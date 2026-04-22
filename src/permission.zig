@@ -1,0 +1,59 @@
+//! 兼容性 re-export shim。M0.6 已把实现拆到 permission/ 子目录。
+//! 保留此文件是为了让 agent_loop.zig / app.zig 的旧 import 继续工作。
+//! 后续里程碑会让调用方迁到新路径，再删除本文件。
+
+const std = @import("std");
+const types = @import("types.zig");
+
+const mode_mod = @import("permission/mode.zig");
+const category_mod = @import("permission/category.zig");
+const decision_mod = @import("permission/decision.zig");
+const prompt_mod = @import("permission/prompt.zig");
+const rule_mod = @import("permission/rule.zig");
+
+// --- 旧 API 重导出 ---
+
+pub const PermissionResult = decision_mod.Decision;
+pub const ToolCategory = category_mod.ToolCategory;
+pub const RiskLevel = category_mod.RiskLevel;
+pub const getToolCategory = category_mod.getToolCategory;
+pub const getRiskLevel = category_mod.getRiskLevel;
+
+/// 旧版 PermissionContext。新 decision.Context 更简洁，但此处保留字段兼容 agent_loop。
+pub const PermissionContext = struct {
+    mode: types.PermissionMode,
+    allocator: std.mem.Allocator,
+};
+
+pub fn createContext(mode: types.PermissionMode, allocator: std.mem.Allocator) PermissionContext {
+    return .{ .mode = mode, .allocator = allocator };
+}
+
+pub fn checkPermission(ctx: *const PermissionContext, tool_name: []const u8, args: []const u8) PermissionResult {
+    const d_ctx = decision_mod.Context{ .mode = ctx.mode };
+    return decision_mod.check(&d_ctx, tool_name, args);
+}
+
+pub fn promptUser(tool_name: []const u8, args: []const u8, allocator: std.mem.Allocator) !bool {
+    _ = allocator;
+    return prompt_mod.ask(tool_name, args);
+}
+
+test {
+    _ = &mode_mod;
+    _ = &category_mod;
+    _ = &decision_mod;
+    _ = &rule_mod;
+    _ = &prompt_mod;
+}
+
+test "shim checkPermission bypass" {
+    const ctx = PermissionContext{ .mode = .bypass, .allocator = std.testing.allocator };
+    try std.testing.expect(checkPermission(&ctx, "Bash", "rm -rf /") == .allow);
+}
+
+test "shim createContext + check plan" {
+    const ctx = createContext(.plan, std.testing.allocator);
+    try std.testing.expect(checkPermission(&ctx, "Read", "") == .allow);
+    try std.testing.expect(checkPermission(&ctx, "Write", "") == .deny);
+}
