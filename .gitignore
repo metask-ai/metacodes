@@ -1,4 +1,3 @@
 .zig/
 zig-out/
 *.zig.zon
-build.zig
