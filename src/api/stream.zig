@@ -396,6 +396,8 @@ pub const Event = union(enum) {
     /// 来自 content_block_start 的工具调用初始信息；内部字段借用自 reader buffer
     /// —— 调用方若要跨 next() 保留，必须 dupe
     tool_use_start: ToolUseResult,
+    /// 用量统计（来自 message_start 或 message_delta 的 usage 字段）；数值不拥有资源
+    usage: UsageDelta,
     /// 结束信号
     done: void,
 
@@ -407,15 +409,50 @@ pub const Event = union(enum) {
                 allocator.free(tu.name);
                 allocator.free(tu.input_json);
             },
-            .done => {},
+            .usage, .done => {},
         }
     }
 };
+
+pub const UsageDelta = struct {
+    input_tokens: u64 = 0,
+    output_tokens: u64 = 0,
+    cache_read_input_tokens: u64 = 0,
+    cache_creation_input_tokens: u64 = 0,
+};
+
+/// 从 usage object JSON（`{"input_tokens":N,"output_tokens":M,...}`）提数值。
+/// 容错：字段缺失返 0；字段存在但非整数返 0。
+fn parseUsageDelta(obj: []const u8) UsageDelta {
+    return .{
+        .input_tokens = parseIntField(obj, "input_tokens"),
+        .output_tokens = parseIntField(obj, "output_tokens"),
+        .cache_read_input_tokens = parseIntField(obj, "cache_read_input_tokens"),
+        .cache_creation_input_tokens = parseIntField(obj, "cache_creation_input_tokens"),
+    };
+}
+
+/// 从 object string 里抽 `"field":<digits>` 的整数值。
+/// 不处理浮点、负数、科学记数——usage 字段都是非负整数。
+fn parseIntField(obj: []const u8, field: []const u8) u64 {
+    var pat_buf: [64]u8 = undefined;
+    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\":", .{field}) catch return 0;
+    const idx = std.mem.indexOf(u8, obj, pat) orelse return 0;
+    var i = idx + pat.len;
+    while (i < obj.len and (obj[i] == ' ' or obj[i] == '\t')) : (i += 1) {}
+    const start = i;
+    while (i < obj.len and obj[i] >= '0' and obj[i] <= '9') : (i += 1) {}
+    if (i == start) return 0;
+    return std.fmt.parseInt(u64, obj[start..i], 10) catch 0;
+}
 
 pub const EventIterator = struct {
     reader: *std.Io.Reader,
     abort: ?*const AbortSignal = null,
     done_flag: bool = false,
+    /// 本次 SSE 流对应的 request_id（client 层设置）。用来把 stream 事件日志和
+    /// 更上游的 HTTP 请求/下游 agent turn 串起来。未设置时日志无 id 上下文。
+    req_id: ?log.RequestId = null,
 
     /// 跨多个 SSE 事件累加的 tool_use 状态。
     /// `content_block_start`(tool_use) 时填入 id/name，input_buf 清空。
@@ -436,6 +473,11 @@ pub const EventIterator = struct {
 
     pub fn initWithAbort(reader: *std.Io.Reader, abort: *const AbortSignal) EventIterator {
         return .{ .reader = reader, .abort = abort };
+    }
+
+    /// 绑定 request_id，让后续所有 event 日志带上同一 id。
+    pub fn setRequestId(self: *EventIterator, id: log.RequestId) void {
+        self.req_id = id;
     }
 
     /// 清理未 emit 的 pending_tool（通常在 error 或提前 drop 时调用）。
@@ -460,18 +502,18 @@ pub const EventIterator = struct {
             if (self.abort) |a| try a.throwIfAborted();
 
             const line_opt = self.reader.takeDelimiter('\n') catch |err| {
-                log.warn("stream", "takeDelimiter failed: {s}", .{@errorName(err)});
+                self.logWarn("takeDelimiter failed: {s}", .{@errorName(err)});
                 return err;
             };
             const line = line_opt orelse {
-                log.debug("stream", "EOF reached (no message_stop before EOF)", .{});
+                self.logDebug("EOF reached (no message_stop before EOF)", .{});
                 self.done_flag = true;
                 return null;
             };
 
             const data = parser.parseLine(line) orelse continue;
             const ev_type = parseEventType(data);
-            log.debug("stream", "event: {s} (line_len={d})", .{ @tagName(ev_type), line.len });
+            self.logDebug("event: {s} line_len={d} data={s}", .{ @tagName(ev_type), line.len, data });
             switch (ev_type) {
                 .content_block_start => {
                     // 检查是不是 tool_use block
@@ -487,6 +529,7 @@ pub const EventIterator = struct {
                             .name = try allocator.dupe(u8, tu.name),
                             .input_buf = .empty,
                         };
+                        self.logInfo("tool_use_start id={s} name={s}", .{ tu.id, tu.name });
                         // tool_use 的参数通过后续 input_json_delta 累加——不立即 emit
                         continue;
                     }
@@ -503,10 +546,12 @@ pub const EventIterator = struct {
                             const unescaped = try util_json.unescapeString(partial, allocator);
                             defer allocator.free(unescaped);
                             try pt.input_buf.appendSlice(allocator, unescaped);
+                            self.logDebug("input_json_delta partial={s}", .{unescaped});
                         }
                         continue;
                     }
                     if (try extractTextDelta(data, allocator)) |text| {
+                        self.logDebug("text_delta bytes={d}", .{text.len});
                         return Event{ .text_delta = text };
                     }
                     continue;
@@ -524,11 +569,13 @@ pub const EventIterator = struct {
                         // 用 std.json.Scanner 做完整性校验（不阻塞事件流——即使格式错仍 emit，
                         // 让下游 tool 返错给 LLM 自纠。这里只记录一下是否合法）
                         validateJsonObject(full_input) catch {
-                            // 校验失败：仍透传给工具，由工具层报错给 LLM（比我们在此吞掉好）
+                            self.logWarn("tool input invalid JSON (emitted anyway): {s}", .{full_input});
                         };
 
                         const id = pt.id;
                         const name = pt.name;
+                        self.logInfo("tool_use complete id={s} name={s} input_bytes={d}", .{ id, name, full_input.len });
+                        self.logDebug("tool_use input_json={s}", .{full_input});
                         pt.input_buf.deinit(allocator);
                         self.pending_tool = null;
                         return Event{ .tool_use_start = .{
@@ -548,26 +595,52 @@ pub const EventIterator = struct {
                         self.pending_tool = null;
                     }
                     self.done_flag = true;
+                    self.logInfo("message_stop", .{});
                     return Event{ .done = {} };
                 },
                 .message_delta => {
                     // 提取 stop_reason 并 log：用户看到截断时能知道原因
-                    // 格式示例：{"type":"message_delta","delta":{"stop_reason":"max_tokens",...},...}
+                    // 格式示例：{"type":"message_delta","delta":{"stop_reason":"max_tokens",...},"usage":{"output_tokens":N,...}}
                     if (findTopLevelObjectField(data, "delta")) |delta_obj| {
                         if (findTopLevelStringField(delta_obj, "stop_reason")) |sr| {
                             if (std.mem.eql(u8, sr, "max_tokens")) {
-                                log.warn("stream", "response hit max_tokens limit — increase max_tokens in request to get longer replies", .{});
+                                self.logWarn("response hit max_tokens limit — increase max_tokens in request to get longer replies", .{});
                             } else {
-                                log.debug("stream", "stop_reason: {s}", .{sr});
+                                self.logInfo("stop_reason: {s}", .{sr});
                             }
+                        }
+                    }
+                    // message_delta 的 usage 是 top-level 的 `usage`，不在 delta 里
+                    if (findTopLevelObjectField(data, "usage")) |usage_obj| {
+                        return Event{ .usage = parseUsageDelta(usage_obj) };
+                    }
+                    continue;
+                },
+                .message_start => {
+                    self.logInfo("message_start", .{});
+                    // message_start 的 usage 嵌在 message 对象里：{"message":{"usage":{...}}}
+                    if (findTopLevelObjectField(data, "message")) |msg_obj| {
+                        if (findTopLevelObjectField(msg_obj, "usage")) |usage_obj| {
+                            return Event{ .usage = parseUsageDelta(usage_obj) };
                         }
                     }
                     continue;
                 },
-                // ping / message_start / unknown → 跳过
+                // ping / unknown → 跳过
                 else => continue,
             }
         }
+    }
+
+    // --- 内部日志 helper：带 req_id 时用 *Id 变体，否则普通 ---
+    fn logDebug(self: *const EventIterator, comptime fmt: []const u8, args: anytype) void {
+        if (self.req_id) |id| log.debugId("stream", id, fmt, args) else log.debug("stream", fmt, args);
+    }
+    fn logInfo(self: *const EventIterator, comptime fmt: []const u8, args: anytype) void {
+        if (self.req_id) |id| log.infoId("stream", id, fmt, args) else log.info("stream", fmt, args);
+    }
+    fn logWarn(self: *const EventIterator, comptime fmt: []const u8, args: anytype) void {
+        if (self.req_id) |id| log.warnId("stream", id, fmt, args) else log.warn("stream", fmt, args);
     }
 };
 

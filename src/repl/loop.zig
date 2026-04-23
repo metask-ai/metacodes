@@ -16,6 +16,10 @@ const input = @import("input.zig");
 const history_mod = @import("history.zig");
 const multiline_mod = @import("multiline.zig");
 const render_mod = @import("render.zig");
+const transcript_mod = @import("../core/transcript.zig");
+const statusline = @import("statusline.zig");
+const progress = @import("progress.zig");
+const util_fs = @import("../util/fs.zig");
 
 pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     std.debug.print("Metacode Super\nType your message or /help for commands\n\n", .{});
@@ -33,7 +37,12 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     const stdin_fd: std.c.fd_t = 0;
     const tty = std.c.isatty(stdin_fd) != 0;
 
+    // 进入 TUI：开启工具 progress 显示（非 TTY 不启用避免污染 pipe 输出）
+    if (tty) progress.enable();
+    defer if (tty) progress.disable();
+
     while (true) {
+        if (tty) statusline.render(app);
         std.debug.print("> ", .{});
 
         const line = if (tty)
@@ -76,14 +85,21 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         if (std.mem.eql(u8, trimmed, "/help")) {
             std.debug.print(
                 \\Commands:
-                \\  /help      Show this help
-                \\  /clear     Clear screen
-                \\  /tools     List available tools
-                \\  /skills    List installed skills
-                \\  /history   Show recent commands
-                \\  /retry     Resend the last user message
-                \\  /compact   Compact oldest messages when over threshold
-                \\  /exit      Exit REPL
+                \\  /help            Show this help
+                \\  /clear           Clear screen
+                \\  /tools           List available tools
+                \\  /skills          List installed skills
+                \\  /history         Show recent commands
+                \\  /resume [id]     List recent sessions, or resume one by id
+                \\  /retry           Resend the last user message
+                \\  /compact         Compact oldest messages when over threshold
+                \\  /doctor          Show environment/config diagnostics
+                \\  /config [show|path]  Inspect config (~/.cc-zig/config.json)
+                \\  /init            Create .cc-zig/ skeleton in the current directory
+                \\  /mcp             List configured MCP servers
+                \\  /commit          Draft a git commit using the model
+                \\  /review          Ask the model to review the current diff
+                \\  /exit            Exit REPL
                 \\
                 \\Multi-line input:
                 \\  Shift+Enter / Ctrl+Enter   insert a newline (requires CSI u capable terminal:
@@ -127,6 +143,55 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             try retryLast(app, allocator, &writer);
             continue;
         }
+        if (std.mem.eql(u8, trimmed, "/cost")) {
+            const u = app.usage;
+            const cost = u.costUsd(app.config.model);
+            std.debug.print(
+                \\Usage ({s}):
+                \\  input         {d} tokens
+                \\  output        {d} tokens
+                \\  cache read    {d} tokens
+                \\  cache create  {d} tokens
+                \\  total cost    ${d:.6} USD
+                \\
+            , .{ app.config.model, u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, cost });
+            continue;
+        }
+        // /resume [id] —— 无参列最近 10 个 session；有参加载
+        if (std.mem.startsWith(u8, trimmed, "/resume")) {
+            const rest = std.mem.trim(u8, trimmed[7..], " \t");
+            try handleResume(app, allocator, rest);
+            continue;
+        }
+        if (std.mem.eql(u8, trimmed, "/doctor")) {
+            try handleDoctor(app, allocator);
+            continue;
+        }
+        if (std.mem.startsWith(u8, trimmed, "/config")) {
+            const rest = std.mem.trim(u8, trimmed[7..], " \t");
+            try handleConfigCmd(app, allocator, rest);
+            continue;
+        }
+        if (std.mem.eql(u8, trimmed, "/init")) {
+            try handleInit(app, allocator);
+            continue;
+        }
+        if (std.mem.eql(u8, trimmed, "/mcp")) {
+            try handleMcp(app);
+            continue;
+        }
+        // /commit 和 /review：把预置 prompt 注入为 user message，走正常 agent_loop 路径
+        if (std.mem.eql(u8, trimmed, "/commit")) {
+            try app.conversation.appendText(.user, COMMIT_PROMPT);
+            // 不 continue，让下面主流程跑一轮
+            try runInjectedAgent(app, allocator, &writer);
+            continue;
+        }
+        if (std.mem.eql(u8, trimmed, "/review")) {
+            try app.conversation.appendText(.user, REVIEW_PROMPT);
+            try runInjectedAgent(app, allocator, &writer);
+            continue;
+        }
 
         // tty 模式：LineEditor 已经在 buffer 里保存换行（Shift+Enter / Ctrl+Enter），一次提交
         // 非 tty 模式：保留 Accumulator fallback（行尾 `\` 续行 / 独占 `"""` 块）
@@ -160,12 +225,14 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             .{ stdin_fd, &app.abort, &watcher_stop },
         ) else null;
 
+        const usage_sink = app.usageSink();
+        const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*j| j else null;
         const result = agent_loop.run(
             &app.conversation,
             &app.api_client,
             app.tool_defs,
             &app.permission_ctx,
-            .{ .verbose = app.config.verbose, .abort = &app.abort },
+            .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs },
             &writer,
             allocator,
         ) catch |err| {
@@ -180,6 +247,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         watcher_stop.store(true, .release);
         if (watcher_thread) |t| t.join();
         if (tty) drainStdin(stdin_fd);
+
+        // 每轮结束 flush transcript（含错误 / abort 路径；只要有变动都想落盘）
+        app.persistTranscript();
 
         if (result.stop_reason == .aborted) {
             std.debug.print("\x1b[33m^C (cancelled)\x1b[0m\n", .{});
@@ -471,18 +541,21 @@ fn retryLast(app: *app_mod.App, allocator: std.mem.Allocator, writer: *DebugWrit
         m.deinit(app.conversation.allocator);
     }
 
+    const usage_sink = app.usageSink();
+    const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*jr| jr else null;
     const result = agent_loop.run(
         &app.conversation,
         &app.api_client,
         app.tool_defs,
         &app.permission_ctx,
-        .{ .verbose = app.config.verbose, .abort = &app.abort },
+        .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs },
         writer,
         allocator,
     ) catch |err| {
         std.debug.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
         return;
     };
+    app.persistTranscript();
     if (result.stop_reason == .aborted) {
         std.debug.print("\x1b[33m^C (cancelled)\x1b[0m\n", .{});
         app.abort.resetForTesting();
@@ -493,6 +566,319 @@ fn historyPath(allocator: std.mem.Allocator) ![]u8 {
     const home_c = std.c.getenv("HOME") orelse return error.NoHome;
     const home = std.mem.span(home_c);
     return std.fmt.allocPrint(allocator, "{s}/.cc-zig/history", .{home});
+}
+
+// ============================================================================
+// /doctor /config /init /mcp /commit /review handlers
+// ============================================================================
+
+const COMMIT_PROMPT =
+    \\Please help create a git commit for the current working tree.
+    \\
+    \\Steps you should follow:
+    \\  1) Run `git status` and `git diff --stat` (via the Bash tool) to see what changed.
+    \\  2) Run `git log -n 5 --oneline` to match the project's commit style.
+    \\  3) Draft a concise, conventional commit message summarising the WHY of the change.
+    \\  4) Stage the intended files with `git add <path> ...` (do NOT use `git add -A`; skip secrets).
+    \\  5) Run `git commit -m "..."`.
+    \\  6) Show `git status` at the end to confirm.
+    \\
+    \\Do NOT push. If the diff is empty, say so and stop.
+;
+
+const REVIEW_PROMPT =
+    \\Please review the current change set (unstaged + staged diff against HEAD).
+    \\
+    \\Steps:
+    \\  1) Run `git diff HEAD` (via Bash) to see all pending changes.
+    \\  2) Identify bugs, edge cases, missing error handling, broken invariants, style issues.
+    \\  3) Group findings by severity: blockers → warnings → nits.
+    \\  4) Quote the specific lines you are commenting on.
+    \\  5) End with a one-line verdict: ready to merge / needs fixes.
+;
+
+fn handleDoctor(app: *app_mod.App, allocator: std.mem.Allocator) !void {
+    std.debug.print("\x1b[1mcc-zig doctor\x1b[0m\n", .{});
+    std.debug.print("  model:            {s}\n", .{app.config.model});
+    std.debug.print("  permission mode:  {s}\n", .{@tagName(app.permission_ctx.mode)});
+    std.debug.print("  api key:          {s}\n", .{if (app.api_key.len > 0) "set" else "MISSING"});
+    std.debug.print("  max_tokens cfg:   {any}\n", .{app.config.max_tokens});
+    std.debug.print("  verbose:          {}\n", .{app.config.verbose});
+    std.debug.print("  transcript:       {s}\n", .{if (app.transcript_writer != null) "on" else "OFF"});
+    std.debug.print("  job registry:     {s}\n", .{if (app.jobs != null) "on" else "OFF"});
+    std.debug.print("  skills loaded:    {d}\n", .{app.skills.len()});
+    std.debug.print("  conversation:     {d} messages\n", .{app.conversation.len()});
+    std.debug.print("  tasks:            {d} in store\n", .{app.tasks.tasks.items.len});
+    std.debug.print("  rules loaded:     {d}\n", .{if (app.rule_set) |r| r.rules.items.len else 0});
+
+    // HOME + CWD + config file 检查
+    const home_c = std.c.getenv("HOME");
+    if (home_c) |h| {
+        std.debug.print("  HOME:             {s}\n", .{std.mem.span(h)});
+    } else {
+        std.debug.print("  HOME:             UNSET\n", .{});
+    }
+
+    if (util_fs.getCwd(allocator)) |cwd| {
+        defer allocator.free(cwd);
+        std.debug.print("  CWD:              {s}\n", .{cwd});
+    } else |_| {
+        std.debug.print("  CWD:              (unreadable)\n", .{});
+    }
+}
+
+fn handleConfigCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
+    _ = app;
+    const home_c = std.c.getenv("HOME") orelse {
+        std.debug.print("HOME not set\n", .{});
+        return;
+    };
+    const home = std.mem.span(home_c);
+    const cfg_path = try std.fmt.allocPrint(allocator, "{s}/.cc-zig/config.json", .{home});
+    defer allocator.free(cfg_path);
+
+    if (rest.len == 0 or std.mem.eql(u8, rest, "show")) {
+        std.debug.print("config path: {s}\n", .{cfg_path});
+        // 尝试读全文
+        const path_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{cfg_path}, 0);
+        defer allocator.free(path_z);
+        const fd = std.c.open(path_z.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        if (fd < 0) {
+            std.debug.print("(file does not exist — use /init to create one)\n", .{});
+            return;
+        }
+        defer _ = std.c.close(fd);
+        var buf: [8192]u8 = undefined;
+        while (true) {
+            const n = std.c.read(fd, &buf, buf.len);
+            if (n <= 0) break;
+            std.debug.print("{s}", .{buf[0..@intCast(n)]});
+        }
+        std.debug.print("\n", .{});
+        return;
+    }
+    if (std.mem.eql(u8, rest, "path")) {
+        std.debug.print("{s}\n", .{cfg_path});
+        return;
+    }
+    std.debug.print("usage: /config [show|path]\n", .{});
+}
+
+fn handleInit(app: *app_mod.App, allocator: std.mem.Allocator) !void {
+    _ = app;
+
+    // 1. 在 CWD 创建 .cc-zig/ 目录
+    const cwd = util_fs.getCwd(allocator) catch {
+        std.debug.print("getcwd failed\n", .{});
+        return;
+    };
+    defer allocator.free(cwd);
+
+    const dir = try std.fmt.allocPrintSentinel(allocator, "{s}/.cc-zig", .{cwd}, 0);
+    defer allocator.free(dir);
+    if (std.c.mkdir(dir.ptr, @as(std.c.mode_t, 0o755)) != 0) {
+        const errno: std.c.E = @enumFromInt(std.c._errno().*);
+        if (errno != .EXIST) {
+            std.debug.print("mkdir {s}: errno={s}\n", .{ dir, @tagName(errno) });
+            return;
+        }
+    }
+
+    const cfg_path = try std.fmt.allocPrintSentinel(allocator, "{s}/config.json", .{dir}, 0);
+    defer allocator.free(cfg_path);
+
+    // 存在性检查：用 access(F_OK) 明确表达"文件是否存在"。
+    // open(RDONLY) 会把"没权限读取 / 不是常规文件 / 符号链接循环"等情况和 ENOENT 混成
+    // 同一个 "fd<0"，后续 CREAT|TRUNC 会截断已存在但我们没读权限的 config。
+    if (std.c.access(cfg_path.ptr, std.c.F_OK) == 0) {
+        std.debug.print("already exists: {s}\n", .{cfg_path});
+        return;
+    }
+    {
+        const errno: std.c.E = @enumFromInt(std.c._errno().*);
+        if (errno != .NOENT) {
+            std.debug.print("access {s}: errno={s}\n", .{ cfg_path, @tagName(errno) });
+            return;
+        }
+    }
+
+    // 2. 写默认 config.json 骨架（只在 access 返 ENOENT 时走到这里）
+    const skeleton =
+        \\{
+        \\  "model": "claude-opus-4-7",
+        \\  "permission_mode": "prompt",
+        \\  "permission_rules": [
+        \\    { "match": { "tool": "Read" }, "decision": "allow" },
+        \\    { "match": { "tool": "Glob" }, "decision": "allow" },
+        \\    { "match": { "tool": "Grep" }, "decision": "allow" }
+        \\  ]
+        \\}
+        \\
+    ;
+    // 用 O_EXCL 防 TOCTOU：两次 access/open 之间若有人建了同名文件，EXCL 会 fail 而非覆盖
+    const fd = std.c.open(cfg_path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) {
+        const errno: std.c.E = @enumFromInt(std.c._errno().*);
+        if (errno == .EXIST) {
+            // access 后 open 前有并发创建；语义等价 "already exists"，不要让用户困惑
+            std.debug.print("already exists (race): {s}\n", .{cfg_path});
+        } else {
+            std.debug.print("create {s}: errno={s}\n", .{ cfg_path, @tagName(errno) });
+        }
+        return;
+    }
+    // close 延后到 write 完成后——但若 write 失败需要 unlink，close 要在 unlink 前
+    // 调用。用 explicit close + unlink，不用 defer（defer 会让 unlink 先于 close）。
+    const n = std.c.write(fd, skeleton.ptr, skeleton.len);
+    _ = std.c.close(fd);
+    const wrote: usize = if (n < 0) 0 else @intCast(n);
+    if (wrote != skeleton.len) {
+        const errno: std.c.E = if (n < 0) @enumFromInt(std.c._errno().*) else .SUCCESS;
+        std.debug.print(
+            "write {s}: errno={s}, wrote {d}/{d} — rolling back\n",
+            .{ cfg_path, @tagName(errno), wrote, skeleton.len },
+        );
+        // 原子性：要么完整写入，要么盘上没有残留文件。部分写入的 config 会让下次
+        // /config show 解析报错，用户无法 debug。unlink 清掉，让他们重跑 /init。
+        _ = std.c.unlink(cfg_path.ptr);
+        return;
+    }
+    std.debug.print("created {s}\n", .{cfg_path});
+}
+
+fn handleMcp(app: *app_mod.App) !void {
+    _ = app;
+    // MCP integration at App level is not yet wired; show best-effort info.
+    std.debug.print(
+        \\MCP servers: (none connected)
+        \\
+        \\Note: MCP client framework exists at src/mcp/ but App-level multi-server
+        \\management is not yet wired. A future release will read the `mcp_servers`
+        \\key from config.json and auto-connect stdio servers.
+        \\
+    , .{});
+}
+
+/// 把预置 prompt 注入为 user message 后触发一次 agent_loop 执行。
+fn runInjectedAgent(app: *app_mod.App, allocator: std.mem.Allocator, writer: *DebugWriter) !void {
+    const usage_sink = app.usageSink();
+    const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*jr| jr else null;
+    const result = agent_loop.run(
+        &app.conversation,
+        &app.api_client,
+        app.tool_defs,
+        &app.permission_ctx,
+        .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs },
+        writer,
+        allocator,
+    ) catch |err| {
+        std.debug.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
+        return;
+    };
+    app.persistTranscript();
+    if (result.stop_reason == .aborted) {
+        std.debug.print("\x1b[33m^C (cancelled)\x1b[0m\n", .{});
+        app.abort.resetForTesting();
+    }
+}
+
+/// /resume：rest == "" 时列出最近 session；rest 是 session id 时加载。
+fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
+    const home_c = std.c.getenv("HOME") orelse {
+        std.debug.print("no HOME env set\n", .{});
+        return;
+    };
+    const home = std.mem.span(home_c);
+
+    const cwd = util_fs.getCwd(allocator) catch {
+        std.debug.print("getcwd failed\n", .{});
+        return;
+    };
+    defer allocator.free(cwd);
+
+    if (rest.len == 0) {
+        const list = transcript_mod.listSessions(cwd, home, allocator) catch |err| {
+            std.debug.print("listSessions failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        defer transcript_mod.freeSessionList(list, allocator);
+
+        if (list.len == 0) {
+            std.debug.print("No previous sessions in this project.\n", .{});
+            return;
+        }
+
+        const show = @min(list.len, 10);
+        std.debug.print("Recent sessions (most recent first):\n", .{});
+        for (list[0..show], 0..) |e, i| {
+            const title = if (e.title.len == 0) "(no title)" else e.title;
+            std.debug.print("  \x1b[36m{d})\x1b[0m \x1b[90m{s}\x1b[0m  {s}  ({d} msgs, model={s})\n", .{ i + 1, e.id, title, e.message_count, e.model });
+        }
+        std.debug.print("\nUse /resume <id> (or /resume <N>) to load a session.\n", .{});
+        return;
+    }
+
+    // rest 是 session id 或纯数字（对应列表位置 1..N）
+    const list = transcript_mod.listSessions(cwd, home, allocator) catch |err| {
+        std.debug.print("listSessions failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer transcript_mod.freeSessionList(list, allocator);
+
+    var target_path: ?[]const u8 = null;
+    // 先尝试解析成数字
+    if (std.fmt.parseInt(usize, rest, 10) catch null) |n| {
+        if (n >= 1 and n <= list.len) target_path = list[n - 1].path;
+    }
+    if (target_path == null) {
+        // 按 id 精确匹配 / 前缀匹配
+        for (list) |e| {
+            if (std.mem.eql(u8, e.id, rest) or std.mem.startsWith(u8, e.id, rest)) {
+                target_path = e.path;
+                break;
+            }
+        }
+    }
+    const path = target_path orelse {
+        std.debug.print("No session matching '{s}'\n", .{rest});
+        return;
+    };
+
+    // 事务性加载：先在临时 conversation 加载，成功后才 atomic 切换。
+    // 失败时保持原 conversation 和 writer 不变，用户下次输入仍写到原 session。
+    const Conversation = @import("../core/conversation.zig").Conversation;
+    var staged = Conversation.init(app.allocator);
+    // ownership 转移标志：true 时下面的 errdefer 不释放（已交给 app.conversation）。
+    // 不用 errdefer staged.deinit() 是因为 Zig 的 errdefer 无法 cancel；
+    // 在 ownership 转移后若后续 error，errdefer 会 double-free。
+    var staged_owned_here = true;
+    errdefer if (staged_owned_here) staged.deinit();
+
+    transcript_mod.loadTranscript(&staged, path, allocator) catch |err| {
+        std.debug.print("load failed: {s} (session state unchanged)\n", .{@errorName(err)});
+        staged.deinit();
+        staged_owned_here = false;
+        return;
+    };
+
+    // 预构造新 writer（dup 可能 OOM，放在切换之前）
+    const dir_owned = try app.allocator.dupe(u8, path);
+    errdefer app.allocator.free(dir_owned);
+    const new_writer = transcript_mod.Writer.openExisting(
+        app.allocator,
+        dir_owned,
+        app.config.model,
+        staged.len(),
+    );
+
+    // 到这里所有操作已经成功：真正 atomic 切换。
+    app.conversation.deinit();
+    app.conversation = staged;
+    staged_owned_here = false; // ownership 已转移给 app.conversation
+    if (app.transcript_writer) |*w| w.deinit();
+    app.transcript_writer = new_writer;
+
+    std.debug.print("Resumed session ({d} messages). Continue by sending a message.\n", .{app.conversation.len()});
 }
 
 /// 最小 writer，把格式化输出走 stderr（与 std.debug.print 同通道）。

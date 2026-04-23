@@ -34,13 +34,12 @@ pub fn main(init: std.process.Init) !void {
     log.initFromEnv();
     if (config.verbose) log.enableVerbose();
 
-    var api_key = config.api_key;
-    if (api_key == null) {
-        if (init.environ_map.get("ANTHROPIC_API_KEY")) |val| api_key = val;
-    }
-    if (api_key == null) api_key = client.ANTHROPIC_AUTH_TOKEN;
+    // API key 优先级：CLI `--api-key <k>` > 硬编码 token。
+    // 不读 ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN：这个代理后端与硬编码 token 绑定，
+    // 读 env 反而会让用户以为切换了 URL/provider（实际 URL 也是硬编码的），造成困惑。
+    const api_key = config.api_key orelse client.ANTHROPIC_AUTH_TOKEN;
 
-    const app = try app_mod.App.init(allocator, init.io, config, api_key.?);
+    const app = try app_mod.App.init(allocator, init.io, config, api_key);
     defer app.deinit();
 
     try app.installSigintHandler();
@@ -89,7 +88,7 @@ fn printHelp() void {
         \\Metacode Super
         \\Usage: metacodes [options]
         \\  --model <model>       Model (default: claude-sonnet-4-20250514)
-        \\  --api-key <key>       API key (or ANTHROPIC_API_KEY)
+        \\  --api-key <key>       API key (overrides built-in token)
         \\  --permission <mode>   auto | prompt | plan | bypass
         \\  --no-theme            Disable colors
         \\  --verbose             Verbose output

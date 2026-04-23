@@ -14,10 +14,32 @@
 
 const std = @import("std");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
+const ReadState = @import("../core/read_state.zig").ReadState;
+const JobRegistry = @import("../core/job_registry.zig").JobRegistry;
+const PermissionContext = @import("../permission.zig").PermissionContext;
+const TaskStore = @import("../core/task_store.zig").TaskStore;
+const Client = @import("../client.zig").Client;
+const ToolDefinition = @import("../json.zig").ToolDefinition;
 
 pub const ToolContext = struct {
     allocator: std.mem.Allocator,
     abort: ?*const AbortSignal = null,
+    /// ReadState 表：Read 成功后会 record，Write/Edit 入口查 get 做 must-read-first 校验。
+    /// 单元测试可用 `simple` 构造跳过（无校验）。
+    read_state: ?*ReadState = null,
+    /// Bash 后台作业注册表：run_in_background + BashOutput + KillShell 用
+    jobs: ?*JobRegistry = null,
+    /// 权限上下文：EnterPlanMode/ExitPlanMode 需要写 mode
+    permission_ctx: ?*PermissionContext = null,
+    /// 进入 plan 模式前的原 mode；ExitPlanMode 时恢复
+    plan_prev_mode: ?*?@import("../types.zig").PermissionMode = null,
+    /// Task 清单：TaskCreate/Get/List/Update/Stop 共享的 scratchpad
+    tasks: ?*TaskStore = null,
+    /// 用于 Agent 工具 spawn 子 agent：共享 API client + tool defs + permission ctx
+    api_client: ?*Client = null,
+    tool_defs: ?[]const ToolDefinition = null,
+    /// 当前 agent 嵌套深度（父=0，子=1，孙=2…）。Agent 工具用它限制递归。
+    agent_depth: u8 = 0,
 
     /// 便利构造：只需 allocator 的场景（大多数单元测试）。
     pub fn simple(allocator: std.mem.Allocator) ToolContext {

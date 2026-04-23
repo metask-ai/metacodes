@@ -91,6 +91,43 @@ pub const Conversation = struct {
         }
         return drop_count;
     }
+
+    /// 保留最近 keep_n 条 message，丢前面的。对 tool_use/tool_result 配对友好：
+    /// 若保留区的第一条是 tool_result（orphan——它指向已丢的 tool_use），则把
+    /// 这条也往前扩展一条"再往前找"，直到保留区首条是 user 非 tool_result 或 assistant 非 tool_use。
+    ///
+    /// 注意：仍会丢老的 user 消息 + 它们对应的 assistant 回答；这是故意的（这是 compact 的本意）。
+    /// 只保证 *边界处* 不留孤儿。
+    pub fn compactKeepRecent(self: *Conversation, keep_n: usize) usize {
+        const total = self.messages.items.len;
+        if (total <= keep_n) return 0;
+
+        var drop_count = total - keep_n;
+        // 把边界左移：只要 messages[drop_count] 是 user 且开头是 tool_result，把它也丢掉
+        // （它指向 messages[drop_count-1] 的 tool_use，两者都属于老上下文）
+        while (drop_count < total) {
+            const first_kept = self.messages.items[drop_count];
+            if (first_kept.role != .user) break;
+            if (first_kept.blocks.len == 0) break;
+            const first_block = first_kept.blocks[0];
+            const is_tool_result = @as(std.meta.Tag(msg.Block), first_block) == .tool_result;
+            if (!is_tool_result) break;
+            drop_count += 1;
+        }
+
+        if (drop_count == 0) return 0;
+        if (drop_count >= total) {
+            // 全丢了——至少保留最后一条（应该不会走到，但防御）
+            drop_count = total - 1;
+        }
+
+        var i: usize = 0;
+        while (i < drop_count) : (i += 1) {
+            const m = self.messages.orderedRemove(0);
+            m.deinit(self.allocator);
+        }
+        return drop_count;
+    }
 };
 
 test "Conversation init / deinit empty" {
@@ -222,4 +259,64 @@ test "totalTokens zero on empty" {
     var c = Conversation.init(std.testing.allocator);
     defer c.deinit();
     try std.testing.expect(c.totalTokens() == 0);
+}
+
+test "compactKeepRecent keeps last N" {
+    var c = Conversation.init(std.testing.allocator);
+    defer c.deinit();
+    try c.appendText(.user, "m1");
+    try c.appendText(.assistant, "m2");
+    try c.appendText(.user, "m3");
+    try c.appendText(.assistant, "m4");
+    try c.appendText(.user, "m5");
+
+    const dropped = c.compactKeepRecent(2);
+    try std.testing.expect(dropped == 3);
+    try std.testing.expect(c.len() == 2);
+    try std.testing.expectEqualStrings("m4", c.messages.items[0].blocks[0].text);
+    try std.testing.expectEqualStrings("m5", c.messages.items[1].blocks[0].text);
+}
+
+test "compactKeepRecent no-op when under keep_n" {
+    var c = Conversation.init(std.testing.allocator);
+    defer c.deinit();
+    try c.appendText(.user, "m1");
+    const dropped = c.compactKeepRecent(5);
+    try std.testing.expect(dropped == 0);
+    try std.testing.expect(c.len() == 1);
+}
+
+test "compactKeepRecent avoids orphan tool_result at boundary" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    // user msg, assistant w/ tool_use, user w/ tool_result, assistant text, user text
+    try c.appendText(.user, "initial user");
+
+    const au_blks = try a.alloc(msg.Block, 1);
+    au_blks[0] = .{ .tool_use = .{
+        .id = try a.dupe(u8, "t1"),
+        .name = try a.dupe(u8, "Read"),
+        .input = try a.dupe(u8, "{}"),
+    } };
+    try c.append(.{ .role = .assistant, .blocks = au_blks });
+
+    const ur_blks = try a.alloc(msg.Block, 1);
+    ur_blks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "t1"),
+        .content = try a.dupe(u8, "result"),
+    } };
+    try c.append(.{ .role = .user, .blocks = ur_blks });
+
+    try c.appendText(.assistant, "answer");
+    try c.appendText(.user, "follow up");
+
+    // keep_n=3 → 理论上应丢前 2，留最后 3（tool_result + answer + follow-up）
+    // 但 tool_result 是 orphan（其 tool_use 在 index=1 被丢）→ 应该往右挪一个
+    const dropped = c.compactKeepRecent(3);
+    try std.testing.expect(dropped == 3); // 多丢一个 tool_result
+    try std.testing.expect(c.len() == 2);
+    try std.testing.expectEqualStrings("answer", c.messages.items[0].blocks[0].text);
+    try std.testing.expectEqualStrings("follow up", c.messages.items[1].blocks[0].text);
 }

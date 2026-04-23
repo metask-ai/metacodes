@@ -9,30 +9,46 @@
 const std = @import("std");
 const Mode = @import("mode.zig").Mode;
 const category = @import("category.zig");
+const rule_matcher = @import("rule_matcher.zig");
+const log = @import("../util/log.zig");
 
 pub const Decision = enum { allow, deny, ask };
 
 pub const Context = struct {
     mode: Mode,
+    /// 可选的细粒度规则集。非 null 时先查规则，命中即用；都不命中落回四模式。
+    rules: ?*const rule_matcher.RuleSet = null,
 };
 
 /// 根据模式 + 工具名决定：允许 / 拒绝 / 询问。
 pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decision {
-    _ = args; // M0 不看参数；沙箱版本会解析 args 做 per-input 判断
-
-    if (ctx.mode == .bypass) return .allow;
+    // 先查细粒度规则
+    if (ctx.rules) |rs| {
+        if (rs.match(tool_name, args)) |d| {
+            log.debug("permission", "rule matched tool={s} -> {s}", .{ tool_name, @tagName(d) });
+            return d;
+        }
+    }
 
     const cat = category.getToolCategory(tool_name);
     const risk = category.getRiskLevel(tool_name);
 
-    if (ctx.mode == .plan) {
-        return if (cat == .read) .allow else .deny;
-    }
-    if (ctx.mode == .auto) {
-        return if (risk == .low) .allow else .ask;
-    }
-    // prompt
-    return if (cat == .read) .allow else .ask;
+    const decision: Decision = blk: {
+        if (ctx.mode == .bypass) break :blk .allow;
+        if (ctx.mode == .plan) break :blk if (cat == .read) .allow else .deny;
+        if (ctx.mode == .auto) break :blk if (risk == .low) .allow else .ask;
+        // prompt
+        break :blk if (cat == .read) .allow else .ask;
+    };
+
+    log.debug("permission", "decide tool={s} mode={s} category={s} risk={s} -> {s}", .{
+        tool_name,
+        @tagName(ctx.mode),
+        @tagName(cat),
+        @tagName(risk),
+        @tagName(decision),
+    });
+    return decision;
 }
 
 test "bypass allows everything including dangerous" {

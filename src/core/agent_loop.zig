@@ -15,9 +15,17 @@ const permission_mod = @import("../permission.zig");
 const msg = @import("message.zig");
 const Conversation = @import("conversation.zig").Conversation;
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
+const ReadState = @import("read_state.zig").ReadState;
+const api_stream = @import("../api/stream.zig");
+const tool_error = @import("tool_error.zig");
+const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
 
 pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error };
+
+/// Auto-compact 阈值下限：避免 resolveMaxTokens 返回异常小值（测试 mock、未知模型）
+/// 导致每 turn 都 compact。低于这个值不做压缩。
+pub const MIN_AUTO_COMPACT_THRESHOLD: usize = 4096;
 
 pub const RunResult = struct {
     stop_reason: StopReason,
@@ -30,6 +38,37 @@ pub const Options = struct {
     system_prompt: ?[]const u8 = null,
     verbose: bool = false,
     abort: ?*const AbortSignal = null,
+    /// 传给 Write/Edit 做 must-read-first 校验。null → 单测/headless 简化路径（不校验）
+    read_state: ?*ReadState = null,
+    /// 收集 stream usage 事件：input/output/cache token 数。null → 不累加。
+    /// by-value：sink 只含两个指针，直接塞进来，避免悬挂指针风险。
+    usage_sink: ?UsageSink = null,
+    /// 自动 compact 的 token 阈值。null → 按 resolveMaxTokens() * 0.7 动态算
+    auto_compact_threshold: ?usize = null,
+    /// 自动 compact 保留的消息数（最新的 N 条）
+    auto_compact_keep_recent: usize = 10,
+    /// Bash 后台作业注册表（给 ToolContext 用，工具侧 Bash/BashOutput/KillShell 用）
+    jobs: ?*@import("job_registry.zig").JobRegistry = null,
+    /// Plan mode 前的原始 mode 存储；EnterPlanMode/ExitPlanMode 用
+    plan_prev_mode: ?*?types.PermissionMode = null,
+    /// 模型 Task 清单（TaskCreate/Get/List/Update/Stop 共享）
+    tasks: ?*@import("task_store.zig").TaskStore = null,
+    /// 供 Agent 工具 spawn 子 agent 复用 api_client + tool_defs
+    api_client: ?*@import("../client.zig").Client = null,
+    tool_defs: ?[]const @import("../json.zig").ToolDefinition = null,
+    /// 本次 run 对应的 agent 嵌套深度（父=0，子=1…）
+    agent_depth: u8 = 0,
+};
+
+/// usage 回调接口：stream 每次吐 usage event 时调用。
+/// App.usage 实现此接口；测试用 mock 亦可。
+pub const UsageSink = struct {
+    ctx: *anyopaque,
+    addFn: *const fn (ctx: *anyopaque, delta: api_stream.UsageDelta) void,
+
+    pub fn add(self: UsageSink, delta: api_stream.UsageDelta) void {
+        self.addFn(self.ctx, delta);
+    }
 };
 
 /// 一次用户请求的完整 agent 运行：发送当前 conversation 到 API，
@@ -53,17 +92,40 @@ pub fn run(
 
     while (turns < opts.max_turns) : (turns += 1) {
         // 开头检查 abort
-        if (opts.abort) |a| if (a.isAborted()) return .{ .stop_reason = .aborted, .turns = turns, .tool_calls = total_tool_calls };
+        if (opts.abort) |a| if (a.isAborted()) {
+            log.warn("agent", "aborted before turn {d}", .{turns + 1});
+            return .{ .stop_reason = .aborted, .turns = turns, .tool_calls = total_tool_calls };
+        };
+
+        // 自动 compact：在发请求前检查 token 估算，超阈值则保留最近 N 条。
+        // 阈值 null 时按 client.resolveMaxTokens() * 0.7 动态算（跟上模型 context window 变化）。
+        // 下限 MIN_AUTO_COMPACT_THRESHOLD：避免 resolveMaxTokens 返回异常小值导致每 turn 都 compact。
+        const auto_threshold: usize = opts.auto_compact_threshold orelse
+            @max(@as(usize, api_client.resolveMaxTokens()) * 7 / 10, MIN_AUTO_COMPACT_THRESHOLD);
+        if (conversation.isOverThreshold(auto_threshold)) {
+            const before = conversation.len();
+            const dropped = conversation.compactKeepRecent(opts.auto_compact_keep_recent);
+            if (dropped > 0) {
+                log.info("agent", "auto-compact: dropped {d} old messages ({d} -> {d}) threshold={d}", .{ dropped, before, conversation.len(), auto_threshold });
+                try stdout_writer.print("\x1b[33m[auto-compacted {d} old messages, kept last {d}]\x1b[0m\n", .{ dropped, conversation.len() });
+            }
+        }
+
+        log.info("agent", "turn {d}/{d} starting (msgs={d})", .{ turns + 1, opts.max_turns, conversation.messages.items.len });
 
         // 1. 构造当前这一轮的 API 请求（把 Conversation 映射为 types.ApiMessage 数组）。
         var api_messages = try buildApiMessages(conversation, allocator);
         defer freeApiMessages(&api_messages, allocator);
 
         // 2. 发送流式请求（abortable 版本：abort 通过 EventIterator 检查点传播）
-        var stream = api_client.sendMessageStreamAbortable(api_messages.items, opts.system_prompt, tool_defs, opts.abort) catch {
+        var stream = api_client.sendMessageStreamAbortable(api_messages.items, opts.system_prompt, tool_defs, opts.abort) catch |err| {
+            log.err("agent", "sendMessageStream failed turn={d}: {s}", .{ turns + 1, @errorName(err) });
             return .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls };
         };
         defer stream.deinit();
+
+        const rid = stream.id;
+        log.infoId("agent", rid, "stream opened, reading events", .{});
 
         // 3. 收集响应 blocks
         var assistant_blocks = std.ArrayList(msg.Block).empty;
@@ -84,11 +146,12 @@ pub fn run(
             const ev_opt = stream.next() catch |err| switch (err) {
                 error.Aborted => {
                     aborted_during_stream = true;
+                    log.warnId("agent", rid, "stream aborted mid-turn", .{});
                     break;
                 },
                 else => |e| {
                     stream_error = true;
-                    log.warn("agent", "stream returned error {s} at turn {d}", .{ @errorName(e), turns + 1 });
+                    log.errId("agent", rid, "stream returned error {s} at turn {d}", .{ @errorName(e), turns + 1 });
                     break;
                 },
             };
@@ -97,6 +160,7 @@ pub fn run(
                 .text => |text| {
                     try stdout_writer.print("{s}", .{text});
                     try assistant_text.appendSlice(allocator, text);
+                    log.debugId("agent", rid, "text chunk bytes={d}", .{text.len});
                     // text bytes 是 stream 分配的 owned——用完必须 free，否则泄漏
                     allocator.free(text);
                 },
@@ -104,6 +168,7 @@ pub fn run(
                     if (opts.verbose) {
                         try stdout_writer.print("\n\x1b[35m[Tool: {s}]\x1b[0m", .{tu.name});
                     }
+                    log.infoId("agent", rid, "tool_use queued id={s} name={s} input_bytes={d}", .{ tu.id, tu.name, tu.input_json.len });
                     // stream 里 id/name/input_json 都是 owned；转移所有权给 tool_uses（不 dupe）
                     try tool_uses.append(allocator, .{
                         .id = tu.id,
@@ -111,10 +176,21 @@ pub fn run(
                         .input = tu.input_json,
                     });
                 },
+                .usage => |u| {
+                    if (opts.usage_sink) |sink| sink.add(u);
+                    log.infoId("agent", rid, "usage in={d} out={d} cache_r={d} cache_w={d}", .{ u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens });
+                },
                 .done => {},
             }
         }
         try stdout_writer.print("\x1b[0m\n", .{});
+
+        log.infoId("agent", rid, "stream finished text_bytes={d} tool_uses={d} aborted={} err={}", .{
+            assistant_text.items.len,
+            tool_uses.items.len,
+            aborted_during_stream,
+            stream_error,
+        });
 
         if (aborted_during_stream) {
             // 保留已流出的 partial assistant text（对齐 TS 原版 `onCancel` 行为）：
@@ -202,25 +278,28 @@ pub fn run(
 
             // 权限检查
             const perm_result = permission_mod.checkPermission(permission_ctx, tu.name, tu.input);
+            log.infoId("permission", rid, "tool={s} decision={s}", .{ tu.name, @tagName(perm_result) });
             switch (perm_result) {
                 .deny => {
-                    const err = try std.fmt.allocPrint(allocator, "permission denied by rule: {s}", .{tu.name});
-                    errdefer allocator.free(err);
+                    log.warnId("permission", rid, "DENY tool={s} input={s}", .{ tu.name, tu.input });
+                    const err_json = try tool_error.errorToJson("PermissionDenied", "tool '{s}' denied by permission rule or plan mode", .{tu.name}, allocator);
+                    errdefer allocator.free(err_json);
                     try result_blocks.append(allocator, .{ .tool_result = .{
                         .tool_use_id = try allocator.dupe(u8, tu.id),
-                        .content = err,
+                        .content = err_json,
                         .is_error = true,
                     } });
                     continue;
                 },
                 .ask => {
                     const allowed = permission_mod.promptUser(tu.name, tu.input, allocator) catch false;
+                    log.infoId("permission", rid, "prompt tool={s} user_allowed={}", .{ tu.name, allowed });
                     if (!allowed) {
-                        const err = try allocator.dupe(u8, "permission denied by user");
-                        errdefer allocator.free(err);
+                        const err_json = try tool_error.errorToJson("PermissionDenied", "user declined '{s}' via prompt", .{tu.name}, allocator);
+                        errdefer allocator.free(err_json);
                         try result_blocks.append(allocator, .{ .tool_result = .{
                             .tool_use_id = try allocator.dupe(u8, tu.id),
-                            .content = err,
+                            .content = err_json,
                             .is_error = true,
                         } });
                         continue;
@@ -231,29 +310,48 @@ pub fn run(
 
             // 派发到工具
             const tool = tools_mod.getTool(tu.name) orelse {
-                const err = try std.fmt.allocPrint(allocator, "unknown tool: {s}", .{tu.name});
-                errdefer allocator.free(err);
+                log.warnId("agent", rid, "unknown tool: {s}", .{tu.name});
+                const err_json = try tool_error.errorToJson("UnknownTool", "no tool named '{s}' is registered", .{tu.name}, allocator);
+                errdefer allocator.free(err_json);
                 try result_blocks.append(allocator, .{ .tool_result = .{
                     .tool_use_id = try allocator.dupe(u8, tu.id),
-                    .content = err,
+                    .content = err_json,
                     .is_error = true,
                 } });
                 continue;
             };
 
+            log.infoId("agent", rid, "tool.exec start name={s} id={s}", .{ tu.name, tu.id });
+            log.debugId("agent", rid, "tool.exec input={s}", .{tu.input});
+            const t_start = util_time.nowMs();
             const exec_result = blk: {
-                const tool_ctx = tools_mod.ToolContext{ .allocator = allocator, .abort = opts.abort };
+                const tool_ctx = tools_mod.ToolContext{
+                    .allocator = allocator,
+                    .abort = opts.abort,
+                    .read_state = opts.read_state,
+                    .jobs = opts.jobs,
+                    .permission_ctx = @constCast(permission_ctx),
+                    .plan_prev_mode = opts.plan_prev_mode,
+                    .tasks = opts.tasks,
+                    .api_client = opts.api_client,
+                    .tool_defs = opts.tool_defs,
+                    .agent_depth = opts.agent_depth,
+                };
                 break :blk tool.execute(&tool_ctx, tu.input);
             } catch |err| {
-                const msg_str = try std.fmt.allocPrint(allocator, "tool error: {s}", .{@errorName(err)});
-                errdefer allocator.free(msg_str);
+                log.warnId("agent", rid, "tool.exec FAILED name={s} err={s} duration_ms={d}", .{ tu.name, @errorName(err), util_time.nowMs() - t_start });
+                const err_json = try tool_error.errorToJson(@errorName(err), "{s} failed with {s}", .{ tu.name, @errorName(err) }, allocator);
+                errdefer allocator.free(err_json);
                 try result_blocks.append(allocator, .{ .tool_result = .{
                     .tool_use_id = try allocator.dupe(u8, tu.id),
-                    .content = msg_str,
+                    .content = err_json,
                     .is_error = true,
                 } });
                 continue;
             };
+
+            log.infoId("agent", rid, "tool.exec done name={s} output_bytes={d} duration_ms={d}", .{ tu.name, exec_result.len, util_time.nowMs() - t_start });
+            log.debugId("agent", rid, "tool.exec output={s}", .{exec_result});
 
             try result_blocks.append(allocator, .{ .tool_result = .{
                 .tool_use_id = try allocator.dupe(u8, tu.id),

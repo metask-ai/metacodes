@@ -33,6 +33,8 @@ pub const SubagentResult = struct {
 pub const SpawnOptions = struct {
     max_turns: u32 = 20,
     system_prompt: ?[]const u8 = null,
+    /// 嵌套深度。Agent 工具 spawn 时传 parent_depth+1。
+    agent_depth: u8 = 1,
 };
 
 pub fn spawnAgent(
@@ -59,6 +61,9 @@ pub fn spawnAgent(
             .max_turns = opts.max_turns,
             .system_prompt = opts.system_prompt,
             .abort = abort,
+            .api_client = api_client,
+            .tool_defs = tool_defs,
+            .agent_depth = opts.agent_depth,
         },
         &sink,
         allocator,

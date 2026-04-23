@@ -13,6 +13,25 @@ pub const MessagesRequest = struct {
     stream: bool = false,
     tools: ?[]const ToolDefinition = null,
     tool_choice: ?ToolChoice = null,
+    /// Prompt caching：顶层 cache_control 自动缓存"最后一个可缓存 block"——
+    /// 在常见用法下（稳定的 system + tools + 变化的 conversation）会把 tools + system
+    /// 一起写 cache。后续请求只要 prefix（tools + system）字节相同就 read cache，
+    /// 约省 70-90% 输入 token 费用 + 显著降低延迟。
+    ///
+    /// 默认开启：对绝大多数 coding agent 用例都是净收益。
+    /// 禁用场景：system 或 tools 每次请求都变（模型不会碰到——本客户端 tools 注册表静态、
+    /// system 在 session 生命周期不变）。
+    ///
+    /// 关键前提：prefix 不能含时间戳/UUID 等易变内容。本客户端的 system prompt 和
+    /// tool schema 都是常量，天然满足。
+    cache_control: ?CacheControl = .{ .type = "ephemeral" },
+};
+
+pub const CacheControl = struct {
+    type: []const u8 = "ephemeral",
+    /// 可选 TTL："5m"（默认）或 "1h"。1h 写入成本 2x（vs 5m 的 1.25x），
+    /// 但跨长间隔仍可读——适合低频请求。默认 null = 5m。
+    ttl: ?[]const u8 = null,
 };
 
 pub const ToolChoice = struct {
@@ -24,6 +43,10 @@ pub const ToolDefinition = struct {
     name: []const u8,
     description: []const u8,
     input_schema: InputSchema,
+    /// Anthropic server tools（web_search_20250305 / code_execution_20250825 等）需要
+    /// 在 JSON 里输出 "type" 字段，而不带 description/input_schema。非 null 时切换到
+    /// server-tool 序列化路径。
+    server_type: ?[]const u8 = null,
 };
 
 pub const InputSchema = struct {
@@ -59,6 +82,16 @@ pub fn serializeMessagesRequest(req: MessagesRequest, allocator: std.mem.Allocat
     if (req.tools) |tools| {
         try result.appendSlice(allocator, ",\"tools\":");
         try serializeTools(tools, &result, allocator);
+    }
+
+    if (req.cache_control) |cc| {
+        try result.appendSlice(allocator, ",\"cache_control\":{\"type\":");
+        try util_json.serializeString(cc.type, &result, allocator);
+        if (cc.ttl) |ttl| {
+            try result.appendSlice(allocator, ",\"ttl\":");
+            try util_json.serializeString(ttl, &result, allocator);
+        }
+        try result.append(allocator, '}');
     }
 
     try result.append(allocator, '}');
@@ -124,12 +157,20 @@ fn serializeTools(tools: []const ToolDefinition, buf: *std.ArrayList(u8), alloca
     for (tools, 0..) |tool, i| {
         if (i > 0) try buf.append(allocator, ',');
         try buf.append(allocator, '{');
-        try buf.appendSlice(allocator, "\"name\":");
-        try util_json.serializeString(tool.name, buf, allocator);
-        try buf.appendSlice(allocator, ",\"description\":");
-        try util_json.serializeString(tool.description, buf, allocator);
-        try buf.appendSlice(allocator, ",\"input_schema\":");
-        try serializeInputSchema(tool.input_schema, buf, allocator);
+        if (tool.server_type) |st| {
+            // Server tool 形态：{"type":"web_search_20250305","name":"web_search"}
+            try buf.appendSlice(allocator, "\"type\":");
+            try util_json.serializeString(st, buf, allocator);
+            try buf.appendSlice(allocator, ",\"name\":");
+            try util_json.serializeString(tool.name, buf, allocator);
+        } else {
+            try buf.appendSlice(allocator, "\"name\":");
+            try util_json.serializeString(tool.name, buf, allocator);
+            try buf.appendSlice(allocator, ",\"description\":");
+            try util_json.serializeString(tool.description, buf, allocator);
+            try buf.appendSlice(allocator, ",\"input_schema\":");
+            try serializeInputSchema(tool.input_schema, buf, allocator);
+        }
         try buf.append(allocator, '}');
     }
     try buf.append(allocator, ']');
@@ -139,6 +180,10 @@ fn serializeInputSchema(schema: InputSchema, buf: *std.ArrayList(u8), allocator:
     try buf.append(allocator, '{');
     try buf.appendSlice(allocator, "\"type\":");
     try util_json.serializeString(schema.type, buf, allocator);
+    // OpenAI-compat JSON Schema 校验器要求 object schema **总是**带 "properties"。
+    // Anthropic native API 对 null properties 是宽容的，但 napi.origintask.cn 这类兼容
+    // 层会返 400 "object schema missing properties"。无参数工具序列化为 "properties":{}
+    // 才能两边都接受。
     if (schema.properties) |props| {
         try buf.appendSlice(allocator, ",\"properties\":{");
         var first = true;
@@ -151,6 +196,8 @@ fn serializeInputSchema(schema: InputSchema, buf: *std.ArrayList(u8), allocator:
             try serializeJsonValue(entry.value_ptr.*, buf, allocator);
         }
         try buf.append(allocator, '}');
+    } else {
+        try buf.appendSlice(allocator, ",\"properties\":{}");
     }
     if (schema.required) |req| {
         try buf.appendSlice(allocator, ",\"required\":[");
@@ -284,4 +331,56 @@ test "serializeMessagesRequest escapes special chars in text" {
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\\\"") != null);
+}
+
+test "serializeMessagesRequest includes cache_control by default" {
+    const msg = types.ApiMessage{ .role = .user, .content = &.{.{ .text = "hi" }} };
+    const req = MessagesRequest{ .model = "m", .messages = &.{msg} };
+    const body = try serializeMessagesRequest(req, std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"cache_control\":{\"type\":\"ephemeral\"}") != null);
+}
+
+test "serializeMessagesRequest cache_control with ttl" {
+    const msg = types.ApiMessage{ .role = .user, .content = &.{.{ .text = "hi" }} };
+    const req = MessagesRequest{
+        .model = "m",
+        .messages = &.{msg},
+        .cache_control = .{ .type = "ephemeral", .ttl = "1h" },
+    };
+    const body = try serializeMessagesRequest(req, std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"ttl\":\"1h\"") != null);
+}
+
+test "serializeMessagesRequest no cache_control when disabled" {
+    const msg = types.ApiMessage{ .role = .user, .content = &.{.{ .text = "hi" }} };
+    const req = MessagesRequest{ .model = "m", .messages = &.{msg}, .cache_control = null };
+    const body = try serializeMessagesRequest(req, std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "cache_control") == null);
+}
+
+test "serializeInputSchema emits empty properties for zero-arg tool" {
+    // Regression: OpenAI-compat layers (napi.origintask.cn 等) 对缺失 "properties" 的 object
+    // schema 返 HTTP 400 "object schema missing properties"。本测试锁定行为：
+    // 即便 properties=null（无命名参数），序列化输出也要带 "properties":{}。
+    const schema = InputSchema{ .type = "object", .properties = null, .required = &.{} };
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try serializeInputSchema(schema, &buf, std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"properties\":{}") != null);
+}
+
+test "serializeInputSchema with required fields still emits properties" {
+    // 另一个常见 case：required=["taskId"] 但我们的 InputSchema 没定义
+    // properties map。OpenAI 兼容层对这种"声明 required 字段但没在 properties 里"本来
+    // 就会抱怨——那是另一个 bug；这里至少保证 properties 字段存在，不漏出 schema-missing
+    // properties 的 400。
+    const schema = InputSchema{ .type = "object", .properties = null, .required = &.{"taskId"} };
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try serializeInputSchema(schema, &buf, std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"properties\":{}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"required\":[\"taskId\"]") != null);
 }

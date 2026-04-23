@@ -4,19 +4,31 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const module = b.createModule(.{
+    // 固定产出两个二进制：metacodes (ReleaseSmall) 和 metacodes-debug (Debug)。
+    // 不受 -Doptimize 影响，一次 build 同时得到发布版和调试版。
+    const release_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = .ReleaseSmall,
         .link_libc = true,
     });
-
     const exe = b.addExecutable(.{
         .name = "metacodes",
-        .root_module = module,
+        .root_module = release_mod,
     });
-
     b.installArtifact(exe);
+
+    const debug_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = .Debug,
+        .link_libc = true,
+    });
+    const debug_exe = b.addExecutable(.{
+        .name = "metacodes-debug",
+        .root_module = debug_mod,
+    });
+    b.installArtifact(debug_exe);
 
     // mock MCP server 二进制：测试专用，不 install。
     const mock_mcp_mod = b.createModule(.{
@@ -31,11 +43,18 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(mock_mcp_exe);
 
-    const run_step = b.step("run", "Run the app");
+    const run_step = b.step("run", "Run the release app");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
     if (b.args) |args| {
         run_cmd.addArgs(args);
+    }
+
+    const run_debug_step = b.step("run-debug", "Run the debug app");
+    const run_debug_cmd = b.addRunArtifact(debug_exe);
+    run_debug_step.dependOn(&run_debug_cmd.step);
+    if (b.args) |args| {
+        run_debug_cmd.addArgs(args);
     }
 
     const test_step = b.step("test", "Run tests");

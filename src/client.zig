@@ -8,19 +8,30 @@ const Catalog = @import("api/catalog.zig").Catalog;
 const AbortSignal = @import("util/abort.zig").AbortSignal;
 
 pub const VERSION = "0.1.0";
-pub const ANTHROPIC_API_URL = "https://napi.origintask.cn/v1/messages";
+pub const ANTHROPIC_API_URL = "http://napi.origintask.cn:8189/v1/messages";
 pub const ANTHROPIC_AUTH_TOKEN = "";
 
 /// HTTP 请求结果
 const RequestResult = union(enum) {
-    full_body: []u8,
+    full_body: struct {
+        body: []u8,
+        id: log.RequestId,
+    },
     streaming_response: StreamResult,
 };
 
 /// 流式响应（持有 Response，caller 通过它逐行读取）
+///
+/// **生命周期陷阱**：`http.Client.Response` 内含 `request: *Request`，指向发起
+/// 请求的 Request 实例。Request 必须在整个 stream 读取过程中存活。我们原先把
+/// `var req` 直接塞进 StreamResult 按值返回，这让 `*Request` 悬挂到已 pop 的栈帧上；
+/// debug 栈 0xaa 填充偶尔能活，ReleaseSmall 下紧凑栈 reuse 必炸。
+/// 修法：Request 放 heap，StreamResult 持有 owned `*Request`，deinit 时 destroy。
 pub const StreamResult = struct {
+    request: *http.Client.Request,
     response: http.Client.Response,
     transfer_buf: [8192]u8,
+    id: log.RequestId,
 };
 
 /// API 客户端
@@ -94,7 +105,7 @@ pub const Client = struct {
         }) catch return error.RequestFailed;
         defer req.deinit();
 
-        req.sendBodyComplete(@constCast("")) catch return error.RequestFailed;
+        req.sendBodiless() catch return error.RequestFailed;
         var redirect_buf: [4096]u8 = undefined;
         const http_response = req.receiveHead(&redirect_buf) catch return error.RequestFailed;
         if (http_response.head.status != .ok) return error.HttpError;
@@ -123,9 +134,10 @@ pub const Client = struct {
 
         const result = try client.doRequest(req_body, false);
         switch (result) {
-            .full_body => |body| {
-                defer client.allocator.free(body);
-                return try parseApiResponse(body, client.allocator);
+            .full_body => |fb| {
+                defer client.allocator.free(fb.body);
+                log.debugId("client", fb.id, "response body ({d} bytes):\n{s}", .{ fb.body.len, fb.body });
+                return try parseApiResponse(fb.body, client.allocator);
             },
             .streaming_response => unreachable,
         }
@@ -169,73 +181,175 @@ pub const Client = struct {
     }
 
     fn doRequest(client: *Client, body: []const u8, streaming: bool) !RequestResult {
-        const uri = std.Uri.parse(ANTHROPIC_API_URL) catch return error.InvalidUrl;
+        const rid = log.genRequestId();
+        const t_start = timestampMs();
+
+        // token preview：前 6 + 后 4 字符，中间打码。日志不能全量打 token。
+        var tok_prev_buf: [24]u8 = undefined;
+        const tok_preview = tokenPreview(client.api_key, &tok_prev_buf);
+        log.infoId("client", rid, "POST {s} model={s} streaming={} token={s} body_bytes={d}", .{
+            ANTHROPIC_API_URL,
+            client.model,
+            streaming,
+            tok_preview,
+            body.len,
+        });
+        log.debugId("client", rid, "request body:\n{s}", .{body});
+
+        const uri = std.Uri.parse(ANTHROPIC_API_URL) catch {
+            log.errId("client", rid, "invalid url", .{});
+            return error.InvalidUrl;
+        };
 
         // 构建 authorization header
         var auth_header_buf: [128]u8 = undefined;
-        const auth_header = std.fmt.bufPrint(&auth_header_buf, "Bearer {s}", .{client.api_key}) catch return error.RequestFailed;
+        const auth_header = std.fmt.bufPrint(&auth_header_buf, "Bearer {s}", .{client.api_key}) catch {
+            log.errId("client", rid, "auth header buffer too small", .{});
+            return error.RequestFailed;
+        };
 
-        var req = client.http_client.request(.POST, uri, .{
+        // Request 必须 heap-allocate：Response 内含 *Request，生命周期要覆盖 stream
+        // 读取过程。若放栈上，doRequest 返回后 *Request 悬挂 → stream.next() 踩到
+        // 新栈内容 segfault（ReleaseSmall 紧凑栈 reuse 下必炸）。
+        const req_ptr = client.allocator.create(http.Client.Request) catch |err| {
+            log.errId("client", rid, "alloc request: {s}", .{@errorName(err)});
+            return error.RequestFailed;
+        };
+        errdefer client.allocator.destroy(req_ptr);
+
+        req_ptr.* = client.http_client.request(.POST, uri, .{
             .extra_headers = &.{
                 .{ .name = "anthropic-version", .value = "2023-06-01" },
                 .{ .name = "content-type", .value = "application/json" },
                 .{ .name = "authorization", .value = auth_header },
             },
-        }) catch return error.RequestFailed;
+        }) catch |err| {
+            log.errId("client", rid, "request setup failed: {s}", .{@errorName(err)});
+            return error.RequestFailed;
+        };
+        // errdefer 销毁顺序：先 req.deinit()（释放连接/缓冲），再 destroy 槽位。
+        errdefer req_ptr.deinit();
 
         // 发送 body
-        req.sendBodyComplete(@constCast(body)) catch return error.RequestFailed;
+        req_ptr.sendBodyComplete(@constCast(body)) catch |err| {
+            log.errId("client", rid, "sendBody failed: {s}", .{@errorName(err)});
+            return error.RequestFailed;
+        };
 
         // 读取响应头
         var redirect_buf: [4096]u8 = undefined;
-        const http_response = req.receiveHead(&redirect_buf) catch return error.RequestFailed;
+        const http_response = req_ptr.receiveHead(&redirect_buf) catch |err| {
+            log.errId("client", rid, "receiveHead failed: {s}", .{@errorName(err)});
+            return error.RequestFailed;
+        };
 
         const status = http_response.head.status;
+        const header_ms = timestampMs() - t_start;
+        log.infoId("client", rid, "HTTP {d} {s} header_latency_ms={d}", .{
+            @intFromEnum(status),
+            @tagName(status),
+            header_ms,
+        });
+
         switch (status) {
             .ok => {},
             .unauthorized => {
-                req.deinit();
+                req_ptr.deinit();
+                client.allocator.destroy(req_ptr);
                 return error.Unauthorized;
             },
             .too_many_requests => {
-                req.deinit();
+                req_ptr.deinit();
+                client.allocator.destroy(req_ptr);
                 return error.RateLimited;
             },
             .internal_server_error => {
-                req.deinit();
+                req_ptr.deinit();
+                client.allocator.destroy(req_ptr);
                 return error.ServerError;
             },
             .bad_gateway => {
-                req.deinit();
+                req_ptr.deinit();
+                client.allocator.destroy(req_ptr);
                 return error.BadGateway;
             },
             .service_unavailable => {
-                req.deinit();
+                req_ptr.deinit();
+                client.allocator.destroy(req_ptr);
                 return error.ServiceUnavailable;
             },
             else => {
-                req.deinit();
+                // 4xx/other：读 body 进 log 便于 debug。否则用户只看到 "HttpError"，
+                // 不知道是 model 名错、字段不识别、还是 API key 过期。
+                var err_body: [2048]u8 = undefined;
+                const body_reader_tmp = req_ptr.reader.bodyReader(
+                    err_body[0..],
+                    http_response.head.transfer_encoding,
+                    http_response.head.content_length,
+                );
+                const n = body_reader_tmp.readSliceShort(err_body[0..]) catch 0;
+                const preview = err_body[0..@min(n, err_body.len)];
+                log.errId("client", rid, "HTTP {d} {s}: body={s}", .{
+                    @intFromEnum(status), @tagName(status), preview,
+                });
+                req_ptr.deinit();
+                client.allocator.destroy(req_ptr);
                 return error.HttpError;
             },
         }
 
         if (streaming) {
+            // 所有权转给调用方：StreamResult.request 拥有 req_ptr，StreamResponse.deinit
+            // 负责 req_ptr.deinit() + destroy。
             return RequestResult{
                 .streaming_response = .{
+                    .request = req_ptr,
                     .response = http_response,
                     .transfer_buf = undefined,
+                    .id = rid,
                 },
             };
         }
 
-        // 非流式：读取完整 body
+        // 非流式：读取完整 body；结束后立即 deinit+destroy req_ptr（不再返回）
         var transfer_buf: [8192]u8 = undefined;
-        const body_reader = req.reader.bodyReader(&transfer_buf, http_response.head.transfer_encoding, http_response.head.content_length);
-        const response_body = body_reader.allocRemaining(client.allocator, std.Io.Limit.limited(1024 * 1024)) catch return error.RequestFailed;
-        req.deinit();
-        return RequestResult{ .full_body = response_body };
+        const body_reader = req_ptr.reader.bodyReader(&transfer_buf, http_response.head.transfer_encoding, http_response.head.content_length);
+        const response_body = body_reader.allocRemaining(client.allocator, std.Io.Limit.limited(1024 * 1024)) catch |err| {
+            log.errId("client", rid, "read body failed: {s}", .{@errorName(err)});
+            req_ptr.deinit();
+            client.allocator.destroy(req_ptr);
+            return error.RequestFailed;
+        };
+        req_ptr.deinit();
+        client.allocator.destroy(req_ptr);
+        log.infoId("client", rid, "response complete bytes={d} total_ms={d}", .{ response_body.len, timestampMs() - t_start });
+        return RequestResult{ .full_body = .{ .body = response_body, .id = rid } };
     }
 };
+
+/// 毫秒时间戳（monotonic），用于测量请求延迟。失败返 0。
+fn timestampMs() u64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) return 0;
+    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
+}
+
+/// Token 打码：只露前 6 + 后 4 字符（常见格式 `sk-xxxxxxxx...yyyy`）。
+/// 过短的 token 直接打 "<short:N>"。out buf 至少 24 字节。
+fn tokenPreview(token: []const u8, out: []u8) []const u8 {
+    if (token.len < 12) {
+        return std.fmt.bufPrint(out, "<short:{d}>", .{token.len}) catch "<?>";
+    }
+    const head = token[0..6];
+    const tail = token[token.len - 4 ..];
+    return std.fmt.bufPrint(out, "{s}...{s}", .{ head, tail }) catch "<?>";
+}
+
+test "tokenPreview masks middle" {
+    var buf: [24]u8 = undefined;
+    try std.testing.expectEqualStrings("sk-6cd...3711", tokenPreview("sk-test-redacted", &buf));
+    try std.testing.expectEqualStrings("<short:4>", tokenPreview("abcd", &buf));
+}
 
 /// API 响应（非流式）
 pub const ApiResponse = struct {
@@ -261,17 +375,22 @@ pub const StreamResponse = struct {
     iter_initialized: bool = false,
     abort: ?*const AbortSignal = null,
     done: bool = false,
+    /// 本次流式请求的 request_id，所有下游（stream event、agent loop、工具调用）
+    /// 用它把日志串起来。
+    id: log.RequestId,
 
     fn init(allocator: std.mem.Allocator, sr: StreamResult, abort: ?*const AbortSignal) StreamResponse {
         return .{
             .allocator = allocator,
             .stream_result = sr,
             .abort = abort,
+            .id = sr.id,
         };
     }
 
     pub fn deinit(self: *StreamResponse) void {
-        self.stream_result.response.request.deinit();
+        self.stream_result.request.deinit();
+        self.allocator.destroy(self.stream_result.request);
     }
 
     /// 读下一个事件。首次调用时懒初始化 EventIterator——Response.reader 的返回是一个
@@ -285,13 +404,17 @@ pub const StreamResponse = struct {
                 api_stream.EventIterator.initWithAbort(reader, a)
             else
                 api_stream.EventIterator.init(reader);
+            self.event_iter.setRequestId(self.id);
             self.iter_initialized = true;
         }
 
         const ev_opt = self.event_iter.next(self.allocator) catch |err| switch (err) {
-            error.Aborted => return error.Aborted,
+            error.Aborted => {
+                log.warnId("stream", self.id, "aborted during event read", .{});
+                return error.Aborted;
+            },
             else => {
-                log.warn("stream", "event_iter.next failed: {s}", .{@errorName(err)});
+                log.warnId("stream", self.id, "event_iter.next failed: {s}", .{@errorName(err)});
                 return error.RequestFailed;
             },
         };
@@ -302,6 +425,7 @@ pub const StreamResponse = struct {
         return switch (ev) {
             .text_delta => |t| StreamEvent{ .text = t },
             .tool_use_start => |tu| StreamEvent{ .tool_use_start = tu },
+            .usage => |u| StreamEvent{ .usage = u },
             .done => blk: {
                 self.done = true;
                 break :blk StreamEvent{ .done = {} };
@@ -313,6 +437,7 @@ pub const StreamResponse = struct {
 pub const StreamEvent = union(enum) {
     text: []u8,
     tool_use_start: json_mod.ToolUseResult,
+    usage: api_stream.UsageDelta,
     done: void,
 };
 
@@ -459,12 +584,21 @@ pub fn withRetry(
 
     var retries: u32 = 0;
     while (true) : (retries += 1) {
-        if (retries >= max_retries) return error.MaxRetriesExceeded;
+        if (retries >= max_retries) {
+            log.err("client", "max retries ({d}) exceeded", .{max_retries});
+            return error.MaxRetriesExceeded;
+        }
 
         const result = client.sendMessage(messages, system, tools);
         switch (result) {
-            error.RateLimited, error.ServerError, error.BadGateway, error.ServiceUnavailable => {
-                const delay_ms = @as(u64, 1000) * (1 << @min(retries, 5));
+            error.RateLimited, error.ServerError, error.BadGateway, error.ServiceUnavailable => |err| {
+                const delay_ms = @as(u64, 1000) * (@as(u64, 1) << @min(@as(u6, @intCast(retries)), 5));
+                log.warn("client", "retry {d}/{d} after {s}; sleeping {d}ms", .{
+                    retries + 1,
+                    max_retries,
+                    @errorName(err),
+                    delay_ms,
+                });
                 std.time.sleep(delay_ms * std.time.ns_per_ms);
                 continue;
             },
@@ -513,4 +647,15 @@ test "estimateTokens" {
     try std.testing.expect(estimateTokens("hello world") > 0);
     try std.testing.expect(estimateTokens("你好") == 2); // 2 CJK codepoints
     try std.testing.expect(estimateTokens("") == 0);
+}
+
+// Regression: GET /v1/models 必须用 sendBodiless()；std.http 对带 body 的 GET 会 assert。
+// 有人把 sendBodiless 改回 sendBodyComplete("")，离线 probeModels 会 panic（非 error）。
+// 源码扫描级断言兜底：测试读自己的源文件，确保关键行不退化。
+test "doGetModels uses sendBodiless (no sendBodyComplete on GET)" {
+    const src = @embedFile("client.zig");
+    // 确认函数里有 sendBodiless 调用
+    try std.testing.expect(std.mem.indexOf(u8, src, "req.sendBodiless()") != null);
+    // 确认没人回退到 sendBodyComplete("") 模式
+    try std.testing.expect(std.mem.indexOf(u8, src, "sendBodyComplete(@constCast(\"\"))") == null);
 }

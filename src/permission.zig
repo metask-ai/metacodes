@@ -10,6 +10,7 @@ const category_mod = @import("permission/category.zig");
 const decision_mod = @import("permission/decision.zig");
 const prompt_mod = @import("permission/prompt.zig");
 const rule_mod = @import("permission/rule.zig");
+const rule_matcher_mod = @import("permission/rule_matcher.zig");
 
 // --- 旧 API 重导出 ---
 
@@ -18,11 +19,15 @@ pub const ToolCategory = category_mod.ToolCategory;
 pub const RiskLevel = category_mod.RiskLevel;
 pub const getToolCategory = category_mod.getToolCategory;
 pub const getRiskLevel = category_mod.getRiskLevel;
+pub const RuleSet = rule_matcher_mod.RuleSet;
+pub const Rule = rule_matcher_mod.Rule;
 
 /// 旧版 PermissionContext。新 decision.Context 更简洁，但此处保留字段兼容 agent_loop。
 pub const PermissionContext = struct {
     mode: types.PermissionMode,
     allocator: std.mem.Allocator,
+    /// 可选的细粒度规则集；null 时只靠四模式兜底。
+    rules: ?*const rule_matcher_mod.RuleSet = null,
 };
 
 pub fn createContext(mode: types.PermissionMode, allocator: std.mem.Allocator) PermissionContext {
@@ -30,7 +35,7 @@ pub fn createContext(mode: types.PermissionMode, allocator: std.mem.Allocator) P
 }
 
 pub fn checkPermission(ctx: *const PermissionContext, tool_name: []const u8, args: []const u8) PermissionResult {
-    const d_ctx = decision_mod.Context{ .mode = ctx.mode };
+    const d_ctx = decision_mod.Context{ .mode = ctx.mode, .rules = ctx.rules };
     return decision_mod.check(&d_ctx, tool_name, args);
 }
 

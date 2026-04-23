@@ -1,16 +1,25 @@
 const std = @import("std");
+const log = @import("../util/log.zig");
+const shell_lex = @import("shell_lex.zig");
 
 /// 路径安全：包含 `..` 视为目录遍历攻击，拒绝。
 ///
 /// 注意：这是最小检查。未来沙箱方案会替换为 realpath + 白名单根 + landlock/openat2 RESOLVE_BENEATH。
 pub fn validateNoTraversal(path: []const u8) error{PathTraversal}!void {
-    if (std.mem.indexOf(u8, path, "..") != null) return error.PathTraversal;
+    if (std.mem.indexOf(u8, path, "..") != null) {
+        log.warn("security", "path traversal blocked: {s}", .{path});
+        return error.PathTraversal;
+    }
 }
 
-/// Bash 危险命令黑名单（唯一事实源）。
+/// Bash 危险命令检查。用 shell-aware tokenizer（阶段 7.4）替代之前的 substring 粗检。
 ///
-/// 命中任一 pattern（substring 匹配）视为危险命令，拒绝执行。
-/// 未来沙箱方案会替换为细粒度能力控制（seccomp allowlist）+ shell parser。
+/// 详情见 shell_lex.zig。本函数仅 re-export 保持调用者 API 不变。
+pub fn validateBashCommand(command: []const u8) error{DangerousCommand}!void {
+    return shell_lex.validate(command);
+}
+
+// 保留以便历史测试继续通过；新代码不要用
 pub const DANGER_PATTERNS = [_][]const u8{
     "rm -rf /",
     "rm -rf ~",
@@ -24,13 +33,6 @@ pub const DANGER_PATTERNS = [_][]const u8{
     "eval(",
     "chmod -R 777",
 };
-
-/// 检查命令是否命中危险黑名单，命中返回 `error.DangerousCommand`。
-pub fn validateBashCommand(command: []const u8) error{DangerousCommand}!void {
-    for (DANGER_PATTERNS) |pattern| {
-        if (std.mem.indexOf(u8, command, pattern) != null) return error.DangerousCommand;
-    }
-}
 
 test "validateNoTraversal accepts safe path" {
     try validateNoTraversal("/etc/hostname");

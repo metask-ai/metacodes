@@ -48,6 +48,11 @@ var g_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
 var g_log_file_fd: ?std.c.fd_t = null;
 var g_initialized: bool = false;
 
+/// request_id 递增计数器。首次生成时用进程启动时间做高位，保证不同进程不撞。
+/// 16-hex-char 字符串，格式 {seed16:x}{seq8:x}，seed 取 clock_gettime 低 32 位。
+var g_reqid_seed: u32 = 0;
+var g_reqid_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
 fn lock() void {
     _ = std.c.pthread_mutex_lock(&g_mutex);
 }
@@ -80,6 +85,17 @@ pub fn initFromEnv() void {
         if (fd >= 0) {
             g_log_file_fd = fd;
         }
+    }
+
+    // 为 request_id 生成 seed：用 monotonic 时钟 sec ^ nsec 截到 u32。
+    // 不追求密码学强度，只是让不同进程启动的日志 id 前缀不同，便于 grep。
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) == 0) {
+        const sec: u64 = @bitCast(@as(i64, ts.sec));
+        const nsec: u64 = @bitCast(@as(i64, ts.nsec));
+        g_reqid_seed = @truncate(sec ^ nsec);
+    } else {
+        g_reqid_seed = 0xDEADBEEF;
     }
     unlock();
 
@@ -149,16 +165,21 @@ fn effectiveLevel(module: []const u8) Level {
 }
 
 /// 日志核心：格式化、串行写 stderr 和可选文件。
-fn logImpl(level: Level, module: []const u8, comptime fmt: []const u8, args: anytype) void {
+fn logImpl(level: Level, module: []const u8, id: ?RequestId, comptime fmt: []const u8, args: anytype) void {
     if (!g_initialized) initFromEnv();
     if (@intFromEnum(level) < @intFromEnum(effectiveLevel(module))) return;
 
     lock();
     defer unlock();
 
-    // 固定格式：[LEVEL module] msg
-    var buf: [4096]u8 = undefined;
-    const prefix = std.fmt.bufPrint(&buf, "{s}[{s} {s}]\x1b[0m ", .{
+    // 固定格式：[LEVEL module req=xxx] msg（req 段仅在 id 非空时出现）
+    var buf: [8192]u8 = undefined;
+    const prefix = if (id) |rid| std.fmt.bufPrint(&buf, "{s}[{s} {s} req={s}]\x1b[0m ", .{
+        level.ansiColor(),
+        level.name(),
+        module,
+        rid.asSlice(),
+    }) catch return else std.fmt.bufPrint(&buf, "{s}[{s} {s}]\x1b[0m ", .{
         level.ansiColor(),
         level.name(),
         module,
@@ -200,16 +221,59 @@ fn writeAll(fd: std.c.fd_t, bytes: []const u8) void {
 // ============================================================================
 
 pub fn debug(module: []const u8, comptime fmt: []const u8, args: anytype) void {
-    logImpl(.debug, module, fmt, args);
+    logImpl(.debug, module, null, fmt, args);
 }
 pub fn info(module: []const u8, comptime fmt: []const u8, args: anytype) void {
-    logImpl(.info, module, fmt, args);
+    logImpl(.info, module, null, fmt, args);
 }
 pub fn warn(module: []const u8, comptime fmt: []const u8, args: anytype) void {
-    logImpl(.warn, module, fmt, args);
+    logImpl(.warn, module, null, fmt, args);
 }
 pub fn err(module: []const u8, comptime fmt: []const u8, args: anytype) void {
-    logImpl(.err, module, fmt, args);
+    logImpl(.err, module, null, fmt, args);
+}
+
+/// 带 request_id 的日志变体：与 debug/info/warn/err 同样级别，多一个 id 上下文。
+/// 用于 HTTP 请求生命周期、Agent turn、工具调用等需要把多条日志串起来的场景。
+pub fn debugId(module: []const u8, id: RequestId, comptime fmt: []const u8, args: anytype) void {
+    logImpl(.debug, module, id, fmt, args);
+}
+pub fn infoId(module: []const u8, id: RequestId, comptime fmt: []const u8, args: anytype) void {
+    logImpl(.info, module, id, fmt, args);
+}
+pub fn warnId(module: []const u8, id: RequestId, comptime fmt: []const u8, args: anytype) void {
+    logImpl(.warn, module, id, fmt, args);
+}
+pub fn errId(module: []const u8, id: RequestId, comptime fmt: []const u8, args: anytype) void {
+    logImpl(.err, module, id, fmt, args);
+}
+
+// ============================================================================
+// RequestId
+// ============================================================================
+
+/// 12-char hex 字符串，用于把一次 HTTP 请求（或 agent turn / 工具调用）的所有
+/// 日志串起来。格式：seed(4B hex=8 char) + seq(2B hex=4 char) = 12 字符。
+/// seq 每次 genRequestId 递增，保证同进程内不撞；seed 进程启动时取时钟低位，
+/// 让多进程的 id 前缀也大概率不同（够 grep 用，不是密码学 ID）。
+pub const RequestId = struct {
+    bytes: [12]u8,
+
+    pub fn asSlice(self: *const RequestId) []const u8 {
+        return self.bytes[0..];
+    }
+};
+
+/// 生成新 request id。线程安全。
+pub fn genRequestId() RequestId {
+    if (!g_initialized) initFromEnv();
+    const seq = g_reqid_seq.fetchAdd(1, .monotonic);
+    var id: RequestId = undefined;
+    // 写 seed (32bit => 8 hex)
+    _ = std.fmt.bufPrint(id.bytes[0..8], "{x:0>8}", .{g_reqid_seed}) catch unreachable;
+    // 写 seq 低 16 bit => 4 hex。超出 65535 次后 wrap，够用
+    _ = std.fmt.bufPrint(id.bytes[8..12], "{x:0>4}", .{@as(u16, @truncate(seq))}) catch unreachable;
+    return id;
 }
 
 // ============================================================================
@@ -251,4 +315,24 @@ test "logImpl is no-op when level too low" {
     debug("test", "should be filtered out: {d}", .{42});
     info("test", "also filtered: {s}", .{"x"});
     // error 会真写 stderr（但 bufPrint 失败不 panic）——测试不验证输出
+}
+
+test "RequestId unique and stable format" {
+    g_reqid_seed = 0xABCD_1234;
+    g_reqid_seq.store(0, .monotonic);
+
+    const a = genRequestId();
+    const b = genRequestId();
+    try testing.expectEqual(@as(usize, 12), a.bytes.len);
+    try testing.expectEqualStrings("abcd12340000", a.asSlice());
+    try testing.expectEqualStrings("abcd12340001", b.asSlice());
+}
+
+test "debugId smoke (does not panic)" {
+    g_default_level = .err;
+    g_module_filters = &.{};
+    const id = genRequestId();
+    debugId("test", id, "filtered debug {d}", .{7});
+    infoId("test", id, "filtered info {s}", .{"ok"});
+    warnId("test", id, "this writes", .{});
 }

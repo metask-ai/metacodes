@@ -1,5 +1,16 @@
 const std = @import("std");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
+const log = @import("../util/log.zig");
+const util_time = @import("../util/time.zig");
+
+/// nowMs：毫秒时间戳，复用 util/time.zig 的单一实现
+fn nowMs() util_time.Millis {
+    return util_time.nowMs();
+}
+
+/// Progress 事件回调：spawn 层每 2s 调一次，通知 TUI 当前命令还在跑。
+/// 为 null 时不调。全局钩子，简单起见用全局 pointer；可以被 repl/progress.zig 设置。
+pub var g_progress_cb: ?*const fn (elapsed_ms: u64, argv0: []const u8) void = null;
 
 /// 从 JSON 对象字符串提取字段值（纯手写解析，适配流式 partial JSON）
 ///
@@ -102,6 +113,9 @@ pub fn spawnCaptureStdoutAbortableTimed(
     abort: ?*const AbortSignal,
     timeout_ms: u64,
 ) ![]u8 {
+    logSpawnArgv(argv, timeout_ms);
+    const t_start = nowMs();
+
     var pipefd: [2]std.c.fd_t = undefined;
     if (std.c.pipe(&pipefd) != 0) return error.SpawnError;
 
@@ -109,6 +123,7 @@ pub fn spawnCaptureStdoutAbortableTimed(
     if (pid < 0) {
         _ = std.c.close(pipefd[0]);
         _ = std.c.close(pipefd[1]);
+        log.err("spawn", "fork failed", .{});
         return error.SpawnError;
     }
 
@@ -124,6 +139,8 @@ pub fn spawnCaptureStdoutAbortableTimed(
         std.c._exit(127);
     }
 
+    log.debug("spawn", "forked pid={d}", .{pid});
+
     // 父进程
     _ = std.c.close(pipefd[1]);
     // 父端也设一次 setpgid，避免竞态（子进程可能还没 setpgid）
@@ -136,7 +153,202 @@ pub fn spawnCaptureStdoutAbortableTimed(
     var status: c_int = 0;
     _ = std.c.waitpid(pid, &status, 0);
 
+    const dt_ms = nowMs() - t_start;
+    if (result) |out| {
+        log.debug("spawn", "pid={d} exit={d} stdout_bytes={d} duration_ms={d}", .{ pid, exitCode(status), out.len, dt_ms });
+    } else |err| {
+        log.warn("spawn", "pid={d} failed err={s} duration_ms={d}", .{ pid, @errorName(err), dt_ms });
+    }
+
     return result;
+}
+
+/// 把 argv 打印成可读形式，最多取前 N 个参数防止日志爆炸。
+fn logSpawnArgv(argv: []const ?[*:0]const u8, timeout_ms: u64) void {
+    var buf: [1024]u8 = undefined;
+    var written: usize = 0;
+    for (argv, 0..) |a_opt, idx| {
+        if (idx >= 8) {
+            const tail = " ...";
+            if (written + tail.len < buf.len) {
+                @memcpy(buf[written..][0..tail.len], tail);
+                written += tail.len;
+            }
+            break;
+        }
+        const a = a_opt orelse break;
+        const sp = std.mem.span(@as([*:0]const u8, a));
+        const need = if (idx == 0) sp.len else sp.len + 1;
+        if (written + need >= buf.len) break;
+        if (idx != 0) {
+            buf[written] = ' ';
+            written += 1;
+        }
+        @memcpy(buf[written..][0..sp.len], sp);
+        written += sp.len;
+    }
+    log.info("spawn", "exec argv=[{s}] timeout_ms={d}", .{ buf[0..written], timeout_ms });
+}
+
+fn exitCode(status: c_int) i32 {
+    // POSIX WEXITSTATUS 等价：(status >> 8) & 0xff；若被信号终止，返回 -signo
+    if ((status & 0x7f) == 0) return @as(i32, @intCast((status >> 8) & 0xff));
+    return -@as(i32, @intCast(status & 0x7f));
+}
+
+/// 带 stdout+stderr+exit_code 的子进程结果。调用方需 allocator.free(stdout) / free(stderr)。
+pub const SpawnOut = struct {
+    stdout: []u8,
+    stderr: []u8,
+    exit_code: i32,
+};
+
+/// spawn 子进程并同时捕获 stdout 和 stderr 到两个独立 buffer，返回 exit_code。
+/// 与 spawnCaptureStdoutAbortableTimed 语义一致（abort/timeout 行为、进程组、kill 策略相同），
+/// 区别只在于多了一条 stderr pipe。给 Bash tool 使用，让模型能看到错误信息。
+///
+/// timeout_ms == 0 无超时；>0 时超时返 error.Timeout（已发 kill）。abort 触发返 error.Aborted。
+pub fn spawnCaptureWithStderrTimed(
+    argv: []const ?[*:0]const u8,
+    allocator: std.mem.Allocator,
+    abort: ?*const AbortSignal,
+    timeout_ms: u64,
+) !SpawnOut {
+    logSpawnArgv(argv, timeout_ms);
+    const t_start = nowMs();
+
+    var out_pipe: [2]std.c.fd_t = undefined;
+    var err_pipe: [2]std.c.fd_t = undefined;
+    if (std.c.pipe(&out_pipe) != 0) return error.SpawnError;
+    if (std.c.pipe(&err_pipe) != 0) {
+        _ = std.c.close(out_pipe[0]);
+        _ = std.c.close(out_pipe[1]);
+        return error.SpawnError;
+    }
+
+    const pid = std.c.fork();
+    if (pid < 0) {
+        _ = std.c.close(out_pipe[0]);
+        _ = std.c.close(out_pipe[1]);
+        _ = std.c.close(err_pipe[0]);
+        _ = std.c.close(err_pipe[1]);
+        log.err("spawn", "fork failed", .{});
+        return error.SpawnError;
+    }
+
+    if (pid == 0) {
+        // 子进程
+        _ = std.c.setpgid(0, 0);
+        _ = std.c.close(out_pipe[0]);
+        _ = std.c.close(err_pipe[0]);
+        _ = std.c.dup2(out_pipe[1], 1);
+        _ = std.c.dup2(err_pipe[1], 2);
+        _ = std.c.close(out_pipe[1]);
+        _ = std.c.close(err_pipe[1]);
+
+        const argv0 = argv[0] orelse std.c._exit(127);
+        _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), &.{null});
+        std.c._exit(127);
+    }
+
+    log.debug("spawn", "forked pid={d} (stdout+stderr)", .{pid});
+
+    // 父进程
+    _ = std.c.close(out_pipe[1]);
+    _ = std.c.close(err_pipe[1]);
+    _ = std.c.setpgid(pid, pid);
+
+    const result = readTwoFdsAbortableTimed(out_pipe[0], err_pipe[0], allocator, pid, abort, timeout_ms);
+    _ = std.c.close(out_pipe[0]);
+    _ = std.c.close(err_pipe[0]);
+
+    var status: c_int = 0;
+    _ = std.c.waitpid(pid, &status, 0);
+    const ec = exitCode(status);
+
+    const dt_ms = nowMs() - t_start;
+    if (result) |r| {
+        log.debug("spawn", "pid={d} exit={d} stdout_bytes={d} stderr_bytes={d} duration_ms={d}", .{ pid, ec, r.stdout.len, r.stderr.len, dt_ms });
+        return .{ .stdout = r.stdout, .stderr = r.stderr, .exit_code = ec };
+    } else |err| {
+        log.warn("spawn", "pid={d} failed err={s} duration_ms={d}", .{ pid, @errorName(err), dt_ms });
+        return err;
+    }
+}
+
+const TwoBufs = struct { stdout: []u8, stderr: []u8 };
+
+/// 同时从两个 fd 读，直到都 EOF（或 abort/timeout 提前结束）。
+fn readTwoFdsAbortableTimed(
+    out_fd: std.c.fd_t,
+    err_fd: std.c.fd_t,
+    allocator: std.mem.Allocator,
+    pgid: std.c.pid_t,
+    abort: ?*const AbortSignal,
+    timeout_ms: u64,
+) !TwoBufs {
+    var buf: [4096]u8 = undefined;
+    var out_list = std.ArrayList(u8).empty;
+    errdefer out_list.deinit(allocator);
+    var err_list = std.ArrayList(u8).empty;
+    errdefer err_list.deinit(allocator);
+
+    var out_done = false;
+    var err_done = false;
+    const start_ms = nowMs();
+    var last_progress_ms = start_ms;
+    const progress_interval_ms: i64 = 2000;
+
+    while (!(out_done and err_done)) {
+        if (abort) |a| if (a.isAborted()) {
+            killGroup(pgid);
+            return error.Aborted;
+        };
+        const elapsed = nowMs() - start_ms;
+        if (timeout_ms > 0) {
+            if (elapsed >= @as(i64, @intCast(timeout_ms))) {
+                killGroup(pgid);
+                return error.Timeout;
+            }
+        }
+        // 每 2s 触发一次 progress（只在回调已设置时）
+        if (g_progress_cb) |cb| {
+            if (nowMs() - last_progress_ms >= progress_interval_ms) {
+                cb(@intCast(elapsed), "bash");
+                last_progress_ms = nowMs();
+            }
+        }
+
+        var pfds = [_]std.c.pollfd{
+            .{ .fd = if (out_done) -1 else out_fd, .events = std.c.POLL.IN, .revents = 0 },
+            .{ .fd = if (err_done) -1 else err_fd, .events = std.c.POLL.IN, .revents = 0 },
+        };
+        const poll_rc = std.c.poll(&pfds, 2, 100);
+        if (poll_rc < 0) return error.ReadError;
+        if (poll_rc == 0) continue;
+
+        if (!out_done) {
+            if ((pfds[0].revents & std.c.POLL.IN) != 0) {
+                const n = std.c.read(out_fd, &buf, buf.len);
+                if (n <= 0) out_done = true else try out_list.appendSlice(allocator, buf[0..@as(usize, @intCast(n))]);
+            } else if ((pfds[0].revents & (std.c.POLL.HUP | std.c.POLL.ERR)) != 0) {
+                out_done = true;
+            }
+        }
+        if (!err_done) {
+            if ((pfds[1].revents & std.c.POLL.IN) != 0) {
+                const n = std.c.read(err_fd, &buf, buf.len);
+                if (n <= 0) err_done = true else try err_list.appendSlice(allocator, buf[0..@as(usize, @intCast(n))]);
+            } else if ((pfds[1].revents & (std.c.POLL.HUP | std.c.POLL.ERR)) != 0) {
+                err_done = true;
+            }
+        }
+    }
+
+    return .{
+        .stdout = try out_list.toOwnedSlice(allocator),
+        .stderr = try err_list.toOwnedSlice(allocator),
+    };
 }
 
 /// 从 pipe 读，可被 abort 中断。abort 时 killpg 杀整组并返回 error.Aborted。
@@ -189,12 +401,6 @@ fn readAbortableTimed(
     }
 
     return try result.toOwnedSlice(allocator);
-}
-
-fn nowMs() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
-    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
 }
 
 /// 向整个进程组发 SIGTERM → 等 2s → SIGKILL。
