@@ -21,6 +21,7 @@ const agent_loop = @import("core/agent_loop.zig");
 const api_stream = @import("api/stream.zig");
 const JobRegistry = @import("core/job_registry.zig").JobRegistry;
 const TaskStore = @import("core/task_store.zig").TaskStore;
+const system_prompt_mod = @import("core/system_prompt.zig");
 
 pub const UsageTotals = struct {
     input_tokens: u64 = 0,
@@ -79,6 +80,8 @@ pub const App = struct {
     plan_prev_mode: ?types.PermissionMode = null,
     /// 模型长任务 scratchpad（Task* 工具共享）
     tasks: TaskStore,
+    /// 预构造的 system prompt（app 启动时一次性 build）。null = build 失败时降级为无 prompt。
+    system_prompt: ?[]u8 = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -130,6 +133,12 @@ pub const App = struct {
             break :blk null;
         };
 
+        // 构造 system prompt（依赖 config.model）。失败仅 log，保持 null。
+        app.system_prompt = system_prompt_mod.build(allocator, config.model) catch |err| blk: {
+            @import("util/log.zig").warn("sysprompt", "build failed: {s} (continuing without system prompt)", .{@errorName(err)});
+            break :blk null;
+        };
+
         return app;
     }
 
@@ -143,6 +152,7 @@ pub const App = struct {
         app.tasks.deinit();
         if (app.rule_set) |*r| r.deinit();
         if (app.jobs) |*j| j.deinit();
+        if (app.system_prompt) |s| app.allocator.free(s);
         app.allocator.destroy(app);
     }
 
