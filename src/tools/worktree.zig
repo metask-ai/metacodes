@@ -1,0 +1,252 @@
+//! Worktree 工具:在隔离 git worktree 中工作。
+//!
+//! 两个工具:
+//!   EnterWorktree(name?, path?, base?)
+//!     - 若提供 path:切换到该已存在的 worktree(必须在 `git worktree list` 中)
+//!     - 否则:在 .cc-zig/worktrees/<name|random>/ 创建新 worktree,基于 base 分支
+//!       (base 缺省 = 当前 default branch,简化为 HEAD)
+//!     - 进入 = chdir + 在 ToolContext 上把 worktree 状态推到一个栈
+//!     - 返回 JSON: {"worktree":"...","branch":"...","entered":true}
+//!
+//!   ExitWorktree(action, discard_changes?)
+//!     - action="keep": 仅 chdir 回 original_cwd,worktree 留盘
+//!     - action="remove":git worktree remove + chdir 回原
+//!     - discard_changes=true → 即使有未提交也强制 remove(否则 git 拒绝)
+//!     - 返回 JSON: {"left":"...","removed":bool,"original_cwd":"..."}
+//!
+//! 状态:App.worktree_stack:[]struct{worktree, original_cwd}
+//!       Enter 时 push,Exit 时 pop。
+
+const std = @import("std");
+const common = @import("common.zig");
+const security = @import("security.zig");
+const ToolContext = @import("context.zig").ToolContext;
+
+pub const WorktreeEntry = struct {
+    worktree_path: []u8,
+    original_cwd: []u8,
+};
+
+/// 全局 worktree 栈 — 由 ToolContext 暴露的 *anyopaque 指针指向 App 上的 ArrayList。
+/// 简单起见:跨工具调用通过 App 的 setter 函数管理。
+pub fn enterExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
+    const a = ctx.allocator;
+    const path_opt = common.extractJsonArg(args, "path");
+    const name_opt = common.extractJsonArg(args, "name");
+
+    if (path_opt) |path| {
+        // 切到已有 worktree
+        if (path.len == 0) return error.EmptyPath;
+        try security.validateNoTraversal(path);
+        if (!worktreeExists(a, path)) return error.WorktreePathNotFound;
+        const old_cwd = try getCwd(a);
+        try chdir(path);
+        try pushWorktree(ctx, path, old_cwd);
+        a.free(old_cwd);
+        return try std.fmt.allocPrint(a,
+            "{{\"worktree\":\"{s}\",\"entered\":true,\"created\":false}}", .{path});
+    }
+
+    // 创建新 worktree
+    const name = name_opt orelse blk: {
+        // 默认 cczig-tmp-<6 hex>
+        var buf: [16]u8 = undefined;
+        const ns = @import("../util/time.zig").nowNs();
+        const id = try std.fmt.bufPrint(&buf, "cczig-{x}", .{@as(u32, @truncate(@as(u128, @intCast(ns))))});
+        break :blk try a.dupe(u8, id);
+    };
+    defer if (name_opt == null) a.free(name);
+
+    const base = common.extractJsonArg(args, "base") orelse "HEAD";
+
+    // 路径:<cwd>/.cc-zig/worktrees/<name>
+    const cwd = try getCwd(a);
+    defer a.free(cwd);
+    const wt_dir = try std.fmt.allocPrint(a, "{s}/.cc-zig/worktrees", .{cwd});
+    defer a.free(wt_dir);
+    try mkdirP(wt_dir);
+    const wt_path = try std.fmt.allocPrint(a, "{s}/{s}", .{ wt_dir, name });
+    defer a.free(wt_path);
+
+    // git worktree add <wt_path> [-b <name>] <base>
+    const wt_z = try a.dupeZ(u8, wt_path);
+    defer a.free(wt_z);
+    const name_z = try a.dupeZ(u8, name);
+    defer a.free(name_z);
+    const base_z = try a.dupeZ(u8, base);
+    defer a.free(base_z);
+    const argv_args = [_]?[*:0]const u8{
+        "/usr/bin/env",
+        "git",
+        "worktree",
+        "add",
+        "-b",
+        name_z.ptr,
+        wt_z.ptr,
+        base_z.ptr,
+        null,
+    };
+    const out = common.spawnCaptureWithStderrTimed(argv_args[0..], a, ctx.abort, 30_000) catch |err| {
+        return try std.fmt.allocPrint(a, "{{\"error\":\"git_failed\",\"message\":\"{s}\"}}", .{@errorName(err)});
+    };
+    defer a.free(out.stdout);
+    defer a.free(out.stderr);
+    if (out.exit_code != 0) {
+        return try std.fmt.allocPrint(a,
+            "{{\"error\":\"git_worktree_add_failed\",\"exit_code\":{d},\"stderr\":\"{s}\"}}",
+            .{ out.exit_code, out.stderr });
+    }
+
+    try chdir(wt_path);
+    try pushWorktree(ctx, wt_path, cwd);
+
+    return try std.fmt.allocPrint(a,
+        "{{\"worktree\":\"{s}\",\"branch\":\"{s}\",\"entered\":true,\"created\":true}}",
+        .{ wt_path, name },
+    );
+}
+
+pub fn exitExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
+    const a = ctx.allocator;
+    const action = common.extractJsonArg(args, "action") orelse return error.MissingAction;
+    if (!std.mem.eql(u8, action, "keep") and !std.mem.eql(u8, action, "remove")) {
+        return error.InvalidAction;
+    }
+    const discard = blk: {
+        const v = common.extractJsonArg(args, "discard_changes") orelse break :blk false;
+        break :blk std.mem.eql(u8, v, "true");
+    };
+
+    const entry = try popWorktree(ctx) orelse return error.NotInWorktree;
+    defer {
+        a.free(entry.worktree_path);
+        a.free(entry.original_cwd);
+    }
+
+    // 先切回去
+    try chdir(entry.original_cwd);
+
+    var removed = false;
+    if (std.mem.eql(u8, action, "remove")) {
+        const wt_z = try a.dupeZ(u8, entry.worktree_path);
+        defer a.free(wt_z);
+        var argv_list = std.ArrayList(?[*:0]const u8).empty;
+        defer argv_list.deinit(a);
+        try argv_list.append(a, "/usr/bin/env");
+        try argv_list.append(a, "git");
+        try argv_list.append(a, "worktree");
+        try argv_list.append(a, "remove");
+        if (discard) try argv_list.append(a, "--force");
+        try argv_list.append(a, wt_z.ptr);
+        try argv_list.append(a, null);
+
+        const out = common.spawnCaptureWithStderrTimed(argv_list.items, a, ctx.abort, 30_000) catch null;
+        if (out) |o| {
+            defer a.free(o.stdout);
+            defer a.free(o.stderr);
+            if (o.exit_code == 0) removed = true;
+        }
+    }
+
+    return try std.fmt.allocPrint(a,
+        "{{\"left\":\"{s}\",\"removed\":{},\"original_cwd\":\"{s}\"}}",
+        .{ entry.worktree_path, removed, entry.original_cwd },
+    );
+}
+
+// ============================================================================
+// Worktree 栈管理 — 通过 ToolContext 上的 callback 回到 App
+// ============================================================================
+
+fn pushWorktree(ctx: *const ToolContext, wt_path: []const u8, cwd: []const u8) !void {
+    const setter = ctx.worktree_push_fn orelse return error.WorktreeStateUnavailable;
+    const state = ctx.worktree_state orelse return error.WorktreeStateUnavailable;
+    try setter(state, ctx.allocator, wt_path, cwd);
+}
+
+fn popWorktree(ctx: *const ToolContext) !?WorktreeEntry {
+    const getter = ctx.worktree_pop_fn orelse return error.WorktreeStateUnavailable;
+    const state = ctx.worktree_state orelse return error.WorktreeStateUnavailable;
+    return try getter(state, ctx.allocator);
+}
+
+// ============================================================================
+// 工具调用
+// ============================================================================
+
+fn chdir(path: []const u8) !void {
+    const path_z = try std.heap.page_allocator.dupeZ(u8, path);
+    defer std.heap.page_allocator.free(path_z);
+    if (std.c.chdir(path_z) != 0) return error.ChdirFailed;
+}
+
+fn getCwd(allocator: std.mem.Allocator) ![]u8 {
+    return @import("../util/fs.zig").getCwd(allocator);
+}
+
+fn mkdirP(path: []const u8) !void {
+    var cur: usize = 0;
+    while (cur < path.len) : (cur += 1) {
+        if (cur > 0 and (path[cur] == '/' or cur == path.len - 1)) {
+            const len = if (path[cur] == '/') cur else cur + 1;
+            var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+            if (len >= buf.len) return error.PathTooLong;
+            @memcpy(buf[0..len], path[0..len]);
+            buf[len] = 0;
+            const seg_z: [*:0]const u8 = @ptrCast(&buf);
+            _ = std.c.mkdir(seg_z, 0o755);
+        }
+    }
+}
+
+fn worktreeExists(allocator: std.mem.Allocator, path: []const u8) bool {
+    // 简单 stat:目录存在即认为是 worktree(更严格的方法是 git worktree list 然后匹配)
+    const path_z = allocator.dupeZ(u8, path) catch return false;
+    defer allocator.free(path_z);
+    const fd = std.c.open(path_z, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return false;
+    _ = std.c.close(fd);
+    return true;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const testing = std.testing;
+
+test "EnterWorktree: empty path errors" {
+    const ctx = ToolContext.simple(testing.allocator);
+    try testing.expectError(error.EmptyPath, enterExecute(&ctx, "{\"path\":\"\"}"));
+}
+
+test "EnterWorktree: nonexistent path errors" {
+    const ctx = ToolContext.simple(testing.allocator);
+    try testing.expectError(error.WorktreePathNotFound, enterExecute(&ctx, "{\"path\":\"/tmp/nonexistent-wt-99999\"}"));
+}
+
+test "ExitWorktree: missing action errors" {
+    const ctx = ToolContext.simple(testing.allocator);
+    try testing.expectError(error.MissingAction, exitExecute(&ctx, "{}"));
+}
+
+test "ExitWorktree: invalid action errors" {
+    const ctx = ToolContext.simple(testing.allocator);
+    try testing.expectError(error.InvalidAction, exitExecute(&ctx, "{\"action\":\"bogus\"}"));
+}
+
+test "ExitWorktree: not in worktree errors" {
+    var state: std.ArrayList(WorktreeEntry) = .empty;
+    defer state.deinit(testing.allocator);
+    var ctx = ToolContext.simple(testing.allocator);
+    ctx.worktree_state = @ptrCast(&state);
+    ctx.worktree_pop_fn = struct {
+        fn pop(s: *anyopaque, a: std.mem.Allocator) anyerror!?WorktreeEntry {
+            const stack: *std.ArrayList(WorktreeEntry) = @ptrCast(@alignCast(s));
+            _ = a;
+            if (stack.items.len == 0) return null;
+            return stack.pop();
+        }
+    }.pop;
+    try testing.expectError(error.NotInWorktree, exitExecute(&ctx, "{\"action\":\"keep\"}"));
+}

@@ -81,6 +81,18 @@ pub const Options = struct {
     parent_model: []const u8 = "",
     /// Skill 集合(Task 工具 subagent preload_skills 字段用)。
     skills_set: ?*const @import("../skills/skill.zig").SkillSet = null,
+    /// Worktree state(EnterWorktree/ExitWorktree 工具用)。
+    worktree_state: ?*anyopaque = null,
+    worktree_push_fn: ?*const fn (
+        state: *anyopaque,
+        allocator: std.mem.Allocator,
+        wt_path: []const u8,
+        original_cwd: []const u8,
+    ) anyerror!void = null,
+    worktree_pop_fn: ?*const fn (
+        state: *anyopaque,
+        allocator: std.mem.Allocator,
+    ) anyerror!?@import("../tools/worktree.zig").WorktreeEntry = null,
 };
 
 /// usage 回调接口：stream 每次吐 usage event 时调用。
@@ -357,6 +369,9 @@ pub fn run(
                     .agents = opts.agents,
                     .parent_model = opts.parent_model,
                     .skills = opts.skills_set,
+                    .worktree_state = opts.worktree_state,
+                    .worktree_push_fn = opts.worktree_push_fn,
+                    .worktree_pop_fn = opts.worktree_pop_fn,
                 };
                 break :blk tools_mod.dispatch(&tool_ctx, tu.name, tu.input);
             } catch |err| {

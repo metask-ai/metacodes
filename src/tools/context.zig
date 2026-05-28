@@ -68,6 +68,18 @@ pub const ToolContext = struct {
     parent_model: []const u8 = "",
     /// Skill 集合(供 subagent preload_skills 字段读取 skill body)。
     skills: ?*const @import("../skills/skill.zig").SkillSet = null,
+    /// Worktree 栈:Enter/ExitWorktree 工具用,App 端提供 push/pop 回调。
+    worktree_state: ?*anyopaque = null,
+    worktree_push_fn: ?*const fn (
+        state: *anyopaque,
+        allocator: std.mem.Allocator,
+        wt_path: []const u8,
+        original_cwd: []const u8,
+    ) anyerror!void = null,
+    worktree_pop_fn: ?*const fn (
+        state: *anyopaque,
+        allocator: std.mem.Allocator,
+    ) anyerror!?@import("worktree.zig").WorktreeEntry = null,
 
     /// 便利构造：只需 allocator 的场景（大多数单元测试）。
     pub fn simple(allocator: std.mem.Allocator) ToolContext {

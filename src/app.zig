@@ -28,6 +28,7 @@ const McpClient = @import("mcp/client.zig").McpClient;
 const McpSession = @import("mcp/registry_bridge.zig").McpSession;
 const ActiveSkillState = @import("skills/active.zig").ActiveSkillState;
 const AgentSet = @import("agents/set.zig").AgentSet;
+const WorktreeEntry = @import("tools/worktree.zig").WorktreeEntry;
 
 pub const UsageTotals = struct {
     input_tokens: u64 = 0,
@@ -109,6 +110,8 @@ pub const App = struct {
     project_dir: ?[]u8 = null,
     /// 已加载的 subagent 定义集合(builtin + personal + project)。
     agents: AgentSet,
+    /// 当前进入的 worktree 栈(支持嵌套)。EnterWorktree push,ExitWorktree pop。
+    worktree_stack: std.ArrayList(WorktreeEntry),
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -137,6 +140,7 @@ pub const App = struct {
             .dyn_registry = DynRegistry.init(allocator),
             .mcp_sessions = .empty,
             .agents = AgentSet.init(allocator),
+            .worktree_stack = .empty,
         };
 
         // 启动时加载 skills:enterprise / ~/.cc-zig / ~/.claude / project chain。
@@ -216,6 +220,11 @@ pub const App = struct {
         if (app.active_skill) |*as| as.deinit();
         if (app.project_dir) |p| app.allocator.free(p);
         app.agents.deinit();
+        for (app.worktree_stack.items) |entry| {
+            app.allocator.free(entry.worktree_path);
+            app.allocator.free(entry.original_cwd);
+        }
+        app.worktree_stack.deinit(app.allocator);
         if (app.rule_set) |*r| r.deinit();
         if (app.jobs) |*j| j.deinit();
         if (app.system_prompt) |s| app.allocator.free(s);
@@ -280,6 +289,29 @@ pub const App = struct {
     /// 取 project_dir;不在 git repo 返空串(供 ${CLAUDE_PROJECT_DIR} 替换默认值)。
     pub fn project_dir_or_empty(app: *const App) []const u8 {
         return app.project_dir orelse "";
+    }
+
+    /// EnterWorktree 工具用:把新 worktree 入栈。
+    pub fn worktreePushTrampoline(
+        state: *anyopaque,
+        allocator: std.mem.Allocator,
+        wt_path: []const u8,
+        original_cwd: []const u8,
+    ) anyerror!void {
+        const app: *App = @ptrCast(@alignCast(state));
+        const entry = WorktreeEntry{
+            .worktree_path = try allocator.dupe(u8, wt_path),
+            .original_cwd = try allocator.dupe(u8, original_cwd),
+        };
+        try app.worktree_stack.append(allocator, entry);
+    }
+
+    /// ExitWorktree 工具用:从栈顶弹出。返 null 表示当前不在任何 worktree。
+    pub fn worktreePopTrampoline(state: *anyopaque, allocator: std.mem.Allocator) anyerror!?WorktreeEntry {
+        _ = allocator;
+        const app: *App = @ptrCast(@alignCast(state));
+        if (app.worktree_stack.items.len == 0) return null;
+        return app.worktree_stack.pop();
     }
 
     /// 从 ~/.cc-zig/config.json 读 permission_rules 数组。失败仅 log，不影响启动。

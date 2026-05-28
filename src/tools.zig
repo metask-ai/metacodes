@@ -9,6 +9,9 @@ const bash_tool = @import("tools/bash.zig");
 const grep_tool = @import("tools/grep.zig");
 const bash_output_tool = @import("tools/bash_output.zig");
 const kill_shell_tool = @import("tools/kill_shell.zig");
+const monitor_tool = @import("tools/monitor.zig");
+const notebook_edit_tool = @import("tools/notebook_edit.zig");
+const worktree_tool = @import("tools/worktree.zig");
 const web_fetch_tool = @import("tools/web_fetch.zig");
 const ask_user_tool = @import("tools/ask_user.zig");
 const plan_mode_tool = @import("tools/plan_mode.zig");
@@ -80,6 +83,30 @@ pub const registry: []const ToolEntry = &.{
         .description = "Terminate a running backgrounded Bash job by job_id",
         .input_schema = .{ .type = "object", .properties = null, .required = &.{"job_id"} },
         .execute = kill_shell_tool.execute,
+    },
+    .{
+        .name = "Monitor",
+        .description = "Start a background monitor that runs a command and streams stdout line-by-line. Use to watch logs, poll status, or react to file changes mid-conversation. Each stdout line is collected into a ring buffer readable via BashOutput(job_id). Stop with KillShell(job_id). Args: command (required), description (required, e.g. 'errors in /var/log/app.log'). Optional: persistent (default false; if true, no timeout).",
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{ "command", "description" } },
+        .execute = monitor_tool.execute,
+    },
+    .{
+        .name = "NotebookEdit",
+        .description = "Modify a Jupyter notebook (.ipynb) cell. Modes: replace (default) overwrites the cell's source; insert adds a new cell after target (or at start if no cell_id); delete removes the target cell. Args: notebook_path (required), new_source (required, may be empty for delete), cell_id (required for replace/delete; optional for insert), cell_type ('code' or 'markdown', required for insert), edit_mode.",
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{ "notebook_path", "new_source" } },
+        .execute = notebook_edit_tool.execute,
+    },
+    .{
+        .name = "EnterWorktree",
+        .description = "Enter an isolated git worktree. Pass `path` to switch into an existing worktree, OR pass `name` (and optional `base` branch) to create a new worktree under .cc-zig/worktrees/<name>/. Changes the session's working directory. Returns {worktree, branch, entered, created}.",
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{} },
+        .execute = worktree_tool.enterExecute,
+    },
+    .{
+        .name = "ExitWorktree",
+        .description = "Exit the current worktree and return to the original directory. Args: action='keep' (leaves worktree and branch intact) or 'remove' (also deletes the worktree). Optional discard_changes=true to force-remove even with uncommitted changes.",
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{"action"} },
+        .execute = worktree_tool.exitExecute,
     },
     .{
         .name = "WebFetch",
@@ -300,6 +327,9 @@ test {
     _ = &grep_tool;
     _ = &bash_output_tool;
     _ = &kill_shell_tool;
+    _ = &monitor_tool;
+    _ = &notebook_edit_tool;
+    _ = &worktree_tool;
     _ = &web_fetch_tool;
     _ = &ask_user_tool;
     _ = &plan_mode_tool;
