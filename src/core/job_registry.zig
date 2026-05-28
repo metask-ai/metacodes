@@ -194,6 +194,15 @@ pub const JobRegistry = struct {
         return entry;
     }
 
+    /// 当前 running 状态的 job 数(statusline 显示用)。
+    pub fn runningCount(self: *const JobRegistry) usize {
+        var n: usize = 0;
+        for (self.jobs.items) |*j| {
+            if (j.status == .running) n += 1;
+        }
+        return n;
+    }
+
     /// 非阻塞 reap：对所有 running job waitpid(WNOHANG)，把已退出的状态更新。
     pub fn reapExited(self: *JobRegistry) void {
         for (self.jobs.items) |*j| {

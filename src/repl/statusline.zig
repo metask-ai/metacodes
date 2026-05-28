@@ -27,14 +27,29 @@ pub fn render(app: *const app_mod.App) void {
     var tok_buf: [16]u8 = undefined;
     const tok_str = formatTokens(&tok_buf, total_tokens);
 
+    // 后台任务数 + cron 数(>0 才显示)
+    const bg_count = if (app.jobs) |*j| j.runningCount() else 0;
+    const cron_count = app.cron_registry.count();
+
+    var extra_buf: [64]u8 = undefined;
+    var extra: []const u8 = "";
+    if (bg_count > 0 and cron_count > 0) {
+        extra = std.fmt.bufPrint(&extra_buf, " | {d}bg | {d}cron", .{ bg_count, cron_count }) catch "";
+    } else if (bg_count > 0) {
+        extra = std.fmt.bufPrint(&extra_buf, " | {d}bg", .{bg_count}) catch "";
+    } else if (cron_count > 0) {
+        extra = std.fmt.bufPrint(&extra_buf, " | {d}cron", .{cron_count}) catch "";
+    }
+
     // 一次性拼接成一行（ANSI dim + 内容 + reset + 换行）再写
-    var line_buf: [256]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "\x1b[2m[{s} | {s} | {s} tok | ${d:.4}]\x1b[0m\n", .{
+    var line_buf: [320]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "\x1b[2m[{s} | {s} | {s} tok | ${d:.4}{s}]\x1b[0m\n", .{
         app.config.model,
         mode_str,
         tok_str,
         cost,
-    }) catch return; // 超 256 字节截断：静默跳过渲染
+        extra,
+    }) catch return; // 超 buf 截断：静默跳过渲染
     writeAll(2, line);
 }
 

@@ -218,6 +218,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         if (trimmed.len > 1 and trimmed[0] == '/' and try handleSkillInvocation(app, allocator, trimmed[1..])) {
             continue;
         }
+        // ! shell mode:直接执行 shell 命令,输出加入对话上下文(不走模型)
+        if (trimmed.len > 1 and trimmed[0] == '!') {
+            try handleShellMode(app, allocator, std.mem.trim(u8, trimmed[1..], " \t"));
+            continue;
+        }
         // /commit 和 /review：把预置 prompt 注入为 user message，走正常 agent_loop 路径
         if (std.mem.eql(u8, trimmed, "/commit")) {
             try app.conversation.appendText(.user, COMMIT_PROMPT);
@@ -1331,6 +1336,54 @@ fn readMemory(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
         try buf.appendSlice(allocator, chunk[0..@intCast(n)]);
     }
     return try buf.toOwnedSlice(allocator);
+}
+
+/// ! shell mode:执行 shell 命令,实时输出 + 加入对话上下文(不经模型审批/解释)。
+fn handleShellMode(app: *app_mod.App, allocator: std.mem.Allocator, command: []const u8) !void {
+    if (command.len == 0) return;
+    // 直接调 Bash 工具 execute(走 bypass — 用户显式 ! 等于授权)
+    const bash = @import("../tools/bash.zig");
+    var tool_ctx = @import("../tools.zig").ToolContext{
+        .allocator = allocator,
+        .abort = &app.abort,
+        .jobs = if (app.jobs) |*j| j else null,
+    };
+    // 组 args JSON
+    var args_buf: std.Io.Writer.Allocating = .init(allocator);
+    defer args_buf.deinit();
+    try args_buf.writer.writeAll("{\"command\":");
+    try std.json.Stringify.encodeJsonString(command, .{}, &args_buf.writer);
+    try args_buf.writer.writeByte('}');
+    const args_json = try args_buf.toOwnedSlice();
+    defer allocator.free(args_json);
+
+    const result = bash.execute(&tool_ctx, args_json) catch |err| {
+        std.debug.print("\x1b[31m! error: {s}\x1b[0m\n", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(result);
+
+    // 显示 stdout/stderr(从 result JSON 抽)
+    const common = @import("../tools/common.zig");
+    if (common.extractJsonArg(result, "stdout")) |so| {
+        const unesc = @import("../util/json.zig").unescapeString(so, allocator) catch null;
+        if (unesc) |u| {
+            defer allocator.free(u);
+            if (u.len > 0) std.debug.print("{s}", .{u});
+        }
+    }
+    if (common.extractJsonArg(result, "stderr")) |se| {
+        const unesc = @import("../util/json.zig").unescapeString(se, allocator) catch null;
+        if (unesc) |u| {
+            defer allocator.free(u);
+            if (u.len > 0) std.debug.print("\x1b[33m{s}\x1b[0m", .{u});
+        }
+    }
+
+    // 把命令 + 输出加入对话上下文(让模型后续能引用)
+    const ctx_msg = try std.fmt.allocPrint(allocator, "[shell] $ {s}\n{s}", .{ command, result });
+    defer allocator.free(ctx_msg);
+    try app.conversation.appendText(.user, ctx_msg);
 }
 
 /// 检查到期 cron,逐个把其 prompt 作为 user message 注入并跑一轮 agent_loop。
