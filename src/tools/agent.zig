@@ -52,6 +52,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         .{
             .max_turns = @intCast(max_turns),
             .agent_depth = ctx.agent_depth + 1,
+            .dyn_registry = ctx.dyn_registry,
         },
     );
     defer result.deinit();

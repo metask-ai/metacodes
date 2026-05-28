@@ -53,6 +53,7 @@ pub fn run(
             .api_client = &app.api_client,
             .tool_defs = app.tool_defs,
             .system_prompt = app.system_prompt,
+            .dyn_registry = &app.dyn_registry,
         },
         &writer,
         allocator,

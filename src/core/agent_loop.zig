@@ -58,6 +58,8 @@ pub const Options = struct {
     tool_defs: ?[]const @import("../json.zig").ToolDefinition = null,
     /// 本次 run 对应的 agent 嵌套深度（父=0，子=1…）
     agent_depth: u8 = 0,
+    /// 运行时工具（Skill/MCP）注册表。null = 仅静态工具。
+    dyn_registry: ?*const @import("../tools/dynamic.zig").DynRegistry = null,
 };
 
 /// usage 回调接口：stream 每次吐 usage event 时调用。
@@ -308,19 +310,7 @@ pub fn run(
                 .allow => {},
             }
 
-            // 派发到工具
-            const tool = tools_mod.getTool(tu.name) orelse {
-                log.warnId("agent", rid, "unknown tool: {s}", .{tu.name});
-                const err_json = try tool_error.errorToJson("UnknownTool", "no tool named '{s}' is registered", .{tu.name}, allocator);
-                errdefer allocator.free(err_json);
-                try result_blocks.append(allocator, .{ .tool_result = .{
-                    .tool_use_id = try allocator.dupe(u8, tu.id),
-                    .content = err_json,
-                    .is_error = true,
-                } });
-                continue;
-            };
-
+            // 派发到工具（先查静态，未命中查 dyn_registry：Skill / MCP）
             log.infoId("agent", rid, "tool.exec start name={s} id={s}", .{ tu.name, tu.id });
             log.debugId("agent", rid, "tool.exec input={s}", .{tu.input});
             const t_start = util_time.nowMs();
@@ -336,11 +326,13 @@ pub fn run(
                     .api_client = opts.api_client,
                     .tool_defs = opts.tool_defs,
                     .agent_depth = opts.agent_depth,
+                    .dyn_registry = opts.dyn_registry,
                 };
-                break :blk tool.execute(&tool_ctx, tu.input);
+                break :blk tools_mod.dispatch(&tool_ctx, tu.name, tu.input);
             } catch |err| {
                 log.warnId("agent", rid, "tool.exec FAILED name={s} err={s} duration_ms={d}", .{ tu.name, @errorName(err), util_time.nowMs() - t_start });
-                const err_json = try tool_error.errorToJson(@errorName(err), "{s} failed with {s}", .{ tu.name, @errorName(err) }, allocator);
+                const code = if (err == error.UnknownTool) "UnknownTool" else @errorName(err);
+                const err_json = try tool_error.errorToJson(code, "{s} failed with {s}", .{ tu.name, @errorName(err) }, allocator);
                 errdefer allocator.free(err_json);
                 try result_blocks.append(allocator, .{ .tool_result = .{
                     .tool_use_id = try allocator.dupe(u8, tu.id),

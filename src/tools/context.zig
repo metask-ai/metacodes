@@ -20,6 +20,7 @@ const PermissionContext = @import("../permission.zig").PermissionContext;
 const TaskStore = @import("../core/task_store.zig").TaskStore;
 const Client = @import("../client.zig").Client;
 const ToolDefinition = @import("../json.zig").ToolDefinition;
+const DynRegistry = @import("dynamic.zig").DynRegistry;
 
 pub const ToolContext = struct {
     allocator: std.mem.Allocator,
@@ -40,6 +41,8 @@ pub const ToolContext = struct {
     tool_defs: ?[]const ToolDefinition = null,
     /// 当前 agent 嵌套深度（父=0，子=1，孙=2…）。Agent 工具用它限制递归。
     agent_depth: u8 = 0,
+    /// 运行时工具表（Skill/MCP）。agent_loop 在静态注册表未命中时回退到此。
+    dyn_registry: ?*const DynRegistry = null,
 
     /// 便利构造：只需 allocator 的场景（大多数单元测试）。
     pub fn simple(allocator: std.mem.Allocator) ToolContext {

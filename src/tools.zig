@@ -151,6 +151,15 @@ pub fn getTool(name: []const u8) ?*const ToolEntry {
 }
 
 pub fn toToolDefinitions(allocator: std.mem.Allocator) ![]json.ToolDefinition {
+    return toToolDefinitionsWithDyn(allocator, null);
+}
+
+/// 合并静态 + 动态工具 + web_search server tool。`dyn` 为 null 时等价 toToolDefinitions。
+/// 顺序：静态 18 → 动态（Skill/MCP）→ web_search。
+pub fn toToolDefinitionsWithDyn(
+    allocator: std.mem.Allocator,
+    dyn: ?*const @import("tools/dynamic.zig").DynRegistry,
+) ![]json.ToolDefinition {
     var defs = try std.ArrayList(json.ToolDefinition).initCapacity(allocator, registry.len + 1);
     defer defs.deinit(allocator);
 
@@ -166,6 +175,8 @@ pub fn toToolDefinitions(allocator: std.mem.Allocator) ![]json.ToolDefinition {
         });
     }
 
+    if (dyn) |d| try d.appendDefinitions(&defs, allocator);
+
     // WebSearch：Anthropic server tool，不走本地 execute；声明后 API 自己执行。
     // name 固定 "web_search"，type 是版本化的 "web_search_20250305"。
     try defs.append(allocator, .{
@@ -180,6 +191,16 @@ pub fn toToolDefinitions(allocator: std.mem.Allocator) ![]json.ToolDefinition {
 
 pub fn executeTool(tool: *const ToolEntry, ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     return tool.execute(ctx, args);
+}
+
+/// 统一派发：先查静态注册表，未命中查 ctx.dyn_registry。
+/// 找不到返 error.UnknownTool —— 由 agent_loop 转 tool_error 给模型。
+pub fn dispatch(ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror![]u8 {
+    if (getTool(name)) |t| return t.execute(ctx, args);
+    if (ctx.dyn_registry) |dr| {
+        if (dr.find(name)) |de| return de.execute(ctx, args, de.ctx_ptr);
+    }
+    return error.UnknownTool;
 }
 
 test "getTool by name" {
@@ -212,6 +233,55 @@ test "toToolDefinitions creates all tools + web_search server tool" {
     // 最后一个是 web_search
     try std.testing.expectEqualStrings("web_search", defs[defs.len - 1].name);
     try std.testing.expect(defs[defs.len - 1].server_type != null);
+}
+
+test "toToolDefinitionsWithDyn appends dynamic tools before web_search" {
+    const dyn_mod = @import("tools/dynamic.zig");
+    var dyn = dyn_mod.DynRegistry.init(std.testing.allocator);
+    defer dyn.deinit();
+    const dummy = struct {
+        fn exec(_: *const ToolContext, _: []const u8, _: ?*anyopaque) anyerror![]u8 {
+            return std.testing.allocator.dupe(u8, "dummy");
+        }
+    }.exec;
+    try dyn.register("MySkill", "a skill", &.{}, dummy, null);
+
+    const defs = try toToolDefinitionsWithDyn(std.testing.allocator, &dyn);
+    defer std.testing.allocator.free(defs);
+
+    try std.testing.expect(defs.len == registry.len + 2); // static + 1 dyn + web_search
+    // web_search 始终在最后
+    try std.testing.expectEqualStrings("web_search", defs[defs.len - 1].name);
+    // 倒数第二是 MySkill（dyn 在 web_search 之前 append）
+    try std.testing.expectEqualStrings("MySkill", defs[defs.len - 2].name);
+}
+
+test "dispatch finds static tool" {
+    const ctx = ToolContext.simple(std.testing.allocator);
+    try std.testing.expectError(error.MissingPath, dispatch(&ctx, "Read", "{}"));
+}
+
+test "dispatch falls back to dyn_registry" {
+    const dyn_mod = @import("tools/dynamic.zig");
+    var dyn = dyn_mod.DynRegistry.init(std.testing.allocator);
+    defer dyn.deinit();
+    const echo = struct {
+        fn exec(_: *const ToolContext, args: []const u8, _: ?*anyopaque) anyerror![]u8 {
+            return std.testing.allocator.dupe(u8, args);
+        }
+    }.exec;
+    try dyn.register("Echo", "echoes input", &.{}, echo, null);
+
+    var ctx = ToolContext.simple(std.testing.allocator);
+    ctx.dyn_registry = &dyn;
+    const out = try dispatch(&ctx, "Echo", "hello");
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("hello", out);
+}
+
+test "dispatch returns UnknownTool when missing everywhere" {
+    var ctx = ToolContext.simple(std.testing.allocator);
+    try std.testing.expectError(error.UnknownTool, dispatch(&ctx, "NoSuchTool", "{}"));
 }
 
 test {

@@ -189,6 +189,165 @@ pub fn extractToolUse(data: []const u8) ?ToolUseResult {
     return ToolUseResult{ .id = id, .name = name, .input_json = input_json };
 }
 
+/// 服务端工具调用（web_search 等）的初始块。Anthropic 的 server tool 由 API 侧执行，
+/// 我们只需把"模型发起搜索"这件事让本地知道——比如让 transcript / UI 显示。
+/// 区别于 tool_use：server_tool_use 的 input 在 content_block_start 就已完整（无 input_json_delta）。
+pub const ServerToolUseInfo = struct { name: []const u8, query: []const u8 };
+
+pub fn extractServerToolUse(data: []const u8) ?ServerToolUseInfo {
+    if (parseEventType(data) != .content_block_start) return null;
+    const block = findTopLevelObjectField(data, "content_block") orelse return null;
+    const block_type = findTopLevelStringField(block, "type") orelse return null;
+    if (!std.mem.eql(u8, block_type, "server_tool_use")) return null;
+    const name = findTopLevelStringField(block, "name") orelse return null;
+    const input = findTopLevelObjectFieldRaw(block, "input") orelse "{}";
+    const query = findTopLevelStringField(input, "query") orelse "";
+    return .{ .name = name, .query = query };
+}
+
+/// 服务端工具结果块（web_search_tool_result）。content 是结果数组。
+/// 返回 raw content array 字符串(借用 data)；调用方按需解析 title/url。
+pub const ServerToolResultInfo = struct { content_array_raw: []const u8 };
+
+pub fn extractServerToolResult(data: []const u8) ?ServerToolResultInfo {
+    if (parseEventType(data) != .content_block_start) return null;
+    const block = findTopLevelObjectField(data, "content_block") orelse return null;
+    const block_type = findTopLevelStringField(block, "type") orelse return null;
+    if (!std.mem.eql(u8, block_type, "web_search_tool_result")) return null;
+    // content 可能是 array 或 error object；我们只处理 array 形态
+    const arr = findTopLevelArrayFieldRaw(block, "content") orelse return null;
+    return .{ .content_array_raw = arr };
+}
+
+/// 把 web_search_tool_result 的 content 数组渲染成可读多行文本。
+/// 输入是 `[{"type":"web_search_result","title":"...","url":"..."}, ...]`。
+/// 返回 owned text 形如 `\n[Web search: 3 results]\n  • Title — https://...\n...`。
+/// 不严格 parse JSON——按字段名 scan,容错性优先。
+pub fn renderWebSearchResults(allocator: std.mem.Allocator, content_array: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var count: usize = 0;
+
+    // 遍历数组里的每个 object。findTopLevelObjectFieldRaw 不适用（不是 object）；
+    // 用简单状态机找每个 top-level {...}。
+    var depth: i32 = 0;
+    var in_str = false;
+    var escaped = false;
+    var obj_start: ?usize = null;
+    var i: usize = 0;
+    var items_buf: std.ArrayList(u8) = .empty;
+    defer items_buf.deinit(allocator);
+
+    while (i < content_array.len) : (i += 1) {
+        const c = content_array[i];
+        if (escaped) { escaped = false; continue; }
+        if (c == '\\') { escaped = true; continue; }
+        if (c == '"') { in_str = !in_str; continue; }
+        if (in_str) continue;
+        if (c == '{') {
+            if (depth == 0) obj_start = i;
+            depth += 1;
+        } else if (c == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                const obj = content_array[obj_start.?..i + 1];
+                const title = findTopLevelStringField(obj, "title") orelse "(no title)";
+                const url = findTopLevelStringField(obj, "url") orelse "(no url)";
+                var line_buf: [2048]u8 = undefined;
+                const line = std.fmt.bufPrint(&line_buf, "  - {s} — {s}\n", .{ title, url }) catch "  - (line too long)\n";
+                try items_buf.appendSlice(allocator, line);
+                count += 1;
+                obj_start = null;
+            }
+        }
+    }
+
+    try out.writer.print("\n[Web search: {d} result{s}]\n", .{ count, if (count == 1) @as([]const u8, "") else @as([]const u8, "s") });
+    try out.writer.writeAll(items_buf.items);
+    return try out.toOwnedSlice();
+}
+
+/// 同 findTopLevelObjectFieldRaw 但找 array `[...]`。
+fn findTopLevelArrayFieldRaw(data: []const u8, field: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < data.len and (data[i] == ' ' or data[i] == '\t' or data[i] == '\n')) : (i += 1) {}
+    if (i >= data.len or data[i] != '{') return null;
+    i += 1;
+    while (i < data.len) {
+        while (i < data.len and (data[i] == ' ' or data[i] == '\t' or data[i] == '\n' or data[i] == ',')) : (i += 1) {}
+        if (i >= data.len or data[i] == '}') return null;
+        if (data[i] != '"') return null;
+        i += 1;
+        const k_start = i;
+        while (i < data.len and data[i] != '"') : (i += 1) {
+            if (data[i] == '\\') i += 1;
+        }
+        if (i >= data.len) return null;
+        const k = data[k_start..i];
+        i += 1;
+        while (i < data.len and (data[i] == ' ' or data[i] == '\t' or data[i] == ':' or data[i] == '\n')) : (i += 1) {}
+        if (i >= data.len) return null;
+        const match = std.mem.eql(u8, k, field);
+        if (data[i] == '[' and match) {
+            // 找匹配的 ]
+            const start = i;
+            var depth: i32 = 0;
+            var in_str = false;
+            var escaped = false;
+            while (i < data.len) : (i += 1) {
+                const c = data[i];
+                if (escaped) { escaped = false; continue; }
+                if (c == '\\') { escaped = true; continue; }
+                if (c == '"') { in_str = !in_str; continue; }
+                if (in_str) continue;
+                if (c == '[') depth += 1;
+                if (c == ']') {
+                    depth -= 1;
+                    if (depth == 0) return data[start..i + 1];
+                }
+            }
+            return null;
+        }
+        // skip value（字符串 / 对象 / 数组 / 字面量）
+        i = skipJsonValue(data, i);
+    }
+    return null;
+}
+
+fn skipJsonValue(data: []const u8, start: usize) usize {
+    var i = start;
+    if (i >= data.len) return i;
+    const c = data[i];
+    if (c == '"') {
+        i += 1;
+        while (i < data.len and data[i] != '"') : (i += 1) {
+            if (data[i] == '\\') i += 1;
+        }
+        return if (i < data.len) i + 1 else i;
+    }
+    if (c == '{' or c == '[') {
+        const open = c;
+        const close: u8 = if (open == '{') '}' else ']';
+        var depth: i32 = 1;
+        i += 1;
+        var in_str = false;
+        var escaped = false;
+        while (i < data.len and depth > 0) : (i += 1) {
+            const ch = data[i];
+            if (escaped) { escaped = false; continue; }
+            if (ch == '\\') { escaped = true; continue; }
+            if (ch == '"') { in_str = !in_str; continue; }
+            if (in_str) continue;
+            if (ch == open) depth += 1;
+            if (ch == close) depth -= 1;
+        }
+        return i;
+    }
+    // literal / number
+    while (i < data.len and data[i] != ',' and data[i] != '}' and data[i] != ']') : (i += 1) {}
+    return i;
+}
+
 /// 找 top-level 字段的 object value，返回完整 `{...}` 片段（借 data）；非 object 返 null。
 fn findTopLevelObjectField(data: []const u8, field: []const u8) ?[]const u8 {
     return findTopLevelObjectFieldRaw(data, field);
@@ -533,7 +692,19 @@ pub const EventIterator = struct {
                         // tool_use 的参数通过后续 input_json_delta 累加——不立即 emit
                         continue;
                     }
-                    // 非 tool_use 的 content_block_start（比如 text block）——跳过
+                    // 服务端工具调用（web_search）：发起搜索的可读标记
+                    if (extractServerToolUse(data)) |stu| {
+                        self.logInfo("server_tool_use name={s} query={s}", .{ stu.name, stu.query });
+                        const text = try std.fmt.allocPrint(allocator, "\n[Web search: \"{s}\"]\n", .{stu.query});
+                        return Event{ .text_delta = text };
+                    }
+                    // 服务端工具结果（web_search_tool_result）：把结果列表渲染成可读文本
+                    if (extractServerToolResult(data)) |str| {
+                        self.logInfo("web_search_tool_result content_len={d}", .{str.content_array_raw.len});
+                        const text = try renderWebSearchResults(allocator, str.content_array_raw);
+                        return Event{ .text_delta = text };
+                    }
+                    // 其它非 tool_use 的 content_block_start（比如 text block）——跳过
                     continue;
                 },
                 .content_block_delta => {
@@ -680,6 +851,40 @@ test "EventIterator: tool_use_start emitted on content_block_stop" {
     try std.testing.expectEqualStrings("Bash", ev.tool_use_start.name);
     // 累加后的 input_json 应该是完整的 {"cmd":"ls"}
     try std.testing.expectEqualStrings("{\"cmd\":\"ls\"}", ev.tool_use_start.input_json);
+}
+
+test "EventIterator: web_search emits search marker + results as text_delta" {
+    // 模拟真实 web_search 流：server_tool_use（带 query）→ result block
+    const sse =
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_abc\",\"name\":\"web_search\",\"input\":{\"query\":\"zig 0.16\"}}}\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srvtoolu_abc\",\"content\":[{\"type\":\"web_search_result\",\"title\":\"Zig 0.16 Release\",\"url\":\"https://ziglang.org/0.16/\"}]}}\n" ++
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"Based on search, Zig 0.16...\"}}\n" ++
+        "data: {\"type\":\"message_stop\"}\n";
+    var reader = std.Io.Reader.fixed(sse);
+    var it = EventIterator.init(&reader);
+    defer it.deinit(std.testing.allocator);
+
+    // 第一个事件：搜索发起的可读标记
+    const ev1 = (try it.next(std.testing.allocator)).?;
+    defer ev1.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, ev1.text_delta, "Web search") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ev1.text_delta, "zig 0.16") != null);
+
+    // 第二个事件：搜索结果渲染
+    const ev2 = (try it.next(std.testing.allocator)).?;
+    defer ev2.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, ev2.text_delta, "Zig 0.16 Release") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ev2.text_delta, "ziglang.org") != null);
+
+    // 第三个事件：模型基于搜索结果给出的回答
+    const ev3 = (try it.next(std.testing.allocator)).?;
+    defer ev3.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, ev3.text_delta, "Based on search") != null);
+
+    // done
+    const ev4 = (try it.next(std.testing.allocator)).?;
+    defer ev4.deinit(std.testing.allocator);
+    try std.testing.expect(ev4 == .done);
 }
 
 test "EventIterator: skips ping and empty lines" {
@@ -900,4 +1105,49 @@ test "validateJsonObject: valid passes" {
 test "validateJsonObject: invalid errors" {
     try std.testing.expectError(error.InvalidJson, validateJsonObject("{not json}"));
     try std.testing.expectError(error.InvalidJson, validateJsonObject("{\"a\":}"));
+}
+
+test "extractServerToolUse: web_search query" {
+    const data = "{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_x\",\"name\":\"web_search\",\"input\":{\"query\":\"zig 0.16 release notes\"}}}";
+    const r = extractServerToolUse(data).?;
+    try std.testing.expectEqualStrings("web_search", r.name);
+    try std.testing.expectEqualStrings("zig 0.16 release notes", r.query);
+}
+
+test "extractServerToolUse: returns null for tool_use" {
+    const data = "{\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Bash\",\"input\":{}}}";
+    try std.testing.expect(extractServerToolUse(data) == null);
+}
+
+test "extractServerToolResult: gets content array" {
+    const data = "{\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srvtoolu_x\",\"content\":[{\"type\":\"web_search_result\",\"title\":\"Zig 0.16\",\"url\":\"https://ziglang.org/news/0.16.0/\"}]}}";
+    const r = extractServerToolResult(data).?;
+    try std.testing.expect(std.mem.indexOf(u8, r.content_array_raw, "Zig 0.16") != null);
+}
+
+test "renderWebSearchResults: single result" {
+    const arr = "[{\"type\":\"web_search_result\",\"title\":\"Zig 0.16\",\"url\":\"https://example.org/0.16\"}]";
+    const out = try renderWebSearchResults(std.testing.allocator, arr);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[Web search: 1 result]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Zig 0.16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "https://example.org/0.16") != null);
+}
+
+test "renderWebSearchResults: empty array" {
+    const out = try renderWebSearchResults(std.testing.allocator, "[]");
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "0 results") != null);
+}
+
+test "renderWebSearchResults: multiple results" {
+    const arr =
+        "[{\"type\":\"web_search_result\",\"title\":\"A\",\"url\":\"https://a/\"}," ++
+        "{\"type\":\"web_search_result\",\"title\":\"B\",\"url\":\"https://b/\"}," ++
+        "{\"type\":\"web_search_result\",\"title\":\"C\",\"url\":\"https://c/\"}]";
+    const out = try renderWebSearchResults(std.testing.allocator, arr);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "3 results") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "C") != null);
 }

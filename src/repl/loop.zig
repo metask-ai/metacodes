@@ -122,6 +122,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         }
         if (std.mem.eql(u8, trimmed, "/tools")) {
             for (tools.registry) |*t| std.debug.print("  \x1b[32m{s}\x1b[0m - {s}\n", .{ t.name, t.description });
+            // 动态工具（Skill / MCP）
+            for (app.dyn_registry.entries.items) |e| {
+                std.debug.print("  \x1b[36m{s}\x1b[0m - {s}\n", .{ e.name, e.description });
+            }
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/skills")) {
@@ -263,7 +267,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             &app.api_client,
             app.tool_defs,
             &app.permission_ctx,
-            .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt },
+            .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry },
             &writer,
             allocator,
         ) catch |err| {
@@ -759,7 +763,7 @@ fn retryLast(app: *app_mod.App, allocator: std.mem.Allocator, writer: *DebugWrit
         &app.api_client,
         app.tool_defs,
         &app.permission_ctx,
-        .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt },
+        .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry },
         writer,
         allocator,
     ) catch |err| {
@@ -847,7 +851,7 @@ fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
 
     // 重建 system prompt（含 knowledge cutoff、模型名）。失败保留旧的。
     const sp_mod = @import("../core/system_prompt.zig");
-    if (sp_mod.build(allocator, new_model)) |sp| {
+    if (sp_mod.buildWithSkills(allocator, new_model, &app.skills)) |sp| {
         if (app.system_prompt) |old| allocator.free(old);
         app.system_prompt = sp;
     } else |err| {
@@ -1007,16 +1011,20 @@ fn handleInit(app: *app_mod.App, allocator: std.mem.Allocator) !void {
 }
 
 fn handleMcp(app: *app_mod.App) !void {
-    _ = app;
-    // MCP integration at App level is not yet wired; show best-effort info.
-    std.debug.print(
-        \\MCP servers: (none connected)
-        \\
-        \\Note: MCP client framework exists at src/mcp/ but App-level multi-server
-        \\management is not yet wired. A future release will read the `mcp_servers`
-        \\key from config.json and auto-connect stdio servers.
-        \\
-    , .{});
+    if (app.mcp_sessions.items.len == 0) {
+        std.debug.print(
+            \\MCP servers: (none connected)
+            \\
+            \\Declare servers in ~/.cc-zig/config.json:
+            \\  {{"mcp_servers":[{{"name":"foo","command":["/path/to/server","--flag"]}}]}}
+            \\
+        , .{});
+        return;
+    }
+    std.debug.print("MCP servers ({d}):\n", .{app.mcp_sessions.items.len});
+    for (app.mcp_sessions.items) |*entry| {
+        std.debug.print("  \x1b[36m{s}\x1b[0m  ({d} tools registered as {s}__*)\n", .{ entry.name, entry.session.bindings.items.len, entry.name });
+    }
 }
 
 /// /agents：列出可用的 sub-agent 能力。当前无独立 agent 定义文件系统，
@@ -1147,7 +1155,7 @@ fn runInjectedAgent(app: *app_mod.App, allocator: std.mem.Allocator, writer: *De
         &app.api_client,
         app.tool_defs,
         &app.permission_ctx,
-        .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt },
+        .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry },
         writer,
         allocator,
     ) catch |err| {

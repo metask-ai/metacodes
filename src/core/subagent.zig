@@ -35,6 +35,8 @@ pub const SpawnOptions = struct {
     system_prompt: ?[]const u8 = null,
     /// 嵌套深度。Agent 工具 spawn 时传 parent_depth+1。
     agent_depth: u8 = 1,
+    /// 父 agent 的 dyn_registry，子 agent 共享同一套 Skill/MCP 工具。
+    dyn_registry: ?*const @import("../tools/dynamic.zig").DynRegistry = null,
 };
 
 pub fn spawnAgent(
@@ -64,6 +66,7 @@ pub fn spawnAgent(
             .api_client = api_client,
             .tool_defs = tool_defs,
             .agent_depth = opts.agent_depth,
+            .dyn_registry = opts.dyn_registry,
         },
         &sink,
         allocator,

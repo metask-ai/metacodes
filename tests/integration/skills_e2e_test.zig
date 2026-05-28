@@ -68,3 +68,58 @@ test "Skills E2E: loadFromDir + Skill tool activation" {
     try std.testing.expect(std.mem.indexOf(u8, sys, "refactor") != null);
     try std.testing.expect(std.mem.indexOf(u8, sys, "review") != null);
 }
+
+test "Skills E2E: tools.dispatch routes Skill tool through dyn_registry" {
+    const a = std.testing.allocator;
+    const dir = "/tmp/cc-zig-skills-dispatch";
+    defer {
+        rmSkill(dir, "demo");
+        if (a.dupeZ(u8, dir)) |dz| {
+            defer a.free(dz);
+            _ = std.c.rmdir(dz);
+        } else |_| {}
+    }
+    try makeSkill(dir, "demo", "---\nname: demo\ndescription: Demo skill\nallowed_tools: Read, Grep\n---\nDemo body.\n");
+
+    var set = cc.skills.SkillSet.init(a);
+    defer set.deinit();
+    try set.loadFromDir(dir);
+
+    var reg = cc.tools_dynamic.DynRegistry.init(a);
+    defer reg.deinit();
+    try cc.skills_tool.registerSkillTool(&reg, &set);
+
+    // 这才是真正的生产路径：模型通过 tools.dispatch 调用,而不是绕过 dispatch 直接 find
+    var ctx = cc.tools.ToolContext.simple(a);
+    ctx.dyn_registry = &reg;
+    const out = try cc.tools.dispatch(&ctx, "Skill", "{\"name\":\"demo\"}");
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "# Skill: demo") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Demo body") != null);
+    // allowed_tools 软约束被注入
+    try std.testing.expect(std.mem.indexOf(u8, out, "ONLY use these tools: Read, Grep") != null);
+}
+
+test "Skills E2E: buildWithSkills injects skill list into system prompt" {
+    const a = std.testing.allocator;
+    const dir = "/tmp/cc-zig-skills-sysprompt";
+    defer {
+        rmSkill(dir, "inject-me");
+        if (a.dupeZ(u8, dir)) |dz| {
+            defer a.free(dz);
+            _ = std.c.rmdir(dz);
+        } else |_| {}
+    }
+    try makeSkill(dir, "inject-me", "---\nname: inject-me\ndescription: Should appear in sysprompt\n---\nbody\n");
+
+    var set = cc.skills.SkillSet.init(a);
+    defer set.deinit();
+    try set.loadFromDir(dir);
+
+    const sp = @import("cc").system_prompt;
+    const prompt = try sp.buildWithSkills(a, "claude-opus-4-7", &set);
+    defer a.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "# Available skills") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "**inject-me**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Should appear in sysprompt") != null);
+}

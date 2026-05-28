@@ -251,20 +251,48 @@ fn buildEnvSection(allocator: std.mem.Allocator, model: []const u8) ![]u8 {
 
 /// 构造完整 system prompt。caller 拥有返回 slice。
 pub fn build(allocator: std.mem.Allocator, model: []const u8) ![]u8 {
+    return buildWithSkills(allocator, model, null);
+}
+
+/// 同 build，外加 skills section（让模型知道有哪些 Skill 可激活、何时激活）。
+/// skills 为 null 或空时不追加该 section（行为同 build）。
+pub fn buildWithSkills(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    skills: ?*const @import("../skills/skill.zig").SkillSet,
+) ![]u8 {
     const env_section = try buildEnvSection(allocator, model);
     defer allocator.free(env_section);
 
+    const skills_section = if (skills) |s| try buildSkillsSection(allocator, s) else try allocator.dupe(u8, "");
+    defer allocator.free(skills_section);
+
     const sep = "\n\n";
     return try std.mem.concat(allocator, u8, &.{
-        INTRO_SECTION, sep,
-        SYSTEM_SECTION, sep,
-        DOING_TASKS_SECTION, sep,
-        ACTIONS_SECTION, sep,
-        USING_TOOLS_SECTION, sep,
-        TONE_SECTION, sep,
+        INTRO_SECTION,             sep,
+        SYSTEM_SECTION,            sep,
+        DOING_TASKS_SECTION,       sep,
+        ACTIONS_SECTION,           sep,
+        USING_TOOLS_SECTION,       sep,
+        TONE_SECTION,              sep,
         OUTPUT_EFFICIENCY_SECTION, sep,
         env_section,
+        if (skills_section.len > 0) sep else "",
+        skills_section,
     });
+}
+
+/// 构造 skills section。空 set 返回空串（caller 不会加 separator）。
+fn buildSkillsSection(allocator: std.mem.Allocator, set: *const @import("../skills/skill.zig").SkillSet) ![]u8 {
+    if (set.len() == 0) return try allocator.dupe(u8, "");
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("# Available skills\n\nYou have access to the following skills. Each describes a focused workflow; activate one by calling the `Skill` tool with the matching `name`. The tool returns the skill's instructions, which you should then follow for that task.\n\n");
+    for (set.skills.items) |s| {
+        try out.writer.print("- **{s}** — {s}\n", .{ s.name, s.description });
+    }
+    return try out.toOwnedSlice();
 }
 
 // ============================================================================
@@ -299,4 +327,26 @@ test "env section includes model id" {
     defer testing.allocator.free(s);
     try testing.expect(std.mem.indexOf(u8, s, "claude-opus-4-7") != null);
     try testing.expect(std.mem.indexOf(u8, s, "# Environment") != null);
+}
+
+test "buildWithSkills empty set behaves like build (no skills section)" {
+    var set = @import("../skills/skill.zig").SkillSet.init(testing.allocator);
+    defer set.deinit();
+    const s = try buildWithSkills(testing.allocator, "claude-opus-4-7", &set);
+    defer testing.allocator.free(s);
+    try testing.expect(std.mem.indexOf(u8, s, "# Available skills") == null);
+}
+
+test "buildWithSkills includes skill name + description" {
+    const skill_mod = @import("../skills/skill.zig");
+    var set = skill_mod.SkillSet.init(testing.allocator);
+    defer set.deinit();
+    const md = "---\nname: code-review\ndescription: Review pending changes for bugs\n---\nbody\n";
+    try set.skills.append(testing.allocator, try skill_mod.parseSkillMd(testing.allocator, md, "/fake"));
+
+    const s = try buildWithSkills(testing.allocator, "claude-opus-4-7", &set);
+    defer testing.allocator.free(s);
+    try testing.expect(std.mem.indexOf(u8, s, "# Available skills") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "**code-review**") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "Review pending changes") != null);
 }

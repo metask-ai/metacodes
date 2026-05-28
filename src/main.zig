@@ -20,10 +20,12 @@ pub const write_tool = @import("tools/write.zig");
 pub const edit_tool = @import("tools/edit.zig");
 pub const mcp_client = @import("mcp/client.zig");
 pub const mcp_protocol = @import("mcp/protocol.zig");
+pub const mcp_registry_bridge = @import("mcp/registry_bridge.zig");
 pub const skills = @import("skills/skill.zig");
 pub const skills_tool = @import("skills/tool.zig");
 pub const skills_discovery = @import("skills/discovery.zig");
 pub const tools_dynamic = @import("tools/dynamic.zig");
+pub const system_prompt = @import("core/system_prompt.zig");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
