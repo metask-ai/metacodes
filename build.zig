@@ -99,6 +99,7 @@ pub fn build(b: *std.Build) void {
         "tests/integration/tool_abort_test.zig",
         "tests/integration/mcp_e2e_test.zig",
         "tests/integration/skills_e2e_test.zig",
+        "tests/integration/agents_e2e_test.zig",
     };
     for (integ_files) |f| {
         const m = b.createModule(.{

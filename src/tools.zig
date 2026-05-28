@@ -136,8 +136,14 @@ pub const registry: []const ToolEntry = &.{
         .execute = task_tools.executeStop,
     },
     .{
+        .name = "Task",
+        .description = "Launch a subagent in an isolated context to handle a side task. Each subagent starts with a fresh context — it cannot see this conversation, only the prompt you pass. Use for: high-volume operations (running tests, processing logs), parallel research, isolating exploration that would flood your context. Args: subagent_type (Explore/Plan/general-purpose/<custom>), description (3-5 word UI label), prompt (the delegation message). Optional: max_turns, model.",
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{ "subagent_type", "description", "prompt" } },
+        .execute = agent_tool.execute,
+    },
+    .{
         .name = "Agent",
-        .description = "Spawn a sub-agent with an isolated conversation to handle an independent sub-task. The sub-agent shares tools + permissions with the parent. Returns the sub-agent's final text and stop info. Use for focused research or tool-heavy work you don't want polluting your context.",
+        .description = "Deprecated alias for Task. Use Task with subagent_type instead. Currently routes to Task with subagent_type=\"general-purpose\".",
         .input_schema = .{ .type = "object", .properties = null, .required = &.{"prompt"} },
         .execute = agent_tool.execute,
     },
@@ -222,6 +228,7 @@ test "getTool by name" {
     try std.testing.expect(getTool("TaskUpdate") != null);
     try std.testing.expect(getTool("TaskStop") != null);
     try std.testing.expect(getTool("Agent") != null);
+    try std.testing.expect(getTool("Task") != null);
     try std.testing.expect(getTool("NonExistent") == null);
     try std.testing.expect(getTool("web_search") == null);
 }

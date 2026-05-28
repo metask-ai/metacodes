@@ -62,6 +62,12 @@ pub const ToolContext = struct {
     project_dir: []const u8 = "",
     /// 全局 disable-shell-execution 开关(settings.json `disableSkillShellExecution`)。
     disable_shell_execution: bool = false,
+    /// Subagent 定义集合(Task 工具据此找 subagent_type → AgentDef)。
+    agents: ?*const @import("../agents/set.zig").AgentSet = null,
+    /// 父 model(供 subagent model 字段 `inherit` 解析)。
+    parent_model: []const u8 = "",
+    /// Skill 集合(供 subagent preload_skills 字段读取 skill body)。
+    skills: ?*const @import("../skills/skill.zig").SkillSet = null,
 
     /// 便利构造：只需 allocator 的场景（大多数单元测试）。
     pub fn simple(allocator: std.mem.Allocator) ToolContext {

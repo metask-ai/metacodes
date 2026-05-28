@@ -261,11 +261,25 @@ pub fn buildWithSkills(
     model: []const u8,
     skills: ?*const @import("../skills/skill.zig").SkillSet,
 ) ![]u8 {
+    return buildWithSkillsAndAgents(allocator, model, skills, null);
+}
+
+/// 完整版:skills section + subagents section。
+/// agents 为 null/空 → 不追加 subagent 章节。
+pub fn buildWithSkillsAndAgents(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    skills: ?*const @import("../skills/skill.zig").SkillSet,
+    agents: ?*const @import("../agents/set.zig").AgentSet,
+) ![]u8 {
     const env_section = try buildEnvSection(allocator, model);
     defer allocator.free(env_section);
 
     const skills_section = if (skills) |s| try buildSkillsSection(allocator, s) else try allocator.dupe(u8, "");
     defer allocator.free(skills_section);
+
+    const agents_section = if (agents) |a| try buildAgentsSection(allocator, a) else try allocator.dupe(u8, "");
+    defer allocator.free(agents_section);
 
     const sep = "\n\n";
     return try std.mem.concat(allocator, u8, &.{
@@ -279,7 +293,22 @@ pub fn buildWithSkills(
         env_section,
         if (skills_section.len > 0) sep else "",
         skills_section,
+        if (agents_section.len > 0) sep else "",
+        agents_section,
     });
+}
+
+/// 构造 subagents section,引导模型何时通过 Task 工具委托。
+fn buildAgentsSection(allocator: std.mem.Allocator, set: *const @import("../agents/set.zig").AgentSet) ![]u8 {
+    if (set.len() == 0) return try allocator.dupe(u8, "");
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("# Available subagents\n\nYou can delegate side tasks to subagents using the `Task` tool. Each subagent runs in its own isolated context — it does not see this conversation, only the prompt you pass it. Use a subagent when a side task would flood your main conversation with search results, logs, or file contents you won't reference again.\n\n");
+    for (set.agents.items) |a| {
+        try out.writer.print("- **{s}** — {s}\n", .{ a.name, a.description });
+    }
+    try out.writer.writeAll("\nTo invoke: `Task(subagent_type=\"<name>\", description=\"<short label>\", prompt=\"<delegation message>\")`.\n");
+    return try out.toOwnedSlice();
 }
 
 /// 构造 skills section。空 set 返回空串（caller 不会加 separator）。

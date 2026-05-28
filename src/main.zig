@@ -26,6 +26,10 @@ pub const skills_tool = @import("skills/tool.zig");
 pub const skills_discovery = @import("skills/discovery.zig");
 pub const active_skill = @import("skills/active.zig");
 pub const permission = @import("permission.zig");
+pub const agents_def = @import("agents/def.zig");
+pub const agents_set = @import("agents/set.zig");
+pub const agents_filter = @import("agents/filter.zig");
+pub const agents_preload = @import("agents/preload.zig");
 pub const tools_dynamic = @import("tools/dynamic.zig");
 pub const system_prompt = @import("core/system_prompt.zig");
 
@@ -165,6 +169,10 @@ test {
     _ = &@import("skills/skill.zig");
     _ = &@import("skills/render.zig");
     _ = &@import("skills/discovery.zig");
+    _ = &@import("agents/def.zig");
+    _ = &@import("agents/set.zig");
+    _ = &@import("agents/filter.zig");
+    _ = &@import("agents/preload.zig");
     _ = &@import("skills/tool.zig");
     _ = &@import("app/config.zig");
     _ = &@import("core/subagent.zig");

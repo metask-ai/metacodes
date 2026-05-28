@@ -75,6 +75,12 @@ pub const Options = struct {
     session_id: []const u8 = "",
     project_dir: []const u8 = "",
     disable_shell_execution: bool = false,
+    /// 子 agent 定义集合(Task 工具据此找 subagent_type)。
+    agents: ?*const @import("../agents/set.zig").AgentSet = null,
+    /// 当前会话用的 model 名(供 subagent inherit 解析)。
+    parent_model: []const u8 = "",
+    /// Skill 集合(Task 工具 subagent preload_skills 字段用)。
+    skills_set: ?*const @import("../skills/skill.zig").SkillSet = null,
 };
 
 /// usage 回调接口：stream 每次吐 usage event 时调用。
@@ -348,6 +354,9 @@ pub fn run(
                     .session_id = opts.session_id,
                     .project_dir = opts.project_dir,
                     .disable_shell_execution = opts.disable_shell_execution,
+                    .agents = opts.agents,
+                    .parent_model = opts.parent_model,
+                    .skills = opts.skills_set,
                 };
                 break :blk tools_mod.dispatch(&tool_ctx, tu.name, tu.input);
             } catch |err| {

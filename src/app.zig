@@ -27,6 +27,7 @@ const skill_tool_mod = @import("skills/tool.zig");
 const McpClient = @import("mcp/client.zig").McpClient;
 const McpSession = @import("mcp/registry_bridge.zig").McpSession;
 const ActiveSkillState = @import("skills/active.zig").ActiveSkillState;
+const AgentSet = @import("agents/set.zig").AgentSet;
 
 pub const UsageTotals = struct {
     input_tokens: u64 = 0,
@@ -106,6 +107,8 @@ pub const App = struct {
     /// 启动时缓存的 project root(沿 cwd 向上找 .git);null = 不在 git repo。
     /// 供 ${CLAUDE_PROJECT_DIR} 替换用。
     project_dir: ?[]u8 = null,
+    /// 已加载的 subagent 定义集合(builtin + personal + project)。
+    agents: AgentSet,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -133,6 +136,7 @@ pub const App = struct {
             .tasks = TaskStore.init(allocator),
             .dyn_registry = DynRegistry.init(allocator),
             .mcp_sessions = .empty,
+            .agents = AgentSet.init(allocator),
         };
 
         // 启动时加载 skills:enterprise / ~/.cc-zig / ~/.claude / project chain。
@@ -140,6 +144,8 @@ pub const App = struct {
         const cwd_for_skills = @import("util/fs.zig").getCwd(allocator) catch null;
         defer if (cwd_for_skills) |c| allocator.free(c);
         app.skills.loadFromStandardPaths(cwd_for_skills orelse "") catch {};
+        // 加载 subagent 定义(builtin 三个 + personal + project)
+        app.agents.loadFromStandardPaths(cwd_for_skills orelse "") catch {};
         // 缓存 project root(供 ${CLAUDE_PROJECT_DIR} 替换)
         if (cwd_for_skills) |cwd| {
             app.project_dir = @import("skills/skill.zig").findRepoRoot(allocator, cwd) catch null;
@@ -182,7 +188,7 @@ pub const App = struct {
         };
 
         // 构造 system prompt（依赖 config.model）。失败仅 log，保持 null。
-        app.system_prompt = system_prompt_mod.buildWithSkills(allocator, config.model, &app.skills) catch |err| blk: {
+        app.system_prompt = system_prompt_mod.buildWithSkillsAndAgents(allocator, config.model, &app.skills, &app.agents) catch |err| blk: {
             @import("util/log.zig").warn("sysprompt", "build failed: {s} (continuing without system prompt)", .{@errorName(err)});
             break :blk null;
         };
@@ -209,6 +215,7 @@ pub const App = struct {
         app.dyn_registry.deinit();
         if (app.active_skill) |*as| as.deinit();
         if (app.project_dir) |p| app.allocator.free(p);
+        app.agents.deinit();
         if (app.rule_set) |*r| r.deinit();
         if (app.jobs) |*j| j.deinit();
         if (app.system_prompt) |s| app.allocator.free(s);

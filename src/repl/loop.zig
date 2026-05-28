@@ -276,7 +276,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             &app.api_client,
             app.tool_defs,
             &app.permission_ctx,
-            .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty() },
+            .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills },
             &writer,
             allocator,
         ) catch |err| {
@@ -860,7 +860,7 @@ fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
 
     // 重建 system prompt（含 knowledge cutoff、模型名）。失败保留旧的。
     const sp_mod = @import("../core/system_prompt.zig");
-    if (sp_mod.buildWithSkills(allocator, new_model, &app.skills)) |sp| {
+    if (sp_mod.buildWithSkillsAndAgents(allocator, new_model, &app.skills, &app.agents)) |sp| {
         if (app.system_prompt) |old| allocator.free(old);
         app.system_prompt = sp;
     } else |err| {
@@ -1036,20 +1036,76 @@ fn handleMcp(app: *app_mod.App) !void {
     }
 }
 
-/// /agents：列出可用的 sub-agent 能力。当前无独立 agent 定义文件系统，
-/// agent 通过内建 Agent 工具内联 spawn——这里说明可用性 + 嵌套上限。
+/// /agents:列出已加载的 subagent 定义(builtin / personal / project / plugin)。
 fn handleAgents(app: *app_mod.App) !void {
-    _ = app;
+    if (app.agents.len() == 0) {
+        std.debug.print("(no subagents loaded)\n", .{});
+        return;
+    }
+
+    // 按来源分组打印
+    const Origin = @import("../agents/def.zig").Origin;
+    const origins = [_]struct { tag: Origin, label: []const u8, color: []const u8 }{
+        .{ .tag = .builtin, .label = "Built-in", .color = "\x1b[33m" },
+        .{ .tag = .personal, .label = "Personal", .color = "\x1b[36m" },
+        .{ .tag = .project, .label = "Project", .color = "\x1b[32m" },
+        .{ .tag = .plugin, .label = "Plugin", .color = "\x1b[35m" },
+        .{ .tag = .cli, .label = "CLI", .color = "\x1b[34m" },
+    };
+
+    std.debug.print("\x1b[1mAvailable subagents ({d})\x1b[0m\n", .{app.agents.len()});
+    for (origins) |og| {
+        var first = true;
+        for (app.agents.agents.items) |*a| {
+            if (a.origin != og.tag) continue;
+            if (first) {
+                std.debug.print("\n{s}{s}\x1b[0m:\n", .{ og.color, og.label });
+                first = false;
+            }
+            // tools 提示
+            const tools_label = if (a.tools.len == 0) "(inherits parent tools)" else "";
+            std.debug.print("  \x1b[1m{s}\x1b[0m — {s}\n", .{ a.name, a.description });
+            if (a.tools.len > 0) {
+                std.debug.print("    tools: ", .{});
+                for (a.tools, 0..) |t, i| {
+                    if (i > 0) std.debug.print(", ", .{});
+                    std.debug.print("{s}", .{t});
+                }
+                std.debug.print("\n", .{});
+            } else {
+                std.debug.print("    {s}\n", .{tools_label});
+            }
+            if (a.disallowed_tools.len > 0) {
+                std.debug.print("    disallowed: ", .{});
+                for (a.disallowed_tools, 0..) |t, i| {
+                    if (i > 0) std.debug.print(", ", .{});
+                    std.debug.print("{s}", .{t});
+                }
+                std.debug.print("\n", .{});
+            }
+            if (!std.mem.eql(u8, a.model, "inherit") and a.model.len > 0) {
+                std.debug.print("    model: {s}\n", .{a.model});
+            }
+            if (a.permission_mode) |m| {
+                std.debug.print("    permissionMode: {s}\n", .{@tagName(m)});
+            }
+            if (a.preload_skills.len > 0) {
+                std.debug.print("    preloaded skills: ", .{});
+                for (a.preload_skills, 0..) |s, i| {
+                    if (i > 0) std.debug.print(", ", .{});
+                    std.debug.print("{s}", .{s});
+                }
+                std.debug.print("\n", .{});
+            }
+            if (a.source_path.len > 0) {
+                std.debug.print("    \x1b[2msource: {s}\x1b[0m\n", .{a.source_path});
+            }
+        }
+    }
+
     std.debug.print(
-        \\Sub-agents:
-        \\  Agent (built-in tool) — spawn an isolated sub-agent for a focused sub-task.
-        \\    The sub-agent shares the same tool set + permissions as the parent and
-        \\    runs in its own conversation (does not pollute the parent context).
-        \\    Max nesting depth: 3.  Args: prompt (required), description, max_turns.
         \\
-        \\Note: file-based agent definitions (~/.cc-zig/agents/<name>.md) are not yet
-        \\loaded; a future release will let you register named agents with custom
-        \\system prompts + tool allowlists.
+        \\Use via the `Task` tool: `Task(subagent_type="<name>", description="...", prompt="...")`.
         \\
     , .{});
 }

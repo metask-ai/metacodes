@@ -37,6 +37,15 @@ pub const SpawnOptions = struct {
     agent_depth: u8 = 1,
     /// 父 agent 的 dyn_registry，子 agent 共享同一套 Skill/MCP 工具。
     dyn_registry: ?*const @import("../tools/dynamic.zig").DynRegistry = null,
+    /// 子 agent 可见的工具白名单(空 = 继承父全部)。已经应用永久禁用集 + def 过滤。
+    /// 注意:此处覆盖 tool_defs 参数本身;子 agent_loop 用这个 tool_defs 跑。
+    tool_defs_override: ?[]const json_mod.ToolDefinition = null,
+    /// per-spawn permission mode 覆盖。null = 沿用父 permission_ctx。
+    permission_mode_override: ?@import("../types.zig").PermissionMode = null,
+    /// 父 dispatch 传过来的回调,subagent 同样需要 Skill 工具激活权限态等。
+    activate_skill_state: ?*anyopaque = null,
+    activate_skill_fn: ?*const fn (state: *anyopaque, skill_name: []const u8, allowed: []const []const u8, disallowed: []const []const u8) anyerror!void = null,
+    project_dir: []const u8 = "",
 };
 
 pub fn spawnAgent(
@@ -53,20 +62,31 @@ pub fn spawnAgent(
 
     try conv.appendText(.user, prompt);
 
+    // 选择实际用的 tool_defs:override > 父
+    const effective_tool_defs = opts.tool_defs_override orelse tool_defs;
+
+    // 选择实际用的 permission_ctx
+    var ctx_override: permission_mod.PermissionContext = permission_ctx.*;
+    if (opts.permission_mode_override) |m| ctx_override.mode = m;
+    const ctx_to_use: *const permission_mod.PermissionContext = if (opts.permission_mode_override != null) &ctx_override else permission_ctx;
+
     var sink = NullWriter{};
     const result = try agent_loop.run(
         &conv,
         api_client,
-        tool_defs,
-        permission_ctx,
+        effective_tool_defs,
+        ctx_to_use,
         .{
             .max_turns = opts.max_turns,
             .system_prompt = opts.system_prompt,
             .abort = abort,
             .api_client = api_client,
-            .tool_defs = tool_defs,
+            .tool_defs = effective_tool_defs,
             .agent_depth = opts.agent_depth,
             .dyn_registry = opts.dyn_registry,
+            .activate_skill_state = opts.activate_skill_state,
+            .activate_skill_fn = opts.activate_skill_fn,
+            .project_dir = opts.project_dir,
         },
         &sink,
         allocator,
