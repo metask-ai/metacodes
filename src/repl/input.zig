@@ -43,6 +43,8 @@ pub const Key = union(enum) {
     shift_tab, // cycle 权限模式
     ctrl_r,
     ctrl_t, // 切换任务列表显示
+    ctrl_o, // 打开 transcript viewer
+    ctrl_x, // Ctrl+X 前缀(配合 Ctrl+K kill 后台)
     paste_begin, // 括号粘贴起始 ESC[200~
     paste_end, // 括号粘贴结束 ESC[201~
     unknown,
@@ -184,6 +186,8 @@ fn byteToKey(b: u8) Key {
         0x09 => .tab,
         0x12 => .ctrl_r,
         0x14 => .ctrl_t,
+        0x0f => .ctrl_o,
+        0x18 => .ctrl_x,
         0x7f, 0x08 => .backspace,
         0x01 => .ctrl_a,
         0x03 => .ctrl_c,
@@ -283,6 +287,10 @@ pub const Action = enum {
     toggle_task_list,
     /// Esc Esc(空 buffer 二次):清 draft + 保存到历史
     clear_draft,
+    /// Ctrl+O:打开 transcript viewer
+    open_transcript,
+    /// Ctrl+X Ctrl+K:kill 所有后台任务
+    kill_background,
     /// 无语义变化（如 unknown 键）
     none,
 };
@@ -295,6 +303,8 @@ pub const LineEditor = struct {
     ctrl_c_armed: bool = false,
     /// 上一次按键是否是 Esc(用于 Esc Esc 双击清 draft)。
     esc_armed: bool = false,
+    /// 上一次按键是否是 Ctrl+X(用于 Ctrl+X Ctrl+K 序列)。
+    ctrl_x_armed: bool = false,
     /// yank ring:Ctrl+W/K/U 删除的内容存这,Ctrl+Y 粘回。
     yank_buf: std.ArrayList(u8),
 
@@ -318,6 +328,10 @@ pub const LineEditor = struct {
         const was_esc_armed = self.esc_armed;
         if (@as(std.meta.Tag(Key), key) != .esc) {
             self.esc_armed = false;
+        }
+        const was_ctrl_x_armed = self.ctrl_x_armed;
+        if (@as(std.meta.Tag(Key), key) != .ctrl_x) {
+            self.ctrl_x_armed = false;
         }
 
         switch (key) {
@@ -377,6 +391,8 @@ pub const LineEditor = struct {
                 return .redraw;
             },
             .ctrl_k => {
+                // Ctrl+X Ctrl+K 序列:kill 后台任务
+                if (was_ctrl_x_armed) return .kill_background;
                 if (self.cursor >= self.buf.items.len) return .none;
                 self.buf.items.len = self.cursor; // 截断
                 return .redraw;
@@ -407,6 +423,11 @@ pub const LineEditor = struct {
             .shift_tab => return .cycle_perm_mode,
             .ctrl_r => return .reverse_search,
             .ctrl_t => return .toggle_task_list,
+            .ctrl_o => return .open_transcript,
+            .ctrl_x => {
+                self.ctrl_x_armed = true;
+                return .none;
+            },
             .ctrl_l => return .redraw_screen,
             .ctrl_w => {
                 // 删上一个词:从 cursor 往前跳过空白,再删到上一个词边界
@@ -908,6 +929,34 @@ test "LineEditor: Esc Esc on empty buffer does not clear" {
 test "KeyParser: ctrl_t byte" {
     var p = KeyParser{};
     try testing.expect(p.feed(0x14).? == .ctrl_t);
+}
+
+test "LineEditor: ctrl_o returns open_transcript" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    try testing.expect((try ed.handle(.ctrl_o)) == .open_transcript);
+}
+
+test "LineEditor: Ctrl+X Ctrl+K sequence → kill_background" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    try testing.expect((try ed.handle(.ctrl_x)) == .none); // arm
+    try testing.expect((try ed.handle(.ctrl_k)) == .kill_background);
+}
+
+test "LineEditor: ctrl_k alone truncates (not kill)" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    try typeStr(&ed, "hello");
+    ed.cursor = 2;
+    try testing.expect((try ed.handle(.ctrl_k)) == .redraw);
+    try testing.expectEqualStrings("he", ed.view());
+}
+
+test "KeyParser: ctrl_o / ctrl_x bytes" {
+    var p = KeyParser{};
+    try testing.expect(p.feed(0x0f).? == .ctrl_o);
+    try testing.expect(p.feed(0x18).? == .ctrl_x);
 }
 
 test "KeyParser: shift_tab via ESC [ Z" {

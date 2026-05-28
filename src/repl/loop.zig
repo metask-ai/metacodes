@@ -533,6 +533,19 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
                 std.debug.print("> ", .{});
                 try redrawLine(editor.view(), editor.cursor);
             },
+            .open_transcript => {
+                input.restoreMode(fd, orig); // 暂退 raw mode 让 viewer 自管
+                const tv = @import("transcript_viewer.zig");
+                tv.run(fd, allocator, &app.conversation, termRows()) catch {};
+                _ = input.enterRawMode(fd);
+                std.debug.print("> ", .{});
+                try redrawLine(editor.view(), editor.cursor);
+            },
+            .kill_background => {
+                const killed = killAllBackground(app);
+                std.debug.print("\r\x1b[2K\x1b[33m[killed {d} background task(s)]\x1b[0m\n> ", .{killed});
+                try redrawLine(editor.view(), editor.cursor);
+            },
             .clear_draft => {
                 // 把当前 draft 存入历史(Up 可恢复),然后清空
                 if (editor.view().len > 0) {
@@ -1350,6 +1363,28 @@ fn readMemory(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
         try buf.appendSlice(allocator, chunk[0..@intCast(n)]);
     }
     return try buf.toOwnedSlice(allocator);
+}
+
+/// 取终端行数(失败回退 24)。
+fn termRows() usize {
+    var ws: std.c.winsize = undefined;
+    const TIOCGWINSZ: c_ulong = if (@import("builtin").os.tag == .macos) 0x40087468 else 0x5413;
+    if (std.c.ioctl(1, TIOCGWINSZ, &ws) == 0 and ws.row > 0) return ws.row;
+    return 24;
+}
+
+/// 杀所有 running 后台任务,返回杀掉的数量。
+fn killAllBackground(app: *app_mod.App) usize {
+    const jobs = if (app.jobs) |*j| j else return 0;
+    var killed: usize = 0;
+    // 收集 running id(避免迭代中改 collection)
+    for (jobs.jobs.items) |*j| {
+        if (j.status != .running) continue;
+        var id_copy: [12]u8 = j.id;
+        jobs.kill(id_copy[0..]) catch continue;
+        killed += 1;
+    }
+    return killed;
 }
 
 /// Ctrl+T:打印任务列表(最多 5 个,带状态图标)。覆盖到 prompt 上方。
