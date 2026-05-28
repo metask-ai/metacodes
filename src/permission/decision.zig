@@ -18,10 +18,24 @@ pub const Context = struct {
     mode: Mode,
     /// 可选的细粒度规则集。非 null 时先查规则，命中即用；都不命中落回四模式。
     rules: ?*const rule_matcher.RuleSet = null,
+    /// 当前激活 skill 的临时白/黑名单(若有)。优先级:active_skill > rules > mode。
+    active_skill: ?*const @import("../skills/active.zig").ActiveSkillState = null,
 };
 
 /// 根据模式 + 工具名决定：允许 / 拒绝 / 询问。
 pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decision {
+    // 0. 最高优先:active skill 白/黑名单
+    if (ctx.active_skill) |as| {
+        if (as.isDisallowed(tool_name, args)) {
+            log.debug("permission", "active skill '{s}' disallowed tool={s}", .{ as.skill_name, tool_name });
+            return .deny;
+        }
+        if (as.isAllowed(tool_name, args)) {
+            log.debug("permission", "active skill '{s}' allowed tool={s}", .{ as.skill_name, tool_name });
+            return .allow;
+        }
+    }
+
     // 先查细粒度规则
     if (ctx.rules) |rs| {
         if (rs.match(tool_name, args)) |d| {

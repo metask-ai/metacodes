@@ -97,7 +97,7 @@ test "Skills E2E: tools.dispatch routes Skill tool through dyn_registry" {
     try std.testing.expect(std.mem.indexOf(u8, out, "# Skill: demo") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Demo body") != null);
     // allowed_tools 软约束被注入
-    try std.testing.expect(std.mem.indexOf(u8, out, "ONLY use these tools: Read, Grep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Active tool grants: Read, Grep") != null);
 }
 
 test "Skills E2E: buildWithSkills injects skill list into system prompt" {
@@ -122,4 +122,176 @@ test "Skills E2E: buildWithSkills injects skill list into system prompt" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "# Available skills") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "**inject-me**") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Should appear in sysprompt") != null);
+}
+
+// =====================================================================
+// Stage B/C/D 综合集成测试
+// =====================================================================
+
+test "Skills E2E: bash injection runs at activation time and emits stdout" {
+    const a = std.testing.allocator;
+    const dir = "/tmp/cc-zig-skills-bash-inject";
+    defer {
+        rmSkill(dir, "echoer");
+        if (a.dupeZ(u8, dir)) |dz| {
+            defer a.free(dz);
+            _ = std.c.rmdir(dz);
+        } else |_| {}
+    }
+    try makeSkill(dir, "echoer",
+        "---\nname: echoer\ndescription: bash inject test\n---\n" ++
+        "Output: !`echo hello-from-bash`\n");
+
+    var set = cc.skills.SkillSet.init(a);
+    defer set.deinit();
+    try set.loadFromDir(dir);
+
+    var reg = cc.tools_dynamic.DynRegistry.init(a);
+    defer reg.deinit();
+    try cc.skills_tool.registerSkillTool(&reg, &set);
+
+    var ctx = cc.tools.ToolContext.simple(a);
+    ctx.dyn_registry = &reg;
+    const out = try cc.tools.dispatch(&ctx, "Skill", "{\"name\":\"echoer\"}");
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Output: hello-from-bash") != null);
+}
+
+test "Skills E2E: disable-model-invocation blocks auto, allows explicit" {
+    const a = std.testing.allocator;
+    const dir = "/tmp/cc-zig-skills-dmi";
+    defer {
+        rmSkill(dir, "deploy");
+        if (a.dupeZ(u8, dir)) |dz| {
+            defer a.free(dz);
+            _ = std.c.rmdir(dz);
+        } else |_| {}
+    }
+    try makeSkill(dir, "deploy",
+        "---\nname: deploy\ndescription: deploys\ndisable-model-invocation: true\n---\nDeploy steps.\n");
+
+    var set = cc.skills.SkillSet.init(a);
+    defer set.deinit();
+    try set.loadFromDir(dir);
+
+    var reg = cc.tools_dynamic.DynRegistry.init(a);
+    defer reg.deinit();
+    try cc.skills_tool.registerSkillTool(&reg, &set);
+
+    // 模型路径(explicit_invocation=false 默认):应被拒
+    var ctx_auto = cc.tools.ToolContext.simple(a);
+    ctx_auto.dyn_registry = &reg;
+    const out_auto = try cc.tools.dispatch(&ctx_auto, "Skill", "{\"name\":\"deploy\"}");
+    defer a.free(out_auto);
+    try std.testing.expect(std.mem.indexOf(u8, out_auto, "SkillRequiresExplicitInvocation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_auto, "Deploy steps") == null);
+
+    // 用户显式路径(explicit_invocation=true):放行
+    var ctx_explicit = cc.tools.ToolContext.simple(a);
+    ctx_explicit.dyn_registry = &reg;
+    ctx_explicit.explicit_invocation = true;
+    const out_explicit = try cc.tools.dispatch(&ctx_explicit, "Skill", "{\"name\":\"deploy\"}");
+    defer a.free(out_explicit);
+    try std.testing.expect(std.mem.indexOf(u8, out_explicit, "Deploy steps") != null);
+}
+
+test "Skills E2E: allowed-tools active skill overrides prompt-mode ask" {
+    const a = std.testing.allocator;
+    const active_mod = @import("cc").active_skill;
+
+    // 模拟在 prompt mode 下(Bash 默认会 ask),激活 skill 后 Bash(git *) 应直接 allow
+    const allowed = [_][]const u8{"Bash(git *)"};
+    var st = try active_mod.ActiveSkillState.init(a, "test", &allowed, &.{});
+    defer st.deinit();
+
+    // 构造 PermissionContext with active_skill
+    var ctx = cc.permission.createContext(.prompt, a);
+    ctx.active_skill = &st;
+
+    // git 命令应被 allow(active skill 覆盖 mode 的 ask)
+    const d1 = cc.permission.checkPermission(&ctx, "Bash", "{\"command\":\"git status\"}");
+    try std.testing.expect(d1 == .allow);
+
+    // 不在白名单的 Bash 命令仍 ask(prompt mode 默认)
+    const d2 = cc.permission.checkPermission(&ctx, "Bash", "{\"command\":\"rm -rf /\"}");
+    try std.testing.expect(d2 == .ask);
+}
+
+test "Skills E2E: disallowed-tools active skill turns allow into deny" {
+    const a = std.testing.allocator;
+    const active_mod = @import("cc").active_skill;
+    const disallowed = [_][]const u8{"AskUserQuestion"};
+    var st = try active_mod.ActiveSkillState.init(a, "test", &.{}, &disallowed);
+    defer st.deinit();
+
+    // 在 bypass 模式下,默认本应 allow;但 disallowed 应胜出 deny
+    var ctx = cc.permission.createContext(.bypass, a);
+    ctx.active_skill = &st;
+    const d = cc.permission.checkPermission(&ctx, "AskUserQuestion", "{}");
+    try std.testing.expect(d == .deny);
+}
+
+test "Skills E2E: $ARGUMENTS rendering through dispatch" {
+    const a = std.testing.allocator;
+    const dir = "/tmp/cc-zig-skills-args";
+    defer {
+        rmSkill(dir, "greet");
+        if (a.dupeZ(u8, dir)) |dz| {
+            defer a.free(dz);
+            _ = std.c.rmdir(dz);
+        } else |_| {}
+    }
+    try makeSkill(dir, "greet",
+        "---\nname: greet\ndescription: hello\n---\nHello $ARGUMENTS!\n");
+
+    var set = cc.skills.SkillSet.init(a);
+    defer set.deinit();
+    try set.loadFromDir(dir);
+
+    var reg = cc.tools_dynamic.DynRegistry.init(a);
+    defer reg.deinit();
+    try cc.skills_tool.registerSkillTool(&reg, &set);
+
+    var ctx = cc.tools.ToolContext.simple(a);
+    ctx.dyn_registry = &reg;
+    const out = try cc.tools.dispatch(&ctx, "Skill", "{\"name\":\"greet\",\"args\":[\"world\"]}");
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Hello world!") != null);
+}
+
+test "Skills E2E: ${CLAUDE_SKILL_DIR} resolves to skill source path" {
+    const a = std.testing.allocator;
+    const dir = "/tmp/cc-zig-skills-dir";
+    defer {
+        rmSkill(dir, "pathy");
+        if (a.dupeZ(u8, dir)) |dz| {
+            defer a.free(dz);
+            _ = std.c.rmdir(dz);
+        } else |_| {}
+    }
+    try makeSkill(dir, "pathy",
+        "---\nname: pathy\ndescription: path test\n---\nMy dir: ${CLAUDE_SKILL_DIR}/scripts\n");
+
+    var set = cc.skills.SkillSet.init(a);
+    defer set.deinit();
+    try set.loadFromDir(dir);
+
+    var reg = cc.tools_dynamic.DynRegistry.init(a);
+    defer reg.deinit();
+    try cc.skills_tool.registerSkillTool(&reg, &set);
+
+    var ctx = cc.tools.ToolContext.simple(a);
+    ctx.dyn_registry = &reg;
+    const out = try cc.tools.dispatch(&ctx, "Skill", "{\"name\":\"pathy\"}");
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "My dir: /tmp/cc-zig-skills-dir/pathy/scripts") != null);
+}
+
+test "Skills E2E: project root cwd-walking loads .cc-zig/skills in repo root" {
+    const a = std.testing.allocator;
+    // 用 cc-t2z 自己 repo
+    const cwd = "/Users/david/prj/cc-t2z/cc-zig";
+    const root = try cc.skills.findRepoRoot(a, cwd);
+    defer a.free(root);
+    try std.testing.expect(std.mem.endsWith(u8, root, "cc-t2z"));
 }

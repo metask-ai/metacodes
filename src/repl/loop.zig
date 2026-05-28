@@ -209,6 +209,12 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             try handleMemory(app, allocator, rest);
             continue;
         }
+
+        // 用户显式 /<skill-name> [args] 触发 — 在内建命令之后兜底。
+        // 必须以 / 开头且看起来像 skill 名(无 / 之外的特殊字符)。
+        if (trimmed.len > 1 and trimmed[0] == '/' and try handleSkillInvocation(app, allocator, trimmed[1..])) {
+            continue;
+        }
         // /commit 和 /review：把预置 prompt 注入为 user message，走正常 agent_loop 路径
         if (std.mem.eql(u8, trimmed, "/commit")) {
             try app.conversation.appendText(.user, COMMIT_PROMPT);
@@ -242,6 +248,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
 
         if (final_input.len == 0) continue;
 
+        // 新一条 user message → 清掉上一次 skill 激活的临时白/黑名单
+        app.clearActiveSkill();
+
         try history.append(final_input);
         // 粘贴占位符 [Pasted text #N] → 展开成真实内容再喂给模型；history 保留紧凑占位符。
         const expanded = blk: {
@@ -267,7 +276,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             &app.api_client,
             app.tool_defs,
             &app.permission_ctx,
-            .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry },
+            .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty() },
             &writer,
             allocator,
         ) catch |err| {
@@ -1105,6 +1114,107 @@ fn handleMemory(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     } else {
         std.debug.print("(no memory yet — use /memory add <text>)\n", .{});
     }
+}
+
+/// 用户显式 /<skill-name> [args] 调用。
+/// 返回 true 表示已处理(skill 命中或不存在但语法看起来像 skill 名);
+/// false 表示不是 skill 调用,继续走普通用户消息。
+///
+/// 处理流程:
+/// 1. 拆 head [args...](shell-style 引号)
+/// 2. head 在 skillset 找;没找到 → 友好提示后返 true(避免被当成普通消息发给模型)
+/// 3. 找到 → 构造 user message 写入 transcript "/name [args]"
+///    然后**直接调用 Skill 工具**(explicit_invocation=true),把结果作为 user-side
+///    tool_result 形态注入 conversation(模拟 Skill 工具被用户那边触发了一次)。
+/// 4. 让 agent_loop 跑一轮 — 模型基于激活的 skill 内容回应。
+fn handleSkillInvocation(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !bool {
+    // 拆 head + args(空格分;不深入引号支持,使用 skills/tool.zig 内的 parseShellQuoted 通过 Skill tool args 处理)
+    var head_end: usize = 0;
+    while (head_end < rest.len and rest[head_end] != ' ' and rest[head_end] != '\t') : (head_end += 1) {}
+    const head = rest[0..head_end];
+    if (head.len == 0) return false;
+
+    // 不允许嵌套斜杠/其它特殊字符 — 那不像 skill 名
+    for (head) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != ':') return false;
+    }
+
+    // 是否真有这个 skill
+    if (app.skills.find(head) == null) return false;
+
+    const args_tail = std.mem.trim(u8, rest[head_end..], " \t");
+
+    // 构造 Skill 工具 args:用 args 字符串透传(parseShellQuoted 在 tool.zig 内拆)
+    var skill_args_buf: std.Io.Writer.Allocating = .init(allocator);
+    defer skill_args_buf.deinit();
+    try skill_args_buf.writer.writeAll("{\"name\":");
+    try std.json.Stringify.encodeJsonString(head, .{}, &skill_args_buf.writer);
+    if (args_tail.len > 0) {
+        try skill_args_buf.writer.writeAll(",\"args\":");
+        try std.json.Stringify.encodeJsonString(args_tail, .{}, &skill_args_buf.writer);
+    }
+    try skill_args_buf.writer.writeByte('}');
+    const skill_args_json = try skill_args_buf.toOwnedSlice();
+    defer allocator.free(skill_args_json);
+
+    // 直接调 Skill 工具(绕过模型) — 通过 dyn_registry
+    const skill_entry = app.dyn_registry.find("Skill") orelse {
+        std.debug.print("\x1b[31m/{s}: Skill tool not registered\x1b[0m\n", .{head});
+        return true;
+    };
+    // 上一个 user message 是新的 → 清掉之前的激活态
+    app.clearActiveSkill();
+    var tool_ctx = @import("../tools.zig").ToolContext{
+        .allocator = allocator,
+        .abort = &app.abort,
+        .read_state = &app.read_state,
+        .permission_ctx = &app.permission_ctx,
+        .dyn_registry = &app.dyn_registry,
+        .activate_skill_state = @ptrCast(app),
+        .activate_skill_fn = &app_mod.App.activateSkillTrampoline,
+        .explicit_invocation = true, // 关键:用户显式触发,disable-model-invocation 跳过
+        .project_dir = app.project_dir_or_empty(),
+        .session_id = "",
+    };
+    const skill_result = skill_entry.execute(&tool_ctx, skill_args_json, skill_entry.ctx_ptr) catch |err| {
+        std.debug.print("\x1b[31m/{s}: skill activation failed: {s}\x1b[0m\n", .{ head, @errorName(err) });
+        return true;
+    };
+    defer allocator.free(skill_result);
+
+    // 把命令和激活结果作为用户消息注入 conversation
+    const user_msg = if (args_tail.len > 0)
+        try std.fmt.allocPrint(allocator, "/{s} {s}", .{ head, args_tail })
+    else
+        try std.fmt.allocPrint(allocator, "/{s}", .{head});
+    defer allocator.free(user_msg);
+    try app.conversation.appendText(.user, user_msg);
+
+    // 把渲染好的 skill 内容紧接其后,作为一段额外 user 上下文(skill 激活的标准做法)
+    try app.conversation.appendText(.user, skill_result);
+
+    // 显示给用户看
+    std.debug.print("\x1b[36m{s}\x1b[0m\n", .{skill_result});
+
+    // 让模型基于激活态回应
+    var writer = DebugWriter{};
+    const usage_sink = app.usageSink();
+    const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*jr| jr else null;
+    const result = agent_loop.run(
+        &app.conversation,
+        &app.api_client,
+        app.tool_defs,
+        &app.permission_ctx,
+        .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty() },
+        &writer,
+        allocator,
+    ) catch |err| {
+        std.debug.print("\x1b[31mError after /{s}: {s}\x1b[0m\n", .{ head, @errorName(err) });
+        return true;
+    };
+    app.persistTranscript();
+    if (result.stop_reason == .aborted) app.abort.resetForTesting();
+    return true;
 }
 
 fn memoryPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {

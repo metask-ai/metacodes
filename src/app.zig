@@ -26,6 +26,7 @@ const DynRegistry = @import("tools/dynamic.zig").DynRegistry;
 const skill_tool_mod = @import("skills/tool.zig");
 const McpClient = @import("mcp/client.zig").McpClient;
 const McpSession = @import("mcp/registry_bridge.zig").McpSession;
+const ActiveSkillState = @import("skills/active.zig").ActiveSkillState;
 
 pub const UsageTotals = struct {
     input_tokens: u64 = 0,
@@ -99,6 +100,12 @@ pub const App = struct {
     /// 已连接的 MCP server。每个 owns 一个 McpClient + McpSession（一一对应）。
     /// 退出时 deinit 反向关闭：先 session（释放 binding 内存）再 client（关 transport）。
     mcp_sessions: std.ArrayList(McpSessionEntry),
+    /// 当前激活的 skill 状态(allowed/disallowed 临时白黑名单)。
+    /// 激活 Skill 工具时设;loop.zig 处理下条 user message 前清。
+    active_skill: ?ActiveSkillState = null,
+    /// 启动时缓存的 project root(沿 cwd 向上找 .git);null = 不在 git repo。
+    /// 供 ${CLAUDE_PROJECT_DIR} 替换用。
+    project_dir: ?[]u8 = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -128,8 +135,15 @@ pub const App = struct {
             .mcp_sessions = .empty,
         };
 
-        // 启动时加载 skills：project CWD + $HOME
-        app.skills.loadFromStandardPaths("") catch {};
+        // 启动时加载 skills:enterprise / ~/.cc-zig / ~/.claude / project chain。
+        // 沿 cwd 向上找 .git 定位 project root,沿途每级 .cc-zig/skills 都加载。
+        const cwd_for_skills = @import("util/fs.zig").getCwd(allocator) catch null;
+        defer if (cwd_for_skills) |c| allocator.free(c);
+        app.skills.loadFromStandardPaths(cwd_for_skills orelse "") catch {};
+        // 缓存 project root(供 ${CLAUDE_PROJECT_DIR} 替换)
+        if (cwd_for_skills) |cwd| {
+            app.project_dir = @import("skills/skill.zig").findRepoRoot(allocator, cwd) catch null;
+        }
 
         // 注册 Skill 工具到 dyn_registry（ctx_ptr 指向 SkillSet）。
         // 失败仅 log——skills 仍可通过 /skills 列表，只是模型激活不了。
@@ -193,6 +207,8 @@ pub const App = struct {
         }
         app.mcp_sessions.deinit(app.allocator);
         app.dyn_registry.deinit();
+        if (app.active_skill) |*as| as.deinit();
+        if (app.project_dir) |p| app.allocator.free(p);
         if (app.rule_set) |*r| r.deinit();
         if (app.jobs) |*j| j.deinit();
         if (app.system_prompt) |s| app.allocator.free(s);
@@ -219,6 +235,44 @@ pub const App = struct {
     /// 获取 agent_loop 能用的 UsageSink（把 event 累加到 app.usage）。
     pub fn usageSink(app: *App) agent_loop.UsageSink {
         return .{ .ctx = @ptrCast(&app.usage), .addFn = usageTotalsAdd };
+    }
+
+    /// 激活一个 skill 的权限态。先清旧的(如有),再装新的。
+    /// 同时把 active_skill 指针挂到 permission_ctx,让 dispatch 时 decision.check 看到。
+    pub fn activateSkill(
+        app: *App,
+        skill_name: []const u8,
+        allowed_tools: []const []const u8,
+        disallowed_tools: []const []const u8,
+    ) !void {
+        if (app.active_skill) |*as| as.deinit();
+        app.active_skill = try ActiveSkillState.init(app.allocator, skill_name, allowed_tools, disallowed_tools);
+        app.permission_ctx.active_skill = &app.active_skill.?;
+    }
+
+    /// 清除激活态(loop.zig 在每条新 user message 进来时调用)。
+    pub fn clearActiveSkill(app: *App) void {
+        if (app.active_skill) |*as| {
+            as.deinit();
+            app.active_skill = null;
+        }
+        app.permission_ctx.active_skill = null;
+    }
+
+    /// Trampoline: ToolContext.activate_skill_fn 签名 — Skill 工具调用它把激活态通知到 App。
+    pub fn activateSkillTrampoline(
+        state: *anyopaque,
+        skill_name: []const u8,
+        allowed: []const []const u8,
+        disallowed: []const []const u8,
+    ) anyerror!void {
+        const app: *App = @ptrCast(@alignCast(state));
+        return app.activateSkill(skill_name, allowed, disallowed);
+    }
+
+    /// 取 project_dir;不在 git repo 返空串(供 ${CLAUDE_PROJECT_DIR} 替换默认值)。
+    pub fn project_dir_or_empty(app: *const App) []const u8 {
+        return app.project_dir orelse "";
     }
 
     /// 从 ~/.cc-zig/config.json 读 permission_rules 数组。失败仅 log，不影响启动。

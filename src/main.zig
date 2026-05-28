@@ -24,6 +24,8 @@ pub const mcp_registry_bridge = @import("mcp/registry_bridge.zig");
 pub const skills = @import("skills/skill.zig");
 pub const skills_tool = @import("skills/tool.zig");
 pub const skills_discovery = @import("skills/discovery.zig");
+pub const active_skill = @import("skills/active.zig");
+pub const permission = @import("permission.zig");
 pub const tools_dynamic = @import("tools/dynamic.zig");
 pub const system_prompt = @import("core/system_prompt.zig");
 
@@ -161,6 +163,7 @@ test {
     _ = &@import("mcp/registry_bridge.zig");
     _ = &@import("tools/dynamic.zig");
     _ = &@import("skills/skill.zig");
+    _ = &@import("skills/render.zig");
     _ = &@import("skills/discovery.zig");
     _ = &@import("skills/tool.zig");
     _ = &@import("app/config.zig");

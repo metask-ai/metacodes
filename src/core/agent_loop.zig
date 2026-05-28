@@ -60,6 +60,21 @@ pub const Options = struct {
     agent_depth: u8 = 0,
     /// 运行时工具（Skill/MCP）注册表。null = 仅静态工具。
     dyn_registry: ?*const @import("../tools/dynamic.zig").DynRegistry = null,
+    /// Skill 激活回调:Skill 工具激活后调用,把临时白/黑名单挂到 App。
+    activate_skill_state: ?*anyopaque = null,
+    activate_skill_fn: ?*const fn (
+        state: *anyopaque,
+        skill_name: []const u8,
+        allowed: []const []const u8,
+        disallowed: []const []const u8,
+    ) anyerror!void = null,
+    /// 本轮的 Skill 工具调用是否为"用户显式 /name 触发"。
+    /// 当前 Stage C 总是 false(只支持模型自主);Stage D 加 /<skill-name> 命令后置 true。
+    explicit_invocation: bool = false,
+    /// session id + project root + shell-exec policy(对接 Skill 渲染)。
+    session_id: []const u8 = "",
+    project_dir: []const u8 = "",
+    disable_shell_execution: bool = false,
 };
 
 /// usage 回调接口：stream 每次吐 usage event 时调用。
@@ -327,6 +342,12 @@ pub fn run(
                     .tool_defs = opts.tool_defs,
                     .agent_depth = opts.agent_depth,
                     .dyn_registry = opts.dyn_registry,
+                    .activate_skill_state = opts.activate_skill_state,
+                    .activate_skill_fn = opts.activate_skill_fn,
+                    .explicit_invocation = opts.explicit_invocation,
+                    .session_id = opts.session_id,
+                    .project_dir = opts.project_dir,
+                    .disable_shell_execution = opts.disable_shell_execution,
                 };
                 break :blk tools_mod.dispatch(&tool_ctx, tu.name, tu.input);
             } catch |err| {

@@ -43,6 +43,25 @@ pub const ToolContext = struct {
     agent_depth: u8 = 0,
     /// 运行时工具表（Skill/MCP）。agent_loop 在静态注册表未命中时回退到此。
     dyn_registry: ?*const DynRegistry = null,
+    /// Skill 激活回调:让 Skill 工具能告诉 App 现在激活了哪个 skill 的权限。
+    /// 签名:(state_ptr, skill_name, allowed, disallowed) → !void
+    /// state_ptr 通常指向 *App,具体 setter 由 App 端 wire。null = 没人接管(Skill 工具仍渲染 body,但权限无效果)。
+    activate_skill_state: ?*anyopaque = null,
+    activate_skill_fn: ?*const fn (
+        state: *anyopaque,
+        skill_name: []const u8,
+        allowed: []const []const u8,
+        disallowed: []const []const u8,
+    ) anyerror!void = null,
+    /// 用户是否显式触发(true = 用户 /name;false = 模型自主调用)。
+    /// 用于 disable-model-invocation 检查。
+    explicit_invocation: bool = false,
+    /// 当前 session id(${CLAUDE_SESSION_ID} 替换 + 日志相关)。
+    session_id: []const u8 = "",
+    /// 当前 project root(${CLAUDE_PROJECT_DIR} 替换)。
+    project_dir: []const u8 = "",
+    /// 全局 disable-shell-execution 开关(settings.json `disableSkillShellExecution`)。
+    disable_shell_execution: bool = false,
 
     /// 便利构造：只需 allocator 的场景（大多数单元测试）。
     pub fn simple(allocator: std.mem.Allocator) ToolContext {

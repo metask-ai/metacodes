@@ -28,6 +28,8 @@ pub const PermissionContext = struct {
     allocator: std.mem.Allocator,
     /// 可选的细粒度规则集；null 时只靠四模式兜底。
     rules: ?*const rule_matcher_mod.RuleSet = null,
+    /// 当前激活 skill 的临时白/黑名单。激活 Skill 工具时设;next user message 清。
+    active_skill: ?*const @import("skills/active.zig").ActiveSkillState = null,
 };
 
 pub fn createContext(mode: types.PermissionMode, allocator: std.mem.Allocator) PermissionContext {
@@ -35,7 +37,7 @@ pub fn createContext(mode: types.PermissionMode, allocator: std.mem.Allocator) P
 }
 
 pub fn checkPermission(ctx: *const PermissionContext, tool_name: []const u8, args: []const u8) PermissionResult {
-    const d_ctx = decision_mod.Context{ .mode = ctx.mode, .rules = ctx.rules };
+    const d_ctx = decision_mod.Context{ .mode = ctx.mode, .rules = ctx.rules, .active_skill = ctx.active_skill };
     return decision_mod.check(&d_ctx, tool_name, args);
 }
 
