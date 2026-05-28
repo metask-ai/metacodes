@@ -26,6 +26,9 @@ const util_fs = @import("../util/fs.zig");
 pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     std.debug.print("Metacode Super\nType your message or /help for commands\n\n", .{});
 
+    // 启动 prompt 建议:基于 git 最近改动的文件给一条灰色提示(对齐 Claude Code)
+    printStartupSuggestion(allocator);
+
     var writer = DebugWriter{};
     var history = history_mod.History.init(allocator);
     defer history.deinit();
@@ -954,7 +957,6 @@ fn handleDoctor(app: *app_mod.App, allocator: std.mem.Allocator) !void {
 }
 
 fn handleConfigCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
-    _ = app;
     const home_c = std.c.getenv("HOME") orelse {
         std.debug.print("HOME not set\n", .{});
         return;
@@ -964,7 +966,16 @@ fn handleConfigCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
     defer allocator.free(cfg_path);
 
     if (rest.len == 0 or std.mem.eql(u8, rest, "show")) {
-        std.debug.print("config path: {s}\n", .{cfg_path});
+        // 当前生效配置(menu-style 摘要)
+        std.debug.print("\x1b[1mActive configuration\x1b[0m\n", .{});
+        std.debug.print("  model:           \x1b[36m{s}\x1b[0m\n", .{app.config.model});
+        std.debug.print("  permission mode: \x1b[36m{s}\x1b[0m  \x1b[2m(Shift+Tab to cycle)\x1b[0m\n", .{@tagName(app.config.permission_mode)});
+        std.debug.print("  verbose:         {}\n", .{app.config.verbose});
+        std.debug.print("  no_theme:        {}\n", .{app.config.no_theme});
+        std.debug.print("  skills loaded:   {d}\n", .{app.skills.len()});
+        std.debug.print("  subagents:       {d}\n", .{app.agents.len()});
+        std.debug.print("  MCP servers:     {d}\n", .{app.mcp_sessions.items.len});
+        std.debug.print("\x1b[2mconfig file: {s}\x1b[0m\n", .{cfg_path});
         // 尝试读全文
         const path_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{cfg_path}, 0);
         defer allocator.free(path_z);
@@ -974,6 +985,7 @@ fn handleConfigCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
             return;
         }
         defer _ = std.c.close(fd);
+        std.debug.print("\x1b[1mfile contents:\x1b[0m\n", .{});
         var buf: [8192]u8 = undefined;
         while (true) {
             const n = std.c.read(fd, &buf, buf.len);
@@ -1363,6 +1375,22 @@ fn readMemory(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
         try buf.appendSlice(allocator, chunk[0..@intCast(n)]);
     }
     return try buf.toOwnedSlice(allocator);
+}
+
+/// 启动建议:跑 `git log` 找最近改动文件,给一条灰色提示。失败静默。
+fn printStartupSuggestion(allocator: std.mem.Allocator) void {
+    if (std.c.isatty(1) == 0) return; // 非 TTY 不显示
+    const argv = [_]?[*:0]const u8{ "/usr/bin/env", "git", "log", "-1", "--name-only", "--pretty=format:", null };
+    const out = @import("../tools/common.zig").spawnCaptureStdoutAbortableTimed(argv[0..], allocator, null, 2000) catch return;
+    defer allocator.free(out);
+    // 取第一个非空行作为最近改动文件
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |line| {
+        const f = std.mem.trim(u8, line, " \t\r");
+        if (f.len == 0) continue;
+        std.debug.print("\x1b[2m  suggestion: explain or improve {s}\x1b[0m\n\n", .{f});
+        return;
+    }
 }
 
 /// 取终端行数(失败回退 24)。
