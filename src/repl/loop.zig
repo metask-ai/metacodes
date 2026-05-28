@@ -110,6 +110,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                 \\  /permissions     Show permission mode + loaded rules
                 \\  /memory [add ..] Show or append cross-session memory
                 \\  /commit          Draft a git commit using the model
+                \\  /btw <q>         Side question (uses context, not added to history)
+                \\  /recap           One-line summary of this session
+                \\  /vim             Toggle vim editor mode
                 \\  /review          Ask the model to review the current diff
                 \\  /exit            Exit REPL
                 \\
@@ -210,6 +213,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // /recap:生成会话一行总结(不进历史)
         if (std.mem.eql(u8, trimmed, "/recap")) {
             try handleRecap(app, allocator);
+            continue;
+        }
+        if (std.mem.eql(u8, trimmed, "/vim")) {
+            app.config.vim_mode = !app.config.vim_mode;
+            std.debug.print("editor mode: \x1b[36m{s}\x1b[0m\n", .{if (app.config.vim_mode) "vim" else "emacs"});
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/agents")) {
@@ -475,12 +483,36 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
 
     var parser = input.KeyParser{};
 
+    // vim 模式状态(仅 app.config.vim_mode 时生效)。默认 INSERT,Esc 进 NORMAL。
+    const vim = @import("vim.zig");
+    var vim_state = vim.VimState.init(allocator);
+    defer vim_state.deinit();
+
     while (true) {
         var b: [1]u8 = undefined;
         const n = posix.read(fd, &b) catch return error.ReadError;
         if (n == 0) return error.Eof;
 
+        // vim 模式 + NORMAL/VISUAL:字节路由到 vim 状态机(Enter/Esc 例外)
+        if (app.config.vim_mode and vim_state.mode != .insert) {
+            if (b[0] == '\r' or b[0] == '\n') {
+                std.debug.print("\n", .{});
+                return try allocator.dupe(u8, editor.view());
+            }
+            const changed = vim.handleNormal(&vim_state, &editor.buf, &editor.cursor, allocator, b[0]) catch false;
+            if (changed) try redrawLine(editor.view(), editor.cursor);
+            continue;
+        }
+
         const key = parser.feed(b[0]) orelse continue;
+
+        // vim INSERT 模式下 Esc → 回 NORMAL(不走 LineEditor 的 esc 语义)
+        if (app.config.vim_mode and key == .esc) {
+            vim_state.mode = .normal;
+            if (editor.cursor > 0) editor.cursor -= 1; // vim 习惯:Esc 后光标左移一格
+            try redrawLine(editor.view(), editor.cursor);
+            continue;
+        }
 
         // 括号粘贴：收集到 paste_end，决定内联还是外部存储 + 占位符
         if (key == .paste_begin) {

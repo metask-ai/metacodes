@@ -162,6 +162,7 @@ test {
     _ = &@import("repl/complete.zig");
     _ = &@import("repl/paste.zig");
     _ = &@import("repl/transcript_viewer.zig");
+    _ = &@import("repl/vim.zig");
     _ = &@import("mcp/protocol.zig");
     _ = &@import("mcp/transport_stdio.zig");
     _ = &@import("mcp/client.zig");

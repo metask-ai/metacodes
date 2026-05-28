@@ -10,6 +10,8 @@ pub const Config = struct {
     permission_mode: PermissionMode = .prompt,
     no_theme: bool = false,
     verbose: bool = false,
+    /// 编辑器模式:false=emacs(默认) / true=vim。`/vim` 命令切换。
+    vim_mode: bool = false,
     /// Headless 模式：非 null 时跑单次 prompt 后退出，不进 REPL。
     /// 来源：`-p "..."` / `--print "..."`，或 `-`（从 stdin 读全部）。
     prompt: ?[]const u8 = null,
