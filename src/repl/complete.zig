@@ -49,6 +49,12 @@ pub fn compute(allocator: std.mem.Allocator, line: []const u8, cursor: usize) !R
     const token = upto[tok_start..];
     if (token.len == 0) return .{ .candidates = &.{}, .replace_start = cursor, .owns_candidates = false };
 
+    // @-mention:`@<path>` 触发文件路径补全(对齐 Claude Code 的 @ 文件提及)。
+    // 保留 @ 前缀,只对 @ 后面的路径部分补全。
+    if (token[0] == '@') {
+        return try pathCandidates(allocator, token[1..], tok_start + 1);
+    }
+
     return try pathCandidates(allocator, token, tok_start);
 }
 
@@ -167,4 +173,24 @@ test "path completion finds known file" {
         if (std.mem.eql(u8, c, "cc-zig-complete-uniq-xyz.txt")) found = true;
     }
     try testing.expect(found);
+}
+
+test "@-mention completion finds file" {
+    const path = "/tmp/cc-zig-atmention-uniq.txt";
+    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    _ = std.c.close(fd);
+    defer _ = std.c.unlink(path);
+
+    // 输入 "review @/tmp/cc-zig-atmention-" → 补全应找到文件,replace_start 在 @ 之后
+    const line = "review @/tmp/cc-zig-atmention-";
+    var r = try compute(testing.allocator, line, line.len);
+    defer r.deinit(testing.allocator);
+    try testing.expect(r.candidates.len >= 1);
+    var found = false;
+    for (r.candidates) |c| {
+        if (std.mem.eql(u8, c, "cc-zig-atmention-uniq.txt")) found = true;
+    }
+    try testing.expect(found);
+    // replace_start 指向 @ 后的 / (保留 @ 前缀不被覆盖)
+    try testing.expect(line[r.replace_start - 1] == '/' or r.replace_start > 7);
 }

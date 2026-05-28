@@ -528,6 +528,20 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
                 std.debug.print("> ", .{});
                 try redrawLine(editor.view(), editor.cursor);
             },
+            .toggle_task_list => {
+                printTaskList(app);
+                std.debug.print("> ", .{});
+                try redrawLine(editor.view(), editor.cursor);
+            },
+            .clear_draft => {
+                // 把当前 draft 存入历史(Up 可恢复),然后清空
+                if (editor.view().len > 0) {
+                    history.append(editor.view()) catch {};
+                }
+                editor.reset();
+                std.debug.print("\r\x1b[2K> ", .{});
+                try redrawLine(editor.view(), editor.cursor);
+            },
             .none => {},
         }
     }
@@ -1336,6 +1350,33 @@ fn readMemory(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
         try buf.appendSlice(allocator, chunk[0..@intCast(n)]);
     }
     return try buf.toOwnedSlice(allocator);
+}
+
+/// Ctrl+T:打印任务列表(最多 5 个,带状态图标)。覆盖到 prompt 上方。
+fn printTaskList(app: *app_mod.App) void {
+    const tasks = app.tasks.tasks.items;
+    std.debug.print("\r\x1b[2K", .{}); // 清当前行
+    if (tasks.len == 0) {
+        std.debug.print("\x1b[2m(no tasks)\x1b[0m\n", .{});
+        return;
+    }
+    std.debug.print("\x1b[1mTasks ({d}):\x1b[0m\n", .{tasks.len});
+    var shown: usize = 0;
+    for (tasks) |t| {
+        if (t.status == .deleted) continue;
+        if (shown >= 5) {
+            std.debug.print("  \x1b[2m... more\x1b[0m\n", .{});
+            break;
+        }
+        const icon = switch (t.status) {
+            .pending => "\x1b[90m○\x1b[0m", // 灰圈
+            .in_progress => "\x1b[33m◐\x1b[0m", // 黄半
+            .completed => "\x1b[32m●\x1b[0m", // 绿实
+            .deleted => unreachable,
+        };
+        std.debug.print("  {s} {s}\n", .{ icon, t.subject });
+        shown += 1;
+    }
 }
 
 /// ! shell mode:执行 shell 命令,实时输出 + 加入对话上下文(不经模型审批/解释)。

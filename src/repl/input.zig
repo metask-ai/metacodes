@@ -42,6 +42,7 @@ pub const Key = union(enum) {
     tab,
     shift_tab, // cycle 权限模式
     ctrl_r,
+    ctrl_t, // 切换任务列表显示
     paste_begin, // 括号粘贴起始 ESC[200~
     paste_end, // 括号粘贴结束 ESC[201~
     unknown,
@@ -182,6 +183,7 @@ fn byteToKey(b: u8) Key {
         '\r', '\n' => .enter,
         0x09 => .tab,
         0x12 => .ctrl_r,
+        0x14 => .ctrl_t,
         0x7f, 0x08 => .backspace,
         0x01 => .ctrl_a,
         0x03 => .ctrl_c,
@@ -277,6 +279,10 @@ pub const Action = enum {
     redraw_screen,
     /// Shift+Tab：cycle 权限模式(调用方改 app.config.permission_mode)
     cycle_perm_mode,
+    /// Ctrl+T：切换任务列表显示
+    toggle_task_list,
+    /// Esc Esc(空 buffer 二次):清 draft + 保存到历史
+    clear_draft,
     /// 无语义变化（如 unknown 键）
     none,
 };
@@ -287,6 +293,8 @@ pub const LineEditor = struct {
     allocator: std.mem.Allocator,
     /// 上一次按键是否是 Ctrl+C（用于"双击退出"语义）。任何其他按键重置为 false。
     ctrl_c_armed: bool = false,
+    /// 上一次按键是否是 Esc(用于 Esc Esc 双击清 draft)。
+    esc_armed: bool = false,
     /// yank ring:Ctrl+W/K/U 删除的内容存这,Ctrl+Y 粘回。
     yank_buf: std.ArrayList(u8),
 
@@ -306,6 +314,10 @@ pub const LineEditor = struct {
         const was_armed = self.ctrl_c_armed;
         if (@as(std.meta.Tag(Key), key) != .ctrl_c) {
             self.ctrl_c_armed = false;
+        }
+        const was_esc_armed = self.esc_armed;
+        if (@as(std.meta.Tag(Key), key) != .esc) {
+            self.esc_armed = false;
         }
 
         switch (key) {
@@ -394,6 +406,7 @@ pub const LineEditor = struct {
             .tab => return .complete,
             .shift_tab => return .cycle_perm_mode,
             .ctrl_r => return .reverse_search,
+            .ctrl_t => return .toggle_task_list,
             .ctrl_l => return .redraw_screen,
             .ctrl_w => {
                 // 删上一个词:从 cursor 往前跳过空白,再删到上一个词边界
@@ -433,7 +446,16 @@ pub const LineEditor = struct {
             },
             // paste_begin/end 由驱动循环（loop.zig）直接处理，编辑器层忽略
             .paste_begin, .paste_end => return .none,
-            .esc, .unknown => return .none,
+            .esc => {
+                // Esc Esc:非空 buffer 二次按 → 清 draft(保存到历史让 Up 可恢复)
+                if (was_esc_armed and self.buf.items.len > 0) {
+                    self.esc_armed = false;
+                    return .clear_draft;
+                }
+                self.esc_armed = true;
+                return .none;
+            },
+            .unknown => return .none,
         }
     }
 
@@ -848,6 +870,44 @@ test "LineEditor: ctrl_l returns redraw_screen" {
     var ed = LineEditor.init(testing.allocator);
     defer ed.deinit();
     try testing.expect((try ed.handle(.ctrl_l)) == .redraw_screen);
+}
+
+test "LineEditor: ctrl_t returns toggle_task_list" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    try testing.expect((try ed.handle(.ctrl_t)) == .toggle_task_list);
+}
+
+test "LineEditor: Esc Esc on non-empty buffer clears draft" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    try typeStr(&ed, "hello");
+    // 第一次 esc:none + arm
+    try testing.expect((try ed.handle(.esc)) == .none);
+    // 第二次 esc(非空 buffer):clear_draft
+    try testing.expect((try ed.handle(.esc)) == .clear_draft);
+}
+
+test "LineEditor: single Esc is none (not clear)" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    try typeStr(&ed, "x");
+    try testing.expect((try ed.handle(.esc)) == .none);
+    // 中间插入字符 → 重置 esc_armed
+    _ = try ed.handle(Key{ .char = 'y' });
+    try testing.expect((try ed.handle(.esc)) == .none); // 又是第一次
+}
+
+test "LineEditor: Esc Esc on empty buffer does not clear" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    try testing.expect((try ed.handle(.esc)) == .none);
+    try testing.expect((try ed.handle(.esc)) == .none); // 空 buffer → 不触发 clear_draft
+}
+
+test "KeyParser: ctrl_t byte" {
+    var p = KeyParser{};
+    try testing.expect(p.feed(0x14).? == .ctrl_t);
 }
 
 test "KeyParser: shift_tab via ESC [ Z" {
