@@ -202,6 +202,16 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             try handleMcp(app);
             continue;
         }
+        // /btw <question>:侧问,不进对话历史(用临时 conversation 跑一次)
+        if (std.mem.startsWith(u8, trimmed, "/btw ")) {
+            try handleBtw(app, allocator, std.mem.trim(u8, trimmed[5..], " \t"));
+            continue;
+        }
+        // /recap:生成会话一行总结(不进历史)
+        if (std.mem.eql(u8, trimmed, "/recap")) {
+            try handleRecap(app, allocator);
+            continue;
+        }
         if (std.mem.eql(u8, trimmed, "/agents")) {
             try handleAgents(app);
             continue;
@@ -547,6 +557,16 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
             .kill_background => {
                 const killed = killAllBackground(app);
                 std.debug.print("\r\x1b[2K\x1b[33m[killed {d} background task(s)]\x1b[0m\n> ", .{killed});
+                try redrawLine(editor.view(), editor.cursor);
+            },
+            .external_edit => {
+                input.restoreMode(fd, orig);
+                if (externalEdit(allocator, editor.view())) |edited| {
+                    defer allocator.free(edited);
+                    editor.setLine(edited) catch {};
+                } else |_| {}
+                _ = input.enterRawMode(fd);
+                std.debug.print("> ", .{});
                 try redrawLine(editor.view(), editor.cursor);
             },
             .clear_draft => {
@@ -1084,6 +1104,86 @@ fn handleInit(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     std.debug.print("created {s}\n", .{cfg_path});
 }
 
+/// 把当前 conversation 拍平成纯文本(role: text),用于 /btw /recap 的上下文喂养。
+fn flattenConversation(app: *app_mod.App, allocator: std.mem.Allocator) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    for (app.conversation.messages.items) |m| {
+        const role = switch (m.role) {
+            .user => "User",
+            .assistant => "Assistant",
+        };
+        for (m.blocks) |b| switch (b) {
+            .text => |t| {
+                try out.appendSlice(allocator, role);
+                try out.appendSlice(allocator, ": ");
+                try out.appendSlice(allocator, t);
+                try out.append(allocator, '\n');
+            },
+            else => {},
+        };
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+/// 用临时 subagent 跑一个不进主历史的查询(/btw /recap 共用)。
+fn runEphemeral(app: *app_mod.App, allocator: std.mem.Allocator, prompt: []const u8) ![]u8 {
+    const subagent = @import("../core/subagent.zig");
+    const result = try subagent.spawnAgent(
+        allocator,
+        &app.api_client,
+        app.tool_defs,
+        &app.permission_ctx,
+        &app.abort,
+        prompt,
+        .{ .max_turns = 1, .agent_depth = 1 }, // 单轮,无工具(纯回答)
+    );
+    defer result.deinit();
+    return try allocator.dupe(u8, result.final_text);
+}
+
+/// /btw <question>:侧问。看当前对话上下文,但不进主历史。
+fn handleBtw(app: *app_mod.App, allocator: std.mem.Allocator, question: []const u8) !void {
+    if (question.len == 0) {
+        std.debug.print("usage: /btw <question>\n", .{});
+        return;
+    }
+    const ctx_text = try flattenConversation(app, allocator);
+    defer allocator.free(ctx_text);
+    const prompt = try std.fmt.allocPrint(allocator,
+        "Here is the current conversation so far:\n\n{s}\n\nSide question (answer concisely from context only, do not use tools): {s}",
+        .{ ctx_text, question });
+    defer allocator.free(prompt);
+
+    const answer = runEphemeral(app, allocator, prompt) catch |err| {
+        std.debug.print("\x1b[31m/btw failed: {s}\x1b[0m\n", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(answer);
+    std.debug.print("\x1b[2m─── btw ───\x1b[0m\n{s}\n\x1b[2m───────────\x1b[0m\n", .{answer});
+}
+
+/// /recap:一行会话总结(不进历史)。
+fn handleRecap(app: *app_mod.App, allocator: std.mem.Allocator) !void {
+    if (app.conversation.len() < 2) {
+        std.debug.print("(not enough conversation to recap)\n", .{});
+        return;
+    }
+    const ctx_text = try flattenConversation(app, allocator);
+    defer allocator.free(ctx_text);
+    const prompt = try std.fmt.allocPrint(allocator,
+        "Summarize this session in ONE concise line (what was worked on, current state):\n\n{s}",
+        .{ctx_text});
+    defer allocator.free(prompt);
+
+    const recap = runEphemeral(app, allocator, prompt) catch |err| {
+        std.debug.print("\x1b[31m/recap failed: {s}\x1b[0m\n", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(recap);
+    std.debug.print("\x1b[36m↻ {s}\x1b[0m\n", .{std.mem.trim(u8, recap, " \n")});
+}
+
 fn handleMcp(app: *app_mod.App) !void {
     if (app.mcp_sessions.items.len == 0) {
         std.debug.print(
@@ -1399,6 +1499,62 @@ fn termRows() usize {
     const TIOCGWINSZ: c_ulong = if (@import("builtin").os.tag == .macos) 0x40087468 else 0x5413;
     if (std.c.ioctl(1, TIOCGWINSZ, &ws) == 0 and ws.row > 0) return ws.row;
     return 24;
+}
+
+/// Ctrl+G:把当前 buffer 写临时文件,开 $VISUAL/$EDITOR 编辑,读回。
+/// 返回编辑后的内容(owned)。失败返 error。
+fn externalEdit(allocator: std.mem.Allocator, current: []const u8) ![]u8 {
+    const editor_env = std.c.getenv("VISUAL") orelse std.c.getenv("EDITOR") orelse return error.NoEditor;
+    const editor_cmd = std.mem.span(editor_env);
+
+    const tmp_path = "/tmp/cc-zig-edit-buffer.txt";
+    // 写当前 buffer
+    {
+        const fd = std.c.open(tmp_path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        if (fd < 0) return error.WriteFailed;
+        defer _ = std.c.close(fd);
+        if (current.len > 0) _ = std.c.write(fd, current.ptr, current.len);
+    }
+
+    // spawn editor(继承 stdin/stdout/stderr,前台阻塞)
+    const editor_z = try allocator.dupeZ(u8, editor_cmd);
+    defer allocator.free(editor_z);
+    const path_z = try allocator.dupeZ(u8, tmp_path);
+    defer allocator.free(path_z);
+    var argv = [_]?[*:0]const u8{ "/bin/sh", "-c", undefined, null };
+    const sh_cmd = try std.fmt.allocPrintSentinel(allocator, "{s} {s}", .{ editor_cmd, tmp_path }, 0);
+    defer allocator.free(sh_cmd);
+    argv[2] = sh_cmd.ptr;
+
+    const pid = std.c.fork();
+    if (pid == 0) {
+        _ = std.c.execve("/bin/sh", @ptrCast(&argv), @ptrCast(std.c.environ));
+        std.c._exit(127);
+    } else if (pid < 0) {
+        return error.ForkFailed;
+    }
+    var status: c_int = 0;
+    _ = std.c.waitpid(pid, &status, 0);
+
+    // 读回
+    const rfd = std.c.open(path_z.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (rfd < 0) return error.ReadFailed;
+    defer _ = std.c.close(rfd);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.read(rfd, &buf, buf.len);
+        if (n <= 0) break;
+        try out.appendSlice(allocator, buf[0..@intCast(n)]);
+    }
+    _ = std.c.unlink(path_z.ptr);
+    // 去掉编辑器常加的尾换行
+    var result = try out.toOwnedSlice(allocator);
+    if (result.len > 0 and result[result.len - 1] == '\n') {
+        result = try allocator.realloc(result, result.len - 1);
+    }
+    return result;
 }
 
 /// 杀所有 running 后台任务,返回杀掉的数量。

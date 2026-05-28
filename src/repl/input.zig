@@ -45,6 +45,7 @@ pub const Key = union(enum) {
     ctrl_t, // 切换任务列表显示
     ctrl_o, // 打开 transcript viewer
     ctrl_x, // Ctrl+X 前缀(配合 Ctrl+K kill 后台)
+    ctrl_g, // 外部编辑器编辑当前 buffer
     paste_begin, // 括号粘贴起始 ESC[200~
     paste_end, // 括号粘贴结束 ESC[201~
     unknown,
@@ -188,6 +189,7 @@ fn byteToKey(b: u8) Key {
         0x14 => .ctrl_t,
         0x0f => .ctrl_o,
         0x18 => .ctrl_x,
+        0x07 => .ctrl_g,
         0x7f, 0x08 => .backspace,
         0x01 => .ctrl_a,
         0x03 => .ctrl_c,
@@ -291,6 +293,8 @@ pub const Action = enum {
     open_transcript,
     /// Ctrl+X Ctrl+K:kill 所有后台任务
     kill_background,
+    /// Ctrl+G:外部编辑器编辑当前 buffer
+    external_edit,
     /// 无语义变化（如 unknown 键）
     none,
 };
@@ -424,6 +428,7 @@ pub const LineEditor = struct {
             .ctrl_r => return .reverse_search,
             .ctrl_t => return .toggle_task_list,
             .ctrl_o => return .open_transcript,
+            .ctrl_g => return .external_edit,
             .ctrl_x => {
                 self.ctrl_x_armed = true;
                 return .none;
@@ -957,6 +962,17 @@ test "KeyParser: ctrl_o / ctrl_x bytes" {
     var p = KeyParser{};
     try testing.expect(p.feed(0x0f).? == .ctrl_o);
     try testing.expect(p.feed(0x18).? == .ctrl_x);
+}
+
+test "LineEditor: ctrl_g returns external_edit" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    try testing.expect((try ed.handle(.ctrl_g)) == .external_edit);
+}
+
+test "KeyParser: ctrl_g byte" {
+    var p = KeyParser{};
+    try testing.expect(p.feed(0x07).? == .ctrl_g);
 }
 
 test "KeyParser: shift_tab via ESC [ Z" {
