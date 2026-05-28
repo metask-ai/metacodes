@@ -109,30 +109,30 @@ test "ReadTool path traversal blocked (file_path)" {
     try std.testing.expectError(error.PathTraversal, execute(&ctx, "{\"file_path\":\"../../etc/passwd\"}"));
 }
 
-test "ReadTool read /etc/hostname via file_path" {
+test "ReadTool read /etc/hosts via file_path" {
     const ctx = testCtx();
-    const r = try execute(&ctx, "{\"file_path\":\"/etc/hostname\"}");
+    const r = try execute(&ctx, "{\"file_path\":\"/etc/hosts\"}");
     defer std.testing.allocator.free(r);
     try std.testing.expect(r.len > 0);
 }
 
-test "ReadTool read /etc/hostname via legacy path" {
+test "ReadTool read /etc/hosts via legacy path" {
     const ctx = testCtx();
-    const r = try execute(&ctx, "{\"path\":\"/etc/hostname\"}");
+    const r = try execute(&ctx, "{\"path\":\"/etc/hosts\"}");
     defer std.testing.allocator.free(r);
     try std.testing.expect(r.len > 0);
 }
 
 test "ReadTool offset beyond file returns empty" {
     const ctx = testCtx();
-    const r = try execute(&ctx, "{\"file_path\":\"/etc/hostname\",\"offset\":1000}");
+    const r = try execute(&ctx, "{\"file_path\":\"/etc/hosts\",\"offset\":1000}");
     defer std.testing.allocator.free(r);
     try std.testing.expect(r.len == 0);
 }
 
 test "ReadTool offset=0 is invalid" {
     const ctx = testCtx();
-    try std.testing.expectError(error.InvalidOffset, execute(&ctx, "{\"file_path\":\"/etc/hostname\",\"offset\":0}"));
+    try std.testing.expectError(error.InvalidOffset, execute(&ctx, "{\"file_path\":\"/etc/hosts\",\"offset\":0}"));
 }
 
 test "ReadTool offset/limit extracts correct slice" {
@@ -184,15 +184,15 @@ test "ReadTool file without trailing newline still gets prefix" {
 
 test "ReadTool limit caps very large file" {
     const ctx = testCtx();
-    // /etc/hostname 一般 1 行；limit=10000 不会报错
-    const r = try execute(&ctx, "{\"file_path\":\"/etc/hostname\",\"limit\":10000}");
+    // /etc/hosts 一般 1 行；limit=10000 不会报错
+    const r = try execute(&ctx, "{\"file_path\":\"/etc/hosts\",\"limit\":10000}");
     defer std.testing.allocator.free(r);
     try std.testing.expect(r.len > 0);
 }
 
 test "ReadTool default limit reads at least first line" {
     const ctx = testCtx();
-    const r = try execute(&ctx, "{\"file_path\":\"/etc/hostname\"}");
+    const r = try execute(&ctx, "{\"file_path\":\"/etc/hosts\"}");
     defer std.testing.allocator.free(r);
     try std.testing.expect(r.len > 0);
 }

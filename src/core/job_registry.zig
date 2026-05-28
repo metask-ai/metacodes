@@ -97,16 +97,29 @@ pub const JobRegistry = struct {
         self.allocator.free(self.base_dir);
     }
 
-    /// 生成新 job id：12 hex = 6 byte，用 getrandom。
+    /// 生成新 job id：12 hex = 6 byte，从 `/dev/urandom` 读熵。
+    /// 之所以不走 `std.posix.getrandom`：Zig 0.16 stable 没有该绑定；macOS libc 也没有
+    /// `getrandom(2)` 系统调用。`/dev/urandom` 在 Linux / macOS / BSD 都可用，纯 POSIX。
     /// 失败 fatal：进程启不了 bg job 比 id 碰撞强。JobRegistry 的使用方已有兜底
     /// （spawnBackground 失败回退同步执行）。
     fn genId() error{RandomFailed}![12]u8 {
         var raw: [6]u8 = undefined;
-        const rc = std.c.getrandom(&raw, raw.len, 0);
-        if (rc != @as(isize, @intCast(raw.len))) {
+        const fd = std.c.open("/dev/urandom", std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        if (fd < 0) {
             const errno = std.c._errno().*;
-            log.err("job", "getrandom failed rc={d} errno={d}", .{ rc, errno });
+            log.err("job", "open /dev/urandom failed errno={d}", .{errno});
             return error.RandomFailed;
+        }
+        defer _ = std.c.close(fd);
+        var pos: usize = 0;
+        while (pos < raw.len) {
+            const n = std.c.read(fd, raw[pos..].ptr, raw.len - pos);
+            if (n <= 0) {
+                const errno = std.c._errno().*;
+                log.err("job", "read /dev/urandom failed rc={d} errno={d}", .{ n, errno });
+                return error.RandomFailed;
+            }
+            pos += @as(usize, @intCast(n));
         }
         var id: [12]u8 = undefined;
         _ = std.fmt.bufPrint(&id, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{ raw[0], raw[1], raw[2], raw[3], raw[4], raw[5] }) catch unreachable;

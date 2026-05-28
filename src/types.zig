@@ -10,6 +10,11 @@ pub const Config = struct {
     permission_mode: PermissionMode = .prompt,
     no_theme: bool = false,
     verbose: bool = false,
+    /// Headless 模式：非 null 时跑单次 prompt 后退出，不进 REPL。
+    /// 来源：`-p "..."` / `--print "..."`，或 `-`（从 stdin 读全部）。
+    prompt: ?[]const u8 = null,
+    /// `--json`：headless 下用 NDJSON 事件流输出，便于 CI/脚本消费。
+    json_output: bool = false,
 };
 
 /// 权限模式

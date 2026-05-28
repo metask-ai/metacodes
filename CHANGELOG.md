@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased — Stage 0+1 parity (2026-05-29)
+
+macOS 移植 + Phase A/B 残留补齐（见 `../doc/SURVEY_2026-05-28.md`）。
+
+### Fixed
+- **macOS 编译**：`job_registry.zig` 的 `std.c.getrandom`（macOS libc 无此调用）改为读 `/dev/urandom`。
+- **macOS 崩溃**：`read_state.zig` 的 `statFd`/`statPath` 之前硬用 Linux `statx`，在 macOS 上对任何已存在文件做 Write/Edit 会 `signal SYS`。改为按 OS comptime 分支（Linux statx / 其它 fstat）。
+- 测试中的 `/etc/hostname`（macOS 不存在）改为 `/etc/hosts`。
+- **452→459 测试在 macOS 全绿。**
+
+### Added
+- **Headless 模式**：`-p "prompt"` / `--print` 单次运行后退出；`-` 从 stdin 读 prompt。
+- **`--json`**：headless 下输出 NDJSON result 事件（stop_reason/turns/tool_calls/usage/text）。
+- **`/model [name]`**：无参列当前 + 服务端 catalog；有参切换并重建 system prompt + 重算 max_tokens。
+- **Grep 全局分页**：`offset` + 全局 `head_limit`（替代之前每文件 `-m`）+ `appliedLimit` 翻页提示。
+
 ## v1.0.0 — 2026-04-20
 
 首个对外可用版本。从 TypeScript 版 Claude Code 完整移植到 Zig 0.17-dev（向下兼容 0.16 稳定版的目标字符集）。

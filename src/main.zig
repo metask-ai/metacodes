@@ -46,6 +46,12 @@ pub fn main(init: std.process.Init) !void {
 
     log.info("main", "metacodes starting; model={s}", .{config.model});
 
+    // Headless 模式：`-p "..."` / stdin pipe → 跑单次 prompt 后退出，不进 REPL。
+    if (config.prompt) |p| {
+        const code = @import("repl/headless.zig").run(app, allocator, p, config.json_output) catch 1;
+        std.process.exit(code);
+    }
+
     try repl.run(app, allocator);
 }
 
@@ -70,9 +76,29 @@ fn parseArgs(init: std.process.Init, allocator: std.mem.Allocator) types.Config 
             config.no_theme = true;
         } else if (std.mem.eql(u8, arg, "--verbose")) {
             config.verbose = true;
+        } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--print")) {
+            if (args.next()) |p| config.prompt = allocator.dupe(u8, p) catch p;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            config.json_output = true;
+        } else if (std.mem.eql(u8, arg, "-")) {
+            // 从 stdin 读全部作为 prompt（headless pipe 模式）
+            config.prompt = readAllStdin(allocator) catch null;
         }
     }
     return config;
+}
+
+/// 读 stdin 全部内容（headless `-` 模式）。EOF 即停。
+fn readAllStdin(allocator: std.mem.Allocator) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.read(0, &chunk, chunk.len);
+        if (n <= 0) break;
+        try buf.appendSlice(allocator, chunk[0..@intCast(n)]);
+    }
+    return buf.toOwnedSlice(allocator);
 }
 
 fn parsePermMode(s: []const u8) types.PermissionMode {
@@ -87,6 +113,9 @@ fn printHelp() void {
     std.debug.print(
         \\Metacode Super
         \\Usage: metacodes [options]
+        \\  -p, --print <prompt>  Headless: run one prompt and exit (no REPL)
+        \\  -                     Headless: read prompt from stdin
+        \\  --json                Headless: emit NDJSON result event
         \\  --model <model>       Model (default: claude-sonnet-4-20250514)
         \\  --api-key <key>       API key (overrides built-in token)
         \\  --permission <mode>   auto | prompt | plan | bypass
@@ -121,6 +150,7 @@ test {
     _ = &@import("repl/history.zig");
     _ = &@import("repl/multiline.zig");
     _ = &@import("repl/render.zig");
+    _ = &@import("repl/headless.zig");
     _ = &@import("mcp/protocol.zig");
     _ = &@import("mcp/transport_stdio.zig");
     _ = &@import("mcp/client.zig");

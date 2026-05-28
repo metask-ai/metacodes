@@ -78,12 +78,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         try argv.append(allocator, "--multiline-dotall");
     }
 
-    // head_limit：rg 的 -m 是 "每文件匹配数"，不是总数；用 post-filter 实现总数截断
-    // 本期先用 -m N 作为近似
-    if (common.extractJsonArg(args, "head_limit")) |h| {
-        try argv.append(allocator, "-m");
-        try argv.append(allocator, h);
-    }
+    // head_limit / offset：全局（跨文件）分页。
+    // 不再用 rg 的 -m（那是每文件上限，跨文件会失真）；改为抓全量输出后按行截断。
+    // offset = 跳过前 N 行；head_limit = 截断后保留 N 行。
+    const head_limit = parseUsize(common.extractJsonArg(args, "head_limit"));
+    const offset = parseUsize(common.extractJsonArg(args, "offset")) orelse 0;
 
     // positional: pattern, path
     try argv.append(allocator, pattern);
@@ -100,7 +99,54 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
     argv_z[argv.items.len] = null;
 
-    return try common.spawnCaptureStdoutAbortable(argv_z, allocator, ctx.abort);
+    const raw = try common.spawnCaptureStdoutAbortable(argv_z, allocator, ctx.abort);
+
+    // 无分页参数 → 原样返回（保持既有行为 + 测试兼容）
+    if (head_limit == null and offset == 0) return raw;
+    defer allocator.free(raw);
+
+    return try paginate(allocator, raw, offset, head_limit);
+}
+
+/// 按行做全局 offset + head_limit 截断。截断发生时在末尾追加一行 appliedLimit 提示，
+/// 让模型知道还有更多结果、可用 offset 翻页。
+fn paginate(allocator: std.mem.Allocator, raw: []const u8, offset: usize, head_limit: ?usize) ![]u8 {
+    // 统计 + 收集行（保留行内容，不含换行符）
+    var lines = std.ArrayList([]const u8).empty;
+    defer lines.deinit(allocator);
+    var it = std.mem.splitScalar(u8, raw, '\n');
+    while (it.next()) |ln| {
+        // splitScalar 末尾的空串（raw 以 \n 结尾）跳过
+        if (ln.len == 0 and it.peek() == null) break;
+        try lines.append(allocator, ln);
+    }
+    const total = lines.items.len;
+
+    const start = @min(offset, total);
+    const remaining = total - start;
+    const take = if (head_limit) |h| @min(h, remaining) else remaining;
+    const end = start + take;
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    for (lines.items[start..end]) |ln| {
+        try out.writer.writeAll(ln);
+        try out.writer.writeByte('\n');
+    }
+
+    const truncated = end < total or start > 0;
+    if (truncated) {
+        try out.writer.print(
+            "\n[appliedLimit: showing lines {d}-{d} of {d}; pass offset={d} for the next page]\n",
+            .{ start + 1, end, total, end },
+        );
+    }
+    return try out.toOwnedSlice();
+}
+
+fn parseUsize(s: ?[]const u8) ?usize {
+    const v = s orelse return null;
+    return std.fmt.parseInt(usize, std.mem.trim(u8, v, " \t"), 10) catch null;
 }
 
 fn isTrue(s: ?[]const u8) bool {
@@ -237,4 +283,59 @@ test "GrepTool glob filter" {
     defer std.testing.allocator.free(r);
     try std.testing.expect(std.mem.indexOf(u8, r, "cc-zig-grep-glob.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "cc-zig-grep-glob.txt") == null);
+}
+
+test "paginate: head_limit truncates and adds appliedLimit notice" {
+    const a = std.testing.allocator;
+    const raw = "l1\nl2\nl3\nl4\nl5\n";
+    const r = try paginate(a, raw, 0, 2);
+    defer a.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "l1\nl2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "l3") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "appliedLimit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "of 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "offset=2") != null);
+}
+
+test "paginate: offset skips leading lines" {
+    const a = std.testing.allocator;
+    const raw = "l1\nl2\nl3\nl4\n";
+    const r = try paginate(a, raw, 2, null);
+    defer a.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "l1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "l3\nl4\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "appliedLimit") != null);
+}
+
+test "paginate: limit >= total has no notice" {
+    const a = std.testing.allocator;
+    const raw = "l1\nl2\n";
+    const r = try paginate(a, raw, 0, 10);
+    defer a.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "l1\nl2\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "appliedLimit") == null);
+}
+
+test "paginate: offset beyond total returns just notice" {
+    const a = std.testing.allocator;
+    const raw = "l1\nl2\n";
+    const r = try paginate(a, raw, 99, null);
+    defer a.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "l1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "of 2") != null);
+}
+
+test "GrepTool global head_limit across content" {
+    const ctx = testCtx();
+    const path = "/tmp/cc-zig-grep-headlimit.txt";
+    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    try std.testing.expect(fd >= 0);
+    const text = "m\nm\nm\nm\nm\n";
+    _ = std.c.write(fd, text.ptr, text.len);
+    _ = std.c.close(fd);
+    defer _ = std.c.unlink(path);
+
+    const r = try execute(&ctx, "{\"pattern\":\"m\",\"path\":\"/tmp/cc-zig-grep-headlimit.txt\",\"output_mode\":\"content\",\"head_limit\":2}");
+    defer std.testing.allocator.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "appliedLimit") != null);
 }

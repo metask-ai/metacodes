@@ -90,6 +90,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                 \\  /tools           List available tools
                 \\  /skills          List installed skills
                 \\  /history         Show recent commands
+                \\  /model [name]    Show or switch the active model
                 \\  /resume [id]     List recent sessions, or resume one by id
                 \\  /retry           Resend the last user message
                 \\  /compact         Compact oldest messages when over threshold
@@ -155,6 +156,12 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                 \\  total cost    ${d:.6} USD
                 \\
             , .{ app.config.model, u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, cost });
+            continue;
+        }
+        // /model [name] —— 无参列当前 + 可选模型；有参切换
+        if (std.mem.startsWith(u8, trimmed, "/model")) {
+            const rest = std.mem.trim(u8, trimmed[6..], " \t");
+            try handleModel(app, allocator, rest);
             continue;
         }
         // /resume [id] —— 无参列最近 10 个 session；有参加载
@@ -596,6 +603,55 @@ const REVIEW_PROMPT =
     \\  4) Quote the specific lines you are commenting on.
     \\  5) End with a one-line verdict: ready to merge / needs fixes.
 ;
+
+/// /model：无参显示当前模型 + 已知候选；有参切换到指定模型并重建 system prompt。
+fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
+    if (rest.len == 0) {
+        std.debug.print("current model: \x1b[36m{s}\x1b[0m\n", .{app.config.model});
+        // 优先列 probe 到的 catalog；为空则列本地已知前缀
+        if (app.api_client.catalog.entries.items.len > 0) {
+            std.debug.print("available (from server):\n", .{});
+            for (app.api_client.catalog.entries.items) |e| {
+                std.debug.print("  {s}  (max_output={d})\n", .{ e.model_id, e.max_tokens });
+            }
+        } else {
+            std.debug.print("known model families:\n", .{});
+            std.debug.print("  claude-opus-4-7 / claude-opus-4-6 / claude-opus-4-5\n", .{});
+            std.debug.print("  claude-sonnet-4-6 / claude-sonnet-4\n", .{});
+            std.debug.print("  claude-haiku-4-5\n", .{});
+        }
+        std.debug.print("usage: /model <model-id>\n", .{});
+        return;
+    }
+
+    // 基本校验：必须像一个 claude 模型 id（避免手滑切到无效值导致 401/404 满屏）。
+    // 若 catalog 非空，也接受 catalog 里出现过的 id。
+    const in_catalog = blk: {
+        for (app.api_client.catalog.entries.items) |e| {
+            if (std.mem.eql(u8, e.model_id, rest)) break :blk true;
+        }
+        break :blk false;
+    };
+    if (!in_catalog and !std.mem.startsWith(u8, rest, "claude-")) {
+        std.debug.print("\x1b[31mrefused: '{s}' doesn't look like a model id (expected 'claude-...')\x1b[0m\n", .{rest});
+        return;
+    }
+
+    const new_model = try allocator.dupe(u8, rest);
+    app.config.model = new_model;
+    app.api_client.model = new_model;
+
+    // 重建 system prompt（含 knowledge cutoff、模型名）。失败保留旧的。
+    const sp_mod = @import("../core/system_prompt.zig");
+    if (sp_mod.build(allocator, new_model)) |sp| {
+        if (app.system_prompt) |old| allocator.free(old);
+        app.system_prompt = sp;
+    } else |err| {
+        std.debug.print("\x1b[33mwarn: system prompt rebuild failed ({s}); kept previous\x1b[0m\n", .{@errorName(err)});
+    }
+
+    std.debug.print("switched to \x1b[36m{s}\x1b[0m (max_output={d})\n", .{ new_model, app.api_client.resolveMaxTokens() });
+}
 
 fn handleDoctor(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     std.debug.print("\x1b[1mcc-zig doctor\x1b[0m\n", .{});
