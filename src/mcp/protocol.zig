@@ -228,6 +228,16 @@ pub fn callToolParams(allocator: std.mem.Allocator, tool_name: []const u8, argum
     , .{ tool_name, arguments_json });
 }
 
+/// 构造 resources/read 的 params（uri 需 JSON 转义）。
+pub fn readResourceParams(allocator: std.mem.Allocator, uri: []const u8) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"uri\":");
+    try std.json.Stringify.encodeJsonString(uri, .{}, &out.writer);
+    try out.writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -306,4 +316,10 @@ test "callToolParams structure" {
     const p = try callToolParams(testing.allocator, "Read", "{\"path\":\"/x\"}");
     defer testing.allocator.free(p);
     try testing.expectEqualStrings("{\"name\":\"Read\",\"arguments\":{\"path\":\"/x\"}}", p);
+}
+
+test "readResourceParams escapes uri" {
+    const p = try readResourceParams(testing.allocator, "file:///a/b.txt");
+    defer testing.allocator.free(p);
+    try testing.expectEqualStrings("{\"uri\":\"file:///a/b.txt\"}", p);
 }

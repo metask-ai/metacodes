@@ -24,6 +24,13 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         }
     }
 
+    // 自动建父目录（对齐 TS：Write 到不存在的目录会先 mkdir -p）。
+    try mkdirParents(path);
+
+    // 写前抓旧内容（用于 structuredPatch / gitDiff）。文件不存在 → 旧内容为空。
+    const old_content = readExisting(allocator, path) catch null;
+    defer if (old_content) |oc| allocator.free(oc);
+
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o666) catch return error.WriteError;
     defer _ = std.c.close(fd);
 
@@ -41,7 +48,70 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (st) |s| rs.record(path, s.mtime_ns, s.size) catch {};
     }
 
-    return try std.fmt.allocPrint(allocator, "{{\"success\": true, \"path\": \"{s}\"}}", .{path});
+    return try renderResult(allocator, path, old_content orelse "", content);
+}
+
+/// 读已存在文件全文（不存在返 error）。供 Write 计算 diff。
+fn readExisting(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
+    defer _ = std.c.close(fd);
+    return try common.readAllFromFd(fd, allocator);
+}
+
+/// 渲染 Write 成功结果：success + path + structuredPatch + gitDiff。
+fn renderResult(allocator: std.mem.Allocator, path: []const u8, old_content: []const u8, new_content: []const u8) ![]u8 {
+    const patch_mod = @import("../core/patch.zig");
+    var patch = patch_mod.compute(allocator, old_content, new_content) catch {
+        // diff 失败不致命：退回最简结果
+        return try std.fmt.allocPrint(allocator, "{{\"success\":true, \"path\": \"{s}\"}}", .{path});
+    };
+    defer patch.deinit(allocator);
+
+    const structured = try patch_mod.toStructuredJson(allocator, patch.hunks);
+    defer allocator.free(structured);
+    const git_diff = try patch_mod.toGitDiff(allocator, path, patch.hunks);
+    defer allocator.free(git_diff);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"success\":true,\"path\":");
+    try std.json.Stringify.encodeJsonString(path, .{}, &out.writer);
+    try out.writer.writeAll(",\"structuredPatch\":");
+    try out.writer.writeAll(structured);
+    try out.writer.writeAll(",\"gitDiff\":");
+    try std.json.Stringify.encodeJsonString(git_diff, .{}, &out.writer);
+    try out.writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
+/// 为 path 创建所有缺失的父目录（等价 mkdir -p 到 dirname）。已存在的目录忽略。
+/// 失败（权限等）静默返回——后续 openat 会以 WriteError 暴露真正问题。
+fn mkdirParents(path: []const u8) !void {
+    // 找最后一个 '/'，其左侧即父目录路径
+    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return; // 无目录分量
+    if (slash == 0) return; // 直接在根目录下，无需建
+    const dir = path[0..slash];
+
+    var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (dir.len >= buf.len) return error.PathTooLong;
+
+    // 逐级建：对每个 '/' 位置，把到该处的前缀 mkdir 一次
+    var i: usize = 1;
+    while (i <= dir.len) : (i += 1) {
+        if (i == dir.len or dir[i] == '/') {
+            @memcpy(buf[0..i], dir[0..i]);
+            buf[i] = 0;
+            const seg_z: [*:0]const u8 = @ptrCast(&buf);
+            // mkdir 返回 <0 且 errno=EEXIST 时忽略
+            if (std.c.mkdir(seg_z, 0o755) != 0) {
+                const errno = std.c._errno().*;
+                if (errno != @intFromEnum(std.c.E.EXIST)) {
+                    // 其它错误（如权限）不在此处 fatal——交给 openat
+                    return;
+                }
+            }
+        }
+    }
 }
 
 fn testCtx() ToolContext {
@@ -68,15 +138,21 @@ test "WriteTool create file" {
     const args = "{\"path\":\"/tmp/cc-zig-write-test.txt\",\"content\":\"hello\"}";
     const result = try execute(&ctx, args);
     defer std.testing.allocator.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"success\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"success\":true") != null);
     _ = std.c.unlink("/tmp/cc-zig-write-test.txt");
 }
 
-test "WriteTool does not auto-mkdir parent directory" {
+test "WriteTool auto-mkdir creates missing parent directory" {
     const ctx = testCtx();
-    // 父目录 /tmp/cc-zig-nonexistent-parent-XXXX/ 不存在 → 应返 WriteError
-    const args = "{\"path\":\"/tmp/cc-zig-nonexistent-parent-9a8b/foo.txt\",\"content\":\"x\"}";
-    try std.testing.expectError(error.WriteError, execute(&ctx, args));
+    const path = "/tmp/cc-zig-mkdir-parent-9a8b/sub/foo.txt";
+    const args = "{\"path\":\"/tmp/cc-zig-mkdir-parent-9a8b/sub/foo.txt\",\"content\":\"x\"}";
+    const result = try execute(&ctx, args);
+    defer std.testing.allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"success\":true") != null);
+    // cleanup
+    _ = std.c.unlink(path);
+    _ = std.c.rmdir("/tmp/cc-zig-mkdir-parent-9a8b/sub");
+    _ = std.c.rmdir("/tmp/cc-zig-mkdir-parent-9a8b");
 }
 
 test "WriteTool not-read-first rejects existing file" {
@@ -107,7 +183,7 @@ test "WriteTool creating new file does not require read" {
     const ctx = ToolContext{ .allocator = a, .read_state = &rs };
     const result = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-write-new-test.txt\",\"content\":\"hello\"}");
     defer a.free(result);
-    try std.testing.expect(std.mem.indexOf(u8, result, "\"success\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"success\":true") != null);
 }
 
 test "WriteTool stale file rejected" {

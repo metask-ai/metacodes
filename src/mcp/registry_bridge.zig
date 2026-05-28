@@ -74,6 +74,38 @@ pub const McpSession = struct {
             try self.bindings.append(self.allocator, binding);
         }
     }
+
+    /// 注册本 server 的 resource 访问工具：`<prefix>__list_resources` + `<prefix>__read_resource`。
+    /// 复用 McpToolBinding（mcp_tool_name 字段此处不用，置空 dup）。
+    pub fn registerResourceTools(
+        self: *McpSession,
+        registry: *DynRegistry,
+        server_prefix: []const u8,
+    ) !void {
+        // list_resources
+        {
+            const binding = try self.allocator.create(McpToolBinding);
+            errdefer self.allocator.destroy(binding);
+            binding.* = .{ .client = self.client, .mcp_tool_name = try self.allocator.dupe(u8, "") };
+            errdefer self.allocator.free(binding.mcp_tool_name);
+            const name = try std.fmt.allocPrint(self.allocator, "{s}__list_resources", .{server_prefix});
+            defer self.allocator.free(name);
+            try registry.register(name, "List resources exposed by this MCP server.", &.{}, executeListResources, binding);
+            try self.bindings.append(self.allocator, binding);
+        }
+        // read_resource
+        {
+            const binding = try self.allocator.create(McpToolBinding);
+            errdefer self.allocator.destroy(binding);
+            binding.* = .{ .client = self.client, .mcp_tool_name = try self.allocator.dupe(u8, "") };
+            errdefer self.allocator.free(binding.mcp_tool_name);
+            const name = try std.fmt.allocPrint(self.allocator, "{s}__read_resource", .{server_prefix});
+            defer self.allocator.free(name);
+            const required = [_][]const u8{"uri"};
+            try registry.register(name, "Read a resource from this MCP server by uri.", &required, executeReadResource, binding);
+            try self.bindings.append(self.allocator, binding);
+        }
+    }
 };
 
 pub const McpToolBinding = struct {
@@ -86,6 +118,20 @@ fn executeMcpTool(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaqu
     // args 应是 JSON object；直接透传
     _ = ctx; // abort 未在本版本传给 MCP 请求——future 扩展
     return try binding.client.callTool(binding.mcp_tool_name, args);
+}
+
+fn executeListResources(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anyerror![]u8 {
+    const binding: *McpToolBinding = @ptrCast(@alignCast(ctx_ptr orelse return error.MissingMcpBinding));
+    _ = ctx;
+    _ = args;
+    return try binding.client.listResources();
+}
+
+fn executeReadResource(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anyerror![]u8 {
+    const binding: *McpToolBinding = @ptrCast(@alignCast(ctx_ptr orelse return error.MissingMcpBinding));
+    _ = ctx;
+    const uri = extractStringField(args, "uri") orelse return error.MissingUri;
+    return try binding.client.readResource(uri);
 }
 
 // 私有 helpers——和 protocol.zig 同逻辑但只处理 object
@@ -154,4 +200,18 @@ test "findObjectEnd simple" {
 
 test "extractStringField works" {
     try testing.expectEqualStrings("foo", extractStringField("{\"name\":\"foo\"}", "name").?);
+}
+
+test "registerResourceTools registers list + read tools" {
+    // 用一个假 client 指针即可（不会真调用，只校验注册）
+    var fake_client: McpClient = undefined;
+    var session = McpSession.init(testing.allocator, &fake_client);
+    defer session.deinit();
+
+    var reg = DynRegistry.init(testing.allocator);
+    defer reg.deinit();
+    try session.registerResourceTools(&reg, "myserver");
+
+    try testing.expect(reg.find("myserver__list_resources") != null);
+    try testing.expect(reg.find("myserver__read_resource") != null);
 }

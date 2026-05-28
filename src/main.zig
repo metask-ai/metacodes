@@ -161,4 +161,5 @@ test {
     _ = &@import("skills/tool.zig");
     _ = &@import("app/config.zig");
     _ = &@import("core/subagent.zig");
+    _ = &@import("core/patch.zig");
 }

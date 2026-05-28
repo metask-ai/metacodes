@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased — Stage 2 parity (2026-05-29)
+
+工具层 P1 语义对齐。
+
+### Added
+- **Read 图像**：`.png/.jpg/.jpeg/.gif/.webp` 读为 base64 + media_type，api/request.zig 序列化时发成真正的 image content block（非文本 dump）；3.75MB 上限。
+- **Read 设备路径黑名单**：`/dev/zero` `/dev/random` `/dev/fd/*` 等会 hang 的路径直接拒绝。
+- **Edit/Write structuredPatch + gitDiff**：返回结构化 hunk（LCS diff，core/patch.zig）+ 标准 unified diff，不再只有 `{"success":true}`。
+- **Edit 安全限制**：`MAX_EDIT_FILE_SIZE` 1 GiB 拒绝 + smart-quote 归一化 fallback（文件弯引号 “ ” ‘ ’ ↔ old_string 直引号）。
+- **Write 自动建父目录**（mkdir -p 语义）。
+- **Skill `allowed_tools` 软约束**：激活带 allowed_tools 的 skill 时在指令顶部注入工具白名单声明（硬隔离待 forked-subagent）。
+- **MCP `resources/list` + `resources/read`**：client 方法 + `<server>__list_resources` / `<server>__read_resource` 工具。
+
 ## Unreleased — Stage 0+1 parity (2026-05-29)
 
 macOS 移植 + Phase A/B 残留补齐（见 `../doc/SURVEY_2026-05-28.md`）。

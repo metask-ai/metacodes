@@ -80,6 +80,18 @@ pub const McpClient = struct {
         defer self.allocator.free(params);
         return try self.request("tools/call", params);
     }
+
+    /// 列出 server 暴露的 resources（resources/list）。返回原始 JSON-RPC result。
+    pub fn listResources(self: *McpClient) ![]u8 {
+        return try self.request("resources/list", protocol.EMPTY_PARAMS);
+    }
+
+    /// 读取一个 resource（resources/read）。uri 为 resource 标识。
+    pub fn readResource(self: *McpClient, uri: []const u8) ![]u8 {
+        const params = try protocol.readResourceParams(self.allocator, uri);
+        defer self.allocator.free(params);
+        return try self.request("resources/read", params);
+    }
 };
 
 // ============================================================================

@@ -39,6 +39,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const fd = std.posix.openat(std.posix.AT.FDCWD, file_path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
     const original = blk: {
         defer _ = std.c.close(fd);
+        const sz = read_state.statFd(fd) catch null;
+        if (sz) |s| {
+            if (s.size > MAX_EDIT_FILE_SIZE) return error.FileTooLarge;
+        }
         break :blk try common.readAllFromFd(fd, allocator);
     };
     defer allocator.free(original);
@@ -47,6 +51,16 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // 这样：1) 真实文件里本来就有类似 "    5\t" 这种前缀的行不被误改；2) 模型带前缀复制过来也能工作。
     const use_stripped = std.mem.indexOf(u8, original, old_unesc) == null;
     if (use_stripped and std.mem.indexOf(u8, original, old_stripped) == null) {
+        // 第三次尝试：smart-quote 归一化（文件里是弯引号 “ ” ‘ ’，模型 old_string 打了直引号）。
+        // 在归一化空间里定位，再映射回 original 的真实字节范围做替换。
+        if (findSmartQuote(original, old_unesc)) |range| {
+            var nc = std.ArrayList(u8).empty;
+            defer nc.deinit(allocator);
+            try nc.appendSlice(allocator, original[0..range.start]);
+            try nc.appendSlice(allocator, new_unesc);
+            try nc.appendSlice(allocator, original[range.end..]);
+            return try finalizeWrite(ctx, allocator, file_path, original, nc.items, old_raw, new_raw);
+        }
         return error.StringNotFound;
     }
     const old_string = if (use_stripped) old_stripped else old_unesc;
@@ -81,10 +95,24 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         try new_content.appendSlice(allocator, original[i + old_string.len ..]);
     }
 
+    return try finalizeWrite(ctx, allocator, file_path, original, new_content.items, old_raw, new_raw);
+}
+
+/// 写入新内容 + 刷新 ReadState mtime + 返回结果 JSON（含 structuredPatch + gitDiff）。
+/// Edit 的正常路径与 smart-quote fallback 路径共用。
+fn finalizeWrite(
+    ctx: *const ToolContext,
+    allocator: std.mem.Allocator,
+    file_path: []const u8,
+    old_content: []const u8,
+    content: []const u8,
+    old_raw: []const u8,
+    new_raw: []const u8,
+) ![]u8 {
     const write_fd = std.posix.openat(std.posix.AT.FDCWD, file_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return error.WriteError;
     defer _ = std.c.close(write_fd);
 
-    const written = std.c.write(write_fd, new_content.items.ptr, new_content.items.len);
+    const written = std.c.write(write_fd, content.ptr, content.len);
     if (written < 0) return error.WriteError;
 
     // 写完后刷新 ReadState 的 mtime，避免紧接着再次 Edit 报 stale
@@ -93,9 +121,81 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (st) |s| rs.record(file_path, s.mtime_ns, s.size) catch {};
     }
 
-    return try std.fmt.allocPrint(allocator,
-        \\{{"file_path":"{s}","old_string":"{s}","new_string":"{s}","success":true}}
-    , .{ file_path, old_raw, new_raw });
+    // structuredPatch + gitDiff
+    const patch_mod = @import("../core/patch.zig");
+    var patch = patch_mod.compute(allocator, old_content, content) catch {
+        return try std.fmt.allocPrint(allocator,
+            \\{{"file_path":"{s}","old_string":"{s}","new_string":"{s}","success":true}}
+        , .{ file_path, old_raw, new_raw });
+    };
+    defer patch.deinit(allocator);
+    const structured = try patch_mod.toStructuredJson(allocator, patch.hunks);
+    defer allocator.free(structured);
+    const git_diff = try patch_mod.toGitDiff(allocator, file_path, patch.hunks);
+    defer allocator.free(git_diff);
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"file_path\":");
+    try std.json.Stringify.encodeJsonString(file_path, .{}, &out.writer);
+    try out.writer.writeAll(",\"success\":true,\"structuredPatch\":");
+    try out.writer.writeAll(structured);
+    try out.writer.writeAll(",\"gitDiff\":");
+    try std.json.Stringify.encodeJsonString(git_diff, .{}, &out.writer);
+    try out.writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
+/// Edit 文件大小上限（1 GiB）：防止误传巨型文件把内存读爆。
+const MAX_EDIT_FILE_SIZE: u64 = 1 << 30;
+
+const Range = struct { start: usize, end: usize };
+
+/// 在 `haystack` 里以"弯/直引号等价"语义搜索 `needle`，返回命中的真实字节范围。
+/// 归一化规则：左右弯双引号 “ ” (U+201C/201D) ↔ 直双引号 "；左右弯单引号 ‘ ’ (U+2018/2019) ↔ 直单引号 '。
+/// 比较在归一化字符层面进行，但返回的是 haystack 中的原始字节偏移（可直接切片替换）。
+fn findSmartQuote(haystack: []const u8, needle: []const u8) ?Range {
+    if (needle.len == 0) return null;
+    var i: usize = 0;
+    while (i < haystack.len) : (i += 1) {
+        if (matchAt(haystack, i, needle)) |end| return .{ .start = i, .end = end };
+    }
+    return null;
+}
+
+/// 从 haystack[start] 起尝试匹配 needle（引号归一化）。成功返回 haystack 中的结束偏移。
+fn matchAt(haystack: []const u8, start: usize, needle: []const u8) ?usize {
+    var hi = start;
+    var ni: usize = 0;
+    while (ni < needle.len) {
+        if (hi >= haystack.len) return null;
+        const h = nextNormChar(haystack, &hi);
+        const n = nextNormChar(needle, &ni);
+        if (h != n) return null;
+    }
+    return hi;
+}
+
+/// 读下一个"归一化字符"：弯引号→对应直引号（返回 ASCII），其它字节原样返回。
+/// 推进 `idx`（弯引号占 3 字节 UTF-8，前进 3；否则前进 1）。
+fn nextNormChar(s: []const u8, idx: *usize) u8 {
+    const i = idx.*;
+    // U+2018 ‘ = E2 80 98, U+2019 ’ = E2 80 99, U+201C “ = E2 80 9C, U+201D ” = E2 80 9D
+    if (i + 2 < s.len and s[i] == 0xE2 and s[i + 1] == 0x80) {
+        switch (s[i + 2]) {
+            0x98, 0x99 => {
+                idx.* = i + 3;
+                return '\'';
+            },
+            0x9C, 0x9D => {
+                idx.* = i + 3;
+                return '"';
+            },
+            else => {},
+        }
+    }
+    idx.* = i + 1;
+    return s[i];
 }
 
 /// 按行扫描；若行首匹配 `^[ ]{0,5}\d+\t` 则去掉该前缀。返回新分配的切片。
@@ -323,4 +423,47 @@ test "EditTool after read succeeds" {
     const result = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-after-read-test.txt\",\"old_string\":\"foo\",\"new_string\":\"bar\"}");
     defer a.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"success\":true") != null);
+}
+
+test "findSmartQuote matches straight needle against curly haystack" {
+    // haystack 含弯双引号 “hi” ；needle 用直引号 "hi"
+    const haystack = "say \xE2\x80\x9Chi\xE2\x80\x9D now";
+    const r = findSmartQuote(haystack, "\"hi\"").?;
+    // “ 起于 index 4，” 占 3 字节，结束于 4 + 3 + 2 + 3 = 12
+    try std.testing.expectEqual(@as(usize, 4), r.start);
+    try std.testing.expectEqual(@as(usize, 12), r.end);
+}
+
+test "findSmartQuote returns null when no match" {
+    try std.testing.expect(findSmartQuote("plain text", "\"x\"") == null);
+}
+
+test "EditTool smart-quote fallback replaces curly with straight" {
+    const a = std.testing.allocator;
+    const path = "/tmp/cc-zig-edit-smartquote.txt";
+    defer _ = std.c.unlink(path);
+    // 文件含弯引号
+    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const content = "const s = \xE2\x80\x9Chello\xE2\x80\x9D;\n";
+    _ = std.c.write(fd, content.ptr, content.len);
+    _ = std.c.close(fd);
+
+    var rs = @import("../core/read_state.zig").ReadState.init(a);
+    defer rs.deinit();
+    const ctx = ToolContext{ .allocator = a, .read_state = &rs };
+    const read = @import("read.zig");
+    const rout = try read.execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-smartquote.txt\"}");
+    a.free(rout);
+
+    // old_string 用直引号；应通过 smart-quote fallback 命中
+    const result = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-smartquote.txt\",\"old_string\":\"const s = \\\"hello\\\";\",\"new_string\":\"const s = world;\"}");
+    defer a.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "\"success\":true") != null);
+
+    // 验证文件内容已替换
+    const vfd = std.c.open(path, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    var rbuf: [128]u8 = undefined;
+    const n = std.c.read(vfd, &rbuf, rbuf.len);
+    _ = std.c.close(vfd);
+    try std.testing.expect(std.mem.indexOf(u8, rbuf[0..@intCast(n)], "world") != null);
 }

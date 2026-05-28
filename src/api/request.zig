@@ -141,7 +141,17 @@ fn serializeContent(content: []const types.ApiContent, buf: *std.ArrayList(u8), 
                 try buf.appendSlice(allocator, "\"type\":\"tool_result\",\"tool_use_id\":");
                 try util_json.serializeString(tr.tool_use_id, buf, allocator);
                 try buf.appendSlice(allocator, ",\"content\":");
-                try util_json.serializeString(tr.content, buf, allocator);
+                // 图像结果：Read 工具返回 {"type":"image","media_type":..,"data":..}
+                // → 发成 content block 数组 [{"type":"image","source":{"type":"base64",...}}]
+                if (extractImageResult(tr.content)) |img| {
+                    try buf.appendSlice(allocator, "[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":");
+                    try util_json.serializeString(img.media_type, buf, allocator);
+                    try buf.appendSlice(allocator, ",\"data\":");
+                    try util_json.serializeString(img.data, buf, allocator);
+                    try buf.appendSlice(allocator, "}}]");
+                } else {
+                    try util_json.serializeString(tr.content, buf, allocator);
+                }
                 if (tr.is_error) {
                     try buf.appendSlice(allocator, ",\"is_error\":true");
                 }
@@ -150,6 +160,19 @@ fn serializeContent(content: []const types.ApiContent, buf: *std.ArrayList(u8), 
         }
     }
     try buf.append(allocator, ']');
+}
+
+const ImageResult = struct { media_type: []const u8, data: []const u8 };
+
+/// 检测 tool_result content 是否为 Read 工具的图像形态。
+/// 仅当以 `{"type":"image"` 开头且含 media_type + data 字段时返回；否则 null（当文本处理）。
+/// 返回的 slice 借用 content 内部字节（未 unescape）——base64/media_type 无需转义，直接透传。
+fn extractImageResult(content: []const u8) ?ImageResult {
+    const trimmed = std.mem.trimStart(u8, content, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "{\"type\":\"image\"")) return null;
+    const mt = util_json.extractStringField(trimmed, "media_type") orelse return null;
+    const data = util_json.extractStringField(trimmed, "data") orelse return null;
+    return .{ .media_type = mt, .data = data };
 }
 
 fn serializeTools(tools: []const ToolDefinition, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
@@ -322,6 +345,32 @@ test "serializeMessagesRequest with tool_result is_error=true" {
     const body = try serializeMessagesRequest(req, std.testing.allocator);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"is_error\":true") != null);
+}
+
+test "serializeMessagesRequest with image tool_result emits content block array" {
+    const msg = types.ApiMessage{
+        .role = .user,
+        .content = &.{.{ .tool_result = .{
+            .tool_use_id = "t1",
+            .content = "{\"type\":\"image\",\"media_type\":\"image/png\",\"data\":\"iVBORw==\"}",
+            .is_error = false,
+        } }},
+    };
+    const req = MessagesRequest{ .model = "m", .messages = &.{msg} };
+    const body = try serializeMessagesRequest(req, std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":[{\"type\":\"image\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"source\":{\"type\":\"base64\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"media_type\":\"image/png\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"data\":\"iVBORw==\"") != null);
+}
+
+test "extractImageResult ignores plain text" {
+    try std.testing.expect(extractImageResult("just text") == null);
+    try std.testing.expect(extractImageResult("{\"stdout\":\"x\"}") == null);
+    const img = extractImageResult("{\"type\":\"image\",\"media_type\":\"image/gif\",\"data\":\"AAAA\"}").?;
+    try std.testing.expectEqualStrings("image/gif", img.media_type);
+    try std.testing.expectEqualStrings("AAAA", img.data);
 }
 
 test "serializeMessagesRequest escapes special chars in text" {

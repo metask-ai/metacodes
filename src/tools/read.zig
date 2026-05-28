@@ -15,6 +15,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         return error.MissingPath;
     if (path.len == 0) return error.EmptyPath;
     try security.validateNoTraversal(path);
+    try rejectDevicePath(path);
+
+    // 图像文件：单独路径——不当文本读（会乱码 + 撑爆 token）。
+    if (imageMediaType(path)) |media_type| {
+        return try readImage(allocator, ctx, path, media_type);
+    }
 
     const offset_1based: usize = if (common.extractJsonArg(args, "offset")) |s|
         std.fmt.parseInt(usize, s, 10) catch 1
@@ -97,6 +103,124 @@ fn renderWithLineNumbers(slice: []const u8, start_line: usize, allocator: std.me
 
 fn testCtx() ToolContext {
     return ToolContext.simple(std.testing.allocator);
+}
+
+/// 阻塞/无限设备路径黑名单——读这些会 hang 或无限流。
+const DEVICE_PATHS = [_][]const u8{
+    "/dev/zero",   "/dev/random", "/dev/urandom", "/dev/null",
+    "/dev/stdin",  "/dev/stdout", "/dev/stderr",  "/dev/full",
+    "/dev/tty",    "/dev/ptmx",
+};
+
+fn rejectDevicePath(path: []const u8) !void {
+    for (DEVICE_PATHS) |dp| {
+        if (std.mem.eql(u8, path, dp)) return error.DevicePathBlocked;
+    }
+    // /dev/fd/* 与 /proc/*/fd/* 也容易 hang
+    if (std.mem.startsWith(u8, path, "/dev/fd/")) return error.DevicePathBlocked;
+}
+
+/// 按扩展名判定图像 media_type；非图像返 null。
+fn imageMediaType(path: []const u8) ?[]const u8 {
+    const Ext = struct { suffix: []const u8, mt: []const u8 };
+    const table = [_]Ext{
+        .{ .suffix = ".png", .mt = "image/png" },
+        .{ .suffix = ".jpg", .mt = "image/jpeg" },
+        .{ .suffix = ".jpeg", .mt = "image/jpeg" },
+        .{ .suffix = ".gif", .mt = "image/gif" },
+        .{ .suffix = ".webp", .mt = "image/webp" },
+    };
+    for (table) |e| {
+        if (endsWithIgnoreCase(path, e.suffix)) return e.mt;
+    }
+    return null;
+}
+
+fn endsWithIgnoreCase(s: []const u8, suffix: []const u8) bool {
+    if (s.len < suffix.len) return false;
+    const tail = s[s.len - suffix.len ..];
+    for (tail, suffix) |a, b| {
+        if (std.ascii.toLower(a) != std.ascii.toLower(b)) return false;
+    }
+    return true;
+}
+
+/// 图像读取上限（base64 前的原始字节）。Anthropic 单图 ~5MB 限制，留余量取 3.75MB。
+const MAX_IMAGE_BYTES: usize = 3_750_000;
+
+/// 读图像 → base64 → 返回结构化 JSON：{"type":"image","media_type":"...","data":"<b64>"}。
+/// api/request.zig 的 serializeContent 检测到此形态会发成真正的 image content block。
+fn readImage(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []const u8, media_type: []const u8) ![]u8 {
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
+    defer _ = std.c.close(fd);
+
+    const st = read_state.statFd(fd) catch null;
+    if (st) |s| {
+        if (s.size > MAX_IMAGE_BYTES) return error.ImageTooLarge;
+    }
+
+    const raw = try common.readAllFromFd(fd, allocator);
+    defer allocator.free(raw);
+    if (raw.len > MAX_IMAGE_BYTES) return error.ImageTooLarge;
+
+    // base64 编码
+    const enc = std.base64.standard.Encoder;
+    const b64_len = enc.calcSize(raw.len);
+    const b64 = try allocator.alloc(u8, b64_len);
+    defer allocator.free(b64);
+    _ = enc.encode(b64, raw);
+
+    // 记录 ReadState（图像也算"读过"，后续 Write 才放行）
+    if (ctx.read_state) |rs| {
+        if (st) |s| rs.record(path, s.mtime_ns, s.size) catch {};
+    }
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"type\":\"image\",\"media_type\":");
+    try std.json.Stringify.encodeJsonString(media_type, .{}, &out.writer);
+    try out.writer.writeAll(",\"data\":");
+    try std.json.Stringify.encodeJsonString(b64, .{}, &out.writer);
+    try out.writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
+test "imageMediaType detects extensions" {
+    try std.testing.expectEqualStrings("image/png", imageMediaType("/x/y.png").?);
+    try std.testing.expectEqualStrings("image/jpeg", imageMediaType("a.JPG").?);
+    try std.testing.expectEqualStrings("image/webp", imageMediaType("z.webp").?);
+    try std.testing.expect(imageMediaType("foo.txt") == null);
+    try std.testing.expect(imageMediaType("noext") == null);
+}
+
+test "rejectDevicePath blocks devices" {
+    try std.testing.expectError(error.DevicePathBlocked, rejectDevicePath("/dev/zero"));
+    try std.testing.expectError(error.DevicePathBlocked, rejectDevicePath("/dev/fd/3"));
+    try rejectDevicePath("/tmp/normal.txt"); // 不报错
+}
+
+test "ReadTool device path blocked via execute" {
+    const ctx = testCtx();
+    try std.testing.expectError(error.DevicePathBlocked, execute(&ctx, "{\"file_path\":\"/dev/zero\"}"));
+}
+
+test "ReadTool image returns structured json" {
+    const ctx = testCtx();
+    const path = "/tmp/cc-zig-read-img-test.png";
+    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    try std.testing.expect(fd >= 0);
+    // 4 字节假 PNG header
+    const bytes = [_]u8{ 0x89, 0x50, 0x4E, 0x47 };
+    _ = std.c.write(fd, &bytes, bytes.len);
+    _ = std.c.close(fd);
+    defer _ = std.c.unlink(path);
+
+    const r = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-read-img-test.png\"}");
+    defer std.testing.allocator.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "\"type\":\"image\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "\"media_type\":\"image/png\"") != null);
+    // base64 of 0x89504E47 = "iVBORw=="
+    try std.testing.expect(std.mem.indexOf(u8, r, "iVBORw") != null);
 }
 
 test "ReadTool missing path" {

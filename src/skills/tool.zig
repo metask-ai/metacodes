@@ -29,6 +29,23 @@ fn execute(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anye
 
     const skill = set.find(name) orelse return error.SkillNotFound;
 
+    // allowed_tools 约束：当前 skill 走"内联注入指令"模型（非 fork 子 agent），
+    // 无法在工具分发层硬隔离工具集。退而求其次：在 body 顶部显式声明只许用这些工具，
+    // 让模型自我约束。硬隔离（forked subagent + tool pool 限制）见 [[skill-forked-exec]]。
+    if (skill.allowed_tools.len > 0) {
+        var out: std.Io.Writer.Allocating = .init(ctx.allocator);
+        defer out.deinit();
+        try out.writer.print("# Skill: {s}\n\n", .{skill.name});
+        try out.writer.writeAll("> Tool restriction: while following this skill, you may ONLY use these tools: ");
+        for (skill.allowed_tools, 0..) |t, i| {
+            if (i > 0) try out.writer.writeAll(", ");
+            try out.writer.writeAll(t);
+        }
+        try out.writer.writeAll(". Do not call any other tool.\n\n");
+        try out.writer.writeAll(skill.body);
+        return try out.toOwnedSlice();
+    }
+
     return try std.fmt.allocPrint(
         ctx.allocator,
         "# Skill: {s}\n\n{s}",
@@ -90,4 +107,22 @@ test "Skill tool: missing name arg" {
         error.MissingSkillName,
         entry.execute(&ctx, "{}", entry.ctx_ptr),
     );
+}
+
+test "Skill tool: allowed_tools injects restriction directive" {
+    var set = SkillSet.init(testing.allocator);
+    defer set.deinit();
+    const md = "---\nname: reader\ndescription: read-only\nallowed_tools: Read, Grep\n---\nLook around.\n";
+    try set.skills.append(testing.allocator, try parseSkillMd(testing.allocator, md, "/fake"));
+
+    var reg = DynRegistry.init(testing.allocator);
+    defer reg.deinit();
+    try registerSkillTool(&reg, &set);
+
+    const entry = reg.find("Skill").?;
+    const ctx = ToolContext.simple(testing.allocator);
+    const out = try entry.execute(&ctx, "{\"name\":\"reader\"}", entry.ctx_ptr);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "ONLY use these tools: Read, Grep") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Look around") != null);
 }
