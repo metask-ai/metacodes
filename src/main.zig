@@ -151,6 +151,8 @@ test {
     _ = &@import("repl/multiline.zig");
     _ = &@import("repl/render.zig");
     _ = &@import("repl/headless.zig");
+    _ = &@import("repl/complete.zig");
+    _ = &@import("repl/paste.zig");
     _ = &@import("mcp/protocol.zig");
     _ = &@import("mcp/transport_stdio.zig");
     _ = &@import("mcp/client.zig");

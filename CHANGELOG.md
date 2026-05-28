@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased — Stage 3 parity (2026-05-29)
+
+REPL / TUI 体验追齐。
+
+### Added
+- **History JSONL**：历史改 JSONL（每行一个 JSON 字符串），多行命令可安全 round-trip；自动迁移旧版纯文本。
+- **代码块语法高亮**：render.zig 对 fenced code block 做轻量 token 高亮（关键字/字符串/数字/注释），通用关键字集覆盖 zig/c/ts/js/py/rust/go。
+- **TAB 补全**：行首 slash 命令补全 + 路径补全（complete.zig）；唯一直接补全，多个列出 + 补到公共前缀。
+- **Ctrl+R 反向历史搜索**：实时匹配 + Enter 接受 / Esc 取消。
+- **粘贴检测 + 外部存储**：bracketed paste mode；大粘贴（>12 行或 >1600 字节）存 `~/.cc-zig/pastes/<N>.txt` + 插入 `[Pasted text #N +M lines]` 占位符，提交前展开为真实内容（paste.zig）。
+- **`/agents` / `/permissions` / `/memory`**：列 sub-agent 能力 / 显示权限模式+规则 / 跨 session 记忆（`~/.cc-zig/memory.md`，`/memory add`）。
+
 ## Unreleased — Stage 2 parity (2026-05-29)
 
 工具层 P1 语义对齐。

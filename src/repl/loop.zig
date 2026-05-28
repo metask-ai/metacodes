@@ -13,6 +13,8 @@ const app_mod = @import("../app.zig");
 const tools = @import("../tools.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const input = @import("input.zig");
+const complete = @import("complete.zig");
+const paste_mod = @import("paste.zig");
 const history_mod = @import("history.zig");
 const multiline_mod = @import("multiline.zig");
 const render_mod = @import("render.zig");
@@ -98,6 +100,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                 \\  /config [show|path]  Inspect config (~/.cc-zig/config.json)
                 \\  /init            Create .cc-zig/ skeleton in the current directory
                 \\  /mcp             List configured MCP servers
+                \\  /agents          List available sub-agent capabilities
+                \\  /permissions     Show permission mode + loaded rules
+                \\  /memory [add ..] Show or append cross-session memory
                 \\  /commit          Draft a git commit using the model
                 \\  /review          Ask the model to review the current diff
                 \\  /exit            Exit REPL
@@ -187,6 +192,19 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             try handleMcp(app);
             continue;
         }
+        if (std.mem.eql(u8, trimmed, "/agents")) {
+            try handleAgents(app);
+            continue;
+        }
+        if (std.mem.eql(u8, trimmed, "/permissions")) {
+            handlePermissions(app);
+            continue;
+        }
+        if (std.mem.startsWith(u8, trimmed, "/memory")) {
+            const rest = std.mem.trim(u8, trimmed[7..], " \t");
+            try handleMemory(app, allocator, rest);
+            continue;
+        }
         // /commit 和 /review：把预置 prompt 注入为 user message，走正常 agent_loop 路径
         if (std.mem.eql(u8, trimmed, "/commit")) {
             try app.conversation.appendText(.user, COMMIT_PROMPT);
@@ -221,7 +239,13 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         if (final_input.len == 0) continue;
 
         try history.append(final_input);
-        try app.conversation.appendText(.user, final_input);
+        // 粘贴占位符 [Pasted text #N] → 展开成真实内容再喂给模型；history 保留紧凑占位符。
+        const expanded = blk: {
+            const home_c = std.c.getenv("HOME") orelse break :blk null;
+            break :blk paste_mod.expandPlaceholders(allocator, std.mem.span(home_c), final_input) catch null;
+        };
+        defer if (expanded) |e| allocator.free(e);
+        try app.conversation.appendText(.user, expanded orelse final_input);
 
         // 生成期间启动 stdin 监听线程：Esc / Ctrl+C / 'q' 字节 → 触发 app.abort
         // 这是因为 raw mode ISIG=false 禁用了 kernel 的 SIGINT 生成，我们必须自己读并翻译
@@ -339,6 +363,72 @@ fn readLineBuffered(allocator: std.mem.Allocator) ![]u8 {
 /// - Ctrl+C (buffer 空，首次) → 打印提示，留在同一行继续等输入
 /// - Ctrl+C (buffer 空，连续第二次) → error.ExitRequested（退出 REPL）
 /// - Ctrl+D (buffer 空) → error.Eof（退出 REPL）
+/// 处理一次括号粘贴：从 paste_begin 之后读到 paste_end，累积原始文本。
+/// 小粘贴内联插入；大粘贴存 ~/.cc-zig/pastes/<N>.txt 并插入占位符。
+fn handlePaste(
+    fd: std.c.fd_t,
+    editor: *input.LineEditor,
+    parser: *input.KeyParser,
+    allocator: std.mem.Allocator,
+) !void {
+    var pasted = std.ArrayList(u8).empty;
+    defer pasted.deinit(allocator);
+
+    // 在粘贴内，原始字节直接收集；只有 paste_end 这个 CSI 序列需要靠 parser 识别。
+    // 实现：逐字节喂 parser；若产出 .paste_end 则结束；产出 .char 收集其字节；
+    // 其它控制键在粘贴内罕见，按其原始字节收集（保留 \n \t 等）。
+    while (true) {
+        var b: [1]u8 = undefined;
+        const n = posix.read(fd, &b) catch break;
+        if (n == 0) break;
+        const key = parser.feed(b[0]) orelse {
+            // parser 处于 CSI 中间态——字节已被吞，等下一个
+            continue;
+        };
+        switch (key) {
+            .paste_end => break,
+            .char => |c| try pasted.append(allocator, c),
+            .enter => try pasted.append(allocator, '\n'),
+            .tab => try pasted.append(allocator, '\t'),
+            else => {}, // 粘贴里的其它控制序列忽略
+        }
+    }
+
+    const text = pasted.items;
+    if (text.len == 0) return;
+
+    if (paste_mod.isLarge(text)) {
+        const home_c = std.c.getenv("HOME");
+        if (home_c) |hc| {
+            const home = std.mem.span(hc);
+            g_paste_id += 1;
+            if (paste_mod.store(allocator, home, g_paste_id, text) catch null) |placeholder| {
+                defer allocator.free(placeholder);
+                try insertAtCursor(editor, allocator, placeholder);
+                return;
+            }
+        }
+        // store 失败 / 无 HOME → 退回内联
+    }
+    try insertAtCursor(editor, allocator, text);
+}
+
+/// 在光标处插入一段文本，光标移到插入末尾。
+fn insertAtCursor(editor: *input.LineEditor, allocator: std.mem.Allocator, text: []const u8) !void {
+    const line = editor.view();
+    var nl = std.ArrayList(u8).empty;
+    defer nl.deinit(allocator);
+    try nl.appendSlice(allocator, line[0..editor.cursor]);
+    try nl.appendSlice(allocator, text);
+    try nl.appendSlice(allocator, line[editor.cursor..]);
+    const new_cursor = editor.cursor + text.len;
+    try editor.setLine(nl.items);
+    editor.cursor = new_cursor;
+}
+
+/// Session 内递增的粘贴编号（用于 [Pasted text #N] 占位符 + pastes/<N>.txt 文件名）。
+var g_paste_id: usize = 0;
+
 fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_mod.History) ![]u8 {
     const orig = input.enterRawMode(fd) orelse {
         // 无法进 raw mode：退化
@@ -357,6 +447,14 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
         if (n == 0) return error.Eof;
 
         const key = parser.feed(b[0]) orelse continue;
+
+        // 括号粘贴：收集到 paste_end，决定内联还是外部存储 + 占位符
+        if (key == .paste_begin) {
+            try handlePaste(fd, &editor, &parser, allocator);
+            try redrawLine(editor.view(), editor.cursor);
+            continue;
+        }
+
         const action = try editor.handle(key);
         switch (action) {
             .redraw => try redrawLine(editor.view(), editor.cursor),
@@ -383,9 +481,115 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
                     try redrawLine(editor.view(), editor.cursor);
                 }
             },
+            .complete => {
+                try handleCompletion(&editor, allocator);
+                try redrawLine(editor.view(), editor.cursor);
+            },
+            .reverse_search => {
+                try handleReverseSearch(fd, &editor, &parser, history, allocator);
+                try redrawLine(editor.view(), editor.cursor);
+            },
             .none => {},
         }
     }
+}
+
+/// TAB 补全：算候选，唯一则补全，多个则列出 + 补到公共前缀。
+fn handleCompletion(editor: *input.LineEditor, allocator: std.mem.Allocator) !void {
+    var r = complete.compute(allocator, editor.view(), editor.cursor) catch return;
+    defer r.deinit(allocator);
+    if (r.candidates.len == 0) return;
+
+    const cursor = editor.cursor;
+    const line = editor.view();
+    // 当前 token = [replace_start, cursor)
+    const replaced_len = cursor - r.replace_start;
+
+    if (r.candidates.len == 1) {
+        try applyCompletion(editor, allocator, r.replace_start, replaced_len, r.candidates[0]);
+        return;
+    }
+    // 多候选：补到公共前缀（若比已输入更长）
+    const pfx = complete.commonPrefix(r.candidates);
+    if (pfx.len > replaced_len) {
+        try applyCompletion(editor, allocator, r.replace_start, replaced_len, pfx);
+    }
+    // 列出候选
+    std.debug.print("\n", .{});
+    for (r.candidates) |c| std.debug.print("  {s}", .{c});
+    std.debug.print("\n", .{});
+    _ = line;
+}
+
+/// 用 candidate 替换 buffer 中 [start, start+old_len) 的内容，光标移到替换末尾。
+fn applyCompletion(editor: *input.LineEditor, allocator: std.mem.Allocator, start: usize, old_len: usize, candidate: []const u8) !void {
+    const line = editor.view();
+    var new_line = std.ArrayList(u8).empty;
+    defer new_line.deinit(allocator);
+    try new_line.appendSlice(allocator, line[0..start]);
+    try new_line.appendSlice(allocator, candidate);
+    const tail_start = start + old_len;
+    if (tail_start < line.len) try new_line.appendSlice(allocator, line[tail_start..]);
+    try editor.setLine(new_line.items);
+    editor.cursor = start + candidate.len;
+}
+
+/// Ctrl+R 反向历史搜索：读字节构建 query，实时显示首个匹配；Enter 接受，Esc/Ctrl+C 取消。
+fn handleReverseSearch(
+    fd: std.c.fd_t,
+    editor: *input.LineEditor,
+    parser: *input.KeyParser,
+    history: *history_mod.History,
+    allocator: std.mem.Allocator,
+) !void {
+    _ = parser;
+    var query = std.ArrayList(u8).empty;
+    defer query.deinit(allocator);
+    var match: ?[]const u8 = null;
+
+    while (true) {
+        // 渲染搜索提示
+        std.debug.print("\r\x1b[2K(reverse-search)`{s}': {s}", .{ query.items, match orelse "" });
+
+        var b: [1]u8 = undefined;
+        const n = posix.read(fd, &b) catch return;
+        if (n == 0) return;
+        const c = b[0];
+
+        if (c == 0x1b or c == 0x03) {
+            // Esc / Ctrl+C：取消，保留原 buffer
+            std.debug.print("\r\x1b[2K", .{});
+            return;
+        }
+        if (c == '\r' or c == '\n') {
+            // 接受当前匹配
+            if (match) |m| {
+                try editor.setLine(m);
+            }
+            std.debug.print("\r\x1b[2K", .{});
+            return;
+        }
+        if (c == 0x7f or c == 0x08) {
+            if (query.items.len > 0) _ = query.pop();
+        } else if (c >= 0x20) {
+            try query.append(allocator, c);
+        } else {
+            continue;
+        }
+        match = searchHistory(history, query.items);
+    }
+}
+
+/// 从最新到最旧找第一个包含 query 的历史项。
+fn searchHistory(history: *history_mod.History, query: []const u8) ?[]const u8 {
+    if (query.len == 0) return null;
+    var i: usize = history.entries.items.len;
+    while (i > 0) {
+        i -= 1;
+        const e = history.entries.items[i];
+        if (std.mem.indexOf(u8, e, query) != null) return e;
+    }
+    return null;
 }
 
 /// 在同一行重绘：回车 → 擦行 → 重写 "> " + buffer → 移动光标。
@@ -813,6 +1017,125 @@ fn handleMcp(app: *app_mod.App) !void {
         \\key from config.json and auto-connect stdio servers.
         \\
     , .{});
+}
+
+/// /agents：列出可用的 sub-agent 能力。当前无独立 agent 定义文件系统，
+/// agent 通过内建 Agent 工具内联 spawn——这里说明可用性 + 嵌套上限。
+fn handleAgents(app: *app_mod.App) !void {
+    _ = app;
+    std.debug.print(
+        \\Sub-agents:
+        \\  Agent (built-in tool) — spawn an isolated sub-agent for a focused sub-task.
+        \\    The sub-agent shares the same tool set + permissions as the parent and
+        \\    runs in its own conversation (does not pollute the parent context).
+        \\    Max nesting depth: 3.  Args: prompt (required), description, max_turns.
+        \\
+        \\Note: file-based agent definitions (~/.cc-zig/agents/<name>.md) are not yet
+        \\loaded; a future release will let you register named agents with custom
+        \\system prompts + tool allowlists.
+        \\
+    , .{});
+}
+
+/// /permissions：显示当前权限模式 + 已从 config.json 加载的细粒度规则。
+fn handlePermissions(app: *app_mod.App) void {
+    std.debug.print("permission mode: \x1b[36m{s}\x1b[0m\n", .{@tagName(app.permission_ctx.mode)});
+    if (app.rule_set) |rs| {
+        if (rs.rules.items.len == 0) {
+            std.debug.print("rules: (none)\n", .{});
+        } else {
+            std.debug.print("rules ({d}):\n", .{rs.rules.items.len});
+            for (rs.rules.items) |r| {
+                const dec = switch (r.decision) {
+                    .allow => "allow",
+                    .deny => "deny",
+                    .ask => "ask",
+                };
+                std.debug.print("  [{s}] tool={s}", .{ dec, r.tool });
+                if (r.command_prefix) |p| std.debug.print(" command_prefix=\"{s}\"", .{p});
+                if (r.path_glob) |g| std.debug.print(" path_glob=\"{s}\"", .{g});
+                std.debug.print("\n", .{});
+            }
+        }
+    } else {
+        std.debug.print("rules: (none loaded — add a permission_rules array to ~/.cc-zig/config.json)\n", .{});
+    }
+}
+
+/// /memory：跨 session 记忆，存于 ~/.cc-zig/memory.md。
+///   /memory            显示全部
+///   /memory add <text> 追加一条（带时间戳）
+fn handleMemory(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
+    _ = app;
+    const home_c = std.c.getenv("HOME") orelse {
+        std.debug.print("HOME not set\n", .{});
+        return;
+    };
+    const home = std.mem.span(home_c);
+
+    if (std.mem.startsWith(u8, rest, "add ")) {
+        const text = std.mem.trim(u8, rest[4..], " \t");
+        if (text.len == 0) {
+            std.debug.print("usage: /memory add <text>\n", .{});
+            return;
+        }
+        try appendMemory(allocator, home, text);
+        std.debug.print("remembered.\n", .{});
+        return;
+    }
+
+    // 显示
+    const content = readMemory(allocator, home) catch null;
+    defer if (content) |c| allocator.free(c);
+    if (content) |c| {
+        if (c.len == 0) {
+            std.debug.print("(memory is empty — use /memory add <text>)\n", .{});
+        } else {
+            std.debug.print("{s}", .{c});
+            if (c[c.len - 1] != '\n') std.debug.print("\n", .{});
+        }
+    } else {
+        std.debug.print("(no memory yet — use /memory add <text>)\n", .{});
+    }
+}
+
+fn memoryPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/.cc-zig/memory.md", .{home});
+}
+
+fn appendMemory(allocator: std.mem.Allocator, home: []const u8, text: []const u8) !void {
+    const dir_z = try std.fmt.allocPrintSentinel(allocator, "{s}/.cc-zig", .{home}, 0);
+    defer allocator.free(dir_z);
+    _ = std.c.mkdir(dir_z.ptr, 0o700);
+
+    const path = try memoryPath(allocator, home);
+    defer allocator.free(path);
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+
+    const fd = std.c.open(path_z.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o600));
+    if (fd < 0) return error.WriteError;
+    defer _ = std.c.close(fd);
+
+    const line = try std.fmt.allocPrint(allocator, "- {s}\n", .{text});
+    defer allocator.free(line);
+    _ = std.c.write(fd, line.ptr, line.len);
+}
+
+fn readMemory(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
+    const path = try memoryPath(allocator, home);
+    defer allocator.free(path);
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.NotFound;
+    defer _ = std.c.close(fd);
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = std.posix.read(fd, &chunk) catch break;
+        if (n == 0) break;
+        try buf.appendSlice(allocator, chunk[0..@intCast(n)]);
+    }
+    return try buf.toOwnedSlice(allocator);
 }
 
 /// 把预置 prompt 注入为 user message 后触发一次 agent_loop 执行。

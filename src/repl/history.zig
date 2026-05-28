@@ -87,7 +87,9 @@ pub const History = struct {
         return p;
     }
 
-    /// 从文件加载（如果存在）。文件格式：每行一条命令。UTF-8 纯文本。
+    /// 从文件加载（如果存在）。
+    /// 格式：JSONL——每行一个 JSON 字符串（`"cmd with \n newline"`）。
+    /// 向后兼容：不以 `"` 开头的行按旧版纯文本整行处理（自动迁移，下次 save 会写成 JSONL）。
     pub fn loadFromFile(self: *History, path: []const u8) !void {
         const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return;
         defer _ = std.c.close(fd);
@@ -104,11 +106,26 @@ pub const History = struct {
 
         var it = std.mem.splitScalar(u8, buf.items, '\n');
         while (it.next()) |line| {
-            try self.append(line);
+            const trimmed = std.mem.trim(u8, line, "\r");
+            if (trimmed.len == 0) continue;
+            if (trimmed[0] == '"') {
+                // JSONL 行：解析为字符串
+                const parsed = std.json.parseFromSlice([]const u8, self.allocator, trimmed, .{}) catch {
+                    // 解析失败 → 当旧版纯文本兜底
+                    try self.append(trimmed);
+                    continue;
+                };
+                defer parsed.deinit();
+                try self.append(parsed.value);
+            } else {
+                // 旧版纯文本行
+                try self.append(trimmed);
+            }
         }
     }
 
-    /// 保存到文件（覆盖写）。路径必须是绝对。父目录不存在会创建（home/.cc-zig/）。
+    /// 保存到文件（覆盖写，JSONL 格式）。路径必须绝对；父目录不存在会创建。
+    /// 每条命令写成一行 JSON 字符串——含换行的多行命令也能安全 round-trip。
     /// 保存后 fsync 确保落盘。
     pub fn saveToFile(self: *const History, path: []const u8) !void {
         // 确保父目录存在（mkdir -p 父目录）
@@ -129,8 +146,12 @@ pub const History = struct {
         defer _ = std.c.close(fd);
 
         for (self.entries.items) |entry| {
-            _ = std.c.write(fd, entry.ptr, entry.len);
-            _ = std.c.write(fd, "\n", 1);
+            var line: std.Io.Writer.Allocating = .init(self.allocator);
+            defer line.deinit();
+            std.json.Stringify.encodeJsonString(entry, .{}, &line.writer) catch continue;
+            line.writer.writeByte('\n') catch continue;
+            const bytes = line.written();
+            _ = std.c.write(fd, bytes.ptr, bytes.len);
         }
         _ = std.c.fsync(fd);
     }
@@ -228,6 +249,41 @@ test "History: roundtrip save/load" {
     try testing.expectEqualStrings("gamma", (try h2.prev("")).?);
     try testing.expectEqualStrings("beta", (try h2.prev("")).?);
     try testing.expectEqualStrings("alpha", (try h2.prev("")).?);
+}
+
+test "History: multiline command survives JSONL round-trip" {
+    const path = "/tmp/cc-zig-history-multiline.jsonl";
+    defer _ = std.c.unlink(path);
+
+    var h1 = History.init(testing.allocator);
+    try h1.append("line1\nline2\nline3");
+    try h1.append("single");
+    try h1.saveToFile(path);
+    h1.deinit();
+
+    var h2 = History.init(testing.allocator);
+    defer h2.deinit();
+    try h2.loadFromFile(path);
+    // 多行命令应作为单条 entry 还原（不被换行拆成 3 条）
+    try testing.expectEqual(@as(usize, 2), h2.len());
+    try testing.expectEqualStrings("single", (try h2.prev("")).?);
+    try testing.expectEqualStrings("line1\nline2\nline3", (try h2.prev("")).?);
+}
+
+test "History: legacy plain-text file auto-migrates" {
+    const path = "/tmp/cc-zig-history-legacy.txt";
+    defer _ = std.c.unlink(path);
+    // 手写旧版纯文本（无引号）
+    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    const legacy = "oldcmd1\noldcmd2\n";
+    _ = std.c.write(fd, legacy.ptr, legacy.len);
+    _ = std.c.close(fd);
+
+    var h = History.init(testing.allocator);
+    defer h.deinit();
+    try h.loadFromFile(path);
+    try testing.expectEqual(@as(usize, 2), h.len());
+    try testing.expectEqualStrings("oldcmd2", (try h.prev("")).?);
 }
 
 test "History: load missing file is ok" {

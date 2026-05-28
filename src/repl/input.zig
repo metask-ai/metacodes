@@ -34,6 +34,10 @@ pub const Key = union(enum) {
     end,
     delete,
     esc,
+    tab,
+    ctrl_r,
+    paste_begin, // 括号粘贴起始 ESC[200~
+    paste_end, // 括号粘贴结束 ESC[201~
     unknown,
 };
 
@@ -103,6 +107,8 @@ pub const KeyParser = struct {
                 if (b == '~') {
                     return switch (self.num1) {
                         3 => .delete,
+                        200 => .paste_begin,
+                        201 => .paste_end,
                         else => .unknown,
                     };
                 }
@@ -161,6 +167,8 @@ pub const KeyParser = struct {
 fn byteToKey(b: u8) Key {
     return switch (b) {
         '\r', '\n' => .enter,
+        0x09 => .tab,
+        0x12 => .ctrl_r,
         0x7f, 0x08 => .backspace,
         0x01 => .ctrl_a,
         0x03 => .ctrl_c,
@@ -207,11 +215,18 @@ pub fn enterRawMode(fd: std.c.fd_t) ?std.c.termios {
     const enable = "\x1b[>4;1m";
     _ = std.c.write(fd, enable.ptr, enable.len);
 
+    // 启用 bracketed paste mode：粘贴内容被 ESC[200~ ... ESC[201~ 包裹，
+    // 让我们能把"粘贴"和"逐字键入"区分开（大块粘贴存外部 + 占位符）。
+    const enable_paste = "\x1b[?2004h";
+    _ = std.c.write(fd, enable_paste.ptr, enable_paste.len);
+
     return orig;
 }
 
 pub fn restoreMode(fd: std.c.fd_t, orig: std.c.termios) void {
-    // 关 modifyOtherKeys
+    // 关 bracketed paste + modifyOtherKeys
+    const disable_paste = "\x1b[?2004l";
+    _ = std.c.write(fd, disable_paste.ptr, disable_paste.len);
     const disable = "\x1b[>4;0m";
     _ = std.c.write(fd, disable.ptr, disable.len);
     _ = std.c.tcsetattr(fd, std.posix.TCSA.FLUSH, &orig);
@@ -238,6 +253,10 @@ pub const Action = enum {
     history_prev,
     /// 历史下一条
     history_next,
+    /// TAB：请求补全（调用方计算候选并回填 buffer）
+    complete,
+    /// Ctrl+R：进入反向历史搜索（调用方驱动搜索 UI）
+    reverse_search,
     /// 无语义变化（如 unknown 键）
     none,
 };
@@ -349,6 +368,10 @@ pub const LineEditor = struct {
             },
             .up => return .history_prev,
             .down => return .history_next,
+            .tab => return .complete,
+            .ctrl_r => return .reverse_search,
+            // paste_begin/end 由驱动循环（loop.zig）直接处理，编辑器层忽略
+            .paste_begin, .paste_end => return .none,
             .esc, .unknown => return .none,
         }
     }
