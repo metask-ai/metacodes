@@ -93,6 +93,10 @@ pub const Options = struct {
         state: *anyopaque,
         allocator: std.mem.Allocator,
     ) anyerror!?@import("../tools/worktree.zig").WorktreeEntry = null,
+    /// MCP session 列表(ListMcpResourcesTool/ReadMcpResourceTool 用)。
+    mcp_sessions: ?*const []@import("../app.zig").McpSessionEntry = null,
+    /// Cron registry(CronCreate/Delete/List 用)。
+    cron_registry: ?*@import("cron_registry.zig").CronRegistry = null,
 };
 
 /// usage 回调接口：stream 每次吐 usage event 时调用。
@@ -372,6 +376,8 @@ pub fn run(
                     .worktree_state = opts.worktree_state,
                     .worktree_push_fn = opts.worktree_push_fn,
                     .worktree_pop_fn = opts.worktree_pop_fn,
+                    .mcp_sessions = opts.mcp_sessions,
+                    .cron_registry = opts.cron_registry,
                 };
                 break :blk tools_mod.dispatch(&tool_ctx, tu.name, tu.input);
             } catch |err| {

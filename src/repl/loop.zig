@@ -44,6 +44,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     defer if (tty) progress.disable();
 
     while (true) {
+        // 检查到期的 cron 任务 —— 把它们的 prompt 作为 user message 注入并跑一轮
+        try fireDueCrons(app, allocator, &writer);
+
         if (tty) statusline.render(app);
         std.debug.print("> ", .{});
 
@@ -276,7 +279,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             &app.api_client,
             app.tool_defs,
             &app.permission_ctx,
-            .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline },
+            .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry },
             &writer,
             allocator,
         ) catch |err| {
@@ -1310,6 +1313,20 @@ fn readMemory(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
         try buf.appendSlice(allocator, chunk[0..@intCast(n)]);
     }
     return try buf.toOwnedSlice(allocator);
+}
+
+/// 检查到期 cron,逐个把其 prompt 作为 user message 注入并跑一轮 agent_loop。
+fn fireDueCrons(app: *app_mod.App, allocator: std.mem.Allocator, writer: *DebugWriter) !void {
+    const due = app.cron_registry.collectDue(allocator) catch return;
+    defer {
+        for (due) |p| allocator.free(p);
+        allocator.free(due);
+    }
+    for (due) |prompt| {
+        std.debug.print("\x1b[2m[cron fired]\x1b[0m {s}\n", .{prompt});
+        try app.conversation.appendText(.user, prompt);
+        try runInjectedAgent(app, allocator, writer);
+    }
 }
 
 /// 把预置 prompt 注入为 user message 后触发一次 agent_loop 执行。

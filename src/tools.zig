@@ -12,6 +12,9 @@ const kill_shell_tool = @import("tools/kill_shell.zig");
 const monitor_tool = @import("tools/monitor.zig");
 const notebook_edit_tool = @import("tools/notebook_edit.zig");
 const worktree_tool = @import("tools/worktree.zig");
+const mcp_resources_tool = @import("tools/mcp_resources.zig");
+const push_notification_tool = @import("tools/push_notification.zig");
+const cron_tool = @import("tools/cron.zig");
 const web_fetch_tool = @import("tools/web_fetch.zig");
 const ask_user_tool = @import("tools/ask_user.zig");
 const plan_mode_tool = @import("tools/plan_mode.zig");
@@ -107,6 +110,42 @@ pub const registry: []const ToolEntry = &.{
         .description = "Exit the current worktree and return to the original directory. Args: action='keep' (leaves worktree and branch intact) or 'remove' (also deletes the worktree). Optional discard_changes=true to force-remove even with uncommitted changes.",
         .input_schema = .{ .type = "object", .properties = null, .required = &.{"action"} },
         .execute = worktree_tool.exitExecute,
+    },
+    .{
+        .name = "ListMcpResourcesTool",
+        .description = "List resources exposed by all connected MCP servers. Optional server arg to filter to a single server. Returns aggregated list of {server, uri, name, description, mimeType}.",
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{} },
+        .execute = mcp_resources_tool.listExecute,
+    },
+    .{
+        .name = "ReadMcpResourceTool",
+        .description = "Read a specific MCP resource by URI. Required: uri. Optional: server (hint for which connected server to query first; otherwise tries all). Returns the resource content as JSON.",
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{"uri"} },
+        .execute = mcp_resources_tool.readExecute,
+    },
+    .{
+        .name = "PushNotification",
+        .description = "Send a desktop notification to pull the user's attention back to the session — e.g. a long task finished, or you need a decision before continuing. Use sparingly: only when there's a real chance the user stepped away. Keep message under 200 chars, one line. Args: message (required).",
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{"message"} },
+        .execute = push_notification_tool.execute,
+    },
+    .{
+        .name = "CronCreate",
+        .description = "Schedule a prompt to fire at a future time. Recurring (cron) or one-shot (delaySeconds). Args: cron (5-field 'M H DoM Mon DoW') OR delaySeconds; prompt (required); recurring (default true). Session-scoped, fires when you return to the prompt. Returns job id.",
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{"prompt"} },
+        .execute = cron_tool.createExecute,
+    },
+    .{
+        .name = "CronDelete",
+        .description = "Cancel a scheduled cron job by id.",
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{"id"} },
+        .execute = cron_tool.deleteExecute,
+    },
+    .{
+        .name = "CronList",
+        .description = "List all scheduled cron jobs in this session.",
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{} },
+        .execute = cron_tool.listExecute,
     },
     .{
         .name = "WebFetch",
@@ -330,6 +369,9 @@ test {
     _ = &monitor_tool;
     _ = &notebook_edit_tool;
     _ = &worktree_tool;
+    _ = &mcp_resources_tool;
+    _ = &push_notification_tool;
+    _ = &cron_tool;
     _ = &web_fetch_tool;
     _ = &ask_user_tool;
     _ = &plan_mode_tool;

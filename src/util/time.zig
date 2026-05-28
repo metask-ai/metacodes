@@ -38,6 +38,13 @@ pub fn nowWallNs() Nanos {
     return sec * std.time.ns_per_s + nsec;
 }
 
+/// REALTIME 秒(unix epoch)。Cron 调度用。
+pub fn nowUnix() i64 {
+    var ts: std.c.timespec = undefined;
+    if (std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts) != 0) return 0;
+    return @intCast(ts.sec);
+}
+
 test "nowMs is monotonic and positive" {
     const a = nowMs();
     const b = nowMs();

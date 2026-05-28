@@ -29,6 +29,7 @@ const McpSession = @import("mcp/registry_bridge.zig").McpSession;
 const ActiveSkillState = @import("skills/active.zig").ActiveSkillState;
 const AgentSet = @import("agents/set.zig").AgentSet;
 const WorktreeEntry = @import("tools/worktree.zig").WorktreeEntry;
+const CronRegistry = @import("core/cron_registry.zig").CronRegistry;
 
 pub const UsageTotals = struct {
     input_tokens: u64 = 0,
@@ -112,6 +113,8 @@ pub const App = struct {
     agents: AgentSet,
     /// 当前进入的 worktree 栈(支持嵌套)。EnterWorktree push,ExitWorktree pop。
     worktree_stack: std.ArrayList(WorktreeEntry),
+    /// Session 级 cron 调度。CronCreate/Delete/List 用;REPL 读 prompt 前 collectDue。
+    cron_registry: CronRegistry,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -141,6 +144,7 @@ pub const App = struct {
             .mcp_sessions = .empty,
             .agents = AgentSet.init(allocator),
             .worktree_stack = .empty,
+            .cron_registry = CronRegistry.init(allocator),
         };
 
         // 启动时加载 skills:enterprise / ~/.cc-zig / ~/.claude / project chain。
@@ -225,6 +229,7 @@ pub const App = struct {
             app.allocator.free(entry.original_cwd);
         }
         app.worktree_stack.deinit(app.allocator);
+        app.cron_registry.deinit();
         if (app.rule_set) |*r| r.deinit();
         if (app.jobs) |*j| j.deinit();
         if (app.system_prompt) |s| app.allocator.free(s);

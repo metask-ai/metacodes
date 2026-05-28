@@ -173,6 +173,13 @@ test {
     _ = &@import("agents/set.zig");
     _ = &@import("agents/filter.zig");
     _ = &@import("agents/preload.zig");
+    _ = &@import("tools/monitor.zig");
+    _ = &@import("tools/notebook_edit.zig");
+    _ = &@import("tools/worktree.zig");
+    _ = &@import("tools/mcp_resources.zig");
+    _ = &@import("tools/push_notification.zig");
+    _ = &@import("tools/cron.zig");
+    _ = &@import("core/cron_registry.zig");
     _ = &@import("skills/tool.zig");
     _ = &@import("app/config.zig");
     _ = &@import("core/subagent.zig");

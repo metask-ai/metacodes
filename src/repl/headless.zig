@@ -63,6 +63,8 @@ pub fn run(
             .worktree_state = @ptrCast(app),
             .worktree_push_fn = &app_mod.App.worktreePushTrampoline,
             .worktree_pop_fn = &app_mod.App.worktreePopTrampoline,
+            .mcp_sessions = &app.mcp_sessions.items,
+            .cron_registry = &app.cron_registry,
         },
         &writer,
         allocator,

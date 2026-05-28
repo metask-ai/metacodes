@@ -80,6 +80,11 @@ pub const ToolContext = struct {
         state: *anyopaque,
         allocator: std.mem.Allocator,
     ) anyerror!?@import("worktree.zig").WorktreeEntry = null,
+    /// MCP session 列表(ListMcpResourcesTool / ReadMcpResourceTool 用)。
+    /// 不直接 import app.zig(防循环);用 anytype pointer 转译。
+    mcp_sessions: ?*const []@import("../app.zig").McpSessionEntry = null,
+    /// Cron registry(CronCreate/Delete/List 用)。
+    cron_registry: ?*@import("../core/cron_registry.zig").CronRegistry = null,
 
     /// 便利构造：只需 allocator 的场景（大多数单元测试）。
     pub fn simple(allocator: std.mem.Allocator) ToolContext {
