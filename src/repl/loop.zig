@@ -51,7 +51,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         std.debug.print("> ", .{});
 
         const line = if (tty)
-            readLineRaw(stdin_fd, allocator, &history) catch |err| switch (err) {
+            readLineRaw(stdin_fd, allocator, &history, app) catch |err| switch (err) {
                 error.Eof => {
                     std.debug.print("Goodbye!\n", .{});
                     break;
@@ -445,7 +445,7 @@ fn insertAtCursor(editor: *input.LineEditor, allocator: std.mem.Allocator, text:
 /// Session 内递增的粘贴编号（用于 [Pasted text #N] 占位符 + pastes/<N>.txt 文件名）。
 var g_paste_id: usize = 0;
 
-fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_mod.History) ![]u8 {
+fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_mod.History, app: *app_mod.App) ![]u8 {
     const orig = input.enterRawMode(fd) orelse {
         // 无法进 raw mode：退化
         return readLineBuffered(allocator);
@@ -503,6 +503,24 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
             },
             .reverse_search => {
                 try handleReverseSearch(fd, &editor, &parser, history, allocator);
+                try redrawLine(editor.view(), editor.cursor);
+            },
+            .cycle_perm_mode => {
+                // default(prompt) → auto → plan → bypass → 回 prompt
+                app.config.permission_mode = switch (app.config.permission_mode) {
+                    .prompt => .auto,
+                    .auto => .plan,
+                    .plan => .bypass,
+                    .bypass => .prompt,
+                };
+                app.permission_ctx.mode = app.config.permission_mode;
+                std.debug.print("\r\x1b[2K\x1b[36m[permission mode: {s}]\x1b[0m\n", .{@tagName(app.config.permission_mode)});
+                std.debug.print("> ", .{});
+                try redrawLine(editor.view(), editor.cursor);
+            },
+            .redraw_screen => {
+                std.debug.print("\x1b[2J\x1b[H", .{});
+                std.debug.print("> ", .{});
                 try redrawLine(editor.view(), editor.cursor);
             },
             .none => {},

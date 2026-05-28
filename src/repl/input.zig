@@ -24,8 +24,13 @@ pub const Key = union(enum) {
     ctrl_e,
     ctrl_u,
     ctrl_k,
+    ctrl_w, // 删上一个词
+    ctrl_y, // 粘回 yank ring
+    ctrl_l, // 重绘屏幕
     ctrl_c,
     ctrl_d,
+    alt_b, // 上一词
+    alt_f, // 下一词
     up,
     down,
     left,
@@ -35,6 +40,7 @@ pub const Key = union(enum) {
     delete,
     esc,
     tab,
+    shift_tab, // cycle 权限模式
     ctrl_r,
     paste_begin, // 括号粘贴起始 ESC[200~
     paste_end, // 括号粘贴结束 ESC[201~
@@ -74,6 +80,12 @@ pub const KeyParser = struct {
                     return null;
                 }
                 self.state = .normal;
+                // Alt+key:ESC 后紧跟字母(meta)。Alt+B / Alt+F 词导航。
+                switch (b) {
+                    'b', 'B' => return .alt_b,
+                    'f', 'F' => return .alt_f,
+                    else => {},
+                }
                 return .esc;
             },
             .csi_seen => {
@@ -90,6 +102,7 @@ pub const KeyParser = struct {
                     'D' => .left,
                     'H' => .home,
                     'F' => .end,
+                    'Z' => .shift_tab, // ESC [ Z = Shift+Tab(backtab)
                     else => .unknown,
                 };
             },
@@ -176,6 +189,9 @@ fn byteToKey(b: u8) Key {
         0x05 => .ctrl_e,
         0x0b => .ctrl_k,
         0x15 => .ctrl_u,
+        0x17 => .ctrl_w,
+        0x19 => .ctrl_y,
+        0x0c => .ctrl_l,
         // 可打印 ASCII：0x20-0x7E
         // UTF-8 多字节：0x80+（首字节 0xC0-0xFF，延续字节 0x80-0xBF）——逐字节作为 .char 透传
         // 终端在显示时会把完整 UTF-8 序列组合成一个字符
@@ -257,6 +273,10 @@ pub const Action = enum {
     complete,
     /// Ctrl+R：进入反向历史搜索（调用方驱动搜索 UI）
     reverse_search,
+    /// Ctrl+L：重绘屏幕(调用方清屏 + 重画 prompt + buffer)
+    redraw_screen,
+    /// Shift+Tab：cycle 权限模式(调用方改 app.config.permission_mode)
+    cycle_perm_mode,
     /// 无语义变化（如 unknown 键）
     none,
 };
@@ -267,13 +287,16 @@ pub const LineEditor = struct {
     allocator: std.mem.Allocator,
     /// 上一次按键是否是 Ctrl+C（用于"双击退出"语义）。任何其他按键重置为 false。
     ctrl_c_armed: bool = false,
+    /// yank ring:Ctrl+W/K/U 删除的内容存这,Ctrl+Y 粘回。
+    yank_buf: std.ArrayList(u8),
 
     pub fn init(allocator: std.mem.Allocator) LineEditor {
-        return .{ .buf = .empty, .allocator = allocator };
+        return .{ .buf = .empty, .allocator = allocator, .yank_buf = .empty };
     }
 
     pub fn deinit(self: *LineEditor) void {
         self.buf.deinit(self.allocator);
+        self.yank_buf.deinit(self.allocator);
     }
 
     /// 输入一个 Key 并更新状态。返回对应 Action。
@@ -369,11 +392,55 @@ pub const LineEditor = struct {
             .up => return .history_prev,
             .down => return .history_next,
             .tab => return .complete,
+            .shift_tab => return .cycle_perm_mode,
             .ctrl_r => return .reverse_search,
+            .ctrl_l => return .redraw_screen,
+            .ctrl_w => {
+                // 删上一个词:从 cursor 往前跳过空白,再删到上一个词边界
+                if (self.cursor == 0) return .none;
+                var start = self.cursor;
+                while (start > 0 and self.buf.items[start - 1] == ' ') start -= 1;
+                while (start > 0 and self.buf.items[start - 1] != ' ') start -= 1;
+                try self.stashYank(self.buf.items[start..self.cursor]);
+                const n = self.cursor - start;
+                var i: usize = 0;
+                while (i < n) : (i += 1) _ = self.buf.orderedRemove(start);
+                self.cursor = start;
+                return .redraw;
+            },
+            .ctrl_y => {
+                if (self.yank_buf.items.len == 0) return .none;
+                try self.buf.insertSlice(self.allocator, self.cursor, self.yank_buf.items);
+                self.cursor += self.yank_buf.items.len;
+                return .redraw;
+            },
+            .alt_b => {
+                if (self.cursor == 0) return .none;
+                var p = self.cursor;
+                while (p > 0 and self.buf.items[p - 1] == ' ') p -= 1;
+                while (p > 0 and self.buf.items[p - 1] != ' ') p -= 1;
+                self.cursor = p;
+                return .redraw;
+            },
+            .alt_f => {
+                const len = self.buf.items.len;
+                if (self.cursor >= len) return .none;
+                var p = self.cursor;
+                while (p < len and self.buf.items[p] == ' ') p += 1;
+                while (p < len and self.buf.items[p] != ' ') p += 1;
+                self.cursor = p;
+                return .redraw;
+            },
             // paste_begin/end 由驱动循环（loop.zig）直接处理，编辑器层忽略
             .paste_begin, .paste_end => return .none,
             .esc, .unknown => return .none,
         }
+    }
+
+    /// 把删除的内容存入 yank_buf(覆盖式,够用)。
+    fn stashYank(self: *LineEditor, slice: []const u8) !void {
+        self.yank_buf.clearRetainingCapacity();
+        try self.yank_buf.appendSlice(self.allocator, slice);
     }
 
     /// 清空（用于 cancel / 历史覆盖写入）。
@@ -732,6 +799,78 @@ test "LineEditor: no-op actions (esc / unknown)" {
     defer ed.deinit();
     try testing.expect((try ed.handle(.esc)) == .none);
     try testing.expect((try ed.handle(.unknown)) == .none);
+}
+
+fn typeStr(ed: *LineEditor, s: []const u8) !void {
+    for (s) |c| _ = try ed.handle(Key{ .char = c });
+}
+
+test "LineEditor: ctrl_w deletes previous word" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    try typeStr(&ed, "hello world foo");
+    _ = try ed.handle(.ctrl_w);
+    try testing.expectEqualStrings("hello world ", ed.view());
+    _ = try ed.handle(.ctrl_w);
+    try testing.expectEqualStrings("hello ", ed.view());
+}
+
+test "LineEditor: ctrl_y yanks back ctrl_w deletion" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    try typeStr(&ed, "alpha beta");
+    _ = try ed.handle(.ctrl_w); // 删 "beta"
+    try testing.expectEqualStrings("alpha ", ed.view());
+    _ = try ed.handle(.ctrl_y); // 粘回
+    try testing.expectEqualStrings("alpha beta", ed.view());
+}
+
+test "LineEditor: alt_b / alt_f word navigation" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    try typeStr(&ed, "one two three");
+    // cursor 在末尾
+    _ = try ed.handle(.alt_b); // 回到 "three" 开头
+    try testing.expectEqual(@as(usize, 8), ed.cursor); // "one two " = 8
+    _ = try ed.handle(.alt_b); // "two" 开头
+    try testing.expectEqual(@as(usize, 4), ed.cursor);
+    _ = try ed.handle(.alt_f); // 跳过 "two" 到下个词末
+    try testing.expectEqual(@as(usize, 7), ed.cursor);
+}
+
+test "LineEditor: shift_tab returns cycle_perm_mode" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    try testing.expect((try ed.handle(.shift_tab)) == .cycle_perm_mode);
+}
+
+test "LineEditor: ctrl_l returns redraw_screen" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    try testing.expect((try ed.handle(.ctrl_l)) == .redraw_screen);
+}
+
+test "KeyParser: shift_tab via ESC [ Z" {
+    var p = KeyParser{};
+    try testing.expect(p.feed(0x1b) == null);
+    try testing.expect(p.feed('[') == null);
+    try testing.expect(p.feed('Z').? == .shift_tab);
+}
+
+test "KeyParser: alt_b / alt_f via ESC b / ESC f" {
+    var p = KeyParser{};
+    try testing.expect(p.feed(0x1b) == null);
+    try testing.expect(p.feed('b').? == .alt_b);
+    var p2 = KeyParser{};
+    try testing.expect(p2.feed(0x1b) == null);
+    try testing.expect(p2.feed('f').? == .alt_f);
+}
+
+test "KeyParser: ctrl_w / ctrl_y / ctrl_l bytes" {
+    var p = KeyParser{};
+    try testing.expect(p.feed(0x17).? == .ctrl_w);
+    try testing.expect(p.feed(0x19).? == .ctrl_y);
+    try testing.expect(p.feed(0x0c).? == .ctrl_l);
 }
 
 test "LineEditor: multi-key stream through KeyParser" {
