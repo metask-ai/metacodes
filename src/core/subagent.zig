@@ -42,6 +42,9 @@ pub const SpawnOptions = struct {
     tool_defs_override: ?[]const json_mod.ToolDefinition = null,
     /// per-spawn permission mode 覆盖。null = 沿用父 permission_ctx。
     permission_mode_override: ?@import("../types.zig").PermissionMode = null,
+    /// per-spawn model 覆盖(用 AgentDef.model 解析后的具体 model 名;"inherit" 父端
+    /// 自己已经解析过,这里只接受具体 model 名或 null)。
+    model_override: ?[]const u8 = null,
     /// 父 dispatch 传过来的回调,subagent 同样需要 Skill 工具激活权限态等。
     activate_skill_state: ?*anyopaque = null,
     activate_skill_fn: ?*const fn (state: *anyopaque, skill_name: []const u8, allowed: []const []const u8, disallowed: []const []const u8) anyerror!void = null,
@@ -87,6 +90,7 @@ pub fn spawnAgent(
             .activate_skill_state = opts.activate_skill_state,
             .activate_skill_fn = opts.activate_skill_fn,
             .project_dir = opts.project_dir,
+            .model_override = opts.model_override,
         },
         &sink,
         allocator,

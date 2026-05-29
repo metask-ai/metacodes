@@ -176,8 +176,24 @@ pub const Client = struct {
         tools: ?[]const json_mod.ToolDefinition,
         abort: ?*const AbortSignal,
     ) !StreamResponse {
+        return client.sendMessageStreamFull(messages, system, tools, abort, null);
+    }
+
+    /// 完整签名:支持 per-call model_override(subagent 用 def.zig 的 model 字段覆盖父 model)。
+    /// model_override = null → 用 client.model;非 null → 用 override。
+    /// 注意 max_tokens 仍走 client.resolveMaxTokens(),因为 model→max_tokens 表查的是 client.model;
+    /// 若 override 后想用 override 的 max_tokens,需扩展 catalog 查询。本期保守:沿用 client max_tokens。
+    pub fn sendMessageStreamFull(
+        client: *Client,
+        messages: []const types.ApiMessage,
+        system: ?[]const u8,
+        tools: ?[]const json_mod.ToolDefinition,
+        abort: ?*const AbortSignal,
+        model_override: ?[]const u8,
+    ) !StreamResponse {
+        const effective_model = model_override orelse client.model;
         const req_body = try json_mod.serializeMessagesRequest(.{
-            .model = client.model,
+            .model = effective_model,
             .max_tokens = client.resolveMaxTokens(),
             .messages = messages,
             .system = system,

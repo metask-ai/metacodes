@@ -84,23 +84,20 @@ test "L2 GAP: subagent 期望用 haiku 但当前用父 model" {
     defer io_runtime.deinit();
     const io = io_runtime.io();
 
-    // 父 agent 用 sonnet
+    // 父 agent 用 sonnet,但本次调用通过 model_override 让 subagent 用 haiku
     var client = cc.client_mod.Client.initWithBaseUrl(a, io, "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
 
-    // 期望:某种机制让此次调用用 haiku(模拟 subagent.spawnAgent 应做的事)
-    // 目前的 API 没法做到 per-call 覆盖 model,所以这里只能发请求 → 必然带父 model
     const empty_messages: []const cc.types_mod.ApiMessage = &.{};
-    var resp = client.sendMessageStream(empty_messages, null, null) catch return error.SkipZigTest;
+    // Phase 2 修复:用 sendMessageStreamFull 传 model_override
+    var resp = client.sendMessageStreamFull(empty_messages, null, null, null, "claude-3-5-haiku-20241022") catch return error.SkipZigTest;
     drainStream(&resp) catch {};
     resp.deinit();
 
     const cap = srv.lastRequest() orelse return error.NoRequestCaptured;
     const model_field = cap.jsonField("model") orelse return error.ModelFieldMissing;
 
-    // 期望转绿后:子 agent 应当用 haiku
-    // 当前:接线未修 → 用 SkipZigTest 标记"已知 GAP",CI 不挂但留下记录。
-    // Phase 2 修接线后:把 SkipZigTest 改 expect,转为真正红/绿断言。
+    // 期望:override 生效 → 请求 body.model 含 haiku
     if (std.mem.indexOf(u8, model_field, "haiku") == null) {
         std.debug.print(
             "[KNOWN GAP] subagent 应用 haiku,但请求 body.model 是 {s}\n" ++
@@ -109,8 +106,8 @@ test "L2 GAP: subagent 期望用 haiku 但当前用父 model" {
         );
         return error.SkipZigTest;
     }
-    // 接线修好后才会走到这里:严格断言
-    try std.testing.expect(true);
+    // Phase 2 接线后:严格断言
+    try std.testing.expect(std.mem.indexOf(u8, model_field, "haiku") != null);
 }
 
 fn drainStream(resp: *cc.client_mod.StreamResponse) !void {
@@ -119,4 +116,48 @@ fn drainStream(resp: *cc.client_mod.StreamResponse) !void {
         if (maybe == null) break;
         if (resp.done) break;
     }
+}
+
+// 生产路径 L2:spawnAgent 透传 model_override 到 client 请求体。
+// 覆盖:tools/agent.zig 解析 def.model → SpawnOptions.model_override
+//      → agent_loop opts.model_override → sendMessageStreamFull
+test "L2 production path: spawnAgent(model_override=haiku) → 请求体 model 是 haiku" {
+    const a = std.heap.page_allocator;
+
+    var srv = try harness.MockServer.start(MINIMAL_END_TURN_SSE, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    const io = io_runtime.io();
+
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io, "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    // 最小 permission ctx:bypass 让 spawnAgent 不卡权限
+    const perm_ctx = cc.permission.PermissionContext{
+        .mode = .bypass_permissions,
+        .allocator = a,
+    };
+
+    const empty_tool_defs: []const cc.json_mod.ToolDefinition = &.{};
+    var result = cc.core_subagent.spawnAgent(
+        a,
+        &client,
+        empty_tool_defs,
+        &perm_ctx,
+        null,
+        "hi",
+        .{ .max_turns = 2, .model_override = "claude-3-5-haiku-20241022" },
+    ) catch |e| {
+        std.debug.print("spawnAgent failed: {s}\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+    defer result.deinit();
+
+    const cap = srv.lastRequest() orelse return error.NoRequestCaptured;
+    const model_field = cap.jsonField("model") orelse return error.ModelFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, model_field, "haiku") != null);
 }

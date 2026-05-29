@@ -84,6 +84,9 @@ pub const Options = struct {
     agents: ?*const @import("../agents/set.zig").AgentSet = null,
     /// 当前会话用的 model 名(供 subagent inherit 解析)。
     parent_model: []const u8 = "",
+    /// per-call model override(subagent 用 AgentDef.model 覆盖父 client.model)。
+    /// null = 用 api_client.model;非 null = 本次 turn 循环的所有请求都用此 model。
+    model_override: ?[]const u8 = null,
     /// Skill 集合(Task 工具 subagent preload_skills 字段用)。
     skills_set: ?*const @import("../skills/skill.zig").SkillSet = null,
     /// Worktree state(EnterWorktree/ExitWorktree 工具用)。
@@ -162,7 +165,9 @@ pub fn run(
         defer freeApiMessages(&api_messages, allocator);
 
         // 2. 发送流式请求（abortable 版本：abort 通过 EventIterator 检查点传播）
-        var stream = api_client.sendMessageStreamAbortable(api_messages.items, opts.system_prompt, tool_defs, opts.abort) catch |err| {
+        //    带 opts.model_override:subagent 用自己的 model(如 Explore=haiku);
+        //    null 时 sendMessageStreamFull 用 api_client.model(父 model)。
+        var stream = api_client.sendMessageStreamFull(api_messages.items, opts.system_prompt, tool_defs, opts.abort, opts.model_override) catch |err| {
             log.err("agent", "sendMessageStream failed turn={d}: {s}", .{ turns + 1, @errorName(err) });
             return .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls };
         };

@@ -74,6 +74,15 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (d.permission_mode) |m| perm_override = mapPermissionMode(m);
     }
 
+    // model override:Task 工具参数 > AgentDef.model > null(继承父)
+    // "inherit" / 空 / 缺失 → null;其它视作 model 名(short alias 或全名)。
+    const model_arg = util_json.extractStringField(args, "model");
+    const model_override: ?[]const u8 = blk: {
+        if (model_arg) |m| if (m.len > 0 and !std.mem.eql(u8, m, "inherit")) break :blk resolveModelAlias(m);
+        if (def_opt) |d| if (d.model.len > 0 and !std.mem.eql(u8, d.model, "inherit")) break :blk resolveModelAlias(d.model);
+        break :blk null;
+    };
+
     // subagent system prompt:def + 环境 + CLAUDE.md/git(Explore/Plan 跳过) + skills preload
     const preload_mod = @import("../agents/preload.zig");
     var sys_prompt: []const u8 = "";
@@ -108,6 +117,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .dyn_registry = ctx.dyn_registry,
             .tool_defs_override = if (filtered_owned != null) effective_tool_defs else null,
             .permission_mode_override = perm_override,
+            .model_override = model_override,
             .activate_skill_state = ctx.activate_skill_state,
             .activate_skill_fn = ctx.activate_skill_fn,
             .project_dir = ctx.project_dir,
@@ -143,6 +153,17 @@ fn mapPermissionMode(mode: @import("../agents/def.zig").PermissionMode) @import(
         .bypassPermissions => .bypass_permissions,
         .plan => .plan,
     };
+}
+
+/// 短名 → 具体 model ID。"haiku" → "claude-3-5-haiku-20241022",
+/// "sonnet"/"opus" 同理映射到当前主力版本。已是全名(含 "claude-")则原样返回。
+/// 留 borrowed 引用,不分配(借 def.model 或 args 的字符串内存)。
+fn resolveModelAlias(name: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, name, "claude-")) return name; // 已是全名
+    if (std.mem.eql(u8, name, "haiku")) return "claude-3-5-haiku-20241022";
+    if (std.mem.eql(u8, name, "sonnet")) return "claude-sonnet-4-20250514";
+    if (std.mem.eql(u8, name, "opus")) return "claude-opus-4-1-20250805";
+    return name; // 未知短名:原样传给 API(由 API 判错)
 }
 
 fn parseUintField(data: []const u8, field: []const u8) ?u64 {
