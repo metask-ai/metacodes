@@ -12,6 +12,7 @@ const category = @import("category.zig");
 const rule_matcher = @import("rule_matcher.zig");
 const settings_mod = @import("settings.zig");
 const rule_spec = @import("rule_spec.zig");
+const hooks_mod = @import("hooks.zig");
 const log = @import("../util/log.zig");
 
 pub const Decision = enum { allow, deny, ask };
@@ -30,10 +31,26 @@ pub const Context = struct {
     sandbox_enabled: bool = false,
     /// autoAllowBashIfSandboxed:沙箱内 bash 自动放行(绕过 ask: Bash(*),deny 仍优先)。
     auto_allow_bash_if_sandboxed: bool = false,
+    /// PreToolUse hook 集合(最高优先,deny-first)。
+    hooks: ?*const hooks_mod.HookSet = null,
+    /// hook spawn 需要 allocator(构造 stdin JSON);未提供 → 跳过 hook。
+    hook_allocator: ?std.mem.Allocator = null,
 };
 
 /// 根据模式 + 工具名决定:允许 / 拒绝 / 询问。
 pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decision {
+    // -1. 最高优先:PreToolUse hook(deny-first)。任一 hook block → deny,
+    //     hook 看不到的工具(matcher 不匹配)直接 proceed 到下层。
+    if (ctx.hooks) |h| {
+        if (ctx.hook_allocator) |ha| {
+            const dec = hooks_mod.runPreToolUse(h, ha, tool_name, args);
+            if (dec == .block) {
+                log.warn("permission", "PreToolUse hook blocked tool={s}", .{tool_name});
+                return .deny;
+            }
+        }
+    }
+
     // 0. 最高优先:active skill 白/黑名单
     if (ctx.active_skill) |as| {
         if (as.isDisallowed(tool_name, args)) {

@@ -32,6 +32,7 @@ pub const active_skill = @import("skills/active.zig");
 pub const permission = @import("permission.zig");
 pub const permission_rule_spec = @import("permission/rule_spec.zig");
 pub const permission_settings = @import("permission/settings.zig");
+pub const permission_hooks = @import("permission/hooks.zig");
 pub const agents_def = @import("agents/def.zig");
 pub const agents_set = @import("agents/set.zig");
 pub const agents_filter = @import("agents/filter.zig");
@@ -169,6 +170,7 @@ test {
     _ = &@import("permission/bash_parser.zig");
     _ = &@import("permission/settings.zig");
     _ = &@import("permission/loader.zig");
+    _ = &@import("permission/hooks.zig");
     _ = &@import("sandbox/profile.zig");
     _ = &@import("sandbox/config.zig");
     _ = &@import("sandbox/exec.zig");

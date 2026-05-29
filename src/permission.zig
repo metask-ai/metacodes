@@ -41,6 +41,8 @@ pub const PermissionContext = struct {
     /// 沙箱启用 + autoAllowBashIfSandboxed(decision 用)。
     sandbox_enabled: bool = false,
     auto_allow_bash_if_sandboxed: bool = false,
+    /// PreToolUse hook 集合(从 settings.hooks.PreToolUse 解析)。
+    hooks: ?*const @import("permission/hooks.zig").HookSet = null,
 };
 
 pub fn createContext(mode: types.PermissionMode, allocator: std.mem.Allocator) PermissionContext {
@@ -56,6 +58,8 @@ pub fn checkPermission(ctx: *const PermissionContext, tool_name: []const u8, arg
         .match_ctx = ctx.match_ctx,
         .sandbox_enabled = ctx.sandbox_enabled,
         .auto_allow_bash_if_sandboxed = ctx.auto_allow_bash_if_sandboxed,
+        .hooks = ctx.hooks,
+        .hook_allocator = ctx.allocator,
     };
     return decision_mod.check(&d_ctx, tool_name, args);
 }

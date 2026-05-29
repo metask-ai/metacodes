@@ -95,6 +95,8 @@ pub const App = struct {
     settings: ?permission_mod.MergedSettings = null,
     /// Sandbox 配置(从 settings 的 sandbox 段解析,跨层合并)。
     sandbox_settings: ?@import("sandbox/config.zig").SandboxSettings = null,
+    /// PreToolUse hooks(从 settings.hooks.PreToolUse 解析)。
+    hooks: ?@import("permission/hooks.zig").HookSet = null,
     /// 缓存的 cwd 绝对路径(供 permission match_ctx 用,session 期不变)。
     cwd_abs: ?[]u8 = null,
     /// 后台 Bash 作业注册表（失败初始化则 null）
@@ -246,6 +248,7 @@ pub const App = struct {
         if (app.rule_set) |*r| r.deinit();
         if (app.settings) |*s| s.deinit();
         if (app.sandbox_settings) |*s| s.deinit();
+        if (app.hooks) |*h| h.deinit();
         if (app.cwd_abs) |c| app.allocator.free(c);
         if (app.jobs) |*j| j.deinit();
         if (app.system_prompt) |s| app.allocator.free(s);
@@ -396,6 +399,38 @@ pub const App = struct {
         app.loadSandboxConfig(home) catch |e| {
             @import("util/log.zig").debug("sandbox", "no sandbox config: {s}", .{@errorName(e)});
         };
+
+        // 解析 hooks 段(同样从 project/user settings 收集 PreToolUse)
+        app.loadHooks(home) catch |e| {
+            @import("util/log.zig").debug("hook", "no hooks: {s}", .{@errorName(e)});
+        };
+    }
+
+    /// 收集 project/user settings 的 hooks.PreToolUse,合并成一个 HookSet。
+    /// 简化:取第一个非空 source(优先 project 覆盖 user)。完整跨层合并留后续。
+    fn loadHooks(app: *App, home: ?[]const u8) !void {
+        const hooks_mod = @import("permission/hooks.zig");
+        const candidates = [_]?[]const u8{
+            if (app.project_dir) |r| (std.fmt.allocPrint(app.allocator, "{s}/.claude/settings.json", .{r}) catch null) else null,
+            if (home) |h| (std.fmt.allocPrint(app.allocator, "{s}/.claude/settings.json", .{h}) catch null) else null,
+        };
+        defer for (candidates) |p| if (p) |x| app.allocator.free(x);
+
+        for (candidates) |maybe_path| {
+            const path = maybe_path orelse continue;
+            const content = readFileAlloc(app.allocator, path) catch continue;
+            defer app.allocator.free(content);
+            var parsed = std.json.parseFromSlice(std.json.Value, app.allocator, content, .{}) catch continue;
+            defer parsed.deinit();
+            var hs = hooks_mod.parse(app.allocator, parsed.value) catch continue;
+            if (!hs.isEmpty()) {
+                app.hooks = hs;
+                app.permission_ctx.hooks = &app.hooks.?;
+                @import("util/log.zig").info("hook", "PreToolUse loaded {d} matcher(s) (from {s})", .{ hs.pre_tool_use.len, path });
+                return;
+            }
+            hs.deinit();
+        }
     }
 
     /// 读 project/.claude/settings.json + ~/.claude/settings.json 的 sandbox 段,
