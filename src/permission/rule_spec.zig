@@ -174,6 +174,16 @@ pub const MatchContext = struct {
 };
 
 pub fn matches(spec: *const RuleSpec, mctx: *const MatchContext, tool_name: []const u8, args: []const u8) bool {
+    return matchesMode(spec, mctx, tool_name, args, .deny);
+}
+
+/// 规则的 allow/deny 语义影响 symlink 处理(对齐 PERMISSION_DESIGN §4.3):
+///   allow:路径规则要求 [原路径] 和 [realpath 解析后] **都**匹配(指向区外的链接也 prompt)
+///   deny :路径规则 [原路径] 或 [realpath] **任一**匹配即触发(指向 denied 文件的链接也 deny)
+/// 非路径规则不受影响。
+pub const RuleMode = enum { allow, deny, ask };
+
+pub fn matchesMode(spec: *const RuleSpec, mctx: *const MatchContext, tool_name: []const u8, args: []const u8, mode: RuleMode) bool {
     // 工具名匹配(MCP 特例)
     if (std.mem.eql(u8, spec.tool, "mcp")) {
         return matchesMcp(spec.spec.mcp_match, tool_name);
@@ -189,12 +199,49 @@ pub fn matches(spec: *const RuleSpec, mctx: *const MatchContext, tool_name: []co
         .all => true,
         .bash_pattern => |pat| matchesBashCompound(pat, extractCommand(args)),
         .powershell_pattern => |pat| matchesBashPattern(pat, extractCommand(args)),
-        .path_pattern => |pp| matchesPathPattern(pp, mctx, extractPath(args)),
+        .path_pattern => |pp| matchesPathDual(pp, mctx, extractPath(args), mode),
         .web_domain => |dom| matchesWebDomain(dom, args),
         .skill_match => |sm| matchesSkill(sm, args),
         .agent_name => |an| matchesAgent(an, args),
         .mcp_match => |m| matchesMcp(m, tool_name),
     };
+}
+
+/// symlink 双路径匹配。原路径 + realpath 解析后的路径。
+/// allow:两者都匹配才命中(更严);deny/ask:任一匹配即命中(更宽)。
+/// realpath 失败(文件不存在 / 非链接)→ 只用原路径单匹配。
+fn matchesPathDual(pp: PathPattern, mctx: *const MatchContext, file_path: []const u8, mode: RuleMode) bool {
+    const orig_match = matchesPathPattern(pp, mctx, file_path);
+
+    // 尝试 realpath 解析
+    var rp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const resolved = realpathZ(&rp_buf, file_path);
+
+    if (resolved == null or std.mem.eql(u8, resolved.?, file_path)) {
+        // 无链接 / 解析失败:单路径语义
+        return orig_match;
+    }
+    const target_match = matchesPathPattern(pp, mctx, resolved.?);
+
+    return switch (mode) {
+        .allow => orig_match and target_match, // 双匹配才放行
+        .deny, .ask => orig_match or target_match, // 任一匹配即触发
+    };
+}
+
+/// realpath(file_path) 写入 buf,返回 slice。失败返 null。
+fn realpathZ(buf: []u8, file_path: []const u8) ?[]const u8 {
+    var pz: [std.fs.max_path_bytes]u8 = undefined;
+    if (file_path.len + 1 > pz.len) return null;
+    @memcpy(pz[0..file_path.len], file_path);
+    pz[file_path.len] = 0;
+    var out: [std.fs.max_path_bytes]u8 = undefined;
+    const res = std.c.realpath(@ptrCast(&pz), &out);
+    if (res == null) return null;
+    const resolved = std.mem.span(@as([*:0]u8, @ptrCast(res.?)));
+    if (resolved.len > buf.len) return null;
+    @memcpy(buf[0..resolved.len], resolved);
+    return buf[0..resolved.len];
 }
 
 /// 复合 Bash 命令(allow 规则语义):每个子命令(strip wrappers 后)都得被 pattern 匹中。
@@ -717,4 +764,42 @@ test "matches: Bash with wrapper stripped before match" {
     var mctx = MatchContext{};
     try testing.expect(matches(&r, &mctx, "Bash", "{\"command\":\"timeout 30 npm test\"}"));
     try testing.expect(matches(&r, &mctx, "Bash", "{\"command\":\"nice -n 5 npm test\"}"));
+}
+
+test "matchesMode: symlink deny triggers if target matches (任一)" {
+    // 建一个真 symlink: /tmp/cczig_link_<pid> → /tmp/cczig_secret_<pid>
+    const pid = std.c.getpid();
+    var secret_buf: [128]u8 = undefined;
+    const secret = try std.fmt.bufPrint(&secret_buf, "/tmp/cczig_secret_{d}.env\x00", .{pid});
+    const secret_path = secret[0 .. secret.len - 1];
+    _ = secret_path;
+    var link_buf: [128]u8 = undefined;
+    const link = try std.fmt.bufPrint(&link_buf, "/tmp/cczig_link_{d}.txt\x00", .{pid});
+    const link_path = link[0 .. link.len - 1];
+
+    // 创建 secret 文件
+    const fd = std.c.open(@ptrCast(secret.ptr), std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) return error.SkipZigTest;
+    _ = std.c.close(fd);
+    defer _ = std.c.unlink(@ptrCast(secret.ptr));
+    // 创建 symlink link → secret
+    _ = std.c.unlink(@ptrCast(link.ptr));
+    if (std.c.symlink(@ptrCast(secret.ptr), @ptrCast(link.ptr)) != 0) return error.SkipZigTest;
+    defer _ = std.c.unlink(@ptrCast(link.ptr));
+
+    // deny 规则:Read(secret 的 basename) — 裸文件名 gitignore 语义,匹配任意深度
+    // 用户访问 link(basename=cczig_link_*.txt 不匹配),但 realpath 解析到 secret
+    // (basename=cczig_secret_*.env 匹配)→ deny 任一即触发
+    var name_buf: [64]u8 = undefined;
+    const secret_name = try std.fmt.bufPrint(&name_buf, "cczig_secret_{d}.env", .{pid});
+    var pat_buf: [96]u8 = undefined;
+    const pat = try std.fmt.bufPrint(&pat_buf, "Read({s})", .{secret_name}); // cwd anchor 裸文件名
+    const r = try parseRule(pat);
+    var mctx = MatchContext{ .cwd = "/private/tmp" };
+
+    var args_buf: [256]u8 = undefined;
+    const args = try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\"}}", .{link_path});
+
+    // deny 模式:link basename 不匹配,但 realpath(secret) basename 匹配 → 任一即触发
+    try testing.expect(matchesMode(&r, &mctx, "Read", args, .deny));
 }

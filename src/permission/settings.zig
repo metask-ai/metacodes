@@ -164,22 +164,22 @@ pub fn evaluate(
     tool_name: []const u8,
     args: []const u8,
 ) Decision {
-    // 先扫所有层的 deny(deny 优先)
+    // 先扫所有层的 deny(deny 优先)— symlink 任一路径匹配即触发
     for (s.layers) |L| {
         for (L.deny) |r| {
-            if (rule_spec.matches(&r.spec, mctx, tool_name, args)) return .deny;
+            if (rule_spec.matchesMode(&r.spec, mctx, tool_name, args, .deny)) return .deny;
         }
     }
-    // 再扫所有层的 allow
+    // 再扫所有层的 allow — symlink 要求原路径 + target 双匹配
     for (s.layers) |L| {
         for (L.allow) |r| {
-            if (rule_spec.matches(&r.spec, mctx, tool_name, args)) return .allow;
+            if (rule_spec.matchesMode(&r.spec, mctx, tool_name, args, .allow)) return .allow;
         }
     }
     // 最后 ask
     for (s.layers) |L| {
         for (L.ask) |r| {
-            if (rule_spec.matches(&r.spec, mctx, tool_name, args)) return .ask;
+            if (rule_spec.matchesMode(&r.spec, mctx, tool_name, args, .ask)) return .ask;
         }
     }
     return .undecided;
