@@ -18,10 +18,14 @@ pub fn render(app: *const app_mod.App) void {
     const cost = u.costUsd(app.config.model);
 
     const mode_str = switch (app.config.permission_mode) {
-        .auto => "auto",
-        .prompt => "prompt",
+        .default => "default",
+        .accept_edits => "acceptEdits",
         .plan => "plan",
-        .bypass => "bypass",
+        .auto => "auto",
+        .dont_ask => "dontAsk",
+        .bypass_permissions => "bypassPermissions",
+        .prompt => "prompt", // legacy alias = default
+        .bypass => "bypass", // legacy alias = bypass_permissions
     };
 
     var tok_buf: [16]u8 = undefined;

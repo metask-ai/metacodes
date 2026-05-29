@@ -136,9 +136,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
 fn mapPermissionMode(mode: @import("../agents/def.zig").PermissionMode) @import("../types.zig").PermissionMode {
     return switch (mode) {
-        .default, .acceptEdits, .dontAsk => .prompt,
+        .default => .default,
+        .acceptEdits => .accept_edits,
         .auto => .auto,
-        .bypassPermissions => .bypass,
+        .dontAsk => .dont_ask,
+        .bypassPermissions => .bypass_permissions,
         .plan => .plan,
     };
 }

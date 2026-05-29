@@ -20,10 +20,29 @@ pub const Config = struct {
 };
 
 /// 权限模式
+/// 权限模式(对齐 Claude Code 6 模式 + 历史别名)。
+///
+/// - default      :仅只读工具免询问(对齐官方;旧 cc-zig 的 `prompt` 等价)
+/// - accept_edits :读 + 文件编辑 + fs 命令(mkdir/touch/mv/cp/rm/rmdir/sed) 免询问(限工作目录)
+/// - plan         :读 + 只读 bash 免询问;写/执行 deny
+/// - auto         :全部尝试 ALLOW + 后台分类器(短期用 risk-level 近似)
+/// - dont_ask     :只放行 permissions.allow 预批准的;其它全 deny
+/// - bypass_permissions :跳过所有 prompt;rm -rf / 仍 prompt 作为电路断路器
+///
+/// 兼容别名:
+///   prompt → default
+///   bypass → bypass_permissions
 pub const PermissionMode = enum {
-    auto,
-    prompt,
+    default,
+    accept_edits,
     plan,
+    auto,
+    dont_ask,
+    bypass_permissions,
+    // ---- 历史别名(已弃用,仍接受) ----
+    /// @deprecated 用 default
+    prompt,
+    /// @deprecated 用 bypass_permissions
     bypass,
 };
 

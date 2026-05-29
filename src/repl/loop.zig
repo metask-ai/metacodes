@@ -556,12 +556,14 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
                 try redrawLine(editor.view(), editor.cursor);
             },
             .cycle_perm_mode => {
-                // default(prompt) → auto → plan → bypass → 回 prompt
+                // Claude Code Shift+Tab 标准循环:default → acceptEdits → plan → default
+                // (auto/dontAsk/bypassPermissions 不在默认循环;通过 CLI flag 启用)
                 app.config.permission_mode = switch (app.config.permission_mode) {
-                    .prompt => .auto,
-                    .auto => .plan,
-                    .plan => .bypass,
-                    .bypass => .prompt,
+                    .default, .prompt => .accept_edits,
+                    .accept_edits => .plan,
+                    .plan => .default,
+                    // 非循环模式按下也回 default
+                    .auto, .dont_ask, .bypass_permissions, .bypass => .default,
                 };
                 app.permission_ctx.mode = app.config.permission_mode;
                 std.debug.print("\r\x1b[2K\x1b[36m[permission mode: {s}]\x1b[0m\n", .{@tagName(app.config.permission_mode)});

@@ -47,11 +47,21 @@ pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decis
     const cat = category.getToolCategory(tool_name);
     const risk = category.getRiskLevel(tool_name);
 
+    const mode_mod = @import("mode.zig");
+    const m = mode_mod.canonical(ctx.mode);
     const decision: Decision = blk: {
-        if (ctx.mode == .bypass) break :blk .allow;
-        if (ctx.mode == .plan) break :blk if (cat == .read) .allow else .deny;
-        if (ctx.mode == .auto) break :blk if (risk == .low) .allow else .ask;
-        // prompt
+        if (m == .bypass_permissions) break :blk .allow;
+        if (m == .plan) break :blk if (cat == .read) .allow else .deny;
+        if (m == .auto) break :blk if (risk == .low) .allow else .ask;
+        if (m == .dont_ask) break :blk .deny; // 仅 explicit allow 规则可放行,落到这层就 deny
+        if (m == .accept_edits) {
+            // 读 + 文件编辑 + fs 命令 ALLOW;其它 ASK
+            if (cat == .read) break :blk .allow;
+            if (std.mem.eql(u8, tool_name, "Write") or std.mem.eql(u8, tool_name, "Edit") or std.mem.eql(u8, tool_name, "NotebookEdit")) break :blk .allow;
+            // TODO: accept_edits 还应放行 mkdir/touch/mv/cp/rm/rmdir/sed,需要 Bash command 解析(Stage A 后续)
+            break :blk .ask;
+        }
+        // default(等价旧 prompt)
         break :blk if (cat == .read) .allow else .ask;
     };
 
@@ -65,9 +75,14 @@ pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decis
     return decision;
 }
 
-test "bypass allows everything including dangerous" {
-    const ctx = Context{ .mode = .bypass };
+test "bypass_permissions allows everything including dangerous" {
+    const ctx = Context{ .mode = .bypass_permissions };
     try std.testing.expect(check(&ctx, "Bash", "rm -rf /") == .allow);
+    try std.testing.expect(check(&ctx, "Write", "") == .allow);
+}
+
+test "legacy bypass alias still works" {
+    const ctx = Context{ .mode = .bypass };
     try std.testing.expect(check(&ctx, "Write", "") == .allow);
 }
 
@@ -87,9 +102,31 @@ test "auto mode: low risk allow, others ask" {
     try std.testing.expect(check(&ctx, "Bash", "") == .ask);
 }
 
-test "prompt mode: read allow, write/exec ask" {
-    const ctx = Context{ .mode = .prompt };
+test "default mode: read allow, write/exec ask" {
+    const ctx = Context{ .mode = .default };
     try std.testing.expect(check(&ctx, "Read", "") == .allow);
     try std.testing.expect(check(&ctx, "Write", "") == .ask);
     try std.testing.expect(check(&ctx, "Bash", "") == .ask);
+}
+
+test "prompt alias still maps to default mode" {
+    const ctx = Context{ .mode = .prompt };
+    try std.testing.expect(check(&ctx, "Read", "") == .allow);
+    try std.testing.expect(check(&ctx, "Write", "") == .ask);
+}
+
+test "accept_edits: read + Write/Edit allow, Bash ask" {
+    const ctx = Context{ .mode = .accept_edits };
+    try std.testing.expect(check(&ctx, "Read", "") == .allow);
+    try std.testing.expect(check(&ctx, "Write", "") == .allow);
+    try std.testing.expect(check(&ctx, "Edit", "") == .allow);
+    try std.testing.expect(check(&ctx, "NotebookEdit", "") == .allow);
+    try std.testing.expect(check(&ctx, "Bash", "ls") == .ask);
+}
+
+test "dont_ask: nothing matched in rules → deny" {
+    const ctx = Context{ .mode = .dont_ask };
+    try std.testing.expect(check(&ctx, "Read", "") == .deny);
+    try std.testing.expect(check(&ctx, "Write", "") == .deny);
+    try std.testing.expect(check(&ctx, "Bash", "ls") == .deny);
 }
