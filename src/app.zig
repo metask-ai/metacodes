@@ -176,13 +176,29 @@ pub const App = struct {
         // 选 TUI 主题:--no-theme → monochrome;否则用 .auto + 终端能力检测
         const theme_mod = @import("repl/tui/theme.zig");
         const tui_term = @import("repl/tui/term.zig");
+        const tui_config = @import("repl/tui/config.zig");
         const cap = tui_term.detectFromEnv(1);
         if (config.no_theme) {
             app.theme_variant = .monochrome;
         } else {
-            app.theme_variant = .auto;
+            // ~/.cc-zig/config.json 的 theme 字段覆盖默认 auto
+            const home_for_theme: ?[]const u8 = blk: {
+                const h = std.c.getenv("HOME") orelse break :blk null;
+                break :blk std.mem.span(h);
+            };
+            const persisted = if (home_for_theme) |h| tui_config.loadTheme(allocator, h) else null;
+            app.theme_variant = persisted orelse .auto;
         }
         app.theme = theme_mod.select(app.theme_variant, cap);
+
+        // 把 project_dir + home 提供给 permission/prompt 的 allow_always 持久化路径
+        {
+            const home_for_prompt = blk: {
+                const h = std.c.getenv("HOME") orelse break :blk @as([]const u8, "");
+                break :blk std.mem.span(h);
+            };
+            @import("permission/prompt.zig").setPersistContext(app.project_dir, home_for_prompt);
+        }
 
         // 注册 Skill 工具到 dyn_registry（ctx_ptr 指向 SkillSet）。
         // 失败仅 log——skills 仍可通过 /skills 列表，只是模型激活不了。

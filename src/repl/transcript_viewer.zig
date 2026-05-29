@@ -33,10 +33,10 @@ pub fn renderToLinesWithTheme(allocator: std.mem.Allocator, conv: *const Convers
 
     for (conv.messages.items) |m| {
         const role_label = switch (m.role) {
-            .user => "\x1b[36m▶ user\x1b[0m",
-            .assistant => "\x1b[32m◀ assistant\x1b[0m",
+            .user => try std.fmt.allocPrint(allocator, "{s}▶ user{s}", .{ th.role_user, th.reset }),
+            .assistant => try std.fmt.allocPrint(allocator, "{s}◀ assistant{s}", .{ th.role_assistant, th.reset }),
         };
-        try lines.append(allocator, try allocator.dupe(u8, role_label));
+        try lines.append(allocator, role_label);
 
         for (m.blocks) |b| {
             switch (b) {
@@ -145,9 +145,10 @@ pub fn runWithTheme(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const C
     const prompts = try userPromptLineIndices(allocator, lines);
     defer allocator.free(prompts);
 
-    // 进 alt screen + 隐藏光标
-    writeAll(1, "\x1b[?1049h\x1b[?25l");
-    defer writeAll(1, "\x1b[?25h\x1b[?1049l"); // 恢复
+    // 进 alt screen + 隐藏光标(用 tui/overlay 抽出的通用形式)
+    var ov = @import("tui/overlay.zig").Overlay{ .fd = 1 };
+    ov.enter();
+    defer ov.exit();
 
     const view_rows = if (rows > 1) rows - 1 else 1;
     var top: usize = 0;

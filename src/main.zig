@@ -171,6 +171,7 @@ test {
     _ = &@import("permission/settings.zig");
     _ = &@import("permission/loader.zig");
     _ = &@import("permission/hooks.zig");
+    _ = &@import("permission/settings_writer.zig");
     _ = &@import("sandbox/profile.zig");
     _ = &@import("sandbox/config.zig");
     _ = &@import("sandbox/exec.zig");
@@ -204,6 +205,7 @@ test {
     _ = &@import("repl/tui/widget/tool_card.zig");
     _ = &@import("repl/tui/widget/thinking.zig");
     _ = &@import("repl/tui/widget/pager.zig");
+    _ = &@import("repl/tui/config.zig");
     _ = &@import("mcp/protocol.zig");
     _ = &@import("mcp/transport_stdio.zig");
     _ = &@import("mcp/client.zig");

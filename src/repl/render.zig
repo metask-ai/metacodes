@@ -18,17 +18,18 @@
 
 const std = @import("std");
 
-// ANSI 常量
-const RESET = "\x1b[0m";
-const BOLD = "\x1b[1m";
-const DIM = "\x1b[2m";
-const ITALIC = "\x1b[3m";
-const CYAN = "\x1b[36m";
-const GRAY = "\x1b[90m";
-const GREEN = "\x1b[32m";
-const YELLOW = "\x1b[33m";
-const MAGENTA = "\x1b[35m";
-const BLUE = "\x1b[34m";
+// ANSI 常量(集中走 tui/ansi.zig;markdown 渲染不感知主题,关色用 NO_COLOR=1)
+const ansi = @import("tui/ansi.zig");
+const RESET = ansi.sgr.reset;
+const BOLD = ansi.sgr.bold;
+const DIM = ansi.sgr.dim;
+const ITALIC = ansi.sgr.italic;
+const CYAN = ansi.sgr.fg_cyan;
+const GRAY = ansi.sgr.fg_bright_black;
+const GREEN = ansi.sgr.fg_green;
+const YELLOW = ansi.sgr.fg_yellow;
+const MAGENTA = ansi.sgr.fg_magenta;
+const BLUE = ansi.sgr.fg_blue;
 
 pub fn renderToOwned(md: []const u8, allocator: std.mem.Allocator) ![]u8 {
     var out = std.ArrayList(u8).empty;

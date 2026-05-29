@@ -31,6 +31,16 @@ fn remember(list: *[MAX_REMEMBERED][]const u8, count: *usize, name: []const u8) 
     count.* += 1;
 }
 
+/// 全局上下文:App 启动时 set,allow_always 选项写 settings.local.json 用。
+/// project_dir 为 null 时退回 ~/.claude/settings.json。
+var g_project_dir: ?[]const u8 = null;
+var g_home: ?[]const u8 = null;
+
+pub fn setPersistContext(project_dir: ?[]const u8, home: []const u8) void {
+    g_project_dir = project_dir;
+    g_home = home;
+}
+
 fn contains(list: []const []const u8, name: []const u8) bool {
     for (list) |n| if (std.mem.eql(u8, n, name)) return true;
     return false;
@@ -54,6 +64,15 @@ pub fn ask(tool_name: []const u8, args: []const u8) !bool {
                 .allow_once => return true,
                 .allow_always => {
                     remember(&g_always_allow, &g_always_allow_count, tool_name);
+                    // 持久化:写到 settings.local.json(project)或 ~/.claude/settings.json
+                    if (g_home) |home| {
+                        const writer = @import("settings_writer.zig");
+                        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                        const written = writer.addAllowRule(arena.allocator(), g_project_dir, home, tool_name, &path_buf) catch null;
+                        if (written) |p| {
+                            std.debug.print("\x1b[2m(persisted to {s})\x1b[0m\n", .{p});
+                        }
+                    }
                     return true;
                 },
                 .deny_once => return false,

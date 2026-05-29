@@ -1392,7 +1392,21 @@ fn handleTheme(app: *app_mod.App, rest: []const u8) void {
     const cap = tui_term.detectFromEnv(1);
     app.theme = theme_mod.select(variant, cap);
     std.debug.print("theme switched to \x1b[36m{s}\x1b[0m\n", .{theme_mod.variantName(variant)});
-    std.debug.print("\x1b[2m(persisting to ~/.cc-zig/config.json deferred to P2)\x1b[0m\n", .{});
+
+    // 持久化到 ~/.cc-zig/config.json
+    const tui_config = @import("tui/config.zig");
+    const home = std.c.getenv("HOME");
+    if (home) |h| {
+        const home_slice = std.mem.span(h);
+        // 临时 arena 给 saveTheme 用
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        tui_config.saveTheme(arena.allocator(), home_slice, variant) catch |e| {
+            std.debug.print("\x1b[2m(persist failed: {s})\x1b[0m\n", .{@errorName(e)});
+            return;
+        };
+        std.debug.print("\x1b[2m(saved to ~/.cc-zig/config.json)\x1b[0m\n", .{});
+    }
 }
 
 /// /memory：跨 session 记忆，存于 ~/.cc-zig/memory.md。
