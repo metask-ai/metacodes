@@ -605,6 +605,27 @@ fn parseIntField(obj: []const u8, field: []const u8) u64 {
     return std.fmt.parseInt(u64, obj[start..i], 10) catch 0;
 }
 
+/// API 报告的 stop_reason(message_delta.delta.stop_reason)。
+pub const StopReason = enum {
+    unknown,
+    end_turn,
+    tool_use,
+    max_tokens,
+    stop_sequence,
+    pause_turn,
+    refusal,
+
+    pub fn fromStr(s: []const u8) StopReason {
+        if (std.mem.eql(u8, s, "end_turn")) return .end_turn;
+        if (std.mem.eql(u8, s, "tool_use")) return .tool_use;
+        if (std.mem.eql(u8, s, "max_tokens")) return .max_tokens;
+        if (std.mem.eql(u8, s, "stop_sequence")) return .stop_sequence;
+        if (std.mem.eql(u8, s, "pause_turn")) return .pause_turn;
+        if (std.mem.eql(u8, s, "refusal")) return .refusal;
+        return .unknown;
+    }
+};
+
 pub const EventIterator = struct {
     reader: *std.Io.Reader,
     abort: ?*const AbortSignal = null,
@@ -612,6 +633,9 @@ pub const EventIterator = struct {
     /// 本次 SSE 流对应的 request_id（client 层设置）。用来把 stream 事件日志和
     /// 更上游的 HTTP 请求/下游 agent turn 串起来。未设置时日志无 id 上下文。
     req_id: ?log.RequestId = null,
+    /// 最后一次 message_delta 报告的 stop_reason(枚举化,避免 owned 字符串)。
+    /// agent_loop drain 完后读它判断是否 max_tokens 续写。
+    last_stop_reason: StopReason = .unknown,
 
     /// 跨多个 SSE 事件累加的 tool_use 状态。
     /// `content_block_start`(tool_use) 时填入 id/name，input_buf 清空。
@@ -774,6 +798,7 @@ pub const EventIterator = struct {
                     // 格式示例：{"type":"message_delta","delta":{"stop_reason":"max_tokens",...},"usage":{"output_tokens":N,...}}
                     if (findTopLevelObjectField(data, "delta")) |delta_obj| {
                         if (findTopLevelStringField(delta_obj, "stop_reason")) |sr| {
+                            self.last_stop_reason = StopReason.fromStr(sr);
                             if (std.mem.eql(u8, sr, "max_tokens")) {
                                 self.logWarn("response hit max_tokens limit — increase max_tokens in request to get longer replies", .{});
                             } else {
@@ -1150,4 +1175,28 @@ test "renderWebSearchResults: multiple results" {
     try std.testing.expect(std.mem.indexOf(u8, out, "3 results") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "A") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "C") != null);
+}
+
+test "StopReason.fromStr" {
+    try std.testing.expect(StopReason.fromStr("max_tokens") == .max_tokens);
+    try std.testing.expect(StopReason.fromStr("end_turn") == .end_turn);
+    try std.testing.expect(StopReason.fromStr("tool_use") == .tool_use);
+    try std.testing.expect(StopReason.fromStr("pause_turn") == .pause_turn);
+    try std.testing.expect(StopReason.fromStr("refusal") == .refusal);
+    try std.testing.expect(StopReason.fromStr("garbage") == .unknown);
+}
+
+test "EventIterator records last_stop_reason from message_delta" {
+    const a = std.testing.allocator;
+    const sse =
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":5}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+    var reader = std.Io.Reader.fixed(sse);
+    var it = EventIterator.init(&reader);
+    defer it.deinit(a);
+    // drain
+    while (try it.next(a)) |ev| {
+        ev.deinit(a);
+    }
+    try std.testing.expect(it.last_stop_reason == .max_tokens);
 }

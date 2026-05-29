@@ -427,6 +427,13 @@ pub const StreamResponse = struct {
         self.allocator.destroy(self.stream_result.request);
     }
 
+    /// drain 完后读 API 报告的 stop_reason(max_tokens 续写判断用)。
+    /// 未初始化 / 未收到 message_delta → .unknown。
+    pub fn stopReason(self: *const StreamResponse) api_stream.StopReason {
+        if (!self.iter_initialized) return .unknown;
+        return self.event_iter.last_stop_reason;
+    }
+
     /// 读下一个事件。首次调用时懒初始化 EventIterator——Response.reader 的返回是一个
     /// 指向 self.stream_result 内部字段的指针，必须在 self 稳定后才能取地址。
     pub fn next(self: *StreamResponse) !?StreamEvent {

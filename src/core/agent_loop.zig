@@ -136,6 +136,9 @@ pub fn run(
 ) !RunResult {
     var turns: u32 = 0;
     var total_tool_calls: u32 = 0;
+    // max_tokens 续写计数:防止模型一直撞上限导致无限续写。上限 3 次。
+    var continuations: u32 = 0;
+    const MAX_CONTINUATIONS: u32 = 3;
 
     while (turns < opts.max_turns) : (turns += 1) {
         // 开头检查 abort
@@ -234,6 +237,9 @@ pub fn run(
         }
         try stdout_writer.print("\x1b[0m\n", .{});
 
+        // 抓本轮 API 报告的 stop_reason(stream.deinit 前读;defer 在 turn 末才执行)
+        const turn_stop_reason = stream.stopReason();
+
         log.infoId("agent", rid, "stream finished text_bytes={d} tool_uses={d} aborted={} err={}", .{
             assistant_text.items.len,
             tool_uses.items.len,
@@ -308,6 +314,14 @@ pub fn run(
             break;
         };
         if (!has_tool_use) {
+            // max_tokens 续写:模型被 token 上限截断(非自然 end_turn),
+            // 注入 continue 提示让它接着写,而不是当作完成。最多 MAX_CONTINUATIONS 次。
+            if (turn_stop_reason == .max_tokens and continuations < MAX_CONTINUATIONS) {
+                continuations += 1;
+                log.infoId("agent", rid, "max_tokens truncation → continuation {d}/{d}", .{ continuations, MAX_CONTINUATIONS });
+                try conversation.appendText(.user, "Your previous response was cut off by the token limit. Continue exactly where you left off, without repeating.");
+                continue;
+            }
             return .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls };
         }
 
