@@ -45,15 +45,18 @@ pub fn render(app: *const app_mod.App) void {
         extra = std.fmt.bufPrint(&extra_buf, " | {d}cron", .{cron_count}) catch "";
     }
 
-    // 一次性拼接成一行（ANSI dim + 内容 + reset + 换行）再写
-    var line_buf: [320]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "\x1b[2m[{s} | {s} | {s} tok | ${d:.4}{s}]\x1b[0m\n", .{
+    // 一次性拼接成一行(theme.dim + 内容 + reset + 换行)再写
+    const th = app.theme;
+    var line_buf: [384]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "{s}[{s} | {s} | {s} tok | ${d:.4}{s}]{s}\n", .{
+        th.dim,
         app.config.model,
         mode_str,
         tok_str,
         cost,
         extra,
-    }) catch return; // 超 buf 截断：静默跳过渲染
+        th.reset,
+    }) catch return; // 超 buf 截断:静默跳过渲染
     writeAll(2, line);
 }
 

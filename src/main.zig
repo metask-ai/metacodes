@@ -203,6 +203,7 @@ test {
     _ = &@import("repl/tui/dialog/permission.zig");
     _ = &@import("repl/tui/widget/tool_card.zig");
     _ = &@import("repl/tui/widget/thinking.zig");
+    _ = &@import("repl/tui/widget/pager.zig");
     _ = &@import("mcp/protocol.zig");
     _ = &@import("mcp/transport_stdio.zig");
     _ = &@import("mcp/client.zig");
