@@ -378,6 +378,20 @@ pub const App = struct {
         };
         @import("util/log.zig").info("permission", "settings loaded: {d} layer(s)", .{app.settings.?.layers.len});
 
+        // disableBypassPermissionsMode / disableAutoMode 强制:若 settings 禁用了某模式
+        // 而当前正处于该模式,降级到 default + 警告(对齐官方:这两个开关是硬约束)。
+        const canon = @import("permission/mode.zig").canonical(app.config.permission_mode);
+        if (app.settings.?.isBypassDisabled() and canon == .bypass_permissions) {
+            @import("util/log.zig").warn("permission", "bypassPermissions disabled by settings → downgraded to default", .{});
+            app.config.permission_mode = .default;
+            app.permission_ctx.mode = .default;
+        }
+        if (app.settings.?.isAutoModeDisabled() and canon == .auto) {
+            @import("util/log.zig").warn("permission", "auto mode disabled by settings → downgraded to default", .{});
+            app.config.permission_mode = .default;
+            app.permission_ctx.mode = .default;
+        }
+
         // 解析 sandbox 段(project shared + user;managed/cli 罕见配沙箱,本期跳过)
         app.loadSandboxConfig(home) catch |e| {
             @import("util/log.zig").debug("sandbox", "no sandbox config: {s}", .{@errorName(e)});

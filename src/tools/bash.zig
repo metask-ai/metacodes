@@ -46,7 +46,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .home = ctx.home_dir,
             .sandbox = sb,
             .disable_for_this_command = disable_sb,
-        }) catch null;
+        }) catch |e| {
+            // failIfUnavailable=true 时沙箱不可用 → 拒绝执行(不降级裸跑)
+            if (e == error.SandboxUnavailable) return error.SandboxUnavailable;
+            // 其它 error(profile 写失败等):降级 passthrough
+            break :blk raw_command;
+        };
         if (maybe) |sw| {
             sandbox_wrap = sw;
             break :blk sw.command;

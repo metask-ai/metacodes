@@ -140,11 +140,13 @@ fn firstToken(cmd: []const u8) []const u8 {
 /// 与 wrapCommand 不同:不返回 argv 而是 shell 串(单引号转义),
 /// 方便复用现有 job_registry / spawnBackground 的 `/bin/sh -c` 路径。
 ///
-/// 返回 null = 不沙箱(同 wrapCommand 的 passthrough/unavailable)。
+/// 返回 null = passthrough(沙箱未启用/不支持但 failIfUnavailable=false → 原样跑)。
+/// 返回 error.SandboxUnavailable = 沙箱不可用且 failIfUnavailable=true → caller 应拒绝执行。
 pub fn wrapAsShellString(alloc: std.mem.Allocator, cmd: []const u8, opts: WrapOptions) !?ShellWrap {
     const r = try wrapCommand(alloc, cmd, opts);
     switch (r) {
-        .passthrough, .unavailable => return null,
+        .passthrough => return null,
+        .unavailable => return error.SandboxUnavailable,
         .wrapped => |wc| {
             const w = wc;
             const q_prof = try shellSingleQuote(alloc, w.profile_path);
@@ -258,6 +260,20 @@ test "wrapCommand: disable_for_this_command → passthrough" {
         .disable_for_this_command = true,
     });
     try testing.expect(r == .passthrough);
+}
+
+test "wrapAsShellString: failIfUnavailable on non-macos → error.SandboxUnavailable" {
+    if (builtin.os.tag == .macos) return error.SkipZigTest; // macos 有 sandbox-exec,测不到 unavailable
+    const sb = config_mod.SandboxSettings{ .enabled = true, .fail_if_unavailable = true };
+    const r = wrapAsShellString(testing.allocator, "ls", .{ .cwd = "/tmp", .sandbox = &sb });
+    try testing.expectError(error.SandboxUnavailable, r);
+}
+
+test "wrapAsShellString: failIfUnavailable=false on non-macos → null passthrough" {
+    if (builtin.os.tag == .macos) return error.SkipZigTest;
+    const sb = config_mod.SandboxSettings{ .enabled = true, .fail_if_unavailable = false };
+    const r = try wrapAsShellString(testing.allocator, "ls", .{ .cwd = "/tmp", .sandbox = &sb });
+    try testing.expect(r == null);
 }
 
 test "wrapCommand: enabled on macos → wrapped argv" {
