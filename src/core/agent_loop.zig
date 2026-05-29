@@ -75,6 +75,11 @@ pub const Options = struct {
     session_id: []const u8 = "",
     project_dir: []const u8 = "",
     disable_shell_execution: bool = false,
+    /// Sandbox 配置(Bash 工具用):非 null 且 enabled 时包 sandbox-exec。
+    sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
+    /// cwd 绝对路径 + HOME(sandbox profile 用)。
+    cwd_abs: []const u8 = "",
+    home_dir: []const u8 = "",
     /// 子 agent 定义集合(Task 工具据此找 subagent_type)。
     agents: ?*const @import("../agents/set.zig").AgentSet = null,
     /// 当前会话用的 model 名(供 subagent inherit 解析)。
@@ -370,6 +375,9 @@ pub fn run(
                     .session_id = opts.session_id,
                     .project_dir = opts.project_dir,
                     .disable_shell_execution = opts.disable_shell_execution,
+                    .sandbox = opts.sandbox,
+                    .cwd_abs = opts.cwd_abs,
+                    .home_dir = opts.home_dir,
                     .agents = opts.agents,
                     .parent_model = opts.parent_model,
                     .skills = opts.skills_set,

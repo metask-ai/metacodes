@@ -18,17 +18,48 @@ pub const AUTO_BACKGROUND_MS: u64 = 15_000;
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
-    const command = common.extractJsonArg(args, "command") orelse return error.MissingCommand;
-    if (command.len == 0) return error.EmptyCommand;
-    try security.validateBashCommand(command);
+    const raw_command = common.extractJsonArg(args, "command") orelse return error.MissingCommand;
+    if (raw_command.len == 0) return error.EmptyCommand;
+    try security.validateBashCommand(raw_command);
 
     // description 仅作日志用途，本期透传但不输出
     _ = common.extractJsonArg(args, "description");
+
+    // Sandbox 包裹(macOS Seatbelt):若 ctx.sandbox 启用,把 command 改写成
+    // `sandbox-exec -f <profile> /bin/bash -c <cmd>`。dangerouslyDisableSandbox=true 跳过。
+    // sandbox_wrap 非 null 时持有临时 profile 文件,函数返回前 deinit 清理。
+    const disable_sb = blk: {
+        if (common.extractJsonArg(args, "dangerouslyDisableSandbox")) |v| {
+            break :blk std.mem.eql(u8, v, "true");
+        }
+        break :blk false;
+    };
+    var sandbox_wrap: ?@import("../sandbox/exec.zig").ShellWrap = null;
+    defer if (sandbox_wrap) |*sw| sw.deinit();
+    const command: []const u8 = blk: {
+        const sb = ctx.sandbox orelse break :blk raw_command;
+        if (!sb.enabled) break :blk raw_command;
+        const sandbox_exec = @import("../sandbox/exec.zig");
+        const cwd = if (ctx.cwd_abs.len > 0) ctx.cwd_abs else ".";
+        const maybe = sandbox_exec.wrapAsShellString(allocator, raw_command, .{
+            .cwd = cwd,
+            .home = ctx.home_dir,
+            .sandbox = sb,
+            .disable_for_this_command = disable_sb,
+        }) catch null;
+        if (maybe) |sw| {
+            sandbox_wrap = sw;
+            break :blk sw.command;
+        }
+        break :blk raw_command;
+    };
 
     // 显式 run_in_background=true：直接丢 job 表立刻返
     if (common.extractJsonArg(args, "run_in_background")) |v| {
         if (std.mem.eql(u8, v, "true")) {
             if (ctx.jobs) |registry| {
+                // 后台:profile 文件不能删(进程还在跑),detach
+                if (sandbox_wrap) |*sw| sw.detached = true;
                 const j = try registry.spawnBackground(command);
                 return try std.fmt.allocPrint(allocator,
                     "{{\"job_id\":\"{s}\",\"status\":\"started\",\"stdout_path\":\"{s}\",\"stderr_path\":\"{s}\"}}",
@@ -54,6 +85,9 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     //   - 未退出 + 达到 AUTO_BACKGROUND_MS & ctx.jobs 可用 → 返回 {auto_backgrounded, job_id}
     //   - 未退出 + 达到用户 timeout → kill + error.Timeout
     if (ctx.jobs) |registry| {
+        // 走 job_registry:命令可能自动转后台,届时 profile 文件不能删 → detach。
+        // 代价:即便命令同步完成,profile 也泄漏到 TMPDIR(系统/重启清理),换取正确性。
+        if (sandbox_wrap) |*sw| sw.detached = true;
         return try runAutoBackgroundable(allocator, registry, command, timeout_ms, ctx.abort);
     }
 

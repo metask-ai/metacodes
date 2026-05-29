@@ -93,6 +93,8 @@ pub const App = struct {
     /// 5 层 settings 聚合(allow/ask/deny + additionalDirectories + disable flags)。
     /// 启动时 loader.load;挂到 permission_ctx.settings。
     settings: ?permission_mod.MergedSettings = null,
+    /// Sandbox 配置(从 settings 的 sandbox 段解析,跨层合并)。
+    sandbox_settings: ?@import("sandbox/config.zig").SandboxSettings = null,
     /// 缓存的 cwd 绝对路径(供 permission match_ctx 用,session 期不变)。
     cwd_abs: ?[]u8 = null,
     /// 后台 Bash 作业注册表（失败初始化则 null）
@@ -243,6 +245,7 @@ pub const App = struct {
         app.cron_registry.deinit();
         if (app.rule_set) |*r| r.deinit();
         if (app.settings) |*s| s.deinit();
+        if (app.sandbox_settings) |*s| s.deinit();
         if (app.cwd_abs) |c| app.allocator.free(c);
         if (app.jobs) |*j| j.deinit();
         if (app.system_prompt) |s| app.allocator.free(s);
@@ -309,6 +312,24 @@ pub const App = struct {
         return app.project_dir orelse "";
     }
 
+    /// sandbox 配置指针(供 agent_loop opts 注入 ToolContext)。null = 未启用。
+    pub fn sandboxPtr(app: *const App) ?*const @import("sandbox/config.zig").SandboxSettings {
+        if (app.sandbox_settings) |*s| return s;
+        return null;
+    }
+
+    /// cwd 绝对路径(sandbox profile 工作目录),空串 = 未知(用 process cwd)。
+    pub fn cwdAbs(app: *const App) []const u8 {
+        return app.cwd_abs orelse "";
+    }
+
+    /// HOME(sandbox ~/ 展开)。
+    pub fn homeDir(app: *const App) []const u8 {
+        _ = app;
+        const h = std.c.getenv("HOME") orelse return "";
+        return std.mem.span(h);
+    }
+
     /// EnterWorktree 工具用:把新 worktree 入栈。
     pub fn worktreePushTrampoline(
         state: *anyopaque,
@@ -356,6 +377,42 @@ pub const App = struct {
             .home = home orelse "",
         };
         @import("util/log.zig").info("permission", "settings loaded: {d} layer(s)", .{app.settings.?.layers.len});
+
+        // 解析 sandbox 段(project shared + user;managed/cli 罕见配沙箱,本期跳过)
+        app.loadSandboxConfig(home) catch |e| {
+            @import("util/log.zig").debug("sandbox", "no sandbox config: {s}", .{@errorName(e)});
+        };
+    }
+
+    /// 读 project/.claude/settings.json + ~/.claude/settings.json 的 sandbox 段,
+    /// 取第一个 enabled 的(简化:不跨层合并 filesystem 数组,本期足够)。
+    fn loadSandboxConfig(app: *App, home: ?[]const u8) !void {
+        const sb_config = @import("sandbox/config.zig");
+        const candidates = [_]?[]const u8{
+            app.config.settings_path,
+            if (app.project_dir) |r| (std.fmt.allocPrint(app.allocator, "{s}/.claude/settings.json", .{r}) catch null) else null,
+            if (home) |h| (std.fmt.allocPrint(app.allocator, "{s}/.claude/settings.json", .{h}) catch null) else null,
+        };
+        // 后两个是 allocPrint 的,用完 free
+        defer {
+            if (candidates[1]) |p| app.allocator.free(p);
+            if (candidates[2]) |p| app.allocator.free(p);
+        }
+
+        for (candidates) |maybe_path| {
+            const path = maybe_path orelse continue;
+            const content = readFileAlloc(app.allocator, path) catch continue;
+            defer app.allocator.free(content);
+            var parsed = std.json.parseFromSlice(std.json.Value, app.allocator, content, .{}) catch continue;
+            defer parsed.deinit();
+            var sb = sb_config.parse(app.allocator, parsed.value) catch continue;
+            if (sb.enabled) {
+                app.sandbox_settings = sb;
+                @import("util/log.zig").info("sandbox", "enabled (from {s})", .{path});
+                return;
+            }
+            sb.deinit();
+        }
     }
 
     /// 运行时追加一个 additionalDirectory(/add-dir 命令),重建 settings 使其立即生效。
@@ -552,6 +609,27 @@ pub const App = struct {
         std.posix.sigaction(std.posix.SIG.INT, &act, null);
     }
 };
+
+/// 读整个文件(POSIX open/read,稳定不依赖 Io.Dir)。caller free。
+fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len + 1 > pbuf.len) return error.PathTooLong;
+    @memcpy(pbuf[0..path.len], path);
+    pbuf[path.len] = 0;
+    const fd = std.c.open(@ptrCast(&pbuf), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.FileNotFound;
+    defer _ = std.c.close(fd);
+    var all: std.ArrayList(u8) = .empty;
+    errdefer all.deinit(alloc);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.read(fd, &buf, buf.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try all.appendSlice(alloc, buf[0..@intCast(n)]);
+    }
+    return try all.toOwnedSlice(alloc);
+}
 
 /// Signal handler: async-signal-safe (仅 atomic store)。
 fn sigintHandler(sig: std.posix.SIG) callconv(.c) void {

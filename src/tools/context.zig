@@ -62,6 +62,12 @@ pub const ToolContext = struct {
     project_dir: []const u8 = "",
     /// 全局 disable-shell-execution 开关(settings.json `disableSkillShellExecution`)。
     disable_shell_execution: bool = false,
+    /// Sandbox 配置(macOS Seatbelt)。非 null 且 enabled 时,Bash 命令包进 sandbox-exec。
+    sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
+    /// 当前 cwd 绝对路径(sandbox profile 工作目录写权限)。空 = 用 process cwd。
+    cwd_abs: []const u8 = "",
+    /// HOME(sandbox profile ~/ 展开)。
+    home_dir: []const u8 = "",
     /// Subagent 定义集合(Task 工具据此找 subagent_type → AgentDef)。
     agents: ?*const @import("../agents/set.zig").AgentSet = null,
     /// 父 model(供 subagent model 字段 `inherit` 解析)。
