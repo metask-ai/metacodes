@@ -200,7 +200,8 @@ pub const Client = struct {
             .stream = true,
             .tools = tools,
         }, client.allocator);
-        errdefer client.allocator.free(req_body);
+        // doRequest 内部 sendBodyComplete 是同步全发,返回后 body 即可释放(stream/error 都)。
+        defer client.allocator.free(req_body);
 
         const result = try client.doRequest(req_body, true);
         switch (result) {
@@ -420,6 +421,8 @@ pub const StreamResponse = struct {
     }
 
     pub fn deinit(self: *StreamResponse) void {
+        // EventIterator 可能持有未 emit 的 pending_tool(流中途断开时残留),释放它。
+        if (self.iter_initialized) self.event_iter.deinit(self.allocator);
         self.stream_result.request.deinit();
         self.allocator.destroy(self.stream_result.request);
     }

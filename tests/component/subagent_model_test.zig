@@ -33,10 +33,8 @@ const MINIMAL_END_TURN_SSE =
 // 证明 base_url override + request capture + jsonField 链路通畅。
 // 当前应**绿**(Client 实例 model 字段总是写进请求 body)。
 test "L2 baseline: Client.model 字段进入请求体" {
-    // 用 page_allocator 而非 testing.allocator:client.sendMessageStream 路径有
-    // 已知 leak(StreamResponse.deinit 未释放某些内部缓冲;L2 框架抓到的真实 bug,
-    // 记入 doc/E2E_TESTING.md §3.1 待修)。
-    const a = std.heap.page_allocator;
+    // 用 testing.allocator:A1 修复后 sendMessageStream 路径不应再泄漏。
+    const a = std.testing.allocator;
 
     var srv = try harness.MockServer.start(MINIMAL_END_TURN_SSE, 0);
     defer srv.stop();
@@ -72,8 +70,8 @@ test "L2 baseline: Client.model 字段进入请求体" {
 // **当前红** — 因为 client.sendMessageStream 没有 per-call model override,
 // subagent 共用父 Client.model(sonnet)。Phase 2 修后转绿。
 test "L2 GAP: subagent 期望用 haiku 但当前用父 model" {
-    // 同上:page_allocator 绕过 sendMessageStream 的已知 leak
-    const a = std.heap.page_allocator;
+    // A1 修复后用 testing.allocator
+    const a = std.testing.allocator;
 
     var srv = try harness.MockServer.start(MINIMAL_END_TURN_SSE, 0);
     defer srv.stop();
@@ -113,7 +111,12 @@ test "L2 GAP: subagent 期望用 haiku 但当前用父 model" {
 fn drainStream(resp: *cc.client_mod.StreamResponse) !void {
     while (true) {
         const maybe = try resp.next();
-        if (maybe == null) break;
+        const ev = maybe orelse break;
+        // StreamEvent.text 是 owned slice,caller 负责释放(对齐 agent_loop)
+        switch (ev) {
+            .text => |t| std.testing.allocator.free(t),
+            else => {},
+        }
         if (resp.done) break;
     }
 }
