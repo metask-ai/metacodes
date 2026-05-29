@@ -108,6 +108,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                 \\  /mcp             List configured MCP servers
                 \\  /agents          List available sub-agent capabilities
                 \\  /permissions     Show permission mode + loaded rules
+                \\  /theme [variant] Show/switch TUI theme (auto/dark/light/mono)
                 \\  /add-dir <path>  Grant read/write access to an extra directory
                 \\  /memory [add ..] Show or append cross-session memory
                 \\  /commit          Draft a git commit using the model
@@ -227,6 +228,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         }
         if (std.mem.eql(u8, trimmed, "/permissions")) {
             handlePermissions(app);
+            continue;
+        }
+        if (std.mem.startsWith(u8, trimmed, "/theme")) {
+            const rest = std.mem.trim(u8, trimmed[6..], " \t");
+            handleTheme(app, rest);
             continue;
         }
         if (std.mem.startsWith(u8, trimmed, "/add-dir")) {
@@ -1362,6 +1368,31 @@ fn handlePermissions(app: *app_mod.App) void {
         if (s.isBypassDisabled()) std.debug.print("  disableBypassPermissionsMode: true\n", .{});
         if (s.isAutoModeDisabled()) std.debug.print("  disableAutoMode: true\n", .{});
     }
+}
+
+/// /theme:列当前 / 切预设(dark / light / mono / auto)
+fn handleTheme(app: *app_mod.App, rest: []const u8) void {
+    const theme_mod = @import("tui/theme.zig");
+    const tui_term = @import("tui/term.zig");
+    if (rest.len == 0) {
+        const variants = [_][]const u8{ "auto", "dark", "light", "mono" };
+        std.debug.print("current theme: \x1b[36m{s}\x1b[0m\n", .{theme_mod.variantName(app.theme_variant)});
+        std.debug.print("available: ", .{});
+        for (variants, 0..) |v, i| {
+            std.debug.print("{s}{s}", .{ v, if (i + 1 < variants.len) ", " else "" });
+        }
+        std.debug.print("\nusage: /theme <variant>\n", .{});
+        return;
+    }
+    const variant = theme_mod.parseVariant(rest) orelse {
+        std.debug.print("unknown theme '{s}'. try: auto, dark, light, mono\n", .{rest});
+        return;
+    };
+    app.theme_variant = variant;
+    const cap = tui_term.detectFromEnv(1);
+    app.theme = theme_mod.select(variant, cap);
+    std.debug.print("theme switched to \x1b[36m{s}\x1b[0m\n", .{theme_mod.variantName(variant)});
+    std.debug.print("\x1b[2m(persisting to ~/.cc-zig/config.json deferred to P2)\x1b[0m\n", .{});
 }
 
 /// /memory：跨 session 记忆，存于 ~/.cc-zig/memory.md。

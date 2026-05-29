@@ -99,6 +99,10 @@ pub const App = struct {
     hooks: ?@import("permission/hooks.zig").HookSet = null,
     /// 缓存的 cwd 绝对路径(供 permission match_ctx 用,session 期不变)。
     cwd_abs: ?[]u8 = null,
+    /// 当前 TUI 主题(启动时根据 --no-theme + ColorCapability 选;/theme 可改)。
+    theme: @import("repl/tui/theme.zig").Theme = @import("repl/tui/theme.zig").dark,
+    /// 当前主题 variant(/theme 命令读它显示当前)。
+    theme_variant: @import("repl/tui/theme.zig").Variant = .auto,
     /// 后台 Bash 作业注册表（失败初始化则 null）
     jobs: ?JobRegistry = null,
     /// 进入 plan 模式前的原 mode；ExitPlanMode 用它恢复
@@ -168,6 +172,17 @@ pub const App = struct {
             app.project_dir = @import("skills/skill.zig").findRepoRoot(allocator, cwd) catch null;
             app.cwd_abs = allocator.dupe(u8, cwd) catch null;
         }
+
+        // 选 TUI 主题:--no-theme → monochrome;否则用 .auto + 终端能力检测
+        const theme_mod = @import("repl/tui/theme.zig");
+        const tui_term = @import("repl/tui/term.zig");
+        const cap = tui_term.detectFromEnv(1);
+        if (config.no_theme) {
+            app.theme_variant = .monochrome;
+        } else {
+            app.theme_variant = .auto;
+        }
+        app.theme = theme_mod.select(app.theme_variant, cap);
 
         // 注册 Skill 工具到 dyn_registry（ctx_ptr 指向 SkillSet）。
         // 失败仅 log——skills 仍可通过 /skills 列表，只是模型激活不了。
