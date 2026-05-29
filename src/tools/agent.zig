@@ -2,13 +2,18 @@
 //!
 //! 完整规范见 doc/SUBAGENT_DESIGN.md(第 5 节)。
 //!
-//! Schema:
+//! Schema(已实现):
 //! - subagent_type:str (必需) — Explore / Plan / general-purpose / <custom name>
 //! - description:str  (必需) — 3-5 词 UI 标签
 //! - prompt:str       (必需) — 委托消息
-//! - run_in_background:bool (可选)
-//! - isolation:str   (可选,worktree)
-//! - model:str       (可选) — 单次 spawn 覆盖
+//! - max_turns:int    (可选) — 单次 spawn 覆盖子 agent 最大轮数
+//! - model:str        (可选) — 单次 spawn 覆盖 model(haiku/sonnet/opus/全名/inherit)
+//!
+//! 未实现(见 doc/E2E_TESTING.md §3.1 + SUBAGENT_DESIGN.md Stage E/F):
+//! - run_in_background:bool — 需要 agent job 线程化机制(JobRegistry 当前只支持
+//!   bash 子进程,不支持后台 subagent)。P2。
+//! - isolation:"worktree"   — 需要真 git worktree spawn + 清理。P3。
+//! 这两个字段当前**不解析**,传了也无效果。不要在 schema required 里声明它们。
 //!
 //! 兼容:不带 subagent_type 但带 prompt 时,等同 subagent_type="general-purpose"(旧 Agent 工具语义)。
 
