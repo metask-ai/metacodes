@@ -498,7 +498,7 @@ fn try_concat(_: []const u8, _: []const u8) []const u8 {
 // args 抽字段(共用 util/json 但简化)
 // ============================================================================
 
-fn extractCommand(args: []const u8) []const u8 {
+pub fn extractCommand(args: []const u8) []const u8 {
     return extractStringField(args, "command") orelse "";
 }
 

@@ -38,6 +38,9 @@ pub const PermissionContext = struct {
     settings: ?*const settings_mod.MergedSettings = null,
     /// path / bash 匹配上下文(cwd / project_root / home)。
     match_ctx: rule_spec_mod.MatchContext = .{},
+    /// 沙箱启用 + autoAllowBashIfSandboxed(decision 用)。
+    sandbox_enabled: bool = false,
+    auto_allow_bash_if_sandboxed: bool = false,
 };
 
 pub fn createContext(mode: types.PermissionMode, allocator: std.mem.Allocator) PermissionContext {
@@ -51,6 +54,8 @@ pub fn checkPermission(ctx: *const PermissionContext, tool_name: []const u8, arg
         .active_skill = ctx.active_skill,
         .settings = ctx.settings,
         .match_ctx = ctx.match_ctx,
+        .sandbox_enabled = ctx.sandbox_enabled,
+        .auto_allow_bash_if_sandboxed = ctx.auto_allow_bash_if_sandboxed,
     };
     return decision_mod.check(&d_ctx, tool_name, args);
 }

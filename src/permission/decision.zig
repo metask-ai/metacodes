@@ -26,6 +26,10 @@ pub const Context = struct {
     settings: ?*const settings_mod.MergedSettings = null,
     /// rule_spec 匹配上下文(cwd / project_root / home),用于 path / bash compound 等。
     match_ctx: rule_spec.MatchContext = .{},
+    /// 沙箱启用?(用于 autoAllowBashIfSandboxed)。
+    sandbox_enabled: bool = false,
+    /// autoAllowBashIfSandboxed:沙箱内 bash 自动放行(绕过 ask: Bash(*),deny 仍优先)。
+    auto_allow_bash_if_sandboxed: bool = false,
 };
 
 /// 根据模式 + 工具名决定:允许 / 拒绝 / 询问。
@@ -78,6 +82,26 @@ pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decis
         if (rs.match(tool_name, args)) |d| {
             log.debug("permission", "legacy rule tool={s} -> {s}", .{ tool_name, @tagName(d) });
             return d;
+        }
+    }
+
+    // 4. Bash 专属免询问(plan/dont_ask 除外,它们语义就是限制):
+    //    a. readonly 内置命令(ls/cat/grep/git status/...)→ ALLOW
+    //    b. autoAllowBashIfSandboxed + 沙箱启用 → ALLOW(物理边界已足够)
+    if (std.mem.eql(u8, tool_name, "Bash")) {
+        const m4 = @import("mode.zig").canonical(ctx.mode);
+        if (m4 != .plan and m4 != .dont_ask) {
+            const cmd = rule_spec.extractCommand(args);
+            const bp = @import("bash_parser.zig");
+            const real = bp.stripWrappers(cmd);
+            if (bp.isReadonlyCommand(real)) {
+                log.debug("permission", "bash readonly auto-allow: {s}", .{real});
+                return .allow;
+            }
+            if (ctx.sandbox_enabled and ctx.auto_allow_bash_if_sandboxed) {
+                log.debug("permission", "autoAllowBashIfSandboxed -> allow", .{});
+                return .allow;
+            }
         }
     }
 
@@ -207,8 +231,8 @@ test "settings allow grants Bash in default mode" {
     const ctx = Context{ .mode = .default, .settings = &ms };
     // git status:settings allow → allow(不询问)
     try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"git status\"}") == .allow);
-    // ls:未命中 settings → 落到 mode → ask
-    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"ls\"}") == .ask);
+    // npm test:未命中 settings、非 readonly → 落到 mode → ask
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"npm test\"}") == .ask);
 }
 
 test "protected path forces ask even with allow rule" {
@@ -233,4 +257,37 @@ test "protected path forces ask even with allow rule" {
     try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/.env\"}") == .ask);
     // .git/config: protected → ask
     try std.testing.expect(check(&ctx, "Edit", "{\"file_path\":\"/proj/.git/config\"}") == .ask);
+}
+
+test "bash readonly auto-allow in default mode" {
+    const ctx = Context{ .mode = .default };
+    // ls / cat / git status → allow(免询问)
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"ls -la\"}") == .allow);
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"git status\"}") == .allow);
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"timeout 5 cat foo\"}") == .allow);
+    // 写类命令仍 ask
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"rm foo\"}") == .ask);
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"git push\"}") == .ask);
+}
+
+test "bash readonly NOT auto-allowed in plan/dont_ask" {
+    // plan:即便 readonly,Bash 仍 deny(plan 不执行任何命令)
+    const ctx_plan = Context{ .mode = .plan };
+    try std.testing.expect(check(&ctx_plan, "Bash", "{\"command\":\"ls\"}") == .deny);
+    // dont_ask:readonly 也不放行(只放 explicit allow)
+    const ctx_da = Context{ .mode = .dont_ask };
+    try std.testing.expect(check(&ctx_da, "Bash", "{\"command\":\"ls\"}") == .deny);
+}
+
+test "autoAllowBashIfSandboxed allows non-readonly bash" {
+    const ctx = Context{
+        .mode = .default,
+        .sandbox_enabled = true,
+        .auto_allow_bash_if_sandboxed = true,
+    };
+    // 沙箱内:即便是写命令也 allow(物理边界已限制)
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"npm install\"}") == .allow);
+    // 没开 autoAllow 时同命令 ask
+    const ctx2 = Context{ .mode = .default, .sandbox_enabled = true, .auto_allow_bash_if_sandboxed = false };
+    try std.testing.expect(check(&ctx2, "Bash", "{\"command\":\"npm install\"}") == .ask);
 }

@@ -408,6 +408,8 @@ pub const App = struct {
             var sb = sb_config.parse(app.allocator, parsed.value) catch continue;
             if (sb.enabled) {
                 app.sandbox_settings = sb;
+                app.permission_ctx.sandbox_enabled = true;
+                app.permission_ctx.auto_allow_bash_if_sandboxed = sb.auto_allow_bash_if_sandboxed;
                 @import("util/log.zig").info("sandbox", "enabled (from {s})", .{path});
                 return;
             }
