@@ -194,6 +194,12 @@ test {
     _ = &@import("repl/paste.zig");
     _ = &@import("repl/transcript_viewer.zig");
     _ = &@import("repl/vim.zig");
+    _ = &@import("repl/tui/ansi.zig");
+    _ = &@import("repl/tui/term.zig");
+    _ = &@import("repl/tui/overlay.zig");
+    _ = &@import("repl/tui/theme.zig");
+    _ = &@import("repl/tui/layout.zig");
+    _ = &@import("repl/tui/test_capture.zig");
     _ = &@import("mcp/protocol.zig");
     _ = &@import("mcp/transport_stdio.zig");
     _ = &@import("mcp/client.zig");
