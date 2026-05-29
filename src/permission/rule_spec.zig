@@ -187,7 +187,7 @@ pub fn matches(spec: *const RuleSpec, mctx: *const MatchContext, tool_name: []co
 
     return switch (spec.spec) {
         .all => true,
-        .bash_pattern => |pat| matchesBashPattern(pat, extractCommand(args)),
+        .bash_pattern => |pat| matchesBashCompound(pat, extractCommand(args)),
         .powershell_pattern => |pat| matchesBashPattern(pat, extractCommand(args)),
         .path_pattern => |pp| matchesPathPattern(pp, mctx, extractPath(args)),
         .web_domain => |dom| matchesWebDomain(dom, args),
@@ -195,6 +195,47 @@ pub fn matches(spec: *const RuleSpec, mctx: *const MatchContext, tool_name: []co
         .agent_name => |an| matchesAgent(an, args),
         .mcp_match => |m| matchesMcp(m, tool_name),
     };
+}
+
+/// 复合 Bash 命令(allow 规则语义):每个子命令(strip wrappers 后)都得被 pattern 匹中。
+/// 任一段没匹中 → 整体不匹中(因为放行 = 必须每段都允许)。
+fn matchesBashCompound(pattern: []const u8, full_cmd: []const u8) bool {
+    const bp = @import("bash_parser.zig");
+    // 单段优化:无 compound 分隔符直接走老路径
+    if (!hasCompoundSep(full_cmd)) {
+        return matchesBashPattern(pattern, bp.stripWrappers(full_cmd));
+    }
+    // 拆 + 逐段判定
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const segs = bp.splitCompound(arena.allocator(), full_cmd) catch return false;
+    if (segs.len == 0) return false;
+    for (segs) |seg| {
+        const real = bp.stripWrappers(seg);
+        if (!matchesBashPattern(pattern, real)) return false;
+    }
+    return true;
+}
+
+fn hasCompoundSep(s: []const u8) bool {
+    var in_s = false;
+    var in_d = false;
+    var in_b = false;
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (!in_d and !in_b and c == '\'') { in_s = !in_s; continue; }
+        if (!in_s and !in_b and c == '"')  { in_d = !in_d; continue; }
+        if (!in_s and !in_d and c == '`')  { in_b = !in_b; continue; }
+        if (in_s or in_d or in_b) continue;
+        if (c == '\\' and i + 1 < s.len) { i += 1; continue; }
+        if (c == ';' or c == '\n' or c == '|') return true;
+        if (c == '&') {
+            if (i + 1 < s.len and s[i + 1] == '&') return true;
+            return true; // 单 & 也算后台分隔
+        }
+    }
+    return false;
 }
 
 // ============================================================================
@@ -658,4 +699,22 @@ test "matches: mcp__server__tool exact" {
     var mctx = MatchContext{};
     try testing.expect(matches(&r, &mctx, "puppeteer__navigate", "{}"));
     try testing.expect(!matches(&r, &mctx, "puppeteer__screenshot", "{}"));
+}
+
+test "matches: Bash compound — all segs must match" {
+    const r = try parseRule("Bash(git *)");
+    var mctx = MatchContext{};
+    // 单段:正常
+    try testing.expect(matches(&r, &mctx, "Bash", "{\"command\":\"git status\"}"));
+    // 复合且全是 git:OK
+    try testing.expect(matches(&r, &mctx, "Bash", "{\"command\":\"git status && git log\"}"));
+    // 复合且夹了 rm:整体拒
+    try testing.expect(!matches(&r, &mctx, "Bash", "{\"command\":\"git status && rm -rf /\"}"));
+}
+
+test "matches: Bash with wrapper stripped before match" {
+    const r = try parseRule("Bash(npm test)");
+    var mctx = MatchContext{};
+    try testing.expect(matches(&r, &mctx, "Bash", "{\"command\":\"timeout 30 npm test\"}"));
+    try testing.expect(matches(&r, &mctx, "Bash", "{\"command\":\"nice -n 5 npm test\"}"));
 }

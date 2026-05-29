@@ -145,6 +145,7 @@ test {
     _ = &@import("tools.zig");
     _ = &@import("permission.zig");
     _ = &@import("permission/rule_spec.zig");
+    _ = &@import("permission/bash_parser.zig");
     _ = &@import("core/message.zig");
     _ = &@import("core/conversation.zig");
     _ = &@import("core/agent_loop.zig");
