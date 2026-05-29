@@ -164,3 +164,68 @@ test "L2 production path: spawnAgent(model_override=haiku) → 请求体 model �
     const model_field = cap.jsonField("model") orelse return error.ModelFieldMissing;
     try std.testing.expect(std.mem.indexOf(u8, model_field, "haiku") != null);
 }
+
+// L2:subagent tool_defs_override → 请求体 tools 数组只含白名单(对齐 AgentDef.tools filter)
+test "L2: spawnAgent(tool_defs_override) → 请求体 tools 收窄" {
+    const a = std.heap.page_allocator;
+
+    var srv = try harness.MockServer.start(MINIMAL_END_TURN_SSE, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    const io = io_runtime.io();
+
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io, "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    const perm_ctx = cc.permission.PermissionContext{ .mode = .bypass_permissions, .allocator = a };
+
+    const empty: []const cc.json_mod.ToolDefinition = &.{};
+    const override = [_]cc.json_mod.ToolDefinition{
+        .{ .name = "Read", .description = "read", .input_schema = .{ .type = "object", .properties = null, .required = &.{} } },
+        .{ .name = "Grep", .description = "grep", .input_schema = .{ .type = "object", .properties = null, .required = &.{} } },
+    };
+
+    var result = cc.core_subagent.spawnAgent(
+        a, &client, empty, &perm_ctx, null, "hi",
+        .{ .max_turns = 2, .tool_defs_override = &override },
+    ) catch return error.SkipZigTest;
+    defer result.deinit();
+
+    const cap = srv.lastRequest() orelse return error.NoRequestCaptured;
+    const tools_field = cap.jsonField("tools") orelse return error.ToolsFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "Read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "Grep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"Write\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"Bash\"") == null);
+}
+
+// L2:subagent permission_mode_override → 子 agent 用覆盖后的 mode(路径贯通)
+test "L2: spawnAgent(permission_mode_override=plan) 生效" {
+    const a = std.heap.page_allocator;
+
+    var srv = try harness.MockServer.start(MINIMAL_END_TURN_SSE, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    const io = io_runtime.io();
+
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io, "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    const perm_ctx = cc.permission.PermissionContext{ .mode = .bypass_permissions, .allocator = a };
+    const empty: []const cc.json_mod.ToolDefinition = &.{};
+    var result = cc.core_subagent.spawnAgent(
+        a, &client, empty, &perm_ctx, null, "hi",
+        .{ .max_turns = 2, .permission_mode_override = .plan },
+    ) catch return error.SkipZigTest;
+    defer result.deinit();
+
+    try std.testing.expect(srv.lastRequest() != null);
+}
