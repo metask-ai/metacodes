@@ -10,19 +10,25 @@ const std = @import("std");
 const Mode = @import("mode.zig").Mode;
 const category = @import("category.zig");
 const rule_matcher = @import("rule_matcher.zig");
+const settings_mod = @import("settings.zig");
+const rule_spec = @import("rule_spec.zig");
 const log = @import("../util/log.zig");
 
 pub const Decision = enum { allow, deny, ask };
 
 pub const Context = struct {
     mode: Mode,
-    /// 可选的细粒度规则集。非 null 时先查规则，命中即用；都不命中落回四模式。
+    /// 旧 schema rule_set(保留兼容,新代码用 settings)。
     rules: ?*const rule_matcher.RuleSet = null,
-    /// 当前激活 skill 的临时白/黑名单(若有)。优先级:active_skill > rules > mode。
+    /// 当前激活 skill 的临时白/黑名单(若有)。优先级:active_skill > settings > rules > mode。
     active_skill: ?*const @import("../skills/active.zig").ActiveSkillState = null,
+    /// 5 层 settings 聚合(管理 + cli + project local/shared + user)。
+    settings: ?*const settings_mod.MergedSettings = null,
+    /// rule_spec 匹配上下文(cwd / project_root / home),用于 path / bash compound 等。
+    match_ctx: rule_spec.MatchContext = .{},
 };
 
-/// 根据模式 + 工具名决定：允许 / 拒绝 / 询问。
+/// 根据模式 + 工具名决定:允许 / 拒绝 / 询问。
 pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decision {
     // 0. 最高优先:active skill 白/黑名单
     if (ctx.active_skill) |as| {
@@ -36,10 +42,41 @@ pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decis
         }
     }
 
-    // 先查细粒度规则
+    // 1. settings(deny → allow → ask;deny 永远优先)
+    if (ctx.settings) |s| {
+        const d = settings_mod.evaluate(s, &ctx.match_ctx, tool_name, args);
+        switch (d) {
+            .deny => {
+                log.debug("permission", "settings deny tool={s}", .{tool_name});
+                return .deny;
+            },
+            .allow => {
+                // 但 protected paths 始终需要 ask(即便 allow 规则命中也不豁免)
+                if (isProtectedTarget(tool_name, args)) {
+                    log.debug("permission", "settings allow OVERRIDDEN by protected path tool={s}", .{tool_name});
+                    return .ask;
+                }
+                log.debug("permission", "settings allow tool={s}", .{tool_name});
+                return .allow;
+            },
+            .ask => {
+                log.debug("permission", "settings ask tool={s}", .{tool_name});
+                return .ask;
+            },
+            .undecided => {}, // 落到下层
+        }
+    }
+
+    // 2. Protected paths:Edit/Write/NotebookEdit 到 .git/.env/.ssh/* 永远 ask
+    if (isProtectedTarget(tool_name, args)) {
+        log.debug("permission", "protected path tool={s} -> ask", .{tool_name});
+        return .ask;
+    }
+
+    // 3. 旧细粒度规则(向后兼容)
     if (ctx.rules) |rs| {
         if (rs.match(tool_name, args)) |d| {
-            log.debug("permission", "rule matched tool={s} -> {s}", .{ tool_name, @tagName(d) });
+            log.debug("permission", "legacy rule tool={s} -> {s}", .{ tool_name, @tagName(d) });
             return d;
         }
     }
@@ -53,15 +90,12 @@ pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decis
         if (m == .bypass_permissions) break :blk .allow;
         if (m == .plan) break :blk if (cat == .read) .allow else .deny;
         if (m == .auto) break :blk if (risk == .low) .allow else .ask;
-        if (m == .dont_ask) break :blk .deny; // 仅 explicit allow 规则可放行,落到这层就 deny
+        if (m == .dont_ask) break :blk .deny;
         if (m == .accept_edits) {
-            // 读 + 文件编辑 + fs 命令 ALLOW;其它 ASK
             if (cat == .read) break :blk .allow;
             if (std.mem.eql(u8, tool_name, "Write") or std.mem.eql(u8, tool_name, "Edit") or std.mem.eql(u8, tool_name, "NotebookEdit")) break :blk .allow;
-            // TODO: accept_edits 还应放行 mkdir/touch/mv/cp/rm/rmdir/sed,需要 Bash command 解析(Stage A 后续)
             break :blk .ask;
         }
-        // default(等价旧 prompt)
         break :blk if (cat == .read) .allow else .ask;
     };
 
@@ -73,6 +107,16 @@ pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decis
         @tagName(decision),
     });
     return decision;
+}
+
+/// 工具是否在写一个 protected path?仅 Edit/Write/NotebookEdit 关心。
+fn isProtectedTarget(tool_name: []const u8, args: []const u8) bool {
+    if (!(std.mem.eql(u8, tool_name, "Write") or
+        std.mem.eql(u8, tool_name, "Edit") or
+        std.mem.eql(u8, tool_name, "NotebookEdit"))) return false;
+    const path = rule_spec.extractPath(args);
+    if (path.len == 0) return false;
+    return settings_mod.isProtectedPath(path);
 }
 
 test "bypass_permissions allows everything including dangerous" {
@@ -129,4 +173,64 @@ test "dont_ask: nothing matched in rules → deny" {
     try std.testing.expect(check(&ctx, "Read", "") == .deny);
     try std.testing.expect(check(&ctx, "Write", "") == .deny);
     try std.testing.expect(check(&ctx, "Bash", "ls") == .deny);
+}
+
+test "settings deny takes precedence over mode bypass" {
+    const alloc = std.testing.allocator;
+    // Build a one-layer settings with Bash(git push) deny
+    const src = "{\"permissions\":{\"deny\":[\"Bash(git push)\"]}}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, src, .{});
+    defer parsed.deinit();
+    const L = try settings_mod.parseLayer(alloc, .user, parsed.value);
+    const layers = try alloc.alloc(settings_mod.Layer, 1);
+    layers[0] = L;
+    var ms = settings_mod.MergedSettings{ .layers = layers, .allocator = alloc };
+    defer ms.deinit();
+
+    const ctx = Context{ .mode = .bypass_permissions, .settings = &ms };
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"git push\"}") == .deny);
+    // 其它 Bash 在 bypass 下仍然 allow
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"ls\"}") == .allow);
+}
+
+test "settings allow grants Bash in default mode" {
+    const alloc = std.testing.allocator;
+    const src = "{\"permissions\":{\"allow\":[\"Bash(git *)\"]}}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, src, .{});
+    defer parsed.deinit();
+    const L = try settings_mod.parseLayer(alloc, .user, parsed.value);
+    const layers = try alloc.alloc(settings_mod.Layer, 1);
+    layers[0] = L;
+    var ms = settings_mod.MergedSettings{ .layers = layers, .allocator = alloc };
+    defer ms.deinit();
+
+    const ctx = Context{ .mode = .default, .settings = &ms };
+    // git status:settings allow → allow(不询问)
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"git status\"}") == .allow);
+    // ls:未命中 settings → 落到 mode → ask
+    try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"ls\"}") == .ask);
+}
+
+test "protected path forces ask even with allow rule" {
+    const alloc = std.testing.allocator;
+    // 用户允许 Write 整个 cwd,但 .env 仍要 ask
+    const src = "{\"permissions\":{\"allow\":[\"Write(./**)\"]}}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, src, .{});
+    defer parsed.deinit();
+    const L = try settings_mod.parseLayer(alloc, .user, parsed.value);
+    const layers = try alloc.alloc(settings_mod.Layer, 1);
+    layers[0] = L;
+    var ms = settings_mod.MergedSettings{ .layers = layers, .allocator = alloc };
+    defer ms.deinit();
+
+    var match_ctx = rule_spec.MatchContext{ .cwd = "/proj" };
+    const ctx = Context{ .mode = .default, .settings = &ms, .match_ctx = match_ctx };
+    _ = &match_ctx;
+
+    // 普通文件:allow
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/src/foo.zig\"}") == .allow);
+    // .env: protected path 覆盖 → ask
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/.env\"}") == .ask);
+    // .git/config: protected → ask
+    try std.testing.expect(check(&ctx, "Edit", "{\"file_path\":\"/proj/.git/config\"}") == .ask);
 }

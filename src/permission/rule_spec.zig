@@ -502,7 +502,7 @@ fn extractCommand(args: []const u8) []const u8 {
     return extractStringField(args, "command") orelse "";
 }
 
-fn extractPath(args: []const u8) []const u8 {
+pub fn extractPath(args: []const u8) []const u8 {
     return extractStringField(args, "file_path") orelse extractStringField(args, "path") orelse "";
 }
 
