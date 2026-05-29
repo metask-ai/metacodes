@@ -31,6 +31,7 @@ pub const skills_discovery = @import("skills/discovery.zig");
 pub const active_skill = @import("skills/active.zig");
 pub const permission = @import("permission.zig");
 pub const permission_rule_spec = @import("permission/rule_spec.zig");
+pub const permission_settings = @import("permission/settings.zig");
 pub const agents_def = @import("agents/def.zig");
 pub const agents_set = @import("agents/set.zig");
 pub const agents_filter = @import("agents/filter.zig");

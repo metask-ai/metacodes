@@ -102,6 +102,7 @@ pub fn build(b: *std.Build) void {
         "tests/integration/skills_e2e_test.zig",
         "tests/integration/agents_e2e_test.zig",
         "tests/component/subagent_model_test.zig",
+        "tests/component/allowed_tools_test.zig",
     };
     for (integ_files) |f| {
         const m = b.createModule(.{
