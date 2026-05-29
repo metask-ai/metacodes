@@ -40,17 +40,32 @@ pub const Client = struct {
     http_client: http.Client,
     api_key: []const u8,
     model: []const u8,
+    /// 完整的 messages endpoint URL。生产 = ANTHROPIC_API_URL;测试 = mock server URL。
+    /// 通过 init 的 base_url_override 注入(L2 测试用)。
+    base_url: []const u8,
     /// 模型 catalog——启动时 `probeModels` 填充。构造后为空，调 probeModels 再生效。
     catalog: Catalog,
     /// 用户 CLI `--max-tokens N` 覆盖；null = 自动（catalog → fallback table → default）。
     max_tokens_override: ?u32 = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, model: []const u8) Client {
+        return initWithBaseUrl(allocator, io, api_key, model, null);
+    }
+
+    /// 测试用:允许覆盖 base_url(指向 MockServer)。生产代码用 init。
+    pub fn initWithBaseUrl(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        api_key: []const u8,
+        model: []const u8,
+        base_url_override: ?[]const u8,
+    ) Client {
         return .{
             .allocator = allocator,
             .http_client = http.Client{ .allocator = allocator, .io = io },
             .api_key = api_key,
             .model = model,
+            .base_url = base_url_override orelse ANTHROPIC_API_URL,
             .catalog = Catalog.init(allocator),
         };
     }
@@ -85,7 +100,7 @@ pub const Client = struct {
     /// GET <base>/v1/models 拉完整响应。
     fn doGetModels(client: *Client) ![]u8 {
         // 把 /v1/messages 替换成 /v1/models
-        const messages_url = ANTHROPIC_API_URL;
+        const messages_url = client.base_url;
         const suffix = "/v1/messages";
         if (!std.mem.endsWith(u8, messages_url, suffix)) return error.UnexpectedUrl;
         const base = messages_url[0 .. messages_url.len - suffix.len];
@@ -188,7 +203,7 @@ pub const Client = struct {
         var tok_prev_buf: [24]u8 = undefined;
         const tok_preview = tokenPreview(client.api_key, &tok_prev_buf);
         log.infoId("client", rid, "POST {s} model={s} streaming={} token={s} body_bytes={d}", .{
-            ANTHROPIC_API_URL,
+            client.base_url,
             client.model,
             streaming,
             tok_preview,
@@ -196,7 +211,7 @@ pub const Client = struct {
         });
         log.debugId("client", rid, "request body:\n{s}", .{body});
 
-        const uri = std.Uri.parse(ANTHROPIC_API_URL) catch {
+        const uri = std.Uri.parse(client.base_url) catch {
             log.errId("client", rid, "invalid url", .{});
             return error.InvalidUrl;
         };

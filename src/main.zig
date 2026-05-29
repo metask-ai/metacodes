@@ -8,6 +8,8 @@ pub const VERSION = "0.1.0";
 
 // Public re-exports for tests and future consumers.
 pub const api_stream = @import("api/stream.zig");
+pub const client_mod = client; // alias for L2 component tests
+pub const types_mod = types;
 pub const util_abort = @import("util/abort.zig");
 pub const conversation = @import("core/conversation.zig");
 pub const agent_loop = @import("core/agent_loop.zig");

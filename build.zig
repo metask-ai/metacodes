@@ -93,13 +93,15 @@ pub fn build(b: *std.Build) void {
         spike_step.dependOn(&b.addRunArtifact(t).step);
     }
 
-    // Integration tests that need to import from src/ —— 给他们一个带 imports 的模块。
+    // Integration / Component 测试:都需要 cc + harness imports,共享构建配置。
+    // 目录区分用途:integration = 真子进程/真 fs;component = mock HTTP + 请求捕获(L2)。
     const integ_files = [_][]const u8{
         "tests/integration/http_stream_e2e_test.zig",
         "tests/integration/tool_abort_test.zig",
         "tests/integration/mcp_e2e_test.zig",
         "tests/integration/skills_e2e_test.zig",
         "tests/integration/agents_e2e_test.zig",
+        "tests/component/subagent_model_test.zig",
     };
     for (integ_files) |f| {
         const m = b.createModule(.{
