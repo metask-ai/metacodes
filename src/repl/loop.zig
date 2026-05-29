@@ -108,6 +108,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                 \\  /mcp             List configured MCP servers
                 \\  /agents          List available sub-agent capabilities
                 \\  /permissions     Show permission mode + loaded rules
+                \\  /add-dir <path>  Grant read/write access to an extra directory
                 \\  /memory [add ..] Show or append cross-session memory
                 \\  /commit          Draft a git commit using the model
                 \\  /btw <q>         Side question (uses context, not added to history)
@@ -226,6 +227,19 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         }
         if (std.mem.eql(u8, trimmed, "/permissions")) {
             handlePermissions(app);
+            continue;
+        }
+        if (std.mem.startsWith(u8, trimmed, "/add-dir")) {
+            const rest = std.mem.trim(u8, trimmed[8..], " \t");
+            if (rest.len == 0) {
+                std.debug.print("usage: /add-dir <path>\n", .{});
+            } else {
+                app.addDirectory(rest) catch |e| {
+                    std.debug.print("/add-dir failed: {s}\n", .{@errorName(e)});
+                    continue;
+                };
+                std.debug.print("added directory: {s}\n", .{rest});
+            }
             continue;
         }
         if (std.mem.startsWith(u8, trimmed, "/memory")) {
@@ -1331,6 +1345,22 @@ fn handlePermissions(app: *app_mod.App) void {
         }
     } else {
         std.debug.print("rules: (none loaded — add a permission_rules array to ~/.cc-zig/config.json)\n", .{});
+    }
+
+    // 新 schema settings 层(permissions.allow/ask/deny)
+    if (app.settings) |*s| {
+        std.debug.print("\nsettings layers ({d}):\n", .{s.layers.len});
+        for (s.layers) |L| {
+            std.debug.print("  [{s}] allow={d} ask={d} deny={d}\n", .{
+                @tagName(L.source), L.allow.len, L.ask.len, L.deny.len,
+            });
+            for (L.allow) |r| std.debug.print("      allow: {s}\n", .{r.raw});
+            for (L.ask) |r| std.debug.print("      ask:   {s}\n", .{r.raw});
+            for (L.deny) |r| std.debug.print("      deny:  {s}\n", .{r.raw});
+            for (L.additional_directories) |d| std.debug.print("      +dir:  {s}\n", .{d});
+        }
+        if (s.isBypassDisabled()) std.debug.print("  disableBypassPermissionsMode: true\n", .{});
+        if (s.isAutoModeDisabled()) std.debug.print("  disableAutoMode: true\n", .{});
     }
 }
 

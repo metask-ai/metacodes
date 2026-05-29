@@ -75,8 +75,16 @@ fn parseArgs(init: std.process.Init, allocator: std.mem.Allocator) types.Config 
             if (args.next()) |m| config.model = allocator.dupe(u8, m) catch m;
         } else if (std.mem.eql(u8, arg, "--api-key")) {
             if (args.next()) |k| config.api_key = allocator.dupe(u8, k) catch k;
-        } else if (std.mem.eql(u8, arg, "--permission")) {
+        } else if (std.mem.eql(u8, arg, "--permission") or std.mem.eql(u8, arg, "--permission-mode")) {
             if (args.next()) |m| config.permission_mode = parsePermMode(m);
+        } else if (std.mem.eql(u8, arg, "--settings")) {
+            if (args.next()) |s| config.settings_path = allocator.dupe(u8, s) catch s;
+        } else if (std.mem.eql(u8, arg, "--allowedTools") or std.mem.eql(u8, arg, "--allowed-tools")) {
+            if (args.next()) |s| config.allowed_tools = allocator.dupe(u8, s) catch s;
+        } else if (std.mem.eql(u8, arg, "--disallowedTools") or std.mem.eql(u8, arg, "--disallowed-tools")) {
+            if (args.next()) |s| config.disallowed_tools = allocator.dupe(u8, s) catch s;
+        } else if (std.mem.eql(u8, arg, "--add-dir")) {
+            if (args.next()) |s| config.add_dirs = appendNulList(allocator, config.add_dirs, s);
         } else if (std.mem.eql(u8, arg, "--max-tokens")) {
             if (args.next()) |s| {
                 config.max_tokens = std.fmt.parseInt(u32, s, 10) catch null;
@@ -111,11 +119,15 @@ fn readAllStdin(allocator: std.mem.Allocator) ![]const u8 {
 }
 
 fn parsePermMode(s: []const u8) types.PermissionMode {
-    if (std.mem.eql(u8, s, "auto")) return .auto;
-    if (std.mem.eql(u8, s, "prompt")) return .prompt;
-    if (std.mem.eql(u8, s, "plan")) return .plan;
-    if (std.mem.eql(u8, s, "bypass")) return .bypass;
-    return .prompt;
+    return @import("permission/mode.zig").parse(s);
+}
+
+/// 累加一个 \x00 分隔的列表(--add-dir 可重复)。返回新分配的串,旧串泄漏到 arena。
+fn appendNulList(allocator: std.mem.Allocator, prev: ?[]const u8, item: []const u8) ?[]const u8 {
+    if (prev) |p| {
+        return std.fmt.allocPrint(allocator, "{s}\x00{s}", .{ p, item }) catch p;
+    }
+    return allocator.dupe(u8, item) catch item;
 }
 
 fn printHelp() void {
@@ -127,7 +139,11 @@ fn printHelp() void {
         \\  --json                Headless: emit NDJSON result event
         \\  --model <model>       Model (default: claude-sonnet-4-20250514)
         \\  --api-key <key>       API key (overrides built-in token)
-        \\  --permission <mode>   auto | prompt | plan | bypass
+        \\  --permission <mode>   default | acceptEdits | plan | auto | dontAsk | bypassPermissions
+        \\  --settings <path>     Extra settings JSON (CLI layer)
+        \\  --allowedTools <list> Comma-separated allow rules, e.g. "Bash(git *),Read"
+        \\  --disallowedTools <l> Comma-separated deny rules
+        \\  --add-dir <path>      Extra read/write directory (repeatable)
         \\  --no-theme            Disable colors
         \\  --verbose             Verbose output
         \\  -h, --help            This help

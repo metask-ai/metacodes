@@ -90,6 +90,11 @@ pub const App = struct {
     usage: UsageTotals = .{},
     /// 从 config.json 加载的细粒度权限规则；null 时仅靠四模式兜底
     rule_set: ?permission_mod.RuleSet = null,
+    /// 5 层 settings 聚合(allow/ask/deny + additionalDirectories + disable flags)。
+    /// 启动时 loader.load;挂到 permission_ctx.settings。
+    settings: ?permission_mod.MergedSettings = null,
+    /// 缓存的 cwd 绝对路径(供 permission match_ctx 用,session 期不变)。
+    cwd_abs: ?[]u8 = null,
     /// 后台 Bash 作业注册表（失败初始化则 null）
     jobs: ?JobRegistry = null,
     /// 进入 plan 模式前的原 mode；ExitPlanMode 用它恢复
@@ -157,6 +162,7 @@ pub const App = struct {
         // 缓存 project root(供 ${CLAUDE_PROJECT_DIR} 替换)
         if (cwd_for_skills) |cwd| {
             app.project_dir = @import("skills/skill.zig").findRepoRoot(allocator, cwd) catch null;
+            app.cwd_abs = allocator.dupe(u8, cwd) catch null;
         }
 
         // 注册 Skill 工具到 dyn_registry（ctx_ptr 指向 SkillSet）。
@@ -184,9 +190,14 @@ pub const App = struct {
             @import("util/log.zig").warn("transcript", "init failed: {s} (session will not persist)", .{@errorName(err)});
         };
 
-        // 从 config.json 加载 permission_rules
+        // 从 config.json 加载 permission_rules（旧 schema，向后兼容）
         app.loadPermissionRules() catch |err| {
             @import("util/log.zig").debug("permission", "no rules loaded: {s}", .{@errorName(err)});
+        };
+
+        // 加载 5 层 settings（新 schema permissions.allow/ask/deny）并挂到 permission_ctx
+        app.loadSettings() catch |err| {
+            @import("util/log.zig").debug("permission", "no settings loaded: {s}", .{@errorName(err)});
         };
 
         // 初始化 job registry
@@ -231,6 +242,8 @@ pub const App = struct {
         app.worktree_stack.deinit(app.allocator);
         app.cron_registry.deinit();
         if (app.rule_set) |*r| r.deinit();
+        if (app.settings) |*s| s.deinit();
+        if (app.cwd_abs) |c| app.allocator.free(c);
         if (app.jobs) |*j| j.deinit();
         if (app.system_prompt) |s| app.allocator.free(s);
         app.allocator.destroy(app);
@@ -317,6 +330,50 @@ pub const App = struct {
         const app: *App = @ptrCast(@alignCast(state));
         if (app.worktree_stack.items.len == 0) return null;
         return app.worktree_stack.pop();
+    }
+
+    /// 加载 5 层 settings(managed/cli/project local+shared/user)+ CLI inline 规则,
+    /// 挂到 permission_ctx.settings,并填 match_ctx(cwd/project_root/home)。
+    fn loadSettings(app: *App) !void {
+        const loader = @import("permission/loader.zig");
+        const home_c = std.c.getenv("HOME");
+        const home: ?[]const u8 = if (home_c) |h| std.mem.span(h) else null;
+
+        const ms = try loader.load(app.allocator, .{
+            .managed = null,
+            .cli = app.config.settings_path,
+            .project_root = app.project_dir,
+            .home = home,
+            .cli_allow = app.config.allowed_tools,
+            .cli_deny = app.config.disallowed_tools,
+            .cli_dirs = app.config.add_dirs,
+        });
+        app.settings = ms;
+        app.permission_ctx.settings = &app.settings.?;
+        app.permission_ctx.match_ctx = .{
+            .cwd = app.cwd_abs orelse "",
+            .project_root = app.project_dir orelse (app.cwd_abs orelse ""),
+            .home = home orelse "",
+        };
+        @import("util/log.zig").info("permission", "settings loaded: {d} layer(s)", .{app.settings.?.layers.len});
+    }
+
+    /// 运行时追加一个 additionalDirectory(/add-dir 命令),重建 settings 使其立即生效。
+    /// dir 复制进 config.add_dirs(\x00 分隔累加),旧 settings deinit 后重 load。
+    pub fn addDirectory(app: *App, dir: []const u8) !void {
+        const new_list = if (app.config.add_dirs) |p|
+            try std.fmt.allocPrint(app.allocator, "{s}\x00{s}", .{ p, dir })
+        else
+            try app.allocator.dupe(u8, dir);
+        // 旧 add_dirs 若是 arena 分配则不 free(parseArgs 用 arena);这里统一不 free 旧值,
+        // 改为只更新指针。new_list 用 app.allocator,deinit 时不单独释放(随 arena/进程结束)。
+        app.config.add_dirs = new_list;
+
+        // 重建 settings
+        if (app.settings) |*s| s.deinit();
+        app.settings = null;
+        app.permission_ctx.settings = null;
+        try app.loadSettings();
     }
 
     /// 从 ~/.cc-zig/config.json 读 permission_rules 数组。失败仅 log，不影响启动。

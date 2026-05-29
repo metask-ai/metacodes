@@ -17,6 +17,15 @@ pub const Config = struct {
     prompt: ?[]const u8 = null,
     /// `--json`：headless 下用 NDJSON 事件流输出，便于 CI/脚本消费。
     json_output: bool = false,
+    /// `--settings <path>`:显式 settings 文件(CLI 层,优先级仅次于 managed)。
+    settings_path: ?[]const u8 = null,
+    /// `--allowedTools "Tool,Tool(spec),..."`:逗号分隔,注入 CLI 层 allow。
+    allowed_tools: ?[]const u8 = null,
+    /// `--disallowedTools "..."`:逗号分隔,注入 CLI 层 deny。
+    disallowed_tools: ?[]const u8 = null,
+    /// `--add-dir <path>`(可重复):额外可读写目录,注入 additionalDirectories。
+    /// 多个用 `\x00` 分隔拼一串(parseArgs 累加)。
+    add_dirs: ?[]const u8 = null,
 };
 
 /// 权限模式

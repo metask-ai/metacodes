@@ -16,6 +16,11 @@ pub const Paths = struct {
     project_root: ?[]const u8 = null,
     /// HOME(用于 ~/.claude/settings.json),可空则取 $HOME
     home: ?[]const u8 = null,
+    /// CLI inline 规则(--allowedTools / --disallowedTools / --add-dir),逗号分隔。
+    cli_allow: ?[]const u8 = null,
+    cli_deny: ?[]const u8 = null,
+    /// --add-dir 多值,用 \x00 分隔。
+    cli_dirs: ?[]const u8 = null,
 };
 
 /// 加载所有 5 层,聚合返回。caller 负责 deinit。
@@ -23,6 +28,9 @@ pub fn load(alloc: std.mem.Allocator, paths: Paths) !settings.MergedSettings {
     var layers: std.ArrayList(settings.Layer) = .empty;
     errdefer {
         for (layers.items) |L| {
+            for (L.allow) |r| alloc.free(r.raw);
+            for (L.ask) |r| alloc.free(r.raw);
+            for (L.deny) |r| alloc.free(r.raw);
             alloc.free(L.allow);
             alloc.free(L.ask);
             alloc.free(L.deny);
@@ -35,6 +43,12 @@ pub fn load(alloc: std.mem.Allocator, paths: Paths) !settings.MergedSettings {
     // 顺序:managed 最高优先(放第一,但 evaluate 按 deny→allow→ask 走,
     //       deny 在哪一层都先扫,所以放第一只对 allow/ask 决胜有意义)
     try maybePushFile(alloc, &layers, .managed, defaultManagedPath(paths));
+
+    // CLI inline layer(--allowedTools/--disallowedTools/--add-dir)在 --settings 文件之前
+    if (paths.cli_allow != null or paths.cli_deny != null or paths.cli_dirs != null) {
+        const L = try settings.buildInlineLayer(alloc, .cli, paths.cli_allow, null, paths.cli_deny, paths.cli_dirs);
+        try layers.append(alloc, L);
+    }
     try maybePushFile(alloc, &layers, .cli, paths.cli);
 
     if (paths.project_root) |root| {

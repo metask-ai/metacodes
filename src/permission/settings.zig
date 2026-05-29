@@ -265,6 +265,69 @@ fn collectArray(
     }
 }
 
+/// 从逗号分隔的 CLI 字符串构建一个 Layer。
+/// allow_csv/ask_csv/deny_csv/dirs_csv 任一为 null/空就跳过。
+/// 用于 --allowedTools / --disallowedTools / --add-dir。
+pub fn buildInlineLayer(
+    alloc: std.mem.Allocator,
+    source: Source,
+    allow_csv: ?[]const u8,
+    ask_csv: ?[]const u8,
+    deny_csv: ?[]const u8,
+    dirs_nul: ?[]const u8,
+) !Layer {
+    var allow_l: std.ArrayList(Rule) = .empty;
+    errdefer allow_l.deinit(alloc);
+    var ask_l: std.ArrayList(Rule) = .empty;
+    errdefer ask_l.deinit(alloc);
+    var deny_l: std.ArrayList(Rule) = .empty;
+    errdefer deny_l.deinit(alloc);
+    var dirs_l: std.ArrayList([]const u8) = .empty;
+    errdefer dirs_l.deinit(alloc);
+
+    try collectCsv(alloc, allow_csv, ',', source, &allow_l);
+    try collectCsv(alloc, ask_csv, ',', source, &ask_l);
+    try collectCsv(alloc, deny_csv, ',', source, &deny_l);
+
+    if (dirs_nul) |d| {
+        var it = std.mem.splitScalar(u8, d, 0);
+        while (it.next()) |seg| {
+            const t = std.mem.trim(u8, seg, " \t");
+            if (t.len == 0) continue;
+            try dirs_l.append(alloc, try alloc.dupe(u8, t));
+        }
+    }
+
+    return Layer{
+        .source = source,
+        .allow = try allow_l.toOwnedSlice(alloc),
+        .ask = try ask_l.toOwnedSlice(alloc),
+        .deny = try deny_l.toOwnedSlice(alloc),
+        .additional_directories = try dirs_l.toOwnedSlice(alloc),
+    };
+}
+
+fn collectCsv(
+    alloc: std.mem.Allocator,
+    csv: ?[]const u8,
+    sep: u8,
+    source: Source,
+    out: *std.ArrayList(Rule),
+) !void {
+    const s = csv orelse return;
+    var it = std.mem.splitScalar(u8, s, sep);
+    while (it.next()) |seg| {
+        const t = std.mem.trim(u8, seg, " \t");
+        if (t.len == 0) continue;
+        const raw = try alloc.dupe(u8, t);
+        const spec = rule_spec.parseRule(raw) catch {
+            alloc.free(raw);
+            continue;
+        };
+        try out.append(alloc, .{ .raw = raw, .spec = spec, .source = source });
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
