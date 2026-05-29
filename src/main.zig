@@ -26,6 +26,7 @@ pub const skills_tool = @import("skills/tool.zig");
 pub const skills_discovery = @import("skills/discovery.zig");
 pub const active_skill = @import("skills/active.zig");
 pub const permission = @import("permission.zig");
+pub const permission_rule_spec = @import("permission/rule_spec.zig");
 pub const agents_def = @import("agents/def.zig");
 pub const agents_set = @import("agents/set.zig");
 pub const agents_filter = @import("agents/filter.zig");
@@ -143,6 +144,7 @@ test {
     _ = &@import("client.zig");
     _ = &@import("tools.zig");
     _ = &@import("permission.zig");
+    _ = &@import("permission/rule_spec.zig");
     _ = &@import("core/message.zig");
     _ = &@import("core/conversation.zig");
     _ = &@import("core/agent_loop.zig");
