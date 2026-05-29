@@ -1,15 +1,77 @@
-//! 用户交互占位（prompt 模式的 y/n/A/q）。
+//! 用户交互:权限询问(prompt 模式的 yes/always/no/don't-ask)。
 //!
-//! 现阶段保留最简实现：从 stdin 读一个字节，`y`/`Y` → 允许，其他拒绝。
-//! 完整的 y/n/A(always)/q(quit) + TTY detection + 非 TTY 默认行为留给 M4 + 沙箱。
+//! TTY 下走 TUI 对话框(tui/dialog/permission.zig);非 TTY 退回最简文字 prompt。
 //!
-//! TODO(sandbox): 加上 RuleSet 动态追加（A = 写入 ruleset）、非 tty 默认策略、历史记忆。
+//! "Yes always" / "Don't ask again" 的 session 级记忆:本模块用一个进程级 SessionRules
+//! 暂存(同 tool_name 不再问)。完整 settings.local.json 持久化由 App 层做(它知道文件路径)。
 
 const std = @import("std");
 const category = @import("category.zig");
+const dialog = @import("../repl/tui/dialog/permission.zig");
+const theme_mod = @import("../repl/tui/theme.zig");
+const term = @import("../repl/tui/term.zig");
+
+/// Session 级权限记忆:always-allow / session-deny 的工具名集合。
+/// 进程级(单 session),不持久化。键是 tool_name(值语义拷贝,固定上限避免无限增长)。
+const MAX_REMEMBERED = 64;
+var g_always_allow: [MAX_REMEMBERED][]const u8 = undefined;
+var g_always_allow_count: usize = 0;
+var g_session_deny: [MAX_REMEMBERED][]const u8 = undefined;
+var g_session_deny_count: usize = 0;
+var g_buf: [MAX_REMEMBERED * 2][64]u8 = undefined; // 工具名拷贝存储
+var g_buf_used: usize = 0;
+
+fn remember(list: *[MAX_REMEMBERED][]const u8, count: *usize, name: []const u8) void {
+    if (count.* >= MAX_REMEMBERED) return;
+    if (g_buf_used >= g_buf.len or name.len > 64) return;
+    const slot = &g_buf[g_buf_used];
+    g_buf_used += 1;
+    @memcpy(slot[0..name.len], name);
+    list[count.*] = slot[0..name.len];
+    count.* += 1;
+}
+
+fn contains(list: []const []const u8, name: []const u8) bool {
+    for (list) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
 
 /// 阻塞式询问用户。返回 true = 允许。
+/// 先查 session 记忆;否则 TTY 走对话框,非 TTY 走文字。
 pub fn ask(tool_name: []const u8, args: []const u8) !bool {
+    // session 记忆优先
+    if (contains(g_always_allow[0..g_always_allow_count], tool_name)) return true;
+    if (contains(g_session_deny[0..g_session_deny_count], tool_name)) return false;
+
+    // TTY → 对话框
+    if (term.isatty(0)) {
+        const cap = term.detectFromEnv(1);
+        const th = theme_mod.select(.auto, cap);
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        if (dialog.prompt(arena.allocator(), th, tool_name, args)) |choice| {
+            switch (choice) {
+                .allow_once => return true,
+                .allow_always => {
+                    remember(&g_always_allow, &g_always_allow_count, tool_name);
+                    return true;
+                },
+                .deny_once => return false,
+                .deny_tool_session => {
+                    remember(&g_session_deny, &g_session_deny_count, tool_name);
+                    return false;
+                },
+            }
+        }
+        // dialog 返回 null(意外非 TTY)→ 落到文字
+    }
+
+    // 非 TTY 退回文字 prompt
+    return askText(tool_name, args);
+}
+
+/// 最简文字 prompt(非 TTY / dialog 不可用时)。
+fn askText(tool_name: []const u8, args: []const u8) !bool {
     const risk = category.getRiskLevel(tool_name);
     const risk_str: []const u8 = switch (risk) {
         .low => "LOW",
@@ -24,4 +86,13 @@ pub fn ask(tool_name: []const u8, args: []const u8) !bool {
     const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch return false;
     if (n > 0 and (buf[0] == 'y' or buf[0] == 'Y')) return true;
     return false;
+}
+
+test "ask 不崩(非 tty 路径覆盖在集成测试)" {
+    // session 记忆 helper 单测
+    g_always_allow_count = 0;
+    g_buf_used = 0;
+    remember(&g_always_allow, &g_always_allow_count, "Bash");
+    try std.testing.expect(contains(g_always_allow[0..g_always_allow_count], "Bash"));
+    try std.testing.expect(!contains(g_always_allow[0..g_always_allow_count], "Write"));
 }
