@@ -167,10 +167,19 @@ pub fn run(
         var api_messages = try buildApiMessages(conversation, allocator);
         defer freeApiMessages(&api_messages, allocator);
 
-        // 2. 发送流式请求（abortable 版本：abort 通过 EventIterator 检查点传播）
+        // 2. Skill 激活时硬隔离工具池(SKILL_DESIGN §11 Stage B.8):
+        //    根据 permission_ctx.active_skill 的 allowed/disallowed 裁 tool_defs,
+        //    模型在请求体里看不见被禁工具,避免反复尝试调用。
+        //    与 decision.check 的 active_skill 权限检查互补(双保险)。
+        const pool_filter = @import("../skills/tool_pool_filter.zig");
+        const filtered_pool = pool_filter.filterToolDefs(allocator, tool_defs, permission_ctx.active_skill) catch null;
+        defer pool_filter.freeFiltered(allocator, filtered_pool);
+        const effective_tool_defs = if (filtered_pool) |fp| fp else tool_defs;
+
+        // 3. 发送流式请求（abortable 版本：abort 通过 EventIterator 检查点传播）
         //    带 opts.model_override:subagent 用自己的 model(如 Explore=haiku);
         //    null 时 sendMessageStreamFull 用 api_client.model(父 model)。
-        var stream = api_client.sendMessageStreamFull(api_messages.items, opts.system_prompt, tool_defs, opts.abort, opts.model_override) catch |err| {
+        var stream = api_client.sendMessageStreamFull(api_messages.items, opts.system_prompt, effective_tool_defs, opts.abort, opts.model_override) catch |err| {
             log.err("agent", "sendMessageStream failed turn={d}: {s}", .{ turns + 1, @errorName(err) });
             return .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls };
         };

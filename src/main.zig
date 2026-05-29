@@ -212,6 +212,7 @@ test {
     _ = &@import("mcp/registry_bridge.zig");
     _ = &@import("tools/dynamic.zig");
     _ = &@import("skills/skill.zig");
+    _ = &@import("skills/tool_pool_filter.zig");
     _ = &@import("skills/render.zig");
     _ = &@import("skills/discovery.zig");
     _ = &@import("agents/def.zig");

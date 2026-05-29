@@ -6,8 +6,12 @@
 //! - allowed_tools:激活时绕过 ask/prompt 直接 allow。支持精确名 + Bash(prefix) 形式。
 //! - disallowed_tools:激活时被 dispatch 拒绝(返 ToolBlockedBySkill)。支持同样的语法。
 //!
-//! 设计选择:**不预先裁剪 tool_defs**(不通知模型工具被去掉),只在 dispatch 层挡。
-//! 理由:模型在激活前已经"看到了"工具,中途消失更困惑;告诉它"被 skill 禁了"更清晰。
+//! 与 tool_pool_filter.zig 双保险(SKILL_DESIGN §11 Stage B.8,硬隔离):
+//! - **池裁剪**(agent_loop 调 tool_pool_filter.filterToolDefs):模型在请求体里
+//!   看不见被禁工具 → 不会反复尝试。
+//! - **权限检查**(本模块 isAllowed/isDisallowed 给 decision.check):即便上游绕过
+//!   池裁剪走 dispatch 直入,仍被拦。
+//! 池裁剪为主、权限为辅,语义对齐 Claude Code 官方 `allowed-tools`/`disallowed-tools`。
 
 const std = @import("std");
 const log = @import("../util/log.zig");
