@@ -603,7 +603,7 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
             .open_transcript => {
                 input.restoreMode(fd, orig); // 暂退 raw mode 让 viewer 自管
                 const tv = @import("transcript_viewer.zig");
-                tv.run(fd, allocator, &app.conversation, termRows()) catch {};
+                tv.runWithTheme(fd, allocator, &app.conversation, termRows(), app.theme) catch {};
                 _ = input.enterRawMode(fd);
                 std.debug.print("> ", .{});
                 try redrawLine(editor.view(), editor.cursor);

@@ -277,3 +277,15 @@ test "VISUAL demo: pager(TUI_DEMO=1)" {
     defer testing.allocator.free(s);
     std.debug.print("\n{s}\n", .{s});
 }
+
+test "VISUAL demo: pager 真 IO(TUI_DEMO=pager)" {
+    if (std.c.getenv("TUI_DEMO_PAGER") == null) return error.SkipZigTest;
+    const th = theme_mod.dark;
+    var content_buf: std.ArrayList(u8) = .empty;
+    defer content_buf.deinit(testing.allocator);
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        try content_buf.print(testing.allocator, "Line {d}: hello world\n", .{i});
+    }
+    try page(testing.allocator, th, content_buf.items, .{});
+}

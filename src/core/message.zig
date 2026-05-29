@@ -22,6 +22,9 @@ pub const Block = union(enum) {
     text: []const u8,
     tool_use: ToolUse,
     tool_result: ToolResult,
+    /// Extended thinking 内容(对齐 Claude 3.7+)。content_block_start type="thinking"
+    /// + thinking_delta 累积。展示走 tui/widget/thinking.zig。
+    thinking: []const u8,
 
     pub fn deinit(self: Block, allocator: std.mem.Allocator) void {
         switch (self) {
@@ -35,6 +38,7 @@ pub const Block = union(enum) {
                 allocator.free(tr.tool_use_id);
                 allocator.free(tr.content);
             },
+            .thinking => |t| allocator.free(t),
         }
     }
 };

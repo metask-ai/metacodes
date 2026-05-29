@@ -188,6 +188,11 @@ pub const Writer = struct {
                     try aw.writer.print(",\"is_error\":{s}", .{if (tr.is_error) "true" else "false"});
                     try aw.writer.writeAll("}");
                 },
+                .thinking => |t| {
+                    try aw.writer.writeAll("{\"type\":\"thinking\",\"thinking\":");
+                    try std.json.Stringify.encodeJsonString(t, .{}, &aw.writer);
+                    try aw.writer.writeAll("}");
+                },
             }
         }
         try aw.writer.writeAll("]}\n");

@@ -61,6 +61,7 @@ pub const Conversation = struct {
                 .text => |t| total += estimateTokens(t),
                 .tool_use => |tu| total += estimateTokens(tu.input) + estimateTokens(tu.name),
                 .tool_result => |tr| total += estimateTokens(tr.content),
+                .thinking => |t| total += estimateTokens(t),
             };
         }
         return total;

@@ -20,6 +20,11 @@ const Conversation = @import("../core/conversation.zig").Conversation;
 /// 把整个对话渲染成可显示的行(owned;caller free 每行 + 数组)。
 /// 每条 message 前加 role 头;tool_use/tool_result 用缩进 + 标记区分。
 pub fn renderToLines(allocator: std.mem.Allocator, conv: *const Conversation) ![][]u8 {
+    return renderToLinesWithTheme(allocator, conv, @import("tui/theme.zig").dark);
+}
+
+pub fn renderToLinesWithTheme(allocator: std.mem.Allocator, conv: *const Conversation, th: @import("tui/theme.zig").Theme) ![][]u8 {
+    const tool_card = @import("tui/widget/tool_card.zig");
     var lines = std.ArrayList([]u8).empty;
     errdefer {
         for (lines.items) |l| allocator.free(l);
@@ -37,14 +42,33 @@ pub fn renderToLines(allocator: std.mem.Allocator, conv: *const Conversation) ![
             switch (b) {
                 .text => |t| try appendWrapped(allocator, &lines, t, "  "),
                 .tool_use => |tu| {
-                    const head = try std.fmt.allocPrint(allocator, "  \x1b[35m⚙ {s}\x1b[0m \x1b[2m{s}\x1b[0m", .{ tu.name, tu.input });
-                    try lines.append(allocator, head);
+                    // tool_card.renderStart 输出多行字符串(2 行带 ANSI);split 进 lines。
+                    const card = try tool_card.renderStart(allocator, th, tu.name, tu.input);
+                    defer allocator.free(card);
+                    var pos: usize = 0;
+                    while (pos < card.len) {
+                        const eol = std.mem.indexOfScalarPos(u8, card, pos, '\n') orelse card.len;
+                        if (eol > pos) {
+                            // 加 2 空格缩进
+                            const indented = try std.fmt.allocPrint(allocator, "  {s}", .{card[pos..eol]});
+                            try lines.append(allocator, indented);
+                        }
+                        pos = eol + 1;
+                    }
                 },
                 .tool_result => |tr| {
-                    const marker = if (tr.is_error) "\x1b[31m✗ result\x1b[0m" else "\x1b[2m✓ result\x1b[0m";
-                    const head = try std.fmt.allocPrint(allocator, "  {s}", .{marker});
+                    // 状态符 + 分隔线 + 折叠输出(最多 5 行)
+                    const marker_color = if (tr.is_error) th.danger else th.success;
+                    const marker_icon = if (tr.is_error) th.icon_cross else th.icon_check;
+                    const marker_line = try std.fmt.allocPrint(allocator, "  {s}{s} result{s}", .{ marker_color, marker_icon, th.reset });
+                    try lines.append(allocator, marker_line);
+                    try appendWrappedFolded(allocator, &lines, tr.content, "    ", th.dim, th.reset, 5);
+                },
+                .thinking => |t| {
+                    // 思考块:头标 + 折叠内容(前 3 行)
+                    const head = try std.fmt.allocPrint(allocator, "  {s}{s} thinking{s}", .{ th.role_thinking, th.icon_thinking, th.reset });
                     try lines.append(allocator, head);
-                    try appendWrapped(allocator, &lines, tr.content, "    \x1b[2m");
+                    try appendWrappedFolded(allocator, &lines, t, "    ", th.dim, th.reset, 3);
                 },
             }
         }
@@ -59,6 +83,37 @@ fn appendWrapped(allocator: std.mem.Allocator, lines: *std.ArrayList([]u8), text
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |seg| {
         const line = try std.fmt.allocPrint(allocator, "{s}{s}\x1b[0m", .{ prefix, seg });
+        try lines.append(allocator, line);
+    }
+}
+
+/// 带折叠的 wrapped:超过 max_lines 后,后续行省略,加 "… N more lines"。
+fn appendWrappedFolded(
+    allocator: std.mem.Allocator,
+    lines: *std.ArrayList([]u8),
+    text: []const u8,
+    prefix: []const u8,
+    color: []const u8,
+    reset: []const u8,
+    max_lines: u16,
+) !void {
+    // 先算总行数
+    var total: u32 = 0;
+    {
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |_| total += 1;
+    }
+    var emitted: u32 = 0;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |seg| {
+        if (emitted >= max_lines) break;
+        const line = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ prefix, color, seg, reset });
+        try lines.append(allocator, line);
+        emitted += 1;
+    }
+    if (total > max_lines) {
+        const more = total - max_lines;
+        const line = try std.fmt.allocPrint(allocator, "{s}{s}… {d} more lines{s}", .{ prefix, color, more, reset });
         try lines.append(allocator, line);
     }
 }
@@ -81,7 +136,11 @@ pub fn freeLines(allocator: std.mem.Allocator, lines: [][]u8) void {
 /// 全屏交互循环。fd = stdin。rows = 终端高度(留 1 行给提示)。
 /// 进 alt screen → 渲染 → 处理键 → 退出恢复。
 pub fn run(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const Conversation, rows: usize) !void {
-    const lines = try renderToLines(allocator, conv);
+    return runWithTheme(fd, allocator, conv, rows, @import("tui/theme.zig").dark);
+}
+
+pub fn runWithTheme(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const Conversation, rows: usize, th: @import("tui/theme.zig").Theme) !void {
+    const lines = try renderToLinesWithTheme(allocator, conv, th);
     defer freeLines(allocator, lines);
     const prompts = try userPromptLineIndices(allocator, lines);
     defer allocator.free(prompts);

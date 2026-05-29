@@ -455,9 +455,15 @@ fn buildApiMessages(
     }
 
     for (conversation.messages.items) |m| {
-        const contents = try allocator.alloc(types.ApiContent, m.blocks.len);
-        for (m.blocks, 0..) |b, i| {
-            contents[i] = switch (b) {
+        // thinking block 不回 API(模型自己产);先算实际要回的 block 数
+        var n_actual: usize = 0;
+        for (m.blocks) |b| {
+            if (@as(std.meta.Tag(msg.Block), b) != .thinking) n_actual += 1;
+        }
+        const contents = try allocator.alloc(types.ApiContent, n_actual);
+        var idx: usize = 0;
+        for (m.blocks) |b| {
+            const c: types.ApiContent = switch (b) {
                 .text => |t| .{ .text = t }, // 借用，不 dupe——lifetime 绑定 conversation
                 .tool_use => |tu| .{ .tool_use = .{ .id = tu.id, .name = tu.name, .input = tu.input } },
                 .tool_result => |tr| .{ .tool_result = .{
@@ -465,7 +471,10 @@ fn buildApiMessages(
                     .content = tr.content,
                     .is_error = tr.is_error,
                 } },
+                .thinking => continue, // 不发回 API
             };
+            contents[idx] = c;
+            idx += 1;
         }
         try out.append(allocator, .{ .role = m.role, .content = contents });
     }
