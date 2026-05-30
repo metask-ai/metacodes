@@ -5,7 +5,13 @@
 //! 2. 检查 disable-model-invocation:若 skill 标了 true 且当前是模型自主调用(非 explicit)→ 拒绝
 //! 3. 渲染 body(render.zig):字符串替换 + bash 注入
 //! 4. 激活权限态(ctx.activate_skill_fn):allowed-tools 直接 allow / disallowed-tools 直接 deny
-//! 5. 返回 `# Skill: <name>\n\n<rendered_body>` 作为 tool_result
+//! 5. 按 context 分叉:
+//!    - inline(default):返回 `# Skill: <name>\n\n<rendered_body>` 内联到主对话
+//!    - fork:用 rendered body 当 prompt spawn 一个 subagent(复用 Agent 工具同路径),
+//!      `agent` 字段选 subagent_type,`model` 字段切模型,返回 subagent 的 final_text。
+//!      注意:这是 fresh-context fork(不继承主对话历史);带历史继承 + 强制后台的
+//!      真 fork(CLAUDE_CODE_FORK_SUBAGENT)是 P3,见 doc/SKILL_DESIGN.md 七节。
+//!      spawn 依赖缺失(无 api_client/tool_defs/permission_ctx 或超深)时降级回 inline + log warn。
 
 const std = @import("std");
 const common = @import("../tools/common.zig");
@@ -13,6 +19,10 @@ const ToolContext = @import("../tools/context.zig").ToolContext;
 const DynRegistry = @import("../tools/dynamic.zig").DynRegistry;
 const SkillSet = @import("skill.zig").SkillSet;
 const render_mod = @import("render.zig");
+const agent_tool = @import("../tools/agent.zig");
+const subagent = @import("../core/subagent.zig");
+const preload_mod = @import("../agents/preload.zig");
+const log = @import("../util/log.zig");
 
 pub fn registerSkillTool(registry: *DynRegistry, set: *SkillSet) !void {
     const required = [_][]const u8{"name"};
@@ -60,16 +70,27 @@ fn execute(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anye
     const rendered = try render_mod.renderBody(ctx.allocator, skill.body, opts);
     defer ctx.allocator.free(rendered);
 
-    // 激活权限态(若 setter 已 wire)
+    // 激活权限态(若 setter 已 wire)。inline 与 fork 都需要(fork 的 subagent 也复用同回调)。
     if (ctx.activate_skill_fn) |setter_fn| {
         if (ctx.activate_skill_state) |state| {
             setter_fn(state, skill.name, skill.allowed_tools, skill.disallowed_tools) catch |err| {
-                @import("../util/log.zig").warn("skill", "activate state failed: {s}", .{@errorName(err)});
+                log.warn("skill", "activate state failed: {s}", .{@errorName(err)});
             };
         }
     }
 
-    // 组装最终回复
+    // context: fork → 用 rendered body 当 prompt spawn subagent。
+    // 依赖任一缺失或超深 → 降级 inline(下方),绝不静默吞掉。
+    if (skill.context == .fork) {
+        if (tryForkSpawn(ctx, skill, rendered)) |forked| {
+            return forked; // owned by ctx.allocator
+        } else |err| {
+            log.warn("skill", "fork spawn unavailable for '{s}' ({s}); falling back to inline", .{ skill.name, @errorName(err) });
+            // 落到下方 inline 组装
+        }
+    }
+
+    // inline(default,或 fork 降级):组装最终回复
     var out: std.Io.Writer.Allocating = .init(ctx.allocator);
     defer out.deinit();
     try out.writer.print("# Skill: {s}\n\n", .{skill.name});
@@ -92,6 +113,77 @@ fn execute(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anye
     }
     try out.writer.writeAll(rendered);
     return try out.toOwnedSlice();
+}
+
+/// context: fork 分支:用 rendered body 当 prompt spawn 一个 fresh-context subagent。
+/// 返回 subagent 的 final_text(包一层 `# Skill: <name> (forked)` 头)。
+/// 任一 spawn 依赖缺失/超深 → 返回 error,调用方降级回 inline。
+fn tryForkSpawn(
+    ctx: *const ToolContext,
+    skill: *const @import("skill.zig").Skill,
+    rendered: []const u8,
+) anyerror![]u8 {
+    // spawn 依赖:与 Agent 工具同前置(api_client / tool_defs / permission_ctx)。
+    const api_client = ctx.api_client orelse return error.ForkUnavailable;
+    const tool_defs = ctx.tool_defs orelse return error.ForkUnavailable;
+    const perm = ctx.permission_ctx orelse return error.ForkUnavailable;
+    if (ctx.agent_depth >= agent_tool.MAX_AGENT_DEPTH) return error.AgentDepthExceeded;
+
+    // subagent def:skill.agent 非空时查 AgentSet;空 → general-purpose 兜底。
+    var def_opt: ?*const @import("../agents/def.zig").AgentDef = null;
+    if (ctx.agents) |as| {
+        if (skill.agent.len > 0) def_opt = as.find(skill.agent);
+        if (def_opt == null) def_opt = as.find("general-purpose");
+    }
+
+    // system prompt:def 存在 → buildSubagentContext;否则兜底(与 agent.zig 一致)。
+    var sys_prompt: []const u8 = "You are a subagent. Complete the task and return a concise summary.\n";
+    var sys_prompt_owned: ?[]u8 = null;
+    defer if (sys_prompt_owned) |p| ctx.allocator.free(p);
+    if (def_opt) |d| {
+        const sp = try preload_mod.buildSubagentContext(ctx.allocator, d, .{
+            .project_dir = ctx.project_dir,
+            .parent_model = ctx.parent_model,
+            .session_id = ctx.session_id,
+            .skills = ctx.skills,
+            .skip_codebase_context = preload_mod.shouldSkipCodebaseContext(d.name),
+            .abort = ctx.abort,
+        });
+        sys_prompt_owned = sp;
+        sys_prompt = sp;
+    }
+
+    // model override:skill.model 经 resolveModelAlias("inherit"/空 → null)。
+    const model_override: ?[]const u8 = blk: {
+        if (skill.model.len > 0 and !std.mem.eql(u8, skill.model, "inherit"))
+            break :blk agent_tool.resolveModelAlias(skill.model);
+        break :blk null;
+    };
+
+    const result = try subagent.spawnAgent(
+        ctx.allocator,
+        api_client,
+        tool_defs,
+        perm,
+        ctx.abort,
+        rendered, // skill body 当 prompt
+        .{
+            .system_prompt = sys_prompt,
+            .agent_depth = ctx.agent_depth + 1,
+            .dyn_registry = ctx.dyn_registry,
+            .model_override = model_override,
+            .activate_skill_state = ctx.activate_skill_state,
+            .activate_skill_fn = ctx.activate_skill_fn,
+            .project_dir = ctx.project_dir,
+        },
+    );
+    defer result.deinit();
+
+    return try std.fmt.allocPrint(
+        ctx.allocator,
+        "# Skill: {s} (forked)\n\n{s}",
+        .{ skill.name, result.final_text },
+    );
 }
 
 /// 从 tool args 抽 arguments 列表。

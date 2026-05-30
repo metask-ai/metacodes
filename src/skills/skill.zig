@@ -49,7 +49,8 @@ pub const Skill = struct {
     arguments: []const []const u8,
     /// 仅人显式 /name 才能调用,模型不能自动触发。
     disable_model_invocation: bool,
-    /// inline(default)在主对话激活;fork 在 subagent 独立跑(未实现 = 实际仍 inline)。
+    /// inline(default)在主对话激活;fork 在 subagent 独立跑(fresh context,
+    /// 用 skill body 当 prompt;不继承主对话历史 = 那是 P3,见 SKILL_DESIGN 七节)。
     context: ExecContext,
     /// 配合 context=fork 指定 subagent 类型(空 = general-purpose)。
     agent: []const u8,

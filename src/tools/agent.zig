@@ -25,7 +25,8 @@ const filter_mod = @import("../agents/filter.zig");
 
 /// 最深嵌套层数。parent=0,孙=2;>= 这个值就拒绝 spawn。
 /// 嵌套 subagent 是允许的(子 agent 也能调 Task),但深度有限保护栈。
-const MAX_AGENT_DEPTH: u8 = 3;
+/// pub:skills/tool.zig 的 context:fork 分支复用同一深度上限。
+pub const MAX_AGENT_DEPTH: u8 = 3;
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // Precondition: depth guard
@@ -163,7 +164,8 @@ fn mapPermissionMode(mode: @import("../agents/def.zig").PermissionMode) @import(
 /// 短名 → 具体 model ID。"haiku" → "claude-3-5-haiku-20241022",
 /// "sonnet"/"opus" 同理映射到当前主力版本。已是全名(含 "claude-")则原样返回。
 /// 留 borrowed 引用,不分配(借 def.model 或 args 的字符串内存)。
-fn resolveModelAlias(name: []const u8) []const u8 {
+/// pub:skills/tool.zig 的 context:fork 分支解析 skill.model 字段时复用。
+pub fn resolveModelAlias(name: []const u8) []const u8 {
     if (std.mem.startsWith(u8, name, "claude-")) return name; // 已是全名
     if (std.mem.eql(u8, name, "haiku")) return "claude-3-5-haiku-20241022";
     if (std.mem.eql(u8, name, "sonnet")) return "claude-sonnet-4-20250514";
