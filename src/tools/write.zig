@@ -1,13 +1,23 @@
 const std = @import("std");
 const common = @import("common.zig");
 const security = @import("security.zig");
+const util_json = @import("../util/json.zig");
 const read_state = @import("../core/read_state.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
-    const path = common.extractJsonArg(args, "path") orelse return error.MissingPath;
-    const content = common.extractJsonArg(args, "content") orelse return error.MissingContent;
+    // 接受 `file_path`(Claude Code / 真 API 标准字段,也是本项目 descriptions.zig 宣称的)
+    // 与历史 `path` 两种字段名(向后兼容)。
+    const path_escaped = common.extractJsonArg(args, "file_path") orelse
+        common.extractJsonArg(args, "path") orelse return error.MissingPath;
+    const content_escaped = common.extractJsonArg(args, "content") orelse return error.MissingContent;
+    // unescape:content 里的 `\n`/`\t`/`\"`/`\uXXXX` 要还原成真实字节再落盘
+    // (否则模型写的多行文件会变成一行字面 `\n`)。path 一般无转义但 unescape 也安全。
+    const path = try util_json.unescapeString(path_escaped, allocator);
+    defer allocator.free(path);
+    const content = try util_json.unescapeString(content_escaped, allocator);
+    defer allocator.free(content);
     if (path.len == 0) return error.EmptyPath;
     try security.validateNoTraversal(path);
 

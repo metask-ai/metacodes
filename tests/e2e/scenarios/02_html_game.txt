@@ -1,0 +1,5 @@
+在当前目录创建一个名为 snake-game 的项目目录,并在里面写一份简短的 DESIGN.md,描述一个贪吃蛇游戏的玩法、控制和计分。
+---
+根据 snake-game/DESIGN.md 的设计,在 snake-game 目录里开发一个可直接在浏览器打开运行的 index.html。要求:用 HTML5 canvas 渲染,WASD 或方向键控制蛇移动,吃到食物加分并变长,撞墙或撞到自己则游戏结束并显示分数,画面里实时显示当前得分。把 HTML、CSS、JavaScript 都放在这一个 index.html 文件里,确保打开即玩。
+---
+读一下你刚写的 snake-game/index.html,检查游戏循环、碰撞检测、计分逻辑有没有明显问题,如果有就直接修复。

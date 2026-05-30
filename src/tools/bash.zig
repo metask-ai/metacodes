@@ -2,6 +2,7 @@ const std = @import("std");
 const common = @import("common.zig");
 const security = @import("security.zig");
 const util_time = @import("../util/time.zig");
+const util_json = @import("../util/json.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
 /// nowMs：毫秒时间戳，复用 util/time.zig
@@ -18,7 +19,13 @@ pub const AUTO_BACKGROUND_MS: u64 = 15_000;
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
-    const raw_command = common.extractJsonArg(args, "command") orelse return error.MissingCommand;
+    const command_escaped = common.extractJsonArg(args, "command") orelse return error.MissingCommand;
+    if (command_escaped.len == 0) return error.EmptyCommand;
+    // extractJsonArg 返回的是【含原始 JSON 转义】的串(如 `>`→`>`、换行→`\n`)。
+    // 必须 unescape 后才能交给 /bin/sh,否则重定向 `>`、换行等会被当字面量丢失。
+    // (对齐 edit.zig 对 old_string/new_string 的处理)
+    const raw_command = try util_json.unescapeString(command_escaped, allocator);
+    defer allocator.free(raw_command);
     if (raw_command.len == 0) return error.EmptyCommand;
     try security.validateBashCommand(raw_command);
 

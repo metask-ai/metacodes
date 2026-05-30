@@ -643,6 +643,12 @@ pub const EventIterator = struct {
     /// `content_block_stop` 时整体 emit 为 `.tool_use_start`（带完整 input_json）并清空。
     pending_tool: ?PendingTool = null,
 
+    /// 单行 SSE 超出 reader buffer(8KB)时的溢出累积缓冲。
+    /// 正常短行走 takeDelimiter 快路径,不碰这里;只有大 input_json_delta(写大文件
+    /// 时模型把整块 JSON 作为一条 >8KB 的 data 行推送)才走 streamDelimiterEnding 累积到此。
+    /// 复用同一 ArrayList,每次清空再用;deinit 时释放。修复 StreamTooLong bug。
+    line_overflow: std.ArrayList(u8) = .empty,
+
     const PendingTool = struct {
         id: []u8, // owned by iterator's allocator (从 next() 传入)
         name: []u8,
@@ -672,6 +678,36 @@ pub const EventIterator = struct {
             pt.input_buf.deinit(allocator);
             self.pending_tool = null;
         }
+        self.line_overflow.deinit(allocator);
+    }
+
+    /// 读一行(到 '\n',不含)。
+    /// 快路径:reader.takeDelimiter 直接借 reader buffer 里的 slice(短行,无分配)。
+    /// 慢路径:行超出 reader buffer(8KB)→ takeDelimiter 报 StreamTooLong,改用
+    ///   streamDelimiterEnding 把整行累积到 line_overflow(可增长),再吞掉分隔符。
+    /// 返回借用 slice(指向 reader buffer 或 self.line_overflow);null = EOF。
+    /// 修复:大 input_json_delta(写大文件)曾因 8KB 上限直接 StreamTooLong→RequestFailed。
+    fn takeLine(self: *EventIterator, allocator: std.mem.Allocator) !?[]const u8 {
+        if (self.reader.takeDelimiter('\n')) |line_opt| {
+            return line_opt; // 含 EOF→null 的快路径
+        } else |err| switch (err) {
+            error.StreamTooLong => {
+                // 慢路径:行比 reader buffer 长。用 Allocating writer 累积整行(可增长)。
+                self.line_overflow.clearRetainingCapacity();
+                var alloc_w: std.Io.Writer.Allocating = .fromArrayList(allocator, &self.line_overflow);
+                _ = self.reader.streamDelimiterEnding(&alloc_w.writer, '\n') catch |e| {
+                    self.line_overflow = alloc_w.toArrayList();
+                    self.logWarn("streamDelimiterEnding failed: {s}", .{@errorName(e)});
+                    return error.ReadFailed;
+                };
+                // streamDelimiterEnding 停在分隔符处(buffer 首字节是 '\n')或 EOF(buffer 空)。
+                // 若还有分隔符,吞掉它,让下次从下一行开始。
+                if (self.reader.bufferedLen() > 0) self.reader.toss(1);
+                self.line_overflow = alloc_w.toArrayList(); // 取回所有权
+                return self.line_overflow.items;
+            },
+            else => return err,
+        }
     }
 
     /// 读到下一个有语义的事件。跳过 ping / unknown / 空行 / 非 data 行。
@@ -684,8 +720,8 @@ pub const EventIterator = struct {
         while (true) {
             if (self.abort) |a| try a.throwIfAborted();
 
-            const line_opt = self.reader.takeDelimiter('\n') catch |err| {
-                self.logWarn("takeDelimiter failed: {s}", .{@errorName(err)});
+            const line_opt = self.takeLine(allocator) catch |err| {
+                self.logWarn("takeLine failed: {s}", .{@errorName(err)});
                 return err;
             };
             const line = line_opt orelse {
@@ -859,6 +895,27 @@ test "EventIterator: text_delta event" {
     const ev = (try it.next(std.testing.allocator)).?;
     defer ev.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("hi", ev.text_delta);
+}
+
+test "EventIterator: 超长 SSE 行(> reader buffer)不再 StreamTooLong" {
+    // 修复 Bug 3:大 input_json_delta/大 text 把一整条 data 行推成 >buffer。
+    // 用 Limited reader 给一个很小的 buffer(64B),构造一条远超它的行,
+    // 验证走 streamDelimiterEnding 累积路径、能完整读出、不报 StreamTooLong。
+    const a = std.testing.allocator;
+    const big = "x" ** 5000; // 5KB 文本,远超 64B buffer
+    const sse = "data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"" ++ big ++ "\"}}\n";
+
+    var src = std.Io.Reader.fixed(sse);
+    var small_buf: [64]u8 = undefined;
+    var limited = std.Io.Reader.limited(&src, .unlimited, &small_buf);
+
+    var it = EventIterator.init(&limited.interface);
+    defer it.deinit(a);
+    const ev = (try it.next(a)).?;
+    defer ev.deinit(a);
+    // text_delta 应完整拿到 5000 个 'x'
+    try std.testing.expectEqual(@as(usize, 5000), ev.text_delta.len);
+    try std.testing.expect(std.mem.indexOfNone(u8, ev.text_delta, "x") == null);
 }
 
 test "EventIterator: tool_use_start emitted on content_block_stop" {

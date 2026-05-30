@@ -1,0 +1,1 @@
+在当前目录创建一个名为 hello-test 的文件夹,在里面新建一个 hello.txt 文件,内容写一行:hello from cc-zig e2e。完成后用一句话确认。
