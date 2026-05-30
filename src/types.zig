@@ -17,6 +17,9 @@ pub const Config = struct {
     prompt: ?[]const u8 = null,
     /// `--json`：headless 下用 NDJSON 事件流输出，便于 CI/脚本消费。
     json_output: bool = false,
+    /// `--dump-prompt`：构造完 system prompt + 工具 defs 后打印到 stdout 并退出，
+    /// 不发网络、不需 API key。用于验证提示词×工具复刻。
+    dump_prompt: bool = false,
     /// `--settings <path>`:显式 settings 文件(CLI 层,优先级仅次于 managed)。
     settings_path: ?[]const u8 = null,
     /// `--allowedTools "Tool,Tool(spec),..."`:逗号分隔,注入 CLI 层 allow。

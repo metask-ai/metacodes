@@ -266,11 +266,25 @@ pub fn buildWithSkills(
 
 /// 完整版:skills section + subagents section。
 /// agents 为 null/空 → 不追加 subagent 章节。
+/// USING_TOOLS 段用静态全量版本(等价工具集齐全)。需要按工具集裁剪用 buildFull。
 pub fn buildWithSkillsAndAgents(
     allocator: std.mem.Allocator,
     model: []const u8,
     skills: ?*const @import("../skills/skill.zig").SkillSet,
     agents: ?*const @import("../agents/set.zig").AgentSet,
+) ![]u8 {
+    return buildFull(allocator, model, skills, agents, null);
+}
+
+/// 最完整版:额外接收 enabled_tool_names,让 # Using your tools 段按工具集动态裁剪
+/// (对应 cc getUsingYourToolsSection(enabledTools))。
+/// enabled_tool_names 为 null → 用全量静态 USING_TOOLS_SECTION(向后兼容)。
+pub fn buildFull(
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    skills: ?*const @import("../skills/skill.zig").SkillSet,
+    agents: ?*const @import("../agents/set.zig").AgentSet,
+    enabled_tool_names: ?[]const []const u8,
 ) ![]u8 {
     const env_section = try buildEnvSection(allocator, model);
     defer allocator.free(env_section);
@@ -281,21 +295,66 @@ pub fn buildWithSkillsAndAgents(
     const agents_section = if (agents) |a| try buildAgentsSection(allocator, a) else try allocator.dupe(u8, "");
     defer allocator.free(agents_section);
 
+    const using_tools_section = if (enabled_tool_names) |names|
+        try buildUsingToolsSection(allocator, names)
+    else
+        try allocator.dupe(u8, USING_TOOLS_SECTION);
+    defer allocator.free(using_tools_section);
+
     const sep = "\n\n";
     return try std.mem.concat(allocator, u8, &.{
         INTRO_SECTION,             sep,
         SYSTEM_SECTION,            sep,
         DOING_TASKS_SECTION,       sep,
         ACTIONS_SECTION,           sep,
-        USING_TOOLS_SECTION,       sep,
+        using_tools_section,       sep,
         TONE_SECTION,              sep,
         OUTPUT_EFFICIENCY_SECTION, sep,
-        env_section,
-        if (skills_section.len > 0) sep else "",
-        skills_section,
-        if (agents_section.len > 0) sep else "",
+        env_section,               if (skills_section.len > 0) sep else "",
+        skills_section,            if (agents_section.len > 0) sep else "",
         agents_section,
     });
+}
+
+/// 按当前工具集动态拼 # Using your tools 段（对应 cc getUsingYourToolsSection）。
+/// 动态耦合:
+/// - 无 Grep → 去掉 "use Grep instead of grep" 子条
+/// - 无 Glob → 去掉 "use Glob instead of find" 子条
+/// - 无 TaskCreate → 去掉任务管理那条
+fn buildUsingToolsSection(allocator: std.mem.Allocator, names: []const []const u8) ![]u8 {
+    const has = struct {
+        fn f(list: []const []const u8, n: []const u8) bool {
+            for (list) |x| if (std.mem.eql(u8, x, n)) return true;
+            return false;
+        }
+    }.f;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator,
+        \\# Using your tools
+        \\ - Do NOT use the Bash to run commands when a relevant dedicated tool is provided. Using dedicated tools allows the user to better understand and review your work. This is CRITICAL to assisting the user:
+        \\  - To read files use Read instead of cat, head, tail, or sed
+        \\  - To edit files use Edit instead of sed or awk
+        \\  - To create files use Write instead of cat with heredoc or echo redirection
+    );
+    if (has(names, "Glob")) {
+        try buf.appendSlice(allocator, "\n  - To search for files use Glob instead of find or ls");
+    }
+    if (has(names, "Grep")) {
+        try buf.appendSlice(allocator, "\n  - To search the content of files, use Grep instead of grep or rg");
+    }
+    try buf.appendSlice(allocator,
+        \\
+        \\  - Reserve using the Bash exclusively for system commands and terminal operations that require shell execution. If you are unsure and there is a relevant dedicated tool, default to using the dedicated tool and only fallback on using the Bash tool for these if it is absolutely necessary.
+    );
+    if (has(names, "TaskCreate") or has(names, "TodoWrite")) {
+        try buf.appendSlice(allocator, "\n - Break down and manage your work with the TaskCreate tool. These tools are helpful for planning your work and helping the user track your progress. Mark each task as completed as soon as you are done with the task. Do not batch up multiple tasks before marking them as completed.");
+    }
+    try buf.appendSlice(allocator, "\n - You can call multiple tools in a single response. If you intend to call multiple tools and there are no dependencies between them, make all independent tool calls in parallel. Maximize use of parallel tool calls where possible to increase efficiency. However, if some tool calls depend on previous calls to inform dependent values, do NOT call these tools in parallel and instead call them sequentially. For instance, if one operation must complete before another starts, run these operations sequentially instead.");
+
+    return try buf.toOwnedSlice(allocator);
 }
 
 /// 构造 subagents section,引导模型何时通过 Task 工具委托。

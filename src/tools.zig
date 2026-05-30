@@ -22,6 +22,8 @@ const task_tools = @import("tools/task_tools.zig");
 const agent_tool = @import("tools/agent.zig");
 
 pub const ToolContext = @import("tools/context.zig").ToolContext;
+pub const PromptContext = @import("tools/prompt_context.zig").PromptContext;
+pub const descriptions = @import("tools/descriptions.zig");
 
 pub const ToolResult = struct {
     content: []const u8,
@@ -31,9 +33,16 @@ pub const ToolResult = struct {
 /// 工具执行函数签名（M2 起）：ctx 携带 allocator、abort、未来还有 permission/cwd。
 pub const ExecuteFn = *const fn (ctx: *const ToolContext, args: []const u8) anyerror![]u8;
 
+/// 工具长描述生成函数签名（动态耦合）：按 PromptContext 生成 owned 描述。
+/// 对应 cc/src/Tool.ts 的 tool.prompt(ctx)。
+pub const DescribeFn = *const fn (allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8;
+
 pub const ToolEntry = struct {
     name: []const u8,
+    /// 静态短描述。describe_fn 为 null 时用它（简单工具）。
     description: []const u8,
+    /// 动态长描述生成器。非 null 时优先于 description（核心工具用，支持动态耦合）。
+    describe_fn: ?DescribeFn = null,
     input_schema: json.InputSchema,
     execute: ExecuteFn,
 };
@@ -41,37 +50,43 @@ pub const ToolEntry = struct {
 pub const registry: []const ToolEntry = &.{
     .{
         .name = "Read",
-        .description = "Read the contents of a file from the file system",
-        .input_schema = .{ .type = "object", .properties = null, .required = &.{"path"} },
+        .description = "Read a file from the local filesystem.",
+        .describe_fn = descriptions.describeRead,
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{"file_path"} },
         .execute = read_tool.execute,
     },
     .{
         .name = "Write",
-        .description = "Write content to a file, replacing the file if it already exists",
-        .input_schema = .{ .type = "object", .properties = null, .required = &.{ "path", "content" } },
+        .description = "Write a file to the local filesystem.",
+        .describe_fn = descriptions.describeWrite,
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{ "file_path", "content" } },
         .execute = write_tool.execute,
     },
     .{
         .name = "Edit",
-        .description = "Edit a file by replacing a specific string with new content",
+        .description = "Performs exact string replacements in files.",
+        .describe_fn = descriptions.describeEdit,
         .input_schema = .{ .type = "object", .properties = null, .required = &.{ "file_path", "old_string", "new_string" } },
         .execute = edit_tool.execute,
     },
     .{
         .name = "Glob",
         .description = "Find files matching a glob pattern",
+        .describe_fn = descriptions.describeGlob,
         .input_schema = .{ .type = "object", .properties = null, .required = &.{"pattern"} },
         .execute = glob_tool.execute,
     },
     .{
         .name = "Bash",
         .description = "Execute a bash command",
+        .describe_fn = descriptions.describeBash,
         .input_schema = .{ .type = "object", .properties = null, .required = &.{"command"} },
         .execute = bash_tool.execute,
     },
     .{
         .name = "Grep",
         .description = "Search for patterns in files using ripgrep",
+        .describe_fn = descriptions.describeGrep,
         .input_schema = .{ .type = "object", .properties = null, .required = &.{"pattern"} },
         .execute = grep_tool.execute,
     },
@@ -204,6 +219,7 @@ pub const registry: []const ToolEntry = &.{
     .{
         .name = "Task",
         .description = "Launch a subagent in an isolated context to handle a side task. Each subagent starts with a fresh context — it cannot see this conversation, only the prompt you pass. Use for: high-volume operations (running tests, processing logs), parallel research, isolating exploration that would flood your context. Args: subagent_type (Explore/Plan/general-purpose/<custom>), description (3-5 word UI label), prompt (the delegation message). Optional: max_turns, model.",
+        .describe_fn = descriptions.describeTask,
         .input_schema = .{ .type = "object", .properties = null, .required = &.{ "subagent_type", "description", "prompt" } },
         .execute = agent_tool.execute,
     },
@@ -223,22 +239,39 @@ pub fn getTool(name: []const u8) ?*const ToolEntry {
 }
 
 pub fn toToolDefinitions(allocator: std.mem.Allocator) ![]json.ToolDefinition {
-    return toToolDefinitionsWithDyn(allocator, null);
+    return toToolDefinitionsFull(allocator, null, null);
 }
 
 /// 合并静态 + 动态工具 + web_search server tool。`dyn` 为 null 时等价 toToolDefinitions。
-/// 顺序：静态 18 → 动态（Skill/MCP）→ web_search。
+/// 顺序：静态 → 动态（Skill/MCP）→ web_search。
 pub fn toToolDefinitionsWithDyn(
     allocator: std.mem.Allocator,
     dyn: ?*const @import("tools/dynamic.zig").DynRegistry,
+) ![]json.ToolDefinition {
+    return toToolDefinitionsFull(allocator, dyn, null);
+}
+
+/// 完整版：额外接收 PromptContext。非 null 时，有 describe_fn 的工具用动态长描述
+/// （对应 cc 的 tool.prompt(ctx)）；否则回退静态 description。
+/// 动态描述在 `allocator` 上分配（调用方用 arena，session 结束统一释放）。
+pub fn toToolDefinitionsFull(
+    allocator: std.mem.Allocator,
+    dyn: ?*const @import("tools/dynamic.zig").DynRegistry,
+    prompt_ctx: ?*const PromptContext,
 ) ![]json.ToolDefinition {
     var defs = try std.ArrayList(json.ToolDefinition).initCapacity(allocator, registry.len + 1);
     defer defs.deinit(allocator);
 
     for (registry) |*tool| {
+        const desc: []const u8 = blk: {
+            if (prompt_ctx) |pc| {
+                if (tool.describe_fn) |df| break :blk try df(allocator, pc);
+            }
+            break :blk tool.description;
+        };
         try defs.append(allocator, .{
             .name = tool.name,
-            .description = tool.description,
+            .description = desc,
             .input_schema = .{
                 .type = tool.input_schema.type,
                 .properties = null,
@@ -259,6 +292,24 @@ pub fn toToolDefinitionsWithDyn(
     });
 
     return try defs.toOwnedSlice(allocator);
+}
+
+/// 就地用新的 PromptContext 重写已有 defs 里"有 describe_fn"工具的 description。
+/// 用于 subagent:父 defs 是用主对话 context 建的,subagent(尤其只读 Explore/Plan)
+/// 需要不同描述(Bash 去 Git 段 + 加只读提醒)。新描述在 allocator 上分配(arena)。
+/// 非 describe_fn 工具 / 动态 Skill / web_search 不动。
+pub fn redescribeForContext(
+    allocator: std.mem.Allocator,
+    defs: []json.ToolDefinition,
+    prompt_ctx: *const PromptContext,
+) !void {
+    for (defs) |*d| {
+        if (getTool(d.name)) |t| {
+            if (t.describe_fn) |df| {
+                d.description = try df(allocator, prompt_ctx);
+            }
+        }
+    }
 }
 
 pub fn executeTool(tool: *const ToolEntry, ctx: *const ToolContext, args: []const u8) anyerror![]u8 {

@@ -80,6 +80,9 @@ pub const App = struct {
     conversation: Conversation,
     api_client: client_mod.Client,
     tool_defs: []json_mod.ToolDefinition,
+    /// 当前启用的工具名（含动态 Skill/MCP）。用于 system prompt 的 # Using your tools
+    /// 段按工具集裁剪 + 构造 PromptContext。生命周期随 arena。
+    enabled_tool_names: []const []const u8 = &.{},
     permission_ctx: permission_mod.PermissionContext,
     abort: AbortSignal,
     skills: SkillSet,
@@ -211,8 +214,22 @@ pub const App = struct {
             @import("util/log.zig").debug("mcp", "no servers connected: {s}", .{@errorName(err)});
         };
 
-        // 现在构造完整的 tool_defs：静态 18 + 动态（Skill / MCP）+ web_search
-        app.tool_defs = try tools_mod.toToolDefinitionsWithDyn(allocator, &app.dyn_registry);
+        // 现在构造完整的 tool_defs：静态 + 动态（Skill / MCP）+ web_search。
+        // 先构造一次拿到全部工具名（含动态），据此建 PromptContext，再带 context 重建——
+        // 让核心工具拿到动态长描述（对应 cc tool.prompt(ctx)）。
+        // arena allocator：第一次的临时 defs 随 session 释放，不单独 free。
+        const probe_defs = try tools_mod.toToolDefinitionsWithDyn(allocator, &app.dyn_registry);
+        const enabled_names = try allocator.alloc([]const u8, probe_defs.len);
+        for (probe_defs, 0..) |d, i| enabled_names[i] = d.name;
+        app.enabled_tool_names = enabled_names;
+
+        const prompt_ctx = tools_mod.PromptContext{
+            .permission_mode = config.permission_mode,
+            .enabled_tool_names = enabled_names,
+            .agent_type = "", // 主对话
+            .include_git = true,
+        };
+        app.tool_defs = try tools_mod.toToolDefinitionsFull(allocator, &app.dyn_registry, &prompt_ctx);
         errdefer allocator.free(app.tool_defs);
 
         // 探测 <base_url>/v1/models 取 model catalog（max_tokens）。失败静默，走本地 fallback。
@@ -241,8 +258,9 @@ pub const App = struct {
             break :blk null;
         };
 
-        // 构造 system prompt（依赖 config.model）。失败仅 log，保持 null。
-        app.system_prompt = system_prompt_mod.buildWithSkillsAndAgents(allocator, config.model, &app.skills, &app.agents) catch |err| blk: {
+        // 构造 system prompt（依赖 config.model）。# Using your tools 段按 enabled_tool_names
+        // 动态裁剪（对应 cc getUsingYourToolsSection(enabledTools)）。失败仅 log，保持 null。
+        app.system_prompt = system_prompt_mod.buildFull(allocator, config.model, &app.skills, &app.agents, app.enabled_tool_names) catch |err| blk: {
             @import("util/log.zig").warn("sysprompt", "build failed: {s} (continuing without system prompt)", .{@errorName(err)});
             break :blk null;
         };
@@ -726,4 +744,3 @@ test "App init/deinit" {
     // 真正的初始化测试放在集成测试层。
     _ = App;
 }
-

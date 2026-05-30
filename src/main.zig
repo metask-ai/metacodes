@@ -61,6 +61,12 @@ pub fn main(init: std.process.Init) !void {
 
     log.info("main", "metacodes starting; model={s}", .{config.model});
 
+    // --dump-prompt：打印组装好的 system prompt + 工具 defs(name + description)后退出。
+    // 不发网络、不需有效 key。用于验证提示词×工具复刻(工具长描述 + 动态裁剪)。
+    if (config.dump_prompt) {
+        dumpPromptAndExit(app);
+    }
+
     // Headless 模式：`-p "..."` / stdin pipe → 跑单次 prompt 后退出，不进 REPL。
     if (config.prompt) |p| {
         const code = @import("repl/headless.zig").run(app, allocator, p, config.json_output) catch 1;
@@ -68,6 +74,36 @@ pub fn main(init: std.process.Init) !void {
     }
 
     try repl.run(app, allocator);
+}
+
+/// 打印组装好的 system prompt + 工具 defs(name + 完整 description),然后退出。
+/// 走 std.c.write(1,...) 直出 stdout——不经日志(避免 8192 截断),不发网络。
+fn dumpWrite(bytes: []const u8) void {
+    var pos: usize = 0;
+    while (pos < bytes.len) {
+        const n = std.c.write(1, bytes.ptr + pos, bytes.len - pos);
+        if (n <= 0) break;
+        pos += @as(usize, @intCast(n));
+    }
+}
+
+fn dumpPromptAndExit(app: *app_mod.App) noreturn {
+    dumpWrite("========== SYSTEM PROMPT ==========\n");
+    if (app.system_prompt) |sp| {
+        dumpWrite(sp);
+    } else {
+        dumpWrite("(null - build failed)");
+    }
+    dumpWrite("\n\n========== TOOL DEFINITIONS ==========\n");
+    for (app.tool_defs) |d| {
+        dumpWrite("\n----- ");
+        dumpWrite(d.name);
+        dumpWrite(" -----\n");
+        dumpWrite(d.description);
+        dumpWrite("\n");
+    }
+    dumpWrite("\n");
+    std.process.exit(0);
 }
 
 fn parseArgs(init: std.process.Init, allocator: std.mem.Allocator) types.Config {
@@ -103,6 +139,8 @@ fn parseArgs(init: std.process.Init, allocator: std.mem.Allocator) types.Config 
             if (args.next()) |p| config.prompt = allocator.dupe(u8, p) catch p;
         } else if (std.mem.eql(u8, arg, "--json")) {
             config.json_output = true;
+        } else if (std.mem.eql(u8, arg, "--dump-prompt")) {
+            config.dump_prompt = true;
         } else if (std.mem.eql(u8, arg, "-")) {
             // 从 stdin 读全部作为 prompt（headless pipe 模式）
             config.prompt = readAllStdin(allocator) catch null;
@@ -225,6 +263,8 @@ test {
     _ = &@import("tools/mcp_resources.zig");
     _ = &@import("tools/push_notification.zig");
     _ = &@import("tools/cron.zig");
+    _ = &@import("tools/prompt_context.zig");
+    _ = &@import("tools/descriptions.zig");
     _ = &@import("core/cron_registry.zig");
     _ = &@import("skills/tool.zig");
     _ = &@import("app/config.zig");

@@ -64,6 +64,21 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         const filtered = try filter_mod.filterToolDefs(ctx.allocator, tool_defs, d);
         filtered_owned = filtered;
         effective_tool_defs = filtered;
+
+        // 动态耦合:用 subagent 的 PromptContext 重写有 describe_fn 工具的描述。
+        // 只读 agent(Explore/Plan)的 Bash 会去掉 Git 段 + 加只读提醒(对齐 cc Explore)。
+        // 描述里引用其它工具的判断基于过滤后的工具集。
+        const tools_mod = @import("../tools.zig");
+        var names = try ctx.allocator.alloc([]const u8, filtered.len);
+        defer ctx.allocator.free(names);
+        for (filtered, 0..) |fd, i| names[i] = fd.name;
+        const sub_prompt_ctx = tools_mod.PromptContext{
+            .permission_mode = if (d.permission_mode) |m| mapPermissionMode(m) else .default,
+            .enabled_tool_names = names,
+            .agent_type = d.name,
+            .include_git = true,
+        };
+        try tools_mod.redescribeForContext(ctx.allocator, filtered, &sub_prompt_ctx);
     }
 
     // per-spawn overrides
