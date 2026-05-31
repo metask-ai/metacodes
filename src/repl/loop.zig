@@ -19,8 +19,10 @@ const history_mod = @import("history.zig");
 const multiline_mod = @import("multiline.zig");
 const render_mod = @import("render.zig");
 const transcript_mod = @import("../core/transcript.zig");
-const statusline = @import("statusline.zig");
 const progress = @import("progress.zig");
+const render_region_mod = @import("tui/render_region.zig");
+const msg_queue_mod = @import("msg_queue.zig");
+const tui_term_root = @import("tui/term.zig");
 const util_fs = @import("../util/fs.zig");
 
 pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
@@ -46,14 +48,26 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     if (tty) progress.enable();
     defer if (tty) progress.disable();
 
+    // 待发送队列:生成期用户按回车提交的消息进此队列;本轮 LLM 结束后,主循环从队首
+    // 逐条取出作为后续 input 续发,直到队空(对齐 Claude Code commandQueue)。
+    var msg_queue = msg_queue_mod.MsgQueue.init(allocator);
+    defer msg_queue.deinit();
+
     while (true) {
         // 检查到期的 cron 任务 —— 把它们的 prompt 作为 user message 注入并跑一轮
         try fireDueCrons(app, allocator, &writer);
 
-        if (tty) statusline.render(app);
-        std.debug.print("> ", .{});
+        // tty:输入框(含状态/footer)由 readLineRaw 内的 RenderRegion 自画(钉底)。
+        // 非 tty:保留裸 "> " prompt 供 pipe 模式可读。
+        const has_queued = msg_queue.len() > 0;
+        if (!tty and !has_queued) std.debug.print("> ", .{});
 
-        const line = if (tty)
+        const line = if (msg_queue.popAllJoined("\n\n")) |q| blk: {
+            // 待发送队列消费:上一轮生成期入队的(可能多条)消息一次性合并 → 本轮 input,
+            // 回显 ❯ <内容> 到 scrollback。多条用空行分隔合成一次提交(对齐 cc 同模式批量)。
+            echoUserSubmission(app, q);
+            break :blk q; // q owned,与 readLine 返回所有权一致
+        } else if (tty)
             readLineRaw(stdin_fd, allocator, &history, app) catch |err| switch (err) {
                 error.Eof => {
                     std.debug.print("Goodbye!\n", .{});
@@ -309,29 +323,63 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         defer if (expanded) |e| allocator.free(e);
         try app.conversation.appendText(.user, expanded orelse final_input);
 
-        // 生成期间启动 stdin 监听线程：Esc / Ctrl+C / 'q' 字节 → 触发 app.abort
-        // 这是因为 raw mode ISIG=false 禁用了 kernel 的 SIGINT 生成，我们必须自己读并翻译
+        // 生成期间底部状态栏(spinner + 实时 token/cost)。仅 tty。
+        // RenderRegion 在生成期维护一个底部 spinner 行;agent_loop 的文本输出经
+        // RegionWriter 与 spinner 协调(文本来时擦 spinner,tick 在文本下方重画)。
+        var gen_region: ?render_region_mod.RenderRegion = if (tty)
+            render_region_mod.RenderRegion.init(allocator, 2, app.theme, tui_term_root.detectFromEnv(1))
+        else
+            null;
+        defer if (gen_region) |*r| r.deinit();
+        if (gen_region) |*r| r.enterGenerating(app, &msg_queue);
+
+        var region_writer: ?render_region_mod.RegionWriter =
+            if (gen_region) |*r| .{ .region = r } else null;
+
+        // 生成期间也要 raw mode:readLineRaw 返回时已 restoreMode(回 cooked),
+        // cooked 下内核按行缓冲,未按 Enter 的键不会被 watcher 的 read 读到 → 边等边打字被吞。
+        // 重进 raw 让 watcher 能逐字节读到输入(编辑 / 回车入队 / Esc 中断)。
+        const gen_raw_orig: ?std.c.termios = if (tty) input.enterRawMode(stdin_fd) else null;
+        defer if (gen_raw_orig) |o| input.restoreMode(stdin_fd, o);
+
+        // 生成期间启动 stdin 监听 + spinner 驱动线程:跑 LineEditor;回车入队;Esc 两档;超时 tickSpinner
         var watcher_stop = std.atomic.Value(bool).init(false);
+        const region_ptr: ?*render_region_mod.RenderRegion = if (gen_region) |*r| r else null;
         const watcher_thread = if (tty) try std.Thread.spawn(
             .{},
             stdinAbortWatcher,
-            .{ stdin_fd, &app.abort, &watcher_stop },
+            .{ stdin_fd, &app.abort, &watcher_stop, region_ptr, @as(?*const app_mod.App, app), @as(?*msg_queue_mod.MsgQueue, &msg_queue), allocator },
         ) else null;
 
         const usage_sink = app.usageSink();
         const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*j| j else null;
-        const result = agent_loop.run(
-            &app.conversation,
-            &app.api_client,
-            app.tool_defs,
-            &app.permission_ctx,
-            .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir() },
-            &writer,
-            allocator,
-        ) catch |err| {
+        const result = blk: {
+            if (region_writer) |*rw| {
+                break :blk agent_loop.run(
+                    &app.conversation,
+                    &app.api_client,
+                    app.tool_defs,
+                    &app.permission_ctx,
+                    .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir() },
+                    rw,
+                    allocator,
+                );
+            } else {
+                break :blk agent_loop.run(
+                    &app.conversation,
+                    &app.api_client,
+                    app.tool_defs,
+                    &app.permission_ctx,
+                    .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir() },
+                    &writer,
+                    allocator,
+                );
+            }
+        } catch |err| {
             // 停 watcher + 清 stdin 缓冲
             watcher_stop.store(true, .release);
             if (watcher_thread) |t| t.join();
+            if (gen_region) |*r| r.leaveGenerating(app);
             if (tty) drainStdin(stdin_fd);
             std.debug.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
             continue;
@@ -339,6 +387,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // 停 watcher + 清 stdin 缓冲（生成期间用户可能误按的键，别污染下一轮）
         watcher_stop.store(true, .release);
         if (watcher_thread) |t| t.join();
+        if (gen_region) |*r| r.leaveGenerating(app);
         if (tty) drainStdin(stdin_fd);
 
         // 每轮结束 flush transcript（含错误 / abort 路径；只要有变动都想落盘）
@@ -351,37 +400,90 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     }
 }
 
-/// 生成期间运行的 stdin 监听线程。
+/// 生成期 stdin 监听线程:跑一个真正的 LineEditor(对齐 Claude Code)。
 ///
-/// 用 poll(fd, 100ms) 循环——100ms 超时时检查 stop flag，有数据时 read 一字节判断：
-///   - 0x03 (Ctrl+C)
-///   - 0x1B (Esc)
-///   - 'q' / 'Q'
-///   任一 → 调 abort.abort(.user_ctrl_c)，退出线程
-///
-/// stop flag（由主线程在生成结束后 set）也会让线程干净退出。
+/// poll(fd, 100ms):超时 → region.tickSpinner(推进 spinner)。有字节:
+///   - 回车 → editor 非空则入待发送队列(msg_queue),清空 editor,重画(队列预览 + 空框)
+///   - Esc  → editor 非空则清空 editor(不中断);editor 空则 abort 当前推理(队列保留)
+///   - 其它(字符/退格/←→/Home/End/...) → editor.handle → 重画(输入框 = editor 内容,光标落编辑点)
+/// 字符只停输入框、不提交;回车才入队;队列由主循环在本轮结束后逐条续发。
 fn stdinAbortWatcher(
     fd: std.c.fd_t,
     abort: *@import("../util/abort.zig").AbortSignal,
     stop: *std.atomic.Value(bool),
+    region: ?*render_region_mod.RenderRegion,
+    app: ?*const app_mod.App,
+    queue: ?*msg_queue_mod.MsgQueue,
+    allocator: std.mem.Allocator,
 ) void {
+    var parser = input.KeyParser{}; // 本线程独占,不持锁
+    var editor = input.LineEditor.init(allocator);
+    defer editor.deinit();
+
+    // 处理一个已解析出的 Key(feed 出的 or flushEsc 出的孤立 ESC)。
+    const handleKey = struct {
+        fn call(
+            key: input.Key,
+            ed: *input.LineEditor,
+            rg: ?*render_region_mod.RenderRegion,
+            ap: ?*const app_mod.App,
+            q: ?*msg_queue_mod.MsgQueue,
+            ab: *@import("../util/abort.zig").AbortSignal,
+        ) void {
+            switch (key) {
+                .enter, .shift_enter, .ctrl_enter => {
+                    // 回车 → 入待发送队列(非空才入),清空输入框。不立即发。
+                    const v = ed.view();
+                    const trimmed = std.mem.trim(u8, v, " \t\r\n");
+                    if (trimmed.len > 0) {
+                        if (q) |qq| _ = qq.push(v);
+                    }
+                    ed.clear();
+                },
+                .esc => {
+                    // Esc 两档:框有内容 → 清空(不中断);框空 → 中断当前推理(队列保留 → 中断后续发)。
+                    if (ed.view().len > 0) {
+                        ed.clear();
+                    } else {
+                        ab.abort(.user_ctrl_c);
+                        return; // 中断不重画(主线程很快收尾)
+                    }
+                },
+                else => {
+                    _ = ed.handle(key) catch {};
+                },
+            }
+            if (rg) |r| {
+                if (ap) |a| {
+                    r.setGenInput(ed.view(), ed.cursor);
+                    r.redrawGen(a);
+                }
+            }
+        }
+    }.call;
+
     while (!stop.load(.acquire)) {
+        // ESC 待决时用短超时(40ms)→ 孤立 ESC 快速兑现为中断;否则常规 100ms tick。
+        const timeout_ms: i32 = if (parser.pendingEsc()) 40 else 100;
         var pfd = [_]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
-        const rc = std.c.poll(&pfd, 1, 100);
-        if (rc <= 0) continue;
+        const rc = std.c.poll(&pfd, 1, timeout_ms);
+        if (rc <= 0) {
+            // 超时:孤立 ESC 兑现 → 处理(可能中断);否则推进 spinner。
+            if (parser.flushEsc()) |k| {
+                handleKey(k, &editor, region, app, queue, abort);
+            } else if (region) |r| {
+                if (app) |a| r.tickSpinner(a);
+            }
+            continue;
+        }
         if ((pfd[0].revents & std.c.POLL.IN) == 0) continue;
 
         var b: [1]u8 = undefined;
         const n = std.c.read(fd, &b, 1);
         if (n <= 0) continue;
 
-        // 生成期间：只有 Esc (0x1B) 触发 abort。其他字节吞掉（防止漏给后续 readLineRaw
-        // 导致 CSI 序列被切断、出现乱码如 "99~99~"）。
-        if (b[0] == 0x1B) {
-            abort.abort(.user_ctrl_c);
-            return;
-        }
-        // 其他按键：静默吞掉，不 abort
+        const key = parser.feed(b[0]) orelse continue; // 多字节(UTF-8/CSI)攒够再出 Key
+        handleKey(key, &editor, region, app, queue, abort);
     }
 }
 
@@ -491,6 +593,44 @@ fn insertAtCursor(editor: *input.LineEditor, allocator: std.mem.Allocator, text:
 /// Session 内递增的粘贴编号（用于 [Pasted text #N] 占位符 + pastes/<N>.txt 文件名）。
 var g_paste_id: usize = 0;
 
+/// SIGWINCH(终端 resize)标志。handler 只 atomic-store(async-signal-safe),
+/// readLineRaw 的 poll 循环超时时观察它 → 立即重画输入框自适应新宽度。
+var g_winch = std.atomic.Value(bool).init(false);
+
+fn sigwinchHandler(sig: std.posix.SIG) callconv(.c) void {
+    _ = sig;
+    g_winch.store(true, .release);
+}
+
+fn installSigwinch() void {
+    var act: std.posix.Sigaction = .{
+        .handler = .{ .handler = sigwinchHandler },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(std.posix.SIG.WINCH, &act, null);
+}
+
+/// 把提交的输入回显到 scrollback(复刻 Claude Code:提交后历史里留 "❯ <内容>")。
+/// 多行内容续行对齐 2 空格;空输入只打一个换行。commit 路径 + carryover 自动提交共用。
+fn echoUserSubmission(app: *app_mod.App, submitted: []const u8) void {
+    if (std.mem.trim(u8, submitted, " \t\r\n").len == 0) {
+        std.debug.print("\n", .{});
+        return;
+    }
+    const th = app.theme;
+    var first = true;
+    var it = std.mem.splitScalar(u8, submitted, '\n');
+    while (it.next()) |seg| {
+        if (first) {
+            std.debug.print("{s}❯{s} {s}\n", .{ th.accent, th.reset, seg });
+            first = false;
+        } else {
+            std.debug.print("  {s}\n", .{seg});
+        }
+    }
+}
+
 fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_mod.History, app: *app_mod.App) ![]u8 {
     const orig = input.enterRawMode(fd) orelse {
         // 无法进 raw mode：退化
@@ -508,19 +648,56 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
     var vim_state = vim.VimState.init(allocator);
     defer vim_state.deinit();
 
+    // 输入期固定底部区(复刻 Claude Code:圆角输入框 + ❯ + footer + 钉底)。
+    var region = render_region_mod.RenderRegion.init(allocator, 2, app.theme, tui_term_root.detectFromEnv(1));
+    defer region.deinit();
+    // 终端 resize 监听:SIGWINCH → 下次 poll 超时时重画自适应。
+    g_winch.store(false, .release);
+    installSigwinch();
+    // 退出 readLineRaw 前擦掉输入框,光标回干净行(覆盖所有 return 路径)。
+    defer {
+        region.setInput("", 0);
+        region.clear();
+        std.debug.print("\x1b[?25h", .{}); // 确保光标可见
+    }
+    // 初始画一个空输入框。
+    region.setInput(editor.view(), editor.cursor);
+    region.render(app);
+
+    // 重画当前输入框(替代旧 redrawLine):同步 editor 状态 → 重画固定区。
+    const redraw = struct {
+        fn call(r: *render_region_mod.RenderRegion, ed: *input.LineEditor, a: *app_mod.App) void {
+            r.setInput(ed.view(), ed.cursor);
+            r.render(a);
+        }
+    }.call;
+
     while (true) {
         var b: [1]u8 = undefined;
+        // 用 poll 带超时读,而非阻塞 read:超时时检查 SIGWINCH(终端 resize)→ 立即重画
+        // 输入框自适应新宽度(否则要等下次按键才更新,真机 resize 卡旧宽)。
+        while (true) {
+            if (g_winch.swap(false, .acquire)) {
+                redraw(&region, &editor, app); // resize → 重测宽度重画
+            }
+            var pfd = [_]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
+            const rc = std.c.poll(&pfd, 1, 200); // 200ms 超时
+            if (rc <= 0) continue; // <0=EINTR(被 SIGWINCH 中断) / 0=超时 → 回头查 flag
+            if ((pfd[0].revents & std.c.POLL.IN) != 0) break; // 有字节可读
+        }
         const n = posix.read(fd, &b) catch return error.ReadError;
         if (n == 0) return error.Eof;
 
         // vim 模式 + NORMAL/VISUAL:字节路由到 vim 状态机(Enter/Esc 例外)
         if (app.config.vim_mode and vim_state.mode != .insert) {
             if (b[0] == '\r' or b[0] == '\n') {
+                region.setInput("", 0);
+                region.clear();
                 std.debug.print("\n", .{});
                 return try allocator.dupe(u8, editor.view());
             }
             const changed = vim.handleNormal(&vim_state, &editor.buf, &editor.cursor, allocator, b[0]) catch false;
-            if (changed) try redrawLine(editor.view(), editor.cursor);
+            if (changed) redraw(&region, &editor, app);
             continue;
         }
 
@@ -530,98 +707,104 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
         if (app.config.vim_mode and key == .esc) {
             vim_state.mode = .normal;
             if (editor.cursor > 0) editor.cursor -= 1; // vim 习惯:Esc 后光标左移一格
-            try redrawLine(editor.view(), editor.cursor);
+            redraw(&region, &editor, app);
             continue;
         }
 
         // 括号粘贴：收集到 paste_end，决定内联还是外部存储 + 占位符
         if (key == .paste_begin) {
             try handlePaste(fd, &editor, &parser, allocator);
-            try redrawLine(editor.view(), editor.cursor);
+            redraw(&region, &editor, app);
             continue;
         }
 
         const action = try editor.handle(key);
         switch (action) {
-            .redraw => try redrawLine(editor.view(), editor.cursor),
+            .redraw => redraw(&region, &editor, app),
             .commit => {
-                std.debug.print("\n", .{});
+                region.setInput("", 0);
+                region.clear();
+                // 提交回显 ❯ <内容> 到 scrollback(否则提交后输入凭空消失)。
+                echoUserSubmission(app, editor.view());
                 return try allocator.dupe(u8, editor.view());
             },
             .cancel => return error.Cancelled,
             .cancel_hint => {
-                // 第一次 Ctrl+C 且 buffer 空 — 提示再按一次退出，当前行留空等下次按键
-                std.debug.print("\r\x1b[2K(再次按 Ctrl+C 退出 REPL)\n> ", .{});
+                // 第一次 Ctrl+C 且 buffer 空 — 提示再按一次退出(打到 scrollback,夹在 clear/render 间)
+                region.clear();
+                std.debug.print("\x1b[2m(再次按 Ctrl+C 退出 REPL)\x1b[0m\n", .{});
+                redraw(&region, &editor, app);
             },
             .exit_repl => return error.ExitRequested,
             .eof => return error.Eof,
             .history_prev => {
                 if (try history.prev(editor.view())) |prev| {
                     try editor.setLine(prev);
-                    try redrawLine(editor.view(), editor.cursor);
+                    redraw(&region, &editor, app);
                 }
             },
             .history_next => {
                 if (history.next()) |nxt| {
                     try editor.setLine(nxt);
-                    try redrawLine(editor.view(), editor.cursor);
+                    redraw(&region, &editor, app);
                 }
             },
             .complete => {
+                // 补全列候选会打多行到 scrollback → clear → 打印 → render
+                region.clear();
                 try handleCompletion(&editor, allocator);
-                try redrawLine(editor.view(), editor.cursor);
+                redraw(&region, &editor, app);
             },
             .reverse_search => {
+                region.clear();
                 try handleReverseSearch(fd, &editor, &parser, history, allocator);
-                try redrawLine(editor.view(), editor.cursor);
+                redraw(&region, &editor, app);
             },
             .cycle_perm_mode => {
                 // Claude Code Shift+Tab 标准循环:default → acceptEdits → plan → default
-                // (auto/dontAsk/bypassPermissions 不在默认循环;通过 CLI flag 启用)
                 app.config.permission_mode = switch (app.config.permission_mode) {
                     .default, .prompt => .accept_edits,
                     .accept_edits => .plan,
                     .plan => .default,
-                    // 非循环模式按下也回 default
                     .auto, .dont_ask, .bypass_permissions, .bypass => .default,
                 };
                 app.permission_ctx.mode = app.config.permission_mode;
-                std.debug.print("\r\x1b[2K\x1b[36m[permission mode: {s}]\x1b[0m\n", .{@tagName(app.config.permission_mode)});
-                std.debug.print("> ", .{});
-                try redrawLine(editor.view(), editor.cursor);
+                // mode 直接体现在 footer + 边框色,重画即可(不再单独打印 [mode])。
+                redraw(&region, &editor, app);
             },
             .redraw_screen => {
+                region.clear();
                 std.debug.print("\x1b[2J\x1b[H", .{});
-                std.debug.print("> ", .{});
-                try redrawLine(editor.view(), editor.cursor);
+                redraw(&region, &editor, app);
             },
             .toggle_task_list => {
+                region.clear();
                 printTaskList(app);
-                std.debug.print("> ", .{});
-                try redrawLine(editor.view(), editor.cursor);
+                redraw(&region, &editor, app);
             },
             .open_transcript => {
+                region.clear();
                 input.restoreMode(fd, orig); // 暂退 raw mode 让 viewer 自管
                 const tv = @import("transcript_viewer.zig");
                 tv.runWithTheme(fd, allocator, &app.conversation, termRows(), app.theme) catch {};
                 _ = input.enterRawMode(fd);
-                std.debug.print("> ", .{});
-                try redrawLine(editor.view(), editor.cursor);
+                redraw(&region, &editor, app);
             },
             .kill_background => {
+                region.clear();
                 const killed = killAllBackground(app);
-                std.debug.print("\r\x1b[2K\x1b[33m[killed {d} background task(s)]\x1b[0m\n> ", .{killed});
-                try redrawLine(editor.view(), editor.cursor);
+                std.debug.print("\x1b[33m[killed {d} background task(s)]\x1b[0m\n", .{killed});
+                redraw(&region, &editor, app);
             },
             .external_edit => {
+                region.clear();
                 input.restoreMode(fd, orig);
                 if (externalEdit(allocator, editor.view())) |edited| {
                     defer allocator.free(edited);
                     editor.setLine(edited) catch {};
                 } else |_| {}
                 _ = input.enterRawMode(fd);
-                std.debug.print("> ", .{});
-                try redrawLine(editor.view(), editor.cursor);
+                redraw(&region, &editor, app);
             },
             .clear_draft => {
                 // 把当前 draft 存入历史(Up 可恢复),然后清空
@@ -629,8 +812,7 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
                     history.append(editor.view()) catch {};
                 }
                 editor.reset();
-                std.debug.print("\r\x1b[2K> ", .{});
-                try redrawLine(editor.view(), editor.cursor);
+                redraw(&region, &editor, app);
             },
             .none => {},
         }
@@ -733,18 +915,6 @@ fn searchHistory(history: *history_mod.History, query: []const u8) ?[]const u8 {
         if (std.mem.indexOf(u8, e, query) != null) return e;
     }
     return null;
-}
-
-/// 在同一行重绘：回车 → 擦行 → 重写 "> " + buffer → 移动光标。
-///
-/// 光标定位按"显示列宽"算，而不是字节偏移——CJK 一字占 2 列、ASCII 占 1 列。
-/// 否则每打一个汉字光标就相对文字末尾右漂 1 列。
-fn redrawLine(line: []const u8, cursor: usize) !void {
-    std.debug.print("\r\x1b[2K> {s}", .{line});
-    const cols = displayWidthUpTo(line, cursor);
-    // "> " 占 2 列 + 文本显示列数
-    const pos = cols + 2;
-    std.debug.print("\r\x1b[{d}C", .{pos});
 }
 
 /// 计算 bytes[0..byte_pos] 在终端上的显示列数（东亚全角 = 2，ASCII = 1）。
@@ -1204,9 +1374,7 @@ fn handleBtw(app: *app_mod.App, allocator: std.mem.Allocator, question: []const 
     }
     const ctx_text = try flattenConversation(app, allocator);
     defer allocator.free(ctx_text);
-    const prompt = try std.fmt.allocPrint(allocator,
-        "Here is the current conversation so far:\n\n{s}\n\nSide question (answer concisely from context only, do not use tools): {s}",
-        .{ ctx_text, question });
+    const prompt = try std.fmt.allocPrint(allocator, "Here is the current conversation so far:\n\n{s}\n\nSide question (answer concisely from context only, do not use tools): {s}", .{ ctx_text, question });
     defer allocator.free(prompt);
 
     const answer = runEphemeral(app, allocator, prompt) catch |err| {
@@ -1225,9 +1393,7 @@ fn handleRecap(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     }
     const ctx_text = try flattenConversation(app, allocator);
     defer allocator.free(ctx_text);
-    const prompt = try std.fmt.allocPrint(allocator,
-        "Summarize this session in ONE concise line (what was worked on, current state):\n\n{s}",
-        .{ctx_text});
+    const prompt = try std.fmt.allocPrint(allocator, "Summarize this session in ONE concise line (what was worked on, current state):\n\n{s}", .{ctx_text});
     defer allocator.free(prompt);
 
     const recap = runEphemeral(app, allocator, prompt) catch |err| {

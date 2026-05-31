@@ -67,6 +67,19 @@ pub const KeyParser = struct {
 
     const State = enum { normal, esc_seen, csi_seen, csi_num1, csi_semi, csi_num2 };
 
+    /// 是否正卡在"已收 ESC、等后续字节判断是否 CSI 序列"的状态。
+    /// 调用方(watcher)在 read 超时时若此为 true,应调 flushEsc() 把孤立 ESC 兑现为 .esc。
+    pub fn pendingEsc(self: *const KeyParser) bool {
+        return self.state == .esc_seen;
+    }
+
+    /// 把卡在 esc_seen 的孤立 ESC 兑现为 .esc(超时无后续字节时调)。非 esc_seen 返 null。
+    pub fn flushEsc(self: *KeyParser) ?Key {
+        if (self.state != .esc_seen) return null;
+        self.state = .normal;
+        return .esc;
+    }
+
     pub fn feed(self: *KeyParser, b: u8) ?Key {
         switch (self.state) {
             .normal => {
@@ -507,6 +520,12 @@ pub const LineEditor = struct {
     pub fn view(self: *const LineEditor) []const u8 {
         return self.buf.items;
     }
+
+    /// 清空编辑行(buf + cursor 归零)。生成期回车入队后清框用。
+    pub fn clear(self: *LineEditor) void {
+        self.buf.clearRetainingCapacity();
+        self.cursor = 0;
+    }
 };
 
 /// UTF-8 continuation byte（高两位是 10）
@@ -515,7 +534,7 @@ inline fn isUtf8Continuation(b: u8) bool {
 }
 
 /// 从 pos 向前找到前一个 UTF-8 字符起始位置。pos 必须在字符边界。
-fn prevCharBoundary(bytes: []const u8, pos: usize) usize {
+pub fn prevCharBoundary(bytes: []const u8, pos: usize) usize {
     if (pos == 0) return 0;
     var p = pos - 1;
     while (p > 0 and isUtf8Continuation(bytes[p])) : (p -= 1) {}
@@ -554,6 +573,18 @@ test "KeyParser: arrow keys sequence" {
     try testing.expect(p.feed(0x1b) == null);
     try testing.expect(p.feed('[') == null);
     try testing.expect(p.feed('A').? == .up);
+}
+
+test "KeyParser: lone ESC flushes via flushEsc (interrupt 用)" {
+    var p = KeyParser{};
+    try testing.expect(p.feed(0x1b) == null); // esc_seen,等后续字节
+    try testing.expect(p.pendingEsc()); // 卡在 esc_seen
+    try testing.expect(p.flushEsc().? == .esc); // 超时兑现孤立 ESC
+    try testing.expect(!p.pendingEsc()); // 回 normal
+    try testing.expect(p.flushEsc() == null); // 非 esc_seen 再 flush 无效
+    // 兑现后状态干净:普通字符仍正常。
+    const k = p.feed('x').?;
+    try testing.expect(@as(std.meta.Tag(Key), k) == .char);
 }
 
 test "KeyParser: delete (ESC [ 3 ~)" {

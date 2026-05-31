@@ -9,11 +9,36 @@
 
 const std = @import("std");
 
-pub const SLASH_COMMANDS = [_][]const u8{
-    "/help",        "/clear",  "/tools",   "/skills",  "/history",
-    "/model",       "/resume", "/retry",   "/compact", "/cost",
-    "/doctor",      "/config", "/init",    "/mcp",     "/agents",
-    "/permissions", "/memory", "/commit",  "/review",  "/exit",
+pub const SlashCmd = struct { name: []const u8, desc: []const u8 };
+
+/// slash 命令表(name + 一行描述,供 `/` 菜单与补全共用)。
+pub const SLASH_COMMAND_TABLE = [_]SlashCmd{
+    .{ .name = "/help", .desc = "Show help and available commands" },
+    .{ .name = "/clear", .desc = "Clear conversation history" },
+    .{ .name = "/tools", .desc = "List available tools" },
+    .{ .name = "/skills", .desc = "List available skills" },
+    .{ .name = "/history", .desc = "Show input history" },
+    .{ .name = "/model", .desc = "Show or switch the model" },
+    .{ .name = "/resume", .desc = "Resume a previous session" },
+    .{ .name = "/retry", .desc = "Retry the last request" },
+    .{ .name = "/compact", .desc = "Compact the conversation context" },
+    .{ .name = "/cost", .desc = "Show token usage and cost" },
+    .{ .name = "/doctor", .desc = "Diagnose the environment" },
+    .{ .name = "/config", .desc = "Show configuration" },
+    .{ .name = "/init", .desc = "Initialize project memory (CLAUDE.md)" },
+    .{ .name = "/mcp", .desc = "Manage MCP servers" },
+    .{ .name = "/agents", .desc = "List subagents" },
+    .{ .name = "/permissions", .desc = "Show permission rules and mode" },
+    .{ .name = "/memory", .desc = "Edit persistent memory" },
+    .{ .name = "/commit", .desc = "Create a git commit" },
+    .{ .name = "/review", .desc = "Ask the model to review the current diff" },
+    .{ .name = "/exit", .desc = "Exit REPL" },
+};
+
+pub const SLASH_COMMANDS = blk: {
+    var arr: [SLASH_COMMAND_TABLE.len][]const u8 = undefined;
+    for (SLASH_COMMAND_TABLE, 0..) |c, i| arr[i] = c.name;
+    break :blk arr;
 };
 
 pub const Result = struct {
