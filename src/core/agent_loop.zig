@@ -23,9 +23,9 @@ const log = @import("../util/log.zig");
 
 pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error };
 
-/// Auto-compact 阈值下限：避免 resolveMaxTokens 返回异常小值（测试 mock、未知模型）
-/// 导致每 turn 都 compact。低于这个值不做压缩。
-pub const MIN_AUTO_COMPACT_THRESHOLD: usize = 4096;
+/// Auto-compact 阈值下限:避免 catalog 返回异常小值(测试 mock、未知模型)导致每 turn 都 compact。
+/// 低于这个值不做压缩。设为 32K——正常对话/工具调研远小于此,只有真逼近 context window 才触发。
+pub const MIN_AUTO_COMPACT_THRESHOLD: usize = 32_000;
 
 pub const RunResult = struct {
     stop_reason: StopReason,
@@ -147,11 +147,13 @@ pub fn run(
             return .{ .stop_reason = .aborted, .turns = turns, .tool_calls = total_tool_calls };
         };
 
-        // 自动 compact：在发请求前检查 token 估算，超阈值则保留最近 N 条。
-        // 阈值 null 时按 client.resolveMaxTokens() * 0.7 动态算（跟上模型 context window 变化）。
-        // 下限 MIN_AUTO_COMPACT_THRESHOLD：避免 resolveMaxTokens 返回异常小值导致每 turn 都 compact。
+        // 自动 compact：发请求前检查 token 估算,超阈值则保留最近 N 条。
+        // 阈值 null 时 = input context window * 0.8(逼近 context 上限才压缩,留出回复空间)。
+        // **必须用 input context window(resolveMaxInputTokens,~200K),不是 output max_tokens(32K)**——
+        // 否则正常工具调研刚读几个文件(20K+)就误触发压缩、丢掉原始问题(真机 bug)。
+        // 下限 MIN_AUTO_COMPACT_THRESHOLD:避免异常小值导致每 turn 都 compact。
         const auto_threshold: usize = opts.auto_compact_threshold orelse
-            @max(@as(usize, api_client.resolveMaxTokens()) * 7 / 10, MIN_AUTO_COMPACT_THRESHOLD);
+            @max(@as(usize, api_client.resolveMaxInputTokens()) * 8 / 10, MIN_AUTO_COMPACT_THRESHOLD);
         if (conversation.isOverThreshold(auto_threshold)) {
             const before = conversation.len();
             const dropped = conversation.compactKeepRecent(opts.auto_compact_keep_recent);
@@ -417,7 +419,7 @@ pub fn run(
                 };
                 break :blk tools_mod.dispatch(&tool_ctx, tu.name, tu.input);
             } catch |err| {
-                log.warnId("agent", rid, "tool.exec FAILED name={s} err={s} duration_ms={d}", .{ tu.name, @errorName(err), util_time.nowMs() - t_start });
+                log.warnId("agent", rid, "tool.exec FAILED name={s} err={s} duration_ms={d} input={s}", .{ tu.name, @errorName(err), util_time.nowMs() - t_start, tu.input[0..@min(tu.input.len, 200)] });
                 const code = if (err == error.UnknownTool) "UnknownTool" else @errorName(err);
                 const err_json = try tool_error.errorToJson(code, "{s} failed with {s}", .{ tu.name, @errorName(err) }, allocator);
                 errdefer allocator.free(err_json);
@@ -589,4 +591,13 @@ test "StopReason has aborted and max_turns" {
     try std.testing.expect(r == .aborted);
     const r2: StopReason = .max_turns;
     try std.testing.expect(r2 == .max_turns);
+}
+
+test "auto-compact 阈值用 input context window 而非 output max_tokens(防回归真机 bug)" {
+    // 真机 bug:阈值曾用 output max_tokens(sonnet 默认 32K)*0.7 → 工具调研刚读几个文件就误触发
+    // 压缩、丢掉原始问题。修复:改用 input context window(~200K)*0.8。
+    // 源级守卫:阈值算式必须调 resolveMaxInputTokens(而非 output 的解析器),且 MIN 不再是早期小值。
+    const src = @embedFile("agent_loop.zig");
+    try std.testing.expect(std.mem.indexOf(u8, src, "resolveMaxInputTokens()) * 8 / 10") != null);
+    try std.testing.expect(MIN_AUTO_COMPACT_THRESHOLD >= 32_000);
 }

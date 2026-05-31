@@ -3,6 +3,10 @@ const common = @import("common.zig");
 const toolchain = @import("../util/toolchain.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
+/// 默认 head_limit(对齐 Claude Code GrepTool):content 模式不传 head_limit 时只返前 250 行,
+/// 防止宽匹配把整个文件灌进上下文。显式传 head_limit=0 = 无限。
+pub const DEFAULT_HEAD_LIMIT: usize = 250;
+
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
     const pattern = common.extractJsonArg(args, "pattern") orelse return error.MissingPattern;
@@ -81,7 +85,9 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // head_limit / offset：全局（跨文件）分页。
     // 不再用 rg 的 -m（那是每文件上限，跨文件会失真）；改为抓全量输出后按行截断。
     // offset = 跳过前 N 行；head_limit = 截断后保留 N 行。
-    const head_limit = parseUsize(common.extractJsonArg(args, "head_limit"));
+    // **默认 head_limit=250**（对齐 Claude Code,防止 `grep "."` 把整个文件灌进上下文）。
+    // 显式传 head_limit=0 = 无限（用户主动要全量时）。缺省（null）→ 用默认 250。
+    const head_limit: usize = parseUsize(common.extractJsonArg(args, "head_limit")) orelse DEFAULT_HEAD_LIMIT;
     const offset = parseUsize(common.extractJsonArg(args, "offset")) orelse 0;
 
     // positional: pattern, path
@@ -101,16 +107,16 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     const raw = try common.spawnCaptureStdoutAbortable(argv_z, allocator, ctx.abort);
 
-    // 无分页参数 → 原样返回（保持既有行为 + 测试兼容）
-    if (head_limit == null and offset == 0) return raw;
+    // head_limit=0（显式无限）且 offset=0 → 原样返回（保持既有行为 + 测试兼容）。
+    if (head_limit == 0 and offset == 0) return raw;
     defer allocator.free(raw);
 
     return try paginate(allocator, raw, offset, head_limit);
 }
 
-/// 按行做全局 offset + head_limit 截断。截断发生时在末尾追加一行 appliedLimit 提示，
-/// 让模型知道还有更多结果、可用 offset 翻页。
-fn paginate(allocator: std.mem.Allocator, raw: []const u8, offset: usize, head_limit: ?usize) ![]u8 {
+/// 按行做全局 offset + head_limit 截断。head_limit=0 表示无限。
+/// 截断发生时在末尾追加一行 appliedLimit 提示，让模型知道还有更多结果、可用 offset 翻页。
+fn paginate(allocator: std.mem.Allocator, raw: []const u8, offset: usize, head_limit: usize) ![]u8 {
     // 统计 + 收集行（保留行内容，不含换行符）
     var lines = std.ArrayList([]const u8).empty;
     defer lines.deinit(allocator);
@@ -124,7 +130,7 @@ fn paginate(allocator: std.mem.Allocator, raw: []const u8, offset: usize, head_l
 
     const start = @min(offset, total);
     const remaining = total - start;
-    const take = if (head_limit) |h| @min(h, remaining) else remaining;
+    const take = if (head_limit == 0) remaining else @min(head_limit, remaining);
     const end = start + take;
 
     var out: std.Io.Writer.Allocating = .init(allocator);
@@ -300,7 +306,7 @@ test "paginate: head_limit truncates and adds appliedLimit notice" {
 test "paginate: offset skips leading lines" {
     const a = std.testing.allocator;
     const raw = "l1\nl2\nl3\nl4\n";
-    const r = try paginate(a, raw, 2, null);
+    const r = try paginate(a, raw, 2, 0); // 0 = 无限 head_limit
     defer a.free(r);
     try std.testing.expect(std.mem.indexOf(u8, r, "l1") == null);
     try std.testing.expect(std.mem.indexOf(u8, r, "l3\nl4\n") != null);
@@ -319,7 +325,7 @@ test "paginate: limit >= total has no notice" {
 test "paginate: offset beyond total returns just notice" {
     const a = std.testing.allocator;
     const raw = "l1\nl2\n";
-    const r = try paginate(a, raw, 99, null);
+    const r = try paginate(a, raw, 99, 0); // 0 = 无限
     defer a.free(r);
     try std.testing.expect(std.mem.indexOf(u8, r, "l1") == null);
     try std.testing.expect(std.mem.indexOf(u8, r, "of 2") != null);
@@ -338,4 +344,47 @@ test "GrepTool global head_limit across content" {
     const r = try execute(&ctx, "{\"pattern\":\"m\",\"path\":\"/tmp/cc-zig-grep-headlimit.txt\",\"output_mode\":\"content\",\"head_limit\":2}");
     defer std.testing.allocator.free(r);
     try std.testing.expect(std.mem.indexOf(u8, r, "appliedLimit") != null);
+}
+
+test "GrepTool 默认 head_limit=250:不传时宽匹配被截断(防撑爆)" {
+    const ctx = testCtx();
+    const path = "/tmp/cc-zig-grep-default-cap.txt";
+    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    try std.testing.expect(fd >= 0);
+    // 写 300 行全匹配 → 不传 head_limit → 应只返 250 行 + appliedLimit 提示。
+    var i: usize = 0;
+    while (i < 300) : (i += 1) _ = std.c.write(fd, "match\n", 6);
+    _ = std.c.close(fd);
+    defer _ = std.c.unlink(path);
+
+    const r = try execute(&ctx, "{\"pattern\":\"match\",\"path\":\"/tmp/cc-zig-grep-default-cap.txt\",\"output_mode\":\"content\"}");
+    defer std.testing.allocator.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "appliedLimit") != null); // 被截断
+    // 数 match 行数应 ≤ 250(+提示行)。
+    var count: usize = 0;
+    var it = std.mem.splitScalar(u8, r, '\n');
+    while (it.next()) |ln| {
+        if (std.mem.indexOf(u8, ln, "match") != null) count += 1;
+    }
+    try std.testing.expect(count <= 250);
+}
+
+test "GrepTool head_limit=0 显式无限:返回全部不截断" {
+    const ctx = testCtx();
+    const path = "/tmp/cc-zig-grep-unlimited.txt";
+    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    try std.testing.expect(fd >= 0);
+    var i: usize = 0;
+    while (i < 300) : (i += 1) _ = std.c.write(fd, "match\n", 6);
+    _ = std.c.close(fd);
+    defer _ = std.c.unlink(path);
+
+    const r = try execute(&ctx, "{\"pattern\":\"match\",\"path\":\"/tmp/cc-zig-grep-unlimited.txt\",\"output_mode\":\"content\",\"head_limit\":0}");
+    defer std.testing.allocator.free(r);
+    var count: usize = 0;
+    var it = std.mem.splitScalar(u8, r, '\n');
+    while (it.next()) |ln| {
+        if (std.mem.indexOf(u8, ln, "match") != null) count += 1;
+    }
+    try std.testing.expect(count == 300); // 全返回
 }

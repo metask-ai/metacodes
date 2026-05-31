@@ -7,6 +7,13 @@ const ToolContext = @import("context.zig").ToolContext;
 /// 默认读取行数上限（对齐 TS：限制 200KB/2000 行用户无感截断）。
 pub const DEFAULT_LIMIT_LINES: usize = 2000;
 
+/// 整读(不带 offset/limit)的文件字节上限(对齐 Claude Code 256KB)。超出 → 拒读 + 提示用
+/// offset/limit 或 Grep,防一次性把大文件灌进上下文。显式传 offset/limit 时不受此限(用户要精确范围)。
+pub const MAX_FILE_BYTES: usize = 256 * 1024;
+
+/// 单行字节上限:超长行(如压缩成一行的 minified 文件)截断到此 + 标记,防"1 行几 MB"撑爆。
+pub const MAX_LINE_BYTES: usize = 2000;
+
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
     // 兼容：优先 file_path（TS 原版），回退 path（历史）
@@ -22,6 +29,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         return try readImage(allocator, ctx, path, media_type);
     }
 
+    const has_offset = common.extractJsonArg(args, "offset") != null;
+    const has_limit = common.extractJsonArg(args, "limit") != null;
     const offset_1based: usize = if (common.extractJsonArg(args, "offset")) |s|
         std.fmt.parseInt(usize, s, 10) catch 1
     else
@@ -37,6 +46,18 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     // 在读之前 fstat 一次拿 mtime/size，供 ReadState 记录用（must-read-first/staleness 校验）
     const st = read_state.statFd(fd) catch null;
+
+    // 大文件守卫:整读(未显式传 offset/limit)且 > MAX_FILE_BYTES → 拒读 + 提示用范围/Grep,
+    // 防一次性把大文件灌进上下文。显式传 offset/limit 表示用户要精确范围 → 放行。
+    if (!has_offset and !has_limit) {
+        if (st) |s| {
+            if (s.size > MAX_FILE_BYTES) {
+                return try std.fmt.allocPrint(allocator,
+                    "{{\"error\":\"file too large ({d} bytes, limit {d}). Read a range with offset+limit, or use Grep to find specific content.\"}}",
+                    .{ s.size, MAX_FILE_BYTES });
+            }
+        }
+    }
 
     const full = try common.readAllFromFd(fd, allocator);
     defer allocator.free(full);
@@ -89,7 +110,16 @@ fn renderWithLineNumbers(slice: []const u8, start_line: usize, allocator: std.me
         var buf: [16]u8 = undefined;
         const prefix = try std.fmt.bufPrint(&buf, "{d: >6}\t", .{line_no});
         try out.appendSlice(allocator, prefix);
-        try out.appendSlice(allocator, slice[pos..line_end]);
+        // 单行超长 → 截断到 MAX_LINE_BYTES(UTF-8 边界安全)+ 标记,防 minified 一行几 MB 撑爆。
+        const raw_line = slice[pos..line_end];
+        if (raw_line.len > MAX_LINE_BYTES) {
+            var cut = MAX_LINE_BYTES;
+            while (cut > 0 and (raw_line[cut] & 0b1100_0000) == 0b1000_0000) : (cut -= 1) {}
+            try out.appendSlice(allocator, raw_line[0..cut]);
+            try out.appendSlice(allocator, " … [line truncated]");
+        } else {
+            try out.appendSlice(allocator, raw_line);
+        }
         if (nl) |i| {
             try out.append(allocator, '\n');
             pos = i + 1;
@@ -319,4 +349,51 @@ test "ReadTool default limit reads at least first line" {
     const r = try execute(&ctx, "{\"file_path\":\"/etc/hosts\"}");
     defer std.testing.allocator.free(r);
     try std.testing.expect(r.len > 0);
+}
+
+test "ReadTool 大文件整读被拒(防撑爆);带 offset/limit 放行" {
+    const ctx = testCtx();
+    const path = "/tmp/cc-zig-read-toobig.txt";
+    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    try std.testing.expect(fd >= 0);
+    // 写 > 256KB(每行短,行数也多)。
+    const line = "abcdefghij\n"; // 11 bytes
+    var i: usize = 0;
+    while (i < 30000) : (i += 1) _ = std.c.write(fd, line.ptr, line.len); // ~330KB
+    _ = std.c.close(fd);
+    defer _ = std.c.unlink(path);
+
+    // 整读(无 offset/limit)→ 拒读 + too large 提示。
+    const r1 = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-read-toobig.txt\"}");
+    defer std.testing.allocator.free(r1);
+    try std.testing.expect(std.mem.indexOf(u8, r1, "too large") != null);
+
+    // 带 limit → 放行(读前 N 行)。
+    const r2 = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-read-toobig.txt\",\"limit\":5}");
+    defer std.testing.allocator.free(r2);
+    try std.testing.expect(std.mem.indexOf(u8, r2, "too large") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r2, "abcdefghij") != null);
+}
+
+test "ReadTool 超长单行被截断 + 标记" {
+    const ctx = testCtx();
+    const path = "/tmp/cc-zig-read-longline.txt";
+    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    try std.testing.expect(fd >= 0);
+    // 一行 5000 个 'x'(超过 MAX_LINE_BYTES=2000),文件总字节 < 256KB 不触发大文件守卫。
+    const big_line = "x" ** 5000;
+    _ = std.c.write(fd, big_line.ptr, big_line.len);
+    _ = std.c.write(fd, "\n", 1);
+    _ = std.c.close(fd);
+    defer _ = std.c.unlink(path);
+
+    const r = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-read-longline.txt\"}");
+    defer std.testing.allocator.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "line truncated") != null);
+    // 截断后该行的 x 数应 ≤ MAX_LINE_BYTES。
+    var xcount: usize = 0;
+    for (r) |c| {
+        if (c == 'x') xcount += 1;
+    }
+    try std.testing.expect(xcount <= MAX_LINE_BYTES);
 }

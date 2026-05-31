@@ -17,6 +17,37 @@ pub const MAX_TIMEOUT_MS: u64 = 24 * 3600 * 1000;
 /// 同步模式超过此时长自动转后台：与 TS 对齐（ASSISTANT_BLOCKING_BUDGET_MS）
 pub const AUTO_BACKGROUND_MS: u64 = 15_000;
 
+/// 前台 Bash 单股(stdout/stderr)输出上限,超出截断(对齐 Claude Code 30K 字符)。
+/// 防止 `cat huge` / `seq 1000000` 等把整个输出灌进上下文。
+pub const MAX_OUTPUT_BYTES: usize = 30_000;
+
+/// 把输出截断到 ≤ MAX_OUTPUT_BYTES(保留头部),超出时追加 `... [N lines truncated] ...`。
+/// 切点回退到不超过上限的最近 UTF-8 字符边界 + 最近换行(不切坏多字节/半行)。
+/// 返回 owned slice(调用方 free);未超限时返回原文 dupe。
+fn truncateHead(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    if (s.len <= MAX_OUTPUT_BYTES) return try allocator.dupe(u8, s);
+
+    // 1. 先定到 MAX_OUTPUT_BYTES,回退到 UTF-8 字符边界(continuation byte 0b10xxxxxx)。
+    var cut = MAX_OUTPUT_BYTES;
+    while (cut > 0 and (s[cut] & 0b1100_0000) == 0b1000_0000) : (cut -= 1) {}
+    // 2. 再回退到最近换行(让截断落在行边界,输出更整齐);若该行很长找不到则就用 cut。
+    if (std.mem.lastIndexOfScalar(u8, s[0..cut], '\n')) |nl| {
+        if (nl + 1 >= MAX_OUTPUT_BYTES / 2) cut = nl + 1; // 仅当不会砍掉过多时才退到换行
+    }
+    // 统计被砍掉的行数(剩余部分的 \n 数 + 1 行尾)。
+    var dropped_lines: usize = 0;
+    for (s[cut..]) |c| {
+        if (c == '\n') dropped_lines += 1;
+    }
+    if (s[s.len - 1] != '\n') dropped_lines += 1;
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    try out.writer.writeAll(s[0..cut]);
+    try out.writer.print("\n... [{d} lines truncated] ...\n", .{dropped_lines});
+    return try out.toOwnedSlice();
+}
+
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
     const command_escaped = common.extractJsonArg(args, "command") orelse return error.MissingCommand;
@@ -112,12 +143,18 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer allocator.free(out.stdout);
     defer allocator.free(out.stderr);
 
+    // 截断到 MAX_OUTPUT_BYTES(保留头部),防大输出撑爆上下文。
+    const out_trunc = try truncateHead(allocator, out.stdout);
+    defer allocator.free(out_trunc);
+    const err_trunc = try truncateHead(allocator, out.stderr);
+    defer allocator.free(err_trunc);
+
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"stdout\":");
-    try std.json.Stringify.encodeJsonString(out.stdout, .{}, &aw.writer);
+    try std.json.Stringify.encodeJsonString(out_trunc, .{}, &aw.writer);
     try aw.writer.writeAll(",\"stderr\":");
-    try std.json.Stringify.encodeJsonString(out.stderr, .{}, &aw.writer);
+    try std.json.Stringify.encodeJsonString(err_trunc, .{}, &aw.writer);
     try aw.writer.print(",\"exit_code\":{d}}}", .{out.exit_code});
     return try aw.toOwnedSlice();
 }
@@ -174,12 +211,17 @@ fn readJobAsSync(allocator: std.mem.Allocator, j: *const @import("../core/job_re
     const err_bytes = readWholeFile(j.stderr_path, allocator) catch try allocator.dupe(u8, "");
     defer allocator.free(err_bytes);
 
+    const out_trunc = try truncateHead(allocator, out_bytes);
+    defer allocator.free(out_trunc);
+    const err_trunc = try truncateHead(allocator, err_bytes);
+    defer allocator.free(err_trunc);
+
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"stdout\":");
-    try std.json.Stringify.encodeJsonString(out_bytes, .{}, &aw.writer);
+    try std.json.Stringify.encodeJsonString(out_trunc, .{}, &aw.writer);
     try aw.writer.writeAll(",\"stderr\":");
-    try std.json.Stringify.encodeJsonString(err_bytes, .{}, &aw.writer);
+    try std.json.Stringify.encodeJsonString(err_trunc, .{}, &aw.writer);
     try aw.writer.print(",\"exit_code\":{d}}}", .{j.exit_code orelse 0});
     return try aw.toOwnedSlice();
 }
@@ -190,14 +232,19 @@ fn formatAutoBackgrounded(allocator: std.mem.Allocator, j: *const @import("../co
     const err_bytes = readWholeFile(j.stderr_path, allocator) catch try allocator.dupe(u8, "");
     defer allocator.free(err_bytes);
 
+    const out_trunc = try truncateHead(allocator, out_bytes);
+    defer allocator.free(out_trunc);
+    const err_trunc = try truncateHead(allocator, err_bytes);
+    defer allocator.free(err_trunc);
+
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"auto_backgrounded\":true,\"job_id\":");
     try std.json.Stringify.encodeJsonString(j.id[0..], .{}, &aw.writer);
     try aw.writer.writeAll(",\"partial_stdout\":");
-    try std.json.Stringify.encodeJsonString(out_bytes, .{}, &aw.writer);
+    try std.json.Stringify.encodeJsonString(out_trunc, .{}, &aw.writer);
     try aw.writer.writeAll(",\"partial_stderr\":");
-    try std.json.Stringify.encodeJsonString(err_bytes, .{}, &aw.writer);
+    try std.json.Stringify.encodeJsonString(err_trunc, .{}, &aw.writer);
     try aw.writer.writeAll(",\"note\":\"Command exceeded 15s; moved to background. Use BashOutput to poll or KillShell to terminate.\"}");
     return try aw.toOwnedSlice();
 }
@@ -302,4 +349,38 @@ test "BashTool auto-backgrounds after 15s" {
         if (j.status == .running) registry.kill(j.idSlice()) catch {};
     }
 }
+
+test "truncateHead: 小输出原样,大输出截断 + 标记" {
+    const a = std.testing.allocator;
+    // 小输出不截。
+    const small = try truncateHead(a, "hello\nworld\n");
+    defer a.free(small);
+    try std.testing.expectEqualStrings("hello\nworld\n", small);
+
+    // 大输出(> MAX_OUTPUT_BYTES)截到 ≤ 上限 + 含 truncated 标记。
+    const big = try a.alloc(u8, MAX_OUTPUT_BYTES + 5000);
+    defer a.free(big);
+    @memset(big, 'a');
+    // 撒一些换行,让回退到换行的逻辑有料。
+    var i: usize = 0;
+    while (i < big.len) : (i += 80) big[i] = '\n';
+    const trunc = try truncateHead(a, big);
+    defer a.free(trunc);
+    try std.testing.expect(std.mem.indexOf(u8, trunc, "lines truncated") != null);
+    // 截断后正文(不含标记)应 ≤ MAX_OUTPUT_BYTES。
+    const marker = std.mem.indexOf(u8, trunc, "\n... [").?;
+    try std.testing.expect(marker <= MAX_OUTPUT_BYTES);
+}
+
+test "BashTool 大输出被截断(防撑爆上下文)" {
+    const a = std.testing.allocator;
+    const ctx = ToolContext{ .allocator = a };
+    // seq 到很大 → stdout 远超 30K → 应截断 + 含 truncated 标记。
+    const r = try execute(&ctx, "{\"command\":\"seq 1 100000\"}");
+    defer a.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "lines truncated") != null);
+    // 整个返回 JSON 不该是完整 100000 行(粗略:远小于 ~600KB)。
+    try std.testing.expect(r.len < 60_000);
+}
+
 

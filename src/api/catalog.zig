@@ -92,6 +92,16 @@ pub const Catalog = struct {
         }
         return model_fallback.maxOutputTokens(model);
     }
+
+    /// 返回 model 的 input context window(用于 auto-compact 阈值)。
+    /// 查 catalog 的 max_input_tokens;没命中 → 保守默认 200K(Claude 标准 context window)。
+    /// 注意:这是 **input 上限**,与 maxTokensFor(output 上限)是两回事——auto-compact 该用本函数。
+    pub fn maxInputTokensFor(self: *const Catalog, model: []const u8) u32 {
+        for (self.entries.items) |e| {
+            if (std.mem.eql(u8, e.model_id, model)) return e.max_input_tokens;
+        }
+        return 200_000;
+    }
 };
 
 // --- JSON 辅助 ---
@@ -229,6 +239,16 @@ test "Catalog: user override beats catalog" {
     defer c.deinit();
     try c.loadFromModelsListJson("{\"data\":[{\"id\":\"x\",\"max_tokens\":1000}]}");
     try testing.expect(c.maxTokensFor("x", 500) == 500);
+}
+
+test "Catalog: maxInputTokensFor 用 context window 非 output max_tokens(auto-compact 阈值用)" {
+    var c = Catalog.init(testing.allocator);
+    defer c.deinit();
+    // max_input_tokens 显式给 → 用它(context window);缺失 → 200K 默认。
+    try c.loadFromModelsListJson("{\"data\":[{\"id\":\"m1\",\"max_tokens\":32000,\"max_input_tokens\":200000},{\"id\":\"m2\",\"max_tokens\":8192}]}");
+    try testing.expect(c.maxInputTokensFor("m1") == 200_000); // 不是 32000
+    try testing.expect(c.maxInputTokensFor("m2") == 200_000); // 缺失 → 默认
+    try testing.expect(c.maxInputTokensFor("unknown") == 200_000); // 未命中 → 默认
 }
 
 test "Catalog: unknown model falls back to local table" {

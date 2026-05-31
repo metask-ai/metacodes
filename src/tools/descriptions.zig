@@ -26,6 +26,8 @@ const READ_DESC =
     \\Usage:
     \\- The file_path parameter must be an absolute path, not a relative path
     \\- By default, it reads up to 2000 lines starting from the beginning of the file
+    \\- Files larger than 256KB are rejected for a full read — pass offset+limit to read a range, or use Grep to find specific content
+    \\- Very long single lines are truncated; the marker "[line truncated]" indicates this
     \\- You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters
     \\- When you already know which part of the file you need, only read that part. This can be important for larger files.
     \\- Results are returned using cat -n format, with line numbers starting at 1
@@ -117,6 +119,7 @@ pub fn describeGrep(allocator: std.mem.Allocator, ctx: *const PromptContext) any
         \\- Supports full regex syntax (e.g., "log.*Error", "function\s+\w+")
         \\- Filter files with glob parameter (e.g., "*.js", "**/*.tsx") or type parameter (e.g., "js", "py", "rust")
         \\- Output modes: "content" shows matching lines, "files_with_matches" shows only file paths (default), "count" shows match counts
+        \\- Results are capped at 250 lines by default (head_limit); pass head_limit:0 for unlimited, or use offset to page. Prefer narrowing the pattern over fetching everything.
         ,
         agent_line,
         "\n",
@@ -167,7 +170,8 @@ pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) any
         \\- You can use the `run_in_background` parameter to run the command in the background. Only use this if you don't need the result immediately and are OK being notified when the command completes later. You do not need to use '&' at the end of the command when using this parameter.
         \\- VERY IMPORTANT: You MUST avoid using search commands like `find` and `grep`. Instead use Grep, Glob, or Agent to search. You MUST avoid read tools like `cat`, `head`, `tail`, and `ls`, and use Read and LS to read files.
         \\- If you _still_ need to run `grep`, STOP. ALWAYS USE ripgrep at `rg` first, which all MetaCode users have pre-installed.
-        \\- When issuing multiple commands, use the ';' or '&&' operator to separate them. DO NOT use newlines.{s}{s}
+        \\- When issuing multiple commands, use the ';' or '&&' operator to separate them. DO NOT use newlines.
+        \\- Output (stdout/stderr) is truncated to ~30KB; a "[N lines truncated]" marker indicates this. Pipe through `head`/`tail` or write to a file and Read a range when you need more.{s}{s}
     , .{ git_section, readonly_note });
 }
 
