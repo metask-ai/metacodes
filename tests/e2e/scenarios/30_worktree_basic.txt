@@ -1,0 +1,5 @@
+请使用 EnterWorktree 工具创建一个名为 feature-x 的新 git worktree 并进入它。
+---
+现在你应该在新 worktree 里。请用 Write 工具创建一个文件 wt-file.txt,内容写一行:created inside worktree。
+---
+请使用 ExitWorktree 工具,action 设为 keep,离开 worktree 回到原目录。然后用一句话总结你做了什么。

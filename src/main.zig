@@ -16,6 +16,10 @@ pub const conversation = @import("core/conversation.zig");
 pub const agent_loop = @import("core/agent_loop.zig");
 pub const core_subagent = @import("core/subagent.zig");
 pub const tools = @import("tools.zig");
+pub const task_tools = @import("tools/task_tools.zig");
+pub const core_task_store = @import("core/task_store.zig");
+pub const tool_context = @import("tools/context.zig");
+pub const tool_error = @import("core/tool_error.zig");
 pub const bash = @import("tools/bash.zig");
 pub const grep = @import("tools/grep.zig");
 pub const glob = @import("tools/glob.zig");
@@ -39,15 +43,51 @@ pub const agents_filter = @import("agents/filter.zig");
 pub const agents_preload = @import("agents/preload.zig");
 pub const tools_dynamic = @import("tools/dynamic.zig");
 pub const system_prompt = @import("core/system_prompt.zig");
+pub const util_log = @import("util/log.zig");
+pub const tui_render_region = @import("repl/tui/render_region.zig");
+pub const tui_status_bar = @import("repl/tui/widget/status_bar.zig");
+pub const tui_verbs = @import("repl/tui/verbs.zig");
+pub const answer_queue = @import("core/answer_queue.zig");
+pub const recorder = @import("core/recorder.zig");
+
+/// 测试钩子:暴露 parseArgs 给 L2(base_url_flag_test 等)。
+/// 传入 argv(含 argv[0] 占位),返回解析后的 Config。
+/// 注意:不要传 --help(会 std.process.exit 杀测试)。
+pub fn parseArgsForTest(argv: []const [*:0]const u8, allocator: std.mem.Allocator) types.Config {
+    var config = types.Config{};
+    var args = std.process.Args.iterate(.{ .vector = argv });
+    parseArgsInto(&config, &args, allocator);
+    return config;
+}
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
-    const config = parseArgs(init, allocator);
+    var config = parseArgs(init, allocator);
 
     // 初始化日志：读 METACODES_LOG / METACODES_LOG_FILE 环境变量
     const log = @import("util/log.zig");
     log.initFromEnv();
     if (config.verbose) log.enableVerbose();
+
+    // --- env fallback:base_url / record_dir(CLI flag 优先,env 兜底)---
+    if (config.base_url == null) {
+        if (std.c.getenv("METACODES_BASE_URL")) |c| config.base_url = std.mem.span(c);
+    }
+    if (config.record_dir == null) {
+        if (std.c.getenv("METACODES_RECORD_DIR")) |c| config.record_dir = std.mem.span(c);
+    }
+
+    // --- 预置应答队列(Stage 3):--answers-file 优先,METACODES_ANSWERS env 兜底 ---
+    if (config.answers_file) |p| {
+        answer_queue.loadFromFile(allocator, p) catch |e|
+            log.warn("answers", "load answers-file {s} failed: {s}", .{ p, @errorName(e) });
+    } else if (std.c.getenv("METACODES_ANSWERS")) |c| {
+        answer_queue.loadFromFile(allocator, std.mem.span(c)) catch |e|
+            log.warn("answers", "load METACODES_ANSWERS failed: {s}", .{@errorName(e)});
+    }
+
+    // --- record/replay cassette 录制目录(Stage 7)---
+    if (config.record_dir) |dir| recorder.setDir(dir);
 
     // API key 优先级：CLI `--api-key <k>` > 硬编码 token。
     // 不读 ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN：这个代理后端与硬编码 token 绑定，
@@ -109,6 +149,12 @@ fn dumpPromptAndExit(app: *app_mod.App) noreturn {
 fn parseArgs(init: std.process.Init, allocator: std.mem.Allocator) types.Config {
     var config = types.Config{};
     var args = std.process.Args.iterate(init.minimal.args);
+    parseArgsInto(&config, &args, allocator);
+    return config;
+}
+
+/// 共享解析逻辑(parseArgs 生产路径 + parseArgsForTest 测试路径都走它)。
+fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, allocator: std.mem.Allocator) void {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printHelp();
@@ -127,6 +173,12 @@ fn parseArgs(init: std.process.Init, allocator: std.mem.Allocator) types.Config 
             if (args.next()) |s| config.disallowed_tools = allocator.dupe(u8, s) catch s;
         } else if (std.mem.eql(u8, arg, "--add-dir")) {
             if (args.next()) |s| config.add_dirs = appendNulList(allocator, config.add_dirs, s);
+        } else if (std.mem.eql(u8, arg, "--answers-file")) {
+            if (args.next()) |s| config.answers_file = allocator.dupe(u8, s) catch s;
+        } else if (std.mem.eql(u8, arg, "--base-url")) {
+            if (args.next()) |s| config.base_url = allocator.dupe(u8, s) catch s;
+        } else if (std.mem.eql(u8, arg, "--record")) {
+            if (args.next()) |s| config.record_dir = allocator.dupe(u8, s) catch s;
         } else if (std.mem.eql(u8, arg, "--max-tokens")) {
             if (args.next()) |s| {
                 config.max_tokens = std.fmt.parseInt(u32, s, 10) catch null;
@@ -146,7 +198,6 @@ fn parseArgs(init: std.process.Init, allocator: std.mem.Allocator) types.Config 
             config.prompt = readAllStdin(allocator) catch null;
         }
     }
-    return config;
 }
 
 /// 读 stdin 全部内容（headless `-` 模式）。EOF 即停。
@@ -188,6 +239,9 @@ fn printHelp() void {
         \\  --allowedTools <list> Comma-separated allow rules, e.g. "Bash(git *),Read"
         \\  --disallowedTools <l> Comma-separated deny rules
         \\  --add-dir <path>      Extra read/write directory (repeatable)
+        \\  --answers-file <path> Preset answers for permission .ask / AskUserQuestion (non-tty)
+        \\  --base-url <url>      Override API endpoint (must end with /v1/messages)
+        \\  --record <dir>        Record requests + SSE responses to dir (cassette)
         \\  --no-theme            Disable colors
         \\  --verbose             Verbose output
         \\  -h, --help            This help
@@ -225,6 +279,7 @@ test {
     _ = &@import("api/catalog.zig");
     _ = &@import("tools/context.zig");
     _ = &@import("repl/input.zig");
+    _ = &@import("repl/msg_queue.zig");
     _ = &@import("repl/history.zig");
     _ = &@import("repl/multiline.zig");
     _ = &@import("repl/render.zig");

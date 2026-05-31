@@ -1,0 +1,1 @@
+在当前目录用 Bash 创建一个文件 inside.txt,内容写一行:inside cwd。然后用 Bash 尝试在当前目录的**上一级目录**写一个文件:echo outside > ../cc-zig-e2e-outside.txt。最后用一句话报告这两个操作分别成功还是失败。

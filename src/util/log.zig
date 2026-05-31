@@ -118,6 +118,16 @@ pub fn setLevel(level: Level) void {
     g_default_level = level;
 }
 
+/// 测试钩子:直接注入日志文件 fd(绕过 METACODES_LOG_FILE 的一次性 init)。
+/// 用于 L2 测试断言 errId/warnId 落盘内容(如 Stage 6 HTTP 错误 body)。
+/// 同时把 g_initialized 置 1,避免后续 logImpl 触发 initFromEnv 覆盖。
+pub fn setLogFileFdForTest(fd: std.c.fd_t) void {
+    lock();
+    defer unlock();
+    g_initialized = true;
+    g_log_file_fd = fd;
+}
+
 /// 解析 "stream:debug,agent:info,*:warn" 这种字符串
 fn parseLogSpec(spec: []const u8) !void {
     // 简化：最多 16 个 filter

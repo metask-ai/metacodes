@@ -35,9 +35,52 @@ tests/e2e/run_e2e.sh 00_smoke
 
 # 自定义单段超时(秒,默认 600)
 E2E_TIMEOUT=900 tests/e2e/run_e2e.sh
+
+# 用 release 二进制(默认 debug,带 trace)
+E2E_BIN=release tests/e2e/run_e2e.sh
+
+# 保留策略:默认留最近 5 个 run;all 全留;0 跑完即删
+E2E_KEEP=all tests/e2e/run_e2e.sh
+E2E_KEEP=0   tests/e2e/run_e2e.sh
+
+# record/replay(Stage 7)
+E2E_RECORD=1 tests/e2e/run_e2e.sh 02_html_game          # 录 cassette
+tests/e2e/replay_e2e.sh runs/<ts>/02_html_game/cassette scenarios/02_html_game.txt
 ```
 
 跑前若没编译会自动 `zig build`。
+
+## 关键设计(2026-05-30 升级)
+
+- **调试基建(Stage 0)**:默认用 `metacodes-debug`(带 error-return-trace);分级日志
+  双写——精简 `<场景>.log`(stdout)+ 全量 `<场景>.debug.log`(请求体/SSE 行/工具入参/
+  权限决策);REPORT 含失败时间线 + transcript 关联。
+- **环境隔离(Stage 1)**:每场景独立 fake HOME(`<workdir>/.home`),隔离 transcript /
+  history / agents/skills/settings → 可重复、不污染真实 `~/.cc-zig`。
+- **`.conf` 场景配置**:同名 `scenarios/<name>.conf` 声明权限模式/settings/allowedTools/
+  answers/git-init/EXPECT 断言/超时。无 `.conf` 的老场景行为不变(默认 bypass)。
+- **EXPECT 断言(Stage 8)**:`EXPECT_FILE` / `EXPECT_CONTAINS` / `EXPECT_MIN_LINES` /
+  `EXPECT_ABSENT`,默认软(REPORT 标 PASS/FAIL),`EXPECT_HARD=1` 进退出码。
+- **应答通道(Stage 3)**:`ANSWERS=fixtures/x.txt` → `--answers-file`,让 default 模式下
+  `.ask` / AskUserQuestion 在无人值守下从预置队列弹应答(不读被 REPL 独占的 fd 0)。
+
+## `.conf` 格式
+
+```
+PERMISSION=default|acceptEdits|plan|auto|dontAsk|bypassPermissions   # 默认 bypass
+SETTINGS=fixtures/sandbox.json          # --settings
+ALLOWED_TOOLS=Read,Bash(ls *)           # --allowedTools
+DISALLOWED_TOOLS=Write                  # --disallowedTools
+ADD_DIR=/tmp/extra                      # --add-dir(可重复)
+ANSWERS=fixtures/answers_x.txt          # --answers-file
+GIT_INIT=1                              # 框架预先 git init + 初始 commit(worktree 用)
+EXPECT_FILE=path/to/file
+EXPECT_CONTAINS=path:substring
+EXPECT_MIN_LINES=path:N
+EXPECT_ABSENT=:substring                # 空 path = 在 log 里找
+EXPECT_HARD=0|1                         # 1 = FAIL 进退出码
+TIMEOUT=600
+```
 
 ## 产物
 

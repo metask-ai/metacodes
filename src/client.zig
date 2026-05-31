@@ -85,6 +85,11 @@ pub const Client = struct {
         return client.catalog.maxTokensFor(client.model, client.max_tokens_override);
     }
 
+    /// 按当前 model 解析 input context window(用于 auto-compact 阈值,非 output max_tokens)。
+    pub fn resolveMaxInputTokens(client: *const Client) u32 {
+        return client.catalog.maxInputTokensFor(client.model);
+    }
+
     /// 启动时探测 `/v1/models` → 填 catalog。失败静默（不报错，fallback 仍可用）。
     pub fn probeModels(client: *Client) void {
         const body = client.doGetModels() catch |err| {
@@ -228,6 +233,9 @@ pub const Client = struct {
         });
         log.debugId("client", rid, "request body:\n{s}", .{body});
 
+        // record/replay(Stage 7):录请求 body(开启新一轮 cassette)。dir 未设时 no-op。
+        @import("core/recorder.zig").recordRequest(body);
+
         const uri = std.Uri.parse(client.base_url) catch {
             log.errId("client", rid, "invalid url", .{});
             return error.InvalidUrl;
@@ -285,47 +293,34 @@ pub const Client = struct {
 
         switch (status) {
             .ok => {},
+            // 错误分支:读 body 进 log 后直接 return error。
+            // 清理交给 errdefer(:253 destroy + :266 deinit)——分支内**不要**手动
+            // deinit/destroy,否则与 errdefer 双重释放 → segfault(这些路径过去无测试
+            // 覆盖,Stage 6 L2 首次触发才暴露此潜伏 bug)。
             .unauthorized => {
-                req_ptr.deinit();
-                client.allocator.destroy(req_ptr);
+                logErrorBody(req_ptr, rid, status, http_response);
                 return error.Unauthorized;
             },
             .too_many_requests => {
-                req_ptr.deinit();
-                client.allocator.destroy(req_ptr);
+                logErrorBody(req_ptr, rid, status, http_response);
                 return error.RateLimited;
             },
             .internal_server_error => {
-                req_ptr.deinit();
-                client.allocator.destroy(req_ptr);
+                logErrorBody(req_ptr, rid, status, http_response);
                 return error.ServerError;
             },
             .bad_gateway => {
-                req_ptr.deinit();
-                client.allocator.destroy(req_ptr);
+                logErrorBody(req_ptr, rid, status, http_response);
                 return error.BadGateway;
             },
             .service_unavailable => {
-                req_ptr.deinit();
-                client.allocator.destroy(req_ptr);
+                logErrorBody(req_ptr, rid, status, http_response);
                 return error.ServiceUnavailable;
             },
             else => {
                 // 4xx/other：读 body 进 log 便于 debug。否则用户只看到 "HttpError"，
                 // 不知道是 model 名错、字段不识别、还是 API key 过期。
-                var err_body: [2048]u8 = undefined;
-                const body_reader_tmp = req_ptr.reader.bodyReader(
-                    err_body[0..],
-                    http_response.head.transfer_encoding,
-                    http_response.head.content_length,
-                );
-                const n = body_reader_tmp.readSliceShort(err_body[0..]) catch 0;
-                const preview = err_body[0..@min(n, err_body.len)];
-                log.errId("client", rid, "HTTP {d} {s}: body={s}", .{
-                    @intFromEnum(status), @tagName(status), preview,
-                });
-                req_ptr.deinit();
-                client.allocator.destroy(req_ptr);
+                logErrorBody(req_ptr, rid, status, http_response);
                 return error.HttpError;
             },
         }
@@ -364,6 +359,28 @@ fn timestampMs() u64 {
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) return 0;
     return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
+}
+
+/// HTTP 错误现场:读响应 body(截断 2KB)以 err 级打日志。
+/// 五个明确 status 分支(401/429/500/502/503)和 else 分支共用,避免"零现场"return。
+/// 必须在 req_ptr.deinit() 之前调用(reader 还活着)。
+fn logErrorBody(
+    req_ptr: *http.Client.Request,
+    rid: log.RequestId,
+    status: http.Status,
+    http_response: http.Client.Response,
+) void {
+    var err_body: [2048]u8 = undefined;
+    const body_reader_tmp = req_ptr.reader.bodyReader(
+        err_body[0..],
+        http_response.head.transfer_encoding,
+        http_response.head.content_length,
+    );
+    const n = body_reader_tmp.readSliceShort(err_body[0..]) catch 0;
+    const preview = err_body[0..@min(n, err_body.len)];
+    log.errId("client", rid, "HTTP {d} {s}: body={s}", .{
+        @intFromEnum(status), @tagName(status), preview,
+    });
 }
 
 /// Token 打码：只露前 6 + 后 4 字符（常见格式 `sk-xxxxxxxx...yyyy`）。
@@ -454,6 +471,12 @@ pub const StreamResponse = struct {
                 log.warnId("stream", self.id, "aborted during event read", .{});
                 return error.Aborted;
             },
+            error.ApiErrorEvent => {
+                // SSE `event: error` 帧:API 主动报错(overloaded/invalid_request 等)。
+                // 上抛**区分性** error,不塌缩成 RequestFailed,让 agent_loop/测试能识别。
+                log.warnId("stream", self.id, "API error event surfaced", .{});
+                return error.ApiError;
+            },
             else => {
                 log.warnId("stream", self.id, "event_iter.next failed: {s}", .{@errorName(err)});
                 return error.RequestFailed;
@@ -495,7 +518,7 @@ fn parseApiResponse(data: []const u8, allocator: std.mem.Allocator) !ApiResponse
     if (std.mem.indexOf(u8, data, "\"stop_reason\":")) |idx| {
         const start = idx + 14;
         const end = std.mem.indexOfScalar(u8, data[start..], ',') orelse (std.mem.indexOfScalar(u8, data[start..], '}') orelse data.len);
-        response.stop_reason = data[start..start + end];
+        response.stop_reason = data[start .. start + end];
     }
 
     if (std.mem.indexOf(u8, data, "\"tool_calls\":[")) |tc_idx| {

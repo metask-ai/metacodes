@@ -12,13 +12,15 @@
 const std = @import("std");
 const common = @import("common.zig");
 const util_json = @import("../util/json.zig");
+const answer_queue = @import("../core/answer_queue.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
 
-    // 非 TTY 下拒绝（否则会吞掉 pipe 输入或死等）
-    if (std.c.isatty(0) == 0) return error.NotATty;
+    // 非 TTY 且应答队列从未加载 → 拒绝(否则会吞掉 pipe 输入或死等)。
+    // 队列曾加载(Stage 3 e2e)时放行:每问从队列弹一条;耗尽则用第一个 option 兜底。
+    if (std.c.isatty(0) == 0 and !answer_queue.wasLoaded()) return error.NotATty;
 
     // 解析 questions 数组。用 std.json.parseFromSlice 取 root.object.get("questions")。
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, args, .{});
@@ -40,6 +42,21 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         const options_v = q_v.object.get("options") orelse return error.InvalidArgs;
         if (question_v != .string or options_v != .array) return error.InvalidArgs;
         if (options_v.array.items.len < 2 or options_v.array.items.len > 4) return error.InvalidArgs;
+
+        // 预置应答队列(Stage 3 e2e):弹一条作为本问应答。
+        // 数字 → 选第 N 项(1-based);否则按 label 精确匹配,匹配不到则用原文。
+        // 队列耗尽但曾加载 → 用第一个 option 兜底(绝不读 fd 0 死等)。
+        if (answer_queue.wasLoaded()) {
+            if (answer_queue.pop()) |picked| {
+                const ans = try resolveAnswer(picked, options_v.array.items, allocator);
+                try answers.append(allocator, ans);
+            } else {
+                const first = options_v.array.items[0];
+                const txt = if (first == .string) first.string else "";
+                try answers.append(allocator, try allocator.dupe(u8, txt));
+            }
+            continue;
+        }
 
         const ans = try askOne(question_v.string, options_v.array.items, allocator);
         try answers.append(allocator, ans);
@@ -79,6 +96,22 @@ fn askOne(question: []const u8, options: []const std.json.Value, allocator: std.
         if (choice < 1 or choice > options.len) continue;
         return try allocator.dupe(u8, options[choice - 1].string);
     }
+}
+
+/// 把预置应答(数字序号 或 label 文本)解析成被选中的 option text(owned)。
+/// 数字 N(1-based)→ options[N-1];否则按 label 精确匹配;都不匹配 → 原文 dupe。
+fn resolveAnswer(picked: []const u8, options: []const std.json.Value, allocator: std.mem.Allocator) ![]const u8 {
+    if (std.fmt.parseInt(usize, picked, 10)) |idx| {
+        if (idx >= 1 and idx <= options.len and options[idx - 1] == .string) {
+            return allocator.dupe(u8, options[idx - 1].string);
+        }
+    } else |_| {}
+    for (options) |o| {
+        if (o == .string and std.mem.eql(u8, o.string, picked)) {
+            return allocator.dupe(u8, o.string);
+        }
+    }
+    return allocator.dupe(u8, picked);
 }
 
 // ============================================================================

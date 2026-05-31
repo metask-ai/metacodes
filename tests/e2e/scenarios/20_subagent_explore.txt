@@ -1,0 +1,3 @@
+先用 Bash 创建两个文件:apple.txt(写一行 "red fruit")和 banana.txt(写一行 "yellow fruit")。
+---
+请使用 Task 工具,subagent_type 设为 Explore,让它探索当前目录下有哪些文件、每个文件的内容是什么,然后把探索结果总结给我。注意 Explore 只做只读探索,不要修改任何文件。

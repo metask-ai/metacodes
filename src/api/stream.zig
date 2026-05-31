@@ -20,6 +20,7 @@ pub const SseEventType = enum {
     message_delta,
     message_stop,
     ping,
+    error_event,
     unknown,
 };
 
@@ -40,6 +41,9 @@ pub fn parseEventType(data: []const u8) SseEventType {
     if (std.mem.eql(u8, type_value, "message_delta")) return .message_delta;
     if (std.mem.eql(u8, type_value, "message_stop")) return .message_stop;
     if (std.mem.eql(u8, type_value, "ping")) return .ping;
+    // Anthropic 错误以 data 帧形式到达:{"type":"error","error":{"type":"overloaded_error",...}}
+    // 识别为 error_event,由 EventIterator 上抛明确 error(不再静默归 .unknown 跳过)。
+    if (std.mem.eql(u8, type_value, "error")) return .error_event;
     return .unknown;
 }
 
@@ -240,9 +244,18 @@ pub fn renderWebSearchResults(allocator: std.mem.Allocator, content_array: []con
 
     while (i < content_array.len) : (i += 1) {
         const c = content_array[i];
-        if (escaped) { escaped = false; continue; }
-        if (c == '\\') { escaped = true; continue; }
-        if (c == '"') { in_str = !in_str; continue; }
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (c == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (c == '"') {
+            in_str = !in_str;
+            continue;
+        }
         if (in_str) continue;
         if (c == '{') {
             if (depth == 0) obj_start = i;
@@ -250,7 +263,7 @@ pub fn renderWebSearchResults(allocator: std.mem.Allocator, content_array: []con
         } else if (c == '}') {
             depth -= 1;
             if (depth == 0) {
-                const obj = content_array[obj_start.?..i + 1];
+                const obj = content_array[obj_start.? .. i + 1];
                 const title = findTopLevelStringField(obj, "title") orelse "(no title)";
                 const url = findTopLevelStringField(obj, "url") orelse "(no url)";
                 var line_buf: [2048]u8 = undefined;
@@ -296,14 +309,23 @@ fn findTopLevelArrayFieldRaw(data: []const u8, field: []const u8) ?[]const u8 {
             var escaped = false;
             while (i < data.len) : (i += 1) {
                 const c = data[i];
-                if (escaped) { escaped = false; continue; }
-                if (c == '\\') { escaped = true; continue; }
-                if (c == '"') { in_str = !in_str; continue; }
+                if (escaped) {
+                    escaped = false;
+                    continue;
+                }
+                if (c == '\\') {
+                    escaped = true;
+                    continue;
+                }
+                if (c == '"') {
+                    in_str = !in_str;
+                    continue;
+                }
                 if (in_str) continue;
                 if (c == '[') depth += 1;
                 if (c == ']') {
                     depth -= 1;
-                    if (depth == 0) return data[start..i + 1];
+                    if (depth == 0) return data[start .. i + 1];
                 }
             }
             return null;
@@ -334,9 +356,18 @@ fn skipJsonValue(data: []const u8, start: usize) usize {
         var escaped = false;
         while (i < data.len and depth > 0) : (i += 1) {
             const ch = data[i];
-            if (escaped) { escaped = false; continue; }
-            if (ch == '\\') { escaped = true; continue; }
-            if (ch == '"') { in_str = !in_str; continue; }
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (ch == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (ch == '"') {
+                in_str = !in_str;
+                continue;
+            }
             if (in_str) continue;
             if (ch == open) depth += 1;
             if (ch == close) depth -= 1;
@@ -726,9 +757,13 @@ pub const EventIterator = struct {
             };
             const line = line_opt orelse {
                 self.logDebug("EOF reached (no message_stop before EOF)", .{});
+                @import("../core/recorder.zig").finishSse();
                 self.done_flag = true;
                 return null;
             };
+
+            // record/replay(Stage 7):录原始 SSE 行(保留 data: 帧 + 空行框架)。no-op 当未录制。
+            @import("../core/recorder.zig").recordSseLine(line);
 
             const data = parser.parseLine(line) orelse continue;
             const ev_type = parseEventType(data);
@@ -827,6 +862,7 @@ pub const EventIterator = struct {
                     }
                     self.done_flag = true;
                     self.logInfo("message_stop", .{});
+                    @import("../core/recorder.zig").finishSse();
                     return Event{ .done = {} };
                 },
                 .message_delta => {
@@ -857,6 +893,15 @@ pub const EventIterator = struct {
                         }
                     }
                     continue;
+                },
+                .error_event => {
+                    // Anthropic 错误帧:{"type":"error","error":{"type":"overloaded_error","message":"..."}}
+                    // 不再静默归 .unknown 跳过——打 err 日志并上抛明确 error,让上游区分
+                    // "API 主动报错" vs "网络/解析失败"(避免三类错误塌缩成 RequestFailed)。
+                    const err_obj = findTopLevelObjectField(data, "error") orelse data;
+                    self.logWarn("API error event: {s}", .{err_obj});
+                    self.done_flag = true;
+                    return error.ApiErrorEvent;
                 },
                 // ping / unknown → 跳过
                 else => continue,

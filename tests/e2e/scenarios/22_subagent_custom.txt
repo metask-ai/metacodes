@@ -1,0 +1,3 @@
+先用 Bash 创建一个文件 sample.py,内容是一个简单的 Python 函数:def add(a, b): return a + b。
+---
+请使用 Task 工具,subagent_type 设为 reviewer(这是一个预置的只读审查 agent),让它审查 sample.py 这个文件并给出意见。把审查结果转述给我。

@@ -1,0 +1,1 @@
+请使用 Task 工具委派一个 general-purpose subagent,任务是:让它再用 Task 工具委派一个子 subagent 去创建文件 nested.txt(内容写一行 "nested depth test"),然后逐层把结果汇报上来。这是在测试 subagent 嵌套(depth=2)。

@@ -1,0 +1,3 @@
+请用 Write 工具创建文件 first.txt,内容写一行:first file。
+---
+请用 Write 工具创建文件 second.txt,内容写一行:second file。完成后用一句话确认两个文件都建好了。

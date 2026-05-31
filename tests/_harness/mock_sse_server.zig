@@ -16,14 +16,28 @@ pub const MockServer = struct {
     body: []const u8,
     /// 每个 SSE event（\n\n 分隔）之间的 sleep，用于模拟慢流
     chunk_delay_ms: u32 = 0,
+    /// HTTP 状态行。默认 200 OK(走 chunked SSE)。非 200 时 sendResponse 发纯 body
+    /// (application/json,非 chunked)——用于 Stage 6 HTTP 错误现场 L2(401/429/5xx)。
+    status_line: []const u8 = "HTTP/1.1 200 OK",
     /// 捕获的请求 raw bytes(headers + body,完整 HTTP 请求)。serveOne 写入,lastRequest 读取。
     /// page_allocator 分配,stop 释放。
     captured_buf: ?[]u8 = null,
     captured_len: usize = 0,
     /// captured_buf 是否已写完(serveOne 写完后置 1)。读端用 .acquire 确保看到完整 buf。
     captured_ready: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    /// cassette 模式:多轮 SSE bodies(每个连接回一条,按序)。null = 单 body 模式。
+    cassette: ?[]const []const u8 = null,
+    /// cassette 当前轮游标(serveLoop 递增)。
+    cassette_pos: usize = 0,
 
     pub fn start(body: []const u8, chunk_delay_ms: u32) !*MockServer {
+        return startWithStatus(body, chunk_delay_ms, "HTTP/1.1 200 OK");
+    }
+
+    /// 起 server 并指定 HTTP 状态行。status_line 非 "...200 OK" 时,sendResponse 发纯 body
+    /// (application/json,非 chunked SSE),让客户端的错误分支读到 body。
+    /// 用于 Stage 6 L2:`startWithStatus("{\"error\":...}", 0, "HTTP/1.1 401 Unauthorized")`。
+    pub fn startWithStatus(body: []const u8, chunk_delay_ms: u32, status_line: []const u8) !*MockServer {
         const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
         if (fd < 0) return error.SocketFailed;
         errdefer _ = std.c.close(fd);
@@ -52,8 +66,47 @@ pub const MockServer = struct {
             .thread = undefined,
             .body = body,
             .chunk_delay_ms = chunk_delay_ms,
+            .status_line = status_line,
         };
         self.thread = try std.Thread.spawn(.{}, serveOne, .{self});
+        return self;
+    }
+
+    /// cassette 模式:多轮回放。每个进来的连接回 bodies[i](i 递增),耗尽后回最后一条。
+    /// 用于 record/replay(Stage 7):agent loop 多轮 tool-use,每轮一个 HTTP 请求。
+    /// backlog 设大些以容纳并发连接。bodies 借用 caller(server 存活期间必须有效)。
+    pub fn startCassette(bodies: []const []const u8, chunk_delay_ms: u32) !*MockServer {
+        const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+        if (fd < 0) return error.SocketFailed;
+        errdefer _ = std.c.close(fd);
+
+        const yes: c_int = 1;
+        _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, &yes, @sizeOf(c_int));
+
+        var addr = std.c.sockaddr.in{
+            .family = std.c.AF.INET,
+            .port = 0,
+            .addr = 0x0100007f,
+            .zero = [_]u8{0} ** 8,
+        };
+        if (std.c.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) < 0) return error.BindFailed;
+        if (std.c.listen(fd, 16) < 0) return error.ListenFailed;
+
+        var bound: std.c.sockaddr.in = undefined;
+        var blen: std.c.socklen_t = @sizeOf(@TypeOf(bound));
+        if (std.c.getsockname(fd, @ptrCast(&bound), &blen) < 0) return error.GetSocknameFailed;
+        const port = std.mem.bigToNative(u16, bound.port);
+
+        const self = try std.heap.page_allocator.create(MockServer);
+        self.* = .{
+            .listen_fd = fd,
+            .port = port,
+            .thread = undefined,
+            .body = if (bodies.len > 0) bodies[bodies.len - 1] else "",
+            .chunk_delay_ms = chunk_delay_ms,
+            .cassette = bodies,
+        };
+        self.thread = try std.Thread.spawn(.{}, serveLoop, .{self});
         return self;
     }
 
@@ -123,7 +176,71 @@ pub const MockServer = struct {
         sendResponse(conn_fd, self);
     }
 
+    /// cassette 多轮:循环 accept,每个连接读请求 + 回 cassette[pos](pos 递增,
+    /// 耗尽用最后一条)。listen_fd 关闭时 accept 返回 < 0,循环退出。
+    fn serveLoop(self: *MockServer) void {
+        while (true) {
+            var client_addr: std.c.sockaddr = undefined;
+            var alen: std.c.socklen_t = @sizeOf(@TypeOf(client_addr));
+            const conn_fd = std.c.accept(self.listen_fd, &client_addr, &alen);
+            if (conn_fd < 0) return; // listen_fd 已关闭(stop)
+            // 选本轮 body
+            const bodies = self.cassette orelse &[_][]const u8{self.body};
+            const idx = @min(self.cassette_pos, bodies.len - 1);
+            self.body = bodies[idx];
+            self.cassette_pos += 1;
+
+            // 读请求(同 serveOne)
+            const cap: usize = 64 * 1024;
+            const buf = std.heap.page_allocator.alloc(u8, cap) catch {
+                sendResponse(conn_fd, self);
+                _ = std.c.close(conn_fd);
+                continue;
+            };
+            var total: usize = 0;
+            var headers_end: ?usize = null;
+            var content_length: usize = 0;
+            while (total < cap and headers_end == null) {
+                const n = std.c.read(conn_fd, buf.ptr + total, cap - total);
+                if (n <= 0) break;
+                total += @intCast(n);
+                if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |i| {
+                    headers_end = i + 4;
+                    content_length = parseContentLength(buf[0..i]);
+                }
+            }
+            if (headers_end) |he| {
+                while (total < cap and (total - he) < content_length) {
+                    const need = content_length - (total - he);
+                    const want = @min(need, cap - total);
+                    if (want == 0) break;
+                    const n = std.c.read(conn_fd, buf.ptr + total, want);
+                    if (n <= 0) break;
+                    total += @intCast(n);
+                }
+            }
+            // 记录最近一次请求(覆盖式;cassette 模式主要关心回放,捕获取最后一轮)
+            if (self.captured_buf) |old| std.heap.page_allocator.free(old);
+            self.captured_buf = buf;
+            self.captured_len = total;
+            self.captured_ready.store(1, .release);
+
+            sendResponse(conn_fd, self);
+            _ = std.c.close(conn_fd);
+        }
+    }
+
     fn sendResponse(conn_fd: std.c.fd_t, self: *MockServer) void {
+        // 非 200:发纯 body(application/json,Content-Length),不走 chunked SSE。
+        // 让客户端的 HTTP 错误分支(logErrorBody)能读到 body。
+        if (std.mem.indexOf(u8, self.status_line, "200") == null) {
+            var hdr_buf: [256]u8 = undefined;
+            const hdr = std.fmt.bufPrint(&hdr_buf, "{s}\r\ncontent-type: application/json\r\ncontent-length: {d}\r\n\r\n", .{ self.status_line, self.body.len }) catch return;
+            _ = std.c.write(conn_fd, hdr.ptr, hdr.len);
+            _ = std.c.write(conn_fd, self.body.ptr, self.body.len);
+            return;
+        }
+
         const header =
             "HTTP/1.1 200 OK\r\n" ++
             "content-type: text/event-stream\r\n" ++
@@ -204,8 +321,14 @@ pub const CapturedRequest = struct {
         if (c == '"') {
             p += 1;
             while (p < b.len) : (p += 1) {
-                if (b[p] == '\\') { p += 1; continue; }
-                if (b[p] == '"') { p += 1; break; }
+                if (b[p] == '\\') {
+                    p += 1;
+                    continue;
+                }
+                if (b[p] == '"') {
+                    p += 1;
+                    break;
+                }
             }
             return b[start..p];
         }
@@ -218,15 +341,24 @@ pub const CapturedRequest = struct {
             while (p < b.len) : (p += 1) {
                 const ch = b[p];
                 if (in_str) {
-                    if (ch == '\\') { p += 1; continue; }
+                    if (ch == '\\') {
+                        p += 1;
+                        continue;
+                    }
                     if (ch == '"') in_str = false;
                     continue;
                 }
-                if (ch == '"') { in_str = true; continue; }
+                if (ch == '"') {
+                    in_str = true;
+                    continue;
+                }
                 if (ch == open) depth += 1;
                 if (ch == close) {
                     depth -= 1;
-                    if (depth == 0) { p += 1; break; }
+                    if (depth == 0) {
+                        p += 1;
+                        break;
+                    }
                 }
             }
             return b[start..p];
@@ -301,9 +433,7 @@ test "MockServer: captures request body + jsonField extracts fields" {
 
     const req_body = "{\"model\":\"claude-3-5-haiku-20241022\",\"max_tokens\":100,\"stream\":true,\"messages\":[]}";
     var hdr_buf: [256]u8 = undefined;
-    const hdr = try std.fmt.bufPrint(&hdr_buf,
-        "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\n\r\n",
-        .{req_body.len});
+    const hdr = try std.fmt.bufPrint(&hdr_buf, "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\n\r\n", .{req_body.len});
     _ = std.c.write(sock, hdr.ptr, hdr.len);
     _ = std.c.write(sock, req_body.ptr, req_body.len);
 

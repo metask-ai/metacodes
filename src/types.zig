@@ -29,6 +29,15 @@ pub const Config = struct {
     /// `--add-dir <path>`(可重复):额外可读写目录,注入 additionalDirectories。
     /// 多个用 `\x00` 分隔拼一串(parseArgs 累加)。
     add_dirs: ?[]const u8 = null,
+    /// `--answers-file <path>` / `METACODES_ANSWERS`:预置应答队列(Stage 3)。
+    /// 非 tty 下权限 .ask / AskUserQuestion 从队列按序弹出,而非读 fd 0(被 REPL 行流独占)。
+    answers_file: ?[]const u8 = null,
+    /// `--base-url <url>` / `METACODES_BASE_URL`:覆盖 API 端点(默认硬编码)。
+    /// 用于 record/replay(指向 mock server)。须以 `/v1/messages` 结尾。
+    base_url: ?[]const u8 = null,
+    /// `--record <dir>` / `METACODES_RECORD_DIR`:把每次请求 body + SSE 响应原始字节
+    /// dump 到该目录(cassette),供 replay 确定性复现。null = 不录制。
+    record_dir: ?[]const u8 = null,
 };
 
 /// 权限模式

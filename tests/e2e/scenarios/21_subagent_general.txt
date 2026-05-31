@@ -1,0 +1,1 @@
+请使用 Task 工具,subagent_type 设为 general-purpose,让它创建一个文件 report.md,里面写一段关于"贪吃蛇游戏设计"的简短说明(三五句话即可)。完成后告诉我 subagent 干了什么。

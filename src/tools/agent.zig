@@ -36,7 +36,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const tool_defs = ctx.tool_defs orelse return error.AgentUnavailable;
     const perm = ctx.permission_ctx orelse return error.AgentUnavailable;
 
-    const prompt_raw = util_json.extractStringField(args, "prompt") orelse return error.MissingField;
+    // 缺 prompt:返回**具名** error(对齐 Bash=MissingCommand / Grep=MissingPattern 约定),
+    // 让 agent_loop 的 "{name} failed with MissingPrompt" 现场告诉模型缺哪个字段,
+    // 而非笼统 MissingField(模型据此原地空参重试,见 e2e Task input={} 风暴)。
+    const prompt_raw = util_json.extractStringField(args, "prompt") orelse return error.MissingPrompt;
     const prompt = try util_json.unescapeString(prompt_raw, ctx.allocator);
     defer ctx.allocator.free(prompt);
 

@@ -47,11 +47,18 @@ fn contains(list: []const []const u8, name: []const u8) bool {
 }
 
 /// 阻塞式询问用户。返回 true = 允许。
-/// 先查 session 记忆;否则 TTY 走对话框,非 TTY 走文字。
+/// 先查 session 记忆;否则:有预置应答队列(非 tty e2e)→ 走文字路径从队列弹;
+/// 否则 TTY 走对话框,非 TTY 走文字。
 pub fn ask(tool_name: []const u8, args: []const u8) !bool {
     // session 记忆优先
     if (contains(g_always_allow[0..g_always_allow_count], tool_name)) return true;
     if (contains(g_session_deny[0..g_session_deny_count], tool_name)) return false;
+
+    // 预置应答队列曾加载(Stage 3 e2e)→ 强制走文字路径(askText 从队列弹/耗尽则
+    // 安全默认 deny,**绝不**退回读 fd 0——它被 REPL 行流独占,会死等)。
+    if (@import("../core/answer_queue.zig").wasLoaded()) {
+        return askText(tool_name, args);
+    }
 
     // TTY → 对话框
     if (term.isatty(0)) {
@@ -91,6 +98,20 @@ pub fn ask(tool_name: []const u8, args: []const u8) !bool {
 
 /// 最简文字 prompt(非 TTY / dialog 不可用时)。
 fn askText(tool_name: []const u8, args: []const u8) !bool {
+    const aq = @import("../core/answer_queue.zig");
+    // 预置应答队列(Stage 3 e2e):非 tty 下 fd 0 被 REPL 行流独占,从队列按序弹应答。
+    // y/Y/a(always) → 允许;其余(n 等)→ 拒绝。
+    if (aq.pop()) |ans| {
+        const yes = ans.len > 0 and (ans[0] == 'y' or ans[0] == 'Y' or ans[0] == 'a' or ans[0] == 'A');
+        std.debug.print("\x1b[2m[Permission] {s}: 预置应答 '{s}' → {s}\x1b[0m\n", .{ tool_name, ans, if (yes) "允许" else "拒绝" });
+        return yes;
+    }
+    // 队列曾加载但已耗尽 → 安全默认 deny(不退回 fd 0 死等)。
+    if (aq.wasLoaded()) {
+        std.debug.print("\x1b[2m[Permission] {s}: 应答队列耗尽 → 默认拒绝\x1b[0m\n", .{tool_name});
+        return false;
+    }
+
     const risk = category.getRiskLevel(tool_name);
     const risk_str: []const u8 = switch (risk) {
         .low => "LOW",

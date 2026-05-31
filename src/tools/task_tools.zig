@@ -30,12 +30,23 @@ fn requireStore(ctx: *const ToolContext) !*task_store.TaskStore {
 //     用于模型可能塞 \n \" 的文本字段（subject、description、activeForm、owner）。
 //     调用方负责 free。
 
+/// 把 field 名映射到具名 error(对齐 Bash=MissingCommand 约定),让 agent_loop 的
+/// "{tool} failed with MissingSubject" 现场告诉模型缺哪个字段,而非笼统 MissingField
+/// (模型据此原地空参重试,见 e2e Task/TaskCreate input={} 风暴)。
+fn missingFieldError(field: []const u8) anyerror {
+    if (std.mem.eql(u8, field, "subject")) return error.MissingSubject;
+    if (std.mem.eql(u8, field, "taskId")) return error.MissingTaskId;
+    if (std.mem.eql(u8, field, "description")) return error.MissingDescription;
+    if (std.mem.eql(u8, field, "status")) return error.MissingStatus;
+    return error.MissingField;
+}
+
 fn extractString(args: []const u8, field: []const u8) !?[]const u8 {
     return util_json.extractStringField(args, field);
 }
 
 fn extractStringOrError(args: []const u8, field: []const u8) ![]const u8 {
-    return util_json.extractStringField(args, field) orelse return error.MissingField;
+    return util_json.extractStringField(args, field) orelse return missingFieldError(field);
 }
 
 fn extractUnescaped(allocator: std.mem.Allocator, args: []const u8, field: []const u8) !?[]u8 {
@@ -44,7 +55,7 @@ fn extractUnescaped(allocator: std.mem.Allocator, args: []const u8, field: []con
 }
 
 fn extractUnescapedOrError(allocator: std.mem.Allocator, args: []const u8, field: []const u8) ![]u8 {
-    const raw = util_json.extractStringField(args, field) orelse return error.MissingField;
+    const raw = util_json.extractStringField(args, field) orelse return missingFieldError(field);
     return try util_json.unescapeString(raw, allocator);
 }
 
@@ -339,6 +350,28 @@ test "TaskCreate + TaskList roundtrip" {
     try testing.expect(std.mem.indexOf(u8, list, "\"First\"") != null);
     try testing.expect(std.mem.indexOf(u8, list, "\"Second\"") != null);
     try testing.expect(std.mem.indexOf(u8, list, "\"status\":\"pending\"") != null);
+}
+
+// e2e triage 修复:缺必需字段返回**具名** error(非笼统 MissingField),
+// 让模型从 "TaskCreate failed with MissingSubject" 知道缺哪个字段而非原地空参重试。
+test "TaskCreate({}) 缺 subject → 具名 MissingSubject(非 MissingField)" {
+    var store = task_store.TaskStore.init(testing.allocator);
+    defer store.deinit();
+    const ctx = testCtx(&store);
+    try testing.expectError(error.MissingSubject, executeCreate(&ctx, "{}"));
+}
+
+test "TaskGet({}) 缺 taskId → 具名 MissingTaskId" {
+    var store = task_store.TaskStore.init(testing.allocator);
+    defer store.deinit();
+    const ctx = testCtx(&store);
+    try testing.expectError(error.MissingTaskId, executeGet(&ctx, "{}"));
+}
+
+test "missingFieldError 映射" {
+    try testing.expectEqual(error.MissingSubject, missingFieldError("subject"));
+    try testing.expectEqual(error.MissingTaskId, missingFieldError("taskId"));
+    try testing.expectEqual(error.MissingField, missingFieldError("unknown_field"));
 }
 
 test "TaskGet returns full task" {
