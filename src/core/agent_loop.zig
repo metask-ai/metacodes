@@ -21,7 +21,29 @@ const tool_error = @import("tool_error.zig");
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
 
-pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error };
+pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error, tool_loop };
+
+/// 同一工具连续返回同样错误码达到此次数 → 判定模型陷入死循环,熔断中止本轮 run。
+/// 实战痛点(e2e 实测):MiniMax 端点对 Task/TaskCreate 反复发空参 `{}`,触发同一
+/// MissingField 错误,从 ~46 turn 烧到 max_turns=50 才停。3 次足以区分"偶发重试"
+/// 与"原地空参风暴";到达即注入明确终止现场并停。
+pub const MAX_SAME_TOOL_ERROR: u32 = 3;
+
+/// 工具失败签名:工具名 + 错误码 的哈希。用于检测"同工具同错连续 N 次"。
+/// 用哈希而非存切片:tu.name/code 生命周期随 turn 释放,存哈希避免悬挂。
+const ToolErrSig = struct {
+    name_hash: u64,
+    code_hash: u64,
+    fn of(name: []const u8, code: []const u8) ToolErrSig {
+        return .{
+            .name_hash = std.hash.Wyhash.hash(0, name),
+            .code_hash = std.hash.Wyhash.hash(0, code),
+        };
+    }
+    fn eql(a: ToolErrSig, b: ToolErrSig) bool {
+        return a.name_hash == b.name_hash and a.code_hash == b.code_hash;
+    }
+};
 
 /// Auto-compact 阈值下限:避免 catalog 返回异常小值(测试 mock、未知模型)导致每 turn 都 compact。
 /// 低于这个值不做压缩。设为 32K——正常对话/工具调研远小于此,只有真逼近 context window 才触发。
@@ -139,6 +161,11 @@ pub fn run(
     // max_tokens 续写计数:防止模型一直撞上限导致无限续写。上限 3 次。
     var continuations: u32 = 0;
     const MAX_CONTINUATIONS: u32 = 3;
+
+    // 工具错误熔断:跟踪上一次工具失败的签名 + 连续相同次数(跨 turn 累积)。
+    // 任意工具成功、或换了工具/错误码 → 重置。连续相同达 MAX_SAME_TOOL_ERROR → 熔断。
+    var last_err_sig: ?ToolErrSig = null;
+    var same_err_count: u32 = 0;
 
     while (turns < opts.max_turns) : (turns += 1) {
         // 开头检查 abort
@@ -343,6 +370,9 @@ pub fn run(
             result_blocks.deinit(allocator);
         }
 
+        // 本轮是否触发工具熔断(同工具同错连续 MAX_SAME_TOOL_ERROR 次)。
+        var tool_loop_tripped = false;
+
         for (last_msg.blocks) |b| {
             const tu = switch (b) {
                 .tool_use => |t| t,
@@ -421,6 +451,16 @@ pub fn run(
             } catch |err| {
                 log.warnId("agent", rid, "tool.exec FAILED name={s} err={s} duration_ms={d} input={s}", .{ tu.name, @errorName(err), util_time.nowMs() - t_start, tu.input[0..@min(tu.input.len, 200)] });
                 const code = if (err == error.UnknownTool) "UnknownTool" else @errorName(err);
+
+                // 熔断计数:同工具同错连续累积。换工具或换错误码 → 归 1。
+                const sig = ToolErrSig.of(tu.name, code);
+                if (last_err_sig != null and last_err_sig.?.eql(sig)) {
+                    same_err_count += 1;
+                } else {
+                    same_err_count = 1;
+                    last_err_sig = sig;
+                }
+
                 const err_json = try tool_error.errorToJson(code, "{s} failed with {s}", .{ tu.name, @errorName(err) }, allocator);
                 errdefer allocator.free(err_json);
                 try result_blocks.append(allocator, .{ .tool_result = .{
@@ -428,8 +468,17 @@ pub fn run(
                     .content = err_json,
                     .is_error = true,
                 } });
+
+                if (same_err_count >= MAX_SAME_TOOL_ERROR) {
+                    log.warnId("agent", rid, "tool-loop circuit breaker tripped: {s} failed with {s} x{d} consecutively", .{ tu.name, code, same_err_count });
+                    tool_loop_tripped = true;
+                }
                 continue;
             };
+
+            // 任意工具成功 → 重置熔断计数(模型脱离死循环)。
+            same_err_count = 0;
+            last_err_sig = null;
 
             log.infoId("agent", rid, "tool.exec done name={s} output_bytes={d} duration_ms={d}", .{ tu.name, exec_result.len, util_time.nowMs() - t_start });
             log.debugId("agent", rid, "tool.exec output={s}", .{exec_result});
@@ -448,6 +497,13 @@ pub fn run(
 
         const blocks_owned = try result_blocks.toOwnedSlice(allocator);
         try conversation.append(.{ .role = .user, .blocks = blocks_owned });
+
+        // 工具熔断:同工具同错连续 MAX_SAME_TOOL_ERROR 次 → 停。错误结果已写入
+        // conversation(供复盘),这里直接返回 .tool_loop,不再发下一轮请求——避免
+        // 模型原地空参风暴烧满 max_turns。
+        if (tool_loop_tripped) {
+            return .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls };
+        }
     }
 
     // 循环正常退出 = turns >= max_turns

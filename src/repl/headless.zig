@@ -129,6 +129,7 @@ fn emitJson(
         .aborted => "aborted",
         .api_error => "api_error",
         .tool_error => "tool_error",
+        .tool_loop => "tool_loop",
     };
     const cost = usage.costUsd(model);
 
