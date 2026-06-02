@@ -186,6 +186,15 @@ pub fn run(
         // 下限 MIN_AUTO_COMPACT_THRESHOLD:避免异常小值导致每 turn 都 compact。
         const auto_threshold: usize = opts.auto_compact_threshold orelse
             @max(@as(usize, api_client.resolveMaxInputTokens()) * 8 / 10, MIN_AUTO_COMPACT_THRESHOLD);
+        // Microcompact(批4):在 full-compact 之前,更低阈值(70% of full)先清旧 tool_result
+        // 内容(最占 token 的部分),保留消息结构。比 compactKeepRecent 温和、不丢对话流。
+        const micro_threshold = auto_threshold * 7 / 10;
+        if (conversation.isOverThreshold(micro_threshold) and !conversation.isOverThreshold(auto_threshold)) {
+            const cleared = conversation.microcompactToolResults(opts.auto_compact_keep_recent);
+            if (cleared > 0) {
+                log.info("agent", "microcompact: cleared {d} old tool_results (msgs={d}) threshold={d}", .{ cleared, conversation.len(), micro_threshold });
+            }
+        }
         if (conversation.isOverThreshold(auto_threshold)) {
             const before = conversation.len();
             const dropped = conversation.compactKeepRecent(opts.auto_compact_keep_recent);

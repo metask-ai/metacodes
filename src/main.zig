@@ -26,6 +26,7 @@ pub const core_read_state = @import("core/read_state.zig");
 pub const tool_exec = @import("core/tool_exec.zig");
 pub const tool_result_storage = @import("tools/tool_result_storage.zig");
 pub const cache_break = @import("core/cache_break.zig");
+pub const core_message = @import("core/message.zig");
 pub const transcript = @import("core/transcript.zig");
 pub const repl_headless = @import("repl/headless.zig");
 pub const app_module = @import("app.zig");

@@ -129,6 +129,42 @@ pub const Conversation = struct {
         }
         return drop_count;
     }
+
+    /// Microcompact(批4,对齐 cc 的工具结果清理):把"较老"消息里的 tool_result 内容
+    /// 替换成短 stub(释放 token),但**保留消息结构**(对话流不断、不调 API)。
+    /// 比 compactKeepRecent 温和:不丢消息,只清旧工具结果(最占 token 的部分)。
+    /// keep_recent_n:最近 N 条消息的 tool_result 不动(可能还要引用)。
+    /// 返回清理的 tool_result 个数。
+    pub fn microcompactToolResults(self: *Conversation, keep_recent_n: usize) usize {
+        const total = self.messages.items.len;
+        if (total <= keep_recent_n) return 0;
+        const boundary = total - keep_recent_n; // [0, boundary) 是"老"消息
+        const STUB = "[tool result cleared to save context]";
+
+        var cleared: usize = 0;
+        var mi: usize = 0;
+        while (mi < boundary) : (mi += 1) {
+            const m = self.messages.items[mi];
+            for (m.blocks, 0..) |b, bi| {
+                switch (b) {
+                    .tool_result => |tr| {
+                        // 已是 stub 的不重复清(幂等)。
+                        if (std.mem.eql(u8, tr.content, STUB)) continue;
+                        const new_content = self.allocator.dupe(u8, STUB) catch continue;
+                        self.allocator.free(@constCast(tr.content));
+                        m.blocks[bi] = .{ .tool_result = .{
+                            .tool_use_id = tr.tool_use_id,
+                            .content = new_content,
+                            .is_error = tr.is_error,
+                        } };
+                        cleared += 1;
+                    },
+                    else => {},
+                }
+            }
+        }
+        return cleared;
+    }
 };
 
 test "Conversation init / deinit empty" {
