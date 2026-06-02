@@ -8,7 +8,7 @@ const Catalog = @import("api/catalog.zig").Catalog;
 const AbortSignal = @import("util/abort.zig").AbortSignal;
 
 pub const VERSION = "0.1.0";
-pub const ANTHROPIC_API_URL = "http://napi.origintask.cn:8189/v1/messages";
+pub const ANTHROPIC_API_URL = "https://napi.metask-ai.com/v1/messages";
 pub const ANTHROPIC_AUTH_TOKEN = "";
 
 /// HTTP 请求结果
