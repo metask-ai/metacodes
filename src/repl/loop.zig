@@ -153,6 +153,17 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             }
             continue;
         }
+        // /task-test[:label] —— 测试专用:造一个 in_progress 任务驱动 TaskTab 渲染。
+        // 无网/离线即可验证 TaskTab(任务通常靠模型 TaskCreate 产生,离线无从触发)。
+        if (std.mem.eql(u8, trimmed, "/task-test") or std.mem.startsWith(u8, trimmed, "/task-test:")) {
+            const label = if (trimmed.len > 11) trimmed[11..] else "test task running";
+            const t = app.tasks.create(label, "test", label) catch {
+                std.debug.print("[task-test] create failed\n", .{});
+                continue;
+            };
+            app.tasks.updateStatus(t.id, .in_progress) catch {};
+            continue;
+        }
         if (std.mem.eql(u8, trimmed, "/skills")) {
             if (app.skills.len() == 0) {
                 std.debug.print("No skills installed. Put SKILL.md files under ~/.cc-zig/skills/<name>/ or <project>/.cc-zig/skills/<name>/\n", .{});
