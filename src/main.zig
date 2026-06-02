@@ -44,6 +44,7 @@ pub const active_skill = @import("skills/active.zig");
 pub const permission = @import("permission.zig");
 pub const permission_rule_spec = @import("permission/rule_spec.zig");
 pub const permission_settings = @import("permission/settings.zig");
+pub const permission_decision = @import("permission/decision.zig");
 pub const permission_hooks = @import("permission/hooks.zig");
 pub const agents_def = @import("agents/def.zig");
 pub const agents_set = @import("agents/set.zig");
