@@ -287,7 +287,19 @@ pub fn toToolDefinitionsFull(
         });
     }
 
-    if (dyn) |d| try d.appendDefinitions(&defs, allocator);
+    // 动态工具(Skill/MCP)按 name 排序后追加(对齐 cc:builtin 前缀稳定 + dyn 排序,
+    // 这样增删一个 MCP 工具不会打乱其余顺序、击穿下游 prompt cache)。静态 registry
+    // 是 comptime 固定序,不动(reorder 它本身就会击穿缓存)。
+    if (dyn) |d| {
+        const dyn_start = defs.items.len;
+        try d.appendDefinitions(&defs, allocator);
+        const dyn_slice = defs.items[dyn_start..];
+        std.sort.block(json.ToolDefinition, dyn_slice, {}, struct {
+            fn lt(_: void, a: json.ToolDefinition, b: json.ToolDefinition) bool {
+                return std.mem.order(u8, a.name, b.name) == .lt;
+            }
+        }.lt);
+    }
 
     // WebSearch：Anthropic server tool，不走本地 execute；声明后 API 自己执行。
     // name 固定 "web_search"，type 是版本化的 "web_search_20250305"。

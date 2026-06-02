@@ -169,6 +169,9 @@ pub fn run(
     var last_err_sig: ?ToolErrSig = null;
     var same_err_count: u32 = 0;
 
+    // Prompt cache 击穿检测(批3):跨 turn 跟踪 cache_read 跌幅 + system/tools 指纹。
+    var cache_detector = @import("cache_break.zig").CacheBreakDetector{};
+
     while (turns < opts.max_turns) : (turns += 1) {
         // 开头检查 abort
         if (opts.abort) |a| if (a.isAborted()) {
@@ -210,6 +213,15 @@ pub fn run(
         // 3. 发送流式请求（abortable 版本：abort 通过 EventIterator 检查点传播）
         //    带 opts.model_override:subagent 用自己的 model(如 Explore=haiku);
         //    null 时 sendMessageStreamFull 用 api_client.model(父 model)。
+        // 击穿检测:发请求前记录 system/tools/model 指纹(tools 用工具名拼接 hash)。
+        {
+            var th = std.hash.Wyhash.init(0);
+            for (effective_tool_defs) |d| th.update(d.name);
+            var tbuf: [16]u8 = undefined;
+            std.mem.writeInt(u64, tbuf[0..8], th.final(), .little);
+            const model_for_req = opts.model_override orelse api_client.model;
+            cache_detector.recordRequest(opts.system_prompt orelse "", tbuf[0..8], model_for_req);
+        }
         var stream = api_client.sendMessageStreamFull(api_messages.items, opts.system_prompt, effective_tool_defs, opts.abort, opts.model_override) catch |err| {
             log.err("agent", "sendMessageStream failed turn={d}: {s}", .{ turns + 1, @errorName(err) });
             return .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls };
@@ -270,6 +282,9 @@ pub fn run(
                 },
                 .usage => |u| {
                     if (opts.usage_sink) |sink| sink.add(u);
+                    if (cache_detector.checkResponse(u.cache_read_input_tokens, u.cache_creation_input_tokens)) |reason| {
+                        log.warnId("cache", rid, "PROMPT CACHE BREAK: {s} [cache_read {d} creation {d}]", .{ reason, u.cache_read_input_tokens, u.cache_creation_input_tokens });
+                    }
                     log.infoId("agent", rid, "usage in={d} out={d} cache_r={d} cache_w={d}", .{ u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens });
                 },
                 .done => {},
