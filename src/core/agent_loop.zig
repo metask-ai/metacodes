@@ -365,7 +365,8 @@ pub fn run(
             return .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls };
         }
 
-        // 6. 执行所有 tool_use，把结果作为 user-role 的 tool_result block 追加
+        // 6. 执行所有 tool_use，把结果作为 user-role 的 tool_result block 追加。
+        //    批1:权限检查主线程串行,执行按 isConcurrencySafe 分批并发(tool_exec.zig)。
         var result_blocks = std.ArrayList(msg.Block).empty;
         errdefer {
             for (result_blocks.items) |b| b.deinit(allocator);
@@ -375,121 +376,99 @@ pub fn run(
         // 本轮是否触发工具熔断(同工具同错连续 MAX_SAME_TOOL_ERROR 次)。
         var tool_loop_tripped = false;
 
+        // 6a. 收集 tool_use + 主线程串行做权限检查 → slots。
+        const tool_exec = @import("tool_exec.zig");
+        var slots = std.ArrayList(tool_exec.Slot).empty;
+        defer slots.deinit(allocator);
         for (last_msg.blocks) |b| {
             const tu = switch (b) {
                 .tool_use => |t| t,
                 else => continue,
             };
             total_tool_calls += 1;
-
-            // 权限检查
             const perm_result = permission_mod.checkPermission(permission_ctx, tu.name, tu.input);
             log.infoId("permission", rid, "tool={s} decision={s}", .{ tu.name, @tagName(perm_result) });
+            var slot = tool_exec.Slot{ .decision = .run, .name = tu.name, .id = tu.id, .input = tu.input };
             switch (perm_result) {
                 .deny => {
                     log.warnId("permission", rid, "DENY tool={s} input={s}", .{ tu.name, tu.input });
-                    const err_json = try tool_error.errorToJson("PermissionDenied", "tool '{s}' denied by permission rule or plan mode", .{tu.name}, allocator);
-                    errdefer allocator.free(err_json);
-                    try result_blocks.append(allocator, .{ .tool_result = .{
-                        .tool_use_id = try allocator.dupe(u8, tu.id),
-                        .content = err_json,
-                        .is_error = true,
-                    } });
-                    continue;
+                    slot.decision = .denied;
+                    slot.content = try tool_error.errorToJson("PermissionDenied", "tool '{s}' denied by permission rule or plan mode", .{tu.name}, allocator);
+                    slot.is_error = true;
                 },
                 .ask => {
                     const allowed = permission_mod.promptUser(tu.name, tu.input, allocator) catch false;
                     log.infoId("permission", rid, "prompt tool={s} user_allowed={}", .{ tu.name, allowed });
                     if (!allowed) {
-                        const err_json = try tool_error.errorToJson("PermissionDenied", "user declined '{s}' via prompt", .{tu.name}, allocator);
-                        errdefer allocator.free(err_json);
-                        try result_blocks.append(allocator, .{ .tool_result = .{
-                            .tool_use_id = try allocator.dupe(u8, tu.id),
-                            .content = err_json,
-                            .is_error = true,
-                        } });
-                        continue;
+                        slot.decision = .denied;
+                        slot.content = try tool_error.errorToJson("PermissionDenied", "user declined '{s}' via prompt", .{tu.name}, allocator);
+                        slot.is_error = true;
                     }
                 },
                 .allow => {},
             }
+            try slots.append(allocator, slot);
+        }
 
-            // 派发到工具（先查静态，未命中查 dyn_registry：Skill / MCP）
-            log.infoId("agent", rid, "tool.exec start name={s} id={s}", .{ tu.name, tu.id });
-            log.debugId("agent", rid, "tool.exec input={s}", .{tu.input});
-            const t_start = util_time.nowMs();
-            const exec_result = blk: {
-                const tool_ctx = tools_mod.ToolContext{
-                    .allocator = allocator,
-                    .abort = opts.abort,
-                    .read_state = opts.read_state,
-                    .jobs = opts.jobs,
-                    .agent_jobs = opts.agent_jobs,
-                    .permission_ctx = @constCast(permission_ctx),
-                    .plan_prev_mode = opts.plan_prev_mode,
-                    .tasks = opts.tasks,
-                    .api_client = opts.api_client,
-                    .tool_defs = opts.tool_defs,
-                    .agent_depth = opts.agent_depth,
-                    .dyn_registry = opts.dyn_registry,
-                    .activate_skill_state = opts.activate_skill_state,
-                    .activate_skill_fn = opts.activate_skill_fn,
-                    .explicit_invocation = opts.explicit_invocation,
-                    .session_id = opts.session_id,
-                    .project_dir = opts.project_dir,
-                    .disable_shell_execution = opts.disable_shell_execution,
-                    .sandbox = opts.sandbox,
-                    .cwd_abs = opts.cwd_abs,
-                    .home_dir = opts.home_dir,
-                    .agents = opts.agents,
-                    .parent_model = opts.parent_model,
-                    .skills = opts.skills_set,
-                    .worktree_state = opts.worktree_state,
-                    .worktree_push_fn = opts.worktree_push_fn,
-                    .worktree_pop_fn = opts.worktree_pop_fn,
-                    .mcp_sessions = opts.mcp_sessions,
-                    .cron_registry = opts.cron_registry,
-                };
-                break :blk tools_mod.dispatch(&tool_ctx, tu.name, tu.input);
-            } catch |err| {
-                log.warnId("agent", rid, "tool.exec FAILED name={s} err={s} duration_ms={d} input={s}", .{ tu.name, @errorName(err), util_time.nowMs() - t_start, tu.input[0..@min(tu.input.len, 200)] });
-                const code = if (err == error.UnknownTool) "UnknownTool" else @errorName(err);
+        // 6b. 构造一次 ToolContext(所有 tool 共用;并发 job 各自换独立 arena allocator)。
+        const base_ctx = tools_mod.ToolContext{
+            .allocator = allocator,
+            .abort = opts.abort,
+            .read_state = opts.read_state,
+            .jobs = opts.jobs,
+            .agent_jobs = opts.agent_jobs,
+            .permission_ctx = @constCast(permission_ctx),
+            .plan_prev_mode = opts.plan_prev_mode,
+            .tasks = opts.tasks,
+            .api_client = opts.api_client,
+            .tool_defs = opts.tool_defs,
+            .agent_depth = opts.agent_depth,
+            .dyn_registry = opts.dyn_registry,
+            .activate_skill_state = opts.activate_skill_state,
+            .activate_skill_fn = opts.activate_skill_fn,
+            .explicit_invocation = opts.explicit_invocation,
+            .session_id = opts.session_id,
+            .project_dir = opts.project_dir,
+            .disable_shell_execution = opts.disable_shell_execution,
+            .sandbox = opts.sandbox,
+            .cwd_abs = opts.cwd_abs,
+            .home_dir = opts.home_dir,
+            .agents = opts.agents,
+            .parent_model = opts.parent_model,
+            .skills = opts.skills_set,
+            .worktree_state = opts.worktree_state,
+            .worktree_push_fn = opts.worktree_push_fn,
+            .worktree_pop_fn = opts.worktree_pop_fn,
+            .mcp_sessions = opts.mcp_sessions,
+            .cron_registry = opts.cron_registry,
+        };
 
-                // 熔断计数:同工具同错连续累积。换工具或换错误码 → 归 1。
-                const sig = ToolErrSig.of(tu.name, code);
+        // 6c. 分批并发执行(denied 的不动,run 的填 content)。
+        tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
+
+        // 6d. 按原顺序回填 result_blocks + 熔断器(同错连续判定,保持原语义)。
+        for (slots.items) |*s| {
+            const content = s.content orelse try tool_error.errorToJson("InternalError", "tool {s} produced no result", .{s.name}, allocator);
+            if (s.is_error) {
+                const sig = ToolErrSig.of(s.name, content);
                 if (last_err_sig != null and last_err_sig.?.eql(sig)) {
                     same_err_count += 1;
                 } else {
                     same_err_count = 1;
                     last_err_sig = sig;
                 }
-
-                const err_json = try tool_error.errorToJson(code, "{s} failed with {s}", .{ tu.name, @errorName(err) }, allocator);
-                errdefer allocator.free(err_json);
-                try result_blocks.append(allocator, .{ .tool_result = .{
-                    .tool_use_id = try allocator.dupe(u8, tu.id),
-                    .content = err_json,
-                    .is_error = true,
-                } });
-
                 if (same_err_count >= MAX_SAME_TOOL_ERROR) {
-                    log.warnId("agent", rid, "tool-loop circuit breaker tripped: {s} failed with {s} x{d} consecutively", .{ tu.name, code, same_err_count });
+                    log.warnId("agent", rid, "tool-loop circuit breaker tripped: {s} x{d} consecutively", .{ s.name, same_err_count });
                     tool_loop_tripped = true;
                 }
-                continue;
-            };
-
-            // 任意工具成功 → 重置熔断计数(模型脱离死循环)。
-            same_err_count = 0;
-            last_err_sig = null;
-
-            log.infoId("agent", rid, "tool.exec done name={s} output_bytes={d} duration_ms={d}", .{ tu.name, exec_result.len, util_time.nowMs() - t_start });
-            log.debugId("agent", rid, "tool.exec output={s}", .{exec_result});
-
+            } else {
+                same_err_count = 0;
+                last_err_sig = null;
+            }
             try result_blocks.append(allocator, .{ .tool_result = .{
-                .tool_use_id = try allocator.dupe(u8, tu.id),
-                .content = exec_result,
-                .is_error = false,
+                .tool_use_id = try allocator.dupe(u8, s.id),
+                .content = content,
+                .is_error = s.is_error,
             } });
         }
 

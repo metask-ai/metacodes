@@ -52,9 +52,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     if (!has_offset and !has_limit) {
         if (st) |s| {
             if (s.size > MAX_FILE_BYTES) {
-                return try std.fmt.allocPrint(allocator,
-                    "{{\"error\":\"file too large ({d} bytes, limit {d}). Read a range with offset+limit, or use Grep to find specific content.\"}}",
-                    .{ s.size, MAX_FILE_BYTES });
+                return try std.fmt.allocPrint(allocator, "{{\"error\":\"file too large ({d} bytes, limit {d}). Read a range with offset+limit, or use Grep to find specific content.\"}}", .{ s.size, MAX_FILE_BYTES });
             }
         }
     }
@@ -87,7 +85,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     // 成功读取（不管有没有内容）都记录 ReadState，后续 Write/Edit 才能放行
     if (ctx.read_state) |rs| {
-        if (st) |s| rs.record(path, s.mtime_ns, s.size) catch {};
+        if (st) |s| rs.recordHashed(path, s.mtime_ns, s.size, std.hash.Wyhash.hash(0, full)) catch {};
     }
 
     return try renderWithLineNumbers(full[line_start..end], offset_1based, allocator);
@@ -137,9 +135,9 @@ fn testCtx() ToolContext {
 
 /// 阻塞/无限设备路径黑名单——读这些会 hang 或无限流。
 const DEVICE_PATHS = [_][]const u8{
-    "/dev/zero",   "/dev/random", "/dev/urandom", "/dev/null",
-    "/dev/stdin",  "/dev/stdout", "/dev/stderr",  "/dev/full",
-    "/dev/tty",    "/dev/ptmx",
+    "/dev/zero",  "/dev/random", "/dev/urandom", "/dev/null",
+    "/dev/stdin", "/dev/stdout", "/dev/stderr",  "/dev/full",
+    "/dev/tty",   "/dev/ptmx",
 };
 
 fn rejectDevicePath(path: []const u8) !void {
@@ -202,7 +200,7 @@ fn readImage(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []cons
 
     // 记录 ReadState（图像也算"读过"，后续 Write 才放行）
     if (ctx.read_state) |rs| {
-        if (st) |s| rs.record(path, s.mtime_ns, s.size) catch {};
+        if (st) |s| rs.recordHashed(path, s.mtime_ns, s.size, std.hash.Wyhash.hash(0, raw)) catch {};
     }
 
     var out: std.Io.Writer.Allocating = .init(allocator);

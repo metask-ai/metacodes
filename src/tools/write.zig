@@ -30,7 +30,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         };
         if (exists) |st| {
             const rec = rs.get(path) orelse return error.NotRead;
-            if (rec.mtime_ns != st.mtime_ns) return error.StaleFile;
+            // staleness 双判:mtime 变了,但内容哈希没变(且记过哈希)→ 不算 stale(对齐 cc)。
+            if (rec.mtime_ns != st.mtime_ns) {
+                const cur_hash = read_state.hashFileContent(path);
+                if (rec.content_hash == 0 or cur_hash != rec.content_hash) return error.StaleFile;
+            }
         }
     }
 
@@ -52,10 +56,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         pos += @as(usize, @intCast(n));
     }
 
-    // 写完后刷新 ReadState 的 mtime，让紧接着的下一轮 Edit 仍然合法（不误报 stale）
+    // 写完后刷新 ReadState 的 mtime + content_hash，让紧接着的 Edit/Write 不误报 stale。
     if (ctx.read_state) |rs| {
         const st = read_state.statFd(fd) catch null;
-        if (st) |s| rs.record(path, s.mtime_ns, s.size) catch {};
+        if (st) |s| rs.recordHashed(path, s.mtime_ns, s.size, std.hash.Wyhash.hash(0, content)) catch {};
     }
 
     return try renderResult(allocator, path, old_content orelse "", content);

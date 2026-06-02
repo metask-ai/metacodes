@@ -20,7 +20,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     if (ctx.read_state) |rs| {
         const st = read_state.statPath(file_path) catch return error.FileNotFound;
         const rec = rs.get(file_path) orelse return error.NotRead;
-        if (rec.mtime_ns != st.mtime_ns) return error.StaleFile;
+        // staleness 双判:mtime 变但内容哈希没变 → 不算 stale(对齐 cc FileEdit)。
+        if (rec.mtime_ns != st.mtime_ns) {
+            const cur_hash = read_state.hashFileContent(file_path);
+            if (rec.content_hash == 0 or cur_hash != rec.content_hash) return error.StaleFile;
+        }
     }
 
     // old/new 是 JSON 字符串值的原始切片（未 unescape）。Edit 对字节精确匹配敏感，
@@ -115,10 +119,10 @@ fn finalizeWrite(
     const written = std.c.write(write_fd, content.ptr, content.len);
     if (written < 0) return error.WriteError;
 
-    // 写完后刷新 ReadState 的 mtime，避免紧接着再次 Edit 报 stale
+    // 写完后刷新 ReadState 的 mtime + content_hash，避免紧接着再次 Edit 报 stale
     if (ctx.read_state) |rs| {
         const st = read_state.statFd(write_fd) catch null;
-        if (st) |s| rs.record(file_path, s.mtime_ns, s.size) catch {};
+        if (st) |s| rs.recordHashed(file_path, s.mtime_ns, s.size, std.hash.Wyhash.hash(0, content)) catch {};
     }
 
     // structuredPatch + gitDiff

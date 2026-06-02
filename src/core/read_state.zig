@@ -24,17 +24,23 @@ pub const Entry = struct {
     mtime_ns: i128,
     byte_size: u64,
     read_at_ns: i128,
+    /// 读取时的内容哈希(Wyhash)。staleness 双判用:mtime 变但 content_hash 不变 → 不算 stale
+    /// (对齐 cc FileEdit:云同步/杀软改 mtime 但内容没变时放行)。0 = 未记录(向后兼容)。
+    content_hash: u64 = 0,
 };
 
 pub const ReadState = struct {
     allocator: std.mem.Allocator,
     // path (owned, heap) → Entry
     map: std.StringHashMap(Entry),
+    /// 并发工具执行(批1)下,Read 在其它线程也会 record。record/get 持锁。
+    mutex: std.c.pthread_mutex_t = .{},
 
     pub fn init(allocator: std.mem.Allocator) ReadState {
         return .{
             .allocator = allocator,
             .map = std.StringHashMap(Entry).init(allocator),
+            .mutex = .{},
         };
     }
 
@@ -44,13 +50,27 @@ pub const ReadState = struct {
         self.map.deinit();
     }
 
-    /// Read 成功后调用：记录 mtime/size/read_at。path 会被 dupe 到内部存储。
-    /// 重复调用同 path 覆盖旧条目。
+    fn lock(self: *ReadState) void {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+    }
+    fn unlock(self: *ReadState) void {
+        _ = std.c.pthread_mutex_unlock(&self.mutex);
+    }
+
+    /// Read 成功后调用:记录 mtime/size/content_hash/read_at。path 会被 dupe 到内部存储。
+    /// content_hash 传 0 表示不记(向后兼容旧调用)。重复调用同 path 覆盖旧条目。线程安全。
     pub fn record(self: *ReadState, path: []const u8, mtime_ns: i128, byte_size: u64) !void {
+        return self.recordHashed(path, mtime_ns, byte_size, 0);
+    }
+
+    pub fn recordHashed(self: *ReadState, path: []const u8, mtime_ns: i128, byte_size: u64, content_hash: u64) !void {
+        self.lock();
+        defer self.unlock();
         const entry = Entry{
             .mtime_ns = mtime_ns,
             .byte_size = byte_size,
             .read_at_ns = util_time.nowNs(),
+            .content_hash = content_hash,
         };
         const gop = try self.map.getOrPut(path);
         if (!gop.found_existing) {
@@ -61,18 +81,41 @@ pub const ReadState = struct {
         gop.value_ptr.* = entry;
     }
 
-    /// 查询记录；返回 null 表示未读过。
-    pub fn get(self: *const ReadState, path: []const u8) ?Entry {
+    /// 查询记录;返回 null 表示未读过。线程安全。
+    pub fn get(self: *ReadState, path: []const u8) ?Entry {
+        self.lock();
+        defer self.unlock();
         return self.map.get(path);
     }
 
     /// 清空（测试或 session 重置用）。
     pub fn clearAll(self: *ReadState) void {
+        self.lock();
+        defer self.unlock();
         var it = self.map.keyIterator();
         while (it.next()) |k| self.allocator.free(k.*);
         self.map.clearRetainingCapacity();
     }
 };
+
+/// 计算文件内容的 Wyhash(staleness 双判用)。读失败返回 0。
+pub fn hashFileContent(path: []const u8) u64 {
+    var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= pbuf.len) return 0;
+    @memcpy(pbuf[0..path.len], path);
+    pbuf[path.len] = 0;
+    const fd = std.c.open(@ptrCast(&pbuf), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return 0;
+    defer _ = std.c.close(fd);
+    var h = std.hash.Wyhash.init(0);
+    var buf: [16 * 1024]u8 = undefined;
+    while (true) {
+        const n = std.c.read(fd, &buf, buf.len);
+        if (n <= 0) break;
+        h.update(buf[0..@intCast(n)]);
+    }
+    return h.final();
+}
 
 pub const StatInfo = struct { mtime_ns: i128, size: u64 };
 

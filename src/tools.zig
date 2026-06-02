@@ -333,6 +333,17 @@ pub fn dispatch(ctx: *const ToolContext, name: []const u8, args: []const u8) any
     return error.UnknownTool;
 }
 
+/// 工具是否可与同批工具并发执行(对齐 cc isConcurrencySafe)。
+/// 安全 = 只读 + 不写任何共享态(或写的共享态已线程安全)。
+///   Read(read_state 已加锁)/Glob/Grep/WebFetch/BashOutput → safe。
+///   Write/Edit/Bash/Task*/NotebookEdit/MCP/Skill 等有副作用或写共享态 → unsafe。
+/// 一期按工具名判定(cc 是 per-input;cc-zig 工具名足够,Bash 即便 readonly 也保守串行)。
+pub fn isConcurrencySafe(name: []const u8) bool {
+    const safe = [_][]const u8{ "Read", "Glob", "Grep", "WebFetch", "BashOutput" };
+    for (safe) |s| if (std.mem.eql(u8, name, s)) return true;
+    return false;
+}
+
 test "getTool by name" {
     try std.testing.expect(getTool("Read") != null);
     try std.testing.expect(getTool("Write") != null);
