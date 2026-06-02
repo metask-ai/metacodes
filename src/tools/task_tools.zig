@@ -253,7 +253,28 @@ pub fn executeUpdate(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 // TaskStop（快捷：等价于 update status=completed）
 // ============================================================================
 
+// TaskStop（统一分流，对齐 Claude Code 的统一 TaskStop）：
+//   - agent_job_id 或 taskId 以 "agent_" 开头 → 终止后台 subagent(abort，非阻塞)。
+//   - 否则 → todo 快捷：等价于 update status=completed。
+// ============================================================================
+
 pub fn executeStop(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
+    // 优先看 agent_job_id;没有再看 taskId 是否带 agent_ 前缀。
+    const agent_id: ?[]const u8 = blk: {
+        if (@import("../util/json.zig").extractStringField(args, "agent_job_id")) |aid| break :blk aid;
+        if (@import("../util/json.zig").extractStringField(args, "taskId")) |tid| {
+            if (std.mem.startsWith(u8, tid, "agent_")) break :blk tid;
+        }
+        break :blk null;
+    };
+    if (agent_id) |aid| {
+        const reg = ctx.agent_jobs orelse return error.AgentJobsUnavailable;
+        reg.kill(aid) catch |e| switch (e) {
+            error.JobNotFound => return error.JobNotFound,
+        };
+        return std.fmt.allocPrint(ctx.allocator, "{{\"agent_job_id\":\"{s}\",\"status\":\"killing\"}}", .{aid});
+    }
+
     const store = try requireStore(ctx);
     const id = try extractStringOrError(args, "taskId");
     try store.updateStatus(id, .completed);

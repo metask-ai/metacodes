@@ -165,6 +165,24 @@ pub fn extractStringField(data: []const u8, field: []const u8) ?[]const u8 {
     return data[start..end];
 }
 
+/// 提取顶层布尔字段 `"field":true|false`(值不带引号)。缺失或非法返回 null。
+pub fn extractBoolField(data: []const u8, field: []const u8) ?bool {
+    var pattern_buf: [256]u8 = undefined;
+    std.debug.assert(field.len < 200);
+    pattern_buf[0] = '"';
+    @memcpy(pattern_buf[1..][0..field.len], field);
+    pattern_buf[1 + field.len] = '"';
+    pattern_buf[2 + field.len] = ':';
+    const pattern = pattern_buf[0 .. 3 + field.len];
+
+    const idx = std.mem.indexOf(u8, data, pattern) orelse return null;
+    var p = idx + pattern.len;
+    while (p < data.len and (data[p] == ' ' or data[p] == '\t')) : (p += 1) {}
+    if (std.mem.startsWith(u8, data[p..], "true")) return true;
+    if (std.mem.startsWith(u8, data[p..], "false")) return false;
+    return null;
+}
+
 test "unescapeString basic" {
     const r = try unescapeString("hello\\nworld", std.testing.allocator);
     defer std.testing.allocator.free(r);

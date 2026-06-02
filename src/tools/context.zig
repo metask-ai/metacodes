@@ -16,6 +16,7 @@ const std = @import("std");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const ReadState = @import("../core/read_state.zig").ReadState;
 const JobRegistry = @import("../core/job_registry.zig").JobRegistry;
+const AgentJobRegistry = @import("../core/agent_job_registry.zig").AgentJobRegistry;
 const PermissionContext = @import("../permission.zig").PermissionContext;
 const TaskStore = @import("../core/task_store.zig").TaskStore;
 const Client = @import("../client.zig").Client;
@@ -30,6 +31,8 @@ pub const ToolContext = struct {
     read_state: ?*ReadState = null,
     /// Bash 后台作业注册表：run_in_background + BashOutput + KillShell 用
     jobs: ?*JobRegistry = null,
+    /// 后台 subagent 作业注册表：Task(run_in_background) + TaskOutput + TaskStop(agent_ id) 用
+    agent_jobs: ?*AgentJobRegistry = null,
     /// 权限上下文：EnterPlanMode/ExitPlanMode 需要写 mode
     permission_ctx: ?*PermissionContext = null,
     /// 进入 plan 模式前的原 mode；ExitPlanMode 时恢复

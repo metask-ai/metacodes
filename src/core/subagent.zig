@@ -49,6 +49,9 @@ pub const SpawnOptions = struct {
     activate_skill_state: ?*anyopaque = null,
     activate_skill_fn: ?*const fn (state: *anyopaque, skill_name: []const u8, allowed: []const []const u8, disallowed: []const []const u8) anyerror!void = null,
     project_dir: []const u8 = "",
+    /// 后台 subagent registry(允许嵌套后台:子 agent 也能 Task(run_in_background)注册进同一 root)。
+    /// null = 子 agent 不能再开后台(同步路径恒 null)。
+    agent_jobs: ?*@import("agent_job_registry.zig").AgentJobRegistry = null,
 };
 
 pub fn spawnAgent(
@@ -59,6 +62,23 @@ pub fn spawnAgent(
     abort: ?*const AbortSignal,
     prompt: []const u8,
     opts: SpawnOptions,
+) !SubagentResult {
+    var sink = NullWriter{};
+    return spawnAgentSink(allocator, api_client, tool_defs, permission_ctx, abort, prompt, opts, &sink);
+}
+
+/// 与 spawnAgent 相同,但允许注入一个 output sink(anytype writer,实现 print)。
+/// 后台 subagent(agent_job_registry)用它把流式 text 导进可查询的缓冲。
+/// 同步路径用 spawnAgent(NullWriter),行为不变。
+pub fn spawnAgentSink(
+    allocator: std.mem.Allocator,
+    api_client: *client_mod.Client,
+    tool_defs: []const json_mod.ToolDefinition,
+    permission_ctx: *const permission_mod.PermissionContext,
+    abort: ?*const AbortSignal,
+    prompt: []const u8,
+    opts: SpawnOptions,
+    sink: anytype,
 ) !SubagentResult {
     var conv = Conversation.init(allocator);
     defer conv.deinit();
@@ -73,7 +93,6 @@ pub fn spawnAgent(
     if (opts.permission_mode_override) |m| ctx_override.mode = m;
     const ctx_to_use: *const permission_mod.PermissionContext = if (opts.permission_mode_override != null) &ctx_override else permission_ctx;
 
-    var sink = NullWriter{};
     const result = try agent_loop.run(
         &conv,
         api_client,
@@ -89,10 +108,11 @@ pub fn spawnAgent(
             .dyn_registry = opts.dyn_registry,
             .activate_skill_state = opts.activate_skill_state,
             .activate_skill_fn = opts.activate_skill_fn,
+            .agent_jobs = opts.agent_jobs,
             .project_dir = opts.project_dir,
             .model_override = opts.model_override,
         },
-        &sink,
+        sink,
         allocator,
     );
 

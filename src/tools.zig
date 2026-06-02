@@ -8,6 +8,7 @@ const glob_tool = @import("tools/glob.zig");
 const bash_tool = @import("tools/bash.zig");
 const grep_tool = @import("tools/grep.zig");
 const bash_output_tool = @import("tools/bash_output.zig");
+const task_output_tool = @import("tools/task_output.zig");
 const kill_shell_tool = @import("tools/kill_shell.zig");
 const monitor_tool = @import("tools/monitor.zig");
 const notebook_edit_tool = @import("tools/notebook_edit.zig");
@@ -212,13 +213,19 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskStop",
-        .description = "Mark a task as completed by id. Shortcut for TaskUpdate status=completed.",
+        .description = "Stop a task by id. For a backgrounded agent job (agent_* id, or agent_job_id arg), requests termination of the running subagent. For a todo task id, marks it completed (shortcut for TaskUpdate status=completed).",
         .input_schema = .{ .type = "object", .properties = null, .required = &.{"taskId"} },
         .execute = task_tools.executeStop,
     },
     .{
+        .name = "TaskOutput",
+        .description = "Read status and incremental output of a backgrounded Task subagent by agent_job_id. While running, returns incremental output (poll with since_byte = previous output_total_bytes); when done, returns final_text + stop_reason. Args: agent_job_id (required), since_byte, max_bytes (optional).",
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{"agent_job_id"} },
+        .execute = task_output_tool.execute,
+    },
+    .{
         .name = "Task",
-        .description = "Launch a subagent in an isolated context to handle a side task. Each subagent starts with a fresh context — it cannot see this conversation, only the prompt you pass. Use for: high-volume operations (running tests, processing logs), parallel research, isolating exploration that would flood your context. Args: subagent_type (Explore/Plan/general-purpose/<custom>), description (3-5 word UI label), prompt (the delegation message). Optional: max_turns, model.",
+        .description = "Launch a subagent in an isolated context to handle a side task. Each subagent starts with a fresh context — it cannot see this conversation, only the prompt you pass. Use for: high-volume operations (running tests, processing logs), parallel research, isolating exploration that would flood your context. Args: subagent_type (Explore/Plan/general-purpose/<custom>), description (3-5 word UI label), prompt (the delegation message). Optional: max_turns, model, run_in_background (true returns an agent_job_id immediately; poll with TaskOutput, stop with TaskStop).",
         .describe_fn = descriptions.describeTask,
         .input_schema = .{ .type = "object", .properties = null, .required = &.{ "subagent_type", "description", "prompt" } },
         .execute = agent_tool.execute,

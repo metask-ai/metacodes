@@ -71,6 +71,8 @@ pub const Options = struct {
     auto_compact_keep_recent: usize = 10,
     /// Bash 后台作业注册表（给 ToolContext 用，工具侧 Bash/BashOutput/KillShell 用）
     jobs: ?*@import("job_registry.zig").JobRegistry = null,
+    /// 后台 subagent 作业注册表（Task run_in_background + TaskOutput + TaskStop agent_ 分流用）
+    agent_jobs: ?*@import("agent_job_registry.zig").AgentJobRegistry = null,
     /// Plan mode 前的原始 mode 存储；EnterPlanMode/ExitPlanMode 用
     plan_prev_mode: ?*?types.PermissionMode = null,
     /// 模型 Task 清单（TaskCreate/Get/List/Update/Stop 共享）
@@ -422,6 +424,7 @@ pub fn run(
                     .abort = opts.abort,
                     .read_state = opts.read_state,
                     .jobs = opts.jobs,
+                    .agent_jobs = opts.agent_jobs,
                     .permission_ctx = @constCast(permission_ctx),
                     .plan_prev_mode = opts.plan_prev_mode,
                     .tasks = opts.tasks,

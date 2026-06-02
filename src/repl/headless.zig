@@ -48,6 +48,7 @@ pub fn run(
             .read_state = &app.read_state,
             .usage_sink = app.usageSink(),
             .jobs = jobs_ptr,
+            .agent_jobs = if (app.agent_jobs) |*aj| aj else null,
             .plan_prev_mode = &app.plan_prev_mode,
             .tasks = &app.tasks,
             .api_client = &app.api_client,

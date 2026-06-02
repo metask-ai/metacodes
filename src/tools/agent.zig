@@ -8,12 +8,12 @@
 //! - prompt:str       (必需) — 委托消息
 //! - max_turns:int    (可选) — 单次 spawn 覆盖子 agent 最大轮数
 //! - model:str        (可选) — 单次 spawn 覆盖 model(haiku/sonnet/opus/全名/inherit)
+//! - run_in_background:bool (可选) — true 则不阻塞,spawn 后台线程(agent_job_registry)
+//!   立即返回 {agent_job_id, status:running};用 TaskOutput 轮询增量输出 / TaskStop 终止。
 //!
-//! 未实现(见 doc/E2E_TESTING.md §3.1 + SUBAGENT_DESIGN.md Stage E/F):
-//! - run_in_background:bool — 需要 agent job 线程化机制(JobRegistry 当前只支持
-//!   bash 子进程,不支持后台 subagent)。P2。
-//! - isolation:"worktree"   — 需要真 git worktree spawn + 清理。P3。
-//! 这两个字段当前**不解析**,传了也无效果。不要在 schema required 里声明它们。
+//! 未实现:
+//! - isolation:"worktree"   — 需要真 git worktree spawn + 清理。P3。当前**不解析**,传了无效果。
+//!   不要在 schema required 里声明它。
 //!
 //! 兼容:不带 subagent_type 但带 prompt 时,等同 subagent_type="general-purpose"(旧 Agent 工具语义)。
 
@@ -125,6 +125,36 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         sys_prompt = sp;
     } else {
         sys_prompt = "You are a subagent. Complete the task and return a concise summary.\n";
+    }
+
+    // run_in_background:true → 不阻塞,spawn 后台线程,立即返回 agent-job-id。
+    // 后续用 TaskOutput(agent_job_id) 轮询增量输出 / TaskStop(agent_job_id) 终止。
+    const bg = util_json.extractBoolField(args, "run_in_background") orelse false;
+    if (bg) {
+        const reg = ctx.agent_jobs orelse return error.AgentJobsUnavailable;
+        const job_id = try reg.spawnBackground(.{
+            .prompt = prompt,
+            .system_prompt = sys_prompt,
+            .tool_defs = effective_tool_defs,
+            .permission_ctx = perm.*,
+            .agents = ctx.agents,
+            .dyn_registry = ctx.dyn_registry,
+            .skills = ctx.skills,
+            .agent_depth = ctx.agent_depth + 1,
+            .max_turns = max_turns,
+            .model_override = model_override,
+            .perm_override = perm_override,
+            .project_dir = ctx.project_dir,
+            .parent_model = ctx.parent_model,
+            .desc = util_json.extractStringField(args, "description") orelse subagent_type_raw,
+            .activate_skill_state = ctx.activate_skill_state,
+            .activate_skill_fn = ctx.activate_skill_fn,
+        });
+        return std.fmt.allocPrint(
+            ctx.allocator,
+            "{{\"agent_job_id\":\"{s}\",\"status\":\"running\",\"subagent_type\":\"{s}\"}}",
+            .{ job_id, subagent_type_raw },
+        );
     }
 
     const result = try subagent.spawnAgent(

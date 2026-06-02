@@ -108,6 +108,8 @@ pub const App = struct {
     theme_variant: @import("repl/tui/theme.zig").Variant = .auto,
     /// 后台 Bash 作业注册表（失败初始化则 null）
     jobs: ?JobRegistry = null,
+    /// 后台 subagent 作业注册表（Task run_in_background）。失败初始化则 null。
+    agent_jobs: ?@import("core/agent_job_registry.zig").AgentJobRegistry = null,
     /// 进入 plan 模式前的原 mode；ExitPlanMode 用它恢复
     plan_prev_mode: ?types.PermissionMode = null,
     /// 模型长任务 scratchpad（Task* 工具共享）
@@ -258,6 +260,13 @@ pub const App = struct {
             break :blk null;
         };
 
+        // 初始化后台 subagent registry（Task run_in_background）。每个 job 内部自建
+        // 专属 Client（指向同 endpoint），故这里只需 api_key/base_url/model。
+        app.agent_jobs = @import("core/agent_job_registry.zig").AgentJobRegistry.init(allocator, api_key, config.base_url, config.model) catch |err| blk: {
+            @import("util/log.zig").warn("agent", "agent_jobs registry init failed: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
         // 构造 system prompt（依赖 config.model）。# Using your tools 段按 enabled_tool_names
         // 动态裁剪（对应 cc getUsingYourToolsSection(enabledTools)）。失败仅 log，保持 null。
         app.system_prompt = system_prompt_mod.buildFull(allocator, config.model, &app.skills, &app.agents, app.enabled_tool_names) catch |err| blk: {
@@ -269,6 +278,10 @@ pub const App = struct {
     }
 
     pub fn deinit(app: *App) void {
+        // 最先 drain 后台 subagent：abort 全部 running → join 全部线程 → free。
+        // 必须早于任何共享资源（agents/dyn_registry/skills/allocator）释放，
+        // 否则在跑的后台线程会触碰已释放内存（UAF）。job 用专属 Client，不依赖 api_client。
+        if (app.agent_jobs) |*aj| aj.deinit();
         if (app.transcript_writer) |*w| w.deinit();
         app.api_client.deinit();
         app.conversation.deinit();
