@@ -78,7 +78,9 @@ def main():
             failed.append(name)
         except Exception as e:  # noqa: BLE001
             print(f"  ✗ {name}  (运行异常)")
-            print("    " + "".join(traceback.format_exception(e)).replace("\n", "\n    "))
+            # 用 format_exc()(无参,全版本兼容);format_exception(e) 单参形态仅 3.10+,
+            # 在 3.9 会自身抛 TypeError 把整个 runner 带崩。
+            print("    " + traceback.format_exc().replace("\n", "\n    "))
             failed.append(name)
 
     print(f"\n=== 结果:{passed} passed / {len(failed)} failed ===")

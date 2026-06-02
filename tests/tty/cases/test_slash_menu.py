@@ -40,6 +40,8 @@ def test_T18b_slash_prefix_filters(bin_path):
     a = TTYAssert(raw)
     bot = a.box_bottom_row()
     foot = a.footer_row()
+    if bot is None or foot is None:
+        a._fail("缺边框/footer(输入框未渲染)")
     menu = "\n".join(a.final.line_text(r) for r in range(bot + 1, foot) if a.final.line_text(r).strip())
     if "/help" in menu:
         a._fail(f"`/co` 菜单不应含 /help:\n{menu}")
