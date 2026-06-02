@@ -35,6 +35,7 @@ pub const mcp_protocol = @import("mcp/protocol.zig");
 pub const mcp_registry_bridge = @import("mcp/registry_bridge.zig");
 pub const skills = @import("skills/skill.zig");
 pub const skills_tool = @import("skills/tool.zig");
+pub const skills_render = @import("skills/render.zig");
 pub const skills_discovery = @import("skills/discovery.zig");
 pub const active_skill = @import("skills/active.zig");
 pub const permission = @import("permission.zig");

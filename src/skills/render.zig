@@ -21,7 +21,12 @@
 //! 安全:
 //!    - 注入默认 10s 超时,可由调用方覆盖
 //!    - 替换/注入只跑**一次** —— 注入输出不再被扫描(防递归 + 防恶意工具回吐占位符)
-//!    - 文件注入(@path)cc-zig 不实现 —— Claude Code 也未明文支持(只支持 bash 注入)
+//!    - 文件注入(@path,对齐 Claude Code memory @include):行首或空白后的 `@path` /
+//!      `@./rel` / `@~/home` / `@/abs` / `@"含空格"` 被该文件内容替换。相对路径锚定
+//!      skill_dir。**安全边界**:解析后必须落在 skill_dir 或 project_dir 之内(防
+//!      `@/etc/passwd` 越界读),否则保留字面 `@path` 不读。文件不存在/越界/超限 →
+//!      静默保留字面(对齐 Claude Code "non-existent silently ignored",不破坏渲染)。
+//!      单文件上限 256KiB。不递归(读入内容不再扫 @/!)。
 
 const std = @import("std");
 const common = @import("../tools/common.zig");
@@ -50,9 +55,14 @@ pub fn renderBody(allocator: std.mem.Allocator, body: []const u8, opts: RenderOp
 
     var segments = std.ArrayList(Segment).empty;
     defer {
-        for (segments.items) |seg| {
-            if (seg == .inject) allocator.free(seg.inject.cmd);
-        }
+        for (segments.items) |seg| switch (seg) {
+            .inject => |inj| allocator.free(inj.cmd),
+            .file_ref => |fr| {
+                allocator.free(fr.raw);
+                allocator.free(fr.literal);
+            },
+            .literal => {},
+        };
         segments.deinit(allocator);
     }
     try scanInjections(allocator, body, &segments);
@@ -80,6 +90,16 @@ pub fn renderBody(allocator: std.mem.Allocator, body: []const u8, opts: RenderOp
             defer allocator.free(replacement);
             try out.appendSlice(allocator, replacement);
         },
+        .file_ref => |fr| {
+            const content = readFileRef(allocator, fr.raw, opts) catch null;
+            if (content) |c| {
+                defer allocator.free(c);
+                try out.appendSlice(allocator, c);
+            } else {
+                // 不存在/越界/超限:静默保留字面 @path(对齐 Claude Code)。
+                try out.appendSlice(allocator, fr.literal);
+            }
+        },
     };
 
     // 若 body 不含 $ARGUMENTS 但用户传了参数 → 追加
@@ -104,7 +124,10 @@ pub fn renderBody(allocator: std.mem.Allocator, body: []const u8, opts: RenderOp
 
 const Range = struct { start: usize, end: usize };
 const Inject = struct { cmd: []u8 };
-const Segment = union(enum) { literal: Range, inject: Inject };
+/// 文件注入:raw 是 `@` 后到分隔符的原始路径文本(可能含 ~ / ./);literal 是包含
+/// 前导 `@` 的完整原文(读取失败/越界时原样回退)。
+const FileRef = struct { raw: []u8, literal: []u8 };
+const Segment = union(enum) { literal: Range, inject: Inject, file_ref: FileRef };
 
 fn scanInjections(allocator: std.mem.Allocator, body: []const u8, segs: *std.ArrayList(Segment)) !void {
     var lit_start: usize = 0;
@@ -150,6 +173,42 @@ fn scanInjections(allocator: std.mem.Allocator, body: []const u8, segs: *std.Arr
                 }
             }
         }
+        // 文件注入 @path / @"quoted path":行首或紧跟空白。对齐 Claude Code 的 (^|\s)@。
+        if (body[i] == '@') {
+            const prev_ok = (i == 0) or isInlineLeftDelim(body[i - 1]);
+            if (prev_ok and i + 1 < body.len) {
+                var raw_start: usize = i + 1;
+                var raw_end: usize = raw_start;
+                var lit_end: usize = undefined;
+                if (body[raw_start] == '"') {
+                    // @"含空格的路径"
+                    raw_start += 1;
+                    if (std.mem.indexOfScalarPos(u8, body, raw_start, '"')) |q| {
+                        raw_end = q;
+                        lit_end = q + 1; // 含闭引号
+                    } else {
+                        raw_end = raw_start; // 无闭引号 → 不当作 file_ref
+                    }
+                } else {
+                    // @非空白串(到下一个空白/换行止)
+                    var p = raw_start;
+                    while (p < body.len and !isPathTerminator(body[p])) : (p += 1) {}
+                    raw_end = p;
+                    lit_end = p;
+                }
+                // 路径非空才识别(纯 "@ " 或 "@\n" 不算)
+                if (raw_end > raw_start) {
+                    try segs.append(allocator, .{ .literal = .{ .start = lit_start, .end = i } });
+                    const raw = try allocator.dupe(u8, body[raw_start..raw_end]);
+                    errdefer allocator.free(raw);
+                    const literal = try allocator.dupe(u8, body[i..lit_end]);
+                    try segs.append(allocator, .{ .file_ref = .{ .raw = raw, .literal = literal } });
+                    i = lit_end;
+                    lit_start = i;
+                    continue;
+                }
+            }
+        }
         i += 1;
     }
     // 收尾 literal
@@ -162,6 +221,92 @@ fn atLineStart(body: []const u8, i: usize) bool {
 
 fn isInlineLeftDelim(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n';
+}
+
+/// @path 的路径在遇到空白/换行/常见标点收尾(对齐 Claude Code 的 @([^\s]+)\b 直觉:
+/// 取非空白串;但额外把行尾标点剔出路径,避免把 markdown 的 "see @a/b.md." 里的句点吞进路径)。
+fn isPathTerminator(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+}
+
+/// @path 文件注入上限。
+const MAX_FILE_REF_BYTES: usize = 256 * 1024;
+
+/// 读 @path 引用的文件,带安全边界。返回 owned 内容或 null(不存在/越界/超限/读失败)。
+/// 解析:`~/...`→HOME;绝对路径原样;否则相对 skill_dir(空则相对 project_dir)。
+/// 边界:解析后的绝对路径必须前缀匹配 skill_dir 或 project_dir 之一,否则拒读(防越界)。
+fn readFileRef(allocator: std.mem.Allocator, raw: []const u8, opts: RenderOptions) !?[]u8 {
+    if (raw.len == 0) return null;
+
+    // 1) 解析成候选绝对路径(owned)
+    const resolved: []u8 = blk: {
+        if (raw[0] == '/') {
+            break :blk try allocator.dupe(u8, raw);
+        } else if (raw[0] == '~') {
+            // ~ 或 ~/...
+            const home_c = std.c.getenv("HOME") orelse return null;
+            const home = std.mem.span(home_c);
+            const rest = if (raw.len > 1 and raw[1] == '/') raw[2..] else raw[1..];
+            break :blk try std.fs.path.join(allocator, &.{ home, rest });
+        } else {
+            // 相对:锚 skill_dir,退而锚 project_dir
+            const base = if (opts.skill_dir.len > 0) opts.skill_dir else opts.project_dir;
+            if (base.len == 0) return null;
+            const rel = if (std.mem.startsWith(u8, raw, "./")) raw[2..] else raw;
+            break :blk try std.fs.path.join(allocator, &.{ base, rel });
+        }
+    };
+    defer allocator.free(resolved);
+
+    // 2) 安全边界:必须落在 skill_dir 或 project_dir 之内(防 @../../../etc/passwd 越界)。
+    //    用 realpath 归一化消除 .. 再前缀匹配。
+    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const resolved_z = try allocator.dupeZ(u8, resolved);
+    defer allocator.free(resolved_z);
+    const real_ptr = std.c.realpath(resolved_z, &real_buf);
+    if (real_ptr == null) return null; // 不存在
+    const real = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(real_ptr.?)), 0);
+
+    if (!withinBoundary(allocator, real, opts.skill_dir) and !withinBoundary(allocator, real, opts.project_dir)) {
+        log.warn("skill.fileref", "@{s} resolves outside skill/project dir ({s}); refusing", .{ raw, real });
+        return null;
+    }
+
+    // 3) 读文件(libc,裁剪版 std),带 size cap。
+    const fd = std.c.open(real.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return null;
+    defer _ = std.c.close(fd);
+
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    var chunk: [16 * 1024]u8 = undefined;
+    while (true) {
+        const n = std.c.read(fd, &chunk, chunk.len);
+        if (n <= 0) break;
+        const un: usize = @intCast(n);
+        if (buf.items.len + un > MAX_FILE_REF_BYTES) {
+            log.warn("skill.fileref", "@{s} exceeds {d} bytes; refusing", .{ raw, MAX_FILE_REF_BYTES });
+            buf.deinit(allocator);
+            return null;
+        }
+        try buf.appendSlice(allocator, chunk[0..un]);
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// real 是否在 boundary 目录之内。boundary 先 realpath 归一化(macOS /tmp→/private/tmp
+/// 符号链接、相对成分等),再前缀匹配 + 路径分隔符边界。boundary 空或无法 realpath → false。
+fn withinBoundary(allocator: std.mem.Allocator, real: []const u8, boundary: []const u8) bool {
+    if (boundary.len == 0) return false;
+    const bz = allocator.dupeZ(u8, boundary) catch return false;
+    defer allocator.free(bz);
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const bp = std.c.realpath(bz, &rb);
+    if (bp == null) return false;
+    const b = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(bp.?)), 0);
+    if (!std.mem.startsWith(u8, real, b)) return false;
+    // 防 /a/bc 误配 /a/b:边界后必须是路径分隔符或字符串结束。
+    return real.len == b.len or real[b.len] == '/';
 }
 
 // ============================================================================
@@ -323,7 +468,8 @@ const testing = std.testing;
 
 test "substitute: $ARGUMENTS" {
     const args = [_][]const u8{ "foo", "bar" };
-    const out = try renderBody(testing.allocator,
+    const out = try renderBody(
+        testing.allocator,
         "Hello $ARGUMENTS world",
         .{ .arguments = &args },
     );
@@ -333,7 +479,8 @@ test "substitute: $ARGUMENTS" {
 
 test "substitute: $N 0-based" {
     const args = [_][]const u8{ "alpha", "beta", "gamma" };
-    const out = try renderBody(testing.allocator,
+    const out = try renderBody(
+        testing.allocator,
         "first=$0 second=$1 third=$2 $ARGUMENTS",
         .{ .arguments = &args },
     );
@@ -344,7 +491,8 @@ test "substitute: $N 0-based" {
 
 test "substitute: $ARGUMENTS[N]" {
     const args = [_][]const u8{ "x", "y" };
-    const out = try renderBody(testing.allocator,
+    const out = try renderBody(
+        testing.allocator,
         "[$ARGUMENTS[0]] vs [$ARGUMENTS[1]]",
         .{ .arguments = &args },
     );
@@ -355,7 +503,8 @@ test "substitute: $ARGUMENTS[N]" {
 test "substitute: $name (named arg)" {
     const names = [_][]const u8{ "issue", "branch" };
     const args = [_][]const u8{ "#42", "main" };
-    const out = try renderBody(testing.allocator,
+    const out = try renderBody(
+        testing.allocator,
         "fix $issue on $branch\n$ARGUMENTS",
         .{ .arguments = &args, .arg_names = &names },
     );
@@ -366,7 +515,8 @@ test "substitute: $name (named arg)" {
 test "substitute: $N without \\$ARGUMENTS still triggers append" {
     // 对齐 Claude Code 字面规则:只检查 $ARGUMENTS。$0 $1 不算"用过 args"
     const args = [_][]const u8{ "a", "b" };
-    const out = try renderBody(testing.allocator,
+    const out = try renderBody(
+        testing.allocator,
         "$0 then $1",
         .{ .arguments = &args },
     );
@@ -382,7 +532,8 @@ test "substitute: unknown \\$foo is preserved as literal" {
 }
 
 test "substitute: \\${CLAUDE_SKILL_DIR}" {
-    const out = try renderBody(testing.allocator,
+    const out = try renderBody(
+        testing.allocator,
         "cd ${CLAUDE_SKILL_DIR}/scripts && ./go.sh",
         .{ .skill_dir = "/home/u/.cc-zig/skills/foo" },
     );
@@ -391,7 +542,8 @@ test "substitute: \\${CLAUDE_SKILL_DIR}" {
 }
 
 test "substitute: \\${CLAUDE_SESSION_ID} + \\${CLAUDE_PROJECT_DIR}" {
-    const out = try renderBody(testing.allocator,
+    const out = try renderBody(
+        testing.allocator,
         "session ${CLAUDE_SESSION_ID} in ${CLAUDE_PROJECT_DIR}",
         .{ .session_id = "abc-123", .project_dir = "/repo" },
     );
@@ -401,7 +553,8 @@ test "substitute: \\${CLAUDE_SESSION_ID} + \\${CLAUDE_PROJECT_DIR}" {
 
 test "missing \\$ARGUMENTS placeholder: appends ARGUMENTS: line" {
     const args = [_][]const u8{ "one", "two" };
-    const out = try renderBody(testing.allocator,
+    const out = try renderBody(
+        testing.allocator,
         "Static skill body.",
         .{ .arguments = &args },
     );
@@ -410,8 +563,9 @@ test "missing \\$ARGUMENTS placeholder: appends ARGUMENTS: line" {
 }
 
 test "present \\$ARGUMENTS placeholder: does NOT append" {
-    const args = [_][]const u8{ "one" };
-    const out = try renderBody(testing.allocator,
+    const args = [_][]const u8{"one"};
+    const out = try renderBody(
+        testing.allocator,
         "Use $ARGUMENTS here.",
         .{ .arguments = &args },
     );
@@ -420,7 +574,8 @@ test "present \\$ARGUMENTS placeholder: does NOT append" {
 }
 
 test "inject: line-start !`cmd` runs and replaces" {
-    const out = try renderBody(testing.allocator,
+    const out = try renderBody(
+        testing.allocator,
         "Output: !`echo hello`",
         .{},
     );
@@ -429,7 +584,8 @@ test "inject: line-start !`cmd` runs and replaces" {
 }
 
 test "inject: mid-line after letter is NOT recognized (KEY=!`cmd`)" {
-    const out = try renderBody(testing.allocator,
+    const out = try renderBody(
+        testing.allocator,
         "KEY=!`echo HELLO`",
         .{},
     );
@@ -439,7 +595,8 @@ test "inject: mid-line after letter is NOT recognized (KEY=!`cmd`)" {
 }
 
 test "inject: disabled by policy emits placeholder text" {
-    const out = try renderBody(testing.allocator,
+    const out = try renderBody(
+        testing.allocator,
         "Output: !`echo bad`",
         .{ .disable_shell_execution = true },
     );
@@ -462,7 +619,8 @@ test "inject: fenced ```! multi-line block" {
 
 test "inject: not recursive — output is plain text" {
     // 注入的 echo 输出 "!`echo nested`",**不**再被当作 inject 处理
-    const out = try renderBody(testing.allocator,
+    const out = try renderBody(
+        testing.allocator,
         "!`echo '!\\`echo nested\\`'`",
         .{},
     );
@@ -471,7 +629,8 @@ test "inject: not recursive — output is plain text" {
 }
 
 test "inject: failure emits placeholder, does not abort render" {
-    const out = try renderBody(testing.allocator,
+    const out = try renderBody(
+        testing.allocator,
         "ok: !`/nonexistent-binary-xyz-99 foo` end",
         .{ .inject_timeout_ms = 2000 },
     );
@@ -479,3 +638,7 @@ test "inject: failure emits placeholder, does not abort render" {
     try testing.expect(std.mem.indexOf(u8, out, "ok:") != null);
     try testing.expect(std.mem.indexOf(u8, out, "end") != null);
 }
+
+// @path 文件注入的端到端测试见 tests/component/skill_fileref_test.zig
+// (render.zig 的 inline test 依赖跨模块 import,无法 standalone 跑;主 cc-test 套件有已知
+//  integration 挂起,故 @path 的 L2 放 component 测试,跑 `zig build test:new`)。
