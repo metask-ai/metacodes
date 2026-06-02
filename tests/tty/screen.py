@@ -234,7 +234,29 @@ class Screen:
     def _apply_sgr(self, ps):
         if not ps:
             ps = [0]
-        for p in ps:
+        i = 0
+        n = len(ps)
+        while i < n:
+            p = ps[i]
+            if p == 38 or p == 48:
+                # 扩展色:38;5;N(256)或 38;2;R;G;B(RGB)。48 是背景,跳过参数不改 class。
+                if i + 1 < n and ps[i + 1] == 5:
+                    idx = ps[i + 2] if i + 2 < n else 0
+                    if p == 38:
+                        self.cur_class = self._class_from_256(idx)
+                    i += 3
+                    continue
+                elif i + 1 < n and ps[i + 1] == 2:
+                    r = ps[i + 2] if i + 2 < n else 0
+                    g = ps[i + 3] if i + 3 < n else 0
+                    b = ps[i + 4] if i + 4 < n else 0
+                    if p == 38:
+                        self.cur_class = self._class_from_rgb(r, g, b)
+                    i += 5
+                    continue
+                # 格式异常:跳过这个 38/48 不误吞后续
+                i += 1
+                continue
             if p == 0:
                 self.cur_class = "plain"
             elif p == 2:
@@ -249,6 +271,44 @@ class Screen:
                 self.cur_class = "danger"
             elif p == 39:
                 self.cur_class = "plain"
+            i += 1
+
+    @staticmethod
+    def _class_from_256(idx: int) -> str:
+        """256 色索引 → border_class。16-231 是 6x6x6 立方,232-255 灰阶。
+        映射到 theme 语义色:青/蓝→accent,黄→warn,红→danger,其余→plain。"""
+        if 16 <= idx <= 231:
+            c = idx - 16
+            r = (c // 36) % 6
+            g = (c // 6) % 6
+            b = c % 6
+            return Screen._class_from_rgb(r * 51, g * 51, b * 51)
+        # 标准 16 色区:复用基本色判定
+        cyan = {6, 14}
+        blue = {4, 12}
+        yellow = {3, 11}
+        red = {1, 9}
+        if idx in cyan or idx in blue:
+            return "accent"
+        if idx in yellow:
+            return "warn"
+        if idx in red:
+            return "danger"
+        return "plain"
+
+    @staticmethod
+    def _class_from_rgb(r: int, g: int, b: int) -> str:
+        """RGB → border_class:按主色相归类(accent=青/蓝,warn=黄,danger=红)。"""
+        # 近灰(三通道接近)→ plain
+        if max(r, g, b) - min(r, g, b) < 40:
+            return "plain"
+        if b > r and (b > g or g > r):  # 蓝/青占优
+            return "accent"
+        if r > 120 and g > 120 and b < 120:  # 红+绿高、蓝低 = 黄
+            return "warn"
+        if r > g and r > b:  # 红占优
+            return "danger"
+        return "plain"
 
     def _put_char(self, ch: str, w: int):
         if self.col >= self.cols:
