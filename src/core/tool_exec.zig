@@ -61,7 +61,19 @@ fn runJob(job: *Job) void {
         return;
     };
     // dispatch 结果在 arena 里 → dupe 到父 allocator 逃逸。
-    s.content = job.parent_allocator.dupe(u8, r) catch null;
+    const owned = job.parent_allocator.dupe(u8, r) catch null;
+    if (owned) |o| {
+        // 大结果落盘(批1C):超阈值 → 替换为 preview+path。
+        const storage = @import("../tools/tool_result_storage.zig");
+        if (storage.maybePersist(job.parent_allocator, s.name, o, job.ctx.home_dir) catch null) |preview| {
+            job.parent_allocator.free(o);
+            s.content = preview;
+        } else {
+            s.content = o;
+        }
+    } else {
+        s.content = null;
+    }
     s.is_error = false;
     log.infoId("agent", job.rid, "tool.exec done(par) name={s} output_bytes={d} duration_ms={d}", .{ s.name, r.len, util_time.nowMs() - t_start });
     job.done = true;
