@@ -141,6 +141,23 @@ pub const RenderRegion = struct {
     /// 【仅输入期】重画输入框:上边框 + ❯content(多行)+ 下边框 + [slash 菜单] + footer。
     /// 输入期无 print(text) 滚动,故可安全用 input_cursor_row(光标实际所在区内行)回顶。
     /// 末尾把光标停在 content 供编辑,并记 input_cursor_row。
+    /// TaskTab:输入框上方显示首个 in_progress 任务的 active_form(无则 subject)。
+    /// 无 in_progress 任务 → 不画,返回 0 行。画一行返回 1。`◐ <text>`(截断到 cols)。
+    /// 对齐 UI_LAYER_DESIGN 阶段 4。
+    fn drawTaskTab(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App) u16 {
+        const text = taskTabLabel(&app.tasks) orelse return 0;
+        const icon = if (self.use_unicode) "◐" else "*";
+        const max_w: usize = if (self.cols > 4) self.cols - 4 else 8;
+        const end = truncateToWidth(text, max_w);
+        w.writeAll(ansi.clear.line) catch {};
+        w.writeAll(self.theme.dim) catch {};
+        w.print("{s} {s}", .{ icon, text[0..end] }) catch {};
+        if (end < text.len) w.writeAll("…") catch {};
+        w.writeAll(self.theme.reset) catch {};
+        w.writeAll("\r\n") catch {};
+        return 1;
+    }
+
     fn renderFrameInner(self: *RenderRegion, app: *const app_mod.App, content: []const u8, cursor: usize) void {
         self.measureSize();
         const w = &self.scratch.writer;
@@ -159,6 +176,10 @@ pub const RenderRegion = struct {
         layoutInput(content, &vlines, inner_w);
 
         var new_rows: u16 = 0;
+
+        // -- TaskTab(可选,输入框上方 1 行)--
+        const task_tab_rows = self.drawTaskTab(w, app);
+        new_rows += task_tab_rows;
 
         // -- 上边框 --
         w.writeAll(ansi.clear.line) catch {};
@@ -211,9 +232,9 @@ pub const RenderRegion = struct {
             w.writeAll(ansi.cursor.up(diff, &nbuf)) catch {};
         }
 
-        // 4. 光标移到内容行(区内行号:上边框(1) + loc.vline)。
+        // 4. 光标移到内容行(区内行号:TaskTab(0/1) + 上边框(1) + loc.vline)。
         const loc = RenderRegion.locateCursor(content, cursor, &vlines);
-        const target_row: u16 = 1 + @as(u16, @intCast(loc.vline));
+        const target_row: u16 = task_tab_rows + 1 + @as(u16, @intCast(loc.vline));
         const footer_row: u16 = new_rows - 1;
         if (footer_row > target_row) {
             w.writeAll(ansi.cursor.up(footer_row - target_row, &nbuf)) catch {};
@@ -737,7 +758,6 @@ pub const RenderRegion = struct {
         }
         self.text_pending_newline = true;
     }
-
 };
 
 /// RegionWriter —— 包装给 agent_loop 的 stdout_writer。
@@ -789,6 +809,33 @@ fn nextCharBytes(s: []const u8, i: usize) usize {
 
 fn displayWidth(s: []const u8) usize {
     return term.displayWidth(s);
+}
+
+/// TaskTab 文本选择(纯函数,可单测):首个 in_progress 任务的 active_form(无则 subject)。
+/// 无 in_progress → null。
+pub fn taskTabLabel(tasks: *const @import("../../core/task_store.zig").TaskStore) ?[]const u8 {
+    for (tasks.tasks.items) |t| {
+        if (t.status == .in_progress) return t.active_form orelse t.subject;
+    }
+    return null;
+}
+
+/// 把 text 截断到不超过 max_w 显示列(CJK=2),为省略号留 1 列。返回 byte 终点。
+/// 整体宽度 ≤ max_w 时返回 text.len(不截)。纯函数,可单测。
+pub fn truncateToWidth(text: []const u8, max_w: usize) usize {
+    if (displayWidth(text) <= max_w) return text.len;
+    var cur: usize = 0;
+    var i: usize = 0;
+    var end: usize = 0;
+    while (i < text.len) {
+        const nb = nextCharBytes(text, i);
+        const cw = displayWidth(text[i .. i + nb]);
+        if (cur + cw > max_w - 1) break;
+        cur += cw;
+        i += nb;
+        end = i;
+    }
+    return end;
 }
 
 /// 把纯文本(无 SGR)按显示宽 max_w 截断写出(CJK=2);超长尾部省略。

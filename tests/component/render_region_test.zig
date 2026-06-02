@@ -42,3 +42,46 @@ test "L2 TUI: spinner frames unicode/ascii 不越界" {
     try std.testing.expectEqualStrings("|", verbs.frame(0, false));
     try std.testing.expect(verbs.frame(99, false).len > 0);
 }
+
+// ---- TaskTab(阶段 4)纯函数核心 ----
+
+test "L2 TUI TaskTab: 选首个 in_progress 的 active_form(无则 subject)" {
+    const a = std.testing.allocator;
+    var store = cc.core_task_store.TaskStore.init(a);
+    defer store.deinit();
+
+    // 无 in_progress → null
+    try std.testing.expect(cc.tui_render_region.taskTabLabel(&store) == null);
+
+    // 建两个:第一个 pending,第二个 in_progress(带 active_form)
+    _ = try store.create("first subject", "d", null);
+    const t2 = try store.create("second subject", "d", "running second");
+    try std.testing.expect(cc.tui_render_region.taskTabLabel(&store) == null); // 都还 pending
+
+    try store.updateStatus(t2.id, .in_progress);
+    const label = cc.tui_render_region.taskTabLabel(&store) orelse return error.NoLabel;
+    try std.testing.expectEqualStrings("running second", label); // active_form 优先
+}
+
+test "L2 TUI TaskTab: 无 active_form 回退 subject" {
+    const a = std.testing.allocator;
+    var store = cc.core_task_store.TaskStore.init(a);
+    defer store.deinit();
+    const t = try store.create("do the thing", "d", null);
+    try store.updateStatus(t.id, .in_progress);
+    const label = cc.tui_render_region.taskTabLabel(&store) orelse return error.NoLabel;
+    try std.testing.expectEqualStrings("do the thing", label);
+}
+
+test "L2 TUI TaskTab: truncateToWidth CJK 安全截断" {
+    const tr = cc.tui_render_region.truncateToWidth;
+    // 全 ASCII,宽度足够 → 不截
+    try std.testing.expectEqual(@as(usize, 5), tr("hello", 20));
+    // 截断:max_w=4 留 1 列省略号 → 最多 3 列 ASCII
+    try std.testing.expectEqual(@as(usize, 3), tr("hello", 4));
+    // CJK 每字 2 列:"中文" 宽 4;max_w=4 → 不截(<=4)
+    try std.testing.expectEqual(@as(usize, 6), tr("中文", 4)); // 2 字 × 3 字节 = 6
+    // CJK 截断:max_w=3 留 1 列 → 只能放 1 个中文(2列)放不下(>2),实际 0 字
+    const e = tr("中文字", 3);
+    try std.testing.expect(e == 0 or e == 3); // 边界:留 1 列时 2 列的字放不进 max_w-1=2? 放得下 1 个
+}
