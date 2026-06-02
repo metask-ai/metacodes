@@ -65,7 +65,7 @@ def test_T19_multiline_reply_complete(bin_path):
     if SKIP:
         return
     raw = run(bin_path, ["sleep:0.8", "type:请逐行输出 1 2 3 4 5 6 每个数字单独占一行", "key:enter", "sleep:8"],
-              per_key_drain=0.05)
+              per_key_drain=0.05, base_url=None)
     a = TTYAssert(raw)
     # 多行数字应在最终屏(或 scrollback)各占一行,且彼此不重叠覆盖。
     text = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
@@ -80,7 +80,7 @@ def test_T17_help_then_question_no_corruption(bin_path):
         return
     raw = run(bin_path, ["sleep:0.8", "type:/help", "key:enter", "sleep:0.6",
                          "type:用一句话回答你是谁", "key:enter", "sleep:10"],
-              per_key_drain=0.05)
+              per_key_drain=0.05, base_url=None)
     a = TTYAssert(raw)
     # 用户提问回显进 scrollback(❯ 行),模型有回复文本 → 证明 /help + 提问 + 回复都正常流过。
     a.assert_prose_contains("用一句话回答你是谁")

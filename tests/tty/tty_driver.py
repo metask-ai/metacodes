@@ -38,8 +38,11 @@ def _set_winsize(fd, rows, cols):
 
 
 def run(bin_path, key_events, term_size=(24, 80), env=None,
-        startup_drain=0.8, per_key_drain=0.25):
+        startup_drain=0.8, per_key_drain=0.25, base_url="http://127.0.0.1:1/v1/messages"):
     """fork pty,设窗口,exec bin,按 key_events 喂键,返回合并原始字节流。
+
+    base_url: 默认指死端口(连接立即 refused,probeModels/请求不 hang)——离线渲染测试用。
+              打真实模型的 case(test_generating 等)传 base_url=None 用硬编码真端点。
 
     key_events 元素(字符串):
       "type:文本"      逐 codepoint 写(模拟打字,每字单独 drain → 暴露逐帧 bug)
@@ -52,6 +55,12 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
     full_env = dict(os.environ)
     full_env["METACODES_LOG"] = "*:warn"
     full_env["FORCE_COLOR"] = "1"  # 锁 basic_16,让 accent/warn 是固定标准色 SGR
+    # 离线:跳过启动期 probeModels 网络调用——它在无网/沙箱里会 hang,导致 REPL 永不渲染
+    # (实测根因:pty 下 0 字节 = 卡在 probeModels,非 drain 时序)。
+    full_env["METACODES_NO_PROBE"] = "1"
+    # HOME 隔离:不读用户真实 ~/.claude / ~/.cc-zig(settings/agents/skills),保证可重复。
+    full_env.setdefault("HOME", "/tmp/cc-tty-home")
+    os.makedirs(full_env["HOME"], exist_ok=True)
     if env:
         full_env.update(env)
 
@@ -61,7 +70,11 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
         try:
             os.environ.clear()
             os.environ.update(full_env)
-            os.execv(bin_path, [bin_path, "--permission", "bypassPermissions"])
+            argv = [bin_path, "--permission", "bypassPermissions"]
+            if base_url:
+                # 死端口兜底:即便 NO_PROBE 失效,网络调用也立即 refused 不 hang。
+                argv += ["--base-url", base_url]
+            os.execv(bin_path, argv)
         except OSError:
             os._exit(127)
         os._exit(127)

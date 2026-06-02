@@ -20,7 +20,7 @@ def test_T14_generating_keeps_input_box(bin_path):
     # 提交一句会产生输出的查询 → 生成期应有【多帧持续】同时有 spinner + 完整输入框 + footer
     # (不是"某一帧有",而是 spinner+框+❯+footer 共存于生成窗口的多个帧 → 区持续可见、不闪没)。
     raw = run(bin_path, ["sleep:0.8", "type:慢慢数到十五,每行一个数字", "key:enter", "sleep:4"],
-              per_key_drain=0.05)
+              per_key_drain=0.05, base_url=None)
     a = TTYAssert(raw)
     coexist = sum(
         1 for sc in a.frame_screens
@@ -41,7 +41,7 @@ def test_T15_type_into_queued_during_gen(bin_path):
     raw = run(bin_path, ["sleep:0.8",
                          "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
                          "sleep:0.6", "type:HELLO", "sleep:2.5"],
-              per_key_drain=0.06)
+              per_key_drain=0.06, base_url=None)
     a = TTYAssert(raw)
     # HELLO 出现在生成帧的 ❯ 内容行
     in_box = any(
@@ -68,7 +68,7 @@ def test_T16_queued_autosubmits_after_gen(bin_path):
     # 第一句须生成够久(长查询),保证 DONE2 在生成窗口内入队(否则被 drainStdin 丢弃,属正确行为)。
     raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
                          "sleep:0.6", "type:DONE2", "key:enter", "sleep:10"],
-              per_key_drain=0.06)
+              per_key_drain=0.06, base_url=None)
     a = TTYAssert(raw)
     # queued "DONE2" 回车入队 → 第一轮结束后自动续发 → ❯ 回显进 scrollback。
     a.assert_prose_contains("DONE2")
@@ -80,7 +80,7 @@ def test_T20_enter_enqueues_clears_box(bin_path):
         return
     raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独一行", "key:enter",
                          "sleep:0.6", "type:QUEUEDMSG", "key:enter", "sleep:2.0"],
-              per_key_drain=0.05)
+              per_key_drain=0.05, base_url=None)
     a = TTYAssert(raw)
     # 回车后某生成帧:队列预览含 QUEUEDMSG(在框上方),且 ❯ 框已清空(不含 QUEUEDMSG)。
     found_preview = False
@@ -105,7 +105,7 @@ def test_T21_multiple_queued_autosubmit(bin_path):
     raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
                          "sleep:0.6", "type:BATCHA", "key:enter",
                          "sleep:0.4", "type:BATCHB", "key:enter", "sleep:10"],
-              per_key_drain=0.05)
+              per_key_drain=0.05, base_url=None)
     a = TTYAssert(raw)
     a.assert_prose_contains("BATCHA")
     a.assert_prose_contains("BATCHB")
@@ -126,7 +126,7 @@ def test_T22_esc_two_tier(bin_path):
         return
     raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60 每行一个数字", "key:enter",
                          "sleep:0.6", "type:TYPED", "key:esc", "sleep:0.8"],
-              per_key_drain=0.05)
+              per_key_drain=0.05, base_url=None)
     a = TTYAssert(raw)
     # Esc 后应有帧:spinner 仍在(生成继续)且框不含 TYPED(已清空)。
     cleared_continues = False
@@ -155,7 +155,7 @@ def test_T23_cjk_ime_in_box(bin_path):
         return
     raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60 每行一个数字", "key:enter",
                          "sleep:0.6", "type:你好世界", "sleep:1.5"],
-              per_key_drain=0.05)
+              per_key_drain=0.05, base_url=None)
     a = TTYAssert(raw)
     found = any(
         sc.find_last_row("esc to interrupt") is not None
@@ -175,7 +175,7 @@ def test_T24_esc_interrupts_then_resends_queue(bin_path):
     raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
                          "sleep:0.8", "type:打断后请回答你是谁", "key:enter",
                          "sleep:0.4", "key:esc", "sleep:8"],
-              per_key_drain=0.05)
+              per_key_drain=0.05, base_url=None)
     a = TTYAssert(raw)
     import re
     from asserts import split_frames
@@ -198,7 +198,7 @@ def test_A6_narrow_terminal_no_wrap(bin_path):
         return
     from screen import str_width
     raw = run(bin_path, ["sleep:0.8", "type:数到八每行一个", "key:enter", "sleep:3"],
-              term_size=(24, 40), per_key_drain=0.05)
+              term_size=(24, 40), per_key_drain=0.05, base_url=None)
     a = TTYAssert(raw, rows=24, cols=40)
     bad = []
     for sc in a.frame_screens:

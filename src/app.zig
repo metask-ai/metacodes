@@ -235,7 +235,13 @@ pub const App = struct {
         errdefer allocator.free(app.tool_defs);
 
         // 探测 <base_url>/v1/models 取 model catalog（max_tokens）。失败静默，走本地 fallback。
-        app.api_client.probeModels();
+        // METACODES_NO_PROBE=1 跳过：离线/沙箱/TTY 测试下 probeModels 的网络调用会 hang,
+        // 跳过让 REPL 立即可用(走本地 model 单价表)。
+        if (std.c.getenv("METACODES_NO_PROBE") == null) {
+            app.api_client.probeModels();
+        } else {
+            @import("util/log.zig").debug("catalog", "probeModels skipped (METACODES_NO_PROBE)", .{});
+        }
         // CLI --max-tokens 覆盖
         app.api_client.setMaxTokensOverride(config.max_tokens);
 
