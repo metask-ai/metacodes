@@ -6,6 +6,7 @@ from asserts import TTYAssert
 def test_T01_empty_box_layout(bin_path):
     raw = run(bin_path, ["sleep:0.8"])
     a = TTYAssert(raw)
+    a.assert_stable()  # 捕获应停在稳定帧(否则提示 drain 不足)
     a.assert_box_present()
     a.assert_box_at_bottom()
     fr = a.footer_row()

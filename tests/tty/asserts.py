@@ -69,6 +69,27 @@ class TTYAssert:
 
     # ---------- 断言 ----------
 
+    def assert_stable(self, last_n=2):
+        """屏幕已settled:最后 last_n 个重画帧的渲染内容完全一致(无 mid-redraw 撕裂)。
+
+        post-hoc 检查(TTYAssert 处理的是已捕获字节,非活进程):若捕获在重画过程
+        中结束,最后两帧会不同 → 提示该用例 drain/sleep 不足、需加时间。帧数 < last_n
+        时跳过(不够样本不强断,避免对单帧场景误报)。
+        """
+        frames = self.frame_screens
+        if len(frames) < last_n:
+            return
+        texts = [
+            "\n".join(f.line_text(r) for r in range(f.rows))
+            for f in frames[-last_n:]
+        ]
+        if any(t != texts[0] for t in texts):
+            self._fail(
+                f"屏幕未 settled(最后 {last_n} 帧不一致,可能 drain/sleep 不足):\n"
+                + "--- 倒数第2帧 ---\n" + frames[-2].render_ascii()
+                + "\n--- 最后帧 ---\n" + frames[-1].render_ascii()
+            )
+
     def box_top_row(self, screen=None):
         sc = screen or self.final
         return sc.find_last_row("╭")
