@@ -22,6 +22,7 @@ pub const task_tools = @import("tools/task_tools.zig");
 pub const task_output_tool = @import("tools/task_output.zig");
 pub const agent_tool = @import("tools/agent.zig");
 pub const core_task_store = @import("core/task_store.zig");
+pub const transcript = @import("core/transcript.zig");
 pub const tool_context = @import("tools/context.zig");
 pub const tool_error = @import("core/tool_error.zig");
 pub const bash = @import("tools/bash.zig");
