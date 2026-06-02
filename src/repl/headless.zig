@@ -90,10 +90,7 @@ pub fn run(
         if (final_text.len == 0 or final_text[final_text.len - 1] != '\n') writeStdout("\n");
     }
 
-    return switch (result.stop_reason) {
-        .end_turn, .max_turns => 0,
-        else => 1,
-    };
+    return exitCodeFor(result.stop_reason);
 }
 
 /// 把 conversation 最后一条 assistant message 的所有 text block 拼起来（owned）。
@@ -124,6 +121,19 @@ fn emitJson(
     usage: *const app_mod.UsageTotals,
     model: []const u8,
 ) !void {
+    const line = try buildResultLine(allocator, final_text, result, usage, model);
+    defer allocator.free(line);
+    writeStdout(line);
+}
+
+/// 构造 result NDJSON 行(owned,含尾部 \n)。提 pub 供 L2 断言格式,不直接写 stdout。
+pub fn buildResultLine(
+    allocator: std.mem.Allocator,
+    final_text: []const u8,
+    result: agent_loop.RunResult,
+    usage: *const app_mod.UsageTotals,
+    model: []const u8,
+) ![]u8 {
     const stop = switch (result.stop_reason) {
         .end_turn => "end_turn",
         .max_turns => "max_turns",
@@ -141,9 +151,15 @@ fn emitJson(
     , .{ stop, result.turns, result.tool_calls, usage.input_tokens, usage.output_tokens, cost });
     try std.json.Stringify.encodeJsonString(final_text, .{}, &aw.writer);
     try aw.writer.writeAll("}\n");
-    const line = try aw.toOwnedSlice();
-    defer allocator.free(line);
-    writeStdout(line);
+    return try aw.toOwnedSlice();
+}
+
+/// 退出码逻辑(提 pub 供 L2):end_turn/max_turns → 0;其它(error/loop/aborted)→ 1。
+pub fn exitCodeFor(stop_reason: agent_loop.StopReason) u8 {
+    return switch (stop_reason) {
+        .end_turn, .max_turns => 0,
+        else => 1,
+    };
 }
 
 fn writeStdout(bytes: []const u8) void {

@@ -138,6 +138,7 @@ pub fn build(b: *std.Build) void {
         "tests/component/agent_background_test.zig",
         "tests/component/skill_fileref_test.zig",
         "tests/component/transcript_roundtrip_test.zig",
+        "tests/component/headless_json_test.zig",
         "tests/component/render_region_test.zig",
     };
     for (integ_files) |f| {
@@ -181,6 +182,7 @@ pub fn build(b: *std.Build) void {
         "tests/component/agent_background_test.zig",
         "tests/component/skill_fileref_test.zig",
         "tests/component/transcript_roundtrip_test.zig",
+        "tests/component/headless_json_test.zig",
         "tests/component/render_region_test.zig",
     };
     for (new_files) |f| {
