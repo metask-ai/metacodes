@@ -100,32 +100,61 @@ pub const Conversation = struct {
     /// 注意：仍会丢老的 user 消息 + 它们对应的 assistant 回答；这是故意的（这是 compact 的本意）。
     /// 只保证 *边界处* 不留孤儿。
     pub fn compactKeepRecent(self: *Conversation, keep_n: usize) usize {
-        const total = self.messages.items.len;
-        if (total <= keep_n) return 0;
-
-        var drop_count = total - keep_n;
-        // 把边界左移：只要 messages[drop_count] 是 user 且开头是 tool_result，把它也丢掉
-        // （它指向 messages[drop_count-1] 的 tool_use，两者都属于老上下文）
-        while (drop_count < total) {
-            const first_kept = self.messages.items[drop_count];
-            if (first_kept.role != .user) break;
-            if (first_kept.blocks.len == 0) break;
-            const first_block = first_kept.blocks[0];
-            const is_tool_result = @as(std.meta.Tag(msg.Block), first_block) == .tool_result;
-            if (!is_tool_result) break;
-            drop_count += 1;
-        }
-
+        const drop_count = self.compactBoundary(keep_n);
         if (drop_count == 0) return 0;
-        if (drop_count >= total) {
-            // 全丢了——至少保留最后一条（应该不会走到，但防御）
-            drop_count = total - 1;
-        }
-
         var i: usize = 0;
         while (i < drop_count) : (i += 1) {
             const m = self.messages.orderedRemove(0);
             m.deinit(self.allocator);
+        }
+        return drop_count;
+    }
+
+    /// 计算 compactKeepRecent 会丢的消息数(boundary):total-keep_n,但把边界左移以避免
+    /// 保留区首条是孤儿 tool_result。供 compactWithSummary 先总结再丢用。
+    pub fn compactBoundary(self: *const Conversation, keep_n: usize) usize {
+        const total = self.messages.items.len;
+        if (total <= keep_n) return 0;
+        var drop_count = total - keep_n;
+        while (drop_count < total) {
+            const first_kept = self.messages.items[drop_count];
+            if (first_kept.role != .user) break;
+            if (first_kept.blocks.len == 0) break;
+            if (@as(std.meta.Tag(msg.Block), first_kept.blocks[0]) != .tool_result) break;
+            drop_count += 1;
+        }
+        if (drop_count >= total) drop_count = total - 1;
+        return drop_count;
+    }
+
+    /// 9 段结构化 compact:先把要丢的消息交给 summarize_fn 生成 summary,再丢老消息,
+    /// 把 summary 作为一条 assistant 消息 prepend 到队首(保住早期上下文,对齐 cc)。
+    /// summarize_fn 返回 null(无 client/失败)→ 退回纯 compactKeepRecent(降级)。
+    /// 返回丢弃的消息数。
+    pub fn compactWithSummary(
+        self: *Conversation,
+        keep_n: usize,
+        ctx: anytype,
+        comptime summarize_fn: fn (@TypeOf(ctx), []const msg.Message) ?[]u8,
+    ) !usize {
+        const drop_count = self.compactBoundary(keep_n);
+        if (drop_count == 0) return 0;
+
+        // 先总结要丢的 [0, drop_count)(在丢之前,内容还在)。
+        const summary = summarize_fn(ctx, self.messages.items[0..drop_count]);
+
+        // 丢老消息。
+        var i: usize = 0;
+        while (i < drop_count) : (i += 1) {
+            const m = self.messages.orderedRemove(0);
+            m.deinit(self.allocator);
+        }
+
+        // 有 summary → prepend 一条 assistant 消息(text block)到队首。
+        if (summary) |s| {
+            const blocks = try self.allocator.alloc(msg.Block, 1);
+            blocks[0] = .{ .text = s }; // s 已是 owned(summarize_fn dupe 的),转移给 block
+            try self.messages.insert(self.allocator, 0, .{ .role = .assistant, .blocks = blocks });
         }
         return drop_count;
     }

@@ -197,7 +197,15 @@ pub fn run(
         }
         if (conversation.isOverThreshold(auto_threshold)) {
             const before = conversation.len();
-            const dropped = conversation.compactKeepRecent(opts.auto_compact_keep_recent);
+            // 9 段结构化摘要(补真缺口):有 api_client → 调模型把要丢的历史总结成 summary
+            // prepend 保住早期上下文(对齐 cc);summarize 失败/无 client → 退回纯丢老消息。
+            const compact_summary = @import("compact_summary.zig");
+            const SummCtx = struct { client: *client_mod.Client, alloc: std.mem.Allocator };
+            const dropped = conversation.compactWithSummary(opts.auto_compact_keep_recent, SummCtx{ .client = api_client, .alloc = allocator }, struct {
+                fn f(c: SummCtx, drop_msgs: []const msg.Message) ?[]u8 {
+                    return compact_summary.summarize(c.alloc, c.client, drop_msgs);
+                }
+            }.f) catch conversation.compactKeepRecent(opts.auto_compact_keep_recent);
             if (dropped > 0) {
                 log.info("agent", "auto-compact: dropped {d} old messages ({d} -> {d}) threshold={d}", .{ dropped, before, conversation.len(), auto_threshold });
                 try stdout_writer.print("\x1b[33m[auto-compacted {d} old messages, kept last {d}]\x1b[0m\n", .{ dropped, conversation.len() });
