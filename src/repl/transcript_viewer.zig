@@ -299,13 +299,15 @@ test "renderToLines: Edit tool_result 经 renderResult 出 diff 着色" {
     var has_red = false;
     const th = @import("tui/theme.zig").dark;
     for (lines) |l| {
-        if (std.mem.indexOf(u8, l, "const b = 20;") != null) has_new = true;
-        if (std.mem.indexOf(u8, l, "const b = 2;") != null) has_old = true;
+        // 内容现经行内语法高亮(const→magenta、20→yellow),整句被 ANSI 切碎,
+        // 故断言高亮无法拆开的片段:数字 20(+行)/ 行内 "b = "。
+        if (std.mem.indexOf(u8, l, "20") != null) has_new = true;
+        if (std.mem.indexOf(u8, l, "b = ") != null) has_old = true;
         if (std.mem.indexOf(u8, l, th.success) != null) has_green = true;
         if (std.mem.indexOf(u8, l, th.danger) != null) has_red = true;
     }
-    try testing.expect(has_new); // + 行内容
-    try testing.expect(has_old); // - 行内容
+    try testing.expect(has_new); // + 行内容(数字 20)
+    try testing.expect(has_old); // 行内 "b = " 片段
     try testing.expect(has_green); // + 行 success 着色
     try testing.expect(has_red); // - 行 danger 着色
 }

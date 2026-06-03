@@ -38,6 +38,7 @@ pub fn renderToOwned(md: []const u8, allocator: std.mem.Allocator) ![]u8 {
     var cursor: usize = 0;
     var in_code_block = false;
     var code_lang: []const u8 = "";
+    var hl_state: HlState = .{};
 
     while (cursor < md.len) {
         // 行首：找下一行边界
@@ -51,12 +52,14 @@ pub fn renderToOwned(md: []const u8, allocator: std.mem.Allocator) ![]u8 {
                 try out.append(allocator, '\n');
                 in_code_block = false;
             } else {
-                try highlightCodeLine(line, code_lang, &out, allocator);
+                try highlightCodeLine(line, code_lang, &hl_state, GRAY, &out, allocator);
+                try out.appendSlice(allocator, RESET);
                 try out.append(allocator, '\n');
             }
         } else if (std.mem.startsWith(u8, line, "```")) {
-            // 进入代码块：捕获语言标记用于高亮
+            // 进入代码块：捕获语言标记用于高亮;重置跨行高亮状态。
             code_lang = std.mem.trim(u8, line[3..], " \t\r");
+            hl_state = .{};
             try out.append(allocator, '\n');
             in_code_block = true;
         } else if (isHeading(line)) |h| {
@@ -149,28 +152,65 @@ fn renderInline(text: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Al
 }
 
 // ============================================================================
-// 代码块语法高亮（轻量 tokenizer）
+// 代码块语法高亮（轻量 tokenizer，分语言 + 跨行状态）
 // ============================================================================
 
-/// 通用关键字集（覆盖 zig/c/ts/js/py/rust/go 的高频词）。
-/// 不追求语言精确——只要 token 是这些词之一就上色，足够提升可读性。
-const KEYWORDS = [_][]const u8{
-    // 控制流
-    "if", "else", "for", "while", "switch", "case", "default", "break", "continue",
-    "return", "match", "loop", "do", "try", "catch", "finally", "throw", "defer", "errdefer",
-    // 声明
-    "const", "var", "let", "fn", "func", "function", "def", "class", "struct", "enum",
-    "union", "interface", "type", "trait", "impl", "pub", "private", "public", "static",
-    "import", "export", "from", "use", "package", "mod", "namespace", "extern", "comptime",
-    "inline", "async", "await", "yield", "new", "delete", "void",
-    // 类型/字面量
-    "int", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "usize", "isize",
-    "f32", "f64", "bool", "true", "false", "null", "nil", "none", "undefined", "self", "this",
-    "string", "str", "char", "double", "float", "long", "short", "unsigned", "and", "or", "not", "in", "is",
+/// 语言族(从 fence info-string 归类)。决定关键字集 + 注释/字符串语法。
+const LangKind = enum { c_like, zig, python, js_ts, rust, go, shell, json, generic };
+
+/// 跨行高亮状态(块注释 / 多行字符串跨行延续)。逐行高亮时由调用方持有并传入。
+pub const HlState = struct {
+    in_block_comment: bool = false, // C 系 /* ... */ 跨行
+    in_multiline_str: bool = false, // python """ / zig \\ / 等
 };
 
-fn isKeyword(word: []const u8) bool {
-    for (KEYWORDS) |kw| {
+fn classifyLang(lang: []const u8) LangKind {
+    const L = struct {
+        fn eq(a: []const u8, comptime b: []const u8) bool {
+            return std.ascii.eqlIgnoreCase(a, b);
+        }
+    };
+    if (L.eq(lang, "zig")) return .zig;
+    if (L.eq(lang, "py") or L.eq(lang, "python") or L.eq(lang, "python3")) return .python;
+    if (L.eq(lang, "js") or L.eq(lang, "ts") or L.eq(lang, "jsx") or L.eq(lang, "tsx") or
+        L.eq(lang, "javascript") or L.eq(lang, "typescript")) return .js_ts;
+    if (L.eq(lang, "rust") or L.eq(lang, "rs")) return .rust;
+    if (L.eq(lang, "go") or L.eq(lang, "golang")) return .go;
+    if (L.eq(lang, "sh") or L.eq(lang, "bash") or L.eq(lang, "shell") or L.eq(lang, "zsh")) return .shell;
+    if (L.eq(lang, "json")) return .json;
+    if (L.eq(lang, "c") or L.eq(lang, "h") or L.eq(lang, "cpp") or L.eq(lang, "cc") or
+        L.eq(lang, "c++") or L.eq(lang, "hpp") or L.eq(lang, "java")) return .c_like;
+    return .generic;
+}
+
+/// 各语言关键字集。generic 用并集(尽量上色)。
+fn keywordsFor(kind: LangKind) []const []const u8 {
+    return switch (kind) {
+        .zig => &.{ "const", "var", "fn", "pub", "struct", "enum", "union", "error", "comptime", "inline", "defer", "errdefer", "try", "catch", "return", "if", "else", "switch", "while", "for", "break", "continue", "and", "or", "orelse", "unreachable", "test", "extern", "export", "usingnamespace", "async", "await", "suspend", "resume", "anytype", "void", "bool", "true", "false", "null", "undefined", "u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize", "f32", "f64", "type" },
+        .python => &.{ "def", "class", "return", "if", "elif", "else", "for", "while", "break", "continue", "import", "from", "as", "with", "try", "except", "finally", "raise", "lambda", "yield", "async", "await", "pass", "global", "nonlocal", "and", "or", "not", "in", "is", "None", "True", "False", "self", "del", "assert" },
+        .js_ts => &.{ "const", "let", "var", "function", "return", "if", "else", "for", "while", "switch", "case", "break", "continue", "class", "extends", "new", "this", "super", "import", "export", "from", "default", "async", "await", "yield", "try", "catch", "finally", "throw", "typeof", "instanceof", "in", "of", "void", "null", "undefined", "true", "false", "interface", "type", "enum", "implements", "public", "private", "protected", "readonly", "string", "number", "boolean", "any" },
+        .rust => &.{ "fn", "let", "mut", "const", "static", "struct", "enum", "trait", "impl", "pub", "use", "mod", "return", "if", "else", "match", "for", "while", "loop", "break", "continue", "where", "self", "Self", "super", "crate", "as", "ref", "move", "async", "await", "dyn", "unsafe", "extern", "true", "false", "Some", "None", "Ok", "Err", "i32", "u32", "i64", "u64", "usize", "isize", "f32", "f64", "bool", "str", "String", "Vec" },
+        .go => &.{ "func", "var", "const", "type", "struct", "interface", "map", "chan", "package", "import", "return", "if", "else", "for", "range", "switch", "case", "default", "break", "continue", "go", "defer", "select", "fallthrough", "nil", "true", "false", "int", "int32", "int64", "uint", "string", "bool", "byte", "rune", "error", "make", "new" },
+        .shell => &.{ "if", "then", "else", "elif", "fi", "for", "while", "do", "done", "case", "esac", "function", "return", "export", "local", "readonly", "in", "echo", "cd", "set", "unset", "source" },
+        .json => &.{ "true", "false", "null" },
+        .c_like => &.{ "int", "char", "void", "float", "double", "long", "short", "unsigned", "signed", "const", "static", "struct", "enum", "union", "typedef", "return", "if", "else", "for", "while", "switch", "case", "default", "break", "continue", "goto", "sizeof", "extern", "inline", "class", "public", "private", "protected", "virtual", "template", "namespace", "using", "new", "delete", "this", "true", "false", "nullptr", "bool", "auto" },
+        .generic => &KEYWORDS,
+    };
+}
+
+/// 通用关键字集（generic 语言用;覆盖各语言高频词的并集）。
+const KEYWORDS = [_][]const u8{
+    "if",     "else",      "for",     "while",   "switch",   "case",      "default",  "break",    "continue",
+    "return", "match",     "loop",    "do",      "try",      "catch",     "finally",  "throw",    "defer",
+    "const",  "var",       "let",     "fn",      "func",     "function",  "def",      "class",    "struct",
+    "enum",   "union",     "interface", "type",  "trait",    "impl",      "pub",      "static",
+    "import", "export",    "from",    "use",     "package",  "mod",       "extern",   "comptime",
+    "inline", "async",     "await",   "new",     "void",     "true",      "false",    "null",     "nil",
+    "self",   "this",      "int",     "bool",    "string",   "and",       "or",       "not",      "in",
+};
+
+fn isKeywordIn(word: []const u8, kws: []const []const u8) bool {
+    for (kws) |kw| {
         if (std.mem.eql(u8, kw, word)) return true;
     }
     return false;
@@ -180,26 +220,117 @@ fn isIdentChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
-/// 单行代码高亮：注释 / 字符串 / 数字 / 关键字 上色，其余原样（dim）。
-/// 整行起手 dim，token 高亮时切色再切回 dim。行尾 RESET 由调用方在 ``` 处补。
-fn highlightCodeLine(line: []const u8, lang: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
-    _ = lang; // 当前用通用规则，不区分语言；保留参数供未来按 lang 调整
-    try out.appendSlice(allocator, GRAY); // 基础色
+/// 单行代码高亮(分语言关键字 + 跨行块注释/多行字符串状态)。
+/// state 跨行持有:进入 C 系 `/* */` 或多行字符串后,后续行整段着色直到闭合。
+/// base:行基色——markdown 代码块传 GRAY;diff 行内高亮传"背景块+默认前景",每个 token
+///   收尾的 RESET 之后重铺 base,使背景色块在整行内不被 token 的 RESET 清掉(bg-aware)。
+/// 行尾不补 RESET(交调用方,diff 行尾要带行号/换行控制)。
+pub fn highlightCodeLine(line: []const u8, lang: []const u8, state: *HlState, base: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    const kind = classifyLang(lang);
+    const kws = keywordsFor(kind);
 
+    // 跨行延续态:整行(或到闭合处)按对应色,然后继续常规扫描。
+    if (state.in_block_comment) {
+        if (std.mem.indexOf(u8, line, "*/")) |close| {
+            const end = close + 2;
+            try out.appendSlice(allocator, DIM);
+            try out.appendSlice(allocator, line[0..end]);
+            try out.appendSlice(allocator, RESET);
+            try out.appendSlice(allocator, base);
+            state.in_block_comment = false;
+            try highlightRest(line[end..], kind, kws, state, base, out, allocator);
+        } else {
+            try out.appendSlice(allocator, DIM);
+            try out.appendSlice(allocator, line);
+            try out.appendSlice(allocator, RESET);
+            try out.appendSlice(allocator, base);
+        }
+        return;
+    }
+    if (state.in_multiline_str) {
+        // python """ 闭合;其余多行(zig \\)逐行延续,行首已无引号。
+        const py_close: ?usize = if (kind == .python) std.mem.indexOf(u8, line, "\"\"\"") else null;
+        if (py_close) |close| {
+            const end = close + 3;
+            try out.appendSlice(allocator, GREEN);
+            try out.appendSlice(allocator, line[0..end]);
+            try out.appendSlice(allocator, RESET);
+            try out.appendSlice(allocator, base);
+            state.in_multiline_str = false;
+            try highlightRest(line[end..], kind, kws, state, base, out, allocator);
+        } else {
+            try out.appendSlice(allocator, GREEN);
+            try out.appendSlice(allocator, line);
+            try out.appendSlice(allocator, RESET);
+            try out.appendSlice(allocator, base);
+        }
+        return;
+    }
+
+    try out.appendSlice(allocator, base);
+    try highlightRest(line, kind, kws, state, base, out, allocator);
+}
+
+/// 扫描一行(无跨行延续态),按 token 上色;每 token 收尾 RESET 后重铺 base(bg-aware)。
+/// 可能在行尾**进入**跨行态(设 state)。
+fn highlightRest(line: []const u8, kind: LangKind, kws: []const []const u8, state: *HlState, base: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    const line_comment_hash = (kind == .python or kind == .shell or kind == .generic);
     var i: usize = 0;
     while (i < line.len) {
         const c = line[i];
 
-        // 行注释：// 或 #（py/sh）—— 到行尾整段灰色（已是 GRAY，加 DIM 区分）
-        if ((c == '/' and i + 1 < line.len and line[i + 1] == '/') or c == '#') {
+        // 块注释起始 /*(C 系 / zig 无块注释,js/rust 有)
+        if (c == '/' and i + 1 < line.len and line[i + 1] == '*' and
+            (kind == .c_like or kind == .js_ts or kind == .rust or kind == .generic))
+        {
+            if (std.mem.indexOfPos(u8, line, i, "*/")) |close| {
+                const end = close + 2;
+                try out.appendSlice(allocator, DIM);
+                try out.appendSlice(allocator, line[i..end]);
+                try out.appendSlice(allocator, RESET);
+                try out.appendSlice(allocator, base);
+                i = end;
+                continue;
+            } else {
+                // 未闭合 → 进入跨行块注释态,本行剩余整段 dim。
+                try out.appendSlice(allocator, DIM);
+                try out.appendSlice(allocator, line[i..]);
+                try out.appendSlice(allocator, RESET);
+                state.in_block_comment = true;
+                return;
+            }
+        }
+
+        // 行注释:// (c/js/rust/go/zig) 或 # (py/sh)
+        const slash_comment = (c == '/' and i + 1 < line.len and line[i + 1] == '/');
+        if (slash_comment or (c == '#' and line_comment_hash)) {
             try out.appendSlice(allocator, DIM);
             try out.appendSlice(allocator, line[i..]);
             try out.appendSlice(allocator, RESET);
-            try out.appendSlice(allocator, GRAY);
+            try out.appendSlice(allocator, base);
             break;
         }
 
-        // 字符串："..." 或 '...'
+        // python 多行字符串 """(本行未闭合 → 进入跨行态)
+        if (kind == .python and c == '"' and i + 2 < line.len and line[i + 1] == '"' and line[i + 2] == '"') {
+            if (std.mem.indexOfPos(u8, line, i + 3, "\"\"\"")) |close| {
+                const end = close + 3;
+                try out.appendSlice(allocator, GREEN);
+                try out.appendSlice(allocator, line[i..end]);
+                try out.appendSlice(allocator, RESET);
+                try out.appendSlice(allocator, base);
+                i = end;
+                continue;
+            } else {
+                try out.appendSlice(allocator, GREEN);
+                try out.appendSlice(allocator, line[i..]);
+                try out.appendSlice(allocator, RESET);
+                state.in_multiline_str = true;
+                return;
+            }
+        }
+
+        // 字符串:"..." 或 '...'
         if (c == '"' or c == '\'') {
             const quote = c;
             var j = i + 1;
@@ -214,7 +345,7 @@ fn highlightCodeLine(line: []const u8, lang: []const u8, out: *std.ArrayList(u8)
             try out.appendSlice(allocator, GREEN);
             try out.appendSlice(allocator, line[i..end]);
             try out.appendSlice(allocator, RESET);
-            try out.appendSlice(allocator, GRAY);
+            try out.appendSlice(allocator, base);
             i = end;
             continue;
         }
@@ -226,7 +357,7 @@ fn highlightCodeLine(line: []const u8, lang: []const u8, out: *std.ArrayList(u8)
             try out.appendSlice(allocator, YELLOW);
             try out.appendSlice(allocator, line[i..j]);
             try out.appendSlice(allocator, RESET);
-            try out.appendSlice(allocator, GRAY);
+            try out.appendSlice(allocator, base);
             i = j;
             continue;
         }
@@ -236,11 +367,11 @@ fn highlightCodeLine(line: []const u8, lang: []const u8, out: *std.ArrayList(u8)
             var j = i;
             while (j < line.len and isIdentChar(line[j])) : (j += 1) {}
             const word = line[i..j];
-            if (isKeyword(word)) {
+            if (isKeywordIn(word, kws)) {
                 try out.appendSlice(allocator, MAGENTA);
                 try out.appendSlice(allocator, word);
                 try out.appendSlice(allocator, RESET);
-                try out.appendSlice(allocator, GRAY);
+                try out.appendSlice(allocator, base);
             } else {
                 try out.appendSlice(allocator, word);
             }
@@ -251,7 +382,6 @@ fn highlightCodeLine(line: []const u8, lang: []const u8, out: *std.ArrayList(u8)
         try out.append(allocator, c);
         i += 1;
     }
-    try out.appendSlice(allocator, RESET);
 }
 
 // ============================================================================
@@ -343,6 +473,53 @@ test "highlight code: comment dimmed" {
     const r = try renderToOwned(md, testing.allocator);
     defer testing.allocator.free(r);
     try testing.expect(std.mem.indexOf(u8, r, "a comment") != null);
+}
+
+test "highlight code: 跨行块注释(C 系 /* */)整段 dim" {
+    // 块注释跨 3 行,中间行不含 /* 也应是 dim(跨行状态生效)。
+    const md =
+        "```c\n" ++
+        "int x; /* start\n" ++
+        "middle of comment\n" ++
+        "end */ int y;\n" ++
+        "```\n";
+    const r = try renderToOwned(md, testing.allocator);
+    defer testing.allocator.free(r);
+    // 中间行整段在 DIM 内(\x1b[2m ... middle ...);若跨行状态没生效,middle 会被当代码高亮。
+    const mid = std.mem.indexOf(u8, r, "middle of comment").?;
+    // middle 之前最近的 SGR 应是 DIM(\x1b[2m)而非 magenta/green。
+    const dim_before = std.mem.lastIndexOf(u8, r[0..mid], "\x1b[2m") orelse 0;
+    const kw_before = std.mem.lastIndexOf(u8, r[0..mid], "\x1b[35m") orelse 0;
+    try testing.expect(dim_before > kw_before); // DIM 比关键字色更近 → middle 在块注释里
+}
+
+test "highlight code: python 多行字符串跨行 green" {
+    const md =
+        "```py\n" ++
+        "x = \"\"\"line one\n" ++
+        "line two\n" ++
+        "\"\"\"\n" ++
+        "```\n";
+    const r = try renderToOwned(md, testing.allocator);
+    defer testing.allocator.free(r);
+    // line two 在多行字符串内 → 它之前最近的色应是 GREEN(\x1b[32m)。
+    const two = std.mem.indexOf(u8, r, "line two").?;
+    const green_before = std.mem.lastIndexOf(u8, r[0..two], "\x1b[32m") orelse 0;
+    const gray_before = std.mem.lastIndexOf(u8, r[0..two], "\x1b[90m") orelse 0;
+    try testing.expect(green_before > gray_before);
+}
+
+test "highlight code: 分语言关键字(go func 高亮,py 不识 func 同等)" {
+    // go:func 是关键字 → magenta。
+    const go = try renderToOwned("```go\nfunc main() {}\n```\n", testing.allocator);
+    defer testing.allocator.free(go);
+    // func 紧跟 magenta。
+    const f = std.mem.indexOf(u8, go, "func").?;
+    try testing.expect(std.mem.lastIndexOf(u8, go[0..f], "\x1b[35m") != null);
+    // python:def 是关键字,func 不是 → def 高亮,普通标识符 func 不会误判为本语言关键字。
+    const py = try renderToOwned("```py\ndef f(): pass\n```\n", testing.allocator);
+    defer testing.allocator.free(py);
+    try testing.expect(std.mem.indexOf(u8, py, "\x1b[35m") != null); // def magenta
 }
 
 test "render multiple paragraphs preserve newlines" {

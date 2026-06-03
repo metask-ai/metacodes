@@ -44,6 +44,10 @@ pub const Theme = struct {
     tree_branch: []const u8,
     tree_end: []const u8,
     tree_pipe: []const u8,
+    /// diff 行背景色块(对齐 metacode):add/del 整行背景 tint。
+    /// 空串 = 不画背景(basic_16/mono 退回纯前景)。由 select 按 ColorCapability 注入。
+    diff_add_bg: []const u8 = "",
+    diff_del_bg: []const u8 = "",
 
     // ============ 边框字符 ============
     box_h: []const u8,
@@ -184,11 +188,25 @@ pub const Variant = enum { auto, dark, light, monochrome };
 /// 即便用户选 dark,能力是 .none 时也强制降级到 monochrome(否则 ANSI 在管道里乱码)。
 pub fn select(variant: Variant, cap: term.ColorCapability) Theme {
     if (cap == .none) return monochrome;
-    return switch (variant) {
+    const is_light = (variant == .light);
+    var th: Theme = switch (variant) {
         .auto, .dark => dark,
         .light => light,
         .monochrome => monochrome,
     };
+    // diff 背景色块:仅 256/truecolor 注入(basic_16 留空 → 纯前景,对齐 metacode)。
+    switch (cap) {
+        .truecolor => {
+            th.diff_add_bg = if (is_light) ansi.diff_bg.tc_add_light else ansi.diff_bg.tc_add_dark;
+            th.diff_del_bg = if (is_light) ansi.diff_bg.tc_del_light else ansi.diff_bg.tc_del_dark;
+        },
+        .extended_256 => {
+            th.diff_add_bg = if (is_light) ansi.diff_bg.idx_add_light else ansi.diff_bg.idx_add_dark;
+            th.diff_del_bg = if (is_light) ansi.diff_bg.idx_del_light else ansi.diff_bg.idx_del_dark;
+        },
+        else => {}, // basic_16:不画背景
+    }
+    return th;
 }
 
 /// 从字符串名解析(供 `/theme dark` 命令用)。
@@ -249,4 +267,26 @@ test "parseVariant 支持别名" {
     try testing.expectEqual(Variant.monochrome, parseVariant("monochrome").?);
     try testing.expectEqual(Variant.auto, parseVariant("auto").?);
     try testing.expect(parseVariant("rainbow") == null);
+}
+
+test "select: diff 背景按 ColorCapability 注入" {
+    // truecolor:RGB 背景转义。
+    const tc = select(.dark, .truecolor);
+    try testing.expectEqualStrings(ansi.diff_bg.tc_add_dark, tc.diff_add_bg);
+    try testing.expectEqualStrings(ansi.diff_bg.tc_del_dark, tc.diff_del_bg);
+    try testing.expect(std.mem.indexOf(u8, tc.diff_add_bg, "48;2;33;58;43") != null);
+    // 256:索引背景。
+    const c256 = select(.dark, .extended_256);
+    try testing.expectEqualStrings(ansi.diff_bg.idx_add_dark, c256.diff_add_bg);
+    try testing.expect(std.mem.indexOf(u8, c256.diff_add_bg, "48;5;22") != null);
+    // basic_16:不画背景(留空,对齐 metacode fg-only)。
+    const c16 = select(.dark, .basic_16);
+    try testing.expectEqualStrings("", c16.diff_add_bg);
+    try testing.expectEqualStrings("", c16.diff_del_bg);
+    // light truecolor 用 GitHub pastel。
+    const lt = select(.light, .truecolor);
+    try testing.expectEqualStrings(ansi.diff_bg.tc_add_light, lt.diff_add_bg);
+    // none → monochrome,无背景。
+    const mono = select(.dark, .none);
+    try testing.expectEqualStrings("", mono.diff_add_bg);
 }

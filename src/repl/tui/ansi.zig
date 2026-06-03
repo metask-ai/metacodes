@@ -64,6 +64,32 @@ pub const sgr = struct {
     pub fn fgRgb(r: u8, g: u8, b: u8, buf: []u8) []const u8 {
         return std.fmt.bufPrint(buf, "\x1b[38;2;{d};{d};{d}m", .{ r, g, b }) catch return "";
     }
+
+    /// 256 色背景。`\x1b[48;5;{N}m`。
+    pub fn bg256(idx: u8, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(buf, "\x1b[48;5;{d}m", .{idx}) catch return "";
+    }
+
+    /// RGB 24-bit 背景。`\x1b[48;2;{R};{G};{B}m`。
+    pub fn bgRgb(r: u8, g: u8, b: u8, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(buf, "\x1b[48;2;{d};{d};{d}m", .{ r, g, b }) catch return "";
+    }
+};
+
+/// diff 行背景调色板(对齐 metacode diff_render.rs)。静态转义串,theme.select 按
+/// ColorCapability 选。truecolor 用 RGB,256 用索引;basic_16/none **不画背景**
+/// (留空——对齐 metacode "ANSI16 背景太饱和盖语法色,退回纯前景")。
+pub const diff_bg = struct {
+    // truecolor(dark muted / light GitHub pastel)
+    pub const tc_add_dark = "\x1b[48;2;33;58;43m"; // #213A2B
+    pub const tc_del_dark = "\x1b[48;2;74;34;29m"; // #4A221D
+    pub const tc_add_light = "\x1b[48;2;218;251;225m"; // #dafbe1
+    pub const tc_del_light = "\x1b[48;2;255;235;233m"; // #ffebe9
+    // 256 色降级
+    pub const idx_add_dark = "\x1b[48;5;22m";
+    pub const idx_del_dark = "\x1b[48;5;52m";
+    pub const idx_add_light = "\x1b[48;5;194m";
+    pub const idx_del_light = "\x1b[48;5;224m";
 };
 
 // ============================================================================

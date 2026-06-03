@@ -22,6 +22,7 @@ const std = @import("std");
 const theme_mod = @import("../theme.zig");
 const layout = @import("../layout.zig");
 const term = @import("../term.zig");
+const render_mod = @import("../../render.zig");
 const Theme = theme_mod.Theme;
 
 pub const RenderOpts = struct {
@@ -503,30 +504,52 @@ fn renderEditDiff(alloc: std.mem.Allocator, th: Theme, output_text: []const u8, 
     const unescaped = jsonUnescape(alloc, diff) catch return renderGenericFold(alloc, th, output_text, out, opts);
     defer alloc.free(unescaped);
 
+    // 从结果里的 file_path/path 推语言(供 diff 行内语法高亮)。
+    const fpath = extractField(output_text, "file_path") orelse extractField(output_text, "path") orelse "";
+    const lang = langFromPath(fpath);
+
     const limit: u16 = if (opts.verbose or opts.transcript) std.math.maxInt(u16) else opts.max_output_lines;
     var shown: u16 = 0;
     var total: u16 = 0;
     var pos: usize = 0;
+    // 行号跟踪:从 @@ -old_start,+new_start @@ 解析,逐行推进。
+    var old_ln: usize = 0;
+    var new_ln: usize = 0;
     while (pos < unescaped.len) {
         const eol = std.mem.indexOfScalarPos(u8, unescaped, pos, '\n') orelse unescaped.len;
         const line = unescaped[pos..eol];
-        // 跳过 diff 文件头(--- / +++ / @@),只着色实际增删/上下文行。
-        const is_header = std.mem.startsWith(u8, line, "+++") or std.mem.startsWith(u8, line, "---") or std.mem.startsWith(u8, line, "@@");
-        if (!is_header) {
-            total += 1;
-            if (opts.collapsed and shown >= limit) {
-                pos = eol + 1;
-                continue;
-            }
-            const color: []const u8 = if (line.len > 0 and line[0] == '+') th.success else if (line.len > 0 and line[0] == '-') th.danger else th.dim;
-            try out.appendSlice(alloc, "  ");
-            try out.appendSlice(alloc, color);
-            try out.appendSlice(alloc, line);
-            try out.appendSlice(alloc, th.reset);
-            try out.append(alloc, '\n');
-            shown += 1;
-        }
         pos = eol + 1;
+
+        if (std.mem.startsWith(u8, line, "+++") or std.mem.startsWith(u8, line, "---")) continue;
+        if (std.mem.startsWith(u8, line, "@@")) {
+            parseHunkHeader(line, &old_ln, &new_ln); // 设置本 hunk 起始行号
+            continue;
+        }
+        total += 1;
+        if (opts.collapsed and shown >= limit) continue;
+
+        const kind: DiffLineKind = if (line.len > 0 and line[0] == '+')
+            .add
+        else if (line.len > 0 and line[0] == '-')
+            .del
+        else
+            .ctx;
+        // 行号:add 用 new、del 用 old、ctx 两者都推进(gutter 显对应侧)。
+        const num: usize = switch (kind) {
+            .add => new_ln,
+            .del => old_ln,
+            .ctx => new_ln,
+        };
+        try appendDiffLine(alloc, th, out, kind, num, line, lang);
+        switch (kind) {
+            .add => new_ln += 1,
+            .del => old_ln += 1,
+            .ctx => {
+                old_ln += 1;
+                new_ln += 1;
+            },
+        }
+        shown += 1;
     }
     if (opts.collapsed and total > limit) {
         try out.appendSlice(alloc, "  ");
@@ -535,6 +558,85 @@ fn renderEditDiff(alloc: std.mem.Allocator, th: Theme, output_text: []const u8, 
         try out.appendSlice(alloc, th.reset);
         try out.append(alloc, '\n');
     }
+}
+
+const DiffLineKind = enum { add, del, ctx };
+
+/// 渲染一条 diff 行:`<行号> <bg 色块>{sign+content}<reset>`。
+/// theme 有 diff 背景(256/truecolor)→ 整段套背景;否则纯前景(basic_16/mono)。
+/// 前导 "  " 缩进交给 appendWithGutter 处理(它会剥掉重套 ⎿)。
+fn appendDiffLine(alloc: std.mem.Allocator, th: Theme, out: *std.ArrayList(u8), kind: DiffLineKind, num: usize, line: []const u8, lang: []const u8) !void {
+    try out.appendSlice(alloc, "  ");
+    // 行号列(dim,右对齐 4 宽)。
+    var num_buf: [8]u8 = undefined;
+    const num_str = std.fmt.bufPrint(&num_buf, "{d:>4} ", .{num}) catch "   ? ";
+    try out.appendSlice(alloc, th.dim);
+    try out.appendSlice(alloc, num_str);
+    try out.appendSlice(alloc, th.reset);
+    // 背景色块(若 theme 提供 256/truecolor;basic_16/mono 为空)。
+    const bg: []const u8 = switch (kind) {
+        .add => th.diff_add_bg,
+        .del => th.diff_del_bg,
+        .ctx => "",
+    };
+    const sign_fg: []const u8 = switch (kind) {
+        .add => th.success,
+        .del => th.danger,
+        .ctx => th.dim,
+    };
+    const sign: u8 = if (line.len > 0) line[0] else ' ';
+    const content = if (line.len > 0) line[1..] else line;
+
+    try out.appendSlice(alloc, bg);
+    // sign 字符:实色(+绿/-红/空 dim),坐在背景块上。
+    try out.appendSlice(alloc, sign_fg);
+    try out.append(alloc, sign);
+    try out.appendSlice(alloc, th.reset);
+    // 内容:语法高亮(bg-aware)。base = bg + (del 行整体 DIM,对齐 metacode 防删除色被语法盖)。
+    // 每个 highlight 行需独立跨行状态(diff 行不连续,不能跨 hunk 续状态)。
+    var hl: render_mod.HlState = .{};
+    var base_buf: std.ArrayList(u8) = .empty;
+    defer base_buf.deinit(alloc);
+    try base_buf.appendSlice(alloc, bg);
+    if (kind == .del) try base_buf.appendSlice(alloc, th.dim);
+    try render_mod.highlightCodeLine(content, lang, &hl, base_buf.items, out, alloc);
+    try out.appendSlice(alloc, th.reset);
+    try out.append(alloc, '\n');
+}
+
+/// 文件扩展名 → 语法高亮语言标记(render.classifyLang 能认的名)。
+fn langFromPath(path: []const u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return "";
+    const ext = path[dot + 1 ..];
+    const map = .{
+        .{ "zig", "zig" },     .{ "py", "python" }, .{ "js", "js" },   .{ "ts", "ts" },
+        .{ "jsx", "jsx" },     .{ "tsx", "tsx" },   .{ "rs", "rust" }, .{ "go", "go" },
+        .{ "c", "c" },         .{ "h", "c" },       .{ "cpp", "cpp" }, .{ "cc", "cpp" },
+        .{ "hpp", "cpp" },     .{ "java", "java" }, .{ "sh", "bash" }, .{ "bash", "bash" },
+        .{ "json", "json" },
+    };
+    inline for (map) |m| {
+        if (std.mem.eql(u8, ext, m[0])) return m[1];
+    }
+    return "";
+}
+
+/// 解析 `@@ -old_start,old_lines +new_start,new_lines @@` 的起始行号。
+fn parseHunkHeader(line: []const u8, old_ln: *usize, new_ln: *usize) void {
+    // 找 '-' 后的数字 = old_start;'+' 后的数字 = new_start。
+    if (std.mem.indexOfScalar(u8, line, '-')) |dash| {
+        old_ln.* = parseLeadingUint(line[dash + 1 ..]) orelse old_ln.*;
+    }
+    if (std.mem.indexOfScalar(u8, line, '+')) |plus| {
+        new_ln.* = parseLeadingUint(line[plus + 1 ..]) orelse new_ln.*;
+    }
+}
+
+fn parseLeadingUint(s: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {}
+    if (i == 0) return null;
+    return std.fmt.parseInt(usize, s[0..i], 10) catch null;
 }
 
 /// Grep/Glob 结果:出 "Found N …" 摘要(对齐 cc SearchResultSummary)。
@@ -875,10 +977,41 @@ test "renderResult: Edit diff +绿 -红 着色" {
     const out_json = "{\"success\":true,\"path\":\"/x\",\"gitDiff\":\"--- a/x\\n+++ b/x\\n@@ -1,2 +1,2 @@\\n ctx\\n-old line\\n+new line\\n\"}";
     const s = try renderResult(testing.allocator, th, "Edit", "{\"file_path\":\"/x\"}", out_json, .ok, 100, .{});
     defer testing.allocator.free(s);
-    // 增行内容、删行内容出现;diff 头(---/+++/@@)不作为内容行显示。
-    try capture.expectContains(s, "new line");
-    try capture.expectContains(s, "old line");
+    // 内容词出现(注:行内语法高亮会在词间插 ANSI,故断言单词而非整句)。
+    try capture.expectContains(s, "line");
+    try capture.expectContains(s, "old");
+    // diff 头(---/+++/@@)不作为内容行显示。
+    try testing.expect(std.mem.indexOf(u8, s, "+++") == null);
     // 着色:+ 行带 success 色(green),- 行带 danger 色(red)。
+    try testing.expect(std.mem.indexOf(u8, s, th.success) != null);
+    try testing.expect(std.mem.indexOf(u8, s, th.danger) != null);
+    // 行号列出现(新格式)。
+    try capture.expectContains(s, "1");
+}
+
+test "renderResult: diff 背景色块(truecolor)+ 行号 + del DIM" {
+    const th = theme_mod.select(.dark, .truecolor);
+    const out_json = "{\"success\":true,\"path\":\"/x.zig\",\"gitDiff\":\"--- a/x.zig\\n+++ b/x.zig\\n@@ -1,1 +1,1 @@\\n-const b = 2;\\n+const b = 20;\\n\"}";
+    const s = try renderResult(testing.allocator, th, "Edit", "{\"file_path\":\"/x.zig\"}", out_json, .ok, 100, .{});
+    defer testing.allocator.free(s);
+    // add 行带绿背景块(truecolor RGB),del 行带红背景块。
+    try testing.expect(std.mem.indexOf(u8, s, "48;2;33;58;43") != null); // add bg #213A2B
+    try testing.expect(std.mem.indexOf(u8, s, "48;2;74;34;29") != null); // del bg #4A221D
+    // del 行整体 DIM(\x1b[2m,防删除色被语法盖)。
+    try testing.expect(std.mem.indexOf(u8, s, th.dim) != null);
+    // 行内语法高亮:const→magenta、20→yellow(数字)。
+    try testing.expect(std.mem.indexOf(u8, s, th.role_tool) != null or std.mem.indexOf(u8, s, "\x1b[35m") != null);
+}
+
+test "renderResult: diff basic_16 无背景块只前景(对齐 metacode fg-only)" {
+    const th = theme_mod.select(.dark, .basic_16);
+    const out_json = "{\"success\":true,\"path\":\"/x.zig\",\"gitDiff\":\"--- a/x.zig\\n+++ b/x.zig\\n@@ -1,1 +1,1 @@\\n-a\\n+b\\n\"}";
+    const s = try renderResult(testing.allocator, th, "Edit", "{\"file_path\":\"/x.zig\"}", out_json, .ok, 100, .{});
+    defer testing.allocator.free(s);
+    // 16 色:不出现任何背景转义(48;2 / 48;5)。
+    try testing.expect(std.mem.indexOf(u8, s, "48;2;") == null);
+    try testing.expect(std.mem.indexOf(u8, s, "48;5;") == null);
+    // 仍有 +绿/-红 前景。
     try testing.expect(std.mem.indexOf(u8, s, th.success) != null);
     try testing.expect(std.mem.indexOf(u8, s, th.danger) != null);
 }
@@ -960,7 +1093,7 @@ test "renderResult: verbose 关折叠(通用)" {
 
 test "VISUAL demo: Edit diff(TUI_DEMO=1)" {
     if (std.c.getenv("TUI_DEMO") == null) return error.SkipZigTest;
-    const th = theme_mod.dark;
+    const th = theme_mod.select(.dark, .truecolor); // 真彩:看背景色块 + 行内高亮
     const out_json = "{\"success\":true,\"path\":\"/x.zig\",\"gitDiff\":\"--- a/x.zig\\n+++ b/x.zig\\n@@ -1,3 +1,3 @@\\n const a = 1;\\n-const b = 2;\\n+const b = 20;\\n const c = 3;\\n\"}";
     const s = try renderResult(testing.allocator, th, "Edit", "{\"file_path\":\"/x.zig\"}", out_json, .ok, 88, .{ .cols = 60 });
     defer testing.allocator.free(s);
