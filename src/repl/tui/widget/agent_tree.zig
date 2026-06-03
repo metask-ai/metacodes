@@ -17,6 +17,7 @@ const std = @import("std");
 const Theme = @import("../theme.zig").Theme;
 const term = @import("../term.zig");
 const registry = @import("../../../core/agent_job_registry.zig");
+const tool_card = @import("tool_card.zig");
 
 const JobSnapshot = registry.AgentJobRegistry.JobSnapshot;
 const JobStatus = registry.JobStatus;
@@ -103,7 +104,14 @@ fn renderJobLine(alloc: std.mem.Allocator, th: Theme, j: JobSnapshot, is_last: b
         try out.appendSlice(alloc, "  ");
         try out.appendSlice(alloc, th.gutter);
         try out.append(alloc, ' ');
-        try out.appendSlice(alloc, j.current_tool);
+        // 动作标签:`Tool(arg)`(复用 tool_card.actionLabel),拿不到参数则纯工具名。
+        const label = tool_card.actionLabel(alloc, j.current_tool, j.current_tool_input) catch null;
+        if (label) |l| {
+            defer alloc.free(l);
+            try out.appendSlice(alloc, l);
+        } else {
+            try out.appendSlice(alloc, j.current_tool);
+        }
         try out.appendSlice(alloc, th.reset);
         try out.append(alloc, '\n');
     }
@@ -121,8 +129,8 @@ const testing = std.testing;
 const theme_mod = @import("../theme.zig");
 const capture = @import("../test_capture.zig");
 
-fn mkSnap(id: []u8, status: JobStatus, desc: []u8, turns: u32, tool_calls: u32, current_turn: u32, current_tool: []u8) JobSnapshot {
-    return .{ .id = id, .status = status, .desc = desc, .turns = turns, .tool_calls = tool_calls, .current_turn = current_turn, .current_tool = current_tool };
+fn mkSnap(id: []u8, status: JobStatus, desc: []u8, turns: u32, tool_calls: u32, current_turn: u32, current_tool: []u8, current_tool_input: []u8) JobSnapshot {
+    return .{ .id = id, .status = status, .desc = desc, .turns = turns, .tool_calls = tool_calls, .current_turn = current_turn, .current_tool = current_tool, .current_tool_input = current_tool_input };
 }
 
 test "agent_tree: 空 jobs → 空串" {
@@ -131,12 +139,13 @@ test "agent_tree: 空 jobs → 空串" {
     try testing.expectEqual(@as(usize, 0), s.len);
 }
 
-test "agent_tree: 单 running job 出标题 + 分支 + 动作行" {
+test "agent_tree: 单 running job 出标题 + 分支 + 动作行(带参数)" {
     var id = "agent_1".*;
     var desc = "inspect repo".*;
     var tool = "Grep".*;
+    var inp = "{\"pattern\":\"TODO\"}".*;
     const jobs = [_]JobSnapshot{
-        mkSnap(&id, .running, &desc, 2, 5, 2, &tool),
+        mkSnap(&id, .running, &desc, 2, 5, 2, &tool, &inp),
     };
     const s = try render(testing.allocator, theme_mod.monochrome, &jobs);
     defer testing.allocator.free(s);
@@ -144,7 +153,8 @@ test "agent_tree: 单 running job 出标题 + 分支 + 动作行" {
     try capture.expectContains(s, "Running 1 subagent…");
     try capture.expectContains(s, "inspect repo");
     try capture.expectContains(s, "5 tools · turn 2");
-    try capture.expectContains(s, "Grep"); // 动作行
+    // 动作行带参数:Grep(TODO)(对齐 cc `⎿ Bash(git status)`)。
+    try capture.expectContains(s, "Grep(TODO)");
     // 单个 = 末枝,mono tree_end="\"。
     try capture.expectContains(s, "\\ inspect repo");
 }
@@ -154,7 +164,7 @@ test "agent_tree: 全 done → finished 标题,无动作行" {
     var desc = "task one".*;
     var empty = "".*;
     const jobs = [_]JobSnapshot{
-        mkSnap(&id, .done, &desc, 3, 7, 3, empty[0..0]),
+        mkSnap(&id, .done, &desc, 3, 7, 3, empty[0..0], empty[0..0]),
     };
     const s = try render(testing.allocator, theme_mod.monochrome, &jobs);
     defer testing.allocator.free(s);
@@ -174,7 +184,7 @@ test "agent_tree: 超 MAX_SHOWN 折叠 +M more" {
         ids[k][6] = @intCast('0' + k);
         @memcpy(descs[k][0..4], "jobx");
         descs[k][3] = @intCast('0' + k);
-        jobs[k] = mkSnap(ids[k][0..7], .running, descs[k][0..4], 1, 1, 1, empty[0..0]);
+        jobs[k] = mkSnap(ids[k][0..7], .running, descs[k][0..4], 1, 1, 1, empty[0..0], empty[0..0]);
     }
     const s = try render(testing.allocator, theme_mod.monochrome, &jobs);
     defer testing.allocator.free(s);
@@ -188,10 +198,11 @@ test "agent_tree: dark 主题树形字符 ├└⎿" {
     var d1 = "first".*;
     var d2 = "second".*;
     var t1 = "Read".*;
+    var in1 = "{\"file_path\":\"/x\"}".*;
     var empty = "".*;
     const jobs = [_]JobSnapshot{
-        mkSnap(&id1, .running, &d1, 1, 1, 1, &t1),
-        mkSnap(&id2, .running, &d2, 1, 2, 1, empty[0..0]),
+        mkSnap(&id1, .running, &d1, 1, 1, 1, &t1, &in1),
+        mkSnap(&id2, .running, &d2, 1, 2, 1, empty[0..0], empty[0..0]),
     };
     const s = try render(testing.allocator, theme_mod.dark, &jobs);
     defer testing.allocator.free(s);
@@ -199,4 +210,5 @@ test "agent_tree: dark 主题树形字符 ├└⎿" {
     try capture.expectContains(s, "└"); // 末枝
     try capture.expectContains(s, "⎿"); // 动作臂
     try capture.expectContains(s, "│"); // 非末枝下竖管
+    try capture.expectContains(s, "Read(/x)"); // 动作行带参数
 }

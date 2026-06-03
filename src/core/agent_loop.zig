@@ -138,16 +138,17 @@ pub const Options = struct {
     /// 会混入 \x1b[32m 等控制码。
     colorize: bool = true,
     /// 实时进度回调(后台 subagent 用):每轮开始 + 每个工具执行前调用,
-    /// 把 (turn, tool_name) 写回调用方(JobEntry)。null = 不上报(前台/headless/同步)。
-    /// state 经类型擦除传 *JobEntry,progress_fn 是其 trampoline。
+    /// 把 (turn, tool_name, tool_input) 写回调用方(JobEntry)。null = 不上报(前台/headless/同步)。
+    /// state 经类型擦除传 *JobEntry,progress_fn 是其 trampoline。tool_input 为工具原始
+    /// input JSON(供动作行渲染参数预览);仅更新轮次时传空。
     progress_state: ?*anyopaque = null,
-    progress_fn: ?*const fn (state: *anyopaque, turn: u32, tool_name: []const u8) void = null,
+    progress_fn: ?*const fn (state: *anyopaque, turn: u32, tool_name: []const u8, tool_input: []const u8) void = null,
 };
 
-/// 内部:发一次进度上报(turn 1-based;tool_name 空 = 仅更新轮次)。
-fn reportProgress(opts: Options, turn: u32, tool_name: []const u8) void {
+/// 内部:发一次进度上报(turn 1-based;tool_name/tool_input 空 = 仅更新轮次)。
+fn reportProgress(opts: Options, turn: u32, tool_name: []const u8, tool_input: []const u8) void {
     if (opts.progress_fn) |f| {
-        if (opts.progress_state) |s| f(s, turn, tool_name);
+        if (opts.progress_state) |s| f(s, turn, tool_name, tool_input);
     }
 }
 
@@ -200,8 +201,9 @@ pub fn run(
             return .{ .stop_reason = .aborted, .turns = turns, .tool_calls = total_tool_calls };
         };
 
-        // 进度上报:进入新一轮(1-based);清空工具名(等本轮工具开跑再填)。
-        reportProgress(opts, turns + 1, "");
+        // 进度上报:进入新一轮(1-based);空 tool 名 = 仅推进轮次,保留上一个工具
+        // (trampoline 据空名跳过工具更新,对齐 cc 持续显示最近动作)。
+        reportProgress(opts, turns + 1, "", "");
 
         // 自动 compact：发请求前检查 token 估算,超阈值则保留最近 N 条。
         // 阈值 null 时 = input context window * 0.8(逼近 context 上限才压缩,留出回复空间)。
@@ -529,11 +531,11 @@ pub fn run(
                 }
             }
         }
-        // 进度上报:本轮第一个 run slot 的工具名(subagent agent 树显示当前动作)。
+        // 进度上报:本轮第一个 run slot 的工具名 + 原始 input(subagent agent 树显示当前动作)。
         if (opts.progress_fn != null) {
             for (slots.items) |*s| {
                 if (s.decision == .run) {
-                    reportProgress(opts, turns + 1, s.name);
+                    reportProgress(opts, turns + 1, s.name, s.input);
                     break;
                 }
             }

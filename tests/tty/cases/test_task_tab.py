@@ -43,7 +43,7 @@ def test_T27_no_tasktab_when_no_task(bin_path):
 
 def test_T28_agent_tree_appears_above_box(bin_path):
     # /agent-test 注册假 running subagent → 输入框上方出现 agent 进度树
-    # (⏺ Running 1 subagent… + 树枝 + 当前工具 Grep),框仍钉底。
+    # (⏺ Running 1 subagent… + 树枝 + 动作行 Bash(git status)),框仍钉底。
     raw = run(bin_path, ["sleep:0.8", "type:/agent-test:inspect repo", "key:enter", "sleep:0.4"])
     a = TTYAssert(raw)
     a.assert_box_present()
@@ -53,7 +53,8 @@ def test_T28_agent_tree_appears_above_box(bin_path):
         a._fail(f"未出现 agent 进度树标题:\n{full}")
     if "inspect repo" not in full:
         a._fail("agent 树未显示 subagent desc")
-    if "Grep" not in full:
-        a._fail("agent 树未显示当前工具(current_tool)")
+    # 动作行带参数:Bash(git status)(对齐 cc `⎿ Bash(git status)`)。
+    if "Bash(git status)" not in full:
+        a._fail(f"agent 树动作行未显示工具+参数 Bash(git status):\n{full}")
     if "turn 2" not in full:
         a._fail("agent 树未显示 current_turn")

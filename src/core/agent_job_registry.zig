@@ -50,10 +50,13 @@ pub const JobEntry = struct {
     turns: u32 = 0,
     tool_calls: u32 = 0,
     /// 实时进度(subagent agent_loop 跑动时持锁更新,供 TUI agent 进度树显示)。
-    /// current_turn:当前轮(1-based);current_tool:当前/最近执行的工具名(定长拷贝)。
+    /// current_turn:当前轮(1-based);current_tool:当前/最近执行的工具名(定长拷贝);
+    /// current_tool_input:该工具的原始 input JSON 快照(定长截断,供动作行渲染参数预览)。
     current_turn: u32 = 0,
     current_tool: [32]u8 = undefined,
     current_tool_len: u8 = 0,
+    current_tool_input: [96]u8 = undefined,
+    current_tool_input_len: u8 = 0,
     err_name: ?[]const u8 = null, // @errorName 静态字符串,不 own
     thread: ?std.Thread = null,
     abort: AbortSignal = undefined,
@@ -86,16 +89,22 @@ pub const JobEntry = struct {
         self.output_buf.appendSlice(self.allocator, bytes) catch {};
     }
 
-    /// agent_loop progress 回调的 trampoline:持锁更新 current_turn/current_tool。
+    /// agent_loop progress 回调的 trampoline:持锁更新 current_turn/current_tool/input。
     /// 经 opts.progress_state(*JobEntry erased)+ progress_fn 注入,见 jobThreadMain。
-    pub fn progressTrampoline(state: *anyopaque, turn: u32, tool_name: []const u8) void {
+    pub fn progressTrampoline(state: *anyopaque, turn: u32, tool_name: []const u8, tool_input: []const u8) void {
         const self: *JobEntry = @ptrCast(@alignCast(state));
         self.lock();
         defer self.unlock();
         self.current_turn = turn;
+        // 空 tool_name = 仅推进轮次(轮开始上报),**保留**上一个工具——对齐 cc
+        // "持续显示最近动作"语义。否则工具执行窗口短于一帧时动作行几乎不可见。
+        if (tool_name.len == 0) return;
         const n = @min(tool_name.len, self.current_tool.len);
         @memcpy(self.current_tool[0..n], tool_name[0..n]);
         self.current_tool_len = @intCast(n);
+        const m = @min(tool_input.len, self.current_tool_input.len);
+        @memcpy(self.current_tool_input[0..m], tool_input[0..m]);
+        self.current_tool_input_len = @intCast(m);
     }
 };
 
@@ -379,7 +388,7 @@ pub const AgentJobRegistry = struct {
 
     /// 测试专用:注册一个**无线程**的假 running entry(供离线 TTY 验证 agent 进度树)。
     /// 不 spawn 线程、不开网络。entry 由 registry deinit 时统一释放(无 thread → join 跳过)。
-    pub fn pushTestEntry(self: *AgentJobRegistry, desc: []const u8, turn: u32, tool: []const u8) !void {
+    pub fn pushTestEntry(self: *AgentJobRegistry, desc: []const u8, turn: u32, tool: []const u8, tool_input: []const u8) !void {
         const a = self.allocator;
         const entry = try a.create(JobEntry);
         errdefer a.destroy(entry);
@@ -400,6 +409,9 @@ pub const AgentJobRegistry = struct {
         const tn = @min(tool.len, entry.current_tool.len);
         @memcpy(entry.current_tool[0..tn], tool[0..tn]);
         entry.current_tool_len = @intCast(tn);
+        const tin = @min(tool_input.len, entry.current_tool_input.len);
+        @memcpy(entry.current_tool_input[0..tin], tool_input[0..tin]);
+        entry.current_tool_input_len = @intCast(tin);
         self.listLock();
         self.entries.append(a, entry) catch |e| {
             self.listUnlock();
@@ -433,6 +445,8 @@ pub const AgentJobRegistry = struct {
         current_turn: u32,
         /// 当前/最近工具名(owned by caller allocator;空 = 无)。
         current_tool: []u8,
+        /// 该工具的原始 input JSON 快照(owned;供动作行渲染参数预览)。
+        current_tool_input: []u8,
     };
 
     pub fn snapshotJobs(self: *AgentJobRegistry, allocator: std.mem.Allocator) ![]JobSnapshot {
@@ -451,6 +465,7 @@ pub const AgentJobRegistry = struct {
                 .tool_calls = e.tool_calls,
                 .current_turn = e.current_turn,
                 .current_tool = try allocator.dupe(u8, e.current_tool[0..e.current_tool_len]),
+                .current_tool_input = try allocator.dupe(u8, e.current_tool_input[0..e.current_tool_input_len]),
             };
             i += 1;
         }
@@ -462,6 +477,7 @@ pub const AgentJobRegistry = struct {
             allocator.free(s.id);
             allocator.free(s.desc);
             allocator.free(s.current_tool);
+            allocator.free(s.current_tool_input);
         }
         allocator.free(snaps);
     }

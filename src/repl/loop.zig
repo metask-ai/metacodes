@@ -169,7 +169,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         if (std.mem.eql(u8, trimmed, "/agent-test") or std.mem.startsWith(u8, trimmed, "/agent-test:")) {
             const desc = if (trimmed.len > 12) trimmed[12..] else "inspect repo";
             if (app.agent_jobs) |*aj| {
-                aj.pushTestEntry(desc, 2, "Grep") catch {
+                aj.pushTestEntry(desc, 2, "Bash", "{\"command\":\"git status\"}") catch {
                     std.debug.print("[agent-test] push failed\n", .{});
                 };
             }

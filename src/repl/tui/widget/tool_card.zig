@@ -714,6 +714,31 @@ fn toolPreview(alloc: std.mem.Allocator, tool_name: []const u8, args: []const u8
     return try alloc.dupe(u8, "");
 }
 
+/// agent 进度树动作行标签:`Tool(arg)` 一行式(对齐 cc `⎿ Bash(git status)`)。
+/// input 为工具原始 JSON(可能被上游截断)。识别不出关键参数 → 退回纯工具名。
+/// caller free。复用 extractField/jsonUnescape/firstLine。
+pub fn actionLabel(alloc: std.mem.Allocator, tool_name: []const u8, input: []const u8) ![]u8 {
+    const arg: ?[]const u8 = blk: {
+        if (std.mem.eql(u8, tool_name, "Bash")) break :blk extractField(input, "command");
+        if (std.mem.eql(u8, tool_name, "Read") or std.mem.eql(u8, tool_name, "Edit") or
+            std.mem.eql(u8, tool_name, "Write") or std.mem.eql(u8, tool_name, "NotebookEdit"))
+            break :blk (extractField(input, "file_path") orelse extractField(input, "path"));
+        if (std.mem.eql(u8, tool_name, "Grep") or std.mem.eql(u8, tool_name, "Glob"))
+            break :blk extractField(input, "pattern");
+        if (std.mem.eql(u8, tool_name, "WebFetch")) break :blk extractField(input, "url");
+        break :blk null;
+    };
+    if (arg) |a| {
+        // command 可能含转义(&&、换行);unescape + 只取首行,再截断到 ~48 列。
+        const dec = try jsonUnescape(alloc, a);
+        defer alloc.free(dec);
+        const one = firstLine(dec);
+        const end = @min(one.len, 48);
+        return try std.fmt.allocPrint(alloc, "{s}({s}{s})", .{ tool_name, one[0..end], if (end < one.len) "…" else "" });
+    }
+    return try alloc.dupe(u8, tool_name);
+}
+
 /// 极简 JSON 顶层 string 字段提取(unescape 不做,只为预览)。
 fn extractField(args: []const u8, key: []const u8) ?[]const u8 {
     var pat_buf: [64]u8 = undefined;

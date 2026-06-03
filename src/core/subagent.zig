@@ -59,7 +59,7 @@ pub const SpawnOptions = struct {
     agent_jobs: ?*@import("agent_job_registry.zig").AgentJobRegistry = null,
     /// 实时进度回调(后台 job 传自己的 JobEntry trampoline;同步路径 null)。
     progress_state: ?*anyopaque = null,
-    progress_fn: ?*const fn (state: *anyopaque, turn: u32, tool_name: []const u8) void = null,
+    progress_fn: ?*const fn (state: *anyopaque, turn: u32, tool_name: []const u8, tool_input: []const u8) void = null,
 };
 
 pub fn spawnAgent(
