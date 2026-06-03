@@ -368,6 +368,10 @@ pub fn run(
                     allocator.free(w.ui_text);
                     allocator.free(w.content_json);
                 },
+                .web_search_query => |q| {
+                    // 主对话不消费 query_update 进度(仅 web_search.zig 子请求驱动 TUI);释放。
+                    allocator.free(q);
+                },
                 .usage => |u| {
                     if (opts.usage_sink) |sink| sink.add(u);
                     if (cache_detector.checkResponse(u.cache_read_input_tokens, u.cache_creation_input_tokens)) |reason| {
@@ -518,7 +522,7 @@ pub fn run(
         }
 
         // 6b. 构造一次 ToolContext(所有 tool 共用;并发 job 各自换独立 arena allocator)。
-        const base_ctx = tools_mod.ToolContext{
+        var base_ctx = tools_mod.ToolContext{
             .allocator = allocator,
             .abort = opts.abort,
             .read_state = opts.read_state,
@@ -551,6 +555,28 @@ pub fn run(
             .mcp_sessions = opts.mcp_sessions,
             .cron_registry = opts.cron_registry,
         };
+
+        // 工具执行期 progress 通路(对齐 cc onProgress):若 stdout_writer 是支持
+        // setToolProgress 的 RenderRegion(顶层 TTY)→ 接 progress_fn 把 WebSearch 子请求的
+        // query_update/results_received 格式化成第二行文本喂 TUI。comptime 探测:headless/
+        // 普通 writer 无此方法 → 编译期消失,progress_fn 保持 null。
+        if (opts.agent_depth == 0 and comptime @hasDecl(@TypeOf(stdout_writer.*), "setToolProgress")) {
+            const Writer = @TypeOf(stdout_writer.*);
+            const Tramp = struct {
+                fn cb(state: *anyopaque, phase: tools_mod.ToolContext.ProgressPhase, text: []const u8, count: u32) void {
+                    const wr: *Writer = @ptrCast(@alignCast(state));
+                    var buf: [192]u8 = undefined;
+                    const line: []const u8 = switch (phase) {
+                        // 对齐 cc UI.tsx:query_update→"Searching: q";results_received→"Found N results for "q"".
+                        .query_update => std.fmt.bufPrint(&buf, "Searching: {s}", .{text}) catch text,
+                        .results_received => std.fmt.bufPrint(&buf, "Found {d} results for \"{s}\"", .{ count, text }) catch text,
+                    };
+                    wr.setToolProgress(line);
+                }
+            };
+            base_ctx.progress_state = @ptrCast(stdout_writer);
+            base_ctx.progress_fn = &Tramp.cb;
+        }
 
         // 6c. 分批并发执行(denied 的不动,run 的填 content)。
         // 过程态(TTY 顶层):执行前打起始卡 + 把"当前工具"喂进底部 spinner(由现有

@@ -74,18 +74,25 @@ pub fn resultRenderMode(tool_name: []const u8) ResultRenderMode {
     return .hidden;
 }
 
+/// 用户可见名(对齐 cc userFacingName):TUI 工具卡标题用。UI 表现层映射,
+/// 不耦合 registry。当前仅 WebSearch → "Web Search"(带空格)。其余用原名。
+pub fn displayName(tool_name: []const u8) []const u8 {
+    if (std.mem.eql(u8, tool_name, "WebSearch")) return "Web Search";
+    return tool_name;
+}
+
 /// 工具开始(无状态符,只有 ⏺ tool_name + 命令预览)。对齐 cc BLACK_CIRCLE bullet。
 /// caller free。
 pub fn renderStart(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, preview_args: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
 
-    // 第 1 行:⏺ tool_name(bullet 用 accent 色)
+    // 第 1 行:⏺ <display name>(bullet 用 accent 色;WebSearch→"Web Search")
     try out.appendSlice(alloc, th.accent);
     try out.appendSlice(alloc, th.icon_act);
     try out.appendSlice(alloc, th.reset);
     try out.append(alloc, ' ');
-    try out.appendSlice(alloc, tool_name);
+    try out.appendSlice(alloc, displayName(tool_name));
     try out.append(alloc, '\n');
 
     // 第 2 行:命令预览(缩进 2 空格 + dim)
@@ -107,18 +114,18 @@ pub fn renderProgress(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
 
-    // 第 1 行:⏺ tool_name + (耗时 spinner)
+    // 第 1 行:⏺ <display name> + (耗时 spinner)
     try out.appendSlice(alloc, th.accent);
     try out.appendSlice(alloc, th.icon_act);
     try out.appendSlice(alloc, th.reset);
     try out.append(alloc, ' ');
-    try out.appendSlice(alloc, tool_name);
+    try out.appendSlice(alloc, displayName(tool_name));
 
     // 右上角:spinner + 耗时
     var stat_buf: [64]u8 = undefined;
     const stat = try std.fmt.bufPrint(&stat_buf, "{s}… {d:.1}s{s}", .{ th.warn, @as(f64, @floatFromInt(elapsed_ms)) / 1000.0, th.reset });
     if (opts.cols > 0) {
-        const left_w = term.displayWidth(th.icon_act) + 1 + term.displayWidth(tool_name);
+        const left_w = term.displayWidth(th.icon_act) + 1 + term.displayWidth(displayName(tool_name));
         // 状态文本的可视宽度:"… X.Ys"
         var vw: [32]u8 = undefined;
         const stat_vis = std.fmt.bufPrint(&vw, "… {d:.1}s", .{@as(f64, @floatFromInt(elapsed_ms)) / 1000.0}) catch "";
@@ -170,12 +177,12 @@ pub fn renderResult(
         return try out.toOwnedSlice(alloc); // 空串
     }
 
-    // 第 1 行:⏺ tool_name + ✓/✗ X.Ys
+    // 第 1 行:⏺ <display name> + ✓/✗ X.Ys
     try out.appendSlice(alloc, th.accent);
     try out.appendSlice(alloc, th.icon_act);
     try out.appendSlice(alloc, th.reset);
     try out.append(alloc, ' ');
-    try out.appendSlice(alloc, tool_name);
+    try out.appendSlice(alloc, displayName(tool_name));
 
     // 右上角:状态符 + 耗时
     const status_color = if (kind == .ok) th.success else th.danger;
@@ -183,7 +190,7 @@ pub fn renderResult(
     var stat_buf: [64]u8 = undefined;
     const stat_inner = try std.fmt.bufPrint(&stat_buf, "{s} {d:.1}s", .{ status_icon, @as(f64, @floatFromInt(elapsed_ms)) / 1000.0 });
     if (opts.cols > 0) {
-        const left_w = term.displayWidth(th.icon_act) + 1 + term.displayWidth(tool_name);
+        const left_w = term.displayWidth(th.icon_act) + 1 + term.displayWidth(displayName(tool_name));
         const stat_w = term.displayWidth(stat_inner);
         if (opts.cols > left_w + stat_w + 1) {
             const pad = opts.cols - left_w - stat_w;
@@ -275,9 +282,13 @@ fn renderResultBody(
     if (std.mem.eql(u8, tool_name, "Read")) {
         return renderReadSummary(alloc, th, output_text, out, opts);
     }
-    if (std.mem.eql(u8, tool_name, "WebFetch") or std.mem.eql(u8, tool_name, "WebSearch")) {
-        // 两者结果首行均为人类可读摘要(WebSearch: `Web search results for query: "..."`);
-        // 非 verbose 只显首行,verbose/transcript 展开。
+    if (std.mem.eql(u8, tool_name, "WebSearch")) {
+        // 完成态(对齐 cc renderToolResultMessage):`Did N searches`(N = 结果块数)。
+        // 详细结果(链接/摘要)verbose/transcript 才展开。
+        return renderWebSearchSummary(alloc, th, output_text, out, opts);
+    }
+    if (std.mem.eql(u8, tool_name, "WebFetch")) {
+        // 结果首行人类可读摘要;非 verbose 只显首行,verbose/transcript 展开。
         return renderWebFetchSummary(alloc, th, output_text, out, opts);
     }
     // 有副作用但返回 JSON 的工具:提关键字段拼一行人话(绝不裸吐 JSON)。
@@ -298,6 +309,14 @@ fn renderResultBody(
 /// 提不到但内容是 JSON(`{`/`[` 开头)→ 显示一行通用错误标记,**绝不裸吐 error JSON**;
 /// 内容是纯文本 → unescape 后折叠。对齐 cc FallbackToolUseErrorMessage。
 fn renderErrorBody(alloc: std.mem.Allocator, th: Theme, output_text: []const u8, out: *std.ArrayList(u8), opts: RenderOpts) !void {
+    // 0) 中断(用户 esc / abort):对齐 cc InterruptedByUser 通用机制 —— 所有工具中断
+    //    都显示 `Interrupted · What should Claude do instead?`,而非裸错误。
+    if (extractField(output_text, "code")) |code| {
+        if (std.mem.eql(u8, code, "Aborted")) {
+            try appendLine(alloc, out, th.dim, "Interrupted · What should Claude do instead?", th.reset);
+            return;
+        }
+    }
     // 1) 结构化错误:优先 detail,退而求其次 message。空串视为提不到。
     const human: ?[]const u8 = blk: {
         if (extractField(output_text, "detail")) |d| {
@@ -719,6 +738,26 @@ fn renderWebFetchSummary(alloc: std.mem.Allocator, th: Theme, output_text: []con
     }
 }
 
+/// WebSearch 完成态(对齐 cc renderToolResultMessage):`Did N searches`。
+/// N = output_text 里 `Web search results for query` 段数(每次搜索一段;子请求通常 1)。
+/// verbose/transcript 才展开完整结果(链接 + 摘要)。
+fn renderWebSearchSummary(alloc: std.mem.Allocator, th: Theme, output_text: []const u8, out: *std.ArrayList(u8), opts: RenderOpts) !void {
+    var n: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, output_text, pos, "Web search results for query")) |i| : (pos = i + 1) n += 1;
+    if (n == 0) n = 1; // 至少做了一次搜索
+    var buf: [48]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "Did {d} search{s}", .{ n, if (n == 1) @as([]const u8, "") else "es" }) catch "Did 1 search";
+    try out.appendSlice(alloc, "  ");
+    try out.appendSlice(alloc, th.success);
+    try out.appendSlice(alloc, line);
+    try out.appendSlice(alloc, th.reset);
+    try out.append(alloc, '\n');
+    if (opts.verbose or opts.transcript) {
+        try renderGenericFold(alloc, th, output_text, out, opts);
+    }
+}
+
 /// 提取 JSON 顶层 string 字段的**原始(仍转义)**值切片(供 unescape)。
 fn extractJsonStringField(args: []const u8, key: []const u8) ?[]const u8 {
     var pat_buf: [64]u8 = undefined;
@@ -816,6 +855,11 @@ fn toolPreview(alloc: std.mem.Allocator, tool_name: []const u8, args: []const u8
     } else if (std.mem.eql(u8, tool_name, "WebFetch")) {
         if (extractField(args, "url")) |u| {
             return try std.fmt.allocPrint(alloc, "↗ {s}", .{u});
+        }
+    } else if (std.mem.eql(u8, tool_name, "WebSearch")) {
+        // 对齐 cc 标题参数:⏺ Web Search("query")。
+        if (extractField(args, "query")) |q| {
+            return try std.fmt.allocPrint(alloc, "\"{s}\"", .{q});
         }
     } else if (std.mem.eql(u8, tool_name, "Agent") or std.mem.eql(u8, tool_name, "Task")) {
         // 让用户认出"这是哪种 subagent"(用户曾困惑"要 subagent 却显示 Task")。
@@ -1267,6 +1311,33 @@ test "renderJsonToolSummary: 提人话不裸吐 JSON" {
         try testing.expect(std.mem.indexOf(u8, out.items, "\"success\"") == null);
         try testing.expect(std.mem.indexOf(u8, out.items, "\"job_id\"") == null);
     }
+}
+
+test "WebSearch 卡片:display name 标题 + Did N searches 完成 + 中断行" {
+    const a = testing.allocator;
+    const th = theme_mod.monochrome;
+    // displayName 映射。
+    try testing.expectEqualStrings("Web Search", displayName("WebSearch"));
+    try testing.expectEqualStrings("Bash", displayName("Bash"));
+
+    // 起始卡:标题用 "Web Search"(带空格)+ 预览 "query"。
+    const start = try renderStart(a, th, "WebSearch", "{\"query\":\"zig news\"}");
+    defer a.free(start);
+    try testing.expect(std.mem.indexOf(u8, start, "Web Search") != null);
+    try testing.expect(std.mem.indexOf(u8, start, "\"zig news\"") != null);
+
+    // 完成卡:Did N searches(N = "Web search results for query" 段数)。
+    const result_text = "Web search results for query: \"zig news\"\n\nsome summary\n\nREMINDER: ...";
+    const res = try renderResult(a, th, "WebSearch", "{\"query\":\"zig news\"}", result_text, .ok, 6600, .{});
+    defer a.free(res);
+    try testing.expect(std.mem.indexOf(u8, res, "Web Search") != null);
+    try testing.expect(std.mem.indexOf(u8, res, "Did 1 search") != null);
+
+    // 中断卡:任意工具 Aborted → cc 通用中断行。
+    const abort_json = "{\"error\":{\"code\":\"Aborted\",\"detail\":\"user interrupted\"}}";
+    const ab = try renderResult(a, th, "WebSearch", "{\"query\":\"q\"}", abort_json, .err, 1000, .{});
+    defer a.free(ab);
+    try testing.expect(std.mem.indexOf(u8, ab, "Interrupted · What should Claude do instead?") != null);
 }
 
 test "renderResult: Task 成功结果不进消息流(空串)" {

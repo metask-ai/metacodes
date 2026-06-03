@@ -70,6 +70,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
                 defer allocator.free(t);
                 try model_text.appendSlice(allocator, t);
             },
+            .web_search_query => |q| {
+                defer allocator.free(q);
+                // 对齐 cc query_update:刷新 TUI 第二行 `Searching: <query>`。
+                ctx.reportProgress(.query_update, q, 0);
+            },
             .web_search_result => |w| {
                 defer allocator.free(w.ui_text); // 子请求不显示 UI 装饰
                 defer allocator.free(w.content_json);
@@ -77,6 +82,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
                 const rendered = try api_stream.renderWebSearchResults(allocator, w.content_json);
                 defer allocator.free(rendered);
                 try links.appendSlice(allocator, rendered);
+                // 对齐 cc search_results_received:刷新第二行 `Found N results`。
+                // count = content_json 里 "url" 字段数(metask content:[] → 0)。
+                const count = countOccurrences(w.content_json, "\"url\"");
+                ctx.reportProgress(.results_received, query, @intCast(count));
             },
             // 子请求只带 server tool,不会有 client tool_use;usage/done 无需处理。
             else => {},
@@ -107,4 +116,13 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 fn setDetail(ctx: *const ToolContext, allocator: std.mem.Allocator, comptime fmt: []const u8, a: anytype) void {
     const slot = ctx.error_detail orelse return;
     slot.* = std.fmt.allocPrint(allocator, fmt, a) catch null;
+}
+
+/// 数 needle 在 haystack 中出现次数(用于从 content 数组数结果条数)。
+fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+    if (needle.len == 0) return 0;
+    var n: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, pos, needle)) |i| : (pos = i + needle.len) n += 1;
+    return n;
 }

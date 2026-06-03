@@ -103,6 +103,21 @@ pub const ToolContext = struct {
     mcp_sessions: ?*const []@import("../app.zig").McpSessionEntry = null,
     /// Cron registry(CronCreate/Delete/List 用)。
     cron_registry: ?*@import("../core/cron_registry.zig").CronRegistry = null,
+    /// 工具执行期进度回调(对齐 cc onProgress):工具(如 WebSearch 子请求)在执行**中**
+    /// 实时上报进度,驱动 TUI 刷新工具卡第二行(Searching: q / Found N results)。
+    /// state 指向 *RenderRegion(经 trampoline),tool_exec 注入。null = 无 TUI(headless/单测)。
+    progress_state: ?*anyopaque = null,
+    progress_fn: ?*const fn (state: *anyopaque, phase: ProgressPhase, text: []const u8, count: u32) void = null,
+
+    /// 工具进度阶段(对齐 cc WebSearchProgress 两态)。
+    pub const ProgressPhase = enum { query_update, results_received };
+
+    /// 上报进度(null 安全)。text 借用,回调内须立即拷贝(不跨调用持有)。
+    pub fn reportProgress(self: *const ToolContext, phase: ProgressPhase, text: []const u8, count: u32) void {
+        if (self.progress_fn) |f| {
+            if (self.progress_state) |st| f(st, phase, text, count);
+        }
+    }
 
     /// 便利构造：只需 allocator 的场景（大多数单元测试）。
     pub fn simple(allocator: std.mem.Allocator) ToolContext {

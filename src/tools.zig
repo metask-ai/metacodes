@@ -51,6 +51,9 @@ pub const ToolEntry = struct {
     /// deferred(对齐 cc ToolSearch):true = 不进默认 tools 数组,只在 prompt 列名;
     /// 模型须先调 ToolSearch 激活才可调。降低工具菜单稀释(弱后端会乱抓 Bash 的根因)。
     deferred: bool = false,
+    /// 用户可见名(对齐 cc userFacingName):TUI 工具卡标题用它而非 registry 名。
+    /// null = 用 name。如 WebSearch → "Web Search"(带空格)。
+    display_name: ?[]const u8 = null,
 };
 
 pub const registry: []const ToolEntry = &.{
@@ -374,8 +377,18 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "blocked_domains", .type = "array", .description = "Exclude these domains from final returned results." },
         }, .required = &.{"query"} },
         .execute = web_search_tool.execute,
+        .display_name = "Web Search",
     },
 };
+
+/// 用户可见名(对齐 cc userFacingName):TUI 工具卡标题用。查 registry display_name,
+/// 无则回退原名。tool_card / 底部 spinner 用它显示 `⏺ Web Search` 而非 `WebSearch`。
+pub fn displayName(name: []const u8) []const u8 {
+    if (getTool(name)) |t| {
+        if (t.display_name) |d| return d;
+    }
+    return name;
+}
 
 pub fn getTool(name: []const u8) ?*const ToolEntry {
     for (registry) |*tool| {

@@ -495,6 +495,7 @@ pub const StreamResponse = struct {
             .text_delta => |t| StreamEvent{ .text = t },
             .tool_use_start => |tu| StreamEvent{ .tool_use_start = tu },
             .web_search_result => |w| StreamEvent{ .web_search_result = w },
+            .web_search_query => |q| StreamEvent{ .web_search_query = q },
             .usage => |u| StreamEvent{ .usage = u },
             .done => blk: {
                 self.done = true;
@@ -508,6 +509,7 @@ pub const StreamEvent = union(enum) {
     text: []u8,
     tool_use_start: json_mod.ToolUseResult,
     web_search_result: api_stream.WebSearchResultEvent,
+    web_search_query: []u8,
     usage: api_stream.UsageDelta,
     done: void,
 };

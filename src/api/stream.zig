@@ -597,6 +597,10 @@ pub const Event = union(enum) {
     ///   子请求(web_search.zig)据此做结构化解析。注:metask 后端常 `[]`(不透传)。
     /// 两字段都 owned，caller free。
     web_search_result: WebSearchResultEvent,
+    /// web_search 的 server_tool_use 阶段:query 解析完成(对齐 cc query_update)。
+    /// 子请求(web_search.zig)据此 reportProgress(.query_update) 刷新 TUI 第二行
+    /// `Searching: <query>`。owned,caller free。
+    web_search_query: []u8,
     /// 用量统计（来自 message_start 或 message_delta 的 usage 字段）；数值不拥有资源
     usage: UsageDelta,
     /// 结束信号
@@ -614,6 +618,7 @@ pub const Event = union(enum) {
                 allocator.free(w.ui_text);
                 allocator.free(w.content_json);
             },
+            .web_search_query => |q| allocator.free(q),
             .usage, .done => {},
         }
     }
@@ -929,6 +934,18 @@ pub const EventIterator = struct {
                             .name = name,
                             .input_json = full_input,
                         } };
+                    }
+                    // server_tool_use(web_search)块结束:query 已累积齐 → emit web_search_query
+                    // (对齐 cc query_update)。优先用户原始 query(ws_user_query)——provider 的
+                    // query 常是占位符("web search"/"searching the web",见 webSearchGroup 同款逻辑);
+                    // 无用户 query 才回退 provider 累积值。
+                    if (self.ws_in_server_tool) {
+                        const provider_q = util_json.extractStringField(self.ws_query.items, "query") orelse "";
+                        const q: []const u8 = if (self.ws_user_query.len > 0) self.ws_user_query else provider_q;
+                        if (q.len > 0) {
+                            const owned = try allocator.dupe(u8, q);
+                            return Event{ .web_search_query = owned };
+                        }
                     }
                     continue;
                 },

@@ -61,6 +61,11 @@ pub const RenderRegion = struct {
     current_tool: [48]u8 = undefined,
     current_tool_len: u8 = 0,
     tool_start_ms: i64 = 0,
+    // 当前工具的进度第二行文本(对齐 cc renderToolUseProgressMessage)。WebSearch 子请求
+    // 经 progress 回调写入(Searching: q / Found N results)。定长 + 持锁,同 current_tool。
+    // _len=0 表示无进度行(普通工具不画第二行)。
+    current_tool_progress: [192]u8 = undefined,
+    current_tool_progress_len: u8 = 0,
     text_pending_newline: bool = false,
     pending_col: u16 = 0, // 半行 chunk 累计显示列(消息穿过续接用)
     region_drawn: bool = false, // 生成期固定区当前是否画在屏上(true ⟹ 光标钉区顶行首)
@@ -104,6 +109,18 @@ pub const RenderRegion = struct {
         self.lock();
         defer self.unlock();
         self.current_tool_len = 0;
+        self.current_tool_progress_len = 0;
+    }
+
+    /// 设置当前工具的进度第二行文本(对齐 cc onProgress→renderToolUseProgressMessage)。
+    /// 工具执行线程(tool_exec 并发批)经 progress 回调调用 → 下次 tickSpinner 重画第二行。
+    /// 持锁:与 spinner 线程读互斥。text 立即拷进定长数组(不持有借用)。
+    pub fn setToolProgress(self: *RenderRegion, text: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        const n = @min(text.len, self.current_tool_progress.len);
+        @memcpy(self.current_tool_progress[0..n], text[0..n]);
+        self.current_tool_progress_len = @intCast(n);
     }
 
     pub fn init(allocator: std.mem.Allocator, fd: std.c.fd_t, theme: Theme, cap: ColorCapability) RenderRegion {
@@ -767,6 +784,13 @@ pub const RenderRegion = struct {
         R += 1;
         w.writeAll("\r\n") catch {};
 
+        // -- 执行中工具卡(对齐 cc:有 progress 第二行的工具,如 WebSearch,在动态区
+        //    渲染可刷新双段卡 ⏺ <Tool> / ⎿ <progress>;随 tick 重画)。普通工具无 progress
+        //    → 不画(仍只走上方 spinner 段)。--
+        if (self.current_tool_len > 0 and self.current_tool_progress_len > 0) {
+            R += self.drawToolProgressCard(w, cur_tool);
+        }
+
         // -- 待发送队列预览(每条 dim 灰,最多 3 条 + "+N more")--
         R += self.drawQueuePreview(w);
 
@@ -843,6 +867,29 @@ pub const RenderRegion = struct {
 
     /// 画待发送队列预览(spinner 与上边框之间,每条 dim 灰 ` ⏳ <msg 首行,截断>`)。返回行数。
     /// 最多 MAX 条,超出补一行 ` +N more`。
+    /// 执行中工具卡(动态区,可刷新):⏺ <Tool> / ⎿ <progress>。对齐 cc 双段卡。
+    /// 仅在工具有 progress 第二行(WebSearch)时调用;随每次 tickSpinner 重画。
+    fn drawToolProgressCard(self: *RenderRegion, w: *std.Io.Writer, tool_name: []const u8) u16 {
+        const th = self.theme;
+        const tool_card = @import("widget/tool_card.zig");
+        const inner_w: usize = if (self.cols > 8) self.cols - 8 else 30;
+        var rows: u16 = 0;
+        // 第 1 行:⏺ <display name>(WebSearch→"Web Search")。
+        w.writeAll(ansi.clear.line) catch {};
+        w.print("{s}{s}{s} {s}", .{ th.accent, th.icon_act, th.reset, tool_card.displayName(tool_name) }) catch {};
+        rows += 1;
+        w.writeAll("\r\n") catch {};
+        // 第 2 行:  ⎿ <progress>(Searching: q / Found N results;随 tick 刷新)。
+        w.writeAll(ansi.clear.line) catch {};
+        const prog = self.current_tool_progress[0..self.current_tool_progress_len];
+        w.print("  {s}{s}{s} ", .{ th.dim, th.gutter, th.reset }) catch {};
+        writeTruncatedWidth(w, prog, inner_w);
+        w.writeAll(th.reset) catch {};
+        rows += 1;
+        w.writeAll("\r\n") catch {};
+        return rows;
+    }
+
     fn drawQueuePreview(self: *RenderRegion, w: *std.Io.Writer) u16 {
         const q = self.gen_queue orelse return 0;
         const MAX = 3;
@@ -921,6 +968,10 @@ pub const RegionWriter = struct {
     }
     pub fn clearCurrentTool(self: *RegionWriter) void {
         self.region.clearCurrentTool();
+    }
+    /// agent_loop 经 comptime 探测调用:把工具进度第二行喂给底部可刷新卡(WebSearch)。
+    pub fn setToolProgress(self: *RegionWriter, text: []const u8) void {
+        self.region.setToolProgress(text);
     }
 };
 

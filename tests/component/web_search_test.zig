@@ -98,3 +98,58 @@ test "L2: WebSearch content:[] 时靠模型摘要作答(非 no-results)" {
     try std.testing.expect(std.mem.indexOf(u8, out, "No search results found") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "REMINDER") != null);
 }
+
+// progress 捕获:验证 web_search.zig 在两阶段 SSE 下驱动 reportProgress
+// (query_update + results_received),对齐 cc onProgress。
+const ProgressCapture = struct {
+    var phases: std.ArrayList(cc.tools.ToolContext.ProgressPhase) = .empty;
+    var last_count: u32 = 0;
+    var last_text_buf: [128]u8 = undefined;
+    var last_text_len: usize = 0;
+    fn cb(_: *anyopaque, phase: cc.tools.ToolContext.ProgressPhase, text: []const u8, count: u32) void {
+        phases.append(std.testing.allocator, phase) catch {};
+        last_count = count;
+        const n = @min(text.len, last_text_buf.len);
+        @memcpy(last_text_buf[0..n], text[0..n]);
+        last_text_len = n;
+    }
+};
+
+test "L2: WebSearch 两阶段驱动 progress 回调(query_update + results_received)" {
+    const a = std.testing.allocator;
+    ProgressCapture.phases = .empty;
+    defer ProgressCapture.phases.deinit(a);
+    ProgressCapture.last_count = 0;
+
+    var srv = try harness.MockServer.start(WEB_SEARCH_SSE, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = makeClient(a, io_runtime.io(), url);
+    defer client.deinit();
+
+    var dummy: u8 = 0;
+    var ctx = cc.tools.ToolContext{
+        .allocator = a,
+        .api_client = &client,
+        .progress_state = @ptrCast(&dummy),
+        .progress_fn = &ProgressCapture.cb,
+    };
+    const out = cc.tools.dispatch(&ctx, "WebSearch", "{\"query\":\"zig language\"}") catch return error.SkipZigTest;
+    defer a.free(out);
+
+    // 应至少有 query_update + results_received 两个 phase。
+    var saw_query = false;
+    var saw_results = false;
+    for (ProgressCapture.phases.items) |p| {
+        if (p == .query_update) saw_query = true;
+        if (p == .results_received) saw_results = true;
+    }
+    try std.testing.expect(saw_query);
+    try std.testing.expect(saw_results);
+    // results_received 的 count:SSE 里 1 个 url → count==1。
+    try std.testing.expectEqual(@as(u32, 1), ProgressCapture.last_count);
+}
