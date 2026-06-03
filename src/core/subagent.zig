@@ -57,6 +57,9 @@ pub const SpawnOptions = struct {
     /// 后台 subagent registry(允许嵌套后台:子 agent 也能 Task(run_in_background)注册进同一 root)。
     /// null = 子 agent 不能再开后台(同步路径恒 null)。
     agent_jobs: ?*@import("agent_job_registry.zig").AgentJobRegistry = null,
+    /// 实时进度回调(后台 job 传自己的 JobEntry trampoline;同步路径 null)。
+    progress_state: ?*anyopaque = null,
+    progress_fn: ?*const fn (state: *anyopaque, turn: u32, tool_name: []const u8) void = null,
 };
 
 pub fn spawnAgent(
@@ -128,6 +131,8 @@ pub fn spawnAgentSink(
             // 后台 subagent 不应往父 stdout 喷 ANSI 着色(final_text/output 会混入 \x1b[32m)。
             // sink 是 NullWriter(同步)或 SinkWriter(后台)时都非交互终端 → 关着色。
             .colorize = false,
+            .progress_state = opts.progress_state,
+            .progress_fn = opts.progress_fn,
         },
         sink,
         allocator,

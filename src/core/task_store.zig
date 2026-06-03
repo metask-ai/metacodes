@@ -11,6 +11,7 @@
 //! - blocks/blockedBy：task ID 列表，模型自行维护依赖图。
 
 const std = @import("std");
+const util_time = @import("../util/time.zig");
 
 pub const TaskStatus = enum {
     pending,
@@ -43,6 +44,9 @@ pub const Task = struct {
     active_form: ?[]const u8 = null, // owned?
     owner: ?[]const u8 = null, // owned?
     status: TaskStatus = .pending,
+    /// 转为 completed 的时戳(ms);供 TUI 清单 TTL(完成 ~30s 后从清单淡出)。
+    /// 0 = 未完成或未记录。
+    completed_ms: i64 = 0,
     blocks: std.ArrayList([]const u8) = .empty, // elements owned
     blocked_by: std.ArrayList([]const u8) = .empty, // elements owned
 
@@ -124,6 +128,12 @@ pub const TaskStore = struct {
                 return;
             }
             t.status = status;
+            // 记/清完成时戳(供 TUI 清单 TTL)。
+            if (status == .completed) {
+                if (t.completed_ms == 0) t.completed_ms = util_time.nowMs();
+            } else {
+                t.completed_ms = 0;
+            }
             return;
         }
         return error.TaskNotFound;
@@ -282,4 +292,18 @@ test "TaskStatus fromString/toString roundtrip" {
     try testing.expect(TaskStatus.fromString("deleted").? == .deleted);
     try testing.expect(TaskStatus.fromString("nope") == null);
     try testing.expectEqualStrings("in_progress", TaskStatus.in_progress.toString());
+}
+
+test "TaskStore: completed 记 completed_ms,转出 completed 清零" {
+    var store = TaskStore.init(testing.allocator);
+    defer store.deinit();
+    const t = try store.create("S", "D", null);
+    try testing.expectEqual(@as(i64, 0), t.completed_ms); // 初始未完成
+
+    try store.updateStatus(t.id, .completed);
+    try testing.expect(t.completed_ms != 0); // 完成记时戳
+
+    // 转回 in_progress(返工)→ 时戳清零,TTL 重置。
+    try store.updateStatus(t.id, .in_progress);
+    try testing.expectEqual(@as(i64, 0), t.completed_ms);
 }

@@ -1,7 +1,7 @@
-"""T25-T27:TaskTab —— 输入框上方显示当前 in_progress 任务(本次新功能)。
+"""T25-T27:Task 清单 —— 输入框上方显示任务(B3 多行面板:◼/◻/● + TTL)。
 
 离线驱动:用测试专用本地命令 /task-test[:label] 造一个 in_progress 任务
-(loop.zig),无需打模型即可让 TaskTab 渲染。验证 ◐ <label> 行出现在输入框上方,
+(loop.zig),无需打模型即可让清单渲染。验证 ◼ <label> 行出现在输入框上方,
 框仍钉底、布局不乱。
 """
 from tty_driver import run
@@ -9,21 +9,21 @@ from asserts import TTYAssert
 
 
 def test_T25_tasktab_appears_above_box(bin_path):
-    # 造任务 → 输入框上方应出现 `◐ building widget` 行。
+    # 造任务 → 输入框上方应出现 `◼ building widget` 行(in_progress 图标,对齐 cc TaskListV2)。
     raw = run(bin_path, ["sleep:0.8", "type:/task-test:building widget", "key:enter", "sleep:0.4"])
     a = TTYAssert(raw)
     a.assert_box_present()
     top = a.box_top_row()
     if top is None or top == 0:
-        a._fail(f"box_top_row 异常(top={top}),无法验证上方 TaskTab")
-    # TaskTab 在上边框正上方一行。
+        a._fail(f"box_top_row 异常(top={top}),无法验证上方任务清单")
+    # 清单在上边框正上方一行。
     tab_line = a.final.line_text(top - 1)
-    if "◐" not in tab_line and "building widget" not in tab_line:
-        a._fail(f"TaskTab 行(row {top-1})未含 ◐/label:'{tab_line}'")
+    if "◼" not in tab_line or "building widget" not in tab_line:
+        a._fail(f"任务清单行(row {top-1})未含 ◼ + label:'{tab_line}'")
 
 
 def test_T26_tasktab_keeps_box_at_bottom(bin_path):
-    # 有 TaskTab 时框仍钉底(下边框紧邻 footer,新增的上方行不破坏底部锚定)。
+    # 有清单时框仍钉底(下边框紧邻 footer,新增的上方行不破坏底部锚定)。
     raw = run(bin_path, ["sleep:0.8", "type:/task-test:x", "key:enter", "sleep:0.4"])
     a = TTYAssert(raw)
     a.assert_box_present()
@@ -31,10 +31,29 @@ def test_T26_tasktab_keeps_box_at_bottom(bin_path):
 
 
 def test_T27_no_tasktab_when_no_task(bin_path):
-    # 无 in_progress 任务时不画 TaskTab(区不含 ◐),回归确认默认行为不变。
+    # 无任务时不画清单(区不含 ◼/◻/●),回归确认默认行为不变。
     raw = run(bin_path, ["sleep:0.8"])
     a = TTYAssert(raw)
     a.assert_box_present()
     full = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
-    if "◐" in full:
-        a._fail("无任务时不应出现 TaskTab(◐)")
+    for icon in ("◼", "◻", "●"):
+        if icon in full:
+            a._fail(f"无任务时不应出现任务清单图标 {icon}")
+
+
+def test_T28_agent_tree_appears_above_box(bin_path):
+    # /agent-test 注册假 running subagent → 输入框上方出现 agent 进度树
+    # (⏺ Running 1 subagent… + 树枝 + 当前工具 Grep),框仍钉底。
+    raw = run(bin_path, ["sleep:0.8", "type:/agent-test:inspect repo", "key:enter", "sleep:0.4"])
+    a = TTYAssert(raw)
+    a.assert_box_present()
+    a.assert_box_at_bottom()
+    full = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
+    if "Running 1 subagent" not in full:
+        a._fail(f"未出现 agent 进度树标题:\n{full}")
+    if "inspect repo" not in full:
+        a._fail("agent 树未显示 subagent desc")
+    if "Grep" not in full:
+        a._fail("agent 树未显示当前工具(current_tool)")
+    if "turn 2" not in full:
+        a._fail("agent 树未显示 current_turn")

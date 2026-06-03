@@ -22,7 +22,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tty_driver import run
 from asserts import TTYAssert
 
-ZIG_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+# __file__ = cc-zig/tests/tty/cases/test_ui_tools.py → 上溯 3 级到 cc-zig。
+# (此前误写 "..","..",落到 cc-zig/tests,REPLAY_BIN 永不存在 → T35-T38 静默 skip。)
+ZIG_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 REPLAY_BIN = os.path.join(ZIG_ROOT, "zig-out", "bin", "replay_server")
 
 
@@ -224,7 +226,7 @@ def _sse_text(txt):
 
 
 def test_T37_taskcreate_shows_tasktab(bin_path):
-    """task 工具(TaskCreate+TaskUpdate in_progress)→ 输入框上方出现 ◐ activeForm TaskTab。"""
+    """task 工具(TaskCreate+TaskUpdate in_progress)→ 输入框上方出现 ◼ activeForm 清单行(B3 多行面板)。"""
     raw = _run_cassette(
         [("a", _sse_tool("tu1", "TaskCreate", {"subject": "build the widget", "description": "d", "activeForm": "Building the widget"})),
          ("b", _sse_tool("tu2", "TaskUpdate", {"taskId": "1", "status": "in_progress"})),
@@ -239,8 +241,8 @@ def test_T37_taskcreate_shows_tasktab(bin_path):
     if top is None or top == 0:
         a._fail("无法定位输入框")
     tab = a.final.line_text(top - 1)
-    # TaskTab 用 activeForm("Building the widget")而非 subject。
-    if "◐" not in tab or "Building the widget" not in tab:
+    # B3 多行 Task 清单:in_progress 用 ◼(对齐 cc TaskListV2),label 用 activeForm。
+    if "◼" not in tab or "Building the widget" not in tab:
         a._fail(f"TaskCreate/Update 后 TaskTab 未显示 activeForm:row={top-1!r} '{tab}'")
 
 

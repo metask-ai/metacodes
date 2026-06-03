@@ -164,6 +164,17 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             app.tasks.updateStatus(t.id, .in_progress) catch {};
             continue;
         }
+        // /agent-test[:desc] —— 测试专用:注册一个假 running subagent(无线程/无网络),
+        // 离线驱动 agent 进度树渲染。
+        if (std.mem.eql(u8, trimmed, "/agent-test") or std.mem.startsWith(u8, trimmed, "/agent-test:")) {
+            const desc = if (trimmed.len > 12) trimmed[12..] else "inspect repo";
+            if (app.agent_jobs) |*aj| {
+                aj.pushTestEntry(desc, 2, "Grep") catch {
+                    std.debug.print("[agent-test] push failed\n", .{});
+                };
+            }
+            continue;
+        }
         if (std.mem.eql(u8, trimmed, "/skills")) {
             if (app.skills.len() == 0) {
                 std.debug.print("No skills installed. Put SKILL.md files under ~/.cc-zig/skills/<name>/ or <project>/.cc-zig/skills/<name>/\n", .{});

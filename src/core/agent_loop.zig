@@ -137,7 +137,19 @@ pub const Options = struct {
     /// 后台 subagent(输出经 SinkWriter 进可查询缓冲)/headless = false,否则 final_text
     /// 会混入 \x1b[32m 等控制码。
     colorize: bool = true,
+    /// 实时进度回调(后台 subagent 用):每轮开始 + 每个工具执行前调用,
+    /// 把 (turn, tool_name) 写回调用方(JobEntry)。null = 不上报(前台/headless/同步)。
+    /// state 经类型擦除传 *JobEntry,progress_fn 是其 trampoline。
+    progress_state: ?*anyopaque = null,
+    progress_fn: ?*const fn (state: *anyopaque, turn: u32, tool_name: []const u8) void = null,
 };
+
+/// 内部:发一次进度上报(turn 1-based;tool_name 空 = 仅更新轮次)。
+fn reportProgress(opts: Options, turn: u32, tool_name: []const u8) void {
+    if (opts.progress_fn) |f| {
+        if (opts.progress_state) |s| f(s, turn, tool_name);
+    }
+}
 
 /// usage 回调接口：stream 每次吐 usage event 时调用。
 /// App.usage 实现此接口；测试用 mock 亦可。
@@ -187,6 +199,9 @@ pub fn run(
             log.warn("agent", "aborted before turn {d}", .{turns + 1});
             return .{ .stop_reason = .aborted, .turns = turns, .tool_calls = total_tool_calls };
         };
+
+        // 进度上报:进入新一轮(1-based);清空工具名(等本轮工具开跑再填)。
+        reportProgress(opts, turns + 1, "");
 
         // 自动 compact：发请求前检查 token 估算,超阈值则保留最近 N 条。
         // 阈值 null 时 = input context window * 0.8(逼近 context 上限才压缩,留出回复空间)。
@@ -511,6 +526,15 @@ pub fn run(
                 // 喂当前工具给底部 spinner(comptime 探测:普通 writer 无此方法 → 编译期消失)。
                 if (comptime @hasDecl(@TypeOf(stdout_writer.*), "setCurrentTool")) {
                     if (first_tool) |name| stdout_writer.setCurrentTool(name, util_time.nowMs());
+                }
+            }
+        }
+        // 进度上报:本轮第一个 run slot 的工具名(subagent agent 树显示当前动作)。
+        if (opts.progress_fn != null) {
+            for (slots.items) |*s| {
+                if (s.decision == .run) {
+                    reportProgress(opts, turns + 1, s.name);
+                    break;
                 }
             }
         }

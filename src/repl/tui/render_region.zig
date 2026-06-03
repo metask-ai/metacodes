@@ -23,6 +23,8 @@ const StatusBar = @import("widget/status_bar.zig").StatusBar;
 const util_time = @import("../../util/time.zig");
 const complete = @import("../complete.zig");
 const msg_queue = @import("../msg_queue.zig");
+const agent_tree = @import("widget/agent_tree.zig");
+const agent_job_registry = @import("../../core/agent_job_registry.zig");
 
 const Theme = theme_mod.Theme;
 const ColorCapability = term.ColorCapability;
@@ -169,33 +171,116 @@ pub const RenderRegion = struct {
     /// 对齐 UI_LAYER_DESIGN 阶段 4。另:有运行中后台 subagent 时,即便无 todo 也画一行
     /// `◐ N subagents running`(用户曾反馈看不到并发 subagent 进度)。
     fn drawTaskTab(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App) u16 {
-        const todo_text = taskTabLabel(&app.tasks);
-        // 后台运行中 subagent 数(agent_jobs 是可空字段;runningCount 需 *mut,这里 const
-        // App → 通过 @constCast 只读统计,不改状态)。
-        const running_subagents: usize = if (app.agent_jobs) |reg| blk: {
-            break :blk @constCast(&reg).runningCount();
-        } else 0;
+        return self.drawPanel(w, app);
+    }
 
-        if (todo_text == null and running_subagents == 0) return 0;
+    /// 输入框上方的多行面板(对齐 cc):agent 进度树(上)+ Task 清单(下)。
+    /// 返回画出的行数。无内容 → 0 行。height_budget 限制总行数,绝不挤掉输入框。
+    fn drawPanel(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App) u16 {
+        // 行预算:终端高度留给 spinner/队列/边框/输入/footer(~8 行)后剩余给面板。
+        const reserved: u16 = 8;
+        const budget: u16 = if (self.rows > reserved) @min(self.rows - reserved, 12) else 0;
+        if (budget == 0) return 0;
+        var used: u16 = 0;
 
-        const icon = if (self.use_unicode) "◐" else "*";
-        w.writeAll(ansi.clear.line) catch {};
-        w.writeAll(self.theme.dim) catch {};
-        if (todo_text) |text| {
-            const max_w: usize = if (self.cols > 4) self.cols - 4 else 8;
-            const end = truncateToWidth(text, max_w);
-            w.print("{s} {s}", .{ icon, text[0..end] }) catch {};
-            if (end < text.len) w.writeAll("…") catch {};
-            // todo + subagent 共存:在同一行尾部追加 subagent 计数。
-            if (running_subagents > 0) {
-                w.print("  ·  {d} subagent{s} running", .{ running_subagents, if (running_subagents == 1) "" else "s" }) catch {};
+        // ---- agent 进度树 ----
+        if (app.agent_jobs) |reg| {
+            const snaps = @constCast(&reg).snapshotJobs(self.allocator) catch null;
+            if (snaps) |s| {
+                defer agent_job_registry.AgentJobRegistry.freeSnapshots(self.allocator, s);
+                if (s.len > 0) {
+                    const tree = agent_tree.render(self.allocator, self.theme, s) catch null;
+                    if (tree) |t| {
+                        defer self.allocator.free(t);
+                        used += self.writePanelLines(w, t, budget - used);
+                    }
+                }
             }
-        } else {
-            w.print("{s} {d} subagent{s} running", .{ icon, running_subagents, if (running_subagents == 1) "" else "s" }) catch {};
         }
-        w.writeAll(self.theme.reset) catch {};
-        w.writeAll("\r\n") catch {};
-        return 1;
+
+        // ---- Task 清单 ----
+        if (used < budget) {
+            used += self.drawTaskList(w, app, budget - used);
+        }
+        return used;
+    }
+
+    /// 把多行文本(已含 ANSI)逐行写入区,每行前 clear.line + \r\n。最多 max_lines 行。
+    fn writePanelLines(self: *RenderRegion, w: *std.Io.Writer, text: []const u8, max_lines: u16) u16 {
+        _ = self;
+        var n: u16 = 0;
+        var pos: usize = 0;
+        while (pos < text.len and n < max_lines) {
+            const eol = std.mem.indexOfScalarPos(u8, text, pos, '\n') orelse text.len;
+            w.writeAll(ansi.clear.line) catch {};
+            w.writeAll(text[pos..eol]) catch {};
+            w.writeAll("\r\n") catch {};
+            n += 1;
+            pos = eol + 1;
+        }
+        return n;
+    }
+
+    /// Task 清单(◼ in_progress / ◻ pending / ● completed,completed 过 TTL 不显)。
+    /// 超预算折叠为 `… +N more`。返回行数。
+    fn drawTaskList(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App, max_lines: u16) u16 {
+        if (max_lines == 0) return 0;
+        const tasks = app.tasks.tasks.items;
+        const now = util_time.nowMs();
+        const TTL_MS: i64 = 30_000;
+
+        // 先数可显条目(active + TTL 内 completed)。
+        var visible: usize = 0;
+        for (tasks) |t| {
+            if (t.status == .completed) {
+                if (t.completed_ms != 0 and now - t.completed_ms <= TTL_MS) visible += 1;
+            } else if (t.status == .pending or t.status == .in_progress) {
+                visible += 1;
+            }
+        }
+        if (visible == 0) return 0;
+
+        var n: u16 = 0;
+        var shown: usize = 0;
+        const cap: usize = if (max_lines > 0) max_lines - @as(u16, if (visible > max_lines) 1 else 0) else 0;
+        const max_w: usize = if (self.cols > 6) self.cols - 6 else 8;
+        for (tasks) |t| {
+            const show = switch (t.status) {
+                .completed => t.completed_ms != 0 and now - t.completed_ms <= TTL_MS,
+                .pending, .in_progress => true,
+                .deleted => false,
+            };
+            if (!show) continue;
+            if (shown >= cap) break;
+            const icon: []const u8 = switch (t.status) {
+                .in_progress => if (self.use_unicode) "◼" else "[*]",
+                .pending => if (self.use_unicode) "◻" else "[ ]",
+                .completed => if (self.use_unicode) "●" else "[x]",
+                .deleted => "",
+            };
+            const color: []const u8 = switch (t.status) {
+                .in_progress => self.theme.warn,
+                .pending => self.theme.dim,
+                .completed => self.theme.success,
+                .deleted => self.theme.dim,
+            };
+            const label = t.active_form orelse t.subject;
+            const end = truncateToWidth(label, max_w);
+            w.writeAll(ansi.clear.line) catch {};
+            w.print("  {s}{s}{s} {s}", .{ color, icon, self.theme.reset, label[0..end] }) catch {};
+            if (end < label.len) w.writeAll("…") catch {};
+            w.writeAll("\r\n") catch {};
+            n += 1;
+            shown += 1;
+        }
+        // 折叠提示。
+        if (visible > shown) {
+            w.writeAll(ansi.clear.line) catch {};
+            w.print("  {s}… +{d} more{s}", .{ self.theme.dim, visible - shown, self.theme.reset }) catch {};
+            w.writeAll("\r\n") catch {};
+            n += 1;
+        }
+        return n;
     }
 
     fn renderFrameInner(self: *RenderRegion, app: *const app_mod.App, content: []const u8, cursor: usize) void {
@@ -676,6 +761,9 @@ pub const RenderRegion = struct {
 
         // -- 待发送队列预览(每条 dim 灰,最多 3 条 + "+N more")--
         R += self.drawQueuePreview(w);
+
+        // -- agent 进度树 + Task 清单面板(输入框上方)--
+        R += self.drawPanel(w, app);
 
         // -- 上边框 --
         w.writeAll(ansi.clear.line) catch {};

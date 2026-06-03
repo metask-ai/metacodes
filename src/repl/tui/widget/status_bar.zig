@@ -91,9 +91,19 @@ pub const StatusBar = struct {
         else
             "";
 
+        // token 速率段:长 turn(>30s)才显示,对齐 cc `↓7.9k tokens` 速率语义。
+        // 速率 = 输出 token / 耗时秒(输出 token 才是"生成"速率)。
+        var rate_buf: [24]u8 = undefined;
+        const rate_seg: []const u8 = if (elapsed_ms > 30_000 and secs > 0) blk: {
+            const rate = @as(f64, @floatFromInt(u.output_tokens)) / secs;
+            var rb: [16]u8 = undefined;
+            const rstr = formatTokens(&rb, @intFromFloat(@max(rate, 0)));
+            break :blk std.fmt.bufPrint(&rate_buf, " · {s} tok/s", .{rstr}) catch "";
+        } else "";
+
         // 先格式化到栈 buffer,再按显示宽截断输出(跳过 SGR 转义)。
         var line_buf: [512]u8 = undefined;
-        const line = std.fmt.bufPrint(&line_buf, "{s}{s} {s}…{s}{s} ({d:.0}s · ↑{s} ↓{s} · ${d:.4}{s} · esc to interrupt){s}", .{
+        const line = std.fmt.bufPrint(&line_buf, "{s}{s} {s}…{s}{s} ({d:.0}s · ↑{s} ↓{s}{s} · ${d:.4}{s} · esc to interrupt){s}", .{
             theme.accent,
             fr,
             verb,
@@ -102,6 +112,7 @@ pub const StatusBar = struct {
             secs,
             in_str,
             out_str,
+            rate_seg,
             cost,
             tool_seg,
             theme.reset,

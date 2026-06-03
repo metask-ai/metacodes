@@ -40,6 +40,10 @@ pub const Theme = struct {
     icon_act: []const u8,
     /// 工具结果 gutter 角符(对齐 cc `  ⎿  `):`⎿`(unicode)/ `\`(ascii)。
     gutter: []const u8,
+    /// agent 进度树形字符(对齐 cc swarm 树):分支 ├ / 末枝 └ / 竖管 │。
+    tree_branch: []const u8,
+    tree_end: []const u8,
+    tree_pipe: []const u8,
 
     // ============ 边框字符 ============
     box_h: []const u8,
@@ -79,6 +83,9 @@ pub const dark: Theme = .{
     .icon_thinking = "✻",
     .icon_act = "⏺",
     .gutter = "⎿",
+    .tree_branch = "├",
+    .tree_end = "└",
+    .tree_pipe = "│",
 
     .box_h = "─",
     .box_v = "│",
@@ -112,6 +119,9 @@ pub const light: Theme = .{
     .icon_thinking = "✻",
     .icon_act = "⏺",
     .gutter = "⎿",
+    .tree_branch = "├",
+    .tree_end = "└",
+    .tree_pipe = "│",
 
     .box_h = "─",
     .box_v = "│",
@@ -147,6 +157,9 @@ pub const monochrome: Theme = .{
     .icon_thinking = "~",
     .icon_act = "*",
     .gutter = "\\",
+    .tree_branch = "+",
+    .tree_end = "\\",
+    .tree_pipe = "|",
 
     // ASCII 边框
     .box_h = "-",

@@ -310,6 +310,7 @@ test {
     _ = &@import("repl/tui/test_capture.zig");
     _ = &@import("repl/tui/dialog/permission.zig");
     _ = &@import("repl/tui/widget/tool_card.zig");
+    _ = &@import("repl/tui/widget/agent_tree.zig");
     _ = &@import("repl/tui/widget/thinking.zig");
     _ = &@import("repl/tui/widget/pager.zig");
     _ = &@import("repl/tui/config.zig");
