@@ -113,14 +113,23 @@ pub const RenderRegion = struct {
     }
 
     /// 设置当前工具的进度第二行文本(对齐 cc onProgress→renderToolUseProgressMessage)。
-    /// 工具执行线程(tool_exec 并发批)经 progress 回调调用 → 下次 tickSpinner 重画第二行。
-    /// 持锁:与 spinner 线程读互斥。text 立即拷进定长数组(不持有借用)。
+    /// 工具执行线程(tool_exec 并发批)经 progress 回调调用。**立即重画一帧**(不等下个
+    /// spinner tick)——否则结果块到达和工具完成贴在一起,Found N 那帧会被 Did N 秒覆盖、
+    /// 渲染不出来(对齐 cc reactive 重渲染)。持锁:与 spinner 线程读/画互斥。
+    /// text 立即拷进定长数组(不持有借用)。
     pub fn setToolProgress(self: *RenderRegion, text: []const u8) void {
         self.lock();
         defer self.unlock();
         const n = @min(text.len, self.current_tool_progress.len);
         @memcpy(self.current_tool_progress[0..n], text[0..n]);
         self.current_tool_progress_len = @intCast(n);
+        // 立即重画(用 enterGenerating 存的 gen_app),让进度行至少渲染一帧。
+        if (self.generating) {
+            if (self.gen_app) |app| {
+                if (self.region_drawn) self.eraseRegion();
+                self.drawGenRegion(app);
+            }
+        }
     }
 
     pub fn init(allocator: std.mem.Allocator, fd: std.c.fd_t, theme: Theme, cap: ColorCapability) RenderRegion {
