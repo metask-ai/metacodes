@@ -29,6 +29,7 @@ SPECIAL = {
     "ctrl_u": b"\x15",
     "ctrl_c": b"\x03",
     "ctrl_d": b"\x04",
+    "ctrl_o": b"\x0f",
     "esc": b"\x1b",
 }
 
@@ -38,11 +39,14 @@ def _set_winsize(fd, rows, cols):
 
 
 def run(bin_path, key_events, term_size=(24, 80), env=None,
-        startup_drain=0.8, per_key_drain=0.25, base_url="http://127.0.0.1:1/v1/messages"):
+        startup_drain=0.8, per_key_drain=0.25, base_url="http://127.0.0.1:1/v1/messages",
+        permission="bypassPermissions", cwd=None):
     """fork pty,设窗口,exec bin,按 key_events 喂键,返回合并原始字节流。
 
     base_url: 默认指死端口(连接立即 refused,probeModels/请求不 hang)——离线渲染测试用。
               打真实模型的 case(test_generating 等)传 base_url=None 用硬编码真端点。
+    permission: --permission 模式(默认 bypassPermissions 免弹窗;测权限弹窗传 "default")。
+    cwd: 子进程工作目录(默认继承)。测权限弹窗时传隔离临时目录,避免项目 .claude/settings 污染。
 
     key_events 元素(字符串):
       "type:文本"      逐 codepoint 写(模拟打字,每字单独 drain → 暴露逐帧 bug)
@@ -52,6 +56,8 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
       "raw:..."        原样字节(用 \\xNN 转义)
     """
     rows, cols = term_size
+    # bin_path 转绝对路径:cwd 非 None 时子进程会 chdir,相对 bin_path 会失效。
+    bin_path = os.path.abspath(bin_path)
     full_env = dict(os.environ)
     full_env["METACODES_LOG"] = "*:warn"
     full_env["FORCE_COLOR"] = "1"  # 锁 basic_16,让 accent/warn 是固定标准色 SGR
@@ -70,7 +76,9 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
         try:
             os.environ.clear()
             os.environ.update(full_env)
-            argv = [bin_path, "--permission", "bypassPermissions"]
+            if cwd:
+                os.chdir(cwd)
+            argv = [bin_path, "--permission", permission]
             if base_url:
                 # 死端口兜底:即便 NO_PROBE 失效,网络调用也立即 refused 不 hang。
                 argv += ["--base-url", base_url]

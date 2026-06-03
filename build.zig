@@ -147,6 +147,8 @@ pub fn build(b: *std.Build) void {
         "tests/component/cache_break_test.zig",
         "tests/component/microcompact_test.zig",
         "tests/component/schema_validation_test.zig",
+        "tests/component/tool_schema_coverage_test.zig",
+        "tests/component/tool_smoke_test.zig",
         "tests/component/compact_summary_test.zig",
         "tests/component/render_region_test.zig",
     };
@@ -200,6 +202,8 @@ pub fn build(b: *std.Build) void {
         "tests/component/cache_break_test.zig",
         "tests/component/microcompact_test.zig",
         "tests/component/schema_validation_test.zig",
+        "tests/component/tool_schema_coverage_test.zig",
+        "tests/component/tool_smoke_test.zig",
         "tests/component/compact_summary_test.zig",
         "tests/component/render_region_test.zig",
     };
@@ -233,6 +237,21 @@ pub fn build(b: *std.Build) void {
     // 经 build SystemCommand 跑会大面积假失败)。跑法:
     //   zig build && python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug
     // 这与 e2e(走 shell 而非 zig build)同理。
+
+    // test:e2e-tty —— tty 真模型工具 e2e(cases/test_e2e_*.py)。与渲染测试不同:这些用例
+    // 自建 PTY、断言靠落盘的 transcript.jsonl(非 build-runner 捕获的屏幕字节),所以经
+    // SystemCommand 跑不受 PTY 时序假失败影响(已实测 stdin=/dev/null 下通过)。
+    // 打真模型(napi.metask-ai.com,client.zig 硬编码 token)→ 默认应设 TTY_SKIP_MODEL=1
+    // 跳过(CI/离线);显式 `TTY_SKIP_MODEL= zig build test:e2e-tty` 才真打模型、真副作用
+    // (真联网/真排程/真发通知/真改 git)。先 build debug 二进制 + mock_mcp_server。
+    const e2e_tty_step = b.step("test:e2e-tty", "Run tty real-model tool e2e (打真模型, 设 TTY_SKIP_MODEL=1 跳过)");
+    const e2e_tty_cmd = b.addSystemCommand(&.{
+        "python3", "tests/tty/run_tty_tests.py",
+        "--bin",   "zig-out/bin/metacodes-debug",
+        "-k",      "e2e_",
+    });
+    e2e_tty_cmd.step.dependOn(b.getInstallStep()); // 确保 metacodes-debug + mock_mcp_server 已 build
+    e2e_tty_step.dependOn(&e2e_tty_cmd.step);
 
     _ = b.addFmt(.{
         .paths = &.{"src/"},

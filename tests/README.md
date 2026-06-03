@@ -25,6 +25,8 @@ tests/
 │   └── diff.zig                      彩色 diff 输出
 ├── unit/                             纯单元（独立于 src，补充 src/ 内测试覆盖不到的）
 ├── component/                        组件测试（mock HTTP / pty）
+│   ├── tool_schema_coverage_test.zig 工具 schema 守卫:遍历 registry,强制每 required 字段在 prop_specs 有定义 + 序列化字节断言（防 TaskCreate MissingRequiredField 类复发）
+│   └── tool_smoke_test.zig           工具执行冒烟:走 dispatch 整链(validateRequired+validateTypes+execute)
 ├── integration/                      集成测试（子进程、真 fs）
 └── golden/                           Golden 快照
     ├── run.zig                       扫描器
