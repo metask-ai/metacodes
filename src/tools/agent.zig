@@ -132,6 +132,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const bg = util_json.extractBoolField(args, "run_in_background") orelse false;
     if (bg) {
         const reg = ctx.agent_jobs orelse return error.AgentJobsUnavailable;
+        var desc_buf: [128]u8 = undefined;
         const job_id = try reg.spawnBackground(.{
             .prompt = prompt,
             .system_prompt = sys_prompt,
@@ -146,7 +147,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .perm_override = perm_override,
             .project_dir = ctx.project_dir,
             .parent_model = ctx.parent_model,
-            .desc = util_json.extractStringField(args, "description") orelse subagent_type_raw,
+            // desc 形如 "<type>: <description>"(对齐 agent 进度树 `├ Explore: inspect repo`);
+            // 无 description 时退回纯 type。registry 内 dupe + 截断 80B,这里栈 buffer 即可。
+            .desc = desc_blk: {
+                const d = util_json.extractStringField(args, "description") orelse break :desc_blk subagent_type_raw;
+                break :desc_blk std.fmt.bufPrint(&desc_buf, "{s}: {s}", .{ subagent_type_raw, d }) catch d;
+            },
             .activate_skill_state = ctx.activate_skill_state,
             .activate_skill_fn = ctx.activate_skill_fn,
         });
