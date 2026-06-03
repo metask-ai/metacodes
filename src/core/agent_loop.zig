@@ -493,7 +493,33 @@ pub fn run(
         };
 
         // 6c. 分批并发执行(denied 的不动,run 的填 content)。
+        // 过程态(TTY 顶层):执行前打起始卡 + 把"当前工具"喂进底部 spinner(由现有
+        // tickSpinner 线程渲染,见 render_region)。headless/subagent(depth>0)/无 theme 跳过。
+        if (opts.tool_render_theme) |th| {
+            if (opts.agent_depth == 0) {
+                const tool_card = @import("../repl/tui/widget/tool_card.zig");
+                var first_tool: ?[]const u8 = null;
+                for (slots.items) |*s| {
+                    if (s.decision != .run) continue;
+                    if (tool_card.resultRenderMode(s.name) == .hidden) continue;
+                    if (first_tool == null) first_tool = s.name;
+                    if (tool_card.renderStart(allocator, th.*, s.name, s.input) catch null) |card| {
+                        defer allocator.free(card);
+                        stdout_writer.print("{s}", .{card}) catch {};
+                    }
+                }
+                // 喂当前工具给底部 spinner(comptime 探测:普通 writer 无此方法 → 编译期消失)。
+                if (comptime @hasDecl(@TypeOf(stdout_writer.*), "setCurrentTool")) {
+                    if (first_tool) |name| stdout_writer.setCurrentTool(name, util_time.nowMs());
+                }
+            }
+        }
         tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
+        if (opts.tool_render_theme != null and opts.agent_depth == 0) {
+            if (comptime @hasDecl(@TypeOf(stdout_writer.*), "clearCurrentTool")) {
+                stdout_writer.clearCurrentTool();
+            }
+        }
 
         // 6d. 按原顺序回填 result_blocks。熔断判定**不在此内层循环累加**——否则单轮内
         // 多个工具调用返回同一错误(如 subagent 第一轮发 3 个 TaskCreate 全失败)会在一轮内
@@ -527,7 +553,7 @@ pub fn run(
             if (opts.tool_render_theme) |th| {
                 const tool_card = @import("../repl/tui/widget/tool_card.zig");
                 const kind: tool_card.ResultKind = if (s.is_error) .err else .ok;
-                if (tool_card.renderResult(allocator, th.*, s.name, s.input, content, kind, 0, .{}) catch null) |card| {
+                if (tool_card.renderResult(allocator, th.*, s.name, s.input, content, kind, s.elapsed_ms, .{}) catch null) |card| {
                     defer allocator.free(card);
                     stdout_writer.print("{s}", .{card}) catch {};
                 }

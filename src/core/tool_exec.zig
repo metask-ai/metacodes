@@ -28,6 +28,8 @@ pub const Slot = struct {
     /// 执行后填:成功内容 或 错误内容(均 owned by caller allocator)。
     content: ?[]u8 = null,
     is_error: bool = false,
+    /// 执行耗时(ms),runJob 填。供 tool_card 显示真实耗时(0 = 未执行/被拒)。
+    elapsed_ms: u64 = 0,
 };
 
 /// 一个并发 job 的输入(safe 批用)。
@@ -56,6 +58,7 @@ fn runJob(job: *Job) void {
         const ej = tool_error.errorToJson(code, "{s} failed with {s}", .{ s.name, @errorName(err) }, job.parent_allocator) catch null;
         s.content = ej;
         s.is_error = true;
+        s.elapsed_ms = @intCast(@max(util_time.nowMs() - t_start, 0));
         log.warnId("agent", job.rid, "tool.exec FAILED(par) name={s} err={s} duration_ms={d} input={s}", .{ s.name, @errorName(err), util_time.nowMs() - t_start, s.input[0..@min(s.input.len, 200)] });
         job.done = true;
         return;
@@ -75,6 +78,7 @@ fn runJob(job: *Job) void {
         s.content = null;
     }
     s.is_error = false;
+    s.elapsed_ms = @intCast(@max(util_time.nowMs() - t_start, 0));
     log.infoId("agent", job.rid, "tool.exec done(par) name={s} output_bytes={d} duration_ms={d}", .{ s.name, r.len, util_time.nowMs() - t_start });
     job.done = true;
 }

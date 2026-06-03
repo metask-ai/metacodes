@@ -53,6 +53,12 @@ pub const RenderRegion = struct {
     spinner_frame: u8 = 0,
     verb: []const u8 = "",
     gen_start_ms: i64 = 0,
+    // 当前执行中的工具(供 spinner 行显示 `⚒ <tool> (X.Ys)`)。定长拷贝而非借用
+    // slice——watcher 线程读、主线程写,{ptr,len} 跨线程撕裂读是 UB;拷进定长数组 +
+    // 持锁更新规避竞争。current_tool_len=0 表示当前无工具。
+    current_tool: [48]u8 = undefined,
+    current_tool_len: u8 = 0,
+    tool_start_ms: i64 = 0,
     text_pending_newline: bool = false,
     pending_col: u16 = 0, // 半行 chunk 累计显示列(消息穿过续接用)
     region_drawn: bool = false, // 生成期固定区当前是否画在屏上(true ⟹ 光标钉区顶行首)
@@ -79,6 +85,23 @@ pub const RenderRegion = struct {
     }
     fn unlock(self: *RenderRegion) void {
         _ = std.c.pthread_mutex_unlock(&self.mutex);
+    }
+
+    /// 设置当前执行中的工具(主线程在工具执行前调)。持锁:与 tickSpinner 的读互斥。
+    pub fn setCurrentTool(self: *RenderRegion, name: []const u8, start_ms: i64) void {
+        self.lock();
+        defer self.unlock();
+        const n = @min(name.len, self.current_tool.len);
+        @memcpy(self.current_tool[0..n], name[0..n]);
+        self.current_tool_len = @intCast(n);
+        self.tool_start_ms = start_ms;
+    }
+
+    /// 清除当前工具(工具执行完调)。持锁。
+    pub fn clearCurrentTool(self: *RenderRegion) void {
+        self.lock();
+        defer self.unlock();
+        self.current_tool_len = 0;
     }
 
     pub fn init(allocator: std.mem.Allocator, fd: std.c.fd_t, theme: Theme, cap: ColorCapability) RenderRegion {
@@ -641,7 +664,13 @@ pub const RenderRegion = struct {
         // -- spinner 行 --
         w.writeAll(ansi.clear.line) catch {};
         const elapsed: u64 = @intCast(@max(util_time.nowMs() - self.gen_start_ms, 0));
-        _ = StatusBar.renderGenerating(w, app, self.theme, self.use_unicode, self.spinner_frame, self.verb, elapsed, inner_w) catch {};
+        // 当前工具 + 其耗时(已在 tickSpinner 锁内,读 current_tool 无竞争)。
+        const cur_tool = self.current_tool[0..self.current_tool_len];
+        const tool_ms: u64 = if (self.current_tool_len > 0)
+            @intCast(@max(util_time.nowMs() - self.tool_start_ms, 0))
+        else
+            0;
+        _ = StatusBar.renderGenerating(w, app, self.theme, self.use_unicode, self.spinner_frame, self.verb, elapsed, cur_tool, tool_ms, inner_w) catch {};
         R += 1;
         w.writeAll("\r\n") catch {};
 
@@ -789,6 +818,14 @@ pub const RegionWriter = struct {
         const s = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..buf.len];
         self.region.writeGenText(s);
     }
+
+    /// agent_loop 经 comptime 探测调用:把当前工具喂给底部 spinner。
+    pub fn setCurrentTool(self: *RegionWriter, name: []const u8, start_ms: i64) void {
+        self.region.setCurrentTool(name, start_ms);
+    }
+    pub fn clearCurrentTool(self: *RegionWriter) void {
+        self.region.clearCurrentTool();
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -883,6 +920,26 @@ test "RenderRegion init/deinit no leak" {
     var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.monochrome, .none), .none);
     defer r.deinit();
     try std.testing.expect(r.cols >= 1);
+}
+
+test "setCurrentTool/clearCurrentTool: 存取 + 截断 + 归零" {
+    var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.monochrome, .none), .none);
+    defer r.deinit();
+    // 初始无工具。
+    try std.testing.expectEqual(@as(u8, 0), r.current_tool_len);
+
+    r.setCurrentTool("Bash", 1000);
+    try std.testing.expectEqualStrings("Bash", r.current_tool[0..r.current_tool_len]);
+    try std.testing.expectEqual(@as(i64, 1000), r.tool_start_ms);
+
+    // 超 48B 的工具名应截断到 48,不越界。
+    const long = "ThisIsAnAbsurdlyLongToolNameThatExceedsFortyEightBytesForSure";
+    r.setCurrentTool(long, 2000);
+    try std.testing.expectEqual(@as(u8, 48), r.current_tool_len);
+    try std.testing.expectEqualStrings(long[0..48], r.current_tool[0..r.current_tool_len]);
+
+    r.clearCurrentTool();
+    try std.testing.expectEqual(@as(u8, 0), r.current_tool_len);
 }
 
 test "nextCharBytes UTF-8 宽度" {

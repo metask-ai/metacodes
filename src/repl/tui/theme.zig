@@ -36,6 +36,10 @@ pub const Theme = struct {
     icon_arrow: []const u8,
     icon_bullet: []const u8,
     icon_thinking: []const u8,
+    /// 工具调用 bullet(对齐 cc BLACK_CIRCLE):`⏺`(unicode)/ `*`(ascii)。
+    icon_act: []const u8,
+    /// 工具结果 gutter 角符(对齐 cc `  ⎿  `):`⎿`(unicode)/ `\`(ascii)。
+    gutter: []const u8,
 
     // ============ 边框字符 ============
     box_h: []const u8,
@@ -73,6 +77,8 @@ pub const dark: Theme = .{
     .icon_arrow = "→",
     .icon_bullet = "•",
     .icon_thinking = "✻",
+    .icon_act = "⏺",
+    .gutter = "⎿",
 
     .box_h = "─",
     .box_v = "│",
@@ -104,6 +110,8 @@ pub const light: Theme = .{
     .icon_arrow = "→",
     .icon_bullet = "•",
     .icon_thinking = "✻",
+    .icon_act = "⏺",
+    .gutter = "⎿",
 
     .box_h = "─",
     .box_v = "│",
@@ -137,6 +145,8 @@ pub const monochrome: Theme = .{
     .icon_arrow = "->",
     .icon_bullet = "-",
     .icon_thinking = "~",
+    .icon_act = "*",
+    .gutter = "\\",
 
     // ASCII 边框
     .box_h = "-",

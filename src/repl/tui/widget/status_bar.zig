@@ -66,6 +66,8 @@ pub const StatusBar = struct {
         frame_idx: u8,
         verb: []const u8,
         elapsed_ms: u64,
+        current_tool: []const u8,
+        tool_ms: u64,
         max_w: usize,
     ) !usize {
         const u = app.usage;
@@ -78,9 +80,20 @@ pub const StatusBar = struct {
         const in_str = formatTokens(&in_buf, u.input_tokens);
         const out_str = formatTokens(&out_buf, u.output_tokens);
 
+        // 当前工具段(执行中才显示):` · ⚒ <tool> (X.Ys)`。
+        var tool_buf: [80]u8 = undefined;
+        const tool_seg: []const u8 = if (current_tool.len > 0)
+            std.fmt.bufPrint(&tool_buf, " · {s} {s} ({d:.1}s)", .{
+                if (use_unicode) "⚒" else "*",
+                current_tool,
+                @as(f64, @floatFromInt(tool_ms)) / 1000.0,
+            }) catch ""
+        else
+            "";
+
         // 先格式化到栈 buffer,再按显示宽截断输出(跳过 SGR 转义)。
         var line_buf: [512]u8 = undefined;
-        const line = std.fmt.bufPrint(&line_buf, "{s}{s} {s}…{s}{s} ({d:.0}s · ↑{s} ↓{s} · ${d:.4} · esc to interrupt){s}", .{
+        const line = std.fmt.bufPrint(&line_buf, "{s}{s} {s}…{s}{s} ({d:.0}s · ↑{s} ↓{s} · ${d:.4}{s} · esc to interrupt){s}", .{
             theme.accent,
             fr,
             verb,
@@ -90,6 +103,7 @@ pub const StatusBar = struct {
             in_str,
             out_str,
             cost,
+            tool_seg,
             theme.reset,
         }) catch {
             // 极端超长 → 退化为最简 spinner。

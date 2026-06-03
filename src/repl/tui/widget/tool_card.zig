@@ -67,17 +67,18 @@ pub fn resultRenderMode(tool_name: []const u8) ResultRenderMode {
     return .hidden;
 }
 
-/// 工具开始(无状态符,只有 ⚙ tool_name + 命令预览)。caller free。
+/// 工具开始(无状态符,只有 ⏺ tool_name + 命令预览)。对齐 cc BLACK_CIRCLE bullet。
+/// caller free。
 pub fn renderStart(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, preview_args: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
 
-    // 第 1 行:⚙ tool_name
-    try out.appendSlice(alloc, th.role_tool);
-    try out.appendSlice(alloc, th.icon_tool);
+    // 第 1 行:⏺ tool_name(bullet 用 accent 色)
+    try out.appendSlice(alloc, th.accent);
+    try out.appendSlice(alloc, th.icon_act);
+    try out.appendSlice(alloc, th.reset);
     try out.append(alloc, ' ');
     try out.appendSlice(alloc, tool_name);
-    try out.appendSlice(alloc, th.reset);
     try out.append(alloc, '\n');
 
     // 第 2 行:命令预览(缩进 2 空格 + dim)
@@ -99,18 +100,18 @@ pub fn renderProgress(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
 
-    // 第 1 行:⚙ tool_name + (耗时 spinner)
-    try out.appendSlice(alloc, th.role_tool);
-    try out.appendSlice(alloc, th.icon_tool);
+    // 第 1 行:⏺ tool_name + (耗时 spinner)
+    try out.appendSlice(alloc, th.accent);
+    try out.appendSlice(alloc, th.icon_act);
+    try out.appendSlice(alloc, th.reset);
     try out.append(alloc, ' ');
     try out.appendSlice(alloc, tool_name);
-    try out.appendSlice(alloc, th.reset);
 
     // 右上角:spinner + 耗时
     var stat_buf: [64]u8 = undefined;
     const stat = try std.fmt.bufPrint(&stat_buf, "{s}… {d:.1}s{s}", .{ th.warn, @as(f64, @floatFromInt(elapsed_ms)) / 1000.0, th.reset });
     if (opts.cols > 0) {
-        const left_w = term.displayWidth(th.icon_tool) + 1 + term.displayWidth(tool_name);
+        const left_w = term.displayWidth(th.icon_act) + 1 + term.displayWidth(tool_name);
         // 状态文本的可视宽度:"… X.Ys"
         var vw: [32]u8 = undefined;
         const stat_vis = std.fmt.bufPrint(&vw, "… {d:.1}s", .{@as(f64, @floatFromInt(elapsed_ms)) / 1000.0}) catch "";
@@ -162,12 +163,12 @@ pub fn renderResult(
         return try out.toOwnedSlice(alloc); // 空串
     }
 
-    // 第 1 行:⚙ tool_name + ✓/✗ X.Ys
-    try out.appendSlice(alloc, th.role_tool);
-    try out.appendSlice(alloc, th.icon_tool);
+    // 第 1 行:⏺ tool_name + ✓/✗ X.Ys
+    try out.appendSlice(alloc, th.accent);
+    try out.appendSlice(alloc, th.icon_act);
+    try out.appendSlice(alloc, th.reset);
     try out.append(alloc, ' ');
     try out.appendSlice(alloc, tool_name);
-    try out.appendSlice(alloc, th.reset);
 
     // 右上角:状态符 + 耗时
     const status_color = if (kind == .ok) th.success else th.danger;
@@ -175,7 +176,7 @@ pub fn renderResult(
     var stat_buf: [64]u8 = undefined;
     const stat_inner = try std.fmt.bufPrint(&stat_buf, "{s} {d:.1}s", .{ status_icon, @as(f64, @floatFromInt(elapsed_ms)) / 1000.0 });
     if (opts.cols > 0) {
-        const left_w = term.displayWidth(th.icon_tool) + 1 + term.displayWidth(tool_name);
+        const left_w = term.displayWidth(th.icon_act) + 1 + term.displayWidth(tool_name);
         const stat_w = term.displayWidth(stat_inner);
         if (opts.cols > left_w + stat_w + 1) {
             const pad = opts.cols - left_w - stat_w;
@@ -203,21 +204,45 @@ pub fn renderResult(
         try out.append(alloc, '\n');
     }
 
-    // 分隔线 + 按工具分发的输出体
+    // 输出体:经子渲染器渲染到临时 buffer(各行 2 空格缩进),再套 ⎿ gutter——
+    // 首行 `  ⎿  ` + 角符,续行 5 空格对齐(对齐 cc `  ⎿  ` gutter)。
     if (output_text.len > 0) {
-        // 分隔线(缩进 2,长度 ~ 48 列)
-        try out.appendSlice(alloc, "  ");
-        try out.appendSlice(alloc, th.dim);
-        var i: usize = 0;
-        while (i < 48) : (i += 1) try out.appendSlice(alloc, th.box_h);
-        try out.appendSlice(alloc, th.reset);
-        try out.append(alloc, '\n');
-
-        // 按工具名分发到专用渲染器;未命中走通用折叠。
-        try renderResultBody(alloc, th, tool_name, output_text, &out, opts, kind);
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(alloc);
+        try renderResultBody(alloc, th, tool_name, output_text, &body, opts, kind);
+        try appendWithGutter(alloc, th, body.items, &out);
     }
 
     return try out.toOwnedSlice(alloc);
+}
+
+/// 把子渲染器产出的 body(各行以 "  " 2 空格缩进)套上 cc 风格 ⎿ gutter:
+///   首行:`  ⎿  <line>`(2 空格 + dim 角符 + 2 空格)
+///   续行:`     <line>`(5 空格,对齐角符之后)
+/// 输入各行原有的 2 空格缩进会被剥掉再重套,避免缩进叠加。空 body 直接返回。
+fn appendWithGutter(alloc: std.mem.Allocator, th: Theme, body: []const u8, out: *std.ArrayList(u8)) !void {
+    if (body.len == 0) return;
+    var first = true;
+    var pos: usize = 0;
+    while (pos < body.len) {
+        const eol = std.mem.indexOfScalarPos(u8, body, pos, '\n') orelse body.len;
+        var line = body[pos..eol];
+        // 剥掉子渲染器加的前导 2 空格(若有),gutter 自带缩进。
+        if (std.mem.startsWith(u8, line, "  ")) line = line[2..];
+        if (first) {
+            try out.appendSlice(alloc, "  ");
+            try out.appendSlice(alloc, th.dim);
+            try out.appendSlice(alloc, th.gutter);
+            try out.appendSlice(alloc, th.reset);
+            try out.appendSlice(alloc, "  ");
+            first = false;
+        } else {
+            try out.appendSlice(alloc, "     "); // 5 空格对齐
+        }
+        try out.appendSlice(alloc, line);
+        try out.append(alloc, '\n');
+        pos = eol + 1;
+    }
 }
 
 /// 按工具名分发结果体渲染。专用渲染器(Edit diff / 搜索摘要 / Read 摘要 / WebFetch 摘要)
@@ -1029,5 +1054,44 @@ test "renderResult: hidden 工具失败时仍渲染(不静默吞错)" {
     // 状态符是失败标记。
     try capture.expectContains(s, "X 0.8s"); // monochrome icon_cross="X"
 }
+
+// ---- cc 风格观感:⏺ bullet + ⎿ gutter + 5 列续行(对齐 Claude Code)----
+
+test "renderStart: 用 ⏺ bullet 而非 ⚙(dark)" {
+    const th = theme_mod.dark;
+    const s = try renderStart(testing.allocator, th, "Bash", "{\"command\":\"ls\"}");
+    defer testing.allocator.free(s);
+    try capture.expectContains(s, "⏺"); // bullet(dark 带色,故分开断言 glyph 与名)
+    try capture.expectContains(s, "Bash");
+    try testing.expect(std.mem.indexOf(u8, s, "⚙") == null); // 旧齿轮不再出现
+}
+
+test "renderResult: ⎿ gutter + 5 列续行 + 无 ──── 分隔线(dark)" {
+    const th = theme_mod.dark;
+    const out = "line1\nline2\n";
+    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"x\"}", out, .ok, 300, .{ .collapsed = false });
+    defer testing.allocator.free(s);
+    try capture.expectContains(s, "⏺"); // bullet
+    // 首行结果挂在 ⎿ gutter 下(gutter 与 line1 之间是 reset+2空格,故分开断言)。
+    try capture.expectContains(s, "⎿");
+    try capture.expectContains(s, "  line1");
+    // 续行 5 空格对齐(角符之后)。
+    try capture.expectContains(s, "     line2");
+    // 旧的 ──── 分隔线彻底移除。
+    try testing.expect(std.mem.indexOf(u8, s, "────") == null);
+}
+
+test "renderResult: monochrome 用 ASCII gutter(\\)而非 unicode" {
+    const th = theme_mod.monochrome;
+    const out = "alpha\nbeta\n";
+    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"x\"}", out, .ok, 100, .{ .collapsed = false });
+    defer testing.allocator.free(s);
+    try capture.expectNoAnsi(s);
+    try capture.expectContains(s, "* Bash"); // mono icon_act="*"
+    try capture.expectContains(s, "\\  alpha"); // mono gutter="\"
+    try capture.expectContains(s, "     beta"); // 续行 5 空格
+    try testing.expect(std.mem.indexOf(u8, s, "⎿") == null); // 无 unicode 角符
+}
+
 
 
