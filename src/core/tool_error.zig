@@ -28,6 +28,7 @@ pub const Code = enum {
     file_not_found,
     multiple_matches,
     string_not_found,
+    no_op_edit,
     other,
 
     pub fn name(self: Code) []const u8 {
@@ -46,6 +47,7 @@ pub const Code = enum {
             .file_not_found => "file_not_found",
             .multiple_matches => "multiple_matches",
             .string_not_found => "string_not_found",
+            .no_op_edit => "no_op_edit",
             .other => "other",
         };
     }
@@ -118,6 +120,7 @@ const ERROR_MAP = [_]ErrorSpec{
     .{ .name = "FileNotFound", .code = .file_not_found, .category = .user_error, .recoverable = true },
     .{ .name = "MultipleMatches", .code = .multiple_matches, .category = .user_error, .recoverable = true },
     .{ .name = "StringNotFound", .code = .string_not_found, .category = .user_error, .recoverable = true },
+    .{ .name = "NoOpEdit", .code = .no_op_edit, .category = .user_error, .recoverable = true },
     // invalid_args 的 error 名字比较多（MissingPath/EmptyPath/InvalidOffset 等），
     // 先列 code=invalid_args 的部分，查询时用 hasAny 辅助而非表中枚举全部
 };

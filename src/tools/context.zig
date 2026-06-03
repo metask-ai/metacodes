@@ -26,6 +26,10 @@ const DynRegistry = @import("dynamic.zig").DynRegistry;
 pub const ToolContext = struct {
     allocator: std.mem.Allocator,
     abort: ?*const AbortSignal = null,
+    /// 工具抛错时可选的富文本 detail:工具在 `return error.X` 前写 `*error_detail = msg`,
+    /// tool_exec 读到后用它替代通用的 "<tool> failed with X" 作为模型可见 detail。
+    /// msg 用 ctx.allocator 分配(errorToJson 会拷贝,arena 释放前读取安全)。null = 不支持。
+    error_detail: ?*?[]const u8 = null,
     /// ReadState 表：Read 成功后会 record，Write/Edit 入口查 get 做 must-read-first 校验。
     /// 单元测试可用 `simple` 构造跳过（无校验）。
     read_state: ?*ReadState = null,

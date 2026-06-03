@@ -49,13 +49,19 @@ fn runJob(job: *Job) void {
     defer arena.deinit();
     var job_ctx = job.ctx.*;
     job_ctx.allocator = arena.allocator();
+    // 富错误 detail 槽:工具可在抛错前写入,替代通用 "X failed with Y"。
+    var err_detail: ?[]const u8 = null;
+    job_ctx.error_detail = &err_detail;
 
     log.infoId("agent", job.rid, "tool.exec start(par) name={s} id={s}", .{ s.name, s.id });
     const r = tools_mod.dispatch(&job_ctx, s.name, s.input) catch |err| {
         const code = if (err == error.UnknownTool) "UnknownTool" else @errorName(err);
         const tool_error = @import("tool_error.zig");
-        // 错误 json 用父 allocator(逃逸 arena)。
-        const ej = tool_error.errorToJson(code, "{s} failed with {s}", .{ s.name, @errorName(err) }, job.parent_allocator) catch null;
+        // 错误 json 用父 allocator(逃逸 arena)。工具填了 detail 用之,否则通用文案。
+        const ej = if (err_detail) |d|
+            tool_error.errorToJson(code, "{s}", .{d}, job.parent_allocator) catch null
+        else
+            tool_error.errorToJson(code, "{s} failed with {s}", .{ s.name, @errorName(err) }, job.parent_allocator) catch null;
         s.content = ej;
         s.is_error = true;
         s.elapsed_ms = @intCast(@max(util_time.nowMs() - t_start, 0));

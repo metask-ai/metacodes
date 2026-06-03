@@ -34,6 +34,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const new_unesc = try util_json.unescapeString(new_raw, allocator);
     defer allocator.free(new_unesc);
 
+    // #1 no-op 拒绝(对齐 cc 错误码1):old==new 改了等于没改,空 diff,白费一轮。
+    if (std.mem.eql(u8, old_unesc, new_unesc)) {
+        setDetail(ctx, allocator, "Edit is a no-op: old_string and new_string are identical. Provide a different new_string.", .{});
+        return error.NoOpEdit;
+    }
+
     // 处理 Read 注入的 "%6d\t" 行号前缀：模型可能原样复制。strip 后作为 fallback 匹配。
     const old_stripped = try stripLineNumberPrefix(old_unesc, allocator);
     defer allocator.free(old_stripped);
@@ -65,6 +71,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             try nc.appendSlice(allocator, original[range.end..]);
             return try finalizeWrite(ctx, allocator, file_path, original, nc.items, old_raw, new_raw);
         }
+        setDetail(ctx, allocator, "{s}", .{notFoundDetail(original, old_unesc)});
         return error.StringNotFound;
     }
     const old_string = if (use_stripped) old_stripped else old_unesc;
@@ -148,6 +155,72 @@ fn finalizeWrite(
     try std.json.Stringify.encodeJsonString(git_diff, .{}, &out.writer);
     try out.writer.writeByte('}');
     return try out.toOwnedSlice();
+}
+
+/// 写入工具富错误 detail(经 ctx.error_detail 通道传给模型)。无通道则静默。
+/// msg 用 ctx.allocator 分配——errorToJson 会拷贝,arena 释放前读取安全。
+fn setDetail(ctx: *const ToolContext, allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) void {
+    const slot = ctx.error_detail orelse return;
+    slot.* = std.fmt.allocPrint(allocator, fmt, args) catch null;
+}
+
+/// #2 not-found 诊断:给模型可操作线索而非干巴巴 "not found"。返回静态字符串
+/// (setDetail 会拷贝)。诊断顺序:空白差异 → 首行在但块不在 → 通用。
+fn notFoundDetail(original: []const u8, old_string: []const u8) []const u8 {
+    // ① 空白归一后能匹配 → 多半是缩进/行尾空白差异。
+    if (whitespaceInsensitiveContains(original, old_string)) {
+        return "old_string not found exactly, but a whitespace-insensitive match exists — the indentation or trailing whitespace differs. Re-Read the file and copy the exact bytes (tabs vs spaces, leading indent).";
+    }
+    // ② old_string 首个非空行在文件里出现,但整块没匹配 → 周边行/缩进对不上。
+    const first = firstNonBlankLine(old_string);
+    if (first.len > 0 and std.mem.indexOf(u8, original, first) != null) {
+        return "old_string not found as a block, though its first line appears in the file — the following lines or their indentation don't match. Re-Read the surrounding lines and copy them verbatim.";
+    }
+    // ③ 通用:压根不在。
+    return "old_string not found in the file. Re-Read the file to get its exact current content; it may have changed or the text may never have existed.";
+}
+
+/// 去掉所有 ASCII 空白(空格/tab/CR/LF)后,original 是否含 old_string。
+/// 用于判断"仅空白差异"。线性扫描,O(n·m) 最坏但 old_string 通常短。
+fn whitespaceInsensitiveContains(original: []const u8, old_string: []const u8) bool {
+    if (old_string.len == 0) return false;
+    var oi: usize = 0;
+    while (oi < original.len) : (oi += 1) {
+        if (matchSkippingWs(original, oi, old_string)) return true;
+    }
+    return false;
+}
+
+fn isWs(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\r' or c == '\n';
+}
+
+/// 从 original[start] 起,跳过两侧空白逐字符匹配 needle。
+fn matchSkippingWs(original: []const u8, start: usize, needle: []const u8) bool {
+    var hi = start;
+    var ni: usize = 0;
+    while (ni < needle.len) {
+        while (ni < needle.len and isWs(needle[ni])) ni += 1;
+        while (hi < original.len and isWs(original[hi])) hi += 1;
+        if (ni >= needle.len) return true;
+        if (hi >= original.len) return false;
+        if (original[hi] != needle[ni]) return false;
+        hi += 1;
+        ni += 1;
+    }
+    return true;
+}
+
+/// 返回首个非空行(去前后空白)。无则空。
+fn firstNonBlankLine(s: []const u8) []const u8 {
+    var pos: usize = 0;
+    while (pos < s.len) {
+        const eol = std.mem.indexOfScalarPos(u8, s, pos, '\n') orelse s.len;
+        const line = std.mem.trim(u8, s[pos..eol], " \t\r");
+        if (line.len > 0) return line;
+        pos = eol + 1;
+    }
+    return "";
 }
 
 /// Edit 文件大小上限（1 GiB）：防止误传巨型文件把内存读爆。
@@ -440,6 +513,62 @@ test "findSmartQuote matches straight needle against curly haystack" {
 
 test "findSmartQuote returns null when no match" {
     try std.testing.expect(findSmartQuote("plain text", "\"x\"") == null);
+}
+
+test "EditTool old==new 拒绝(NoOpEdit)+ detail" {
+    const a = std.testing.allocator;
+    const path = "/tmp/cc-zig-edit-noop.txt";
+    defer _ = std.c.unlink(path);
+    const write = @import("write.zig");
+    var rs = @import("../core/read_state.zig").ReadState.init(a);
+    defer rs.deinit();
+    var detail: ?[]const u8 = null;
+    const ctx = ToolContext{ .allocator = a, .read_state = &rs, .error_detail = &detail };
+    a.free(try write.execute(&ctx, "{\"path\":\"/tmp/cc-zig-edit-noop.txt\",\"content\":\"abc\"}"));
+    // old==new → NoOpEdit,且 detail 被填。
+    try std.testing.expectError(error.NoOpEdit, execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-noop.txt\",\"old_string\":\"abc\",\"new_string\":\"abc\"}"));
+    try std.testing.expect(detail != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.?, "no-op") != null);
+    if (detail) |d| a.free(d);
+}
+
+test "EditTool not-found 诊断:仅空白差异提示" {
+    const a = std.testing.allocator;
+    const path = "/tmp/cc-zig-edit-wsdiff.txt";
+    defer _ = std.c.unlink(path);
+    const write = @import("write.zig");
+    var rs = @import("../core/read_state.zig").ReadState.init(a);
+    defer rs.deinit();
+    var detail: ?[]const u8 = null;
+    const ctx = ToolContext{ .allocator = a, .read_state = &rs, .error_detail = &detail };
+    // 文件用 tab 缩进;old_string 用空格缩进 → 仅空白差异。
+    a.free(try write.execute(&ctx, "{\"path\":\"/tmp/cc-zig-edit-wsdiff.txt\",\"content\":\"\\tfoo()\"}"));
+    const read = @import("read.zig");
+    a.free(try read.execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-wsdiff.txt\"}"));
+    try std.testing.expectError(error.StringNotFound, execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-wsdiff.txt\",\"old_string\":\"    foo()\",\"new_string\":\"    bar()\"}"));
+    try std.testing.expect(detail != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.?, "whitespace") != null);
+    if (detail) |d| a.free(d);
+}
+
+test "notFoundDetail: 三档诊断" {
+    // ① 仅空白差异。
+    try std.testing.expect(std.mem.indexOf(u8, notFoundDetail("\tfoo()\n", "    foo()"), "whitespace") != null);
+    // ② 首行在但块不在。
+    try std.testing.expect(std.mem.indexOf(u8, notFoundDetail("alpha\nXXX\n", "alpha\nbeta"), "first line") != null);
+    // ③ 通用。
+    try std.testing.expect(std.mem.indexOf(u8, notFoundDetail("nothing here", "zzz"), "not found") != null);
+}
+
+test "whitespaceInsensitiveContains" {
+    try std.testing.expect(whitespaceInsensitiveContains("\tfoo ( )", "foo()"));
+    try std.testing.expect(whitespaceInsensitiveContains("a b c", "abc"));
+    try std.testing.expect(!whitespaceInsensitiveContains("abc", "xyz"));
+}
+
+test "firstNonBlankLine" {
+    try std.testing.expectEqualStrings("hi", firstNonBlankLine("  \n  hi  \nbye"));
+    try std.testing.expectEqualStrings("", firstNonBlankLine("   \n\t\n"));
 }
 
 test "EditTool smart-quote fallback replaces curly with straight" {

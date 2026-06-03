@@ -190,3 +190,47 @@ test "L2 smoke: TaskCreate → TaskList → TaskUpdate(完整 CRUD 经 dispatch)
     defer a.free(u);
     try std.testing.expect(std.mem.indexOf(u8, u, "\"error\"") == null);
 }
+
+test "L2 e2e: Edit no-op 经 executeSlots → 富 detail 到达 slot(code=no_op_edit)" {
+    const a = std.testing.allocator;
+    const tool_exec = cc.tool_exec;
+    const path = "/tmp/cc-smoke-edit-noop-e2e.txt";
+    defer _ = std.c.unlink(path);
+    var ctx = simpleCtx(a);
+    a.free(try tools.dispatch(&ctx, "Write", "{\"file_path\":\"/tmp/cc-smoke-edit-noop-e2e.txt\",\"content\":\"abc\"}"));
+
+    // 经 executeSlots(真正接 error_detail 通道的路径,非 dispatch 直调)。
+    var slots = [_]tool_exec.Slot{
+        .{ .decision = .run, .name = "Edit", .id = "e0", .input = "{\"file_path\":\"/tmp/cc-smoke-edit-noop-e2e.txt\",\"old_string\":\"abc\",\"new_string\":\"abc\"}" },
+    };
+    tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
+    defer if (slots[0].content) |c| a.free(c);
+
+    try std.testing.expect(slots[0].is_error);
+    const content = slots[0].content.?;
+    // 富 detail 经 errorToJson 进 slot:code=no_op_edit + 可操作 detail,而非通用 "Edit failed with NoOpEdit"。
+    try std.testing.expect(std.mem.indexOf(u8, content, "no_op_edit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "no-op") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "failed with") == null);
+}
+
+test "L2 e2e: Edit not-found 经 executeSlots → 富诊断到达 slot" {
+    const a = std.testing.allocator;
+    const tool_exec = cc.tool_exec;
+    const path = "/tmp/cc-smoke-edit-nf-e2e.txt";
+    defer _ = std.c.unlink(path);
+    var ctx = simpleCtx(a);
+    a.free(try tools.dispatch(&ctx, "Write", "{\"file_path\":\"/tmp/cc-smoke-edit-nf-e2e.txt\",\"content\":\"hello world\"}"));
+
+    var slots = [_]tool_exec.Slot{
+        .{ .decision = .run, .name = "Edit", .id = "e0", .input = "{\"file_path\":\"/tmp/cc-smoke-edit-nf-e2e.txt\",\"old_string\":\"nonexistent\",\"new_string\":\"x\"}" },
+    };
+    tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
+    defer if (slots[0].content) |c| a.free(c);
+
+    try std.testing.expect(slots[0].is_error);
+    const content = slots[0].content.?;
+    try std.testing.expect(std.mem.indexOf(u8, content, "string_not_found") != null);
+    // 诊断给了"Re-Read"可操作建议,而非干巴巴 "failed with"。
+    try std.testing.expect(std.mem.indexOf(u8, content, "Re-Read") != null);
+}
