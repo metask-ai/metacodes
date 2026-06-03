@@ -298,7 +298,7 @@ pub fn run(
             const model_for_req = opts.model_override orelse api_client.model;
             cache_detector.recordRequest(opts.system_prompt orelse "", tbuf[0..8], model_for_req);
         }
-        var stream = api_client.sendMessageStreamFull(api_messages.items, opts.system_prompt, effective_tool_defs, opts.abort, opts.model_override) catch |err| {
+        var stream = api_client.sendMessageStreamFull(api_messages.items, opts.system_prompt, effective_tool_defs, opts.abort, opts.model_override, null) catch |err| {
             log.err("agent", "sendMessageStream failed turn={d}: {s}", .{ turns + 1, @errorName(err) });
             return .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls };
         };
@@ -359,6 +359,14 @@ pub fn run(
                         .name = tu.name,
                         .input = tu.input_json,
                     });
+                },
+                .web_search_result => |w| {
+                    // 主对话:照打 UI 装饰(⏺ Web Search ...),TUI 字节与旧版一致。
+                    // content_json(结构化结果)主对话不消费(仅 web_search.zig 子请求用)。
+                    try stdout_writer.print("{s}", .{w.ui_text});
+                    try assistant_text.appendSlice(allocator, w.ui_text);
+                    allocator.free(w.ui_text);
+                    allocator.free(w.content_json);
                 },
                 .usage => |u| {
                     if (opts.usage_sink) |sink| sink.add(u);

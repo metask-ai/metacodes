@@ -104,6 +104,18 @@ pub fn serializeMessagesRequest(req: MessagesRequest, allocator: std.mem.Allocat
         try serializeTools(tools, &result, allocator);
     }
 
+    // tool_choice:{"type":"auto"} | {"type":"tool","name":"web_search"} 等。
+    // 强制工具(forced tool use)由 web_search 子请求用,保证模型必发搜索。
+    if (req.tool_choice) |tc| {
+        try result.appendSlice(allocator, ",\"tool_choice\":{\"type\":");
+        try util_json.serializeString(tc.type, &result, allocator);
+        if (tc.name) |n| {
+            try result.appendSlice(allocator, ",\"name\":");
+            try util_json.serializeString(n, &result, allocator);
+        }
+        try result.append(allocator, '}');
+    }
+
     if (req.cache_control) |cc| {
         try result.appendSlice(allocator, ",\"cache_control\":{\"type\":");
         try util_json.serializeString(cc.type, &result, allocator);
@@ -360,6 +372,27 @@ test "serializeMessagesRequest with stream=true" {
     const body = try serializeMessagesRequest(req, std.testing.allocator);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+}
+
+test "serializeMessagesRequest with forced tool_choice" {
+    const msg = types.ApiMessage{ .role = .user, .content = &.{.{ .text = "hi" }} };
+    const req = MessagesRequest{
+        .model = "m",
+        .messages = &.{msg},
+        .tool_choice = .{ .type = "tool", .name = "web_search" },
+    };
+    const body = try serializeMessagesRequest(req, std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    // 端到端字节断言:声明的 tool_choice 字段真序列化进请求体(防"声明了未接线")。
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\":{\"type\":\"tool\",\"name\":\"web_search\"}") != null);
+}
+
+test "serializeMessagesRequest omits tool_choice when null" {
+    const msg = types.ApiMessage{ .role = .user, .content = &.{.{ .text = "hi" }} };
+    const req = MessagesRequest{ .model = "m", .messages = &.{msg} };
+    const body = try serializeMessagesRequest(req, std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tool_choice") == null);
 }
 
 test "serializeMessagesRequest with tool_use content" {

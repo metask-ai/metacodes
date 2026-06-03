@@ -1,18 +1,25 @@
-//! WebSearch:普通函数工具(对齐 mecode WebSearchHandler)。
+//! WebSearch:普通函数工具(对齐 cc WebSearchTool / mecode WebSearchHandler)。
 //!
 //! 根因背景:把 Anthropic server-tool 异形对象 `{"type":"web_search_...","name":"web_search"}`
 //! 直接放进主请求 tools 数组,会毒化 OpenAI-compat 后端(metask/MiniMax)的 function-calling
-//! 解析,模型退回 Bash(二分实证)。mecode 的解法:WebSearch 是普通 {name,desc,input_schema}
-//! 函数工具,真正搜索在**隔离子请求**里用 server tool 完成——server-tool 异形只出现在那个
-//! 单工具子请求里,不污染主对话工具集。
+//! 解析,模型退回 Bash(二分实证)。解法(对齐 cc/mecode):WebSearch 是普通函数工具,
+//! 真正搜索在**隔离子请求**里用 server tool 完成——异形只出现在那个单工具子请求,不污染
+//! 主对话工具集。子 agent 被异形毒化无所谓(它只干搜索这一件事)。
 //!
-//! execute:用 ctx.api_client 发一次性子请求(user=query + 仅 web_search server tool),
-//! drain 文本(EventIterator 已把 web_search_tool_result 渲染进文本流),返回给模型。
+//! 两阶段交互(对齐 cc makeOutputFromSearchResponse):子请求里模型发 server_tool_use →
+//! 后端回 web_search_tool_result(结构化结果块)→ 模型据此续写文本摘要。本 execute 收集:
+//!   - .web_search_result 事件的 content_json → title/url 链接(结构化结果)
+//!   - .text 事件 → 模型续写摘要
+//! 按 cc mapToolResultToToolResultBlockParam 格式化:query 头 + 摘要 + Links + REMINDER。
+//! 注:metask 后端常 content:[](不透传结果数组),此时结果全靠模型续写文本。
+//!
+//! tool_choice 强制 web_search(对齐 cc 弱模型路径):保证模型必发搜索而非闲聊。
 
 const std = @import("std");
 const common = @import("common.zig");
 const types = @import("../types.zig");
 const json_mod = @import("../json.zig");
+const api_stream = @import("../api/stream.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
@@ -28,18 +35,30 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         .input_schema = .{ .type = "object", .properties = null, .required = &.{} },
         .server_type = "web_search_20250305",
     }};
-    const msgs = [_]types.ApiMessage{.{ .role = .user, .content = &.{.{ .text = query }} }};
+    // prompt + system 对齐 cc WebSearchTool.call:
+    //   user = "Perform a web search for the query: <query>"
+    //   system = "You are an assistant for performing a web search tool use"
+    const search_prompt = try std.fmt.allocPrint(allocator, "Perform a web search for the query: {s}", .{query});
+    defer allocator.free(search_prompt);
+    const sys_prompt = "You are an assistant for performing a web search tool use";
+    const msgs = [_]types.ApiMessage{.{ .role = .user, .content = &.{.{ .text = search_prompt }} }};
 
-    var stream = client.sendMessageStreamFull(&msgs, null, &tools_one, ctx.abort, null) catch |err| {
+    // tool_choice 强制 web_search(对齐 cc 弱模型路径):保证模型必发搜索。
+    const tc = json_mod.ToolChoice{ .type = "tool", .name = "web_search" };
+
+    var stream = client.sendMessageStreamFull(&msgs, sys_prompt, &tools_one, ctx.abort, null, tc) catch |err| {
         setDetail(ctx, allocator, "web search request failed: {s}", .{@errorName(err)});
         return error.WebSearchFailed;
     };
     defer stream.deinit();
-    stream.user_query = query; // 让结果显示真实 query
+    stream.user_query = query; // 让 UI 装饰显示真实 query
 
-    // drain 文本(web_search 结果由 EventIterator 渲染进文本流)。
-    var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(allocator);
+    // 收集:模型续写摘要(model_text)+ 结构化结果链接(links)。
+    var model_text: std.ArrayList(u8) = .empty;
+    defer model_text.deinit(allocator);
+    var links: std.ArrayList(u8) = .empty;
+    defer links.deinit(allocator);
+
     while (true) {
         const ev = stream.next() catch |err| {
             setDetail(ctx, allocator, "web search stream error: {s}", .{@errorName(err)});
@@ -49,19 +68,40 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         switch (e) {
             .text => |t| {
                 defer allocator.free(t);
-                try out.appendSlice(allocator, t);
+                try model_text.appendSlice(allocator, t);
             },
-            // 子请求只带 server tool,不会有 client tool_use;其余事件(usage/done)无需处理。
+            .web_search_result => |w| {
+                defer allocator.free(w.ui_text); // 子请求不显示 UI 装饰
+                defer allocator.free(w.content_json);
+                // content_json 是原始结果数组(metask 常 "[]")。渲染成 `- title — url` 行。
+                const rendered = try api_stream.renderWebSearchResults(allocator, w.content_json);
+                defer allocator.free(rendered);
+                try links.appendSlice(allocator, rendered);
+            },
+            // 子请求只带 server tool,不会有 client tool_use;usage/done 无需处理。
             else => {},
         }
     }
 
-    const text = std.mem.trim(u8, out.items, " \t\r\n");
-    if (text.len == 0) {
-        return try std.fmt.allocPrint(allocator, "{{\"query\":\"{s}\",\"results\":\"no results\"}}", .{query});
+    const text = std.mem.trim(u8, model_text.items, " \t\r\n");
+    const link_text = std.mem.trim(u8, links.items, " \t\r\n");
+    // 空结果(模型既没续写摘要、后端也没透传结果)→ 对齐 cc/mecode no_results。
+    if (text.len == 0 and link_text.len == 0) {
+        return try std.fmt.allocPrint(allocator, "No search results found for: {s}", .{query});
     }
-    // 返回纯文本结果(已含渲染好的标题/URL 行)。
-    return try allocator.dupe(u8, text);
+
+    // 输出格式对齐 cc mapToolResultToToolResultBlockParam:
+    //   Web search results for query: "<q>"
+    //   <模型摘要>
+    //   <结构化链接行>
+    //   REMINDER: ...markdown hyperlinks.
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.print("Web search results for query: \"{s}\"\n\n", .{query});
+    if (text.len > 0) try out.writer.print("{s}\n\n", .{text});
+    if (link_text.len > 0) try out.writer.print("{s}\n\n", .{link_text});
+    try out.writer.writeAll("REMINDER: You MUST include the sources above in your response to the user using markdown hyperlinks.");
+    return try out.toOwnedSlice();
 }
 
 fn setDetail(ctx: *const ToolContext, allocator: std.mem.Allocator, comptime fmt: []const u8, a: anytype) void {

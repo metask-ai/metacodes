@@ -181,7 +181,7 @@ pub const Client = struct {
         tools: ?[]const json_mod.ToolDefinition,
         abort: ?*const AbortSignal,
     ) !StreamResponse {
-        return client.sendMessageStreamFull(messages, system, tools, abort, null);
+        return client.sendMessageStreamFull(messages, system, tools, abort, null, null);
     }
 
     /// 完整签名:支持 per-call model_override(subagent 用 def.zig 的 model 字段覆盖父 model)。
@@ -195,6 +195,7 @@ pub const Client = struct {
         tools: ?[]const json_mod.ToolDefinition,
         abort: ?*const AbortSignal,
         model_override: ?[]const u8,
+        tool_choice: ?json_mod.ToolChoice,
     ) !StreamResponse {
         const effective_model = model_override orelse client.model;
         const req_body = try json_mod.serializeMessagesRequest(.{
@@ -204,6 +205,7 @@ pub const Client = struct {
             .system = system,
             .stream = true,
             .tools = tools,
+            .tool_choice = tool_choice,
         }, client.allocator);
         // doRequest 内部 sendBodyComplete 是同步全发,返回后 body 即可释放(stream/error 都)。
         defer client.allocator.free(req_body);
@@ -492,6 +494,7 @@ pub const StreamResponse = struct {
         return switch (ev) {
             .text_delta => |t| StreamEvent{ .text = t },
             .tool_use_start => |tu| StreamEvent{ .tool_use_start = tu },
+            .web_search_result => |w| StreamEvent{ .web_search_result = w },
             .usage => |u| StreamEvent{ .usage = u },
             .done => blk: {
                 self.done = true;
@@ -504,6 +507,7 @@ pub const StreamResponse = struct {
 pub const StreamEvent = union(enum) {
     text: []u8,
     tool_use_start: json_mod.ToolUseResult,
+    web_search_result: api_stream.WebSearchResultEvent,
     usage: api_stream.UsageDelta,
     done: void,
 };

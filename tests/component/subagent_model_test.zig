@@ -88,7 +88,7 @@ test "L2 GAP: subagent 期望用 haiku 但当前用父 model" {
 
     const empty_messages: []const cc.types_mod.ApiMessage = &.{};
     // Phase 2 修复:用 sendMessageStreamFull 传 model_override
-    var resp = client.sendMessageStreamFull(empty_messages, null, null, null, "claude-3-5-haiku-20241022") catch return error.SkipZigTest;
+    var resp = client.sendMessageStreamFull(empty_messages, null, null, null, "claude-3-5-haiku-20241022", null) catch return error.SkipZigTest;
     drainStream(&resp) catch {};
     resp.deinit();
 

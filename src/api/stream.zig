@@ -591,6 +591,12 @@ pub const Event = union(enum) {
     /// 来自 content_block_start 的工具调用初始信息；内部字段借用自 reader buffer
     /// —— 调用方若要跨 next() 保留，必须 dupe
     tool_use_start: ToolUseResult,
+    /// web_search_tool_result 块(server tool 两阶段的第二段)。
+    /// - ui_text:`⏺ Web Search(...) ⎿ Did 1 search` UI 装饰(主对话直接打印,对齐 cc TUI)。
+    /// - content_json:web_search_tool_result 的原始 content 数组(title/url);
+    ///   子请求(web_search.zig)据此做结构化解析。注:metask 后端常 `[]`(不透传)。
+    /// 两字段都 owned，caller free。
+    web_search_result: WebSearchResultEvent,
     /// 用量统计（来自 message_start 或 message_delta 的 usage 字段）；数值不拥有资源
     usage: UsageDelta,
     /// 结束信号
@@ -604,9 +610,18 @@ pub const Event = union(enum) {
                 allocator.free(tu.name);
                 allocator.free(tu.input_json);
             },
+            .web_search_result => |w| {
+                allocator.free(w.ui_text);
+                allocator.free(w.content_json);
+            },
             .usage, .done => {},
         }
     }
+};
+
+pub const WebSearchResultEvent = struct {
+    ui_text: []u8, // owned
+    content_json: []u8, // owned(原始 content 数组字符串,可能为 "[]")
 };
 
 pub const UsageDelta = struct {
@@ -851,13 +866,16 @@ pub const EventIterator = struct {
                         self.ws_query.clearRetainingCapacity();
                         continue;
                     }
-                    // 服务端工具结果（web_search_tool_result）：本次搜索结束 → emit 一组
-                    // ⏺ Web Search("query") / ⎿ Did 1 search in Xs(per-search,对齐 cc 真实表现)。
+                    // 服务端工具结果（web_search_tool_result）：本次搜索结束 → emit
+                    // web_search_result 事件:ui_text(⏺ Web Search 装饰,主对话照打,TUI 不变)
+                    // + content_json(原始结果数组,子请求据此结构化解析;metask 常 `[]`)。
                     if (extractServerToolResult(data)) |str| {
                         self.logInfo("web_search_tool_result content_len={d}", .{str.content_array_raw.len});
                         self.ws_in_server_tool = false;
                         const group = try self.webSearchGroup(allocator);
-                        return Event{ .text_delta = group };
+                        errdefer allocator.free(group);
+                        const content = try allocator.dupe(u8, str.content_array_raw);
+                        return Event{ .web_search_result = .{ .ui_text = group, .content_json = content } };
                     }
                     // 其它 content_block_start（text block 等）——跳过
                     continue;
@@ -1004,6 +1022,29 @@ test "EventIterator: text_delta event" {
     try std.testing.expectEqualStrings("hi", ev.text_delta);
 }
 
+test "EventIterator: web_search_tool_result → web_search_result 事件(含 content)" {
+    const a = std.testing.allocator;
+    // content_block_start 携带 web_search_tool_result + 非空 content 数组(title/url)。
+    const sse = "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srv_1\",\"content\":[{\"type\":\"web_search_result\",\"title\":\"Zig\",\"url\":\"https://ziglang.org\"}]}}\n";
+    var reader = std.Io.Reader.fixed(sse);
+    var it = EventIterator.init(&reader);
+    defer it.deinit(a);
+    const ev = (try it.next(a)).?;
+    defer ev.deinit(a);
+    // 是 web_search_result 变体,不是 text_delta。
+    try std.testing.expect(ev == .web_search_result);
+    const w = ev.web_search_result;
+    // ui_text:UI 装饰(⏺ Web Search),主对话照打。
+    try std.testing.expect(std.mem.indexOf(u8, w.ui_text, "Web Search") != null);
+    // content_json:原始结果数组,含 title/url(子请求据此结构化解析)。
+    try std.testing.expect(std.mem.indexOf(u8, w.content_json, "ziglang.org") != null);
+    // renderWebSearchResults 能从 content_json 渲染出结果行。
+    const rendered = try renderWebSearchResults(a, w.content_json);
+    defer a.free(rendered);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "https://ziglang.org") != null);
+}
+
 test "EventIterator: 超长 SSE 行(> reader buffer)不再 StreamTooLong" {
     // 修复 Bug 3:大 input_json_delta/大 text 把一整条 data 行推成 >buffer。
     // 用 Limited reader 给一个很小的 buffer(64B),构造一条远超它的行,
@@ -1058,6 +1099,7 @@ test "EventIterator: web_search 优先显示用户原始 query(对齐 mecode,pro
     while (try it.next(std.testing.allocator)) |ev| {
         defer ev.deinit(std.testing.allocator);
         if (ev == .text_delta) try all.appendSlice(std.testing.allocator, ev.text_delta);
+        if (ev == .web_search_result) try all.appendSlice(std.testing.allocator, ev.web_search_result.ui_text);
         if (ev == .done) break;
     }
     const s = all.items;
@@ -1088,6 +1130,7 @@ test "EventIterator: web_search per-search 组(对齐 cc:⏺ Web Search + ⎿ Di
     while (try it.next(std.testing.allocator)) |ev| {
         defer ev.deinit(std.testing.allocator);
         if (ev == .text_delta) try all.appendSlice(std.testing.allocator, ev.text_delta);
+        if (ev == .web_search_result) try all.appendSlice(std.testing.allocator, ev.web_search_result.ui_text);
         if (ev == .done) break;
     }
     const s = all.items;
@@ -1117,6 +1160,7 @@ test "EventIterator: 两次搜索 → 两组各 Did 1 search(per-search 不累�
     while (try it.next(std.testing.allocator)) |ev| {
         defer ev.deinit(std.testing.allocator);
         if (ev == .text_delta) try all.appendSlice(std.testing.allocator, ev.text_delta);
+        if (ev == .web_search_result) try all.appendSlice(std.testing.allocator, ev.web_search_result.ui_text);
         if (ev == .done) break;
     }
     // 两组 ⏺ Web Search + 两个 Did 1 search(per-search,不合并成 Did 2)
@@ -1403,6 +1447,7 @@ test "EventIterator: 真后端形态(空数组 + 占位 query)不打噪音" {
     while (try it.next(std.testing.allocator)) |ev| {
         defer ev.deinit(std.testing.allocator);
         if (ev == .text_delta) try all.appendSlice(std.testing.allocator, ev.text_delta);
+        if (ev == .web_search_result) try all.appendSlice(std.testing.allocator, ev.web_search_result.ui_text);
         if (ev == .done) break;
     }
     const s = all.items;
