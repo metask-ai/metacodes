@@ -789,14 +789,19 @@ pub const RenderRegion = struct {
             @intCast(@max(util_time.nowMs() - self.tool_start_ms, 0))
         else
             0;
-        _ = StatusBar.renderGenerating(w, app, self.theme, self.use_unicode, self.spinner_frame, self.verb, elapsed, cur_tool, tool_ms, inner_w) catch {};
+        // hasProgressCard 工具(WebSearch)由下方动态卡显示,spinner 行**不**显工具段
+        // (对齐 cc:底部 spinner 不显工具名)→ 传空 cur_tool。普通工具仍传(转圈带名)。
+        const tool_card = @import("widget/tool_card.zig");
+        const has_card = self.current_tool_len > 0 and tool_card.hasProgressCard(cur_tool);
+        const spinner_tool: []const u8 = if (has_card) "" else cur_tool;
+        _ = StatusBar.renderGenerating(w, app, self.theme, self.use_unicode, self.spinner_frame, self.verb, elapsed, spinner_tool, if (has_card) 0 else tool_ms, inner_w) catch {};
         R += 1;
         w.writeAll("\r\n") catch {};
 
-        // -- 执行中工具卡(对齐 cc:有 progress 第二行的工具,如 WebSearch,在动态区
-        //    渲染可刷新双段卡 ⏺ <Tool> / ⎿ <progress>;随 tick 重画)。普通工具无 progress
-        //    → 不画(仍只走上方 spinner 段)。--
-        if (self.current_tool_len > 0 and self.current_tool_progress_len > 0) {
+        // -- 执行中工具卡(对齐 cc 单一工具卡:hasProgressCard 工具如 WebSearch,执行中即在
+        //    动态区显双段卡 ⏺ <Tool> / ⎿ <progress>;随 tick 重画)。progress 未到时第二行
+        //    用 Searching… 占位(避免先 spinner、后冒卡的跳变)。普通工具不画。--
+        if (has_card) {
             R += self.drawToolProgressCard(w, cur_tool);
         }
 
@@ -889,8 +894,12 @@ pub const RenderRegion = struct {
         rows += 1;
         w.writeAll("\r\n") catch {};
         // 第 2 行:  ⎿ <progress>(Searching: q / Found N results;随 tick 刷新)。
+        // progress 未到(刚开始搜索)→ 用 "Searching…" 占位,对齐 cc 执行中即显第二行。
         w.writeAll(ansi.clear.line) catch {};
-        const prog = self.current_tool_progress[0..self.current_tool_progress_len];
+        const prog: []const u8 = if (self.current_tool_progress_len > 0)
+            self.current_tool_progress[0..self.current_tool_progress_len]
+        else
+            "Searching…";
         w.print("  {s}{s}{s} ", .{ th.dim, th.gutter, th.reset }) catch {};
         writeTruncatedWidth(w, prog, inner_w);
         w.writeAll(th.reset) catch {};

@@ -81,6 +81,13 @@ pub fn displayName(tool_name: []const u8) []const u8 {
     return tool_name;
 }
 
+/// 该工具执行中是否有"可重绘 progress 卡"(对齐 cc 单一工具卡:执行中由动态区那张卡
+/// 独占显示)。返 true 的工具:不走 renderStart→滚动历史、不在底部 spinner 显工具段,
+/// 改由 render_region.drawToolProgressCard 在动态区显示双段卡。当前仅 WebSearch。
+pub fn hasProgressCard(tool_name: []const u8) bool {
+    return std.mem.eql(u8, tool_name, "WebSearch");
+}
+
 /// 工具开始(无状态符,只有 ⏺ tool_name + 命令预览)。对齐 cc BLACK_CIRCLE bullet。
 /// caller free。
 pub fn renderStart(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, preview_args: []const u8) ![]u8 {
@@ -1319,6 +1326,10 @@ test "WebSearch 卡片:display name 标题 + Did N searches 完成 + 中断行" 
     // displayName 映射。
     try testing.expectEqualStrings("Web Search", displayName("WebSearch"));
     try testing.expectEqualStrings("Bash", displayName("Bash"));
+    // hasProgressCard:仅 WebSearch(执行中走单一动态卡,不重复显示)。
+    try testing.expect(hasProgressCard("WebSearch"));
+    try testing.expect(!hasProgressCard("Bash"));
+    try testing.expect(!hasProgressCard("WebFetch"));
 
     // 起始卡:标题用 "Web Search"(带空格)+ 预览 "query"。
     const start = try renderStart(a, th, "WebSearch", "{\"query\":\"zig news\"}");

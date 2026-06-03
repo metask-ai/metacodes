@@ -589,6 +589,9 @@ pub fn run(
                     if (s.decision != .run) continue;
                     if (tool_card.resultRenderMode(s.name) == .hidden) continue;
                     if (first_tool == null) first_tool = s.name;
+                    // hasProgressCard 工具(WebSearch):执行中由动态区可重绘卡独占显示,
+                    // 不往滚动历史打起始卡(否则与动态卡重复,对齐 cc 单一工具卡)。
+                    if (tool_card.hasProgressCard(s.name)) continue;
                     if (tool_card.renderStart(allocator, th.*, s.name, s.input) catch null) |card| {
                         defer allocator.free(card);
                         stdout_writer.print("{s}", .{card}) catch {};
