@@ -371,7 +371,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                     &app.api_client,
                     app.tool_defs,
                     &app.permission_ctx,
-                    .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir() },
+                    .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .tool_render_theme = &app.theme },
                     rw,
                     allocator,
                 );
@@ -381,7 +381,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                     &app.api_client,
                     app.tool_defs,
                     &app.permission_ctx,
-                    .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir() },
+                    .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .tool_render_theme = &app.theme },
                     &writer,
                     allocator,
                 );
@@ -403,6 +403,12 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
 
         // 每轮结束 flush transcript（含错误 / abort 路径；只要有变动都想落盘）
         app.persistTranscript();
+
+        // 工具可能改了权限模式(EnterPlanMode/ExitPlanMode 写 permission_ctx.mode)。
+        // footer/border 读的是 config.permission_mode → 回同步,否则 TUI 不反映 plan 模式。
+        if (app.config.permission_mode != app.permission_ctx.mode) {
+            app.config.permission_mode = app.permission_ctx.mode;
+        }
 
         if (result.stop_reason == .aborted) {
             std.debug.print("\x1b[33m^C (cancelled)\x1b[0m\n", .{});
@@ -1712,7 +1718,7 @@ fn handleSkillInvocation(app: *app_mod.App, allocator: std.mem.Allocator, rest: 
         &app.api_client,
         app.tool_defs,
         &app.permission_ctx,
-        .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir() },
+        .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .tool_render_theme = &app.theme },
         &writer,
         allocator,
     ) catch |err| {
@@ -1857,30 +1863,48 @@ fn killAllBackground(app: *app_mod.App) usize {
     return killed;
 }
 
-/// Ctrl+T:打印任务列表(最多 5 个,带状态图标)。覆盖到 prompt 上方。
+/// Ctrl+T:打印任务列表(最多 5 个,带状态图标)+ 后台 subagent job 列表。覆盖到 prompt 上方。
 fn printTaskList(app: *app_mod.App) void {
     const tasks = app.tasks.tasks.items;
     std.debug.print("\r\x1b[2K", .{}); // 清当前行
     if (tasks.len == 0) {
         std.debug.print("\x1b[2m(no tasks)\x1b[0m\n", .{});
-        return;
-    }
-    std.debug.print("\x1b[1mTasks ({d}):\x1b[0m\n", .{tasks.len});
-    var shown: usize = 0;
-    for (tasks) |t| {
-        if (t.status == .deleted) continue;
-        if (shown >= 5) {
-            std.debug.print("  \x1b[2m... more\x1b[0m\n", .{});
-            break;
+    } else {
+        std.debug.print("\x1b[1mTasks ({d}):\x1b[0m\n", .{tasks.len});
+        var shown: usize = 0;
+        for (tasks) |t| {
+            if (t.status == .deleted) continue;
+            if (shown >= 5) {
+                std.debug.print("  \x1b[2m... more\x1b[0m\n", .{});
+                break;
+            }
+            const icon = switch (t.status) {
+                .pending => "\x1b[90m○\x1b[0m", // 灰圈
+                .in_progress => "\x1b[33m◐\x1b[0m", // 黄半
+                .completed => "\x1b[32m●\x1b[0m", // 绿实
+                .deleted => unreachable,
+            };
+            std.debug.print("  {s} {s}\n", .{ icon, t.subject });
+            shown += 1;
         }
-        const icon = switch (t.status) {
-            .pending => "\x1b[90m○\x1b[0m", // 灰圈
-            .in_progress => "\x1b[33m◐\x1b[0m", // 黄半
-            .completed => "\x1b[32m●\x1b[0m", // 绿实
-            .deleted => unreachable,
-        };
-        std.debug.print("  {s} {s}\n", .{ icon, t.subject });
-        shown += 1;
+    }
+
+    // 后台 subagent jobs(独立于 todo 任务):running/done/failed/killed。
+    if (app.agent_jobs) |*reg| {
+        const snaps = reg.snapshotJobs(app.allocator) catch return;
+        defer @import("../core/agent_job_registry.zig").AgentJobRegistry.freeSnapshots(app.allocator, snaps);
+        if (snaps.len == 0) return;
+        std.debug.print("\x1b[1mSubagents ({d}):\x1b[0m\n", .{snaps.len});
+        for (snaps) |s| {
+            const icon = switch (s.status) {
+                .running => "\x1b[33m◐\x1b[0m", // 黄半:跑
+                .done => "\x1b[32m●\x1b[0m", // 绿实:完成
+                .failed => "\x1b[31m✗\x1b[0m", // 红叉:失败
+                .killed => "\x1b[90m○\x1b[0m", // 灰:终止
+            };
+            const label = if (s.desc.len > 0) s.desc else s.id;
+            std.debug.print("  {s} {s} \x1b[2m({d} turns, {d} tool calls)\x1b[0m\n", .{ icon, label, s.turns, s.tool_calls });
+        }
     }
 }
 

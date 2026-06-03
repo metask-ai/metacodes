@@ -129,6 +129,14 @@ pub const Options = struct {
     mcp_sessions: ?*const []@import("../app.zig").McpSessionEntry = null,
     /// Cron registry(CronCreate/Delete/List 用)。
     cron_registry: ?*@import("cron_registry.zig").CronRegistry = null,
+    /// 实时工具卡渲染主题(REPL 用):非 null 时,每个工具执行后把结果经
+    /// tool_card.renderResult 渲染到 stdout_writer(Edit diff 着色 / 搜索摘要 / Read 摘要)。
+    /// null(headless/单测)→ 不渲染,保持纯净输出。
+    tool_render_theme: ?*const @import("../repl/tui/theme.zig").Theme = null,
+    /// 是否给 assistant 流式文本加 ANSI 着色(\x1b[32m…)。前台交互 REPL = true;
+    /// 后台 subagent(输出经 SinkWriter 进可查询缓冲)/headless = false,否则 final_text
+    /// 会混入 \x1b[32m 等控制码。
+    colorize: bool = true,
 };
 
 /// usage 回调接口：stream 每次吐 usage event 时调用。
@@ -164,8 +172,9 @@ pub fn run(
     var continuations: u32 = 0;
     const MAX_CONTINUATIONS: u32 = 3;
 
-    // 工具错误熔断:跟踪上一次工具失败的签名 + 连续相同次数(跨 turn 累积)。
-    // 任意工具成功、或换了工具/错误码 → 重置。连续相同达 MAX_SAME_TOOL_ERROR → 熔断。
+    // 工具错误熔断:**按 turn** 跟踪"同错轮"。本轮有错、无成功、且本轮所有 error 同签名
+    // → 算一个"同错轮";连续 MAX_SAME_TOOL_ERROR 个同签名同错轮 → 熔断。任意成功/换签名
+    // /无错 → 重置。判定在 6d 内层循环**之后**(避免单轮多工具同错被误算多次)。
     var last_err_sig: ?ToolErrSig = null;
     var same_err_count: u32 = 0;
 
@@ -245,6 +254,10 @@ pub fn run(
         };
         defer stream.deinit();
 
+        // web_search 显示用:把最近一条用户文本作为真实 query 透传给 stream(对齐 mecode——
+        // provider 返回的 web_search query 常是占位符,优先显示用户原始输入)。
+        stream.user_query = latestUserText(conversation);
+
         const rid = stream.id;
         log.infoId("agent", rid, "stream opened, reading events", .{});
 
@@ -260,7 +273,7 @@ pub fn run(
         var tool_uses = std.ArrayList(msg.ToolUse).empty;
         defer tool_uses.deinit(allocator);
 
-        try stdout_writer.print("\x1b[32m", .{});
+        if (opts.colorize) try stdout_writer.print("\x1b[32m", .{});
         var aborted_during_stream = false;
         var stream_error = false;
         while (true) {
@@ -307,7 +320,11 @@ pub fn run(
                 .done => {},
             }
         }
-        try stdout_writer.print("\x1b[0m\n", .{});
+        if (opts.colorize) {
+            try stdout_writer.print("\x1b[0m\n", .{});
+        } else {
+            try stdout_writer.print("\n", .{});
+        }
 
         // 抓本轮 API 报告的 stop_reason(stream.deinit 前读;defer 在 turn 末才执行)
         const turn_stop_reason = stream.stopReason();
@@ -478,30 +495,63 @@ pub fn run(
         // 6c. 分批并发执行(denied 的不动,run 的填 content)。
         tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
 
-        // 6d. 按原顺序回填 result_blocks + 熔断器(同错连续判定,保持原语义)。
+        // 6d. 按原顺序回填 result_blocks。熔断判定**不在此内层循环累加**——否则单轮内
+        // 多个工具调用返回同一错误(如 subagent 第一轮发 3 个 TaskCreate 全失败)会在一轮内
+        // 把 same_err_count 累到阈值,turns=1 就误熔断。改为:本轮只归纳"本轮错误特征"
+        // (是否所有 error slot 同签名、有无成功 slot),循环后做**跨 turn**累积判定。
+        var turn_err_sig: ?ToolErrSig = null; // 本轮 error slot 的统一签名(若全同)
+        var turn_uniform_err = true; // 本轮 error slot 是否全是同一签名
+        var turn_any_error = false; // 本轮是否有 error slot
+        var turn_any_success = false; // 本轮是否有成功 slot
         for (slots.items) |*s| {
             const content = s.content orelse try tool_error.errorToJson("InternalError", "tool {s} produced no result", .{s.name}, allocator);
             if (s.is_error) {
+                turn_any_error = true;
                 const sig = ToolErrSig.of(s.name, content);
-                if (last_err_sig != null and last_err_sig.?.eql(sig)) {
-                    same_err_count += 1;
+                if (turn_err_sig) |prev| {
+                    if (!prev.eql(sig)) turn_uniform_err = false;
                 } else {
-                    same_err_count = 1;
-                    last_err_sig = sig;
-                }
-                if (same_err_count >= MAX_SAME_TOOL_ERROR) {
-                    log.warnId("agent", rid, "tool-loop circuit breaker tripped: {s} x{d} consecutively", .{ s.name, same_err_count });
-                    tool_loop_tripped = true;
+                    turn_err_sig = sig;
                 }
             } else {
-                same_err_count = 0;
-                last_err_sig = null;
+                turn_any_success = true;
             }
             try result_blocks.append(allocator, .{ .tool_result = .{
                 .tool_use_id = try allocator.dupe(u8, s.id),
                 .content = content,
                 .is_error = s.is_error,
             } });
+
+            // 实时工具卡渲染(REPL):把结果经 tool_card 渲染到屏幕——Edit/Write diff 着色、
+            // Grep/Glob 摘要、Read 摘要。headless/单测 tool_render_theme=null → 跳过。
+            if (opts.tool_render_theme) |th| {
+                const tool_card = @import("../repl/tui/widget/tool_card.zig");
+                const kind: tool_card.ResultKind = if (s.is_error) .err else .ok;
+                if (tool_card.renderResult(allocator, th.*, s.name, s.input, content, kind, 0, .{}) catch null) |card| {
+                    defer allocator.free(card);
+                    stdout_writer.print("{s}", .{card}) catch {};
+                }
+            }
+        }
+
+        // 跨 turn 熔断累积:本轮被视为"同错轮"当且仅当——有错、无成功、且本轮所有 error
+        // 同一签名。连续 MAX_SAME_TOOL_ERROR 个"同错轮"且签名一致 → 熔断。任意成功 / 换
+        // 签名 / 无错 → 重置。这样既治"连续多轮原地同错风暴",又不误杀"单轮并发多工具同错"。
+        if (turn_any_error and !turn_any_success and turn_uniform_err) {
+            const sig = turn_err_sig.?;
+            if (last_err_sig != null and last_err_sig.?.eql(sig)) {
+                same_err_count += 1;
+            } else {
+                same_err_count = 1;
+                last_err_sig = sig;
+            }
+            if (same_err_count >= MAX_SAME_TOOL_ERROR) {
+                log.warnId("agent", rid, "tool-loop circuit breaker tripped: same error x{d} turns consecutively", .{same_err_count});
+                tool_loop_tripped = true;
+            }
+        } else {
+            same_err_count = 0;
+            last_err_sig = null;
         }
 
         if (result_blocks.items.len == 0) {
@@ -522,6 +572,21 @@ pub fn run(
 
     // 循环正常退出 = turns >= max_turns
     return .{ .stop_reason = .max_turns, .turns = turns, .tool_calls = total_tool_calls };
+}
+
+/// 取对话里最近一条 user 文本 block(borrowed),用于 web_search 显示真实 query。
+/// 找不到返回 ""。从后往前找第一条 role==.user 且含 text block 的。
+fn latestUserText(conversation: *const @import("conversation.zig").Conversation) []const u8 {
+    var i: usize = conversation.messages.items.len;
+    while (i > 0) {
+        i -= 1;
+        const m = conversation.messages.items[i];
+        if (m.role != .user) continue;
+        for (m.blocks) |b| {
+            if (b == .text and b.text.len > 0) return b.text;
+        }
+    }
+    return "";
 }
 
 /// 把 Conversation 中的所有消息 1:1 映射为 `types.ApiMessage`，

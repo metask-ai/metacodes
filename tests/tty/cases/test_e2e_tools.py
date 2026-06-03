@@ -134,13 +134,49 @@ def test_e2e_taskcreate(bin_path):
 def test_e2e_task_subagent(bin_path):
     if SKIP:
         return
-    # 子代理委派意图:Task 首选;模型偶尔自己用 Glob/Bash 直接找也算意图满足。
-    assert_tool_e2e(
-        bin_path,
-        "Use the Task tool with subagent_type Explore to find any .md files in the current directory",
-        "Task",
-        required_keys=["prompt"],
-        wait_s=20,
-        require_card=False,
-        accept_tools=["Task", "Agent", "Glob", "Bash"],
-    )
+    # 强断言 subagent **出口**(不只是主 agent 发起了 Task)。这是之前漏掉熔断 bug 的根因:
+    # 旧断言只验"主 agent 调了 Task",subagent 内部第一轮熔断也照样绿;且 accept_tools 的
+    # Bash/Glob 兜底把"Task 子系统坏了"直接吞掉。现在:让主 agent 起后台 subagent + 轮询到
+    # 完成,从 transcript 的 TaskOutput 结果断言 subagent 真干完活——
+    #   stop_reason != tool_loop(没被熔断)、turns >= 2(真干活非卡在第一轮)、
+    #   final_text 有实质内容(非空开场白)、不含 ANSI(\x1b)。
+    # 不给 Bash/Glob 兜底:这个用例就是要钉 subagent 子系统本身。
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from e2e_helpers import RETRIES, fresh_home, find_subagent_done  # noqa: E402
+    from tty_driver import run as _run  # noqa: E402
+    import shutil as _shutil
+
+    prompt = ("Launch a background subagent with the Task tool (run_in_background true, "
+              "subagent_type Explore) to count the .zig files under src/core. Then poll with "
+              "TaskOutput until it finishes and report the count.")
+    last_done = None
+    homes = []
+    for _ in range(RETRIES):
+        home = fresh_home()
+        homes.append(home)
+        _run(bin_path,
+             ["sleep:0.8", "type:" + prompt, "key:enter", "sleep:32"],
+             base_url=None, env={"HOME": home}, per_key_drain=0.04, startup_drain=1.2)
+        done = find_subagent_done(home)
+        if done is not None:
+            last_done = done
+            sr = done.get("stop_reason")
+            ft = done.get("final_text", "") or ""
+            turns = done.get("turns", 0)
+            ok = (sr != "tool_loop"
+                  and turns >= 2
+                  and len(ft.strip()) >= 20
+                  and "\x1b" not in ft
+                  and "\\u001b" not in ft)
+            if ok:
+                for h in homes:
+                    _shutil.rmtree(h, ignore_errors=True)
+                return
+    # 全部 attempt 失败 → 判负,带诊断
+    diag = ("subagent 出口断言未通过(%d attempts)。最后一次 done=%r\n"
+            "  期望: stop_reason!=tool_loop, turns>=2, final_text 实质且无 ANSI\n"
+            "  HOME(保留): %s") % (RETRIES, last_done, homes[-1] if homes else "?")
+    for h in homes[:-1]:
+        _shutil.rmtree(h, ignore_errors=True)
+    raise AssertionError(diag)

@@ -65,6 +65,55 @@ def read_tool_uses(home):
     return uses
 
 
+def read_tool_results(home):
+    """扫该 HOME 下所有 transcript.jsonl,返回所有 tool_result 的 content 字符串列表。
+
+    transcript 里 user message 的 blocks 含 `{"type":"tool_result","content":"<str>",...}`。
+    后台 subagent 的 TaskOutput 结果(含 status/stop_reason/turns/final_text 的 JSON)即在此。
+    """
+    results = []
+    pattern = os.path.join(home, ".cc-zig", "projects", "*", "*", "transcript.jsonl")
+    for path in glob.glob(pattern):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or '"tool_result"' not in line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    blocks = msg.get("blocks")
+                    if not isinstance(blocks, list):
+                        continue
+                    for b in blocks:
+                        if isinstance(b, dict) and b.get("type") == "tool_result":
+                            c = b.get("content", "")
+                            if isinstance(c, str):
+                                results.append(c)
+        except OSError:
+            continue
+    return results
+
+
+def find_subagent_done(home):
+    """从 transcript 的 tool_result 里找后台 subagent 完成记录(TaskOutput status=done)。
+
+    返回解析后的 dict(含 stop_reason/turns/tool_calls/final_text),找不到返回 None。
+    """
+    for c in read_tool_results(home):
+        if '"status":"done"' not in c and '"stop_reason"' not in c:
+            continue
+        try:
+            d = json.loads(c)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(d, dict) and "stop_reason" in d:
+            return d
+    return None
+
+
 def tool_called(uses, name, required_keys=None):
     """uses 里是否有 name 工具、且 input 含全部 required_keys。
 

@@ -153,11 +153,16 @@ pub fn extractStringField(data: []const u8, field: []const u8) ?[]const u8 {
     @memcpy(pattern_buf[1..][0..field.len], field);
     pattern_buf[1 + field.len] = '"';
     pattern_buf[2 + field.len] = ':';
-    pattern_buf[3 + field.len] = '"';
-    const pattern = pattern_buf[0 .. 4 + field.len];
+    // 只匹配到 `"field":`,冒号后允许空白(模型/标准 JSON 序列化器常发 `"k": "v"`)。
+    const pattern = pattern_buf[0 .. 3 + field.len];
 
     const idx = std.mem.indexOf(u8, data, pattern) orelse return null;
-    const start = idx + pattern.len;
+    var start = idx + pattern.len;
+    // 跳过冒号后的空白(空格 / tab / 换行)。
+    while (start < data.len and (data[start] == ' ' or data[start] == '\t' or data[start] == '\n' or data[start] == '\r')) : (start += 1) {}
+    // 必须是字符串值的开引号。
+    if (start >= data.len or data[start] != '"') return null;
+    start += 1;
     var end = start;
     while (end < data.len) : (end += 1) {
         if (data[end] == '"' and data[end - 1] != '\\') break;
@@ -223,6 +228,21 @@ test "extractStringField basic" {
 
 test "extractStringField missing" {
     try std.testing.expect(extractStringField("{\"a\":1}", "missing") == null);
+}
+
+test "extractStringField tolerates whitespace after colon" {
+    // 回归:模型/标准 JSON 序列化器常发 `"key": "value"`(冒号后空格)。
+    // 旧实现要求引号紧贴冒号 → Task/Agent/MCP 全部 MissingField。
+    const sp = "{\"subject\": \"do x\", \"description\": \"desc\"}";
+    try std.testing.expectEqualStrings("do x", extractStringField(sp, "subject").?);
+    try std.testing.expectEqualStrings("desc", extractStringField(sp, "description").?);
+    // tab / 换行也容忍
+    const tab = "{\"k\":\t\"v\"}";
+    try std.testing.expectEqualStrings("v", extractStringField(tab, "k").?);
+    const nl = "{\n  \"k\":\n  \"v\"\n}";
+    try std.testing.expectEqualStrings("v", extractStringField(nl, "k").?);
+    // 非字符串值(数字)→ null(本函数只取 string)
+    try std.testing.expect(extractStringField("{\"k\": 5}", "k") == null);
 }
 
 test "unescapeString preserves plain text" {

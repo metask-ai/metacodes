@@ -23,6 +23,25 @@ const BG_DONE_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+// subagent 第一轮:**单轮内发 3 个 TaskCreate**(精确复现致命 bug 触发场景——小模型
+// "先规划"习惯,一轮发多个 TaskCreate)。每个含齐全 subject+description。
+// 修复前:subagent ctx.tasks=null → 3 个全 TaskStoreUnavailable → 单轮内熔断 turns=1。
+// 修复后:① subagent 有独立 TaskStore → TaskCreate 成功;② 即便失败,单轮多工具同错也
+// 不再误熔断。
+const SUBAGENT_3_TASKCREATE_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"TaskCreate\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"subject\\\":\\\"a\\\",\\\"description\\\":\\\"da\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t2\",\"name\":\"TaskCreate\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"subject\\\":\\\"b\\\",\\\"description\\\":\\\"db\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t3\",\"name\":\"TaskCreate\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"subject\\\":\\\"c\\\",\\\"description\\\":\\\"dc\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
 fn makeCtx(
     a: std.mem.Allocator,
     client: *cc.client_mod.Client,
@@ -236,4 +255,93 @@ test "L2 后台并发: 多 job 各得不同 id 且都可查;MAX_BG_JOBS 上限�
     } else |err| {
         try std.testing.expectEqual(error.TooManyBackgroundJobs, err);
     }
+}
+
+// 回归(本次修复核心):subagent 第一轮单轮内发 3 个 TaskCreate。
+// 修复前两 bug 叠加 → subagent ctx.tasks=null 全失败 + 单轮内熔断 → stop_reason=tool_loop,
+// turns=1,final_text 只有开场白。这正是 tty e2e 当时没抓到的(它只验主 agent 发起了 Task,
+// 不验 subagent 内部出口)。本用例从**出口**断言:subagent 不熔断 + 干完活。
+//
+// 为什么放这层:真模型 e2e 无法稳定让 subagent"恰好单轮发 3 个 TaskCreate"(MiniMax 不
+// 确定),但这里用 cassette 精确复现该轮次,确定性、每次必触发。
+test "L2 回归: subagent 单轮多 TaskCreate 不熔断,正常完成(治 tasks=null + 单轮误熔断)" {
+    const a = std.testing.allocator;
+
+    // 第 1 轮:3 个 TaskCreate(原 bug 触发轮);第 2 轮:end_turn 收尾。
+    const bodies = [_][]const u8{ SUBAGENT_3_TASKCREATE_SSE, BG_DONE_SSE };
+    var srv = try harness.MockServer.startCassette(&bodies, 50);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "k", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    var agents = cc.agents_set.AgentSet.init(a);
+    defer agents.deinit();
+    try agents.loadFromStandardPaths("");
+
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var reg = try cc.agent_job_registry.AgentJobRegistry.init(a, "k", url, "claude-sonnet-4-20250514");
+    defer reg.deinit();
+
+    const ctx = makeCtx(a, &client, &agents, &perm, &reg);
+
+    const spawn_out = try cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"general-purpose\",\"prompt\":\"plan and do\",\"run_in_background\":true}");
+    defer a.free(spawn_out);
+    const job_id = try extractJobId(a, spawn_out);
+    defer a.free(job_id);
+
+    const query = try std.fmt.allocPrint(a, "{{\"agent_job_id\":\"{s}\"}}", .{job_id});
+    defer a.free(query);
+
+    var done = false;
+    var i: usize = 0;
+    while (i < 500) : (i += 1) { // 最多 ~5s
+        const r = try cc.task_output_tool.execute(&ctx, query);
+        defer a.free(r);
+        if (std.mem.indexOf(u8, r, "\"status\":\"done\"") != null) {
+            // 核心断言:subagent 走完两轮正常 end_turn,**不是** tool_loop 熔断。
+            try std.testing.expect(std.mem.indexOf(u8, r, "\"stop_reason\":\"tool_loop\"") == null);
+            try std.testing.expect(std.mem.indexOf(u8, r, "\"stop_reason\":\"end_turn\"") != null);
+            // 干完了活(走到第 2 轮的收尾文本),不是 turns=1 卡死。
+            try std.testing.expect(std.mem.indexOf(u8, r, "BG DONE") != null);
+            done = true;
+            break;
+        }
+        sleepMs(10);
+    }
+    try std.testing.expect(done);
+}
+
+// A-1 精准接线断言(同步路径,直接读 SubagentResult):subagent 调 3 个 TaskCreate →
+// subagent_tasks_created 应为 3。这条**专门**抓"spawnAgent 是否给 subagent 接了非 null
+// task store"——若没接(原 bug),3 个 TaskCreate 全 TaskStoreUnavailable,计数为 0。
+// (后台那条 e2e 因 A-2 修好后也不熔断而变绿,无法单独暴露 A-1;此条用计数把 A-1 钉死。)
+test "L2 接线: subagent 调 TaskCreate 真成功(独立 store 接通,计数=3)" {
+    const a = std.testing.allocator;
+
+    const bodies = [_][]const u8{ SUBAGENT_3_TASKCREATE_SSE, BG_DONE_SSE };
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "k", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
+
+    const result = try cc.core_subagent.spawnAgent(a, &client, empty_defs, &perm, null, "plan and do", .{ .max_turns = 5 });
+    defer result.deinit();
+
+    // 接线证明:3 个 TaskCreate 全部成功落进 subagent 独立 store。tasks=null 时此值=0。
+    try std.testing.expectEqual(@as(u32, 3), result.subagent_tasks_created);
+    // 顺带:不熔断、走到收尾。
+    try std.testing.expect(result.stop_reason != .tool_loop);
 }

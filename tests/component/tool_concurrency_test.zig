@@ -115,3 +115,40 @@ test "L2 并发: per-message 聚合预算(多大结果合计超 200k → 落盘�
     try std.testing.expect(persisted_count >= 1);
     try std.testing.expect(total <= 200_000); // 落盘后合计达标
 }
+
+test "L2 并发: per-input 分类(Bash readonly safe / 写 unsafe)" {
+    try std.testing.expect(tools.isConcurrencySafeInput("Bash", "{\"command\":\"ls -la\"}"));
+    try std.testing.expect(tools.isConcurrencySafeInput("Bash", "{\"command\":\"git status\"}"));
+    try std.testing.expect(!tools.isConcurrencySafeInput("Bash", "{\"command\":\"rm -rf x\"}"));
+    try std.testing.expect(!tools.isConcurrencySafeInput("Bash", "{\"command\":\"echo hi > f\"}"));
+    // 非 Bash 沿用名单
+    try std.testing.expect(tools.isConcurrencySafeInput("Read", "{\"file_path\":\"/x\"}"));
+    try std.testing.expect(!tools.isConcurrencySafeInput("Write", "{\"file_path\":\"/x\",\"content\":\"y\"}"));
+}
+
+test "L2 并发: per-message 预算跳过 Read(防 Read→file→Read 环)" {
+    const a = std.testing.allocator;
+    _ = std.c.mkdir("/tmp/cc-budget-home2", 0o755);
+    // Read 结果(maxResultChars==maxInt)即便很大,也不应被强制落盘。
+    // 配 2 个大 Grep + 1 个大 Read,合计超预算 → 只落 Grep,Read 原样保留。
+    const big = try a.alloc(u8, 90_000);
+    defer a.free(big);
+    @memset(big, 'R');
+    var slots = [_]tool_exec.Slot{
+        .{ .decision = .denied, .name = "Read", .id = "r", .input = "{}", .content = try a.dupe(u8, big), .is_error = false },
+        .{ .decision = .denied, .name = "Grep", .id = "g1", .input = "{}", .content = try a.dupe(u8, big), .is_error = false },
+        .{ .decision = .denied, .name = "Grep", .id = "g2", .input = "{}", .content = try a.dupe(u8, big), .is_error = false },
+    };
+    defer for (&slots) |*s| if (s.content) |c| a.free(c);
+    const ctx = cc.tool_context.ToolContext{ .allocator = a, .home_dir = "/tmp/cc-budget-home2" };
+    tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
+
+    // Read 结果未被落盘(仍是原始 90k 'R')
+    try std.testing.expect(std.mem.indexOf(u8, slots[0].content.?, "\"persisted\":true") == null);
+    try std.testing.expect(slots[0].content.?.len == 90_000);
+    // 至少一个 Grep 被落盘
+    var grep_persisted: usize = 0;
+    if (std.mem.indexOf(u8, slots[1].content.?, "\"persisted\":true") != null) grep_persisted += 1;
+    if (std.mem.indexOf(u8, slots[2].content.?, "\"persisted\":true") != null) grep_persisted += 1;
+    try std.testing.expect(grep_persisted >= 1);
+}

@@ -320,6 +320,9 @@ pub const registry: []const ToolEntry = &.{
         .name = "Task",
         .description = "Launch a subagent in an isolated context to handle a side task. Each subagent starts with a fresh context — it cannot see this conversation, only the prompt you pass. Use for: high-volume operations (running tests, processing logs), parallel research, isolating exploration that would flood your context. Args: subagent_type (Explore/Plan/general-purpose/<custom>), description (3-5 word UI label), prompt (the delegation message). Optional: max_turns, model, run_in_background (true returns an agent_job_id immediately; poll with TaskOutput, stop with TaskStop).",
         .describe_fn = descriptions.describeTask,
+        // 工具 name 必须保持 "Task"——这是模型 SFT 训练时学到的工具标识符,改名会降低
+        // 模型识别/调用可靠性。用户看到的 "subagent" 概念在 UI 层(tool_card 预览)体现,
+        // 不动工具 name。
         // schema required 只列**真正必需**的:subagent_type 缺省 general-purpose、
         // description 只是 UI 标签 → 都不是硬必需(agent.zig 有默认)。只有 prompt 缺会真失败。
         .input_schema = .{ .type = "object", .prop_specs = &.{
@@ -333,8 +336,10 @@ pub const registry: []const ToolEntry = &.{
         .execute = agent_tool.execute,
     },
     .{
+        // 兼容别名:某些上下文可能用 "Agent"。路由到同一 execute。主工具 name 是 "Task"
+        // (SFT 锚点)。
         .name = "Agent",
-        .description = "Deprecated alias for Task. Use Task with subagent_type instead. Currently routes to Task with subagent_type=\"general-purpose\".",
+        .description = "Alias for Task. Use Task with subagent_type instead. Routes to Task (subagent_type defaults to general-purpose).",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "prompt", .type = "string", .description = "The task/delegation message for the subagent" },
             .{ .name = "subagent_type", .type = "string", .description = "Agent type; defaults to general-purpose" },

@@ -93,10 +93,10 @@ pub fn executeSlots(
             i += 1;
             continue;
         }
-        // 收集从 i 起连续的同安全性 run-slot 为一批。
-        const safe = tools_mod.isConcurrencySafe(slots[i].name);
+        // 收集从 i 起连续的同安全性 run-slot 为一批。per-input 判定(Bash 看 command)。
+        const safe = tools_mod.isConcurrencySafeInput(slots[i].name, slots[i].input);
         var j = i;
-        while (j < slots.len and slots[j].decision == .run and tools_mod.isConcurrencySafe(slots[j].name) == safe) : (j += 1) {}
+        while (j < slots.len and slots[j].decision == .run and tools_mod.isConcurrencySafeInput(slots[j].name, slots[j].input) == safe) : (j += 1) {}
         // slots[i..j] 是一批(同安全性)。
         if (safe and (j - i) > 1) {
             runConcurrentBatch(slots[i..j], base_ctx, parent_allocator, rid);
@@ -131,6 +131,9 @@ fn enforceMessageBudget(slots: []Slot, base_ctx: *const ToolContext, parent_allo
         var biggest_len: usize = 0;
         for (slots, 0..) |s, k| {
             const c = s.content orelse continue;
+            // Read(maxResultChars==maxInt)永不落盘——它自有 maxTokens 上限,落盘会造
+            // Read→file→Read 环(对齐 cc FileRead Infinity + per-message frozen/skip)。
+            if (storage.maxResultChars(s.name) == std.math.maxInt(usize)) continue;
             // 已是 persisted/truncated preview 的不再处理(幂等)。
             if (std.mem.indexOf(u8, c, "\"persisted\":true") != null or std.mem.indexOf(u8, c, "\"truncated\":true") != null) continue;
             if (c.len > biggest_len) {

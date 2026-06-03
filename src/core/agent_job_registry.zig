@@ -211,8 +211,8 @@ pub const AgentJobRegistry = struct {
         _ = std.c.pthread_mutex_unlock(&self.list_mutex);
     }
 
-    /// running job 计数(持 list 锁)。
-    fn runningCount(self: *AgentJobRegistry) usize {
+    /// running job 计数(持 list 锁)。TUI(TaskTab)用。
+    pub fn runningCount(self: *AgentJobRegistry) usize {
         var n: usize = 0;
         for (self.entries.items) |e| {
             e.lock();
@@ -369,6 +369,44 @@ pub const AgentJobRegistry = struct {
         self.listLock();
         defer self.listUnlock();
         return self.index.get(key);
+    }
+
+    /// 后台 subagent job 的值语义快照(供 TUI Ctrl+T 列表用,不持锁/不持指针)。
+    /// id/desc 拷进调用者 allocator;调用者用完整体 free(freeSnapshots)。
+    pub const JobSnapshot = struct {
+        id: []u8,
+        status: JobStatus,
+        desc: []u8,
+        turns: u32,
+        tool_calls: u32,
+    };
+
+    pub fn snapshotJobs(self: *AgentJobRegistry, allocator: std.mem.Allocator) ![]JobSnapshot {
+        self.listLock();
+        defer self.listUnlock();
+        var out = try allocator.alloc(JobSnapshot, self.entries.items.len);
+        var i: usize = 0;
+        for (self.entries.items) |e| {
+            e.lock();
+            defer e.unlock();
+            out[i] = .{
+                .id = try allocator.dupe(u8, e.idSlice()),
+                .status = e.status,
+                .desc = try allocator.dupe(u8, e.desc_preview),
+                .turns = e.turns,
+                .tool_calls = e.tool_calls,
+            };
+            i += 1;
+        }
+        return out;
+    }
+
+    pub fn freeSnapshots(allocator: std.mem.Allocator, snaps: []JobSnapshot) void {
+        for (snaps) |s| {
+            allocator.free(s.id);
+            allocator.free(s.desc);
+        }
+        allocator.free(snaps);
     }
 
     /// 终止一个后台 job(只 abort,非阻塞)。状态由线程跑到检查点后自置 .killed。

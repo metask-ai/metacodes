@@ -424,6 +424,8 @@ pub const StreamResponse = struct {
     iter_initialized: bool = false,
     abort: ?*const AbortSignal = null,
     done: bool = false,
+    /// 本轮用户原始输入(borrowed),透传给 EventIterator 供 web_search 显示真实 query。
+    user_query: []const u8 = "",
     /// 本次流式请求的 request_id，所有下游（stream event、agent loop、工具调用）
     /// 用它把日志串起来。
     id: log.RequestId,
@@ -463,6 +465,7 @@ pub const StreamResponse = struct {
             else
                 api_stream.EventIterator.init(reader);
             self.event_iter.setRequestId(self.id);
+            if (self.user_query.len > 0) self.event_iter.setUserQuery(self.user_query);
             self.iter_initialized = true;
         }
 

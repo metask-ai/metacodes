@@ -186,9 +186,9 @@ test "Subagents E2E: subagents section in system prompt" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Task(subagent_type") != null);
 }
 
-test "Subagents E2E: Task tool registered in static registry" {
-    try std.testing.expect(cc.tools.getTool("Task") != null);
-    try std.testing.expect(cc.tools.getTool("Agent") != null); // 兼容别名
+test "Subagents E2E: Task tool registered in static registry (Agent 兼容别名)" {
+    try std.testing.expect(cc.tools.getTool("Task") != null); // 主名(SFT 锚点)
+    try std.testing.expect(cc.tools.getTool("Agent") != null); // 兼容别名仍可路由
 }
 
 test "Subagents E2E: Task tool fails clean without subagent_type if no Agents set" {

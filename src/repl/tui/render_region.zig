@@ -143,16 +143,33 @@ pub const RenderRegion = struct {
     /// 末尾把光标停在 content 供编辑,并记 input_cursor_row。
     /// TaskTab:输入框上方显示首个 in_progress 任务的 active_form(无则 subject)。
     /// 无 in_progress 任务 → 不画,返回 0 行。画一行返回 1。`◐ <text>`(截断到 cols)。
-    /// 对齐 UI_LAYER_DESIGN 阶段 4。
+    /// 对齐 UI_LAYER_DESIGN 阶段 4。另:有运行中后台 subagent 时,即便无 todo 也画一行
+    /// `◐ N subagents running`(用户曾反馈看不到并发 subagent 进度)。
     fn drawTaskTab(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App) u16 {
-        const text = taskTabLabel(&app.tasks) orelse return 0;
+        const todo_text = taskTabLabel(&app.tasks);
+        // 后台运行中 subagent 数(agent_jobs 是可空字段;runningCount 需 *mut,这里 const
+        // App → 通过 @constCast 只读统计,不改状态)。
+        const running_subagents: usize = if (app.agent_jobs) |reg| blk: {
+            break :blk @constCast(&reg).runningCount();
+        } else 0;
+
+        if (todo_text == null and running_subagents == 0) return 0;
+
         const icon = if (self.use_unicode) "◐" else "*";
-        const max_w: usize = if (self.cols > 4) self.cols - 4 else 8;
-        const end = truncateToWidth(text, max_w);
         w.writeAll(ansi.clear.line) catch {};
         w.writeAll(self.theme.dim) catch {};
-        w.print("{s} {s}", .{ icon, text[0..end] }) catch {};
-        if (end < text.len) w.writeAll("…") catch {};
+        if (todo_text) |text| {
+            const max_w: usize = if (self.cols > 4) self.cols - 4 else 8;
+            const end = truncateToWidth(text, max_w);
+            w.print("{s} {s}", .{ icon, text[0..end] }) catch {};
+            if (end < text.len) w.writeAll("…") catch {};
+            // todo + subagent 共存:在同一行尾部追加 subagent 计数。
+            if (running_subagents > 0) {
+                w.print("  ·  {d} subagent{s} running", .{ running_subagents, if (running_subagents == 1) "" else "s" }) catch {};
+            }
+        } else {
+            w.print("{s} {d} subagent{s} running", .{ icon, running_subagents, if (running_subagents == 1) "" else "s" }) catch {};
+        }
         w.writeAll(self.theme.reset) catch {};
         w.writeAll("\r\n") catch {};
         return 1;

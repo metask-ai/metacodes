@@ -31,6 +31,17 @@ pub fn renderToLinesWithTheme(allocator: std.mem.Allocator, conv: *const Convers
         lines.deinit(allocator);
     }
 
+    // 先建 tool_use_id → {name,input} 查表,供 tool_result 用 renderResult 走逐工具渲染器
+    // (Edit diff 着色 / 搜索摘要 / Read 摘要)。borrow 自 conversation,无需 free。
+    const ToolMeta = struct { name: []const u8, input: []const u8 };
+    var tool_meta = std.StringHashMap(ToolMeta).init(allocator);
+    defer tool_meta.deinit();
+    for (conv.messages.items) |m| {
+        for (m.blocks) |b| {
+            if (b == .tool_use) try tool_meta.put(b.tool_use.id, .{ .name = b.tool_use.name, .input = b.tool_use.input });
+        }
+    }
+
     for (conv.messages.items) |m| {
         const role_label = switch (m.role) {
             .user => try std.fmt.allocPrint(allocator, "{s}▶ user{s}", .{ th.role_user, th.reset }),
@@ -57,12 +68,23 @@ pub fn renderToLinesWithTheme(allocator: std.mem.Allocator, conv: *const Convers
                     }
                 },
                 .tool_result => |tr| {
-                    // 状态符 + 分隔线 + 折叠输出(最多 5 行)
-                    const marker_color = if (tr.is_error) th.danger else th.success;
-                    const marker_icon = if (tr.is_error) th.icon_cross else th.icon_check;
-                    const marker_line = try std.fmt.allocPrint(allocator, "  {s}{s} result{s}", .{ marker_color, marker_icon, th.reset });
-                    try lines.append(allocator, marker_line);
-                    try appendWrappedFolded(allocator, &lines, tr.content, "    ", th.dim, th.reset, 5);
+                    // 用 renderResult 走逐工具渲染器(Edit diff 着色 / 搜索摘要 / Read 摘要);
+                    // transcript 视图展开(verbose 语义)。查不到 tool_use 则用空名走通用折叠。
+                    const meta = tool_meta.get(tr.tool_use_id);
+                    const t_name: []const u8 = if (meta) |mm| mm.name else "";
+                    const t_input: []const u8 = if (meta) |mm| mm.input else "{}";
+                    const kind: tool_card.ResultKind = if (tr.is_error) .err else .ok;
+                    const card = try tool_card.renderResult(allocator, th, t_name, t_input, tr.content, kind, 0, .{ .transcript = true });
+                    defer allocator.free(card);
+                    var pos: usize = 0;
+                    while (pos < card.len) {
+                        const eol = std.mem.indexOfScalarPos(u8, card, pos, '\n') orelse card.len;
+                        if (eol > pos) {
+                            const indented = try std.fmt.allocPrint(allocator, "  {s}", .{card[pos..eol]});
+                            try lines.append(allocator, indented);
+                        }
+                        pos = eol + 1;
+                    }
                 },
                 .thinking => |t| {
                     // 思考块:头标 + 折叠内容(前 3 行)
@@ -239,6 +261,53 @@ test "renderToLines: user + assistant + tool" {
     try testing.expect(has_user);
     try testing.expect(has_asst);
     try testing.expect(has_found);
+}
+
+test "renderToLines: Edit tool_result 经 renderResult 出 diff 着色" {
+    const a = testing.allocator;
+    const msg = @import("../core/message.zig");
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+
+    // assistant 发起 Edit tool_use
+    {
+        const blocks = try a.alloc(msg.Block, 1);
+        blocks[0] = .{ .tool_use = .{
+            .id = try a.dupe(u8, "tu_1"),
+            .name = try a.dupe(u8, "Edit"),
+            .input = try a.dupe(u8, "{\"file_path\":\"/x.zig\"}"),
+        } };
+        try conv.append(.{ .role = .assistant, .blocks = blocks });
+    }
+    // user 回 tool_result(含 gitDiff)
+    {
+        const blocks = try a.alloc(msg.Block, 1);
+        blocks[0] = .{ .tool_result = .{
+            .tool_use_id = try a.dupe(u8, "tu_1"),
+            .content = try a.dupe(u8, "{\"success\":true,\"path\":\"/x.zig\",\"gitDiff\":\"--- a/x.zig\\n+++ b/x.zig\\n@@ -1,1 +1,1 @@\\n-const b = 2;\\n+const b = 20;\\n\"}"),
+            .is_error = false,
+        } };
+        try conv.append(.{ .role = .user, .blocks = blocks });
+    }
+
+    const lines = try renderToLinesWithTheme(a, &conv, @import("tui/theme.zig").dark);
+    defer freeLines(a, lines);
+
+    var has_new = false;
+    var has_old = false;
+    var has_green = false;
+    var has_red = false;
+    const th = @import("tui/theme.zig").dark;
+    for (lines) |l| {
+        if (std.mem.indexOf(u8, l, "const b = 20;") != null) has_new = true;
+        if (std.mem.indexOf(u8, l, "const b = 2;") != null) has_old = true;
+        if (std.mem.indexOf(u8, l, th.success) != null) has_green = true;
+        if (std.mem.indexOf(u8, l, th.danger) != null) has_red = true;
+    }
+    try testing.expect(has_new); // + 行内容
+    try testing.expect(has_old); // - 行内容
+    try testing.expect(has_green); // + 行 success 着色
+    try testing.expect(has_red); // - 行 danger 着色
 }
 
 test "userPromptLineIndices: finds user lines" {

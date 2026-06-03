@@ -40,6 +40,18 @@ test "L2 triage: TaskCreate(有 subject) 仍正常工作(未破坏 happy path)" 
     try std.testing.expect(std.mem.indexOf(u8, r, "\"id\":\"1\"") != null);
 }
 
+test "L2 回归: TaskCreate 容忍冒号后空格(extractStringField 修复)" {
+    // 真实 bug:模型/标准 JSON 发 `"subject": "x"`(冒号后空格)时,旧 extractStringField
+    // 要求引号紧贴冒号 → MissingSubject。修复后应正常创建。
+    var store = cc.core_task_store.TaskStore.init(std.testing.allocator);
+    defer store.deinit();
+    const ctx = ctxWithStore(&store);
+    const r = try cc.task_tools.executeCreate(&ctx, "{\"subject\": \"spaced\", \"description\": \"d\"}");
+    defer std.testing.allocator.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "\"id\":\"1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "spaced") != null);
+}
+
 // Task 工具(subagent):缺 prompt → 具名 MissingPrompt。
 // 注意 execute 先查 depth/api_client 依赖,故这里只能间接断言错误名常量存在;
 // 完整路径在 e2e(真模型空参 → 现场含 MissingPrompt)。这里锁住 errorToJson 映射:
