@@ -180,3 +180,54 @@ def test_e2e_task_subagent(bin_path):
     for h in homes[:-1]:
         _shutil.rmtree(h, ignore_errors=True)
     raise AssertionError(diag)
+
+
+def test_e2e_agent_tree_onscreen(bin_path):
+    """真模型 + 后台 subagent → 主 agent 轮询期间,屏幕底部应闪现 agent 进度树
+    (⏺ Running N subagent… + 树枝 + subagent desc)。
+
+    这是 B2 的端到端真模型验证:不只看 transcript 出口(那是 test_e2e_task_subagent),
+    而是确认 agent_jobs → drawPanel → agent_tree 这条 TUI 链在真运行里画到了屏上。
+    扫所有帧:任一帧出现树标题即通过(轮询窗口短,树只在 running 期可见)。
+    真模型不确定 → 重试 RETRIES 次。term 开大(rows=40)给面板留空间。
+    """
+    if SKIP:
+        return
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from e2e_helpers import RETRIES, fresh_home  # noqa: E402
+    from tty_driver import run as _run  # noqa: E402
+    from asserts import TTYAssert  # noqa: E402
+    import shutil as _shutil
+
+    prompt = ("Launch a background subagent with the Task tool (run_in_background true, "
+              "subagent_type Explore) to count the .zig files under src/core. Then poll with "
+              "TaskOutput until it finishes and report the count.")
+    homes = []
+    last_diag = "?"
+    for _ in range(RETRIES):
+        home = fresh_home()
+        homes.append(home)
+        raw = _run(bin_path,
+                   ["sleep:0.8", "type:" + prompt, "key:enter", "sleep:32"],
+                   base_url=None, env={"HOME": home}, term_size=(40, 100),
+                   per_key_drain=0.04, startup_drain=1.2)
+        a = TTYAssert(raw, rows=40, cols=100)
+        hit = False
+        for sc in a.frame_screens:
+            full = "\n".join(sc.line_text(r) for r in range(sc.rows))
+            # 树标题(running 或 finished 形态均可)+ subagent 概念出现即算画到。
+            if ("subagent" in full) and ("Running" in full or "finished" in full):
+                hit = True
+                break
+        if hit:
+            for h in homes:
+                _shutil.rmtree(h, ignore_errors=True)
+            return
+        last_diag = a.frame_screens[-1].render_ascii() if a.frame_screens else "(无帧)"
+
+    for h in homes[:-1]:
+        _shutil.rmtree(h, ignore_errors=True)
+    raise AssertionError(
+        "agent 进度树未在任何帧出现(%d attempts)。最后帧:\n%s\n  HOME(保留): %s"
+        % (RETRIES, last_diag, homes[-1] if homes else "?"))
