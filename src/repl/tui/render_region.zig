@@ -184,8 +184,10 @@ pub const RenderRegion = struct {
         var used: u16 = 0;
 
         // ---- agent 进度树 ----
-        if (app.agent_jobs) |reg| {
-            const snaps = @constCast(&reg).snapshotJobs(self.allocator) catch null;
+        // 用 App.agentJobsPtr()(指向 App 字段本身),不要 `if (app.agent_jobs) |reg|`
+        // 捕获——那是值拷贝,listLock 会锁栈副本的 mutex 而非真 registry 的(race)。
+        if (app.agentJobsPtr()) |reg| {
+            const snaps = reg.snapshotJobs(self.allocator) catch null;
             if (snaps) |s| {
                 defer agent_job_registry.AgentJobRegistry.freeSnapshots(self.allocator, s);
                 if (s.len > 0) {
@@ -240,9 +242,14 @@ pub const RenderRegion = struct {
         }
         if (visible == 0) return 0;
 
+        // 行预算分配:可全显则全显(无省略号);否则留 1 行给省略号显 max_lines-1 条。
+        // 边界:max_lines==1 且溢出 → 不留省略号行,直接显 1 条真任务(省略号吃掉唯一一行
+        // 却 0 任务是信息量为零的退化,不可取)。
+        const overflow = visible > max_lines;
+        const cap: usize = if (!overflow) visible else if (max_lines >= 2) max_lines - 1 else 1;
+
         var n: u16 = 0;
         var shown: usize = 0;
-        const cap: usize = if (max_lines > 0) max_lines - @as(u16, if (visible > max_lines) 1 else 0) else 0;
         const max_w: usize = if (self.cols > 6) self.cols - 6 else 8;
         for (tasks) |t| {
             const show = switch (t.status) {
@@ -273,8 +280,9 @@ pub const RenderRegion = struct {
             n += 1;
             shown += 1;
         }
-        // 折叠提示。
-        if (visible > shown) {
+        // 折叠提示:仅当还有预算行(n < max_lines)且确有未显条目时才画,
+        // 否则会超预算(max_lines==1 时已显 1 条真任务,不再挤省略号行)。
+        if (visible > shown and n < max_lines) {
             w.writeAll(ansi.clear.line) catch {};
             w.print("  {s}… +{d} more{s}", .{ self.theme.dim, visible - shown, self.theme.reset }) catch {};
             w.writeAll("\r\n") catch {};

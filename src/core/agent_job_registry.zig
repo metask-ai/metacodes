@@ -52,6 +52,9 @@ pub const JobEntry = struct {
     /// 实时进度(subagent agent_loop 跑动时持锁更新,供 TUI agent 进度树显示)。
     /// current_turn:当前轮(1-based);current_tool:当前/最近执行的工具名(定长拷贝);
     /// current_tool_input:该工具的原始 input JSON 快照(定长截断,供动作行渲染参数预览)。
+    /// **注意:job 结束(done/failed/killed)后 current_tool/input 是 stale 的**——
+    /// 保留的是最后一个工具,不清空(对齐 cc 持续显示最近动作)。渲染方必须先查 status
+    /// == .running 再用 current_tool,否则会显示已结束 job 的鬼影动作(见 agent_tree)。
     current_turn: u32 = 0,
     current_tool: [32]u8 = undefined,
     current_tool_len: u8 = 0,

@@ -729,12 +729,14 @@ pub fn actionLabel(alloc: std.mem.Allocator, tool_name: []const u8, input: []con
         break :blk null;
     };
     if (arg) |a| {
-        // command 可能含转义(&&、换行);unescape + 只取首行,再截断到 ~48 列。
+        // command 可能含转义(&&、换行);unescape + 只取首行,再按**显示宽度**截断到 ~48 列
+        // (用 layout.truncate:char-boundary-safe + CJK 宽字符正确,绝不切碎 UTF-8)。
         const dec = try jsonUnescape(alloc, a);
         defer alloc.free(dec);
         const one = firstLine(dec);
-        const end = @min(one.len, 48);
-        return try std.fmt.allocPrint(alloc, "{s}({s}{s})", .{ tool_name, one[0..end], if (end < one.len) "…" else "" });
+        const trunc = try layout.truncate(alloc, one, 48, "…");
+        defer if (trunc.ptr != one.ptr) alloc.free(trunc); // truncate 不超长时借用 one,不能 free
+        return try std.fmt.allocPrint(alloc, "{s}({s})", .{ tool_name, trunc });
     }
     return try alloc.dupe(u8, tool_name);
 }
@@ -1116,6 +1118,53 @@ test "renderResult: monochrome 用 ASCII gutter(\\)而非 unicode" {
     try capture.expectContains(s, "\\  alpha"); // mono gutter="\"
     try capture.expectContains(s, "     beta"); // 续行 5 空格
     try testing.expect(std.mem.indexOf(u8, s, "⎿") == null); // 无 unicode 角符
+}
+
+// ---- actionLabel:agent 树动作行 `Tool(arg)`(width-safe 截断)----
+
+test "actionLabel: 各工具关键参数" {
+    const a = testing.allocator;
+    {
+        const s = try actionLabel(a, "Bash", "{\"command\":\"git status\"}");
+        defer a.free(s);
+        try testing.expectEqualStrings("Bash(git status)", s);
+    }
+    {
+        const s = try actionLabel(a, "Read", "{\"file_path\":\"/etc/hosts\"}");
+        defer a.free(s);
+        try testing.expectEqualStrings("Read(/etc/hosts)", s);
+    }
+    {
+        const s = try actionLabel(a, "Grep", "{\"pattern\":\"TODO\"}");
+        defer a.free(s);
+        try testing.expectEqualStrings("Grep(TODO)", s);
+    }
+    {
+        // 识别不出参数 → 纯工具名。
+        const s = try actionLabel(a, "SomeTool", "{}");
+        defer a.free(s);
+        try testing.expectEqualStrings("SomeTool", s);
+    }
+}
+
+test "actionLabel: 多行 command 只取首行" {
+    const s = try actionLabel(testing.allocator, "Bash", "{\"command\":\"cd /x\\nmake\"}");
+    defer testing.allocator.free(s);
+    try testing.expectEqualStrings("Bash(cd /x)", s);
+}
+
+test "actionLabel: 超长 CJK 参数按显示宽截断且不切碎 UTF-8" {
+    // 30 个中文(显示宽 60 列)> 48 列上限 → 必须按宽度截断,且输出仍是合法 UTF-8。
+    const path = "{\"file_path\":\"中文路径中文路径中文路径中文路径中文路径中文路径中文路径中文路径中文路径中文路径\"}";
+    const s = try actionLabel(testing.allocator, "Read", path);
+    defer testing.allocator.free(s);
+    // 合法 UTF-8(切在字符边界,绝不半个码点)。
+    try testing.expect(std.unicode.utf8ValidateSlice(s));
+    // 截断标记存在。
+    try testing.expect(std.mem.indexOf(u8, s, "…") != null);
+    // 形如 Read(...…)。
+    try testing.expect(std.mem.startsWith(u8, s, "Read("));
+    try testing.expect(std.mem.endsWith(u8, s, ")"));
 }
 
 

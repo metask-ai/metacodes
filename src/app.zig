@@ -389,6 +389,16 @@ pub const App = struct {
         return null;
     }
 
+    /// 后台 subagent registry 的**可变**指针(TUI 只读统计/快照用)。
+    /// 关键:`|*aj|` 捕获的是 App 字段本身的地址(App 会话级稳定),不是值拷贝——
+    /// 这样 snapshotJobs/runningCount 里 listLock 锁的是**真 registry 的 mutex**,
+    /// 与后台线程注册新 job 时锁的是同一把,不会锁到栈副本(那是 race)。
+    /// @constCast 去掉 const 是诚实的:快照只动 mutex 不改逻辑状态(同 sandboxPtr 理据)。
+    pub fn agentJobsPtr(app: *const App) ?*@import("core/agent_job_registry.zig").AgentJobRegistry {
+        if (app.agent_jobs) |*aj| return @constCast(aj);
+        return null;
+    }
+
     /// cwd 绝对路径(sandbox profile 工作目录),空串 = 未知(用 process cwd)。
     pub fn cwdAbs(app: *const App) []const u8 {
         return app.cwd_abs orelse "";
