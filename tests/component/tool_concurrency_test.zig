@@ -87,3 +87,31 @@ test "L2 并发: unsafe 工具串行单跑(未知工具→错误,不崩)" {
     try std.testing.expect(slots[0].is_error);
     try std.testing.expect(slots[0].content != null and std.mem.indexOf(u8, slots[0].content.?, "UnknownTool") != null);
 }
+
+test "L2 并发: per-message 聚合预算(多大结果合计超 200k → 落盘最大的)" {
+    const a = std.testing.allocator;
+    _ = std.c.mkdir("/tmp/cc-budget-home", 0o755);
+    // 3 个 denied slot 各预填 ~80k 内容(decision=.denied 让 executeSlots 不执行,只走聚合预算)
+    const big = try a.alloc(u8, 80_000);
+    defer a.free(big);
+    @memset(big, 'Z');
+    var slots = [_]tool_exec.Slot{
+        .{ .decision = .denied, .name = "Grep", .id = "a", .input = "{}", .content = try a.dupe(u8, big), .is_error = false },
+        .{ .decision = .denied, .name = "Grep", .id = "b", .input = "{}", .content = try a.dupe(u8, big), .is_error = false },
+        .{ .decision = .denied, .name = "Grep", .id = "c", .input = "{}", .content = try a.dupe(u8, big), .is_error = false },
+    };
+    defer for (&slots) |*s| if (s.content) |c| a.free(c);
+    const ctx = cc.tool_context.ToolContext{ .allocator = a, .home_dir = "/tmp/cc-budget-home" };
+    tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
+
+    // 合计 240k > 200k → 至少一个被落盘(preview)
+    var persisted_count: usize = 0;
+    var total: usize = 0;
+    for (slots) |s| {
+        const c = s.content.?;
+        total += c.len;
+        if (std.mem.indexOf(u8, c, "\"persisted\":true") != null) persisted_count += 1;
+    }
+    try std.testing.expect(persisted_count >= 1);
+    try std.testing.expect(total <= 200_000); // 落盘后合计达标
+}

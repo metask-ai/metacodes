@@ -110,6 +110,46 @@ pub fn executeSlots(
         }
         i = j;
     }
+
+    // per-message 聚合预算(对齐 cc MAX_TOOL_RESULTS_PER_MESSAGE_CHARS):一轮多个工具
+    // 结果合计超 200k → 按大小降序把最大的落盘(替成 preview)直到达标。批1A 并发后
+    // 多工具同时产大结果更易触发;单结果落盘(maybePersist)已在 runJob 做,这里管"合计"。
+    enforceMessageBudget(slots, base_ctx, parent_allocator);
+}
+
+const MAX_TOOL_RESULTS_PER_MESSAGE: usize = 200_000;
+
+fn enforceMessageBudget(slots: []Slot, base_ctx: *const ToolContext, parent_allocator: std.mem.Allocator) void {
+    const storage = @import("../tools/tool_result_storage.zig");
+    var total: usize = 0;
+    for (slots) |s| total += if (s.content) |c| c.len else 0;
+    if (total <= MAX_TOOL_RESULTS_PER_MESSAGE) return;
+
+    // 反复挑当前最大且"还没落盘"的 slot 落盘,直到达标或没得落。
+    while (total > MAX_TOOL_RESULTS_PER_MESSAGE) {
+        var biggest: ?usize = null;
+        var biggest_len: usize = 0;
+        for (slots, 0..) |s, k| {
+            const c = s.content orelse continue;
+            // 已是 persisted/truncated preview 的不再处理(幂等)。
+            if (std.mem.indexOf(u8, c, "\"persisted\":true") != null or std.mem.indexOf(u8, c, "\"truncated\":true") != null) continue;
+            if (c.len > biggest_len) {
+                biggest_len = c.len;
+                biggest = k;
+            }
+        }
+        const idx = biggest orelse break; // 没有可落盘的了
+        const s = &slots[idx];
+        const old = s.content.?;
+        // 强制落盘:用 0 阈值确保这个一定被落(maybePersist 内部按 maxResultChars 判,
+        // 这里直接调 persistForced 绕过阈值)。
+        const preview = storage.persistForced(parent_allocator, s.name, old, base_ctx.home_dir) catch null;
+        if (preview) |p| {
+            total = total - old.len + p.len;
+            parent_allocator.free(old);
+            s.content = p;
+        } else break; // 落盘失败 → 停(避免死循环)
+    }
 }
 
 /// 一批 safe slot 并发执行(每个独立线程,cap MAX_TOOL_CONCURRENCY)。

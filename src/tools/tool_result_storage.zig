@@ -26,9 +26,19 @@ pub fn maybePersist(
     content: []const u8,
     home_dir: []const u8,
 ) !?[]u8 {
-    const limit = maxResultChars(name);
-    if (content.len <= limit) return null;
+    if (content.len <= maxResultChars(name)) return null;
+    return try persistForced(allocator, name, content, home_dir);
+}
 
+/// 无视阈值,强制落盘并返回 preview(owned)。供 per-message 聚合预算挑大结果落盘用。
+/// 写盘失败 → 返回截断 preview(降级)。
+pub fn persistForced(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    content: []const u8,
+    home_dir: []const u8,
+) !?[]u8 {
+    _ = name;
     const hash = std.hash.Wyhash.hash(0, content);
 
     // 落盘路径:$HOME/.cc-zig/tool-results/<hash>.txt

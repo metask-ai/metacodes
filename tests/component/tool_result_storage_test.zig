@@ -62,3 +62,14 @@ test "L2 落盘: Read 工具不落盘(自限,maxResultChars=max)" {
     try std.testing.expectEqual(std.math.maxInt(usize), storage.maxResultChars("Read"));
     try std.testing.expectEqual(storage.DEFAULT_MAX_RESULT_CHARS, storage.maxResultChars("Grep"));
 }
+
+test "L2 落盘: persistForced 无视阈值强制落盘小结果" {
+    const a = std.testing.allocator;
+    _ = std.c.mkdir("/tmp/cc-trs-home", 0o755);
+    // 小结果(< 阈值),maybePersist 不落盘,但 persistForced 强制落盘
+    try std.testing.expect((try storage.maybePersist(a, "Grep", "tiny", "/tmp/cc-trs-home")) == null);
+    const r = (try storage.persistForced(a, "Grep", "tiny but forced", "/tmp/cc-trs-home")) orelse return error.ShouldPersist;
+    defer a.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "\"persisted\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "tiny but forced") != null);
+}
