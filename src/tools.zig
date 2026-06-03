@@ -227,7 +227,9 @@ pub const registry: []const ToolEntry = &.{
         .name = "Task",
         .description = "Launch a subagent in an isolated context to handle a side task. Each subagent starts with a fresh context — it cannot see this conversation, only the prompt you pass. Use for: high-volume operations (running tests, processing logs), parallel research, isolating exploration that would flood your context. Args: subagent_type (Explore/Plan/general-purpose/<custom>), description (3-5 word UI label), prompt (the delegation message). Optional: max_turns, model, run_in_background (true returns an agent_job_id immediately; poll with TaskOutput, stop with TaskStop).",
         .describe_fn = descriptions.describeTask,
-        .input_schema = .{ .type = "object", .properties = null, .required = &.{ "subagent_type", "description", "prompt" } },
+        // schema required 只列**真正必需**的:subagent_type 缺省 general-purpose、
+        // description 只是 UI 标签 → 都不是硬必需(agent.zig 有默认)。只有 prompt 缺会真失败。
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{"prompt"} },
         .execute = agent_tool.execute,
     },
     .{
@@ -335,10 +337,29 @@ pub fn executeTool(tool: *const ToolEntry, ctx: *const ToolContext, args: []cons
     return tool.execute(ctx, args);
 }
 
+/// Schema 层校验(对齐 cc 的 zod safeParse 层):执行前检查 input JSON 含所有 required
+/// 字段。缺则返 error.MissingRequiredField(agent_loop 转 invalid_args 现场给模型)。
+/// 这是工具自身 MissingX 检查之外的统一前置层——uniform + 在 dispatch 前拦,且对没写
+/// 自检的工具也兜底。检查用顶层 "field": 子串(与 extractJsonArg 同口径,够分辨缺失)。
+pub fn validateRequired(name: []const u8, args: []const u8) error{MissingRequiredField}!void {
+    const t = getTool(name) orelse return; // 动态工具(MCP/Skill)走自己的校验
+    const required = t.input_schema.required orelse return;
+    for (required) |field| {
+        var pat_buf: [128]u8 = undefined;
+        if (field.len + 3 > pat_buf.len) continue;
+        // 匹配 "field": (顶层键)。简化:子串匹配(args 是工具入参 JSON,误报概率极低)。
+        const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\"", .{field}) catch continue;
+        if (std.mem.indexOf(u8, args, pat) == null) return error.MissingRequiredField;
+    }
+}
+
 /// 统一派发：先查静态注册表，未命中查 ctx.dyn_registry。
 /// 找不到返 error.UnknownTool —— 由 agent_loop 转 tool_error 给模型。
 pub fn dispatch(ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror![]u8 {
-    if (getTool(name)) |t| return t.execute(ctx, args);
+    if (getTool(name)) |t| {
+        try validateRequired(name, args); // schema 层:缺 required 字段 → 早拦
+        return t.execute(ctx, args);
+    }
     if (ctx.dyn_registry) |dr| {
         if (dr.find(name)) |de| return de.execute(ctx, args, de.ctx_ptr);
     }
