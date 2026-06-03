@@ -49,13 +49,16 @@ pub const ResultKind = enum { ok, err };
 pub const ResultRenderMode = enum { hidden, summary };
 
 pub fn resultRenderMode(tool_name: []const u8) ResultRenderMode {
-    // opt-out:Task 族(状态在 Task 面板)、plan mode(模式切换,无输出)。
+    // opt-out(故意 hidden):
+    // - Task 族:状态在 Task 面板反馈,不刷消息流。
+    // - plan mode:模式切换,无输出。
+    // - AskUserQuestion:走专门的交互 UI(选项菜单),非工具卡片。
+    // - Skill:结果(rendered body)内联进对话文本,本身就是可见内容,无需卡片。
     if (std.mem.startsWith(u8, tool_name, "Task")) return .hidden;
     if (std.mem.eql(u8, tool_name, "EnterPlanMode") or std.mem.eql(u8, tool_name, "ExitPlanMode")) return .hidden;
-    // 有专用 summary 渲染器的工具。
-    // 注:WebSearch 现为普通函数工具(隔离子请求在 web_search.zig 内完成),
-    // 主对话把它当普通 tool_use/tool_result——需正常显示卡片(start + 结果摘要),
-    // 否则 resultRenderMode=hidden 会让 agent_loop 连 ⏺ 起始卡都跳过(屏幕全空)。
+    if (std.mem.eql(u8, tool_name, "AskUserQuestion")) return .hidden;
+    if (std.mem.eql(u8, tool_name, "Skill")) return .hidden;
+    // 有专用 summary 渲染器的工具(renderResultBody 分发到 diff/搜索/Read/WebFetch 渲染器)。
     const summary_tools = [_][]const u8{
         "Bash",     "BashOutput", "Edit", "Write", "Read", "Grep", "Glob",
         "WebFetch", "WebSearch",  "Agent",
@@ -63,7 +66,11 @@ pub fn resultRenderMode(tool_name: []const u8) ResultRenderMode {
     for (summary_tools) |t| {
         if (std.mem.eql(u8, tool_name, t)) return .summary;
     }
-    // 未知/无渲染器工具:默认 hidden(不吐 JSON)。新工具要显示就显式加渲染器 + summary。
+    // 有副作用、返回 JSON 的工具:有人话渲染器(renderJsonToolSummary)→ summary。
+    // 否则 hidden 会让 agent_loop 连 ⏺ 起始卡都跳过(工具被调用时 TUI 完全无感,
+    // 2026-06-04 实测过的 WebSearch bug)。
+    if (isJsonSummaryTool(tool_name)) return .summary;
+    // 真正未知/无渲染器的工具:仍 hidden(绝不裸吐 JSON;新工具要显示就加渲染器)。
     return .hidden;
 }
 
@@ -272,6 +279,11 @@ fn renderResultBody(
         // 两者结果首行均为人类可读摘要(WebSearch: `Web search results for query: "..."`);
         // 非 verbose 只显首行,verbose/transcript 展开。
         return renderWebFetchSummary(alloc, th, output_text, out, opts);
+    }
+    // 有副作用但返回 JSON 的工具:提关键字段拼一行人话(绝不裸吐 JSON)。
+    // NotebookEdit/KillShell/Monitor/Cron*/Worktree/PushNotification/ListMcp/ReadMcp/ToolSearch。
+    if (isJsonSummaryTool(tool_name)) {
+        return renderJsonToolSummary(alloc, th, tool_name, output_text, out, opts);
     }
     if (std.mem.eql(u8, tool_name, "Bash") or std.mem.eql(u8, tool_name, "BashOutput")) {
         return renderBashResult(alloc, th, output_text, out, opts);
@@ -869,6 +881,106 @@ fn extractField(args: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// 提取 JSON 顶层字段的**裸值**(bool/number/到 `,` 或 `}` 为止),不要求引号包裹。
+/// 用于 `"killed":true` / `"cells_after":5` / `"count":3` 这类非 string 值。
+fn extractRawField(args: []const u8, key: []const u8) ?[]const u8 {
+    var pat_buf: [64]u8 = undefined;
+    if (key.len + 4 > pat_buf.len) return null;
+    pat_buf[0] = '"';
+    @memcpy(pat_buf[1..][0..key.len], key);
+    pat_buf[1 + key.len] = '"';
+    pat_buf[2 + key.len] = ':';
+    const pat = pat_buf[0 .. 3 + key.len];
+    const idx = std.mem.indexOf(u8, args, pat) orelse return null;
+    var p = idx + pat.len;
+    while (p < args.len and (args[p] == ' ' or args[p] == '\t')) : (p += 1) {}
+    const start = p;
+    while (p < args.len and args[p] != ',' and args[p] != '}' and args[p] != ' ') : (p += 1) {}
+    if (p == start) return null;
+    return args[start..p];
+}
+
+/// 这些工具有副作用、返回 JSON,需提关键字段拼人话(绝不裸吐 JSON),由 renderJsonToolSummary 处理。
+fn isJsonSummaryTool(tool_name: []const u8) bool {
+    const names = [_][]const u8{
+        "NotebookEdit",         "KillShell",           "Monitor",
+        "CronCreate",           "CronDelete",          "CronList",
+        "EnterWorktree",        "ExitWorktree",        "PushNotification",
+        "ListMcpResourcesTool", "ReadMcpResourceTool", "ToolSearch",
+    };
+    for (names) |n| if (std.mem.eql(u8, tool_name, n)) return true;
+    return false;
+}
+
+/// 把有副作用工具的 JSON 结果提成一行人话。提不到关键字段 → 通用 "done" 兜底(不吐 JSON)。
+fn renderJsonToolSummary(
+    alloc: std.mem.Allocator,
+    th: Theme,
+    tool_name: []const u8,
+    output_text: []const u8,
+    out: *std.ArrayList(u8),
+    opts: RenderOpts,
+) !void {
+    var line_buf: [256]u8 = undefined;
+    const line: []const u8 = blk: {
+        if (std.mem.eql(u8, tool_name, "NotebookEdit")) {
+            const path = extractJsonStringField(output_text, "path") orelse "notebook";
+            const mode = extractJsonStringField(output_text, "mode") orelse "edit";
+            break :blk std.fmt.bufPrint(&line_buf, "{s} {s}", .{ mode, path }) catch "edited notebook";
+        }
+        if (std.mem.eql(u8, tool_name, "KillShell")) {
+            const status = extractJsonStringField(output_text, "status") orelse "killed";
+            break :blk std.fmt.bufPrint(&line_buf, "shell {s}", .{status}) catch "killed shell";
+        }
+        if (std.mem.eql(u8, tool_name, "Monitor")) {
+            const desc = extractJsonStringField(output_text, "description") orelse "";
+            if (desc.len > 0)
+                break :blk std.fmt.bufPrint(&line_buf, "monitoring: {s}", .{desc}) catch "monitor started"
+            else
+                break :blk "monitor started";
+        }
+        if (std.mem.eql(u8, tool_name, "CronCreate")) {
+            const rec = extractRawField(output_text, "recurring") orelse "false";
+            break :blk std.fmt.bufPrint(&line_buf, "scheduled (recurring={s})", .{rec}) catch "scheduled";
+        }
+        if (std.mem.eql(u8, tool_name, "CronDelete")) {
+            const del = extractRawField(output_text, "deleted") orelse "false";
+            break :blk std.fmt.bufPrint(&line_buf, "deleted={s}", .{del}) catch "deleted";
+        }
+        if (std.mem.eql(u8, tool_name, "CronList")) {
+            const cnt = extractRawField(output_text, "count") orelse "0";
+            break :blk std.fmt.bufPrint(&line_buf, "{s} scheduled job(s)", .{cnt}) catch "listed jobs";
+        }
+        if (std.mem.eql(u8, tool_name, "EnterWorktree")) {
+            const wt = extractJsonStringField(output_text, "worktree") orelse "worktree";
+            break :blk std.fmt.bufPrint(&line_buf, "entered {s}", .{wt}) catch "entered worktree";
+        }
+        if (std.mem.eql(u8, tool_name, "ExitWorktree")) {
+            break :blk "exited worktree";
+        }
+        if (std.mem.eql(u8, tool_name, "PushNotification")) {
+            const sent = extractRawField(output_text, "sent") orelse "true";
+            break :blk if (std.mem.eql(u8, sent, "true")) "notification sent" else "notification not sent";
+        }
+        if (std.mem.eql(u8, tool_name, "ToolSearch")) {
+            // 返回 <functions>...schema;数 <function> 个数。
+            var n: usize = 0;
+            var pos: usize = 0;
+            while (std.mem.indexOfPos(u8, output_text, pos, "<function>")) |i| : (pos = i + 1) n += 1;
+            break :blk std.fmt.bufPrint(&line_buf, "activated {d} tool(s)", .{n}) catch "activated tools";
+        }
+        if (std.mem.eql(u8, tool_name, "ListMcpResourcesTool") or std.mem.eql(u8, tool_name, "ReadMcpResourceTool")) {
+            break :blk "MCP resource(s)";
+        }
+        break :blk "done";
+    };
+    try appendLine(alloc, out, th.success, line, th.reset);
+    // verbose/transcript:展开原始 JSON 供排查(折叠)。
+    if (opts.verbose or opts.transcript) {
+        try renderGenericFold(alloc, th, output_text, out, opts);
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -1103,26 +1215,58 @@ test "VISUAL demo: Edit diff(TUI_DEMO=1)" {
 
 // ---- opt-out 不变量(无裸 JSON / hidden 工具结果不进消息流)----
 
-test "resultRenderMode: Task 族 + plan 模式 + 未知工具 → hidden" {
+test "resultRenderMode: 故意 hidden vs 应显示" {
+    // 故意 hidden:Task 族(Task 面板)、plan 模式(模式切换)、AskUserQuestion(交互 UI)、
+    // Skill(结果内联进对话文本)。
     try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("Task"));
     try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("TaskCreate"));
     try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("TaskOutput"));
     try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("EnterPlanMode"));
     try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("ExitPlanMode"));
-    // 无专用渲染器的工具(暂)归 hidden,绝不裸吐 JSON。
-    try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("NotebookEdit"));
+    try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("AskUserQuestion"));
     try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("Skill"));
-    try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("ListMcpResourcesTool"));
-    try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("ReadMcpResourceTool"));
-    // 完全未知的工具也 hidden。
+    // 完全未知的工具 hidden(绝不裸吐 JSON)。
     try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("SomeFutureTool"));
     // 有专用渲染器的工具 → summary。
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("Bash"));
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("Edit"));
     // 回归守卫:WebSearch 现为普通函数工具,必须 summary(否则 agent_loop 连 ⏺ 起始卡
-    // 都跳过 → TUI 完全不显示 web search,2026-06-04 实测过的 bug)。
+    // 都跳过 → TUI 完全不显示,2026-06-04 实测过的 bug)。
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("WebSearch"));
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("WebFetch"));
+    // 有副作用、返回 JSON 的工具:有人话渲染器 → summary(同样曾被误吞)。
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("NotebookEdit"));
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("KillShell"));
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("Monitor"));
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("CronCreate"));
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("EnterWorktree"));
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("PushNotification"));
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("ToolSearch"));
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("ListMcpResourcesTool"));
+}
+
+test "renderJsonToolSummary: 提人话不裸吐 JSON" {
+    const a = testing.allocator;
+    const th = theme_mod.monochrome;
+    const cases = [_]struct { name: []const u8, json: []const u8, want: []const u8 }{
+        .{ .name = "NotebookEdit", .json = "{\"success\":true,\"path\":\"nb.ipynb\",\"mode\":\"replace\",\"cells_after\":5}", .want = "replace nb.ipynb" },
+        .{ .name = "KillShell", .json = "{\"job_id\":\"j1\",\"status\":\"killed\"}", .want = "shell killed" },
+        .{ .name = "Monitor", .json = "{\"job_id\":\"j1\",\"status\":\"running\",\"description\":\"watch log\"}", .want = "monitoring: watch log" },
+        .{ .name = "CronCreate", .json = "{\"id\":\"c1\",\"recurring\":true,\"scheduled\":true}", .want = "recurring=true" },
+        .{ .name = "CronDelete", .json = "{\"deleted\":true,\"id\":\"c1\"}", .want = "deleted=true" },
+        .{ .name = "CronList", .json = "{\"jobs\":[],\"count\":3}", .want = "3 scheduled" },
+        .{ .name = "PushNotification", .json = "{\"sent\":true,\"message\":\"x\"}", .want = "notification sent" },
+    };
+    for (cases) |c| {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        try renderJsonToolSummary(a, th, c.name, c.json, &out, .{});
+        // 含人话关键词。
+        try testing.expect(std.mem.indexOf(u8, out.items, c.want) != null);
+        // 不裸吐 JSON(非 verbose 不应出现原始字段引号块)。
+        try testing.expect(std.mem.indexOf(u8, out.items, "\"success\"") == null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "\"job_id\"") == null);
+    }
 }
 
 test "renderResult: Task 成功结果不进消息流(空串)" {
@@ -1134,13 +1278,17 @@ test "renderResult: Task 成功结果不进消息流(空串)" {
     try testing.expectEqual(@as(usize, 0), s.len);
 }
 
-test "renderResult: NotebookEdit 成功结果 hidden(不裸吐 JSON)" {
+test "renderResult: NotebookEdit 显示人话摘要(不裸吐 JSON)" {
     const th = theme_mod.monochrome;
     const out = "{\"success\":true,\"path\":\"/n.ipynb\",\"mode\":\"replace\",\"cells_after\":3}";
     const s = try renderResult(testing.allocator, th, "NotebookEdit", "{\"notebook_path\":\"/n.ipynb\"}", out, .ok, 100, .{});
     defer testing.allocator.free(s);
-    // hidden:整条空串,屏幕上看不到任何 JSON 大括号。
-    try testing.expectEqual(@as(usize, 0), s.len);
+    // 显示卡片 + 人话摘要(mode + path),不再 hidden(曾被误吞,2026-06-04 修)。
+    try testing.expect(std.mem.indexOf(u8, s, "NotebookEdit") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "replace /n.ipynb") != null);
+    // 但绝不裸吐 JSON 字段名。
+    try testing.expect(std.mem.indexOf(u8, s, "\"success\"") == null);
+    try testing.expect(std.mem.indexOf(u8, s, "cells_after") == null);
 }
 
 test "renderResult: 错误结果提取 detail 而非裸吐 error JSON" {
