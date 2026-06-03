@@ -67,9 +67,9 @@ test "L2 工具排序: 动态工具按 name 排序(prefix 稳定)" {
     var dyn = cc.tools_dynamic.DynRegistry.init(a);
     defer dyn.deinit();
     // 乱序注册 3 个动态工具
-    try dyn.register("zzz_tool", "z", &.{}, dummyExec, null);
-    try dyn.register("aaa_tool", "a", &.{}, dummyExec, null);
-    try dyn.register("mmm_tool", "m", &.{}, dummyExec, null);
+    try dyn.register("zzz_tool", "z", &.{}, dummyExec, null, false);
+    try dyn.register("aaa_tool", "a", &.{}, dummyExec, null, false);
+    try dyn.register("mmm_tool", "m", &.{}, dummyExec, null, false);
 
     const defs = try cc.tools.toToolDefinitionsFull(a, &dyn, null);
     defer a.free(defs);

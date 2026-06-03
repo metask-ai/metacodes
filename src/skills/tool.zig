@@ -32,6 +32,7 @@ pub fn registerSkillTool(registry: *DynRegistry, set: *SkillSet) !void {
         &required,
         execute,
         @ptrCast(set),
+        false, // Skill 是单个常驻工具,不 deferred
     );
 }
 

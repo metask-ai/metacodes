@@ -301,19 +301,48 @@ pub fn buildFull(
         try allocator.dupe(u8, USING_TOOLS_SECTION);
     defer allocator.free(using_tools_section);
 
+    const deferred_section = try buildDeferredToolsSection(allocator);
+    defer allocator.free(deferred_section);
+
     const sep = "\n\n";
     return try std.mem.concat(allocator, u8, &.{
         INTRO_SECTION,             sep,
         SYSTEM_SECTION,            sep,
         DOING_TASKS_SECTION,       sep,
         ACTIONS_SECTION,           sep,
-        using_tools_section,       sep,
+        using_tools_section,       if (deferred_section.len > 0) sep else "",
+        deferred_section,          sep,
         TONE_SECTION,              sep,
         OUTPUT_EFFICIENCY_SECTION, sep,
         env_section,               if (skills_section.len > 0) sep else "",
         skills_section,            if (agents_section.len > 0) sep else "",
         agents_section,
     });
+}
+
+/// 列出 deferred 工具(name + 短描述),说明调 ToolSearch 取 schema 才能用(对齐 cc
+/// <available-deferred-tools>)。registry 里 deferred=true 的进名单。
+/// 注:内置工具现已全常驻(deferred=false),对齐 cc"只 defer MCP"。MCP 动态工具在
+/// DynRegistry(此函数看不到),其 prompt 列名待 MCP 启动接线后补;当前无 MCP → 返空串。
+fn buildDeferredToolsSection(allocator: std.mem.Allocator) ![]u8 {
+    const tools = @import("../tools.zig");
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    var any = false;
+    for (tools.registry) |*t| {
+        if (!t.deferred) continue;
+        if (!any) {
+            try buf.appendSlice(allocator,
+                \\# Deferred tools
+                \\The tools below are available but their parameter schemas are not loaded yet, so you cannot call them directly. To use one, first call ToolSearch with `select:<name>` (or keywords) to fetch its schema; after that it is callable like any other tool.
+                \\
+            );
+            any = true;
+        }
+        try buf.print(allocator, "\n- {s} — {s}", .{ t.name, t.description });
+    }
+    if (!any) return try allocator.dupe(u8, "");
+    return try buf.toOwnedSlice(allocator);
 }
 
 /// 按当前工具集动态拼 # Using your tools 段（对应 cc getUsingYourToolsSection）。

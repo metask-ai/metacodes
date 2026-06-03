@@ -47,6 +47,9 @@ pub const ToolDefinition = struct {
     /// 在 JSON 里输出 "type" 字段，而不带 description/input_schema。非 null 时切换到
     /// server-tool 序列化路径。
     server_type: ?[]const u8 = null,
+    /// 运行期内部标记(不序列化进 API):deferred 工具(MCP 等)默认不进 tools 数组,
+    /// 经 ToolSearch 激活后才发。agent_loop 据此过滤。
+    deferred: bool = false,
 };
 
 /// 单个参数的 JSON Schema 描述。comptime 友好（纯字面量），用于内置工具表里
@@ -196,30 +199,33 @@ fn serializeTools(tools: []const ToolDefinition, buf: *std.ArrayList(u8), alloca
     try buf.append(allocator, '[');
     for (tools, 0..) |tool, i| {
         if (i > 0) try buf.append(allocator, ',');
-        try buf.append(allocator, '{');
-        if (tool.server_type) |st| {
-            // Server tool 形态：{"type":"web_search_20250305","name":"web_search"}
-            try buf.appendSlice(allocator, "\"type\":");
-            try util_json.serializeString(st, buf, allocator);
-            try buf.appendSlice(allocator, ",\"name\":");
-            try util_json.serializeString(tool.name, buf, allocator);
-            // 非空 description 也带上(给模型用法指引,让它形成真实搜索 query)。
-            // Anthropic native 对 server tool 忽略 description,但代理后端会用它指导模型。
-            if (tool.description.len > 0) {
-                try buf.appendSlice(allocator, ",\"description\":");
-                try util_json.serializeString(tool.description, buf, allocator);
-            }
-        } else {
-            try buf.appendSlice(allocator, "\"name\":");
-            try util_json.serializeString(tool.name, buf, allocator);
-            try buf.appendSlice(allocator, ",\"description\":");
-            try util_json.serializeString(tool.description, buf, allocator);
-            try buf.appendSlice(allocator, ",\"input_schema\":");
-            try serializeInputSchema(tool.input_schema, buf, allocator);
-        }
-        try buf.append(allocator, '}');
+        try serializeOneTool(tool, buf, allocator);
     }
     try buf.append(allocator, ']');
+}
+
+/// 序列化单个工具为 `{"name","description","input_schema":{...}}`(server tool 形态见内)。
+/// ToolSearch 用它把命中工具的完整 schema 喂给模型(<functions> 块)。
+pub fn serializeOneTool(tool: ToolDefinition, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    try buf.append(allocator, '{');
+    if (tool.server_type) |st| {
+        try buf.appendSlice(allocator, "\"type\":");
+        try util_json.serializeString(st, buf, allocator);
+        try buf.appendSlice(allocator, ",\"name\":");
+        try util_json.serializeString(tool.name, buf, allocator);
+        if (tool.description.len > 0) {
+            try buf.appendSlice(allocator, ",\"description\":");
+            try util_json.serializeString(tool.description, buf, allocator);
+        }
+    } else {
+        try buf.appendSlice(allocator, "\"name\":");
+        try util_json.serializeString(tool.name, buf, allocator);
+        try buf.appendSlice(allocator, ",\"description\":");
+        try util_json.serializeString(tool.description, buf, allocator);
+        try buf.appendSlice(allocator, ",\"input_schema\":");
+        try serializeInputSchema(tool.input_schema, buf, allocator);
+    }
+    try buf.append(allocator, '}');
 }
 
 fn serializeInputSchema(schema: InputSchema, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {

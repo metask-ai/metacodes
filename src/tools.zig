@@ -21,6 +21,8 @@ const ask_user_tool = @import("tools/ask_user.zig");
 const plan_mode_tool = @import("tools/plan_mode.zig");
 const task_tools = @import("tools/task_tools.zig");
 const agent_tool = @import("tools/agent.zig");
+const tool_search_tool = @import("tools/tool_search.zig");
+const web_search_tool = @import("tools/web_search.zig");
 
 pub const ToolContext = @import("tools/context.zig").ToolContext;
 pub const PromptContext = @import("tools/prompt_context.zig").PromptContext;
@@ -46,6 +48,9 @@ pub const ToolEntry = struct {
     describe_fn: ?DescribeFn = null,
     input_schema: json.InputSchema,
     execute: ExecuteFn,
+    /// deferred(对齐 cc ToolSearch):true = 不进默认 tools 数组,只在 prompt 列名;
+    /// 模型须先调 ToolSearch 激活才可调。降低工具菜单稀释(弱后端会乱抓 Bash 的根因)。
+    deferred: bool = false,
 };
 
 pub const registry: []const ToolEntry = &.{
@@ -347,6 +352,29 @@ pub const registry: []const ToolEntry = &.{
         }, .required = &.{"prompt"} },
         .execute = agent_tool.execute,
     },
+    // ToolSearch:core 常驻。模型按 query 检索 deferred 工具的完整 schema 并激活,
+    // 激活后该工具进后续请求 tools 数组变可调(对齐 cc ToolSearch)。
+    .{
+        .name = "ToolSearch",
+        .description = "Fetches full schema definitions for deferred tools so they can be called. Some tools are deferred — only their names are shown in the prompt, with no parameter schema, so they cannot be invoked until fetched. Pass a `query` of keywords to find matching deferred tools, or `select:<tool_name>` (comma-separated for multiple) to fetch specific ones by name. Returns the matched tools' full JSON schemas; once returned, each tool is callable exactly like a core tool.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "query", .type = "string", .description = "Keywords to find deferred tools, or `select:<tool_name>` (comma-separated) to fetch by exact name." },
+            .{ .name = "max_results", .type = "integer", .description = "Maximum number of results to return (default 5)" },
+        }, .required = &.{"query"} },
+        .execute = tool_search_tool.execute,
+    },
+    // WebSearch:普通函数工具(对齐 mecode)。execute 在隔离子请求里用 server tool 真搜,
+    // 主请求只暴露此规整 schema——避免 server-tool 异形毒化后端。deferred(按需激活)。
+    .{
+        .name = "WebSearch",
+        .description = "Searches the web and returns matching results. allowed_domains narrows the search scope; blocked_domains filters final returned results.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "query", .type = "string", .description = "The search query to use." },
+            .{ .name = "allowed_domains", .type = "array", .description = "Restrict search results to these domains." },
+            .{ .name = "blocked_domains", .type = "array", .description = "Exclude these domains from final returned results." },
+        }, .required = &.{"query"} },
+        .execute = web_search_tool.execute,
+    },
 };
 
 pub fn getTool(name: []const u8) ?*const ToolEntry {
@@ -354,6 +382,27 @@ pub fn getTool(name: []const u8) ?*const ToolEntry {
         if (std.mem.eql(u8, tool.name, name)) return tool;
     }
     return null;
+}
+
+/// 把单个工具序列化为 schema JSON(`{"name","description","input_schema":{...}}`)。
+/// ToolSearch 用它把命中的 deferred 工具 schema 喂给模型。describe_fn 需 PromptContext,
+/// ToolSearch 处无之 → 用静态 description(足够模型理解参数)。caller free。
+pub fn toolSchemaJson(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    const t = getTool(name) orelse return error.UnknownTool;
+    const def = json.ToolDefinition{
+        .name = t.name,
+        .description = t.description,
+        .input_schema = .{
+            .type = t.input_schema.type,
+            .prop_specs = t.input_schema.prop_specs,
+            .properties = null,
+            .required = t.input_schema.required,
+        },
+    };
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try @import("api/request.zig").serializeOneTool(def, &buf, allocator);
+    return try buf.toOwnedSlice(allocator);
 }
 
 pub fn toToolDefinitions(allocator: std.mem.Allocator) ![]json.ToolDefinition {
@@ -399,6 +448,7 @@ pub fn toToolDefinitionsFull(
                 .properties = null,
                 .required = tool.input_schema.required,
             },
+            .deferred = tool.deferred,
         });
     }
 
@@ -416,14 +466,9 @@ pub fn toToolDefinitionsFull(
         }.lt);
     }
 
-    // WebSearch：Anthropic server tool，不走本地 execute；声明后 API 自己执行。
-    // name 固定 "web_search"，type 是版本化的 "web_search_20250305"。
-    try defs.append(allocator, .{
-        .name = "web_search",
-        .description = "",
-        .input_schema = .{ .type = "object", .properties = null, .required = &.{} },
-        .server_type = "web_search_20250305",
-    });
+    // 注:不再发 Anthropic server-tool 形态的 web_search(异形对象毒化弱后端 function-calling,
+    // 二分实证为根因)。WebSearch 改为普通函数工具(对齐 mecode),见 registry 里的 "WebSearch"
+    // 条目;其 execute 在隔离子请求里用 server tool 真搜,主请求只暴露规整 schema。
 
     return try defs.toOwnedSlice(allocator);
 }
@@ -689,16 +734,28 @@ test "getTool by name" {
     try std.testing.expect(getTool("web_search") == null);
 }
 
-test "toToolDefinitions creates all tools + web_search server tool" {
+test "toToolDefinitions creates all registry tools (WebSearch is a normal function tool)" {
     const defs = try toToolDefinitions(std.testing.allocator);
     defer std.testing.allocator.free(defs);
-    try std.testing.expect(defs.len == registry.len + 1); // +1 = web_search
-    // 最后一个是 web_search
-    try std.testing.expectEqualStrings("web_search", defs[defs.len - 1].name);
-    try std.testing.expect(defs[defs.len - 1].server_type != null);
+    // 不再追加 server-tool 形态的 web_search(异形毒化后端,已删)。defs == registry。
+    try std.testing.expect(defs.len == registry.len);
+    // WebSearch 作为普通函数工具在 registry 里,带 input_schema、无 server_type。
+    // 内置工具全常驻(对齐 cc:只 defer MCP),故 WebSearch 不 deferred。
+    const ws = getTool("WebSearch").?;
+    try std.testing.expect(!ws.deferred);
+    var found_ws = false;
+    for (defs) |d| {
+        if (std.mem.eql(u8, d.name, "WebSearch")) {
+            found_ws = true;
+            try std.testing.expect(d.server_type == null);
+        }
+        // 绝不应再出现 server-tool 形态的 web_search。
+        try std.testing.expect(!std.mem.eql(u8, d.name, "web_search"));
+    }
+    try std.testing.expect(found_ws);
 }
 
-test "toToolDefinitionsWithDyn appends dynamic tools before web_search" {
+test "toToolDefinitionsWithDyn appends dynamic tools after static (no server-tool web_search)" {
     const dyn_mod = @import("tools/dynamic.zig");
     var dyn = dyn_mod.DynRegistry.init(std.testing.allocator);
     defer dyn.deinit();
@@ -707,16 +764,14 @@ test "toToolDefinitionsWithDyn appends dynamic tools before web_search" {
             return std.testing.allocator.dupe(u8, "dummy");
         }
     }.exec;
-    try dyn.register("MySkill", "a skill", &.{}, dummy, null);
+    try dyn.register("MySkill", "a skill", &.{}, dummy, null, false);
 
     const defs = try toToolDefinitionsWithDyn(std.testing.allocator, &dyn);
     defer std.testing.allocator.free(defs);
 
-    try std.testing.expect(defs.len == registry.len + 2); // static + 1 dyn + web_search
-    // web_search 始终在最后
-    try std.testing.expectEqualStrings("web_search", defs[defs.len - 1].name);
-    // 倒数第二是 MySkill（dyn 在 web_search 之前 append）
-    try std.testing.expectEqualStrings("MySkill", defs[defs.len - 2].name);
+    try std.testing.expect(defs.len == registry.len + 1); // static + 1 dyn(无 web_search)
+    // 动态工具在末尾。
+    try std.testing.expectEqualStrings("MySkill", defs[defs.len - 1].name);
 }
 
 test "dispatch finds static tool" {
@@ -737,7 +792,7 @@ test "dispatch falls back to dyn_registry" {
             return std.testing.allocator.dupe(u8, args);
         }
     }.exec;
-    try dyn.register("Echo", "echoes input", &.{}, echo, null);
+    try dyn.register("Echo", "echoes input", &.{}, echo, null, false);
 
     var ctx = ToolContext.simple(std.testing.allocator);
     ctx.dyn_registry = &dyn;

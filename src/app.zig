@@ -124,6 +124,9 @@ pub const App = struct {
     /// 当前激活的 skill 状态(allowed/disallowed 临时白黑名单)。
     /// 激活 Skill 工具时设;loop.zig 处理下条 user message 前清。
     active_skill: ?ActiveSkillState = null,
+    /// ToolSearch 激活的 deferred 工具名集(会话级,只增不减)。每轮 agent_loop 据此把
+    /// deferred 工具放回 tools 数组。owns the duped name keys。
+    activated_tools: std.StringHashMap(void),
     /// 启动时缓存的 project root(沿 cwd 向上找 .git);null = 不在 git repo。
     /// 供 ${CLAUDE_PROJECT_DIR} 替换用。
     project_dir: ?[]u8 = null,
@@ -156,6 +159,7 @@ pub const App = struct {
             .permission_ctx = permission_mod.createContext(config.permission_mode, allocator),
             .abort = AbortSignal.init(),
             .skills = SkillSet.init(allocator),
+            .activated_tools = std.StringHashMap(void).init(allocator),
             .read_state = ReadState.init(allocator),
             .tasks = TaskStore.init(allocator),
             .dyn_registry = DynRegistry.init(allocator),
@@ -305,6 +309,11 @@ pub const App = struct {
         app.mcp_sessions.deinit(app.allocator);
         app.dyn_registry.deinit();
         if (app.active_skill) |*as| as.deinit();
+        {
+            var it = app.activated_tools.keyIterator();
+            while (it.next()) |k| app.allocator.free(k.*);
+            app.activated_tools.deinit();
+        }
         if (app.project_dir) |p| app.allocator.free(p);
         app.agents.deinit();
         for (app.worktree_stack.items) |entry| {
@@ -376,6 +385,21 @@ pub const App = struct {
     ) anyerror!void {
         const app: *App = @ptrCast(@alignCast(state));
         return app.activateSkill(skill_name, allowed, disallowed);
+    }
+
+    /// 激活一个 deferred 工具(ToolSearch 调):记入 activated_tools 集(dupe name,只增)。
+    /// 已激活则幂等。下一轮 agent_loop 据此把该工具放回 tools 数组。
+    pub fn activateTool(app: *App, tool_name: []const u8) !void {
+        if (app.activated_tools.contains(tool_name)) return;
+        const key = try app.allocator.dupe(u8, tool_name);
+        errdefer app.allocator.free(key);
+        try app.activated_tools.put(key, {});
+    }
+
+    /// Trampoline: ToolContext.activate_tool_fn 签名 — ToolSearch 调用它激活 deferred 工具。
+    pub fn activateToolTrampoline(state: *anyopaque, tool_name: []const u8) anyerror!void {
+        const app: *App = @ptrCast(@alignCast(state));
+        return app.activateTool(tool_name);
     }
 
     /// 取 project_dir;不在 git repo 返空串(供 ${CLAUDE_PROJECT_DIR} 替换默认值)。

@@ -70,7 +70,7 @@ pub const McpSession = struct {
             const full_name = try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ server_prefix, name });
             defer self.allocator.free(full_name);
 
-            try registry.register(full_name, desc, &.{}, executeMcpTool, binding);
+            try registry.register(full_name, desc, &.{}, executeMcpTool, binding, true);
             try self.bindings.append(self.allocator, binding);
         }
     }
@@ -90,7 +90,7 @@ pub const McpSession = struct {
             errdefer self.allocator.free(binding.mcp_tool_name);
             const name = try std.fmt.allocPrint(self.allocator, "{s}__list_resources", .{server_prefix});
             defer self.allocator.free(name);
-            try registry.register(name, "List resources exposed by this MCP server.", &.{}, executeListResources, binding);
+            try registry.register(name, "List resources exposed by this MCP server.", &.{}, executeListResources, binding, true);
             try self.bindings.append(self.allocator, binding);
         }
         // read_resource
@@ -102,7 +102,7 @@ pub const McpSession = struct {
             const name = try std.fmt.allocPrint(self.allocator, "{s}__read_resource", .{server_prefix});
             defer self.allocator.free(name);
             const required = [_][]const u8{"uri"};
-            try registry.register(name, "Read a resource from this MCP server by uri.", &required, executeReadResource, binding);
+            try registry.register(name, "Read a resource from this MCP server by uri.", &required, executeReadResource, binding, true);
             try self.bindings.append(self.allocator, binding);
         }
     }

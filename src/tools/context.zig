@@ -60,6 +60,11 @@ pub const ToolContext = struct {
         allowed: []const []const u8,
         disallowed: []const []const u8,
     ) anyerror!void = null,
+    /// ToolSearch 激活 deferred 工具的回调(仿 activate_skill)。
+    /// 签名:(state_ptr, tool_name) → !void。state_ptr 指向 *App,把 tool_name 记入
+    /// App 的 activated 集,下一轮该 deferred 工具进 tools 数组变可调。null = 不接管。
+    activate_tool_state: ?*anyopaque = null,
+    activate_tool_fn: ?*const fn (state: *anyopaque, tool_name: []const u8) anyerror!void = null,
     /// 用户是否显式触发(true = 用户 /name;false = 模型自主调用)。
     /// 用于 disable-model-invocation 检查。
     explicit_invocation: bool = false,

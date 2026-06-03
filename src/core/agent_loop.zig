@@ -92,6 +92,9 @@ pub const Options = struct {
         allowed: []const []const u8,
         disallowed: []const []const u8,
     ) anyerror!void = null,
+    /// ToolSearch 激活 deferred 工具的回调(透传到 ToolContext)。
+    activate_tool_state: ?*anyopaque = null,
+    activate_tool_fn: ?*const fn (state: *anyopaque, tool_name: []const u8) anyerror!void = null,
     /// 本轮的 Skill 工具调用是否为"用户显式 /name 触发"。
     /// 当前 Stage C 总是 false(只支持模型自主);Stage D 加 /<skill-name> 命令后置 true。
     explicit_invocation: bool = false,
@@ -113,6 +116,9 @@ pub const Options = struct {
     model_override: ?[]const u8 = null,
     /// Skill 集合(Task 工具 subagent preload_skills 字段用)。
     skills_set: ?*const @import("../skills/skill.zig").SkillSet = null,
+    /// ToolSearch 激活的 deferred 工具名集。非 null 时:deferred 且不在此集的工具
+    /// 不进 API tools 数组(降低弱后端工具菜单稀释)。null = 不过滤 deferred(全暴露)。
+    activated_tools: ?*const std.StringHashMap(void) = null,
     /// Worktree state(EnterWorktree/ExitWorktree 工具用)。
     worktree_state: ?*anyopaque = null,
     worktree_push_fn: ?*const fn (
@@ -251,7 +257,34 @@ pub fn run(
         const pool_filter = @import("../skills/tool_pool_filter.zig");
         const filtered_pool = pool_filter.filterToolDefs(allocator, tool_defs, permission_ctx.active_skill) catch null;
         defer pool_filter.freeFiltered(allocator, filtered_pool);
-        const effective_tool_defs = if (filtered_pool) |fp| fp else tool_defs;
+        const skill_filtered = if (filtered_pool) |fp| fp else tool_defs;
+
+        // deferred 过滤(对齐 cc:isMcp→defer)。deferred 工具(主要是 MCP 动态工具)
+        // 未激活 → 不进 tools 数组,经 ToolSearch 取 schema 激活后才发。内置工具全不 deferred
+        // (实测 33 工具守纪律;真根因是 web_search 异形而非工具数)。
+        // 仅顶层(opts.activated_tools 非 null)生效;subagent 不传 → 全暴露。
+        var deferred_filtered: ?[]json_mod.ToolDefinition = null;
+        defer if (deferred_filtered) |df| allocator.free(df);
+        const effective_tool_defs = blk: {
+            const acts = opts.activated_tools orelse break :blk skill_filtered;
+            // 无任何 deferred 工具 → 不必过滤(对齐 cc:无 deferred 则正常全发)。
+            var has_deferred = false;
+            for (skill_filtered) |d| {
+                if (d.deferred) {
+                    has_deferred = true;
+                    break;
+                }
+            }
+            if (!has_deferred) break :blk skill_filtered;
+            var keep: std.ArrayList(json_mod.ToolDefinition) = .empty;
+            errdefer keep.deinit(allocator);
+            for (skill_filtered) |d| {
+                if (d.deferred and !acts.contains(d.name)) continue; // deferred 未激活 → 隐藏
+                keep.append(allocator, d) catch break :blk skill_filtered;
+            }
+            deferred_filtered = keep.toOwnedSlice(allocator) catch break :blk skill_filtered;
+            break :blk deferred_filtered.?;
+        };
 
         // 3. 发送流式请求（abortable 版本：abort 通过 EventIterator 检查点传播）
         //    带 opts.model_override:subagent 用自己的 model(如 Explore=haiku);
@@ -492,6 +525,8 @@ pub fn run(
             .dyn_registry = opts.dyn_registry,
             .activate_skill_state = opts.activate_skill_state,
             .activate_skill_fn = opts.activate_skill_fn,
+            .activate_tool_state = opts.activate_tool_state,
+            .activate_tool_fn = opts.activate_tool_fn,
             .explicit_invocation = opts.explicit_invocation,
             .session_id = opts.session_id,
             .project_dir = opts.project_dir,

@@ -25,6 +25,9 @@ pub const DynToolEntry = struct {
     required_fields: []const []const u8 = &.{}, // owned（每个 entry + slice）
     execute: DynExecuteFn,
     ctx_ptr: ?*anyopaque = null,
+    /// deferred(对齐 cc isMcp→defer):MCP 工具 true → 不进默认 tools 数组,经 ToolSearch
+    /// 激活才发。Skill 工具 false(它是单个常驻工具)。
+    deferred: bool = false,
 };
 
 pub const DynRegistry = struct {
@@ -46,6 +49,7 @@ pub const DynRegistry = struct {
     }
 
     /// 注册（转移字符串所有权）。name 不能与已有冲突。
+    /// deferred: MCP 工具传 true(经 ToolSearch 激活才发);Skill 等常驻工具传 false。
     pub fn register(
         self: *DynRegistry,
         name: []const u8,
@@ -53,6 +57,7 @@ pub const DynRegistry = struct {
         required_fields: []const []const u8,
         execute: DynExecuteFn,
         ctx_ptr: ?*anyopaque,
+        deferred: bool,
     ) !void {
         for (self.entries.items) |e| {
             if (std.mem.eql(u8, e.name, name)) return error.ToolAlreadyRegistered;
@@ -76,6 +81,7 @@ pub const DynRegistry = struct {
             .required_fields = req_owned,
             .execute = execute,
             .ctx_ptr = ctx_ptr,
+            .deferred = deferred,
         });
     }
 
@@ -102,6 +108,7 @@ pub const DynRegistry = struct {
                     .properties = null,
                     .required = e.required_fields,
                 },
+                .deferred = e.deferred,
             });
         }
     }
@@ -120,7 +127,7 @@ fn dummyExec(_: *const ToolContext, _: []const u8, _: ?*anyopaque) anyerror![]u8
 test "DynRegistry: register + find" {
     var r = DynRegistry.init(testing.allocator);
     defer r.deinit();
-    try r.register("my_tool", "description", &.{"arg1"}, dummyExec, null);
+    try r.register("my_tool", "description", &.{"arg1"}, dummyExec, null, false);
     const e = r.find("my_tool").?;
     try testing.expectEqualStrings("my_tool", e.name);
     try testing.expectEqualStrings("description", e.description);
@@ -130,8 +137,8 @@ test "DynRegistry: register + find" {
 test "DynRegistry: duplicate register errors" {
     var r = DynRegistry.init(testing.allocator);
     defer r.deinit();
-    try r.register("t", "d", &.{}, dummyExec, null);
-    try testing.expectError(error.ToolAlreadyRegistered, r.register("t", "d", &.{}, dummyExec, null));
+    try r.register("t", "d", &.{}, dummyExec, null, false);
+    try testing.expectError(error.ToolAlreadyRegistered, r.register("t", "d", &.{}, dummyExec, null, false));
 }
 
 test "DynRegistry: find missing returns null" {
@@ -143,8 +150,8 @@ test "DynRegistry: find missing returns null" {
 test "DynRegistry: appendDefinitions appends" {
     var r = DynRegistry.init(testing.allocator);
     defer r.deinit();
-    try r.register("t1", "desc1", &.{"a"}, dummyExec, null);
-    try r.register("t2", "desc2", &.{ "a", "b" }, dummyExec, null);
+    try r.register("t1", "desc1", &.{"a"}, dummyExec, null, false);
+    try r.register("t2", "desc2", &.{ "a", "b" }, dummyExec, null, false);
 
     var defs = std.ArrayList(json.ToolDefinition).empty;
     defer defs.deinit(testing.allocator);
@@ -156,7 +163,7 @@ test "DynRegistry: appendDefinitions appends" {
 test "DynRegistry: execute dispatches to fn" {
     var r = DynRegistry.init(testing.allocator);
     defer r.deinit();
-    try r.register("dummy", "d", &.{}, dummyExec, null);
+    try r.register("dummy", "d", &.{}, dummyExec, null, false);
     const e = r.find("dummy").?;
     const ctx = ToolContext.simple(testing.allocator);
     const out = try e.execute(&ctx, "{}", e.ctx_ptr);

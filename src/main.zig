@@ -329,6 +329,8 @@ test {
     _ = &@import("agents/preload.zig");
     _ = &@import("tools/monitor.zig");
     _ = &@import("tools/notebook_edit.zig");
+    _ = &@import("tools/tool_search.zig");
+    _ = &@import("tools/web_search.zig");
     _ = &@import("tools/worktree.zig");
     _ = &@import("tools/mcp_resources.zig");
     _ = &@import("tools/push_notification.zig");
