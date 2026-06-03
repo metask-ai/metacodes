@@ -53,13 +53,12 @@ pub fn resultRenderMode(tool_name: []const u8) ResultRenderMode {
     if (std.mem.startsWith(u8, tool_name, "Task")) return .hidden;
     if (std.mem.eql(u8, tool_name, "EnterPlanMode") or std.mem.eql(u8, tool_name, "ExitPlanMode")) return .hidden;
     // 有专用 summary 渲染器的工具。
-    // 注:WebSearch 是 Anthropic server tool,结果由 stream.zig:renderWebSearchResults
-    // 单独渲染,不走本地 renderResult 路径,故不在此列。
-    // 注:NotebookEdit/Skill/ListMcp/ReadMcp 暂无专用渲染器 → 走 hidden(不裸吐 JSON),
-    // 后续补 summary 渲染器时再加入本列(对齐 A2)。
+    // 注:WebSearch 现为普通函数工具(隔离子请求在 web_search.zig 内完成),
+    // 主对话把它当普通 tool_use/tool_result——需正常显示卡片(start + 结果摘要),
+    // 否则 resultRenderMode=hidden 会让 agent_loop 连 ⏺ 起始卡都跳过(屏幕全空)。
     const summary_tools = [_][]const u8{
-        "Bash", "BashOutput", "Edit", "Write", "Read", "Grep", "Glob",
-        "WebFetch", "Agent",
+        "Bash",     "BashOutput", "Edit", "Write", "Read", "Grep", "Glob",
+        "WebFetch", "WebSearch",  "Agent",
     };
     for (summary_tools) |t| {
         if (std.mem.eql(u8, tool_name, t)) return .summary;
@@ -269,7 +268,9 @@ fn renderResultBody(
     if (std.mem.eql(u8, tool_name, "Read")) {
         return renderReadSummary(alloc, th, output_text, out, opts);
     }
-    if (std.mem.eql(u8, tool_name, "WebFetch")) {
+    if (std.mem.eql(u8, tool_name, "WebFetch") or std.mem.eql(u8, tool_name, "WebSearch")) {
+        // 两者结果首行均为人类可读摘要(WebSearch: `Web search results for query: "..."`);
+        // 非 verbose 只显首行,verbose/transcript 展开。
         return renderWebFetchSummary(alloc, th, output_text, out, opts);
     }
     if (std.mem.eql(u8, tool_name, "Bash") or std.mem.eql(u8, tool_name, "BashOutput")) {
@@ -1118,6 +1119,10 @@ test "resultRenderMode: Task 族 + plan 模式 + 未知工具 → hidden" {
     // 有专用渲染器的工具 → summary。
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("Bash"));
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("Edit"));
+    // 回归守卫:WebSearch 现为普通函数工具,必须 summary(否则 agent_loop 连 ⏺ 起始卡
+    // 都跳过 → TUI 完全不显示 web search,2026-06-04 实测过的 bug)。
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("WebSearch"));
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("WebFetch"));
 }
 
 test "renderResult: Task 成功结果不进消息流(空串)" {
