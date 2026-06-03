@@ -123,12 +123,13 @@ pub fn executeCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     const subject = try extractUnescapedOrError(ctx.allocator, args, "subject");
     defer ctx.allocator.free(subject);
-    const description_opt = try extractUnescaped(ctx.allocator, args, "description");
-    defer if (description_opt) |d| ctx.allocator.free(d);
+    // description 必填(对齐 cc TaskCreateTool 的 z.string() + schema required)。
+    // 缺字段返具名 MissingDescription(不再 orelse "" 静默吞掉,与 schema 声明一致)。
+    const description = try extractUnescapedOrError(ctx.allocator, args, "description");
+    defer ctx.allocator.free(description);
     const active_form = try extractUnescaped(ctx.allocator, args, "activeForm");
     defer if (active_form) |af| ctx.allocator.free(af);
 
-    const description = description_opt orelse "";
     const t = try store.create(subject, description, active_form);
 
     var out: std.ArrayList(u8) = .empty;
@@ -380,6 +381,15 @@ test "TaskCreate({}) 缺 subject → 具名 MissingSubject(非 MissingField)" {
     defer store.deinit();
     const ctx = testCtx(&store);
     try testing.expectError(error.MissingSubject, executeCreate(&ctx, "{}"));
+}
+
+// 对齐 cc:description 必填。早先实现 `orelse ""` 静默吞掉缺失,与 schema required
+// 声明矛盾。现在缺 description(但有 subject)返具名 MissingDescription。
+test "TaskCreate 有 subject 缺 description → 具名 MissingDescription" {
+    var store = task_store.TaskStore.init(testing.allocator);
+    defer store.deinit();
+    const ctx = testCtx(&store);
+    try testing.expectError(error.MissingDescription, executeCreate(&ctx, "{\"subject\":\"S\"}"));
 }
 
 test "TaskGet({}) 缺 taskId → 具名 MissingTaskId" {

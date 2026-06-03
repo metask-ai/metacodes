@@ -49,9 +49,26 @@ pub const ToolDefinition = struct {
     server_type: ?[]const u8 = null,
 };
 
+/// 单个参数的 JSON Schema 描述。comptime 友好（纯字面量），用于内置工具表里
+/// 静态声明 properties。模型据此知道每个字段的**名字+类型+用途**——否则只能从
+/// required 列表反推名字、毫无类型/说明，OpenAI 兼容层行为不稳，触发空参/漏参风暴。
+pub const PropSpec = struct {
+    name: []const u8,
+    /// JSON Schema type: "string" / "integer" / "number" / "boolean" / "array" / "object"
+    type: []const u8,
+    description: []const u8 = "",
+    /// array 元素类型（type=="array" 时输出 "items":{"type":...}）。
+    items_type: ?[]const u8 = null,
+    /// 枚举取值（输出 "enum":[...]）。
+    enum_values: ?[]const []const u8 = null,
+};
+
 pub const InputSchema = struct {
     type: []const u8 = "object",
+    /// 动态工具（MCP/Skill）运行时构造的 properties。与 prop_specs 二选一。
     properties: ?std.json.ObjectMap = null,
+    /// 内置工具 comptime 声明的 properties。非 null 时优先于 properties 序列化。
+    prop_specs: ?[]const PropSpec = null,
     required: ?[]const []const u8 = null,
 };
 
@@ -186,6 +203,12 @@ fn serializeTools(tools: []const ToolDefinition, buf: *std.ArrayList(u8), alloca
             try util_json.serializeString(st, buf, allocator);
             try buf.appendSlice(allocator, ",\"name\":");
             try util_json.serializeString(tool.name, buf, allocator);
+            // 非空 description 也带上(给模型用法指引,让它形成真实搜索 query)。
+            // Anthropic native 对 server tool 忽略 description,但代理后端会用它指导模型。
+            if (tool.description.len > 0) {
+                try buf.appendSlice(allocator, ",\"description\":");
+                try util_json.serializeString(tool.description, buf, allocator);
+            }
         } else {
             try buf.appendSlice(allocator, "\"name\":");
             try util_json.serializeString(tool.name, buf, allocator);
@@ -207,7 +230,17 @@ fn serializeInputSchema(schema: InputSchema, buf: *std.ArrayList(u8), allocator:
     // Anthropic native API 对 null properties 是宽容的，但 napi.origintask.cn 这类兼容
     // 层会返 400 "object schema missing properties"。无参数工具序列化为 "properties":{}
     // 才能两边都接受。
-    if (schema.properties) |props| {
+    //
+    // 优先级：prop_specs（内置工具 comptime 声明）> properties（动态工具运行时 ObjectMap）
+    // > {}（无参数）。prop_specs 给模型完整的字段名+类型+说明，根治"空参/漏参风暴"。
+    if (schema.prop_specs) |specs| {
+        try buf.appendSlice(allocator, ",\"properties\":{");
+        for (specs, 0..) |spec, i| {
+            if (i > 0) try buf.append(allocator, ',');
+            try serializePropSpec(spec, buf, allocator);
+        }
+        try buf.append(allocator, '}');
+    } else if (schema.properties) |props| {
         try buf.appendSlice(allocator, ",\"properties\":{");
         var first = true;
         var it = props.iterator();
@@ -227,6 +260,31 @@ fn serializeInputSchema(schema: InputSchema, buf: *std.ArrayList(u8), allocator:
         for (req, 0..) |r, i| {
             if (i > 0) try buf.append(allocator, ',');
             try util_json.serializeString(r, buf, allocator);
+        }
+        try buf.append(allocator, ']');
+    }
+    try buf.append(allocator, '}');
+}
+
+/// 序列化单个 PropSpec 为 `"name":{"type":...,"description":...,...}`。
+fn serializePropSpec(spec: PropSpec, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    try util_json.serializeString(spec.name, buf, allocator);
+    try buf.appendSlice(allocator, ":{\"type\":");
+    try util_json.serializeString(spec.type, buf, allocator);
+    if (spec.description.len > 0) {
+        try buf.appendSlice(allocator, ",\"description\":");
+        try util_json.serializeString(spec.description, buf, allocator);
+    }
+    if (spec.items_type) |it| {
+        try buf.appendSlice(allocator, ",\"items\":{\"type\":");
+        try util_json.serializeString(it, buf, allocator);
+        try buf.append(allocator, '}');
+    }
+    if (spec.enum_values) |vals| {
+        try buf.appendSlice(allocator, ",\"enum\":[");
+        for (vals, 0..) |v, i| {
+            if (i > 0) try buf.append(allocator, ',');
+            try util_json.serializeString(v, buf, allocator);
         }
         try buf.append(allocator, ']');
     }
@@ -421,6 +479,33 @@ test "serializeInputSchema emits empty properties for zero-arg tool" {
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"properties\":{}") != null);
 }
 
+test "serializeTools: server tool 带非空 description 会序列化(让模型形成真 query)" {
+    const defs = [_]ToolDefinition{.{
+        .name = "web_search",
+        .description = "Derive a concise query.",
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{} },
+        .server_type = "web_search_20250305",
+    }};
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try serializeTools(&defs, &buf, std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"type\":\"web_search_20250305\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"description\":\"Derive a concise query.\"") != null);
+}
+
+test "serializeTools: server tool 空 description 不序列化 description 字段" {
+    const defs = [_]ToolDefinition{.{
+        .name = "web_search",
+        .description = "",
+        .input_schema = .{ .type = "object", .properties = null, .required = &.{} },
+        .server_type = "web_search_20250305",
+    }};
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try serializeTools(&defs, &buf, std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"description\"") == null);
+}
+
 test "serializeInputSchema with required fields still emits properties" {
     // 另一个常见 case：required=["taskId"] 但我们的 InputSchema 没定义
     // properties map。OpenAI 兼容层对这种"声明 required 字段但没在 properties 里"本来
@@ -432,4 +517,42 @@ test "serializeInputSchema with required fields still emits properties" {
     try serializeInputSchema(schema, &buf, std.testing.allocator);
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"properties\":{}") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"required\":[\"taskId\"]") != null);
+}
+
+test "serializeInputSchema: prop_specs 输出具名字段+类型+说明(根治空 properties)" {
+    // 核心回归:有 prop_specs 时 properties 必须含真实字段定义,而非空 {}。
+    // 这是 TaskCreate MissingRequiredField bug 的根因——模型拿不到字段名。
+    const schema = InputSchema{
+        .type = "object",
+        .prop_specs = &.{
+            .{ .name = "subject", .type = "string", .description = "A brief title for the task" },
+            .{ .name = "description", .type = "string", .description = "What needs to be done" },
+        },
+        .required = &.{ "subject", "description" },
+    };
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try serializeInputSchema(schema, &buf, std.testing.allocator);
+    // 不再是空 properties
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"properties\":{}") == null);
+    // 含具名字段 + 类型 + 说明
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"subject\":{\"type\":\"string\",\"description\":\"A brief title for the task\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"description\":{\"type\":\"string\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"required\":[\"subject\",\"description\"]") != null);
+}
+
+test "serializeInputSchema: prop_specs 支持 array items 与 enum" {
+    const schema = InputSchema{
+        .type = "object",
+        .prop_specs = &.{
+            .{ .name = "tags", .type = "array", .items_type = "string" },
+            .{ .name = "mode", .type = "string", .enum_values = &.{ "a", "b" } },
+        },
+        .required = &.{},
+    };
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try serializeInputSchema(schema, &buf, std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"items\":{\"type\":\"string\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"enum\":[\"a\",\"b\"]") != null);
 }

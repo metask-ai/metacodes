@@ -45,3 +45,91 @@ test "L2 schema: MissingRequiredField 归 invalid_args" {
     defer a.free(j);
     try std.testing.expect(std.mem.indexOf(u8, j, "invalid_args") != null);
 }
+
+// ---- 类型层(validateTypes,对齐 cc zod 类型校验) ----
+
+test "L2 schema 类型: Bash.timeout 该 int 传 string → 拦" {
+    try std.testing.expectError(error.InvalidFieldType, tools.validateTypes("Bash", "{\"command\":\"ls\",\"timeout\":\"5\"}"));
+    // 正确类型通过
+    try tools.validateTypes("Bash", "{\"command\":\"ls\",\"timeout\":5}");
+}
+
+test "L2 schema 类型: Edit.replace_all 该 bool 传 string → 拦" {
+    try std.testing.expectError(error.InvalidFieldType, tools.validateTypes("Edit", "{\"file_path\":\"/x\",\"old_string\":\"a\",\"new_string\":\"b\",\"replace_all\":\"yes\"}"));
+    try tools.validateTypes("Edit", "{\"file_path\":\"/x\",\"old_string\":\"a\",\"new_string\":\"b\",\"replace_all\":true}");
+}
+
+test "L2 schema 类型: Read.limit 该 int 传 string → 拦" {
+    try std.testing.expectError(error.InvalidFieldType, tools.validateTypes("Read", "{\"file_path\":\"/x\",\"limit\":\"10\"}"));
+    try tools.validateTypes("Read", "{\"file_path\":\"/x\",\"limit\":10}");
+}
+
+test "L2 schema 类型: 字段缺失 → 类型层跳过(不误报)" {
+    // Read 不带 limit/offset → 类型层不报
+    try tools.validateTypes("Read", "{\"file_path\":\"/x\"}");
+    // command 是 string,正确
+    try tools.validateTypes("Bash", "{\"command\":\"ls -la\"}");
+}
+
+test "L2 schema 类型: file_path 该 string 传 number → 拦" {
+    try std.testing.expectError(error.InvalidFieldType, tools.validateTypes("Write", "{\"file_path\":123,\"content\":\"x\"}"));
+}
+
+test "L2 schema 类型: InvalidFieldType 归 invalid_args" {
+    const a = std.testing.allocator;
+    const j = try cc.tool_error.errorToJson("InvalidFieldType", "{s} failed", .{"InvalidFieldType"}, a);
+    defer a.free(j);
+    try std.testing.expect(std.mem.indexOf(u8, j, "invalid_args") != null);
+}
+
+// ---- properties 端到端(根治 TaskCreate MissingRequiredField:模型必须收到字段定义) ----
+
+test "L2 接线: toToolDefinitions 透传内置工具的 prop_specs(非 null 且含具名字段)" {
+    const a = std.testing.allocator;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+
+    // 找 TaskCreate / Read,断言它们带 prop_specs(早先 toToolDefinitionsFull 硬编码
+    // null 把 schema 抹掉 → 模型只收到空 properties → 空参风暴)。
+    var saw_taskcreate = false;
+    var saw_read = false;
+    for (defs) |d| {
+        if (std.mem.eql(u8, d.name, "TaskCreate")) {
+            saw_taskcreate = true;
+            const specs = d.input_schema.prop_specs orelse return error.TestUnexpectedResult;
+            var has_subject = false;
+            var has_description = false;
+            for (specs) |s| {
+                if (std.mem.eql(u8, s.name, "subject")) has_subject = true;
+                if (std.mem.eql(u8, s.name, "description")) has_description = true;
+            }
+            try std.testing.expect(has_subject and has_description);
+        }
+        if (std.mem.eql(u8, d.name, "Read")) {
+            saw_read = true;
+            const specs = d.input_schema.prop_specs orelse return error.TestUnexpectedResult;
+            try std.testing.expect(specs.len > 0);
+            try std.testing.expect(std.mem.eql(u8, specs[0].name, "file_path"));
+        }
+    }
+    try std.testing.expect(saw_taskcreate and saw_read);
+}
+
+test "L2 序列化: 整个请求体里 TaskCreate 的 properties 含 subject/description(非空)" {
+    const a = std.testing.allocator;
+    const defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(defs);
+
+    const types = cc.json_mod;
+    const msg = cc.types_mod.ApiMessage{ .role = .user, .content = &.{.{ .text = "hi" }} };
+    const req = types.MessagesRequest{ .model = "m", .messages = &.{msg}, .tools = defs };
+    const body = try types.serializeMessagesRequest(req, a);
+    defer a.free(body);
+
+    // 真正抓本 bug 的断言:发给模型的 schema 里,TaskCreate 的 properties 不是空 {},
+    // 含具名字段+类型。子串足够(字段定义紧凑无空格)。
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"subject\":{\"type\":\"string\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"file_path\":{\"type\":\"string\"") != null);
+    // 不应再出现"required 点名了字段但 properties 是空 {}"的自相矛盾形态。
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"properties\":{\"") != null);
+}

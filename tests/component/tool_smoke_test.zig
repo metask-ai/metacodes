@@ -1,0 +1,192 @@
+//! L2 组件测试(层2):工具执行冒烟 —— 统一走 dispatch 整链。
+//!
+//! 与既有 src/tools/*.zig 单测的区别:那些**直调 execute**,绕过了 dispatch 的
+//! validateRequired + validateTypes 前置校验链;而 agent_loop 实际走的是 dispatch。
+//! 本测试用 cc.tools.dispatch(&ctx, name, args) 跑完整链路,确保:
+//!   ① 正常入参 → 工具执行成功、输出含预期;
+//!   ② 缺 required 字段 → MissingRequiredField(校验链拦在 execute 前);
+//!   ③ 类型错 → InvalidFieldType。
+//! 每工具 2-3 例(正常 + 错误/边界)。
+//!
+//! 不可在纯 L2 自动化执行的工具(WebFetch 需网络、Cron 需时钟、PushNotification 发
+//! 系统通知、AskUserQuestion 需 TTY、Monitor 长驻、Worktree 改 cwd+git、MCP 需 server)
+//! 不在此造执行冒烟——它们的 schema 由 tool_schema_coverage_test 覆盖,执行覆盖缺口
+//! 在 doc/E2E_TESTING.md 差距矩阵登记。详见该文档。
+
+const std = @import("std");
+const cc = @import("cc");
+
+const tools = cc.tools;
+const ToolContext = cc.tool_context.ToolContext;
+
+fn simpleCtx(a: std.mem.Allocator) ToolContext {
+    return ToolContext.simple(a);
+}
+
+// ============================================================================
+// dispatch 校验链(所有工具共享的前置层)
+// ============================================================================
+
+test "L2 smoke/dispatch: 缺 required → MissingRequiredField(链路拦在 execute 前)" {
+    const a = std.testing.allocator;
+    var ctx = simpleCtx(a);
+    try std.testing.expectError(error.MissingRequiredField, tools.dispatch(&ctx, "Write", "{\"file_path\":\"/tmp/x\"}"));
+    try std.testing.expectError(error.MissingRequiredField, tools.dispatch(&ctx, "Bash", "{}"));
+    try std.testing.expectError(error.MissingRequiredField, tools.dispatch(&ctx, "TaskCreate", "{\"subject\":\"S\"}"));
+}
+
+test "L2 smoke/dispatch: 类型错 → InvalidFieldType" {
+    const a = std.testing.allocator;
+    var ctx = simpleCtx(a);
+    try std.testing.expectError(error.InvalidFieldType, tools.dispatch(&ctx, "Bash", "{\"command\":\"ls\",\"timeout\":\"5\"}"));
+    try std.testing.expectError(error.InvalidFieldType, tools.dispatch(&ctx, "Read", "{\"file_path\":\"/x\",\"limit\":\"10\"}"));
+}
+
+test "L2 smoke/dispatch: 未知工具 → UnknownTool" {
+    const a = std.testing.allocator;
+    var ctx = simpleCtx(a);
+    try std.testing.expectError(error.UnknownTool, tools.dispatch(&ctx, "__no_such_tool__", "{}"));
+}
+
+// ============================================================================
+// Bash(无副作用)
+// ============================================================================
+
+test "L2 smoke: Bash echo → stdout 含输出, exit_code 0" {
+    const a = std.testing.allocator;
+    var ctx = simpleCtx(a);
+    const out = try tools.dispatch(&ctx, "Bash", "{\"command\":\"echo cc_smoke_hello\"}");
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "cc_smoke_hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"exit_code\":0") != null);
+}
+
+test "L2 smoke: Bash 非零退出 → exit_code 透传" {
+    const a = std.testing.allocator;
+    var ctx = simpleCtx(a);
+    const out = try tools.dispatch(&ctx, "Bash", "{\"command\":\"exit 3\"}");
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"exit_code\":3") != null);
+}
+
+// ============================================================================
+// Write / Read(文件副作用,写→读回验证)
+// ============================================================================
+
+test "L2 smoke: Write 新文件 → Read 读回内容一致" {
+    const a = std.testing.allocator;
+    var ctx = simpleCtx(a);
+    const path = "/tmp/cc-smoke-write-read.txt";
+    defer _ = std.c.unlink(path);
+
+    const wout = try tools.dispatch(&ctx, "Write", "{\"file_path\":\"/tmp/cc-smoke-write-read.txt\",\"content\":\"smoke_body_42\"}");
+    defer a.free(wout);
+    // Write 成功不应是 error JSON
+    try std.testing.expect(std.mem.indexOf(u8, wout, "\"error\"") == null);
+
+    const rout = try tools.dispatch(&ctx, "Read", "{\"file_path\":\"/tmp/cc-smoke-write-read.txt\"}");
+    defer a.free(rout);
+    try std.testing.expect(std.mem.indexOf(u8, rout, "smoke_body_42") != null);
+}
+
+test "L2 smoke: Read 不存在文件 → FileNotFound" {
+    const a = std.testing.allocator;
+    var ctx = simpleCtx(a);
+    try std.testing.expectError(error.FileNotFound, tools.dispatch(&ctx, "Read", "{\"file_path\":\"/tmp/cc-smoke-nope-9z9z.txt\"}"));
+}
+
+// ============================================================================
+// Edit(文件副作用;simple ctx 无 read_state → 跳过 must-read 校验)
+// ============================================================================
+
+test "L2 smoke: Edit 替换字符串 → Read 读回新内容" {
+    const a = std.testing.allocator;
+    var ctx = simpleCtx(a);
+    const path = "/tmp/cc-smoke-edit.txt";
+    defer _ = std.c.unlink(path);
+
+    const wout = try tools.dispatch(&ctx, "Write", "{\"file_path\":\"/tmp/cc-smoke-edit.txt\",\"content\":\"before_X done\"}");
+    a.free(wout);
+
+    const eout = try tools.dispatch(&ctx, "Edit", "{\"file_path\":\"/tmp/cc-smoke-edit.txt\",\"old_string\":\"before_X\",\"new_string\":\"after_Y\"}");
+    defer a.free(eout);
+    try std.testing.expect(std.mem.indexOf(u8, eout, "\"success\":true") != null);
+
+    const rout = try tools.dispatch(&ctx, "Read", "{\"file_path\":\"/tmp/cc-smoke-edit.txt\"}");
+    defer a.free(rout);
+    try std.testing.expect(std.mem.indexOf(u8, rout, "after_Y") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rout, "before_X") == null);
+}
+
+test "L2 smoke: Edit old_string 未找到 → 错误(不静默成功)" {
+    const a = std.testing.allocator;
+    var ctx = simpleCtx(a);
+    const path = "/tmp/cc-smoke-edit-nf.txt";
+    defer _ = std.c.unlink(path);
+    const wout = try tools.dispatch(&ctx, "Write", "{\"file_path\":\"/tmp/cc-smoke-edit-nf.txt\",\"content\":\"hello\"}");
+    a.free(wout);
+
+    // old_string 不存在 → execute 返 error(具名),dispatch 透传
+    const r = tools.dispatch(&ctx, "Edit", "{\"file_path\":\"/tmp/cc-smoke-edit-nf.txt\",\"old_string\":\"NOPE\",\"new_string\":\"x\"}");
+    try std.testing.expectError(error.StringNotFound, r);
+}
+
+// ============================================================================
+// Grep / Glob(依赖 ripgrep;CI 无 rg 则 skip,不误判)
+// ============================================================================
+
+test "L2 smoke: Grep 在临时文件里匹配已知串(content 模式带行号)" {
+    const a = std.testing.allocator;
+    var ctx = simpleCtx(a);
+    const path = "/tmp/cc-smoke-grep.txt";
+    defer _ = std.c.unlink(path);
+    const wout = try tools.dispatch(&ctx, "Write", "{\"file_path\":\"/tmp/cc-smoke-grep.txt\",\"content\":\"alpha\\nNEEDLE_777\\nbeta\"}");
+    a.free(wout);
+
+    const out = tools.dispatch(&ctx, "Grep", "{\"pattern\":\"NEEDLE_777\",\"path\":\"/tmp/cc-smoke-grep.txt\",\"output_mode\":\"content\"}") catch |err| {
+        if (err == error.RipgrepNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "NEEDLE_777") != null);
+}
+
+test "L2 smoke: Glob 匹配临时目录下文件" {
+    const a = std.testing.allocator;
+    var ctx = simpleCtx(a);
+    const path = "/tmp/cc-smoke-glob-uniq.md";
+    defer _ = std.c.unlink(path);
+    const wout = try tools.dispatch(&ctx, "Write", "{\"file_path\":\"/tmp/cc-smoke-glob-uniq.md\",\"content\":\"x\"}");
+    a.free(wout);
+
+    const out = tools.dispatch(&ctx, "Glob", "{\"pattern\":\"cc-smoke-glob-uniq.md\",\"path\":\"/tmp\"}") catch |err| {
+        if (err == error.RipgrepNotFound) return error.SkipZigTest;
+        return err;
+    };
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "cc-smoke-glob-uniq.md") != null);
+}
+
+// ============================================================================
+// Task 工具族(本地 scratchpad,需 ctx.tasks)
+// ============================================================================
+
+test "L2 smoke: TaskCreate → TaskList → TaskUpdate(完整 CRUD 经 dispatch)" {
+    const a = std.testing.allocator;
+    var store = cc.core_task_store.TaskStore.init(a);
+    defer store.deinit();
+    var ctx = simpleCtx(a);
+    ctx.tasks = &store;
+
+    const c = try tools.dispatch(&ctx, "TaskCreate", "{\"subject\":\"Smoke task\",\"description\":\"do smoke\"}");
+    defer a.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "\"id\":\"1\"") != null);
+
+    const l = try tools.dispatch(&ctx, "TaskList", "{}");
+    defer a.free(l);
+    try std.testing.expect(std.mem.indexOf(u8, l, "Smoke task") != null);
+
+    const u = try tools.dispatch(&ctx, "TaskUpdate", "{\"taskId\":\"1\",\"status\":\"completed\"}");
+    defer a.free(u);
+    try std.testing.expect(std.mem.indexOf(u8, u, "\"error\"") == null);
+}
