@@ -49,6 +49,8 @@ fn runJob(job: *Job) void {
     defer arena.deinit();
     var job_ctx = job.ctx.*;
     job_ctx.allocator = arena.allocator();
+    // per-toolUse 进度路由:盖上本 job 的 tool_use id,reportProgress 据此找对应卡。
+    job_ctx.progress_tool_id = s.id;
     // 富错误 detail 槽:工具可在抛错前写入,替代通用 "X failed with Y"。
     var err_detail: ?[]const u8 = null;
     job_ctx.error_detail = &err_detail;

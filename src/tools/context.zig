@@ -106,16 +106,19 @@ pub const ToolContext = struct {
     /// 工具执行期进度回调(对齐 cc onProgress):工具(如 WebSearch 子请求)在执行**中**
     /// 实时上报进度,驱动 TUI 刷新工具卡第二行(Searching: q / Found N results)。
     /// state 指向 *RenderRegion(经 trampoline),tool_exec 注入。null = 无 TUI(headless/单测)。
+    /// id = 该工具的 tool_use id(per-toolUse 多卡按它路由;tool_exec runJob 盖入)。
     progress_state: ?*anyopaque = null,
-    progress_fn: ?*const fn (state: *anyopaque, phase: ProgressPhase, text: []const u8, count: u32) void = null,
+    progress_tool_id: []const u8 = "",
+    progress_fn: ?*const fn (state: *anyopaque, id: []const u8, phase: ProgressPhase, text: []const u8, count: u32) void = null,
 
     /// 工具进度阶段(对齐 cc WebSearchProgress 两态)。
     pub const ProgressPhase = enum { query_update, results_received };
 
     /// 上报进度(null 安全)。text 借用,回调内须立即拷贝(不跨调用持有)。
+    /// id 自动用 self.progress_tool_id(per-toolUse 多卡路由)。
     pub fn reportProgress(self: *const ToolContext, phase: ProgressPhase, text: []const u8, count: u32) void {
         if (self.progress_fn) |f| {
-            if (self.progress_state) |st| f(st, phase, text, count);
+            if (self.progress_state) |st| f(st, self.progress_tool_id, phase, text, count);
         }
     }
 

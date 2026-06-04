@@ -623,7 +623,7 @@ pub fn dispatch(ctx: *const ToolContext, name: []const u8, args: []const u8) any
 ///   Write/Edit/Bash/Task*/NotebookEdit/MCP/Skill 等有副作用或写共享态 → unsafe。
 /// 一期按工具名判定(cc 是 per-input;cc-zig 工具名足够,Bash 即便 readonly 也保守串行)。
 pub fn isConcurrencySafe(name: []const u8) bool {
-    const safe = [_][]const u8{ "Read", "Glob", "Grep", "WebFetch", "BashOutput" };
+    const safe = [_][]const u8{ "Read", "Glob", "Grep", "WebFetch", "WebSearch", "BashOutput" };
     for (safe) |s| if (std.mem.eql(u8, name, s)) return true;
     return false;
 }
@@ -690,6 +690,12 @@ fn hasOutputRedirect(cmd: []const u8) bool {
 }
 
 test "isConcurrencySafeInput: Bash readonly per-input" {
+    // WebSearch/WebFetch 只读 → safe(同轮多个可并发,对齐 cc)。
+    try std.testing.expect(isConcurrencySafe("WebSearch"));
+    try std.testing.expect(isConcurrencySafe("WebFetch"));
+    try std.testing.expect(isConcurrencySafe("Read"));
+    try std.testing.expect(!isConcurrencySafe("Write"));
+    try std.testing.expect(!isConcurrencySafe("Edit"));
     // 单命令只读 → safe
     try std.testing.expect(isConcurrencySafeInput("Bash", "{\"command\":\"ls -la /tmp\"}"));
     try std.testing.expect(isConcurrencySafeInput("Bash", "{\"command\":\"cat /etc/hosts\"}"));

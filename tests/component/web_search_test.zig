@@ -106,7 +106,7 @@ const ProgressCapture = struct {
     var last_count: u32 = 0;
     var last_text_buf: [128]u8 = undefined;
     var last_text_len: usize = 0;
-    fn cb(_: *anyopaque, phase: cc.tools.ToolContext.ProgressPhase, text: []const u8, count: u32) void {
+    fn cb(_: *anyopaque, _: []const u8, phase: cc.tools.ToolContext.ProgressPhase, text: []const u8, count: u32) void {
         phases.append(std.testing.allocator, phase) catch {};
         last_count = count;
         const n = @min(text.len, last_text_buf.len);

@@ -29,6 +29,18 @@ const agent_job_registry = @import("../../core/agent_job_registry.zig");
 const Theme = theme_mod.Theme;
 const ColorCapability = term.ColorCapability;
 
+/// per-toolUse 进度卡(并发 WebSearch 各一张,不互盖)。定长字段供跨线程持锁拷贝。
+const MAX_TOOL_CARDS = 6;
+const ToolCard = struct {
+    id: [40]u8 = undefined,
+    id_len: u8 = 0,
+    name: [32]u8 = undefined,
+    name_len: u8 = 0,
+    progress: [192]u8 = undefined,
+    progress_len: u8 = 0,
+    start_ms: i64 = 0,
+};
+
 pub const RenderRegion = struct {
     fd: std.c.fd_t,
     cols: u16 = 80,
@@ -66,6 +78,11 @@ pub const RenderRegion = struct {
     // _len=0 表示无进度行(普通工具不画第二行)。
     current_tool_progress: [192]u8 = undefined,
     current_tool_progress_len: u8 = 0,
+    // per-toolUse 多卡(对齐 cc progressMessages 按 toolUseID):并发/连续的多个 WebSearch
+    // 各占一张可刷新卡,不互盖。仅 hasProgressCard 工具进此数组;普通工具仍走上面的
+    // current_tool spinner 段。固定容量(够并发批),定长字段 + 持锁(同 current_tool)。
+    tool_cards: [MAX_TOOL_CARDS]ToolCard = [_]ToolCard{.{}} ** MAX_TOOL_CARDS,
+    tool_cards_len: u8 = 0,
     text_pending_newline: bool = false,
     pending_col: u16 = 0, // 半行 chunk 累计显示列(消息穿过续接用)
     region_drawn: bool = false, // 生成期固定区当前是否画在屏上(true ⟹ 光标钉区顶行首)
@@ -94,7 +111,7 @@ pub const RenderRegion = struct {
         _ = std.c.pthread_mutex_unlock(&self.mutex);
     }
 
-    /// 设置当前执行中的工具(主线程在工具执行前调)。持锁:与 tickSpinner 的读互斥。
+    /// 设置当前执行中的工具(普通工具,spinner 段 `⚒ <tool>`)。持锁。
     pub fn setCurrentTool(self: *RenderRegion, name: []const u8, start_ms: i64) void {
         self.lock();
         defer self.unlock();
@@ -104,7 +121,7 @@ pub const RenderRegion = struct {
         self.tool_start_ms = start_ms;
     }
 
-    /// 清除当前工具(工具执行完调)。持锁。
+    /// 清除当前工具(普通工具 spinner 段)。持锁。
     pub fn clearCurrentTool(self: *RenderRegion) void {
         self.lock();
         defer self.unlock();
@@ -112,17 +129,59 @@ pub const RenderRegion = struct {
         self.current_tool_progress_len = 0;
     }
 
-    /// 设置当前工具的进度第二行文本(对齐 cc onProgress→renderToolUseProgressMessage)。
-    /// 工具执行线程(tool_exec 并发批)经 progress 回调调用。**立即重画一帧**(不等下个
-    /// spinner tick)——否则结果块到达和工具完成贴在一起,Found N 那帧会被 Did N 秒覆盖、
-    /// 渲染不出来(对齐 cc reactive 重渲染)。持锁:与 spinner 线程读/画互斥。
-    /// text 立即拷进定长数组(不持有借用)。
-    pub fn setToolProgress(self: *RenderRegion, text: []const u8) void {
+    /// 新增一张 per-toolUse 进度卡(hasProgressCard 工具如 WebSearch 执行前调)。
+    /// 按 id 去重(已存在则更新 start);满则丢弃(MAX_TOOL_CARDS 够并发批)。持锁。
+    pub fn addToolCard(self: *RenderRegion, id: []const u8, name: []const u8, start_ms: i64) void {
         self.lock();
         defer self.unlock();
-        const n = @min(text.len, self.current_tool_progress.len);
-        @memcpy(self.current_tool_progress[0..n], text[0..n]);
-        self.current_tool_progress_len = @intCast(n);
+        if (self.findCardIdx(id)) |idx| {
+            self.tool_cards[idx].start_ms = start_ms;
+            return;
+        }
+        if (self.tool_cards_len >= MAX_TOOL_CARDS) return;
+        var c = &self.tool_cards[self.tool_cards_len];
+        const idn = @min(id.len, c.id.len);
+        @memcpy(c.id[0..idn], id[0..idn]);
+        c.id_len = @intCast(idn);
+        const nn = @min(name.len, c.name.len);
+        @memcpy(c.name[0..nn], name[0..nn]);
+        c.name_len = @intCast(nn);
+        c.progress_len = 0;
+        c.start_ms = start_ms;
+        self.tool_cards_len += 1;
+    }
+
+    /// 移除一张 per-toolUse 卡(工具完成调)。持锁。数组紧凑(末尾补位)。
+    pub fn clearToolCard(self: *RenderRegion, id: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        const idx = self.findCardIdx(id) orelse return;
+        const last = self.tool_cards_len - 1;
+        if (idx != last) self.tool_cards[idx] = self.tool_cards[last];
+        self.tool_cards_len -= 1;
+    }
+
+    fn findCardIdx(self: *RenderRegion, id: []const u8) ?usize {
+        var i: usize = 0;
+        while (i < self.tool_cards_len) : (i += 1) {
+            const c = &self.tool_cards[i];
+            if (std.mem.eql(u8, c.id[0..c.id_len], id)) return i;
+        }
+        return null;
+    }
+
+    /// 设置某张 per-toolUse 卡的进度第二行(对齐 cc onProgress→renderToolUseProgressMessage)。
+    /// 工具执行线程(tool_exec 并发批)经 progress 回调按 id 调用 → 写对应卡 + **立即重画一帧**
+    /// (不等下个 spinner tick,否则 Found N 会被 Did N 秒覆盖渲不出;对齐 cc reactive)。
+    /// 持锁:与 spinner 线程读/画互斥。text 立即拷进定长数组(不持有借用)。
+    pub fn setToolProgress(self: *RenderRegion, id: []const u8, text: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        const idx = self.findCardIdx(id) orelse return;
+        var c = &self.tool_cards[idx];
+        const n = @min(text.len, c.progress.len);
+        @memcpy(c.progress[0..n], text[0..n]);
+        c.progress_len = @intCast(n);
         // 立即重画(用 enterGenerating 存的 gen_app),让进度行至少渲染一帧。
         if (self.generating) {
             if (self.gen_app) |app| {
@@ -789,20 +848,20 @@ pub const RenderRegion = struct {
             @intCast(@max(util_time.nowMs() - self.tool_start_ms, 0))
         else
             0;
-        // hasProgressCard 工具(WebSearch)由下方动态卡显示,spinner 行**不**显工具段
-        // (对齐 cc:底部 spinner 不显工具名)→ 传空 cur_tool。普通工具仍传(转圈带名)。
-        const tool_card = @import("widget/tool_card.zig");
-        const has_card = self.current_tool_len > 0 and tool_card.hasProgressCard(cur_tool);
-        const spinner_tool: []const u8 = if (has_card) "" else cur_tool;
-        _ = StatusBar.renderGenerating(w, app, self.theme, self.use_unicode, self.spinner_frame, self.verb, elapsed, spinner_tool, if (has_card) 0 else tool_ms, inner_w) catch {};
+        // spinner 行只显普通工具段 `⚒ <tool>`(current_tool)。hasProgressCard 工具(WebSearch)
+        // 不进 current_tool、改走下方 per-toolUse 多卡 → spinner 不显它们(对齐 cc:底部
+        // spinner 不显工具名,各 WebSearch 由自己的卡显示)。
+        _ = StatusBar.renderGenerating(w, app, self.theme, self.use_unicode, self.spinner_frame, self.verb, elapsed, cur_tool, tool_ms, inner_w) catch {};
         R += 1;
         w.writeAll("\r\n") catch {};
 
-        // -- 执行中工具卡(对齐 cc 单一工具卡:hasProgressCard 工具如 WebSearch,执行中即在
-        //    动态区显双段卡 ⏺ <Tool> / ⎿ <progress>;随 tick 重画)。progress 未到时第二行
-        //    用 Searching… 占位(避免先 spinner、后冒卡的跳变)。普通工具不画。--
-        if (has_card) {
-            R += self.drawToolProgressCard(w, cur_tool);
+        // -- 执行中 per-toolUse 进度卡(对齐 cc:并发/连续多个 WebSearch 各占一张可刷新卡,
+        //    不互盖)。每张 ⏺ <Tool> / ⎿ <progress|Searching…>;随 tick 重画。--
+        {
+            var ci: usize = 0;
+            while (ci < self.tool_cards_len) : (ci += 1) {
+                R += self.drawToolProgressCard(w, &self.tool_cards[ci]);
+            }
         }
 
         // -- 待发送队列预览(每条 dim 灰,最多 3 条 + "+N more")--
@@ -881,23 +940,23 @@ pub const RenderRegion = struct {
 
     /// 画待发送队列预览(spinner 与上边框之间,每条 dim 灰 ` ⏳ <msg 首行,截断>`)。返回行数。
     /// 最多 MAX 条,超出补一行 ` +N more`。
-    /// 执行中工具卡(动态区,可刷新):⏺ <Tool> / ⎿ <progress>。对齐 cc 双段卡。
-    /// 仅在工具有 progress 第二行(WebSearch)时调用;随每次 tickSpinner 重画。
-    fn drawToolProgressCard(self: *RenderRegion, w: *std.Io.Writer, tool_name: []const u8) u16 {
+    /// 执行中 per-toolUse 进度卡(动态区,可刷新):⏺ <Tool> / ⎿ <progress>。对齐 cc 双段卡。
+    /// 随每次 tickSpinner 重画。card 是某张 tool_cards 条目。
+    fn drawToolProgressCard(self: *RenderRegion, w: *std.Io.Writer, card: *const ToolCard) u16 {
         const th = self.theme;
         const tool_card = @import("widget/tool_card.zig");
         const inner_w: usize = if (self.cols > 8) self.cols - 8 else 30;
         var rows: u16 = 0;
         // 第 1 行:⏺ <display name>(WebSearch→"Web Search")。
         w.writeAll(ansi.clear.line) catch {};
-        w.print("{s}{s}{s} {s}", .{ th.accent, th.icon_act, th.reset, tool_card.displayName(tool_name) }) catch {};
+        w.print("{s}{s}{s} {s}", .{ th.accent, th.icon_act, th.reset, tool_card.displayName(card.name[0..card.name_len]) }) catch {};
         rows += 1;
         w.writeAll("\r\n") catch {};
         // 第 2 行:  ⎿ <progress>(Searching: q / Found N results;随 tick 刷新)。
         // progress 未到(刚开始搜索)→ 用 "Searching…" 占位,对齐 cc 执行中即显第二行。
         w.writeAll(ansi.clear.line) catch {};
-        const prog: []const u8 = if (self.current_tool_progress_len > 0)
-            self.current_tool_progress[0..self.current_tool_progress_len]
+        const prog: []const u8 = if (card.progress_len > 0)
+            card.progress[0..card.progress_len]
         else
             "Searching…";
         w.print("  {s}{s}{s} ", .{ th.dim, th.gutter, th.reset }) catch {};
@@ -980,16 +1039,22 @@ pub const RegionWriter = struct {
         self.region.writeGenText(s);
     }
 
-    /// agent_loop 经 comptime 探测调用:把当前工具喂给底部 spinner。
+    /// agent_loop 经 comptime 探测调用:把当前工具喂给底部 spinner(普通工具)。
     pub fn setCurrentTool(self: *RegionWriter, name: []const u8, start_ms: i64) void {
         self.region.setCurrentTool(name, start_ms);
     }
     pub fn clearCurrentTool(self: *RegionWriter) void {
         self.region.clearCurrentTool();
     }
-    /// agent_loop 经 comptime 探测调用:把工具进度第二行喂给底部可刷新卡(WebSearch)。
-    pub fn setToolProgress(self: *RegionWriter, text: []const u8) void {
-        self.region.setToolProgress(text);
+    /// per-toolUse 进度卡(WebSearch):建/删/刷新进度,按 tool_use id 路由。
+    pub fn addToolCard(self: *RegionWriter, id: []const u8, name: []const u8, start_ms: i64) void {
+        self.region.addToolCard(id, name, start_ms);
+    }
+    pub fn clearToolCard(self: *RegionWriter, id: []const u8) void {
+        self.region.clearToolCard(id);
+    }
+    pub fn setToolProgress(self: *RegionWriter, id: []const u8, text: []const u8) void {
+        self.region.setToolProgress(id, text);
     }
 };
 
@@ -1105,6 +1170,39 @@ test "setCurrentTool/clearCurrentTool: 存取 + 截断 + 归零" {
 
     r.clearCurrentTool();
     try std.testing.expectEqual(@as(u8, 0), r.current_tool_len);
+}
+
+test "per-toolUse 多卡:按 id 各写各卡不互盖 + 增删" {
+    var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.monochrome, .none), .none);
+    defer r.deinit();
+    try std.testing.expectEqual(@as(u8, 0), r.tool_cards_len);
+
+    // 两个并发 WebSearch:各一张卡。
+    r.addToolCard("id_a", "WebSearch", 100);
+    r.addToolCard("id_b", "WebSearch", 200);
+    try std.testing.expectEqual(@as(u8, 2), r.tool_cards_len);
+
+    // 各写各的 progress,不互盖。
+    r.setToolProgress("id_a", "Searching: alpha");
+    r.setToolProgress("id_b", "Searching: beta");
+    const ia = r.findCardIdx("id_a").?;
+    const ib = r.findCardIdx("id_b").?;
+    try std.testing.expectEqualStrings("Searching: alpha", r.tool_cards[ia].progress[0..r.tool_cards[ia].progress_len]);
+    try std.testing.expectEqualStrings("Searching: beta", r.tool_cards[ib].progress[0..r.tool_cards[ib].progress_len]);
+
+    // 重复 addToolCard 同 id 不新增。
+    r.addToolCard("id_a", "WebSearch", 300);
+    try std.testing.expectEqual(@as(u8, 2), r.tool_cards_len);
+
+    // 删一张,另一张保留且 progress 不丢。
+    r.clearToolCard("id_a");
+    try std.testing.expectEqual(@as(u8, 1), r.tool_cards_len);
+    try std.testing.expect(r.findCardIdx("id_a") == null);
+    const ib2 = r.findCardIdx("id_b").?;
+    try std.testing.expectEqualStrings("Searching: beta", r.tool_cards[ib2].progress[0..r.tool_cards[ib2].progress_len]);
+
+    r.clearToolCard("id_b");
+    try std.testing.expectEqual(@as(u8, 0), r.tool_cards_len);
 }
 
 test "nextCharBytes UTF-8 宽度" {

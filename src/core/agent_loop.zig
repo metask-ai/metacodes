@@ -563,7 +563,7 @@ pub fn run(
         if (opts.agent_depth == 0 and comptime @hasDecl(@TypeOf(stdout_writer.*), "setToolProgress")) {
             const Writer = @TypeOf(stdout_writer.*);
             const Tramp = struct {
-                fn cb(state: *anyopaque, phase: tools_mod.ToolContext.ProgressPhase, text: []const u8, count: u32) void {
+                fn cb(state: *anyopaque, id: []const u8, phase: tools_mod.ToolContext.ProgressPhase, text: []const u8, count: u32) void {
                     const wr: *Writer = @ptrCast(@alignCast(state));
                     var buf: [192]u8 = undefined;
                     const line: []const u8 = switch (phase) {
@@ -571,7 +571,7 @@ pub fn run(
                         .query_update => std.fmt.bufPrint(&buf, "Searching: {s}", .{text}) catch text,
                         .results_received => std.fmt.bufPrint(&buf, "Found {d} results for \"{s}\"", .{ count, text }) catch text,
                     };
-                    wr.setToolProgress(line);
+                    wr.setToolProgress(id, line);
                 }
             };
             base_ctx.progress_state = @ptrCast(stdout_writer);
@@ -585,19 +585,23 @@ pub fn run(
             if (opts.agent_depth == 0) {
                 const tool_card = @import("../repl/tui/widget/tool_card.zig");
                 var first_tool: ?[]const u8 = null;
+                const has_card_writer = comptime @hasDecl(@TypeOf(stdout_writer.*), "addToolCard");
                 for (slots.items) |*s| {
                     if (s.decision != .run) continue;
                     if (tool_card.resultRenderMode(s.name) == .hidden) continue;
+                    // hasProgressCard 工具(WebSearch):执行中由动态区 per-toolUse 卡显示
+                    // (不打起始卡到滚动历史、不进 spinner 段)。每个 tool_use 一张卡(并发不互盖)。
+                    if (tool_card.hasProgressCard(s.name)) {
+                        if (has_card_writer) stdout_writer.addToolCard(s.id, s.name, util_time.nowMs());
+                        continue;
+                    }
                     if (first_tool == null) first_tool = s.name;
-                    // hasProgressCard 工具(WebSearch):执行中由动态区可重绘卡独占显示,
-                    // 不往滚动历史打起始卡(否则与动态卡重复,对齐 cc 单一工具卡)。
-                    if (tool_card.hasProgressCard(s.name)) continue;
                     if (tool_card.renderStart(allocator, th.*, s.name, s.input) catch null) |card| {
                         defer allocator.free(card);
                         stdout_writer.print("{s}", .{card}) catch {};
                     }
                 }
-                // 喂当前工具给底部 spinner(comptime 探测:普通 writer 无此方法 → 编译期消失)。
+                // 喂普通工具给底部 spinner(hasProgressCard 工具走多卡,不喂 spinner)。
                 if (comptime @hasDecl(@TypeOf(stdout_writer.*), "setCurrentTool")) {
                     if (first_tool) |name| stdout_writer.setCurrentTool(name, util_time.nowMs());
                 }
@@ -616,6 +620,13 @@ pub fn run(
         if (opts.tool_render_theme != null and opts.agent_depth == 0) {
             if (comptime @hasDecl(@TypeOf(stdout_writer.*), "clearCurrentTool")) {
                 stdout_writer.clearCurrentTool();
+            }
+            // 清掉本轮 hasProgressCard 工具的 per-toolUse 卡(完成卡由下方 renderResult 落历史)。
+            if (comptime @hasDecl(@TypeOf(stdout_writer.*), "clearToolCard")) {
+                const tool_card = @import("../repl/tui/widget/tool_card.zig");
+                for (slots.items) |*s| {
+                    if (s.decision == .run and tool_card.hasProgressCard(s.name)) stdout_writer.clearToolCard(s.id);
+                }
             }
         }
 
