@@ -25,6 +25,14 @@ pub fn renderToLines(allocator: std.mem.Allocator, conv: *const Conversation) ![
 
 pub fn renderToLinesWithTheme(allocator: std.mem.Allocator, conv: *const Conversation, th: @import("tui/theme.zig").Theme) ![][]u8 {
     const tool_card = @import("tui/widget/tool_card.zig");
+    // 全程持 snapshot 锁:遍历 conv.messages.items 期间禁止 append(realloc 会抽走 items
+    // 底层 buffer → UAF)。生成期 watcher 线程经此读快照,与主线程 agent_loop 的 append 互斥。
+    // mutex 是同步原语,@constCast 取可变指针不算逻辑修改 conv。锁持有时间 = 一次渲染(O(msgs)),
+    // append 一轮几次故阻塞可忽略。
+    const mut_conv = @constCast(conv);
+    mut_conv.lockSnapshot();
+    defer mut_conv.unlockSnapshot();
+
     var lines = std.ArrayList([]u8).empty;
     errdefer {
         for (lines.items) |l| allocator.free(l);

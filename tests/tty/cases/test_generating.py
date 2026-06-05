@@ -208,3 +208,88 @@ def test_A6_narrow_terminal_no_wrap(bin_path):
     if bad:
         a._fail(f"窄终端生成期有行宽 > cols=40(折行风险):{bad[:3]}")
 
+
+def _gen_frames(a):
+    """生成期帧(含 'esc to interrupt' 的 spinner 帧)。"""
+    return [sc for sc in a.frame_screens if sc.find_last_row("esc to interrupt") is not None]
+
+
+def test_T30_gen_help_nonmodal(bin_path):
+    # 生成期按 ? → footer 区原地展开快捷键(非模态:输入框 ❯/╭ 仍在)。早期 bug:? 被当
+    # 字面字符塞进输入框,生成期完全不响应。长查询保证 ? 落在生成窗口。
+    if SKIP:
+        return
+    raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
+                         "sleep:0.6", "type:?", "sleep:0.5"],
+              per_key_drain=0.05, base_url=None)
+    a = TTYAssert(raw)
+    gen = _gen_frames(a)
+    if not gen:
+        a._fail("无生成期帧(? 时模型已结束?重试或加长查询)")
+        return
+    # 某生成帧:help 快捷键展开 + 输入框仍在(非模态)。
+    ok = any(
+        sc.find_last_row("Open transcript") is not None
+        and sc.find_last_row("❯") is not None
+        and sc.find_last_row("╭") is not None
+        for sc in gen
+    )
+    if not ok:
+        a._fail("生成期 ? 未展开 help(或非模态输入框丢失)")
+    a.assert_no_full_clear()
+
+
+def test_T31_gen_help_esc_only_closes(bin_path):
+    # 生成期 ? 开 help 后按 esc → 只关 help、不中断生成(先关弹层再中断)。
+    # esc 为末键,sleep 足够长靠 flushEsc 兑现;之后生成应继续(spinner 帧仍在)。
+    if SKIP:
+        return
+    raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
+                         "sleep:0.6", "type:?", "sleep:0.4", "key:esc", "sleep:3"],
+              per_key_drain=0.05, base_url=None)
+    a = TTYAssert(raw)
+    import re
+    from asserts import split_frames
+    prose = re.sub(rb"\x1b\[[0-9;?>]*[A-Za-z]", b"",
+                   b"".join(c for k, c in split_frames(raw) if k == "prose")).decode("utf-8", "replace")
+    # esc 只关 help 不中断:生成应继续(prose 有数字增长)或自然结束。不应出现 cancelled。
+    # (若 esc 误中断,会有 cancel 标记且数列被截断。)
+    finished_or_progressing = any(str(n) in prose for n in (10, 20, 30, 40, 50, 59, 60))
+    if "cancel" in prose.lower() and not finished_or_progressing:
+        a._fail("生成期 help 开时 esc 误中断了生成(应只关 help)")
+
+
+def test_T32_gen_ctrl_o_transcript(bin_path):
+    # 生成期按 Ctrl+O → transcript 模态覆盖生成区(对齐 cc app:toggleTranscript Global)。
+    # 先 sleep 让首轮 append 进 conversation,transcript 才有内容。
+    if SKIP:
+        return
+    raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
+                         "sleep:1.2", "key:ctrl_o", "sleep:0.6"],
+              per_key_drain=0.05, base_url=None)
+    a = TTYAssert(raw)
+    # 某帧含 transcript 标题;且不进 alt screen。
+    ok = any(sc.find_last_row("transcript (Ctrl+O") is not None for sc in a.frame_screens)
+    if not ok:
+        a._fail("生成期 Ctrl+O 未打开 transcript")
+    assert b"\x1b[?1049h" not in raw, "生成期 transcript 误进 alt screen"
+
+
+def test_T33_gen_ctrl_o_toggle_close(bin_path):
+    # 生成期 Ctrl+O 开 transcript → 再 Ctrl+O 关 → 回到生成区(spinner 帧),无 transcript 残留。
+    if SKIP:
+        return
+    raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
+                         "sleep:1.2", "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:1"],
+              per_key_drain=0.05, base_url=None)
+    a = TTYAssert(raw)
+    # 最后若干帧应回到生成区(含 esc to interrupt),非 transcript。
+    last_frames = a.frame_screens[-3:] if len(a.frame_screens) >= 3 else a.frame_screens
+    back_to_gen = any(sc.find_last_row("esc to interrupt") is not None for sc in last_frames)
+    still_transcript = last_frames[-1].find_last_row("transcript (Ctrl+O") is not None if last_frames else False
+    if still_transcript:
+        a._fail("Ctrl+O 关闭后仍残留 transcript")
+    if not back_to_gen:
+        a._fail("Ctrl+O 关闭后未回到生成区(或生成已结束,可重试)")
+
+

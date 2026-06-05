@@ -27,6 +27,7 @@ const agent_tree = @import("widget/agent_tree.zig");
 const agent_job_registry = @import("../../core/agent_job_registry.zig");
 const ui_mod = @import("ui.zig");
 const event_mod = @import("event.zig");
+const input = @import("../input.zig");
 const ui_state_mod = @import("ui_state.zig");
 const transcript_viewer = @import("../transcript_viewer.zig");
 const Conversation = @import("../../core/conversation.zig").Conversation;
@@ -641,7 +642,41 @@ pub const RenderRegion = struct {
         return eff;
     }
 
-    /// 给 ui.render 的行字节流每行行首注入 clear.line(ui.render 不写 ESC[2K),
+    /// 生成期按键分流(对应输入期 applyEvent,持锁)。watcher 线程调:同步 editor 投影 →
+    /// dispatch(复用输入期同一份 `?`/help/Ctrl+O/transcript 滚动语义)→ 处理 overlay 快照
+    /// 跳变 → 重画走 drawGenRegion(非 renderInner)。返回 Effect 供 watcher 决定是否喂 LineEditor。
+    /// conv 供 transcript overlay 生成 lines(renderToLinesWithTheme 内部持 snapshot 锁防 append UAF)。
+    pub fn applyGenKey(
+        self: *RenderRegion,
+        app: *const app_mod.App,
+        conv: *const Conversation,
+        key: input.Key,
+        ed_view: []const u8,
+        ed_cursor: usize,
+    ) event_mod.Effect {
+        self.lock();
+        defer self.unlock();
+        if (!self.generating) return .{};
+        // dispatch 判"空 buffer + ?"依赖 editor 投影,调前同步 watcher 的 LineEditor 视图。
+        self.ui.editor = .{ .view = ed_view, .cursor = ed_cursor };
+        const was = self.ui.overlay;
+        const eff = ui_mod.dispatch(&self.ui, .{ .key = .{ .key = key } });
+        const now = self.ui.overlay;
+        // transcript overlay 跳变:进入生成快照(借 conv),退出释放。生成期**不** reanchor
+        // (输入期才需,生成区靠 prev_rows 收缩擦除维持锚位)。
+        if (now == .transcript and was != .transcript) {
+            self.freeTranscriptLines();
+            self.transcript_lines = transcript_viewer.renderToLinesWithTheme(self.allocator, conv, self.theme) catch null;
+        } else if (now != .transcript and was == .transcript) {
+            self.freeTranscriptLines();
+        }
+        if (eff.redraw_region and self.generating) {
+            if (self.region_drawn) self.eraseRegion();
+            self.drawGenRegion(app);
+        }
+        return eff;
+    }
+
     /// 否则收缩时新帧短行会留旧帧残字。薄 writer 适配 ui.render 的 anytype 接口。
     const RegionLineWriter = struct {
         inner: *std.Io.Writer,
@@ -1037,6 +1072,13 @@ pub const RenderRegion = struct {
             w.writeAll("\r") catch {};
         }
 
+        // overlay==.transcript:模态覆盖整个生成区,画 transcript 后直接返回
+        // (跳过 spinner/cards/queue/panel/border/editor/footer 全套及末尾 editor 光标定位)。
+        if (self.ui.overlay == .transcript) {
+            self.drawGenTranscript(w, &nb);
+            return;
+        }
+
         const inner_w: usize = if (self.cols > 4) self.cols - 1 else 40;
         const border_color = self.borderColor(app.config.permission_mode);
         const content = self.gen_view;
@@ -1105,10 +1147,19 @@ pub const RenderRegion = struct {
         R += 1;
         w.writeAll("\r\n") catch {};
 
-        // -- footer(末行不 \r\n)--
-        w.writeAll(ansi.clear.line) catch {};
-        self.drawFooter(w, app);
-        R += 1;
+        // -- footer(末行不 \r\n)或 help 菜单(help_open 时原地展开,对齐输入期 renderFrameInner)--
+        if (self.ui.help_open) {
+            // renderHelpLines 末行也带 \r\n → 光标多下移 1 行,补 up(1) 与 footer 分支对齐
+            // (否则 footer_rownum 偏移 1 → 下帧回区顶少 1 行 → 顶边框残留;本会话输入期已踩过)。
+            var hlw = RegionLineWriter{ .inner = w };
+            const hrows = ui_mod.renderHelpLines(&hlw, self.theme, self.cols) catch 0;
+            R += hrows;
+            if (hrows > 0) w.writeAll(ansi.cursor.up(1, &nb)) catch {};
+        } else {
+            w.writeAll(ansi.clear.line) catch {};
+            self.drawFooter(w, app);
+            R += 1;
+        }
 
         // 光标在 footer 行末 = 区最后一行(第 R-1 行)。
         // 收缩残留擦除:若新 R < 上次画的 prev_rows,清掉多余尾行。
@@ -1142,7 +1193,49 @@ pub const RenderRegion = struct {
         self.flush();
     }
 
-    /// 画待发送队列预览(spinner 与上边框之间,每条 dim 灰 ` ⏳ <msg 首行,截断>`)。返回行数。
+    /// 生成期 transcript 模态帧(对应输入期 renderOverlayInner,但记 cursor_in_region_row 而非
+    /// input_cursor_row——生成期 eraseRegion 读前者)。调用前 drawGenRegion 已 hide+封口,
+    /// 光标在区顶续接点。这里画 transcript → 收缩擦除 → 回区顶。w/nb 由 drawGenRegion 传入。
+    fn drawGenTranscript(self: *RenderRegion, w: *std.Io.Writer, nb: []u8) void {
+        // 几何注入(renderTranscript 用 state.rows 算窗口高 rows-3,天然限高不撑爆)。
+        self.ui.cols = self.cols;
+        self.ui.rows = self.rows;
+
+        var lw = RegionLineWriter{ .inner = w };
+        const frame = ui_mod.render(&lw, .{
+            .state = &self.ui,
+            .now_ms = util_time.nowMs(),
+            .theme = self.theme,
+            .use_unicode = self.use_unicode,
+            .transcript_lines = if (self.transcript_lines) |ls| ls else &.{},
+        }) catch ui_mod.Frame{};
+        const new_rows: u16 = frame.rows;
+
+        // renderTranscript 末行带 \r\n → 光标在区下方一行,up(1) 回区最后一行(同 renderOverlayInner)。
+        if (new_rows > 0) w.writeAll(ansi.cursor.up(1, nb)) catch {};
+
+        // 收缩残留擦除(transcript 关闭/变矮时清旧区尾行)。
+        if (new_rows < self.prev_rows) {
+            const diff = self.prev_rows - new_rows;
+            var k: u16 = 0;
+            while (k < diff) : (k += 1) {
+                w.writeAll("\r\n") catch {};
+                w.writeAll(ansi.clear.line) catch {};
+            }
+            w.writeAll(ansi.cursor.up(diff, nb)) catch {};
+        }
+
+        // 模态无编辑光标:回区顶行首。记 cursor_in_region_row=0 → eraseRegion 的 up(0) 自洽。
+        if (new_rows > 1) w.writeAll(ansi.cursor.up(new_rows - 1, nb)) catch {};
+        w.writeAll(ansi.cursor.column(1, nb)) catch {};
+        w.writeAll(ansi.cursor.show) catch {};
+
+        self.prev_rows = new_rows;
+        self.cursor_in_region_row = 0;
+        self.region_drawn = true;
+        self.flush();
+    }
+
     /// 最多 MAX 条,超出补一行 ` +N more`。
     /// 执行中 per-toolUse 进度卡(动态区,可刷新):⏺ <Tool> / ⎿ <progress>。对齐 cc 双段卡。
     /// 随每次 tickSpinner 重画。card 是某张 tool_cards 条目。

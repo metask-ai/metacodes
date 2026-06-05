@@ -12,6 +12,12 @@ const msg = @import("message.zig");
 pub const Conversation = struct {
     allocator: std.mem.Allocator,
     messages: std.ArrayList(msg.Message),
+    // 快照锁:保护 messages.items 的结构性改动(append → 可能 realloc)与 transcript 快照
+    // 遍历的互斥。生成期 watcher 线程按 Ctrl+O 调 transcript_viewer 遍历 messages.items,
+    // 与主线程 agent_loop 的 append 并发——append 触发 ArrayList realloc 会使遍历中的旧
+    // items slice 失效(UAF)。append 与 lockSnapshot/unlockSnapshot 包裹的快照读持同一锁。
+    // 竞争极低:append 一轮几次、快照仅 Ctrl+O 时,故用粗粒度锁无性能问题。
+    snapshot_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
 
     pub fn init(allocator: std.mem.Allocator) Conversation {
         return .{ .allocator = allocator, .messages = .empty };
@@ -22,8 +28,18 @@ pub const Conversation = struct {
         self.messages.deinit(self.allocator);
     }
 
+    /// transcript 快照读前后持锁——与 append 互斥,防遍历 messages.items 时被 realloc 抽走。
+    pub fn lockSnapshot(self: *Conversation) void {
+        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
+    }
+    pub fn unlockSnapshot(self: *Conversation) void {
+        _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+    }
+
     /// 追加消息（转移所有权）。传入的 Message 不得再手动 deinit。
     pub fn append(self: *Conversation, m: msg.Message) !void {
+        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
         try self.messages.append(self.allocator, m);
     }
 

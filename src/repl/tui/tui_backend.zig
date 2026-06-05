@@ -270,20 +270,38 @@ pub const TuiBackend = struct {
     }
 
     /// 处理一个已解析出的 Key(feed 出的 or flushEsc 出的孤立 ESC)。
+    ///
+    /// 统一分流:所有键先走 applyGenKey→dispatch(复用输入期 `?`/help/Ctrl+O/transcript 滚动
+    /// 全部语义)。watcher 据返回 Effect:
+    ///   · action != .pass_to_editor → dispatch 已消费(开关 help/overlay/滚动),内部已重画,不动 editor;
+    ///   · action == .pass_to_editor → dispatch 未消费,按键类型决定生成期独有语义:
+    ///       - enter 系 → 入待发送队列 + clear(dispatch 无"入队"概念,故落 pass_to_editor 由此接);
+    ///       - esc     → 无弹层,中断推理(入队已打的字 + abort);
+    ///       - 其余     → 普通编辑键喂 LineEditor。
+    /// 关键:enter/esc 也经 dispatch 先过一遍 → overlay/help 开着时它们被 dispatch 路由消费
+    /// (transcript 期 enter 被 dispatchTranscriptKey 忽略,不会误入队;help 期 esc 只关 help)。
+    /// esc 优先级:overlay 开→关 overlay;help 开→关 help;都关→中断(先关弹层再中断)。
     fn handleKey(self: *TuiBackend, key: input.Key, ed: *input.LineEditor) void {
+        const app = self.input_app orelse return;
+        const eff = self.region.applyGenKey(app, &app.conversation, key, ed.view(), ed.cursor);
+        if (eff.action != .pass_to_editor) return; // dispatch 已消费(help/overlay/滚动),不动 editor
+
+        // 走到这:dispatch 未消费该键(无弹层激活)。按键类型决定生成期语义。
         switch (key) {
             .enter, .shift_enter, .ctrl_enter => {
-                // 回车 → 入待发送队列(非空才入),清空输入框。不立即发。
+                // 回车 → 入待发送队列(非空才入)+ clear。不立即发。
                 const v = ed.view();
                 const trimmed = std.mem.trim(u8, v, " \t\r\n");
                 if (trimmed.len > 0) {
                     if (self.queue) |qq| _ = qq.push(v);
                 }
                 ed.clear();
+                self.region.setGenInput(ed.view(), ed.cursor);
+                self.region.redrawGen(app);
+                return;
             },
             .esc => {
-                // 单 esc 直接中断当前推理(对齐 CC chat:cancel)。框里已打的字先入队
-                // (不丢用户输入,中断后自动续发);再 abort(直戳 AbortSignal,机制不变)。
+                // 无弹层的 esc → 中断推理。框里已打的字先入队(不丢,中断后自动续发),再 abort。
                 const v = ed.view();
                 const trimmed = std.mem.trim(u8, v, " \t\r\n");
                 if (trimmed.len > 0) {
@@ -294,12 +312,11 @@ pub const TuiBackend = struct {
                 return; // 中断不重画(主线程很快收尾)
             },
             else => {
+                // 普通编辑键 → 喂 LineEditor,重画生成区输入框。
                 _ = ed.handle(key) catch {};
+                self.region.setGenInput(ed.view(), ed.cursor);
+                self.region.redrawGen(app);
             },
-        }
-        if (self.input_app) |a| {
-            self.region.setGenInput(ed.view(), ed.cursor);
-            self.region.redrawGen(a);
         }
     }
 };
