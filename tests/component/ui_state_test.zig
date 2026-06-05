@@ -108,6 +108,52 @@ test "dispatch: transcript overlay 下全局键不上抛(被 overlay 拦截)" {
     try testing.expectEqual(event.LoopAction.none, ui.dispatch(&s, keyTag(.ctrl_l)).action);
 }
 
+test "dispatch: Ctrl+X Ctrl+K 序列 → kill_background(arming 在 UiState)" {
+    var s = UiState{};
+    const e1 = ui.dispatch(&s, keyTag(.ctrl_x));
+    try testing.expect(s.ctrl_x_armed); // Ctrl+X 置 armed
+    try testing.expectEqual(event.LoopAction.none, e1.action); // Ctrl+X 单独不上抛
+    const e2 = ui.dispatch(&s, keyTag(.ctrl_k));
+    try testing.expectEqual(event.LoopAction.kill_background, e2.action); // 序列 → 杀后台
+    try testing.expect(!s.ctrl_x_armed); // 消费后清 armed
+}
+
+test "dispatch: Ctrl+X 后非 Ctrl+K → armed 清除,该键照常(防粘连)" {
+    var s = UiState{};
+    _ = ui.dispatch(&s, keyTag(.ctrl_x));
+    try testing.expect(s.ctrl_x_armed);
+    // 跟一个普通字符 → armed 清除,字符透传编辑器(不触发 kill)。
+    const e = ui.dispatch(&s, keyChar('a'));
+    try testing.expect(!s.ctrl_x_armed);
+    try testing.expectEqual(event.LoopAction.pass_to_editor, e.action);
+}
+
+test "dispatch: Ctrl+X 在生成期也能序列杀后台(两期一致)" {
+    var s = UiState{ .phase = .generating };
+    _ = ui.dispatch(&s, keyTag(.ctrl_x));
+    try testing.expectEqual(event.LoopAction.kill_background, ui.dispatch(&s, keyTag(.ctrl_k)).action);
+}
+
+test "dispatch: 单 Ctrl+K(无 arming)→ pass_to_editor(kill-line 归 editor)" {
+    var s = UiState{};
+    const e = ui.dispatch(&s, keyTag(.ctrl_k));
+    try testing.expectEqual(event.LoopAction.pass_to_editor, e.action); // editor 当 kill-line
+}
+
+test "dispatch: 裸 esc(无 help/overlay)→ pass_to_editor(输入期 clear_draft 归 editor)" {
+    var s = UiState{};
+    const e = ui.dispatch(&s, keyTag(.esc));
+    try testing.expectEqual(event.LoopAction.pass_to_editor, e.action);
+}
+
+test "dispatch: help 开时 esc → 只关 help,不透传(先关弹层)" {
+    var s = UiState{ .help_open = true };
+    const e = ui.dispatch(&s, keyTag(.esc));
+    try testing.expect(!s.help_open); // help 关闭
+    try testing.expectEqual(event.LoopAction.none, e.action); // 不透传(不触发 editor clear_draft)
+    try testing.expect(e.redraw_region);
+}
+
 test "dispatch: transcript 下 j/k 滚动,q 关闭" {
     var s = UiState{ .overlay = .transcript, .transcript_top = 0 };
     _ = ui.dispatch(&s, keyChar('j'));
