@@ -103,6 +103,38 @@ def read_tool_results(home):
     return results
 
 
+def read_tool_results_with_error(home):
+    """扫该 HOME 下所有 transcript.jsonl,返回 [(content, is_error)] 列表。
+    用于校验工具 execute 是否成功(is_error=true → execute 返回了 error,被序列化回灌)。
+    这是补"声明=接线=测试"盲区:旧 assert_tool_e2e 只看工具被调用,不看执行成功与否。
+    """
+    results = []
+    pattern = os.path.join(home, ".cc-zig", "projects", "*", "*", "transcript.jsonl")
+    for path in glob.glob(pattern):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or '"tool_result"' not in line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    blocks = msg.get("blocks")
+                    if not isinstance(blocks, list):
+                        continue
+                    for b in blocks:
+                        if isinstance(b, dict) and b.get("type") == "tool_result":
+                            c = b.get("content", "")
+                            err = bool(b.get("is_error", False))
+                            if isinstance(c, str):
+                                results.append((c, err))
+        except OSError:
+            continue
+    return results
+
+
 def find_subagent_done(home):
     """从 transcript 的 tool_result 里找后台 subagent 完成记录(TaskOutput status=done)。
 
@@ -182,7 +214,7 @@ def run_e2e_tool(bin_path, prompt, tool_name, required_keys=None,
 def assert_tool_e2e(bin_path, prompt, tool_name, required_keys=None,
                     extra_keys=None, wait_s=12, env=None, cwd=None,
                     require_card=True, cleanup_home=True, retries=None,
-                    accept_tools=None):
+                    accept_tools=None, expect_tool_ok=False):
     """完整断言:重试 retries(默认 RETRIES)次,任一次"意图被满足"即通过。
 
     通过判据(两档):
@@ -193,6 +225,11 @@ def assert_tool_e2e(bin_path, prompt, tool_name, required_keys=None,
          已实测同一 prompt 多次在 Grep/Bash/TaskCreate 间漂移。特定工具的 schema 正确性
          由 L2 tool_schema_coverage_test 守卫,不依赖真模型采样。
     require_card=True 时额外软校验屏幕出现工具卡片(失败不单独判负,并入重试)。
+
+    expect_tool_ok=True 时(补"声明=接线=测试"盲区):额外**硬校验**——transcript 里至少有
+    一条 is_error != true 的 tool_result,且**没有** is_error=true 的(工具 execute 失败即转红)。
+    旧判据只看工具被调用,工具 execute 返回 error 仍判绿——AskUserQuestion 的 InvalidArgs
+    就这样漏网。开启此参数的用例确保工具真正执行成功。
     返回最后一次 (raw, home, uses) 供调用方追加断言。
     """
     n = retries if retries is not None else RETRIES
@@ -208,7 +245,14 @@ def assert_tool_e2e(bin_path, prompt, tool_name, required_keys=None,
             (not require_card) or screen_has_tool_card(raw, tool_name))
         # ② 同类工具算过(意图满足)
         alt = bool(accept_tools) and any_tool_called(uses, accept_tools)
-        if preferred or alt:
+        # ③ 工具执行成功校验(expect_tool_ok):无 is_error=true 的 tool_result,且至少一条成功。
+        tool_ok = True
+        if expect_tool_ok:
+            tr = read_tool_results_with_error(home)
+            had_error = any(err for (_c, err) in tr)
+            had_ok = any((not err) for (_c, err) in tr)
+            tool_ok = had_ok and not had_error
+        if (preferred or alt) and tool_ok:
             if cleanup_home:
                 for h in homes:
                     shutil.rmtree(h, ignore_errors=True)
@@ -218,9 +262,14 @@ def assert_tool_e2e(bin_path, prompt, tool_name, required_keys=None,
     raw, home, uses = last
     names = sorted({u["name"] for u in uses})
     accepted = (" / 或同类工具 %s" % accept_tools) if accept_tools else ""
-    diag = ("工具 %s%s 未被调用(required_keys=%s)。%d 次 attempt 全失败。\n"
-            "  transcript 实际调用的工具: %s\n"
-            "  HOME(保留供调试): %s") % (tool_name, accepted, required_keys, n, names, home)
+    ok_note = ""
+    if expect_tool_ok:
+        tr = read_tool_results_with_error(home)
+        errs = [c[:120] for (c, err) in tr if err]
+        ok_note = "\n  expect_tool_ok=True: tool_result 里有 is_error=true: %s" % (errs or "(无,但也无成功结果)")
+    diag = ("工具 %s%s 未被调用或执行失败(required_keys=%s)。%d 次 attempt 全失败。\n"
+            "  transcript 实际调用的工具: %s%s\n"
+            "  HOME(保留供调试): %s") % (tool_name, accepted, required_keys, n, names, ok_note, home)
     if cleanup_home:
         for h in homes[:-1]:
             shutil.rmtree(h, ignore_errors=True)

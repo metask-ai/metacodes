@@ -64,6 +64,15 @@ pub const PropSpec = struct {
     items_type: ?[]const u8 = null,
     /// 枚举取值（输出 "enum":[...]）。
     enum_values: ?[]const []const u8 = null,
+    /// array 元素是 object 时,元素对象的字段(输出 "items":{"type":"object","properties":{...}})。
+    /// 与 items_type 二选一:有 items_props 则 items 是对象 schema,否则用 items_type 简单类型。
+    items_props: ?[]const PropSpec = null,
+    /// items_props 里哪些字段必填(array-of-object 的元素 required)。
+    items_required: ?[]const []const u8 = null,
+    /// type=="object" 时,对象自身的字段(输出 "properties":{...})。支持嵌套对象。
+    object_props: ?[]const PropSpec = null,
+    /// object_props 里哪些字段必填。
+    object_required: ?[]const []const u8 = null,
 };
 
 pub const InputSchema = struct {
@@ -285,6 +294,7 @@ fn serializeInputSchema(schema: InputSchema, buf: *std.ArrayList(u8), allocator:
 }
 
 /// 序列化单个 PropSpec 为 `"name":{"type":...,"description":...,...}`。
+/// 支持嵌套:array-of-object(items_props)、object(object_props)递归输出完整 JSON Schema。
 fn serializePropSpec(spec: PropSpec, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
     try util_json.serializeString(spec.name, buf, allocator);
     try buf.appendSlice(allocator, ":{\"type\":");
@@ -293,10 +303,30 @@ fn serializePropSpec(spec: PropSpec, buf: *std.ArrayList(u8), allocator: std.mem
         try buf.appendSlice(allocator, ",\"description\":");
         try util_json.serializeString(spec.description, buf, allocator);
     }
-    if (spec.items_type) |it| {
+    // array 元素:优先 items_props(对象 schema),否则 items_type(简单类型)。
+    if (spec.items_props) |iprops| {
+        try buf.appendSlice(allocator, ",\"items\":{\"type\":\"object\",\"properties\":{");
+        for (iprops, 0..) |p, i| {
+            if (i > 0) try buf.append(allocator, ',');
+            try serializePropSpec(p, buf, allocator);
+        }
+        try buf.append(allocator, '}');
+        try serializeRequired(spec.items_required, buf, allocator);
+        try buf.append(allocator, '}');
+    } else if (spec.items_type) |it| {
         try buf.appendSlice(allocator, ",\"items\":{\"type\":");
         try util_json.serializeString(it, buf, allocator);
         try buf.append(allocator, '}');
+    }
+    // object 自身字段(嵌套对象)。
+    if (spec.object_props) |oprops| {
+        try buf.appendSlice(allocator, ",\"properties\":{");
+        for (oprops, 0..) |p, i| {
+            if (i > 0) try buf.append(allocator, ',');
+            try serializePropSpec(p, buf, allocator);
+        }
+        try buf.append(allocator, '}');
+        try serializeRequired(spec.object_required, buf, allocator);
     }
     if (spec.enum_values) |vals| {
         try buf.appendSlice(allocator, ",\"enum\":[");
@@ -307,6 +337,18 @@ fn serializePropSpec(spec: PropSpec, buf: *std.ArrayList(u8), allocator: std.mem
         try buf.append(allocator, ']');
     }
     try buf.append(allocator, '}');
+}
+
+/// 输出 `,"required":["a","b"]`(若非空)。
+fn serializeRequired(req: ?[]const []const u8, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    const r = req orelse return;
+    if (r.len == 0) return;
+    try buf.appendSlice(allocator, ",\"required\":[");
+    for (r, 0..) |name, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try util_json.serializeString(name, buf, allocator);
+    }
+    try buf.append(allocator, ']');
 }
 
 fn serializeJsonValue(value: std.json.Value, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
@@ -365,6 +407,46 @@ test "serializeMessagesRequest with system prompt" {
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"system\":\"You are X.\"") != null);
 }
+
+test "serializeOneTool: 嵌套 PropSpec(array-of-object + object_props)递归输出" {
+    const a = std.testing.allocator;
+    // 模拟 AskUserQuestion:questions[].options[] 两层 array-of-object 嵌套。
+    const tool = ToolDefinition{
+        .name = "AskUserQuestion",
+        .description = "ask",
+        .input_schema = .{
+            .type = "object",
+            .prop_specs = &.{
+                .{
+                    .name = "questions",
+                    .type = "array",
+                    .items_props = &.{
+                        .{ .name = "question", .type = "string" },
+                        .{ .name = "options", .type = "array", .items_props = &.{
+                            .{ .name = "label", .type = "string" },
+                            .{ .name = "description", .type = "string" },
+                        }, .items_required = &.{ "label", "description" } },
+                        .{ .name = "multiSelect", .type = "boolean" },
+                    },
+                    .items_required = &.{ "question", "options" },
+                },
+            },
+            .required = &.{"questions"},
+        },
+    };
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try serializeOneTool(tool, &buf, a);
+    const out = buf.items;
+    // 关键断言:嵌套结构真的序列化出来了(模型才能收到正确 schema)。
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"items\":{\"type\":\"object\",\"properties\":{") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"label\":{\"type\":\"string\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"description\":{\"type\":\"string\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"multiSelect\":{\"type\":\"boolean\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"required\":[\"label\",\"description\"]") != null);
+    // options 不再是被当字符串数组(无 items:{"type":"string"} 在 options 位置)。
+}
+
 
 test "serializeMessagesRequest with stream=true" {
     const msg = types.ApiMessage{ .role = .user, .content = &.{.{ .text = "hi" }} };

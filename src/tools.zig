@@ -250,7 +250,28 @@ pub const registry: []const ToolEntry = &.{
         .name = "AskUserQuestion",
         .description = "Ask the user a multiple-choice question interactively. Only works in TTY. Use when you need user decision to proceed (architecture choices, ambiguous requests).",
         .input_schema = .{ .type = "object", .prop_specs = &.{
-            .{ .name = "questions", .type = "array", .description = "List of questions, each with header/question/options", .items_type = "object" },
+            .{
+                .name = "questions",
+                .type = "array",
+                .description = "List of questions to ask the user (1-4).",
+                // 嵌套 schema:每个 question 是对象,options 又是 {label,description} 对象数组。
+                .items_props = &.{
+                    .{ .name = "question", .type = "string", .description = "The complete question to ask. Clear, specific, ends with '?'." },
+                    .{ .name = "header", .type = "string", .description = "Very short label/chip for the question (max 12 chars)." },
+                    .{
+                        .name = "options",
+                        .type = "array",
+                        .description = "The available choices (2-4). Each a distinct option object.",
+                        .items_props = &.{
+                            .{ .name = "label", .type = "string", .description = "Display text the user selects. Concise (1-5 words)." },
+                            .{ .name = "description", .type = "string", .description = "Explanation of what this option means / its trade-offs." },
+                        },
+                        .items_required = &.{ "label", "description" },
+                    },
+                    .{ .name = "multiSelect", .type = "boolean", .description = "Allow selecting multiple options instead of one. Default false." },
+                },
+                .items_required = &.{ "question", "header", "options" },
+            },
         }, .required = &.{"questions"} },
         .execute = ask_user_tool.execute,
     },

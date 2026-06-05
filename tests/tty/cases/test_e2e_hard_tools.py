@@ -83,7 +83,8 @@ def test_e2e_askuserquestion(bin_path):
     if SKIP:
         return
     # AskUserQuestion 阻塞读 stdin(tty 下打印数字选项,读一行数字)。
-    # driver 提问后喂 "1\n" 应答,验证工具被调用 + 应答后流程继续。
+    # driver 提问后喂 "1\n" 应答。expect_tool_ok=True:硬校验工具 execute 成功(无 is_error)——
+    # 这条曾漏过 InvalidArgs bug(options 对象数组被当字符串数组解析失败,旧判据只看工具被调用判绿)。
     assert_tool_e2e(
         bin_path,
         "Ask me a multiple choice question about which color I prefer, with options red green blue",
@@ -93,6 +94,7 @@ def test_e2e_askuserquestion(bin_path):
         require_card=False,
         accept_tools=["AskUserQuestion"],
         extra_keys=["type:1", "key:enter", "sleep:4"],
+        expect_tool_ok=True,
     )
 
 
