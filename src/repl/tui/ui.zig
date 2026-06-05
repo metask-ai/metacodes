@@ -104,6 +104,19 @@ fn dispatchKey(state: *UiState, key: input.Key) Effect {
     // transcript overlay 优先消费按键(模态视图)。
     if (state.overlay == .transcript) return dispatchTranscriptKey(state, key);
 
+    // Ctrl+X Ctrl+K 序列(Emacs 双键前缀,杀后台任务)。arming 在 UiState,dispatch 统一处理。
+    // 进入即消费上次的 armed(每键清一次,除非本键是 Ctrl+X 重新设)→ 防粘连。
+    const was_x_armed = state.ctrl_x_armed;
+    state.ctrl_x_armed = false;
+    if (key == .ctrl_x) {
+        state.ctrl_x_armed = true; // 等下一个键
+        return .{ .redraw_region = false }; // Ctrl+X 单独无视觉变化
+    }
+    if (was_x_armed and key == .ctrl_k) {
+        return .{ .action = .kill_background }; // Ctrl+X Ctrl+K → 杀后台(两期共用)
+    }
+    // (was_x_armed 但下个键非 Ctrl+K:armed 已清,该键照常走下面分发,如 Ctrl+K 单按=kill-line)
+
     // `?` 帮助(非模态,对齐 cc onChange):空 editor 打 `?` → toggle help_open,`?` 不进 editor。
     if (key == .char and key.char == '?' and state.editor.view.len == 0) {
         state.help_open = !state.help_open;
@@ -127,6 +140,30 @@ fn dispatchKey(state: *UiState, key: input.Key) Effect {
         state.transcript_top = 0;
         return .{ .redraw_region = true };
     }
+    // Ctrl+T → 切 task 面板显隐(对齐 cc app:toggleTodos)。纯内存 toggle,两期共用。
+    // drawPanel/drawTaskList 读 panel.task_list_visible 门控。
+    if (key == .ctrl_t) {
+        state.panel.task_list_visible = !state.panel.task_list_visible;
+        return .{ .redraw_region = true };
+    }
+
+    // ── 全局快捷键:dispatch 识别 → 上抛 LoopAction,IO 体留调用方(两期共用解析)──────
+    // 按 UiState gate:生成期对无意义的键(history/complete/reverse_search/external_edit)
+    // 直接吞掉(无补全器/无搜索 UI/不起 $EDITOR),不上抛、不透传。
+    const gen = state.phase == .generating;
+    switch (key) {
+        // 两期都激活的全局键。
+        .shift_tab => return .{ .action = .cycle_perm_mode },
+        .ctrl_l => return .{ .action = .redraw_screen },
+        // 仅输入期激活:生成期无对应子系统 → 吞掉(redraw_region=false,不透传不上抛)。
+        .up => return if (gen) .{} else .{ .action = .history_prev },
+        .down => return if (gen) .{} else .{ .action = .history_next },
+        .tab => return if (gen) .{} else .{ .action = .complete },
+        .ctrl_r => return if (gen) .{} else .{ .action = .reverse_search },
+        .ctrl_g => return if (gen) .{} else .{ .action = .external_edit },
+        else => {},
+    }
+
     // 其余按键:交 LineEditor 处理。若刚关了 help,带上 redraw_region 让 help 菜单从屏消失。
     return .{ .redraw_region = help_closed, .action = .pass_to_editor };
 }

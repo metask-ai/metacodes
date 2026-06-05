@@ -30,6 +30,9 @@ SPECIAL = {
     "ctrl_c": b"\x03",
     "ctrl_d": b"\x04",
     "ctrl_o": b"\x0f",
+    "ctrl_t": b"\x14",
+    "ctrl_l": b"\x0c",
+    "ctrl_r": b"\x12",
     "esc": b"\x1b",
 }
 

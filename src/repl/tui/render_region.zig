@@ -274,6 +274,7 @@ pub const RenderRegion = struct {
     /// 超预算折叠为 `… +N more`。返回行数。
     fn drawTaskList(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App, max_lines: u16) u16 {
         if (max_lines == 0) return 0;
+        if (!self.ui.panel.task_list_visible) return 0; // Ctrl+T 隐藏:不画 task 清单
         const tasks = app.tasks.tasks.items;
         const now = util_time.nowMs();
         const TTL_MS: i64 = 30_000;

@@ -740,6 +740,62 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
             switch (eff.action) {
                 .pass_to_editor => {}, // 落到下面正常编辑
                 .none, .commit, .cancel, .exit => continue, // overlay 消费了(已重画),不喂 editor
+                // ── 全局快捷键:dispatch 上抛 → 在此执行 IO 体(单一真相源:键解析全在 dispatch)──
+                .history_prev => {
+                    if (try history.prev(editor.view())) |prev| {
+                        try editor.setLine(prev);
+                        redraw(&region, &editor, app);
+                    }
+                    continue;
+                },
+                .history_next => {
+                    if (history.next()) |nxt| {
+                        try editor.setLine(nxt);
+                        redraw(&region, &editor, app);
+                    }
+                    continue;
+                },
+                .complete => {
+                    region.clear();
+                    try handleCompletion(&editor, allocator);
+                    redraw(&region, &editor, app);
+                    continue;
+                },
+                .reverse_search => {
+                    region.clear();
+                    try handleReverseSearch(fd, &editor, &parser, history, allocator);
+                    redraw(&region, &editor, app);
+                    continue;
+                },
+                .cycle_perm_mode => {
+                    app.cyclePermMode();
+                    redraw(&region, &editor, app);
+                    continue;
+                },
+                .redraw_screen => {
+                    region.clear();
+                    std.debug.print("\x1b[2J\x1b[H", .{});
+                    redraw(&region, &editor, app);
+                    continue;
+                },
+                .external_edit => {
+                    region.clear();
+                    input.restoreMode(fd, orig);
+                    if (externalEdit(allocator, editor.view())) |edited| {
+                        defer allocator.free(edited);
+                        editor.setLine(edited) catch {};
+                    } else |_| {}
+                    _ = input.enterRawMode(fd);
+                    redraw(&region, &editor, app);
+                    continue;
+                },
+                .kill_background => {
+                    region.clear();
+                    const killed = app.killAllBackground();
+                    std.debug.print("\x1b[33m[killed {d} background task(s)]\x1b[0m\n", .{killed});
+                    redraw(&region, &editor, app);
+                    continue;
+                },
             }
         }
 
@@ -762,75 +818,6 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
             },
             .exit_repl => return error.ExitRequested,
             .eof => return error.Eof,
-            .history_prev => {
-                if (try history.prev(editor.view())) |prev| {
-                    try editor.setLine(prev);
-                    redraw(&region, &editor, app);
-                }
-            },
-            .history_next => {
-                if (history.next()) |nxt| {
-                    try editor.setLine(nxt);
-                    redraw(&region, &editor, app);
-                }
-            },
-            .complete => {
-                // 补全列候选会打多行到 scrollback → clear → 打印 → render
-                region.clear();
-                try handleCompletion(&editor, allocator);
-                redraw(&region, &editor, app);
-            },
-            .reverse_search => {
-                region.clear();
-                try handleReverseSearch(fd, &editor, &parser, history, allocator);
-                redraw(&region, &editor, app);
-            },
-            .cycle_perm_mode => {
-                // Claude Code Shift+Tab 标准循环:default → acceptEdits → plan → default
-                app.config.permission_mode = switch (app.config.permission_mode) {
-                    .default, .prompt => .accept_edits,
-                    .accept_edits => .plan,
-                    .plan => .default,
-                    .auto, .dont_ask, .bypass_permissions, .bypass => .default,
-                };
-                app.permission_ctx.mode = app.config.permission_mode;
-                // mode 直接体现在 footer + 边框色,重画即可(不再单独打印 [mode])。
-                redraw(&region, &editor, app);
-            },
-            .redraw_screen => {
-                region.clear();
-                std.debug.print("\x1b[2J\x1b[H", .{});
-                redraw(&region, &editor, app);
-            },
-            .toggle_task_list => {
-                region.clear();
-                printTaskList(app);
-                redraw(&region, &editor, app);
-            },
-            .open_transcript => {
-                region.clear();
-                input.restoreMode(fd, orig); // 暂退 raw mode 让 viewer 自管
-                const tv = @import("transcript_viewer.zig");
-                tv.runWithTheme(fd, allocator, &app.conversation, termRows(), app.theme) catch {};
-                _ = input.enterRawMode(fd);
-                redraw(&region, &editor, app);
-            },
-            .kill_background => {
-                region.clear();
-                const killed = killAllBackground(app);
-                std.debug.print("\x1b[33m[killed {d} background task(s)]\x1b[0m\n", .{killed});
-                redraw(&region, &editor, app);
-            },
-            .external_edit => {
-                region.clear();
-                input.restoreMode(fd, orig);
-                if (externalEdit(allocator, editor.view())) |edited| {
-                    defer allocator.free(edited);
-                    editor.setLine(edited) catch {};
-                } else |_| {}
-                _ = input.enterRawMode(fd);
-                redraw(&region, &editor, app);
-            },
             .clear_draft => {
                 // 把当前 draft 存入历史(Up 可恢复),然后清空
                 if (editor.view().len > 0) {
@@ -1860,18 +1847,6 @@ fn externalEdit(allocator: std.mem.Allocator, current: []const u8) ![]u8 {
 }
 
 /// 杀所有 running 后台任务,返回杀掉的数量。
-fn killAllBackground(app: *app_mod.App) usize {
-    const jobs = if (app.jobs) |*j| j else return 0;
-    var killed: usize = 0;
-    // 收集 running id(避免迭代中改 collection)
-    for (jobs.jobs.items) |*j| {
-        if (j.status != .running) continue;
-        var id_copy: [12]u8 = j.id;
-        jobs.kill(id_copy[0..]) catch continue;
-        killed += 1;
-    }
-    return killed;
-}
 
 /// Ctrl+T:打印任务列表(最多 5 个,带状态图标)+ 后台 subagent job 列表。覆盖到 prompt 上方。
 fn printTaskList(app: *app_mod.App) void {

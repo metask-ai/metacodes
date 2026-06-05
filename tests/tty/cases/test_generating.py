@@ -293,3 +293,25 @@ def test_T33_gen_ctrl_o_toggle_close(bin_path):
         a._fail("Ctrl+O 关闭后未回到生成区(或生成已结束,可重试)")
 
 
+def test_T34_gen_shift_tab_cycles_mode(bin_path):
+    # 生成期 Shift+Tab → 循环权限模式(footer mode part 变)。验证全局键经 dispatch 上抛后
+    # 两期一致(对齐 cc Shift+Tab 在 isLoading 仍激活)。早期 bug:生成期 watcher 丢弃 action。
+    # 注:mode part 替换 footer 的 "esc to interrupt" 段(同一行),故不能用它筛生成帧——
+    # 直接在所有帧找 mode 切换标志。短查询 + shift_tab 早按,确保落在生成窗口。
+    if SKIP:
+        return
+    # 用 default 模式启动(tty_driver 默认 bypassPermissions,其 cycle 是 bypass→default
+    # 看不到 accept edits)。default 下 Shift+Tab → accept edits,可断言。
+    raw = run(bin_path, ["sleep:0.8", "type:数到30每行一个数字", "key:enter",
+                         "sleep:0.6", "key:shift_tab", "sleep:1.5"],
+              per_key_drain=0.05, base_url=None, permission="default")
+    a = TTYAssert(raw)
+    # 某帧 footer 出现非 default 模式(accept edits / plan mode)——Shift+Tab 在生成期切换生效。
+    ok = any(
+        sc.find_last_row("accept edits") is not None or sc.find_last_row("plan mode") is not None
+        for sc in a.frame_screens
+    )
+    if not ok:
+        a._fail("生成期 Shift+Tab 未切换权限模式(footer 无 accept edits/plan mode)")
+
+

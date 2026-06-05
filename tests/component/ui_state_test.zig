@@ -58,6 +58,56 @@ test "dispatch: Ctrl+O 在 none/transcript 间切换(真视图态)" {
     try testing.expectEqual(ui_state.Overlay.none, s.overlay);
 }
 
+test "dispatch: Ctrl+T 切 task 面板显隐(toggle panel.task_list_visible,dispatch 内消费)" {
+    var s = UiState{};
+    try testing.expect(s.panel.task_list_visible); // 默认显示
+    const e1 = ui.dispatch(&s, keyTag(.ctrl_t));
+    try testing.expect(!s.panel.task_list_visible); // 第一次 → 隐藏
+    try testing.expect(e1.redraw_region);
+    try testing.expectEqual(event.LoopAction.none, e1.action); // dispatch 内消费,不上抛/不透传
+    _ = ui.dispatch(&s, keyTag(.ctrl_t));
+    try testing.expect(s.panel.task_list_visible); // 第二次 → 恢复
+}
+
+test "dispatch: Ctrl+T 在生成期也生效(两期共用一份语义)" {
+    var s = UiState{ .phase = .generating };
+    _ = ui.dispatch(&s, keyTag(.ctrl_t));
+    try testing.expect(!s.panel.task_list_visible);
+}
+
+test "dispatch: transcript overlay 下 Ctrl+T 被 overlay 拦截(面板不变)" {
+    var s = UiState{ .overlay = .transcript };
+    _ = ui.dispatch(&s, keyTag(.ctrl_t));
+    try testing.expect(s.panel.task_list_visible); // 模态吞掉,默认 true 不变
+}
+
+test "dispatch: 全局键上抛 LoopAction(输入期)——shift_tab/ctrl_l/up/down/tab/ctrl_r/ctrl_g" {
+    var s = UiState{}; // phase=.input
+    try testing.expectEqual(event.LoopAction.cycle_perm_mode, ui.dispatch(&s, keyTag(.shift_tab)).action);
+    try testing.expectEqual(event.LoopAction.redraw_screen, ui.dispatch(&s, keyTag(.ctrl_l)).action);
+    try testing.expectEqual(event.LoopAction.history_prev, ui.dispatch(&s, keyTag(.up)).action);
+    try testing.expectEqual(event.LoopAction.history_next, ui.dispatch(&s, keyTag(.down)).action);
+    try testing.expectEqual(event.LoopAction.complete, ui.dispatch(&s, keyTag(.tab)).action);
+    try testing.expectEqual(event.LoopAction.reverse_search, ui.dispatch(&s, keyTag(.ctrl_r)).action);
+    try testing.expectEqual(event.LoopAction.external_edit, ui.dispatch(&s, keyTag(.ctrl_g)).action);
+}
+
+test "dispatch: 生成期 gate——shift_tab/ctrl_l 仍激活,history/complete/search/edit 被吞" {
+    var s = UiState{ .phase = .generating };
+    try testing.expectEqual(event.LoopAction.cycle_perm_mode, ui.dispatch(&s, keyTag(.shift_tab)).action);
+    try testing.expectEqual(event.LoopAction.redraw_screen, ui.dispatch(&s, keyTag(.ctrl_l)).action);
+    try testing.expectEqual(event.LoopAction.none, ui.dispatch(&s, keyTag(.up)).action);
+    try testing.expectEqual(event.LoopAction.none, ui.dispatch(&s, keyTag(.tab)).action);
+    try testing.expectEqual(event.LoopAction.none, ui.dispatch(&s, keyTag(.ctrl_r)).action);
+    try testing.expectEqual(event.LoopAction.none, ui.dispatch(&s, keyTag(.ctrl_g)).action);
+}
+
+test "dispatch: transcript overlay 下全局键不上抛(被 overlay 拦截)" {
+    var s = UiState{ .overlay = .transcript };
+    try testing.expectEqual(event.LoopAction.none, ui.dispatch(&s, keyTag(.shift_tab)).action);
+    try testing.expectEqual(event.LoopAction.none, ui.dispatch(&s, keyTag(.ctrl_l)).action);
+}
+
 test "dispatch: transcript 下 j/k 滚动,q 关闭" {
     var s = UiState{ .overlay = .transcript, .transcript_top = 0 };
     _ = ui.dispatch(&s, keyChar('j'));

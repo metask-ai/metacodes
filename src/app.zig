@@ -349,6 +349,31 @@ pub const App = struct {
         if (app.transcript_writer) |*w| w.flush(&app.conversation);
     }
 
+    /// Shift+Tab:循环权限模式 default → acceptEdits → plan → default(对齐 Claude Code)。
+    /// 改 config + permission_ctx;footer 读 live permission_ctx.mode 即反映。两期(loop/tui_backend)共用。
+    pub fn cyclePermMode(app: *App) void {
+        app.config.permission_mode = switch (app.config.permission_mode) {
+            .default, .prompt => .accept_edits,
+            .accept_edits => .plan,
+            .plan => .default,
+            .auto, .dont_ask, .bypass_permissions, .bypass => .default,
+        };
+        app.permission_ctx.mode = app.config.permission_mode;
+    }
+
+    /// Ctrl+X Ctrl+K:杀所有 running 后台任务,返回 killed 数。两期共用。
+    pub fn killAllBackground(app: *App) usize {
+        const jobs = if (app.jobs) |*j| j else return 0;
+        var killed: usize = 0;
+        for (jobs.jobs.items) |*j| {
+            if (j.status != .running) continue;
+            var id_copy: [12]u8 = j.id; // 快照 id(kill 可能改 collection)
+            jobs.kill(id_copy[0..]) catch continue;
+            killed += 1;
+        }
+        return killed;
+    }
+
     /// 获取 agent_loop 能用的 UsageSink（把 event 累加到 app.usage）。
     pub fn usageSink(app: *App) agent_loop.UsageSink {
         return .{ .ctx = @ptrCast(&app.usage), .addFn = usageTotalsAdd };

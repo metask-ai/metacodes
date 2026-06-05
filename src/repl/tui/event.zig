@@ -19,6 +19,26 @@ pub const LoopAction = enum {
     cancel,
     /// 退出 REPL。
     exit,
+    // ── 全局快捷键上抛(dispatch 识别键 → 上抛,调用方按自己能力执行 IO)──────────
+    // dispatch 是纯函数不碰 fd/raw-mode/子进程/history,这些动作的 IO 体留在调用方
+    // (输入期 loop.zig / 生成期 tui_backend.zig)。生成期对无意义的(history/complete/
+    // reverse_search/external_edit)在 dispatch 内就 gate 掉,不会上抛到这。
+    /// ↑ 上一条历史(调用方查 history → editor.setLine)。
+    history_prev,
+    /// ↓ 下一条历史。
+    history_next,
+    /// Tab 补全(调用方跑补全引擎)。
+    complete,
+    /// Ctrl+R 反向搜索(调用方进独占 fd 读循环)。
+    reverse_search,
+    /// Ctrl+G 外部编辑器(调用方暂退 raw mode 起 $EDITOR)。
+    external_edit,
+    /// Ctrl+L 清屏重画。
+    redraw_screen,
+    /// Ctrl+X Ctrl+K 杀所有后台任务。
+    kill_background,
+    /// Shift+Tab 循环权限模式(调用方改 app.config.permission_mode/permission_ctx)。
+    cycle_perm_mode,
 };
 
 pub const KeyEvent = struct { key: input.Key };

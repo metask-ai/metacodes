@@ -309,28 +309,8 @@ pub const Action = enum {
     exit_repl,
     /// 空输入 Ctrl+D → 主动退出 REPL；非空输入 Ctrl+D → 丢弃
     eof,
-    /// 历史上一条
-    history_prev,
-    /// 历史下一条
-    history_next,
-    /// TAB：请求补全（调用方计算候选并回填 buffer）
-    complete,
-    /// Ctrl+R：进入反向历史搜索（调用方驱动搜索 UI）
-    reverse_search,
-    /// Ctrl+L：重绘屏幕(调用方清屏 + 重画 prompt + buffer)
-    redraw_screen,
-    /// Shift+Tab：cycle 权限模式(调用方改 app.config.permission_mode)
-    cycle_perm_mode,
-    /// Ctrl+T：切换任务列表显示
-    toggle_task_list,
     /// Esc Esc(空 buffer 二次):清 draft + 保存到历史
     clear_draft,
-    /// Ctrl+O:打开 transcript viewer
-    open_transcript,
-    /// Ctrl+X Ctrl+K:kill 所有后台任务
-    kill_background,
-    /// Ctrl+G:外部编辑器编辑当前 buffer
-    external_edit,
     /// 无语义变化（如 unknown 键）
     none,
 };
@@ -349,8 +329,6 @@ pub const LineEditor = struct {
     ctrl_c_armed: bool = false,
     /// 上一次按键是否是 Esc(用于 Esc Esc 双击清 draft)。
     esc_armed: bool = false,
-    /// 上一次按键是否是 Ctrl+X(用于 Ctrl+X Ctrl+K 序列)。
-    ctrl_x_armed: bool = false,
     /// yank ring:Ctrl+W/K/U 删除的内容存这,Ctrl+Y 粘回。
     yank_buf: std.ArrayList(u8),
     /// undo 栈:破坏性编辑前快照 buf+cursor。深度上限 undo_max_depth,超了丢最旧。
@@ -382,10 +360,6 @@ pub const LineEditor = struct {
         if (@as(std.meta.Tag(Key), key) != .esc) {
             self.esc_armed = false;
         }
-        const was_ctrl_x_armed = self.ctrl_x_armed;
-        if (@as(std.meta.Tag(Key), key) != .ctrl_x) {
-            self.ctrl_x_armed = false;
-        }
 
         // undo 去抖:破坏性编辑前 push 当前状态。char 连打只在段首压一次(last_op != char);
         // 其它破坏性操作每次都压。导航键不压但更新 last_op(使 char→left→char 在第二个 char 重新压)。
@@ -399,8 +373,9 @@ pub const LineEditor = struct {
                     self.pushUndo();
                 },
                 .ctrl_k => {
-                    // Ctrl+X Ctrl+K 是 kill_background(非破坏);末尾 Ctrl+K 是 no-op。仅真截断才压。
-                    if (!was_ctrl_x_armed and self.cursor < self.buf.items.len) self.pushUndo();
+                    // Ctrl+K 单按 = kill-line(Ctrl+X Ctrl+K 序列已迁 dispatch,不到 editor)。
+                    // 仅真截断才压 undo(末尾 Ctrl+K 是 no-op)。
+                    if (self.cursor < self.buf.items.len) self.pushUndo();
                 },
                 else => {},
             }
@@ -464,8 +439,7 @@ pub const LineEditor = struct {
                 return .redraw;
             },
             .ctrl_k => {
-                // Ctrl+X Ctrl+K 序列:kill 后台任务
-                if (was_ctrl_x_armed) return .kill_background;
+                // Ctrl+K 单按 = kill-line(删到行尾)。Ctrl+X Ctrl+K 序列(杀后台)已迁 dispatch。
                 if (self.cursor >= self.buf.items.len) return .none;
                 self.buf.items.len = self.cursor; // 截断
                 return .redraw;
@@ -490,19 +464,9 @@ pub const LineEditor = struct {
                 if (self.buf.items.len == 0) return .eof;
                 return .none; // 非空时忽略（不删除字符，不像 delete）
             },
-            .up => return .history_prev,
-            .down => return .history_next,
-            .tab => return .complete,
-            .shift_tab => return .cycle_perm_mode,
-            .ctrl_r => return .reverse_search,
-            .ctrl_t => return .toggle_task_list,
-            .ctrl_o => return .open_transcript,
-            .ctrl_g => return .external_edit,
-            .ctrl_x => {
-                self.ctrl_x_armed = true;
-                return .none;
-            },
-            .ctrl_l => return .redraw_screen,
+            // 全局快捷键(↑↓/Tab/Shift+Tab/Ctrl+R/T/O/G/X/L)已全部由 dispatch(ui.zig)拦截解析,
+            // editor 永远收不到它们(dispatch 返回非 pass_to_editor)→ 此处不再处理,落 else=.none。
+            // Ctrl+X Ctrl+K 序列也迁 dispatch(UiState.ctrl_x_armed),editor 只管 Ctrl+K 单按 kill-line。
             .ctrl_w => {
                 // 删上一个词:从 cursor 往前跳过空白,再删到上一个词边界
                 if (self.cursor == 0) return .none;
@@ -559,6 +523,9 @@ pub const LineEditor = struct {
                 self.esc_armed = true;
                 return .none;
             },
+            // 全局快捷键(↑↓/Tab/Shift+Tab/Ctrl+R/T/O/G/X/L)由 dispatch(ui.zig)拦截,
+            // editor 正常收不到;此处兜底返 .none(防御:vim/边界路径若漏到这不崩)。
+            .up, .down, .tab, .shift_tab, .ctrl_r, .ctrl_t, .ctrl_o, .ctrl_g, .ctrl_x, .ctrl_l => return .none,
             .unknown => return .none,
         }
     }
@@ -885,11 +852,20 @@ test "LineEditor: ctrl_d non-empty -> none" {
     try testing.expect(a == .none);
 }
 
-test "LineEditor: up/down -> history actions" {
+test "LineEditor: 全局键(↑↓/Tab/Shift+Tab/Ctrl+R/T/O/G/L)不再归 editor → .none(已迁 dispatch)" {
     var ed = LineEditor.init(testing.allocator);
     defer ed.deinit();
-    try testing.expect((try ed.handle(.up)) == .history_prev);
-    try testing.expect((try ed.handle(.down)) == .history_next);
+    // 这些键由 dispatch(ui.zig)拦截解析,editor 兜底返 .none(防御:误加回会被此测抓)。
+    try testing.expect((try ed.handle(.up)) == .none);
+    try testing.expect((try ed.handle(.down)) == .none);
+    try testing.expect((try ed.handle(.tab)) == .none);
+    try testing.expect((try ed.handle(.shift_tab)) == .none);
+    try testing.expect((try ed.handle(.ctrl_r)) == .none);
+    try testing.expect((try ed.handle(.ctrl_t)) == .none);
+    try testing.expect((try ed.handle(.ctrl_o)) == .none);
+    try testing.expect((try ed.handle(.ctrl_g)) == .none);
+    try testing.expect((try ed.handle(.ctrl_l)) == .none);
+    try testing.expect((try ed.handle(.ctrl_x)) == .none);
 }
 
 test "LineEditor: setLine / reset" {
@@ -1045,24 +1021,6 @@ test "LineEditor: alt_b / alt_f word navigation" {
     try testing.expectEqual(@as(usize, 7), ed.cursor);
 }
 
-test "LineEditor: shift_tab returns cycle_perm_mode" {
-    var ed = LineEditor.init(testing.allocator);
-    defer ed.deinit();
-    try testing.expect((try ed.handle(.shift_tab)) == .cycle_perm_mode);
-}
-
-test "LineEditor: ctrl_l returns redraw_screen" {
-    var ed = LineEditor.init(testing.allocator);
-    defer ed.deinit();
-    try testing.expect((try ed.handle(.ctrl_l)) == .redraw_screen);
-}
-
-test "LineEditor: ctrl_t returns toggle_task_list" {
-    var ed = LineEditor.init(testing.allocator);
-    defer ed.deinit();
-    try testing.expect((try ed.handle(.ctrl_t)) == .toggle_task_list);
-}
-
 test "LineEditor: Esc Esc on non-empty buffer clears draft" {
     var ed = LineEditor.init(testing.allocator);
     defer ed.deinit();
@@ -1095,19 +1053,6 @@ test "KeyParser: ctrl_t byte" {
     try testing.expect(p.feed(0x14).? == .ctrl_t);
 }
 
-test "LineEditor: ctrl_o returns open_transcript" {
-    var ed = LineEditor.init(testing.allocator);
-    defer ed.deinit();
-    try testing.expect((try ed.handle(.ctrl_o)) == .open_transcript);
-}
-
-test "LineEditor: Ctrl+X Ctrl+K sequence → kill_background" {
-    var ed = LineEditor.init(testing.allocator);
-    defer ed.deinit();
-    try testing.expect((try ed.handle(.ctrl_x)) == .none); // arm
-    try testing.expect((try ed.handle(.ctrl_k)) == .kill_background);
-}
-
 test "LineEditor: ctrl_k alone truncates (not kill)" {
     var ed = LineEditor.init(testing.allocator);
     defer ed.deinit();
@@ -1121,12 +1066,6 @@ test "KeyParser: ctrl_o / ctrl_x bytes" {
     var p = KeyParser{};
     try testing.expect(p.feed(0x0f).? == .ctrl_o);
     try testing.expect(p.feed(0x18).? == .ctrl_x);
-}
-
-test "LineEditor: ctrl_g returns external_edit" {
-    var ed = LineEditor.init(testing.allocator);
-    defer ed.deinit();
-    try testing.expect((try ed.handle(.ctrl_g)) == .external_edit);
 }
 
 test "KeyParser: ctrl_g byte" {

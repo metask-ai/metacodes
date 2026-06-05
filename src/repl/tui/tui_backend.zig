@@ -76,7 +76,7 @@ pub const TuiBackend = struct {
     // 自决动画驱动(GUI=requestAnimationFrame,语音=无 tick),不依赖 stdin poll。
     /// 输入线程的 fd / app / allocator(startInput 注入)。
     input_fd: std.c.fd_t = 0,
-    input_app: ?*const app_mod.App = null,
+    input_app: ?*app_mod.App = null,
     input_alloc: ?std.mem.Allocator = null,
     /// 写入端的 AbortSignal(watcher esc 调 .abort)。与只读的 abort_signal 同一对象。
     input_abort: ?*abort.AbortSignal = null,
@@ -215,7 +215,7 @@ pub const TuiBackend = struct {
     /// 启动生成期键盘监听线程(loop.zig 在 agent_loop.run 前调)。
     /// fd=stdin;app 供 spinner 重画;queue/input_abort 须已在 backend 上设好。
     /// 非 tty / 无 region 时不应调用(loop.zig 已门控)。
-    pub fn startInput(self: *TuiBackend, fd: std.c.fd_t, app: *const app_mod.App, allocator: std.mem.Allocator) !void {
+    pub fn startInput(self: *TuiBackend, fd: std.c.fd_t, app: *app_mod.App, allocator: std.mem.Allocator) !void {
         self.input_fd = fd;
         self.input_app = app;
         self.input_alloc = allocator;
@@ -284,9 +284,32 @@ pub const TuiBackend = struct {
     fn handleKey(self: *TuiBackend, key: input.Key, ed: *input.LineEditor) void {
         const app = self.input_app orelse return;
         const eff = self.region.applyGenKey(app, &app.conversation, key, ed.view(), ed.cursor);
-        if (eff.action != .pass_to_editor) return; // dispatch 已消费(help/overlay/滚动),不动 editor
 
-        // 走到这:dispatch 未消费该键(无弹层激活)。按键类型决定生成期语义。
+        // dispatch 上抛的全局 LoopAction:生成期能执行的(两期共享:cycle_perm_mode/redraw_screen/
+        // kill_background)在此处理,IO 体属生成期调用方。dispatch 已 gate 掉生成期无意义的键
+        // (history/complete/reverse_search/external_edit → action=.none,不会到这)。
+        switch (eff.action) {
+            .pass_to_editor => {}, // 落下面 key switch(生成期编辑/入队/中断)
+            .cycle_perm_mode => {
+                app.cyclePermMode();
+                self.region.redrawGen(app);
+                return;
+            },
+            .redraw_screen => {
+                std.debug.print("\x1b[2J\x1b[H", .{});
+                self.region.redrawGen(app);
+                return;
+            },
+            .kill_background => {
+                _ = app.killAllBackground();
+                self.region.redrawGen(app);
+                return;
+            },
+            // 其余(none/help/overlay/滚动/生成期被吞的键)→ dispatch/applyGenKey 已消费,不动 editor。
+            else => return,
+        }
+
+        // 走到这:dispatch 未消费该键(pass_to_editor,无弹层激活)。按键类型决定生成期语义。
         switch (key) {
             .enter, .shift_enter, .ctrl_enter => {
                 // 回车 → 入待发送队列(非空才入)+ clear。不立即发。

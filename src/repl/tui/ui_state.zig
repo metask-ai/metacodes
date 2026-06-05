@@ -112,6 +112,10 @@ pub const UiState = struct {
     // transcript overlay 滚动位置(Ctrl+O 视图态)
     transcript_top: usize = 0,
 
+    // Ctrl+X Ctrl+K 序列 arming(Emacs 风格双键前缀):Ctrl+X 后置 true,下个键消费。
+    // 从 LineEditor 迁来 → dispatch 统一处理序列,两期一致(生成期也能 Ctrl+X-K 杀后台)。
+    ctrl_x_armed: bool = false,
+
     // 瞬时提示(对齐 CC:"再按 Ctrl+C 退出" / "agent finished" 等)
     hint: ?[]const u8 = null,
 };
