@@ -349,15 +349,22 @@ pub const App = struct {
         if (app.transcript_writer) |*w| w.flush(&app.conversation);
     }
 
-    /// Shift+Tab:循环权限模式 default → acceptEdits → plan → default(对齐 Claude Code)。
-    /// 改 config + permission_ctx;footer 读 live permission_ctx.mode 即反映。两期(loop/tui_backend)共用。
-    pub fn cyclePermMode(app: *App) void {
-        app.config.permission_mode = switch (app.config.permission_mode) {
+    /// Shift+Tab 的纯状态机:当前 mode → 下一个 mode(对齐 Claude Code)。
+    /// 循环档(default/acceptEdits/plan)三者轮转;非循环档(bypass/auto/dont_ask)→ default。
+    /// 抽成纯函数让状态机可纯单测(不构造 App),cyclePermMode 只做副作用接线。
+    pub fn nextPermMode(mode: types.PermissionMode) types.PermissionMode {
+        return switch (mode) {
             .default, .prompt => .accept_edits,
             .accept_edits => .plan,
             .plan => .default,
             .auto, .dont_ask, .bypass_permissions, .bypass => .default,
         };
+    }
+
+    /// Shift+Tab:循环权限模式 default → acceptEdits → plan → default(对齐 Claude Code)。
+    /// 改 config + permission_ctx;footer 读 live permission_ctx.mode 即反映。两期(loop/tui_backend)共用。
+    pub fn cyclePermMode(app: *App) void {
+        app.config.permission_mode = nextPermMode(app.config.permission_mode);
         app.permission_ctx.setMode(app.config.permission_mode);
     }
 
@@ -821,4 +828,24 @@ test "App init/deinit" {
     // 注意：init.io 在测试环境下不易构造，这里只校验 init/deinit 签名可用。
     // 真正的初始化测试放在集成测试层。
     _ = App;
+}
+
+test "nextPermMode: Shift+Tab 循环状态机(对齐 cc)" {
+    // 循环档三者轮转:default → acceptEdits → plan → default。
+    // 此前只有慢 PTY(test_mode_commit T08)覆盖;下沉成纯单测。
+    try std.testing.expectEqual(types.PermissionMode.accept_edits, App.nextPermMode(.default));
+    try std.testing.expectEqual(types.PermissionMode.plan, App.nextPermMode(.accept_edits));
+    try std.testing.expectEqual(types.PermissionMode.default, App.nextPermMode(.plan));
+    // prompt 别名等价 default → acceptEdits。
+    try std.testing.expectEqual(types.PermissionMode.accept_edits, App.nextPermMode(.prompt));
+    // 非循环档(bypass/auto/dont_ask)→ default(对齐 cc:从特殊模式按一次回循环起点)。
+    try std.testing.expectEqual(types.PermissionMode.default, App.nextPermMode(.bypass_permissions));
+    try std.testing.expectEqual(types.PermissionMode.default, App.nextPermMode(.bypass));
+    try std.testing.expectEqual(types.PermissionMode.default, App.nextPermMode(.auto));
+    try std.testing.expectEqual(types.PermissionMode.default, App.nextPermMode(.dont_ask));
+    // 三步回到起点(完整一圈)。
+    try std.testing.expectEqual(
+        types.PermissionMode.default,
+        App.nextPermMode(App.nextPermMode(App.nextPermMode(.default))),
+    );
 }

@@ -73,6 +73,31 @@ test "render: input 帧含 editor view + footer,绝不含 \\x1b[2J" {
     try capture.expectContains(stripped, "shift+tab to cycle");
 }
 
+test "render: footer default 态显 '? for shortcuts',不显 cycle 提示(对齐 cc)" {
+    // default 态是 cyclePermMode 循环起点;footer 分支与非 default 不同。
+    // 此前仅 PTY(test_mode_commit/test_overlay)覆盖;下沉成纯投影单测。
+    var s = UiState{ .phase = .input, .editor = .{ .view = "", .cursor = 0 }, .footer = .{ .mode = .default } };
+    var cw = capture.CaptureWriter.init(testing.allocator);
+    defer cw.deinit();
+    _ = try ui.render(&cw, mkInputs(&s));
+    const stripped = try capture.stripAnsi(testing.allocator, cw.output());
+    defer testing.allocator.free(stripped);
+    try capture.expectContains(stripped, "? for shortcuts"); // default 专属
+    try testing.expect(std.mem.indexOf(u8, stripped, "shift+tab to cycle") == null); // default 不显 cycle
+    try testing.expect(std.mem.indexOf(u8, stripped, "mode on") == null); // 无 mode part
+}
+
+test "render: footer accept_edits 态显 mode part(cyclePermMode 中间档)" {
+    var s = UiState{ .phase = .input, .editor = .{ .view = "", .cursor = 0 }, .footer = .{ .mode = .accept_edits } };
+    var cw = capture.CaptureWriter.init(testing.allocator);
+    defer cw.deinit();
+    _ = try ui.render(&cw, mkInputs(&s));
+    const stripped = try capture.stripAnsi(testing.allocator, cw.output());
+    defer testing.allocator.free(stripped);
+    try capture.expectContains(stripped, "accept edits on"); // cc 风格 title
+    try capture.expectContains(stripped, "shift+tab to cycle"); // 非 default → 显 cycle
+}
+
 test "render: generating 帧 spinner 行确定性(注入 now_ms)" {
     var s = UiState{ .phase = .generating, .spinner = .{ .verb = "Thinking", .start_ms = 0 } };
     var cw = capture.CaptureWriter.init(testing.allocator);
