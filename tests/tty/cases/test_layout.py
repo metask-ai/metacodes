@@ -10,8 +10,10 @@ def test_T01_empty_box_layout(bin_path):
     a.assert_box_present()
     a.assert_box_at_bottom()
     fr = a.footer_row()
-    a.assert_line_contains(fr, "? for shortcuts")
+    # bypass 模式(driver 默认)footer = "⏵⏵ bypass permissions on (shift+tab to cycle)"
+    # (2026-06-05 对齐 cc:非 default 态不再含 "? for shortcuts")。
     a.assert_line_contains(fr, "shift+tab to cycle")
+    a.assert_line_contains(fr, "bypass permissions on")
     # 光标在 ❯ 行 col=2
     a.assert_cursor_on_content("")
 

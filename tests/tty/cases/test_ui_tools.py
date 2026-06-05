@@ -247,7 +247,7 @@ def test_T37_taskcreate_shows_tasktab(bin_path):
 
 
 def test_T38_enterplanmode_updates_footer(bin_path):
-    """EnterPlanMode 工具 → footer 反映 "plan on"(回归:config/ctx mode 同步 bug)。"""
+    """EnterPlanMode 工具 → footer 反映 "plan mode on"(回归:config/ctx mode 同步 bug)。"""
     raw = _run_cassette(
         [("a", _sse_tool("tu1", "EnterPlanMode", {})),
          ("b", _sse_text("in plan"))],
@@ -259,8 +259,125 @@ def test_T38_enterplanmode_updates_footer(bin_path):
     foot = None
     for r in range(a.final.rows):
         lt = a.final.line_text(r)
-        # CC 风格 footer:"{mode} on · shift+tab to cycle · …"。
+        # CC 风格 footer:"{symbol} {title} on · shift+tab to cycle · …"。
         if "shift+tab to cycle" in lt:
             foot = lt
-    if foot is None or "plan on" not in foot:
-        a._fail(f"EnterPlanMode 后 footer 未显示 'plan on':{foot!r}")
+    # 2026-06-05:footer mode part 改为 cc title 形式 "plan mode on"(原 "plan on")。
+    if foot is None or "plan mode on" not in foot:
+        a._fail(f"EnterPlanMode 后 footer 未显示 'plan mode on':{foot!r}")
+
+
+def test_T39_plan_mode_reflects_during_generation(bin_path):
+    """#11:EnterPlanMode 在生成期触发 → footer 在生成窗口内即反映 plan(非等 turn 结束)。
+
+    cassette:step a 发 EnterPlanMode(tool_use)→ 工具写 permission_ctx.mode=plan;
+    step b 发文本(生成继续)。生成期 drawFooter 读 permission_ctx.mode(live),tickSpinner
+    重画即反映。断言:某个生成期帧的 footer 已含 'plan mode'(修 #11 前只在 turn 结束后才同步)。
+    """
+    raw = _run_cassette(
+        [("a", _sse_tool("tu1", "EnterPlanMode", {})),
+         ("b", _sse_text("now in plan mode generating some text"))],
+        ["sleep:0.8", "type:plan it", "key:enter", "sleep:2.0"],
+    )
+    if raw is None:
+        return
+    a = TTYAssert(raw)
+    # 扫所有捕获帧(含生成期),只要有一帧 footer 含 plan mode 即证生成期已联动。
+    found = False
+    for sc in a.frame_screens:
+        for r in range(sc.rows):
+            lt = sc.line_text(r)
+            if "shift+tab to cycle" in lt and "plan mode" in lt:
+                found = True
+                break
+        if found:
+            break
+    if not found:
+        a._fail("生成期无任何帧 footer 反映 plan mode(#11:生成期联动失效)")
+
+
+def test_T40_assistant_markdown_render(bin_path):
+    """#22+#23:live 助手文本 markdown 轻度渲染 + 缩进 + 段首 ⏺。
+
+    cassette 注入一段 markdown 助手文本,断言渲染结果(对齐 cc):
+      - `## Heading` → 去掉 `##`,以 `⏺ ` 段首前缀(段落首行)
+      - `**bold**` → 去掉 `**`(标记消化)
+      - `- item`   → `•` 列表符 + 2 空格缩进
+      - 代码块围栏 ``` → 去掉(不裸吐 ```)
+    """
+    md = "## Heading\\n\\nSome **bold** text.\\n\\n- one\\n- two\\n\\n```py\\nprint('x')\\n```"
+    raw = _run_cassette([("a", _sse_text(md))],
+                        ["sleep:0.8", "type:show md", "key:enter", "sleep:2.5"])
+    if raw is None:
+        return
+    a = TTYAssert(raw)
+    screen = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
+    # 标题渲染:去 ## + ⏺ 段首(整屏应有 "⏺ Heading",且无裸 "## Heading")。
+    assert "## Heading" not in screen, "标题未渲染(裸 ##):\n" + screen
+    assert "Heading" in screen, "标题文字丢失:\n" + screen
+    assert "⏺" in screen, "助手段落缺 ⏺ 前缀:\n" + screen
+    # bold 标记消化(无裸 **)。
+    assert "**bold**" not in screen, "bold 标记未消化(裸 **):\n" + screen
+    assert "bold" in screen
+    # 列表用 • + 缩进。
+    assert "•" in screen, "列表未渲染为 •:\n" + screen
+    # 代码块围栏消化(无裸 ```)。
+    assert "```" not in screen, "代码块围栏未消化(裸 ```):\n" + screen
+    assert "print" in screen, "代码块内容丢失:\n" + screen
+
+
+def test_T41_webfetch_output_reasonable(bin_path):
+    """WebFetch 工具卡输出合理:`⏺ WebFetch(url)` + `⎿ Received N bytes` 人话摘要,
+    **绝不裸吐结果 JSON**({\"bytes\":/\"content\": 等字段名)。
+
+    cassette 注入 WebFetch tool_use(指向 example.com)→ 工具真 curl(在线则成功)。
+    断言对网络状态鲁棒:无论成败,卡都不得裸吐 JSON;在线成功时显 Received N bytes。
+    """
+    url = "https://example.com"
+    raw = _run_cassette(
+        [("a", _sse_tool("tu1", "WebFetch", {"url": url})),
+         ("b", _sse_text("done"))],
+        ["sleep:0.8", "type:fetch it", "key:enter", "sleep:4.0"],
+    )
+    if raw is None:
+        return
+    a = TTYAssert(raw)
+    screen = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
+    # 工具卡标题:⏺ WebFetch(url)。
+    assert "WebFetch" in screen, "无 WebFetch 工具卡:\n" + screen
+    # **核心:绝不裸吐结果 JSON 字段名**(反模式回归守卫)。
+    assert '"bytes"' not in screen, "WebFetch 裸吐 JSON(bytes):\n" + screen
+    assert '"content"' not in screen, "WebFetch 裸吐 JSON(content):\n" + screen
+    assert '"truncated"' not in screen, "WebFetch 裸吐 JSON(truncated):\n" + screen
+    # 在线成功时应有 'Received N bytes' 人话摘要;离线/失败也不得裸 JSON(上面已守)。
+    if "Received" in screen:
+        import re
+        assert re.search(r"Received \d+ bytes", screen), "Received 摘要格式不对:\n" + screen
+
+
+def test_T42_transcript_close_reanchors_box_to_bottom(bin_path):
+    """#24 回归:小屏 + 多行对话时,Ctrl+O 开 transcript(比框高、顶动终端)→ 再 Ctrl+O 关,
+    输入框必须重锚回**屏底**(修前漂到屏顶、下方留大片空白)。
+
+    cassette 注入多行助手回复 → 小屏(16 行)→ Ctrl+O 开 → Ctrl+O 关 → 断言框在屏下半部、
+    框下方无大片空白。
+    """
+    reply = "line one\\nline two\\nline three\\nline four\\nline five\\nline six"
+    raw = _run_cassette(
+        [("a", _sse_text(reply))],
+        ["sleep:0.8", "type:hi", "key:enter", "sleep:2.0",
+         "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"],
+        term_size=(16, 80),
+    )
+    if raw is None:
+        return
+    a = TTYAssert(raw)
+    a.assert_box_present()
+    top = a.box_top_row()
+    bot = a.box_bottom_row()
+    rows = a.final.rows
+    assert top is not None and bot is not None, "无完整输入框"
+    # 框应在屏下半部(底部锚定),不得漂到屏顶(修前的 bug:top≈0)。
+    assert top >= rows // 2, f"输入框未回到屏底(top={top}, rows={rows}),疑似漂到屏顶:\n" + "\n".join(a.final.line_text(r) for r in range(rows))
+    # 框下方(footer 之后)无大片非空残留。
+    a.assert_box_at_bottom()

@@ -18,14 +18,16 @@ fn mkInputs(s: *const UiState) ui.RenderInputs {
     return .{ .state = s, .now_ms = 0, .theme = theme_mod.monochrome, .use_unicode = false };
 }
 
-test "render: overlay=help 投影多列快捷键" {
-    var s = UiState{ .overlay = .help, .cols = 80, .rows = 24 };
+test "render: help_open 在输入帧 footer 区投影多列快捷键(非模态,输入框仍在)" {
+    var s = UiState{ .help_open = true, .cols = 80, .rows = 24, .editor = .{ .view = "", .cursor = 0 } };
     var cw = capture.CaptureWriter.init(testing.allocator);
     defer cw.deinit();
     const frame = try ui.render(&cw, mkInputs(&s));
-    try capture.expectContains(cw.output(), "Ctrl+O");
-    try capture.expectContains(cw.output(), "Open transcript");
-    try capture.expectContains(cw.output(), "Shift+Tab");
+    const out = cw.output();
+    try capture.expectContains(out, "Ctrl+O");
+    try capture.expectContains(out, "Open transcript");
+    try capture.expectContains(out, "Shift+Tab");
+    try capture.expectContains(out, "❯"); // 输入框仍在(非模态)
     try testing.expect(frame.rows > 1);
 }
 
@@ -66,8 +68,9 @@ test "render: input 帧含 editor view + footer,绝不含 \\x1b[2J" {
     const stripped = try capture.stripAnsi(testing.allocator, cw.output());
     defer testing.allocator.free(stripped);
     try capture.expectContains(stripped, "abc");
-    try capture.expectContains(stripped, "plan on"); // footer CC 风格
-    try capture.expectContains(stripped, "? for shortcuts");
+    try capture.expectContains(stripped, "plan mode on"); // footer CC 风格 mode part(symbol+title)
+    // 非 default(plan)态 footer 含 cycle 提示;default 态才显 "? for shortcuts"(2026-06-05 对齐 cc)。
+    try capture.expectContains(stripped, "shift+tab to cycle");
 }
 
 test "render: generating 帧 spinner 行确定性(注入 now_ms)" {
@@ -93,24 +96,26 @@ test "E2E 内存级: ? 开 help → render help 帧 → 任意键关 → render 
         _ = try ui.render(&cw, mkInputs(&s));
         try testing.expect(std.mem.indexOf(u8, cw.output(), "Open transcript") == null);
     }
-    // dispatch '?' → help
+    // dispatch '?' → help_open(非模态)
     const e1 = ui.dispatch(&s, .{ .key = .{ .key = .{ .char = '?' } } });
     try testing.expect(e1.redraw_region);
-    try testing.expectEqual(ui_state.Overlay.help, s.overlay);
+    try testing.expect(s.help_open);
+    try testing.expectEqual(ui_state.Overlay.none, s.overlay); // help 不再是 overlay
     {
         var cw = capture.CaptureWriter.init(testing.allocator);
         defer cw.deinit();
         _ = try ui.render(&cw, mkInputs(&s));
-        try capture.expectContains(cw.output(), "Open transcript"); // help 帧
+        try capture.expectContains(cw.output(), "Open transcript"); // footer 区展开 help
+        try capture.expectContains(cw.output(), "❯"); // 输入框仍在(非模态)
     }
-    // dispatch 任意键 → 关闭
+    // dispatch 任意键 → 关闭 help(该键透传编辑器)
     _ = ui.dispatch(&s, .{ .key = .{ .key = .{ .char = 'x' } } });
-    try testing.expectEqual(ui_state.Overlay.none, s.overlay);
+    try testing.expect(!s.help_open);
     {
         var cw = capture.CaptureWriter.init(testing.allocator);
         defer cw.deinit();
         _ = try ui.render(&cw, mkInputs(&s));
-        try testing.expect(std.mem.indexOf(u8, cw.output(), "Open transcript") == null); // 回输入帧
+        try testing.expect(std.mem.indexOf(u8, cw.output(), "Open transcript") == null); // 回正常 footer
     }
 }
 

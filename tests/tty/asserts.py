@@ -100,7 +100,12 @@ class TTYAssert:
 
     def footer_row(self, screen=None):
         sc = screen or self.final
-        return sc.find_last_row("? for shortcuts")
+        # footer 标志:default 态含 "? for shortcuts";非 default 态含 "shift+tab to cycle"
+        # (2026-06-05 对齐 cc:非 default footer 不再含 "? for shortcuts")。
+        r = sc.find_last_row("? for shortcuts")
+        if r is None:
+            r = sc.find_last_row("shift+tab to cycle")
+        return r
 
     def content_row(self, screen=None):
         sc = screen or self.final

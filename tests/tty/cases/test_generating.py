@@ -27,7 +27,9 @@ def test_T14_generating_keeps_input_box(bin_path):
         if sc.find_last_row("esc to interrupt") is not None
         and sc.find_last_row("╭") is not None
         and sc.find_last_row("❯") is not None
-        and sc.find_last_row("? for shortcuts") is not None
+        # footer 标志:bypass 模式(driver 默认)footer 含 "shift+tab to cycle"
+        # (2026-06-05 对齐 cc:非 default 态不再含 "? for shortcuts")。
+        and sc.find_last_row("shift+tab to cycle") is not None
     )
     # 旧 bug:0 帧共存(区被擦没)。修复后应有相当多帧(每 100ms tick 画一次)。
     if coexist < 3:
