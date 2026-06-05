@@ -502,7 +502,7 @@ pub const RenderRegion = struct {
         // mode 真相源 = app.permission_ctx.mode(live):输入期与 config 同步,生成期工具
         // (EnterPlanMode/ExitPlanMode)直接写它 → spinner tick 重画即反映(修 #11 生成期不联动)。
         // self.ui.footer.mode 仅当 ctx 为 default 但 footer 被 .usage 喂过非默认值时兜底(罕见)。
-        const live = app.permission_ctx.mode;
+        const live = app.permission_ctx.modeValue();
         const mode_pm = if (live != .default) live else self.ui.footer.mode;
         const sym = sb.modeSymbol(mode_pm);
         const title = sb.modeTitle(mode_pm);

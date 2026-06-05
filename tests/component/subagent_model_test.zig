@@ -141,7 +141,7 @@ test "L2 production path: spawnAgent(model_override=haiku) → 请求体 model �
 
     // 最小 permission ctx:bypass 让 spawnAgent 不卡权限
     const perm_ctx = cc.permission.PermissionContext{
-        .mode = .bypass_permissions,
+        .mode = .init(.bypass_permissions),
         .allocator = a,
     };
 
@@ -181,7 +181,7 @@ test "L2: spawnAgent(tool_defs_override) → 请求体 tools 收窄" {
     var client = cc.client_mod.Client.initWithBaseUrl(a, io, "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
 
-    const perm_ctx = cc.permission.PermissionContext{ .mode = .bypass_permissions, .allocator = a };
+    const perm_ctx = cc.permission.PermissionContext{ .mode = .init(.bypass_permissions), .allocator = a };
 
     const empty: []const cc.json_mod.ToolDefinition = &.{};
     const override = [_]cc.json_mod.ToolDefinition{
@@ -219,7 +219,7 @@ test "L2: spawnAgent(permission_mode_override=plan) 生效" {
     var client = cc.client_mod.Client.initWithBaseUrl(a, io, "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
 
-    const perm_ctx = cc.permission.PermissionContext{ .mode = .bypass_permissions, .allocator = a };
+    const perm_ctx = cc.permission.PermissionContext{ .mode = .init(.bypass_permissions), .allocator = a };
     const empty: []const cc.json_mod.ToolDefinition = &.{};
     var result = cc.core_subagent.spawnAgent(
         a, &client, empty, &perm_ctx, null, "hi",

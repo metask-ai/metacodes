@@ -15,9 +15,9 @@ pub fn executeEnter(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const prev_slot = ctx.plan_prev_mode orelse return error.NotAvailable;
 
     // 若已在 plan 模式，幂等返回（不覆盖 prev）
-    if (pctx.mode != .plan) {
-        prev_slot.* = pctx.mode;
-        pctx.mode = .plan;
+    if (pctx.modeValue() != .plan) {
+        prev_slot.* = pctx.modeValue();
+        pctx.setMode(.plan);
     }
     return try ctx.allocator.dupe(u8, "{\"mode\":\"plan\",\"status\":\"entered\"}");
 }
@@ -27,16 +27,16 @@ pub fn executeExit(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const pctx = ctx.permission_ctx orelse return error.NotAvailable;
     const prev_slot = ctx.plan_prev_mode orelse return error.NotAvailable;
 
-    if (pctx.mode == .plan) {
+    if (pctx.modeValue() == .plan) {
         if (prev_slot.*) |m| {
-            pctx.mode = m;
+            pctx.setMode(m);
             prev_slot.* = null;
         } else {
             // 没记录 prev → 回退到 prompt 安全默认
-            pctx.mode = .prompt;
+            pctx.setMode(.prompt);
         }
     }
-    return try std.fmt.allocPrint(ctx.allocator, "{{\"mode\":\"{s}\",\"status\":\"exited\"}}", .{@tagName(pctx.mode)});
+    return try std.fmt.allocPrint(ctx.allocator, "{{\"mode\":\"{s}\",\"status\":\"exited\"}}", .{@tagName(pctx.modeValue())});
 }
 
 test "EnterPlanMode without ctx returns NotAvailable" {
@@ -47,7 +47,7 @@ test "EnterPlanMode without ctx returns NotAvailable" {
 test "Enter/Exit plan mode cycle" {
     const a = std.testing.allocator;
     const permission = @import("../permission.zig");
-    var pctx = permission.PermissionContext{ .mode = .auto, .allocator = a };
+    var pctx = permission.PermissionContext{ .mode = .init(.auto), .allocator = a };
     var prev: ?@import("../types.zig").PermissionMode = null;
     const ctx = ToolContext{
         .allocator = a,
@@ -55,14 +55,14 @@ test "Enter/Exit plan mode cycle" {
         .plan_prev_mode = &prev,
     };
 
-    try std.testing.expect(pctx.mode == .auto);
+    try std.testing.expect(pctx.modeValue() == .auto);
     const r1 = try executeEnter(&ctx, "{}");
     defer a.free(r1);
-    try std.testing.expect(pctx.mode == .plan);
+    try std.testing.expect(pctx.modeValue() == .plan);
     try std.testing.expect(prev.? == .auto);
 
     const r2 = try executeExit(&ctx, "{}");
     defer a.free(r2);
-    try std.testing.expect(pctx.mode == .auto);
+    try std.testing.expect(pctx.modeValue() == .auto);
     try std.testing.expect(prev == null);
 }

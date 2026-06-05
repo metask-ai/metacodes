@@ -528,7 +528,7 @@ fn jobThreadMain(input: *JobInput) void {
     const e = input.entry;
 
     var ctx_override = input.permission_ctx;
-    if (input.perm_override) |m| ctx_override.mode = m;
+    if (input.perm_override) |m| ctx_override.setMode(m);
 
     // 后台 subagent 输出导进 job buffer 的 backend。colorize=false(非交互终端,
     // 对齐旧 SinkWriter + subagent colorize=false);工具卡事件 no-op(depth>=1 本就不发)。

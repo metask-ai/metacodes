@@ -48,7 +48,7 @@ test "L2: --allowedTools 'Bash(git *)' → Bash(git status) 在 default 模式 a
     var ms = cc.permission.MergedSettings{ .layers = layers, .allocator = a };
 
     const perm_ctx = cc.permission.PermissionContext{
-        .mode = .default,
+        .mode = .init(.default),
         .allocator = a,
         .settings = &ms,
     };
@@ -96,7 +96,7 @@ test "L2: --disallowedTools 'Bash(rm *)' → Bash(rm foo) deny" {
     var ms = cc.permission.MergedSettings{ .layers = layers, .allocator = a };
 
     const perm_ctx = cc.permission.PermissionContext{
-        .mode = .default,
+        .mode = .init(.default),
         .allocator = a,
         .settings = &ms,
     };
@@ -140,7 +140,7 @@ test "L2: --allowedTools + --disallowedTools 同时 → deny 优先" {
     var ms = cc.permission.MergedSettings{ .layers = layers, .allocator = a };
 
     const perm_ctx = cc.permission.PermissionContext{
-        .mode = .default,
+        .mode = .init(.default),
         .allocator = a,
         .settings = &ms,
     };

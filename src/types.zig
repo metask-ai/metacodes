@@ -53,7 +53,7 @@ pub const Config = struct {
 /// 兼容别名:
 ///   prompt → default
 ///   bypass → bypass_permissions
-pub const PermissionMode = enum {
+pub const PermissionMode = enum(u8) {
     default,
     accept_edits,
     plan,

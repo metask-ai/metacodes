@@ -100,7 +100,7 @@ pub fn spawnAgentSink(
 
     // 选择实际用的 permission_ctx
     var ctx_override: permission_mod.PermissionContext = permission_ctx.*;
-    if (opts.permission_mode_override) |m| ctx_override.mode = m;
+    if (opts.permission_mode_override) |m| ctx_override.setMode(m);
     const ctx_to_use: *const permission_mod.PermissionContext = if (opts.permission_mode_override != null) &ctx_override else permission_ctx;
 
     // subagent 是隔离上下文:给它**自己的** TaskStore。早先未挂 store(opts 无 tasks 字段)→

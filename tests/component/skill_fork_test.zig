@@ -50,7 +50,7 @@ test "L2: skill context:fork → spawn subagent (请求体含 body)" {
     defer reg.deinit();
     try cc.skills_tool.registerSkillTool(&reg, &set);
 
-    var perm = cc.permission.PermissionContext{ .mode = .bypass_permissions, .allocator = a };
+    var perm = cc.permission.PermissionContext{ .mode = .init(.bypass_permissions), .allocator = a };
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
 
     var ctx = cc.tools.ToolContext.simple(a);
@@ -101,7 +101,7 @@ test "L2: skill context:inline → 不 spawn (无 HTTP 请求)" {
     defer reg.deinit();
     try cc.skills_tool.registerSkillTool(&reg, &set);
 
-    var perm = cc.permission.PermissionContext{ .mode = .bypass_permissions, .allocator = a };
+    var perm = cc.permission.PermissionContext{ .mode = .init(.bypass_permissions), .allocator = a };
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
     var ctx = cc.tools.ToolContext.simple(a);
     ctx.api_client = &client;
@@ -146,7 +146,7 @@ test "L2: skill fork + model:haiku → 请求体 model 是 haiku" {
     defer reg.deinit();
     try cc.skills_tool.registerSkillTool(&reg, &set);
 
-    var perm = cc.permission.PermissionContext{ .mode = .bypass_permissions, .allocator = a };
+    var perm = cc.permission.PermissionContext{ .mode = .init(.bypass_permissions), .allocator = a };
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
     var ctx = cc.tools.ToolContext.simple(a);
     ctx.api_client = &client;
@@ -195,7 +195,7 @@ test "L2: skill fork + agent:<custom> → 请求体 system 来自 AgentDef" {
     defer reg.deinit();
     try cc.skills_tool.registerSkillTool(&reg, &set);
 
-    var perm = cc.permission.PermissionContext{ .mode = .bypass_permissions, .allocator = a };
+    var perm = cc.permission.PermissionContext{ .mode = .init(.bypass_permissions), .allocator = a };
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
     var ctx = cc.tools.ToolContext.simple(a);
     ctx.api_client = &client;

@@ -462,8 +462,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
 
         // 工具可能改了权限模式(EnterPlanMode/ExitPlanMode 写 permission_ctx.mode)。
         // footer/border 读的是 config.permission_mode → 回同步,否则 TUI 不反映 plan 模式。
-        if (app.config.permission_mode != app.permission_ctx.mode) {
-            app.config.permission_mode = app.permission_ctx.mode;
+        if (app.config.permission_mode != app.permission_ctx.modeValue()) {
+            app.config.permission_mode = app.permission_ctx.modeValue();
         }
 
         if (result.stop_reason == .aborted) {
@@ -1185,7 +1185,7 @@ fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
 fn handleDoctor(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     std.debug.print("\x1b[1mcc-zig doctor\x1b[0m\n", .{});
     std.debug.print("  model:            {s}\n", .{app.config.model});
-    std.debug.print("  permission mode:  {s}\n", .{@tagName(app.permission_ctx.mode)});
+    std.debug.print("  permission mode:  {s}\n", .{@tagName(app.permission_ctx.modeValue())});
     std.debug.print("  api key:          {s}\n", .{if (app.api_key.len > 0) "set" else "MISSING"});
     std.debug.print("  max_tokens cfg:   {any}\n", .{app.config.max_tokens});
     std.debug.print("  verbose:          {}\n", .{app.config.verbose});
@@ -1509,7 +1509,7 @@ fn handleAgents(app: *app_mod.App) !void {
 
 /// /permissions：显示当前权限模式 + 已从 config.json 加载的细粒度规则。
 fn handlePermissions(app: *app_mod.App) void {
-    std.debug.print("permission mode: \x1b[36m{s}\x1b[0m\n", .{@tagName(app.permission_ctx.mode)});
+    std.debug.print("permission mode: \x1b[36m{s}\x1b[0m\n", .{@tagName(app.permission_ctx.modeValue())});
     if (app.rule_set) |rs| {
         if (rs.rules.items.len == 0) {
             std.debug.print("rules: (none)\n", .{});

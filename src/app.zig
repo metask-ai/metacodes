@@ -358,7 +358,7 @@ pub const App = struct {
             .plan => .default,
             .auto, .dont_ask, .bypass_permissions, .bypass => .default,
         };
-        app.permission_ctx.mode = app.config.permission_mode;
+        app.permission_ctx.setMode(app.config.permission_mode);
     }
 
     /// Ctrl+X Ctrl+K:杀所有 running 后台任务,返回 killed 数。两期共用。
@@ -514,12 +514,12 @@ pub const App = struct {
         if (app.settings.?.isBypassDisabled() and canon == .bypass_permissions) {
             @import("util/log.zig").warn("permission", "bypassPermissions disabled by settings → downgraded to default", .{});
             app.config.permission_mode = .default;
-            app.permission_ctx.mode = .default;
+            app.permission_ctx.setMode(.default);
         }
         if (app.settings.?.isAutoModeDisabled() and canon == .auto) {
             @import("util/log.zig").warn("permission", "auto mode disabled by settings → downgraded to default", .{});
             app.config.permission_mode = .default;
-            app.permission_ctx.mode = .default;
+            app.permission_ctx.setMode(.default);
         }
 
         // 解析 sandbox 段(project shared + user;managed/cli 罕见配沙箱,本期跳过)

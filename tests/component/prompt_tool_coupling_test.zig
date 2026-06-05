@@ -159,7 +159,7 @@ test "L2 e2e: 请求体 tools 携带动态长描述" {
     var pc = cc.tools.PromptContext{ .enabled_tool_names = &names, .include_git = true };
     const defs = try cc.tools.toToolDefinitionsFull(a, null, &pc);
 
-    const perm = cc.permission.PermissionContext{ .mode = .bypass_permissions, .allocator = a };
+    const perm = cc.permission.PermissionContext{ .mode = .init(.bypass_permissions), .allocator = a };
     var result = cc.core_subagent.spawnAgent(
         a,
         &client,
