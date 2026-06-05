@@ -131,24 +131,21 @@ pub fn renderStart(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, p
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
 
-    // 第 1 行:⏺ <display name>(bullet 用 accent 色;WebSearch→"Web Search")
+    // 单行标题(对齐 cc):`⏺ <display name>(<arg>)`。bullet 用 accent 色;arg 内联括号
+    // (Write/Edit→basename、Bash→命令、WebSearch→"query"…),无 arg 则只显工具名。
     try out.appendSlice(alloc, th.accent);
     try out.appendSlice(alloc, th.icon_act);
     try out.appendSlice(alloc, th.reset);
     try out.append(alloc, ' ');
     try out.appendSlice(alloc, displayName(tool_name));
-    try out.append(alloc, '\n');
-
-    // 第 2 行:命令预览(缩进 2 空格 + dim)
-    const preview = try toolPreview(alloc, tool_name, preview_args);
-    defer alloc.free(preview);
-    if (preview.len > 0) {
-        try out.appendSlice(alloc, "  ");
-        try out.appendSlice(alloc, th.dim);
-        try out.appendSlice(alloc, preview);
-        try out.appendSlice(alloc, th.reset);
-        try out.append(alloc, '\n');
+    const arg = try headerArg(alloc, tool_name, preview_args);
+    defer alloc.free(arg);
+    if (arg.len > 0) {
+        try out.append(alloc, '(');
+        try out.appendSlice(alloc, arg);
+        try out.append(alloc, ')');
     }
+    try out.append(alloc, '\n');
 
     return try out.toOwnedSlice(alloc);
 }
@@ -221,44 +218,44 @@ pub fn renderResult(
         return try out.toOwnedSlice(alloc); // 空串
     }
 
-    // 第 1 行:⏺ <display name> + ✓/✗ X.Ys
-    try out.appendSlice(alloc, th.accent);
-    try out.appendSlice(alloc, th.icon_act);
-    try out.appendSlice(alloc, th.reset);
-    try out.append(alloc, ' ');
-    try out.appendSlice(alloc, displayName(tool_name));
+    // 标题行:**仅 transcript(独立卡)渲染**。live 模式起始卡(renderStart)已打 `⏺ Name(arg)`
+    // 标题,结果卡只补 `⎿ body`,避免标题重复(对齐 cc 单卡形态)。
+    if (opts.transcript) {
+        // 第 1 行:⏺ <display name>(arg) + ✓/✗ X.Ys
+        try out.appendSlice(alloc, th.accent);
+        try out.appendSlice(alloc, th.icon_act);
+        try out.appendSlice(alloc, th.reset);
+        try out.append(alloc, ' ');
+        try out.appendSlice(alloc, displayName(tool_name));
+        const harg = try headerArg(alloc, tool_name, preview_args);
+        defer alloc.free(harg);
+        if (harg.len > 0) {
+            try out.append(alloc, '(');
+            try out.appendSlice(alloc, harg);
+            try out.append(alloc, ')');
+        }
 
-    // 右上角:状态符 + 耗时。图标经 headerIcon 解耦(Bash 非零 exit→✗、转后台→中性)。
-    const hicon = headerIcon(th, tool_name, output_text, kind);
-    const status_color = hicon.color;
-    const status_icon = hicon.glyph;
-    var stat_buf: [64]u8 = undefined;
-    const stat_inner = try std.fmt.bufPrint(&stat_buf, "{s} {d:.1}s", .{ status_icon, @as(f64, @floatFromInt(elapsed_ms)) / 1000.0 });
-    if (opts.cols > 0) {
-        const left_w = term.displayWidth(th.icon_act) + 1 + term.displayWidth(displayName(tool_name));
-        const stat_w = term.displayWidth(stat_inner);
-        if (opts.cols > left_w + stat_w + 1) {
-            const pad = opts.cols - left_w - stat_w;
-            var p: usize = 0;
-            while (p < pad) : (p += 1) try out.append(alloc, ' ');
+        // 右上角:状态符 + 耗时。图标经 headerIcon 解耦(Bash 非零 exit→✗、转后台→中性)。
+        const hicon = headerIcon(th, tool_name, output_text, kind);
+        const status_color = hicon.color;
+        const status_icon = hicon.glyph;
+        var stat_buf: [64]u8 = undefined;
+        const stat_inner = try std.fmt.bufPrint(&stat_buf, "{s} {d:.1}s", .{ status_icon, @as(f64, @floatFromInt(elapsed_ms)) / 1000.0 });
+        if (opts.cols > 0) {
+            const left_w = term.displayWidth(th.icon_act) + 1 + term.displayWidth(displayName(tool_name));
+            const stat_w = term.displayWidth(stat_inner);
+            if (opts.cols > left_w + stat_w + 1) {
+                const pad = opts.cols - left_w - stat_w;
+                var p: usize = 0;
+                while (p < pad) : (p += 1) try out.append(alloc, ' ');
+            } else {
+                try out.append(alloc, ' ');
+            }
         } else {
             try out.append(alloc, ' ');
         }
-    } else {
-        try out.append(alloc, ' ');
-    }
-    try out.appendSlice(alloc, status_color);
-    try out.appendSlice(alloc, stat_inner);
-    try out.appendSlice(alloc, th.reset);
-    try out.append(alloc, '\n');
-
-    // 第 2 行:命令预览
-    const preview = try toolPreview(alloc, tool_name, preview_args);
-    defer alloc.free(preview);
-    if (preview.len > 0) {
-        try out.appendSlice(alloc, "  ");
-        try out.appendSlice(alloc, th.dim);
-        try out.appendSlice(alloc, preview);
+        try out.appendSlice(alloc, status_color);
+        try out.appendSlice(alloc, stat_inner);
         try out.appendSlice(alloc, th.reset);
         try out.append(alloc, '\n');
     }
@@ -318,7 +315,18 @@ fn renderResultBody(
     if (kind == .err) {
         return renderErrorBody(alloc, th, output_text, out, opts);
     }
-    if (std.mem.eql(u8, tool_name, "Edit") or std.mem.eql(u8, tool_name, "Write")) {
+    if (std.mem.eql(u8, tool_name, "Write")) {
+        // cc 风格:Write 结果首行摘要 `Wrote N lines to <basename>`,下接内容预览(diff)。
+        const path = extractField(output_text, "file_path") orelse extractField(output_text, "path") orelse "";
+        const n = countWrittenLines(alloc, output_text);
+        if (n > 0 and path.len > 0) {
+            try out.appendSlice(alloc, "  ");
+            try out.print(alloc, "Wrote {d} line{s} to {s}", .{ n, if (n == 1) "" else "s", basename(path) });
+            try out.append(alloc, '\n');
+        }
+        return renderEditDiff(alloc, th, output_text, out, opts);
+    }
+    if (std.mem.eql(u8, tool_name, "Edit")) {
         return renderEditDiff(alloc, th, output_text, out, opts);
     }
     if (std.mem.eql(u8, tool_name, "Grep") or std.mem.eql(u8, tool_name, "Glob")) {
@@ -799,16 +807,34 @@ fn renderReadSummary(alloc: std.mem.Allocator, th: Theme, output_text: []const u
     }
 }
 
-/// WebFetch 结果:出首行状态摘要;verbose 展开正文。
+/// WebFetch 结果:人话摘要 `Received N bytes[ (truncated)]`(对齐 cc `Received N bytes (status)`,
+/// zig 结果 JSON 无 HTTP status 故略);verbose/transcript 展开正文 content。**绝不裸吐 JSON。**
 fn renderWebFetchSummary(alloc: std.mem.Allocator, th: Theme, output_text: []const u8, out: *std.ArrayList(u8), opts: RenderOpts) !void {
-    const first_eol = std.mem.indexOfScalar(u8, output_text, '\n') orelse output_text.len;
+    const bytes = extractNumberField(output_text, "bytes");
+    const truncated = std.mem.indexOf(u8, output_text, "\"truncated\":true") != null;
     try out.appendSlice(alloc, "  ");
     try out.appendSlice(alloc, th.success);
-    try out.appendSlice(alloc, output_text[0..first_eol]);
+    if (bytes) |b| {
+        try out.print(alloc, "Received {d} bytes", .{b});
+        if (truncated) try out.appendSlice(alloc, " (truncated)");
+    } else {
+        // 无 bytes 字段(异常结果)→ 仍给人话,不裸吐 JSON。
+        try out.appendSlice(alloc, "Fetched");
+    }
     try out.appendSlice(alloc, th.reset);
     try out.append(alloc, '\n');
+    // verbose/transcript:展开抓取正文(content 字段),仍不裸吐整个 JSON。
     if (opts.verbose or opts.transcript) {
-        try renderGenericFold(alloc, th, output_text, out, opts);
+        if (extractField(output_text, "content")) |content| {
+            const dec = jsonUnescape(alloc, content) catch null;
+            defer if (dec) |d| alloc.free(d);
+            const body = dec orelse content;
+            // 折叠超长正文(用 renderGenericFold 套 condensed 行数)。
+            var tmp: std.ArrayList(u8) = .empty;
+            defer tmp.deinit(alloc);
+            try tmp.appendSlice(alloc, body);
+            try renderGenericFold(alloc, th, tmp.items, out, opts);
+        }
     }
 }
 
@@ -901,6 +927,59 @@ fn jsonUnescape(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
 // ============================================================================
 // 命令预览构造
 // ============================================================================
+
+/// cc 风格内联标题参数:`⏺ Tool(arg)` 括号里的内容(单行,无前缀符号)。
+/// 对齐 cc:Write/Edit→文件 basename;Bash→命令首行;Read→basename;Grep/Glob→pattern;
+/// WebFetch→域名;WebSearch→"query";其余→空(标题不带括号)。caller free。
+fn headerArg(alloc: std.mem.Allocator, tool_name: []const u8, args: []const u8) ![]u8 {
+    if (std.mem.eql(u8, tool_name, "Bash")) {
+        if (extractField(args, "command")) |cmd| {
+            const dec = try jsonUnescape(alloc, cmd);
+            defer alloc.free(dec);
+            return try alloc.dupe(u8, firstLine(dec));
+        }
+    } else if (std.mem.eql(u8, tool_name, "Read") or std.mem.eql(u8, tool_name, "Edit") or
+        std.mem.eql(u8, tool_name, "Write") or std.mem.eql(u8, tool_name, "NotebookEdit"))
+    {
+        if (extractField(args, "file_path") orelse extractField(args, "path")) |p| {
+            return try alloc.dupe(u8, basename(p)); // cc 用 basename,不显完整路径
+        }
+    } else if (std.mem.eql(u8, tool_name, "Grep") or std.mem.eql(u8, tool_name, "Glob")) {
+        if (extractField(args, "pattern")) |p| return try alloc.dupe(u8, p);
+    } else if (std.mem.eql(u8, tool_name, "WebFetch")) {
+        if (extractField(args, "url")) |u| return try alloc.dupe(u8, u);
+    } else if (std.mem.eql(u8, tool_name, "WebSearch")) {
+        if (extractField(args, "query")) |q| return try std.fmt.allocPrint(alloc, "\"{s}\"", .{q});
+    } else if (std.mem.eql(u8, tool_name, "Agent") or std.mem.eql(u8, tool_name, "Task")) {
+        if (extractField(args, "subagent_type") orelse extractField(args, "description")) |d|
+            return try alloc.dupe(u8, d);
+    }
+    return try alloc.dupe(u8, "");
+}
+
+/// 路径 basename(最后一个 / 后的部分;无 / 则原样)。
+fn basename(p: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, p, '/')) |i| return p[i + 1 ..];
+    return p;
+}
+
+/// 从 Write 结果 gitDiff 数 `+` 行(新写入行数,对齐 cc `Wrote N lines`)。失败返 0。
+/// gitDiff 是 JSON 转义串,需先 unescape 再按真实换行分行。
+fn countWrittenLines(alloc: std.mem.Allocator, output_text: []const u8) usize {
+    const diff = extractJsonStringField(output_text, "gitDiff") orelse return 0;
+    const un = jsonUnescape(alloc, diff) catch return 0;
+    defer alloc.free(un);
+    var n: usize = 0;
+    var pos: usize = 0;
+    while (pos < un.len) {
+        const eol = std.mem.indexOfScalarPos(u8, un, pos, '\n') orelse un.len;
+        const line = un[pos..eol];
+        // `+` 开头但非 `+++`(文件头)= 新增行。
+        if (line.len > 0 and line[0] == '+' and !(line.len >= 3 and line[1] == '+' and line[2] == '+')) n += 1;
+        pos = eol + 1;
+    }
+    return n;
+}
 
 /// 根据工具名和参数 JSON 生成单行预览("$ cmd" / "📄 path" / 等)。caller free。
 /// 不识别的工具 → 返回空 slice(预览行省略)。
@@ -1106,33 +1185,32 @@ fn renderJsonToolSummary(
 const testing = std.testing;
 const capture = @import("../test_capture.zig");
 
-test "renderStart: Bash 工具" {
+test "renderStart: Bash 工具(内联参数标题)" {
     const th = theme_mod.monochrome;
     const s = try renderStart(testing.allocator, th, "Bash", "{\"command\":\"git status\"}");
     defer testing.allocator.free(s);
-    try capture.expectContains(s, "* Bash"); // monochrome icon_tool="*"
-    try capture.expectContains(s, "$ git status");
+    // cc 风格单行标题:`* Bash(git status)`(monochrome icon_act="*")。
+    try capture.expectContains(s, "Bash(git status)");
     try capture.expectNoAnsi(s);
 }
 
-test "renderStart: Read 工具用 📄 预览" {
+test "renderStart: Read 工具内联 basename" {
     const th = theme_mod.dark;
     const s = try renderStart(testing.allocator, th, "Read", "{\"file_path\":\"/etc/hosts\"}");
     defer testing.allocator.free(s);
-    try capture.expectContains(s, "Read");
-    try capture.expectContains(s, "📄 /etc/hosts");
+    try capture.expectContains(s, "Read(hosts)"); // cc 用 basename,非完整路径
 }
 
-test "renderStart: Edit 用 ± 预览" {
+test "renderStart: Edit 内联 basename(对齐 cc)" {
     const th = theme_mod.monochrome;
     const s = try renderStart(testing.allocator, th, "Edit", "{\"file_path\":\"/x.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}");
     defer testing.allocator.free(s);
-    try capture.expectContains(s, "± /x.zig");
+    try capture.expectContains(s, "Edit(x.zig)");
 }
 
 test "renderResult: ok + ✓ + 耗时" {
     const th = theme_mod.monochrome;
-    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"ls\"}", "file.txt\n", .ok, 1500, .{});
+    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"ls\"}", "file.txt\n", .ok, 1500, .{ .transcript = true });
     defer testing.allocator.free(s);
     try capture.expectContains(s, "+ 1.5s"); // monochrome icon_check="+"
     try capture.expectContains(s, "file.txt");
@@ -1140,7 +1218,7 @@ test "renderResult: ok + ✓ + 耗时" {
 
 test "renderResult: err + ✗" {
     const th = theme_mod.monochrome;
-    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"false\"}", "exit 1\n", .err, 200, .{});
+    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"false\"}", "exit 1\n", .err, 200, .{ .transcript = true });
     defer testing.allocator.free(s);
     try capture.expectContains(s, "X 0.2s"); // monochrome icon_cross="X"
     try capture.expectContains(s, "exit 1");
@@ -1162,7 +1240,7 @@ test "renderResult: 折叠超长输出" {
 test "renderResult: collapsed=false 全部显示" {
     const th = theme_mod.monochrome;
     const long = "a\nb\nc\nd\ne\nf\ng\n";
-    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"x\"}", long, .ok, 100, .{ .collapsed = false, .max_output_lines = 3 });
+    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"x\"}", long, .ok, 100, .{ .collapsed = false, .max_output_lines = 3, .transcript = true });
     defer testing.allocator.free(s);
     try capture.expectContains(s, "g");
     try testing.expect(std.mem.indexOf(u8, s, "more lines") == null);
@@ -1170,7 +1248,7 @@ test "renderResult: collapsed=false 全部显示" {
 
 test "renderResult: cols 右对齐状态符" {
     const th = theme_mod.monochrome;
-    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"x\"}", "", .ok, 100, .{ .cols = 60 });
+    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"x\"}", "", .ok, 100, .{ .cols = 60, .transcript = true });
     defer testing.allocator.free(s);
     // 在 60 列宽下应有 padding 把 "+ 0.1s" 推到右边
     try capture.expectContains(s, "+ 0.1s");
@@ -1206,7 +1284,7 @@ test "renderResult: Edit diff +绿 -红 着色" {
     const th = theme_mod.dark;
     // 模拟 Write/Edit 结果 JSON,gitDiff 字段含标准 diff(JSON 转义)。
     const out_json = "{\"success\":true,\"path\":\"/x\",\"gitDiff\":\"--- a/x\\n+++ b/x\\n@@ -1,2 +1,2 @@\\n ctx\\n-old line\\n+new line\\n\"}";
-    const s = try renderResult(testing.allocator, th, "Edit", "{\"file_path\":\"/x\"}", out_json, .ok, 100, .{});
+    const s = try renderResult(testing.allocator, th, "Edit", "{\"file_path\":\"/x\"}", out_json, .ok, 100, .{ .transcript = true });
     defer testing.allocator.free(s);
     // 内容词出现(注:行内语法高亮会在词间插 ANSI,故断言单词而非整句)。
     try capture.expectContains(s, "line");
@@ -1223,7 +1301,7 @@ test "renderResult: Edit diff +绿 -红 着色" {
 test "renderResult: diff 背景色块(truecolor)+ 行号 + del DIM" {
     const th = theme_mod.select(.dark, .truecolor);
     const out_json = "{\"success\":true,\"path\":\"/x.zig\",\"gitDiff\":\"--- a/x.zig\\n+++ b/x.zig\\n@@ -1,1 +1,1 @@\\n-const b = 2;\\n+const b = 20;\\n\"}";
-    const s = try renderResult(testing.allocator, th, "Edit", "{\"file_path\":\"/x.zig\"}", out_json, .ok, 100, .{});
+    const s = try renderResult(testing.allocator, th, "Edit", "{\"file_path\":\"/x.zig\"}", out_json, .ok, 100, .{ .transcript = true });
     defer testing.allocator.free(s);
     // add 行带绿背景块(truecolor RGB),del 行带红背景块。
     try testing.expect(std.mem.indexOf(u8, s, "48;2;33;58;43") != null); // add bg #213A2B
@@ -1238,7 +1316,7 @@ test "renderResult: diff 整块矩形(cols 填充背景到行尾,对齐 CC)" {
     const th = theme_mod.select(.dark, .truecolor);
     const out_json = "{\"success\":true,\"path\":\"/x.zig\",\"gitDiff\":\"--- a/x.zig\\n+++ b/x.zig\\n@@ -1,1 +1,1 @@\\n+const b = 20;\\n\"}";
     // cols=40 → 内容区可用宽 = 40-5(gutter)=35。add 行内容显示宽 < 35 → 应 padEnd 空格填充。
-    const s = try renderResult(testing.allocator, th, "Edit", "{\"file_path\":\"/x.zig\"}", out_json, .ok, 100, .{ .cols = 40 });
+    const s = try renderResult(testing.allocator, th, "Edit", "{\"file_path\":\"/x.zig\"}", out_json, .ok, 100, .{ .cols = 40, .transcript = true });
     defer testing.allocator.free(s);
     // 矩形特征:背景块开启后,行尾有填充空格(背景延伸),最后才 reset。
     // 验证:add bg 序列出现,且其后(同一行内)有连续空格填充到接近列宽。
@@ -1256,7 +1334,7 @@ test "renderResult: diff 整块矩形(cols 填充背景到行尾,对齐 CC)" {
 test "renderResult: diff basic_16 无背景块只前景(对齐 metacode fg-only)" {
     const th = theme_mod.select(.dark, .basic_16);
     const out_json = "{\"success\":true,\"path\":\"/x.zig\",\"gitDiff\":\"--- a/x.zig\\n+++ b/x.zig\\n@@ -1,1 +1,1 @@\\n-a\\n+b\\n\"}";
-    const s = try renderResult(testing.allocator, th, "Edit", "{\"file_path\":\"/x.zig\"}", out_json, .ok, 100, .{});
+    const s = try renderResult(testing.allocator, th, "Edit", "{\"file_path\":\"/x.zig\"}", out_json, .ok, 100, .{ .transcript = true });
     defer testing.allocator.free(s);
     // 16 色:不出现任何背景转义(48;2 / 48;5)。
     try testing.expect(std.mem.indexOf(u8, s, "48;2;") == null);
@@ -1269,7 +1347,7 @@ test "renderResult: diff basic_16 无背景块只前景(对齐 metacode fg-only)
 test "renderResult: Edit 无 gitDiff → 退回通用折叠" {
     const th = theme_mod.monochrome;
     const out_json = "{\"success\":true,\"path\":\"/x\"}";
-    const s = try renderResult(testing.allocator, th, "Write", "{\"file_path\":\"/x\"}", out_json, .ok, 100, .{});
+    const s = try renderResult(testing.allocator, th, "Write", "{\"file_path\":\"/x\"}", out_json, .ok, 100, .{ .transcript = true });
     defer testing.allocator.free(s);
     // 不崩,原样走通用折叠(含 path 文本)。
     try capture.expectContains(s, "/x");
@@ -1288,7 +1366,7 @@ test "renderResult: Grep/Glob 出 Found N 摘要(condensed)" {
 test "renderResult: Grep verbose 展开文件列表" {
     const th = theme_mod.monochrome;
     const out = "src/a.zig\nsrc/b.zig\n";
-    const s = try renderResult(testing.allocator, th, "Grep", "{\"pattern\":\"foo\"}", out, .ok, 50, .{ .verbose = true });
+    const s = try renderResult(testing.allocator, th, "Grep", "{\"pattern\":\"foo\"}", out, .ok, 50, .{ .verbose = true, .transcript = true });
     defer testing.allocator.free(s);
     try capture.expectContains(s, "Found 2 results");
     try capture.expectContains(s, "src/a.zig"); // verbose 展开
@@ -1308,19 +1386,35 @@ test "renderResult: Read 出 Read N lines 摘要" {
 test "renderResult: Read image 摘要直用首行" {
     const th = theme_mod.monochrome;
     const out = "Read image (512 KB)\n";
-    const s = try renderResult(testing.allocator, th, "Read", "{\"file_path\":\"/x.png\"}", out, .ok, 30, .{});
+    const s = try renderResult(testing.allocator, th, "Read", "{\"file_path\":\"/x.png\"}", out, .ok, 30, .{ .transcript = true });
     defer testing.allocator.free(s);
     try capture.expectContains(s, "Read image (512 KB)");
 }
 
-test "renderResult: WebFetch 出状态摘要" {
+test "renderResult: WebFetch 人话摘要(真 JSON 契约,不裸吐)" {
     const th = theme_mod.monochrome;
-    const out = "Received 12 KB (HTTP 200 OK)\n<html>...</html>\n";
+    // 真 WebFetch 结果 JSON 形态(web_fetch.zig):{url,bytes,truncated,content}。
+    const out = "{\"url\":\"http://x\",\"bytes\":528,\"truncated\":false,\"content\":\"Example Domain body text\"}";
     const s = try renderResult(testing.allocator, th, "WebFetch", "{\"url\":\"http://x\"}", out, .ok, 80, .{});
     defer testing.allocator.free(s);
-    try capture.expectContains(s, "Received 12 KB (HTTP 200 OK)");
-    // condensed:不展开正文
-    try testing.expect(std.mem.indexOf(u8, s, "<html>") == null);
+    // 人话摘要 `Received N bytes`(对齐 cc),condensed 不展开正文。
+    try capture.expectContains(s, "Received 528 bytes");
+    // **绝不裸吐 JSON 字段名**(反模式:之前裸打 output_text 首行=整个 JSON)。
+    try testing.expect(std.mem.indexOf(u8, s, "\"bytes\"") == null);
+    try testing.expect(std.mem.indexOf(u8, s, "\"content\"") == null);
+    // condensed:不展开正文。
+    try testing.expect(std.mem.indexOf(u8, s, "Example Domain body text") == null);
+}
+
+test "renderResult: WebFetch truncated 标注 + verbose 展开正文" {
+    const th = theme_mod.monochrome;
+    const out = "{\"url\":\"http://x\",\"bytes\":99999,\"truncated\":true,\"content\":\"long page body\"}";
+    const s = try renderResult(testing.allocator, th, "WebFetch", "{\"url\":\"http://x\"}", out, .ok, 80, .{ .verbose = true });
+    defer testing.allocator.free(s);
+    try capture.expectContains(s, "Received 99999 bytes");
+    try capture.expectContains(s, "(truncated)");
+    try capture.expectContains(s, "long page body"); // verbose 展开正文
+    try testing.expect(std.mem.indexOf(u8, s, "\"content\"") == null); // 仍不裸吐字段名
 }
 
 test "renderResult: Bash 仍走通用折叠(无专用渲染器)" {
@@ -1335,7 +1429,7 @@ test "renderResult: Bash 仍走通用折叠(无专用渲染器)" {
 test "renderResult: verbose 关折叠(通用)" {
     const th = theme_mod.monochrome;
     const out = "a\nb\nc\nd\ne\nf\ng\n";
-    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"x\"}", out, .ok, 10, .{ .max_output_lines = 3, .verbose = true });
+    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"x\"}", out, .ok, 10, .{ .max_output_lines = 3, .verbose = true, .transcript = true });
     defer testing.allocator.free(s);
     try capture.expectContains(s, "g"); // 全显示
     try testing.expect(std.mem.indexOf(u8, s, "more lines") == null);
@@ -1345,7 +1439,7 @@ test "VISUAL demo: Edit diff(TUI_DEMO=1)" {
     if (std.c.getenv("TUI_DEMO") == null) return error.SkipZigTest;
     const th = theme_mod.select(.dark, .truecolor); // 真彩:看背景色块 + 行内高亮
     const out_json = "{\"success\":true,\"path\":\"/x.zig\",\"gitDiff\":\"--- a/x.zig\\n+++ b/x.zig\\n@@ -1,3 +1,3 @@\\n const a = 1;\\n-const b = 2;\\n+const b = 20;\\n const c = 3;\\n\"}";
-    const s = try renderResult(testing.allocator, th, "Edit", "{\"file_path\":\"/x.zig\"}", out_json, .ok, 88, .{ .cols = 60 });
+    const s = try renderResult(testing.allocator, th, "Edit", "{\"file_path\":\"/x.zig\"}", out_json, .ok, 88, .{ .cols = 60, .transcript = true });
     defer testing.allocator.free(s);
     std.debug.print("\n{s}\n", .{s});
 }
@@ -1405,7 +1499,7 @@ test "renderResult: Bash 非零 exit_code 头部降级 ✗(#3)" {
     // #3 修复:Bash 把非零 exit 包成正常 JSON(is_error=false → kind=.ok),但头部图标
     // 应降级 ✓→✗ 给失败可视提示。不碰 is_error(它进 API tool_result)。
     const th = theme_mod.monochrome; // icon_check="+" icon_cross="X"
-    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"exit 3\"}", "{\"stdout\":\"\",\"stderr\":\"\",\"exit_code\":3}", .ok, 100, .{});
+    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"exit 3\"}", "{\"stdout\":\"\",\"stderr\":\"\",\"exit_code\":3}", .ok, 100, .{ .transcript = true });
     defer testing.allocator.free(s);
     // 头部应是 X(cross)不是 +(check)——尽管 kind=.ok。
     try testing.expect(std.mem.indexOf(u8, s, "X 0.1s") != null);
@@ -1414,7 +1508,7 @@ test "renderResult: Bash 非零 exit_code 头部降级 ✗(#3)" {
 
 test "renderResult: Bash exit_code=0 头部仍 ✓(#3 不误伤)" {
     const th = theme_mod.monochrome;
-    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"true\"}", "{\"stdout\":\"ok\\n\",\"exit_code\":0}", .ok, 100, .{});
+    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"true\"}", "{\"stdout\":\"ok\\n\",\"exit_code\":0}", .ok, 100, .{ .transcript = true });
     defer testing.allocator.free(s);
     try testing.expect(std.mem.indexOf(u8, s, "+ 0.1s") != null); // 仍 check
     try testing.expect(std.mem.indexOf(u8, s, "X 0.1s") == null);
@@ -1424,7 +1518,7 @@ test "renderResult: auto_backgrounded 头部中性 + ▶ 提示不裸吐 JSON(#4
     // #4 修复:超 15s 转后台,头部非 ✓(中性 icon_act);body 渲染 ▶ 提示行,不裸吐 JSON。
     const th = theme_mod.monochrome; // icon_act="*"
     const json = "{\"auto_backgrounded\":true,\"job_id\":\"abc123\",\"partial_stdout\":\"\",\"partial_stderr\":\"\",\"note\":\"Command exceeded 15s; moved to background.\"}";
-    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"sleep 20\"}", json, .ok, 15100, .{});
+    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"sleep 20\"}", json, .ok, 15100, .{ .transcript = true });
     defer testing.allocator.free(s);
     // 头部:中性 *(icon_act)不是 +(check)。
     try testing.expect(std.mem.indexOf(u8, s, "* 15.1s") != null);
@@ -1477,7 +1571,7 @@ test "WebSearch 卡片:display name 标题 + Did N searches 完成 + 中断行" 
 
     // 完成卡:Did N searches(N = "Web search results for query" 段数)。
     const result_text = "Web search results for query: \"zig news\"\n\nsome summary\n\nREMINDER: ...";
-    const res = try renderResult(a, th, "WebSearch", "{\"query\":\"zig news\"}", result_text, .ok, 6600, .{});
+    const res = try renderResult(a, th, "WebSearch", "{\"query\":\"zig news\"}", result_text, .ok, 6600, .{ .transcript = true });
     defer a.free(res);
     try testing.expect(std.mem.indexOf(u8, res, "Web Search") != null);
     try testing.expect(std.mem.indexOf(u8, res, "Did 1 search") != null);
@@ -1493,7 +1587,7 @@ test "renderResult: Task 成功结果不进消息流(空串)" {
     const th = theme_mod.monochrome;
     // Task 返回的典型 JSON,绝不应出现在屏幕上。
     const out = "{\"task_id\":\"agent_1\",\"result\":\"done\"}";
-    const s = try renderResult(testing.allocator, th, "Task", "{\"description\":\"x\"}", out, .ok, 1200, .{});
+    const s = try renderResult(testing.allocator, th, "Task", "{\"description\":\"x\"}", out, .ok, 1200, .{ .transcript = true });
     defer testing.allocator.free(s);
     try testing.expectEqual(@as(usize, 0), s.len);
 }
@@ -1503,8 +1597,8 @@ test "renderResult: NotebookEdit 显示人话摘要(不裸吐 JSON)" {
     const out = "{\"success\":true,\"path\":\"/n.ipynb\",\"mode\":\"replace\",\"cells_after\":3}";
     const s = try renderResult(testing.allocator, th, "NotebookEdit", "{\"notebook_path\":\"/n.ipynb\"}", out, .ok, 100, .{});
     defer testing.allocator.free(s);
-    // 显示卡片 + 人话摘要(mode + path),不再 hidden(曾被误吞,2026-06-04 修)。
-    try testing.expect(std.mem.indexOf(u8, s, "NotebookEdit") != null);
+    // 结果体显示人话摘要(mode + path),不再 hidden(曾被误吞,2026-06-04 修)。
+    // 注:live 模式(transcript=false)结果卡只含 ⎿ body(标题在起始卡),故只断言 body 摘要。
     try testing.expect(std.mem.indexOf(u8, s, "replace /n.ipynb") != null);
     // 但绝不裸吐 JSON 字段名。
     try testing.expect(std.mem.indexOf(u8, s, "\"success\"") == null);
@@ -1515,7 +1609,7 @@ test "renderResult: 错误结果提取 detail 而非裸吐 error JSON" {
     const th = theme_mod.monochrome;
     // 结构化工具错误(tool_error.errorToJson 形态)。
     const out = "{\"error\":{\"code\":\"E_NOENT\",\"detail\":\"file not found: /missing\"}}";
-    const s = try renderResult(testing.allocator, th, "Read", "{\"file_path\":\"/missing\"}", out, .err, 50, .{});
+    const s = try renderResult(testing.allocator, th, "Read", "{\"file_path\":\"/missing\"}", out, .err, 50, .{ .transcript = true });
     defer testing.allocator.free(s);
     // detail 文本出现,且解过转义。
     try capture.expectContains(s, "file not found: /missing");
@@ -1528,7 +1622,7 @@ test "renderResult: 非结构化错误 unescape 后折叠显示" {
     const th = theme_mod.monochrome;
     // 没有 detail 字段的错误:整段 unescape 后显示,不丢失。
     const out = "permission denied\\nretry later\\n";
-    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"x\"}", out, .err, 50, .{});
+    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"x\"}", out, .err, 50, .{ .transcript = true });
     defer testing.allocator.free(s);
     try capture.expectContains(s, "permission denied");
     try capture.expectContains(s, "retry later");
@@ -1538,7 +1632,7 @@ test "renderResult: 无 detail 的结构化错误不裸吐 JSON" {
     const th = theme_mod.monochrome;
     // errorToJson 总带 detail,但外部错误可能只有 code → 绝不裸吐 {"error":...}。
     const out = "{\"error\":{\"code\":\"E_X\",\"recoverable\":false}}";
-    const s = try renderResult(testing.allocator, th, "Read", "{\"file_path\":\"/x\"}", out, .err, 50, .{});
+    const s = try renderResult(testing.allocator, th, "Read", "{\"file_path\":\"/x\"}", out, .err, 50, .{ .transcript = true });
     defer testing.allocator.free(s);
     try capture.expectContains(s, "[tool error]");
     // 不出现任何 JSON 结构残留。
@@ -1550,7 +1644,7 @@ test "renderResult: 无 detail 的结构化错误不裸吐 JSON" {
 test "renderResult: detail 为空串退回 message" {
     const th = theme_mod.monochrome;
     const out = "{\"error\":{\"detail\":\"\",\"message\":\"disk full\"}}";
-    const s = try renderResult(testing.allocator, th, "Write", "{\"file_path\":\"/x\"}", out, .err, 50, .{});
+    const s = try renderResult(testing.allocator, th, "Write", "{\"file_path\":\"/x\"}", out, .err, 50, .{ .transcript = true });
     defer testing.allocator.free(s);
     try capture.expectContains(s, "disk full");
     try testing.expect(std.mem.indexOf(u8, s, "\"message\"") == null);
@@ -1560,7 +1654,7 @@ test "renderResult: err 侧绕过专用渲染器(Edit 失败不走 diff)" {
     const th = theme_mod.dark;
     // Edit 失败:即便输出里有 gitDiff,err 路径也应走 renderErrorBody 而非 diff 着色。
     const out = "{\"error\":{\"detail\":\"old_string not found\"},\"gitDiff\":\"--- a\\n+++ b\\n+x\\n\"}";
-    const s = try renderResult(testing.allocator, th, "Edit", "{\"file_path\":\"/x\"}", out, .err, 50, .{});
+    const s = try renderResult(testing.allocator, th, "Edit", "{\"file_path\":\"/x\"}", out, .err, 50, .{ .transcript = true });
     defer testing.allocator.free(s);
     try capture.expectContains(s, "old_string not found");
     // diff 正文(+x 的内容行)不应出现 —— 证明没走 renderEditDiff。
@@ -1570,7 +1664,7 @@ test "renderResult: err 侧绕过专用渲染器(Edit 失败不走 diff)" {
 test "renderResult: err 侧 Grep 失败走 error 体而非 Found N 摘要" {
     const th = theme_mod.monochrome;
     const out = "{\"error\":{\"detail\":\"invalid regex\"}}";
-    const s = try renderResult(testing.allocator, th, "Grep", "{\"pattern\":\"[\"}", out, .err, 50, .{});
+    const s = try renderResult(testing.allocator, th, "Grep", "{\"pattern\":\"[\"}", out, .err, 50, .{ .transcript = true });
     defer testing.allocator.free(s);
     try capture.expectContains(s, "invalid regex");
     try testing.expect(std.mem.indexOf(u8, s, "Found") == null);
@@ -1580,7 +1674,7 @@ test "renderResult: hidden 工具失败时仍渲染(不静默吞错)" {
     const th = theme_mod.monochrome;
     // Task 成功 → hidden(空串);但失败必须让用户看到,否则 subagent 错误被吞。
     const out = "{\"error\":{\"detail\":\"subagent crashed\"}}";
-    const s = try renderResult(testing.allocator, th, "Task", "{\"description\":\"x\"}", out, .err, 800, .{});
+    const s = try renderResult(testing.allocator, th, "Task", "{\"description\":\"x\"}", out, .err, 800, .{ .transcript = true });
     defer testing.allocator.free(s);
     try testing.expect(s.len > 0);
     try capture.expectContains(s, "subagent crashed");
@@ -1602,7 +1696,7 @@ test "renderStart: 用 ⏺ bullet 而非 ⚙(dark)" {
 test "renderResult: ⎿ gutter + 5 列续行 + 无 ──── 分隔线(dark)" {
     const th = theme_mod.dark;
     const out = "line1\nline2\n";
-    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"x\"}", out, .ok, 300, .{ .collapsed = false });
+    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"x\"}", out, .ok, 300, .{ .collapsed = false, .transcript = true });
     defer testing.allocator.free(s);
     try capture.expectContains(s, "⏺"); // bullet
     // 首行结果挂在 ⎿ gutter 下(gutter 与 line1 之间是 reset+2空格,故分开断言)。
@@ -1617,7 +1711,7 @@ test "renderResult: ⎿ gutter + 5 列续行 + 无 ──── 分隔线(dark)"
 test "renderResult: monochrome 用 ASCII gutter(\\)而非 unicode" {
     const th = theme_mod.monochrome;
     const out = "alpha\nbeta\n";
-    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"x\"}", out, .ok, 100, .{ .collapsed = false });
+    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"x\"}", out, .ok, 100, .{ .collapsed = false, .transcript = true });
     defer testing.allocator.free(s);
     try capture.expectNoAnsi(s);
     try capture.expectContains(s, "* Bash"); // mono icon_act="*"

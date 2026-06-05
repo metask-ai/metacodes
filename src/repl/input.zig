@@ -65,6 +65,9 @@ pub const KeyParser = struct {
     state: State = .normal,
     num1: u32 = 0,
     num2: u32 = 0,
+    // 一字节 feed 偶尔需吐两个键(ESC 后紧跟普通字符 = 孤立 ESC + 该字符):
+    // feed 返回第一个(.esc),把第二个键暂存这里,调用方 feed 后须 while(drain())|k| 排空。
+    pending: ?Key = null,
 
     const State = enum { normal, esc_seen, csi_seen, csi_num1, csi_semi, csi_num2 };
 
@@ -72,6 +75,14 @@ pub const KeyParser = struct {
     /// 调用方(watcher)在 read 超时时若此为 true,应调 flushEsc() 把孤立 ESC 兑现为 .esc。
     pub fn pendingEsc(self: *const KeyParser) bool {
         return self.state == .esc_seen;
+    }
+
+    /// 取出 feed 暂存的第二个键(若有)。调用方每次 feed 后循环 drain 至 null。
+    /// 用于 ESC + 普通字符这类一次 feed 产出两键的场景(否则后一个字符被吞)。
+    pub fn drain(self: *KeyParser) ?Key {
+        const k = self.pending orelse return null;
+        self.pending = null;
+        return k;
     }
 
     /// 把卡在 esc_seen 的孤立 ESC 兑现为 .esc(超时无后续字节时调)。非 esc_seen 返 null。
@@ -98,12 +109,22 @@ pub const KeyParser = struct {
                     return null;
                 }
                 self.state = .normal;
-                // Alt+key:ESC 后紧跟字母(meta)。Alt+B / Alt+F 词导航。
+                // Alt+key:ESC 后紧跟字母(meta)。Alt+B / Alt+F 词导航——是单个组合键,不拆。
                 switch (b) {
                     'b', 'B' => return .alt_b,
                     'f', 'F' => return .alt_f,
                     else => {},
                 }
+                // ESC ESC:第二个 ESC 重新开始一个待定序列。兑现第一个 .esc,自身回 esc_seen
+                // 等后续字节(否则双击 Esc 的第二下会被当 .unknown 丢掉)。
+                if (b == 0x1b) {
+                    self.state = .esc_seen;
+                    return .esc;
+                }
+                // 其它字符:这是"孤立 ESC + 该字符"两个独立键(用户极快连打,或终端把
+                // 两次按键合批送来)。兑现 ESC 为本次返回值,该字符的键暂存 pending,
+                // 调用方 while(drain()) 取出——否则该字符被吞(早期 bug)。
+                self.pending = byteToKey(b);
                 return .esc;
             },
             .csi_seen => {
@@ -652,6 +673,46 @@ test "KeyParser: lone ESC flushes via flushEsc (interrupt 用)" {
     // 兑现后状态干净:普通字符仍正常。
     const k = p.feed('x').?;
     try testing.expect(@as(std.meta.Tag(Key), k) == .char);
+}
+
+test "KeyParser: ESC followed by printable char yields two keys (esc + char, 不吞字符)" {
+    var p = KeyParser{};
+    // ESC 后紧跟 'x'(终端把两次快按合批送来,或用户极快连打):
+    // feed(0x1b) 进 esc_seen 不出键;feed('x') 兑现 .esc 并把 'x' 暂存 pending。
+    try testing.expect(p.feed(0x1b) == null);
+    const first = p.feed('x').?;
+    try testing.expect(first == .esc); // 第一个键 = 孤立 ESC
+    const second = p.drain().?; // 第二个键 = 'x'(早期 bug:此字符被吞)
+    try testing.expect(@as(std.meta.Tag(Key), second) == .char);
+    try testing.expect(second.char == 'x');
+    try testing.expect(p.drain() == null); // 排空后无残留
+}
+
+test "KeyParser: ESC + 'b'/'f' 仍是 Alt 组合键(不拆成两键)" {
+    var p = KeyParser{};
+    try testing.expect(p.feed(0x1b) == null);
+    try testing.expect(p.feed('b').? == .alt_b); // ESC b = Alt+B(词左),单个键
+    try testing.expect(p.drain() == null); // 不产生第二个键
+    try testing.expect(p.feed(0x1b) == null);
+    try testing.expect(p.feed('f').? == .alt_f); // ESC f = Alt+F(词右)
+    try testing.expect(p.drain() == null);
+}
+
+test "KeyParser: ESC ESC — 第一个兑现,第二个重新待定" {
+    var p = KeyParser{};
+    try testing.expect(p.feed(0x1b) == null);
+    try testing.expect(p.feed(0x1b).? == .esc); // 兑现第一个 ESC
+    try testing.expect(p.drain() == null); // 第二个 ESC 不入 pending(它回到 esc_seen)
+    try testing.expect(p.pendingEsc()); // 仍卡在 esc_seen(等第三字节)
+    try testing.expect(p.flushEsc().? == .esc); // 超时兑现第二个 ESC
+}
+
+test "KeyParser: ESC + 控制键(Ctrl+A)— ESC 兑现 + 控制键不丢" {
+    var p = KeyParser{};
+    try testing.expect(p.feed(0x1b) == null);
+    try testing.expect(p.feed(0x01).? == .esc); // 0x01 = Ctrl+A
+    try testing.expect(p.drain().? == .ctrl_a); // 控制键也保留(不吞)
+    try testing.expect(p.drain() == null);
 }
 
 test "KeyParser: delete (ESC [ 3 ~)" {

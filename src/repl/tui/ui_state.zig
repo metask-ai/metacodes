@@ -12,8 +12,9 @@ const types = @import("../../types.zig");
 /// 决策面:输入期 vs 生成期。
 pub const Phase = enum { input, generating };
 
-/// 覆盖视图:占满决策面的模态视图(help/transcript 覆盖正常输入/生成帧)。
-pub const Overlay = enum { none, help, transcript };
+/// 覆盖视图:占满决策面的**模态**视图(transcript 覆盖正常输入/生成帧)。
+/// 注:`?` 帮助不是 overlay——它是非模态的 footer 区展开(见 UiState.help_open)。
+pub const Overlay = enum { none, transcript };
 
 /// 编辑器投影:borrow LineEditor.buf.items(渲染瞬时有效)。LineEditor 本体不并入 UiState。
 pub const EditorState = struct {
@@ -92,6 +93,9 @@ pub const UiState = struct {
     // 决策面
     phase: Phase = .input,
     overlay: Overlay = .none,
+    /// `?` 快捷键帮助:**非模态**——footer 区原地展开多列快捷键,输入框仍在、可继续打字
+    /// (对齐 cc helpOpen,见 PromptInputFooter.tsx)。与 transcript overlay(模态)不同。
+    help_open: bool = false,
 
     // 编辑器投影
     editor: EditorState = .{},

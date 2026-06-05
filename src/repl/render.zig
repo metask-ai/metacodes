@@ -83,6 +83,40 @@ pub fn renderToOwned(md: []const u8, allocator: std.mem.Allocator) ![]u8 {
     return try out.toOwnedSlice(allocator);
 }
 
+/// 流式跨行 markdown 状态(供 live 逐行渲染携带:代码块/语法高亮跨行)。
+pub const StreamState = struct {
+    in_code_block: bool = false,
+    code_lang: []const u8 = "",
+    hl_state: HlState = .{},
+};
+
+/// 渲染**单行** markdown(不含尾随 \n)到 out,携带跨行状态 st(代码块/高亮)。
+/// 对齐 renderToOwned 的逐行逻辑,供 live 流式路径逐行调用——inline(bold/code/heading/list)
+/// 行内即决,代码块靠 st.in_code_block 跨行。caller 自行追加 \n。
+pub fn renderLineStreaming(line: []const u8, st: *StreamState, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    if (st.in_code_block) {
+        if (std.mem.startsWith(u8, line, "```")) {
+            try out.appendSlice(allocator, RESET);
+            st.in_code_block = false;
+        } else {
+            try highlightCodeLine(line, st.code_lang, &st.hl_state, GRAY, out, allocator);
+            try out.appendSlice(allocator, RESET);
+        }
+    } else if (std.mem.startsWith(u8, line, "```")) {
+        st.code_lang = std.mem.trim(u8, line[3..], " \t\r");
+        st.hl_state = .{};
+        st.in_code_block = true;
+        // 围栏行本身不输出内容(对齐 cc 去围栏)。
+    } else if (isHeading(line)) |h| {
+        try renderHeading(line, h, out, allocator);
+    } else if (isListItem(line)) |prefix_len| {
+        try out.appendSlice(allocator, "  • ");
+        try renderInline(line[prefix_len..], out, allocator);
+    } else {
+        try renderInline(line, out, allocator);
+    }
+}
+
 /// 返回 '#' 数量（1-4），非标题返 null。
 fn isHeading(line: []const u8) ?usize {
     var i: usize = 0;
@@ -400,6 +434,39 @@ test "render bold" {
     const r = try renderToOwned("**bold**", testing.allocator);
     defer testing.allocator.free(r);
     try testing.expectEqualStrings("\x1b[1mbold\x1b[0m", r);
+}
+
+test "renderLineStreaming: 逐行携带代码块状态 + 去标记" {
+    var st: StreamState = .{};
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+
+    // heading:## 去掉,bold cyan(只验文字 + 无 ## 残留)。
+    out.clearRetainingCapacity();
+    try renderLineStreaming("## Hi", &st, &out, testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, out.items, "Hi") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "##") == null);
+
+    // inline bold:** 消化。
+    out.clearRetainingCapacity();
+    try renderLineStreaming("a **b** c", &st, &out, testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, out.items, "**") == null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "b") != null);
+
+    // 代码块:围栏行进 in_code_block,围栏本身不输出文字内容(去围栏)。
+    out.clearRetainingCapacity();
+    try renderLineStreaming("```python", &st, &out, testing.allocator);
+    try testing.expect(st.in_code_block);
+    try testing.expect(std.mem.indexOf(u8, out.items, "```") == null);
+    // 代码块内行:内容保留(语法高亮会插 ANSI,故只验关键 token 在)。
+    out.clearRetainingCapacity();
+    try renderLineStreaming("print('x')", &st, &out, testing.allocator);
+    try testing.expect(std.mem.indexOf(u8, out.items, "print") != null);
+    try testing.expect(std.mem.indexOf(u8, out.items, "'x'") != null);
+    // 闭合围栏:退出代码块。
+    out.clearRetainingCapacity();
+    try renderLineStreaming("```", &st, &out, testing.allocator);
+    try testing.expect(!st.in_code_block);
 }
 
 test "render italic" {

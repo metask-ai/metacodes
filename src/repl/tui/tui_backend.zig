@@ -110,9 +110,11 @@ pub const TuiBackend = struct {
     fn emitImpl(self: *TuiBackend, ev: CoreEvent) void {
         switch (ev) {
             .stream_begin => {
-                if (self.colorize) self.region.writeGenText("\x1b[32m");
+                // 助手文本走 markdown 渲染路径(beginGenAssistant 重置状态 + 标记段首)。
+                // markdown 渲染器自带颜色,故不再裹 colorize 绿色括号。
+                self.region.beginGenAssistant();
             },
-            .text_chunk => |t| self.region.writeGenText(t),
+            .text_chunk => |t| self.region.writeGenAssistantText(t),
             .tool_start => |s| {
                 if (s.card) {
                     self.region.addToolCard(s.id, s.name, util_time.nowMs());
@@ -170,7 +172,9 @@ pub const TuiBackend = struct {
                 self.region.writeGenText(s);
             },
             .stream_done => {
-                self.region.writeGenText(if (self.colorize) "\x1b[0m\n" else "\n");
+                // 先 flush 助手文本残行(markdown 渲染),再补段尾换行。
+                self.region.flushGenAssistant();
+                self.region.writeGenText("\n");
             },
         }
     }
@@ -260,6 +264,8 @@ pub const TuiBackend = struct {
 
             const key = parser.feed(b[0]) orelse continue; // 多字节(UTF-8/CSI)攒够再出 Key
             self.handleKey(key, &editor);
+            // ESC + 普通字符:feed 吐 .esc 后第二个键在 pending,排空(否则字符被吞)。
+            while (parser.drain()) |k2| self.handleKey(k2, &editor);
         }
     }
 

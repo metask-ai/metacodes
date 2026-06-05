@@ -180,6 +180,43 @@ pub fn modeName(m: types.PermissionMode) []const u8 {
     };
 }
 
+/// footer mode part 的人话标题(对齐 cc PermissionMode.ts title,小写化后接 " on")。
+/// default/prompt 返回 ""——调用方据此跳过 mode part(对齐 cc isDefaultMode)。
+pub fn modeTitle(m: types.PermissionMode) []const u8 {
+    return switch (m) {
+        .default, .prompt => "",
+        .plan => "plan mode",
+        .accept_edits => "accept edits",
+        .bypass_permissions, .bypass => "bypass permissions",
+        .dont_ask => "don't ask",
+        .auto => "auto mode",
+    };
+}
+
+/// footer mode part 前缀符号(对齐 cc PermissionMode.ts symbol)。
+/// plan=⏸(U+23F8 PAUSE_ICON),其余非 default=⏵⏵。
+pub fn modeSymbol(m: types.PermissionMode) []const u8 {
+    return switch (m) {
+        .default, .prompt => "",
+        .plan => "\u{23f8}",
+        .accept_edits, .bypass_permissions, .bypass, .dont_ask, .auto => "\u{23f5}\u{23f5}",
+    };
+}
+
+/// footer mode part 着色(对齐 cc getModeColor 的 ansi 降级列):
+/// plan→planMode(ansi:cyan=accent) / acceptEdits→autoAccept(ansi:magenta) /
+/// bypass·dontAsk→error(ansi:red=danger) / auto→warning(ansi:yellow=warn)。
+pub fn modeColor(theme: Theme, m: types.PermissionMode) []const u8 {
+    return switch (m) {
+        .default, .prompt => theme.dim,
+        .plan => theme.accent,
+        .accept_edits => theme.mode_accept,
+        .bypass_permissions, .bypass, .dont_ask => theme.danger,
+        .auto => theme.warn,
+    };
+}
+
+
 /// token 数紧凑格式:<1K 原样;<1M "1.2K";>=1M "1.23M"。(从 statusline.zig 收敛)
 pub fn formatTokens(buf: []u8, n: u64) []const u8 {
     if (n < 1000) {
@@ -206,4 +243,34 @@ test "modeName covers all" {
     try std.testing.expectEqualStrings("default", modeName(.default));
     try std.testing.expectEqualStrings("plan", modeName(.plan));
     try std.testing.expectEqualStrings("bypassPermissions", modeName(.bypass_permissions));
+}
+
+test "modeTitle/Symbol: default 隐藏 mode part, 非 default 对齐 cc" {
+    // default/prompt → 空 title(footer 据此跳过 mode part,对齐 cc isDefaultMode)
+    try std.testing.expectEqualStrings("", modeTitle(.default));
+    try std.testing.expectEqualStrings("", modeTitle(.prompt));
+    try std.testing.expectEqualStrings("", modeSymbol(.default));
+    // 非 default:title 小写人话 + symbol
+    try std.testing.expectEqualStrings("plan mode", modeTitle(.plan));
+    try std.testing.expectEqualStrings("accept edits", modeTitle(.accept_edits));
+    try std.testing.expectEqualStrings("bypass permissions", modeTitle(.bypass_permissions));
+    try std.testing.expectEqualStrings("don't ask", modeTitle(.dont_ask));
+    try std.testing.expectEqualStrings("auto mode", modeTitle(.auto));
+    // plan symbol = ⏸ (U+23F8);其余非 default = ⏵⏵
+    try std.testing.expectEqualStrings("\u{23f8}", modeSymbol(.plan));
+    try std.testing.expectEqualStrings("\u{23f5}\u{23f5}", modeSymbol(.accept_edits));
+}
+
+test "modeColor 对齐 cc getModeColor 的 ansi 降级映射" {
+    const th = @import("../theme.zig").dark;
+    // plan→planMode(cyan=accent) / acceptEdits→autoAccept(magenta=mode_accept) /
+    // bypass·dontAsk→error(red=danger) / auto→warning(yellow=warn)
+    try std.testing.expectEqualStrings(th.accent, modeColor(th, .plan));
+    try std.testing.expectEqualStrings(th.mode_accept, modeColor(th, .accept_edits));
+    try std.testing.expectEqualStrings(th.danger, modeColor(th, .bypass_permissions));
+    try std.testing.expectEqualStrings(th.danger, modeColor(th, .dont_ask));
+    try std.testing.expectEqualStrings(th.warn, modeColor(th, .auto));
+    // acceptEdits 色应区别于 plan 色(确认 6 档不再全同 accent)
+    try std.testing.expect(!std.mem.eql(u8, modeColor(th, .accept_edits), modeColor(th, .plan)));
+    try std.testing.expect(!std.mem.eql(u8, modeColor(th, .bypass_permissions), modeColor(th, .plan)));
 }

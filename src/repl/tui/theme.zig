@@ -22,6 +22,8 @@ pub const Theme = struct {
     warn: []const u8,
     danger: []const u8,
     info: []const u8,
+    /// acceptEdits 模式色(对齐 cc autoAccept = ansi:magenta)。footer mode part 用。
+    mode_accept: []const u8 = ansi.sgr.fg_magenta,
 
     // ============ 角色色(消息渲染区分)============
     role_user: []const u8,
@@ -146,6 +148,7 @@ pub const monochrome: Theme = .{
     .warn = "",
     .danger = "",
     .info = "",
+    .mode_accept = "",
 
     .role_user = "",
     .role_assistant = "",

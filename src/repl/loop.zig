@@ -160,8 +160,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         }
         // 行首单独 `?` → 快捷键帮助(对齐 CC `?` for shortcuts)。仅整行 trim 后 == "?" 触发,
         // 不拦截含 ? 的正常句子。
-        // 注:tty 下 `?` 由 overlay(dispatch)即时拦截、永不提交到这;此分支是 headless/非-tty
-        // fallback(headless 无 overlay,`?` 提交后打帮助文本)。
+        // 注:tty 下 `?` 由 dispatch 即时拦截 → 非模态 footer 区展开(help_open,见 ui.zig),
+        // 永不提交到这;此分支是 headless/非-tty fallback(headless 无 footer 区,`?` 提交后打帮助文本)。
         if (std.mem.eql(u8, trimmed, "?")) {
             std.debug.print(
                 \\Keyboard shortcuts:
@@ -535,13 +535,23 @@ fn handlePaste(
             // parser 处于 CSI 中间态——字节已被吞，等下一个
             continue;
         };
-        switch (key) {
-            .paste_end => break,
-            .char => |c| try pasted.append(allocator, c),
-            .enter => try pasted.append(allocator, '\n'),
-            .tab => try pasted.append(allocator, '\t'),
-            else => {}, // 粘贴里的其它控制序列忽略
+        // feed 可能吐两个键(ESC+普通字符):先处理 feed 的,再排空 pending。
+        var k: ?input.Key = key;
+        var done = false;
+        while (k) |kk| {
+            switch (kk) {
+                .paste_end => {
+                    done = true;
+                    break;
+                },
+                .char => |c| try pasted.append(allocator, c),
+                .enter => try pasted.append(allocator, '\n'),
+                .tab => try pasted.append(allocator, '\t'),
+                else => {}, // 粘贴里的其它控制序列忽略
+            }
+            k = parser.drain();
         }
+        if (done) break;
     }
 
     const text = pasted.items;
@@ -660,34 +670,52 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
 
     while (true) {
         var b: [1]u8 = undefined;
+        // synthetic_key:无新字节但需立即处理的键。两个来源:
+        //  (a) parser.drain():上一轮 feed(ESC+普通字符)吐出的第二个键暂存在 pending,先消费完;
+        //  (b) parser.flushEsc():孤立 ESC 在 poll 超时时兑现为 .esc。
+        // pending 优先于读新字节——否则 ESC 后那个字符会被吞(早期 bug)。
+        var synthetic_key: ?input.Key = parser.drain();
         // 用 poll 带超时读,而非阻塞 read:超时时检查 SIGWINCH(终端 resize)→ 立即重画
         // 输入框自适应新宽度(否则要等下次按键才更新,真机 resize 卡旧宽)。
-        while (true) {
+        if (synthetic_key == null) while (true) {
             if (g_winch.swap(false, .acquire)) {
                 redraw(&region, &editor, app); // resize → 重测宽度重画
             }
             var pfd = [_]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
             const rc = std.c.poll(&pfd, 1, 200); // 200ms 超时
-            if (rc <= 0) continue; // <0=EINTR(被 SIGWINCH 中断) / 0=超时 → 回头查 flag
-            if ((pfd[0].revents & std.c.POLL.IN) != 0) break; // 有字节可读
-        }
-        const n = posix.read(fd, &b) catch return error.ReadError;
-        if (n == 0) return error.Eof;
-
-        // vim 模式 + NORMAL/VISUAL:字节路由到 vim 状态机(Enter/Esc 例外)
-        if (app.config.vim_mode and vim_state.mode != .insert) {
-            if (b[0] == '\r' or b[0] == '\n') {
-                region.setInput("", 0);
-                region.clear();
-                std.debug.print("\n", .{});
-                return try allocator.dupe(u8, editor.view());
+            if (rc <= 0) {
+                // 超时/EINTR:若 parser 卡在 esc_seen(收到孤立 ESC 等后续字节),
+                // 此时无后续字节到来 → 兑现为 .esc(否则 Esc 永远到不了 dispatch/editor)。
+                if (parser.flushEsc()) |k| {
+                    synthetic_key = k;
+                    break;
+                }
+                continue; // <0=EINTR(被 SIGWINCH 中断) / 0=超时 → 回头查 flag
             }
-            const changed = vim.handleNormal(&vim_state, &editor.buf, &editor.cursor, allocator, b[0]) catch false;
-            if (changed) redraw(&region, &editor, app);
-            continue;
-        }
+            if ((pfd[0].revents & std.c.POLL.IN) != 0) break; // 有字节可读
+        };
 
-        const key = parser.feed(b[0]) orelse continue;
+        // 取键:合成键(孤立 ESC 超时兑现)优先;否则读一字节喂 parser。
+        // parser.feed 返 null = 序列未完成(如刚收 ESC / CSI 中段)→ 回头继续读。
+        const key = if (synthetic_key) |sk| sk else blk: {
+            const n = posix.read(fd, &b) catch return error.ReadError;
+            if (n == 0) return error.Eof;
+
+            // vim 模式 + NORMAL/VISUAL:字节路由到 vim 状态机(Enter/Esc 例外)
+            if (app.config.vim_mode and vim_state.mode != .insert) {
+                if (b[0] == '\r' or b[0] == '\n') {
+                    region.setInput("", 0);
+                    region.clear();
+                    std.debug.print("\n", .{});
+                    return try allocator.dupe(u8, editor.view());
+                }
+                const changed = vim.handleNormal(&vim_state, &editor.buf, &editor.cursor, allocator, b[0]) catch false;
+                if (changed) redraw(&region, &editor, app);
+                continue;
+            }
+
+            break :blk parser.feed(b[0]) orelse continue;
+        };
 
         // vim INSERT 模式下 Esc → 回 NORMAL(不走 LineEditor 的 esc 语义)
         if (app.config.vim_mode and key == .esc) {

@@ -78,6 +78,12 @@ pub const RenderRegion = struct {
     // 末尾残行在 leaveGenerating 时 flush。
     line_buf: std.ArrayList(u8) = .empty,
 
+    // 助手文本(text_chunk)专用流式缓冲 + markdown 跨行状态。与 line_buf(裸 writeGenText,
+    // 工具卡用)分开:助手文本要逐行过 markdown + 缩进 + 段首 ⏺,工具卡不能动。
+    md_buf: std.ArrayList(u8) = .empty,
+    md_state: @import("../render.zig").StreamState = .{},
+    md_at_segment_start: bool = true, // 段首行用 ⏺ 前缀,续行用缩进
+
     // 阶段1:overlay 逻辑态(help/transcript)由 UiState 承载;机制态(prev_rows 等)仍在上面。
     ui: ui_state_mod.UiState = .{},
     // transcript overlay 期间持有的 owned lines(开 overlay 时生成,关时 freeLines)。
@@ -155,6 +161,7 @@ pub const RenderRegion = struct {
         self.freeTranscriptLines();
         self.scratch.deinit();
         self.line_buf.deinit(self.allocator);
+        self.md_buf.deinit(self.allocator);
     }
 
     fn freeTranscriptLines(self: *RenderRegion) void {
@@ -386,10 +393,21 @@ pub const RenderRegion = struct {
         // -- slash 命令菜单(`/` 前缀,在下边框与 footer 之间垂直列出)--
         new_rows += self.drawSlashMenu(w, content);
 
-        // -- footer --
-        w.writeAll(ansi.clear.line) catch {};
-        self.drawFooter(w, app);
-        new_rows += 1;
+        // -- footer 区:help_open 时原地展开快捷键菜单(非模态,对齐 cc);否则正常 footer 行 --
+        if (self.ui.help_open) {
+            // renderHelpLines 每行末尾 \r\n;行首 clear.line 由下方 RegionLineWriter 注入。
+            var hlw = RegionLineWriter{ .inner = w };
+            const hrows = ui_mod.renderHelpLines(&hlw, self.theme, self.cols) catch 0;
+            new_rows += hrows;
+            // renderHelpLines 末行也带 \r\n → 光标停在末行下一行行首,比 footer 分支多下移 1 行。
+            // 补 up(1) 把光标拉回区内最后一行,与 footer 分支"光标停在区内最后一行"约定一致——
+            // 否则下方 footer_row/input_cursor_row 全部偏移 1,下一帧回区顶少 1 行 → 顶边框残留。
+            if (hrows > 0) w.writeAll(ansi.cursor.up(1, &nbuf)) catch {};
+        } else {
+            w.writeAll(ansi.clear.line) catch {};
+            self.drawFooter(w, app);
+            new_rows += 1;
+        }
 
         // 此刻光标在 footer 行末 = 区内最后一行(行号 new_rows-1)。
 
@@ -426,10 +444,10 @@ pub const RenderRegion = struct {
 
     /// 边框色:plan→warn(黄),bash(留待)→danger,其它→accent。
     fn borderColor(self: *RenderRegion, mode: types.PermissionMode) []const u8 {
-        return switch (mode) {
-            .plan => self.theme.warn,
-            else => self.theme.accent,
-        };
+        // cc 输入框边框色恒为 promptBorder,不随 permission mode 变(仅 bash 模式例外,cc-zig 暂无)。
+        // mode 的视觉区分全交给 footer 的 mode part(drawFooter + status_bar.modeColor)。
+        _ = mode;
+        return self.theme.accent;
     }
 
     /// 画一条横边框线(top=true 用 ╭─╮,否则 ╰─╯)。无左右竖线之外的填充。
@@ -472,16 +490,31 @@ pub const RenderRegion = struct {
         return rows;
     }
 
-    /// footer:左 "{mode} on · shift+tab to cycle · ? for shortcuts"(对齐 CC)右 "{tok} tokens",dim。
+    /// footer:左 "[{symbol} {title} on · ]shift+tab to cycle · ? for shortcuts"(对齐 CC)
+    /// 右 "{tok} tokens"。mode part 用 modeColor 单独着色(plan→cyan/acceptEdits→magenta/
+    /// bypass·dontAsk→red/auto→yellow);default 不显 mode part(对齐 cc isDefaultMode)。
+    /// 其余文字 dim。
     fn drawFooter(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App) void {
         const th = self.theme;
-        // 阶段2:读 self.ui.footer(数据由 .usage 事件喂)而非裸读 app。app 仅作 fallback——
-        // 若 footer 尚未被 .usage 填过(mode 仍默认且 token 为 0),用 app 当前值兜底。
-        const mode_pm = if (self.ui.footer.mode != .default) self.ui.footer.mode else app.config.permission_mode;
-        const mode_str = @import("widget/status_bar.zig").modeName(mode_pm);
-        var left_buf: [192]u8 = undefined;
-        // CC 风格:"{mode} on · shift+tab to cycle · ? for shortcuts"。
-        const left = std.fmt.bufPrint(&left_buf, " {s} on · shift+tab to cycle · ? for shortcuts", .{mode_str}) catch " ? for shortcuts";
+        const sb = @import("widget/status_bar.zig");
+        // mode 真相源 = app.permission_ctx.mode(live):输入期与 config 同步,生成期工具
+        // (EnterPlanMode/ExitPlanMode)直接写它 → spinner tick 重画即反映(修 #11 生成期不联动)。
+        // self.ui.footer.mode 仅当 ctx 为 default 但 footer 被 .usage 喂过非默认值时兜底(罕见)。
+        const live = app.permission_ctx.mode;
+        const mode_pm = if (live != .default) live else self.ui.footer.mode;
+        const sym = sb.modeSymbol(mode_pm);
+        const title = sb.modeTitle(mode_pm);
+        const show_mode = title.len != 0; // default/prompt → 不显 mode part
+
+        // mode part 纯文本(用于宽度计算,不含 SGR)。cc 格式:非 default → `{sym} {title} on (shift+tab to cycle)`;
+        // default → 无 mode part(下方 hint 显 `? for shortcuts`)。对齐 cc 真实 footer。
+        var mode_buf: [96]u8 = undefined;
+        const mode_plain = if (show_mode)
+            (std.fmt.bufPrint(&mode_buf, " {s} {s} on (shift+tab to cycle)", .{ sym, title }) catch "")
+        else
+            "";
+        // default 态显 `? for shortcuts`;非 default 已在 mode part 含 cycle 提示,hint 留空。
+        const hint = if (show_mode) "" else " ? for shortcuts";
 
         const total = blk: {
             const ft = self.ui.footer.totalTokens();
@@ -490,14 +523,22 @@ pub const RenderRegion = struct {
             break :blk u.input_tokens + u.output_tokens;
         };
         var tok_buf: [16]u8 = undefined;
-        const tok_str = @import("widget/status_bar.zig").formatTokens(&tok_buf, total);
+        const tok_str = sb.formatTokens(&tok_buf, total);
         var right_buf: [48]u8 = undefined;
         const right = std.fmt.bufPrint(&right_buf, "{s} tokens ", .{tok_str}) catch "";
 
-        const left_w = displayWidth(left);
+        // 宽度按纯文本算(displayWidth 不跳 SGR,故 SGR 不能进被测字符串)。
+        const left_w = displayWidth(mode_plain) + displayWidth(hint);
         const right_w = displayWidth(right);
+
+        // 写:mode part 用 modeColor 着色,其余 dim。
+        if (show_mode) {
+            w.writeAll(sb.modeColor(th, mode_pm)) catch {};
+            w.writeAll(mode_plain) catch {};
+            w.writeAll(th.reset) catch {};
+        }
         w.writeAll(th.dim) catch {};
-        w.writeAll(left) catch {};
+        w.writeAll(hint) catch {};
         // 两端对齐:中间填空格
         if (self.cols > left_w + right_w) {
             const gap = self.cols - left_w - right_w;
@@ -585,6 +626,10 @@ pub const RenderRegion = struct {
             self.transcript_lines = transcript_viewer.renderToLinesWithTheme(self.allocator, conv, self.theme) catch null;
         } else if (now != .transcript and was == .transcript) {
             self.freeTranscriptLines();
+            // transcript 退出再锚定:transcript 可能比输入框高、顶动了终端,直接 renderInner
+            // 会让输入框停在 transcript 旧区顶(漂到屏上方,下方留空)。修:擦掉 transcript 区
+            // → 用绝对定位把光标移到屏底输入框应在的行 → renderInner 从那里画 → 输入框落回底部。
+            self.reanchorBottomAfterOverlay();
         }
         if (eff.redraw_region and !self.generating) {
             if (self.ui.overlay != .none) {
@@ -710,6 +755,24 @@ pub const RenderRegion = struct {
         self.flush();
     }
 
+    /// transcript 退出后把输入框重锚到屏底:先擦 transcript 区(clearInner),再用绝对定位
+    /// 把光标移到屏底输入框应在的首行(self.rows - 估算框高),renderInner 从那里画 → 框落底部。
+    /// 不进 alt-screen;绝对定位作用于可视屏(scrollback 模式合法)。
+    fn reanchorBottomAfterOverlay(self: *RenderRegion) void {
+        self.clearInner(); // 擦 transcript 区 + 回区顶,prev_rows=0/visible=false
+        self.measureSize();
+        // 估算输入框高:上下边框(2)+ 至少 1 内容行 + footer(1) = 4(无 TaskTab/slash 时)。
+        // 多估几行无害:renderInner 的 shrink-erase 会清掉框下方多余空行。
+        const box_h: u16 = 4;
+        const w = &self.scratch.writer;
+        self.resetScratch();
+        var nbuf: [16]u8 = undefined;
+        const target_row: u16 = if (self.rows > box_h) self.rows - box_h + 1 else 1;
+        w.writeAll(ansi.cursor.move(target_row, 1, &nbuf)) catch {};
+        self.flush();
+        // 此后 input_cursor_row=0/prev_rows=0,renderInner 在 target_row 起画输入框(屏底)。
+    }
+
     // =====================================================================
     // 生成期:文本零重绘 + 区(spinner+输入框+footer)按事件节流重画
     // =====================================================================
@@ -744,7 +807,8 @@ pub const RenderRegion = struct {
         _ = app;
         self.lock();
         defer self.unlock();
-        self.flushLineBuf(); // 先把行缓冲残行(无尾随 \n 的末行)输出,别丢
+        self.flushGenAssistantLocked(); // 助手文本残行(markdown)先 flush
+        self.flushLineBuf(); // 再把行缓冲残行(无尾随 \n 的末行)输出,别丢
         self.eraseRegion(); // 擦掉固定区(若在),光标回文本续接点
         if (self.text_pending_newline) {
             const w = &self.scratch.writer;
@@ -831,6 +895,73 @@ pub const RenderRegion = struct {
         if (self.line_buf.items.len == 0) return;
         self.emitToScroll(self.line_buf.items);
         self.line_buf.clearRetainingCapacity();
+    }
+
+    /// 助手文本段开始(stream_begin):重置 markdown 流式状态 + 标记段首(下一行用 ⏺ 前缀)。
+    pub fn beginGenAssistant(self: *RenderRegion) void {
+        self.lock();
+        defer self.unlock();
+        self.md_buf.clearRetainingCapacity();
+        self.md_state = .{};
+        self.md_at_segment_start = true;
+    }
+
+    /// 写助手文本(text_chunk):逐行过 markdown(render.renderLineStreaming)+ 段首 ⏺ / 续行
+    /// 2 空格缩进,对齐 cc。残行留缓冲,下个 chunk 续接;stream_done 时 flushGenAssistant。
+    pub fn writeGenAssistantText(self: *RenderRegion, text: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        if (text.len == 0) return;
+        self.md_buf.appendSlice(self.allocator, text) catch {
+            self.emitToScroll(text); // OOM 兜底裸发
+            return;
+        };
+        // 逐个完整行(到 \n)渲染输出;残行留缓冲。
+        while (std.mem.indexOfScalar(u8, self.md_buf.items, '\n')) |nl| {
+            const line = self.md_buf.items[0..nl];
+            self.emitAssistantLine(line, true);
+            // 删已发行(含 \n)
+            const rest = self.md_buf.items.len - (nl + 1);
+            std.mem.copyForwards(u8, self.md_buf.items[0..rest], self.md_buf.items[nl + 1 ..]);
+            self.md_buf.shrinkRetainingCapacity(rest);
+        }
+    }
+
+    /// flush 助手文本残行(stream_done / leaveGenerating)。public:持锁。
+    pub fn flushGenAssistant(self: *RenderRegion) void {
+        self.lock();
+        defer self.unlock();
+        self.flushGenAssistantLocked();
+    }
+
+    /// flush 助手文本残行(内部,调用方已持锁)。
+    fn flushGenAssistantLocked(self: *RenderRegion) void {
+        if (self.md_buf.items.len == 0) return;
+        self.emitAssistantLine(self.md_buf.items, false);
+        self.md_buf.clearRetainingCapacity();
+    }
+
+    /// 渲染一行助手文本(markdown + 前缀)到 scrollback。with_nl=true 行尾加 \n。
+    fn emitAssistantLine(self: *RenderRegion, line: []const u8, with_nl: bool) void {
+        const md_render = @import("../render.zig");
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        // 前缀:段首行 `⏺ `(accent),续行 `  `(2 空格缩进,对齐 cc)。
+        if (self.md_at_segment_start) {
+            buf.appendSlice(self.allocator, self.theme.accent) catch {};
+            buf.appendSlice(self.allocator, self.theme.icon_act) catch {};
+            buf.appendSlice(self.allocator, self.theme.reset) catch {};
+            buf.append(self.allocator, ' ') catch {};
+            self.md_at_segment_start = false;
+        } else {
+            buf.appendSlice(self.allocator, "  ") catch {};
+        }
+        md_render.renderLineStreaming(line, &self.md_state, &buf, self.allocator) catch {
+            // 渲染失败:裸发原行(带前缀已在 buf)。
+            buf.appendSlice(self.allocator, line) catch {};
+        };
+        if (with_nl) buf.append(self.allocator, '\n') catch {};
+        self.emitToScroll(buf.items);
     }
 
     /// 实际把一段文本输出到 scrollback:擦区(若在)→ print → 若刚才区在屏则重画区。
