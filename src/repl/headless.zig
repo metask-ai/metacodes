@@ -11,14 +11,10 @@
 const std = @import("std");
 const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
+const writer_backend = @import("../core/writer_backend.zig");
 
-/// 静默 writer：吞掉 agent_loop 的流式输出（ANSI + tool 注解），headless 只要最终文本。
-const SilentWriter = struct {
-    pub fn print(_: *@This(), comptime fmt: []const u8, args: anytype) !void {
-        _ = fmt;
-        _ = args;
-    }
-};
+/// headless 用 WriterBackend null-sink:吞掉 agent_loop 的流式输出（ANSI + tool 注解），
+/// 只要最终文本。工具卡事件 no-op,text_chunk/颜色括号全丢弃。
 
 /// 跑单次 prompt。返回进程退出码。
 pub fn run(
@@ -35,7 +31,8 @@ pub fn run(
 
     try app.conversation.appendText(.user, trimmed);
 
-    var writer = SilentWriter{};
+    var wb = writer_backend.WriterBackend.initNull();
+    const be = wb.backend();
     const jobs_ptr = if (app.jobs) |*j| j else null;
     const result = agent_loop.run(
         &app.conversation,
@@ -70,7 +67,7 @@ pub fn run(
             .mcp_sessions = &app.mcp_sessions.items,
             .cron_registry = &app.cron_registry,
         },
-        &writer,
+        &be,
         allocator,
     ) catch |err| {
         std.debug.print("error: {s}\n", .{@errorName(err)});

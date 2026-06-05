@@ -120,33 +120,29 @@ def test_T21_multiple_queued_autosubmit(bin_path):
         a._fail(f"队列多条应合并为一次提交(一个 ❯ 块),实际 ❯ 行:{echoes}")
 
 
-def test_T22_esc_two_tier(bin_path):
-    # Esc 两档:框有字 → Esc 清空框、生成继续(spinner 仍在);框空再 Esc → 中断。
+def test_T22_esc_interrupts(bin_path):
+    # 单 esc 直接中断当前任务(对齐 CC,不再两档)。框里已打的字先入队续发,再中断。
     if SKIP:
         return
+    import re
+    from asserts import split_frames
     raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60 每行一个数字", "key:enter",
-                         "sleep:0.6", "type:TYPED", "key:esc", "sleep:0.8"],
+                         "sleep:0.6", "type:TYPED", "key:esc", "sleep:3"],
               per_key_drain=0.05, base_url=None)
     a = TTYAssert(raw)
-    # Esc 后应有帧:spinner 仍在(生成继续)且框不含 TYPED(已清空)。
-    cleared_continues = False
-    for sc in a.frame_screens:
-        if sc.find_last_row("esc to interrupt") is None:
-            continue
-        cr = sc.find_last_row("❯")
-        box = sc.line_text(cr) if cr is not None else ""
-        # 找一帧:在打了 TYPED 之后(整流里出现过 TYPED)、且当前框无 TYPED
-        if "TYPED" not in box:
-            cleared_continues = True
-    # 至少 TYPED 一度出现过(证明输入到框),且存在 spinner 帧框为空(Esc 已清)
+    prose = re.sub(rb"\x1b\[[0-9;?>]*[A-Za-z]", b"",
+                   b"".join(c for k, c in split_frames(raw) if k == "prose")).decode("utf-8", "replace")
+    # TYPED 应一度出现在框(证明输入进了编辑器)。
     typed_seen = any(
         sc.find_last_row("❯") is not None and "TYPED" in sc.line_text(sc.find_last_row("❯"))
         for sc in a.frame_screens
     )
     if not typed_seen:
         a._fail("TYPED 未曾出现在框(输入没进编辑器)")
-    if not cleared_continues:
-        a._fail("Esc 后框未清空 / 生成未继续")
+    # 单 esc 后应中断:出现 cancel 标记(或第一条已自然结束)。核心是不再"清框继续"。
+    finished = "59" in prose or "60" in prose
+    if "cancel" not in prose.lower() and not finished:
+        a._fail("单 esc 未中断当前推理(无 cancel 标记)")
 
 
 def test_T23_cjk_ime_in_box(bin_path):

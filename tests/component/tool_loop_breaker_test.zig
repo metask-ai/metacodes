@@ -16,6 +16,7 @@ const harness = @import("harness");
 const cc = @import("cc");
 
 const agent_loop = cc.agent_loop;
+const writer_backend = cc.writer_backend;
 
 /// 一个"调用未知工具 __nope__"的完整 SSE 响应(单 turn)。dispatch 必返 UnknownTool。
 const TOOL_USE_NOPE_SSE =
@@ -26,12 +27,7 @@ const TOOL_USE_NOPE_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
-const SilentWriter = struct {
-    pub fn print(_: *@This(), comptime fmt: []const u8, args: anytype) !void {
-        _ = fmt;
-        _ = args;
-    }
-};
+// 旧 SilentWriter 已由 WriterBackend null-sink 取代(见各 test)。
 
 test "L2 熔断器: 同工具同错连续 3 次 → stop_reason=.tool_loop 且 turns==3(不烧到 max_turns)" {
     const a = std.testing.allocator;
@@ -60,14 +56,15 @@ test "L2 熔断器: 同工具同错连续 3 次 → stop_reason=.tool_loop 且 t
     const perm = cc.permission.createContext(.bypass_permissions, a);
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
 
-    var writer = SilentWriter{};
+    var wb = writer_backend.WriterBackend.initNull();
+    const be = wb.backend();
     const result = agent_loop.run(
         &conv,
         &client,
         empty_defs,
         &perm,
         .{ .max_turns = 20 }, // 远高于 3:证明是熔断而非 max_turns 停的
-        &writer,
+        &be,
         a,
     ) catch |e| {
         std.debug.print("agent_loop.run failed: {s}\n", .{@errorName(e)});
@@ -121,8 +118,9 @@ test "L2 熔断器回归: 单轮内多工具同错 不应熔断(turns 继续到 
 
     const perm = cc.permission.createContext(.bypass_permissions, a);
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
-    var writer = SilentWriter{};
-    const result = agent_loop.run(&conv, &client, empty_defs, &perm, .{ .max_turns = 20 }, &writer, a) catch |e| {
+    var wb = writer_backend.WriterBackend.initNull();
+    const be = wb.backend();
+    const result = agent_loop.run(&conv, &client, empty_defs, &perm, .{ .max_turns = 20 }, &be, a) catch |e| {
         std.debug.print("run failed: {s}\n", .{@errorName(e)});
         return error.SkipZigTest;
     };

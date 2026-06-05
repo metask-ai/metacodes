@@ -24,6 +24,7 @@ const json_mod = @import("../json.zig");
 const permission_mod = @import("../permission.zig");
 const subagent = @import("subagent.zig");
 const agent_loop = @import("agent_loop.zig");
+const writer_backend = @import("writer_backend.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
@@ -92,13 +93,16 @@ pub const JobEntry = struct {
         self.output_buf.appendSlice(self.allocator, bytes) catch {};
     }
 
-    /// agent_loop progress 回调的 trampoline:持锁更新 current_turn/current_tool/input。
+    /// agent_loop progress 回调的 trampoline:持锁更新 current_turn/current_tool/input/tool_calls。
     /// 经 opts.progress_state(*JobEntry erased)+ progress_fn 注入,见 jobThreadMain。
-    pub fn progressTrampoline(state: *anyopaque, turn: u32, tool_name: []const u8, tool_input: []const u8) void {
+    pub fn progressTrampoline(state: *anyopaque, turn: u32, tool_name: []const u8, tool_input: []const u8, tool_calls: u32) void {
         const self: *JobEntry = @ptrCast(@alignCast(state));
         self.lock();
         defer self.unlock();
         self.current_turn = turn;
+        // tool_calls 实时回写(单调累计)——必须在下方 early return 之前,使轮起始上报
+        // (空 tool_name)也刷新计数,subagent 树 `· N tools ·` 才能执行中累加而非恒 0。
+        self.tool_calls = tool_calls;
         // 空 tool_name = 仅推进轮次(轮开始上报),**保留**上一个工具——对齐 cc
         // "持续显示最近动作"语义。否则工具执行窗口短于一帧时动作行几乎不可见。
         if (tool_name.len == 0) return;
@@ -183,23 +187,12 @@ const JobInput = struct {
     }
 };
 
-/// 把后台 subagent 的流式输出导进 entry.output_buf 的 writer。
-/// 替代 subagent 默认的 NullWriter,实现增量可见。
-const SinkWriter = struct {
-    entry: *JobEntry,
-    pub fn print(self: *@This(), comptime fmt: []const u8, args: anytype) !void {
-        // 小段格式化到栈/临时,再持锁 append。常见是单段 text delta。
-        var buf: [4096]u8 = undefined;
-        const s = std.fmt.bufPrint(&buf, fmt, args) catch {
-            // 超长:退化为分配一次
-            const big = std.fmt.allocPrint(self.entry.allocator, fmt, args) catch return;
-            defer self.entry.allocator.free(big);
-            self.entry.appendOutput(big);
-            return;
-        };
-        self.entry.appendOutput(s);
-    }
-};
+/// WriterBackend 的 sink:把 CoreEvent 字节(text_chunk 等)导进 entry.output_buf,实现
+/// 增量可见。ctx 是 *JobEntry。backend 已预格式化好字节,这里只持锁 append。
+fn jobSink(ctx: *anyopaque, bytes: []const u8) void {
+    const e: *JobEntry = @ptrCast(@alignCast(ctx));
+    e.appendOutput(bytes);
+}
 
 pub const AgentJobRegistry = struct {
     allocator: std.mem.Allocator,
@@ -537,7 +530,10 @@ fn jobThreadMain(input: *JobInput) void {
     var ctx_override = input.permission_ctx;
     if (input.perm_override) |m| ctx_override.mode = m;
 
-    var sink = SinkWriter{ .entry = e };
+    // 后台 subagent 输出导进 job buffer 的 backend。colorize=false(非交互终端,
+    // 对齐旧 SinkWriter + subagent colorize=false);工具卡事件 no-op(depth>=1 本就不发)。
+    var wb = writer_backend.WriterBackend{ .sink_ctx = @ptrCast(e), .sink = jobSink, .colorize = false };
+    const be = wb.backend();
 
     const opts = subagent.SpawnOptions{
         .max_turns = if (input.max_turns > 0) input.max_turns else 20,
@@ -564,7 +560,7 @@ fn jobThreadMain(input: *JobInput) void {
         &e.abort,
         input.prompt,
         opts,
-        &sink,
+        &be,
     ) catch |err| {
         e.lock();
         e.status = .failed;
@@ -583,4 +579,35 @@ fn jobThreadMain(input: *JobInput) void {
     e.unlock();
 
     input.cleanup();
+}
+
+const testing = std.testing;
+
+test "progressTrampoline 实时回写 tool_calls(#6:subagent 树执行中累加非恒 0)" {
+    // #6 修复:执行中 trampoline 必须实时回写 tool_calls,否则 subagent 树恒显 `· 0 tools ·`
+    //(旧 bug:tool_calls 只在 job 跑完后一次性赋值)。
+    var reg = try AgentJobRegistry.init(testing.allocator, "test-key", "http://127.0.0.1:1", "test-model");
+    defer reg.deinit();
+
+    try reg.pushTestEntry("count files", 1, "", "");
+    const entry = reg.entries.items[0];
+    // 初值:running 且 tool_calls=0(尚未调工具)。
+    try testing.expectEqual(@as(u32, 0), entry.tool_calls);
+
+    // 模拟 agent_loop 上报:turn 2,刚调完第 5 个工具(Grep)。
+    JobEntry.progressTrampoline(entry, 2, "Grep", "{\"pattern\":\"x\"}", 5);
+
+    // 快照应反映实时累计值(执行中,非跑完)。
+    const snaps = try reg.snapshotJobs(testing.allocator);
+    defer AgentJobRegistry.freeSnapshots(testing.allocator, snaps);
+    try testing.expectEqual(@as(usize, 1), snaps.len);
+    try testing.expectEqual(JobStatus.running, snaps[0].status);
+    try testing.expectEqual(@as(u32, 5), snaps[0].tool_calls);
+    try testing.expectEqual(@as(u32, 2), snaps[0].current_turn);
+
+    // 轮起始上报(空 tool_name)也刷新计数(early-return 之前回写)。
+    JobEntry.progressTrampoline(entry, 3, "", "", 7);
+    const snaps2 = try reg.snapshotJobs(testing.allocator);
+    defer AgentJobRegistry.freeSnapshots(testing.allocator, snaps2);
+    try testing.expectEqual(@as(u32, 7), snaps2[0].tool_calls);
 }

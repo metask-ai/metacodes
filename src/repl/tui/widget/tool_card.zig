@@ -74,6 +74,43 @@ pub fn resultRenderMode(tool_name: []const u8) ResultRenderMode {
     return .hidden;
 }
 
+/// 是否在工具开始时渲染起始卡(⏺ <tool>)。与 resultRenderMode(它管*结果体*显示)分离。
+///
+/// Task/Agent:起始卡可见(用户必须看到 subagent 被启动),但结果体仍 hidden
+/// (状态在 Task 面板反馈)。AskUserQuestion/plan-mode/Skill:无起始卡(走专门 UI)。
+/// 历史 bug:agent_loop 旧逻辑直接用 resultRenderMode==hidden 跳过起始卡 → Task 被调用时
+/// TUI 完全无感(用户看不到 subagent 启动)。本函数把"是否打起始卡"独立出来修复之。
+pub fn showStartCard(tool_name: []const u8) bool {
+    if (std.mem.eql(u8, tool_name, "AskUserQuestion")) return false;
+    if (std.mem.eql(u8, tool_name, "EnterPlanMode") or std.mem.eql(u8, tool_name, "ExitPlanMode")) return false;
+    if (std.mem.eql(u8, tool_name, "Skill")) return false;
+    // Task/Agent:起始卡可见(精确匹配,避免 TaskCreate/TaskUpdate 等子工具噪声)。
+    if (std.mem.eql(u8, tool_name, "Task") or std.mem.eql(u8, tool_name, "Agent")) return true;
+    // 其余:沿用 resultRenderMode——非 hidden 才打起始卡。
+    return resultRenderMode(tool_name) != .hidden;
+}
+
+/// 头部状态图标 + 颜色。与 ResultKind 解耦,处理 Bash 的两类"成功但非真成功"特例:
+///   - 非零 exit_code:cc 语义上是正常结果(grep miss/test fail),不改 is_error(它进
+///     API tool_result),但头部图标降级 ✓→✗ 给用户失败可视提示。
+///   - auto_backgrounded:超 15s 转后台,不是完成,头部用中性 ⏺(非绿 ✓)。
+/// 非 Bash 工具:沿用 kind → ✓/✗。
+fn headerIcon(th: Theme, tool_name: []const u8, output_text: []const u8, kind: ResultKind) struct { glyph: []const u8, color: []const u8 } {
+    if (kind == .ok and std.mem.eql(u8, tool_name, "Bash")) {
+        if (std.mem.indexOf(u8, output_text, "\"auto_backgrounded\":true") != null) {
+            // 转后台:中性 ⏺ + warn 色(非成功、非失败)。
+            return .{ .glyph = th.icon_act, .color = th.warn };
+        }
+        if (extractNumberField(output_text, "exit_code")) |code| {
+            if (code != 0) return .{ .glyph = th.icon_cross, .color = th.danger };
+        }
+    }
+    return if (kind == .ok)
+        .{ .glyph = th.icon_check, .color = th.success }
+    else
+        .{ .glyph = th.icon_cross, .color = th.danger };
+}
+
 /// 用户可见名(对齐 cc userFacingName):TUI 工具卡标题用。UI 表现层映射,
 /// 不耦合 registry。当前仅 WebSearch → "Web Search"(带空格)。其余用原名。
 pub fn displayName(tool_name: []const u8) []const u8 {
@@ -191,9 +228,10 @@ pub fn renderResult(
     try out.append(alloc, ' ');
     try out.appendSlice(alloc, displayName(tool_name));
 
-    // 右上角:状态符 + 耗时
-    const status_color = if (kind == .ok) th.success else th.danger;
-    const status_icon = if (kind == .ok) th.icon_check else th.icon_cross;
+    // 右上角:状态符 + 耗时。图标经 headerIcon 解耦(Bash 非零 exit→✗、转后台→中性)。
+    const hicon = headerIcon(th, tool_name, output_text, kind);
+    const status_color = hicon.color;
+    const status_icon = hicon.glyph;
     var stat_buf: [64]u8 = undefined;
     const stat_inner = try std.fmt.bufPrint(&stat_buf, "{s} {d:.1}s", .{ status_icon, @as(f64, @floatFromInt(elapsed_ms)) / 1000.0 });
     if (opts.cols > 0) {
@@ -395,10 +433,17 @@ fn appendLine(alloc: std.mem.Allocator, out: *std.ArrayList(u8), color: []const 
 /// Bash 结果:从结果 JSON 提取 stdout/stderr/exit_code,**unescape 后**显示真实多行输出,
 /// 而非裸 JSON。对齐 cc BashToolResultMessage(渲染 stdout 文本本身,不含 JSON 包装)。
 fn renderBashResult(alloc: std.mem.Allocator, th: Theme, output_text: []const u8, out: *std.ArrayList(u8), opts: RenderOpts) !void {
-    // 后台 Bash:{"job_id":..,"status":"started",...} → 一行提示,不展开。
+    // 后台 Bash → 一行提示,不展开裸 JSON。两类:
+    //   - explicit bg(run_in_background):{"job_id":..,"status":"started",...}
+    //   - auto bg(超 15s 转后台):{"auto_backgrounded":true,"job_id":..,"note":..}(无 status)
     if (extractField(output_text, "job_id")) |jid| {
-        if (extractField(output_text, "status") != null) {
-            const line = try std.fmt.allocPrint(alloc, "▶ background job {s}", .{jid});
+        const is_started = extractField(output_text, "status") != null;
+        const is_auto = std.mem.indexOf(u8, output_text, "\"auto_backgrounded\":true") != null;
+        if (is_started or is_auto) {
+            const line = if (is_auto)
+                try std.fmt.allocPrint(alloc, "▶ moved to background job {s} (exceeded 15s)", .{jid})
+            else
+                try std.fmt.allocPrint(alloc, "▶ background job {s}", .{jid});
             defer alloc.free(line);
             try appendLine(alloc, out, th.dim, line, th.reset);
             return;
@@ -579,7 +624,7 @@ fn renderEditDiff(alloc: std.mem.Allocator, th: Theme, output_text: []const u8, 
             .del => old_ln,
             .ctx => new_ln,
         };
-        try appendDiffLine(alloc, th, out, kind, num, line, lang);
+        try appendDiffLine(alloc, th, out, kind, num, line, lang, opts.cols);
         switch (kind) {
             .add => new_ln += 1,
             .del => old_ln += 1,
@@ -604,15 +649,12 @@ const DiffLineKind = enum { add, del, ctx };
 /// 渲染一条 diff 行:`<行号> <bg 色块>{sign+content}<reset>`。
 /// theme 有 diff 背景(256/truecolor)→ 整段套背景;否则纯前景(basic_16/mono)。
 /// 前导 "  " 缩进交给 appendWithGutter 处理(它会剥掉重套 ⎿)。
-fn appendDiffLine(alloc: std.mem.Allocator, th: Theme, out: *std.ArrayList(u8), kind: DiffLineKind, num: usize, line: []const u8, lang: []const u8) !void {
-    try out.appendSlice(alloc, "  ");
-    // 行号列(dim,右对齐 4 宽)。
-    var num_buf: [8]u8 = undefined;
-    const num_str = std.fmt.bufPrint(&num_buf, "{d:>4} ", .{num}) catch "   ? ";
-    try out.appendSlice(alloc, th.dim);
-    try out.appendSlice(alloc, num_str);
-    try out.appendSlice(alloc, th.reset);
-    // 背景色块(若 theme 提供 256/truecolor;basic_16/mono 为空)。
+/// 渲染一条 diff 行:`<bg 色块>{行号 sign content <行尾填充>}<reset>`(整行矩形,对齐 CC)。
+/// theme 有 diff 背景(256/truecolor)→ 行号+sign+内容+行尾填充全在同一背景块,padEnd 到列宽
+/// 成矩形;否则纯前景(basic_16/mono),不填充空块。
+/// 前导 "  " 缩进交给 appendWithGutter 处理(它剥掉重套 ⎿,占 5 列)。cols 为终端宽,
+/// 内容区可用宽 = cols - 5(gutter 缩进)。
+fn appendDiffLine(alloc: std.mem.Allocator, th: Theme, out: *std.ArrayList(u8), kind: DiffLineKind, num: usize, line: []const u8, lang: []const u8, cols: u16) !void {
     const bg: []const u8 = switch (kind) {
         .add => th.diff_add_bg,
         .del => th.diff_del_bg,
@@ -626,19 +668,44 @@ fn appendDiffLine(alloc: std.mem.Allocator, th: Theme, out: *std.ArrayList(u8), 
     const sign: u8 = if (line.len > 0) line[0] else ' ';
     const content = if (line.len > 0) line[1..] else line;
 
+    // 前导 2 空格(gutter 会剥掉换成 ⎿ 缩进)。
+    try out.appendSlice(alloc, "  ");
+
+    // 背景块从行号开始(对齐 CC:行号也在块内)。
     try out.appendSlice(alloc, bg);
-    // sign 字符:实色(+绿/-红/空 dim),坐在背景块上。
+
+    // 行号列(右对齐 4 宽 + 1 空格 = 5 显示列;dim 但在 bg 上)。
+    var num_buf: [8]u8 = undefined;
+    const num_str = std.fmt.bufPrint(&num_buf, "{d:>4} ", .{num}) catch "   ? ";
+    try out.appendSlice(alloc, th.dim);
+    try out.appendSlice(alloc, num_str);
+    // sign 字符:实色(+绿/-红/空 dim),坐在背景块上。注意先 reset dim 再上 sign_fg。
+    try out.appendSlice(alloc, th.reset);
+    try out.appendSlice(alloc, bg);
     try out.appendSlice(alloc, sign_fg);
     try out.append(alloc, sign);
-    try out.appendSlice(alloc, th.reset);
-    // 内容:语法高亮(bg-aware)。base = bg + (del 行整体 DIM,对齐 metacode 防删除色被语法盖)。
-    // 每个 highlight 行需独立跨行状态(diff 行不连续,不能跨 hunk 续状态)。
+
+    // 内容:语法高亮(bg-aware)。base = bg + (del 行整体 DIM)。高亮内部每 token 后 RESET+base,
+    // 背景连续;高亮结束**不 reset**,留着接行尾填充。
     var hl: render_mod.HlState = .{};
     var base_buf: std.ArrayList(u8) = .empty;
     defer base_buf.deinit(alloc);
     try base_buf.appendSlice(alloc, bg);
     if (kind == .del) try base_buf.appendSlice(alloc, th.dim);
+    try out.appendSlice(alloc, base_buf.items); // 内容前先铺一次 base(sign 后的起点)
     try render_mod.highlightCodeLine(content, lang, &hl, base_buf.items, out, alloc);
+
+    // 行尾填充:仅当有背景色(256/truecolor)。padEnd 到内容区可用宽(cols - 5 gutter 缩进),
+    // 让背景铺满成矩形。已写显示宽 = 行号 5 + sign 1 + content 显示宽。
+    if (bg.len > 0 and cols > 5) {
+        const avail: usize = @as(usize, cols) - 5;
+        const used: usize = 5 + 1 + term.displayWidth(content);
+        if (used < avail) {
+            try out.appendSlice(alloc, bg); // 确保填充段背景在(防高亮末尾状态偏移)
+            var i: usize = 0;
+            while (i < avail - used) : (i += 1) try out.append(alloc, ' ');
+        }
+    }
     try out.appendSlice(alloc, th.reset);
     try out.append(alloc, '\n');
 }
@@ -1167,6 +1234,25 @@ test "renderResult: diff 背景色块(truecolor)+ 行号 + del DIM" {
     try testing.expect(std.mem.indexOf(u8, s, th.role_tool) != null or std.mem.indexOf(u8, s, "\x1b[35m") != null);
 }
 
+test "renderResult: diff 整块矩形(cols 填充背景到行尾,对齐 CC)" {
+    const th = theme_mod.select(.dark, .truecolor);
+    const out_json = "{\"success\":true,\"path\":\"/x.zig\",\"gitDiff\":\"--- a/x.zig\\n+++ b/x.zig\\n@@ -1,1 +1,1 @@\\n+const b = 20;\\n\"}";
+    // cols=40 → 内容区可用宽 = 40-5(gutter)=35。add 行内容显示宽 < 35 → 应 padEnd 空格填充。
+    const s = try renderResult(testing.allocator, th, "Edit", "{\"file_path\":\"/x.zig\"}", out_json, .ok, 100, .{ .cols = 40 });
+    defer testing.allocator.free(s);
+    // 矩形特征:背景块开启后,行尾有填充空格(背景延伸),最后才 reset。
+    // 验证:add bg 序列出现,且其后(同一行内)有连续空格填充到接近列宽。
+    const add_bg = "48;2;33;58;43";
+    const bg_pos_opt = std.mem.indexOf(u8, s, add_bg);
+    try testing.expect(bg_pos_opt != null);
+    const bg_pos = bg_pos_opt.?;
+    // 从 bg 起到行尾(\n)之间,应有一段 >=4 连续空格(填充证据;内容 "const b = 20;" 约 13 列,
+    // 行号5+sign1+13=19,填到 35 → 约 16 空格填充)。
+    const nl = std.mem.indexOfScalarPos(u8, s, bg_pos, '\n') orelse s.len;
+    const seg = s[bg_pos..nl];
+    try testing.expect(std.mem.indexOf(u8, seg, "    ") != null); // >=4 连续空格 = 填充证据
+}
+
 test "renderResult: diff basic_16 无背景块只前景(对齐 metacode fg-only)" {
     const th = theme_mod.select(.dark, .basic_16);
     const out_json = "{\"success\":true,\"path\":\"/x.zig\",\"gitDiff\":\"--- a/x.zig\\n+++ b/x.zig\\n@@ -1,1 +1,1 @@\\n-a\\n+b\\n\"}";
@@ -1294,6 +1380,58 @@ test "resultRenderMode: 故意 hidden vs 应显示" {
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("PushNotification"));
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("ToolSearch"));
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("ListMcpResourcesTool"));
+}
+
+test "showStartCard: Task/Agent 起始卡可见但结果仍 hidden(#8)" {
+    // #8 修复:起始卡门控与结果门控分离。Task/Agent 必须打起始卡(用户看到 subagent 启动),
+    // 但结果体仍 hidden(状态在 Task 面板)。
+    try testing.expect(showStartCard("Task"));
+    try testing.expect(showStartCard("Agent"));
+    // 结果侧不变:Task 结果仍 hidden。
+    try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("Task"));
+    // 走专门 UI 的工具:不打起始卡。
+    try testing.expect(!showStartCard("AskUserQuestion"));
+    try testing.expect(!showStartCard("EnterPlanMode"));
+    try testing.expect(!showStartCard("ExitPlanMode"));
+    try testing.expect(!showStartCard("Skill"));
+    // 普通可见工具:打起始卡(沿用 resultRenderMode != hidden)。
+    try testing.expect(showStartCard("Bash"));
+    try testing.expect(showStartCard("WebSearch"));
+    // 完全未知工具:不打(resultRenderMode hidden)。
+    try testing.expect(!showStartCard("SomeFutureTool"));
+}
+
+test "renderResult: Bash 非零 exit_code 头部降级 ✗(#3)" {
+    // #3 修复:Bash 把非零 exit 包成正常 JSON(is_error=false → kind=.ok),但头部图标
+    // 应降级 ✓→✗ 给失败可视提示。不碰 is_error(它进 API tool_result)。
+    const th = theme_mod.monochrome; // icon_check="+" icon_cross="X"
+    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"exit 3\"}", "{\"stdout\":\"\",\"stderr\":\"\",\"exit_code\":3}", .ok, 100, .{});
+    defer testing.allocator.free(s);
+    // 头部应是 X(cross)不是 +(check)——尽管 kind=.ok。
+    try testing.expect(std.mem.indexOf(u8, s, "X 0.1s") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "+ 0.1s") == null);
+}
+
+test "renderResult: Bash exit_code=0 头部仍 ✓(#3 不误伤)" {
+    const th = theme_mod.monochrome;
+    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"true\"}", "{\"stdout\":\"ok\\n\",\"exit_code\":0}", .ok, 100, .{});
+    defer testing.allocator.free(s);
+    try testing.expect(std.mem.indexOf(u8, s, "+ 0.1s") != null); // 仍 check
+    try testing.expect(std.mem.indexOf(u8, s, "X 0.1s") == null);
+}
+
+test "renderResult: auto_backgrounded 头部中性 + ▶ 提示不裸吐 JSON(#4)" {
+    // #4 修复:超 15s 转后台,头部非 ✓(中性 icon_act);body 渲染 ▶ 提示行,不裸吐 JSON。
+    const th = theme_mod.monochrome; // icon_act="*"
+    const json = "{\"auto_backgrounded\":true,\"job_id\":\"abc123\",\"partial_stdout\":\"\",\"partial_stderr\":\"\",\"note\":\"Command exceeded 15s; moved to background.\"}";
+    const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"sleep 20\"}", json, .ok, 15100, .{});
+    defer testing.allocator.free(s);
+    // 头部:中性 *(icon_act)不是 +(check)。
+    try testing.expect(std.mem.indexOf(u8, s, "* 15.1s") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "+ 15.1s") == null);
+    // body:▶ 后台提示 + job id,且不裸吐 auto_backgrounded JSON。
+    try testing.expect(std.mem.indexOf(u8, s, "moved to background job abc123") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "auto_backgrounded") == null);
 }
 
 test "renderJsonToolSummary: 提人话不裸吐 JSON" {

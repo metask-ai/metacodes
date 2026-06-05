@@ -34,6 +34,88 @@ pub const StreamResult = struct {
     id: log.RequestId,
 };
 
+/// 网络瞬态错误判定:服务端关连接(keep-alive 回收/LB 断连)、连接重置、读到 EOF 等。
+/// 这些是**建连/收头阶段**的可重试错误(请求未产生副作用,从头重发安全)。
+/// 已实测:MockServer 断连时 std.http receiveHead 抛 error.HttpConnectionClosing。
+pub fn isTransientNetworkError(err: anyerror) bool {
+    return switch (err) {
+        error.HttpConnectionClosing,
+        error.ConnectionResetByPeer,
+        error.ConnectionTimedOut,
+        error.BrokenPipe,
+        error.EndOfStream,
+        error.UnexpectedReadFailure,
+        error.UnexpectedWriteFailure,
+        error.NetworkUnreachable,
+        error.ConnectionRefused,
+        error.TemporaryNameServerFailure,
+        => true,
+        else => false,
+    };
+}
+
+/// 给定错误是否值得重试(瞬态网络错误 + 可重试 HTTP 状态)。对齐 CC shouldRetry:
+/// 连接错误、429、5xx(ServerError/BadGateway/ServiceUnavailable)、overloaded(ApiError 由上层判)。
+pub fn isRetriableError(err: anyerror) bool {
+    if (isTransientNetworkError(err)) return true;
+    return switch (err) {
+        error.TransientNetwork,
+        error.RateLimited,
+        error.ServerError,
+        error.BadGateway,
+        error.ServiceUnavailable,
+        => true,
+        else => false,
+    };
+}
+
+/// 重试退避(对齐 CC getRetryDelay):min(base * 2^(attempt-1), 32000) + jitter(0~25%)。
+/// attempt 从 1 起。base_ms 可注入(测试用小值避免真 sleep)。jitter 用 attempt 派生(确定性,
+/// 不引入全局 rng;测试可预测)。
+pub fn retryDelayMs(attempt: u32, base_ms: u64) u64 {
+    const shift: u6 = @min(@as(u6, @intCast(@min(attempt -| 1, 16))), 6);
+    const base = @min(base_ms << shift, 32_000);
+    // jitter:0~25% of base,由 attempt 派生(确定性)。
+    const jitter = (base / 4) * (@as(u64, attempt) % 5) / 5;
+    return base + jitter;
+}
+
+/// 默认重试次数(对齐 CC DEFAULT_MAX_RETRIES=10;env CLAUDE_CODE_MAX_RETRIES 覆盖)。
+pub fn defaultMaxRetries() u32 {
+    if (std.c.getenv("CLAUDE_CODE_MAX_RETRIES")) |v_c| {
+        const v = std.mem.span(v_c);
+        return std.fmt.parseInt(u32, v, 10) catch 10;
+    }
+    return 10;
+}
+
+pub const RETRY_BASE_MS: u64 = 500;
+
+/// 重试 UI 上报回调(agent_loop 注入,把 attempt/max/delay 渲染成 "Retrying in Ns…")。
+/// state 类型擦除(指向 stdout_writer 等);headless 传 null。
+pub const RetryReporter = struct {
+    state: *anyopaque,
+    report: *const fn (state: *anyopaque, attempt: u32, max: u32, delay_ms: u64) void,
+};
+
+/// 可中断 sleep:分片 sleep(每 ≤50ms 查一次 abort)。返回 true=睡满,false=被 abort 打断。
+pub fn interruptibleSleepMs(total_ms: u64, abort: ?*const AbortSignal) bool {
+    const step_ms: u64 = 50;
+    var slept: u64 = 0;
+    while (slept < total_ms) {
+        if (abort) |a| if (a.isAborted()) return false;
+        const chunk = @min(step_ms, total_ms - slept);
+        // chunk ≤ 50ms < 1s → sec=0;nsec=chunk*1e6(用字面量风格,运行时值经 @as 显式标注)。
+        const ns: i64 = @as(i64, @intCast(chunk)) * 1_000_000;
+        var req = std.c.timespec{ .sec = 0, .nsec = ns };
+        var rem: std.c.timespec = undefined;
+        _ = std.c.nanosleep(&req, &rem);
+        slept += chunk;
+    }
+    if (abort) |a| if (a.isAborted()) return false;
+    return true;
+}
+
 /// API 客户端
 pub const Client = struct {
     allocator: std.mem.Allocator,
@@ -219,6 +301,43 @@ pub const Client = struct {
         }
     }
 
+    /// 建连阶段重试包装(对齐 CC withRetry)。仅覆盖 sendMessageStreamFull(建连+收头),
+    /// 此时流尚未消费、未输出任何文本 → 从头重发安全。可重试错误(瞬态网络/429/5xx)按
+    /// 指数退避重试,最多 max_retries 次;UI 经 reporter 回调(前 3 次由 reporter 自行降噪)。
+    /// retry_base_ms=0 时用默认 RETRY_BASE_MS(测试注入小值避免真 sleep)。
+    pub fn sendMessageStreamFullRetry(
+        client: *Client,
+        messages: []const types.ApiMessage,
+        system: ?[]const u8,
+        tools: ?[]const json_mod.ToolDefinition,
+        abort: ?*const AbortSignal,
+        model_override: ?[]const u8,
+        tool_choice: ?json_mod.ToolChoice,
+        max_retries: u32,
+        retry_base_ms: u64,
+        reporter: ?RetryReporter,
+    ) !StreamResponse {
+        const base_ms = if (retry_base_ms > 0) retry_base_ms else RETRY_BASE_MS;
+        var attempt: u32 = 0;
+        while (true) {
+            const r = client.sendMessageStreamFull(messages, system, tools, abort, model_override, tool_choice);
+            if (r) |stream| {
+                return stream;
+            } else |err| {
+                attempt += 1;
+                if (!isRetriableError(err) or attempt >= max_retries) {
+                    log.err("client", "stream connect failed after {d} attempt(s): {s}", .{ attempt, @errorName(err) });
+                    return err;
+                }
+                const delay = retryDelayMs(attempt, base_ms);
+                if (reporter) |rep| rep.report(rep.state, attempt, max_retries, delay);
+                log.warn("client", "stream connect retry {d}/{d} after {s}; sleeping {d}ms", .{ attempt, max_retries, @errorName(err), delay });
+                // 可中断 sleep:每 50ms 查一次 abort。
+                if (!interruptibleSleepMs(delay, abort)) return error.Aborted;
+            }
+        }
+    }
+
     fn doRequest(client: *Client, body: []const u8, streaming: bool) !RequestResult {
         const rid = log.genRequestId();
         const t_start = timestampMs();
@@ -275,6 +394,7 @@ pub const Client = struct {
         // 发送 body
         req_ptr.sendBodyComplete(@constCast(body)) catch |err| {
             log.errId("client", rid, "sendBody failed: {s}", .{@errorName(err)});
+            if (isTransientNetworkError(err)) return error.TransientNetwork;
             return error.RequestFailed;
         };
 
@@ -282,6 +402,8 @@ pub const Client = struct {
         var redirect_buf: [4096]u8 = undefined;
         const http_response = req_ptr.receiveHead(&redirect_buf) catch |err| {
             log.errId("client", rid, "receiveHead failed: {s}", .{@errorName(err)});
+            // 网络瞬态错误(服务端关连接等)上抛区分性 error,让重试层识别;非瞬态塌缩 RequestFailed。
+            if (isTransientNetworkError(err)) return error.TransientNetwork;
             return error.RequestFailed;
         };
 
@@ -664,15 +786,15 @@ pub fn withRetry(
 
         const result = client.sendMessage(messages, system, tools);
         switch (result) {
-            error.RateLimited, error.ServerError, error.BadGateway, error.ServiceUnavailable => |err| {
-                const delay_ms = @as(u64, 1000) * (@as(u64, 1) << @min(@as(u6, @intCast(retries)), 5));
+            error.TransientNetwork, error.RateLimited, error.ServerError, error.BadGateway, error.ServiceUnavailable => |err| {
+                const delay_ms = retryDelayMs(retries + 1, RETRY_BASE_MS);
                 log.warn("client", "retry {d}/{d} after {s}; sleeping {d}ms", .{
                     retries + 1,
                     max_retries,
                     @errorName(err),
                     delay_ms,
                 });
-                std.time.sleep(delay_ms * std.time.ns_per_ms);
+                _ = interruptibleSleepMs(delay_ms, null);
                 continue;
             },
             else => return result,

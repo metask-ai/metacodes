@@ -29,6 +29,9 @@ pub const MockServer = struct {
     cassette: ?[]const []const u8 = null,
     /// cassette 当前轮游标(serveLoop 递增)。
     cassette_pos: usize = 0,
+    /// flaky 模式:前 N 个连接读完请求后直接 close 不写响应(模拟服务端建连阶段断连,
+    /// 客户端 receiveHead 拿到 ConnectionClosing/EOF)。serveLoop 每断一次递减,归 0 后正常服务。
+    flaky_close_remaining: usize = 0,
 
     pub fn start(body: []const u8, chunk_delay_ms: u32) !*MockServer {
         return startWithStatus(body, chunk_delay_ms, "HTTP/1.1 200 OK");
@@ -105,6 +108,43 @@ pub const MockServer = struct {
             .body = if (bodies.len > 0) bodies[bodies.len - 1] else "",
             .chunk_delay_ms = chunk_delay_ms,
             .cassette = bodies,
+        };
+        self.thread = try std.Thread.spawn(.{}, serveLoop, .{self});
+        return self;
+    }
+
+    /// flaky 模式:前 close_first_n 个连接读完请求后直接断开(不写响应),之后正常回 body。
+    /// 用于测试网络瞬态错误重试:客户端前 N 次 receiveHead 失败、第 N+1 次成功。
+    /// close_first_n 很大(如 99)= 永远断,测重试耗尽。body 借用 caller(server 存活期间有效)。
+    pub fn startFlaky(body: []const u8, close_first_n: usize) !*MockServer {
+        const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+        if (fd < 0) return error.SocketFailed;
+        errdefer _ = std.c.close(fd);
+
+        const yes: c_int = 1;
+        _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, &yes, @sizeOf(c_int));
+
+        var addr = std.c.sockaddr.in{
+            .family = std.c.AF.INET,
+            .port = 0,
+            .addr = 0x0100007f,
+            .zero = [_]u8{0} ** 8,
+        };
+        if (std.c.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) < 0) return error.BindFailed;
+        if (std.c.listen(fd, 16) < 0) return error.ListenFailed;
+
+        var bound: std.c.sockaddr.in = undefined;
+        var blen: std.c.socklen_t = @sizeOf(@TypeOf(bound));
+        if (std.c.getsockname(fd, @ptrCast(&bound), &blen) < 0) return error.GetSocknameFailed;
+        const port = std.mem.bigToNative(u16, bound.port);
+
+        const self = try std.heap.page_allocator.create(MockServer);
+        self.* = .{
+            .listen_fd = fd,
+            .port = port,
+            .thread = undefined,
+            .body = body,
+            .flaky_close_remaining = close_first_n,
         };
         self.thread = try std.Thread.spawn(.{}, serveLoop, .{self});
         return self;
@@ -224,6 +264,13 @@ pub const MockServer = struct {
             self.captured_buf = buf;
             self.captured_len = total;
             self.captured_ready.store(1, .release);
+
+            // flaky:前 N 个连接读完请求后直接断开(不写响应)→ 客户端 receiveHead 失败。
+            if (self.flaky_close_remaining > 0) {
+                self.flaky_close_remaining -= 1;
+                _ = std.c.close(conn_fd);
+                continue;
+            }
 
             sendResponse(conn_fd, self);
             _ = std.c.close(conn_fd);

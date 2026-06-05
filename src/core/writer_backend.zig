@@ -1,0 +1,109 @@
+//! WriterBackend:把 UiBackend vtable 接到一个"只收字节"的 sink(print-only writer)。
+//!
+//! 塌缩旧 4 种 print-only writer(DebugWriter/SilentWriter/NullWriter/SinkWriter)——
+//! 它们只有 `print`,区别仅在字节去向(std.debug.print / 丢弃 / 丢弃 / 追加 job buf)。
+//! WriterBackend 参数化一个 `sink` fn-ptr(ctx, bytes),由调用点提供适配器。
+//!
+//! 字节精确(对齐旧 agent_loop 直 print):旧 print-only writer 因 comptime @hasDecl
+//! 守卫,卡/进度分支编译期消失——它们从不收卡字节,只收 text/颜色括号/auto-compact 行/
+//! verbose 行/尾换行。故 WriterBackend:
+//!   .stream_begin       → colorize ? sink("\x1b[32m")
+//!   .text_chunk         → sink(t)
+//!   .auto_compact       → sink(格式化行)
+//!   .retry_notice       → [门控] sink("Retrying in Ns…")
+//!   .tool_start{card=f}  → verbose ? sink("\n\x1b[35m[Tool: name]\x1b[0m")
+//!   .stream_done        → sink(colorize ? "\x1b[0m\n" : "\n")
+//!   其余(卡/spinner/progress/usage/phase) → no-op
+//! poll → 恒 null(print-only sink 无输入端)。
+
+const std = @import("std");
+const ui_backend = @import("../repl/ui_backend.zig");
+const ui_event = @import("../repl/ui_event.zig");
+
+const CoreEvent = ui_event.CoreEvent;
+const UiEvent = ui_event.UiEvent;
+const UiBackend = ui_backend.UiBackend;
+
+pub const WriterBackend = struct {
+    /// sink 适配器:把字节交给底层(std.debug.print / job buf / 丢弃)。
+    sink_ctx: *anyopaque,
+    sink: *const fn (ctx: *anyopaque, bytes: []const u8) void,
+    colorize: bool = false,
+    verbose: bool = false,
+    show_retry: bool = false,
+
+    /// null sink:丢弃所有字节(SilentWriter/NullWriter 等价)。
+    pub fn nullSink(_: *anyopaque, _: []const u8) void {}
+
+    /// 便利:构造一个丢弃一切的 WriterBackend(headless/subagent/测试)。
+    pub fn initNull() WriterBackend {
+        return .{ .sink_ctx = undefined, .sink = nullSink };
+    }
+
+    pub fn backend(self: *WriterBackend) UiBackend {
+        return .{
+            .ctx = @ptrCast(self),
+            .emit = emitThunk,
+            .poll = pollThunk,
+        };
+    }
+
+    fn emitThunk(ctx: *anyopaque, ev: CoreEvent) void {
+        const self: *WriterBackend = @ptrCast(@alignCast(ctx));
+        self.emitImpl(ev);
+    }
+
+    fn pollThunk(_: *anyopaque) ?UiEvent {
+        return null; // print-only sink 无输入端
+    }
+
+    inline fn emit(self: *WriterBackend, bytes: []const u8) void {
+        self.sink(self.sink_ctx, bytes);
+    }
+
+    fn emitImpl(self: *WriterBackend, ev: CoreEvent) void {
+        switch (ev) {
+            .stream_begin => {
+                if (self.colorize) self.emit("\x1b[32m");
+            },
+            .text_chunk => |t| self.emit(t),
+            .tool_start => |s| {
+                // 仅 verbose 普通工具行(对齐旧 agent_loop:387);card=true / 起始卡 no-op。
+                if (!s.card and self.verbose) {
+                    var buf: [256]u8 = undefined;
+                    const v = std.fmt.bufPrint(&buf, "\n\x1b[35m[Tool: {s}]\x1b[0m", .{s.name}) catch return;
+                    self.emit(v);
+                }
+            },
+            .auto_compact => |c| {
+                var buf: [256]u8 = undefined;
+                const s = std.fmt.bufPrint(
+                    &buf,
+                    "\x1b[33m[auto-compacted {d} old messages, kept last {d}]\x1b[0m\n",
+                    .{ c.dropped, c.kept },
+                ) catch return;
+                self.emit(s);
+            },
+            .retry_notice => |r| {
+                if (!self.show_retry) return;
+                if (r.attempt < 3) return;
+                const secs = (r.delay_ms + 999) / 1000;
+                var buf: [256]u8 = undefined;
+                const s = if (self.colorize)
+                    std.fmt.bufPrint(&buf, "\x1b[2mRetrying in {d}s… (attempt {d}/{d})\x1b[0m\n", .{ secs, r.attempt, r.max }) catch return
+                else
+                    std.fmt.bufPrint(&buf, "Retrying in {d}s… (attempt {d}/{d})\n", .{ secs, r.attempt, r.max }) catch return;
+                self.emit(s);
+            },
+            .stream_done => {
+                self.emit(if (self.colorize) "\x1b[0m\n" else "\n");
+            },
+            // print-only sink 不收这些(旧 @hasDecl 守卫即编译期消失):
+            .set_current_tool, .clear_current_tool, .tool_progress, .tool_result, .usage, .phase_change => {},
+        }
+    }
+};
+
+test {
+    std.testing.refAllDecls(@This());
+}

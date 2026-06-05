@@ -27,6 +27,11 @@ pub const CaptureWriter = struct {
         try self.buf.appendSlice(self.allocator, bytes);
     }
 
+    /// 别名:兼容 anytype writer 接口(ui.render 用 writeAll,std.Io.Writer 同名)。
+    pub fn writeAll(self: *CaptureWriter, bytes: []const u8) !void {
+        try self.buf.appendSlice(self.allocator, bytes);
+    }
+
     pub fn print(self: *CaptureWriter, comptime fmt: []const u8, args: anytype) !void {
         const s = try std.fmt.allocPrint(self.allocator, fmt, args);
         defer self.allocator.free(s);

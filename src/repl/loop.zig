@@ -24,6 +24,20 @@ const render_region_mod = @import("tui/render_region.zig");
 const msg_queue_mod = @import("msg_queue.zig");
 const tui_term_root = @import("tui/term.zig");
 const util_fs = @import("../util/fs.zig");
+const ui_backend_mod = @import("ui_backend.zig");
+const writer_backend_mod = @import("../core/writer_backend.zig");
+const tui_backend_mod = @import("tui/tui_backend.zig");
+
+/// 把 CoreEvent 的字节写到 std.debug.print(stderr)——非 TTY 交互 / cron / skill 等场景。
+/// 对齐旧 DebugWriter.print 行为。
+fn debugSink(_: *anyopaque, bytes: []const u8) void {
+    std.debug.print("{s}", .{bytes});
+}
+
+/// 建一个走 std.debug.print 的 WriterBackend(colorize=true 复刻旧 DebugWriter 继承的默认)。
+fn debugBackend(verbose: bool, show_retry: bool) writer_backend_mod.WriterBackend {
+    return .{ .sink_ctx = undefined, .sink = debugSink, .colorize = true, .verbose = verbose, .show_retry = show_retry };
+}
 
 pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     std.debug.print("Metacode Super\nType your message or /help for commands\n\n", .{});
@@ -31,7 +45,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     // 启动 prompt 建议:基于 git 最近改动的文件给一条灰色提示(对齐 Claude Code)
     printStartupSuggestion(allocator);
 
-    var writer = DebugWriter{};
+    // 顶层 REPL 的辅助 backend(cron/skill/retry 等非主对话路径用):走 std.debug.print。
+    // 主对话路径在生成期单独构造 TuiBackend/WriterBackend(见下)。
+    var aux_wb = debugBackend(app.config.verbose, true);
+    const aux_be = aux_wb.backend();
     var history = history_mod.History.init(allocator);
     defer history.deinit();
 
@@ -55,7 +72,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
 
     while (true) {
         // 检查到期的 cron 任务 —— 把它们的 prompt 作为 user message 注入并跑一轮
-        try fireDueCrons(app, allocator, &writer);
+        try fireDueCrons(app, allocator, &aux_be);
 
         // tty:输入框(含状态/footer)由 readLineRaw 内的 RenderRegion 自画(钉底)。
         // 非 tty:保留裸 "> " prompt 供 pipe 模式可读。
@@ -141,6 +158,39 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             , .{});
             continue;
         }
+        // 行首单独 `?` → 快捷键帮助(对齐 CC `?` for shortcuts)。仅整行 trim 后 == "?" 触发,
+        // 不拦截含 ? 的正常句子。
+        // 注:tty 下 `?` 由 overlay(dispatch)即时拦截、永不提交到这;此分支是 headless/非-tty
+        // fallback(headless 无 overlay,`?` 提交后打帮助文本)。
+        if (std.mem.eql(u8, trimmed, "?")) {
+            std.debug.print(
+                \\Keyboard shortcuts:
+                \\  Enter              Submit
+                \\  Shift+Enter        Insert newline (CSI-u terminals)
+                \\  Ctrl+A / Ctrl+E    Start / end of line
+                \\  Alt+B / Alt+F      Word back / forward
+                \\  Ctrl+U / Ctrl+K    Kill to start / end of line
+                \\  Ctrl+W             Delete previous word
+                \\  Ctrl+Y             Yank (paste last kill)
+                \\  Ctrl+_             Undo
+                \\  Ctrl+R             Reverse history search
+                \\  Up / Down          History prev / next
+                \\  Ctrl+L             Clear screen
+                \\  Ctrl+T             Toggle task list
+                \\  Ctrl+O             Open transcript viewer
+                \\  Ctrl+G             Edit buffer in $EDITOR
+                \\  Shift+Tab          Cycle permission mode
+                \\  Ctrl+X Ctrl+K      Kill background tasks
+                \\  Esc                Interrupt current task
+                \\  Esc Esc            Clear draft (when idle)
+                \\  Ctrl+C             Cancel / exit (twice when empty)
+                \\  Ctrl+D             EOF / exit when empty
+                \\  !<cmd>             Run shell command
+                \\  /help              List commands
+                \\
+            , .{});
+            continue;
+        }
         if (std.mem.eql(u8, trimmed, "/clear")) {
             std.debug.print("\x1b[2J\x1b[H", .{});
             continue;
@@ -197,7 +247,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/retry")) {
-            try retryLast(app, allocator, &writer);
+            try retryLast(app, allocator, &aux_be);
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/cost")) {
@@ -304,12 +354,12 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         if (std.mem.eql(u8, trimmed, "/commit")) {
             try app.conversation.appendText(.user, COMMIT_PROMPT);
             // 不 continue，让下面主流程跑一轮
-            try runInjectedAgent(app, allocator, &writer);
+            try runInjectedAgent(app, allocator, &aux_be);
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/review")) {
             try app.conversation.appendText(.user, REVIEW_PROMPT);
-            try runInjectedAgent(app, allocator, &writer);
+            try runInjectedAgent(app, allocator, &aux_be);
             continue;
         }
 
@@ -364,51 +414,46 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         const gen_raw_orig: ?std.c.termios = if (tty) input.enterRawMode(stdin_fd) else null;
         defer if (gen_raw_orig) |o| input.restoreMode(stdin_fd, o);
 
-        // 生成期间启动 stdin 监听 + spinner 驱动线程:跑 LineEditor;回车入队;Esc 两档;超时 tickSpinner
-        var watcher_stop = std.atomic.Value(bool).init(false);
-        const region_ptr: ?*render_region_mod.RenderRegion = if (gen_region) |*r| r else null;
-        const watcher_thread = if (tty) try std.Thread.spawn(
-            .{},
-            stdinAbortWatcher,
-            .{ stdin_fd, &app.abort, &watcher_stop, region_ptr, @as(?*const app_mod.App, app), @as(?*msg_queue_mod.MsgQueue, &msg_queue), allocator },
-        ) else null;
-
         const usage_sink = app.usageSink();
         const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*j| j else null;
-        const result = blk: {
-            if (region_writer) |*rw| {
-                break :blk agent_loop.run(
-                    &app.conversation,
-                    &app.api_client,
-                    app.tool_defs,
-                    &app.permission_ctx,
-                    .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .activate_tool_state = @ptrCast(app), .activate_tool_fn = &app_mod.App.activateToolTrampoline, .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .tool_render_theme = &app.theme },
-                    rw,
-                    allocator,
-                );
-            } else {
-                break :blk agent_loop.run(
-                    &app.conversation,
-                    &app.api_client,
-                    app.tool_defs,
-                    &app.permission_ctx,
-                    .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .activate_tool_state = @ptrCast(app), .activate_tool_fn = &app_mod.App.activateToolTrampoline, .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .tool_render_theme = &app.theme },
-                    &writer,
-                    allocator,
-                );
-            }
-        } catch |err| {
+        // UI backend:TUI 路径用 TuiBackend(包 region,渲染工具卡 + 颜色 + owns 生成期键盘输入);
+        // 非 TTY 用 WriterBackend(走 std.debug.print)。两者实现同一 UiBackend vtable。
+        // 阶段 C:生成期 stdin watcher 线程归 TuiBackend(startInput/stopInput),loop 不再硬编码。
+        //
+        // 生命周期约束(隐式但必须守):`tui_be` 必须在整个生成期(直到 stopInput 返回)保持
+        // 栈存活且**地址不被移动**。`ui_be.ctx` = `@ptrCast(&tui_be.?)`(经 `if(tui_be)|*tb|`
+        // capture,指向 optional payload 在 tui_be 内部的稳定地址),watcher 线程的 `self` 也是
+        // 同一地址——agent_loop(emit)与 watcher(键盘)共享这一个 TuiBackend 实例。
+        // 不要把 tui_be 重新赋值 / 搬移 / 放进会 realloc 的容器,否则两个指针指向坟墓。
+        var tui_be: ?tui_backend_mod.TuiBackend = if (region_writer) |*rw|
+            .{ .region = rw.region, .theme = &app.theme, .alloc = allocator, .colorize = true, .verbose = app.config.verbose, .show_retry = true, .usage_acc = null, .queue = &msg_queue, .abort_signal = &app.abort, .input_abort = &app.abort }
+        else
+            null;
+        var fallback_be = debugBackend(app.config.verbose, true);
+        const ui_be: ui_backend_mod.UiBackend = if (tui_be) |*tb| tb.backend() else fallback_be.backend();
+
+        // 生成期键盘监听:仅 tty + 有 TuiBackend 时启动(回车入队 / Esc 中断 / 超时 tickSpinner)。
+        if (tty) {
+            if (tui_be) |*tb| try tb.startInput(stdin_fd, app, allocator);
+        }
+        const result = agent_loop.run(
+            &app.conversation,
+            &app.api_client,
+            app.tool_defs,
+            &app.permission_ctx,
+            .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .activate_tool_state = @ptrCast(app), .activate_tool_fn = &app_mod.App.activateToolTrampoline, .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .tool_render_theme = &app.theme },
+            &ui_be,
+            allocator,
+        ) catch |err| {
             // 停 watcher + 清 stdin 缓冲
-            watcher_stop.store(true, .release);
-            if (watcher_thread) |t| t.join();
+            if (tui_be) |*tb| tb.stopInput();
             if (gen_region) |*r| r.leaveGenerating(app);
             if (tty) drainStdin(stdin_fd);
             std.debug.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
             continue;
         };
         // 停 watcher + 清 stdin 缓冲（生成期间用户可能误按的键，别污染下一轮）
-        watcher_stop.store(true, .release);
-        if (watcher_thread) |t| t.join();
+        if (tui_be) |*tb| tb.stopInput();
         if (gen_region) |*r| r.leaveGenerating(app);
         if (tty) drainStdin(stdin_fd);
 
@@ -425,93 +470,6 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             std.debug.print("\x1b[33m^C (cancelled)\x1b[0m\n", .{});
             app.abort.resetForTesting();
         }
-    }
-}
-
-/// 生成期 stdin 监听线程:跑一个真正的 LineEditor(对齐 Claude Code)。
-///
-/// poll(fd, 100ms):超时 → region.tickSpinner(推进 spinner)。有字节:
-///   - 回车 → editor 非空则入待发送队列(msg_queue),清空 editor,重画(队列预览 + 空框)
-///   - Esc  → editor 非空则清空 editor(不中断);editor 空则 abort 当前推理(队列保留)
-///   - 其它(字符/退格/←→/Home/End/...) → editor.handle → 重画(输入框 = editor 内容,光标落编辑点)
-/// 字符只停输入框、不提交;回车才入队;队列由主循环在本轮结束后逐条续发。
-fn stdinAbortWatcher(
-    fd: std.c.fd_t,
-    abort: *@import("../util/abort.zig").AbortSignal,
-    stop: *std.atomic.Value(bool),
-    region: ?*render_region_mod.RenderRegion,
-    app: ?*const app_mod.App,
-    queue: ?*msg_queue_mod.MsgQueue,
-    allocator: std.mem.Allocator,
-) void {
-    var parser = input.KeyParser{}; // 本线程独占,不持锁
-    var editor = input.LineEditor.init(allocator);
-    defer editor.deinit();
-
-    // 处理一个已解析出的 Key(feed 出的 or flushEsc 出的孤立 ESC)。
-    const handleKey = struct {
-        fn call(
-            key: input.Key,
-            ed: *input.LineEditor,
-            rg: ?*render_region_mod.RenderRegion,
-            ap: ?*const app_mod.App,
-            q: ?*msg_queue_mod.MsgQueue,
-            ab: *@import("../util/abort.zig").AbortSignal,
-        ) void {
-            switch (key) {
-                .enter, .shift_enter, .ctrl_enter => {
-                    // 回车 → 入待发送队列(非空才入),清空输入框。不立即发。
-                    const v = ed.view();
-                    const trimmed = std.mem.trim(u8, v, " \t\r\n");
-                    if (trimmed.len > 0) {
-                        if (q) |qq| _ = qq.push(v);
-                    }
-                    ed.clear();
-                },
-                .esc => {
-                    // Esc 两档:框有内容 → 清空(不中断);框空 → 中断当前推理(队列保留 → 中断后续发)。
-                    if (ed.view().len > 0) {
-                        ed.clear();
-                    } else {
-                        ab.abort(.user_ctrl_c);
-                        return; // 中断不重画(主线程很快收尾)
-                    }
-                },
-                else => {
-                    _ = ed.handle(key) catch {};
-                },
-            }
-            if (rg) |r| {
-                if (ap) |a| {
-                    r.setGenInput(ed.view(), ed.cursor);
-                    r.redrawGen(a);
-                }
-            }
-        }
-    }.call;
-
-    while (!stop.load(.acquire)) {
-        // ESC 待决时用短超时(40ms)→ 孤立 ESC 快速兑现为中断;否则常规 100ms tick。
-        const timeout_ms: i32 = if (parser.pendingEsc()) 40 else 100;
-        var pfd = [_]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
-        const rc = std.c.poll(&pfd, 1, timeout_ms);
-        if (rc <= 0) {
-            // 超时:孤立 ESC 兑现 → 处理(可能中断);否则推进 spinner。
-            if (parser.flushEsc()) |k| {
-                handleKey(k, &editor, region, app, queue, abort);
-            } else if (region) |r| {
-                if (app) |a| r.tickSpinner(a);
-            }
-            continue;
-        }
-        if ((pfd[0].revents & std.c.POLL.IN) == 0) continue;
-
-        var b: [1]u8 = undefined;
-        const n = std.c.read(fd, &b, 1);
-        if (n <= 0) continue;
-
-        const key = parser.feed(b[0]) orelse continue; // 多字节(UTF-8/CSI)攒够再出 Key
-        handleKey(key, &editor, region, app, queue, abort);
     }
 }
 
@@ -744,6 +702,17 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
             try handlePaste(fd, &editor, &parser, allocator);
             redraw(&region, &editor, app);
             continue;
+        }
+
+        // 阶段1:overlay 分流(? help / Ctrl+O transcript)。非 vim 模式才介入。
+        // dispatch 判断"空 buffer + ?"依赖 editor 投影,调前同步。
+        if (!app.config.vim_mode) {
+            region.ui.editor = .{ .view = editor.view(), .cursor = editor.cursor };
+            const eff = region.applyEvent(app, &app.conversation, .{ .key = .{ .key = key } });
+            switch (eff.action) {
+                .pass_to_editor => {}, // 落到下面正常编辑
+                .none, .commit, .cancel, .exit => continue, // overlay 消费了(已重画),不喂 editor
+            }
         }
 
         const action = try editor.handle(key);
@@ -1069,7 +1038,7 @@ fn printHistory(history: *const history_mod.History) void {
 }
 
 /// /retry：找 conversation 里最后一条 user text，重发 agent_loop（不追加重复消息）。
-fn retryLast(app: *app_mod.App, allocator: std.mem.Allocator, writer: *DebugWriter) !void {
+fn retryLast(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui_backend_mod.UiBackend) !void {
     // 找最后一条 user 消息——删除所有后面的 assistant/user 回合，回到上一次 user 发出前的状态
     var idx: ?usize = null;
     var i = app.conversation.messages.items.len;
@@ -1101,7 +1070,7 @@ fn retryLast(app: *app_mod.App, allocator: std.mem.Allocator, writer: *DebugWrit
         app.tool_defs,
         &app.permission_ctx,
         .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry },
-        writer,
+        backend,
         allocator,
     ) catch |err| {
         std.debug.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
@@ -1720,8 +1689,10 @@ fn handleSkillInvocation(app: *app_mod.App, allocator: std.mem.Allocator, rest: 
     // 显示给用户看
     std.debug.print("\x1b[36m{s}\x1b[0m\n", .{skill_result});
 
-    // 让模型基于激活态回应
-    var writer = DebugWriter{};
+    // 让模型基于激活态回应。WriterBackend/std.debug.print:tool_render_theme 虽传,但
+    // print-only backend 的工具卡事件 no-op(对齐旧 DebugWriter 经 @hasDecl 编译期消失)。
+    var wb = debugBackend(app.config.verbose, true);
+    const be = wb.backend();
     const usage_sink = app.usageSink();
     const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*jr| jr else null;
     const result = agent_loop.run(
@@ -1730,7 +1701,7 @@ fn handleSkillInvocation(app: *app_mod.App, allocator: std.mem.Allocator, rest: 
         app.tool_defs,
         &app.permission_ctx,
         .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .tool_render_theme = &app.theme },
-        &writer,
+        &be,
         allocator,
     ) catch |err| {
         std.debug.print("\x1b[31mError after /{s}: {s}\x1b[0m\n", .{ head, @errorName(err) });
@@ -1969,7 +1940,7 @@ fn handleShellMode(app: *app_mod.App, allocator: std.mem.Allocator, command: []c
 }
 
 /// 检查到期 cron,逐个把其 prompt 作为 user message 注入并跑一轮 agent_loop。
-fn fireDueCrons(app: *app_mod.App, allocator: std.mem.Allocator, writer: *DebugWriter) !void {
+fn fireDueCrons(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui_backend_mod.UiBackend) !void {
     const due = app.cron_registry.collectDue(allocator) catch return;
     defer {
         for (due) |p| allocator.free(p);
@@ -1978,12 +1949,12 @@ fn fireDueCrons(app: *app_mod.App, allocator: std.mem.Allocator, writer: *DebugW
     for (due) |prompt| {
         std.debug.print("\x1b[2m[cron fired]\x1b[0m {s}\n", .{prompt});
         try app.conversation.appendText(.user, prompt);
-        try runInjectedAgent(app, allocator, writer);
+        try runInjectedAgent(app, allocator, backend);
     }
 }
 
 /// 把预置 prompt 注入为 user message 后触发一次 agent_loop 执行。
-fn runInjectedAgent(app: *app_mod.App, allocator: std.mem.Allocator, writer: *DebugWriter) !void {
+fn runInjectedAgent(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui_backend_mod.UiBackend) !void {
     const usage_sink = app.usageSink();
     const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*jr| jr else null;
     const result = agent_loop.run(
@@ -1992,7 +1963,7 @@ fn runInjectedAgent(app: *app_mod.App, allocator: std.mem.Allocator, writer: *De
         app.tool_defs,
         &app.permission_ctx,
         .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry },
-        writer,
+        backend,
         allocator,
     ) catch |err| {
         std.debug.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
@@ -2103,10 +2074,3 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
 
     std.debug.print("Resumed session ({d} messages). Continue by sending a message.\n", .{app.conversation.len()});
 }
-
-/// 最小 writer，把格式化输出走 stderr（与 std.debug.print 同通道）。
-const DebugWriter = struct {
-    pub fn print(_: *@This(), comptime fmt: []const u8, args: anytype) !void {
-        std.debug.print(fmt, args);
-    }
-};

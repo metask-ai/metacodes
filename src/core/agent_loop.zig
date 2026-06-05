@@ -20,6 +20,10 @@ const api_stream = @import("../api/stream.zig");
 const tool_error = @import("tool_error.zig");
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
+const ui_backend = @import("../repl/ui_backend.zig");
+const ui_event = @import("../repl/ui_event.zig");
+const UiBackend = ui_backend.UiBackend;
+const CoreEvent = ui_event.CoreEvent;
 
 pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error, tool_loop };
 
@@ -135,9 +139,9 @@ pub const Options = struct {
     mcp_sessions: ?*const []@import("../app.zig").McpSessionEntry = null,
     /// Cron registry(CronCreate/Delete/List 用)。
     cron_registry: ?*@import("cron_registry.zig").CronRegistry = null,
-    /// 实时工具卡渲染主题(REPL 用):非 null 时,每个工具执行后把结果经
-    /// tool_card.renderResult 渲染到 stdout_writer(Edit diff 着色 / 搜索摘要 / Read 摘要)。
-    /// null(headless/单测)→ 不渲染,保持纯净输出。
+    /// 实时工具卡渲染主题(REPL 用):非 null 时,每个工具执行后 emit tool_result,
+    /// 由 backend(TuiBackend)经 renderResult 渲染(Edit diff 着色 / 搜索摘要 / Read 摘要)。
+    /// null(headless/单测)→ 不 emit 工具卡事件,保持纯净输出。
     tool_render_theme: ?*const @import("../repl/tui/theme.zig").Theme = null,
     /// 是否给 assistant 流式文本加 ANSI 着色(\x1b[32m…)。前台交互 REPL = true;
     /// 后台 subagent(输出经 SinkWriter 进可查询缓冲)/headless = false,否则 final_text
@@ -146,15 +150,17 @@ pub const Options = struct {
     /// 实时进度回调(后台 subagent 用):每轮开始 + 每个工具执行前调用,
     /// 把 (turn, tool_name, tool_input) 写回调用方(JobEntry)。null = 不上报(前台/headless/同步)。
     /// state 经类型擦除传 *JobEntry,progress_fn 是其 trampoline。tool_input 为工具原始
-    /// input JSON(供动作行渲染参数预览);仅更新轮次时传空。
+    /// input JSON(供动作行渲染参数预览);仅更新轮次时传空。tool_calls 为截至当前的累计
+    /// 工具调用数(供 subagent 树 `· N tools ·` 实时显示)。
     progress_state: ?*anyopaque = null,
-    progress_fn: ?*const fn (state: *anyopaque, turn: u32, tool_name: []const u8, tool_input: []const u8) void = null,
+    progress_fn: ?*const fn (state: *anyopaque, turn: u32, tool_name: []const u8, tool_input: []const u8, tool_calls: u32) void = null,
 };
 
 /// 内部:发一次进度上报(turn 1-based;tool_name/tool_input 空 = 仅更新轮次)。
-fn reportProgress(opts: Options, turn: u32, tool_name: []const u8, tool_input: []const u8) void {
+/// tool_calls = 截至此刻累计工具调用数(单调,trampoline 持锁回写 JobEntry.tool_calls)。
+fn reportProgress(opts: Options, turn: u32, tool_name: []const u8, tool_input: []const u8, tool_calls: u32) void {
     if (opts.progress_fn) |f| {
-        if (opts.progress_state) |s| f(s, turn, tool_name, tool_input);
+        if (opts.progress_state) |s| f(s, turn, tool_name, tool_input, tool_calls);
     }
 }
 
@@ -174,15 +180,16 @@ pub const UsageSink = struct {
 /// 如果有 tool_use 则执行、追加 tool_result 到 conversation，继续下一轮。
 /// 直到没有 tool_use、turns 达到 max_turns、或 abort 触发。
 ///
-/// 每轮的 assistant 响应文字也通过 stdout_writer 实时输出（便于 REPL 看流）。
-/// stdout_writer 必须有 `print(fmt, args)` 方法（用 `anytype`）。
+/// 每轮的 assistant 响应文字也通过 backend 实时输出（便于 REPL 看流）。
+/// backend 是显式 vtable 契约(UiBackend):agent_loop 只发语义 CoreEvent,所有表达
+/// (ANSI 颜色 / 工具卡渲染)由 backend 实现(TuiBackend / WriterBackend)完成。
 pub fn run(
     conversation: *Conversation,
     api_client: *client_mod.Client,
     tool_defs: []const json_mod.ToolDefinition,
     permission_ctx: *const permission_mod.PermissionContext,
     opts: Options,
-    stdout_writer: anytype,
+    backend: *const UiBackend,
     allocator: std.mem.Allocator,
 ) !RunResult {
     var turns: u32 = 0;
@@ -209,7 +216,7 @@ pub fn run(
 
         // 进度上报:进入新一轮(1-based);空 tool 名 = 仅推进轮次,保留上一个工具
         // (trampoline 据空名跳过工具更新,对齐 cc 持续显示最近动作)。
-        reportProgress(opts, turns + 1, "", "");
+        reportProgress(opts, turns + 1, "", "", total_tool_calls);
 
         // 自动 compact：发请求前检查 token 估算,超阈值则保留最近 N 条。
         // 阈值 null 时 = input context window * 0.8(逼近 context 上限才压缩,留出回复空间)。
@@ -240,7 +247,7 @@ pub fn run(
             }.f) catch conversation.compactKeepRecent(opts.auto_compact_keep_recent);
             if (dropped > 0) {
                 log.info("agent", "auto-compact: dropped {d} old messages ({d} -> {d}) threshold={d}", .{ dropped, before, conversation.len(), auto_threshold });
-                try stdout_writer.print("\x1b[33m[auto-compacted {d} old messages, kept last {d}]\x1b[0m\n", .{ dropped, conversation.len() });
+                backend.emitEvent(.{ .auto_compact = .{ .dropped = @as(u32, @intCast(dropped)), .kept = @as(u32, @intCast(conversation.len())) } });
             }
         }
 
@@ -298,7 +305,29 @@ pub fn run(
             const model_for_req = opts.model_override orelse api_client.model;
             cache_detector.recordRequest(opts.system_prompt orelse "", tbuf[0..8], model_for_req);
         }
-        var stream = api_client.sendMessageStreamFull(api_messages.items, opts.system_prompt, effective_tool_defs, opts.abort, opts.model_override, null) catch |err| {
+        // 建连阶段重试(对齐 CC withRetry):瞬态网络错误/429/5xx 退避重试,UI 提示"Retrying…"。
+        // 仅覆盖建连+收头(未消费流、未输出文本);进入 stream.next() 后不再重试(已输出)。
+        // 门控/格式/着色全在 backend 的 .retry_notice 处理(show_retry/colorize)——此处只转发。
+        const RetryUi = struct {
+            be: *const UiBackend,
+            fn report(state: *anyopaque, attempt: u32, max: u32, delay_ms: u64) void {
+                const self: *@This() = @ptrCast(@alignCast(state));
+                self.be.emitEvent(.{ .retry_notice = .{ .attempt = attempt, .max = max, .delay_ms = delay_ms } });
+            }
+        };
+        var retry_ui = RetryUi{ .be = backend };
+        const reporter = client_mod.RetryReporter{ .state = @ptrCast(&retry_ui), .report = RetryUi.report };
+        var stream = api_client.sendMessageStreamFullRetry(
+            api_messages.items,
+            opts.system_prompt,
+            effective_tool_defs,
+            opts.abort,
+            opts.model_override,
+            null,
+            client_mod.defaultMaxRetries(),
+            0, // base_ms=0 → 用默认 RETRY_BASE_MS(500)
+            reporter,
+        ) catch |err| {
             log.err("agent", "sendMessageStream failed turn={d}: {s}", .{ turns + 1, @errorName(err) });
             return .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls };
         };
@@ -323,7 +352,7 @@ pub fn run(
         var tool_uses = std.ArrayList(msg.ToolUse).empty;
         defer tool_uses.deinit(allocator);
 
-        if (opts.colorize) try stdout_writer.print("\x1b[32m", .{});
+        if (opts.colorize) backend.emitEvent(.stream_begin);
         var aborted_during_stream = false;
         var stream_error = false;
         while (true) {
@@ -342,16 +371,15 @@ pub fn run(
             const ev = ev_opt orelse break;
             switch (ev) {
                 .text => |text| {
-                    try stdout_writer.print("{s}", .{text});
+                    backend.emitEvent(.{ .text_chunk = text });
                     try assistant_text.appendSlice(allocator, text);
                     log.debugId("agent", rid, "text chunk bytes={d}", .{text.len});
                     // text bytes 是 stream 分配的 owned——用完必须 free，否则泄漏
                     allocator.free(text);
                 },
                 .tool_use_start => |tu| {
-                    if (opts.verbose) {
-                        try stdout_writer.print("\n\x1b[35m[Tool: {s}]\x1b[0m", .{tu.name});
-                    }
+                    // verbose 的 `[Tool: name]` 行移到 backend(在 tool_start 渲染时打,
+                    // 见 TuiBackend/WriterBackend);此处只入队 tool_use。
                     log.infoId("agent", rid, "tool_use queued id={s} name={s} input_bytes={d}", .{ tu.id, tu.name, tu.input_json.len });
                     // stream 里 id/name/input_json 都是 owned；转移所有权给 tool_uses（不 dupe）
                     try tool_uses.append(allocator, .{
@@ -362,8 +390,9 @@ pub fn run(
                 },
                 .web_search_result => |w| {
                     // 主对话:照打 UI 装饰(⏺ Web Search ...),TUI 字节与旧版一致。
+                    // ui_text 是预渲染的可见 assistant 内容(例外:含 ANSI 但属"可见输出")。
                     // content_json(结构化结果)主对话不消费(仅 web_search.zig 子请求用)。
-                    try stdout_writer.print("{s}", .{w.ui_text});
+                    backend.emitEvent(.{ .text_chunk = w.ui_text });
                     try assistant_text.appendSlice(allocator, w.ui_text);
                     allocator.free(w.ui_text);
                     allocator.free(w.content_json);
@@ -382,11 +411,8 @@ pub fn run(
                 .done => {},
             }
         }
-        if (opts.colorize) {
-            try stdout_writer.print("\x1b[0m\n", .{});
-        } else {
-            try stdout_writer.print("\n", .{});
-        }
+        // 闭颜色括号 + 尾换行由 backend 决定(colorize ? "\x1b[0m\n" : "\n")。
+        backend.emitEvent(.stream_done);
 
         // 抓本轮 API 报告的 stop_reason(stream.deinit 前读;defer 在 turn 末才执行)
         const turn_stop_reason = stream.stopReason();
@@ -556,76 +582,73 @@ pub fn run(
             .cron_registry = opts.cron_registry,
         };
 
-        // 工具执行期 progress 通路(对齐 cc onProgress):若 stdout_writer 是支持
-        // setToolProgress 的 RenderRegion(顶层 TTY)→ 接 progress_fn 把 WebSearch 子请求的
-        // query_update/results_received 格式化成第二行文本喂 TUI。comptime 探测:headless/
-        // 普通 writer 无此方法 → 编译期消失,progress_fn 保持 null。
-        if (opts.agent_depth == 0 and comptime @hasDecl(@TypeOf(stdout_writer.*), "setToolProgress")) {
-            const Writer = @TypeOf(stdout_writer.*);
+        // 工具执行期 progress 通路(对齐 cc onProgress):把 WebSearch 子请求的
+        // query_update/results_received 格式化成第二行文本,经 backend.emit(.tool_progress) 喂 UI。
+        // depth==0 才接(子 agent 不驱动顶层 TUI)。WriterBackend 的 tool_progress no-op → 无害,
+        // 故去掉旧 @hasDecl 探测。
+        if (opts.agent_depth == 0) {
             const Tramp = struct {
                 fn cb(state: *anyopaque, id: []const u8, phase: tools_mod.ToolContext.ProgressPhase, text: []const u8, count: u32) void {
-                    const wr: *Writer = @ptrCast(@alignCast(state));
+                    const be: *const UiBackend = @ptrCast(@alignCast(state));
                     var buf: [192]u8 = undefined;
                     const line: []const u8 = switch (phase) {
                         // 对齐 cc UI.tsx:query_update→"Searching: q";results_received→"Found N results for "q"".
                         .query_update => std.fmt.bufPrint(&buf, "Searching: {s}", .{text}) catch text,
                         .results_received => std.fmt.bufPrint(&buf, "Found {d} results for \"{s}\"", .{ count, text }) catch text,
                     };
-                    wr.setToolProgress(id, line);
+                    // line 是栈 borrow,emit 同步消费(TuiBackend.setToolProgress 立即拷进定长卡)。
+                    be.emitEvent(.{ .tool_progress = .{ .id = id, .text = line } });
                 }
             };
-            base_ctx.progress_state = @ptrCast(stdout_writer);
+            base_ctx.progress_state = @constCast(@ptrCast(backend));
             base_ctx.progress_fn = &Tramp.cb;
         }
 
         // 6c. 分批并发执行(denied 的不动,run 的填 content)。
         // 过程态(TTY 顶层):执行前打起始卡 + 把"当前工具"喂进底部 spinner(由现有
         // tickSpinner 线程渲染,见 render_region)。headless/subagent(depth>0)/无 theme 跳过。
-        if (opts.tool_render_theme) |th| {
-            if (opts.agent_depth == 0) {
-                const tool_card = @import("../repl/tui/widget/tool_card.zig");
-                var first_tool: ?[]const u8 = null;
-                const has_card_writer = comptime @hasDecl(@TypeOf(stdout_writer.*), "addToolCard");
-                for (slots.items) |*s| {
-                    if (s.decision != .run) continue;
-                    if (tool_card.resultRenderMode(s.name) == .hidden) continue;
-                    // hasProgressCard 工具(WebSearch):执行中由动态区 per-toolUse 卡显示
-                    // (不打起始卡到滚动历史、不进 spinner 段)。每个 tool_use 一张卡(并发不互盖)。
-                    if (tool_card.hasProgressCard(s.name)) {
-                        if (has_card_writer) stdout_writer.addToolCard(s.id, s.name, util_time.nowMs());
-                        continue;
-                    }
-                    if (first_tool == null) first_tool = s.name;
-                    if (tool_card.renderStart(allocator, th.*, s.name, s.input) catch null) |card| {
-                        defer allocator.free(card);
-                        stdout_writer.print("{s}", .{card}) catch {};
-                    }
+        // 门控(showStartCard/hasProgressCard)留在此(纯分类器);渲染移入 backend。
+        if (opts.tool_render_theme != null and opts.agent_depth == 0) {
+            const tool_card = @import("../repl/tui/widget/tool_card.zig");
+            var first_tool: ?[]const u8 = null;
+            for (slots.items) |*s| {
+                if (s.decision != .run) continue;
+                // 起始卡门控:**B1 有意收紧**——旧版用 `resultRenderMode(s.name)==.hidden`,
+                // 现改 `showStartCard`(tool_card.zig)。差异:`Task`(精确名)结果是 hidden
+                // (状态走 Task 面板,不刷消息流)但**起始卡现在可见**——用户须看到 subagent
+                // 启动。其余(AskUserQuestion/EnterPlanMode/ExitPlanMode/Skill/未知工具)行为不变。
+                // 这是 showStartCard 与 resultRenderMode 的解耦:起始卡可见 ≠ 结果卡可见。
+                if (!tool_card.showStartCard(s.name)) continue;
+                // hasProgressCard 工具(WebSearch):执行中由动态区 per-toolUse 卡显示
+                // (不打起始卡到滚动历史、不进 spinner 段)。每个 tool_use 一张卡(并发不互盖)。
+                if (tool_card.hasProgressCard(s.name)) {
+                    backend.emitEvent(.{ .tool_start = .{ .id = s.id, .name = s.name, .input = s.input, .card = true } });
+                    continue;
                 }
-                // 喂普通工具给底部 spinner(hasProgressCard 工具走多卡,不喂 spinner)。
-                if (comptime @hasDecl(@TypeOf(stdout_writer.*), "setCurrentTool")) {
-                    if (first_tool) |name| stdout_writer.setCurrentTool(name, util_time.nowMs());
-                }
+                if (first_tool == null) first_tool = s.name;
+                // card=false:backend 渲染起始卡到滚动历史(renderStart)。
+                backend.emitEvent(.{ .tool_start = .{ .id = s.id, .name = s.name, .input = s.input, .card = false } });
             }
+            // 喂普通工具给底部 spinner(hasProgressCard 工具走多卡,不喂 spinner)。
+            if (first_tool) |name| backend.emitEvent(.{ .set_current_tool = .{ .name = name } });
         }
         // 进度上报:本轮第一个 run slot 的工具名 + 原始 input(subagent agent 树显示当前动作)。
         if (opts.progress_fn != null) {
             for (slots.items) |*s| {
                 if (s.decision == .run) {
-                    reportProgress(opts, turns + 1, s.name, s.input);
+                    reportProgress(opts, turns + 1, s.name, s.input, total_tool_calls);
                     break;
                 }
             }
         }
         tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
         if (opts.tool_render_theme != null and opts.agent_depth == 0) {
-            if (comptime @hasDecl(@TypeOf(stdout_writer.*), "clearCurrentTool")) {
-                stdout_writer.clearCurrentTool();
-            }
+            backend.emitEvent(.clear_current_tool);
             // 清掉本轮 hasProgressCard 工具的 per-toolUse 卡(完成卡由下方 renderResult 落历史)。
-            if (comptime @hasDecl(@TypeOf(stdout_writer.*), "clearToolCard")) {
-                const tool_card = @import("../repl/tui/widget/tool_card.zig");
-                for (slots.items) |*s| {
-                    if (s.decision == .run and tool_card.hasProgressCard(s.name)) stdout_writer.clearToolCard(s.id);
+            const tool_card = @import("../repl/tui/widget/tool_card.zig");
+            for (slots.items) |*s| {
+                if (s.decision == .run and tool_card.hasProgressCard(s.name)) {
+                    backend.emitEvent(.{ .tool_result = .{ .id = s.id, .name = s.name, .input = s.input, .content = "", .is_error = s.is_error, .card = true } });
                 }
             }
         }
@@ -657,15 +680,19 @@ pub fn run(
                 .is_error = s.is_error,
             } });
 
-            // 实时工具卡渲染(REPL):把结果经 tool_card 渲染到屏幕——Edit/Write diff 着色、
-            // Grep/Glob 摘要、Read 摘要。headless/单测 tool_render_theme=null → 跳过。
-            if (opts.tool_render_theme) |th| {
-                const tool_card = @import("../repl/tui/widget/tool_card.zig");
-                const kind: tool_card.ResultKind = if (s.is_error) .err else .ok;
-                if (tool_card.renderResult(allocator, th.*, s.name, s.input, content, kind, s.elapsed_ms, .{}) catch null) |card| {
-                    defer allocator.free(card);
-                    stdout_writer.print("{s}", .{card}) catch {};
-                }
+            // 实时工具卡渲染(REPL):把结果经 backend 渲染到屏幕——Edit/Write diff 着色、
+            // Grep/Glob 摘要、Read 摘要。headless/单测 tool_render_theme=null → 跳过(emit 仍发,
+            // 但那些场景用 WriterBackend,tool_result no-op)。渲染移入 backend(renderResult)。
+            if (opts.tool_render_theme != null) {
+                backend.emitEvent(.{ .tool_result = .{
+                    .id = s.id,
+                    .name = s.name,
+                    .input = s.input,
+                    .content = content,
+                    .is_error = s.is_error,
+                    .card = false,
+                    .elapsed_ms = s.elapsed_ms,
+                } });
             }
         }
 

@@ -247,7 +247,7 @@ def test_T37_taskcreate_shows_tasktab(bin_path):
 
 
 def test_T38_enterplanmode_updates_footer(bin_path):
-    """EnterPlanMode 工具 → footer 反映 (plan)(回归:config/ctx mode 同步 bug)。"""
+    """EnterPlanMode 工具 → footer 反映 "plan on"(回归:config/ctx mode 同步 bug)。"""
     raw = _run_cassette(
         [("a", _sse_tool("tu1", "EnterPlanMode", {})),
          ("b", _sse_text("in plan"))],
@@ -259,7 +259,8 @@ def test_T38_enterplanmode_updates_footer(bin_path):
     foot = None
     for r in range(a.final.rows):
         lt = a.final.line_text(r)
-        if "cycle (" in lt:
+        # CC 风格 footer:"{mode} on · shift+tab to cycle · …"。
+        if "shift+tab to cycle" in lt:
             foot = lt
-    if foot is None or "plan" not in foot:
-        a._fail(f"EnterPlanMode 后 footer 未显示 (plan):{foot!r}")
+    if foot is None or "plan on" not in foot:
+        a._fail(f"EnterPlanMode 后 footer 未显示 'plan on':{foot!r}")

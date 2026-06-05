@@ -46,6 +46,7 @@ pub const Key = union(enum) {
     ctrl_o, // 打开 transcript viewer
     ctrl_x, // Ctrl+X 前缀(配合 Ctrl+K kill 后台)
     ctrl_g, // 外部编辑器编辑当前 buffer
+    ctrl_underscore, // Ctrl+_ / Ctrl+Shift+- (0x1f): undo
     paste_begin, // 括号粘贴起始 ESC[200~
     paste_end, // 括号粘贴结束 ESC[201~
     unknown,
@@ -213,6 +214,7 @@ fn byteToKey(b: u8) Key {
         0x17 => .ctrl_w,
         0x19 => .ctrl_y,
         0x0c => .ctrl_l,
+        0x1f => .ctrl_underscore, // Ctrl+_ / Ctrl+Shift+- : undo
         // 可打印 ASCII：0x20-0x7E
         // UTF-8 多字节：0x80+（首字节 0xC0-0xFF，延续字节 0x80-0xBF）——逐字节作为 .char 透传
         // 终端在显示时会把完整 UTF-8 序列组合成一个字符
@@ -312,6 +314,12 @@ pub const Action = enum {
     none,
 };
 
+const Snapshot = struct {
+    bytes: []u8, // owned(dupe);pop/丢弃/deinit 时 free
+    cursor: usize,
+};
+const undo_max_depth = 50;
+
 pub const LineEditor = struct {
     buf: std.ArrayList(u8),
     cursor: usize = 0,
@@ -324,14 +332,21 @@ pub const LineEditor = struct {
     ctrl_x_armed: bool = false,
     /// yank ring:Ctrl+W/K/U 删除的内容存这,Ctrl+Y 粘回。
     yank_buf: std.ArrayList(u8),
+    /// undo 栈:破坏性编辑前快照 buf+cursor。深度上限 undo_max_depth,超了丢最旧。
+    undo_stack: std.ArrayList(Snapshot),
+    /// 去抖:上一次 handle 处理的 Key tag。连续 .char 只在段首 push 一次。
+    last_op: ?std.meta.Tag(Key) = null,
+    // TODO(redo):redo 栈留待后续(CC 主要只做 undo,Ctrl+Y 已被 yank 占用)。
 
     pub fn init(allocator: std.mem.Allocator) LineEditor {
-        return .{ .buf = .empty, .allocator = allocator, .yank_buf = .empty };
+        return .{ .buf = .empty, .allocator = allocator, .yank_buf = .empty, .undo_stack = .empty };
     }
 
     pub fn deinit(self: *LineEditor) void {
         self.buf.deinit(self.allocator);
         self.yank_buf.deinit(self.allocator);
+        for (self.undo_stack.items) |s| self.allocator.free(s.bytes);
+        self.undo_stack.deinit(self.allocator);
     }
 
     /// 输入一个 Key 并更新状态。返回对应 Action。
@@ -349,6 +364,26 @@ pub const LineEditor = struct {
         const was_ctrl_x_armed = self.ctrl_x_armed;
         if (@as(std.meta.Tag(Key), key) != .ctrl_x) {
             self.ctrl_x_armed = false;
+        }
+
+        // undo 去抖:破坏性编辑前 push 当前状态。char 连打只在段首压一次(last_op != char);
+        // 其它破坏性操作每次都压。导航键不压但更新 last_op(使 char→left→char 在第二个 char 重新压)。
+        {
+            const tag = @as(std.meta.Tag(Key), key);
+            switch (key) {
+                .char => {
+                    if (self.last_op != .char) self.pushUndo();
+                },
+                .backspace, .delete, .ctrl_u, .ctrl_w, .ctrl_y, .shift_enter, .ctrl_enter => {
+                    self.pushUndo();
+                },
+                .ctrl_k => {
+                    // Ctrl+X Ctrl+K 是 kill_background(非破坏);末尾 Ctrl+K 是 no-op。仅真截断才压。
+                    if (!was_ctrl_x_armed and self.cursor < self.buf.items.len) self.pushUndo();
+                },
+                else => {},
+            }
+            self.last_op = tag;
         }
 
         switch (key) {
@@ -466,6 +501,15 @@ pub const LineEditor = struct {
                 self.cursor += self.yank_buf.items.len;
                 return .redraw;
             },
+            .ctrl_underscore => {
+                // undo:pop 栈顶快照恢复 buf+cursor。空栈则无操作。
+                const snap = self.undo_stack.pop() orelse return .none;
+                defer self.allocator.free(snap.bytes);
+                self.buf.clearRetainingCapacity();
+                try self.buf.appendSlice(self.allocator, snap.bytes);
+                self.cursor = if (snap.cursor <= self.buf.items.len) snap.cursor else self.buf.items.len;
+                return .redraw;
+            },
             .alt_b => {
                 if (self.cursor == 0) return .none;
                 var p = self.cursor;
@@ -504,10 +548,31 @@ pub const LineEditor = struct {
         try self.yank_buf.appendSlice(self.allocator, slice);
     }
 
+    /// 破坏性编辑前调用:把当前 buf+cursor 压入 undo 栈(dupe owned)。超上限丢最旧。
+    /// void(非 !void):瞬时 OOM 只丢 undo 历史,不破坏编辑。
+    fn pushUndo(self: *LineEditor) void {
+        const snap = self.allocator.dupe(u8, self.buf.items) catch return;
+        if (self.undo_stack.items.len >= undo_max_depth) {
+            const oldest = self.undo_stack.orderedRemove(0);
+            self.allocator.free(oldest.bytes);
+        }
+        self.undo_stack.append(self.allocator, .{ .bytes = snap, .cursor = self.cursor }) catch {
+            self.allocator.free(snap); // append 失败:回收防泄漏
+        };
+    }
+
+    /// 清空 undo 历史(reset/setLine/clear 时调:行已换,旧快照无意义)。
+    fn clearUndo(self: *LineEditor) void {
+        for (self.undo_stack.items) |s| self.allocator.free(s.bytes);
+        self.undo_stack.clearRetainingCapacity();
+        self.last_op = null;
+    }
+
     /// 清空（用于 cancel / 历史覆盖写入）。
     pub fn reset(self: *LineEditor) void {
         self.buf.clearRetainingCapacity();
         self.cursor = 0;
+        self.clearUndo();
     }
 
     /// 把 buffer 整体替换为给定字节（用于历史导航写回）。
@@ -515,6 +580,7 @@ pub const LineEditor = struct {
         self.buf.clearRetainingCapacity();
         try self.buf.appendSlice(self.allocator, line);
         self.cursor = self.buf.items.len;
+        self.clearUndo();
     }
 
     pub fn view(self: *const LineEditor) []const u8 {
@@ -525,6 +591,7 @@ pub const LineEditor = struct {
     pub fn clear(self: *LineEditor) void {
         self.buf.clearRetainingCapacity();
         self.cursor = 0;
+        self.clearUndo();
     }
 };
 
@@ -1043,4 +1110,62 @@ test "LineEditor: multi-key stream through KeyParser" {
 test "enterRawMode on non-tty returns null or restores cleanly" {
     const orig = enterRawMode(0);
     if (orig) |o| restoreMode(0, o);
+}
+
+test "KeyParser: ctrl_underscore byte 0x1f" {
+    var p = KeyParser{};
+    try testing.expect(p.feed(0x1f).? == .ctrl_underscore);
+}
+
+test "LineEditor: undo 折叠 char 连打为一个单元" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    try typeStr(&ed, "abc"); // 连续 char → 段首压一次快照(空串)
+    try testing.expectEqualStrings("abc", ed.view());
+    try testing.expect((try ed.handle(.ctrl_underscore)) == .redraw);
+    try testing.expectEqualStrings("", ed.view()); // 整段回退到空
+    try testing.expectEqual(@as(usize, 0), ed.cursor);
+}
+
+test "LineEditor: undo 跨操作类型逐个回退" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    try typeStr(&ed, "ab"); // 快照1:""(char 段首)
+    _ = try ed.handle(.backspace); // 快照2:"ab" → 现 "a"
+    try testing.expectEqualStrings("a", ed.view());
+    try testing.expect((try ed.handle(.ctrl_underscore)) == .redraw);
+    try testing.expectEqualStrings("ab", ed.view()); // undo backspace
+    try testing.expect((try ed.handle(.ctrl_underscore)) == .redraw);
+    try testing.expectEqualStrings("", ed.view()); // undo char 段
+}
+
+test "LineEditor: undo 空栈返回 none" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    try testing.expect((try ed.handle(.ctrl_underscore)) == .none);
+}
+
+test "LineEditor: undo 栈深上限不下溢不泄漏" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    // 交替 char/backspace 制造 >50 个破坏性操作(每个都压快照)。
+    var i: usize = 0;
+    while (i < 60) : (i += 1) {
+        _ = try ed.handle(.{ .char = 'x' });
+        _ = try ed.handle(.backspace);
+    }
+    // undo 到底:不下溢、不泄漏(testing.allocator 会抓泄漏)。
+    var n: usize = 0;
+    while (n < 130) : (n += 1) {
+        if ((try ed.handle(.ctrl_underscore)) == .none) break;
+    }
+    try testing.expect((try ed.handle(.ctrl_underscore)) == .none); // 已见底
+}
+
+test "LineEditor: reset 清 undo 历史" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    try typeStr(&ed, "hello");
+    ed.reset();
+    try testing.expect((try ed.handle(.ctrl_underscore)) == .none); // 历史已清
 }

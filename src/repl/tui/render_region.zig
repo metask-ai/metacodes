@@ -25,21 +25,14 @@ const complete = @import("../complete.zig");
 const msg_queue = @import("../msg_queue.zig");
 const agent_tree = @import("widget/agent_tree.zig");
 const agent_job_registry = @import("../../core/agent_job_registry.zig");
+const ui_mod = @import("ui.zig");
+const event_mod = @import("event.zig");
+const ui_state_mod = @import("ui_state.zig");
+const transcript_viewer = @import("../transcript_viewer.zig");
+const Conversation = @import("../../core/conversation.zig").Conversation;
 
 const Theme = theme_mod.Theme;
 const ColorCapability = term.ColorCapability;
-
-/// per-toolUse 进度卡(并发 WebSearch 各一张,不互盖)。定长字段供跨线程持锁拷贝。
-const MAX_TOOL_CARDS = 6;
-const ToolCard = struct {
-    id: [40]u8 = undefined,
-    id_len: u8 = 0,
-    name: [32]u8 = undefined,
-    name_len: u8 = 0,
-    progress: [192]u8 = undefined,
-    progress_len: u8 = 0,
-    start_ms: i64 = 0,
-};
 
 pub const RenderRegion = struct {
     fd: std.c.fd_t,
@@ -64,25 +57,8 @@ pub const RenderRegion = struct {
 
     // 生成期状态
     generating: bool = false,
-    spinner_frame: u8 = 0,
-    verb: []const u8 = "",
-    gen_start_ms: i64 = 0,
-    // 当前执行中的工具(供 spinner 行显示 `⚒ <tool> (X.Ys)`)。定长拷贝而非借用
-    // slice——watcher 线程读、主线程写,{ptr,len} 跨线程撕裂读是 UB;拷进定长数组 +
-    // 持锁更新规避竞争。current_tool_len=0 表示当前无工具。
-    current_tool: [48]u8 = undefined,
-    current_tool_len: u8 = 0,
-    tool_start_ms: i64 = 0,
-    // 当前工具的进度第二行文本(对齐 cc renderToolUseProgressMessage)。WebSearch 子请求
-    // 经 progress 回调写入(Searching: q / Found N results)。定长 + 持锁,同 current_tool。
-    // _len=0 表示无进度行(普通工具不画第二行)。
-    current_tool_progress: [192]u8 = undefined,
-    current_tool_progress_len: u8 = 0,
-    // per-toolUse 多卡(对齐 cc progressMessages 按 toolUseID):并发/连续的多个 WebSearch
-    // 各占一张可刷新卡,不互盖。仅 hasProgressCard 工具进此数组;普通工具仍走上面的
-    // current_tool spinner 段。固定容量(够并发批),定长字段 + 持锁(同 current_tool)。
-    tool_cards: [MAX_TOOL_CARDS]ToolCard = [_]ToolCard{.{}} ** MAX_TOOL_CARDS,
-    tool_cards_len: u8 = 0,
+    // spinner/verb/工具/进度卡的真相源 = self.ui(UiState);drawGenRegion 读它。
+    // 旧的 spinner_frame/verb/gen_start_ms/current_tool*/tool_cards* 字段已删(单一真相源)。
     text_pending_newline: bool = false,
     pending_col: u16 = 0, // 半行 chunk 累计显示列(消息穿过续接用)
     region_drawn: bool = false, // 生成期固定区当前是否画在屏上(true ⟹ 光标钉区顶行首)
@@ -102,6 +78,11 @@ pub const RenderRegion = struct {
     // 末尾残行在 leaveGenerating 时 flush。
     line_buf: std.ArrayList(u8) = .empty,
 
+    // 阶段1:overlay 逻辑态(help/transcript)由 UiState 承载;机制态(prev_rows 等)仍在上面。
+    ui: ui_state_mod.UiState = .{},
+    // transcript overlay 期间持有的 owned lines(开 overlay 时生成,关时 freeLines)。
+    transcript_lines: ?[][]u8 = null,
+
     mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
 
     fn lock(self: *RenderRegion) void {
@@ -115,73 +96,38 @@ pub const RenderRegion = struct {
     pub fn setCurrentTool(self: *RenderRegion, name: []const u8, start_ms: i64) void {
         self.lock();
         defer self.unlock();
-        const n = @min(name.len, self.current_tool.len);
-        @memcpy(self.current_tool[0..n], name[0..n]);
-        self.current_tool_len = @intCast(n);
-        self.tool_start_ms = start_ms;
+        ui_state_mod.setCurrentTool(&self.ui, name, start_ms);
     }
 
     /// 清除当前工具(普通工具 spinner 段)。持锁。
     pub fn clearCurrentTool(self: *RenderRegion) void {
         self.lock();
         defer self.unlock();
-        self.current_tool_len = 0;
-        self.current_tool_progress_len = 0;
+        ui_state_mod.clearCurrentTool(&self.ui);
     }
 
     /// 新增一张 per-toolUse 进度卡(hasProgressCard 工具如 WebSearch 执行前调)。
-    /// 按 id 去重(已存在则更新 start);满则丢弃(MAX_TOOL_CARDS 够并发批)。持锁。
+    /// 按 id 去重;满则丢弃(MAX_TOOL_CARDS 够并发批)。持锁。
     pub fn addToolCard(self: *RenderRegion, id: []const u8, name: []const u8, start_ms: i64) void {
         self.lock();
         defer self.unlock();
-        if (self.findCardIdx(id)) |idx| {
-            self.tool_cards[idx].start_ms = start_ms;
-            return;
-        }
-        if (self.tool_cards_len >= MAX_TOOL_CARDS) return;
-        var c = &self.tool_cards[self.tool_cards_len];
-        const idn = @min(id.len, c.id.len);
-        @memcpy(c.id[0..idn], id[0..idn]);
-        c.id_len = @intCast(idn);
-        const nn = @min(name.len, c.name.len);
-        @memcpy(c.name[0..nn], name[0..nn]);
-        c.name_len = @intCast(nn);
-        c.progress_len = 0;
-        c.start_ms = start_ms;
-        self.tool_cards_len += 1;
+        ui_state_mod.addCard(&self.ui, id, name, start_ms);
     }
 
-    /// 移除一张 per-toolUse 卡(工具完成调)。持锁。数组紧凑(末尾补位)。
+    /// 移除一张 per-toolUse 卡(工具完成调)。持锁。数组紧凑(前移补位)。
     pub fn clearToolCard(self: *RenderRegion, id: []const u8) void {
         self.lock();
         defer self.unlock();
-        const idx = self.findCardIdx(id) orelse return;
-        const last = self.tool_cards_len - 1;
-        if (idx != last) self.tool_cards[idx] = self.tool_cards[last];
-        self.tool_cards_len -= 1;
-    }
-
-    fn findCardIdx(self: *RenderRegion, id: []const u8) ?usize {
-        var i: usize = 0;
-        while (i < self.tool_cards_len) : (i += 1) {
-            const c = &self.tool_cards[i];
-            if (std.mem.eql(u8, c.id[0..c.id_len], id)) return i;
-        }
-        return null;
+        ui_state_mod.clearCard(&self.ui, id);
     }
 
     /// 设置某张 per-toolUse 卡的进度第二行(对齐 cc onProgress→renderToolUseProgressMessage)。
-    /// 工具执行线程(tool_exec 并发批)经 progress 回调按 id 调用 → 写对应卡 + **立即重画一帧**
-    /// (不等下个 spinner tick,否则 Found N 会被 Did N 秒覆盖渲不出;对齐 cc reactive)。
-    /// 持锁:与 spinner 线程读/画互斥。text 立即拷进定长数组(不持有借用)。
+    /// 工具执行线程经 progress 回调按 id 调用 → 写对应卡 + **立即重画一帧**(不等下个 tick,
+    /// 否则 Found N 会被 Did N 秒覆盖渲不出)。持锁:与 spinner 线程读/画互斥。
     pub fn setToolProgress(self: *RenderRegion, id: []const u8, text: []const u8) void {
         self.lock();
         defer self.unlock();
-        const idx = self.findCardIdx(id) orelse return;
-        var c = &self.tool_cards[idx];
-        const n = @min(text.len, c.progress.len);
-        @memcpy(c.progress[0..n], text[0..n]);
-        c.progress_len = @intCast(n);
+        ui_state_mod.setCardProgress(&self.ui, id, text);
         // 立即重画(用 enterGenerating 存的 gen_app),让进度行至少渲染一帧。
         if (self.generating) {
             if (self.gen_app) |app| {
@@ -206,8 +152,16 @@ pub const RenderRegion = struct {
     }
 
     pub fn deinit(self: *RenderRegion) void {
+        self.freeTranscriptLines();
         self.scratch.deinit();
         self.line_buf.deinit(self.allocator);
+    }
+
+    fn freeTranscriptLines(self: *RenderRegion) void {
+        if (self.transcript_lines) |ls| {
+            transcript_viewer.freeLines(self.allocator, ls);
+            self.transcript_lines = null;
+        }
     }
 
     /// 设置输入态(loop 每次按键后调,再调 render)。
@@ -518,15 +472,23 @@ pub const RenderRegion = struct {
         return rows;
     }
 
-    /// footer:左 "? for shortcuts · shift+tab to cycle (mode)" 右 "{tok} tokens",dim。
+    /// footer:左 "{mode} on · shift+tab to cycle · ? for shortcuts"(对齐 CC)右 "{tok} tokens",dim。
     fn drawFooter(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App) void {
         const th = self.theme;
-        const mode_str = @import("widget/status_bar.zig").modeName(app.config.permission_mode);
-        var left_buf: [160]u8 = undefined;
-        const left = std.fmt.bufPrint(&left_buf, " ? for shortcuts · shift+tab to cycle ({s})", .{mode_str}) catch " ? for shortcuts";
+        // 阶段2:读 self.ui.footer(数据由 .usage 事件喂)而非裸读 app。app 仅作 fallback——
+        // 若 footer 尚未被 .usage 填过(mode 仍默认且 token 为 0),用 app 当前值兜底。
+        const mode_pm = if (self.ui.footer.mode != .default) self.ui.footer.mode else app.config.permission_mode;
+        const mode_str = @import("widget/status_bar.zig").modeName(mode_pm);
+        var left_buf: [192]u8 = undefined;
+        // CC 风格:"{mode} on · shift+tab to cycle · ? for shortcuts"。
+        const left = std.fmt.bufPrint(&left_buf, " {s} on · shift+tab to cycle · ? for shortcuts", .{mode_str}) catch " ? for shortcuts";
 
-        const u = app.usage;
-        const total = u.input_tokens + u.output_tokens;
+        const total = blk: {
+            const ft = self.ui.footer.totalTokens();
+            if (ft > 0) break :blk ft;
+            const u = app.usage;
+            break :blk u.input_tokens + u.output_tokens;
+        };
         var tok_buf: [16]u8 = undefined;
         const tok_str = @import("widget/status_bar.zig").formatTokens(&tok_buf, total);
         var right_buf: [48]u8 = undefined;
@@ -596,7 +558,117 @@ pub const RenderRegion = struct {
         self.lock();
         defer self.unlock();
         if (self.generating) return; // 生成期不画多行区
-        self.renderInner(app);
+        if (self.ui.overlay != .none) {
+            self.renderOverlayInner(app);
+        } else {
+            self.renderInner(app);
+        }
+    }
+
+    /// 阶段1:输入期按键先经 dispatch(锁内改 UiState + 据 Effect 重画)。
+    /// 调用方(readLineRaw)在调用前应同步 self.ui.editor(供 dispatch 判断"空 buffer + ?")。
+    /// conv 供 transcript overlay 生成 lines。返回 Effect.action 供主循环决定是否喂 LineEditor。
+    pub fn applyEvent(
+        self: *RenderRegion,
+        app: *const app_mod.App,
+        conv: *const Conversation,
+        ev: event_mod.Event,
+    ) event_mod.Effect {
+        self.lock();
+        defer self.unlock();
+        const was = self.ui.overlay;
+        const eff = ui_mod.dispatch(&self.ui, ev);
+        const now = self.ui.overlay;
+        // transcript overlay 跳变:进入时生成 lines(借 conv),退出时释放。
+        if (now == .transcript and was != .transcript) {
+            self.freeTranscriptLines();
+            self.transcript_lines = transcript_viewer.renderToLinesWithTheme(self.allocator, conv, self.theme) catch null;
+        } else if (now != .transcript and was == .transcript) {
+            self.freeTranscriptLines();
+        }
+        if (eff.redraw_region and !self.generating) {
+            if (self.ui.overlay != .none) {
+                self.renderOverlayInner(app);
+            } else {
+                self.renderInner(app);
+            }
+        }
+        return eff;
+    }
+
+    /// 给 ui.render 的行字节流每行行首注入 clear.line(ui.render 不写 ESC[2K),
+    /// 否则收缩时新帧短行会留旧帧残字。薄 writer 适配 ui.render 的 anytype 接口。
+    const RegionLineWriter = struct {
+        inner: *std.Io.Writer,
+        at_line_start: bool = true,
+        pub fn writeAll(self: *RegionLineWriter, bytes: []const u8) !void {
+            if (self.at_line_start and bytes.len > 0) {
+                try self.inner.writeAll(ansi.clear.line);
+                self.at_line_start = false;
+            }
+            try self.inner.writeAll(bytes);
+            if (bytes.len > 0 and bytes[bytes.len - 1] == '\n') self.at_line_start = true;
+        }
+        pub fn print(self: *RegionLineWriter, comptime fmt: []const u8, args: anytype) !void {
+            var buf: [4096]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..];
+            try self.writeAll(s);
+        }
+    };
+
+    /// overlay 帧渲染:复用 renderFrameInner 的 erase/prev_rows 骨架,中段换成 ui.render 输出。
+    /// 与正常输入框共用 prev_rows/input_cursor_row 不变式 → 切换时自动收缩擦除。
+    fn renderOverlayInner(self: *RenderRegion, app: *const app_mod.App) void {
+        _ = app;
+        self.measureSize();
+        const w = &self.scratch.writer;
+        self.resetScratch();
+        var nbuf: [16]u8 = undefined;
+
+        // 1. hide + 回区顶 + 行首(同 renderFrameInner)。
+        w.writeAll(ansi.cursor.hide) catch {};
+        if (self.input_cursor_row > 0) w.writeAll(ansi.cursor.up(self.input_cursor_row, &nbuf)) catch {};
+        w.writeAll(ansi.cursor.column(1, &nbuf)) catch {};
+
+        // 2. 几何注入 UiState(renderTranscript 用 state.rows 算窗口)。
+        self.ui.cols = self.cols;
+        self.ui.rows = self.rows;
+
+        // 3. ui.render 写中段(经 RegionLineWriter 注入 clear.line)。
+        var lw = RegionLineWriter{ .inner = w };
+        const frame = ui_mod.render(&lw, .{
+            .state = &self.ui,
+            .now_ms = util_time.nowMs(),
+            .theme = self.theme,
+            .use_unicode = self.use_unicode,
+            .transcript_lines = if (self.transcript_lines) |ls| ls else &.{},
+        }) catch ui_mod.Frame{};
+        const new_rows: u16 = frame.rows;
+
+        // ui.render 末行带 \r\n → 光标在区下方。先 up(1) 回到区最后一行,对齐
+        // renderFrameInner 的"光标停在最后一行"约定,使下方收缩擦除/回顶逻辑一致。
+        if (new_rows > 0) w.writeAll(ansi.cursor.up(1, &nbuf)) catch {};
+
+        // 4. 收缩残留擦除(同 renderFrameInner:443-451)。
+        if (new_rows < self.prev_rows) {
+            const diff = self.prev_rows - new_rows;
+            var k: u16 = 0;
+            while (k < diff) : (k += 1) {
+                w.writeAll("\r\n") catch {};
+                w.writeAll(ansi.clear.line) catch {};
+            }
+            w.writeAll(ansi.cursor.up(diff, &nbuf)) catch {};
+        }
+
+        // 5. overlay 无编辑光标:回区顶(下一帧 renderFrameInner 从 input_cursor_row=0 起)。
+        if (new_rows > 1) w.writeAll(ansi.cursor.up(new_rows - 1, &nbuf)) catch {};
+        w.writeAll(ansi.cursor.column(1, &nbuf)) catch {};
+        w.writeAll(ansi.cursor.show) catch {};
+
+        self.prev_rows = new_rows;
+        self.input_cursor_row = 0;
+        self.visible = true;
+        self.flush();
     }
 
     /// 擦掉固定区,光标回区顶第一行行首,prev_rows=0。
@@ -653,14 +725,17 @@ pub const RenderRegion = struct {
         self.gen_cursor = 0;
         self.line_buf.clearRetainingCapacity(); // 新一轮:清行缓冲
         self.generating = true;
-        self.spinner_frame = 0;
         self.region_drawn = false; // 区不在屏:首个 tick 才画区
         self.prev_rows = 0; // 生成期 prev_rows = 上次 drawGenRegion 画的 R(eraseRegion 用)
         self.cursor_in_region_row = 0;
-        self.gen_start_ms = util_time.nowMs();
-        self.verb = verbs.pick(@intCast(util_time.nowMs() & 0xffff));
         self.text_pending_newline = false;
         self.pending_col = 0;
+        // 生成期状态单一真相源 = self.ui(drawGenRegion 读它)。overlay 强制关闭。
+        self.ui.phase = .generating;
+        self.ui.overlay = .none;
+        self.ui.spinner = .{ .frame = 0, .verb = verbs.pick(@intCast(util_time.nowMs() & 0xffff)), .start_ms = util_time.nowMs() };
+        self.ui.tools.current_len = 0;
+        self.ui.tools.cards_len = 0;
     }
 
     /// 离开生成期:擦掉固定区(若在)+ 补半行换行 + 收尾。不再返回 carryover
@@ -680,6 +755,7 @@ pub const RenderRegion = struct {
             self.pending_col = 0;
         }
         self.generating = false;
+        self.ui.phase = .input; // 同步:退生成期 → 输入期(双写过渡)
         self.region_drawn = false;
         self.gen_app = null;
         self.gen_queue = null;
@@ -713,7 +789,7 @@ pub const RenderRegion = struct {
         self.lock();
         defer self.unlock();
         if (!self.generating) return;
-        self.spinner_frame +%= 1;
+        self.ui.spinner.frame +%= 1;
         if (self.region_drawn) self.eraseRegion();
         self.drawGenRegion(app);
     }
@@ -839,28 +915,25 @@ pub const RenderRegion = struct {
 
         var R: u16 = 0;
 
-        // -- spinner 行 --
+        // -- spinner 行 --(读 self.ui.spinner/tools 单一真相源,不再读旧双写字段)
         w.writeAll(ansi.clear.line) catch {};
-        const elapsed: u64 = @intCast(@max(util_time.nowMs() - self.gen_start_ms, 0));
-        // 当前工具 + 其耗时(已在 tickSpinner 锁内,读 current_tool 无竞争)。
-        const cur_tool = self.current_tool[0..self.current_tool_len];
-        const tool_ms: u64 = if (self.current_tool_len > 0)
-            @intCast(@max(util_time.nowMs() - self.tool_start_ms, 0))
+        const elapsed: u64 = @intCast(@max(util_time.nowMs() - self.ui.spinner.start_ms, 0));
+        const cur_tool = self.ui.tools.currentSlice();
+        const tool_ms: u64 = if (self.ui.tools.current_len > 0)
+            @intCast(@max(util_time.nowMs() - self.ui.tools.current_start_ms, 0))
         else
             0;
-        // spinner 行只显普通工具段 `⚒ <tool>`(current_tool)。hasProgressCard 工具(WebSearch)
-        // 不进 current_tool、改走下方 per-toolUse 多卡 → spinner 不显它们(对齐 cc:底部
-        // spinner 不显工具名,各 WebSearch 由自己的卡显示)。
-        _ = StatusBar.renderGenerating(w, app, self.theme, self.use_unicode, self.spinner_frame, self.verb, elapsed, cur_tool, tool_ms, inner_w) catch {};
+        // spinner 行只显普通工具段 `⚒ <tool>`(current)。hasProgressCard 工具(WebSearch)
+        // 不进 current、改走下方 per-toolUse 多卡 → spinner 不显它们(对齐 cc)。
+        _ = StatusBar.renderGenerating(w, app, self.theme, self.use_unicode, self.ui.spinner.frame, self.ui.spinner.verb, elapsed, cur_tool, tool_ms, inner_w) catch {};
         R += 1;
         w.writeAll("\r\n") catch {};
 
-        // -- 执行中 per-toolUse 进度卡(对齐 cc:并发/连续多个 WebSearch 各占一张可刷新卡,
-        //    不互盖)。每张 ⏺ <Tool> / ⎿ <progress|Searching…>;随 tick 重画。--
+        // -- 执行中 per-toolUse 进度卡(读 self.ui.tools.cards 单一真相源)--
         {
             var ci: usize = 0;
-            while (ci < self.tool_cards_len) : (ci += 1) {
-                R += self.drawToolProgressCard(w, &self.tool_cards[ci]);
+            while (ci < self.ui.tools.cards_len) : (ci += 1) {
+                R += self.drawToolProgressCard(w, &self.ui.tools.cards[ci]);
             }
         }
 
@@ -942,7 +1015,7 @@ pub const RenderRegion = struct {
     /// 最多 MAX 条,超出补一行 ` +N more`。
     /// 执行中 per-toolUse 进度卡(动态区,可刷新):⏺ <Tool> / ⎿ <progress>。对齐 cc 双段卡。
     /// 随每次 tickSpinner 重画。card 是某张 tool_cards 条目。
-    fn drawToolProgressCard(self: *RenderRegion, w: *std.Io.Writer, card: *const ToolCard) u16 {
+    fn drawToolProgressCard(self: *RenderRegion, w: *std.Io.Writer, card: *const ui_state_mod.ToolCardState) u16 {
         const th = self.theme;
         const tool_card = @import("widget/tool_card.zig");
         const inner_w: usize = if (self.cols > 8) self.cols - 8 else 30;
@@ -1152,57 +1225,56 @@ test "RenderRegion init/deinit no leak" {
     try std.testing.expect(r.cols >= 1);
 }
 
-test "setCurrentTool/clearCurrentTool: 存取 + 截断 + 归零" {
+test "setCurrentTool/clearCurrentTool: 存取 + 截断 + 归零(读 ui.tools 真相源)" {
     var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.monochrome, .none), .none);
     defer r.deinit();
-    // 初始无工具。
-    try std.testing.expectEqual(@as(u8, 0), r.current_tool_len);
+    try std.testing.expectEqual(@as(u8, 0), r.ui.tools.current_len);
 
     r.setCurrentTool("Bash", 1000);
-    try std.testing.expectEqualStrings("Bash", r.current_tool[0..r.current_tool_len]);
-    try std.testing.expectEqual(@as(i64, 1000), r.tool_start_ms);
+    try std.testing.expectEqualStrings("Bash", r.ui.tools.currentSlice());
+    try std.testing.expectEqual(@as(i64, 1000), r.ui.tools.current_start_ms);
 
     // 超 48B 的工具名应截断到 48,不越界。
     const long = "ThisIsAnAbsurdlyLongToolNameThatExceedsFortyEightBytesForSure";
     r.setCurrentTool(long, 2000);
-    try std.testing.expectEqual(@as(u8, 48), r.current_tool_len);
-    try std.testing.expectEqualStrings(long[0..48], r.current_tool[0..r.current_tool_len]);
+    try std.testing.expectEqual(@as(u8, 48), r.ui.tools.current_len);
+    try std.testing.expectEqualStrings(long[0..48], r.ui.tools.currentSlice());
 
     r.clearCurrentTool();
-    try std.testing.expectEqual(@as(u8, 0), r.current_tool_len);
+    try std.testing.expectEqual(@as(u8, 0), r.ui.tools.current_len);
 }
 
-test "per-toolUse 多卡:按 id 各写各卡不互盖 + 增删" {
+test "per-toolUse 多卡:按 id 各写各卡不互盖 + 增删(读 ui.tools 真相源)" {
     var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.monochrome, .none), .none);
     defer r.deinit();
-    try std.testing.expectEqual(@as(u8, 0), r.tool_cards_len);
+    try std.testing.expectEqual(@as(u8, 0), r.ui.tools.cards_len);
 
     // 两个并发 WebSearch:各一张卡。
     r.addToolCard("id_a", "WebSearch", 100);
     r.addToolCard("id_b", "WebSearch", 200);
-    try std.testing.expectEqual(@as(u8, 2), r.tool_cards_len);
+    try std.testing.expectEqual(@as(u8, 2), r.ui.tools.cards_len);
 
     // 各写各的 progress,不互盖。
     r.setToolProgress("id_a", "Searching: alpha");
     r.setToolProgress("id_b", "Searching: beta");
-    const ia = r.findCardIdx("id_a").?;
-    const ib = r.findCardIdx("id_b").?;
-    try std.testing.expectEqualStrings("Searching: alpha", r.tool_cards[ia].progress[0..r.tool_cards[ia].progress_len]);
-    try std.testing.expectEqualStrings("Searching: beta", r.tool_cards[ib].progress[0..r.tool_cards[ib].progress_len]);
+    const ia = ui_state_mod.findCard(&r.ui, "id_a").?;
+    const ib = ui_state_mod.findCard(&r.ui, "id_b").?;
+    try std.testing.expectEqualStrings("Searching: alpha", r.ui.tools.cards[ia].progressSlice());
+    try std.testing.expectEqualStrings("Searching: beta", r.ui.tools.cards[ib].progressSlice());
 
     // 重复 addToolCard 同 id 不新增。
     r.addToolCard("id_a", "WebSearch", 300);
-    try std.testing.expectEqual(@as(u8, 2), r.tool_cards_len);
+    try std.testing.expectEqual(@as(u8, 2), r.ui.tools.cards_len);
 
     // 删一张,另一张保留且 progress 不丢。
     r.clearToolCard("id_a");
-    try std.testing.expectEqual(@as(u8, 1), r.tool_cards_len);
-    try std.testing.expect(r.findCardIdx("id_a") == null);
-    const ib2 = r.findCardIdx("id_b").?;
-    try std.testing.expectEqualStrings("Searching: beta", r.tool_cards[ib2].progress[0..r.tool_cards[ib2].progress_len]);
+    try std.testing.expectEqual(@as(u8, 1), r.ui.tools.cards_len);
+    try std.testing.expect(ui_state_mod.findCard(&r.ui, "id_a") == null);
+    const ib2 = ui_state_mod.findCard(&r.ui, "id_b").?;
+    try std.testing.expectEqualStrings("Searching: beta", r.ui.tools.cards[ib2].progressSlice());
 
     r.clearToolCard("id_b");
-    try std.testing.expectEqual(@as(u8, 0), r.tool_cards_len);
+    try std.testing.expectEqual(@as(u8, 0), r.ui.tools.cards_len);
 }
 
 test "nextCharBytes UTF-8 宽度" {

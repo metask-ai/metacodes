@@ -497,7 +497,7 @@ test "hashCwd deterministic" {
 test "write then load roundtrip" {
     const a = std.testing.allocator;
     // 用 /tmp 模拟 HOME
-    const tmp_home = try std.fmt.allocPrint(a, "/tmp/cc-zig-transcript-test-{d}", .{std.time.milliTimestamp()});
+    const tmp_home = try std.fmt.allocPrint(a, "/tmp/cc-zig-transcript-test-{d}", .{util_time.nowMs()});
     defer {
         util_fs.testing.rmrfBestEffort(tmp_home);
         a.free(tmp_home);
@@ -530,7 +530,7 @@ test "write then load roundtrip" {
 
 test "write tool_use and tool_result roundtrip" {
     const a = std.testing.allocator;
-    const tmp_home = try std.fmt.allocPrint(a, "/tmp/cc-zig-transcript-test-tu-{d}", .{std.time.milliTimestamp()});
+    const tmp_home = try std.fmt.allocPrint(a, "/tmp/cc-zig-transcript-test-tu-{d}", .{util_time.nowMs()});
     defer {
         util_fs.testing.rmrfBestEffort(tmp_home);
         a.free(tmp_home);
@@ -571,7 +571,7 @@ test "write tool_use and tool_result roundtrip" {
 
 test "listSessions orders by last_modified desc" {
     const a = std.testing.allocator;
-    const tmp_home = try std.fmt.allocPrint(a, "/tmp/cc-zig-transcript-list-test-{d}", .{std.time.milliTimestamp()});
+    const tmp_home = try std.fmt.allocPrint(a, "/tmp/cc-zig-transcript-list-test-{d}", .{util_time.nowMs()});
     defer {
         util_fs.testing.rmrfBestEffort(tmp_home);
         a.free(tmp_home);
@@ -588,8 +588,10 @@ test "listSessions orders by last_modified desc" {
         defer a.free(fmt_buf);
         try conv.appendText(.user, fmt_buf);
         w.flush(&conv);
-        // 保证时间戳不同
-        std.time.sleep(2 * std.time.ns_per_ms);
+        // 保证时间戳不同(Zig 0.16 无 std.time.sleep,用 std.c.nanosleep)。
+        var req = std.c.timespec{ .sec = 0, .nsec = 2_000_000 };
+        var rem: std.c.timespec = undefined;
+        _ = std.c.nanosleep(&req, &rem);
     }
 
     const list = try listSessions("/project-X", tmp_home, a);

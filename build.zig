@@ -152,6 +152,11 @@ pub fn build(b: *std.Build) void {
         "tests/component/tool_smoke_test.zig",
         "tests/component/compact_summary_test.zig",
         "tests/component/render_region_test.zig",
+        "tests/component/stream_retry_test.zig",
+        "tests/component/ui_state_test.zig",
+        "tests/component/ui_render_test.zig",
+        "tests/component/ui_backend_test.zig",
+        "tests/component/ui_multifrontend_test.zig",
     };
     for (integ_files) |f| {
         const m = b.createModule(.{
@@ -207,6 +212,11 @@ pub fn build(b: *std.Build) void {
         "tests/component/tool_smoke_test.zig",
         "tests/component/compact_summary_test.zig",
         "tests/component/render_region_test.zig",
+        "tests/component/stream_retry_test.zig",
+        "tests/component/ui_state_test.zig",
+        "tests/component/ui_render_test.zig",
+        "tests/component/ui_backend_test.zig",
+        "tests/component/ui_multifrontend_test.zig",
     };
     for (new_files) |f| {
         const m = b.createModule(.{

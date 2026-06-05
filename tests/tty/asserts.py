@@ -134,8 +134,8 @@ class TTYAssert:
         if fr is None:
             self._fail("无 footer 行")
         txt = self.final.line_text(fr)
-        if f"({mode_str})" not in txt:
-            self._fail(f"footer 模式应为 ({mode_str}),实际 '{txt}'")
+        if f"{mode_str} on" not in txt:
+            self._fail(f"footer 模式应为 '{mode_str} on',实际 '{txt}'")
 
     def assert_input_echo(self, text):
         """❯ 行(+续行)拼出的文本 == text;光标列 == 2 + 文本显示宽。"""

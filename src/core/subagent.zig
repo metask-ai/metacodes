@@ -14,6 +14,8 @@ const client_mod = @import("../client.zig");
 const json_mod = @import("../json.zig");
 const permission_mod = @import("../permission.zig");
 const agent_loop = @import("agent_loop.zig");
+const writer_backend = @import("writer_backend.zig");
+const ui_backend = @import("../repl/ui_backend.zig");
 const Conversation = @import("conversation.zig").Conversation;
 const msg = @import("message.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
@@ -59,7 +61,7 @@ pub const SpawnOptions = struct {
     agent_jobs: ?*@import("agent_job_registry.zig").AgentJobRegistry = null,
     /// 实时进度回调(后台 job 传自己的 JobEntry trampoline;同步路径 null)。
     progress_state: ?*anyopaque = null,
-    progress_fn: ?*const fn (state: *anyopaque, turn: u32, tool_name: []const u8, tool_input: []const u8) void = null,
+    progress_fn: ?*const fn (state: *anyopaque, turn: u32, tool_name: []const u8, tool_input: []const u8, tool_calls: u32) void = null,
 };
 
 pub fn spawnAgent(
@@ -71,13 +73,13 @@ pub fn spawnAgent(
     prompt: []const u8,
     opts: SpawnOptions,
 ) !SubagentResult {
-    var sink = NullWriter{};
-    return spawnAgentSink(allocator, api_client, tool_defs, permission_ctx, abort, prompt, opts, &sink);
+    var wb = writer_backend.WriterBackend.initNull();
+    const be = wb.backend();
+    return spawnAgentSink(allocator, api_client, tool_defs, permission_ctx, abort, prompt, opts, &be);
 }
 
-/// 与 spawnAgent 相同,但允许注入一个 output sink(anytype writer,实现 print)。
-/// 后台 subagent(agent_job_registry)用它把流式 text 导进可查询的缓冲。
-/// 同步路径用 spawnAgent(NullWriter),行为不变。
+/// 与 spawnAgent 相同,但允许注入一个 UiBackend(后台 job 用 WriterBackend 把流式
+/// text 导进可查询缓冲;同步路径用 null backend,行为不变)。
 pub fn spawnAgentSink(
     allocator: std.mem.Allocator,
     api_client: *client_mod.Client,
@@ -86,7 +88,7 @@ pub fn spawnAgentSink(
     abort: ?*const AbortSignal,
     prompt: []const u8,
     opts: SpawnOptions,
-    sink: anytype,
+    backend: *const ui_backend.UiBackend,
 ) !SubagentResult {
     var conv = Conversation.init(allocator);
     defer conv.deinit();
@@ -134,7 +136,7 @@ pub fn spawnAgentSink(
             .progress_state = opts.progress_state,
             .progress_fn = opts.progress_fn,
         },
-        sink,
+        backend,
         allocator,
     );
 
@@ -159,14 +161,6 @@ pub fn spawnAgentSink(
         .subagent_tasks_created = @intCast(sub_tasks.tasks.items.len),
     };
 }
-
-/// 忽略所有输出的 writer——subagent 的 text 不应进入父 stdout。
-const NullWriter = struct {
-    pub fn print(_: *@This(), comptime fmt: []const u8, args: anytype) !void {
-        _ = fmt;
-        _ = args;
-    }
-};
 
 // ============================================================================
 // Tests（纯签名/接口测试——真 API 调用需要集成）

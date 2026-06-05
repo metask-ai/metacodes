@@ -30,6 +30,12 @@ RETRIES = 3
 SKIP = os.environ.get("TTY_SKIP_MODEL") == "1"
 
 
+class SkipTest(Exception):
+    """真模型漂移导致被测路径未被触发(如所有重试模型都没调目标工具)→ 跳过,
+    既不算 pass 也不算 fail。区别于 AssertionError(被测路径触发了但行为错=真 regression)。
+    runner 识别本异常计入 skipped。"""
+
+
 def fresh_home():
     """每个 attempt 用独立 HOME,transcript 隔离、易定位最新 session。"""
     return tempfile.mkdtemp(prefix="cc-e2e-home-")

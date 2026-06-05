@@ -16,6 +16,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)  # 让 cases 能 import screen/asserts/tty_driver
 
 from asserts import AssertError  # noqa: E402
+try:
+    from e2e_helpers import SkipTest  # noqa: E402
+except Exception:  # noqa: BLE001
+    class SkipTest(Exception):  # fallback:e2e_helpers 不可用时仍可跑非 e2e 用例
+        pass
 
 
 def load_cases():
@@ -66,12 +71,17 @@ def main():
 
     passed = 0
     failed = []
+    skipped = []
     print(f"=== TTY 测试:{len(cases)} 个用例,bin={bin_path} ===\n")
     for name, fn in cases:
         try:
             fn(bin_path)
             print(f"  ✓ {name}")
             passed += 1
+        except SkipTest as e:
+            # 真模型漂移:被测路径未触发(模型没调目标工具)→ 跳过,非失败。
+            print(f"  ⊘ {name}  (skip: {e})")
+            skipped.append(name)
         except AssertError as e:
             print(f"  ✗ {name}")
             print("    " + str(e).replace("\n", "\n    "))
@@ -83,7 +93,10 @@ def main():
             print("    " + traceback.format_exc().replace("\n", "\n    "))
             failed.append(name)
 
-    print(f"\n=== 结果:{passed} passed / {len(failed)} failed ===")
+    skip_note = f" / {len(skipped)} skipped" if skipped else ""
+    print(f"\n=== 结果:{passed} passed / {len(failed)} failed{skip_note} ===")
+    if skipped:
+        print("跳过(模型漂移):", ", ".join(skipped))
     if failed:
         print("失败:", ", ".join(failed))
         return 1
