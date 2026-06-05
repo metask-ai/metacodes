@@ -604,33 +604,15 @@ pub fn run(
             base_ctx.progress_fn = &Tramp.cb;
         }
 
-        // 6c. 分批并发执行(denied 的不动,run 的填 content)。
-        // 过程态(TTY 顶层):执行前打起始卡 + 把"当前工具"喂进底部 spinner(由现有
-        // tickSpinner 线程渲染,见 render_region)。headless/subagent(depth>0)/无 theme 跳过。
-        // 门控(showStartCard/hasProgressCard)留在此(纯分类器);渲染移入 backend。
+        // 6c. 分批并发执行。过程态(TTY 顶层):无条件 emit tool_start(每个 run slot);
+        // **渲染决策(showStartCard/hasProgressCard/喂 spinner)全在 backend**——agent_loop
+        // 不再 import tool_card UI widget(层泄漏修复)。headless/subagent(depth>0)/无 theme
+        // 时 tool_render_theme=null → 不 emit(那些场景 WriterBackend 也 no-op)。
         if (opts.tool_render_theme != null and opts.agent_depth == 0) {
-            const tool_card = @import("../repl/tui/widget/tool_card.zig");
-            var first_tool: ?[]const u8 = null;
             for (slots.items) |*s| {
                 if (s.decision != .run) continue;
-                // 起始卡门控:**B1 有意收紧**——旧版用 `resultRenderMode(s.name)==.hidden`,
-                // 现改 `showStartCard`(tool_card.zig)。差异:`Task`(精确名)结果是 hidden
-                // (状态走 Task 面板,不刷消息流)但**起始卡现在可见**——用户须看到 subagent
-                // 启动。其余(AskUserQuestion/EnterPlanMode/ExitPlanMode/Skill/未知工具)行为不变。
-                // 这是 showStartCard 与 resultRenderMode 的解耦:起始卡可见 ≠ 结果卡可见。
-                if (!tool_card.showStartCard(s.name)) continue;
-                // hasProgressCard 工具(WebSearch):执行中由动态区 per-toolUse 卡显示
-                // (不打起始卡到滚动历史、不进 spinner 段)。每个 tool_use 一张卡(并发不互盖)。
-                if (tool_card.hasProgressCard(s.name)) {
-                    backend.emitEvent(.{ .tool_start = .{ .id = s.id, .name = s.name, .input = s.input, .card = true } });
-                    continue;
-                }
-                if (first_tool == null) first_tool = s.name;
-                // card=false:backend 渲染起始卡到滚动历史(renderStart)。
-                backend.emitEvent(.{ .tool_start = .{ .id = s.id, .name = s.name, .input = s.input, .card = false } });
+                backend.emitEvent(.{ .tool_start = .{ .id = s.id, .name = s.name, .input = s.input } });
             }
-            // 喂普通工具给底部 spinner(hasProgressCard 工具走多卡,不喂 spinner)。
-            if (first_tool) |name| backend.emitEvent(.{ .set_current_tool = .{ .name = name } });
         }
         // 进度上报:本轮第一个 run slot 的工具名 + 原始 input(subagent agent 树显示当前动作)。
         if (opts.progress_fn != null) {
@@ -644,11 +626,10 @@ pub fn run(
         tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
         if (opts.tool_render_theme != null and opts.agent_depth == 0) {
             backend.emitEvent(.clear_current_tool);
-            // 清掉本轮 hasProgressCard 工具的 per-toolUse 卡(完成卡由下方 renderResult 落历史)。
-            const tool_card = @import("../repl/tui/widget/tool_card.zig");
+            // 进度卡工具的清卡也无条件发(backend 据 name 自决 clearToolCard)。
             for (slots.items) |*s| {
-                if (s.decision == .run and tool_card.hasProgressCard(s.name)) {
-                    backend.emitEvent(.{ .tool_result = .{ .id = s.id, .name = s.name, .input = s.input, .content = "", .is_error = s.is_error, .card = true } });
+                if (s.decision == .run) {
+                    backend.emitEvent(.{ .tool_result = .{ .id = s.id, .name = s.name, .input = s.input, .content = "", .is_error = s.is_error } });
                 }
             }
         }
@@ -690,7 +671,6 @@ pub fn run(
                     .input = s.input,
                     .content = content,
                     .is_error = s.is_error,
-                    .card = false,
                     .elapsed_ms = s.elapsed_ms,
                 } });
             }

@@ -45,15 +45,13 @@ pub const CoreEvent = union(enum) {
     /// backend 决定是否开颜色括号。
     stream_begin,
 
-    /// 工具开始执行。
-    /// card=true:per-toolUse 进度卡(WebSearch 类,hasProgressCard)→ backend addToolCard。
-    /// card=false:普通工具的滚动历史起始卡(showStartCard)→ backend renderStart→scrollback。
-    /// 注:spinner 喂走独立的 set_current_tool(每轮只喂第一个工具)。
+    /// 工具开始执行。agent_loop 无条件发(每个 run slot 一个);backend 据 name 自决渲染:
+    /// hasProgressCard(WebSearch)→ addToolCard;showStartCard → renderStart→scrollback;
+    /// 都不是 → 跳过(AskUserQuestion/plan/Skill 走专门 UI)。spinner 喂也由 backend 自决。
     tool_start: struct {
         id: []const u8,
         name: []const u8,
         input: []const u8,
-        card: bool,
     },
 
     /// 把当前工具喂底部 spinner(每轮第一个普通工具)。取代旧 setCurrentTool。
@@ -70,16 +68,14 @@ pub const CoreEvent = union(enum) {
     /// 清除底部 spinner 当前工具(本轮工具执行完)。取代旧 clearCurrentTool。
     clear_current_tool,
 
-    /// 工具执行完成。
-    /// card=true:清 per-toolUse 进度卡(WebSearch)→ backend clearToolCard。
-    /// card=false:渲染结果卡到滚动历史(Edit diff/摘要)→ backend renderResult→scrollback。
+    /// 工具执行完成。agent_loop 无条件发;backend 据 name 自决:
+    /// hasProgressCard → clearToolCard;否则 renderResult→scrollback(showStartCard=false 跳过)。
     tool_result: struct {
         id: []const u8,
         name: []const u8,
         input: []const u8,
         content: []const u8,
         is_error: bool,
-        card: bool,
         elapsed_ms: u64 = 0,
     },
 
@@ -141,12 +137,11 @@ test "CoreEvent.text_chunk 可 JSON 序列化" {
     try std.testing.expect(std.mem.indexOf(u8, out, "hello") != null);
 }
 
-test "CoreEvent.tool_start 可 JSON 序列化(含 card 标志)" {
+test "CoreEvent.tool_start 可 JSON 序列化(backend 据 name 自决渲染)" {
     const ev = CoreEvent{ .tool_start = .{
         .id = "tu_1",
         .name = "WebSearch",
         .input = "{\"q\":\"zig\"}",
-        .card = true,
     } };
     const out = try std.json.Stringify.valueAlloc(std.testing.allocator, ev, .{});
     defer std.testing.allocator.free(out);

@@ -84,6 +84,10 @@ pub const TuiBackend = struct {
     input_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     input_thread: ?std.Thread = null,
 
+    /// 本轮 spinner 是否已喂工具(从 tool_start 自决喂第一个普通工具;clear_current_tool 重置)。
+    /// agent_loop 不再预算"喂哪个工具"——backend 据 tool_card 分类自决,层泄漏修复。
+    spinner_fed: bool = false,
+
     pub fn init(region: *RenderRegion) TuiBackend {
         return .{ .region = region };
     }
@@ -116,24 +120,35 @@ pub const TuiBackend = struct {
             },
             .text_chunk => |t| self.region.writeGenAssistantText(t),
             .tool_start => |s| {
-                if (s.card) {
+                // backend 据 tool_card 分类自决渲染(层泄漏修复:agent_loop 无条件发,不碰 tool_card)。
+                if (tool_card.hasProgressCard(s.name)) {
+                    // WebSearch 类:per-toolUse 进度卡(不喂 spinner)。
                     self.region.addToolCard(s.id, s.name, util_time.nowMs());
-                } else {
-                    // verbose:旧 agent_loop:387 的 `\n\x1b[35m[Tool: name]\x1b[0m`。
+                } else if (tool_card.showStartCard(s.name)) {
                     if (self.verbose) {
                         var buf: [256]u8 = undefined;
                         const v = std.fmt.bufPrint(&buf, "\n\x1b[35m[Tool: {s}]\x1b[0m", .{s.name}) catch null;
                         if (v) |line| self.region.writeGenText(line);
                     }
-                    // 滚动历史起始卡(renderStart)。需 theme+alloc。
+                    // 滚动历史起始卡(renderStart)。
                     self.renderCardStart(s.name, s.input);
+                    // 本轮第一个普通工具喂底部 spinner(取代旧 agent_loop 预算的 set_current_tool)。
+                    if (!self.spinner_fed) {
+                        self.region.setCurrentTool(s.name, util_time.nowMs());
+                        self.spinner_fed = true;
+                    }
                 }
+                // showStartCard=false(AskUserQuestion/plan/Skill)→ 跳过(走专门 UI)。
             },
             .set_current_tool => |s| self.region.setCurrentTool(s.name, util_time.nowMs()),
             .tool_progress => |p| self.region.setToolProgress(p.id, p.text),
-            .clear_current_tool => self.region.clearCurrentTool(),
+            .clear_current_tool => {
+                self.region.clearCurrentTool();
+                self.spinner_fed = false; // 本轮结束,重置喂 spinner 标志。
+            },
             .tool_result => |r| {
-                if (r.card) {
+                // backend 自决(同 tool_start):进度卡工具清卡,普通工具渲染结果卡。
+                if (tool_card.hasProgressCard(r.name)) {
                     self.region.clearToolCard(r.id);
                 } else {
                     self.renderCardResult(r);

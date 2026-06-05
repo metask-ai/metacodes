@@ -68,8 +68,10 @@ pub const WriterBackend = struct {
             },
             .text_chunk => |t| self.emit(t),
             .tool_start => |s| {
-                // 仅 verbose 普通工具行(对齐旧 agent_loop:387);card=true / 起始卡 no-op。
-                if (!s.card and self.verbose) {
+                // verbose 普通工具行(对齐旧 agent_loop:387)。WriterBackend 是 core 层,
+                // 不 import UI widget tool_card 做分类(层泄漏);verbose 下打所有工具名即可
+                // (headless/非主路径,多打进度卡工具名无害)。
+                if (self.verbose) {
                     var buf: [256]u8 = undefined;
                     const v = std.fmt.bufPrint(&buf, "\n\x1b[35m[Tool: {s}]\x1b[0m", .{s.name}) catch return;
                     self.emit(v);

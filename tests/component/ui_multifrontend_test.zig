@@ -157,8 +157,8 @@ test "阶段E: HeadlessBackend 每个 CoreEvent → 可解析的 JSON 行" {
 
     be.emitEvent(.stream_begin);
     be.emitEvent(.{ .text_chunk = "答案是" });
-    be.emitEvent(.{ .tool_start = .{ .id = "tu1", .name = "Bash", .input = "{}", .card = false } });
-    be.emitEvent(.{ .tool_result = .{ .id = "tu1", .name = "Bash", .input = "{}", .content = "ok", .is_error = false, .card = false, .elapsed_ms = 12 } });
+    be.emitEvent(.{ .tool_start = .{ .id = "tu1", .name = "Bash", .input = "{}" } });
+    be.emitEvent(.{ .tool_result = .{ .id = "tu1", .name = "Bash", .input = "{}", .content = "ok", .is_error = false, .elapsed_ms = 12 } });
     be.emitEvent(.{ .usage = .{ .input_tokens = 5, .output_tokens = 3 } });
     be.emitEvent(.stream_done);
 

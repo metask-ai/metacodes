@@ -68,9 +68,9 @@ test "mock backend: emit 序列被完整记录" {
     const be = mb.backend();
 
     be.emitEvent(.{ .text_chunk = "hi" });
-    be.emitEvent(.{ .tool_start = .{ .id = "t1", .name = "Bash", .input = "{}", .card = false } });
+    be.emitEvent(.{ .tool_start = .{ .id = "t1", .name = "Bash", .input = "{}" } });
     be.emitEvent(.{ .tool_progress = .{ .id = "t1", .text = "running" } });
-    be.emitEvent(.{ .tool_result = .{ .id = "t1", .name = "Bash", .input = "{}", .content = "ok", .is_error = false, .card = false } });
+    be.emitEvent(.{ .tool_result = .{ .id = "t1", .name = "Bash", .input = "{}", .content = "ok", .is_error = false } });
     be.emitEvent(.stream_done);
 
     try testing.expectEqual(@as(usize, 5), mb.events.items.len);
@@ -120,31 +120,33 @@ test "TuiBackend.emit: set_current_tool / clear_current_tool → spinner 状态"
     try testing.expectEqual(@as(usize, 0), region.ui.tools.currentSlice().len);
 }
 
-test "TuiBackend.emit: tool_start(card=false) 无 theme → 不渲染卡(不崩)" {
+test "TuiBackend.emit: tool_start(普通工具)→ backend 自决喂 spinner(spinner_fed)" {
     var region = try makeRegion(testing.allocator);
     defer region.deinit();
-    // 无 theme/alloc → renderCardStart 直接跳过(等价旧 headless 无 theme)。
     var tb = tui_backend.TuiBackend.init(&region);
     const be = tb.backend();
-    be.emitEvent(.{ .tool_start = .{ .id = "x", .name = "Grep", .input = "{}", .card = false } });
-    // 不喂 spinner(card=false 只渲滚动卡);spinner 仍空。
+    be.emitEvent(.{ .tool_start = .{ .id = "x", .name = "Grep", .input = "{}" } });
+    // 层泄漏修复后:spinner 喂归 backend。普通工具(showStartCard,非进度卡)→ 喂第一个。
+    try testing.expectEqualStrings("Grep", region.ui.tools.currentSlice());
+    // clear_current_tool 重置 spinner_fed,清当前工具。
+    be.emitEvent(.clear_current_tool);
     try testing.expectEqual(@as(usize, 0), region.ui.tools.currentSlice().len);
 }
 
-test "TuiBackend.emit: tool_start(card=true) → addToolCard + progress + clear" {
+test "TuiBackend.emit: tool_start(WebSearch) → backend 自决进度卡 addToolCard + progress + clear" {
     var region = try makeRegion(testing.allocator);
     defer region.deinit();
     var tb = tui_backend.TuiBackend.init(&region);
     const be = tb.backend();
 
-    be.emitEvent(.{ .tool_start = .{ .id = "ws1", .name = "WebSearch", .input = "{}", .card = true } });
+    be.emitEvent(.{ .tool_start = .{ .id = "ws1", .name = "WebSearch", .input = "{}" } });
     try testing.expectEqual(@as(u8, 1), region.ui.tools.cards_len);
     try testing.expectEqualStrings("WebSearch", region.ui.tools.cards[0].nameSlice());
 
     be.emitEvent(.{ .tool_progress = .{ .id = "ws1", .text = "Found 3" } });
     try testing.expectEqualStrings("Found 3", region.ui.tools.cards[0].progressSlice());
 
-    be.emitEvent(.{ .tool_result = .{ .id = "ws1", .name = "WebSearch", .input = "{}", .content = "", .is_error = false, .card = true } });
+    be.emitEvent(.{ .tool_result = .{ .id = "ws1", .name = "WebSearch", .input = "{}", .content = "", .is_error = false } });
     try testing.expectEqual(@as(u8, 0), region.ui.tools.cards_len);
 }
 
@@ -292,7 +294,7 @@ test "WriterBackend 字节锁: verbose tool_start(card=false) == legacy [Tool: n
     defer cap.deinit();
     var wb = writer_backend.WriterBackend{ .sink_ctx = @ptrCast(&cap), .sink = CaptureSink.sink, .verbose = true };
     const be = wb.backend();
-    be.emitEvent(.{ .tool_start = .{ .id = "t", .name = "Bash", .input = "{}", .card = false } });
+    be.emitEvent(.{ .tool_start = .{ .id = "t", .name = "Bash", .input = "{}" } });
     try testing.expectEqualStrings("\n\x1b[35m[Tool: Bash]\x1b[0m", cap.buf.items);
 }
 
@@ -302,11 +304,11 @@ test "WriterBackend: 卡/spinner/progress/usage 事件全 no-op(print-only 不�
     var wb = writer_backend.WriterBackend{ .sink_ctx = @ptrCast(&cap), .sink = CaptureSink.sink, .verbose = false };
     const be = wb.backend();
 
-    be.emitEvent(.{ .tool_start = .{ .id = "t", .name = "WebSearch", .input = "{}", .card = true } });
+    be.emitEvent(.{ .tool_start = .{ .id = "t", .name = "WebSearch", .input = "{}" } });
     be.emitEvent(.{ .set_current_tool = .{ .name = "Bash" } });
     be.emitEvent(.{ .tool_progress = .{ .id = "t", .text = "Found 3" } });
     be.emitEvent(.clear_current_tool);
-    be.emitEvent(.{ .tool_result = .{ .id = "t", .name = "Bash", .input = "{}", .content = "ok", .is_error = false, .card = false, .elapsed_ms = 10 } });
+    be.emitEvent(.{ .tool_result = .{ .id = "t", .name = "Bash", .input = "{}", .content = "ok", .is_error = false, .elapsed_ms = 10 } });
     be.emitEvent(.{ .usage = .{ .input_tokens = 5 } });
     be.emitEvent(.{ .phase_change = .generating });
     // verbose=false tool_start(card=false) 也不发 → 全程零字节。
