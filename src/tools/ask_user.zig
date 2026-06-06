@@ -14,7 +14,10 @@ const std = @import("std");
 const common = @import("common.zig");
 const util_json = @import("../util/json.zig");
 const answer_queue = @import("../core/answer_queue.zig");
-const ToolContext = @import("context.zig").ToolContext;
+const context = @import("context.zig");
+const ToolContext = context.ToolContext;
+const AskQuestion = context.AskQuestion;
+const AskOption = context.AskOption;
 
 /// 从 option 对象取 label(必有);非对象或无 label → error。
 fn optionLabel(o: std.json.Value) ![]const u8 {
@@ -46,30 +49,15 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     var answers = std.ArrayList([]const u8).empty;
     defer {
-        for (answers.items) |a| allocator.free(a);
+        for (answers.items) |a| allocator.free(@constCast(a));
         answers.deinit(allocator);
     }
 
-    for (qs_v.array.items) |q_v| {
-        if (q_v != .object) return error.InvalidArgs;
-        const question_v = q_v.object.get("question") orelse return error.InvalidArgs;
-        const options_v = q_v.object.get("options") orelse return error.InvalidArgs;
-        if (question_v != .string or options_v != .array) return error.InvalidArgs;
-        if (options_v.array.items.len < 2 or options_v.array.items.len > 4) return error.InvalidArgs;
-        // header(可选,短标签;无则 "");multiSelect(可选,默认 false)。
-        const header: []const u8 = if (q_v.object.get("header")) |h|
-            (if (h == .string) h.string else "")
-        else
-            "";
-        const multi: bool = if (q_v.object.get("multiSelect")) |m|
-            (m == .bool and m.bool)
-        else
-            false;
-        // 校验每个 option 都有合法 label(早失败,不进交互/队列)。
-        for (options_v.array.items) |o| _ = try optionLabel(o);
-
-        // 预置应答队列(Stage 3 e2e):弹一条作为本问应答。
-        if (answer_queue.wasLoaded()) {
+    // 应答队列路径(Stage 3 e2e:非交互,逐问从队列弹应答)。校验同交互路径(早失败)。
+    if (answer_queue.wasLoaded()) {
+        for (qs_v.array.items) |q_v| {
+            const options_v = try validateQuestion(q_v);
+            const multi = questionMulti(q_v);
             if (answer_queue.pop()) |picked| {
                 const ans = try resolveAnswer(picked, options_v.array.items, multi, allocator);
                 try answers.append(allocator, ans);
@@ -78,11 +66,32 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
                 const txt = try optionLabel(options_v.array.items[0]);
                 try answers.append(allocator, try allocator.dupe(u8, txt));
             }
-            continue;
         }
+    } else {
+        // 交互路径:校验 + 构造 []AskQuestion,经回调让 TUI backend(主线程)渲染可交互对话框。
+        // 回调缺失(headless/WriterBackend/单测)→ NotATty(与非 tty 拒绝语义一致)。
+        const ask_fn = ctx.ask_question_fn orelse return error.NotATty;
+        const ask_state = ctx.ask_question_state orelse return error.NotATty;
 
-        const ans = try askOne(question_v.string, header, options_v.array.items, multi, allocator);
-        try answers.append(allocator, ans);
+        var qlist = std.ArrayList(AskQuestion).empty;
+        defer qlist.deinit(allocator);
+        for (qs_v.array.items) |q_v| {
+            const options_v = try validateQuestion(q_v);
+            var opts = std.ArrayList(AskOption).empty;
+            errdefer opts.deinit(allocator);
+            for (options_v.array.items) |o| {
+                try opts.append(allocator, .{ .label = try optionLabel(o), .description = optionDesc(o) });
+            }
+            try qlist.append(allocator, .{
+                .question = q_v.object.get("question").?.string, // validateQuestion 已确保 .string
+                .header = questionHeader(q_v),
+                .multi = questionMulti(q_v),
+                .options = try opts.toOwnedSlice(allocator),
+            });
+        }
+        defer for (qlist.items) |q| allocator.free(@constCast(q.options));
+
+        try ask_fn(ask_state, allocator, qlist.items, &answers);
     }
 
     // 序列化 answers
@@ -97,43 +106,28 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     return try aw.toOwnedSlice();
 }
 
-/// 打印 header + 问题 + 选项(label[ — desc]),读用户输入。返回选中 label(s)(owned)。
-/// 单选:一个数字。多选:逗号分隔数字(如 1,3),label 用 ", " 拼接。
-fn askOne(question: []const u8, header: []const u8, options: []const std.json.Value, multi: bool, allocator: std.mem.Allocator) ![]const u8 {
-    // 打印到 stderr(不污染 stdout 的工具输出流)。
-    if (header.len > 0) std.debug.print("\n\x1b[2m{s}\x1b[0m", .{header});
-    std.debug.print("\n\x1b[1m? {s}\x1b[0m\n", .{question});
-    for (options, 0..) |o, idx| {
-        const label = try optionLabel(o);
-        const desc = optionDesc(o);
-        if (desc.len > 0) {
-            std.debug.print("  \x1b[36m{d})\x1b[0m {s} \x1b[2m— {s}\x1b[0m\n", .{ idx + 1, label, desc });
-        } else {
-            std.debug.print("  \x1b[36m{d})\x1b[0m {s}\n", .{ idx + 1, label });
-        }
-    }
+/// 校验单个 question 对象(question 是 string、options 是 2-4 长 array、每 option 有合法 label)。
+/// 返回 options 的 json array Value(供两路径共用)。任一不合规 → InvalidArgs(早失败)。
+fn validateQuestion(q_v: std.json.Value) !std.json.Value {
+    if (q_v != .object) return error.InvalidArgs;
+    const question_v = q_v.object.get("question") orelse return error.InvalidArgs;
+    const options_v = q_v.object.get("options") orelse return error.InvalidArgs;
+    if (question_v != .string or options_v != .array) return error.InvalidArgs;
+    if (options_v.array.items.len < 2 or options_v.array.items.len > 4) return error.InvalidArgs;
+    for (options_v.array.items) |o| _ = try optionLabel(o);
+    return options_v;
+}
 
-    while (true) {
-        if (multi) {
-            std.debug.print("Choose (逗号分隔多个, 如 1,3) [1-{d}]: ", .{options.len});
-        } else {
-            std.debug.print("Choose [1-{d}]: ", .{options.len});
-        }
-        var line_buf: [256]u8 = undefined;
-        const n = std.c.read(0, &line_buf, line_buf.len);
-        if (n <= 0) return error.InputAborted;
-        const line = std.mem.trim(u8, line_buf[0..@intCast(n)], " \t\r\n");
-        if (line.len == 0) continue;
+/// header(可选短标签;无/非字符串 → "")。
+fn questionHeader(q_v: std.json.Value) []const u8 {
+    const h = q_v.object.get("header") orelse return "";
+    return if (h == .string) h.string else "";
+}
 
-        if (multi) {
-            // 解析逗号分隔的数字,收集选中 label,用 ", " 拼接。
-            if (try parseMultiChoice(line, options, allocator)) |joined| return joined;
-            continue; // 解析失败 → 重提示
-        }
-        const choice = std.fmt.parseInt(usize, line, 10) catch continue;
-        if (choice < 1 or choice > options.len) continue;
-        return try allocator.dupe(u8, try optionLabel(options[choice - 1]));
-    }
+/// multiSelect(可选,默认 false)。
+fn questionMulti(q_v: std.json.Value) bool {
+    const m = q_v.object.get("multiSelect") orelse return false;
+    return m == .bool and m.bool;
 }
 
 /// 解析逗号分隔的数字序号(1-based),返回选中 label 用 ", " 拼接(owned)。

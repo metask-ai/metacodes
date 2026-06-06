@@ -82,8 +82,9 @@ def test_e2e_monitor(bin_path):
 def test_e2e_askuserquestion(bin_path):
     if SKIP:
         return
-    # AskUserQuestion 阻塞读 stdin(tty 下打印数字选项,读一行数字)。
-    # driver 提问后喂 "1\n" 应答。expect_tool_ok=True:硬校验工具 execute 成功(无 is_error)——
+    # AskUserQuestion 走 TUI 可交互对话框(dialog/ask_question.zig,drawBox + ↑↓/数字 + enter)。
+    # TuiBackend.askQuestion 停 watcher + 持渲染锁 + 主线程独占 fd0 渲染(对齐 cc)。
+    # 这里喂数字 "1" 选第一项;expect_tool_ok=True 硬校验 execute 成功(无 is_error)——
     # 这条曾漏过 InvalidArgs bug(options 对象数组被当字符串数组解析失败,旧判据只看工具被调用判绿)。
     assert_tool_e2e(
         bin_path,
@@ -94,6 +95,25 @@ def test_e2e_askuserquestion(bin_path):
         require_card=False,
         accept_tools=["AskUserQuestion"],
         extra_keys=["type:1", "key:enter", "sleep:4"],
+        expect_tool_ok=True,
+    )
+
+
+def test_e2e_askuserquestion_arrow_nav(bin_path):
+    if SKIP:
+        return
+    # 方向键导航变体(新交互层独有,旧裸 read 行无法测):喂 ↓ 移到第二项 + enter 确认。
+    # 验证 drawBox 对话框 + ↑↓ 高亮选择端到端工作(用户原报"看不到可交互层"的核心修复)。
+    # 真模型对选项命名有漂移,故只硬校验 tool_ok + 工具被调,不断言具体 answer 文本。
+    assert_tool_e2e(
+        bin_path,
+        "Ask me a multiple choice question about which color I prefer, with options red green blue",
+        "AskUserQuestion",
+        required_keys=["questions"],
+        wait_s=12,
+        require_card=False,
+        accept_tools=["AskUserQuestion"],
+        extra_keys=["key:down", "sleep:0.5", "key:enter", "sleep:5"],
         expect_tool_ok=True,
     )
 

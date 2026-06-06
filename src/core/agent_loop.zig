@@ -135,6 +135,14 @@ pub const Options = struct {
         state: *anyopaque,
         allocator: std.mem.Allocator,
     ) anyerror!?@import("../tools/worktree.zig").WorktreeEntry = null,
+    /// AskUserQuestion 交互回调(state 指 *TuiBackend)。仅顶层 TUI 接(agent_depth==0)。
+    ask_question_state: ?*anyopaque = null,
+    ask_question_fn: ?*const fn (
+        state: *anyopaque,
+        allocator: std.mem.Allocator,
+        questions: []const @import("../tools/context.zig").AskQuestion,
+        out_answers: *std.ArrayList([]const u8),
+    ) anyerror!void = null,
     /// MCP session 列表(ListMcpResourcesTool/ReadMcpResourceTool 用)。
     mcp_sessions: ?*const []@import("../app.zig").McpSessionEntry = null,
     /// Cron registry(CronCreate/Delete/List 用)。
@@ -602,6 +610,12 @@ pub fn run(
             };
             base_ctx.progress_state = @constCast(@ptrCast(backend));
             base_ctx.progress_fn = &Tramp.cb;
+        }
+
+        // AskUserQuestion 回调:仅顶层 TUI(depth==0)接——子 agent 无 tty,不弹对话框。
+        if (opts.ask_question_fn != null and opts.agent_depth == 0) {
+            base_ctx.ask_question_state = opts.ask_question_state;
+            base_ctx.ask_question_fn = opts.ask_question_fn;
         }
 
         // 6c. 分批并发执行。过程态(TTY 顶层):无条件 emit tool_start(每个 run slot);

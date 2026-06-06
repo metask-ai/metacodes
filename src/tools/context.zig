@@ -23,6 +23,19 @@ const Client = @import("../client.zig").Client;
 const ToolDefinition = @import("../json.zig").ToolDefinition;
 const DynRegistry = @import("dynamic.zig").DynRegistry;
 
+/// AskUserQuestion 的结构化输入(解析+校验在 ask_user.zig 做,渲染在 dialog/ask_question.zig)。
+/// 放在中性的 context 层:所有工具已 import 它,避免 ask_user.zig ↔ tui dialog 的循环依赖。
+pub const AskOption = struct {
+    label: []const u8,
+    description: []const u8,
+};
+pub const AskQuestion = struct {
+    question: []const u8,
+    header: []const u8,
+    multi: bool,
+    options: []const AskOption,
+};
+
 pub const ToolContext = struct {
     allocator: std.mem.Allocator,
     abort: ?*const AbortSignal = null,
@@ -110,6 +123,19 @@ pub const ToolContext = struct {
     progress_state: ?*anyopaque = null,
     progress_tool_id: []const u8 = "",
     progress_fn: ?*const fn (state: *anyopaque, id: []const u8, phase: ProgressPhase, text: []const u8, count: u32) void = null,
+
+    /// AskUserQuestion 交互回调:工具(主线程)把校验好的 questions 交给 TUI backend,
+    /// backend 停 watcher + 持渲染锁 + 独占 fd0 渲染可交互对话框,把选中的 label(s) append 进
+    /// out_answers(每问一条,多选用 ", " 拼接;owned by allocator,caller free)。
+    /// state 指向 *TuiBackend(经 trampoline)。null = 无 TUI(headless/单测/子 agent)→ 工具回退 NotATty。
+    /// questions 借用(工具栈上构造,回调同步消费,不跨调用持有)。
+    ask_question_state: ?*anyopaque = null,
+    ask_question_fn: ?*const fn (
+        state: *anyopaque,
+        allocator: std.mem.Allocator,
+        questions: []const AskQuestion,
+        out_answers: *std.ArrayList([]const u8),
+    ) anyerror!void = null,
 
     /// 工具进度阶段(对齐 cc WebSearchProgress 两态)。
     pub const ProgressPhase = enum { query_update, results_received };

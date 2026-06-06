@@ -43,6 +43,8 @@ const input = @import("../input.zig");
 const app_mod = @import("../../app.zig");
 const transcript_viewer = @import("../transcript_viewer.zig");
 const term = @import("term.zig");
+const ask_dialog = @import("dialog/ask_question.zig");
+const tool_ctx = @import("../../tools/context.zig");
 
 const RenderRegion = render_region.RenderRegion;
 const Theme = theme_mod.Theme;
@@ -275,6 +277,44 @@ pub const TuiBackend = struct {
         }
     }
 
+    /// AskUserQuestion 回调(经 ToolContext.ask_question_fn 注入,工具在 agent_loop 主线程调)。
+    /// 渲染可交互对话框,把选中 label(s) append 进 out。序列(顺序铁律见 plan):
+    ///   ① stopInput:停 watcher,主线程接管 fd0(此刻主线程不持锁 → 与 watcher 短临界区不死锁)。
+    ///   ② enterExclusiveOverlay:持渲染锁(挡 emit 线程)+ 擦生成期固定区(冻结、给对话框干净屏)。
+    ///   ③ defer 退出时:exitExclusiveOverlay 重画固定区 + 退锁;再 startInput 重启 watcher(spinner/esc 恢复)。
+    ///   ④ ask_dialog.run:主线程独占 fd0 跑 wizard。它绝不碰 region 渲染方法(非递归 mutex 自死锁)。
+    /// 非 tty / 无 app → NotATty(工具回退)。run 内 ESC/Ctrl+C → InputAborted 经 defer 清理后上传。
+    fn askQuestion(
+        self: *TuiBackend,
+        allocator: std.mem.Allocator,
+        questions: []const tool_ctx.AskQuestion,
+        out: *std.ArrayList([]const u8),
+    ) anyerror!void {
+        const fd = self.input_fd;
+        if (!term.isatty(fd)) return error.NotATty;
+        const app = self.input_app orelse return error.NotATty;
+        const th = if (self.theme) |t| t.* else theme_mod.dark;
+
+        self.stopInput(); // ① 停 watcher(此前主线程不持锁)
+        self.region.enterExclusiveOverlay(); // ② 持锁 + 擦固定区
+        defer {
+            self.region.exitExclusiveOverlay(app); // ③ 重画固定区 + 退锁
+            if (self.input_alloc) |a| self.startInput(fd, app, a) catch {}; // 重启 watcher(失败降级,不崩)
+        }
+        try ask_dialog.run(allocator, th, fd, questions, out); // ④ 独占 fd0 跑 wizard
+    }
+
+    /// trampoline:ToolContext.ask_question_fn 的 *anyopaque state → *TuiBackend。
+    pub fn askQuestionTrampoline(
+        state: *anyopaque,
+        allocator: std.mem.Allocator,
+        questions: []const tool_ctx.AskQuestion,
+        out: *std.ArrayList([]const u8),
+    ) anyerror!void {
+        const self: *TuiBackend = @ptrCast(@alignCast(state));
+        return self.askQuestion(allocator, questions, out);
+    }
+
     /// 生成期 stdin 监听主循环(从旧 loop.zig stdinAbortWatcher 原样搬入)。
     /// 行为不变:回车→入队(queue);esc→已打字先入队再 abort(直戳 AbortSignal);
     /// 超时→孤立 ESC 兑现 or tickSpinner。AbortSignal 机制完全不动。
@@ -402,4 +442,6 @@ pub const TuiBackend = struct {
 
 test {
     std.testing.refAllDecls(@This());
+    // 显式收录子模块 test(refAllDecls 非递归):ask_question dialog 的 render/joinChecked 单测。
+    _ = ask_dialog;
 }
