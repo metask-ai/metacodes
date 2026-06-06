@@ -14,7 +14,7 @@
 //!
 //! 命令预览(`$ git status` 那行)按工具分类生成:
 //!   Bash      → "$ {command}"
-//!   Read      → "📄 {path}"  (mono: "R {path}")
+//!   Read      → "{basename}"  (对齐 cc:无 icon、basename 非完整路径)
 //!   Edit/Write → "± {path}" (mono: "E {path}")
 //!   其它      → "" (省略)
 
@@ -1196,7 +1196,8 @@ fn toolPreview(alloc: std.mem.Allocator, tool_name: []const u8, args: []const u8
         }
     } else if (std.mem.eql(u8, tool_name, "Read")) {
         if (extractField(args, "file_path") orelse extractField(args, "path")) |p| {
-            return try std.fmt.allocPrint(alloc, "📄 {s}", .{p});
+            // 对齐 cc:Read 卡 ⎿ 行只显 basename,**无 📄 icon、无完整路径**(实测 `  ⎿  CLAUDE.md`)。
+            return try alloc.dupe(u8, basename(p));
         }
     } else if (std.mem.eql(u8, tool_name, "Edit") or std.mem.eql(u8, tool_name, "Write") or std.mem.eql(u8, tool_name, "NotebookEdit")) {
         if (extractField(args, "file_path") orelse extractField(args, "path")) |p| {
