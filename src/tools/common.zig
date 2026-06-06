@@ -132,6 +132,14 @@ pub fn spawnCaptureStdoutAbortableTimed(
         _ = std.c.setpgid(0, 0); // 新进程组；killpg 可杀整组
         _ = std.c.close(pipefd[0]);
         _ = std.c.dup2(pipefd[1], 1);
+        // stderr → /dev/null：本函数是 stdout-only 捕获，子进程(git/rg/...)的 stderr
+        // 绝不能泄漏到终端污染 TUI(实测:非 git 目录跑 `git log` → `fatal: not a git
+        // repository` 直接打到屏上)。要 stderr 的调用方用 *WithStderr 变体。
+        const devnull = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+        if (devnull >= 0) {
+            _ = std.c.dup2(devnull, 2);
+            if (devnull != 2) _ = std.c.close(devnull);
+        }
         _ = std.c.close(pipefd[1]);
 
         const argv0 = argv[0] orelse std.c._exit(127);

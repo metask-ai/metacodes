@@ -193,9 +193,22 @@ class Screen:
         f = chr(final)
         n1 = ps[0] if ps else 0
         if private:
-            # ?25l/h 光标显隐;其余私有模式吞掉
+            # ?25l/h 光标显隐
             if private == b"?" and ps and ps[0] == 25:
                 self.cursor_visible = f == "h"
+            # ?1049h/l alt-screen:h=保存主屏(grid+光标)并清屏切到 alt;l=恢复主屏到进入前。
+            # 真实终端行为——transcript viewer 靠它保护 scrollback、退出原样恢复输入框。
+            elif private == b"?" and ps and ps[0] == 1049:
+                if f == "h":
+                    self._alt_saved = ([row[:] for row in self.grid], self.row, self.col, self.scrolled)
+                    self.grid = [[Cell() for _ in range(self.cols)] for _ in range(self.rows)]
+                    self.row = 0
+                    self.col = 0
+                elif f == "l":
+                    saved = getattr(self, "_alt_saved", None)
+                    if saved is not None:
+                        self.grid, self.row, self.col, self.scrolled = saved
+                        self._alt_saved = None
             return
         if f == "A":  # up
             self.row = max(0, self.row - max(1, n1))

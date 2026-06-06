@@ -9,6 +9,7 @@ const cc = @import("cc");
 
 const ui = cc.tui_ui;
 const ui_state = cc.tui_ui_state;
+const event = cc.tui_event;
 const capture = cc.tui_test_capture;
 const theme_mod = cc.tui_theme;
 
@@ -29,34 +30,6 @@ test "render: help_open 在输入帧 footer 区投影多列快捷键(非模态,�
     try capture.expectContains(out, "Shift+Tab");
     try capture.expectContains(out, "❯"); // 输入框仍在(非模态)
     try testing.expect(frame.rows > 1);
-}
-
-test "render: overlay=transcript 投影注入的对话行" {
-    var s = UiState{ .overlay = .transcript, .transcript_top = 0, .rows = 10 };
-    const lines = [_][]const u8{ "user: hi", "assistant: hello", "user: bye" };
-    var cw = capture.CaptureWriter.init(testing.allocator);
-    defer cw.deinit();
-    var in = mkInputs(&s);
-    in.transcript_lines = &lines;
-    _ = try ui.render(&cw, in);
-    const stripped = try capture.stripAnsi(testing.allocator, cw.output());
-    defer testing.allocator.free(stripped);
-    try capture.expectContains(stripped, "hello");
-    try capture.expectContains(stripped, "transcript");
-}
-
-test "render: transcript 滚动窗口跳过 top 之前的行" {
-    var s = UiState{ .overlay = .transcript, .transcript_top = 2, .rows = 10 };
-    const lines = [_][]const u8{ "L0", "L1", "L2_visible", "L3_visible" };
-    var cw = capture.CaptureWriter.init(testing.allocator);
-    defer cw.deinit();
-    var in = mkInputs(&s);
-    in.transcript_lines = &lines;
-    _ = try ui.render(&cw, in);
-    const stripped = try capture.stripAnsi(testing.allocator, cw.output());
-    defer testing.allocator.free(stripped);
-    try capture.expectContains(stripped, "L2_visible");
-    try testing.expect(std.mem.indexOf(u8, stripped, "L0") == null); // top 之前不显示
 }
 
 test "render: input 帧含 editor view + footer,绝不含 \\x1b[2J" {
@@ -125,7 +98,6 @@ test "E2E 内存级: ? 开 help → render help 帧 → 任意键关 → render 
     const e1 = ui.dispatch(&s, .{ .key = .{ .key = .{ .char = '?' } } });
     try testing.expect(e1.redraw_region);
     try testing.expect(s.help_open);
-    try testing.expectEqual(ui_state.Overlay.none, s.overlay); // help 不再是 overlay
     {
         var cw = capture.CaptureWriter.init(testing.allocator);
         defer cw.deinit();
@@ -144,21 +116,15 @@ test "E2E 内存级: ? 开 help → render help 帧 → 任意键关 → render 
     }
 }
 
-test "E2E 内存级: Ctrl+O 开 transcript → render transcript 帧 → 再 Ctrl+O 关" {
+test "dispatch: Ctrl+O 上抛 open_transcript(alt-screen,不改 UiState 渲染态)" {
+    // transcript 现走 alt-screen viewer(transcript_viewer.zig),Ctrl+O 只上抛 LoopAction,
+    // 不改 UiState、不嵌入式渲染。渲染帧仍是普通输入帧。
     var s = UiState{ .rows = 10 };
-    const lines = [_][]const u8{ "conv line A", "conv line B" };
-    _ = ui.dispatch(&s, .{ .key = .{ .key = .ctrl_o } });
-    try testing.expectEqual(ui_state.Overlay.transcript, s.overlay);
-    {
-        var cw = capture.CaptureWriter.init(testing.allocator);
-        defer cw.deinit();
-        var in = mkInputs(&s);
-        in.transcript_lines = &lines;
-        _ = try ui.render(&cw, in);
-        const stripped = try capture.stripAnsi(testing.allocator, cw.output());
-        defer testing.allocator.free(stripped);
-        try capture.expectContains(stripped, "conv line A");
-    }
-    _ = ui.dispatch(&s, .{ .key = .{ .key = .ctrl_o } });
-    try testing.expectEqual(ui_state.Overlay.none, s.overlay);
+    const eff = ui.dispatch(&s, .{ .key = .{ .key = .ctrl_o } });
+    try testing.expectEqual(event.LoopAction.open_transcript, eff.action);
+    // 渲染仍是输入帧(含 ❯),不含 transcript 标题。
+    var cw = capture.CaptureWriter.init(testing.allocator);
+    defer cw.deinit();
+    _ = try ui.render(&cw, mkInputs(&s));
+    try capture.expectContains(cw.output(), "❯");
 }

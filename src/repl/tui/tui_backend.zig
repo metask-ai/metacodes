@@ -41,6 +41,8 @@ const tool_card = @import("widget/tool_card.zig");
 const theme_mod = @import("theme.zig");
 const input = @import("../input.zig");
 const app_mod = @import("../../app.zig");
+const transcript_viewer = @import("../transcript_viewer.zig");
+const term = @import("term.zig");
 
 const RenderRegion = render_region.RenderRegion;
 const Theme = theme_mod.Theme;
@@ -121,9 +123,15 @@ pub const TuiBackend = struct {
             .text_chunk => |t| self.region.writeGenAssistantText(t),
             .tool_start => |s| {
                 // backend 据 tool_card 分类自决渲染(层泄漏修复:agent_loop 无条件发,不碰 tool_card)。
-                if (tool_card.hasProgressCard(s.name)) {
-                    // WebSearch 类:per-toolUse 进度卡(不喂 spinner)。
-                    self.region.addToolCard(s.id, s.name, util_time.nowMs());
+                if (tool_card.usesDynamicCard(s.name)) {
+                    // WebSearch(progress 卡)+ 类A(Bash/Read/Grep/Glob,执行期动态卡):
+                    // 整张卡活在动态区。存 input 供动态卡第二行 `$ cmd` 预览。
+                    self.region.addToolCard(s.id, s.name, s.input, util_time.nowMs());
+                    // 类A 仍喂底部 spinner(卡 + spinner 并存,对齐 cc);WebSearch 不喂(沿用旧)。
+                    if (tool_card.usesLiveCard(s.name) and !self.spinner_fed) {
+                        self.region.setCurrentTool(s.name, util_time.nowMs());
+                        self.spinner_fed = true;
+                    }
                 } else if (tool_card.showStartCard(s.name)) {
                     if (self.verbose) {
                         var buf: [256]u8 = undefined;
@@ -147,8 +155,15 @@ pub const TuiBackend = struct {
                 self.spinner_fed = false; // 本轮结束,重置喂 spinner 标志。
             },
             .tool_result => |r| {
-                // backend 自决(同 tool_start):进度卡工具清卡,普通工具渲染结果卡。
-                if (tool_card.hasProgressCard(r.name)) {
+                // backend 自决三分支:
+                //  ① 类A(usesLiveCard):commit 动态卡进 scrollback(过去式标题)。
+                //     agent_loop 对每工具发两次 tool_result(:632 空 content / :668 真 content)——
+                //     只认 content.len>0(:668)做 commit,:632 空事件 no-op,防双 commit。
+                //  ② WebSearch(hasProgressCard):完成只移除动态卡(结果走助手文本)。
+                //  ③ 其余(类B 等):renderResult 写 scrollback(不变)。
+                if (tool_card.usesLiveCard(r.name)) {
+                    if (r.content.len > 0) self.commitToolCard(r);
+                } else if (tool_card.hasProgressCard(r.name)) {
                     self.region.clearToolCard(r.id);
                 } else {
                     self.renderCardResult(r);
@@ -211,6 +226,19 @@ pub const TuiBackend = struct {
         const card = tool_card.renderResult(a, th.*, r.name, r.input, r.content, kind, r.elapsed_ms, .{}) catch return;
         defer a.free(card);
         self.region.writeGenText(card); // 空串(hidden 成功结果) → writeGenText no-op
+    }
+
+    /// 类A 工具完成:把动态卡 commit 进 scrollback(过去式标题 + ⎿ 输入预览)。
+    /// **先 clearToolCard 从动态区移除,再 writeGenText 写 scrollback**——writeGenText→emitToScroll
+    /// 内部 erase→print→redraw,此时卡已不在动态区,故无残影/重影,无需新原子操作。
+    fn commitToolCard(self: *TuiBackend, r: anytype) void {
+        const th = self.theme orelse return;
+        const a = self.alloc orelse return;
+        const kind: tool_card.ResultKind = if (r.is_error) .err else .ok;
+        const card = tool_card.renderLiveDone(a, th.*, r.name, r.input, r.content, kind, r.elapsed_ms, .{ .cols = self.region.cols }) catch return;
+        defer a.free(card);
+        self.region.clearToolCard(r.id); // 先移除动态卡
+        self.region.writeGenText(card); // 再 commit 进 scrollback
     }
 
     fn pollImpl(self: *TuiBackend) ?UiEvent {
@@ -318,6 +346,19 @@ pub const TuiBackend = struct {
             .kill_background => {
                 _ = app.killAllBackground();
                 self.region.redrawGen(app);
+                return;
+            },
+            .open_transcript => {
+                // 生成期 Ctrl+O → alt-screen 全屏 transcript viewer。enterExclusiveOverlay 持渲染锁
+                // (emit 线程阻塞在锁上不抢 stdout)+ 擦生成期固定区;viewer 进/出 alt-screen(主屏
+                // 被冻结保存、退出自动恢复);exitExclusiveOverlay 锁内重画固定区 + 释放锁。
+                const a = self.input_alloc orelse return;
+                const sz = term.getSize(self.input_fd);
+                const rows: usize = if (sz) |s| s.rows else 24;
+                const th = if (self.theme) |t| t.* else theme_mod.dark;
+                self.region.enterExclusiveOverlay();
+                transcript_viewer.runWithTheme(self.input_fd, a, &app.conversation, rows, th) catch {};
+                self.region.exitExclusiveOverlay(app);
                 return;
             },
             // 其余(none/help/overlay/滚动/生成期被吞的键)→ dispatch/applyGenKey 已消费,不动 editor。

@@ -150,6 +150,41 @@ test "TuiBackend.emit: tool_start(WebSearch) → backend 自决进度卡 addTool
     try testing.expectEqual(@as(u8, 0), region.ui.tools.cards_len);
 }
 
+test "TuiBackend.emit: 类A(Bash)live card 两态 + 双 tool_result 只 commit 一次(R1 守卫)" {
+    // 对齐 cc 2.1.165:Bash 执行期动态卡,完成 commit 进 scrollback(过去式标题)。
+    // 关键:agent_loop 对每工具发两次 tool_result——:632 空 content / :668 真 content。
+    // 只认 content.len>0 做 commit,:632 空事件 no-op,防双 commit。本测守卫这个坑。
+    var region = try makeRegion(testing.allocator);
+    defer region.deinit();
+    var tb = tui_backend.TuiBackend.init(&region);
+    // commitToolCard 需 theme+alloc(production 在 loop.zig 构造时设);测试显式设上。
+    tb.theme = &region.theme;
+    tb.alloc = testing.allocator;
+    const be = tb.backend();
+
+    // tool_start:类A 占动态卡 + 喂底部 spinner(卡 + spinner 并存)。
+    be.emitEvent(.{ .tool_start = .{ .id = "b1", .name = "Bash", .input =
+        \\{"command":"echo hi"}
+    } });
+    try testing.expectEqual(@as(u8, 1), region.ui.tools.cards_len);
+    try testing.expectEqualStrings("Bash", region.ui.tools.cards[0].nameSlice());
+    try testing.expectEqualStrings("Bash", region.ui.tools.currentSlice()); // spinner 也喂了
+
+    // 第一次 tool_result(agent_loop:632 空事件):content="" → no-op,卡不动。
+    be.emitEvent(.{ .tool_result = .{ .id = "b1", .name = "Bash", .input =
+        \\{"command":"echo hi"}
+    , .content = "", .is_error = false } });
+    try testing.expectEqual(@as(u8, 1), region.ui.tools.cards_len); // 卡仍在,未 commit
+
+    // 第二次 tool_result(agent_loop:668 真事件):content 非空 → commit + 清卡。
+    be.emitEvent(.{ .tool_result = .{ .id = "b1", .name = "Bash", .input =
+        \\{"command":"echo hi"}
+    , .content =
+        \\{"stdout":"hi\n","exit_code":0}
+    , .is_error = false, .elapsed_ms = 100 } });
+    try testing.expectEqual(@as(u8, 0), region.ui.tools.cards_len); // 卡已 commit 移除
+}
+
 test "TuiBackend.emit: usage 累加进 usage_acc" {
     var region = try makeRegion(testing.allocator);
     defer region.deinit();
