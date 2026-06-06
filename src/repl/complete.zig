@@ -41,6 +41,40 @@ pub const SLASH_COMMANDS = blk: {
     break :blk arr;
 };
 
+/// slash 菜单是否应弹出(整行 trim 后以 `/` 开头且无空格 → 命令补全态)。
+/// 单一真相源:dispatch(导航键语义)与 drawSlashMenu(渲染)共用,防两处判定漂移。
+pub fn slashMenuOpen(line: []const u8) bool {
+    const trimmed = std.mem.trimStart(u8, line, " \t");
+    if (!std.mem.startsWith(u8, trimmed, "/")) return false;
+    if (std.mem.indexOfScalar(u8, trimmed, ' ') != null) return false;
+    return slashFilterCount(line) > 0;
+}
+
+/// 当前 `/` 前缀匹配的命令数(菜单显示的行数,也是导航上限)。
+pub fn slashFilterCount(line: []const u8) usize {
+    const trimmed = std.mem.trimStart(u8, line, " \t");
+    if (!std.mem.startsWith(u8, trimmed, "/")) return 0;
+    if (std.mem.indexOfScalar(u8, trimmed, ' ') != null) return 0;
+    var n: usize = 0;
+    for (SLASH_COMMAND_TABLE) |cmd| {
+        if (std.mem.startsWith(u8, cmd.name, trimmed)) n += 1;
+    }
+    return n;
+}
+
+/// 取第 idx 个匹配命令(0-based,顺序同 drawSlashMenu);越界返回 null。
+pub fn slashNthMatch(line: []const u8, idx: usize) ?SlashCmd {
+    const trimmed = std.mem.trimStart(u8, line, " \t");
+    if (!std.mem.startsWith(u8, trimmed, "/")) return null;
+    var n: usize = 0;
+    for (SLASH_COMMAND_TABLE) |cmd| {
+        if (!std.mem.startsWith(u8, cmd.name, trimmed)) continue;
+        if (n == idx) return cmd;
+        n += 1;
+    }
+    return null;
+}
+
 pub const Result = struct {
     /// 候选项（借用：slash 命令是静态字符串；路径是 owned，见 owns_candidates）。
     candidates: [][]const u8,

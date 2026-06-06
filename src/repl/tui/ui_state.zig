@@ -12,10 +12,6 @@ const types = @import("../../types.zig");
 /// 决策面:输入期 vs 生成期。
 pub const Phase = enum { input, generating };
 
-/// 覆盖视图:占满决策面的**模态**视图(transcript 覆盖正常输入/生成帧)。
-/// 注:`?` 帮助不是 overlay——它是非模态的 footer 区展开(见 UiState.help_open)。
-pub const Overlay = enum { none, transcript };
-
 /// 编辑器投影:borrow LineEditor.buf.items(渲染瞬时有效)。LineEditor 本体不并入 UiState。
 pub const EditorState = struct {
     view: []const u8 = "",
@@ -39,6 +35,10 @@ pub const ToolCardState = struct {
     name_len: u8 = 0,
     progress: [192]u8 = [_]u8{0} ** 192,
     progress_len: u8 = 0,
+    /// 工具入参 JSON(类A 动态卡每帧重画第二行 `$ cmd`/`📄 path` 预览需要;与 progress 正交:
+    /// progress 是 WebSearch 运行时回调写入,input 是 tool_start 时一次性存)。
+    input: [256]u8 = [_]u8{0} ** 256,
+    input_len: u16 = 0,
     start_ms: i64 = 0,
 
     pub fn idSlice(self: *const ToolCardState) []const u8 {
@@ -49,6 +49,9 @@ pub const ToolCardState = struct {
     }
     pub fn progressSlice(self: *const ToolCardState) []const u8 {
         return self.progress[0..self.progress_len];
+    }
+    pub fn inputSlice(self: *const ToolCardState) []const u8 {
+        return self.input[0..self.input_len];
     }
 };
 
@@ -92,9 +95,8 @@ pub const UiState = struct {
 
     // 决策面
     phase: Phase = .input,
-    overlay: Overlay = .none,
     /// `?` 快捷键帮助:**非模态**——footer 区原地展开多列快捷键,输入框仍在、可继续打字
-    /// (对齐 cc helpOpen,见 PromptInputFooter.tsx)。与 transcript overlay(模态)不同。
+    /// (对齐 cc helpOpen,见 PromptInputFooter.tsx)。transcript 走 alt-screen viewer,非 overlay。
     help_open: bool = false,
 
     // 编辑器投影
@@ -109,12 +111,13 @@ pub const UiState = struct {
     footer: FooterState = .{},
     panel: PanelState = .{},
 
-    // transcript overlay 滚动位置(Ctrl+O 视图态)
-    transcript_top: usize = 0,
-
     // Ctrl+X Ctrl+K 序列 arming(Emacs 风格双键前缀):Ctrl+X 后置 true,下个键消费。
     // 从 LineEditor 迁来 → dispatch 统一处理序列,两期一致(生成期也能 Ctrl+X-K 杀后台)。
     ctrl_x_armed: bool = false,
+
+    // slash 菜单选中项(对齐 cc:`/` 菜单 ↑↓ 移高亮 + Enter 选中)。menu 开时 ↑↓ 改它而非历史导航。
+    // 渲染按它高亮(accent 色);菜单关(非 `/` 态)恒重置为 0。范围由 complete.slashFilterCount 钳制。
+    slash_sel: usize = 0,
 
     // 瞬时提示(对齐 CC:"再按 Ctrl+C 退出" / "agent finished" 等)
     hint: ?[]const u8 = null,
@@ -144,7 +147,7 @@ pub fn findCard(s: *const UiState, id: []const u8) ?usize {
 }
 
 /// 追加进度卡(定长拷贝;满或重复 id 则忽略/更新)。
-pub fn addCard(s: *UiState, id: []const u8, name: []const u8, start_ms: i64) void {
+pub fn addCard(s: *UiState, id: []const u8, name: []const u8, input: []const u8, start_ms: i64) void {
     if (findCard(s, id) != null) return;
     if (s.tools.cards_len >= MAX_TOOL_CARDS) return;
     var c = &s.tools.cards[s.tools.cards_len];
@@ -154,6 +157,9 @@ pub fn addCard(s: *UiState, id: []const u8, name: []const u8, start_ms: i64) voi
     const nn = @min(name.len, c.name.len);
     @memcpy(c.name[0..nn], name[0..nn]);
     c.name_len = @intCast(nn);
+    const inn = @min(input.len, c.input.len);
+    @memcpy(c.input[0..inn], input[0..inn]);
+    c.input_len = @intCast(inn);
     c.progress_len = 0;
     c.start_ms = start_ms;
     s.tools.cards_len += 1;

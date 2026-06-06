@@ -11,6 +11,7 @@ const term = @import("term.zig");
 const Theme = @import("theme.zig").Theme;
 const ui_state = @import("ui_state.zig");
 const event = @import("event.zig");
+const complete = @import("../complete.zig");
 const agent_job_registry = @import("../../core/agent_job_registry.zig");
 
 const UiState = ui_state.UiState;
@@ -25,7 +26,6 @@ pub const RenderInputs = struct {
     use_unicode: bool = true,
     agent_snaps: []const agent_job_registry.AgentJobRegistry.JobSnapshot = &.{},
     queue_preview: []const []const u8 = &.{},
-    transcript_lines: []const []const u8 = &.{},
 };
 
 /// 一帧的几何描述(Renderer 据此做光标定位/收缩擦除)。字节已写入 render 的 w。
@@ -75,7 +75,7 @@ pub fn dispatch(state: *UiState, ev: Event) Effect {
             return .{ .redraw_region = true };
         },
         .add_tool_card => |c| {
-            ui_state.addCard(state, c.id, c.name, c.start_ms);
+            ui_state.addCard(state, c.id, c.name, c.input, c.start_ms);
             return .{ .redraw_region = true };
         },
         .clear_tool_card => |c| {
@@ -85,15 +85,22 @@ pub fn dispatch(state: *UiState, ev: Event) Effect {
         .phase_change => |p| {
             state.phase = p.to;
             if (p.to == .generating) state.spinner.frame = 0;
-            // 切换到生成期关闭任何弹出:transcript overlay + 非模态 help(生成期不弹)。
+            // 切换到生成期关闭非模态 help(生成期不弹)。
             if (p.to == .generating) {
-                state.overlay = .none;
                 state.help_open = false;
             }
             return .{ .redraw_region = true };
         },
         .editor_view => |e| {
             state.editor = .{ .view = e.view, .cursor = e.cursor };
+            // slash 菜单选中项随 buffer 变化归位:菜单关 → 重置 0;过滤变窄 → 钳到末项。
+            // (打字改前缀会重排匹配列表,选中项不归位会指向错命令。)
+            const n = complete.slashFilterCount(e.view);
+            if (n == 0) {
+                state.slash_sel = 0;
+            } else if (state.slash_sel >= n) {
+                state.slash_sel = n - 1;
+            }
             return .{ .redraw_region = true };
         },
         .job_progress => return .{ .redraw_region = true },
@@ -101,9 +108,6 @@ pub fn dispatch(state: *UiState, ev: Event) Effect {
 }
 
 fn dispatchKey(state: *UiState, key: input.Key) Effect {
-    // transcript overlay 优先消费按键(模态视图)。
-    if (state.overlay == .transcript) return dispatchTranscriptKey(state, key);
-
     // Ctrl+X Ctrl+K 序列(Emacs 双键前缀,杀后台任务)。arming 在 UiState,dispatch 统一处理。
     // 进入即消费上次的 armed(每键清一次,除非本键是 Ctrl+X 重新设)→ 防粘连。
     const was_x_armed = state.ctrl_x_armed;
@@ -134,17 +138,42 @@ fn dispatchKey(state: *UiState, key: input.Key) Effect {
         help_closed = true; // 标记:末尾 pass_to_editor 要带 redraw_region(让 help 菜单消屏)。
     }
 
-    // Ctrl+O → 切 transcript 视图态(不退 raw mode)。
+    // Ctrl+O → 打开 transcript 全屏查看器(alt-screen)。dispatch 不碰 fd/raw-mode,
+    // 上抛 .open_transcript,IO 体留调用方(输入期 loop.zig / 生成期 tui_backend.zig
+    // 进 alt-screen 调 transcript_viewer.runWithTheme)。两期共用。
     if (key == .ctrl_o) {
-        state.overlay = if (state.overlay == .transcript) .none else .transcript;
-        state.transcript_top = 0;
-        return .{ .redraw_region = true };
+        return .{ .action = .open_transcript };
     }
     // Ctrl+T → 切 task 面板显隐(对齐 cc app:toggleTodos)。纯内存 toggle,两期共用。
     // drawPanel/drawTaskList 读 panel.task_list_visible 门控。
     if (key == .ctrl_t) {
         state.panel.task_list_visible = !state.panel.task_list_visible;
         return .{ .redraw_region = true };
+    }
+
+    // ── slash 菜单导航(对齐 cc DIFF#4:`/` 菜单 ↑↓ 移高亮 + Enter 选中 + Tab 补全)──────
+    // 仅输入期 + 菜单开(`/` 前缀无空格且有匹配)时介入,抢 ↑↓/Enter/Tab 语义;
+    // 否则这些键照常走历史导航/提交/补全。菜单关时 slash_sel 恒 0(下方非 `/` 态会重置)。
+    {
+        const gen0 = state.phase == .generating;
+        const view = state.editor.view;
+        if (!gen0 and complete.slashMenuOpen(view)) {
+            const n = complete.slashFilterCount(view);
+            if (state.slash_sel >= n) state.slash_sel = if (n == 0) 0 else n - 1;
+            switch (key) {
+                .down => {
+                    state.slash_sel = (state.slash_sel + 1) % n; // 循环(对齐 cc 列表滚动)
+                    return .{ .redraw_region = true };
+                },
+                .up => {
+                    state.slash_sel = if (state.slash_sel == 0) n - 1 else state.slash_sel - 1;
+                    return .{ .redraw_region = true };
+                },
+                .enter => return .{ .action = .slash_select }, // 填命令 + 提交
+                .tab => return .{ .action = .slash_complete }, // 仅补全(不提交)
+                else => {},
+            }
+        }
     }
 
     // ── 全局快捷键:dispatch 识别 → 上抛 LoopAction,IO 体留调用方(两期共用解析)──────
@@ -168,56 +197,16 @@ fn dispatchKey(state: *UiState, key: input.Key) Effect {
     return .{ .redraw_region = help_closed, .action = .pass_to_editor };
 }
 
-/// transcript overlay 的滚动/退出键。
-fn dispatchTranscriptKey(state: *UiState, key: input.Key) Effect {
-    switch (key) {
-        .ctrl_o, .esc => {
-            state.overlay = .none;
-            return .{ .redraw_region = true };
-        },
-        .char => |c| switch (c) {
-            'q' => {
-                state.overlay = .none;
-                return .{ .redraw_region = true };
-            },
-            'j' => {
-                state.transcript_top +|= 1;
-                return .{ .redraw_region = true };
-            },
-            'k' => {
-                state.transcript_top -|= 1;
-                return .{ .redraw_region = true };
-            },
-            'g' => {
-                state.transcript_top = 0;
-                return .{ .redraw_region = true };
-            },
-            else => return .{ .redraw_region = false },
-        },
-        .down => {
-            state.transcript_top +|= 1;
-            return .{ .redraw_region = true };
-        },
-        .up => {
-            state.transcript_top -|= 1;
-            return .{ .redraw_region = true };
-        },
-        else => return .{ .redraw_region = false },
-    }
-}
-
 // ============================ render ============================
 
-/// 纯投影:state → 帧字节写入 w。transcript overlay 模态;否则按 phase。
+/// 纯投影:state → 帧字节写入 w。按 phase 渲染输入/生成帧。
+/// transcript 现走 alt-screen viewer(transcript_viewer.zig),不再嵌入式渲染。
 /// `?` help 非模态——在 renderInputFrame 内把 footer 区换成快捷键菜单(输入框仍在)。
 pub fn render(w: anytype, in: RenderInputs) !Frame {
     const s = in.state;
-    return switch (s.overlay) {
-        .transcript => try renderTranscript(w, in),
-        .none => switch (s.phase) {
-            .input => try renderInputFrame(w, in),
-            .generating => try renderGenFrame(w, in),
-        },
+    return switch (s.phase) {
+        .input => try renderInputFrame(w, in),
+        .generating => try renderGenFrame(w, in),
     };
 }
 
@@ -271,29 +260,6 @@ pub fn renderHelpLines(w: anytype, th: Theme, cols: u16) !u16 {
         rows += 1;
     }
     return rows;
-}
-
-fn renderTranscript(w: anytype, in: RenderInputs) !Frame {
-    const th = in.theme;
-    const lines = in.transcript_lines;
-    // 窗口:从 transcript_top 起,最多 rows-3 行(留标题+边距)。j/k 滚动看更多。
-    const view_rows: usize = if (in.state.rows > 3) in.state.rows - 3 else 1;
-    var rows: u16 = 0;
-    try w.writeAll(th.dim);
-    try w.writeAll(" transcript (Ctrl+O / q to close · j/k scroll)");
-    try w.writeAll(th.reset);
-    try w.writeAll("\r\n");
-    rows += 1;
-    const top = @min(in.state.transcript_top, lines.len);
-    var i = top;
-    var shown: usize = 0;
-    while (i < lines.len and shown < view_rows) : (i += 1) {
-        try w.writeAll(lines[i]);
-        try w.writeAll("\r\n");
-        rows += 1;
-        shown += 1;
-    }
-    return .{ .rows = rows, .cursor_row = 0, .cursor_col = 0 };
 }
 
 /// 输入期帧(阶段 0 最简版:❯ + editor view + footer 行)。

@@ -470,6 +470,7 @@ pub const RenderRegion = struct {
     }
 
     /// 画 slash 命令菜单(`/` 前缀且无空格时)。每行 ` /cmd   描述`,匹配项列出。
+    /// 选中项(self.ui.slash_sel)命令名用 accent 高亮,其余 dim(对齐 cc:↑↓ 移高亮)。
     /// 返回新增行数(每行末尾 \r\n,光标停下一行行首供 footer 续画)。调用前光标停下边框下一行行首。
     fn drawSlashMenu(self: *RenderRegion, w: *std.Io.Writer, content: []const u8) u16 {
         const trimmed = std.mem.trimStart(u8, content, " \t");
@@ -479,17 +480,22 @@ pub const RenderRegion = struct {
         const th = self.theme;
         var rows: u16 = 0;
         const MAX_ROWS: u16 = 10; // 菜单最多列 10 项,防撑爆终端
+        var match_idx: usize = 0; // 第几个匹配项(与 slash_sel 对齐)
         for (complete.SLASH_COMMAND_TABLE) |cmd| {
             if (!std.mem.startsWith(u8, cmd.name, trimmed)) continue;
             if (rows >= MAX_ROWS) break;
+            const selected = match_idx == self.ui.slash_sel;
             w.writeAll(ansi.clear.line) catch {};
-            w.print("  {s}{s}{s}", .{ th.accent, cmd.name, th.reset }) catch {};
+            // 对齐 cc:固定 2 空格缩进,选中项命令名 accent,非选中 dim gray(仅颜色区分,不移位)。
+            const name_color = if (selected) th.accent else th.dim;
+            w.print("  {s}{s}{s}", .{ name_color, cmd.name, th.reset }) catch {};
             const pad = if (cmd.name.len < 14) 14 - cmd.name.len else 1;
             var p: usize = 0;
             while (p < pad) : (p += 1) w.writeAll(" ") catch {};
             w.print("{s}{s}{s}", .{ th.dim, cmd.desc, th.reset }) catch {};
             w.writeAll("\r\n") catch {};
             rows += 1;
+            match_idx += 1;
         }
         return rows;
     }

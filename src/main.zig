@@ -73,6 +73,7 @@ pub const tui_event = @import("repl/tui/event.zig");
 pub const tui_theme = @import("repl/tui/theme.zig");
 pub const tui_test_capture = @import("repl/tui/test_capture.zig");
 pub const repl_input = @import("repl/input.zig");
+pub const repl_complete = @import("repl/complete.zig");
 pub const answer_queue = @import("core/answer_queue.zig");
 pub const recorder = @import("core/recorder.zig");
 

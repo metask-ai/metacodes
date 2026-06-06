@@ -31,6 +31,9 @@ pub const LoopAction = enum {
     complete,
     /// Ctrl+R 反向搜索(调用方进独占 fd 读循环)。
     reverse_search,
+    /// Ctrl+O 打开 transcript 全屏查看器(调用方进 alt-screen 独占 fd 读循环,
+    /// 复用 transcript_viewer.runWithTheme)。两期共用。
+    open_transcript,
     /// Ctrl+G 外部编辑器(调用方暂退 raw mode 起 $EDITOR)。
     external_edit,
     /// Ctrl+L 清屏重画。
@@ -39,6 +42,11 @@ pub const LoopAction = enum {
     kill_background,
     /// Shift+Tab 循环权限模式(调用方改 app.config.permission_mode/permission_ctx)。
     cycle_perm_mode,
+    /// slash 菜单选中(Enter):调用方把 editor buffer 换成选中命令名后**提交**。
+    /// 选中项 = complete.slashNthMatch(view, state.slash_sel)。
+    slash_select,
+    /// slash 菜单补全(Tab):把 editor buffer 换成选中命令名但**不提交**(留用户补参数)。
+    slash_complete,
 };
 
 pub const KeyEvent = struct { key: input.Key };
@@ -53,7 +61,7 @@ pub const UsageEvent = struct {
 };
 pub const TextChunkEvent = struct { text: []const u8 };
 pub const SetToolEvent = struct { name: []const u8, start_ms: i64 };
-pub const ToolCardEvent = struct { id: []const u8, name: []const u8, start_ms: i64 };
+pub const ToolCardEvent = struct { id: []const u8, name: []const u8, input: []const u8 = "", start_ms: i64 };
 pub const ClearCardEvent = struct { id: []const u8 };
 pub const ToolProgressEvent = struct { id: []const u8, text: []const u8 };
 pub const PhaseChangeEvent = struct { to: ui_state.Phase };

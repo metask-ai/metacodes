@@ -25,7 +25,6 @@ test "dispatch: 空 editor 按 ? → help_open(非模态)" {
     var s = UiState{};
     const eff = ui.dispatch(&s, keyChar('?'));
     try testing.expect(s.help_open);
-    try testing.expectEqual(ui_state.Overlay.none, s.overlay); // help 不再是 overlay
     try testing.expect(eff.redraw_region);
 }
 
@@ -50,12 +49,12 @@ test "dispatch: help 开着打其它字符 → 关 help 且该键透传编辑器
     try testing.expectEqual(event.LoopAction.pass_to_editor, eff.action);
 }
 
-test "dispatch: Ctrl+O 在 none/transcript 间切换(真视图态)" {
+test "dispatch: Ctrl+O 上抛 open_transcript(alt-screen viewer,非嵌入式 overlay)" {
+    // Ctrl+O 不再 toggle 内嵌 overlay 视图态,而是上抛 LoopAction.open_transcript,
+    // 由调用方(loop.zig / tui_backend.zig)进 alt-screen 调 transcript_viewer。
     var s = UiState{};
-    _ = ui.dispatch(&s, keyTag(.ctrl_o));
-    try testing.expectEqual(ui_state.Overlay.transcript, s.overlay);
-    _ = ui.dispatch(&s, keyTag(.ctrl_o));
-    try testing.expectEqual(ui_state.Overlay.none, s.overlay);
+    const eff = ui.dispatch(&s, keyTag(.ctrl_o));
+    try testing.expectEqual(event.LoopAction.open_transcript, eff.action);
 }
 
 test "dispatch: Ctrl+T 切 task 面板显隐(toggle panel.task_list_visible,dispatch 内消费)" {
@@ -73,12 +72,6 @@ test "dispatch: Ctrl+T 在生成期也生效(两期共用一份语义)" {
     var s = UiState{ .phase = .generating };
     _ = ui.dispatch(&s, keyTag(.ctrl_t));
     try testing.expect(!s.panel.task_list_visible);
-}
-
-test "dispatch: transcript overlay 下 Ctrl+T 被 overlay 拦截(面板不变)" {
-    var s = UiState{ .overlay = .transcript };
-    _ = ui.dispatch(&s, keyTag(.ctrl_t));
-    try testing.expect(s.panel.task_list_visible); // 模态吞掉,默认 true 不变
 }
 
 test "dispatch: 全局键上抛 LoopAction(输入期)——shift_tab/ctrl_l/up/down/tab/ctrl_r/ctrl_g" {
@@ -100,12 +93,6 @@ test "dispatch: 生成期 gate——shift_tab/ctrl_l 仍激活,history/complete/
     try testing.expectEqual(event.LoopAction.none, ui.dispatch(&s, keyTag(.tab)).action);
     try testing.expectEqual(event.LoopAction.none, ui.dispatch(&s, keyTag(.ctrl_r)).action);
     try testing.expectEqual(event.LoopAction.none, ui.dispatch(&s, keyTag(.ctrl_g)).action);
-}
-
-test "dispatch: transcript overlay 下全局键不上抛(被 overlay 拦截)" {
-    var s = UiState{ .overlay = .transcript };
-    try testing.expectEqual(event.LoopAction.none, ui.dispatch(&s, keyTag(.shift_tab)).action);
-    try testing.expectEqual(event.LoopAction.none, ui.dispatch(&s, keyTag(.ctrl_l)).action);
 }
 
 test "dispatch: Ctrl+X Ctrl+K 序列 → kill_background(arming 在 UiState)" {
@@ -154,24 +141,6 @@ test "dispatch: help 开时 esc → 只关 help,不透传(先关弹层)" {
     try testing.expect(e.redraw_region);
 }
 
-test "dispatch: transcript 下 j/k 滚动,q 关闭" {
-    var s = UiState{ .overlay = .transcript, .transcript_top = 0 };
-    _ = ui.dispatch(&s, keyChar('j'));
-    try testing.expectEqual(@as(usize, 1), s.transcript_top);
-    _ = ui.dispatch(&s, keyChar('j'));
-    try testing.expectEqual(@as(usize, 2), s.transcript_top);
-    _ = ui.dispatch(&s, keyChar('k'));
-    try testing.expectEqual(@as(usize, 1), s.transcript_top);
-    _ = ui.dispatch(&s, keyChar('q'));
-    try testing.expectEqual(ui_state.Overlay.none, s.overlay);
-}
-
-test "dispatch: transcript_top k 在 0 处不下溢" {
-    var s = UiState{ .overlay = .transcript, .transcript_top = 0 };
-    _ = ui.dispatch(&s, keyChar('k'));
-    try testing.expectEqual(@as(usize, 0), s.transcript_top); // saturating
-}
-
 test "dispatch: spinner_tick 推进帧 + 要求重画" {
     var s = UiState{ .phase = .generating };
     const eff = ui.dispatch(&s, .spinner_tick);
@@ -203,7 +172,7 @@ test "dispatch: text_chunk → emit_scroll(不改固定区)" {
 
 test "dispatch: tool_progress 走 immediate 快速路径" {
     var s = UiState{ .phase = .generating };
-    ui_state.addCard(&s, "id_a", "WebSearch", 0);
+    ui_state.addCard(&s, "id_a", "WebSearch", "", 0);
     const eff = ui.dispatch(&s, .{ .tool_progress = .{ .id = "id_a", .text = "Found 5 results" } });
     try testing.expect(eff.immediate and eff.redraw_region);
     try testing.expectEqualStrings("Found 5 results", s.tools.cards[0].progressSlice());
@@ -211,8 +180,8 @@ test "dispatch: tool_progress 走 immediate 快速路径" {
 
 test "dispatch: add/clear tool card" {
     var s = UiState{};
-    ui_state.addCard(&s, "a", "WebSearch", 0);
-    ui_state.addCard(&s, "b", "WebSearch", 0);
+    ui_state.addCard(&s, "a", "WebSearch", "", 0);
+    ui_state.addCard(&s, "b", "WebSearch", "", 0);
     try testing.expectEqual(@as(u8, 2), s.tools.cards_len);
     ui_state.clearCard(&s, "a");
     try testing.expectEqual(@as(u8, 1), s.tools.cards_len);
@@ -221,17 +190,16 @@ test "dispatch: add/clear tool card" {
 
 test "dispatch: add 重复 id 忽略" {
     var s = UiState{};
-    ui_state.addCard(&s, "a", "WebSearch", 0);
-    ui_state.addCard(&s, "a", "WebSearch", 0);
+    ui_state.addCard(&s, "a", "WebSearch", "", 0);
+    ui_state.addCard(&s, "a", "WebSearch", "", 0);
     try testing.expectEqual(@as(u8, 1), s.tools.cards_len);
 }
 
-test "dispatch: phase_change → generating 重置 spinner + 关 help/overlay" {
+test "dispatch: phase_change → generating 重置 spinner + 关 help" {
     var s = UiState{ .help_open = true, .spinner = .{ .frame = 9 } };
     _ = ui.dispatch(&s, .{ .phase_change = .{ .to = .generating } });
     try testing.expectEqual(ui_state.Phase.generating, s.phase);
     try testing.expectEqual(@as(u8, 0), s.spinner.frame);
-    try testing.expectEqual(ui_state.Overlay.none, s.overlay);
     try testing.expect(!s.help_open); // 生成期关闭 help
 }
 
@@ -248,4 +216,70 @@ test "dispatch: set/clear current tool" {
     try testing.expectEqualStrings("Bash", s.tools.currentSlice());
     _ = ui.dispatch(&s, .clear_current_tool);
     try testing.expectEqual(@as(u8, 0), s.tools.current_len);
+}
+
+// ── DIFF#4: slash 菜单导航(↑↓ 移高亮 + Enter 选中 + Tab 补全)──────────────────
+const complete = cc.repl_complete;
+
+test "dispatch: slash 菜单开 → Down 移选中(slash_sel++, 不上抛 history)" {
+    var s = UiState{};
+    _ = ui.dispatch(&s, .{ .editor_view = .{ .view = "/", .cursor = 1 } });
+    try testing.expectEqual(@as(usize, 0), s.slash_sel);
+    const e = ui.dispatch(&s, keyTag(.down));
+    try testing.expectEqual(@as(usize, 1), s.slash_sel);
+    try testing.expect(e.redraw_region);
+    try testing.expectEqual(event.LoopAction.none, e.action); // 不是 history_next
+}
+
+test "dispatch: slash 菜单开 → Up 在 0 处回绕到末项" {
+    var s = UiState{};
+    _ = ui.dispatch(&s, .{ .editor_view = .{ .view = "/", .cursor = 1 } });
+    const n = complete.slashFilterCount("/");
+    const e = ui.dispatch(&s, keyTag(.up));
+    try testing.expectEqual(n - 1, s.slash_sel); // 0 → 末项
+    try testing.expectEqual(event.LoopAction.none, e.action);
+}
+
+test "dispatch: slash 菜单开 → Enter 上抛 slash_select" {
+    var s = UiState{};
+    _ = ui.dispatch(&s, .{ .editor_view = .{ .view = "/", .cursor = 1 } });
+    const e = ui.dispatch(&s, keyTag(.enter));
+    try testing.expectEqual(event.LoopAction.slash_select, e.action);
+}
+
+test "dispatch: slash 菜单开 → Tab 上抛 slash_complete" {
+    var s = UiState{};
+    _ = ui.dispatch(&s, .{ .editor_view = .{ .view = "/", .cursor = 1 } });
+    const e = ui.dispatch(&s, keyTag(.tab));
+    try testing.expectEqual(event.LoopAction.slash_complete, e.action);
+}
+
+test "dispatch: slash 菜单关(普通文本) → Up 仍走 history(不抢键)" {
+    var s = UiState{};
+    _ = ui.dispatch(&s, .{ .editor_view = .{ .view = "hello", .cursor = 5 } });
+    const e = ui.dispatch(&s, keyTag(.up));
+    try testing.expectEqual(event.LoopAction.history_prev, e.action);
+    try testing.expectEqual(@as(usize, 0), s.slash_sel);
+}
+
+test "dispatch: slash 菜单 → 打字过滤变窄,slash_sel 钳到末项" {
+    var s = UiState{};
+    _ = ui.dispatch(&s, .{ .editor_view = .{ .view = "/", .cursor = 1 } });
+    // 移到一个较大的 index
+    var i: usize = 0;
+    while (i < 5) : (i += 1) _ = ui.dispatch(&s, keyTag(.down));
+    const big = s.slash_sel;
+    // 过滤到只剩 /clear(唯一匹配)→ slash_sel 应钳到 0
+    _ = ui.dispatch(&s, .{ .editor_view = .{ .view = "/clea", .cursor = 5 } });
+    const n2 = complete.slashFilterCount("/clea");
+    try testing.expect(s.slash_sel < n2 or s.slash_sel == 0);
+    try testing.expect(big >= s.slash_sel);
+}
+
+test "slashNthMatch: 顺序与表一致" {
+    const c0 = complete.slashNthMatch("/", 0).?;
+    try testing.expectEqualStrings("/help", c0.name);
+    // /c 前缀:/clear /compact /cost /config /commit(按表顺序)
+    const cc0 = complete.slashNthMatch("/c", 0).?;
+    try testing.expectEqualStrings("/clear", cc0.name);
 }

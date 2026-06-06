@@ -19,6 +19,7 @@ const history_mod = @import("history.zig");
 const multiline_mod = @import("multiline.zig");
 const render_mod = @import("render.zig");
 const transcript_mod = @import("../core/transcript.zig");
+const transcript_viewer = @import("transcript_viewer.zig");
 const progress = @import("progress.zig");
 const render_region_mod = @import("tui/render_region.zig");
 const msg_queue_mod = @import("msg_queue.zig");
@@ -40,7 +41,7 @@ fn debugBackend(verbose: bool, show_retry: bool) writer_backend_mod.WriterBacken
 }
 
 pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
-    std.debug.print("Metacode Super\nType your message or /help for commands\n\n", .{});
+    printStartupBanner(app);
 
     // 启动 prompt 建议:基于 git 最近改动的文件给一条灰色提示(对齐 Claude Code)
     printStartupSuggestion(allocator);
@@ -761,10 +762,40 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
                     redraw(&region, &editor, app);
                     continue;
                 },
+                .slash_complete => {
+                    // Tab on slash 菜单:把 buffer 换成选中命令名(不提交,留补参数)。
+                    if (complete.slashNthMatch(editor.view(), region.ui.slash_sel)) |cmd| {
+                        try editor.setLine(cmd.name);
+                    }
+                    redraw(&region, &editor, app);
+                    continue;
+                },
+                .slash_select => {
+                    // Enter on slash 菜单:把 buffer 换成选中命令名后提交(对齐 cc:Enter 运行选中项)。
+                    // 复刻 .commit 路径(下方 editor.handle(.enter)→.commit 同款):清区 + 回显 + 返回。
+                    if (complete.slashNthMatch(editor.view(), region.ui.slash_sel)) |cmd| {
+                        try editor.setLine(cmd.name);
+                    }
+                    region.ui.slash_sel = 0;
+                    region.setInput("", 0);
+                    region.clear();
+                    echoUserSubmission(app, editor.view());
+                    return try allocator.dupe(u8, editor.view());
+                },
                 .reverse_search => {
                     region.clear();
                     try handleReverseSearch(fd, &editor, &parser, history, allocator);
                     redraw(&region, &editor, app);
+                    continue;
+                },
+                .open_transcript => {
+                    // Ctrl+O → alt-screen 全屏 transcript viewer(ESC[?1049h/l)。alt-screen 是
+                    // 独立屏幕缓冲:进入时终端保存主屏(含已画好的输入框),viewer 在 alt 屏渲染,
+                    // 退出时终端**自动恢复主屏到进入前精确状态**。故无需 clear/redraw——多余的
+                    // clear+redraw 反而会改动主屏导致框漂 1 行。直接进出,主屏原样幂等。
+                    const sz = tui_term_root.getSize(fd);
+                    const rows: usize = if (sz) |s| s.rows else 24;
+                    transcript_viewer.runWithTheme(fd, allocator, &app.conversation, rows, region.theme) catch {};
                     continue;
                 },
                 .cycle_perm_mode => {
@@ -1764,6 +1795,58 @@ fn readMemory(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
         try buf.appendSlice(allocator, chunk[0..@intCast(n)]);
     }
     return try buf.toOwnedSlice(allocator);
+}
+
+/// 启动 banner:圆角 box(对齐 cc 2.1.x)。版本 + 模型 + cwd 三行。
+/// 非 TTY 退化为纯文本两行(pipe 友好)。box 内宽固定取 min(cols-2, 64)。
+fn printStartupBanner(app: *const app_mod.App) void {
+    const th = app.theme;
+    if (std.c.isatty(1) == 0) {
+        std.debug.print("cc-zig\nType your message or /help for commands\n\n", .{});
+        return;
+    }
+    const cols: usize = blk: {
+        var ws: std.c.winsize = undefined;
+        const TIOCGWINSZ: c_ulong = if (@import("builtin").os.tag == .macos) 0x40087468 else 0x5413;
+        if (std.c.ioctl(1, TIOCGWINSZ, @intFromPtr(&ws)) == 0 and ws.col > 0) break :blk ws.col;
+        break :blk 80;
+    };
+    const inner: usize = @min(if (cols > 2) cols - 2 else 60, @as(usize, 64));
+
+    const title = " cc-zig ";
+    // 顶边框:╭─ cc-zig ───…──╮
+    std.debug.print("{s}{s}{s}{s}", .{ th.accent, th.box_tl, th.box_h, title });
+    var filled: usize = 1 + displayWidthAscii(title); // box_h(1) + title
+    while (filled < inner) : (filled += 1) std.debug.print("{s}", .{th.box_h});
+    std.debug.print("{s}{s}\n", .{ th.box_tr, th.reset });
+
+    // 内容行:模型 + cwd。
+    printBannerLine(th, inner, app.config.model);
+    printBannerLine(th, inner, app.cwdAbs());
+
+    // 底边框。
+    std.debug.print("{s}{s}", .{ th.accent, th.box_bl });
+    var k: usize = 0;
+    while (k < inner) : (k += 1) std.debug.print("{s}", .{th.box_h});
+    std.debug.print("{s}{s}\n\n", .{ th.box_br, th.reset });
+}
+
+/// banner 一行内容:│ + inner 列(2 空格缩进 + text + 右补空格)+ │。
+/// inner 列宽 == 顶/底边框的 box_h 数,保证左右竖线对齐。
+fn printBannerLine(th: anytype, inner: usize, text: []const u8) void {
+    const pad_left = 2;
+    const avail = if (inner > pad_left) inner - pad_left else 0; // text 最多占 inner-2 列
+    const shown = if (displayWidthAscii(text) > avail) text[0..@min(text.len, avail)] else text;
+    std.debug.print("{s}{s}{s}  {s}", .{ th.accent, th.box_v, th.reset, shown });
+    // 右补空格,使 pad_left + shown_width + fill == inner,再竖线。
+    var w: usize = pad_left + displayWidthAscii(shown);
+    while (w < inner) : (w += 1) std.debug.print(" ", .{});
+    std.debug.print("{s}{s}{s}\n", .{ th.accent, th.box_v, th.reset });
+}
+
+/// 粗略显示宽(ASCII 1/字;非 ASCII 字节按 UTF-8 估算——banner 文本多为路径/模型名,ASCII 为主)。
+fn displayWidthAscii(s: []const u8) usize {
+    return @import("tui/term.zig").displayWidth(s);
 }
 
 /// 启动建议:跑 `git log` 找最近改动文件,给一条灰色提示。失败静默。

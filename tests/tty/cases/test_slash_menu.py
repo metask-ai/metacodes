@@ -89,3 +89,40 @@ def test_T17_help_then_question_no_corruption(bin_path):
     # 那是捕获时序而非排版错乱——此时跳过钉底断言(prose 完整性已证明无 corruption)。
     if a.box_top_row() is not None and a.footer_row() is not None and a.content_row() is not None:
         a.assert_box_at_bottom()
+
+
+def _menu_rows_classes(raw):
+    """返回菜单各行 (text, 命令名首字符的 border_class)。用于验证高亮选中项。"""
+    from screen import Screen
+    sc = Screen(24, 80); sc.feed(raw)
+    # 找下边框(全 ─ 行)与 footer(含 shift+tab)之间的菜单行
+    rows = []
+    for r in range(sc.rows):
+        t = sc.line_text(r)
+        s = t.strip()
+        if s.startswith("/"):
+            # 命令名首字符 '/' 所在列的 class
+            col = t.index("/")
+            cls = sc.grid[r][col].border_class
+            rows.append((s.split()[0], cls))
+    return rows
+
+
+def test_T18d_down_moves_highlight(bin_path):
+    # 打 `/` → Down 一次 → 第 2 个候选(/clear)应高亮(accent),其余 dim(对齐 cc DIFF#4)。
+    raw = run(bin_path, ["sleep:0.8", "type:/", "sleep:0.2", "key:down", "sleep:0.2"], per_key_drain=0.06)
+    rows = _menu_rows_classes(raw)
+    accent = [name for name, cls in rows if cls == "accent"]
+    if accent != ["/clear"]:
+        a = TTYAssert(raw)
+        a._fail(f"Down 后应只 /clear 高亮(accent),实得 accent={accent},rows={rows}")
+
+
+def test_T18e_first_item_highlighted_by_default(bin_path):
+    # 打 `/` → 默认第 1 项(/help)高亮。
+    raw = run(bin_path, ["sleep:0.8", "type:/", "sleep:0.3"], per_key_drain=0.06)
+    rows = _menu_rows_classes(raw)
+    accent = [name for name, cls in rows if cls == "accent"]
+    if accent != ["/help"]:
+        a = TTYAssert(raw)
+        a._fail(f"默认应 /help 高亮,实得 accent={accent},rows={rows}")
