@@ -107,3 +107,28 @@ test "L2 回归锚点: 核心工具的具名字段+类型(人读快照)" {
     // 不应再出现"required 点名字段但 properties 空 {}"的自相矛盾形态
     try std.testing.expect(std.mem.indexOf(u8, body, "\"properties\":{\"") != null);
 }
+
+test "L2 嵌套守卫: AskUserQuestion 两层嵌套 schema 完整序列化进请求体" {
+    // AskUserQuestion 是唯一两层嵌套(questions[].options[].{label,description})的工具。
+    // d7b3dd0 改 request.zig 加递归 serializePropSpec,但当年没补字节级断言守卫——本测补洞。
+    const a = std.testing.allocator;
+    const defs = try tools.toToolDefinitions(a);
+    defer a.free(defs);
+
+    const types = cc.json_mod;
+    const msg = cc.types_mod.ApiMessage{ .role = .user, .content = &.{.{ .text = "hi" }} };
+    const req = types.MessagesRequest{ .model = "m", .messages = &.{msg}, .tools = defs };
+    const body = try types.serializeMessagesRequest(req, a);
+    defer a.free(body);
+
+    // 第一层:questions 是 array。
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"questions\":{\"type\":\"array\"") != null);
+    // 第二层:question/header/options/multiSelect 出现在 questions 的 items.properties。
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"question\":{\"type\":\"string\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"options\":{\"type\":\"array\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"multiSelect\":{\"type\":\"boolean\"") != null);
+    // 第三层(options 的 items):label/description 必须出现(最深嵌套,最易被序列化漏掉)。
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"label\":{\"type\":\"string\"") != null);
+    // 嵌套 required:options items 的 required 含 label/description。
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"required\":[\"label\",\"description\"]") != null);
+}
