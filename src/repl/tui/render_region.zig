@@ -85,6 +85,11 @@ pub const RenderRegion = struct {
     md_state: @import("../render.zig").StreamState = .{},
     md_at_segment_start: bool = true, // 段首行用 ⏺ 前缀,续行用缩进
 
+    // markdown 表格累积(GFM):流式逐行到达,需缓冲整块再渲染(对齐 cc 框线)。
+    tbl_rows: std.ArrayList([]u8) = .empty, // 原始行 owned dup(含分隔行)
+    in_table: bool = false,
+    tbl_unconfirmed: bool = false, // 表头已缓冲、分隔行未到(暂定,可回滚)
+
     // 阶段1:overlay 逻辑态(help/transcript)由 UiState 承载;机制态(prev_rows 等)仍在上面。
     ui: ui_state_mod.UiState = .{},
 
@@ -176,6 +181,8 @@ pub const RenderRegion = struct {
         self.scratch.deinit();
         self.line_buf.deinit(self.allocator);
         self.md_buf.deinit(self.allocator);
+        for (self.tbl_rows.items) |r| self.allocator.free(r);
+        self.tbl_rows.deinit(self.allocator);
     }
 
     /// 设置输入态(loop 每次按键后调,再调 render)。
@@ -902,6 +909,15 @@ pub const RenderRegion = struct {
         self.md_buf.clearRetainingCapacity();
         self.md_state = .{};
         self.md_at_segment_start = true;
+        self.resetTableLocked();
+    }
+
+    /// 清空表格累积态(free 每行 dup)。调用方持锁。
+    fn resetTableLocked(self: *RenderRegion) void {
+        for (self.tbl_rows.items) |r| self.allocator.free(r);
+        self.tbl_rows.clearRetainingCapacity();
+        self.in_table = false;
+        self.tbl_unconfirmed = false;
     }
 
     /// 写助手文本(text_chunk):逐行过 markdown(render.renderLineStreaming)+ 段首 ⏺ / 续行
@@ -917,12 +933,117 @@ pub const RenderRegion = struct {
         // 逐个完整行(到 \n)渲染输出;残行留缓冲。
         while (std.mem.indexOfScalar(u8, self.md_buf.items, '\n')) |nl| {
             const line = self.md_buf.items[0..nl];
-            self.emitAssistantLine(line, true);
+            self.handleAssistantLine(line);
             // 删已发行(含 \n)
             const rest = self.md_buf.items.len - (nl + 1);
             std.mem.copyForwards(u8, self.md_buf.items[0..rest], self.md_buf.items[nl + 1 ..]);
             self.md_buf.shrinkRetainingCapacity(rest);
         }
+    }
+
+    /// 处理一条完整助手文本行:表格检测/缓冲(对齐 cc 框线),否则普通 emit。
+    /// 表格识别须前瞻分隔行,但流式逐行到达 → pipe 行先当暂定表头,下行确认或回滚。
+    fn handleAssistantLine(self: *RenderRegion, line: []const u8) void {
+        const md_render = @import("../render.zig");
+
+        if (self.in_table) {
+            if (self.tbl_unconfirmed) {
+                // 等分隔行确认。
+                if (md_render.isTableSeparator(line)) {
+                    self.appendTableRow(line);
+                    self.tbl_unconfirmed = false;
+                    return;
+                }
+                // 回滚:暂定表头其实是普通行。
+                const header = self.tbl_rows.items[0];
+                self.emitAssistantLine(header, true);
+                self.resetTableLocked();
+                // 继续把本行当普通行处理(可能又是新表头)。
+            } else {
+                // 已确认表格:含 pipe 非空行续入,否则块结束。
+                const trimmed = std.mem.trim(u8, line, " \t\r");
+                if (trimmed.len > 0 and md_render.lineHasPipe(line)) {
+                    self.appendTableRow(line);
+                    return;
+                }
+                self.flushTableBlock();
+                // 落本行(普通处理)。
+            }
+        }
+
+        // 非 code-block 且非表格中 且行含 pipe → 暂定表头。
+        if (!self.md_state.in_code_block and !self.in_table and md_render.lineHasPipe(line)) {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            if (trimmed.len > 0) {
+                self.appendTableRow(line);
+                self.in_table = true;
+                self.tbl_unconfirmed = true;
+                return;
+            }
+        }
+
+        self.emitAssistantLine(line, true);
+    }
+
+    /// 把一行原始文本 dup 进 tbl_rows;OOM 兜底直接 emit 并清表格态。
+    fn appendTableRow(self: *RenderRegion, line: []const u8) void {
+        const dup = self.allocator.dupe(u8, line) catch {
+            self.emitAssistantLine(line, true);
+            return;
+        };
+        self.tbl_rows.append(self.allocator, dup) catch {
+            self.allocator.free(dup);
+            self.emitAssistantLine(line, true);
+        };
+    }
+
+    /// flush 表格块:确认的渲框线整块 emit;未确认的各行 verbatim;空则 noop。
+    fn flushTableBlock(self: *RenderRegion) void {
+        const md_render = @import("../render.zig");
+        if (self.tbl_rows.items.len == 0) {
+            self.resetTableLocked();
+            return;
+        }
+        if (self.tbl_unconfirmed) {
+            for (self.tbl_rows.items) |r| self.emitAssistantLine(r, true);
+            self.resetTableLocked();
+            return;
+        }
+        const avail: usize = if (self.cols > 2) self.cols - 2 else 0;
+        if (avail == 0) {
+            for (self.tbl_rows.items) |r| self.emitAssistantLine(r, true);
+            self.resetTableLocked();
+            return;
+        }
+        const tbl = md_render.renderTable(self.tbl_rows.items, avail, self.allocator) catch {
+            for (self.tbl_rows.items) |r| self.emitAssistantLine(r, true);
+            self.resetTableLocked();
+            return;
+        };
+        defer self.allocator.free(tbl);
+        self.emitTableBlock(tbl);
+        self.resetTableLocked();
+    }
+
+    /// 把渲好的多行框表 emit 进 scrollback:首物理行用段前缀(⏺/续行),其余全 2 空格。
+    /// 整块一次 emitToScroll(含 \n 安全,见 emitToScroll/updatePendingTail)。
+    fn emitTableBlock(self: *RenderRegion, tbl: []const u8) void {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        var first = true;
+        var it = std.mem.splitScalar(u8, tbl, '\n');
+        while (it.next()) |pline| {
+            if (first) {
+                self.appendAssistantPrefix(&buf, self.md_at_segment_start);
+                self.md_at_segment_start = false;
+                first = false;
+            } else {
+                buf.appendSlice(self.allocator, "  ") catch {};
+            }
+            buf.appendSlice(self.allocator, pline) catch {};
+            buf.append(self.allocator, '\n') catch {};
+        }
+        self.emitToScroll(buf.items);
     }
 
     /// flush 助手文本残行(stream_done / leaveGenerating)。public:持锁。
@@ -934,8 +1055,12 @@ pub const RenderRegion = struct {
 
     /// flush 助手文本残行(内部,调用方已持锁)。
     fn flushGenAssistantLocked(self: *RenderRegion) void {
+        // 先 flush 待定表格块(确认的渲框线;未确认/不完整的 verbatim)。
+        if (self.in_table) self.flushTableBlock();
         if (self.md_buf.items.len == 0) return;
-        self.emitAssistantLine(self.md_buf.items, false);
+        // 残行可能本身是表格头(pipe 行无后续分隔)→ handleAssistantLine 暂存,再 flush。
+        self.handleAssistantLine(self.md_buf.items);
+        if (self.in_table) self.flushTableBlock();
         self.md_buf.clearRetainingCapacity();
     }
 
