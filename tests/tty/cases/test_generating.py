@@ -210,13 +210,12 @@ def test_A6_narrow_terminal_no_wrap(bin_path):
 
 
 def _gen_frames(a):
-    """生成期帧。spinner 行(含 '…' + 'tokens')是生成期可靠标志——它在 help 开/关都在,
-    而 'esc to interrupt' 已移到 footer(2026-06-06 对齐 cc),help 开时 footer 被替换 → 该行消失。
-    故用 spinner 行检测,不再依赖 footer 的 interrupt 文案。"""
+    """生成期帧。spinner 行(含 '…')是生成期可靠标志——它在 help 开/关都在。
+    注:30s 门控后(对齐 cc),<30s 的 spinner 只有 `<char> <Verb>…`,无 token,
+    故检测只能靠 '…'(不能再依赖 'tokens');'esc to interrupt' 在 footer(help 开时会被替换)。"""
     def is_gen(sc):
         for r in range(sc.rows):
-            t = sc.line_text(r)
-            if "…" in t and "tokens" in t:
+            if "…" in sc.line_text(r):
                 return True
         return False
     return [sc for sc in a.frame_screens if is_gen(sc)]

@@ -55,12 +55,12 @@ pub const StatusBar = struct {
         return 1;
     }
 
-    /// generating 形态:写一行 spinner,返回 1。对齐 cc 2.1.x:`✶ <Verb>… (Ns · ↓ N tokens)`。
-    /// **只显输出 token**(生成速率语义),不再塞 `↑in/$cost/⚒tool/esc`——
-    /// `esc to interrupt` 移到 footer(drawFooter 生成期渲染),与 cc 一致(DIFF#1 spinner超载)。
+    /// generating 形态:写一行 spinner,返回 1。对齐 cc 2.1.167(SpinnerAnimationRow.tsx):
+    /// **30s 门控**——前 30 秒只显 `{char} {verb}…`(无计时/token);≥30s 才显
+    /// `{char} {verb}… ({Ns} · ↓ {N} tokens)`(token>0 才含 token 段)。cc `SHOW_TOKENS_AFTER_MS=30_000`。
+    /// `esc to interrupt` 在 footer(drawFooter 生成期),非此行。
     /// 留 current_tool/tool_ms 形参不读(调用方签名稳定,工具进度走下方 per-toolUse 卡)。
-    /// max_w = 最大显示宽(= inner_w);超宽按显示宽截断(跳过 ANSI SGR 不计宽),
-    /// 防 DECAWM 折行使生成期区实际行数 > R 导致 UP(R-1) 错位。
+    /// max_w = 最大显示宽(= inner_w);超宽按显示宽截断(跳过 ANSI SGR 不计宽)。
     pub fn renderGenerating(
         writer: anytype,
         app: *const app_mod.App,
@@ -75,35 +75,45 @@ pub const StatusBar = struct {
     ) !usize {
         _ = current_tool;
         _ = tool_ms;
-        const u = app.usage;
-        const secs = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
         const fr = verbs.frame(frame_idx, use_unicode);
 
-        var out_buf: [16]u8 = undefined;
-        const out_str = formatTokens(&out_buf, u.output_tokens);
-
-        // 先格式化到栈 buffer,再按显示宽截断输出(跳过 SGR 转义)。
-        // cc 形态:`✶ Verb… (Ns · ↓ N tokens)`——计时 + 输出 token,无成本/输入/工具/中断。
-        const arrow = if (use_unicode) "↓" else "v";
         var line_buf: [256]u8 = undefined;
-        const line = std.fmt.bufPrint(&line_buf, "{s}{s} {s}…{s}{s} ({d:.0}s · {s} {s} tokens){s}", .{
-            theme.accent,
-            fr,
-            verb,
-            theme.reset,
-            theme.dim,
-            secs,
-            arrow,
-            out_str,
-            theme.reset,
+        // 30s 门控(对齐 cc SpinnerAnimationRow.tsx:19 SHOW_TOKENS_AFTER_MS):
+        // 未到阈值 → 极简 `{char} {verb}…`,无计时无 token。
+        if (elapsed_ms < SHOW_TOKENS_AFTER_MS) {
+            const line = std.fmt.bufPrint(&line_buf, "{s}{s} {s}{s}…{s}", .{
+                theme.accent, fr, theme.reset, verb, theme.reset,
+            }) catch {
+                try writer.print("{s}{s}{s}", .{ theme.accent, fr, theme.reset });
+                return 1;
+            };
+            try writeTruncated(writer, line, max_w);
+            return 1;
+        }
+
+        // ≥30s → 显计时 + token(token>0 才含 `· ↓ N tokens`)。
+        const secs = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
+        const out_tok = app.usage.output_tokens;
+        const arrow = if (use_unicode) "↓" else "v";
+        var meta_buf: [48]u8 = undefined;
+        var tok_buf: [16]u8 = undefined;
+        const meta: []const u8 = if (out_tok > 0)
+            (std.fmt.bufPrint(&meta_buf, " ({d:.0}s · {s} {s} tokens)", .{ secs, arrow, formatTokens(&tok_buf, out_tok) }) catch "")
+        else
+            (std.fmt.bufPrint(&meta_buf, " ({d:.0}s)", .{secs}) catch "");
+        const line = std.fmt.bufPrint(&line_buf, "{s}{s} {s}{s}…{s}{s}{s}{s}", .{
+            theme.accent, fr, theme.reset, verb, theme.reset, theme.dim, meta, theme.reset,
         }) catch {
-            // 极端超长 → 退化为最简 spinner。
             try writer.print("{s}{s}{s}", .{ theme.accent, fr, theme.reset });
             return 1;
         };
         try writeTruncated(writer, line, max_w);
         return 1;
     }
+
+    /// cc spinner 显示计时+token 的最小生成耗时(SpinnerAnimationRow.tsx:19)。
+    const SHOW_TOKENS_AFTER_MS: u64 = 30_000;
+
 
     /// 把含 SGR 的字符串按可见显示宽 max_w 截断后写出。ANSI 转义(\x1b[...m 等)不计宽且原样保留;
     /// 截断点后剩余的可见字符丢弃,但补一个 reset 防染色泄漏。

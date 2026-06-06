@@ -445,8 +445,9 @@ pub const RenderRegion = struct {
         } else {
             w.writeAll(ansi.clear.line) catch {};
             if (shell) {
-                // shell 模式 footer:`! for shell mode`(对齐 cc,无 mode part / token)。
-                w.print("{s}  ! for shell mode{s}", .{ self.theme.dim, self.theme.reset }) catch {};
+                // shell 模式 footer:`! for bash mode`(对齐 cc PromptInputFooterLeftSide ModeIndicator,
+                // mode==='bash' → `! for bash mode`;无 mode part / token)。
+                w.print("{s}  ! for bash mode{s}", .{ self.theme.dim, self.theme.reset }) catch {};
             } else {
                 self.drawFooter(w, app);
             }
@@ -564,10 +565,11 @@ pub const RenderRegion = struct {
         return rows;
     }
 
-    /// footer:左 "[{symbol} {title} on · ]shift+tab to cycle · ? for shortcuts"(对齐 CC)
-    /// 右 "{tok} tokens"。mode part 用 modeColor 单独着色(plan→cyan/acceptEdits→magenta/
-    /// bypass·dontAsk→red/auto→yellow);default 不显 mode part(对齐 cc isDefaultMode)。
-    /// 其余文字 dim。
+    /// footer(纯左对齐,对齐 cc:无右侧 token):
+    ///   非 default → `{symbol} {title} on (shift+tab to cycle)`[生成期 ` · esc to interrupt`]
+    ///   default → 生成期 `esc to interrupt` / 输入期 `? for shortcuts`
+    /// mode part 用 modeColor 单独着色(plan→cyan/acceptEdits→magenta/bypass·dontAsk→red/auto→yellow);
+    /// 其余文字 dim。token 用量走 /cost,不进 footer。
     fn drawFooter(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App) void {
         const th = self.theme;
         const sb = @import("widget/status_bar.zig");
@@ -594,22 +596,8 @@ pub const RenderRegion = struct {
             (if (show_mode) " · esc to interrupt" else " esc to interrupt")
         else if (show_mode) "" else " ? for shortcuts";
 
-        const total = blk: {
-            const ft = self.ui.footer.totalTokens();
-            if (ft > 0) break :blk ft;
-            const u = app.usage;
-            break :blk u.input_tokens + u.output_tokens;
-        };
-        var tok_buf: [16]u8 = undefined;
-        const tok_str = sb.formatTokens(&tok_buf, total);
-        var right_buf: [48]u8 = undefined;
-        const right = std.fmt.bufPrint(&right_buf, "{s} tokens ", .{tok_str}) catch "";
-
-        // 宽度按纯文本算(displayWidth 不跳 SGR,故 SGR 不能进被测字符串)。
-        const left_w = displayWidth(mode_plain) + displayWidth(hint);
-        const right_w = displayWidth(right);
-
-        // 写:mode part 用 modeColor 着色,其余 dim。
+        // 写:mode part 用 modeColor 着色,其余 dim。cc footer 纯左对齐快捷键,**无右侧 token**
+        // (对齐 cc:footer 行只左对齐文案;token 用量走 /cost)。
         if (show_mode) {
             w.writeAll(sb.modeColor(th, mode_pm)) catch {};
             w.writeAll(mode_plain) catch {};
@@ -617,13 +605,6 @@ pub const RenderRegion = struct {
         }
         w.writeAll(th.dim) catch {};
         w.writeAll(hint) catch {};
-        // 两端对齐:中间填空格
-        if (self.cols > left_w + right_w) {
-            const gap = self.cols - left_w - right_w;
-            var i: usize = 0;
-            while (i < gap) : (i += 1) w.writeAll(" ") catch {};
-            w.writeAll(right) catch {};
-        }
         w.writeAll(th.reset) catch {};
     }
 
@@ -815,6 +796,7 @@ pub const RenderRegion = struct {
     /// 完成态(对齐 cc DIFF#2):`✻ <Verb过去式> for Ns · ↓ N tokens`,提交进 scrollback 留痕。
     /// 不再返回 carryover(待发送队列由主循环消费,见 loop.zig)。
     pub fn leaveGenerating(self: *RenderRegion, app: *const app_mod.App) void {
+        _ = app; // 完成态 spinner 不再读 usage(去 token);签名保留供 callers 稳定。
         self.lock();
         defer self.unlock();
         self.flushGenAssistantLocked(); // 助手文本残行(markdown)先 flush
@@ -832,7 +814,7 @@ pub const RenderRegion = struct {
         // 仅当本轮有可感知耗时(≥0.5s)才显,避免瞬时轮出现 "for 0s" 噪声。
         const gen_elapsed: u64 = @intCast(@max(util_time.nowMs() -% self.ui.spinner.start_ms, 0));
         if (gen_elapsed >= 500) {
-            self.emitFinishedSpinner(app, gen_elapsed);
+            self.emitFinishedSpinner(gen_elapsed);
         }
         self.generating = false;
         self.ui.phase = .input; // 同步:退生成期 → 输入期(双写过渡)
@@ -980,26 +962,16 @@ pub const RenderRegion = struct {
         self.emitToScroll(buf.items);
     }
 
-    /// 提交完成态 spinner 行进 scrollback(对齐 cc `✻ <Verb过去式> for Ns · ↓ N tokens`)。
-    /// verb 用 pickPast(同 seed = spinner.start_ms,整轮固定);区已在 leaveGenerating 擦掉,
-    /// 此处当作普通 scrollback 行 emit(emitToScroll 会处理区在/不在)。
-    fn emitFinishedSpinner(self: *RenderRegion, app: *const app_mod.App, elapsed_ms: u64) void {
+    /// 提交完成态 spinner 行进 scrollback(对齐 cc `✻ <Verb过去式> for Ns`,无 token——
+    /// cc 短任务实测 `✻ Brewed for 1s`)。verb 用 pickPast(同 seed = spinner.start_ms,整轮固定);
+    /// 区已在 leaveGenerating 擦掉,此处当作普通 scrollback 行 emit(emitToScroll 会处理区在/不在)。
+    fn emitFinishedSpinner(self: *RenderRegion, elapsed_ms: u64) void {
         const th = self.theme;
-        const sb = @import("widget/status_bar.zig");
         const fr = verbs.frame(0, self.use_unicode); // 完成态用固定 ✻(frames[0])
         const verb_past = verbs.pickPast(@bitCast(self.ui.spinner.start_ms));
         const secs: f64 = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
-        const out_tok = app.usage.output_tokens;
-
         var buf: [160]u8 = undefined;
-        const line = if (out_tok > 0) blk: {
-            var tb: [16]u8 = undefined;
-            const ts = sb.formatTokens(&tb, out_tok);
-            const arrow = if (self.use_unicode) "↓" else "v";
-            break :blk std.fmt.bufPrint(&buf, "{s}{s} {s}{s}{s} for {d:.0}s · {s} {s} tokens{s}\n", .{
-                th.accent, fr, th.reset, th.dim, verb_past, secs, arrow, ts, th.reset,
-            }) catch return;
-        } else std.fmt.bufPrint(&buf, "{s}{s} {s}{s}{s} for {d:.0}s{s}\n", .{
+        const line = std.fmt.bufPrint(&buf, "{s}{s} {s}{s}{s} for {d:.0}s{s}\n", .{
             th.accent, fr, th.reset, th.dim, verb_past, secs, th.reset,
         }) catch return;
         self.emitToScroll(line);

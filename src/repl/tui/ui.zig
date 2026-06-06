@@ -317,9 +317,10 @@ fn renderGenFrame(w: anytype, in: RenderInputs) !Frame {
     return .{ .rows = rows, .cursor_row = 0, .cursor_col = 0 };
 }
 
-/// footer 行(CC 风格:左 `[{symbol} {title} on · ]shift+tab to cycle · ? for shortcuts` + 右 `{tok} tokens`,
-/// 两端对齐)。读 UiState.footer(数据由 .usage 事件喂)。mode part 按 status_bar.modeColor 单独着色,
-/// default 不显 mode part(对齐 cc isDefaultMode)。pub:render_region 委托复用。cols 从 in.state.cols 取。
+/// footer 行(cc 风格,纯左对齐,**无右侧 token**):
+///   非 default → `{symbol} {title} on (shift+tab to cycle)`;default → `? for shortcuts`。
+/// 读 UiState.footer(数据由 .usage 事件喂)。mode part 按 status_bar.modeColor 单独着色。
+/// pub:render_region 委托复用。cols 从 in.state.cols 取。
 pub fn renderFooterLine(w: anytype, in: RenderInputs) !u16 {
     const th = in.theme;
     const s = in.state;
@@ -337,15 +338,7 @@ pub fn renderFooterLine(w: anytype, in: RenderInputs) !u16 {
     // cc 对齐:非 default mode part 含括号 cycle 提示,hint 留空;default 显 `? for shortcuts`。
     const hint = if (show_mode) "" else " ? for shortcuts";
 
-    var tok_buf: [16]u8 = undefined;
-    const tok_str = formatTokens(&tok_buf, s.footer.totalTokens());
-    var right_buf: [48]u8 = undefined;
-    const right = std.fmt.bufPrint(&right_buf, "{s} tokens ", .{tok_str}) catch "";
-
-    // 宽度按纯文本算(displayWidth 不跳 SGR)。
-    const left_w = term.displayWidth(mode_plain) + term.displayWidth(hint);
-    const right_w = term.displayWidth(right);
-
+    // cc footer 纯左对齐快捷键,无右侧 token。
     if (show_mode) {
         try w.writeAll(sb.modeColor(th, mode_pm));
         try w.writeAll(mode_plain);
@@ -353,24 +346,7 @@ pub fn renderFooterLine(w: anytype, in: RenderInputs) !u16 {
     }
     try w.writeAll(th.dim);
     try w.writeAll(hint);
-    if (s.cols > left_w + right_w) {
-        const gap = s.cols - left_w - right_w;
-        var i: usize = 0;
-        while (i < gap) : (i += 1) try w.writeAll(" ");
-        try w.writeAll(right);
-    }
     try w.writeAll(th.reset);
     try w.writeAll("\r\n");
     return 1;
-}
-
-/// token 紧凑格式(<1K 原样;<1M "1.2K";>=1M "1.23M")。从 status_bar 收敛。
-fn formatTokens(buf: []u8, n: u64) []const u8 {
-    if (n < 1000) return std.fmt.bufPrint(buf, "{d}", .{n}) catch "0";
-    if (n < 1_000_000) {
-        const k = @as(f64, @floatFromInt(n)) / 1000.0;
-        return std.fmt.bufPrint(buf, "{d:.1}K", .{k}) catch "0";
-    }
-    const m = @as(f64, @floatFromInt(n)) / 1_000_000.0;
-    return std.fmt.bufPrint(buf, "{d:.2}M", .{m}) catch "0";
 }
