@@ -1,18 +1,19 @@
-//! Transcript viewer:Ctrl+O 打开的全屏对话浏览器。
+//! Transcript viewer:Ctrl+O 打开的对话浏览器。
 //!
-//! 用 alt screen(ESC[?1049h / ESC[?1049l)切到独立屏幕,渲染完整对话历史
-//! (含 tool_use / tool_result 细节,主流程默认折叠),退出后恢复原屏。
+//! **inline 内联模式(对齐 cc 2.1.167,DIFF#6/#7)**:不进 alt-screen,不 2J 清屏——
+//! 用绝对光标定位(`ESC[{r};1H` + `ESC[2K`)原地重绘整个可见视口(像 cc 全帧管理)。
+//! 关键正确性:绝不 emit 滚动用的 `\n`(会把内容推进 scrollback 毁历史),只用光标定位。
+//! 退出时重绘对话尾部 + 交还给 loop.zig 重画输入框(对齐 cc 关闭后历史+输入框可见)。
 //!
-//! 键:
-//!   j / ↓ / Space   向下滚一行
-//!   k / ↑           向上滚一行
+//! 键(对齐 cc:↑↓ 主滚动 + ctrl+o toggle;保留 vim 键作增强):
+//!   ↓ / j / Space   向下滚一行       ↑ / k   向上滚一行
 //!   { / }           上/下一条 user prompt
 //!   g / G           顶 / 底
-//!   q / Esc / Ctrl+C 退出
+//!   q / Esc / Ctrl+O 退出(ctrl+o 对称开关)
 //!
 //! 本模块拆两层:
 //!   - renderToLines:把 Conversation 渲染成行数组(纯函数,可单测)
-//!   - run:alt-screen 交互循环(从 loop.zig 调,需要 tty)
+//!   - runWithTheme:inline 交互循环(从 loop.zig 调,需要 tty)
 
 const std = @import("std");
 const Conversation = @import("../core/conversation.zig").Conversation;
@@ -163,8 +164,8 @@ pub fn freeLines(allocator: std.mem.Allocator, lines: [][]u8) void {
     allocator.free(lines);
 }
 
-/// 全屏交互循环。fd = stdin。rows = 终端高度(留 1 行给提示)。
-/// 进 alt screen → 渲染 → 处理键 → 退出恢复。
+/// inline 交互循环。fd = stdin。rows = 终端高度(末 1 行给提示)。
+/// 进 alt screen → 渲染 → 处理键 → 退出恢复。(签名保留,内部已改 inline 内联,见模块头注)
 pub fn run(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const Conversation, rows: usize) !void {
     return runWithTheme(fd, allocator, conv, rows, @import("tui/theme.zig").dark);
 }
@@ -175,32 +176,87 @@ pub fn runWithTheme(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const C
     const prompts = try userPromptLineIndices(allocator, lines);
     defer allocator.free(prompts);
 
-    // 进 alt screen + 隐藏光标(用 tui/overlay 抽出的通用形式)
-    var ov = @import("tui/overlay.zig").Overlay{ .fd = 1 };
-    ov.enter();
-    defer ov.exit();
+    const cols = blk: {
+        const sz = @import("tui/term.zig").getSize(fd) orelse break :blk @as(usize, 80);
+        break :blk @as(usize, sz.cols);
+    };
 
-    const view_rows = if (rows > 1) rows - 1 else 1;
+    // inline 内联:不进 alt-screen。保存光标 + 隐藏(DECSC),退出时恢复(DECRC)。
+    writeAll(1, "\x1b[?25l"); // hide cursor
+    defer writeAll(1, "\x1b[?25h"); // show cursor
+
+    // 视口:末 2 行留给 footer(对齐 cc:分隔线 + 提示)。
+    const footer_rows: usize = 2;
+    const view_rows = if (rows > footer_rows + 1) rows - footer_rows - 1 else 1;
     var top: usize = 0;
     const max_top = if (lines.len > view_rows) lines.len - view_rows else 0;
+    top = max_top; // 对齐 cc:打开时定位到底部(最新)
 
+    // 简单 ESC 序列解析:↑=\x1b[A ↓=\x1b[B。esc 单独=退出。
     while (true) {
-        drawScreen(lines, top, view_rows);
+        drawScreenInline(lines, top, view_rows, rows, cols, th);
         var b: [1]u8 = undefined;
         const n = std.c.read(fd, &b, 1);
         if (n <= 0) break;
-        switch (b[0]) {
-            'q', 0x1b, 0x03 => break, // q / Esc / Ctrl+C
+        const c = b[0];
+        if (c == 0x1b) {
+            // 可能是方向键 CSI 或单 Esc。读后续两字节判定。
+            var s0: [1]u8 = undefined;
+            const n2 = std.c.read(fd, &s0, 1);
+            if (n2 <= 0) break; // 裸 Esc → 退出
+            if (s0[0] == '[') {
+                var s1: [1]u8 = undefined;
+                const n3 = std.c.read(fd, &s1, 1);
+                if (n3 <= 0) break;
+                switch (s1[0]) {
+                    'A' => top = if (top > 0) top - 1 else 0, // ↑
+                    'B' => top = @min(top + 1, max_top), // ↓
+                    else => {},
+                }
+                continue;
+            }
+            break; // Esc + 非 [ → 退出
+        }
+        switch (c) {
+            'q', 0x03, 0x0f => break, // q / Ctrl+C / Ctrl+O(对称开关)
             'j', ' ' => top = @min(top + 1, max_top),
             'k' => top = if (top > 0) top - 1 else 0,
             'g' => top = 0,
             'G' => top = max_top,
-            'd' => top = @min(top + view_rows / 2, max_top), // half page down
+            'd' => top = @min(top + view_rows / 2, max_top),
             'u' => top = if (top > view_rows / 2) top - view_rows / 2 else 0,
             '}' => top = @min(nextPrompt(prompts, top), max_top),
             '{' => top = prevPrompt(prompts, top),
             else => {},
         }
+    }
+
+    // 退出:重建"正常视图"的可见视口(对齐 cc 关闭后形态:历史尾 + 底部输入框)。
+    // 关键正确性(守住 test_ctrl_o_bottom_anchored_idempotent):用绝对光标定位重绘,**不 2J、
+    // 不 emit \n 滚动**——把对话尾部 N 行填到上方,光标停在"输入框锚定行"(rows - box_h),
+    // loop.zig 随后从此处 redraw 输入框 → 框回到屏底原位,scrollback 不被毁。
+    const box_h: usize = 5; // 上框(1)+❯(1)+下框(1)+footer(1)+底部余量(1);使框回原 box_top
+    const tail_rows: usize = if (rows > box_h) rows - box_h else 1;
+    // 对话尾部起始行:lines 末 tail_rows 行(不足则从 0)。
+    const tail_start: usize = if (lines.len > tail_rows) lines.len - tail_rows else 0;
+    {
+        var nb: [16]u8 = undefined;
+        writeAll(1, "\x1b[H");
+        var rr: usize = 0;
+        var li: usize = tail_start;
+        while (rr < tail_rows) : (rr += 1) {
+            writeAll(1, std.fmt.bufPrint(&nb, "\x1b[{d};1H\x1b[2K", .{rr + 1}) catch "");
+            if (li < lines.len) {
+                writeAll(1, lines[li]);
+                li += 1;
+            }
+        }
+        // 清掉 box 区那几行(redraw 会重画),光标停在锚定行(tail_rows+1)。
+        var cr: usize = tail_rows;
+        while (cr < rows) : (cr += 1) {
+            writeAll(1, std.fmt.bufPrint(&nb, "\x1b[{d};1H\x1b[2K", .{cr + 1}) catch "");
+        }
+        writeAll(1, std.fmt.bufPrint(&nb, "\x1b[{d};1H", .{tail_rows + 1}) catch "");
     }
 }
 
@@ -219,17 +275,37 @@ fn prevPrompt(prompts: []const usize, cur: usize) usize {
     return result;
 }
 
-fn drawScreen(lines: []const []const u8, top: usize, view_rows: usize) void {
-    writeAll(1, "\x1b[2J\x1b[H"); // 清屏 + 光标回顶
+/// inline 内联重绘整个可见视口(对齐 cc:绝对光标定位 + 逐行 ESC[2K,**不 2J、不 emit \n**)。
+/// 顶部 view_rows 行画 transcript 内容,末两行画 cc 风格 footer(分隔线 + 提示)。
+fn drawScreenInline(lines: []const []const u8, top: usize, view_rows: usize, rows: usize, cols: usize, th: @import("tui/theme.zig").Theme) void {
+    var nbuf: [16]u8 = undefined;
+    // 光标 home。
+    writeAll(1, "\x1b[H");
+    var r: usize = 0;
     var i: usize = top;
-    var drawn: usize = 0;
-    while (drawn < view_rows and i < lines.len) : (i += 1) {
-        writeAll(1, lines[i]);
-        writeAll(1, "\r\n");
-        drawn += 1;
+    while (r < view_rows) : (r += 1) {
+        // 绝对定位到第 r+1 行行首 + 清行。
+        writeAll(1, std.fmt.bufPrint(&nbuf, "\x1b[{d};1H\x1b[2K", .{r + 1}) catch "");
+        if (i < lines.len) {
+            writeAll(1, lines[i]);
+            i += 1;
+        }
     }
-    // 底部提示行
-    writeAll(1, "\x1b[7m transcript  j/k scroll  {/} prompts  g/G top/bot  q quit \x1b[0m");
+    // 分隔线行(view_rows+1)。
+    const sep_row = view_rows + 1;
+    writeAll(1, std.fmt.bufPrint(&nbuf, "\x1b[{d};1H\x1b[2K", .{sep_row}) catch "");
+    writeAll(1, th.dim);
+    var k: usize = 0;
+    const sep_w = if (cols > 0) cols else 80;
+    while (k < sep_w) : (k += 1) writeAll(1, "\xe2\x94\x80"); // ─
+    writeAll(1, th.reset);
+    // footer 提示行(对齐 cc):`Showing detailed transcript · ctrl+o to toggle · ↑↓ scroll · ? for shortcuts`。
+    const foot_row = view_rows + 2;
+    writeAll(1, std.fmt.bufPrint(&nbuf, "\x1b[{d};1H\x1b[2K", .{foot_row}) catch "");
+    writeAll(1, th.dim);
+    writeAll(1, "  Showing detailed transcript · ctrl+o to toggle · ↑↓ scroll · q quit");
+    writeAll(1, th.reset);
+    _ = rows;
 }
 
 fn writeAll(fd: std.c.fd_t, bytes: []const u8) void {

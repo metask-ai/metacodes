@@ -64,9 +64,10 @@ def test_help_esc_dismiss_no_border_residue(bin_path):
     # 输入框完整且钉底。
     a.assert_box_present()
     a.assert_box_at_bottom()
-    # 无边框残留:顶/底边框各恰 1 条。
-    assert text.count("╭") == 1, "顶边框残留(关 help 几何错,应恰 1 条 ╭):\n" + text
-    assert text.count("╰") == 1, "底边框残留(应恰 1 条 ╰):\n" + text
+    # 无边框残留:输入框恰 1 个(早期 bug:关 help 残留孤立顶边框)。
+    # 三横线边框(─)与 banner 分隔线通用,不能 count("─");改 count ❯ 内容行 == 1。
+    assert text.count("❯") == 1, "输入框残留(关 help 几何错,应恰 1 个 ❯ 输入框):\n" + text
+    a.assert_box_at_bottom()  # 顺带验证框钉底、footer 下无残留
 
 
 def test_help_esc_repeated_no_border_accumulation(bin_path):
@@ -83,8 +84,8 @@ def test_help_esc_repeated_no_border_accumulation(bin_path):
     a.assert_box_present()
     a.assert_box_at_bottom()
     assert "Open transcript" not in text, "末轮 Esc 未关 help:\n" + text
-    assert text.count("╭") == 1, "3 轮开关后顶边框累积残留:\n" + text
-    assert text.count("╰") == 1, "3 轮开关后底边框累积残留:\n" + text
+    # 三横线边框不可 count("─")(与 banner 通用);改 count ❯ == 1 验证无框累积。
+    assert text.count("❯") == 1, "3 轮开关后输入框累积残留(应恰 1 个 ❯):\n" + text
 
 
 def test_esc_then_char_not_swallowed(bin_path):
@@ -111,38 +112,36 @@ def test_esc_then_char_not_swallowed(bin_path):
     assert "k" in content_text, "ESC 后的字符 'k' 被吞了(drain 接线缺失?):\n输入行=[" + content_text + "]\n" + text
 
 
-def test_ctrl_o_transcript_no_alt_screen(bin_path):
+def test_ctrl_o_enters_inline_transcript(bin_path):
+    # Ctrl+O → inline 内联 transcript viewer(对齐 cc 2.1.167,DIFF#6/#7)。
+    # **不进 alt-screen**(无 ESC[?1049h):原地重绘视口(绝对光标定位,不 2J/不 \n),
+    # 不动 scrollback;footer 变 cc 风格 `Showing detailed transcript · ctrl+o to toggle · ↑↓ scroll`。
     raw = run(bin_path, ["sleep:0.8", "key:ctrl_o", "sleep:0.4"], per_key_drain=0.1)
-    a = TTYAssert(raw)
-    text = _screen_text(a)
-    assert "transcript" in text, text
-    assert b"\x1b[?1049h" not in raw, "overlay 误进 alt screen(应是嵌入视图态)"
+    assert b"\x1b[?1049h" not in raw, "inline transcript 不应进 alt-screen(ESC[?1049h)"
+    assert b"Showing detailed transcript" in raw, "应渲染 cc 风格 transcript footer"
 
 
 def test_ctrl_o_toggle_close(bin_path):
-    # Ctrl+O 开 → 再 Ctrl+O 关 → 回输入框。
-    raw = run(bin_path, ["sleep:0.8", "key:ctrl_o", "sleep:0.3", "key:ctrl_o", "sleep:0.3"], per_key_drain=0.1)
+    # Ctrl+O 开 inline → 再 Ctrl+O 关(viewer 认 0x0f 退出)→ 恢复输入框。
+    raw = run(bin_path, ["sleep:0.8", "key:ctrl_o", "sleep:0.4", "key:ctrl_o", "sleep:0.4"], per_key_drain=0.1)
     a = TTYAssert(raw)
     a.assert_box_present()
-    a.assert_box_at_bottom()
-    assert b"\x1b[?1049h" not in raw
+    assert b"\x1b[?1049h" not in raw, "inline 不进 alt-screen"
+    # 关闭后 transcript footer 不再在最终屏。
+    text = _screen_text(a)
+    assert "Showing detailed transcript" not in text, "关闭后残留 transcript footer:\n" + text
 
 
 def test_ctrl_o_double_press_clean(bin_path):
-    # 边界:连按两次 Ctrl+O(几乎无间隔)= 开+关 = 净回输入框,无 transcript 残留。
-    # 再连按两次仍干净(偶数次 toggle 必回原态)。无卡死、无 alt screen。
+    # 连按两次 Ctrl+O(开+关)→ 净回输入框,无 transcript 残留。
     raw = run(bin_path,
               ["sleep:0.8",
-               "key:ctrl_o", "key:ctrl_o", "sleep:0.4",   # 连按两次
-               "key:ctrl_o", "key:ctrl_o", "sleep:0.4"],  # 再连按两次
-              per_key_drain=0.05)
+               "key:ctrl_o", "key:ctrl_o", "sleep:0.5"],  # 连按两次:开+关
+              per_key_drain=0.08)
     a = TTYAssert(raw)
     a.assert_box_present()           # 回到输入框
-    a.assert_box_at_bottom()
     text = _screen_text(a)
-    # 终态不应残留 transcript 视图标题(开+关后应净回输入框)。
-    assert "transcript (Ctrl+O" not in text, "连按两次后残留 transcript 视图:\n" + text
-    assert b"\x1b[?1049h" not in raw, "误进 alt screen"
+    assert "Showing detailed transcript" not in text, "退出后残留 transcript footer:\n" + text
 
 
 def test_question_in_nonempty_buffer_is_literal(bin_path):
@@ -153,3 +152,44 @@ def test_question_in_nonempty_buffer_is_literal(bin_path):
     # foo? 应在输入框里,不展开 help 快捷键。
     assert "Open transcript" not in text, "非空 buffer 的 ? 误触发 help"
     assert "foo?" in text, text
+
+
+def test_ctrl_o_bottom_anchored_idempotent(bin_path):
+    # 回归(2026-06-06 真 bug):框**贴屏底 + 历史多**时,两次 Ctrl+O(开+关)后框位置
+    # 必须与按之前一致(box_top 不跳)。早期嵌入式 overlay bug:进入 transcript 从区顶向下画
+    # ~19 行,框贴屏底时滚动 ~15 行把 scrollback 永久滚走 → 退出后框跳屏顶(box_top 19→4)。
+    # inline 内联(对齐 cc):用绝对光标定位重绘视口、绝不 emit \n 滚动,故 scrollback 不被毁,
+    # 框位置幂等。这是 inline 实现必须守住的正确性不变式。
+    import re
+
+    def box_only(events):
+        a = TTYAssert(run(bin_path, ["sleep:0.8"] + events, term_size=(24, 80),
+                          per_key_drain=0.04, startup_drain=0.8), rows=24, cols=80)
+        return a.box_top_row()
+
+    msgs = []
+    for i in range(6):
+        msgs += ["type:msg %d zig" % i, "key:enter", "sleep:1.0"]
+
+    box0 = box_only(msgs)
+    box2 = box_only(msgs + ["key:ctrl_o", "sleep:0.6", "key:ctrl_o", "sleep:0.6"])
+
+    # 前置:框确实被推到屏底(否则测不出 bug)。
+    assert box0 is not None and box0 >= 14, \
+        f"T0 框应被历史推到屏底(box_top={box0}),否则测不出跳屏顶 bug"
+    # 核心幂等:两次 Ctrl+O 后框回原位(无跳屏顶、无滚走历史)。
+    assert box0 == box2, f"两次 Ctrl+O 后框漂移(box_top {box0}→{box2}):inline 滚动毁了 scrollback"
+
+
+def test_ctrl_o_tall_history_inline(bin_path):
+    # 长历史 + 小终端:Ctrl+O 进 inline transcript,退出恢复输入框,无 alt-screen。
+    msgs = []
+    for i in range(5):
+        msgs += ["type:line %d" % i, "key:enter", "sleep:0.9"]
+    raw = run(bin_path, ["sleep:0.8"] + msgs + ["key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"],
+              term_size=(12, 80), per_key_drain=0.05, startup_drain=0.8)
+    a = TTYAssert(raw, rows=12, cols=80)
+    text = _screen_text(a)
+    assert b"\x1b[?1049h" not in raw, "inline 不应进 alt-screen"
+    assert "Showing detailed transcript" not in text, "退出后残留 transcript footer:\n" + text
+    a.assert_box_present()

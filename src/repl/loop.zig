@@ -824,13 +824,15 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
                     continue;
                 },
                 .open_transcript => {
-                    // Ctrl+O → alt-screen 全屏 transcript viewer(ESC[?1049h/l)。alt-screen 是
-                    // 独立屏幕缓冲:进入时终端保存主屏(含已画好的输入框),viewer 在 alt 屏渲染,
-                    // 退出时终端**自动恢复主屏到进入前精确状态**。故无需 clear/redraw——多余的
-                    // clear+redraw 反而会改动主屏导致框漂 1 行。直接进出,主屏原样幂等。
+                    // Ctrl+O → inline 内联 transcript viewer(对齐 cc 2.1.167,DIFF#6/#7)。
+                    // 不再 alt-screen:viewer 原地重绘整个可见视口(绝对光标定位,**不 2J/不 emit \n**,
+                    // 不滚动 → 不毁 scrollback)。退出时 viewer 把对话尾重绘到上方、光标停在"输入框锚定行",
+                    // 此处 redraw 从该行重画输入框 → 框回屏底原位(守 idempotent)。
                     const sz = tui_term_root.getSize(fd);
                     const rows: usize = if (sz) |s| s.rows else 24;
+                    region.clear();
                     transcript_viewer.runWithTheme(fd, allocator, &app.conversation, rows, region.theme) catch {};
+                    redraw(&region, &editor, app);
                     continue;
                 },
                 .cycle_perm_mode => {

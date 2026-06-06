@@ -268,36 +268,31 @@ def test_T31_gen_help_esc_only_closes(bin_path):
 
 
 def test_T32_gen_ctrl_o_transcript(bin_path):
-    # 生成期按 Ctrl+O → 进 alt-screen 全屏 transcript viewer(2026-06-06 改回 alt-screen)。
+    # 生成期按 Ctrl+O → inline 内联 transcript viewer(对齐 cc,不进 alt-screen)。
     # 持渲染锁,emit 线程阻塞不抢 stdout;先 sleep 让首轮 append 进 conversation,transcript 有内容。
     if SKIP:
         return
     raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
                          "sleep:1.5", "key:ctrl_o", "sleep:0.8"],
               per_key_drain=0.05, base_url=None)
-    a = TTYAssert(raw)
-    assert b"\x1b[?1049h" in raw, "生成期 Ctrl+O 应进 alt-screen transcript viewer"
-    # alt-screen 内渲染 transcript 标题。
-    saw = any(sc.find_last_row("transcript") is not None for sc in a.frame_screens)
-    if not saw:
-        a._fail("生成期 Ctrl+O alt-screen 未渲染 transcript")
+    assert b"\x1b[?1049h" not in raw, "生成期 Ctrl+O inline 不应进 alt-screen"
+    assert b"Showing detailed transcript" in raw, "生成期 Ctrl+O 应渲染 cc 风格 transcript footer"
 
 
 def test_T33_gen_ctrl_o_toggle_close(bin_path):
-    # 生成期 Ctrl+O 开 alt-screen → 再 Ctrl+O 关(viewer 认 0x0f 退出)→ 退 alt-screen 回生成区。
+    # 生成期 Ctrl+O 开 inline → 再 Ctrl+O 关(viewer 认 0x0f 退出)→ 回生成区。
     if SKIP:
         return
     raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
                          "sleep:1.5", "key:ctrl_o", "sleep:0.6", "key:ctrl_o", "sleep:1"],
               per_key_drain=0.05, base_url=None)
     a = TTYAssert(raw)
-    assert b"\x1b[?1049h" in raw, "应进 alt-screen"
-    assert b"\x1b[?1049l" in raw, "再按 Ctrl+O 应退出 alt-screen"
-    # 退出后回到生成区(含 esc to interrupt),或生成已结束。
-    last_frames = a.frame_screens[-3:] if len(a.frame_screens) >= 3 else a.frame_screens
-    still_transcript = last_frames[-1].find_last_row("transcript (Ctrl+O") is not None if last_frames else False
-    if still_transcript:
-        a._fail("Ctrl+O 关闭后仍残留 transcript")
+    assert b"\x1b[?1049h" not in raw, "inline 不进 alt-screen"
+    assert b"Showing detailed transcript" in raw, "应一度显示 transcript footer"
+    # 关闭后最终屏不残留 transcript footer。
+    last = a.frame_screens[-1] if a.frame_screens else None
+    if last is not None and last.find_last_row("Showing detailed transcript") is not None:
+        a._fail("Ctrl+O 关闭后仍残留 transcript footer")
 
 
 def test_T34_gen_shift_tab_cycles_mode(bin_path):
