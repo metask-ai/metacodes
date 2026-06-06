@@ -865,7 +865,20 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
             }
         }
 
+        // Ctrl+Y paste 提示(对齐 cc DIFF#9):杀行键(Ctrl+U/K/W)且确有删除内容 → 置提示;
+        // 打字(char)→ 清提示。在 editor.handle 前后比对 yank_buf 长度判定"确有删除"。
+        const yank_before = editor.yankLen();
+        switch (key) {
+            .char => region.ui.paste_hint = false,
+            else => {},
+        }
         const action = try editor.handle(key);
+        switch (key) {
+            .ctrl_u, .ctrl_k, .ctrl_w => {
+                if (editor.yankLen() > yank_before) region.ui.paste_hint = true;
+            },
+            else => {},
+        }
         switch (action) {
             .redraw => redraw(&region, &editor, app),
             .commit => {

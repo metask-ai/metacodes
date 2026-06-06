@@ -433,7 +433,8 @@ pub const LineEditor = struct {
             },
             .ctrl_u => {
                 if (self.cursor == 0) return .none;
-                // 删除光标左边所有字符
+                // 删除光标左边所有字符,先存入 yank ring(供 Ctrl+Y 粘回,对齐 cc)。
+                try self.stashYank(self.buf.items[0..self.cursor]);
                 self.buf.replaceRangeAssumeCapacity(0, self.cursor, &.{});
                 self.cursor = 0;
                 return .redraw;
@@ -441,6 +442,7 @@ pub const LineEditor = struct {
             .ctrl_k => {
                 // Ctrl+K 单按 = kill-line(删到行尾)。Ctrl+X Ctrl+K 序列(杀后台)已迁 dispatch。
                 if (self.cursor >= self.buf.items.len) return .none;
+                try self.stashYank(self.buf.items[self.cursor..]); // 存 yank(Ctrl+Y 粘回)
                 self.buf.items.len = self.cursor; // 截断
                 return .redraw;
             },
@@ -573,6 +575,11 @@ pub const LineEditor = struct {
 
     pub fn view(self: *const LineEditor) []const u8 {
         return self.buf.items;
+    }
+
+    /// yank ring 当前内容长度(供 UI 判断"是否有可粘贴的已删文本",对齐 cc Ctrl+Y 提示)。
+    pub fn yankLen(self: *const LineEditor) usize {
+        return self.yank_buf.items.len;
     }
 
     /// 清空编辑行(buf + cursor 归零)。生成期回车入队后清框用。

@@ -373,6 +373,20 @@ pub const RenderRegion = struct {
         const task_tab_rows = self.drawTaskTab(w, app);
         new_rows += task_tab_rows;
 
+        // -- Ctrl+Y paste 提示(对齐 cc DIFF#9:框上方右对齐 `Ctrl+Y to paste deleted text`)--
+        if (self.ui.paste_hint) {
+            w.writeAll(ansi.clear.line) catch {};
+            const hint = "Ctrl+Y to paste deleted text";
+            const hw = displayWidth(hint);
+            if (self.cols > hw) {
+                var g: usize = 0;
+                while (g < self.cols - hw) : (g += 1) w.writeAll(" ") catch {};
+            }
+            w.print("{s}{s}{s}", .{ self.theme.dim, hint, self.theme.reset }) catch {};
+            w.writeAll("\r\n") catch {};
+            new_rows += 1;
+        }
+
         // -- 上边框 --
         w.writeAll(ansi.clear.line) catch {};
         self.drawBorderLine(w, border_color, true, inner_w);
@@ -452,11 +466,12 @@ pub const RenderRegion = struct {
             w.writeAll(ansi.cursor.up(diff, &nbuf)) catch {};
         }
 
-        // 4. 光标移到内容行(区内行号:TaskTab(0/1) + 上边框(1) + loc.vline)。
+        // 4. 光标移到内容行(区内行号:TaskTab(0/1) + paste提示(0/1) + 上边框(1) + loc.vline)。
         // shell 模式:cursor 是相对完整 content(含 `!`)的;body 去掉了 `!` → body_cursor = cursor-1。
         const body_cursor: usize = if (shell and cursor > 0) cursor - 1 else cursor;
         const loc = RenderRegion.locateCursor(body, body_cursor, &vlines);
-        const target_row: u16 = task_tab_rows + 1 + @as(u16, @intCast(loc.vline));
+        const hint_rows: u16 = if (self.ui.paste_hint) 1 else 0;
+        const target_row: u16 = task_tab_rows + hint_rows + 1 + @as(u16, @intCast(loc.vline));
         const footer_row: u16 = new_rows - 1;
         if (footer_row > target_row) {
             w.writeAll(ansi.cursor.up(footer_row - target_row, &nbuf)) catch {};
