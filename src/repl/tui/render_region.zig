@@ -940,26 +940,81 @@ pub const RenderRegion = struct {
     }
 
     /// 渲染一行助手文本(markdown + 前缀)到 scrollback。with_nl=true 行尾加 \n。
+    /// 长行按终端宽 SGR-aware 软折 + 悬挂缩进(对齐 cc:续行缩进 2 列对齐 `⏺ ` 后内容,不回第 0 列)。
     fn emitAssistantLine(self: *RenderRegion, line: []const u8, with_nl: bool) void {
         const md_render = @import("../render.zig");
+        // 先把 markdown 渲染到临时 buf(不含前缀),再 SGR-aware 软折到带前缀/缩进的输出。
+        var rendered: std.ArrayList(u8) = .empty;
+        defer rendered.deinit(self.allocator);
+        md_render.renderLineStreaming(line, &self.md_state, &rendered, self.allocator) catch {
+            rendered.clearRetainingCapacity();
+            rendered.appendSlice(self.allocator, line) catch {};
+        };
+
+        const seg_start = self.md_at_segment_start;
+        self.md_at_segment_start = false;
+
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
-        // 前缀:段首行 `⏺ `(accent),续行 `  `(2 空格缩进,对齐 cc)。
-        if (self.md_at_segment_start) {
+        // 前缀:段首行 `⏺ `(accent),续行(逻辑续行 + 软折)`  `(2 空格,对齐 cc)。
+        const prefix_w: usize = 2; // `⏺ ` 与 `  ` 同显示宽 = 2
+        const avail: usize = if (self.cols > prefix_w + 4) self.cols - prefix_w else 0; // 0 = 不折
+        self.appendAssistantPrefix(&buf, seg_start);
+        if (avail == 0) {
+            buf.appendSlice(self.allocator, rendered.items) catch {};
+        } else {
+            // SGR-aware 软折:转义序列原子零宽,可见字符按显示宽累计;到 avail 换行 + 2 空格缩进。
+            var vis_w: usize = 0;
+            var i: usize = 0;
+            const s = rendered.items;
+            while (i < s.len) {
+                if (s[i] == 0x1b) {
+                    const esc_end = scanEscape(s, i);
+                    buf.appendSlice(self.allocator, s[i..esc_end]) catch {};
+                    i = esc_end;
+                    continue;
+                }
+                const cp_len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+                const end = @min(i + cp_len, s.len);
+                const cw = term.displayWidth(s[i..end]);
+                if (vis_w + cw > avail and vis_w > 0) {
+                    // 软折:换行 + 2 空格悬挂缩进,重置可见宽。
+                    buf.append(self.allocator, '\n') catch {};
+                    buf.appendSlice(self.allocator, "  ") catch {};
+                    vis_w = 0;
+                }
+                buf.appendSlice(self.allocator, s[i..end]) catch {};
+                vis_w += cw;
+                i = end;
+            }
+        }
+        if (with_nl) buf.append(self.allocator, '\n') catch {};
+        self.emitToScroll(buf.items);
+    }
+
+    /// 助手行前缀:段首 `⏺ `(accent),续行 `  `(2 空格)。
+    fn appendAssistantPrefix(self: *RenderRegion, buf: *std.ArrayList(u8), seg_start: bool) void {
+        if (seg_start) {
             buf.appendSlice(self.allocator, self.theme.accent) catch {};
             buf.appendSlice(self.allocator, self.theme.icon_act) catch {};
             buf.appendSlice(self.allocator, self.theme.reset) catch {};
             buf.append(self.allocator, ' ') catch {};
-            self.md_at_segment_start = false;
         } else {
             buf.appendSlice(self.allocator, "  ") catch {};
         }
-        md_render.renderLineStreaming(line, &self.md_state, &buf, self.allocator) catch {
-            // 渲染失败:裸发原行(带前缀已在 buf)。
-            buf.appendSlice(self.allocator, line) catch {};
-        };
-        if (with_nl) buf.append(self.allocator, '\n') catch {};
-        self.emitToScroll(buf.items);
+    }
+
+    /// 从 s[i]=ESC 起扫完整转义序列,返回其后第一个字节索引(原子透传用)。
+    /// CSI(`\x1b[...字母`)到字母结尾;OSC/其它两字节 ESC 序列吃 2 字节兜底。
+    fn scanEscape(s: []const u8, i: usize) usize {
+        var j = i + 1;
+        if (j < s.len and s[j] == '[') {
+            j += 1;
+            while (j < s.len and !std.ascii.isAlphabetic(s[j])) : (j += 1) {}
+            if (j < s.len) j += 1; // 含结尾字母
+            return j;
+        }
+        return @min(i + 2, s.len); // 两字节转义兜底
     }
 
     /// 提交完成态 spinner 行进 scrollback(对齐 cc `✻ <Verb过去式> for Ns`,无 token——
