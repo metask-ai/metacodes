@@ -38,8 +38,17 @@ def _card_header_line(text: str, tool_name: str):
 
     一次工具调用产生两行 '⏺ <tool>':起始卡(无状态)与完成卡(带 ✓/✗/▶ + 时长)。
     优先返回带状态符的完成卡;若都没有(仍在执行中)退回最后一个匹配行。
+    类A 工具(Bash/Read/Grep/Glob)完成卡标题是自然语言(对齐 cc),非 `Tool(args)`——
+    故按别名匹配(Bash→"shell command"、Read→"file"…)。
     """
-    matches = [ln for ln in text.splitlines() if "⏺" in ln and tool_name in ln]
+    NL_ALIAS = {
+        "Bash": ("Bash", "shell command"),
+        "Read": ("Read", " file"),
+        "Grep": ("Grep", "pattern", "Search"),
+        "Glob": ("Glob", " file"),
+    }
+    needles = NL_ALIAS.get(tool_name, (tool_name,))
+    matches = [ln for ln in text.splitlines() if "⏺" in ln and any(n in ln for n in needles)]
     if not matches:
         return None
     for ln in matches:
