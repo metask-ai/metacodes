@@ -3,7 +3,7 @@
 //! 两个形态(复刻 Claude Code 观感):
 //! - **idle**(输入期):`{model} · {mode} · {N}tok · ${cost}[· Nbg][· Ncron]`
 //!   等价于旧 statusline.render 的内容,被 RenderRegion 吸收。
-//! - **generating**(生成期):`{spinner} {verb}… ({Xs} · ↑{in} ↓{out} · ${cost} · esc to interrupt)`
+//! - **generating**(生成期):`{spinner} {verb}… ({Xs} · ↓ {out} tokens)`(对齐 cc;esc 在 footer)
 //!
 //! 约定:不自己 write,把行字节(含 SGR+reset,不含尾随 \r\n)写进调用方提供的 writer
 //! (RenderRegion 持有 Io.Writer.Allocating over scratch),返回 line_count(恒 1)。
@@ -55,7 +55,10 @@ pub const StatusBar = struct {
         return 1;
     }
 
-    /// generating 形态:写一行(spinner + verb + 计时 + token + 中断提示),返回 1。
+    /// generating 形态:写一行 spinner,返回 1。对齐 cc 2.1.x:`✶ <Verb>… (Ns · ↓ N tokens)`。
+    /// **只显输出 token**(生成速率语义),不再塞 `↑in/$cost/⚒tool/esc`——
+    /// `esc to interrupt` 移到 footer(drawFooter 生成期渲染),与 cc 一致(DIFF#1 spinner超载)。
+    /// 留 current_tool/tool_ms 形参不读(调用方签名稳定,工具进度走下方 per-toolUse 卡)。
     /// max_w = 最大显示宽(= inner_w);超宽按显示宽截断(跳过 ANSI SGR 不计宽),
     /// 防 DECAWM 折行使生成期区实际行数 > R 导致 UP(R-1) 错位。
     pub fn renderGenerating(
@@ -70,51 +73,28 @@ pub const StatusBar = struct {
         tool_ms: u64,
         max_w: usize,
     ) !usize {
+        _ = current_tool;
+        _ = tool_ms;
         const u = app.usage;
-        const cost = u.costUsd(app.config.model);
         const secs = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
         const fr = verbs.frame(frame_idx, use_unicode);
 
-        var in_buf: [16]u8 = undefined;
         var out_buf: [16]u8 = undefined;
-        const in_str = formatTokens(&in_buf, u.input_tokens);
         const out_str = formatTokens(&out_buf, u.output_tokens);
 
-        // 当前工具段(执行中才显示):` · ⚒ <tool> (X.Ys)`。
-        var tool_buf: [80]u8 = undefined;
-        const tool_seg: []const u8 = if (current_tool.len > 0)
-            std.fmt.bufPrint(&tool_buf, " · {s} {s} ({d:.1}s)", .{
-                if (use_unicode) "⚒" else "*",
-                current_tool,
-                @as(f64, @floatFromInt(tool_ms)) / 1000.0,
-            }) catch ""
-        else
-            "";
-
-        // token 速率段:长 turn(>30s)才显示,对齐 cc `↓7.9k tokens` 速率语义。
-        // 速率 = 输出 token / 耗时秒(输出 token 才是"生成"速率)。
-        var rate_buf: [24]u8 = undefined;
-        const rate_seg: []const u8 = if (elapsed_ms > 30_000 and secs > 0) blk: {
-            const rate = @as(f64, @floatFromInt(u.output_tokens)) / secs;
-            var rb: [16]u8 = undefined;
-            const rstr = formatTokens(&rb, @intFromFloat(@max(rate, 0)));
-            break :blk std.fmt.bufPrint(&rate_buf, " · {s} tok/s", .{rstr}) catch "";
-        } else "";
-
         // 先格式化到栈 buffer,再按显示宽截断输出(跳过 SGR 转义)。
-        var line_buf: [512]u8 = undefined;
-        const line = std.fmt.bufPrint(&line_buf, "{s}{s} {s}…{s}{s} ({d:.0}s · ↑{s} ↓{s}{s} · ${d:.4}{s} · esc to interrupt){s}", .{
+        // cc 形态:`✶ Verb… (Ns · ↓ N tokens)`——计时 + 输出 token,无成本/输入/工具/中断。
+        const arrow = if (use_unicode) "↓" else "v";
+        var line_buf: [256]u8 = undefined;
+        const line = std.fmt.bufPrint(&line_buf, "{s}{s} {s}…{s}{s} ({d:.0}s · {s} {s} tokens){s}", .{
             theme.accent,
             fr,
             verb,
             theme.reset,
             theme.dim,
             secs,
-            in_str,
+            arrow,
             out_str,
-            rate_seg,
-            cost,
-            tool_seg,
             theme.reset,
         }) catch {
             // 极端超长 → 退化为最简 spinner。

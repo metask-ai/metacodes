@@ -87,8 +87,6 @@ pub const RenderRegion = struct {
 
     // 阶段1:overlay 逻辑态(help/transcript)由 UiState 承载;机制态(prev_rows 等)仍在上面。
     ui: ui_state_mod.UiState = .{},
-    // transcript overlay 期间持有的 owned lines(开 overlay 时生成,关时 freeLines)。
-    transcript_lines: ?[][]u8 = null,
 
     mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
 
@@ -97,6 +95,22 @@ pub const RenderRegion = struct {
     }
     fn unlock(self: *RenderRegion) void {
         _ = std.c.pthread_mutex_unlock(&self.mutex);
+    }
+
+    /// 生成期 overlay(alt-screen transcript viewer)用:持渲染锁,使 agent_loop emit 线程
+    /// 阻塞在锁上、不与 viewer 抢 stdout。enter/exit 必须配对。viewer 自身不请求本锁(无死锁)。
+    /// enter 持锁后擦掉生成期固定区(光标回文本续接点),使 viewer 进 alt-screen 时主屏是干净
+    /// 的文本流末尾;exit 在**锁内**重画固定区后再释放锁(避免与 redrawGen 重复 lock 死锁)。
+    pub fn enterExclusiveOverlay(self: *RenderRegion) void {
+        self.lock();
+        if (self.generating and self.region_drawn) self.eraseRegion();
+    }
+    pub fn exitExclusiveOverlay(self: *RenderRegion, app: *const app_mod.App) void {
+        if (self.generating) {
+            if (self.region_drawn) self.eraseRegion();
+            self.drawGenRegion(app);
+        }
+        self.unlock();
     }
 
     /// 设置当前执行中的工具(普通工具,spinner 段 `⚒ <tool>`)。持锁。
@@ -115,10 +129,10 @@ pub const RenderRegion = struct {
 
     /// 新增一张 per-toolUse 进度卡(hasProgressCard 工具如 WebSearch 执行前调)。
     /// 按 id 去重;满则丢弃(MAX_TOOL_CARDS 够并发批)。持锁。
-    pub fn addToolCard(self: *RenderRegion, id: []const u8, name: []const u8, start_ms: i64) void {
+    pub fn addToolCard(self: *RenderRegion, id: []const u8, name: []const u8, input_json: []const u8, start_ms: i64) void {
         self.lock();
         defer self.unlock();
-        ui_state_mod.addCard(&self.ui, id, name, start_ms);
+        ui_state_mod.addCard(&self.ui, id, name, input_json, start_ms);
     }
 
     /// 移除一张 per-toolUse 卡(工具完成调)。持锁。数组紧凑(前移补位)。
@@ -159,17 +173,9 @@ pub const RenderRegion = struct {
     }
 
     pub fn deinit(self: *RenderRegion) void {
-        self.freeTranscriptLines();
         self.scratch.deinit();
         self.line_buf.deinit(self.allocator);
         self.md_buf.deinit(self.allocator);
-    }
-
-    fn freeTranscriptLines(self: *RenderRegion) void {
-        if (self.transcript_lines) |ls| {
-            transcript_viewer.freeLines(self.allocator, ls);
-            self.transcript_lines = null;
-        }
     }
 
     /// 设置输入态(loop 每次按键后调,再调 render)。
@@ -452,18 +458,14 @@ pub const RenderRegion = struct {
         return self.theme.accent;
     }
 
-    /// 画一条横边框线(top=true 用 ╭─╮,否则 ╰─╯)。无左右竖线之外的填充。
+    /// 画一条横边框线。对齐 cc 2.1.x:输入框是上下两条**全宽水平线**(无圆角、无左右竖线),
+    /// 内容行 `❯ text` 本就无侧竖线。top 参数保留(两条线视觉相同,语义上区分上/下)。
     fn drawBorderLine(self: *RenderRegion, w: *std.Io.Writer, color: []const u8, top: bool, inner_w: usize) void {
+        _ = top;
         const th = self.theme;
-        const left = if (top) th.box_tl else th.box_bl;
-        const right = if (top) th.box_tr else th.box_br;
         w.writeAll(color) catch {};
-        w.writeAll(left) catch {};
         var i: usize = 0;
-        // 中间填充 box_h,留出 left+right 两端(各占 1 显示列)
-        const fill = if (inner_w >= 2) inner_w - 2 else 0;
-        while (i < fill) : (i += 1) w.writeAll(th.box_h) catch {};
-        w.writeAll(right) catch {};
+        while (i < inner_w) : (i += 1) w.writeAll(th.box_h) catch {};
         w.writeAll(th.reset) catch {};
     }
 
@@ -516,7 +518,11 @@ pub const RenderRegion = struct {
         else
             "";
         // default 态显 `? for shortcuts`;非 default 已在 mode part 含 cycle 提示,hint 留空。
-        const hint = if (show_mode) "" else " ? for shortcuts";
+        // 生成期(self.generating):右接 `esc to interrupt`(对齐 cc:中断提示在 footer 非 spinner 行)。
+        // cc 实测:非 default → `{mode part} · esc to interrupt`(有 `· ` 分隔);default → `esc to interrupt`。
+        const hint = if (self.generating)
+            (if (show_mode) " · esc to interrupt" else " esc to interrupt")
+        else if (show_mode) "" else " ? for shortcuts";
 
         const total = blk: {
             const ft = self.ui.footer.totalTokens();
@@ -601,11 +607,7 @@ pub const RenderRegion = struct {
         self.lock();
         defer self.unlock();
         if (self.generating) return; // 生成期不画多行区
-        if (self.ui.overlay != .none) {
-            self.renderOverlayInner(app);
-        } else {
-            self.renderInner(app);
-        }
+        self.renderInner(app);
     }
 
     /// 阶段1:输入期按键先经 dispatch(锁内改 UiState + 据 Effect 重画)。
@@ -619,34 +621,19 @@ pub const RenderRegion = struct {
     ) event_mod.Effect {
         self.lock();
         defer self.unlock();
-        const was = self.ui.overlay;
+        _ = conv;
         const eff = ui_mod.dispatch(&self.ui, ev);
-        const now = self.ui.overlay;
-        // transcript overlay 跳变:进入时生成 lines(借 conv),退出时释放。
-        if (now == .transcript and was != .transcript) {
-            self.freeTranscriptLines();
-            self.transcript_lines = transcript_viewer.renderToLinesWithTheme(self.allocator, conv, self.theme) catch null;
-        } else if (now != .transcript and was == .transcript) {
-            self.freeTranscriptLines();
-            // transcript 退出再锚定:transcript 可能比输入框高、顶动了终端,直接 renderInner
-            // 会让输入框停在 transcript 旧区顶(漂到屏上方,下方留空)。修:擦掉 transcript 区
-            // → 用绝对定位把光标移到屏底输入框应在的行 → renderInner 从那里画 → 输入框落回底部。
-            self.reanchorBottomAfterOverlay();
-        }
+        // transcript 现走 alt-screen viewer(Ctrl+O → dispatch 上抛 .open_transcript,
+        // 调用方进 alt-screen),不再嵌入式渲染。此处只处理输入框固定区重画。
         if (eff.redraw_region and !self.generating) {
-            if (self.ui.overlay != .none) {
-                self.renderOverlayInner(app);
-            } else {
-                self.renderInner(app);
-            }
+            self.renderInner(app);
         }
         return eff;
     }
 
     /// 生成期按键分流(对应输入期 applyEvent,持锁)。watcher 线程调:同步 editor 投影 →
-    /// dispatch(复用输入期同一份 `?`/help/Ctrl+O/transcript 滚动语义)→ 处理 overlay 快照
-    /// 跳变 → 重画走 drawGenRegion(非 renderInner)。返回 Effect 供 watcher 决定是否喂 LineEditor。
-    /// conv 供 transcript overlay 生成 lines(renderToLinesWithTheme 内部持 snapshot 锁防 append UAF)。
+    /// dispatch(复用输入期同一份 `?`/help/Ctrl+O 语义)→ 重画走 drawGenRegion。
+    /// 返回 Effect 供 watcher 决定是否喂 LineEditor / 执行 .open_transcript 等上抛动作。
     pub fn applyGenKey(
         self: *RenderRegion,
         app: *const app_mod.App,
@@ -658,19 +645,10 @@ pub const RenderRegion = struct {
         self.lock();
         defer self.unlock();
         if (!self.generating) return .{};
+        _ = conv;
         // dispatch 判"空 buffer + ?"依赖 editor 投影,调前同步 watcher 的 LineEditor 视图。
         self.ui.editor = .{ .view = ed_view, .cursor = ed_cursor };
-        const was = self.ui.overlay;
         const eff = ui_mod.dispatch(&self.ui, .{ .key = .{ .key = key } });
-        const now = self.ui.overlay;
-        // transcript overlay 跳变:进入生成快照(借 conv),退出释放。生成期**不** reanchor
-        // (输入期才需,生成区靠 prev_rows 收缩擦除维持锚位)。
-        if (now == .transcript and was != .transcript) {
-            self.freeTranscriptLines();
-            self.transcript_lines = transcript_viewer.renderToLinesWithTheme(self.allocator, conv, self.theme) catch null;
-        } else if (now != .transcript and was == .transcript) {
-            self.freeTranscriptLines();
-        }
         if (eff.redraw_region and self.generating) {
             if (self.region_drawn) self.eraseRegion();
             self.drawGenRegion(app);
@@ -696,61 +674,6 @@ pub const RenderRegion = struct {
             try self.writeAll(s);
         }
     };
-
-    /// overlay 帧渲染:复用 renderFrameInner 的 erase/prev_rows 骨架,中段换成 ui.render 输出。
-    /// 与正常输入框共用 prev_rows/input_cursor_row 不变式 → 切换时自动收缩擦除。
-    fn renderOverlayInner(self: *RenderRegion, app: *const app_mod.App) void {
-        _ = app;
-        self.measureSize();
-        const w = &self.scratch.writer;
-        self.resetScratch();
-        var nbuf: [16]u8 = undefined;
-
-        // 1. hide + 回区顶 + 行首(同 renderFrameInner)。
-        w.writeAll(ansi.cursor.hide) catch {};
-        if (self.input_cursor_row > 0) w.writeAll(ansi.cursor.up(self.input_cursor_row, &nbuf)) catch {};
-        w.writeAll(ansi.cursor.column(1, &nbuf)) catch {};
-
-        // 2. 几何注入 UiState(renderTranscript 用 state.rows 算窗口)。
-        self.ui.cols = self.cols;
-        self.ui.rows = self.rows;
-
-        // 3. ui.render 写中段(经 RegionLineWriter 注入 clear.line)。
-        var lw = RegionLineWriter{ .inner = w };
-        const frame = ui_mod.render(&lw, .{
-            .state = &self.ui,
-            .now_ms = util_time.nowMs(),
-            .theme = self.theme,
-            .use_unicode = self.use_unicode,
-            .transcript_lines = if (self.transcript_lines) |ls| ls else &.{},
-        }) catch ui_mod.Frame{};
-        const new_rows: u16 = frame.rows;
-
-        // ui.render 末行带 \r\n → 光标在区下方。先 up(1) 回到区最后一行,对齐
-        // renderFrameInner 的"光标停在最后一行"约定,使下方收缩擦除/回顶逻辑一致。
-        if (new_rows > 0) w.writeAll(ansi.cursor.up(1, &nbuf)) catch {};
-
-        // 4. 收缩残留擦除(同 renderFrameInner:443-451)。
-        if (new_rows < self.prev_rows) {
-            const diff = self.prev_rows - new_rows;
-            var k: u16 = 0;
-            while (k < diff) : (k += 1) {
-                w.writeAll("\r\n") catch {};
-                w.writeAll(ansi.clear.line) catch {};
-            }
-            w.writeAll(ansi.cursor.up(diff, &nbuf)) catch {};
-        }
-
-        // 5. overlay 无编辑光标:回区顶(下一帧 renderFrameInner 从 input_cursor_row=0 起)。
-        if (new_rows > 1) w.writeAll(ansi.cursor.up(new_rows - 1, &nbuf)) catch {};
-        w.writeAll(ansi.cursor.column(1, &nbuf)) catch {};
-        w.writeAll(ansi.cursor.show) catch {};
-
-        self.prev_rows = new_rows;
-        self.input_cursor_row = 0;
-        self.visible = true;
-        self.flush();
-    }
 
     /// 擦掉固定区,光标回区顶第一行行首,prev_rows=0。
     /// 供"消息穿过协议"的 beginMessage 及退出清理用。
@@ -791,24 +714,6 @@ pub const RenderRegion = struct {
         self.flush();
     }
 
-    /// transcript 退出后把输入框重锚到屏底:先擦 transcript 区(clearInner),再用绝对定位
-    /// 把光标移到屏底输入框应在的首行(self.rows - 估算框高),renderInner 从那里画 → 框落底部。
-    /// 不进 alt-screen;绝对定位作用于可视屏(scrollback 模式合法)。
-    fn reanchorBottomAfterOverlay(self: *RenderRegion) void {
-        self.clearInner(); // 擦 transcript 区 + 回区顶,prev_rows=0/visible=false
-        self.measureSize();
-        // 估算输入框高:上下边框(2)+ 至少 1 内容行 + footer(1) = 4(无 TaskTab/slash 时)。
-        // 多估几行无害:renderInner 的 shrink-erase 会清掉框下方多余空行。
-        const box_h: u16 = 4;
-        const w = &self.scratch.writer;
-        self.resetScratch();
-        var nbuf: [16]u8 = undefined;
-        const target_row: u16 = if (self.rows > box_h) self.rows - box_h + 1 else 1;
-        w.writeAll(ansi.cursor.move(target_row, 1, &nbuf)) catch {};
-        self.flush();
-        // 此后 input_cursor_row=0/prev_rows=0,renderInner 在 target_row 起画输入框(屏底)。
-    }
-
     // =====================================================================
     // 生成期:文本零重绘 + 区(spinner+输入框+footer)按事件节流重画
     // =====================================================================
@@ -829,18 +734,17 @@ pub const RenderRegion = struct {
         self.cursor_in_region_row = 0;
         self.text_pending_newline = false;
         self.pending_col = 0;
-        // 生成期状态单一真相源 = self.ui(drawGenRegion 读它)。overlay 强制关闭。
+        // 生成期状态单一真相源 = self.ui(drawGenRegion 读它)。
         self.ui.phase = .generating;
-        self.ui.overlay = .none;
         self.ui.spinner = .{ .frame = 0, .verb = verbs.pick(@intCast(util_time.nowMs() & 0xffff)), .start_ms = util_time.nowMs() };
         self.ui.tools.current_len = 0;
         self.ui.tools.cards_len = 0;
     }
 
-    /// 离开生成期:擦掉固定区(若在)+ 补半行换行 + 收尾。不再返回 carryover
-    /// (待发送队列由主循环消费,见 loop.zig)。
+    /// 离开生成期:擦掉固定区(若在)+ 提交完成态 spinner 行进 scrollback + 补半行换行 + 收尾。
+    /// 完成态(对齐 cc DIFF#2):`✻ <Verb过去式> for Ns · ↓ N tokens`,提交进 scrollback 留痕。
+    /// 不再返回 carryover(待发送队列由主循环消费,见 loop.zig)。
     pub fn leaveGenerating(self: *RenderRegion, app: *const app_mod.App) void {
-        _ = app;
         self.lock();
         defer self.unlock();
         self.flushGenAssistantLocked(); // 助手文本残行(markdown)先 flush
@@ -853,6 +757,12 @@ pub const RenderRegion = struct {
             self.flush();
             self.text_pending_newline = false;
             self.pending_col = 0;
+        }
+        // -- 完成态 spinner:提交进 scrollback(对齐 cc `✻ Verb for Ns`)--
+        // 仅当本轮有可感知耗时(≥0.5s)才显,避免瞬时轮出现 "for 0s" 噪声。
+        const gen_elapsed: u64 = @intCast(@max(util_time.nowMs() -% self.ui.spinner.start_ms, 0));
+        if (gen_elapsed >= 500) {
+            self.emitFinishedSpinner(app, gen_elapsed);
         }
         self.generating = false;
         self.ui.phase = .input; // 同步:退生成期 → 输入期(双写过渡)
@@ -1000,6 +910,31 @@ pub const RenderRegion = struct {
         self.emitToScroll(buf.items);
     }
 
+    /// 提交完成态 spinner 行进 scrollback(对齐 cc `✻ <Verb过去式> for Ns · ↓ N tokens`)。
+    /// verb 用 pickPast(同 seed = spinner.start_ms,整轮固定);区已在 leaveGenerating 擦掉,
+    /// 此处当作普通 scrollback 行 emit(emitToScroll 会处理区在/不在)。
+    fn emitFinishedSpinner(self: *RenderRegion, app: *const app_mod.App, elapsed_ms: u64) void {
+        const th = self.theme;
+        const sb = @import("widget/status_bar.zig");
+        const fr = verbs.frame(0, self.use_unicode); // 完成态用固定 ✻(frames[0])
+        const verb_past = verbs.pickPast(@bitCast(self.ui.spinner.start_ms));
+        const secs: f64 = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
+        const out_tok = app.usage.output_tokens;
+
+        var buf: [160]u8 = undefined;
+        const line = if (out_tok > 0) blk: {
+            var tb: [16]u8 = undefined;
+            const ts = sb.formatTokens(&tb, out_tok);
+            const arrow = if (self.use_unicode) "↓" else "v";
+            break :blk std.fmt.bufPrint(&buf, "{s}{s} {s}{s}{s} for {d:.0}s · {s} {s} tokens{s}\n", .{
+                th.accent, fr, th.reset, th.dim, verb_past, secs, arrow, ts, th.reset,
+            }) catch return;
+        } else std.fmt.bufPrint(&buf, "{s}{s} {s}{s}{s} for {d:.0}s{s}\n", .{
+            th.accent, fr, th.reset, th.dim, verb_past, secs, th.reset,
+        }) catch return;
+        self.emitToScroll(line);
+    }
+
     /// 实际把一段文本输出到 scrollback:擦区(若在)→ print → 若刚才区在屏则重画区。
     /// print 仅在 region_drawn==false 时发生(eraseRegion 后),draw/erase 成对、续接点用画区快照还原。
     fn emitToScroll(self: *RenderRegion, text: []const u8) void {
@@ -1071,13 +1006,6 @@ pub const RenderRegion = struct {
             w.writeAll("\n") catch {};
         } else {
             w.writeAll("\r") catch {};
-        }
-
-        // overlay==.transcript:模态覆盖整个生成区,画 transcript 后直接返回
-        // (跳过 spinner/cards/queue/panel/border/editor/footer 全套及末尾 editor 光标定位)。
-        if (self.ui.overlay == .transcript) {
-            self.drawGenTranscript(w, &nb);
-            return;
         }
 
         const inner_w: usize = if (self.cols > 4) self.cols - 1 else 40;
@@ -1196,47 +1124,6 @@ pub const RenderRegion = struct {
 
     /// 生成期 transcript 模态帧(对应输入期 renderOverlayInner,但记 cursor_in_region_row 而非
     /// input_cursor_row——生成期 eraseRegion 读前者)。调用前 drawGenRegion 已 hide+封口,
-    /// 光标在区顶续接点。这里画 transcript → 收缩擦除 → 回区顶。w/nb 由 drawGenRegion 传入。
-    fn drawGenTranscript(self: *RenderRegion, w: *std.Io.Writer, nb: []u8) void {
-        // 几何注入(renderTranscript 用 state.rows 算窗口高 rows-3,天然限高不撑爆)。
-        self.ui.cols = self.cols;
-        self.ui.rows = self.rows;
-
-        var lw = RegionLineWriter{ .inner = w };
-        const frame = ui_mod.render(&lw, .{
-            .state = &self.ui,
-            .now_ms = util_time.nowMs(),
-            .theme = self.theme,
-            .use_unicode = self.use_unicode,
-            .transcript_lines = if (self.transcript_lines) |ls| ls else &.{},
-        }) catch ui_mod.Frame{};
-        const new_rows: u16 = frame.rows;
-
-        // renderTranscript 末行带 \r\n → 光标在区下方一行,up(1) 回区最后一行(同 renderOverlayInner)。
-        if (new_rows > 0) w.writeAll(ansi.cursor.up(1, nb)) catch {};
-
-        // 收缩残留擦除(transcript 关闭/变矮时清旧区尾行)。
-        if (new_rows < self.prev_rows) {
-            const diff = self.prev_rows - new_rows;
-            var k: u16 = 0;
-            while (k < diff) : (k += 1) {
-                w.writeAll("\r\n") catch {};
-                w.writeAll(ansi.clear.line) catch {};
-            }
-            w.writeAll(ansi.cursor.up(diff, nb)) catch {};
-        }
-
-        // 模态无编辑光标:回区顶行首。记 cursor_in_region_row=0 → eraseRegion 的 up(0) 自洽。
-        if (new_rows > 1) w.writeAll(ansi.cursor.up(new_rows - 1, nb)) catch {};
-        w.writeAll(ansi.cursor.column(1, nb)) catch {};
-        w.writeAll(ansi.cursor.show) catch {};
-
-        self.prev_rows = new_rows;
-        self.cursor_in_region_row = 0;
-        self.region_drawn = true;
-        self.flush();
-    }
-
     /// 最多 MAX 条,超出补一行 ` +N more`。
     /// 执行中 per-toolUse 进度卡(动态区,可刷新):⏺ <Tool> / ⎿ <progress>。对齐 cc 双段卡。
     /// 随每次 tickSpinner 重画。card 是某张 tool_cards 条目。
@@ -1244,21 +1131,37 @@ pub const RenderRegion = struct {
         const th = self.theme;
         const tool_card = @import("widget/tool_card.zig");
         const inner_w: usize = if (self.cols > 8) self.cols - 8 else 30;
+        const name = card.name[0..card.name_len];
+        const is_live = tool_card.usesLiveCard(name);
         var rows: u16 = 0;
-        // 第 1 行:⏺ <display name>(WebSearch→"Web Search")。
+
+        // 第 1 行:⏺ <标题>。WebSearch → displayName(旧);类A → 自然语言进行时(Running 1 shell command…)。
         w.writeAll(ansi.clear.line) catch {};
-        w.print("{s}{s}{s} {s}", .{ th.accent, th.icon_act, th.reset, tool_card.displayName(card.name[0..card.name_len]) }) catch {};
+        if (is_live) {
+            const title = tool_card.toolRunningTitle(self.allocator, name, card.inputSlice()) catch null;
+            defer if (title) |t| self.allocator.free(t);
+            w.print("{s}{s}{s} {s}", .{ th.accent, th.icon_act, th.reset, title orelse tool_card.displayName(name) }) catch {};
+        } else {
+            w.print("{s}{s}{s} {s}", .{ th.accent, th.icon_act, th.reset, tool_card.displayName(name) }) catch {};
+        }
         rows += 1;
         w.writeAll("\r\n") catch {};
-        // 第 2 行:  ⎿ <progress>(Searching: q / Found N results;随 tick 刷新)。
-        // progress 未到(刚开始搜索)→ 用 "Searching…" 占位,对齐 cc 执行中即显第二行。
+
+        // 第 2 行:⎿ <内容>。WebSearch → progress(Found N…)/「Searching…」占位;
+        // 类A → 输入预览($ cmd / 📄 path / /pat/),与完成态一致(只标题变)。
         w.writeAll(ansi.clear.line) catch {};
-        const prog: []const u8 = if (card.progress_len > 0)
-            card.progress[0..card.progress_len]
-        else
-            "Searching…";
         w.print("  {s}{s}{s} ", .{ th.dim, th.gutter, th.reset }) catch {};
-        writeTruncatedWidth(w, prog, inner_w);
+        if (is_live) {
+            const preview = tool_card.toolPreviewPub(self.allocator, name, card.inputSlice()) catch null;
+            defer if (preview) |p| self.allocator.free(p);
+            writeTruncatedWidth(w, preview orelse "", inner_w);
+        } else {
+            const prog: []const u8 = if (card.progress_len > 0)
+                card.progress[0..card.progress_len]
+            else
+                "Searching…";
+            writeTruncatedWidth(w, prog, inner_w);
+        }
         w.writeAll(th.reset) catch {};
         rows += 1;
         w.writeAll("\r\n") catch {};
@@ -1345,8 +1248,8 @@ pub const RegionWriter = struct {
         self.region.clearCurrentTool();
     }
     /// per-toolUse 进度卡(WebSearch):建/删/刷新进度,按 tool_use id 路由。
-    pub fn addToolCard(self: *RegionWriter, id: []const u8, name: []const u8, start_ms: i64) void {
-        self.region.addToolCard(id, name, start_ms);
+    pub fn addToolCard(self: *RegionWriter, id: []const u8, name: []const u8, input_json: []const u8, start_ms: i64) void {
+        self.region.addToolCard(id, name, input_json, start_ms);
     }
     pub fn clearToolCard(self: *RegionWriter, id: []const u8) void {
         self.region.clearToolCard(id);
@@ -1475,8 +1378,8 @@ test "per-toolUse 多卡:按 id 各写各卡不互盖 + 增删(读 ui.tools 真�
     try std.testing.expectEqual(@as(u8, 0), r.ui.tools.cards_len);
 
     // 两个并发 WebSearch:各一张卡。
-    r.addToolCard("id_a", "WebSearch", 100);
-    r.addToolCard("id_b", "WebSearch", 200);
+    r.addToolCard("id_a", "WebSearch", "{\"query\":\"alpha\"}", 100);
+    r.addToolCard("id_b", "WebSearch", "{\"query\":\"beta\"}", 200);
     try std.testing.expectEqual(@as(u8, 2), r.ui.tools.cards_len);
 
     // 各写各的 progress,不互盖。
@@ -1488,7 +1391,7 @@ test "per-toolUse 多卡:按 id 各写各卡不互盖 + 增删(读 ui.tools 真�
     try std.testing.expectEqualStrings("Searching: beta", r.ui.tools.cards[ib].progressSlice());
 
     // 重复 addToolCard 同 id 不新增。
-    r.addToolCard("id_a", "WebSearch", 300);
+    r.addToolCard("id_a", "WebSearch", "{\"query\":\"alpha\"}", 300);
     try std.testing.expectEqual(@as(u8, 2), r.ui.tools.cards_len);
 
     // 删一张,另一张保留且 progress 不丢。

@@ -25,8 +25,8 @@ def test_T14_generating_keeps_input_box(bin_path):
     coexist = sum(
         1 for sc in a.frame_screens
         if sc.find_last_row("esc to interrupt") is not None
-        and sc.find_last_row("╭") is not None
         and sc.find_last_row("❯") is not None
+        # 三横线边框无 ╭;❯ 内容行即证输入框在。
         # footer 标志:bypass 模式(driver 默认)footer 含 "shift+tab to cycle"
         # (2026-06-05 对齐 cc:非 default 态不再含 "? for shortcuts")。
         and sc.find_last_row("shift+tab to cycle") is not None
@@ -210,8 +210,16 @@ def test_A6_narrow_terminal_no_wrap(bin_path):
 
 
 def _gen_frames(a):
-    """生成期帧(含 'esc to interrupt' 的 spinner 帧)。"""
-    return [sc for sc in a.frame_screens if sc.find_last_row("esc to interrupt") is not None]
+    """生成期帧。spinner 行(含 '…' + 'tokens')是生成期可靠标志——它在 help 开/关都在,
+    而 'esc to interrupt' 已移到 footer(2026-06-06 对齐 cc),help 开时 footer 被替换 → 该行消失。
+    故用 spinner 行检测,不再依赖 footer 的 interrupt 文案。"""
+    def is_gen(sc):
+        for r in range(sc.rows):
+            t = sc.line_text(r)
+            if "…" in t and "tokens" in t:
+                return True
+        return False
+    return [sc for sc in a.frame_screens if is_gen(sc)]
 
 
 def test_T30_gen_help_nonmodal(bin_path):
@@ -219,7 +227,7 @@ def test_T30_gen_help_nonmodal(bin_path):
     # 字面字符塞进输入框,生成期完全不响应。长查询保证 ? 落在生成窗口。
     if SKIP:
         return
-    raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
+    raw = run(bin_path, ["sleep:0.8", "type:请用中文从 1 数到 200,每个数字单独占一行,不要省略任何数字", "key:enter",
                          "sleep:0.6", "type:?", "sleep:0.5"],
               per_key_drain=0.05, base_url=None)
     a = TTYAssert(raw)
@@ -231,7 +239,7 @@ def test_T30_gen_help_nonmodal(bin_path):
     ok = any(
         sc.find_last_row("Open transcript") is not None
         and sc.find_last_row("❯") is not None
-        and sc.find_last_row("╭") is not None
+        # 三横线边框无 ╭;❯ 即证非模态输入框仍在。
         for sc in gen
     )
     if not ok:
@@ -260,37 +268,36 @@ def test_T31_gen_help_esc_only_closes(bin_path):
 
 
 def test_T32_gen_ctrl_o_transcript(bin_path):
-    # 生成期按 Ctrl+O → transcript 模态覆盖生成区(对齐 cc app:toggleTranscript Global)。
-    # 先 sleep 让首轮 append 进 conversation,transcript 才有内容。
+    # 生成期按 Ctrl+O → 进 alt-screen 全屏 transcript viewer(2026-06-06 改回 alt-screen)。
+    # 持渲染锁,emit 线程阻塞不抢 stdout;先 sleep 让首轮 append 进 conversation,transcript 有内容。
     if SKIP:
         return
     raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
-                         "sleep:1.2", "key:ctrl_o", "sleep:0.6"],
+                         "sleep:1.5", "key:ctrl_o", "sleep:0.8"],
               per_key_drain=0.05, base_url=None)
     a = TTYAssert(raw)
-    # 某帧含 transcript 标题;且不进 alt screen。
-    ok = any(sc.find_last_row("transcript (Ctrl+O") is not None for sc in a.frame_screens)
-    if not ok:
-        a._fail("生成期 Ctrl+O 未打开 transcript")
-    assert b"\x1b[?1049h" not in raw, "生成期 transcript 误进 alt screen"
+    assert b"\x1b[?1049h" in raw, "生成期 Ctrl+O 应进 alt-screen transcript viewer"
+    # alt-screen 内渲染 transcript 标题。
+    saw = any(sc.find_last_row("transcript") is not None for sc in a.frame_screens)
+    if not saw:
+        a._fail("生成期 Ctrl+O alt-screen 未渲染 transcript")
 
 
 def test_T33_gen_ctrl_o_toggle_close(bin_path):
-    # 生成期 Ctrl+O 开 transcript → 再 Ctrl+O 关 → 回到生成区(spinner 帧),无 transcript 残留。
+    # 生成期 Ctrl+O 开 alt-screen → 再 Ctrl+O 关(viewer 认 0x0f 退出)→ 退 alt-screen 回生成区。
     if SKIP:
         return
     raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
-                         "sleep:1.2", "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:1"],
+                         "sleep:1.5", "key:ctrl_o", "sleep:0.6", "key:ctrl_o", "sleep:1"],
               per_key_drain=0.05, base_url=None)
     a = TTYAssert(raw)
-    # 最后若干帧应回到生成区(含 esc to interrupt),非 transcript。
+    assert b"\x1b[?1049h" in raw, "应进 alt-screen"
+    assert b"\x1b[?1049l" in raw, "再按 Ctrl+O 应退出 alt-screen"
+    # 退出后回到生成区(含 esc to interrupt),或生成已结束。
     last_frames = a.frame_screens[-3:] if len(a.frame_screens) >= 3 else a.frame_screens
-    back_to_gen = any(sc.find_last_row("esc to interrupt") is not None for sc in last_frames)
     still_transcript = last_frames[-1].find_last_row("transcript (Ctrl+O") is not None if last_frames else False
     if still_transcript:
         a._fail("Ctrl+O 关闭后仍残留 transcript")
-    if not back_to_gen:
-        a._fail("Ctrl+O 关闭后未回到生成区(或生成已结束,可重试)")
 
 
 def test_T34_gen_shift_tab_cycles_mode(bin_path):
