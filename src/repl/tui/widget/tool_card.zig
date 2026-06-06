@@ -26,8 +26,8 @@ const render_mod = @import("../../render.zig");
 const Theme = theme_mod.Theme;
 
 pub const RenderOpts = struct {
-    /// 输出最多显示几行(超出折叠 + "… N more lines")
-    max_output_lines: u16 = 5,
+    /// 输出最多显示几行(超出折叠 + "… +N lines")。对齐 cc 2.1.167:前 10 行。
+    max_output_lines: u16 = 10,
     /// 是否启用折叠(false = 全部显示)
     collapsed: bool = true,
     /// 终端宽度(决定状态右对齐位置;0 = 不右对齐)
@@ -115,6 +115,7 @@ fn headerIcon(th: Theme, tool_name: []const u8, output_text: []const u8, kind: R
 /// 不耦合 registry。当前仅 WebSearch → "Web Search"(带空格)。其余用原名。
 pub fn displayName(tool_name: []const u8) []const u8 {
     if (std.mem.eql(u8, tool_name, "WebSearch")) return "Web Search";
+    if (std.mem.eql(u8, tool_name, "Edit")) return "Update"; // 对齐 cc:Edit 卡标题 = Update(file)
     return tool_name;
 }
 
@@ -124,6 +125,67 @@ pub fn displayName(tool_name: []const u8) []const u8 {
 pub fn hasProgressCard(tool_name: []const u8) bool {
     return std.mem.eql(u8, tool_name, "WebSearch");
 }
+
+/// 类A(查询/执行类):执行期整张卡活在底部动态重绘区(自然语言进行时标题),
+/// 完成后 **commit 进 scrollback**(过去式标题)。对齐 cc 2.1.165 工具卡两态。
+/// 与 hasProgressCard(WebSearch:完成只移除,结果走助手文本)互斥。
+pub fn usesLiveCard(tool_name: []const u8) bool {
+    return std.mem.eql(u8, tool_name, "Bash") or std.mem.eql(u8, tool_name, "Read") or
+        std.mem.eql(u8, tool_name, "Grep") or std.mem.eql(u8, tool_name, "Glob");
+}
+
+/// tool_start 时是否占用动态区那张卡(addToolCard)。两类(WebSearch progress + 类A live)统称。
+pub fn usesDynamicCard(tool_name: []const u8) bool {
+    return hasProgressCard(tool_name) or usesLiveCard(tool_name);
+}
+
+/// 类A 工具运行中进行时标题(不含 ⏺ bullet,调用点加)。对齐 cc `Running 1 shell command…`。
+/// caller free。
+pub fn toolRunningTitle(alloc: std.mem.Allocator, tool_name: []const u8, args: []const u8) ![]u8 {
+    _ = args;
+    const s: []const u8 = if (std.mem.eql(u8, tool_name, "Bash"))
+        "Running 1 shell command…"
+    else if (std.mem.eql(u8, tool_name, "Read"))
+        "Reading 1 file…"
+    else if (std.mem.eql(u8, tool_name, "Grep"))
+        "Searching for 1 pattern…"
+    else if (std.mem.eql(u8, tool_name, "Glob"))
+        "Finding files…"
+    else
+        displayName(tool_name);
+    return try alloc.dupe(u8, s);
+}
+
+/// 类A 工具完成过去式标题(不含 ⏺ bullet)。对齐 cc `Ran 1 shell command`。
+/// content 供需计数的工具(Glob:数结果行)用,其余忽略。caller free。
+pub fn toolDoneTitle(alloc: std.mem.Allocator, tool_name: []const u8, args: []const u8, content: []const u8) ![]u8 {
+    _ = args;
+    if (std.mem.eql(u8, tool_name, "Bash")) return try alloc.dupe(u8, "Ran 1 shell command");
+    if (std.mem.eql(u8, tool_name, "Read")) return try alloc.dupe(u8, "Read 1 file");
+    if (std.mem.eql(u8, tool_name, "Grep")) return try alloc.dupe(u8, "Searched for 1 pattern");
+    if (std.mem.eql(u8, tool_name, "Glob")) {
+        const n = countGlobMatches(content);
+        if (n > 0) return try std.fmt.allocPrint(alloc, "Found {d} file{s}", .{ n, if (n == 1) "" else "s" });
+        return try alloc.dupe(u8, "Found files");
+    }
+    return try alloc.dupe(u8, displayName(tool_name));
+}
+
+/// 从 Glob 结果 content 数匹配文件数。Glob 结果是 JSON(含 matches 数组或换行分隔路径)。
+/// 数 content 里的 `\n`(每路径一行)。数不出返 0。
+fn countGlobMatches(content: []const u8) usize {
+    // Glob 工具结果格式:JSON 字符串字段含路径列表(\n 分隔),或 matches 数组。
+    // 简化:数 JSON 转义的 `\\n` 出现次数 + 1(若有非空内容)。保守:数不出返 0。
+    if (content.len == 0) return 0;
+    var n: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, content, pos, "\\n")) |i| {
+        n += 1;
+        pos = i + 2;
+    }
+    return n; // 无 \n → 0(由 toolDoneTitle 兜底 "Found files")
+}
+
 
 /// 工具开始(无状态符,只有 ⏺ tool_name + 命令预览)。对齐 cc BLACK_CIRCLE bullet。
 /// caller free。
@@ -235,29 +297,9 @@ pub fn renderResult(
             try out.append(alloc, ')');
         }
 
-        // 右上角:状态符 + 耗时。图标经 headerIcon 解耦(Bash 非零 exit→✗、转后台→中性)。
-        const hicon = headerIcon(th, tool_name, output_text, kind);
-        const status_color = hicon.color;
-        const status_icon = hicon.glyph;
-        var stat_buf: [64]u8 = undefined;
-        const stat_inner = try std.fmt.bufPrint(&stat_buf, "{s} {d:.1}s", .{ status_icon, @as(f64, @floatFromInt(elapsed_ms)) / 1000.0 });
-        if (opts.cols > 0) {
-            const left_w = term.displayWidth(th.icon_act) + 1 + term.displayWidth(displayName(tool_name));
-            const stat_w = term.displayWidth(stat_inner);
-            if (opts.cols > left_w + stat_w + 1) {
-                const pad = opts.cols - left_w - stat_w;
-                var p: usize = 0;
-                while (p < pad) : (p += 1) try out.append(alloc, ' ');
-            } else {
-                try out.append(alloc, ' ');
-            }
-        } else {
-            try out.append(alloc, ' ');
-        }
-        try out.appendSlice(alloc, status_color);
-        try out.appendSlice(alloc, stat_inner);
-        try out.appendSlice(alloc, th.reset);
-        try out.append(alloc, '\n');
+        // 右上角:状态符 + 耗时(复用 appendStatusRight)。左侧宽 = bullet+空格+displayName。
+        const left_w = term.displayWidth(th.icon_act) + 1 + term.displayWidth(displayName(tool_name));
+        try appendStatusRight(alloc, th, tool_name, output_text, kind, elapsed_ms, opts, left_w, &out);
     }
 
     // 输出体:经子渲染器渲染到临时 buffer(各行 2 空格缩进),再套 ⎿ gutter——
@@ -272,10 +314,86 @@ pub fn renderResult(
     return try out.toOwnedSlice(alloc);
 }
 
-/// 把子渲染器产出的 body(各行以 "  " 2 空格缩进)套上 cc 风格 ⎿ gutter:
-///   首行:`  ⎿  <line>`(2 空格 + dim 角符 + 2 空格)
-///   续行:`     <line>`(5 空格,对齐角符之后)
-/// 输入各行原有的 2 空格缩进会被剥掉再重套,避免缩进叠加。空 body 直接返回。
+/// 右上角状态符 + 耗时(`✓ 0.4s` 右对齐)。renderResult / renderLiveDone 共用。
+/// left_w:标题行左侧已占显示宽(bullet+空格+标题),用于算右对齐填充。
+/// 图标经 headerIcon 解耦(Bash 非零 exit→✗、转后台→中性)。末尾带 '\n'。
+fn appendStatusRight(
+    alloc: std.mem.Allocator,
+    th: Theme,
+    tool_name: []const u8,
+    output_text: []const u8,
+    kind: ResultKind,
+    elapsed_ms: u64,
+    opts: RenderOpts,
+    left_w: usize,
+    out: *std.ArrayList(u8),
+) !void {
+    const hicon = headerIcon(th, tool_name, output_text, kind);
+    var stat_buf: [64]u8 = undefined;
+    const stat_inner = try std.fmt.bufPrint(&stat_buf, "{s} {d:.1}s", .{ hicon.glyph, @as(f64, @floatFromInt(elapsed_ms)) / 1000.0 });
+    if (opts.cols > 0) {
+        const stat_w = term.displayWidth(stat_inner);
+        if (opts.cols > left_w + stat_w + 1) {
+            const pad = opts.cols - left_w - stat_w;
+            var p: usize = 0;
+            while (p < pad) : (p += 1) try out.append(alloc, ' ');
+        } else {
+            try out.append(alloc, ' ');
+        }
+    } else {
+        try out.append(alloc, ' ');
+    }
+    try out.appendSlice(alloc, hicon.color);
+    try out.appendSlice(alloc, stat_inner);
+    try out.appendSlice(alloc, th.reset);
+    try out.append(alloc, '\n');
+}
+
+/// 类A 工具(Bash/Read/Grep/Glob)完成后 commit 进 scrollback 的完整卡。对齐 cc 2.1.165:
+///   行1: `⏺ <toolDoneTitle>`(过去式自然语言)+ 右对齐 `✓/✗ X.Ys`
+///   行2: `  ⎿  <toolPreview>`(**只显输入** $ cmd / 📄 path / /pat/,不显输出——输出走助手文本)
+/// 与 renderResult(live 模式只补 ⎿ body)不同:类A 运行中标题在动态区会被擦,commit 卡须自带完整标题。
+/// caller free。
+pub fn renderLiveDone(
+    alloc: std.mem.Allocator,
+    th: Theme,
+    tool_name: []const u8,
+    input: []const u8,
+    content: []const u8,
+    kind: ResultKind,
+    elapsed_ms: u64,
+    opts: RenderOpts,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    // 行1:⏺ <done title> + 右对齐状态符。
+    const title = try toolDoneTitle(alloc, tool_name, input, content);
+    defer alloc.free(title);
+    try out.appendSlice(alloc, th.accent);
+    try out.appendSlice(alloc, th.icon_act);
+    try out.appendSlice(alloc, th.reset);
+    try out.append(alloc, ' ');
+    try out.appendSlice(alloc, title);
+    const left_w = term.displayWidth(th.icon_act) + 1 + term.displayWidth(title);
+    try appendStatusRight(alloc, th, tool_name, content, kind, elapsed_ms, opts, left_w, &out);
+
+    // 行2:⎿ 只显输入预览($ cmd / 📄 path / /pat/)。与运行中态第二行一致。
+    const preview = try toolPreview(alloc, tool_name, input);
+    defer alloc.free(preview);
+    if (preview.len > 0) {
+        try out.appendSlice(alloc, "  ");
+        try out.appendSlice(alloc, th.dim);
+        try out.appendSlice(alloc, th.gutter);
+        try out.appendSlice(alloc, th.reset);
+        try out.appendSlice(alloc, "  ");
+        try out.appendSlice(alloc, preview);
+        try out.append(alloc, '\n');
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
 fn appendWithGutter(alloc: std.mem.Allocator, th: Theme, body: []const u8, out: *std.ArrayList(u8)) !void {
     if (body.len == 0) return;
     var first = true;
@@ -316,7 +434,8 @@ fn renderResultBody(
         return renderErrorBody(alloc, th, output_text, out, opts);
     }
     if (std.mem.eql(u8, tool_name, "Write")) {
-        // cc 风格:Write 结果首行摘要 `Wrote N lines to <basename>`,下接内容预览(diff)。
+        // cc 风格:Write 结果首行摘要 `Wrote N lines to <basename>`,下接内容预览。
+        // 对齐 cc DIFF#8b:Write 是纯新建,预览**无 diff 标记**(plain 行号,非 +/-)。
         const path = extractField(output_text, "file_path") orelse extractField(output_text, "path") orelse "";
         const n = countWrittenLines(alloc, output_text);
         if (n > 0 and path.len > 0) {
@@ -324,10 +443,10 @@ fn renderResultBody(
             try out.print(alloc, "Wrote {d} line{s} to {s}", .{ n, if (n == 1) "" else "s", basename(path) });
             try out.append(alloc, '\n');
         }
-        return renderEditDiff(alloc, th, output_text, out, opts);
+        return renderEditDiffImpl(alloc, th, output_text, out, opts, true); // plain=true(无 +/-)
     }
     if (std.mem.eql(u8, tool_name, "Edit")) {
-        return renderEditDiff(alloc, th, output_text, out, opts);
+        return renderEditDiffImpl(alloc, th, output_text, out, opts, false); // plain=false(diff +/-)
     }
     if (std.mem.eql(u8, tool_name, "Grep") or std.mem.eql(u8, tool_name, "Glob")) {
         return renderSearchSummary(alloc, th, output_text, out, opts);
@@ -423,7 +542,7 @@ fn renderGenericFold(alloc: std.mem.Allocator, th: Theme, output_text: []const u
     if (opts.collapsed and total_lines > limit) {
         try out.appendSlice(alloc, "  ");
         try out.appendSlice(alloc, th.dim);
-        try out.print(alloc, "… {d} more lines", .{total_lines - limit});
+        try out.print(alloc, "… +{d} lines", .{total_lines - limit}); // 对齐 cc DIFF#8:`… +N lines`
         try out.appendSlice(alloc, th.reset);
         try out.append(alloc, '\n');
     }
@@ -586,9 +705,11 @@ fn extractNumberField(args: []const u8, key: []const u8) ?i64 {
     return std.fmt.parseInt(i64, args[start..p], 10) catch null;
 }
 
-/// Edit/Write 结果:从结果 JSON 提取 gitDiff,逐行 +绿 / -红 / 空dim 着色(对齐 cc
-/// StructuredPatch 着色)。未含 gitDiff(如简化结果)退回通用折叠。
-fn renderEditDiff(alloc: std.mem.Allocator, th: Theme, output_text: []const u8, out: *std.ArrayList(u8), opts: RenderOpts) !void {
+/// Edit/Write 结果:从结果 JSON 提取 gitDiff,逐行着色(对齐 cc StructuredPatch)。
+/// 未含 gitDiff(如简化结果)退回通用折叠。
+/// plain=true(Write 纯新建):行号无 +/- 标记、无 add 背景(对齐 cc DIFF#8b);
+/// plain=false(Edit diff):+绿/-红/空dim diff 着色。
+fn renderEditDiffImpl(alloc: std.mem.Allocator, th: Theme, output_text: []const u8, out: *std.ArrayList(u8), opts: RenderOpts, plain: bool) !void {
     const diff = extractJsonStringField(output_text, "gitDiff") orelse {
         return renderGenericFold(alloc, th, output_text, out, opts);
     };
@@ -632,7 +753,7 @@ fn renderEditDiff(alloc: std.mem.Allocator, th: Theme, output_text: []const u8, 
             .del => old_ln,
             .ctx => new_ln,
         };
-        try appendDiffLine(alloc, th, out, kind, num, line, lang, opts.cols);
+        try appendDiffLine(alloc, th, out, kind, num, line, lang, opts.cols, plain);
         switch (kind) {
             .add => new_ln += 1,
             .del => old_ln += 1,
@@ -646,7 +767,7 @@ fn renderEditDiff(alloc: std.mem.Allocator, th: Theme, output_text: []const u8, 
     if (opts.collapsed and total > limit) {
         try out.appendSlice(alloc, "  ");
         try out.appendSlice(alloc, th.dim);
-        try out.print(alloc, "… {d} more diff lines", .{total - limit});
+        try out.print(alloc, "… +{d} lines", .{total - limit}); // 对齐 cc DIFF#8:`… +N lines`
         try out.appendSlice(alloc, th.reset);
         try out.append(alloc, '\n');
     }
@@ -662,7 +783,25 @@ const DiffLineKind = enum { add, del, ctx };
 /// 成矩形;否则纯前景(basic_16/mono),不填充空块。
 /// 前导 "  " 缩进交给 appendWithGutter 处理(它剥掉重套 ⎿,占 5 列)。cols 为终端宽,
 /// 内容区可用宽 = cols - 5(gutter 缩进)。
-fn appendDiffLine(alloc: std.mem.Allocator, th: Theme, out: *std.ArrayList(u8), kind: DiffLineKind, num: usize, line: []const u8, lang: []const u8, cols: u16) !void {
+fn appendDiffLine(alloc: std.mem.Allocator, th: Theme, out: *std.ArrayList(u8), kind: DiffLineKind, num: usize, line: []const u8, lang: []const u8, cols: u16, plain: bool) !void {
+    // plain(Write 纯新建):无 +/- sign、无 add 背景——只 `行号 内容`(对齐 cc DIFF#8b)。
+    if (plain) {
+        const content = if (line.len > 0 and (line[0] == '+' or line[0] == '-' or line[0] == ' '))
+            line[1..]
+        else
+            line;
+        try out.appendSlice(alloc, "  ");
+        var num_buf: [8]u8 = undefined;
+        const num_str = std.fmt.bufPrint(&num_buf, "{d:>4} ", .{num}) catch "   ? ";
+        try out.appendSlice(alloc, th.dim);
+        try out.appendSlice(alloc, num_str);
+        try out.appendSlice(alloc, th.reset);
+        var hl: render_mod.HlState = .{};
+        try render_mod.highlightCodeLine(content, lang, &hl, "", out, alloc);
+        try out.appendSlice(alloc, th.reset);
+        try out.append(alloc, '\n');
+        return;
+    }
     const bg: []const u8 = switch (kind) {
         .add => th.diff_add_bg,
         .del => th.diff_del_bg,
@@ -982,6 +1121,12 @@ fn countWrittenLines(alloc: std.mem.Allocator, output_text: []const u8) usize {
 }
 
 /// 根据工具名和参数 JSON 生成单行预览("$ cmd" / "📄 path" / 等)。caller free。
+/// 不识别的工具 → 返回空 slice(预览行省略)。pub:类A 动态卡(render_region)复用。
+pub fn toolPreviewPub(alloc: std.mem.Allocator, tool_name: []const u8, args: []const u8) ![]u8 {
+    return toolPreview(alloc, tool_name, args);
+}
+
+/// 根据工具名和参数 JSON 生成单行预览("$ cmd" / "📄 path" / 等)。caller free。
 /// 不识别的工具 → 返回空 slice(预览行省略)。
 fn toolPreview(alloc: std.mem.Allocator, tool_name: []const u8, args: []const u8) ![]u8 {
     if (std.mem.eql(u8, tool_name, "Bash")) {
@@ -1201,11 +1346,11 @@ test "renderStart: Read 工具内联 basename" {
     try capture.expectContains(s, "Read(hosts)"); // cc 用 basename,非完整路径
 }
 
-test "renderStart: Edit 内联 basename(对齐 cc)" {
+test "renderStart: Edit 内联 basename + 标题 Update(对齐 cc)" {
     const th = theme_mod.monochrome;
     const s = try renderStart(testing.allocator, th, "Edit", "{\"file_path\":\"/x.zig\",\"old_string\":\"a\",\"new_string\":\"b\"}");
     defer testing.allocator.free(s);
-    try capture.expectContains(s, "Edit(x.zig)");
+    try capture.expectContains(s, "Update(x.zig)"); // cc:Edit 卡标题=Update(file),basename 非全路径
 }
 
 test "renderResult: ok + ✓ + 耗时" {
@@ -1232,7 +1377,7 @@ test "renderResult: 折叠超长输出" {
     defer testing.allocator.free(s);
     try capture.expectContains(s, "line1");
     try capture.expectContains(s, "line5");
-    try capture.expectContains(s, "… 5 more lines");
+    try capture.expectContains(s, "… +5 lines");
     // line6 应该被折叠
     try testing.expect(std.mem.indexOf(u8, s, "line6") == null);
 }
@@ -1423,7 +1568,7 @@ test "renderResult: Bash 仍走通用折叠(无专用渲染器)" {
     const s = try renderResult(testing.allocator, th, "Bash", "{\"command\":\"x\"}", out, .ok, 10, .{ .max_output_lines = 3 });
     defer testing.allocator.free(s);
     try capture.expectContains(s, "a");
-    try capture.expectContains(s, "… 4 more lines");
+    try capture.expectContains(s, "… +4 lines");
 }
 
 test "renderResult: verbose 关折叠(通用)" {
