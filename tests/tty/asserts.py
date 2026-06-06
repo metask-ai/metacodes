@@ -90,13 +90,38 @@ class TTYAssert:
                 + "\n--- 最后帧 ---\n" + frames[-1].render_ascii()
             )
 
+    def _is_rule_row(self, sc, r):
+        """该行是否为输入框横线边框(全 ─,对齐 cc 2.1.x 三横线)。
+        要求整行去空白后非空且只由 ─ 组成(banner 分隔线同形,但不在框紧邻位置)。"""
+        t = sc.line_text(r).strip()
+        return len(t) > 0 and set(t) == {"─"}
+
     def box_top_row(self, screen=None):
+        # 2026-06-06 对齐 cc 2.1.x:输入框边框从圆角 ╭╰ 改为三横线(全宽 ─)。
+        # 上边框 = ❯ 内容行上方最近的一条全 ─ 横线(框上边框恒紧邻 ❯ 首行之上)。
         sc = screen or self.final
-        return sc.find_last_row("╭")
+        cr = sc.find_last_row("❯")
+        if cr is None:
+            return None
+        r = cr - 1
+        while r >= 0:
+            if self._is_rule_row(sc, r):
+                return r
+            r -= 1
+        return None
 
     def box_bottom_row(self, screen=None):
+        # 下边框 = ❯ 内容行下方最近的一条全 ─ 横线(在 slash 菜单之上)。
         sc = screen or self.final
-        return sc.find_last_row("╰")
+        cr = sc.find_last_row("❯")
+        if cr is None:
+            return None
+        r = cr + 1
+        while r < sc.rows:
+            if self._is_rule_row(sc, r):
+                return r
+            r += 1
+        return None
 
     def footer_row(self, screen=None):
         sc = screen or self.final
@@ -113,7 +138,7 @@ class TTYAssert:
 
     def assert_box_present(self):
         if self.box_top_row() is None or self.content_row() is None or self.footer_row() is None:
-            self._fail("输入框未完整渲染(缺 ╭ / ❯ / footer)")
+            self._fail("输入框未完整渲染(缺 上横线 / ❯ / footer)")
 
     def assert_box_at_bottom(self):
         """框钉"内容底部":下边框紧邻 footer 上方,且 footer 之下无任何非空内容行。
@@ -143,7 +168,8 @@ class TTYAssert:
             self._fail(f"footer 模式应为 '{mode_str} on',实际 '{txt}'")
 
     def assert_input_echo(self, text):
-        """❯ 行(+续行)拼出的文本 == text;光标列 == 2 + 文本显示宽。"""
+        """❯ 行(+续行)拼出的文本 == text;光标列 == 2 + 文本显示宽。
+        空框时输入框显示灰色 placeholder(对齐 cc),expect "" 时把 placeholder 视作空。"""
         cr = self.content_row()
         if cr is None:
             self._fail("无 ❯ 内容行")
@@ -153,6 +179,10 @@ class TTYAssert:
         idx = line.find("❯")
         if idx >= 0:
             after = line[idx + 1 :].lstrip(" ")
+        # 空框 placeholder(对齐 cc):expect "" 时 placeholder 文案算作空。
+        PLACEHOLDERS = ('Try "fix typecheck errors"', 'Try "fix lint errors"')
+        if text == "" and after in PLACEHOLDERS:
+            after = ""
         if after != text:
             self._fail(f"输入回显应为 '{text}',实际 '{after}'(整行 '{line}')")
 
@@ -170,10 +200,10 @@ class TTYAssert:
             self._fail(f"光标列应为 2+宽({text_before_cursor!r})={expected},实际 {c}")
 
     def assert_no_jitter(self):
-        """所有输入态帧的框顶行号必须恒定(不漂移),每帧框元素各 1。"""
+        """所有输入态帧的框顶行号必须恒定(不漂移)。框顶 = ❯ 内容行上一行(三横线对齐后)。"""
         tops = []
         for sc in self.frame_screens:
-            t = sc.find_last_row("╭")
+            t = self.box_top_row(sc)
             if t is not None:
                 tops.append(t)
         if not tops:
@@ -210,9 +240,12 @@ class TTYAssert:
             # 宽松:尾部附近有 show cursor
             if b"\x1b[?25h" not in self.raw[-200:]:
                 self._fail("退出未 show cursor")
-        # 最终屏不应有残留输入框(查边框 ╭/╰;不能查 ❯——提交回显的用户消息合法含 ❯)
-        if self.final.find_row("╭") is not None or self.final.find_row("╰") is not None:
-            self._fail("退出后仍残留输入框边框 ╭/╰")
+        # 最终屏不应有残留输入框。三横线边框(─)与 banner 通用,不能查;
+        # 改查 footer 文案(框专属,clean exit 后消失):"? for shortcuts" / "shift+tab to cycle"。
+        f = self.final
+        if (f.find_row("? for shortcuts") is not None
+                or f.find_row("shift+tab to cycle") is not None):
+            self._fail("退出后仍残留输入框 footer")
 
     def assert_prose_contains(self, substr):
         """帧间散文本(banner/本地命令输出)含 substr。"""

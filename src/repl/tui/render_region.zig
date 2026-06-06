@@ -359,8 +359,13 @@ pub const RenderRegion = struct {
         const inner_w: usize = if (self.cols > 4) self.cols - 1 else 40;
         const border_color = self.borderColor(app.config.permission_mode);
 
+        // shell 模式(对齐 cc DIFF#3):buffer 以 `!` 开头 → 前缀 `!`(替 ❯),内容去掉 `!`、footer
+        // 变 `! for shell mode`、placeholder 变。`! ` 与 `❯ ` 同宽(2 列),layout 用 body 不偏移。
+        const shell = isShellMode(content);
+        const body: []const u8 = if (shell) content[1..] else content;
+
         var vlines = VisualLines.init();
-        layoutInput(content, &vlines, inner_w);
+        layoutInput(body, &vlines, inner_w);
 
         var new_rows: u16 = 0;
 
@@ -380,13 +385,23 @@ pub const RenderRegion = struct {
         while (li < content_rows) : (li += 1) {
             w.writeAll(ansi.clear.line) catch {};
             if (li == 0) {
-                w.print("{s}{s} {s}", .{ self.theme.accent, PROMPT_POINTER, self.theme.reset }) catch {};
+                // 前缀:shell 模式 `!`(warn 色,对齐 cc),否则 `❯`(accent)。
+                if (shell) {
+                    w.print("{s}{s} {s}", .{ self.theme.warn, "!", self.theme.reset }) catch {};
+                } else {
+                    w.print("{s}{s} {s}", .{ self.theme.accent, PROMPT_POINTER, self.theme.reset }) catch {};
+                }
             } else {
                 w.writeAll("  ") catch {};
             }
-            if (li < vlines.count) {
+            if (li == 0 and body.len == 0) {
+                // 空 body → 灰色 placeholder(对齐 cc:普通 `Try "fix typecheck errors"`,shell `Try "fix lint errors"`)。
+                // (layoutInput 对空串也 push 一个 (0,0) 段 → vlines.count==1,故不能靠 li<vlines.count 判空。)
+                const ph = if (shell) "Try \"fix lint errors\"" else "Try \"fix typecheck errors\"";
+                w.print("{s}{s}{s}", .{ self.theme.dim, ph, self.theme.reset }) catch {};
+            } else if (li < vlines.count) {
                 const seg = vlines.slices[li];
-                w.writeAll(content[seg.start..seg.end]) catch {};
+                w.writeAll(body[seg.start..seg.end]) catch {};
             }
             new_rows += 1;
             w.writeAll("\r\n") catch {};
@@ -413,7 +428,12 @@ pub const RenderRegion = struct {
             if (hrows > 0) w.writeAll(ansi.cursor.up(1, &nbuf)) catch {};
         } else {
             w.writeAll(ansi.clear.line) catch {};
-            self.drawFooter(w, app);
+            if (shell) {
+                // shell 模式 footer:`! for shell mode`(对齐 cc,无 mode part / token)。
+                w.print("{s}  ! for shell mode{s}", .{ self.theme.dim, self.theme.reset }) catch {};
+            } else {
+                self.drawFooter(w, app);
+            }
             new_rows += 1;
         }
 
@@ -431,7 +451,9 @@ pub const RenderRegion = struct {
         }
 
         // 4. 光标移到内容行(区内行号:TaskTab(0/1) + 上边框(1) + loc.vline)。
-        const loc = RenderRegion.locateCursor(content, cursor, &vlines);
+        // shell 模式:cursor 是相对完整 content(含 `!`)的;body 去掉了 `!` → body_cursor = cursor-1。
+        const body_cursor: usize = if (shell and cursor > 0) cursor - 1 else cursor;
+        const loc = RenderRegion.locateCursor(body, body_cursor, &vlines);
         const target_row: u16 = task_tab_rows + 1 + @as(u16, @intCast(loc.vline));
         const footer_row: u16 = new_rows - 1;
         if (footer_row > target_row) {
@@ -1271,6 +1293,12 @@ pub const RegionWriter = struct {
 
 /// 输入框 prompt 指针(复刻 Claude Code 的 figures.pointer)。
 const PROMPT_POINTER = "❯";
+
+/// shell 模式判定(对齐 cc DIFF#3):buffer 以 `!` 开头 → shell 模式。
+/// 与 loop.zig 提交期 `!cmd` 执行路径一致(同一 sigil),输入期只改 UI 表达。
+fn isShellMode(content: []const u8) bool {
+    return content.len > 0 and content[0] == '!';
+}
 
 /// visual line 切分结果(逻辑行 \n + 软折行后的各段 byte 区间)。
 /// 固定上限避免 alloc;超出上限的行不再记录(极长输入降级)。
