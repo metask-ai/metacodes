@@ -304,6 +304,8 @@ pub fn renderResult(
 
     // 输出体:经子渲染器渲染到临时 buffer(各行 2 空格缩进),再套 ⎿ gutter——
     // 首行 `  ⎿  ` + 角符,续行 5 空格对齐(对齐 cc `  ⎿  ` gutter)。
+    // 注:body 可能含 diff SGR(Edit/Write 整行背景块),不能按 codepoint 软折(会断 SGR);
+    // 故 body 走 appendWithGutter(逻辑行 5 列悬挂,不软折)。纯文本长行软折只用于 `$ cmd` 预览(见 renderLiveDone)。
     if (output_text.len > 0) {
         var body: std.ArrayList(u8) = .empty;
         defer body.deinit(alloc);
@@ -379,16 +381,11 @@ pub fn renderLiveDone(
     try appendStatusRight(alloc, th, tool_name, content, kind, elapsed_ms, opts, left_w, &out);
 
     // 行2:⎿ 只显输入预览($ cmd / 📄 path / /pat/)。与运行中态第二行一致。
+    // 长命令按宽度软折行 + 5 列悬挂缩进(对齐 cc:续行不回第 0 列,见 appendGutterWrapped)。
     const preview = try toolPreview(alloc, tool_name, input);
     defer alloc.free(preview);
     if (preview.len > 0) {
-        try out.appendSlice(alloc, "  ");
-        try out.appendSlice(alloc, th.dim);
-        try out.appendSlice(alloc, th.gutter);
-        try out.appendSlice(alloc, th.reset);
-        try out.appendSlice(alloc, "  ");
-        try out.appendSlice(alloc, preview);
-        try out.append(alloc, '\n');
+        try appendGutterWrapped(alloc, th, preview, opts.cols, &out);
     }
 
     return try out.toOwnedSlice(alloc);
@@ -418,6 +415,65 @@ fn appendWithGutter(alloc: std.mem.Allocator, th: Theme, body: []const u8, out: 
         pos = eol + 1;
     }
 }
+
+/// `⎿` gutter 行 + **宽度感知软折行 + 悬挂缩进**(对齐 cc:长命令/长摘要自然换行只到当前缩进极限,
+/// 续行缩进 5 列对齐 `⎿  ` 之后的内容,不回第 0 列)。首行 `  ⎿  <seg>`,续行(逻辑续行 + 软折)`     <seg>`。
+/// cols=0(无宽度信息)→ 退化为不折行(每逻辑行整行输出)。按显示宽折(CJK 占 2 列)。
+fn appendGutterWrapped(alloc: std.mem.Allocator, th: Theme, text: []const u8, cols: usize, out: *std.ArrayList(u8)) !void {
+    if (text.len == 0) return;
+    const GUTTER_W: usize = 5; // `  ⎿  ` 显示宽 = 2 + 1(⎿)+ 2
+    const avail: usize = if (cols > GUTTER_W + 4) cols - GUTTER_W else 0; // 0 = 不折行
+    var first = true;
+    var pos: usize = 0;
+    while (pos < text.len) {
+        const eol = std.mem.indexOfScalarPos(u8, text, pos, '\n') orelse text.len;
+        var line = text[pos..eol];
+        if (std.mem.startsWith(u8, line, "  ")) line = line[2..]; // 剥子渲染器前导 2 空格
+        // 软折:把 line 按显示宽 avail 切成多段(avail=0 → 整行一段)。
+        var seg_start: usize = 0;
+        while (seg_start <= line.len) {
+            const seg_end = if (avail == 0) line.len else wrapPoint(line, seg_start, avail);
+            const seg = line[seg_start..seg_end];
+            // 前缀:首行 gutter,续行/软折行 5 空格。
+            if (first) {
+                try out.appendSlice(alloc, "  ");
+                try out.appendSlice(alloc, th.dim);
+                try out.appendSlice(alloc, th.gutter);
+                try out.appendSlice(alloc, th.reset);
+                try out.appendSlice(alloc, "  ");
+                first = false;
+            } else {
+                try out.appendSlice(alloc, "     ");
+            }
+            try out.appendSlice(alloc, seg);
+            try out.append(alloc, '\n');
+            if (seg_end >= line.len) break;
+            seg_start = seg_end;
+        }
+        pos = eol + 1;
+    }
+}
+
+/// 从 start 起,返回不超过 max_w 显示宽的最大 byte 终点(至少推进 1 个 codepoint,防死循环)。
+/// 按 UTF-8 codepoint 推进,CJK 等宽字符占 2 列(term.displayWidth)。
+fn wrapPoint(s: []const u8, start: usize, max_w: usize) usize {
+    var i = start;
+    var w: usize = 0;
+    while (i < s.len) {
+        const cp_len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        const end = @min(i + cp_len, s.len);
+        const cw = term.displayWidth(s[i..end]);
+        if (w + cw > max_w) {
+            // 至少吃 1 个 codepoint,避免 start 处零进展死循环。
+            if (i == start) return end;
+            return i;
+        }
+        w += cw;
+        i = end;
+    }
+    return i;
+}
+
 
 /// 按工具名分发结果体渲染。专用渲染器(Edit diff / 搜索摘要 / Read 摘要 / WebFetch 摘要)
 /// 各自决定折叠/着色;未命中工具走 renderGenericFold(现有逐行折叠,Bash 等用)。
