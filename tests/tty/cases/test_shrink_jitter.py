@@ -35,13 +35,18 @@ def test_T33_grow_then_shrink_top_anchored(bin_path):
     a = TTYAssert(raw)
     tops = []
     for sc in a.frame_screens:
-        t = sc.find_last_row("╭")
+        # 跳过 Ctrl+Y paste 提示帧:Ctrl+U 后框上方多一行 `Ctrl+Y to paste deleted text`
+        # (对齐 cc DIFF#9),框合理下移 1 行——这不是 grow/shrink 抖动,排除该帧再检跳动。
+        if sc.find_last_row("Ctrl+Y to paste deleted text") is not None:
+            continue
+        # 三横线边框无 ╭;改锚 ❯ 内容行检测跳动(框漂则 ❯ 行号漂)。
+        t = sc.find_last_row("❯")
         if t is not None:
             tops.append(t)
     if not tops:
         a._fail("无输入框帧")
     if len(set(tops)) != 1:
-        a._fail(f"上边框跳动!逐帧顶行号={tops}(上锚定应恒定)")
+        a._fail(f"输入框跳动!逐帧 ❯ 行号={tops}(上锚定应恒定)")
     # 收缩后回到单行(下边框 = top + 2)。
     a.assert_box_height(1)
 

@@ -371,13 +371,13 @@ def test_T42_transcript_close_reanchors_box_to_bottom(bin_path):
     )
     if raw is None:
         return
-    a = TTYAssert(raw)
+    a = TTYAssert(raw, rows=16, cols=80)  # PTY 是 16 行;TTYAssert 默认 24 → top>=rows//2 用错分母
     a.assert_box_present()
     top = a.box_top_row()
     bot = a.box_bottom_row()
     rows = a.final.rows
     assert top is not None and bot is not None, "无完整输入框"
-    # 框应在屏下半部(底部锚定),不得漂到屏顶(修前的 bug:top≈0)。
+    # 框应在屏下半部(inline 关闭后框锚在对话尾之下,对齐 cc),不得漂到屏顶(修前 bug:top≈0)。
     assert top >= rows // 2, f"输入框未回到屏底(top={top}, rows={rows}),疑似漂到屏顶:\n" + "\n".join(a.final.line_text(r) for r in range(rows))
     # 框下方(footer 之后)无大片非空残留。
     a.assert_box_at_bottom()
