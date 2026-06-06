@@ -415,6 +415,8 @@ pub const RenderRegion = struct {
 
         // -- slash 命令菜单(`/` 前缀,在下边框与 footer 之间垂直列出)--
         new_rows += self.drawSlashMenu(w, content);
+        // -- @-mention 文件菜单(`@token`,同位置;对齐 cc DIFF#5)--
+        new_rows += self.drawAtMenu(w, content, self.input_cursor);
 
         // -- footer 区:help_open 时原地展开快捷键菜单(非模态,对齐 cc);否则正常 footer 行 --
         if (self.ui.help_open) {
@@ -518,6 +520,31 @@ pub const RenderRegion = struct {
             w.writeAll("\r\n") catch {};
             rows += 1;
             match_idx += 1;
+        }
+        return rows;
+    }
+
+    /// 画 @-mention 文件菜单(`@token`,下边框与 footer 之间)。每行 `+ <path>`(对齐 cc),
+    /// 选中项(self.ui.slash_sel)accent 高亮,其余 dim。候选来自 complete.atCandidates(文件路径)。
+    /// 返回新增行数。alloc 失败/无候选返回 0(不弹)。
+    fn drawAtMenu(self: *RenderRegion, w: *std.Io.Writer, content: []const u8, cursor: usize) u16 {
+        if (!complete.atMenuActive(content, cursor)) return 0;
+        var r = complete.atCandidates(self.allocator, content, cursor) catch return 0;
+        defer r.deinit(self.allocator);
+        if (r.candidates.len == 0) return 0;
+
+        const th = self.theme;
+        var rows: u16 = 0;
+        const MAX_ROWS: u16 = 10;
+        for (r.candidates, 0..) |cand, i| {
+            if (rows >= MAX_ROWS) break;
+            const selected = i == self.ui.slash_sel;
+            w.writeAll(ansi.clear.line) catch {};
+            // cc 文件项前缀 `+ `;选中 accent,非选中 dim。
+            const color = if (selected) th.accent else th.dim;
+            w.print("  {s}+ {s}{s}", .{ color, cand, th.reset }) catch {};
+            w.writeAll("\r\n") catch {};
+            rows += 1;
         }
         return rows;
     }

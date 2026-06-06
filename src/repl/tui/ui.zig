@@ -176,6 +176,22 @@ fn dispatchKey(state: *UiState, key: input.Key) Effect {
         }
     }
 
+    // ── @-mention 菜单导航(对齐 cc DIFF#5)──────────────────────────────────────
+    // dispatch 无 allocator → 不能算文件候选数,只能检测 @ 激活并上抛动作;
+    // 候选数/slash_sel 钳位 + 插入由 loop.zig(有 allocator)处理。
+    {
+        const gen1 = state.phase == .generating;
+        if (!gen1 and complete.atMenuActive(state.editor.view, state.editor.cursor)) {
+            switch (key) {
+                .down => return .{ .action = .at_nav, .at_nav_dir = true },
+                .up => return .{ .action = .at_nav, .at_nav_dir = false },
+                .enter => return .{ .action = .at_select },
+                .tab => return .{ .action = .at_select },
+                else => {},
+            }
+        }
+    }
+
     // ── 全局快捷键:dispatch 识别 → 上抛 LoopAction,IO 体留调用方(两期共用解析)──────
     // 按 UiState gate:生成期对无意义的键(history/complete/reverse_search/external_edit)
     // 直接吞掉(无补全器/无搜索 UI/不起 $EDITOR),不上抛、不透传。

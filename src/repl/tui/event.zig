@@ -47,6 +47,12 @@ pub const LoopAction = enum {
     slash_select,
     /// slash 菜单补全(Tab):把 editor buffer 换成选中命令名但**不提交**(留用户补参数)。
     slash_complete,
+    /// @-mention 菜单导航(↑↓):调用方(有 allocator)算文件候选数、移 slash_sel、重画。
+    /// dir 见 Effect.at_nav_dir(true=down/false=up)。dispatch 无 allocator 不能算候选数,故上抛。
+    at_nav,
+    /// @-mention 选中(Enter/Tab):调用方把 @token 换成选中文件路径。Enter 后不自动提交
+    /// (对齐 cc:@ 插入引用后继续编辑);区别仅语义,均插入。
+    at_select,
 };
 
 pub const KeyEvent = struct { key: input.Key };
@@ -94,4 +100,6 @@ pub const Effect = struct {
     immediate: bool = false,
     /// 非渲染语义动作,交主循环处理。
     action: LoopAction = .none,
+    /// at_nav 方向:true=down(下/选下一个),false=up。仅 action==.at_nav 时有意义。
+    at_nav_dir: bool = true,
 };

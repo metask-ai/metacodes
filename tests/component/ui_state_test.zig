@@ -283,3 +283,43 @@ test "slashNthMatch: 顺序与表一致" {
     const cc0 = complete.slashNthMatch("/c", 0).?;
     try testing.expectEqualStrings("/clear", cc0.name);
 }
+
+// ── DIFF#5: @-mention 菜单(dispatch 检测 @ 激活 → 上抛 at_nav/at_select)──────────
+test "dispatch: @ 菜单激活 → Down 上抛 at_nav(dir=down)" {
+    var s = UiState{};
+    _ = ui.dispatch(&s, .{ .editor_view = .{ .view = "@", .cursor = 1 } });
+    const e = ui.dispatch(&s, keyTag(.down));
+    try testing.expectEqual(event.LoopAction.at_nav, e.action);
+    try testing.expect(e.at_nav_dir); // down
+}
+
+test "dispatch: @ 菜单激活 → Up 上抛 at_nav(dir=up)" {
+    var s = UiState{};
+    _ = ui.dispatch(&s, .{ .editor_view = .{ .view = "@src/", .cursor = 5 } });
+    const e = ui.dispatch(&s, keyTag(.up));
+    try testing.expectEqual(event.LoopAction.at_nav, e.action);
+    try testing.expect(!e.at_nav_dir); // up
+}
+
+test "dispatch: @ 菜单 → Enter/Tab 上抛 at_select" {
+    var s = UiState{};
+    _ = ui.dispatch(&s, .{ .editor_view = .{ .view = "@RE", .cursor = 3 } });
+    try testing.expectEqual(event.LoopAction.at_select, ui.dispatch(&s, keyTag(.enter)).action);
+    try testing.expectEqual(event.LoopAction.at_select, ui.dispatch(&s, keyTag(.tab)).action);
+}
+
+test "dispatch: 非 @ token(普通文本)→ Up 仍走 history(不抢键)" {
+    var s = UiState{};
+    _ = ui.dispatch(&s, .{ .editor_view = .{ .view = "hello @ world", .cursor = 13 } });
+    // 光标在 "world" 上,当前 token 非 @ → 不激活 @ 菜单。
+    const e = ui.dispatch(&s, keyTag(.up));
+    try testing.expectEqual(event.LoopAction.history_prev, e.action);
+}
+
+test "atMenuActive: 仅当前 token 以 @ 开头才激活" {
+    try testing.expect(complete.atMenuActive("@", 1));
+    try testing.expect(complete.atMenuActive("@src/foo", 8));
+    try testing.expect(complete.atMenuActive("see @RE", 7));
+    try testing.expect(!complete.atMenuActive("hello", 5));
+    try testing.expect(!complete.atMenuActive("@x done", 7)); // 光标后 token 是 "done"
+}

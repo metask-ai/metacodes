@@ -782,6 +782,41 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
                     echoUserSubmission(app, editor.view());
                     return try allocator.dupe(u8, editor.view());
                 },
+                .at_nav => {
+                    // @-mention 菜单 ↑↓:算文件候选数 → 移 slash_sel(循环)→ 重画。
+                    var r = complete.atCandidates(allocator, editor.view(), editor.cursor) catch {
+                        continue;
+                    };
+                    defer r.deinit(allocator);
+                    const n = r.candidates.len;
+                    if (n > 0) {
+                        if (region.ui.slash_sel >= n) region.ui.slash_sel = n - 1;
+                        if (eff.at_nav_dir) {
+                            region.ui.slash_sel = (region.ui.slash_sel + 1) % n;
+                        } else {
+                            region.ui.slash_sel = if (region.ui.slash_sel == 0) n - 1 else region.ui.slash_sel - 1;
+                        }
+                    }
+                    redraw(&region, &editor, app);
+                    continue;
+                },
+                .at_select => {
+                    // @-mention Enter/Tab:把 @token 后的路径换成选中候选(对齐 cc:插入引用,不提交)。
+                    var r = complete.atCandidates(allocator, editor.view(), editor.cursor) catch {
+                        continue;
+                    };
+                    defer r.deinit(allocator);
+                    if (r.candidates.len > 0) {
+                        const idx = @min(region.ui.slash_sel, r.candidates.len - 1);
+                        const cand = r.candidates[idx];
+                        // 替换 [replace_start, cursor) 为候选(保留 @ 前缀与已输入目录)。
+                        const old_len = editor.cursor - @min(r.replace_start, editor.cursor);
+                        try applyCompletion(&editor, allocator, r.replace_start, old_len, cand);
+                    }
+                    region.ui.slash_sel = 0;
+                    redraw(&region, &editor, app);
+                    continue;
+                },
                 .reverse_search => {
                     region.clear();
                     try handleReverseSearch(fd, &editor, &parser, history, allocator);

@@ -75,6 +75,21 @@ pub fn slashNthMatch(line: []const u8, idx: usize) ?SlashCmd {
     return null;
 }
 
+/// @-mention 菜单是否激活(对齐 cc DIFF#5):光标前最后一个空白分隔 token 以 `@` 开头。
+/// 与 compute() 的 @-mention 路径同源(token[0]=='@' → pathCandidates)。
+pub fn atMenuActive(line: []const u8, cursor: usize) bool {
+    const upto = line[0..@min(cursor, line.len)];
+    var tok_start = upto.len;
+    while (tok_start > 0 and !isWs(upto[tok_start - 1])) : (tok_start -= 1) {}
+    const token = upto[tok_start..];
+    return token.len >= 1 and token[0] == '@';
+}
+
+/// @ 菜单候选(文件路径,owned)。调用方用完 deinit。复用 compute 的 @-mention 路径。
+pub fn atCandidates(allocator: std.mem.Allocator, line: []const u8, cursor: usize) !Result {
+    return compute(allocator, line[0..@min(cursor, line.len)], @min(cursor, line.len));
+}
+
 pub const Result = struct {
     /// 候选项（借用：slash 命令是静态字符串；路径是 owned，见 owns_candidates）。
     candidates: [][]const u8,
