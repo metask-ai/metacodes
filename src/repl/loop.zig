@@ -616,16 +616,49 @@ fn echoUserSubmission(app: *app_mod.App, submitted: []const u8) void {
         return;
     }
     const th = app.theme;
-    var first = true;
+    // 软折 + 2 列悬挂缩进(对齐 cc:长输入回显续行缩进 2 列,不回第 0 列)。
+    const cols: usize = if (tui_term_root.getSize(1)) |s| s.cols else 80;
+    const avail: usize = if (cols > 6) cols - 2 else 0; // 0 = 不折
+    var first_logical = true;
     var it = std.mem.splitScalar(u8, submitted, '\n');
     while (it.next()) |seg| {
-        if (first) {
-            std.debug.print("{s}❯{s} {s}\n", .{ th.accent, th.reset, seg });
-            first = false;
-        } else {
-            std.debug.print("  {s}\n", .{seg});
+        // 每个逻辑行按显示宽软折成多段;首段带前缀(❯/续行 2 空格),软折续段恒 2 空格。
+        var start: usize = 0;
+        var first_seg = true;
+        while (start <= seg.len) {
+            const end = if (avail == 0) seg.len else wrapPointAt(seg, start, avail);
+            const piece = seg[start..end];
+            if (first_logical and first_seg) {
+                std.debug.print("{s}❯{s} {s}\n", .{ th.accent, th.reset, piece });
+            } else {
+                std.debug.print("  {s}\n", .{piece});
+            }
+            first_seg = false;
+            if (end >= seg.len) break;
+            start = end;
+            // 续段跳过 1 个折点空格(对齐 cc 词折:断行处的空格不带到续行行首)。
+            if (start < seg.len and seg[start] == ' ') start += 1;
         }
+        first_logical = false;
     }
+}
+
+/// 从 start 起返回不超过 max_w 显示宽的最大 byte 终点(至少进 1 codepoint 防死循环)。纯文本用。
+fn wrapPointAt(s: []const u8, start: usize, max_w: usize) usize {
+    var i = start;
+    var w: usize = 0;
+    while (i < s.len) {
+        const cp_len = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+        const e = @min(i + cp_len, s.len);
+        const cw = tui_term_root.displayWidth(s[i..e]);
+        if (w + cw > max_w) {
+            if (i == start) return e;
+            return i;
+        }
+        w += cw;
+        i = e;
+    }
+    return i;
 }
 
 fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_mod.History, app: *app_mod.App) ![]u8 {
