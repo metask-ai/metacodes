@@ -89,6 +89,13 @@ pub fn wrapLines(alloc: std.mem.Allocator, s: []const u8, cols: usize) ![]const 
             cur_cols = 0;
             continue;
         }
+        // SGR 序列(\x1b[...m)是零宽原子:不计宽、绝不在其中/其后强制断行。
+        // 否则像 \x1b[0m 这样的 reset 会被当成可见字符,把宽度算爆、reset 被拆到下一行
+        // (实测:权限对话框参数预览行尾游离的 "0m")。
+        if (sgrLen(s, i)) |slen| {
+            i += slen;
+            continue;
+        }
         const n = nextCharBytes(s, i);
         const ch_w = term.displayWidth(s[i .. i + n]);
         if (cur_cols + ch_w > cols and i > line_start) {
@@ -104,6 +111,36 @@ pub fn wrapLines(alloc: std.mem.Allocator, s: []const u8, cols: usize) ![]const 
     }
     if (line_start < s.len) try lines.append(alloc, s[line_start..]);
     return try lines.toOwnedSlice(alloc);
+}
+
+/// 若 s[i] 起是一个 SGR 序列(`\x1b[` … 终结于 `m`),返回其字节长;否则 null。
+/// 只认 SGR(以 m 结尾)——其它 CSI(光标/擦除)不该出现在 drawBox content 里。
+fn sgrLen(s: []const u8, i: usize) ?usize {
+    if (i + 1 >= s.len or s[i] != 0x1b or s[i + 1] != '[') return null;
+    var j = i + 2;
+    while (j < s.len) : (j += 1) {
+        const c = s[j];
+        if (c == 'm') return j - i + 1;
+        // SGR 参数只含数字和 ';';遇到别的(非法/其它 CSI)→ 不当 SGR。
+        if (!(c >= '0' and c <= '9') and c != ';') return null;
+    }
+    return null; // 未终结
+}
+
+/// 显示宽度,但跳过 SGR 序列(零宽)。drawBox 内容含内嵌颜色时用它算框宽/padding。
+fn visibleWidth(s: []const u8) usize {
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (sgrLen(s, i)) |slen| {
+            i += slen;
+            continue;
+        }
+        const n = nextCharBytes(s, i);
+        w += term.displayWidth(s[i .. i + n]);
+        i += n;
+    }
+    return w;
 }
 
 // ============================================================================
@@ -129,7 +166,7 @@ pub fn drawBox(alloc: std.mem.Allocator, th: Theme, content: []const u8, opts: B
 
     var max_w: usize = 0;
     for (lines) |ln| {
-        const w = term.displayWidth(ln);
+        const w = visibleWidth(ln);
         if (w > max_w) max_w = w;
     }
     const title_w = term.displayWidth(opts.title);
@@ -172,9 +209,10 @@ pub fn drawBox(alloc: std.mem.Allocator, th: Theme, content: []const u8, opts: B
         var p: usize = 0;
         while (p < opts.padding) : (p += 1) try out.append(alloc, ' ');
         try out.appendSlice(alloc, ln);
-        // 右 padding 补齐到 inner_w(行宽)
-        const ln_w = term.displayWidth(ln);
-        const pad_r = (inner_w - opts.padding) - ln_w; // 已 padding 左 1,内容右还需 inner_w - left_pad - ln_w
+        // 右 padding 补齐到 inner_w(行宽)。visibleWidth 跳过 SGR,否则含 ANSI 行算宽偏大 →
+        // pad_r 下溢 panic / 框右边不齐。
+        const ln_w = visibleWidth(ln);
+        const pad_r = (inner_w - opts.padding) -| ln_w; // 饱和减,防 underflow
         var pr: usize = 0;
         while (pr < pad_r) : (pr += 1) try out.append(alloc, ' ');
         try out.appendSlice(alloc, th.dim);
@@ -264,6 +302,47 @@ test "wrapLines: 换行符强制断行" {
     try testing.expectEqual(@as(usize, 2), lines.len);
     try testing.expectEqualStrings("ab", lines[0]);
     try testing.expectEqualStrings("cd", lines[1]);
+}
+
+test "sgrLen: 识别 SGR 序列长度" {
+    try testing.expectEqual(@as(?usize, 4), sgrLen("\x1b[0m", 0)); // ESC [ 0 m
+    try testing.expectEqual(@as(?usize, 5), sgrLen("\x1b[31m", 0)); // ESC [ 3 1 m
+    try testing.expectEqual(@as(?usize, null), sgrLen("abc", 0)); // 非 SGR
+    try testing.expectEqual(@as(?usize, null), sgrLen("\x1b[2A", 0)); // 光标移动(非 m 结尾)→ 不当 SGR
+}
+
+test "visibleWidth: SGR 零宽" {
+    try testing.expectEqual(@as(usize, 2), visibleWidth("\x1b[31mhi\x1b[0m")); // 只数 "hi"
+    try testing.expectEqual(@as(usize, 3), visibleWidth("abc"));
+}
+
+test "wrapLines: SGR-aware — reset 不被拆行,宽度只数可见字符" {
+    // 含内嵌 dim+reset 的内容折到窄宽:SGR 零宽,可见 "0123456789" 按 cols 折,
+    // reset(\x1b[0m)绝不被算进宽度而拆出游离 "0m"(权限对话框那个 bug)。
+    const s = "\x1b[2m0123456789\x1b[0m";
+    const lines = try wrapLines(testing.allocator, s, 5);
+    defer testing.allocator.free(lines);
+    for (lines) |ln| try testing.expect(visibleWidth(ln) <= 5);
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(testing.allocator);
+    for (lines) |ln| try joined.appendSlice(testing.allocator, ln);
+    try testing.expect(std.mem.indexOf(u8, joined.items, "\x1b[0m") != null);
+}
+
+test "drawBox: 含内嵌 ANSI 内容,框宽按可见字符算(SGR 不撑大)" {
+    const t = theme.monochrome; // 边框无色,内容自带 ANSI
+    const content = "\x1b[31mhi\x1b[0m"; // 可见 "hi" = 2 列
+    const s = try drawBox(testing.allocator, t, content, .{ .title = "", .padding = 1 });
+    defer testing.allocator.free(s);
+    // 关键断言:ANSI 不撑大框 —— 内容行的可见宽 = "hi"(2),框按它算(非按字节)。
+    // (drawBox 对空标题有最小宽 4 的既有下限,故底边宽取 max(2,4);这里只验"不超宽":
+    //  若 SGR 被当可见字符,max_w 会 ≥ 2+ANSI字节 → 框明显更宽。)
+    // 内容行原样含 ANSI(hi 带色),且右边框 | 对齐(SGR-aware padding 不下溢 panic)。
+    try testing.expect(std.mem.indexOf(u8, s, "\x1b[31mhi\x1b[0m") != null);
+    // 框不被 SGR 撑大:底边 '-' 数 = inner = max(visible 2, 最小 4) + padding*2(2) = 6,绝不是
+    // 把 9 字节 ANSI 串算进去的 11+。断言底边恰好 6 个 '-'。
+    try testing.expect(std.mem.indexOf(u8, s, "+------+") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "+-------+") == null); // 没有更宽
 }
 
 test "drawBox: monochrome 主题输出形状正确" {

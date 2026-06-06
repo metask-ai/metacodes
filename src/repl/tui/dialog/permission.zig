@@ -100,28 +100,38 @@ pub fn render(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: 
 pub fn prompt(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: []const u8) ?PermissionChoice {
     const input = @import("../../input.zig");
     const in_fd: std.c.fd_t = 0;
-    const out_fd: std.c.fd_t = 1;
 
     if (!term.isatty(in_fd)) return null;
 
     const orig = input.enterRawMode(in_fd) orelse return null;
     defer input.restoreMode(in_fd, orig);
 
+    return promptLoop(alloc, th, in_fd, 1, tool_name, args);
+}
+
+/// 渲染 + 读键循环(不管 raw mode / 终端接管——调用方负责)。
+/// 用于:① prompt() 自己进 raw mode 后调;② TuiBackend 终端接管(停 watcher+持锁)后调。
+/// out_fd 输出(prompt 用 stdout=1;TuiBackend 接管用 stderr=2 与 region 同流)。
+/// 重画用 render 实际行数(不再硬编码 8——参数长会折行变多行,硬编码会错位)。
+pub fn promptLoop(alloc: std.mem.Allocator, th: Theme, in_fd: std.c.fd_t, out_fd: std.c.fd_t, tool_name: []const u8, args: []const u8) ?PermissionChoice {
     var selected: usize = 0;
+    var prev_rows: usize = 0;
     while (true) {
-        // 渲染(每次重画:先光标回到对话框起点 — 简化:直接重画,靠 \r 不够,这里
-        // 用"擦除上次行数 + 重画"。MVP:第一次画,之后用 cursor up 重画)
+        if (prev_rows > 0) {
+            var up_buf: [16]u8 = undefined;
+            writeAll(out_fd, ansi.cursor.up(@intCast(prev_rows), &up_buf));
+            writeAll(out_fd, "\r");
+        }
         const frame = render(alloc, th, tool_name, args, selected) catch return .deny_once;
         defer alloc.free(frame);
         writeAll(out_fd, frame);
+        prev_rows = countRows(frame);
 
-        // 读一个键
         var buf: [8]u8 = undefined;
         const n = std.c.read(in_fd, &buf, buf.len);
         if (n <= 0) return .deny_once;
         const b = buf[0];
 
-        // 直接键
         switch (b) {
             'y', 'Y' => return .allow_once,
             'a', 'A' => return .allow_always,
@@ -139,12 +149,16 @@ pub fn prompt(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: 
                 else => {},
             }
         }
-        // 重画前把光标移回对话框顶部(对话框高度 = 内容行数 + 2 边框)
-        // 对话框:顶边 + 工具名 + 参数 + 空行 + 4 选项 + 底边 = 8 行
-        var up_buf: [16]u8 = undefined;
-        writeAll(out_fd, ansi.cursor.up(8, &up_buf));
-        writeAll(out_fd, "\r");
     }
+}
+
+/// frame 占的终端行数(= '\n' 数),供 cursor.up 精确回顶。
+fn countRows(frame: []const u8) usize {
+    var rows: usize = 0;
+    for (frame) |c| {
+        if (c == '\n') rows += 1;
+    }
+    return rows;
 }
 
 fn writeAll(fd: std.c.fd_t, bytes: []const u8) void {

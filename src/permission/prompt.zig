@@ -41,6 +41,28 @@ pub fn setPersistContext(project_dir: ?[]const u8, home: []const u8) void {
     g_home = home;
 }
 
+/// 可选的对话框 runner 注入:有 TuiBackend 时,loop.zig 把它设成 backend 的"终端接管"
+/// 包装(停 watcher + 持渲染锁后渲染对话框,根治与键盘 watcher 抢 fd0)。null = 没设
+/// → ask() 回退裸 dialog.prompt(直接 read fd0,仅在无 watcher 的场景安全)。
+/// 签名同 dialog.prompt:返回选择 or null(非 tty/失败)。
+const PermissionChoice = dialog.PermissionChoice;
+var g_dialog_runner: ?*const fn (state: *anyopaque, tool_name: []const u8, args: []const u8) ?PermissionChoice = null;
+var g_dialog_runner_state: ?*anyopaque = null;
+
+pub fn setDialogRunner(
+    state: *anyopaque,
+    runner: *const fn (state: *anyopaque, tool_name: []const u8, args: []const u8) ?PermissionChoice,
+) void {
+    g_dialog_runner_state = state;
+    g_dialog_runner = runner;
+}
+
+/// 清除 runner(生成期结束后,避免悬垂指向已失效的 TuiBackend 栈实例)。
+pub fn clearDialogRunner() void {
+    g_dialog_runner = null;
+    g_dialog_runner_state = null;
+}
+
 fn contains(list: []const []const u8, name: []const u8) bool {
     for (list) |n| if (std.mem.eql(u8, n, name)) return true;
     return false;
@@ -66,7 +88,13 @@ pub fn ask(tool_name: []const u8, args: []const u8) !bool {
         const th = theme_mod.select(.auto, cap);
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        if (dialog.prompt(arena.allocator(), th, tool_name, args)) |choice| {
+        // 有注入的 runner(TuiBackend 终端接管)→ 走它(停 watcher+持锁,不抢 fd0);
+        // 否则裸 dialog.prompt(无 watcher 场景)。两者返回同一 PermissionChoice。
+        const choice_opt: ?PermissionChoice = if (g_dialog_runner) |runner|
+            runner(g_dialog_runner_state.?, tool_name, args)
+        else
+            dialog.prompt(arena.allocator(), th, tool_name, args);
+        if (choice_opt) |choice| {
             switch (choice) {
                 .allow_once => return true,
                 .allow_always => {

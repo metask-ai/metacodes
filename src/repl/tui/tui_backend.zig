@@ -44,6 +44,7 @@ const app_mod = @import("../../app.zig");
 const transcript_viewer = @import("../transcript_viewer.zig");
 const term = @import("term.zig");
 const ask_dialog = @import("dialog/ask_question.zig");
+const perm_dialog = @import("dialog/permission.zig");
 const tool_ctx = @import("../../tools/context.zig");
 
 const RenderRegion = render_region.RenderRegion;
@@ -313,6 +314,32 @@ pub const TuiBackend = struct {
     ) anyerror!void {
         const self: *TuiBackend = @ptrCast(@alignCast(state));
         return self.askQuestion(allocator, questions, out);
+    }
+
+    /// 权限弹窗:同 askQuestion 的终端接管协调(停 watcher+持锁),根治与 watcher 抢 fd0。
+    /// 经 prompt_mod 的 dialog runner 注入(loop.zig 设),session 记忆/persist 仍在 prompt_mod。
+    /// 返回 PermissionChoice;非 tty/无 app → null(prompt_mod 回退裸 dialog/文字)。
+    fn promptPermission(self: *TuiBackend, tool_name: []const u8, args: []const u8) ?perm_dialog.PermissionChoice {
+        const fd = self.input_fd;
+        if (!term.isatty(fd)) return null;
+        const app = self.input_app orelse return null;
+        const th = if (self.theme) |t| t.* else theme_mod.dark;
+        const a = self.input_alloc orelse return null;
+
+        self.stopInput();
+        self.region.enterExclusiveOverlay();
+        defer {
+            self.region.exitExclusiveOverlay(app);
+            self.startInput(fd, app, a) catch {};
+        }
+        // promptLoop:不进 raw mode(接管期终端已是生成期 raw),输出走 fd2(与 region 同流)。
+        return perm_dialog.promptLoop(a, th, fd, 2, tool_name, args);
+    }
+
+    /// trampoline:prompt_mod.setDialogRunner 的 state → *TuiBackend。
+    pub fn promptPermissionRunner(state: *anyopaque, tool_name: []const u8, args: []const u8) ?perm_dialog.PermissionChoice {
+        const self: *TuiBackend = @ptrCast(@alignCast(state));
+        return self.promptPermission(tool_name, args);
     }
 
     /// 生成期 stdin 监听主循环(从旧 loop.zig stdinAbortWatcher 原样搬入)。
