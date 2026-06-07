@@ -66,6 +66,8 @@ pub const Options = struct {
     abort: ?*const AbortSignal = null,
     /// 传给 Write/Edit 做 must-read-first 校验。null → 单测/headless 简化路径（不校验）
     read_state: ?*ReadState = null,
+    /// Edit/Write 旁路高亮缓存(diff 工具卡 tree-sitter 着色用)。null → 不缓存。
+    edit_hl_cache: ?*@import("edit_hl_cache.zig").EditHlCache = null,
     /// 收集 stream usage 事件：input/output/cache token 数。null → 不累加。
     /// by-value：sink 只含两个指针，直接塞进来，避免悬挂指针风险。
     usage_sink: ?UsageSink = null,
@@ -580,6 +582,7 @@ pub fn run(
             .allocator = allocator,
             .abort = opts.abort,
             .read_state = opts.read_state,
+            .edit_hl_cache = opts.edit_hl_cache,
             .jobs = opts.jobs,
             .agent_jobs = opts.agent_jobs,
             .permission_ctx = @constCast(permission_ctx),

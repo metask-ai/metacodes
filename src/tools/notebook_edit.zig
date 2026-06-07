@@ -68,14 +68,23 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     if (cells_ptr.* != .array) return error.InvalidCellsField;
     var cells_list = &cells_ptr.array; // ArrayList Managed
 
-    // 操作 cells
+    // 操作 cells。同时记录 old/new source(供 diff 展示 + tree-sitter 高亮)。
+    var old_src: []const u8 = "";
+    var new_src: []const u8 = "";
+    var is_markdown = std.mem.eql(u8, cell_type, "markdown");
     switch (mode) {
         .replace => {
             const idx = findCellById(cells_list.items, cell_id.?) orelse return error.CellNotFound;
+            // 改前抓旧 source(供 diff);cell_type 未显式改时沿用原 cell 类型判 markdown。
+            old_src = try cellSourceDup(a, cells_list.items[idx]);
+            if (common.extractJsonArg(args, "cell_type") == null) {
+                is_markdown = cellIsMarkdown(cells_list.items[idx]);
+            }
             try setCellSource(parsed.arena.allocator(), &cells_list.items[idx], new_source);
             if (common.extractJsonArg(args, "cell_type")) |_| {
                 try cells_list.items[idx].object.put(parsed.arena.allocator(), "cell_type", .{ .string = cell_type });
             }
+            new_src = new_source;
         },
         .insert => {
             const new_cell = try buildNewCell(parsed.arena.allocator(), cell_type, new_source);
@@ -85,22 +94,90 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             } else {
                 try cells_list.insert(0, new_cell);
             }
+            new_src = new_source; // old="" → 纯新增(plain 展示)
         },
         .delete => {
             const idx = findCellById(cells_list.items, cell_id.?) orelse return error.CellNotFound;
+            old_src = try cellSourceDup(a, cells_list.items[idx]); // new="" → 纯删除
+            is_markdown = cellIsMarkdown(cells_list.items[idx]);
             _ = cells_list.orderedRemove(idx);
         },
     }
+    defer if (old_src.len > 0) a.free(old_src);
 
     // 写回
     const out_json = try serializeNotebook(a, root);
     defer a.free(out_json);
     try writeFile(path, out_json);
 
-    return try std.fmt.allocPrint(a,
-        "{{\"success\":true,\"path\":\"{s}\",\"mode\":\"{s}\",\"cells_after\":{d}}}",
+    // cell 语言(供高亮):markdown cell 不高亮代码;code cell 用 notebook language_info.name(默认 python)。
+    const lang: []const u8 = if (is_markdown) "" else notebookLang(root);
+
+    // 旁路缓存 cell 新旧 source(供工具卡 tree-sitter 高亮;不进对话历史)。
+    if (ctx.edit_hl_cache) |cache| {
+        cache.put(ctx.progress_tool_id, old_src, new_src);
+    }
+
+    // 产 gitDiff(供工具卡 diff 渲染)。失败则退回简单摘要(不阻断)。
+    const patch_mod = @import("../core/patch.zig");
+    const git_diff: ?[]u8 = blk: {
+        var patch = patch_mod.compute(a, old_src, new_src) catch break :blk null;
+        defer patch.deinit(a);
+        break :blk patch_mod.toGitDiff(a, path, patch.hunks) catch null;
+    };
+    defer if (git_diff) |g| a.free(g);
+
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try out.writer.print(
+        "{{\"success\":true,\"path\":\"{s}\",\"mode\":\"{s}\",\"cells_after\":{d}",
         .{ path, edit_mode_str, cells_list.items.len },
     );
+    if (lang.len > 0) {
+        try out.writer.print(",\"lang\":\"{s}\"", .{lang});
+    }
+    if (git_diff) |g| {
+        try out.writer.writeAll(",\"gitDiff\":");
+        try std.json.Stringify.encodeJsonString(g, .{}, &out.writer);
+    }
+    try out.writer.writeByte('}');
+    return try out.toOwnedSlice();
+}
+
+/// 读 cell.source(Jupyter 里可能是 string 或 array of strings),拼成单串(owned)。
+fn cellSourceDup(allocator: std.mem.Allocator, cell: std.json.Value) ![]const u8 {
+    if (cell != .object) return try allocator.dupe(u8, "");
+    const src = cell.object.get("source") orelse return try allocator.dupe(u8, "");
+    switch (src) {
+        .string => |s| return try allocator.dupe(u8, s),
+        .array => |arr| {
+            var buf: std.ArrayList(u8) = .empty;
+            errdefer buf.deinit(allocator);
+            for (arr.items) |item| {
+                if (item == .string) try buf.appendSlice(allocator, item.string);
+            }
+            return try buf.toOwnedSlice(allocator);
+        },
+        else => return try allocator.dupe(u8, ""),
+    }
+}
+
+fn cellIsMarkdown(cell: std.json.Value) bool {
+    if (cell != .object) return false;
+    const ct = cell.object.get("cell_type") orelse return false;
+    return ct == .string and std.mem.eql(u8, ct.string, "markdown");
+}
+
+/// notebook 的 metadata.language_info.name(默认 "python")。
+fn notebookLang(root: std.json.Value) []const u8 {
+    if (root != .object) return "python";
+    const meta = root.object.get("metadata") orelse return "python";
+    if (meta != .object) return "python";
+    const li = meta.object.get("language_info") orelse return "python";
+    if (li != .object) return "python";
+    const name = li.object.get("name") orelse return "python";
+    if (name != .string or name.string.len == 0) return "python";
+    return name.string;
 }
 
 fn findCellById(cells: []const std.json.Value, id: []const u8) ?usize {

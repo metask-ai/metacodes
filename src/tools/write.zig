@@ -62,6 +62,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (st) |s| rs.recordHashed(path, s.mtime_ns, s.size, std.hash.Wyhash.hash(0, content)) catch {};
     }
 
+    // 旁路缓存新旧全文(供 diff 工具卡 tree-sitter 高亮;不进对话历史)。新建文件 old="".
+    if (ctx.edit_hl_cache) |cache| {
+        cache.put(ctx.progress_tool_id, old_content orelse "", content);
+    }
+
     return try renderResult(allocator, path, old_content orelse "", content);
 }
 

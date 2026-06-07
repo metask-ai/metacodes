@@ -22,6 +22,8 @@ const std = @import("std");
 const ansi = @import("tui/ansi.zig");
 // CJK-aware 显示宽度(表格列宽/cell 折行用);term 不引 render,无循环依赖。
 const term = @import("tui/term.zig");
+const theme_mod = @import("tui/theme.zig");
+const SyntaxTheme = theme_mod.SyntaxTheme;
 const RESET = ansi.sgr.reset;
 const BOLD = ansi.sgr.bold;
 const DIM = ansi.sgr.dim;
@@ -54,7 +56,7 @@ pub fn renderToOwned(md: []const u8, allocator: std.mem.Allocator) ![]u8 {
                 try out.append(allocator, '\n');
                 in_code_block = false;
             } else {
-                try highlightCodeLine(line, code_lang, &hl_state, GRAY, &out, allocator);
+                try highlightCodeLine(line, code_lang, &hl_state, GRAY, &out, allocator, ansi.syntax_palette.b16);
                 try out.appendSlice(allocator, RESET);
                 try out.append(allocator, '\n');
             }
@@ -118,13 +120,13 @@ pub const StreamState = struct {
 /// 渲染**单行** markdown(不含尾随 \n)到 out,携带跨行状态 st(代码块/高亮)。
 /// 对齐 renderToOwned 的逐行逻辑,供 live 流式路径逐行调用——inline(bold/code/heading/list)
 /// 行内即决,代码块靠 st.in_code_block 跨行。caller 自行追加 \n。
-pub fn renderLineStreaming(line: []const u8, st: *StreamState, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+pub fn renderLineStreaming(line: []const u8, st: *StreamState, out: *std.ArrayList(u8), allocator: std.mem.Allocator, syn: SyntaxTheme) !void {
     if (st.in_code_block) {
         if (std.mem.startsWith(u8, line, "```")) {
             try out.appendSlice(allocator, RESET);
             st.in_code_block = false;
         } else {
-            try highlightCodeLine(line, st.code_lang, &st.hl_state, GRAY, out, allocator);
+            try highlightCodeLine(line, st.code_lang, &st.hl_state, GRAY, out, allocator, syn);
             try out.appendSlice(allocator, RESET);
         }
     } else if (std.mem.startsWith(u8, line, "```")) {
@@ -291,22 +293,25 @@ fn isIdentChar(c: u8) bool {
 /// base:行基色——markdown 代码块传 GRAY;diff 行内高亮传"背景块+默认前景",每个 token
 ///   收尾的 RESET 之后重铺 base,使背景色块在整行内不被 token 的 RESET 清掉(bg-aware)。
 /// 行尾不补 RESET(交调用方,diff 行尾要带行号/换行控制)。
-pub fn highlightCodeLine(line: []const u8, lang: []const u8, state: *HlState, base: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+pub fn highlightCodeLine(line: []const u8, lang: []const u8, state: *HlState, base: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Allocator, syn: SyntaxTheme) !void {
     const kind = classifyLang(lang);
     const kws = keywordsFor(kind);
+    // syn 各组空时回退历史 basic-16 常量(保证 16 色/无主题路径零回归)。
+    const c_str = if (syn.string.len > 0) syn.string else GREEN;
+    const c_cmt = if (syn.comment.len > 0) syn.comment else DIM;
 
     // 跨行延续态:整行(或到闭合处)按对应色,然后继续常规扫描。
     if (state.in_block_comment) {
         if (std.mem.indexOf(u8, line, "*/")) |close| {
             const end = close + 2;
-            try out.appendSlice(allocator, DIM);
+            try out.appendSlice(allocator, c_cmt);
             try out.appendSlice(allocator, line[0..end]);
             try out.appendSlice(allocator, RESET);
             try out.appendSlice(allocator, base);
             state.in_block_comment = false;
-            try highlightRest(line[end..], kind, kws, state, base, out, allocator);
+            try highlightRest(line[end..], kind, kws, state, base, out, allocator, syn);
         } else {
-            try out.appendSlice(allocator, DIM);
+            try out.appendSlice(allocator, c_cmt);
             try out.appendSlice(allocator, line);
             try out.appendSlice(allocator, RESET);
             try out.appendSlice(allocator, base);
@@ -318,14 +323,14 @@ pub fn highlightCodeLine(line: []const u8, lang: []const u8, state: *HlState, ba
         const py_close: ?usize = if (kind == .python) std.mem.indexOf(u8, line, "\"\"\"") else null;
         if (py_close) |close| {
             const end = close + 3;
-            try out.appendSlice(allocator, GREEN);
+            try out.appendSlice(allocator, c_str);
             try out.appendSlice(allocator, line[0..end]);
             try out.appendSlice(allocator, RESET);
             try out.appendSlice(allocator, base);
             state.in_multiline_str = false;
-            try highlightRest(line[end..], kind, kws, state, base, out, allocator);
+            try highlightRest(line[end..], kind, kws, state, base, out, allocator, syn);
         } else {
-            try out.appendSlice(allocator, GREEN);
+            try out.appendSlice(allocator, c_str);
             try out.appendSlice(allocator, line);
             try out.appendSlice(allocator, RESET);
             try out.appendSlice(allocator, base);
@@ -334,12 +339,16 @@ pub fn highlightCodeLine(line: []const u8, lang: []const u8, state: *HlState, ba
     }
 
     try out.appendSlice(allocator, base);
-    try highlightRest(line, kind, kws, state, base, out, allocator);
+    try highlightRest(line, kind, kws, state, base, out, allocator, syn);
 }
 
 /// 扫描一行(无跨行延续态),按 token 上色;每 token 收尾 RESET 后重铺 base(bg-aware)。
-/// 可能在行尾**进入**跨行态(设 state)。
-fn highlightRest(line: []const u8, kind: LangKind, kws: []const []const u8, state: *HlState, base: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+/// 可能在行尾**进入**跨行态(设 state)。syn 提供语义色,空组回退历史 basic-16。
+fn highlightRest(line: []const u8, kind: LangKind, kws: []const []const u8, state: *HlState, base: []const u8, out: *std.ArrayList(u8), allocator: std.mem.Allocator, syn: SyntaxTheme) !void {
+    const c_str = if (syn.string.len > 0) syn.string else GREEN;
+    const c_num = if (syn.number.len > 0) syn.number else YELLOW;
+    const c_kw = if (syn.keyword.len > 0) syn.keyword else MAGENTA;
+    const c_cmt = if (syn.comment.len > 0) syn.comment else DIM;
     const line_comment_hash = (kind == .python or kind == .shell or kind == .generic);
     var i: usize = 0;
     while (i < line.len) {
@@ -351,7 +360,7 @@ fn highlightRest(line: []const u8, kind: LangKind, kws: []const []const u8, stat
         {
             if (std.mem.indexOfPos(u8, line, i, "*/")) |close| {
                 const end = close + 2;
-                try out.appendSlice(allocator, DIM);
+                try out.appendSlice(allocator, c_cmt);
                 try out.appendSlice(allocator, line[i..end]);
                 try out.appendSlice(allocator, RESET);
                 try out.appendSlice(allocator, base);
@@ -359,7 +368,7 @@ fn highlightRest(line: []const u8, kind: LangKind, kws: []const []const u8, stat
                 continue;
             } else {
                 // 未闭合 → 进入跨行块注释态,本行剩余整段 dim。
-                try out.appendSlice(allocator, DIM);
+                try out.appendSlice(allocator, c_cmt);
                 try out.appendSlice(allocator, line[i..]);
                 try out.appendSlice(allocator, RESET);
                 state.in_block_comment = true;
@@ -370,7 +379,7 @@ fn highlightRest(line: []const u8, kind: LangKind, kws: []const []const u8, stat
         // 行注释:// (c/js/rust/go/zig) 或 # (py/sh)
         const slash_comment = (c == '/' and i + 1 < line.len and line[i + 1] == '/');
         if (slash_comment or (c == '#' and line_comment_hash)) {
-            try out.appendSlice(allocator, DIM);
+            try out.appendSlice(allocator, c_cmt);
             try out.appendSlice(allocator, line[i..]);
             try out.appendSlice(allocator, RESET);
             try out.appendSlice(allocator, base);
@@ -381,14 +390,14 @@ fn highlightRest(line: []const u8, kind: LangKind, kws: []const []const u8, stat
         if (kind == .python and c == '"' and i + 2 < line.len and line[i + 1] == '"' and line[i + 2] == '"') {
             if (std.mem.indexOfPos(u8, line, i + 3, "\"\"\"")) |close| {
                 const end = close + 3;
-                try out.appendSlice(allocator, GREEN);
+                try out.appendSlice(allocator, c_str);
                 try out.appendSlice(allocator, line[i..end]);
                 try out.appendSlice(allocator, RESET);
                 try out.appendSlice(allocator, base);
                 i = end;
                 continue;
             } else {
-                try out.appendSlice(allocator, GREEN);
+                try out.appendSlice(allocator, c_str);
                 try out.appendSlice(allocator, line[i..]);
                 try out.appendSlice(allocator, RESET);
                 state.in_multiline_str = true;
@@ -408,7 +417,7 @@ fn highlightRest(line: []const u8, kind: LangKind, kws: []const []const u8, stat
                 if (line[j] == quote) break;
             }
             const end = if (j < line.len) j + 1 else line.len;
-            try out.appendSlice(allocator, GREEN);
+            try out.appendSlice(allocator, c_str);
             try out.appendSlice(allocator, line[i..end]);
             try out.appendSlice(allocator, RESET);
             try out.appendSlice(allocator, base);
@@ -420,7 +429,7 @@ fn highlightRest(line: []const u8, kind: LangKind, kws: []const []const u8, stat
         if (std.ascii.isDigit(c)) {
             var j = i;
             while (j < line.len and (std.ascii.isAlphanumeric(line[j]) or line[j] == '.' or line[j] == '_')) : (j += 1) {}
-            try out.appendSlice(allocator, YELLOW);
+            try out.appendSlice(allocator, c_num);
             try out.appendSlice(allocator, line[i..j]);
             try out.appendSlice(allocator, RESET);
             try out.appendSlice(allocator, base);
@@ -434,7 +443,7 @@ fn highlightRest(line: []const u8, kind: LangKind, kws: []const []const u8, stat
             while (j < line.len and isIdentChar(line[j])) : (j += 1) {}
             const word = line[i..j];
             if (isKeywordIn(word, kws)) {
-                try out.appendSlice(allocator, MAGENTA);
+                try out.appendSlice(allocator, c_kw);
                 try out.appendSlice(allocator, word);
                 try out.appendSlice(allocator, RESET);
                 try out.appendSlice(allocator, base);
@@ -950,29 +959,29 @@ test "renderLineStreaming: 逐行携带代码块状态 + 去标记" {
 
     // heading:## 去掉,bold cyan(只验文字 + 无 ## 残留)。
     out.clearRetainingCapacity();
-    try renderLineStreaming("## Hi", &st, &out, testing.allocator);
+    try renderLineStreaming("## Hi", &st, &out, testing.allocator, ansi.syntax_palette.b16);
     try testing.expect(std.mem.indexOf(u8, out.items, "Hi") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "##") == null);
 
     // inline bold:** 消化。
     out.clearRetainingCapacity();
-    try renderLineStreaming("a **b** c", &st, &out, testing.allocator);
+    try renderLineStreaming("a **b** c", &st, &out, testing.allocator, ansi.syntax_palette.b16);
     try testing.expect(std.mem.indexOf(u8, out.items, "**") == null);
     try testing.expect(std.mem.indexOf(u8, out.items, "b") != null);
 
     // 代码块:围栏行进 in_code_block,围栏本身不输出文字内容(去围栏)。
     out.clearRetainingCapacity();
-    try renderLineStreaming("```python", &st, &out, testing.allocator);
+    try renderLineStreaming("```python", &st, &out, testing.allocator, ansi.syntax_palette.b16);
     try testing.expect(st.in_code_block);
     try testing.expect(std.mem.indexOf(u8, out.items, "```") == null);
     // 代码块内行:内容保留(语法高亮会插 ANSI,故只验关键 token 在)。
     out.clearRetainingCapacity();
-    try renderLineStreaming("print('x')", &st, &out, testing.allocator);
+    try renderLineStreaming("print('x')", &st, &out, testing.allocator, ansi.syntax_palette.b16);
     try testing.expect(std.mem.indexOf(u8, out.items, "print") != null);
     try testing.expect(std.mem.indexOf(u8, out.items, "'x'") != null);
     // 闭合围栏:退出代码块。
     out.clearRetainingCapacity();
-    try renderLineStreaming("```", &st, &out, testing.allocator);
+    try renderLineStreaming("```", &st, &out, testing.allocator, ansi.syntax_palette.b16);
     try testing.expect(!st.in_code_block);
 }
 

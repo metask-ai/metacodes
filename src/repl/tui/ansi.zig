@@ -92,6 +92,93 @@ pub const diff_bg = struct {
     pub const idx_del_light = "\x1b[48;5;224m";
 };
 
+/// 语法高亮语义色调色板(对齐 VS Code Dark+/Light+;参考 metacode syntect 设计)。
+/// theme.select 按 ColorCapability 选一套填进 Theme.syntax。**fg-only,无 bold/italic/
+/// underline**——终端对斜体/下划线渲染参差(metacode 经验);只用前景色保证一致。
+/// 每套含 10 个语义组,空串 = 不上色(走 base 底色)。
+pub const syntax_palette = struct {
+    /// basic_16(dark/light 共用;16 色分不出明暗)。**字节须 == 历史硬编码值**,
+    /// 保证 16 色终端零回归(keyword=magenta/string=green/number=yellow/function=cyan/type=blue)。
+    pub const b16 = Syntax{
+        .keyword = sgr.fg_magenta,
+        .string = sgr.fg_green,
+        .number = sgr.fg_yellow,
+        .constant = sgr.fg_yellow,
+        .function = sgr.fg_cyan,
+        .type = sgr.fg_blue,
+        .comment = "", // 渲染层回退 th.dim
+        .variable = "",
+        .operator = "",
+        .punctuation = "",
+    };
+    /// 256 色 dark(VS Code Dark+ 近似索引)。
+    pub const idx_dark = Syntax{
+        .keyword = "\x1b[38;5;176m",
+        .string = "\x1b[38;5;173m",
+        .number = "\x1b[38;5;151m",
+        .constant = "\x1b[38;5;151m",
+        .function = "\x1b[38;5;187m",
+        .type = "\x1b[38;5;79m", // teal
+        .comment = "\x1b[38;5;65m",
+        .variable = "\x1b[38;5;153m",
+        .operator = "",
+        .punctuation = "",
+    };
+    /// 256 色 light(深墨)。
+    pub const idx_light = Syntax{
+        .keyword = "\x1b[38;5;127m",
+        .string = "\x1b[38;5;124m",
+        .number = "\x1b[38;5;28m",
+        .constant = "\x1b[38;5;28m",
+        .function = "\x1b[38;5;136m",
+        .type = "\x1b[38;5;30m",
+        .comment = "\x1b[38;5;102m",
+        .variable = "\x1b[38;5;25m",
+        .operator = "",
+        .punctuation = "",
+    };
+    /// truecolor dark(VS Code Dark+ 原色)。
+    pub const tc_dark = Syntax{
+        .keyword = "\x1b[38;2;197;134;192m", // #C586C0
+        .string = "\x1b[38;2;206;145;120m", // #CE9178
+        .number = "\x1b[38;2;181;206;168m", // #B5CEA8
+        .constant = "\x1b[38;2;181;206;168m",
+        .function = "\x1b[38;2;220;220;170m", // #DCDCAA
+        .type = "\x1b[38;2;78;201;176m", // #4EC9B0 teal
+        .comment = "\x1b[38;2;106;153;85m", // #6A9955
+        .variable = "\x1b[38;2;156;220;254m", // #9CDCFE
+        .operator = "",
+        .punctuation = "",
+    };
+    /// truecolor light(VS Code Light+ 原色)。
+    pub const tc_light = Syntax{
+        .keyword = "\x1b[38;2;175;0;219m", // #AF00DB
+        .string = "\x1b[38;2;163;21;21m", // #A31515
+        .number = "\x1b[38;2;9;134;88m", // #098658
+        .constant = "\x1b[38;2;9;134;88m",
+        .function = "\x1b[38;2;121;94;38m", // #795E26
+        .type = "\x1b[38;2;38;127;153m", // #267F99
+        .comment = "\x1b[38;2;0;128;0m", // #008000
+        .variable = "\x1b[38;2;0;16;128m", // #001080
+        .operator = "",
+        .punctuation = "",
+    };
+
+    /// 调色板单元(与 theme.SyntaxTheme 同形;此处定义避免循环 import)。
+    pub const Syntax = struct {
+        keyword: []const u8 = "",
+        string: []const u8 = "",
+        comment: []const u8 = "",
+        number: []const u8 = "",
+        function: []const u8 = "",
+        type: []const u8 = "",
+        constant: []const u8 = "",
+        variable: []const u8 = "",
+        operator: []const u8 = "",
+        punctuation: []const u8 = "",
+    };
+};
+
 // ============================================================================
 // 光标控制
 // ============================================================================

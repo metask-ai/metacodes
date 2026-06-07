@@ -23,6 +23,8 @@ const theme_mod = @import("../theme.zig");
 const layout = @import("../layout.zig");
 const term = @import("../term.zig");
 const render_mod = @import("../../render.zig");
+const ts = @import("../../../treesitter/ts.zig");
+const highlight = @import("../../../treesitter/highlight.zig");
 const Theme = theme_mod.Theme;
 
 pub const RenderOpts = struct {
@@ -36,6 +38,10 @@ pub const RenderOpts = struct {
     verbose: bool = false,
     /// transcript 历史视图(对齐 cc isTranscriptMode):语义同 verbose(展开)。
     transcript: bool = false,
+    /// Edit/Write diff 的 tree-sitter 高亮缓存(按 tool_id 取新旧全文)。null → 退回关键字表。
+    edit_hl_cache: ?*@import("../../../core/edit_hl_cache.zig").EditHlCache = null,
+    /// 本次 tool_use id(查 edit_hl_cache 用)。
+    tool_id: []const u8 = "",
 };
 
 pub const ResultKind = enum { ok, err };
@@ -508,6 +514,19 @@ fn renderResultBody(
     if (std.mem.eql(u8, tool_name, "Edit")) {
         return renderEditDiffImpl(alloc, th, output_text, out, opts, false); // plain=false(diff +/-)
     }
+    if (std.mem.eql(u8, tool_name, "NotebookEdit")) {
+        // cell 改动有 gitDiff → 摘要行 + diff 渲染(tree-sitter 高亮,lang 从结果取);
+        // 无 gitDiff(纯结构改/patch 失败)→ 退回 JSON 摘要。
+        if (extractJsonStringField(output_text, "gitDiff") != null) {
+            const mode = extractJsonStringField(output_text, "mode") orelse "edit";
+            const path = extractField(output_text, "path") orelse extractField(output_text, "file_path") orelse "notebook";
+            try out.appendSlice(alloc, "  ");
+            try out.print(alloc, "{s} cell in {s}", .{ mode, basename(path) });
+            try out.append(alloc, '\n');
+            return renderEditDiffImpl(alloc, th, output_text, out, opts, false);
+        }
+        return renderJsonToolSummary(alloc, th, tool_name, output_text, out, opts);
+    }
     if (std.mem.eql(u8, tool_name, "Grep") or std.mem.eql(u8, tool_name, "Glob")) {
         return renderSearchSummary(alloc, th, output_text, out, opts);
     }
@@ -778,8 +797,25 @@ fn renderEditDiffImpl(alloc: std.mem.Allocator, th: Theme, output_text: []const 
     defer alloc.free(unescaped);
 
     // 从结果里的 file_path/path 推语言(供 diff 行内语法高亮)。
+    // NotebookEdit 等无法从扩展名(.ipynb)推断的工具,结果带显式 "lang" 字段 → 优先用它。
     const fpath = extractField(output_text, "file_path") orelse extractField(output_text, "path") orelse "";
-    const lang = langFromPath(fpath);
+    const explicit_lang = extractField(output_text, "lang");
+    const lang = if (explicit_lang) |l| l else langFromPath(fpath);
+
+    // tree-sitter 高亮:从旁路缓存按 tool_id 取新文件全文 → 整文件解析 → 按行 span 索引。
+    // 命中失败/不支持语言/解析失败 → hl_opt 保持 null,appendDiffLine 退回关键字表(零回归)。
+    var hl_opt: ?highlight.Highlights = null;
+    defer if (hl_opt) |*h| h.deinit();
+    if (opts.edit_hl_cache) |cache| {
+        if (cache.get(opts.tool_id)) |entry| {
+            // ts.Lang:显式 lang 字段优先(langFromTsName),否则按文件扩展名。
+            const tslang_opt = if (explicit_lang) |l| tsLangFromName(l) else ts.Lang.fromPath(fpath);
+            if (tslang_opt) |tslang| {
+                hl_opt = highlight.highlightFile(alloc, entry.new, tslang) catch null;
+            }
+        }
+    }
+    const hl_ptr: ?*const highlight.Highlights = if (hl_opt) |*h| h else null;
 
     const limit: u16 = if (opts.verbose or opts.transcript) std.math.maxInt(u16) else opts.max_output_lines;
     var shown: u16 = 0;
@@ -813,7 +849,7 @@ fn renderEditDiffImpl(alloc: std.mem.Allocator, th: Theme, output_text: []const 
             .del => old_ln,
             .ctx => new_ln,
         };
-        try appendDiffLine(alloc, th, out, kind, num, line, lang, opts.cols, plain);
+        try appendDiffLine(alloc, th, out, kind, num, line, lang, opts.cols, plain, hl_ptr);
         switch (kind) {
             .add => new_ln += 1,
             .del => old_ln += 1,
@@ -843,7 +879,7 @@ const DiffLineKind = enum { add, del, ctx };
 /// 成矩形;否则纯前景(basic_16/mono),不填充空块。
 /// 前导 "  " 缩进交给 appendWithGutter 处理(它剥掉重套 ⎿,占 5 列)。cols 为终端宽,
 /// 内容区可用宽 = cols - 5(gutter 缩进)。
-fn appendDiffLine(alloc: std.mem.Allocator, th: Theme, out: *std.ArrayList(u8), kind: DiffLineKind, num: usize, line: []const u8, lang: []const u8, cols: u16, plain: bool) !void {
+fn appendDiffLine(alloc: std.mem.Allocator, th: Theme, out: *std.ArrayList(u8), kind: DiffLineKind, num: usize, line: []const u8, lang: []const u8, cols: u16, plain: bool, hl: ?*const highlight.Highlights) !void {
     // plain(Write 纯新建):无 +/- sign、无 add 背景——只 `行号 内容`(对齐 cc DIFF#8b)。
     if (plain) {
         const content = if (line.len > 0 and (line[0] == '+' or line[0] == '-' or line[0] == ' '))
@@ -856,8 +892,7 @@ fn appendDiffLine(alloc: std.mem.Allocator, th: Theme, out: *std.ArrayList(u8), 
         try out.appendSlice(alloc, th.dim);
         try out.appendSlice(alloc, num_str);
         try out.appendSlice(alloc, th.reset);
-        var hl: render_mod.HlState = .{};
-        try render_mod.highlightCodeLine(content, lang, &hl, "", out, alloc);
+        try colorLineContent(alloc, th, out, content, lang, "", hl, num, kind);
         try out.appendSlice(alloc, th.reset);
         try out.append(alloc, '\n');
         return;
@@ -894,13 +929,12 @@ fn appendDiffLine(alloc: std.mem.Allocator, th: Theme, out: *std.ArrayList(u8), 
 
     // 内容:语法高亮(bg-aware)。base = bg + (del 行整体 DIM)。高亮内部每 token 后 RESET+base,
     // 背景连续;高亮结束**不 reset**,留着接行尾填充。
-    var hl: render_mod.HlState = .{};
     var base_buf: std.ArrayList(u8) = .empty;
     defer base_buf.deinit(alloc);
     try base_buf.appendSlice(alloc, bg);
     if (kind == .del) try base_buf.appendSlice(alloc, th.dim);
     try out.appendSlice(alloc, base_buf.items); // 内容前先铺一次 base(sign 后的起点)
-    try render_mod.highlightCodeLine(content, lang, &hl, base_buf.items, out, alloc);
+    try colorLineContent(alloc, th, out, content, lang, base_buf.items, hl, num, kind);
 
     // 行尾填充:仅当有背景色(256/truecolor)。padEnd 到内容区可用宽(cols - 5 gutter 缩进),
     // 让背景铺满成矩形。已写显示宽 = 行号 5 + sign 1 + content 显示宽。
@@ -915,6 +949,101 @@ fn appendDiffLine(alloc: std.mem.Allocator, th: Theme, out: *std.ArrayList(u8), 
     }
     try out.appendSlice(alloc, th.reset);
     try out.append(alloc, '\n');
+}
+
+/// 给 diff 行内容着色。优先 tree-sitter span(add/ctx 行,缓存命中且行文本字节匹配),
+/// 否则退回关键字表 highlightCodeLine(del 行/无缓存/不匹配 → 零回归)。
+/// num = 该行行号(add/ctx 的 new 行号);base = token 间重铺的底色(含 bg + del 的 dim)。
+fn colorLineContent(
+    alloc: std.mem.Allocator,
+    th: Theme,
+    out: *std.ArrayList(u8),
+    content: []const u8,
+    lang: []const u8,
+    base: []const u8,
+    hl: ?*const highlight.Highlights,
+    num: usize,
+    kind: DiffLineKind,
+) !void {
+    // tree-sitter span 路径:仅 add/ctx(在新文件,有 new 行号)且行文本与缓存内容字节相等。
+    if (hl) |h| {
+        if (kind != .del) {
+            if (h.textForLine(num)) |file_line| {
+                if (std.mem.eql(u8, file_line, content)) {
+                    try renderSpans(alloc, th, out, content, h.spansForLine(num), base);
+                    return;
+                }
+            }
+        }
+    }
+    // 退回关键字表(bg-aware)。
+    var st: render_mod.HlState = .{};
+    try render_mod.highlightCodeLine(content, lang, &st, base, out, alloc, th.syntax);
+}
+
+/// 按 span 给一行着色(bg-aware,仿关键字表的 token 着色纪律):
+/// span 内字节发 groupColor → 内容 → RESET+base(保背景连续);span 外字节用 base。
+/// 结尾**不 reset**(留给行尾填充)。span 是相对行首的字节偏移,有序不重叠。
+fn renderSpans(
+    alloc: std.mem.Allocator,
+    th: Theme,
+    out: *std.ArrayList(u8),
+    content: []const u8,
+    spans: []const highlight.Span,
+    base: []const u8,
+) !void {
+    var col: usize = 0;
+    for (spans) |s| {
+        const sstart = @min(@as(usize, s.start), content.len);
+        const send = @min(@as(usize, s.end), content.len);
+        if (sstart >= send) continue;
+        // span 前的未着色字节(用 base 底色)。
+        if (sstart > col) try out.appendSlice(alloc, content[col..sstart]);
+        // span 着色:groupColor → 内容 → reset → 重铺 base。
+        const color = groupColor(th, s.group);
+        if (color.len > 0) try out.appendSlice(alloc, color);
+        try out.appendSlice(alloc, content[sstart..send]);
+        try out.appendSlice(alloc, th.reset);
+        try out.appendSlice(alloc, base);
+        col = send;
+    }
+    // 行尾剩余未着色字节。
+    if (col < content.len) try out.appendSlice(alloc, content[col..]);
+}
+
+/// HighlightGroup → ANSI 前景色,**从 th.syntax 取**(主题化、随终端能力变化)。
+/// comment 组空时回退 th.dim(basic_16 下 syntax.comment="";256/truecolor 用调色板绿)。
+fn groupColor(th: Theme, group: highlight.Group) []const u8 {
+    return switch (group) {
+        .keyword => th.syntax.keyword,
+        .string => th.syntax.string,
+        .number => th.syntax.number,
+        .constant => th.syntax.constant,
+        .comment => if (th.syntax.comment.len > 0) th.syntax.comment else th.dim,
+        .function => th.syntax.function,
+        .type => th.syntax.type,
+        .variable => th.syntax.variable,
+        .operator => th.syntax.operator,
+        .punctuation => th.syntax.punctuation,
+        .none => "",
+    };
+}
+
+/// 语言名(结果 "lang" 字段)→ ts.Lang。供 NotebookEdit 等显式带语言的工具。
+fn tsLangFromName(name: []const u8) ?ts.Lang {
+    const Pair = struct { n: []const u8, l: ts.Lang };
+    const table = [_]Pair{
+        .{ .n = "zig", .l = .zig },
+        .{ .n = "python", .l = .python },
+        .{ .n = "typescript", .l = .typescript },
+        .{ .n = "tsx", .l = .tsx },
+        .{ .n = "c", .l = .c },
+        .{ .n = "bash", .l = .bash },
+    };
+    for (table) |p| {
+        if (std.mem.eql(u8, name, p.n)) return p.l;
+    }
+    return null;
 }
 
 /// 文件扩展名 → 语法高亮语言标记(render.classifyLang 能认的名)。
@@ -1514,8 +1643,10 @@ test "renderResult: diff 背景色块(truecolor)+ 行号 + del DIM" {
     try testing.expect(std.mem.indexOf(u8, s, "48;2;74;34;29") != null); // del bg #4A221D
     // del 行整体 DIM(\x1b[2m,防删除色被语法盖)。
     try testing.expect(std.mem.indexOf(u8, s, th.dim) != null);
-    // 行内语法高亮:const→magenta、20→yellow(数字)。
-    try testing.expect(std.mem.indexOf(u8, s, th.role_tool) != null or std.mem.indexOf(u8, s, "\x1b[35m") != null);
+    // 行内语法高亮(truecolor theme):const→keyword RGB 紫(#C586C0),20→number RGB(#B5CEA8)。
+    // (此用例无 edit_hl_cache → 走关键字表 fallback,高亮色现也从 th.syntax 取,故是 truecolor RGB。)
+    try testing.expect(std.mem.indexOf(u8, s, "38;2;197;134;192") != null); // keyword 紫
+    try testing.expect(std.mem.indexOf(u8, s, "38;2;181;206;168") != null); // number(20)绿
 }
 
 test "renderResult: diff 整块矩形(cols 填充背景到行尾,对齐 CC)" {

@@ -87,6 +87,9 @@ pub const App = struct {
     abort: AbortSignal,
     skills: SkillSet,
     read_state: ReadState,
+    /// Edit/Write 旁路高亮缓存(tool_id → 新旧全文)。供 diff 工具卡 tree-sitter 着色;
+    /// 不进对话历史。session 退出 deinit。
+    edit_hl_cache: @import("core/edit_hl_cache.zig").EditHlCache,
     /// Session transcript writer；失败初始化则保持 null（日志落盘 fallback）
     transcript_writer: ?transcript.Writer = null,
     /// 本 session 累计用量（跨多 turn）
@@ -165,6 +168,7 @@ pub const App = struct {
             .skills = SkillSet.init(allocator),
             .activated_tools = std.StringHashMap(void).init(allocator),
             .read_state = ReadState.init(allocator),
+            .edit_hl_cache = @import("core/edit_hl_cache.zig").EditHlCache.init(allocator),
             .tasks = TaskStore.init(allocator),
             .dyn_registry = DynRegistry.init(allocator),
             .mcp_sessions = .empty,
@@ -201,6 +205,14 @@ pub const App = struct {
             };
             const persisted = if (home_for_theme) |h| tui_config.loadTheme(allocator, h) else null;
             app.theme_variant = persisted orelse .auto;
+        }
+        // variant=.auto 且支持颜色:探测终端背景色自动选 dark/light(仿 mecode)。
+        // 跳过条件:已显式持久化具体 variant(用户优先)、能力 none、NO_PROBE、非 tty。
+        if (app.theme_variant == .auto and cap != .none and std.c.getenv("METACODES_NO_PROBE") == null) {
+            const bg_probe = @import("repl/tui/bg_probe.zig");
+            if (bg_probe.probeBackground(1)) |bg| {
+                app.theme_variant = if (bg_probe.isLight(bg)) .light else .dark;
+            }
         }
         app.theme = theme_mod.select(app.theme_variant, cap);
 
@@ -306,6 +318,7 @@ pub const App = struct {
         app.allocator.free(app.tool_defs);
         app.skills.deinit();
         app.read_state.deinit();
+        app.edit_hl_cache.deinit();
         app.tasks.deinit();
         // MCP：先 session（释放 binding 内存）再 client（关 transport + reap 子进程）
         for (app.mcp_sessions.items) |*entry| {

@@ -13,6 +13,10 @@ const std = @import("std");
 const ansi = @import("ansi.zig");
 const term = @import("term.zig");
 
+/// 语法高亮语义色(10 组)。复用 ansi.syntax_palette.Syntax 为单一真相源。
+/// 由 select() 按 ColorCapability 填(b16/256/truecolor),basic_16 用历史色保兼容。
+pub const SyntaxTheme = ansi.syntax_palette.Syntax;
+
 pub const Theme = struct {
     // ============ 语义色 ============
     primary: []const u8,
@@ -50,6 +54,9 @@ pub const Theme = struct {
     /// 空串 = 不画背景(basic_16/mono 退回纯前景)。由 select 按 ColorCapability 注入。
     diff_add_bg: []const u8 = "",
     diff_del_bg: []const u8 = "",
+    /// 语法高亮语义色(代码 diff + markdown 代码块)。默认 b16(const dark/light 烤入),
+    /// select() 对 256/truecolor 升级;monochrome 留空。空组 = 不上色。
+    syntax: SyntaxTheme = ansi.syntax_palette.b16,
 
     // ============ 边框字符 ============
     box_h: []const u8,
@@ -176,6 +183,9 @@ pub const monochrome: Theme = .{
     .box_bl = "+",
     .box_br = "+",
 
+    // 无语法高亮(mono):全空,渲染层退回纯文本/dim。
+    .syntax = .{},
+
     .reset = "",
 };
 
@@ -208,6 +218,15 @@ pub fn select(variant: Variant, cap: term.ColorCapability) Theme {
             th.diff_del_bg = if (is_light) ansi.diff_bg.idx_del_light else ansi.diff_bg.idx_del_dark;
         },
         else => {}, // basic_16:不画背景
+    }
+    // 语法高亮色:basic_16 用 const 烤入的 b16(零回归);256/truecolor 升级到丰富调色板。
+    // monochrome 不升级(留空)。
+    if (variant != .monochrome) {
+        switch (cap) {
+            .truecolor => th.syntax = if (is_light) ansi.syntax_palette.tc_light else ansi.syntax_palette.tc_dark,
+            .extended_256 => th.syntax = if (is_light) ansi.syntax_palette.idx_light else ansi.syntax_palette.idx_dark,
+            else => {}, // basic_16:保留 const 烤入的 b16
+        }
     }
     return th;
 }
@@ -292,4 +311,33 @@ test "select: diff 背景按 ColorCapability 注入" {
     // none → monochrome,无背景。
     const mono = select(.dark, .none);
     try testing.expectEqualStrings("", mono.diff_add_bg);
+}
+
+test "select: 语法高亮色按 ColorCapability 升级" {
+    // basic_16 → b16(magenta keyword,保历史字节)。
+    const b16 = select(.dark, .basic_16);
+    try testing.expectEqualStrings(ansi.sgr.fg_magenta, b16.syntax.keyword);
+    // truecolor → tc_dark(RGB 紫)。
+    const tc = select(.dark, .truecolor);
+    try testing.expect(std.mem.indexOf(u8, tc.syntax.keyword, "38;2;197;134;192") != null);
+    // type 在 truecolor 是 teal RGB,与 basic_16 的 fg_blue 不同(证明升级)。
+    try testing.expect(!std.mem.eql(u8, tc.syntax.type, b16.syntax.type));
+    // 256 → idx,且与 b16 不同。
+    const x256 = select(.dark, .extended_256);
+    try testing.expect(!std.mem.eql(u8, x256.syntax.type, b16.syntax.type));
+    // light ≠ dark(truecolor)。
+    const lt = select(.light, .truecolor);
+    try testing.expect(!std.mem.eql(u8, lt.syntax.keyword, tc.syntax.keyword));
+    // monochrome → 全空(none cap)。
+    const mono = select(.dark, .none);
+    try testing.expectEqualStrings("", mono.syntax.keyword);
+}
+
+test "const dark 烤入 b16 syntax(独立用 theme_mod.dark 时高亮可用)" {
+    // 现有测试直接用 theme_mod.dark(非 select),其 syntax 须有 basic-16 值。
+    try testing.expectEqualStrings(ansi.sgr.fg_magenta, dark.syntax.keyword);
+    try testing.expectEqualStrings(ansi.sgr.fg_green, dark.syntax.string);
+    try testing.expectEqualStrings(ansi.sgr.fg_yellow, dark.syntax.number);
+    // monochrome 烤入空。
+    try testing.expectEqualStrings("", monochrome.syntax.keyword);
 }

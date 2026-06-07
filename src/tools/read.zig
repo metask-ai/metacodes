@@ -2,6 +2,8 @@ const std = @import("std");
 const common = @import("common.zig");
 const security = @import("security.zig");
 const read_state = @import("../core/read_state.zig");
+const ts = @import("../treesitter/ts.zig");
+const code_map = @import("code_map.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
 /// 默认读取行数上限（对齐 TS：限制 200KB/2000 行用户无感截断）。
@@ -29,6 +31,15 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         return try readImage(allocator, ctx, path, media_type);
     }
 
+    // outline 模式(opt-in):返回符号大纲(函数/类型/类 + 行号 + 签名)而非文件内容。
+    // 仅对 tree-sitter 支持的语言;不支持则回退正常读取(向后兼容)。
+    if (isTrue(common.extractJsonArg(args, "outline"))) {
+        if (ts.Lang.fromPath(path)) |lang| {
+            return try readOutline(allocator, path, lang);
+        }
+        // 不支持的语言 → 落到正常读取路径
+    }
+
     const has_offset = common.extractJsonArg(args, "offset") != null;
     const has_limit = common.extractJsonArg(args, "limit") != null;
     const offset_1based: usize = if (common.extractJsonArg(args, "offset")) |s|
@@ -47,11 +58,17 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // 在读之前 fstat 一次拿 mtime/size，供 ReadState 记录用（must-read-first/staleness 校验）
     const st = read_state.statFd(fd) catch null;
 
-    // 大文件守卫:整读(未显式传 offset/limit)且 > MAX_FILE_BYTES → 拒读 + 提示用范围/Grep,
-    // 防一次性把大文件灌进上下文。显式传 offset/limit 表示用户要精确范围 → 放行。
+    // 大文件守卫:整读(未显式传 offset/limit)且 > MAX_FILE_BYTES → 不再死胡同报错;
+    // 若是 tree-sitter 支持的语言,返回符号大纲 + 提示(用 offset/limit 读具体范围);
+    // 否则维持原"too large"错误串(不支持的语言无法出大纲)。显式 offset/limit 放行。
     if (!has_offset and !has_limit) {
         if (st) |s| {
             if (s.size > MAX_FILE_BYTES) {
+                if (ts.Lang.fromPath(path)) |lang| {
+                    const outline = try readOutlineFromFd(allocator, path, lang, fd);
+                    defer allocator.free(outline);
+                    return try std.fmt.allocPrint(allocator, "File too large to show in full ({d} bytes, limit {d}). Outline below; Read a range with offset+limit for bodies.\n\n{s}", .{ s.size, MAX_FILE_BYTES, outline });
+                }
                 return try std.fmt.allocPrint(allocator, "{{\"error\":\"file too large ({d} bytes, limit {d}). Read a range with offset+limit, or use Grep to find specific content.\"}}", .{ s.size, MAX_FILE_BYTES });
             }
         }
@@ -90,6 +107,25 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     return try renderWithLineNumbers(full[line_start..end], offset_1based, allocator);
 }
+
+fn isTrue(s: ?[]const u8) bool {
+    return s != null and std.mem.eql(u8, s.?, "true");
+}
+
+/// outline 模式:打开文件、读全量、渲染符号大纲。调用方拥有返回串。
+fn readOutline(allocator: std.mem.Allocator, path: []const u8, lang: ts.Lang) ![]u8 {
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
+    defer _ = std.c.close(fd);
+    return try readOutlineFromFd(allocator, path, lang, fd);
+}
+
+/// 已有 fd 时渲染大纲(大文件守卫路径复用,避免重开)。
+fn readOutlineFromFd(allocator: std.mem.Allocator, path: []const u8, lang: ts.Lang, fd: std.posix.fd_t) ![]u8 {
+    const source = try common.readAllFromFd(fd, allocator);
+    defer allocator.free(source);
+    return try code_map.renderOutlineForSource(allocator, path, source, lang);
+}
+
 
 /// 把切片按行加 "%6d\t" 前缀（对齐 TS cat -n）。
 /// 输入 slice 可能以 \n 结尾或不以 \n 结尾；尾行不足时仍带前缀，尾部不强制补 \n。

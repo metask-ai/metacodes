@@ -3,6 +3,8 @@ const types = @import("types.zig");
 const client = @import("client.zig");
 const app_mod = @import("app.zig");
 const repl = @import("repl/loop.zig");
+const ts_export = @import("treesitter/export.zig");
+pub const treesitter_export = ts_export;
 
 pub const VERSION = "0.1.0";
 
@@ -23,6 +25,7 @@ pub const task_output_tool = @import("tools/task_output.zig");
 pub const agent_tool = @import("tools/agent.zig");
 pub const core_task_store = @import("core/task_store.zig");
 pub const core_read_state = @import("core/read_state.zig");
+pub const core_edit_hl_cache = @import("core/edit_hl_cache.zig");
 pub const tool_exec = @import("core/tool_exec.zig");
 pub const tool_result_storage = @import("tools/tool_result_storage.zig");
 pub const cache_break = @import("core/cache_break.zig");
@@ -71,6 +74,7 @@ pub const tui_ui_state = @import("repl/tui/ui_state.zig");
 pub const tui_ui = @import("repl/tui/ui.zig");
 pub const tui_event = @import("repl/tui/event.zig");
 pub const tui_theme = @import("repl/tui/theme.zig");
+pub const tool_card = @import("repl/tui/widget/tool_card.zig");
 pub const tui_test_capture = @import("repl/tui/test_capture.zig");
 pub const repl_input = @import("repl/input.zig");
 pub const repl_complete = @import("repl/complete.zig");
@@ -89,6 +93,14 @@ pub fn parseArgsForTest(argv: []const [*:0]const u8, allocator: std.mem.Allocato
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
+
+    // export-symbols 子命令(层三机制):在 App init *之前*处理——不发网络、不需 key。
+    //   metacodes export-symbols <dir> [-o <file>]
+    // walk <dir>,抽所有支持语言的符号,写 JSONL(供外围 metaknow skill 灌 KG)。
+    if (try maybeRunExportSymbols(init, allocator)) |code| {
+        std.process.exit(code);
+    }
+
     var config = parseArgs(init, allocator);
 
     // 初始化日志：读 METACODES_LOG / METACODES_LOG_FILE 环境变量
@@ -171,6 +183,37 @@ fn dumpPromptAndExit(app: *app_mod.App) noreturn {
     }
     dumpWrite("\n");
     std.process.exit(0);
+}
+
+/// 检测并执行 export-symbols 子命令。返回 null = 非该子命令(继续正常流程);
+/// 返回退出码 = 已执行,调用方应 exit。
+///   metacodes export-symbols <dir> [-o <file>] [--output <file>]
+fn maybeRunExportSymbols(init: std.process.Init, allocator: std.mem.Allocator) !?u8 {
+    var args = std.process.Args.iterate(init.minimal.args);
+    _ = args.next(); // 跳过 argv[0](程序名)
+
+    const first = args.next() orelse return null;
+    if (!std.mem.eql(u8, first, "export-symbols")) return null;
+
+    var dir: ?[]const u8 = null;
+    var out_path: ?[]const u8 = null;
+    while (args.next()) |s| {
+        if (std.mem.eql(u8, s, "-o") or std.mem.eql(u8, s, "--output")) {
+            const v = args.next() orelse {
+                std.debug.print("export-symbols: -o requires a path\n", .{});
+                return 2;
+            };
+            out_path = v;
+        } else if (dir == null) {
+            dir = s;
+        }
+    }
+
+    const target = dir orelse {
+        std.debug.print("usage: metacodes export-symbols <dir> [-o <file>]\n", .{});
+        return 2;
+    };
+    return try ts_export.run(allocator, target, out_path);
 }
 
 fn parseArgs(init: std.process.Init, allocator: std.mem.Allocator) types.Config {
@@ -284,6 +327,10 @@ test {
     _ = &@import("json.zig");
     _ = &@import("client.zig");
     _ = &@import("tools.zig");
+    _ = &@import("treesitter/ts.zig");
+    _ = &@import("treesitter/symbols.zig");
+    _ = &@import("treesitter/export.zig");
+    _ = &@import("core/edit_hl_cache.zig");
     _ = &@import("permission.zig");
     _ = &@import("permission/rule_spec.zig");
     _ = &@import("permission/bash_parser.zig");
@@ -321,6 +368,7 @@ test {
     _ = &@import("repl/tui/term.zig");
     _ = &@import("repl/tui/overlay.zig");
     _ = &@import("repl/tui/theme.zig");
+    _ = &@import("repl/tui/bg_probe.zig");
     _ = &@import("repl/tui/layout.zig");
     _ = &@import("repl/tui/test_capture.zig");
     _ = &@import("repl/tui/render_region.zig");

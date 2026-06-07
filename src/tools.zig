@@ -23,6 +23,8 @@ const task_tools = @import("tools/task_tools.zig");
 const agent_tool = @import("tools/agent.zig");
 const tool_search_tool = @import("tools/tool_search.zig");
 const web_search_tool = @import("tools/web_search.zig");
+const code_map_tool = @import("tools/code_map.zig");
+const find_symbol_tool = @import("tools/find_symbol.zig");
 
 pub const ToolContext = @import("tools/context.zig").ToolContext;
 pub const PromptContext = @import("tools/prompt_context.zig").PromptContext;
@@ -65,6 +67,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "file_path", .type = "string", .description = "The absolute path to the file to read" },
             .{ .name = "offset", .type = "integer", .description = "The line number to start reading from (1-based)" },
             .{ .name = "limit", .type = "integer", .description = "The number of lines to read" },
+            .{ .name = "outline", .type = "boolean", .description = "Return a symbol outline (functions/types with line numbers) instead of file contents. Supported for zig/ts/tsx/python/c/bash." },
         }, .required = &.{"file_path"} },
         .execute = read_tool.execute,
     },
@@ -113,6 +116,35 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "-n", .type = "boolean", .description = "Show line numbers (content mode)" },
         }, .required = &.{"pattern"} },
         .execute = grep_tool.execute,
+    },
+    // CodeMap:代码结构大纲(tree-sitter)。排在搜索工具之后、Bash 之前——和 Grep/Glob
+    // 同属"专用搜索/导航工具",比整文件 Read 省 token,引导模型优先用它定位定义。
+    .{
+        .name = "CodeMap",
+        .description = "Produce a structural outline of code: functions, types, classes, constants " ++
+            "with line numbers and signatures. Pass a file path for one file, or a glob (e.g. " ++
+            "src/**/*.zig) to map many files. Far cheaper than reading whole files when you only " ++
+            "need to find where things are defined. Supports zig, typescript, tsx, python, c, bash.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "path", .type = "string", .description = "A file path OR a glob pattern (e.g. src/**/*.zig)" },
+            .{ .name = "lang", .type = "string", .description = "Force a language; default infers from extension", .enum_values = &.{ "zig", "typescript", "tsx", "python", "c", "bash" } },
+        }, .required = &.{"path"} },
+        .execute = code_map_tool.execute,
+    },
+    // FindSymbol:跨文件找符号*定义*(tree-sitter)。deferred——藏 ToolSearch 后,
+    // 避免稀释默认工具菜单(同 cc 只 defer 非核心工具的思路)。
+    .{
+        .name = "FindSymbol",
+        .description = "Find where a symbol is DEFINED across the codebase. Unlike Grep (which " ++
+            "returns all occurrences), this returns only definitions, with file:line and signature. " ++
+            "Useful for jumping to a function/type/class definition by name.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "name", .type = "string", .description = "The symbol name to find the definition of" },
+            .{ .name = "kind", .type = "string", .description = "Optional kind filter", .enum_values = &.{ "function", "method", "struct", "enum", "union", "type", "constant", "variable", "class", "interface" } },
+            .{ .name = "path", .type = "string", .description = "Optional directory/glob to scope the search (defaults to cwd)" },
+        }, .required = &.{"name"} },
+        .execute = find_symbol_tool.execute,
+        .deferred = true,
     },
     // Bash 排在所有文件/搜索专用工具(Read/Write/Edit/Glob/Grep)之后,对齐 mecode 的
     // 工具顺序(default.md 工具清单:…Glob, Grep, NotebookEdit, Bash…)。MiniMax 类模型

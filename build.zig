@@ -1,5 +1,42 @@
 const std = @import("std");
 
+// 把 vendored tree-sitter runtime + grammar 的 C 源接到一个 module 上。
+// C 源挂在 module(非 exe)上,所以每个 root=src/main.zig 的 module 都要调一次:
+// release/debug exe + test_module + integ/new 循环里的 cc_mod。
+//
+// 关键:只编 runtime/src/lib.c(摊销头,#include 其余运行时 .c;逐个编会重复符号)。
+// 生成的 parser.c/scanner.c 会触发 UBSan → -fno-sanitize=undefined。
+// scanner 全是纯 C(.c),无 C++,故不需要 link_libcpp。
+fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
+    const ts = "vendor/tree-sitter";
+    mod.addIncludePath(b.path(ts ++ "/runtime/include"));
+    mod.addIncludePath(b.path(ts ++ "/runtime/src"));
+    inline for (.{
+        "zig",
+        "typescript/typescript",
+        "typescript/tsx",
+        "python",
+        "c",
+        "bash",
+    }) |g| {
+        mod.addIncludePath(b.path(ts ++ "/grammars/" ++ g ++ "/src"));
+    }
+    const flags = &[_][]const u8{ "-std=c11", "-fno-sanitize=undefined" };
+    mod.addCSourceFile(.{ .file = b.path(ts ++ "/runtime/src/lib.c"), .flags = flags });
+    mod.addCSourceFiles(.{ .files = &.{
+        ts ++ "/grammars/zig/src/parser.c",
+        ts ++ "/grammars/typescript/typescript/src/parser.c",
+        ts ++ "/grammars/typescript/typescript/src/scanner.c",
+        ts ++ "/grammars/typescript/tsx/src/parser.c",
+        ts ++ "/grammars/typescript/tsx/src/scanner.c",
+        ts ++ "/grammars/python/src/parser.c",
+        ts ++ "/grammars/python/src/scanner.c",
+        ts ++ "/grammars/c/src/parser.c",
+        ts ++ "/grammars/bash/src/parser.c",
+        ts ++ "/grammars/bash/src/scanner.c",
+    }, .flags = flags });
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -12,6 +49,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSmall,
         .link_libc = true,
     });
+    addTreeSitter(b, release_mod);
     const exe = b.addExecutable(.{
         .name = "metacodes",
         .root_module = release_mod,
@@ -24,6 +62,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
         .link_libc = true,
     });
+    addTreeSitter(b, debug_mod);
     const debug_exe = b.addExecutable(.{
         .name = "metacodes-debug",
         .root_module = debug_mod,
@@ -89,6 +128,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    addTreeSitter(b, test_module);
     const test_obj = b.addTest(.{
         .name = "cc-test",
         .root_module = test_module,
@@ -158,6 +198,12 @@ pub fn build(b: *std.Build) void {
         "tests/component/ui_render_test.zig",
         "tests/component/ui_backend_test.zig",
         "tests/component/ui_multifrontend_test.zig",
+        "tests/component/code_map_test.zig",
+        "tests/component/find_symbol_test.zig",
+        "tests/component/read_outline_test.zig",
+        "tests/component/export_symbols_test.zig",
+        "tests/component/edit_syntaxcheck_test.zig",
+        "tests/component/diff_highlight_test.zig",
     };
     for (integ_files) |f| {
         const m = b.createModule(.{
@@ -180,6 +226,7 @@ pub fn build(b: *std.Build) void {
         });
         m.addImport("harness", harness_mod);
         m.addImport("cc", cc_mod);
+        addTreeSitter(b, cc_mod);
         const t = b.addTest(.{ .name = "integration", .root_module = m });
         const run_t = b.addRunArtifact(t);
         run_t.step.dependOn(b.getInstallStep()); // 确保 mock_mcp_server 被 build
@@ -219,6 +266,12 @@ pub fn build(b: *std.Build) void {
         "tests/component/ui_render_test.zig",
         "tests/component/ui_backend_test.zig",
         "tests/component/ui_multifrontend_test.zig",
+        "tests/component/code_map_test.zig",
+        "tests/component/find_symbol_test.zig",
+        "tests/component/read_outline_test.zig",
+        "tests/component/export_symbols_test.zig",
+        "tests/component/edit_syntaxcheck_test.zig",
+        "tests/component/diff_highlight_test.zig",
     };
     for (new_files) |f| {
         const m = b.createModule(.{
@@ -241,8 +294,24 @@ pub fn build(b: *std.Build) void {
         });
         m.addImport("harness", harness_mod);
         m.addImport("cc", cc_mod);
+        addTreeSitter(b, cc_mod);
         const t = b.addTest(.{ .name = "new-l2", .root_module = m });
         new_step.dependOn(&b.addRunArtifact(t).step);
+    }
+
+    // test:ts —— 只跑 tree-sitter 相关 L1 单测(隔离 artifact,绕开主套件 integration 挂起)。
+    // root=src/treesitter/test_root.zig 聚合 ts/symbols 等,接 addTreeSitter 链 C。
+    const ts_step = b.step("test:ts", "Run tree-sitter L1 unit tests (isolated)");
+    {
+        const m = b.createModule(.{
+            .root_source_file = b.path("src/treesitter/test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        addTreeSitter(b, m);
+        const t = b.addTest(.{ .name = "ts-l1", .root_module = m });
+        ts_step.dependOn(&b.addRunArtifact(t).step);
     }
 
     // 注:TTY 渲染测试(tests/tty/)用独立 python runner 跑,**不接 zig build**——

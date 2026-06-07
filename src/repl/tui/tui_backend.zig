@@ -60,6 +60,8 @@ pub const TuiBackend = struct {
     /// 工具卡渲染所需(renderStart/renderResult)。null → 卡渲染跳过(等价无 theme)。
     theme: ?*const Theme = null,
     alloc: ?std.mem.Allocator = null,
+    /// Edit/Write diff 的 tree-sitter 高亮缓存(loop.zig 注入 &app.edit_hl_cache)。
+    edit_hl_cache: ?*@import("../../core/edit_hl_cache.zig").EditHlCache = null,
     /// 颜色括号(stream_begin/stream_done)+ retry 着色。
     colorize: bool = false,
     /// verbose:tool_start 前打 `[Tool: name]` 行(对齐旧 agent_loop:387)。
@@ -226,7 +228,17 @@ pub const TuiBackend = struct {
     /// 结果卡 RenderOpts(cols + verbose)。抽成 helper 便于回归测试:
     /// cols 必须来自 region(漏传=0 → diff 背景块不 padEnd → 右缘参差,非矩形)。
     fn cardResultOpts(self: *const TuiBackend) tool_card.RenderOpts {
-        return .{ .cols = self.region.cols, .verbose = self.verbose };
+        return self.cardResultOptsFor("");
+    }
+
+    /// 带 tool_id 的 RenderOpts(Edit/Write diff 高亮按 tool_id 查缓存)。
+    fn cardResultOptsFor(self: *const TuiBackend, tool_id: []const u8) tool_card.RenderOpts {
+        return .{
+            .cols = self.region.cols,
+            .verbose = self.verbose,
+            .edit_hl_cache = self.edit_hl_cache,
+            .tool_id = tool_id,
+        };
     }
 
     /// 渲染结果卡到滚动历史(tool_card.renderResult)。需 theme+alloc;缺则跳过。
@@ -234,7 +246,7 @@ pub const TuiBackend = struct {
         const th = self.theme orelse return;
         const a = self.alloc orelse return;
         const kind: tool_card.ResultKind = if (r.is_error) .err else .ok;
-        const card = tool_card.renderResult(a, th.*, r.name, r.input, r.content, kind, r.elapsed_ms, self.cardResultOpts()) catch return;
+        const card = tool_card.renderResult(a, th.*, r.name, r.input, r.content, kind, r.elapsed_ms, self.cardResultOptsFor(r.id)) catch return;
         defer a.free(card);
         self.region.writeGenText(card); // 空串(hidden 成功结果) → writeGenText no-op
     }

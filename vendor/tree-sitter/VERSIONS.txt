@@ -1,0 +1,11 @@
+# tree-sitter vendored sources — pinned versions
+# 由 scripts/download-tree-sitter.sh 生成。升级走脚本,勿手改源。
+#
+# runtime  tree-sitter/tree-sitter                  v0.26.9  (ABI 13..15)
+# zig      tree-sitter-grammars/tree-sitter-zig     v1.1.2      (ABI 14)
+# ts/tsx   tree-sitter/tree-sitter-typescript       v0.23.2
+# python   tree-sitter/tree-sitter-python           v0.23.6
+# c        tree-sitter/tree-sitter-c                v0.24.1
+# bash     tree-sitter/tree-sitter-bash             v0.23.3
+#
+# License: MIT (runtime + 全部 grammar)。

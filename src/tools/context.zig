@@ -48,6 +48,9 @@ pub const ToolContext = struct {
     /// ReadState 表：Read 成功后会 record，Write/Edit 入口查 get 做 must-read-first 校验。
     /// 单元测试可用 `simple` 构造跳过（无校验）。
     read_state: ?*ReadState = null,
+    /// Edit/Write 旁路高亮缓存:finalizeWrite 把新旧全文 put 进来(key=progress_tool_id),
+    /// diff 工具卡渲染时取出做 tree-sitter 着色。null = 不缓存(headless/测试)。
+    edit_hl_cache: ?*@import("../core/edit_hl_cache.zig").EditHlCache = null,
     /// Bash 后台作业注册表：run_in_background + BashOutput + KillShell 用
     jobs: ?*JobRegistry = null,
     /// 后台 subagent 作业注册表：Task(run_in_background) + TaskOutput + TaskStop(agent_ id) 用

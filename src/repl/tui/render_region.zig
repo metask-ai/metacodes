@@ -1089,7 +1089,7 @@ pub const RenderRegion = struct {
         // 先把 markdown 渲染到临时 buf(不含前缀),再 SGR-aware 软折到带前缀/缩进的输出。
         var rendered: std.ArrayList(u8) = .empty;
         defer rendered.deinit(self.allocator);
-        md_render.renderLineStreaming(line, &self.md_state, &rendered, self.allocator) catch {
+        md_render.renderLineStreaming(line, &self.md_state, &rendered, self.allocator, self.theme.syntax) catch {
             rendered.clearRetainingCapacity();
             rendered.appendSlice(self.allocator, line) catch {};
         };
