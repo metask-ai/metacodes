@@ -45,7 +45,9 @@ const transcript_viewer = @import("../transcript_viewer.zig");
 const term = @import("term.zig");
 const ask_dialog = @import("dialog/ask_question.zig");
 const perm_dialog = @import("dialog/permission.zig");
+const exit_plan_dialog = @import("dialog/exit_plan_mode.zig");
 const tool_ctx = @import("../../tools/context.zig");
+const ui_request = @import("../ui_request.zig");
 
 const RenderRegion = render_region.RenderRegion;
 const Theme = theme_mod.Theme;
@@ -221,12 +223,18 @@ pub const TuiBackend = struct {
         self.region.writeGenText(card); // 空串(hidden) → writeGenText no-op
     }
 
+    /// 结果卡 RenderOpts(cols + verbose)。抽成 helper 便于回归测试:
+    /// cols 必须来自 region(漏传=0 → diff 背景块不 padEnd → 右缘参差,非矩形)。
+    fn cardResultOpts(self: *const TuiBackend) tool_card.RenderOpts {
+        return .{ .cols = self.region.cols, .verbose = self.verbose };
+    }
+
     /// 渲染结果卡到滚动历史(tool_card.renderResult)。需 theme+alloc;缺则跳过。
     fn renderCardResult(self: *TuiBackend, r: anytype) void {
         const th = self.theme orelse return;
         const a = self.alloc orelse return;
         const kind: tool_card.ResultKind = if (r.is_error) .err else .ok;
-        const card = tool_card.renderResult(a, th.*, r.name, r.input, r.content, kind, r.elapsed_ms, .{}) catch return;
+        const card = tool_card.renderResult(a, th.*, r.name, r.input, r.content, kind, r.elapsed_ms, self.cardResultOpts()) catch return;
         defer a.free(card);
         self.region.writeGenText(card); // 空串(hidden 成功结果) → writeGenText no-op
     }
@@ -278,48 +286,16 @@ pub const TuiBackend = struct {
         }
     }
 
-    /// AskUserQuestion 回调(经 ToolContext.ask_question_fn 注入,工具在 agent_loop 主线程调)。
-    /// 渲染可交互对话框,把选中 label(s) append 进 out。序列(顺序铁律见 plan):
-    ///   ① stopInput:停 watcher,主线程接管 fd0(此刻主线程不持锁 → 与 watcher 短临界区不死锁)。
-    ///   ② enterExclusiveOverlay:持渲染锁(挡 emit 线程)+ 擦生成期固定区(冻结、给对话框干净屏)。
-    ///   ③ defer 退出时:exitExclusiveOverlay 重画固定区 + 退锁;再 startInput 重启 watcher(spinner/esc 恢复)。
-    ///   ④ ask_dialog.run:主线程独占 fd0 跑 wizard。它绝不碰 region 渲染方法(非递归 mutex 自死锁)。
-    /// 非 tty / 无 app → NotATty(工具回退)。run 内 ESC/Ctrl+C → InputAborted 经 defer 清理后上传。
-    fn askQuestion(
+    /// 统一的终端接管骨架(三套 UI 请求曾各写一遍,现合一)。
+    /// 顺序铁律:① stopInput(主线程接管 fd0,此刻不持锁)② enterExclusiveOverlay(持渲染锁+擦固定区)
+    /// ③ 调 body(独占 fd0 跑对话框,绝不碰 region 渲染方法——非递归 mutex 自死锁)
+    /// ④ defer exitExclusiveOverlay(重画固定区+退锁)+ startInput(重启 watcher)。
+    /// body 收到 fd(stdin)+ theme + allocator,返回 R。非 tty/无 app → 返回 null(调用方兜底)。
+    fn withTerminalTakeover(
         self: *TuiBackend,
-        allocator: std.mem.Allocator,
-        questions: []const tool_ctx.AskQuestion,
-        out: *std.ArrayList([]const u8),
-    ) anyerror!void {
-        const fd = self.input_fd;
-        if (!term.isatty(fd)) return error.NotATty;
-        const app = self.input_app orelse return error.NotATty;
-        const th = if (self.theme) |t| t.* else theme_mod.dark;
-
-        self.stopInput(); // ① 停 watcher(此前主线程不持锁)
-        self.region.enterExclusiveOverlay(); // ② 持锁 + 擦固定区
-        defer {
-            self.region.exitExclusiveOverlay(app); // ③ 重画固定区 + 退锁
-            if (self.input_alloc) |a| self.startInput(fd, app, a) catch {}; // 重启 watcher(失败降级,不崩)
-        }
-        try ask_dialog.run(allocator, th, fd, questions, out); // ④ 独占 fd0 跑 wizard
-    }
-
-    /// trampoline:ToolContext.ask_question_fn 的 *anyopaque state → *TuiBackend。
-    pub fn askQuestionTrampoline(
-        state: *anyopaque,
-        allocator: std.mem.Allocator,
-        questions: []const tool_ctx.AskQuestion,
-        out: *std.ArrayList([]const u8),
-    ) anyerror!void {
-        const self: *TuiBackend = @ptrCast(@alignCast(state));
-        return self.askQuestion(allocator, questions, out);
-    }
-
-    /// 权限弹窗:同 askQuestion 的终端接管协调(停 watcher+持锁),根治与 watcher 抢 fd0。
-    /// 经 prompt_mod 的 dialog runner 注入(loop.zig 设),session 记忆/persist 仍在 prompt_mod。
-    /// 返回 PermissionChoice;非 tty/无 app → null(prompt_mod 回退裸 dialog/文字)。
-    fn promptPermission(self: *TuiBackend, tool_name: []const u8, args: []const u8) ?perm_dialog.PermissionChoice {
+        comptime R: type,
+        body: *const fn (fd: std.c.fd_t, th: Theme, a: std.mem.Allocator) R,
+    ) ?R {
         const fd = self.input_fd;
         if (!term.isatty(fd)) return null;
         const app = self.input_app orelse return null;
@@ -332,14 +308,76 @@ pub const TuiBackend = struct {
             self.region.exitExclusiveOverlay(app);
             self.startInput(fd, app, a) catch {};
         }
-        // promptLoop:不进 raw mode(接管期终端已是生成期 raw),输出走 fd2(与 region 同流)。
-        return perm_dialog.promptLoop(a, th, fd, 2, tool_name, args);
+        return body(fd, th, a);
     }
 
-    /// trampoline:prompt_mod.setDialogRunner 的 state → *TuiBackend。
-    pub fn promptPermissionRunner(state: *anyopaque, tool_name: []const u8, args: []const u8) ?perm_dialog.PermissionChoice {
+    /// 统一 UI 请求入口:按 req tag 分派到对应对话框(终端接管共享)。
+    /// 替代旧 askQuestion/promptPermission/exitPlanPrompt 三套独立实现。
+    /// 非 tty / 无 app → 安全默认(plan→reject;permission→deny_once;ask→error.NotATty)。
+    fn handleUiRequest(
+        self: *TuiBackend,
+        allocator: std.mem.Allocator,
+        req: *const ui_request.UiRequest,
+        out: *ui_request.UiResponse,
+    ) anyerror!void {
+        switch (req.*) {
+            .ask_question => |questions| {
+                // ask_question 的 answers 挂调用方传入的 allocator;不能用 withTerminalTakeover
+                // 的固定签名(它传 self.input_alloc),故就地展开同款接管骨架。
+                const fd = self.input_fd;
+                if (!term.isatty(fd)) return error.NotATty;
+                const app = self.input_app orelse return error.NotATty;
+                const th = if (self.theme) |t| t.* else theme_mod.dark;
+                self.stopInput();
+                self.region.enterExclusiveOverlay();
+                defer {
+                    self.region.exitExclusiveOverlay(app);
+                    if (self.input_alloc) |a| self.startInput(fd, app, a) catch {};
+                }
+                var answers: std.ArrayList([]const u8) = .empty;
+                errdefer {
+                    for (answers.items) |it| allocator.free(@constCast(it));
+                    answers.deinit(allocator);
+                }
+                try ask_dialog.run(allocator, th, fd, questions, &answers, self.region.cols);
+                out.* = .{ .answers = try answers.toOwnedSlice(allocator) };
+            },
+            .permission => |p| {
+                const Ctx = struct {
+                    threadlocal var tool: []const u8 = "";
+                    threadlocal var args: []const u8 = "";
+                    fn run(fd: std.c.fd_t, th: Theme, a: std.mem.Allocator) perm_dialog.PermissionChoice {
+                        return perm_dialog.promptLoop(a, th, fd, 2, tool, args) orelse .deny_once;
+                    }
+                };
+                Ctx.tool = p.tool;
+                Ctx.args = p.args;
+                const choice = self.withTerminalTakeover(perm_dialog.PermissionChoice, &Ctx.run) orelse .deny_once;
+                out.* = .{ .permission = choice };
+            },
+            .plan_approval => |pa| {
+                const Ctx = struct {
+                    threadlocal var plan_md: []const u8 = "";
+                    fn run(fd: std.c.fd_t, th: Theme, a: std.mem.Allocator) tool_ctx.ToolContext.PlanApproval {
+                        return exit_plan_dialog.run(a, th, fd, 2, plan_md) orelse .reject;
+                    }
+                };
+                Ctx.plan_md = pa.plan_md;
+                const choice = self.withTerminalTakeover(tool_ctx.ToolContext.PlanApproval, &Ctx.run) orelse .reject;
+                out.* = .{ .plan_approval = choice };
+            },
+        }
+    }
+
+    /// trampoline:ToolContext.ui_request_fn 的 *anyopaque state → *TuiBackend。
+    pub fn uiRequestTrampoline(
+        state: *anyopaque,
+        allocator: std.mem.Allocator,
+        req: *const ui_request.UiRequest,
+        out: *ui_request.UiResponse,
+    ) anyerror!void {
         const self: *TuiBackend = @ptrCast(@alignCast(state));
-        return self.promptPermission(tool_name, args);
+        return self.handleUiRequest(allocator, req, out);
     }
 
     /// 生成期 stdin 监听主循环(从旧 loop.zig stdinAbortWatcher 原样搬入)。
@@ -471,4 +509,22 @@ test {
     std.testing.refAllDecls(@This());
     // 显式收录子模块 test(refAllDecls 非递归):ask_question dialog 的 render/joinChecked 单测。
     _ = ask_dialog;
+    _ = exit_plan_dialog; // ExitPlanMode 审批对话框 render/键映射单测
+}
+
+test "tool_result(Edit): renderCardResult 用 region.cols(回归:diff 矩形填充)" {
+    // 回归:renderCardResult 曾用 `.{}`(cols=0),appendDiffLine 跳过行尾填充 → 背景块
+    // 右缘参差(非矩形)。修复后 opts.cols 取自 region.cols → diff 行 padEnd 到列宽成矩形。
+    const a = std.testing.allocator;
+    // RenderRegion 写 fd=2(std.debug.print),无法经 fd 捕获;故验"opts 携带 region.cols"
+    // 这一接线点(真正的 bug 在此),叠加 tool_card 已有的"cols→padEnd 矩形"单测,端到端闭合。
+    var region = RenderRegion.init(a, 2, theme_mod.monochrome, .none);
+    defer region.deinit();
+    region.cols = 123; // 哨兵宽
+    var backend = TuiBackend.init(&region);
+    backend.verbose = true;
+
+    const opts = backend.cardResultOpts();
+    try std.testing.expectEqual(@as(u16, 123), opts.cols); // cols 必须从 region 流入(非 0)
+    try std.testing.expectEqual(true, opts.verbose);
 }

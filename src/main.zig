@@ -297,6 +297,8 @@ test {
     _ = &@import("core/message.zig");
     _ = &@import("core/conversation.zig");
     _ = &@import("core/agent_loop.zig");
+    _ = &@import("core/proposed_plan.zig");
+    _ = &@import("core/plan_file.zig");
     _ = &@import("app.zig");
     _ = &@import("repl/loop.zig");
     _ = &@import("util/abort.zig");
@@ -324,6 +326,7 @@ test {
     _ = &@import("repl/tui/render_region.zig");
     _ = &@import("repl/ui_event.zig");
     _ = &@import("repl/ui_backend.zig");
+    _ = &@import("repl/ui_request.zig");
     _ = &@import("repl/tui/tui_backend.zig");
     _ = &@import("core/writer_backend.zig");
     _ = &@import("core/headless_backend.zig");

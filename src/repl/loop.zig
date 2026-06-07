@@ -441,7 +441,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // 生成期结束统一 clear(defer),避免悬垂指向 tui_be 栈实例。
         if (tui_be) |*tb| {
             const prompt_mod = @import("../permission/prompt.zig");
-            prompt_mod.setDialogRunner(@ptrCast(tb), &tui_backend_mod.TuiBackend.promptPermissionRunner);
+            prompt_mod.setDialogRunner(@ptrCast(tb), &tui_backend_mod.TuiBackend.uiRequestTrampoline);
         }
         defer if (tui_be != null) @import("../permission/prompt.zig").clearDialogRunner();
         const result = agent_loop.run(
@@ -449,7 +449,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             &app.api_client,
             app.tool_defs,
             &app.permission_ctx,
-            .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .activate_tool_state = @ptrCast(app), .activate_tool_fn = &app_mod.App.activateToolTrampoline, .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline, .ask_question_state = if (tui_be) |*tb| @as(*anyopaque, @ptrCast(tb)) else null, .ask_question_fn = if (tui_be != null) &tui_backend_mod.TuiBackend.askQuestionTrampoline else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .tool_render_theme = &app.theme },
+            .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .activate_tool_state = @ptrCast(app), .activate_tool_fn = &app_mod.App.activateToolTrampoline, .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline, .ui_request_state = if (tui_be) |*tb| @as(*anyopaque, @ptrCast(tb)) else null, .ui_request_fn = if (tui_be != null) &tui_backend_mod.TuiBackend.uiRequestTrampoline else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .tool_render_theme = &app.theme },
             &ui_be,
             allocator,
         ) catch |err| {
@@ -1836,7 +1836,7 @@ fn handleSkillInvocation(app: *app_mod.App, allocator: std.mem.Allocator, rest: 
         &app.api_client,
         app.tool_defs,
         &app.permission_ctx,
-        .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .tool_render_theme = &app.theme },
+        .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .tool_render_theme = &app.theme },
         &be,
         allocator,
     ) catch |err| {
@@ -1964,59 +1964,9 @@ fn termRows() usize {
 }
 
 /// Ctrl+G:把当前 buffer 写临时文件,开 $VISUAL/$EDITOR 编辑,读回。
-/// 返回编辑后的内容(owned)。失败返 error。
+/// 实现移到 input.externalEdit(与 AskUserQuestion preview note 共用),此处转发。
 fn externalEdit(allocator: std.mem.Allocator, current: []const u8) ![]u8 {
-    const editor_env = std.c.getenv("VISUAL") orelse std.c.getenv("EDITOR") orelse return error.NoEditor;
-    const editor_cmd = std.mem.span(editor_env);
-
-    const tmp_path = "/tmp/cc-zig-edit-buffer.txt";
-    // 写当前 buffer
-    {
-        const fd = std.c.open(tmp_path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
-        if (fd < 0) return error.WriteFailed;
-        defer _ = std.c.close(fd);
-        if (current.len > 0) _ = std.c.write(fd, current.ptr, current.len);
-    }
-
-    // spawn editor(继承 stdin/stdout/stderr,前台阻塞)
-    const editor_z = try allocator.dupeZ(u8, editor_cmd);
-    defer allocator.free(editor_z);
-    const path_z = try allocator.dupeZ(u8, tmp_path);
-    defer allocator.free(path_z);
-    var argv = [_]?[*:0]const u8{ "/bin/sh", "-c", undefined, null };
-    const sh_cmd = try std.fmt.allocPrintSentinel(allocator, "{s} {s}", .{ editor_cmd, tmp_path }, 0);
-    defer allocator.free(sh_cmd);
-    argv[2] = sh_cmd.ptr;
-
-    const pid = std.c.fork();
-    if (pid == 0) {
-        _ = std.c.execve("/bin/sh", @ptrCast(&argv), @ptrCast(std.c.environ));
-        std.c._exit(127);
-    } else if (pid < 0) {
-        return error.ForkFailed;
-    }
-    var status: c_int = 0;
-    _ = std.c.waitpid(pid, &status, 0);
-
-    // 读回
-    const rfd = std.c.open(path_z.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-    if (rfd < 0) return error.ReadFailed;
-    defer _ = std.c.close(rfd);
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = std.c.read(rfd, &buf, buf.len);
-        if (n <= 0) break;
-        try out.appendSlice(allocator, buf[0..@intCast(n)]);
-    }
-    _ = std.c.unlink(path_z.ptr);
-    // 去掉编辑器常加的尾换行
-    var result = try out.toOwnedSlice(allocator);
-    if (result.len > 0 and result[result.len - 1] == '\n') {
-        result = try allocator.realloc(result, result.len - 1);
-    }
-    return result;
+    return input.externalEdit(allocator, current);
 }
 
 /// 杀所有 running 后台任务,返回杀掉的数量。

@@ -35,6 +35,9 @@ pub const Context = struct {
     hooks: ?*const hooks_mod.HookSet = null,
     /// hook spawn 需要 allocator(构造 stdin JSON);未提供 → 跳过 hook。
     hook_allocator: ?std.mem.Allocator = null,
+    /// 当前 session 的 plan 文件全路径(plan 模式下特许写此文件;空串 = 无)。
+    /// 对齐 cc isSessionPlanFile:plan 模式下模型把计划写到此文件,是唯一可写文件。
+    plan_file_path: []const u8 = "",
 };
 
 /// 根据模式 + 工具名决定:允许 / 拒绝 / 询问。
@@ -129,7 +132,24 @@ pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decis
     const m = mode_mod.canonical(ctx.mode);
     const decision: Decision = blk: {
         if (m == .bypass_permissions) break :blk .allow;
-        if (m == .plan) break :blk if (cat == .read) .allow else .deny;
+        if (m == .plan) {
+            if (cat == .read) break :blk .allow;
+            // plan 文件特许:plan 模式下 Write/Edit 目标==当前 session plan 文件 → allow
+            // (对齐 cc isSessionPlanFile:plan 文件是 plan 模式下唯一可写文件)。
+            if (ctx.plan_file_path.len > 0 and
+                (std.mem.eql(u8, tool_name, "Write") or std.mem.eql(u8, tool_name, "Edit")))
+            {
+                const util_json = @import("../util/json.zig");
+                const plan_file = @import("../core/plan_file.zig");
+                if (util_json.extractStringField(args, "file_path")) |target| {
+                    if (plan_file.isPlanFile(ctx.plan_file_path, target)) {
+                        log.debug("permission", "plan mode: allow write to plan file {s}", .{target});
+                        break :blk .allow;
+                    }
+                }
+            }
+            break :blk .deny;
+        }
         if (m == .auto) break :blk if (risk == .low) .allow else .ask;
         if (m == .dont_ask) break :blk .deny;
         if (m == .accept_edits) {
@@ -178,6 +198,19 @@ test "plan mode: read allowed, write/exec denied" {
     try std.testing.expect(check(&ctx, "Write", "") == .deny);
     try std.testing.expect(check(&ctx, "Edit", "") == .deny);
     try std.testing.expect(check(&ctx, "Bash", "") == .deny);
+}
+
+test "plan mode: 特许写 plan 文件,其它 Write 仍 deny(对齐 cc isSessionPlanFile)" {
+    const plan_path = "/home/u/.cc-zig/plans/cozy-canyon.md";
+    const ctx = Context{ .mode = .plan, .plan_file_path = plan_path };
+    // 写 plan 文件 → allow。
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/home/u/.cc-zig/plans/cozy-canyon.md\",\"content\":\"x\"}") == .allow);
+    try std.testing.expect(check(&ctx, "Edit", "{\"file_path\":\"/home/u/.cc-zig/plans/cozy-canyon.md\"}") == .allow);
+    // 写别的文件 → 仍 deny(plan 文件是唯一例外)。
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/home/u/src/main.zig\",\"content\":\"x\"}") == .deny);
+    // 无 plan_file_path 配置时,连 plan 路径也 deny(机制未启用)。
+    const ctx_noplan = Context{ .mode = .plan };
+    try std.testing.expect(check(&ctx_noplan, "Write", "{\"file_path\":\"/home/u/.cc-zig/plans/cozy-canyon.md\"}") == .deny);
 }
 
 test "auto mode: low risk allow, others ask" {

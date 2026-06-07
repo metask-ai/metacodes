@@ -112,6 +112,10 @@ pub const App = struct {
     agent_jobs: ?@import("core/agent_job_registry.zig").AgentJobRegistry = null,
     /// 进入 plan 模式前的原 mode；ExitPlanMode 用它恢复
     plan_prev_mode: ?types.PermissionMode = null,
+    /// 当前 session 的 plan 文件全路径(`{home}/.cc-zig/plans/{slug}.md`,owned)。
+    /// init 时算一次,挂到 permission_ctx.plan_file_path(plan 模式特许写)+ ToolContext。
+    /// 空串 = home 缺失,plan 文件机制降级(模型把计划写对话文本)。
+    plan_file_path: []u8 = &.{},
     /// 模型长任务 scratchpad（Task* 工具共享）
     tasks: TaskStore,
     /// 预构造的 system prompt（app 启动时一次性 build）。null = build 失败时降级为无 prompt。
@@ -254,6 +258,10 @@ pub const App = struct {
             @import("util/log.zig").warn("transcript", "init failed: {s} (session will not persist)", .{@errorName(err)});
         };
 
+        // 计算本 session 的 plan 文件路径(plan 模式下模型把计划写这里;唯一可写)。
+        // slug seed 优先用 transcript session id(每 session 稳定),否则时间兜底。
+        app.initPlanFilePath();
+
         // 从 config.json 加载 permission_rules（旧 schema，向后兼容）
         app.loadPermissionRules() catch |err| {
             @import("util/log.zig").debug("permission", "no rules loaded: {s}", .{@errorName(err)});
@@ -315,6 +323,7 @@ pub const App = struct {
             app.activated_tools.deinit();
         }
         if (app.project_dir) |p| app.allocator.free(p);
+        if (app.plan_file_path.len > 0) app.allocator.free(app.plan_file_path);
         app.agents.deinit();
         for (app.worktree_stack.items) |entry| {
             app.allocator.free(entry.worktree_path);
@@ -349,6 +358,31 @@ pub const App = struct {
         if (app.transcript_writer) |*w| w.flush(&app.conversation);
     }
 
+    /// 计算本 session 的 plan 文件路径 + mkdir。seed 优先用 transcript session id(每 session
+    /// 稳定),否则时间兜底。失败仅降级(plan_file_path 留空,plan 模式靠对话文本)。
+    fn initPlanFilePath(app: *App) void {
+        const plan_file = @import("core/plan_file.zig");
+        const home = app.homeDir();
+        if (home.len == 0) return;
+        // seed:session id(transcript dir basename)哈希;无 transcript → 时间。
+        const seed: u64 = blk: {
+            if (app.transcript_writer) |*w| {
+                const base = std.fs.path.basename(w.dir);
+                if (base.len > 0) break :blk std.hash.Wyhash.hash(0, base);
+            }
+            break :blk @as(u64, @bitCast(@import("util/time.zig").nowMs()));
+        };
+        var slug_buf: [64]u8 = undefined;
+        const slug = plan_file.slugFromSeed(seed, &slug_buf);
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = plan_file.planFilePath(home, slug, &path_buf);
+        if (path.len == 0) return;
+        plan_file.ensureDir(home) catch {}; // mkdir 失败不致命:写盘时模型会拿到错误
+        app.plan_file_path = app.allocator.dupe(u8, path) catch return;
+        // 挂到 permission_ctx,plan 模式下 decision 据此特许写 plan 文件。
+        app.permission_ctx.plan_file_path = app.plan_file_path;
+    }
+
     /// Shift+Tab 的纯状态机:当前 mode → 下一个 mode(对齐 Claude Code)。
     /// 循环档(default/acceptEdits/plan)三者轮转;非循环档(bypass/auto/dont_ask)→ default。
     /// 抽成纯函数让状态机可纯单测(不构造 App),cyclePermMode 只做副作用接线。
@@ -364,8 +398,17 @@ pub const App = struct {
     /// Shift+Tab:循环权限模式 default → acceptEdits → plan → default(对齐 Claude Code)。
     /// 改 config + permission_ctx;footer 读 live permission_ctx.mode 即反映。两期(loop/tui_backend)共用。
     pub fn cyclePermMode(app: *App) void {
-        app.config.permission_mode = nextPermMode(app.config.permission_mode);
-        app.permission_ctx.setMode(app.config.permission_mode);
+        const from = app.config.permission_mode;
+        const to = nextPermMode(from);
+        // 经 Shift+Tab 进/出 plan 时同步维护 plan_prev_mode,使 ExitPlanMode(approve)能恢复
+        // 到进 plan 前的真实模式(否则回退 default)。进 plan:记 from;离开 plan:清。
+        if (to == .plan and from != .plan) {
+            app.plan_prev_mode = from;
+        } else if (from == .plan and to != .plan) {
+            app.plan_prev_mode = null;
+        }
+        app.config.permission_mode = to;
+        app.permission_ctx.setMode(to);
     }
 
     /// Ctrl+X Ctrl+K:杀所有 running 后台任务,返回 killed 数。两期共用。

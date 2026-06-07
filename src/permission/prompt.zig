@@ -41,26 +41,26 @@ pub fn setPersistContext(project_dir: ?[]const u8, home: []const u8) void {
     g_home = home;
 }
 
-/// 可选的对话框 runner 注入:有 TuiBackend 时,loop.zig 把它设成 backend 的"终端接管"
-/// 包装(停 watcher + 持渲染锁后渲染对话框,根治与键盘 watcher 抢 fd0)。null = 没设
-/// → ask() 回退裸 dialog.prompt(直接 read fd0,仅在无 watcher 的场景安全)。
-/// 签名同 dialog.prompt:返回选择 or null(非 tty/失败)。
+/// 可选的统一 UI 请求 runner 注入:有 TuiBackend 时,loop.zig 把它设成 backend 的
+/// uiRequestTrampoline(终端接管 + 按 tag 分派)。null = 没设 → ask() 回退裸 dialog.prompt。
+/// 与 ask_question/plan_approval 共用同一回调(三套 UI 请求已统一)。
 const PermissionChoice = dialog.PermissionChoice;
-var g_dialog_runner: ?*const fn (state: *anyopaque, tool_name: []const u8, args: []const u8) ?PermissionChoice = null;
-var g_dialog_runner_state: ?*anyopaque = null;
+const ui_request = @import("../repl/ui_request.zig");
+var g_ui_runner: ?ui_request.UiRequestFn = null;
+var g_ui_runner_state: ?*anyopaque = null;
 
 pub fn setDialogRunner(
     state: *anyopaque,
-    runner: *const fn (state: *anyopaque, tool_name: []const u8, args: []const u8) ?PermissionChoice,
+    runner: ui_request.UiRequestFn,
 ) void {
-    g_dialog_runner_state = state;
-    g_dialog_runner = runner;
+    g_ui_runner_state = state;
+    g_ui_runner = runner;
 }
 
 /// 清除 runner(生成期结束后,避免悬垂指向已失效的 TuiBackend 栈实例)。
 pub fn clearDialogRunner() void {
-    g_dialog_runner = null;
-    g_dialog_runner_state = null;
+    g_ui_runner = null;
+    g_ui_runner_state = null;
 }
 
 fn contains(list: []const []const u8, name: []const u8) bool {
@@ -88,12 +88,20 @@ pub fn ask(tool_name: []const u8, args: []const u8) !bool {
         const th = theme_mod.select(.auto, cap);
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        // 有注入的 runner(TuiBackend 终端接管)→ 走它(停 watcher+持锁,不抢 fd0);
+        // 有注入的 runner(TuiBackend 终端接管)→ 发 .permission UiRequest(停 watcher+持锁);
         // 否则裸 dialog.prompt(无 watcher 场景)。两者返回同一 PermissionChoice。
-        const choice_opt: ?PermissionChoice = if (g_dialog_runner) |runner|
-            runner(g_dialog_runner_state.?, tool_name, args)
-        else
-            dialog.prompt(arena.allocator(), th, tool_name, args);
+        const choice_opt: ?PermissionChoice = blk: {
+            if (g_ui_runner) |runner| {
+                const req = ui_request.UiRequest{ .permission = .{ .tool = tool_name, .args = args } };
+                var resp: ui_request.UiResponse = undefined;
+                runner(g_ui_runner_state.?, arena.allocator(), &req, &resp) catch break :blk null;
+                break :blk switch (resp) {
+                    .permission => |c| c,
+                    else => null,
+                };
+            }
+            break :blk dialog.prompt(arena.allocator(), th, tool_name, args);
+        };
         if (choice_opt) |choice| {
             switch (choice) {
                 .allow_once => return true,

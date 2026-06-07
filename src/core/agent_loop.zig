@@ -111,6 +111,8 @@ pub const Options = struct {
     /// cwd 绝对路径 + HOME(sandbox profile 用)。
     cwd_abs: []const u8 = "",
     home_dir: []const u8 = "",
+    /// 当前 session plan 文件路径(ExitPlanMode 读盘兜底用;仅顶层接)。
+    plan_file_path: []const u8 = "",
     /// 子 agent 定义集合(Task 工具据此找 subagent_type)。
     agents: ?*const @import("../agents/set.zig").AgentSet = null,
     /// 当前会话用的 model 名(供 subagent inherit 解析)。
@@ -135,14 +137,10 @@ pub const Options = struct {
         state: *anyopaque,
         allocator: std.mem.Allocator,
     ) anyerror!?@import("../tools/worktree.zig").WorktreeEntry = null,
-    /// AskUserQuestion 交互回调(state 指 *TuiBackend)。仅顶层 TUI 接(agent_depth==0)。
-    ask_question_state: ?*anyopaque = null,
-    ask_question_fn: ?*const fn (
-        state: *anyopaque,
-        allocator: std.mem.Allocator,
-        questions: []const @import("../tools/context.zig").AskQuestion,
-        out_answers: *std.ArrayList([]const u8),
-    ) anyerror!void = null,
+    /// 统一 UI 请求回调(替代旧 ask_question/exit_plan 三套;state 指 *TuiBackend)。
+    /// 仅顶层 TUI 接(agent_depth==0)——子 agent 无 tty。
+    ui_request_state: ?*anyopaque = null,
+    ui_request_fn: ?@import("../repl/ui_request.zig").UiRequestFn = null,
     /// MCP session 列表(ListMcpResourcesTool/ReadMcpResourceTool 用)。
     mcp_sessions: ?*const []@import("../app.zig").McpSessionEntry = null,
     /// Cron registry(CronCreate/Delete/List 用)。
@@ -325,9 +323,23 @@ pub fn run(
         };
         var retry_ui = RetryUi{ .be = backend };
         const reporter = client_mod.RetryReporter{ .state = @ptrCast(&retry_ui), .report = RetryUi.report };
+
+        // Plan 模式每轮把 plan 指令追加到 system prompt(对齐 mecode 每轮 developer_instructions):
+        // 根治"指令只在 EnterPlanMode 返回出现一次,后续轮模型忘了 <proposed_plan> 格式"。
+        // turn 作用域 alloc,用后 free;非 plan 模式直接用 opts.system_prompt(零开销)。
+        var sys_prompt_owned: ?[]u8 = null;
+        defer if (sys_prompt_owned) |p| allocator.free(p);
+        const effective_system_prompt: ?[]const u8 = blk: {
+            if (permission_ctx.modeValue() != .plan) break :blk opts.system_prompt;
+            const plan_mode = @import("../tools/plan_mode.zig");
+            const base = opts.system_prompt orelse "";
+            sys_prompt_owned = std.fmt.allocPrint(allocator, "{s}\n\n# Plan Mode (active)\n{s}", .{ base, plan_mode.PLAN_MODE_INSTRUCTIONS }) catch null;
+            break :blk if (sys_prompt_owned) |p| p else opts.system_prompt;
+        };
+
         var stream = api_client.sendMessageStreamFullRetry(
             api_messages.items,
-            opts.system_prompt,
+            effective_system_prompt,
             effective_tool_defs,
             opts.abort,
             opts.model_override,
@@ -556,6 +568,14 @@ pub fn run(
         }
 
         // 6b. 构造一次 ToolContext(所有 tool 共用;并发 job 各自换独立 arena allocator)。
+        // plan 模式:从刚提交的助手文本提取 <proposed_plan>,存进 ctx 供 ExitPlanMode 读
+        //（XML 协议主路径,对齐 mecode:计划走文本流而非工具参数)。turn 作用域,用后 free。
+        var proposed_plan_buf: ?[]u8 = null;
+        defer if (proposed_plan_buf) |p| allocator.free(p);
+        if (permission_ctx.modeValue() == .plan and assistant_text.items.len > 0) {
+            const pp = @import("proposed_plan.zig");
+            proposed_plan_buf = pp.extractProposedPlan(allocator, assistant_text.items) catch null;
+        }
         var base_ctx = tools_mod.ToolContext{
             .allocator = allocator,
             .abort = opts.abort,
@@ -580,6 +600,8 @@ pub fn run(
             .sandbox = opts.sandbox,
             .cwd_abs = opts.cwd_abs,
             .home_dir = opts.home_dir,
+            .plan_file_path = opts.plan_file_path,
+            .last_proposed_plan = if (proposed_plan_buf) |p| p else "",
             .agents = opts.agents,
             .parent_model = opts.parent_model,
             .skills = opts.skills_set,
@@ -612,10 +634,11 @@ pub fn run(
             base_ctx.progress_fn = &Tramp.cb;
         }
 
-        // AskUserQuestion 回调:仅顶层 TUI(depth==0)接——子 agent 无 tty,不弹对话框。
-        if (opts.ask_question_fn != null and opts.agent_depth == 0) {
-            base_ctx.ask_question_state = opts.ask_question_state;
-            base_ctx.ask_question_fn = opts.ask_question_fn;
+        // 统一 UI 请求回调(AskUserQuestion/权限/plan 审批共用):仅顶层 TUI(depth==0)接——
+        // 子 agent 无 tty,工具按语义兜底(ask→NotATty;plan→answer_queue/reject)。
+        if (opts.ui_request_fn != null and opts.agent_depth == 0) {
+            base_ctx.ui_request_state = opts.ui_request_state;
+            base_ctx.ui_request_fn = opts.ui_request_fn;
         }
 
         // 6c. 分批并发执行。过程态(TTY 顶层):无条件 emit tool_start(每个 run slot);

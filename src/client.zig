@@ -641,9 +641,17 @@ fn parseApiResponse(data: []const u8, allocator: std.mem.Allocator) !ApiResponse
     var response = ApiResponse{};
 
     if (std.mem.indexOf(u8, data, "\"content\":[")) |idx| {
-        const content_start = idx + 12;
-        const content_end = findJsonArrayEnd(data, content_start) orelse data.len;
-        response.content = try allocator.dupe(u8, data[content_start - 1 .. content_end + 1]);
+        // needle `"content":[` 长 11;`[` 在 idx+10。从 `[` 起扫(depth 计数要看到开括号),
+        // findJsonArrayEnd 返回**闭括号之后**的索引 → 切片 [bracket, end) 含整个 `[...]`。
+        const bracket = idx + 10;
+        if (bracket < data.len) {
+            const end = findJsonArrayEnd(data, bracket) orelse data.len;
+            // 防御:end 已是"闭括号后一位",最大可为 data.len;不再 +1(旧 bug:content_end+1 越界)。
+            const safe_end = @min(end, data.len);
+            if (safe_end > bracket) {
+                response.content = try allocator.dupe(u8, data[bracket..safe_end]);
+            }
+        }
     }
 
     if (std.mem.indexOf(u8, data, "\"stop_reason\":")) |idx| {
@@ -830,6 +838,49 @@ test "findJsonArrayEnd" {
     try std.testing.expect(findJsonArrayEnd("[1,2,3]", 0) == 7);
     try std.testing.expect(findJsonArrayEnd("[{\"a\":1},{\"b\":2}]", 0) == 17);
     try std.testing.expect(findJsonArrayEnd("[1,[2,3]]", 0) == 9); // closing ] is at index 8, returns 9
+}
+
+test "parseApiResponse: 提取 content 数组 + stop_reason" {
+    const a = std.testing.allocator;
+    const data = "{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"stop_reason\":\"end_turn\"}";
+    const resp = try parseApiResponse(data, a);
+    defer a.free(resp.content);
+    // content 应是完整 `[...]` 数组(含括号)。
+    try std.testing.expect(resp.content.len > 0);
+    try std.testing.expect(resp.content[0] == '[');
+    try std.testing.expect(resp.content[resp.content.len - 1] == ']');
+    try std.testing.expect(std.mem.indexOf(u8, resp.content, "\"text\":\"hi\"") != null);
+    // stop_reason 现有实现含引号(`"end_turn"`);只断言包含 end_turn(不锁引号细节)。
+    try std.testing.expect(resp.stop_reason != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.stop_reason.?, "end_turn") != null);
+}
+
+test "parseApiResponse: content 数组在末尾(回归 index OOB:旧 content_end+1 越界)" {
+    // 真 TTY 实测崩点:auto-compact 的非流式响应,content 数组是最后一段时,
+    // 旧代码 `data[content_start-1 .. content_end+1]` 的 +1 越界 panic。
+    const a = std.testing.allocator;
+    const data = "{\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"plan summary\"}]}";
+    const resp = try parseApiResponse(data, a);
+    defer a.free(resp.content);
+    try std.testing.expect(std.mem.indexOf(u8, resp.content, "plan summary") != null);
+    try std.testing.expect(resp.content[resp.content.len - 1] == ']'); // 不越界,正确收尾
+}
+
+test "parseApiResponse: 畸形响应(content 数组未闭合)不崩" {
+    // findJsonArrayEnd 返回 null → fallback data.len;不该 +1 越界。
+    const a = std.testing.allocator;
+    const data = "{\"content\":[{\"type\":\"text\",\"text\":\"truncated";
+    const resp = try parseApiResponse(data, a);
+    defer if (resp.content.len > 0) a.free(resp.content);
+    // 不崩即通过(content 截到 data 末尾)。
+    try std.testing.expect(resp.content.len <= data.len);
+}
+
+test "parseApiResponse: 无 content 字段 → 空" {
+    const a = std.testing.allocator;
+    const resp = try parseApiResponse("{\"stop_reason\":\"end_turn\"}", a);
+    defer if (resp.content.len > 0) a.free(resp.content);
+    try std.testing.expect(resp.content.len == 0);
 }
 
 test "extractJsonString" {

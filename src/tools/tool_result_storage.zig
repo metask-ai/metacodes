@@ -15,6 +15,11 @@ const PREVIEW_CHARS: usize = 2000;
 pub fn maxResultChars(name: []const u8) usize {
     // Read 自己已有 256KB 文件守卫 + 行截断,不再二次落盘(避免 Read→file→Read 环)。
     if (std.mem.eql(u8, name, "Read")) return std.math.maxInt(usize);
+    // Write/Edit/NotebookEdit 结果是**结构化展示数据**(structuredPatch + gitDiff),不是
+    // 批量文本 dump。落盘会用 `{"persisted":...}` 信封替换掉 gitDiff,工具卡拿不到 diff →
+    // 退回通用折叠裸吐信封 JSON(对齐 cc:编辑结果从不落盘,模型侧只回短文本,diff 仅供展示)。
+    if (std.mem.eql(u8, name, "Write") or std.mem.eql(u8, name, "Edit") or std.mem.eql(u8, name, "NotebookEdit"))
+        return std.math.maxInt(usize);
     return DEFAULT_MAX_RESULT_CHARS;
 }
 
@@ -79,4 +84,29 @@ pub fn persistForced(
         try w.writeAll("}");
     }
     return try aw.toOwnedSlice();
+}
+
+test "maybePersist: Write/Edit/NotebookEdit 永不落盘(diff 须供工具卡展示)" {
+    const a = std.testing.allocator;
+    // 构造一个超阈值的 Edit 结果(含 gitDiff)。
+    const big = try a.alloc(u8, DEFAULT_MAX_RESULT_CHARS + 100);
+    defer a.free(big);
+    @memset(big, 'x');
+    // home_dir 非空,正常本可落盘;但 Write/Edit/NotebookEdit 被豁免 → 返 null(不改)。
+    for ([_][]const u8{ "Write", "Edit", "NotebookEdit" }) |name| {
+        const r = try maybePersist(a, name, big, "/tmp");
+        try std.testing.expect(r == null); // null = 不落盘
+    }
+}
+
+test "maybePersist: 非编辑类大结果仍落盘(回归保护)" {
+    const a = std.testing.allocator;
+    const big = try a.alloc(u8, DEFAULT_MAX_RESULT_CHARS + 100);
+    defer a.free(big);
+    @memset(big, 'x');
+    const r = try maybePersist(a, "Bash", big, "/tmp");
+    defer if (r) |p| a.free(p);
+    try std.testing.expect(r != null); // 仍落盘
+    // 信封含 persisted 标记(不再裸吐原文)。
+    try std.testing.expect(std.mem.indexOf(u8, r.?, "\"persisted\":true") != null);
 }

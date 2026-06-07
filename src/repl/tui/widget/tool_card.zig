@@ -316,7 +316,8 @@ pub fn renderResult(
     return try out.toOwnedSlice(alloc);
 }
 
-/// 右上角状态符 + 耗时(`✓ 0.4s` 右对齐)。renderResult / renderLiveDone 共用。
+/// 右上角状态符 + 耗时(`✓ 0.4s` 右对齐)。**仅 renderResult 的 transcript(Ctrl+O 历史视图)用**。
+/// 正常 scrollback 的 committed 卡(renderLiveDone)不显耗时(对齐 cc 2.1.165)。
 /// left_w:标题行左侧已占显示宽(bullet+空格+标题),用于算右对齐填充。
 /// 图标经 headerIcon 解耦(Bash 非零 exit→✗、转后台→中性)。末尾带 '\n'。
 fn appendStatusRight(
@@ -369,7 +370,11 @@ pub fn renderLiveDone(
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
 
-    // 行1:⏺ <done title> + 右对齐状态符。
+    // 行1:⏺ <done title>。**不显右对齐耗时**——对齐 cc 2.1.165:committed scrollback 卡
+    // 只有 `⏺ Ran 1 shell command` 标题,无 `✓ 0.1s`(耗时仅在运行中动态卡/spinner 上,
+    // 不进历史)。kind 的成功/失败由 ⎿ body 体现(错误结果走 renderResultBody 红字)。
+    _ = kind;
+    _ = elapsed_ms;
     const title = try toolDoneTitle(alloc, tool_name, input, content);
     defer alloc.free(title);
     try out.appendSlice(alloc, th.accent);
@@ -377,8 +382,7 @@ pub fn renderLiveDone(
     try out.appendSlice(alloc, th.reset);
     try out.append(alloc, ' ');
     try out.appendSlice(alloc, title);
-    const left_w = term.displayWidth(th.icon_act) + 1 + term.displayWidth(title);
-    try appendStatusRight(alloc, th, tool_name, content, kind, elapsed_ms, opts, left_w, &out);
+    try out.append(alloc, '\n');
 
     // 行2:⎿ 只显输入预览($ cmd / 📄 path / /pat/)。与运行中态第二行一致。
     // 长命令按宽度软折行 + 5 列悬挂缩进(对齐 cc:续行不回第 0 列,见 appendGutterWrapped)。
@@ -1908,6 +1912,26 @@ test "renderResult: ⎿ gutter + 5 列续行 + 无 ──── 分隔线(dark)"
     try capture.expectContains(s, "     line2");
     // 旧的 ──── 分隔线彻底移除。
     try testing.expect(std.mem.indexOf(u8, s, "────") == null);
+}
+
+test "renderLiveDone: committed 卡无右对齐耗时(回归:实测 cc 历史卡不显 ✓ Ns)" {
+    // 实测 bug:每条历史工具卡右侧显示 `✓ 0.1s`,cc 2.1.165 committed scrollback 卡无此耗时
+    //（耗时仅在运行中动态卡/spinner)。renderLiveDone 不该再调 appendStatusRight。
+    const th = theme_mod.dark;
+    const s = try renderLiveDone(testing.allocator, th, "Bash", "{\"command\":\"git status\"}", "ok", .ok, 1234, .{ .cols = 80 });
+    defer testing.allocator.free(s);
+    try capture.expectContains(s, "Ran 1 shell command"); // 过去式标题仍在
+    // 不含耗时(1234ms→"1.2s")也不含状态符 ✓。
+    try testing.expect(std.mem.indexOf(u8, s, "1.2s") == null);
+    try testing.expect(std.mem.indexOf(u8, s, "✓") == null);
+}
+
+test "renderLiveDone: 失败工具也不显耗时/✗(错误走 ⎿ body)" {
+    const th = theme_mod.dark;
+    const s = try renderLiveDone(testing.allocator, th, "Bash", "{\"command\":\"false\"}", "err", .err, 500, .{ .cols = 80 });
+    defer testing.allocator.free(s);
+    try testing.expect(std.mem.indexOf(u8, s, "0.5s") == null);
+    try testing.expect(std.mem.indexOf(u8, s, "✗") == null);
 }
 
 test "renderResult: monochrome 用 ASCII gutter(\\)而非 unicode" {

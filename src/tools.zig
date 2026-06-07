@@ -265,6 +265,7 @@ pub const registry: []const ToolEntry = &.{
                         .items_props = &.{
                             .{ .name = "label", .type = "string", .description = "Display text the user selects. Concise (1-5 words)." },
                             .{ .name = "description", .type = "string", .description = "Explanation of what this option means / its trade-offs." },
+                            .{ .name = "preview", .type = "string", .description = "Optional ASCII/markdown mockup shown side-by-side when this option is focused (single-select only). Use for layouts/code/diagram comparisons." },
                         },
                         .items_required = &.{ "label", "description" },
                     },
@@ -277,14 +278,16 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "EnterPlanMode",
-        .description = "Enter plan mode: read-only tools are allowed, write/exec are denied. Use when you want to analyze and propose before acting.",
+        .description = "Enter plan mode to research and design before implementing. Use this tool PROACTIVELY at the start of any non-trivial task — new features, multi-file changes, refactors, architectural decisions, anything with multiple valid approaches, or when the user asks for a plan/design. In plan mode only read-only tools (Read/Grep/Glob) are allowed; write/exec are denied, so you investigate first, then call ExitPlanMode with your plan for the user to approve. Skip it only for trivial one-line fixes or pure questions. When in doubt, prefer entering plan mode — getting sign-off before writing code prevents wasted work.",
         .input_schema = .{ .type = "object", .properties = null, .required = &.{} },
         .execute = plan_mode_tool.executeEnter,
     },
     .{
         .name = "ExitPlanMode",
-        .description = "Exit plan mode, restoring the previous permission mode. Use after the user has approved the plan.",
-        .input_schema = .{ .type = "object", .properties = null, .required = &.{} },
+        .description = "Present your plan and request approval to exit plan mode. Shows the plan to the user in an approval dialog: they choose to proceed (restores execution mode), proceed with auto-accept edits, or keep planning. Only call this once you have a complete plan. Pass the plan as markdown in the `plan` field so the user can review it. If rejected, keep refining and call again.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "plan", .type = "string", .description = "The plan to present to the user for approval, as concise markdown." },
+        }, .required = &.{} },
         .execute = plan_mode_tool.executeExit,
     },
     .{

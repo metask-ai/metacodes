@@ -84,6 +84,9 @@ pub const RenderRegion = struct {
     md_buf: std.ArrayList(u8) = .empty,
     md_state: @import("../render.zig").StreamState = .{},
     md_at_segment_start: bool = true, // 段首行用 ⏺ 前缀,续行用缩进
+    /// plan 模式:位于 <proposed_plan>...</proposed_plan> 块内(块内容不进 scrollback,
+    /// 计划由审批框单独展示;对齐 mecode strip_proposed_plan_blocks)。
+    in_proposed_plan: bool = false,
 
     // markdown 表格累积(GFM):流式逐行到达,需缓冲整块再渲染(对齐 cc 框线)。
     tbl_rows: std.ArrayList([]u8) = .empty, // 原始行 owned dup(含分隔行)
@@ -909,6 +912,7 @@ pub const RenderRegion = struct {
         self.md_buf.clearRetainingCapacity();
         self.md_state = .{};
         self.md_at_segment_start = true;
+        self.in_proposed_plan = false; // 新一轮助手文本,重置 plan 块状态
         self.resetTableLocked();
     }
 
@@ -945,6 +949,20 @@ pub const RenderRegion = struct {
     /// 表格识别须前瞻分隔行,但流式逐行到达 → pipe 行先当暂定表头,下行确认或回滚。
     fn handleAssistantLine(self: *RenderRegion, line: []const u8) void {
         const md_render = @import("../render.zig");
+
+        // <proposed_plan> 块过滤:整行标签开/闭块,块内容不显示(计划走审批框)。
+        // 不在 code-block 内才识别(代码块里出现同名行按字面)。对齐 mecode 整行匹配规则。
+        if (!self.md_state.in_code_block) {
+            const t = std.mem.trim(u8, line, " \t\r");
+            if (!self.in_proposed_plan and std.mem.eql(u8, t, "<proposed_plan>")) {
+                self.in_proposed_plan = true;
+                return; // 吞标签行
+            }
+            if (self.in_proposed_plan) {
+                if (std.mem.eql(u8, t, "</proposed_plan>")) self.in_proposed_plan = false;
+                return; // 吞块内容 + 闭标签行
+            }
+        }
 
         if (self.in_table) {
             if (self.tbl_unconfirmed) {

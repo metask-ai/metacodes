@@ -104,6 +104,9 @@ test "L2 回归锚点: 核心工具的具名字段+类型(人读快照)" {
     // Bash / Grep
     try std.testing.expect(std.mem.indexOf(u8, body, "\"command\":{\"type\":\"string\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"pattern\":{\"type\":\"string\"") != null);
+    // ExitPlanMode 的 plan 字段(可选,但必须序列化进请求体,模型才知道该传计划摘要)。
+    // 实测 bug:plan 曾误设 required → 模型不传就被 validateRequired 拦死;改可选后仍须可见。
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"plan\":{\"type\":\"string\"") != null);
     // 不应再出现"required 点名字段但 properties 空 {}"的自相矛盾形态
     try std.testing.expect(std.mem.indexOf(u8, body, "\"properties\":{\"") != null);
 }

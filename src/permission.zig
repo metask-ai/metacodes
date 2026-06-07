@@ -45,6 +45,8 @@ pub const PermissionContext = struct {
     auto_allow_bash_if_sandboxed: bool = false,
     /// PreToolUse hook 集合(从 settings.hooks.PreToolUse 解析)。
     hooks: ?*const @import("permission/hooks.zig").HookSet = null,
+    /// 当前 session plan 文件全路径(plan 模式特许写;App init 时算,挂此处)。空串=无。
+    plan_file_path: []const u8 = "",
 
     /// 读 mode(acquire:看到其它线程的 setMode release 写)。
     pub fn modeValue(self: *const PermissionContext) types.PermissionMode {
@@ -71,6 +73,7 @@ pub fn checkPermission(ctx: *const PermissionContext, tool_name: []const u8, arg
         .auto_allow_bash_if_sandboxed = ctx.auto_allow_bash_if_sandboxed,
         .hooks = ctx.hooks,
         .hook_allocator = ctx.allocator,
+        .plan_file_path = ctx.plan_file_path,
     };
     return decision_mod.check(&d_ctx, tool_name, args);
 }

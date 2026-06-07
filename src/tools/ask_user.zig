@@ -34,11 +34,14 @@ fn optionDesc(o: std.json.Value) []const u8 {
     return if (dv == .string) dv.string else "";
 }
 
+fn optionPreview(o: std.json.Value) []const u8 {
+    if (o != .object) return "";
+    const pv = o.object.get("preview") orelse return "";
+    return if (pv == .string) pv.string else "";
+}
+
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
-
-    // 非 TTY 且应答队列从未加载 → 拒绝(否则会吞掉 pipe 输入或死等)。
-    if (std.c.isatty(0) == 0 and !answer_queue.wasLoaded()) return error.NotATty;
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, args, .{});
     defer parsed.deinit();
@@ -46,6 +49,20 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     if (root != .object) return error.InvalidArgs;
     const qs_v = root.object.get("questions") orelse return error.MissingQuestions;
     if (qs_v != .array) return error.InvalidArgs;
+    // 问题数 1-4(对齐 cc AskUserQuestionTool z.array().min(1).max(4))。**参数校验先于 tty/环境检查**:
+    // 否则超量问题漏进 dialog,>MAX_Q(8) 时 run() 错误地 return InputAborted——把"参数超限"
+    // 伪装成"用户取消"(真 tty bug:9 问场景模型逐餐拆 → InputAborted,工具静默失败降级文本)。
+    if (qs_v.array.items.len < 1 or qs_v.array.items.len > 4) {
+        if (ctx.error_detail) |slot| slot.* = std.fmt.allocPrint(
+            allocator,
+            "AskUserQuestion accepts 1-4 questions but got {d}. Merge related items into a single question (use multiSelect for multi-pick) or split into separate tool calls of ≤4 questions each.",
+            .{qs_v.array.items.len},
+        ) catch null;
+        return error.TooManyQuestions;
+    }
+
+    // 非 TTY 且应答队列从未加载 → 拒绝(否则会吞掉 pipe 输入或死等)。
+    if (std.c.isatty(0) == 0 and !answer_queue.wasLoaded()) return error.NotATty;
 
     var answers = std.ArrayList([]const u8).empty;
     defer {
@@ -70,8 +87,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     } else {
         // 交互路径:校验 + 构造 []AskQuestion,经回调让 TUI backend(主线程)渲染可交互对话框。
         // 回调缺失(headless/WriterBackend/单测)→ NotATty(与非 tty 拒绝语义一致)。
-        const ask_fn = ctx.ask_question_fn orelse return error.NotATty;
-        const ask_state = ctx.ask_question_state orelse return error.NotATty;
+        if (ctx.ui_request_fn == null or ctx.ui_request_state == null) return error.NotATty;
 
         var qlist = std.ArrayList(AskQuestion).empty;
         defer qlist.deinit(allocator);
@@ -80,7 +96,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             var opts = std.ArrayList(AskOption).empty;
             errdefer opts.deinit(allocator);
             for (options_v.array.items) |o| {
-                try opts.append(allocator, .{ .label = try optionLabel(o), .description = optionDesc(o) });
+                try opts.append(allocator, .{ .label = try optionLabel(o), .description = optionDesc(o), .preview = optionPreview(o) });
             }
             try qlist.append(allocator, .{
                 .question = q_v.object.get("question").?.string, // validateQuestion 已确保 .string
@@ -91,7 +107,30 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         }
         defer for (qlist.items) |q| allocator.free(@constCast(q.options));
 
-        try ask_fn(ask_state, allocator, qlist.items, &answers);
+        // 统一 UI 请求:发 .ask_question,backend 渲染对话框,返回选中 label(s)(owned)。
+        const ui_request = @import("../repl/ui_request.zig");
+        const req = ui_request.UiRequest{ .ask_question = qlist.items };
+        var resp: ui_request.UiResponse = undefined;
+        _ = try ctx.requestUi(allocator, &req, &resp);
+        // resp.answers owned by allocator → 转移进 answers(后续序列化用),用完统一 free。
+        switch (resp) {
+            .answers => |arr| {
+                defer allocator.free(arr); // 释放外层 slice(元素所有权转移给 answers)
+                for (arr) |ans| try answers.append(allocator, ans);
+            },
+            else => return error.NotATty, // backend 返回了非预期 tag(不该发生)
+        }
+    }
+
+    // "Chat about this" 哨兵:用户选择放弃结构化问答转自由回复(对齐 cc onRespondToClaude)。
+    // 任一答案是哨兵 → 不把它当答案塞模型,返回一句话提示让模型等用户自由输入。
+    const ask_dialog = @import("../repl/tui/dialog/ask_question.zig");
+    for (answers.items) |a| {
+        if (std.mem.eql(u8, a, ask_dialog.CHAT_SENTINEL)) {
+            return try allocator.dupe(u8,
+                \\{"user_chose_free_response":true,"note":"User dismissed the structured question to reply in their own words. Wait for their next message; do not re-ask."}
+            );
+        }
     }
 
     // 序列化 answers
@@ -184,11 +223,63 @@ fn resolveAnswer(picked: []const u8, options: []const std.json.Value, multi: boo
 // Tests
 // ============================================================================
 
+test "AskUserQuestion: >4 问 → TooManyQuestions(早失败,不漏进 dialog 变 InputAborted)" {
+    // 真 tty bug:9 问场景 run() 返 InputAborted,模型误解为"用户取消/环境不支持"降级文本。
+    // 修:工具层校验 1-4 问(对齐 cc z.array().min(1).max(4)),超限清晰报错让模型重组。
+    const a = std.testing.allocator;
+    answer_queue.load("1"); // 即便有应答队列,也应在校验阶段早失败(校验先于队列消费)。
+    defer answer_queue.resetForTest();
+    var err_detail: ?[]const u8 = null;
+    const ctx = ToolContext{ .allocator = a, .error_detail = &err_detail };
+    // 5 个问题(>4)。
+    const args =
+        \\{"questions":[
+        \\{"question":"q1","options":[{"label":"a"},{"label":"b"}]},
+        \\{"question":"q2","options":[{"label":"a"},{"label":"b"}]},
+        \\{"question":"q3","options":[{"label":"a"},{"label":"b"}]},
+        \\{"question":"q4","options":[{"label":"a"},{"label":"b"}]},
+        \\{"question":"q5","options":[{"label":"a"},{"label":"b"}]}]}
+    ;
+    try std.testing.expectError(error.TooManyQuestions, execute(&ctx, args));
+    // 富 detail 写入,含上限提示(模型可见,引导合并/拆分)。
+    try std.testing.expect(err_detail != null);
+    defer if (err_detail) |d| a.free(@constCast(d));
+    try std.testing.expect(std.mem.indexOf(u8, err_detail.?, "1-4 questions") != null);
+}
+
+test "AskUserQuestion: 0 问 → TooManyQuestions(min 1)" {
+    const a = std.testing.allocator;
+    var err_detail: ?[]const u8 = null;
+    const ctx = ToolContext{ .allocator = a, .error_detail = &err_detail };
+    defer if (err_detail) |d| a.free(@constCast(d));
+    try std.testing.expectError(error.TooManyQuestions, execute(&ctx, "{\"questions\":[]}"));
+}
+
+test "AskUserQuestion: 恰好 4 问通过校验(边界,经应答队列)" {
+    const a = std.testing.allocator;
+    answer_queue.load("1"); // 队列只 1 项,其余 3 问走"队列耗尽→首选项兜底"路径(不读 fd)。
+    defer answer_queue.resetForTest();
+    const ctx = ToolContext{ .allocator = a };
+    const args =
+        \\{"questions":[
+        \\{"question":"q1","options":[{"label":"a1"},{"label":"b1"}]},
+        \\{"question":"q2","options":[{"label":"a2"},{"label":"b2"}]},
+        \\{"question":"q3","options":[{"label":"a3"},{"label":"b3"}]},
+        \\{"question":"q4","options":[{"label":"a4"},{"label":"b4"}]}]}
+    ;
+    const out = try execute(&ctx, args); // 不应 TooManyQuestions
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"answers\"") != null);
+}
+
 test "AskUserQuestion rejects non-tty" {
-    // zig test 环境不是 tty，execute 应返 NotATty
+    // zig test 环境不是 tty，合法参数(1 问)应返 NotATty(参数校验通过后才到 tty 检查)。
     const a = std.testing.allocator;
     const ctx = ToolContext{ .allocator = a };
-    try std.testing.expectError(error.NotATty, execute(&ctx, "{\"questions\":[]}"));
+    const args =
+        \\{"questions":[{"question":"q","options":[{"label":"a"},{"label":"b"}]}]}
+    ;
+    try std.testing.expectError(error.NotATty, execute(&ctx, args));
 }
 
 test "AskUserQuestion: 对象数组 options 经应答队列解析(单选数字)" {
@@ -241,4 +332,22 @@ test "AskUserQuestion: 字符串数组 options(旧格式)→ InvalidArgs(真实 
         \\{"questions":[{"question":"pick","options":["a","b"]}]}
     ;
     try std.testing.expectError(error.InvalidArgs, execute(&ctx, args));
+}
+
+test "AskUserQuestion: Chat about this 哨兵 → 自由回复结果(不当答案塞模型,bug2)" {
+    const a = std.testing.allocator;
+    const ask_dialog = @import("../repl/tui/dialog/ask_question.zig");
+    // 经应答队列喂哨兵(resolveAnswer 非数字/非匹配 label → 原文透传),模拟对话框选 Chat。
+    answer_queue.load(ask_dialog.CHAT_SENTINEL);
+    defer answer_queue.resetForTest();
+    const ctx = ToolContext{ .allocator = a };
+    const args =
+        \\{"questions":[{"question":"pick","options":[{"label":"apple"},{"label":"banana"}]}]}
+    ;
+    const out = try execute(&ctx, args);
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "user_chose_free_response") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"answers\"") == null); // 绝不把哨兵当 answer 输出
+    // 哨兵本身(含 NUL)不得泄漏进结果。
+    try std.testing.expect(std.mem.indexOf(u8, out, ask_dialog.CHAT_SENTINEL) == null);
 }

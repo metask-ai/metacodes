@@ -292,6 +292,57 @@ pub fn restoreMode(fd: std.c.fd_t, orig: std.c.termios) void {
     _ = std.c.tcsetattr(fd, std.posix.TCSA.FLUSH, &orig);
 }
 
+/// 把 `current` 写临时文件,开 $VISUAL/$EDITOR(前台阻塞)编辑,读回(owned,去尾换行)。
+/// 调用方负责终端模式:本函数 spawn 的编辑器自管 termios,但调用方应在调用前退 raw / 调用后重进。
+/// REPL 主循环(loop.zig Ctrl+G)和 AskUserQuestion preview note(ask_question.zig ctrl+g)共用。
+pub fn externalEdit(allocator: std.mem.Allocator, current: []const u8) ![]u8 {
+    const editor_env = std.c.getenv("VISUAL") orelse std.c.getenv("EDITOR") orelse return error.NoEditor;
+    const editor_cmd = std.mem.span(editor_env);
+
+    const tmp_path = "/tmp/cc-zig-edit-buffer.txt";
+    {
+        const fd = std.c.open(tmp_path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        if (fd < 0) return error.WriteFailed;
+        defer _ = std.c.close(fd);
+        if (current.len > 0) _ = std.c.write(fd, current.ptr, current.len);
+    }
+
+    const path_z = try allocator.dupeZ(u8, tmp_path);
+    defer allocator.free(path_z);
+    var argv = [_]?[*:0]const u8{ "/bin/sh", "-c", undefined, null };
+    const sh_cmd = try std.fmt.allocPrintSentinel(allocator, "{s} {s}", .{ editor_cmd, tmp_path }, 0);
+    defer allocator.free(sh_cmd);
+    argv[2] = sh_cmd.ptr;
+
+    const pid = std.c.fork();
+    if (pid == 0) {
+        _ = std.c.execve("/bin/sh", @ptrCast(&argv), @ptrCast(std.c.environ));
+        std.c._exit(127);
+    } else if (pid < 0) {
+        return error.ForkFailed;
+    }
+    var status: c_int = 0;
+    _ = std.c.waitpid(pid, &status, 0);
+
+    const rfd = std.c.open(path_z.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (rfd < 0) return error.ReadFailed;
+    defer _ = std.c.close(rfd);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.read(rfd, &buf, buf.len);
+        if (n <= 0) break;
+        try out.appendSlice(allocator, buf[0..@intCast(n)]);
+    }
+    _ = std.c.unlink(path_z.ptr);
+    var result = try out.toOwnedSlice(allocator);
+    if (result.len > 0 and result[result.len - 1] == '\n') {
+        result = try allocator.realloc(result, result.len - 1);
+    }
+    return result;
+}
+
 // ============================================================================
 // LineEditor：buffer + cursor，按 Key 产生 Action
 // ============================================================================

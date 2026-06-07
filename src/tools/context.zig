@@ -28,6 +28,8 @@ const DynRegistry = @import("dynamic.zig").DynRegistry;
 pub const AskOption = struct {
     label: []const u8,
     description: []const u8,
+    /// 单选 preview 内容(ASCII/markdown mockup),空=无。选中时右侧 side-by-side 框展示。
+    preview: []const u8 = "",
 };
 pub const AskQuestion = struct {
     question: []const u8,
@@ -93,6 +95,11 @@ pub const ToolContext = struct {
     cwd_abs: []const u8 = "",
     /// HOME(sandbox profile ~/ 展开)。
     home_dir: []const u8 = "",
+    /// 当前 session plan 文件全路径(ExitPlanMode 模型未传 plan 时从此读回兜底)。空=无。
+    plan_file_path: []const u8 = "",
+    /// 末轮助手消息里提取的 `<proposed_plan>` 内容(agent_loop 在 plan 模式末轮填;
+    /// ExitPlanMode 优先读它作为计划来源)。空=本轮无 proposed_plan。借用 conversation 内存。
+    last_proposed_plan: []const u8 = "",
     /// Subagent 定义集合(Task 工具据此找 subagent_type → AgentDef)。
     agents: ?*const @import("../agents/set.zig").AgentSet = null,
     /// 父 model(供 subagent model 字段 `inherit` 解析)。
@@ -124,18 +131,20 @@ pub const ToolContext = struct {
     progress_tool_id: []const u8 = "",
     progress_fn: ?*const fn (state: *anyopaque, id: []const u8, phase: ProgressPhase, text: []const u8, count: u32) void = null,
 
-    /// AskUserQuestion 交互回调:工具(主线程)把校验好的 questions 交给 TUI backend,
-    /// backend 停 watcher + 持渲染锁 + 独占 fd0 渲染可交互对话框,把选中的 label(s) append 进
-    /// out_answers(每问一条,多选用 ", " 拼接;owned by allocator,caller free)。
-    /// state 指向 *TuiBackend(经 trampoline)。null = 无 TUI(headless/单测/子 agent)→ 工具回退 NotATty。
-    /// questions 借用(工具栈上构造,回调同步消费,不跨调用持有)。
-    ask_question_state: ?*anyopaque = null,
-    ask_question_fn: ?*const fn (
-        state: *anyopaque,
-        allocator: std.mem.Allocator,
-        questions: []const AskQuestion,
-        out_answers: *std.ArrayList([]const u8),
-    ) anyerror!void = null,
+    /// 统一 UI 请求回调(替代旧 ask_question_fn / exit_plan_fn / 权限 dialog_runner 三套)。
+    /// 工具(主线程)构造一个 UiRequest 交给 TUI backend,backend 停 watcher + 持渲染锁 +
+    /// 独占 fd0 渲染对应对话框,把用户选择写回 out。state 指向 *TuiBackend(经 trampoline)。
+    /// null = 无 TUI(headless/单测/子 agent)→ 各工具按语义兜底(ask→NotATty;plan→answer_queue/reject)。
+    /// req/out 借用(回调同步消费);ask_question 的 answers slice owned by allocator(caller free)。
+    ui_request_state: ?*anyopaque = null,
+    ui_request_fn: ?@import("../repl/ui_request.zig").UiRequestFn = null,
+
+    /// ExitPlanMode 审批结果(对齐 cc 三选项)。
+    /// - approve_default:批准 → 恢复进 plan 前的原模式(通常 default),模型继续执行。
+    /// - approve_accept_edits:批准并自动接受编辑 → 切 accept_edits。
+    /// - reject:留在 plan 模式,模型继续打磨计划(不执行)。
+    pub const PlanApproval = enum { approve_default, approve_accept_edits, reject };
+
 
     /// 工具进度阶段(对齐 cc WebSearchProgress 两态)。
     pub const ProgressPhase = enum { query_update, results_received };
@@ -146,6 +155,20 @@ pub const ToolContext = struct {
         if (self.progress_fn) |f| {
             if (self.progress_state) |st| f(st, self.progress_tool_id, phase, text, count);
         }
+    }
+
+    /// 发一个统一 UI 请求(同步阻塞)。有回调 + state → 调它写 out 返回 true;否则返回 false
+    /// (调用方按语义兜底:ask→NotATty;plan→answer_queue/reject)。req/out 调用方栈上提供。
+    pub fn requestUi(
+        self: *const ToolContext,
+        allocator: std.mem.Allocator,
+        req: *const @import("../repl/ui_request.zig").UiRequest,
+        out: *@import("../repl/ui_request.zig").UiResponse,
+    ) anyerror!bool {
+        const f = self.ui_request_fn orelse return false;
+        const st = self.ui_request_state orelse return false;
+        try f(st, allocator, req, out);
+        return true;
     }
 
     /// 便利构造：只需 allocator 的场景（大多数单元测试）。
