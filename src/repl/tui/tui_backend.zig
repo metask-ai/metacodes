@@ -31,8 +31,8 @@
 
 const std = @import("std");
 const render_region = @import("render_region.zig");
-const ui_backend = @import("../ui_backend.zig");
-const ui_event = @import("../ui_event.zig");
+const ui_backend = @import("../../core/protocol/ui_backend.zig");
+const ui_event = @import("../../core/protocol/ui_event.zig");
 const msg_queue = @import("../msg_queue.zig");
 const abort = @import("../../util/abort.zig");
 const util_time = @import("../../util/time.zig");
@@ -47,7 +47,7 @@ const ask_dialog = @import("dialog/ask_question.zig");
 const perm_dialog = @import("dialog/permission.zig");
 const exit_plan_dialog = @import("dialog/exit_plan_mode.zig");
 const tool_ctx = @import("../../tools/context.zig");
-const ui_request = @import("../ui_request.zig");
+const ui_request = @import("../../core/protocol/ui_request.zig");
 
 const RenderRegion = render_region.RenderRegion;
 const Theme = theme_mod.Theme;

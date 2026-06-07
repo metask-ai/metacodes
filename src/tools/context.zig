@@ -123,7 +123,7 @@ pub const ToolContext = struct {
     ) anyerror!?@import("worktree.zig").WorktreeEntry = null,
     /// MCP session 列表(ListMcpResourcesTool / ReadMcpResourceTool 用)。
     /// 不直接 import app.zig(防循环);用 anytype pointer 转译。
-    mcp_sessions: ?*const []@import("../app.zig").McpSessionEntry = null,
+    mcp_sessions: ?*const []@import("../core/mcp_session.zig").McpSessionEntry = null,
     /// Cron registry(CronCreate/Delete/List 用)。
     cron_registry: ?*@import("../core/cron_registry.zig").CronRegistry = null,
     /// 工具执行期进度回调(对齐 cc onProgress):工具(如 WebSearch 子请求)在执行**中**
@@ -140,7 +140,7 @@ pub const ToolContext = struct {
     /// null = 无 TUI(headless/单测/子 agent)→ 各工具按语义兜底(ask→NotATty;plan→answer_queue/reject)。
     /// req/out 借用(回调同步消费);ask_question 的 answers slice owned by allocator(caller free)。
     ui_request_state: ?*anyopaque = null,
-    ui_request_fn: ?@import("../repl/ui_request.zig").UiRequestFn = null,
+    ui_request_fn: ?@import("../core/protocol/ui_request.zig").UiRequestFn = null,
 
     /// ExitPlanMode 审批结果(对齐 cc 三选项)。
     /// - approve_default:批准 → 恢复进 plan 前的原模式(通常 default),模型继续执行。
@@ -165,8 +165,8 @@ pub const ToolContext = struct {
     pub fn requestUi(
         self: *const ToolContext,
         allocator: std.mem.Allocator,
-        req: *const @import("../repl/ui_request.zig").UiRequest,
-        out: *@import("../repl/ui_request.zig").UiResponse,
+        req: *const @import("../core/protocol/ui_request.zig").UiRequest,
+        out: *@import("../core/protocol/ui_request.zig").UiResponse,
     ) anyerror!bool {
         const f = self.ui_request_fn orelse return false;
         const st = self.ui_request_state orelse return false;

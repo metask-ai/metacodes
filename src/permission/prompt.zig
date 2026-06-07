@@ -1,15 +1,14 @@
 //! 用户交互:权限询问(prompt 模式的 yes/always/no/don't-ask)。
 //!
-//! TTY 下走 TUI 对话框(tui/dialog/permission.zig);非 TTY 退回最简文字 prompt。
+//! 已设注入的 UI runner(TuiBackend 经 setDialogRunner)→ 发 .permission UiRequest 让前端渲染;
+//! 无 runner → 退回最简文字 prompt。**不直接依赖任何 TUI 对话框**(库可在无 UI 时复用)。
 //!
 //! "Yes always" / "Don't ask again" 的 session 级记忆:本模块用一个进程级 SessionRules
 //! 暂存(同 tool_name 不再问)。完整 settings.local.json 持久化由 App 层做(它知道文件路径)。
 
 const std = @import("std");
 const category = @import("category.zig");
-const dialog = @import("../repl/tui/dialog/permission.zig");
-const theme_mod = @import("../repl/tui/theme.zig");
-const term = @import("../repl/tui/term.zig");
+const PermissionChoice = @import("../core/protocol/permission_choice.zig").PermissionChoice;
 
 /// Session 级权限记忆:always-allow / session-deny 的工具名集合。
 /// 进程级(单 session),不持久化。键是 tool_name(值语义拷贝,固定上限避免无限增长)。
@@ -42,10 +41,9 @@ pub fn setPersistContext(project_dir: ?[]const u8, home: []const u8) void {
 }
 
 /// 可选的统一 UI 请求 runner 注入:有 TuiBackend 时,loop.zig 把它设成 backend 的
-/// uiRequestTrampoline(终端接管 + 按 tag 分派)。null = 没设 → ask() 回退裸 dialog.prompt。
+/// uiRequestTrampoline(终端接管 + 按 tag 分派)。null = 没设 → ask() 回退文字 prompt。
 /// 与 ask_question/plan_approval 共用同一回调(三套 UI 请求已统一)。
-const PermissionChoice = dialog.PermissionChoice;
-const ui_request = @import("../repl/ui_request.zig");
+const ui_request = @import("../core/protocol/ui_request.zig");
 var g_ui_runner: ?ui_request.UiRequestFn = null;
 var g_ui_runner_state: ?*anyopaque = null;
 
@@ -82,14 +80,11 @@ pub fn ask(tool_name: []const u8, args: []const u8) !bool {
         return askText(tool_name, args);
     }
 
-    // TTY → 对话框
-    if (term.isatty(0)) {
-        const cap = term.detectFromEnv(1);
-        const th = theme_mod.select(.auto, cap);
+    // TTY + 已注入 runner → 经 UiRequest 让前端(TuiBackend)渲染对话框。
+    // 无 runner(库消费者未接 UI / 无 watcher 场景)→ 落到下方文字 prompt。
+    if ((std.c.isatty(0) != 0)) {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        // 有注入的 runner(TuiBackend 终端接管)→ 发 .permission UiRequest(停 watcher+持锁);
-        // 否则裸 dialog.prompt(无 watcher 场景)。两者返回同一 PermissionChoice。
         const choice_opt: ?PermissionChoice = blk: {
             if (g_ui_runner) |runner| {
                 const req = ui_request.UiRequest{ .permission = .{ .tool = tool_name, .args = args } };
@@ -100,7 +95,7 @@ pub fn ask(tool_name: []const u8, args: []const u8) !bool {
                     else => null,
                 };
             }
-            break :blk dialog.prompt(arena.allocator(), th, tool_name, args);
+            break :blk null; // 无 runner → 落文字 prompt(不再裸调 TUI dialog)
         };
         if (choice_opt) |choice| {
             switch (choice) {

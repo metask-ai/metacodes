@@ -20,16 +20,8 @@ const layout = @import("../layout.zig");
 const term = @import("../term.zig");
 const Theme = theme_mod.Theme;
 
-pub const PermissionChoice = enum {
-    /// 本次允许
-    allow_once,
-    /// 永久允许该工具(写 settings.local.json)
-    allow_always,
-    /// 本次拒绝
-    deny_once,
-    /// 该 session 不再询问该工具(临时 deny 规则)
-    deny_tool_session,
-};
+/// PermissionChoice 已移到中立协议位置(core/protocol/);此处 re-export 保 UI 端引用兼容。
+pub const PermissionChoice = @import("../../../core/protocol/permission_choice.zig").PermissionChoice;
 
 pub const Option = struct {
     key: u8, // 'y' / 'a' / 'n' / 'd'

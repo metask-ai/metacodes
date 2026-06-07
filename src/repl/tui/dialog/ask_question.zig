@@ -41,7 +41,8 @@ const CURSOR_BLOCK_ASCII = "_";
 
 /// Chat about this 选中提交时返回的哨兵(对齐 cc onRespondToClaude:取消结构化问答转自由回复)。
 /// 上层 ask_user/agent_loop 识别此值 → 不把它当答案塞给模型(留空答案,用户自由输入)。
-pub const CHAT_SENTINEL = "\x00__cc_chat_about_this__";
+/// 已移到中立协议位置;此处 re-export 保 UI 端引用兼容。
+pub const CHAT_SENTINEL = @import("../../../core/protocol/chat_sentinel.zig").CHAT_SENTINEL;
 
 fn isUnicode(th: Theme) bool {
     // mono 主题 box_h = "-"(ASCII);其余 = "─"(unicode)。借此判降级。

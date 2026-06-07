@@ -107,6 +107,42 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(replay_exe);
 
+    // ── metacodes-core 可复用库 module(root=src/lib.zig,UI 图不可达)──────────
+    // 供其他 Zig 项目经 build.zig.zon 依赖 `@import("metacodes-core")`。
+    // 经 tools/* 用 tree-sitter → 必须 addTreeSitter。
+    const core_mod = b.addModule("metacodes-core", .{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addTreeSitter(b, core_mod);
+
+    // test:lib —— 编译库全图(refAllDeclsRecursive),绿即证库与 UI 物理隔离。
+    const core_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addTreeSitter(b, core_test_mod);
+    const core_test = b.addTest(.{ .name = "metacodes-core-test", .root_module = core_test_mod });
+    const core_test_step = b.step("test:lib", "Test/compile the metacodes-core library module (proves UI isolation)");
+    core_test_step.dependOn(&b.addRunArtifact(core_test).step);
+
+    // example —— 独立消费者,经 module 用库跑一轮 agent loop(见 example/main.zig)。
+    const example_mod = b.createModule(.{
+        .root_source_file = b.path("example/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    example_mod.addImport("metacodes-core", core_mod);
+    // 注:不在 example_mod 上 addTreeSitter —— C 对象随 core_mod 传入,重复接会 duplicate symbol。
+    const example_exe = b.addExecutable(.{ .name = "example", .root_module = example_mod });
+    const example_step = b.step("example", "Build & run the metacodes-core example");
+    example_step.dependOn(&b.addRunArtifact(example_exe).step);
+
     const run_step = b.step("run", "Run the release app");
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);

@@ -119,7 +119,7 @@ pub fn executeExit(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     // 决定审批结果:① 统一 UI 请求弹框;② answer_queue 兜底;③ 安全默认 reject(留 plan)。
     var choice: PlanApproval = .reject;
-    const ui_request = @import("../repl/ui_request.zig");
+    const ui_request = @import("../core/protocol/ui_request.zig");
     const req = ui_request.UiRequest{ .plan_approval = .{ .plan_md = plan_md } };
     var resp: ui_request.UiResponse = undefined;
     if (try ctx.requestUi(ctx.allocator, &req, &resp)) {
@@ -198,8 +198,8 @@ var g_mock_seen_len: usize = 0;
 fn mockUiRequestFn(
     state: *anyopaque,
     allocator: std.mem.Allocator,
-    req: *const @import("../repl/ui_request.zig").UiRequest,
-    out: *@import("../repl/ui_request.zig").UiResponse,
+    req: *const @import("../core/protocol/ui_request.zig").UiRequest,
+    out: *@import("../core/protocol/ui_request.zig").UiResponse,
 ) anyerror!void {
     _ = state;
     _ = allocator;

@@ -17,8 +17,8 @@
 //! poll → 恒 null(print-only sink 无输入端)。
 
 const std = @import("std");
-const ui_backend = @import("../repl/ui_backend.zig");
-const ui_event = @import("../repl/ui_event.zig");
+const ui_backend = @import("protocol/ui_backend.zig");
+const ui_event = @import("protocol/ui_event.zig");
 
 const CoreEvent = ui_event.CoreEvent;
 const UiEvent = ui_event.UiEvent;

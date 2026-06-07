@@ -24,8 +24,8 @@
 //!   colorize 闭括号 print("\x1b[0m\n")  → emit(.stream_done)
 
 const std = @import("std");
-const api_stream = @import("../api/stream.zig");
-const abort = @import("../util/abort.zig");
+const api_stream = @import("../../api/stream.zig");
+const abort = @import("../../util/abort.zig");
 
 /// UI 当前所处阶段(对齐 RenderRegion 的 generating/input 双态)。
 pub const Phase = enum(u8) {

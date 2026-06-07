@@ -10,11 +10,10 @@
 //! 进程外 backend(未来 WsBackend)可序列化传输。
 
 const std = @import("std");
-const context = @import("../tools/context.zig");
-const perm_dialog = @import("tui/dialog/permission.zig");
+const context = @import("../../tools/context.zig");
 
 pub const AskQuestion = context.AskQuestion;
-pub const PermissionChoice = perm_dialog.PermissionChoice;
+pub const PermissionChoice = @import("permission_choice.zig").PermissionChoice;
 pub const PlanApproval = context.ToolContext.PlanApproval;
 
 /// UI 请求(backend → 渲染对应对话框,同步阻塞拿用户选择)。

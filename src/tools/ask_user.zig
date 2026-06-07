@@ -114,7 +114,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         defer for (qlist.items) |q| allocator.free(@constCast(q.options));
 
         // 统一 UI 请求:发 .ask_question,backend 渲染对话框,返回选中 label(s)(owned)。
-        const ui_request = @import("../repl/ui_request.zig");
+        const ui_request = @import("../core/protocol/ui_request.zig");
         const req = ui_request.UiRequest{ .ask_question = qlist.items };
         var resp: ui_request.UiResponse = undefined;
         _ = try ctx.requestUi(allocator, &req, &resp);
@@ -130,9 +130,9 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     // "Chat about this" 哨兵:用户选择放弃结构化问答转自由回复(对齐 cc onRespondToClaude)。
     // 任一答案是哨兵 → 不把它当答案塞模型,返回一句话提示让模型等用户自由输入。
-    const ask_dialog = @import("../repl/tui/dialog/ask_question.zig");
+    const chat_sentinel = @import("../core/protocol/chat_sentinel.zig");
     for (answers.items) |a| {
-        if (std.mem.eql(u8, a, ask_dialog.CHAT_SENTINEL)) {
+        if (std.mem.eql(u8, a, chat_sentinel.CHAT_SENTINEL)) {
             return try allocator.dupe(u8,
                 \\{"user_chose_free_response":true,"note":"User dismissed the structured question to reply in their own words. Wait for their next message; do not re-ask."}
             );
@@ -344,9 +344,9 @@ test "AskUserQuestion: 字符串数组 options(旧格式)→ InvalidArgs(真实 
 
 test "AskUserQuestion: Chat about this 哨兵 → 自由回复结果(不当答案塞模型,bug2)" {
     const a = std.testing.allocator;
-    const ask_dialog = @import("../repl/tui/dialog/ask_question.zig");
+    const chat_sentinel = @import("../core/protocol/chat_sentinel.zig");
     // 经应答队列喂哨兵(resolveAnswer 非数字/非匹配 label → 原文透传),模拟对话框选 Chat。
-    answer_queue.load(ask_dialog.CHAT_SENTINEL);
+    answer_queue.load(chat_sentinel.CHAT_SENTINEL);
     defer answer_queue.resetForTest();
     const ctx = ToolContext{ .allocator = a };
     const args =
@@ -357,5 +357,5 @@ test "AskUserQuestion: Chat about this 哨兵 → 自由回复结果(不当答�
     try std.testing.expect(std.mem.indexOf(u8, out, "user_chose_free_response") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"answers\"") == null); // 绝不把哨兵当 answer 输出
     // 哨兵本身(含 NUL)不得泄漏进结果。
-    try std.testing.expect(std.mem.indexOf(u8, out, ask_dialog.CHAT_SENTINEL) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, chat_sentinel.CHAT_SENTINEL) == null);
 }

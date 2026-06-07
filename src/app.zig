@@ -67,11 +67,7 @@ var g_abort_signal: ?*AbortSignal = null;
 
 /// 一个已连接 MCP server 的资源捆绑：name（owned）+ heap-allocated client + session。
 /// session 内的 binding 指针指向同一个 client；client 必须比 session 活得久。
-pub const McpSessionEntry = struct {
-    name: []u8,
-    client: *McpClient,
-    session: McpSession,
-};
+pub const McpSessionEntry = @import("core/mcp_session.zig").McpSessionEntry;
 
 pub const App = struct {
     allocator: std.mem.Allocator,

@@ -20,8 +20,8 @@ const api_stream = @import("../api/stream.zig");
 const tool_error = @import("tool_error.zig");
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
-const ui_backend = @import("../repl/ui_backend.zig");
-const ui_event = @import("../repl/ui_event.zig");
+const ui_backend = @import("protocol/ui_backend.zig");
+const ui_event = @import("protocol/ui_event.zig");
 const UiBackend = ui_backend.UiBackend;
 const CoreEvent = ui_event.CoreEvent;
 
@@ -142,15 +142,16 @@ pub const Options = struct {
     /// 统一 UI 请求回调(替代旧 ask_question/exit_plan 三套;state 指 *TuiBackend)。
     /// 仅顶层 TUI 接(agent_depth==0)——子 agent 无 tty。
     ui_request_state: ?*anyopaque = null,
-    ui_request_fn: ?@import("../repl/ui_request.zig").UiRequestFn = null,
+    ui_request_fn: ?@import("protocol/ui_request.zig").UiRequestFn = null,
     /// MCP session 列表(ListMcpResourcesTool/ReadMcpResourceTool 用)。
-    mcp_sessions: ?*const []@import("../app.zig").McpSessionEntry = null,
+    mcp_sessions: ?*const []@import("mcp_session.zig").McpSessionEntry = null,
     /// Cron registry(CronCreate/Delete/List 用)。
     cron_registry: ?*@import("cron_registry.zig").CronRegistry = null,
-    /// 实时工具卡渲染主题(REPL 用):非 null 时,每个工具执行后 emit tool_result,
+    /// 是否给每个工具执行 emit tool_start/tool_result 事件(REPL=true)。
     /// 由 backend(TuiBackend)经 renderResult 渲染(Edit diff 着色 / 搜索摘要 / Read 摘要)。
-    /// null(headless/单测)→ 不 emit 工具卡事件,保持纯净输出。
-    tool_render_theme: ?*const @import("../repl/tui/theme.zig").Theme = null,
+    /// false(headless/单测)→ 不 emit 工具卡事件,保持纯净输出。
+    /// (原 tool_render_theme: ?*const Theme,只当存在标志用;为解 core→UI 类型依赖降为 bool。)
+    emit_tool_cards: bool = false,
     /// 是否给 assistant 流式文本加 ANSI 着色(\x1b[32m…)。前台交互 REPL = true;
     /// 后台 subagent(输出经 SinkWriter 进可查询缓冲)/headless = false,否则 final_text
     /// 会混入 \x1b[32m 等控制码。
@@ -648,7 +649,7 @@ pub fn run(
         // **渲染决策(showStartCard/hasProgressCard/喂 spinner)全在 backend**——agent_loop
         // 不再 import tool_card UI widget(层泄漏修复)。headless/subagent(depth>0)/无 theme
         // 时 tool_render_theme=null → 不 emit(那些场景 WriterBackend 也 no-op)。
-        if (opts.tool_render_theme != null and opts.agent_depth == 0) {
+        if (opts.emit_tool_cards and opts.agent_depth == 0) {
             for (slots.items) |*s| {
                 if (s.decision != .run) continue;
                 backend.emitEvent(.{ .tool_start = .{ .id = s.id, .name = s.name, .input = s.input } });
@@ -664,7 +665,7 @@ pub fn run(
             }
         }
         tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
-        if (opts.tool_render_theme != null and opts.agent_depth == 0) {
+        if (opts.emit_tool_cards and opts.agent_depth == 0) {
             backend.emitEvent(.clear_current_tool);
             // 进度卡工具的清卡也无条件发(backend 据 name 自决 clearToolCard)。
             for (slots.items) |*s| {
@@ -704,7 +705,7 @@ pub fn run(
             // 实时工具卡渲染(REPL):把结果经 backend 渲染到屏幕——Edit/Write diff 着色、
             // Grep/Glob 摘要、Read 摘要。headless/单测 tool_render_theme=null → 跳过(emit 仍发,
             // 但那些场景用 WriterBackend,tool_result no-op)。渲染移入 backend(renderResult)。
-            if (opts.tool_render_theme != null) {
+            if (opts.emit_tool_cards) {
                 backend.emitEvent(.{ .tool_result = .{
                     .id = s.id,
                     .name = s.name,

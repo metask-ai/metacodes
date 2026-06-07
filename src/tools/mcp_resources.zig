@@ -192,7 +192,7 @@ test "list: missing mcp_sessions errors" {
 }
 
 test "read: missing uri errors" {
-    var sessions: []@import("../app.zig").McpSessionEntry = &.{};
+    var sessions: []@import("../core/mcp_session.zig").McpSessionEntry = &.{};
     var ctx = ToolContext.simple(testing.allocator);
     ctx.mcp_sessions = &sessions;
     try testing.expectError(error.MissingUri, readExecute(&ctx, "{}"));

@@ -131,13 +131,18 @@ pub const UiBackend = struct {
 
 ## 5. 关键文件
 
-- `src/repl/ui_event.zig` —— CoreEvent / UiEvent
-- `src/repl/ui_backend.zig` —— UiBackend vtable
+> ⚠️ 协议文件 2026-06-07 已从 `repl/`(UI 目录)移到 `core/protocol/`(中立位)——见 §8 库抽取。
+> 下列旧路径仅作历史参照;现行路径见 §8。
+
+- `src/core/protocol/ui_event.zig` —— CoreEvent / UiEvent / Phase(原 repl/ui_event.zig)
+- `src/core/protocol/ui_backend.zig` —— UiBackend vtable(原 repl/ui_backend.zig)
+- `src/core/protocol/ui_request.zig` —— UiRequest/UiResponse/UiRequestFn(原 repl/ui_request.zig)
 - `src/repl/tui/tui_backend.zig` —— TuiBackend(渲染 + 键盘 + tick)
 - `src/core/writer_backend.zig` —— WriterBackend(print-only sink)
 - `src/core/headless_backend.zig` —— HeadlessBackend(JSON 行)
 - `src/core/agent_loop.zig` —— `run(... backend: *const UiBackend ...)`,只发 CoreEvent
 - `src/repl/loop.zig` —— 编排:构造 backend、startInput/stopInput
+
 
 ## 6. 可测试性(本框架最大收益之一)
 
@@ -161,3 +166,33 @@ CoreEvent/UiEvent/UiBackend 纯数据 + 函数指针,不碰 fd。因此:
   少写代码、不碰已验证可靠的原语,也是工程能力。
 - **共享可变缓冲是坑**:backend 上挂 `line_buf` struct 字段被多分支复用 → 改栈局部
   (`var buf: [256]u8`),物理上消除跨线程撕缓冲的可能,而非靠"恰好只有主线程写"的隐式不变量。
+
+## 8. 库抽取:metacodes-core(2026-06-07)
+
+UI 解耦(A–E)证明了 agent 循环层只经 UiBackend/CoreEvent 与 UI 通信。本次把循环层正式
+**抽成独立 Zig 库 `metacodes-core`**,供其他项目复用。库对外接口契约见 `doc/LIB_API.md`。
+
+**做法(物理分离,库留原地、移协议、断泄漏)**:
+- **协议落中立位**:`ui_backend`/`ui_event`/`ui_request` 从 `repl/`(UI 目录)`git mv` 到
+  `core/protocol/`。这同时**解了循环依赖**(原 agent_loop→repl/ui_event→api/stream、
+  context→repl/ui_request→context 是环;协议进库后变协议→库单向、UI→协议+库单向)。
+- **提取纯数据**:`PermissionChoice` 枚举、`CHAT_SENTINEL` 常量从 `tui/dialog/*` 提到
+  `core/protocol/{permission_choice,chat_sentinel}.zig`(tui 侧 re-export 保兼容)。
+- **断 4 类 core→UI 泄漏**:① `McpSessionEntry` 从 app.zig 移到 `core/mcp_session.zig`;
+  ② `agent_loop.Options.tool_render_theme: ?*Theme`(UI 类型)→ `emit_tool_cards: bool`
+  (原只当存在标志用,从不解引用);③ `permission/prompt.zig` 去 3 个 tui import(裸 dialog
+  回退改文字 prompt——TUI 仍经注入的 g_ui_runner 发 .permission UiRequest,无回归);
+  ④ `tools/ask_user.zig` 去 dialog import(只为 CHAT_SENTINEL,改指中立常量)。
+- **库 root**:`src/lib.zig` re-export 库公共面(引擎/工具/协议/权限/参考 backend),
+  **不导出** repl/tui/app/main。`build.zig` 加 `b.addModule("metacodes-core")` +
+  `build.zig.zon`。
+
+**边界的编译器证明**:`zig build test:lib`(`refAllDecls` 编 lib.zig 全图)绿 = 库可达模块
+图物理够不到 UI 层。库子树 `grep '../repl|../app|../tui|tui/dialog|tui/theme|tui/term'` = 0。
+
+**关键决策**:库留原地、只移 3 协议文件(~80 行 churn,而非移 116 库文件几百处);
+`cc`=main.zig 不变(app + 52 测试零 churn);app 暂走相对路径,metacodes-core 并行供外部
++ example 用(P4 dogfood 未做——test:lib 已强制边界,P4 动 cc 聚合器风险大无新增收益)。
+
+**关键文件**:`src/lib.zig`、`src/core/protocol/*`、`src/core/mcp_session.zig`、
+`example/main.zig`、`doc/LIB_API.md`、`build.zig`(module + test:lib + example step)、`build.zig.zon`。

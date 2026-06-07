@@ -11,8 +11,8 @@
 //! poll → 恒 null(无输入端;真正的 headless 输入由上层编排,不经此 backend)。
 
 const std = @import("std");
-const ui_backend = @import("../repl/ui_backend.zig");
-const ui_event = @import("../repl/ui_event.zig");
+const ui_backend = @import("protocol/ui_backend.zig");
+const ui_event = @import("protocol/ui_event.zig");
 const log = @import("../util/log.zig");
 
 const CoreEvent = ui_event.CoreEvent;
