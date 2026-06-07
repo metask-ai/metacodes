@@ -57,6 +57,17 @@ pub fn groupFromCapture(name: []const u8) Group {
     return .none;
 }
 
+/// 覆盖优先级:cursor match 顺序不定,用它仲裁同字节多 capture。
+/// none 最低(0);variable 次低(1,通用兜底,不盖具体语义);其余具体组同高(2)。
+/// 这样 `(identifier) @variable` 绝不覆盖 @function/@type/@constant 等精确着色。
+fn groupPriority(g: Group) u8 {
+    return switch (g) {
+        .none => 0,
+        .variable => 1,
+        else => 2,
+    };
+}
+
 /// 行内字节区间 + 高亮组。start/end 是相对**行首**的字节偏移。
 pub const Span = struct { start: u32, end: u32, group: Group };
 
@@ -115,11 +126,14 @@ pub fn highlightFile(gpa: std.mem.Allocator, source: []const u8, lang: ts.Lang) 
         defer cursor.deinit();
         cursor.exec(&query, tree.root());
 
-        // 2) 遍历每个 match 的每个 capture,涂字节(后写覆盖)。
-        // 跳过带 predicate 的 pattern:基础 cursor 不求值 #match?/#eq?,这些 pattern 会
-        // 无条件命中(如 python `((identifier) @constant (#match? "^[A-Z_]+$"))` 会把所有
-        // identifier 染成 constant)。跳过后落到无条件的通用规则(如 (identifier) @variable),
-        // 着色正确。代价:少数 predicate 精修(大写常量/builtin 特判)丢失,可接受。
+        // 2) 遍历每个 match 的每个 capture,涂字节。
+        // 跳过带过滤 predicate(?结尾,如 #match?/#eq?)的 pattern:基础 cursor 不求值它们,
+        // 这类 pattern 会无条件命中(python `((identifier) @constant (#match? "^[A-Z_]+$"))`
+        // 会把所有 identifier 染成 constant)。保留 directive(#set! 等)。
+        // **优先级覆盖**(非"后写覆盖"):cursor 返回 match 的顺序按节点位置而非 pattern 文件
+        // 顺序,故同一字节会被宽松规则((identifier) @variable)和精确规则(@function/@type)
+        // 各命中一次,顺序不定。用 priority 仲裁:variable/none 最低,绝不覆盖已painted的
+        // function/type/keyword 等(对齐 tree-sitter-highlight "specific wins")。
         while (cursor.nextMatch()) |m| {
             if (query.patternHasFilterPredicate(m.pattern_index)) continue;
             const caps = m.captures[0..m.capture_count];
@@ -130,8 +144,13 @@ pub fn highlightFile(gpa: std.mem.Allocator, source: []const u8, lang: ts.Lang) 
                 const s = node.startByte();
                 const e = node.endByte();
                 if (s >= e or e > source.len) continue;
+                const gp = groupPriority(g);
                 var i: usize = s;
-                while (i < e) : (i += 1) paint[i] = g;
+                while (i < e) : (i += 1) {
+                    // 仅当新 group 优先级 >= 已有,才覆盖(同级允许覆盖=同位置后到的精确规则;
+                    // 但 variable 这类低优先级绝不盖 function/type)。
+                    if (gp >= groupPriority(paint[i])) paint[i] = g;
+                }
             }
         }
     }
@@ -247,6 +266,19 @@ test "predicate-gated capture 不过度着色(tty 实测回归:python/c identifi
         defer hl.deinit();
         try testing.expectEqual(Group.string, groupAt(&hl, 1, 10)); // "hi" 仍着色
     }
+}
+
+test "优先级覆盖:variable 不盖 function/type(tty 实测回归:Write/diff 颜色丰富度)" {
+    // 根因:cursor match 返回顺序按节点位置非 pattern 文件顺序,通用 (identifier) @variable
+    // 可能**后于**精确 @function/@type 命中同字节 → 纯"后写覆盖"把 function/type 染回 variable
+    // (Write 一个 .py 时所有标识符全成蓝 variable,颜色看着很少)。修:groupPriority 仲裁,
+    // variable 最低不盖具体组。
+    var hl = try highlightFile(testing.allocator, "def greet(name: str) -> str:\n    pass\n", .python);
+    defer hl.deinit();
+    // greet=function(定义名),str=type(注解),name=variable。
+    try testing.expectEqual(Group.function, groupAt(&hl, 1, 4)); // greet
+    try testing.expectEqual(Group.type, groupAt(&hl, 1, 17)); // str(第一个)
+    try testing.expectEqual(Group.variable, groupAt(&hl, 1, 10)); // name
 }
 
 test "textForLine 与 spansForLine 行号对齐(1-based)" {
