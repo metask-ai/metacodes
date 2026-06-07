@@ -253,7 +253,7 @@ pub const registry: []const ToolEntry = &.{
             .{
                 .name = "questions",
                 .type = "array",
-                .description = "List of questions to ask the user (1-4).",
+                .description = "List of questions to ask the user (1-9). Prefer multiSelect when the user can pick several options for one question, rather than splitting into many single-select questions.",
                 // 嵌套 schema:每个 question 是对象,options 又是 {label,description} 对象数组。
                 .items_props = &.{
                     .{ .name = "question", .type = "string", .description = "The complete question to ask. Clear, specific, ends with '?'." },

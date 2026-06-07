@@ -19,6 +19,10 @@ const ToolContext = context.ToolContext;
 const AskQuestion = context.AskQuestion;
 const AskOption = context.AskOption;
 
+/// 一次调用最多问几个问题(用户决策:放宽到 9,比 cc 的 4 宽,鼓励一次问全)。
+/// 必须 ≤ dialog 的 MAX_Q(栈数组容量);两者一起改,否则 4<nq≤MAX_Q 漏进 dialog 撞容量上限。
+pub const MAX_QUESTIONS = 9;
+
 /// 从 option 对象取 label(必有);非对象或无 label → error。
 fn optionLabel(o: std.json.Value) ![]const u8 {
     if (o != .object) return error.InvalidArgs;
@@ -49,14 +53,16 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     if (root != .object) return error.InvalidArgs;
     const qs_v = root.object.get("questions") orelse return error.MissingQuestions;
     if (qs_v != .array) return error.InvalidArgs;
-    // 问题数 1-4(对齐 cc AskUserQuestionTool z.array().min(1).max(4))。**参数校验先于 tty/环境检查**:
-    // 否则超量问题漏进 dialog,>MAX_Q(8) 时 run() 错误地 return InputAborted——把"参数超限"
-    // 伪装成"用户取消"(真 tty bug:9 问场景模型逐餐拆 → InputAborted,工具静默失败降级文本)。
-    if (qs_v.array.items.len < 1 or qs_v.array.items.len > 4) {
+    // 问题数 1-MAX_QUESTIONS。**参数校验先于 tty/环境检查**(schema-first,对齐 cc):否则超量问题
+    // 漏进 dialog,>MAX_Q 时 run() 错误地 return InputAborted——把"参数超限"伪装成"用户取消"
+    // (真 tty bug:9 问场景模型逐餐拆 → InputAborted,工具静默失败降级文本)。
+    // 放宽到 9(用户决策:比 cc 的 4 宽,鼓励一次问全;wizard 单屏只画当前问 + 导航条切换,不撑屏)。
+    // 仍设上限:对话框是单屏阻塞键盘导航,无限问会让用户在"答到第几个"里迷失。超限引导用 multiSelect。
+    if (qs_v.array.items.len < 1 or qs_v.array.items.len > MAX_QUESTIONS) {
         if (ctx.error_detail) |slot| slot.* = std.fmt.allocPrint(
             allocator,
-            "AskUserQuestion accepts 1-4 questions but got {d}. Merge related items into a single question (use multiSelect for multi-pick) or split into separate tool calls of ≤4 questions each.",
-            .{qs_v.array.items.len},
+            "AskUserQuestion accepts 1-{d} questions but got {d}. Use multiSelect to let the user pick several options in one question, merge related items, or split into separate tool calls.",
+            .{ MAX_QUESTIONS, qs_v.array.items.len },
         ) catch null;
         return error.TooManyQuestions;
     }
@@ -223,28 +229,29 @@ fn resolveAnswer(picked: []const u8, options: []const std.json.Value, multi: boo
 // Tests
 // ============================================================================
 
-test "AskUserQuestion: >4 问 → TooManyQuestions(早失败,不漏进 dialog 变 InputAborted)" {
-    // 真 tty bug:9 问场景 run() 返 InputAborted,模型误解为"用户取消/环境不支持"降级文本。
-    // 修:工具层校验 1-4 问(对齐 cc z.array().min(1).max(4)),超限清晰报错让模型重组。
+test "AskUserQuestion: >9 问 → TooManyQuestions(早失败,不漏进 dialog 变 InputAborted)" {
+    // 真 tty bug:超量问题 run() 返 InputAborted,模型误解为"用户取消/环境不支持"降级文本。
+    // 修:工具层校验 1-MAX_QUESTIONS(9),超限清晰报错让模型用 multiSelect/合并/拆分。
     const a = std.testing.allocator;
     answer_queue.load("1"); // 即便有应答队列,也应在校验阶段早失败(校验先于队列消费)。
     defer answer_queue.resetForTest();
     var err_detail: ?[]const u8 = null;
     const ctx = ToolContext{ .allocator = a, .error_detail = &err_detail };
-    // 5 个问题(>4)。
-    const args =
-        \\{"questions":[
-        \\{"question":"q1","options":[{"label":"a"},{"label":"b"}]},
-        \\{"question":"q2","options":[{"label":"a"},{"label":"b"}]},
-        \\{"question":"q3","options":[{"label":"a"},{"label":"b"}]},
-        \\{"question":"q4","options":[{"label":"a"},{"label":"b"}]},
-        \\{"question":"q5","options":[{"label":"a"},{"label":"b"}]}]}
-    ;
-    try std.testing.expectError(error.TooManyQuestions, execute(&ctx, args));
-    // 富 detail 写入,含上限提示(模型可见,引导合并/拆分)。
+    // 10 个问题(>9)。
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.appendSlice(a, "{\"questions\":[");
+    for (0..10) |i| {
+        if (i > 0) try buf.append(a, ',');
+        try buf.print(a, "{{\"question\":\"q{d}\",\"options\":[{{\"label\":\"a\"}},{{\"label\":\"b\"}}]}}", .{i});
+    }
+    try buf.appendSlice(a, "]}");
+    try std.testing.expectError(error.TooManyQuestions, execute(&ctx, buf.items));
+    // 富 detail 写入,含上限提示(模型可见,引导 multiSelect/合并/拆分)。
     try std.testing.expect(err_detail != null);
     defer if (err_detail) |d| a.free(@constCast(d));
-    try std.testing.expect(std.mem.indexOf(u8, err_detail.?, "1-4 questions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_detail.?, "1-9 questions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_detail.?, "multiSelect") != null);
 }
 
 test "AskUserQuestion: 0 问 → TooManyQuestions(min 1)" {
@@ -255,19 +262,20 @@ test "AskUserQuestion: 0 问 → TooManyQuestions(min 1)" {
     try std.testing.expectError(error.TooManyQuestions, execute(&ctx, "{\"questions\":[]}"));
 }
 
-test "AskUserQuestion: 恰好 4 问通过校验(边界,经应答队列)" {
+test "AskUserQuestion: 恰好 9 问通过校验(放宽后边界,经应答队列)" {
     const a = std.testing.allocator;
-    answer_queue.load("1"); // 队列只 1 项,其余 3 问走"队列耗尽→首选项兜底"路径(不读 fd)。
+    answer_queue.load("1"); // 队列只 1 项,其余 8 问走"队列耗尽→首选项兜底"路径(不读 fd)。
     defer answer_queue.resetForTest();
     const ctx = ToolContext{ .allocator = a };
-    const args =
-        \\{"questions":[
-        \\{"question":"q1","options":[{"label":"a1"},{"label":"b1"}]},
-        \\{"question":"q2","options":[{"label":"a2"},{"label":"b2"}]},
-        \\{"question":"q3","options":[{"label":"a3"},{"label":"b3"}]},
-        \\{"question":"q4","options":[{"label":"a4"},{"label":"b4"}]}]}
-    ;
-    const out = try execute(&ctx, args); // 不应 TooManyQuestions
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.appendSlice(a, "{\"questions\":[");
+    for (0..9) |i| { // 恰好 MAX_QUESTIONS
+        if (i > 0) try buf.append(a, ',');
+        try buf.print(a, "{{\"question\":\"q{d}\",\"options\":[{{\"label\":\"a{d}\"}},{{\"label\":\"b{d}\"}}]}}", .{ i, i, i });
+    }
+    try buf.appendSlice(a, "]}");
+    const out = try execute(&ctx, buf.items); // 不应 TooManyQuestions
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"answers\"") != null);
 }

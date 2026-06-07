@@ -66,6 +66,55 @@ pub const NavInfo = struct {
     current: usize, // 0..N-1 = 第 N 问;N = Submit 视图
 };
 
+/// 画导航条 `←  ☐ H1 ☒ H2  ✔ Submit  →`(render 与 renderSubmit 共用,避免两处实现漂移)。
+/// 全量 chip 宽超终端 → 退紧凑 `←  <当前chip>  (i/N)  ✔ Submit →`(9 问也不撑屏)。
+/// current==headers.len 时为 Submit 视图(Submit 高亮、紧凑模式不显单问 chip)。
+fn appendNavBar(alloc: std.mem.Allocator, out: *std.ArrayList(u8), th: Theme, nav: NavInfo, width: usize) !void {
+    const on_submit = nav.current == nav.headers.len;
+    // 全量 chip 宽预估:每 chip ≈ chip符(2) + 空格(1) + header可见宽(≤12) + 间隔(2);+ ← + ✔Submit + →。
+    var est: usize = 2 + 2 + 7 + 4;
+    for (nav.headers) |h| est += 3 + @min(term.displayWidth(h), 12) + 2;
+    const compact = est > width;
+
+    try out.appendSlice(alloc, th.dim);
+    try out.appendSlice(alloc, if (isUnicode(th)) "←" else "<");
+    try out.appendSlice(alloc, th.reset);
+    try out.appendSlice(alloc, "  ");
+    if (compact) {
+        if (!on_submit) {
+            try out.appendSlice(alloc, th.accent);
+            try out.appendSlice(alloc, if (isUnicode(th)) (if (nav.answered[nav.current]) CHIP_ON else CHIP_OFF) else (if (nav.answered[nav.current]) "[x]" else "[ ]"));
+            try out.append(alloc, ' ');
+            const hdr = try layout.truncate(alloc, nav.headers[nav.current], 12, "…");
+            defer if (hdr.ptr != nav.headers[nav.current].ptr) alloc.free(@constCast(hdr));
+            try out.appendSlice(alloc, hdr);
+            try out.appendSlice(alloc, th.reset);
+        }
+        try out.appendSlice(alloc, th.dim);
+        try out.print(alloc, "  ({d}/{d})  ", .{ @min(nav.current + 1, nav.headers.len), nav.headers.len });
+        try out.appendSlice(alloc, th.reset);
+    } else for (nav.headers, 0..) |h, qi| {
+        const cur = qi == nav.current;
+        if (cur) try out.appendSlice(alloc, th.accent) else try out.appendSlice(alloc, th.dim);
+        try out.appendSlice(alloc, if (isUnicode(th)) (if (nav.answered[qi]) CHIP_ON else CHIP_OFF) else (if (nav.answered[qi]) "[x]" else "[ ]"));
+        try out.append(alloc, ' ');
+        const hdr = try layout.truncate(alloc, h, 12, "…");
+        defer if (hdr.ptr != h.ptr) alloc.free(@constCast(hdr));
+        try out.appendSlice(alloc, hdr);
+        try out.appendSlice(alloc, th.reset);
+        try out.appendSlice(alloc, "  ");
+    }
+    if (on_submit) try out.appendSlice(alloc, th.accent) else try out.appendSlice(alloc, th.dim);
+    try out.appendSlice(alloc, if (isUnicode(th)) SUBMIT_MARK else "v");
+    try out.appendSlice(alloc, " Submit");
+    try out.appendSlice(alloc, th.reset);
+    try out.appendSlice(alloc, "  ");
+    try out.appendSlice(alloc, th.dim);
+    try out.appendSlice(alloc, if (isUnicode(th)) "→" else ">");
+    try out.appendSlice(alloc, th.reset);
+    try out.append(alloc, '\n');
+}
+
 /// 渲染单个问题(对齐 cc 实录:chip 行/导航条 + 底边 + 裸排问题/选项 + 底部分隔线,**不套外层 box**)。
 /// nav != null(多问):画 `←  chip… ✔ Submit  →` 导航条;nav == null(单问):画单 chip 行 + 底边。
 /// selected:当前高亮选项 index(含末尾追加的 Other/Chat 虚拟项)。
@@ -98,33 +147,7 @@ pub fn render(
 
     // ── 顶部:导航条(多问)/ chip 行(单问)。────────────────────────────
     if (nav) |nv| {
-        // `←  ☐ H1  ☒ H2  ✔ Submit  →`,当前视图 accent 高亮。
-        try out.appendSlice(alloc, th.dim);
-        try out.appendSlice(alloc, if (isUnicode(th)) "←" else "<");
-        try out.appendSlice(alloc, th.reset);
-        try out.appendSlice(alloc, "  ");
-        for (nv.headers, 0..) |h, qi| {
-            const cur = qi == nv.current;
-            if (cur) try out.appendSlice(alloc, th.accent) else try out.appendSlice(alloc, th.dim);
-            try out.appendSlice(alloc, if (isUnicode(th)) (if (nv.answered[qi]) CHIP_ON else CHIP_OFF) else (if (nv.answered[qi]) "[x]" else "[ ]"));
-            try out.append(alloc, ' ');
-            const hdr = try layout.truncate(alloc, h, 12, "…");
-            defer if (hdr.ptr != h.ptr) alloc.free(@constCast(hdr));
-            try out.appendSlice(alloc, hdr);
-            try out.appendSlice(alloc, th.reset);
-            try out.appendSlice(alloc, "  ");
-        }
-        // Submit 视图项。
-        const on_submit = nv.current == nv.headers.len;
-        if (on_submit) try out.appendSlice(alloc, th.accent) else try out.appendSlice(alloc, th.dim);
-        try out.appendSlice(alloc, if (isUnicode(th)) SUBMIT_MARK else "v");
-        try out.appendSlice(alloc, " Submit");
-        try out.appendSlice(alloc, th.reset);
-        try out.appendSlice(alloc, "  ");
-        try out.appendSlice(alloc, th.dim);
-        try out.appendSlice(alloc, if (isUnicode(th)) "→" else ">");
-        try out.appendSlice(alloc, th.reset);
-        try out.append(alloc, '\n');
+        try appendNavBar(alloc, &out, th, nv, width);
     } else {
         // 单问:` ☐ header` chip + box 底边。
         try out.append(alloc, ' ');
@@ -435,29 +458,7 @@ pub fn renderSubmit(
     const sep_w: usize = if (width > 2) width else 80;
 
     // 导航条(current = Submit)。
-    try out.appendSlice(alloc, th.dim);
-    try out.appendSlice(alloc, if (isUnicode(th)) "←" else "<");
-    try out.appendSlice(alloc, th.reset);
-    try out.appendSlice(alloc, "  ");
-    for (nav.headers, 0..) |h, qi| {
-        try out.appendSlice(alloc, th.dim);
-        try out.appendSlice(alloc, if (isUnicode(th)) (if (nav.answered[qi]) CHIP_ON else CHIP_OFF) else (if (nav.answered[qi]) "[x]" else "[ ]"));
-        try out.append(alloc, ' ');
-        const hdr = try layout.truncate(alloc, h, 12, "…");
-        defer if (hdr.ptr != h.ptr) alloc.free(@constCast(hdr));
-        try out.appendSlice(alloc, hdr);
-        try out.appendSlice(alloc, th.reset);
-        try out.appendSlice(alloc, "  ");
-    }
-    try out.appendSlice(alloc, th.accent); // Submit 高亮
-    try out.appendSlice(alloc, if (isUnicode(th)) SUBMIT_MARK else "v");
-    try out.appendSlice(alloc, " Submit");
-    try out.appendSlice(alloc, th.reset);
-    try out.appendSlice(alloc, "  ");
-    try out.appendSlice(alloc, th.dim);
-    try out.appendSlice(alloc, if (isUnicode(th)) "→" else ">");
-    try out.appendSlice(alloc, th.reset);
-    try out.append(alloc, '\n');
+    try appendNavBar(alloc, &out, th, nav, width);
 
     try out.appendSlice(alloc, "Review your answers\n");
     if (!all_answered) {
@@ -508,9 +509,15 @@ fn writeAll(fd: std.c.fd_t, bytes: []const u8) void {
     }
 }
 
-/// 上限(schema 限问题 1-4、每问选项 2-4;留充裕余量)。
-const MAX_Q = 8;
+/// 上限(每问选项 2-4;问题数上限在 ask_user.MAX_QUESTIONS=9 校验,这里留余量防越界)。
+/// MAX_Q 必须 ≥ ask_user.MAX_QUESTIONS,否则合法的 9 问会撞这里的栈数组容量崩 InputAborted。
+const MAX_Q = 12;
 const MAX_OPT = 16;
+
+comptime {
+    // 容量必须容得下工具层放行的最大问题数,否则合法输入会在 run() 里越界/被错误兜底。
+    std.debug.assert(MAX_Q >= @import("../../../tools/ask_user.zig").MAX_QUESTIONS);
+}
 
 /// 单问的可变状态(wizard 跨视图保留)。
 const QState = struct {
@@ -960,6 +967,40 @@ test "joinChecked: 全勾选" {
     const joined = try joinChecked(testing.allocator, &opts, &.{ true, true });
     defer testing.allocator.free(@constCast(joined));
     try testing.expectEqualStrings("x, y", joined);
+}
+
+test "render: 9 问导航条退紧凑模式不撑屏(80 列)" {
+    // 放宽到 9 问后导航条全量 chip ~140 列 > 80 → 必须退紧凑 `(i/N)`,否则软换行错乱。
+    const th = theme_mod.monochrome;
+    const opts = [_]ctx.AskOption{ mkOpt("a", ""), mkOpt("b", "") };
+    const q = ctx.AskQuestion{ .question = "q", .header = "Day1早餐", .multi = false, .options = &opts };
+    var hdrs: [9][]const u8 = undefined;
+    var ans: [9]bool = undefined;
+    for (0..9) |i| {
+        hdrs[i] = "Day1早餐";
+        ans[i] = false;
+    }
+    const nav = NavInfo{ .headers = &hdrs, .answered = &ans, .current = 4 };
+    const r = try render(testing.allocator, th, q, nav, 0, &.{ false, false, false, false }, "", .{}, 80);
+    defer testing.allocator.free(r.frame);
+    const nl = std.mem.indexOfScalar(u8, r.frame, '\n') orelse r.frame.len;
+    try testing.expect(visibleWidth(r.frame[0..nl]) <= 80); // 导航条不超终端宽
+    try capture.expectContains(r.frame, "(5/9)"); // 紧凑进度计数(current=4 → 第5问)
+    try capture.expectContains(r.frame, "Submit"); // Submit 项仍在
+}
+
+test "render: 少量问题仍画全部 chip(不误退紧凑)" {
+    const th = theme_mod.monochrome;
+    const opts = [_]ctx.AskOption{ mkOpt("a", ""), mkOpt("b", "") };
+    const q = ctx.AskQuestion{ .question = "q", .header = "C2", .multi = false, .options = &opts };
+    const hdrs = [_][]const u8{ "C1", "C2" };
+    const ans = [_]bool{ false, false };
+    const nav = NavInfo{ .headers = &hdrs, .answered = &ans, .current = 1 };
+    const r = try render(testing.allocator, th, q, nav, 0, &.{ false, false, false, false }, "", .{}, 80);
+    defer testing.allocator.free(r.frame);
+    try capture.expectContains(r.frame, "C1"); // 全量 chip:两个 header 都在
+    try capture.expectContains(r.frame, "C2");
+    try testing.expect(std.mem.indexOf(u8, r.frame, "(2/2)") == null); // 没退紧凑
 }
 
 
