@@ -80,6 +80,9 @@ pub const App = struct {
     /// 段按工具集裁剪 + 构造 PromptContext。生命周期随 arena。
     enabled_tool_names: []const []const u8 = &.{},
     permission_ctx: permission_mod.PermissionContext,
+    /// Session 级权限记忆(always-allow / session-deny)。挂到 permission_ctx.session_rules。
+    /// 每 App(= 每 session)一份;多 Session 化后随 SessionContext 走,不再进程全局。
+    session_rules: @import("permission/session_rules.zig").SessionRules = .{},
     abort: AbortSignal,
     skills: SkillSet,
     read_state: ReadState,
@@ -212,14 +215,9 @@ pub const App = struct {
         }
         app.theme = theme_mod.select(app.theme_variant, cap);
 
-        // 把 project_dir + home 提供给 permission/prompt 的 allow_always 持久化路径
-        {
-            const home_for_prompt = blk: {
-                const h = std.c.getenv("HOME") orelse break :blk @as([]const u8, "");
-                break :blk std.mem.span(h);
-            };
-            @import("permission/prompt.zig").setPersistContext(app.project_dir, home_for_prompt);
-        }
+        // Session 级权限记忆挂到 permission_ctx(persist 路径复用 match_ctx.home/project_root,
+        // 在 settings 加载处统一设,无需独立 persist context)。
+        app.permission_ctx.session_rules = &app.session_rules;
 
         // 注册 Skill 工具到 dyn_registry（ctx_ptr 指向 SkillSet）。
         // 失败仅 log——skills 仍可通过 /skills 列表，只是模型激活不了。

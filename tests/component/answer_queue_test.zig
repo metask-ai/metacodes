@@ -12,15 +12,16 @@ const cc = @import("cc");
 // 贯通:load 队列 → promptUser 按 pop 的 y/n 返 true/false。
 test "L2 Stage3: promptUser 从 answer_queue 按序弹 y/n" {
     const a = std.testing.allocator;
+    var ctx = cc.permission.PermissionContext{ .allocator = a };
 
     cc.answer_queue.load("y\nn\na\n");
 
     // 第一问:y → 允许
-    try std.testing.expect(try cc.permission.promptUser("Write", "{\"path\":\"x\"}", a));
+    try std.testing.expect(try cc.permission.promptUser(&ctx, "Write", "{\"path\":\"x\"}"));
     // 第二问:n → 拒绝
-    try std.testing.expect(!(try cc.permission.promptUser("Write", "{\"path\":\"y\"}", a)));
+    try std.testing.expect(!(try cc.permission.promptUser(&ctx, "Write", "{\"path\":\"y\"}")));
     // 第三问:a(always) → 允许
-    try std.testing.expect(try cc.permission.promptUser("Bash", "{\"command\":\"ls\"}", a));
+    try std.testing.expect(try cc.permission.promptUser(&ctx, "Bash", "{\"command\":\"ls\"}"));
 
     cc.answer_queue.resetForTest();
 }
@@ -28,10 +29,11 @@ test "L2 Stage3: promptUser 从 answer_queue 按序弹 y/n" {
 // 队列耗尽 → 安全默认 deny(不读 fd 0,不死等)。
 test "L2 Stage3: 队列耗尽 → 默认 deny" {
     const a = std.testing.allocator;
+    var ctx = cc.permission.PermissionContext{ .allocator = a };
     cc.answer_queue.load("y\n");
-    try std.testing.expect(try cc.permission.promptUser("Write", "{}", a)); // 弹 y
+    try std.testing.expect(try cc.permission.promptUser(&ctx, "Write", "{}")); // 弹 y
     // 队列空 → isActive false → 走原非 tty 文字路径,fd 0 在 test 下无输入 → deny
-    try std.testing.expect(!(try cc.permission.promptUser("Write", "{}", a)));
+    try std.testing.expect(!(try cc.permission.promptUser(&ctx, "Write", "{}")));
     cc.answer_queue.resetForTest();
 }
 

@@ -52,6 +52,7 @@ pub const permission = @import("permission.zig"); // PermissionContext
 pub const permission_decision = @import("permission/decision.zig");
 pub const permission_settings = @import("permission/settings.zig");
 pub const permission_prompt = @import("permission/prompt.zig"); // 断 UI 后纯协议路径
+pub const permission_session_rules = @import("permission/session_rules.zig"); // per-session 权限记忆
 
 // ── agents / skills / mcp / sandbox ────────────────────────────────────────
 pub const agents_def = @import("agents/def.zig");

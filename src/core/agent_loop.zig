@@ -557,7 +557,9 @@ pub fn run(
                     slot.is_error = true;
                 },
                 .ask => {
-                    const allowed = permission_mod.promptUser(tu.name, tu.input, allocator) catch false;
+                    // ctx constCast:promptUser 写 session 记忆(有副作用)。同 plan_mode 分支
+                    // 的 @constCast 先例——agent_loop 持 *const 但权限交互本就改 per-session 状态。
+                    const allowed = permission_mod.promptUser(@constCast(permission_ctx), tu.name, tu.input) catch false;
                     log.infoId("permission", rid, "prompt tool={s} user_allowed={}", .{ tu.name, allowed });
                     if (!allowed) {
                         slot.decision = .denied;

@@ -437,13 +437,16 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         if (tty) {
             if (tui_be) |*tb| try tb.startInput(stdin_fd, app, allocator);
         }
-        // 权限弹窗 dialog runner:有 TuiBackend 时注入终端接管路径(停 watcher+持锁,不抢 fd0)。
-        // 生成期结束统一 clear(defer),避免悬垂指向 tui_be 栈实例。
+        // 权限弹窗 UI runner:有 TuiBackend 时注入到 per-session permission_ctx(终端接管路径:
+        // 停 watcher+持锁,不抢 fd0)。生成期结束统一清(defer),避免悬垂指向 tui_be 栈实例。
         if (tui_be) |*tb| {
-            const prompt_mod = @import("../permission/prompt.zig");
-            prompt_mod.setDialogRunner(@ptrCast(tb), &tui_backend_mod.TuiBackend.uiRequestTrampoline);
+            app.permission_ctx.ui_request_state = @ptrCast(tb);
+            app.permission_ctx.ui_request_fn = &tui_backend_mod.TuiBackend.uiRequestTrampoline;
         }
-        defer if (tui_be != null) @import("../permission/prompt.zig").clearDialogRunner();
+        defer if (tui_be != null) {
+            app.permission_ctx.ui_request_state = null;
+            app.permission_ctx.ui_request_fn = null;
+        };
         const result = agent_loop.run(
             &app.conversation,
             &app.api_client,
