@@ -452,7 +452,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             &app.api_client,
             app.tool_defs,
             &app.permission_ctx,
-            .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .activate_tool_state = @ptrCast(app), .activate_tool_fn = &app_mod.App.activateToolTrampoline, .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline, .ui_request_state = if (tui_be) |*tb| @as(*anyopaque, @ptrCast(tb)) else null, .ui_request_fn = if (tui_be != null) &tui_backend_mod.TuiBackend.uiRequestTrampoline else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
+            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .activate_tool_state = @ptrCast(app), .activate_tool_fn = &app_mod.App.activateToolTrampoline, .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline, .ui_request_state = if (tui_be) |*tb| @as(*anyopaque, @ptrCast(tb)) else null, .ui_request_fn = if (tui_be != null) &tui_backend_mod.TuiBackend.uiRequestTrampoline else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
             &ui_be,
             allocator,
         ) catch |err| {
@@ -1208,7 +1208,7 @@ fn retryLast(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui
         &app.api_client,
         app.tool_defs,
         &app.permission_ctx,
-        .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry },
         backend,
         allocator,
     ) catch |err| {
@@ -1840,7 +1840,7 @@ fn handleSkillInvocation(app: *app_mod.App, allocator: std.mem.Allocator, rest: 
         &app.api_client,
         app.tool_defs,
         &app.permission_ctx,
-        .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true },
         &be,
         allocator,
     ) catch |err| {
@@ -2093,7 +2093,7 @@ fn runInjectedAgent(app: *app_mod.App, allocator: std.mem.Allocator, backend: *c
         &app.api_client,
         app.tool_defs,
         &app.permission_ctx,
-        .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry },
         backend,
         allocator,
     ) catch |err| {

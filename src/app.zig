@@ -73,6 +73,34 @@ pub const App = struct {
     allocator: std.mem.Allocator,
     config: types.Config,
     api_key: []const u8,
+    // ── 会话身份(M6)──────────────────────────────────────────────────────
+    /// 本 App 实例的会话标识。**cc-zig 的多 Session 模型 = 多个 App 实例,各为一个
+    /// SessionContext(见下分区注释),共享一个进程。**
+    /// **现状是 multi-session-READY,不是 DONE**:当前仍是一进程一 App 一 session
+    /// (main 只 create 一个 App,无 sessions HashMap,无多线程跑多 run())。M1-M6 移除了
+    /// 多 session 的**前提障碍**(清掉会串台的进程全局 permission/progress/ui-runner,给 App
+    /// 身份 + session 路由通了),使"未来加 sessions map + 起多线程跑多个 App"成为可能;
+    /// 但 M6 本身没有第二个 session 在跑。剩 g_abort_signal 待 M7 路由。
+    /// session_id 用于把本会话的 emit/UiRequest 路由到对应 UI 视图。init 时 gen() 一个。
+    /// **TODO**:本 id 与 transcript 目录名 id 是两个独立 gen(),将来应统一(App 生成、transcript 复用)。
+    session_id: @import("core/session_id.zig").SessionId = @import("core/session_id.zig").SessionId.single,
+
+    // ── ProcessContainer 区(进程级,逻辑上只读)──────────────────────────────
+    // config / api_key / api_client / tool_defs / enabled_tool_names / skills / agents /
+    // dyn_registry / settings / sandbox_settings / hooks / rule_set / theme*。
+    // 逻辑上只读配置/能力。**当前每 App 各持一份**(各自 Client/SkillSet…)。真多 session 时,
+    // tool_defs/skills/agents 可提取到共享 ProcessContainer(只读,省内存);**api_client 建议保持
+    // per-session**(避免共享 http 连接的线程竞争,同 agent_job_registry 每 job 一个 Client)。
+    // 这是 GUI 集成时的优化,非 M6 的活——此处仅画线,非已实现的物理共享。
+    //
+    // ── SessionContext 区(每会话独立可变;就是"一个 App = 一个 session"的本体)────
+    // conversation / read_state / edit_hl_cache / jobs / agent_jobs / tasks / cron_registry /
+    // mcp_sessions / worktree_stack / abort / permission_ctx / session_rules / plan_prev_mode /
+    // plan_file_path / usage / transcript_writer / activated_tools / active_skill /
+    // cwd_abs / project_dir / system_prompt。
+    // 这些是会话状态,每 App 实例独立 = 天然 per-session 隔离。
+    // **注:此分区是注释级"地图"(未来真拆分的指引),非编译器 enforced 边界——
+    //   加字段时自觉归对区。真拆 struct 时才需 enforcement。**
     conversation: Conversation,
     api_client: client_mod.Client,
     tool_defs: []json_mod.ToolDefinition,
@@ -159,6 +187,7 @@ pub const App = struct {
             .allocator = allocator,
             .config = config,
             .api_key = api_key,
+            .session_id = @import("core/session_id.zig").gen(), // 本会话身份(路由用)
             .conversation = Conversation.init(allocator),
             .api_client = client_mod.Client.initWithBaseUrl(allocator, io, api_key, config.model, config.base_url),
             .tool_defs = &.{}, // 占位，下面重建
@@ -218,6 +247,7 @@ pub const App = struct {
         // Session 级权限记忆挂到 permission_ctx(persist 路径复用 match_ctx.home/project_root,
         // 在 settings 加载处统一设,无需独立 persist context)。
         app.permission_ctx.session_rules = &app.session_rules;
+        app.permission_ctx.session = app.session_id; // 权限对话框路由到本会话视图(M5/M6)
 
         // 注册 Skill 工具到 dyn_registry（ctx_ptr 指向 SkillSet）。
         // 失败仅 log——skills 仍可通过 /skills 列表，只是模型激活不了。

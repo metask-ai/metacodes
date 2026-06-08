@@ -135,6 +135,68 @@ test "阶段E: mock backend 跑真 agent_loop,断言 CoreEvent 序列(纯内存,
     try std.testing.expect(std.mem.eql(u8, &rec.last_session.bytes, &SessionId.single.bytes));
 }
 
+// M6(还 M4 欠条):传**非 .single** session → emit 端到端带同一个(证路由真透传,
+// 不是某处硬编码 .single)。这是 M4 占位断言(只测默认值)的真正补强。
+test "M6: 自定义 session 经 agent_loop emit 端到端透传(非默认路由)" {
+    const a = std.testing.allocator;
+    const bodies = [_][]const u8{TEXT_SSE};
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "k", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "hi");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+
+    var rec = Recorder.init(a);
+    defer rec.deinit();
+    const be = rec.backend();
+
+    // 造一个明确非 .single 的 session。
+    const custom = cc.session_id.gen();
+    try std.testing.expect(!std.mem.eql(u8, &custom.bytes, &SessionId.single.bytes));
+
+    _ = agent_loop.run(&conv, &client, &.{}, &perm, .{ .max_turns = 3, .colorize = true, .session = custom }, &be, a) catch
+        return error.SkipZigTest;
+
+    // emit 收到的 session == 传入的 custom(路由按值透传,无中途丢失/硬编码 .single)。
+    try std.testing.expect(std.mem.eql(u8, &rec.last_session.bytes, &custom.bytes));
+}
+
+// M6(还 M5 欠条):ToolContext.requestUi 把 ctx.session 透传给 UiRequestFn 回调。
+// 用一个捕获 session 的 mock runner,验自定义 session 不被弄丢(现 plan/ask mock 都忽略 session)。
+const SessionCapture = struct {
+    threadlocal var got: SessionId = SessionId.single;
+    fn runner(_: *anyopaque, session: SessionId, _: std.mem.Allocator, _: *const cc.ui_request.UiRequest, out: *cc.ui_request.UiResponse) anyerror!void {
+        got = session;
+        out.* = .{ .plan_approval = .reject };
+    }
+};
+
+test "M6: requestUi 把 ctx.session 透传给 UiRequestFn(非默认)" {
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    const custom = cc.session_id.gen();
+    var ctx = cc.tool_context.ToolContext{
+        .allocator = a,
+        .ui_request_state = @ptrCast(&dummy),
+        .ui_request_fn = &SessionCapture.runner,
+        .session = custom,
+    };
+    const req = cc.ui_request.UiRequest{ .plan_approval = .{ .plan_md = "x" } };
+    var resp: cc.ui_request.UiResponse = undefined;
+    _ = try ctx.requestUi(a, &req, &resp);
+    // 回调收到的 session == ctx.session(透传未丢)。
+    try std.testing.expect(std.mem.eql(u8, &SessionCapture.got.bytes, &custom.bytes));
+}
+
 // ── HeadlessBackend:CoreEvent → JSON 行 ─────────────────────────────────────
 const JsonSink = struct {
     lines: std.ArrayList([]u8) = .empty,
