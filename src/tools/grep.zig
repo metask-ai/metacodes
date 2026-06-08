@@ -107,11 +107,64 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     const raw = try common.spawnCaptureStdoutAbortable(argv_z, allocator, ctx.abort);
 
-    // head_limit=0（显式无限）且 offset=0 → 原样返回（保持既有行为 + 测试兼容）。
-    if (head_limit == 0 and offset == 0) return raw;
-    defer allocator.free(raw);
+    // grep 主体结果(可能分页)。
+    const grep_out: []u8 = blk: {
+        if (head_limit == 0 and offset == 0) break :blk raw; // 原样(测试兼容)
+        defer allocator.free(raw);
+        break :blk try paginate(allocator, raw, offset, head_limit);
+    };
 
-    return try paginate(allocator, raw, offset, head_limit);
+    // 搭车增强:pattern 是裸标识符时,前置 FindSymbol 定义块——模型找符号时定义就是
+    // 它最想要的,直接塞到眼前,省一次显式 FindSymbol 调用。非标识符(正则/含空格)跳过。
+    if (definitionsPrefix(allocator, pattern, path, ctx)) |prefix| {
+        defer allocator.free(prefix);
+        defer allocator.free(grep_out);
+        return try std.mem.concat(allocator, u8, &.{ prefix, grep_out });
+    }
+    return grep_out;
+}
+
+/// pattern 是裸标识符(无正则元字符、合法标识符形态)→ 返回 FindSymbol 定义块字符串,
+/// 否则 null。定义块形如:
+///   Definitions of `clamp` (via FindSymbol — exact symbol definitions):
+///     util.zig:3  function  pub fn clamp(...)
+///   ── all grep matches below ──
+/// 找不到定义 / 任何错误 → null(静默降级,绝不影响 grep 主结果)。
+fn definitionsPrefix(
+    allocator: std.mem.Allocator,
+    pattern: []const u8,
+    path: []const u8,
+    ctx: *const ToolContext,
+) ?[]u8 {
+    if (!isBareIdentifier(pattern)) return null;
+    const find_symbol = @import("find_symbol.zig");
+    const defs = find_symbol.findDefinitions(allocator, pattern, path, null, ctx) catch return null;
+    defer {
+        for (defs) |s| find_symbol.freeSymbolPublic(allocator, s);
+        allocator.free(defs);
+    }
+    if (defs.len == 0) return null;
+
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const w = &out.writer;
+    w.print("Definitions of `{s}` (via FindSymbol — exact symbol definitions):\n", .{pattern}) catch return null;
+    for (defs) |s| {
+        w.print("  {s}:{d}  {s}  {s}\n", .{ s.file, s.line_start, s.kind.jsonName(), s.signature }) catch return null;
+    }
+    w.writeAll("── all grep matches below ──\n") catch return null;
+    return out.toOwnedSlice() catch null;
+}
+
+/// 合法标识符:首字符字母/下划线,其余字母/数字/下划线;非空。
+/// 排除一切正则元字符、空格、点号等——这些是真·正则搜索,不该触发符号查找。
+fn isBareIdentifier(s: []const u8) bool {
+    if (s.len == 0 or s.len > 128) return false;
+    for (s, 0..) |c, i| {
+        const ok = std.ascii.isAlphabetic(c) or c == '_' or (i > 0 and std.ascii.isDigit(c));
+        if (!ok) return false;
+    }
+    return true;
 }
 
 /// 按行做全局 offset + head_limit 截断。head_limit=0 表示无限。
@@ -387,4 +440,54 @@ test "GrepTool head_limit=0 显式无限:返回全部不截断" {
         if (std.mem.indexOf(u8, ln, "match") != null) count += 1;
     }
     try std.testing.expect(count == 300); // 全返回
+}
+
+test "isBareIdentifier 仅接受裸标识符,拒绝正则/空格/点号" {
+    // 裸标识符 → true
+    try std.testing.expect(isBareIdentifier("clamp"));
+    try std.testing.expect(isBareIdentifier("maxArea"));
+    try std.testing.expect(isBareIdentifier("_priv"));
+    try std.testing.expect(isBareIdentifier("Parser2"));
+    // 正则/特殊 → false(这些是真·正则搜索,不该触发符号查找)
+    try std.testing.expect(!isBareIdentifier("log.*Error"));
+    try std.testing.expect(!isBareIdentifier("function\\s+\\w+"));
+    try std.testing.expect(!isBareIdentifier("foo bar"));
+    try std.testing.expect(!isBareIdentifier("a.b"));
+    try std.testing.expect(!isBareIdentifier("2fast")); // 数字开头非法标识符
+    try std.testing.expect(!isBareIdentifier(""));
+    try std.testing.expect(!isBareIdentifier("a" ** 129)); // 超长
+}
+
+test "Grep 搭车:裸标识符前置 FindSymbol 定义块;正则不触发" {
+    const ctx = testCtx();
+    // 写一个真 .zig fixture(含 clamp 定义)
+    const dir = "/tmp/cc-zig-grep-hitch-test";
+    _ = std.c.mkdir(dir, 0o755);
+    const fpath = dir ++ "/sample.zig";
+    defer _ = std.c.unlink(fpath);
+    {
+        const fd = std.c.open(fpath, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        try std.testing.expect(fd >= 0);
+        const text = "pub fn clamp(v: i32) i32 { return v; }\nconst x = clamp(3);\n";
+        _ = std.c.write(fd, text.ptr, text.len);
+        _ = std.c.close(fd);
+    }
+
+    // ① 裸标识符 "clamp" → 应前置定义块
+    {
+        const r = try execute(&ctx, "{\"pattern\":\"clamp\",\"path\":\"" ++ dir ++ "\",\"output_mode\":\"content\"}");
+        defer std.testing.allocator.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, r, "via FindSymbol") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r, "all grep matches below") != null);
+        // 定义块在 grep 结果之前
+        const def_pos = std.mem.indexOf(u8, r, "via FindSymbol").?;
+        const sep_pos = std.mem.indexOf(u8, r, "all grep matches below").?;
+        try std.testing.expect(def_pos < sep_pos);
+    }
+    // ② 正则 "clamp.*i32" → 不触发(isBareIdentifier=false),无定义块
+    {
+        const r = try execute(&ctx, "{\"pattern\":\"clamp.*i32\",\"path\":\"" ++ dir ++ "\",\"output_mode\":\"content\"}");
+        defer std.testing.allocator.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, r, "via FindSymbol") == null);
+    }
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const grammars = @import("vendor/tree-sitter/grammars.zig");
 
 // 把 vendored tree-sitter runtime + grammar 的 C 源接到一个 module 上。
 // C 源挂在 module(非 exe)上,所以每个 root=src/main.zig 的 module 都要调一次:
@@ -7,34 +8,24 @@ const std = @import("std");
 // 关键:只编 runtime/src/lib.c(摊销头,#include 其余运行时 .c;逐个编会重复符号)。
 // 生成的 parser.c/scanner.c 会触发 UBSan → -fno-sanitize=undefined。
 // scanner 全是纯 C(.c),无 C++,故不需要 link_libcpp。
+//
+// grammar 列表来自 `vendor/tree-sitter/grammars.zig`(单一真理源)——加语言只改那里。
 fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
     const ts = "vendor/tree-sitter";
     mod.addIncludePath(b.path(ts ++ "/runtime/include"));
     mod.addIncludePath(b.path(ts ++ "/runtime/src"));
-    inline for (.{
-        "zig",
-        "typescript/typescript",
-        "typescript/tsx",
-        "python",
-        "c",
-        "bash",
-    }) |g| {
-        mod.addIncludePath(b.path(ts ++ "/grammars/" ++ g ++ "/src"));
-    }
     const flags = &[_][]const u8{ "-std=c11", "-fno-sanitize=undefined" };
     mod.addCSourceFile(.{ .file = b.path(ts ++ "/runtime/src/lib.c"), .flags = flags });
-    mod.addCSourceFiles(.{ .files = &.{
-        ts ++ "/grammars/zig/src/parser.c",
-        ts ++ "/grammars/typescript/typescript/src/parser.c",
-        ts ++ "/grammars/typescript/typescript/src/scanner.c",
-        ts ++ "/grammars/typescript/tsx/src/parser.c",
-        ts ++ "/grammars/typescript/tsx/src/scanner.c",
-        ts ++ "/grammars/python/src/parser.c",
-        ts ++ "/grammars/python/src/scanner.c",
-        ts ++ "/grammars/c/src/parser.c",
-        ts ++ "/grammars/bash/src/parser.c",
-        ts ++ "/grammars/bash/src/scanner.c",
-    }, .flags = flags });
+    inline for (grammars.GRAMMARS) |g| {
+        mod.addIncludePath(b.path(ts ++ "/grammars/" ++ g.dir ++ "/src"));
+        mod.addCSourceFile(.{ .file = b.path(ts ++ "/grammars/" ++ g.dir ++ "/src/parser.c"), .flags = flags });
+        if (g.has_scanner) {
+            mod.addCSourceFile(.{ .file = b.path(ts ++ "/grammars/" ++ g.dir ++ "/src/scanner.c"), .flags = flags });
+        }
+        inline for (g.extra_csources) |extra| {
+            mod.addCSourceFile(.{ .file = b.path(ts ++ "/grammars/" ++ g.dir ++ "/src/" ++ extra), .flags = flags });
+        }
+    }
 }
 
 pub fn build(b: *std.Build) void {
@@ -165,9 +156,11 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addTreeSitter(b, test_module);
+    const tfilter = b.option([]const u8, "tfilter", "test filter");
     const test_obj = b.addTest(.{
         .name = "cc-test",
         .root_module = test_module,
+        .filters = if (tfilter) |f| &.{f} else &.{},
     });
     const test_run = b.addRunArtifact(test_obj);
     test_step.dependOn(&test_run.step);
@@ -240,6 +233,7 @@ pub fn build(b: *std.Build) void {
         "tests/component/export_symbols_test.zig",
         "tests/component/edit_syntaxcheck_test.zig",
         "tests/component/diff_highlight_test.zig",
+        "tests/component/prompt_override_test.zig",
     };
     for (integ_files) |f| {
         const m = b.createModule(.{
@@ -308,6 +302,7 @@ pub fn build(b: *std.Build) void {
         "tests/component/export_symbols_test.zig",
         "tests/component/edit_syntaxcheck_test.zig",
         "tests/component/diff_highlight_test.zig",
+        "tests/component/prompt_override_test.zig",
     };
     for (new_files) |f| {
         const m = b.createModule(.{

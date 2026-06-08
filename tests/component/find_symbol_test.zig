@@ -1,6 +1,6 @@
 //! L2 组件测试:FindSymbol 工具端到端(走 dispatch 整链)。
 //! DoD:name / kind / path schema 字段真生效。
-//! FindSymbol 是 deferred,但 dispatch 直接可跑(deferral 只影响 prompt 曝光)。
+//! FindSymbol 现为默认常驻工具(2026-06-08 从 deferred 提出)。
 
 const std = @import("std");
 const cc = @import("cc");

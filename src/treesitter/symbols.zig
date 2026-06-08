@@ -7,6 +7,7 @@
 //! 返回的 Symbols 用内部 ArenaAllocator 持有全部 dup 字符串,deinit 一次释放。
 const std = @import("std");
 const ts = @import("ts.zig");
+const registry = @import("registry.zig");
 
 pub const Kind = enum {
     function,
@@ -53,10 +54,14 @@ pub const Kind = enum {
         return .other;
     }
 
-    /// 具体度:去重时同 (line,name) 保留更具体的 kind(constant/variable 最弱)。
+    /// 具体度:去重时同 (line,name) 保留更具体的 kind。
+    /// constant/variable/other 最弱(1);泛 type(2);具体容器 struct/enum/union/class/interface
+    /// 最强(3)——一个 struct 比泛 "type" 更精确(Go 的 type_spec 同时匹配 struct 与泛 type 时取 struct)。
     fn specificity(self: Kind) u8 {
         return switch (self) {
             .constant, .variable, .other => 1,
+            .type => 2,
+            .@"struct", .@"enum", .@"union", .class, .interface => 3,
             else => 2,
         };
     }
@@ -84,13 +89,15 @@ pub const Symbols = struct {
 };
 
 fn querySrc(lang: ts.Lang) []const u8 {
-    return switch (lang) {
-        .zig => @embedFile("queries/zig.scm"),
-        .typescript, .tsx => @embedFile("queries/typescript.scm"),
-        .python => @embedFile("queries/python.scm"),
-        .c => @embedFile("queries/c.scm"),
-        .bash => @embedFile("queries/bash.scm"),
-    };
+    // 由 registry 驱动:仅 has_symbols 的语言嵌入 queries/<query_name>.scm。
+    // 无 symbols 查询的语言返回 ""(extractSymbols 的 Query.init 会失败→空符号→CodeMap fallback)。
+    inline for (registry.LANGS) |spec| {
+        if (lang == @field(ts.Lang, spec.tag)) {
+            if (spec.has_symbols) return @embedFile("queries/" ++ spec.query_name ++ ".scm");
+            return "";
+        }
+    }
+    unreachable;
 }
 
 // 收集阶段的临时记录(借 source/tree 内存,尚未 dup)。
@@ -492,3 +499,130 @@ test "空源码 → 无符号,无泄漏" {
 }
 
 
+
+test "extractSymbols go: function/method/struct/interface/type/const/var" {
+    const src =
+        \\package main
+        \\
+        \\type Point struct {
+        \\    X int
+        \\}
+        \\
+        \\type Shape interface {
+        \\    Area() int
+        \\}
+        \\
+        \\const Pi = 3
+        \\
+        \\var Version = "1.0"
+        \\
+        \\func Add(a int, b int) int {
+        \\    return a + b
+        \\}
+        \\
+        \\func (p Point) Dist() int {
+        \\    return p.X
+        \\}
+    ;
+    var syms = try extractSymbols(testing.allocator, "t.go", src, .go);
+    defer syms.deinit();
+    try testing.expectEqual(Kind.@"struct", findSym(syms.items, "Point").?.kind);
+    try testing.expectEqual(Kind.interface, findSym(syms.items, "Shape").?.kind);
+    try testing.expectEqual(Kind.function, findSym(syms.items, "Add").?.kind);
+    try testing.expectEqual(Kind.method, findSym(syms.items, "Dist").?.kind);
+    try testing.expectEqual(Kind.constant, findSym(syms.items, "Pi").?.kind);
+    try testing.expectEqual(Kind.variable, findSym(syms.items, "Version").?.kind);
+}
+
+test "extractSymbols javascript: function/class/method" {
+    const src =
+        \\function add(a, b) { return a + b; }
+        \\class Point {
+        \\  dist() { return 0; }
+        \\}
+    ;
+    var syms = try extractSymbols(testing.allocator, "t.js", src, .javascript);
+    defer syms.deinit();
+    try testing.expectEqual(Kind.function, findSym(syms.items, "add").?.kind);
+    try testing.expectEqual(Kind.class, findSym(syms.items, "Point").?.kind);
+    try testing.expectEqual(Kind.method, findSym(syms.items, "dist").?.kind);
+}
+
+test "extractSymbols java: class/interface/method" {
+    const src =
+        \\interface Shape { int area(); }
+        \\class Rect implements Shape {
+        \\  public int area() { return 0; }
+        \\}
+    ;
+    var syms = try extractSymbols(testing.allocator, "t.java", src, .java);
+    defer syms.deinit();
+    try testing.expectEqual(Kind.interface, findSym(syms.items, "Shape").?.kind);
+    try testing.expectEqual(Kind.class, findSym(syms.items, "Rect").?.kind);
+    try testing.expectEqual(Kind.method, findSym(syms.items, "area").?.kind);
+}
+
+test "extractSymbols rust: struct/enum/trait/fn" {
+    const src =
+        \\struct Point { x: i32 }
+        \\enum Color { Red, Green }
+        \\trait Shape { fn area(&self) -> i32; }
+        \\fn add(a: i32, b: i32) -> i32 { a + b }
+    ;
+    var syms = try extractSymbols(testing.allocator, "t.rs", src, .rust);
+    defer syms.deinit();
+    try testing.expectEqual(Kind.@"struct", findSym(syms.items, "Point").?.kind);
+    try testing.expectEqual(Kind.@"enum", findSym(syms.items, "Color").?.kind);
+    try testing.expectEqual(Kind.interface, findSym(syms.items, "Shape").?.kind);
+    try testing.expectEqual(Kind.function, findSym(syms.items, "add").?.kind);
+}
+
+test "extractSymbols cpp: class/struct/function" {
+    const src =
+        \\struct Pt { int x; };
+        \\class Rect { public: int area(); };
+        \\int add(int a, int b) { return a + b; }
+    ;
+    var syms = try extractSymbols(testing.allocator, "t.cpp", src, .cpp);
+    defer syms.deinit();
+    try testing.expectEqual(Kind.@"struct", findSym(syms.items, "Pt").?.kind);
+    try testing.expectEqual(Kind.class, findSym(syms.items, "Rect").?.kind);
+    try testing.expectEqual(Kind.function, findSym(syms.items, "add").?.kind);
+}
+
+test "extractSymbols ruby: class/module/method" {
+    const src =
+        \\module Geo
+        \\  class Point
+        \\    def dist
+        \\      0
+        \\    end
+        \\  end
+        \\end
+    ;
+    var syms = try extractSymbols(testing.allocator, "t.rb", src, .ruby);
+    defer syms.deinit();
+    try testing.expectEqual(Kind.class, findSym(syms.items, "Point").?.kind);
+    try testing.expectEqual(Kind.method, findSym(syms.items, "dist").?.kind);
+}
+
+test "extractSymbols csharp: class/interface/method" {
+    const src =
+        \\interface IShape { int Area(); }
+        \\class Rect : IShape {
+        \\  public int Area() { return 0; }
+        \\}
+    ;
+    var syms = try extractSymbols(testing.allocator, "t.cs", src, .csharp);
+    defer syms.deinit();
+    try testing.expectEqual(Kind.interface, findSym(syms.items, "IShape").?.kind);
+    try testing.expectEqual(Kind.class, findSym(syms.items, "Rect").?.kind);
+    try testing.expectEqual(Kind.method, findSym(syms.items, "Area").?.kind);
+}
+
+test "extractSymbols 仅高亮语言返回空(CodeMap fallback)" {
+    const json_src = "{\"key\": \"value\"}";
+    var syms = try extractSymbols(testing.allocator, "t.json", json_src, .json);
+    defer syms.deinit();
+    try testing.expectEqual(@as(usize, 0), syms.items.len);
+}

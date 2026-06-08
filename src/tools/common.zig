@@ -113,6 +113,29 @@ pub fn spawnCaptureStdoutAbortableTimed(
     abort: ?*const AbortSignal,
     timeout_ms: u64,
 ) ![]u8 {
+    return spawnCaptureStdoutAbortableTimedCapped(argv, allocator, abort, timeout_ms, 0);
+}
+
+/// 巨型仓库防护变体:max_bytes>0 时,捕获到 ≥max_bytes 就 killpg 子进程并返回已读部分
+/// (截断但有效,不报错)。用于 `rg --files` 在 Chrome 这种仓库会吐几十 MB 路径、列表阶段
+/// 就卡死的场景——只读够前 N 个文件即可(后续反正被 MAX_FILES 截)。max_bytes==0 = 不限。
+pub fn spawnCaptureStdoutCapped(
+    argv: []const ?[*:0]const u8,
+    allocator: std.mem.Allocator,
+    abort: ?*const AbortSignal,
+    timeout_ms: u64,
+    max_bytes: usize,
+) ![]u8 {
+    return spawnCaptureStdoutAbortableTimedCapped(argv, allocator, abort, timeout_ms, max_bytes);
+}
+
+fn spawnCaptureStdoutAbortableTimedCapped(
+    argv: []const ?[*:0]const u8,
+    allocator: std.mem.Allocator,
+    abort: ?*const AbortSignal,
+    timeout_ms: u64,
+    max_bytes: usize,
+) ![]u8 {
     logSpawnArgv(argv, timeout_ms);
     const t_start = nowMs();
 
@@ -154,7 +177,7 @@ pub fn spawnCaptureStdoutAbortableTimed(
     // 父端也设一次 setpgid，避免竞态（子进程可能还没 setpgid）
     _ = std.c.setpgid(pid, pid);
 
-    const result = readAbortableTimed(pipefd[0], allocator, pid, abort, timeout_ms);
+    const result = readAbortableTimedCapped(pipefd[0], allocator, pid, abort, timeout_ms, max_bytes);
     _ = std.c.close(pipefd[0]);
 
     // 如果是 abort/timeout，上面已经 kill 过；reap
@@ -377,6 +400,21 @@ fn readAbortableTimed(
     abort: ?*const AbortSignal,
     timeout_ms: u64,
 ) ![]u8 {
+    return readAbortableTimedCapped(fd, allocator, pgid, abort, timeout_ms, 0);
+}
+
+/// 同 readAbortableTimed,但 max_bytes>0 时:一旦捕获字节数 ≥ max_bytes,killpg 终止子进程
+/// 并返回已读部分。用于巨型仓库防护:`rg --files` 在 Chrome 这种仓库会吐几十 MB 路径,
+/// 列表阶段就卡死;调用方只需前 N 个文件(后面反正被 MAX_FILES 截),读够就杀。
+/// 不报错——返回"截断但有效"的输出(按行解析,调用方对最后半行做容错)。
+fn readAbortableTimedCapped(
+    fd: std.c.fd_t,
+    allocator: std.mem.Allocator,
+    pgid: std.c.pid_t,
+    abort: ?*const AbortSignal,
+    timeout_ms: u64,
+    max_bytes: usize,
+) ![]u8 {
     var buf: [4096]u8 = undefined;
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
@@ -403,6 +441,11 @@ fn readAbortableTimed(
             const n = std.c.read(fd, &buf, buf.len);
             if (n <= 0) break; // EOF 或错误
             try result.appendSlice(allocator, buf[0..@as(usize, @intCast(n))]);
+            // 字节上限:读够就杀子进程,返回已读部分(不报错,截断但有效)。
+            if (max_bytes > 0 and result.items.len >= max_bytes) {
+                killGroup(pgid);
+                break;
+            }
         } else if ((pfd[0].revents & (std.c.POLL.HUP | std.c.POLL.ERR)) != 0) {
             break;
         }
@@ -519,4 +562,19 @@ test "spawnCaptureStdoutAbortable: abort mid-run kills process" {
     try std.testing.expectError(error.Aborted, result);
     // killGroup 含 2s sleep（SIGTERM 后等），所以总时间应该在 ~2s 左右但 < 5s
     try std.testing.expect(dt < 4500);
+}
+
+test "spawnCaptureStdoutCapped 截断无限输出且不挂死" {
+    const a = std.testing.allocator;
+    // `yes` 无限打印,无 cap 会挂死;cap=8KB 必须很快返回 ≤ 略多于 8KB。
+    var argv = [_]?[*:0]const u8{ "/usr/bin/yes", "abcdefgh", null };
+    const out = spawnCaptureStdoutCapped(argv[0..argv.len], a, null, 5000, 8 * 1024) catch |e| {
+        // 某些环境 yes 路径不同 → 跳过(不算失败)
+        if (e == error.SpawnError) return;
+        return e;
+    };
+    defer a.free(out);
+    // 读到了内容,且被 cap 截断在合理范围(cap + 一次 read buffer 4KB 余量内)
+    try std.testing.expect(out.len >= 8 * 1024);
+    try std.testing.expect(out.len < 8 * 1024 + 8 * 1024);
 }

@@ -9,6 +9,7 @@
 //!   - ts_node_type 返回 [*:0]const u8 → std.mem.span 转 slice。
 //!   - 节点 row/column 是 0-based;用户可见行号 +1,集中在 symbols.zig 处理。
 const std = @import("std");
+const registry = @import("registry.zig");
 
 /// 裸 C API 声明。对齐 vendor/tree-sitter/runtime/include/tree_sitter/api.h。
 pub const c = struct {
@@ -109,6 +110,19 @@ pub const c = struct {
     pub extern fn tree_sitter_python() *const TSLanguage;
     pub extern fn tree_sitter_c() *const TSLanguage;
     pub extern fn tree_sitter_bash() *const TSLanguage;
+    pub extern fn tree_sitter_go() *const TSLanguage;
+    pub extern fn tree_sitter_javascript() *const TSLanguage;
+    pub extern fn tree_sitter_java() *const TSLanguage;
+    pub extern fn tree_sitter_rust() *const TSLanguage;
+    pub extern fn tree_sitter_cpp() *const TSLanguage;
+    pub extern fn tree_sitter_ruby() *const TSLanguage;
+    pub extern fn tree_sitter_c_sharp() *const TSLanguage;
+    pub extern fn tree_sitter_json() *const TSLanguage;
+    pub extern fn tree_sitter_yaml() *const TSLanguage;
+    pub extern fn tree_sitter_toml() *const TSLanguage;
+    pub extern fn tree_sitter_html() *const TSLanguage;
+    pub extern fn tree_sitter_css() *const TSLanguage;
+    pub extern fn tree_sitter_markdown() *const TSLanguage;
 };
 
 // ABI 守卫:布局漂移(grammar/runtime 升级)立即编译失败,而非运行时神秘崩溃。
@@ -124,6 +138,8 @@ pub const Error = error{
 };
 
 /// 支持的语言。enum → extern language fn + 扩展名探测。
+/// **enum 成员必须与 registry.LANGS 逐一对应**(顺序+tag),下方 comptime 断言守卫。
+/// 加语言:registry.zig 加一行 + 这里 enum 加成员 + c 块加 extern fn + vendor grammar + 2 .scm。
 pub const Lang = enum {
     zig,
     typescript,
@@ -131,47 +147,67 @@ pub const Lang = enum {
     python,
     c,
     bash,
+    go,
+    javascript,
+    java,
+    rust,
+    cpp,
+    ruby,
+    csharp,
+    json,
+    yaml,
+    toml,
+    html,
+    css,
+    markdown,
 
+    /// 由 registry 驱动:按 tag 匹配,调对应 extern fn。inline for 编译期展开成等价 switch。
     pub fn language(self: Lang) *const c.TSLanguage {
-        return switch (self) {
-            .zig => c.tree_sitter_zig(),
-            .typescript => c.tree_sitter_typescript(),
-            .tsx => c.tree_sitter_tsx(),
-            .python => c.tree_sitter_python(),
-            .c => c.tree_sitter_c(),
-            .bash => c.tree_sitter_bash(),
-        };
+        inline for (registry.LANGS) |spec| {
+            if (self == @field(Lang, spec.tag)) {
+                return @field(c, spec.ts_fn)();
+            }
+        }
+        unreachable; // comptime 断言保证 enum 成员都在 registry,不可达
     }
 
     pub fn name(self: Lang) []const u8 {
         return @tagName(self);
     }
 
-    /// 按文件扩展名推断语言;不支持返回 null。
+    /// 按文件扩展名推断语言;不支持返回 null。由 registry 的 extensions 驱动。
     pub fn fromPath(path: []const u8) ?Lang {
         const ext = std.fs.path.extension(path);
         if (ext.len == 0) return null;
-        const Pair = struct { e: []const u8, l: Lang };
-        const table = [_]Pair{
-            .{ .e = ".zig", .l = .zig },
-            .{ .e = ".ts", .l = .typescript },
-            .{ .e = ".mts", .l = .typescript },
-            .{ .e = ".cts", .l = .typescript },
-            .{ .e = ".tsx", .l = .tsx },
-            .{ .e = ".jsx", .l = .tsx },
-            .{ .e = ".py", .l = .python },
-            .{ .e = ".pyi", .l = .python },
-            .{ .e = ".c", .l = .c },
-            .{ .e = ".h", .l = .c },
-            .{ .e = ".sh", .l = .bash },
-            .{ .e = ".bash", .l = .bash },
-        };
-        for (table) |p| {
-            if (std.ascii.eqlIgnoreCase(ext, p.e)) return p.l;
+        inline for (registry.LANGS) |spec| {
+            inline for (spec.extensions) |e| {
+                if (std.ascii.eqlIgnoreCase(ext, e)) return @field(Lang, spec.tag);
+            }
         }
         return null;
     }
 };
+
+// ── 单一真理源一致性守卫(收敛的核心价值:漏加任一处编译期报错)──────────────
+comptime {
+    const lang_fields = @typeInfo(Lang).@"enum".fields;
+    // ① enum 成员数 == registry 条目数
+    if (lang_fields.len != registry.LANGS.len) {
+        @compileError(std.fmt.comptimePrint(
+            "Lang enum 有 {d} 个成员,但 registry.LANGS 有 {d} 条——加语言时漏改了一处",
+            .{ lang_fields.len, registry.LANGS.len },
+        ));
+    }
+    // ② 每条 registry 的 tag 都有对应 enum 成员,且 ts_fn 在 c 块里有 extern 声明
+    for (registry.LANGS) |spec| {
+        if (!@hasField(Lang, spec.tag)) {
+            @compileError("registry tag '" ++ spec.tag ++ "' 在 Lang enum 里没有对应成员");
+        }
+        if (!@hasDecl(c, spec.ts_fn)) {
+            @compileError("registry ts_fn '" ++ spec.ts_fn ++ "' 在 c 块里没有 extern 声明");
+        }
+    }
+}
 
 pub const Parser = struct {
     raw: *c.TSParser,
@@ -370,8 +406,9 @@ test "Lang.fromPath 扩展名映射" {
     try testing.expectEqual(Lang.c, Lang.fromPath("y.c").?);
     try testing.expectEqual(Lang.c, Lang.fromPath("y.h").?);
     try testing.expectEqual(Lang.bash, Lang.fromPath("z.sh").?);
-    try testing.expect(Lang.fromPath("README.md") == null);
+    try testing.expectEqual(Lang.markdown, Lang.fromPath("README.md").?); // .md 现支持(仅高亮)
     try testing.expect(Lang.fromPath("noext") == null);
+    try testing.expect(Lang.fromPath("a.unknownext") == null);
 }
 
 test "parse 干净 Zig 片段 → root=source_file, 无错误" {
@@ -396,5 +433,29 @@ test "6 语言 language() 入口都非空 + parser 可建" {
     inline for (.{ Lang.zig, Lang.typescript, Lang.tsx, Lang.python, Lang.c, Lang.bash }) |l| {
         var p = try Parser.init(l);
         defer p.deinit();
+    }
+}
+
+test "fromPath 识别全部新语言扩展名" {
+    try std.testing.expectEqual(Lang.go, Lang.fromPath("main.go").?);
+    try std.testing.expectEqual(Lang.javascript, Lang.fromPath("a.js").?);
+    try std.testing.expectEqual(Lang.java, Lang.fromPath("A.java").?);
+    try std.testing.expectEqual(Lang.rust, Lang.fromPath("m.rs").?);
+    try std.testing.expectEqual(Lang.cpp, Lang.fromPath("x.cpp").?);
+    try std.testing.expectEqual(Lang.ruby, Lang.fromPath("r.rb").?);
+    try std.testing.expectEqual(Lang.csharp, Lang.fromPath("C.cs").?);
+    try std.testing.expectEqual(Lang.json, Lang.fromPath("p.json").?);
+    try std.testing.expectEqual(Lang.yaml, Lang.fromPath("c.yaml").?);
+    try std.testing.expectEqual(Lang.yaml, Lang.fromPath("c.yml").?);
+    try std.testing.expectEqual(Lang.toml, Lang.fromPath("Cargo.toml").?);
+    try std.testing.expectEqual(Lang.html, Lang.fromPath("i.html").?);
+    try std.testing.expectEqual(Lang.css, Lang.fromPath("s.css").?);
+    try std.testing.expectEqual(Lang.markdown, Lang.fromPath("R.md").?);
+}
+
+test "language() 对每门语言返回非空 TSLanguage" {
+    inline for (registry.LANGS) |spec| {
+        const lang = @field(Lang, spec.tag);
+        _ = lang.language(); // 不崩 = extern fn 正确链接
     }
 }

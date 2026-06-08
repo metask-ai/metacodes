@@ -85,6 +85,7 @@ const USING_TOOLS_SECTION =
     \\  - To create files use Write instead of cat with heredoc or echo redirection
     \\  - To search for files use Glob instead of find or ls
     \\  - To search the content of files, use Grep instead of grep or rg
+    \\  - To locate where functions/types/classes are DEFINED, use CodeMap (a structural outline) instead of reading whole files; reach for FindSymbol to jump to a single named definition
     \\  - Reserve using the Bash exclusively for system commands and terminal operations that require shell execution. If you are unsure and there is a relevant dedicated tool, default to using the dedicated tool and only fallback on using the Bash tool for these if it is absolutely necessary.
     \\ - Break down and manage your work with the TaskCreate tool. These tools are helpful for planning your work and helping the user track your progress. Mark each task as completed as soon as you are done with the task. Do not batch up multiple tasks before marking them as completed.
     \\ - You can call multiple tools in a single response. If you intend to call multiple tools and there are no dependencies between them, make all independent tool calls in parallel. Maximize use of parallel tool calls where possible to increase efficiency. However, if some tool calls depend on previous calls to inform dependent values, do NOT call these tools in parallel and instead call them sequentially. For instance, if one operation must complete before another starts, run these operations sequentially instead.
@@ -295,10 +296,12 @@ pub fn buildFull(
     const agents_section = if (agents) |a| try buildAgentsSection(allocator, a) else try allocator.dupe(u8, "");
     defer allocator.free(agents_section);
 
-    const using_tools_section = if (enabled_tool_names) |names|
-        try buildUsingToolsSection(allocator, names)
-    else
-        try allocator.dupe(u8, USING_TOOLS_SECTION);
+    // # Using your tools 段:env override(slot "USING_TOOLS")优先,否则按工具集动态拼。
+    const using_tools_section = blk: {
+        if (@import("prompt_override.zig").lookup(allocator, "USING_TOOLS")) |ov| break :blk ov;
+        if (enabled_tool_names) |names| break :blk try buildUsingToolsSection(allocator, names);
+        break :blk try allocator.dupe(u8, USING_TOOLS_SECTION);
+    };
     defer allocator.free(using_tools_section);
 
     const deferred_section = try buildDeferredToolsSection(allocator);
@@ -373,6 +376,16 @@ fn buildUsingToolsSection(allocator: std.mem.Allocator, names: []const []const u
     }
     if (has(names, "Grep")) {
         try buf.appendSlice(allocator, "\n  - To search the content of files, use Grep instead of grep or rg");
+    }
+    if (has(names, "CodeMap")) {
+        // FindSymbol 一句仅当它也在工具集时附加(它是 deferred,通常不在默认 names,
+        // 但 ToolSearch 激活后会进 names → 描述自然升级)。
+        const find_sym = if (has(names, "FindSymbol"))
+            "; reach for FindSymbol to jump to a single named definition"
+        else
+            "";
+        try buf.appendSlice(allocator, "\n  - To locate where functions/types/classes are DEFINED, use CodeMap (a structural outline) instead of reading whole files");
+        try buf.appendSlice(allocator, find_sym);
     }
     try buf.appendSlice(allocator,
         \\
@@ -466,4 +479,30 @@ test "buildWithSkills includes skill name + description" {
     try testing.expect(std.mem.indexOf(u8, s, "# Available skills") != null);
     try testing.expect(std.mem.indexOf(u8, s, "**code-review**") != null);
     try testing.expect(std.mem.indexOf(u8, s, "Review pending changes") != null);
+}
+
+test "buildUsingToolsSection gates CodeMap + FindSymbol guidance on tool presence" {
+    const a = testing.allocator;
+
+    // 无 CodeMap → 无引导行
+    {
+        const s = try buildUsingToolsSection(a, &.{ "Read", "Grep", "Glob" });
+        defer a.free(s);
+        try testing.expect(std.mem.indexOf(u8, s, "use CodeMap") == null);
+        try testing.expect(std.mem.indexOf(u8, s, "FindSymbol") == null);
+    }
+    // 有 CodeMap、无 FindSymbol → CodeMap 行有,FindSymbol 子句无
+    {
+        const s = try buildUsingToolsSection(a, &.{ "Read", "Grep", "CodeMap" });
+        defer a.free(s);
+        try testing.expect(std.mem.indexOf(u8, s, "use CodeMap") != null);
+        try testing.expect(std.mem.indexOf(u8, s, "FindSymbol") == null);
+    }
+    // CodeMap + FindSymbol(ToolSearch 激活后)→ 两者都在
+    {
+        const s = try buildUsingToolsSection(a, &.{ "Read", "Grep", "CodeMap", "FindSymbol" });
+        defer a.free(s);
+        try testing.expect(std.mem.indexOf(u8, s, "use CodeMap") != null);
+        try testing.expect(std.mem.indexOf(u8, s, "FindSymbol") != null);
+    }
 }

@@ -18,6 +18,9 @@ const ToolContext = @import("context.zig").ToolContext;
 const MAX_FILES: usize = 200;
 /// 单文件源码字节上限(超大文件跳过解析,避免卡顿)。
 const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+/// `rg --files` 输出字节上限:巨型仓库(Chrome ~40 万文件)会吐几十 MB 路径,
+/// 读到此上限就 killpg 止血。路径均长 ~80B × MAX_FILES=200 ≈ 16KB,256KB 给足余量。
+const LIST_BYTE_CAP: usize = 256 * 1024;
 
 /// 渲染单文件大纲为缩进文本树(供 Read 工具的 outline 模式复用)。
 /// 调用方拥有返回串。lang 已知、source 已读。空符号 → "(no symbols)\n"。
@@ -207,7 +210,7 @@ fn listFiles(allocator: std.mem.Allocator, glob: []const u8, ctx: *const ToolCon
         glob_z.ptr,
         null,
     };
-    const raw = try common.spawnCaptureStdoutAbortable(argv[0..argv.len], allocator, ctx.abort);
+    const raw = try common.spawnCaptureStdoutCapped(argv[0..argv.len], allocator, ctx.abort, 0, LIST_BYTE_CAP);
     defer allocator.free(raw);
 
     var files: std.ArrayList([]const u8) = .empty;

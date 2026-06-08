@@ -8,6 +8,7 @@
 //! highlights.scm 里更具体的 pattern 通常在后,自然更精确),再按行合并连续同 group 成 span。
 const std = @import("std");
 const ts = @import("ts.zig");
+const registry = @import("registry.zig");
 
 /// 高亮组(颜色由渲染层 groupColor 映射)。
 pub const Group = enum(u8) {
@@ -95,13 +96,14 @@ pub const Highlights = struct {
 };
 
 fn querySrc(lang: ts.Lang) []const u8 {
-    return switch (lang) {
-        .zig => @embedFile("queries/highlights/zig.scm"),
-        .typescript, .tsx => @embedFile("queries/highlights/typescript.scm"),
-        .python => @embedFile("queries/highlights/python.scm"),
-        .c => @embedFile("queries/highlights/c.scm"),
-        .bash => @embedFile("queries/highlights/bash.scm"),
-    };
+    // 由 registry 驱动:按 tag 匹配,嵌入 queries/highlights/<query_name>.scm。
+    // inline for 编译期展开;@embedFile 路径 comptime 拼接。
+    inline for (registry.LANGS) |spec| {
+        if (lang == @field(ts.Lang, spec.tag)) {
+            return @embedFile("queries/highlights/" ++ spec.query_name ++ ".scm");
+        }
+    }
+    unreachable; // ts.zig 的 comptime 断言保证覆盖所有 Lang
 }
 
 /// 解析整文件 → 按行高亮索引。不支持/parse/query 编译失败 → error(调用方退回关键字表)。

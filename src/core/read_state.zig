@@ -27,6 +27,9 @@ pub const Entry = struct {
     /// 读取时的内容哈希(Wyhash)。staleness 双判用:mtime 变但 content_hash 不变 → 不算 stale
     /// (对齐 cc FileEdit:云同步/杀软改 mtime 但内容没变时放行)。0 = 未记录(向后兼容)。
     content_hash: u64 = 0,
+    /// 本 session 是否已对该文件展示过 CodeMap/FindSymbol 提示(Read 弱提示去重频控用)。
+    /// record 覆盖时保留(不因再次 Read 重置),确保同一文件一个 session 只提一次。
+    hinted: bool = false,
 };
 
 pub const ReadState = struct {
@@ -66,19 +69,37 @@ pub const ReadState = struct {
     pub fn recordHashed(self: *ReadState, path: []const u8, mtime_ns: i128, byte_size: u64, content_hash: u64) !void {
         self.lock();
         defer self.unlock();
-        const entry = Entry{
-            .mtime_ns = mtime_ns,
-            .byte_size = byte_size,
-            .read_at_ns = util_time.nowNs(),
-            .content_hash = content_hash,
-        };
         const gop = try self.map.getOrPut(path);
+        // 保留已有的 hinted(再次 Read 同文件不应重置"提示过"标记)。
+        const prev_hinted = if (gop.found_existing) gop.value_ptr.hinted else false;
         if (!gop.found_existing) {
             // 分配一份 owned key；getOrPut 的 key_ptr 此时还指向传入的临时 slice
             const owned = try self.allocator.dupe(u8, path);
             gop.key_ptr.* = owned;
         }
-        gop.value_ptr.* = entry;
+        gop.value_ptr.* = .{
+            .mtime_ns = mtime_ns,
+            .byte_size = byte_size,
+            .read_at_ns = util_time.nowNs(),
+            .content_hash = content_hash,
+            .hinted = prev_hinted,
+        };
+    }
+
+    /// 标记该文件本 session 已展示过提示。文件必须已 record(Read 成功后才提示)。
+    /// 未找到条目时静默忽略(理论不会发生:提示总在 record 之后)。线程安全。
+    pub fn markHinted(self: *ReadState, path: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        if (self.map.getPtr(path)) |e| e.hinted = true;
+    }
+
+    /// 该文件本 session 是否已展示过提示。未读过 → false。线程安全。
+    pub fn wasHinted(self: *ReadState, path: []const u8) bool {
+        self.lock();
+        defer self.unlock();
+        if (self.map.get(path)) |e| return e.hinted;
+        return false;
     }
 
     /// 查询记录;返回 null 表示未读过。线程安全。
@@ -224,4 +245,18 @@ test "statPath real file" {
     const s = try statPath(path);
     try std.testing.expect(s.size == 5);
     try std.testing.expect(s.mtime_ns > 0);
+}
+
+test "hinted 标记:markHinted/wasHinted + record 覆盖时保留" {
+    var rs = ReadState.init(std.testing.allocator);
+    defer rs.deinit();
+    try rs.record("/x/foo.zig", 100, 10);
+    try std.testing.expect(!rs.wasHinted("/x/foo.zig"));
+    rs.markHinted("/x/foo.zig");
+    try std.testing.expect(rs.wasHinted("/x/foo.zig"));
+    // 再次 record 同文件(模拟再读)→ hinted 不被重置
+    try rs.record("/x/foo.zig", 200, 20);
+    try std.testing.expect(rs.wasHinted("/x/foo.zig"));
+    // 未读过的文件 → false
+    try std.testing.expect(!rs.wasHinted("/x/never.zig"));
 }

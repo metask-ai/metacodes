@@ -1,11 +1,29 @@
 # tree-sitter vendored sources — pinned versions
 # 由 scripts/download-tree-sitter.sh 生成。升级走脚本,勿手改源。
+# 语言清单单一真理源:vendor/tree-sitter/grammars.zig + src/treesitter/registry.zig
 #
 # runtime  tree-sitter/tree-sitter                  v0.26.9  (ABI 13..15)
-# zig      tree-sitter-grammars/tree-sitter-zig     v1.1.2      (ABI 14)
-# ts/tsx   tree-sitter/tree-sitter-typescript       v0.23.2
-# python   tree-sitter/tree-sitter-python           v0.23.6
-# c        tree-sitter/tree-sitter-c                v0.24.1
-# bash     tree-sitter/tree-sitter-bash             v0.23.3
+#
+# 完整支持(grammar+highlights+symbols 查询):
+#   zig      tree-sitter-grammars/tree-sitter-zig     v1.1.2
+#   ts/tsx   tree-sitter/tree-sitter-typescript       v0.23.2
+#   python   tree-sitter/tree-sitter-python           v0.23.6
+#   c        tree-sitter/tree-sitter-c                v0.24.1
+#   bash     tree-sitter/tree-sitter-bash             v0.23.3
+#   go       tree-sitter/tree-sitter-go               v0.25.0
+#   javascript tree-sitter/tree-sitter-javascript     v0.25.0
+#   java     tree-sitter/tree-sitter-java             v0.23.5
+#   rust     tree-sitter/tree-sitter-rust             v0.24.2
+#   cpp      tree-sitter/tree-sitter-cpp              v0.23.4  (scanner 纯 C,无需 libcpp)
+#   ruby     tree-sitter/tree-sitter-ruby             v0.23.1
+#   csharp   tree-sitter/tree-sitter-c-sharp          v0.23.5
+#
+# 仅高亮(grammar+highlights,无 symbols 查询 → CodeMap/FindSymbol fallback Grep):
+#   json     tree-sitter/tree-sitter-json             v0.24.8
+#   yaml     tree-sitter-grammars/tree-sitter-yaml    v0.7.2   (含 schema.{core,json,legacy}.c)
+#   toml     tree-sitter-grammars/tree-sitter-toml    v0.7.0
+#   html     tree-sitter/tree-sitter-html             v0.23.2  (含 tag.h)
+#   css      tree-sitter/tree-sitter-css              v0.25.0
+#   markdown tree-sitter-grammars/tree-sitter-markdown v0.5.3  (仅块级,行内未 vendor)
 #
 # License: MIT (runtime + 全部 grammar)。

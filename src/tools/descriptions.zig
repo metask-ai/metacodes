@@ -130,6 +130,32 @@ pub fn describeGrep(allocator: std.mem.Allocator, ctx: *const PromptContext) any
 }
 
 // ============================================================================
+// CodeMap — tree-sitter 结构大纲。无 cc 对应物,描述自拟。
+// 动态:若 FindSymbol 在工具集(或可经 ToolSearch 激活)则提一句"找定义用它"。
+// 引导力度对齐 Grep:给明确 use case + "prefer over whole-file Read"。
+// ============================================================================
+pub fn describeCodeMap(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
+    // FindSymbol 现为默认工具(2026-06-08 从 deferred 提出),无需 ToolSearch 激活;
+    // 描述里直接引导"按名找单个定义用 FindSymbol"。
+    _ = ctx;
+    return std.mem.concat(allocator, u8, &.{
+        \\Produce a structural outline of SOURCE CODE — every function, type, class, constant, and method with its line number and signature — without reading the file bodies.
+        \\
+        \\Usage:
+        \\- This tool is for source code only (zig, typescript, tsx, python, c, bash). For plain-text, config, JSON, Markdown, or other non-code files, fall back to Read or Grep.
+        \\- ALWAYS prefer CodeMap over reading a whole file when your goal is to LOCATE definitions (where is function X? what methods does this type have? what's the shape of this module?). It returns just the skeleton, costing a fraction of the tokens of a full Read.
+        \\- Pass a single file path to map one file, or a glob (e.g. `src/**/*`) to map many files at once — ideal for getting your bearings in an unfamiliar module or directory. The language of each file is inferred from its extension.
+        \\- Typical workflow: CodeMap to find WHERE something is defined → Read with offset+limit to pull just that range → Edit. Reserve a full-file Read for when you genuinely need the entire contents.
+        \\- Use Grep when you need to find all USES/occurrences of a string or regex; use CodeMap when you need the DEFINITIONS and overall structure.
+        ,
+        "\n- To jump straight to a single symbol's definition by name (when you don't know which file it lives in), use the FindSymbol tool instead.",
+        "\n",
+        \\- Supported languages: zig, typescript, tsx, python, c, bash. For other languages, fall back to Grep or Read.
+        ,
+    });
+}
+
+// ============================================================================
 // Bash — cc/src/tools/BashTool/prompt.ts
 // 动态:① background note;② Git 协议段(ctx.include_git);③ 只读 agent 提醒。
 // ============================================================================
@@ -229,8 +255,24 @@ test "describeGrep contains ALWAYS-use-Grep + agent line only when Agent enabled
     try std.testing.expect(std.mem.indexOf(u8, d2, "open-ended searches") == null);
 }
 
-test "describeBash includes Git section only when include_git and not readonly agent" {
+test "describeCodeMap guides toward definitions and prefers over whole-file Read" {
     const a = std.testing.allocator;
+    const ctx = PromptContext{};
+    const d = try describeCodeMap(a, &ctx);
+    defer a.free(d);
+    try std.testing.expect(std.mem.indexOf(u8, d, "structural outline") != null);
+    // 核心引导:LOCATE 定义优先 CodeMap 而非整文件 Read
+    try std.testing.expect(std.mem.indexOf(u8, d, "prefer CodeMap over reading a whole file") != null);
+    // 提及 FindSymbol(已提为默认工具,不再需要 ToolSearch 激活)
+    try std.testing.expect(std.mem.indexOf(u8, d, "FindSymbol") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "ToolSearch") == null);
+    // 强调仅针对源代码
+    try std.testing.expect(std.mem.indexOf(u8, d, "source code only") != null);
+    // 含字面 glob 大括号不应导致格式化崩溃(用 concat 而非 allocPrint);语言中立 glob
+    try std.testing.expect(std.mem.indexOf(u8, d, "src/**/*`") != null);
+}
+
+test "describeBash includes Git section only when include_git and not readonly agent" {    const a = std.testing.allocator;
     const main_ctx = PromptContext{ .include_git = true };
     const d1 = try describeBash(a, &main_ctx);
     defer a.free(d1);

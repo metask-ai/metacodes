@@ -3,6 +3,7 @@ const common = @import("common.zig");
 const security = @import("security.zig");
 const read_state = @import("../core/read_state.zig");
 const ts = @import("../treesitter/ts.zig");
+const registry = @import("../treesitter/registry.zig");
 const code_map = @import("code_map.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
@@ -32,12 +33,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
 
     // outline 模式(opt-in):返回符号大纲(函数/类型/类 + 行号 + 签名)而非文件内容。
-    // 仅对 tree-sitter 支持的语言;不支持则回退正常读取(向后兼容)。
+    // 仅对**有 symbols 查询**的语言(json/yaml 等仅高亮语言无大纲 → 回退正常读取,向后兼容)。
     if (isTrue(common.extractJsonArg(args, "outline"))) {
         if (ts.Lang.fromPath(path)) |lang| {
-            return try readOutline(allocator, path, lang);
+            if (registry.hasSymbols(lang)) return try readOutline(allocator, path, lang);
         }
-        // 不支持的语言 → 落到正常读取路径
+        // 不支持/无 symbols 的语言 → 落到正常读取路径
     }
 
     const has_offset = common.extractJsonArg(args, "offset") != null;
@@ -65,9 +66,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (st) |s| {
             if (s.size > MAX_FILE_BYTES) {
                 if (ts.Lang.fromPath(path)) |lang| {
-                    const outline = try readOutlineFromFd(allocator, path, lang, fd);
-                    defer allocator.free(outline);
-                    return try std.fmt.allocPrint(allocator, "File too large to show in full ({d} bytes, limit {d}). Outline below; Read a range with offset+limit for bodies.\n\n{s}", .{ s.size, MAX_FILE_BYTES, outline });
+                    if (registry.hasSymbols(lang)) {
+                        const outline = try readOutlineFromFd(allocator, path, lang, fd);
+                        defer allocator.free(outline);
+                        return try std.fmt.allocPrint(allocator, "File too large to show in full ({d} bytes, limit {d}). Outline below; Read a range with offset+limit for bodies.\n\n{s}", .{ s.size, MAX_FILE_BYTES, outline });
+                    }
                 }
                 return try std.fmt.allocPrint(allocator, "{{\"error\":\"file too large ({d} bytes, limit {d}). Read a range with offset+limit, or use Grep to find specific content.\"}}", .{ s.size, MAX_FILE_BYTES });
             }
@@ -105,7 +108,36 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (st) |s| rs.recordHashed(path, s.mtime_ns, s.size, std.hash.Wyhash.hash(0, full)) catch {};
     }
 
-    return try renderWithLineNumbers(full[line_start..end], offset_1based, allocator);
+    const rendered = try renderWithLineNumbers(full[line_start..end], offset_1based, allocator);
+
+    // 弱提示(搭车):整读(无 offset/limit)一个**能被 tree-sitter 解析出符号**的源码文件时,
+    // 在结果末尾追加一句 system-reminder,引导"定位定义可用 CodeMap/FindSymbol 更快"。
+    // 频控:同一文件本 session 只提一次(read_state.hinted),避免反复读同文件时唠叨。
+    // 触发条件(全满足):无 offset/limit + tree-sitter 支持的语言 + >150 行 + 能抽出符号 + 没提过。
+    // "能抽出符号"避免对空文件/纯注释/解析失败的源码误提("对它 CodeMap 也没用")。
+    if (!has_offset and !has_limit) {
+        if (ts.Lang.fromPath(path)) |lang| {
+            const total_lines = std.mem.count(u8, full, "\n") + 1;
+            const already = if (ctx.read_state) |rs| rs.wasHinted(path) else false;
+            if (total_lines > 150 and !already and sourceHasSymbols(allocator, path, full, lang)) {
+                if (ctx.read_state) |rs| rs.markHinted(path);
+                defer allocator.free(rendered);
+                return try std.fmt.allocPrint(allocator,
+                    "{s}\n\n<system-reminder>This is a {d}-line source file. If you only need to find where something is defined, CodeMap (a structural outline) or FindSymbol (jump to a named definition) would be faster and cheaper than reading the whole file.</system-reminder>",
+                    .{ rendered, total_lines });
+            }
+        }
+    }
+    return rendered;
+}
+
+/// 试 tree-sitter 抽符号,有 ≥1 个定义则 true。供 Read 弱提示门控:只对"CodeMap 真能出东西"
+/// 的源码文件提示。解析失败/无符号 → false(不提)。
+fn sourceHasSymbols(allocator: std.mem.Allocator, path: []const u8, source: []const u8, lang: ts.Lang) bool {
+    const symbols = @import("../treesitter/symbols.zig");
+    var syms = symbols.extractSymbols(allocator, path, source, lang) catch return false;
+    defer syms.deinit();
+    return syms.items.len > 0;
 }
 
 fn isTrue(s: ?[]const u8) bool {
@@ -430,4 +462,105 @@ test "ReadTool 超长单行被截断 + 标记" {
         if (c == 'x') xcount += 1;
     }
     try std.testing.expect(xcount <= MAX_LINE_BYTES);
+}
+
+test "Read 弱提示:>150行源码末尾追加 CodeMap reminder;小文件不追加" {
+    const ctx = testCtx();
+    // 大源码文件(200 行 .zig)→ 应带 reminder
+    {
+        const path = "/tmp/cc-zig-read-hint-big.zig";
+        const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        try std.testing.expect(fd >= 0);
+        var i: usize = 0;
+        while (i < 200) : (i += 1) {
+            const line = "const x = 1;\n";
+            _ = std.c.write(fd, line.ptr, line.len);
+        }
+        _ = std.c.close(fd);
+        defer _ = std.c.unlink(path);
+
+        const r = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-read-hint-big.zig\"}");
+        defer std.testing.allocator.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, r, "<system-reminder>") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r, "CodeMap") != null);
+    }
+    // 小源码文件(10 行)→ 不带 reminder
+    {
+        const path = "/tmp/cc-zig-read-hint-small.zig";
+        const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        try std.testing.expect(fd >= 0);
+        const text = "const a = 1;\nconst b = 2;\n";
+        _ = std.c.write(fd, text.ptr, text.len);
+        _ = std.c.close(fd);
+        defer _ = std.c.unlink(path);
+
+        const r = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-read-hint-small.zig\"}");
+        defer std.testing.allocator.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, r, "<system-reminder>") == null);
+    }
+    // 大的非源码文件(.txt 200 行)→ 不带 reminder(仅源码触发)
+    {
+        const path = "/tmp/cc-zig-read-hint-big.txt";
+        const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        try std.testing.expect(fd >= 0);
+        var i: usize = 0;
+        while (i < 200) : (i += 1) {
+            const line = "plain text line\n";
+            _ = std.c.write(fd, line.ptr, line.len);
+        }
+        _ = std.c.close(fd);
+        defer _ = std.c.unlink(path);
+
+        const r = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-read-hint-big.txt\"}");
+        defer std.testing.allocator.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, r, "<system-reminder>") == null);
+    }
+}
+
+test "Read 弱提示:无符号源码不提 + 同 session 同文件只提一次" {
+    // 大源码文件但**无符号**(200 行纯注释)→ 不提(CodeMap 对它出不了东西)
+    {
+        const ctx = testCtx();
+        const path = "/tmp/cc-zig-read-hint-nosym.zig";
+        const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        try std.testing.expect(fd >= 0);
+        var i: usize = 0;
+        while (i < 200) : (i += 1) {
+            const line = "// just a comment line\n";
+            _ = std.c.write(fd, line.ptr, line.len);
+        }
+        _ = std.c.close(fd);
+        defer _ = std.c.unlink(path);
+
+        const r = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-read-hint-nosym.zig\"}");
+        defer std.testing.allocator.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, r, "<system-reminder>") == null);
+    }
+
+    // 带真 ReadState 的 ctx:同一文件读两次,只有第一次带 reminder(session 去重)
+    {
+        var rs = read_state.ReadState.init(std.testing.allocator);
+        defer rs.deinit();
+        var ctx = testCtx();
+        ctx.read_state = &rs;
+
+        const path = "/tmp/cc-zig-read-hint-dedup.zig";
+        const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        try std.testing.expect(fd >= 0);
+        var i: usize = 0;
+        while (i < 200) : (i += 1) {
+            const line = "pub fn f() void {}\n";
+            _ = std.c.write(fd, line.ptr, line.len);
+        }
+        _ = std.c.close(fd);
+        defer _ = std.c.unlink(path);
+
+        const r1 = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-read-hint-dedup.zig\"}");
+        defer std.testing.allocator.free(r1);
+        try std.testing.expect(std.mem.indexOf(u8, r1, "<system-reminder>") != null);
+
+        const r2 = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-read-hint-dedup.zig\"}");
+        defer std.testing.allocator.free(r2);
+        try std.testing.expect(std.mem.indexOf(u8, r2, "<system-reminder>") == null); // 第二次不再提
+    }
 }

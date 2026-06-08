@@ -121,30 +121,34 @@ pub const registry: []const ToolEntry = &.{
     // 同属"专用搜索/导航工具",比整文件 Read 省 token,引导模型优先用它定位定义。
     .{
         .name = "CodeMap",
-        .description = "Produce a structural outline of code: functions, types, classes, constants " ++
-            "with line numbers and signatures. Pass a file path for one file, or a glob (e.g. " ++
-            "src/**/*.zig) to map many files. Far cheaper than reading whole files when you only " ++
+        .description = "Produce a structural outline of source code: functions, types, classes, " ++
+            "constants with line numbers and signatures. Operates on SOURCE CODE only (not " ++
+            "plain-text, config, JSON, or docs). Pass a file path for one file, or a glob (e.g. " ++
+            "src/**/*) to map many files. Far cheaper than reading whole files when you only " ++
             "need to find where things are defined. Supports zig, typescript, tsx, python, c, bash.",
+        .describe_fn = descriptions.describeCodeMap,
         .input_schema = .{ .type = "object", .prop_specs = &.{
-            .{ .name = "path", .type = "string", .description = "A file path OR a glob pattern (e.g. src/**/*.zig)" },
+            .{ .name = "path", .type = "string", .description = "A file path OR a glob pattern (e.g. src/**/*)" },
             .{ .name = "lang", .type = "string", .description = "Force a language; default infers from extension", .enum_values = &.{ "zig", "typescript", "tsx", "python", "c", "bash" } },
         }, .required = &.{"path"} },
         .execute = code_map_tool.execute,
     },
-    // FindSymbol:跨文件找符号*定义*(tree-sitter)。deferred——藏 ToolSearch 后,
-    // 避免稀释默认工具菜单(同 cc 只 defer 非核心工具的思路)。
+    // FindSymbol:跨文件找符号*定义*(tree-sitter)。常驻默认工具菜单——A/B 实验(2026-06-08,
+    // 192 次真模型)证明 deferred(藏 ToolSearch 后)致"找定义题"压不动(命中率仅 17%,
+    // p=0.156 不显著),模型大量退回 Grep/ToolSearch。提为默认后无需激活即可直接调。
     .{
         .name = "FindSymbol",
-        .description = "Find where a symbol is DEFINED across the codebase. Unlike Grep (which " ++
-            "returns all occurrences), this returns only definitions, with file:line and signature. " ++
-            "Useful for jumping to a function/type/class definition by name.",
+        .description = "Find where a symbol is DEFINED across the codebase (SOURCE CODE only). " ++
+            "Unlike Grep (which returns all occurrences), this returns only definitions, with " ++
+            "file:line and signature. Use this to jump to a function/type/class definition by " ++
+            "name when you don't know which file it lives in. Supports zig, typescript, tsx, " ++
+            "python, c, bash.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "name", .type = "string", .description = "The symbol name to find the definition of" },
             .{ .name = "kind", .type = "string", .description = "Optional kind filter", .enum_values = &.{ "function", "method", "struct", "enum", "union", "type", "constant", "variable", "class", "interface" } },
             .{ .name = "path", .type = "string", .description = "Optional directory/glob to scope the search (defaults to cwd)" },
         }, .required = &.{"name"} },
         .execute = find_symbol_tool.execute,
-        .deferred = true,
     },
     // Bash 排在所有文件/搜索专用工具(Read/Write/Edit/Glob/Grep)之后,对齐 mecode 的
     // 工具顺序(default.md 工具清单:…Glob, Grep, NotebookEdit, Bash…)。MiniMax 类模型
@@ -487,6 +491,18 @@ pub fn toToolDefinitionsWithDyn(
     return toToolDefinitionsFull(allocator, dyn, null);
 }
 
+/// 查工具描述的 env override(slot "TOOL_DESC_<UPPER_NAME>")。命中返回 owned slice
+/// (挂 allocator,同其它描述),否则 null。用于提示词 A/B:同一二进制热切工具描述。
+fn overrideToolDesc(allocator: std.mem.Allocator, tool_name: []const u8) ?[]u8 {
+    const prefix = "TOOL_DESC_";
+    var slot_buf: [prefix.len + 64]u8 = undefined;
+    if (tool_name.len > slot_buf.len - prefix.len) return null;
+    @memcpy(slot_buf[0..prefix.len], prefix);
+    for (tool_name, 0..) |c, i| slot_buf[prefix.len + i] = std.ascii.toUpper(c);
+    const slot = slot_buf[0 .. prefix.len + tool_name.len];
+    return @import("core/prompt_override.zig").lookup(allocator, slot);
+}
+
 /// 完整版：额外接收 PromptContext。非 null 时，有 describe_fn 的工具用动态长描述
 /// （对应 cc 的 tool.prompt(ctx)）；否则回退静态 description。
 /// 动态描述在 `allocator` 上分配（调用方用 arena，session 结束统一释放）。
@@ -500,6 +516,9 @@ pub fn toToolDefinitionsFull(
 
     for (registry) |*tool| {
         const desc: []const u8 = blk: {
+            // env override(slot "TOOL_DESC_<UPPER_NAME>")优先于 describe_fn / 静态描述。
+            // 用于提示词 A/B 实验:同一二进制按 env 切换工具描述,无需重编译。
+            if (overrideToolDesc(allocator, tool.name)) |ov| break :blk ov;
             if (prompt_ctx) |pc| {
                 if (tool.describe_fn) |df| break :blk try df(allocator, pc);
             }
