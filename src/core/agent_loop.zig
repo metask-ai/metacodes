@@ -671,6 +671,7 @@ pub fn run(
         }
         // 子进程心跳(Bash 长命令"仍在运行")per-session 通路:从 opts 透传到 ctx → spawn 层。
         base_ctx.spawn_tick_fn = opts.spawn_tick_fn;
+        base_ctx.session = sess; // UiRequest 路由到本 session 视图(M5)
 
         // 6c. 分批并发执行。过程态(TTY 顶层):无条件 emit tool_start(每个 run slot);
         // **渲染决策(showStartCard/hasProgressCard/喂 spinner)全在 backend**——agent_loop

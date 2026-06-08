@@ -387,6 +387,7 @@ pub const TuiBackend = struct {
     /// trampoline:ToolContext.ui_request_fn 的 *anyopaque state → *TuiBackend。
     pub fn uiRequestTrampoline(
         state: *anyopaque,
+        _: SessionId, // TUI N=1:单终端,忽略 session(GUI 多视图 backend 才据它路由)
         allocator: std.mem.Allocator,
         req: *const ui_request.UiRequest,
         out: *ui_request.UiResponse,

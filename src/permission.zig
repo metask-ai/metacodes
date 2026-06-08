@@ -55,6 +55,11 @@ pub const PermissionContext = struct {
     /// null = 无 runner → ask 退回文字 prompt。
     ui_request_state: ?*anyopaque = null,
     ui_request_fn: ?@import("core/protocol/ui_request.zig").UiRequestFn = null,
+    /// 本 ctx 归属的会话(权限对话框路由到对应 session 视图)。默认 .single(N=1)。
+    /// **M6 待办**:这与 ToolContext.session 是同一概念的两份拷贝(权限路径走 PermissionContext,
+    /// 工具路径走 ToolContext)。M6 拆 SessionContext 后,两者都从 SessionContext.id 取,这俩
+    /// 字段消失。在此之前 M6 必须**同时**填这俩,否则权限框/工具框路由到不同 session(不一致)。
+    session: @import("core/session_id.zig").SessionId = @import("core/session_id.zig").SessionId.single,
 
     /// 读 mode(acquire:看到其它线程的 setMode release 写)。
     pub fn modeValue(self: *const PermissionContext) types.PermissionMode {

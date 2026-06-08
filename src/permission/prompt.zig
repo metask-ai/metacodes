@@ -37,7 +37,7 @@ pub fn ask(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bo
             if (ctx.ui_request_fn) |runner| {
                 const req = ui_request.UiRequest{ .permission = .{ .tool = tool_name, .args = args } };
                 var resp: ui_request.UiResponse = undefined;
-                runner(ctx.ui_request_state.?, arena.allocator(), &req, &resp) catch break :blk null;
+                runner(ctx.ui_request_state.?, ctx.session, arena.allocator(), &req, &resp) catch break :blk null;
                 break :blk switch (resp) {
                     .permission => |c| c,
                     else => null,
