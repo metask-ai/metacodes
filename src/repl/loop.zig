@@ -1265,7 +1265,7 @@ fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
         if (app.api_client.catalog.entries.items.len > 0) {
             std.debug.print("available (from server):\n", .{});
             for (app.api_client.catalog.entries.items) |e| {
-                std.debug.print("  {s}  (max_output={d})\n", .{ e.model_id, e.max_tokens });
+                std.debug.print("  {s}  (context={?d} max_output={?d})\n", .{ e.model_id, e.max_input_tokens, e.max_tokens });
             }
         } else {
             std.debug.print("known model families:\n", .{});
