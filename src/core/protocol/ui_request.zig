@@ -38,8 +38,15 @@ pub const UiResponse = union(enum) {
 
 /// 统一回调签名(挂 ToolContext)。state 指向 *TuiBackend(经 trampoline)。
 /// out 由调用方栈上提供,回调写入;ask_question 的 answers slice owned by allocator。
+///
+/// **多 Session 路由**:session 标识该请求归属哪个会话——GUI backend 据它把对话框渲染到
+/// 对应 session 的视图(TUI N=1 忽略)。与 emit/poll 同款 envelope-on-signature(M4 D1)。
+/// **保持同步**:工具调它本就须阻塞自己 session 的线程等用户答(它要答案才能继续);
+/// 并发隔离归 M6 per-session 线程,不在协议层做异步 request_id(避死循环/响应丢失)。
+pub const SessionId = @import("../session_id.zig").SessionId;
 pub const UiRequestFn = *const fn (
     state: *anyopaque,
+    session: SessionId,
     allocator: std.mem.Allocator,
     req: *const UiRequest,
     out: *UiResponse,

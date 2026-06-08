@@ -30,6 +30,7 @@ pub const agent_job_registry = @import("core/agent_job_registry.zig");
 pub const cron_registry = @import("core/cron_registry.zig");
 pub const cache_break = @import("core/cache_break.zig");
 pub const transcript = @import("core/transcript.zig");
+pub const session_id = @import("core/session_id.zig"); // SessionId 值类型(多 Session 基石)
 pub const system_prompt = @import("core/system_prompt.zig");
 pub const answer_queue = @import("core/answer_queue.zig");
 pub const recorder = @import("core/recorder.zig");
@@ -51,6 +52,7 @@ pub const permission = @import("permission.zig"); // PermissionContext
 pub const permission_decision = @import("permission/decision.zig");
 pub const permission_settings = @import("permission/settings.zig");
 pub const permission_prompt = @import("permission/prompt.zig"); // 断 UI 后纯协议路径
+pub const permission_session_rules = @import("permission/session_rules.zig"); // per-session 权限记忆
 
 // ── agents / skills / mcp / sandbox ────────────────────────────────────────
 pub const agents_def = @import("agents/def.zig");

@@ -27,6 +27,29 @@ const CoreEvent = ui_event.CoreEvent;
 
 pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error, tool_loop };
 
+/// 工具进度 trampoline:把工具的 progress 回调(WebSearch query/results)转成 CoreEvent,
+/// 经 backend 路由到归属 session 的 UI。per-run 实例(backend + session),progress_state 指它。
+///
+/// **生命周期 invariant**:progress_state 指向的 ProgressTramp 栈变量(agent_loop while-turn
+/// 块内)必须活过 `executeSlots`——progress_fn 只在 executeSlots 同步执行期间被工具回调,
+/// 那时存储仍在帧上。**若将来把工具执行改成异步/跨 turn 持有 ctx,必须把它移到更长寿的存储**
+/// (否则 progress_fn 在栈回收后触发 = UAF)。
+const ProgressTramp = struct {
+    be: *const UiBackend,
+    session: @import("session_id.zig").SessionId,
+    fn cb(state: *anyopaque, id: []const u8, phase: tools_mod.ToolContext.ProgressPhase, text: []const u8, count: u32) void {
+        const self: *@This() = @ptrCast(@alignCast(state));
+        var buf: [192]u8 = undefined;
+        const line: []const u8 = switch (phase) {
+            // 对齐 cc UI.tsx:query_update→"Searching: q";results_received→"Found N results…".
+            .query_update => std.fmt.bufPrint(&buf, "Searching: {s}", .{text}) catch text,
+            .results_received => std.fmt.bufPrint(&buf, "Found {d} results for \"{s}\"", .{ count, text }) catch text,
+        };
+        // line 是栈 borrow,emit 同步消费(TuiBackend.setToolProgress 立即拷进定长卡)。
+        self.be.emitEvent(self.session, .{ .tool_progress = .{ .id = id, .text = line } });
+    }
+};
+
 /// 同一工具连续返回同样错误码达到此次数 → 判定模型陷入死循环,熔断中止本轮 run。
 /// 实战痛点(e2e 实测):MiniMax 端点对 Task/TaskCreate 反复发空参 `{}`,触发同一
 /// MissingField 错误,从 ~46 turn 烧到 max_turns=50 才停。3 次足以区分"偶发重试"
@@ -61,6 +84,9 @@ pub const RunResult = struct {
 
 pub const Options = struct {
     max_turns: u32 = 50,
+    /// 本次 run 归属的会话(emit/poll 路由用)。默认 .single(N=1/TUI);M6 多 Session 时
+    /// 由 SessionContext 传各自的 id。所有 backend.emitEvent 用它路由到对应 UI 视图。
+    session: @import("session_id.zig").SessionId = @import("session_id.zig").SessionId.single,
     system_prompt: ?[]const u8 = null,
     verbose: bool = false,
     abort: ?*const AbortSignal = null,
@@ -152,6 +178,9 @@ pub const Options = struct {
     /// false(headless/单测)→ 不 emit 工具卡事件,保持纯净输出。
     /// (原 tool_render_theme: ?*const Theme,只当存在标志用;为解 core→UI 类型依赖降为 bool。)
     emit_tool_cards: bool = false,
+    /// 子进程长命令"仍在运行"心跳回调(per-session,传给 ToolContext.spawn_tick_fn → spawn 层)。
+    /// 重构前是 tools/common.zig 进程全局 g_progress_cb。REPL tty 下 loop.zig 设;headless=null。
+    spawn_tick_fn: ?*const fn (elapsed_ms: u64, argv0: []const u8) void = null,
     /// 是否给 assistant 流式文本加 ANSI 着色(\x1b[32m…)。前台交互 REPL = true;
     /// 后台 subagent(输出经 SinkWriter 进可查询缓冲)/headless = false,否则 final_text
     /// 会混入 \x1b[32m 等控制码。
@@ -201,6 +230,8 @@ pub fn run(
     backend: *const UiBackend,
     allocator: std.mem.Allocator,
 ) !RunResult {
+    // 本次 run 归属的会话(emit/poll 路由用)。N=1/TUI 默认 .single;M6 由 SessionContext 传。
+    const sess = opts.session;
     var turns: u32 = 0;
     var total_tool_calls: u32 = 0;
     // max_tokens 续写计数:防止模型一直撞上限导致无限续写。上限 3 次。
@@ -256,7 +287,7 @@ pub fn run(
             }.f) catch conversation.compactKeepRecent(opts.auto_compact_keep_recent);
             if (dropped > 0) {
                 log.info("agent", "auto-compact: dropped {d} old messages ({d} -> {d}) threshold={d}", .{ dropped, before, conversation.len(), auto_threshold });
-                backend.emitEvent(.{ .auto_compact = .{ .dropped = @as(u32, @intCast(dropped)), .kept = @as(u32, @intCast(conversation.len())) } });
+                backend.emitEvent(sess, .{ .auto_compact = .{ .dropped = @as(u32, @intCast(dropped)), .kept = @as(u32, @intCast(conversation.len())) } });
             }
         }
 
@@ -319,12 +350,13 @@ pub fn run(
         // 门控/格式/着色全在 backend 的 .retry_notice 处理(show_retry/colorize)——此处只转发。
         const RetryUi = struct {
             be: *const UiBackend,
+            session: @import("session_id.zig").SessionId,
             fn report(state: *anyopaque, attempt: u32, max: u32, delay_ms: u64) void {
                 const self: *@This() = @ptrCast(@alignCast(state));
-                self.be.emitEvent(.{ .retry_notice = .{ .attempt = attempt, .max = max, .delay_ms = delay_ms } });
+                self.be.emitEvent(self.session, .{ .retry_notice = .{ .attempt = attempt, .max = max, .delay_ms = delay_ms } });
             }
         };
-        var retry_ui = RetryUi{ .be = backend };
+        var retry_ui = RetryUi{ .be = backend, .session = sess };
         const reporter = client_mod.RetryReporter{ .state = @ptrCast(&retry_ui), .report = RetryUi.report };
 
         // Plan 模式每轮把 plan 指令追加到 system prompt(对齐 mecode 每轮 developer_instructions):
@@ -375,7 +407,7 @@ pub fn run(
         var tool_uses = std.ArrayList(msg.ToolUse).empty;
         defer tool_uses.deinit(allocator);
 
-        if (opts.colorize) backend.emitEvent(.stream_begin);
+        if (opts.colorize) backend.emitEvent(sess, .stream_begin);
         var aborted_during_stream = false;
         var stream_error = false;
         while (true) {
@@ -394,7 +426,7 @@ pub fn run(
             const ev = ev_opt orelse break;
             switch (ev) {
                 .text => |text| {
-                    backend.emitEvent(.{ .text_chunk = text });
+                    backend.emitEvent(sess, .{ .text_chunk = text });
                     try assistant_text.appendSlice(allocator, text);
                     log.debugId("agent", rid, "text chunk bytes={d}", .{text.len});
                     // text bytes 是 stream 分配的 owned——用完必须 free，否则泄漏
@@ -415,7 +447,7 @@ pub fn run(
                     // 主对话:照打 UI 装饰(⏺ Web Search ...),TUI 字节与旧版一致。
                     // ui_text 是预渲染的可见 assistant 内容(例外:含 ANSI 但属"可见输出")。
                     // content_json(结构化结果)主对话不消费(仅 web_search.zig 子请求用)。
-                    backend.emitEvent(.{ .text_chunk = w.ui_text });
+                    backend.emitEvent(sess, .{ .text_chunk = w.ui_text });
                     try assistant_text.appendSlice(allocator, w.ui_text);
                     allocator.free(w.ui_text);
                     allocator.free(w.content_json);
@@ -435,7 +467,7 @@ pub fn run(
             }
         }
         // 闭颜色括号 + 尾换行由 backend 决定(colorize ? "\x1b[0m\n" : "\n")。
-        backend.emitEvent(.stream_done);
+        backend.emitEvent(sess, .stream_done);
 
         // 抓本轮 API 报告的 stop_reason(stream.deinit 前读;defer 在 turn 末才执行)
         const turn_stop_reason = stream.stopReason();
@@ -557,7 +589,9 @@ pub fn run(
                     slot.is_error = true;
                 },
                 .ask => {
-                    const allowed = permission_mod.promptUser(tu.name, tu.input, allocator) catch false;
+                    // ctx constCast:promptUser 写 session 记忆(有副作用)。同 plan_mode 分支
+                    // 的 @constCast 先例——agent_loop 持 *const 但权限交互本就改 per-session 状态。
+                    const allowed = permission_mod.promptUser(@constCast(permission_ctx), tu.name, tu.input) catch false;
                     log.infoId("permission", rid, "prompt tool={s} user_allowed={}", .{ tu.name, allowed });
                     if (!allowed) {
                         slot.decision = .denied;
@@ -579,6 +613,9 @@ pub fn run(
             const pp = @import("proposed_plan.zig");
             proposed_plan_buf = pp.extractProposedPlan(allocator, assistant_text.items) catch null;
         }
+        // 工具进度 trampoline 的 per-run 存储(backend + session),供 progress_state 指向。
+        // 声明在 base_ctx 同作用域,生命周期覆盖整个工具执行。
+        var progress_tramp: ProgressTramp = undefined;
         var base_ctx = tools_mod.ToolContext{
             .allocator = allocator,
             .abort = opts.abort,
@@ -621,21 +658,9 @@ pub fn run(
         // depth==0 才接(子 agent 不驱动顶层 TUI)。WriterBackend 的 tool_progress no-op → 无害,
         // 故去掉旧 @hasDecl 探测。
         if (opts.agent_depth == 0) {
-            const Tramp = struct {
-                fn cb(state: *anyopaque, id: []const u8, phase: tools_mod.ToolContext.ProgressPhase, text: []const u8, count: u32) void {
-                    const be: *const UiBackend = @ptrCast(@alignCast(state));
-                    var buf: [192]u8 = undefined;
-                    const line: []const u8 = switch (phase) {
-                        // 对齐 cc UI.tsx:query_update→"Searching: q";results_received→"Found N results for "q"".
-                        .query_update => std.fmt.bufPrint(&buf, "Searching: {s}", .{text}) catch text,
-                        .results_received => std.fmt.bufPrint(&buf, "Found {d} results for \"{s}\"", .{ count, text }) catch text,
-                    };
-                    // line 是栈 borrow,emit 同步消费(TuiBackend.setToolProgress 立即拷进定长卡)。
-                    be.emitEvent(.{ .tool_progress = .{ .id = id, .text = line } });
-                }
-            };
-            base_ctx.progress_state = @constCast(@ptrCast(backend));
-            base_ctx.progress_fn = &Tramp.cb;
+            progress_tramp = .{ .be = backend, .session = sess };
+            base_ctx.progress_state = @ptrCast(&progress_tramp);
+            base_ctx.progress_fn = &ProgressTramp.cb;
         }
 
         // 统一 UI 请求回调(AskUserQuestion/权限/plan 审批共用):仅顶层 TUI(depth==0)接——
@@ -644,6 +669,9 @@ pub fn run(
             base_ctx.ui_request_state = opts.ui_request_state;
             base_ctx.ui_request_fn = opts.ui_request_fn;
         }
+        // 子进程心跳(Bash 长命令"仍在运行")per-session 通路:从 opts 透传到 ctx → spawn 层。
+        base_ctx.spawn_tick_fn = opts.spawn_tick_fn;
+        base_ctx.session = sess; // UiRequest 路由到本 session 视图(M5)
 
         // 6c. 分批并发执行。过程态(TTY 顶层):无条件 emit tool_start(每个 run slot);
         // **渲染决策(showStartCard/hasProgressCard/喂 spinner)全在 backend**——agent_loop
@@ -652,7 +680,7 @@ pub fn run(
         if (opts.emit_tool_cards and opts.agent_depth == 0) {
             for (slots.items) |*s| {
                 if (s.decision != .run) continue;
-                backend.emitEvent(.{ .tool_start = .{ .id = s.id, .name = s.name, .input = s.input } });
+                backend.emitEvent(sess, .{ .tool_start = .{ .id = s.id, .name = s.name, .input = s.input } });
             }
         }
         // 进度上报:本轮第一个 run slot 的工具名 + 原始 input(subagent agent 树显示当前动作)。
@@ -666,11 +694,11 @@ pub fn run(
         }
         tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
         if (opts.emit_tool_cards and opts.agent_depth == 0) {
-            backend.emitEvent(.clear_current_tool);
+            backend.emitEvent(sess, .clear_current_tool);
             // 进度卡工具的清卡也无条件发(backend 据 name 自决 clearToolCard)。
             for (slots.items) |*s| {
                 if (s.decision == .run) {
-                    backend.emitEvent(.{ .tool_result = .{ .id = s.id, .name = s.name, .input = s.input, .content = "", .is_error = s.is_error } });
+                    backend.emitEvent(sess, .{ .tool_result = .{ .id = s.id, .name = s.name, .input = s.input, .content = "", .is_error = s.is_error } });
                 }
             }
         }
@@ -706,7 +734,7 @@ pub fn run(
             // Grep/Glob 摘要、Read 摘要。headless/单测 tool_render_theme=null → 跳过(emit 仍发,
             // 但那些场景用 WriterBackend,tool_result no-op)。渲染移入 backend(renderResult)。
             if (opts.emit_tool_cards) {
-                backend.emitEvent(.{ .tool_result = .{
+                backend.emitEvent(sess, .{ .tool_result = .{
                     .id = s.id,
                     .name = s.name,
                     .input = s.input,

@@ -1,78 +1,26 @@
 //! 用户交互:权限询问(prompt 模式的 yes/always/no/don't-ask)。
 //!
-//! 已设注入的 UI runner(TuiBackend 经 setDialogRunner)→ 发 .permission UiRequest 让前端渲染;
-//! 无 runner → 退回最简文字 prompt。**不直接依赖任何 TUI 对话框**(库可在无 UI 时复用)。
+//! 已设注入的 UI runner(PermissionContext.ui_request_fn)→ 发 .permission UiRequest 让前端
+//! 渲染;无 runner → 退回最简文字 prompt。**不直接依赖任何 TUI 对话框**(库可在无 UI 时复用)。
 //!
-//! "Yes always" / "Don't ask again" 的 session 级记忆:本模块用一个进程级 SessionRules
-//! 暂存(同 tool_name 不再问)。完整 settings.local.json 持久化由 App 层做(它知道文件路径)。
+//! Session 级记忆("Yes always" / "Don't ask again")、persist 路径、UI runner 全部经
+//! PermissionContext 携带(每 session 一份),不再用进程全局——多 Session 不串台。
 
 const std = @import("std");
 const category = @import("category.zig");
 const PermissionChoice = @import("../core/protocol/permission_choice.zig").PermissionChoice;
-
-/// Session 级权限记忆:always-allow / session-deny 的工具名集合。
-/// 进程级(单 session),不持久化。键是 tool_name(值语义拷贝,固定上限避免无限增长)。
-const MAX_REMEMBERED = 64;
-var g_always_allow: [MAX_REMEMBERED][]const u8 = undefined;
-var g_always_allow_count: usize = 0;
-var g_session_deny: [MAX_REMEMBERED][]const u8 = undefined;
-var g_session_deny_count: usize = 0;
-var g_buf: [MAX_REMEMBERED * 2][64]u8 = undefined; // 工具名拷贝存储
-var g_buf_used: usize = 0;
-
-fn remember(list: *[MAX_REMEMBERED][]const u8, count: *usize, name: []const u8) void {
-    if (count.* >= MAX_REMEMBERED) return;
-    if (g_buf_used >= g_buf.len or name.len > 64) return;
-    const slot = &g_buf[g_buf_used];
-    g_buf_used += 1;
-    @memcpy(slot[0..name.len], name);
-    list[count.*] = slot[0..name.len];
-    count.* += 1;
-}
-
-/// 全局上下文:App 启动时 set,allow_always 选项写 settings.local.json 用。
-/// project_dir 为 null 时退回 ~/.claude/settings.json。
-var g_project_dir: ?[]const u8 = null;
-var g_home: ?[]const u8 = null;
-
-pub fn setPersistContext(project_dir: ?[]const u8, home: []const u8) void {
-    g_project_dir = project_dir;
-    g_home = home;
-}
-
-/// 可选的统一 UI 请求 runner 注入:有 TuiBackend 时,loop.zig 把它设成 backend 的
-/// uiRequestTrampoline(终端接管 + 按 tag 分派)。null = 没设 → ask() 回退文字 prompt。
-/// 与 ask_question/plan_approval 共用同一回调(三套 UI 请求已统一)。
 const ui_request = @import("../core/protocol/ui_request.zig");
-var g_ui_runner: ?ui_request.UiRequestFn = null;
-var g_ui_runner_state: ?*anyopaque = null;
+const PermissionContext = @import("../permission.zig").PermissionContext;
 
-pub fn setDialogRunner(
-    state: *anyopaque,
-    runner: ui_request.UiRequestFn,
-) void {
-    g_ui_runner_state = state;
-    g_ui_runner = runner;
-}
-
-/// 清除 runner(生成期结束后,避免悬垂指向已失效的 TuiBackend 栈实例)。
-pub fn clearDialogRunner() void {
-    g_ui_runner = null;
-    g_ui_runner_state = null;
-}
-
-fn contains(list: []const []const u8, name: []const u8) bool {
-    for (list) |n| if (std.mem.eql(u8, n, name)) return true;
-    return false;
-}
-
-/// 阻塞式询问用户。返回 true = 允许。
-/// 先查 session 记忆;否则:有预置应答队列(非 tty e2e)→ 走文字路径从队列弹;
-/// 否则 TTY 走对话框,非 TTY 走文字。
-pub fn ask(tool_name: []const u8, args: []const u8) !bool {
-    // session 记忆优先
-    if (contains(g_always_allow[0..g_always_allow_count], tool_name)) return true;
-    if (contains(g_session_deny[0..g_session_deny_count], tool_name)) return false;
+/// 阻塞式询问用户。返回 true = 允许。ctx 携带 session 记忆 / UI runner / persist 路径。
+/// **ctx 非 const**:本函数有副作用(写 session 记忆 rememberAllow/Deny、写 settings.local.json)。
+/// 线程契约:M6 前假设单线程调用(SessionRules 无锁);M6 多 session 多线程化时给 SessionRules 加锁。
+pub fn ask(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bool {
+    // session 记忆优先(per-session,不串台)
+    if (ctx.session_rules) |sr| {
+        if (sr.isAllowed(tool_name)) return true;
+        if (sr.isDenied(tool_name)) return false;
+    }
 
     // 预置应答队列曾加载(Stage 3 e2e)→ 强制走文字路径(askText 从队列弹/耗尽则
     // 安全默认 deny,**绝不**退回读 fd 0——它被 REPL 行流独占,会死等)。
@@ -80,16 +28,16 @@ pub fn ask(tool_name: []const u8, args: []const u8) !bool {
         return askText(tool_name, args);
     }
 
-    // TTY + 已注入 runner → 经 UiRequest 让前端(TuiBackend)渲染对话框。
+    // TTY + 已注入 runner → 经 UiRequest 让前端渲染对话框。
     // 无 runner(库消费者未接 UI / 无 watcher 场景)→ 落到下方文字 prompt。
     if ((std.c.isatty(0) != 0)) {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const choice_opt: ?PermissionChoice = blk: {
-            if (g_ui_runner) |runner| {
+            if (ctx.ui_request_fn) |runner| {
                 const req = ui_request.UiRequest{ .permission = .{ .tool = tool_name, .args = args } };
                 var resp: ui_request.UiResponse = undefined;
-                runner(g_ui_runner_state.?, arena.allocator(), &req, &resp) catch break :blk null;
+                runner(ctx.ui_request_state.?, ctx.session, arena.allocator(), &req, &resp) catch break :blk null;
                 break :blk switch (resp) {
                     .permission => |c| c,
                     else => null,
@@ -101,21 +49,28 @@ pub fn ask(tool_name: []const u8, args: []const u8) !bool {
             switch (choice) {
                 .allow_once => return true,
                 .allow_always => {
-                    remember(&g_always_allow, &g_always_allow_count, tool_name);
-                    // 持久化:写到 settings.local.json(project)或 ~/.claude/settings.json
-                    if (g_home) |home| {
+                    if (ctx.session_rules) |sr| sr.rememberAllow(tool_name);
+                    // 持久化:写到 settings.local.json(project)或 ~/.claude/settings.json。
+                    // 路径上下文复用 ctx.match_ctx(project_root / home)——App init 在 ask 之前填好。
+                    const home = ctx.match_ctx.home;
+                    if (home.len > 0) {
                         const writer = @import("settings_writer.zig");
                         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-                        const written = writer.addAllowRule(arena.allocator(), g_project_dir, home, tool_name, &path_buf) catch null;
+                        const project: ?[]const u8 = if (ctx.match_ctx.project_root.len > 0) ctx.match_ctx.project_root else null;
+                        const written = writer.addAllowRule(arena.allocator(), project, home, tool_name, &path_buf) catch null;
                         if (written) |p| {
                             std.debug.print("\x1b[2m(persisted to {s})\x1b[0m\n", .{p});
                         }
+                    } else {
+                        // match_ctx 未填(理论上 ask 总在 init 后,home 非空)。仍 allow_always,
+                        // 但 session 内有效、不落盘——显式 warn,避免"权限记不住"静默失败抓瞎。
+                        @import("../util/log.zig").warn("permission", "allow_always persist skipped: match_ctx.home empty (only session-scoped)", .{});
                     }
                     return true;
                 },
                 .deny_once => return false,
                 .deny_tool_session => {
-                    remember(&g_session_deny, &g_session_deny_count, tool_name);
+                    if (ctx.session_rules) |sr| sr.rememberDeny(tool_name);
                     return false;
                 },
             }
@@ -159,11 +114,5 @@ fn askText(tool_name: []const u8, args: []const u8) !bool {
     return false;
 }
 
-test "ask 不崩(非 tty 路径覆盖在集成测试)" {
-    // session 记忆 helper 单测
-    g_always_allow_count = 0;
-    g_buf_used = 0;
-    remember(&g_always_allow, &g_always_allow_count, "Bash");
-    try std.testing.expect(contains(g_always_allow[0..g_always_allow_count], "Bash"));
-    try std.testing.expect(!contains(g_always_allow[0..g_always_allow_count], "Write"));
-}
+// session 记忆的单测在 session_rules.zig;ask 的真链路(answer_queue → ask → askText)
+// 在 tests/component/answer_queue_test.zig 覆盖。本模块不再放占位测试。

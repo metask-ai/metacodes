@@ -19,6 +19,7 @@ const headless_backend = cc.headless_backend;
 const CoreEvent = ui_event.CoreEvent;
 const UiEvent = ui_event.UiEvent;
 const UiBackend = ui_backend.UiBackend;
+const SessionId = ui_backend.SessionId;
 
 // ── 一轮纯文本响应(end_turn) ──────────────────────────────────────────────
 const TEXT_SSE =
@@ -35,6 +36,7 @@ const Recorder = struct {
     tags: std.ArrayList([]const u8) = .empty, // 事件 tag 名序列(静态字面量,不拷)
     texts: std.ArrayList([]u8) = .empty, // text_chunk 的内容(深拷贝)
     allocator: std.mem.Allocator,
+    last_session: SessionId = SessionId.single,
 
     fn init(a: std.mem.Allocator) Recorder {
         return .{ .allocator = a };
@@ -47,8 +49,9 @@ const Recorder = struct {
     fn backend(self: *Recorder) UiBackend {
         return .{ .ctx = @ptrCast(self), .emit = emitThunk, .poll = pollThunk };
     }
-    fn emitThunk(ctx: *anyopaque, ev: CoreEvent) void {
+    fn emitThunk(ctx: *anyopaque, session: SessionId, ev: CoreEvent) void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.last_session = session; // 记录最近事件归属的 session(验路由)
         self.tags.append(self.allocator, @tagName(ev)) catch return;
         // text_chunk 的 borrow slice 必须**同步深拷贝**(emit 返回后即失效)。
         if (ev == .text_chunk) {
@@ -58,7 +61,7 @@ const Recorder = struct {
             };
         }
     }
-    fn pollThunk(_: *anyopaque) ?UiEvent {
+    fn pollThunk(_: *anyopaque, _: SessionId) ?UiEvent {
         return null;
     }
     fn hasTag(self: *const Recorder, tag: []const u8) bool {
@@ -127,6 +130,71 @@ test "阶段E: mock backend 跑真 agent_loop,断言 CoreEvent 序列(纯内存,
     const joined = try rec.joinedText(a);
     defer a.free(joined);
     try std.testing.expectEqualStrings("hello world", joined);
+
+    // M4:事件归属 session 正确路由。未传 .session → 默认 .single,emit 带的就是它。
+    try std.testing.expect(std.mem.eql(u8, &rec.last_session.bytes, &SessionId.single.bytes));
+}
+
+// M6(还 M4 欠条):传**非 .single** session → emit 端到端带同一个(证路由真透传,
+// 不是某处硬编码 .single)。这是 M4 占位断言(只测默认值)的真正补强。
+test "M6: 自定义 session 经 agent_loop emit 端到端透传(非默认路由)" {
+    const a = std.testing.allocator;
+    const bodies = [_][]const u8{TEXT_SSE};
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "k", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "hi");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+
+    var rec = Recorder.init(a);
+    defer rec.deinit();
+    const be = rec.backend();
+
+    // 造一个明确非 .single 的 session。
+    const custom = cc.session_id.gen();
+    try std.testing.expect(!std.mem.eql(u8, &custom.bytes, &SessionId.single.bytes));
+
+    _ = agent_loop.run(&conv, &client, &.{}, &perm, .{ .max_turns = 3, .colorize = true, .session = custom }, &be, a) catch
+        return error.SkipZigTest;
+
+    // emit 收到的 session == 传入的 custom(路由按值透传,无中途丢失/硬编码 .single)。
+    try std.testing.expect(std.mem.eql(u8, &rec.last_session.bytes, &custom.bytes));
+}
+
+// M6(还 M5 欠条):ToolContext.requestUi 把 ctx.session 透传给 UiRequestFn 回调。
+// 用一个捕获 session 的 mock runner,验自定义 session 不被弄丢(现 plan/ask mock 都忽略 session)。
+const SessionCapture = struct {
+    threadlocal var got: SessionId = SessionId.single;
+    fn runner(_: *anyopaque, session: SessionId, _: std.mem.Allocator, _: *const cc.ui_request.UiRequest, out: *cc.ui_request.UiResponse) anyerror!void {
+        got = session;
+        out.* = .{ .plan_approval = .reject };
+    }
+};
+
+test "M6: requestUi 把 ctx.session 透传给 UiRequestFn(非默认)" {
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    const custom = cc.session_id.gen();
+    var ctx = cc.tool_context.ToolContext{
+        .allocator = a,
+        .ui_request_state = @ptrCast(&dummy),
+        .ui_request_fn = &SessionCapture.runner,
+        .session = custom,
+    };
+    const req = cc.ui_request.UiRequest{ .plan_approval = .{ .plan_md = "x" } };
+    var resp: cc.ui_request.UiResponse = undefined;
+    _ = try ctx.requestUi(a, &req, &resp);
+    // 回调收到的 session == ctx.session(透传未丢)。
+    try std.testing.expect(std.mem.eql(u8, &SessionCapture.got.bytes, &custom.bytes));
 }
 
 // ── HeadlessBackend:CoreEvent → JSON 行 ─────────────────────────────────────
@@ -155,12 +223,12 @@ test "阶段E: HeadlessBackend 每个 CoreEvent → 可解析的 JSON 行" {
     var hb = headless_backend.HeadlessBackend.init(a, @ptrCast(&js), JsonSink.sink);
     const be = hb.backend();
 
-    be.emitEvent(.stream_begin);
-    be.emitEvent(.{ .text_chunk = "答案是" });
-    be.emitEvent(.{ .tool_start = .{ .id = "tu1", .name = "Bash", .input = "{}" } });
-    be.emitEvent(.{ .tool_result = .{ .id = "tu1", .name = "Bash", .input = "{}", .content = "ok", .is_error = false, .elapsed_ms = 12 } });
-    be.emitEvent(.{ .usage = .{ .input_tokens = 5, .output_tokens = 3 } });
-    be.emitEvent(.stream_done);
+    be.emitEvent(SessionId.single, .stream_begin);
+    be.emitEvent(SessionId.single, .{ .text_chunk = "答案是" });
+    be.emitEvent(SessionId.single, .{ .tool_start = .{ .id = "tu1", .name = "Bash", .input = "{}" } });
+    be.emitEvent(SessionId.single, .{ .tool_result = .{ .id = "tu1", .name = "Bash", .input = "{}", .content = "ok", .is_error = false, .elapsed_ms = 12 } });
+    be.emitEvent(SessionId.single, .{ .usage = .{ .input_tokens = 5, .output_tokens = 3 } });
+    be.emitEvent(SessionId.single, .stream_done);
 
     try std.testing.expectEqual(@as(usize, 6), js.lines.items.len);
 

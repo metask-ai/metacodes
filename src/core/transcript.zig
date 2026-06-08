@@ -27,28 +27,12 @@ const util_fs = @import("../util/fs.zig");
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
 
-pub const SessionId = struct {
-    bytes: [24]u8, // 16 hex(time) + 8 hex(rand) = 24 chars
+const session_id_mod = @import("session_id.zig");
+pub const SessionId = session_id_mod.SessionId;
 
-    pub fn asSlice(self: *const SessionId) []const u8 {
-        return self.bytes[0..];
-    }
-};
-
-/// 生成 session id：ms 时间戳 + 4 byte 随机。自然可排序。
+/// genSessionId 是 session_id.gen 的兼容别名(保留供既有调用方;新代码直接用 session_id.gen)。
 pub fn genSessionId() SessionId {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
-    const ms: u64 = @intCast(@divTrunc(@as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000), 1));
-    // 不要真随机：用 monotonic ns 低 32 位
-    var ts2: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts2);
-    const rand: u32 = @truncate(@as(u64, @bitCast(@as(i64, @intCast(ts2.nsec)))));
-
-    var id: SessionId = undefined;
-    _ = std.fmt.bufPrint(id.bytes[0..16], "{x:0>16}", .{ms}) catch unreachable;
-    _ = std.fmt.bufPrint(id.bytes[16..24], "{x:0>8}", .{rand}) catch unreachable;
-    return id;
+    return session_id_mod.gen();
 }
 
 /// 计算 cwd hash（xxhash64 lo 32 位 hex + hi 32 位 hex）。

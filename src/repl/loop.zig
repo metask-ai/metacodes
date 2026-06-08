@@ -62,9 +62,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     const stdin_fd: std.c.fd_t = 0;
     const tty = std.c.isatty(stdin_fd) != 0;
 
-    // 进入 TUI：开启工具 progress 显示（非 TTY 不启用避免污染 pipe 输出）
-    if (tty) progress.enable();
-    defer if (tty) progress.disable();
+    // 工具 progress 心跳:tty 下经 agent_loop Options.spawn_tick_fn 传入(per-session,非全局)。
+    // 非 TTY 不接(避免污染 pipe 输出)。具体在每次 run() 的 Options 里设 .spawn_tick_fn。
+    const spawn_tick: ?*const fn (u64, []const u8) void = if (tty) &progress.progressCb else null;
 
     // 待发送队列:生成期用户按回车提交的消息进此队列;本轮 LLM 结束后,主循环从队首
     // 逐条取出作为后续 input 续发,直到队空(对齐 Claude Code commandQueue)。
@@ -437,19 +437,22 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         if (tty) {
             if (tui_be) |*tb| try tb.startInput(stdin_fd, app, allocator);
         }
-        // 权限弹窗 dialog runner:有 TuiBackend 时注入终端接管路径(停 watcher+持锁,不抢 fd0)。
-        // 生成期结束统一 clear(defer),避免悬垂指向 tui_be 栈实例。
+        // 权限弹窗 UI runner:有 TuiBackend 时注入到 per-session permission_ctx(终端接管路径:
+        // 停 watcher+持锁,不抢 fd0)。生成期结束统一清(defer),避免悬垂指向 tui_be 栈实例。
         if (tui_be) |*tb| {
-            const prompt_mod = @import("../permission/prompt.zig");
-            prompt_mod.setDialogRunner(@ptrCast(tb), &tui_backend_mod.TuiBackend.uiRequestTrampoline);
+            app.permission_ctx.ui_request_state = @ptrCast(tb);
+            app.permission_ctx.ui_request_fn = &tui_backend_mod.TuiBackend.uiRequestTrampoline;
         }
-        defer if (tui_be != null) @import("../permission/prompt.zig").clearDialogRunner();
+        defer if (tui_be != null) {
+            app.permission_ctx.ui_request_state = null;
+            app.permission_ctx.ui_request_fn = null;
+        };
         const result = agent_loop.run(
             &app.conversation,
             &app.api_client,
             app.tool_defs,
             &app.permission_ctx,
-            .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .activate_tool_state = @ptrCast(app), .activate_tool_fn = &app_mod.App.activateToolTrampoline, .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline, .ui_request_state = if (tui_be) |*tb| @as(*anyopaque, @ptrCast(tb)) else null, .ui_request_fn = if (tui_be != null) &tui_backend_mod.TuiBackend.uiRequestTrampoline else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true },
+            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .activate_tool_state = @ptrCast(app), .activate_tool_fn = &app_mod.App.activateToolTrampoline, .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline, .ui_request_state = if (tui_be) |*tb| @as(*anyopaque, @ptrCast(tb)) else null, .ui_request_fn = if (tui_be != null) &tui_backend_mod.TuiBackend.uiRequestTrampoline else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
             &ui_be,
             allocator,
         ) catch |err| {
@@ -1205,7 +1208,7 @@ fn retryLast(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui
         &app.api_client,
         app.tool_defs,
         &app.permission_ctx,
-        .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry },
         backend,
         allocator,
     ) catch |err| {
@@ -1831,12 +1834,13 @@ fn handleSkillInvocation(app: *app_mod.App, allocator: std.mem.Allocator, rest: 
     const be = wb.backend();
     const usage_sink = app.usageSink();
     const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*jr| jr else null;
+    // 辅助路径(skill 调用 / cron 注入),非用户盯着的主交互循环 → 不接 spawn_tick_fn(默认 null,Bash 长命令静默,故意不传非遗漏)。
     const result = agent_loop.run(
         &app.conversation,
         &app.api_client,
         app.tool_defs,
         &app.permission_ctx,
-        .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true },
         &be,
         allocator,
     ) catch |err| {
@@ -2083,12 +2087,13 @@ fn fireDueCrons(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const
 fn runInjectedAgent(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui_backend_mod.UiBackend) !void {
     const usage_sink = app.usageSink();
     const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*jr| jr else null;
+    // 辅助路径(skill 调用 / cron 注入),非用户盯着的主交互循环 → 不接 spawn_tick_fn(默认 null,Bash 长命令静默,故意不传非遗漏)。
     const result = agent_loop.run(
         &app.conversation,
         &app.api_client,
         app.tool_defs,
         &app.permission_ctx,
-        .{ .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry },
         backend,
         allocator,
     ) catch |err| {

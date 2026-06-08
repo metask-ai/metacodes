@@ -197,6 +197,7 @@ var g_mock_seen_plan: [256]u8 = undefined;
 var g_mock_seen_len: usize = 0;
 fn mockUiRequestFn(
     state: *anyopaque,
+    _: @import("../core/session_id.zig").SessionId,
     allocator: std.mem.Allocator,
     req: *const @import("../core/protocol/ui_request.zig").UiRequest,
     out: *@import("../core/protocol/ui_request.zig").UiResponse,

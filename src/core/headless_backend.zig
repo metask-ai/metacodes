@@ -18,6 +18,7 @@ const log = @import("../util/log.zig");
 const CoreEvent = ui_event.CoreEvent;
 const UiEvent = ui_event.UiEvent;
 const UiBackend = ui_backend.UiBackend;
+const SessionId = ui_backend.SessionId;
 
 pub const HeadlessBackend = struct {
     /// sink 适配器:收一行 JSON(不含尾 \n;由 sink 决定是否换行/落盘/发送)。
@@ -37,7 +38,7 @@ pub const HeadlessBackend = struct {
         };
     }
 
-    fn emitThunk(ctx: *anyopaque, ev: CoreEvent) void {
+    fn emitThunk(ctx: *anyopaque, _: SessionId, ev: CoreEvent) void {
         const self: *HeadlessBackend = @ptrCast(@alignCast(ctx));
         // 整个 CoreEvent → JSON 行。序列化失败(OOM)不致命,但**不静默吞**:
         // 丢一行可能让下游 parser 错位/丢工具结果(违反"No silent caps")→ 记 warn。
@@ -49,7 +50,7 @@ pub const HeadlessBackend = struct {
         self.sink(self.sink_ctx, line);
     }
 
-    fn pollThunk(_: *anyopaque) ?UiEvent {
+    fn pollThunk(_: *anyopaque, _: SessionId) ?UiEvent {
         return null; // headless 无输入端
     }
 };

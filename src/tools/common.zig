@@ -8,9 +8,8 @@ fn nowMs() util_time.Millis {
     return util_time.nowMs();
 }
 
-/// Progress 事件回调：spawn 层每 2s 调一次，通知 TUI 当前命令还在跑。
-/// 为 null 时不调。全局钩子，简单起见用全局 pointer；可以被 repl/progress.zig 设置。
-pub var g_progress_cb: ?*const fn (elapsed_ms: u64, argv0: []const u8) void = null;
+/// Progress 心跳:子进程长命令"仍在运行"提示。重构前是进程全局 g_progress_cb(多 Session
+/// 串台),已移到 ToolContext.spawn_tick_fn(per-session),作为参数传入 spawnCaptureWithStderrTimed。
 
 /// 从 JSON 对象字符串提取字段值（纯手写解析，适配流式 partial JSON）
 ///
@@ -244,6 +243,9 @@ pub fn spawnCaptureWithStderrTimed(
     allocator: std.mem.Allocator,
     abort: ?*const AbortSignal,
     timeout_ms: u64,
+    /// 子进程"仍在运行"心跳(每 2s),per-session 经 ToolContext.spawn_tick_fn 传入。
+    /// null = 不显示心跳。替代旧进程全局 g_progress_cb(多 Session 串台)。
+    tick_fn: ?*const fn (elapsed_ms: u64, argv0: []const u8) void,
 ) !SpawnOut {
     logSpawnArgv(argv, timeout_ms);
     const t_start = nowMs();
@@ -289,7 +291,15 @@ pub fn spawnCaptureWithStderrTimed(
     _ = std.c.close(err_pipe[1]);
     _ = std.c.setpgid(pid, pid);
 
-    const result = readTwoFdsAbortableTimed(out_pipe[0], err_pipe[0], allocator, pid, abort, timeout_ms);
+    // tick 显示的命令名:取 argv[0] 的 basename(旧代码硬编码 "bash",对 WebFetch/Worktree
+    // 等走本函数的工具是错的——它们不是 bash)。null argv[0] 兜底 "?"。
+    const cmd_label: []const u8 = blk: {
+        const a0 = argv[0] orelse break :blk "?";
+        const full = std.mem.span(a0);
+        const slash = std.mem.lastIndexOfScalar(u8, full, '/');
+        break :blk if (slash) |i| full[i + 1 ..] else full;
+    };
+    const result = readTwoFdsAbortableTimed(out_pipe[0], err_pipe[0], allocator, pid, abort, timeout_ms, tick_fn, cmd_label);
     _ = std.c.close(out_pipe[0]);
     _ = std.c.close(err_pipe[0]);
 
@@ -317,6 +327,8 @@ fn readTwoFdsAbortableTimed(
     pgid: std.c.pid_t,
     abort: ?*const AbortSignal,
     timeout_ms: u64,
+    tick_fn: ?*const fn (elapsed_ms: u64, argv0: []const u8) void,
+    cmd_label: []const u8,
 ) !TwoBufs {
     var buf: [4096]u8 = undefined;
     var out_list = std.ArrayList(u8).empty;
@@ -342,10 +354,10 @@ fn readTwoFdsAbortableTimed(
                 return error.Timeout;
             }
         }
-        // 每 2s 触发一次 progress（只在回调已设置时）
-        if (g_progress_cb) |cb| {
+        // 每 2s 触发一次 progress（只在心跳回调已传入时）
+        if (tick_fn) |cb| {
             if (nowMs() - last_progress_ms >= progress_interval_ms) {
-                cb(@intCast(elapsed), "bash");
+                cb(@intCast(elapsed), cmd_label);
                 last_progress_ms = nowMs();
             }
         }

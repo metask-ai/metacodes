@@ -147,3 +147,16 @@ test "all reasons round-trip" {
         try std.testing.expect(s.reason() == r);
     }
 }
+
+test "per-session 隔离:两个独立 AbortSignal,abort 一个不影响另一个" {
+    // 多 Session 核心保证:每 App(session)持自己的 abort 字段。GUI 经 App.requestStop()
+    // 停某会话 → 只置该会话的 abort,别的会话照跑。这里直接验两个 AbortSignal 互不干扰。
+    var a = AbortSignal.init();
+    var b = AbortSignal.init();
+    a.abort(.user_ctrl_c);
+    try std.testing.expect(a.isAborted());
+    try std.testing.expect(!b.isAborted()); // 关键:停 a 不波及 b
+    b.abort(.timeout);
+    try std.testing.expect(b.reason() == .timeout);
+    try std.testing.expect(a.reason() == .user_ctrl_c); // a 的 reason 不被 b 覆盖
+}

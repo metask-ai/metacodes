@@ -47,6 +47,19 @@ pub const PermissionContext = struct {
     hooks: ?*const @import("permission/hooks.zig").HookSet = null,
     /// 当前 session plan 文件全路径(plan 模式特许写;App init 时算,挂此处)。空串=无。
     plan_file_path: []const u8 = "",
+    /// Session 级权限记忆(always-allow / session-deny)。指针:*const ctx 仍可经它 remember。
+    /// null = 无记忆(单测/库消费者不接)→ 每次都问。每 session 一个实例(多 Session 不串台)。
+    session_rules: ?*@import("permission/session_rules.zig").SessionRules = null,
+    /// UI 请求 runner(权限框经它让前端渲染)。重构前是 prompt.zig 的 g_ui_runner 全局
+    /// (多 Session 会串台 + 指向已失效 TuiBackend 的 UAF)。现挂 per-session ctx。
+    /// null = 无 runner → ask 退回文字 prompt。
+    ui_request_state: ?*anyopaque = null,
+    ui_request_fn: ?@import("core/protocol/ui_request.zig").UiRequestFn = null,
+    /// 本 ctx 归属的会话(权限对话框路由到对应 session 视图)。默认 .single(N=1)。
+    /// **M6 待办**:这与 ToolContext.session 是同一概念的两份拷贝(权限路径走 PermissionContext,
+    /// 工具路径走 ToolContext)。M6 拆 SessionContext 后,两者都从 SessionContext.id 取,这俩
+    /// 字段消失。在此之前 M6 必须**同时**填这俩,否则权限框/工具框路由到不同 session(不一致)。
+    session: @import("core/session_id.zig").SessionId = @import("core/session_id.zig").SessionId.single,
 
     /// 读 mode(acquire:看到其它线程的 setMode release 写)。
     pub fn modeValue(self: *const PermissionContext) types.PermissionMode {
@@ -78,9 +91,9 @@ pub fn checkPermission(ctx: *const PermissionContext, tool_name: []const u8, arg
     return decision_mod.check(&d_ctx, tool_name, args);
 }
 
-pub fn promptUser(tool_name: []const u8, args: []const u8, allocator: std.mem.Allocator) !bool {
-    _ = allocator;
-    return prompt_mod.ask(tool_name, args);
+/// 询问用户(有副作用:写 session 记忆 / 落盘)。ctx 非 const,见 prompt.ask 线程契约。
+pub fn promptUser(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bool {
+    return prompt_mod.ask(ctx, tool_name, args);
 }
 
 test {

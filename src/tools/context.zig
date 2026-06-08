@@ -134,6 +134,12 @@ pub const ToolContext = struct {
     progress_tool_id: []const u8 = "",
     progress_fn: ?*const fn (state: *anyopaque, id: []const u8, phase: ProgressPhase, text: []const u8, count: u32) void = null,
 
+    /// 子进程"仍在运行"心跳回调(spawn 层每 2s 调,Bash/WebFetch/Worktree 长命令用)。
+    /// 重构前是 tools/common.zig 的进程全局 g_progress_cb(多 Session 串台)。现 per-session 挂
+    /// ToolContext,传给 spawnCaptureWithStderrTimed。null = 不显示心跳(headless/非 tty)。
+    /// 比 progress_fn 简单:只报 (elapsed_ms, argv0),不分 phase——是 Bash spawn 的轻量 ticker。
+    spawn_tick_fn: ?*const fn (elapsed_ms: u64, argv0: []const u8) void = null,
+
     /// 统一 UI 请求回调(替代旧 ask_question_fn / exit_plan_fn / 权限 dialog_runner 三套)。
     /// 工具(主线程)构造一个 UiRequest 交给 TUI backend,backend 停 watcher + 持渲染锁 +
     /// 独占 fd0 渲染对应对话框,把用户选择写回 out。state 指向 *TuiBackend(经 trampoline)。
@@ -141,6 +147,11 @@ pub const ToolContext = struct {
     /// req/out 借用(回调同步消费);ask_question 的 answers slice owned by allocator(caller free)。
     ui_request_state: ?*anyopaque = null,
     ui_request_fn: ?@import("../core/protocol/ui_request.zig").UiRequestFn = null,
+    /// 本 ToolContext 归属的会话(UiRequest 路由到对应 session 视图)。默认 .single(N=1)。
+    /// agent_loop 构造 base_ctx 时从 opts.session 设。
+    /// **M6 待办**:与 PermissionContext.session 是同一概念的两份(见那里注释);M6 拆
+    /// SessionContext 后两者都从 SessionContext.id 取,本字段消失。
+    session: @import("../core/session_id.zig").SessionId = @import("../core/session_id.zig").SessionId.single,
 
     /// ExitPlanMode 审批结果(对齐 cc 三选项)。
     /// - approve_default:批准 → 恢复进 plan 前的原模式(通常 default),模型继续执行。
@@ -170,7 +181,7 @@ pub const ToolContext = struct {
     ) anyerror!bool {
         const f = self.ui_request_fn orelse return false;
         const st = self.ui_request_state orelse return false;
-        try f(st, allocator, req, out);
+        try f(st, self.session, allocator, req, out);
         return true;
     }
 

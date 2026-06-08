@@ -139,7 +139,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer allocator.free(cmd_z);
     const argv0: [*:0]const u8 = "/bin/sh";
     var argv: [4]?[*:0]const u8 = .{ argv0, "-c", cmd_z.ptr, null };
-    const out = try common.spawnCaptureWithStderrTimed(argv[0..argv.len], allocator, ctx.abort, timeout_ms);
+    const out = try common.spawnCaptureWithStderrTimed(argv[0..argv.len], allocator, ctx.abort, timeout_ms, ctx.spawn_tick_fn);
     defer allocator.free(out.stdout);
     defer allocator.free(out.stderr);
 
