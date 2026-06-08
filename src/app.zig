@@ -63,6 +63,9 @@ fn usageTotalsAdd(ctx: *anyopaque, d: api_stream.UsageDelta) void {
 
 /// 全局 AbortSignal 指针，供 signal handler 访问。installSigintHandler 绑定后非 null。
 /// signal handler 只读该指针 + 调 abort.abort()——不分配、不 IO、不获锁。
+/// **多 Session 说明**:这是唯一剩的进程全局,但**不是**多 session 缺陷——SIGINT 是进程级
+/// 单一信号,只服务前台 TUI(N=1)会话。多 session(GUI)经每个会话的 per-instance
+/// app.abort.abort() 直接中断,旁路 SIGINT。故无需做成 per-session 路由表。
 var g_abort_signal: ?*AbortSignal = null;
 
 /// 一个已连接 MCP server 的资源捆绑：name（owned）+ heap-allocated client + session。
@@ -861,8 +864,13 @@ pub const App = struct {
         }
     }
 
-    /// 把 app.abort 绑到进程级 SIGINT handler。只需调用一次。
-    /// 再次按 Ctrl+C 时，handler 会 atomic-store true；主循环通过 isAborted() 观察。
+    /// 把 app.abort 绑到进程级 SIGINT handler。**只在前台(TUI N=1)会话调一次。**
+    /// SIGINT 是进程级单一信号——一个进程只有一个 handler,只能指向一个 abort。这对 TUI
+    /// 正确(N=1:唯一会话即前台会话)。**多 Session(GUI)不用 SIGINT 路由**:GUI 没有
+    /// "Ctrl+C 打到哪个会话"的歧义,它对每个会话**直接调 `app.abort.abort(reason)`**
+    /// (AbortSignal.abort 已 public,app.abort 是 per-instance,各会话独立中断,互不影响)。
+    /// 故 g_abort_signal 单指针不是多 session 缺陷——它是 TUI 单终端的正确机制,GUI 旁路它。
+    /// (不预包 requestStop wrapper:GUI 真来时直接调 abort.abort + 那时定确切语义,避孤儿 API。)
     pub fn installSigintHandler(app: *App) !void {
         g_abort_signal = &app.abort;
 

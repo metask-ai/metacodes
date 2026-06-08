@@ -6,6 +6,10 @@
 //!
 //! 设计:process-global(对齐 answer_queue / prompt.zig 惯例)。dir == null 时
 //! 全部 no-op,client.zig / stream.zig 的 tap 点零开销,签名不变。
+//!
+//! **多 Session 说明(M7 决策)**:g_dir/g_seq 进程全局**故意保留**——record/replay 是单
+//! session 的调试/e2e 路径(一次只录一个会话),非多 session 生产路径。强行 per-session 化是
+//! 为不存在的需求加复杂度。真要并发录多会话时再按 session_id 分文件名(低优先级)。
 
 const std = @import("std");
 const log = @import("../util/log.zig");
