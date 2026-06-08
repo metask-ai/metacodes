@@ -88,6 +88,11 @@ pub const Options = struct {
     /// 由 SessionContext 传各自的 id。所有 backend.emitEvent 用它路由到对应 UI 视图。
     session: @import("session_id.zig").SessionId = @import("session_id.zig").SessionId.single,
     system_prompt: ?[]const u8 = null,
+    /// 首条 user-context message(对齐 cc prependUserContext):CLAUDE.md 链 + AutoMem +
+    /// currentDate,`<system-reminder>` 包裹。仅主 session 传(subagent 走 preload 自己的链)。
+    /// null → 不 prepend(headless/subagent/无记忆)。由 user_context.build 生成,owned-by-caller,
+    /// 生命周期须覆盖整个 run。
+    inject_user_context: ?[]const u8 = null,
     verbose: bool = false,
     abort: ?*const AbortSignal = null,
     /// 传给 Write/Edit 做 must-read-first 校验。null → 单测/headless 简化路径（不校验）
@@ -294,7 +299,7 @@ pub fn run(
         log.info("agent", "turn {d}/{d} starting (msgs={d})", .{ turns + 1, opts.max_turns, conversation.messages.items.len });
 
         // 1. 构造当前这一轮的 API 请求（把 Conversation 映射为 types.ApiMessage 数组）。
-        var api_messages = try buildApiMessages(conversation, allocator);
+        var api_messages = try buildApiMessages(conversation, allocator, opts.inject_user_context);
         defer freeApiMessages(&api_messages, allocator);
 
         // 2. Skill 激活时硬隔离工具池(SKILL_DESIGN §11 Stage B.8):
@@ -805,10 +810,23 @@ fn latestUserText(conversation: *const @import("conversation.zig").Conversation)
 fn buildApiMessages(
     conversation: *const Conversation,
     allocator: std.mem.Allocator,
+    inject_user_context: ?[]const u8,
 ) !std.ArrayList(types.ApiMessage) {
     var out = std.ArrayList(types.ApiMessage).empty;
     errdefer {
         freeApiMessages(&out, allocator);
+    }
+
+    // 首条 user-context message(对齐 cc prependUserContext):合成一条 user message,
+    // content 单 text block = `<system-reminder>` 包裹的 CLAUDE.md/AutoMem/currentDate。
+    // 借用 inject_user_context 的字节(不 dupe);freeApiMessages 只 free content 数组本身,
+    // 不 free block 内字符串——与下方 conversation 借用块同策略。
+    if (inject_user_context) |ctx_text| {
+        if (ctx_text.len > 0) {
+            const contents = try allocator.alloc(types.ApiContent, 1);
+            contents[0] = .{ .text = ctx_text };
+            try out.append(allocator, .{ .role = .user, .content = contents });
+        }
     }
 
     for (conversation.messages.items) |m| {
@@ -851,7 +869,7 @@ test "buildApiMessages maps blocks" {
     defer c.deinit();
     try c.appendText(.user, "hi");
 
-    var api = try buildApiMessages(&c, a);
+    var api = try buildApiMessages(&c, a, null);
     defer freeApiMessages(&api, a);
 
     try std.testing.expect(api.items.len == 1);
@@ -883,7 +901,7 @@ test "buildApiMessages maps tool_use and tool_result" {
     } };
     try c.append(.{ .role = .user, .blocks = blks_u });
 
-    var api = try buildApiMessages(&c, a);
+    var api = try buildApiMessages(&c, a, null);
     defer freeApiMessages(&api, a);
 
     try std.testing.expect(api.items.len == 2);
@@ -895,7 +913,7 @@ test "buildApiMessages empty conversation returns empty" {
     const a = std.testing.allocator;
     var c = Conversation.init(a);
     defer c.deinit();
-    var api = try buildApiMessages(&c, a);
+    var api = try buildApiMessages(&c, a, null);
     defer freeApiMessages(&api, a);
     try std.testing.expect(api.items.len == 0);
 }
@@ -907,7 +925,7 @@ test "buildApiMessages preserves roles" {
     try c.appendText(.user, "u1");
     try c.appendText(.assistant, "a1");
     try c.appendText(.user, "u2");
-    var api = try buildApiMessages(&c, a);
+    var api = try buildApiMessages(&c, a, null);
     defer freeApiMessages(&api, a);
     try std.testing.expect(api.items[0].role == .user);
     try std.testing.expect(api.items[1].role == .assistant);
@@ -926,7 +944,7 @@ test "buildApiMessages multiple blocks per message" {
         .input = try a.dupe(u8, "{}"),
     } };
     try c.append(.{ .role = .assistant, .blocks = blks });
-    var api = try buildApiMessages(&c, a);
+    var api = try buildApiMessages(&c, a, null);
     defer freeApiMessages(&api, a);
     try std.testing.expect(api.items[0].content.len == 2);
 }

@@ -274,7 +274,7 @@ pub fn buildWithSkillsAndAgents(
     skills: ?*const @import("../skills/skill.zig").SkillSet,
     agents: ?*const @import("../agents/set.zig").AgentSet,
 ) ![]u8 {
-    return buildFull(allocator, model, skills, agents, null);
+    return buildFull(allocator, model, skills, agents, null, "");
 }
 
 /// 最完整版:额外接收 enabled_tool_names,让 # Using your tools 段按工具集动态裁剪
@@ -286,6 +286,7 @@ pub fn buildFull(
     skills: ?*const @import("../skills/skill.zig").SkillSet,
     agents: ?*const @import("../agents/set.zig").AgentSet,
     enabled_tool_names: ?[]const []const u8,
+    memdir_abs: []const u8,
 ) ![]u8 {
     const env_section = try buildEnvSection(allocator, model);
     defer allocator.free(env_section);
@@ -295,6 +296,13 @@ pub fn buildFull(
 
     const agents_section = if (agents) |a| try buildAgentsSection(allocator, a) else try allocator.dupe(u8, "");
     defer allocator.free(agents_section);
+
+    // # Memory 段(通道 B):仅 memdir 启用(memdir_abs 非空)时拼。教模型管理自动记忆。
+    const memory_section = if (memdir_abs.len > 0)
+        try @import("memory/memory_section.zig").build(allocator, memdir_abs)
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(memory_section);
 
     // # Using your tools 段:env override(slot "USING_TOOLS")优先,否则按工具集动态拼。
     const using_tools_section = blk: {
@@ -317,7 +325,8 @@ pub fn buildFull(
         deferred_section,          sep,
         TONE_SECTION,              sep,
         OUTPUT_EFFICIENCY_SECTION, sep,
-        env_section,               if (skills_section.len > 0) sep else "",
+        env_section,               if (memory_section.len > 0) sep else "",
+        memory_section,            if (skills_section.len > 0) sep else "",
         skills_section,            if (agents_section.len > 0) sep else "",
         agents_section,
     });

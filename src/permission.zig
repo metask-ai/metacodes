@@ -47,6 +47,9 @@ pub const PermissionContext = struct {
     hooks: ?*const @import("permission/hooks.zig").HookSet = null,
     /// 当前 session plan 文件全路径(plan 模式特许写;App init 时算,挂此处)。空串=无。
     plan_file_path: []const u8 = "",
+    /// memdir 绝对路径(通道 B 自动记忆;App init 时算,挂此处)。空串=禁用。
+    /// 写此子树内文件任何模式豁免(对齐 cc isAutoMemPath),deny/protected 仍优先。
+    memdir_abs: []const u8 = "",
     /// Session 级权限记忆(always-allow / session-deny)。指针:*const ctx 仍可经它 remember。
     /// null = 无记忆(单测/库消费者不接)→ 每次都问。每 session 一个实例(多 Session 不串台)。
     session_rules: ?*@import("permission/session_rules.zig").SessionRules = null,
@@ -87,6 +90,8 @@ pub fn checkPermission(ctx: *const PermissionContext, tool_name: []const u8, arg
         .hooks = ctx.hooks,
         .hook_allocator = ctx.allocator,
         .plan_file_path = ctx.plan_file_path,
+        .memdir_abs = ctx.memdir_abs,
+        .memdir_allocator = ctx.allocator,
     };
     return decision_mod.check(&d_ctx, tool_name, args);
 }

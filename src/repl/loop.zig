@@ -136,13 +136,13 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                 \\  /compact         Compact oldest messages when over threshold
                 \\  /doctor          Show environment/config diagnostics
                 \\  /config [show|path]  Inspect config (~/.cc-zig/config.json)
-                \\  /init            Create .cc-zig/ skeleton in the current directory
+                \\  /init            Analyze the codebase and write CLAUDE.md (model-driven)
                 \\  /mcp             List configured MCP servers
                 \\  /agents          List available sub-agent capabilities
                 \\  /permissions     Show permission mode + loaded rules
                 \\  /theme [variant] Show/switch TUI theme (auto/dark/light/mono)
                 \\  /add-dir <path>  Grant read/write access to an extra directory
-                \\  /memory [add ..] Show or append cross-session memory
+                \\  /memory [edit <slot>]  List memory files; edit user|project|local|auto in $EDITOR
                 \\  /commit          Draft a git commit using the model
                 \\  /btw <q>         Side question (uses context, not added to history)
                 \\  /recap           One-line summary of this session
@@ -287,7 +287,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/init")) {
-            try handleInit(app, allocator);
+            // 对齐 cc:prompt 型命令——注入指令让模型扫码库写 CLAUDE.md(走正常 agent_loop)。
+            try app.conversation.appendText(.user, INIT_PROMPT);
+            try runInjectedAgent(app, allocator, &aux_be);
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/mcp")) {
@@ -335,7 +337,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             }
             continue;
         }
-        if (std.mem.startsWith(u8, trimmed, "/memory")) {
+        if (std.mem.eql(u8, trimmed, "/memory") or std.mem.startsWith(u8, trimmed, "/memory ")) {
             const rest = std.mem.trim(u8, trimmed[7..], " \t");
             try handleMemory(app, allocator, rest);
             continue;
@@ -452,7 +454,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             &app.api_client,
             app.tool_defs,
             &app.permission_ctx,
-            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .activate_tool_state = @ptrCast(app), .activate_tool_fn = &app_mod.App.activateToolTrampoline, .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline, .ui_request_state = if (tui_be) |*tb| @as(*anyopaque, @ptrCast(tb)) else null, .ui_request_fn = if (tui_be != null) &tui_backend_mod.TuiBackend.uiRequestTrampoline else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
+            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .activate_tool_state = @ptrCast(app), .activate_tool_fn = &app_mod.App.activateToolTrampoline, .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline, .ui_request_state = if (tui_be) |*tb| @as(*anyopaque, @ptrCast(tb)) else null, .ui_request_fn = if (tui_be != null) &tui_backend_mod.TuiBackend.uiRequestTrampoline else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
             &ui_be,
             allocator,
         ) catch |err| {
@@ -1168,6 +1170,33 @@ test "decodeCodepoint: 3-byte" {
     try testing.expect(cp == 0x4F60); // 你
 }
 
+test "shellQuoteSingle: 元字符被单引号包死,不被 shell 拆(Linus #1)" {
+    const a = testing.allocator;
+    // 含空格 + 分号 + $() + 反引号 + && 的恶意目录名
+    const evil = "/tmp/a b; rm -rf ~/$(curl x)`id`&&echo/CLAUDE.md";
+    const q = try shellQuoteSingle(a, evil);
+    defer a.free(q);
+    // 整体单引号包裹
+    try testing.expect(q[0] == '\'');
+    try testing.expect(q[q.len - 1] == '\'');
+    // 原文里没有单引号,故内部应原样保留(元字符在单引号内对 shell 失效)
+    try testing.expect(std.mem.indexOf(u8, q, "a b; rm -rf") != null);
+
+    // 路径含单引号 → 转成 '\'' 序列(闭引号→转义引号→重开引号)
+    const with_quote = "/tmp/o'brien/CLAUDE.md";
+    const q2 = try shellQuoteSingle(a, with_quote);
+    defer a.free(q2);
+    try testing.expect(std.mem.indexOf(u8, q2, "'\\''") != null);
+    // 转义后不应出现裸的 `o'brien`(那个 ' 已被打断)
+    try testing.expect(std.mem.indexOf(u8, q2, "o'brien") == null);
+
+    // 普通路径:首尾引号 + 中间原样
+    const plain = "/home/u/.claude/CLAUDE.md";
+    const q3 = try shellQuoteSingle(a, plain);
+    defer a.free(q3);
+    try testing.expectEqualStrings("'/home/u/.claude/CLAUDE.md'", q3);
+}
+
 fn printHistory(history: *const history_mod.History) void {
     std.debug.print("History ({d} entries):\n", .{history.entries.items.len});
     const start: usize = if (history.entries.items.len > 20) history.entries.items.len - 20 else 0;
@@ -1208,7 +1237,7 @@ fn retryLast(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui
         &app.api_client,
         app.tool_defs,
         &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry },
         backend,
         allocator,
     ) catch |err| {
@@ -1257,6 +1286,29 @@ const REVIEW_PROMPT =
     \\  5) End with a one-line verdict: ready to merge / needs fixes.
 ;
 
+/// /init:对齐 cc OLD_INIT_PROMPT——让**模型**扫码库后写 CLAUDE.md(prompt 型命令,
+/// 不是本地建 config.json)。注入为 user message 走正常 agent_loop。
+const INIT_PROMPT =
+    \\Please analyze this codebase and create a CLAUDE.md file in the repository root, which will be
+    \\provided to future Claude Code sessions as project memory.
+    \\
+    \\What to do:
+    \\  1) Explore the codebase (use Read/Glob/Grep/CodeMap and the Bash tool for `git`/build files) to
+    \\     understand: build & test & lint commands, the high-level architecture, key modules and how they
+    \\     fit together, and any non-obvious conventions.
+    \\  2) If a CLAUDE.md already exists, improve it rather than overwrite — preserve anything still correct.
+    \\  3) Also incorporate any existing rules files if present (e.g. .cursorrules, .github/copilot-instructions.md)
+    \\     and useful pointers from README.
+    \\  4) Write CLAUDE.md with the Write tool. Begin the file with this exact header:
+    \\
+    \\     # CLAUDE.md
+    \\
+    \\     This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+    \\
+    \\Keep it concise and high-signal: commands a developer actually runs, the architecture a newcomer needs,
+    \\and conventions that are NOT obvious from reading a single file. Do not pad it with restated source code.
+;
+
 /// /model：无参显示当前模型 + 已知候选；有参切换到指定模型并重建 system prompt。
 fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
     if (rest.len == 0) {
@@ -1295,8 +1347,10 @@ fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8
     app.api_client.model = new_model;
 
     // 重建 system prompt（含 knowledge cutoff、模型名）。失败保留旧的。
+    // 用 buildFull 透传 enabled_tool_names + memdir_abs,与 App.init 一致(否则 /model 后
+    // 丢失 # Using your tools 动态裁剪 + # Memory 段)。
     const sp_mod = @import("../core/system_prompt.zig");
-    if (sp_mod.buildWithSkillsAndAgents(allocator, new_model, &app.skills, &app.agents)) |sp| {
+    if (sp_mod.buildFull(allocator, new_model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs)) |sp| {
         if (app.system_prompt) |old| allocator.free(old);
         app.system_prompt = sp;
     } else |err| {
@@ -1380,88 +1434,6 @@ fn handleConfigCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
         return;
     }
     std.debug.print("usage: /config [show|path]\n", .{});
-}
-
-fn handleInit(app: *app_mod.App, allocator: std.mem.Allocator) !void {
-    _ = app;
-
-    // 1. 在 CWD 创建 .cc-zig/ 目录
-    const cwd = util_fs.getCwd(allocator) catch {
-        std.debug.print("getcwd failed\n", .{});
-        return;
-    };
-    defer allocator.free(cwd);
-
-    const dir = try std.fmt.allocPrintSentinel(allocator, "{s}/.cc-zig", .{cwd}, 0);
-    defer allocator.free(dir);
-    if (std.c.mkdir(dir.ptr, @as(std.c.mode_t, 0o755)) != 0) {
-        const errno: std.c.E = @enumFromInt(std.c._errno().*);
-        if (errno != .EXIST) {
-            std.debug.print("mkdir {s}: errno={s}\n", .{ dir, @tagName(errno) });
-            return;
-        }
-    }
-
-    const cfg_path = try std.fmt.allocPrintSentinel(allocator, "{s}/config.json", .{dir}, 0);
-    defer allocator.free(cfg_path);
-
-    // 存在性检查：用 access(F_OK) 明确表达"文件是否存在"。
-    // open(RDONLY) 会把"没权限读取 / 不是常规文件 / 符号链接循环"等情况和 ENOENT 混成
-    // 同一个 "fd<0"，后续 CREAT|TRUNC 会截断已存在但我们没读权限的 config。
-    if (std.c.access(cfg_path.ptr, std.c.F_OK) == 0) {
-        std.debug.print("already exists: {s}\n", .{cfg_path});
-        return;
-    }
-    {
-        const errno: std.c.E = @enumFromInt(std.c._errno().*);
-        if (errno != .NOENT) {
-            std.debug.print("access {s}: errno={s}\n", .{ cfg_path, @tagName(errno) });
-            return;
-        }
-    }
-
-    // 2. 写默认 config.json 骨架（只在 access 返 ENOENT 时走到这里）
-    const skeleton =
-        \\{
-        \\  "model": "claude-opus-4-7",
-        \\  "permission_mode": "prompt",
-        \\  "permission_rules": [
-        \\    { "match": { "tool": "Read" }, "decision": "allow" },
-        \\    { "match": { "tool": "Glob" }, "decision": "allow" },
-        \\    { "match": { "tool": "Grep" }, "decision": "allow" }
-        \\  ]
-        \\}
-        \\
-    ;
-    // 用 O_EXCL 防 TOCTOU：两次 access/open 之间若有人建了同名文件，EXCL 会 fail 而非覆盖
-    const fd = std.c.open(cfg_path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, @as(std.c.mode_t, 0o644));
-    if (fd < 0) {
-        const errno: std.c.E = @enumFromInt(std.c._errno().*);
-        if (errno == .EXIST) {
-            // access 后 open 前有并发创建；语义等价 "already exists"，不要让用户困惑
-            std.debug.print("already exists (race): {s}\n", .{cfg_path});
-        } else {
-            std.debug.print("create {s}: errno={s}\n", .{ cfg_path, @tagName(errno) });
-        }
-        return;
-    }
-    // close 延后到 write 完成后——但若 write 失败需要 unlink，close 要在 unlink 前
-    // 调用。用 explicit close + unlink，不用 defer（defer 会让 unlink 先于 close）。
-    const n = std.c.write(fd, skeleton.ptr, skeleton.len);
-    _ = std.c.close(fd);
-    const wrote: usize = if (n < 0) 0 else @intCast(n);
-    if (wrote != skeleton.len) {
-        const errno: std.c.E = if (n < 0) @enumFromInt(std.c._errno().*) else .SUCCESS;
-        std.debug.print(
-            "write {s}: errno={s}, wrote {d}/{d} — rolling back\n",
-            .{ cfg_path, @tagName(errno), wrote, skeleton.len },
-        );
-        // 原子性：要么完整写入，要么盘上没有残留文件。部分写入的 config 会让下次
-        // /config show 解析报错，用户无法 debug。unlink 清掉，让他们重跑 /init。
-        _ = std.c.unlink(cfg_path.ptr);
-        return;
-    }
-    std.debug.print("created {s}\n", .{cfg_path});
 }
 
 /// 把当前 conversation 拍平成纯文本(role: text),用于 /btw /recap 的上下文喂养。
@@ -1711,42 +1683,136 @@ fn handleTheme(app: *app_mod.App, rest: []const u8) void {
     }
 }
 
-/// /memory：跨 session 记忆，存于 ~/.cc-zig/memory.md。
-///   /memory            显示全部
-///   /memory add <text> 追加一条（带时间戳）
-fn handleMemory(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
-    _ = app;
-    const home_c = std.c.getenv("HOME") orelse {
-        std.debug.print("HOME not set\n", .{});
-        return;
-    };
-    const home = std.mem.span(home_c);
+/// libc system(3)(0.16 std.c 无绑定):fork + /bin/sh -c + waitpid,stdio 继承父进程。
+/// 用于 /memory edit 启动交互式 $EDITOR(需继承 tty,Bash 工具捕获输出不适用)。
+extern "c" fn system(command: [*:0]const u8) c_int;
+fn c_system(command: [*:0]const u8) c_int {
+    return system(command);
+}
 
-    if (std.mem.startsWith(u8, rest, "add ")) {
-        const text = std.mem.trim(u8, rest[4..], " \t");
-        if (text.len == 0) {
-            std.debug.print("usage: /memory add <text>\n", .{});
-            return;
-        }
-        try appendMemory(allocator, home, text);
-        std.debug.print("remembered.\n", .{});
-        return;
+/// /memory:列出记忆文件槽位 + 用 $EDITOR 打开(对齐 cc /memory MemoryFileSelector)。
+///   /memory               列出所有记忆文件槽位(User/Project/Local CLAUDE.md + 自动记忆目录)
+///   /memory edit <slot>   用 $VISUAL/$EDITOR 打开指定槽位(user|project|local|auto);不存在则创建
+/// 旧的 `/memory add <text>` 写 ~/.cc-zig/memory.md 已废弃——那条链从不注入模型(死记忆),
+/// 现对齐 cc:记忆 = CLAUDE.md 链(人写)+ memdir 自动记忆(模型写),都已真正喂给模型。
+fn handleMemory(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
+    const home = app.homeDir();
+    const cwd = app.cwdAbs();
+
+    if (std.mem.eql(u8, rest, "edit") or std.mem.startsWith(u8, rest, "edit ")) {
+        const slot = std.mem.trim(u8, rest[4..], " \t");
+        return editMemorySlot(app, allocator, home, cwd, slot);
     }
 
-    // 显示
-    const content = readMemory(allocator, home) catch null;
-    defer if (content) |c| allocator.free(c);
-    if (content) |c| {
-        if (c.len == 0) {
-            std.debug.print("(memory is empty — use /memory add <text>)\n", .{});
-        } else {
-            std.debug.print("{s}", .{c});
-            if (c[c.len - 1] != '\n') std.debug.print("\n", .{});
-        }
-    } else {
-        std.debug.print("(no memory yet — use /memory add <text>)\n", .{});
+    // 列出槽位
+    std.debug.print("Memory files (edit with: /memory edit <slot>):\n", .{});
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+
+    if (home.len > 0) {
+        const up = std.fmt.bufPrint(&pbuf, "{s}/.claude/CLAUDE.md", .{home}) catch "";
+        printMemorySlot("user", up, "your global instructions for all projects");
+    }
+    if (cwd.len > 0) {
+        var b2: [std.fs.max_path_bytes]u8 = undefined;
+        const pp = std.fmt.bufPrint(&b2, "{s}/CLAUDE.md", .{cwd}) catch "";
+        printMemorySlot("project", pp, "project instructions, checked into the repo");
+        var b3: [std.fs.max_path_bytes]u8 = undefined;
+        const lp = std.fmt.bufPrint(&b3, "{s}/CLAUDE.local.md", .{cwd}) catch "";
+        printMemorySlot("local", lp, "private project instructions, gitignored");
+    }
+    if (app.memdir_abs.len > 0) {
+        var b4: [std.fs.max_path_bytes]u8 = undefined;
+        const ap = std.fmt.bufPrint(&b4, "{s}/MEMORY.md", .{app.memdir_abs}) catch "";
+        printMemorySlot("auto", ap, "auto-memory index (model-managed, persists across sessions)");
     }
 }
+
+fn printMemorySlot(slot: []const u8, path: []const u8, desc: []const u8) void {
+    if (path.len == 0) return;
+    const exists = blk: {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (path.len + 1 > buf.len) break :blk false;
+        @memcpy(buf[0..path.len], path);
+        buf[path.len] = 0;
+        break :blk std.c.access(@ptrCast(&buf), std.c.F_OK) == 0;
+    };
+    const tag = if (exists) "        " else " (new)  ";
+    std.debug.print("  \x1b[36m{s: <8}\x1b[0m{s}{s}\n    \x1b[2m{s}\x1b[0m\n", .{ slot, tag, path, desc });
+}
+
+/// 解析 slot → 路径,mkdir 父目录,$VISUAL/$EDITOR 打开(对齐 cc editFileInEditor)。
+fn editMemorySlot(app: *app_mod.App, allocator: std.mem.Allocator, home: []const u8, cwd: []const u8, slot: []const u8) !void {
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const path: []const u8 = blk: {
+        if (std.mem.eql(u8, slot, "user")) {
+            if (home.len == 0) return std.debug.print("HOME not set\n", .{});
+            break :blk std.fmt.bufPrint(&pbuf, "{s}/.claude/CLAUDE.md", .{home}) catch return;
+        } else if (std.mem.eql(u8, slot, "project")) {
+            if (cwd.len == 0) return std.debug.print("no cwd\n", .{});
+            break :blk std.fmt.bufPrint(&pbuf, "{s}/CLAUDE.md", .{cwd}) catch return;
+        } else if (std.mem.eql(u8, slot, "local")) {
+            if (cwd.len == 0) return std.debug.print("no cwd\n", .{});
+            break :blk std.fmt.bufPrint(&pbuf, "{s}/CLAUDE.local.md", .{cwd}) catch return;
+        } else if (std.mem.eql(u8, slot, "auto")) {
+            if (app.memdir_abs.len == 0) return std.debug.print("auto-memory disabled\n", .{});
+            break :blk std.fmt.bufPrint(&pbuf, "{s}/MEMORY.md", .{app.memdir_abs}) catch return;
+        } else {
+            return std.debug.print("usage: /memory edit <user|project|local|auto>\n", .{});
+        }
+    };
+
+    // mkdir 父目录(~/.claude 等可能不存在);创建空文件(保留已存在,wx 语义)。
+    if (std.fs.path.dirname(path)) |d| @import("../util/fs.zig").mkdirParents(d) catch {};
+    {
+        var zb: [std.fs.max_path_bytes]u8 = undefined;
+        if (path.len + 1 <= zb.len) {
+            @memcpy(zb[0..path.len], path);
+            zb[path.len] = 0;
+            // O_CREAT|O_EXCL:已存在不动,不存在建空。
+            const fd = std.c.open(@ptrCast(&zb), std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, @as(std.c.mode_t, 0o644));
+            if (fd >= 0) _ = std.c.close(fd);
+        }
+    }
+
+    const editor = std.c.getenv("VISUAL") orelse std.c.getenv("EDITOR") orelse {
+        std.debug.print("$VISUAL/$EDITOR not set. File is at:\n  {s}\n", .{path});
+        return;
+    };
+    const ed = std.mem.span(editor);
+    // 安全(Linus #1):path 含 cwd/home,目录名可合法含 shell 元字符(空格/;/$/`/&&/$(...))。
+    // 未引用直接进 system() 的 /bin/sh -c 就是命令注入(`/tmp/a;rm -rf ~` 这种目录名触发)。
+    // 修:path 用单引号包死 + 转义内部单引号(`'`→`'\''`),shell 单引号内一切元字符失效。
+    // editor 不引(允许 `$EDITOR="code -w"` 带参数;它来自用户自己的 env,信任级别高于 cwd)。
+    const quoted_path = try shellQuoteSingle(allocator, path);
+    defer allocator.free(quoted_path);
+    const cmd = try std.fmt.allocPrintSentinel(allocator, "{s} {s}", .{ ed, quoted_path }, 0);
+    defer allocator.free(cmd);
+    const rc = c_system(cmd.ptr);
+    if (rc != 0) {
+        std.debug.print("editor exited non-zero (rc={d}); file is at:\n  {s}\n", .{ rc, path });
+        return;
+    }
+    std.debug.print("\x1b[2medited {s} (restart or /model to reload into context)\x1b[0m\n", .{path});
+}
+
+/// POSIX shell 单引号转义:把 s 包成可安全嵌入 `/bin/sh -c` 的单引号字符串。
+/// 规则:整体单引号包裹;内部每个 `'` 替成 `'\''`(闭引号→转义引号→重开引号)。
+/// 单引号内 shell 不解释任何元字符,故除 `'` 外无需处理。返回 owned。
+fn shellQuoteSingle(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '\'');
+    for (s) |c| {
+        if (c == '\'') {
+            try out.appendSlice(allocator, "'\\''");
+        } else {
+            try out.append(allocator, c);
+        }
+    }
+    try out.append(allocator, '\'');
+    return out.toOwnedSlice(allocator);
+}
+
 
 /// 用户显式 /<skill-name> [args] 调用。
 /// 返回 true 表示已处理(skill 命中或不存在但语法看起来像 skill 名);
@@ -1840,7 +1906,7 @@ fn handleSkillInvocation(app: *app_mod.App, allocator: std.mem.Allocator, rest: 
         &app.api_client,
         app.tool_defs,
         &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true },
         &be,
         allocator,
     ) catch |err| {
@@ -1850,45 +1916,6 @@ fn handleSkillInvocation(app: *app_mod.App, allocator: std.mem.Allocator, rest: 
     app.persistTranscript();
     if (result.stop_reason == .aborted) app.abort.resetForTesting();
     return true;
-}
-
-fn memoryPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/.cc-zig/memory.md", .{home});
-}
-
-fn appendMemory(allocator: std.mem.Allocator, home: []const u8, text: []const u8) !void {
-    const dir_z = try std.fmt.allocPrintSentinel(allocator, "{s}/.cc-zig", .{home}, 0);
-    defer allocator.free(dir_z);
-    _ = std.c.mkdir(dir_z.ptr, 0o700);
-
-    const path = try memoryPath(allocator, home);
-    defer allocator.free(path);
-    const path_z = try allocator.dupeZ(u8, path);
-    defer allocator.free(path_z);
-
-    const fd = std.c.open(path_z.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o600));
-    if (fd < 0) return error.WriteError;
-    defer _ = std.c.close(fd);
-
-    const line = try std.fmt.allocPrint(allocator, "- {s}\n", .{text});
-    defer allocator.free(line);
-    _ = std.c.write(fd, line.ptr, line.len);
-}
-
-fn readMemory(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
-    const path = try memoryPath(allocator, home);
-    defer allocator.free(path);
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.NotFound;
-    defer _ = std.c.close(fd);
-    var buf = std.ArrayList(u8).empty;
-    errdefer buf.deinit(allocator);
-    var chunk: [4096]u8 = undefined;
-    while (true) {
-        const n = std.posix.read(fd, &chunk) catch break;
-        if (n == 0) break;
-        try buf.appendSlice(allocator, chunk[0..@intCast(n)]);
-    }
-    return try buf.toOwnedSlice(allocator);
 }
 
 /// 启动 banner:圆角 box(对齐 cc 2.1.x)。版本 + 模型 + cwd 三行。
@@ -2093,7 +2120,7 @@ fn runInjectedAgent(app: *app_mod.App, allocator: std.mem.Allocator, backend: *c
         &app.api_client,
         app.tool_defs,
         &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .dyn_registry = &app.dyn_registry },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry },
         backend,
         allocator,
     ) catch |err| {

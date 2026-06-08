@@ -149,10 +149,17 @@ pub const App = struct {
     /// init 时算一次,挂到 permission_ctx.plan_file_path(plan 模式特许写)+ ToolContext。
     /// 空串 = home 缺失,plan 文件机制降级(模型把计划写对话文本)。
     plan_file_path: []u8 = &.{},
+    /// 本 session 的 memdir 绝对路径(通道 B 自动记忆;`{home}/.cc-zig/projects/<hash>/memory`,
+    /// owned)。init 时算一次,挂 permission_ctx.memdir_abs(写豁免)。空串=禁用/无 home。
+    memdir_abs: []u8 = &.{},
     /// 模型长任务 scratchpad（Task* 工具共享）
     tasks: TaskStore,
     /// 预构造的 system prompt（app 启动时一次性 build）。null = build 失败时降级为无 prompt。
     system_prompt: ?[]u8 = null,
+    /// 首条 user-context message(CLAUDE.md 链 + AutoMem + currentDate,`<system-reminder>` 包裹)。
+    /// init 时构建一次(memoize),agent_loop 每轮 prepend。owned;deinit free。
+    /// null = 无记忆内容 / CLAUDE_CODE_DISABLE_CLAUDE_MDS。
+    user_context: ?[]u8 = null,
     /// 运行时工具表（Skill + MCP 工具都注册到这里）。
     dyn_registry: DynRegistry,
     /// 已连接的 MCP server。每个 owns 一个 McpClient + McpSession（一一对应）。
@@ -301,6 +308,9 @@ pub const App = struct {
         // slug seed 优先用 transcript session id(每 session 稳定),否则时间兜底。
         app.initPlanFilePath();
 
+        // 计算本 session 的 memdir 路径(通道 B 自动记忆)+ mkdir + 挂权限豁免。
+        app.initMemdir();
+
         // 从 config.json 加载 permission_rules（旧 schema，向后兼容）
         app.loadPermissionRules() catch |err| {
             @import("util/log.zig").debug("permission", "no rules loaded: {s}", .{@errorName(err)});
@@ -326,8 +336,27 @@ pub const App = struct {
 
         // 构造 system prompt（依赖 config.model）。# Using your tools 段按 enabled_tool_names
         // 动态裁剪（对应 cc getUsingYourToolsSection(enabledTools)）。失败仅 log，保持 null。
-        app.system_prompt = system_prompt_mod.buildFull(allocator, config.model, &app.skills, &app.agents, app.enabled_tool_names) catch |err| blk: {
+        app.system_prompt = system_prompt_mod.buildFull(allocator, config.model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs) catch |err| blk: {
             @import("util/log.zig").warn("sysprompt", "build failed: {s} (continuing without system prompt)", .{@errorName(err)});
+            break :blk null;
+        };
+
+        // 构造首条 user-context message(通道 A:CLAUDE.md 链 + currentDate,system-reminder 包裹)。
+        // 向上递归从 cwd 收集 CLAUDE.md;User 级读 ~/.claude/CLAUDE.md。失败仅 log,保持 null。
+        // 通道 B(AutoMem):读 memdir 的 MEMORY.md 索引(已截断)拼进同一 user message。
+        const auto_mem: []u8 = blk: {
+            if (app.memdir_abs.len == 0) break :blk &.{};
+            const memdir = @import("core/memory/memdir.zig");
+            const idx = memdir.readIndexTruncated(allocator, app.homeDir(), app.cwdAbs()) catch null;
+            break :blk (idx orelse &.{});
+        };
+        defer if (auto_mem.len > 0) allocator.free(auto_mem);
+        app.user_context = @import("core/memory/user_context.zig").build(allocator, .{
+            .cwd = app.cwdAbs(),
+            .home = app.homeDir(),
+            .auto_mem = auto_mem,
+        }) catch |err| blk: {
+            @import("util/log.zig").warn("memory", "user_context build failed: {s}", .{@errorName(err)});
             break :blk null;
         };
 
@@ -364,6 +393,7 @@ pub const App = struct {
         }
         if (app.project_dir) |p| app.allocator.free(p);
         if (app.plan_file_path.len > 0) app.allocator.free(app.plan_file_path);
+        if (app.memdir_abs.len > 0) app.allocator.free(app.memdir_abs);
         app.agents.deinit();
         for (app.worktree_stack.items) |entry| {
             app.allocator.free(entry.worktree_path);
@@ -378,6 +408,7 @@ pub const App = struct {
         if (app.cwd_abs) |c| app.allocator.free(c);
         if (app.jobs) |*j| j.deinit();
         if (app.system_prompt) |s| app.allocator.free(s);
+        if (app.user_context) |u| app.allocator.free(u);
         app.allocator.destroy(app);
     }
 
@@ -422,6 +453,23 @@ pub const App = struct {
         app.plan_file_path = app.allocator.dupe(u8, path) catch return;
         // 挂到 permission_ctx,plan 模式下 decision 据此特许写 plan 文件。
         app.permission_ctx.plan_file_path = app.plan_file_path;
+    }
+
+    /// 计算本 session 的 memdir 绝对路径(通道 B)+ mkdir + 挂权限豁免。
+    /// memdir 禁用(env)或无 home/cwd → 留空串(降级:不豁免、不注入 AutoMem)。
+    fn initMemdir(app: *App) void {
+        const memdir = @import("core/memory/memdir.zig");
+        if (!memdir.isEnabled()) return;
+        const home = app.homeDir();
+        const cwd = app.cwdAbs();
+        if (home.len == 0 or cwd.len == 0) return;
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = memdir.memdirPath(home, cwd, &buf);
+        if (path.len == 0) return;
+        memdir.ensureDir(home, cwd) catch {}; // mkdir 失败不致命:写盘时模型拿到错误
+        app.memdir_abs = app.allocator.dupe(u8, path) catch return;
+        // 挂到 permission_ctx:写 memdir 子树内文件任何模式豁免(decision isAutoMemPath)。
+        app.permission_ctx.memdir_abs = app.memdir_abs;
     }
 
     /// Shift+Tab 的纯状态机:当前 mode → 下一个 mode(对齐 Claude Code)。

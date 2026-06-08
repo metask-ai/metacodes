@@ -38,6 +38,13 @@ pub const Context = struct {
     /// 当前 session 的 plan 文件全路径(plan 模式下特许写此文件;空串 = 无)。
     /// 对齐 cc isSessionPlanFile:plan 模式下模型把计划写到此文件,是唯一可写文件。
     plan_file_path: []const u8 = "",
+    /// memdir 绝对路径(通道 B 自动记忆目录;空串 = 禁用)。模型用 Write/Edit 自管记忆,
+    /// 写此子树内的文件**任何模式都豁免**(对齐 cc isAutoMemPath)。
+    /// 安全:豁免严格限于 memdir 子树(realpath + 分隔符边界,见 memdir.isAutoMemPath);
+    /// deny 规则 / protected paths 仍优先(memdir 在 ~/.cc-zig 下不与之重叠,原则上仍受约束)。
+    memdir_abs: []const u8 = "",
+    /// memdir 豁免判定需要 allocator(realpath 归一化);null → 跳过豁免(降级:按常规决策)。
+    memdir_allocator: ?std.mem.Allocator = null,
 };
 
 /// 根据模式 + 工具名决定:允许 / 拒绝 / 询问。
@@ -95,6 +102,25 @@ pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decis
     if (isProtectedTarget(tool_name, args)) {
         log.debug("permission", "protected path tool={s} -> ask", .{tool_name});
         return .ask;
+    }
+
+    // 2.5 memdir 写豁免(通道 B):模型用 Write/Edit 自管自动记忆目录。目标落在 memdir
+    //     子树内 → 任何模式 allow(对齐 cc isAutoMemPath)。**置于 deny/protected 之后**:
+    //     那两层仍优先(deny 规则、protected paths 不被记忆豁免绕过)。
+    //     安全:isAutoMemPath 用 realpath + 分隔符边界,严格限 memdir 子树。
+    if (ctx.memdir_abs.len > 0) {
+        if (std.mem.eql(u8, tool_name, "Write") or std.mem.eql(u8, tool_name, "Edit")) {
+            if (ctx.memdir_allocator) |ma| {
+                const util_json = @import("../util/json.zig");
+                const memdir = @import("../core/memory/memdir.zig");
+                if (util_json.extractStringField(args, "file_path")) |target| {
+                    if (memdir.isAutoMemPath(ma, ctx.memdir_abs, target)) {
+                        log.debug("permission", "memdir auto-mem write allow: {s}", .{target});
+                        return .allow;
+                    }
+                }
+            }
+        }
     }
 
     // 3. 旧细粒度规则(向后兼容)
@@ -211,6 +237,34 @@ test "plan mode: 特许写 plan 文件,其它 Write 仍 deny(对齐 cc isSession
     // 无 plan_file_path 配置时,连 plan 路径也 deny(机制未启用)。
     const ctx_noplan = Context{ .mode = .plan };
     try std.testing.expect(check(&ctx_noplan, "Write", "{\"file_path\":\"/home/u/.cc-zig/plans/cozy-canyon.md\"}") == .deny);
+}
+
+test "memdir 写豁免:子树内任何模式 allow,外部按常规;deny 仍优先(通道 B)" {
+    const a = std.testing.allocator;
+    // 真建一个 memdir 子树(isAutoMemPath 走 realpath,需真实路径)。
+    const util_time = @import("../util/time.zig");
+    const memdir = @import("../core/memory/memdir.zig");
+    const fsmod = @import("../util/fs.zig");
+    var home_buf: [128]u8 = undefined;
+    const home = try std.fmt.bufPrint(&home_buf, "/tmp/cc-zig-decision-memdir-{d}", .{util_time.nowMs()});
+    defer fsmod.testing.rmrfBestEffort(home);
+    try memdir.ensureDir(home, "/fake/repo");
+    var mdbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const md = memdir.memdirPath(home, "/fake/repo", &mdbuf);
+
+    // plan 模式(最严):写 memdir 内文件仍 allow(记忆与 plan 正交)。
+    const ctx = Context{ .mode = .plan, .memdir_abs = md, .memdir_allocator = a };
+    var ibuf: [std.fs.max_path_bytes + 64]u8 = undefined;
+    const inside_args = try std.fmt.bufPrint(&ibuf, "{{\"file_path\":\"{s}/topic.md\",\"content\":\"x\"}}", .{md});
+    try std.testing.expect(check(&ctx, "Write", inside_args) == .allow);
+    try std.testing.expect(check(&ctx, "Edit", inside_args) == .allow);
+
+    // memdir 外的文件:plan 模式照常 deny(豁免严格限子树)。
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/etc/passwd\",\"content\":\"x\"}") == .deny);
+
+    // 未配置 memdir_abs → 连 memdir 路径也不豁免(走常规 plan deny)。
+    const ctx_off = Context{ .mode = .plan };
+    try std.testing.expect(check(&ctx_off, "Write", inside_args) == .deny);
 }
 
 test "auto mode: low risk allow, others ask" {

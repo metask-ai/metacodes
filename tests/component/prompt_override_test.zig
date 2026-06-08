@@ -73,7 +73,7 @@ test "USING_TOOLS env overrides # Using your tools section in buildFull" {
     // ① 不设:默认段含 "Do NOT use the Bash",不含 sentinel。
     {
         _ = unsetenv(slot_z);
-        const s = try cc.system_prompt.buildFull(a, "claude-opus-4-7", null, null, &.{ "Read", "CodeMap" });
+        const s = try cc.system_prompt.buildFull(a, "claude-opus-4-7", null, null, &.{ "Read", "CodeMap" }, "");
         defer a.free(s);
         try std.testing.expect(std.mem.indexOf(u8, s, sentinel) == null);
         try std.testing.expect(std.mem.indexOf(u8, s, "Do NOT use the Bash") != null);
@@ -83,7 +83,7 @@ test "USING_TOOLS env overrides # Using your tools section in buildFull" {
     {
         setOverride(slot_z, sentinel);
         defer _ = unsetenv(slot_z);
-        const s = try cc.system_prompt.buildFull(a, "claude-opus-4-7", null, null, &.{ "Read", "CodeMap" });
+        const s = try cc.system_prompt.buildFull(a, "claude-opus-4-7", null, null, &.{ "Read", "CodeMap" }, "");
         defer a.free(s);
         try std.testing.expect(std.mem.indexOf(u8, s, sentinel) != null);
         try std.testing.expect(std.mem.indexOf(u8, s, "Do NOT use the Bash") == null);

@@ -206,6 +206,8 @@ pub fn build(b: *std.Build) void {
         "tests/component/task_error_test.zig",
         "tests/component/tool_loop_breaker_test.zig",
         "tests/component/plan_mode_inject_test.zig",
+        "tests/component/user_context_inject_test.zig",
+        "tests/component/memdir_inject_test.zig",
         "tests/component/agent_background_test.zig",
         "tests/component/skill_fileref_test.zig",
         "tests/component/transcript_roundtrip_test.zig",
@@ -269,6 +271,7 @@ pub fn build(b: *std.Build) void {
     // 的 integration 挂起)。每个文件独立 artifact,带 cc + harness imports。
     const new_step = b.step("test:new", "Run only the new e2e-framework L2 component tests");
     const new_files = [_][]const u8{
+        "tests/component/user_context_inject_test.zig",
         "tests/component/http_error_test.zig",
         "tests/component/answer_queue_test.zig",
         "tests/component/base_url_flag_test.zig",
@@ -328,6 +331,41 @@ pub fn build(b: *std.Build) void {
         addTreeSitter(b, cc_mod);
         const t = b.addTest(.{ .name = "new-l2", .root_module = m });
         new_step.dependOn(&b.addRunArtifact(t).step);
+    }
+
+    // test:mem —— 记忆系统 L2 组件测试(隔离 artifact,绕开主套件 integration 挂起)。
+    // 通道 A:user_context_inject;通道 B:memdir_inject。MockServer 断言端到端进请求体。
+    const mem_step = b.step("test:mem", "Run memory-system L2 component tests (isolated)");
+    {
+        const mem_files = [_][]const u8{
+            "tests/component/user_context_inject_test.zig",
+            "tests/component/memdir_inject_test.zig",
+        };
+        for (mem_files) |f| {
+            const m = b.createModule(.{
+                .root_source_file = b.path(f),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            });
+            const harness_mod = b.createModule(.{
+                .root_source_file = b.path("tests/_harness/mock_sse_server.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            });
+            const cc_mod = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            });
+            m.addImport("harness", harness_mod);
+            m.addImport("cc", cc_mod);
+            addTreeSitter(b, cc_mod);
+            const t = b.addTest(.{ .name = "mem-l2", .root_module = m });
+            mem_step.dependOn(&b.addRunArtifact(t).step);
+        }
     }
 
     // test:ts —— 只跑 tree-sitter 相关 L1 单测(隔离 artifact,绕开主套件 integration 挂起)。

@@ -51,6 +51,7 @@ pub fn run(
             .api_client = &app.api_client,
             .tool_defs = app.tool_defs,
             .system_prompt = app.system_prompt,
+            .inject_user_context = app.user_context,
             .dyn_registry = &app.dyn_registry,
             .activate_skill_state = @ptrCast(app),
             .activate_skill_fn = &app_mod.App.activateSkillTrampoline,
