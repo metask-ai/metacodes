@@ -4,6 +4,7 @@ const security = @import("security.zig");
 const util_json = @import("../util/json.zig");
 const read_state = @import("../core/read_state.zig");
 const ToolContext = @import("context.zig").ToolContext;
+const tt = @import("test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
@@ -154,32 +155,40 @@ test "WriteTool path traversal blocked" {
 
 test "WriteTool create file" {
     const ctx = testCtx();
-    const args = "{\"path\":\"/tmp/cc-zig-write-test.txt\",\"content\":\"hello\"}";
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "write-test.txt");
+    var abuf: [320]u8 = undefined;
+    const args = try std.fmt.bufPrint(&abuf, "{{\"path\":\"{s}\",\"content\":\"hello\"}}", .{path});
     const result = try execute(&ctx, args);
     defer std.testing.allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"success\":true") != null);
-    _ = std.c.unlink("/tmp/cc-zig-write-test.txt");
+    _ = std.c.unlink(path.ptr);
 }
 
 test "WriteTool auto-mkdir creates missing parent directory" {
     const ctx = testCtx();
-    const path = "/tmp/cc-zig-mkdir-parent-9a8b/sub/foo.txt";
-    const args = "{\"path\":\"/tmp/cc-zig-mkdir-parent-9a8b/sub/foo.txt\",\"content\":\"x\"}";
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "mkdir-parent-9a8b/sub/foo.txt");
+    var abuf: [320]u8 = undefined;
+    const args = try std.fmt.bufPrint(&abuf, "{{\"path\":\"{s}\",\"content\":\"x\"}}", .{path});
     const result = try execute(&ctx, args);
     defer std.testing.allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"success\":true") != null);
     // cleanup
-    _ = std.c.unlink(path);
-    _ = std.c.rmdir("/tmp/cc-zig-mkdir-parent-9a8b/sub");
-    _ = std.c.rmdir("/tmp/cc-zig-mkdir-parent-9a8b");
+    _ = std.c.unlink(path.ptr);
+    var sbuf: [256]u8 = undefined;
+    _ = std.c.rmdir((tt.path(&sbuf, "mkdir-parent-9a8b/sub")).ptr);
+    var dbuf: [256]u8 = undefined;
+    _ = std.c.rmdir((tt.path(&dbuf, "mkdir-parent-9a8b")).ptr);
 }
 
 test "WriteTool not-read-first rejects existing file" {
     const a = std.testing.allocator;
-    const path = "/tmp/cc-zig-write-mrf-test.txt";
-    defer _ = std.c.unlink(path);
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "write-mrf-test.txt");
+    defer _ = std.c.unlink(path.ptr);
     // 先存在一个文件（外部创建）
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     _ = std.c.write(fd, "old", 3);
     _ = std.c.close(fd);
 
@@ -187,30 +196,36 @@ test "WriteTool not-read-first rejects existing file" {
     defer rs.deinit();
 
     const ctx = ToolContext{ .allocator = a, .read_state = &rs };
-    try std.testing.expectError(error.NotRead, execute(&ctx, "{\"path\":\"/tmp/cc-zig-write-mrf-test.txt\",\"content\":\"new\"}"));
+    var abuf: [320]u8 = undefined;
+    const args = try std.fmt.bufPrint(&abuf, "{{\"path\":\"{s}\",\"content\":\"new\"}}", .{path});
+    try std.testing.expectError(error.NotRead, execute(&ctx, args));
 }
 
 test "WriteTool creating new file does not require read" {
     const a = std.testing.allocator;
-    const path = "/tmp/cc-zig-write-new-test.txt";
-    _ = std.c.unlink(path); // 确保不存在
-    defer _ = std.c.unlink(path);
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "write-new-test.txt");
+    _ = std.c.unlink(path.ptr); // 确保不存在
+    defer _ = std.c.unlink(path.ptr);
 
     var rs = @import("../core/read_state.zig").ReadState.init(a);
     defer rs.deinit();
 
     const ctx = ToolContext{ .allocator = a, .read_state = &rs };
-    const result = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-write-new-test.txt\",\"content\":\"hello\"}");
+    var abuf: [320]u8 = undefined;
+    const args = try std.fmt.bufPrint(&abuf, "{{\"path\":\"{s}\",\"content\":\"hello\"}}", .{path});
+    const result = try execute(&ctx, args);
     defer a.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"success\":true") != null);
 }
 
 test "WriteTool stale file rejected" {
     const a = std.testing.allocator;
-    const path = "/tmp/cc-zig-write-stale-test.txt";
-    defer _ = std.c.unlink(path);
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "write-stale-test.txt");
+    defer _ = std.c.unlink(path.ptr);
 
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     _ = std.c.write(fd, "v1", 2);
     _ = std.c.close(fd);
 
@@ -220,5 +235,7 @@ test "WriteTool stale file rejected" {
     try rs.record(path, 1, 2);
 
     const ctx = ToolContext{ .allocator = a, .read_state = &rs };
-    try std.testing.expectError(error.StaleFile, execute(&ctx, "{\"path\":\"/tmp/cc-zig-write-stale-test.txt\",\"content\":\"v2\"}"));
+    var abuf: [320]u8 = undefined;
+    const args = try std.fmt.bufPrint(&abuf, "{{\"path\":\"{s}\",\"content\":\"v2\"}}", .{path});
+    try std.testing.expectError(error.StaleFile, execute(&ctx, args));
 }

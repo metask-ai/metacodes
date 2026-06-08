@@ -1,5 +1,6 @@
 const std = @import("std");
 const common = @import("common.zig");
+const tt = @import("test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 const toolchain = @import("../util/toolchain.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
@@ -240,16 +241,19 @@ test "GrepTool files_with_matches default" {
 
 test "GrepTool content mode with -n" {
     const ctx = testCtx();
-    // 准备一个包含 "needle" 的临时文件
-    const path = "/tmp/cc-zig-grep-content-test.txt";
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    // 准备一个包含 "needle" 的临时文件(per-pid 唯一路径,避免并发撞车)
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "grep-content-test.txt");
+    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     const text = "pre\nneedle line\npost\n";
     _ = std.c.write(fd, text.ptr, text.len);
     _ = std.c.close(fd);
-    defer _ = std.c.unlink(path);
+    defer _ = std.c.unlink(path.ptr);
 
-    const r = try execute(&ctx, "{\"pattern\":\"needle\",\"path\":\"/tmp/cc-zig-grep-content-test.txt\",\"output_mode\":\"content\"}");
+    var abuf: [320]u8 = undefined;
+    const args = try std.fmt.bufPrint(&abuf, "{{\"pattern\":\"needle\",\"path\":\"{s}\",\"output_mode\":\"content\"}}", .{path});
+    const r = try execute(&ctx, args);
     defer std.testing.allocator.free(r);
     // content 模式应含行号 "2:" 和匹配文本 "needle"
     try std.testing.expect(std.mem.indexOf(u8, r, "needle") != null);
@@ -258,15 +262,18 @@ test "GrepTool content mode with -n" {
 
 test "GrepTool count mode" {
     const ctx = testCtx();
-    const path = "/tmp/cc-zig-grep-count-test.txt";
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "grep-count-test.txt");
+    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     const text = "x\nx\ny\nx\n";
     _ = std.c.write(fd, text.ptr, text.len);
     _ = std.c.close(fd);
-    defer _ = std.c.unlink(path);
+    defer _ = std.c.unlink(path.ptr);
 
-    const r = try execute(&ctx, "{\"pattern\":\"x\",\"path\":\"/tmp/cc-zig-grep-count-test.txt\",\"output_mode\":\"count\"}");
+    var abuf: [320]u8 = undefined;
+    const args = try std.fmt.bufPrint(&abuf, "{{\"pattern\":\"x\",\"path\":\"{s}\",\"output_mode\":\"count\"}}", .{path});
+    const r = try execute(&ctx, args);
     defer std.testing.allocator.free(r);
     // rg -c 对单文件输出 "3\n"（无 path 前缀）
     const trimmed = std.mem.trim(u8, r, " \r\n");
@@ -275,30 +282,36 @@ test "GrepTool count mode" {
 
 test "GrepTool case insensitive" {
     const ctx = testCtx();
-    const path = "/tmp/cc-zig-grep-i-test.txt";
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "grep-i-test.txt");
+    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     const text = "HELLO\nworld\n";
     _ = std.c.write(fd, text.ptr, text.len);
     _ = std.c.close(fd);
-    defer _ = std.c.unlink(path);
+    defer _ = std.c.unlink(path.ptr);
 
-    const r = try execute(&ctx, "{\"pattern\":\"hello\",\"path\":\"/tmp/cc-zig-grep-i-test.txt\",\"output_mode\":\"content\",\"-i\":true}");
+    var abuf: [320]u8 = undefined;
+    const args = try std.fmt.bufPrint(&abuf, "{{\"pattern\":\"hello\",\"path\":\"{s}\",\"output_mode\":\"content\",\"-i\":true}}", .{path});
+    const r = try execute(&ctx, args);
     defer std.testing.allocator.free(r);
     try std.testing.expect(std.mem.indexOf(u8, r, "HELLO") != null);
 }
 
 test "GrepTool -B -A context" {
     const ctx = testCtx();
-    const path = "/tmp/cc-zig-grep-ctx-test.txt";
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "grep-ctx-test.txt");
+    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     const text = "before\nmatch\nafter\nother\n";
     _ = std.c.write(fd, text.ptr, text.len);
     _ = std.c.close(fd);
-    defer _ = std.c.unlink(path);
+    defer _ = std.c.unlink(path.ptr);
 
-    const r = try execute(&ctx, "{\"pattern\":\"match\",\"path\":\"/tmp/cc-zig-grep-ctx-test.txt\",\"output_mode\":\"content\",\"-B\":\"1\",\"-A\":\"1\"}");
+    var abuf: [360]u8 = undefined;
+    const args = try std.fmt.bufPrint(&abuf, "{{\"pattern\":\"match\",\"path\":\"{s}\",\"output_mode\":\"content\",\"-B\":\"1\",\"-A\":\"1\"}}", .{path});
+    const r = try execute(&ctx, args);
     defer std.testing.allocator.free(r);
     try std.testing.expect(std.mem.indexOf(u8, r, "before") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "after") != null);
@@ -307,15 +320,18 @@ test "GrepTool -B -A context" {
 
 test "GrepTool -C context shorthand" {
     const ctx = testCtx();
-    const path = "/tmp/cc-zig-grep-cC-test.txt";
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "grep-cC-test.txt");
+    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     const text = "a\nb\nHIT\nc\nd\n";
     _ = std.c.write(fd, text.ptr, text.len);
     _ = std.c.close(fd);
-    defer _ = std.c.unlink(path);
+    defer _ = std.c.unlink(path.ptr);
 
-    const r = try execute(&ctx, "{\"pattern\":\"HIT\",\"path\":\"/tmp/cc-zig-grep-cC-test.txt\",\"output_mode\":\"content\",\"-C\":\"1\"}");
+    var abuf: [360]u8 = undefined;
+    const args = try std.fmt.bufPrint(&abuf, "{{\"pattern\":\"HIT\",\"path\":\"{s}\",\"output_mode\":\"content\",\"-C\":\"1\"}}", .{path});
+    const r = try execute(&ctx, args);
     defer std.testing.allocator.free(r);
     try std.testing.expect(std.mem.indexOf(u8, r, "b") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "c") != null);
@@ -324,24 +340,31 @@ test "GrepTool -C context shorthand" {
 
 test "GrepTool glob filter" {
     const ctx = testCtx();
-    // 在 /tmp 造两个文件：一个 .zig 一个 .txt
-    const zig_path: [*:0]const u8 = "/tmp/cc-zig-grep-glob.zig";
-    const txt_path: [*:0]const u8 = "/tmp/cc-zig-grep-glob.txt";
+    // 在 per-pid 临时目录造两个文件：一个 .zig 一个 .txt
+    var zbuf: [256]u8 = undefined;
+    var tbuf: [256]u8 = undefined;
+    const zig_path = tt.path(&zbuf, "grep-glob.zig");
+    const txt_path = tt.path(&tbuf, "grep-glob.txt");
     const text = "hello\n";
 
-    const fd1 = std.c.open(zig_path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd1 = std.c.open(zig_path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     _ = std.c.write(fd1, text.ptr, text.len);
     _ = std.c.close(fd1);
-    const fd2 = std.c.open(txt_path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd2 = std.c.open(txt_path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     _ = std.c.write(fd2, text.ptr, text.len);
     _ = std.c.close(fd2);
-    defer _ = std.c.unlink(zig_path);
-    defer _ = std.c.unlink(txt_path);
+    defer _ = std.c.unlink(zig_path.ptr);
+    defer _ = std.c.unlink(txt_path.ptr);
 
-    const r = try execute(&ctx, "{\"pattern\":\"hello\",\"path\":\"/tmp\",\"output_mode\":\"files_with_matches\",\"glob\":\"cc-zig-grep-glob.zig\"}");
+    // 搜索 per-pid 目录,glob 只命中 .zig。
+    var dbuf: [256]u8 = undefined;
+    const dir = tt.path(&dbuf, ""); // 目录本身(末尾 /)
+    var abuf: [384]u8 = undefined;
+    const args = try std.fmt.bufPrint(&abuf, "{{\"pattern\":\"hello\",\"path\":\"{s}\",\"output_mode\":\"files_with_matches\",\"glob\":\"grep-glob.zig\"}}", .{dir});
+    const r = try execute(&ctx, args);
     defer std.testing.allocator.free(r);
-    try std.testing.expect(std.mem.indexOf(u8, r, "cc-zig-grep-glob.zig") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r, "cc-zig-grep-glob.txt") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "grep-glob.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "grep-glob.txt") == null);
 }
 
 test "paginate: head_limit truncates and adds appliedLimit notice" {
@@ -460,13 +483,15 @@ test "isBareIdentifier 仅接受裸标识符,拒绝正则/空格/点号" {
 
 test "Grep 搭车:裸标识符前置 FindSymbol 定义块;正则不触发" {
     const ctx = testCtx();
-    // 写一个真 .zig fixture(含 clamp 定义)
-    const dir = "/tmp/cc-zig-grep-hitch-test";
-    _ = std.c.mkdir(dir, 0o755);
-    const fpath = dir ++ "/sample.zig";
-    defer _ = std.c.unlink(fpath);
+    // 写一个真 .zig fixture(含 clamp 定义),用 per-pid 唯一目录避免并发撞车。
+    var dbuf: [256]u8 = undefined;
+    const dir = tt.path(&dbuf, "grep-hitch"); // per-pid 子目录
+    _ = std.c.mkdir(dir.ptr, 0o755);
+    var fbuf: [320]u8 = undefined;
+    const fpath = std.fmt.bufPrintZ(&fbuf, "{s}/sample.zig", .{dir}) catch unreachable;
+    defer _ = std.c.unlink(fpath.ptr);
     {
-        const fd = std.c.open(fpath, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        const fd = std.c.open(fpath.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try std.testing.expect(fd >= 0);
         const text = "pub fn clamp(v: i32) i32 { return v; }\nconst x = clamp(3);\n";
         _ = std.c.write(fd, text.ptr, text.len);
@@ -475,7 +500,9 @@ test "Grep 搭车:裸标识符前置 FindSymbol 定义块;正则不触发" {
 
     // ① 裸标识符 "clamp" → 应前置定义块
     {
-        const r = try execute(&ctx, "{\"pattern\":\"clamp\",\"path\":\"" ++ dir ++ "\",\"output_mode\":\"content\"}");
+        var abuf: [320]u8 = undefined;
+        const args = try std.fmt.bufPrint(&abuf, "{{\"pattern\":\"clamp\",\"path\":\"{s}\",\"output_mode\":\"content\"}}", .{dir});
+        const r = try execute(&ctx, args);
         defer std.testing.allocator.free(r);
         try std.testing.expect(std.mem.indexOf(u8, r, "via FindSymbol") != null);
         try std.testing.expect(std.mem.indexOf(u8, r, "all grep matches below") != null);
@@ -486,7 +513,9 @@ test "Grep 搭车:裸标识符前置 FindSymbol 定义块;正则不触发" {
     }
     // ② 正则 "clamp.*i32" → 不触发(isBareIdentifier=false),无定义块
     {
-        const r = try execute(&ctx, "{\"pattern\":\"clamp.*i32\",\"path\":\"" ++ dir ++ "\",\"output_mode\":\"content\"}");
+        var abuf: [320]u8 = undefined;
+        const args = try std.fmt.bufPrint(&abuf, "{{\"pattern\":\"clamp.*i32\",\"path\":\"{s}\",\"output_mode\":\"content\"}}", .{dir});
+        const r = try execute(&ctx, args);
         defer std.testing.allocator.free(r);
         try std.testing.expect(std.mem.indexOf(u8, r, "via FindSymbol") == null);
     }

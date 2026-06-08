@@ -4,6 +4,7 @@ const security = @import("security.zig");
 const util_json = @import("../util/json.zig");
 const read_state = @import("../core/read_state.zig");
 const ToolContext = @import("context.zig").ToolContext;
+const tt = @import("test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
@@ -363,30 +364,37 @@ test "EditTool path traversal blocked" {
 
 test "EditTool basic replace" {
     const ctx = testCtx();
-    const path = "/tmp/cc-zig-edit-test.txt";
-    defer _ = std.c.unlink(path);
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "edit-test.txt");
+    defer _ = std.c.unlink(path.ptr);
 
     const write = @import("write.zig");
-    std.testing.allocator.free(try write.execute(&ctx, "{\"path\":\"/tmp/cc-zig-edit-test.txt\",\"content\":\"Hello World\"}"));
+    var b1: [320]u8 = undefined;
+    std.testing.allocator.free(try write.execute(&ctx, try std.fmt.bufPrint(&b1, "{{\"path\":\"{s}\",\"content\":\"Hello World\"}}", .{path})));
 
-    const result = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-test.txt\",\"old_string\":\"World\",\"new_string\":\"Zig\"}");
+    var b2: [320]u8 = undefined;
+    const result = try execute(&ctx, try std.fmt.bufPrint(&b2, "{{\"file_path\":\"{s}\",\"old_string\":\"World\",\"new_string\":\"Zig\"}}", .{path}));
     defer std.testing.allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"success\":true") != null);
 }
 
 test "EditTool replace_all" {
     const ctx = testCtx();
-    const path = "/tmp/cc-zig-edit-all-test.txt";
-    defer _ = std.c.unlink(path);
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "edit-all-test.txt");
+    defer _ = std.c.unlink(path.ptr);
 
     const write = @import("write.zig");
-    std.testing.allocator.free(try write.execute(&ctx, "{\"path\":\"/tmp/cc-zig-edit-all-test.txt\",\"content\":\"foo foo foo\"}"));
+    var b1: [320]u8 = undefined;
+    std.testing.allocator.free(try write.execute(&ctx, try std.fmt.bufPrint(&b1, "{{\"path\":\"{s}\",\"content\":\"foo foo foo\"}}", .{path})));
 
-    const result = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-all-test.txt\",\"old_string\":\"foo\",\"new_string\":\"bar\",\"replace_all\":true}");
+    var b2: [320]u8 = undefined;
+    const result = try execute(&ctx, try std.fmt.bufPrint(&b2, "{{\"file_path\":\"{s}\",\"old_string\":\"foo\",\"new_string\":\"bar\",\"replace_all\":true}}", .{path}));
     defer std.testing.allocator.free(result);
 
     const read = @import("read.zig");
-    const content = try read.execute(&ctx, "{\"path\":\"/tmp/cc-zig-edit-all-test.txt\"}");
+    var b3: [320]u8 = undefined;
+    const content = try read.execute(&ctx, try std.fmt.bufPrint(&b3, "{{\"path\":\"{s}\"}}", .{path}));
     defer std.testing.allocator.free(content);
     try std.testing.expect(std.mem.indexOf(u8, content, "foo") == null);
     try std.testing.expect(std.mem.indexOf(u8, content, "bar bar bar") != null);
@@ -394,58 +402,71 @@ test "EditTool replace_all" {
 
 test "EditTool string not found" {
     const ctx = testCtx();
-    const path = "/tmp/cc-zig-edit-nf-test.txt";
-    defer _ = std.c.unlink(path);
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "edit-nf-test.txt");
+    defer _ = std.c.unlink(path.ptr);
 
     const write = @import("write.zig");
-    std.testing.allocator.free(try write.execute(&ctx, "{\"path\":\"/tmp/cc-zig-edit-nf-test.txt\",\"content\":\"hello\"}"));
+    var b1: [320]u8 = undefined;
+    std.testing.allocator.free(try write.execute(&ctx, try std.fmt.bufPrint(&b1, "{{\"path\":\"{s}\",\"content\":\"hello\"}}", .{path})));
 
-    try std.testing.expectError(error.StringNotFound, execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-nf-test.txt\",\"old_string\":\"missing\",\"new_string\":\"x\"}"));
+    var b2: [320]u8 = undefined;
+    try std.testing.expectError(error.StringNotFound, execute(&ctx, try std.fmt.bufPrint(&b2, "{{\"file_path\":\"{s}\",\"old_string\":\"missing\",\"new_string\":\"x\"}}", .{path})));
 }
 
 test "EditTool MultipleMatches without replace_all" {
     const ctx = testCtx();
-    const path = "/tmp/cc-zig-edit-multi-test.txt";
-    defer _ = std.c.unlink(path);
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "edit-multi-test.txt");
+    defer _ = std.c.unlink(path.ptr);
 
     const write = @import("write.zig");
-    std.testing.allocator.free(try write.execute(&ctx, "{\"path\":\"/tmp/cc-zig-edit-multi-test.txt\",\"content\":\"foo foo foo\"}"));
+    var b1: [320]u8 = undefined;
+    std.testing.allocator.free(try write.execute(&ctx, try std.fmt.bufPrint(&b1, "{{\"path\":\"{s}\",\"content\":\"foo foo foo\"}}", .{path})));
 
     // 未设 replace_all，foo 多次命中 → MultipleMatches
-    try std.testing.expectError(error.MultipleMatches, execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-multi-test.txt\",\"old_string\":\"foo\",\"new_string\":\"bar\"}"));
+    var b2: [320]u8 = undefined;
+    try std.testing.expectError(error.MultipleMatches, execute(&ctx, try std.fmt.bufPrint(&b2, "{{\"file_path\":\"{s}\",\"old_string\":\"foo\",\"new_string\":\"bar\"}}", .{path})));
 }
 
 test "EditTool MultipleMatches bypass with replace_all" {
     const ctx = testCtx();
-    const path = "/tmp/cc-zig-edit-multi-ok-test.txt";
-    defer _ = std.c.unlink(path);
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "edit-multi-ok-test.txt");
+    defer _ = std.c.unlink(path.ptr);
 
     const write = @import("write.zig");
-    std.testing.allocator.free(try write.execute(&ctx, "{\"path\":\"/tmp/cc-zig-edit-multi-ok-test.txt\",\"content\":\"foo foo foo\"}"));
+    var b1: [320]u8 = undefined;
+    std.testing.allocator.free(try write.execute(&ctx, try std.fmt.bufPrint(&b1, "{{\"path\":\"{s}\",\"content\":\"foo foo foo\"}}", .{path})));
 
     // replace_all=true 时多匹配是合法的
-    const result = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-multi-ok-test.txt\",\"old_string\":\"foo\",\"new_string\":\"bar\",\"replace_all\":true}");
+    var b2: [320]u8 = undefined;
+    const result = try execute(&ctx, try std.fmt.bufPrint(&b2, "{{\"file_path\":\"{s}\",\"old_string\":\"foo\",\"new_string\":\"bar\",\"replace_all\":true}}", .{path}));
     defer std.testing.allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"success\":true") != null);
 }
 
 test "EditTool strips cat-n line numbers from old_string" {
     const ctx = testCtx();
-    const path = "/tmp/cc-zig-edit-lnstrip-test.txt";
-    defer _ = std.c.unlink(path);
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "edit-lnstrip-test.txt");
+    defer _ = std.c.unlink(path.ptr);
 
     const write = @import("write.zig");
-    std.testing.allocator.free(try write.execute(&ctx, "{\"path\":\"/tmp/cc-zig-edit-lnstrip-test.txt\",\"content\":\"hello\\nworld\"}"));
+    var b1: [320]u8 = undefined;
+    std.testing.allocator.free(try write.execute(&ctx, try std.fmt.bufPrint(&b1, "{{\"path\":\"{s}\",\"content\":\"hello\\nworld\"}}", .{path})));
 
     // 模拟模型从 Read 结果里复制带行号前缀的 old_string:
     //   "     2\\tworld"  —— Edit 应识别并 strip，匹配文件中的 "world"
-    const result = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-lnstrip-test.txt\",\"old_string\":\"     2\\tworld\",\"new_string\":\"     2\\tzig\"}");
+    var b2: [320]u8 = undefined;
+    const result = try execute(&ctx, try std.fmt.bufPrint(&b2, "{{\"file_path\":\"{s}\",\"old_string\":\"     2\\tworld\",\"new_string\":\"     2\\tzig\"}}", .{path}));
     defer std.testing.allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"success\":true") != null);
 
     // 读回验证文件现在是 "hello\nzig"（注意 read 会加前缀，检查 content 包含 "zig"）
     const read = @import("read.zig");
-    const content = try read.execute(&ctx, "{\"path\":\"/tmp/cc-zig-edit-lnstrip-test.txt\"}");
+    var b3: [320]u8 = undefined;
+    const content = try read.execute(&ctx, try std.fmt.bufPrint(&b3, "{{\"path\":\"{s}\"}}", .{path}));
     defer std.testing.allocator.free(content);
     try std.testing.expect(std.mem.indexOf(u8, content, "zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "world") == null);
@@ -494,10 +515,11 @@ test "EditTool not-read-first rejects" {
 
 test "EditTool stale rejected" {
     const a = std.testing.allocator;
-    const path = "/tmp/cc-zig-edit-stale-test.txt";
-    defer _ = std.c.unlink(path);
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "edit-stale-test.txt");
+    defer _ = std.c.unlink(path.ptr);
 
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     _ = std.c.write(fd, "hello", 5);
     _ = std.c.close(fd);
 
@@ -506,15 +528,17 @@ test "EditTool stale rejected" {
     try rs.record(path, 1, 5); // 假 mtime
 
     const ctx = ToolContext{ .allocator = a, .read_state = &rs };
-    try std.testing.expectError(error.StaleFile, execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-stale-test.txt\",\"old_string\":\"hello\",\"new_string\":\"world\"}"));
+    var abuf: [320]u8 = undefined;
+    try std.testing.expectError(error.StaleFile, execute(&ctx, try std.fmt.bufPrint(&abuf, "{{\"file_path\":\"{s}\",\"old_string\":\"hello\",\"new_string\":\"world\"}}", .{path})));
 }
 
 test "EditTool after read succeeds" {
     const a = std.testing.allocator;
-    const path = "/tmp/cc-zig-edit-after-read-test.txt";
-    defer _ = std.c.unlink(path);
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "edit-after-read-test.txt");
+    defer _ = std.c.unlink(path.ptr);
 
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     _ = std.c.write(fd, "foo", 3);
     _ = std.c.close(fd);
 
@@ -524,11 +548,13 @@ test "EditTool after read succeeds" {
     const ctx = ToolContext{ .allocator = a, .read_state = &rs };
     // 先模拟 Read（从文件 stat 出真 mtime 记入）
     const read = @import("read.zig");
-    const rout = try read.execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-after-read-test.txt\"}");
+    var rb: [320]u8 = undefined;
+    const rout = try read.execute(&ctx, try std.fmt.bufPrint(&rb, "{{\"file_path\":\"{s}\"}}", .{path}));
     a.free(rout);
 
     // 现在 Edit 应成功
-    const result = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-after-read-test.txt\",\"old_string\":\"foo\",\"new_string\":\"bar\"}");
+    var abuf: [320]u8 = undefined;
+    const result = try execute(&ctx, try std.fmt.bufPrint(&abuf, "{{\"file_path\":\"{s}\",\"old_string\":\"foo\",\"new_string\":\"bar\"}}", .{path}));
     defer a.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"success\":true") != null);
 }
@@ -548,16 +574,19 @@ test "findSmartQuote returns null when no match" {
 
 test "EditTool old==new 拒绝(NoOpEdit)+ detail" {
     const a = std.testing.allocator;
-    const path = "/tmp/cc-zig-edit-noop.txt";
-    defer _ = std.c.unlink(path);
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "edit-noop.txt");
+    defer _ = std.c.unlink(path.ptr);
     const write = @import("write.zig");
     var rs = @import("../core/read_state.zig").ReadState.init(a);
     defer rs.deinit();
     var detail: ?[]const u8 = null;
     const ctx = ToolContext{ .allocator = a, .read_state = &rs, .error_detail = &detail };
-    a.free(try write.execute(&ctx, "{\"path\":\"/tmp/cc-zig-edit-noop.txt\",\"content\":\"abc\"}"));
+    var b1: [320]u8 = undefined;
+    a.free(try write.execute(&ctx, try std.fmt.bufPrint(&b1, "{{\"path\":\"{s}\",\"content\":\"abc\"}}", .{path})));
     // old==new → NoOpEdit,且 detail 被填。
-    try std.testing.expectError(error.NoOpEdit, execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-noop.txt\",\"old_string\":\"abc\",\"new_string\":\"abc\"}"));
+    var b2: [320]u8 = undefined;
+    try std.testing.expectError(error.NoOpEdit, execute(&ctx, try std.fmt.bufPrint(&b2, "{{\"file_path\":\"{s}\",\"old_string\":\"abc\",\"new_string\":\"abc\"}}", .{path})));
     try std.testing.expect(detail != null);
     try std.testing.expect(std.mem.indexOf(u8, detail.?, "no-op") != null);
     if (detail) |d| a.free(d);
@@ -565,18 +594,22 @@ test "EditTool old==new 拒绝(NoOpEdit)+ detail" {
 
 test "EditTool not-found 诊断:仅空白差异提示" {
     const a = std.testing.allocator;
-    const path = "/tmp/cc-zig-edit-wsdiff.txt";
-    defer _ = std.c.unlink(path);
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "edit-wsdiff.txt");
+    defer _ = std.c.unlink(path.ptr);
     const write = @import("write.zig");
     var rs = @import("../core/read_state.zig").ReadState.init(a);
     defer rs.deinit();
     var detail: ?[]const u8 = null;
     const ctx = ToolContext{ .allocator = a, .read_state = &rs, .error_detail = &detail };
     // 文件用 tab 缩进;old_string 用空格缩进 → 仅空白差异。
-    a.free(try write.execute(&ctx, "{\"path\":\"/tmp/cc-zig-edit-wsdiff.txt\",\"content\":\"\\tfoo()\"}"));
+    var b1: [320]u8 = undefined;
+    a.free(try write.execute(&ctx, try std.fmt.bufPrint(&b1, "{{\"path\":\"{s}\",\"content\":\"\\tfoo()\"}}", .{path})));
     const read = @import("read.zig");
-    a.free(try read.execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-wsdiff.txt\"}"));
-    try std.testing.expectError(error.StringNotFound, execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-wsdiff.txt\",\"old_string\":\"    foo()\",\"new_string\":\"    bar()\"}"));
+    var b2: [320]u8 = undefined;
+    a.free(try read.execute(&ctx, try std.fmt.bufPrint(&b2, "{{\"file_path\":\"{s}\"}}", .{path})));
+    var b3: [320]u8 = undefined;
+    try std.testing.expectError(error.StringNotFound, execute(&ctx, try std.fmt.bufPrint(&b3, "{{\"file_path\":\"{s}\",\"old_string\":\"    foo()\",\"new_string\":\"    bar()\"}}", .{path})));
     try std.testing.expect(detail != null);
     try std.testing.expect(std.mem.indexOf(u8, detail.?, "whitespace") != null);
     if (detail) |d| a.free(d);
@@ -604,10 +637,11 @@ test "firstNonBlankLine" {
 
 test "EditTool smart-quote fallback replaces curly with straight" {
     const a = std.testing.allocator;
-    const path = "/tmp/cc-zig-edit-smartquote.txt";
-    defer _ = std.c.unlink(path);
+    var pbuf: [256]u8 = undefined;
+    const path = tt.path(&pbuf, "edit-smartquote.txt");
+    defer _ = std.c.unlink(path.ptr);
     // 文件含弯引号
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     const content = "const s = \xE2\x80\x9Chello\xE2\x80\x9D;\n";
     _ = std.c.write(fd, content.ptr, content.len);
     _ = std.c.close(fd);
@@ -616,16 +650,18 @@ test "EditTool smart-quote fallback replaces curly with straight" {
     defer rs.deinit();
     const ctx = ToolContext{ .allocator = a, .read_state = &rs };
     const read = @import("read.zig");
-    const rout = try read.execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-smartquote.txt\"}");
+    var rb: [320]u8 = undefined;
+    const rout = try read.execute(&ctx, try std.fmt.bufPrint(&rb, "{{\"file_path\":\"{s}\"}}", .{path}));
     a.free(rout);
 
     // old_string 用直引号；应通过 smart-quote fallback 命中
-    const result = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-edit-smartquote.txt\",\"old_string\":\"const s = \\\"hello\\\";\",\"new_string\":\"const s = world;\"}");
+    var abuf: [384]u8 = undefined;
+    const result = try execute(&ctx, try std.fmt.bufPrint(&abuf, "{{\"file_path\":\"{s}\",\"old_string\":\"const s = \\\"hello\\\";\",\"new_string\":\"const s = world;\"}}", .{path}));
     defer a.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "\"success\":true") != null);
 
     // 验证文件内容已替换
-    const vfd = std.c.open(path, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const vfd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     var rbuf: [128]u8 = undefined;
     const n = std.c.read(vfd, &rbuf, rbuf.len);
     _ = std.c.close(vfd);

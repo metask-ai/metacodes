@@ -33,7 +33,7 @@ test "L2 transcript: 写 → loadTranscript 往返,消息数/角色/text 一致"
     try conv.appendText(.user, "second user msg");
 
     // 2) 写盘
-    var writer = try transcript.Writer.init(a, "/some/cwd", home, "claude-sonnet-4-20250514");
+    var writer = try transcript.Writer.init(a, "/some/cwd", home, "claude-sonnet-4-20250514", transcript.genSessionId());
     const session_dir = try a.dupe(u8, writer.dir);
     defer a.free(session_dir);
     writer.flush(&conv);
@@ -71,7 +71,7 @@ test "L2 transcript: openExisting resume 续写不重复已刷盘消息" {
     defer conv.deinit();
     try conv.appendText(.user, "msg A");
     try conv.appendText(.assistant, "reply A");
-    var w1 = try transcript.Writer.init(a, "/cwd", home, "m");
+    var w1 = try transcript.Writer.init(a, "/cwd", home, "m", transcript.genSessionId());
     const dir = try a.dupe(u8, w1.dir);
     defer a.free(dir);
     w1.flush(&conv);

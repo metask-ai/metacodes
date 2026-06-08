@@ -389,7 +389,8 @@ pub const App = struct {
         const cwd = try @import("util/fs.zig").getCwd(app.allocator);
         defer app.allocator.free(cwd);
 
-        const w = try transcript.Writer.init(app.allocator, cwd, home, app.config.model);
+        // session_id 传入,使 transcript 目录名 == App.session_id(统一,不再两个独立 gen)。
+        const w = try transcript.Writer.init(app.allocator, cwd, home, app.config.model, app.session_id);
         app.transcript_writer = w;
     }
 

@@ -68,9 +68,10 @@ pub const Writer = struct {
         cwd: []const u8,
         home: []const u8,
         model: []const u8,
+        /// 会话 id(由 App 传入,统一 App.session_id 与 transcript 目录名)。
+        sid: SessionId,
     ) !Writer {
         const cwd_hash = hashCwd(cwd);
-        const sid = genSessionId();
 
         // 构造路径 $HOME/.cc-zig/projects/<cwd_hash>/<session_id>/
         const dir = try std.fmt.allocPrint(allocator, "{s}/.cc-zig/projects/{s}/{s}", .{ home, cwd_hash[0..], sid.bytes[0..] });
@@ -487,7 +488,7 @@ test "write then load roundtrip" {
         a.free(tmp_home);
     }
 
-    var writer = try Writer.init(a, "/dummy/cwd", tmp_home, "claude-sonnet-4-20250514");
+    var writer = try Writer.init(a, "/dummy/cwd", tmp_home, "claude-sonnet-4-20250514", genSessionId());
     defer writer.deinit();
 
     var conv = Conversation.init(a);
@@ -520,7 +521,7 @@ test "write tool_use and tool_result roundtrip" {
         a.free(tmp_home);
     }
 
-    var writer = try Writer.init(a, "/dummy", tmp_home, "claude-sonnet");
+    var writer = try Writer.init(a, "/dummy", tmp_home, "claude-sonnet", genSessionId());
     defer writer.deinit();
 
     var conv = Conversation.init(a);
@@ -564,7 +565,7 @@ test "listSessions orders by last_modified desc" {
     // 写三个 session
     var i: usize = 0;
     while (i < 3) : (i += 1) {
-        var w = try Writer.init(a, "/project-X", tmp_home, "m");
+        var w = try Writer.init(a, "/project-X", tmp_home, "m", genSessionId());
         defer w.deinit();
         var conv = Conversation.init(a);
         defer conv.deinit();
