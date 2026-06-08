@@ -360,7 +360,7 @@ fn appendStatusRight(
 
 /// 类A 工具(Bash/Read/Grep/Glob)完成后 commit 进 scrollback 的完整卡。对齐 cc 2.1.165:
 ///   行1: `⏺ <toolDoneTitle>`(过去式自然语言)+ 右对齐 `✓/✗ X.Ys`
-///   行2: `  ⎿  <toolPreview>`(**只显输入** $ cmd / 📄 path / /pat/,不显输出——输出走助手文本)
+///   行2: `  ⎿  <toolPreview>`(**只显输入** $ cmd / 📄 path / pattern: "…",不显输出——输出走助手文本)
 /// 与 renderResult(live 模式只补 ⎿ body)不同:类A 运行中标题在动态区会被擦,commit 卡须自带完整标题。
 /// caller free。
 pub fn renderLiveDone(
@@ -390,7 +390,7 @@ pub fn renderLiveDone(
     try out.appendSlice(alloc, title);
     try out.append(alloc, '\n');
 
-    // 行2:⎿ 只显输入预览($ cmd / 📄 path / /pat/)。与运行中态第二行一致。
+    // 行2:⎿ 只显输入预览($ cmd / 📄 path / pattern: "…")。与运行中态第二行一致。
     // 长命令按宽度软折行 + 5 列悬挂缩进(对齐 cc:续行不回第 0 列,见 appendGutterWrapped)。
     const preview = try toolPreview(alloc, tool_name, input);
     defer alloc.free(preview);
@@ -1337,8 +1337,13 @@ fn toolPreview(alloc: std.mem.Allocator, tool_name: []const u8, args: []const u8
             return try std.fmt.allocPrint(alloc, "± {s}", .{p});
         }
     } else if (std.mem.eql(u8, tool_name, "Grep") or std.mem.eql(u8, tool_name, "Glob")) {
+        // 对齐 cc GrepTool/UI.tsx:`pattern: "<pat>"[, path: "<path>"]`(双引号包,非斜杠)。
+        // 旧 `/{s}/` 会把以 / 开头/结尾的 pattern(如搜 "/v1/models")显示成 "//v1/models/"。
         if (extractField(args, "pattern")) |p| {
-            return try std.fmt.allocPrint(alloc, "/{s}/", .{p});
+            if (extractField(args, "path")) |path| {
+                return try std.fmt.allocPrint(alloc, "pattern: \"{s}\", path: \"{s}\"", .{ p, path });
+            }
+            return try std.fmt.allocPrint(alloc, "pattern: \"{s}\"", .{p});
         }
     } else if (std.mem.eql(u8, tool_name, "WebFetch")) {
         if (extractField(args, "url")) |u| {
@@ -2108,6 +2113,28 @@ test "actionLabel: 多行 command 只取首行" {
     const s = try actionLabel(testing.allocator, "Bash", "{\"command\":\"cd /x\\nmake\"}");
     defer testing.allocator.free(s);
     try testing.expectEqualStrings("Bash(cd /x)", s);
+}
+
+test "toolPreview: Grep pattern 用 pattern:\"…\" 格式(不产生双斜杠)" {
+    const a = testing.allocator;
+    // 回归:含 / 的 pattern(如搜 \"/v1/models\")旧 `/{s}/` 会显示成 `//v1/models/`。
+    {
+        const s = try toolPreviewPub(a, "Grep", "{\"pattern\":\"/v1/models\"}");
+        defer a.free(s);
+        try testing.expectEqualStrings("pattern: \"/v1/models\"", s);
+        try testing.expect(std.mem.indexOf(u8, s, "//") == null); // 无双斜杠
+    }
+    {
+        const s = try toolPreviewPub(a, "Grep", "{\"pattern\":\"TODO\"}");
+        defer a.free(s);
+        try testing.expectEqualStrings("pattern: \"TODO\"", s);
+    }
+    {
+        // 带 path:对齐 cc `pattern: "x", path: "y"`。
+        const s = try toolPreviewPub(a, "Grep", "{\"pattern\":\"foo\",\"path\":\"src/util\"}");
+        defer a.free(s);
+        try testing.expectEqualStrings("pattern: \"foo\", path: \"src/util\"", s);
+    }
 }
 
 test "actionLabel: 超长 CJK 参数按显示宽截断且不切碎 UTF-8" {
