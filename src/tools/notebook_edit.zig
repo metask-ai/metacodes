@@ -18,7 +18,7 @@
 
 const std = @import("std");
 const common = @import("common.zig");
-const security = @import("security.zig");
+const path_mod = @import("../util/path.zig");
 const ToolContext = @import("context.zig").ToolContext;
 const util_json = @import("../util/json.zig");
 
@@ -26,9 +26,11 @@ const EditMode = enum { replace, insert, delete };
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const a = ctx.allocator;
-    const path = common.extractJsonArg(args, "notebook_path") orelse return error.MissingNotebookPath;
-    if (path.len == 0) return error.EmptyNotebookPath;
-    try security.validateNoTraversal(path);
+    const path_raw = common.extractJsonArg(args, "notebook_path") orelse return error.MissingNotebookPath;
+    if (path_raw.len == 0) return error.EmptyNotebookPath;
+    // 归一化(展开 ~、折叠、查 traversal)。openat 不认 ~。
+    const path = try path_mod.normalizeChecked(a, path_raw, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
+    defer a.free(path);
     if (!std.mem.endsWith(u8, path, ".ipynb")) return error.NotANotebook;
 
     const new_source_raw = common.extractJsonArg(args, "new_source") orelse "";

@@ -354,6 +354,7 @@ test {
     _ = &@import("util/toolchain.zig");
     _ = &@import("util/log.zig");
     _ = &@import("util/model.zig");
+    _ = &@import("util/path.zig");
     _ = &@import("api/catalog.zig");
     _ = &@import("tools/context.zig");
     _ = &@import("repl/input.zig");

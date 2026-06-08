@@ -1,12 +1,16 @@
 const std = @import("std");
 const log = @import("../util/log.zig");
 const shell_lex = @import("shell_lex.zig");
+const path_mod = @import("../util/path.zig");
 
-/// 路径安全：包含 `..` 视为目录遍历攻击，拒绝。
+/// 路径安全：包含作为**完整路径段**的 `..` 视为目录遍历攻击，拒绝。
+///
+/// 委托给 `path.containsTraversal`(只匹配段边界的 `..`),修掉旧 `indexOf("..")` 误杀
+/// 合法文件名(`my..file.txt`、`a..b`)的 bug,全仓 traversal 语义统一。
 ///
 /// 注意：这是最小检查。未来沙箱方案会替换为 realpath + 白名单根 + landlock/openat2 RESOLVE_BENEATH。
 pub fn validateNoTraversal(path: []const u8) error{PathTraversal}!void {
-    if (std.mem.indexOf(u8, path, "..") != null) {
+    if (path_mod.containsTraversal(path)) {
         log.warn("security", "path traversal blocked: {s}", .{path});
         return error.PathTraversal;
     }

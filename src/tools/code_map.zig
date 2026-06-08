@@ -8,7 +8,7 @@
 //!     fn extractSymbols    (60-95)  pub fn extractSymbols(...) !Symbols
 const std = @import("std");
 const common = @import("common.zig");
-const security = @import("security.zig");
+const path_mod = @import("../util/path.zig");
 const toolchain = @import("../util/toolchain.zig");
 const ts = @import("../treesitter/ts.zig");
 const symbols = @import("../treesitter/symbols.zig");
@@ -48,9 +48,12 @@ pub fn renderOutlineForSource(
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
-    const path = common.extractJsonArg(args, "path") orelse return error.MissingPath;
-    if (path.len == 0) return error.EmptyPath;
-    try security.validateNoTraversal(path);
+    const path_raw = common.extractJsonArg(args, "path") orelse return error.MissingPath;
+    if (path_raw.len == 0) return error.EmptyPath;
+    // 归一化(展开 ~、折叠、查 traversal)。path 可能含 glob 通配(src/**/*.zig),
+    // ** 不被词法折叠影响;~ 必须展开(openat/rg 都不认)。
+    const path = try path_mod.normalizeChecked(allocator, path_raw, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
+    defer allocator.free(path);
 
     // lang 覆盖(可选);否则按扩展名推断。显式给了但不认识 → 报错(不静默忽略 typo)。
     const lang_override: ?ts.Lang = if (common.extractJsonArg(args, "lang")) |l|

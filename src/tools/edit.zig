@@ -1,6 +1,6 @@
 const std = @import("std");
 const common = @import("common.zig");
-const security = @import("security.zig");
+const path_mod = @import("../util/path.zig");
 const util_json = @import("../util/json.zig");
 const read_state = @import("../core/read_state.zig");
 const ToolContext = @import("context.zig").ToolContext;
@@ -8,13 +8,15 @@ const tt = @import("test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
-    const file_path = common.extractJsonArg(args, "file_path") orelse return error.MissingFilePath;
+    const file_path_raw = common.extractJsonArg(args, "file_path") orelse return error.MissingFilePath;
     const old_raw = common.extractJsonArg(args, "old_string") orelse return error.MissingOldString;
     const new_raw = common.extractJsonArg(args, "new_string") orelse return error.MissingNewString;
 
-    if (file_path.len == 0) return error.EmptyFilePath;
+    if (file_path_raw.len == 0) return error.EmptyFilePath;
     if (old_raw.len == 0) return error.EmptyOldString;
-    try security.validateNoTraversal(file_path);
+    // 归一化(展开 ~、折叠、查 traversal)。openat 不认 ~,必须自己展开。
+    const file_path = try path_mod.normalizeChecked(allocator, file_path_raw, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
+    defer allocator.free(file_path);
 
     // must-read-first：Edit 必须先 Read 过；挂了 ReadState 才校验。
     // Edit 和 Write 不同：Edit 必然需要文件存在且内容可匹配，所以文件必须存在 → 必须被读过。

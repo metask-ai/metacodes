@@ -1,6 +1,6 @@
 const std = @import("std");
 const common = @import("common.zig");
-const security = @import("security.zig");
+const path_mod = @import("../util/path.zig");
 const util_json = @import("../util/json.zig");
 const read_state = @import("../core/read_state.zig");
 const ToolContext = @import("context.zig").ToolContext;
@@ -15,12 +15,15 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const content_escaped = common.extractJsonArg(args, "content") orelse return error.MissingContent;
     // unescape:content 里的 `\n`/`\t`/`\"`/`\uXXXX` 要还原成真实字节再落盘
     // (否则模型写的多行文件会变成一行字面 `\n`)。path 一般无转义但 unescape 也安全。
-    const path = try util_json.unescapeString(path_escaped, allocator);
-    defer allocator.free(path);
+    // path 必须**先 unescape 再归一化**:模型可能写 `"~/foo"`,要先还原成 `~/foo` 再展开 ~。
+    const path_unesc = try util_json.unescapeString(path_escaped, allocator);
+    defer allocator.free(path_unesc);
     const content = try util_json.unescapeString(content_escaped, allocator);
     defer allocator.free(content);
-    if (path.len == 0) return error.EmptyPath;
-    try security.validateNoTraversal(path);
+    if (path_unesc.len == 0) return error.EmptyPath;
+    // 归一化(展开 ~、折叠、查 traversal)。openat 不认 ~。
+    const path = try path_mod.normalizeChecked(allocator, path_unesc, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
+    defer allocator.free(path);
 
     // must-read-first 校验：若挂了 ReadState（正式 agent 路径），文件存在但没读过 → 拒绝
     // 两个例外：1) 文件不存在（即将创建）；2) ReadState 未挂（单测/dev 路径）
@@ -238,4 +241,31 @@ test "WriteTool stale file rejected" {
     var abuf: [320]u8 = undefined;
     const args = try std.fmt.bufPrint(&abuf, "{{\"path\":\"{s}\",\"content\":\"v2\"}}", .{path});
     try std.testing.expectError(error.StaleFile, execute(&ctx, args));
+}
+
+test "WriteTool null byte 路径拒绝(防 C 字符串截断)" {
+    // write 路径经 unescapeString → JSON  还原成真 \0 → 归一化层 EmbeddedNullByte 拦截。
+    // 防止 "/etc/passwd\0.txt" 被 openat 当成 "/etc/passwd" 静默写错文件。
+    const ctx = testCtx();
+    try std.testing.expectError(error.EmbeddedNullByte, execute(&ctx, "{\"file_path\":\"/tmp/x\\u0000evil\",\"content\":\"y\"}"));
+}
+
+test "WriteTool ~ 展开端到端" {
+    // ~/file 应展开到 home 并写入。home 指向 test_tmp 的 per-pid 目录(已存在)。
+    const a = std.testing.allocator;
+    var seed: [256]u8 = undefined;
+    _ = tt.path(&seed, "seed"); // 触发 test_tmp 建 /tmp/cc-zig-test-<pid> 目录
+    var hbuf: [128]u8 = undefined;
+    const home = std.fmt.bufPrint(&hbuf, "/tmp/cc-zig-test-{d}", .{@as(i64, std.c.getpid())}) catch unreachable;
+    var ctx = testCtx();
+    ctx.home_dir = home;
+    const r = try execute(&ctx, "{\"file_path\":\"~/tilde-write-test.txt\",\"content\":\"hello-tilde\"}");
+    defer a.free(r);
+    // 读回验证落盘到展开后的真实路径
+    var pbuf: [256]u8 = undefined;
+    const real = std.fmt.bufPrintZ(&pbuf, "{s}/tilde-write-test.txt", .{home}) catch unreachable;
+    defer _ = std.c.unlink(real.ptr);
+    const fd = std.c.open(real.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    try std.testing.expect(fd >= 0); // 文件存在 = ~ 已展开
+    _ = std.c.close(fd);
 }

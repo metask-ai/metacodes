@@ -1,15 +1,23 @@
 const std = @import("std");
 const common = @import("common.zig");
-const security = @import("security.zig");
 const toolchain = @import("../util/toolchain.zig");
 const ToolContext = @import("context.zig").ToolContext;
+const path_mod = @import("../util/path.zig");
+const read_state = @import("../core/read_state.zig");
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
     const pattern = common.extractJsonArg(args, "pattern") orelse return error.MissingPattern;
-    const path = common.extractJsonArg(args, "path") orelse ".";
+    const path_raw = common.extractJsonArg(args, "path") orelse ".";
     if (pattern.len == 0) return error.EmptyPattern;
-    try security.validateNoTraversal(path);
+    // 归一化(展开 ~、折叠、查 traversal)。替代旧 validateNoTraversal。
+    const path = try path_mod.normalizeChecked(allocator, path_raw, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
+    defer allocator.free(path);
+    // 存在性检查:--no-messages 会把"路径不存在"静默成空结果 → 先拦给明确错误。
+    _ = read_state.statPath(path) catch {
+        common.setErrorDetail(ctx.error_detail, allocator, "path not found: '{s}' (用绝对路径或 ~/...?)", .{path});
+        return error.PathNotFound;
+    };
 
     const rg_path = try toolchain.ripgrepPath();
 

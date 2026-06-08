@@ -8,6 +8,19 @@ fn nowMs() util_time.Millis {
     return util_time.nowMs();
 }
 
+/// 写富错误 detail 到 ctx.error_detail 通道(传给模型可见)。slot 为 null 则静默。
+/// 与 edit.zig 的 setDetail 同模式,提到 common 供 grep/glob/find_symbol 等共享。
+/// msg 用 allocator 分配(errorToJson 会拷贝,arena 释放前读取安全)。
+pub fn setErrorDetail(
+    slot: ?*?[]const u8,
+    allocator: std.mem.Allocator,
+    comptime fmt: []const u8,
+    args: anytype,
+) void {
+    const s = slot orelse return;
+    s.* = std.fmt.allocPrint(allocator, fmt, args) catch null;
+}
+
 /// Progress 心跳:子进程长命令"仍在运行"提示。重构前是进程全局 g_progress_cb(多 Session
 /// 串台),已移到 ToolContext.spawn_tick_fn(per-session),作为参数传入 spawnCaptureWithStderrTimed。
 

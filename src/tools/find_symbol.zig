@@ -5,7 +5,8 @@
 //! 输出 JSON 数组,便于模型/上层解析。
 const std = @import("std");
 const common = @import("common.zig");
-const security = @import("security.zig");
+const path_mod = @import("../util/path.zig");
+const read_state = @import("../core/read_state.zig");
 const toolchain = @import("../util/toolchain.zig");
 const ts = @import("../treesitter/ts.zig");
 const symbols = @import("../treesitter/symbols.zig");
@@ -21,8 +22,15 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
     const name = common.extractJsonArg(args, "name") orelse return error.MissingName;
     if (name.len == 0) return error.EmptyName;
-    const path = common.extractJsonArg(args, "path") orelse ".";
-    try security.validateNoTraversal(path);
+    const path_raw = common.extractJsonArg(args, "path") orelse ".";
+    // 归一化(展开 ~、折叠、查 traversal)。rg 经 execve 不认 ~。
+    const path = try path_mod.normalizeChecked(allocator, path_raw, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
+    defer allocator.free(path);
+    // 存在性检查:rg 静默路径错误 → 先拦给明确错误。
+    _ = read_state.statPath(path) catch {
+        common.setErrorDetail(ctx.error_detail, allocator, "path not found: '{s}' (用绝对路径或 ~/...?)", .{path});
+        return error.PathNotFound;
+    };
     const kind_filter = common.extractJsonArg(args, "kind"); // 可选
 
     const defs = try findDefinitions(allocator, name, path, kind_filter, ctx);

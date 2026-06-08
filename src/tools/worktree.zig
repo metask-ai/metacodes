@@ -19,7 +19,7 @@
 
 const std = @import("std");
 const common = @import("common.zig");
-const security = @import("security.zig");
+const path_mod = @import("../util/path.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
 pub const WorktreeEntry = struct {
@@ -34,10 +34,12 @@ pub fn enterExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const path_opt = common.extractJsonArg(args, "path");
     const name_opt = common.extractJsonArg(args, "name");
 
-    if (path_opt) |path| {
-        // 切到已有 worktree
-        if (path.len == 0) return error.EmptyPath;
-        try security.validateNoTraversal(path);
+    if (path_opt) |path_raw| {
+        // 切到已有 worktree。只归一化 path(name/base 是 worktree 名/git ref,不是文件系统路径)。
+        if (path_raw.len == 0) return error.EmptyPath;
+        // 归一化(展开 ~、折叠、查 traversal)。chdir/open 不认 ~。
+        const path = try path_mod.normalizeChecked(a, path_raw, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
+        defer a.free(path);
         if (!worktreeExists(a, path)) return error.WorktreePathNotFound;
         const old_cwd = try getCwd(a);
         try chdir(path);

@@ -1,11 +1,12 @@
 const std = @import("std");
 const common = @import("common.zig");
-const security = @import("security.zig");
+const path_mod = @import("../util/path.zig");
 const read_state = @import("../core/read_state.zig");
 const ts = @import("../treesitter/ts.zig");
 const registry = @import("../treesitter/registry.zig");
 const code_map = @import("code_map.zig");
 const ToolContext = @import("context.zig").ToolContext;
+const tt = @import("test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 
 /// 默认读取行数上限（对齐 TS：限制 200KB/2000 行用户无感截断）。
 pub const DEFAULT_LIMIT_LINES: usize = 2000;
@@ -20,11 +21,13 @@ pub const MAX_LINE_BYTES: usize = 2000;
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
     // 兼容：优先 file_path（TS 原版），回退 path（历史）
-    const path = common.extractJsonArg(args, "file_path") orelse
+    const path_raw = common.extractJsonArg(args, "file_path") orelse
         common.extractJsonArg(args, "path") orelse
         return error.MissingPath;
-    if (path.len == 0) return error.EmptyPath;
-    try security.validateNoTraversal(path);
+    if (path_raw.len == 0) return error.EmptyPath;
+    // 归一化(展开 ~、折叠、查 traversal)。execve 不经 shell,~ 必须自己展开;openat 同样不认 ~。
+    const path = try path_mod.normalizeChecked(allocator, path_raw, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
+    defer allocator.free(path);
     try rejectDevicePath(path);
 
     // 图像文件：单独路径——不当文本读（会乱码 + 撑爆 token）。
@@ -563,4 +566,47 @@ test "Read 弱提示:无符号源码不提 + 同 session 同文件只提一次" 
         defer std.testing.allocator.free(r2);
         try std.testing.expect(std.mem.indexOf(u8, r2, "<system-reminder>") == null); // 第二次不再提
     }
+}
+
+test "ReadTool ~ 展开端到端(主 bug 回归)" {
+    // 原始 bug:~/foo 不展开 → openat 找字面 ~ 目录 → FileNotFound。
+    // 写 fixture 到 tmpdir,把 home_dir 注入为 tmpdir,Read `~/fixture` 应展开并读到内容。
+    const a = std.testing.allocator;
+    var pbuf: [256]u8 = undefined;
+    const fpath = tt.path(&pbuf, "tilde-expand-read.txt");
+    const fd = std.c.open(fpath.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    try std.testing.expect(fd >= 0);
+    const text = "tilde-needle-content";
+    _ = std.c.write(fd, text.ptr, text.len);
+    _ = std.c.close(fd);
+    defer _ = std.c.unlink(fpath.ptr);
+
+    // home_dir = /tmp/cc-zig-test-<pid>;故 ~/tilde-expand-read.txt 展开到 fixture。
+    var hbuf: [128]u8 = undefined;
+    const home = std.fmt.bufPrint(&hbuf, "/tmp/cc-zig-test-{d}", .{@as(i64, std.c.getpid())}) catch unreachable;
+    var ctx = ToolContext.simple(a);
+    ctx.home_dir = home;
+
+    const r = try execute(&ctx, "{\"file_path\":\"~/tilde-expand-read.txt\"}");
+    defer a.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "tilde-needle-content") != null);
+}
+
+test "ReadTool 含 .. 的合法文件名不被误杀" {
+    // 旧 indexOf("..") 会误杀;新 containsTraversal 只匹配路径段 .. → 这个文件名应放行。
+    const a = std.testing.allocator;
+    var pbuf: [256]u8 = undefined;
+    const fpath = tt.path(&pbuf, "my..legit..file.txt");
+    const fd = std.c.open(fpath.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    try std.testing.expect(fd >= 0);
+    _ = std.c.write(fd, "ok", 2);
+    _ = std.c.close(fd);
+    defer _ = std.c.unlink(fpath.ptr);
+
+    var abuf: [320]u8 = undefined;
+    const args = std.fmt.bufPrint(&abuf, "{{\"file_path\":\"{s}\"}}", .{fpath}) catch unreachable;
+    const ctx = testCtx();
+    const r = try execute(&ctx, args); // 不应 PathTraversal
+    defer a.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "ok") != null);
 }

@@ -3,6 +3,8 @@ const common = @import("common.zig");
 const tt = @import("test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 const toolchain = @import("../util/toolchain.zig");
 const ToolContext = @import("context.zig").ToolContext;
+const path_mod = @import("../util/path.zig");
+const read_state = @import("../core/read_state.zig");
 
 /// 默认 head_limit(对齐 Claude Code GrepTool):content 模式不传 head_limit 时只返前 250 行,
 /// 防止宽匹配把整个文件灌进上下文。显式传 head_limit=0 = 无限。
@@ -11,10 +13,20 @@ pub const DEFAULT_HEAD_LIMIT: usize = 250;
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
     const pattern = common.extractJsonArg(args, "pattern") orelse return error.MissingPattern;
-    const path = common.extractJsonArg(args, "path") orelse ".";
+    const path_raw = common.extractJsonArg(args, "path") orelse ".";
     if (pattern.len == 0) return error.EmptyPattern;
 
+    // 归一化路径(展开 ~、折叠 //、查 traversal)。execve 不经 shell,~ 必须自己展开。
+    const path = try path_mod.normalizeChecked(allocator, path_raw, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
+    defer allocator.free(path);
+    // 存在性检查:rg 的 --no-messages 会把"路径不存在"静默成空结果。这里先拦,给模型明确错误。
+    _ = read_state.statPath(path) catch {
+        common.setErrorDetail(ctx.error_detail, allocator, "path not found: '{s}' (用绝对路径或 ~/...?)", .{path});
+        return error.PathNotFound;
+    };
+
     const rg_path = try toolchain.ripgrepPath();
+
 
     // output_mode: content (默认，带行号) / files_with_matches / count
     const output_mode = common.extractJsonArg(args, "output_mode") orelse "files_with_matches";
@@ -519,4 +531,17 @@ test "Grep 搭车:裸标识符前置 FindSymbol 定义块;正则不触发" {
         defer std.testing.allocator.free(r);
         try std.testing.expect(std.mem.indexOf(u8, r, "via FindSymbol") == null);
     }
+}
+
+test "GrepTool 不存在路径 → PathNotFound(非静默空)" {
+    // 静默 bug 回归:--no-messages 曾把"路径不存在"吞成空结果。现应明确报错。
+    const ctx = testCtx();
+    try std.testing.expectError(error.PathNotFound, execute(&ctx, "{\"pattern\":\"x\",\"path\":\"/no/such/dir/zzz-nonexistent\"}"));
+}
+
+test "GrepTool path=. 默认值不被存在性检查误伤" {
+    const ctx = testCtx();
+    // path 缺省 = "." 必存在,statPath 不该拦;pattern 无匹配返空但不报 PathNotFound。
+    const r = try execute(&ctx, "{\"pattern\":\"zzzzzz-nonexistent-zzzzzz\"}");
+    defer std.testing.allocator.free(r);
 }
