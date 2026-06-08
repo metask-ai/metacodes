@@ -54,6 +54,7 @@ const Theme = theme_mod.Theme;
 const CoreEvent = ui_event.CoreEvent;
 const UiEvent = ui_event.UiEvent;
 const UiBackend = ui_backend.UiBackend;
+const SessionId = ui_backend.SessionId;
 
 pub const TuiBackend = struct {
     region: *RenderRegion,
@@ -110,12 +111,14 @@ pub const TuiBackend = struct {
         };
     }
 
-    fn emitThunk(ctx: *anyopaque, ev: CoreEvent) void {
+    // TuiBackend 是 N=1(单全屏终端),忽略 session——所有事件都归这一个会话视图。
+    // GUI 多视图 backend 才需按 session 分流(M6+)。
+    fn emitThunk(ctx: *anyopaque, _: SessionId, ev: CoreEvent) void {
         const self: *TuiBackend = @ptrCast(@alignCast(ctx));
         self.emitImpl(ev);
     }
 
-    fn pollThunk(ctx: *anyopaque) ?UiEvent {
+    fn pollThunk(ctx: *anyopaque, _: SessionId) ?UiEvent {
         const self: *TuiBackend = @ptrCast(@alignCast(ctx));
         return self.pollImpl();
     }

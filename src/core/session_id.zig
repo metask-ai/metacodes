@@ -22,6 +22,12 @@ pub const SessionId = struct {
     pub fn asSlice(self: *const SessionId) []const u8 {
         return self.bytes[0..];
     }
+
+    /// 单 Session(N=1 / TUI)默认占位 id。多 Session 路由前,所有事件都归属它。
+    /// **用 ASCII '0'(0x30)不是 \0(0x00)**:bytes 当 hex 字符串用(asSlice 喂持久化路径),
+    /// 全 \0 会让路径含 NUL 字节炸掉;"000…0" 是合法 24-char hex。gen() 永远产不出它
+    /// (要 ms 时间戳=0=1970-01-01,现实不可能)→ 安全 sentinel。**勿"优化"成 std.mem.zeroes。**
+    pub const single: SessionId = .{ .bytes = .{'0'} ** 24 };
 };
 
 /// 生成 session id:ms 时间戳(可排序)+ monotonic ns 低 32 位(去重)。不用真随机

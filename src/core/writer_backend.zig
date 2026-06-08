@@ -23,6 +23,7 @@ const ui_event = @import("protocol/ui_event.zig");
 const CoreEvent = ui_event.CoreEvent;
 const UiEvent = ui_event.UiEvent;
 const UiBackend = ui_backend.UiBackend;
+const SessionId = ui_backend.SessionId;
 
 pub const WriterBackend = struct {
     /// sink 适配器:把字节交给底层(std.debug.print / job buf / 丢弃)。
@@ -48,12 +49,12 @@ pub const WriterBackend = struct {
         };
     }
 
-    fn emitThunk(ctx: *anyopaque, ev: CoreEvent) void {
+    fn emitThunk(ctx: *anyopaque, _: SessionId, ev: CoreEvent) void {
         const self: *WriterBackend = @ptrCast(@alignCast(ctx));
         self.emitImpl(ev);
     }
 
-    fn pollThunk(_: *anyopaque) ?UiEvent {
+    fn pollThunk(_: *anyopaque, _: SessionId) ?UiEvent {
         return null; // print-only sink 无输入端
     }
 

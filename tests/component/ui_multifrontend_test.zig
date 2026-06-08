@@ -19,6 +19,7 @@ const headless_backend = cc.headless_backend;
 const CoreEvent = ui_event.CoreEvent;
 const UiEvent = ui_event.UiEvent;
 const UiBackend = ui_backend.UiBackend;
+const SessionId = ui_backend.SessionId;
 
 // ── 一轮纯文本响应(end_turn) ──────────────────────────────────────────────
 const TEXT_SSE =
@@ -35,6 +36,7 @@ const Recorder = struct {
     tags: std.ArrayList([]const u8) = .empty, // 事件 tag 名序列(静态字面量,不拷)
     texts: std.ArrayList([]u8) = .empty, // text_chunk 的内容(深拷贝)
     allocator: std.mem.Allocator,
+    last_session: SessionId = SessionId.single,
 
     fn init(a: std.mem.Allocator) Recorder {
         return .{ .allocator = a };
@@ -47,8 +49,9 @@ const Recorder = struct {
     fn backend(self: *Recorder) UiBackend {
         return .{ .ctx = @ptrCast(self), .emit = emitThunk, .poll = pollThunk };
     }
-    fn emitThunk(ctx: *anyopaque, ev: CoreEvent) void {
+    fn emitThunk(ctx: *anyopaque, session: SessionId, ev: CoreEvent) void {
         const self: *Recorder = @ptrCast(@alignCast(ctx));
+        self.last_session = session; // 记录最近事件归属的 session(验路由)
         self.tags.append(self.allocator, @tagName(ev)) catch return;
         // text_chunk 的 borrow slice 必须**同步深拷贝**(emit 返回后即失效)。
         if (ev == .text_chunk) {
@@ -58,7 +61,7 @@ const Recorder = struct {
             };
         }
     }
-    fn pollThunk(_: *anyopaque) ?UiEvent {
+    fn pollThunk(_: *anyopaque, _: SessionId) ?UiEvent {
         return null;
     }
     fn hasTag(self: *const Recorder, tag: []const u8) bool {
@@ -127,6 +130,9 @@ test "阶段E: mock backend 跑真 agent_loop,断言 CoreEvent 序列(纯内存,
     const joined = try rec.joinedText(a);
     defer a.free(joined);
     try std.testing.expectEqualStrings("hello world", joined);
+
+    // M4:事件归属 session 正确路由。未传 .session → 默认 .single,emit 带的就是它。
+    try std.testing.expect(std.mem.eql(u8, &rec.last_session.bytes, &SessionId.single.bytes));
 }
 
 // ── HeadlessBackend:CoreEvent → JSON 行 ─────────────────────────────────────
@@ -155,12 +161,12 @@ test "阶段E: HeadlessBackend 每个 CoreEvent → 可解析的 JSON 行" {
     var hb = headless_backend.HeadlessBackend.init(a, @ptrCast(&js), JsonSink.sink);
     const be = hb.backend();
 
-    be.emitEvent(.stream_begin);
-    be.emitEvent(.{ .text_chunk = "答案是" });
-    be.emitEvent(.{ .tool_start = .{ .id = "tu1", .name = "Bash", .input = "{}" } });
-    be.emitEvent(.{ .tool_result = .{ .id = "tu1", .name = "Bash", .input = "{}", .content = "ok", .is_error = false, .elapsed_ms = 12 } });
-    be.emitEvent(.{ .usage = .{ .input_tokens = 5, .output_tokens = 3 } });
-    be.emitEvent(.stream_done);
+    be.emitEvent(SessionId.single, .stream_begin);
+    be.emitEvent(SessionId.single, .{ .text_chunk = "答案是" });
+    be.emitEvent(SessionId.single, .{ .tool_start = .{ .id = "tu1", .name = "Bash", .input = "{}" } });
+    be.emitEvent(SessionId.single, .{ .tool_result = .{ .id = "tu1", .name = "Bash", .input = "{}", .content = "ok", .is_error = false, .elapsed_ms = 12 } });
+    be.emitEvent(SessionId.single, .{ .usage = .{ .input_tokens = 5, .output_tokens = 3 } });
+    be.emitEvent(SessionId.single, .stream_done);
 
     try std.testing.expectEqual(@as(usize, 6), js.lines.items.len);
 
