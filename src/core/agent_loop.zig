@@ -152,6 +152,9 @@ pub const Options = struct {
     /// false(headless/单测)→ 不 emit 工具卡事件,保持纯净输出。
     /// (原 tool_render_theme: ?*const Theme,只当存在标志用;为解 core→UI 类型依赖降为 bool。)
     emit_tool_cards: bool = false,
+    /// 子进程长命令"仍在运行"心跳回调(per-session,传给 ToolContext.spawn_tick_fn → spawn 层)。
+    /// 重构前是 tools/common.zig 进程全局 g_progress_cb。REPL tty 下 loop.zig 设;headless=null。
+    spawn_tick_fn: ?*const fn (elapsed_ms: u64, argv0: []const u8) void = null,
     /// 是否给 assistant 流式文本加 ANSI 着色(\x1b[32m…)。前台交互 REPL = true;
     /// 后台 subagent(输出经 SinkWriter 进可查询缓冲)/headless = false,否则 final_text
     /// 会混入 \x1b[32m 等控制码。
@@ -646,6 +649,8 @@ pub fn run(
             base_ctx.ui_request_state = opts.ui_request_state;
             base_ctx.ui_request_fn = opts.ui_request_fn;
         }
+        // 子进程心跳(Bash 长命令"仍在运行")per-session 通路:从 opts 透传到 ctx → spawn 层。
+        base_ctx.spawn_tick_fn = opts.spawn_tick_fn;
 
         // 6c. 分批并发执行。过程态(TTY 顶层):无条件 emit tool_start(每个 run slot);
         // **渲染决策(showStartCard/hasProgressCard/喂 spinner)全在 backend**——agent_loop

@@ -47,7 +47,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         url_z.ptr,
         null,
     };
-    const out = try common.spawnCaptureWithStderrTimed(argv[0..argv.len], allocator, ctx.abort, 20_000);
+    const out = try common.spawnCaptureWithStderrTimed(argv[0..argv.len], allocator, ctx.abort, 20_000, ctx.spawn_tick_fn);
     defer allocator.free(out.stdout);
     defer allocator.free(out.stderr);
 

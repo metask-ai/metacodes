@@ -353,7 +353,7 @@ fn runShell(alloc: std.mem.Allocator, cmd: []const u8) ![]u8 {
     defer alloc.free(cmd_z);
     const argv0: [*:0]const u8 = "/bin/sh";
     var argv: [4]?[*:0]const u8 = .{ argv0, "-c", cmd_z.ptr, null };
-    const out = try common.spawnCaptureWithStderrTimed(argv[0..argv.len], alloc, null, 10_000);
+    const out = try common.spawnCaptureWithStderrTimed(argv[0..argv.len], alloc, null, 10_000, null);
     alloc.free(out.stderr);
     return out.stdout;
 }
