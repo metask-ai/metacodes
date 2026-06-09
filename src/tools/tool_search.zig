@@ -67,9 +67,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer out.deinit();
     try out.writer.writeAll("<functions>\n");
     for (matched.items) |name| {
-        if (ctx.activate_tool_fn) |f| {
-            if (ctx.activate_tool_state) |st| f(st, name) catch {};
-        }
+        if (ctx.tool_activator) |act| act.activate(name) catch {};
         // 静态工具用 toolSchemaJson;dyn(MCP)工具从 DynRegistry 条目建 schema。
         const schema: []u8 = tools.toolSchemaJson(allocator, name) catch blk: {
             const dr = ctx.dyn_registry orelse return error.UnknownTool;
@@ -137,8 +135,7 @@ test "ToolSearch: select 静态工具返回 schema + 激活" {
     var dummy: u8 = 0;
     const ctx = ToolContext{
         .allocator = a,
-        .activate_tool_state = @ptrCast(&dummy),
-        .activate_tool_fn = &testActivate,
+        .tool_activator = .{ .ctx = @ptrCast(&dummy), .activateFn = &testActivate },
     };
     // select 一个静态工具(Read)即可返回其 schema(select 不要求 deferred)。
     const out = try execute(&ctx, "{\"query\":\"select:Read\"}");
@@ -160,8 +157,7 @@ test "ToolSearch: 关键字 + select 命中 dyn(MCP)deferred 工具" {
     const ctx = ToolContext{
         .allocator = a,
         .dyn_registry = &dyn,
-        .activate_tool_state = @ptrCast(&dummy),
-        .activate_tool_fn = &testActivate,
+        .tool_activator = .{ .ctx = @ptrCast(&dummy), .activateFn = &testActivate },
     };
     // 关键字命中。
     const out1 = try execute(&ctx, "{\"query\":\"github issue\"}");

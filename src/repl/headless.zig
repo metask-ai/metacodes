@@ -53,8 +53,7 @@ pub fn run(
             .system_prompt = app.system_prompt,
             .inject_user_context = app.user_context,
             .dyn_registry = &app.dyn_registry,
-            .activate_skill_state = @ptrCast(app),
-            .activate_skill_fn = &app_mod.App.activateSkillTrampoline,
+            .skill_activator = .{ .ctx = @ptrCast(app), .activateFn = &app_mod.App.activateSkillTrampoline },
             .project_dir = app.project_dir_or_empty(),
             .sandbox = app.sandboxPtr(),
             .cwd_abs = app.cwdAbs(),
@@ -62,9 +61,7 @@ pub fn run(
             .agents = &app.agents,
             .parent_model = app.config.model,
             .skills_set = &app.skills,
-            .worktree_state = @ptrCast(app),
-            .worktree_push_fn = &app_mod.App.worktreePushTrampoline,
-            .worktree_pop_fn = &app_mod.App.worktreePopTrampoline,
+            .worktree_hook = .{ .ctx = @ptrCast(app), .pushFn = &app_mod.App.worktreePushTrampoline, .popFn = &app_mod.App.worktreePopTrampoline },
             .mcp_sessions = &app.mcp_sessions.items,
             .cron_registry = &app.cron_registry,
         },
@@ -139,6 +136,7 @@ pub fn buildResultLine(
         .api_error => "api_error",
         .tool_error => "tool_error",
         .tool_loop => "tool_loop",
+        .suspended => "suspended",
     };
     const cost = usage.costUsd(model);
 

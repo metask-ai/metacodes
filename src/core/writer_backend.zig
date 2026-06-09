@@ -102,7 +102,8 @@ pub const WriterBackend = struct {
                 self.emit(if (self.colorize) "\x1b[0m\n" else "\n");
             },
             // print-only sink 不收这些(旧 @hasDecl 守卫即编译期消失):
-            .set_current_tool, .clear_current_tool, .tool_progress, .tool_result, .usage, .phase_change => {},
+            // ui_request_pending:异步前端专属;print-only(headless/后台 job)不投递,no-op。
+            .set_current_tool, .clear_current_tool, .tool_progress, .tool_result, .usage, .phase_change, .ui_request_pending => {},
         }
     }
 };

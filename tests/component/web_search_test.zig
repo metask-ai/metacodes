@@ -135,8 +135,7 @@ test "L2: WebSearch 两阶段驱动 progress 回调(query_update + results_recei
     var ctx = cc.tools.ToolContext{
         .allocator = a,
         .api_client = &client,
-        .progress_state = @ptrCast(&dummy),
-        .progress_fn = &ProgressCapture.cb,
+        .progress_reporter = .{ .ctx = @ptrCast(&dummy), .reportFn = &ProgressCapture.cb },
     };
     const out = cc.tools.dispatch(&ctx, "WebSearch", "{\"query\":\"zig language\"}") catch return error.SkipZigTest;
     defer a.free(out);

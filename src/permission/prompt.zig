@@ -34,10 +34,13 @@ pub fn ask(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bo
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const choice_opt: ?PermissionChoice = blk: {
-            if (ctx.ui_request_fn) |runner| {
+            if (ctx.ui_requester) |runner| {
                 const req = ui_request.UiRequest{ .permission = .{ .tool = tool_name, .args = args } };
                 var resp: ui_request.UiResponse = undefined;
-                runner(ctx.ui_request_state.?, ctx.session, arena.allocator(), &req, &resp) catch break :blk null;
+                // permission 门是 executeSlots 前的同步门,不支持挂起(out of scope)——
+                // 仅 .answered 读 resp;.pending/.unavailable 落文字 prompt 兜底。
+                const outcome = runner.request(ctx.session, arena.allocator(), &req, &resp) catch break :blk null;
+                if (outcome != .answered) break :blk null;
                 break :blk switch (resp) {
                     .permission => |c| c,
                     else => null,

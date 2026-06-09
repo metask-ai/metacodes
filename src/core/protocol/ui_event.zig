@@ -101,6 +101,15 @@ pub const CoreEvent = union(enum) {
     /// 一轮流式输出结束(取代旧 `print("\x1b[0m\n")`/`print("\n")`)。
     /// backend 决定闭颜色括号 + 尾换行。
     stream_done,
+
+    /// 可挂起 UI 请求预留(Stage 1):异步前端(Slack/邮件/工作流)收到此事件后,
+    /// 据 tool_use_id + request_json 把请求 out-of-band 投递给人类,响应到达后经
+    /// resumeWithResponse 注入。sync 前端(TUI/GUI)no-op(它们走同步阻塞 requestUi)。
+    /// 纯数据(无指针/闭包)→ 可序列化跨进程(WsBackend)。
+    ui_request_pending: struct {
+        tool_use_id: []const u8,
+        request_json: []const u8,
+    },
 };
 
 /// UI → core:用户产生的事件(非阻塞 poll 拉取)。

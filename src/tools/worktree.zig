@@ -161,15 +161,13 @@ pub fn exitExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 // ============================================================================
 
 fn pushWorktree(ctx: *const ToolContext, wt_path: []const u8, cwd: []const u8) !void {
-    const setter = ctx.worktree_push_fn orelse return error.WorktreeStateUnavailable;
-    const state = ctx.worktree_state orelse return error.WorktreeStateUnavailable;
-    try setter(state, ctx.allocator, wt_path, cwd);
+    const hook = ctx.worktree_hook orelse return error.WorktreeStateUnavailable;
+    try hook.push(ctx.allocator, wt_path, cwd);
 }
 
 fn popWorktree(ctx: *const ToolContext) !?WorktreeEntry {
-    const getter = ctx.worktree_pop_fn orelse return error.WorktreeStateUnavailable;
-    const state = ctx.worktree_state orelse return error.WorktreeStateUnavailable;
-    return try getter(state, ctx.allocator);
+    const hook = ctx.worktree_hook orelse return error.WorktreeStateUnavailable;
+    return try hook.pop(ctx.allocator);
 }
 
 // ============================================================================
@@ -241,14 +239,20 @@ test "ExitWorktree: not in worktree errors" {
     var state: std.ArrayList(WorktreeEntry) = .empty;
     defer state.deinit(testing.allocator);
     var ctx = ToolContext.simple(testing.allocator);
-    ctx.worktree_state = @ptrCast(&state);
-    ctx.worktree_pop_fn = struct {
+    const Hook = struct {
+        fn push(s: *anyopaque, a: std.mem.Allocator, wt: []const u8, cwd: []const u8) anyerror!void {
+            _ = s;
+            _ = a;
+            _ = wt;
+            _ = cwd;
+        }
         fn pop(s: *anyopaque, a: std.mem.Allocator) anyerror!?WorktreeEntry {
             const stack: *std.ArrayList(WorktreeEntry) = @ptrCast(@alignCast(s));
             _ = a;
             if (stack.items.len == 0) return null;
             return stack.pop();
         }
-    }.pop;
+    };
+    ctx.worktree_hook = .{ .ctx = @ptrCast(&state), .pushFn = &Hook.push, .popFn = &Hook.pop };
     try testing.expectError(error.NotInWorktree, exitExecute(&ctx, "{\"action\":\"keep\"}"));
 }

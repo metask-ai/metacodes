@@ -72,12 +72,10 @@ fn execute(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anye
     defer ctx.allocator.free(rendered);
 
     // 激活权限态(若 setter 已 wire)。inline 与 fork 都需要(fork 的 subagent 也复用同回调)。
-    if (ctx.activate_skill_fn) |setter_fn| {
-        if (ctx.activate_skill_state) |state| {
-            setter_fn(state, skill.name, skill.allowed_tools, skill.disallowed_tools) catch |err| {
-                log.warn("skill", "activate state failed: {s}", .{@errorName(err)});
-            };
-        }
+    if (ctx.skill_activator) |act| {
+        act.activate(skill.name, skill.allowed_tools, skill.disallowed_tools) catch |err| {
+            log.warn("skill", "activate state failed: {s}", .{@errorName(err)});
+        };
     }
 
     // context: fork → 用 rendered body 当 prompt spawn subagent。
@@ -173,8 +171,7 @@ fn tryForkSpawn(
             .agent_depth = ctx.agent_depth + 1,
             .dyn_registry = ctx.dyn_registry,
             .model_override = model_override,
-            .activate_skill_state = ctx.activate_skill_state,
-            .activate_skill_fn = ctx.activate_skill_fn,
+            .skill_activator = ctx.skill_activator,
             .project_dir = ctx.project_dir,
         },
     );

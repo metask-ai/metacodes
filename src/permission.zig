@@ -55,9 +55,8 @@ pub const PermissionContext = struct {
     session_rules: ?*@import("permission/session_rules.zig").SessionRules = null,
     /// UI 请求 runner(权限框经它让前端渲染)。重构前是 prompt.zig 的 g_ui_runner 全局
     /// (多 Session 会串台 + 指向已失效 TuiBackend 的 UAF)。现挂 per-session ctx。
-    /// null = 无 runner → ask 退回文字 prompt。
-    ui_request_state: ?*anyopaque = null,
-    ui_request_fn: ?@import("core/protocol/ui_request.zig").UiRequestFn = null,
+    /// null = 无 runner → ask 退回文字 prompt。见 UiRequester。
+    ui_requester: ?@import("core/protocol/ui_request.zig").UiRequester = null,
     /// 本 ctx 归属的会话(权限对话框路由到对应 session 视图)。默认 .single(N=1)。
     /// **M6 待办**:这与 ToolContext.session 是同一概念的两份拷贝(权限路径走 PermissionContext,
     /// 工具路径走 ToolContext)。M6 拆 SessionContext 后,两者都从 SessionContext.id 取,这俩

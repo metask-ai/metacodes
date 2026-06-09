@@ -122,13 +122,14 @@ pub fn executeExit(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const ui_request = @import("../core/protocol/ui_request.zig");
     const req = ui_request.UiRequest{ .plan_approval = .{ .plan_md = plan_md } };
     var resp: ui_request.UiResponse = undefined;
-    if (try ctx.requestUi(ctx.allocator, &req, &resp)) {
+    if (try ctx.requestUi(ctx.allocator, &req, &resp) == .answered) {
         choice = switch (resp) {
             .plan_approval => |c| c,
             else => .reject, // backend 返回非预期 tag
         };
     } else {
-        // 无 UI 回调(headless/子 agent)→ answer_queue 兜底,再无则 reject。
+        // 无 UI 回调(headless/子 agent,outcome=.unavailable)→ answer_queue 兜底,再无则 reject。
+        // (Stage 1:sync 恒 .answered 走上分支;.pending 异步挂起在 Stage 2 才接。)
         choice = approvalFromQueue() orelse .reject;
     }
 
@@ -201,7 +202,7 @@ fn mockUiRequestFn(
     allocator: std.mem.Allocator,
     req: *const @import("../core/protocol/ui_request.zig").UiRequest,
     out: *@import("../core/protocol/ui_request.zig").UiResponse,
-) anyerror!void {
+) anyerror!@import("../core/protocol/ui_request.zig").RequestOutcome {
     _ = state;
     _ = allocator;
     switch (req.*) {
@@ -212,6 +213,7 @@ fn mockUiRequestFn(
         },
         else => out.* = .{ .plan_approval = .reject },
     }
+    return .answered;
 }
 
 fn setupExitCtx(a: std.mem.Allocator, pctx: *@import("../permission.zig").PermissionContext, prev: *?@import("../types.zig").PermissionMode, dummy_state: *anyopaque) ToolContext {
@@ -219,8 +221,7 @@ fn setupExitCtx(a: std.mem.Allocator, pctx: *@import("../permission.zig").Permis
         .allocator = a,
         .permission_ctx = pctx,
         .plan_prev_mode = prev,
-        .ui_request_state = dummy_state,
-        .ui_request_fn = &mockUiRequestFn,
+        .ui_requester = .{ .ctx = dummy_state, .requestFn = &mockUiRequestFn },
     };
 }
 
@@ -334,8 +335,7 @@ test "ExitPlanMode 模型未传 plan → 从 plan 文件读盘兜底(对齐 cc n
         .allocator = a,
         .permission_ctx = &pctx,
         .plan_prev_mode = &prev,
-        .ui_request_state = &dummy,
-        .ui_request_fn = &mockUiRequestFn,
+        .ui_requester = .{ .ctx = &dummy, .requestFn = &mockUiRequestFn },
         .plan_file_path = path, // 关键:ExitPlanMode 据此读盘
     };
 
@@ -379,8 +379,7 @@ test "ExitPlanMode 优先用 ctx.last_proposed_plan(XML 协议主路径)" {
         .allocator = a,
         .permission_ctx = &pctx,
         .plan_prev_mode = &prev,
-        .ui_request_state = &dummy,
-        .ui_request_fn = &mockUiRequestFn,
+        .ui_requester = .{ .ctx = &dummy, .requestFn = &mockUiRequestFn },
         .last_proposed_plan = "# Plan from XML\n1. do it\n",
     };
     g_mock_choice = .approve_default;
