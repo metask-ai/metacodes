@@ -1,0 +1,49 @@
+# metacode 模型上下文窗口表(auto-compact 阈值用)。源自 models.dev,极度精简。
+# 格式:"<model-id-substring>" = <context_window_tokens>
+# 匹配:exact 优先,再 substring(长 key 优先)。命中此表 > /v1/models probe > 200000 默认。
+# 用户可编辑本文件(~/.metacode/models.toml)覆盖/新增。
+[models]
+
+# ── Claude(Anthropic)──
+"claude-opus-4-8" = 1000000
+"claude-opus-4-7" = 1000000
+"claude-opus-4-6" = 1000000
+"claude-opus-4-5" = 200000
+"claude-opus-4-1" = 200000
+"claude-opus-4" = 200000
+"claude-sonnet-4-6" = 1000000
+"claude-sonnet-4-5" = 200000
+"claude-sonnet-4" = 200000
+"claude-haiku-4" = 200000
+"claude-3-5-haiku" = 200000
+"claude-3-5-sonnet" = 200000
+"opus" = 200000
+"sonnet" = 200000
+"haiku" = 200000
+
+# ── OpenAI ──
+"gpt-5" = 400000
+"gpt-4.1" = 1047576
+"gpt-4o" = 128000
+"o3" = 200000
+"o1" = 200000
+
+# ── Google Gemini ──
+"gemini-2.5-pro" = 1000000
+"gemini-2.0-flash" = 1000000
+"gemini" = 1000000
+
+# ── DeepSeek ──
+"deepseek-v4" = 1048576
+"deepseek-reasoner" = 128000
+"deepseek-chat" = 128000
+"deepseek" = 128000
+
+# ── Qwen ──
+"qwen3-max" = 256000
+"qwen-plus" = 1000000
+"qwen-flash" = 1000000
+"qwen" = 128000
+
+# ── MiniMax(metacode 常用代理后端)──
+"minimax" = 1000000

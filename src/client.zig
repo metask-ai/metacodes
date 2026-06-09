@@ -127,6 +127,9 @@ pub const Client = struct {
     base_url: []const u8,
     /// 模型 catalog——启动时 `probeModels` 填充。构造后为空，调 probeModels 再生效。
     catalog: Catalog,
+    /// 模型上下文窗口表(~/.metacode/models.toml)。precedence:命中此表 > catalog probe > 200K。
+    /// App 持有,借用不拥有(null = 未挂,落 catalog)。
+    model_context: ?*const @import("app/model_context.zig").ModelContext = null,
     /// 用户 CLI `--max-tokens N` 覆盖；null = 自动（catalog → fallback table → default）。
     max_tokens_override: ?u32 = null,
 
@@ -169,6 +172,10 @@ pub const Client = struct {
 
     /// 按当前 model 解析 input context window(用于 auto-compact 阈值,非 output max_tokens)。
     pub fn resolveMaxInputTokens(client: *const Client) u32 {
+        // precedence:~/.metacode/models.toml 命中 > catalog(/v1/models probe)> 200K 默认。
+        if (client.model_context) |mc| {
+            if (mc.windowFor(client.model)) |w| return w;
+        }
         return client.catalog.maxInputTokensFor(client.model);
     }
 

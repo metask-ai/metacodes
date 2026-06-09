@@ -180,6 +180,8 @@ pub const App = struct {
     worktree_stack: std.ArrayList(WorktreeEntry),
     /// Session 级 cron 调度。CronCreate/Delete/List 用;REPL 读 prompt 前 collectDue。
     cron_registry: CronRegistry,
+    /// 模型上下文窗口表(~/.metacode/models.toml)。api_client.model_context 借用它做 auto-compact 阈值。
+    model_context: @import("app/model_context.zig").ModelContext,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -213,6 +215,7 @@ pub const App = struct {
             .agents = AgentSet.init(allocator),
             .worktree_stack = .empty,
             .cron_registry = CronRegistry.init(allocator),
+            .model_context = @import("app/model_context.zig").ModelContext.init(allocator),
         };
 
         // 启动时加载 skills:enterprise / ~/.cc-zig / ~/.claude / project chain。
@@ -287,6 +290,11 @@ pub const App = struct {
         };
         app.tool_defs = try tools_mod.toToolDefinitionsFull(allocator, &app.dyn_registry, &prompt_ctx);
         errdefer allocator.free(app.tool_defs);
+
+        // 加载模型上下文窗口表(~/.metacode/models.toml)并挂到 client。
+        // precedence 高于 probe → auto-compact 阈值优先用此表(offline 可靠 + 用户可编辑)。
+        app.model_context.loadOrBundle();
+        app.api_client.model_context = &app.model_context;
 
         // 探测 <base_url>/v1/models 取 model catalog（max_tokens）。失败静默，走本地 fallback。
         // METACODES_NO_PROBE=1 跳过：离线/沙箱/TTY 测试下 probeModels 的网络调用会 hang,
@@ -401,6 +409,7 @@ pub const App = struct {
         }
         app.worktree_stack.deinit(app.allocator);
         app.cron_registry.deinit();
+        app.model_context.deinit();
         if (app.rule_set) |*r| r.deinit();
         if (app.settings) |*s| s.deinit();
         if (app.sandbox_settings) |*s| s.deinit();
