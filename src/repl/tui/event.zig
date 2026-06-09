@@ -53,6 +53,12 @@ pub const LoopAction = enum {
     /// @-mention 选中(Enter/Tab):调用方把 @token 换成选中文件路径。Enter 后不自动提交
     /// (对齐 cc:@ 插入引用后继续编辑);区别仅语义,均插入。
     at_select,
+    // ── Agent switcher(区域2,对齐 cc v2.1.168)──────────────────────────────────
+    /// Enter 查看选中 agent 的 transcript(调用方读 registry.copyTranscript → alt-screen 显示)。
+    /// 选中 agent id 由调用方按 ui.agents.sel 从 snapshotJobs 解析。
+    agents_view,
+    /// x 停止选中 agent(调用方 registry.kill(id))。
+    agents_stop,
 };
 
 pub const KeyEvent = struct { key: input.Key };

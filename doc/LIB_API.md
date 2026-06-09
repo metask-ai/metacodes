@@ -1,7 +1,9 @@
 # metacodes-core — 库对外接口能力
 
 > 可复用的 LLM 编码-agent 引擎(Zig 0.16,无 UI、无 CLI)。从 cc-zig 抽出,供其他
-> Zig 项目经 `build.zig.zon` 依赖。本文档 = 库的对外接口契约。
+> Zig 项目经 `build.zig.zon` 依赖。本文档 = 库的对外接口契约(快速接入)。
+>
+> **架构参考**(模块职责图 + 协议契约 + 设计不变式 + 多前端接入)见 `doc/CORE_REFERENCE.md`。
 
 ## 1. 是什么
 

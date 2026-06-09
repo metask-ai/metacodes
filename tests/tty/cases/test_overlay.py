@@ -181,6 +181,30 @@ def test_ctrl_o_bottom_anchored_idempotent(bin_path):
     assert box0 == box2, f"两次 Ctrl+O 后框漂移(box_top {box0}→{box2}):inline 滚动毁了 scrollback"
 
 
+def test_ctrl_o_idempotent_with_agent_panel(bin_path):
+    # 回归(2026-06-09 真 bug):有 agent 进度树/task panel(输入框上方可变行)时,
+    # transcript_viewer 旧版硬编码 box_h=5 忽略 panel 行 → 退出锚定错位 → 残留 + TUI 乱。
+    # 修:box_h = region.fixedRegionHeight()+1(含 panel)。本测试钉死:有 panel 时连续 Ctrl+O
+    # 收敛到干净贴底态(框完整 + agent 树完整无残留 + 无重叠),且再按幂等(box_top 稳定)。
+    setup = ["type:/agent-test-multi", "key:enter", "sleep:0.4"]
+    # 连按 4 次(2 个开关周期)后应稳定。
+    raw = run(bin_path, ["sleep:0.8"] + setup +
+              ["key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5",
+               "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"],
+              term_size=(24, 100), per_key_drain=0.04, startup_drain=0.8)
+    a = TTYAssert(raw, rows=24, cols=100)
+    full = "\n".join(a.final.line_text(r) for r in range(24))
+    # 框存在且贴屏底(footer 下无大片残留)。
+    a.assert_box_present()
+    a.assert_box_at_bottom()
+    # agent 进度树完整保留(panel 未被 Ctrl+O 毁)。
+    assert "Running 2 Explore agents" in full, "Ctrl+O 后 agent 进度树丢失:\n" + full
+    assert "Summarize mod2.py" in full, "Ctrl+O 后 agent 树残缺:\n" + full
+    # 无重复框边框(残留会留多条 ─── 行)。
+    border_lines = [r for r in range(24) if a.final.line_text(r).strip().startswith("─" * 20)]
+    assert len(border_lines) == 2, f"框边框行数异常(应 2,实 {len(border_lines)}),疑残留:\n" + full
+
+
 def test_ctrl_o_tall_history_inline(bin_path):
     # 长历史 + 小终端:Ctrl+O 进 inline transcript,退出恢复输入框,无 alt-screen。
     msgs = []

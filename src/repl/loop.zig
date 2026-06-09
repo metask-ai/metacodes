@@ -22,6 +22,7 @@ const transcript_mod = @import("../core/transcript.zig");
 const transcript_viewer = @import("transcript_viewer.zig");
 const progress = @import("progress.zig");
 const render_region_mod = @import("tui/render_region.zig");
+const agent_job_registry_mod = @import("../core/agent_job_registry.zig");
 const msg_queue_mod = @import("msg_queue.zig");
 const tui_term_root = @import("tui/term.zig");
 const util_fs = @import("../util/fs.zig");
@@ -220,9 +221,19 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         if (std.mem.eql(u8, trimmed, "/agent-test") or std.mem.startsWith(u8, trimmed, "/agent-test:")) {
             const desc = if (trimmed.len > 12) trimmed[12..] else "inspect repo";
             if (app.agent_jobs) |*aj| {
-                aj.pushTestEntry(desc, 2, "Bash", "{\"command\":\"git status\"}") catch {
+                aj.pushTestEntryFull("Explore", desc, 1, 17300, "Read", "{\"file_path\":\"/Users/x/mod0.py\"}", .running) catch {
                     std.debug.print("[agent-test] push failed\n", .{});
                 };
+            }
+            continue;
+        }
+        // /agent-test-multi —— 测试专用:造 3 个不同状态 Explore agent(驱动完整进度树
+        // 三态 + 标题分组 + switcher)。① mid-tool(有 tokens) ② Initializing(0 tool) ③ Done。
+        if (std.mem.eql(u8, trimmed, "/agent-test-multi")) {
+            if (app.agent_jobs) |*aj| {
+                aj.pushTestEntryFull("Explore", "Summarize mod0.py", 1, 17300, "Read", "{\"file_path\":\"/Users/x/mod0.py\"}", .running) catch {};
+                aj.pushTestEntryFull("Explore", "Summarize mod1.py", 0, 0, "", "", .running) catch {};
+                aj.pushTestEntryFull("Explore", "Summarize mod2.py", 3, 17700, "", "", .done) catch {};
             }
             continue;
         }
@@ -442,19 +453,17 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // 权限弹窗 UI runner:有 TuiBackend 时注入到 per-session permission_ctx(终端接管路径:
         // 停 watcher+持锁,不抢 fd0)。生成期结束统一清(defer),避免悬垂指向 tui_be 栈实例。
         if (tui_be) |*tb| {
-            app.permission_ctx.ui_request_state = @ptrCast(tb);
-            app.permission_ctx.ui_request_fn = &tui_backend_mod.TuiBackend.uiRequestTrampoline;
+            app.permission_ctx.ui_requester = .{ .ctx = @ptrCast(tb), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline };
         }
         defer if (tui_be != null) {
-            app.permission_ctx.ui_request_state = null;
-            app.permission_ctx.ui_request_fn = null;
+            app.permission_ctx.ui_requester = null;
         };
         const result = agent_loop.run(
             &app.conversation,
             &app.api_client,
             app.tool_defs,
             &app.permission_ctx,
-            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .activate_tool_state = @ptrCast(app), .activate_tool_fn = &app_mod.App.activateToolTrampoline, .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_state = @ptrCast(app), .worktree_push_fn = &app_mod.App.worktreePushTrampoline, .worktree_pop_fn = &app_mod.App.worktreePopTrampoline, .ui_request_state = if (tui_be) |*tb| @as(*anyopaque, @ptrCast(tb)) else null, .ui_request_fn = if (tui_be != null) &tui_backend_mod.TuiBackend.uiRequestTrampoline else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
+            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry, .skill_activator = .{ .ctx = @ptrCast(app), .activateFn = &app_mod.App.activateSkillTrampoline }, .tool_activator = .{ .ctx = @ptrCast(app), .activateFn = &app_mod.App.activateToolTrampoline }, .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_hook = .{ .ctx = @ptrCast(app), .pushFn = &app_mod.App.worktreePushTrampoline, .popFn = &app_mod.App.worktreePopTrampoline }, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
             &ui_be,
             allocator,
         ) catch |err| {
@@ -875,8 +884,13 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
                     // 此处 redraw 从该行重画输入框 → 框回屏底原位(守 idempotent)。
                     const sz = tui_term_root.getSize(fd);
                     const rows: usize = if (sz) |s| s.rows else 24;
+                    // panel-aware box 高度:fixedRegionHeight = 框区高(prev_rows 扣掉框上方
+                    // agent树/task/paste_hint panel——退出后由 redraw 重画,不属 viewer 锚定的框区)。
+                    // **在 clear 之前**快照(clear 清零)。+1 复现旧常量 5(无 panel 时框区=4)。
+                    const box_region = region.fixedRegionHeight();
+                    const box_h: usize = if (box_region > 0) box_region + 1 else 5;
                     region.clear();
-                    transcript_viewer.runWithTheme(fd, allocator, &app.conversation, rows, region.theme) catch {};
+                    transcript_viewer.runWithThemeBoxH(fd, allocator, &app.conversation, rows, region.theme, box_h) catch {};
                     redraw(&region, &editor, app);
                     continue;
                 },
@@ -906,6 +920,19 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
                     region.clear();
                     const killed = app.killAllBackground();
                     std.debug.print("\x1b[33m[killed {d} background task(s)]\x1b[0m\n", .{killed});
+                    redraw(&region, &editor, app);
+                    continue;
+                },
+                .agents_view => {
+                    // 持久 viewing 现在纯靠 dispatch 设 view=.viewing + render_region.drawAgentViewing
+                    // 帧渲染(非 print)。dispatch 不再上抛此 action;保留防御性 redraw。
+                    redraw(&region, &editor, app);
+                    continue;
+                },
+                .agents_stop => {
+                    // 停止选中 agent(registry.kill)。
+                    region.clear();
+                    stopSelectedAgent(app, &region) catch {};
                     redraw(&region, &editor, app);
                     continue;
                 },
@@ -1868,8 +1895,7 @@ fn handleSkillInvocation(app: *app_mod.App, allocator: std.mem.Allocator, rest: 
         .read_state = &app.read_state,
         .permission_ctx = &app.permission_ctx,
         .dyn_registry = &app.dyn_registry,
-        .activate_skill_state = @ptrCast(app),
-        .activate_skill_fn = &app_mod.App.activateSkillTrampoline,
+        .skill_activator = .{ .ctx = @ptrCast(app), .activateFn = &app_mod.App.activateSkillTrampoline },
         .explicit_invocation = true, // 关键:用户显式触发,disable-model-invocation 跳过
         .project_dir = app.project_dir_or_empty(),
         .session_id = "",
@@ -1906,7 +1932,7 @@ fn handleSkillInvocation(app: *app_mod.App, allocator: std.mem.Allocator, rest: 
         &app.api_client,
         app.tool_defs,
         &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry, .activate_skill_state = @ptrCast(app), .activate_skill_fn = &app_mod.App.activateSkillTrampoline, .project_dir = app.project_dir_or_empty(), .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry, .skill_activator = .{ .ctx = @ptrCast(app), .activateFn = &app_mod.App.activateSkillTrampoline }, .project_dir = app.project_dir_or_empty(), .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true },
         &be,
         allocator,
     ) catch |err| {
@@ -2002,7 +2028,20 @@ fn externalEdit(allocator: std.mem.Allocator, current: []const u8) ![]u8 {
 
 /// 杀所有 running 后台任务,返回杀掉的数量。
 
-/// Ctrl+T:打印任务列表(最多 5 个,带状态图标)+ 后台 subagent job 列表。覆盖到 prompt 上方。
+
+/// 停止选中 agent(registry.kill)。region.ui.agents.sel 是 1-based agent index。
+fn stopSelectedAgent(app: *app_mod.App, region: *render_region_mod.RenderRegion) !void {
+    const reg = app.agentJobsPtr() orelse return;
+    const sel = region.ui.agents.sel;
+    if (sel == 0) return;
+    const allocator = app.allocator;
+    const snaps = reg.snapshotJobs(allocator) catch return;
+    defer agent_job_registry_mod.AgentJobRegistry.freeSnapshots(allocator, snaps);
+    if (sel - 1 >= snaps.len) return;
+    reg.kill(snaps[sel - 1].id) catch {};
+    std.debug.print("\r\x1b[2K\x1b[33m[stopped agent {s}]\x1b[0m\n", .{snaps[sel - 1].desc});
+}
+
 fn printTaskList(app: *app_mod.App) void {
     const tasks = app.tasks.tasks.items;
     std.debug.print("\r\x1b[2K", .{}); // 清当前行

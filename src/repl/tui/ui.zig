@@ -192,6 +192,95 @@ fn dispatchKey(state: *UiState, key: input.Key) Effect {
         }
     }
 
+    // ── Agent switcher(区域2,对齐 cc v2.1.168)──────────────────────────────────
+    // 已在 list 态:↑/↓ 移动选择、enter 查看/关、esc 关、x 停。抢这些键(优先于历史/编辑)。
+    // 打开入口:`←`(输入期 editor 空 + 有 agent) / `↓`(生成期 + 有 running agent)。
+    // 严格 gate 防破坏光标移动/历史导航。
+    {
+        const gen2 = state.phase == .generating;
+        if (state.agents.view == .list) {
+            switch (key) {
+                .up => {
+                    state.agents.selectUp();
+                    return .{ .redraw_region = true };
+                },
+                .down => {
+                    state.agents.selectDown(state.agent_count);
+                    return .{ .redraw_region = true };
+                },
+                .enter => {
+                    // sel==0(main)→ 关闭回 main;否则进**持久 viewing**(分隔 label 变被查看 agent
+                    // 的 desc + switcher marker ⏺)。viewing_id 在 render 层落定(committed=false 触发)。
+                    if (state.agents.sel == 0) {
+                        state.agents.close();
+                        return .{ .redraw_region = true };
+                    }
+                    state.agents.view = .viewing;
+                    state.agents.viewing_committed = false; // render 下一帧把 sel 对应 id 落定
+                    return .{ .redraw_region = true };
+                },
+                .esc => {
+                    state.agents.close();
+                    return .{ .redraw_region = true };
+                },
+                .char => {
+                    if (key.char == 'x' and state.agents.selection_active and state.agents.sel > 0) {
+                        return .{ .action = .agents_stop };
+                    }
+                },
+                else => {},
+            }
+            // list 态吞掉其它键(不透传编辑器),避免误打字。
+            return .{ .redraw_region = false };
+        }
+        // viewing 态:↑/↓ **只移 ❯ 高亮**(不切被查看对象——对齐真 cc:Enter 才提交);
+        // Enter on sel>0 → 重新落定 viewing_id(切到新选中 agent);esc 退回 list。
+        if (state.agents.view == .viewing) {
+            switch (key) {
+                .up => {
+                    state.agents.selectUp();
+                    // sel 回到 0(main)→ 退出 viewing 回 list(main 无可查看对象)。
+                    if (state.agents.sel == 0) state.agents.view = .list;
+                    return .{ .redraw_region = true };
+                },
+                .down => {
+                    state.agents.selectDown(state.agent_count);
+                    return .{ .redraw_region = true };
+                },
+                .enter => {
+                    // 在 viewing 态对当前高亮的 agent 再按 Enter → 切换被查看对象(render 落定新 id)。
+                    if (state.agents.sel > 0) state.agents.viewing_committed = false;
+                    return .{ .redraw_region = true };
+                },
+                .esc => {
+                    state.agents.view = .list; // 退回列表(再 esc 关闭)
+                    return .{ .redraw_region = true };
+                },
+                .char => {
+                    if (key.char == 'x' and state.agents.sel > 0) return .{ .action = .agents_stop };
+                },
+                else => {},
+            }
+            return .{ .redraw_region = false };
+        }
+        // 未打开:检测入口键。
+        if (state.agents.view == .closed and state.agent_count > 0) {
+            if (!gen2 and key == .left and state.editor.view.len == 0) {
+                // 空闲 + editor 空 + 有 agent → 进 list(对齐实拍 `← for agents`)。
+                state.agents.view = .list;
+                state.agents.selection_active = false;
+                state.agents.sel = 0;
+                return .{ .redraw_region = true };
+            }
+            if (gen2 and key == .down) {
+                // 生成期 `↓ to manage` → 进 list + 立即激活选择(实拍 ↓ 直接出 ❯)。
+                state.agents.view = .list;
+                state.agents.selectDown(state.agent_count);
+                return .{ .redraw_region = true };
+            }
+        }
+    }
+
     // ── 全局快捷键:dispatch 识别 → 上抛 LoopAction,IO 体留调用方(两期共用解析)──────
     // 按 UiState gate:生成期对无意义的键(history/complete/reverse_search/external_edit)
     // 直接吞掉(无补全器/无搜索 UI/不起 $EDITOR),不上抛、不透传。

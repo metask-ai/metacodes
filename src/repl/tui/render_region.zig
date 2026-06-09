@@ -105,17 +105,26 @@ pub const RenderRegion = struct {
         _ = std.c.pthread_mutex_unlock(&self.mutex);
     }
 
-    /// 生成期 overlay(alt-screen transcript viewer)用:持渲染锁,使 agent_loop emit 线程
+    /// 生成期 overlay(inline transcript viewer)用:持渲染锁,使 agent_loop emit 线程
     /// 阻塞在锁上、不与 viewer 抢 stdout。enter/exit 必须配对。viewer 自身不请求本锁(无死锁)。
-    /// enter 持锁后擦掉生成期固定区(光标回文本续接点),使 viewer 进 alt-screen 时主屏是干净
-    /// 的文本流末尾;exit 在**锁内**重画固定区后再释放锁(避免与 redrawGen 重复 lock 死锁)。
+    /// enter 持锁后擦掉生成期固定区(光标回文本续接点)**并清零区状态**(region_drawn/prev_rows/
+    /// cursor_in_region_row)——viewer 随后用**绝对光标定位**整屏重绘并把光标停在锚定行(对齐 idle 期
+    /// loop.zig 的 `region.clear()` 语义)。exit 不再 eraseRegion(viewer 已整屏重绘 + 光标在锚定行,
+    /// 区状态已清零;再 eraseRegion 会用 viewer 接管前的陈旧 cursor_in_region_row → 擦错行 → 残留),
+    /// 直接 drawGenRegion 从锚定行重画。**幂等根因修复**:不依赖 viewer 接管期间漂移的 prev_rows。
     pub fn enterExclusiveOverlay(self: *RenderRegion) void {
         self.lock();
         if (self.generating and self.region_drawn) self.eraseRegion();
+        // 区状态清零:viewer 整屏接管后,旧区不再在屏上的"已知位置"——exit 必须从干净态重画,
+        // 不能用陈旧 cursor_in_region_row 去 eraseRegion(那是 bug#3 残留的根因)。
+        self.region_drawn = false;
+        self.prev_rows = 0;
+        self.cursor_in_region_row = 0;
     }
     pub fn exitExclusiveOverlay(self: *RenderRegion, app: *const app_mod.App) void {
         if (self.generating) {
-            if (self.region_drawn) self.eraseRegion();
+            // viewer 已把光标停在输入框锚定行 + 整屏重绘干净;区状态已在 enter 清零(region_drawn=false)。
+            // 直接 drawGenRegion 从锚定行重画固定区(不 eraseRegion —— 无旧区可擦,陈旧定位会擦错行)。
             self.drawGenRegion(app);
         }
         self.unlock();
@@ -246,6 +255,21 @@ pub const RenderRegion = struct {
         if (budget == 0) return 0;
         var used: u16 = 0;
 
+        // ---- Agent viewing(持久查看):view==.viewing 时主区(框上方 panel 位)换被查看 agent 的
+        // transcript + 分隔线,替代进度树/task。下方 drawAgentSwitcher 列表仍画(共存)。
+        if (self.ui.agents.view == .viewing) {
+            // viewing 时也要回写 agent_count(供 dispatch ↑↓ 钳制)。
+            if (app.agentJobsPtr()) |reg| {
+                const snaps = reg.snapshotJobs(self.allocator) catch null;
+                if (snaps) |s| {
+                    self.ui.agent_count = s.len;
+                    agent_job_registry.AgentJobRegistry.freeSnapshots(self.allocator, s);
+                }
+            }
+            used += self.drawAgentViewing(w, app, budget - used);
+            return used;
+        }
+
         // ---- agent 进度树 ----
         // 用 App.agentJobsPtr()(指向 App 字段本身),不要 `if (app.agent_jobs) |reg|`
         // 捕获——那是值拷贝,listLock 会锁栈副本的 mutex 而非真 registry 的(race)。
@@ -253,13 +277,17 @@ pub const RenderRegion = struct {
             const snaps = reg.snapshotJobs(self.allocator) catch null;
             if (snaps) |s| {
                 defer agent_job_registry.AgentJobRegistry.freeSnapshots(self.allocator, s);
+                // agent_count 镜像回写(dispatch ↓/← 入口 + 选择钳制用,switcher 关闭时也更新)。
+                self.ui.agent_count = s.len;
                 if (s.len > 0) {
-                    const tree = agent_tree.render(self.allocator, self.theme, s) catch null;
+                    const tree = agent_tree.render(self.allocator, self.theme, s, util_time.nowMs()) catch null;
                     if (tree) |t| {
                         defer self.allocator.free(t);
                         used += self.writePanelLines(w, t, budget - used);
                     }
                 }
+            } else {
+                self.ui.agent_count = 0;
             }
         }
 
@@ -464,6 +492,8 @@ pub const RenderRegion = struct {
             new_rows += 1;
         }
 
+        // Agent switcher(区域2):footer 下方,占额外行。在收缩擦除前累加进 new_rows。
+        new_rows += self.drawAgentSwitcher(w, app);
         // 此刻光标在 footer 行末 = 区内最后一行(行号 new_rows-1)。
 
         // 3. 收缩残留擦除
@@ -483,6 +513,7 @@ pub const RenderRegion = struct {
         const loc = RenderRegion.locateCursor(body, body_cursor, &vlines);
         const hint_rows: u16 = if (self.ui.paste_hint) 1 else 0;
         const target_row: u16 = task_tab_rows + hint_rows + 1 + @as(u16, @intCast(loc.vline));
+        // 最底行 = new_rows-1(footer + 可能的 agent switcher 行)。光标从最底回输入行。
         const footer_row: u16 = new_rows - 1;
         if (footer_row > target_row) {
             w.writeAll(ansi.cursor.up(footer_row - target_row, &nbuf)) catch {};
@@ -602,9 +633,31 @@ pub const RenderRegion = struct {
         // default 态显 `? for shortcuts`;非 default 已在 mode part 含 cycle 提示,hint 留空。
         // 生成期(self.generating):右接 `esc to interrupt`(对齐 cc:中断提示在 footer 非 spinner 行)。
         // cc 实测:非 default → `{mode part} · esc to interrupt`(有 `· ` 分隔);default → `esc to interrupt`。
-        const hint = if (self.generating)
-            (if (show_mode) " · esc to interrupt" else " esc to interrupt")
-        else if (show_mode) "" else " ? for shortcuts";
+        // agent 区域(对齐实拍 v2.1.168):
+        //   生成期 + 有 running agent → 追加 ` · ↓ to manage`(进 switcher 选择)。
+        //   空闲期 + 有 agent(running/done 均可查看)→ 追加 ` · ← for agents`。
+        var has_running_agents = false;
+        var has_any_agents = false;
+        if (app.agentJobsPtr()) |reg| {
+            has_running_agents = reg.runningCount() > 0;
+            has_any_agents = reg.totalCount() > 0;
+        }
+        var hint_buf: [96]u8 = undefined;
+        const hint: []const u8 = blk: {
+            if (self.generating) {
+                const base = if (show_mode) " · esc to interrupt" else " esc to interrupt";
+                if (has_running_agents) {
+                    break :blk std.fmt.bufPrint(&hint_buf, "{s} · ↓ to manage", .{base}) catch base;
+                }
+                break :blk base;
+            }
+            // 空闲期。
+            const base = if (show_mode) "" else " ? for shortcuts";
+            if (has_any_agents) {
+                break :blk std.fmt.bufPrint(&hint_buf, "{s} · ← for agents", .{base}) catch base;
+            }
+            break :blk base;
+        };
 
         // 写:mode part 用 modeColor 着色,其余 dim。cc footer 纯左对齐快捷键,**无右侧 token**
         // (对齐 cc:footer 行只左对齐文案;token 用量走 /cost)。
@@ -616,6 +669,150 @@ pub const RenderRegion = struct {
         w.writeAll(th.dim) catch {};
         w.writeAll(hint) catch {};
         w.writeAll(th.reset) catch {};
+    }
+
+    /// Agent viewing 帧(区域2 持久查看):view==.viewing 时画在**输入框上方**(替代 panel 位置)——
+    /// **只画一行右对齐分隔 label** `──── <desc> ──`(对齐真 cc v2.1.169 实拍金标准:viewing 态
+    /// 真 cc 不渲染被查看 agent 的 transcript,只把分隔线 label 变成被查看 agent 的 desc + switcher
+    /// marker 翻 ⏺;主 scrollback 始终是主 agent 对话)。被查看对象由 **viewing_id** 解析(Enter 提交,
+    /// ↑↓ 不动),非 sel。viewing_committed=false 时在此落定 viewing_id(reconcile)。返回画的行数。
+    fn drawAgentViewing(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App, budget: u16) u16 {
+        if (self.ui.agents.view != .viewing) return 0;
+        if (budget == 0) return 0;
+        const reg = app.agentJobsPtr() orelse return 0;
+        const sel = self.ui.agents.sel;
+        const th = self.theme;
+        const snaps = reg.snapshotJobs(self.allocator) catch return 0;
+        defer agent_job_registry.AgentJobRegistry.freeSnapshots(self.allocator, snaps);
+
+        // viewing_id 落定(Enter 触发的 reconcile):未 committed 时把当前 sel 对应 agent 的 id 拷入。
+        if (!self.ui.agents.viewing_committed and sel > 0 and sel - 1 < snaps.len) {
+            self.ui.agents.commitViewingId(snaps[sel - 1].id);
+        }
+        // 按已落定的 viewing_id 找被查看 agent 的 desc(非 sel —— ↑↓ 移光标不切被查看对象)。
+        const vid = self.ui.agents.viewingIdSlice();
+        if (vid.len == 0) return 0;
+        var desc: []const u8 = "";
+        for (snaps) |s| {
+            if (std.mem.eql(u8, s.id, vid)) {
+                desc = s.desc;
+                break;
+            }
+        }
+        if (desc.len == 0) return 0; // 被查看 agent 已消失(完成/停止)→ 不画 label
+
+        const cols: usize = if (self.ui.cols > 4) self.ui.cols else 80;
+        // 分隔线头:`──────── <desc> ──`(右对齐 desc)。
+        w.writeAll(ansi.clear.line) catch {};
+        w.writeAll(th.dim) catch {};
+        {
+            const dw = displayWidth(desc);
+            const pad = if (cols > dw + 4) cols - dw - 4 else 0;
+            var i: usize = 0;
+            while (i < pad) : (i += 1) w.writeAll("─") catch {};
+            w.print(" {s} ──", .{desc}) catch {};
+        }
+        w.writeAll(th.reset) catch {};
+        w.writeAll("\r\n") catch {};
+        return 1;
+    }
+
+    /// Agent switcher 列表(区域2,footer 下方)。对齐 cc v2.1.168 实拍:
+    ///   <空行>
+    ///   ⏺ main                              ↑/↓ to select · Enter to view
+    ///   ◯ Explore  Summarize mod0.py                                  3s
+    /// 仅当 ui.agents.view != .closed 时画。返回画的行数(供 new_rows 累加)。
+    /// 每行前置 `\r\n` + clear(承接 footer 行末光标);caller 据返回行数算几何。
+    fn drawAgentSwitcher(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App) u16 {
+        if (self.ui.agents.view == .closed) return 0;
+        const reg = app.agentJobsPtr() orelse return 0;
+        const th = self.theme;
+        const snaps = reg.snapshotJobs(self.allocator) catch return 0;
+        defer agent_job_registry.AgentJobRegistry.freeSnapshots(self.allocator, snaps);
+
+        const cols: usize = if (self.ui.cols > 4) self.ui.cols else 80;
+        const ag = &self.ui.agents;
+        var rows: u16 = 0;
+
+        // 空行分隔(footer 与 switcher 间)。
+        w.writeAll("\r\n") catch {};
+        w.writeAll(ansi.clear.line) catch {};
+        rows += 1;
+
+        // 行 0:main。marker ⏺(在 main 视图)/◯(在看 agent)。右对齐 hint 随选择目标变。
+        const main_selected = ag.selection_active and ag.sel == 0;
+        const viewing = ag.view == .viewing;
+        {
+            w.writeAll("\r\n") catch {};
+            w.writeAll(ansi.clear.line) catch {};
+            // 选择光标 ❯(选中行左侧)。
+            if (main_selected) {
+                w.print("{s}❯ {s}", .{ th.accent, th.reset }) catch {};
+            } else {
+                w.writeAll("  ") catch {};
+            }
+            const marker = if (viewing) "◯" else "⏺";
+            const mc = if (viewing) th.dim else th.accent;
+            w.print("{s}{s}{s} main", .{ mc, marker, th.reset }) catch {};
+            // 右对齐 hint。
+            const hint = if (ag.selection_active and ag.sel > 0)
+                "Enter to view · x to stop · ctrl+x ctrl+k to stop all agents"
+            else
+                "↑/↓ to select · Enter to view";
+            const left_w: usize = (if (main_selected) @as(usize, 4) else 2) + 1 + 5; // ❯/space + marker + " main"
+            const hint_w = displayWidth(hint);
+            if (cols > left_w + hint_w + 1) {
+                const pad = cols - left_w - hint_w;
+                var i: usize = 0;
+                while (i < pad) : (i += 1) w.writeAll(" ") catch {};
+            } else {
+                w.writeAll(" ") catch {};
+            }
+            w.print("{s}{s}{s}", .{ th.dim, hint, th.reset }) catch {};
+            rows += 1;
+        }
+
+        // 行 1..N:每个 agent。marker ◯(普通)/⏺(被查看)。`<Type>  <desc>` + 右对齐 `Ns`。
+        const now = util_time.nowMs();
+        for (snaps, 0..) |s, idx| {
+            const sel_row = idx + 1;
+            const is_selected = ag.selection_active and ag.sel == sel_row;
+            // viewing 时被查看 agent(marker ⏺)= viewing_id 命中(Enter 提交,非 sel)。
+            // ↑↓ 移 ❯(is_selected)不改 ⏺;只有 Enter 重新落定 viewing_id 才切 ⏺。
+            const is_viewed = viewing and std.mem.eql(u8, s.id, ag.viewingIdSlice());
+            w.writeAll("\r\n") catch {};
+            w.writeAll(ansi.clear.line) catch {};
+            if (is_selected) {
+                w.print("{s}❯ {s}", .{ th.accent, th.reset }) catch {};
+            } else {
+                w.writeAll("  ") catch {};
+            }
+            const marker = if (is_viewed) "⏺" else "◯";
+            w.print("{s}{s}{s} ", .{ th.dim, marker, th.reset }) catch {};
+            // <Type>  <desc>。
+            const elapsed_s: i64 = if (s.started_ms != 0) @divTrunc(@max(now - s.started_ms, 0), 1000) else 0;
+            var es_buf: [16]u8 = undefined;
+            const es = std.fmt.bufPrint(&es_buf, "{d}s", .{elapsed_s}) catch "0s";
+            // 左侧文本宽度估算(marker 2 + cursor 2 + type + 2sp + desc)。
+            const type_w = displayWidth(s.agent_type);
+            const desc_w = displayWidth(s.desc);
+            w.print("{s}{s}{s}  {s}", .{ th.accent, s.agent_type, th.reset, s.desc }) catch {};
+            const left_w: usize = 2 + 2 + type_w + 2 + desc_w;
+            const es_w = displayWidth(es);
+            if (cols > left_w + es_w + 1) {
+                const pad = cols - left_w - es_w;
+                var i: usize = 0;
+                while (i < pad) : (i += 1) w.writeAll(" ") catch {};
+            } else {
+                w.writeAll(" ") catch {};
+            }
+            w.print("{s}{s}{s}", .{ th.dim, es, th.reset }) catch {};
+            rows += 1;
+        }
+
+        // agent_count 镜像回写(dispatch ↓ 选择钳制用)。
+        self.ui.agent_count = snaps.len;
+        return rows;
     }
 
     /// 把 view 切成 visual lines(逻辑行按 \n,再按 inner_w 软折行)。纯函数(不读 self 字段)。
@@ -903,6 +1100,37 @@ pub const RenderRegion = struct {
         if (self.line_buf.items.len == 0) return;
         self.emitToScroll(self.line_buf.items);
         self.line_buf.clearRetainingCapacity();
+    }
+
+    /// 结束当前 scrollback 行:若末尾是半行(text_pending_newline)补一个 \n;已在行首则 no-op。
+    /// 幂等——连调多次只补一次。供 stream_done 用,替代旧的无条件 writeGenText("\n")(后者在
+    /// 助手文本已以 \n 结尾时多吐空行 → 多批次 tool 卡间冒空行 bug 的根因)。
+    /// 先 flush 两个缓冲(助手 markdown 残行 + 普通行缓冲残行),否则 text_pending_newline 不含缓冲态。
+    pub fn endScrollLine(self: *RenderRegion) void {
+        self.lock();
+        defer self.unlock();
+        self.flushGenAssistantLocked();
+        self.flushLineBuf();
+        if (!self.text_pending_newline) return; // 已在行首 → 幂等 no-op
+        const was_drawn = self.region_drawn;
+        if (self.region_drawn) self.eraseRegion();
+        const w = &self.scratch.writer;
+        self.resetScratch();
+        w.writeAll("\n") catch {};
+        self.flush();
+        self.text_pending_newline = false;
+        self.pending_col = 0;
+        if (was_drawn) {
+            if (self.gen_app) |a| self.drawGenRegion(a);
+        }
+    }
+
+    /// 框区高(Ctrl+O box_h 用):= prev_rows(完整固定区:框上方 panel + 框 + 下方 switcher,
+    /// 它们退出后整体由 redraw 重画,viewer 须为整个区留位)。持锁读(gen 期 watcher 线程会改)。
+    pub fn fixedRegionHeight(self: *RenderRegion) usize {
+        self.lock();
+        defer self.unlock();
+        return self.prev_rows;
     }
 
     /// 助手文本段开始(stream_begin):重置 markdown 流式状态 + 标记段首(下一行用 ⏺ 前缀)。
@@ -1329,6 +1557,9 @@ pub const RenderRegion = struct {
             self.drawFooter(w, app);
             R += 1;
         }
+
+        // Agent switcher(区域2):footer 下方,占额外行(生成期 `↓ to manage` 进入)。
+        R += self.drawAgentSwitcher(w, app);
 
         // 光标在 footer 行末 = 区最后一行(第 R-1 行)。
         // 收缩残留擦除:若新 R < 上次画的 prev_rows,清掉多余尾行。

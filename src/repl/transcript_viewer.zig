@@ -171,6 +171,12 @@ pub fn run(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const Conversati
 }
 
 pub fn runWithTheme(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const Conversation, rows: usize, th: @import("tui/theme.zig").Theme) !void {
+    return runWithThemeBoxH(fd, allocator, conv, rows, th, 5);
+}
+
+/// box_h = 输入框区实际总高(含 panel:agent树/task/switcher)。退出时把对话尾填到 rows-box_h,
+/// 光标停在锚定行。caller 传 region.prev_rows+1(快照在 region.clear 之前);无 panel 时 = 5(旧常量)。
+pub fn runWithThemeBoxH(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const Conversation, rows: usize, th: @import("tui/theme.zig").Theme, box_h_in: usize) !void {
     const lines = try renderToLinesWithTheme(allocator, conv, th);
     defer freeLines(allocator, lines);
     const prompts = try userPromptLineIndices(allocator, lines);
@@ -235,7 +241,7 @@ pub fn runWithTheme(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const C
     // 关键正确性(守住 test_ctrl_o_bottom_anchored_idempotent):用绝对光标定位重绘,**不 2J、
     // 不 emit \n 滚动**——把对话尾部 N 行填到上方,光标停在"输入框锚定行"(rows - box_h),
     // loop.zig 随后从此处 redraw 输入框 → 框回到屏底原位,scrollback 不被毁。
-    const box_h: usize = 5; // 上框(1)+❯(1)+下框(1)+footer(1)+底部余量(1);使框回原 box_top
+    const box_h: usize = box_h_in; // 调用方传 region.prev_rows+1(含 panel);无 panel = 5(旧常量)
     const tail_rows: usize = if (rows > box_h) rows - box_h else 1;
     // 对话尾部起始行:lines 末 tail_rows 行(不足则从 0)。
     const tail_start: usize = if (lines.len > tail_rows) lines.len - tail_rows else 0;

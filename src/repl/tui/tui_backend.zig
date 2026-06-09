@@ -212,9 +212,12 @@ pub const TuiBackend = struct {
                 self.region.writeGenText(s);
             },
             .stream_done => {
-                // 先 flush 助手文本残行(markdown 渲染),再补段尾换行。
-                self.region.flushGenAssistant();
-                self.region.writeGenText("\n");
+                // 结束助手文本行(幂等):半行补 \n,已在行首 no-op。
+                // 旧版无条件 writeGenText("\n") 在文本已以 \n 结尾时多吐空行 → 多批次 tool 卡间冒空行。
+                self.region.endScrollLine();
+            },
+            .ui_request_pending => {
+                // TUI 是同步前端(走阻塞 requestUi,恒 .answered,从不挂起)→ 此事件不会发给它,no-op。
             },
         }
     }
@@ -391,9 +394,11 @@ pub const TuiBackend = struct {
         allocator: std.mem.Allocator,
         req: *const ui_request.UiRequest,
         out: *ui_request.UiResponse,
-    ) anyerror!void {
+    ) anyerror!ui_request.RequestOutcome {
         const self: *TuiBackend = @ptrCast(@alignCast(state));
-        return self.handleUiRequest(allocator, req, out);
+        try self.handleUiRequest(allocator, req, out);
+        // TUI 同步前端:对话框已阻塞收到响应,out 已写 → 恒 .answered(从不挂起)。
+        return .answered;
     }
 
     /// 生成期 stdin 监听主循环(从旧 loop.zig stdinAbortWatcher 原样搬入)。
@@ -477,8 +482,14 @@ pub const TuiBackend = struct {
                 const sz = term.getSize(self.input_fd);
                 const rows: usize = if (sz) |s| s.rows else 24;
                 const th = if (self.theme) |t| t.* else theme_mod.dark;
+                // panel-aware box 高度:gen 期 region.prev_rows = drawGenRegion 的完整区高(含 panel)。
+                // 持渲染锁读(watcher 线程会改);快照在 enterExclusiveOverlay 前。+1 复现旧常量 5。
+                const box_h: usize = blk: {
+                    const pr = self.region.fixedRegionHeight();
+                    break :blk if (pr > 0) pr + 1 else 5;
+                };
                 self.region.enterExclusiveOverlay();
-                transcript_viewer.runWithTheme(self.input_fd, a, &app.conversation, rows, th) catch {};
+                transcript_viewer.runWithThemeBoxH(self.input_fd, a, &app.conversation, rows, th, box_h) catch {};
                 self.region.exitExclusiveOverlay(app);
                 return;
             },

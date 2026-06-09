@@ -87,6 +87,61 @@ pub const PanelState = struct {
     task_list_visible: bool = true,
 };
 
+/// Agent switcher(区域2,对齐 cc v2.1.168 footer 下方 agent 列表)。
+/// 状态机:closed → list(↓/← 进)→ viewing(Enter)。selection_active 决定是否显 ❯ 光标。
+pub const AgentView = enum { closed, list, viewing };
+pub const AgentSwitcherState = struct {
+    view: AgentView = .closed,
+    /// 进 list 后是否已用 ↑/↓ 激活选择(显 ❯ 光标)。首次进 list 未选 → false(无光标)。
+    selection_active: bool = false,
+    /// 当前选中行:0 = "main",1..=N = agent index(对应 snapshotJobs 顺序)。
+    sel: usize = 0,
+    /// viewing 态正在查看的 agent id(idSlice 拷贝定长)。**Enter 提交时落定**,↑↓ 不动它
+    /// (对齐真 cc:↑↓ 只移 ❯ 高亮,Enter 才切换被查看对象 → 分隔 label + ⏺ marker)。
+    viewing_id: [16]u8 = undefined,
+    viewing_id_len: u8 = 0,
+    /// viewing_id 是否已落定。dispatch(纯状态层,无 registry)进 viewing / 再 Enter 时置 false,
+    /// 由 render(能访问 snapshot)在下一帧把 sel 对应 agent 的 id 拷进 viewing_id 并置 true。
+    viewing_committed: bool = false,
+
+    pub fn viewingIdSlice(self: *const AgentSwitcherState) []const u8 {
+        return self.viewing_id[0..self.viewing_id_len];
+    }
+    /// render 层落定 viewing_id(从 snapshot 取 id)。id 长度截到 16。
+    pub fn commitViewingId(self: *AgentSwitcherState, id: []const u8) void {
+        const n = @min(id.len, self.viewing_id.len);
+        @memcpy(self.viewing_id[0..n], id[0..n]);
+        self.viewing_id_len = @intCast(n);
+        self.viewing_committed = true;
+    }
+    /// 选择上移(钳制到 0)。首次只激活停当前 sel(对称 selectDown)。
+    pub fn selectUp(self: *AgentSwitcherState) void {
+        if (!self.selection_active) {
+            self.selection_active = true;
+            return;
+        }
+        if (self.sel > 0) self.sel -= 1;
+    }
+    /// 选择下移(钳制到 agent_count;sel 0=main,1..N=agent)。
+    /// 首次激活(selection_active 从 false→true)只激活、停在当前 sel(对齐实拍:← 进入后
+    /// 首个 ↓ 选中 main 显 ❯);已激活则真正下移。
+    pub fn selectDown(self: *AgentSwitcherState, agent_count: usize) void {
+        if (!self.selection_active) {
+            self.selection_active = true;
+            return;
+        }
+        if (self.sel < agent_count) self.sel += 1;
+    }
+    /// 关闭 switcher,回 main 视图。
+    pub fn close(self: *AgentSwitcherState) void {
+        self.view = .closed;
+        self.selection_active = false;
+        self.sel = 0;
+        self.viewing_id_len = 0;
+        self.viewing_committed = false;
+    }
+};
+
 /// 集中 UI 逻辑状态。机制态(prev_rows 等)不在此(属 Renderer)。
 pub const UiState = struct {
     // 几何(resize 改)
@@ -125,6 +180,12 @@ pub const UiState = struct {
 
     // 瞬时提示(对齐 CC:"再按 Ctrl+C 退出" / "agent finished" 等)
     hint: ?[]const u8 = null,
+
+    // Agent switcher(区域2):footer 下方 agent 列表 + agent transcript 查看。
+    agents: AgentSwitcherState = .{},
+    /// agent 数量镜像(由 render/usage 时回写,dispatch 用于 ↓ 选择钳制)。
+    /// dispatch 是纯函数无 registry 访问,靠此镜像知道选择上界。
+    agent_count: usize = 0,
 };
 
 // ---- 状态操作 helper(纯逻辑,dispatch 调用)----

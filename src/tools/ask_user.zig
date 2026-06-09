@@ -93,7 +93,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     } else {
         // 交互路径:校验 + 构造 []AskQuestion,经回调让 TUI backend(主线程)渲染可交互对话框。
         // 回调缺失(headless/WriterBackend/单测)→ NotATty(与非 tty 拒绝语义一致)。
-        if (ctx.ui_request_fn == null or ctx.ui_request_state == null) return error.NotATty;
+        if (ctx.ui_requester == null) return error.NotATty;
 
         var qlist = std.ArrayList(AskQuestion).empty;
         defer qlist.deinit(allocator);
@@ -117,7 +117,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         const ui_request = @import("../core/protocol/ui_request.zig");
         const req = ui_request.UiRequest{ .ask_question = qlist.items };
         var resp: ui_request.UiResponse = undefined;
-        _ = try ctx.requestUi(allocator, &req, &resp);
+        const outcome = try ctx.requestUi(allocator, &req, &resp);
+        // Stage 1(协议预留):sync 前端恒返 .answered。pending(异步挂起)在 Stage 2 才接;
+        // 此处非 .answered 走 NotATty 兜底(等价现状,sync 永不到此)。
+        if (outcome != .answered) return error.NotATty;
         // resp.answers owned by allocator → 转移进 answers(后续序列化用),用完统一 free。
         switch (resp) {
             .answers => |arr| {
