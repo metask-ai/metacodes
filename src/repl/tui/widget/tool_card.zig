@@ -721,23 +721,36 @@ fn renderTaskResult(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, 
         try appendLine(alloc, out, th.dim, line, th.reset);
         return;
     }
-    // Task / Agent spawn(同步):{"subagent_type":..,"final_text":..,"stop_reason":..}
+    // Task / Agent spawn(同步):{"subagent_type":..,"final_text":..,"tool_calls":N,"tokens":N,"elapsed_ms":N}
+    // 完成态塌缩卡(对齐实拍 `⎿ Done (2 tool uses · 18.1k tokens · 8s)`)。
     if (std.mem.eql(u8, tool_name, "Task") or std.mem.eql(u8, tool_name, "Agent")) {
         const st = extractField(output_text, "subagent_type") orelse "subagent";
-        if (extractField(output_text, "final_text")) |ft| {
-            const dec = try jsonUnescape(alloc, ft);
-            defer alloc.free(dec);
-            const head = firstLine(std.mem.trim(u8, dec, " \n"));
-            const line = try std.fmt.allocPrint(alloc, "◆ {s}: {s}", .{ st, head });
-            defer alloc.free(line);
-            try appendLine(alloc, out, th.dim, line, th.reset);
-            return;
-        }
         // 后台 spawn:{"agent_job_id":..,"status":"running",..}
         if (extractField(output_text, "agent_job_id")) |jid| {
             const line = try std.fmt.allocPrint(alloc, "◆ {s} subagent started ({s})", .{ st, jid });
             defer alloc.free(line);
             try appendLine(alloc, out, th.dim, line, th.reset);
+            return;
+        }
+        // 同步完成:Done (N tool use(s) · X tokens · Ns)。
+        if (extractField(output_text, "final_text") != null or extractNumberField(output_text, "tool_calls") != null) {
+            const tc = extractNumberField(output_text, "tool_calls") orelse 0;
+            const tokens = extractNumberField(output_text, "tokens") orelse 0;
+            const elapsed_ms = extractNumberField(output_text, "elapsed_ms") orelse 0;
+            var line: std.ArrayList(u8) = .empty;
+            defer line.deinit(alloc);
+            try line.appendSlice(alloc, "Done (");
+            try line.print(alloc, "{d} tool use{s}", .{ tc, if (tc == 1) "" else "s" });
+            if (tc > 0 and tokens > 0) {
+                const tk = try fmtTokensK(alloc, tokens);
+                defer alloc.free(tk);
+                try line.print(alloc, " · {s} tokens", .{tk});
+            }
+            if (elapsed_ms > 0) {
+                try line.print(alloc, " · {d}s", .{@divTrunc(elapsed_ms + 500, 1000)});
+            }
+            try line.append(alloc, ')');
+            try appendLine(alloc, out, th.dim, line.items, th.reset);
             return;
         }
     }
@@ -766,6 +779,13 @@ fn firstLine(s: []const u8) []const u8 {
 }
 
 /// 提取顶层数字字段(extractField 只取 string 值;exit_code/turns 是裸数字)。
+/// token 数格式化(对齐 agent_tree.fmtTokens):17300 → "17.3k";<1000 原样。i64 入参。
+fn fmtTokensK(alloc: std.mem.Allocator, n: i64) ![]u8 {
+    if (n < 1000) return std.fmt.allocPrint(alloc, "{d}", .{n});
+    const k = @as(f64, @floatFromInt(n)) / 1000.0;
+    return std.fmt.allocPrint(alloc, "{d:.1}k", .{k});
+}
+
 fn extractNumberField(args: []const u8, key: []const u8) ?i64 {
     var pat_buf: [64]u8 = undefined;
     if (key.len + 4 > pat_buf.len) return null;
@@ -1389,6 +1409,31 @@ pub fn actionLabel(alloc: std.mem.Allocator, tool_name: []const u8, input: []con
         const trunc = try layout.truncate(alloc, one, 48, "…");
         defer if (trunc.ptr != one.ptr) alloc.free(trunc); // truncate 不超长时借用 one,不能 free
         return try std.fmt.allocPrint(alloc, "{s}({s})", .{ tool_name, trunc });
+    }
+    return try alloc.dupe(u8, tool_name);
+}
+
+/// agent 进度树/transcript 动作行专用:`Tool: arg` 冒号式(对齐 cc `Read: /path`)。
+/// 与 actionLabel(`Tool(arg)`)区别仅在分隔符。Read 用全路径(实拍 `Read: /Users/.../mod0.py`)。
+/// 拿不到参数则纯工具名。caller free。
+pub fn actionLabelColon(alloc: std.mem.Allocator, tool_name: []const u8, input: []const u8) ![]u8 {
+    const arg: ?[]const u8 = blk: {
+        if (std.mem.eql(u8, tool_name, "Bash")) break :blk extractField(input, "command");
+        if (std.mem.eql(u8, tool_name, "Read") or std.mem.eql(u8, tool_name, "Edit") or
+            std.mem.eql(u8, tool_name, "Write") or std.mem.eql(u8, tool_name, "NotebookEdit"))
+            break :blk (extractField(input, "file_path") orelse extractField(input, "path"));
+        if (std.mem.eql(u8, tool_name, "Grep") or std.mem.eql(u8, tool_name, "Glob"))
+            break :blk extractField(input, "pattern");
+        if (std.mem.eql(u8, tool_name, "WebFetch")) break :blk extractField(input, "url");
+        break :blk null;
+    };
+    if (arg) |a| {
+        const dec = try jsonUnescape(alloc, a);
+        defer alloc.free(dec);
+        const one = firstLine(dec);
+        const trunc = try layout.truncate(alloc, one, 60, "…");
+        defer if (trunc.ptr != one.ptr) alloc.free(trunc);
+        return try std.fmt.allocPrint(alloc, "{s}: {s}", .{ tool_name, trunc });
     }
     return try alloc.dupe(u8, tool_name);
 }

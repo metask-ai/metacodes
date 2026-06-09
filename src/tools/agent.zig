@@ -132,7 +132,6 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const bg = util_json.extractBoolField(args, "run_in_background") orelse false;
     if (bg) {
         const reg = ctx.agent_jobs orelse return error.AgentJobsUnavailable;
-        var desc_buf: [128]u8 = undefined;
         const job_id = try reg.spawnBackground(.{
             .prompt = prompt,
             .system_prompt = sys_prompt,
@@ -147,14 +146,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .perm_override = perm_override,
             .project_dir = ctx.project_dir,
             .parent_model = ctx.parent_model,
-            // desc 形如 "<type>: <description>"(对齐 agent 进度树 `├ Explore: inspect repo`);
-            // 无 description 时退回纯 type。registry 内 dupe + 截断 80B,这里栈 buffer 即可。
-            .desc = desc_blk: {
-                const d = util_json.extractStringField(args, "description") orelse break :desc_blk subagent_type_raw;
-                break :desc_blk std.fmt.bufPrint(&desc_buf, "{s}: {s}", .{ subagent_type_raw, d }) catch d;
-            },
-            .activate_skill_state = ctx.activate_skill_state,
-            .activate_skill_fn = ctx.activate_skill_fn,
+            // desc = 纯描述(进度树行 `├ <desc>`);agent_type 单独传(标题按 type 分组)。
+            // 无 description 时退回纯 type 作描述。
+            .desc = util_json.extractStringField(args, "description") orelse subagent_type_raw,
+            .agent_type = subagent_type_raw,
+            .skill_activator = ctx.skill_activator,
         });
         return std.fmt.allocPrint(
             ctx.allocator,
@@ -163,9 +159,36 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         );
     }
 
+    // 同步路径:注册前台进度 entry(供进度树实时显示),并发安全靠 per-call client。
+    // desc(纯描述,不带 "type: " 前缀)给进度树行;agent_type 给标题分组。
+    const fg_desc = util_json.extractStringField(args, "description") orelse subagent_type_raw;
+    var fg_entry: ?*@import("../core/agent_job_registry.zig").JobEntry = null;
+    if (ctx.agent_jobs) |reg| {
+        fg_entry = reg.registerForeground(subagent_type_raw, fg_desc, prompt);
+    }
+    // 父轮把 Region 1 进度树视为 transient:tool_result 返回后移除该前台 entry。
+    defer if (fg_entry) |e| {
+        if (ctx.agent_jobs) |reg| reg.removeForeground(e);
+    };
+
+    // per-call client:并发同步 Task(executeSlots 把多个 Task 放 worker 线程)各用独立
+    // Client,绝不跨线程共享 ctx.api_client 的 http.Client。无 registry(headless)则退回
+    // ctx.api_client(headless 无 TUI,串行可接受)。
+    var owned_client: ?@import("../core/agent_job_registry.zig").AgentJobRegistry.OwnedClient = null;
+    defer if (owned_client) |oc| oc.deinit();
+    const call_client: *@import("../client.zig").Client = blk: {
+        if (ctx.agent_jobs) |reg| {
+            if (reg.makeClient()) |oc| {
+                owned_client = oc;
+                break :blk oc.client;
+            } else |_| {}
+        }
+        break :blk api_client;
+    };
+
     const result = try subagent.spawnAgent(
         ctx.allocator,
-        api_client,
+        call_client,
         tool_defs, // 父 tool_defs (override 通过 SpawnOptions 传)
         perm,
         ctx.abort,
@@ -178,12 +201,28 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .tool_defs_override = if (filtered_owned != null) effective_tool_defs else null,
             .permission_mode_override = perm_override,
             .model_override = model_override,
-            .activate_skill_state = ctx.activate_skill_state,
-            .activate_skill_fn = ctx.activate_skill_fn,
+            .skill_activator = ctx.skill_activator,
             .project_dir = ctx.project_dir,
+            // 进度/token 回写到前台 entry,被 watcher tickSpinner 拾取渲染进度树。
+            .progress_reporter = if (fg_entry) |e| .{ .ctx = @ptrCast(e), .reportFn = &@import("../core/agent_job_registry.zig").JobEntry.progressTrampoline } else null,
+            .usage_sink = if (fg_entry) |e| .{ .ctx = @ptrCast(e), .addFn = &@import("../core/agent_job_registry.zig").JobEntry.usageTrampoline } else null,
         },
     );
     defer result.deinit();
+
+    // 标记前台 entry 完成(终值),removeForeground 由上面的 defer 兜底。
+    var fg_tokens: u64 = 0;
+    var fg_elapsed_ms: u64 = 0;
+    if (fg_entry) |e| {
+        if (ctx.agent_jobs) |reg| reg.finishForeground(e, result.turns, result.tool_calls, result.stop_reason);
+        // 读 tokens + 算耗时(entry 仍有效,removeForeground 在函数返回时才跑)。
+        e.lockPublic();
+        fg_tokens = e.tokens;
+        const start = e.started_ms;
+        e.unlockPublic();
+        const now = @import("../util/time.zig").nowMs();
+        fg_elapsed_ms = @intCast(@max(now - start, 0));
+    }
 
     // 输出 JSON
     var out: std.ArrayList(u8) = .empty;
@@ -194,10 +233,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try util_json.serializeString(result.final_text, &out, ctx.allocator);
     try out.appendSlice(ctx.allocator, ",\"stop_reason\":\"");
     try out.appendSlice(ctx.allocator, @tagName(result.stop_reason));
+    // tokens + elapsed_ms:完成态塌缩卡 `Done (N tool uses · X tokens · Ns)` 渲染用。
     const tail = try std.fmt.allocPrint(
         ctx.allocator,
-        "\",\"turns\":{d},\"tool_calls\":{d}}}",
-        .{ result.turns, result.tool_calls },
+        "\",\"turns\":{d},\"tool_calls\":{d},\"tokens\":{d},\"elapsed_ms\":{d}}}",
+        .{ result.turns, result.tool_calls, fg_tokens, fg_elapsed_ms },
     );
     defer ctx.allocator.free(tail);
     try out.appendSlice(ctx.allocator, tail);

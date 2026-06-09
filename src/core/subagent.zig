@@ -53,15 +53,16 @@ pub const SpawnOptions = struct {
     /// 自己已经解析过,这里只接受具体 model 名或 null)。
     model_override: ?[]const u8 = null,
     /// 父 dispatch 传过来的回调,subagent 同样需要 Skill 工具激活权限态等。
-    activate_skill_state: ?*anyopaque = null,
-    activate_skill_fn: ?*const fn (state: *anyopaque, skill_name: []const u8, allowed: []const []const u8, disallowed: []const []const u8) anyerror!void = null,
+    skill_activator: ?@import("../tools/context.zig").SkillActivator = null,
     project_dir: []const u8 = "",
     /// 后台 subagent registry(允许嵌套后台:子 agent 也能 Task(run_in_background)注册进同一 root)。
     /// null = 子 agent 不能再开后台(同步路径恒 null)。
     agent_jobs: ?*@import("agent_job_registry.zig").AgentJobRegistry = null,
     /// 实时进度回调(后台 job 传自己的 JobEntry trampoline;同步路径 null)。
-    progress_state: ?*anyopaque = null,
-    progress_fn: ?*const fn (state: *anyopaque, turn: u32, tool_name: []const u8, tool_input: []const u8, tool_calls: u32) void = null,
+    progress_reporter: ?agent_loop.ProgressReporter = null,
+    /// usage 回写(后台/前台 job 把 token 数喂进 JobEntry.tokens,供进度树 `· X tokens`)。
+    /// null = 不统计(同步无 registry 路径)。透传给 agent_loop.Options.usage_sink。
+    usage_sink: ?agent_loop.UsageSink = null,
 };
 
 pub fn spawnAgent(
@@ -124,8 +125,7 @@ pub fn spawnAgentSink(
             .tool_defs = effective_tool_defs,
             .agent_depth = opts.agent_depth,
             .dyn_registry = opts.dyn_registry,
-            .activate_skill_state = opts.activate_skill_state,
-            .activate_skill_fn = opts.activate_skill_fn,
+            .skill_activator = opts.skill_activator,
             .agent_jobs = opts.agent_jobs,
             .project_dir = opts.project_dir,
             .model_override = opts.model_override,
@@ -133,8 +133,8 @@ pub fn spawnAgentSink(
             // 后台 subagent 不应往父 stdout 喷 ANSI 着色(final_text/output 会混入 \x1b[32m)。
             // sink 是 NullWriter(同步)或 SinkWriter(后台)时都非交互终端 → 关着色。
             .colorize = false,
-            .progress_state = opts.progress_state,
-            .progress_fn = opts.progress_fn,
+            .progress_reporter = opts.progress_reporter,
+            .usage_sink = opts.usage_sink,
         },
         backend,
         allocator,

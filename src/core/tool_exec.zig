@@ -91,6 +91,20 @@ fn runJob(job: *Job) void {
     job.done = true;
 }
 
+/// per-slot 并发安全判定:在 isConcurrencySafeInput 之上叠加同步 Task 特例。
+/// 同步 Task/Agent(非 run_in_background)各自 spawn 独立子 agent + 独立 TaskStore,
+/// 唯一共享风险是 http.Client——agent.zig 同步路径用 registry.makeClient 造 per-call
+/// client 规避。故仅当有 agent_jobs(能造独立 client)时才允许 Task 并发,否则保守串行
+/// (headless 无 TUI,串行无碍)。对齐 cc:多个 Task 在一轮内并行跑(独立计时器)。
+fn slotSafe(ctx: *const ToolContext, s: Slot) bool {
+    if ((std.mem.eql(u8, s.name, "Task") or std.mem.eql(u8, s.name, "Agent")) and ctx.agent_jobs != null) {
+        // run_in_background 的 Task 立即返回不阻塞,本就不进并发批语义;但即便并发也安全
+        // (它只注册后台 job 即返回)。统一按 safe 处理。
+        return true;
+    }
+    return tools_mod.isConcurrencySafeInput(s.name, s.input);
+}
+
 /// 执行 slots 中所有 decision==.run 的 tool(分批并发);denied 的不动。
 /// 结果写回 slot.content/is_error。base_ctx 是构造好的 ToolContext(allocator=父)。
 pub fn executeSlots(
@@ -105,10 +119,11 @@ pub fn executeSlots(
             i += 1;
             continue;
         }
-        // 收集从 i 起连续的同安全性 run-slot 为一批。per-input 判定(Bash 看 command)。
-        const safe = tools_mod.isConcurrencySafeInput(slots[i].name, slots[i].input);
+        // 收集从 i 起连续的同安全性 run-slot 为一批。per-input 判定(Bash 看 command;
+        // Task 同步 spawn 仅当有 agent_jobs 可造 per-call client 时算 safe,见 slotSafe)。
+        const safe = slotSafe(base_ctx, slots[i]);
         var j = i;
-        while (j < slots.len and slots[j].decision == .run and tools_mod.isConcurrencySafeInput(slots[j].name, slots[j].input) == safe) : (j += 1) {}
+        while (j < slots.len and slots[j].decision == .run and slotSafe(base_ctx, slots[j]) == safe) : (j += 1) {}
         // slots[i..j] 是一批(同安全性)。
         if (safe and (j - i) > 1) {
             runConcurrentBatch(slots[i..j], base_ctx, parent_allocator, rid);

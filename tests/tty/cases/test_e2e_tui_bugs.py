@@ -58,15 +58,18 @@ def _card_header_line(text: str, tool_name: str):
 
 
 def test_e2e_bug3_bash_nonzero_exit_icon(bin_path):
-    """#3:Bash 非零退出码,头部图标应是 ✗ 不是 ✓。
+    """#3(已对齐 cc v2.1.168 实拍,2026-06-09 修正测试):Bash 非零退出的 **committed
+    scrollback 卡**头部是中性 `⏺ Ran 1 shell command`(**非 ✗**),失败由 body($ cmd)+
+    模型后续文本(exit code N)体现。
 
-    根因:tool_exec.zig is_error 只在 dispatch 抛 Zig error 时 true;Bash 把非零 exit
-    包成正常 JSON {"exit_code":3} 返回,不抛错 → is_error=false → kind=.ok → 渲染 ✓。
-    修复:headerIcon 对 Bash + exit_code!=0 降级为 ✗(不碰 is_error)。
+    旧版测试错误假设"头部应 ✗"——napicc 实拍真 cc 证明:Bash committed 卡标题恒中性 ⏺,
+    无 ✓/✗(cc 设计:类A 工具完成卡用自然语言标题 + 中性 bullet,成败不进头部图标)。
+    cc-zig renderLiveDone 同此(⏺ + body)。✗ 降级仅在 Ctrl+O transcript 详细视图(headerIcon),
+    不在正常 scrollback。故本测试改为验证:Bash 调用了 + committed 卡是中性 ⏺ 标题(不崩、不误显 ✗)。
     """
     if SKIP:
         return
-    ever_called = False  # 被测路径(模型真调了 Bash)是否曾触发
+    ever_called = False
     for _ in range(RETRIES):
         raw, home, uses = run_e2e_tool(
             bin_path,
@@ -78,12 +81,12 @@ def test_e2e_bug3_bash_nonzero_exit_icon(bin_path):
         ever_called = True
         text = _prose_text(raw)
         hdr = _card_header_line(text, "Bash")
-        # body 应含红 exit 3(佐证非零路径命中),头部图标应是 ✗ 非 ✓
-        if hdr and "✗" in hdr and "✓" not in hdr:
-            return  # 绿
+        # committed 卡标题:中性 `⏺ Ran ... shell command`(对齐 cc 实拍),**不得**误显 ✗/✓ 状态符。
+        if hdr is not None and "shell command" in hdr and "✗" not in hdr and "✓" not in hdr:
+            return  # 绿:中性 ⏺ 标题,对齐 cc
     if not ever_called:
         raise SkipTest("模型 %d 次重试均未调 Bash(漂移),被测路径未触发" % RETRIES)
-    raise AssertionError("Bug#3 regression:Bash 调用了但非零退出头部仍显示 ✓(应 ✗)")
+    raise AssertionError("Bug#3:Bash committed 卡标题应为中性 `⏺ Ran ... shell command`(对齐 cc 实拍),实际异常")
 
 
 def test_e2e_bug4_auto_background_neutral_icon(bin_path):

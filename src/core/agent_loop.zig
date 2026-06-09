@@ -25,7 +25,7 @@ const ui_event = @import("protocol/ui_event.zig");
 const UiBackend = ui_backend.UiBackend;
 const CoreEvent = ui_event.CoreEvent;
 
-pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error, tool_loop };
+pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error, tool_loop, suspended };
 
 /// 工具进度 trampoline:把工具的 progress 回调(WebSearch query/results)转成 CoreEvent,
 /// 经 backend 路由到归属 session 的 UI。per-run 实例(backend + session),progress_state 指它。
@@ -121,17 +121,10 @@ pub const Options = struct {
     agent_depth: u8 = 0,
     /// 运行时工具（Skill/MCP）注册表。null = 仅静态工具。
     dyn_registry: ?*const @import("../tools/dynamic.zig").DynRegistry = null,
-    /// Skill 激活回调:Skill 工具激活后调用,把临时白/黑名单挂到 App。
-    activate_skill_state: ?*anyopaque = null,
-    activate_skill_fn: ?*const fn (
-        state: *anyopaque,
-        skill_name: []const u8,
-        allowed: []const []const u8,
-        disallowed: []const []const u8,
-    ) anyerror!void = null,
-    /// ToolSearch 激活 deferred 工具的回调(透传到 ToolContext)。
-    activate_tool_state: ?*anyopaque = null,
-    activate_tool_fn: ?*const fn (state: *anyopaque, tool_name: []const u8) anyerror!void = null,
+    /// Skill 激活回调:Skill 工具激活后调用,把临时白/黑名单挂到 App。见 ToolContext.SkillActivator。
+    skill_activator: ?tools_mod.SkillActivator = null,
+    /// ToolSearch 激活 deferred 工具的回调(透传到 ToolContext)。见 ToolContext.ToolActivator。
+    tool_activator: ?tools_mod.ToolActivator = null,
     /// 本轮的 Skill 工具调用是否为"用户显式 /name 触发"。
     /// 当前 Stage C 总是 false(只支持模型自主);Stage D 加 /<skill-name> 命令后置 true。
     explicit_invocation: bool = false,
@@ -158,22 +151,11 @@ pub const Options = struct {
     /// ToolSearch 激活的 deferred 工具名集。非 null 时:deferred 且不在此集的工具
     /// 不进 API tools 数组(降低弱后端工具菜单稀释)。null = 不过滤 deferred(全暴露)。
     activated_tools: ?*const std.StringHashMap(void) = null,
-    /// Worktree state(EnterWorktree/ExitWorktree 工具用)。
-    worktree_state: ?*anyopaque = null,
-    worktree_push_fn: ?*const fn (
-        state: *anyopaque,
-        allocator: std.mem.Allocator,
-        wt_path: []const u8,
-        original_cwd: []const u8,
-    ) anyerror!void = null,
-    worktree_pop_fn: ?*const fn (
-        state: *anyopaque,
-        allocator: std.mem.Allocator,
-    ) anyerror!?@import("../tools/worktree.zig").WorktreeEntry = null,
-    /// 统一 UI 请求回调(替代旧 ask_question/exit_plan 三套;state 指 *TuiBackend)。
-    /// 仅顶层 TUI 接(agent_depth==0)——子 agent 无 tty。
-    ui_request_state: ?*anyopaque = null,
-    ui_request_fn: ?@import("protocol/ui_request.zig").UiRequestFn = null,
+    /// Worktree 钩子(EnterWorktree/ExitWorktree 工具用)。见 ToolContext.WorktreeHook。
+    worktree_hook: ?tools_mod.WorktreeHook = null,
+    /// 统一 UI 请求回调(替代旧 ask_question/exit_plan 三套;ctx 指 *TuiBackend)。
+    /// 仅顶层 TUI 接(agent_depth==0)——子 agent 无 tty。见 UiRequester。
+    ui_requester: ?@import("protocol/ui_request.zig").UiRequester = null,
     /// MCP session 列表(ListMcpResourcesTool/ReadMcpResourceTool 用)。
     mcp_sessions: ?*const []@import("mcp_session.zig").McpSessionEntry = null,
     /// Cron registry(CronCreate/Delete/List 用)。
@@ -191,21 +173,26 @@ pub const Options = struct {
     /// 会混入 \x1b[32m 等控制码。
     colorize: bool = true,
     /// 实时进度回调(后台 subagent 用):每轮开始 + 每个工具执行前调用,
-    /// 把 (turn, tool_name, tool_input) 写回调用方(JobEntry)。null = 不上报(前台/headless/同步)。
-    /// state 经类型擦除传 *JobEntry,progress_fn 是其 trampoline。tool_input 为工具原始
-    /// input JSON(供动作行渲染参数预览);仅更新轮次时传空。tool_calls 为截至当前的累计
-    /// 工具调用数(供 subagent 树 `· N tools ·` 实时显示)。
-    progress_state: ?*anyopaque = null,
-    progress_fn: ?*const fn (state: *anyopaque, turn: u32, tool_name: []const u8, tool_input: []const u8, tool_calls: u32) void = null,
+    /// 把 (turn, tool_name, tool_input, tool_calls) 写回调用方(JobEntry)。null = 不上报。见 ProgressReporter。
+    progress_reporter: ?ProgressReporter = null,
 };
 
 /// 内部:发一次进度上报(turn 1-based;tool_name/tool_input 空 = 仅更新轮次)。
 /// tool_calls = 截至此刻累计工具调用数(单调,trampoline 持锁回写 JobEntry.tool_calls)。
 fn reportProgress(opts: Options, turn: u32, tool_name: []const u8, tool_input: []const u8, tool_calls: u32) void {
-    if (opts.progress_fn) |f| {
-        if (opts.progress_state) |s| f(s, turn, tool_name, tool_input, tool_calls);
-    }
+    if (opts.progress_reporter) |r| r.report(turn, tool_name, tool_input, tool_calls);
 }
+
+/// agent_loop 轮/工具级进度回调(turn/tool_name/tool_input/tool_calls 签名)。
+/// subagent 进度树喂数据用(JobEntry.progressTrampoline 实现)。与 ToolContext 的
+/// ToolProgressReporter(id/phase/text/count)是不同回调。
+pub const ProgressReporter = struct {
+    ctx: *anyopaque,
+    reportFn: *const fn (ctx: *anyopaque, turn: u32, tool_name: []const u8, tool_input: []const u8, tool_calls: u32) void,
+    pub fn report(self: ProgressReporter, turn: u32, tool_name: []const u8, tool_input: []const u8, tool_calls: u32) void {
+        self.reportFn(self.ctx, turn, tool_name, tool_input, tool_calls);
+    }
+};
 
 /// usage 回调接口：stream 每次吐 usage event 时调用。
 /// App.usage 实现此接口；测试用 mock 亦可。
@@ -635,10 +622,8 @@ pub fn run(
             .tool_defs = opts.tool_defs,
             .agent_depth = opts.agent_depth,
             .dyn_registry = opts.dyn_registry,
-            .activate_skill_state = opts.activate_skill_state,
-            .activate_skill_fn = opts.activate_skill_fn,
-            .activate_tool_state = opts.activate_tool_state,
-            .activate_tool_fn = opts.activate_tool_fn,
+            .skill_activator = opts.skill_activator,
+            .tool_activator = opts.tool_activator,
             .explicit_invocation = opts.explicit_invocation,
             .session_id = opts.session_id,
             .project_dir = opts.project_dir,
@@ -651,9 +636,7 @@ pub fn run(
             .agents = opts.agents,
             .parent_model = opts.parent_model,
             .skills = opts.skills_set,
-            .worktree_state = opts.worktree_state,
-            .worktree_push_fn = opts.worktree_push_fn,
-            .worktree_pop_fn = opts.worktree_pop_fn,
+            .worktree_hook = opts.worktree_hook,
             .mcp_sessions = opts.mcp_sessions,
             .cron_registry = opts.cron_registry,
         };
@@ -664,15 +647,13 @@ pub fn run(
         // 故去掉旧 @hasDecl 探测。
         if (opts.agent_depth == 0) {
             progress_tramp = .{ .be = backend, .session = sess };
-            base_ctx.progress_state = @ptrCast(&progress_tramp);
-            base_ctx.progress_fn = &ProgressTramp.cb;
+            base_ctx.progress_reporter = .{ .ctx = @ptrCast(&progress_tramp), .reportFn = &ProgressTramp.cb };
         }
 
         // 统一 UI 请求回调(AskUserQuestion/权限/plan 审批共用):仅顶层 TUI(depth==0)接——
         // 子 agent 无 tty,工具按语义兜底(ask→NotATty;plan→answer_queue/reject)。
-        if (opts.ui_request_fn != null and opts.agent_depth == 0) {
-            base_ctx.ui_request_state = opts.ui_request_state;
-            base_ctx.ui_request_fn = opts.ui_request_fn;
+        if (opts.ui_requester != null and opts.agent_depth == 0) {
+            base_ctx.ui_requester = opts.ui_requester;
         }
         // 子进程心跳(Bash 长命令"仍在运行")per-session 通路:从 opts 透传到 ctx → spawn 层。
         base_ctx.spawn_tick_fn = opts.spawn_tick_fn;
@@ -689,7 +670,7 @@ pub fn run(
             }
         }
         // 进度上报:本轮第一个 run slot 的工具名 + 原始 input(subagent agent 树显示当前动作)。
-        if (opts.progress_fn != null) {
+        if (opts.progress_reporter != null) {
             for (slots.items) |*s| {
                 if (s.decision == .run) {
                     reportProgress(opts, turns + 1, s.name, s.input, total_tool_calls);
@@ -861,6 +842,23 @@ fn freeApiMessages(list: *std.ArrayList(types.ApiMessage), allocator: std.mem.Al
         allocator.free(m.content);
     }
     list.deinit(allocator);
+}
+
+test "ProgressReporter.report 经接口触达回调" {
+    const S = struct {
+        var hits: u32 = 0;
+        var last_calls: u32 = 0;
+        fn cb(_: *anyopaque, _: u32, _: []const u8, _: []const u8, tool_calls: u32) void {
+            hits += 1;
+            last_calls = tool_calls;
+        }
+    };
+    S.hits = 0;
+    var dummy: u8 = 0;
+    const r = ProgressReporter{ .ctx = @ptrCast(&dummy), .reportFn = &S.cb };
+    r.report(2, "Grep", "{}", 5);
+    try std.testing.expectEqual(@as(u32, 1), S.hits);
+    try std.testing.expectEqual(@as(u32, 5), S.last_calls);
 }
 
 test "buildApiMessages maps blocks" {

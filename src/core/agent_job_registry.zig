@@ -67,6 +67,20 @@ pub const JobEntry = struct {
     allocator: std.mem.Allocator,
     started_ms: util_time.Millis = 0,
     desc_preview: []u8 = &.{}, // owned
+    /// 前台(同步)job 标记。foreground job **无 thread**(跑在主线程/并发批的 worker 上,
+    /// 由 agent.zig 同步 spawn 驱动),其进度经 progressTrampoline 写入,供进度树渲染。
+    /// 与后台 job 共用 entries/snapshot/agent_tree 渲染链;区别仅在生命周期(transient,
+    /// 父轮结束即 removeForeground)与释放路径(无 thread → 不 join)。
+    foreground: bool = false,
+    /// agent 类型(如 "Explore"),从 desc 拆出。进度树标题按 type 分组计数需要。owned。
+    agent_type: []u8 = &.{},
+    /// 累计 token(input+output,经 usage_sink 持锁累加)。进度树行 `· X tokens` 用。
+    tokens: u64 = 0,
+    /// 该 agent 收到的 prompt 预览(spawn 时 dup,截断)。区域2 查看 transcript 顶部显示。owned。
+    prompt_preview: []u8 = &.{},
+    /// 该 agent 的可读 transcript(progress trampoline 持锁 append `⎿ Tool: arg` 行)。
+    /// 区域2 Enter 查看 agent 上下文用。owned ArrayList。
+    transcript: std.ArrayList(u8) = .empty,
 
     pub fn idSlice(self: *const JobEntry) []const u8 {
         return self.id[0..self.id_len];
@@ -112,8 +126,32 @@ pub const JobEntry = struct {
         const m = @min(tool_input.len, self.current_tool_input.len);
         @memcpy(self.current_tool_input[0..m], tool_input[0..m]);
         self.current_tool_input_len = @intCast(m);
+        // 顺带把这次工具动作 append 进 transcript(区域2 查看 agent 上下文用)。
+        // 格式对齐进度树动作行: `⎿ <Tool: arg>`(actionLabelColon 由渲染方算,这里存原料)。
+        // 失败静默(transcript 是辅助展示,非正确性路径)。
+        appendTranscriptToolLine(&self.transcript, self.allocator, tool_name[0..n], tool_input[0..m]) catch {};
+    }
+
+    /// usage_sink trampoline:持锁更新 tokens。state 是 *JobEntry。
+    /// 语义对齐 cc 进度树的 token 数(实拍多 agent 同值 ~17k)——取最新 input+output 快照
+    /// (context 大小镜像),非跨轮累加。每个 usage event 覆盖。
+    pub fn usageTrampoline(state: *anyopaque, delta: @import("../api/stream.zig").UsageDelta) void {
+        const self: *JobEntry = @ptrCast(@alignCast(state));
+        self.lock();
+        defer self.unlock();
+        self.tokens = delta.input_tokens + delta.output_tokens;
     }
 };
+
+/// 把一行工具动作存进 transcript:`<tool>\t<input>\n`(tab 分隔原料,渲染方再格式化)。
+/// 截断超长 input 防 transcript 膨胀。
+fn appendTranscriptToolLine(list: *std.ArrayList(u8), a: std.mem.Allocator, tool: []const u8, input: []const u8) !void {
+    if (tool.len == 0) return;
+    try list.appendSlice(a, tool);
+    try list.append(a, '\t');
+    try list.appendSlice(a, input[0..@min(input.len, 256)]);
+    try list.append(a, '\n');
+}
 
 /// 启动后台 job 所需的全部参数。调用方(agent.zig)填好后交给 spawnBackground,
 /// 由 registry 内部 dupe 进堆分配的 JobInput。
@@ -134,8 +172,9 @@ pub const SpawnParams = struct {
     project_dir: []const u8 = "",
     parent_model: []const u8 = "",
     desc: []const u8 = "",
-    activate_skill_state: ?*anyopaque = null,
-    activate_skill_fn: ?*const fn (state: *anyopaque, skill_name: []const u8, allowed: []const []const u8, disallowed: []const []const u8) anyerror!void = null,
+    /// agent 类型(如 "Explore";进度树标题按 type 分组用)。
+    agent_type: []const u8 = "",
+    skill_activator: ?@import("../tools/context.zig").SkillActivator = null,
 };
 
 /// 线程拥有的输入。线程结束时自行 cleanup(free dupe + client/io deinit + destroy)。
@@ -161,8 +200,7 @@ const JobInput = struct {
     agents: ?*const AgentSet,
     dyn_registry: ?*const DynRegistry,
     skills: ?*const SkillSet,
-    activate_skill_state: ?*anyopaque,
-    activate_skill_fn: ?*const fn (state: *anyopaque, skill_name: []const u8, allowed: []const []const u8, disallowed: []const []const u8) anyerror!void,
+    skill_activator: ?@import("../tools/context.zig").SkillActivator,
     // 专属资源:
     io_runtime: *std.Io.Threaded,
     client: *client_mod.Client,
@@ -245,6 +283,13 @@ pub const AgentJobRegistry = struct {
         return n;
     }
 
+    /// 总 entry 数(含已完成,供空闲期 `← for agents` 入口判定)。持 list 锁。
+    pub fn totalCount(self: *AgentJobRegistry) usize {
+        self.listLock();
+        defer self.listUnlock();
+        return self.entries.items.len;
+    }
+
     fn genId(self: *AgentJobRegistry) [16]u8 {
         self.seq +%= 1;
         var raw: [4]u8 = undefined;
@@ -286,6 +331,8 @@ pub const AgentJobRegistry = struct {
         };
         entry.desc_preview = try a.dupe(u8, p.desc[0..@min(p.desc.len, 80)]);
         errdefer a.free(entry.desc_preview);
+        entry.agent_type = a.dupe(u8, p.agent_type[0..@min(p.agent_type.len, 32)]) catch &.{};
+        errdefer if (entry.agent_type.len > 0) a.free(entry.agent_type);
 
         // 2) 专属 io_runtime + Client(堆分配,所有权给 JobInput)
         const io_rt = try a.create(std.Io.Threaded);
@@ -343,8 +390,7 @@ pub const AgentJobRegistry = struct {
             .agents = p.agents,
             .dyn_registry = p.dyn_registry,
             .skills = p.skills,
-            .activate_skill_state = p.activate_skill_state,
-            .activate_skill_fn = p.activate_skill_fn,
+            .skill_activator = p.skill_activator,
             .io_runtime = io_rt,
             .client = client,
             .registry = self,
@@ -373,8 +419,7 @@ pub const AgentJobRegistry = struct {
             }
             self.listUnlock();
             input.cleanup(); // free dupe + client/io deinit + destroy input
-            a.free(entry.desc_preview);
-            a.destroy(entry);
+            freeEntry(entry); // free desc_preview/agent_type/output_buf/transcript + destroy
             return e;
         };
 
@@ -382,9 +427,19 @@ pub const AgentJobRegistry = struct {
         return entry.idSlice();
     }
 
-    /// 测试专用:注册一个**无线程**的假 running entry(供离线 TTY 验证 agent 进度树)。
+    /// 测试专用:注册一个**无线程**的假 entry(供离线 TTY 验证 agent 进度树/switcher)。
     /// 不 spawn 线程、不开网络。entry 由 registry deinit 时统一释放(无 thread → join 跳过)。
-    pub fn pushTestEntry(self: *AgentJobRegistry, desc: []const u8, turn: u32, tool: []const u8, tool_input: []const u8) !void {
+    /// 全参数版:type/desc/tool_calls/tokens/status/current_tool 全可控,驱动新树格式。
+    pub fn pushTestEntryFull(
+        self: *AgentJobRegistry,
+        agent_type: []const u8,
+        desc: []const u8,
+        tool_calls: u32,
+        tokens: u64,
+        tool: []const u8,
+        tool_input: []const u8,
+        status: JobStatus,
+    ) !void {
         const a = self.allocator;
         const entry = try a.create(JobEntry);
         errdefer a.destroy(entry);
@@ -392,6 +447,7 @@ pub const AgentJobRegistry = struct {
         entry.mutex = .{};
         entry.abort = AbortSignal.init();
         entry.started_ms = util_time.nowMs();
+        entry.foreground = true;
         const id = self.genId();
         entry.id = id;
         entry.id_len = blk: {
@@ -400,23 +456,40 @@ pub const AgentJobRegistry = struct {
             break :blk n;
         };
         entry.desc_preview = try a.dupe(u8, desc[0..@min(desc.len, 80)]);
-        entry.status = .running;
-        entry.current_turn = turn;
+        errdefer a.free(entry.desc_preview);
+        entry.agent_type = a.dupe(u8, agent_type[0..@min(agent_type.len, 32)]) catch &.{};
+        entry.status = status;
+        entry.current_turn = 1;
+        entry.tool_calls = tool_calls;
+        entry.tokens = tokens;
         const tn = @min(tool.len, entry.current_tool.len);
         @memcpy(entry.current_tool[0..tn], tool[0..tn]);
         entry.current_tool_len = @intCast(tn);
         const tin = @min(tool_input.len, entry.current_tool_input.len);
         @memcpy(entry.current_tool_input[0..tin], tool_input[0..tin]);
         entry.current_tool_input_len = @intCast(tin);
+        // 测试用 transcript:prompt(从 desc 派生)+ 当前工具行,供区域2 viewing 渲染。
+        entry.prompt_preview = a.dupe(u8, desc) catch &.{};
+        if (tool.len > 0) {
+            appendTranscriptToolLine(&entry.transcript, a, tool, tool_input) catch {};
+        }
         self.listLock();
         self.entries.append(a, entry) catch |e| {
             self.listUnlock();
-            a.free(entry.desc_preview);
-            a.destroy(entry);
+            freeEntry(entry);
             return e;
         };
         self.index.put(entry.id, entry) catch {};
         self.listUnlock();
+    }
+
+    /// 旧签名 wrapper(back-compat):默认 type="Explore",running。turn 映射 current_turn
+    /// (旧语义),tool_calls/tokens 保持 0(测试校验初值为 0)。
+    pub fn pushTestEntry(self: *AgentJobRegistry, desc: []const u8, turn: u32, tool: []const u8, tool_input: []const u8) !void {
+        try self.pushTestEntryFull("Explore", desc, 0, 0, tool, tool_input, .running);
+        // 旧测试用 turn 作 current_turn 语义,覆盖之(Full 固定设 1)。
+        const e = self.entries.items[self.entries.items.len - 1];
+        e.current_turn = turn;
     }
 
     /// O(1) 按 id 查 entry。
@@ -443,6 +516,14 @@ pub const AgentJobRegistry = struct {
         current_tool: []u8,
         /// 该工具的原始 input JSON 快照(owned;供动作行渲染参数预览)。
         current_tool_input: []u8,
+        /// 是否前台(同步)job。
+        foreground: bool = false,
+        /// agent 类型(owned;如 "Explore";进度树标题按 type 分组用)。
+        agent_type: []u8,
+        /// 累计 token(进度树行 `· X tokens` 用)。
+        tokens: u64 = 0,
+        /// 起始时间(毫秒;进度树 2s 后 ctrl+b 提示 + switcher elapsed 用)。
+        started_ms: util_time.Millis = 0,
     };
 
     pub fn snapshotJobs(self: *AgentJobRegistry, allocator: std.mem.Allocator) ![]JobSnapshot {
@@ -462,6 +543,10 @@ pub const AgentJobRegistry = struct {
                 .current_turn = e.current_turn,
                 .current_tool = try allocator.dupe(u8, e.current_tool[0..e.current_tool_len]),
                 .current_tool_input = try allocator.dupe(u8, e.current_tool_input[0..e.current_tool_input_len]),
+                .foreground = e.foreground,
+                .agent_type = try allocator.dupe(u8, e.agent_type),
+                .tokens = e.tokens,
+                .started_ms = e.started_ms,
             };
             i += 1;
         }
@@ -474,6 +559,7 @@ pub const AgentJobRegistry = struct {
             allocator.free(s.desc);
             allocator.free(s.current_tool);
             allocator.free(s.current_tool_input);
+            allocator.free(s.agent_type);
         }
         allocator.free(snaps);
     }
@@ -483,6 +569,112 @@ pub const AgentJobRegistry = struct {
     pub fn kill(self: *AgentJobRegistry, id: []const u8) error{JobNotFound}!void {
         const e = self.get(id) orelse return error.JobNotFound;
         e.abort.abort(.user_ctrl_c);
+    }
+
+    /// 造一个专属 io_runtime + Client(堆分配,所有权归调用者)。供同步前台 Task
+    /// 并发执行时每个 spawn 用独立 Client,避免跨线程共享 App.api_client。
+    /// 调用者用完: client.deinit(); destroy(client); io.deinit(); destroy(io)。
+    pub const OwnedClient = struct {
+        io: *std.Io.Threaded,
+        client: *client_mod.Client,
+        allocator: std.mem.Allocator,
+        pub fn deinit(self: OwnedClient) void {
+            self.client.deinit();
+            self.allocator.destroy(self.client);
+            self.io.deinit();
+            self.allocator.destroy(self.io);
+        }
+    };
+    pub fn makeClient(self: *AgentJobRegistry) !OwnedClient {
+        const a = self.allocator;
+        const io_rt = try a.create(std.Io.Threaded);
+        errdefer a.destroy(io_rt);
+        io_rt.* = std.Io.Threaded.init(a, .{});
+        errdefer io_rt.deinit();
+        const client = try a.create(client_mod.Client);
+        errdefer a.destroy(client);
+        client.* = client_mod.Client.initWithBaseUrl(a, io_rt.io(), self.api_key, self.model, self.base_url);
+        return .{ .io = io_rt, .client = client, .allocator = a };
+    }
+
+    /// 前台(同步)job 注册:堆分配一个无线程的 running entry,返回稳定 *JobEntry
+    /// 供 agent.zig 同步路径传 progress_state/usage_state。spawn 在主线程/并发批 worker
+    /// 上同步驱动,进度经 trampoline 写入,被 watcher tickSpinner 拾取渲染。
+    /// agent_type 从 desc 拆出(用于进度树按 type 分组)。失败返回 null(降级为无进度可见)。
+    pub fn registerForeground(self: *AgentJobRegistry, agent_type: []const u8, desc: []const u8, prompt: []const u8) ?*JobEntry {
+        const a = self.allocator;
+        const entry = a.create(JobEntry) catch return null;
+        entry.* = .{ .allocator = a };
+        entry.mutex = .{};
+        entry.abort = AbortSignal.init();
+        entry.started_ms = util_time.nowMs();
+        entry.status = .running;
+        entry.foreground = true;
+        const id = self.genId();
+        entry.id = id;
+        entry.id_len = blk: {
+            var n: u8 = 0;
+            while (n < id.len and id[n] != 0) : (n += 1) {}
+            break :blk n;
+        };
+        entry.desc_preview = a.dupe(u8, desc[0..@min(desc.len, 80)]) catch {
+            a.destroy(entry);
+            return null;
+        };
+        entry.agent_type = a.dupe(u8, agent_type[0..@min(agent_type.len, 32)]) catch &.{};
+        entry.prompt_preview = a.dupe(u8, prompt[0..@min(prompt.len, 4096)]) catch &.{};
+        self.listLock();
+        self.entries.append(a, entry) catch {
+            self.listUnlock();
+            freeEntry(entry);
+            return null;
+        };
+        self.index.put(entry.id, entry) catch {};
+        self.listUnlock();
+        return entry;
+    }
+
+    /// 前台 job 完成:持锁标记 done/失败 + 终值。entry 仍留在 registry(transient
+    /// 进度树会在父轮结束 removeForeground 时移除)。
+    pub fn finishForeground(self: *AgentJobRegistry, e: *JobEntry, turns: u32, tool_calls: u32, stop_reason: agent_loop.StopReason) void {
+        _ = self;
+        e.lock();
+        e.turns = turns;
+        e.tool_calls = tool_calls;
+        e.stop_reason = stop_reason;
+        e.status = if (e.abort.isAborted()) .killed else .done;
+        e.unlock();
+    }
+
+    /// 移除一个前台 entry(从 entries/index 摘除并释放)。仅前台(thread==null)可用。
+    /// 父轮结束 / Region 1 transient 消失时调用。
+    pub fn removeForeground(self: *AgentJobRegistry, e: *JobEntry) void {
+        self.listLock();
+        _ = self.index.remove(e.id);
+        for (self.entries.items, 0..) |it, i| {
+            if (it == e) {
+                _ = self.entries.swapRemove(i);
+                break;
+            }
+        }
+        self.listUnlock();
+        freeEntry(e);
+    }
+
+    /// 拷贝某 agent 的 transcript(prompt + 工具行原料)到调用者 allocator。
+    /// 区域2 Enter 查看 agent 上下文用。持锁 dup,无跨线程借用。找不到返 null。
+    pub fn copyTranscript(self: *AgentJobRegistry, id: []const u8, allocator: std.mem.Allocator) !?[]u8 {
+        const e = self.get(id) orelse return null;
+        e.lock();
+        defer e.unlock();
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        if (e.prompt_preview.len > 0) {
+            try out.appendSlice(allocator, e.prompt_preview);
+            try out.append(allocator, '\n');
+        }
+        try out.appendSlice(allocator, e.transcript.items);
+        return try out.toOwnedSlice(allocator);
     }
 
     /// abort 全部 running → join 全部线程 → free。drain 循环覆盖迟注册的嵌套 job。
@@ -510,10 +702,7 @@ pub const AgentJobRegistry = struct {
 
         // 所有线程已退,单线程 free 每个 entry
         for (self.entries.items) |e| {
-            if (e.final_text) |ft| e.allocator.free(ft);
-            e.output_buf.deinit(e.allocator);
-            e.allocator.free(e.desc_preview);
-            e.allocator.destroy(e);
+            freeEntry(e);
         }
         self.entries.deinit(self.allocator);
         self.index.deinit();
@@ -522,6 +711,18 @@ pub const AgentJobRegistry = struct {
         self.allocator.free(self.model);
     }
 };
+
+/// 释放一个 entry 的所有 owned 内存 + destroy。调用前必须确保无线程再碰它
+/// (deinit 已 join;foreground entry thread==null 单线程安全)。
+fn freeEntry(e: *JobEntry) void {
+    if (e.final_text) |ft| e.allocator.free(ft);
+    e.output_buf.deinit(e.allocator);
+    e.allocator.free(e.desc_preview);
+    if (e.agent_type.len > 0) e.allocator.free(e.agent_type);
+    if (e.prompt_preview.len > 0) e.allocator.free(e.prompt_preview);
+    e.transcript.deinit(e.allocator);
+    e.allocator.destroy(e);
+}
 
 /// 后台线程主函数:跑 subagent,结果偷进 entry,cleanup input(不碰 entry 释放)。
 fn jobThreadMain(input: *JobInput) void {
@@ -543,13 +744,13 @@ fn jobThreadMain(input: *JobInput) void {
         .tool_defs_override = input.tool_defs_owned,
         .permission_mode_override = input.perm_override,
         .model_override = input.model_override,
-        .activate_skill_state = input.activate_skill_state,
-        .activate_skill_fn = input.activate_skill_fn,
+        .skill_activator = input.skill_activator,
         .project_dir = input.project_dir,
         .agent_jobs = input.registry, // 允许嵌套后台
         // 实时进度回写:agent_loop 每轮/每工具调 trampoline,持锁更新 e.current_turn/tool。
-        .progress_state = @ptrCast(e),
-        .progress_fn = &JobEntry.progressTrampoline,
+        .progress_reporter = .{ .ctx = @ptrCast(e), .reportFn = &JobEntry.progressTrampoline },
+        // token 回写:usage event 持锁更新 e.tokens,供进度树 `· X tokens`。
+        .usage_sink = .{ .ctx = @ptrCast(e), .addFn = &JobEntry.usageTrampoline },
     };
 
     const result = subagent.spawnAgentSink(

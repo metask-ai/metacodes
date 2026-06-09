@@ -43,18 +43,39 @@ def test_T27_no_tasktab_when_no_task(bin_path):
 
 def test_T28_agent_tree_appears_above_box(bin_path):
     # /agent-test 注册假 running subagent → 输入框上方出现 agent 进度树
-    # (⏺ Running 1 subagent… + 树枝 + 动作行 Bash(git status)),框仍钉底。
+    # (⏺ Running 1 Explore agent… + 行 N tool use · tokens + 动作行冒号式),框仍钉底。
+    # 对齐 cc v2.1.168 实拍金标准(napicc 录制)。
     raw = run(bin_path, ["sleep:0.8", "type:/agent-test:inspect repo", "key:enter", "sleep:0.4"])
     a = TTYAssert(raw)
     a.assert_box_present()
     a.assert_box_at_bottom()
     full = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
-    if "Running 1 subagent" not in full:
-        a._fail(f"未出现 agent 进度树标题:\n{full}")
+    # 标题按 type 分组(Explore)。
+    if "Running 1 Explore agent" not in full:
+        a._fail(f"未出现按 type 分组的标题 'Running 1 Explore agent':\n{full}")
     if "inspect repo" not in full:
         a._fail("agent 树未显示 subagent desc")
-    # 动作行带参数:Bash(git status)(对齐 cc `⎿ Bash(git status)`)。
-    if "Bash(git status)" not in full:
-        a._fail(f"agent 树动作行未显示工具+参数 Bash(git status):\n{full}")
-    if "turn 2" not in full:
-        a._fail("agent 树未显示 current_turn")
+    # 行格式:N tool use(s)(对齐 cc,非旧 `N tools · turn M`)。
+    if "tool use" not in full:
+        a._fail(f"agent 树行未显示 'tool use(s)':\n{full}")
+    # 动作行冒号式 Tool: arg(对齐 cc `⎿ Read: /path`,非旧 `Read(/path)`)。
+    if "Read:" not in full:
+        a._fail(f"agent 树动作行未显示冒号式 'Read:':\n{full}")
+
+
+def test_T29_agent_tree_multi_grouped_title(bin_path):
+    # /agent-test-multi 造 3 个 Explore agent(2 running + 1 done)→ 标题 "Running 2 Explore agents…"
+    # + 三态动作行(Read: / Initializing… / Done)。
+    raw = run(bin_path, ["sleep:0.8", "type:/agent-test-multi", "key:enter", "sleep:0.4"])
+    a = TTYAssert(raw)
+    a.assert_box_present()
+    full = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
+    if "Running 2 Explore agents" not in full:
+        a._fail(f"未出现复数分组标题 'Running 2 Explore agents':\n{full}")
+    # 三态动作行全在。
+    for needle in ("Read:", "Initializing…", "Done"):
+        if needle not in full:
+            a._fail(f"agent 树缺三态动作行 '{needle}':\n{full}")
+    # 0 tool uses 的 agent 不显 tokens(mod1)。
+    if "0 tool uses" not in full:
+        a._fail(f"未出现 '0 tool uses':\n{full}")
