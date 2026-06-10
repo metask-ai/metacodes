@@ -57,9 +57,9 @@ def test_S4_esc_closes_switcher(bin_path):
 
 
 def test_S5_enter_views_agent_transcript(bin_path):
-    # `←` 进 → `↓`(main) → `↓`(agent0) → `Enter` 提交 viewing(对齐真 cc v2.1.169 金标准):
-    # 输入框上方分隔线 label 变成被查看 agent 的 desc + switcher 列表里被看 agent marker ⏺。
-    # **真 cc 不渲染 agent transcript 面板**(无 `❯ prompt`/`⎿ Tool` 行)——只有 label + marker。
+    # `←` 进 → `↓`(main) → `↓`(agent0) → `Enter` 提交 viewing(对齐真 cc v2.1.169/170 金标准):
+    # **主区整体切成被查看 subagent 的完整对话历史**(output_buf:prompt+助手文本+工具行)+ 分隔 label
+    # + switcher 列表里被看 agent marker ⏺。golden=tmp/tty_golden/napicc_agent_viewing.txt。
     base = ["sleep:0.8", "type:/agent-test-multi", "key:enter", "sleep:0.3",
             "key:left", "sleep:0.2", "key:down", "sleep:0.15", "key:down", "sleep:0.15",
             "key:enter", "sleep:0.4"]
@@ -69,9 +69,23 @@ def test_S5_enter_views_agent_transcript(bin_path):
     # 被查看 agent marker = ⏺(switcher 列表里);main 翻 ◯。
     assert "⏺ Explore  Summarize mod0.py" in full, f"被查看 agent marker 未变 ⏺:\n{full}"
     assert "◯ main" in full, f"viewing 时 main marker 未翻 ◯:\n{full}"
-    # 负向:**不应**出现自创 transcript 面板行(对齐真 cc:viewing 不画 transcript)。
-    assert "❯ Summarize mod0.py" not in full, f"viewing 不应渲染 agent prompt 行(真 cc 无此面板):\n{full}"
-    assert "(no transcript yet)" not in full, f"viewing 不应有 transcript 占位:\n{full}"
+    # **核心(V1)**:主区显被查看 subagent 的对话历史(/agent-test-multi 给 agent0 填了假 output_buf)。
+    assert "我来分析 mod0.py" in full, f"viewing 主区未显 subagent 助手文本(V1 切对话失败):\n{full}"
+    assert "transform" in full, f"viewing 主区未显 subagent 对话内容:\n{full}"
+
+
+def test_S5b_viewing_pageup_scrolls(bin_path):
+    # viewing 态 PageUp 滚动主区对话历史(V2)。16 行小窗口逼出滚动:进入钉底显末尾,
+    # PageUp 后显更早的行(对话开头 prompt)。
+    base = ["sleep:0.8", "type:/agent-test-multi", "key:enter", "sleep:0.3",
+            "key:left", "sleep:0.2", "key:down", "sleep:0.15", "key:down", "sleep:0.15",
+            "key:enter", "sleep:0.4"]
+    # 进入(钉底):窗口容不下全部对话 → 末尾的 `transform 第 42 行` 可见,开头 prompt 不可见。
+    bottom = _full(run(bin_path, base, term_size=(16, 100)))
+    assert "transform 在第 42 行" in bottom, f"viewing 钉底未显末尾对话:\n{bottom}"
+    # PageUp → 滚到开头:prompt 行可见。
+    up = _full(run(bin_path, base + ["raw:\\x1b[5~", "sleep:0.3"], term_size=(16, 100)))
+    assert "我来分析 mod0.py" in up, f"PageUp 未滚到对话开头:\n{up}"
 
 
 def test_S6_viewing_down_moves_cursor_not_commit(bin_path):

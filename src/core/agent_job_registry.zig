@@ -492,6 +492,17 @@ pub const AgentJobRegistry = struct {
         e.current_turn = turn;
     }
 
+    /// 测试专用:清掉所有(测试注入的)entry + 释放。供 /agent-churn-test 收尾,不污染后续状态。
+    /// 仅用于无 thread 的测试 entry(foreground/pushTestEntry);有 thread 的真 job 不该走这。
+    pub fn clearTestEntries(self: *AgentJobRegistry) void {
+        self.listLock();
+        defer self.listUnlock();
+        while (self.entries.items.len > 0) {
+            const e = self.entries.pop().?;
+            freeEntry(e);
+        }
+    }
+
     /// O(1) 按 id 查 entry。
     pub fn get(self: *AgentJobRegistry, id: []const u8) ?*JobEntry {
         if (id.len > 16) return null;
@@ -677,6 +688,24 @@ pub const AgentJobRegistry = struct {
         return try out.toOwnedSlice(allocator);
     }
 
+    /// 拷贝某 agent 的完整对话(prompt + output_buf 完整输出流)到调用者 allocator。
+    /// agent switcher viewing 态主区显示被查看 subagent 对话用。持锁 dup 快照(被查看 agent
+    /// 可能在跑、output_buf 在变 → 拷快照防 race)。找不到 id 返 null。owned,caller free。
+    /// 与 copyTranscript 区别:本函数含 output_buf(助手文本+工具卡完整流),非只工具行。
+    pub fn copyOutputBuf(self: *AgentJobRegistry, id: []const u8, allocator: std.mem.Allocator) !?[]u8 {
+        const e = self.get(id) orelse return null;
+        e.lock();
+        defer e.unlock();
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        if (e.prompt_preview.len > 0) {
+            try out.appendSlice(allocator, e.prompt_preview);
+            try out.append(allocator, '\n');
+        }
+        try out.appendSlice(allocator, e.output_buf.items);
+        return try out.toOwnedSlice(allocator);
+    }
+
     /// abort 全部 running → join 全部线程 → free。drain 循环覆盖迟注册的嵌套 job。
     pub fn deinit(self: *AgentJobRegistry) void {
         // drain:反复 abort + join,直到没有未 join 的线程。
@@ -811,4 +840,24 @@ test "progressTrampoline 实时回写 tool_calls(#6:subagent 树执行中累加�
     const snaps2 = try reg.snapshotJobs(testing.allocator);
     defer AgentJobRegistry.freeSnapshots(testing.allocator, snaps2);
     try testing.expectEqual(@as(u32, 7), snaps2[0].tool_calls);
+}
+
+test "copyOutputBuf: prompt_preview + output_buf 完整流;缺 id 返 null" {
+    var reg = try AgentJobRegistry.init(testing.allocator, "test-key", "http://127.0.0.1:1", "test-model");
+    defer reg.deinit();
+    try reg.pushTestEntry("inspect repo", 1, "", "");
+    const entry = reg.entries.items[0];
+    // 模拟 subagent 输出流写进 output_buf。
+    entry.appendOutput("⏺ 探索 backend\n");
+    entry.appendOutput("  ⎿ Read main.go\n");
+
+    const id = entry.idSlice();
+    const out = (try reg.copyOutputBuf(id, testing.allocator)).?;
+    defer testing.allocator.free(out);
+    // 含 output_buf 内容(助手文本流)。
+    try testing.expect(std.mem.indexOf(u8, out, "探索 backend") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Read main.go") != null);
+
+    // 缺失 id → null。
+    try testing.expect((try reg.copyOutputBuf("agent_deadbeef", testing.allocator)) == null);
 }

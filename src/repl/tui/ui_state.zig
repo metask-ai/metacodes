@@ -103,16 +103,33 @@ pub const AgentSwitcherState = struct {
     /// viewing_id 是否已落定。dispatch(纯状态层,无 registry)进 viewing / 再 Enter 时置 false,
     /// 由 render(能访问 snapshot)在下一帧把 sel 对应 agent 的 id 拷进 viewing_id 并置 true。
     viewing_committed: bool = false,
+    /// viewing 主区视口滚动位置(0=顶部行,top..top+view_rows)。PageUp/Dn 在 dispatch 饱和加减,
+    /// render 层每帧用真实 max_top clamp 回写(dispatch 拿不到总行数/几何)。
+    view_top: usize = 0,
+    /// 切被查看对象(Enter 提交新 viewing_id)时置 true → render 层落定 view_top=max_top(定位底部/最新,
+    /// 对齐 cc 打开 transcript 定位底部)。落定后置 false。
+    view_top_at_bottom: bool = false,
 
     pub fn viewingIdSlice(self: *const AgentSwitcherState) []const u8 {
         return self.viewing_id[0..self.viewing_id_len];
     }
-    /// render 层落定 viewing_id(从 snapshot 取 id)。id 长度截到 16。
+    /// render 层落定 viewing_id(从 snapshot 取 id)。id 长度截到 16。切被查看对象 → 视口复位到底部。
     pub fn commitViewingId(self: *AgentSwitcherState, id: []const u8) void {
         const n = @min(id.len, self.viewing_id.len);
         @memcpy(self.viewing_id[0..n], id[0..n]);
         self.viewing_id_len = @intCast(n);
         self.viewing_committed = true;
+        self.view_top_at_bottom = true; // 切换被查看对象 → 视口定位底部(最新)
+    }
+    /// PageUp:视口上翻一页(饱和减,不越界 0)。render 层再 clamp。step=view_rows 由调用方传。
+    pub fn viewPageUp(self: *AgentSwitcherState, step: usize) void {
+        self.view_top = if (self.view_top > step) self.view_top - step else 0;
+        self.view_top_at_bottom = false; // 手动滚动 → 不再自动钉底
+    }
+    /// PageDown:视口下翻一页(render 层 clamp 到 max_top)。
+    pub fn viewPageDown(self: *AgentSwitcherState, step: usize) void {
+        self.view_top +%= step;
+        self.view_top_at_bottom = false;
     }
     /// 选择上移(钳制到 0)。首次只激活停当前 sel(对称 selectDown)。
     pub fn selectUp(self: *AgentSwitcherState) void {
@@ -139,6 +156,8 @@ pub const AgentSwitcherState = struct {
         self.sel = 0;
         self.viewing_id_len = 0;
         self.viewing_committed = false;
+        self.view_top = 0;
+        self.view_top_at_bottom = false;
     }
 };
 
@@ -247,4 +266,39 @@ pub fn clearCard(s: *UiState, id: []const u8) void {
         s.tools.cards[i] = s.tools.cards[i + 1];
     }
     s.tools.cards_len -= 1;
+}
+
+// ── 测试 ──────────────────────────────────────────────────────────────────────
+const testing = std.testing;
+
+test "AgentSwitcherState: viewPageUp/Down 改 view_top + 取消钉底" {
+    var a: AgentSwitcherState = .{};
+    a.view_top = 20;
+    a.view_top_at_bottom = true;
+    a.viewPageUp(10);
+    try testing.expectEqual(@as(usize, 10), a.view_top);
+    try testing.expect(!a.view_top_at_bottom); // 手动滚动 → 取消钉底
+    a.viewPageUp(100); // 饱和到 0,不下溢
+    try testing.expectEqual(@as(usize, 0), a.view_top);
+    a.viewPageDown(5);
+    try testing.expectEqual(@as(usize, 5), a.view_top); // render 层再 clamp 到 max_top
+}
+
+test "AgentSwitcherState: commitViewingId 落定 id + 视口钉底" {
+    var a: AgentSwitcherState = .{};
+    a.view_top = 99;
+    a.commitViewingId("agent_abc");
+    try testing.expectEqualStrings("agent_abc", a.viewingIdSlice());
+    try testing.expect(a.viewing_committed);
+    try testing.expect(a.view_top_at_bottom); // 切被查看对象 → 钉底(render 落定 max_top)
+}
+
+test "AgentSwitcherState: close 复位 view_top" {
+    var a: AgentSwitcherState = .{};
+    a.view = .viewing;
+    a.view_top = 50;
+    a.view_top_at_bottom = true;
+    a.close();
+    try testing.expectEqual(@as(usize, 0), a.view_top);
+    try testing.expect(!a.view_top_at_bottom);
 }

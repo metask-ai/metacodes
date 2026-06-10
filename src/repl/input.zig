@@ -38,6 +38,8 @@ pub const Key = union(enum) {
     home,
     end,
     delete,
+    page_up, // ESC[5~（agent viewing 视口翻页）
+    page_down, // ESC[6~
     esc,
     tab,
     shift_tab, // cycle 权限模式
@@ -159,6 +161,8 @@ pub const KeyParser = struct {
                 if (b == '~') {
                     return switch (self.num1) {
                         3 => .delete,
+                        5 => .page_up,
+                        6 => .page_down,
                         200 => .paste_begin,
                         201 => .paste_end,
                         else => .unknown,
@@ -579,6 +583,7 @@ pub const LineEditor = struct {
             // 全局快捷键(↑↓/Tab/Shift+Tab/Ctrl+R/T/O/G/X/L)由 dispatch(ui.zig)拦截,
             // editor 正常收不到;此处兜底返 .none(防御:vim/边界路径若漏到这不崩)。
             .up, .down, .tab, .shift_tab, .ctrl_r, .ctrl_t, .ctrl_o, .ctrl_g, .ctrl_x, .ctrl_l => return .none,
+            .page_up, .page_down => return .none, // viewing 视口翻页键,editor 不处理(dispatch 拦截)
             .unknown => return .none,
         }
     }
@@ -746,6 +751,19 @@ test "KeyParser: delete (ESC [ 3 ~)" {
     _ = p.feed('[');
     _ = p.feed('3');
     try testing.expect(p.feed('~').? == .delete);
+}
+
+test "KeyParser: page_up (ESC [ 5 ~) / page_down (ESC [ 6 ~)" {
+    var p = KeyParser{};
+    _ = p.feed(0x1b);
+    _ = p.feed('[');
+    _ = p.feed('5');
+    try testing.expect(p.feed('~').? == .page_up);
+    // 状态复位后可解析下一个序列。
+    _ = p.feed(0x1b);
+    _ = p.feed('[');
+    _ = p.feed('6');
+    try testing.expect(p.feed('~').? == .page_down);
 }
 
 test "LineEditor: insert chars" {
