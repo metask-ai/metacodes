@@ -52,15 +52,17 @@ pub fn renderToLinesWithTheme(allocator: std.mem.Allocator, conv: *const Convers
     }
 
     for (conv.messages.items) |m| {
-        const role_label = switch (m.role) {
-            .user => try std.fmt.allocPrint(allocator, "{s}▶ user{s}", .{ th.role_user, th.reset }),
-            .assistant => try std.fmt.allocPrint(allocator, "{s}◀ assistant{s}", .{ th.role_assistant, th.reset }),
-        };
-        try lines.append(allocator, role_label);
-
+        // cc 风格 transcript:**不画 ▶ user/◀ assistant 角色头**(对齐 napicc v2.1.170 实拍:viewer
+        // 内容与主区同款渲染,assistant=⏺+markdown / user=❯+原文,无角色标签)。这保证 Ctrl+O 进出
+        // 渲染等效——退出重绘的行 == 主区已渲染的行,markdown 不会"变源码"、无 ▶/◀ 残留。
         for (m.blocks) |b| {
             switch (b) {
-                .text => |t| try appendWrapped(allocator, &lines, t, "  "),
+                .text => |t| switch (m.role) {
+                    // assistant 文本:逐行过 markdown(渲染等效主区 emitAssistantLine),段首 ⏺ 续行 2 空格。
+                    .assistant => try appendAssistantMarkdown(allocator, &lines, t, th),
+                    // user 文本:❯ 前缀 + 原文(不渲 markdown,对齐主区 user 回显)。
+                    .user => try appendUserText(allocator, &lines, t, th),
+                },
                 .tool_use => |tu| {
                     // tool_card.renderStart 输出多行字符串(2 行带 ANSI);split 进 lines。
                     const card = try tool_card.renderStart(allocator, th, tu.name, tu.input);
@@ -109,12 +111,40 @@ pub fn renderToLinesWithTheme(allocator: std.mem.Allocator, conv: *const Convers
     return try lines.toOwnedSlice(allocator);
 }
 
-/// 按 '\n' 拆 text,每行加前缀。(不做列宽 wrap,终端自己软换行)
-fn appendWrapped(allocator: std.mem.Allocator, lines: *std.ArrayList([]u8), text: []const u8, prefix: []const u8) !void {
+/// assistant 文本:逐行过 markdown(复用主区 render.renderLineStreaming,渲染等效),段首 `⏺ `(accent)
+/// 续行 `  `(2 空格,对齐主区 emitAssistantLine 前缀)。一个 text block 用一个 StreamState(代码块跨行)。
+/// 不做列宽软折(transcript 终端自己软换行;主区软折是为固定区,viewer 全屏可不折)。
+fn appendAssistantMarkdown(allocator: std.mem.Allocator, lines: *std.ArrayList([]u8), text: []const u8, th: @import("tui/theme.zig").Theme) !void {
+    const md_render = @import("render.zig");
+    var st: md_render.StreamState = .{};
+    var first = true;
     var it = std.mem.splitScalar(u8, text, '\n');
     while (it.next()) |seg| {
-        const line = try std.fmt.allocPrint(allocator, "{s}{s}\x1b[0m", .{ prefix, seg });
+        var rendered: std.ArrayList(u8) = .empty;
+        defer rendered.deinit(allocator);
+        md_render.renderLineStreaming(seg, &st, &rendered, allocator, th.syntax) catch {
+            rendered.clearRetainingCapacity();
+            rendered.appendSlice(allocator, seg) catch {};
+        };
+        // 段首 `⏺ `(accent),续行 `  `。代码块围栏行 renderLineStreaming 输出空 → 仍占一行(对齐主区)。
+        const prefix: []const u8 = if (first) "⏺ " else "  ";
+        const color: []const u8 = if (first) th.accent else "";
+        const line = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}", .{ color, prefix, th.reset, rendered.items, "\x1b[0m" });
         try lines.append(allocator, line);
+        first = false;
+    }
+}
+
+/// user 文本:`❯ ` 前缀(accent)+ 原文(不渲 markdown,对齐主区 user 回显)。续行 2 空格缩进。
+fn appendUserText(allocator: std.mem.Allocator, lines: *std.ArrayList([]u8), text: []const u8, th: @import("tui/theme.zig").Theme) !void {
+    var first = true;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |seg| {
+        const prefix: []const u8 = if (first) "❯ " else "  ";
+        const color: []const u8 = if (first) th.accent else "";
+        const line = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}\x1b[0m", .{ color, prefix, th.reset, seg });
+        try lines.append(allocator, line);
+        first = false;
     }
 }
 
@@ -150,11 +180,13 @@ fn appendWrappedFolded(
 }
 
 /// 找所有 user prompt 在 lines 里的行号(用于 { } 跳转)。
+/// 找 user prompt 行的行号({/} 跳转用)。user 文本段首前缀 `❯ `(appendUserText)。
+/// (旧版认 `▶ user` 角色头,已去;改认 ❯ 前缀。assistant/tool 行不含 ❯,无误匹配。)
 pub fn userPromptLineIndices(allocator: std.mem.Allocator, lines: []const []const u8) ![]usize {
     var idx = std.ArrayList(usize).empty;
     errdefer idx.deinit(allocator);
     for (lines, 0..) |l, i| {
-        if (std.mem.indexOf(u8, l, "▶ user") != null) try idx.append(allocator, i);
+        if (std.mem.indexOf(u8, l, "❯ ") != null) try idx.append(allocator, i);
     }
     return try idx.toOwnedSlice(allocator);
 }
@@ -170,13 +202,12 @@ pub fn run(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const Conversati
     return runWithTheme(fd, allocator, conv, rows, @import("tui/theme.zig").dark);
 }
 
+/// inline transcript viewer(方案 A,对齐 napicc v2.1.170 金标准):**不覆盖 banner/历史**。
+/// 调用约定:进入时**光标已在固定区区顶行**(caller 的 region.clear()/eraseRegion 擦完停在那)。
+/// 用 DECSC(\x1b7)存档区顶 → 每帧 DECRC(\x1b8)回区顶 + ESC[J 清到屏底(banner 在区顶之上不动)
+/// + 从区顶往下画 transcript + 末2行画 footer。退出 DECRC+ESC[J 回区顶清掉 transcript,光标停区顶,
+/// caller redraw 从区顶相对重画固定区 → 跟随内容、幂等。不需 box_h/绝对行号。
 pub fn runWithTheme(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const Conversation, rows: usize, th: @import("tui/theme.zig").Theme) !void {
-    return runWithThemeBoxH(fd, allocator, conv, rows, th, 5);
-}
-
-/// box_h = 输入框区实际总高(含 panel:agent树/task/switcher)。退出时把对话尾填到 rows-box_h,
-/// 光标停在锚定行。caller 传 region.prev_rows+1(快照在 region.clear 之前);无 panel 时 = 5(旧常量)。
-pub fn runWithThemeBoxH(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const Conversation, rows: usize, th: @import("tui/theme.zig").Theme, box_h_in: usize) !void {
     const lines = try renderToLinesWithTheme(allocator, conv, th);
     defer freeLines(allocator, lines);
     const prompts = try userPromptLineIndices(allocator, lines);
@@ -187,11 +218,13 @@ pub fn runWithThemeBoxH(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *con
         break :blk @as(usize, sz.cols);
     };
 
-    // inline 内联:不进 alt-screen。保存光标 + 隐藏(DECSC),退出时恢复(DECRC)。
+    // inline:不进 alt-screen。**进入时光标在区顶** → DECSC 存档(\x1b7),每帧/退出 DECRC(\x1b8)回此点。
+    // 隐藏光标(viewer 期间无编辑光标)。
     writeAll(1, "\x1b[?25l"); // hide cursor
+    writeAll(1, "\x1b7"); // DECSC: 存档区顶(banner 在其上方,不被 viewer 触碰)
     defer writeAll(1, "\x1b[?25h"); // show cursor
 
-    // 视口:末 2 行留给 footer(对齐 cc:分隔线 + 提示)。
+    // 视口:从区顶到屏底,末 2 行留给 footer(分隔线 + 提示)。view_rows 是上界(屏底自然夹住)。
     const footer_rows: usize = 2;
     const view_rows = if (rows > footer_rows + 1) rows - footer_rows - 1 else 1;
     var top: usize = 0;
@@ -217,6 +250,16 @@ pub fn runWithThemeBoxH(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *con
                 switch (s1[0]) {
                     'A' => top = if (top > 0) top - 1 else 0, // ↑
                     'B' => top = @min(top + 1, max_top), // ↓
+                    '5' => { // PageUp(ESC[5~)——读掉结尾 ~
+                        var s2: [1]u8 = undefined;
+                        _ = std.c.read(fd, &s2, 1);
+                        top = if (top > view_rows) top - view_rows else 0;
+                    },
+                    '6' => { // PageDown(ESC[6~)
+                        var s2: [1]u8 = undefined;
+                        _ = std.c.read(fd, &s2, 1);
+                        top = @min(top + view_rows, max_top);
+                    },
                     else => {},
                 }
                 continue;
@@ -237,33 +280,11 @@ pub fn runWithThemeBoxH(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *con
         }
     }
 
-    // 退出:重建"正常视图"的可见视口(对齐 cc 关闭后形态:历史尾 + 底部输入框)。
-    // 关键正确性(守住 test_ctrl_o_bottom_anchored_idempotent):用绝对光标定位重绘,**不 2J、
-    // 不 emit \n 滚动**——把对话尾部 N 行填到上方,光标停在"输入框锚定行"(rows - box_h),
-    // loop.zig 随后从此处 redraw 输入框 → 框回到屏底原位,scrollback 不被毁。
-    const box_h: usize = box_h_in; // 调用方传 region.prev_rows+1(含 panel);无 panel = 5(旧常量)
-    const tail_rows: usize = if (rows > box_h) rows - box_h else 1;
-    // 对话尾部起始行:lines 末 tail_rows 行(不足则从 0)。
-    const tail_start: usize = if (lines.len > tail_rows) lines.len - tail_rows else 0;
-    {
-        var nb: [16]u8 = undefined;
-        writeAll(1, "\x1b[H");
-        var rr: usize = 0;
-        var li: usize = tail_start;
-        while (rr < tail_rows) : (rr += 1) {
-            writeAll(1, std.fmt.bufPrint(&nb, "\x1b[{d};1H\x1b[2K", .{rr + 1}) catch "");
-            if (li < lines.len) {
-                writeAll(1, lines[li]);
-                li += 1;
-            }
-        }
-        // 清掉 box 区那几行(redraw 会重画),光标停在锚定行(tail_rows+1)。
-        var cr: usize = tail_rows;
-        while (cr < rows) : (cr += 1) {
-            writeAll(1, std.fmt.bufPrint(&nb, "\x1b[{d};1H\x1b[2K", .{cr + 1}) catch "");
-        }
-        writeAll(1, std.fmt.bufPrint(&nb, "\x1b[{d};1H", .{tail_rows + 1}) catch "");
-    }
+    // 退出(方案 A):回区顶(DECRC)+ ESC[J 清掉 viewer 画的 transcript+footer(banner 在区顶之上不动)。
+    // 光标停区顶,caller(loop.zig redraw / tui_backend exitExclusiveOverlay)从区顶相对重画固定区
+    // → 跟随内容、与基线逐行一致(幂等)。**不再 tail 重绘、不再贴底光标**(那是旧 bug 根源)。
+    writeAll(1, "\x1b8"); // DECRC: 回区顶
+    writeAll(1, "\x1b[J"); // 清区顶到屏底(transcript + footer)
 }
 
 fn nextPrompt(prompts: []const usize, cur: usize) usize {
@@ -281,37 +302,39 @@ fn prevPrompt(prompts: []const usize, cur: usize) usize {
     return result;
 }
 
-/// inline 内联重绘整个可见视口(对齐 cc:绝对光标定位 + 逐行 ESC[2K,**不 2J、不 emit \n**)。
-/// 顶部 view_rows 行画 transcript 内容,末两行画 cc 风格 footer(分隔线 + 提示)。
+/// inline 内联重绘 transcript 视口(方案 A:从**区顶**往下画,不覆盖 banner)。
+/// `\x1b8`(DECRC)回区顶存档点 → `\x1b[J` 清区顶到屏底(banner 在区顶之上不动)→ 从区顶逐行画
+/// transcript(行进用 `\x1b[1B\r` cursor-down,屏底 no-op 不滚动)→ footer 用**绝对**屏底末2行定位
+/// (`\x1b[{rows-1/rows};1H`,覆盖任何 transcript 溢出行)。绝不 \x1b[H/不 2J/不 emit \n。
 fn drawScreenInline(lines: []const []const u8, top: usize, view_rows: usize, rows: usize, cols: usize, th: @import("tui/theme.zig").Theme) void {
     var nbuf: [16]u8 = undefined;
-    // 光标 home。
-    writeAll(1, "\x1b[H");
+    // 回区顶(DECRC)+ 清区顶到屏底(banner 在区顶之上,保留)。
+    writeAll(1, "\x1b8");
+    writeAll(1, "\x1b[J");
+    // 从区顶往下逐行画 transcript。第一行原地画,后续行 `\x1b[1B\r`(下移+回行首,屏底 no-op 不滚)。
     var r: usize = 0;
     var i: usize = top;
     while (r < view_rows) : (r += 1) {
-        // 绝对定位到第 r+1 行行首 + 清行。
-        writeAll(1, std.fmt.bufPrint(&nbuf, "\x1b[{d};1H\x1b[2K", .{r + 1}) catch "");
+        if (r > 0) writeAll(1, "\x1b[1B\r"); // 下移一行 + 回行首(不滚动)
+        writeAll(1, "\x1b[2K"); // 清行
         if (i < lines.len) {
             writeAll(1, lines[i]);
             i += 1;
         }
     }
-    // 分隔线行(view_rows+1)。
-    const sep_row = view_rows + 1;
+    // footer(绝对屏底末2行,与区顶无关):分隔线(rows-1)+ 提示(rows)。覆盖 transcript 溢出。
+    const sep_row = if (rows >= 2) rows - 1 else 1;
     writeAll(1, std.fmt.bufPrint(&nbuf, "\x1b[{d};1H\x1b[2K", .{sep_row}) catch "");
     writeAll(1, th.dim);
     var k: usize = 0;
     const sep_w = if (cols > 0) cols else 80;
     while (k < sep_w) : (k += 1) writeAll(1, "\xe2\x94\x80"); // ─
     writeAll(1, th.reset);
-    // footer 提示行(对齐 cc):`Showing detailed transcript · ctrl+o to toggle · ↑↓ scroll · ? for shortcuts`。
-    const foot_row = view_rows + 2;
-    writeAll(1, std.fmt.bufPrint(&nbuf, "\x1b[{d};1H\x1b[2K", .{foot_row}) catch "");
+    // footer 提示行(对齐 napicc v2.1.170 金标准全文)。
+    writeAll(1, std.fmt.bufPrint(&nbuf, "\x1b[{d};1H\x1b[2K", .{rows}) catch "");
     writeAll(1, th.dim);
     writeAll(1, "  Showing detailed transcript · ctrl+o to toggle · ↑↓ scroll · q quit");
     writeAll(1, th.reset);
-    _ = rows;
 }
 
 fn writeAll(fd: std.c.fd_t, bytes: []const u8) void {
@@ -329,7 +352,7 @@ fn writeAll(fd: std.c.fd_t, bytes: []const u8) void {
 
 const testing = std.testing;
 
-test "renderToLines: user + assistant + tool" {
+test "renderToLines: user=❯前缀 / assistant=⏺前缀+markdown(无角色头,渲染等效主区)" {
     const a = testing.allocator;
     var conv = Conversation.init(a);
     defer conv.deinit();
@@ -339,18 +362,38 @@ test "renderToLines: user + assistant + tool" {
     const lines = try renderToLines(a, &conv);
     defer freeLines(a, lines);
 
-    // 至少含 user 头 + assistant 头 + 两行 text
-    var has_user = false;
-    var has_asst = false;
+    var has_user_prefix = false; // user 文本 ❯ 前缀
+    var has_asst_prefix = false; // assistant 段首 ⏺ 前缀
     var has_found = false;
+    var has_role_header = false; // 不应再有 ▶ user / ◀ assistant 角色头
     for (lines) |l| {
-        if (std.mem.indexOf(u8, l, "user") != null) has_user = true;
-        if (std.mem.indexOf(u8, l, "assistant") != null) has_asst = true;
+        if (std.mem.indexOf(u8, l, "❯ ") != null and std.mem.indexOf(u8, l, "fix the bug") != null) has_user_prefix = true;
+        if (std.mem.indexOf(u8, l, "⏺ ") != null and std.mem.indexOf(u8, l, "Looking at it") != null) has_asst_prefix = true;
         if (std.mem.indexOf(u8, l, "Found it") != null) has_found = true;
+        if (std.mem.indexOf(u8, l, "▶ user") != null or std.mem.indexOf(u8, l, "◀ assistant") != null) has_role_header = true;
     }
-    try testing.expect(has_user);
-    try testing.expect(has_asst);
+    try testing.expect(has_user_prefix);
+    try testing.expect(has_asst_prefix);
     try testing.expect(has_found);
+    try testing.expect(!has_role_header); // 关键:无角色头(对齐 cc,渲染等效主区)
+}
+
+test "renderToLines: assistant markdown 渲染(粗体→SGR,非源码)" {
+    const a = testing.allocator;
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.assistant, "this is **bold** text");
+    const lines = try renderToLines(a, &conv);
+    defer freeLines(a, lines);
+    // markdown 渲染后:`**bold**` 字面源码不应出现(应渲成 SGR 加粗);"bold" 文字仍在。
+    var has_literal_stars = false;
+    var has_bold_word = false;
+    for (lines) |l| {
+        if (std.mem.indexOf(u8, l, "**bold**") != null) has_literal_stars = true;
+        if (std.mem.indexOf(u8, l, "bold") != null) has_bold_word = true;
+    }
+    try testing.expect(!has_literal_stars); // 关键:不显源码 `**bold**`(bug#1 根治)
+    try testing.expect(has_bold_word);
 }
 
 test "renderToLines: Edit tool_result 经 renderResult 出 diff 着色" {

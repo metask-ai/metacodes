@@ -18,6 +18,9 @@ const UiState = ui_state.UiState;
 const Event = event.Event;
 const Effect = event.Effect;
 
+/// agent viewing 视口 PageUp/Dn 翻页步长(dispatch 无几何 → 固定行数,render 层按真实 view_rows clamp)。
+const VIEW_PAGE_STEP: usize = 10;
+
 /// render 的只读输入:state + 注入的时间/主题 + 大数据只读借用(测试传空/mock)。
 pub const RenderInputs = struct {
     state: *const UiState,
@@ -250,6 +253,15 @@ fn dispatchKey(state: *UiState, key: input.Key) Effect {
                 .enter => {
                     // 在 viewing 态对当前高亮的 agent 再按 Enter → 切换被查看对象(render 落定新 id)。
                     if (state.agents.sel > 0) state.agents.viewing_committed = false;
+                    return .{ .redraw_region = true };
+                },
+                .page_up => {
+                    // 视口上翻(dispatch 无几何 → 用固定 step,render 层按真实 view_rows clamp)。
+                    state.agents.viewPageUp(VIEW_PAGE_STEP);
+                    return .{ .redraw_region = true };
+                },
+                .page_down => {
+                    state.agents.viewPageDown(VIEW_PAGE_STEP);
                     return .{ .redraw_region = true };
                 },
                 .esc => {

@@ -234,7 +234,55 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                 aj.pushTestEntryFull("Explore", "Summarize mod0.py", 1, 17300, "Read", "{\"file_path\":\"/Users/x/mod0.py\"}", .running) catch {};
                 aj.pushTestEntryFull("Explore", "Summarize mod1.py", 0, 0, "", "", .running) catch {};
                 aj.pushTestEntryFull("Explore", "Summarize mod2.py", 3, 17700, "", "", .done) catch {};
+                // 给首个 agent 填假 output_buf,使 viewing 它时能看到对话视口(离线 tty 测试用)。
+                if (aj.entries.items.len > 0) {
+                    const e0 = aj.entries.items[0];
+                    e0.output_buf.appendSlice(aj.allocator,
+                        \\⏺ 我来分析 mod0.py 的结构。
+                        \\  ⎿ Read: /Users/x/mod0.py
+                        \\⏺ 这是一个数据处理模块,核心是 transform 函数。
+                        \\  ⎿ Grep: def transform
+                        \\⏺ transform 在第 42 行,负责把原始记录归一化。
+                        \\
+                    ) catch {};
+                }
             }
+            continue;
+        }
+        // /agent-churn-test —— 测试专用:**离线确定性复现 bug#2**(生成期 spinner 遗留进 scrollback)。
+        // 真模型才触发的条件 = subagent 树在生成期**动态变行数** + spinner tick + emit 交替。这里用
+        // 临时 RenderRegion 离线驱动:enterGenerating → 循环{tickSpinner + 增 agent(树长高)+ 偶尔
+        // writeGenText emit} → leaveGenerating。无网络/无真模型。若固定区 erase 几何在树长高时失准,
+        // spinner 行会漏擦遗留进 scrollback(tty 测试数最终屏 spinner 行数 >1 = bug)。
+        if (std.mem.eql(u8, trimmed, "/agent-churn-test") and tty) {
+            if (app.agent_jobs) |*aj| {
+                var creg = render_region_mod.RenderRegion.init(allocator, 2, app.theme, tui_term_root.detectFromEnv(1));
+                defer creg.deinit();
+                creg.enterGenerating(app, &msg_queue);
+                var i: usize = 0;
+                while (i < 12) : (i += 1) {
+                    // 每 3 轮加一个 running agent → 进度树行数递增(模拟 subagent 陆续 spawn)。
+                    if (i % 3 == 0 and aj.entries.items.len < 4) {
+                        var nbuf: [32]u8 = undefined;
+                        const desc = std.fmt.bufPrint(&nbuf, "subagent task {d}", .{aj.entries.items.len}) catch "task";
+                        aj.pushTestEntryFull("Explore", desc, @intCast(i), @intCast(i * 100), "Bash", "{\"command\":\"x\"}", .running) catch {};
+                    }
+                    creg.tickSpinner(app); // 重画固定区(spinner + 当前高度的进度树)
+                    // 偶尔 emit 一行进 scrollback(模拟主 agent 产文本/工具卡)。
+                    if (i % 2 == 1) creg.writeGenText("⏺ main agent step\n");
+                }
+                creg.leaveGenerating(app);
+                // 清掉测试 agent(不污染后续)。
+                aj.clearTestEntries();
+            }
+            std.debug.print("\x1b[2m[agent-churn-test] done\x1b[0m\n", .{});
+            continue;
+        }
+        // 供离线 tty 验证 Ctrl+O transcript 渲染等效(markdown 渲染、无 ▶/◀ 角色头、进出无源码残留)。
+        if (std.mem.eql(u8, trimmed, "/md-test")) {
+            app.conversation.appendText(.user, "你是谁") catch {};
+            app.conversation.appendText(.assistant, "我是 **MetaCode**,一个本地 `CLI` 编程助手。\n- 阅读代码\n- 调试 bug") catch {};
+            std.debug.print("\x1b[2m[md-test] 注入 1 user + 1 assistant(含 markdown)\x1b[0m\n", .{});
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/skills")) {
@@ -878,19 +926,14 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
                     continue;
                 },
                 .open_transcript => {
-                    // Ctrl+O → inline 内联 transcript viewer(对齐 cc 2.1.167,DIFF#6/#7)。
-                    // 不再 alt-screen:viewer 原地重绘整个可见视口(绝对光标定位,**不 2J/不 emit \n**,
-                    // 不滚动 → 不毁 scrollback)。退出时 viewer 把对话尾重绘到上方、光标停在"输入框锚定行",
-                    // 此处 redraw 从该行重画输入框 → 框回屏底原位(守 idempotent)。
+                    // Ctrl+O → inline transcript viewer(方案 A:不覆盖 banner)。region.clear() 擦固定区
+                    // + 光标停区顶(=内容结束下一行,banner 在其上方保留)+ 清零 input_cursor_row;
+                    // viewer 从区顶 DECSC 存档往下画 transcript,退出回区顶 + ESC[J 清掉,redraw 从区顶
+                    // 相对重画固定区 → 跟随内容、幂等(不再 box_h 反推贴底,那是 box_top 漂移 bug 根源)。
                     const sz = tui_term_root.getSize(fd);
                     const rows: usize = if (sz) |s| s.rows else 24;
-                    // panel-aware box 高度:fixedRegionHeight = 框区高(prev_rows 扣掉框上方
-                    // agent树/task/paste_hint panel——退出后由 redraw 重画,不属 viewer 锚定的框区)。
-                    // **在 clear 之前**快照(clear 清零)。+1 复现旧常量 5(无 panel 时框区=4)。
-                    const box_region = region.fixedRegionHeight();
-                    const box_h: usize = if (box_region > 0) box_region + 1 else 5;
                     region.clear();
-                    transcript_viewer.runWithThemeBoxH(fd, allocator, &app.conversation, rows, region.theme, box_h) catch {};
+                    transcript_viewer.runWithTheme(fd, allocator, &app.conversation, rows, region.theme) catch {};
                     redraw(&region, &editor, app);
                     continue;
                 },

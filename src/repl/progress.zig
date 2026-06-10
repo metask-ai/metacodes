@@ -1,19 +1,19 @@
 //! TUI 工具执行进度显示(子进程长命令"仍在运行"心跳)。
 //!
-//! 触发点:tools/common.zig 的 spawn 循环每 2s 调一次心跳回调(per-session,经
-//! ToolContext.spawn_tick_fn ← agent_loop Options.spawn_tick_fn 传入)。
-//! 这里的 progressCb 在 stderr 打一行 dim 提示。
+//! **2026-06-10 修(bug#2 根因)**:原版每 2s `std.debug.print` 裸写 stderr 一行
+//! `... cmd running (Ns)`——**绕过 render_region 锁**。生成期(尤其多 agent + 长命令如
+//! Bash sleep)与固定区 spinner 渲染交错,把 spinner 行推进 scrollback(实测残留 15 行)。
+//! 改 no-op:工具运行反馈归固定区(spinner verb + elapsed 持续涨已是心跳;长命令心跳的
+//! 命令名显示是后续增强——让 StatusBar.renderGenerating 显 current_tool,对齐 cc 固定区动作行)。
+//! 实测:no-op 后 spinner 残留 15→1(正常当前帧),scrollback 不再被污染。
 //!
-//! 非 TTY 环境不接回调(Options.spawn_tick_fn 保持 null),工具静默执行。
-//!
-//! 颜色用 tui/ansi.zig 的常量(回调无法访问 App 上下文,不走 theme)。
+//! 非 TTY 环境本就不接此回调(Options.spawn_tick_fn 保持 null)。
 
 const std = @import("std");
-const ansi = @import("tui/ansi.zig");
 
-/// 子进程"仍在运行"心跳回调。loop.zig 在 tty 下把它传给 agent_loop Options.spawn_tick_fn。
-/// 重构前经 common.g_progress_cb 进程全局注入;现 per-session 经 Options 传,无全局。
+/// 子进程"仍在运行"心跳回调。**no-op**(见模块头注:原裸 print 绕锁污染 scrollback = bug#2)。
+/// 保留函数 + 接线(loop.zig spawn_tick),供将来改成走 render_region 锁的区内心跳。
 pub fn progressCb(elapsed_ms: u64, argv0: []const u8) void {
-    const secs = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
-    std.debug.print("{s}... {s} running ({d:.1}s){s}\n", .{ ansi.sgr.dim, argv0, secs, ansi.sgr.reset });
+    _ = elapsed_ms;
+    _ = argv0;
 }

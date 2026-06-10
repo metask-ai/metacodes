@@ -105,18 +105,26 @@ pub const RenderRegion = struct {
         _ = std.c.pthread_mutex_unlock(&self.mutex);
     }
 
-    /// 生成期 overlay(inline transcript viewer)用:持渲染锁,使 agent_loop emit 线程
+    /// 生成期 overlay(inline transcript viewer,方案 A)用:持渲染锁,使 agent_loop emit 线程
     /// 阻塞在锁上、不与 viewer 抢 stdout。enter/exit 必须配对。viewer 自身不请求本锁(无死锁)。
-    /// enter 持锁后擦掉生成期固定区(光标回文本续接点)**并清零区状态**(region_drawn/prev_rows/
-    /// cursor_in_region_row)——viewer 随后用**绝对光标定位**整屏重绘并把光标停在锚定行(对齐 idle 期
-    /// loop.zig 的 `region.clear()` 语义)。exit 不再 eraseRegion(viewer 已整屏重绘 + 光标在锚定行,
-    /// 区状态已清零;再 eraseRegion 会用 viewer 接管前的陈旧 cursor_in_region_row → 擦错行 → 残留),
-    /// 直接 drawGenRegion 从锚定行重画。**幂等根因修复**:不依赖 viewer 接管期间漂移的 prev_rows。
+    /// enter 持锁后 eraseRegion 擦掉生成期固定区(光标回区顶=文本续接点)+ 清零区状态;viewer 从区顶
+    /// DECSC(\x1b7)存档往下画 transcript(不覆盖区顶之上的 banner/历史),退出 DECRC(\x1b8)回区顶 +
+    /// ESC[J 清掉 transcript。exit drawGenRegion 从区顶相对重画固定区 → 跟随内容、幂等。
+    /// (不再依赖 box_h/绝对贴底——那是 box_top 漂移 bug 根源。)
     pub fn enterExclusiveOverlay(self: *RenderRegion) void {
         self.lock();
+        // 半行封口(text_pending_newline 时补 \n):使 eraseRegion 后光标(=viewer DECSC 存档点)在行首,
+        // 否则存档点落半行中,viewer DECRC 回去 + ESC[J 会从半行处清 → 错位。
+        if (self.generating and self.text_pending_newline) {
+            const w = &self.scratch.writer;
+            self.resetScratch();
+            w.writeAll("\n") catch {};
+            self.flush();
+            self.text_pending_newline = false;
+            self.pending_col = 0;
+        }
         if (self.generating and self.region_drawn) self.eraseRegion();
-        // 区状态清零:viewer 整屏接管后,旧区不再在屏上的"已知位置"——exit 必须从干净态重画,
-        // 不能用陈旧 cursor_in_region_row 去 eraseRegion(那是 bug#3 残留的根因)。
+        // 区状态清零:viewer 接管后旧区不再在"已知位置";exit 从干净态(区顶)drawGenRegion 重画。
         self.region_drawn = false;
         self.prev_rows = 0;
         self.cursor_in_region_row = 0;
@@ -256,9 +264,11 @@ pub const RenderRegion = struct {
         var used: u16 = 0;
 
         // ---- Agent viewing(持久查看):view==.viewing 时主区(框上方 panel 位)换被查看 agent 的
-        // transcript + 分隔线,替代进度树/task。下方 drawAgentSwitcher 列表仍画(共存)。
+        // **完整对话历史(output_buf 视口,可 PageUp/Dn 滚)** + 分隔线,替代进度树/task。
+        // 下方 drawAgentSwitcher 列表仍画(共存)。viewing 视口预算独立放宽(不受上面 12 行限制):
+        // 扣死 框(3) + footer(1) + switcher(空行1+main1+agent_count) + 分隔头(1) + 余量后,剩给视口。
         if (self.ui.agents.view == .viewing) {
-            // viewing 时也要回写 agent_count(供 dispatch ↑↓ 钳制)。
+            // viewing 时回写 agent_count(供 dispatch ↑↓ 钳制 + 下面预算计算)。
             if (app.agentJobsPtr()) |reg| {
                 const snaps = reg.snapshotJobs(self.allocator) catch null;
                 if (snaps) |s| {
@@ -266,7 +276,11 @@ pub const RenderRegion = struct {
                     agent_job_registry.AgentJobRegistry.freeSnapshots(self.allocator, s);
                 }
             }
-            used += self.drawAgentViewing(w, app, budget - used);
+            // viewing 视口预算:总行 rows - 框3 - footer1 - switcher(2+agent_count) - 分隔头1 - 余量1。
+            const switcher_rows: u16 = 2 + @as(u16, @intCast(@min(self.ui.agent_count, 200)));
+            const fixed_below: u16 = 3 + 1 + switcher_rows + 1 + 1; // 框+footer+switcher+分隔头+余量
+            const view_budget: u16 = if (self.rows > fixed_below) self.rows - fixed_below else 0;
+            used += self.drawAgentViewing(w, app, view_budget);
             return used;
         }
 
@@ -672,10 +686,10 @@ pub const RenderRegion = struct {
     }
 
     /// Agent viewing 帧(区域2 持久查看):view==.viewing 时画在**输入框上方**(替代 panel 位置)——
-    /// **只画一行右对齐分隔 label** `──── <desc> ──`(对齐真 cc v2.1.169 实拍金标准:viewing 态
-    /// 真 cc 不渲染被查看 agent 的 transcript,只把分隔线 label 变成被查看 agent 的 desc + switcher
-    /// marker 翻 ⏺;主 scrollback 始终是主 agent 对话)。被查看对象由 **viewing_id** 解析(Enter 提交,
-    /// ↑↓ 不动),非 sel。viewing_committed=false 时在此落定 viewing_id(reconcile)。返回画的行数。
+    /// 一行右对齐分隔 label `──── <desc> ──` + **被查看 subagent 的完整对话历史视口**(output_buf,
+    /// 可 PageUp/Dn 滚)。对齐真 cc v2.1.169/170 实拍金标准:viewing 主区整体换成被查看 subagent
+    /// 的对话(prompt + 助手文本 + 工具行)。被查看对象由 viewing_id 解析(Enter 提交,↑↓ 不动)。
+    /// viewing_committed=false 时落定 viewing_id;view_top_at_bottom/越界由本函数 clamp。返回画的行数。
     fn drawAgentViewing(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App, budget: u16) u16 {
         if (self.ui.agents.view != .viewing) return 0;
         if (budget == 0) return 0;
@@ -689,20 +703,22 @@ pub const RenderRegion = struct {
         if (!self.ui.agents.viewing_committed and sel > 0 and sel - 1 < snaps.len) {
             self.ui.agents.commitViewingId(snaps[sel - 1].id);
         }
-        // 按已落定的 viewing_id 找被查看 agent 的 desc(非 sel —— ↑↓ 移光标不切被查看对象)。
+        // 按已落定的 viewing_id 找被查看 agent 的 desc + id(非 sel —— ↑↓ 移光标不切被查看对象)。
         const vid = self.ui.agents.viewingIdSlice();
         if (vid.len == 0) return 0;
         var desc: []const u8 = "";
+        var found = false;
         for (snaps) |s| {
             if (std.mem.eql(u8, s.id, vid)) {
                 desc = s.desc;
+                found = true;
                 break;
             }
         }
-        if (desc.len == 0) return 0; // 被查看 agent 已消失(完成/停止)→ 不画 label
+        if (!found) return 0; // 被查看 agent 已消失(完成/停止移除)→ 不画
 
         const cols: usize = if (self.ui.cols > 4) self.ui.cols else 80;
-        // 分隔线头:`──────── <desc> ──`(右对齐 desc)。
+        // ── 分隔线头:`──────── <desc> ──`(右对齐 desc)。
         w.writeAll(ansi.clear.line) catch {};
         w.writeAll(th.dim) catch {};
         {
@@ -714,7 +730,32 @@ pub const RenderRegion = struct {
         }
         w.writeAll(th.reset) catch {};
         w.writeAll("\r\n") catch {};
-        return 1;
+        var rows: u16 = 1;
+
+        // ── output_buf 对话视口(budget-1 行,分隔头占 1 行)。
+        const view_rows: u16 = if (budget > 1) budget - 1 else 0;
+        if (view_rows == 0) return rows;
+
+        const out = (reg.copyOutputBuf(vid, self.allocator) catch null) orelse {
+            // 无 output_buf(刚起未产出)→ 占位一行。
+            w.writeAll(ansi.clear.line) catch {};
+            w.print("  {s}(no output yet){s}", .{ th.dim, th.reset }) catch {};
+            w.writeAll("\r\n") catch {};
+            return rows + 1;
+        };
+        defer self.allocator.free(out);
+
+        // view_top clamp:max_top = max(0, total_lines - view_rows)。at_bottom 落定到 max_top。
+        const total = countOutputLines(out);
+        const max_top: usize = if (total > view_rows) total - view_rows else 0;
+        if (self.ui.agents.view_top_at_bottom) {
+            self.ui.agents.view_top = max_top;
+            self.ui.agents.view_top_at_bottom = false;
+        } else if (self.ui.agents.view_top > max_top) {
+            self.ui.agents.view_top = max_top; // PageDn 越界自愈
+        }
+        rows += drawOutputWindow(w, out, self.ui.agents.view_top, view_rows, cols, th);
+        return rows;
     }
 
     /// Agent switcher 列表(区域2,footer 下方)。对齐 cc v2.1.168 实拍:
@@ -1123,14 +1164,6 @@ pub const RenderRegion = struct {
         if (was_drawn) {
             if (self.gen_app) |a| self.drawGenRegion(a);
         }
-    }
-
-    /// 框区高(Ctrl+O box_h 用):= prev_rows(完整固定区:框上方 panel + 框 + 下方 switcher,
-    /// 它们退出后整体由 redraw 重画,viewer 须为整个区留位)。持锁读(gen 期 watcher 线程会改)。
-    pub fn fixedRegionHeight(self: *RenderRegion) usize {
-        self.lock();
-        defer self.unlock();
-        return self.prev_rows;
     }
 
     /// 助手文本段开始(stream_begin):重置 markdown 流式状态 + 标记段首(下一行用 ⏺ 前缀)。
@@ -1773,6 +1806,51 @@ fn displayWidth(s: []const u8) usize {
     return term.displayWidth(s);
 }
 
+/// 数 output_buf 的行数(\n 分隔;末行无 \n 也计 1)。空 buf = 0 行。
+/// agent viewing 视口滚动几何用(max_top = max(0, total - view_rows))。
+fn countOutputLines(buf: []const u8) usize {
+    if (buf.len == 0) return 0;
+    var n: usize = 0;
+    var pos: usize = 0;
+    while (pos < buf.len) {
+        const eol = std.mem.indexOfScalarPos(u8, buf, pos, '\n') orelse {
+            n += 1; // 末行无 \n
+            break;
+        };
+        n += 1;
+        pos = eol + 1;
+        if (pos == buf.len) break; // 末尾恰好 \n,不算额外空行
+    }
+    return n;
+}
+
+/// 画 output_buf 的窗口 [top, top+view_rows):每行前 ESC[2K + 截断到 cols + \r\n。
+/// 返回实际画的行数(≤ view_rows;buf 行不够则少画)。agent viewing 主区视口用。
+/// 纯渲染(无 self),便于单测。dim 包裹(subagent 对话区视觉弱化,对齐 cc viewing)。
+fn drawOutputWindow(w: *std.Io.Writer, buf: []const u8, top: usize, view_rows: u16, cols: usize, th: Theme) u16 {
+    if (view_rows == 0) return 0;
+    const max_w: usize = if (cols > 2) cols - 1 else 40;
+    var line_idx: usize = 0;
+    var pos: usize = 0;
+    var drawn: u16 = 0;
+    while (pos <= buf.len and drawn < view_rows) {
+        const eol = std.mem.indexOfScalarPos(u8, buf, pos, '\n') orelse buf.len;
+        if (line_idx >= top) {
+            w.writeAll(ansi.clear.line) catch {};
+            w.writeAll(th.dim) catch {};
+            writeTruncatedWidth(w, buf[pos..eol], max_w);
+            w.writeAll(th.reset) catch {};
+            w.writeAll("\r\n") catch {};
+            drawn += 1;
+        }
+        line_idx += 1;
+        if (eol >= buf.len) break;
+        pos = eol + 1;
+    }
+    return drawn;
+}
+
+
 /// TaskTab 文本选择(纯函数,可单测):首个 in_progress 任务的 active_form(无则 subject)。
 /// 无 in_progress → null。
 pub fn taskTabLabel(tasks: *const @import("../../core/task_store.zig").TaskStore) ?[]const u8 {
@@ -1886,6 +1964,33 @@ test "nextCharBytes UTF-8 宽度" {
     try std.testing.expectEqual(@as(usize, 1), nextCharBytes("a", 0));
     try std.testing.expectEqual(@as(usize, 3), nextCharBytes("中", 0)); // 中文 3 字节
     try std.testing.expectEqual(@as(usize, 1), nextCharBytes("", 0)); // 越界保底
+}
+
+test "countOutputLines:空/单行/多行/末尾换行" {
+    try std.testing.expectEqual(@as(usize, 0), countOutputLines(""));
+    try std.testing.expectEqual(@as(usize, 1), countOutputLines("abc")); // 无 \n
+    try std.testing.expectEqual(@as(usize, 2), countOutputLines("a\nb"));
+    try std.testing.expectEqual(@as(usize, 2), countOutputLines("a\nb\n")); // 末尾 \n 不算空行
+    try std.testing.expectEqual(@as(usize, 3), countOutputLines("a\nb\nc"));
+}
+
+test "drawOutputWindow:窗口切片 + 截断 + 行数" {
+    const a = std.testing.allocator;
+    const buf = "line0\nline1\nline2\nline3";
+    // top=1, view_rows=2 → 画 line1, line2。
+    var aw: std.Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    const n = drawOutputWindow(&aw.writer, buf, 1, 2, 80, theme_mod.dark);
+    try std.testing.expectEqual(@as(u16, 2), n);
+    const out = aw.written();
+    try std.testing.expect(std.mem.indexOf(u8, out, "line1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "line2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "line0") == null); // top 之上不画
+    try std.testing.expect(std.mem.indexOf(u8, out, "line3") == null); // 超 view_rows 不画
+    // 行不够:top=3,view_rows=5 → 只剩 line3 一行。
+    var aw2: std.Io.Writer.Allocating = .init(a);
+    defer aw2.deinit();
+    try std.testing.expectEqual(@as(u16, 1), drawOutputWindow(&aw2.writer, buf, 3, 5, 80, theme_mod.dark));
 }
 
 test "layoutInput:逻辑行 \\n 切分" {

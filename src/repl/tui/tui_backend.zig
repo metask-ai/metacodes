@@ -475,21 +475,16 @@ pub const TuiBackend = struct {
                 return;
             },
             .open_transcript => {
-                // 生成期 Ctrl+O → alt-screen 全屏 transcript viewer。enterExclusiveOverlay 持渲染锁
-                // (emit 线程阻塞在锁上不抢 stdout)+ 擦生成期固定区;viewer 进/出 alt-screen(主屏
-                // 被冻结保存、退出自动恢复);exitExclusiveOverlay 锁内重画固定区 + 释放锁。
+                // 生成期 Ctrl+O → inline transcript viewer(方案 A:不覆盖 banner)。enterExclusiveOverlay
+                // 持渲染锁(emit 线程阻塞不抢 stdout)+ eraseRegion 擦生成期固定区(光标停区顶);viewer
+                // 从区顶 DECSC 往下画 transcript,退出回区顶清掉;exitExclusiveOverlay 锁内 drawGenRegion
+                // 从区顶相对重画固定区 + 释放锁 → 跟随内容、幂等(不再 box_h 反推贴底)。
                 const a = self.input_alloc orelse return;
                 const sz = term.getSize(self.input_fd);
                 const rows: usize = if (sz) |s| s.rows else 24;
                 const th = if (self.theme) |t| t.* else theme_mod.dark;
-                // panel-aware box 高度:gen 期 region.prev_rows = drawGenRegion 的完整区高(含 panel)。
-                // 持渲染锁读(watcher 线程会改);快照在 enterExclusiveOverlay 前。+1 复现旧常量 5。
-                const box_h: usize = blk: {
-                    const pr = self.region.fixedRegionHeight();
-                    break :blk if (pr > 0) pr + 1 else 5;
-                };
                 self.region.enterExclusiveOverlay();
-                transcript_viewer.runWithThemeBoxH(self.input_fd, a, &app.conversation, rows, th, box_h) catch {};
+                transcript_viewer.runWithTheme(self.input_fd, a, &app.conversation, rows, th) catch {};
                 self.region.exitExclusiveOverlay(app);
                 return;
             },

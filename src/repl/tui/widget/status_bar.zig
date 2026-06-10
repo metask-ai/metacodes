@@ -55,9 +55,9 @@ pub const StatusBar = struct {
         return 1;
     }
 
-    /// generating 形态:写一行 spinner,返回 1。对齐 cc 2.1.167(SpinnerAnimationRow.tsx):
-    /// **30s 门控**——前 30 秒只显 `{char} {verb}…`(无计时/token);≥30s 才显
-    /// `{char} {verb}… ({Ns} · ↓ {N} tokens)`(token>0 才含 token 段)。cc `SHOW_TOKENS_AFTER_MS=30_000`。
+    /// generating 形态:写一行 spinner,返回 1。对齐 napicc v2.1.170(2026-06-10 实测纠正):
+    /// **2s 门控**——前 2 秒只显 `{char} {verb}…`(无计时/token);≥2s 才显
+    /// `{char} {verb}… ({Ns} · ↓ {N} tokens)`(token>0 才含 token 段)。旧"30s 门控"认知被实拍推翻。
     /// `esc to interrupt` 在 footer(drawFooter 生成期),非此行。
     /// 留 current_tool/tool_ms 形参不读(调用方签名稳定,工具进度走下方 per-toolUse 卡)。
     /// max_w = 最大显示宽(= inner_w);超宽按显示宽截断(跳过 ANSI SGR 不计宽)。
@@ -78,8 +78,7 @@ pub const StatusBar = struct {
         const fr = verbs.frame(frame_idx, use_unicode);
 
         var line_buf: [256]u8 = undefined;
-        // 30s 门控(对齐 cc SpinnerAnimationRow.tsx:19 SHOW_TOKENS_AFTER_MS):
-        // 未到阈值 → 极简 `{char} {verb}…`,无计时无 token。
+        // 计时/token 门控(2s,对齐 napicc v2.1.170 实拍):未到阈值 → 极简 `{char} {verb}…`。
         if (elapsed_ms < SHOW_TOKENS_AFTER_MS) {
             const line = std.fmt.bufPrint(&line_buf, "{s}{s} {s}{s}…{s}", .{
                 theme.accent, fr, theme.reset, verb, theme.reset,
@@ -111,8 +110,11 @@ pub const StatusBar = struct {
         return 1;
     }
 
-    /// cc spinner 显示计时+token 的最小生成耗时(SpinnerAnimationRow.tsx:19)。
-    const SHOW_TOKENS_AFTER_MS: u64 = 30_000;
+    /// cc spinner 显示计时+token 的最小生成耗时。
+    /// **2026-06-10 实测纠正(napicc v2.1.170 金标准)**:真 cc 2-3s 就显 `(Ns · ↓Nk tokens)`,
+    /// 非旧认知的 30s 门控(SHOW_TOKENS_AFTER_MS=30000,可能 cc 旧版/源码推测有误)。降到 2s 对齐实拍。
+    /// golden=tmp/tty_golden/napicc_gen_single_step.raw(样本 (2s·thinking)/(3s·↓40 tokens))。
+    const SHOW_TOKENS_AFTER_MS: u64 = 2_000;
 
 
     /// 把含 SGR 的字符串按可见显示宽 max_w 截断后写出。ANSI 转义(\x1b[...m 等)不计宽且原样保留;
