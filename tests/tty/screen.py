@@ -78,6 +78,9 @@ class Screen:
         self.col = 0
         self.cursor_visible = True
         self.scrolled = 0
+        # DECSC/DECRC 存档的光标位置(ESC 7 / ESC 8)。
+        self._saved_row = 0
+        self._saved_col = 0
         # 当前 SGR 状态 → border_class
         self.cur_class = "plain"
         # ANSI 解析状态
@@ -153,7 +156,16 @@ class Screen:
             if j < n:
                 return j + 1 - i
             return None
-        # ESC 后单字节(如 ESC 7 / ESC 8 存光标)——吞 2 字节
+        # ESC 7 = DECSC 存光标;ESC 8 = DECRC 复光标(transcript viewer inline 锚区顶用)。
+        if c1 == ord("7"):
+            self._saved_row = self.row
+            self._saved_col = self.col
+            return 2
+        if c1 == ord("8"):
+            self.row = self._saved_row
+            self.col = self._saved_col
+            return 2
+        # ESC 后其它单字节 —— 吞 2 字节
         return 2
 
     def _handle_csi(self, data: bytes, i: int):
@@ -236,11 +248,25 @@ class Screen:
             elif mode == 1:
                 for c in range(0, self.col + 1):
                     self.grid[self.row][c].clear()
-        elif f == "J":  # 清屏
+        elif f == "J":  # 清屏:0=光标到屏底,1=屏顶到光标,2=全屏
             if mode_is_full(n1):
                 for rowcells in self.grid:
                     for cell in rowcells:
                         cell.clear()
+            elif n1 == 0:
+                # 光标到屏幕末:当前行光标后 + 下方所有行(transcript viewer inline 退出 \x1b[J 用)。
+                for c in range(self.col, self.cols):
+                    self.grid[self.row][c].clear()
+                for r in range(self.row + 1, self.rows):
+                    for cell in self.grid[r]:
+                        cell.clear()
+            elif n1 == 1:
+                # 屏顶到光标。
+                for r in range(0, self.row):
+                    for cell in self.grid[r]:
+                        cell.clear()
+                for c in range(0, self.col + 1):
+                    self.grid[self.row][c].clear()
         elif f == "m":  # SGR → border_class
             self._apply_sgr(ps)
 

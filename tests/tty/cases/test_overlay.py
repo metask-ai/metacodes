@@ -121,6 +121,28 @@ def test_ctrl_o_enters_inline_transcript(bin_path):
     assert b"Showing detailed transcript" in raw, "应渲染 cc 风格 transcript footer"
 
 
+def _screen_full(raw, rows=20, cols=90):
+    a = TTYAssert(raw, rows=rows, cols=cols)
+    return "\n".join(a.final.line_text(r) for r in range(a.final.rows))
+
+
+def test_ctrl_o_markdown_render_equivalent(bin_path):
+    # bug#1+#2 根治:对话含 markdown,Ctrl+O viewer 渲染等效主区(markdown 渲染、无 ▶/◀ 角色头),
+    # 退出后主区不变源码、无残留。/md-test 注入 1 user + 1 assistant(含 **粗体**/`代码`/列表)。
+    base = ["sleep:0.8", "type:/md-test", "key:enter", "sleep:0.4"]
+    # viewer 内:markdown 渲染(无源码 `**`)+ cc 风格前缀(❯/⏺,无 ▶ user/◀ assistant)。
+    inside = _screen_full(run(bin_path, base + ["key:ctrl_o", "sleep:0.5"], term_size=(20, 90)), rows=20)
+    assert "⏺ 我是 MetaCode" in inside, f"viewer 未用 ⏺ 前缀渲染 assistant:\n{inside}"
+    assert "❯ 你是谁" in inside, f"viewer 未用 ❯ 前缀渲染 user:\n{inside}"
+    assert "**MetaCode**" not in inside, f"viewer 显示 markdown 源码 `**`(bug#1):\n{inside}"
+    assert "▶ user" not in inside and "◀ assistant" not in inside, f"viewer 残留 ▶/◀ 角色头(bug#2):\n{inside}"
+    assert "• 阅读代码" in inside, f"viewer 未渲染列表(- → •):\n{inside}"
+    # 退出后:主区无源码 `**`、无 ▶/◀ 残留(进出渲染等效)。
+    after = _screen_full(run(bin_path, base + ["key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"], term_size=(20, 90)), rows=20)
+    assert "**MetaCode**" not in after, f"退出后主区变 markdown 源码(bug#1):\n{after}"
+    assert "▶ user" not in after and "◀ assistant" not in after, f"退出后 ▶/◀ 残留(bug#2):\n{after}"
+
+
 def test_ctrl_o_toggle_close(bin_path):
     # Ctrl+O 开 inline → 再 Ctrl+O 关(viewer 认 0x0f 退出)→ 恢复输入框。
     raw = run(bin_path, ["sleep:0.8", "key:ctrl_o", "sleep:0.4", "key:ctrl_o", "sleep:0.4"], per_key_drain=0.1)
@@ -205,6 +227,34 @@ def test_ctrl_o_idempotent_with_agent_panel(bin_path):
     assert len(border_lines) == 2, f"框边框行数异常(应 2,实 {len(border_lines)}),疑残留:\n" + full
 
 
+def test_ctrl_o_agent_panel_box_top_idempotent(bin_path):
+    # 回归(2026-06-10 真 bug,用户实测):有 agent panel 时 Ctrl+O 开+关后 box_top **数值**必须幂等。
+    # 旧 bug:viewer 退出绝对定位贴屏底(box_top=rows-5),但基线固定区跟随内容(不贴底)→ 两种锚定
+    # 不一致 → 整体下移~panel高度,banner 滚出。修(方案A):viewer DECSC 锚区顶、不覆盖 banner,退出
+    # 回区顶相对重画 → 跟随内容、幂等。覆盖多终端高度(漂移量=rows-20,高终端漂得多,必须都幂等)。
+    # (旧 test_ctrl_o_idempotent_with_agent_panel 只验框存在/树保留/边框计数,漏了 box_top 数值漂移。)
+    def box_top(rows):
+        raw = run(bin_path, ["sleep:0.8", "type:/agent-test-multi", "key:enter", "sleep:0.4"],
+                  term_size=(rows, 90), per_key_drain=0.05, startup_drain=0.8)
+        return TTYAssert(raw, rows=rows, cols=90).box_top_row()
+
+    def box_top_after_toggle(rows):
+        raw = run(bin_path, ["sleep:0.8", "type:/agent-test-multi", "key:enter", "sleep:0.4",
+                             "key:ctrl_o", "sleep:0.5", "key:ctrl_o", "sleep:0.5"],
+                  term_size=(rows, 90), per_key_drain=0.05, startup_drain=0.8)
+        return TTYAssert(raw, rows=rows, cols=90).box_top_row(), raw
+
+    for rows in (20, 24, 30, 40):
+        b0 = box_top(rows)
+        b2, raw = box_top_after_toggle(rows)
+        assert b0 is not None and b2 is not None, f"rows={rows} box_top 定位失败"
+        assert b0 == b2, f"rows={rows}: agent panel Ctrl+O 开关后 box_top 漂移 {b0}→{b2}(应幂等,跟随内容不贴底)"
+        # banner + agent 树退出后保留(viewer 不覆盖 banner)。
+        import re as _re
+        txt = _re.sub(rb"\x1b\[[0-9;?>]*[A-Za-z]", b"", raw).decode("utf-8", "replace")
+        assert "Running 2 Explore agents" in txt, f"rows={rows}: Ctrl+O 后 agent 进度树丢失"
+
+
 def test_ctrl_o_tall_history_inline(bin_path):
     # 长历史 + 小终端:Ctrl+O 进 inline transcript,退出恢复输入框,无 alt-screen。
     msgs = []
@@ -217,3 +267,18 @@ def test_ctrl_o_tall_history_inline(bin_path):
     assert b"\x1b[?1049h" not in raw, "inline 不应进 alt-screen"
     assert "Showing detailed transcript" not in text, "退出后残留 transcript footer:\n" + text
     a.assert_box_present()
+
+
+def test_gen_region_agent_churn_no_spinner_residue(bin_path):
+    # 回归(2026-06-10):生成期固定区在 agent 进度树**行数动态变化**(subagent 陆续 spawn)时,
+    # erase/draw 几何不能漏擦 → spinner 行不得遗留进 scrollback。/agent-churn-test 离线驱动:
+    # enterGenerating → 循环 tickSpinner + 增 agent(树长高) + emit,leaveGenerating。
+    # (单线程几何不变式守护;真模型多线程时序的 spinner 遗留是另一类并发 bug,见 KG,offline tty 复现不了。)
+    import re
+    raw = run(bin_path, ["sleep:0.8", "type:/agent-churn-test", "key:enter", "sleep:1.2"],
+              term_size=(30, 100), per_key_drain=0.05, startup_drain=0.8)
+    a = TTYAssert(raw, rows=30, cols=100)
+    lines = [a.final.line_text(r) for r in range(30)]
+    spin = [l for l in lines if re.search(r"[✸✻✦✶✺✷✽·] \w+…", l)]
+    # 最终屏最多 1 个 spinner(完成态/收尾),不得有多行遗留快照。
+    assert len(spin) <= 1, f"生成期 agent 树变化致 spinner 遗留 scrollback({len(spin)} 行):\n" + "\n".join(lines)
