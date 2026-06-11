@@ -330,23 +330,36 @@ fn extractStringArray(
         while (p < data.len and (data[p] == ' ' or data[p] == '\t' or data[p] == ',')) : (p += 1) {}
         if (p >= data.len) break;
         if (data[p] == ']') break;
-        if (data[p] != '"') return error.MalformedArray;
-        p += 1;
-        const start = p;
-        // 读到下一个非转义 "
-        while (p < data.len) : (p += 1) {
-            if (data[p] == '\\') {
-                p += 1;
-                continue;
+        if (data[p] == '"') {
+            // 带引号字符串元素:读到下一个非转义 "。
+            p += 1;
+            const start = p;
+            while (p < data.len) : (p += 1) {
+                if (data[p] == '\\') {
+                    p += 1;
+                    continue;
+                }
+                if (data[p] == '"') break;
             }
-            if (data[p] == '"') break;
+            if (p >= data.len) return error.MalformedArray;
+            // unescape:把 \n \" \\ \uXXXX 转回来(与文本字段处理一致)
+            const s = try util_json.unescapeString(data[start..p], allocator);
+            errdefer allocator.free(s);
+            try list.append(allocator, s);
+            p += 1;
+        } else {
+            // 裸元素(数字 id 等):模型常把 id 数组发成 `"addBlocks":[1,2]` 而非 `["1","2"]`
+            // (同 taskId 裸数字 bug,见 extractStringOrNumberField)。取到 ,/]/空白前的 token。
+            const start = p;
+            while (p < data.len) : (p += 1) {
+                const c = data[p];
+                if (c == ',' or c == ']' or c == ' ' or c == '\t' or c == '\n' or c == '\r') break;
+            }
+            if (p == start) return error.MalformedArray;
+            const s = try allocator.dupe(u8, data[start..p]);
+            errdefer allocator.free(s);
+            try list.append(allocator, s);
         }
-        if (p >= data.len) return error.MalformedArray;
-        // unescape：把 \n \" \\ \uXXXX 转回来（与文本字段处理一致）
-        const s = try util_json.unescapeString(data[start..p], allocator);
-        errdefer allocator.free(s);
-        try list.append(allocator, s);
-        p += 1;
     }
 
     return try list.toOwnedSlice(allocator);
@@ -481,6 +494,34 @@ test "TaskUpdate status + field + blocks" {
     try testing.expectEqualStrings("me", store.get("1").?.owner.?);
     try testing.expect(store.get("1").?.blocks.items.len == 1);
     try testing.expectEqualStrings("2", store.get("1").?.blocks.items[0]);
+}
+
+test "TaskUpdate addBlocks: 裸数字数组元素容错(模型发 addBlocks:[2] 非 [\"2\"])" {
+    // 同 taskId 裸数字 bug:id 数组里模型也常发裸数字。旧版 extractStringArray 撞非引号元素
+    // → MalformedArray → addBlocks 整个失败。修:裸元素也取 token。
+    var store = task_store.TaskStore.init(testing.allocator);
+    defer store.deinit();
+    const ctx = testCtx(&store);
+    testing.allocator.free(try executeCreate(&ctx, "{\"subject\":\"A\",\"description\":\"Da\"}"));
+    testing.allocator.free(try executeCreate(&ctx, "{\"subject\":\"B\",\"description\":\"Db\"}"));
+    testing.allocator.free(try executeCreate(&ctx, "{\"subject\":\"C\",\"description\":\"Dc\"}"));
+
+    // 裸数字 taskId + 裸数字数组元素(模型真实形态)。
+    const r = try executeUpdate(&ctx, "{\"taskId\":1,\"addBlocks\":[2,3]}");
+    defer testing.allocator.free(r);
+    try testing.expect(store.get("1").?.blocks.items.len == 2);
+    try testing.expectEqualStrings("2", store.get("1").?.blocks.items[0]);
+    try testing.expectEqualStrings("3", store.get("1").?.blocks.items[1]);
+}
+
+test "TaskStop: 裸数字 taskId 容错" {
+    var store = task_store.TaskStore.init(testing.allocator);
+    defer store.deinit();
+    const ctx = testCtx(&store);
+    testing.allocator.free(try executeCreate(&ctx, "{\"subject\":\"A\",\"description\":\"Da\"}"));
+    const r = try executeStop(&ctx, "{\"taskId\":1}"); // 裸数字
+    defer testing.allocator.free(r);
+    try testing.expect(store.get("1").?.status == .completed);
 }
 
 test "TaskUpdate delete removes task" {
