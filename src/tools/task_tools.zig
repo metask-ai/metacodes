@@ -23,9 +23,10 @@ fn requireStore(ctx: *const ToolContext) !*task_store.TaskStore {
 // ------------------ 参数抽取 helpers ------------------
 // JSON 入参，工具 args 已由 client.zig 累积成完整 UTF-8。这里只做"找字段"，不做 strict schema。
 //
-// 两类 helper：
+// 三类 helper：
 //   extractString / extractStringOrError —— 返回 raw slice，借 args 底层内存，
-//     仅用于 ID / enum 等"保证无转义"的字段（taskId、status）。
+//     仅用于 enum 等"保证带引号且无转义"的字段（status）。
+//   extractIdOrError —— id 类字段（taskId），容忍裸数字（模型常发 "taskId":1 非 "1"）。
 //   extractUnescaped / extractUnescapedOrError —— 返回 owned bytes，已 JSON-unescape，
 //     用于模型可能塞 \n \" 的文本字段（subject、description、activeForm、owner）。
 //     调用方负责 free。
@@ -47,6 +48,13 @@ fn extractString(args: []const u8, field: []const u8) !?[]const u8 {
 
 fn extractStringOrError(args: []const u8, field: []const u8) ![]const u8 {
     return util_json.extractStringField(args, field) orelse return missingFieldError(field);
+}
+
+/// 取 id 类字段(taskId),**容忍裸数字**:模型常把数字 id 发成 `"taskId":1` 而非 `"1"`
+/// (实测:TaskCreate 返 id="1" 后模型调 TaskUpdate 发 `"taskId":1` → 旧版误报 MissingTaskId)。
+/// id 永不含 JSON 转义(序列号/slug),故借 raw slice 即可,无需 unescape。
+fn extractIdOrError(args: []const u8, field: []const u8) ![]const u8 {
+    return util_json.extractStringOrNumberField(args, field) orelse return missingFieldError(field);
 }
 
 fn extractUnescaped(allocator: std.mem.Allocator, args: []const u8, field: []const u8) !?[]u8 {
@@ -148,7 +156,7 @@ pub fn executeCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
 pub fn executeGet(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const store = try requireStore(ctx);
-    const id = try extractStringOrError(args, "taskId");
+    const id = try extractIdOrError(args, "taskId");
     const t = store.get(id) orelse return error.TaskNotFound;
 
     var out: std.ArrayList(u8) = .empty;
@@ -182,7 +190,7 @@ pub fn executeList(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
 pub fn executeUpdate(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const store = try requireStore(ctx);
-    const id = try extractStringOrError(args, "taskId");
+    const id = try extractIdOrError(args, "taskId");
 
     if (try extractString(args, "status")) |status_str| {
         const st = TaskStatus.fromString(status_str) orelse return error.InvalidStatus;
@@ -277,7 +285,7 @@ pub fn executeStop(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
 
     const store = try requireStore(ctx);
-    const id = try extractStringOrError(args, "taskId");
+    const id = try extractIdOrError(args, "taskId");
     try store.updateStatus(id, .completed);
     return try ctx.allocator.dupe(u8, "{\"ok\":true,\"status\":\"completed\"}");
 }
@@ -425,6 +433,37 @@ test "TaskGet non-existent errors" {
     defer store.deinit();
     const ctx = testCtx(&store);
     try testing.expectError(error.TaskNotFound, executeGet(&ctx, "{\"taskId\":\"99\"}"));
+}
+
+test "TaskUpdate: 裸数字 taskId 容错(真 bug:模型发 \"taskId\":1 非 \"1\" → 旧版误报 MissingTaskId)" {
+    // 实测真 tty:TaskCreate 返 id="1" 后,模型调 TaskUpdate 发 {"status":"completed","taskId":1}
+    // (数字,非字符串)。旧版 extractStringField 只认带引号值 → null → MissingTaskId。
+    // 修:taskId 走 extractStringOrNumberField,裸数字 1 取成 "1",命中 store。
+    var store = task_store.TaskStore.init(testing.allocator);
+    defer store.deinit();
+    const ctx = testCtx(&store);
+    const c = try executeCreate(&ctx, "{\"subject\":\"X\",\"description\":\"D\"}");
+    testing.allocator.free(c);
+
+    // 裸数字 taskId(模型真实发送形态)→ 应成功更新,不再 MissingTaskId。
+    const u = try executeUpdate(&ctx, "{\"status\":\"completed\",\"taskId\":1}");
+    defer testing.allocator.free(u);
+    try testing.expect(std.mem.indexOf(u8, u, "\"ok\":true") != null);
+    // 验证确实命中 id="1" 的任务(状态真改成 completed)。
+    const g = try executeGet(&ctx, "{\"taskId\":1}"); // Get 也容忍裸数字
+    defer testing.allocator.free(g);
+    try testing.expect(std.mem.indexOf(u8, g, "\"status\":\"completed\"") != null);
+}
+
+test "TaskGet: 裸数字 taskId 容错" {
+    var store = task_store.TaskStore.init(testing.allocator);
+    defer store.deinit();
+    const ctx = testCtx(&store);
+    const c = try executeCreate(&ctx, "{\"subject\":\"X\",\"description\":\"D\"}");
+    testing.allocator.free(c);
+    const g = try executeGet(&ctx, "{\"taskId\":1}"); // 裸数字
+    defer testing.allocator.free(g);
+    try testing.expect(std.mem.indexOf(u8, g, "\"subject\":\"X\"") != null);
 }
 
 test "TaskUpdate status + field + blocks" {

@@ -170,6 +170,45 @@ pub fn extractStringField(data: []const u8, field: []const u8) ?[]const u8 {
     return data[start..end];
 }
 
+/// 提取顶层字段为**字符串或数字**(返回 raw slice,借 data 内存)。缺失返回 null。
+/// `extractStringField` 只认带引号的字符串值;但模型常把"看起来是数字的 id"发成裸数字
+/// (实测:TaskCreate 返 id="1" 后,模型调 TaskUpdate 发 `"taskId":1` 而非 `"1"` → 旧版
+/// 当作缺字段报 MissingTaskId)。本函数对 id 类字段容错:带引号走字符串(可含转义),裸值
+/// 取到下一个 `,`/`}`/空白前的 token(数字/true/false/null 的字面量),供数字 id 用。
+/// 注意:字符串分支返回**已去引号但仍含转义**的内层(同 extractStringField),裸值分支返回原样
+/// 字面量;调用方按需 unescape。
+pub fn extractStringOrNumberField(data: []const u8, field: []const u8) ?[]const u8 {
+    var pattern_buf: [256]u8 = undefined;
+    std.debug.assert(field.len < 200);
+    pattern_buf[0] = '"';
+    @memcpy(pattern_buf[1..][0..field.len], field);
+    pattern_buf[1 + field.len] = '"';
+    pattern_buf[2 + field.len] = ':';
+    const pattern = pattern_buf[0 .. 3 + field.len];
+
+    const idx = std.mem.indexOf(u8, data, pattern) orelse return null;
+    var start = idx + pattern.len;
+    while (start < data.len and (data[start] == ' ' or data[start] == '\t' or data[start] == '\n' or data[start] == '\r')) : (start += 1) {}
+    if (start >= data.len) return null;
+    if (data[start] == '"') {
+        // 字符串值:沿用 extractStringField 的内层提取(处理转义引号)。
+        start += 1;
+        var end = start;
+        while (end < data.len) : (end += 1) {
+            if (data[end] == '"' and data[end - 1] != '\\') break;
+        }
+        return data[start..end];
+    }
+    // 裸值(数字 / true / false / null):取到分隔符前的 token。
+    var end = start;
+    while (end < data.len) : (end += 1) {
+        const c = data[end];
+        if (c == ',' or c == '}' or c == ']' or c == ' ' or c == '\t' or c == '\n' or c == '\r') break;
+    }
+    if (end == start) return null;
+    return data[start..end];
+}
+
 /// 提取顶层布尔字段 `"field":true|false`(值不带引号)。缺失或非法返回 null。
 pub fn extractBoolField(data: []const u8, field: []const u8) ?bool {
     var pattern_buf: [256]u8 = undefined;
@@ -243,6 +282,23 @@ test "extractStringField tolerates whitespace after colon" {
     try std.testing.expectEqualStrings("v", extractStringField(nl, "k").?);
     // 非字符串值(数字)→ null(本函数只取 string)
     try std.testing.expect(extractStringField("{\"k\": 5}", "k") == null);
+}
+
+test "extractStringOrNumberField: string 与裸数字都取" {
+    // 字符串值:同 extractStringField。
+    try std.testing.expectEqualStrings("abc", extractStringOrNumberField("{\"id\":\"abc\"}", "id").?);
+    // 裸数字(真 bug:模型发 "taskId":1)→ 取成 "1"。
+    try std.testing.expectEqualStrings("1", extractStringOrNumberField("{\"taskId\":1}", "taskId").?);
+    // 数字在中间(后跟 ,)。
+    try std.testing.expectEqualStrings("42", extractStringOrNumberField("{\"taskId\":42,\"x\":1}", "taskId").?);
+    // 冒号后空白 + 数字。
+    try std.testing.expectEqualStrings("7", extractStringOrNumberField("{\"taskId\": 7 }", "taskId").?);
+    // 字符串在中间(后跟 ,)。
+    try std.testing.expectEqualStrings("整理核心架构", extractStringOrNumberField("{\"taskId\":\"整理核心架构\",\"s\":1}", "taskId").?);
+    // 缺字段 → null。
+    try std.testing.expect(extractStringOrNumberField("{\"a\":1}", "taskId") == null);
+    // 数字 id 是末字段(后跟 })。
+    try std.testing.expectEqualStrings("3", extractStringOrNumberField("{\"status\":\"completed\",\"taskId\":3}", "taskId").?);
 }
 
 test "unescapeString preserves plain text" {
