@@ -131,6 +131,77 @@ def test_e2e_taskcreate(bin_path):
     )
 
 
+def test_e2e_task_update_numeric_id(bin_path):
+    """真模型 e2e:创建任务列表 → "完成所有任务" → TaskUpdate 真返 {"ok":true},**无 MissingTaskId**。
+
+    堵的盲区(2026-06-11):此前 tty 层**从无**"真模型调 TaskUpdate"的路径——只测了 TaskCreate
+    (test_e2e_taskcreate)与后台 subagent(test_e2e_task_subagent,另一套)。而真 bug 只在 update
+    路径触发:TaskCreate 返 id="1"(字符串)后,模型把 taskId 发成**裸数字** `1`(非 "1"),旧版
+    extractStringField 只认带引号值 → 误报 MissingTaskId。离线单测又清一色用 "taskId":"1"(测试
+    作者按 schema 理想形态写),两层都绕开了"模型真实发裸数字"。本 e2e 走完整 create→update 流程,
+    让模型自然发出 taskId(无论数字还是字符串),钉死 update 路径不再 MissingTaskId。
+
+    **断言走 transcript 权威层**(对齐本仓"断言权威工件非屏幕态"):看 TaskUpdate 的 tool_result——
+    任一条含 MissingTaskId = regression;至少一条 {"ok":true} = update 路径真通。
+    """
+    if SKIP:
+        return
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from e2e_helpers import RETRIES, fresh_home, read_tool_uses, read_tool_results_with_error  # noqa: E402
+    from tty_driver import run as _run  # noqa: E402
+    import json as _json
+    import shutil as _shutil
+
+    last_diag = None
+    homes = []
+    for _ in range(RETRIES):
+        home = fresh_home()
+        homes.append(home)
+        # 一轮内:建 3 任务的列表 → 提交 → 让模型"完成所有任务"(自然驱动 TaskUpdate)。
+        _run(bin_path,
+             ["sleep:0.8",
+              "type:用 TaskCreate 创建三个任务:整理核心架构、整理账号调度、整理协议转换,每个都给 description。",
+              "key:enter", "sleep:30",
+              "type:好,把所有任务都标记为 completed", "key:enter", "sleep:28"],
+             base_url=None, env={"HOME": home}, per_key_drain=0.04, startup_drain=1.2)
+
+        uses = read_tool_uses(home)
+        # 必须真有 TaskCreate + TaskUpdate 被调用(否则模型漂移,重试)。
+        created = [u for u in uses if u["name"] == "TaskCreate"]
+        updates = [u for u in uses if u["name"] == "TaskUpdate"]
+        if not created or not updates:
+            last_diag = "模型未走 create→update 路径(TaskCreate=%d, TaskUpdate=%d)" % (len(created), len(updates))
+            continue
+
+        # transcript 权威层:扫所有 tool_result,看 TaskUpdate 的结果。
+        results = read_tool_results_with_error(home)
+        missing_taskid = [c for (c, _e) in results if "MissingTaskId" in c]
+        ok_updates = [c for (c, _e) in results if '"ok":true' in c]
+        if missing_taskid:
+            # 真 regression:TaskUpdate 报 MissingTaskId。带上模型真实发送的 taskId 形态便于诊断。
+            taskid_shapes = [
+                (u["input"] or "") for u in updates
+            ]
+            last_diag = ("TaskUpdate 报 MissingTaskId(regression)。模型发送的 TaskUpdate input:%r\n"
+                         "  MissingTaskId 结果:%r\n  HOME(保留):%s"
+                         % (taskid_shapes, missing_taskid[:3], home))
+            break  # 确定性 bug,不靠重试洗白
+        if ok_updates:
+            for h in homes:
+                _shutil.rmtree(h, ignore_errors=True)
+            return  # 绿:TaskUpdate 真返 {"ok":true},update 路径通,无 MissingTaskId。
+        last_diag = "TaskUpdate 被调但无 {\"ok\":true} 也无 MissingTaskId(结果:%r)" % (
+            [c[:80] for (c, _e) in results][-3:])
+
+    for h in homes[:-1]:
+        _shutil.rmtree(h, ignore_errors=True)
+    if last_diag and "MissingTaskId" in last_diag:
+        raise AssertionError("Bug#numeric-taskId regression:" + last_diag)
+    from e2e_helpers import SkipTest  # noqa: E402
+    raise SkipTest("模型 %d 次未稳定走 create→update 路径:%s" % (RETRIES, last_diag))
+
+
 def test_e2e_task_subagent(bin_path):
     if SKIP:
         return
