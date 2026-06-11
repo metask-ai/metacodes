@@ -216,6 +216,16 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             app.tasks.updateStatus(t.id, .in_progress) catch {};
             continue;
         }
+        // /task-test-done[:label] —— 测试专用:造一个 completed 任务,离线驱动完成态图标(✓)渲染。
+        if (std.mem.eql(u8, trimmed, "/task-test-done") or std.mem.startsWith(u8, trimmed, "/task-test-done:")) {
+            const label = if (trimmed.len > 16) trimmed[16..] else "test task done";
+            const t = app.tasks.create(label, "test", label) catch {
+                std.debug.print("[task-test-done] create failed\n", .{});
+                continue;
+            };
+            app.tasks.updateStatus(t.id, .completed) catch {};
+            continue;
+        }
         // /agent-test[:desc] —— 测试专用:注册一个假 running subagent(无线程/无网络),
         // 离线驱动 agent 进度树渲染。
         if (std.mem.eql(u8, trimmed, "/agent-test") or std.mem.startsWith(u8, trimmed, "/agent-test:")) {
@@ -2102,7 +2112,7 @@ fn printTaskList(app: *app_mod.App) void {
             const icon = switch (t.status) {
                 .pending => "\x1b[90m○\x1b[0m", // 灰圈
                 .in_progress => "\x1b[33m◐\x1b[0m", // 黄半
-                .completed => "\x1b[32m●\x1b[0m", // 绿实
+                .completed => "\x1b[32m✓\x1b[0m", // 绿勾:完成
                 .deleted => unreachable,
             };
             std.debug.print("  {s} {s}\n", .{ icon, t.subject });

@@ -1,4 +1,4 @@
-"""T25-T27:Task 清单 —— 输入框上方显示任务(B3 多行面板:◼/◻/● + TTL)。
+"""T25-T27:Task 清单 —— 输入框上方显示任务(B3 多行面板:◼/◻/✓ + TTL)。
 
 离线驱动:用测试专用本地命令 /task-test[:label] 造一个 in_progress 任务
 (loop.zig),无需打模型即可让清单渲染。验证 ◼ <label> 行出现在输入框上方,
@@ -31,14 +31,29 @@ def test_T26_tasktab_keeps_box_at_bottom(bin_path):
 
 
 def test_T27_no_tasktab_when_no_task(bin_path):
-    # 无任务时不画清单(区不含 ◼/◻/●),回归确认默认行为不变。
+    # 无任务时不画清单(区不含 ◼/◻/✓),回归确认默认行为不变。
     raw = run(bin_path, ["sleep:0.8"])
     a = TTYAssert(raw)
     a.assert_box_present()
     full = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
-    for icon in ("◼", "◻", "●"):
+    for icon in ("◼", "◻", "✓"):
         if icon in full:
             a._fail(f"无任务时不应出现任务清单图标 {icon}")
+
+
+def test_T28_completed_task_shows_checkmark(bin_path):
+    # 回归(用户实测 bug):completed 任务图标应是**勾 ✓**,不是实心圆 ●。
+    # /task-test-done 离线造一个 completed 任务,断言清单行含 ✓ 且**不含** ●。
+    raw = run(bin_path, ["sleep:0.8", "type:/task-test-done:answered q1", "key:enter", "sleep:0.4"])
+    a = TTYAssert(raw)
+    a.assert_box_present()
+    full = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
+    if "answered q1" not in full:
+        a._fail(f"completed 任务未渲染(缺 label):\n{full}")
+    if "✓" not in full:
+        a._fail(f"completed 任务图标应为勾 ✓,实际清单:\n{full}")
+    if "●" in full:
+        a._fail(f"completed 任务不应再用实心圆 ●(应改勾 ✓):\n{full}")
 
 
 def test_T28_agent_tree_appears_above_box(bin_path):

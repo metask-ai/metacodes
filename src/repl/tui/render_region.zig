@@ -328,7 +328,7 @@ pub const RenderRegion = struct {
         return n;
     }
 
-    /// Task 清单(◼ in_progress / ◻ pending / ● completed,completed 过 TTL 不显)。
+    /// Task 清单(◼ in_progress / ◻ pending / ✓ completed,completed 过 TTL 不显)。
     /// 超预算折叠为 `… +N more`。返回行数。
     fn drawTaskList(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App, max_lines: u16) u16 {
         if (max_lines == 0) return 0;
@@ -368,7 +368,7 @@ pub const RenderRegion = struct {
             const icon: []const u8 = switch (t.status) {
                 .in_progress => if (self.use_unicode) "◼" else "[*]",
                 .pending => if (self.use_unicode) "◻" else "[ ]",
-                .completed => if (self.use_unicode) "●" else "[x]",
+                .completed => if (self.use_unicode) "✓" else "[x]", // 勾:完成(对齐用户预期/真 cc todo done)
                 .deleted => "",
             };
             const color: []const u8 = switch (t.status) {
