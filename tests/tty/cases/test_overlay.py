@@ -176,14 +176,14 @@ def test_question_in_nonempty_buffer_is_literal(bin_path):
     assert "foo?" in text, text
 
 
-def test_ctrl_o_bottom_anchored_idempotent(bin_path):
-    # 回归(2026-06-06 真 bug):框**贴屏底 + 历史多**时,两次 Ctrl+O(开+关)后框位置
+def test_ctrl_o_box_top_idempotent(bin_path):
+    # 回归(2026-06-06 真 bug,2026-06-11 方案A 修正):历史多时两次 Ctrl+O(开+关)后框位置
     # 必须与按之前一致(box_top 不跳)。早期嵌入式 overlay bug:进入 transcript 从区顶向下画
-    # ~19 行,框贴屏底时滚动 ~15 行把 scrollback 永久滚走 → 退出后框跳屏顶(box_top 19→4)。
-    # inline 内联(对齐 cc):用绝对光标定位重绘视口、绝不 emit \n 滚动,故 scrollback 不被毁,
-    # 框位置幂等。这是 inline 实现必须守住的正确性不变式。
-    import re
-
+    # ~19 行,滚动把 scrollback 永久滚走 → 退出后框跳屏顶。后续又一个 bug:viewer 退出贴屏底
+    # (box_top=rows-5)而基线固定区跟随内容(不贴底)→ 不一致 → 漂移。
+    # inline 方案A(对齐 napicc v2.1.170 金标准):DECSC 锚区顶、不覆盖 banner、绝不 emit \n 滚动,
+    # 退出回区顶相对重画 → **跟随内容(不贴底)**、box_top 幂等。这是 inline 实现的正确性不变式。
+    # 注意:金标准框跟随内容,故**不再**前置断言"框贴屏底"(box0 >= 14)——那恰是被否定的旧行为。
     def box_only(events):
         a = TTYAssert(run(bin_path, ["sleep:0.8"] + events, term_size=(24, 80),
                           per_key_drain=0.04, startup_drain=0.8), rows=24, cols=80)
@@ -196,11 +196,10 @@ def test_ctrl_o_bottom_anchored_idempotent(bin_path):
     box0 = box_only(msgs)
     box2 = box_only(msgs + ["key:ctrl_o", "sleep:0.6", "key:ctrl_o", "sleep:0.6"])
 
-    # 前置:框确实被推到屏底(否则测不出 bug)。
-    assert box0 is not None and box0 >= 14, \
-        f"T0 框应被历史推到屏底(box_top={box0}),否则测不出跳屏顶 bug"
-    # 核心幂等:两次 Ctrl+O 后框回原位(无跳屏顶、无滚走历史)。
-    assert box0 == box2, f"两次 Ctrl+O 后框漂移(box_top {box0}→{box2}):inline 滚动毁了 scrollback"
+    # 核心幂等:两次 Ctrl+O 后框回原位(无跳屏顶、无滚走历史、无贴底漂移)。
+    assert box0 is not None and box2 is not None, \
+        f"box_top 定位失败(box0={box0}, box2={box2})"
+    assert box0 == box2, f"两次 Ctrl+O 后框漂移(box_top {box0}→{box2}):inline 几何失准"
 
 
 def test_ctrl_o_idempotent_with_agent_panel(bin_path):

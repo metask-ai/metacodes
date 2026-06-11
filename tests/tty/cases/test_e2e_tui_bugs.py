@@ -90,42 +90,51 @@ def test_e2e_bug3_bash_nonzero_exit_icon(bin_path):
 
 
 def test_e2e_bug4_auto_background_neutral_icon(bin_path):
-    """#4:Bash 超 15s 自动转后台,头部不应是 ✓,且不应裸吐 auto_backgrounded JSON。
+    """#4:Bash 超 15s 自动转后台,committed 卡须显 `▶ moved to background job …`,
+    不裸吐 auto_backgrounded JSON,头部不显 ✓。
 
-    根因:formatAutoBackgrounded 返回正常 JSON(无 status、无 exit_code)→ is_error=false → ✓;
+    根因(原始):formatAutoBackgrounded 返回正常 JSON(无 status/exit_code)→ is_error=false → ✓;
     renderBashResult 的 job_id 分支要求 status!=null 不命中 → 落 renderGenericFold 裸吐 JSON。
-    修复:job_id 分支认 auto_backgrounded → "▶ ...background";headerIcon 中性。
+    第二根因(2026-06-11 本轮抓到):类A Bash 的 committed scrollback 卡走 **renderLiveDone**(非
+    renderResult),而 renderLiveDone 丢 content、只显 ⏺标题 + ⎿输入预览 → auto-bg 转后台**无任何
+    痕迹**。修:renderLiveDone 经 bgJobLine 共用渲染 → committed 卡显 ▶ 转后台提示。
+
+    **断言走权威层 + scrollback prose,不查最终视口**:auto-bg 后模型常持续 BashOutput 轮询,把那张
+    卡挤出可见视口——查最终屏幕会误判成"未触发"而 skip(旧 bug,实测踩坑)。改为:
+      ① 触发判据 = transcript 里出现 auto_backgrounded 结果(权威,与视口无关);
+      ② 渲染判据 = scrollback prose(整条字节流的 committed 部分,卡滚走仍在)含 ▶ 转后台提示行,
+         且 prose 不裸吐 auto_backgrounded JSON。
     """
     if SKIP:
         return
-    triggered = False  # auto-background 被测渲染路径是否真触发(Bash 完成卡 + 转后台现象都齐)
+    from e2e_helpers import read_tool_results  # 权威层:transcript tool_result content
+    triggered = False  # auto-background 真触发(transcript 出现 auto_backgrounded 结果)
     for _ in range(RETRIES):
+        # wait 给足:模型起步 + sleep 20 + auto-bg(15s)+ 转后台卡 commit。短窗口会截断在卡渲染前。
         raw, home, uses = run_e2e_tool(
             bin_path,
             "Run this shell command for me right now with the Bash tool: sleep 20",
-            "Bash", required_keys=["command"], wait_s=20,
+            "Bash", required_keys=["command"], wait_s=36,
         )
         if not tool_called(uses, "Bash", ["command"]):
-            continue  # 没调 Bash → 漂移
-        text = _prose_text(raw)
-        hdr = _card_header_line(text, "Bash")
-        # 被测路径"真触发"的严格判据:必须同时满足
-        #   ① Bash 完成卡头部抓到了(hdr 非空,带状态符)——否则是渲染快照不全的漂移;
-        #   ② 该 Bash 命令自己转了后台(它的 ⎿ 体出现 auto_backgrounded/moved to background)。
-        # 注意:不能只查全局 "background job"——BashOutput 轮询结果也渲染 "▶ background job",
-        # 会把"Bash 卡没抓全但 BashOutput 出现了"的漂移误判成 regression(2026-06-04 实测踩坑)。
-        hit_autobg = ('"auto_backgrounded"' in text) or ("moved to background job" in text)
-        if hdr is None or not hit_autobg:
-            continue  # Bash 完成卡没抓到 / 没转后台 → 漂移,重试
+            continue  # 没调 Bash → 漂移,重试
+        # ① 权威层触发判据:该次 run 的 transcript 里出现 auto_backgrounded 结果。
+        results = read_tool_results(home)
+        if not any('"auto_backgrounded":true' in r for r in results):
+            continue  # 命令没到 15s / 没转后台 → 漂移,重试
         triggered = True
-        ok_icon = "✓" not in hdr                          # 头部非 ✓(中性 ⏺ 或 ✗)
+        # ② 渲染层判据:scrollback prose(committed 字节,卡滚走仍在)。
+        text = _prose_text(raw)
         ok_marker = "▶ moved to background job" in text    # 修复输出的转后台提示行
-        ok_nojson = '"auto_backgrounded"' not in text      # 未裸吐 JSON
-        if ok_icon and ok_marker and ok_nojson:
+        ok_nojson = '"auto_backgrounded"' not in text      # committed 卡未裸吐 JSON
+        hdr = _card_header_line(text, "Bash")              # Bash 完成卡头部(中性 ⏺,无 ✓)
+        ok_icon = hdr is None or "✓" not in hdr
+        if ok_marker and ok_nojson and ok_icon:
             return
     if not triggered:
-        raise SkipTest("模型 %d 次重试均未触发 auto-background(未调 Bash / 命令未到 15s / 卡未抓全)" % RETRIES)
-    raise AssertionError("Bug#4 regression:auto-background 仍显示 ✓ / 裸吐 JSON / 缺 ▶ 后台提示")
+        raise SkipTest("模型 %d 次重试均未触发 auto-background(未调 Bash / 命令未到 15s)" % RETRIES)
+    raise AssertionError("Bug#4 regression:auto-background committed 卡缺 ▶ 转后台提示 / 裸吐 JSON / 头部显 ✓")
+
 
 
 # #6 用的 prompt:启动后台 Explore subagent,做多个工具调用(数 .zig + 读一个),TaskOutput 轮询。

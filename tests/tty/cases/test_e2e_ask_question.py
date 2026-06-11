@@ -203,33 +203,37 @@ def test_e2e_ask_chat_about_free_response(bin_path):
     shutil.rmtree(home, ignore_errors=True)
 
 
-def test_e2e_ask_too_many_questions(bin_path):
-    """超限(> MAX_QUESTIONS=9)→ 工具层 TooManyQuestions,不漏进 dialog 变 InputAborted。
+def test_e2e_ask_max_questions_boundary(bin_path):
+    """边界:恰好 9 问(= MAX_QUESTIONS 上限)是**合法**请求 → 正常进多问 wizard 对话框,
+    **不**被误当超限拒绝(TooManyQuestions),不崩。
 
-    **此 e2e 已退化为弱验证(2026-06-09)**:核心不变量由离线确定性单测守
-    (src/tools/ask_user.zig:235 `>9 问 → TooManyQuestions`、:260 `0 问 → TooManyQuestions`)——
-    那是确定的、可靠的。真模型 e2e **测不准**此路径:模型几乎总把问题数压到 ≤9(合法区,
-    用户放宽 MAX_QUESTIONS=9 自 cc 的 4),≤9 问合法 → 进 dialog 等输入 → e2e 不喂答案 → 超时
-    InputAborted(**正常**,非 bug)。故本 e2e 只做"软存在性"检查:若模型恰好传了 >9 问触发工具层
-    拦截,则验 TooManyQuestions;否则 skip(模型未触发超限路径,非 bug)。多问 dialog 正常路径由
-    test_e2e_ask_multi_question_nav 覆盖。
+    为什么改测 9(满额)而非 >9(超限):超限路径真模型 e2e 测不准(模型几乎总把问题数压到
+    合法区 / 走 Task / 把工具调用当文本打印 → 恒 skip,零信号);且超限不变量已由离线确定性
+    单测守(ask_user.zig:235 `>9→TooManyQuestions`、:260 `0→TooManyQuestions`、:268 `恰好 9 通过`)。
+    满额边界(9 问)是更有价值且能真触发的正向路径:验证"恰好到上限的合法请求不被错拒"。
+    多问导航/切换由 test_e2e_ask_multi_question_nav 覆盖,此处只钉满额合法 + 无超限误报 + 无崩。
     """
     if SKIP:
         return
-    days = "/".join("D%d-%s" % (d, m) for d in range(1, 5) for m in ("早", "午", "晚"))  # 12 个
-    prompt = ('用 AskUserQuestion 工具,一次调用传 12 个独立问题(%s),每问选项米饭/面条/拌汤。'
-              '必须一次调用传全部 12 个问题,不要拆成多次调用,不要压缩,不要用 Task。' % days)
+    days = "; ".join('Q%d header "D%d" "Pick meal %d?" options Rice/Noodles' % (i, i, i)
+                     for i in range(1, 10))  # 9 个单选问题
+    prompt = ('Use the AskUserQuestion tool NOW with these NINE single-select questions in ONE call: '
+              '%s. Call immediately, do not use Bash or Task, do not write files.' % days)
     home = fresh_home()
     keys = ["sleep:1.0", "type:" + prompt, "key:enter", "sleep:%d" % WAIT]
     raw = run(bin_path, keys, base_url=None, env={"HOME": home},
               permission="bypassPermissions", per_key_drain=0.06, startup_drain=1.2)
     _no_crash(raw, home)
     blob = _all_tool_results(home)
-    # 只有当工具层真触发了 TooManyQuestions(模型传 >9)才算命中被测路径并验证;
-    # 其余一切(模型压到 ≤9 合法 → InputAborted 超时 / 走 Task / 漂移)→ skip(非 bug)。
-    if "TooManyQuestions" in blob:
+    text = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", raw.decode("utf-8", "replace"))
+    # 9 问是合法上限:**绝不**触发 TooManyQuestions(否则=边界把合法满额请求错拒,真 regression)。
+    assert "TooManyQuestions" not in blob, ("9 问(满额合法)被错当超限拒绝(TooManyQuestions);"
+                                            "边界 off-by-one regression。HOME: %s" % home)
+    # 软存在性:模型若真发了多问 AskUserQuestion,屏幕应出现 wizard 导航条(Submit + chip)。
+    # 否则(漂移/超时/把工具调用当文本打印)→ skip,不变量由离线单测守。
+    if "Submit" not in text or ("☐" not in text and "[ ]" not in text):
         shutil.rmtree(home, ignore_errors=True)
-        return  # 命中超限拦截:工具层清晰报错,绿。
+        raise SkipTest("模型未调多问 AskUserQuestion(漂移/超时);满额合法性由离线单测守。HOME: %s" % home)
     shutil.rmtree(home, ignore_errors=True)
-    raise SkipTest("模型未传 >9 问触发超限(压到 ≤9 合法/走 Task/漂移);核心不变量由离线单测守")
+
 

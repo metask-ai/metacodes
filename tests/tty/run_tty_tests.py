@@ -4,11 +4,16 @@
 每个 case 函数签名:def test_xxx(bin_path) -> None,失败 raise AssertError(含屏幕 diff)。
 退出码:0 全过;1 有失败;2 环境错误(无二进制 / 非 macOS-Linux)。
 
+**实时输出**:每条测试开始前先打 `▶ <name> …`、结束后打结果 + 耗时,每行都 flush。
+被管道/重定向到文件时(非 tty)Python 默认块缓冲会把输出攒到进程退出——本 runner 强制
+每条 flush(见 _emit),故 `tail -f` 日志能逐条看到进度,不会"卡到最后才出全部结果"。
+
 用法:
   python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug [-k 过滤] [-v]
 """
 import os
 import sys
+import time
 import importlib.util
 import traceback
 
@@ -21,6 +26,12 @@ try:
 except Exception:  # noqa: BLE001
     class SkipTest(Exception):  # fallback:e2e_helpers 不可用时仍可跑非 e2e 用例
         pass
+
+
+def _emit(line, *, newline=True):
+    """打印一行并**立即 flush**(被重定向到文件时也实时可见,不被块缓冲攒住)。"""
+    sys.stdout.write(line + ("\n" if newline else ""))
+    sys.stdout.flush()
 
 
 def load_cases():
@@ -72,33 +83,44 @@ def main():
     passed = 0
     failed = []
     skipped = []
-    print(f"=== TTY 测试:{len(cases)} 个用例,bin={bin_path} ===\n")
-    for name, fn in cases:
+    total = len(cases)
+    _emit(f"=== TTY 测试:{total} 个用例,bin={bin_path} ===\n")
+    suite_t0 = time.monotonic()
+    for idx, (name, fn) in enumerate(cases, 1):
+        # 先打"开始"行(无换行,带 carriage-return 风格的进度前缀),立即 flush
+        # → 即使该测试要跑 40s,日志也立刻显示"正在跑哪条",不会黑屏到结束。
+        _emit(f"[{idx}/{total}] ▶ {name} … ", newline=False)
+        t0 = time.monotonic()
         try:
             fn(bin_path)
-            print(f"  ✓ {name}")
+            dt = time.monotonic() - t0
+            _emit(f"✓ ({dt:.1f}s)")
             passed += 1
         except SkipTest as e:
+            dt = time.monotonic() - t0
             # 真模型漂移:被测路径未触发(模型没调目标工具)→ 跳过,非失败。
-            print(f"  ⊘ {name}  (skip: {e})")
+            _emit(f"⊘ skip ({dt:.1f}s): {e}")
             skipped.append(name)
         except AssertError as e:
-            print(f"  ✗ {name}")
-            print("    " + str(e).replace("\n", "\n    "))
+            dt = time.monotonic() - t0
+            _emit(f"✗ FAIL ({dt:.1f}s)")
+            _emit("    " + str(e).replace("\n", "\n    "))
             failed.append(name)
         except Exception as e:  # noqa: BLE001
-            print(f"  ✗ {name}  (运行异常)")
+            dt = time.monotonic() - t0
+            _emit(f"✗ FAIL ({dt:.1f}s) (运行异常)")
             # 用 format_exc()(无参,全版本兼容);format_exception(e) 单参形态仅 3.10+,
             # 在 3.9 会自身抛 TypeError 把整个 runner 带崩。
-            print("    " + traceback.format_exc().replace("\n", "\n    "))
+            _emit("    " + traceback.format_exc().replace("\n", "\n    "))
             failed.append(name)
 
+    suite_dt = time.monotonic() - suite_t0
     skip_note = f" / {len(skipped)} skipped" if skipped else ""
-    print(f"\n=== 结果:{passed} passed / {len(failed)} failed{skip_note} ===")
+    _emit(f"\n=== 结果:{passed} passed / {len(failed)} failed{skip_note}  ({suite_dt:.0f}s) ===")
     if skipped:
-        print("跳过(模型漂移):", ", ".join(skipped))
+        _emit("跳过(模型漂移):" + ", ".join(skipped))
     if failed:
-        print("失败:", ", ".join(failed))
+        _emit("失败:" + ", ".join(failed))
         return 1
     return 0
 

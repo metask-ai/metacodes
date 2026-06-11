@@ -164,9 +164,16 @@ def test_e2e_task_subagent(bin_path):
             sr = done.get("stop_reason")
             ft = done.get("final_text", "") or ""
             turns = done.get("turns", 0)
+            stripped = ft.strip()
+            # "实质内容"判据:非空 + 不是纯 ANSI 残渣。**不卡长度下限**——任务是"数 .zig 文件",
+            # 正确答案天然简短(如 "**36**" 6 字符),旧 `len>=20` 会把正确但简洁的回答误判为失败
+            # (2026-06-11 实测:subagent 答 **36** 正确却被拒)。真正要排除的是空回答/纯开场白/崩溃,
+            # 故改判:非空 + 含字母或数字(数文件类任务必含数字)+ 无 ANSI。
+            has_alnum = any(c.isalnum() for c in stripped)
             ok = (sr != "tool_loop"
                   and turns >= 2
-                  and len(ft.strip()) >= 20
+                  and len(stripped) >= 1
+                  and has_alnum
                   and "\x1b" not in ft
                   and "\\u001b" not in ft)
             if ok:
@@ -175,7 +182,7 @@ def test_e2e_task_subagent(bin_path):
                 return
     # 全部 attempt 失败 → 判负,带诊断
     diag = ("subagent 出口断言未通过(%d attempts)。最后一次 done=%r\n"
-            "  期望: stop_reason!=tool_loop, turns>=2, final_text 实质且无 ANSI\n"
+            "  期望: stop_reason!=tool_loop, turns>=2, final_text 非空且含字母数字且无 ANSI\n"
             "  HOME(保留): %s") % (RETRIES, last_done, homes[-1] if homes else "?")
     for h in homes[:-1]:
         _shutil.rmtree(h, ignore_errors=True)

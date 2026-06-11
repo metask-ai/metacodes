@@ -100,26 +100,52 @@ def test_T20_enter_enqueues_clears_box(bin_path):
 
 
 def test_T21_multiple_queued_autosubmit(bin_path):
-    # 生成期入队 2 条 → 一轮结束后**一次性合并提交**(对齐 cc 同模式批量)→ 两条都进 scrollback,
-    # 且只产生一个新的提交块(BATCHB 作为 BATCHA 的续行,而非各自独立一轮)。
+    # 生成期入队 2 条 → 一轮结束后**一次性合并提交**(对齐 cc 同模式批量,loop.zig popAllJoined("\n\n"))
+    # → 合并成一条 user 消息(BATCHA\n\nBATCHB),而非各自独立一轮。
     if SKIP:
         return
-    raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
-                         "sleep:0.6", "type:BATCHA", "key:enter",
-                         "sleep:0.4", "type:BATCHB", "key:enter", "sleep:10"],
-              per_key_drain=0.05, base_url=None)
-    a = TTYAssert(raw)
-    a.assert_prose_contains("BATCHA")
-    a.assert_prose_contains("BATCHB")
-    # 合并提交:除首轮长查询外,队列只回显一个 ❯ 块(BATCHA 行 + BATCHB 续行),不是两个独立轮。
-    import re
-    from asserts import split_frames
-    prose = re.sub(rb"\x1b\[[0-9;?>]*[A-Za-z]", b"",
-                   b"".join(c for k, c in split_frames(raw) if k == "prose")).decode("utf-8", "replace")
-    echoes = [l for l in prose.split("\n") if l.strip().startswith("❯")]
-    # 首查询 1 个 ❯ + 合并批次 1 个 ❯(BATCHA);BATCHB 是续行不带 ❯ → 总共 2 个 ❯ 行。
-    if len([e for e in echoes if "BATCH" in e]) != 1:
-        a._fail(f"队列多条应合并为一次提交(一个 ❯ 块),实际 ❯ 行:{echoes}")
+    import glob
+    import json
+    import shutil
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from e2e_helpers import fresh_home  # noqa: E402
+
+    # 时序要点(2026-06-11 修正):两条排队消息必须在**同一次**生成窗口内入队,否则首轮结束时
+    # popAllJoined 只捞到 BATCHA、BATCHB 落入下一轮 → 不合并。故首查询够长(数到 50 + 慢慢来)+
+    # 两条快速连入(0.5s/0.3s)+ 尾部 sleep 给足。旧版"数到 60 + sleep 10"耗在计数上 → 确定性失败。
+    #
+    # **断言走 transcript 权威层**(关键稳定性修复):合并结果是一条 user 消息 `BATCHA\n\nBATCHB`,
+    # 这在 transcript 里确定记录,与屏幕回显时序无关。旧版查 scrollback prose 的 ❯ 回显——模型答题
+    # 速度波动时回显可能没落到捕获窗口内 → flaky。transcript 是 popAllJoined 合并的权威证据。
+    home = fresh_home()
+    run(bin_path, ["sleep:0.8", "type:请从 1 数到 50,每个数字单独占一行,慢慢来", "key:enter",
+                   "sleep:0.5", "type:BATCHA", "key:enter",
+                   "sleep:0.3", "type:BATCHB", "key:enter", "sleep:22"],
+        per_key_drain=0.05, base_url=None, env={"HOME": home})
+
+    # 扫 transcript 的 user 消息,找含 BATCH 的文本块。
+    user_batch_msgs = []
+    for path in glob.glob(os.path.join(home, ".cc-zig", "projects", "*", "*", "transcript.jsonl")):
+        for line in open(path, encoding="utf-8", errors="replace"):
+            try:
+                m = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if m.get("role") != "user":
+                continue
+            for b in m.get("blocks", []):
+                if b.get("type") == "text" and "BATCH" in (b.get("text") or ""):
+                    user_batch_msgs.append(b["text"])
+    shutil.rmtree(home, ignore_errors=True)
+
+    # 核心断言:BATCHA 与 BATCHB **合并进同一条 user 消息**(popAllJoined "\n\n"),
+    # 而非两条独立 user 消息。即:恰有 1 条含 BATCH 的 user 消息,且同时含 BATCHA + BATCHB。
+    assert len(user_batch_msgs) == 1, (
+        "队列多条应合并为一条 user 消息,实际含 BATCH 的 user 消息 %d 条:%r"
+        % (len(user_batch_msgs), user_batch_msgs))
+    merged = user_batch_msgs[0]
+    assert "BATCHA" in merged and "BATCHB" in merged, (
+        "合并消息应含 BATCHA + BATCHB,实际:%r" % merged)
 
 
 def test_T22_esc_interrupts(bin_path):

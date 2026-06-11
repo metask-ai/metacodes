@@ -390,6 +390,18 @@ pub fn renderLiveDone(
     try out.appendSlice(alloc, title);
     try out.append(alloc, '\n');
 
+    // 行2:⎿ 预览。
+    // **后台 Bash 例外**:auto-bg(超 15s)/explicit bg(run_in_background)的 committed 卡
+    // 必须显 `▶ moved to background job …` / `▶ background job …`——否则用户看不出命令转了后台
+    // (committed 卡是历史里唯一留痕,动态卡已移除)。其余 Bash/类A 仍只显输入预览(对齐 cc 2.1.165)。
+    if (bgJobLine(alloc, tool_name, content)) |bg| {
+        if (bg) |line| {
+            defer alloc.free(line);
+            try appendLine(alloc, &out, th.dim, line, th.reset);
+            return try out.toOwnedSlice(alloc);
+        }
+    } else |_| {}
+
     // 行2:⎿ 只显输入预览($ cmd / 📄 path / pattern: "…")。与运行中态第二行一致。
     // 长命令按宽度软折行 + 5 列悬挂缩进(对齐 cc:续行不回第 0 列,见 appendGutterWrapped)。
     const preview = try toolPreview(alloc, tool_name, input);
@@ -399,6 +411,21 @@ pub fn renderLiveDone(
     }
 
     return try out.toOwnedSlice(alloc);
+}
+
+/// 后台 Bash 结果 → 提示行文本(owned;caller free)。非后台结果返 null。
+/// 两类:auto-bg(`{"auto_backgrounded":true,"job_id":..}`)/ explicit bg(`{"job_id":..,"status":..}`)。
+/// renderBashResult(transcript/类B 路径)与 renderLiveDone(类A committed 路径)共用,避免漂移。
+fn bgJobLine(alloc: std.mem.Allocator, tool_name: []const u8, content: []const u8) !?[]u8 {
+    if (!std.mem.eql(u8, tool_name, "Bash")) return null;
+    const jid = extractField(content, "job_id") orelse return null;
+    const is_started = extractField(content, "status") != null;
+    const is_auto = std.mem.indexOf(u8, content, "\"auto_backgrounded\":true") != null;
+    if (!is_started and !is_auto) return null;
+    return if (is_auto)
+        try std.fmt.allocPrint(alloc, "▶ moved to background job {s} (exceeded 15s)", .{jid})
+    else
+        try std.fmt.allocPrint(alloc, "▶ background job {s}", .{jid});
 }
 
 fn appendWithGutter(alloc: std.mem.Allocator, th: Theme, body: []const u8, out: *std.ArrayList(u8)) !void {
@@ -639,21 +666,11 @@ fn appendLine(alloc: std.mem.Allocator, out: *std.ArrayList(u8), color: []const 
 /// Bash 结果:从结果 JSON 提取 stdout/stderr/exit_code,**unescape 后**显示真实多行输出,
 /// 而非裸 JSON。对齐 cc BashToolResultMessage(渲染 stdout 文本本身,不含 JSON 包装)。
 fn renderBashResult(alloc: std.mem.Allocator, th: Theme, output_text: []const u8, out: *std.ArrayList(u8), opts: RenderOpts) !void {
-    // 后台 Bash → 一行提示,不展开裸 JSON。两类:
-    //   - explicit bg(run_in_background):{"job_id":..,"status":"started",...}
-    //   - auto bg(超 15s 转后台):{"auto_backgrounded":true,"job_id":..,"note":..}(无 status)
-    if (extractField(output_text, "job_id")) |jid| {
-        const is_started = extractField(output_text, "status") != null;
-        const is_auto = std.mem.indexOf(u8, output_text, "\"auto_backgrounded\":true") != null;
-        if (is_started or is_auto) {
-            const line = if (is_auto)
-                try std.fmt.allocPrint(alloc, "▶ moved to background job {s} (exceeded 15s)", .{jid})
-            else
-                try std.fmt.allocPrint(alloc, "▶ background job {s}", .{jid});
-            defer alloc.free(line);
-            try appendLine(alloc, out, th.dim, line, th.reset);
-            return;
-        }
+    // 后台 Bash → 一行提示,不展开裸 JSON(两类:explicit/auto)。与 renderLiveDone 共用 bgJobLine。
+    if (try bgJobLine(alloc, "Bash", output_text)) |line| {
+        defer alloc.free(line);
+        try appendLine(alloc, out, th.dim, line, th.reset);
+        return;
     }
 
     const stdout_raw = extractField(output_text, "stdout");
@@ -1913,6 +1930,39 @@ test "renderResult: auto_backgrounded 头部中性 + ▶ 提示不裸吐 JSON(#4
     // body:▶ 后台提示 + job id,且不裸吐 auto_backgrounded JSON。
     try testing.expect(std.mem.indexOf(u8, s, "moved to background job abc123") != null);
     try testing.expect(std.mem.indexOf(u8, s, "auto_backgrounded") == null);
+}
+
+test "renderLiveDone: auto_backgrounded committed 卡显 ▶ 转后台提示(#4 真 e2e 路径)" {
+    // **关键**:类A Bash 的 committed scrollback 卡走 renderLiveDone(非 renderResult)。
+    // 旧 bug:renderLiveDone 只显 ⏺标题 + ⎿输入预览,**丢 content** → auto-bg 转后台无任何痕迹,
+    // 用户看不出命令进了后台(committed 卡是历史唯一留痕)。真 e2e(bug4)抓不到是因屏幕断言
+    // 抓最终视口、卡被 BashOutput 轮询挤走 → skip 误判;离线单测只测 renderResult(错路径)。
+    // 修:renderLiveDone 经 bgJobLine 共用渲染 → committed 卡显 ▶ moved to background job …。
+    const th = theme_mod.monochrome;
+    const json = "{\"auto_backgrounded\":true,\"job_id\":\"abc123\",\"note\":\"Command exceeded 15s; moved to background.\"}";
+    const s = try renderLiveDone(testing.allocator, th, "Bash", "{\"command\":\"sleep 20\"}", json, .ok, 15100, .{ .cols = 80 });
+    defer testing.allocator.free(s);
+    try testing.expect(std.mem.indexOf(u8, s, "moved to background job abc123") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "auto_backgrounded") == null); // 不裸吐 JSON
+    try testing.expect(std.mem.indexOf(u8, s, "$ sleep 20") == null); // 后台态不再退回输入预览
+}
+
+test "renderLiveDone: explicit run_in_background committed 卡显 ▶ background job" {
+    const th = theme_mod.monochrome;
+    const json = "{\"job_id\":\"j9\",\"status\":\"started\",\"command\":\"sleep 99\"}";
+    const s = try renderLiveDone(testing.allocator, th, "Bash", "{\"command\":\"sleep 99\"}", json, .ok, 200, .{ .cols = 80 });
+    defer testing.allocator.free(s);
+    try testing.expect(std.mem.indexOf(u8, s, "background job j9") != null);
+}
+
+test "renderLiveDone: 普通 Bash(非后台)committed 卡仍只显输入预览(不回归)" {
+    // 非后台结果:bgJobLine 返 null → 走原 ⎿ 输入预览路径($ cmd),body 不展开 stdout(对齐 cc 2.1.165)。
+    const th = theme_mod.monochrome;
+    const json = "{\"stdout\":\"hello\\n\",\"exit_code\":0}";
+    const s = try renderLiveDone(testing.allocator, th, "Bash", "{\"command\":\"echo hello\"}", json, .ok, 100, .{ .cols = 80 });
+    defer testing.allocator.free(s);
+    try testing.expect(std.mem.indexOf(u8, s, "$ echo hello") != null); // 输入预览在
+    try testing.expect(std.mem.indexOf(u8, s, "background job") == null); // 非后台,无 ▶ 后台行
 }
 
 test "renderJsonToolSummary: 提人话不裸吐 JSON" {
