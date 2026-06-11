@@ -28,10 +28,8 @@ pub const ColorCapability = enum {
 /// TERM 含 "256color" → TERM=xterm/screen/tmux(basic_16)→ none。
 /// FORCE_COLOR=1/2/3 可强制对应级别(对齐 https://no-color.org / FORCE_COLOR 约定)。
 pub fn detectColor(env_no_color: bool, env_force_color: ?u8, term: ?[]const u8, colorterm: ?[]const u8, tty: bool) ColorCapability {
-    // NO_COLOR 强制关闭(规范:任何非空值即关)
-    if (env_no_color) return .none;
-
-    // FORCE_COLOR 优先级最高
+    // FORCE_COLOR 优先级最高(对齐 no-color.org / chalk:FORCE_COLOR 显式压过 NO_COLOR)。
+    // 必须在 NO_COLOR 之前判——否则 NO_COLOR 短路,用户用 FORCE_COLOR 强开颜色无效。
     if (env_force_color) |level| {
         return switch (level) {
             0 => .none,
@@ -41,6 +39,9 @@ pub fn detectColor(env_no_color: bool, env_force_color: ?u8, term: ?[]const u8, 
             else => .basic_16,
         };
     }
+
+    // NO_COLOR 强制关闭(规范:任何非空值即关)。
+    if (env_no_color) return .none;
 
     if (!tty) return .none;
 
@@ -212,6 +213,13 @@ test "detectColor: FORCE_COLOR 优先" {
     try testing.expectEqual(ColorCapability.extended_256, detectColor(false, 2, null, null, false));
     try testing.expectEqual(ColorCapability.basic_16, detectColor(false, 1, null, null, false));
     try testing.expectEqual(ColorCapability.none, detectColor(false, 0, null, null, false));
+}
+
+test "detectColor: FORCE_COLOR 压过 NO_COLOR(no-color.org 优先级)" {
+    // FORCE_COLOR=3 + NO_COLOR=1 → 仍 truecolor(FORCE_COLOR 更高,显式压过 NO_COLOR)。
+    try testing.expectEqual(ColorCapability.truecolor, detectColor(true, 3, "xterm-256color", null, true));
+    // FORCE_COLOR=0 + NO_COLOR=1 → none(两者都要关,一致)。
+    try testing.expectEqual(ColorCapability.none, detectColor(true, 0, "xterm-256color", null, true));
 }
 
 test "detectColor: COLORTERM=truecolor" {

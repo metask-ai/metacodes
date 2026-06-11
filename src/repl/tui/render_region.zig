@@ -408,7 +408,7 @@ pub const RenderRegion = struct {
         if (self.input_cursor_row > 0) w.writeAll(ansi.cursor.up(self.input_cursor_row, &nbuf)) catch {};
         w.writeAll(ansi.cursor.column(1, &nbuf)) catch {};
 
-        const inner_w: usize = if (self.cols > 4) self.cols - 1 else 40;
+        const inner_w: usize = self.innerWidth();
         const border_color = self.borderColor(app.config.permission_mode);
 
         // shell 模式(对齐 cc DIFF#3):buffer 以 `!` 开头 → 前缀 `!`(替 ❯),内容去掉 `!`、footer
@@ -635,7 +635,11 @@ pub const RenderRegion = struct {
         const mode_pm = if (live != .default) live else self.ui.footer.mode;
         const sym = sb.modeSymbol(mode_pm);
         const title = sb.modeTitle(mode_pm);
-        const show_mode = title.len != 0; // default/prompt → 不显 mode part
+        // 缓冲含粘贴占位符 `[Pasted text #N +M lines]`(空闲期)→ footer 整条换成
+        // `paste again to expand`(对齐真 cc v2.1.172:连 mode part 一起替换),占位符删后自动复原。
+        const paste_placeholder = !self.generating and
+            std.mem.indexOf(u8, self.input_view, "[Pasted text #") != null;
+        const show_mode = title.len != 0 and !paste_placeholder; // default/prompt 或占位符态 → 不显 mode part
 
         // mode part 纯文本(用于宽度计算,不含 SGR)。cc 格式:非 default → `{sym} {title} on (shift+tab to cycle)`;
         // default → 无 mode part(下方 hint 显 `? for shortcuts`)。对齐 cc 真实 footer。
@@ -666,6 +670,14 @@ pub const RenderRegion = struct {
                 break :blk base;
             }
             // 空闲期。
+            // 占位符态:整条 footer = `paste again to expand`(show_mode 已被置 false)。
+            if (paste_placeholder) break :blk " paste again to expand";
+            // 多行编辑中:显示当前终端的换行方式(对齐真 cc getNewlineInstructions,按 cc-zig 实际能力:
+            // 白名单终端 shift+⏎,Apple Terminal 等 \+⏎)。提示最有用时=正在组多行。
+            const multiline = std.mem.indexOfScalar(u8, self.input_view, '\n') != null;
+            if (multiline) {
+                break :blk std.fmt.bufPrint(&hint_buf, "  {s}", .{input.newlineHint()}) catch " ? for shortcuts";
+            }
             const base = if (show_mode) "" else " ? for shortcuts";
             if (has_any_agents) {
                 break :blk std.fmt.bufPrint(&hint_buf, "{s} · ← for agents", .{base}) catch base;
@@ -891,14 +903,63 @@ pub const RenderRegion = struct {
         var vi: usize = 0;
         while (vi < vlines.count) : (vi += 1) {
             const seg = vlines.slices[vi];
-            // 光标在本段内(含段末;最后一段含 view.len)
-            const seg_end_incl = if (vi == vlines.count - 1) seg.end + 1 else seg.end;
+            // 光标在本段内(含段末;最后一段含 view.len)。
+            // 非末段:若段末是 \n(逻辑换行),cur==seg.end 归本段(=行尾,光标在 \n 前);
+            // 若段末是软折点(无 \n,下段从同 byte 起),cur==seg.end 归下段行首(col 0),故不含。
+            const ends_in_nl = seg.end < view.len and view[seg.end] == '\n';
+            const seg_end_incl = if (vi == vlines.count - 1 or ends_in_nl) seg.end + 1 else seg.end;
             if (cur >= seg.start and cur < seg_end_incl) {
                 const vcol = displayWidth(view[seg.start..@min(cur, seg.end)]);
                 return .{ .vline = vi, .vcol = vcol };
             }
         }
         return .{ .vline = 0, .vcol = 0 };
+    }
+
+    /// locateCursor 的逆:给定目标 visual line + 目标显示列(goal_vcol),返回落点 byte offset。
+    /// 纯函数。竖移(up/down)用——保 goal column,clamp 到目标行宽,返回恒为字符边界。
+    /// 约定与 locateCursor 一致:返回「光标所在字符左缘列 >= goal_vcol」的首个字符的 byte index;
+    /// 走到段末未达 goal → 返段末(seg.end)= 该可视行尾(\n 前 / 软折点)。
+    fn offsetForVisualPos(view: []const u8, vlines: *const VisualLines, target_vline: usize, goal_vcol: usize) usize {
+        if (vlines.count == 0) return 0;
+        const vi = @min(target_vline, vlines.count - 1);
+        const seg = vlines.slices[vi];
+        var i = seg.start;
+        var col: usize = 0;
+        while (i < seg.end) {
+            if (col >= goal_vcol) return i;
+            const nb = nextCharBytes(view, i);
+            col += displayWidth(view[i .. i + nb]);
+            i += nb;
+        }
+        return seg.end; // clamp 到可视行尾
+    }
+
+    /// 输入框内宽(单一真相源:与 renderInput/renderGenerating 的 inner_w 完全一致)。
+    fn innerWidth(self: *const RenderRegion) usize {
+        return if (self.cols > 4) self.cols - 1 else 40;
+    }
+
+    pub const VMoveResult = struct { moved: bool, cursor: usize, goal_vcol: usize };
+
+    /// up/down 在多行/软折缓冲里做【可视行】竖移(对齐真 cc v2.1.172)。
+    /// moved=false 表示光标已在首/末可视行边界(调用方据此回退历史导航)。
+    /// 否则返回新 cursor(byte offset)+ 保留/初始化的 goal_vcol。
+    /// 用 self.cols 算 inner_w(故须在 RenderRegion 上而非纯 dispatch);持锁读 cols。
+    pub fn tryVerticalMove(self: *RenderRegion, input_view: []const u8, cursor: usize, cur_goal: ?usize, dir_down: bool) VMoveResult {
+        self.lock();
+        const inner_w = self.innerWidth();
+        self.unlock();
+        var vlines = VisualLines.init();
+        layoutInput(input_view, &vlines, inner_w);
+        const loc = locateCursor(input_view, cursor, &vlines);
+        // 边界:末行 down / 首行 up → 不动,回退历史。
+        if (dir_down and loc.vline + 1 >= vlines.count) return .{ .moved = false, .cursor = cursor, .goal_vcol = loc.vcol };
+        if (!dir_down and loc.vline == 0) return .{ .moved = false, .cursor = cursor, .goal_vcol = loc.vcol };
+        const goal = cur_goal orelse loc.vcol;
+        const target = if (dir_down) loc.vline + 1 else loc.vline - 1;
+        const new_cursor = offsetForVisualPos(input_view, &vlines, target, goal);
+        return .{ .moved = true, .cursor = new_cursor, .goal_vcol = goal };
     }
 
     /// 公开重画(持锁)。输入期调用。
@@ -1509,7 +1570,7 @@ pub const RenderRegion = struct {
             w.writeAll("\r") catch {};
         }
 
-        const inner_w: usize = if (self.cols > 4) self.cols - 1 else 40;
+        const inner_w: usize = self.innerWidth();
         const border_color = self.borderColor(app.config.permission_mode);
         const content = self.gen_view;
 
@@ -2027,4 +2088,94 @@ test "locateCursor:中文显示列宽" {
     const loc = RenderRegion.locateCursor(view, 6, &vl);
     try std.testing.expectEqual(@as(usize, 0), loc.vline);
     try std.testing.expectEqual(@as(usize, 4), loc.vcol); // 2+2 列
+}
+
+test "offsetForVisualPos:精确列" {
+    const view = "aaa\nbb\ncccc";
+    var vl = VisualLines.init();
+    RenderRegion.layoutInput(view, &vl, 80); // 3 逻辑行
+    // 目标 vline=0, goal=2 → "aa|a" offset 2
+    try std.testing.expectEqual(@as(usize, 2), RenderRegion.offsetForVisualPos(view, &vl, 0, 2));
+}
+
+test "offsetForVisualPos:goal 超行宽 clamp 到行尾" {
+    const view = "aaa\nbb\ncccc";
+    var vl = VisualLines.init();
+    RenderRegion.layoutInput(view, &vl, 80);
+    // vline=1 是 "bb"(seg 4..6),goal=99 → clamp 到 seg.end=6(\n 前=行尾)
+    try std.testing.expectEqual(@as(usize, 6), RenderRegion.offsetForVisualPos(view, &vl, 1, 99));
+}
+
+test "offsetForVisualPos:软折段落点(可视行非逻辑行)" {
+    // 24 个 a,inner_w=10 → avail=7 → 软折成多段。
+    const view = "a" ** 24;
+    var vl = VisualLines.init();
+    RenderRegion.layoutInput(view, &vl, 10);
+    try std.testing.expect(vl.count >= 2);
+    // 第 2 可视行 goal=5 → 该段 start + 5
+    const seg1 = vl.slices[1];
+    try std.testing.expectEqual(seg1.start + 5, RenderRegion.offsetForVisualPos(view, &vl, 1, 5));
+}
+
+test "offsetForVisualPos:UTF-8 不落 mid-char" {
+    const view = "你好世界"; // 每字 3 字节,显示宽 2
+    var vl = VisualLines.init();
+    RenderRegion.layoutInput(view, &vl, 80);
+    // goal=3(落在「好」中间显示列):约定取左缘 >= goal 的首字符 → 「世」起点 offset 6
+    const off = RenderRegion.offsetForVisualPos(view, &vl, 0, 3);
+    try std.testing.expectEqual(@as(usize, 0), off % 3); // 恒为字符边界(3 倍数)
+    try std.testing.expectEqual(@as(usize, 6), off);
+}
+
+test "offsetForVisualPos:空 vlines 返 0" {
+    const view = "";
+    var vl = VisualLines.init();
+    RenderRegion.layoutInput(view, &vl, 80); // push 一个空段 0..0
+    try std.testing.expectEqual(@as(usize, 0), RenderRegion.offsetForVisualPos(view, &vl, 0, 5));
+}
+
+test "tryVerticalMove:多行竖移 + 边界回退 + goal 保持" {
+    var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.monochrome, .none), .none);
+    defer r.deinit();
+    r.cols = 80; // 宽够,3 逻辑行各成一可视行
+    const view = "aaa\nbb\ncccc"; // seg: aaa(0..3) bb(4..6) cccc(7..11)
+
+    // 末行尾(cursor=11)up → 落 bb 行,goal=4(cccc 末列)clamp 到 bb 行尾(offset 6)
+    const up1 = r.tryVerticalMove(view, 11, null, false);
+    try std.testing.expect(up1.moved);
+    try std.testing.expectEqual(@as(usize, 6), up1.cursor); // bb 行尾(\n 前)
+    try std.testing.expectEqual(@as(usize, 4), up1.goal_vcol); // goal=cccc 末列 4
+
+    // 继续 up(带 goal=4)→ 落 aaa 行,clamp 到 aaa 尾(offset 3)
+    const up2 = r.tryVerticalMove(view, up1.cursor, up1.goal_vcol, false);
+    try std.testing.expect(up2.moved);
+    try std.testing.expectEqual(@as(usize, 3), up2.cursor); // aaa 行尾
+    try std.testing.expectEqual(@as(usize, 4), up2.goal_vcol); // goal 不变
+
+    // 首行 up → moved=false(回退历史)
+    const up3 = r.tryVerticalMove(view, up2.cursor, up2.goal_vcol, false);
+    try std.testing.expect(!up3.moved);
+
+    // 末行 down → moved=false
+    const down_end = r.tryVerticalMove(view, 11, null, true);
+    try std.testing.expect(!down_end.moved);
+
+    // 中间行 down:从 bb 行尾(6)down → cccc 行 clamp goal=2 → offset 7+2=9
+    const down1 = r.tryVerticalMove(view, 6, 2, true);
+    try std.testing.expect(down1.moved);
+    try std.testing.expectEqual(@as(usize, 9), down1.cursor);
+}
+
+test "tryVerticalMove:软折单行 up 落软折续行(可视行非逻辑行)" {
+    var r = RenderRegion.init(std.testing.allocator, 2, theme_mod.select(.monochrome, .none), .none);
+    defer r.deinit();
+    r.cols = 11; // inner_w=10 → avail=7 → 长行软折
+    // 24 个 a(软折多段)+ \n + short:光标在 short 尾,up 应落到 a 的最后一个软折段
+    const view = "a" ** 24 ++ "\nshort";
+    const cursor = view.len; // short 尾
+    const up1 = r.tryVerticalMove(view, cursor, null, false);
+    try std.testing.expect(up1.moved);
+    // 落点必须落在 a 行的【最后一个软折段】(21..24)内,即软折续行而非逻辑行首(0),
+    // 证明竖移按可视行(软折段)而非逻辑行。goal=width("short")=5 > 3 → clamp 到段尾 24。
+    try std.testing.expect(up1.cursor >= 21 and up1.cursor <= 24);
 }

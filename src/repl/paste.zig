@@ -12,7 +12,9 @@
 const std = @import("std");
 
 /// 触发外部存储的阈值：行数 > 此值 或 字节数 > 此值。
-pub const LINE_THRESHOLD: usize = 12;
+/// 真 cc v2.1.172 实测(record_input_behavior.py threshold.txt):≤3 行内联,≥4 行转占位符
+/// → 阈值 3(`> 3` 即 ≥4 行)。
+pub const LINE_THRESHOLD: usize = 3;
 pub const BYTE_THRESHOLD: usize = 1600;
 
 pub fn isLarge(text: []const u8) bool {
@@ -53,7 +55,8 @@ pub fn store(allocator: std.mem.Allocator, home: []const u8, id: usize, text: []
         pos += @intCast(n);
     }
 
-    return try std.fmt.allocPrint(allocator, "[Pasted text #{d} +{d} lines]", .{ id, countLines(text) });
+    // 占位符计数对齐真 cc:+M 的 M = 总行数 − 1(4 行→+3,20 行→+19)。
+    return try std.fmt.allocPrint(allocator, "[Pasted text #{d} +{d} lines]", .{ id, countLines(text) -| 1 });
 }
 
 /// 读回某个粘贴文件的内容（提交时 expand 用）。
@@ -129,6 +132,12 @@ test "isLarge by lines" {
     try testing.expect(isLarge(&buf));
 }
 
+test "isLarge boundary: 3 inline, 4 large (cc v2.1.172)" {
+    // 真 cc 实测:≤3 行内联,≥4 行转占位符。
+    try testing.expect(!isLarge("a\nb\nc")); // 3 行
+    try testing.expect(isLarge("a\nb\nc\nd")); // 4 行
+}
+
 test "isLarge by bytes" {
     const big = "x" ** (BYTE_THRESHOLD + 1);
     try testing.expect(isLarge(big));
@@ -163,6 +172,36 @@ test "store + load + expand round trip" {
     try testing.expect(std.mem.indexOf(u8, expanded, "line A\nline B\nline C") != null);
     try testing.expect(std.mem.indexOf(u8, expanded, "before ") != null);
     try testing.expect(std.mem.indexOf(u8, expanded, " after") != null);
+}
+
+test "store placeholder count = lines - 1 (cc v2.1.172)" {
+    const a = testing.allocator;
+    const home = "/tmp/cc-zig-paste-home";
+    _ = std.c.mkdir(home, 0o700);
+    defer {
+        var pz: [256]u8 = undefined;
+        inline for (.{ 4, 20 }) |id| {
+            const p = std.fmt.bufPrintZ(&pz, "{s}/.cc-zig/pastes/{d}.txt", .{ home, id }) catch unreachable;
+            _ = std.c.unlink(p.ptr);
+        }
+    }
+
+    // 4 行 → "+3 lines"
+    const four = "L0\nL1\nL2\nL3";
+    const ph4 = (try store(a, home, 4, four)).?;
+    defer a.free(ph4);
+    try testing.expect(std.mem.indexOf(u8, ph4, "+3 lines") != null);
+
+    // 20 行 → "+19 lines"
+    var buf: [200]u8 = undefined;
+    var w: usize = 0;
+    inline for (0..20) |i| {
+        const seg = std.fmt.bufPrint(buf[w..], "R{d}\n", .{i}) catch unreachable;
+        w += seg.len;
+    }
+    const ph20 = (try store(a, home, 20, buf[0 .. w - 1])).?; // 去掉末尾 \n → 恰 20 行
+    defer a.free(ph20);
+    try testing.expect(std.mem.indexOf(u8, ph20, "+19 lines") != null);
 }
 
 test "expandPlaceholders no marker returns dupe" {

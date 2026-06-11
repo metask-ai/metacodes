@@ -27,6 +27,11 @@ pub const LoopAction = enum {
     history_prev,
     /// ↓ 下一条历史。
     history_next,
+    /// ↑ 在多行/软折缓冲里竖移光标(调用方经 RenderRegion.tryVerticalMove 算落点;
+    /// 边界=首可视行时回退 history_prev)。详见 INPUT_BEHAVIOR_DIFF_2026-06-11.md。
+    cursor_up,
+    /// ↓ 同上,边界=末可视行时回退 history_next。
+    cursor_down,
     /// Tab 补全(调用方跑补全引擎)。
     complete,
     /// Ctrl+R 反向搜索(调用方进独占 fd 读循环)。

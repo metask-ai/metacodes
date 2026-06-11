@@ -302,8 +302,10 @@ fn dispatchKey(state: *UiState, key: input.Key) Effect {
         .shift_tab => return .{ .action = .cycle_perm_mode },
         .ctrl_l => return .{ .action = .redraw_screen },
         // 仅输入期激活:生成期无对应子系统 → 吞掉(redraw_region=false,不透传不上抛)。
-        .up => return if (gen) .{} else .{ .action = .history_prev },
-        .down => return if (gen) .{} else .{ .action = .history_next },
+        // up/down 上抛 cursor_up/down(非直接 history):loop 经 RenderRegion 判可视行边界,
+        // 多行/软折缓冲里竖移,仅首/末可视行才回退历史。dispatch 无宽度看不到软折,故不在此决断。
+        .up => return if (gen) .{} else .{ .action = .cursor_up },
+        .down => return if (gen) .{} else .{ .action = .cursor_down },
         .tab => return if (gen) .{} else .{ .action = .complete },
         .ctrl_r => return if (gen) .{} else .{ .action = .reverse_search },
         .ctrl_g => return if (gen) .{} else .{ .action = .external_edit },

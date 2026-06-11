@@ -111,10 +111,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
 
         const trimmed = std.mem.trim(u8, line, " \t\r\n");
         if (trimmed.len == 0) {
-            if (line.len == 0) {
-                std.debug.print("Goodbye!\n", .{});
-                break;
-            }
+            // 空提交(空串/纯空白)→ 无操作,留在 REPL(对齐真 cc:空 enter 不做事、不退出)。
+            // 退出只由真 EOF 触发:tty 由 readLineRaw 抛 error.Eof(上方 91-94),
+            // 非 tty 由 readLineBuffered 抛 error.Eof(573 行起,read 返 0)。空串≠EOF。
+            // 历史 bug:Warp 下 shift+enter 发裸 \n → 提交空 buffer → 旧代码当 EOF 退出整个程序。
             continue;
         }
 
@@ -854,6 +854,33 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
                 .pass_to_editor => {}, // 落到下面正常编辑
                 .none, .commit, .cancel, .exit => continue, // overlay 消费了(已重画),不喂 editor
                 // ── 全局快捷键:dispatch 上抛 → 在此执行 IO 体(单一真相源:键解析全在 dispatch)──
+                // up/down:先试多行/软折【可视行】竖移(经 RenderRegion,它持 cols 算 inner_w);
+                // moved=false(光标已在首/末可视行)才回退历史导航。对齐真 cc v2.1.172。
+                .cursor_up, .cursor_down => {
+                    const down = eff.action == .cursor_down;
+                    const r = region.tryVerticalMove(editor.view(), editor.cursor, editor.goal_vcol, down);
+                    if (r.moved) {
+                        editor.cursor = r.cursor;
+                        editor.goal_vcol = r.goal_vcol;
+                        redraw(&region, &editor, app);
+                    } else {
+                        editor.goal_vcol = null;
+                        if (down) {
+                            if (history.next()) |nxt| {
+                                try editor.setLine(nxt);
+                                redraw(&region, &editor, app);
+                            }
+                        } else {
+                            if (try history.prev(editor.view())) |prev| {
+                                try editor.setLine(prev);
+                                redraw(&region, &editor, app);
+                            }
+                        }
+                    }
+                    continue;
+                },
+                // 历史导航(保留:cursor_up/down 在可视行边界回退到这两个语义;
+                // 也供未来直接上抛历史的路径用)。
                 .history_prev => {
                     if (try history.prev(editor.view())) |prev| {
                         try editor.setLine(prev);
@@ -2011,7 +2038,10 @@ fn printStartupBanner(app: *const app_mod.App) void {
         if (std.c.ioctl(1, TIOCGWINSZ, @intFromPtr(&ws)) == 0 and ws.col > 0) break :blk ws.col;
         break :blk 80;
     };
-    const inner: usize = @min(if (cols > 2) cols - 2 else 60, @as(usize, 64));
+    // welcome 框宽度对齐输入分隔线:框总宽 = box_tl + inner×box_h + box_tr = inner+2,
+    // 须等于输入分隔线宽 inner_w = cols-1(见 render_region.innerWidth)→ inner = cols-3。
+    // 去掉旧的 64 封顶——宽窗口下旧版框 64 列、分隔线满宽,两条线不等长(用户实测割裂)。
+    const inner: usize = if (cols > 3) cols - 3 else 60;
 
     const title = " cc-zig ";
     // 顶边框:╭─ cc-zig ───…──╮

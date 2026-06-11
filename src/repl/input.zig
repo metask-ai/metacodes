@@ -168,6 +168,17 @@ pub const KeyParser = struct {
                         else => .unknown,
                     };
                 }
+                // 无 modifier 的 CSI-u(ESC[<cp>u,无 ;mod):Kitty disambiguate 模式下
+                // Enter/Esc/纯文本也可能编成 CSI-u。还原成对应键,避免被当 .unknown 吞掉。
+                if (b == 'u') {
+                    return switch (self.num1) {
+                        13 => .enter, // 无 mod Enter
+                        27 => .esc, // 无 mod Esc
+                        // ASCII 可打印 → char(兼容把纯文本也 CSI-u 编码的终端)。
+                        0x20...0x7e => Key{ .char = @intCast(self.num1) },
+                        else => .unknown,
+                    };
+                }
                 return .unknown;
             },
             .csi_semi => {
@@ -252,8 +263,58 @@ fn byteToKey(b: u8) Key {
 // ============================================================================
 
 /// 切 raw 模式，返回旧 termios；非 tty 或失败返 null。
-/// 同时启用 xterm modifyOtherKeys / CSI u 协议，以区分 Shift+Enter / Ctrl+Enter。
-/// 不支持 CSI u 的终端会忽略这条转义，行为无损。
+/// 进 raw mode。返回原 termios(供 restoreMode 复原);非 tty 返 null。
+/// 仅对**白名单终端**(shouldEnableKittyKeyboard)启用 Kitty 键盘协议 / xterm modifyOtherKeys,
+/// 以区分 Shift+Enter / Ctrl+Enter。非白名单(如 Apple Terminal)不发——它们会 honor 协议并
+/// 发回 parser 处理不了的 codepoint(对齐真 cc terminal.ts:167:无条件发是 #23350 踩过的坑)。
+///
+/// **键盘协议序列**(对齐真 cc ink.tsx:418,pop-before-push 防残留栈叠加):
+///   `\x1b[<u`   DISABLE_KITTY_KEYBOARD —— 先 pop 清 Kitty 栈
+///   `\x1b[>1u`  ENABLE_KITTY flags=1(disambiguate-only):歧义键(Shift/Ctrl+Enter、
+///              Esc、功能键)编成 CSI-u,纯文本不编码 → Warp/iTerm/kitty/WezTerm/ghostty 用这条
+///   `\x1b[>4;2m` ENABLE_MODIFY_OTHER_KEYS level 2:不支持 Kitty 的 xterm 系走这条
+/// 实测:Warp 收到 `\x1b[>1u` 后 Shift+Enter 才发 `\x1b[13;2u`(否则退回裸 \n,被当 Enter)。
+/// 非白名单终端 Shift+Enter 发裸 \r/\n,换行改靠 backslash+return(见 LineEditor.handle .enter)。
+pub const kbd_enable_seq = "\x1b[<u" ++ "\x1b[>1u" ++ "\x1b[>4;2m";
+pub const kbd_disable_seq = "\x1b[<u" ++ "\x1b[>4m"; // DISABLE_KITTY(pop) + DISABLE_MODIFY_OTHER_KEYS
+
+/// Kitty 键盘协议**白名单**(对齐真 cc terminal.ts:167 EXTENDED_KEYS_TERMINALS + 实测追加 Warp)。
+/// 真 cc 注释铁证:此前无条件发(#23350)是 bug——某些终端(Apple Terminal/SSH/xterm.js)会
+/// honor enable 并发回 parser 处理不了的 codepoint(→ 各种键乱/乱码)。故只对已知正确实现
+/// Kitty/modifyOtherKeys 的终端发。Apple_Terminal 不在此列 → 不发协议,换行靠 backslash+return。
+/// WarpTerminal 为 cc-zig 追加(用户实测:其默认未开 Kitty,需主动发 \x1b[>1u 才能 Shift+Enter 换行)。
+const kitty_term_programs = [_][]const u8{ "iTerm.app", "WezTerm", "ghostty", "WarpTerminal" };
+
+/// 纯函数(便于纯单测,不依赖真 env):据 TERM_PROGRAM / TERM / TMUX 判断是否发 Kitty 协议。
+fn classifyKittyKeyboard(term_program: ?[]const u8, term: ?[]const u8, has_tmux: bool) bool {
+    if (has_tmux) return true; // tmux 接受 modifyOtherKeys 且不转发 Kitty 给外层(对齐真 cc)
+    if (term_program) |tp| {
+        for (kitty_term_programs) |n| if (std.mem.eql(u8, tp, n)) return true;
+    }
+    if (term) |t| {
+        if (std.mem.indexOf(u8, t, "kitty") != null) return true; // xterm-kitty 等
+        if (std.mem.eql(u8, t, "xterm-ghostty")) return true;
+    }
+    return false;
+}
+
+/// 读真实 env 调 classifyKittyKeyboard。getenv 返 ?[*:0]const u8 → span 成 ?[]const u8。
+pub fn shouldEnableKittyKeyboard() bool {
+    const tp: ?[]const u8 = if (std.c.getenv("TERM_PROGRAM")) |p| std.mem.span(p) else null;
+    const term: ?[]const u8 = if (std.c.getenv("TERM")) |t| std.mem.span(t) else null;
+    const has_tmux: bool = if (std.c.getenv("TMUX")) |v| std.mem.span(v).len > 0 else false;
+    return classifyKittyKeyboard(tp, term, has_tmux);
+}
+
+/// 当前终端的换行方式提示(对齐真 cc getNewlineInstructions,但按 cc-zig 实际能力):
+/// - 白名单终端(发 Kitty 协议 → Shift+Enter 真换行)→ "shift + ⏎ for newline"
+/// - 非白名单(Apple Terminal 等,Shift+Enter 发裸 \r=Enter 会提交)→ "\ + ⏎ for newline"
+///   (cc-zig 无 macOS 原生 modifier 检测,故 Apple Terminal 只能靠 backslash 续行,
+///    不能照抄真 cc 对 Apple 的 "shift+⏎" 文案——那会误导)。
+pub fn newlineHint() []const u8 {
+    return if (shouldEnableKittyKeyboard()) "shift + \xe2\x8f\x8e for newline" else "\\ + \xe2\x8f\x8e for newline";
+}
+
 pub fn enterRawMode(fd: std.c.fd_t) ?std.c.termios {
     var orig: std.c.termios = undefined;
     if (std.c.tcgetattr(fd, &orig) != 0) return null;
@@ -273,26 +334,30 @@ pub fn enterRawMode(fd: std.c.fd_t) ?std.c.termios {
 
     if (std.c.tcsetattr(fd, std.posix.TCSA.FLUSH, &raw) != 0) return null;
 
-    // 启用 xterm modifyOtherKeys mode 1：只编码 "普通方式无法表示的组合键"
-    // （Shift+Enter、Ctrl+Enter）。mode 2 会把所有 Ctrl+字母也编码为 CSI u，
-    // 导致 Ctrl+C 变成 `\x1b[99;5u` 被我们的状态机漏判→输出"99~"一类乱码。mode 1 更保守。
-    const enable = "\x1b[>4;1m";
-    _ = std.c.write(fd, enable.ptr, enable.len);
-
-    // 启用 bracketed paste mode：粘贴内容被 ESC[200~ ... ESC[201~ 包裹，
-    // 让我们能把"粘贴"和"逐字键入"区分开（大块粘贴存外部 + 占位符）。
-    const enable_paste = "\x1b[?2004h";
-    _ = std.c.write(fd, enable_paste.ptr, enable_paste.len);
+    // 哑终端(TERM=dumb 或空)不发任何键盘协议/粘贴序列,避免乱码回显。
+    const term = std.c.getenv("TERM");
+    const dumb = term == null or std.mem.eql(u8, std.mem.span(term.?), "dumb") or std.mem.span(term.?).len == 0;
+    if (!dumb) {
+        // Kitty 键盘协议 + modifyOtherKeys 仅对白名单终端发(非白名单会乱码/键失常)。
+        if (shouldEnableKittyKeyboard()) {
+            _ = std.c.write(fd, kbd_enable_seq.ptr, kbd_enable_seq.len);
+        }
+        // bracketed paste 兼容性好,所有非 dumb 终端都发(粘贴内容被 ESC[200~ ... ESC[201~ 包裹)。
+        const enable_paste = "\x1b[?2004h";
+        _ = std.c.write(fd, enable_paste.ptr, enable_paste.len);
+    }
 
     return orig;
 }
 
 pub fn restoreMode(fd: std.c.fd_t, orig: std.c.termios) void {
-    // 关 bracketed paste + modifyOtherKeys
+    // 关 bracketed paste(始终)+ 键盘协议(仅白名单——对称 enterRawMode,同进程 env 不变判定恒一致,
+    // 不会发了 enable 没 disable;非白名单不发孤立 disable,避免 Apple Terminal honor 它出异常)。
     const disable_paste = "\x1b[?2004l";
     _ = std.c.write(fd, disable_paste.ptr, disable_paste.len);
-    const disable = "\x1b[>4;0m";
-    _ = std.c.write(fd, disable.ptr, disable.len);
+    if (shouldEnableKittyKeyboard()) {
+        _ = std.c.write(fd, kbd_disable_seq.ptr, kbd_disable_seq.len);
+    }
     _ = std.c.tcsetattr(fd, std.posix.TCSA.FLUSH, &orig);
 }
 
@@ -390,6 +455,10 @@ pub const LineEditor = struct {
     undo_stack: std.ArrayList(Snapshot),
     /// 去抖:上一次 handle 处理的 Key tag。连续 .char 只在段首 push 一次。
     last_op: ?std.meta.Tag(Key) = null,
+    /// up/down 竖移的 sticky 目标显示列(visual col)。null=无竖移流。
+    /// 任何经 handle 的键(非竖移)清空;竖移路径(loop 经 RenderRegion.tryVerticalMove)
+    /// 直接维护此字段,故连续 up/down 保 goal column。详见 ui_compare/diff/INPUT_BEHAVIOR_DIFF_2026-06-11.md。
+    goal_vcol: ?usize = null,
     // TODO(redo):redo 栈留待后续(CC 主要只做 undo,Ctrl+Y 已被 yank 占用)。
 
     pub fn init(allocator: std.mem.Allocator) LineEditor {
@@ -405,6 +474,8 @@ pub const LineEditor = struct {
 
     /// 输入一个 Key 并更新状态。返回对应 Action。
     pub fn handle(self: *LineEditor, key: Key) !Action {
+        // 任何经 editor 的键都是非竖移键(up/down 在 dispatch 截获,永不入此)→ 终结竖移流。
+        self.goal_vcol = null;
         // "双击 Ctrl+C 退出" 语义：只有连续两次 Ctrl+C（中间无其他按键）才触发 exit_repl。
         // 非 ctrl_c 按键会重置 armed 标志。
         const was_armed = self.ctrl_c_armed;
@@ -424,7 +495,7 @@ pub const LineEditor = struct {
                 .char => {
                     if (self.last_op != .char) self.pushUndo();
                 },
-                .backspace, .delete, .ctrl_u, .ctrl_w, .ctrl_y, .shift_enter, .ctrl_enter => {
+                .backspace, .delete, .ctrl_u, .ctrl_w, .ctrl_y, .shift_enter => {
                     self.pushUndo();
                 },
                 .ctrl_k => {
@@ -443,12 +514,33 @@ pub const LineEditor = struct {
                 self.cursor += 1;
                 return .redraw;
             },
-            .enter => return .commit,
-            .shift_enter, .ctrl_enter => {
+            .enter => {
+                // backslash + return 续行(对齐真 cc useTextInput.ts:247-267):光标前一字节是
+                // ASCII '\'(0x5c)且处逻辑行尾(buffer 末尾或下一字节是 '\n')→ 删 '\' + 原位插 '\n'
+                // + 不提交。非白名单终端(Apple Terminal)Shift+Enter 发裸 \r→.enter,靠此换行;
+                // 白名单终端用 .shift_enter(13;2u)直接插 \n,不经此,两路径不冲突。
+                // '\'=0x5c 是 ASCII,UTF-8 多字节字节均 >= 0x80,前一字节直接比安全。
+                if (self.cursor > 0 and self.buf.items[self.cursor - 1] == '\\') {
+                    const at_eol = self.cursor == self.buf.items.len or self.buf.items[self.cursor] == '\n';
+                    if (at_eol) {
+                        self.pushUndo(); // .enter 不在上方 pushUndo 白名单,续行改 buffer 须显式压栈
+                        _ = self.buf.orderedRemove(self.cursor - 1); // 删 '\'
+                        self.cursor -= 1;
+                        try self.buf.insert(self.allocator, self.cursor, '\n'); // 原位插 '\n'
+                        self.cursor += 1;
+                        return .redraw;
+                    }
+                }
+                return .commit;
+            },
+            .shift_enter => {
                 try self.buf.insert(self.allocator, self.cursor, '\n');
                 self.cursor += 1;
                 return .redraw;
             },
+            // Ctrl+Enter(CSI-u 13;5u):真 cc v2.1.172 实测**不换行**(整个序列被吞:既不插
+            // \n 也不插字符),只 Shift+Enter 换行。对齐 → no-op。
+            .ctrl_enter => return .none,
             .backspace => {
                 if (self.cursor == 0) return .none;
                 const start = prevCharBoundary(self.buf.items, self.cursor);
@@ -612,6 +704,7 @@ pub const LineEditor = struct {
         for (self.undo_stack.items) |s| self.allocator.free(s.bytes);
         self.undo_stack.clearRetainingCapacity();
         self.last_op = null;
+        self.goal_vcol = null; // 整体替换 buffer(reset/setLine/clear)亦终结竖移流
     }
 
     /// 清空（用于 cancel / 历史覆盖写入）。
@@ -1019,6 +1112,26 @@ test "KeyParser: Ctrl+Enter via CSI u" {
     try testing.expect(p.feed('u').? == .ctrl_enter);
 }
 
+test "KeyParser: 无 mod CSI-u 文本键还原(Kitty disambiguate)" {
+    // ESC[97u(无 ;mod)= 'a' → .char='a'(兼容把纯文本也 CSI-u 编码的终端)。
+    var p = KeyParser{};
+    for ([_]u8{ 0x1b, '[', '9', '7' }) |b| try testing.expect(p.feed(b) == null);
+    const k = p.feed('u').?;
+    try testing.expect(@as(std.meta.Tag(Key), k) == .char);
+    try testing.expect(k.char == 'a');
+}
+
+test "KeyParser: 无 mod CSI-u Enter/Esc 还原" {
+    // ESC[13u → .enter(无 mod Enter,非 0x20-0x7e 范围,须显式)
+    var p1 = KeyParser{};
+    for ([_]u8{ 0x1b, '[', '1', '3' }) |b| try testing.expect(p1.feed(b) == null);
+    try testing.expect(p1.feed('u').? == .enter);
+    // ESC[27u → .esc
+    var p2 = KeyParser{};
+    for ([_]u8{ 0x1b, '[', '2', '7' }) |b| try testing.expect(p2.feed(b) == null);
+    try testing.expect(p2.feed('u').? == .esc);
+}
+
 test "KeyParser: CSI Delete still works" {
     var p = KeyParser{};
     for ([_]u8{ 0x1b, '[', '3' }) |b| try testing.expect(p.feed(b) == null);
@@ -1045,12 +1158,13 @@ test "LineEditor: shift_enter inserts newline without commit" {
     try testing.expect((try ed.handle(.enter)) == .commit);
 }
 
-test "LineEditor: ctrl_enter inserts newline" {
+test "LineEditor: ctrl_enter is no-op (对齐真 cc:只 shift_enter 换行)" {
     var ed = LineEditor.init(testing.allocator);
     defer ed.deinit();
     _ = try ed.handle(Key{ .char = 'x' });
-    _ = try ed.handle(.ctrl_enter);
-    try testing.expectEqualStrings("x\n", ed.view());
+    const action = try ed.handle(.ctrl_enter);
+    try testing.expect(action == .none); // 不换行、不提交
+    try testing.expectEqualStrings("x", ed.view()); // 缓冲不变,无 \n
 }
 
 test "LineEditor: no-op actions (esc / unknown)" {
@@ -1186,6 +1300,84 @@ test "LineEditor: multi-key stream through KeyParser" {
 test "enterRawMode on non-tty returns null or restores cleanly" {
     const orig = enterRawMode(0);
     if (orig) |o| restoreMode(0, o);
+}
+
+test "键盘协议序列字节(接线:enter/restore 发的就是这些)" {
+    // Kitty disambiguate(>1u)是 Warp/iTerm/kitty 等区分 Shift/Ctrl+Enter 的关键。
+    // 实测:Warp 收到 \x1b[>1u 后 Shift+Enter 才发 \x1b[13;2u。
+    try testing.expectEqualStrings("\x1b[<u\x1b[>1u\x1b[>4;2m", kbd_enable_seq);
+    try testing.expectEqualStrings("\x1b[<u\x1b[>4m", kbd_disable_seq);
+}
+
+test "classifyKittyKeyboard:白名单分流矩阵" {
+    // Apple Terminal(TERM=xterm-256color)→ 不发(根本不支持 Kitty,无条件发会乱)。
+    try testing.expect(!classifyKittyKeyboard("Apple_Terminal", "xterm-256color", false));
+    // 白名单 TERM_PROGRAM(含实测追加的 Warp)。
+    try testing.expect(classifyKittyKeyboard("WarpTerminal", "xterm-256color", false));
+    try testing.expect(classifyKittyKeyboard("iTerm.app", null, false));
+    try testing.expect(classifyKittyKeyboard("WezTerm", null, false));
+    try testing.expect(classifyKittyKeyboard("ghostty", null, false));
+    // TERM 子串命中(TERM_PROGRAM 可能不设)。
+    try testing.expect(classifyKittyKeyboard(null, "xterm-kitty", false));
+    try testing.expect(classifyKittyKeyboard(null, "xterm-ghostty", false));
+    // tmux 透传。
+    try testing.expect(classifyKittyKeyboard(null, "screen-256color", true));
+    // 默认/未知 → 不发。
+    try testing.expect(!classifyKittyKeyboard(null, "xterm-256color", false));
+    try testing.expect(!classifyKittyKeyboard(null, null, false));
+    try testing.expect(!classifyKittyKeyboard("vscode", "xterm-256color", false));
+}
+
+test "newlineHint:返两种文案之一(随当前 env)" {
+    // newlineHint 读真实 env;只断言它返回两种已知文案之一(避免依赖 CI env 具体值)。
+    const h = newlineHint();
+    const shift = "shift + \xe2\x8f\x8e for newline";
+    const backslash = "\\ + \xe2\x8f\x8e for newline";
+    try testing.expect(std.mem.eql(u8, h, shift) or std.mem.eql(u8, h, backslash));
+    // 含义自洽:能发 Kitty ⇔ 显示 shift 方式。
+    if (shouldEnableKittyKeyboard()) {
+        try testing.expectEqualStrings(shift, h);
+    } else {
+        try testing.expectEqualStrings(backslash, h);
+    }
+}
+
+test "LineEditor: backslash+return 行尾续行(Apple Terminal 换行)" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    for ("abc\\") |c| _ = try ed.handle(Key{ .char = c }); // 打 "abc\"
+    const action = try ed.handle(.enter);
+    try testing.expect(action == .redraw); // 不提交
+    try testing.expectEqualStrings("abc\n", ed.view()); // 删 \ 插 \n
+    try testing.expectEqual(@as(usize, 4), ed.cursor);
+    // 续行后继续打字
+    _ = try ed.handle(Key{ .char = 'd' });
+    try testing.expectEqualStrings("abc\nd", ed.view());
+}
+
+test "LineEditor: 无尾 backslash 的 enter 仍提交" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    for ("abc") |c| _ = try ed.handle(Key{ .char = c });
+    try testing.expect((try ed.handle(.enter)) == .commit);
+}
+
+test "LineEditor: 行中 backslash 不触发续行" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    try ed.setLine("a\\b"); // "a\b",cursor 在末尾
+    ed.cursor = 2; // 光标在 '\' 后、'b' 前(行中,非行尾)
+    try testing.expect((try ed.handle(.enter)) == .commit); // 不续行
+}
+
+test "LineEditor: backslash 续行可 undo" {
+    var ed = LineEditor.init(testing.allocator);
+    defer ed.deinit();
+    for ("ab\\") |c| _ = try ed.handle(Key{ .char = c });
+    _ = try ed.handle(.enter); // 续行 → "ab\n"
+    try testing.expectEqualStrings("ab\n", ed.view());
+    _ = try ed.handle(.ctrl_underscore); // undo
+    try testing.expectEqualStrings("ab\\", ed.view());
 }
 
 test "KeyParser: ctrl_underscore byte 0x1f" {

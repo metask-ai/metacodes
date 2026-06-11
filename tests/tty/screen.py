@@ -70,14 +70,21 @@ class Cell:
 
 
 class Screen:
-    def __init__(self, rows: int = 24, cols: int = 80):
+    def __init__(self, rows: int = 24, cols: int = 80, autowrap: bool = False):
         self.rows = rows
         self.cols = cols
+        # autowrap=False(默认):理想终端——col>=cols 直接截断(实现端自己软折,现有用例据此写)。
+        # autowrap=True:严格 DEC 终端(如 Apple Terminal)——写满最后一列进入 pending-wrap
+        #   (DEC Last-Column Flag),下个可打印字符才真换行。用于复现"终端 autowrap 致框线错位"。
+        self.autowrap = autowrap
         self.grid = [[Cell() for _ in range(cols)] for _ in range(rows)]
         self.row = 0
         self.col = 0
         self.cursor_visible = True
         self.scrolled = 0
+        self._pending_wrap = False  # DEC Last-Column Flag(仅 autowrap=True 用)
+        self.sync_depth = 0  # ?2026h/l 配对计数(BSU/ESU)
+        self.max_sync_depth = 0
         # DECSC/DECRC 存档的光标位置(ESC 7 / ESC 8)。
         self._saved_row = 0
         self._saved_col = 0
@@ -106,9 +113,12 @@ class Screen:
                 continue
             if b == 0x0D:  # \r
                 self.col = 0
+                self._pending_wrap = False
                 i += 1
                 continue
             if b == 0x0A:  # \n
+                # autowrap 下若处 pending-wrap:DEC 语义是 \n 仍只下移一行(延迟换行不叠加)。
+                self._pending_wrap = False
                 self._newline()
                 i += 1
                 continue
@@ -208,6 +218,13 @@ class Screen:
             # ?25l/h 光标显隐
             if private == b"?" and ps and ps[0] == 25:
                 self.cursor_visible = f == "h"
+            # ?2026h/l Synchronized Output(BSU/ESU):记配对深度,供断言"整帧原子包裹"。
+            elif private == b"?" and ps and ps[0] == 2026:
+                if f == "h":
+                    self.sync_depth += 1
+                    self.max_sync_depth = max(self.max_sync_depth, self.sync_depth)
+                elif f == "l" and self.sync_depth > 0:
+                    self.sync_depth -= 1
             # ?1049h/l alt-screen:h=保存主屏(grid+光标)并清屏切到 alt;l=恢复主屏到进入前。
             # 真实终端行为——transcript viewer 靠它保护 scrollback、退出原样恢复输入框。
             elif private == b"?" and ps and ps[0] == 1049:
@@ -223,16 +240,22 @@ class Screen:
                         self._alt_saved = None
             return
         if f == "A":  # up
+            self._pending_wrap = False
             self.row = max(0, self.row - max(1, n1))
         elif f == "B":  # down
+            self._pending_wrap = False
             self.row = min(self.rows - 1, self.row + max(1, n1))
         elif f == "C":  # right
+            self._pending_wrap = False
             self.col = min(self.cols - 1, self.col + max(1, n1))
         elif f == "D":  # left
+            self._pending_wrap = False
             self.col = max(0, self.col - max(1, n1))
         elif f == "G":  # 绝对列(1-based)
+            self._pending_wrap = False
             self.col = max(0, min(self.cols - 1, (n1 if ps else 1) - 1))
         elif f == "H" or f == "f":  # 绝对定位(1-based)
+            self._pending_wrap = False
             r = (ps[0] if len(ps) >= 1 and ps[0] else 1) - 1
             c = (ps[1] if len(ps) >= 2 and ps[1] else 1) - 1
             self.row = max(0, min(self.rows - 1, r))
@@ -350,8 +373,21 @@ class Screen:
         return "plain"
 
     def _put_char(self, ch: str, w: int):
+        if self.autowrap:
+            # 严格 DEC autowrap:若处 pending-wrap,先延迟换行(下移+回列0)再放字符。
+            if self._pending_wrap:
+                self._pending_wrap = False
+                self.col = 0
+                self._newline()
+            # 宽字符放不下当前行尾 → 也触发换行(简化:宽字符不跨行折半)。
+            if w == 2 and self.col == self.cols - 1:
+                self.col = 0
+                self._newline()
+        else:
+            if self.col >= self.cols:
+                return  # 理想终端:实现端软折,不写溢出;防御性截断
         if self.col >= self.cols:
-            return  # 实现端软折行,不应写溢出;防御性截断
+            return
         cell = self.grid[self.row][self.col]
         cell.ch = ch
         cell.width = max(1, w)
@@ -364,8 +400,14 @@ class Screen:
             cont.ch = ""
             cont.border_class = self.cur_class
         self.col += max(1, w)
-        if self.col > self.cols:
-            self.col = self.cols
+        if self.autowrap:
+            # 写到最后一列:进入 pending-wrap(光标停在末列,不立即换行)。
+            if self.col >= self.cols:
+                self.col = self.cols - 1
+                self._pending_wrap = True
+        else:
+            if self.col > self.cols:
+                self.col = self.cols
 
     def _newline(self):
         if self.row >= self.rows - 1:

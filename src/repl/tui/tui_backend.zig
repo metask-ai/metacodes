@@ -494,7 +494,7 @@ pub const TuiBackend = struct {
 
         // 走到这:dispatch 未消费该键(pass_to_editor,无弹层激活)。按键类型决定生成期语义。
         switch (key) {
-            .enter, .shift_enter, .ctrl_enter => {
+            .enter, .shift_enter => {
                 // 回车 → 入待发送队列(非空才入)+ clear。不立即发。
                 const v = ed.view();
                 const trimmed = std.mem.trim(u8, v, " \t\r\n");
@@ -506,6 +506,8 @@ pub const TuiBackend = struct {
                 self.region.redrawGen(app);
                 return;
             },
+            // Ctrl+Enter:真 cc 实测无效键(不换行/不提交)→ 生成期同样 no-op,不入队不重画。
+            .ctrl_enter => return,
             .esc => {
                 // 无弹层的 esc → 中断推理。框里已打的字先入队(不丢,中断后自动续发),再 abort。
                 const v = ed.view();

@@ -78,8 +78,8 @@ test "dispatch: 全局键上抛 LoopAction(输入期)——shift_tab/ctrl_l/up/d
     var s = UiState{}; // phase=.input
     try testing.expectEqual(event.LoopAction.cycle_perm_mode, ui.dispatch(&s, keyTag(.shift_tab)).action);
     try testing.expectEqual(event.LoopAction.redraw_screen, ui.dispatch(&s, keyTag(.ctrl_l)).action);
-    try testing.expectEqual(event.LoopAction.history_prev, ui.dispatch(&s, keyTag(.up)).action);
-    try testing.expectEqual(event.LoopAction.history_next, ui.dispatch(&s, keyTag(.down)).action);
+    try testing.expectEqual(event.LoopAction.cursor_up, ui.dispatch(&s, keyTag(.up)).action);
+    try testing.expectEqual(event.LoopAction.cursor_down, ui.dispatch(&s, keyTag(.down)).action);
     try testing.expectEqual(event.LoopAction.complete, ui.dispatch(&s, keyTag(.tab)).action);
     try testing.expectEqual(event.LoopAction.reverse_search, ui.dispatch(&s, keyTag(.ctrl_r)).action);
     try testing.expectEqual(event.LoopAction.external_edit, ui.dispatch(&s, keyTag(.ctrl_g)).action);
@@ -254,11 +254,12 @@ test "dispatch: slash 菜单开 → Tab 上抛 slash_complete" {
     try testing.expectEqual(event.LoopAction.slash_complete, e.action);
 }
 
-test "dispatch: slash 菜单关(普通文本) → Up 仍走 history(不抢键)" {
+test "dispatch: slash 菜单关(普通文本) → Up 落到 cursor_up(不抢键)" {
     var s = UiState{};
     _ = ui.dispatch(&s, .{ .editor_view = .{ .view = "hello", .cursor = 5 } });
     const e = ui.dispatch(&s, keyTag(.up));
-    try testing.expectEqual(event.LoopAction.history_prev, e.action);
+    // slash 菜单关时不抢 Up;落到全局 fallthrough = cursor_up(loop 据可视行边界决定竖移/历史)。
+    try testing.expectEqual(event.LoopAction.cursor_up, e.action);
     try testing.expectEqual(@as(usize, 0), s.slash_sel);
 }
 
@@ -308,12 +309,12 @@ test "dispatch: @ 菜单 → Enter/Tab 上抛 at_select" {
     try testing.expectEqual(event.LoopAction.at_select, ui.dispatch(&s, keyTag(.tab)).action);
 }
 
-test "dispatch: 非 @ token(普通文本)→ Up 仍走 history(不抢键)" {
+test "dispatch: 非 @ token(普通文本)→ Up 落到 cursor_up(不抢键)" {
     var s = UiState{};
     _ = ui.dispatch(&s, .{ .editor_view = .{ .view = "hello @ world", .cursor = 13 } });
-    // 光标在 "world" 上,当前 token 非 @ → 不激活 @ 菜单。
+    // 光标在 "world" 上,当前 token 非 @ → 不激活 @ 菜单 → 落到全局 cursor_up。
     const e = ui.dispatch(&s, keyTag(.up));
-    try testing.expectEqual(event.LoopAction.history_prev, e.action);
+    try testing.expectEqual(event.LoopAction.cursor_up, e.action);
 }
 
 test "atMenuActive: 仅当前 token 以 @ 开头才激活" {
