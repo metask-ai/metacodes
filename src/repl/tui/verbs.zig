@@ -26,21 +26,6 @@ pub const verbs = [_][]const u8{
 /// spinner 动画帧字符(有颜色能力时用)。每 tick 推进一帧。
 pub const frames = [_][]const u8{ "✻", "✦", "✶", "✺", "✷", "✸" };
 
-/// 完成态过去式动词(对齐 cc `✻ <Verb> for Ns`:Brewed/Cogitated/Sautéed…)。
-/// 完成态 verb 独立于生成期 verb(cc 实测完成态另取一词),按 seed 整轮固定。
-pub const verbs_past = [_][]const u8{
-    "Thought",     "Pondered",    "Cooked",     "Brewed",        "Conjured",
-    "Noodled",     "Computed",    "Crunched",   "Churned",       "Tinkered",
-    "Wrangled",    "Sculpted",    "Assembled",  "Orchestrated",  "Synthesized",
-    "Untangled",   "Percolated",  "Marinated",  "Distilled",     "Reticulated",
-    "Calibrated",  "Forged",      "Wove",       "Spun",          "Hatched",
-    "Plotted",     "Schemed",     "Divined",    "Channeled",     "Summoned",
-    "Crafted",     "Polished",    "Tuned",      "Wired",         "Stitched",
-    "Composed",    "Drafted",     "Mulled",     "Ruminated",     "Cogitated",
-    "Processed",   "Calculated",  "Iterated",   "Deliberated",   "Considered",
-    "Whirred",     "Buzzed",      "Hummed",     "Simmered",      "Bubbled",
-};
-
 /// monochrome / 无 unicode 时的降级帧。
 pub const frames_ascii = [_][]const u8{ "|", "/", "-", "\\" };
 
@@ -49,11 +34,6 @@ pub fn pick(seed: u64) []const u8 {
     return verbs[@intCast(seed % verbs.len)];
 }
 
-/// 按 seed 取一个完成态过去式动词(整轮固定;与 pick 同 seed 但不同表 → 完成态独立换词)。
-pub fn pickPast(seed: u64) []const u8 {
-    // 加偏移避免与 pick 同 index 取到对应进行/过去同源词,贴 cc"完成态另取一词"观感。
-    return verbs_past[@intCast((seed +% 7) % verbs_past.len)];
-}
 
 /// 按 frame 序号取动画字符。use_unicode=false 用 ASCII 降级集。
 pub fn frame(idx: u8, use_unicode: bool) []const u8 {

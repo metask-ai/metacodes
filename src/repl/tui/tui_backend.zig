@@ -551,6 +551,10 @@ pub const TuiBackend = struct {
                 return;
             },
             .open_transcript => {
+                // Ctrl+O 去抖:按住("不断 Ctrl+O")的 auto-repeat 连发会高频 toggle alt-screen,
+                // 真终端(Warp)跟不上 → footer 多行堆叠 + 退出后框不幂等。抑制紧随的 reopen,
+                // 使按住一次只产生一对 open/close(单次 toggle 干净路径)。见 RenderRegion.noteCtrloAndShouldSuppressReopen。
+                if (self.region.noteCtrloAndShouldSuppressReopen()) return;
                 // 生成期 Ctrl+O → 全屏 transcript viewer(alt-screen,2026-06-13 根治多 agent"显两份")。
                 // enterExclusiveOverlay 持渲染锁(emit 线程阻塞在锁上、不抢 stdout);viewer 自己进/出
                 // alt-screen 独立缓冲(ESC[?1049h/l)全屏画 transcript,退出由终端**自动恢复主缓冲**;

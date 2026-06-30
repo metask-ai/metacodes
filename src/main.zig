@@ -198,6 +198,14 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(code);
     }
 
+    // 交互式 TUI 拥有终端:禁止日志写 stderr(fd 2),否则 err/warn 与渲染(render_region.flush 也走
+    // std.debug.print→fd 2)字节级交错,把固定区写花、滚屏 desync。日志仍写文件(METACODES_LOG_FILE)。
+    // **gate 必须查渲染所在的 fd 2**(不是 fd 1):`metacodes >file` 只重定向 stdout、TUI 仍渲染到 fd 2 的
+    // 终端,此时也要抑制日志。verbose(用户显式要日志)/ fd 2 非 tty(无终端可写花)不关。
+    if (!config.verbose and std.c.isatty(2) != 0) {
+        log.setStderrEnabled(false);
+    }
+
     try repl.run(app, allocator);
 }
 

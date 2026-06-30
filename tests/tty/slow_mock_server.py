@@ -36,6 +36,49 @@ def slow_text_then_tooluse(n_chunks=15, delay=0.5, tool="Read", tool_input='{"fi
     return b''.join(parts)
 
 
+def slow_text_then_end(n_chunks=14, delay=0.4):
+    """慢吐 N 个 text chunk(每块 delay 秒)后以 end_turn 收尾(单 turn 干净结束)。
+    用于需要"宽生成窗口然后确定性停下"的 tty 测试(如生成期反复 Ctrl+O → 停止后查幂等)。
+    无 tool_use → 不进 turn2、不依赖文件,整条流就是一次生成到结束。"""
+    parts = [
+        b'data: {"type":"message_start","message":{"id":"m1","role":"assistant","model":"x","usage":{"input_tokens":1,"output_tokens":1}}}\n\n',
+        b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+    ]
+    for i in range(n_chunks):
+        parts.append((b'__DELAY__%f\n' % delay))
+        parts.append(('data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"tok%d "}}\n\n' % i).encode())
+    parts += [
+        b'data: {"type":"content_block_stop","index":0}\n\n',
+        b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\n',
+        b'data: {"type":"message_stop"}\n\n',
+    ]
+    return b''.join(parts)
+
+
+def slow_websearch_subrequest(delay=0.5, n_delay=14, title="AI News Today", url="https://example.com"):
+    """WebSearch 工具的**隔离子请求** turn(web_search.zig execute → client.sendMessageStreamFull)。
+    server_tool_use(web_search)→ [慢:n_delay×delay 秒空窗,期间 `⏺ Web Search` 进度卡常驻底部固定区]→
+    web_search_tool_result(含一条 title/url)→ 模型摘要 text → end_turn。
+    用于"生成期有进度卡时按住 Ctrl+O"的 tty 复现:慢窗口让卡停在屏上,期间注入 Ctrl+O burst。"""
+    p = [
+        b'data: {"type":"message_start","message":{"id":"ws","role":"assistant","model":"x","usage":{"input_tokens":1,"output_tokens":1}}}\n\n',
+        b'data: {"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srv_1","name":"web_search","input":{}}}\n\n',
+        b'data: {"type":"content_block_stop","index":0}\n\n',
+    ]
+    for _ in range(n_delay):
+        p.append(b'__DELAY__%f\n' % delay)
+    p += [
+        ('data: {"type":"content_block_start","index":1,"content_block":{"type":"web_search_tool_result","tool_use_id":"srv_1","content":[{"type":"web_search_result","title":"%s","url":"%s"}]}}\n\n' % (title, url)).encode(),
+        b'data: {"type":"content_block_stop","index":1}\n\n',
+        b'data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}\n\n',
+        b'data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"AI news summary."}}\n\n',
+        b'data: {"type":"content_block_stop","index":2}\n\n',
+        b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}\n\n',
+        b'data: {"type":"message_stop"}\n\n',
+    ]
+    return b''.join(p)
+
+
 def simple_text(text="SHOULD_NOT_REACH"):
     return (
         b'data: {"type":"message_start","message":{"id":"m2","role":"assistant","model":"x","usage":{"input_tokens":1,"output_tokens":1}}}\n\n'

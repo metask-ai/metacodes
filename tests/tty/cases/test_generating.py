@@ -215,6 +215,104 @@ def test_T24_esc_interrupts_then_resends_queue(bin_path):
         a._fail("中断后队列消息未自动续发提交")
 
 
+def test_completion_spinner_never_commits_to_history(bin_path):
+    # 用户实测 bug:每次回答完,spinner 的完成态词("✻ Hatched for 1s" / "Cooked for 1s" / "Drafted
+    # for 2s")被 commit 进**历史消息区**,多轮后一行行堆噪声。产品决策:**spinner 根本不该进历史区**
+    # —— 它是纯瞬态指示器,生成结束随固定区一起擦掉,不留任何完成态行。
+    # (旧版 leaveGenerating 每轮 ≥0.5s 就 emitFinishedSpinner;cc 默认仅 >30s 长轮有 turn_duration
+    #  系统消息,但用户明确要求 cc-zig 不要它。此处已彻底移除 emitFinishedSpinner。)
+    # 为什么旧 tty 测试没发现:无任何用例断言"完成态行不入 scrollback";且我此前探针里见过该行却
+    # 误判成"cc 正常思考总结"放过(确认偏差)。test_overlay 的 spinner-residue 测试只断言 ≤1 行,
+    # 反而容忍了它。本测试用离线 mock 多轮短对话,钉死 committed scrollback 里**零**完成态行。
+    import re
+    from slow_mock_server import SlowMockServer, slow_text_then_end
+    from asserts import split_frames
+
+    # 两轮短对话(各 ~1.6s),复刻用户"在么 / 你是谁"多轮场景。离线 mock,确定性。
+    turns = [slow_text_then_end(n_chunks=4, delay=0.4), slow_text_then_end(n_chunks=4, delay=0.4)]
+    with SlowMockServer(turns) as srv:
+        raw = run(bin_path,
+                  ["sleep:0.8", "type:在么", "key:enter", "sleep:3.0",
+                   "type:你是谁", "key:enter", "sleep:3.0"],
+                  base_url=srv.url, startup_drain=0.8, per_key_drain=0.06, term_size=(24, 80))
+
+    # committed scrollback(帧间散文本 = 真正进历史区的字节)。
+    prose = re.sub(rb"\x1b\[[0-9;?>]*[A-Za-z]", b"",
+                   b"".join(c for k, c in split_frames(raw) if k == "prose")).decode("utf-8", "replace")
+    # 完成态行形态:`<spinner字符> <Verb> for <N>s`(区别于生成期实时 spinner 的 `<Verb>… (Ns)`,后者带 …)。
+    completion = re.compile(r"[✻✦✶✺✷✸]\s+\w+\s+for\s+\d+s")
+    hits = completion.findall(prose)
+    assert not hits, (
+        "完成态 spinner 行被 commit 进历史区(应彻底不入,用户实测 bug):%r\n--- scrollback ---\n%s"
+        % (hits, prose[-1200:]))
+    # 兜底:连"for Ns"裸形态也不该在历史区(mock 助手文本不含 for,故任何命中即 bug)。
+    assert not re.search(r"\bfor \d+s\b", prose), \
+        "历史区出现 'for Ns'(完成态行残留):\n" + prose[-1200:]
+
+
+def test_logs_never_leak_into_tui_render_stream(bin_path):
+    # 用户实测(Warp):web 搜索时 spinner 在 input 上方留**残影**堆叠。根因(offline 复现坐实):
+    #   日志默认级别 .err → err/warn 写 **stderr(fd 2)**,而交互式 TUI 渲染走 fd 1——同一终端。
+    #   任何 err(web 搜索是最易出错路径:真后端 HTTP 子请求 / JSON 解析)直接**注入渲染流**,
+    #   插进固定区(实测插进 footer 行 `esc to interrupt[ERROR client ...]`)→ 滚屏 desync →
+    #   in-place 区重画错位 → spinner/footer 一行行堆进 scrollback。
+    #   离线干净 mock 不 err → 从不复现;这是真机 + 出错路径才暴露,靠 HTTP-500 mock 离线钉死。
+    # 修:交互式 TUI(isatty + 非 verbose)启动时 log.setStderrEnabled(false) → 日志不上屏
+    #   (仍写 METACODES_LOG_FILE);用户可见错误走正规 UI 通道(retry/卡),非裸日志。
+    import re
+    import http.server
+    import socketserver
+    import threading
+    from asserts import split_frames
+
+    OK_SSE = (
+        b'data: {"type":"message_start","message":{"id":"m","role":"assistant","model":"x","usage":{"input_tokens":1,"output_tokens":1}}}\n\n'
+        b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+        b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n'
+        b'data: {"type":"content_block_stop","index":0}\n\n'
+        b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n'
+        b'data: {"type":"message_stop"}\n\n'
+    )
+    state = {"n": 0}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            ln = int(self.headers.get("content-length", 0))
+            self.rfile.read(ln)
+            state["n"] += 1
+            if state["n"] <= 2:  # 前两连接 500 → 触发 client err 日志(+ 重试)
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(b'{"error":"boom"}')
+            else:
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(OK_SSE)
+                self.wfile.flush()
+
+    socketserver.TCPServer.allow_reuse_address = True
+    srv = socketserver.TCPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        raw = run(bin_path, ["sleep:0.8", "type:hi", "key:enter", "sleep:5"],
+                  base_url="http://127.0.0.1:%d/v1/messages" % port,
+                  startup_drain=0.8, per_key_drain=0.05, term_size=(24, 80))
+    finally:
+        srv.shutdown()
+
+    det = re.sub(rb"\x1b\[[0-9;?>]*[A-Za-z]", b"", raw).decode("utf-8", "replace")
+    # 核心:任何日志前缀都不得出现在 TUI 渲染流里(否则注入固定区 → 残影)。
+    assert "[ERROR" not in det, "err 日志泄漏进 TUI 渲染流(会注入固定区致残影):\n" + \
+        "\n".join(l for l in det.split("\n") if "ERROR" in l)[:600]
+    assert "[WARN" not in det, "warn 日志泄漏进 TUI 渲染流:\n" + \
+        "\n".join(l for l in det.split("\n") if "WARN" in l)[:600]
+
+
 def test_A6_narrow_terminal_no_wrap(bin_path):
     # 窄终端 cols=40:生成期 spinner 行被截断到 cols-1,不触发 DECAWM 折行 →
     # 区实际行数 = R,底部框/footer 不错位。断言:生成期共存帧的可见行宽不超 cols。

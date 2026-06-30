@@ -36,6 +36,10 @@ const Theme = theme_mod.Theme;
 const ColorCapability = term.ColorCapability;
 
 pub const RenderRegion = struct {
+    /// Ctrl+O 重开去抖窗口(ms)。键盘 auto-repeat 通常 ≤66ms/次(>15/s),故 120ms 能折叠
+    /// "按住"连发,又远小于人为"开→关→再开"的有意间隔 → 不误伤故意快速 toggle。见 noteCtrloAndShouldSuppressReopen。
+    const OVERLAY_REOPEN_DEBOUNCE_MS: i64 = 120;
+
     fd: std.c.fd_t,
     cols: u16 = 80,
     rows: u16 = 24,
@@ -64,6 +68,8 @@ pub const RenderRegion = struct {
     text_pending_newline: bool = false,
     pending_col: u16 = 0, // 半行 chunk 累计显示列(消息穿过续接用)
     region_drawn: bool = false, // 生成期固定区当前是否画在屏上(true ⟹ 光标钉区顶行首)
+    // Ctrl+O alt-screen toggle 去抖时戳(单调 ms;0=从未)。见 noteCtrloAndShouldSuppressReopen。
+    last_overlay_ctrlo_ms: i64 = 0,
     // 画区时对续接点的快照:eraseRegion 必须按"画区那一刻"的半行状态还原,
     // 而非用 live 的 text_pending_newline/pending_col——后者会被 writeGenText.updatePendingTail
     // 在一对 draw/erase 之间改掉,导致 erase 选错分支 → 光标错位一行 → print 落到 scrollback。
@@ -113,6 +119,29 @@ pub const RenderRegion = struct {
     /// 注:enter 里的 eraseRegion / overlay_region_height / 半行封口是旧 inline(DECSC)模式遗留,
     /// alt-screen 下不再被 viewer 依赖(独立缓冲全屏绝对定位);保留仅遵守"其他保持不变"scope,
     /// overlay_region_height 已是死量(viewer 丢弃 anchor_hint),后续清理时一并删。
+    /// Ctrl+O alt-screen toggle 去抖。键盘 auto-repeat(按住 Ctrl+O / "不断 Ctrl+O")会发一连串
+    /// CSI-u(`ESC[111;5u`,白名单终端如 Warp)或裸 0x0f → 每个都 toggle 一次 transcript viewer
+    /// 的 alt-screen(`ESC[?1049h`/`l`)。真终端(用户实测 Warp)跟不上这种高频 alt-screen 切换 →
+    /// footer 多行堆叠 + 退出后输入框不幂等(偏移/残留)。离线 pty 复现不出(Screen 模型如实
+    /// 模拟 alt-screen 存/复原,1049h/l 配对即干净),但真机抖动是确凿的。
+    ///
+    /// 修法:open 前调本函数,**记下本次 Ctrl+O 时戳**(故名 note...),并返回是否抑制——若距上次
+    /// Ctrl+O < 阈值则抑制重开,使"按住一次"只产生一对 open/close(viewer 自身的 close 仍正常,
+    /// 只压住紧随其后的 reopen)。每次 Ctrl+O 都刷新时戳,按住期间持续刷新 → 全程不重开;松开后
+    /// (间隔 > 阈值)的下次 Ctrl+O 正常开。close 由 viewer 内部消费、不经此门 → 故意打开再关闭恒生效。
+    /// 返回 true = 本次应被抑制(调用方不开 viewer)。**有副作用**(写 last_overlay_ctrlo_ms),名字已点明。
+    ///
+    /// 线程安全:`last_overlay_ctrlo_ms` 只被 Ctrl+O 处理路径碰。生成期由 watcher 线程调(tui_backend),
+    /// 输入期由主线程调(loop.zig)——两期**时间互斥**(要么在生成、要么在输入提示符,绝不并发),
+    /// 故无并发读写,不需锁。即便退一万步有 torn read:aligned i64 在 arm64/x86-64 上读写本就原子,
+    /// 且值是单调时戳,最坏结果只是去抖窗口偏一下,绝不崩。
+    pub fn noteCtrloAndShouldSuppressReopen(self: *RenderRegion) bool {
+        const now = util_time.nowMs();
+        const prev = self.last_overlay_ctrlo_ms;
+        self.last_overlay_ctrlo_ms = now;
+        return prev != 0 and (now - prev) < OVERLAY_REOPEN_DEBOUNCE_MS;
+    }
+
     pub fn enterExclusiveOverlay(self: *RenderRegion) void {
         self.lock();
         // 半行封口(text_pending_newline 时补 \n):旧 inline 模式为对齐 DECSC 存档点在行首。alt-screen 下
@@ -144,9 +173,10 @@ pub const RenderRegion = struct {
     }
     pub fn exitExclusiveOverlay(self: *RenderRegion, app: *const app_mod.App) void {
         if (self.generating) {
-            // alt-screen 退出(viewer 的 defer ov.exit())已由终端自动恢复主缓冲;区状态已在 enter 清零
-            // (region_drawn=false)。直接 drawGenRegion 在恢复后的主缓冲上重画固定区(不 eraseRegion——
-            // 无旧区可擦,陈旧定位会擦错行)。
+            // footer 残影根因(真机 Warp + DSR 诊断坐实):alt-screen 退出 `?1049l` 主缓冲恢复**不精确**
+            // (游标列不还原、偶尔行偏 1),旧版"假设恢复干净直接重画"→ 旧固定区行残留。
+            // 修复点不在这里特判,而在 drawGenRegion 开头的 `ESC[0J`(每次区重画都把区下方主动清净)——
+            // 单一机制、不依赖 ?1049/DECRC 的恢复精度(DSR 证明 Warp 对 DECSC/DECRC 也不还原列,已删那条死路)。
             self.drawGenRegion(app);
         }
         self.unlock();
@@ -1133,12 +1163,11 @@ pub const RenderRegion = struct {
             self.text_pending_newline = false;
             self.pending_col = 0;
         }
-        // -- 完成态 spinner:提交进 scrollback(对齐 cc `✻ Verb for Ns`)--
-        // 仅当本轮有可感知耗时(≥0.5s)才显,避免瞬时轮出现 "for 0s" 噪声。
-        const gen_elapsed: u64 = @intCast(@max(util_time.nowMs() -% self.ui.spinner.start_ms, 0));
-        if (gen_elapsed >= 500) {
-            self.emitFinishedSpinner(gen_elapsed);
-        }
+        // -- 完成态 spinner:**不**提交进 scrollback(产品决策)--
+        // spinner 是纯瞬态指示器,生成结束即随固定区一起擦掉(上面 eraseRegion 已抹掉),不留任何
+        // `✻ Verb for Ns` 进历史消息区。旧版每轮(≥0.5s)都 commit 一行 → 1~2s 琐碎短轮也堆噪声
+        // (用户实测 bug)。注:cc 默认有 turn_duration 系统消息(REPL.tsx:2970,仅 >30s 长轮),
+        // 但用户明确要求 cc-zig 不要它 → 此处不对齐 cc,彻底不提交。
         self.generating = false;
         self.ui.phase = .input; // 同步:退生成期 → 输入期(双写过渡)
         self.region_drawn = false;
@@ -1496,21 +1525,6 @@ pub const RenderRegion = struct {
         return @min(i + 2, s.len); // 两字节转义兜底
     }
 
-    /// 提交完成态 spinner 行进 scrollback(对齐 cc `✻ <Verb过去式> for Ns`,无 token——
-    /// cc 短任务实测 `✻ Brewed for 1s`)。verb 用 pickPast(同 seed = spinner.start_ms,整轮固定);
-    /// 区已在 leaveGenerating 擦掉,此处当作普通 scrollback 行 emit(emitToScroll 会处理区在/不在)。
-    fn emitFinishedSpinner(self: *RenderRegion, elapsed_ms: u64) void {
-        const th = self.theme;
-        const fr = verbs.frame(0, self.use_unicode); // 完成态用固定 ✻(frames[0])
-        const verb_past = verbs.pickPast(@bitCast(self.ui.spinner.start_ms));
-        const secs: f64 = @as(f64, @floatFromInt(elapsed_ms)) / 1000.0;
-        var buf: [160]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "{s}{s} {s}{s}{s} for {d:.0}s{s}\n", .{
-            th.accent, fr, th.reset, th.dim, verb_past, secs, th.reset,
-        }) catch return;
-        self.emitToScroll(line);
-    }
-
     /// 实际把一段文本输出到 scrollback:擦区(若在)→ print → 若刚才区在屏则重画区。
     /// print 仅在 region_drawn==false 时发生(eraseRegion 后),draw/erase 成对、续接点用画区快照还原。
     fn emitToScroll(self: *RenderRegion, text: []const u8) void {
@@ -1583,6 +1597,13 @@ pub const RenderRegion = struct {
         } else {
             w.writeAll("\r") catch {};
         }
+        // 区重画自清:此刻光标在区顶行首,且在已提交文本**下方**(上面 \r/\n 已让过半行文本)。
+        // 从这里 `ESC[0J` 清到屏末,吃掉区**下方**的任何陈旧尾行(工具卡完成/队列变化致区收缩遗留),
+        // **单一机制**取代旧的 per-shrink 尾行擦除。只清光标下方,绝不碰上方 scrollback、不滚动、
+        // 不清 scrollback(区别于禁用的 ESC[2J),offline 区已干净 → 无副作用。
+        // (注:曾试图用它修 Warp 的 alt-screen `?1049l` footer 残影,但真机诊断证明那是 Warp 渲染 bug,
+        //  ESC[0J 治不了——见 commit message 的根因诊断;此处保留仅因它是正确的区收缩自清单一机制。)
+        w.writeAll(ansi.clear.to_end_of_screen) catch {};
 
         const inner_w: usize = self.innerWidth();
         const border_color = self.borderColor(app.config.permission_mode);
@@ -1669,17 +1690,8 @@ pub const RenderRegion = struct {
         // Agent switcher(区域2):footer 下方,占额外行(生成期 `↓ to manage` 进入)。
         R += self.drawAgentSwitcher(w, app);
 
-        // 光标在 footer 行末 = 区最后一行(第 R-1 行)。
-        // 收缩残留擦除:若新 R < 上次画的 prev_rows,清掉多余尾行。
-        if (R < self.prev_rows) {
-            const diff = self.prev_rows - R;
-            var k: u16 = 0;
-            while (k < diff) : (k += 1) {
-                w.writeAll("\r\n") catch {};
-                w.writeAll(ansi.clear.line) catch {};
-            }
-            w.writeAll(ansi.cursor.up(diff, &nb)) catch {};
-        }
+        // 光标在 footer 行末 = 区最后一行(第 R-1 行)。区下方的陈旧尾行已由开头的 ESC[0J 清净
+        // (单一机制),不再需要旧的 per-shrink 尾行擦除。
 
         // -- 光标落在 editor 编辑点(供 IME 候选窗对齐)--
         // 编辑点区内行号 = 上边框行号 + 1(❯ 行)+ loc.vline;列 = 2(prefix)+ loc.vcol。

@@ -1064,6 +1064,10 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
                     continue;
                 },
                 .open_transcript => {
+                    // Ctrl+O 去抖:按住的 auto-repeat 连发会高频 toggle alt-screen,真终端(Warp)
+                    // 跟不上 → footer 多行堆叠 + 退出后框不幂等。抑制紧随的 reopen,使按住一次只
+                    // 产生一对 open/close。见 RenderRegion.noteCtrloAndShouldSuppressReopen(生成期同源处理)。
+                    if (region.noteCtrloAndShouldSuppressReopen()) continue;
                     // Ctrl+O → inline transcript viewer(方案 A:不覆盖 banner)。region.clear() 擦固定区
                     // + 光标停区顶(=内容结束下一行,banner 在其上方保留)+ 清零 input_cursor_row;
                     // viewer 从区顶 DECSC 存档往下画 transcript,退出回区顶 + ESC[J 清掉,redraw 从区顶

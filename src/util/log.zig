@@ -47,6 +47,10 @@ var g_module_filters: []const ModuleFilter = &.{};
 var g_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
 var g_log_file_fd: ?std.c.fd_t = null;
 var g_initialized: bool = false;
+/// 是否往 stderr(fd 2)写日志。交互式 TUI 拥有终端时**必须关掉**——否则任何 err/warn 直接
+/// 注入渲染流(fd 1/2 同一终端),把固定区写花、滚屏 desync(实测:web 搜索的 HTTP err 注入
+/// footer 行 → spinner/footer 残影堆叠)。关掉后日志仍写文件(METACODES_LOG_FILE),只是不上屏。
+var g_stderr_enabled: bool = true;
 
 /// request_id 递增计数器。首次生成时用进程启动时间做高位，保证不同进程不撞。
 /// 16-hex-char 字符串，格式 {seed16:x}{seq8:x}，seed 取 clock_gettime 低 32 位。
@@ -201,7 +205,9 @@ fn logImpl(level: Level, module: []const u8, id: ?RequestId, comptime fmt: []con
         if (msg_buf_start + tail.len < buf.len) {
             @memcpy(buf[msg_buf_start..][0..tail.len], tail);
             const total = buf[0 .. msg_buf_start + tail.len];
-            writeAll(2, total);
+            // 终端 log 走 std.debug.print(持 lockStdErr)——与渲染 flush 同一把锁,杜绝二者**字节级
+            // 交错**(否则 log 的 raw write(2) 插进 render 的转义序列中段 → 区几何错乱、spinner 堆叠)。
+            if (g_stderr_enabled) std.debug.print("{s}", .{total});
             if (g_log_file_fd) |fd| writeAll(fd, total);
         }
         return;
@@ -212,9 +218,19 @@ fn logImpl(level: Level, module: []const u8, id: ?RequestId, comptime fmt: []con
     if (total_len + 1 < buf.len) {
         buf[total_len] = '\n';
         const total = buf[0 .. total_len + 1];
-        writeAll(2, total);
+        // 终端 log 走 std.debug.print(持 lockStdErr,与渲染 flush 同锁)→ 与 render 字节级互斥,
+        // 不会把 log 插进 render 的转义序列中段。见上方截断分支同注。
+        if (g_stderr_enabled) std.debug.print("{s}", .{total});
         if (g_log_file_fd) |fd| writeAll(fd, total);
     }
+}
+
+/// 交互式 TUI 拥有终端时调 `setStderrEnabled(false)`,禁止日志注入渲染流(见 g_stderr_enabled)。
+/// 日志仍写文件(若 METACODES_LOG_FILE 设置)。verbose / headless / 非 tty 不调,保留 stderr。
+pub fn setStderrEnabled(enabled: bool) void {
+    lock();
+    defer unlock();
+    g_stderr_enabled = enabled;
 }
 
 fn writeAll(fd: std.c.fd_t, bytes: []const u8) void {
