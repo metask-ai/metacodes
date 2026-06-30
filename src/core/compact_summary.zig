@@ -33,7 +33,7 @@ const COMPACT_SYSTEM =
 /// drop_msgs 是即将被丢弃的消息切片(borrowed)。返回 owned summary 文本。
 pub fn summarize(
     allocator: std.mem.Allocator,
-    client: *client_mod.Client,
+    provider: @import("../api/provider.zig").Provider,
     drop_msgs: []const msg.Message,
 ) ?[]u8 {
     if (drop_msgs.len == 0) return null;
@@ -70,7 +70,7 @@ pub fn summarize(
         .role = .user,
         .content = &[_]types.ApiContent{.{ .text = user_text }},
     }};
-    const resp = client.sendMessage(&api_msgs, COMPACT_SYSTEM, null) catch |err| {
+    const resp = provider.send(&api_msgs, COMPACT_SYSTEM, null) catch |err| {
         log.warn("compact", "summarize API call failed: {s} (falling back to keep-recent)", .{@errorName(err)});
         return null;
     };

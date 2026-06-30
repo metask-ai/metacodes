@@ -52,22 +52,22 @@ pub const SpawnOptions = struct {
     /// per-spawn model 覆盖(用 AgentDef.model 解析后的具体 model 名;"inherit" 父端
     /// 自己已经解析过,这里只接受具体 model 名或 null)。
     model_override: ?[]const u8 = null,
-    /// 父 dispatch 传过来的回调,subagent 同样需要 Skill 工具激活权限态等。
-    skill_activator: ?@import("../tools/context.zig").SkillActivator = null,
+    /// 父 dispatch 传过来的宿主能力(L5)。subagent 通常只用 skill 激活(调用方传 skillOnly 投影);
+    /// 见 HostServices.skillOnly。
+    host_services: ?@import("../tools/context.zig").HostServices = null,
     project_dir: []const u8 = "",
     /// 后台 subagent registry(允许嵌套后台:子 agent 也能 Task(run_in_background)注册进同一 root)。
     /// null = 子 agent 不能再开后台(同步路径恒 null)。
     agent_jobs: ?*@import("agent_job_registry.zig").AgentJobRegistry = null,
-    /// 实时进度回调(后台 job 传自己的 JobEntry trampoline;同步路径 null)。
-    progress_reporter: ?agent_loop.ProgressReporter = null,
-    /// usage 回写(后台/前台 job 把 token 数喂进 JobEntry.tokens,供进度树 `· X tokens`)。
-    /// null = 不统计(同步无 registry 路径)。透传给 agent_loop.Options.usage_sink。
-    usage_sink: ?agent_loop.UsageSink = null,
+    /// 预建对话(Ctrl+B 主对话转后台用):非 null 时 spawnAgentSink **用它续跑**(忽略 prompt 参数),
+    /// 而非从空 conversation + appendText(prompt) 起。**所有权转移给 spawnAgentSink**(它 defer deinit)。
+    /// 普通 subagent 恒 null(从 prompt 起新对话)。
+    prebuilt_conversation: ?Conversation = null,
 };
 
 pub fn spawnAgent(
     allocator: std.mem.Allocator,
-    api_client: *client_mod.Client,
+    api_client: *client_mod.Client, // *Client(非 Provider):subagent 内部 .provider() 化后传给子 run();见 P1 职责边界
     tool_defs: []const json_mod.ToolDefinition,
     permission_ctx: *const permission_mod.PermissionContext,
     abort: ?*const AbortSignal,
@@ -91,10 +91,14 @@ pub fn spawnAgentSink(
     opts: SpawnOptions,
     backend: *const ui_backend.UiBackend,
 ) !SubagentResult {
-    var conv = Conversation.init(allocator);
+    // 预建对话(Ctrl+B 转后台续跑)→ 用它(所有权转移,本函数 defer deinit);否则从 prompt 起新对话。
+    var conv = if (opts.prebuilt_conversation) |pc| pc else blk: {
+        var c = Conversation.init(allocator);
+        errdefer c.deinit();
+        try c.appendText(.user, prompt);
+        break :blk c;
+    };
     defer conv.deinit();
-
-    try conv.appendText(.user, prompt);
 
     // 选择实际用的 tool_defs:override > 父
     const effective_tool_defs = opts.tool_defs_override orelse tool_defs;
@@ -114,7 +118,7 @@ pub fn spawnAgentSink(
 
     const result = try agent_loop.run(
         &conv,
-        api_client,
+        api_client.provider(),
         effective_tool_defs,
         ctx_to_use,
         .{
@@ -125,7 +129,7 @@ pub fn spawnAgentSink(
             .tool_defs = effective_tool_defs,
             .agent_depth = opts.agent_depth,
             .dyn_registry = opts.dyn_registry,
-            .skill_activator = opts.skill_activator,
+            .host_services = opts.host_services,
             .agent_jobs = opts.agent_jobs,
             .project_dir = opts.project_dir,
             .model_override = opts.model_override,
@@ -133,8 +137,6 @@ pub fn spawnAgentSink(
             // 后台 subagent 不应往父 stdout 喷 ANSI 着色(final_text/output 会混入 \x1b[32m)。
             // sink 是 NullWriter(同步)或 SinkWriter(后台)时都非交互终端 → 关着色。
             .colorize = false,
-            .progress_reporter = opts.progress_reporter,
-            .usage_sink = opts.usage_sink,
         },
         backend,
         allocator,

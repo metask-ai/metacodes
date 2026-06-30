@@ -40,6 +40,7 @@ pub const RenderRegion = struct {
     cols: u16 = 80,
     rows: u16 = 24,
     prev_rows: u16 = 0, // 上一帧固定区总行数;0=未画。eraseRegion 用它擦旧区。
+    overlay_region_height: u16 = 0, // enterExclusiveOverlay 捕获的 erase 前区高(viewer anchor 兜底用)
     input_cursor_row: u16 = 0, // 【仅输入期】上帧结束光标在区内第几行(从区顶 0 算)——输入期回顶支点。
     // 生成期:drawGenRegion 末尾把光标停在 editor 编辑点(供 IME),并记 cursor_in_region_row
     // (光标距区顶行数);writeGenText 擦区前先 UP(cursor_in_region_row)+\r 回区顶再 erase。
@@ -105,16 +106,17 @@ pub const RenderRegion = struct {
         _ = std.c.pthread_mutex_unlock(&self.mutex);
     }
 
-    /// 生成期 overlay(inline transcript viewer,方案 A)用:持渲染锁,使 agent_loop emit 线程
+    /// 生成期 overlay(全屏 transcript viewer,alt-screen)用:持渲染锁,使 agent_loop emit 线程
     /// 阻塞在锁上、不与 viewer 抢 stdout。enter/exit 必须配对。viewer 自身不请求本锁(无死锁)。
-    /// enter 持锁后 eraseRegion 擦掉生成期固定区(光标回区顶=文本续接点)+ 清零区状态;viewer 从区顶
-    /// DECSC(\x1b7)存档往下画 transcript(不覆盖区顶之上的 banner/历史),退出 DECRC(\x1b8)回区顶 +
-    /// ESC[J 清掉 transcript。exit drawGenRegion 从区顶相对重画固定区 → 跟随内容、幂等。
-    /// (不再依赖 box_h/绝对贴底——那是 box_top 漂移 bug 根源。)
+    /// viewer 自己进/出 alt-screen 独立缓冲(ESC[?1049h/l)全屏画 transcript,退出由终端**自动恢复主
+    /// 缓冲**;exit 持锁 drawGenRegion 在恢复后的主缓冲上重画固定区 → 释放锁。
+    /// 注:enter 里的 eraseRegion / overlay_region_height / 半行封口是旧 inline(DECSC)模式遗留,
+    /// alt-screen 下不再被 viewer 依赖(独立缓冲全屏绝对定位);保留仅遵守"其他保持不变"scope,
+    /// overlay_region_height 已是死量(viewer 丢弃 anchor_hint),后续清理时一并删。
     pub fn enterExclusiveOverlay(self: *RenderRegion) void {
         self.lock();
-        // 半行封口(text_pending_newline 时补 \n):使 eraseRegion 后光标(=viewer DECSC 存档点)在行首,
-        // 否则存档点落半行中,viewer DECRC 回去 + ESC[J 会从半行处清 → 错位。
+        // 半行封口(text_pending_newline 时补 \n):旧 inline 模式为对齐 DECSC 存档点在行首。alt-screen 下
+        // 不再用 DECSC,但补 \n 仍无害(保 scrollback 末行干净),保留不动。
         if (self.generating and self.text_pending_newline) {
             const w = &self.scratch.writer;
             self.resetScratch();
@@ -123,16 +125,28 @@ pub const RenderRegion = struct {
             self.text_pending_newline = false;
             self.pending_col = 0;
         }
+        // overlay_region_height:DEAD(viewer 丢弃 anchor_hint),保留不动,见上注。
+        self.overlay_region_height = self.prev_rows;
         if (self.generating and self.region_drawn) self.eraseRegion();
-        // 区状态清零:viewer 接管后旧区不再在"已知位置";exit 从干净态(区顶)drawGenRegion 重画。
+        // 区状态清零:exit 从干净态 drawGenRegion 重画(对话由 alt-screen 退出自动恢复)。
         self.region_drawn = false;
         self.prev_rows = 0;
         self.cursor_in_region_row = 0;
     }
+
+    /// **DEAD since 2026-06-13 alt-screen 切换**:旧 inline 模式的区顶 anchor 兜底(DSR 不可用时用)。
+    /// viewer 现已 `_ = anchor_hint;` 丢弃(独立缓冲全屏绝对定位,不需 anchor)。保留仅遵守"其他保持
+    /// 不变"scope,后续清理一并删。
+    pub fn overlayAnchorHint(self: *const RenderRegion, rows: usize) usize {
+        const h: usize = self.overlay_region_height;
+        if (h == 0 or h > rows) return 1;
+        return rows - h + 1;
+    }
     pub fn exitExclusiveOverlay(self: *RenderRegion, app: *const app_mod.App) void {
         if (self.generating) {
-            // viewer 已把光标停在输入框锚定行 + 整屏重绘干净;区状态已在 enter 清零(region_drawn=false)。
-            // 直接 drawGenRegion 从锚定行重画固定区(不 eraseRegion —— 无旧区可擦,陈旧定位会擦错行)。
+            // alt-screen 退出(viewer 的 defer ov.exit())已由终端自动恢复主缓冲;区状态已在 enter 清零
+            // (region_drawn=false)。直接 drawGenRegion 在恢复后的主缓冲上重画固定区(不 eraseRegion——
+            // 无旧区可擦,陈旧定位会擦错行)。
             self.drawGenRegion(app);
         }
         self.unlock();

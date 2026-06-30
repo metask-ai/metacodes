@@ -54,6 +54,24 @@ pub const Conversation = struct {
         return self.messages.items.len;
     }
 
+    /// 深拷贝整个对话到 dst allocator(转后台续跑用)。返回的 Conversation 与源 **0 共享指针**
+    /// (每 message/block 的字节都 dupe 到 dst),可安全交给后台线程,源在前台被 reset 不影响它。
+    /// 持快照锁:防拷贝遍历时被并发 append realloc 抽走 items(同 transcript 快照纪律)。
+    /// 失败回收已拷部分,不泄漏。
+    pub fn cloneInto(self: *Conversation, dst: std.mem.Allocator) !Conversation {
+        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        var out = Conversation.init(dst);
+        errdefer out.deinit();
+        try out.messages.ensureTotalCapacity(dst, self.messages.items.len);
+        for (self.messages.items) |m| {
+            const mc = try m.dupe(dst);
+            errdefer mc.deinit(dst);
+            try out.messages.append(dst, mc);
+        }
+        return out;
+    }
+
     /// UTF-8 感知的 token 估算。规则（与原 client.zig:estimateTokens 对齐）：
     /// - ASCII 字符 1 token
     /// - CJK 字符 (U+4E00..U+9FFF) 1 token
@@ -401,4 +419,31 @@ test "compactKeepRecent avoids orphan tool_result at boundary" {
     try std.testing.expect(c.len() == 2);
     try std.testing.expectEqualStrings("answer", c.messages.items[0].blocks[0].text);
     try std.testing.expectEqualStrings("follow up", c.messages.items[1].blocks[0].text);
+}
+
+test "cloneInto 深拷贝独立 + 源 reset 不影响副本 + 无泄漏" {
+    const a = std.testing.allocator;
+    var src = Conversation.init(a);
+    // 含 text + tool_use + tool_result 的多消息对话。
+    try src.appendText(.user, "q1");
+    const au = try a.alloc(msg.Block, 1);
+    au[0] = .{ .tool_use = .{ .id = try a.dupe(u8, "t1"), .name = try a.dupe(u8, "Bash"), .input = try a.dupe(u8, "{}") } };
+    try src.append(.{ .role = .assistant, .blocks = au });
+    const ur = try a.alloc(msg.Block, 1);
+    ur[0] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "t1"), .content = try a.dupe(u8, "out"), .is_error = false } };
+    try src.append(.{ .role = .user, .blocks = ur });
+
+    var copy = try src.cloneInto(a);
+    defer copy.deinit();
+    try std.testing.expectEqual(@as(usize, 3), copy.len());
+    // 指针不共享:首消息 text 字节地址不同。
+    try std.testing.expect(src.messages.items[0].blocks[0].text.ptr != copy.messages.items[0].blocks[0].text.ptr);
+
+    // 源 reset(deinit + 重 init)→ 副本仍完整有效。
+    src.deinit();
+    src = Conversation.init(a);
+    src.deinit();
+    try std.testing.expectEqualStrings("q1", copy.messages.items[0].blocks[0].text);
+    try std.testing.expectEqualStrings("Bash", copy.messages.items[1].blocks[0].tool_use.name);
+    try std.testing.expectEqualStrings("out", copy.messages.items[2].blocks[0].tool_result.content);
 }

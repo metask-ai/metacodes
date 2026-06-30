@@ -45,6 +45,9 @@ pub const LoopAction = enum {
     redraw_screen,
     /// Ctrl+X Ctrl+K 杀所有后台任务。
     kill_background,
+    /// Ctrl+B 生成期把当前主对话转后台续跑(调用方深拷贝 conversation → spawnBackground →
+    /// reset 前台)。仅生成期上抛;输入期无意义,dispatch gate 掉。
+    background_main,
     /// Shift+Tab 循环权限模式(调用方改 app.config.permission_mode/permission_ctx)。
     cycle_perm_mode,
     /// slash 菜单选中(Enter):调用方把 editor buffer 换成选中命令名后**提交**。

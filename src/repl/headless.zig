@@ -31,19 +31,18 @@ pub fn run(
 
     try app.conversation.appendText(.user, trimmed);
 
-    var wb = writer_backend.WriterBackend.initNull();
+    var wb = writer_backend.WriterBackend.initNullWithUsage(&app.usage);
     const be = wb.backend();
     const jobs_ptr = if (app.jobs) |*j| j else null;
     const result = agent_loop.run(
         &app.conversation,
-        &app.api_client,
+        app.provider(),
         app.tool_defs,
         &app.permission_ctx,
         .{
             .verbose = app.config.verbose,
             .abort = &app.abort,
             .read_state = &app.read_state,
-            .usage_sink = app.usageSink(),
             .jobs = jobs_ptr,
             .agent_jobs = if (app.agent_jobs) |*aj| aj else null,
             .plan_prev_mode = &app.plan_prev_mode,
@@ -53,7 +52,7 @@ pub fn run(
             .system_prompt = app.system_prompt,
             .inject_user_context = app.user_context,
             .dyn_registry = &app.dyn_registry,
-            .skill_activator = .{ .ctx = @ptrCast(app), .activateFn = &app_mod.App.activateSkillTrampoline },
+            .host_services = app.hostServices(),
             .project_dir = app.project_dir_or_empty(),
             .sandbox = app.sandboxPtr(),
             .cwd_abs = app.cwdAbs(),
@@ -61,7 +60,6 @@ pub fn run(
             .agents = &app.agents,
             .parent_model = app.config.model,
             .skills_set = &app.skills,
-            .worktree_hook = .{ .ctx = @ptrCast(app), .pushFn = &app_mod.App.worktreePushTrampoline, .popFn = &app_mod.App.worktreePopTrampoline },
             .mcp_sessions = &app.mcp_sessions.items,
             .cron_registry = &app.cron_registry,
         },
@@ -73,6 +71,18 @@ pub fn run(
     };
 
     app.persistTranscript();
+
+    // L3:挂起 → 落 suspend.json(挂起元数据 + 同轮已完成结果),供跨进程恢复。
+    if (result.suspend_info) |si| {
+        defer si.deinit();
+        if (app.sessionDir()) |dir| {
+            const suspend_state = @import("../core/suspend_state.zig");
+            suspend_state.writeFromSuspendInfo(dir, si, allocator) catch |e| {
+                std.debug.print("warning: suspend.json write failed: {s}\n", .{@errorName(e)});
+            };
+            std.debug.print("⏸ Suspended (kind={s}) — resume from session dir: {s}\n", .{ si.kind, dir });
+        }
+    }
 
     const final_text = lastAssistantText(&app.conversation, allocator) catch "";
     defer if (final_text.len > 0) allocator.free(final_text);
@@ -137,6 +147,7 @@ pub fn buildResultLine(
         .tool_error => "tool_error",
         .tool_loop => "tool_loop",
         .suspended => "suspended",
+        .backgrounded => "backgrounded", // headless 不会转后台,但 switch 须穷尽
     };
     const cost = usage.costUsd(model);
 
@@ -150,10 +161,12 @@ pub fn buildResultLine(
     return try aw.toOwnedSlice();
 }
 
-/// 退出码逻辑(提 pub 供 L2):end_turn/max_turns → 0;其它(error/loop/aborted)→ 1。
+/// 退出码逻辑(提 pub 供 L2):end_turn/max_turns → 0;suspended → 2(挂起待恢复,非失败);
+/// 其它(error/loop/aborted)→ 1。
 pub fn exitCodeFor(stop_reason: agent_loop.StopReason) u8 {
     return switch (stop_reason) {
         .end_turn, .max_turns => 0,
+        .suspended => 2, // 挂起待恢复:区别于完成(0)与失败(1)
         else => 1,
     };
 }

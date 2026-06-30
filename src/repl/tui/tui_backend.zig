@@ -56,6 +56,37 @@ const UiEvent = ui_event.UiEvent;
 const UiBackend = ui_backend.UiBackend;
 const SessionId = ui_backend.SessionId;
 
+/// watcher 线程注入态(fd/app/alloc)的持锁聚合。**严格 leaf lock**:
+/// - mutex 只罩这三个标量字段的读写,临界区内**绝不**调任何会阻塞/IO/取 RenderRegion 锁的函数;
+/// - mutex **绝不**跨 poll/read/handleKey/tickSpinner/enterExclusiveOverlay/viewer/join 持有;
+/// - 与 RenderRegion 锁(R)永不嵌套(I 先取先放,再单独取 R)→ 无锁序倒置、无死锁。
+/// 读者(watcher / 主线程接管前)统一 `snapshot()` 拷出栈局部后立即放锁,后续全用局部(对齐 L1
+/// "syscall 参数先快照")。详见 TuiBackend.input_ctx 字段上的并发不变量 + 半截真相注释。
+const InputCtx = struct {
+    mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    fd: std.c.fd_t = 0,
+    app: ?*app_mod.App = null,
+    alloc: ?std.mem.Allocator = null,
+
+    const Snapshot = struct { fd: std.c.fd_t, app: ?*app_mod.App, alloc: ?std.mem.Allocator };
+
+    /// 持锁拷出三字段到栈,立即放锁返回。leaf-lock:调用方拿到 Snapshot 后才做 IO/取 R 锁。
+    fn snapshot(self: *InputCtx) Snapshot {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        return .{ .fd = self.fd, .app = self.app, .alloc = self.alloc };
+    }
+
+    /// 持锁写三字段(startInput 注入)。
+    fn set(self: *InputCtx, fd: std.c.fd_t, app: *app_mod.App, alloc: std.mem.Allocator) void {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        self.fd = fd;
+        self.app = app;
+        self.alloc = alloc;
+    }
+};
+
 pub const TuiBackend = struct {
     region: *RenderRegion,
     /// 工具卡渲染所需(renderStart/renderResult)。null → 卡渲染跳过(等价无 theme)。
@@ -69,8 +100,9 @@ pub const TuiBackend = struct {
     verbose: bool = false,
     /// retry 提示是否显示(前台 agent_depth==0 才 true;门控见 .retry_notice)。
     show_retry: bool = false,
-    /// usage 累加目标(可选)。主路径置 null,usage 走 opts.usage_sink 避免双计。
-    usage_acc: ?*api_stream.UsageDelta = null,
+    /// usage 累加目标(L1:usage 走 CoreEvent.usage 总线;TuiBackend 累加进 app.usage)。
+    /// 指向 &app.usage(core UsageTotals)。null = 不累加(测试/无 App)。
+    usage_acc: ?*@import("../../core/usage.zig").UsageTotals = null,
     /// poll 输入源(可选)。
     queue: ?*msg_queue.MsgQueue = null,
     abort_signal: ?*const abort.AbortSignal = null,
@@ -84,13 +116,29 @@ pub const TuiBackend = struct {
     // 超时分支驱动(单线程 poll-timeout 模式,无需第二个 tick 线程——避免双线程争
     // RenderRegion 锁)。agent_loop 完全不管 tick。GUI/语音后端各自实现 startInput 时
     // 自决动画驱动(GUI=requestAnimationFrame,语音=无 tick),不依赖 stdin poll。
-    /// 输入线程的 fd / app / allocator(startInput 注入)。
-    input_fd: std.c.fd_t = 0,
-    input_app: ?*app_mod.App = null,
-    input_alloc: ?std.mem.Allocator = null,
+    /// 输入线程的 fd / app / allocator(startInput 注入)。收进 InputCtx 持锁访问。
+    ///
+    /// **并发不变量(当前)**:三字段仅 `startInput` 写,而 `startInput` 仅在 watcher 不存活时调
+    /// (初始 / `stopInput` join 之后)→ watcher 存活期 lifetime-immutable,初值经 spawn 的 release
+    /// happens-before 对 watcher 可见。今天**无 live data race**。
+    ///
+    /// `input_ctx.mutex`(I 锁)罩这三字段的读写。今天它真正消除的并发读是**主线程接管前的读**
+    /// (`withTerminalTakeover`/`handleUiRequest` 在 `stopInput` 之前 snapshot,此刻 watcher 仍存活
+    /// →真并发);watcher 侧入口 snapshot 一次后字段对它 immutable(见 watcherMain),I 锁对 watcher
+    /// 而言与 spawn release 等效,取之仅为统一纪律。
+    ///
+    /// **⚠ 半截真相(多 session 落地前必读)**:I 锁只能保护**指针发布**(谁读到的是完整、最新的 `app`
+    /// 指针)。它**不保护指针指向的 App 的 lifetime**——若未来某线程在 watcher 存活期把 `app` 换走 /
+    /// 析构旧 App,watcher 仍在 `tickSpinner(app)` / `app.conversation` 解引用旧 App = use-after-free,
+    /// 这把锁救不了。且 watcher 现在入口只 snapshot 一次,mid-life swap 它根本看不见(这是有意的:swap 的
+    /// lifetime 半边没解,看见反而危险)。真正安全的 app-swap 必须保证"旧 App 活过所有在飞 watcher 解引用"
+    /// (refcount,或 stop-swap-restart——后者正是 stopInput/startInput 已提供的)。多 session 真做 swap
+    /// 时,连 lifetime 带 publication + 是否每轮重读一并设计,别只看这把锁。
+    input_ctx: InputCtx = .{},
     /// 写入端的 AbortSignal(watcher esc 调 .abort)。与只读的 abort_signal 同一对象。
     input_abort: ?*abort.AbortSignal = null,
-    /// 线程停止标志 + 句柄。
+    /// 线程停止标志 + 句柄。**故意留在 InputCtx 外**:input_stop 是 watcher 循环条件(不能为读它而取
+    /// I 锁,会无谓扩大临界区);input_thread 仅主线程 start 写 / stop 读清(无 watcher 读)。
     input_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     input_thread: ?std.Thread = null,
 
@@ -180,13 +228,11 @@ pub const TuiBackend = struct {
                 }
             },
             .usage => |u| {
-                if (self.usage_acc) |acc| {
-                    acc.input_tokens += u.input_tokens;
-                    acc.output_tokens += u.output_tokens;
-                    acc.cache_read_input_tokens += u.cache_read_input_tokens;
-                    acc.cache_creation_input_tokens += u.cache_creation_input_tokens;
-                }
+                if (self.usage_acc) |acc| acc.apply(u);
             },
+            // L1:轮/工具级进度事件——顶层 TUI 进度走 spinner + set_current_tool,不消费 .progress
+            // (它是 subagent 进度树用,由 JobEntry 后端消费)。顶层 no-op。
+            .progress => {},
             .phase_change => {
                 // enter/leaveGenerating 仍由 loop 编排(需 *App)。此处 no-op。
             },
@@ -219,6 +265,8 @@ pub const TuiBackend = struct {
             .ui_request_pending => {
                 // TUI 是同步前端(走阻塞 requestUi,恒 .answered,从不挂起)→ 此事件不会发给它,no-op。
             },
+            // L4 诊断事件:DiagnosticsBackend 专属(经 TeeBackend 旁挂),TUI 不渲染,no-op。
+            .diag_turn_begin, .diag_turn_end, .diag_breaker_tripped, .diag_cache_break, .diag_continuation, .diag_run_end => {},
         }
     }
 
@@ -288,9 +336,11 @@ pub const TuiBackend = struct {
     /// fd=stdin;app 供 spinner 重画;queue/input_abort 须已在 backend 上设好。
     /// 非 tty / 无 region 时不应调用(loop.zig 已门控)。
     pub fn startInput(self: *TuiBackend, fd: std.c.fd_t, app: *app_mod.App, allocator: std.mem.Allocator) !void {
-        self.input_fd = fd;
-        self.input_app = app;
-        self.input_alloc = allocator;
+        // 护栏:start 前必须已 stop+join 上一个 watcher。**debug-only 安全网**——release 里 assert 蒸发,
+        // 不是不变量的真正强制者(真正强制靠 input_thread 这个 optional 的存在性 + 调用纪律)。多 session
+        // 若要硬保证,得让 start 在 input_thread!=null 时返回 error 或先内部 stop(Linus #3 认知项)。
+        std.debug.assert(self.input_thread == null);
+        self.input_ctx.set(fd, app, allocator); // 持 I 锁写;spawn 的 release 另给初值可见性
         self.input_stop.store(false, .release);
         self.input_thread = try std.Thread.spawn(.{}, watcherMain, .{self});
     }
@@ -299,8 +349,11 @@ pub const TuiBackend = struct {
     pub fn stopInput(self: *TuiBackend) void {
         if (self.input_thread) |t| {
             self.input_stop.store(true, .release);
-            t.join();
+            t.join(); // **绝不持 I 锁跨 join**:否则与阻塞在 I.snapshot 的 watcher 死锁
             self.input_thread = null;
+            // 不 clear 三字段:join 后无 watcher 读,stale 值无害(下次 startInput 覆写)。曾加 clear 为
+            // 保"字段只在 I 内变"审美,反给 join 后的 self 读刨 null 窗口(ask_question defer 重启被迫绕)
+            // → 自找复杂度,删之(Linus #1)。
         }
     }
 
@@ -314,11 +367,13 @@ pub const TuiBackend = struct {
         comptime R: type,
         body: *const fn (fd: std.c.fd_t, th: Theme, a: std.mem.Allocator) R,
     ) ?R {
-        const fd = self.input_fd;
+        // 此读在 stopInput(join watcher)**之前** → 与存活 watcher 真并发,必须经 I 锁 snapshot。
+        const snap = self.input_ctx.snapshot();
+        const fd = snap.fd;
         if (!term.isatty(fd)) return null;
-        const app = self.input_app orelse return null;
+        const app = snap.app orelse return null;
         const th = if (self.theme) |t| t.* else theme_mod.dark;
-        const a = self.input_alloc orelse return null;
+        const a = snap.alloc orelse return null;
 
         self.stopInput();
         self.region.enterExclusiveOverlay();
@@ -341,16 +396,18 @@ pub const TuiBackend = struct {
         switch (req.*) {
             .ask_question => |questions| {
                 // ask_question 的 answers 挂调用方传入的 allocator;不能用 withTerminalTakeover
-                // 的固定签名(它传 self.input_alloc),故就地展开同款接管骨架。
-                const fd = self.input_fd;
+                // 的固定签名(它传 input_ctx.alloc),故就地展开同款接管骨架。
+                // 读在 stopInput 之前 → 与存活 watcher 真并发,经 I 锁 snapshot;defer 重启沿用 snap(已拷出)。
+                const snap = self.input_ctx.snapshot();
+                const fd = snap.fd;
                 if (!term.isatty(fd)) return error.NotATty;
-                const app = self.input_app orelse return error.NotATty;
+                const app = snap.app orelse return error.NotATty;
                 const th = if (self.theme) |t| t.* else theme_mod.dark;
                 self.stopInput();
                 self.region.enterExclusiveOverlay();
                 defer {
                     self.region.exitExclusiveOverlay(app);
-                    if (self.input_alloc) |a| self.startInput(fd, app, a) catch {};
+                    if (snap.alloc) |a| self.startInput(fd, app, a) catch {};
                 }
                 var answers: std.ArrayList([]const u8) = .empty;
                 errdefer {
@@ -384,6 +441,12 @@ pub const TuiBackend = struct {
                 const choice = self.withTerminalTakeover(tool_ctx.ToolContext.PlanApproval, &Ctx.run) orelse .reject;
                 out.* = .{ .plan_approval = choice };
             },
+            .custom => {
+                // L2:同步终端 backend 无法渲染任意动态 UI(它只会画固定对话框)。custom 信封
+                // 是给未来 GUI/web 后端的——TUI 返 error,工具据此兜底(对齐 ask→NotATty)。
+                // 真正的 custom 渲染走异步前端(L3 挂起路径)或带 UI runtime 的 backend。
+                return error.CustomUiUnsupported;
+            },
         }
     }
 
@@ -405,8 +468,14 @@ pub const TuiBackend = struct {
     /// 行为不变:回车→入队(queue);esc→已打字先入队再 abort(直戳 AbortSignal);
     /// 超时→孤立 ESC 兑现 or tickSpinner。AbortSignal 机制完全不动。
     fn watcherMain(self: *TuiBackend) void {
-        const allocator = self.input_alloc orelse return;
-        const fd = self.input_fd;
+        // 入口快照一次:三字段在 watcher 生命周期内 immutable(仅 startInput 写,且仅在无 watcher 时调
+        // ——见 input_ctx 注释)。故入口经 I 锁拷出 (fd, app, alloc) 即够,无需每轮重读(那是为"未来
+        // mid-life swap"加的 speculative 热路径锁,但 swap 的 lifetime 半边本就没解,半截能力不值热路径
+        // 开销 → 退回入口一次,Linus #2)。多 session 真做 swap 时连 lifetime 带 publication 一并设计。
+        const snap = self.input_ctx.snapshot();
+        const app = snap.app orelse return;
+        const fd = snap.fd;
+        const allocator = snap.alloc orelse return;
         var parser = input.KeyParser{}; // 本线程独占,不持锁
         var editor = input.LineEditor.init(allocator);
         defer editor.deinit();
@@ -419,9 +488,9 @@ pub const TuiBackend = struct {
             if (rc <= 0) {
                 // 超时:孤立 ESC 兑现 → 处理(可能中断);否则推进 spinner。
                 if (parser.flushEsc()) |k| {
-                    self.handleKey(k, &editor);
+                    self.handleKey(snap, k, &editor);
                 } else {
-                    self.region.tickSpinner(self.input_app.?);
+                    self.region.tickSpinner(app);
                 }
                 continue;
             }
@@ -432,9 +501,9 @@ pub const TuiBackend = struct {
             if (n <= 0) continue;
 
             const key = parser.feed(b[0]) orelse continue; // 多字节(UTF-8/CSI)攒够再出 Key
-            self.handleKey(key, &editor);
+            self.handleKey(snap, key, &editor);
             // ESC + 普通字符:feed 吐 .esc 后第二个键在 pending,排空(否则字符被吞)。
-            while (parser.drain()) |k2| self.handleKey(k2, &editor);
+            while (parser.drain()) |k2| self.handleKey(snap, k2, &editor);
         }
     }
 
@@ -450,8 +519,8 @@ pub const TuiBackend = struct {
     /// 关键:enter/esc 也经 dispatch 先过一遍 → overlay/help 开着时它们被 dispatch 路由消费
     /// (transcript 期 enter 被 dispatchTranscriptKey 忽略,不会误入队;help 期 esc 只关 help)。
     /// esc 优先级:overlay 开→关 overlay;help 开→关 help;都关→中断(先关弹层再中断)。
-    fn handleKey(self: *TuiBackend, key: input.Key, ed: *input.LineEditor) void {
-        const app = self.input_app orelse return;
+    fn handleKey(self: *TuiBackend, snap: InputCtx.Snapshot, key: input.Key, ed: *input.LineEditor) void {
+        const app = snap.app orelse return;
         const eff = self.region.applyGenKey(app, &app.conversation, key, ed.view(), ed.cursor);
 
         // dispatch 上抛的全局 LoopAction:生成期能执行的(两期共享:cycle_perm_mode/redraw_screen/
@@ -474,17 +543,28 @@ pub const TuiBackend = struct {
                 self.region.redrawGen(app);
                 return;
             },
+            .background_main => {
+                // Ctrl+B 生成期:置位转后台请求信号。agent_loop 在下个 turn 边界 load 到 → 返回
+                // .backgrounded;loop.zig 据此深拷贝 conversation 转后台 + reset 前台。watcher 这里
+                // 只 store 信号(对齐 esc 直戳 abort),不碰 conversation/IO(那是主线程 run 返回后的事)。
+                app.background_request.store(true, .release);
+                return;
+            },
             .open_transcript => {
-                // 生成期 Ctrl+O → inline transcript viewer(方案 A:不覆盖 banner)。enterExclusiveOverlay
-                // 持渲染锁(emit 线程阻塞不抢 stdout)+ eraseRegion 擦生成期固定区(光标停区顶);viewer
-                // 从区顶 DECSC 往下画 transcript,退出回区顶清掉;exitExclusiveOverlay 锁内 drawGenRegion
-                // 从区顶相对重画固定区 + 释放锁 → 跟随内容、幂等(不再 box_h 反推贴底)。
-                const a = self.input_alloc orelse return;
-                const sz = term.getSize(self.input_fd);
+                // 生成期 Ctrl+O → 全屏 transcript viewer(alt-screen,2026-06-13 根治多 agent"显两份")。
+                // enterExclusiveOverlay 持渲染锁(emit 线程阻塞在锁上、不抢 stdout);viewer 自己进/出
+                // alt-screen 独立缓冲(ESC[?1049h/l)全屏画 transcript,退出由终端**自动恢复主缓冲**;
+                // exitExclusiveOverlay 锁内 drawGenRegion 在恢复后的主缓冲上从锚定行重画固定区 + 释放锁。
+                const a = snap.alloc orelse return;
+                const sz = term.getSize(snap.fd);
                 const rows: usize = if (sz) |s| s.rows else 24;
                 const th = if (self.theme) |t| t.* else theme_mod.dark;
                 self.region.enterExclusiveOverlay();
-                transcript_viewer.runWithTheme(self.input_fd, a, &app.conversation, rows, th) catch {};
+                // anchor_hint:DEAD since 2026-06-13 alt-screen 切换 —— viewer 已 `_ = anchor_hint;` 丢弃
+                // (独立缓冲全屏绝对定位,不需区顶 anchor)。此调用 + overlayAnchorHint/overlay_region_height
+                // 整条链路现为死代码,保留仅为遵守"其他保持不变"scope;后续清理时一并删。
+                const anchor_hint = self.region.overlayAnchorHint(rows);
+                transcript_viewer.runWithThemeAnchor(snap.fd, a, &app.conversation, rows, anchor_hint, th) catch {};
                 self.region.exitExclusiveOverlay(app);
                 return;
             },
@@ -517,6 +597,12 @@ pub const TuiBackend = struct {
                 }
                 ed.clear();
                 if (self.input_abort) |ab| ab.abort(.user_ctrl_c);
+                // 多 agent:esc 还要 abort 所有 running agent job——前台 Task 的 subagent 走 app.abort
+                // 已被打断,但**后台/嵌套** agent job 持自己的 entry.abort,app.abort 不触达,否则 esc 后
+                // 它们继续跑(用户实测 bug:启动多 agent 后 esc 不终止)。非阻塞 abort,不 join。
+                if (app.agent_jobs) |*reg| {
+                    _ = reg.abortAllRunning();
+                }
                 return; // 中断不重画(主线程很快收尾)
             },
             else => {

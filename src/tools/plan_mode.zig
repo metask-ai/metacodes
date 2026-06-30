@@ -122,15 +122,15 @@ pub fn executeExit(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const ui_request = @import("../core/protocol/ui_request.zig");
     const req = ui_request.UiRequest{ .plan_approval = .{ .plan_md = plan_md } };
     var resp: ui_request.UiResponse = undefined;
-    if (try ctx.requestUi(ctx.allocator, &req, &resp) == .answered) {
-        choice = switch (resp) {
+    switch (try ctx.requestUi(ctx.allocator, &req, &resp)) {
+        .answered => choice = switch (resp) {
             .plan_approval => |c| c,
             else => .reject, // backend 返回非预期 tag
-        };
-    } else {
-        // 无 UI 回调(headless/子 agent,outcome=.unavailable)→ answer_queue 兜底,再无则 reject。
-        // (Stage 1:sync 恒 .answered 走上分支;.pending 异步挂起在 Stage 2 才接。)
-        choice = approvalFromQueue() orelse .reject;
+        },
+        // L3:异步前端挂起 → error.UiPending(agent_loop 挂起,resumeRun 续跑)。
+        .pending => return error.UiPending,
+        // 无 UI 回调(headless/子 agent)→ answer_queue 兜底,再无则 reject。
+        .unavailable => choice = approvalFromQueue() orelse .reject,
     }
 
     switch (choice) {

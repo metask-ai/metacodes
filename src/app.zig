@@ -8,6 +8,9 @@
 const std = @import("std");
 const types = @import("types.zig");
 const client_mod = @import("client.zig");
+const openai_mod = @import("api/openai_client.zig");
+const gemini_mod = @import("api/gemini_client.zig");
+const provider_mod = @import("api/provider.zig");
 const json_mod = @import("json.zig");
 const tools_mod = @import("tools.zig");
 const permission_mod = @import("permission.zig");
@@ -31,35 +34,9 @@ const AgentSet = @import("agents/set.zig").AgentSet;
 const WorktreeEntry = @import("tools/worktree.zig").WorktreeEntry;
 const CronRegistry = @import("core/cron_registry.zig").CronRegistry;
 
-pub const UsageTotals = struct {
-    input_tokens: u64 = 0,
-    output_tokens: u64 = 0,
-    cache_read_input_tokens: u64 = 0,
-    cache_creation_input_tokens: u64 = 0,
-
-    pub fn apply(self: *UsageTotals, d: api_stream.UsageDelta) void {
-        self.input_tokens += d.input_tokens;
-        self.output_tokens += d.output_tokens;
-        self.cache_read_input_tokens += d.cache_read_input_tokens;
-        self.cache_creation_input_tokens += d.cache_creation_input_tokens;
-    }
-
-    pub fn costUsd(self: *const UsageTotals, model: []const u8) f64 {
-        return pricing.computeCost(
-            pricing.rateFor(model),
-            self.input_tokens,
-            self.output_tokens,
-            self.cache_read_input_tokens,
-            self.cache_creation_input_tokens,
-        );
-    }
-};
-
-/// 给 agent_loop 用的 trampoline：把 *anyopaque 还原成 *UsageTotals。
-fn usageTotalsAdd(ctx: *anyopaque, d: api_stream.UsageDelta) void {
-    const self: *UsageTotals = @ptrCast(@alignCast(ctx));
-    self.apply(d);
-}
+/// 跨 turn 累加的 token 计数。L1:类型下沉到 core/usage.zig(usage 走 CoreEvent 总线后
+/// 需 core 可引用);app 只 re-export,行为不变(app.usage / costUsd / 各 UI 读法照旧)。
+pub const UsageTotals = @import("core/usage.zig").UsageTotals;
 
 /// 全局 AbortSignal 指针，供 signal handler 访问。installSigintHandler 绑定后非 null。
 /// signal handler 只读该指针 + 调 abort.abort()——不分配、不 IO、不获锁。
@@ -106,6 +83,12 @@ pub const App = struct {
     //   加字段时自觉归对区。真拆 struct 时才需 enforcement。**
     conversation: Conversation,
     api_client: client_mod.Client,
+    /// OpenAI 后端(config.provider_kind==.openai 时非 null)。与 api_client 二选一:
+    /// provider() 据 config.provider_kind 选哪个的 .provider()。**core/UI 只见 App.provider()
+    /// 返回的中立 Provider,不知道背后是哪家**(多 Provider 重构 P3 组装层)。
+    openai_client: ?openai_mod.OpenAIClient = null,
+    /// Gemini 后端(config.provider_kind==.gemini 时非 null)。持有状态缓存句柄表(C3)。
+    gemini_client: ?gemini_mod.GeminiClient = null,
     tool_defs: []json_mod.ToolDefinition,
     /// 当前启用的工具名（含动态 Skill/MCP）。用于 system prompt 的 # Using your tools
     /// 段按工具集裁剪 + 构造 PromptContext。生命周期随 arena。
@@ -115,6 +98,9 @@ pub const App = struct {
     /// 每 App(= 每 session)一份;多 Session 化后随 SessionContext 走,不再进程全局。
     session_rules: @import("permission/session_rules.zig").SessionRules = .{},
     abort: AbortSignal,
+    /// Ctrl+B 转后台请求信号(地址稳定:watcher 线程 store、agent_loop turn 边界 load)。
+    /// 与 abort 分开:abort=用户中断(对话留前台),background=主对话转后台续跑。
+    background_request: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     skills: SkillSet,
     read_state: ReadState,
     /// Edit/Write 旁路高亮缓存(tool_id → 新旧全文)。供 diff 工具卡 tree-sitter 着色;
@@ -218,6 +204,16 @@ pub const App = struct {
             .model_context = @import("app/model_context.zig").ModelContext.init(allocator),
         };
 
+        // OpenAI 后端:仅当 provider_kind==.openai 才建(讲 chat/completions 协议)。
+        // base_url 复用 config.base_url(record/replay 指 MockServer);null → OpenAI 官方端点。
+        if (config.provider_kind == .openai) {
+            app.openai_client = openai_mod.OpenAIClient.init(allocator, io, api_key, config.model, config.base_url);
+        }
+        // Gemini 后端:仅当 provider_kind==.gemini 才建(讲 generateContent 协议 + 有状态缓存)。
+        if (config.provider_kind == .gemini) {
+            app.gemini_client = gemini_mod.GeminiClient.init(allocator, io, api_key, config.model, config.base_url);
+        }
+
         // 启动时加载 skills:enterprise / ~/.cc-zig / ~/.claude / project chain。
         // 沿 cwd 向上找 .git 定位 project root,沿途每级 .cc-zig/skills 都加载。
         const cwd_for_skills = @import("util/fs.zig").getCwd(allocator) catch null;
@@ -299,13 +295,20 @@ pub const App = struct {
         // 探测 <base_url>/v1/models 取 model catalog（max_tokens）。失败静默，走本地 fallback。
         // METACODES_NO_PROBE=1 跳过：离线/沙箱/TTY 测试下 probeModels 的网络调用会 hang,
         // 跳过让 REPL 立即可用(走本地 model 单价表)。
-        if (std.c.getenv("METACODES_NO_PROBE") == null) {
-            app.api_client.probeModels();
+        // **仅 anthropic 模式 probe**:probeModels 打 Anthropic 的 /v1/models,openai 模式下
+        // api_client 是死资源、且其 base_url 指向 Anthropic 端点——probe 它=对错端点发真请求
+        // (用真 key),必须跳过。openai 的 context_window 走 OpenAIClient 自己的硬编码值。
+        if (config.provider_kind == .anthropic) {
+            if (std.c.getenv("METACODES_NO_PROBE") == null) {
+                app.api_client.probeModels();
+            } else {
+                @import("util/log.zig").debug("catalog", "probeModels skipped (METACODES_NO_PROBE)", .{});
+            }
+            // CLI --max-tokens 覆盖(仅作用于 anthropic api_client)
+            app.api_client.setMaxTokensOverride(config.max_tokens);
         } else {
-            @import("util/log.zig").debug("catalog", "probeModels skipped (METACODES_NO_PROBE)", .{});
+            @import("util/log.zig").debug("catalog", "probeModels skipped (provider={s})", .{@tagName(config.provider_kind)});
         }
-        // CLI --max-tokens 覆盖
-        app.api_client.setMaxTokensOverride(config.max_tokens);
 
         // 初始化 transcript writer：需要 cwd + HOME
         app.initTranscriptWriter() catch |err| {
@@ -371,6 +374,17 @@ pub const App = struct {
         return app;
     }
 
+    /// 组装层选 Provider:据 config.provider_kind 返回对应后端的中立 Provider。
+    /// **这是整个多 Provider 重构里唯一 if(provider) 的地方**——core(agent_loop)/UI 只调
+    /// `app.provider()` 拿中立 Provider,完全不知道背后是 Anthropic 还是 OpenAI。
+    pub fn provider(app: *App) provider_mod.Provider {
+        return switch (app.config.provider_kind) {
+            .anthropic => app.api_client.provider(),
+            .openai => app.openai_client.?.provider(),
+            .gemini => app.gemini_client.?.provider(),
+        };
+    }
+
     pub fn deinit(app: *App) void {
         // 最先 drain 后台 subagent：abort 全部 running → join 全部线程 → free。
         // 必须早于任何共享资源（agents/dyn_registry/skills/allocator）释放，
@@ -378,6 +392,8 @@ pub const App = struct {
         if (app.agent_jobs) |*aj| aj.deinit();
         if (app.transcript_writer) |*w| w.deinit();
         app.api_client.deinit();
+        if (app.openai_client) |*oc| oc.deinit();
+        if (app.gemini_client) |*gc| gc.deinit();
         app.conversation.deinit();
         app.allocator.free(app.tool_defs);
         app.skills.deinit();
@@ -437,6 +453,12 @@ pub const App = struct {
     /// Agent loop 每轮结束后调用一次，把 conversation 新增的 message 刷到 transcript。
     pub fn persistTranscript(app: *App) void {
         if (app.transcript_writer) |*w| w.flush(&app.conversation);
+    }
+
+    /// 当前 session 目录(transcript.jsonl / suspend.json 所在)。无 writer → null。
+    pub fn sessionDir(app: *App) ?[]const u8 {
+        if (app.transcript_writer) |*w| return w.dir;
+        return null;
     }
 
     /// 计算本 session 的 plan 文件路径 + mkdir。seed 优先用 transcript session id(每 session
@@ -520,11 +542,6 @@ pub const App = struct {
             killed += 1;
         }
         return killed;
-    }
-
-    /// 获取 agent_loop 能用的 UsageSink（把 event 累加到 app.usage）。
-    pub fn usageSink(app: *App) agent_loop.UsageSink {
-        return .{ .ctx = @ptrCast(&app.usage), .addFn = usageTotalsAdd };
     }
 
     /// 激活一个 skill 的权限态。先清旧的(如有),再装新的。
@@ -629,6 +646,18 @@ pub const App = struct {
         const app: *App = @ptrCast(@alignCast(state));
         if (app.worktree_stack.items.len == 0) return null;
         return app.worktree_stack.pop();
+    }
+
+    /// L5:把 App 提供给工具的三类宿主能力(Skill 激活 / ToolSearch 激活 / Worktree push-pop)
+    /// 聚合成一个 HostServices——一个 ctx(=app)+ 四个 trampoline,取代散落的四个裸字段。
+    pub fn hostServices(app: *App) tools_mod.HostServices {
+        return .{
+            .ctx = @ptrCast(app),
+            .activateSkillFn = &activateSkillTrampoline,
+            .activateToolFn = &activateToolTrampoline,
+            .worktreePushFn = &worktreePushTrampoline,
+            .worktreePopFn = &worktreePopTrampoline,
+        };
     }
 
     /// 加载 5 层 settings(managed/cli/project local+shared/user)+ CLI inline 规则,

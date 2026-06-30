@@ -30,6 +30,12 @@ pub const Slot = struct {
     is_error: bool = false,
     /// 执行耗时(ms),runJob 填。供 tool_card 显示真实耗时(0 = 未执行/被拒)。
     elapsed_ms: u64 = 0,
+    /// L3 挂起:工具返 error.UiPending(异步 custom UI 未完成)→ runJob 置此并填 pending_kind/
+    /// payload(从 ctx.pending_request 取,dupe 到父 allocator 逃逸)。content 留 null(无结果)。
+    /// agent_loop 扫到 pending → emit ui_request_pending + 整轮挂起(stop_reason=.suspended)。
+    pending: bool = false,
+    pending_kind: ?[]u8 = null,
+    pending_payload: ?[]u8 = null,
 };
 
 /// 一个并发 job 的输入(safe 批用)。
@@ -54,9 +60,25 @@ fn runJob(job: *Job) void {
     // 富错误 detail 槽:工具可在抛错前写入,替代通用 "X failed with Y"。
     var err_detail: ?[]const u8 = null;
     job_ctx.error_detail = &err_detail;
+    // L3 挂起槽:工具发起 custom UI 拿到 .pending → 写 {kind,payload} 进这里 + 返 error.UiPending。
+    var pending_req: ?tools_mod.PendingRequest = null;
+    job_ctx.pending_request = &pending_req;
 
     log.infoId("agent", job.rid, "tool.exec start(par) name={s} id={s}", .{ s.name, s.id });
     const r = tools_mod.dispatch(&job_ctx, s.name, s.input) catch |err| {
+        // L3:UiPending 是控制信号(非工具错误)——置 pending 标志 + 把 kind/payload dupe 到父
+        // allocator 逃逸 arena(供 agent_loop emit + 落盘),不置 is_error、不产 tool_result。
+        if (err == error.UiPending) {
+            s.pending = true;
+            if (pending_req) |pr| {
+                s.pending_kind = job.parent_allocator.dupe(u8, pr.kind) catch null;
+                s.pending_payload = job.parent_allocator.dupe(u8, pr.payload_json) catch null;
+            }
+            s.elapsed_ms = @intCast(@max(util_time.nowMs() - t_start, 0));
+            log.infoId("agent", job.rid, "tool.exec PENDING(par) name={s} id={s} kind={s}", .{ s.name, s.id, if (pending_req) |pr| pr.kind else "" });
+            job.done = true;
+            return;
+        }
         const code = if (err == error.UnknownTool) "UnknownTool" else @errorName(err);
         const tool_error = @import("tool_error.zig");
         // 错误 json 用父 allocator(逃逸 arena)。工具填了 detail 用之,否则通用文案。

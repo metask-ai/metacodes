@@ -118,9 +118,13 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         const req = ui_request.UiRequest{ .ask_question = qlist.items };
         var resp: ui_request.UiResponse = undefined;
         const outcome = try ctx.requestUi(allocator, &req, &resp);
-        // Stage 1(协议预留):sync 前端恒返 .answered。pending(异步挂起)在 Stage 2 才接;
-        // 此处非 .answered 走 NotATty 兜底(等价现状,sync 永不到此)。
-        if (outcome != .answered) return error.NotATty;
+        // L3:异步前端返 .pending → error.UiPending(agent_loop 挂起,响应到达 resumeRun 续跑);
+        // .unavailable(headless/无 backend/sync 永不到此)→ NotATty 兜底。sync TUI 恒 .answered。
+        switch (outcome) {
+            .answered => {},
+            .pending => return error.UiPending,
+            .unavailable => return error.NotATty,
+        }
         // resp.answers owned by allocator → 转移进 answers(后续序列化用),用完统一 free。
         switch (resp) {
             .answers => |arr| {

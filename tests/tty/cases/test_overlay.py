@@ -3,7 +3,7 @@
 全离线(死端口,不打模型)。验证(2026-06-05 改:? 对齐 cc 非模态):
   - 空框按 ? → footer 区原地展开快捷键(不需回车),? 不进输入框,**输入框仍在**(非模态)。
   - help 下打其它字符 → 关闭 help,该字符进输入框(非模态)。
-  - Ctrl+O → transcript overlay(模态),且不进 alt screen(无 ESC[?1049h)。
+  - Ctrl+O → 全屏 transcript(模态,alt-screen ESC[?1049h;退出由终端自动恢复主缓冲)。
   - transcript 滚动/关闭 → 回输入框。
 """
 import os
@@ -113,12 +113,34 @@ def test_esc_then_char_not_swallowed(bin_path):
 
 
 def test_ctrl_o_enters_inline_transcript(bin_path):
-    # Ctrl+O → inline 内联 transcript viewer(对齐 cc 2.1.167,DIFF#6/#7)。
-    # **不进 alt-screen**(无 ESC[?1049h):原地重绘视口(绝对光标定位,不 2J/不 \n),
-    # 不动 scrollback;footer 变 cc 风格 `Showing detailed transcript · ctrl+o to toggle · ↑↓ scroll`。
+    # Ctrl+O → 全屏 transcript viewer(alt-screen)。多 agent 长跑时 inline 重画会显两份/footer
+    # 堆叠/几何漂移,根治法=进 alt-screen 独立缓冲全屏画,退出由终端自动恢复主缓冲(banner+对话+框)。
     raw = run(bin_path, ["sleep:0.8", "key:ctrl_o", "sleep:0.4"], per_key_drain=0.1)
-    assert b"\x1b[?1049h" not in raw, "inline transcript 不应进 alt-screen(ESC[?1049h)"
+    assert b"\x1b[?1049h" in raw, "全屏 transcript 应进 alt-screen(ESC[?1049h)"
     assert b"Showing detailed transcript" in raw, "应渲染 cc 风格 transcript footer"
+
+
+def test_ctrl_o_via_kitty_csi_u(bin_path):
+    # 实测 bug:Kitty 键盘协议白名单终端把 Ctrl+O 编成 CSI-u(ESC[111;5u,111='o'/5=Ctrl)
+    # 而非裸 0x0f。旧 CSI-u 解析表无 'o' → 返 .unknown → Ctrl+O 静默失效("完全无反应")。
+    # 用 raw 注入 CSI-u 序列(模拟这类终端的真实字节),断言 viewer 照常打开。
+    raw = run(bin_path, ["sleep:0.8", "raw:\\x1b[111;5u", "sleep:0.4"], per_key_drain=0.1)
+    assert b"\x1b[?1049h" in raw, "全屏 transcript 应进 alt-screen"
+    assert b"Showing detailed transcript" in raw, "CSI-u 形式的 Ctrl+O 也应打开 transcript viewer(回归 bug)"
+
+
+def test_ctrl_o_csi_u_toggles_closed(bin_path):
+    # 实测 bug:agent 运行期 Ctrl+O 进 transcript 后再按 Ctrl+O 无法 toggle 关闭。根因:
+    # transcript_viewer 自己的裸字节 read 循环只认 0x0f,不认 Kitty CSI-u ESC[111;5u →
+    # 白名单终端第二次 Ctrl+O(CSI-u 形式)被忽略,viewer 不退出。修:viewer 解析 CSI-u codepoint。
+    # 第一次 0x0f 开,第二次 CSI-u 关 → 最终屏无 transcript footer(成功 toggle)。
+    raw = run(bin_path, ["sleep:0.8", "key:ctrl_o", "sleep:0.4", "raw:\\x1b[111;5u", "sleep:0.4"], per_key_drain=0.15)
+    assert b"Showing detailed transcript" in raw, "第一次 Ctrl+O 应打开 transcript"
+    a = TTYAssert(raw)
+    final = "\n".join(a.final.line_text(r) for r in range(a.final.rows))
+    assert "Showing detailed transcript" not in final, \
+        "第二次 Ctrl+O(CSI-u 形式)未 toggle 关闭 transcript(回归 bug):\n" + final
+    a.assert_box_present()  # 关闭后输入框恢复
 
 
 def _screen_full(raw, rows=20, cols=90):
@@ -148,7 +170,7 @@ def test_ctrl_o_toggle_close(bin_path):
     raw = run(bin_path, ["sleep:0.8", "key:ctrl_o", "sleep:0.4", "key:ctrl_o", "sleep:0.4"], per_key_drain=0.1)
     a = TTYAssert(raw)
     a.assert_box_present()
-    assert b"\x1b[?1049h" not in raw, "inline 不进 alt-screen"
+    assert b"\x1b[?1049h" in raw, "全屏 transcript 应进 alt-screen"
     # 关闭后 transcript footer 不再在最终屏。
     text = _screen_text(a)
     assert "Showing detailed transcript" not in text, "关闭后残留 transcript footer:\n" + text
@@ -177,13 +199,12 @@ def test_question_in_nonempty_buffer_is_literal(bin_path):
 
 
 def test_ctrl_o_box_top_idempotent(bin_path):
-    # 回归(2026-06-06 真 bug,2026-06-11 方案A 修正):历史多时两次 Ctrl+O(开+关)后框位置
-    # 必须与按之前一致(box_top 不跳)。早期嵌入式 overlay bug:进入 transcript 从区顶向下画
-    # ~19 行,滚动把 scrollback 永久滚走 → 退出后框跳屏顶。后续又一个 bug:viewer 退出贴屏底
-    # (box_top=rows-5)而基线固定区跟随内容(不贴底)→ 不一致 → 漂移。
-    # inline 方案A(对齐 napicc v2.1.170 金标准):DECSC 锚区顶、不覆盖 banner、绝不 emit \n 滚动,
-    # 退出回区顶相对重画 → **跟随内容(不贴底)**、box_top 幂等。这是 inline 实现的正确性不变式。
-    # 注意:金标准框跟随内容,故**不再**前置断言"框贴屏底"(box0 >= 14)——那恰是被否定的旧行为。
+    # 回归(2026-06-06 真 bug,2026-06-13 改 alt-screen 根治):历史多时两次 Ctrl+O(开+关)后框
+    # 位置必须与按之前一致(box_top 不跳)。早期嵌入式 overlay bug:进入 transcript 从区顶向下画
+    # ~19 行,滚动把 scrollback 永久滚走 → 退出后框跳屏顶;后续 inline 修法又按下葫芦起瓢(退出 \n
+    # 重发对话尾把框推走、贴底漂移)。**alt-screen 根治**:进 ESC[?1049h 切独立缓冲(主屏 grid+
+    # 光标整屏保存)、全屏画 transcript;退出 ESC[?1049l 由终端**逐字节恢复主缓冲** → box_top 必然
+    # 与按前一致(终端保证),无任何 inline 几何数学。
     def box_only(events):
         a = TTYAssert(run(bin_path, ["sleep:0.8"] + events, term_size=(24, 80),
                           per_key_drain=0.04, startup_drain=0.8), rows=24, cols=80)
@@ -196,10 +217,10 @@ def test_ctrl_o_box_top_idempotent(bin_path):
     box0 = box_only(msgs)
     box2 = box_only(msgs + ["key:ctrl_o", "sleep:0.6", "key:ctrl_o", "sleep:0.6"])
 
-    # 核心幂等:两次 Ctrl+O 后框回原位(无跳屏顶、无滚走历史、无贴底漂移)。
+    # 核心幂等:alt-screen 退出自动恢复主缓冲 → 框回原位(无跳屏顶、无滚走历史、无贴底漂移)。
     assert box0 is not None and box2 is not None, \
         f"box_top 定位失败(box0={box0}, box2={box2})"
-    assert box0 == box2, f"两次 Ctrl+O 后框漂移(box_top {box0}→{box2}):inline 几何失准"
+    assert box0 == box2, f"两次 Ctrl+O 后框漂移(box_top {box0}→{box2}):alt-screen 恢复失准"
 
 
 def test_ctrl_o_idempotent_with_agent_panel(bin_path):
@@ -254,8 +275,9 @@ def test_ctrl_o_agent_panel_box_top_idempotent(bin_path):
         assert "Running 2 Explore agents" in txt, f"rows={rows}: Ctrl+O 后 agent 进度树丢失"
 
 
-def test_ctrl_o_tall_history_inline(bin_path):
-    # 长历史 + 小终端:Ctrl+O 进 inline transcript,退出恢复输入框,无 alt-screen。
+def test_ctrl_o_tall_history_alt_screen(bin_path):
+    # 长历史 + 小终端:Ctrl+O 进全屏 transcript(alt-screen),退出由终端自动恢复主缓冲(输入框回来)。
+    # 这正是"多 agent 长跑显两份"的代表场景——alt-screen 独立缓冲根治:进退都不碰主屏 scrollback。
     msgs = []
     for i in range(5):
         msgs += ["type:line %d" % i, "key:enter", "sleep:0.9"]
@@ -263,7 +285,7 @@ def test_ctrl_o_tall_history_inline(bin_path):
               term_size=(12, 80), per_key_drain=0.05, startup_drain=0.8)
     a = TTYAssert(raw, rows=12, cols=80)
     text = _screen_text(a)
-    assert b"\x1b[?1049h" not in raw, "inline 不应进 alt-screen"
+    assert b"\x1b[?1049h" in raw, "全屏 transcript 应进 alt-screen"
     assert "Showing detailed transcript" not in text, "退出后残留 transcript footer:\n" + text
     a.assert_box_present()
 
@@ -281,3 +303,58 @@ def test_gen_region_agent_churn_no_spinner_residue(bin_path):
     spin = [l for l in lines if re.search(r"[✸✻✦✶✺✷✽·] \w+…", l)]
     # 最终屏最多 1 个 spinner(完成态/收尾),不得有多行遗留快照。
     assert len(spin) <= 1, f"生成期 agent 树变化致 spinner 遗留 scrollback({len(spin)} 行):\n" + "\n".join(lines)
+
+
+def test_ctrlb_backgrounds_main_session_deterministic(bin_path):
+    """Ctrl+B 生成期把主对话转后台续跑(确定性,慢 mock,不打真模型)。
+
+    机制:慢 mock turn1 慢吐 ~7.5s text 后以 tool_use 收尾 → 必有 turn2。在 turn1 执行期间注入
+    Ctrl+B(0x02)→ 信号置位 → turn2 **开头**被拦截,run 返回 .backgrounded → loop 深拷贝转后台。
+    断言:① 前台打出 "已转后台续跑";② agent tree 出现转后台的 main agent;③ turn2 的哨兵
+    "SHOULD_NOT_REACH" 不出现(turn2 起点确实被拦,没继续跑)。
+    """
+    import re
+    # 准备工具要读的文件(turn1 末尾的 Read 在转后台前可能已被调度,文件存在避免噪声)。
+    with open("/tmp/bgtest_file.txt", "w") as f:
+        f.write("hi\n")
+    from slow_mock_server import SlowMockServer, slow_text_then_tooluse, simple_text
+    turns = [
+        slow_text_then_tooluse(n_chunks=15, delay=0.5),  # turn1:宽窗口 + tool_use 收尾
+        simple_text("SHOULD_NOT_REACH"),                  # turn2:不该到达(被转后台拦截)
+    ]
+    with SlowMockServer(turns) as srv:
+        raw = run(
+            bin_path,
+            ["type:do it", "key:enter", "sleep:2.5", "raw:\\x02", "sleep:6.5", "type:next", "sleep:0.5"],
+            base_url=srv.url, startup_drain=0.8, per_key_drain=0.15,
+        )
+    txt = re.compile(rb"\x1b\[[0-9;?>]*[A-Za-z]").sub(b"", raw).decode("utf-8", "replace")
+    assert "已转后台续跑" in txt, "Ctrl+B 未触发转后台(无 '已转后台续跑' 提示):\n" + txt[-1500:]
+    assert "SHOULD_NOT_REACH" not in txt, "turn2 被执行了(转后台未在 turn 边界拦截):\n" + txt[-1500:]
+    # agent tree 出现转后台的 main agent(loop 打 "Running 1 main agent" 或树里含 main)。
+    assert ("main agent" in txt) or ("main" in txt), "agent tree 未显示转后台的 main agent:\n" + txt[-1500:]
+
+
+def test_ctrl_o_multiagent_no_scroll_garbage(bin_path):
+    # 用户实测 bug:多 agent 运行期(生成期固定区高)按 Ctrl+O → 多余空行 + scrollback 重复
+    # (根因:viewer 从很低的区顶相对下移画 view_rows=rows-3 行,撑出屏底滚屏)。修:view_rows 夹到
+    # anchor 下方可用行数,不滚屏。本测试:/agent-test-multi 造 3 agent(高区)→ 慢 mock 进生成期 →
+    # Ctrl+O。断言:footer 恰好 1 次(无重复)、transcript 正常打开。
+    import re
+    from slow_mock_server import SlowMockServer, slow_text_then_tooluse
+    # 慢 text turn(宽窗口)以 tool_use 收尾;agent tree 由 /agent-test-multi 预置。
+    turns = [slow_text_then_tooluse(n_chunks=14, delay=0.5)]
+    with SlowMockServer(turns) as srv:
+        raw = run(
+            bin_path,
+            ["sleep:0.8", "type:/agent-test-multi", "key:enter", "sleep:0.4",
+             "type:go", "key:enter", "sleep:2.5", "key:ctrl_o", "sleep:1.2"],
+            base_url=srv.url, startup_drain=0.8, per_key_drain=0.15, term_size=(24, 80),
+        )
+    a = TTYAssert(raw, rows=24, cols=80)
+    final = "\n".join(a.final.line_text(r) for r in range(24))
+    foot = final.count("Showing detailed transcript")
+    assert foot == 1, f"transcript footer 出现 {foot} 次(应 1 次;>1=滚屏重复 bug):\n{final}"
+    assert "Showing detailed transcript" in final, "Ctrl+O 未打开 transcript viewer"
+    # 全屏 transcript 进 alt-screen(独立缓冲 → 根治多 agent"显两份":主屏对话被 alt 缓冲整屏遮住)。
+    assert b"\x1b[?1049h" in raw, "全屏 transcript 应进 alt-screen"

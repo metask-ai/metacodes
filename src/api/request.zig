@@ -249,7 +249,7 @@ pub fn serializeOneTool(tool: ToolDefinition, buf: *std.ArrayList(u8), allocator
     try buf.append(allocator, '}');
 }
 
-fn serializeInputSchema(schema: InputSchema, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+pub fn serializeInputSchema(schema: InputSchema, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
     try buf.append(allocator, '{');
     try buf.appendSlice(allocator, "\"type\":");
     try util_json.serializeString(schema.type, buf, allocator);

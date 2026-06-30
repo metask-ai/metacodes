@@ -40,7 +40,7 @@ test "L2: plan 模式 → system prompt 含 plan 指令(每轮注入,根治多�
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
     var wb = writer_backend.WriterBackend.initNull();
     const be = wb.backend();
-    _ = agent_loop.run(&conv, &client, empty_defs, &perm, .{ .max_turns = 1, .system_prompt = "BASE_PROMPT_MARKER" }, &be, a) catch return error.SkipZigTest;
+    _ = agent_loop.run(&conv, client.provider(), empty_defs, &perm, .{ .max_turns = 1, .system_prompt = "BASE_PROMPT_MARKER" }, &be, a) catch return error.SkipZigTest;
 
     const cap = srv.lastRequest() orelse return error.NoRequestCaptured;
     const sys = cap.jsonField("system") orelse return error.SystemFieldMissing;
@@ -71,7 +71,7 @@ test "L2: 非 plan 模式 → system prompt 不含 plan 指令(零开销)" {
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
     var wb = writer_backend.WriterBackend.initNull();
     const be = wb.backend();
-    _ = agent_loop.run(&conv, &client, empty_defs, &perm, .{ .max_turns = 1, .system_prompt = "BASE_ONLY" }, &be, a) catch return error.SkipZigTest;
+    _ = agent_loop.run(&conv, client.provider(), empty_defs, &perm, .{ .max_turns = 1, .system_prompt = "BASE_ONLY" }, &be, a) catch return error.SkipZigTest;
 
     const cap = srv.lastRequest() orelse return error.NoRequestCaptured;
     const sys = cap.jsonField("system") orelse return error.SystemFieldMissing;

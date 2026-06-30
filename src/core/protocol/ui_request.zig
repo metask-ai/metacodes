@@ -24,6 +24,18 @@ pub const UiRequest = union(enum) {
     permission: struct { tool: []const u8, args: []const u8 },
     /// ExitPlanMode 计划审批:展示计划 markdown,三选项。
     plan_approval: struct { plan_md: []const u8 },
+    /// L2:可扩展信封(动态 UI 北极星)。core 不理解 kind 的语义,只把它**转发**给 backend;
+    /// backend(可能是临时起的 web 服务/GUI/客户端)据 kind 渲染对应界面、收集结构化结果。
+    /// 例:kind="video_timeline",payload_json=时间线规格(HTML/参数 schema),响应是用户编辑后的
+    /// 剪辑参数 JSON。三个具名变体(ask_question/permission/plan_approval)保留——它们高频且语义
+    /// 稳定,具名比 custom 更类型安全;custom 是 escape hatch,不是替代。
+    /// 同步终端 backend(TuiBackend)无法渲染任意界面 → 返 error.CustomUiUnsupported(工具兜底)。
+    ///
+    /// **schema 责任**:kind 的 payload_json 与响应 result JSON 的 schema **由发起 tool 与 renderer
+    /// 双方约定**——core 不校验(它不懂任何 kind,这是 opaque passthrough 的代价与本分)。两端
+    /// 跨进程时尤其要**版本化**(kind 内嵌版本号 / 共享 schema 声明),否则 JSON 在 tool↔renderer
+    /// 间裸奔会 schema drift。当前(L2)仅协议合约就位,首个真实生产负载待 L3 挂起路径接入。
+    custom: struct { kind: []const u8, payload_json: []const u8 },
 };
 
 /// UI 响应(用户的选择)。tag 与对应 UiRequest 一一对应。
@@ -34,6 +46,9 @@ pub const UiResponse = union(enum) {
     permission: PermissionChoice,
     /// 计划审批选择。
     plan_approval: PlanApproval,
+    /// L2:custom 请求的结构化结果 JSON(backend 收集、序列化)。owned by allocator(caller free)。
+    /// core/工具不解析其语义,原样回传给发起的工具(工具自己懂 kind 对应的 schema)。
+    custom: []const u8,
 };
 
 /// 统一回调签名(挂 ToolContext)。state 指向 *TuiBackend(经 trampoline)。
@@ -119,6 +134,35 @@ test "UiRequester.request 经接口触达回调" {
     try testing.expectEqual(RequestOutcome.answered, outcome);
 }
 
+test "L2(仅协议层): custom 信封经 UiRequester 双向往返(无生产渲染路径,真实端到端见 L3)" {
+    // 诚实范围:本测试用 mock backend 证明协议层往返正确(kind 进、result JSON 出)。
+    // 生产渲染路径当前不存在(TuiBackend.custom 返 CustomUiUnsupported);首个真实负载待 L3。
+    const S = struct {
+        var got_kind: []const u8 = "";
+        // 模拟一个能渲染 custom UI 的 backend:据 kind 回一个结构化结果 JSON。
+        fn cb(_: *anyopaque, _: SessionId, _: std.mem.Allocator, req: *const UiRequest, out: *UiResponse) anyerror!RequestOutcome {
+            switch (req.*) {
+                .custom => |c| {
+                    got_kind = c.kind;
+                    out.* = .{ .custom = "{\"in\":3,\"out\":42}" }; // 用户编辑后的剪辑参数
+                    return .answered;
+                },
+                else => return .unavailable,
+            }
+        }
+    };
+    S.got_kind = "";
+    var dummy: u8 = 0;
+    const r = UiRequester{ .ctx = @ptrCast(&dummy), .requestFn = &S.cb };
+    const req = UiRequest{ .custom = .{ .kind = "video_timeline", .payload_json = "{\"clips\":[]}" } };
+    var resp: UiResponse = undefined;
+    const outcome = try r.request(SessionId.single, testing.allocator, &req, &resp);
+    try testing.expectEqual(RequestOutcome.answered, outcome);
+    try testing.expectEqualStrings("video_timeline", S.got_kind); // backend 收到 kind
+    try testing.expect(resp == .custom);
+    try testing.expectEqualStrings("{\"in\":3,\"out\":42}", resp.custom); // 工具拿到结构化结果
+}
+
 test "RequestOutcome 三态可表达 + serializeUiRequest 往返" {
     // pending 是控制信号(异步前端用),与 answered/unavailable 区分。
     try testing.expect(RequestOutcome.pending != RequestOutcome.answered);
@@ -127,4 +171,17 @@ test "RequestOutcome 三态可表达 + serializeUiRequest 往返" {
     const json = try serializeUiRequest(testing.allocator, &req);
     defer testing.allocator.free(json);
     try testing.expect(std.mem.indexOf(u8, json, "Bash") != null);
+}
+
+test "L2: custom 信封可序列化 + 响应 tag 对应" {
+    // 动态 UI:任意 kind + payload,core 不解析,序列化转发给异步前端。
+    const req = UiRequest{ .custom = .{ .kind = "video_timeline", .payload_json = "{\"clips\":[]}" } };
+    try testing.expect(req == .custom);
+    const json = try serializeUiRequest(testing.allocator, &req);
+    defer testing.allocator.free(json);
+    try testing.expect(std.mem.indexOf(u8, json, "video_timeline") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "clips") != null);
+    // 响应 custom = 结构化结果 JSON。
+    const resp = UiResponse{ .custom = "{\"in\":3,\"out\":42}" };
+    try testing.expect(resp == .custom);
 }

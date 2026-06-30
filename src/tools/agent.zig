@@ -150,7 +150,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             // 无 description 时退回纯 type 作描述。
             .desc = util_json.extractStringField(args, "description") orelse subagent_type_raw,
             .agent_type = subagent_type_raw,
-            .skill_activator = ctx.skill_activator,
+            // subagent 只接 skill 激活(skillOnly 投影:不碰父 worktree 栈/ToolSearch 集)。
+            .host_services = if (ctx.host_services) |hs| hs.skillOnly() else null,
         });
         return std.fmt.allocPrint(
             ctx.allocator,
@@ -186,7 +187,13 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         break :blk api_client;
     };
 
-    const result = try subagent.spawnAgent(
+    // L1:前台进度/token/流式 text 走 JobEntry backend(取代旧 progress_reporter/usage_sink
+    // 两通道)。无 fg_entry(无 registry/headless)→ null-writer backend(丢弃流式输出)。
+    // 单一 spawnAgentSink 调用 + 单一 SpawnOptions(避免两份字段漂移)。
+    var null_wb = @import("../core/writer_backend.zig").WriterBackend.initNull();
+    const be: @import("../core/protocol/ui_backend.zig").UiBackend =
+        if (fg_entry) |e| e.backend() else null_wb.backend();
+    const result = try subagent.spawnAgentSink(
         ctx.allocator,
         call_client,
         tool_defs, // 父 tool_defs (override 通过 SpawnOptions 传)
@@ -201,12 +208,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .tool_defs_override = if (filtered_owned != null) effective_tool_defs else null,
             .permission_mode_override = perm_override,
             .model_override = model_override,
-            .skill_activator = ctx.skill_activator,
+            .host_services = if (ctx.host_services) |hs| hs.skillOnly() else null,
             .project_dir = ctx.project_dir,
-            // 进度/token 回写到前台 entry,被 watcher tickSpinner 拾取渲染进度树。
-            .progress_reporter = if (fg_entry) |e| .{ .ctx = @ptrCast(e), .reportFn = &@import("../core/agent_job_registry.zig").JobEntry.progressTrampoline } else null,
-            .usage_sink = if (fg_entry) |e| .{ .ctx = @ptrCast(e), .addFn = &@import("../core/agent_job_registry.zig").JobEntry.usageTrampoline } else null,
         },
+        &be,
     );
     defer result.deinit();
 

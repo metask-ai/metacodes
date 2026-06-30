@@ -72,8 +72,9 @@ fn execute(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anye
     defer ctx.allocator.free(rendered);
 
     // 激活权限态(若 setter 已 wire)。inline 与 fork 都需要(fork 的 subagent 也复用同回调)。
-    if (ctx.skill_activator) |act| {
-        act.activate(skill.name, skill.allowed_tools, skill.disallowed_tools) catch |err| {
+    if (ctx.host_services) |hs| {
+        hs.activateSkill(skill.name, skill.allowed_tools, skill.disallowed_tools) catch |err| {
+            // HostCapabilityUnavailable = 宿主未接 skill 激活能力,降级(skill body 仍渲染,权限无效)。
             log.warn("skill", "activate state failed: {s}", .{@errorName(err)});
         };
     }
@@ -171,7 +172,7 @@ fn tryForkSpawn(
             .agent_depth = ctx.agent_depth + 1,
             .dyn_registry = ctx.dyn_registry,
             .model_override = model_override,
-            .skill_activator = ctx.skill_activator,
+            .host_services = if (ctx.host_services) |hs| hs.skillOnly() else null,
             .project_dir = ctx.project_dir,
         },
     );

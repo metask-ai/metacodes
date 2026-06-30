@@ -38,38 +38,67 @@ pub const AskQuestion = struct {
     options: []const AskOption,
 };
 
+/// L3 挂起:一个待异步前端处理的 custom UI 请求(工具填 ToolContext.pending_request,
+/// runJob → Slot.pending_payload,agent_loop emit ui_request_pending)。纯数据,可序列化落盘
+/// (suspend.json)。kind 标识界面类型(如 "video_timeline"),payload_json 是渲染规格。
+pub const PendingRequest = struct {
+    kind: []const u8,
+    payload_json: []const u8,
+};
+
 // ── 工具回调接口(仿 agent_loop.UsageSink:把裸 *anyopaque+*fn 对收成类型安全的接口值)──
 // 放中立 context 层:agent_loop.Options 和 ToolContext 都引用,零循环依赖
 // (agent_loop → tools.zig → context.zig,context 不反向 import agent_loop)。
 
-/// Skill 激活回调:Skill 工具激活后把临时白/黑名单挂到 App。
-pub const SkillActivator = struct {
+/// HostServices(L5):把"工具请求宿主(App)改其状态"的三类请求-响应回调聚合成**一个**接口。
+///
+/// 背景:SkillActivator / ToolActivator / WorktreeHook 三者本质相同——都是工具(执行期)
+/// 调宿主、宿主改自身状态(激活 skill 白黑名单 / 激活 deferred 工具 / worktree 栈 push-pop)。
+/// 它们**有返回值、是请求-响应**(非单向通知),故 L1 没把它们收进 CoreEvent 事件总线;
+/// 但它们在 App→ToolContext 路径上全部 `ctx = @ptrCast(app)`——同一个宿主、四个一样的裸指针 +
+/// 四个 trampoline。L5 收成一个 HostServices:一个 ctx(=app)+ 四个可空 fn-ptr。
+///
+/// **进程内能力**:这些改宿主内存,与可序列化的 CoreEvent 总线是两类东西(跨进程后端各自
+/// 用 RPC 实现 HostServices,不走事件总线)。不要混。
+///
+/// **可空字段**:不同路径提供的能力子集不同(subagent 只需 activateSkill;ToolSearch 只需
+/// activateTool;worktree 只需 push/pop)。null fn-ptr = 该能力不可用,对应方法按语义兜底
+/// (activate* 返 error.HostCapabilityUnavailable;worktree push/pop 同)。
+pub const HostServices = struct {
     ctx: *anyopaque,
-    activateFn: *const fn (ctx: *anyopaque, skill_name: []const u8, allowed: []const []const u8, disallowed: []const []const u8) anyerror!void,
-    pub fn activate(self: SkillActivator, skill_name: []const u8, allowed: []const []const u8, disallowed: []const []const u8) anyerror!void {
-        return self.activateFn(self.ctx, skill_name, allowed, disallowed);
-    }
-};
+    activateSkillFn: ?*const fn (ctx: *anyopaque, skill_name: []const u8, allowed: []const []const u8, disallowed: []const []const u8) anyerror!void = null,
+    activateToolFn: ?*const fn (ctx: *anyopaque, tool_name: []const u8) anyerror!void = null,
+    worktreePushFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, wt_path: []const u8, original_cwd: []const u8) anyerror!void = null,
+    worktreePopFn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?@import("worktree.zig").WorktreeEntry = null,
 
-/// ToolSearch 激活 deferred 工具的回调:把 tool_name 记入 App 的 activated 集。
-pub const ToolActivator = struct {
-    ctx: *anyopaque,
-    activateFn: *const fn (ctx: *anyopaque, tool_name: []const u8) anyerror!void,
-    pub fn activate(self: ToolActivator, tool_name: []const u8) anyerror!void {
-        return self.activateFn(self.ctx, tool_name);
-    }
-};
+    pub const Error = error{HostCapabilityUnavailable};
 
-/// Worktree 栈钩子:Enter/ExitWorktree 工具用,App 端提供 push/pop。3 个裸字段收成 1 个接口。
-pub const WorktreeHook = struct {
-    ctx: *anyopaque,
-    pushFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, wt_path: []const u8, original_cwd: []const u8) anyerror!void,
-    popFn: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?@import("worktree.zig").WorktreeEntry,
-    pub fn push(self: WorktreeHook, allocator: std.mem.Allocator, wt_path: []const u8, original_cwd: []const u8) anyerror!void {
-        return self.pushFn(self.ctx, allocator, wt_path, original_cwd);
+    /// Skill 激活后把临时白/黑名单挂到宿主。无 activateSkillFn → HostCapabilityUnavailable。
+    pub fn activateSkill(self: HostServices, skill_name: []const u8, allowed: []const []const u8, disallowed: []const []const u8) anyerror!void {
+        const f = self.activateSkillFn orelse return Error.HostCapabilityUnavailable;
+        return f(self.ctx, skill_name, allowed, disallowed);
     }
-    pub fn pop(self: WorktreeHook, allocator: std.mem.Allocator) anyerror!?@import("worktree.zig").WorktreeEntry {
-        return self.popFn(self.ctx, allocator);
+    /// ToolSearch 激活 deferred 工具,记入宿主 activated 集。无 fn → HostCapabilityUnavailable。
+    pub fn activateTool(self: HostServices, tool_name: []const u8) anyerror!void {
+        const f = self.activateToolFn orelse return Error.HostCapabilityUnavailable;
+        return f(self.ctx, tool_name);
+    }
+    /// EnterWorktree 压栈。无 fn → HostCapabilityUnavailable(工具映射成 WorktreeStateUnavailable)。
+    pub fn worktreePush(self: HostServices, allocator: std.mem.Allocator, wt_path: []const u8, original_cwd: []const u8) anyerror!void {
+        const f = self.worktreePushFn orelse return Error.HostCapabilityUnavailable;
+        return f(self.ctx, allocator, wt_path, original_cwd);
+    }
+    /// ExitWorktree 弹栈。无 fn → HostCapabilityUnavailable。
+    pub fn worktreePop(self: HostServices, allocator: std.mem.Allocator) anyerror!?@import("worktree.zig").WorktreeEntry {
+        const f = self.worktreePopFn orelse return Error.HostCapabilityUnavailable;
+        return f(self.ctx, allocator);
+    }
+
+    /// 投影成"只保留 skill 激活"的子集(其余能力清空)。subagent 用:它能激活 skill,但
+    /// **不能**碰父的 worktree 栈(并发后台 subagent 在独立线程,改父 worktree 栈=数据竞争)
+    /// 或父的 ToolSearch activated 集(隔离)。对齐 L5 前 subagent 只接 skill_activator 的语义。
+    pub fn skillOnly(self: HostServices) HostServices {
+        return .{ .ctx = self.ctx, .activateSkillFn = self.activateSkillFn };
     }
 };
 
@@ -90,6 +119,11 @@ pub const ToolContext = struct {
     /// tool_exec 读到后用它替代通用的 "<tool> failed with X" 作为模型可见 detail。
     /// msg 用 ctx.allocator 分配(errorToJson 会拷贝,arena 释放前读取安全)。null = 不支持。
     error_detail: ?*?[]const u8 = null,
+    /// L3 挂起:工具发起的 custom UI 请求拿到 RequestOutcome.pending 时,在 `return error.UiPending`
+    /// 前把 `{kind, payload_json}` 写进这个槽;tool_exec(runJob)读到后填 Slot.pending_payload,
+    /// agent_loop 据此 emit ui_request_pending + 挂起。null = 不支持挂起(同步/无异步 backend)。
+    /// kind/payload 用 ctx.allocator 分配(逃逸需 runJob dupe 到父,见 tool_exec)。
+    pending_request: ?*?PendingRequest = null,
     /// ReadState 表：Read 成功后会 record，Write/Edit 入口查 get 做 must-read-first 校验。
     /// 单元测试可用 `simple` 构造跳过（无校验）。
     read_state: ?*ReadState = null,
@@ -113,13 +147,9 @@ pub const ToolContext = struct {
     agent_depth: u8 = 0,
     /// 运行时工具表（Skill/MCP）。agent_loop 在静态注册表未命中时回退到此。
     dyn_registry: ?*const DynRegistry = null,
-    /// Skill 激活回调:让 Skill 工具能告诉 App 现在激活了哪个 skill 的权限。
-    /// Skill 激活:Skill 工具激活后把临时白/黑名单挂到 App。null = 没人接管
-    /// (Skill 工具仍渲染 body,但权限无效果)。见 SkillActivator。
-    skill_activator: ?SkillActivator = null,
-    /// ToolSearch 激活 deferred 工具:把 tool_name 记入 App 的 activated 集,
-    /// 下一轮该 deferred 工具进 tools 数组变可调。null = 不接管。见 ToolActivator。
-    tool_activator: ?ToolActivator = null,
+    /// L5:宿主能力聚合(Skill 激活 / ToolSearch 激活 / Worktree push-pop)——三类"工具改宿主
+    /// 状态"的请求-响应回调收成一个接口。null = 无宿主(纯单测)。各能力可空,见 HostServices。
+    host_services: ?HostServices = null,
     /// 用户是否显式触发(true = 用户 /name;false = 模型自主调用)。
     /// 用于 disable-model-invocation 检查。
     explicit_invocation: bool = false,
@@ -146,8 +176,6 @@ pub const ToolContext = struct {
     parent_model: []const u8 = "",
     /// Skill 集合(供 subagent preload_skills 字段读取 skill body)。
     skills: ?*const @import("../skills/skill.zig").SkillSet = null,
-    /// Worktree 栈:Enter/ExitWorktree 工具用,App 端提供 push/pop。见 WorktreeHook。
-    worktree_hook: ?WorktreeHook = null,
     /// MCP session 列表(ListMcpResourcesTool / ReadMcpResourceTool 用)。
     /// 不直接 import app.zig(防循环);用 anytype pointer 转译。
     mcp_sessions: ?*const []@import("../core/mcp_session.zig").McpSessionEntry = null,
@@ -208,6 +236,43 @@ pub const ToolContext = struct {
         return try r.request(self.session, allocator, req, out);
     }
 
+    /// L3:发起一个 custom UI 请求(动态 UI)。三态:
+    /// - answered:同步 backend 已渲染并写 out.custom(结果 JSON),返回它(borrow,arena 有效)。
+    /// - pending:异步 backend 已 stash 请求未阻塞 → 把 {kind,payload_json} 写进 pending_request 槽
+    ///   并返 error.UiPending(agent_loop 据此挂起)。**out 未写,不得读**。
+    /// - unavailable:无 requester(headless/子 agent/无 backend)→ error.CustomUiUnsupported(工具兜底)。
+    /// kind/payload_json 借用调用方内存;pending 时 dupe 进 pending_request(逃逸 runJob arena 由其负责)。
+    ///
+    /// **⚠️ error.UiPending 是控制信号,工具绝不能 catch 它**——必须让它一路冒泡到 tool_exec.runJob
+    /// (那里特判成挂起)。工具若 `requestUiCustom() catch {...}` 吞掉 UiPending,挂起静默失效、
+    /// 变成普通工具结果。**子 agent(Task)内的挂起目前未定义**(子 run 返 .suspended 后父怎么 resume
+    /// 子,无机制)——custom UI 工具只应在顶层用;子 agent 内发起 = future(见 L3 plan gap)。
+    pub fn requestUiCustom(
+        self: *const ToolContext,
+        allocator: std.mem.Allocator,
+        kind: []const u8,
+        payload_json: []const u8,
+    ) anyerror![]const u8 {
+        const ui_request = @import("../core/protocol/ui_request.zig");
+        const req = ui_request.UiRequest{ .custom = .{ .kind = kind, .payload_json = payload_json } };
+        var out: ui_request.UiResponse = undefined;
+        switch (try self.requestUi(allocator, &req, &out)) {
+            .answered => return switch (out) {
+                .custom => |j| j,
+                else => error.CustomUiUnsupported, // backend 返非 custom tag = 协议违例
+            },
+            .pending => {
+                const slot = self.pending_request orelse return error.CustomUiUnsupported;
+                slot.* = .{
+                    .kind = try allocator.dupe(u8, kind),
+                    .payload_json = try allocator.dupe(u8, payload_json),
+                };
+                return error.UiPending;
+            },
+            .unavailable => return error.CustomUiUnsupported,
+        }
+    }
+
     /// 便利构造：只需 allocator 的场景（大多数单元测试）。
     pub fn simple(allocator: std.mem.Allocator) ToolContext {
         return .{ .allocator = allocator };
@@ -249,18 +314,26 @@ const TestState = struct {
     }
 };
 
-test "SkillActivator.activate 经接口触达回调" {
+test "HostServices.activateSkill 经接口触达回调" {
     var st = TestState{};
-    const act = SkillActivator{ .ctx = @ptrCast(&st), .activateFn = &TestState.skillCb };
-    try act.activate("foo", &.{}, &.{});
+    const hs = HostServices{ .ctx = @ptrCast(&st), .activateSkillFn = &TestState.skillCb };
+    try hs.activateSkill("foo", &.{}, &.{});
     try std.testing.expectEqual(@as(u32, 1), st.skill_hits);
 }
 
-test "ToolActivator.activate 经接口触达回调" {
+test "HostServices.activateTool 经接口触达回调" {
     var st = TestState{};
-    const act = ToolActivator{ .ctx = @ptrCast(&st), .activateFn = &TestState.toolCb };
-    try act.activate("Bash");
+    const hs = HostServices{ .ctx = @ptrCast(&st), .activateToolFn = &TestState.toolCb };
+    try hs.activateTool("Bash");
     try std.testing.expectEqual(@as(u32, 1), st.tool_hits);
+}
+
+test "HostServices: 缺失能力返 HostCapabilityUnavailable" {
+    var st = TestState{};
+    // 只接 activateSkill,不接 tool/worktree → 对应方法返 HostCapabilityUnavailable。
+    const hs = HostServices{ .ctx = @ptrCast(&st), .activateSkillFn = &TestState.skillCb };
+    try std.testing.expectError(error.HostCapabilityUnavailable, hs.activateTool("x"));
+    try std.testing.expectError(error.HostCapabilityUnavailable, hs.worktreePop(std.testing.allocator));
 }
 
 test "ToolProgressReporter.report 经接口触达回调" {

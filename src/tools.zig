@@ -27,9 +27,8 @@ const code_map_tool = @import("tools/code_map.zig");
 const find_symbol_tool = @import("tools/find_symbol.zig");
 
 pub const ToolContext = @import("tools/context.zig").ToolContext;
-pub const SkillActivator = @import("tools/context.zig").SkillActivator;
-pub const ToolActivator = @import("tools/context.zig").ToolActivator;
-pub const WorktreeHook = @import("tools/context.zig").WorktreeHook;
+pub const HostServices = @import("tools/context.zig").HostServices;
+pub const PendingRequest = @import("tools/context.zig").PendingRequest;
 pub const ToolProgressReporter = @import("tools/context.zig").ToolProgressReporter;
 pub const PromptContext = @import("tools/prompt_context.zig").PromptContext;
 pub const descriptions = @import("tools/descriptions.zig");

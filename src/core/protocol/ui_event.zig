@@ -59,10 +59,21 @@ pub const CoreEvent = union(enum) {
         name: []const u8,
     },
 
-    /// 工具执行中进度刷新(按 tool_use id 路由)。
+    /// 工具执行中进度刷新(按 tool_use id 路由)。WebSearch 子请求等工具内进度。
     tool_progress: struct {
         id: []const u8,
         text: []const u8,
+    },
+
+    /// 轮/工具级进度(turn 1-based;tool_name/tool_input 空 = 仅推进轮次,保留上一动作)。
+    /// tool_calls = 截至此刻累计工具调用数(单调)。subagent 进度树消费此事件更新
+    /// turn/当前工具/token 行。取代旧 ProgressReporter 扁平回调(L1:单向通知=事件)。
+    /// 顶层 TUI 后端忽略它(顶层进度走 spinner + set_current_tool);仅 JobEntry 后端消费。
+    progress: struct {
+        turn: u32,
+        tool_name: []const u8,
+        tool_input: []const u8,
+        tool_calls: u32,
     },
 
     /// 清除底部 spinner 当前工具(本轮工具执行完)。取代旧 clearCurrentTool。
@@ -110,6 +121,26 @@ pub const CoreEvent = union(enum) {
         tool_use_id: []const u8,
         request_json: []const u8,
     },
+
+    // ── L4 诊断变体(可观测性)──────────────────────────────────────────────
+    // agent_loop 在现有 log 点旁 emit;渲染 backend(TUI/Writer/JobEntry)一律 no-op,
+    // 仅 DiagnosticsBackend 消费。内联 trace_id(run 级,12-byte RequestId)+ depth
+    // (agent 嵌套深度:父 0 子 1)。**当前 DiagnosticsBackend 只挂顶层,只见 depth=0**;
+    // depth 字段为日后接 subagent(跨 agent span 树)留位,本版恒 0(见 diagnostics_backend.zig)。
+    // 全值类型(trace_id 是定长数组,非 slice)→ 可 JSON 序列化、可跨进程。
+
+    /// 诊断:一轮开始。span 树的 turn span 起点。
+    diag_turn_begin: struct { trace_id: [12]u8, depth: u8, turn: u32 },
+    /// 诊断:一轮结束(本轮累计 tool_calls)。turn span 终点。
+    diag_turn_end: struct { trace_id: [12]u8, depth: u8, turn: u32, tool_calls: u32 },
+    /// 诊断:工具熔断器触发(同错连续 N 轮)。
+    diag_breaker_tripped: struct { trace_id: [12]u8, depth: u8, same_err_count: u32 },
+    /// 诊断:prompt cache 击穿(cache_read 跌幅触发)。
+    diag_cache_break: struct { trace_id: [12]u8, depth: u8, cache_read: u64, cache_creation: u64 },
+    /// 诊断:max_tokens 截断 → 续写(第 n/max 次)。
+    diag_continuation: struct { trace_id: [12]u8, depth: u8, n: u32, max: u32 },
+    /// 诊断:run 结束(stop_reason + 总计)。run span 终点;借用 slice(同步消费)。
+    diag_run_end: struct { trace_id: [12]u8, depth: u8, turns: u32, tool_calls: u32, stop_reason_name: []const u8 },
 };
 
 /// UI → core:用户产生的事件(非阻塞 poll 拉取)。

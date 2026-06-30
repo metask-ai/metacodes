@@ -46,7 +46,7 @@ test "L2: inject_user_context → 首条 message 进请求体" {
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
     var wb = writer_backend.WriterBackend.initNull();
     const be = wb.backend();
-    _ = agent_loop.run(&conv, &client, empty_defs, &perm, .{
+    _ = agent_loop.run(&conv, client.provider(), empty_defs, &perm, .{
         .max_turns = 1,
         .system_prompt = "BASE",
         .inject_user_context = INJECT_MARKER,
@@ -83,7 +83,7 @@ test "L2: inject_user_context=null → body 不含注入文本" {
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
     var wb = writer_backend.WriterBackend.initNull();
     const be = wb.backend();
-    _ = agent_loop.run(&conv, &client, empty_defs, &perm, .{
+    _ = agent_loop.run(&conv, client.provider(), empty_defs, &perm, .{
         .max_turns = 1,
         .system_prompt = "BASE",
         .inject_user_context = null,

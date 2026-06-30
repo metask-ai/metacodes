@@ -192,7 +192,7 @@ test "TuiBackend.emit: 类A(Bash)live card 两态 + 双 tool_result 只 commit �
 test "TuiBackend.emit: usage 累加进 usage_acc" {
     var region = try makeRegion(testing.allocator);
     defer region.deinit();
-    var acc = cc.api_stream.UsageDelta{};
+    var acc = cc.app_module.UsageTotals{};
     var tb = tui_backend.TuiBackend.init(&region);
     tb.usage_acc = &acc;
     const be = tb.backend();

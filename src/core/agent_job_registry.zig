@@ -24,7 +24,7 @@ const json_mod = @import("../json.zig");
 const permission_mod = @import("../permission.zig");
 const subagent = @import("subagent.zig");
 const agent_loop = @import("agent_loop.zig");
-const writer_backend = @import("writer_backend.zig");
+const Conversation = @import("conversation.zig").Conversation;
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
@@ -107,18 +107,49 @@ pub const JobEntry = struct {
         self.output_buf.appendSlice(self.allocator, bytes) catch {};
     }
 
-    /// agent_loop progress 回调的 trampoline:持锁更新 current_turn/current_tool/input/tool_calls。
-    /// 经 opts.progress_state(*JobEntry erased)+ progress_fn 注入,见 jobThreadMain。
-    pub fn progressTrampoline(state: *anyopaque, turn: u32, tool_name: []const u8, tool_input: []const u8, tool_calls: u32) void {
+    /// L1:JobEntry 是一个 UiBackend——subagent 的 agent_loop 经 backend.emit 把流式 text /
+    /// 轮工具进度 / token usage 全喂进来,更新自身字段,供进度树渲染。取代旧三通道
+    /// (WriterBackend+jobSink / progressTrampoline / usageTrampoline)。
+    /// **线程**:emit 在 subagent 自己的线程调(后台 job 线程;前台并发批的 worker)。**每个
+    /// 消费分支各自持 self.mutex**(appendOutput / applyProgress / usage 分支),与主线程渲染读
+    /// 形成 happens-before。注意 pthread mutex 非递归——emitThunk 本身不持锁,勿在其顶层加锁
+    /// (否则重入 appendOutput/applyProgress 死锁)。新增分支若读写 self.* 必须自行上锁。
+    /// **语义(L1 行为变化)**:前台 entry(synchronous Task)现在也走本 backend,故其 output_buf
+    /// 会被流式 text 填充(旧前台路径走 null-writer 丢弃)。前台 entry 在 index 中可被 TaskOutput
+    /// 按 id 查到——但前台 Task 同步阻塞返回 final_text,模型无法在其执行中查它;唯一可见窗口是
+    /// 同批并发 Task 互查,届时读到的是对端 subagent 的真实流式输出(正确数据,非脏读)。
+    pub fn backend(self: *JobEntry) @import("protocol/ui_backend.zig").UiBackend {
+        return .{ .ctx = @ptrCast(self), .emit = &emitThunk, .poll = &pollThunk };
+    }
+
+    fn pollThunk(_: *anyopaque, _: @import("protocol/ui_backend.zig").SessionId) ?@import("protocol/ui_backend.zig").UiEvent {
+        return null; // subagent 无用户输入通道
+    }
+
+    fn emitThunk(state: *anyopaque, _: @import("protocol/ui_backend.zig").SessionId, ev: @import("protocol/ui_backend.zig").CoreEvent) void {
         const self: *JobEntry = @ptrCast(@alignCast(state));
+        switch (ev) {
+            // 流式 text(及 web_search 的 ui_text)→ 增量输出缓冲(TaskOutput since_byte 读)。
+            .text_chunk => |t| self.appendOutput(t),
+            // 轮/工具级进度 → current_turn/tool/tool_calls/transcript。
+            .progress => |p| self.applyProgress(p.turn, p.tool_name, p.tool_input, p.tool_calls),
+            // token usage → tokens(取最新 input+output 快照,镜像 context 大小,对齐 cc)。
+            .usage => |u| {
+                self.lock();
+                defer self.unlock();
+                self.tokens = u.input_tokens + u.output_tokens;
+            },
+            else => {}, // tool_start/result/stream_* 等表达事件:后台 subagent 无 TUI,忽略。
+        }
+    }
+
+    /// 持锁更新进度字段(原 progressTrampoline 主体)。turn/tool_calls 单调回写;空 tool_name
+    /// = 仅推进轮次,保留上一动作(对齐 cc"持续显示最近动作");非空则更新当前工具 + transcript。
+    fn applyProgress(self: *JobEntry, turn: u32, tool_name: []const u8, tool_input: []const u8, tool_calls: u32) void {
         self.lock();
         defer self.unlock();
         self.current_turn = turn;
-        // tool_calls 实时回写(单调累计)——必须在下方 early return 之前,使轮起始上报
-        // (空 tool_name)也刷新计数,subagent 树 `· N tools ·` 才能执行中累加而非恒 0。
         self.tool_calls = tool_calls;
-        // 空 tool_name = 仅推进轮次(轮开始上报),**保留**上一个工具——对齐 cc
-        // "持续显示最近动作"语义。否则工具执行窗口短于一帧时动作行几乎不可见。
         if (tool_name.len == 0) return;
         const n = @min(tool_name.len, self.current_tool.len);
         @memcpy(self.current_tool[0..n], tool_name[0..n]);
@@ -126,20 +157,7 @@ pub const JobEntry = struct {
         const m = @min(tool_input.len, self.current_tool_input.len);
         @memcpy(self.current_tool_input[0..m], tool_input[0..m]);
         self.current_tool_input_len = @intCast(m);
-        // 顺带把这次工具动作 append 进 transcript(区域2 查看 agent 上下文用)。
-        // 格式对齐进度树动作行: `⎿ <Tool: arg>`(actionLabelColon 由渲染方算,这里存原料)。
-        // 失败静默(transcript 是辅助展示,非正确性路径)。
         appendTranscriptToolLine(&self.transcript, self.allocator, tool_name[0..n], tool_input[0..m]) catch {};
-    }
-
-    /// usage_sink trampoline:持锁更新 tokens。state 是 *JobEntry。
-    /// 语义对齐 cc 进度树的 token 数(实拍多 agent 同值 ~17k)——取最新 input+output 快照
-    /// (context 大小镜像),非跨轮累加。每个 usage event 覆盖。
-    pub fn usageTrampoline(state: *anyopaque, delta: @import("../api/stream.zig").UsageDelta) void {
-        const self: *JobEntry = @ptrCast(@alignCast(state));
-        self.lock();
-        defer self.unlock();
-        self.tokens = delta.input_tokens + delta.output_tokens;
     }
 };
 
@@ -174,7 +192,11 @@ pub const SpawnParams = struct {
     desc: []const u8 = "",
     /// agent 类型(如 "Explore";进度树标题按 type 分组用)。
     agent_type: []const u8 = "",
-    skill_activator: ?@import("../tools/context.zig").SkillActivator = null,
+    /// L5:后台 subagent 的宿主能力(通常 skillOnly 投影)。见 HostServices。
+    host_services: ?@import("../tools/context.zig").HostServices = null,
+    /// Ctrl+B 主对话转后台:预建对话副本(深拷贝,所有权转移给 registry → JobInput → spawnAgentSink)。
+    /// null=普通 subagent(从 prompt 起新对话)。
+    prebuilt_conversation: ?Conversation = null,
 };
 
 /// 线程拥有的输入。线程结束时自行 cleanup(free dupe + client/io deinit + destroy)。
@@ -200,10 +222,13 @@ const JobInput = struct {
     agents: ?*const AgentSet,
     dyn_registry: ?*const DynRegistry,
     skills: ?*const SkillSet,
-    skill_activator: ?@import("../tools/context.zig").SkillActivator,
+    host_services: ?@import("../tools/context.zig").HostServices,
     // 专属资源:
     io_runtime: *std.Io.Threaded,
     client: *client_mod.Client,
+    /// Ctrl+B 主对话转后台:预建对话(深拷贝副本,所有权在此)。jobThreadMain move 进 SpawnOptions
+    /// 后立即置 null(单一所有者);仅 spawn 失败回滚时 cleanup 命中 deinit。null=普通 subagent(从 prompt 起)。
+    prebuilt_conversation: ?Conversation = null,
     // 嵌套后台:子 agent 也能 Task(run_in_background) 注册进同一 root registry。
     registry: *AgentJobRegistry,
 
@@ -217,6 +242,7 @@ const JobInput = struct {
         a.free(self.project_dir);
         a.free(self.parent_model);
         if (self.model_override) |m| a.free(m);
+        if (self.prebuilt_conversation) |*c| c.deinit(); // 仅 spawn 失败回滚命中(jobThreadMain 成功路径已 move 置 null)
         self.client.deinit();
         a.destroy(self.client);
         self.io_runtime.deinit();
@@ -224,13 +250,6 @@ const JobInput = struct {
         a.destroy(self);
     }
 };
-
-/// WriterBackend 的 sink:把 CoreEvent 字节(text_chunk 等)导进 entry.output_buf,实现
-/// 增量可见。ctx 是 *JobEntry。backend 已预格式化好字节,这里只持锁 append。
-fn jobSink(ctx: *anyopaque, bytes: []const u8) void {
-    const e: *JobEntry = @ptrCast(@alignCast(ctx));
-    e.appendOutput(bytes);
-}
 
 pub const AgentJobRegistry = struct {
     allocator: std.mem.Allocator,
@@ -310,14 +329,25 @@ pub const AgentJobRegistry = struct {
     }
 
     /// 启动后台 job,立即返回 id(指向 entry.id,registry 存活期间有效)。
-    pub fn spawnBackground(self: *AgentJobRegistry, p: SpawnParams) ![]const u8 {
+    /// **所有权 / 失败回滚(committed-flag 模型)**:本函数逐资源 errdefer,全部 gate 在 `if (!committed)`。
+    /// spawn 线程成功后才 `committed = true`(所有权转移给线程,errdefer 全部失效)。在那之前的**任何**
+    /// 失败路径只需 `return e`——errdefer 统一释放,**不手动 cleanup**(手动 cleanup + errdefer 共存会
+    /// double-free:Zig errdefer 在 catch+return e 时照样触发,实测验证)。`p.prebuilt_conversation`
+    /// 同样 consume-on-call:失败由 errdefer 释放,成功由 job(jobThreadMain move 进 spawnAgentSink)释放。
+    pub fn spawnBackground(self: *AgentJobRegistry, p_in: SpawnParams) ![]const u8 {
+        var p = p_in;
+        var committed = false; // spawn 成功才置 true;此前所有 errdefer 都 gate 在 !committed
+        // prebuilt_conversation 的释放(失败路径):consume-on-call,errdefer 接管。
+        errdefer if (!committed) {
+            if (p.prebuilt_conversation) |*c| c.deinit();
+        };
         if (self.runningCount() >= MAX_BG_JOBS) return error.TooManyBackgroundJobs;
 
         const a = self.allocator;
 
         // 1) 堆分配 entry(地址稳定)
         const entry = try a.create(JobEntry);
-        errdefer a.destroy(entry);
+        errdefer if (!committed) a.destroy(entry);
         entry.* = .{ .allocator = a };
         entry.mutex = .{};
         entry.abort = AbortSignal.init();
@@ -330,36 +360,36 @@ pub const AgentJobRegistry = struct {
             break :blk n;
         };
         entry.desc_preview = try a.dupe(u8, p.desc[0..@min(p.desc.len, 80)]);
-        errdefer a.free(entry.desc_preview);
+        errdefer if (!committed) a.free(entry.desc_preview);
         entry.agent_type = a.dupe(u8, p.agent_type[0..@min(p.agent_type.len, 32)]) catch &.{};
-        errdefer if (entry.agent_type.len > 0) a.free(entry.agent_type);
+        errdefer if (!committed and entry.agent_type.len > 0) a.free(entry.agent_type);
 
         // 2) 专属 io_runtime + Client(堆分配,所有权给 JobInput)
         const io_rt = try a.create(std.Io.Threaded);
-        errdefer a.destroy(io_rt);
+        errdefer if (!committed) a.destroy(io_rt);
         io_rt.* = std.Io.Threaded.init(a, .{});
-        errdefer io_rt.deinit();
+        errdefer if (!committed) io_rt.deinit();
 
         const client = try a.create(client_mod.Client);
-        errdefer a.destroy(client);
+        errdefer if (!committed) a.destroy(client);
         client.* = client_mod.Client.initWithBaseUrl(a, io_rt.io(), self.api_key, self.model, self.base_url);
-        errdefer client.deinit();
+        errdefer if (!committed) client.deinit();
 
         // 3) dupe 所有借用内存进 JobInput(必须在 spawn 之前)
         const input = try a.create(JobInput);
-        errdefer a.destroy(input);
+        errdefer if (!committed) a.destroy(input);
         const prompt_owned = try a.dupe(u8, p.prompt);
-        errdefer a.free(prompt_owned);
+        errdefer if (!committed) a.free(prompt_owned);
         const sys_owned = try a.dupe(u8, p.system_prompt);
-        errdefer a.free(sys_owned);
+        errdefer if (!committed) a.free(sys_owned);
         const defs_owned = try a.dupe(json_mod.ToolDefinition, p.tool_defs);
-        errdefer a.free(defs_owned);
+        errdefer if (!committed) a.free(defs_owned);
         // 深拷贝每个 description 进 job 内存(父 execute 返回后原串被释放 → 否则 UAF)。
         // name/input_schema/server_type 指向静态注册表,长生命周期,浅拷贝即可。
         const desc_copies = try a.alloc([]u8, defs_owned.len);
-        errdefer a.free(desc_copies);
+        errdefer if (!committed) a.free(desc_copies);
         var nd: usize = 0;
-        errdefer for (desc_copies[0..nd]) |d| a.free(d);
+        errdefer if (!committed) for (desc_copies[0..nd]) |d| a.free(d);
         for (defs_owned, 0..) |*d, di| {
             const c = try a.dupe(u8, d.description);
             desc_copies[di] = c;
@@ -367,11 +397,11 @@ pub const AgentJobRegistry = struct {
             d.description = c;
         }
         const pdir_owned = try a.dupe(u8, p.project_dir);
-        errdefer a.free(pdir_owned);
+        errdefer if (!committed) a.free(pdir_owned);
         const pmodel_owned = try a.dupe(u8, p.parent_model);
-        errdefer a.free(pmodel_owned);
+        errdefer if (!committed) a.free(pmodel_owned);
         const mover_owned: ?[]u8 = if (p.model_override) |m| try a.dupe(u8, m) else null;
-        errdefer if (mover_owned) |m| a.free(m);
+        errdefer if (!committed) if (mover_owned) |m| a.free(m);
 
         input.* = .{
             .allocator = a,
@@ -390,13 +420,15 @@ pub const AgentJobRegistry = struct {
             .agents = p.agents,
             .dyn_registry = p.dyn_registry,
             .skills = p.skills,
-            .skill_activator = p.skill_activator,
+            .host_services = p.host_services,
             .io_runtime = io_rt,
             .client = client,
+            .prebuilt_conversation = p.prebuilt_conversation, // move(Ctrl+B 转后台);普通 subagent=null
             .registry = self,
         };
 
-        // 4) 注册进 entries + index(持 list 锁),在 spawn 之前——保证 id 立即可查
+        // 4) 注册进 entries + index(持 list 锁),在 spawn 之前——保证 id 立即可查。
+        //    失败:只 return e,上面所有 !committed errdefer 统一释放(不手动 cleanup → 防 double-free)。
         self.listLock();
         self.entries.append(a, entry) catch |e| {
             self.listUnlock();
@@ -404,11 +436,8 @@ pub const AgentJobRegistry = struct {
         };
         self.index.put(entry.id, entry) catch {};
         self.listUnlock();
-
-        // 5) spawn 线程。spawn 成功后所有权(input/entry/client/io)归线程 + registry,
-        //    上面的 errdefer 不再触发(已过)。
-        entry.thread = std.Thread.spawn(.{}, jobThreadMain, .{input}) catch |e| {
-            // spawn 失败:回滚——从 registry 摘掉 + cleanup input + destroy entry
+        // 注册成功后 entry 已进 entries——若下面 spawn 失败,需从 entries 摘掉再让 errdefer 释放。
+        errdefer if (!committed) {
             self.listLock();
             _ = self.index.remove(entry.id);
             for (self.entries.items, 0..) |it, i| {
@@ -418,10 +447,12 @@ pub const AgentJobRegistry = struct {
                 }
             }
             self.listUnlock();
-            input.cleanup(); // free dupe + client/io deinit + destroy input
-            freeEntry(entry); // free desc_preview/agent_type/output_buf/transcript + destroy
-            return e;
         };
+
+        // 5) spawn 线程。成功 → committed=true,所有权(input/entry/client/io/prebuilt)归线程 + registry,
+        //    所有 errdefer 失效。失败 → return e,errdefer 统一回滚(摘 registry + 释放全部资源)。
+        entry.thread = try std.Thread.spawn(.{}, jobThreadMain, .{input});
+        committed = true;
 
         log.info("agent", "background job spawned id={s} desc={s}", .{ entry.idSlice(), entry.desc_preview });
         return entry.idSlice();
@@ -580,6 +611,25 @@ pub const AgentJobRegistry = struct {
     pub fn kill(self: *AgentJobRegistry, id: []const u8) error{JobNotFound}!void {
         const e = self.get(id) orelse return error.JobNotFound;
         e.abort.abort(.user_ctrl_c);
+    }
+
+    /// 非阻塞 abort 所有 running job(esc 中断用)。**不 join**(watcher 线程调,不能阻塞)——
+    /// 各 job 跑到检查点后自退。前台 Task 的 subagent 走 app.abort 已被中断;此处补齐**后台/嵌套**
+    /// agent job(它们持自己的 entry.abort,app.abort 不触达)。返回触发的数量。幂等。
+    pub fn abortAllRunning(self: *AgentJobRegistry) usize {
+        self.listLock();
+        defer self.listUnlock();
+        var n: usize = 0;
+        for (self.entries.items) |e| {
+            e.lock();
+            const running = e.status == .running;
+            e.unlock();
+            if (running) {
+                e.abort.abort(.user_ctrl_c);
+                n += 1;
+            }
+        }
+        return n;
     }
 
     /// 造一个专属 io_runtime + Client(堆分配,所有权归调用者)。供同步前台 Task
@@ -760,10 +810,9 @@ fn jobThreadMain(input: *JobInput) void {
     var ctx_override = input.permission_ctx;
     if (input.perm_override) |m| ctx_override.setMode(m);
 
-    // 后台 subagent 输出导进 job buffer 的 backend。colorize=false(非交互终端,
-    // 对齐旧 SinkWriter + subagent colorize=false);工具卡事件 no-op(depth>=1 本就不发)。
-    var wb = writer_backend.WriterBackend{ .sink_ctx = @ptrCast(e), .sink = jobSink, .colorize = false };
-    const be = wb.backend();
+    // L1:JobEntry 自身就是 backend——流式 text 进 output_buf、进度/token 更新树字段,
+    // 单通道(取代旧 WriterBackend+jobSink / progress / usage 三通道)。
+    const be = e.backend();
 
     const opts = subagent.SpawnOptions{
         .max_turns = if (input.max_turns > 0) input.max_turns else 20,
@@ -773,14 +822,14 @@ fn jobThreadMain(input: *JobInput) void {
         .tool_defs_override = input.tool_defs_owned,
         .permission_mode_override = input.perm_override,
         .model_override = input.model_override,
-        .skill_activator = input.skill_activator,
+        .host_services = input.host_services,
         .project_dir = input.project_dir,
         .agent_jobs = input.registry, // 允许嵌套后台
-        // 实时进度回写:agent_loop 每轮/每工具调 trampoline,持锁更新 e.current_turn/tool。
-        .progress_reporter = .{ .ctx = @ptrCast(e), .reportFn = &JobEntry.progressTrampoline },
-        // token 回写:usage event 持锁更新 e.tokens,供进度树 `· X tokens`。
-        .usage_sink = .{ .ctx = @ptrCast(e), .addFn = &JobEntry.usageTrampoline },
+        // Ctrl+B 转后台:move 预建对话给 spawnAgentSink(它 defer deinit)。**move 后立即置 null**:
+        // 单一所有者不变式——此后只有 opts/spawnAgentSink 持有,input.cleanup 不再 deinit(防 double-free)。
+        .prebuilt_conversation = input.prebuilt_conversation,
     };
+    input.prebuilt_conversation = null;
 
     const result = subagent.spawnAgentSink(
         input.allocator,
@@ -813,21 +862,21 @@ fn jobThreadMain(input: *JobInput) void {
 
 const testing = std.testing;
 
-test "progressTrampoline 实时回写 tool_calls(#6:subagent 树执行中累加非恒 0)" {
-    // #6 修复:执行中 trampoline 必须实时回写 tool_calls,否则 subagent 树恒显 `· 0 tools ·`
-    //(旧 bug:tool_calls 只在 job 跑完后一次性赋值)。
+test "JobEntry backend 消费 CoreEvent.progress 实时回写 tool_calls(L1:#6 进度=事件)" {
+    // #6 修复:执行中进度必须实时回写 tool_calls,否则 subagent 树恒显 `· 0 tools ·`。
+    // L1 后:进度走 backend.emit(.progress)(取代旧 progressTrampoline 回调)。本测试经
+    // JobEntry.backend() 的 emit 驱动,端到端验证 CoreEvent.progress → 树字段的接线。
     var reg = try AgentJobRegistry.init(testing.allocator, "test-key", "http://127.0.0.1:1", "test-model");
     defer reg.deinit();
 
     try reg.pushTestEntry("count files", 1, "", "");
     const entry = reg.entries.items[0];
-    // 初值:running 且 tool_calls=0(尚未调工具)。
     try testing.expectEqual(@as(u32, 0), entry.tool_calls);
 
+    const be = entry.backend();
     // 模拟 agent_loop 上报:turn 2,刚调完第 5 个工具(Grep)。
-    JobEntry.progressTrampoline(entry, 2, "Grep", "{\"pattern\":\"x\"}", 5);
+    be.emitEvent(.single, .{ .progress = .{ .turn = 2, .tool_name = "Grep", .tool_input = "{\"pattern\":\"x\"}", .tool_calls = 5 } });
 
-    // 快照应反映实时累计值(执行中,非跑完)。
     const snaps = try reg.snapshotJobs(testing.allocator);
     defer AgentJobRegistry.freeSnapshots(testing.allocator, snaps);
     try testing.expectEqual(@as(usize, 1), snaps.len);
@@ -836,10 +885,121 @@ test "progressTrampoline 实时回写 tool_calls(#6:subagent 树执行中累加�
     try testing.expectEqual(@as(u32, 2), snaps[0].current_turn);
 
     // 轮起始上报(空 tool_name)也刷新计数(early-return 之前回写)。
-    JobEntry.progressTrampoline(entry, 3, "", "", 7);
+    be.emitEvent(.single, .{ .progress = .{ .turn = 3, .tool_name = "", .tool_input = "", .tool_calls = 7 } });
     const snaps2 = try reg.snapshotJobs(testing.allocator);
     defer AgentJobRegistry.freeSnapshots(testing.allocator, snaps2);
     try testing.expectEqual(@as(u32, 7), snaps2[0].tool_calls);
+
+    // usage 事件回写 tokens(取最新 input+output 快照)。
+    be.emitEvent(.single, .{ .usage = .{ .input_tokens = 1000, .output_tokens = 200 } });
+    entry.lockPublic();
+    const tok = entry.tokens;
+    entry.unlockPublic();
+    try testing.expectEqual(@as(u64, 1200), tok);
+
+    // L1 行为:text_chunk 进 output_buf(前台 entry 也走本 backend,故流式 text 被填充)。
+    be.emitEvent(.single, .{ .text_chunk = "hello " });
+    be.emitEvent(.single, .{ .text_chunk = "world" });
+    entry.lockPublic();
+    const out = entry.output_buf.items;
+    entry.unlockPublic();
+    try testing.expectEqualStrings("hello world", out);
+}
+
+test "spawnBackground prebuilt_conversation consume-on-call:失败路径不泄漏(R3)" {
+    // Ctrl+B 转后台:spawnBackground 是 consume-on-call —— 失败路径必须释放传入的 prebuilt
+    // conversation。填满 registry 触发 TooManyBackgroundJobs 早退,断言 testing.allocator 不报
+    // 泄漏/double-free(=失败路径正确 deinit 了 prebuilt copy)。
+    const a = testing.allocator;
+    var reg = try AgentJobRegistry.init(a, "test-key", "http://127.0.0.1:1", "test-model");
+    defer reg.deinit();
+
+    var i: usize = 0;
+    while (i < MAX_BG_JOBS) : (i += 1) try reg.pushTestEntry("filler", 1, "", "");
+
+    var copy = Conversation.init(a);
+    try copy.appendText(.user, "continue this");
+    try copy.appendText(.assistant, "ok");
+
+    const r = reg.spawnBackground(.{
+        .prompt = "",
+        .system_prompt = "",
+        .tool_defs = &.{},
+        .permission_ctx = permission_mod.createContext(.bypass_permissions, a),
+        .prebuilt_conversation = copy,
+    });
+    try testing.expectError(error.TooManyBackgroundJobs, r);
+    // 不手动 deinit copy:consume 语义下失败路径已释放。testing.allocator 检查泄漏/double-free。
+}
+
+test "abortAllRunning:esc 中断 abort 所有 running agent job(非阻塞)" {
+    // 用户实测 bug:启动多 agent 后 esc 不终止。根因:后台/嵌套 agent job 持自己的 entry.abort,
+    // app.abort 不触达。esc 现调 abortAllRunning() 补齐。验证:对所有 running entry 置 abort、返回数量。
+    const a = testing.allocator;
+    var reg = try AgentJobRegistry.init(a, "k", "http://127.0.0.1:1", "m");
+    defer reg.deinit();
+    // pushTestEntry 造无线程的 running entry(状态 .running)。
+    try reg.pushTestEntry("agent A", 1, "", "");
+    try reg.pushTestEntry("agent B", 1, "", "");
+    // 验证初始未 abort。
+    try testing.expect(!reg.entries.items[0].abort.isAborted());
+    try testing.expect(!reg.entries.items[1].abort.isAborted());
+
+    const n = reg.abortAllRunning();
+    try testing.expectEqual(@as(usize, 2), n);
+    // 两个 running job 的 abort 都被触发。
+    try testing.expect(reg.entries.items[0].abort.isAborted());
+    try testing.expect(reg.entries.items[1].abort.isAborted());
+    // 幂等:再调一次不报错(已 abort 的再 abort 无副作用)。
+    _ = reg.abortAllRunning();
+}
+
+test "spawnBackground committed-flag:input.* 建好后失败也无泄漏(FailingAllocator,不 spawn 线程)" {
+    // 用 FailingAllocator 在 spawnBackground 的 dupe/创建块中途失败,驱动 !committed errdefer 统一回滚
+    // (含 prebuilt_conversation 深拷贝)。**只扫会在 Thread.spawn 之前失败的低 fail_index**——避免
+    // 成功路径起真线程在失败 allocator 上跑出无关 OOM 泄漏。验证 committed-flag 模型在每个早期失败点
+    // 都不泄漏、不 double-free(对照旧 spawn-fail 路径手动 cleanup+errdefer 共存的 double-free)。
+    const base = testing.allocator;
+    // spawnBackground 成功前的 alloc 次数(entry/io/client/input/各 dupe)约 13-18 次;扫 1..13 确保
+    // 每次失败都落在 input.* 之前或 entries.append 处,**绝不到 Thread.spawn**(线程从不起)。
+    var n: usize = 1;
+    while (n <= 13) : (n += 1) {
+        var fa = std.testing.FailingAllocator.init(base, .{ .fail_index = n });
+        const a = fa.allocator();
+        // registry 自身 init 也要 alloc;init 失败就跳过该 index(本测试只关心 spawnBackground 内部回滚)。
+        var reg = AgentJobRegistry.init(a, "k", "http://127.0.0.1:1", "m") catch continue;
+        defer reg.deinit();
+
+        var copy = Conversation.init(a);
+        copy.appendText(.user, "hist") catch {
+            copy.deinit();
+            continue;
+        };
+
+        // 必失败(fail_index 落在 spawnBackground 内部);consume 语义释放 copy + errdefer 释放全部资源。
+        // **覆盖盲区(诚实登记)**:本测试只能驱动 **alloc 失败** 路径(input.* 之前的各 dupe/create errdefer)。
+        // 而 spawn-后的 un-register errdefer(line ~440)只在 **Thread.spawn 失败** 时触发——spawn 失败不是
+        // alloc 失败,FailingAllocator 模拟不出。那条 errdefer 的正确性靠代码审查 + LIFO 顺序保证(un-register
+        // 后注册→最先跑→在 destroy(entry) 前用有效指针 swapRemove),非本测试覆盖。
+        const r = reg.spawnBackground(.{
+            .prompt = "p",
+            .system_prompt = "s",
+            .tool_defs = &.{},
+            .permission_ctx = permission_mod.createContext(.bypass_permissions, a),
+            .desc = "main",
+            .agent_type = "main",
+            .prebuilt_conversation = copy,
+        });
+        // **硬警报**(Linus):本扫描区间(1..13)按设计 fail_index 永远落在 Thread.spawn 之前 → 必失败。
+        // 若 spawnBackground 竟成功,说明有人在 spawn 前加了 alloc、13 这个边界过时了 → 测试退化成
+        // "起真线程在失败 allocator 上跑出无关 OOM 泄漏"。与其悄悄 flaky,不如**响**:成功即报错,
+        // 逼维护者把上界调到 spawn 前的真实 alloc 数。(reg.deinit defer 会 abort+join 误起的线程。)
+        if (r) |_| {
+            return error.TestFailIndexTooHigh; // 扫到了 spawn 成功路径——调小上界或对齐真实 alloc 数
+        } else |_| {}
+        // FailingAllocator 在 reg.deinit 后由 testing.allocator(base)检查:errdefer 必须已释放
+        // copy + 所有 spawnBackground 内分配,否则报泄漏。
+    }
 }
 
 test "copyOutputBuf: prompt_preview + output_buf 完整流;缺 id 返 null" {

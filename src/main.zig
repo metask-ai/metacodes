@@ -10,6 +10,11 @@ pub const VERSION = "0.1.0";
 
 // Public re-exports for tests and future consumers.
 pub const api_stream = @import("api/stream.zig");
+pub const api_provider = @import("api/provider.zig");
+pub const api_capability = @import("api/capability.zig");
+pub const api_cache = @import("api/cache.zig");
+pub const api_openai = @import("api/openai_client.zig");
+pub const api_gemini = @import("api/gemini_client.zig");
 pub const client_mod = client; // alias for L2 component tests
 pub const types_mod = types;
 pub const json_mod = @import("json.zig");
@@ -71,6 +76,9 @@ pub const session_id = @import("core/session_id.zig");
 pub const tui_backend = @import("repl/tui/tui_backend.zig");
 pub const writer_backend = @import("core/writer_backend.zig");
 pub const headless_backend = @import("core/headless_backend.zig");
+pub const suspend_state = @import("core/suspend_state.zig");
+pub const tee_backend = @import("core/tee_backend.zig");
+pub const diagnostics_backend = @import("core/diagnostics_backend.zig");
 pub const repl_msg_queue = @import("repl/msg_queue.zig");
 pub const tui_status_bar = @import("repl/tui/widget/status_bar.zig");
 pub const tui_verbs = @import("repl/tui/verbs.zig");
@@ -93,6 +101,30 @@ pub fn parseArgsForTest(argv: []const [*:0]const u8, allocator: std.mem.Allocato
     var args = std.process.Args.iterate(.{ .vector = argv });
     parseArgsInto(&config, &args, allocator);
     return config;
+}
+
+/// 据 model 名前缀推断 provider 协议(纯函数,无 env)。gpt*/o1*/o3* → openai,gemini* → gemini,
+/// 其余 anthropic。env METACODES_PROVIDER 在 main 里显式覆盖此推断。
+pub fn inferProviderKind(model: []const u8) types.ProviderKind {
+    if (std.mem.startsWith(u8, model, "gpt") or
+        std.mem.startsWith(u8, model, "o1") or
+        std.mem.startsWith(u8, model, "o3"))
+    {
+        return .openai;
+    }
+    if (std.mem.startsWith(u8, model, "gemini")) return .gemini;
+    return .anthropic;
+}
+
+test "inferProviderKind:model 前缀选 provider 协议" {
+    try std.testing.expectEqual(types.ProviderKind.openai, inferProviderKind("gpt-4o"));
+    try std.testing.expectEqual(types.ProviderKind.openai, inferProviderKind("gpt-4o-mini"));
+    try std.testing.expectEqual(types.ProviderKind.openai, inferProviderKind("o1-preview"));
+    try std.testing.expectEqual(types.ProviderKind.openai, inferProviderKind("o3-mini"));
+    try std.testing.expectEqual(types.ProviderKind.gemini, inferProviderKind("gemini-2.5-flash"));
+    try std.testing.expectEqual(types.ProviderKind.gemini, inferProviderKind("gemini-2.5-pro"));
+    try std.testing.expectEqual(types.ProviderKind.anthropic, inferProviderKind("claude-sonnet-4-20250514"));
+    try std.testing.expectEqual(types.ProviderKind.anthropic, inferProviderKind("claude-opus-4-1"));
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -118,6 +150,16 @@ pub fn main(init: std.process.Init) !void {
     }
     if (config.record_dir == null) {
         if (std.c.getenv("METACODES_RECORD_DIR")) |c| config.record_dir = std.mem.span(c);
+    }
+
+    // --- provider 选择:env METACODES_PROVIDER 显式优先,否则据 model 前缀推断 ---
+    // (gpt*/o1*/o3* → openai,gemini* → gemini)。只在此组装层据此选 Client;core/UI 零感知。
+    if (std.c.getenv("METACODES_PROVIDER")) |c| {
+        const v = std.mem.span(c);
+        if (std.mem.eql(u8, v, "openai")) config.provider_kind = .openai;
+        if (std.mem.eql(u8, v, "gemini")) config.provider_kind = .gemini;
+    } else {
+        config.provider_kind = inferProviderKind(config.model);
     }
 
     // --- 预置应答队列(Stage 3):--answers-file 优先,METACODES_ANSWERS env 兜底 ---
@@ -388,6 +430,9 @@ test {
     _ = &@import("repl/tui/tui_backend.zig");
     _ = &@import("core/writer_backend.zig");
     _ = &@import("core/headless_backend.zig");
+    _ = &@import("core/tee_backend.zig");
+    _ = &@import("core/diagnostics_backend.zig");
+    _ = &@import("core/suspend_state.zig");
     _ = &@import("repl/tui/ui_state.zig");
     _ = &@import("repl/tui/ui.zig");
     _ = &@import("repl/tui/event.zig");

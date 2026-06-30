@@ -293,26 +293,26 @@ def test_T31_gen_help_esc_only_closes(bin_path):
 
 
 def test_T32_gen_ctrl_o_transcript(bin_path):
-    # 生成期按 Ctrl+O → inline 内联 transcript viewer(对齐 cc,不进 alt-screen)。
-    # 持渲染锁,emit 线程阻塞不抢 stdout;先 sleep 让首轮 append 进 conversation,transcript 有内容。
+    # 生成期按 Ctrl+O → 全屏 transcript viewer(alt-screen)。持渲染锁,emit 线程阻塞不抢 stdout;
+    # 先 sleep 让首轮 append 进 conversation,transcript 有内容。alt-screen 独立缓冲根治多 agent 显两份。
     if SKIP:
         return
     raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
                          "sleep:1.5", "key:ctrl_o", "sleep:0.8"],
               per_key_drain=0.05, base_url=None)
-    assert b"\x1b[?1049h" not in raw, "生成期 Ctrl+O inline 不应进 alt-screen"
+    assert b"\x1b[?1049h" in raw, "生成期 Ctrl+O 全屏 transcript 应进 alt-screen"
     assert b"Showing detailed transcript" in raw, "生成期 Ctrl+O 应渲染 cc 风格 transcript footer"
 
 
 def test_T33_gen_ctrl_o_toggle_close(bin_path):
-    # 生成期 Ctrl+O 开 inline → 再 Ctrl+O 关(viewer 认 0x0f 退出)→ 回生成区。
+    # 生成期 Ctrl+O 开全屏(alt-screen)→ 再 Ctrl+O 关(viewer 认 0x0f/CSI-u 退出)→ 终端自动恢复回生成区。
     if SKIP:
         return
     raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
                          "sleep:1.5", "key:ctrl_o", "sleep:0.6", "key:ctrl_o", "sleep:1"],
               per_key_drain=0.05, base_url=None)
     a = TTYAssert(raw)
-    assert b"\x1b[?1049h" not in raw, "inline 不进 alt-screen"
+    assert b"\x1b[?1049h" in raw, "全屏 transcript 应进 alt-screen"
     assert b"Showing detailed transcript" in raw, "应一度显示 transcript footer"
     # 关闭后最终屏不残留 transcript footer。
     last = a.frame_screens[-1] if a.frame_screens else None

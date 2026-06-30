@@ -9,6 +9,7 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const client_mod = @import("../client.zig");
+const provider_mod = @import("../api/provider.zig");
 const json_mod = @import("../json.zig");
 const tools_mod = @import("../tools.zig");
 const permission_mod = @import("../permission.zig");
@@ -25,7 +26,7 @@ const ui_event = @import("protocol/ui_event.zig");
 const UiBackend = ui_backend.UiBackend;
 const CoreEvent = ui_event.CoreEvent;
 
-pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error, tool_loop, suspended };
+pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error, tool_loop, suspended, backgrounded };
 
 /// 工具进度 trampoline:把工具的 progress 回调(WebSearch query/results)转成 CoreEvent,
 /// 经 backend 路由到归属 session 的 UI。per-run 实例(backend + session),progress_state 指它。
@@ -76,10 +77,47 @@ const ToolErrSig = struct {
 /// 低于这个值不做压缩。设为 32K——正常对话/工具调研远小于此,只有真逼近 context window 才触发。
 pub const MIN_AUTO_COMPACT_THRESHOLD: usize = 32_000;
 
+/// L3 挂起信息:stop_reason==.suspended 时非空,带出挂起点供调用方落盘 + 恢复。
+/// owned by run() 的 allocator;调用方用后 free(deinit)。
+///
+/// **API 配对约束(关键)**:Anthropic 要求 assistant 的每个 tool_use 在紧接 user 消息里都有
+/// 对应 tool_result——不能拆成两次 user 消息。故挂起时**不**提交任何 partial user 消息;
+/// 已完成工具(非 pending)的结果 stash 进 completed_results,resume 时与 pending 工具的迟来
+/// 结果**一起**作为单条 user 消息补齐(A+B 同 turn),满足配对。
+pub const SuspendInfo = struct {
+    /// 待补迟来结果的 pending tool_use id(owned)。
+    tool_use_id: []const u8,
+    kind: []const u8, // custom UI 类型(owned)
+    payload_json: []const u8, // 渲染规格(owned)
+    /// 同轮已完成工具的结果(owned)。resume 时与 pending 的迟来结果一起补成单条 user 消息。
+    completed_results: []CompletedResult,
+    allocator: std.mem.Allocator,
+
+    pub const CompletedResult = struct {
+        tool_use_id: []const u8, // owned
+        content: []const u8, // owned
+        is_error: bool,
+    };
+
+    pub fn deinit(self: SuspendInfo) void {
+        self.allocator.free(self.tool_use_id);
+        self.allocator.free(self.kind);
+        self.allocator.free(self.payload_json);
+        for (self.completed_results) |cr| {
+            self.allocator.free(cr.tool_use_id);
+            self.allocator.free(cr.content);
+        }
+        self.allocator.free(self.completed_results);
+    }
+};
+
 pub const RunResult = struct {
     stop_reason: StopReason,
     turns: u32,
     tool_calls: u32,
+    /// L3:仅 stop_reason==.suspended 时非空。调用方据此落盘 suspend.json + 投递 UI 请求,
+    /// 响应到达后 resumeRun 注入。用后 deinit。
+    suspend_info: ?SuspendInfo = null,
 };
 
 pub const Options = struct {
@@ -95,13 +133,15 @@ pub const Options = struct {
     inject_user_context: ?[]const u8 = null,
     verbose: bool = false,
     abort: ?*const AbortSignal = null,
+    /// 转后台请求信号(Ctrl+B 生成期置位)。run() 每轮**开头**(turn 边界,conversation 干净时)
+    /// load 一次,命中则返回 stop_reason=.backgrounded(不中断当前未完成的 turn)。调用方据此把
+    /// 主对话深拷贝转后台续跑。与 abort 分开:abort 是用户中断(对话留前台),background 是转后台续跑。
+    /// null → 不支持转后台(headless/子 agent)。
+    background_request: ?*const std.atomic.Value(bool) = null,
     /// 传给 Write/Edit 做 must-read-first 校验。null → 单测/headless 简化路径（不校验）
     read_state: ?*ReadState = null,
     /// Edit/Write 旁路高亮缓存(diff 工具卡 tree-sitter 着色用)。null → 不缓存。
     edit_hl_cache: ?*@import("edit_hl_cache.zig").EditHlCache = null,
-    /// 收集 stream usage 事件：input/output/cache token 数。null → 不累加。
-    /// by-value：sink 只含两个指针，直接塞进来，避免悬挂指针风险。
-    usage_sink: ?UsageSink = null,
     /// 自动 compact 的 token 阈值。null → 按 resolveMaxTokens() * 0.7 动态算
     auto_compact_threshold: ?usize = null,
     /// 自动 compact 保留的消息数（最新的 N 条）
@@ -114,17 +154,20 @@ pub const Options = struct {
     plan_prev_mode: ?*?types.PermissionMode = null,
     /// 模型 Task 清单（TaskCreate/Get/List/Update/Stop 共享）
     tasks: ?*@import("task_store.zig").TaskStore = null,
-    /// 供 Agent 工具 spawn 子 agent 复用 api_client + tool_defs
+    /// 供 Agent 工具 spawn 子 agent 复用 api_client + tool_defs。
+    /// **职责边界(P1)**:这是工具/subagent **构造** per-call client(initWithBaseUrl/makeClient)用的
+    /// *Client,与 run() 第一参数收的 Provider(已 provider 化的"用 LLM"路径)**不同职责**——Provider
+    /// vtable 是"用",不含构造能力。工具层(web_search 隔离子请求 / Agent spawn)的 provider 化是
+    /// P2/P3 待办;在此之前这里保持 *Client。见 metaknow「多 Provider 分离架构设计」。
     api_client: ?*@import("../client.zig").Client = null,
     tool_defs: ?[]const @import("../json.zig").ToolDefinition = null,
     /// 本次 run 对应的 agent 嵌套深度（父=0，子=1…）
     agent_depth: u8 = 0,
     /// 运行时工具（Skill/MCP）注册表。null = 仅静态工具。
     dyn_registry: ?*const @import("../tools/dynamic.zig").DynRegistry = null,
-    /// Skill 激活回调:Skill 工具激活后调用,把临时白/黑名单挂到 App。见 ToolContext.SkillActivator。
-    skill_activator: ?tools_mod.SkillActivator = null,
-    /// ToolSearch 激活 deferred 工具的回调(透传到 ToolContext)。见 ToolContext.ToolActivator。
-    tool_activator: ?tools_mod.ToolActivator = null,
+    /// L5:宿主能力聚合(Skill 激活 / ToolSearch 激活 / Worktree push-pop)。透传到 ToolContext。
+    /// 见 ToolContext.HostServices。
+    host_services: ?tools_mod.HostServices = null,
     /// 本轮的 Skill 工具调用是否为"用户显式 /name 触发"。
     /// 当前 Stage C 总是 false(只支持模型自主);Stage D 加 /<skill-name> 命令后置 true。
     explicit_invocation: bool = false,
@@ -151,8 +194,6 @@ pub const Options = struct {
     /// ToolSearch 激活的 deferred 工具名集。非 null 时:deferred 且不在此集的工具
     /// 不进 API tools 数组(降低弱后端工具菜单稀释)。null = 不过滤 deferred(全暴露)。
     activated_tools: ?*const std.StringHashMap(void) = null,
-    /// Worktree 钩子(EnterWorktree/ExitWorktree 工具用)。见 ToolContext.WorktreeHook。
-    worktree_hook: ?tools_mod.WorktreeHook = null,
     /// 统一 UI 请求回调(替代旧 ask_question/exit_plan 三套;ctx 指 *TuiBackend)。
     /// 仅顶层 TUI 接(agent_depth==0)——子 agent 无 tty。见 UiRequester。
     ui_requester: ?@import("protocol/ui_request.zig").UiRequester = null,
@@ -172,38 +213,34 @@ pub const Options = struct {
     /// 后台 subagent(输出经 SinkWriter 进可查询缓冲)/headless = false,否则 final_text
     /// 会混入 \x1b[32m 等控制码。
     colorize: bool = true,
-    /// 实时进度回调(后台 subagent 用):每轮开始 + 每个工具执行前调用,
-    /// 把 (turn, tool_name, tool_input, tool_calls) 写回调用方(JobEntry)。null = 不上报。见 ProgressReporter。
-    progress_reporter: ?ProgressReporter = null,
 };
 
-/// 内部:发一次进度上报(turn 1-based;tool_name/tool_input 空 = 仅更新轮次)。
-/// tool_calls = 截至此刻累计工具调用数(单调,trampoline 持锁回写 JobEntry.tool_calls)。
-fn reportProgress(opts: Options, turn: u32, tool_name: []const u8, tool_input: []const u8, tool_calls: u32) void {
-    if (opts.progress_reporter) |r| r.report(turn, tool_name, tool_input, tool_calls);
+/// 内部:发一次进度事件(turn 1-based;tool_name/tool_input 空 = 仅更新轮次)。
+/// tool_calls = 截至此刻累计工具调用数(单调)。L1 重构:轮/工具级进度从扁平回调
+/// (旧 ProgressReporter → JobEntry)收编进 CoreEvent.progress 事件——单向通知=事件。
+/// 顶层 TUI 后端忽略它;JobEntry 后端(subagent 进度树)消费它更新 turn/工具/token 行。
+fn emitProgress(backend: *const UiBackend, sess: @import("session_id.zig").SessionId, turn: u32, tool_name: []const u8, tool_input: []const u8, tool_calls: u32) void {
+    backend.emitEvent(sess, .{ .progress = .{ .turn = turn, .tool_name = tool_name, .tool_input = tool_input, .tool_calls = tool_calls } });
 }
 
-/// agent_loop 轮/工具级进度回调(turn/tool_name/tool_input/tool_calls 签名)。
-/// subagent 进度树喂数据用(JobEntry.progressTrampoline 实现)。与 ToolContext 的
-/// ToolProgressReporter(id/phase/text/count)是不同回调。
-pub const ProgressReporter = struct {
-    ctx: *anyopaque,
-    reportFn: *const fn (ctx: *anyopaque, turn: u32, tool_name: []const u8, tool_input: []const u8, tool_calls: u32) void,
-    pub fn report(self: ProgressReporter, turn: u32, tool_name: []const u8, tool_input: []const u8, tool_calls: u32) void {
-        self.reportFn(self.ctx, turn, tool_name, tool_input, tool_calls);
-    }
-};
-
-/// usage 回调接口：stream 每次吐 usage event 时调用。
-/// App.usage 实现此接口；测试用 mock 亦可。
-pub const UsageSink = struct {
-    ctx: *anyopaque,
-    addFn: *const fn (ctx: *anyopaque, delta: api_stream.UsageDelta) void,
-
-    pub fn add(self: UsageSink, delta: api_stream.UsageDelta) void {
-        self.addFn(self.ctx, delta);
-    }
-};
+/// L4:run 出口统一收口——发 diag_run_end 诊断事件后返回 result。每个 `return <result>` 改成
+/// `return finishRun(backend, sess, trace_id, depth, <result>)`,保证所有出口(abort/api_error/
+/// end_turn/tool_error/tool_loop/max_turns)都 emit run span 终点,无遗漏(对齐"诊断不沉默")。
+///
+/// **span 平衡契约**:正常完成的 turn(有工具→循环 / 无工具→end_turn)都发 diag_turn_end,
+/// 每个 turn_begin 配一个 turn_end。异常终止(abort/api_error/tool_error/tool_loop)**不**发
+/// turn_end——该 turn 未完成,由 run_end 的 stop_reason 标明死因。消费者:turn span 未闭合 +
+/// run_end 非 end_turn/max_turns = 该 turn 被中断,正确语义,非 bug。
+fn finishRun(backend: *const UiBackend, sess: @import("session_id.zig").SessionId, trace_id: [12]u8, depth: u8, result: RunResult) RunResult {
+    backend.emitEvent(sess, .{ .diag_run_end = .{
+        .trace_id = trace_id,
+        .depth = depth,
+        .turns = result.turns,
+        .tool_calls = result.tool_calls,
+        .stop_reason_name = @tagName(result.stop_reason),
+    } });
+    return result;
+}
 
 /// 一次用户请求的完整 agent 运行：发送当前 conversation 到 API，
 /// 收集事件到 assistant message 里（text 和 tool_use blocks），
@@ -215,7 +252,7 @@ pub const UsageSink = struct {
 /// (ANSI 颜色 / 工具卡渲染)由 backend 实现(TuiBackend / WriterBackend)完成。
 pub fn run(
     conversation: *Conversation,
-    api_client: *client_mod.Client,
+    provider: provider_mod.Provider,
     tool_defs: []const json_mod.ToolDefinition,
     permission_ctx: *const permission_mod.PermissionContext,
     opts: Options,
@@ -224,6 +261,10 @@ pub fn run(
 ) !RunResult {
     // 本次 run 归属的会话(emit/poll 路由用)。N=1/TUI 默认 .single;M6 由 SessionContext 传。
     const sess = opts.session;
+    // L4:run 级 trace_id(整个 run 一个,跨所有 turn);诊断事件内联携带,DiagnosticsBackend
+    // 据 trace_id+depth 重建 span 树。depth = agent 嵌套深度(父 0 子 1)。
+    const trace_id = log.genRequestId().bytes;
+    const depth = opts.agent_depth;
     var turns: u32 = 0;
     var total_tool_calls: u32 = 0;
     // max_tokens 续写计数:防止模型一直撞上限导致无限续写。上限 3 次。
@@ -243,12 +284,22 @@ pub fn run(
         // 开头检查 abort
         if (opts.abort) |a| if (a.isAborted()) {
             log.warn("agent", "aborted before turn {d}", .{turns + 1});
-            return .{ .stop_reason = .aborted, .turns = turns, .tool_calls = total_tool_calls };
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .aborted, .turns = turns, .tool_calls = total_tool_calls });
         };
 
-        // 进度上报:进入新一轮(1-based);空 tool 名 = 仅推进轮次,保留上一个工具
-        // (trampoline 据空名跳过工具更新,对齐 cc 持续显示最近动作)。
-        reportProgress(opts, turns + 1, "", "", total_tool_calls);
+        // 转后台请求(Ctrl+B):turn 边界检查——此刻 conversation 干净(上轮 tool_result 已 append),
+        // 返回 .backgrounded 让调用方深拷贝转后台续跑。**只在 turn 开头查**(run 是同步循环,无中途
+        // 暂停点;唯一安全转后台点是 turn 边界)。与 abort 分开:这不是中断,是把完整对话搬去后台。
+        if (opts.background_request) |bg| if (bg.load(.acquire)) {
+            log.info("agent", "background requested before turn {d} → backgrounding", .{turns + 1});
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .backgrounded, .turns = turns, .tool_calls = total_tool_calls });
+        };
+
+        // 进度事件:进入新一轮(1-based);空 tool 名 = 仅推进轮次,保留上一个工具
+        // (JobEntry 后端据空名跳过工具更新,对齐 cc 持续显示最近动作)。
+        emitProgress(backend, sess, turns + 1, "", "", total_tool_calls);
+        // L4 诊断:turn span 起点。
+        backend.emitEvent(sess, .{ .diag_turn_begin = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1 } });
 
         // 自动 compact：发请求前检查 token 估算,超阈值则保留最近 N 条。
         // 阈值 null 时 = input context window * 0.8(逼近 context 上限才压缩,留出回复空间)。
@@ -256,7 +307,7 @@ pub fn run(
         // 否则正常工具调研刚读几个文件(20K+)就误触发压缩、丢掉原始问题(真机 bug)。
         // 下限 MIN_AUTO_COMPACT_THRESHOLD:避免异常小值导致每 turn 都 compact。
         const auto_threshold: usize = opts.auto_compact_threshold orelse
-            @max(@as(usize, api_client.resolveMaxInputTokens()) * 8 / 10, MIN_AUTO_COMPACT_THRESHOLD);
+            @max(@as(usize, provider.maxInputTokens()) * 8 / 10, MIN_AUTO_COMPACT_THRESHOLD);
         // Microcompact(批4):在 full-compact 之前,更低阈值(70% of full)先清旧 tool_result
         // 内容(最占 token 的部分),保留消息结构。比 compactKeepRecent 温和、不丢对话流。
         const micro_threshold = auto_threshold * 7 / 10;
@@ -271,10 +322,10 @@ pub fn run(
             // 9 段结构化摘要(补真缺口):有 api_client → 调模型把要丢的历史总结成 summary
             // prepend 保住早期上下文(对齐 cc);summarize 失败/无 client → 退回纯丢老消息。
             const compact_summary = @import("compact_summary.zig");
-            const SummCtx = struct { client: *client_mod.Client, alloc: std.mem.Allocator };
-            const dropped = conversation.compactWithSummary(opts.auto_compact_keep_recent, SummCtx{ .client = api_client, .alloc = allocator }, struct {
+            const SummCtx = struct { provider: provider_mod.Provider, alloc: std.mem.Allocator };
+            const dropped = conversation.compactWithSummary(opts.auto_compact_keep_recent, SummCtx{ .provider = provider, .alloc = allocator }, struct {
                 fn f(c: SummCtx, drop_msgs: []const msg.Message) ?[]u8 {
-                    return compact_summary.summarize(c.alloc, c.client, drop_msgs);
+                    return compact_summary.summarize(c.alloc, c.provider, drop_msgs);
                 }
             }.f) catch conversation.compactKeepRecent(opts.auto_compact_keep_recent);
             if (dropped > 0) {
@@ -325,16 +376,46 @@ pub fn run(
             break :blk deferred_filtered.?;
         };
 
+        // P2 能力门控(真消费者):剔除当前 provider 不支持的工具(如不支持 web_search 的后端
+        // → WebSearch 不进 tools 数组,对齐 cc isEnabled)。当前单 Anthropic 全支持 → 无剔除
+        // (行为零变化),但门控路径活着且被测;P3 加缺能力 provider 时自动生效。
+        const capability = @import("../api/capability.zig");
+        var cap_filtered: ?[]json_mod.ToolDefinition = null;
+        defer if (cap_filtered) |cf| allocator.free(cf);
+        const gated_tool_defs = blk: {
+            // 先扫:有没有"需要某能力但 provider 不支持"的工具?没有则不必重建数组。
+            var any_dropped = false;
+            for (effective_tool_defs) |d| {
+                if (capability.requiredCapability(d.name)) |cap| {
+                    if (!provider.supports(cap)) {
+                        any_dropped = true;
+                        break;
+                    }
+                }
+            }
+            if (!any_dropped) break :blk effective_tool_defs;
+            var keep: std.ArrayList(json_mod.ToolDefinition) = .empty;
+            errdefer keep.deinit(allocator);
+            for (effective_tool_defs) |d| {
+                if (capability.requiredCapability(d.name)) |cap| {
+                    if (!provider.supports(cap)) continue; // provider 不支持 → 剔除
+                }
+                keep.append(allocator, d) catch break :blk effective_tool_defs;
+            }
+            cap_filtered = keep.toOwnedSlice(allocator) catch break :blk effective_tool_defs;
+            break :blk cap_filtered.?;
+        };
+
         // 3. 发送流式请求（abortable 版本：abort 通过 EventIterator 检查点传播）
         //    带 opts.model_override:subagent 用自己的 model(如 Explore=haiku);
         //    null 时 sendMessageStreamFull 用 api_client.model(父 model)。
         // 击穿检测:发请求前记录 system/tools/model 指纹(tools 用工具名拼接 hash)。
         {
             var th = std.hash.Wyhash.init(0);
-            for (effective_tool_defs) |d| th.update(d.name);
+            for (gated_tool_defs) |d| th.update(d.name);
             var tbuf: [16]u8 = undefined;
             std.mem.writeInt(u64, tbuf[0..8], th.final(), .little);
-            const model_for_req = opts.model_override orelse api_client.model;
+            const model_for_req = opts.model_override orelse provider.model();
             cache_detector.recordRequest(opts.system_prompt orelse "", tbuf[0..8], model_for_req);
         }
         // 建连阶段重试(对齐 CC withRetry):瞬态网络错误/429/5xx 退避重试,UI 提示"Retrying…"。
@@ -349,7 +430,7 @@ pub fn run(
             }
         };
         var retry_ui = RetryUi{ .be = backend, .session = sess };
-        const reporter = client_mod.RetryReporter{ .state = @ptrCast(&retry_ui), .report = RetryUi.report };
+        const reporter = provider_mod.RetryReporter{ .state = @ptrCast(&retry_ui), .report = RetryUi.report };
 
         // Plan 模式每轮把 plan 指令追加到 system prompt(对齐 mecode 每轮 developer_instructions):
         // 根治"指令只在 EnterPlanMode 返回出现一次,后续轮模型忘了 <proposed_plan> 格式"。
@@ -364,27 +445,24 @@ pub fn run(
             break :blk if (sys_prompt_owned) |p| p else opts.system_prompt;
         };
 
-        var stream = api_client.sendMessageStreamFullRetry(
+        var stream = provider.sendStreamRetry(
             api_messages.items,
             effective_system_prompt,
-            effective_tool_defs,
+            gated_tool_defs,
             opts.abort,
             opts.model_override,
             null,
             client_mod.defaultMaxRetries(),
             0, // base_ms=0 → 用默认 RETRY_BASE_MS(500)
             reporter,
+            latestUserText(conversation), // web_search 显示用:用户原话(P1:作请求参数传, 不再 post-set)
         ) catch |err| {
             log.err("agent", "sendMessageStream failed turn={d}: {s}", .{ turns + 1, @errorName(err) });
-            return .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls };
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
         };
         defer stream.deinit();
 
-        // web_search 显示用:把最近一条用户文本作为真实 query 透传给 stream(对齐 mecode——
-        // provider 返回的 web_search query 常是占位符,优先显示用户原始输入)。
-        stream.user_query = latestUserText(conversation);
-
-        const rid = stream.id;
+        const rid = stream.requestId();
         log.infoId("agent", rid, "stream opened, reading events", .{});
 
         // 3. 收集响应 blocks
@@ -449,9 +527,13 @@ pub fn run(
                     allocator.free(q);
                 },
                 .usage => |u| {
-                    if (opts.usage_sink) |sink| sink.add(u);
+                    // L1:usage 走 CoreEvent 总线(顶层 TuiBackend 累加进 app.usage;
+                    // JobEntry 后端累加进 .tokens 供进度树)——取代旧 opts.usage_sink 私有回调。
+                    backend.emitEvent(sess, .{ .usage = u });
                     if (cache_detector.checkResponse(u.cache_read_input_tokens, u.cache_creation_input_tokens)) |reason| {
                         log.warnId("cache", rid, "PROMPT CACHE BREAK: {s} [cache_read {d} creation {d}]", .{ reason, u.cache_read_input_tokens, u.cache_creation_input_tokens });
+                        // L4 诊断:cache 击穿。
+                        backend.emitEvent(sess, .{ .diag_cache_break = .{ .trace_id = trace_id, .depth = depth, .cache_read = u.cache_read_input_tokens, .cache_creation = u.cache_creation_input_tokens } });
                     }
                     log.infoId("agent", rid, "usage in={d} out={d} cache_r={d} cache_w={d}", .{ u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens });
                 },
@@ -493,7 +575,7 @@ pub fn run(
             } else {
                 assistant_blocks.deinit(allocator);
             }
-            return .{ .stop_reason = .aborted, .turns = turns + 1, .tool_calls = total_tool_calls };
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .aborted, .turns = turns + 1, .tool_calls = total_tool_calls });
         }
 
         // Stream error：不把残缺的 assistant_text / tool_uses commit 到 conversation
@@ -507,7 +589,7 @@ pub fn run(
             tool_uses.clearRetainingCapacity();
             for (assistant_blocks.items) |b| b.deinit(allocator);
             assistant_blocks.deinit(allocator);
-            return .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls };
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
         }
 
         // 4. 把 assistant text + tool_uses 组装成 Message 追加到 conversation
@@ -543,10 +625,15 @@ pub fn run(
             if (turn_stop_reason == .max_tokens and continuations < MAX_CONTINUATIONS) {
                 continuations += 1;
                 log.infoId("agent", rid, "max_tokens truncation → continuation {d}/{d}", .{ continuations, MAX_CONTINUATIONS });
+                // L4 诊断:续写。
+                backend.emitEvent(sess, .{ .diag_continuation = .{ .trace_id = trace_id, .depth = depth, .n = continuations, .max = MAX_CONTINUATIONS } });
                 try conversation.appendText(.user, "Your previous response was cut off by the token limit. Continue exactly where you left off, without repeating.");
                 continue;
             }
-            return .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls };
+            // L4 诊断:本轮无 tool_use → turn 结束(span 平衡:每个 turn_begin 都配一个
+            // turn_end,无论有无工具)。紧接 run_end(end_turn)收口。
+            backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls });
         }
 
         // 6. 执行所有 tool_use，把结果作为 user-role 的 tool_result block 追加。
@@ -622,8 +709,7 @@ pub fn run(
             .tool_defs = opts.tool_defs,
             .agent_depth = opts.agent_depth,
             .dyn_registry = opts.dyn_registry,
-            .skill_activator = opts.skill_activator,
-            .tool_activator = opts.tool_activator,
+            .host_services = opts.host_services,
             .explicit_invocation = opts.explicit_invocation,
             .session_id = opts.session_id,
             .project_dir = opts.project_dir,
@@ -636,7 +722,6 @@ pub fn run(
             .agents = opts.agents,
             .parent_model = opts.parent_model,
             .skills = opts.skills_set,
-            .worktree_hook = opts.worktree_hook,
             .mcp_sessions = opts.mcp_sessions,
             .cron_registry = opts.cron_registry,
         };
@@ -669,13 +754,12 @@ pub fn run(
                 backend.emitEvent(sess, .{ .tool_start = .{ .id = s.id, .name = s.name, .input = s.input } });
             }
         }
-        // 进度上报:本轮第一个 run slot 的工具名 + 原始 input(subagent agent 树显示当前动作)。
-        if (opts.progress_reporter != null) {
-            for (slots.items) |*s| {
-                if (s.decision == .run) {
-                    reportProgress(opts, turns + 1, s.name, s.input, total_tool_calls);
-                    break;
-                }
+        // 进度事件:本轮第一个 run slot 的工具名 + 原始 input(subagent agent 树显示当前动作)。
+        // 无条件 emit——backend 自决消费(顶层 TuiBackend 忽略 .progress;JobEntry 后端更新树)。
+        for (slots.items) |*s| {
+            if (s.decision == .run) {
+                emitProgress(backend, sess, turns + 1, s.name, s.input, total_tool_calls);
+                break;
             }
         }
         tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
@@ -687,6 +771,68 @@ pub fn run(
                     backend.emitEvent(sess, .{ .tool_result = .{ .id = s.id, .name = s.name, .input = s.input, .content = "", .is_error = s.is_error } });
                 }
             }
+        }
+
+        // 6c.5 L3 挂起:本轮有工具返 error.UiPending(异步 custom UI 未完成)→ 整轮挂起。
+        // **API 配对约束**:assistant 的每个 tool_use 须在紧接 user 消息里有 tool_result,不能拆
+        // 两次。故挂起时**不**提交任何 partial user 消息;已完成工具的结果 stash 进 SuspendInfo,
+        // resume 时与 pending 的迟来结果一起补成单条 user 消息(A+B 同 turn)。
+        // 找首个 pending 作挂起点;其余 pending(MVP 不支持多挂起点)→ 当错误,resume 时也配对补。
+        var first_pending: ?*tool_exec.Slot = null;
+        for (slots.items) |*s| {
+            if (s.pending) {
+                first_pending = s;
+                break;
+            }
+        }
+        if (first_pending) |s| {
+            // 收集**所有非挂起点**工具的结果(已完成的用真实结果;其余 pending 用错误占位)——
+            // 它们都要在 resume 时与挂起点的迟来结果同 turn 补齐,满足 API 配对。
+            var completed: std.ArrayList(SuspendInfo.CompletedResult) = .empty;
+            errdefer completed.deinit(allocator);
+            for (slots.items) |*o| {
+                if (o == s or o.decision != .run) continue;
+                const content: []const u8 = if (o.pending)
+                    // 非首个 pending:MVP 不支持并发挂起 → 错误占位(模型 resume 后可重试)。
+                    try tool_error.errorToJson("ConcurrentSuspendUnsupported", "tool {s} requested UI while another suspended; not supported in MVP", .{o.name}, allocator)
+                else
+                    try allocator.dupe(u8, o.content orelse "{}");
+                try completed.append(allocator, .{
+                    .tool_use_id = try allocator.dupe(u8, o.id),
+                    .content = content,
+                    .is_error = if (o.pending) true else o.is_error,
+                });
+                // 释放 slot 原 owned 内存(content 已 dupe 进 completed;pending 的 kind/payload
+                // 不进 SuspendInfo)——否则泄漏(正常路径 content 移交 result_blocks,此处改 dupe)。
+                if (o.content) |c| {
+                    allocator.free(c);
+                    o.content = null;
+                }
+                if (o.pending) {
+                    if (o.pending_kind) |k| allocator.free(k);
+                    if (o.pending_payload) |p| allocator.free(p);
+                    o.pending_kind = null;
+                    o.pending_payload = null;
+                }
+            }
+            // result_blocks 这轮不提交(挂起不落 partial user 消息);释放已 append 的(本应为空)。
+            result_blocks.clearAndFree(allocator);
+            const kind = s.pending_kind orelse "";
+            const payload = s.pending_payload orelse "{}";
+            // 异步前端据此投递 UI 请求(tool_use_id + 渲染规格)。
+            backend.emitEvent(sess, .{ .ui_request_pending = .{ .tool_use_id = s.id, .request_json = payload } });
+            // SuspendInfo 接管挂起点 slot 的 pending 字符串所有权(移动,不重复 dupe);置 null 防 double-free。
+            const si = SuspendInfo{
+                .tool_use_id = try allocator.dupe(u8, s.id),
+                .kind = if (s.pending_kind) |k| k else try allocator.dupe(u8, ""),
+                .payload_json = if (s.pending_payload) |p| p else try allocator.dupe(u8, "{}"),
+                .completed_results = try completed.toOwnedSlice(allocator),
+                .allocator = allocator,
+            };
+            s.pending_kind = null;
+            s.pending_payload = null;
+            log.infoId("agent", rid, "run SUSPENDED tool_use_id={s} kind={s} completed_siblings={d}", .{ s.id, kind, si.completed_results.len });
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .suspended, .turns = turns + 1, .tool_calls = total_tool_calls, .suspend_info = si });
         }
 
         // 6d. 按原顺序回填 result_blocks。熔断判定**不在此内层循环累加**——否则单轮内
@@ -744,6 +890,8 @@ pub fn run(
             }
             if (same_err_count >= MAX_SAME_TOOL_ERROR) {
                 log.warnId("agent", rid, "tool-loop circuit breaker tripped: same error x{d} turns consecutively", .{same_err_count});
+                // L4 诊断:熔断触发。
+                backend.emitEvent(sess, .{ .diag_breaker_tripped = .{ .trace_id = trace_id, .depth = depth, .same_err_count = same_err_count } });
                 tool_loop_tripped = true;
             }
         } else {
@@ -753,7 +901,7 @@ pub fn run(
 
         if (result_blocks.items.len == 0) {
             result_blocks.deinit(allocator);
-            return .{ .stop_reason = .tool_error, .turns = turns + 1, .tool_calls = total_tool_calls };
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_error, .turns = turns + 1, .tool_calls = total_tool_calls });
         }
 
         const blocks_owned = try result_blocks.toOwnedSlice(allocator);
@@ -763,12 +911,60 @@ pub fn run(
         // conversation(供复盘),这里直接返回 .tool_loop,不再发下一轮请求——避免
         // 模型原地空参风暴烧满 max_turns。
         if (tool_loop_tripped) {
-            return .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls };
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
         }
+
+        // L4 诊断:turn span 终点(本轮有 tool_use、将进入下一轮的正常路径;无工具的
+        // end_turn 路径在上方提前 return + diag_run_end 收口,故不重复发)。
+        backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
     }
 
     // 循环正常退出 = turns >= max_turns
-    return .{ .stop_reason = .max_turns, .turns = turns, .tool_calls = total_tool_calls };
+    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .max_turns, .turns = turns, .tool_calls = total_tool_calls });
+}
+
+/// L3 恢复:把异步 UI 响应 + 同轮已完成工具的结果**一起**注入为单条 user 消息(满足 API 的
+/// tool_use/tool_result 同 turn 配对),然后续跑 run()。
+///
+/// conversation 须已含挂起点的 assistant(带那些 tool_use)——同进程时它还在内存;跨进程/重启
+/// 时由调用方先 loadTranscript 从盘重建。resumeRun 不关心来源,只:① 构造一条 user 消息,内含
+/// **挂起点 tool_use 的迟来 tool_result(content=response_json)+ completed_results 里每个同轮
+/// 已完成工具的 tool_result**;② 调 run() 续跑。response_json / completed 借用,append 时 dupe。
+///
+/// **为什么要 completed_results**:挂起的那条 assistant 消息可能有多个 tool_use(A=pending,
+/// B/C=done)。API 要求 A+B+C 的 tool_result 都在紧接的同一条 user 消息里。挂起时已完成的 B/C
+/// 结果没单独提交(那样会拆 turn 违规),而是 stash 在 SuspendInfo.completed_results,此刻一起补。
+pub fn resumeRun(
+    conversation: *Conversation,
+    provider: provider_mod.Provider,
+    tool_defs: []const json_mod.ToolDefinition,
+    permission_ctx: *const permission_mod.PermissionContext,
+    resumed_tool_use_id: []const u8,
+    response_json: []const u8,
+    completed_results: []const SuspendInfo.CompletedResult,
+    opts: Options,
+    backend: *const UiBackend,
+    allocator: std.mem.Allocator,
+) !RunResult {
+    // 一条 user 消息,内含挂起点的迟来结果 + 所有同轮已完成工具的结果(同 turn 配对)。
+    var blocks: std.ArrayList(msg.Block) = .empty;
+    errdefer blocks.deinit(allocator);
+    try blocks.append(allocator, .{ .tool_result = .{
+        .tool_use_id = try allocator.dupe(u8, resumed_tool_use_id),
+        .content = try allocator.dupe(u8, response_json),
+        .is_error = false,
+    } });
+    for (completed_results) |cr| {
+        try blocks.append(allocator, .{ .tool_result = .{
+            .tool_use_id = try allocator.dupe(u8, cr.tool_use_id),
+            .content = try allocator.dupe(u8, cr.content),
+            .is_error = cr.is_error,
+        } });
+    }
+    try conversation.append(.{ .role = .user, .blocks = try blocks.toOwnedSlice(allocator) });
+    log.info("agent", "resume: injected {d} tool_result(s) (pending={s} + {d} siblings), continuing run", .{ completed_results.len + 1, resumed_tool_use_id, completed_results.len });
+    // 续跑(可能再次挂起——resume 可链式)。
+    return run(conversation, provider, tool_defs, permission_ctx, opts, backend, allocator);
 }
 
 /// 取对话里最近一条 user 文本 block(borrowed),用于 web_search 显示真实 query。
@@ -844,21 +1040,37 @@ fn freeApiMessages(list: *std.ArrayList(types.ApiMessage), allocator: std.mem.Al
     list.deinit(allocator);
 }
 
-test "ProgressReporter.report 经接口触达回调" {
+test "emitProgress 发 CoreEvent.progress 到 backend(L1:进度=事件)" {
     const S = struct {
         var hits: u32 = 0;
+        var last_turn: u32 = 0;
         var last_calls: u32 = 0;
-        fn cb(_: *anyopaque, _: u32, _: []const u8, _: []const u8, tool_calls: u32) void {
-            hits += 1;
-            last_calls = tool_calls;
+        var last_tool: [16]u8 = undefined;
+        var last_tool_len: usize = 0;
+        fn emit(_: *anyopaque, _: ui_backend.SessionId, ev: ui_backend.CoreEvent) void {
+            switch (ev) {
+                .progress => |p| {
+                    hits += 1;
+                    last_turn = p.turn;
+                    last_calls = p.tool_calls;
+                    last_tool_len = @min(p.tool_name.len, last_tool.len);
+                    @memcpy(last_tool[0..last_tool_len], p.tool_name[0..last_tool_len]);
+                },
+                else => {},
+            }
+        }
+        fn poll(_: *anyopaque, _: ui_backend.SessionId) ?ui_backend.UiEvent {
+            return null;
         }
     };
     S.hits = 0;
     var dummy: u8 = 0;
-    const r = ProgressReporter{ .ctx = @ptrCast(&dummy), .reportFn = &S.cb };
-    r.report(2, "Grep", "{}", 5);
+    const be = ui_backend.UiBackend{ .ctx = @ptrCast(&dummy), .emit = &S.emit, .poll = &S.poll };
+    emitProgress(&be, .single, 2, "Grep", "{}", 5);
     try std.testing.expectEqual(@as(u32, 1), S.hits);
+    try std.testing.expectEqual(@as(u32, 2), S.last_turn);
     try std.testing.expectEqual(@as(u32, 5), S.last_calls);
+    try std.testing.expectEqualStrings("Grep", S.last_tool[0..S.last_tool_len]);
 }
 
 test "buildApiMessages maps blocks" {

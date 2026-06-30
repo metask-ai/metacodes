@@ -16,7 +16,7 @@ const std = @import("std");
 pub const VERSION = "0.1.0";
 
 // ── 引擎 ─────────────────────────────────────────────────────────────────
-pub const agent_loop = @import("core/agent_loop.zig"); // run(), Options, RunResult, StopReason, UsageSink
+pub const agent_loop = @import("core/agent_loop.zig"); // run(), Options, RunResult, StopReason
 pub const conversation = @import("core/conversation.zig");
 pub const message = @import("core/message.zig");
 pub const subagent = @import("core/subagent.zig");
@@ -38,6 +38,11 @@ pub const recorder = @import("core/recorder.zig");
 // ── API / client / 配置 ─────────────────────────────────────────────────
 pub const client = @import("client.zig");
 pub const api_stream = @import("api/stream.zig");
+pub const api_provider = @import("api/provider.zig"); // 多 provider vtable
+pub const api_capability = @import("api/capability.zig");
+pub const api_cache = @import("api/cache.zig"); // 多 provider 缓存扩展点契约
+pub const api_openai = @import("api/openai_client.zig");
+pub const api_gemini = @import("api/gemini_client.zig"); // 第三 provider:Gemini + 有状态缓存
 pub const json = @import("json.zig");
 pub const types = @import("types.zig");
 pub const config = @import("app/config.zig");
@@ -76,6 +81,9 @@ pub const mcp_session = @import("core/mcp_session.zig"); // McpSessionEntry
 // ── 参考 backend(库自带的非-UI 前端,可直接用或当模板)────────────────────
 pub const writer_backend = @import("core/writer_backend.zig"); // 打印型 sink
 pub const headless_backend = @import("core/headless_backend.zig"); // CoreEvent → JSON
+pub const suspend_state = @import("core/suspend_state.zig");
+pub const tee_backend = @import("core/tee_backend.zig"); // L4:多路转发 decorator
+pub const diagnostics_backend = @import("core/diagnostics_backend.zig"); // L4:诊断 trace 后端
 
 // ── 工具库 ───────────────────────────────────────────────────────────────
 pub const util_abort = @import("util/abort.zig"); // AbortSignal

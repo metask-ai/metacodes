@@ -38,7 +38,14 @@ pub const Config = struct {
     /// `--record <dir>` / `METACODES_RECORD_DIR`:把每次请求 body + SSE 响应原始字节
     /// dump 到该目录(cassette),供 replay 确定性复现。null = 不录制。
     record_dir: ?[]const u8 = null,
+    /// LLM 后端协议选择。默认 anthropic;`METACODES_PROVIDER=openai` 或 model 前缀
+    /// gpt*/o1*/o3* → openai(讲 chat/completions 协议)。**只在 App 组装层据此选 Client,
+    /// core/UI 零感知**(多 Provider 重构 P3)。
+    provider_kind: ProviderKind = .anthropic,
 };
+
+/// LLM 后端协议种类(App 组装层据此选具体 Client;core 只见中立 Provider)。
+pub const ProviderKind = enum { anthropic, openai, gemini };
 
 /// 权限模式
 /// 权限模式(对齐 Claude Code 6 模式 + 历史别名)。

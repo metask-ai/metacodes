@@ -60,7 +60,7 @@ test "L2 熔断器: 同工具同错连续 3 次 → stop_reason=.tool_loop 且 t
     const be = wb.backend();
     const result = agent_loop.run(
         &conv,
-        &client,
+        client.provider(),
         empty_defs,
         &perm,
         .{ .max_turns = 20 }, // 远高于 3:证明是熔断而非 max_turns 停的
@@ -120,7 +120,7 @@ test "L2 熔断器回归: 单轮内多工具同错 不应熔断(turns 继续到 
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
     var wb = writer_backend.WriterBackend.initNull();
     const be = wb.backend();
-    const result = agent_loop.run(&conv, &client, empty_defs, &perm, .{ .max_turns = 20 }, &be, a) catch |e| {
+    const result = agent_loop.run(&conv, client.provider(), empty_defs, &perm, .{ .max_turns = 20 }, &be, a) catch |e| {
         std.debug.print("run failed: {s}\n", .{@errorName(e)});
         return error.SkipZigTest;
     };

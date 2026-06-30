@@ -161,13 +161,20 @@ pub fn exitExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 // ============================================================================
 
 fn pushWorktree(ctx: *const ToolContext, wt_path: []const u8, cwd: []const u8) !void {
-    const hook = ctx.worktree_hook orelse return error.WorktreeStateUnavailable;
-    try hook.push(ctx.allocator, wt_path, cwd);
+    const hs = ctx.host_services orelse return error.WorktreeStateUnavailable;
+    // 单一失败点:能力缺失映射成 WorktreeStateUnavailable;真实 push 错误(如 OOM)照常上抛。
+    hs.worktreePush(ctx.allocator, wt_path, cwd) catch |e| switch (e) {
+        error.HostCapabilityUnavailable => return error.WorktreeStateUnavailable,
+        else => return e,
+    };
 }
 
 fn popWorktree(ctx: *const ToolContext) !?WorktreeEntry {
-    const hook = ctx.worktree_hook orelse return error.WorktreeStateUnavailable;
-    return try hook.pop(ctx.allocator);
+    const hs = ctx.host_services orelse return error.WorktreeStateUnavailable;
+    return hs.worktreePop(ctx.allocator) catch |e| switch (e) {
+        error.HostCapabilityUnavailable => return error.WorktreeStateUnavailable,
+        else => return e,
+    };
 }
 
 // ============================================================================
@@ -253,6 +260,6 @@ test "ExitWorktree: not in worktree errors" {
             return stack.pop();
         }
     };
-    ctx.worktree_hook = .{ .ctx = @ptrCast(&state), .pushFn = &Hook.push, .popFn = &Hook.pop };
+    ctx.host_services = .{ .ctx = @ptrCast(&state), .worktreePushFn = &Hook.push, .worktreePopFn = &Hook.pop };
     try testing.expectError(error.NotInWorktree, exitExecute(&ctx, "{\"action\":\"keep\"}"));
 }

@@ -647,18 +647,10 @@ fn parseUsageDelta(obj: []const u8) UsageDelta {
     };
 }
 
-/// 从 object string 里抽 `"field":<digits>` 的整数值。
-/// 不处理浮点、负数、科学记数——usage 字段都是非负整数。
+/// 从 object string 里抽 `"field":<digits>` 的整数值。委托给 util_json.extractIntField
+/// (单一真相源,见 util/json.zig);此处保留薄包装供本文件 parseUsageDelta 调用。
 fn parseIntField(obj: []const u8, field: []const u8) u64 {
-    var pat_buf: [64]u8 = undefined;
-    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\":", .{field}) catch return 0;
-    const idx = std.mem.indexOf(u8, obj, pat) orelse return 0;
-    var i = idx + pat.len;
-    while (i < obj.len and (obj[i] == ' ' or obj[i] == '\t')) : (i += 1) {}
-    const start = i;
-    while (i < obj.len and obj[i] >= '0' and obj[i] <= '9') : (i += 1) {}
-    if (i == start) return 0;
-    return std.fmt.parseInt(u64, obj[start..i], 10) catch 0;
+    return util_json.extractIntField(obj, field);
 }
 
 /// API 报告的 stop_reason(message_delta.delta.stop_reason)。
@@ -680,6 +672,67 @@ pub const StopReason = enum {
         if (std.mem.eql(u8, s, "refusal")) return .refusal;
         return .unknown;
     }
+};
+
+// ── 中立流式响应契约(多 Provider 重构)──────────────────────────────────────
+// 这些类型从 client.zig 下沉到中立层(api/stream.zig),让 provider.zig 只 import 本文件
+// (叶子,无循环依赖)即可定义非 generic 的 Provider 接口。client.zig re-export 它们保持兼容。
+
+/// 流式事件(provider 无关)。各 provider 的解析路径把自家 SSE 翻译成它。
+/// 注:与内部 Event 同形,差别仅 text 字段名(StreamResponse.next 做 text_delta→text 映射)。
+pub const StreamEvent = union(enum) {
+    text: []u8,
+    tool_use_start: ToolUseResult,
+    web_search_result: WebSearchResultEvent,
+    web_search_query: []u8,
+    usage: UsageDelta,
+    done: void,
+};
+
+/// 非流式响应(provider 无关)。
+pub const ToolCallResult = struct {
+    id: []const u8 = "",
+    name: []const u8 = "",
+    input: []const u8 = "",
+};
+pub const ApiResponse = struct {
+    content: []const u8 = "",
+    stop_reason: ?[]const u8 = null,
+    tool_calls: []const ToolCallResult = &.{},
+};
+
+/// 中立的流式响应句柄(type-erased vtable)。Provider.sendStream 返回它——接口里**不出现**
+/// 任何 provider 具体类型,故 Provider 无需 generic、无循环依赖。各 provider 的具体 StreamResponse
+/// (Anthropic 的 EventIterator / 未来 OpenAI 的解析器)各自实现 handle()→StreamHandle。
+///
+/// **借用契约**:handle 的 ctx 借用底层 StreamResponse;底层必须比 handle 活得久(同步消费)。
+pub const StreamHandle = struct {
+    ctx: *anyopaque,
+    nextFn: *const fn (ctx: *anyopaque) anyerror!?StreamEvent,
+    deinitFn: *const fn (ctx: *anyopaque) void,
+    stopReasonFn: *const fn (ctx: *anyopaque) StopReason,
+    /// 本次请求的 RequestId(日志串联用)。**契约:每个 provider 实现必须在建连时生成一个有效
+    /// RequestId 并经此暴露**——不可返回未初始化值(否则跨 provider 日志串联静默错乱)。
+    requestIdFn: *const fn (ctx: *anyopaque) @import("../util/log.zig").RequestId,
+
+    pub inline fn next(self: StreamHandle) anyerror!?StreamEvent {
+        return self.nextFn(self.ctx);
+    }
+    pub inline fn deinit(self: StreamHandle) void {
+        self.deinitFn(self.ctx);
+    }
+    pub inline fn stopReason(self: StreamHandle) StopReason {
+        return self.stopReasonFn(self.ctx);
+    }
+    pub inline fn requestId(self: StreamHandle) @import("../util/log.zig").RequestId {
+        return self.requestIdFn(self.ctx);
+    }
+};
+
+/// 建连重试的 UI 回调(provider 无关:退避时通知前端)。从 client.zig 下沉到中立层。
+pub const RetryReporter = struct {
+    state: *anyopaque,
+    report: *const fn (state: *anyopaque, attempt: u32, max: u32, delay_ms: u64) void,
 };
 
 pub const EventIterator = struct {

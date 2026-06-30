@@ -227,6 +227,36 @@ pub fn extractBoolField(data: []const u8, field: []const u8) ?bool {
     return null;
 }
 
+/// 提取 `"field":<digits>` 的非负整数值(裸数字,值不带引号)。缺失/非整数返回 0。
+/// 用 indexOf 找首个 `"field":`,故对嵌套子对象里的唯一字段名同样有效(如 OpenAI 的
+/// prompt_tokens_details.cached_tokens)。不处理浮点/负数/科学记数——计数类字段都是非负整数。
+pub fn extractIntField(data: []const u8, field: []const u8) u64 {
+    var pat_buf: [256]u8 = undefined;
+    std.debug.assert(field.len < 250);
+    pat_buf[0] = '"';
+    @memcpy(pat_buf[1..][0..field.len], field);
+    pat_buf[1 + field.len] = '"';
+    pat_buf[2 + field.len] = ':';
+    const pat = pat_buf[0 .. 3 + field.len];
+    const idx = std.mem.indexOf(u8, data, pat) orelse return 0;
+    var i = idx + pat.len;
+    while (i < data.len and (data[i] == ' ' or data[i] == '\t')) : (i += 1) {}
+    const start = i;
+    while (i < data.len and data[i] >= '0' and data[i] <= '9') : (i += 1) {}
+    if (i == start) return 0;
+    return std.fmt.parseInt(u64, data[start..i], 10) catch 0;
+}
+
+test "extractIntField basic + nested + missing" {
+    try std.testing.expectEqual(@as(u64, 42), extractIntField("{\"a\":42,\"b\":7}", "a"));
+    // 嵌套子对象里的字段
+    try std.testing.expectEqual(@as(u64, 99), extractIntField("{\"x\":{\"y\":99}}", "y"));
+    // 冒号后空格
+    try std.testing.expectEqual(@as(u64, 5), extractIntField("{\"k\": 5}", "k"));
+    // 缺失 → 0
+    try std.testing.expectEqual(@as(u64, 0), extractIntField("{\"a\":1}", "z"));
+}
+
 test "unescapeString basic" {
     const r = try unescapeString("hello\\nworld", std.testing.allocator);
     defer std.testing.allocator.free(r);

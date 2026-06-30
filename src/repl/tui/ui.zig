@@ -147,6 +147,14 @@ fn dispatchKey(state: *UiState, key: input.Key) Effect {
     if (key == .ctrl_o) {
         return .{ .action = .open_transcript };
     }
+    // Ctrl+B → 生成期把主对话转后台续跑(对齐 cc task:background)。仅生成期有意义
+    // (输入期没有正在跑的 run,返 redraw no-op 消费掉)。IO 体(深拷贝 conversation +
+    // spawnBackground + reset 前台)留调用方 tui_backend/loop。MVP 单击即转(agent_tree 已有
+    // 常驻 hint "(ctrl+b to run in background)" 作发现性;双击防抖留后续增强)。
+    if (key == .ctrl_b) {
+        if (state.phase == .generating) return .{ .action = .background_main };
+        return .{ .redraw_region = false };
+    }
     // Ctrl+T → 切 task 面板显隐(对齐 cc app:toggleTodos)。纯内存 toggle,两期共用。
     // drawPanel/drawTaskList 读 panel.task_list_visible 门控。
     if (key == .ctrl_t) {

@@ -46,6 +46,7 @@ pub const Key = union(enum) {
     ctrl_r,
     ctrl_t, // 切换任务列表显示
     ctrl_o, // 打开 transcript viewer
+    ctrl_b, // 生成期:把主对话转后台续跑(run in background)
     ctrl_x, // Ctrl+X 前缀(配合 Ctrl+K kill 后台)
     ctrl_g, // 外部编辑器编辑当前 buffer
     ctrl_underscore, // Ctrl+_ / Ctrl+Shift+- (0x1f): undo
@@ -211,15 +212,28 @@ pub const KeyParser = struct {
                             else => .enter,
                         };
                     }
-                    // Ctrl+字母：mod=5 表示 Ctrl
+                    // Ctrl+字母：mod=5 表示 Ctrl。Kitty disambiguate 模式下某些终端/tmux 会把
+                    // 普通 Ctrl+letter 也编成 CSI-u(非仅歧义键)→ 必须覆盖 app 用到的全部 Ctrl 组合,
+                    // 否则该键在这些终端上静默丢(实测 bug:Ctrl+O 在发 CSI-u 的终端无反应)。
+                    // 与 byteToKey 的 0x01-0x1f 控制字节集保持一致。
                     if (self.num2 == 5) {
                         return switch (self.num1) {
                             99, 67 => .ctrl_c, // 'c' / 'C'
-                            100, 68 => .ctrl_d, // 'd' / 'D'
+                            100, 68 => .ctrl_d, // 'd'
                             97, 65 => .ctrl_a,
                             101, 69 => .ctrl_e,
                             107, 75 => .ctrl_k,
                             117, 85 => .ctrl_u,
+                            111, 79 => .ctrl_o, // 'o' — transcript viewer(实测漏)
+                            98, 66 => .ctrl_b, // 'b' — 转后台(run in background)
+                            114, 82 => .ctrl_r, // 'r' — reverse search
+                            116, 84 => .ctrl_t, // 't' — task panel toggle
+                            103, 71 => .ctrl_g, // 'g'
+                            120, 88 => .ctrl_x, // 'x' — Ctrl+X 前缀
+                            108, 76 => .ctrl_l, // 'l' — external edit
+                            119, 87 => .ctrl_w, // 'w'
+                            121, 89 => .ctrl_y, // 'y'
+                            95 => .ctrl_underscore, // '_' — undo
                             else => .unknown,
                         };
                     }
@@ -238,6 +252,7 @@ fn byteToKey(b: u8) Key {
         0x12 => .ctrl_r,
         0x14 => .ctrl_t,
         0x0f => .ctrl_o,
+        0x02 => .ctrl_b, // 生成期转后台(run in background)
         0x18 => .ctrl_x,
         0x07 => .ctrl_g,
         0x7f, 0x08 => .backspace,
@@ -674,7 +689,7 @@ pub const LineEditor = struct {
             },
             // 全局快捷键(↑↓/Tab/Shift+Tab/Ctrl+R/T/O/G/X/L)由 dispatch(ui.zig)拦截,
             // editor 正常收不到;此处兜底返 .none(防御:vim/边界路径若漏到这不崩)。
-            .up, .down, .tab, .shift_tab, .ctrl_r, .ctrl_t, .ctrl_o, .ctrl_g, .ctrl_x, .ctrl_l => return .none,
+            .up, .down, .tab, .shift_tab, .ctrl_r, .ctrl_t, .ctrl_o, .ctrl_b, .ctrl_g, .ctrl_x, .ctrl_l => return .none,
             .page_up, .page_down => return .none, // viewing 视口翻页键,editor 不处理(dispatch 拦截)
             .unknown => return .none,
         }
@@ -1256,6 +1271,44 @@ test "KeyParser: ctrl_o / ctrl_x bytes" {
     var p = KeyParser{};
     try testing.expect(p.feed(0x0f).? == .ctrl_o);
     try testing.expect(p.feed(0x18).? == .ctrl_x);
+}
+
+test "KeyParser: Ctrl+B byte + Kitty CSI-u(转后台键路径)" {
+    // 裸字节 0x02 → .ctrl_b。
+    var p = KeyParser{};
+    try testing.expect(p.feed(0x02).? == .ctrl_b);
+    // Kitty CSI-u 形式 ESC[98;5u(98='b',5=Ctrl)→ .ctrl_b(白名单终端会发这个而非 0x02)。
+    var p2 = KeyParser{};
+    inline for ("\x1b[98;5u") |c| {
+        const k = p2.feed(c);
+        if (c == 'u') try testing.expect(k.? == .ctrl_b);
+    }
+}
+
+test "KeyParser: Ctrl+O via Kitty CSI-u (ESC[111;5u)" {
+    // 实测 bug:Kitty disambiguate 模式下某些终端把 Ctrl+O 编成 CSI-u(111='o',5=Ctrl)
+    // 而非裸 0x0f → 旧 CSI-u 表无 'o' → 返 .unknown → Ctrl+O 静默失效。覆盖该路径。
+    var p = KeyParser{};
+    try testing.expect(p.feed(0x1b) == null);
+    try testing.expect(p.feed('[') == null);
+    try testing.expect(p.feed('1') == null);
+    try testing.expect(p.feed('1') == null);
+    try testing.expect(p.feed('1') == null);
+    try testing.expect(p.feed(';') == null);
+    try testing.expect(p.feed('5') == null);
+    try testing.expect(p.feed('u').? == .ctrl_o);
+    // 大写 'O'(79)同样映射(某些终端 Ctrl+Shift 变体)。
+    var p2 = KeyParser{};
+    inline for ("\x1b[79;5u") |c| {
+        const k = p2.feed(c);
+        if (c == 'u') try testing.expect(k.? == .ctrl_o);
+    }
+    // 其它新增覆盖键抽查:Ctrl+R(114) / Ctrl+T(116) 经 CSI-u 也能解。
+    var p3 = KeyParser{};
+    inline for ("\x1b[114;5u") |c| {
+        const k = p3.feed(c);
+        if (c == 'u') try testing.expect(k.? == .ctrl_r);
+    }
 }
 
 test "KeyParser: ctrl_g byte" {

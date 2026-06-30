@@ -32,6 +32,9 @@ pub const WriterBackend = struct {
     colorize: bool = false,
     verbose: bool = false,
     show_retry: bool = false,
+    /// usage 累加目标(L1:usage 走 CoreEvent.usage 总线)。非主交互路径(skill 注入 / cron)
+    /// 用 WriterBackend 也要把 token 计入 app.usage,否则 /cost 漏算这些 turn。null = 不累加。
+    usage_acc: ?*@import("usage.zig").UsageTotals = null,
 
     /// null sink:丢弃所有字节(SilentWriter/NullWriter 等价)。
     pub fn nullSink(_: *anyopaque, _: []const u8) void {}
@@ -39,6 +42,11 @@ pub const WriterBackend = struct {
     /// 便利:构造一个丢弃一切的 WriterBackend(headless/subagent/测试)。
     pub fn initNull() WriterBackend {
         return .{ .sink_ctx = undefined, .sink = nullSink };
+    }
+
+    /// 便利:丢弃字节但累加 usage(headless 仍要 /cost 计数)。
+    pub fn initNullWithUsage(usage_acc: *@import("usage.zig").UsageTotals) WriterBackend {
+        return .{ .sink_ctx = undefined, .sink = nullSink, .usage_acc = usage_acc };
     }
 
     pub fn backend(self: *WriterBackend) UiBackend {
@@ -101,9 +109,14 @@ pub const WriterBackend = struct {
             .stream_done => {
                 self.emit(if (self.colorize) "\x1b[0m\n" else "\n");
             },
+            // usage:累加进 usage_acc(若接),供 /cost。其余卡/spinner/progress/phase no-op。
+            .usage => |u| {
+                if (self.usage_acc) |acc| acc.apply(u);
+            },
             // print-only sink 不收这些(旧 @hasDecl 守卫即编译期消失):
             // ui_request_pending:异步前端专属;print-only(headless/后台 job)不投递,no-op。
-            .set_current_tool, .clear_current_tool, .tool_progress, .tool_result, .usage, .phase_change, .ui_request_pending => {},
+            // diag_*:L4 诊断事件,DiagnosticsBackend 专属,渲染后端 no-op。
+            .set_current_tool, .clear_current_tool, .tool_progress, .progress, .tool_result, .phase_change, .ui_request_pending, .diag_turn_begin, .diag_turn_end, .diag_breaker_tripped, .diag_cache_break, .diag_continuation, .diag_run_end => {},
         }
     }
 };

@@ -41,6 +41,29 @@ pub const Block = union(enum) {
             .thinking => |t| allocator.free(t),
         }
     }
+
+    /// 深拷贝本 block 的全部 owned 字节到 dst allocator(转后台 conversation 副本用)。
+    /// 失败时已分配部分自行回收(errdefer),不泄漏。返回的 Block 完全归 dst。
+    pub fn dupe(self: Block, dst: std.mem.Allocator) !Block {
+        return switch (self) {
+            .text => |t| Block{ .text = try dst.dupe(u8, t) },
+            .thinking => |t| Block{ .thinking = try dst.dupe(u8, t) },
+            .tool_use => |tu| blk: {
+                const id = try dst.dupe(u8, tu.id);
+                errdefer dst.free(id);
+                const name = try dst.dupe(u8, tu.name);
+                errdefer dst.free(name);
+                const input = try dst.dupe(u8, tu.input);
+                break :blk Block{ .tool_use = .{ .id = id, .name = name, .input = input } };
+            },
+            .tool_result => |tr| blk: {
+                const tid = try dst.dupe(u8, tr.tool_use_id);
+                errdefer dst.free(tid);
+                const content = try dst.dupe(u8, tr.content);
+                break :blk Block{ .tool_result = .{ .tool_use_id = tid, .content = content, .is_error = tr.is_error } };
+            },
+        };
+    }
 };
 
 pub const ToolUse = struct {
@@ -63,6 +86,19 @@ pub const Message = struct {
     pub fn deinit(self: Message, allocator: std.mem.Allocator) void {
         for (self.blocks) |b| b.deinit(allocator);
         allocator.free(self.blocks);
+    }
+
+    /// 深拷贝本消息(role + 每个 block)到 dst allocator。失败回收已拷部分,不泄漏。
+    pub fn dupe(self: Message, dst: std.mem.Allocator) !Message {
+        const blocks = try dst.alloc(Block, self.blocks.len);
+        errdefer dst.free(blocks);
+        var n: usize = 0;
+        errdefer for (blocks[0..n]) |b| b.deinit(dst);
+        for (self.blocks, 0..) |b, i| {
+            blocks[i] = try b.dupe(dst);
+            n = i + 1;
+        }
+        return .{ .role = self.role, .blocks = blocks };
     }
 };
 
@@ -117,4 +153,26 @@ test "Message with multiple blocks" {
     defer m.deinit(a);
     try std.testing.expect(m.blocks.len == 2);
     try std.testing.expect(@as(std.meta.Tag(Block), m.blocks[1]) == .tool_use);
+}
+
+test "Message.dupe 深拷贝独立 + 无泄漏(含 4 种 block)" {
+    const a = std.testing.allocator;
+    const blocks = try a.alloc(Block, 4);
+    blocks[0] = .{ .text = try a.dupe(u8, "hi") };
+    blocks[1] = .{ .thinking = try a.dupe(u8, "thinking...") };
+    blocks[2] = .{ .tool_use = .{ .id = try a.dupe(u8, "t1"), .name = try a.dupe(u8, "Bash"), .input = try a.dupe(u8, "{}") } };
+    blocks[3] = .{ .tool_result = .{ .tool_use_id = try a.dupe(u8, "t1"), .content = try a.dupe(u8, "ok"), .is_error = true } };
+    var src = Message{ .role = .assistant, .blocks = blocks };
+
+    var copy = try src.dupe(a);
+    // 释放源 → 副本仍有效(证明深拷贝,无共享指针)。
+    src.deinit(a);
+    defer copy.deinit(a);
+    try std.testing.expect(copy.role == .assistant);
+    try std.testing.expectEqual(@as(usize, 4), copy.blocks.len);
+    try std.testing.expectEqualStrings("hi", copy.blocks[0].text);
+    try std.testing.expectEqualStrings("thinking...", copy.blocks[1].thinking);
+    try std.testing.expectEqualStrings("Bash", copy.blocks[2].tool_use.name);
+    try std.testing.expectEqualStrings("ok", copy.blocks[3].tool_result.content);
+    try std.testing.expect(copy.blocks[3].tool_result.is_error);
 }

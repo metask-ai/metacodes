@@ -10,6 +10,7 @@
 const std = @import("std");
 const posix = std.posix;
 const app_mod = @import("../app.zig");
+const Conversation = @import("../core/conversation.zig").Conversation;
 const tools = @import("../tools.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const input = @import("input.zig");
@@ -28,6 +29,8 @@ const tui_term_root = @import("tui/term.zig");
 const util_fs = @import("../util/fs.zig");
 const ui_backend_mod = @import("../core/protocol/ui_backend.zig");
 const writer_backend_mod = @import("../core/writer_backend.zig");
+const tee_backend_mod = @import("../core/tee_backend.zig");
+const diagnostics_backend_mod = @import("../core/diagnostics_backend.zig");
 const tui_backend_mod = @import("tui/tui_backend.zig");
 
 /// 把 CoreEvent 的字节写到 std.debug.print(stderr)——非 TTY 交互 / cron / skill 等场景。
@@ -37,8 +40,8 @@ fn debugSink(_: *anyopaque, bytes: []const u8) void {
 }
 
 /// 建一个走 std.debug.print 的 WriterBackend(colorize=true 复刻旧 DebugWriter 继承的默认)。
-fn debugBackend(verbose: bool, show_retry: bool) writer_backend_mod.WriterBackend {
-    return .{ .sink_ctx = undefined, .sink = debugSink, .colorize = true, .verbose = verbose, .show_retry = show_retry };
+fn debugBackend(verbose: bool, show_retry: bool, usage_acc: ?*@import("../core/usage.zig").UsageTotals) writer_backend_mod.WriterBackend {
+    return .{ .sink_ctx = undefined, .sink = debugSink, .colorize = true, .verbose = verbose, .show_retry = show_retry, .usage_acc = usage_acc };
 }
 
 pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
@@ -49,7 +52,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
 
     // 顶层 REPL 的辅助 backend(cron/skill/retry 等非主对话路径用):走 std.debug.print。
     // 主对话路径在生成期单独构造 TuiBackend/WriterBackend(见下)。
-    var aux_wb = debugBackend(app.config.verbose, true);
+    var aux_wb = debugBackend(app.config.verbose, true, &app.usage);
     const aux_be = aux_wb.backend();
     var history = history_mod.History.init(allocator);
     defer history.deinit();
@@ -486,7 +489,6 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         const gen_raw_orig: ?std.c.termios = if (tty) input.enterRawMode(stdin_fd) else null;
         defer if (gen_raw_orig) |o| input.restoreMode(stdin_fd, o);
 
-        const usage_sink = app.usageSink();
         const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*j| j else null;
         // UI backend:TUI 路径用 TuiBackend(包 region,渲染工具卡 + 颜色 + owns 生成期键盘输入);
         // 非 TTY 用 WriterBackend(走 std.debug.print)。两者实现同一 UiBackend vtable。
@@ -498,11 +500,28 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // 同一地址——agent_loop(emit)与 watcher(键盘)共享这一个 TuiBackend 实例。
         // 不要把 tui_be 重新赋值 / 搬移 / 放进会 realloc 的容器,否则两个指针指向坟墓。
         var tui_be: ?tui_backend_mod.TuiBackend = if (region_writer) |*rw|
-            .{ .region = rw.region, .theme = &app.theme, .alloc = allocator, .edit_hl_cache = &app.edit_hl_cache, .colorize = true, .verbose = app.config.verbose, .show_retry = true, .usage_acc = null, .queue = &msg_queue, .abort_signal = &app.abort, .input_abort = &app.abort }
+            .{ .region = rw.region, .theme = &app.theme, .alloc = allocator, .edit_hl_cache = &app.edit_hl_cache, .colorize = true, .verbose = app.config.verbose, .show_retry = true, .usage_acc = &app.usage, .queue = &msg_queue, .abort_signal = &app.abort, .input_abort = &app.abort }
         else
             null;
-        var fallback_be = debugBackend(app.config.verbose, true);
+        var fallback_be = debugBackend(app.config.verbose, true, &app.usage);
         const ui_be: ui_backend_mod.UiBackend = if (tui_be) |*tb| tb.backend() else fallback_be.backend();
+
+        // L4:METACODES_TRACE 开启时,旁挂 DiagnosticsBackend(经 TeeBackend 转发)收集结构化
+        // trace,run 结束后 dump 成 NDJSON 到 stderr。关闭时直接用 ui_be,零开销。
+        const trace_on = std.c.getenv("METACODES_TRACE") != null;
+        var diag_be = diagnostics_backend_mod.DiagnosticsBackend.init(allocator);
+        defer diag_be.deinit();
+        var diag_ui = diag_be.backend();
+        var tee = tee_backend_mod.TeeBackend{ .primary = &ui_be, .secondary = &diag_ui };
+        const tee_ui = tee.backend();
+        const effective_be: *const ui_backend_mod.UiBackend = if (trace_on) &tee_ui else &ui_be;
+        defer if (trace_on) {
+            const jsonl = diag_be.toJsonl(allocator) catch null;
+            if (jsonl) |j| {
+                defer allocator.free(j);
+                std.debug.print("{s}", .{j});
+            }
+        };
 
         // 生成期键盘监听:仅 tty + 有 TuiBackend 时启动(回车入队 / Esc 中断 / 超时 tickSpinner)。
         if (tty) {
@@ -518,11 +537,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         };
         const result = agent_loop.run(
             &app.conversation,
-            &app.api_client,
+            app.provider(),
             app.tool_defs,
             &app.permission_ctx,
-            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry, .skill_activator = .{ .ctx = @ptrCast(app), .activateFn = &app_mod.App.activateSkillTrampoline }, .tool_activator = .{ .ctx = @ptrCast(app), .activateFn = &app_mod.App.activateToolTrampoline }, .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .worktree_hook = .{ .ctx = @ptrCast(app), .pushFn = &app_mod.App.worktreePushTrampoline, .popFn = &app_mod.App.worktreePopTrampoline }, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
-            &ui_be,
+            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
+            effective_be,
             allocator,
         ) catch |err| {
             // 停 watcher + 清 stdin 缓冲
@@ -540,6 +559,16 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // 每轮结束 flush transcript（含错误 / abort 路径；只要有变动都想落盘）
         app.persistTranscript();
 
+        // L3:挂起 → 落 suspend.json + 提示恢复方式。释放 suspend_info(owned)。
+        if (result.suspend_info) |si| {
+            defer si.deinit();
+            if (app.sessionDir()) |dir| {
+                const suspend_state = @import("../core/suspend_state.zig");
+                suspend_state.writeFromSuspendInfo(dir, si, allocator) catch {};
+                std.debug.print("\x1b[36m⏸ Suspended (kind={s}) — resume from: {s}\x1b[0m\n", .{ si.kind, dir });
+            }
+        }
+
         // 工具可能改了权限模式(EnterPlanMode/ExitPlanMode 写 permission_ctx.mode)。
         // footer/border 读的是 config.permission_mode → 回同步,否则 TUI 不反映 plan 模式。
         if (app.config.permission_mode != app.permission_ctx.modeValue()) {
@@ -550,7 +579,79 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             std.debug.print("\x1b[33m^C (cancelled)\x1b[0m\n", .{});
             app.abort.resetForTesting();
         }
+
+        // Ctrl+B 转后台:turn 边界返回 .backgrounded。深拷贝当前对话 → spawnBackground 续跑 →
+        // 成功才 reset 前台开新会话。顺序铁律:先 clone 再 spawn 再 reset(失败不 reset,保留对话重试)。
+        if (result.stop_reason == .backgrounded) {
+            app.background_request.store(false, .monotonic); // 复位信号(否则下一轮 run 立即又转后台)
+            backgroundCurrentSession(app) catch |err| {
+                std.debug.print("\x1b[31m转后台失败: {s}(对话保留前台)\x1b[0m\n", .{@errorName(err)});
+            };
+        }
     }
+}
+
+/// Ctrl+B:把当前主对话深拷贝转后台续跑,成功后 reset 前台开新会话。
+/// 顺序铁律:① clone(registry allocator)② spawnBackground(成功后 copy 所有权转移)③ reset 前台。
+/// 任一步失败 → 不 reset 前台(保留对话让用户重试),copy 在失败路径释放。
+///
+/// **隐性契约(D)**:后台 job 借用 app.agents/skills/dyn_registry(只读,App 生命周期)。这些在
+/// 后台 job 存活期间(可数分钟)**必须保持不可变**——前台若有运行时写入路径(动态加载 skill /
+/// 注册 agent),与后台读并发就是竞争。当前无此类运行时写入,安全;新增前需重新评估。
+/// conversation 是深拷贝(零共享);Client/io_runtime/abort 后台专属;故唯一隐患就是上述借用集。
+///
+/// **MVP 简化(E)**:单击即转后台,不可逆(无 foreground-back),无双击防抖。误触代价=对话被搬走、
+/// 前台清空;靠转后台后的明确提示("⤳ 已转后台续跑")让用户知道发生了什么 + 去 agent switcher 找回。
+/// 双击防抖 / foreground-back 列后续增强。
+fn backgroundCurrentSession(app: *app_mod.App) !void {
+    const reg = if (app.agent_jobs) |*aj| aj else return error.NoBackgroundRegistry;
+    if (app.conversation.len() == 0) return; // 空对话无意义,静默忽略
+
+    // ① 深拷贝到 registry allocator(后台线程独立持有,与前台 0 共享)。
+    const copy = try app.conversation.cloneInto(reg.allocator);
+    // 注:spawnBackground 是 consume-on-call —— 成败都接管 copy 所有权,故此处**不**加 errdefer,
+    // 也不在成功后置空(传值进去后本地 copy 只是个失效别名,不再 deinit)。
+
+    // desc = 对话首个 text block 首句(agent tree 标题);空兜底 "main session"。
+    const desc = firstUserLine(&app.conversation);
+
+    // ② spawnBackground(prebuilt=copy)。consume 语义:成功转移给 job,失败它自己释放 copy。
+    _ = try reg.spawnBackground(.{
+        .prompt = "", // 忽略(prebuilt 非 null)
+        .system_prompt = app.system_prompt orelse "",
+        .tool_defs = app.tool_defs,
+        .permission_ctx = app.permission_ctx,
+        .agents = &app.agents,
+        .dyn_registry = &app.dyn_registry,
+        .skills = &app.skills,
+        .agent_depth = 0,
+        .parent_model = app.config.model,
+        .desc = desc,
+        .agent_type = "main",
+        .host_services = app.hostServices(),
+        .prebuilt_conversation = copy,
+    });
+
+    // ③ reset 前台开新空会话(对齐 cc:转后台后前台清空)。后台拿的是副本,前台 deinit 不影响它。
+    app.conversation.deinit();
+    app.conversation = Conversation.init(app.allocator);
+    std.debug.print("\x1b[36m⤳ 已转后台续跑(agent tree 可见进度);前台开新会话\x1b[0m\n", .{});
+}
+
+/// 取对话首个 user text block 首句(截断 80),供 agent tree 标题。空对话返 "main session"。
+fn firstUserLine(conv: *const Conversation) []const u8 {
+    for (conv.messages.items) |m| {
+        for (m.blocks) |b| switch (b) {
+            .text => |t| {
+                const trimmed = std.mem.trim(u8, t, " \t\r\n");
+                if (trimmed.len == 0) continue;
+                const end = std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len;
+                return trimmed[0..@min(end, 80)];
+            },
+            else => {},
+        };
+    }
+    return "main session";
 }
 
 /// Drain stdin buffer: 非阻塞读尽剩余字节。生成结束后调用，避免用户在 LLM 输出时
@@ -1003,6 +1104,7 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
                     redraw(&region, &editor, app);
                     continue;
                 },
+                .background_main => {}, // 输入期 Ctrl+B 无意义(无正在跑的 run);dispatch 已 gate,这里兜底
                 .agents_view => {
                     // 持久 viewing 现在纯靠 dispatch 设 view=.viewing + render_region.drawAgentViewing
                     // 帧渲染(非 print)。dispatch 不再上抛此 action;保留防御性 redraw。
@@ -1126,8 +1228,43 @@ fn handleReverseSearch(
         if (n == 0) return;
         const c = b[0];
 
-        if (c == 0x1b or c == 0x03) {
-            // Esc / Ctrl+C：取消，保留原 buffer
+        if (c == 0x1b) {
+            // 可能是裸 Esc,或 Kitty CSI-u 编码的 Esc(\x1b[27u)/Enter(\x1b[13u)/方向键。读后续判定:
+            // 非 '[' → 裸 Esc 取消;'[' → 解析 CSI codepoint(27=Esc 取消 / 13=Enter 接受 / 其余忽略并吞掉序列)。
+            // 不解析会把 `[27u` 等字节漏给下一轮 read 成乱码(白名单终端 reverse-search 的 CSI-u 盲区)。
+            var nb: [1]u8 = undefined;
+            const nn = posix.read(fd, &nb) catch return;
+            if (nn == 0 or nb[0] != '[') {
+                std.debug.print("\r\x1b[2K", .{}); // 裸 Esc → 取消
+                return;
+            }
+            // 读 CSI 序列到终止字母,解析首段 codepoint。
+            var cp: u32 = 0;
+            var in_mod = false;
+            while (true) {
+                var sx: [1]u8 = undefined;
+                const sn = posix.read(fd, &sx) catch break;
+                if (sn == 0) break;
+                const ch = sx[0];
+                if (ch >= '0' and ch <= '9') {
+                    if (!in_mod) cp = cp * 10 + (ch - '0');
+                } else if (ch == ';') {
+                    in_mod = true;
+                } else break; // 终止字母(u/~/letter)
+            }
+            if (cp == 13) {
+                if (match) |m| try editor.setLine(m); // Kitty Enter → 接受
+                std.debug.print("\r\x1b[2K", .{});
+                return;
+            }
+            if (cp == 27 or cp == 0) { // CSI-u Esc(27)或裸 ESC[(无 codepoint)→ 取消
+                std.debug.print("\r\x1b[2K", .{});
+                return;
+            }
+            continue; // 其余 CSI(方向键等)忽略,继续搜索
+        }
+        if (c == 0x03) {
+            // Ctrl+C:取消,保留原 buffer
             std.debug.print("\r\x1b[2K", .{});
             return;
         }
@@ -1337,14 +1474,13 @@ fn retryLast(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui
         m.deinit(app.conversation.allocator);
     }
 
-    const usage_sink = app.usageSink();
     const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*jr| jr else null;
     const result = agent_loop.run(
         &app.conversation,
-        &app.api_client,
+        app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry },
         backend,
         allocator,
     ) catch |err| {
@@ -1975,7 +2111,7 @@ fn handleSkillInvocation(app: *app_mod.App, allocator: std.mem.Allocator, rest: 
         .read_state = &app.read_state,
         .permission_ctx = &app.permission_ctx,
         .dyn_registry = &app.dyn_registry,
-        .skill_activator = .{ .ctx = @ptrCast(app), .activateFn = &app_mod.App.activateSkillTrampoline },
+        .host_services = app.hostServices(),
         .explicit_invocation = true, // 关键:用户显式触发,disable-model-invocation 跳过
         .project_dir = app.project_dir_or_empty(),
         .session_id = "",
@@ -2002,17 +2138,16 @@ fn handleSkillInvocation(app: *app_mod.App, allocator: std.mem.Allocator, rest: 
 
     // 让模型基于激活态回应。WriterBackend/std.debug.print:tool_render_theme 虽传,但
     // print-only backend 的工具卡事件 no-op(对齐旧 DebugWriter 经 @hasDecl 编译期消失)。
-    var wb = debugBackend(app.config.verbose, true);
+    var wb = debugBackend(app.config.verbose, true, &app.usage);
     const be = wb.backend();
-    const usage_sink = app.usageSink();
     const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*jr| jr else null;
     // 辅助路径(skill 调用 / cron 注入),非用户盯着的主交互循环 → 不接 spawn_tick_fn(默认 null,Bash 长命令静默,故意不传非遗漏)。
     const result = agent_loop.run(
         &app.conversation,
-        &app.api_client,
+        app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry, .skill_activator = .{ .ctx = @ptrCast(app), .activateFn = &app_mod.App.activateSkillTrampoline }, .project_dir = app.project_dir_or_empty(), .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .project_dir = app.project_dir_or_empty(), .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true },
         &be,
         allocator,
     ) catch |err| {
@@ -2234,15 +2369,14 @@ fn fireDueCrons(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const
 
 /// 把预置 prompt 注入为 user message 后触发一次 agent_loop 执行。
 fn runInjectedAgent(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui_backend_mod.UiBackend) !void {
-    const usage_sink = app.usageSink();
     const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*jr| jr else null;
     // 辅助路径(skill 调用 / cron 注入),非用户盯着的主交互循环 → 不接 spawn_tick_fn(默认 null,Bash 长命令静默,故意不传非遗漏)。
     const result = agent_loop.run(
         &app.conversation,
-        &app.api_client,
+        app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .usage_sink = usage_sink, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry },
         backend,
         allocator,
     ) catch |err| {
@@ -2320,7 +2454,6 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
 
     // 事务性加载：先在临时 conversation 加载，成功后才 atomic 切换。
     // 失败时保持原 conversation 和 writer 不变，用户下次输入仍写到原 session。
-    const Conversation = @import("../core/conversation.zig").Conversation;
     var staged = Conversation.init(app.allocator);
     // ownership 转移标志：true 时下面的 errdefer 不释放（已交给 app.conversation）。
     // 不用 errdefer staged.deinit() 是因为 Zig 的 errdefer 无法 cancel；

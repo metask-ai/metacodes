@@ -6,8 +6,13 @@ const json_mod = @import("json.zig");
 const api_stream = @import("api/stream.zig");
 const Catalog = @import("api/catalog.zig").Catalog;
 const AbortSignal = @import("util/abort.zig").AbortSignal;
+const provider_mod = @import("api/provider.zig");
 
 pub const VERSION = "0.1.0";
+
+/// P0:AnthropicProvider 复用中立 Provider 接口(非 generic)。Client.provider() 产出它
+/// (thunk 转调 + StreamResponse.handle() 中立化)。P1 起 agent_loop 等收 Provider 类型。
+pub const AnthropicProvider = provider_mod.Provider;
 pub const ANTHROPIC_API_URL = "https://napi.metask-ai.com/v1/messages";
 pub const ANTHROPIC_AUTH_TOKEN = "";
 
@@ -93,10 +98,7 @@ pub const RETRY_BASE_MS: u64 = 500;
 
 /// 重试 UI 上报回调(agent_loop 注入,把 attempt/max/delay 渲染成 "Retrying in Ns…")。
 /// state 类型擦除(指向 stdout_writer 等);headless 传 null。
-pub const RetryReporter = struct {
-    state: *anyopaque,
-    report: *const fn (state: *anyopaque, attempt: u32, max: u32, delay_ms: u64) void,
-};
+pub const RetryReporter = api_stream.RetryReporter;
 
 /// 可中断 sleep:分片 sleep(每 ≤50ms 查一次 abort)。返回 true=睡满,false=被 abort 打断。
 pub fn interruptibleSleepMs(total_ms: u64, abort: ?*const AbortSignal) bool {
@@ -158,6 +160,63 @@ pub const Client = struct {
     pub fn deinit(client: *Client) void {
         client.http_client.deinit();
         client.catalog.deinit();
+    }
+
+    // ── P0:Provider vtable 包装(AnthropicProvider = Client 的 thunk)─────────
+    // Client.provider() 产出一个 Provider,其 fn-ptr 转调本 Client 的现有方法,行为零变化。
+    // agent_loop 后续(P1)改收 AnthropicProvider 而非 *Client,解耦到接口。
+    pub fn provider(client: *Client) AnthropicProvider {
+        return .{
+            .ctx = @ptrCast(client),
+            .modelFn = &pModel,
+            .sendStreamFn = &pSendStream,
+            .sendStreamRetryFn = &pSendStreamRetry,
+            .sendFn = &pSend,
+            .maxTokensFn = &pMaxTokens,
+            .maxInputTokensFn = &pMaxInputTokens,
+            .supportsFn = &pSupports,
+        };
+    }
+    fn pModel(ctx: *anyopaque) []const u8 {
+        return asClient(ctx).model;
+    }
+    fn pSendStream(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, user_query: []const u8) anyerror!provider_mod.StreamHandle {
+        const c = asClient(ctx);
+        var sr = try c.sendMessageStreamFull(messages, system, tools, abort, model_override, tool_choice);
+        sr.user_query = user_query;
+        return boxHandle(c.allocator, sr);
+    }
+    fn pSendStreamRetry(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, max_retries: u32, retry_base_ms: u64, reporter: ?RetryReporter, user_query: []const u8) anyerror!provider_mod.StreamHandle {
+        const c = asClient(ctx);
+        var sr = try c.sendMessageStreamFullRetry(messages, system, tools, abort, model_override, tool_choice, max_retries, retry_base_ms, reporter);
+        sr.user_query = user_query;
+        return boxHandle(c.allocator, sr);
+    }
+    /// 把按值返回的 StreamResponse 堆框 + 包成中立 StreamHandle(地址稳定,next 后不移动)。
+    fn boxHandle(allocator: std.mem.Allocator, sr: StreamResponse) !provider_mod.StreamHandle {
+        // 拷贝前断言:sr 的 event_iter 未初始化(否则拷贝会把指向旧框 transfer_buf 的 reader 带进
+        // 新框 → 悬挂)。send 路径返回的 sr 恒未初始化;此 assert 焊死该契约,防未来改坏。
+        std.debug.assert(!sr.iter_initialized);
+        const heap = try allocator.create(StreamResponse);
+        heap.* = sr;
+        return heap.heapHandle();
+    }
+    fn pSend(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition) anyerror!ApiResponse {
+        return asClient(ctx).sendMessage(messages, system, tools);
+    }
+    fn pMaxTokens(ctx: *anyopaque) u32 {
+        return asClient(ctx).resolveMaxTokens();
+    }
+    fn pMaxInputTokens(ctx: *anyopaque) u32 {
+        return asClient(ctx).resolveMaxInputTokens();
+    }
+    fn pSupports(ctx: *anyopaque, cap: provider_mod.Capability) bool {
+        // P2:走 capability 表(单一真相源),按当前 model 真判, 不再恒 true stub。
+        const capability = @import("api/capability.zig");
+        return capability.supports(.anthropic, asClient(ctx).model, cap);
+    }
+    inline fn asClient(ctx: *anyopaque) *Client {
+        return @ptrCast(@alignCast(ctx));
     }
 
     /// 设置 CLI max_tokens 覆盖。null 恢复自动。
@@ -532,17 +591,9 @@ test "tokenPreview masks middle" {
 }
 
 /// API 响应（非流式）
-pub const ApiResponse = struct {
-    content: []const u8 = "",
-    stop_reason: ?[]const u8 = null,
-    tool_calls: []const ToolCallResult = &.{},
-};
-
-pub const ToolCallResult = struct {
-    id: []const u8,
-    name: []const u8,
-    input: []const u8,
-};
+// ApiResponse/ToolCallResult 下沉到中立层 api/stream.zig(多 Provider 重构);此处 re-export 保持兼容。
+pub const ApiResponse = api_stream.ApiResponse;
+pub const ToolCallResult = api_stream.ToolCallResult;
 
 /// 流式响应迭代器（M1.4 起改为真流式）。
 ///
@@ -575,6 +626,40 @@ pub const StreamResponse = struct {
         if (self.iter_initialized) self.event_iter.deinit(self.allocator);
         self.stream_result.request.deinit();
         self.allocator.destroy(self.stream_result.request);
+    }
+
+    // ── 中立化:把 *堆分配* 的 StreamResponse 包成 provider 无关的 StreamHandle ──
+    // StreamResponse.next 懒初始化 event_iter 时取 &self.stream_result 内部地址,故 self 首次
+    // next 后**不可移动**——必须堆分配地址稳定。heapHandle 接管堆指针,handle.deinit 释放内部
+    // 资源 + 销毁堆框。返回的 StreamHandle 借用该堆 StreamResponse(同步消费)。
+    pub fn heapHandle(self: *StreamResponse) api_stream.StreamHandle {
+        // 安全前提(焊死):self 必须堆分配 + event_iter **尚未初始化**。因为 next() 懒初始化时
+        // 取 &self.stream_result.transfer_buf 的地址喂 reader——一旦初始化过, self 就不可移动/拷贝
+        // (那个内联 8KB 数组地址会悬挂)。boxHandle 在 send 返回后立刻包, 此时恒未初始化。
+        // 违反此前提(未来若有人在包之前先 next 一次)= 偶发悬挂指针, assert 当场 panic 暴露。
+        std.debug.assert(!self.iter_initialized);
+        return .{
+            .ctx = @ptrCast(self),
+            .nextFn = &hNext,
+            .deinitFn = &hDeinit,
+            .stopReasonFn = &hStopReason,
+            .requestIdFn = &hRequestId,
+        };
+    }
+    fn hNext(ctx: *anyopaque) anyerror!?StreamEvent {
+        return @as(*StreamResponse, @ptrCast(@alignCast(ctx))).next();
+    }
+    fn hDeinit(ctx: *anyopaque) void {
+        const sr: *StreamResponse = @ptrCast(@alignCast(ctx));
+        const a = sr.allocator;
+        sr.deinit();
+        a.destroy(sr); // 销毁堆框(heapHandle 的前提是 sr 来自 a.create)
+    }
+    fn hStopReason(ctx: *anyopaque) api_stream.StopReason {
+        return @as(*StreamResponse, @ptrCast(@alignCast(ctx))).stopReason();
+    }
+    fn hRequestId(ctx: *anyopaque) log.RequestId {
+        return @as(*StreamResponse, @ptrCast(@alignCast(ctx))).id;
     }
 
     /// drain 完后读 API 报告的 stop_reason(max_tokens 续写判断用)。
@@ -634,14 +719,9 @@ pub const StreamResponse = struct {
     }
 };
 
-pub const StreamEvent = union(enum) {
-    text: []u8,
-    tool_use_start: json_mod.ToolUseResult,
-    web_search_result: api_stream.WebSearchResultEvent,
-    web_search_query: []u8,
-    usage: api_stream.UsageDelta,
-    done: void,
-};
+// StreamEvent 下沉到中立层 api/stream.zig(多 Provider 重构);此处 re-export 保持兼容
+// (cc.client_mod.StreamEvent 等现有引用不变)。
+pub const StreamEvent = api_stream.StreamEvent;
 
 /// 解析非流式 API 响应
 fn parseApiResponse(data: []const u8, allocator: std.mem.Allocator) !ApiResponse {

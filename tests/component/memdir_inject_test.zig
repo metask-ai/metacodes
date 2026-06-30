@@ -50,7 +50,7 @@ test "L2: memdir 启用 → system prompt 含 # Memory 段 + memdir 路径(进�
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
     var wb = writer_backend.WriterBackend.initNull();
     const be = wb.backend();
-    _ = agent_loop.run(&conv, &client, empty_defs, &perm, .{
+    _ = agent_loop.run(&conv, client.provider(), empty_defs, &perm, .{
         .max_turns = 1,
         .system_prompt = sp,
     }, &be, a) catch return error.SkipZigTest;
@@ -91,7 +91,7 @@ test "L2: AutoMem 索引 → 首条 user message(经 user_context.build)" {
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
     var wb = writer_backend.WriterBackend.initNull();
     const be = wb.backend();
-    _ = agent_loop.run(&conv, &client, empty_defs, &perm, .{
+    _ = agent_loop.run(&conv, client.provider(), empty_defs, &perm, .{
         .max_turns = 1,
         .system_prompt = "BASE",
         .inject_user_context = uc,

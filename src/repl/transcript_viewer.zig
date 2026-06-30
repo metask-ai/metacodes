@@ -1,22 +1,24 @@
 //! Transcript viewer:Ctrl+O 打开的对话浏览器。
 //!
-//! **inline 内联模式(对齐 cc 2.1.167,DIFF#6/#7)**:不进 alt-screen,不 2J 清屏——
-//! 用绝对光标定位(`ESC[{r};1H` + `ESC[2K`)原地重绘整个可见视口(像 cc 全帧管理)。
-//! 关键正确性:绝不 emit 滚动用的 `\n`(会把内容推进 scrollback 毁历史),只用光标定位。
-//! 退出时重绘对话尾部 + 交还给 loop.zig 重画输入框(对齐 cc 关闭后历史+输入框可见)。
+//! **alt-screen 全屏模式(2026-06-13,根治多 agent"显两份"/footer 堆叠/几何漂移)**:进 `ESC[?1049h`
+//! 切独立缓冲(主屏 grid+光标整屏保存)→ 全帧绝对定位画 transcript + 末2行 footer → 退出 `ESC[?1049l`
+//! 由终端**自动逐字节恢复主缓冲**(banner+对话+输入框原样回来,零工作、零漂移、零 scrollback 污染)。
+//! 空缓冲 + 绝对定位 → 天然无两份、无滚动。早期试过 inline(不进 alt-screen)既要覆盖滚进可视区的对话、
+//! 又要退出不滚动,本质矛盾无法兼得(DIFF#6/#7 的"对齐 cc 不进 alt-screen"满足不了长对话),故改 alt-screen。
 //!
 //! 键(对齐 cc:↑↓ 主滚动 + ctrl+o toggle;保留 vim 键作增强):
 //!   ↓ / j / Space   向下滚一行       ↑ / k   向上滚一行
 //!   { / }           上/下一条 user prompt
 //!   g / G           顶 / 底
-//!   q / Esc / Ctrl+O 退出(ctrl+o 对称开关)
+//!   q / Esc / Ctrl+O 退出(ctrl+o 对称开关;白名单终端 Ctrl+O=CSI-u ESC[111;5u 也认)
 //!
 //! 本模块拆两层:
 //!   - renderToLines:把 Conversation 渲染成行数组(纯函数,可单测)
-//!   - runWithTheme:inline 交互循环(从 loop.zig 调,需要 tty)
+//!   - runWithTheme:alt-screen 交互循环(从 loop.zig / tui_backend 调,需要 tty)
 
 const std = @import("std");
 const Conversation = @import("../core/conversation.zig").Conversation;
+const Overlay = @import("tui/overlay.zig").Overlay;
 
 /// 把整个对话渲染成可显示的行(owned;caller free 每行 + 数组)。
 /// 每条 message 前加 role 头;tool_use/tool_result 用缩进 + 标记区分。
@@ -196,18 +198,23 @@ pub fn freeLines(allocator: std.mem.Allocator, lines: [][]u8) void {
     allocator.free(lines);
 }
 
-/// inline 交互循环。fd = stdin。rows = 终端高度(末 1 行给提示)。
-/// 进 alt screen → 渲染 → 处理键 → 退出恢复。(签名保留,内部已改 inline 内联,见模块头注)
+/// 交互循环。fd = stdin。rows = 终端高度(末 2 行给 footer)。
+/// 进 alt-screen(ESC[?1049h)→ 全屏画 → 处理键 → 退出 ESC[?1049l 自动恢复主缓冲(见模块头注)。
 pub fn run(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const Conversation, rows: usize) !void {
     return runWithTheme(fd, allocator, conv, rows, @import("tui/theme.zig").dark);
 }
 
-/// inline transcript viewer(方案 A,对齐 napicc v2.1.170 金标准):**不覆盖 banner/历史**。
-/// 调用约定:进入时**光标已在固定区区顶行**(caller 的 region.clear()/eraseRegion 擦完停在那)。
-/// 用 DECSC(\x1b7)存档区顶 → 每帧 DECRC(\x1b8)回区顶 + ESC[J 清到屏底(banner 在区顶之上不动)
-/// + 从区顶往下画 transcript + 末2行画 footer。退出 DECRC+ESC[J 回区顶清掉 transcript,光标停区顶,
-/// caller redraw 从区顶相对重画固定区 → 跟随内容、幂等。不需 box_h/绝对行号。
+/// 全屏 transcript viewer(2026-06-13 改 alt-screen,根治多 agent"显两份")。进 \x1b[?1049h 切独立
+/// 缓冲、全屏绝对定位画 transcript + 末2行 footer;退出 \x1b[?1049l 由终端**自动逐字节恢复主缓冲**
+/// (banner+对话+输入框原样回来,零漂移、零 scrollback 污染)。空缓冲 + 绝对定位 → 天然无两份。
 pub fn runWithTheme(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const Conversation, rows: usize, th: @import("tui/theme.zig").Theme) !void {
+    return runWithThemeAnchor(fd, allocator, conv, rows, 1, th);
+}
+
+/// anchor_hint:旧 inline 模式的区顶兜底行,alt-screen 不再需要(独立缓冲全屏绝对定位)。保留参数
+/// 仅为不动 caller 签名(tui_backend/loop 仍传它)——内部丢弃。
+pub fn runWithThemeAnchor(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const Conversation, rows: usize, anchor_hint: usize, th: @import("tui/theme.zig").Theme) !void {
+    _ = anchor_hint; // alt-screen 全屏模式不需要区顶 anchor(独立缓冲,绝对定位)
     const lines = try renderToLinesWithTheme(allocator, conv, th);
     defer freeLines(allocator, lines);
     const prompts = try userPromptLineIndices(allocator, lines);
@@ -218,22 +225,24 @@ pub fn runWithTheme(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const C
         break :blk @as(usize, sz.cols);
     };
 
-    // inline:不进 alt-screen。**进入时光标在区顶** → DECSC 存档(\x1b7),每帧/退出 DECRC(\x1b8)回此点。
-    // 隐藏光标(viewer 期间无编辑光标)。
-    writeAll(1, "\x1b[?25l"); // hide cursor
-    writeAll(1, "\x1b7"); // DECSC: 存档区顶(banner 在其上方,不被 viewer 触碰)
-    defer writeAll(1, "\x1b[?25h"); // show cursor
+    // **alt-screen 全屏 transcript**(用户实测:多 agent 长跑时 inline 重画会显两份/footer 堆叠/几何
+    // 漂移——根因是 inline 既要覆盖滚进可视区的对话、又要退出不滚动,无法兼得)。改用 alt-screen:进
+    // 独立缓冲全屏画 transcript(空缓冲 → 绝对定位天然无两份),退出由终端**自动逐字节恢复主缓冲**
+    // (banner+对话+输入框原样回来,零漂移)。只此 Ctrl+O 进全屏,其它一切不变。
+    var ov = Overlay{};
+    ov.enter(); // \x1b[?1049h + hide cursor + home
+    defer ov.exit(); // \x1b[?1049l → 终端自动恢复主缓冲
 
-    // 视口:从区顶到屏底,末 2 行留给 footer(分隔线 + 提示)。view_rows 是上界(屏底自然夹住)。
+    // 视口:rows 1..rows-2 全部给内容,末 2 行 footer。alt 缓冲空,全屏绝对定位画无两份、无滚动。
     const footer_rows: usize = 2;
-    const view_rows = if (rows > footer_rows + 1) rows - footer_rows - 1 else 1;
+    const view_rows: usize = if (rows > footer_rows) rows - footer_rows else 1;
     var top: usize = 0;
     const max_top = if (lines.len > view_rows) lines.len - view_rows else 0;
     top = max_top; // 对齐 cc:打开时定位到底部(最新)
 
     // 简单 ESC 序列解析:↑=\x1b[A ↓=\x1b[B。esc 单独=退出。
     while (true) {
-        drawScreenInline(lines, top, view_rows, rows, cols, th);
+        drawScreen(lines, top, view_rows, rows, cols, th);
         var b: [1]u8 = undefined;
         const n = std.c.read(fd, &b, 1);
         if (n <= 0) break;
@@ -260,6 +269,14 @@ pub fn runWithTheme(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const C
                         _ = std.c.read(fd, &s2, 1);
                         top = @min(top + view_rows, max_top);
                     },
+                    '0'...'4', '7'...'9' => {
+                        // Kitty/modifyOtherKeys CSI-u:ESC[<cp>;<mod>u(白名单终端把 Ctrl+O 编成
+                        // ESC[111;5u 而非裸 0x0f → 旧 viewer 不退出,toggle 失效)。读完整序列到终止字母,
+                        // 取 codepoint(';' 前的数字)。Ctrl+O(111)/q(113)/Esc(27)→ 退出(对称开关)。
+                        const cp = readCsiCodepoint(fd, s1[0] - '0');
+                        if (cp == 111 or cp == 113 or cp == 27) break;
+                        // 其余 CSI-u(功能键等)忽略。
+                    },
                     else => {},
                 }
                 continue;
@@ -280,11 +297,29 @@ pub fn runWithTheme(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const C
         }
     }
 
-    // 退出(方案 A):回区顶(DECRC)+ ESC[J 清掉 viewer 画的 transcript+footer(banner 在区顶之上不动)。
-    // 光标停区顶,caller(loop.zig redraw / tui_backend exitExclusiveOverlay)从区顶相对重画固定区
-    // → 跟随内容、与基线逐行一致(幂等)。**不再 tail 重绘、不再贴底光标**(那是旧 bug 根源)。
-    writeAll(1, "\x1b8"); // DECRC: 回区顶
-    writeAll(1, "\x1b[J"); // 清区顶到屏底(transcript + footer)
+    // 退出:alt-screen(defer ov.exit() → \x1b[?1049l)由终端**自动逐字节恢复主缓冲**——banner+对话+
+    // 输入框原样回来,零工作、零漂移。不再手动 \x1b[2J 清屏 + \n 重发对话尾(那是 inline 模式产物,
+    // 会把框推走、重引 box_top 漂移)。caller(tui_backend/loop)在 ov.exit() 后 redraw 画固定区/输入框。
+}
+
+/// 读完一段 CSI 序列(已读到 ESC[<first_digit>),返回 ';' 前的 codepoint(如 Ctrl+O=111),
+/// 并把剩余字节(mod 数字 + 终止字母 u/~/letter)读干净,不污染下一轮 read。
+fn readCsiCodepoint(fd: std.c.fd_t, first_digit: u8) u32 {
+    var cp: u32 = first_digit;
+    var in_mod = false; // 进入 ';' 后是 modifier 段,后续数字不计入 codepoint
+    while (true) {
+        var sx: [1]u8 = undefined;
+        const nx = std.c.read(fd, &sx, 1);
+        if (nx <= 0) return cp;
+        const ch = sx[0];
+        if (ch >= '0' and ch <= '9') {
+            if (!in_mod) cp = cp * 10 + (ch - '0');
+        } else if (ch == ';') {
+            in_mod = true;
+        } else {
+            return cp; // 终止字母(u / ~ / A-Z / a-z)
+        }
+    }
 }
 
 fn nextPrompt(prompts: []const usize, cur: usize) usize {
@@ -302,27 +337,24 @@ fn prevPrompt(prompts: []const usize, cur: usize) usize {
     return result;
 }
 
-/// inline 内联重绘 transcript 视口(方案 A:从**区顶**往下画,不覆盖 banner)。
-/// `\x1b8`(DECRC)回区顶存档点 → `\x1b[J` 清区顶到屏底(banner 在区顶之上不动)→ 从区顶逐行画
-/// transcript(行进用 `\x1b[1B\r` cursor-down,屏底 no-op 不滚动)→ footer 用**绝对**屏底末2行定位
-/// (`\x1b[{rows-1/rows};1H`,覆盖任何 transcript 溢出行)。绝不 \x1b[H/不 2J/不 emit \n。
-fn drawScreenInline(lines: []const []const u8, top: usize, view_rows: usize, rows: usize, cols: usize, th: @import("tui/theme.zig").Theme) void {
+/// 在 alt-screen 独立缓冲里全屏重绘 transcript:内容画屏顶 rows 1..rows-2(每行 `\x1b[{r};1H` 绝对
+/// 定位 + `\x1b[2K` 清行 + 内容)、footer 画屏底末2行(分隔线 rows-1 + 提示 rows)。缓冲是空的,
+/// 绝对定位天然无两份、无滚动。退出由 caller 的 `Overlay.exit()`(ESC[?1049l)自动恢复主缓冲。
+fn drawScreen(lines: []const []const u8, top: usize, view_rows: usize, rows: usize, cols: usize, th: @import("tui/theme.zig").Theme) void {
     var nbuf: [16]u8 = undefined;
-    // 回区顶(DECRC)+ 清区顶到屏底(banner 在区顶之上,保留)。
-    writeAll(1, "\x1b8");
-    writeAll(1, "\x1b[J");
-    // 从区顶往下逐行画 transcript。第一行原地画,后续行 `\x1b[1B\r`(下移+回行首,屏底 no-op 不滚)。
+    // alt-screen 独立缓冲内全帧绝对定位:内容画 rows 1..view_rows(=rows-2),每行 \x1b[{r};1H + 清行 +
+    // 内容。缓冲是空的 → 绝对定位天然无两份、无滚动。空行也清(覆盖上一帧滚动后的残留)。
     var r: usize = 0;
     var i: usize = top;
     while (r < view_rows) : (r += 1) {
-        if (r > 0) writeAll(1, "\x1b[1B\r"); // 下移一行 + 回行首(不滚动)
-        writeAll(1, "\x1b[2K"); // 清行
+        const screen_row = r + 1; // 1-based,从屏顶画
+        writeAll(1, std.fmt.bufPrint(&nbuf, "\x1b[{d};1H\x1b[2K", .{screen_row}) catch "");
         if (i < lines.len) {
             writeAll(1, lines[i]);
             i += 1;
         }
     }
-    // footer(绝对屏底末2行,与区顶无关):分隔线(rows-1)+ 提示(rows)。覆盖 transcript 溢出。
+    // footer(固定屏底末2行):分隔线(rows-1)+ 提示(rows)。绝对行 → 不堆叠成多行。
     const sep_row = if (rows >= 2) rows - 1 else 1;
     writeAll(1, std.fmt.bufPrint(&nbuf, "\x1b[{d};1H\x1b[2K", .{sep_row}) catch "");
     writeAll(1, th.dim);

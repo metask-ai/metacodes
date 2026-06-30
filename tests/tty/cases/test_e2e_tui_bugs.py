@@ -208,3 +208,4 @@ def test_e2e_bug8_task_start_card_visible(bin_path):
     if not ever_called:
         raise SkipTest("模型 %d 次重试均未调 Task/Agent(漂移),被测路径未触发" % RETRIES)
     raise AssertionError("Bug#8 regression:Task 被调用但起始卡(⏺ Task)不可见,或结果 JSON 被裸吐")
+

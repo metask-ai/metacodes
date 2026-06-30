@@ -68,6 +68,10 @@ const Recorder = struct {
         for (self.tags.items) |t| if (std.mem.eql(u8, t, tag)) return true;
         return false;
     }
+    fn tagIndex(self: *const Recorder, tag: []const u8) ?usize {
+        for (self.tags.items, 0..) |t, i| if (std.mem.eql(u8, t, tag)) return i;
+        return null;
+    }
     fn joinedText(self: *const Recorder, a: std.mem.Allocator) ![]u8 {
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(a);
@@ -104,7 +108,7 @@ test "阶段E: mock backend 跑真 agent_loop,断言 CoreEvent 序列(纯内存,
 
     const result = agent_loop.run(
         &conv,
-        &client,
+        client.provider(),
         empty_defs,
         &perm,
         .{ .max_turns = 3, .colorize = true }, // colorize=true → 应有 stream_begin/stream_done
@@ -122,9 +126,16 @@ test "阶段E: mock backend 跑真 agent_loop,断言 CoreEvent 序列(纯内存,
     try std.testing.expect(rec.hasTag("text_chunk"));
     try std.testing.expect(rec.hasTag("stream_done"));
 
-    // 首事件是 stream_begin,末事件是 stream_done(颜色括号正好包文本区)。
-    try std.testing.expectEqualStrings("stream_begin", rec.tags.items[0]);
-    try std.testing.expectEqualStrings("stream_done", rec.tags.items[rec.tags.items.len - 1]);
+    // L1:轮起始先发 .progress(turn 推进),再 stream_begin。usage 在流中发(stream_done 前)。
+    // 故断言改为"流括号包住文本区"的相对顺序,而非绝对首尾(progress/usage 是诊断事件,
+    // 可出现在流括号之外)。stream_begin 必在第一个 text_chunk 之前,stream_done 在其之后。
+    const idx_begin = rec.tagIndex("stream_begin").?;
+    const idx_text = rec.tagIndex("text_chunk").?;
+    const idx_done = rec.tagIndex("stream_done").?;
+    try std.testing.expect(idx_begin < idx_text);
+    try std.testing.expect(idx_text < idx_done);
+    // 首事件是 .progress(L1:轮起始进度),证明进度已收编进 CoreEvent 总线。
+    try std.testing.expectEqualStrings("progress", rec.tags.items[0]);
 
     // 文本块拼起来 == 模型吐的全文(证明 text_chunk 内容正确,深拷贝未丢)。
     const joined = try rec.joinedText(a);
@@ -163,7 +174,7 @@ test "M6: 自定义 session 经 agent_loop emit 端到端透传(非默认路由)
     const custom = cc.session_id.gen();
     try std.testing.expect(!std.mem.eql(u8, &custom.bytes, &SessionId.single.bytes));
 
-    _ = agent_loop.run(&conv, &client, &.{}, &perm, .{ .max_turns = 3, .colorize = true, .session = custom }, &be, a) catch
+    _ = agent_loop.run(&conv, client.provider(), &.{}, &perm, .{ .max_turns = 3, .colorize = true, .session = custom }, &be, a) catch
         return error.SkipZigTest;
 
     // emit 收到的 session == 传入的 custom(路由按值透传,无中途丢失/硬编码 .single)。
@@ -277,7 +288,7 @@ test "阶段E: HeadlessBackend 接真 agent_loop(CoreEvent→JSON 全链)" {
     var hb = headless_backend.HeadlessBackend.init(a, @ptrCast(&js), JsonSink.sink);
     const be = hb.backend();
 
-    const result = agent_loop.run(&conv, &client, empty_defs, &perm, .{ .max_turns = 3, .colorize = false }, &be, a) catch |e| {
+    const result = agent_loop.run(&conv, client.provider(), empty_defs, &perm, .{ .max_turns = 3, .colorize = false }, &be, a) catch |e| {
         std.debug.print("run failed: {s}\n", .{@errorName(e)});
         return error.SkipZigTest;
     };
