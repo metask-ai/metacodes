@@ -11,6 +11,8 @@ const std = @import("std");
 
 pub const SlashCmd = struct { name: []const u8, desc: []const u8 };
 
+pub const MODEL_MENU_MAX_ROWS: usize = 8;
+
 /// slash 命令表(name + 一行描述,供 `/` 菜单与补全共用)。
 pub const SLASH_COMMAND_TABLE = [_]SlashCmd{
     .{ .name = "/help", .desc = "Show help and available commands" },
@@ -18,10 +20,13 @@ pub const SLASH_COMMAND_TABLE = [_]SlashCmd{
     .{ .name = "/tools", .desc = "List available tools" },
     .{ .name = "/skills", .desc = "List available skills" },
     .{ .name = "/history", .desc = "Show input history" },
-    .{ .name = "/model", .desc = "Show or switch the model" },
+    .{ .name = "/model", .desc = "Select model by group and capability" },
+    .{ .name = "/models", .desc = "Select account API key and model" },
     .{ .name = "/resume", .desc = "Resume a previous session" },
     .{ .name = "/retry", .desc = "Retry the last request" },
     .{ .name = "/compact", .desc = "Compact the conversation context" },
+    .{ .name = "/goal", .desc = "View or manage the session goal" },
+    .{ .name = "/loop", .desc = "Control automatic continuation" },
     .{ .name = "/cost", .desc = "Show token usage and cost" },
     .{ .name = "/doctor", .desc = "Diagnose the environment" },
     .{ .name = "/config", .desc = "Show configuration" },
@@ -48,6 +53,18 @@ pub fn slashMenuOpen(line: []const u8) bool {
     if (!std.mem.startsWith(u8, trimmed, "/")) return false;
     if (std.mem.indexOfScalar(u8, trimmed, ' ') != null) return false;
     return slashFilterCount(line) > 0;
+}
+
+/// `/model` 的服务端 catalog 菜单。它和普通 slash 菜单同占下边框与 footer 之间的区域,
+/// 但导航/Enter 语义是选择模型,不是选择 slash command。
+pub fn modelMenuOpen(line: []const u8) bool {
+    _ = line;
+    return false;
+}
+
+pub fn modelsMenuOpen(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    return std.mem.eql(u8, trimmed, "/models") or std.mem.eql(u8, trimmed, "/model");
 }
 
 /// 当前 `/` 前缀匹配的命令数(菜单显示的行数,也是导航上限)。

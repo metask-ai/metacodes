@@ -4,6 +4,9 @@ const client = @import("client.zig");
 const app_mod = @import("app.zig");
 const repl = @import("repl/loop.zig");
 const ts_export = @import("treesitter/export.zig");
+const auth = @import("core/auth.zig");
+const api_keys_mod = @import("api/api_keys.zig");
+const catalog_mod = @import("api/catalog.zig");
 pub const treesitter_export = ts_export;
 
 pub const VERSION = "0.1.0";
@@ -19,6 +22,7 @@ pub const client_mod = client; // alias for L2 component tests
 pub const types_mod = types;
 pub const json_mod = @import("json.zig");
 pub const util_abort = @import("util/abort.zig");
+pub const util_fs = @import("util/fs.zig");
 pub const conversation = @import("core/conversation.zig");
 pub const agent_loop = @import("core/agent_loop.zig");
 pub const core_subagent = @import("core/subagent.zig");
@@ -29,6 +33,8 @@ pub const task_tools = @import("tools/task_tools.zig");
 pub const task_output_tool = @import("tools/task_output.zig");
 pub const agent_tool = @import("tools/agent.zig");
 pub const core_task_store = @import("core/task_store.zig");
+pub const core_goal = @import("core/goal.zig");
+pub const core_auth = auth;
 pub const core_read_state = @import("core/read_state.zig");
 pub const core_edit_hl_cache = @import("core/edit_hl_cache.zig");
 pub const tool_exec = @import("core/tool_exec.zig");
@@ -37,6 +43,7 @@ pub const cache_break = @import("core/cache_break.zig");
 pub const core_message = @import("core/message.zig");
 pub const transcript = @import("core/transcript.zig");
 pub const repl_headless = @import("repl/headless.zig");
+pub const repl_loop = @import("repl/loop.zig");
 pub const app_module = @import("app.zig");
 pub const tool_context = @import("tools/context.zig");
 pub const tool_error = @import("core/tool_error.zig");
@@ -136,6 +143,9 @@ pub fn main(init: std.process.Init) !void {
     if (try maybeRunExportSymbols(init, allocator)) |code| {
         std.process.exit(code);
     }
+    if (try maybeRunAuthCommand(init, allocator)) |code| {
+        std.process.exit(code);
+    }
 
     var config = parseArgs(init, allocator);
 
@@ -147,6 +157,9 @@ pub fn main(init: std.process.Init) !void {
     // --- env fallback:base_url / record_dir(CLI flag 优先,env 兜底)---
     if (config.base_url == null) {
         if (std.c.getenv("METACODES_BASE_URL")) |c| config.base_url = std.mem.span(c);
+    }
+    if (std.c.getenv("METACODES_AUTH_PRECEDENCE")) |c| {
+        if (auth.parsePrecedence(std.mem.span(c))) |p| config.auth_precedence = p;
     }
     if (config.record_dir == null) {
         if (std.c.getenv("METACODES_RECORD_DIR")) |c| config.record_dir = std.mem.span(c);
@@ -174,10 +187,35 @@ pub fn main(init: std.process.Init) !void {
     // --- record/replay cassette 录制目录(Stage 7)---
     if (config.record_dir) |dir| recorder.setDir(dir);
 
-    // API key 优先级：CLI `--api-key <k>` > 硬编码 token。
-    // 不读 ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN：这个代理后端与硬编码 token 绑定，
-    // 读 env 反而会让用户以为切换了 URL/provider（实际 URL 也是硬编码的），造成困惑。
-    const api_key = config.api_key orelse client.ANTHROPIC_AUTH_TOKEN;
+    var resolved_credential = auth.resolveCredential(allocator, config.api_key, config.auth_precedence) catch |err| {
+        @import("util/log.zig").err("auth", "credential resolution failed: {s}", .{@errorName(err)});
+        std.debug.print(
+            \\Authentication required.
+            \\Use one of:
+            \\  metacodes login --oauth-token-json <token-response.json>
+            \\  metacodes login --api-key <key>
+            \\  export METASK_API_KEY=...
+            \\
+            \\No token value was printed.
+            \\
+        , .{});
+        return err;
+    };
+    defer resolved_credential.deinit(allocator);
+    const api_key = resolved_credential.bearer_token;
+
+    applyStoredLoginSelection(allocator, &config) catch |err| {
+        log.debug("auth", "stored model selection unavailable: {s}", .{@errorName(err)});
+    };
+    if (!isUsableConfiguredSession(config, resolved_credential.source)) {
+        std.debug.print(
+            \\Metask login is incomplete.
+            \\Run `metacodes login` in a terminal and select an API key, model, and reasoning effort.
+            \\Use --model and --reasoning-effort only when intentionally overriding the saved selection.
+            \\
+        , .{});
+        return error.IncompleteLoginSelection;
+    }
 
     const app = try app_mod.App.init(allocator, init.io, config, api_key);
     defer app.deinit();
@@ -270,6 +308,361 @@ fn maybeRunExportSymbols(init: std.process.Init, allocator: std.mem.Allocator) !
     return try ts_export.run(allocator, target, out_path);
 }
 
+fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u8 {
+    var args = std.process.Args.iterate(init.minimal.args);
+    _ = args.next(); // 跳过 argv[0](程序名)
+    const cmd = args.next() orelse return null;
+    if (std.mem.eql(u8, cmd, "logout")) {
+        auth.clearDefault(allocator) catch |err| switch (err) {
+            error.NoHome => {
+                std.debug.print("No HOME set; no credentials cleared.\n", .{});
+                return 1;
+            },
+            else => {
+                std.debug.print("Logout failed: {s}\n", .{@errorName(err)});
+                return 1;
+            },
+        };
+        std.debug.print("Logged out. Local credentials cleared.\n", .{});
+        return 0;
+    }
+    if (!std.mem.eql(u8, cmd, "login")) return null;
+
+    var mode: enum { browser, help, status, api_key, oauth_json } = .browser;
+    var value: ?[]const u8 = null;
+    var open_browser = true;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "status") or std.mem.eql(u8, arg, "--status")) {
+            mode = .status;
+        } else if (std.mem.eql(u8, arg, "--api-key")) {
+            mode = .api_key;
+            value = args.next() orelse {
+                std.debug.print("usage: metacodes login --api-key <key>\n", .{});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, arg, "--oauth-token-json")) {
+            mode = .oauth_json;
+            value = args.next() orelse {
+                std.debug.print("usage: metacodes login --oauth-token-json <file>\n", .{});
+                return 2;
+            };
+        } else if (std.mem.eql(u8, arg, "--no-browser")) {
+            mode = .browser;
+            open_browser = false;
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            mode = .help;
+        }
+    }
+
+    switch (mode) {
+        .browser => {
+            var imported = auth.loginWithBrowser(allocator, .{ .open_browser = open_browser }) catch |err| {
+                std.debug.print("OAuth browser login failed: {s}\n", .{@errorName(err)});
+                return 1;
+            };
+            defer imported.deinit(allocator);
+            var stored = auth.loadDefault(allocator) catch |err| switch (err) {
+                error.NotFound, error.NoHome => auth.StoredCredentials{},
+                else => {
+                    std.debug.print("Could not read existing credentials: {s}\n", .{@errorName(err)});
+                    return 1;
+                },
+            };
+            defer stored.deinit(allocator);
+            if (stored.oauth) |*old| {
+                old.deinit(allocator);
+                stored.oauth = null;
+            }
+            stored.oauth = imported.oauth;
+            imported.oauth = null;
+            runLoginSelectionWizard(allocator, init.io, &stored) catch |err| {
+                std.debug.print("Login setup failed after OAuth: {s}\n", .{@errorName(err)});
+                return 1;
+            };
+            try auth.saveDefault(allocator, stored);
+            std.debug.print("Successfully logged in with Metask OAuth. API key, model, and reasoning effort were selected. Secrets were not printed.\n", .{});
+            return 0;
+        },
+        .help => {
+            printLoginHelp();
+            return 0;
+        },
+        .status => {
+            try printLoginStatus(allocator);
+            return 0;
+        },
+        .api_key => {
+            const k = std.mem.trim(u8, value.?, " \t\r\n");
+            if (k.len == 0) {
+                std.debug.print("Refusing to store an empty API key.\n", .{});
+                return 2;
+            }
+            var stored = auth.loadDefault(allocator) catch |err| switch (err) {
+                error.NotFound, error.NoHome => auth.StoredCredentials{},
+                else => {
+                    std.debug.print("Could not read existing credentials: {s}\n", .{@errorName(err)});
+                    return 1;
+                },
+            };
+            defer stored.deinit(allocator);
+            if (stored.api_key) |old| {
+                @memset(old, 0);
+                allocator.free(old);
+                stored.api_key = null;
+            }
+            stored.api_key = try allocator.dupe(u8, k);
+            runModelSelectionForStoredApiKey(allocator, init.io, &stored) catch |err| {
+                std.debug.print("Login setup failed after API key import: {s}\n", .{@errorName(err)});
+                return 1;
+            };
+            try auth.saveDefault(allocator, stored);
+            std.debug.print("Stored Metask API key. Model and reasoning effort were selected. Token value was not printed.\n", .{});
+            return 0;
+        },
+        .oauth_json => {
+            const body = try readFileArg(allocator, value.?);
+            defer allocator.free(body);
+            var imported = auth.importOAuthTokenResponse(allocator, body, @import("util/time.zig").nowUnix()) catch |err| {
+                std.debug.print("OAuth token import failed: {s}\n", .{@errorName(err)});
+                return 1;
+            };
+            defer imported.deinit(allocator);
+            var stored = auth.loadDefault(allocator) catch |err| switch (err) {
+                error.NotFound, error.NoHome => auth.StoredCredentials{},
+                else => {
+                    std.debug.print("Could not read existing credentials: {s}\n", .{@errorName(err)});
+                    return 1;
+                },
+            };
+            defer stored.deinit(allocator);
+            if (stored.oauth) |*old| {
+                old.deinit(allocator);
+                stored.oauth = null;
+            }
+            stored.oauth = imported.oauth;
+            imported.oauth = null;
+            runLoginSelectionWizard(allocator, init.io, &stored) catch |err| {
+                std.debug.print("Login setup failed after OAuth import: {s}\n", .{@errorName(err)});
+                return 1;
+            };
+            try auth.saveDefault(allocator, stored);
+            std.debug.print("Stored Metask OAuth credentials. API key, model, and reasoning effort were selected. Secrets were not printed.\n", .{});
+            return 0;
+        },
+    }
+}
+
+fn printLoginHelp() void {
+    std.debug.print(
+        \\Usage:
+        \\  metacodes login
+        \\  metacodes login --no-browser
+        \\  metacodes login status
+        \\  metacodes login --oauth-token-json <token-response.json>
+        \\  metacodes login --api-key <key>
+        \\  metacodes logout
+        \\
+        \\Default login starts a local browser OAuth flow on /auth/callback.
+        \\Use --no-browser to print the URL without launching a browser.
+        \\OAuth token JSON must match the Metask token endpoint response:
+        \\access_token, refresh_token, token_type=Bearer, expires_in.
+        \\Secrets are stored in ~/.cc-zig/auth.json with 0600 permissions.
+        \\
+    , .{});
+}
+
+fn runLoginSelectionWizard(allocator: std.mem.Allocator, io: std.Io, stored: *auth.StoredCredentials) !void {
+    try requireInteractiveLogin();
+    const oauth_cred = &(stored.oauth orelse return error.MissingOAuth);
+    const messages_url = loginMessagesUrl();
+    var keys = api_keys_mod.Catalog.init(allocator);
+    defer keys.deinit();
+    try api_keys_mod.fetchInto(&keys, allocator, io, messages_url, oauth_cred.access_token);
+    if (keys.entries.items.len == 0) return error.NoApiKeys;
+
+    std.debug.print("\nSelect API key / model group:\n", .{});
+    for (keys.entries.items, 0..) |entry, i| {
+        std.debug.print("  {d}. {s}", .{ i + 1, entry.label });
+        if (entry.group.len > 0) std.debug.print(" [{s}]", .{entry.group});
+        std.debug.print(" (...{s})\n", .{entry.suffix});
+    }
+    const key_idx = try promptChoice(allocator, keys.entries.items.len);
+    const selected = keys.entries.items[key_idx];
+    replaceStoredApiKey(allocator, stored, selected.secret) catch return error.OutOfMemory;
+    try runModelSelectionForStoredApiKey(allocator, io, stored);
+}
+
+fn runModelSelectionForStoredApiKey(allocator: std.mem.Allocator, io: std.Io, stored: *auth.StoredCredentials) !void {
+    try requireInteractiveLogin();
+    const key = stored.api_key orelse return error.MissingCredentials;
+    var c = client.Client.initWithBaseUrl(allocator, io, key, "model-selection", loginMessagesUrl());
+    defer c.deinit();
+    c.probeModels();
+    if (c.catalog.entries.items.len == 0) return error.NoModels;
+
+    std.debug.print("\nSelect model:\n", .{});
+    for (c.catalog.entries.items, 0..) |entry, i| {
+        std.debug.print("  {d}. {s}", .{ i + 1, entry.model_id });
+        if (entry.max_input_tokens) |ctx| std.debug.print(" ctx={d}", .{ctx});
+        if (entry.max_tokens) |out| std.debug.print(" out={d}", .{out});
+        std.debug.print("\n", .{});
+    }
+    const model_idx = try promptChoice(allocator, c.catalog.entries.items.len);
+    const model = c.catalog.entries.items[model_idx];
+    if (stored.selected_model) |old| allocator.free(old);
+    stored.selected_model = try allocator.dupe(u8, model.model_id);
+
+    var effort_buf: [5]types.ReasoningEffort = undefined;
+    const efforts = reasoningOptionsForMask(model.reasoning_mask, &effort_buf);
+    std.debug.print("\nSelect reasoning effort:\n", .{});
+    for (efforts, 0..) |effort, i| {
+        std.debug.print("  {d}. {s}\n", .{ i + 1, effort.name() });
+    }
+    const effort_idx = try promptChoice(allocator, efforts.len);
+    stored.reasoning_effort = efforts[effort_idx];
+}
+
+fn loginMessagesUrl() []const u8 {
+    if (std.c.getenv("METACODES_BASE_URL")) |u| return std.mem.span(u);
+    return client.ANTHROPIC_API_URL;
+}
+
+fn replaceStoredApiKey(allocator: std.mem.Allocator, stored: *auth.StoredCredentials, key: []const u8) !void {
+    if (stored.api_key) |old| {
+        @memset(old, 0);
+        allocator.free(old);
+    }
+    stored.api_key = try allocator.dupe(u8, key);
+}
+
+fn requireInteractiveLogin() !void {
+    if (std.c.isatty(0) == 0 or std.c.isatty(2) == 0) return error.InteractiveTerminalRequired;
+}
+
+fn promptChoice(allocator: std.mem.Allocator, count: usize) !usize {
+    _ = allocator;
+    while (true) {
+        std.debug.print("Choose [1-{d}]: ", .{count});
+        var buf: [64]u8 = undefined;
+        const n = readLine(&buf) catch return error.InputFailed;
+        const s = std.mem.trim(u8, buf[0..n], " \t\r\n");
+        if (s.len == 0) return 0;
+        const v = std.fmt.parseInt(usize, s, 10) catch {
+            std.debug.print("Invalid choice.\n", .{});
+            continue;
+        };
+        if (v >= 1 and v <= count) return v - 1;
+        std.debug.print("Choice out of range.\n", .{});
+    }
+}
+
+fn readLine(buf: []u8) !usize {
+    var len: usize = 0;
+    while (len < buf.len) {
+        var ch: [1]u8 = undefined;
+        const n = std.c.read(0, &ch, 1);
+        if (n < 0) return error.InputFailed;
+        if (n == 0) break;
+        if (ch[0] == '\n' or ch[0] == '\r') break;
+        buf[len] = ch[0];
+        len += 1;
+    }
+    return len;
+}
+
+fn reasoningOptionsForMask(mask: u8, buf: *[5]types.ReasoningEffort) []const types.ReasoningEffort {
+    const ordered = [_]types.ReasoningEffort{ .low, .medium, .high, .xhigh };
+    buf[0] = .none;
+    var n: usize = 1;
+    for (ordered) |effort| {
+        if ((mask & catalog_mod.reasoningBit(effort)) != 0) {
+            buf[n] = effort;
+            n += 1;
+        }
+    }
+    return buf[0..n];
+}
+
+fn printLoginStatus(allocator: std.mem.Allocator) !void {
+    const path = auth.authFilePath(allocator) catch |err| {
+        std.debug.print("No credential file path: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(path);
+    var stored = auth.loadFromPath(allocator, path) catch |err| switch (err) {
+        error.NotFound => {
+            std.debug.print("Not logged in. Credential file: {s}\n", .{path});
+            if (std.c.getenv(auth.METASK_API_KEY_ENV) != null) {
+                std.debug.print("METASK_API_KEY override is set.\n", .{});
+            }
+            return;
+        },
+        else => {
+            std.debug.print("Credential status unavailable: {s}\n", .{@errorName(err)});
+            return;
+        },
+    };
+    defer stored.deinit(allocator);
+    std.debug.print("Credential file: {s}\n", .{path});
+    if (stored.oauth) |o| {
+        std.debug.print("Stored OAuth: yes (expires_at={d}", .{o.expires_at});
+        if (o.account_id != null) std.debug.print(", account_id set", .{});
+        if (o.profile != null) std.debug.print(", profile set", .{});
+        std.debug.print(")\n", .{});
+    } else {
+        std.debug.print("Stored OAuth: no\n", .{});
+    }
+    std.debug.print("Stored API key: {s}\n", .{if (stored.api_key != null) "yes" else "no"});
+    std.debug.print("Selected model: {s}\n", .{stored.selected_model orelse "no"});
+    std.debug.print("Reasoning effort: {s}\n", .{if (stored.reasoning_effort) |e| e.name() else "no"});
+    if (std.c.getenv(auth.METASK_API_KEY_ENV) != null) {
+        std.debug.print("METASK_API_KEY override is set and wins unless --auth-precedence oauth-first is used.\n", .{});
+    }
+}
+
+fn readFileArg(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = std.c.open(path_z.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.OpenFailed;
+    defer _ = std.c.close(fd);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.read(fd, &buf, buf.len);
+        if (n < 0) return error.ReadFailed;
+        if (n == 0) break;
+        try out.appendSlice(allocator, buf[0..@intCast(n)]);
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn applyStoredLoginSelection(allocator: std.mem.Allocator, config: *types.Config) !void {
+    var stored = auth.loadDefault(allocator) catch |err| switch (err) {
+        error.NotFound, error.NoHome => return,
+        else => return err,
+    };
+    defer stored.deinit(allocator);
+    if (!config.model_explicit) {
+        if (stored.selected_model) |m| {
+            config.model = try allocator.dupe(u8, m);
+            config.model_explicit = true;
+        }
+    }
+    if (config.reasoning_effort == null) {
+        config.reasoning_effort = stored.reasoning_effort;
+    }
+}
+
+fn isUsableConfiguredSession(config: types.Config, source: auth.CredentialSource) bool {
+    return switch (source) {
+        .cli_api_key, .env_api_key => true,
+        .stored_api_key => config.model_explicit and config.reasoning_effort != null,
+        .stored_oauth => false,
+    };
+}
+
 fn parseArgs(init: std.process.Init, allocator: std.mem.Allocator) types.Config {
     var config = types.Config{};
     var args = std.process.Args.iterate(init.minimal.args);
@@ -284,7 +677,12 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             printHelp();
             std.process.exit(0);
         } else if (std.mem.eql(u8, arg, "--model")) {
-            if (args.next()) |m| config.model = allocator.dupe(u8, m) catch m;
+            if (args.next()) |m| {
+                config.model = allocator.dupe(u8, m) catch m;
+                config.model_explicit = true;
+            }
+        } else if (std.mem.eql(u8, arg, "--reasoning-effort") or std.mem.eql(u8, arg, "--thinking")) {
+            if (args.next()) |e| config.reasoning_effort = types.ReasoningEffort.parse(e);
         } else if (std.mem.eql(u8, arg, "--api-key")) {
             if (args.next()) |k| config.api_key = allocator.dupe(u8, k) catch k;
         } else if (std.mem.eql(u8, arg, "--permission") or std.mem.eql(u8, arg, "--permission-mode")) {
@@ -301,6 +699,10 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             if (args.next()) |s| config.answers_file = allocator.dupe(u8, s) catch s;
         } else if (std.mem.eql(u8, arg, "--base-url")) {
             if (args.next()) |s| config.base_url = allocator.dupe(u8, s) catch s;
+        } else if (std.mem.eql(u8, arg, "--auth-precedence")) {
+            if (args.next()) |s| {
+                if (auth.parsePrecedence(s)) |p| config.auth_precedence = p;
+            }
         } else if (std.mem.eql(u8, arg, "--record")) {
             if (args.next()) |s| config.record_dir = allocator.dupe(u8, s) catch s;
         } else if (std.mem.eql(u8, arg, "--max-tokens")) {
@@ -357,7 +759,8 @@ fn printHelp() void {
         \\  -                     Headless: read prompt from stdin
         \\  --json                Headless: emit NDJSON result event
         \\  --model <model>       Model (default: claude-sonnet-4-20250514)
-        \\  --api-key <key>       API key (overrides built-in token)
+        \\  --reasoning-effort <e> none|minimal|low|medium|high|xhigh
+        \\  --api-key <key>       API key (overrides stored credentials by default)
         \\  --permission <mode>   default | acceptEdits | plan | auto | dontAsk | bypassPermissions
         \\  --settings <path>     Extra settings JSON (CLI layer)
         \\  --allowedTools <list> Comma-separated allow rules, e.g. "Bash(git *),Read"
@@ -365,6 +768,7 @@ fn printHelp() void {
         \\  --add-dir <path>      Extra read/write directory (repeatable)
         \\  --answers-file <path> Preset answers for permission .ask / AskUserQuestion (non-tty)
         \\  --base-url <url>      Override API endpoint (must end with /v1/messages)
+        \\  --auth-precedence <p> api-key-first | oauth-first
         \\  --record <dir>        Record requests + SSE responses to dir (cassette)
         \\  --no-theme            Disable colors
         \\  --verbose             Verbose output
@@ -385,6 +789,8 @@ test {
     _ = &@import("treesitter/symbols.zig");
     _ = &@import("treesitter/export.zig");
     _ = &@import("core/edit_hl_cache.zig");
+    _ = &@import("core/goal.zig");
+    _ = &@import("core/auth.zig");
     _ = &@import("permission.zig");
     _ = &@import("permission/rule_spec.zig");
     _ = &@import("permission/bash_parser.zig");
@@ -415,6 +821,7 @@ test {
     _ = &@import("api/catalog.zig");
     _ = &@import("tools/context.zig");
     _ = &@import("repl/input.zig");
+    _ = &@import("repl/model_command.zig");
     _ = &@import("repl/msg_queue.zig");
     _ = &@import("repl/history.zig");
     _ = &@import("repl/multiline.zig");

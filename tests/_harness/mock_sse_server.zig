@@ -282,7 +282,7 @@ pub const MockServer = struct {
         // 让客户端的 HTTP 错误分支(logErrorBody)能读到 body。
         if (std.mem.indexOf(u8, self.status_line, "200") == null) {
             var hdr_buf: [256]u8 = undefined;
-            const hdr = std.fmt.bufPrint(&hdr_buf, "{s}\r\ncontent-type: application/json\r\ncontent-length: {d}\r\n\r\n", .{ self.status_line, self.body.len }) catch return;
+            const hdr = std.fmt.bufPrint(&hdr_buf, "{s}\r\ncontent-type: application/json\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n", .{ self.status_line, self.body.len }) catch return;
             _ = std.c.write(conn_fd, hdr.ptr, hdr.len);
             _ = std.c.write(conn_fd, self.body.ptr, self.body.len);
             return;
@@ -292,7 +292,8 @@ pub const MockServer = struct {
             "HTTP/1.1 200 OK\r\n" ++
             "content-type: text/event-stream\r\n" ++
             "cache-control: no-cache\r\n" ++
-            "transfer-encoding: chunked\r\n\r\n";
+            "transfer-encoding: chunked\r\n" ++
+            "connection: close\r\n\r\n";
         _ = std.c.write(conn_fd, header.ptr, header.len);
 
         var cursor: usize = 0;

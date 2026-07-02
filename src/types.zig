@@ -4,6 +4,8 @@ const std = @import("std");
 pub const Config = struct {
     api_key: ?[]const u8 = null,
     model: []const u8 = "claude-sonnet-4-20250514",
+    model_explicit: bool = false,
+    reasoning_effort: ?ReasoningEffort = null,
     /// 每次请求的 max_tokens。null = 根据 model 自动挑（util/model.zig 查表）；
     /// 非 null = 用户 CLI 明确指定的值，尊重覆盖。
     max_tokens: ?u32 = null,
@@ -35,6 +37,9 @@ pub const Config = struct {
     /// `--base-url <url>` / `METACODES_BASE_URL`:覆盖 API 端点(默认硬编码)。
     /// 用于 record/replay(指向 mock server)。须以 `/v1/messages` 结尾。
     base_url: ?[]const u8 = null,
+    /// Credential resolver precedence. Default matches docs: explicit CLI/env API
+    /// key wins over stored OAuth unless user opts into oauth-first.
+    auth_precedence: AuthPrecedence = .api_key_first,
     /// `--record <dir>` / `METACODES_RECORD_DIR`:把每次请求 body + SSE 响应原始字节
     /// dump 到该目录(cassette),供 replay 确定性复现。null = 不录制。
     record_dir: ?[]const u8 = null,
@@ -46,6 +51,45 @@ pub const Config = struct {
 
 /// LLM 后端协议种类(App 组装层据此选具体 Client;core 只见中立 Provider)。
 pub const ProviderKind = enum { anthropic, openai, gemini };
+
+pub const AuthPrecedence = enum { api_key_first, oauth_first };
+
+pub const ReasoningEffort = enum {
+    none,
+    minimal,
+    low,
+    medium,
+    high,
+    xhigh,
+
+    pub fn parse(s: []const u8) ?ReasoningEffort {
+        if (std.ascii.eqlIgnoreCase(s, "none") or std.ascii.eqlIgnoreCase(s, "off")) return .none;
+        if (std.ascii.eqlIgnoreCase(s, "minimal")) return .minimal;
+        if (std.ascii.eqlIgnoreCase(s, "low")) return .low;
+        if (std.ascii.eqlIgnoreCase(s, "medium") or std.ascii.eqlIgnoreCase(s, "med")) return .medium;
+        if (std.ascii.eqlIgnoreCase(s, "high")) return .high;
+        if (std.ascii.eqlIgnoreCase(s, "xhigh") or std.ascii.eqlIgnoreCase(s, "max")) return .xhigh;
+        return null;
+    }
+
+    pub fn name(self: ReasoningEffort) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .minimal => "minimal",
+            .low => "low",
+            .medium => "medium",
+            .high => "high",
+            .xhigh => "xhigh",
+        };
+    }
+
+    pub fn active(self: ReasoningEffort) bool {
+        return switch (self) {
+            .none, .minimal => false,
+            .low, .medium, .high, .xhigh => true,
+        };
+    }
+};
 
 /// 权限模式
 /// 权限模式(对齐 Claude Code 6 模式 + 历史别名)。
@@ -203,7 +247,7 @@ fn printHelp() void {
         \\
         \\Options:
         \\  --model <model>       Model to use (default: claude-sonnet-4-20250514)
-        \\  --api-key <key>       Anthropic API key (or ANTHROPIC_API_KEY env)
+        \\  --api-key <key>       Metask API key (or METASK_API_KEY env)
         \\  --permission <mode>   Permission mode: auto, prompt, plan, bypass
         \\  --no-theme            Disable colors
         \\  --verbose             Verbose output
@@ -221,7 +265,7 @@ pub fn printHelpToWriter(stdout: anytype) !void {
         \\
         \\Options:
         \\  --model <model>       Model to use (default: claude-sonnet-4-20250514)
-        \\  --api-key <key>       Anthropic API key (or ANTHROPIC_API_KEY env)
+        \\  --api-key <key>       Metask API key (or METASK_API_KEY env)
         \\  --permission <mode>   Permission mode: auto, prompt, plan, bypass
         \\  --no-theme            Disable colors
         \\  --verbose             Verbose output

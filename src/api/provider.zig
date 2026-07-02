@@ -86,6 +86,7 @@ pub const Provider = struct {
     /// 模型规格:output 上限 / input context window(auto-compact 阈值用)。
     maxTokensFn: *const fn (ctx: *anyopaque) u32,
     maxInputTokensFn: *const fn (ctx: *anyopaque) u32,
+    reasoningEffortFn: *const fn (ctx: *anyopaque) ?types.ReasoningEffort,
 
     /// 能力查询(P2 真接表;P0 实现可恒按 Anthropic 能力答)。
     supportsFn: *const fn (ctx: *anyopaque, cap: Capability) bool,
@@ -108,6 +109,9 @@ pub const Provider = struct {
     }
     pub inline fn maxInputTokens(self: Provider) u32 {
         return self.maxInputTokensFn(self.ctx);
+    }
+    pub inline fn reasoningEffort(self: Provider) ?types.ReasoningEffort {
+        return self.reasoningEffortFn(self.ctx);
     }
     pub inline fn supports(self: Provider, cap: Capability) bool {
         return self.supportsFn(self.ctx, cap);

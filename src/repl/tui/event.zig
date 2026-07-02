@@ -55,6 +55,16 @@ pub const LoopAction = enum {
     slash_select,
     /// slash 菜单补全(Tab):把 editor buffer 换成选中命令名但**不提交**(留用户补参数)。
     slash_complete,
+    /// /model 服务端模型菜单导航(↑↓):调用方按 catalog 数量移动 slash_sel。
+    model_nav,
+    /// /model 服务端模型菜单选中(Enter):调用方提交 `/model use <id>`。
+    model_select,
+    /// /model 服务端模型菜单补全(Tab):调用方填入 `/model use <id>` 但不提交。
+    model_complete,
+    /// /models 两级菜单导航(账号 API key → 模型)。
+    models_nav,
+    /// /models 两级菜单选中。
+    models_select,
     /// @-mention 菜单导航(↑↓):调用方(有 allocator)算文件候选数、移 slash_sel、重画。
     /// dir 见 Effect.at_nav_dir(true=down/false=up)。dispatch 无 allocator 不能算候选数,故上抛。
     at_nav,
@@ -114,6 +124,6 @@ pub const Effect = struct {
     immediate: bool = false,
     /// 非渲染语义动作,交主循环处理。
     action: LoopAction = .none,
-    /// at_nav 方向:true=down(下/选下一个),false=up。仅 action==.at_nav 时有意义。
+    /// nav 方向:true=down(下/选下一个),false=up。仅 action==.at_nav/.model_nav/.models_nav 时有意义。
     at_nav_dir: bool = true,
 };

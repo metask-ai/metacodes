@@ -130,6 +130,7 @@ pub const GeminiClient = struct {
             .sendFn = &pSend,
             .maxTokensFn = &pMaxTokens,
             .maxInputTokensFn = &pMaxInputTokens,
+            .reasoningEffortFn = &pReasoningEffort,
             .supportsFn = &pSupports,
         };
     }
@@ -144,6 +145,9 @@ pub const GeminiClient = struct {
     }
     fn pMaxInputTokens(ctx: *anyopaque) u32 {
         return cast(ctx).context_window;
+    }
+    fn pReasoningEffort(_: *anyopaque) ?types.ReasoningEffort {
+        return null;
     }
     fn pSupports(ctx: *anyopaque, cap: provider_mod.Capability) bool {
         return capability.supports(.gemini, cast(ctx).model, cap);

@@ -14,7 +14,7 @@ fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
     const ts = "vendor/tree-sitter";
     mod.addIncludePath(b.path(ts ++ "/runtime/include"));
     mod.addIncludePath(b.path(ts ++ "/runtime/src"));
-    const flags = &[_][]const u8{ "-std=c11", "-fno-sanitize=undefined" };
+    const flags = &[_][]const u8{ "-std=c11", "-D_GNU_SOURCE", "-D_DEFAULT_SOURCE", "-fno-sanitize=undefined" };
     mod.addCSourceFile(.{ .file = b.path(ts ++ "/runtime/src/lib.c"), .flags = flags });
     inline for (grammars.GRAMMARS) |g| {
         mod.addIncludePath(b.path(ts ++ "/grammars/" ++ g.dir ++ "/src"));
@@ -160,7 +160,7 @@ pub fn build(b: *std.Build) void {
     const test_obj = b.addTest(.{
         .name = "cc-test",
         .root_module = test_module,
-        .filters = if (tfilter) |f| &.{f} else &.{},
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     const test_run = b.addRunArtifact(test_obj);
     test_step.dependOn(&test_run.step);
@@ -183,7 +183,11 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         });
-        const t = b.addTest(.{ .name = "spike", .root_module = m });
+        const t = b.addTest(.{
+            .name = "spike",
+            .root_module = m,
+            .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+        });
         spike_step.dependOn(&b.addRunArtifact(t).step);
     }
 
@@ -219,10 +223,13 @@ pub fn build(b: *std.Build) void {
         "tests/component/tool_result_storage_test.zig",
         "tests/component/cache_break_test.zig",
         "tests/component/microcompact_test.zig",
+        "tests/component/goal_state_test.zig",
+        "tests/component/auth_test.zig",
         "tests/component/schema_validation_test.zig",
         "tests/component/tool_schema_coverage_test.zig",
         "tests/component/tool_smoke_test.zig",
         "tests/component/compact_summary_test.zig",
+        "tests/component/auto_compact_request_test.zig",
         "tests/component/render_region_test.zig",
         "tests/component/stream_retry_test.zig",
         "tests/component/ui_state_test.zig",
@@ -266,7 +273,11 @@ pub fn build(b: *std.Build) void {
         m.addImport("harness", harness_mod);
         m.addImport("cc", cc_mod);
         addTreeSitter(b, cc_mod);
-        const t = b.addTest(.{ .name = "integration", .root_module = m });
+        const t = b.addTest(.{
+            .name = "integration",
+            .root_module = m,
+            .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+        });
         const run_t = b.addRunArtifact(t);
         run_t.step.dependOn(b.getInstallStep()); // 确保 mock_mcp_server 被 build
         spike_step.dependOn(&run_t.step);
@@ -296,10 +307,13 @@ pub fn build(b: *std.Build) void {
         "tests/component/tool_result_storage_test.zig",
         "tests/component/cache_break_test.zig",
         "tests/component/microcompact_test.zig",
+        "tests/component/goal_state_test.zig",
+        "tests/component/auth_test.zig",
         "tests/component/schema_validation_test.zig",
         "tests/component/tool_schema_coverage_test.zig",
         "tests/component/tool_smoke_test.zig",
         "tests/component/compact_summary_test.zig",
+        "tests/component/auto_compact_request_test.zig",
         "tests/component/render_region_test.zig",
         "tests/component/stream_retry_test.zig",
         "tests/component/ui_state_test.zig",
@@ -343,7 +357,11 @@ pub fn build(b: *std.Build) void {
         m.addImport("harness", harness_mod);
         m.addImport("cc", cc_mod);
         addTreeSitter(b, cc_mod);
-        const t = b.addTest(.{ .name = "new-l2", .root_module = m });
+        const t = b.addTest(.{
+            .name = "new-l2",
+            .root_module = m,
+            .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+        });
         new_step.dependOn(&b.addRunArtifact(t).step);
     }
 
@@ -377,7 +395,11 @@ pub fn build(b: *std.Build) void {
             m.addImport("harness", harness_mod);
             m.addImport("cc", cc_mod);
             addTreeSitter(b, cc_mod);
-            const t = b.addTest(.{ .name = "mem-l2", .root_module = m });
+            const t = b.addTest(.{
+                .name = "mem-l2",
+                .root_module = m,
+                .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+            });
             mem_step.dependOn(&b.addRunArtifact(t).step);
         }
     }
@@ -393,7 +415,11 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         addTreeSitter(b, m);
-        const t = b.addTest(.{ .name = "ts-l1", .root_module = m });
+        const t = b.addTest(.{
+            .name = "ts-l1",
+            .root_module = m,
+            .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+        });
         ts_step.dependOn(&b.addRunArtifact(t).step);
     }
 

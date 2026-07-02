@@ -289,8 +289,8 @@ test "Skills E2E: ${CLAUDE_SKILL_DIR} resolves to skill source path" {
 
 test "Skills E2E: project root cwd-walking loads .cc-zig/skills in repo root" {
     const a = std.testing.allocator;
-    // 用 cc-t2z 自己 repo
-    const cwd = "/Users/david/prj/cc-t2z/cc-zig";
+    const cwd = try cc.util_fs.getCwd(a);
+    defer a.free(cwd);
     const root = try cc.skills.findRepoRoot(a, cwd);
     defer a.free(root);
     try std.testing.expect(std.mem.endsWith(u8, root, "cc-t2z"));

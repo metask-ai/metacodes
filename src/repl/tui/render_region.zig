@@ -22,6 +22,7 @@ const verbs = @import("verbs.zig");
 const StatusBar = @import("widget/status_bar.zig").StatusBar;
 const util_time = @import("../../util/time.zig");
 const complete = @import("../complete.zig");
+const model_command = @import("../model_command.zig");
 const msg_queue = @import("../msg_queue.zig");
 const agent_tree = @import("widget/agent_tree.zig");
 const agent_job_registry = @import("../../core/agent_job_registry.zig");
@@ -523,8 +524,14 @@ pub const RenderRegion = struct {
         new_rows += 1;
         w.writeAll("\r\n") catch {};
 
+        // -- /models 两级菜单:账号 API key → 该 key 可用模型 --
+        const models_menu_rows = self.drawModelsPickerMenu(w, app, content);
+        new_rows += models_menu_rows;
+        // -- /model 服务端 catalog 菜单(输入 `/model` 后立即在底部显示候选,不等提交)--
+        const model_menu_rows = if (models_menu_rows == 0) self.drawModelCatalogMenu(w, app, content) else 0;
+        new_rows += model_menu_rows;
         // -- slash 命令菜单(`/` 前缀,在下边框与 footer 之间垂直列出)--
-        new_rows += self.drawSlashMenu(w, content);
+        if (models_menu_rows == 0 and model_menu_rows == 0) new_rows += self.drawSlashMenu(w, content);
         // -- @-mention 文件菜单(`@token`,同位置;对齐 cc DIFF#5)--
         new_rows += self.drawAtMenu(w, content, self.input_cursor);
 
@@ -635,6 +642,160 @@ pub const RenderRegion = struct {
             w.writeAll("\r\n") catch {};
             rows += 1;
             match_idx += 1;
+        }
+        return rows;
+    }
+
+    fn drawModelsPickerMenu(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App, content: []const u8) u16 {
+        const trimmed = std.mem.trim(u8, content, " \t\r\n");
+        if (!std.mem.eql(u8, trimmed, "/models") and !std.mem.eql(u8, trimmed, "/model")) return 0;
+        if (app.models_picker_key_index == null) return self.drawApiKeyMenu(w, app);
+        if (app.models_picker_model_index != null) return self.drawReasoningMenu(w, app);
+        return self.drawModelCatalogMenuForTitle(w, app, "Models for selected API key");
+    }
+
+    fn drawReasoningMenu(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App) u16 {
+        const th = self.theme;
+        const entries = app.api_client.catalog.entries.items;
+        const model_idx = app.models_picker_model_index orelse 0;
+        const mask = if (model_idx < entries.len) entries[model_idx].reasoning_mask else 0;
+        var efforts_buf: [5]types.ReasoningEffort = undefined;
+        const efforts = reasoningOptions(mask, &efforts_buf);
+        var rows: u16 = 0;
+
+        w.writeAll(ansi.clear.line) catch {};
+        w.print("  {s}Reasoning effort{s}", .{ th.accent, th.reset }) catch {};
+        if (model_idx < entries.len) {
+            w.print(" {s}for {s}{s}", .{ th.dim, entries[model_idx].model_id, th.reset }) catch {};
+        }
+        w.writeAll("\r\n") catch {};
+        rows += 1;
+
+        const selected_idx = @min(self.ui.slash_sel, efforts.len - 1);
+        for (efforts, 0..) |effort, i| {
+            const selected = i == selected_idx;
+            const color = if (selected) th.accent else th.dim;
+            w.writeAll(ansi.clear.line) catch {};
+            w.print("  {s}{s} {s}{s}", .{ color, if (selected) ">" else " ", effort.name(), th.reset }) catch {};
+            w.writeAll("\r\n") catch {};
+            rows += 1;
+        }
+        return rows;
+    }
+
+    fn drawApiKeyMenu(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App) u16 {
+        const th = self.theme;
+        const entries = app.api_key_catalog.entries.items;
+        var rows: u16 = 0;
+
+        w.writeAll(ansi.clear.line) catch {};
+        w.print("  {s}API keys for this account{s}", .{ th.accent, th.reset }) catch {};
+        if (entries.len > 0) {
+            w.print(" {s}({d}){s}", .{ th.dim, entries.len, th.reset }) catch {};
+        } else {
+            w.print(" {s}(unavailable){s}", .{ th.dim, th.reset }) catch {};
+        }
+        w.writeAll("\r\n") catch {};
+        rows += 1;
+
+        if (entries.len == 0) {
+            w.writeAll(ansi.clear.line) catch {};
+            w.print("  {s}login with OAuth, or set {s} to the account API-key endpoint{s}", .{ th.dim, @import("../../api/api_keys.zig").API_KEYS_URL_ENV, th.reset }) catch {};
+            w.writeAll("\r\n") catch {};
+            return rows + 1;
+        }
+
+        const MAX_ROWS: u16 = @intCast(complete.MODEL_MENU_MAX_ROWS);
+        const selected_idx = @min(self.ui.slash_sel, @min(entries.len, complete.MODEL_MENU_MAX_ROWS) - 1);
+        var shown: u16 = 0;
+        for (entries, 0..) |entry, i| {
+            if (shown >= MAX_ROWS) break;
+            const selected = i == selected_idx;
+            const color = if (selected) th.accent else th.dim;
+            w.writeAll(ansi.clear.line) catch {};
+            w.print("  {s}{s} ", .{ color, if (selected) ">" else " " }) catch {};
+            const reserve = if (entry.group.len > 0) @as(usize, 34) else @as(usize, 28);
+            writeTruncatedWidth(w, entry.label, if (self.cols > reserve) self.cols - reserve else 16);
+            if (entry.group.len > 0) {
+                w.print("{s} {s}[", .{ th.reset, th.dim }) catch {};
+                writeTruncatedWidth(w, entry.group, 24);
+                w.writeAll("]") catch {};
+            }
+            w.print("{s} {s}...{s}{s}", .{ th.reset, th.dim, entry.suffix, th.reset }) catch {};
+            w.writeAll("\r\n") catch {};
+            rows += 1;
+            shown += 1;
+            if (shown == MAX_ROWS and i + 1 < entries.len) {
+                w.writeAll(ansi.clear.line) catch {};
+                w.print("  {s}… +{d} more API keys{s}", .{ th.dim, entries.len - shown, th.reset }) catch {};
+                w.writeAll("\r\n") catch {};
+                rows += 1;
+                break;
+            }
+        }
+        return rows;
+    }
+
+    /// 输入框里正好是 `/model` 时,在下边框与 footer 之间显示启动期从服务端 `/v1/models`
+    /// probe 到的模型列表。这里故意只读 server catalog,不把内置 fallback 伪装成服务端结果。
+    fn drawModelCatalogMenu(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App, content: []const u8) u16 {
+        const trimmed = std.mem.trim(u8, content, " \t\r\n");
+        if (!std.mem.eql(u8, trimmed, "/model")) return 0;
+        return self.drawModelCatalogMenuForTitle(w, app, "Models from server");
+    }
+
+    fn drawModelCatalogMenuForTitle(self: *RenderRegion, w: *std.Io.Writer, app: *const app_mod.App, title: []const u8) u16 {
+        const th = self.theme;
+        const entries = app.api_client.catalog.entries.items;
+        var rows: u16 = 0;
+
+        w.writeAll(ansi.clear.line) catch {};
+        w.print("  {s}{s}{s}", .{ th.accent, title, th.reset }) catch {};
+        if (entries.len > 0) {
+            w.print(" {s}({d}){s}", .{ th.dim, entries.len, th.reset }) catch {};
+        } else {
+            w.print(" {s}(unavailable){s}", .{ th.dim, th.reset }) catch {};
+        }
+        w.writeAll("\r\n") catch {};
+        rows += 1;
+
+        if (entries.len == 0) {
+            w.writeAll(ansi.clear.line) catch {};
+            w.print("  {s}server model list unavailable; press Enter for local model groups{s}", .{ th.dim, th.reset }) catch {};
+            w.writeAll("\r\n") catch {};
+            return rows + 1;
+        }
+
+        const MAX_ROWS: u16 = @intCast(complete.MODEL_MENU_MAX_ROWS);
+        const id_max: usize = if (self.cols > 42) self.cols - 42 else 24;
+        const selected_idx = @min(self.ui.slash_sel, @min(entries.len, complete.MODEL_MENU_MAX_ROWS) - 1);
+        var shown: u16 = 0;
+        for (entries, 0..) |entry, i| {
+            if (shown >= MAX_ROWS) break;
+            const selected = i == selected_idx;
+            const current = std.mem.eql(u8, entry.model_id, app.config.model);
+            const color = if (selected or current) th.accent else th.dim;
+            var caps_buf: [96]u8 = undefined;
+            const caps = capabilityChips(app.config.provider_kind, entry.model_id, &caps_buf);
+
+            w.writeAll(ansi.clear.line) catch {};
+            w.print("  {s}{s}{s} ", .{ color, if (selected) ">" else " ", if (current) "*" else " " }) catch {};
+            writeTruncatedWidth(w, entry.model_id, id_max);
+            w.print("{s} {s}{s}", .{ th.reset, th.dim, model_command.groupForModel(entry.model_id) }) catch {};
+            if (entry.max_input_tokens) |ctx| w.print(" ctx={d}", .{ctx}) catch {};
+            if (entry.max_tokens) |out| w.print(" out={d}", .{out}) catch {};
+            w.print(" {s}{s}", .{ caps, th.reset }) catch {};
+            w.writeAll("\r\n") catch {};
+            rows += 1;
+            shown += 1;
+
+            if (shown == MAX_ROWS and i + 1 < entries.len) {
+                w.writeAll(ansi.clear.line) catch {};
+                w.print("  {s}… +{d} more from server{s}", .{ th.dim, entries.len - shown, th.reset }) catch {};
+                w.writeAll("\r\n") catch {};
+                rows += 1;
+                break;
+            }
         }
         return rows;
     }
@@ -1937,7 +2098,6 @@ fn drawOutputWindow(w: *std.Io.Writer, buf: []const u8, top: usize, view_rows: u
     return drawn;
 }
 
-
 /// TaskTab 文本选择(纯函数,可单测):首个 in_progress 任务的 active_form(无则 subject)。
 /// 无 in_progress → null。
 pub fn taskTabLabel(tasks: *const @import("../../core/task_store.zig").TaskStore) ?[]const u8 {
@@ -1981,6 +2141,47 @@ fn writeTruncatedWidth(w: *std.Io.Writer, s: []const u8, max_w: usize) void {
         vis += cw;
         i = end;
     }
+}
+
+fn capabilityChips(provider: types.ProviderKind, model: []const u8, buf: []u8) []const u8 {
+    var len: usize = 0;
+    appendCapabilityChip(buf, &len, provider, model, .extended_thinking, "think");
+    appendCapabilityChip(buf, &len, provider, model, .structured_output, "json");
+    appendCapabilityChip(buf, &len, provider, model, .web_search, "web");
+    appendCapabilityChip(buf, &len, provider, model, .prompt_cache, "cache");
+    appendCapabilityChip(buf, &len, provider, model, .server_tool, "tool");
+    return if (len == 0) "basic" else buf[0..len];
+}
+
+fn appendCapabilityChip(
+    buf: []u8,
+    len: *usize,
+    provider: types.ProviderKind,
+    model: []const u8,
+    cap: model_command.Capability,
+    label: []const u8,
+) void {
+    if (!model_command.supports(provider, model, cap)) return;
+    const sep: []const u8 = if (len.* == 0) "" else ",";
+    if (len.* + sep.len + label.len > buf.len) return;
+    @memcpy(buf[len.*..][0..sep.len], sep);
+    len.* += sep.len;
+    @memcpy(buf[len.*..][0..label.len], label);
+    len.* += label.len;
+}
+
+fn reasoningOptions(mask: u8, buf: *[5]types.ReasoningEffort) []const types.ReasoningEffort {
+    const catalog = @import("../../api/catalog.zig");
+    const ordered = [_]types.ReasoningEffort{ .low, .medium, .high, .xhigh };
+    buf[0] = .none;
+    var n: usize = 1;
+    for (ordered) |effort| {
+        if ((mask & catalog.reasoningBit(effort)) != 0) {
+            buf[n] = effort;
+            n += 1;
+        }
+    }
+    return buf[0..n];
 }
 
 fn displayWidthUpTo(s: []const u8, byte_off: usize) usize {

@@ -29,6 +29,12 @@ fn rmDir(p: []const u8) void {
     _ = std.c.rmdir(pz);
 }
 
+fn currentProjectRoot(allocator: std.mem.Allocator) ![]u8 {
+    const cwd = try cc.util_fs.getCwd(allocator);
+    defer allocator.free(cwd);
+    return try cc.skills.findRepoRoot(allocator, cwd);
+}
+
 test "Subagents E2E: 3 builtins injected on init" {
     const a = std.testing.allocator;
     var set = cc.agents_set.AgentSet.init(a);
@@ -139,8 +145,10 @@ test "Subagents E2E: buildSubagentContext for Explore skips CLAUDE.md+git" {
 
     const expl = set.find("Explore").?;
     const preload = @import("cc").agents_preload;
+    const project_dir = try currentProjectRoot(a);
+    defer a.free(project_dir);
     const sys = try preload.buildSubagentContext(a, expl, .{
-        .project_dir = "/Users/david/prj/cc-t2z",
+        .project_dir = project_dir,
         .parent_model = "claude-opus-4-7",
         .skip_codebase_context = preload.shouldSkipCodebaseContext(expl.name),
     });
@@ -158,8 +166,10 @@ test "Subagents E2E: buildSubagentContext for general-purpose includes git statu
 
     const gp = set.find("general-purpose").?;
     const preload = @import("cc").agents_preload;
+    const project_dir = try currentProjectRoot(a);
+    defer a.free(project_dir);
     const sys = try preload.buildSubagentContext(a, gp, .{
-        .project_dir = "/Users/david/prj/cc-t2z",
+        .project_dir = project_dir,
         .parent_model = "claude-opus-4-7",
         .skip_codebase_context = preload.shouldSkipCodebaseContext(gp.name),
     });

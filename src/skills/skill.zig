@@ -618,8 +618,10 @@ test "SkillSet: directory name as fallback skill name" {
 
 test "findRepoRoot: detects .git in current or parent" {
     const a = testing.allocator;
-    // 自己 repo 一定能找到
-    const root = try findRepoRoot(a, "/Users/david/prj/cc-t2z/cc-zig");
+    const cwd = try @import("../util/fs.zig").getCwd(a);
+    defer a.free(cwd);
+    // 从当前测试工作目录向上找 repo root,避免绑定开发机绝对路径。
+    const root = try findRepoRoot(a, cwd);
     defer a.free(root);
     try testing.expect(std.mem.endsWith(u8, root, "cc-t2z"));
 }

@@ -9,8 +9,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tty_driver import run
 from asserts import TTYAssert
 
-# 这套二进制用硬编码 token(client.zig ANTHROPIC_AUTH_TOKEN),无需 API key env;
-# 但若想跳过(离线/CI),设 TTY_SKIP_MODEL=1。
+# 这套用例打真实模型，需要 metacodes login 或 METASK_API_KEY；
+# 若想跳过(离线/CI),设 TTY_SKIP_MODEL=1。
 SKIP = os.environ.get("TTY_SKIP_MODEL") == "1"
 
 
@@ -438,5 +438,4 @@ def test_T34_gen_shift_tab_cycles_mode(bin_path):
     )
     if not ok:
         a._fail("生成期 Shift+Tab 未切换权限模式(footer 无 accept edits/plan mode)")
-
 

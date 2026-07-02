@@ -70,11 +70,21 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
     # 离线:跳过启动期 probeModels 网络调用——它在无网/沙箱里会 hang,导致 REPL 永不渲染
     # (实测根因:pty 下 0 字节 = 卡在 probeModels,非 drain 时序)。
     full_env["METACODES_NO_PROBE"] = "1"
+    # Offline UI tests use a dead base_url and never send a real model request.
+    # OAuth removed the old built-in token fallback, so provide a dummy bearer
+    # only for that offline path. Live model tests pass base_url=None and must
+    # keep the user's real env/OAuth credential resolution intact.
+    if base_url:
+        full_env.setdefault("METASK_API_KEY", "tty-dummy-key")
     # HOME 隔离:不读用户真实 ~/.claude / ~/.cc-zig(settings/agents/skills),保证可重复。
     full_env.setdefault("HOME", "/tmp/cc-tty-home")
     os.makedirs(full_env["HOME"], exist_ok=True)
     if env:
-        full_env.update(env)
+        for k, v in env.items():
+            if v is None:
+                full_env.pop(k, None)
+            else:
+                full_env[k] = v
 
     pid, fd = pty.fork()
     if pid == 0:

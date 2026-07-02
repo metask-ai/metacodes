@@ -77,6 +77,7 @@ pub const OpenAIClient = struct {
             .sendFn = &pSend,
             .maxTokensFn = &pMaxTokens,
             .maxInputTokensFn = &pMaxInputTokens,
+            .reasoningEffortFn = &pReasoningEffort,
             .supportsFn = &pSupports,
         };
     }
@@ -91,6 +92,9 @@ pub const OpenAIClient = struct {
     }
     fn pMaxInputTokens(ctx: *anyopaque) u32 {
         return cast(ctx).context_window;
+    }
+    fn pReasoningEffort(_: *anyopaque) ?types.ReasoningEffort {
+        return null;
     }
     fn pSupports(ctx: *anyopaque, cap: provider_mod.Capability) bool {
         return capability.supports(.openai, cast(ctx).model, cap);
@@ -125,8 +129,8 @@ pub const OpenAIClient = struct {
         const rid = log.genRequestId();
         log.infoId("openai", rid, "POST {s} model={s} body_bytes={d} cache_mode={s}", .{ self.base_url, self.model, body.len, cache.modeFor(.openai).label() });
         const uri = std.Uri.parse(self.base_url) catch return error.InvalidUrl;
-        var auth_buf: [256]u8 = undefined;
-        const auth = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{self.api_key}) catch return error.RequestFailed;
+        const auth = std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.api_key}) catch return error.RequestFailed;
+        defer secureFree(self.allocator, auth);
 
         const req_ptr = try self.allocator.create(http.Client.Request);
         errdefer self.allocator.destroy(req_ptr); // 唯一 destroy:所有错误路径靠它(不手动 destroy,否则 double-free)
@@ -165,6 +169,11 @@ pub const OpenAIClient = struct {
         return heap.handle();
     }
 };
+
+fn secureFree(allocator: std.mem.Allocator, buf: []u8) void {
+    @memset(buf, 0);
+    allocator.free(buf);
+}
 
 /// OpenAI 流式响应:持 Response + transfer buffer + 逐行 SSE 解析状态。包成中立 StreamHandle。
 const OpenAIStream = struct {
@@ -247,12 +256,14 @@ const OpenAIStream = struct {
         // cached_tokens→cache_read,经 cache.parseOpenAICacheUsage)。让缓存命中能上抛 UI,与 Anthropic 一致。
         if (std.mem.indexOf(u8, data, "\"usage\"") != null) {
             const cu = cache.parseOpenAICacheUsage(data);
-            return StreamEvent{ .usage = UsageDelta{
-                .input_tokens = util_json.extractIntField(data, "prompt_tokens"),
-                .output_tokens = util_json.extractIntField(data, "completion_tokens"),
-                .cache_read_input_tokens = cu.read_tokens,
-                .cache_creation_input_tokens = cu.creation_tokens, // OpenAI 无写区分 → 0
-            } };
+            return StreamEvent{
+                .usage = UsageDelta{
+                    .input_tokens = util_json.extractIntField(data, "prompt_tokens"),
+                    .output_tokens = util_json.extractIntField(data, "completion_tokens"),
+                    .cache_read_input_tokens = cu.read_tokens,
+                    .cache_creation_input_tokens = cu.creation_tokens, // OpenAI 无写区分 → 0
+                },
+            };
         }
         // finish_reason → StopReason(末 chunk)。
         if (util_json.extractStringField(data, "finish_reason")) |fr| {

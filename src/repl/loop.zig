@@ -32,6 +32,11 @@ const writer_backend_mod = @import("../core/writer_backend.zig");
 const tee_backend_mod = @import("../core/tee_backend.zig");
 const diagnostics_backend_mod = @import("../core/diagnostics_backend.zig");
 const tui_backend_mod = @import("tui/tui_backend.zig");
+const goal_mod = @import("../core/goal.zig");
+const usage_mod = @import("../core/usage.zig");
+const types_mod = @import("../types.zig");
+const util_time = @import("../util/time.zig");
+const model_command = @import("model_command.zig");
 
 /// 把 CoreEvent 的字节写到 std.debug.print(stderr)——非 TTY 交互 / cron / skill 等场景。
 /// 对齐旧 DebugWriter.print 行为。
@@ -78,6 +83,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     while (true) {
         // 检查到期的 cron 任务 —— 把它们的 prompt 作为 user message 注入并跑一轮
         try fireDueCrons(app, allocator, &aux_be);
+
+        if (shouldRunLoopContinuation(app, msg_queue.len())) {
+            try runLoopContinuation(app, allocator, &aux_be);
+            continue;
+        }
 
         // tty:输入框(含状态/footer)由 readLineRaw 内的 RenderRegion 自画(钉底)。
         // 非 tty:保留裸 "> " prompt 供 pipe 模式可读。
@@ -138,6 +148,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                 \\  /resume [id]     List recent sessions, or resume one by id
                 \\  /retry           Resend the last user message
                 \\  /compact         Compact oldest messages when over threshold
+                \\  /goal [cmd]      View/manage the session goal
+                \\  /loop [cmd]      View/control automatic continuation
                 \\  /doctor          Show environment/config diagnostics
                 \\  /config [show|path]  Inspect config (~/.cc-zig/config.json)
                 \\  /init            Analyze the codebase and write CLAUDE.md (model-driven)
@@ -298,6 +310,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             std.debug.print("\x1b[2m[md-test] 注入 1 user + 1 assistant(含 markdown)\x1b[0m\n", .{});
             continue;
         }
+        if (std.c.getenv("METACODES_TEST_HOOKS") != null and std.mem.eql(u8, trimmed, "/compact-stress-test")) {
+            try injectCompactStressHistory(app, allocator);
+            std.debug.print("\x1b[2m[compact-stress-test] injected large history\x1b[0m\n", .{});
+            continue;
+        }
         if (std.mem.eql(u8, trimmed, "/skills")) {
             if (app.skills.len() == 0) {
                 std.debug.print("No skills installed. Put SKILL.md files under ~/.cc-zig/skills/<name>/ or <project>/.cc-zig/skills/<name>/\n", .{});
@@ -319,6 +336,16 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             std.debug.print("Compacted {d} old messages ({d} → {d}).\n", .{ dropped, before, app.conversation.len() });
             continue;
         }
+        if (std.mem.eql(u8, trimmed, "/goal") or std.mem.startsWith(u8, trimmed, "/goal ")) {
+            const rest = std.mem.trim(u8, trimmed[5..], " \t");
+            try handleGoal(app, rest);
+            continue;
+        }
+        if (std.mem.eql(u8, trimmed, "/loop") or std.mem.startsWith(u8, trimmed, "/loop ")) {
+            const rest = std.mem.trim(u8, trimmed[5..], " \t");
+            handleLoop(app, rest);
+            continue;
+        }
         if (std.mem.eql(u8, trimmed, "/retry")) {
             try retryLast(app, allocator, &aux_be);
             continue;
@@ -337,8 +364,12 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             , .{ app.config.model, u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, cost });
             continue;
         }
+        if (std.mem.eql(u8, trimmed, "/models")) {
+            std.debug.print("/models is an interactive picker: choose an API key first, then choose a model. Use /model for text filters.\n", .{});
+            continue;
+        }
         // /model [name] —— 无参列当前 + 可选模型；有参切换
-        if (std.mem.startsWith(u8, trimmed, "/model")) {
+        if (std.mem.eql(u8, trimmed, "/model") or std.mem.startsWith(u8, trimmed, "/model ")) {
             const rest = std.mem.trim(u8, trimmed[6..], " \t");
             try handleModel(app, allocator, rest);
             continue;
@@ -535,6 +566,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         defer if (tui_be != null) {
             app.permission_ctx.ui_requester = null;
         };
+        const usage_before = app.usage;
+        const mode_before = app.permission_ctx.modeValue();
+        const started_ns = util_time.nowNs();
         const result = agent_loop.run(
             &app.conversation,
             app.provider(),
@@ -551,6 +585,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             std.debug.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
             continue;
         };
+        accountGoalUsageAfterRun(app, usage_before, mode_before, started_ns);
         // 停 watcher + 清 stdin 缓冲（生成期间用户可能误按的键，别污染下一轮）
         if (tui_be) |*tb| tb.stopInput();
         if (gen_region) |*r| r.leaveGenerating(app);
@@ -877,6 +912,7 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
     // 重画当前输入框(替代旧 redrawLine):同步 editor 状态 → 重画固定区。
     const redraw = struct {
         fn call(r: *render_region_mod.RenderRegion, ed: *input.LineEditor, a: *app_mod.App) void {
+            if (!complete.modelsMenuOpen(ed.view())) a.models_picker_key_index = null;
             r.setInput(ed.view(), ed.cursor);
             r.render(a);
         }
@@ -1017,6 +1053,114 @@ fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_m
                         try editor.setLine(cmd.name);
                     }
                     region.ui.slash_sel = 0;
+                    region.setInput("", 0);
+                    region.clear();
+                    echoUserSubmission(app, editor.view());
+                    return try allocator.dupe(u8, editor.view());
+                },
+                .model_nav => {
+                    // /model 服务端 catalog 菜单 ↑↓:只在已 probe 到服务端模型时移动选择。
+                    const n = @min(app.api_client.catalog.entries.items.len, complete.MODEL_MENU_MAX_ROWS);
+                    if (n > 0) {
+                        if (region.ui.slash_sel >= n) region.ui.slash_sel = n - 1;
+                        if (eff.at_nav_dir) {
+                            region.ui.slash_sel = (region.ui.slash_sel + 1) % n;
+                        } else {
+                            region.ui.slash_sel = if (region.ui.slash_sel == 0) n - 1 else region.ui.slash_sel - 1;
+                        }
+                    }
+                    redraw(&region, &editor, app);
+                    continue;
+                },
+                .model_complete, .model_select => {
+                    // Tab 填入 `/model use <id>` 继续编辑;Enter 直接提交同一条命令。
+                    const entries = app.api_client.catalog.entries.items;
+                    if (entries.len == 0) {
+                        redraw(&region, &editor, app);
+                        continue;
+                    }
+                    const visible_n = @min(entries.len, complete.MODEL_MENU_MAX_ROWS);
+                    const idx = @min(region.ui.slash_sel, visible_n - 1);
+                    const line = try std.fmt.allocPrint(allocator, "/model use {s}", .{entries[idx].model_id});
+                    defer allocator.free(line);
+                    try editor.setLine(line);
+                    region.ui.slash_sel = 0;
+                    if (eff.action == .model_complete) {
+                        redraw(&region, &editor, app);
+                        continue;
+                    }
+                    region.setInput("", 0);
+                    region.clear();
+                    echoUserSubmission(app, editor.view());
+                    return try allocator.dupe(u8, editor.view());
+                },
+                .models_nav => {
+                    const n = if (app.models_picker_key_index == null)
+                        @min(app.api_key_catalog.entries.items.len, complete.MODEL_MENU_MAX_ROWS)
+                    else if (app.models_picker_model_index == null)
+                        @min(app.api_client.catalog.entries.items.len, complete.MODEL_MENU_MAX_ROWS)
+                    else
+                        reasoningOptionCount(app);
+                    if (n > 0) {
+                        if (region.ui.slash_sel >= n) region.ui.slash_sel = n - 1;
+                        if (eff.at_nav_dir) {
+                            region.ui.slash_sel = (region.ui.slash_sel + 1) % n;
+                        } else {
+                            region.ui.slash_sel = if (region.ui.slash_sel == 0) n - 1 else region.ui.slash_sel - 1;
+                        }
+                    }
+                    redraw(&region, &editor, app);
+                    continue;
+                },
+                .models_select => {
+                    if (app.models_picker_key_index == null) {
+                        const keys = app.api_key_catalog.entries.items;
+                        if (keys.len == 0) {
+                            redraw(&region, &editor, app);
+                            continue;
+                        }
+                        const visible_n = @min(keys.len, complete.MODEL_MENU_MAX_ROWS);
+                        const idx = @min(region.ui.slash_sel, visible_n - 1);
+                        app.selectApiKeyForModels(idx) catch |err| {
+                            region.clear();
+                            std.debug.print("\x1b[31m/model key selection failed: {s}\x1b[0m\n", .{@errorName(err)});
+                        };
+                        app.models_picker_model_index = null;
+                        region.ui.slash_sel = 0;
+                        redraw(&region, &editor, app);
+                        continue;
+                    }
+
+                    if (app.models_picker_model_index == null) {
+                        const entries = app.api_client.catalog.entries.items;
+                        if (entries.len == 0) {
+                            redraw(&region, &editor, app);
+                            continue;
+                        }
+                        const visible_n = @min(entries.len, complete.MODEL_MENU_MAX_ROWS);
+                        const idx = @min(region.ui.slash_sel, visible_n - 1);
+                        app.models_picker_model_index = idx;
+                        region.ui.slash_sel = 0;
+                        redraw(&region, &editor, app);
+                        continue;
+                    }
+
+                    const entries = app.api_client.catalog.entries.items;
+                    const model_idx = app.models_picker_model_index.?;
+                    if (entries.len == 0 or model_idx >= entries.len) {
+                        redraw(&region, &editor, app);
+                        continue;
+                    }
+                    var efforts_buf: [5]types_mod.ReasoningEffort = undefined;
+                    const efforts = reasoningOptionsForMask(entries[model_idx].reasoning_mask, &efforts_buf);
+                    const effort_idx = @min(region.ui.slash_sel, efforts.len - 1);
+                    app.setReasoningEffort(efforts[effort_idx]);
+                    const line = try std.fmt.allocPrint(allocator, "/model use {s}", .{entries[model_idx].model_id});
+                    defer allocator.free(line);
+                    try editor.setLine(line);
+                    region.ui.slash_sel = 0;
+                    app.models_picker_key_index = null;
+                    app.models_picker_model_index = null;
                     region.setInput("", 0);
                     region.clear();
                     echoUserSubmission(app, editor.view());
@@ -1479,6 +1623,9 @@ fn retryLast(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui
     }
 
     const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*jr| jr else null;
+    const usage_before = app.usage;
+    const mode_before = app.permission_ctx.modeValue();
+    const started_ns = util_time.nowNs();
     const result = agent_loop.run(
         &app.conversation,
         app.provider(),
@@ -1491,6 +1638,7 @@ fn retryLast(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui
         std.debug.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
         return;
     };
+    accountGoalUsageAfterRun(app, usage_before, mode_before, started_ns);
     app.persistTranscript();
     if (result.stop_reason == .aborted) {
         std.debug.print("\x1b[33m^C (cancelled)\x1b[0m\n", .{});
@@ -1556,62 +1704,176 @@ const INIT_PROMPT =
     \\and conventions that are NOT obvious from reading a single file. Do not pad it with restated source code.
 ;
 
-/// /model：无参显示当前模型 + 已知候选；有参切换到指定模型并重建 system prompt。
+/// /model：按分组/能力浏览模型，或切换当前 provider 内的模型。
 fn handleModel(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
-    if (rest.len == 0) {
-        std.debug.print("current model: \x1b[36m{s}\x1b[0m\n", .{app.config.model});
-        // 优先列 probe 到的 catalog；为空则列本地已知前缀
-        if (app.api_client.catalog.entries.items.len > 0) {
-            std.debug.print("available (from server):\n", .{});
-            for (app.api_client.catalog.entries.items) |e| {
-                std.debug.print("  {s}  (context={?d} max_output={?d})\n", .{ e.model_id, e.max_input_tokens, e.max_tokens });
+    const candidates = try model_command.collectCandidates(allocator, app.config.provider_kind, app.api_client.catalog.entries.items);
+    defer allocator.free(candidates);
+
+    switch (model_command.parseQuery(rest)) {
+        .list => {
+            printModelList(app, candidates, null, null);
+            return;
+        },
+        .help => {
+            printModelHelp();
+            return;
+        },
+        .group => |group| {
+            if (group.len == 0) {
+                std.debug.print("usage: /model group <anthropic|opus|sonnet|haiku|openai|gemini>\n", .{});
+                return;
             }
+            printModelList(app, candidates, group, null);
+            return;
+        },
+        .capability => |cap| {
+            printModelList(app, candidates, null, cap);
+            return;
+        },
+        .unknown => |value| {
+            std.debug.print("\x1b[31munknown /model selector: {s}\x1b[0m\n", .{value});
+            printModelHelp();
+            return;
+        },
+        .use_model => |target_raw| {
+            if (target_raw.len == 0) {
+                std.debug.print("usage: /model use <model-id>\n", .{});
+                return;
+            }
+            const resolved = @import("../tools/agent.zig").resolveModelAlias(target_raw);
+            try switchModel(app, allocator, candidates, resolved);
+            return;
+        },
+    }
+}
+
+fn printModelHelp() void {
+    std.debug.print(
+        \\usage:
+        \\  /model
+        \\  /model group <anthropic|opus|sonnet|haiku|openai|gemini>
+        \\  /model capability <web_search|thinking|prompt_cache|structured_output|server_tool>
+        \\  /model use <model-id>
+        \\  /model <model-id>
+        \\
+        \\Model switching is limited to the provider selected at startup. Start with
+        \\--model gpt-... or --model gemini-... to use another provider family.
+        \\
+    , .{});
+}
+
+fn printModelList(
+    app: *app_mod.App,
+    candidates: []const model_command.Candidate,
+    group_filter: ?[]const u8,
+    cap_filter: ?model_command.Capability,
+) void {
+    std.debug.print("current model: \x1b[36m{s}\x1b[0m  provider={s}\n", .{ app.config.model, @tagName(app.config.provider_kind) });
+    if (group_filter) |g| std.debug.print("filter group: {s}\n", .{g});
+    if (cap_filter) |cap| std.debug.print("filter capability: {s}\n", .{model_command.capabilityLabel(cap)});
+
+    var listed: usize = 0;
+    var last_group: []const u8 = "";
+    for (candidates) |c| {
+        if (group_filter) |g| if (!model_command.matchesGroup(c, g)) continue;
+        if (cap_filter) |cap| if (!model_command.supports(c.provider, c.id, cap)) continue;
+        if (!std.mem.eql(u8, last_group, c.group)) {
+            last_group = c.group;
+            std.debug.print("\n{s}:\n", .{c.group});
+        }
+        printModelCandidate(c, std.mem.eql(u8, c.id, app.config.model));
+        listed += 1;
+    }
+
+    if (listed == 0) {
+        std.debug.print("  no models match this selector for provider {s}\n", .{@tagName(app.config.provider_kind)});
+    }
+    std.debug.print("\nusage: /model use <model-id>  |  /model group <name>  |  /model capability <name>\n", .{});
+}
+
+fn printModelCandidate(c: model_command.Candidate, current: bool) void {
+    if (current) {
+        std.debug.print("  \x1b[36m*{s}\x1b[0m", .{c.id});
+    } else {
+        std.debug.print("   {s}", .{c.id});
+    }
+    std.debug.print("  [{s}/{s} {s}]", .{ @tagName(c.provider), c.group, @tagName(c.source) });
+    if (c.max_input_tokens) |v| std.debug.print(" context={d}", .{v});
+    if (c.max_tokens) |v| std.debug.print(" max_output={d}", .{v});
+    std.debug.print(" capabilities=", .{});
+    printCapabilities(c.provider, c.id);
+    std.debug.print("\n", .{});
+}
+
+fn reasoningOptionsForMask(mask: u8, buf: *[5]types_mod.ReasoningEffort) []const types_mod.ReasoningEffort {
+    const catalog = @import("../api/catalog.zig");
+    const ordered = [_]types_mod.ReasoningEffort{ .low, .medium, .high, .xhigh };
+    buf[0] = .none;
+    var n: usize = 1;
+    for (ordered) |effort| {
+        if ((mask & catalog.reasoningBit(effort)) != 0) {
+            buf[n] = effort;
+            n += 1;
+        }
+    }
+    return buf[0..n];
+}
+
+fn reasoningOptionCount(app: *const app_mod.App) usize {
+    const idx = app.models_picker_model_index orelse return 0;
+    if (idx >= app.api_client.catalog.entries.items.len) return 0;
+    var buf: [5]types_mod.ReasoningEffort = undefined;
+    return reasoningOptionsForMask(app.api_client.catalog.entries.items[idx].reasoning_mask, &buf).len;
+}
+
+fn printCapabilities(provider: types_mod.ProviderKind, model: []const u8) void {
+    const caps = [_]model_command.Capability{ .web_search, .server_tool, .extended_thinking, .prompt_cache, .structured_output };
+    var first = true;
+    for (caps) |cap| {
+        if (!model_command.supports(provider, model, cap)) continue;
+        if (!first) std.debug.print(",", .{});
+        std.debug.print("{s}", .{model_command.capabilityLabel(cap)});
+        first = false;
+    }
+    if (first) std.debug.print("none", .{});
+}
+
+fn switchModel(
+    app: *app_mod.App,
+    allocator: std.mem.Allocator,
+    candidates: []const model_command.Candidate,
+    model: []const u8,
+) !void {
+    _ = allocator;
+    if (!model_command.canUseInCurrentProvider(app.config.provider_kind, candidates, model)) {
+        if (model_command.providerForModel(model)) |p| {
+            std.debug.print(
+                "\x1b[31mrefused: {s} belongs to provider {s}, but this session is {s}\x1b[0m\n",
+                .{ model, @tagName(p), @tagName(app.config.provider_kind) },
+            );
         } else {
-            std.debug.print("known model families:\n", .{});
-            std.debug.print("  claude-opus-4-7 / claude-opus-4-6 / claude-opus-4-5\n", .{});
-            std.debug.print("  claude-sonnet-4-6 / claude-sonnet-4\n", .{});
-            std.debug.print("  claude-haiku-4-5\n", .{});
+            std.debug.print("\x1b[31mrefused: unknown model id '{s}'\x1b[0m\n", .{model});
         }
-        std.debug.print("usage: /model <model-id>\n", .{});
+        std.debug.print("Start a new session with --model <id> to switch provider families.\n", .{});
         return;
     }
 
-    // 基本校验：必须像一个 claude 模型 id（避免手滑切到无效值导致 401/404 满屏）。
-    // 若 catalog 非空，也接受 catalog 里出现过的 id。
-    const in_catalog = blk: {
-        for (app.api_client.catalog.entries.items) |e| {
-            if (std.mem.eql(u8, e.model_id, rest)) break :blk true;
-        }
-        break :blk false;
+    app.switchModel(model) catch |err| {
+        std.debug.print("\x1b[33mwarn: model sync failed ({s})\x1b[0m\n", .{@errorName(err)});
+        return;
     };
-    if (!in_catalog and !std.mem.startsWith(u8, rest, "claude-")) {
-        std.debug.print("\x1b[31mrefused: '{s}' doesn't look like a model id (expected 'claude-...')\x1b[0m\n", .{rest});
-        return;
-    }
+    app.persistLoginSelection();
 
-    const new_model = try allocator.dupe(u8, rest);
-    app.config.model = new_model;
-    app.api_client.model = new_model;
-
-    // 重建 system prompt（含 knowledge cutoff、模型名）。失败保留旧的。
-    // 用 buildFull 透传 enabled_tool_names + memdir_abs,与 App.init 一致(否则 /model 后
-    // 丢失 # Using your tools 动态裁剪 + # Memory 段)。
-    const sp_mod = @import("../core/system_prompt.zig");
-    if (sp_mod.buildFull(allocator, new_model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs)) |sp| {
-        if (app.system_prompt) |old| allocator.free(old);
-        app.system_prompt = sp;
-    } else |err| {
-        std.debug.print("\x1b[33mwarn: system prompt rebuild failed ({s}); kept previous\x1b[0m\n", .{@errorName(err)});
-    }
-
-    std.debug.print("switched to \x1b[36m{s}\x1b[0m (max_output={d})\n", .{ new_model, app.api_client.resolveMaxTokens() });
+    std.debug.print("switched to \x1b[36m{s}\x1b[0m", .{app.config.model});
+    if (app.config.reasoning_effort) |effort| std.debug.print(" reasoning={s}", .{effort.name()});
+    std.debug.print(" (max_output={d})\n", .{app.provider().maxTokens()});
 }
 
 fn handleDoctor(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     std.debug.print("\x1b[1mcc-zig doctor\x1b[0m\n", .{});
     std.debug.print("  model:            {s}\n", .{app.config.model});
     std.debug.print("  permission mode:  {s}\n", .{@tagName(app.permission_ctx.modeValue())});
-    std.debug.print("  api key:          {s}\n", .{if (app.api_key.len > 0) "set" else "MISSING"});
+    std.debug.print("  auth token:       {s}\n", .{if (app.api_key.len > 0) "set" else "MISSING"});
     std.debug.print("  max_tokens cfg:   {any}\n", .{app.config.max_tokens});
     std.debug.print("  verbose:          {}\n", .{app.config.verbose});
     std.debug.print("  transcript:       {s}\n", .{if (app.transcript_writer != null) "on" else "OFF"});
@@ -1634,6 +1896,16 @@ fn handleDoctor(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         std.debug.print("  CWD:              {s}\n", .{cwd});
     } else |_| {
         std.debug.print("  CWD:              (unreadable)\n", .{});
+    }
+}
+
+fn injectCompactStressHistory(app: *app_mod.App, allocator: std.mem.Allocator) !void {
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        const text = try allocator.alloc(u8, 12_000);
+        defer allocator.free(text);
+        @memset(text, 'x');
+        try app.conversation.appendText(if (i % 2 == 0) .user else .assistant, text);
     }
 }
 
@@ -1681,6 +1953,298 @@ fn handleConfigCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
         return;
     }
     std.debug.print("usage: /config [show|path]\n", .{});
+}
+
+pub const GoalCommand = union(enum) {
+    view: void,
+    help: void,
+    clear: void,
+    set: []const u8,
+    edit: []const u8,
+    budget: ?u64,
+    pause: void,
+    resume_goal: void,
+    complete: void,
+    blocked: void,
+    invalid: void,
+};
+
+pub fn parseGoalCommand(rest_raw: []const u8) GoalCommand {
+    const rest = std.mem.trim(u8, rest_raw, " \t");
+    if (rest.len == 0 or std.mem.eql(u8, rest, "view") or std.mem.eql(u8, rest, "status")) return .{ .view = {} };
+    if (std.mem.eql(u8, rest, "help")) return .{ .help = {} };
+    if (std.mem.eql(u8, rest, "clear")) return .{ .clear = {} };
+    if (std.mem.startsWith(u8, rest, "set ")) return .{ .set = std.mem.trim(u8, rest[4..], " \t") };
+    if (std.mem.startsWith(u8, rest, "edit ")) return .{ .edit = std.mem.trim(u8, rest[5..], " \t") };
+    if (std.mem.startsWith(u8, rest, "budget ")) {
+        const arg = std.mem.trim(u8, rest[7..], " \t");
+        if (std.mem.eql(u8, arg, "none") or std.mem.eql(u8, arg, "clear")) return .{ .budget = null };
+        const budget = std.fmt.parseInt(u64, arg, 10) catch return .{ .invalid = {} };
+        return .{ .budget = budget };
+    }
+    if (std.mem.eql(u8, rest, "pause")) return .{ .pause = {} };
+    if (std.mem.eql(u8, rest, "resume")) return .{ .resume_goal = {} };
+    if (std.mem.eql(u8, rest, "complete")) return .{ .complete = {} };
+    if (std.mem.eql(u8, rest, "blocked") or std.mem.eql(u8, rest, "block")) return .{ .blocked = {} };
+    return .{ .invalid = {} };
+}
+
+fn handleGoal(app: *app_mod.App, rest: []const u8) !void {
+    switch (parseGoalCommand(rest)) {
+        .view => {
+            printGoal(app);
+            return;
+        },
+        .help => {
+            printGoalHelp();
+            return;
+        },
+        .clear => {
+            app.goal_state.clearInMemory();
+            app.persistGoal();
+            std.debug.print("Goal cleared.\n", .{});
+            return;
+        },
+        .set => |objective| {
+            app.goal_state.setNew(objective, null) catch |err| {
+                printGoalError(err);
+                return;
+            };
+            app.persistGoal();
+            std.debug.print("Goal set.\n", .{});
+            printGoal(app);
+            return;
+        },
+        .edit => |objective| {
+            app.goal_state.editObjective(objective) catch |err| {
+                printGoalError(err);
+                return;
+            };
+            app.persistGoal();
+            std.debug.print("Goal updated.\n", .{});
+            printGoal(app);
+            return;
+        },
+        .budget => |budget| {
+            app.goal_state.setBudget(budget) catch |err| {
+                printGoalError(err);
+                return;
+            };
+            app.persistGoal();
+            printGoal(app);
+            return;
+        },
+        .pause => {
+            try setGoalStatus(app, .paused);
+            return;
+        },
+        .resume_goal => {
+            try setGoalStatus(app, .active);
+            return;
+        },
+        .complete => {
+            try setGoalStatus(app, .complete);
+            return;
+        },
+        .blocked => {
+            try setGoalStatus(app, .blocked);
+            return;
+        },
+        .invalid => {},
+    }
+    std.debug.print("usage: /goal [view|set <objective>|edit <objective>|budget <tokens|none>|pause|resume|complete|blocked|clear]\n", .{});
+}
+
+fn setGoalStatus(app: *app_mod.App, status: goal_mod.Status) !void {
+    app.goal_state.setStatus(status) catch |err| {
+        printGoalError(err);
+        return;
+    };
+    app.persistGoal();
+    printGoal(app);
+}
+
+fn printGoal(app: *const app_mod.App) void {
+    const g = app.goal_state.current orelse {
+        std.debug.print("No goal set. Use /goal set <objective>.\n", .{});
+        return;
+    };
+    std.debug.print("\x1b[1mGoal\x1b[0m [{s}]\n", .{@tagName(g.status)});
+    std.debug.print("  id:      {s}\n", .{g.id[0..]});
+    std.debug.print("  target:  {s}\n", .{g.objective});
+    if (g.token_budget) |budget| {
+        const remaining: u64 = if (g.tokens_used >= budget) 0 else budget - g.tokens_used;
+        std.debug.print("  budget:  {d} tokens ({d} used, {d} left)\n", .{ budget, g.tokens_used, remaining });
+    } else {
+        std.debug.print("  budget:  none ({d} tokens used)\n", .{g.tokens_used});
+    }
+}
+
+fn printGoalHelp() void {
+    std.debug.print(
+        \\Goal commands:
+        \\  /goal                         Show current goal
+        \\  /goal set <objective>         Create or replace the session goal
+        \\  /goal edit <objective>        Edit the current objective
+        \\  /goal budget <tokens|none>    Set or clear token budget
+        \\  /goal pause|resume            Pause or resume continuation eligibility
+        \\  /goal complete|blocked        Mark final status
+        \\  /goal clear                   Remove the goal
+        \\
+    , .{});
+}
+
+fn printGoalError(err: anyerror) void {
+    const msg = switch (err) {
+        error.EmptyObjective => "empty objective",
+        error.NoGoal => "no goal set",
+        error.InvalidBudget => "invalid budget",
+        else => @errorName(err),
+    };
+    std.debug.print("\x1b[31m/goal failed: {s}\x1b[0m\n", .{msg});
+}
+
+pub const LoopCommand = union(enum) {
+    status: void,
+    off: void,
+    on: u32,
+    invalid: void,
+};
+
+pub fn parseLoopCommand(rest_raw: []const u8) LoopCommand {
+    const rest = std.mem.trim(u8, rest_raw, " \t");
+    if (rest.len == 0 or std.mem.eql(u8, rest, "status")) return .{ .status = {} };
+    if (std.mem.eql(u8, rest, "off") or std.mem.eql(u8, rest, "stop")) return .{ .off = {} };
+    if (std.mem.eql(u8, rest, "on") or std.mem.startsWith(u8, rest, "on ")) {
+        const n_raw = if (rest.len > 2) std.mem.trim(u8, rest[2..], " \t") else "";
+        const n = if (n_raw.len == 0) @as(u32, 10) else std.fmt.parseInt(u32, n_raw, 10) catch return .{ .invalid = {} };
+        if (n == 0) return .{ .invalid = {} };
+        return .{ .on = n };
+    }
+    return .{ .invalid = {} };
+}
+
+fn handleLoop(app: *app_mod.App, rest: []const u8) void {
+    switch (parseLoopCommand(rest)) {
+        .status => {
+            printLoopStatus(app);
+            return;
+        },
+        .off => {
+            app.loop_enabled = false;
+            app.loop_remaining = 0;
+            std.debug.print("Loop continuation stopped.\n", .{});
+            return;
+        },
+        .on => |n| {
+            if (app.goal_state.current == null) {
+                std.debug.print("Set a goal first: /goal set <objective>\n", .{});
+                return;
+            }
+            if (app.goal_state.current.?.status != .active) {
+                std.debug.print("Goal must be active before loop continuation can start.\n", .{});
+                return;
+            }
+            app.loop_enabled = true;
+            app.loop_remaining = n;
+            printLoopStatus(app);
+            return;
+        },
+        .invalid => {},
+    }
+    std.debug.print("usage: /loop [status|on [max-continuations]|off]\n", .{});
+}
+
+fn printLoopStatus(app: *const app_mod.App) void {
+    std.debug.print("Loop continuation: {s}", .{if (app.loop_enabled) "on" else "off"});
+    if (app.loop_enabled) std.debug.print(" ({d} remaining)", .{app.loop_remaining});
+    std.debug.print("\n", .{});
+    if (app.goal_state.current) |g| {
+        std.debug.print("Goal status: {s}\n", .{@tagName(g.status)});
+    } else {
+        std.debug.print("No goal set.\n", .{});
+    }
+}
+
+fn shouldRunLoopContinuation(app: *const app_mod.App, queued_count: usize) bool {
+    const goal_status = if (app.goal_state.current) |g| g.status else null;
+    return shouldRunLoopContinuationInput(.{
+        .loop_enabled = app.loop_enabled,
+        .loop_remaining = app.loop_remaining,
+        .queued_count = queued_count,
+        .goal_status = goal_status,
+        .permission_mode = app.permission_ctx.modeValue(),
+        .aborted = app.abort.isAborted(),
+    });
+}
+
+fn runLoopContinuation(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui_backend_mod.UiBackend) !void {
+    const g = app.goal_state.current orelse return;
+    if (app.loop_remaining > 0) app.loop_remaining -= 1;
+    const prompt = try std.fmt.allocPrint(
+        allocator,
+        "<system-reminder>Continue working toward the active goal. Goal: {s}. If the goal appears complete or genuinely blocked, say that explicitly in your response so the user can mark it with /goal complete or /goal blocked. Slash commands are user input controls; do not claim you executed one. Do not start unrelated work.</system-reminder>",
+        .{g.objective},
+    );
+    defer allocator.free(prompt);
+    std.debug.print("\x1b[2m[loop continuation: {d} remaining]\x1b[0m\n", .{app.loop_remaining});
+    try runInjectedAgentWithSynthetic(app, allocator, backend, prompt);
+    if (app.loop_remaining == 0) {
+        app.loop_enabled = false;
+        std.debug.print("\x1b[2m[loop continuation stopped: limit reached]\x1b[0m\n", .{});
+    }
+}
+
+pub const LoopGateInput = struct {
+    loop_enabled: bool,
+    loop_remaining: u32,
+    queued_count: usize,
+    goal_status: ?goal_mod.Status,
+    permission_mode: types_mod.PermissionMode,
+    aborted: bool,
+};
+
+pub fn shouldRunLoopContinuationInput(input_state: LoopGateInput) bool {
+    if (!input_state.loop_enabled or input_state.loop_remaining == 0) return false;
+    if (input_state.queued_count > 0) return false;
+    const status = input_state.goal_status orelse return false;
+    if (status != .active) return false;
+    if (input_state.permission_mode == .plan) return false;
+    if (input_state.aborted) return false;
+    return true;
+}
+
+fn accountGoalUsageAfterRun(app: *app_mod.App, before: usage_mod.UsageTotals, mode_before: types_mod.PermissionMode, started_ns: util_time.Nanos) void {
+    if (mode_before == .plan) return;
+    if (app.goal_state.current == null) return;
+    const delta = goalBudgetTokenDelta(before, app.usage);
+    const elapsed_ms = elapsedSinceMs(started_ns);
+    if (delta == 0 and elapsed_ms == 0) return;
+    const id = app.goal_state.current.?.id;
+    app.goal_state.accountProgress(delta, elapsed_ms, id[0..]) catch |err| {
+        @import("../util/log.zig").warn("goal", "usage accounting failed: {s}", .{@errorName(err)});
+        return;
+    };
+    app.persistGoal();
+    if (app.goal_state.current) |g| {
+        if (g.status == .budget_limited) {
+            app.loop_enabled = false;
+            app.loop_remaining = 0;
+            std.debug.print("\x1b[2m[goal budget reached]\x1b[0m\n", .{});
+        }
+    }
+}
+
+fn goalBudgetTokenDelta(before: usage_mod.UsageTotals, after: usage_mod.UsageTotals) u64 {
+    const input_delta = after.input_tokens -| before.input_tokens;
+    const output_delta = after.output_tokens -| before.output_tokens;
+    return input_delta +| output_delta;
+}
+
+fn elapsedSinceMs(started_ns: util_time.Nanos) u64 {
+    const now = util_time.nowNs();
+    if (now <= started_ns) return 0;
+    return @intCast(@divTrunc(now - started_ns, std.time.ns_per_ms));
 }
 
 /// 把当前 conversation 拍平成纯文本(role: text),用于 /btw /recap 的上下文喂养。
@@ -2060,7 +2624,6 @@ fn shellQuoteSingle(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-
 /// 用户显式 /<skill-name> [args] 调用。
 /// 返回 true 表示已处理(skill 命中或不存在但语法看起来像 skill 名);
 /// false 表示不是 skill 调用,继续走普通用户消息。
@@ -2249,8 +2812,6 @@ fn externalEdit(allocator: std.mem.Allocator, current: []const u8) ![]u8 {
 }
 
 /// 杀所有 running 后台任务,返回杀掉的数量。
-
-
 /// 停止选中 agent(registry.kill)。region.ui.agents.sel 是 1-based agent index。
 fn stopSelectedAgent(app: *app_mod.App, region: *render_region_mod.RenderRegion) !void {
     const reg = app.agentJobsPtr() orelse return;
@@ -2373,20 +2934,28 @@ fn fireDueCrons(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const
 
 /// 把预置 prompt 注入为 user message 后触发一次 agent_loop 执行。
 fn runInjectedAgent(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui_backend_mod.UiBackend) !void {
+    return runInjectedAgentWithSynthetic(app, allocator, backend, null);
+}
+
+fn runInjectedAgentWithSynthetic(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui_backend_mod.UiBackend, synthetic_user_input: ?[]const u8) !void {
     const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*jr| jr else null;
     // 辅助路径(skill 调用 / cron 注入),非用户盯着的主交互循环 → 不接 spawn_tick_fn(默认 null,Bash 长命令静默,故意不传非遗漏)。
+    const usage_before = app.usage;
+    const mode_before = app.permission_ctx.modeValue();
+    const started_ns = util_time.nowNs();
     const result = agent_loop.run(
         &app.conversation,
         app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = synthetic_user_input, .dyn_registry = &app.dyn_registry },
         backend,
         allocator,
     ) catch |err| {
         std.debug.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
         return;
     };
+    accountGoalUsageAfterRun(app, usage_before, mode_before, started_ns);
     app.persistTranscript();
     if (result.stop_reason == .aborted) {
         std.debug.print("\x1b[33m^C (cancelled)\x1b[0m\n", .{});
@@ -2488,6 +3057,111 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     staged_owned_here = false; // ownership 已转移给 app.conversation
     if (app.transcript_writer) |*w| w.deinit();
     app.transcript_writer = new_writer;
+    app.loadGoalFromSessionDir(path);
 
     std.debug.print("Resumed session ({d} messages). Continue by sending a message.\n", .{app.conversation.len()});
+}
+
+test "/loop gate: requires active goal, no queued input, non-plan mode, non-aborted run" {
+    const base = LoopGateInput{
+        .loop_enabled = true,
+        .loop_remaining = 3,
+        .queued_count = 0,
+        .goal_status = .active,
+        .permission_mode = .default,
+        .aborted = false,
+    };
+    try std.testing.expect(shouldRunLoopContinuationInput(base));
+
+    var no_goal = base;
+    no_goal.goal_status = null;
+    try std.testing.expect(!shouldRunLoopContinuationInput(no_goal));
+
+    var paused = base;
+    paused.goal_status = .paused;
+    try std.testing.expect(!shouldRunLoopContinuationInput(paused));
+
+    var completed_goal = base;
+    completed_goal.goal_status = .complete;
+    try std.testing.expect(!shouldRunLoopContinuationInput(completed_goal));
+
+    var queued = base;
+    queued.queued_count = 1;
+    try std.testing.expect(!shouldRunLoopContinuationInput(queued));
+
+    var plan = base;
+    plan.permission_mode = .plan;
+    try std.testing.expect(!shouldRunLoopContinuationInput(plan));
+
+    var aborted = base;
+    aborted.aborted = true;
+    try std.testing.expect(!shouldRunLoopContinuationInput(aborted));
+
+    var exhausted = base;
+    exhausted.loop_remaining = 0;
+    try std.testing.expect(!shouldRunLoopContinuationInput(exhausted));
+}
+
+test "/goal command parser covers user input command surface" {
+    try std.testing.expectEqual(@as(std.meta.Tag(GoalCommand), .view), std.meta.activeTag(parseGoalCommand("")));
+    try std.testing.expectEqual(@as(std.meta.Tag(GoalCommand), .view), std.meta.activeTag(parseGoalCommand("status")));
+    try std.testing.expectEqual(@as(std.meta.Tag(GoalCommand), .help), std.meta.activeTag(parseGoalCommand("help")));
+    try std.testing.expectEqual(@as(std.meta.Tag(GoalCommand), .clear), std.meta.activeTag(parseGoalCommand("clear")));
+
+    const set_cmd = parseGoalCommand("set   ship oauth");
+    try std.testing.expectEqual(@as(std.meta.Tag(GoalCommand), .set), std.meta.activeTag(set_cmd));
+    try std.testing.expectEqualStrings("ship oauth", set_cmd.set);
+
+    const edit_cmd = parseGoalCommand("edit revised goal ");
+    try std.testing.expectEqual(@as(std.meta.Tag(GoalCommand), .edit), std.meta.activeTag(edit_cmd));
+    try std.testing.expectEqualStrings("revised goal", edit_cmd.edit);
+
+    const budget_cmd = parseGoalCommand("budget 123");
+    try std.testing.expectEqual(@as(std.meta.Tag(GoalCommand), .budget), std.meta.activeTag(budget_cmd));
+    try std.testing.expectEqual(@as(?u64, 123), budget_cmd.budget);
+
+    const clear_budget = parseGoalCommand("budget none");
+    try std.testing.expectEqual(@as(std.meta.Tag(GoalCommand), .budget), std.meta.activeTag(clear_budget));
+    try std.testing.expectEqual(@as(?u64, null), clear_budget.budget);
+
+    try std.testing.expectEqual(@as(std.meta.Tag(GoalCommand), .pause), std.meta.activeTag(parseGoalCommand("pause")));
+    try std.testing.expectEqual(@as(std.meta.Tag(GoalCommand), .resume_goal), std.meta.activeTag(parseGoalCommand("resume")));
+    try std.testing.expectEqual(@as(std.meta.Tag(GoalCommand), .complete), std.meta.activeTag(parseGoalCommand("complete")));
+    try std.testing.expectEqual(@as(std.meta.Tag(GoalCommand), .blocked), std.meta.activeTag(parseGoalCommand("block")));
+    try std.testing.expectEqual(@as(std.meta.Tag(GoalCommand), .invalid), std.meta.activeTag(parseGoalCommand("budget nope")));
+}
+
+test "/loop command parser covers user input command surface" {
+    try std.testing.expectEqual(@as(std.meta.Tag(LoopCommand), .status), std.meta.activeTag(parseLoopCommand("")));
+    try std.testing.expectEqual(@as(std.meta.Tag(LoopCommand), .status), std.meta.activeTag(parseLoopCommand("status")));
+    try std.testing.expectEqual(@as(std.meta.Tag(LoopCommand), .off), std.meta.activeTag(parseLoopCommand("off")));
+    try std.testing.expectEqual(@as(std.meta.Tag(LoopCommand), .off), std.meta.activeTag(parseLoopCommand("stop")));
+
+    const on_default = parseLoopCommand("on");
+    try std.testing.expectEqual(@as(std.meta.Tag(LoopCommand), .on), std.meta.activeTag(on_default));
+    try std.testing.expectEqual(@as(u32, 10), on_default.on);
+
+    const on_limited = parseLoopCommand("on 3");
+    try std.testing.expectEqual(@as(std.meta.Tag(LoopCommand), .on), std.meta.activeTag(on_limited));
+    try std.testing.expectEqual(@as(u32, 3), on_limited.on);
+
+    try std.testing.expectEqual(@as(std.meta.Tag(LoopCommand), .invalid), std.meta.activeTag(parseLoopCommand("on 0")));
+    try std.testing.expectEqual(@as(std.meta.Tag(LoopCommand), .invalid), std.meta.activeTag(parseLoopCommand("on nope")));
+    try std.testing.expectEqual(@as(std.meta.Tag(LoopCommand), .invalid), std.meta.activeTag(parseLoopCommand("forever")));
+}
+
+test "/goal accounting delta charges only input plus output usage" {
+    const before = usage_mod.UsageTotals{
+        .input_tokens = 10,
+        .output_tokens = 20,
+        .cache_read_input_tokens = 100,
+        .cache_creation_input_tokens = 200,
+    };
+    const after = usage_mod.UsageTotals{
+        .input_tokens = 15,
+        .output_tokens = 27,
+        .cache_read_input_tokens = 999,
+        .cache_creation_input_tokens = 999,
+    };
+    try std.testing.expectEqual(@as(u64, 12), goalBudgetTokenDelta(before, after));
 }

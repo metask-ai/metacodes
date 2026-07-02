@@ -13,6 +13,7 @@ pub const MessagesRequest = struct {
     stream: bool = false,
     tools: ?[]const ToolDefinition = null,
     tool_choice: ?ToolChoice = null,
+    reasoning_effort: ?types.ReasoningEffort = null,
     /// Prompt caching：顶层 cache_control 自动缓存"最后一个可缓存 block"——
     /// 在常见用法下（稳定的 system + tools + 变化的 conversation）会把 tools + system
     /// 一起写 cache。后续请求只要 prefix（tools + system）字节相同就 read cache，
@@ -123,6 +124,15 @@ pub fn serializeMessagesRequest(req: MessagesRequest, allocator: std.mem.Allocat
             try util_json.serializeString(n, &result, allocator);
         }
         try result.append(allocator, '}');
+    }
+
+    if (req.reasoning_effort) |effort| {
+        if (effort.active()) {
+            try result.appendSlice(allocator, ",\"output_config\":{\"effort\":");
+            try util_json.serializeString(effort.name(), &result, allocator);
+            try result.append(allocator, '}');
+            try result.appendSlice(allocator, ",\"thinking\":{\"type\":\"adaptive\"}");
+        }
     }
 
     if (req.cache_control) |cc| {
@@ -447,7 +457,6 @@ test "serializeOneTool: 嵌套 PropSpec(array-of-object + object_props)递归输
     // options 不再是被当字符串数组(无 items:{"type":"string"} 在 options 位置)。
 }
 
-
 test "serializeMessagesRequest with stream=true" {
     const msg = types.ApiMessage{ .role = .user, .content = &.{.{ .text = "hi" }} };
     const req = MessagesRequest{ .model = "m", .messages = &.{msg}, .stream = true };
@@ -587,6 +596,15 @@ test "serializeMessagesRequest no cache_control when disabled" {
     const body = try serializeMessagesRequest(req, std.testing.allocator);
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "cache_control") == null);
+}
+
+test "serializeMessagesRequest with reasoning effort emits output_config and adaptive thinking" {
+    const msg = types.ApiMessage{ .role = .user, .content = &.{.{ .text = "hi" }} };
+    const req = MessagesRequest{ .model = "m", .messages = &.{msg}, .reasoning_effort = .high };
+    const body = try serializeMessagesRequest(req, std.testing.allocator);
+    defer std.testing.allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"output_config\":{\"effort\":\"high\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"adaptive\"}") != null);
 }
 
 test "serializeInputSchema emits empty properties for zero-arg tool" {

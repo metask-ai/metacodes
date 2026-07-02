@@ -23,6 +23,7 @@ const std = @import("std");
 const json_mod = @import("../json.zig");
 const model_fallback = @import("../util/model.zig");
 const log = @import("../util/log.zig");
+const types = @import("../types.zig");
 
 pub const Catalog = struct {
     allocator: std.mem.Allocator,
@@ -35,6 +36,11 @@ pub const Catalog = struct {
         // null = 后端未给该字段 → 查询时各自走 fallback，互不牵连。
         max_tokens: ?u32, // 单次请求可生成的 output tokens 上限
         max_input_tokens: ?u32, // context window（input 上限）
+        reasoning_mask: u8 = 0,
+
+        pub fn supportsReasoning(self: Entry, effort: types.ReasoningEffort) bool {
+            return (self.reasoning_mask & reasoningBit(effort)) != 0;
+        }
     };
 
     pub fn init(allocator: std.mem.Allocator) Catalog {
@@ -62,7 +68,7 @@ pub const Catalog = struct {
 
         var pos: usize = 1; // 跳开头 '['
         while (pos < data_arr.len) {
-            while (pos < data_arr.len and (data_arr[pos] == ' ' or data_arr[pos] == ',')) : (pos += 1) {}
+            while (pos < data_arr.len and (isJsonWs(data_arr[pos]) or data_arr[pos] == ',')) : (pos += 1) {}
             if (pos >= data_arr.len or data_arr[pos] != '{') break;
             const obj_end = findObjectEnd(data_arr, pos) orelse break;
             const obj = data_arr[pos..obj_end];
@@ -74,6 +80,7 @@ pub const Catalog = struct {
             // /v1/models 文档示例里 max_input_tokens 常为占位 0 的情况)。
             const mt = nonZero(extractUintField(obj, "max_tokens"));
             const mit = nonZero(extractUintField(obj, "max_input_tokens"));
+            const reasoning_mask = extractReasoningMask(obj);
 
             const id_owned = try self.allocator.dupe(u8, id);
             errdefer self.allocator.free(id_owned);
@@ -81,6 +88,7 @@ pub const Catalog = struct {
                 .model_id = id_owned,
                 .max_tokens = mt,
                 .max_input_tokens = mit,
+                .reasoning_mask = reasoning_mask,
             });
             log.debug("catalog", "model {s}: max_tokens={?d} max_input_tokens={?d}", .{ id, mt, mit });
         }
@@ -113,7 +121,39 @@ pub const Catalog = struct {
         }
         return 200_000;
     }
+
+    pub fn reasoningMaskFor(self: *const Catalog, model: []const u8) u8 {
+        for (self.entries.items) |e| {
+            if (std.mem.eql(u8, e.model_id, model)) return e.reasoning_mask;
+        }
+        return 0;
+    }
 };
+
+pub fn reasoningBit(effort: types.ReasoningEffort) u8 {
+    return switch (effort) {
+        .none => 1 << 0,
+        .minimal => 1 << 1,
+        .low => 1 << 2,
+        .medium => 1 << 3,
+        .high => 1 << 4,
+        .xhigh => 1 << 5,
+    };
+}
+
+pub fn defaultReasoningForMask(mask: u8) ?types.ReasoningEffort {
+    const ordered = [_]types.ReasoningEffort{ .low, .medium, .high, .xhigh };
+    var supported: [4]types.ReasoningEffort = undefined;
+    var n: usize = 0;
+    for (ordered) |effort| {
+        if ((mask & reasoningBit(effort)) != 0) {
+            supported[n] = effort;
+            n += 1;
+        }
+    }
+    if (n == 0) return null;
+    return supported[(n - 1) / 2];
+}
 
 /// 把解析结果归一成 `?u32`：缺失或 0(占位值)→ null；超 u32 上限 → 饱和到 maxInt(u32)。
 /// 后端用 0 占位的数值字段不应被当成有效值(对齐 Anthropic 官方 /v1/models 示例)。
@@ -125,19 +165,28 @@ fn nonZero(v: ?u64) ?u32 {
     return null;
 }
 
+fn extractReasoningMask(obj: []const u8) u8 {
+    const caps = findObjectField(obj, "capabilities") orelse return 0;
+    const effort = findObjectField(caps, "effort") orelse return 0;
+    var mask: u8 = 0;
+    if (capSupported(effort, "low")) mask |= reasoningBit(.low);
+    if (capSupported(effort, "medium")) mask |= reasoningBit(.medium);
+    if (capSupported(effort, "high")) mask |= reasoningBit(.high);
+    if (capSupported(effort, "max")) mask |= reasoningBit(.xhigh);
+    if (capSupported(effort, "xhigh")) mask |= reasoningBit(.xhigh);
+    return mask;
+}
+
+fn capSupported(effort_obj: []const u8, name: []const u8) bool {
+    const cap = findObjectField(effort_obj, name) orelse return false;
+    return std.mem.indexOf(u8, cap, "\"supported\":true") != null or
+        std.mem.indexOf(u8, cap, "\"supported\": true") != null;
+}
+
 // --- JSON 辅助 ---
 
 fn findObjectField(data: []const u8, field: []const u8) ?[]const u8 {
-    var buf: [256]u8 = undefined;
-    if (field.len > 200) return null;
-    buf[0] = '"';
-    @memcpy(buf[1..][0..field.len], field);
-    buf[1 + field.len] = '"';
-    buf[2 + field.len] = ':';
-    const pat = buf[0 .. 3 + field.len];
-    const idx = std.mem.indexOf(u8, data, pat) orelse return null;
-    var pos = idx + pat.len;
-    while (pos < data.len and data[pos] == ' ') : (pos += 1) {}
+    const pos = findFieldValueStart(data, field) orelse return null;
     if (pos >= data.len) return null;
     const open = data[pos];
     const close: u8 = switch (open) {
@@ -204,16 +253,9 @@ fn findObjectEnd(data: []const u8, start: usize) ?usize {
 }
 
 fn extractStringField(data: []const u8, field: []const u8) ?[]const u8 {
-    var buf: [256]u8 = undefined;
-    if (field.len > 200) return null;
-    buf[0] = '"';
-    @memcpy(buf[1..][0..field.len], field);
-    buf[1 + field.len] = '"';
-    buf[2 + field.len] = ':';
-    buf[3 + field.len] = '"';
-    const pat = buf[0 .. 4 + field.len];
-    const idx = std.mem.indexOf(u8, data, pat) orelse return null;
-    const s = idx + pat.len;
+    var s = findFieldValueStart(data, field) orelse return null;
+    if (s >= data.len or data[s] != '"') return null;
+    s += 1;
     var e = s;
     while (e < data.len) : (e += 1) {
         if (data[e] == '"' and data[e - 1] != '\\') break;
@@ -222,20 +264,50 @@ fn extractStringField(data: []const u8, field: []const u8) ?[]const u8 {
 }
 
 fn extractUintField(data: []const u8, field: []const u8) ?u64 {
+    const start = findFieldValueStart(data, field) orelse return null;
+    var end = start;
+    while (end < data.len and data[end] >= '0' and data[end] <= '9') : (end += 1) {}
+    if (end == start) return null;
+    return std.fmt.parseInt(u64, data[start..end], 10) catch null;
+}
+
+fn findFieldValueStart(data: []const u8, field: []const u8) ?usize {
     var buf: [256]u8 = undefined;
     if (field.len > 200) return null;
     buf[0] = '"';
     @memcpy(buf[1..][0..field.len], field);
     buf[1 + field.len] = '"';
-    buf[2 + field.len] = ':';
-    const pat = buf[0 .. 3 + field.len];
+    const pat = buf[0 .. 2 + field.len];
     const idx = std.mem.indexOf(u8, data, pat) orelse return null;
-    var start = idx + pat.len;
-    while (start < data.len and data[start] == ' ') : (start += 1) {}
-    var end = start;
-    while (end < data.len and data[end] >= '0' and data[end] <= '9') : (end += 1) {}
-    if (end == start) return null;
-    return std.fmt.parseInt(u64, data[start..end], 10) catch null;
+    var pos = idx + pat.len;
+    while (pos < data.len and isJsonWs(data[pos])) : (pos += 1) {}
+    if (pos >= data.len or data[pos] != ':') return null;
+    pos += 1;
+    while (pos < data.len and isJsonWs(data[pos])) : (pos += 1) {}
+    return pos;
+}
+
+fn isJsonWs(c: u8) bool {
+    return switch (c) {
+        ' ', '\t', '\r', '\n' => true,
+        else => false,
+    };
+}
+
+test "catalog parses model list with JSON whitespace" {
+    var c = Catalog.init(std.testing.allocator);
+    defer c.deinit();
+    try c.loadFromModelsListJson(
+        \\{
+        \\  "data": [
+        \\    { "id": "claude-dev-sonnet-20260702", "max_tokens": 8192, "max_input_tokens": 200000 }
+        \\  ]
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 1), c.entries.items.len);
+    try std.testing.expectEqualStrings("claude-dev-sonnet-20260702", c.entries.items[0].model_id);
+    try std.testing.expectEqual(@as(?u32, 8192), c.entries.items[0].max_tokens);
+    try std.testing.expectEqual(@as(?u32, 200000), c.entries.items[0].max_input_tokens);
 }
 
 // ============================================================================
@@ -245,7 +317,7 @@ fn extractUintField(data: []const u8, field: []const u8) ?u64 {
 const testing = std.testing;
 
 test "Catalog: loadFromModelsListJson with sglang-proxy format" {
-    // 紧凑 JSON（不带空格/换行）—— findObjectField/extractUintField 不处理中间空白
+    // 紧凑 JSON 是 sglang-proxy 常见返回格式。
     const sample = "{\"data\":[{\"id\":\"claude-sonnet-4-6\",\"type\":\"model\",\"max_tokens\":64000,\"display_name\":\"Sonnet 4.6\"},{\"id\":\"claude-opus-4-6\",\"type\":\"model\",\"max_tokens\":128000,\"display_name\":\"Opus\"}],\"has_more\":false}";
     var c = Catalog.init(testing.allocator);
     defer c.deinit();

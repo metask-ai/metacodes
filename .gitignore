@@ -5,3 +5,5 @@ zig-out/
 # e2e 测试产物(真实模型跑出的临时项目 + 日志)
 tests/e2e/runs/
 bin/
+__pycache__/
+*.pyc

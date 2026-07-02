@@ -283,6 +283,29 @@ pub const AgentJobRegistry = struct {
         };
     }
 
+    /// Update the default parent model used for subsequently spawned agent
+    /// jobs. Already-running jobs own their own Client/model copies.
+    pub fn setModel(self: *AgentJobRegistry, model: []const u8) !void {
+        const model_owned = try self.allocator.dupe(u8, model);
+        self.listLock();
+        defer self.listUnlock();
+        const old = self.model;
+        self.model = model_owned;
+        self.allocator.free(old);
+    }
+
+    /// Update the API key used for subsequently spawned agent jobs.
+    /// Already-running jobs own their Client copies and are left untouched.
+    pub fn setApiKey(self: *AgentJobRegistry, api_key: []const u8) !void {
+        const key_owned = try self.allocator.dupe(u8, api_key);
+        self.listLock();
+        defer self.listUnlock();
+        const old = self.api_key;
+        self.api_key = key_owned;
+        @memset(old, 0);
+        self.allocator.free(old);
+    }
+
     fn listLock(self: *AgentJobRegistry) void {
         _ = std.c.pthread_mutex_lock(&self.list_mutex);
     }
@@ -861,6 +884,15 @@ fn jobThreadMain(input: *JobInput) void {
 }
 
 const testing = std.testing;
+
+test "AgentJobRegistry setModel updates future clients" {
+    var reg = try AgentJobRegistry.init(testing.allocator, "test-key", "http://127.0.0.1:1", "old-model");
+    defer reg.deinit();
+    try reg.setModel("new-model");
+    var owned = try reg.makeClient();
+    defer owned.deinit();
+    try testing.expectEqualStrings("new-model", owned.client.model);
+}
 
 test "JobEntry backend 消费 CoreEvent.progress 实时回写 tool_calls(L1:#6 进度=事件)" {
     // #6 修复:执行中进度必须实时回写 tool_calls,否则 subagent 树恒显 `· 0 tools ·`。

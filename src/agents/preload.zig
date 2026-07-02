@@ -232,9 +232,13 @@ test "buildSubagentContext: skip_codebase_context omits CLAUDE.md/git" {
     const a = testing.allocator;
     var d = try parseAgentMd(a, "---\nname: Explore\ndescription: x\n---\nbody\n", "/x", .builtin);
     defer d.deinit(a);
+    const cwd = try @import("../util/fs.zig").getCwd(a);
+    defer a.free(cwd);
+    const project_dir = try @import("../skills/skill.zig").findRepoRoot(a, cwd);
+    defer a.free(project_dir);
 
     const ctx = try buildSubagentContext(a, &d, .{
-        .project_dir = "/Users/david/prj/cc-t2z", // 真存在的 repo,有 CLAUDE.md
+        .project_dir = project_dir,
         .skip_codebase_context = true,
     });
     defer a.free(ctx);

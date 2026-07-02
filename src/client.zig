@@ -14,7 +14,6 @@ pub const VERSION = "0.1.0";
 /// (thunk 转调 + StreamResponse.handle() 中立化)。P1 起 agent_loop 等收 Provider 类型。
 pub const AnthropicProvider = provider_mod.Provider;
 pub const ANTHROPIC_API_URL = "https://napi.metask-ai.com/v1/messages";
-pub const ANTHROPIC_AUTH_TOKEN = "";
 
 /// HTTP 请求结果
 const RequestResult = union(enum) {
@@ -134,6 +133,7 @@ pub const Client = struct {
     model_context: ?*const @import("app/model_context.zig").ModelContext = null,
     /// 用户 CLI `--max-tokens N` 覆盖；null = 自动（catalog → fallback table → default）。
     max_tokens_override: ?u32 = null,
+    reasoning_effort: ?types.ReasoningEffort = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, model: []const u8) Client {
         return initWithBaseUrl(allocator, io, api_key, model, null);
@@ -174,6 +174,7 @@ pub const Client = struct {
             .sendFn = &pSend,
             .maxTokensFn = &pMaxTokens,
             .maxInputTokensFn = &pMaxInputTokens,
+            .reasoningEffortFn = &pReasoningEffort,
             .supportsFn = &pSupports,
         };
     }
@@ -209,6 +210,9 @@ pub const Client = struct {
     }
     fn pMaxInputTokens(ctx: *anyopaque) u32 {
         return asClient(ctx).resolveMaxInputTokens();
+    }
+    fn pReasoningEffort(ctx: *anyopaque) ?types.ReasoningEffort {
+        return asClient(ctx).reasoning_effort;
     }
     fn pSupports(ctx: *anyopaque, cap: provider_mod.Capability) bool {
         // P2:走 capability 表(单一真相源),按当前 model 真判, 不再恒 true stub。
@@ -262,8 +266,8 @@ pub const Client = struct {
 
         const uri = std.Uri.parse(url) catch return error.InvalidUrl;
 
-        var auth_header_buf: [256]u8 = undefined;
-        const auth_header = std.fmt.bufPrint(&auth_header_buf, "Bearer {s}", .{client.api_key}) catch return error.RequestFailed;
+        const auth_header = std.fmt.allocPrint(client.allocator, "Bearer {s}", .{client.api_key}) catch return error.RequestFailed;
+        defer secureFree(client.allocator, auth_header);
 
         var req = client.http_client.request(.GET, uri, .{
             .extra_headers = &.{
@@ -297,6 +301,7 @@ pub const Client = struct {
             .system = system,
             .stream = false,
             .tools = tools,
+            .reasoning_effort = client.reasoning_effort,
         }, client.allocator);
         defer client.allocator.free(req_body);
 
@@ -354,6 +359,7 @@ pub const Client = struct {
             .stream = true,
             .tools = tools,
             .tool_choice = tool_choice,
+            .reasoning_effort = client.reasoning_effort,
         }, client.allocator);
         // doRequest 内部 sendBodyComplete 是同步全发,返回后 body 即可释放(stream/error 都)。
         defer client.allocator.free(req_body);
@@ -428,12 +434,13 @@ pub const Client = struct {
             return error.InvalidUrl;
         };
 
-        // 构建 authorization header
-        var auth_header_buf: [128]u8 = undefined;
-        const auth_header = std.fmt.bufPrint(&auth_header_buf, "Bearer {s}", .{client.api_key}) catch {
-            log.errId("client", rid, "auth header buffer too small", .{});
+        // OAuth access tokens can be longer than a small stack buffer. Allocate
+        // the header value and scrub it after request setup.
+        const auth_header = std.fmt.allocPrint(client.allocator, "Bearer {s}", .{client.api_key}) catch {
+            log.errId("client", rid, "alloc auth header failed", .{});
             return error.RequestFailed;
         };
+        defer secureFree(client.allocator, auth_header);
 
         // Request 必须 heap-allocate：Response 内含 *Request，生命周期要覆盖 stream
         // 读取过程。若放栈上，doRequest 返回后 *Request 悬挂 → stream.next() 踩到
@@ -543,6 +550,11 @@ pub const Client = struct {
         return RequestResult{ .full_body = .{ .body = response_body, .id = rid } };
     }
 };
+
+fn secureFree(allocator: std.mem.Allocator, buf: []u8) void {
+    @memset(buf, 0);
+    allocator.free(buf);
+}
 
 /// 毫秒时间戳（monotonic），用于测量请求延迟。失败返 0。
 fn timestampMs() u64 {

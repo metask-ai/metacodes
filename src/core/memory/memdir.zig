@@ -13,6 +13,7 @@
 //! 否则 `~/.cc-zig/projects/<hash>/memory-evil` 或 `..` 穿越能骗过前缀匹配 → 任意写洞。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const transcript = @import("../transcript.zig");
 
 /// MEMORY.md 索引上限(对齐 cc MAX_ENTRYPOINT_LINES / MAX_ENTRYPOINT_BYTES)。
@@ -136,6 +137,13 @@ fn isSymlink(path: []const u8) bool {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
+    if (builtin.os.tag == .linux) {
+        var stx: std.os.linux.Statx = undefined;
+        const flags: u32 = std.os.linux.AT.SYMLINK_NOFOLLOW;
+        const rc = std.os.linux.statx(std.os.linux.AT.FDCWD, @ptrCast(&buf), flags, .{ .TYPE = true }, &stx);
+        if (@as(isize, @bitCast(rc)) < 0) return false;
+        return (stx.mode & std.os.linux.S.IFMT) == std.os.linux.S.IFLNK;
+    }
     var st: std.c.Stat = undefined;
     if (lstat(@ptrCast(&buf), &st) != 0) return false;
     return (st.mode & std.c.S.IFMT) == std.c.S.IFLNK;

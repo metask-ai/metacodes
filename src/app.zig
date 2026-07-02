@@ -8,6 +8,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 const client_mod = @import("client.zig");
+const api_keys_mod = @import("api/api_keys.zig");
 const openai_mod = @import("api/openai_client.zig");
 const gemini_mod = @import("api/gemini_client.zig");
 const provider_mod = @import("api/provider.zig");
@@ -33,6 +34,7 @@ const ActiveSkillState = @import("skills/active.zig").ActiveSkillState;
 const AgentSet = @import("agents/set.zig").AgentSet;
 const WorktreeEntry = @import("tools/worktree.zig").WorktreeEntry;
 const CronRegistry = @import("core/cron_registry.zig").CronRegistry;
+const GoalState = @import("core/goal.zig").State;
 
 /// 跨 turn 累加的 token 计数。L1:类型下沉到 core/usage.zig(usage 走 CoreEvent 总线后
 /// 需 core 可引用);app 只 re-export,行为不变(app.usage / costUsd / 各 UI 读法照旧)。
@@ -53,6 +55,11 @@ pub const App = struct {
     allocator: std.mem.Allocator,
     config: types.Config,
     api_key: []const u8,
+    oauth_token_for_catalog: ?[]u8 = null,
+    selected_api_key_owned: ?[]u8 = null,
+    api_key_catalog: api_keys_mod.Catalog,
+    models_picker_key_index: ?usize = null,
+    models_picker_model_index: ?usize = null,
     // ── 会话身份(M6)──────────────────────────────────────────────────────
     /// 本 App 实例的会话标识。**cc-zig 的多 Session 模型 = 多个 App 实例,各为一个
     /// SessionContext(见下分区注释),共享一个进程。**
@@ -140,6 +147,12 @@ pub const App = struct {
     memdir_abs: []u8 = &.{},
     /// 模型长任务 scratchpad（Task* 工具共享）
     tasks: TaskStore,
+    /// Session-scoped objective state for /goal and /loop.
+    goal_state: GoalState,
+    /// User-controlled automatic continuation. /loop on sets enabled + remaining budget;
+    /// the REPL starts continuations only from idle boundaries via agent_loop.run().
+    loop_enabled: bool = false,
+    loop_remaining: u32 = 0,
     /// 预构造的 system prompt（app 启动时一次性 build）。null = build 失败时降级为无 prompt。
     system_prompt: ?[]u8 = null,
     /// 首条 user-context message(CLAUDE.md 链 + AutoMem + currentDate,`<system-reminder>` 包裹)。
@@ -185,6 +198,7 @@ pub const App = struct {
             .allocator = allocator,
             .config = config,
             .api_key = api_key,
+            .api_key_catalog = api_keys_mod.Catalog.init(allocator),
             .session_id = @import("core/session_id.zig").gen(), // 本会话身份(路由用)
             .conversation = Conversation.init(allocator),
             .api_client = client_mod.Client.initWithBaseUrl(allocator, io, api_key, config.model, config.base_url),
@@ -196,6 +210,9 @@ pub const App = struct {
             .read_state = ReadState.init(allocator),
             .edit_hl_cache = @import("core/edit_hl_cache.zig").EditHlCache.init(allocator),
             .tasks = TaskStore.init(allocator),
+            .goal_state = GoalState.init(allocator),
+            .loop_enabled = false,
+            .loop_remaining = 0,
             .dyn_registry = DynRegistry.init(allocator),
             .mcp_sessions = .empty,
             .agents = AgentSet.init(allocator),
@@ -300,12 +317,15 @@ pub const App = struct {
         // (用真 key),必须跳过。openai 的 context_window 走 OpenAIClient 自己的硬编码值。
         if (config.provider_kind == .anthropic) {
             if (std.c.getenv("METACODES_NO_PROBE") == null) {
+                app.oauth_token_for_catalog = @import("core/auth.zig").resolveStoredOAuthBearer(allocator) catch null;
+                app.probeApiKeys();
                 app.api_client.probeModels();
             } else {
                 @import("util/log.zig").debug("catalog", "probeModels skipped (METACODES_NO_PROBE)", .{});
             }
             // CLI --max-tokens 覆盖(仅作用于 anthropic api_client)
             app.api_client.setMaxTokensOverride(config.max_tokens);
+            app.api_client.reasoning_effort = config.reasoning_effort;
         } else {
             @import("util/log.zig").debug("catalog", "probeModels skipped (provider={s})", .{@tagName(config.provider_kind)});
         }
@@ -340,14 +360,14 @@ pub const App = struct {
 
         // 初始化后台 subagent registry（Task run_in_background）。每个 job 内部自建
         // 专属 Client（指向同 endpoint），故这里只需 api_key/base_url/model。
-        app.agent_jobs = @import("core/agent_job_registry.zig").AgentJobRegistry.init(allocator, api_key, config.base_url, config.model) catch |err| blk: {
+        app.agent_jobs = @import("core/agent_job_registry.zig").AgentJobRegistry.init(allocator, app.api_key, config.base_url, app.config.model) catch |err| blk: {
             @import("util/log.zig").warn("agent", "agent_jobs registry init failed: {s}", .{@errorName(err)});
             break :blk null;
         };
 
         // 构造 system prompt（依赖 config.model）。# Using your tools 段按 enabled_tool_names
         // 动态裁剪（对应 cc getUsingYourToolsSection(enabledTools)）。失败仅 log，保持 null。
-        app.system_prompt = system_prompt_mod.buildFull(allocator, config.model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs) catch |err| blk: {
+        app.system_prompt = system_prompt_mod.buildFull(allocator, app.config.model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs) catch |err| blk: {
             @import("util/log.zig").warn("sysprompt", "build failed: {s} (continuing without system prompt)", .{@errorName(err)});
             break :blk null;
         };
@@ -392,6 +412,15 @@ pub const App = struct {
         if (app.agent_jobs) |*aj| aj.deinit();
         if (app.transcript_writer) |*w| w.deinit();
         app.api_client.deinit();
+        if (app.oauth_token_for_catalog) |tok| {
+            @memset(tok, 0);
+            app.allocator.free(tok);
+        }
+        app.api_key_catalog.deinit();
+        if (app.selected_api_key_owned) |k| {
+            @memset(k, 0);
+            app.allocator.free(k);
+        }
         if (app.openai_client) |*oc| oc.deinit();
         if (app.gemini_client) |*gc| gc.deinit();
         app.conversation.deinit();
@@ -400,6 +429,7 @@ pub const App = struct {
         app.read_state.deinit();
         app.edit_hl_cache.deinit();
         app.tasks.deinit();
+        app.goal_state.deinit();
         // MCP：先 session（释放 binding 内存）再 client（关 transport + reap 子进程）
         for (app.mcp_sessions.items) |*entry| {
             entry.session.deinit();
@@ -437,6 +467,89 @@ pub const App = struct {
         app.allocator.destroy(app);
     }
 
+    pub fn probeApiKeys(app: *App) void {
+        if (app.config.provider_kind != .anthropic) return;
+        const bearer = app.oauth_token_for_catalog orelse app.api_key;
+        api_keys_mod.fetchInto(&app.api_key_catalog, app.allocator, app.api_client.http_client.io, app.api_client.base_url, bearer) catch |err| {
+            @import("util/log.zig").debug("auth", "api key list probe failed: {s}", .{@errorName(err)});
+        };
+        if (app.api_key_catalog.entries.items.len == 0) {
+            app.api_key_catalog.addCurrentKeyFallback(app.api_key) catch |err| {
+                @import("util/log.zig").debug("auth", "current API key fallback unavailable: {s}", .{@errorName(err)});
+            };
+        }
+    }
+
+    pub fn selectApiKeyForModels(app: *App, idx: usize) !void {
+        if (idx >= app.api_key_catalog.entries.items.len) return error.InvalidApiKeySelection;
+        const secret = app.api_key_catalog.entries.items[idx].secret;
+        const owned = try app.allocator.dupe(u8, secret);
+        errdefer {
+            @memset(owned, 0);
+            app.allocator.free(owned);
+        }
+        if (app.selected_api_key_owned) |old| {
+            @memset(old, 0);
+            app.allocator.free(old);
+        }
+        app.selected_api_key_owned = owned;
+        app.api_key = owned;
+        app.api_client.api_key = owned;
+        if (app.openai_client) |*oc| oc.api_key = owned;
+        if (app.gemini_client) |*gc| gc.api_key = owned;
+        if (app.agent_jobs) |*aj| try aj.setApiKey(owned);
+
+        app.api_client.catalog.deinit();
+        app.api_client.catalog = @import("api/catalog.zig").Catalog.init(app.allocator);
+        app.api_client.probeModels();
+        app.models_picker_key_index = idx;
+    }
+
+    pub fn switchModel(app: *App, model_id: []const u8) !void {
+        const model = try app.allocator.dupe(u8, model_id);
+        app.config.model = model;
+        app.api_client.model = model;
+        if (app.openai_client) |*oc| oc.model = model;
+        if (app.gemini_client) |*gc| gc.model = model;
+        if (app.transcript_writer) |*w| w.model = model;
+        if (app.agent_jobs) |*aj| try aj.setModel(model);
+        const sp_mod = @import("core/system_prompt.zig");
+        if (sp_mod.buildFull(app.allocator, model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs)) |sp| {
+            if (app.system_prompt) |old| app.allocator.free(old);
+            app.system_prompt = sp;
+        } else |_| {}
+    }
+
+    pub fn setReasoningEffort(app: *App, effort: types.ReasoningEffort) void {
+        app.config.reasoning_effort = effort;
+        app.api_client.reasoning_effort = effort;
+    }
+
+    pub fn persistLoginSelection(app: *App) void {
+        const auth_mod = @import("core/auth.zig");
+        var stored = auth_mod.loadDefault(app.allocator) catch |err| switch (err) {
+            error.NotFound, error.NoHome => auth_mod.StoredCredentials{},
+            else => {
+                @import("util/log.zig").warn("auth", "load for selection persist failed: {s}", .{@errorName(err)});
+                return;
+            },
+        };
+        defer stored.deinit(app.allocator);
+        if (app.selected_api_key_owned) |k| {
+            if (stored.api_key) |old| {
+                @memset(old, 0);
+                app.allocator.free(old);
+            }
+            stored.api_key = app.allocator.dupe(u8, k) catch return;
+        }
+        if (stored.selected_model) |old| app.allocator.free(old);
+        stored.selected_model = app.allocator.dupe(u8, app.config.model) catch return;
+        stored.reasoning_effort = app.config.reasoning_effort;
+        auth_mod.saveDefault(app.allocator, stored) catch |err| {
+            @import("util/log.zig").warn("auth", "persist selection failed: {s}", .{@errorName(err)});
+        };
+    }
+
     fn initTranscriptWriter(app: *App) !void {
         // HOME
         const home_z = std.c.getenv("HOME") orelse return error.NoHome;
@@ -453,6 +566,25 @@ pub const App = struct {
     /// Agent loop 每轮结束后调用一次，把 conversation 新增的 message 刷到 transcript。
     pub fn persistTranscript(app: *App) void {
         if (app.transcript_writer) |*w| w.flush(&app.conversation);
+    }
+
+    /// Persist the current /goal state into the active session directory.
+    pub fn persistGoal(app: *App) void {
+        const dir = app.sessionDir() orelse return;
+        app.goal_state.persistToDir(dir) catch |err| {
+            @import("util/log.zig").warn("goal", "persist failed: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Load /goal state from a session directory. Missing goal.json means no active goal.
+    pub fn loadGoalFromSessionDir(app: *App, dir: []const u8) void {
+        app.goal_state.loadFromDir(dir) catch |err| switch (err) {
+            error.NotFound => app.goal_state.clearInMemory(),
+            else => {
+                @import("util/log.zig").warn("goal", "load failed: {s}", .{@errorName(err)});
+                app.goal_state.clearInMemory();
+            },
+        };
     }
 
     /// 当前 session 目录(transcript.jsonl / suspend.json 所在)。无 writer → null。

@@ -162,6 +162,34 @@ fn dispatchKey(state: *UiState, key: input.Key) Effect {
         return .{ .redraw_region = true };
     }
 
+    // ── /models 两级账号 API key / model 菜单导航。必须先于普通 slash 菜单。
+    {
+        const gen_models = state.phase == .generating;
+        if (!gen_models and complete.modelsMenuOpen(state.editor.view)) {
+            switch (key) {
+                .down => return .{ .action = .models_nav, .at_nav_dir = true },
+                .up => return .{ .action = .models_nav, .at_nav_dir = false },
+                .enter => return .{ .action = .models_select },
+                else => {},
+            }
+        }
+    }
+
+    // ── /model 服务端 catalog 菜单导航。必须先于普通 slash 菜单,否则 `/model`
+    // 会被当成单个 slash command,方向键无法选择模型。
+    {
+        const gen0 = state.phase == .generating;
+        if (!gen0 and complete.modelMenuOpen(state.editor.view)) {
+            switch (key) {
+                .down => return .{ .action = .model_nav, .at_nav_dir = true },
+                .up => return .{ .action = .model_nav, .at_nav_dir = false },
+                .enter => return .{ .action = .model_select },
+                .tab => return .{ .action = .model_complete },
+                else => {},
+            }
+        }
+    }
+
     // ── slash 菜单导航(对齐 cc DIFF#4:`/` 菜单 ↑↓ 移高亮 + Enter 选中 + Tab 补全)──────
     // 仅输入期 + 菜单开(`/` 前缀无空格且有匹配)时介入,抢 ↑↓/Enter/Tab 语义;
     // 否则这些键照常走历史导航/提交/补全。菜单关时 slash_sel 恒 0(下方非 `/` 态会重置)。
