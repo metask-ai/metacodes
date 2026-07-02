@@ -9,6 +9,20 @@
 const std = @import("std");
 const msg = @import("message.zig");
 
+pub const TOOL_RESULT_CLEARED_STUB = "[tool result cleared to save context]";
+pub const TOOL_RESULT_CONTEXT_MIN_BYTES: usize = 8 * 1024;
+pub const TOOL_RESULT_CONTEXT_MAX_BYTES: usize = 64 * 1024;
+pub const TOOL_RESULT_CONTEXT_WINDOW_DIVISOR: usize = 16;
+pub const DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP: usize = 2;
+
+pub fn toolResultContextBytes(max_input_tokens: usize) usize {
+    const derived = if (max_input_tokens == 0)
+        TOOL_RESULT_CONTEXT_MIN_BYTES
+    else
+        max_input_tokens / TOOL_RESULT_CONTEXT_WINDOW_DIVISOR;
+    return @min(@max(derived, TOOL_RESULT_CONTEXT_MIN_BYTES), TOOL_RESULT_CONTEXT_MAX_BYTES);
+}
+
 pub const Conversation = struct {
     allocator: std.mem.Allocator,
     messages: std.ArrayList(msg.Message),
@@ -119,6 +133,8 @@ pub const Conversation = struct {
         if (total < 4) return 0;
 
         const drop_count = total / 2;
+        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
         var i: usize = 0;
         while (i < drop_count) : (i += 1) {
             const m = self.messages.orderedRemove(0);
@@ -136,6 +152,8 @@ pub const Conversation = struct {
     pub fn compactKeepRecent(self: *Conversation, keep_n: usize) usize {
         const drop_count = self.compactBoundary(keep_n);
         if (drop_count == 0) return 0;
+        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
         var i: usize = 0;
         while (i < drop_count) : (i += 1) {
             const m = self.messages.orderedRemove(0);
@@ -171,13 +189,62 @@ pub const Conversation = struct {
         ctx: anytype,
         comptime summarize_fn: fn (@TypeOf(ctx), []const msg.Message) ?[]u8,
     ) !usize {
-        const drop_count = self.compactBoundary(keep_n);
-        if (drop_count == 0) return 0;
+        const report = try self.compactWithSummaryReport(keep_n, ctx, summarize_fn);
+        return report.dropped;
+    }
 
-        // 先总结要丢的 [0, drop_count)(在丢之前,内容还在)。
-        const summary = summarize_fn(ctx, self.messages.items[0..drop_count]);
+    pub const CompactReport = struct {
+        dropped: usize,
+        summary_used: bool,
+    };
+
+    pub const ToolResultReduction = struct {
+        cleared: usize = 0,
+        truncated: usize = 0,
+        bytes_before: usize = 0,
+        bytes_after: usize = 0,
+
+        pub fn changed(self: ToolResultReduction) bool {
+            return self.cleared > 0 or self.truncated > 0;
+        }
+    };
+
+    pub fn compactWithSummaryReport(
+        self: *Conversation,
+        keep_n: usize,
+        ctx: anytype,
+        comptime summarize_fn: fn (@TypeOf(ctx), []const msg.Message) ?[]u8,
+    ) !CompactReport {
+        var drop_count: usize = 0;
+        var summary_input: []msg.Message = &.{};
+        {
+            _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
+            defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+            drop_count = self.compactBoundary(keep_n);
+            if (drop_count == 0) return .{ .dropped = 0, .summary_used = false };
+
+            summary_input = try self.allocator.alloc(msg.Message, drop_count);
+            errdefer self.allocator.free(summary_input);
+            var copied: usize = 0;
+            errdefer for (summary_input[0..copied]) |m| m.deinit(self.allocator);
+            for (self.messages.items[0..drop_count], 0..) |m, i| {
+                summary_input[i] = try m.dupe(self.allocator);
+                copied = i + 1;
+            }
+        }
+        defer {
+            for (summary_input) |m| m.deinit(self.allocator);
+            self.allocator.free(summary_input);
+        }
+
+        // 先总结要丢的 [0, drop_count)。这里传 owned snapshot,不借用
+        // self.messages.items,避免 summarize 期间 append/realloc 让 slice 悬挂。
+        const summary = summarize_fn(ctx, summary_input);
+        errdefer if (summary) |s| self.allocator.free(s);
 
         // 丢老消息。
+        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
         var i: usize = 0;
         while (i < drop_count) : (i += 1) {
             const m = self.messages.orderedRemove(0);
@@ -187,10 +254,11 @@ pub const Conversation = struct {
         // 有 summary → prepend 一条 assistant 消息(text block)到队首。
         if (summary) |s| {
             const blocks = try self.allocator.alloc(msg.Block, 1);
+            errdefer self.allocator.free(blocks);
             blocks[0] = .{ .text = s }; // s 已是 owned(summarize_fn dupe 的),转移给 block
             try self.messages.insert(self.allocator, 0, .{ .role = .assistant, .blocks = blocks });
         }
-        return drop_count;
+        return .{ .dropped = drop_count, .summary_used = summary != null };
     }
 
     /// Microcompact(批4,对齐 cc 的工具结果清理):把"较老"消息里的 tool_result 内容
@@ -202,7 +270,8 @@ pub const Conversation = struct {
         const total = self.messages.items.len;
         if (total <= keep_recent_n) return 0;
         const boundary = total - keep_recent_n; // [0, boundary) 是"老"消息
-        const STUB = "[tool result cleared to save context]";
+        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
 
         var cleared: usize = 0;
         var mi: usize = 0;
@@ -212,14 +281,8 @@ pub const Conversation = struct {
                 switch (b) {
                     .tool_result => |tr| {
                         // 已是 stub 的不重复清(幂等)。
-                        if (std.mem.eql(u8, tr.content, STUB)) continue;
-                        const new_content = self.allocator.dupe(u8, STUB) catch continue;
-                        self.allocator.free(@constCast(tr.content));
-                        m.blocks[bi] = .{ .tool_result = .{
-                            .tool_use_id = tr.tool_use_id,
-                            .content = new_content,
-                            .is_error = tr.is_error,
-                        } };
+                        if (std.mem.eql(u8, tr.content, TOOL_RESULT_CLEARED_STUB)) continue;
+                        if (!self.clearToolResultAt(m, bi)) continue;
                         cleared += 1;
                     },
                     else => {},
@@ -228,7 +291,144 @@ pub const Conversation = struct {
         }
         return cleared;
     }
+
+    /// Codex-style tool output pressure valve: keep only the most recent K
+    /// tool_result blocks intact, independent of message boundaries. This avoids
+    /// the common failure mode where "recent N messages" preserves many old tool
+    /// outputs in a dense tool turn and full compact keeps firing with low savings.
+    pub fn microcompactToolResultsByRecentResults(self: *Conversation, keep_recent_results: usize) ToolResultReduction {
+        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        var out = ToolResultReduction{};
+        var seen_recent: usize = 0;
+        var mi = self.messages.items.len;
+        while (mi > 0) {
+            mi -= 1;
+            const m = self.messages.items[mi];
+            var bi = m.blocks.len;
+            while (bi > 0) {
+                bi -= 1;
+                const b = m.blocks[bi];
+                if (b != .tool_result) continue;
+                seen_recent += 1;
+                if (seen_recent <= keep_recent_results) continue;
+                const tr = b.tool_result;
+                if (std.mem.eql(u8, tr.content, TOOL_RESULT_CLEARED_STUB)) continue;
+                const before = tr.content.len;
+                if (!self.clearToolResultAt(m, bi)) continue;
+                out.cleared += 1;
+                out.bytes_before += before;
+                out.bytes_after += TOOL_RESULT_CLEARED_STUB.len;
+            }
+        }
+        return out;
+    }
+
+    /// Bound every inline tool_result. The latest result is still shown to the
+    /// model, but as a head/tail preview instead of an unbounded blob. This is
+    /// intentionally independent of full compact: a single recent tool result
+    /// can be enough to exceed the context window.
+    pub fn truncateLargeToolResults(self: *Conversation, max_bytes: usize) ToolResultReduction {
+        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        var out = ToolResultReduction{};
+        if (max_bytes == 0) return out;
+        for (self.messages.items) |m| {
+            for (m.blocks, 0..) |b, bi| {
+                if (b != .tool_result) continue;
+                const tr = b.tool_result;
+                if (tr.content.len <= max_bytes) continue;
+                if (std.mem.eql(u8, tr.content, TOOL_RESULT_CLEARED_STUB)) continue;
+                const before = tr.content.len;
+                const new_content = truncateToolResultContent(self.allocator, tr.content, max_bytes) catch continue;
+                self.allocator.free(@constCast(tr.content));
+                m.blocks[bi] = .{ .tool_result = .{
+                    .tool_use_id = tr.tool_use_id,
+                    .content = new_content,
+                    .is_error = tr.is_error,
+                } };
+                out.truncated += 1;
+                out.bytes_before += before;
+                out.bytes_after += new_content.len;
+            }
+        }
+        return out;
+    }
+
+    fn clearToolResultAt(self: *Conversation, m: msg.Message, bi: usize) bool {
+        const tr = m.blocks[bi].tool_result;
+        const new_content = self.allocator.dupe(u8, TOOL_RESULT_CLEARED_STUB) catch return false;
+        self.allocator.free(@constCast(tr.content));
+        m.blocks[bi] = .{ .tool_result = .{
+            .tool_use_id = tr.tool_use_id,
+            .content = new_content,
+            .is_error = tr.is_error,
+        } };
+        return true;
+    }
 };
+
+fn truncateToolResultContent(allocator: std.mem.Allocator, content: []const u8, max_bytes: usize) ![]u8 {
+    if (content.len <= max_bytes) return try allocator.dupe(u8, content);
+    if (max_bytes < 1024) {
+        return try std.fmt.allocPrint(
+            allocator,
+            "[tool output truncated to fit context: original_bytes={d}]",
+            .{content.len},
+        );
+    }
+
+    const preview_budget = max_bytes - 512;
+    const wanted_head_len = preview_budget * 3 / 4;
+    const wanted_tail_len = preview_budget - wanted_head_len;
+    const content_is_valid_utf8 = std.unicode.utf8ValidateSlice(content);
+    const head_end = if (content_is_valid_utf8)
+        floorUtf8Boundary(content, wanted_head_len)
+    else
+        validUtf8PrefixLen(content, wanted_head_len);
+    var tail_start = if (content_is_valid_utf8)
+        ceilUtf8Boundary(content, content.len - wanted_tail_len)
+    else
+        content.len;
+    if (tail_start < head_end) tail_start = head_end;
+    const omitted = tail_start - head_end;
+    return try std.fmt.allocPrint(
+        allocator,
+        "[tool output truncated to fit context: original_bytes={d}, shown_head_bytes={d}, shown_tail_bytes={d}]\n\n{s}\n\n...[truncated {d} bytes]...\n\n{s}",
+        .{ content.len, head_end, content.len - tail_start, content[0..head_end], omitted, content[tail_start..] },
+    );
+}
+
+fn floorUtf8Boundary(s: []const u8, desired: usize) usize {
+    var end = @min(desired, s.len);
+    if (end == s.len) return end;
+    while (end > 0 and isUtf8ContinuationByte(s[end])) : (end -= 1) {}
+    return end;
+}
+
+fn ceilUtf8Boundary(s: []const u8, desired: usize) usize {
+    var start = @min(desired, s.len);
+    while (start < s.len and isUtf8ContinuationByte(s[start])) : (start += 1) {}
+    return start;
+}
+
+fn validUtf8PrefixLen(s: []const u8, desired: usize) usize {
+    var i: usize = 0;
+    var last: usize = 0;
+    const limit = @min(desired, s.len);
+    while (i < limit) {
+        const n = std.unicode.utf8ByteSequenceLength(s[i]) catch break;
+        if (i + n > limit) break;
+        _ = std.unicode.utf8Decode(s[i .. i + n]) catch break;
+        i += n;
+        last = i;
+    }
+    return last;
+}
+
+fn isUtf8ContinuationByte(b: u8) bool {
+    return (b & 0b1100_0000) == 0b1000_0000;
+}
 
 test "Conversation init / deinit empty" {
     var c = Conversation.init(std.testing.allocator);

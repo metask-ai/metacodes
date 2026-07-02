@@ -100,6 +100,10 @@ pub const CoreEvent = union(enum) {
     auto_compact: struct {
         dropped: u32,
         kept: u32,
+        before_tokens: u64 = 0,
+        after_tokens: u64 = 0,
+        /// trigger | summary_fallback | no_savings_recovered | tool_result_pressure
+        cause: []const u8 = "trigger",
     },
 
     /// 流式建连重试提示(第 attempt/max 次,退避 delay_ms)。

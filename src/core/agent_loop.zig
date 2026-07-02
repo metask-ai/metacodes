@@ -14,7 +14,8 @@ const json_mod = @import("../json.zig");
 const tools_mod = @import("../tools.zig");
 const permission_mod = @import("../permission.zig");
 const msg = @import("message.zig");
-const Conversation = @import("conversation.zig").Conversation;
+const conversation_mod = @import("conversation.zig");
+const Conversation = conversation_mod.Conversation;
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const ReadState = @import("read_state.zig").ReadState;
 const api_stream = @import("../api/stream.zig");
@@ -131,6 +132,10 @@ pub const Options = struct {
     /// null → 不 prepend(headless/subagent/无记忆)。由 user_context.build 生成,owned-by-caller,
     /// 生命周期须覆盖整个 run。
     inject_user_context: ?[]const u8 = null,
+    /// One-shot user-role steering item appended to the first API request only.
+    /// This is intentionally not written to Conversation/transcript; extensions such
+    /// as /loop use it to continue work without fabricating a persisted user turn.
+    synthetic_user_input: ?[]const u8 = null,
     verbose: bool = false,
     abort: ?*const AbortSignal = null,
     /// 转后台请求信号(Ctrl+B 生成期置位)。run() 每轮**开头**(turn 边界,conversation 干净时)
@@ -223,6 +228,94 @@ fn emitProgress(backend: *const UiBackend, sess: @import("session_id.zig").Sessi
     backend.emitEvent(sess, .{ .progress = .{ .turn = turn, .tool_name = tool_name, .tool_input = tool_input, .tool_calls = tool_calls } });
 }
 
+const EffectiveToolSet = struct {
+    filtered_pool: ?[]json_mod.ToolDefinition = null,
+    deferred_filtered: ?[]json_mod.ToolDefinition = null,
+    cap_filtered: ?[]json_mod.ToolDefinition = null,
+    defs: []const json_mod.ToolDefinition = &.{},
+
+    fn deinit(self: *EffectiveToolSet, allocator: std.mem.Allocator) void {
+        if (self.filtered_pool) |fp| allocator.free(fp);
+        if (self.deferred_filtered) |df| allocator.free(df);
+        if (self.cap_filtered) |cf| allocator.free(cf);
+        self.* = .{};
+    }
+};
+
+fn buildEffectiveToolSet(
+    allocator: std.mem.Allocator,
+    tool_defs: []const json_mod.ToolDefinition,
+    permission_ctx: *const permission_mod.PermissionContext,
+    activated_tools: ?*const std.StringHashMap(void),
+    provider: provider_mod.Provider,
+) EffectiveToolSet {
+    var out = EffectiveToolSet{ .defs = tool_defs };
+
+    const pool_filter = @import("../skills/tool_pool_filter.zig");
+    out.filtered_pool = pool_filter.filterToolDefs(allocator, tool_defs, permission_ctx.active_skill) catch null;
+    const skill_filtered = if (out.filtered_pool) |fp| fp else tool_defs;
+    out.defs = skill_filtered;
+
+    const effective_tool_defs = blk: {
+        const acts = activated_tools orelse break :blk skill_filtered;
+        var has_deferred = false;
+        for (skill_filtered) |d| {
+            if (d.deferred) {
+                has_deferred = true;
+                break;
+            }
+        }
+        if (!has_deferred) break :blk skill_filtered;
+
+        var keep: std.ArrayList(json_mod.ToolDefinition) = .empty;
+        for (skill_filtered) |d| {
+            if (d.deferred and !acts.contains(d.name)) continue;
+            keep.append(allocator, d) catch {
+                keep.deinit(allocator);
+                break :blk skill_filtered;
+            };
+        }
+        out.deferred_filtered = keep.toOwnedSlice(allocator) catch {
+            keep.deinit(allocator);
+            break :blk skill_filtered;
+        };
+        break :blk out.deferred_filtered.?;
+    };
+    out.defs = effective_tool_defs;
+
+    const capability = @import("../api/capability.zig");
+    const gated_tool_defs = blk: {
+        var any_dropped = false;
+        for (effective_tool_defs) |d| {
+            if (capability.requiredCapability(d.name)) |cap| {
+                if (!provider.supports(cap)) {
+                    any_dropped = true;
+                    break;
+                }
+            }
+        }
+        if (!any_dropped) break :blk effective_tool_defs;
+
+        var keep: std.ArrayList(json_mod.ToolDefinition) = .empty;
+        for (effective_tool_defs) |d| {
+            if (capability.requiredCapability(d.name)) |cap| {
+                if (!provider.supports(cap)) continue;
+            }
+            keep.append(allocator, d) catch {
+                keep.deinit(allocator);
+                break :blk effective_tool_defs;
+            };
+        }
+        out.cap_filtered = keep.toOwnedSlice(allocator) catch {
+            keep.deinit(allocator);
+            break :blk effective_tool_defs;
+        };
+        break :blk out.cap_filtered.?;
+    };
+    out.defs = gated_tool_defs;
+    return out;
+}
+
 /// L4:run 出口统一收口——发 diag_run_end 诊断事件后返回 result。每个 `return <result>` 改成
 /// `return finishRun(backend, sess, trace_id, depth, <result>)`,保证所有出口(abort/api_error/
 /// end_turn/tool_error/tool_loop/max_turns)都 emit run span 终点,无遗漏(对齐"诊断不沉默")。
@@ -301,6 +394,25 @@ pub fn run(
         // L4 诊断:turn span 起点。
         backend.emitEvent(sess, .{ .diag_turn_begin = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1 } });
 
+        // Plan 模式每轮把 plan 指令追加到 system prompt(对齐 mecode 每轮 developer_instructions):
+        // 根治"指令只在 EnterPlanMode 返回出现一次,后续轮模型忘了 <proposed_plan> 格式"。
+        // turn 作用域 alloc,用后 free;非 plan 模式直接用 opts.system_prompt(零开销)。
+        var sys_prompt_owned: ?[]u8 = null;
+        defer if (sys_prompt_owned) |p| allocator.free(p);
+        const effective_system_prompt: ?[]const u8 = blk: {
+            if (permission_ctx.modeValue() != .plan) break :blk opts.system_prompt;
+            const plan_mode = @import("../tools/plan_mode.zig");
+            const base = opts.system_prompt orelse "";
+            sys_prompt_owned = std.fmt.allocPrint(allocator, "{s}\n\n# Plan Mode (active)\n{s}", .{ base, plan_mode.PLAN_MODE_INSTRUCTIONS }) catch null;
+            break :blk if (sys_prompt_owned) |p| p else opts.system_prompt;
+        };
+
+        // 工具池过滤必须在 compact 判断之前完成。auto-compact 以"实际下一次请求"
+        // 为准，而不是未经过 skill/deferred/capability 门控的全量工具表。
+        var effective_tools = buildEffectiveToolSet(allocator, tool_defs, permission_ctx, opts.activated_tools, provider);
+        defer effective_tools.deinit(allocator);
+        const gated_tool_defs = effective_tools.defs;
+
         // 自动 compact：发请求前检查 token 估算,超阈值则保留最近 N 条。
         // 阈值 null 时 = input context window * 0.8(逼近 context 上限才压缩,留出回复空间)。
         // **必须用 input context window(resolveMaxInputTokens,~200K),不是 output max_tokens(32K)**——
@@ -308,105 +420,80 @@ pub fn run(
         // 下限 MIN_AUTO_COMPACT_THRESHOLD:避免异常小值导致每 turn 都 compact。
         const auto_threshold: usize = opts.auto_compact_threshold orelse
             @max(@as(usize, provider.maxInputTokens()) * 8 / 10, MIN_AUTO_COMPACT_THRESHOLD);
-        // Microcompact(批4):在 full-compact 之前,更低阈值(70% of full)先清旧 tool_result
-        // 内容(最占 token 的部分),保留消息结构。比 compactKeepRecent 温和、不丢对话流。
+        const synthetic_user_input = if (turns == 0) opts.synthetic_user_input else null;
+        const tool_result_limit = conversation_mod.toolResultContextBytes(provider.maxInputTokens());
+        const preflight_truncated = conversation.truncateLargeToolResults(tool_result_limit);
+        if (preflight_truncated.changed()) {
+            log.info("agent", "tool-result truncate: truncated={d} cleared={d} bytes={d}->{d} max_inline={d}", .{ preflight_truncated.truncated, preflight_truncated.cleared, preflight_truncated.bytes_before, preflight_truncated.bytes_after, tool_result_limit });
+        }
+
+        var request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, effective_system_prompt, opts.inject_user_context, synthetic_user_input, gated_tool_defs, opts.model_override);
+        // Microcompact:在 full-compact 之前,更低阈值(70% of full)先清旧 tool_result
+        // 内容(最占 token 的部分),保留消息结构。这里按最近 tool_result 个数保留,不是按消息数:
+        // 工具密集 turn 中,最近 N 条消息可能仍包着一串旧结果,导致 full compact 低收益反复触发。
         const micro_threshold = auto_threshold * 7 / 10;
-        if (conversation.isOverThreshold(micro_threshold) and !conversation.isOverThreshold(auto_threshold)) {
-            const cleared = conversation.microcompactToolResults(opts.auto_compact_keep_recent);
-            if (cleared > 0) {
-                log.info("agent", "microcompact: cleared {d} old tool_results (msgs={d}) threshold={d}", .{ cleared, conversation.len(), micro_threshold });
+        if (request_tokens_before > micro_threshold and request_tokens_before <= auto_threshold) {
+            const reduced = conversation.microcompactToolResultsByRecentResults(conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP);
+            if (reduced.changed()) {
+                log.info("agent", "microcompact: cleared={d} truncated={d} old tool_results bytes={d}->{d} keep_recent_results={d} threshold={d}", .{ reduced.cleared, reduced.truncated, reduced.bytes_before, reduced.bytes_after, conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP, micro_threshold });
+                request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, effective_system_prompt, opts.inject_user_context, synthetic_user_input, gated_tool_defs, opts.model_override);
             }
         }
-        if (conversation.isOverThreshold(auto_threshold)) {
-            const before = conversation.len();
+        if (request_tokens_before > auto_threshold) {
+            const before_len = conversation.len();
             // 9 段结构化摘要(补真缺口):有 api_client → 调模型把要丢的历史总结成 summary
             // prepend 保住早期上下文(对齐 cc);summarize 失败/无 client → 退回纯丢老消息。
             const compact_summary = @import("compact_summary.zig");
             const SummCtx = struct { provider: provider_mod.Provider, alloc: std.mem.Allocator };
-            const dropped = conversation.compactWithSummary(opts.auto_compact_keep_recent, SummCtx{ .provider = provider, .alloc = allocator }, struct {
+            var report = conversation.compactWithSummaryReport(opts.auto_compact_keep_recent, SummCtx{ .provider = provider, .alloc = allocator }, struct {
                 fn f(c: SummCtx, drop_msgs: []const msg.Message) ?[]u8 {
                     return compact_summary.summarize(c.alloc, c.provider, drop_msgs);
                 }
-            }.f) catch conversation.compactKeepRecent(opts.auto_compact_keep_recent);
-            if (dropped > 0) {
-                log.info("agent", "auto-compact: dropped {d} old messages ({d} -> {d}) threshold={d}", .{ dropped, before, conversation.len(), auto_threshold });
-                backend.emitEvent(sess, .{ .auto_compact = .{ .dropped = @as(u32, @intCast(dropped)), .kept = @as(u32, @intCast(conversation.len())) } });
+            }.f) catch Conversation.CompactReport{
+                .dropped = conversation.compactKeepRecent(opts.auto_compact_keep_recent),
+                .summary_used = false,
+            };
+            if (report.dropped > 0) {
+                var cause: []const u8 = if (report.summary_used) "trigger" else "summary_fallback";
+                var request_tokens_after = estimateNextRequestTokensOrFallback(allocator, provider, conversation, effective_system_prompt, opts.inject_user_context, synthetic_user_input, gated_tool_defs, opts.model_override);
+                if (request_tokens_after >= request_tokens_before) {
+                    const recovered = conversation.microcompactToolResultsByRecentResults(0);
+                    if (recovered.changed()) {
+                        cause = "tool_result_pressure";
+                        request_tokens_after = estimateNextRequestTokensOrFallback(allocator, provider, conversation, effective_system_prompt, opts.inject_user_context, synthetic_user_input, gated_tool_defs, opts.model_override);
+                    } else {
+                        const recovered_msgs = conversation.compactKeepRecent(opts.auto_compact_keep_recent);
+                        if (recovered_msgs > 0) {
+                            report.dropped += recovered_msgs;
+                            cause = "no_savings_recovered";
+                            request_tokens_after = estimateNextRequestTokensOrFallback(allocator, provider, conversation, effective_system_prompt, opts.inject_user_context, synthetic_user_input, gated_tool_defs, opts.model_override);
+                        }
+                    }
+                } else if (request_tokens_after > auto_threshold) {
+                    const emergency = conversation.microcompactToolResultsByRecentResults(0);
+                    if (emergency.changed()) {
+                        cause = "tool_result_pressure";
+                        request_tokens_after = estimateNextRequestTokensOrFallback(allocator, provider, conversation, effective_system_prompt, opts.inject_user_context, synthetic_user_input, gated_tool_defs, opts.model_override);
+                    }
+                }
+                log.info("agent", "auto-compact: dropped {d} old messages ({d} -> {d}) threshold={d} before_tokens={d} after_tokens={d} cause={s}", .{ report.dropped, before_len, conversation.len(), auto_threshold, request_tokens_before, request_tokens_after, cause });
+                backend.emitEvent(sess, .{ .auto_compact = .{
+                    .dropped = @as(u32, @intCast(report.dropped)),
+                    .kept = @as(u32, @intCast(conversation.len())),
+                    .before_tokens = @intCast(request_tokens_before),
+                    .after_tokens = @intCast(request_tokens_after),
+                    .cause = cause,
+                } });
             }
         }
 
         log.info("agent", "turn {d}/{d} starting (msgs={d})", .{ turns + 1, opts.max_turns, conversation.messages.items.len });
 
         // 1. 构造当前这一轮的 API 请求（把 Conversation 映射为 types.ApiMessage 数组）。
-        var api_messages = try buildApiMessages(conversation, allocator, opts.inject_user_context);
+        var api_messages = try buildApiMessages(conversation, allocator, opts.inject_user_context, synthetic_user_input);
         defer freeApiMessages(&api_messages, allocator);
 
-        // 2. Skill 激活时硬隔离工具池(SKILL_DESIGN §11 Stage B.8):
-        //    根据 permission_ctx.active_skill 的 allowed/disallowed 裁 tool_defs,
-        //    模型在请求体里看不见被禁工具,避免反复尝试调用。
-        //    与 decision.check 的 active_skill 权限检查互补(双保险)。
-        const pool_filter = @import("../skills/tool_pool_filter.zig");
-        const filtered_pool = pool_filter.filterToolDefs(allocator, tool_defs, permission_ctx.active_skill) catch null;
-        defer pool_filter.freeFiltered(allocator, filtered_pool);
-        const skill_filtered = if (filtered_pool) |fp| fp else tool_defs;
-
-        // deferred 过滤(对齐 cc:isMcp→defer)。deferred 工具(主要是 MCP 动态工具)
-        // 未激活 → 不进 tools 数组,经 ToolSearch 取 schema 激活后才发。内置工具全不 deferred
-        // (实测 33 工具守纪律;真根因是 web_search 异形而非工具数)。
-        // 仅顶层(opts.activated_tools 非 null)生效;subagent 不传 → 全暴露。
-        var deferred_filtered: ?[]json_mod.ToolDefinition = null;
-        defer if (deferred_filtered) |df| allocator.free(df);
-        const effective_tool_defs = blk: {
-            const acts = opts.activated_tools orelse break :blk skill_filtered;
-            // 无任何 deferred 工具 → 不必过滤(对齐 cc:无 deferred 则正常全发)。
-            var has_deferred = false;
-            for (skill_filtered) |d| {
-                if (d.deferred) {
-                    has_deferred = true;
-                    break;
-                }
-            }
-            if (!has_deferred) break :blk skill_filtered;
-            var keep: std.ArrayList(json_mod.ToolDefinition) = .empty;
-            errdefer keep.deinit(allocator);
-            for (skill_filtered) |d| {
-                if (d.deferred and !acts.contains(d.name)) continue; // deferred 未激活 → 隐藏
-                keep.append(allocator, d) catch break :blk skill_filtered;
-            }
-            deferred_filtered = keep.toOwnedSlice(allocator) catch break :blk skill_filtered;
-            break :blk deferred_filtered.?;
-        };
-
-        // P2 能力门控(真消费者):剔除当前 provider 不支持的工具(如不支持 web_search 的后端
-        // → WebSearch 不进 tools 数组,对齐 cc isEnabled)。当前单 Anthropic 全支持 → 无剔除
-        // (行为零变化),但门控路径活着且被测;P3 加缺能力 provider 时自动生效。
-        const capability = @import("../api/capability.zig");
-        var cap_filtered: ?[]json_mod.ToolDefinition = null;
-        defer if (cap_filtered) |cf| allocator.free(cf);
-        const gated_tool_defs = blk: {
-            // 先扫:有没有"需要某能力但 provider 不支持"的工具?没有则不必重建数组。
-            var any_dropped = false;
-            for (effective_tool_defs) |d| {
-                if (capability.requiredCapability(d.name)) |cap| {
-                    if (!provider.supports(cap)) {
-                        any_dropped = true;
-                        break;
-                    }
-                }
-            }
-            if (!any_dropped) break :blk effective_tool_defs;
-            var keep: std.ArrayList(json_mod.ToolDefinition) = .empty;
-            errdefer keep.deinit(allocator);
-            for (effective_tool_defs) |d| {
-                if (capability.requiredCapability(d.name)) |cap| {
-                    if (!provider.supports(cap)) continue; // provider 不支持 → 剔除
-                }
-                keep.append(allocator, d) catch break :blk effective_tool_defs;
-            }
-            cap_filtered = keep.toOwnedSlice(allocator) catch break :blk effective_tool_defs;
-            break :blk cap_filtered.?;
-        };
-
-        // 3. 发送流式请求（abortable 版本：abort 通过 EventIterator 检查点传播）
+        // 2. 发送流式请求（abortable 版本：abort 通过 EventIterator 检查点传播）
         //    带 opts.model_override:subagent 用自己的 model(如 Explore=haiku);
         //    null 时 sendMessageStreamFull 用 api_client.model(父 model)。
         // 击穿检测:发请求前记录 system/tools/model 指纹(tools 用工具名拼接 hash)。
@@ -431,19 +518,6 @@ pub fn run(
         };
         var retry_ui = RetryUi{ .be = backend, .session = sess };
         const reporter = provider_mod.RetryReporter{ .state = @ptrCast(&retry_ui), .report = RetryUi.report };
-
-        // Plan 模式每轮把 plan 指令追加到 system prompt(对齐 mecode 每轮 developer_instructions):
-        // 根治"指令只在 EnterPlanMode 返回出现一次,后续轮模型忘了 <proposed_plan> 格式"。
-        // turn 作用域 alloc,用后 free;非 plan 模式直接用 opts.system_prompt(零开销)。
-        var sys_prompt_owned: ?[]u8 = null;
-        defer if (sys_prompt_owned) |p| allocator.free(p);
-        const effective_system_prompt: ?[]const u8 = blk: {
-            if (permission_ctx.modeValue() != .plan) break :blk opts.system_prompt;
-            const plan_mode = @import("../tools/plan_mode.zig");
-            const base = opts.system_prompt orelse "";
-            sys_prompt_owned = std.fmt.allocPrint(allocator, "{s}\n\n# Plan Mode (active)\n{s}", .{ base, plan_mode.PLAN_MODE_INSTRUCTIONS }) catch null;
-            break :blk if (sys_prompt_owned) |p| p else opts.system_prompt;
-        };
 
         var stream = provider.sendStreamRetry(
             api_messages.items,
@@ -988,6 +1062,7 @@ fn buildApiMessages(
     conversation: *const Conversation,
     allocator: std.mem.Allocator,
     inject_user_context: ?[]const u8,
+    synthetic_user_input: ?[]const u8,
 ) !std.ArrayList(types.ApiMessage) {
     var out = std.ArrayList(types.ApiMessage).empty;
     errdefer {
@@ -1030,6 +1105,13 @@ fn buildApiMessages(
         }
         try out.append(allocator, .{ .role = m.role, .content = contents });
     }
+    if (synthetic_user_input) |synthetic_text| {
+        if (synthetic_text.len > 0) {
+            const contents = try allocator.alloc(types.ApiContent, 1);
+            contents[0] = .{ .text = synthetic_text };
+            try out.append(allocator, .{ .role = .user, .content = contents });
+        }
+    }
     return out;
 }
 
@@ -1038,6 +1120,115 @@ fn freeApiMessages(list: *std.ArrayList(types.ApiMessage), allocator: std.mem.Al
         allocator.free(m.content);
     }
     list.deinit(allocator);
+}
+
+fn estimateNextRequestTokens(
+    allocator: std.mem.Allocator,
+    provider: provider_mod.Provider,
+    conversation: *const Conversation,
+    system_prompt: ?[]const u8,
+    inject_user_context: ?[]const u8,
+    synthetic_user_input: ?[]const u8,
+    tool_defs: []const json_mod.ToolDefinition,
+    model_override: ?[]const u8,
+) !usize {
+    var api_messages = try buildApiMessages(conversation, allocator, inject_user_context, synthetic_user_input);
+    defer freeApiMessages(&api_messages, allocator);
+    return estimateApiRequestTokens(allocator, provider, api_messages.items, system_prompt, tool_defs, model_override);
+}
+
+fn estimateApiRequestTokens(
+    allocator: std.mem.Allocator,
+    provider: provider_mod.Provider,
+    messages: []const types.ApiMessage,
+    system_prompt: ?[]const u8,
+    tool_defs: []const json_mod.ToolDefinition,
+    model_override: ?[]const u8,
+) !usize {
+    const req_body = try json_mod.serializeMessagesRequest(.{
+        .model = model_override orelse provider.model(),
+        .max_tokens = provider.maxTokens(),
+        .messages = messages,
+        .system = system_prompt,
+        .stream = true,
+        .tools = tool_defs,
+        .reasoning_effort = provider.reasoningEffort(),
+    }, allocator);
+    defer allocator.free(req_body);
+    return Conversation.estimateTokens(req_body);
+}
+
+fn estimateNextRequestTokensOrFallback(
+    allocator: std.mem.Allocator,
+    provider: provider_mod.Provider,
+    conversation: *const Conversation,
+    system_prompt: ?[]const u8,
+    inject_user_context: ?[]const u8,
+    synthetic_user_input: ?[]const u8,
+    tool_defs: []const json_mod.ToolDefinition,
+    model_override: ?[]const u8,
+) usize {
+    return estimateNextRequestTokens(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override) catch |err| {
+        log.warn("agent", "actual request token estimate failed: {s}; using fallback estimate", .{@errorName(err)});
+        return estimateNextRequestTokensFallback(conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs);
+    };
+}
+
+fn estimateNextRequestTokensFallback(
+    conversation: *const Conversation,
+    system_prompt: ?[]const u8,
+    inject_user_context: ?[]const u8,
+    synthetic_user_input: ?[]const u8,
+    tool_defs: []const json_mod.ToolDefinition,
+) usize {
+    var total = conversation.totalTokens();
+    if (system_prompt) |s| total += Conversation.estimateTokens(s);
+    if (inject_user_context) |s| total += Conversation.estimateTokens(s);
+    if (synthetic_user_input) |s| total += Conversation.estimateTokens(s);
+    for (tool_defs) |tool| {
+        total += Conversation.estimateTokens(tool.name);
+        total += Conversation.estimateTokens(tool.description);
+        if (tool.server_type) |server_type| total += Conversation.estimateTokens(server_type);
+        total += estimateInputSchemaTokens(tool.input_schema);
+    }
+    return total;
+}
+
+fn estimateInputSchemaTokens(schema: json_mod.InputSchema) usize {
+    var total = Conversation.estimateTokens(schema.type);
+    if (schema.prop_specs) |props| {
+        total += estimatePropSpecsTokens(props);
+    }
+    if (schema.required) |required| {
+        for (required) |r| total += Conversation.estimateTokens(r);
+    }
+    if (schema.properties) |props| {
+        var it = props.iterator();
+        while (it.next()) |entry| total += Conversation.estimateTokens(entry.key_ptr.*);
+    }
+    return total;
+}
+
+fn estimatePropSpecsTokens(props: []const json_mod.PropSpec) usize {
+    var total: usize = 0;
+    for (props) |prop| {
+        total += Conversation.estimateTokens(prop.name);
+        total += Conversation.estimateTokens(prop.type);
+        total += Conversation.estimateTokens(prop.description);
+        if (prop.items_type) |t| total += Conversation.estimateTokens(t);
+        if (prop.enum_values) |vals| {
+            for (vals) |v| total += Conversation.estimateTokens(v);
+        }
+        if (prop.items_props) |nested| total += estimatePropSpecsTokens(nested);
+        if (prop.items_required) |required| {
+            for (required) |r| total += Conversation.estimateTokens(r);
+        }
+        if (prop.object_props) |nested| total += estimatePropSpecsTokens(nested);
+        if (prop.object_required) |required| {
+            for (required) |r| total += Conversation.estimateTokens(r);
+        }
+    }
+    return total;
 }
 
 test "emitProgress 发 CoreEvent.progress 到 backend(L1:进度=事件)" {
@@ -1079,7 +1270,7 @@ test "buildApiMessages maps blocks" {
     defer c.deinit();
     try c.appendText(.user, "hi");
 
-    var api = try buildApiMessages(&c, a, null);
+    var api = try buildApiMessages(&c, a, null, null);
     defer freeApiMessages(&api, a);
 
     try std.testing.expect(api.items.len == 1);
@@ -1111,7 +1302,7 @@ test "buildApiMessages maps tool_use and tool_result" {
     } };
     try c.append(.{ .role = .user, .blocks = blks_u });
 
-    var api = try buildApiMessages(&c, a, null);
+    var api = try buildApiMessages(&c, a, null, null);
     defer freeApiMessages(&api, a);
 
     try std.testing.expect(api.items.len == 2);
@@ -1123,7 +1314,7 @@ test "buildApiMessages empty conversation returns empty" {
     const a = std.testing.allocator;
     var c = Conversation.init(a);
     defer c.deinit();
-    var api = try buildApiMessages(&c, a, null);
+    var api = try buildApiMessages(&c, a, null, null);
     defer freeApiMessages(&api, a);
     try std.testing.expect(api.items.len == 0);
 }
@@ -1135,7 +1326,7 @@ test "buildApiMessages preserves roles" {
     try c.appendText(.user, "u1");
     try c.appendText(.assistant, "a1");
     try c.appendText(.user, "u2");
-    var api = try buildApiMessages(&c, a, null);
+    var api = try buildApiMessages(&c, a, null, null);
     defer freeApiMessages(&api, a);
     try std.testing.expect(api.items[0].role == .user);
     try std.testing.expect(api.items[1].role == .assistant);
@@ -1154,9 +1345,228 @@ test "buildApiMessages multiple blocks per message" {
         .input = try a.dupe(u8, "{}"),
     } };
     try c.append(.{ .role = .assistant, .blocks = blks });
-    var api = try buildApiMessages(&c, a, null);
+    var api = try buildApiMessages(&c, a, null, null);
     defer freeApiMessages(&api, a);
     try std.testing.expect(api.items[0].content.len == 2);
+}
+
+test "buildApiMessages appends one-shot synthetic user input without mutating conversation" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "real user");
+
+    var api = try buildApiMessages(&c, a, null, "synthetic steering");
+    defer freeApiMessages(&api, a);
+
+    try std.testing.expectEqual(@as(usize, 1), c.len());
+    try std.testing.expectEqual(@as(usize, 2), api.items.len);
+    try std.testing.expect(api.items[0].role == .user);
+    try std.testing.expectEqualStrings("real user", api.items[0].content[0].text);
+    try std.testing.expect(api.items[1].role == .user);
+    try std.testing.expectEqualStrings("synthetic steering", api.items[1].content[0].text);
+}
+
+const TestProviderState = struct {
+    model: []const u8 = "test-model",
+    max_tokens: u32 = 777,
+    max_input_tokens: u32 = 200_000,
+    supports_web_search: bool = true,
+    reasoning_effort: ?types.ReasoningEffort = null,
+};
+
+fn testProvider(state: *TestProviderState) provider_mod.Provider {
+    const F = struct {
+        fn asState(ctx: *anyopaque) *TestProviderState {
+            return @ptrCast(@alignCast(ctx));
+        }
+        fn model(ctx: *anyopaque) []const u8 {
+            return asState(ctx).model;
+        }
+        fn sendStream(_: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition, _: ?*const AbortSignal, _: ?[]const u8, _: ?json_mod.ToolChoice, _: []const u8) anyerror!provider_mod.StreamHandle {
+            return error.UnexpectedTestCall;
+        }
+        fn sendStreamRetry(_: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition, _: ?*const AbortSignal, _: ?[]const u8, _: ?json_mod.ToolChoice, _: u32, _: u64, _: ?provider_mod.RetryReporter, _: []const u8) anyerror!provider_mod.StreamHandle {
+            return error.UnexpectedTestCall;
+        }
+        fn send(_: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition) anyerror!provider_mod.ApiResponse {
+            return error.UnexpectedTestCall;
+        }
+        fn maxTokens(ctx: *anyopaque) u32 {
+            return asState(ctx).max_tokens;
+        }
+        fn maxInputTokens(ctx: *anyopaque) u32 {
+            return asState(ctx).max_input_tokens;
+        }
+        fn reasoningEffort(ctx: *anyopaque) ?types.ReasoningEffort {
+            return asState(ctx).reasoning_effort;
+        }
+        fn supports(ctx: *anyopaque, cap: provider_mod.Capability) bool {
+            if (cap == .web_search) return asState(ctx).supports_web_search;
+            return true;
+        }
+    };
+    return .{
+        .ctx = @ptrCast(state),
+        .modelFn = F.model,
+        .sendStreamFn = F.sendStream,
+        .sendStreamRetryFn = F.sendStreamRetry,
+        .sendFn = F.send,
+        .maxTokensFn = F.maxTokens,
+        .maxInputTokensFn = F.maxInputTokens,
+        .reasoningEffortFn = F.reasoningEffort,
+        .supportsFn = F.supports,
+    };
+}
+
+test "estimateNextRequestTokens serializes the actual next Anthropic request" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "short");
+
+    var state = TestProviderState{ .model = "base-model", .max_tokens = 777, .reasoning_effort = .medium };
+    const provider = testProvider(&state);
+    const tool_defs = [_]json_mod.ToolDefinition{.{
+        .name = "Read",
+        .description = "Read file contents",
+        .input_schema = .{ .prop_specs = &.{.{ .name = "file_path", .type = "string", .description = "Path to read" }}, .required = &.{"file_path"} },
+    }};
+    const estimated = try estimateNextRequestTokens(
+        a,
+        provider,
+        &c,
+        "system prompt text",
+        "user context text",
+        "synthetic steering text",
+        &tool_defs,
+        "override-model",
+    );
+
+    var api = try buildApiMessages(&c, a, "user context text", "synthetic steering text");
+    defer freeApiMessages(&api, a);
+    const body = try json_mod.serializeMessagesRequest(.{
+        .model = "override-model",
+        .max_tokens = 777,
+        .messages = api.items,
+        .system = "system prompt text",
+        .stream = true,
+        .tools = &tool_defs,
+        .reasoning_effort = .medium,
+    }, a);
+    defer a.free(body);
+    try std.testing.expectEqual(Conversation.estimateTokens(body), estimated);
+    try std.testing.expect(std.mem.indexOf(u8, body, "synthetic steering text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "override-model") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"output_config\":{\"effort\":\"medium\"}") != null);
+}
+
+test "auto-compact preflight truncates huge recent tool_result before next request estimate" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "inspect large output");
+
+    const limit = conversation_mod.toolResultContextBytes(200_000);
+    const blocks = try a.alloc(msg.Block, 1);
+    const huge = try a.alloc(u8, limit * 4);
+    @memset(huge, 'A');
+    huge[huge.len - 1] = 'Z';
+    blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "toolu_huge"),
+        .content = huge,
+        .is_error = false,
+    } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+
+    var state = TestProviderState{};
+    const provider = testProvider(&state);
+    const before = try estimateNextRequestTokens(a, provider, &c, null, null, null, &.{}, null);
+    const reduced = c.truncateLargeToolResults(limit);
+    try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
+    const after = try estimateNextRequestTokens(a, provider, &c, null, null, null, &.{}, null);
+    try std.testing.expect(after < before);
+
+    var api = try buildApiMessages(&c, a, null, null);
+    defer freeApiMessages(&api, a);
+    const body = try json_mod.serializeMessagesRequest(.{
+        .model = provider.model(),
+        .max_tokens = provider.maxTokens(),
+        .messages = api.items,
+        .stream = true,
+        .tools = &.{},
+    }, a);
+    defer a.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "original_bytes") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "toolu_huge") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "Z") != null);
+    try std.testing.expectEqual(Conversation.estimateTokens(body), after);
+    try std.testing.expect(body.len < before);
+}
+
+test "auto-compact preflight keeps serialized request valid UTF-8 after multibyte truncation" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    const limit = conversation_mod.toolResultContextBytes(0);
+    var payload = std.ArrayList(u8).empty;
+    defer payload.deinit(a);
+    while (payload.items.len < limit * 3) {
+        try payload.appendSlice(a, "路径/中文/🙂/");
+    }
+
+    const blocks = try a.alloc(msg.Block, 1);
+    blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "toolu_utf8"),
+        .content = try a.dupe(u8, payload.items),
+        .is_error = false,
+    } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+
+    const reduced = c.truncateLargeToolResults(limit);
+    try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(c.messages.items[0].blocks[0].tool_result.content));
+
+    var state = TestProviderState{};
+    const provider = testProvider(&state);
+    var api = try buildApiMessages(&c, a, null, null);
+    defer freeApiMessages(&api, a);
+    const body = try json_mod.serializeMessagesRequest(.{
+        .model = provider.model(),
+        .max_tokens = provider.maxTokens(),
+        .messages = api.items,
+        .stream = true,
+        .tools = &.{},
+    }, a);
+    defer a.free(body);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(body));
+    try std.testing.expect(std.mem.indexOf(u8, body, "original_bytes") != null);
+}
+
+test "buildEffectiveToolSet hides unactivated deferred tools for compact estimate" {
+    const a = std.testing.allocator;
+    const tool_defs = [_]json_mod.ToolDefinition{
+        .{
+            .name = "Read",
+            .description = "Read file contents",
+            .input_schema = .{ .prop_specs = &.{.{ .name = "file_path", .type = "string" }}, .required = &.{"file_path"} },
+        },
+        .{
+            .name = "DeferredHuge",
+            .description = "This deferred schema should not affect the next request estimate until activated.",
+            .input_schema = .{ .prop_specs = &.{.{ .name = "payload", .type = "string", .description = "large hidden payload" }}, .required = &.{"payload"} },
+            .deferred = true,
+        },
+    };
+    var activated = std.StringHashMap(void).init(a);
+    defer activated.deinit();
+    var permission_ctx = permission_mod.PermissionContext{ .allocator = a };
+    var state = TestProviderState{};
+    var effective = buildEffectiveToolSet(a, &tool_defs, &permission_ctx, &activated, testProvider(&state));
+    defer effective.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), effective.defs.len);
+    try std.testing.expectEqualStrings("Read", effective.defs[0].name);
 }
 
 test "StopReason has aborted and max_turns" {
@@ -1172,6 +1582,6 @@ test "auto-compact 阈值用 input context window 而非 output max_tokens(防�
     // 压缩、丢掉原始问题。修复:改用 input context window(~200K)*0.8。
     // 源级守卫:阈值算式必须调 resolveMaxInputTokens(而非 output 的解析器),且 MIN 不再是早期小值。
     const src = @embedFile("agent_loop.zig");
-    try std.testing.expect(std.mem.indexOf(u8, src, "resolveMaxInputTokens()) * 8 / 10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "provider.maxInputTokens()) * 8 / 10") != null);
     try std.testing.expect(MIN_AUTO_COMPACT_THRESHOLD >= 32_000);
 }
