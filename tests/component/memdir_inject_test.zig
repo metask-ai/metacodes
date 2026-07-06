@@ -36,7 +36,7 @@ test "L2: memdir 启用 → system prompt 含 # Memory 段 + memdir 路径(进�
 
     // 用 buildFull 直接造含 memory 段的 system prompt(模拟 App.init 的产物)。
     const memdir_abs = "/home/u/.cc-zig/projects/deadbeef/memory";
-    const sp = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, null, memdir_abs);
+    const sp = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, null, memdir_abs, false);
     defer a.free(sp);
     // sanity:section 在 system prompt 里
     try std.testing.expect(std.mem.indexOf(u8, sp, "# Memory") != null);

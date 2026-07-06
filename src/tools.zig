@@ -20,6 +20,7 @@ const web_fetch_tool = @import("tools/web_fetch.zig");
 const ask_user_tool = @import("tools/ask_user.zig");
 const plan_mode_tool = @import("tools/plan_mode.zig");
 const task_tools = @import("tools/task_tools.zig");
+const kg_tools = @import("tools/kg_tools.zig");
 const agent_tool = @import("tools/agent.zig");
 const tool_search_tool = @import("tools/tool_search.zig");
 const web_search_tool = @import("tools/web_search.zig");
@@ -328,6 +329,24 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "plan", .type = "string", .description = "The plan to present to the user for approval, as concise markdown." },
         }, .required = &.{} },
         .execute = plan_mode_tool.executeExit,
+    },
+    .{
+        .name = "KgRemember",
+        .description = "Persist a durable memory into the knowledge graph (survives across sessions). Use for: decisions made, user preferences/corrections, non-obvious project facts. Keep it short and structured; do NOT log transient task state.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "text", .type = "string", .description = "The fact to remember. Short, self-contained; include Why when it is a correction or decision." },
+            .{ .name = "kind", .type = "string", .description = "observation (default) | decision | user_preference | concept" },
+            .{ .name = "scope", .type = "string", .description = "project (default) | global — global only for cross-project user preferences" },
+        }, .required = &.{"text"} },
+        .execute = kg_tools.executeRemember,
+    },
+    .{
+        .name = "KgRecall",
+        .description = "Search the knowledge graph for durable memories (decisions, preferences, project facts) from this and past sessions. Use when the user refers to prior decisions/context or when continuing cross-session work.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "query", .type = "string", .description = "Keywords to search (BM25 full-text)" },
+        }, .required = &.{"query"} },
+        .execute = kg_tools.executeRecall,
     },
     .{
         .name = "TaskCreate",

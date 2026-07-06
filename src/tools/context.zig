@@ -115,6 +115,10 @@ pub const ToolProgressReporter = struct {
 pub const ToolContext = struct {
     allocator: std.mem.Allocator,
     abort: ?*const AbortSignal = null,
+    /// TinyKG 客户端(记忆/计划/DAG 真相源;设计 KG_DESIGN v3-final)。
+    /// null = 未配置(缺二进制)——KG 工具此时不会注册;non-null 但 !ready = degraded。
+    kg: ?*@import("../kg/client.zig").KgClient = null,
+
     /// 工具抛错时可选的富文本 detail:工具在 `return error.X` 前写 `*error_detail = msg`,
     /// tool_exec 读到后用它替代通用的 "<tool> failed with X" 作为模型可见 detail。
     /// msg 用 ctx.allocator 分配(errorToJson 会拷贝,arena 释放前读取安全)。null = 不支持。

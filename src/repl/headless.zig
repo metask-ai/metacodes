@@ -47,6 +47,7 @@ pub fn run(
             .agent_jobs = if (app.agent_jobs) |*aj| aj else null,
             .plan_prev_mode = &app.plan_prev_mode,
             .tasks = &app.tasks,
+            .kg = if (app.kg) |*k| k else null,
             .api_client = &app.api_client,
             .tool_defs = app.tool_defs,
             .system_prompt = app.system_prompt,

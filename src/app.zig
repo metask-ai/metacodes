@@ -149,6 +149,13 @@ pub const App = struct {
     /// 本 session 的 memdir 绝对路径(通道 B 自动记忆;`{home}/.cc-zig/projects/<hash>/memory`,
     /// owned)。init 时算一次,挂 permission_ctx.memdir_abs(写豁免)。空串=禁用/无 home。
     memdir_abs: []u8 = &.{},
+    /// TinyKG 客户端(记忆/计划/DAG;设计 KG_DESIGN v3-final)。null = 未初始化
+    /// (缺 home 等);non-null 但 !ready = degraded。工具经 ctx.kg 拿指针。
+    kg: ?@import("kg/client.zig").KgClient = null,
+    /// per-project 指针目录 `{home}/.cc-zig/projects/<hash>`(kg_root/kg_inbox 落此)。owned。
+    kg_projects_dir: []u8 = &.{},
+    /// KG 启动注入快照(kg/inject.zig;owned)。空串=空态(不注入)。
+    kg_summary: []u8 = &.{},
     /// 模型长任务 scratchpad（Task* 工具共享）
     tasks: TaskStore,
     /// Session-scoped objective state for /goal and /loop.
@@ -346,6 +353,10 @@ pub const App = struct {
         // 计算本 session 的 memdir 路径(通道 B 自动记忆)+ mkdir + 挂权限豁免。
         app.initMemdir();
 
+        // 初始化 TinyKG(记忆/计划/DAG 真相源)。best-effort:失败 → kg=null/degraded,
+        // KG 工具不注册、注入段不出现——KG 是增强非依赖(设计 §6)。
+        app.initKg();
+
         // 从 config.json 加载 permission_rules（旧 schema，向后兼容）
         app.loadPermissionRules() catch |err| {
             @import("util/log.zig").debug("permission", "no rules loaded: {s}", .{@errorName(err)});
@@ -371,7 +382,7 @@ pub const App = struct {
 
         // 构造 system prompt（依赖 config.model）。# Using your tools 段按 enabled_tool_names
         // 动态裁剪（对应 cc getUsingYourToolsSection(enabledTools)）。失败仅 log，保持 null。
-        app.system_prompt = system_prompt_mod.buildFull(allocator, app.config.model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs) catch |err| blk: {
+        app.system_prompt = system_prompt_mod.buildFull(allocator, app.config.model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady()) catch |err| blk: {
             @import("util/log.zig").warn("sysprompt", "build failed: {s} (continuing without system prompt)", .{@errorName(err)});
             break :blk null;
         };
@@ -390,6 +401,7 @@ pub const App = struct {
             .cwd = app.cwdAbs(),
             .home = app.homeDir(),
             .auto_mem = auto_mem,
+            .kg_summary = app.kg_summary,
         }) catch |err| blk: {
             @import("util/log.zig").warn("memory", "user_context build failed: {s}", .{@errorName(err)});
             break :blk null;
@@ -430,6 +442,9 @@ pub const App = struct {
         if (app.openai_client) |*oc| oc.deinit();
         if (app.gemini_client) |*gc| gc.deinit();
         app.conversation.deinit();
+        if (app.kg) |*k| k.deinit();
+        if (app.kg_projects_dir.len > 0) app.allocator.free(app.kg_projects_dir);
+        if (app.kg_summary.len > 0) app.allocator.free(app.kg_summary);
         app.allocator.free(app.tool_defs);
         app.skills.deinit();
         app.read_state.deinit();
@@ -527,7 +542,7 @@ pub const App = struct {
 
         if (app.agent_jobs) |*aj| try aj.setModel(model);
         const sp_mod = @import("core/system_prompt.zig");
-        const new_system_prompt = sp_mod.buildFull(app.allocator, model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs) catch null;
+        const new_system_prompt = sp_mod.buildFull(app.allocator, model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady()) catch null;
 
         if (app.model_switch_owned) |old| app.allocator.free(old);
         app.model_switch_owned = model;
@@ -680,6 +695,66 @@ pub const App = struct {
         app.memdir_abs = app.allocator.dupe(u8, path) catch return;
         // 挂到 permission_ctx:写 memdir 子树内文件任何模式豁免(decision isAutoMemPath)。
         app.permission_ctx.memdir_abs = app.memdir_abs;
+    }
+
+    /// KG 就绪判定(kg 非 null 且 ready)。system prompt / 工具注册用。
+    pub fn kgReady(app: *const App) bool {
+        if (app.kg) |*k| return k.ready;
+        return false;
+    }
+
+    /// 初始化 TinyKG(设计 v3-final §1 D2、§6)。best-effort:任何步骤失败都不致命。
+    /// P1:同步 ensureReady + 同步注入摘要(本地未竞争 store 为毫秒级)。
+    /// **P2 待办**:移到后台线程(锁竞争最坏 35s;设计 §5 要求启动零阻塞)——已记账。
+    fn initKg(app: *App) void {
+        const home = app.homeDir();
+        const cwd = app.cwdAbs();
+        if (home.len == 0 or cwd.len == 0) return;
+
+        // per-project 指针目录 = memdir 的父目录(`{home}/.cc-zig/projects/<hash>`)。
+        const cwd_hash = @import("core/transcript.zig").hashCwd(cwd);
+        app.kg_projects_dir = std.fmt.allocPrint(app.allocator, "{s}/.cc-zig/projects/{s}", .{ home, cwd_hash[0..] }) catch return;
+
+        // domain = git 根目录名 + hash 后缀(可读 + 防撞);非 git 用 cwd basename。
+        const domain = app.computeKgDomain(cwd_hash) catch return;
+        defer app.allocator.free(domain);
+
+        const kg_bin_cfg: ?[]const u8 = null; // config.json kg_bin(P2 接线)
+        const kg_store_cfg: ?[]const u8 = null;
+        var client = @import("kg/client.zig").KgClient.init(app.allocator, .{
+            .home = home,
+            .domain = domain,
+            .config_bin = kg_bin_cfg,
+            .config_store = kg_store_cfg,
+            .exe_dir = app.exeDir(),
+        }) catch return;
+        client.ensureReady();
+        app.kg = client;
+
+        // 注入摘要(空态零输出)。
+        if (client.ready) {
+            const inject = @import("kg/inject.zig");
+            if (inject.buildSummary(app.allocator, &app.kg.?, app.kg_projects_dir)) |sum| {
+                app.kg_summary = sum;
+            }
+        }
+    }
+
+    /// domain id:git 根目录 basename + cwd_hash 前 8(可读 + 防撞)。git 失败退 cwd basename。
+    fn computeKgDomain(app: *App, cwd_hash: [16]u8) ![]u8 {
+        const cwd = app.cwdAbs();
+        const base = std.fs.path.basename(cwd);
+        const safe_base = if (base.len == 0) "root" else base;
+        return std.fmt.allocPrint(app.allocator, "{s}-{s}", .{ safe_base, cwd_hash[0..8] });
+    }
+
+    /// cc-zig 可执行文件所在目录(定位 vendor/tinykg)。
+    /// P1:std 无稳定 selfExePath,vendor 定位改由调用方经 config/env 指定;
+    /// 未指定时回落 dev 路径(`~/prj/tinykg/...`)。返 null = 跳过 vendor 查找。
+    /// **P2 待办**:main 捕获 argv[0] 存进 config,exeDir 从此解析 vendor(记账)。
+    fn exeDir(app: *App) ?[]const u8 {
+        _ = app;
+        return null;
     }
 
     /// Shift+Tab 的纯状态机:当前 mode → 下一个 mode(对齐 Claude Code)。

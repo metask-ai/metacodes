@@ -7,3 +7,4 @@ tests/e2e/runs/
 bin/
 __pycache__/
 *.pyc
+vendor/tinykg/tinykg

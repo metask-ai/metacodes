@@ -274,12 +274,21 @@ pub fn buildWithSkillsAndAgents(
     skills: ?*const @import("../skills/skill.zig").SkillSet,
     agents: ?*const @import("../agents/set.zig").AgentSet,
 ) ![]u8 {
-    return buildFull(allocator, model, skills, agents, null, "");
+    return buildFull(allocator, model, skills, agents, null, "", false);
 }
 
 /// 最完整版:额外接收 enabled_tool_names,让 # Using your tools 段按工具集动态裁剪
 /// (对应 cc getUsingYourToolsSection(enabledTools))。
 /// enabled_tool_names 为 null → 用全量静态 USING_TOOLS_SECTION(向后兼容)。
+/// KG 段(设计 KG_DESIGN v3-final §5):仅 kg ready 时拼。≤15 行——决策边界 + 写入纪律。
+pub const KG_SECTION =
+    \\# Knowledge Graph
+    \\A persistent knowledge graph stores durable memory and the cross-session task graph. It outlives this session: decisions, user corrections, and plan progress recorded there will be visible to future sessions.
+    \\
+    \\When to KgRecall: the user refers to prior decisions or past work; you are continuing cross-session work; an ambiguous request likely depends on earlier project choices. Skip it for self-contained tasks.
+    \\When to KgRemember: a decision was made and confirmed; the user corrected you (record the rule + why); you learned a non-obvious project fact. Write short, structured facts — never transient task chatter or raw logs.
+;
+
 pub fn buildFull(
     allocator: std.mem.Allocator,
     model: []const u8,
@@ -287,6 +296,7 @@ pub fn buildFull(
     agents: ?*const @import("../agents/set.zig").AgentSet,
     enabled_tool_names: ?[]const []const u8,
     memdir_abs: []const u8,
+    kg_ready: bool,
 ) ![]u8 {
     const env_section = try buildEnvSection(allocator, model);
     defer allocator.free(env_section);
@@ -315,6 +325,8 @@ pub fn buildFull(
     const deferred_section = try buildDeferredToolsSection(allocator);
     defer allocator.free(deferred_section);
 
+    const kg_section: []const u8 = if (kg_ready) KG_SECTION else "";
+
     const sep = "\n\n";
     return try std.mem.concat(allocator, u8, &.{
         INTRO_SECTION,             sep,
@@ -328,7 +340,8 @@ pub fn buildFull(
         env_section,               if (memory_section.len > 0) sep else "",
         memory_section,            if (skills_section.len > 0) sep else "",
         skills_section,            if (agents_section.len > 0) sep else "",
-        agents_section,
+        agents_section,            if (kg_section.len > 0) sep else "",
+        kg_section,
     });
 }
 

@@ -54,6 +54,9 @@ pub const BuildOptions = struct {
     home: []const u8 = "",
     /// AutoMem 段(memdir MEMORY.md 索引,已截断)。空则不加。owned-by-caller。
     auto_mem: []const u8 = "",
+    /// KG 注入段(持久任务图启动快照,kg/inject.zig 构建)。空则不加(空态零输出,
+    /// 设计 KG_DESIGN v3-final §5)。owned-by-caller。
+    kg_summary: []const u8 = "",
 };
 
 /// 构建 user-context 文本(owned)。无任何内容(CLAUDE.md 链空 + auto_mem 空)返回 null
@@ -66,7 +69,8 @@ pub fn build(allocator: std.mem.Allocator, opts: BuildOptions) !?[]u8 {
 
     const has_chain = chain.len > 0;
     const has_mem = opts.auto_mem.len > 0;
-    if (!has_chain and !has_mem) return null;
+    const has_kg = opts.kg_summary.len > 0;
+    if (!has_chain and !has_mem and !has_kg) return null;
 
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -89,6 +93,11 @@ pub fn build(allocator: std.mem.Allocator, opts: BuildOptions) !?[]u8 {
         if (has_chain) try out.appendSlice(allocator, "\n");
         try out.appendSlice(allocator, opts.auto_mem);
         try out.appendSlice(allocator, "\n");
+    }
+    if (has_kg) {
+        // KG 持久任务图快照(设计 v3-final §5;空态在上游即零输出,这里必非空)。
+        try out.appendSlice(allocator, "\n");
+        try out.appendSlice(allocator, opts.kg_summary);
     }
 
     // currentDate
@@ -175,6 +184,27 @@ test "build: auto_mem appended" {
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "# Memory Index") != null);
     try testing.expect(std.mem.indexOf(u8, out, "[Foo](foo.md)") != null);
+}
+
+test "build: kg_summary 注入(DoD:KG 段端到端进首条 user message)" {
+    const a = testing.allocator;
+    // 仅 kg_summary,无 CLAUDE.md 无 auto_mem:也应产出(has_kg 触发)。
+    const out = (try build(a, .{
+        .cwd = "",
+        .home = "",
+        .kg_summary = "# Knowledge Graph — 持久任务图(root 7)\n开放任务:2 ready / 1 blocked(共 3)\n",
+    })).?;
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "Knowledge Graph — 持久任务图(root 7)") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "2 ready / 1 blocked") != null);
+    // 仍在 system-reminder 信封内(与 claudeMd 同车)。
+    try testing.expect(std.mem.indexOf(u8, out, "<system-reminder>") != null);
+}
+
+test "build: kg_summary 空 + 无其他内容 → null(空态零输出)" {
+    const a = testing.allocator;
+    const out = try build(a, .{ .cwd = "", .home = "", .kg_summary = "" });
+    try testing.expect(out == null);
 }
 
 test "build: disabled via env CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 returns null" {
