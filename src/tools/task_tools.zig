@@ -15,6 +15,7 @@ const task_store = @import("../core/task_store.zig");
 const TaskStatus = task_store.TaskStatus;
 const Task = task_store.Task;
 const util_json = @import("../util/json.zig");
+const common = @import("common.zig");
 
 fn requireStore(ctx: *const ToolContext) !*task_store.TaskStore {
     return ctx.tasks orelse return error.TaskStoreUnavailable;
@@ -176,12 +177,98 @@ pub fn executeList(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(ctx.allocator);
     try out.append(ctx.allocator, '[');
-    for (store.tasks.items, 0..) |t, i| {
-        if (i > 0) try out.append(ctx.allocator, ',');
+    var first = true;
+    for (store.tasks.items) |t| {
+        if (!first) try out.append(ctx.allocator, ',');
+        first = false;
         try writeTaskJson(&out, ctx.allocator, t, false);
     }
+    // KG 持久计划步骤(有活跃 kg_root 时,从 frontier 呈现;id="kg-<node>",readiness→status)。
+    // 这让模型在同一份任务清单里看到跨会话计划步骤(设计 v3 §2:图为唯一真相)。
+    appendKgFrontier(ctx, &out, &first) catch {}; // best-effort:KG 失败不影响会话内 todo
     try out.append(ctx.allocator, ']');
     return try out.toOwnedSlice(ctx.allocator);
+}
+
+/// 把 KG frontier(活跃计划图的开放步骤)作为任务项追加进 TaskList 输出。
+/// id="kg-<node>";status:ready→pending / blocked|missing→"blocked"(TUI/模型据此排序)。
+fn appendKgFrontier(ctx: *const ToolContext, out: *std.ArrayList(u8), first: *bool) !void {
+    const kg = ctx.kg orelse return;
+    if (!kg.ready or ctx.kg_projects_dir.len == 0) return;
+    const inject = @import("../kg/inject.zig");
+    const root = inject.readIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_root") orelse return;
+    // stale 防御:root 非 task → 清指针,不呈现。
+    if (!(kg.nodeIsTask(root) catch false)) {
+        inject.clearIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_root");
+        return;
+    }
+    const rows = kg.frontier(root, 50) catch return;
+    defer {
+        for (rows) |*r| r.deinit(ctx.allocator);
+        ctx.allocator.free(rows);
+    }
+    for (rows) |r| {
+        if (!first.*) try out.append(ctx.allocator, ',');
+        first.* = false;
+        const status = if (r.readiness == .ready) "pending" else "blocked";
+        try out.appendSlice(ctx.allocator, "{\"id\":\"kg-");
+        const idbuf = try std.fmt.allocPrint(ctx.allocator, "{d}", .{r.task_id});
+        defer ctx.allocator.free(idbuf);
+        try out.appendSlice(ctx.allocator, idbuf);
+        try out.appendSlice(ctx.allocator, "\",\"subject\":");
+        try writeString(out, ctx.allocator, r.text);
+        try out.appendSlice(ctx.allocator, ",\"status\":\"");
+        try out.appendSlice(ctx.allocator, status);
+        try out.appendSlice(ctx.allocator, "\",\"plan_step\":true,\"readiness\":\"");
+        try out.appendSlice(ctx.allocator, @tagName(r.readiness));
+        try out.appendSlice(ctx.allocator, "\"}");
+    }
+}
+
+/// KG 计划步骤更新(TaskUpdate 的 kg-<node> 路由)。completed→closeTask,deleted→deleteTask。
+fn updateKgTask(ctx: *const ToolContext, node_id_str: []const u8, args: []const u8) anyerror![]u8 {
+    const kg = ctx.kg orelse return error.KgUnavailable;
+    if (!kg.ready) return error.KgUnavailable;
+    const node_id = std.fmt.parseInt(u64, node_id_str, 10) catch return error.InvalidStatus;
+
+    const status_str = (try extractString(args, "status")) orelse {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KG 计划步骤只支持 status=completed|deleted", .{});
+        return error.InvalidStatus;
+    };
+    const st = TaskStatus.fromString(status_str) orelse return error.InvalidStatus;
+    switch (st) {
+        .completed => {
+            const evidence = (try extractUnescaped(ctx.allocator, args, "evidence")) orelse
+                (try extractUnescaped(ctx.allocator, args, "description")) orelse
+                try ctx.allocator.dupe(u8, "completed");
+            defer ctx.allocator.free(evidence);
+            kg.closeTask(node_id, evidence) catch |e| {
+                common.setErrorDetail(ctx.error_detail, ctx.allocator, "闭合计划步骤失败({s}): {s}", .{ @errorName(e), kg.detail() });
+                return error.KgCloseFailed;
+            };
+            // 搭车:返回更新后的 frontier(刷新看板——设计 §2.2 R2 幂等"看板"非"领任务")。
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(ctx.allocator);
+            try out.appendSlice(ctx.allocator, "{\"ok\":true,\"closed\":true,\"next\":");
+            var first = true;
+            try out.append(ctx.allocator, '[');
+            appendKgFrontier(ctx, &out, &first) catch {};
+            try out.append(ctx.allocator, ']');
+            try out.appendSlice(ctx.allocator, "}");
+            return out.toOwnedSlice(ctx.allocator);
+        },
+        .deleted => {
+            kg.deleteTask(node_id) catch |e| {
+                common.setErrorDetail(ctx.error_detail, ctx.allocator, "删除计划步骤失败({s})", .{@errorName(e)});
+                return error.KgCloseFailed;
+            };
+            return try ctx.allocator.dupe(u8, "{\"ok\":true,\"deleted\":true}");
+        },
+        else => {
+            // in_progress/pending 是易失 UI 态,计划步骤不落图(设计 §2:UI 态仅缓存)。
+            return try ctx.allocator.dupe(u8, "{\"ok\":true,\"note\":\"计划步骤的 in_progress 状态不持久化(UI 态)\"}");
+        },
+    }
 }
 
 // ============================================================================
@@ -191,6 +278,13 @@ pub fn executeList(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 pub fn executeUpdate(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const store = try requireStore(ctx);
     const id = try extractIdOrError(args, "taskId");
+
+    // KG 计划步骤(id 形如 "kg-<node>",由 TaskList 从 frontier 呈现)→ 路由到 KG。
+    // completed → closeTask(revise→verification,自动解锁 depends_on 链);deleted → deleteTask。
+    // 这是"DAG 驱动执行"的闭环:模型领 ready 步骤、干活、TaskUpdate completed → 下一步解锁。
+    if (std.mem.startsWith(u8, id, "kg-")) {
+        return updateKgTask(ctx, id["kg-".len..], args);
+    }
 
     if (try extractString(args, "status")) |status_str| {
         const st = TaskStatus.fromString(status_str) orelse return error.InvalidStatus;

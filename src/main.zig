@@ -36,6 +36,7 @@ pub const agent_tool = @import("tools/agent.zig");
 pub const core_task_store = @import("core/task_store.zig");
 pub const kg_client = @import("kg/client.zig");
 pub const kg_inject = @import("kg/inject.zig");
+pub const kg_plan_commit = @import("kg/plan_commit.zig");
 pub const core_goal = @import("core/goal.zig");
 pub const core_auth = auth;
 pub const core_read_state = @import("core/read_state.zig");

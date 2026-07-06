@@ -34,7 +34,14 @@ pub const PLAN_MODE_INSTRUCTIONS =
     "tag <proposed_plan> on its own line, the markdown plan on the next lines, the closing tag </proposed_plan> " ++
     "on its own line. Then call ExitPlanMode (no need to repeat the plan in its arguments). " ++
     "Do NOT ask 'should I proceed?' in plain text — ExitPlanMode requests approval. The user approves (then you " ++
-    "implement) or asks you to keep refining. Produce at most one <proposed_plan> block per turn.";
+    "implement) or asks you to keep refining. Produce at most one <proposed_plan> block per turn. " ++
+    "PLAN STRUCTURE: write the plan as a numbered or bulleted list of concrete, independently-completable, " ++
+    "verifiable steps. On approval the plan becomes a PERSISTENT TASK GRAPH — you and future sessions resume " ++
+    "progress from it (via TaskList), so each step must stand on its own. Steps are serial by default (each " ++
+    "depends on the previous). If steps are independent, mark dependencies explicitly at the end of a step line " ++
+    "as '(depends: N)' or '(depends: N,M)' referring to earlier step numbers — independent steps can then be " ++
+    "executed in parallel. After approval, use TaskList to pick ready steps and TaskUpdate completed to close " ++
+    "each one (which auto-unlocks its dependents).";
 
 pub fn executeEnter(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     _ = args;
@@ -139,12 +146,16 @@ pub fn executeExit(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             const restore = prev_slot.* orelse .default;
             pctx.setMode(restore);
             prev_slot.* = null;
-            return try std.fmt.allocPrint(ctx.allocator, "{{\"mode\":\"{s}\",\"status\":\"approved\"}}", .{@tagName(pctx.modeValue())});
+            const kg_note = try commitPlanToGraph(ctx, plan_md);
+            defer if (kg_note) |n| ctx.allocator.free(n);
+            return try std.fmt.allocPrint(ctx.allocator, "{{\"mode\":\"{s}\",\"status\":\"approved\"{s}}}", .{ @tagName(pctx.modeValue()), kg_note orelse "" });
         },
         .approve_accept_edits => {
             pctx.setMode(.accept_edits);
             prev_slot.* = null;
-            return try ctx.allocator.dupe(u8, "{\"mode\":\"acceptEdits\",\"status\":\"approved\"}");
+            const kg_note = try commitPlanToGraph(ctx, plan_md);
+            defer if (kg_note) |n| ctx.allocator.free(n);
+            return try std.fmt.allocPrint(ctx.allocator, "{{\"mode\":\"acceptEdits\",\"status\":\"approved\"{s}}}", .{kg_note orelse ""});
         },
         .reject => {
             // 留在 plan 模式;告知模型继续打磨,不要执行。
@@ -153,6 +164,38 @@ pub fn executeExit(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
                 "\"note\":\"User wants to keep planning. Continue refining the plan and do not execute. Call ExitPlanMode again when the plan is updated.\"}");
         },
     }
+}
+
+/// 批准时把计划落成持久任务 DAG(设计 §3)。返回 owned JSON 片段(",\"kg\":{...}"追加进
+/// 工具结果)供模型立即进入执行;KG 不可用/失败 → 返回 null(计划仍批准,不阻塞——降级)。
+/// 写 kg_root 指针文件供下次 session 恢复。
+fn commitPlanToGraph(ctx: *const ToolContext, plan_md: []const u8) !?[]u8 {
+    const kg = ctx.kg orelse return null;
+    if (!kg.ready or plan_md.len == 0) return null;
+
+    const plan_commit = @import("../kg/plan_commit.zig");
+    const result = plan_commit.commit(ctx.allocator, kg, plan_md) catch |e| {
+        // 落图失败不阻塞批准(降级):模型仍按计划执行,只是没进图。
+        return try std.fmt.allocPrint(ctx.allocator, ",\"kg\":{{\"committed\":false,\"error\":\"{s}\"}}", .{@errorName(e)});
+    };
+
+    // 写 kg_root 指针(下次 session 从 frontier 恢复)。
+    if (ctx.kg_projects_dir.len > 0) {
+        const inject = @import("../kg/inject.zig");
+        inject.writeIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_root", result.root_id) catch {};
+    }
+
+    if (!result.structured) {
+        return try std.fmt.allocPrint(ctx.allocator,
+            ",\"kg\":{{\"committed\":true,\"root_id\":{d},\"structured\":false," ++
+            "\"note\":\"计划未能结构化,已按整体目标入图。用 TaskList 查看,TaskUpdate completed 闭合。\"}}",
+            .{result.root_id});
+    }
+    const status = if (result.incomplete) "incomplete" else "complete";
+    return try std.fmt.allocPrint(ctx.allocator,
+        ",\"kg\":{{\"committed\":true,\"root_id\":{d},\"steps\":{d}/{d},\"status\":\"{s}\"," ++
+        "\"note\":\"计划已存为持久任务图({d} 步)。用 TaskList 领 ready 任务,完成后 TaskUpdate completed(会自动解锁后续步骤)。未来 session 从图恢复进度。\"}}",
+        .{ result.root_id, result.steps_committed, result.total_steps, status, result.total_steps });
 }
 
 test "EnterPlanMode without ctx returns NotAvailable" {

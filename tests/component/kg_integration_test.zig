@@ -237,3 +237,156 @@ test "L2 KG: 版本门 — degraded 明示且不 spawn" {
     // degraded 后调用直接返回 Degraded(不 spawn)。
     try std.testing.expectError(cc.kg_client.KgError.Degraded, kg.recall("x", 5, false));
 }
+
+test "L2 KG: plan 落图 → frontier → 闭合解锁(DAG 驱动全链)" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/kgplan.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-plan");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const plan_commit = @import("cc").kg_plan_commit;
+    const plan =
+        \\重构解析器
+        \\1. 读现有代码
+        \\2. 写新实现
+        \\3. 补测试
+    ;
+    const r = try plan_commit.commit(a, &kg, plan);
+    try std.testing.expect(r.structured);
+    try std.testing.expectEqual(@as(usize, 3), r.steps_committed);
+    try std.testing.expect(!r.incomplete);
+
+    // frontier:步骤1 ready,步骤2/3 因 depends_on 链 missing_dependencies。
+    const rows1 = try kg.frontier(r.root_id, 10);
+    defer {
+        for (rows1) |*row| row.deinit(a);
+        a.free(rows1);
+    }
+    var ready1: usize = 0;
+    var step1_id: u64 = 0;
+    for (rows1) |row| {
+        if (row.readiness == .ready) {
+            ready1 += 1;
+            if (std.mem.indexOf(u8, row.text, "读现有代码") != null) step1_id = row.task_id;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), ready1); // 只有步骤1 ready
+    try std.testing.expect(step1_id != 0);
+
+    // 闭合步骤1 → 步骤2 应自动变 ready。
+    try kg.closeTask(step1_id, "步骤1完成:代码已读");
+    const rows2 = try kg.frontier(r.root_id, 10);
+    defer {
+        for (rows2) |*row| row.deinit(a);
+        a.free(rows2);
+    }
+    var has_step1 = false;
+    var step2_ready = false;
+    for (rows2) |row| {
+        if (std.mem.indexOf(u8, row.text, "读现有代码") != null) has_step1 = true;
+        if (std.mem.indexOf(u8, row.text, "写新实现") != null and row.readiness == .ready) step2_ready = true;
+    }
+    try std.testing.expect(!has_step1); // 步骤1 已闭合,退出 frontier
+    try std.testing.expect(step2_ready); // 步骤2 解锁
+}
+
+test "L2 KG: 无结构计划 → 全文单 root task(不阻塞,设计降级)" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/kgflat.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-flat");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const plan_commit = @import("cc").kg_plan_commit;
+    const r = try plan_commit.commit(a, &kg, "就改个 typo,没有步骤结构");
+    try std.testing.expect(!r.structured); // 无结构
+    try std.testing.expect(r.root_id > 0); // 但仍落图(全文单 root task)
+}
+
+test "L2 KG: DAG 驱动闭环经工具 — TaskList 呈现 frontier + TaskUpdate kg- 闭合解锁" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const proj_dir = pbuf[0..dir_len]; // 用 tmp 目录当 kg_projects_dir
+    const store = try std.fmt.allocPrint(a, "{s}/kgloop.kg", .{proj_dir});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-loop");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    // 落图 3 步线性计划 + 写 kg_root 指针。
+    const plan_commit = @import("cc").kg_plan_commit;
+    const inject = @import("cc").kg_inject;
+    const r = try plan_commit.commit(a, &kg, "计划\n1. A\n2. B\n3. C");
+    try inject.writeIdPointer(a, proj_dir, "kg_root", r.root_id);
+
+    // 构造 ToolContext(kg + kg_projects_dir + tasks)。
+    const task_tools = @import("cc").task_tools;
+    const TaskStore = @import("cc").core_task_store.TaskStore;
+    var tstore = TaskStore.init(a);
+    defer tstore.deinit();
+    const ctx = @import("cc").tool_context.ToolContext{
+        .allocator = a,
+        .tasks = &tstore,
+        .kg = &kg,
+        .kg_projects_dir = proj_dir,
+    };
+
+    // TaskList:应含 kg- 计划步骤,步骤1 ready(pending)、步骤2/3 blocked。
+    const list1 = try task_tools.executeList(&ctx, "{}");
+    defer a.free(list1);
+    try std.testing.expect(std.mem.indexOf(u8, list1, "\"plan_step\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list1, "\"kg-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list1, "\"subject\":\"A\"") != null);
+
+    // 找到步骤 A 的 kg-id(它是 ready)。frontier 直接查更稳。
+    const rows = try kg.frontier(r.root_id, 10);
+    defer {
+        for (rows) |*row| row.deinit(a);
+        a.free(rows);
+    }
+    var a_id: u64 = 0;
+    for (rows) |row| {
+        if (std.mem.eql(u8, std.mem.trim(u8, row.text, " "), "A")) a_id = row.task_id;
+    }
+    try std.testing.expect(a_id != 0);
+
+    // TaskUpdate kg-<A> completed → 闭合,返回刷新的 frontier(next 含 B ready)。
+    const upd_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"completed\",\"evidence\":\"A done\"}}", .{a_id});
+    defer a.free(upd_args);
+    const upd = try task_tools.executeUpdate(&ctx, upd_args);
+    defer a.free(upd);
+    try std.testing.expect(std.mem.indexOf(u8, upd, "\"closed\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, upd, "\"subject\":\"B\"") != null); // B 解锁进 next
+
+    // A 已闭合退出 frontier;再 TaskList 不应再含 subject "A"(它现在是 verification)。
+    const list2 = try task_tools.executeList(&ctx, "{}");
+    defer a.free(list2);
+    try std.testing.expect(std.mem.indexOf(u8, list2, "\"subject\":\"A\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, list2, "\"subject\":\"B\"") != null);
+}

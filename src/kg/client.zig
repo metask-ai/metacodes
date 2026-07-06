@@ -259,6 +259,62 @@ pub const KgClient = struct {
         return self.dataError("add-node 输出不可解析: {s}", .{line});
     }
 
+    // ── 任务 DAG(P2:write-through + plan 落图 + 图驱动)──────────────
+    // 契约见设计 §9 核对表:depends_on 串行、单次 revise 闭合、frontier 单层。
+
+    /// 建任务节点(schema_type=todo|plan_step)。返回 node id。best-effort provenance。
+    pub fn createTask(self: *KgClient, text: []const u8, schema_type: []const u8) KgError!u64 {
+        const out = try self.runCheckedWrite(&.{
+            "add-node",         self.store_path, "task",          text,
+            "--domain",         self.domain,     "--schema-type", schema_type,
+        });
+        defer self.freeOut(out);
+        const line = std.mem.trim(u8, out.stdout, " \r\n");
+        if (std.mem.startsWith(u8, line, "node ")) {
+            return std.fmt.parseInt(u64, line["node ".len..], 10) catch self.dataError("createTask 输出不可解析: {s}", .{line});
+        }
+        return self.dataError("createTask 输出不可解析: {s}", .{line});
+    }
+
+    /// 建边(contains/depends_on/blocks…)。环检测由 tinykg dag 层强制 → data 错透传。
+    pub fn addEdge(self: *KgClient, src: u64, rel: []const u8, dst: u64) KgError!void {
+        var sbuf: [24]u8 = undefined;
+        var dbuf: [24]u8 = undefined;
+        const s_str = std.fmt.bufPrint(&sbuf, "{d}", .{src}) catch unreachable;
+        const d_str = std.fmt.bufPrint(&dbuf, "{d}", .{dst}) catch unreachable;
+        const out = try self.runCheckedWrite(&.{ "add-edge", self.store_path, s_str, rel, d_str });
+        self.freeOut(out);
+    }
+
+    /// 闭合任务:`revise <id> verification "<evidence>"`(单步,解锁依赖链+出 frontier)。
+    pub fn closeTask(self: *KgClient, task_id: u64, evidence: []const u8) KgError!void {
+        var idbuf: [24]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{task_id}) catch unreachable;
+        const out = try self.runCheckedWrite(&.{
+            "revise",           self.store_path, id_str,          "verification",
+            evidence,           "--domain",      self.domain,     "--schema-type",
+            "verification",
+        });
+        self.freeOut(out);
+    }
+
+    /// 删任务(TaskUpdate deleted → delete-node)。
+    pub fn deleteTask(self: *KgClient, task_id: u64) KgError!void {
+        return self.forget(task_id);
+    }
+
+    /// 单任务 readiness(TaskList 排序/看板用)。
+    pub fn taskReadiness(self: *KgClient, task_id: u64) KgError!FrontierRow.Readiness {
+        var idbuf: [24]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{task_id}) catch unreachable;
+        const out = try self.runChecked(&.{ "task-ready", self.store_path, id_str });
+        defer self.freeOut(out);
+        const v = std.mem.trim(u8, out.stdout, " \r\n");
+        if (std.mem.eql(u8, v, "ready")) return .ready;
+        if (std.mem.eql(u8, v, "blocked")) return .blocked;
+        return .missing_dependencies;
+    }
+
     /// 给节点打 provenance(session id)。best-effort:失败仅 log,不上抛。
     pub fn tagProvenance(self: *KgClient, node_id: u64, session_id: []const u8) void {
         var idbuf: [24]u8 = undefined;

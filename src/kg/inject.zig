@@ -117,8 +117,12 @@ fn appendPrint(out: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime f
 
 fn firstLineTrunc(text: []const u8, max: usize) []const u8 {
     const line_end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
-    var end = @min(line_end, max);
-    while (end > 0 and (text[end - 1] & 0xC0) == 0x80) end -= 1; // UTF-8 边界
+    // 只在**因 max 截断**(切点可能落在多字节字符中间)时才回退到 UTF-8 边界。
+    // line_end 是自然边界(字符完整),不能回退——否则会把 '\n' 前最后一个完整 CJK
+    // 字符切掉、产出坏 UTF-8("步骤一:读代码" → "步骤一:读代�")。
+    if (line_end <= max) return text[0..line_end];
+    var end = max;
+    while (end > 0 and (text[end - 1] & 0xC0) == 0x80) end -= 1; // 回到字符起点,不切半个字
     return text[0..end];
 }
 

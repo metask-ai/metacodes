@@ -118,6 +118,9 @@ pub const ToolContext = struct {
     /// TinyKG 客户端(记忆/计划/DAG 真相源;设计 KG_DESIGN v3-final)。
     /// null = 未配置(缺二进制)——KG 工具此时不会注册;non-null 但 !ready = degraded。
     kg: ?*@import("../kg/client.zig").KgClient = null,
+    /// KG per-project 指针目录(`{home}/.cc-zig/projects/<git根hash>`)。plan 落图写 kg_root
+    /// 到此。空串 = 未配置。设计 KG_DESIGN v3-final §3。
+    kg_projects_dir: []const u8 = "",
 
     /// 工具抛错时可选的富文本 detail:工具在 `return error.X` 前写 `*error_detail = msg`,
     /// tool_exec 读到后用它替代通用的 "<tool> failed with X" 作为模型可见 detail。
