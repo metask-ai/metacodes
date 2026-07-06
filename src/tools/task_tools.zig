@@ -139,6 +139,23 @@ pub fn executeCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const active_form = try extractUnescaped(ctx.allocator, args, "activeForm");
     defer if (active_form) |af| ctx.allocator.free(af);
 
+    // KG write-through(设计 v3 §2:图为唯一真相):KG 可用 → todo 直接落图挂 inbox root,
+    // 返回 id="kg-<node>"(单命名空间——后续 TaskUpdate/Get/Stop 一律走 kg- 路由)。
+    // 失败(KG 降级/落图错)→ 退内存 store(现状,id="N")。**绝不 brick**:任何 KG 错都不
+    // 让 TaskCreate 失败,只退内存(KG 是增强非依赖)。
+    if (createKgTask(ctx, subject, description)) |kg_node| {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(ctx.allocator);
+        try out.appendSlice(ctx.allocator, "{\"task\":{\"id\":\"kg-");
+        const idbuf = try std.fmt.allocPrint(ctx.allocator, "{d}", .{kg_node});
+        defer ctx.allocator.free(idbuf);
+        try out.appendSlice(ctx.allocator, idbuf);
+        try out.appendSlice(ctx.allocator, "\",\"subject\":");
+        try writeString(&out, ctx.allocator, subject);
+        try out.appendSlice(ctx.allocator, ",\"persisted\":true}}");
+        return try out.toOwnedSlice(ctx.allocator);
+    }
+
     const t = try store.create(subject, description, active_form);
 
     var out: std.ArrayList(u8) = .empty;
@@ -151,6 +168,42 @@ pub fn executeCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     return try out.toOwnedSlice(ctx.allocator);
 }
 
+/// TaskCreate write-through:把 todo 落图挂 inbox root。返回 kg node id(成功)或 null(降级/失败)。
+/// **best-effort 且绝不 brick**:任何一步失败都返 null → 上层退内存 store。
+fn createKgTask(ctx: *const ToolContext, subject: []const u8, description: []const u8) ?u64 {
+    const kg = ctx.kg orelse return null;
+    if (!kg.ready or ctx.kg_projects_dir.len == 0) return null;
+
+    const inbox = ensureInboxRoot(ctx, kg) orelse return null;
+
+    // 节点文本 = subject + 换行 + description(首行 = 看板标题,firstLineTrunc 只取首行)。
+    const text = if (description.len > 0)
+        std.fmt.allocPrint(ctx.allocator, "{s}\n{s}", .{ subject, description }) catch return null
+    else
+        ctx.allocator.dupe(u8, subject) catch return null;
+    defer ctx.allocator.free(text);
+
+    const node = kg.createTask(text, "todo") catch return null;
+    // contains 边失败:节点已建但没挂进 inbox → 它仍是合法 task,只是不在 inbox frontier。
+    // 不回滚(delete 是全店重写,代价大);返回 node id,frontier 少显一条不致命。
+    kg.addEdge(inbox, "contains", node) catch {};
+    return node;
+}
+
+/// 懒建 inbox root(会话待办容器)。读 kg_inbox 指针;缺失/stale → 建新 root task + 写指针。
+/// 返回 inbox root id 或 null(KG 错)。
+fn ensureInboxRoot(ctx: *const ToolContext, kg: *@import("../kg/client.zig").KgClient) ?u64 {
+    const inject = @import("../kg/inject.zig");
+    if (inject.readIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_inbox")) |id| {
+        // stale 校验:指针指向的必须仍是 task(被 GC/改写则重建)。
+        if (kg.nodeIsTask(id) catch false) return id;
+        inject.clearIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_inbox");
+    }
+    const root = kg.createTask("会话待办(ad-hoc todos)", "inbox_root") catch return null;
+    inject.writeIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_inbox", root) catch {};
+    return root;
+}
+
 // ============================================================================
 // TaskGet
 // ============================================================================
@@ -158,6 +211,10 @@ pub fn executeCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 pub fn executeGet(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const store = try requireStore(ctx);
     const id = try extractIdOrError(args, "taskId");
+
+    // KG 任务(id="kg-<node>")→ 从图取节点文本(单命名空间:write-through 后 todo 也是 kg-)。
+    if (std.mem.startsWith(u8, id, "kg-")) return getKgTask(ctx, id["kg-".len..]);
+
     const t = store.get(id) orelse return error.TaskNotFound;
 
     var out: std.ArrayList(u8) = .empty;
@@ -196,18 +253,26 @@ pub fn executeList(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     return try out.toOwnedSlice(ctx.allocator);
 }
 
-/// 把 KG frontier(活跃计划图的开放步骤)作为任务项追加进 TaskList 输出。
-/// id="kg-<node>";status:ready→pending / blocked|missing→"blocked"(TUI/模型据此排序)。
+/// 把 KG frontier(计划图步骤 + inbox todos)作为任务项追加进 TaskList 输出。
+/// 两个 root:kg_root(plan_step,plan 批准建)+ kg_inbox(todo,TaskCreate write-through 建)。
+/// id="kg-<node>";status:ready→pending / blocked|missing→"blocked"。
 fn appendKgFrontier(ctx: *const ToolContext, out: *std.ArrayList(u8), first: *bool) !void {
     const kg = ctx.kg orelse return;
     if (!kg.ready or ctx.kg_projects_dir.len == 0) return;
+    try appendRootFrontier(ctx, out, first, "kg_root", true);
+    try appendRootFrontier(ctx, out, first, "kg_inbox", false);
+}
+
+/// 呈现单个 root 的 frontier。is_plan 标注 plan_step(true)vs inbox todo(false)。
+fn appendRootFrontier(ctx: *const ToolContext, out: *std.ArrayList(u8), first: *bool, pointer_name: []const u8, is_plan: bool) !void {
+    const kg = ctx.kg.?;
     const inject = @import("../kg/inject.zig");
-    const root = inject.readIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_root") orelse return;
+    const root = inject.readIdPointer(ctx.allocator, ctx.kg_projects_dir, pointer_name) orelse return;
     // M2:省掉冗余 nodeIsTask spawn——task-frontier 对非 task/不存在的 root 本就空返;
     // 空 frontier 时顺手清 stale 指针。热路径少一次子进程。
     const rows = kg.frontier(root, 50) catch return;
     if (rows.len == 0) {
-        inject.clearIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_root");
+        inject.clearIdPointer(ctx.allocator, ctx.kg_projects_dir, pointer_name);
         ctx.allocator.free(rows);
         return;
     }
@@ -224,13 +289,42 @@ fn appendKgFrontier(ctx: *const ToolContext, out: *std.ArrayList(u8), first: *bo
         defer ctx.allocator.free(idbuf);
         try out.appendSlice(ctx.allocator, idbuf);
         try out.appendSlice(ctx.allocator, "\",\"subject\":");
-        try writeString(out, ctx.allocator, r.text);
+        // subject = 首行(标题);write-through 的 todo 文本是 "subject\ndescription",
+        // 计划步骤多为单行——两者都取首行做看板标题。
+        const nl = std.mem.indexOfScalar(u8, r.text, '\n');
+        const title = if (nl) |i| r.text[0..i] else r.text;
+        try writeString(out, ctx.allocator, title);
         try out.appendSlice(ctx.allocator, ",\"status\":\"");
         try out.appendSlice(ctx.allocator, status);
-        try out.appendSlice(ctx.allocator, "\",\"plan_step\":true,\"readiness\":\"");
+        try out.appendSlice(ctx.allocator, "\",\"");
+        try out.appendSlice(ctx.allocator, if (is_plan) "plan_step" else "persisted");
+        try out.appendSlice(ctx.allocator, "\":true,\"readiness\":\"");
         try out.appendSlice(ctx.allocator, @tagName(r.readiness));
         try out.appendSlice(ctx.allocator, "\"}");
     }
+}
+
+/// KG 任务查询(TaskGet 的 kg-<node> 路由)。返回节点文本(首行 subject + 全文 description)。
+fn getKgTask(ctx: *const ToolContext, node_id_str: []const u8) anyerror![]u8 {
+    const kg = ctx.kg orelse return error.KgUnavailable;
+    if (!kg.ready) return error.KgUnavailable;
+    const node_id = std.fmt.parseInt(u64, node_id_str, 10) catch return error.TaskNotFound;
+    const text = kg.fetchNodeText(node_id) catch return error.TaskNotFound;
+    defer ctx.allocator.free(text);
+    if (text.len == 0) return error.TaskNotFound;
+    // 首行 = subject,全文 = description(与 createKgTask 的 subject\ndescription 对称)。
+    const nl = std.mem.indexOfScalar(u8, text, '\n');
+    const subject = if (nl) |i| text[0..i] else text;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(ctx.allocator);
+    try out.appendSlice(ctx.allocator, "{\"id\":\"kg-");
+    try out.appendSlice(ctx.allocator, node_id_str);
+    try out.appendSlice(ctx.allocator, "\",\"subject\":");
+    try writeString(&out, ctx.allocator, subject);
+    try out.appendSlice(ctx.allocator, ",\"description\":");
+    try writeString(&out, ctx.allocator, text);
+    try out.appendSlice(ctx.allocator, ",\"persisted\":true}");
+    return try out.toOwnedSlice(ctx.allocator);
 }
 
 /// KG 计划步骤更新(TaskUpdate 的 kg-<node> 路由)。completed→closeTask,deleted→deleteTask。
@@ -388,6 +482,17 @@ pub fn executeStop(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     const store = try requireStore(ctx);
     const id = try extractIdOrError(args, "taskId");
+    // KG 任务(kg-<node>)→ 闭合(与 TaskUpdate completed 同路径)。
+    if (std.mem.startsWith(u8, id, "kg-")) {
+        const kg = ctx.kg orelse return error.KgUnavailable;
+        if (!kg.ready) return error.KgUnavailable;
+        const node_id = std.fmt.parseInt(u64, id["kg-".len..], 10) catch return error.TaskNotFound;
+        kg.closeTask(node_id, "completed") catch |e| {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "闭合任务失败({s})", .{@errorName(e)});
+            return error.KgCloseFailed;
+        };
+        return try ctx.allocator.dupe(u8, "{\"ok\":true,\"status\":\"completed\"}");
+    }
     try store.updateStatus(id, .completed);
     return try ctx.allocator.dupe(u8, "{\"ok\":true,\"status\":\"completed\"}");
 }

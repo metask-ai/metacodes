@@ -391,6 +391,75 @@ test "L2 KG: DAG 驱动闭环经工具 — TaskList 呈现 frontier + TaskUpdate
     try std.testing.expect(std.mem.indexOf(u8, list2, "\"subject\":\"B\"") != null);
 }
 
+test "L2 KG: TaskCreate write-through — ad-hoc todo 落图 inbox,TaskList 呈现,TaskGet/Stop 走 kg-" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const proj_dir = pbuf[0..dir_len];
+    const store = try std.fmt.allocPrint(a, "{s}/kgwt.kg", .{proj_dir});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-wt");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const task_tools = @import("cc").task_tools;
+    const TaskStore = @import("cc").core_task_store.TaskStore;
+    var tstore = TaskStore.init(a);
+    defer tstore.deinit();
+    const ctx = @import("cc").tool_context.ToolContext{
+        .allocator = a,
+        .tasks = &tstore,
+        .kg = &kg,
+        .kg_projects_dir = proj_dir,
+    };
+
+    // TaskCreate → 应 write-through 返回 kg-<node>(非内存 "1")+ persisted:true。
+    const c = try task_tools.executeCreate(&ctx, "{\"subject\":\"重构解析器\",\"description\":\"拆分 lexer\"}");
+    defer a.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "\"id\":\"kg-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "\"persisted\":true") != null);
+    // 内存 store 不该有它(单命名空间,图为真相)。
+    try std.testing.expect(tstore.tasks.items.len == 0);
+
+    // 提取 kg- id。
+    const id_start = std.mem.indexOf(u8, c, "kg-").?;
+    var id_end = id_start;
+    while (id_end < c.len and c[id_end] != '"') id_end += 1;
+    const kg_id = c[id_start..id_end]; // 形如 "kg-2"
+
+    // TaskList → 应含该 todo(从 inbox frontier),persisted 标注。
+    const list = try task_tools.executeList(&ctx, "{}");
+    defer a.free(list);
+    try std.testing.expect(std.mem.indexOf(u8, list, "\"重构解析器\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list, "\"persisted\":true") != null);
+
+    // TaskGet kg-<node> → 图取节点。
+    const get_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"{s}\"}}", .{kg_id});
+    defer a.free(get_args);
+    const g = try task_tools.executeGet(&ctx, get_args);
+    defer a.free(g);
+    try std.testing.expect(std.mem.indexOf(u8, g, "重构解析器") != null);
+    try std.testing.expect(std.mem.indexOf(u8, g, "拆分 lexer") != null);
+
+    // TaskStop kg-<node> → 闭合(出 frontier)。
+    const stop_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"{s}\"}}", .{kg_id});
+    defer a.free(stop_args);
+    const s = try task_tools.executeStop(&ctx, stop_args);
+    defer a.free(s);
+    try std.testing.expect(std.mem.indexOf(u8, s, "completed") != null);
+
+    // 闭合后 TaskList 不再含该 todo。
+    const list2 = try task_tools.executeList(&ctx, "{}");
+    defer a.free(list2);
+    try std.testing.expect(std.mem.indexOf(u8, list2, "\"重构解析器\"") == null);
+}
+
 test "L2 KG: plan 落图同时建 markdown 文档,render 回人类可读(P3 D3)" {
     const a = std.testing.allocator;
     const bin = findBin(a) orelse return error.SkipZigTest;

@@ -441,7 +441,7 @@ pub const KgClient = struct {
     }
 
     /// 取节点全文(`get <id>` TSV 第 3 列,已 unescape)。owned;NotFound 返 error.Data。
-    fn fetchNodeText(self: *KgClient, node_id: u64) KgError![]u8 {
+    pub fn fetchNodeText(self: *KgClient, node_id: u64) KgError![]u8 {
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{node_id}) catch unreachable;
         const out = try self.runChecked(&.{ "get", self.store_path, id_str });
