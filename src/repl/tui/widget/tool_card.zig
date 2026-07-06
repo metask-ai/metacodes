@@ -60,6 +60,12 @@ pub fn resultRenderMode(tool_name: []const u8) ResultRenderMode {
     // - plan mode:模式切换,无输出。
     // - AskUserQuestion:走专门的交互 UI(选项菜单),非工具卡片。
     // - Skill:结果(rendered body)内联进对话文本,本身就是可见内容,无需卡片。
+    // Task 写操作(建/改/闭)→ **可见一行确认**(用户对任务建/闭合有感;cc 的 TodoWrite 也
+    // 可见渲染,这是 parity 非 divergence)。查询类(TaskList/TaskGet)+ 面板反馈的 Task/Agent
+    // spawn + TaskOutput 仍 hidden(状态在 Task 面板/subagent 卡,避免与面板重复刷屏)。
+    if (std.mem.eql(u8, tool_name, "TaskCreate") or
+        std.mem.eql(u8, tool_name, "TaskUpdate") or
+        std.mem.eql(u8, tool_name, "TaskStop")) return .summary;
     if (std.mem.startsWith(u8, tool_name, "Task")) return .hidden;
     if (std.mem.eql(u8, tool_name, "EnterPlanMode") or std.mem.eql(u8, tool_name, "ExitPlanMode")) return .hidden;
     if (std.mem.eql(u8, tool_name, "AskUserQuestion")) return .hidden;
@@ -92,6 +98,10 @@ pub fn showStartCard(tool_name: []const u8) bool {
     if (std.mem.eql(u8, tool_name, "Skill")) return false;
     // Task/Agent:起始卡可见(精确匹配,避免 TaskCreate/TaskUpdate 等子工具噪声)。
     if (std.mem.eql(u8, tool_name, "Task") or std.mem.eql(u8, tool_name, "Agent")) return true;
+    // Task 写子工具是**瞬时**操作:只显结果一行,不打起始卡(否则 sub-second 卡闪一下)。
+    if (std.mem.eql(u8, tool_name, "TaskCreate") or
+        std.mem.eql(u8, tool_name, "TaskUpdate") or
+        std.mem.eql(u8, tool_name, "TaskStop")) return false;
     // 其余:沿用 resultRenderMode——非 hidden 才打起始卡。
     return resultRenderMode(tool_name) != .hidden;
 }
@@ -780,9 +790,18 @@ fn renderTaskResult(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, 
         try appendLine(alloc, out, th.dim, line, th.reset);
         return;
     }
-    // TaskUpdate/TaskStop/TaskList/其它:{"ok":true} 等 → 简短确认。
+    // TaskUpdate/TaskStop:按结果字段给有意义的一行(闭合/删除/更新)。
     if (std.mem.indexOf(u8, output_text, "\"ok\":true") != null) {
-        try appendLine(alloc, out, th.dim, "✓ ok", th.reset);
+        const msg = if (std.mem.indexOf(u8, output_text, "\"deleted\":true") != null)
+            "task deleted"
+        else if (std.mem.indexOf(u8, output_text, "\"closed\":true") != null or
+            std.mem.indexOf(u8, output_text, "\"status\":\"completed\"") != null)
+            "task completed"
+        else
+            "task updated";
+        const line = try std.fmt.allocPrint(alloc, "{s} {s}", .{ th.icon_check, msg });
+        defer alloc.free(line);
+        try appendLine(alloc, out, th.dim, line, th.reset);
         return;
     }
     // 兜底:走通用(已 unescape 防裸 JSON 一坨)。
@@ -1864,11 +1883,16 @@ test "VISUAL demo: Edit diff(TUI_DEMO=1)" {
 // ---- opt-out 不变量(无裸 JSON / hidden 工具结果不进消息流)----
 
 test "resultRenderMode: 故意 hidden vs 应显示" {
-    // 故意 hidden:Task 族(Task 面板)、plan 模式(模式切换)、AskUserQuestion(交互 UI)、
-    // Skill(结果内联进对话文本)。
+    // 故意 hidden:Task spawn(面板/subagent 卡)、查询类 TaskList/TaskGet、TaskOutput、
+    // plan 模式、AskUserQuestion、Skill。
     try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("Task"));
-    try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("TaskCreate"));
+    try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("TaskList"));
+    try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("TaskGet"));
     try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("TaskOutput"));
+    // Task 写操作 → 可见一行确认(用户对建/闭合有感;cc TodoWrite parity)。
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("TaskCreate"));
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("TaskUpdate"));
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("TaskStop"));
     try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("EnterPlanMode"));
     try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("ExitPlanMode"));
     try testing.expectEqual(ResultRenderMode.hidden, resultRenderMode("AskUserQuestion"));

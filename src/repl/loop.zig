@@ -2047,7 +2047,7 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
     }
 
     if (std.mem.eql(u8, arg, "plan")) {
-        // P3 D3:把持久计划渲染成人类可读 markdown(取代"看不见的图")。
+        // P3 D3:把持久计划渲染成人类可读 markdown + **叠加进度**(✓完成/○ready/⊘阻塞)。
         const inject = @import("../kg/inject.zig");
         const doc = if (app.kg_projects_dir.len > 0) inject.readIdPointer(allocator, app.kg_projects_dir, "kg_plan_doc") else null;
         if (doc) |doc_id| {
@@ -2056,7 +2056,14 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
                 return;
             };
             defer allocator.free(md);
-            std.debug.print("{s}\n", .{md});
+            // 取 kg_root frontier(开放步骤 + readiness)叠加进度标记。root 缺失/空 → 纯渲染。
+            const root = inject.readIdPointer(allocator, app.kg_projects_dir, "kg_root");
+            const rows: []@import("../kg/client.zig").FrontierRow = if (root) |r| (kg.frontier(r, 100) catch &.{}) else &.{};
+            defer {
+                for (rows) |*fr| fr.deinit(allocator);
+                if (rows.len > 0) allocator.free(rows);
+            }
+            printPlanWithProgress(md, rows);
         } else {
             std.debug.print("(本项目无持久计划文档;plan 模式批准计划后从此可见)\n", .{});
         }
@@ -2085,6 +2092,65 @@ fn firstLine(text: []const u8) []const u8 {
     var n = @min(end, 100);
     while (n > 0 and (text[n - 1] & 0xC0) == 0x80) n -= 1; // 不切半个 CJK 字
     return text[0..n];
+}
+
+/// 渲染计划 markdown + 叠加进度标记(✓完成 / ○ready / ⊘阻塞)。
+/// 步骤行(列表项 `- ` / `* ` / `N. `)按文本匹配 open frontier:命中→○/⊘,未命中→✓ 完成。
+/// 非步骤行(标题/散文)原样输出。frontier 空(全做完或无 root)→ 步骤全 ✓。
+fn printPlanWithProgress(md: []const u8, rows: []const @import("../kg/client.zig").FrontierRow) void {
+    var total: usize = 0;
+    var done: usize = 0;
+    // 第一遍:计数(供进度头)。
+    var it0 = std.mem.splitScalar(u8, md, '\n');
+    while (it0.next()) |line| {
+        if (stepContent(line) != null) total += 1;
+    }
+    var it1 = std.mem.splitScalar(u8, md, '\n');
+    while (it1.next()) |line| {
+        if (stepContent(line)) |content| {
+            // 匹配 open frontier(readiness)。
+            var mark: []const u8 = "✓"; // 默认:不在 frontier = 已完成
+            for (rows) |r| {
+                if (frontierMatches(r.text, content)) {
+                    mark = switch (r.readiness) {
+                        .ready => "○",
+                        .blocked => "⊘",
+                        .missing_dependencies => "…",
+                    };
+                    break;
+                }
+            }
+            if (std.mem.eql(u8, mark, "✓")) done += 1;
+            std.debug.print("  {s} {s}\n", .{ mark, content });
+        } else {
+            std.debug.print("{s}\n", .{line});
+        }
+    }
+    if (total > 0) std.debug.print("\n进度:{d}/{d} 完成\n", .{ done, total });
+}
+
+/// 若 line 是列表步骤项,返回去掉标记后的内容(trim);否则 null。
+fn stepContent(line: []const u8) ?[]const u8 {
+    const t = std.mem.trim(u8, line, " \t\r");
+    if (t.len < 2) return null;
+    // `- ` / `* ` / `+ `
+    if ((t[0] == '-' or t[0] == '*' or t[0] == '+') and t[1] == ' ') {
+        return std.mem.trim(u8, t[2..], " \t\r");
+    }
+    // `N. ` / `N) `(可多位数字)
+    var i: usize = 0;
+    while (i < t.len and t[i] >= '0' and t[i] <= '9') i += 1;
+    if (i > 0 and i + 1 < t.len and (t[i] == '.' or t[i] == ')') and t[i + 1] == ' ') {
+        return std.mem.trim(u8, t[i + 2 ..], " \t\r");
+    }
+    return null;
+}
+
+/// frontier 步骤文本 vs markdown 步骤内容是否同一步骤(首行 + 双向包含,容忍标记/截断差异)。
+fn frontierMatches(frontier_text: []const u8, md_content: []const u8) bool {
+    const ft = std.mem.trim(u8, firstLine(frontier_text), " \t\r");
+    if (ft.len == 0 or md_content.len == 0) return false;
+    return std.mem.indexOf(u8, md_content, ft) != null or std.mem.indexOf(u8, ft, md_content) != null;
 }
 
 /// 打印某个 root(kg_root/kg_inbox)的 frontier。返回是否显示了内容(供"全空"提示)。
@@ -3288,4 +3354,28 @@ test "/goal accounting delta charges only input plus output usage" {
         .cache_creation_input_tokens = 999,
     };
     try std.testing.expectEqual(@as(u64, 12), goalBudgetTokenDelta(before, after));
+}
+
+test "stepContent: 识别列表步骤项 / 跳过标题散文" {
+    // 数字列表(单/多位 + . 或 ))。
+    try std.testing.expectEqualStrings("步骤一:读代码", stepContent("1. 步骤一:读代码").?);
+    try std.testing.expectEqualStrings("第十步", stepContent("10) 第十步").?);
+    // 无序列表 - * +。
+    try std.testing.expectEqualStrings("做事", stepContent("- 做事").?);
+    try std.testing.expectEqualStrings("做事", stepContent("  * 做事").?); // 带缩进
+    // 非步骤:标题 / 散文 / 空。
+    try std.testing.expect(stepContent("# 重构计划") == null);
+    try std.testing.expect(stepContent("这是一段说明") == null);
+    try std.testing.expect(stepContent("") == null);
+    try std.testing.expect(stepContent("1.没空格不算") == null); // N. 后必须空格
+}
+
+test "frontierMatches: 首行 + 双向包含匹配同一步骤" {
+    // frontier 文本(可能多行)vs markdown 步骤内容:同一步骤应匹配。
+    try std.testing.expect(frontierMatches("步骤二:写实现", "步骤二:写实现"));
+    try std.testing.expect(frontierMatches("步骤二:写实现\n第二行细节", "步骤二:写实现")); // frontier 多行取首行
+    try std.testing.expect(frontierMatches("步骤二", "步骤二:写实现")); // frontier 是 md 的前缀
+    // 不同步骤不匹配。
+    try std.testing.expect(!frontierMatches("步骤三:测试", "步骤二:写实现"));
+    try std.testing.expect(!frontierMatches("", "步骤二"));
 }
