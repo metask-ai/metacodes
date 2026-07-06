@@ -536,6 +536,9 @@ pub const App = struct {
         if (app.openai_client) |*oc| oc.model = model;
         if (app.gemini_client) |*gc| gc.model = model;
         if (app.transcript_writer) |*w| w.model = model;
+        // usage 锚点是旧模型 tokenizer 实计的,跨模型不可比(tokenizer 差异可达 ±20%)
+        // → 作废,下一轮新模型的 usage 自动重建。
+        app.conversation.invalidateUsageAnchor();
 
         if (app.pending_previous_model_for_compact) |old| app.allocator.free(old);
         app.pending_previous_model_for_compact = previous_model_copy;

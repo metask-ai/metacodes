@@ -187,6 +187,58 @@ test "L2 microcompact: invalid UTF-8 tool_result truncates to valid preview" {
 test "L2 microcompact: tool result preview budget follows model input window" {
     try std.testing.expectEqual(@as(usize, 8 * 1024), cc.conversation.toolResultContextBytes(0));
     try std.testing.expectEqual(@as(usize, 8 * 1024), cc.conversation.toolResultContextBytes(32_000));
-    try std.testing.expectEqual(@as(usize, 12_500), cc.conversation.toolResultContextBytes(200_000));
+    // window/8 字节:200K → 25KB(对齐 cc 25000 字符截断);262144(glm-5.2)→ 32KB。
+    try std.testing.expectEqual(@as(usize, 25_000), cc.conversation.toolResultContextBytes(200_000));
+    try std.testing.expectEqual(@as(usize, 32_768), cc.conversation.toolResultContextBytes(262_144));
     try std.testing.expectEqual(@as(usize, 64 * 1024), cc.conversation.toolResultContextBytes(2_000_000));
+}
+
+// ── usage 锚点接线(DoD:声明=接线=测试)────────────────────────────────
+// 断言真 agent_loop + MockServer SSE 流的 message_start usage 真正落到
+// conversation.usage_anchor(in+cache_r+cache_w 求和,msg_count=请求时消息数)。
+// 若有人删掉 agent_loop usage 事件里的 setUsageAnchor 调用,此测试红。
+
+const harness = @import("harness");
+
+const USAGE_ANCHOR_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":2000,\"cache_creation_input_tokens\":345,\"output_tokens\":0}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+test "L2 usage 锚点接线: message_start usage → conversation.usageAnchor(in+cache_r+cache_w)" {
+    const a = std.testing.allocator;
+    const bodies = [_][]const u8{USAGE_ANCHOR_SSE};
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    const io = io_runtime.io();
+
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io, "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "hi");
+
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var wb = cc.writer_backend.WriterBackend.initNull();
+    const be = wb.backend();
+    const result = cc.agent_loop.run(&conv, client.provider(), &.{}, &perm, .{ .max_turns = 2 }, &be, a) catch |e| {
+        std.debug.print("agent_loop.run failed: {s}\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+
+    const anchor = conv.usageAnchor() orelse return error.TestExpectedAnchor;
+    // 100 + 2000 + 345:三段求和 = 服务端实计完整 prompt(Anthropic-exclusive 语义)。
+    try std.testing.expectEqual(@as(usize, 2445), anchor.context_tokens);
+    // usage 到达时 assistant 消息尚未 append → 锚点只覆盖请求时的 1 条消息。
+    try std.testing.expectEqual(@as(usize, 1), anchor.msg_count);
 }

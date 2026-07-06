@@ -936,22 +936,17 @@ pub fn withRetry(
     }
 }
 
-/// Token 计数估算
+/// Token 计数估算(与 Conversation.estimateTokens 同公式:ASCII/4 + 非 ASCII 码点)。
 pub fn estimateTokens(text: []const u8) usize {
     if (text.len == 0) return 0;
-    var count: usize = 0;
+    var ascii: usize = 0;
+    var other: usize = 0;
     var view = std.unicode.Utf8View.init(text) catch return text.len / 4;
     var it = view.iterator();
     while (it.nextCodepoint()) |cp| {
-        if (cp < 0x80) {
-            count += 1;
-        } else if (cp >= 0x4E00 and cp <= 0x9FFF) {
-            count += 1; // CJK: each char is roughly 1 token
-        } else {
-            count += 1;
-        }
+        if (cp < 0x80) ascii += 1 else other += 1;
     }
-    return @max(count, text.len / 4);
+    return (ascii + 3) / 4 + other;
 }
 
 test "findJsonObjectEnd" {
@@ -1017,8 +1012,10 @@ test "extractJsonString" {
 
 test "estimateTokens" {
     try std.testing.expect(estimateTokens("hello world") > 0);
-    try std.testing.expect(estimateTokens("你好") == 2); // 2 CJK codepoints
+    try std.testing.expect(estimateTokens("你好") == 2); // 2 CJK codepoints ≈ 2 tokens
     try std.testing.expect(estimateTokens("") == 0);
+    // 校准:ASCII ≈ 4 字符/token(实测 claude/gpt/glm 3.3~4.5 bytes/token)。
+    try std.testing.expect(estimateTokens("abcdefgh") == 2);
 }
 
 // Regression: GET /v1/models 必须用 sendBodiless()；std.http 对带 body 的 GET 会 assert。

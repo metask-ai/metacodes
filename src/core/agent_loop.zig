@@ -635,6 +635,12 @@ pub fn run(
                         // L1:usage 走 CoreEvent 总线(顶层 TuiBackend 累加进 app.usage;
                         // JobEntry 后端累加进 .tokens 供进度树)——取代旧 opts.usage_sink 私有回调。
                         backend.emitEvent(sess, .{ .usage = u });
+                        // usage 锚点:服务端实计 prompt tokens(in+cache_r+cache_w)。
+                        // auto-compact 估算以此为基准,只对之后新 append 的消息做本地估算
+                        // (估算器 vs 各家 tokenizer 偏差不再随会话放大;glm-5.2 262K 窗口
+                        // 下旧的纯字节估算超估 ~3.5x,在真实 ~65K 时就误触发 blocking 清空)。
+                        const anchor_tokens = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens;
+                        conversation.setUsageAnchor(@intCast(anchor_tokens));
                         if (cache_detector.checkResponse(u.cache_read_input_tokens, u.cache_creation_input_tokens)) |reason| {
                             log.warnId("cache", rid, "PROMPT CACHE BREAK: {s} [cache_read {d} creation {d}]", .{ reason, u.cache_read_input_tokens, u.cache_creation_input_tokens });
                             // L4 诊断:cache 击穿。
@@ -1220,9 +1226,36 @@ fn estimateNextRequestTokens(
     tool_defs: []const json_mod.ToolDefinition,
     model_override: ?[]const u8,
 ) !usize {
+    // 热路径:usage 锚点有效 → 服务端实计 tokens + 锚点后新消息的本地估算。
+    // 锚点请求已含 system/tools/inject_user_context,不重复计;synthetic 只在
+    // turns==0 发,锚点在则它已被计入或不再发,同样不补。
+    if (conversation.usageAnchor()) |anchor| {
+        var total: usize = anchor.context_tokens;
+        for (conversation.messages.items[anchor.msg_count..]) |m| {
+            total += estimateMessageTokens(m);
+        }
+        return total;
+    }
+    // 冷路径(首轮/后端不报 usage/前缀被 compact 改写):序列化真实下一请求做全量估算。
     var api_messages = try buildApiMessages(conversation, allocator, inject_user_context, synthetic_user_input);
     defer freeApiMessages(&api_messages, allocator);
     return estimateApiRequestTokens(allocator, provider, api_messages.items, system_prompt, tool_defs, model_override);
+}
+
+/// 单条消息的 token 估算(usage 锚点后缀用):text/tool_use/tool_result 各 block
+/// 走 Conversation.estimateTokens,再加 JSON 信封开销;thinking 不回 API 不计。
+fn estimateMessageTokens(m: msg.Message) usize {
+    var total: usize = 8; // message 信封(role/content 括号)
+    for (m.blocks) |b| {
+        total += 12; // block 信封(type/id 等字段)
+        switch (b) {
+            .text => |t| total += Conversation.estimateTokens(t),
+            .tool_use => |tu| total += Conversation.estimateTokens(tu.name) + Conversation.estimateTokens(tu.input),
+            .tool_result => |tr| total += Conversation.estimateTokens(tr.content),
+            .thinking => {},
+        }
+    }
+    return total;
 }
 
 fn estimateApiRequestTokens(
@@ -1284,6 +1317,10 @@ fn recoverContextWindowExceeded(
         log.err("agent", "context-window recovery exhausted turn={d} attempts={d}", .{ turn_number, attempts.* });
         return false;
     }
+    // 先作废 usage 锚点:removeOldest 反正会作废它,提前作废让 before/after 同用
+    // 冷路径基准——否则 before=锚点实计、after=冷估算,删消息后数字反而翻倍(假遥测,
+    // 实录 2026-07-06 fix4.log:dropped=1 before=203081 after=415469)。
+    conversation.invalidateUsageAnchor();
     const before_tokens = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
     const before_len = conversation.len();
     const dropped = conversation.removeOldestForContextRecovery();
@@ -1741,6 +1778,106 @@ test "estimateNextRequestTokens serializes the actual next Anthropic request" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"output_config\":{\"effort\":\"medium\"}") != null);
 }
 
+test "usage anchor: estimate = server tokens + suffix estimate; no anchor falls back to serialize" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "question");
+
+    var state = TestProviderState{};
+    const provider = testProvider(&state);
+
+    // 无锚点:冷路径 = 序列化全请求估算。
+    const cold = try estimateNextRequestTokens(a, provider, &c, null, null, null, &.{}, null);
+    try std.testing.expect(cold > 0);
+
+    // 设锚点(模拟 message_start usage),再追加后缀。
+    c.setUsageAnchor(100_000);
+    try c.appendText(.assistant, "reply text");
+    const anchored = try estimateNextRequestTokens(a, provider, &c, null, null, null, &.{}, null);
+    var expected: usize = 100_000;
+    expected += estimateMessageTokens(c.messages.items[1]);
+    try std.testing.expectEqual(expected, anchored);
+}
+
+test "usage anchor suppresses false blocking-limit nuke (glm-5.2 并发工具风暴回归)" {
+    // 实测场景(2026-07-06):glm-5.2 窗口 262144,一轮 20 个并发 Read。
+    // 旧行为:纯字节估算 384K > blocking 239K → 全部 tool_result 未给模型看就清成
+    // stub,模型拿 20 个空结果幻觉"已完成"。真实用量仅 ~15K/245K。
+    // 新行为:usage 锚点(真实 in+cache)+ 后缀校准估算 → 远低于阈值,一个都不清。
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "read all 20 files");
+    c.setUsageAnchor(13_522); // message_start 报的真实 prompt tokens
+
+    // 20 个 tool_use + 20 个 32KB tool_result(toolResultContextBytes(262144) 截断后)。
+    const tu_blocks = try a.alloc(msg.Block, 20);
+    for (tu_blocks, 0..) |*b, i| {
+        var idbuf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&idbuf, "t{d}", .{i});
+        b.* = .{ .tool_use = .{
+            .id = try a.dupe(u8, id),
+            .name = try a.dupe(u8, "Read"),
+            .input = try a.dupe(u8, "{\"file_path\":\"/tmp/data.txt\"}"),
+        } };
+    }
+    try c.append(.{ .role = .assistant, .blocks = tu_blocks });
+    const tr_blocks = try a.alloc(msg.Block, 20);
+    for (tr_blocks, 0..) |*b, i| {
+        var idbuf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&idbuf, "t{d}", .{i});
+        const content = try a.alloc(u8, 32 * 1024);
+        @memset(content, 'r');
+        b.* = .{ .tool_result = .{
+            .tool_use_id = try a.dupe(u8, id),
+            .content = content,
+            .is_error = false,
+        } };
+    }
+    try c.append(.{ .role = .user, .blocks = tr_blocks });
+
+    var provider_state = TestProviderState{
+        .allocator = a,
+        .max_input_tokens = 262_144, // metask /v1/models 实测值
+        .max_tokens = 64_000,
+    };
+    const provider = testProvider(&provider_state);
+
+    const Capture = struct {
+        fn emit(_: *anyopaque, _: @import("session_id.zig").SessionId, _: CoreEvent) void {}
+        fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = Capture.emit, .poll = Capture.poll };
+
+    const outcome = try runAutoCompactIfNeeded(
+        &c,
+        provider,
+        null,
+        null,
+        null,
+        &.{},
+        null,
+        null,
+        null, // 阈值走窗口公式:auto=229144
+        10,
+        "post_tool_follow_up_threshold",
+        &backend,
+        .single,
+        null,
+        a,
+    );
+
+    // est = 13522 + 20×(32768/4) + 信封 ≈ 178K < 229144 → 不触发;结果全部保留。
+    try std.testing.expectEqual(AutoCompactOutcome.not_needed, outcome);
+    for (c.messages.items[2].blocks) |b| {
+        try std.testing.expect(b.tool_result.content.len == 32 * 1024); // 无一被清成 stub
+    }
+}
+
 test "auto-compact preflight truncates huge recent tool_result before next request estimate" {
     const a = std.testing.allocator;
     var c = Conversation.init(a);
@@ -1789,7 +1926,8 @@ test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool s
     var c = Conversation.init(a);
     defer c.deinit();
 
-    const chunk = try a.alloc(u8, 2048);
+    // 8192 ASCII ≈ 2048 est-token/条(校准估算 ASCII/4);30 条 ≈ 61K > 32K 阈值。
+    const chunk = try a.alloc(u8, 8192);
     defer a.free(chunk);
     @memset(chunk, 'x');
     var i: usize = 0;
@@ -1873,7 +2011,8 @@ test "previous-model compact uses old model override before smaller-window sampl
     var c = Conversation.init(a);
     defer c.deinit();
 
-    const chunk = try a.alloc(u8, 2048);
+    // 8192 ASCII ≈ 2048 est-token/条;30 条 ≈ 61K > 32K 阈值(校准估算 ASCII/4)。
+    const chunk = try a.alloc(u8, 8192);
     defer a.free(chunk);
     @memset(chunk, 'p');
     var i: usize = 0;
@@ -2077,21 +2216,21 @@ test "context warning emits once only at medium pressure" {
     const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = Capture.emit, .poll = Capture.poll };
     var emitted = false;
 
-    emitContextWarningIfNeeded(&backend, .single, context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 159_999), &emitted);
+    emitContextWarningIfNeeded(&backend, .single, context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 147_999), &emitted);
     try std.testing.expectEqual(@as(u32, 0), cap.warnings);
     try std.testing.expect(!emitted);
 
-    emitContextWarningIfNeeded(&backend, .single, context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 160_000), &emitted);
+    emitContextWarningIfNeeded(&backend, .single, context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 148_000), &emitted);
     try std.testing.expectEqual(@as(u32, 1), cap.warnings);
     try std.testing.expect(emitted);
     try std.testing.expectEqualStrings("medium", cap.level.?);
-    try std.testing.expectEqual(@as(u64, 160_000), cap.current_tokens);
+    try std.testing.expectEqual(@as(u64, 148_000), cap.current_tokens);
 
-    emitContextWarningIfNeeded(&backend, .single, context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 165_000), &emitted);
+    emitContextWarningIfNeeded(&backend, .single, context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 152_000), &emitted);
     try std.testing.expectEqual(@as(u32, 1), cap.warnings);
 
     emitted = false;
-    emitContextWarningIfNeeded(&backend, .single, context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 167_000), &emitted);
+    emitContextWarningIfNeeded(&backend, .single, context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 155_000), &emitted);
     try std.testing.expectEqual(@as(u32, 1), cap.warnings);
     try std.testing.expect(!emitted);
 }
@@ -2185,6 +2324,7 @@ test "auto-compact 阈值用 input context window 而非 output max_tokens(防�
     // 源级守卫:阈值算式必须调 resolveMaxInputTokens(而非 output 的解析器),且 MIN 不再是早期小值。
     const src = @embedFile("agent_loop.zig");
     try std.testing.expect(std.mem.indexOf(u8, src, "ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens()") != null);
-    try std.testing.expectEqual(@as(usize, 167_000), context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 0).auto_compact_threshold);
+    // 全额输出预留(服务端校验 in+max_tokens ≤ window):200K-32K-13K = 155K。
+    try std.testing.expectEqual(@as(usize, 155_000), context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 0).auto_compact_threshold);
     try std.testing.expect(MIN_AUTO_COMPACT_THRESHOLD >= 32_000);
 }

@@ -297,10 +297,11 @@ test "P3/缓存: OpenAI cached_tokens → 中立 UsageDelta.cache_read(onUsage �
         else => {},
     };
 
-    // OpenAI 的 cached_tokens=1920 → 中立 cache_read_input_tokens=1920;prompt_tokens=2006 → input。
+    // OpenAI 的 cached_tokens=1920 → 中立 cache_read=1920;prompt_tokens=2006 **含** cached,
+    // 归一成 Anthropic-exclusive 语义:input = 2006-1920 = 86(消费方 in+cache_r 求和不双计)。
     try std.testing.expect(saw_usage);
     try std.testing.expectEqual(@as(u64, 1920), cache_read);
-    try std.testing.expectEqual(@as(u64, 2006), input_tokens);
+    try std.testing.expectEqual(@as(u64, 86), input_tokens);
 
     // 请求体含 stream_options.include_usage(否则 OpenAI 默认流式不发 usage)。
     const cap = srv.lastRequest().?;

@@ -12,8 +12,10 @@ const msg = @import("message.zig");
 pub const TOOL_RESULT_CLEARED_STUB = "[tool result cleared to save context]";
 pub const TOOL_RESULT_CONTEXT_MIN_BYTES: usize = 8 * 1024;
 pub const TOOL_RESULT_CONTEXT_MAX_BYTES: usize = 64 * 1024;
-pub const TOOL_RESULT_CONTEXT_WINDOW_DIVISOR: usize = 16;
-pub const DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP: usize = 2;
+/// window(token 数)/8 → 单条 tool_result 内联字节上限(≈ window/32 token,4 bytes/token)。
+/// 200K 窗口 → 25KB,与 cc 的 25000 字符截断对齐;262K(glm-5.2)→ 32KB;1M → 64KB cap。
+/// 旧值 /16 直接把 token 数当字节数用(200K → 12.5KB),单位错配导致截断过狠。
+pub const TOOL_RESULT_CONTEXT_WINDOW_DIVISOR: usize = 8;
 
 pub fn toolResultContextBytes(max_input_tokens: usize) usize {
     const derived = if (max_input_tokens == 0)
@@ -22,12 +24,17 @@ pub fn toolResultContextBytes(max_input_tokens: usize) usize {
         max_input_tokens / TOOL_RESULT_CONTEXT_WINDOW_DIVISOR;
     return @min(@max(derived, TOOL_RESULT_CONTEXT_MIN_BYTES), TOOL_RESULT_CONTEXT_MAX_BYTES);
 }
+pub const DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP: usize = 2;
 
 pub const Conversation = struct {
     allocator: std.mem.Allocator,
     messages: std.ArrayList(msg.Message),
     ghost_snapshots: std.ArrayList(msg.Message),
     mutation_version: u64 = 0,
+    /// API usage 锚点:上次请求服务端实际计的 prompt tokens(in+cache_r+cache_w)。
+    /// auto-compact 的 token 估算以它为基准,只对锚点之后新 append 的消息做本地估算,
+    /// 避免估算器与各家 tokenizer 的偏差随会话长度放大(对齐 cc 用 usage 算 context%)。
+    usage_anchor: ?UsageAnchor = null,
     // 快照锁:保护 messages.items 的结构性改动(append → 可能 realloc)与 transcript 快照
     // 遍历的互斥。生成期 watcher 线程按 Ctrl+O 调 transcript_viewer 遍历 messages.items,
     // 与主线程 agent_loop 的 append 并发——append 触发 ArrayList realloc 会使遍历中的旧
@@ -54,12 +61,55 @@ pub const Conversation = struct {
         _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
     }
 
+    pub const UsageAnchor = struct {
+        /// 服务端实计 prompt tokens(input + cache_read + cache_creation)。
+        context_tokens: usize,
+        /// 采样时的消息数:该 usage 覆盖 messages[0..msg_count](含 system/tools/注入)。
+        msg_count: usize,
+    };
+
+    /// 记录 API usage 锚点(agent_loop 在收到 message_start usage 时调)。
+    /// context_tokens=0 视为后端不报 usage,不建锚点。
+    pub fn setUsageAnchor(self: *Conversation, context_tokens: usize) void {
+        if (context_tokens == 0) return;
+        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        self.usage_anchor = .{
+            .context_tokens = context_tokens,
+            .msg_count = self.messages.items.len,
+        };
+    }
+
+    /// 取仍有效的 usage 锚点。锚点由前缀改写操作精确作废(见 noteShrinkAtLocked):
+    /// 只有 messages[0..msg_count) 被改写/丢弃才失效;截断/清理锚点后追加的消息不影响
+    /// 前缀实计数(否则每轮 preflight 截断新结果都会把锚点打回冷路径字节估算)。
+    pub fn usageAnchor(self: *const Conversation) ?UsageAnchor {
+        const a = self.usage_anchor orelse return null;
+        if (a.msg_count > self.messages.items.len) return null;
+        return a;
+    }
+
+    /// 前缀改写通知(调用方须已持 snapshot_mutex):msg_index 落在锚点覆盖区 → 作废。
+    fn noteShrinkAtLocked(self: *Conversation, msg_index: usize) void {
+        if (self.usage_anchor) |a| {
+            if (msg_index < a.msg_count) self.usage_anchor = null;
+        }
+    }
+
+    /// 显式作废锚点。context-window recovery 进入时调:让 before/after 遥测同用
+    /// 冷路径基准(否则 before 锚点实计、after 冷估算,删一条消息数字反而翻倍)。
+    pub fn invalidateUsageAnchor(self: *Conversation) void {
+        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        self.usage_anchor = null;
+    }
+
     /// 追加消息（转移所有权）。传入的 Message 不得再手动 deinit。
     pub fn append(self: *Conversation, m: msg.Message) !void {
         _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
         defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
         try self.messages.append(self.allocator, m);
-        self.mutation_version +%= 1;
+        self.mutation_version +%= 1; // append 只 bump mutation,不 bump shrink(不改前缀)
     }
 
     /// 便利方法：追加仅 text 的消息。字节被复制。
@@ -196,22 +246,27 @@ pub const Conversation = struct {
         replacement.messages = .empty;
         replacement.ghost_snapshots = .empty;
         self.mutation_version +%= 1;
+        self.usage_anchor = null; // 前缀被丢弃/替换,实计锚点作废
         return true;
     }
 
-    /// UTF-8 感知的 token 估算。规则（与原 client.zig:estimateTokens 对齐）：
-    /// - ASCII 字符 1 token
-    /// - CJK 字符 (U+4E00..U+9FFF) 1 token
-    /// - 其他 1 token
-    /// - 空字符串 0
-    /// - 无效 UTF-8 退化为 `len/4`
+    /// 校准 token 估算:ASCII ≈ 4 字符/token,非 ASCII 码点(CJK 等)≈ 1 码点/token。
+    /// 空字符串 0;无效 UTF-8 退化为 `len/4`。
+    /// 依据:metask/glm-5.2 实测 3.54 bytes/token(2026-07-06 usage 对拍),claude/gpt
+    /// 英文/代码/JSON 3.3~4.5。旧实现按码点计数(ASCII 下≈字节数)超估 ~4x:
+    /// glm-5.2(262K 窗口)在真实用量 ~65K 时就触发 auto-compact / blocking-limit,
+    /// 并发工具风暴下把全部 tool_result 清成 stub(auto compact"失效"根因之一)。
+    /// 注意这是冷路径兜底;有 API usage 时以 usage anchor 为准(见 setUsageAnchor)。
     pub fn estimateTokens(text: []const u8) usize {
         if (text.len == 0) return 0;
-        var count: usize = 0;
+        var ascii: usize = 0;
+        var other: usize = 0;
         var view = std.unicode.Utf8View.init(text) catch return text.len / 4;
         var it = view.iterator();
-        while (it.nextCodepoint()) |_| count += 1;
-        return @max(count, text.len / 4);
+        while (it.nextCodepoint()) |cp| {
+            if (cp < 0x80) ascii += 1 else other += 1;
+        }
+        return (ascii + 3) / 4 + other;
     }
 
     /// 全部消息的 text block 字节数估算总和。tool_use/tool_result 的 JSON 也算入。
@@ -255,6 +310,7 @@ pub const Conversation = struct {
             m.deinit(self.allocator);
         }
         self.mutation_version +%= 1;
+        self.usage_anchor = null; // 前缀被丢弃/替换,实计锚点作废
         return drop_count;
     }
 
@@ -276,6 +332,7 @@ pub const Conversation = struct {
             m.deinit(self.allocator);
         }
         self.mutation_version +%= 1;
+        self.usage_anchor = null; // 前缀被丢弃/替换,实计锚点作废
         return drop_count;
     }
 
@@ -301,6 +358,7 @@ pub const Conversation = struct {
             dropped += 1;
         }
         self.mutation_version +%= 1;
+        self.usage_anchor = null; // 前缀被丢弃/替换,实计锚点作废
         return dropped;
     }
 
@@ -391,6 +449,7 @@ pub const Conversation = struct {
             try self.messages.insert(self.allocator, 0, .{ .role = .assistant, .blocks = blocks });
         }
         self.mutation_version +%= 1;
+        self.usage_anchor = null; // 前缀被丢弃/替换,实计锚点作废
         return .{ .dropped = drop_count, .summary_used = summary != null };
     }
 
@@ -416,6 +475,7 @@ pub const Conversation = struct {
                         // 已是 stub 的不重复清(幂等)。
                         if (std.mem.eql(u8, tr.content, TOOL_RESULT_CLEARED_STUB)) continue;
                         if (!self.clearToolResultAt(m, bi)) continue;
+                        self.noteShrinkAtLocked(mi);
                         cleared += 1;
                     },
                     else => {},
@@ -450,6 +510,7 @@ pub const Conversation = struct {
                 if (std.mem.eql(u8, tr.content, TOOL_RESULT_CLEARED_STUB)) continue;
                 const before = tr.content.len;
                 if (!self.clearToolResultAt(m, bi)) continue;
+                self.noteShrinkAtLocked(mi);
                 out.cleared += 1;
                 out.bytes_before += before;
                 out.bytes_after += TOOL_RESULT_CLEARED_STUB.len;
@@ -468,7 +529,7 @@ pub const Conversation = struct {
         defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
         var out = ToolResultReduction{};
         if (max_bytes == 0) return out;
-        for (self.messages.items) |m| {
+        for (self.messages.items, 0..) |m, mi| {
             for (m.blocks, 0..) |b, bi| {
                 if (b != .tool_result) continue;
                 const tr = b.tool_result;
@@ -482,6 +543,7 @@ pub const Conversation = struct {
                     .content = new_content,
                     .is_error = tr.is_error,
                 } };
+                self.noteShrinkAtLocked(mi);
                 out.truncated += 1;
                 out.bytes_before += before;
                 out.bytes_after += new_content.len;
@@ -669,6 +731,98 @@ test "estimateTokens empty" {
 
 test "estimateTokens invalid utf8 falls back to len/4" {
     try std.testing.expect(Conversation.estimateTokens("\xff\xff\xff\xff\xff\xff\xff\xff") == 2);
+}
+
+test "estimateTokens calibrated: ASCII/4 + non-ASCII codepoints" {
+    // 8 ASCII → 2;9 ASCII → ceil(9/4)=3。
+    try std.testing.expectEqual(@as(usize, 2), Conversation.estimateTokens("abcdefgh"));
+    try std.testing.expectEqual(@as(usize, 3), Conversation.estimateTokens("abcdefghi"));
+    // 混合:4 ASCII(1)+ 2 CJK(2)= 3。
+    try std.testing.expectEqual(@as(usize, 3), Conversation.estimateTokens("abcd你好"));
+}
+
+test "usage anchor: append keeps it valid, shrink invalidates it" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "first message");
+    try std.testing.expect(c.usageAnchor() == null); // 未设锚点
+
+    c.setUsageAnchor(12_345);
+    const anchor = c.usageAnchor().?;
+    try std.testing.expectEqual(@as(usize, 12_345), anchor.context_tokens);
+    try std.testing.expectEqual(@as(usize, 1), anchor.msg_count);
+
+    // append 不作废锚点(新消息属于锚点后缀)。
+    try c.appendText(.assistant, "reply");
+    try std.testing.expect(c.usageAnchor() != null);
+    try std.testing.expectEqual(@as(usize, 1), c.usageAnchor().?.msg_count);
+
+    // 收缩(compactKeepRecent 丢老消息)→ 锚点作废。
+    try c.appendText(.user, "third");
+    try c.appendText(.assistant, "fourth");
+    _ = c.compactKeepRecent(2);
+    try std.testing.expect(c.usageAnchor() == null);
+}
+
+test "usage anchor: microcompact clear invalidates it" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const blocks = try a.alloc(msg.Block, 1);
+    blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "t1"),
+        .content = try a.dupe(u8, "big tool output that will be cleared"),
+        .is_error = false,
+    } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+    try c.appendText(.assistant, "done");
+    c.setUsageAnchor(50_000);
+    try std.testing.expect(c.usageAnchor() != null);
+
+    const reduced = c.microcompactToolResultsByRecentResults(0);
+    try std.testing.expectEqual(@as(usize, 1), reduced.cleared);
+    try std.testing.expect(c.usageAnchor() == null); // 前缀被改写,实计数不再可信
+}
+
+test "usage anchor: truncating a post-anchor tool_result keeps the anchor (glm 逐轮截断回归)" {
+    // 实测回归(2026-07-06 fix2.log):每轮新 Read 结果被 preflight truncate,
+    // 粗粒度失效把锚点每轮打回冷路径字节估算 → 真实 106K 被估成 222K+ 误触发 microcompact。
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "read files");
+    c.setUsageAnchor(100_000); // 覆盖 messages[0..1]
+
+    // 锚点之后追加一条超大 tool_result(属于后缀)。
+    const blocks = try a.alloc(msg.Block, 1);
+    const huge = try a.alloc(u8, 100 * 1024);
+    @memset(huge, 'x');
+    blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "t1"),
+        .content = huge,
+        .is_error = false,
+    } };
+    try c.append(.{ .role = .user, .blocks = blocks });
+
+    const reduced = c.truncateLargeToolResults(32 * 1024);
+    try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
+    // 后缀截断不影响前缀实计数 → 锚点仍有效。
+    try std.testing.expect(c.usageAnchor() != null);
+
+    // 清后缀 result(index 1 ≥ msg_count 1,不在锚点覆盖区)同样保锚点。
+    const cleared = c.microcompactToolResultsByRecentResults(0);
+    try std.testing.expectEqual(@as(usize, 1), cleared.cleared);
+    try std.testing.expect(c.usageAnchor() != null);
+}
+
+test "usage anchor: zero usage from backend does not create an anchor" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "msg");
+    c.setUsageAnchor(0);
+    try std.testing.expect(c.usageAnchor() == null);
 }
 
 test "totalTokens across mixed blocks" {

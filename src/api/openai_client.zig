@@ -257,9 +257,12 @@ const OpenAIStream = struct {
         // cached_tokens→cache_read,经 cache.parseOpenAICacheUsage)。让缓存命中能上抛 UI,与 Anthropic 一致。
         if (std.mem.indexOf(u8, data, "\"usage\"") != null) {
             const cu = cache.parseOpenAICacheUsage(data);
+            // 语义归一(Anthropic-exclusive):OpenAI 的 prompt_tokens **包含** cached_tokens,
+            // 中立 UsageDelta 约定 input_tokens 不含 cache(Anthropic 语义)。消费方
+            // (usage 锚点/成本累计)按 in+cache_r+cache_w 求和——不减会把缓存双计。
             return StreamEvent{
                 .usage = UsageDelta{
-                    .input_tokens = util_json.extractIntField(data, "prompt_tokens"),
+                    .input_tokens = util_json.extractIntField(data, "prompt_tokens") -| cu.read_tokens,
                     .output_tokens = util_json.extractIntField(data, "completion_tokens"),
                     .cache_read_input_tokens = cu.read_tokens,
                     .cache_creation_input_tokens = cu.creation_tokens, // OpenAI 无写区分 → 0

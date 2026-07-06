@@ -314,8 +314,11 @@ const GeminiStream = struct {
         // 这保证"内容+usage 同 chunk"时 usage 不被静默丢(旧逻辑只在无内容 chunk emit usage = 丢)。
         if (std.mem.indexOf(u8, data, "\"usageMetadata\"") != null) {
             const cu = cache.parseGeminiCacheUsage(data);
+            // 语义归一(Anthropic-exclusive):Gemini 的 promptTokenCount **包含**
+            // cachedContentTokenCount;中立 UsageDelta 的 input_tokens 不含 cache,
+            // 消费方按 in+cache_r+cache_w 求和(usage 锚点/成本)——不减会双计。
             const usage = UsageDelta{
-                .input_tokens = util_json.extractIntField(data, "promptTokenCount"),
+                .input_tokens = util_json.extractIntField(data, "promptTokenCount") -| cu.read_tokens,
                 .output_tokens = util_json.extractIntField(data, "candidatesTokenCount"),
                 .cache_read_input_tokens = cu.read_tokens,
                 .cache_creation_input_tokens = cu.creation_tokens,
