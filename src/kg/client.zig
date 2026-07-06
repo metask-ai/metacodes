@@ -260,14 +260,23 @@ pub const KgClient = struct {
     }
 
     // ── markdown 文档(P3:plan 人类可见,设计 D3)────────────────────
-    // import-md-doc 把 markdown 存成图(document+section+md:* 投影,content-hash 幂等);
-    // render-md-doc 无损渲染回 markdown 给人看。图与文档同源两视图(实证)。
+    // import-md-doc 把 markdown 存成图(document+section+md:* 投影);render-md-doc 无损渲染回
+    // markdown。图与文档同源两视图(实证)。
+    //
+    // **关键(Linus 抓的确定性 bug)**:tinykg 按 source path 派生 external_key,同 key 再导入走
+    // **增量合并**——复用旧投影边并**保留其陈旧 order_key**,新边填空槽 → 兄弟节点 order_key 撞车
+    // (schema_duplicate_order_key)→ render 用 edge_id 兜底排序 → 步骤**乱序**。所以每份**不同**
+    // 计划必须走干净全新导入:tmp 路径带**内容 hash 后缀**→ 不同内容不同 path 不同 doc(单调
+    // order_key);相同内容同 path → tinykg 真幂等(document_created=false, nodes_imported=0)。
+    // 代价:不同计划迭代留旧 document 成孤儿,可 gc-md-orphans 清(低频,可接受)。
 
     /// 把 markdown 文本导入成文档图,返回 document node id。写临时 .md 文件喂 import-md-doc
     /// (它只接文件路径,不接 stdin)。best-effort:失败返 data 错。
     pub fn importMarkdownDoc(self: *KgClient, markdown: []const u8) KgError!u64 {
-        // 写临时文件(tinykg import-md-doc 只接文件路径)。
-        const tmp_path = std.fmt.allocPrint(self.allocator, "{s}.mdimport.tmp", .{self.store_path}) catch return KgError.OutOfMemory;
+        // 内容 hash 后缀:保证"不同计划→不同 source path→不同 document 节点"(避开增量合并的
+        // order_key 撞车),"相同计划→同 path→真幂等"。
+        const content_hash = std.hash.Wyhash.hash(0x7ac3, markdown);
+        const tmp_path = std.fmt.allocPrint(self.allocator, "{s}.mdimport.{x}.tmp", .{ self.store_path, content_hash }) catch return KgError.OutOfMemory;
         defer self.allocator.free(tmp_path);
         writeTmpFile(self.allocator, tmp_path, markdown) catch return self.dataError("写 md 临时文件失败", .{});
         defer deleteTmpFile(self.allocator, tmp_path);

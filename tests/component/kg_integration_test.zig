@@ -492,4 +492,26 @@ test "L2 KG: plan 落图同时建 markdown 文档,render 回人类可读(P3 D3)"
     try std.testing.expect(std.mem.indexOf(u8, md, "重构解析器") != null);
     try std.testing.expect(std.mem.indexOf(u8, md, "步骤一:读代码") != null);
     try std.testing.expect(std.mem.indexOf(u8, md, "步骤二:写实现") != null);
+
+    // Linus 回归:同 store 批准**不同**计划(标题位移)——内容 hash 后缀保证走干净全新导入,
+    // 不撞 order_key,render 顺序必须正确(bug 时 inserted 会掉到第 2 位)。
+    const plan2 =
+        \\新计划
+        \\1. inserted-first
+        \\2. 步骤一:读代码
+        \\3. 步骤二:写实现
+    ;
+    const r2 = try plan_commit.commit(a, &kg, plan2);
+    try std.testing.expect(r2.doc_id != r.doc_id); // 不同计划 → 不同 document(非增量合并)
+    const md2 = try kg.renderMarkdownDoc(r2.doc_id);
+    defer a.free(md2);
+    const p_ins = std.mem.indexOf(u8, md2, "inserted-first") orelse return error.TestUnexpectedResult;
+    const p_s1 = std.mem.indexOf(u8, md2, "步骤一:读代码") orelse return error.TestUnexpectedResult;
+    const p_s2 = std.mem.indexOf(u8, md2, "步骤二:写实现") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(p_ins < p_s1); // inserted-first 在最前(bug 时它掉到 alpha 后)
+    try std.testing.expect(p_s1 < p_s2);
+
+    // 真幂等:相同内容再导入 → 同 document(不新建)。
+    const r3 = try plan_commit.commit(a, &kg, plan2);
+    try std.testing.expect(r3.doc_id == r2.doc_id);
 }
