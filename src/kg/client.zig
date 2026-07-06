@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const common = @import("../tools/common.zig");
+const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const log = @import("../util/log.zig");
 
 pub const EXPECTED_STORAGE_FORMAT_VERSION = "2";
@@ -92,6 +93,14 @@ pub const KgClient = struct {
     degraded_reason: ?[]u8 = null,
     /// 最近一次 data 类错误的 detail(owned,透传给模型)。
     last_detail: ?[]u8 = null,
+    /// abort 信号(M1:ESC 中断——穿进 spawn,避免锁竞争时最坏 13 分钟不可中断)。
+    /// 借用,不拥有;工具/​/kg 调用前 setAbort。
+    abort: ?*const AbortSignal = null,
+
+    /// 设 abort 信号(工具执行前调;领域方法内的 spawn 据此可中断)。
+    pub fn setAbort(self: *KgClient, abort: ?*const AbortSignal) void {
+        self.abort = abort;
+    }
 
     pub fn deinit(self: *KgClient) void {
         if (self.bin_path) |p| self.allocator.free(p);
@@ -184,7 +193,7 @@ pub const KgClient = struct {
     pub fn ensureReady(self: *KgClient) void {
         if (self.ready) return;
         const bin = self.bin_path orelse {
-            self.setDegraded("tinykg 二进制未找到(METACODES_KG_BIN / config kg_bin / vendor/tinykg/tinykg);运行 scripts/build-tinykg.sh 生成", .{});
+            self.setDegraded("tinykg 二进制未找到。设 METACODES_KG_BIN=<path>,或 scripts/build-tinykg.sh 生成 vendor/tinykg/tinykg(需从已安装路径启动 metacodes 才能定位 vendor)", .{});
             return;
         };
         // store 缺 → init(先建父目录)。
@@ -237,7 +246,7 @@ pub const KgClient = struct {
     /// 写记忆节点。返回 node id。scope_global=true → domain=global。
     pub fn remember(self: *KgClient, kind: MemoryKind, text: []const u8, schema_type: []const u8, scope_global: bool) KgError!u64 {
         const domain = if (scope_global) "global" else self.domain;
-        const out = try self.runChecked(&.{
+        const out = try self.runCheckedWrite(&.{
             "add-node",         self.store_path, kind.label(), text,
             "--domain",         domain,          "--schema-type", schema_type,
         });
@@ -275,6 +284,7 @@ pub const KgClient = struct {
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, out.stdout, .{}) catch
             return self.dataError("search JSON 解析失败", .{});
         defer parsed.deinit();
+        if (parsed.value != .object) return self.dataError("search JSON 顶层非 object", .{});
         const hits_v = parsed.value.object.get("hits") orelse return self.dataError("search JSON 无 hits", .{});
         if (hits_v != .array) return self.dataError("search hits 非数组", .{});
 
@@ -325,14 +335,20 @@ pub const KgClient = struct {
             const text = self.fetchNodeText(node_id) catch "";
             defer if (text.len > 0) self.allocator.free(text);
 
-            const h = RecallHit{
+            // L1:先 dupe 三字段到局部 + errdefer,再 append——避免"kind 成功、domain 失败"泄漏。
+            const k_owned = self.allocator.dupe(u8, kind) catch return KgError.OutOfMemory;
+            errdefer self.allocator.free(k_owned);
+            const d_owned = self.allocator.dupe(u8, domain) catch return KgError.OutOfMemory;
+            errdefer self.allocator.free(d_owned);
+            const t_owned = self.allocator.dupe(u8, truncateBytes(text, 800)) catch return KgError.OutOfMemory;
+            errdefer self.allocator.free(t_owned);
+            results.append(self.allocator, .{
                 .node_id = node_id,
-                .kind = self.allocator.dupe(u8, kind) catch return KgError.OutOfMemory,
-                .domain = self.allocator.dupe(u8, domain) catch return KgError.OutOfMemory,
-                .text = self.allocator.dupe(u8, truncateBytes(text, 800)) catch return KgError.OutOfMemory,
+                .kind = k_owned,
+                .domain = d_owned,
+                .text = t_owned,
                 .score = score,
-            };
-            results.append(self.allocator, h) catch return KgError.OutOfMemory;
+            }) catch return KgError.OutOfMemory;
         }
         return results.toOwnedSlice(self.allocator) catch KgError.OutOfMemory;
     }
@@ -397,6 +413,35 @@ pub const KgClient = struct {
         return rows.toOwnedSlice(self.allocator) catch KgError.OutOfMemory;
     }
 
+    /// 本项目记忆节点数(启动锚:注入段告诉模型"存在 N 条记忆",提升 recall 采用率
+    /// ——PM 反馈#3,对齐 A/B 结论"架构位置 > 措辞")。近似:store 总节点数(P1 无
+    /// per-domain 计数原语;绝大多数早期用户单项目,误差可接受)。失败返 0(不阻塞)。
+    pub fn memoryCount(self: *KgClient) usize {
+        if (!self.ready) return 0;
+        const out = self.runChecked(&.{ "stats", self.store_path }) catch return 0;
+        defer self.freeOut(out);
+        const n = extractInfoField(out.stdout, "nodes") orelse return 0;
+        return std.fmt.parseInt(usize, n, 10) catch 0;
+    }
+
+    /// 删节点(/kg forget:用户删除权,投毒自救,设计 §7)。data 错(NotFound)透传。
+    pub fn forget(self: *KgClient, node_id: u64) KgError!void {
+        var idbuf: [24]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{node_id}) catch unreachable;
+        const out = try self.runCheckedWrite(&.{ "delete-node", self.store_path, id_str });
+        self.freeOut(out);
+    }
+
+    /// 最近记忆列表(/kg mem:用户可检视性,设计 §7)。用空查询近似"全部",
+    /// 客户端过滤同 recall(domain + 排除任务面)。返回 owned hits。
+    pub fn listRecentMemories(self: *KgClient, limit: usize) KgError![]RecallHit {
+        // BM25 无"列全部"——用高频虚词兜底召回;更完整的列举 P2 走 tinyql query。
+        return self.recall("the a 的 是 用", limit, false) catch |e| switch (e) {
+            KgError.Data => &.{}, // 空 store 等 → 空列表,不算错误
+            else => e,
+        };
+    }
+
     /// 节点是否存在且为 task kind(stale kg_root 防御,设计 §3)。
     pub fn nodeIsTask(self: *KgClient, node_id: u64) KgError!bool {
         var idbuf: [24]u8 = undefined;
@@ -409,7 +454,11 @@ pub const KgClient = struct {
         // get 输出含 kind 列;粗判 "task" 词存在于首行。
         var it = std.mem.splitScalar(u8, out.stdout, '\n');
         const first = it.next() orelse return false;
-        return std.mem.indexOf(u8, first, "\ttask\t") != null or std.mem.indexOf(u8, first, " task ") != null;
+        // 精确切第 2 列(id\tkind\ttext)比对,不用 " task " 空格兜底(text 含 " task " 会假阳性,L3)。
+        var cols = std.mem.splitScalar(u8, first, '\t');
+        _ = cols.next(); // id
+        const kind = cols.next() orelse return false;
+        return std.mem.eql(u8, kind, "task");
     }
 
     // ── spawn 与错误归一(设计 §6)────────────────────────────────────
@@ -430,20 +479,41 @@ pub const KgClient = struct {
             for (argv.items) |a| if (a) |p| self.allocator.free(std.mem.span(p));
             argv.deinit(self.allocator);
         }
-        try argv.append(self.allocator, try self.allocator.dupeZ(u8, bin));
-        for (args) |a| try argv.append(self.allocator, try self.allocator.dupeZ(u8, a));
+        // L2:先 dupeZ 到局部,append 失败时 free(否则 dupeZ 结果泄漏)。
+        {
+            const b = try self.allocator.dupeZ(u8, bin);
+            argv.append(self.allocator, b) catch |e| {
+                self.allocator.free(b);
+                return e;
+            };
+        }
+        for (args) |a| {
+            const z = try self.allocator.dupeZ(u8, a);
+            argv.append(self.allocator, z) catch |e| {
+                self.allocator.free(z);
+                return e;
+            };
+        }
         try argv.append(self.allocator, null);
-        return common.spawnCaptureWithStderrTimed(argv.items, self.allocator, null, SPAWN_TIMEOUT_MS, null);
+        return common.spawnCaptureWithStderrTimed(argv.items, self.allocator, self.abort, SPAWN_TIMEOUT_MS, null);
     }
 
     /// ready 检查 + 瞬时重试 + 错误分类。exit!=0 时按 stderr 分类:
     /// `tinykg: error: Timeout` → transient(重试);NotFound/InvalidId/Cycle* → data;其余 → transient。
+    /// **写操作不重试**(M3:add-node/delete-node/revise 非幂等——killpg 超时后子进程状态
+    /// 未知,节点可能已落盘,重试=重复写)。读操作可安全重试。
     fn runChecked(self: *KgClient, args: []const []const u8) KgError!Out {
+        return self.runCheckedRetry(args, true);
+    }
+    fn runCheckedWrite(self: *KgClient, args: []const []const u8) KgError!Out {
+        return self.runCheckedRetry(args, false);
+    }
+    fn runCheckedRetry(self: *KgClient, args: []const []const u8, retry: bool) KgError!Out {
         if (!self.ready) return KgError.Degraded;
         var attempt: u32 = 0;
         while (true) : (attempt += 1) {
             const out = self.runRaw(args) catch {
-                if (attempt < TRANSIENT_RETRIES) {
+                if (retry and attempt < TRANSIENT_RETRIES) {
                     sleepMs(TRANSIENT_RETRY_DELAY_MS);
                     continue;
                 }
@@ -461,7 +531,7 @@ pub const KgClient = struct {
                 },
                 .transient => {
                     self.freeOut(out);
-                    if (attempt < TRANSIENT_RETRIES) {
+                    if (retry and attempt < TRANSIENT_RETRIES) {
                         sleepMs(TRANSIENT_RETRY_DELAY_MS);
                         continue;
                     }

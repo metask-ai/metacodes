@@ -697,7 +697,8 @@ pub const App = struct {
         app.permission_ctx.memdir_abs = app.memdir_abs;
     }
 
-    /// KG 就绪判定(kg 非 null 且 ready)。system prompt / 工具注册用。
+    /// KG 就绪判定(kg 非 null 且 ready)。**仅 system prompt 门控用**(tool_defs 在
+    /// initKg 之前构建,不做注册过滤——工具恒注册,degraded 时返回 kg_unavailable)。
     pub fn kgReady(app: *const App) bool {
         if (app.kg) |*k| return k.ready;
         return false;
@@ -711,22 +712,23 @@ pub const App = struct {
         const cwd = app.cwdAbs();
         if (home.len == 0 or cwd.len == 0) return;
 
-        // per-project 指针目录 = memdir 的父目录(`{home}/.cc-zig/projects/<hash>`)。
-        const cwd_hash = @import("core/transcript.zig").hashCwd(cwd);
-        app.kg_projects_dir = std.fmt.allocPrint(app.allocator, "{s}/.cc-zig/projects/{s}", .{ home, cwd_hash[0..] }) catch return;
+        // **domain/指针目录都锚定 git 根**(H5:同一仓库无论从哪个子目录启动都是同一
+        // domain,否则记忆按 cwd 碎片化——BM25/隔离/global 全建立在"一仓一 domain"上)。
+        // project_dir = findRepoRoot(沿 cwd 上溯 .git);非 git repo 退 cwd。
+        const anchor = app.project_dir orelse cwd;
+        const anchor_hash = @import("core/transcript.zig").hashCwd(anchor);
+        app.kg_projects_dir = std.fmt.allocPrint(app.allocator, "{s}/.cc-zig/projects/{s}", .{ home, anchor_hash[0..] }) catch return;
 
-        // domain = git 根目录名 + hash 后缀(可读 + 防撞);非 git 用 cwd basename。
-        const domain = app.computeKgDomain(cwd_hash) catch return;
+        // domain = git 根 basename + git 根 hash 前 8(可读 + 防撞)。
+        const domain = app.computeKgDomain(anchor, anchor_hash) catch return;
         defer app.allocator.free(domain);
 
-        const kg_bin_cfg: ?[]const u8 = null; // config.json kg_bin(P2 接线)
-        const kg_store_cfg: ?[]const u8 = null;
         var client = @import("kg/client.zig").KgClient.init(app.allocator, .{
             .home = home,
             .domain = domain,
-            .config_bin = kg_bin_cfg,
-            .config_store = kg_store_cfg,
-            .exe_dir = app.exeDir(),
+            .config_bin = null, // config.json kg_bin(P2 接线)
+            .config_store = null,
+            .exe_dir = app.config.exe_dir, // argv[0] 解析(H1:vendor 定位现在真可达)
         }) catch return;
         client.ensureReady();
         app.kg = client;
@@ -740,21 +742,11 @@ pub const App = struct {
         }
     }
 
-    /// domain id:git 根目录 basename + cwd_hash 前 8(可读 + 防撞)。git 失败退 cwd basename。
-    fn computeKgDomain(app: *App, cwd_hash: [16]u8) ![]u8 {
-        const cwd = app.cwdAbs();
-        const base = std.fs.path.basename(cwd);
+    /// domain id:锚点(git 根/cwd)basename + 锚点 hash 前 8(可读 + 防撞)。
+    fn computeKgDomain(app: *App, anchor: []const u8, anchor_hash: [16]u8) ![]u8 {
+        const base = std.fs.path.basename(anchor);
         const safe_base = if (base.len == 0) "root" else base;
-        return std.fmt.allocPrint(app.allocator, "{s}-{s}", .{ safe_base, cwd_hash[0..8] });
-    }
-
-    /// cc-zig 可执行文件所在目录(定位 vendor/tinykg)。
-    /// P1:std 无稳定 selfExePath,vendor 定位改由调用方经 config/env 指定;
-    /// 未指定时回落 dev 路径(`~/prj/tinykg/...`)。返 null = 跳过 vendor 查找。
-    /// **P2 待办**:main 捕获 argv[0] 存进 config,exeDir 从此解析 vendor(记账)。
-    fn exeDir(app: *App) ?[]const u8 {
-        _ = app;
-        return null;
+        return std.fmt.allocPrint(app.allocator, "{s}-{s}", .{ safe_base, anchor_hash[0..8] });
     }
 
     /// Shift+Tab 的纯状态机:当前 mode → 下一个 mode(对齐 Claude Code)。

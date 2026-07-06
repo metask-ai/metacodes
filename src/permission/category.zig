@@ -17,6 +17,9 @@ pub fn getToolCategory(tool_name: []const u8) ToolCategory {
     if (std.mem.eql(u8, tool_name, "Write") or std.mem.eql(u8, tool_name, "Edit")) {
         return .write;
     }
+    // KgRemember 是持久写(跨会话 store);plan 模式(只读探索)不该静默放行(M5)。
+    // KgRecall 是只读检索 → read。
+    if (std.mem.eql(u8, tool_name, "KgRemember")) return .write;
     if (std.mem.eql(u8, tool_name, "Bash")) return .execute;
     return .read;
 }
@@ -42,6 +45,13 @@ test "getToolCategory write tools" {
 
 test "getToolCategory execute tools" {
     try std.testing.expect(getToolCategory("Bash") == .execute);
+}
+
+test "getToolCategory: KgRemember=write(plan 模式不静默放行),KgRecall=read" {
+    // M5:KgRemember 是持久跨会话写,plan 模式(只读探索)decision 走 cat==.read→allow 的
+    // 分支时它必须落到非 read,否则 plan 下静默写盘。
+    try std.testing.expect(getToolCategory("KgRemember") == .write);
+    try std.testing.expect(getToolCategory("KgRecall") == .read);
 }
 
 test "getToolCategory unknown defaults to read" {

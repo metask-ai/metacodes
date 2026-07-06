@@ -31,6 +31,7 @@ fn degradedResult(allocator: std.mem.Allocator, kg: ?*kg_mod.KgClient) ![]u8 {
 pub fn executeRemember(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const kg = requireKg(ctx) orelse return degradedResult(ctx.allocator, null);
     if (!kg.ready) return degradedResult(ctx.allocator, kg);
+    kg.setAbort(ctx.abort); // M1:ESC 可中断 spawn
 
     const text = util_json.extractStringField(args, "text") orelse {
         common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRemember 缺少必填字段 text", .{});
@@ -56,16 +57,21 @@ pub fn executeRemember(ctx: *const ToolContext, args: []const u8) anyerror![]u8 
         break :blk std.ascii.eqlIgnoreCase(raw, "global");
     };
 
-    // 近重复搭车门(设计 §5):写前 recall 一次,top1 高分附提示——不硬拦。
+    // 近重复搭车门(设计 §5):写前 recall,top1 **文本**与新文本高度重合时附提示——不硬拦。
+    // 用文本比对而非 BM25 分数:实测 BM25 分数随语料规模变化(1 节点 9.8、2 节点 21),
+    // 绝对阈值不可靠(Linus M4)。文本归一化重合是尺度无关的确定性信号。
     var dup_note: ?[]u8 = null;
     defer if (dup_note) |n| ctx.allocator.free(n);
-    if (kg.recall(text_owned, 1, false)) |hits| {
+    if (kg.recall(text_owned, 3, false)) |hits| {
         defer {
             for (hits) |*h| h.deinit(ctx.allocator);
             ctx.allocator.free(hits);
         }
-        if (hits.len > 0 and hits[0].score >= 18.0) {
-            dup_note = try std.fmt.allocPrint(ctx.allocator, "已有相近记忆 node {d}(score {d:.1}),若为同一事实请考虑更新而非新增", .{ hits[0].node_id, hits[0].score });
+        for (hits) |h| {
+            if (isNearDuplicate(text_owned, h.text)) {
+                dup_note = try std.fmt.allocPrint(ctx.allocator, "已有高度相似记忆 node {d},若为同一事实请考虑更新而非新增", .{h.node_id});
+                break;
+            }
         }
     } else |_| {} // 近重复检查失败不阻塞写入
 
@@ -93,6 +99,7 @@ pub fn executeRemember(ctx: *const ToolContext, args: []const u8) anyerror![]u8 
 pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const kg = requireKg(ctx) orelse return degradedResult(ctx.allocator, null);
     if (!kg.ready) return degradedResult(ctx.allocator, kg);
+    kg.setAbort(ctx.abort); // M1:ESC 可中断 spawn
 
     const query = util_json.extractStringField(args, "query") orelse {
         common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall 缺少必填字段 query", .{});
@@ -144,6 +151,42 @@ fn kgErrorResult(ctx: *const ToolContext, kg: *kg_mod.KgClient, e: kg_mod.KgErro
     }
 }
 
+/// 近重复判定(尺度无关,不依赖 BM25 分数):归一化空白后,一方是另一方前缀,或
+/// 归一化后完全相等。保守——只认高度重合,漏判(不提示)优于误判(阻扰正常写入)。
+fn isNearDuplicate(new_text: []const u8, existing: []const u8) bool {
+    const a = std.mem.trim(u8, new_text, " \t\r\n");
+    const b = std.mem.trim(u8, existing, " \t\r\n");
+    if (a.len == 0 or b.len == 0) return false;
+    if (std.mem.eql(u8, a, b)) return true;
+    // 一方是另一方前缀(existing 常是被截断到 800 字节的)且重合 ≥ 短串的 90%。
+    const shorter = @min(a.len, b.len);
+    const longer = @max(a.len, b.len);
+    if (shorter * 10 < longer * 9) return false; // 长度差 >10% → 不算重复
+    return std.mem.startsWith(u8, a, b[0..@min(b.len, shorter)]) or std.mem.startsWith(u8, b, a[0..@min(a.len, shorter)]);
+}
+
 fn appendJsonString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
     try util_json.serializeString(s, out, allocator);
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+const testing = std.testing;
+
+test "isNearDuplicate: 尺度无关文本重合判定(替代不可靠的 BM25 分数门,M4)" {
+    // 完全相同 → dup。
+    try testing.expect(isNearDuplicate("auth 用 JWT", "auth 用 JWT"));
+    // 归一化空白后相同 → dup。
+    try testing.expect(isNearDuplicate("  auth 用 JWT \n", "auth 用 JWT"));
+    // existing 是 new 的前缀(被截断到 800 字节的情况)且长度接近 → dup。
+    try testing.expect(isNearDuplicate("auth 用 JWT 存 header 15 分钟", "auth 用 JWT 存 header 15 分"));
+    // 完全不同 → 非 dup。
+    try testing.expect(!isNearDuplicate("auth 用 JWT", "数据库用 postgres 分区"));
+    // 长度差 >10% → 非 dup(不同信息量)。
+    try testing.expect(!isNearDuplicate("auth 用 JWT 存 header 15 分钟过期 refresh token httponly", "auth"));
+    // 空串 → 非 dup(不阻扰)。
+    try testing.expect(!isNearDuplicate("", "x"));
+    try testing.expect(!isNearDuplicate("x", ""));
 }

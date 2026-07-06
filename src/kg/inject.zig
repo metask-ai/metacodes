@@ -4,9 +4,9 @@
 //! 实时真相靠 TaskList。**空态零输出**(无 kg_root / frontier 空 → 一个字不注入)。
 //! 预算:记忆通道合计目标 300-600 tok(本段自身 ≤ ~40 行硬截断兜底)。
 //!
-//! 线程模型:App init 派后台线程跑 buildSummary(store-info/frontier 可能被目录锁
-//! 卡最长 35s,绝不阻塞启动);产物是**不可变快照字符串**,主线程 turn 边界取用
-//! (Linus 条件 4 方案 a:零锁,单向 handoff,经 atomic flag)。
+//! 线程模型(P1 现状):App.initKg **同步**调 buildSummary(内部 spawn tinykg;本地未竞争
+//! store 为毫秒级)。锁竞争时最坏挂 35s——**P2 待办**:移后台线程,产不可变快照,主线程
+//! turn 边界取用(设计 §5 要求启动零阻塞)。此处不谎称已线程化(Linus M2)。
 
 const std = @import("std");
 const client_mod = @import("client.zig");
@@ -47,33 +47,39 @@ pub fn clearIdPointer(allocator: std.mem.Allocator, projects_dir: []const u8, na
 
 /// 构建注入段。返回 null = 空态(零输出);否则 owned 字符串。
 /// 在后台线程调用(内部 spawn tinykg;主线程绝不直接调)。
+/// 两部分:① 记忆数锚(count>0 时,提升 recall 采用率——PM#3);② plan frontier(有活跃图时)。
 pub fn buildSummary(
     allocator: std.mem.Allocator,
     kg: *client_mod.KgClient,
     projects_dir: []const u8,
 ) ?[]u8 {
     if (!kg.ready) return null;
-    const root_id = readIdPointer(allocator, projects_dir, "kg_root") orelse return null;
+    const mem_count = kg.memoryCount();
 
-    // stale 防御:root 不存在/非 task → 清指针,空态。
-    const is_task = kg.nodeIsTask(root_id) catch return null;
-    if (!is_task) {
-        clearIdPointer(allocator, projects_dir, "kg_root");
-        return null;
+    // plan frontier(可选)。
+    var rows: []client_mod.FrontierRow = &.{};
+    var root_id: u64 = 0;
+    if (readIdPointer(allocator, projects_dir, "kg_root")) |rid| {
+        const is_task = kg.nodeIsTask(rid) catch false;
+        if (!is_task) {
+            clearIdPointer(allocator, projects_dir, "kg_root"); // stale 防御
+        } else {
+            rows = kg.frontier(rid, 50) catch &.{};
+            root_id = rid;
+        }
     }
-
-    const rows = kg.frontier(root_id, 50) catch return null;
     defer {
         for (rows) |*r| r.deinit(allocator);
-        allocator.free(rows);
+        if (rows.len > 0) allocator.free(rows);
     }
-    if (rows.len == 0) return null; // 空 frontier:图存在但无开放任务 → 不占预算
 
-    return renderSummary(allocator, root_id, rows) catch null;
+    // 全空(无记忆 + 无 frontier)→ 空态零输出。
+    if (mem_count == 0 and rows.len == 0) return null;
+    return renderSummary(allocator, root_id, rows, mem_count) catch null;
 }
 
-/// 纯渲染(可单测):frontier rows → 注入段文本。
-pub fn renderSummary(allocator: std.mem.Allocator, root_id: u64, rows: []const client_mod.FrontierRow) ![]u8 {
+/// 纯渲染(可单测):记忆数锚 + frontier rows → 注入段文本。
+pub fn renderSummary(allocator: std.mem.Allocator, root_id: u64, rows: []const client_mod.FrontierRow, mem_count: usize) ![]u8 {
     var ready_count: usize = 0;
     var blocked_count: usize = 0;
     for (rows) |r| {
@@ -82,17 +88,24 @@ pub fn renderSummary(allocator: std.mem.Allocator, root_id: u64, rows: []const c
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    try appendPrint(&out, allocator, "# Knowledge Graph — 持久任务图(root {d})\n", .{root_id});
-    try appendPrint(&out, allocator, "开放任务:{d} ready / {d} blocked(共 {d})\n", .{ ready_count, blocked_count, rows.len });
-    var shown: usize = 0;
-    for (rows) |r| {
-        if (r.readiness != .ready) continue;
-        if (shown >= MAX_READY_SHOWN) break;
-        shown += 1;
-        try appendPrint(&out, allocator, "- [{d}] {s}\n", .{ r.task_id, firstLineTrunc(r.text, 120) });
+    try out.appendSlice(allocator, "# Knowledge Graph\n");
+    // ① 记忆数锚(采用率:让模型知道"图里有货",recall 前先查——PM#3)。
+    if (mem_count > 0) {
+        try appendPrint(&out, allocator, "本项目/全局共 {d} 条持久记忆——处理涉及既往决策/约定的任务前,先 KgRecall。\n", .{mem_count});
     }
-    if (ready_count > MAX_READY_SHOWN) try appendPrint(&out, allocator, "- …还有 {d} 个 ready 任务\n", .{ready_count - MAX_READY_SHOWN});
-    try out.appendSlice(allocator, "此为启动快照,以 TaskList 实时结果为准。\n");
+    // ② plan frontier(有活跃图时)。
+    if (rows.len > 0) {
+        try appendPrint(&out, allocator, "持久任务图(root {d}):{d} ready / {d} blocked(共 {d})\n", .{ root_id, ready_count, blocked_count, rows.len });
+        var shown: usize = 0;
+        for (rows) |r| {
+            if (r.readiness != .ready) continue;
+            if (shown >= MAX_READY_SHOWN) break;
+            shown += 1;
+            try appendPrint(&out, allocator, "- [{d}] {s}\n", .{ r.task_id, firstLineTrunc(r.text, 120) });
+        }
+        if (ready_count > MAX_READY_SHOWN) try appendPrint(&out, allocator, "- …还有 {d} 个 ready 任务\n", .{ready_count - MAX_READY_SHOWN});
+        try out.appendSlice(allocator, "此为启动快照,以 TaskList 实时结果为准。\n");
+    }
     return out.toOwnedSlice(allocator);
 }
 
@@ -124,9 +137,10 @@ test "renderSummary 空态外的完整渲染:计数/ready 前3/快照声明" {
         .{ .task_id = 14, .readiness = .ready, .text = @constCast("步骤四") },
         .{ .task_id = 15, .readiness = .ready, .text = @constCast("步骤五") },
     };
-    const s = try renderSummary(a, 1, &rows);
+    const s = try renderSummary(a, 1, &rows, 5);
     defer a.free(s);
     try testing.expect(std.mem.indexOf(u8, s, "root 1") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "5 条持久记忆") != null);
     try testing.expect(std.mem.indexOf(u8, s, "4 ready / 1 blocked(共 5)") != null);
     try testing.expect(std.mem.indexOf(u8, s, "[11] 步骤一:读代码") != null);
     try testing.expect(std.mem.indexOf(u8, s, "第二行不显示") == null); // 只取首行

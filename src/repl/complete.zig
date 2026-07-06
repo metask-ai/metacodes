@@ -35,6 +35,7 @@ pub const SLASH_COMMAND_TABLE = [_]SlashCmd{
     .{ .name = "/agents", .desc = "List subagents" },
     .{ .name = "/permissions", .desc = "Show permission rules and mode" },
     .{ .name = "/memory", .desc = "Edit persistent memory" },
+    .{ .name = "/kg", .desc = "Knowledge graph: status, memories, forget" },
     .{ .name = "/commit", .desc = "Create a git commit" },
     .{ .name = "/review", .desc = "Ask the model to review the current diff" },
     .{ .name = "/exit", .desc = "Exit REPL" },

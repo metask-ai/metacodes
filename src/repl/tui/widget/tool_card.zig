@@ -1506,6 +1506,7 @@ fn isJsonSummaryTool(tool_name: []const u8) bool {
         "CronCreate",           "CronDelete",          "CronList",
         "EnterWorktree",        "ExitWorktree",        "PushNotification",
         "ListMcpResourcesTool", "ReadMcpResourceTool", "ToolSearch",
+        "KgRemember",           "KgRecall",
     };
     for (names) |n| if (std.mem.eql(u8, tool_name, n)) return true;
     return false;
@@ -1570,6 +1571,18 @@ fn renderJsonToolSummary(
         }
         if (std.mem.eql(u8, tool_name, "ListMcpResourcesTool") or std.mem.eql(u8, tool_name, "ReadMcpResourceTool")) {
             break :blk "MCP resource(s)";
+        }
+        if (std.mem.eql(u8, tool_name, "KgRemember")) {
+            // {"remembered":{"node_id":N,"kind":"..","scope":".."}} 或 {"kg_unavailable":..}
+            if (extractRawField(output_text, "kg_unavailable") != null) break :blk "KG unavailable";
+            const nid = extractRawField(output_text, "node_id") orelse "?";
+            const knd = extractJsonStringField(output_text, "kind") orelse "memory";
+            break :blk std.fmt.bufPrint(&line_buf, "remembered #{s} ({s})", .{ nid, knd }) catch "remembered";
+        }
+        if (std.mem.eql(u8, tool_name, "KgRecall")) {
+            if (extractRawField(output_text, "kg_unavailable") != null) break :blk "KG unavailable";
+            const cnt = extractRawField(output_text, "count") orelse "0";
+            break :blk std.fmt.bufPrint(&line_buf, "recalled {s} memory(ies)", .{cnt}) catch "recalled";
         }
         break :blk "done";
     };
@@ -1878,6 +1891,37 @@ test "resultRenderMode: 故意 hidden vs 应显示" {
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("PushNotification"));
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("ToolSearch"));
     try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("ListMcpResourcesTool"));
+    // KG 记忆工具**必须可见**(设计禁 hidden;投毒写入用户须看得见)。
+    // 回归守卫:kg_tools.zig 头注释声称"禁 hidden 已在注册处保证",此断言即那条保证。
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("KgRemember"));
+    try testing.expectEqual(ResultRenderMode.summary, resultRenderMode("KgRecall"));
+    try testing.expect(showStartCard("KgRemember")); // ⏺ 起始卡也要打
+    try testing.expect(showStartCard("KgRecall"));
+}
+
+test "KG 工具卡人话渲染:remembered/recalled/unavailable" {
+    const a = testing.allocator;
+    const th = theme_mod.monochrome;
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        try renderJsonToolSummary(a, th, "KgRemember", "{\"remembered\":{\"node_id\":42,\"kind\":\"decision\",\"scope\":\"project\"}}", &out, .{});
+        try testing.expect(std.mem.indexOf(u8, out.items, "remembered #42") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "decision") != null);
+        try testing.expect(std.mem.indexOf(u8, out.items, "{") == null); // 不裸吐 JSON
+    }
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        try renderJsonToolSummary(a, th, "KgRecall", "{\"hits\":[{}],\"count\":3}", &out, .{});
+        try testing.expect(std.mem.indexOf(u8, out.items, "recalled 3") != null);
+    }
+    {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(a);
+        try renderJsonToolSummary(a, th, "KgRemember", "{\"kg_unavailable\":true,\"reason\":\"x\"}", &out, .{});
+        try testing.expect(std.mem.indexOf(u8, out.items, "KG unavailable") != null);
+    }
 }
 
 test "showStartCard: Task/Agent 起始卡可见但结果仍 hidden(#8)" {

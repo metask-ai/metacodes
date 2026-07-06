@@ -162,6 +162,63 @@ test "L2 KG: global scope 记忆跨项目可见" {
     }
 }
 
+const harness = @import("harness");
+
+const KG_END_TURN_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+test "L2 KG: 注入段经 inject_user_context 进请求体(字节断言,DoD)" {
+    // 端到端:kg_summary → user_context.build → inject_user_context → buildApiMessages
+    // → 序列化请求体。用真 MockServer 捕获 body,断言 KG 记忆锚字节在内。
+    const a = std.testing.allocator;
+
+    // 先造 user_context(含 kg_summary),证明 KG 段进入首条 user message。
+    const uc = (try cc.user_context.build(a, .{
+        .cwd = "",
+        .home = "",
+        .kg_summary = "# Knowledge Graph\n本项目/全局共 7 条持久记忆——处理涉及既往决策/约定的任务前,先 KgRecall。\n",
+    })).?;
+    defer a.free(uc);
+
+    var srv = try harness.MockServer.start(KG_END_TURN_SSE, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    const io = io_runtime.io();
+
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io, "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "hi");
+
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var wb = cc.writer_backend.WriterBackend.initNull();
+    const be = wb.backend();
+    const result = cc.agent_loop.run(&conv, client.provider(), &.{}, &perm, .{
+        .max_turns = 1,
+        .inject_user_context = uc, // ← KG 注入通道
+    }, &be, a) catch |e| {
+        std.debug.print("agent_loop.run failed: {s}\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
+
+    const cap = srv.lastRequest() orelse return error.NoRequestCaptured;
+    // KG 记忆锚必须出现在实际发出的请求 body 里。
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "7 条持久记忆") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "KgRecall") != null);
+}
+
 test "L2 KG: 版本门 — degraded 明示且不 spawn" {
     const a = std.testing.allocator;
     // 故意给不存在的二进制 → degraded,ensureReady 不崩,recall 返回 Degraded。

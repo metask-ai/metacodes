@@ -23,6 +23,11 @@ pub const PERMANENTLY_DISABLED = [_][]const u8{
     "ExitPlanMode",
     "ScheduleWakeup",
     "WaitForMcpServers",
+    // KG 写工具**只归主 agent**(设计 v3-final §2.8.4 单写者原则):subagent 干活+返报告,
+    // 父 agent 验收后闭合/记忆。避免多线程 KgClient 数据竞争(last_detail/degraded_reason
+    // 裸写)+ 避免子 agent 拿到 kg=null 后收到"KG 未配置"假错(H3)。
+    "KgRemember",
+    "KgRecall",
 };
 
 pub fn filterToolDefs(
@@ -90,6 +95,25 @@ fn fakeDefs(allocator: std.mem.Allocator) ![]json.ToolDefinition {
         out[i] = .{ .name = n, .description = "", .input_schema = .{ .type = "object", .properties = null, .required = &.{} } };
     }
     return out;
+}
+
+test "filterToolDefs: KG 工具从 subagent 移除(单写者 H3)" {
+    const a = testing.allocator;
+    var def = try makeFakeDef(a, "", "", null);
+    defer def.deinit(a);
+    const parent = [_]json.ToolDefinition{
+        .{ .name = "Read", .description = "", .input_schema = .{} },
+        .{ .name = "KgRemember", .description = "", .input_schema = .{} },
+        .{ .name = "KgRecall", .description = "", .input_schema = .{} },
+    };
+    const filtered = try filterToolDefs(a, &parent, &def);
+    defer a.free(filtered);
+    for (filtered) |d| {
+        try testing.expect(!std.mem.eql(u8, d.name, "KgRemember"));
+        try testing.expect(!std.mem.eql(u8, d.name, "KgRecall"));
+    }
+    try testing.expectEqual(@as(usize, 1), filtered.len); // 只剩 Read
+    try testing.expectEqualStrings("Read", filtered[0].name);
 }
 
 test "filterToolDefs: permanently disabled removed" {

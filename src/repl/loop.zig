@@ -350,6 +350,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             try retryLast(app, allocator, &aux_be);
             continue;
         }
+        if (std.mem.eql(u8, trimmed, "/kg") or std.mem.startsWith(u8, trimmed, "/kg ")) {
+            const rest = std.mem.trim(u8, trimmed[3..], " \t");
+            try handleKg(app, allocator, rest);
+            continue;
+        }
         if (std.mem.eql(u8, trimmed, "/cost")) {
             const u = app.usage;
             const cost = u.costUsd(app.config.model);
@@ -1991,6 +1996,91 @@ pub fn parseGoalCommand(rest_raw: []const u8) GoalCommand {
     if (std.mem.eql(u8, rest, "complete")) return .{ .complete = {} };
     if (std.mem.eql(u8, rest, "blocked") or std.mem.eql(u8, rest, "block")) return .{ .blocked = {} };
     return .{ .invalid = {} };
+}
+
+/// /kg —— KG 用户面(设计 v3-final §7:状态/记忆列表/删除/导出)。
+/// 无参=状态;`mem`=最近记忆;`forget <id>`=删除(投毒自救);`export`=导出 markdown。
+fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
+    const kg = if (app.kg) |*k| k else {
+        std.debug.print("KG 未配置(缺 tinykg 二进制)。运行 scripts/build-tinykg.sh 生成。\n", .{});
+        return;
+    };
+    if (!kg.ready) {
+        std.debug.print("KG 已降级:{s}\n", .{kg.degradedMessage()});
+        return;
+    }
+    const arg = std.mem.trim(u8, rest, " \t");
+
+    if (arg.len == 0) {
+        // 状态:store 路径 + domain + frontier(有 kg_root 时)。
+        std.debug.print("KG store: {s}\ndomain:   {s}\n", .{ kg.store_path, kg.domain });
+        const inject = @import("../kg/inject.zig");
+        if (app.kg_projects_dir.len > 0) {
+            if (inject.readIdPointer(allocator, app.kg_projects_dir, "kg_root")) |root| {
+                const rows = kg.frontier(root, 30) catch {
+                    std.debug.print("(frontier 查询失败)\n", .{});
+                    return;
+                };
+                defer {
+                    for (rows) |*r| r.deinit(allocator);
+                    allocator.free(rows);
+                }
+                std.debug.print("plan root {d} — {d} 个开放任务:\n", .{ root, rows.len });
+                for (rows) |r| {
+                    const mark = switch (r.readiness) {
+                        .ready => "○",
+                        .blocked => "⊘",
+                        .missing_dependencies => "…",
+                    };
+                    std.debug.print("  {s} [{d}] {s}\n", .{ mark, r.task_id, firstLine(r.text) });
+                }
+            } else {
+                std.debug.print("(本项目无活跃计划图;计划批准后从此恢复)\n", .{});
+            }
+        }
+        return;
+    }
+
+    if (std.mem.eql(u8, arg, "mem")) {
+        const hits = kg.listRecentMemories(15) catch {
+            std.debug.print("(记忆列表查询失败)\n", .{});
+            return;
+        };
+        defer {
+            for (hits) |*h| h.deinit(allocator);
+            allocator.free(hits);
+        }
+        if (hits.len == 0) {
+            std.debug.print("(暂无记忆)\n", .{});
+            return;
+        }
+        std.debug.print("最近记忆({d} 条):\n", .{hits.len});
+        for (hits) |h| {
+            std.debug.print("  [{d}] {s}: {s}\n", .{ h.node_id, h.kind, firstLine(h.text) });
+        }
+        return;
+    }
+
+    if (std.mem.startsWith(u8, arg, "forget ")) {
+        const id_str = std.mem.trim(u8, arg["forget ".len..], " \t");
+        const id = std.fmt.parseInt(u64, id_str, 10) catch {
+            std.debug.print("用法:/kg forget <node-id>\n", .{});
+            return;
+        };
+        kg.forget(id) catch |e| {
+            std.debug.print("删除失败({s}): {s}\n", .{ @errorName(e), kg.detail() });
+            return;
+        };
+        std.debug.print("已删除 node {d}。\n", .{id});
+        return;
+    }
+
+    std.debug.print("用法:/kg(状态)| /kg mem(最近记忆)| /kg forget <id>(删除)\n", .{});
+}
+
+fn firstLine(text: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    return text[0..@min(end, 100)];
 }
 
 fn handleGoal(app: *app_mod.App, rest: []const u8) !void {
