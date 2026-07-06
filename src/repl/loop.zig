@@ -574,7 +574,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             app.provider(),
             app.tool_defs,
             &app.permission_ctx,
-            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
+            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .model_switch_compact = app.pendingModelSwitchCompact(), .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
             effective_be,
             allocator,
         ) catch |err| {
@@ -582,9 +582,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             if (tui_be) |*tb| tb.stopInput();
             if (gen_region) |*r| r.leaveGenerating(app);
             if (tty) drainStdin(stdin_fd);
+            app.clearPendingModelSwitchCompact();
             std.debug.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
             continue;
         };
+        app.clearPendingModelSwitchCompact();
         accountGoalUsageAfterRun(app, usage_before, mode_before, started_ns);
         // 停 watcher + 清 stdin 缓冲（生成期间用户可能误按的键，别污染下一轮）
         if (tui_be) |*tb| tb.stopInput();
@@ -1631,13 +1633,15 @@ fn retryLast(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui
         app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .model_switch_compact = app.pendingModelSwitchCompact(), .dyn_registry = &app.dyn_registry },
         backend,
         allocator,
     ) catch |err| {
         std.debug.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
+        app.clearPendingModelSwitchCompact();
         return;
     };
+    app.clearPendingModelSwitchCompact();
     accountGoalUsageAfterRun(app, usage_before, mode_before, started_ns);
     app.persistTranscript();
     if (result.stop_reason == .aborted) {
@@ -2714,13 +2718,15 @@ fn handleSkillInvocation(app: *app_mod.App, allocator: std.mem.Allocator, rest: 
         app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .project_dir = app.project_dir_or_empty(), .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .model_switch_compact = app.pendingModelSwitchCompact(), .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .project_dir = app.project_dir_or_empty(), .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true },
         &be,
         allocator,
     ) catch |err| {
         std.debug.print("\x1b[31mError after /{s}: {s}\x1b[0m\n", .{ head, @errorName(err) });
+        app.clearPendingModelSwitchCompact();
         return true;
     };
+    app.clearPendingModelSwitchCompact();
     app.persistTranscript();
     if (result.stop_reason == .aborted) app.abort.resetForTesting();
     return true;
@@ -2948,13 +2954,15 @@ fn runInjectedAgentWithSynthetic(app: *app_mod.App, allocator: std.mem.Allocator
         app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = synthetic_user_input, .dyn_registry = &app.dyn_registry },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = synthetic_user_input, .model_switch_compact = app.pendingModelSwitchCompact(), .dyn_registry = &app.dyn_registry },
         backend,
         allocator,
     ) catch |err| {
         std.debug.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
+        app.clearPendingModelSwitchCompact();
         return;
     };
+    app.clearPendingModelSwitchCompact();
     accountGoalUsageAfterRun(app, usage_before, mode_before, started_ns);
     app.persistTranscript();
     if (result.stop_reason == .aborted) {

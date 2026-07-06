@@ -1,4 +1,5 @@
-//! 9 段结构化 compact 摘要(补真缺口,对齐 cc services/compact/prompt.ts)。
+//! Compact 摘要生成。默认模板对齐 metacode-rs core/templates/compact/*，
+//! 并允许用 env 指定文件在不改代码的情况下 A/B 调 prompt。
 //!
 //! cc-zig 原 auto-compact 是"留最近 N 条、丢老的"——丢得多、丢失早期上下文。
 //! cc 的做法:调模型把要丢的历史总结成 9 段结构化 summary,替换老消息,保真。
@@ -6,35 +7,40 @@
 //! 失败/无 client → 返 null,caller 退回纯 compactKeepRecent(降级不阻断)。
 
 const std = @import("std");
-const client_mod = @import("../client.zig");
 const types = @import("../types.zig");
 const msg = @import("message.zig");
-const Conversation = @import("conversation.zig").Conversation;
 const log = @import("../util/log.zig");
+const json_mod = @import("../json.zig");
+const provider_mod = @import("../api/provider.zig");
 
-/// 9 段结构化摘要 system prompt(对齐 cc compact/prompt.ts 的分段)。
-const COMPACT_SYSTEM =
-    \\You are summarizing a software-engineering conversation so it can continue after older
-    \\messages are dropped. Capture ALL technical detail needed to resume seamlessly. Output
-    \\EXACTLY these 9 sections (markdown headers), each concise but complete. Do NOT use tools.
-    \\
-    \\1. Primary Request and Intent — what the user explicitly asked for.
-    \\2. Key Technical Concepts — frameworks, languages, patterns in play.
-    \\3. Files and Code Sections — specific files touched + why they matter (include key paths).
-    \\4. Errors and Fixes — errors hit and how they were resolved.
-    \\5. Problem Solving — problems solved and ongoing troubleshooting.
-    \\6. All User Messages — list the user's non-tool-result messages (intent trail).
-    \\7. Pending Tasks — what remains to do.
-    \\8. Current Work — precisely what was being worked on just before this summary.
-    \\9. Optional Next Step — the immediate next step, with a direct quote if relevant.
-;
+const DEFAULT_COMPACT_SYSTEM = @embedFile("templates/compact/prompt.md");
+const DEFAULT_SUMMARY_PREFIX = @embedFile("templates/compact/summary_prefix.md");
+const COMPACT_PROMPT_FILE_ENV = "METACODES_COMPACT_PROMPT_FILE";
+const COMPACT_SUMMARY_PREFIX_FILE_ENV = "METACODES_COMPACT_SUMMARY_PREFIX_FILE";
+
+pub fn defaultSystemPrompt() []const u8 {
+    return DEFAULT_COMPACT_SYSTEM;
+}
+
+pub fn defaultSummaryPrefix() []const u8 {
+    return DEFAULT_SUMMARY_PREFIX;
+}
 
 /// 生成要丢消息的 9 段摘要。client 为 null 或调用失败 → null(caller 降级)。
 /// drop_msgs 是即将被丢弃的消息切片(borrowed)。返回 owned summary 文本。
 pub fn summarize(
     allocator: std.mem.Allocator,
-    provider: @import("../api/provider.zig").Provider,
+    provider: provider_mod.Provider,
     drop_msgs: []const msg.Message,
+) ?[]u8 {
+    return summarizeWithModel(allocator, provider, drop_msgs, null);
+}
+
+pub fn summarizeWithModel(
+    allocator: std.mem.Allocator,
+    provider: provider_mod.Provider,
+    drop_msgs: []const msg.Message,
+    model_override: ?[]const u8,
 ) ?[]u8 {
     if (drop_msgs.len == 0) return null;
 
@@ -63,17 +69,132 @@ pub fn summarize(
         transcript_buf.append(allocator, '\n') catch return null;
     }
 
-    const user_text = std.fmt.allocPrint(allocator, "Summarize this conversation into the 9 sections:\n\n{s}", .{transcript_buf.items}) catch return null;
+    const user_text = std.fmt.allocPrint(allocator, "Summarize this conversation for compaction:\n\n{s}", .{transcript_buf.items}) catch return null;
     defer allocator.free(user_text);
+
+    const system_prompt = loadTemplateOrDefault(allocator, COMPACT_PROMPT_FILE_ENV, DEFAULT_COMPACT_SYSTEM) catch return null;
+    defer allocator.free(system_prompt);
 
     const api_msgs = [_]types.ApiMessage{.{
         .role = .user,
         .content = &[_]types.ApiContent{.{ .text = user_text }},
     }};
-    const resp = provider.send(&api_msgs, COMPACT_SYSTEM, null) catch |err| {
+    const resp = provider.sendWithModel(&api_msgs, system_prompt, null, model_override) catch |err| {
         log.warn("compact", "summarize API call failed: {s} (falling back to keep-recent)", .{@errorName(err)});
         return null;
     };
+    defer if (resp.content.len > 0) allocator.free(resp.content);
     if (resp.content.len == 0) return null;
-    return allocator.dupe(u8, resp.content) catch null;
+    return applySummaryPrefix(allocator, resp.content) catch null;
+}
+
+pub fn applySummaryPrefix(allocator: std.mem.Allocator, summary_suffix: []const u8) ![]u8 {
+    const prefix = try loadTemplateOrDefault(allocator, COMPACT_SUMMARY_PREFIX_FILE_ENV, DEFAULT_SUMMARY_PREFIX);
+    defer allocator.free(prefix);
+    return std.fmt.allocPrint(allocator, "{s}\n{s}", .{ trimRightAscii(prefix, " \t\r\n"), summary_suffix });
+}
+
+fn loadTemplateOrDefault(allocator: std.mem.Allocator, env_name: [:0]const u8, default_text: []const u8) ![]u8 {
+    if (std.c.getenv(env_name.ptr)) |path_c| {
+        const path = std.mem.span(path_c);
+        if (path.len > 0) {
+            return readFileAllocLimited(allocator, path, 128 * 1024) catch |err| {
+                log.warn("compact", "failed to read {s}={s}: {s}; using embedded template", .{ env_name, path, @errorName(err) });
+                return try allocator.dupe(u8, default_text);
+            };
+        }
+    }
+    return try allocator.dupe(u8, default_text);
+}
+
+fn readFileAllocLimited(allocator: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path_z, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
+    defer _ = std.c.close(fd);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.posix.read(fd, &buf) catch return error.ReadFailed;
+        if (n == 0) break;
+        if (out.items.len + n > limit) return error.FileTooLarge;
+        try out.appendSlice(allocator, buf[0..n]);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn trimRightAscii(s: []const u8, chars: []const u8) []const u8 {
+    var end = s.len;
+    while (end > 0 and std.mem.indexOfScalar(u8, chars, s[end - 1]) != null) : (end -= 1) {}
+    return s[0..end];
+}
+
+test "compact summary default templates match metacode-rs shape" {
+    try std.testing.expect(std.mem.indexOf(u8, defaultSystemPrompt(), "CONTEXT CHECKPOINT COMPACTION") != null);
+    try std.testing.expect(std.mem.indexOf(u8, defaultSummaryPrefix(), "Another language model started") != null);
+}
+
+test "compact summary applies summary_prefix" {
+    const a = std.testing.allocator;
+    const out = try applySummaryPrefix(a, "handoff body");
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Another language model started") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out, "handoff body"));
+}
+
+fn testSummarizeFreesProviderResponseContent() !void {
+    const a = std.testing.allocator;
+    var input = try msg.textMessage(.user, "hello", a);
+    defer input.deinit(a);
+    var ctx = struct {
+        allocator: std.mem.Allocator,
+    }{ .allocator = a };
+
+    const Fake = struct {
+        fn model(_: *anyopaque) []const u8 {
+            return "fake";
+        }
+        fn send(ctx_ptr: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition, _: ?[]const u8) anyerror!provider_mod.ApiResponse {
+            const c: *@TypeOf(ctx) = @ptrCast(@alignCast(ctx_ptr));
+            return .{ .content = try c.allocator.dupe(u8, "summary body") };
+        }
+        fn sendStream(_: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition, _: ?*const @import("../util/abort.zig").AbortSignal, _: ?[]const u8, _: ?json_mod.ToolChoice, _: []const u8) anyerror!provider_mod.StreamHandle {
+            return error.Unused;
+        }
+        fn sendStreamRetry(_: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition, _: ?*const @import("../util/abort.zig").AbortSignal, _: ?[]const u8, _: ?json_mod.ToolChoice, _: u32, _: u64, _: ?provider_mod.RetryReporter, _: []const u8) anyerror!provider_mod.StreamHandle {
+            return error.Unused;
+        }
+        fn maxTokens(_: *anyopaque) u32 {
+            return 32_000;
+        }
+        fn maxInputTokens(_: *anyopaque) u32 {
+            return 200_000;
+        }
+        fn reasoningEffort(_: *anyopaque) ?types.ReasoningEffort {
+            return null;
+        }
+        fn supports(_: *anyopaque, _: provider_mod.Capability) bool {
+            return false;
+        }
+    };
+
+    const provider = provider_mod.Provider{
+        .ctx = &ctx,
+        .modelFn = Fake.model,
+        .sendStreamFn = Fake.sendStream,
+        .sendStreamRetryFn = Fake.sendStreamRetry,
+        .sendFn = Fake.send,
+        .maxTokensFn = Fake.maxTokens,
+        .maxInputTokensFn = Fake.maxInputTokens,
+        .reasoningEffortFn = Fake.reasoningEffort,
+        .supportsFn = Fake.supports,
+    };
+    const summary = summarize(a, provider, &.{input}) orelse return error.TestUnexpectedResult;
+    defer a.free(summary);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "summary body") != null);
+}
+
+test "compact summary summarize frees provider response content" {
+    try testSummarizeFreesProviderResponseContent();
 }

@@ -245,6 +245,15 @@ pub const TuiBackend = struct {
                 ) catch return;
                 self.region.writeGenText(s);
             },
+            .context_warning => |w| {
+                var buf: [256]u8 = undefined;
+                const s = std.fmt.bufPrint(
+                    &buf,
+                    "\x1b[33m[context warning: {d}/{d} tokens, auto-compact at {d}, blocking at {d}]\x1b[0m\n",
+                    .{ w.current_tokens, w.warning_threshold, w.auto_compact_threshold, w.blocking_limit },
+                ) catch return;
+                self.region.writeGenText(s);
+            },
             .retry_notice => |r| {
                 // 门控对齐旧 RetryUi(agent_loop:312-314):仅前台显示、前 3 次隐藏。
                 if (!self.show_retry) return;

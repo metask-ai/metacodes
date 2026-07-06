@@ -31,6 +31,10 @@ const TEXT_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+const CONTEXT_ERROR_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"too many input tokens for the context window\"}}\n\n";
+
 // ── Recording mock backend:收 CoreEvent 的 tag(深拷贝 text 便于断言) ─────────
 const Recorder = struct {
     tags: std.ArrayList([]const u8) = .empty, // 事件 tag 名序列(静态字面量,不拷)
@@ -144,6 +148,55 @@ test "阶段E: mock backend 跑真 agent_loop,断言 CoreEvent 序列(纯内存,
 
     // M4:事件归属 session 正确路由。未传 .session → 默认 .single,emit 带的就是它。
     try std.testing.expect(std.mem.eql(u8, &rec.last_session.bytes, &SessionId.single.bytes));
+}
+
+test "L2 AutoCompact: agent_loop recovers from SSE context-window-exceeded before payload" {
+    const a = std.testing.allocator;
+    const bodies = [_][]const u8{ CONTEXT_ERROR_SSE, TEXT_SSE };
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    const io = io_runtime.io();
+
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io, "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "oldest context");
+    try conv.appendText(.assistant, "middle context");
+    try conv.appendText(.user, "current request");
+
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var rec = Recorder.init(a);
+    defer rec.deinit();
+    const be = rec.backend();
+
+    const result = agent_loop.run(
+        &conv,
+        client.provider(),
+        &.{},
+        &perm,
+        .{ .max_turns = 3, .colorize = true },
+        &be,
+        a,
+    ) catch |e| {
+        std.debug.print("agent_loop.run failed: {s}\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+
+    try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expect(rec.hasTag("auto_compact"));
+    const text = try rec.joinedText(a);
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "hello world") != null);
+    try std.testing.expectEqual(@as(usize, 3), conv.len());
+    try std.testing.expectEqualStrings("middle context", conv.messages.items[0].blocks[0].text);
+    try std.testing.expectEqualStrings("current request", conv.messages.items[1].blocks[0].text);
 }
 
 // M6(还 M4 欠条):传**非 .single** session → emit 端到端带同一个(证路由真透传,

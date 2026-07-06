@@ -60,6 +60,10 @@ pub const App = struct {
     api_key_catalog: api_keys_mod.Catalog,
     models_picker_key_index: ?usize = null,
     models_picker_model_index: ?usize = null,
+    model_switch_owned: ?[]u8 = null,
+    pending_previous_model_for_compact: ?[]u8 = null,
+    pending_previous_model_context_window: ?u32 = null,
+    pending_current_model_context_window: ?u32 = null,
     // ── 会话身份(M6)──────────────────────────────────────────────────────
     /// 本 App 实例的会话标识。**cc-zig 的多 Session 模型 = 多个 App 实例,各为一个
     /// SessionContext(见下分区注释),共享一个进程。**
@@ -421,6 +425,8 @@ pub const App = struct {
             @memset(k, 0);
             app.allocator.free(k);
         }
+        if (app.model_switch_owned) |m| app.allocator.free(m);
+        if (app.pending_previous_model_for_compact) |m| app.allocator.free(m);
         if (app.openai_client) |*oc| oc.deinit();
         if (app.gemini_client) |*gc| gc.deinit();
         app.conversation.deinit();
@@ -506,18 +512,56 @@ pub const App = struct {
     }
 
     pub fn switchModel(app: *App, model_id: []const u8) !void {
+        const previous_model = app.config.model;
+        const previous_window = app.api_client.resolveMaxInputTokens();
+        const current_window = app.api_client.resolveMaxInputTokensFor(model_id);
+        const needs_previous_model_compact = shouldQueueModelSwitchCompact(previous_model, model_id, previous_window, current_window);
+
         const model = try app.allocator.dupe(u8, model_id);
+        errdefer app.allocator.free(model);
+        const previous_model_copy = if (needs_previous_model_compact)
+            try app.allocator.dupe(u8, previous_model)
+        else
+            null;
+        errdefer if (previous_model_copy) |m| app.allocator.free(m);
+
+        if (app.agent_jobs) |*aj| try aj.setModel(model);
+        const sp_mod = @import("core/system_prompt.zig");
+        const new_system_prompt = sp_mod.buildFull(app.allocator, model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs) catch null;
+
+        if (app.model_switch_owned) |old| app.allocator.free(old);
+        app.model_switch_owned = model;
         app.config.model = model;
         app.api_client.model = model;
         if (app.openai_client) |*oc| oc.model = model;
         if (app.gemini_client) |*gc| gc.model = model;
         if (app.transcript_writer) |*w| w.model = model;
-        if (app.agent_jobs) |*aj| try aj.setModel(model);
-        const sp_mod = @import("core/system_prompt.zig");
-        if (sp_mod.buildFull(app.allocator, model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs)) |sp| {
+
+        if (app.pending_previous_model_for_compact) |old| app.allocator.free(old);
+        app.pending_previous_model_for_compact = previous_model_copy;
+        app.pending_previous_model_context_window = if (needs_previous_model_compact) previous_window else null;
+        app.pending_current_model_context_window = if (needs_previous_model_compact) current_window else null;
+
+        if (new_system_prompt) |sp| {
             if (app.system_prompt) |old| app.allocator.free(old);
             app.system_prompt = sp;
-        } else |_| {}
+        }
+    }
+
+    pub fn pendingModelSwitchCompact(app: *const App) ?agent_loop.ModelSwitchCompact {
+        const previous_model = app.pending_previous_model_for_compact orelse return null;
+        return .{
+            .previous_model = previous_model,
+            .previous_context_window = app.pending_previous_model_context_window orelse return null,
+            .current_context_window = app.pending_current_model_context_window orelse return null,
+        };
+    }
+
+    pub fn clearPendingModelSwitchCompact(app: *App) void {
+        if (app.pending_previous_model_for_compact) |old| app.allocator.free(old);
+        app.pending_previous_model_for_compact = null;
+        app.pending_previous_model_context_window = null;
+        app.pending_current_model_context_window = null;
     }
 
     pub fn setReasoningEffort(app: *App, effort: types.ReasoningEffort) void {
@@ -1102,6 +1146,15 @@ pub const App = struct {
     }
 };
 
+pub fn shouldQueueModelSwitchCompact(
+    previous_model: []const u8,
+    current_model: []const u8,
+    previous_context_window: u32,
+    current_context_window: u32,
+) bool {
+    return !std.mem.eql(u8, previous_model, current_model) and previous_context_window > current_context_window;
+}
+
 /// 读整个文件(POSIX open/read,稳定不依赖 Io.Dir)。caller free。
 fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
@@ -1155,4 +1208,11 @@ test "nextPermMode: Shift+Tab 循环状态机(对齐 cc)" {
         types.PermissionMode.default,
         App.nextPermMode(App.nextPermMode(App.nextPermMode(.default))),
     );
+}
+
+test "model switch compact is queued only when switching to smaller context window" {
+    try std.testing.expect(shouldQueueModelSwitchCompact("large", "small", 200_000, 80_000));
+    try std.testing.expect(!shouldQueueModelSwitchCompact("same", "same", 200_000, 80_000));
+    try std.testing.expect(!shouldQueueModelSwitchCompact("small", "large", 80_000, 200_000));
+    try std.testing.expect(!shouldQueueModelSwitchCompact("a", "b", 200_000, 200_000));
 }

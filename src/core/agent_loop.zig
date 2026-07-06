@@ -20,6 +20,7 @@ const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const ReadState = @import("read_state.zig").ReadState;
 const api_stream = @import("../api/stream.zig");
 const tool_error = @import("tool_error.zig");
+const context_pressure_mod = @import("context_pressure.zig");
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
 const ui_backend = @import("protocol/ui_backend.zig");
@@ -77,6 +78,7 @@ const ToolErrSig = struct {
 /// Auto-compact 阈值下限:避免 catalog 返回异常小值(测试 mock、未知模型)导致每 turn 都 compact。
 /// 低于这个值不做压缩。设为 32K——正常对话/工具调研远小于此,只有真逼近 context window 才触发。
 pub const MIN_AUTO_COMPACT_THRESHOLD: usize = 32_000;
+pub const COMPACT_MIN_SAVED_PERCENT: usize = 5;
 
 /// L3 挂起信息:stop_reason==.suspended 时非空,带出挂起点供调用方落盘 + 恢复。
 /// owned by run() 的 allocator;调用方用后 free(deinit)。
@@ -147,7 +149,7 @@ pub const Options = struct {
     read_state: ?*ReadState = null,
     /// Edit/Write 旁路高亮缓存(diff 工具卡 tree-sitter 着色用)。null → 不缓存。
     edit_hl_cache: ?*@import("edit_hl_cache.zig").EditHlCache = null,
-    /// 自动 compact 的 token 阈值。null → 按 resolveMaxTokens() * 0.7 动态算
+    /// 自动 compact 的 token 阈值。null → 按 input context window 扣输出保留区后动态算。
     auto_compact_threshold: ?usize = null,
     /// 自动 compact 保留的消息数（最新的 N 条）
     auto_compact_keep_recent: usize = 10,
@@ -194,6 +196,9 @@ pub const Options = struct {
     /// per-call model override(subagent 用 AgentDef.model 覆盖父 client.model)。
     /// null = 用 api_client.model;非 null = 本次 turn 循环的所有请求都用此 model。
     model_override: ?[]const u8 = null,
+    /// /model 从大上下文窗口切到小窗口后，下一次采样前先用旧模型做一次 inline compact。
+    /// 新模型可能已经装不下旧历史+compact prompt，旧模型仍可完成摘要。
+    model_switch_compact: ?ModelSwitchCompact = null,
     /// Skill 集合(Task 工具 subagent preload_skills 字段用)。
     skills_set: ?*const @import("../skills/skill.zig").SkillSet = null,
     /// ToolSearch 激活的 deferred 工具名集。非 null 时:deferred 且不在此集的工具
@@ -218,6 +223,12 @@ pub const Options = struct {
     /// 后台 subagent(输出经 SinkWriter 进可查询缓冲)/headless = false,否则 final_text
     /// 会混入 \x1b[32m 等控制码。
     colorize: bool = true,
+};
+
+pub const ModelSwitchCompact = struct {
+    previous_model: []const u8,
+    previous_context_window: u32,
+    current_context_window: u32,
 };
 
 /// 内部:发一次进度事件(turn 1-based;tool_name/tool_input 空 = 仅更新轮次)。
@@ -372,6 +383,7 @@ pub fn run(
 
     // Prompt cache 击穿检测(批3):跨 turn 跟踪 cache_read 跌幅 + system/tools 指纹。
     var cache_detector = @import("cache_break.zig").CacheBreakDetector{};
+    var context_warning_emitted = false;
 
     while (turns < opts.max_turns) : (turns += 1) {
         // 开头检查 abort
@@ -418,93 +430,58 @@ pub fn run(
         // **必须用 input context window(resolveMaxInputTokens,~200K),不是 output max_tokens(32K)**——
         // 否则正常工具调研刚读几个文件(20K+)就误触发压缩、丢掉原始问题(真机 bug)。
         // 下限 MIN_AUTO_COMPACT_THRESHOLD:避免异常小值导致每 turn 都 compact。
-        const auto_threshold: usize = opts.auto_compact_threshold orelse
-            @max(@as(usize, provider.maxInputTokens()) * 8 / 10, MIN_AUTO_COMPACT_THRESHOLD);
         const synthetic_user_input = if (turns == 0) opts.synthetic_user_input else null;
-        const tool_result_limit = conversation_mod.toolResultContextBytes(provider.maxInputTokens());
-        const preflight_truncated = conversation.truncateLargeToolResults(tool_result_limit);
-        if (preflight_truncated.changed()) {
-            log.info("agent", "tool-result truncate: truncated={d} cleared={d} bytes={d}->{d} max_inline={d}", .{ preflight_truncated.truncated, preflight_truncated.cleared, preflight_truncated.bytes_before, preflight_truncated.bytes_after, tool_result_limit });
-        }
-
-        var request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, effective_system_prompt, opts.inject_user_context, synthetic_user_input, gated_tool_defs, opts.model_override);
-        // Microcompact:在 full-compact 之前,更低阈值(70% of full)先清旧 tool_result
-        // 内容(最占 token 的部分),保留消息结构。这里按最近 tool_result 个数保留,不是按消息数:
-        // 工具密集 turn 中,最近 N 条消息可能仍包着一串旧结果,导致 full compact 低收益反复触发。
-        const micro_threshold = auto_threshold * 7 / 10;
-        if (request_tokens_before > micro_threshold and request_tokens_before <= auto_threshold) {
-            const reduced = conversation.microcompactToolResultsByRecentResults(conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP);
-            if (reduced.changed()) {
-                log.info("agent", "microcompact: cleared={d} truncated={d} old tool_results bytes={d}->{d} keep_recent_results={d} threshold={d}", .{ reduced.cleared, reduced.truncated, reduced.bytes_before, reduced.bytes_after, conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP, micro_threshold });
-                request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, effective_system_prompt, opts.inject_user_context, synthetic_user_input, gated_tool_defs, opts.model_override);
+        const model_switch_compact = if (turns == 0) opts.model_switch_compact else null;
+        var previous_model_compact_outcome: AutoCompactOutcome = .not_needed;
+        if (model_switch_compact) |msc| {
+            if (!std.mem.eql(u8, msc.previous_model, provider.model()) and msc.previous_context_window > msc.current_context_window) {
+                previous_model_compact_outcome = try runAutoCompactIfNeeded(
+                    conversation,
+                    provider,
+                    effective_system_prompt,
+                    opts.inject_user_context,
+                    synthetic_user_input,
+                    gated_tool_defs,
+                    opts.model_override,
+                    msc.previous_model,
+                    opts.auto_compact_threshold,
+                    opts.auto_compact_keep_recent,
+                    "pre_sampling_previous_model_smaller_window",
+                    backend,
+                    sess,
+                    &context_warning_emitted,
+                    allocator,
+                );
+                if (previous_model_compact_outcome == .api_error) {
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
+                }
             }
         }
-        if (request_tokens_before > auto_threshold) {
-            const before_len = conversation.len();
-            // 9 段结构化摘要(补真缺口):有 api_client → 调模型把要丢的历史总结成 summary
-            // prepend 保住早期上下文(对齐 cc);summarize 失败/无 client → 退回纯丢老消息。
-            const compact_summary = @import("compact_summary.zig");
-            const SummCtx = struct { provider: provider_mod.Provider, alloc: std.mem.Allocator };
-            var report = conversation.compactWithSummaryReport(opts.auto_compact_keep_recent, SummCtx{ .provider = provider, .alloc = allocator }, struct {
-                fn f(c: SummCtx, drop_msgs: []const msg.Message) ?[]u8 {
-                    return compact_summary.summarize(c.alloc, c.provider, drop_msgs);
-                }
-            }.f) catch Conversation.CompactReport{
-                .dropped = conversation.compactKeepRecent(opts.auto_compact_keep_recent),
-                .summary_used = false,
-            };
-            if (report.dropped > 0) {
-                var cause: []const u8 = if (report.summary_used) "trigger" else "summary_fallback";
-                var request_tokens_after = estimateNextRequestTokensOrFallback(allocator, provider, conversation, effective_system_prompt, opts.inject_user_context, synthetic_user_input, gated_tool_defs, opts.model_override);
-                if (request_tokens_after >= request_tokens_before) {
-                    const recovered = conversation.microcompactToolResultsByRecentResults(0);
-                    if (recovered.changed()) {
-                        cause = "tool_result_pressure";
-                        request_tokens_after = estimateNextRequestTokensOrFallback(allocator, provider, conversation, effective_system_prompt, opts.inject_user_context, synthetic_user_input, gated_tool_defs, opts.model_override);
-                    } else {
-                        const recovered_msgs = conversation.compactKeepRecent(opts.auto_compact_keep_recent);
-                        if (recovered_msgs > 0) {
-                            report.dropped += recovered_msgs;
-                            cause = "no_savings_recovered";
-                            request_tokens_after = estimateNextRequestTokensOrFallback(allocator, provider, conversation, effective_system_prompt, opts.inject_user_context, synthetic_user_input, gated_tool_defs, opts.model_override);
-                        }
-                    }
-                } else if (request_tokens_after > auto_threshold) {
-                    const emergency = conversation.microcompactToolResultsByRecentResults(0);
-                    if (emergency.changed()) {
-                        cause = "tool_result_pressure";
-                        request_tokens_after = estimateNextRequestTokensOrFallback(allocator, provider, conversation, effective_system_prompt, opts.inject_user_context, synthetic_user_input, gated_tool_defs, opts.model_override);
-                    }
-                }
-                log.info("agent", "auto-compact: dropped {d} old messages ({d} -> {d}) threshold={d} before_tokens={d} after_tokens={d} cause={s}", .{ report.dropped, before_len, conversation.len(), auto_threshold, request_tokens_before, request_tokens_after, cause });
-                backend.emitEvent(sess, .{ .auto_compact = .{
-                    .dropped = @as(u32, @intCast(report.dropped)),
-                    .kept = @as(u32, @intCast(conversation.len())),
-                    .before_tokens = @intCast(request_tokens_before),
-                    .after_tokens = @intCast(request_tokens_after),
-                    .cause = cause,
-                } });
+        if (previous_model_compact_outcome != .skipped_no_savings) {
+            const pre_sampling_compact = try runAutoCompactIfNeeded(
+                conversation,
+                provider,
+                effective_system_prompt,
+                opts.inject_user_context,
+                synthetic_user_input,
+                gated_tool_defs,
+                opts.model_override,
+                null,
+                opts.auto_compact_threshold,
+                opts.auto_compact_keep_recent,
+                "pre_sampling_pending_turn_threshold",
+                backend,
+                sess,
+                &context_warning_emitted,
+                allocator,
+            );
+            if (pre_sampling_compact == .api_error) {
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
             }
         }
 
         log.info("agent", "turn {d}/{d} starting (msgs={d})", .{ turns + 1, opts.max_turns, conversation.messages.items.len });
 
-        // 1. 构造当前这一轮的 API 请求（把 Conversation 映射为 types.ApiMessage 数组）。
-        var api_messages = try buildApiMessages(conversation, allocator, opts.inject_user_context, synthetic_user_input);
-        defer freeApiMessages(&api_messages, allocator);
-
-        // 2. 发送流式请求（abortable 版本：abort 通过 EventIterator 检查点传播）
-        //    带 opts.model_override:subagent 用自己的 model(如 Explore=haiku);
-        //    null 时 sendMessageStreamFull 用 api_client.model(父 model)。
-        // 击穿检测:发请求前记录 system/tools/model 指纹(tools 用工具名拼接 hash)。
-        {
-            var th = std.hash.Wyhash.init(0);
-            for (gated_tool_defs) |d| th.update(d.name);
-            var tbuf: [16]u8 = undefined;
-            std.mem.writeInt(u64, tbuf[0..8], th.final(), .little);
-            const model_for_req = opts.model_override orelse provider.model();
-            cache_detector.recordRequest(opts.system_prompt orelse "", tbuf[0..8], model_for_req);
-        }
         // 建连阶段重试(对齐 CC withRetry):瞬态网络错误/429/5xx 退避重试,UI 提示"Retrying…"。
         // 仅覆盖建连+收头(未消费流、未输出文本);进入 stream.next() 后不再重试(已输出)。
         // 门控/格式/着色全在 backend 的 .retry_notice 处理(show_retry/colorize)——此处只转发。
@@ -519,27 +496,16 @@ pub fn run(
         var retry_ui = RetryUi{ .be = backend, .session = sess };
         const reporter = provider_mod.RetryReporter{ .state = @ptrCast(&retry_ui), .report = RetryUi.report };
 
-        var stream = provider.sendStreamRetry(
-            api_messages.items,
-            effective_system_prompt,
-            gated_tool_defs,
-            opts.abort,
-            opts.model_override,
-            null,
-            client_mod.defaultMaxRetries(),
-            0, // base_ms=0 → 用默认 RETRY_BASE_MS(500)
-            reporter,
-            latestUserText(conversation), // web_search 显示用:用户原话(P1:作请求参数传, 不再 post-set)
-        ) catch |err| {
-            log.err("agent", "sendMessageStream failed turn={d}: {s}", .{ turns + 1, @errorName(err) });
-            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
-        };
-        defer stream.deinit();
+        // 1+2. 构造当前这一轮的 API 请求并发送。若建连/收头阶段或 SSE error
+        // 明确报 context-window-exceeded,按 Rust compact recovery 路径逐步删最老
+        // history 后重试。同一 turn 内重试,不把恢复尝试计成新 turn。
+        var context_recovery_attempts: usize = 0;
+        const context_recovery_cap = @max(conversation.len(), 1);
+        var turn_stop_reason: api_stream.StopReason = .unknown;
+        var rid_for_turn: log.RequestId = undefined;
 
-        const rid = stream.requestId();
-        log.infoId("agent", rid, "stream opened, reading events", .{});
-
-        // 3. 收集响应 blocks
+        // 3. 收集响应 blocks。声明在 request_recovery 外层，使 SSE context
+        // recovery 可以清空临时状态后重试同一 turn。
         var assistant_blocks = std.ArrayList(msg.Block).empty;
         errdefer {
             for (assistant_blocks.items) |b| b.deinit(allocator);
@@ -551,120 +517,216 @@ pub fn run(
         var tool_uses = std.ArrayList(msg.ToolUse).empty;
         defer tool_uses.deinit(allocator);
 
-        if (opts.colorize) backend.emitEvent(sess, .stream_begin);
-        var aborted_during_stream = false;
-        var stream_error = false;
-        while (true) {
-            const ev_opt = stream.next() catch |err| switch (err) {
-                error.Aborted => {
-                    aborted_during_stream = true;
-                    log.warnId("agent", rid, "stream aborted mid-turn", .{});
-                    break;
+        request_recovery: while (true) {
+            var stream: api_stream.StreamHandle = undefined;
+            var api_messages = try buildApiMessages(conversation, allocator, opts.inject_user_context, synthetic_user_input);
+            defer freeApiMessages(&api_messages, allocator);
+
+            // 击穿检测:发请求前记录 system/tools/model 指纹(tools 用工具名拼接 hash)。
+            {
+                var th = std.hash.Wyhash.init(0);
+                for (gated_tool_defs) |d| th.update(d.name);
+                var tbuf: [16]u8 = undefined;
+                std.mem.writeInt(u64, tbuf[0..8], th.final(), .little);
+                const model_for_req = opts.model_override orelse provider.model();
+                cache_detector.recordRequest(opts.system_prompt orelse "", tbuf[0..8], model_for_req);
+            }
+
+            stream = provider.sendStreamRetry(
+                api_messages.items,
+                effective_system_prompt,
+                gated_tool_defs,
+                opts.abort,
+                opts.model_override,
+                null,
+                client_mod.defaultMaxRetries(),
+                0, // base_ms=0 → 用默认 RETRY_BASE_MS(500)
+                reporter,
+                latestUserText(conversation), // web_search 显示用:用户原话(P1:作请求参数传, 不再 post-set)
+            ) catch |err| switch (err) {
+                error.ContextWindowExceeded => {
+                    if (!recoverContextWindowExceeded(
+                        conversation,
+                        provider,
+                        effective_system_prompt,
+                        opts.inject_user_context,
+                        synthetic_user_input,
+                        gated_tool_defs,
+                        opts.model_override,
+                        backend,
+                        sess,
+                        &context_recovery_attempts,
+                        context_recovery_cap,
+                        turns + 1,
+                        allocator,
+                    )) {
+                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
+                    }
+                    continue :request_recovery;
                 },
                 else => |e| {
-                    stream_error = true;
-                    log.errId("agent", rid, "stream returned error {s} at turn {d}", .{ @errorName(e), turns + 1 });
-                    break;
+                    log.err("agent", "sendMessageStream failed turn={d}: {s}", .{ turns + 1, @errorName(e) });
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
                 },
             };
-            const ev = ev_opt orelse break;
-            switch (ev) {
-                .text => |text| {
-                    backend.emitEvent(sess, .{ .text_chunk = text });
-                    try assistant_text.appendSlice(allocator, text);
-                    log.debugId("agent", rid, "text chunk bytes={d}", .{text.len});
-                    // text bytes 是 stream 分配的 owned——用完必须 free，否则泄漏
-                    allocator.free(text);
-                },
-                .tool_use_start => |tu| {
-                    // verbose 的 `[Tool: name]` 行移到 backend(在 tool_start 渲染时打,
-                    // 见 TuiBackend/WriterBackend);此处只入队 tool_use。
-                    log.infoId("agent", rid, "tool_use queued id={s} name={s} input_bytes={d}", .{ tu.id, tu.name, tu.input_json.len });
-                    // stream 里 id/name/input_json 都是 owned；转移所有权给 tool_uses（不 dupe）
-                    try tool_uses.append(allocator, .{
-                        .id = tu.id,
-                        .name = tu.name,
-                        .input = tu.input_json,
-                    });
-                },
-                .web_search_result => |w| {
-                    // 主对话:照打 UI 装饰(⏺ Web Search ...),TUI 字节与旧版一致。
-                    // ui_text 是预渲染的可见 assistant 内容(例外:含 ANSI 但属"可见输出")。
-                    // content_json(结构化结果)主对话不消费(仅 web_search.zig 子请求用)。
-                    backend.emitEvent(sess, .{ .text_chunk = w.ui_text });
-                    try assistant_text.appendSlice(allocator, w.ui_text);
-                    allocator.free(w.ui_text);
-                    allocator.free(w.content_json);
-                },
-                .web_search_query => |q| {
-                    // 主对话不消费 query_update 进度(仅 web_search.zig 子请求驱动 TUI);释放。
-                    allocator.free(q);
-                },
-                .usage => |u| {
-                    // L1:usage 走 CoreEvent 总线(顶层 TuiBackend 累加进 app.usage;
-                    // JobEntry 后端累加进 .tokens 供进度树)——取代旧 opts.usage_sink 私有回调。
-                    backend.emitEvent(sess, .{ .usage = u });
-                    if (cache_detector.checkResponse(u.cache_read_input_tokens, u.cache_creation_input_tokens)) |reason| {
-                        log.warnId("cache", rid, "PROMPT CACHE BREAK: {s} [cache_read {d} creation {d}]", .{ reason, u.cache_read_input_tokens, u.cache_creation_input_tokens });
-                        // L4 诊断:cache 击穿。
-                        backend.emitEvent(sess, .{ .diag_cache_break = .{ .trace_id = trace_id, .depth = depth, .cache_read = u.cache_read_input_tokens, .cache_creation = u.cache_creation_input_tokens } });
+            defer stream.deinit();
+
+            rid_for_turn = stream.requestId();
+            const rid = rid_for_turn;
+            log.infoId("agent", rid, "stream opened, reading events", .{});
+
+            if (opts.colorize) backend.emitEvent(sess, .stream_begin);
+            var aborted_during_stream = false;
+            var stream_error = false;
+            var stream_context_window_exceeded = false;
+            while (true) {
+                const ev_opt = stream.next() catch |err| switch (err) {
+                    error.Aborted => {
+                        aborted_during_stream = true;
+                        log.warnId("agent", rid, "stream aborted mid-turn", .{});
+                        break;
+                    },
+                    error.ContextWindowExceeded => {
+                        stream_error = true;
+                        stream_context_window_exceeded = true;
+                        log.warnId("agent", rid, "stream returned context-window-exceeded at turn {d}", .{turns + 1});
+                        break;
+                    },
+                    else => |e| {
+                        stream_error = true;
+                        log.errId("agent", rid, "stream returned error {s} at turn {d}", .{ @errorName(e), turns + 1 });
+                        break;
+                    },
+                };
+                const ev = ev_opt orelse break;
+                switch (ev) {
+                    .text => |text| {
+                        backend.emitEvent(sess, .{ .text_chunk = text });
+                        try assistant_text.appendSlice(allocator, text);
+                        log.debugId("agent", rid, "text chunk bytes={d}", .{text.len});
+                        // text bytes 是 stream 分配的 owned——用完必须 free，否则泄漏
+                        allocator.free(text);
+                    },
+                    .tool_use_start => |tu| {
+                        // verbose 的 `[Tool: name]` 行移到 backend(在 tool_start 渲染时打,
+                        // 见 TuiBackend/WriterBackend);此处只入队 tool_use。
+                        log.infoId("agent", rid, "tool_use queued id={s} name={s} input_bytes={d}", .{ tu.id, tu.name, tu.input_json.len });
+                        // stream 里 id/name/input_json 都是 owned；转移所有权给 tool_uses（不 dupe）
+                        try tool_uses.append(allocator, .{
+                            .id = tu.id,
+                            .name = tu.name,
+                            .input = tu.input_json,
+                        });
+                    },
+                    .web_search_result => |w| {
+                        // 主对话:照打 UI 装饰(⏺ Web Search ...),TUI 字节与旧版一致。
+                        // ui_text 是预渲染的可见 assistant 内容(例外:含 ANSI 但属"可见输出")。
+                        // content_json(结构化结果)主对话不消费(仅 web_search.zig 子请求用)。
+                        backend.emitEvent(sess, .{ .text_chunk = w.ui_text });
+                        try assistant_text.appendSlice(allocator, w.ui_text);
+                        allocator.free(w.ui_text);
+                        allocator.free(w.content_json);
+                    },
+                    .web_search_query => |q| {
+                        // 主对话不消费 query_update 进度(仅 web_search.zig 子请求驱动 TUI);释放。
+                        allocator.free(q);
+                    },
+                    .usage => |u| {
+                        // L1:usage 走 CoreEvent 总线(顶层 TuiBackend 累加进 app.usage;
+                        // JobEntry 后端累加进 .tokens 供进度树)——取代旧 opts.usage_sink 私有回调。
+                        backend.emitEvent(sess, .{ .usage = u });
+                        if (cache_detector.checkResponse(u.cache_read_input_tokens, u.cache_creation_input_tokens)) |reason| {
+                            log.warnId("cache", rid, "PROMPT CACHE BREAK: {s} [cache_read {d} creation {d}]", .{ reason, u.cache_read_input_tokens, u.cache_creation_input_tokens });
+                            // L4 诊断:cache 击穿。
+                            backend.emitEvent(sess, .{ .diag_cache_break = .{ .trace_id = trace_id, .depth = depth, .cache_read = u.cache_read_input_tokens, .cache_creation = u.cache_creation_input_tokens } });
+                        }
+                        log.infoId("agent", rid, "usage in={d} out={d} cache_r={d} cache_w={d}", .{ u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens });
+                    },
+                    .done => {},
+                }
+            }
+            // 闭颜色括号 + 尾换行由 backend 决定(colorize ? "\x1b[0m\n" : "\n")。
+            backend.emitEvent(sess, .stream_done);
+
+            // 抓本轮 API 报告的 stop_reason(stream.deinit 前读;defer 在 turn 末才执行)
+            turn_stop_reason = stream.stopReason();
+
+            log.infoId("agent", rid, "stream finished text_bytes={d} tool_uses={d} aborted={} err={}", .{
+                assistant_text.items.len,
+                tool_uses.items.len,
+                aborted_during_stream,
+                stream_error,
+            });
+
+            if (aborted_during_stream) {
+                // 保留已流出的 partial assistant text（对齐 TS 原版 `onCancel` 行为）：
+                // 让用户看到已生成的内容；下次用 /retry 能继续。
+                // tool_uses 累了一半但没收齐 content_block_stop 时可能残缺——弃掉（不 commit）。
+                for (tool_uses.items) |tu| {
+                    allocator.free(tu.id);
+                    allocator.free(tu.name);
+                    allocator.free(tu.input);
+                }
+                tool_uses.clearRetainingCapacity();
+
+                if (assistant_text.items.len > 0) {
+                    const text_owned = try allocator.dupe(u8, assistant_text.items);
+                    errdefer allocator.free(text_owned);
+                    try assistant_blocks.append(allocator, .{ .text = text_owned });
+                }
+                if (assistant_blocks.items.len > 0) {
+                    const blocks_slice = try assistant_blocks.toOwnedSlice(allocator);
+                    try conversation.append(.{ .role = .assistant, .blocks = blocks_slice });
+                } else {
+                    assistant_blocks.deinit(allocator);
+                }
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .aborted, .turns = turns + 1, .tool_calls = total_tool_calls });
+            }
+
+            // Stream error：不把残缺的 assistant_text / tool_uses commit 到 conversation
+            // 否则下一轮会把残片作为 context 导致模型"续写"残片。
+            // context-window-exceeded 若发生在任何 assistant payload 之前，可以安全删老
+            // history 并重开同一 turn；一旦已经流出内容，就不能假装 UI 可回滚。
+            if (stream_error) {
+                const can_recover_context_error = stream_context_window_exceeded and
+                    assistant_text.items.len == 0 and
+                    tool_uses.items.len == 0 and
+                    assistant_blocks.items.len == 0;
+                for (tool_uses.items) |tu| {
+                    allocator.free(tu.id);
+                    allocator.free(tu.name);
+                    allocator.free(tu.input);
+                }
+                tool_uses.clearRetainingCapacity();
+                for (assistant_blocks.items) |b| b.deinit(allocator);
+                assistant_blocks.clearRetainingCapacity();
+                assistant_text.clearRetainingCapacity();
+                if (can_recover_context_error) {
+                    if (!recoverContextWindowExceeded(
+                        conversation,
+                        provider,
+                        effective_system_prompt,
+                        opts.inject_user_context,
+                        synthetic_user_input,
+                        gated_tool_defs,
+                        opts.model_override,
+                        backend,
+                        sess,
+                        &context_recovery_attempts,
+                        context_recovery_cap,
+                        turns + 1,
+                        allocator,
+                    )) {
+                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
                     }
-                    log.infoId("agent", rid, "usage in={d} out={d} cache_r={d} cache_w={d}", .{ u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens });
-                },
-                .done => {},
+                    continue :request_recovery;
+                }
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
             }
+
+            break :request_recovery;
         }
-        // 闭颜色括号 + 尾换行由 backend 决定(colorize ? "\x1b[0m\n" : "\n")。
-        backend.emitEvent(sess, .stream_done);
-
-        // 抓本轮 API 报告的 stop_reason(stream.deinit 前读;defer 在 turn 末才执行)
-        const turn_stop_reason = stream.stopReason();
-
-        log.infoId("agent", rid, "stream finished text_bytes={d} tool_uses={d} aborted={} err={}", .{
-            assistant_text.items.len,
-            tool_uses.items.len,
-            aborted_during_stream,
-            stream_error,
-        });
-
-        if (aborted_during_stream) {
-            // 保留已流出的 partial assistant text（对齐 TS 原版 `onCancel` 行为）：
-            // 让用户看到已生成的内容；下次用 /retry 能继续。
-            // tool_uses 累了一半但没收齐 content_block_stop 时可能残缺——弃掉（不 commit）。
-            for (tool_uses.items) |tu| {
-                allocator.free(tu.id);
-                allocator.free(tu.name);
-                allocator.free(tu.input);
-            }
-            tool_uses.clearRetainingCapacity();
-
-            if (assistant_text.items.len > 0) {
-                const text_owned = try allocator.dupe(u8, assistant_text.items);
-                errdefer allocator.free(text_owned);
-                try assistant_blocks.append(allocator, .{ .text = text_owned });
-            }
-            if (assistant_blocks.items.len > 0) {
-                const blocks_slice = try assistant_blocks.toOwnedSlice(allocator);
-                try conversation.append(.{ .role = .assistant, .blocks = blocks_slice });
-            } else {
-                assistant_blocks.deinit(allocator);
-            }
-            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .aborted, .turns = turns + 1, .tool_calls = total_tool_calls });
-        }
-
-        // Stream error：不把残缺的 assistant_text / tool_uses commit 到 conversation
-        // 否则下一轮会把残片作为 context 导致模型"续写"残片
-        if (stream_error) {
-            for (tool_uses.items) |tu| {
-                allocator.free(tu.id);
-                allocator.free(tu.name);
-                allocator.free(tu.input);
-            }
-            tool_uses.clearRetainingCapacity();
-            for (assistant_blocks.items) |b| b.deinit(allocator);
-            assistant_blocks.deinit(allocator);
-            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
-        }
+        const rid = rid_for_turn;
 
         // 4. 把 assistant text + tool_uses 组装成 Message 追加到 conversation
         if (assistant_text.items.len > 0) {
@@ -988,6 +1050,32 @@ pub fn run(
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
         }
 
+        // Mid-turn follow-up compact: after tool_result blocks are appended and
+        // before the next sampling request, re-check the actual pending request.
+        // This is the explicit Rust/metacode "post_sampling_follow_up_threshold"
+        // equivalent; the next loop's pre-sampling check would be close, but this
+        // makes the follow-up boundary a real trigger point with its own cause.
+        const post_tool_compact = try runAutoCompactIfNeeded(
+            conversation,
+            provider,
+            effective_system_prompt,
+            opts.inject_user_context,
+            null,
+            gated_tool_defs,
+            opts.model_override,
+            null,
+            opts.auto_compact_threshold,
+            opts.auto_compact_keep_recent,
+            "post_tool_follow_up_threshold",
+            backend,
+            sess,
+            &context_warning_emitted,
+            allocator,
+        );
+        if (post_tool_compact == .api_error) {
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
+        }
+
         // L4 诊断:turn span 终点(本轮有 tool_use、将进入下一轮的正常路径;无工具的
         // end_turn 路径在上方提前 return + diag_run_end 收口,故不重复发)。
         backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
@@ -1172,6 +1260,189 @@ fn estimateNextRequestTokensOrFallback(
         log.warn("agent", "actual request token estimate failed: {s}; using fallback estimate", .{@errorName(err)});
         return estimateNextRequestTokensFallback(conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs);
     };
+}
+
+const AutoCompactOutcome = enum { not_needed, compacted, skipped_no_savings, api_error };
+
+fn recoverContextWindowExceeded(
+    conversation: *Conversation,
+    provider: provider_mod.Provider,
+    system_prompt: ?[]const u8,
+    inject_user_context: ?[]const u8,
+    synthetic_user_input: ?[]const u8,
+    tool_defs: []const json_mod.ToolDefinition,
+    model_override: ?[]const u8,
+    backend: *const UiBackend,
+    sess: @import("session_id.zig").SessionId,
+    attempts: *usize,
+    cap: usize,
+    turn_number: u32,
+    allocator: std.mem.Allocator,
+) bool {
+    attempts.* += 1;
+    if (attempts.* > cap) {
+        log.err("agent", "context-window recovery exhausted turn={d} attempts={d}", .{ turn_number, attempts.* });
+        return false;
+    }
+    const before_tokens = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
+    const before_len = conversation.len();
+    const dropped = conversation.removeOldestForContextRecovery();
+    if (dropped == 0) {
+        log.err("agent", "context-window recovery impossible turn={d} msgs={d}", .{ turn_number, conversation.len() });
+        return false;
+    }
+    const after_tokens = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
+    log.warn("agent", "context-window recovery: dropped={d} msgs={d}->{d} before_tokens={d} after_tokens={d} attempt={d}", .{ dropped, before_len, conversation.len(), before_tokens, after_tokens, attempts.* });
+    backend.emitEvent(sess, .{ .auto_compact = .{
+        .dropped = @as(u32, @intCast(dropped)),
+        .kept = @as(u32, @intCast(conversation.len())),
+        .before_tokens = @intCast(before_tokens),
+        .after_tokens = @intCast(after_tokens),
+        .cause = "context_window_exceeded_recovery",
+    } });
+    return true;
+}
+
+fn runAutoCompactIfNeeded(
+    conversation: *Conversation,
+    provider: provider_mod.Provider,
+    system_prompt: ?[]const u8,
+    inject_user_context: ?[]const u8,
+    synthetic_user_input: ?[]const u8,
+    tool_defs: []const json_mod.ToolDefinition,
+    model_override: ?[]const u8,
+    compact_model_override: ?[]const u8,
+    configured_threshold: ?usize,
+    keep_recent: usize,
+    trigger_cause: []const u8,
+    backend: *const UiBackend,
+    sess: @import("session_id.zig").SessionId,
+    context_warning_emitted: ?*bool,
+    allocator: std.mem.Allocator,
+) !AutoCompactOutcome {
+    var outcome: AutoCompactOutcome = .not_needed;
+    const tool_result_limit = conversation_mod.toolResultContextBytes(provider.maxInputTokens());
+    const preflight_truncated = conversation.truncateLargeToolResults(tool_result_limit);
+    if (preflight_truncated.changed()) {
+        outcome = .compacted;
+        log.info("agent", "tool-result truncate: truncated={d} cleared={d} bytes={d}->{d} max_inline={d}", .{ preflight_truncated.truncated, preflight_truncated.cleared, preflight_truncated.bytes_before, preflight_truncated.bytes_after, tool_result_limit });
+    }
+
+    var request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
+    var pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), configured_threshold, request_tokens_before);
+    emitContextWarningIfNeeded(backend, sess, pressure, context_warning_emitted);
+    const auto_threshold: usize = @max(pressure.auto_compact_threshold, MIN_AUTO_COMPACT_THRESHOLD);
+    const micro_threshold = @max(@min(pressure.warning_threshold, auto_threshold), MIN_AUTO_COMPACT_THRESHOLD);
+    if (request_tokens_before > micro_threshold and request_tokens_before <= auto_threshold) {
+        const reduced = conversation.microcompactToolResultsByRecentResults(conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP);
+        if (reduced.changed()) {
+            outcome = .compacted;
+            log.info("agent", "microcompact: cleared={d} truncated={d} old tool_results bytes={d}->{d} keep_recent_results={d} threshold={d} cause={s}", .{ reduced.cleared, reduced.truncated, reduced.bytes_before, reduced.bytes_after, conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP, micro_threshold, trigger_cause });
+            request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
+            pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), configured_threshold, request_tokens_before);
+        }
+    }
+
+    if (request_tokens_before >= auto_threshold) {
+        const compact_summary = @import("compact_summary.zig");
+        const SummCtx = struct { provider: provider_mod.Provider, alloc: std.mem.Allocator, model_override: ?[]const u8 };
+        const summary_model = compact_model_override orelse model_override;
+        var preview = try conversation.cloneForCompactPreview(allocator, keep_recent);
+        defer preview.deinit();
+        const before_len = preview.conversation.len();
+        const report = preview.conversation.compactWithSummaryReport(keep_recent, SummCtx{ .provider = provider, .alloc = allocator, .model_override = summary_model }, struct {
+            fn f(c: SummCtx, drop_msgs: []const msg.Message) ?[]u8 {
+                return compact_summary.summarizeWithModel(c.alloc, c.provider, drop_msgs, c.model_override);
+            }
+        }.f) catch Conversation.CompactReport{
+            .dropped = preview.conversation.compactKeepRecent(keep_recent),
+            .summary_used = false,
+        };
+        if (report.dropped > 0) {
+            var cause: []const u8 = if (report.summary_used) trigger_cause else "summary_fallback";
+            var request_tokens_after = estimateNextRequestTokensOrFallback(allocator, provider, &preview.conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
+            var saved_percent = compactSavedPercent(request_tokens_before, request_tokens_after);
+            if (report.summary_used and !compactHasMinSavings(request_tokens_before, request_tokens_after)) {
+                outcome = .skipped_no_savings;
+                log.warn("agent", "auto-compact skipped: summary savings below {d}% before_tokens={d} after_tokens={d} saved_percent={d} dropped={d} cause={s}", .{ COMPACT_MIN_SAVED_PERCENT, request_tokens_before, request_tokens_after, saved_percent, report.dropped, trigger_cause });
+            } else {
+                if (request_tokens_after > auto_threshold) {
+                    const emergency = preview.conversation.microcompactToolResultsByRecentResults(0);
+                    if (emergency.changed()) {
+                        cause = "tool_result_pressure";
+                        request_tokens_after = estimateNextRequestTokensOrFallback(allocator, provider, &preview.conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
+                        saved_percent = compactSavedPercent(request_tokens_before, request_tokens_after);
+                    }
+                }
+                if (!conversation.replaceWithOwnedIfSuffixUnchanged(&preview.suffix, &preview.conversation)) {
+                    log.warn("agent", "auto-compact aborted: conversation suffix changed during summary generation cause={s}", .{trigger_cause});
+                    return .api_error;
+                }
+                log.info("agent", "auto-compact: dropped {d} old messages ({d} -> {d}) threshold={d} before_tokens={d} after_tokens={d} saved_percent={d} cause={s}", .{ report.dropped, before_len, conversation.len(), auto_threshold, request_tokens_before, request_tokens_after, saved_percent, cause });
+                backend.emitEvent(sess, .{ .auto_compact = .{
+                    .dropped = @as(u32, @intCast(report.dropped)),
+                    .kept = @as(u32, @intCast(conversation.len())),
+                    .before_tokens = @intCast(request_tokens_before),
+                    .after_tokens = @intCast(request_tokens_after),
+                    .cause = cause,
+                } });
+                outcome = .compacted;
+                request_tokens_before = request_tokens_after;
+                pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), configured_threshold, request_tokens_before);
+            }
+        }
+    }
+
+    if (outcome == .skipped_no_savings) return outcome;
+
+    if (pressure.isAtBlockingLimit()) {
+        const reduced = conversation.microcompactToolResultsByRecentResults(0);
+        if (reduced.changed()) {
+            outcome = .compacted;
+            const before_block_tokens = request_tokens_before;
+            request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
+            pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), configured_threshold, request_tokens_before);
+            log.warn("agent", "blocking-limit recovery microcompact: bytes={d}->{d} before_tokens={d} after_tokens={d} cause={s}", .{ reduced.bytes_before, reduced.bytes_after, before_block_tokens, request_tokens_before, trigger_cause });
+        }
+        if (pressure.isAtBlockingLimit()) {
+            log.err("agent", "context blocking limit reached: tokens={d} blocking_limit={d} raw_window={d} effective_window={d} cause={s}", .{ request_tokens_before, pressure.blocking_limit, pressure.raw_context_window, pressure.effective_context_window, trigger_cause });
+            return .api_error;
+        }
+    }
+    return outcome;
+}
+
+fn emitContextWarningIfNeeded(
+    backend: *const UiBackend,
+    sess: @import("session_id.zig").SessionId,
+    pressure: context_pressure_mod.ContextPressure,
+    emitted: ?*bool,
+) void {
+    const flag = emitted orelse return;
+    if (flag.*) return;
+    if (pressure.level() != .medium) return;
+    flag.* = true;
+    backend.emitEvent(sess, .{ .context_warning = .{
+        .current_tokens = @intCast(pressure.current_context_tokens),
+        .warning_threshold = @intCast(pressure.warning_threshold),
+        .auto_compact_threshold = @intCast(pressure.auto_compact_threshold),
+        .blocking_limit = @intCast(pressure.blocking_limit),
+        .level = pressure.level().label(),
+    } });
+}
+
+fn compactHasMinSavings(before_tokens: usize, after_tokens: usize) bool {
+    if (before_tokens == 0) return false;
+    if (after_tokens >= before_tokens) return false;
+    const saved = before_tokens - after_tokens;
+    const divisor = 100 / COMPACT_MIN_SAVED_PERCENT;
+    const required = before_tokens / divisor + @intFromBool(before_tokens % divisor != 0);
+    return saved >= required;
+}
+
+fn compactSavedPercent(before_tokens: usize, after_tokens: usize) usize {
+    if (before_tokens == 0 or after_tokens >= before_tokens) return 0;
+    return (before_tokens - after_tokens) * 100 / before_tokens;
 }
 
 fn estimateNextRequestTokensFallback(
@@ -1373,6 +1644,9 @@ const TestProviderState = struct {
     max_input_tokens: u32 = 200_000,
     supports_web_search: bool = true,
     reasoning_effort: ?types.ReasoningEffort = null,
+    allocator: ?std.mem.Allocator = null,
+    compact_summary_response: ?[]const u8 = null,
+    last_send_model_override: ?[]const u8 = null,
 };
 
 fn testProvider(state: *TestProviderState) provider_mod.Provider {
@@ -1389,7 +1663,13 @@ fn testProvider(state: *TestProviderState) provider_mod.Provider {
         fn sendStreamRetry(_: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition, _: ?*const AbortSignal, _: ?[]const u8, _: ?json_mod.ToolChoice, _: u32, _: u64, _: ?provider_mod.RetryReporter, _: []const u8) anyerror!provider_mod.StreamHandle {
             return error.UnexpectedTestCall;
         }
-        fn send(_: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition) anyerror!provider_mod.ApiResponse {
+        fn send(ctx: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition, model_override: ?[]const u8) anyerror!provider_mod.ApiResponse {
+            const st = asState(ctx);
+            st.last_send_model_override = model_override;
+            if (st.compact_summary_response) |body| {
+                const a = st.allocator orelse return error.UnexpectedTestCall;
+                return .{ .content = try a.dupe(u8, body) };
+            }
             return error.UnexpectedTestCall;
         }
         fn maxTokens(ctx: *anyopaque) u32 {
@@ -1504,6 +1784,328 @@ test "auto-compact preflight truncates huge recent tool_result before next reque
     try std.testing.expect(body.len < before);
 }
 
+test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool suffix" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    const chunk = try a.alloc(u8, 2048);
+    defer a.free(chunk);
+    @memset(chunk, 'x');
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        try c.appendText(.user, chunk);
+    }
+
+    const tool_use_blocks = try a.alloc(msg.Block, 1);
+    tool_use_blocks[0] = .{ .tool_use = .{
+        .id = try a.dupe(u8, "t1"),
+        .name = try a.dupe(u8, "Read"),
+        .input = try a.dupe(u8, "{\"file_path\":\"/tmp/huge\"}"),
+    } };
+    try c.append(.{ .role = .assistant, .blocks = tool_use_blocks });
+
+    const tool_result_blocks = try a.alloc(msg.Block, 1);
+    tool_result_blocks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "t1"),
+        .content = try a.dupe(u8, "tool output"),
+        .is_error = false,
+    } };
+    try c.append(.{ .role = .user, .blocks = tool_result_blocks });
+
+    var provider_state = TestProviderState{
+        .allocator = a,
+        .compact_summary_response = "small summary",
+        .max_input_tokens = 200_000,
+        .max_tokens = 32_000,
+    };
+    const provider = testProvider(&provider_state);
+
+    const Capture = struct {
+        cause: ?[]const u8 = null,
+        dropped: u32 = 0,
+        fn emit(ctx: *anyopaque, _: @import("session_id.zig").SessionId, ev: CoreEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (ev) {
+                .auto_compact => |ac| {
+                    self.cause = ac.cause;
+                    self.dropped = ac.dropped;
+                },
+                else => {},
+            }
+        }
+        fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+            return null;
+        }
+    };
+    var cap = Capture{};
+    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = Capture.emit, .poll = Capture.poll };
+
+    const before_len = c.len();
+    const outcome = try runAutoCompactIfNeeded(
+        &c,
+        provider,
+        null,
+        null,
+        null,
+        &.{},
+        null,
+        null,
+        32_000,
+        2,
+        "post_tool_follow_up_threshold",
+        &backend,
+        .single,
+        null,
+        a,
+    );
+
+    try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
+    try std.testing.expect(cap.dropped > 0);
+    try std.testing.expect(c.len() < before_len);
+    try std.testing.expectEqualStrings("post_tool_follow_up_threshold", cap.cause.?);
+    try std.testing.expect(c.messages.items[c.messages.items.len - 2].blocks[0] == .tool_use);
+    try std.testing.expect(c.messages.items[c.messages.items.len - 1].blocks[0] == .tool_result);
+}
+
+test "previous-model compact uses old model override before smaller-window sampling" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    const chunk = try a.alloc(u8, 2048);
+    defer a.free(chunk);
+    @memset(chunk, 'p');
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        try c.appendText(.user, chunk);
+    }
+
+    var provider_state = TestProviderState{
+        .model = "new-small-model",
+        .allocator = a,
+        .compact_summary_response = "small summary",
+        .max_input_tokens = 80_000,
+        .max_tokens = 32_000,
+    };
+    const provider = testProvider(&provider_state);
+
+    const Capture = struct {
+        cause: ?[]const u8 = null,
+        fn emit(ctx: *anyopaque, _: @import("session_id.zig").SessionId, ev: CoreEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (ev) {
+                .auto_compact => |ac| self.cause = ac.cause,
+                else => {},
+            }
+        }
+        fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+            return null;
+        }
+    };
+    var cap = Capture{};
+    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = Capture.emit, .poll = Capture.poll };
+
+    const outcome = try runAutoCompactIfNeeded(
+        &c,
+        provider,
+        null,
+        null,
+        null,
+        &.{},
+        null,
+        "old-large-model",
+        32_000,
+        2,
+        "pre_sampling_previous_model_smaller_window",
+        &backend,
+        .single,
+        null,
+        a,
+    );
+
+    try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
+    try std.testing.expectEqualStrings("old-large-model", provider_state.last_send_model_override.?);
+    try std.testing.expectEqualStrings("pre_sampling_previous_model_smaller_window", cap.cause.?);
+}
+
+test "stream context-window recovery retries before assistant payload" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "oldest context");
+    try c.appendText(.assistant, "middle context");
+    try c.appendText(.user, "current request");
+
+    const FakeStream = struct {
+        allocator: std.mem.Allocator,
+        attempt: u32 = 0,
+        index: u32 = 0,
+        rid: log.RequestId = undefined,
+
+        fn next(ctx: *anyopaque) anyerror!?api_stream.StreamEvent {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.attempt == 0) return error.ContextWindowExceeded;
+            if (self.index == 0) {
+                self.index += 1;
+                return api_stream.StreamEvent{ .text = try self.allocator.dupe(u8, "ok") };
+            }
+            return null;
+        }
+        fn deinit(_: *anyopaque) void {}
+        fn stop(ctx: *anyopaque) api_stream.StopReason {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return if (self.attempt == 0) .unknown else .end_turn;
+        }
+        fn requestId(ctx: *anyopaque) log.RequestId {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.rid;
+        }
+    };
+    const FakeProvider = struct {
+        allocator: std.mem.Allocator,
+        sends: u32 = 0,
+        streams: [2]FakeStream = undefined,
+
+        fn asState(ctx: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ctx));
+        }
+        fn model(_: *anyopaque) []const u8 {
+            return "fake";
+        }
+        fn sendStreamRetry(ctx: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition, _: ?*const AbortSignal, _: ?[]const u8, _: ?json_mod.ToolChoice, _: u32, _: u64, _: ?provider_mod.RetryReporter, _: []const u8) anyerror!provider_mod.StreamHandle {
+            const st = asState(ctx);
+            if (st.sends >= st.streams.len) return error.UnexpectedTestCall;
+            const attempt = st.sends;
+            st.streams[attempt] = .{ .allocator = st.allocator, .attempt = attempt, .rid = log.genRequestId() };
+            st.sends += 1;
+            return .{
+                .ctx = @ptrCast(&st.streams[attempt]),
+                .nextFn = FakeStream.next,
+                .deinitFn = FakeStream.deinit,
+                .stopReasonFn = FakeStream.stop,
+                .requestIdFn = FakeStream.requestId,
+            };
+        }
+        fn sendStream(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, user_query: []const u8) anyerror!provider_mod.StreamHandle {
+            return sendStreamRetry(ctx, messages, system, tools, abort, model_override, tool_choice, 0, 0, null, user_query);
+        }
+        fn send(_: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition, _: ?[]const u8) anyerror!provider_mod.ApiResponse {
+            return error.UnexpectedTestCall;
+        }
+        fn maxTokens(_: *anyopaque) u32 {
+            return 32_000;
+        }
+        fn maxInputTokens(_: *anyopaque) u32 {
+            return 200_000;
+        }
+        fn reasoningEffort(_: *anyopaque) ?types.ReasoningEffort {
+            return null;
+        }
+        fn supports(_: *anyopaque, _: provider_mod.Capability) bool {
+            return false;
+        }
+        fn provider(self: *@This()) provider_mod.Provider {
+            return .{
+                .ctx = @ptrCast(self),
+                .modelFn = model,
+                .sendStreamFn = sendStream,
+                .sendStreamRetryFn = sendStreamRetry,
+                .sendFn = send,
+                .maxTokensFn = maxTokens,
+                .maxInputTokensFn = maxInputTokens,
+                .reasoningEffortFn = reasoningEffort,
+                .supportsFn = supports,
+            };
+        }
+    };
+
+    const Capture = struct {
+        auto_compacts: u32 = 0,
+        text: std.ArrayList(u8) = .empty,
+        allocator: std.mem.Allocator,
+        fn emit(ctx: *anyopaque, _: @import("session_id.zig").SessionId, ev: CoreEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (ev) {
+                .auto_compact => self.auto_compacts += 1,
+                .text_chunk => |t| self.text.appendSlice(self.allocator, t) catch {},
+                else => {},
+            }
+        }
+        fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+            return null;
+        }
+    };
+
+    var fp = FakeProvider{ .allocator = a };
+    var cap = Capture{ .allocator = a };
+    defer cap.text.deinit(a);
+    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = Capture.emit, .poll = Capture.poll };
+    const perm = permission_mod.createContext(.bypass_permissions, a);
+    const result = try run(&c, fp.provider(), &.{}, &perm, .{ .max_turns = 2, .colorize = false }, &backend, a);
+
+    try std.testing.expectEqual(StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 2), fp.sends);
+    try std.testing.expectEqual(@as(u32, 1), cap.auto_compacts);
+    try std.testing.expectEqualStrings("ok", cap.text.items);
+    try std.testing.expectEqual(@as(usize, 3), c.len());
+    try std.testing.expectEqualStrings("middle context", c.messages.items[0].blocks[0].text);
+    try std.testing.expectEqualStrings("current request", c.messages.items[1].blocks[0].text);
+}
+
+test "context warning emits once only at medium pressure" {
+    const Capture = struct {
+        warnings: u32 = 0,
+        level: ?[]const u8 = null,
+        current_tokens: u64 = 0,
+        fn emit(ctx: *anyopaque, _: @import("session_id.zig").SessionId, ev: CoreEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (ev) {
+                .context_warning => |w| {
+                    self.warnings += 1;
+                    self.level = w.level;
+                    self.current_tokens = w.current_tokens;
+                },
+                else => {},
+            }
+        }
+        fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+            return null;
+        }
+    };
+    var cap = Capture{};
+    const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = Capture.emit, .poll = Capture.poll };
+    var emitted = false;
+
+    emitContextWarningIfNeeded(&backend, .single, context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 159_999), &emitted);
+    try std.testing.expectEqual(@as(u32, 0), cap.warnings);
+    try std.testing.expect(!emitted);
+
+    emitContextWarningIfNeeded(&backend, .single, context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 160_000), &emitted);
+    try std.testing.expectEqual(@as(u32, 1), cap.warnings);
+    try std.testing.expect(emitted);
+    try std.testing.expectEqualStrings("medium", cap.level.?);
+    try std.testing.expectEqual(@as(u64, 160_000), cap.current_tokens);
+
+    emitContextWarningIfNeeded(&backend, .single, context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 165_000), &emitted);
+    try std.testing.expectEqual(@as(u32, 1), cap.warnings);
+
+    emitted = false;
+    emitContextWarningIfNeeded(&backend, .single, context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 167_000), &emitted);
+    try std.testing.expectEqual(@as(u32, 1), cap.warnings);
+    try std.testing.expect(!emitted);
+}
+
+test "compactHasMinSavings requires at least five percent reduction" {
+    try std.testing.expect(compactHasMinSavings(1000, 949)); // 5.1%
+    try std.testing.expect(compactHasMinSavings(1000, 950)); // exactly 5%
+    try std.testing.expect(!compactHasMinSavings(1000, 951));
+    try std.testing.expect(!compactHasMinSavings(1000, 1000));
+    try std.testing.expect(!compactHasMinSavings(0, 0));
+    try std.testing.expectEqual(@as(usize, 5), compactSavedPercent(1000, 950));
+    try std.testing.expectEqual(@as(usize, 0), compactSavedPercent(1000, 1000));
+}
+
 test "auto-compact preflight keeps serialized request valid UTF-8 after multibyte truncation" {
     const a = std.testing.allocator;
     var c = Conversation.init(a);
@@ -1579,9 +2181,10 @@ test "StopReason has aborted and max_turns" {
 
 test "auto-compact 阈值用 input context window 而非 output max_tokens(防回归真机 bug)" {
     // 真机 bug:阈值曾用 output max_tokens(sonnet 默认 32K)*0.7 → 工具调研刚读几个文件就误触发
-    // 压缩、丢掉原始问题。修复:改用 input context window(~200K)*0.8。
+    // 压缩、丢掉原始问题。修复:改用 input context window(~200K)扣 output reserve 后的 CC/Rust 阈值。
     // 源级守卫:阈值算式必须调 resolveMaxInputTokens(而非 output 的解析器),且 MIN 不再是早期小值。
     const src = @embedFile("agent_loop.zig");
-    try std.testing.expect(std.mem.indexOf(u8, src, "provider.maxInputTokens()) * 8 / 10") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens()") != null);
+    try std.testing.expectEqual(@as(usize, 167_000), context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 0).auto_compact_threshold);
     try std.testing.expect(MIN_AUTO_COMPACT_THRESHOLD >= 32_000);
 }

@@ -4,6 +4,7 @@ const http = std.http;
 const types = @import("types.zig");
 const json_mod = @import("json.zig");
 const api_stream = @import("api/stream.zig");
+const error_class = @import("api/error_class.zig");
 const Catalog = @import("api/catalog.zig").Catalog;
 const AbortSignal = @import("util/abort.zig").AbortSignal;
 const provider_mod = @import("api/provider.zig");
@@ -202,8 +203,8 @@ pub const Client = struct {
         heap.* = sr;
         return heap.heapHandle();
     }
-    fn pSend(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition) anyerror!ApiResponse {
-        return asClient(ctx).sendMessage(messages, system, tools);
+    fn pSend(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, model_override: ?[]const u8) anyerror!ApiResponse {
+        return asClient(ctx).sendMessageWithModel(messages, system, tools, model_override);
     }
     fn pMaxTokens(ctx: *anyopaque) u32 {
         return asClient(ctx).resolveMaxTokens();
@@ -235,11 +236,15 @@ pub const Client = struct {
 
     /// 按当前 model 解析 input context window(用于 auto-compact 阈值,非 output max_tokens)。
     pub fn resolveMaxInputTokens(client: *const Client) u32 {
+        return client.resolveMaxInputTokensFor(client.model);
+    }
+
+    pub fn resolveMaxInputTokensFor(client: *const Client, model: []const u8) u32 {
         // precedence:~/.metacode/models.toml 命中 > catalog(/v1/models probe)> 200K 默认。
         if (client.model_context) |mc| {
-            if (mc.windowFor(client.model)) |w| return w;
+            if (mc.windowFor(model)) |w| return w;
         }
-        return client.catalog.maxInputTokensFor(client.model);
+        return client.catalog.maxInputTokensFor(model);
     }
 
     /// 启动时探测 `/v1/models` → 填 catalog。失败静默（不报错，fallback 仍可用）。
@@ -294,8 +299,19 @@ pub const Client = struct {
         system: ?[]const u8,
         tools: ?[]const json_mod.ToolDefinition,
     ) !ApiResponse {
+        return client.sendMessageWithModel(messages, system, tools, null);
+    }
+
+    pub fn sendMessageWithModel(
+        client: *Client,
+        messages: []const types.ApiMessage,
+        system: ?[]const u8,
+        tools: ?[]const json_mod.ToolDefinition,
+        model_override: ?[]const u8,
+    ) !ApiResponse {
+        const effective_model = model_override orelse client.model;
         const req_body = try json_mod.serializeMessagesRequest(.{
-            .model = client.model,
+            .model = effective_model,
             .max_tokens = client.resolveMaxTokens(),
             .messages = messages,
             .system = system,
@@ -495,29 +511,31 @@ pub const Client = struct {
             // deinit/destroy,否则与 errdefer 双重释放 → segfault(这些路径过去无测试
             // 覆盖,Stage 6 L2 首次触发才暴露此潜伏 bug)。
             .unauthorized => {
-                logErrorBody(req_ptr, rid, status, http_response);
+                _ = logErrorBody(req_ptr, rid, status, http_response);
                 return error.Unauthorized;
             },
             .too_many_requests => {
-                logErrorBody(req_ptr, rid, status, http_response);
+                _ = logErrorBody(req_ptr, rid, status, http_response);
                 return error.RateLimited;
             },
             .internal_server_error => {
-                logErrorBody(req_ptr, rid, status, http_response);
+                _ = logErrorBody(req_ptr, rid, status, http_response);
                 return error.ServerError;
             },
             .bad_gateway => {
-                logErrorBody(req_ptr, rid, status, http_response);
+                _ = logErrorBody(req_ptr, rid, status, http_response);
                 return error.BadGateway;
             },
             .service_unavailable => {
-                logErrorBody(req_ptr, rid, status, http_response);
+                _ = logErrorBody(req_ptr, rid, status, http_response);
                 return error.ServiceUnavailable;
             },
             else => {
                 // 4xx/other：读 body 进 log 便于 debug。否则用户只看到 "HttpError"，
                 // 不知道是 model 名错、字段不识别、还是 API key 过期。
-                logErrorBody(req_ptr, rid, status, http_response);
+                if (logErrorBody(req_ptr, rid, status, http_response).context_window_exceeded) {
+                    return error.ContextWindowExceeded;
+                }
                 return error.HttpError;
             },
         }
@@ -571,7 +589,7 @@ fn logErrorBody(
     rid: log.RequestId,
     status: http.Status,
     http_response: http.Client.Response,
-) void {
+) ErrorBodyInfo {
     var err_body: [2048]u8 = undefined;
     const body_reader_tmp = req_ptr.reader.bodyReader(
         err_body[0..],
@@ -583,7 +601,12 @@ fn logErrorBody(
     log.errId("client", rid, "HTTP {d} {s}: body={s}", .{
         @intFromEnum(status), @tagName(status), preview,
     });
+    return .{ .context_window_exceeded = error_class.isContextWindowExceeded(preview) };
 }
+
+const ErrorBodyInfo = struct {
+    context_window_exceeded: bool = false,
+};
 
 /// Token 打码：只露前 6 + 后 4 字符（常见格式 `sk-xxxxxxxx...yyyy`）。
 /// 过短的 token 直接打 "<short:N>"。out buf 至少 24 字节。
@@ -707,6 +730,10 @@ pub const StreamResponse = struct {
                 // 上抛**区分性** error,不塌缩成 RequestFailed,让 agent_loop/测试能识别。
                 log.warnId("stream", self.id, "API error event surfaced", .{});
                 return error.ApiError;
+            },
+            error.ContextWindowExceededEvent => {
+                log.warnId("stream", self.id, "context-window-exceeded error event surfaced", .{});
+                return error.ContextWindowExceeded;
             },
             else => {
                 log.warnId("stream", self.id, "event_iter.next failed: {s}", .{@errorName(err)});

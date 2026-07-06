@@ -26,6 +26,8 @@ pub fn toolResultContextBytes(max_input_tokens: usize) usize {
 pub const Conversation = struct {
     allocator: std.mem.Allocator,
     messages: std.ArrayList(msg.Message),
+    ghost_snapshots: std.ArrayList(msg.Message),
+    mutation_version: u64 = 0,
     // 快照锁:保护 messages.items 的结构性改动(append → 可能 realloc)与 transcript 快照
     // 遍历的互斥。生成期 watcher 线程按 Ctrl+O 调 transcript_viewer 遍历 messages.items,
     // 与主线程 agent_loop 的 append 并发——append 触发 ArrayList realloc 会使遍历中的旧
@@ -34,12 +36,14 @@ pub const Conversation = struct {
     snapshot_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
 
     pub fn init(allocator: std.mem.Allocator) Conversation {
-        return .{ .allocator = allocator, .messages = .empty };
+        return .{ .allocator = allocator, .messages = .empty, .ghost_snapshots = .empty };
     }
 
     pub fn deinit(self: *Conversation) void {
         for (self.messages.items) |m| m.deinit(self.allocator);
         self.messages.deinit(self.allocator);
+        for (self.ghost_snapshots.items) |m| m.deinit(self.allocator);
+        self.ghost_snapshots.deinit(self.allocator);
     }
 
     /// transcript 快照读前后持锁——与 append 互斥,防遍历 messages.items 时被 realloc 抽走。
@@ -55,6 +59,7 @@ pub const Conversation = struct {
         _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
         defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
         try self.messages.append(self.allocator, m);
+        self.mutation_version +%= 1;
     }
 
     /// 便利方法：追加仅 text 的消息。字节被复制。
@@ -83,7 +88,115 @@ pub const Conversation = struct {
             errdefer mc.deinit(dst);
             try out.messages.append(dst, mc);
         }
+        try out.ghost_snapshots.ensureTotalCapacity(dst, self.ghost_snapshots.items.len);
+        for (self.ghost_snapshots.items) |m| {
+            const mc = try m.dupe(dst);
+            errdefer mc.deinit(dst);
+            try out.ghost_snapshots.append(dst, mc);
+        }
         return out;
+    }
+
+    pub const SuffixSnapshot = struct {
+        allocator: std.mem.Allocator,
+        version: u64,
+        start_index: usize,
+        items: []msg.Message,
+
+        pub fn deinit(self: *SuffixSnapshot) void {
+            for (self.items) |m| m.deinit(self.allocator);
+            self.allocator.free(self.items);
+            self.items = &.{};
+        }
+    };
+
+    pub const CompactPreview = struct {
+        conversation: Conversation,
+        suffix: SuffixSnapshot,
+
+        pub fn deinit(self: *CompactPreview) void {
+            self.conversation.deinit();
+            self.suffix.deinit();
+        }
+    };
+
+    /// Clone full history and the retained compact suffix under one lock. The
+    /// suffix snapshot is later used to reject replacing history if another
+    /// turn/tool path appended or edited the active suffix while summarizing.
+    pub fn cloneForCompactPreview(self: *Conversation, dst: std.mem.Allocator, keep_n: usize) !CompactPreview {
+        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+
+        const start_index = compactBoundaryForItems(self.messages.items, keep_n);
+        var out = Conversation.init(dst);
+        errdefer out.deinit();
+        try out.messages.ensureTotalCapacity(dst, self.messages.items.len);
+        for (self.messages.items) |m| {
+            const mc = try m.dupe(dst);
+            errdefer mc.deinit(dst);
+            try out.messages.append(dst, mc);
+        }
+        try out.ghost_snapshots.ensureTotalCapacity(dst, self.ghost_snapshots.items.len);
+        for (self.ghost_snapshots.items) |m| {
+            const mc = try m.dupe(dst);
+            errdefer mc.deinit(dst);
+            try out.ghost_snapshots.append(dst, mc);
+        }
+
+        const suffix_len = self.messages.items.len - start_index;
+        const suffix_items = try dst.alloc(msg.Message, suffix_len);
+        errdefer dst.free(suffix_items);
+        var copied: usize = 0;
+        errdefer for (suffix_items[0..copied]) |m| m.deinit(dst);
+        for (self.messages.items[start_index..], 0..) |m, i| {
+            suffix_items[i] = try m.dupe(dst);
+            copied = i + 1;
+        }
+
+        return .{
+            .conversation = out,
+            .suffix = .{
+                .allocator = dst,
+                .version = self.mutation_version,
+                .start_index = start_index,
+                .items = suffix_items,
+            },
+        };
+    }
+
+    /// Replace this conversation with an owned replacement produced off to the
+    /// side. Used by compact preview paths so the live history is only mutated
+    /// after savings/boundary checks pass. `replacement` is drained on success.
+    pub fn replaceWithOwned(self: *Conversation, replacement: *Conversation) bool {
+        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        return self.replaceWithOwnedLocked(replacement);
+    }
+
+    pub fn replaceWithOwnedIfSuffixUnchanged(self: *Conversation, snapshot: *const SuffixSnapshot, replacement: *Conversation) bool {
+        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        if (self.mutation_version != snapshot.version) return false;
+        if (snapshot.start_index > self.messages.items.len) return false;
+        if (self.messages.items.len - snapshot.start_index != snapshot.items.len) return false;
+        for (self.messages.items[snapshot.start_index..], snapshot.items) |live, snap| {
+            if (!messageEql(live, snap)) return false;
+        }
+        return self.replaceWithOwnedLocked(replacement);
+    }
+
+    fn replaceWithOwnedLocked(self: *Conversation, replacement: *Conversation) bool {
+        if (!sameAllocator(self.allocator, replacement.allocator)) return false;
+        for (self.messages.items) |m| m.deinit(self.allocator);
+        self.messages.deinit(self.allocator);
+        for (self.ghost_snapshots.items) |m| m.deinit(self.allocator);
+        self.ghost_snapshots.deinit(self.allocator);
+        self.messages = replacement.messages;
+        self.ghost_snapshots = replacement.ghost_snapshots;
+        replacement.messages = .empty;
+        replacement.ghost_snapshots = .empty;
+        self.mutation_version +%= 1;
+        return true;
     }
 
     /// UTF-8 感知的 token 估算。规则（与原 client.zig:estimateTokens 对齐）：
@@ -137,9 +250,11 @@ pub const Conversation = struct {
         defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
         var i: usize = 0;
         while (i < drop_count) : (i += 1) {
+            self.appendGhostSnapshotLocked(self.messages.items[0]);
             const m = self.messages.orderedRemove(0);
             m.deinit(self.allocator);
         }
+        self.mutation_version +%= 1;
         return drop_count;
     }
 
@@ -156,27 +271,43 @@ pub const Conversation = struct {
         defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
         var i: usize = 0;
         while (i < drop_count) : (i += 1) {
+            self.appendGhostSnapshotLocked(self.messages.items[0]);
             const m = self.messages.orderedRemove(0);
             m.deinit(self.allocator);
         }
+        self.mutation_version +%= 1;
         return drop_count;
+    }
+
+    /// Context-window-exceeded recovery: remove the oldest history item and
+    /// any immediately orphaned tool_result boundary. This mirrors the Rust
+    /// recovery path's one-item-at-a-time shrink while preserving Anthropic's
+    /// tool_use/tool_result pairing invariant at the retained boundary.
+    pub fn removeOldestForContextRecovery(self: *Conversation) usize {
+        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        if (self.messages.items.len <= 1) return 0;
+
+        var dropped: usize = 0;
+        self.appendGhostSnapshotLocked(self.messages.items[0]);
+        const first = self.messages.orderedRemove(0);
+        first.deinit(self.allocator);
+        dropped += 1;
+
+        while (self.messages.items.len > 1 and isLeadingOrphanToolResult(self.messages.items[0])) {
+            self.appendGhostSnapshotLocked(self.messages.items[0]);
+            const m = self.messages.orderedRemove(0);
+            m.deinit(self.allocator);
+            dropped += 1;
+        }
+        self.mutation_version +%= 1;
+        return dropped;
     }
 
     /// 计算 compactKeepRecent 会丢的消息数(boundary):total-keep_n,但把边界左移以避免
     /// 保留区首条是孤儿 tool_result。供 compactWithSummary 先总结再丢用。
     pub fn compactBoundary(self: *const Conversation, keep_n: usize) usize {
-        const total = self.messages.items.len;
-        if (total <= keep_n) return 0;
-        var drop_count = total - keep_n;
-        while (drop_count < total) {
-            const first_kept = self.messages.items[drop_count];
-            if (first_kept.role != .user) break;
-            if (first_kept.blocks.len == 0) break;
-            if (@as(std.meta.Tag(msg.Block), first_kept.blocks[0]) != .tool_result) break;
-            drop_count += 1;
-        }
-        if (drop_count >= total) drop_count = total - 1;
-        return drop_count;
+        return compactBoundaryForItems(self.messages.items, keep_n);
     }
 
     /// 9 段结构化 compact:先把要丢的消息交给 summarize_fn 生成 summary,再丢老消息,
@@ -247,6 +378,7 @@ pub const Conversation = struct {
         defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
         var i: usize = 0;
         while (i < drop_count) : (i += 1) {
+            self.appendGhostSnapshotLocked(self.messages.items[0]);
             const m = self.messages.orderedRemove(0);
             m.deinit(self.allocator);
         }
@@ -258,6 +390,7 @@ pub const Conversation = struct {
             blocks[0] = .{ .text = s }; // s 已是 owned(summarize_fn dupe 的),转移给 block
             try self.messages.insert(self.allocator, 0, .{ .role = .assistant, .blocks = blocks });
         }
+        self.mutation_version +%= 1;
         return .{ .dropped = drop_count, .summary_used = summary != null };
     }
 
@@ -289,6 +422,7 @@ pub const Conversation = struct {
                 }
             }
         }
+        if (cleared > 0) self.mutation_version +%= 1;
         return cleared;
     }
 
@@ -321,6 +455,7 @@ pub const Conversation = struct {
                 out.bytes_after += TOOL_RESULT_CLEARED_STUB.len;
             }
         }
+        if (out.changed()) self.mutation_version +%= 1;
         return out;
     }
 
@@ -352,6 +487,7 @@ pub const Conversation = struct {
                 out.bytes_after += new_content.len;
             }
         }
+        if (out.changed()) self.mutation_version +%= 1;
         return out;
     }
 
@@ -366,7 +502,65 @@ pub const Conversation = struct {
         } };
         return true;
     }
+
+    fn appendGhostSnapshotLocked(self: *Conversation, m: msg.Message) void {
+        const copy = m.dupe(self.allocator) catch return;
+        self.ghost_snapshots.append(self.allocator, copy) catch {
+            copy.deinit(self.allocator);
+            return;
+        };
+    }
 };
+
+fn isLeadingOrphanToolResult(m: msg.Message) bool {
+    if (m.role != .user) return false;
+    if (m.blocks.len == 0) return false;
+    return @as(std.meta.Tag(msg.Block), m.blocks[0]) == .tool_result;
+}
+
+fn compactBoundaryForItems(items: []const msg.Message, keep_n: usize) usize {
+    const total = items.len;
+    if (total <= keep_n) return 0;
+    var drop_count = total - keep_n;
+    while (drop_count < total) {
+        const first_kept = items[drop_count];
+        if (first_kept.role != .user) break;
+        if (first_kept.blocks.len == 0) break;
+        if (@as(std.meta.Tag(msg.Block), first_kept.blocks[0]) != .tool_result) break;
+        drop_count += 1;
+    }
+    if (drop_count >= total) drop_count = total - 1;
+    return drop_count;
+}
+
+fn messageEql(a: msg.Message, b: msg.Message) bool {
+    if (a.role != b.role) return false;
+    if (a.blocks.len != b.blocks.len) return false;
+    for (a.blocks, b.blocks) |ab, bb| {
+        if (!blockEql(ab, bb)) return false;
+    }
+    return true;
+}
+
+fn blockEql(a: msg.Block, b: msg.Block) bool {
+    const tag_a = @as(std.meta.Tag(msg.Block), a);
+    const tag_b = @as(std.meta.Tag(msg.Block), b);
+    if (tag_a != tag_b) return false;
+    return switch (a) {
+        .text => |t| std.mem.eql(u8, t, b.text),
+        .thinking => |t| std.mem.eql(u8, t, b.thinking),
+        .tool_use => |tu| std.mem.eql(u8, tu.id, b.tool_use.id) and
+            std.mem.eql(u8, tu.name, b.tool_use.name) and
+            std.mem.eql(u8, tu.input, b.tool_use.input),
+        .tool_result => |tr| std.mem.eql(u8, tr.tool_use_id, b.tool_result.tool_use_id) and
+            std.mem.eql(u8, tr.content, b.tool_result.content) and
+            tr.is_error == b.tool_result.is_error,
+    };
+}
+
+fn sameAllocator(a: std.mem.Allocator, b: std.mem.Allocator) bool {
+    return a.ptr == b.ptr and a.vtable == b.vtable;
+}
 
 fn truncateToolResultContent(allocator: std.mem.Allocator, content: []const u8, max_bytes: usize) ![]u8 {
     if (content.len <= max_bytes) return try allocator.dupe(u8, content);
@@ -573,6 +767,8 @@ test "compactKeepRecent keeps last N" {
     const dropped = c.compactKeepRecent(2);
     try std.testing.expect(dropped == 3);
     try std.testing.expect(c.len() == 2);
+    try std.testing.expectEqual(@as(usize, 3), c.ghost_snapshots.items.len);
+    try std.testing.expectEqualStrings("m1", c.ghost_snapshots.items[0].blocks[0].text);
     try std.testing.expectEqualStrings("m4", c.messages.items[0].blocks[0].text);
     try std.testing.expectEqualStrings("m5", c.messages.items[1].blocks[0].text);
 }
@@ -621,6 +817,109 @@ test "compactKeepRecent avoids orphan tool_result at boundary" {
     try std.testing.expectEqualStrings("follow up", c.messages.items[1].blocks[0].text);
 }
 
+test "removeOldestForContextRecovery drops orphan tool_result boundary" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    const au_blks = try a.alloc(msg.Block, 1);
+    au_blks[0] = .{ .tool_use = .{
+        .id = try a.dupe(u8, "t1"),
+        .name = try a.dupe(u8, "Read"),
+        .input = try a.dupe(u8, "{}"),
+    } };
+    try c.append(.{ .role = .assistant, .blocks = au_blks });
+
+    const ur_blks = try a.alloc(msg.Block, 1);
+    ur_blks[0] = .{ .tool_result = .{
+        .tool_use_id = try a.dupe(u8, "t1"),
+        .content = try a.dupe(u8, "result"),
+    } };
+    try c.append(.{ .role = .user, .blocks = ur_blks });
+    try c.appendText(.assistant, "after");
+
+    const dropped = c.removeOldestForContextRecovery();
+    try std.testing.expectEqual(@as(usize, 2), dropped);
+    try std.testing.expectEqual(@as(usize, 1), c.len());
+    try std.testing.expectEqualStrings("after", c.messages.items[0].blocks[0].text);
+}
+
+test "replaceWithOwned swaps only after preview succeeds" {
+    const a = std.testing.allocator;
+    var live = Conversation.init(a);
+    defer live.deinit();
+    try live.appendText(.user, "old");
+
+    var preview = try live.cloneInto(a);
+    defer preview.deinit();
+    try preview.appendText(.assistant, "new");
+    try std.testing.expect(live.replaceWithOwned(&preview));
+
+    try std.testing.expectEqual(@as(usize, 2), live.len());
+    try std.testing.expectEqual(@as(usize, 0), preview.len());
+    try std.testing.expectEqualStrings("old", live.messages.items[0].blocks[0].text);
+    try std.testing.expectEqualStrings("new", live.messages.items[1].blocks[0].text);
+}
+
+test "replaceWithOwned rejects replacement with different allocator" {
+    const a = std.testing.allocator;
+    var live = Conversation.init(a);
+    defer live.deinit();
+    try live.appendText(.user, "old");
+
+    var buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    var replacement = Conversation.init(fba.allocator());
+    defer replacement.deinit();
+    try replacement.appendText(.assistant, "new");
+
+    try std.testing.expect(!live.replaceWithOwned(&replacement));
+    try std.testing.expectEqual(@as(usize, 1), live.len());
+    try std.testing.expectEqual(@as(usize, 1), replacement.len());
+    try std.testing.expectEqualStrings("old", live.messages.items[0].blocks[0].text);
+    try std.testing.expectEqualStrings("new", replacement.messages.items[0].blocks[0].text);
+}
+
+test "replaceWithOwnedIfSuffixUnchanged accepts unchanged suffix" {
+    const a = std.testing.allocator;
+    var live = Conversation.init(a);
+    defer live.deinit();
+    try live.appendText(.user, "old 1");
+    try live.appendText(.assistant, "old 2");
+    try live.appendText(.user, "keep");
+
+    var preview = try live.cloneForCompactPreview(a, 1);
+    defer preview.deinit();
+    _ = preview.conversation.compactKeepRecent(1);
+    try preview.conversation.appendText(.assistant, "summary");
+
+    try std.testing.expect(live.replaceWithOwnedIfSuffixUnchanged(&preview.suffix, &preview.conversation));
+    try std.testing.expectEqual(@as(usize, 2), live.len());
+    try std.testing.expectEqual(@as(usize, 0), preview.conversation.len());
+    try std.testing.expectEqualStrings("keep", live.messages.items[0].blocks[0].text);
+    try std.testing.expectEqualStrings("summary", live.messages.items[1].blocks[0].text);
+}
+
+test "replaceWithOwnedIfSuffixUnchanged rejects concurrent append" {
+    const a = std.testing.allocator;
+    var live = Conversation.init(a);
+    defer live.deinit();
+    try live.appendText(.user, "old 1");
+    try live.appendText(.assistant, "old 2");
+    try live.appendText(.user, "keep");
+
+    var preview = try live.cloneForCompactPreview(a, 1);
+    defer preview.deinit();
+    _ = preview.conversation.compactKeepRecent(1);
+    try preview.conversation.appendText(.assistant, "summary");
+
+    try live.appendText(.user, "concurrent new message");
+    try std.testing.expect(!live.replaceWithOwnedIfSuffixUnchanged(&preview.suffix, &preview.conversation));
+    try std.testing.expectEqual(@as(usize, 4), live.len());
+    try std.testing.expectEqualStrings("concurrent new message", live.messages.items[3].blocks[0].text);
+    try std.testing.expect(preview.conversation.len() > 0);
+}
+
 test "cloneInto 深拷贝独立 + 源 reset 不影响副本 + 无泄漏" {
     const a = std.testing.allocator;
     var src = Conversation.init(a);
@@ -646,4 +945,25 @@ test "cloneInto 深拷贝独立 + 源 reset 不影响副本 + 无泄漏" {
     try std.testing.expectEqualStrings("q1", copy.messages.items[0].blocks[0].text);
     try std.testing.expectEqualStrings("Bash", copy.messages.items[1].blocks[0].tool_use.name);
     try std.testing.expectEqualStrings("out", copy.messages.items[2].blocks[0].tool_result.content);
+}
+
+test "ghost snapshots survive clone and are not live messages" {
+    const a = std.testing.allocator;
+    var src = Conversation.init(a);
+    defer src.deinit();
+    try src.appendText(.user, "m1");
+    try src.appendText(.assistant, "m2");
+    try src.appendText(.user, "m3");
+    _ = src.compactKeepRecent(1);
+
+    try std.testing.expectEqual(@as(usize, 1), src.len());
+    try std.testing.expectEqual(@as(usize, 2), src.ghost_snapshots.items.len);
+
+    var copy = try src.cloneInto(a);
+    defer copy.deinit();
+    try std.testing.expectEqual(@as(usize, 1), copy.len());
+    try std.testing.expectEqual(@as(usize, 2), copy.ghost_snapshots.items.len);
+    try std.testing.expect(src.ghost_snapshots.items[0].blocks[0].text.ptr != copy.ghost_snapshots.items[0].blocks[0].text.ptr);
+    try std.testing.expectEqualStrings("m1", copy.ghost_snapshots.items[0].blocks[0].text);
+    try std.testing.expectEqualStrings("m3", copy.messages.items[0].blocks[0].text);
 }

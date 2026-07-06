@@ -303,6 +303,22 @@ test "WriterBackend 字节锁: auto_compact == legacy 行" {
     try testing.expectEqualStrings("\x1b[33m[auto-compacted 5 old messages, kept last 12]\x1b[0m\n", cap.buf.items);
 }
 
+test "WriterBackend 字节锁: context_warning visible" {
+    var cap = CaptureSink.init(testing.allocator);
+    defer cap.deinit();
+    var wb = writer_backend.WriterBackend{ .sink_ctx = @ptrCast(&cap), .sink = CaptureSink.sink };
+    const be = wb.backend();
+
+    be.emitEvent(S, .{ .context_warning = .{
+        .current_tokens = 160_000,
+        .warning_threshold = 160_000,
+        .auto_compact_threshold = 167_000,
+        .blocking_limit = 177_000,
+        .level = "medium",
+    } });
+    try testing.expectEqualStrings("\x1b[33m[context warning: 160000/160000 tokens, auto-compact at 167000, blocking at 177000]\x1b[0m\n", cap.buf.items);
+}
+
 test "WriterBackend 字节锁: retry 门控 + legacy 格式" {
     var cap = CaptureSink.init(testing.allocator);
     defer cap.deinit();

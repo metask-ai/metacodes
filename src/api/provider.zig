@@ -81,6 +81,7 @@ pub const Provider = struct {
         messages: []const types.ApiMessage,
         system: ?[]const u8,
         tools: ?[]const json_mod.ToolDefinition,
+        model_override: ?[]const u8,
     ) anyerror!ApiResponse,
 
     /// 模型规格:output 上限 / input context window(auto-compact 阈值用)。
@@ -102,7 +103,10 @@ pub const Provider = struct {
         return self.sendStreamRetryFn(self.ctx, messages, system, tools, abort, model_override, tool_choice, max_retries, retry_base_ms, reporter, user_query);
     }
     pub inline fn send(self: Provider, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition) anyerror!ApiResponse {
-        return self.sendFn(self.ctx, messages, system, tools);
+        return self.sendWithModel(messages, system, tools, null);
+    }
+    pub inline fn sendWithModel(self: Provider, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, model_override: ?[]const u8) anyerror!ApiResponse {
+        return self.sendFn(self.ctx, messages, system, tools, model_override);
     }
     pub inline fn maxTokens(self: Provider) u32 {
         return self.maxTokensFn(self.ctx);

@@ -3,6 +3,7 @@ const util_json = @import("../util/json.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
+const error_class = @import("error_class.zig");
 
 /// SSE 行解析：提取 `data: ` 之后的 JSON payload；非 data 行返回 null。
 pub const SseParser = struct {
@@ -1051,6 +1052,7 @@ pub const EventIterator = struct {
                     const err_obj = findTopLevelObjectField(data, "error") orelse data;
                     self.logWarn("API error event: {s}", .{err_obj});
                     self.done_flag = true;
+                    if (error_class.isContextWindowExceeded(err_obj)) return error.ContextWindowExceededEvent;
                     return error.ApiErrorEvent;
                 },
                 // ping / unknown → 跳过

@@ -19,6 +19,7 @@
 //!   stdout_writer.clearToolCard        → emit(.tool_result)(card=true)
 //!   tool_card.renderResult→print       → emit(.tool_result)(card=false,backend 渲染)
 //!   usage_sink                         → emit(.usage)
+//!   context warning                    → emit(.context_warning)
 //!   auto-compact 行                    → emit(.auto_compact)
 //!   重试提示                            → emit(.retry_notice)
 //!   colorize 闭括号 print("\x1b[0m\n")  → emit(.stream_done)
@@ -96,13 +97,24 @@ pub const CoreEvent = union(enum) {
     /// 阶段切换(input ↔ generating)。
     phase_change: Phase,
 
+    /// 上下文接近 auto-compact 阈值的主动提示。每个 run 至多发一次。
+    context_warning: struct {
+        current_tokens: u64,
+        warning_threshold: u64,
+        auto_compact_threshold: u64,
+        blocking_limit: u64,
+        level: []const u8,
+    },
+
     /// 自动压缩历史:丢弃 dropped 条旧消息,保留 kept 条。
     auto_compact: struct {
         dropped: u32,
         kept: u32,
         before_tokens: u64 = 0,
         after_tokens: u64 = 0,
-        /// trigger | summary_fallback | no_savings_recovered | tool_result_pressure
+        /// pre_sampling_pending_turn_threshold | pre_sampling_previous_model_smaller_window |
+        /// post_tool_follow_up_threshold | summary_fallback | tool_result_pressure |
+        /// context_window_exceeded_recovery
         cause: []const u8 = "trigger",
     },
 
@@ -192,6 +204,20 @@ test "CoreEvent.tool_start 可 JSON 序列化(backend 据 name 自决渲染)" {
     try std.testing.expect(std.mem.indexOf(u8, out, "tool_start") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "WebSearch") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "tu_1") != null);
+}
+
+test "CoreEvent.context_warning 可 JSON 序列化" {
+    const ev = CoreEvent{ .context_warning = .{
+        .current_tokens = 160_000,
+        .warning_threshold = 160_000,
+        .auto_compact_threshold = 167_000,
+        .blocking_limit = 177_000,
+        .level = "medium",
+    } };
+    const out = try std.json.Stringify.valueAlloc(std.testing.allocator, ev, .{});
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "context_warning") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "medium") != null);
 }
 
 test "CoreEvent.usage 复用 stream.UsageDelta" {

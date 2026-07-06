@@ -24,6 +24,7 @@ pub const json_mod = @import("json.zig");
 pub const util_abort = @import("util/abort.zig");
 pub const util_fs = @import("util/fs.zig");
 pub const conversation = @import("core/conversation.zig");
+pub const compact_summary = @import("core/compact_summary.zig");
 pub const agent_loop = @import("core/agent_loop.zig");
 pub const core_subagent = @import("core/subagent.zig");
 pub const agent_job_registry = @import("core/agent_job_registry.zig");
@@ -132,6 +133,10 @@ test "inferProviderKind:model 前缀选 provider 协议" {
     try std.testing.expectEqual(types.ProviderKind.gemini, inferProviderKind("gemini-2.5-pro"));
     try std.testing.expectEqual(types.ProviderKind.anthropic, inferProviderKind("claude-sonnet-4-20250514"));
     try std.testing.expectEqual(types.ProviderKind.anthropic, inferProviderKind("claude-opus-4-1"));
+}
+
+test "compact summary module tests are reachable from root" {
+    try std.testing.expect(compact_summary.defaultSystemPrompt().len > 0);
 }
 
 pub fn main(init: std.process.Init) !void {

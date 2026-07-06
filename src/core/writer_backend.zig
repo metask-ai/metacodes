@@ -9,6 +9,7 @@
 //! verbose 行/尾换行。故 WriterBackend:
 //!   .stream_begin       → colorize ? sink("\x1b[32m")
 //!   .text_chunk         → sink(t)
+//!   .context_warning    → sink(格式化 warning 行)
 //!   .auto_compact       → sink(格式化行)
 //!   .retry_notice       → [门控] sink("Retrying in Ns…")
 //!   .tool_start{card=f}  → verbose ? sink("\n\x1b[35m[Tool: name]\x1b[0m")
@@ -92,6 +93,15 @@ pub const WriterBackend = struct {
                     &buf,
                     "\x1b[33m[auto-compacted {d} old messages, kept last {d}]\x1b[0m\n",
                     .{ c.dropped, c.kept },
+                ) catch return;
+                self.emit(s);
+            },
+            .context_warning => |w| {
+                var buf: [256]u8 = undefined;
+                const s = std.fmt.bufPrint(
+                    &buf,
+                    "\x1b[33m[context warning: {d}/{d} tokens, auto-compact at {d}, blocking at {d}]\x1b[0m\n",
+                    .{ w.current_tokens, w.warning_threshold, w.auto_compact_threshold, w.blocking_limit },
                 ) catch return;
                 self.emit(s);
             },

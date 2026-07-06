@@ -18,6 +18,7 @@ pub const VERSION = "0.1.0";
 // ── 引擎 ─────────────────────────────────────────────────────────────────
 pub const agent_loop = @import("core/agent_loop.zig"); // run(), Options, RunResult, StopReason
 pub const conversation = @import("core/conversation.zig");
+pub const compact_summary = @import("core/compact_summary.zig");
 pub const message = @import("core/message.zig");
 pub const subagent = @import("core/subagent.zig");
 pub const tool_exec = @import("core/tool_exec.zig");
@@ -34,10 +35,12 @@ pub const session_id = @import("core/session_id.zig"); // SessionId 值类型(�
 pub const system_prompt = @import("core/system_prompt.zig");
 pub const answer_queue = @import("core/answer_queue.zig");
 pub const recorder = @import("core/recorder.zig");
+pub const context_pressure = @import("core/context_pressure.zig");
 
 // ── API / client / 配置 ─────────────────────────────────────────────────
 pub const client = @import("client.zig");
 pub const api_stream = @import("api/stream.zig");
+pub const api_error_class = @import("api/error_class.zig");
 pub const api_provider = @import("api/provider.zig"); // 多 provider vtable
 pub const api_capability = @import("api/capability.zig");
 pub const api_cache = @import("api/cache.zig"); // 多 provider 缓存扩展点契约
