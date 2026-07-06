@@ -2061,6 +2061,23 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
         return;
     }
 
+    if (std.mem.eql(u8, arg, "plan")) {
+        // P3 D3:把持久计划渲染成人类可读 markdown(取代"看不见的图")。
+        const inject = @import("../kg/inject.zig");
+        const doc = if (app.kg_projects_dir.len > 0) inject.readIdPointer(allocator, app.kg_projects_dir, "kg_plan_doc") else null;
+        if (doc) |doc_id| {
+            const md = kg.renderMarkdownDoc(doc_id) catch {
+                std.debug.print("(计划文档渲染失败)\n", .{});
+                return;
+            };
+            defer allocator.free(md);
+            std.debug.print("{s}\n", .{md});
+        } else {
+            std.debug.print("(本项目无持久计划文档;plan 模式批准计划后从此可见)\n", .{});
+        }
+        return;
+    }
+
     if (std.mem.startsWith(u8, arg, "forget ")) {
         const id_str = std.mem.trim(u8, arg["forget ".len..], " \t");
         const id = std.fmt.parseInt(u64, id_str, 10) catch {
@@ -2075,7 +2092,7 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
         return;
     }
 
-    std.debug.print("用法:/kg(状态)| /kg mem(最近记忆)| /kg forget <id>(删除)\n", .{});
+    std.debug.print("用法:/kg(状态)| /kg mem(记忆)| /kg plan(计划 markdown)| /kg forget <id>(删除)\n", .{});
 }
 
 fn firstLine(text: []const u8) []const u8 {

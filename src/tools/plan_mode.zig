@@ -189,13 +189,16 @@ fn commitPlanToGraph(ctx: *const ToolContext, plan_md: []const u8) !?[]u8 {
         return try std.fmt.allocPrint(ctx.allocator, ",\"kg\":{{\"committed\":false,\"error\":\"{s}\"}}", .{@errorName(e)});
     };
 
-    // 写 kg_root 指针(下次 session 从 frontier 恢复)。
+    // 写 kg_root 指针(下次 session 从 frontier 恢复)+ kg_plan_doc 指针(P3:/kg plan 渲染)。
     if (ctx.kg_projects_dir.len > 0) {
         const inject = @import("../kg/inject.zig");
         inject.writeIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_root", result.root_id) catch |e| {
             // Linus H1:指针写失败不静默——否则"图有了指针没了",frontier 永不呈现且零报错。
             @import("../util/log.zig").warn("kg", "写 kg_root 指针失败({s} dir={s}):跨会话恢复将失效", .{ @errorName(e), ctx.kg_projects_dir });
         };
+        if (result.doc_id > 0) {
+            inject.writeIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_plan_doc", result.doc_id) catch {};
+        }
     }
 
     if (!result.structured) {

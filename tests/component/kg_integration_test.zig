@@ -390,3 +390,37 @@ test "L2 KG: DAG 驱动闭环经工具 — TaskList 呈现 frontier + TaskUpdate
     try std.testing.expect(std.mem.indexOf(u8, list2, "\"subject\":\"A\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, list2, "\"subject\":\"B\"") != null);
 }
+
+test "L2 KG: plan 落图同时建 markdown 文档,render 回人类可读(P3 D3)" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/kgmddoc.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-md");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const plan_commit = @import("cc").kg_plan_commit;
+    const plan =
+        \\重构解析器
+        \\1. 步骤一:读代码
+        \\2. 步骤二:写实现
+    ;
+    const r = try plan_commit.commit(a, &kg, plan);
+    try std.testing.expect(r.structured); // 有序列表 → 2 步结构化
+    try std.testing.expect(r.doc_id > 0); // markdown 文档已建(同源两视图)
+
+    // render 回 markdown,人类可读——标题/结构保留。
+    const md = try kg.renderMarkdownDoc(r.doc_id);
+    defer a.free(md);
+    try std.testing.expect(std.mem.indexOf(u8, md, "重构解析器") != null);
+    try std.testing.expect(std.mem.indexOf(u8, md, "步骤一:读代码") != null);
+    try std.testing.expect(std.mem.indexOf(u8, md, "步骤二:写实现") != null);
+}

@@ -142,6 +142,7 @@ pub const CommitResult = struct {
     incomplete: bool, // 部分失败(第 k 步落图失败)
     structured: bool, // false = 解析无结构,落成单 root task
     truncated: bool, // 计划超 MAX_STEPS 被截断(M1:绝不静默)
+    doc_id: u64 = 0, // markdown 文档 node id(P3 D3:人类可见 /kg plan render);0=未导入
 };
 
 /// 把计划落成任务 DAG。返回 root id(供指针文件持久化)。
@@ -157,7 +158,8 @@ pub fn commit(
     // 无结构(<2 步)→ 全文单 root task(设计:绝不因解析失败不落图)。
     if (parsed.steps.len < 2) {
         const root = try kg.createTask(plan_text, "plan_step");
-        return .{ .root_id = root, .steps_committed = 0, .total_steps = 0, .incomplete = false, .structured = false, .truncated = parsed.truncated };
+        const doc = kg.importMarkdownDoc(plan_text) catch 0; // 人类可见文档(bonus,失败不阻塞)
+        return .{ .root_id = root, .steps_committed = 0, .total_steps = 0, .incomplete = false, .structured = false, .truncated = parsed.truncated, .doc_id = doc };
     }
 
     const root = try kg.createTask(parsed.title, "plan_step");
@@ -184,7 +186,10 @@ pub fn commit(
         committed += 1;
     }
 
-    return .{ .root_id = root, .steps_committed = committed, .total_steps = parsed.steps.len, .incomplete = false, .structured = true, .truncated = parsed.truncated };
+    // P3 D3:把计划正文导入成 markdown 文档(人类可见 /kg plan render-md-doc)。
+    // 图与文档同源两视图;失败不阻塞(任务 DAG 已建好)。
+    const doc = kg.importMarkdownDoc(plan_text) catch 0;
+    return .{ .root_id = root, .steps_committed = committed, .total_steps = parsed.steps.len, .incomplete = false, .structured = true, .truncated = parsed.truncated, .doc_id = doc };
 }
 
 // ============================================================================

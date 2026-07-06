@@ -259,6 +259,37 @@ pub const KgClient = struct {
         return self.dataError("add-node 输出不可解析: {s}", .{line});
     }
 
+    // ── markdown 文档(P3:plan 人类可见,设计 D3)────────────────────
+    // import-md-doc 把 markdown 存成图(document+section+md:* 投影,content-hash 幂等);
+    // render-md-doc 无损渲染回 markdown 给人看。图与文档同源两视图(实证)。
+
+    /// 把 markdown 文本导入成文档图,返回 document node id。写临时 .md 文件喂 import-md-doc
+    /// (它只接文件路径,不接 stdin)。best-effort:失败返 data 错。
+    pub fn importMarkdownDoc(self: *KgClient, markdown: []const u8) KgError!u64 {
+        // 写临时文件(tinykg import-md-doc 只接文件路径)。
+        const tmp_path = std.fmt.allocPrint(self.allocator, "{s}.mdimport.tmp", .{self.store_path}) catch return KgError.OutOfMemory;
+        defer self.allocator.free(tmp_path);
+        writeTmpFile(self.allocator, tmp_path, markdown) catch return self.dataError("写 md 临时文件失败", .{});
+        defer deleteTmpFile(self.allocator, tmp_path);
+
+        const out = try self.runCheckedWrite(&.{
+            "import-md-doc", self.store_path, tmp_path, "--domain", self.domain,
+        });
+        defer self.freeOut(out);
+        // stdout: `import_md_doc ... document=<id> nodes_imported=..`
+        if (extractKvU64(out.stdout, "document=")) |id| return id;
+        return self.dataError("import-md-doc 输出无 document id: {s}", .{trimForLog(out.stdout)});
+    }
+
+    /// 渲染文档回 markdown(/kg plan 人类可见)。owned。
+    pub fn renderMarkdownDoc(self: *KgClient, doc_id: u64) KgError![]u8 {
+        var idbuf: [24]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{doc_id}) catch unreachable;
+        const out = try self.runChecked(&.{ "render-md-doc", self.store_path, id_str });
+        defer self.freeOut(out);
+        return self.allocator.dupe(u8, out.stdout) catch KgError.OutOfMemory;
+    }
+
     // ── 任务 DAG(P2:write-through + plan 落图 + 图驱动)──────────────
     // 契约见设计 §9 核对表:depends_on 串行、单次 revise 闭合、frontier 单层。
 
@@ -709,6 +740,31 @@ fn truncateBytes(text: []const u8, max: usize) []const u8 {
 fn trimForLog(s: []const u8) []const u8 {
     const t = std.mem.trim(u8, s, " \r\n\t");
     return if (t.len > 200) t[0..200] else t;
+}
+
+/// 从 `key=value` 行式输出提 u64(如 `document=5`)。
+fn extractKvU64(text: []const u8, key: []const u8) ?u64 {
+    const i = std.mem.indexOf(u8, text, key) orelse return null;
+    const rest = text[i + key.len ..];
+    var end: usize = 0;
+    while (end < rest.len and std.ascii.isDigit(rest[end])) end += 1;
+    if (end == 0) return null;
+    return std.fmt.parseInt(u64, rest[0..end], 10) catch null;
+}
+
+/// 写临时文件(md 导入用;tinykg import-md-doc 只接文件路径)。
+fn writeTmpFile(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
+    const pz = try allocator.dupeZ(u8, path);
+    defer allocator.free(pz);
+    const f = std.c.fopen(pz.ptr, "w") orelse return error.WriteFailed;
+    defer _ = std.c.fclose(f);
+    if (bytes.len > 0) _ = std.c.fwrite(bytes.ptr, 1, bytes.len, f);
+}
+
+fn deleteTmpFile(allocator: std.mem.Allocator, path: []const u8) void {
+    const pz = allocator.dupeZ(u8, path) catch return;
+    defer allocator.free(pz);
+    _ = std.c.unlink(pz.ptr);
 }
 
 fn dirExists(path: []const u8) bool {
