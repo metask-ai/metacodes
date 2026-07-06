@@ -718,6 +718,10 @@ pub const App = struct {
         const anchor = app.project_dir orelse cwd;
         const anchor_hash = @import("core/transcript.zig").hashCwd(anchor);
         app.kg_projects_dir = std.fmt.allocPrint(app.allocator, "{s}/.cc-zig/projects/{s}", .{ home, anchor_hash[0..] }) catch return;
+        // **必须建目录**(Linus H1):否则从 git 子目录启动时 anchor_hash != cwd_hash,
+        // projects/<anchor_hash> 无人 mkdir → plan 落图的 kg_root 指针 writeIdPointer 失败
+        // 被 catch{} 吞 → frontier 永不呈现 → 整个 P2 跨会话恢复静默半死。逐级 mkdir。
+        mkdirKgProjectsDir(app.allocator, home, anchor_hash);
 
         // domain = git 根 basename + git 根 hash 前 8(可读 + 防撞)。
         const domain = app.computeKgDomain(anchor, anchor_hash) catch return;
@@ -740,6 +744,24 @@ pub const App = struct {
                 app.kg_summary = sum;
             }
         }
+    }
+
+    /// 逐级建 `{home}/.cc-zig/projects/<hash>`(Linus H1)。best-effort:失败静默
+    /// (下游 writeIdPointer 会 log.warn;此处仅尽量把目录建出来)。
+    fn mkdirKgProjectsDir(allocator: std.mem.Allocator, home: []const u8, hash: [16]u8) void {
+        const parts = [_][]const u8{ ".cc-zig", ".cc-zig/projects" };
+        for (parts) |p| {
+            const dir = std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, p }) catch return;
+            defer allocator.free(dir);
+            const dz = allocator.dupeZ(u8, dir) catch return;
+            defer allocator.free(dz);
+            _ = std.c.mkdir(dz, 0o700);
+        }
+        const full = std.fmt.allocPrint(allocator, "{s}/.cc-zig/projects/{s}", .{ home, hash[0..] }) catch return;
+        defer allocator.free(full);
+        const fz = allocator.dupeZ(u8, full) catch return;
+        defer allocator.free(fz);
+        _ = std.c.mkdir(fz, 0o700);
     }
 
     /// domain id:锚点(git 根/cwd)basename + 锚点 hash 前 8(可读 + 防撞)。

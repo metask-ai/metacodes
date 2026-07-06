@@ -141,6 +141,7 @@ pub const CommitResult = struct {
     total_steps: usize,
     incomplete: bool, // 部分失败(第 k 步落图失败)
     structured: bool, // false = 解析无结构,落成单 root task
+    truncated: bool, // 计划超 MAX_STEPS 被截断(M1:绝不静默)
 };
 
 /// 把计划落成任务 DAG。返回 root id(供指针文件持久化)。
@@ -156,7 +157,7 @@ pub fn commit(
     // 无结构(<2 步)→ 全文单 root task(设计:绝不因解析失败不落图)。
     if (parsed.steps.len < 2) {
         const root = try kg.createTask(plan_text, "plan_step");
-        return .{ .root_id = root, .steps_committed = 0, .total_steps = 0, .incomplete = false, .structured = false };
+        return .{ .root_id = root, .steps_committed = 0, .total_steps = 0, .incomplete = false, .structured = false, .truncated = parsed.truncated };
     }
 
     const root = try kg.createTask(parsed.title, "plan_step");
@@ -167,23 +168,23 @@ pub fn commit(
     for (parsed.steps, 0..) |step, i| {
         // 节点 → contains 边 → depends_on 边(逐条;失败即停,前缀已是合法图)。
         const sid = kg.createTask(step.text, "plan_step") catch {
-            return .{ .root_id = root, .steps_committed = committed, .total_steps = parsed.steps.len, .incomplete = true, .structured = true };
+            return .{ .root_id = root, .steps_committed = committed, .total_steps = parsed.steps.len, .incomplete = true, .structured = true, .truncated = parsed.truncated };
         };
         step_ids[i] = sid;
         kg.addEdge(root, "contains", sid) catch {
-            return .{ .root_id = root, .steps_committed = committed, .total_steps = parsed.steps.len, .incomplete = true, .structured = true };
+            return .{ .root_id = root, .steps_committed = committed, .total_steps = parsed.steps.len, .incomplete = true, .structured = true, .truncated = parsed.truncated };
         };
         for (step.deps) |dep_idx| {
             if (dep_idx < i) { // 只连已建的前驱
                 kg.addEdge(sid, "depends_on", step_ids[dep_idx]) catch {
-                    return .{ .root_id = root, .steps_committed = committed, .total_steps = parsed.steps.len, .incomplete = true, .structured = true };
+                    return .{ .root_id = root, .steps_committed = committed, .total_steps = parsed.steps.len, .incomplete = true, .structured = true, .truncated = parsed.truncated };
                 };
             }
         }
         committed += 1;
     }
 
-    return .{ .root_id = root, .steps_committed = committed, .total_steps = parsed.steps.len, .incomplete = false, .structured = true };
+    return .{ .root_id = root, .steps_committed = committed, .total_steps = parsed.steps.len, .incomplete = false, .structured = true, .truncated = parsed.truncated };
 }
 
 // ============================================================================

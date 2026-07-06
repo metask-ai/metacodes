@@ -39,6 +39,11 @@ const BOX_WIDTH = 72;
 /// 渲染审批对话框为字符串。selected = 当前高亮选项 index(0..2)。caller free。
 /// plan_md 是计划 markdown(可多行);逐行 dim 显示,超 MAX_PLAN_LINES 折叠。
 pub fn render(alloc: std.mem.Allocator, th: Theme, plan_md: []const u8, selected: usize) ![]u8 {
+    return renderWithKg(alloc, th, plan_md, selected, 0);
+}
+
+/// 带 KG 步骤数的渲染:kg_steps>0 时在提示行前加一行"批准后将存为 N 步持久任务图"。
+pub fn renderWithKg(alloc: std.mem.Allocator, th: Theme, plan_md: []const u8, selected: usize, kg_steps: usize) ![]u8 {
     var content: std.ArrayList(u8) = .empty;
     defer content.deinit(alloc);
 
@@ -78,6 +83,14 @@ pub fn render(alloc: std.mem.Allocator, th: Theme, plan_md: []const u8, selected
     }
     try content.append(alloc, '\n');
 
+    // KG 落图提示(PM P0-1:让用户看见计划将成为持久任务图)。
+    if (kg_steps > 0) {
+        try content.appendSlice(alloc, th.accent);
+        try content.print(alloc, "✓ 批准后将存为 {d} 步持久任务图(跨会话可恢复,用 /kg 查看)", .{kg_steps});
+        try content.appendSlice(alloc, th.reset);
+        try content.appendSlice(alloc, "\n\n");
+    }
+
     // 提示行。
     try content.appendSlice(alloc, "Would you like to proceed?");
     try content.append(alloc, '\n');
@@ -110,6 +123,10 @@ pub fn render(alloc: std.mem.Allocator, th: Theme, plan_md: []const u8, selected
 /// 默认高亮第 3 项(No, keep planning)——安全默认偏向"不轻易放行"。
 /// 返回 null = 读失败(调用方按 .reject 兜底)。
 pub fn run(alloc: std.mem.Allocator, th: Theme, in_fd: std.c.fd_t, out_fd: std.c.fd_t, plan_md: []const u8) ?PlanApproval {
+    return runWithKg(alloc, th, in_fd, out_fd, plan_md, 0);
+}
+
+pub fn runWithKg(alloc: std.mem.Allocator, th: Theme, in_fd: std.c.fd_t, out_fd: std.c.fd_t, plan_md: []const u8, kg_steps: usize) ?PlanApproval {
     var selected: usize = 0; // 默认高亮第一项(Yes, proceed)——计划已展示,用户主动 review 后多数批准
     var prev_rows: usize = 0;
     while (true) {
@@ -118,7 +135,7 @@ pub fn run(alloc: std.mem.Allocator, th: Theme, in_fd: std.c.fd_t, out_fd: std.c
             writeAll(out_fd, ansi.cursor.up(@intCast(prev_rows), &up_buf));
             writeAll(out_fd, "\r");
         }
-        const frame = render(alloc, th, plan_md, selected) catch return .reject;
+        const frame = renderWithKg(alloc, th, plan_md, selected, kg_steps) catch return .reject;
         defer alloc.free(frame);
         writeAll(out_fd, frame);
         prev_rows = countRows(frame);

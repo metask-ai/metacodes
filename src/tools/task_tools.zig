@@ -185,7 +185,13 @@ pub fn executeList(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
     // KG 持久计划步骤(有活跃 kg_root 时,从 frontier 呈现;id="kg-<node>",readiness→status)。
     // 这让模型在同一份任务清单里看到跨会话计划步骤(设计 v3 §2:图为唯一真相)。
-    appendKgFrontier(ctx, &out, &first) catch {}; // best-effort:KG 失败不影响会话内 todo
+    // M3:原子——失败回滚 out 到追加前长度,绝不吐半截坏 JSON。
+    const kg_mark = out.items.len;
+    const kg_first_before = first;
+    appendKgFrontier(ctx, &out, &first) catch {
+        out.shrinkRetainingCapacity(kg_mark);
+        first = kg_first_before;
+    };
     try out.append(ctx.allocator, ']');
     return try out.toOwnedSlice(ctx.allocator);
 }
@@ -197,12 +203,14 @@ fn appendKgFrontier(ctx: *const ToolContext, out: *std.ArrayList(u8), first: *bo
     if (!kg.ready or ctx.kg_projects_dir.len == 0) return;
     const inject = @import("../kg/inject.zig");
     const root = inject.readIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_root") orelse return;
-    // stale 防御:root 非 task → 清指针,不呈现。
-    if (!(kg.nodeIsTask(root) catch false)) {
+    // M2:省掉冗余 nodeIsTask spawn——task-frontier 对非 task/不存在的 root 本就空返;
+    // 空 frontier 时顺手清 stale 指针。热路径少一次子进程。
+    const rows = kg.frontier(root, 50) catch return;
+    if (rows.len == 0) {
         inject.clearIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_root");
+        ctx.allocator.free(rows);
         return;
     }
-    const rows = kg.frontier(root, 50) catch return;
     defer {
         for (rows) |*r| r.deinit(ctx.allocator);
         ctx.allocator.free(rows);
@@ -260,7 +268,7 @@ fn updateKgTask(ctx: *const ToolContext, node_id_str: []const u8, args: []const 
         .deleted => {
             kg.deleteTask(node_id) catch |e| {
                 common.setErrorDetail(ctx.error_detail, ctx.allocator, "删除计划步骤失败({s})", .{@errorName(e)});
-                return error.KgCloseFailed;
+                return error.KgDeleteFailed;
             };
             return try ctx.allocator.dupe(u8, "{\"ok\":true,\"deleted\":true}");
         },

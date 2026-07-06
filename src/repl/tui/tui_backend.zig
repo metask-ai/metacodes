@@ -442,11 +442,13 @@ pub const TuiBackend = struct {
             .plan_approval => |pa| {
                 const Ctx = struct {
                     threadlocal var plan_md: []const u8 = "";
+                    threadlocal var kg_steps: usize = 0;
                     fn run(fd: std.c.fd_t, th: Theme, a: std.mem.Allocator) tool_ctx.ToolContext.PlanApproval {
-                        return exit_plan_dialog.run(a, th, fd, 2, plan_md) orelse .reject;
+                        return exit_plan_dialog.runWithKg(a, th, fd, 2, plan_md, kg_steps) orelse .reject;
                     }
                 };
                 Ctx.plan_md = pa.plan_md;
+                Ctx.kg_steps = pa.kg_step_count;
                 const choice = self.withTerminalTakeover(tool_ctx.ToolContext.PlanApproval, &Ctx.run) orelse .reject;
                 out.* = .{ .plan_approval = choice };
             },

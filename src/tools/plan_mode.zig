@@ -124,10 +124,20 @@ pub fn executeExit(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     };
     defer ctx.allocator.free(plan_md);
 
+    // 审批前预解析步骤数(KG 可用且计划有结构时):让审批框显示"批准后存为 N 步任务图"
+    // (PM P0-1:用户看见计划将入图)。与批准后 commitPlanToGraph 同源 parse,数字一致。
+    const kg_steps: usize = blk: {
+        const kg = ctx.kg orelse break :blk 0;
+        if (!kg.ready or plan_md.len == 0) break :blk 0;
+        var parsed = @import("../kg/plan_commit.zig").parse(ctx.allocator, plan_md) catch break :blk 0;
+        defer parsed.deinit(ctx.allocator);
+        break :blk parsed.steps.len; // <2 步 → 0(无结构,落单 root,不宣称 N 步)
+    };
+
     // 决定审批结果:① 统一 UI 请求弹框;② answer_queue 兜底;③ 安全默认 reject(留 plan)。
     var choice: PlanApproval = .reject;
     const ui_request = @import("../core/protocol/ui_request.zig");
-    const req = ui_request.UiRequest{ .plan_approval = .{ .plan_md = plan_md } };
+    const req = ui_request.UiRequest{ .plan_approval = .{ .plan_md = plan_md, .kg_step_count = kg_steps } };
     var resp: ui_request.UiResponse = undefined;
     switch (try ctx.requestUi(ctx.allocator, &req, &resp)) {
         .answered => choice = switch (resp) {
@@ -182,7 +192,10 @@ fn commitPlanToGraph(ctx: *const ToolContext, plan_md: []const u8) !?[]u8 {
     // 写 kg_root 指针(下次 session 从 frontier 恢复)。
     if (ctx.kg_projects_dir.len > 0) {
         const inject = @import("../kg/inject.zig");
-        inject.writeIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_root", result.root_id) catch {};
+        inject.writeIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_root", result.root_id) catch |e| {
+            // Linus H1:指针写失败不静默——否则"图有了指针没了",frontier 永不呈现且零报错。
+            @import("../util/log.zig").warn("kg", "写 kg_root 指针失败({s} dir={s}):跨会话恢复将失效", .{ @errorName(e), ctx.kg_projects_dir });
+        };
     }
 
     if (!result.structured) {
@@ -192,10 +205,11 @@ fn commitPlanToGraph(ctx: *const ToolContext, plan_md: []const u8) !?[]u8 {
             .{result.root_id});
     }
     const status = if (result.incomplete) "incomplete" else "complete";
+    const trunc_note = if (result.truncated) "(注意:计划超 40 步,超出部分未入图)" else "";
     return try std.fmt.allocPrint(ctx.allocator,
-        ",\"kg\":{{\"committed\":true,\"root_id\":{d},\"steps\":{d}/{d},\"status\":\"{s}\"," ++
-        "\"note\":\"计划已存为持久任务图({d} 步)。用 TaskList 领 ready 任务,完成后 TaskUpdate completed(会自动解锁后续步骤)。未来 session 从图恢复进度。\"}}",
-        .{ result.root_id, result.steps_committed, result.total_steps, status, result.total_steps });
+        ",\"kg\":{{\"committed\":true,\"root_id\":{d},\"steps\":{d}/{d},\"status\":\"{s}\",\"truncated\":{}," ++
+        "\"note\":\"计划已存为持久任务图({d} 步){s}。用 TaskList 领 ready 任务,完成后 TaskUpdate completed(会自动解锁后续步骤)。未来 session 从图恢复进度。\"}}",
+        .{ result.root_id, result.steps_committed, result.total_steps, status, result.truncated, result.total_steps, trunc_note });
 }
 
 test "EnterPlanMode without ctx returns NotAvailable" {

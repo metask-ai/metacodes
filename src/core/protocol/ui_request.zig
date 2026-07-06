@@ -23,7 +23,9 @@ pub const UiRequest = union(enum) {
     /// 权限确认:工具名 + 参数预览。
     permission: struct { tool: []const u8, args: []const u8 },
     /// ExitPlanMode 计划审批:展示计划 markdown,三选项。
-    plan_approval: struct { plan_md: []const u8 },
+    /// kg_step_count>0 时对话框显示"批准后将存为 N 步持久任务图"(PM P0-1:让用户
+    /// 看见计划将入图;0 = KG 不可用或无结构,不显示。批准前 parse,与实际落图同源)。
+    plan_approval: struct { plan_md: []const u8, kg_step_count: usize = 0 },
     /// L2:可扩展信封(动态 UI 北极星)。core 不理解 kind 的语义,只把它**转发**给 backend;
     /// backend(可能是临时起的 web 服务/GUI/客户端)据 kind 渲染对应界面、收集结构化结果。
     /// 例:kind="video_timeline",payload_json=时间线规格(HTML/参数 schema),响应是用户编辑后的
