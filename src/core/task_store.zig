@@ -109,6 +109,29 @@ pub const TaskStore = struct {
         return t;
     }
 
+    /// 用**显式 id** 插入(KG write-through 镜像:图为持久真相,store 为 TaskTab/TaskList 的
+    /// 同步显示缓存;id 用 "kg-<node>" 与图对齐)。已存在同 id → 幂等跳过(供启动重建)。
+    /// status 可指定(计划步骤 blocked 等)。绝不动 next_id(kg- 不占数字命名空间)。
+    pub fn createWithId(
+        self: *TaskStore,
+        id: []const u8,
+        subject: []const u8,
+        description: []const u8,
+        status: TaskStatus,
+    ) !void {
+        if (self.get(id) != null) return; // 幂等
+        const t = try self.allocator.create(Task);
+        errdefer self.allocator.destroy(t);
+        const id_owned = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(id_owned);
+        const subj = try self.allocator.dupe(u8, subject);
+        errdefer self.allocator.free(subj);
+        const desc = try self.allocator.dupe(u8, description);
+        errdefer self.allocator.free(desc);
+        t.* = .{ .id = id_owned, .subject = subj, .description = desc, .active_form = null, .status = status };
+        try self.tasks.append(self.allocator, t);
+    }
+
     /// 按 id 查找。返回指针（借），找不到 null。
     pub fn get(self: *TaskStore, id: []const u8) ?*Task {
         for (self.tasks.items) |t| {

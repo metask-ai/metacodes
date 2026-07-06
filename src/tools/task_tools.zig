@@ -187,7 +187,23 @@ fn createKgTask(ctx: *const ToolContext, subject: []const u8, description: []con
     // contains 边失败:节点已建但没挂进 inbox → 它仍是合法 task,只是不在 inbox frontier。
     // 不回滚(delete 是全店重写,代价大);返回 node id,frontier 少显一条不致命。
     kg.addEdge(inbox, "contains", node) catch {};
+
+    // **镜像进内存 store**(PM P0-A 回归修复):图是持久真相,store 是 TaskTab/TaskList 的
+    // 同步显示缓存。不镜像 → TaskTab 只读 store → KG ready 时面板全黑(任务落图但面板不读图)。
+    if (ctx.tasks) |store| {
+        var idbuf: [24]u8 = undefined;
+        const kg_id = std.fmt.bufPrint(&idbuf, "kg-{d}", .{node}) catch return node;
+        store.createWithId(kg_id, subject, description, .pending) catch {};
+    }
     return node;
+}
+
+/// 从 store 移除 kg- 镜像(闭合/删除计划步骤或 todo 后,让 TaskTab/TaskList 同步消失)。
+fn removeKgMirror(ctx: *const ToolContext, node_id: u64) void {
+    const store = ctx.tasks orelse return;
+    var idbuf: [24]u8 = undefined;
+    const kg_id = std.fmt.bufPrint(&idbuf, "kg-{d}", .{node_id}) catch return;
+    store.updateStatus(kg_id, .deleted) catch {}; // 缺失 → no-op
 }
 
 /// 懒建 inbox root(会话待办容器)。读 kg_inbox 指针;缺失/stale → 建新 root task + 写指针。
@@ -212,8 +228,11 @@ pub fn executeGet(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const store = try requireStore(ctx);
     const id = try extractIdOrError(args, "taskId");
 
-    // KG 任务(id="kg-<node>")→ 从图取节点文本(单命名空间:write-through 后 todo 也是 kg-)。
-    if (std.mem.startsWith(u8, id, "kg-")) return getKgTask(ctx, id["kg-".len..]);
+    // KG 任务(id="kg-<node>"):todo 已镜像进 store(命中即返,零 spawn);
+    // 计划步骤只在图里 → store 未命中时从图取(getKgTask)。
+    if (std.mem.startsWith(u8, id, "kg-") and store.get(id) == null) {
+        return getKgTask(ctx, id["kg-".len..]);
+    }
 
     const t = store.get(id) orelse return error.TaskNotFound;
 
@@ -253,14 +272,14 @@ pub fn executeList(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     return try out.toOwnedSlice(ctx.allocator);
 }
 
-/// 把 KG frontier(计划图步骤 + inbox todos)作为任务项追加进 TaskList 输出。
-/// 两个 root:kg_root(plan_step,plan 批准建)+ kg_inbox(todo,TaskCreate write-through 建)。
-/// id="kg-<node>";status:ready→pending / blocked|missing→"blocked"。
+/// 把 KG **计划步骤** frontier(kg_root)作为任务项追加进 TaskList 输出。
+/// 计划步骤的 readiness(depends_on 解锁)是图**派生**的,必须每次从 frontier 读活值。
+/// inbox todos **不**走这里——它们已 write-through 镜像进内存 store(见 createKgTask),
+/// 由 executeList 的 store 遍历呈现;若也读 inbox frontier 会双列。
 fn appendKgFrontier(ctx: *const ToolContext, out: *std.ArrayList(u8), first: *bool) !void {
     const kg = ctx.kg orelse return;
     if (!kg.ready or ctx.kg_projects_dir.len == 0) return;
     try appendRootFrontier(ctx, out, first, "kg_root", true);
-    try appendRootFrontier(ctx, out, first, "kg_inbox", false);
 }
 
 /// 呈现单个 root 的 frontier。is_plan 标注 plan_step(true)vs inbox todo(false)。
@@ -348,6 +367,7 @@ fn updateKgTask(ctx: *const ToolContext, node_id_str: []const u8, args: []const 
                 common.setErrorDetail(ctx.error_detail, ctx.allocator, "闭合计划步骤失败({s}): {s}", .{ @errorName(e), kg.detail() });
                 return error.KgCloseFailed;
             };
+            removeKgMirror(ctx, node_id); // store 镜像同步消失(TaskTab/TaskList)
             // 搭车:返回更新后的 frontier(刷新看板——设计 §2.2 R2 幂等"看板"非"领任务")。
             var out: std.ArrayList(u8) = .empty;
             errdefer out.deinit(ctx.allocator);
@@ -364,11 +384,18 @@ fn updateKgTask(ctx: *const ToolContext, node_id_str: []const u8, args: []const 
                 common.setErrorDetail(ctx.error_detail, ctx.allocator, "删除计划步骤失败({s})", .{@errorName(e)});
                 return error.KgDeleteFailed;
             };
+            removeKgMirror(ctx, node_id); // store 镜像同步消失
             return try ctx.allocator.dupe(u8, "{\"ok\":true,\"deleted\":true}");
         },
         else => {
-            // in_progress/pending 是易失 UI 态,计划步骤不落图(设计 §2:UI 态仅缓存)。
-            return try ctx.allocator.dupe(u8, "{\"ok\":true,\"note\":\"计划步骤的 in_progress 状态不持久化(UI 态)\"}");
+            // in_progress/pending 是易失 UI 态,不落图(设计 §2:UI 态仅缓存)。但要同步进
+            // store 镜像,让 TaskTab 显示 todo 的 in_progress(镜像缺失=计划步骤 → no-op)。
+            if (ctx.tasks) |store| {
+                var idbuf: [24]u8 = undefined;
+                const kg_id = std.fmt.bufPrint(&idbuf, "kg-{d}", .{node_id}) catch return error.OutOfMemory;
+                store.updateStatus(kg_id, st) catch {};
+            }
+            return try ctx.allocator.dupe(u8, "{\"ok\":true,\"note\":\"in_progress 是 UI 态,已更新看板(不持久化到图)\"}");
         },
     }
 }
@@ -491,6 +518,7 @@ pub fn executeStop(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             common.setErrorDetail(ctx.error_detail, ctx.allocator, "闭合任务失败({s})", .{@errorName(e)});
             return error.KgCloseFailed;
         };
+        removeKgMirror(ctx, node_id); // store 镜像同步消失
         return try ctx.allocator.dupe(u8, "{\"ok\":true,\"status\":\"completed\"}");
     }
     try store.updateStatus(id, .completed);

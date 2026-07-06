@@ -424,8 +424,9 @@ test "L2 KG: TaskCreate write-through — ad-hoc todo 落图 inbox,TaskList 呈�
     defer a.free(c);
     try std.testing.expect(std.mem.indexOf(u8, c, "\"id\":\"kg-") != null);
     try std.testing.expect(std.mem.indexOf(u8, c, "\"persisted\":true") != null);
-    // 内存 store 不该有它(单命名空间,图为真相)。
-    try std.testing.expect(tstore.tasks.items.len == 0);
+    // 镜像进内存 store(PM P0-A:TaskTab 显示缓存),id 用 kg-<node>。
+    try std.testing.expect(tstore.tasks.items.len == 1);
+    try std.testing.expect(std.mem.startsWith(u8, tstore.tasks.items[0].id, "kg-"));
 
     // 提取 kg- id。
     const id_start = std.mem.indexOf(u8, c, "kg-").?;
@@ -433,11 +434,10 @@ test "L2 KG: TaskCreate write-through — ad-hoc todo 落图 inbox,TaskList 呈�
     while (id_end < c.len and c[id_end] != '"') id_end += 1;
     const kg_id = c[id_start..id_end]; // 形如 "kg-2"
 
-    // TaskList → 应含该 todo(从 inbox frontier),persisted 标注。
+    // TaskList → 应含该 todo(从 store 镜像呈现)。
     const list = try task_tools.executeList(&ctx, "{}");
     defer a.free(list);
     try std.testing.expect(std.mem.indexOf(u8, list, "\"重构解析器\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, list, "\"persisted\":true") != null);
 
     // TaskGet kg-<node> → 图取节点。
     const get_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"{s}\"}}", .{kg_id});

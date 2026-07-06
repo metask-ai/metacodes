@@ -2014,28 +2014,13 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
     if (arg.len == 0) {
         // 状态:store 路径 + domain + frontier(有 kg_root 时)。
         std.debug.print("KG store: {s}\ndomain:   {s}\n", .{ kg.store_path, kg.domain });
-        const inject = @import("../kg/inject.zig");
         if (app.kg_projects_dir.len > 0) {
-            if (inject.readIdPointer(allocator, app.kg_projects_dir, "kg_root")) |root| {
-                const rows = kg.frontier(root, 30) catch {
-                    std.debug.print("(frontier 查询失败)\n", .{});
-                    return;
-                };
-                defer {
-                    for (rows) |*r| r.deinit(allocator);
-                    allocator.free(rows);
-                }
-                std.debug.print("plan root {d} — {d} 个开放任务:\n", .{ root, rows.len });
-                for (rows) |r| {
-                    const mark = switch (r.readiness) {
-                        .ready => "○",
-                        .blocked => "⊘",
-                        .missing_dependencies => "…",
-                    };
-                    std.debug.print("  {s} [{d}] {s}\n", .{ mark, r.task_id, firstLine(r.text) });
-                }
-            } else {
-                std.debug.print("(本项目无活跃计划图;计划批准后从此恢复)\n", .{});
+            // 两个 root 都显示,和模型侧 appendKgFrontier 对齐(P1-B:此前只读 kg_root,
+            // ad-hoc todo 连 /kg 都不显示 → 用户面/模型面读不同子集)。
+            const shown_plan = printKgRootFrontier(allocator, kg, app.kg_projects_dir, "kg_root", "计划");
+            const shown_inbox = printKgRootFrontier(allocator, kg, app.kg_projects_dir, "kg_inbox", "待办");
+            if (!shown_plan and !shown_inbox) {
+                std.debug.print("(本项目无活跃计划图/待办;计划批准或 TaskCreate 后从此恢复)\n", .{});
             }
         }
         return;
@@ -2097,7 +2082,31 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
 
 fn firstLine(text: []const u8) []const u8 {
     const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
-    return text[0..@min(end, 100)];
+    var n = @min(end, 100);
+    while (n > 0 and (text[n - 1] & 0xC0) == 0x80) n -= 1; // 不切半个 CJK 字
+    return text[0..n];
+}
+
+/// 打印某个 root(kg_root/kg_inbox)的 frontier。返回是否显示了内容(供"全空"提示)。
+fn printKgRootFrontier(allocator: std.mem.Allocator, kg: anytype, projects_dir: []const u8, pointer: []const u8, label: []const u8) bool {
+    const inject = @import("../kg/inject.zig");
+    const root = inject.readIdPointer(allocator, projects_dir, pointer) orelse return false;
+    const rows = kg.frontier(root, 30) catch return false;
+    defer {
+        for (rows) |*r| r.deinit(allocator);
+        allocator.free(rows);
+    }
+    if (rows.len == 0) return false;
+    std.debug.print("{s} root {d} — {d} 个开放:\n", .{ label, root, rows.len });
+    for (rows) |r| {
+        const mark = switch (r.readiness) {
+            .ready => "○",
+            .blocked => "⊘",
+            .missing_dependencies => "…",
+        };
+        std.debug.print("  {s} [{d}] {s}\n", .{ mark, r.task_id, firstLine(r.text) });
+    }
+    return true;
 }
 
 fn handleGoal(app: *app_mod.App, rest: []const u8) !void {

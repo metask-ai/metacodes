@@ -743,6 +743,30 @@ pub const App = struct {
             if (inject.buildSummary(app.allocator, &app.kg.?, app.kg_projects_dir)) |sum| {
                 app.kg_summary = sum;
             }
+            // 跨会话重建 TaskTab 显示缓存:把 inbox 里未完成的 todo 镜像进内存 store,
+            // 让上次会话建的持久任务重启后仍在面板/TaskList 可见(PM P0-A:图为真相,
+            // store 为显示缓存;不重建 → 重启后面板空、跨会话连续性只在图里用户看不见)。
+            rebuildInboxMirror(app);
+        }
+    }
+
+    /// 从 kg_inbox frontier 重建内存 store 镜像(启动一次)。best-effort。
+    fn rebuildInboxMirror(app: *App) void {
+        const inject = @import("kg/inject.zig");
+        const inbox = inject.readIdPointer(app.allocator, app.kg_projects_dir, "kg_inbox") orelse return;
+        const kg = &app.kg.?;
+        const rows = kg.frontier(inbox, 50) catch return;
+        defer {
+            for (rows) |*r| r.deinit(app.allocator);
+            app.allocator.free(rows);
+        }
+        for (rows) |r| {
+            var idbuf: [24]u8 = undefined;
+            const kg_id = std.fmt.bufPrint(&idbuf, "kg-{d}", .{r.task_id}) catch continue;
+            const nl = std.mem.indexOfScalar(u8, r.text, '\n');
+            const subject = if (nl) |i| r.text[0..i] else r.text;
+            const status: @import("core/task_store.zig").TaskStatus = if (r.readiness == .ready) .pending else .pending;
+            app.tasks.createWithId(kg_id, subject, r.text, status) catch {};
         }
     }
 
