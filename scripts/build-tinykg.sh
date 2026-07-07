@@ -17,8 +17,15 @@ VENDOR="$HERE/vendor/tinykg"
 command -v zig >/dev/null || { echo "error: zig 不在 PATH" >&2; exit 1; }
 
 COMMIT=$(git -C "$SRC" rev-parse HEAD)
-DIRTY=$(git -C "$SRC" status --porcelain | grep -v '^??' | wc -l | tr -d ' ')
-[ "$DIRTY" = "0" ] || echo "warn: tinykg 工作区有未提交改动($DIRTY 个文件),vendor 的二进制将不可复现" >&2
+# 干净树时 grep -v 无匹配返 rc=1,pipefail 会误杀脚本 → 用 { ... || true; } 中和。
+DIRTY=$(git -C "$SRC" status --porcelain | { grep -v '^??' || true; } | wc -l | tr -d ' ')
+# 默认**拒绝**从脏树 vendor(不可复现的二进制是 dev-degraded 类问题的温床——PM review)。
+# 开发期临时 build 用 --allow-dirty 显式绕过(产出会标 dirty,别 commit 进仓)。
+if [ "$DIRTY" != "0" ] && [ "${2:-}" != "--allow-dirty" ]; then
+  echo "error: tinykg 工作区有未提交改动($DIRTY 个文件)。vendored 二进制必须从干净 commit 构建" >&2
+  echo "       先在 $SRC 提交,或加 --allow-dirty 做一次性 dev build(勿 commit 进仓)" >&2
+  exit 1
+fi
 
 echo "building tinykg @ ${COMMIT:0:12} (ReleaseSafe)..."
 (cd "$SRC" && zig build -Doptimize=ReleaseSafe)

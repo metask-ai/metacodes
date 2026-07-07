@@ -1,5 +1,5 @@
-tinykg_commit=cf34bf5977d71581c91c3285a4ea80cfadb49fcc
-tinykg_dirty=6
+tinykg_commit=8fff2c6780fcd8e44aa50abf0e4bf3341a52e665
+tinykg_dirty=0
 storage_format_version=2
-built_at=2026-07-06T17:30:27Z
+built_at=2026-07-07T15:28:13Z
 zig=0.16.0

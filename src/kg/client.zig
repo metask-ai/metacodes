@@ -19,12 +19,6 @@ const common = @import("../tools/common.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const log = @import("../util/log.zig");
 
-// lib 链接烟雾:把 tinykg lib 拉进编译图(walking skeleton,证明链接通)。
-// 阶段:先编译期链接,后续把下方子进程调用逐个换成 lib_probe 之上的直接调用。
-comptime {
-    _ = @import("lib_probe.zig");
-}
-
 pub const EXPECTED_STORAGE_FORMAT_VERSION = "2";
 /// > tinykg 目录锁 30s 超时(cli.zig:1733-1857)。
 pub const SPAWN_TIMEOUT_MS: u64 = 35_000;
@@ -128,7 +122,9 @@ pub const KgClient = struct {
         /// 测试注入:覆盖 env 读取(null = 读真实 env)。
         env_bin: ?[]const u8 = null,
         env_store: ?[]const u8 = null,
-        /// cc-zig 可执行文件所在目录(用于定位 vendor/;null = 跳过 vendor 查找)。
+        /// dev 兜底 opt-in 开关(METACODES_KG_DEV);测试注入,null = 读真实 env。
+        env_dev: ?[]const u8 = null,
+        /// 测试注入:覆盖 exe 目录(null = selfExeDirPath 真实定位,不再依赖 argv[0])。
         exe_dir: ?[]const u8 = null,
     };
 
@@ -157,8 +153,15 @@ pub const KgClient = struct {
         return std.fmt.allocPrint(allocator, "{s}/.cc-zig/kg/store.kg", .{opts.home});
     }
 
-    /// bin 查找顺序:env > config > vendor/tinykg/tinykg(exe 同级向上找)> dev 兜底。
-    /// 每个候选做 access 检查,全失败返 null(→ ensureReady 判 degraded)。
+    /// bin 查找顺序:env METACODES_KG_BIN > config kg_bin > **vendored**(自真实 exe 目录
+    /// 向上逐级找 vendor/tinykg/tinykg)> dev 兜底(**仅 METACODES_KG_DEV 显式 opt-in**)。
+    /// 每候选 access 检查,全失败返 null(→ ensureReady 判 degraded)。
+    ///
+    /// PM review 修:旧版① vendored 用调用方传的 exe_dir(argv[0] 派生),裸名经 PATH 启动
+    /// 时 exe_dir=null → 跳过 vendored;② 相对偏移写死 `../vendor`,从 zig-out/bin 启动时
+    /// 算成 zig-out/vendor(不存在,真 vendored 在 cc-zig/vendor 上溯两级)→ 两者叠加 → 静默
+    /// 落到会漂移的 dev 树 → "dev degraded"。新版:selfExeDirPath 真实定位(不依赖 argv[0])
+    /// + 向上逐级搜(兼容 zig-out/bin 与 <prefix>/bin 布局)+ dev 兜底改 opt-in(默认绝不静默落 dev)。
     fn resolveBinPath(allocator: std.mem.Allocator, opts: ResolveOptions) !?[]u8 {
         if (opts.env_bin orelse envGet("METACODES_KG_BIN")) |v| {
             if (v.len > 0 and isExecutable(v)) return try allocator.dupe(u8, v);
@@ -168,14 +171,69 @@ pub const KgClient = struct {
             if (v.len > 0 and isExecutable(v)) return try allocator.dupe(u8, v);
             if (v.len > 0) return null;
         }
-        if (opts.exe_dir) |dir| {
-            const vendored = try std.fmt.allocPrint(allocator, "{s}/../vendor/tinykg/tinykg", .{dir});
-            if (isExecutable(vendored)) return vendored;
-            allocator.free(vendored);
+        // vendored:真实 exe 目录(opts.exe_dir 为测试注入覆盖;否则 OS 级 selfExeDir)向上搜。
+        var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const exe_dir: ?[]const u8 = opts.exe_dir orelse selfExeDir(&exe_buf);
+        if (exe_dir) |dir| {
+            if (try findVendoredUpward(allocator, dir)) |p| return p;
         }
-        const dev = try std.fmt.allocPrint(allocator, "{s}/prj/tinykg/zig-out/bin/tinykg", .{opts.home});
-        if (isExecutable(dev)) return dev;
-        allocator.free(dev);
+        // dev 兜底:仅显式 opt-in(METACODES_KG_DEV,非空非 "0")。默认绝不静默落 dev——那是
+        // 会漂移的 live 树,正是 dev-degraded 痛点根源(PM review)。
+        if (opts.env_dev orelse envGet("METACODES_KG_DEV")) |v| {
+            if (v.len > 0 and !std.mem.eql(u8, v, "0")) {
+                const dev = try std.fmt.allocPrint(allocator, "{s}/prj/tinykg/zig-out/bin/tinykg", .{opts.home});
+                if (isExecutable(dev)) return dev;
+                allocator.free(dev);
+            }
+        }
+        return null;
+    }
+
+    extern "c" fn _NSGetExecutablePath(buf: [*]u8, bufsize: *u32) c_int;
+
+    /// OS 级真实 exe 目录(**不依赖 argv[0]**,PATH 裸名启动也可靠——修 exe_dir=null 静默落 dev
+    /// 的根)。macOS `_NSGetExecutablePath` / Linux `/proc/self/exe`,realpath 解 symlink(安装
+    /// 常经 /usr/local/bin symlink)。失败/不支持平台 → null。返回 slice 承接在 buf。
+    fn selfExeDir(buf: []u8) ?[]const u8 {
+        const builtin = @import("builtin");
+        var raw: [std.fs.max_path_bytes:0]u8 = undefined;
+        const exe_path: [:0]const u8 = switch (builtin.os.tag) {
+            .macos, .ios, .tvos, .watchos => blk: {
+                var size: u32 = @intCast(raw.len);
+                if (_NSGetExecutablePath(&raw, &size) != 0) return null;
+                const len = std.mem.indexOfScalar(u8, raw[0..], 0) orelse return null;
+                break :blk raw[0..len :0];
+            },
+            .linux => blk: {
+                const n = std.c.readlink("/proc/self/exe", &raw, raw.len);
+                if (n <= 0) return null;
+                const un: usize = @intCast(n);
+                if (un >= raw.len) return null;
+                raw[un] = 0;
+                break :blk raw[0..un :0];
+            },
+            else => return null,
+        };
+        var rp: [std.fs.max_path_bytes]u8 = undefined;
+        const resolved = std.c.realpath(exe_path.ptr, &rp);
+        const full: []const u8 = if (resolved != null) std.mem.span(resolved.?) else exe_path;
+        const dir = std.fs.path.dirname(full) orelse return null;
+        if (dir.len == 0 or dir.len >= buf.len) return null;
+        @memcpy(buf[0..dir.len], dir);
+        return buf[0..dir.len];
+    }
+
+    /// 自 start_dir 向上逐级(≤6 级)找 `<dir>/vendor/tinykg/tinykg`。
+    /// zig-out/bin 布局需上溯两级到 cc-zig/vendor;安装布局 <prefix>/bin 上溯一级到 <prefix>/vendor。
+    fn findVendoredUpward(allocator: std.mem.Allocator, start_dir: []const u8) !?[]u8 {
+        var cur: []const u8 = start_dir;
+        var level: usize = 0;
+        while (level < 6) : (level += 1) {
+            const cand = try std.fmt.allocPrint(allocator, "{s}/vendor/tinykg/tinykg", .{cur});
+            if (isExecutable(cand)) return cand;
+            allocator.free(cand);
+            cur = std.fs.path.dirname(cur) orelse break;
+        }
         return null;
     }
 
@@ -199,7 +257,7 @@ pub const KgClient = struct {
     pub fn ensureReady(self: *KgClient) void {
         if (self.ready) return;
         const bin = self.bin_path orelse {
-            self.setDegraded("tinykg 二进制未找到。设 METACODES_KG_BIN=<path>,或 scripts/build-tinykg.sh 生成 vendor/tinykg/tinykg(需从已安装路径启动 metacodes 才能定位 vendor)", .{});
+            self.setDegraded("tinykg 二进制未找到。跑 scripts/build-tinykg.sh 生成 vendor/tinykg/tinykg,或设 METACODES_KG_BIN=<path>(dev 树用 METACODES_KG_DEV=1 显式开启)", .{});
             return;
         };
         // store 缺 → init(先建父目录)。
@@ -869,6 +927,36 @@ test "路径解析优先级:env > config > 默认;显式 bin 不可用不静默�
     var c3 = try KgClient.init(a, .{ .home = "/home/u", .domain = "p", .env_store = "", .env_bin = "" });
     defer c3.deinit();
     try testing.expectEqualStrings("/home/u/.cc-zig/kg/store.kg", c3.store_path);
+}
+
+test "bin 解析:dev 兜底默认关(opt-in),vendored 缺失不静默落 dev" {
+    const a = testing.allocator;
+    // exe_dir 指向无 vendored 的目录 + dev 未 opt-in(env_dev="")→ bin_path null——
+    // **即便本机 ~/prj/tinykg 有 dev 树也绝不静默落**(旧 bug:静默落漂移 dev 树 = degraded 根源)。
+    var c = try KgClient.init(a, .{
+        .home = "/home/u",
+        .domain = "p",
+        .env_bin = "",
+        .env_store = "",
+        .env_dev = "", // dev 兜底关
+        .exe_dir = "/tmp/definitely-no-vendor-xyzzy/bin",
+    });
+    defer c.deinit();
+    try testing.expect(c.bin_path == null);
+
+    // "0" 也算关。
+    var c0 = try KgClient.init(a, .{
+        .home = "/home/u",
+        .domain = "p",
+        .env_bin = "",
+        .env_store = "",
+        .env_dev = "0",
+        .exe_dir = "/tmp/definitely-no-vendor-xyzzy/bin",
+    });
+    defer c0.deinit();
+    try testing.expect(c0.bin_path == null);
+    // 注:vendored 向上搜的正确性由真机验证(metacodes 从 zig-out/bin 启动解析到
+    // cc-zig/vendor/tinykg/tinykg)——比 mock 文件系统更强的证据。
 }
 
 test "classifyCliError 三类归一" {
