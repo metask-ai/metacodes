@@ -19,6 +19,12 @@ const common = @import("../tools/common.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const log = @import("../util/log.zig");
 
+// lib 链接烟雾:把 tinykg lib 拉进编译图(walking skeleton,证明链接通)。
+// 阶段:先编译期链接,后续把下方子进程调用逐个换成 lib_probe 之上的直接调用。
+comptime {
+    _ = @import("lib_probe.zig");
+}
+
 pub const EXPECTED_STORAGE_FORMAT_VERSION = "2";
 /// > tinykg 目录锁 30s 超时(cli.zig:1733-1857)。
 pub const SPAWN_TIMEOUT_MS: u64 = 35_000;

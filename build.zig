@@ -1,6 +1,12 @@
 const std = @import("std");
 const grammars = @import("vendor/tree-sitter/grammars.zig");
 
+// tinykg 作为 lib 链接(取代子进程 CLI)。tinykg 是纯 Zig、self-contained(无 build_options),
+// 故直接引其 src/tinykg.zig 建 module。路径:sibling 仓 ~/prj/tinykg(cc-zig 的 ../../tinykg)。
+// 每个 importer 按自身 optimize 建一份(ReleaseSmall/Debug 不能共用一个 module 实例)。
+// 待办(productionize):pin 到稳定 commit / vendored 源,而非跟 live dev 树。
+const tinykg_root = "../../tinykg/src/tinykg.zig";
+
 // 把 vendored tree-sitter runtime + grammar 的 C 源接到一个 module 上。
 // C 源挂在 module(非 exe)上,所以每个 root=src/main.zig 的 module 都要调一次:
 // release/debug exe + test_module + integ/new 循环里的 cc_mod。
@@ -26,6 +32,15 @@ fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
             mod.addCSourceFile(.{ .file = b.path(ts ++ "/grammars/" ++ g.dir ++ "/src/" ++ extra), .flags = flags });
         }
     }
+    // tinykg lib(同"每个 metacodes-source module 都要"的 native 依赖,和 tree-sitter 同集)。
+    // client.zig comptime 引 lib_probe → @import("tinykg"),故所有编 src 树的 module 都需此 import。
+    // 用 module 自身的 target/optimize 建 tinykg 实例(ReleaseSmall/Debug/test 各一份)。
+    mod.addImport("tinykg", b.createModule(.{
+        .root_source_file = b.path(tinykg_root),
+        .target = mod.resolved_target,
+        .optimize = mod.optimize orelse .Debug,
+        .link_libc = true,
+    }));
 }
 
 pub fn build(b: *std.Build) void {
