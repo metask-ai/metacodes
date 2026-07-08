@@ -342,9 +342,9 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "KgRecall",
-        .description = "Search the knowledge graph for durable memories (decisions, preferences, project facts) from this and past sessions. Use when the user refers to prior decisions/context or when continuing cross-session work.",
+        .description = "Search the knowledge graph for durable memories (decisions, preferences, project facts) from this and past sessions. Use when the user refers to prior decisions/context or when continuing cross-session work. Retrieval is LEXICAL (BM25, no embeddings) — you supply the semantics by expanding the query (see query field).",
         .input_schema = .{ .type = "object", .prop_specs = &.{
-            .{ .name = "query", .type = "string", .description = "Keywords to search (BM25 full-text)" },
+            .{ .name = "query", .type = "string", .description = "Search keywords. Because retrieval is LEXICAL (exact word/character match, no vector/semantic search), EXPAND the topic into a set of related keywords in ONE query: add synonyms, closely-related terms, and BOTH Chinese and English forms — a memory may be stored in either language or as code identifiers (e.g. crash↔崩溃, threshold↔阈值, panic↔报错/unreachable, retrieval↔召回/recall). Example: to recall why a process crashed → 'panic crash unreachable 崩溃 报错'. Extra keywords are safe — the most relevant memories rank first (coverage-first)." },
         }, .required = &.{"query"} },
         .execute = kg_tools.executeRecall,
     },
