@@ -204,6 +204,8 @@ pub const Options = struct {
     tasks: ?*@import("task_store.zig").TaskStore = null,
     kg: ?*@import("../kg/client.zig").KgClient = null,
     kg_projects_dir: []const u8 = "",
+    /// AutoMem memdir 绝对路径(B/C 合并 markdown 自动入图)。
+    memdir_abs: []const u8 = "",
     /// 供 Agent 工具 spawn 子 agent 复用 api_client + tool_defs。
     /// **职责边界(P1)**:这是工具/subagent **构造** per-call client(initWithBaseUrl/makeClient)用的
     /// *Client,与 run() 第一参数收的 Provider(已 provider 化的"用 LLM"路径)**不同职责**——Provider
@@ -907,6 +909,7 @@ pub fn run(
             .tasks = opts.tasks,
             .kg = opts.kg,
             .kg_projects_dir = opts.kg_projects_dir,
+            .memdir_abs = opts.memdir_abs,
             .api_client = opts.api_client,
             .tool_defs = opts.tool_defs,
             .agent_depth = opts.agent_depth,

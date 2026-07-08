@@ -651,3 +651,95 @@ test "L2 KG: plan 落图同时建 markdown 文档,render 回人类可读(P3 D3)"
     const r3 = try plan_commit.commit(a, &kg, plan2);
     try std.testing.expect(r3.doc_id == r2.doc_id);
 }
+
+test "L2 KG: B/C 合并 — Write memdir markdown 自动入图,召回命中 section 正文" {
+    // 声明=接线=测试(DoD):Write 工具落盘 memdir/*.md → autosync 自动 importMarkdownDoc
+    // + 挂 project 子树 → recall(search --project,md:* 投影下钻)命中 section 正文。
+    // 同时锁排除项:MEMORY.md(索引)绝不入图。
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const proj_dir = pbuf[0..dir_len];
+    const store = try std.fmt.allocPrint(a, "{s}/kgauto.kg", .{proj_dir});
+    defer a.free(store);
+    // memdir = <tmp>/memory(isAutoMemPath 要 realpath 存在)
+    const memdir_abs = try std.fmt.allocPrint(a, "{s}/memory", .{proj_dir});
+    defer a.free(memdir_abs);
+    {
+        var zbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        @memcpy(zbuf[0..memdir_abs.len], memdir_abs);
+        zbuf[memdir_abs.len] = 0;
+        _ = std.c.mkdir(@ptrCast(&zbuf), 0o755);
+    }
+
+    var kg = try makeClient(a, bin, store, "proj-auto");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const write_tool = @import("cc").write_tool;
+    var rs = @import("cc").core_read_state.ReadState.init(a);
+    defer rs.deinit();
+    const ctx = @import("cc").tool_context.ToolContext{
+        .allocator = a,
+        .kg = &kg,
+        .kg_projects_dir = proj_dir,
+        .memdir_abs = memdir_abs,
+        .read_state = &rs,
+    };
+
+    // ① 写记忆 markdown → 自动入图。
+    const args = try std.fmt.allocPrint(a,
+        \\{{"file_path":"{s}/memory/lesson-parser.md","content":"# parser lesson\n\n## root cause\n\nquokka tokenizer offset bug lesson body\n"}}
+    , .{proj_dir});
+    defer a.free(args);
+    const out1 = try write_tool.execute(&ctx, args);
+    defer a.free(out1);
+    try std.testing.expect(std.mem.indexOf(u8, out1, "\"success\":true") != null);
+
+    // 召回:section 正文命中(证明 import + attach + md:* 下钻全链通)。
+    const hits = try kg.recall("quokka tokenizer offset", 10, false);
+    defer {
+        for (hits) |*h| h.deinit(a);
+        a.free(hits);
+    }
+    try std.testing.expect(hits.len >= 1);
+    var found = false;
+    for (hits) |h| {
+        if (std.mem.indexOf(u8, h.text, "quokka") != null) found = true;
+    }
+    try std.testing.expect(found);
+
+    // ② MEMORY.md(索引)不入图:写后召回其独特词应零命中。
+    const args2 = try std.fmt.allocPrint(a,
+        \\{{"file_path":"{s}/memory/MEMORY.md","content":"# Memory Index\n\n- xylophone unique index marker entry\n"}}
+    , .{proj_dir});
+    defer a.free(args2);
+    const out2 = try write_tool.execute(&ctx, args2);
+    defer a.free(out2);
+    try std.testing.expect(std.mem.indexOf(u8, out2, "\"success\":true") != null);
+    const hits2 = try kg.recall("xylophone unique index marker", 10, false);
+    defer {
+        for (hits2) |*h| h.deinit(a);
+        a.free(hits2);
+    }
+    try std.testing.expect(hits2.len == 0);
+
+    // ③ memdir 外的 .md 不入图。
+    const args3 = try std.fmt.allocPrint(a,
+        \\{{"file_path":"{s}/outside-note.md","content":"# outside\n\nzeppelin outside marker body\n"}}
+    , .{proj_dir});
+    defer a.free(args3);
+    const out3 = try write_tool.execute(&ctx, args3);
+    defer a.free(out3);
+    const hits3 = try kg.recall("zeppelin outside marker", 10, false);
+    defer {
+        for (hits3) |*h| h.deinit(a);
+        a.free(hits3);
+    }
+    try std.testing.expect(hits3.len == 0);
+}

@@ -140,6 +140,9 @@ fn finalizeWrite(
         cache.put(ctx.progress_tool_id, old_content, content);
     }
 
+    // B/C 合并:memdir 记忆 markdown 自动入图(best-effort;content=编辑后全文)。
+    @import("../kg/autosync.zig").maybeImportMemoryFile(ctx, file_path, content);
+
     // structuredPatch + gitDiff
     const patch_mod = @import("../core/patch.zig");
     var patch = patch_mod.compute(allocator, old_content, content) catch {

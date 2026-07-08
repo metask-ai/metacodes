@@ -121,6 +121,9 @@ pub const ToolContext = struct {
     /// KG per-project 指针目录(`{home}/.metacodes/projects/<git根hash>`)。plan 落图写 kg_root
     /// 到此。空串 = 未配置。设计 KG_DESIGN v3-final §3。
     kg_projects_dir: []const u8 = "",
+    /// AutoMem memdir 绝对路径(B/C 合并:Write/Edit 落盘 memdir markdown 自动入图用)。
+    /// 空串=禁用。
+    memdir_abs: []const u8 = "",
 
     /// 工具抛错时可选的富文本 detail:工具在 `return error.X` 前写 `*error_detail = msg`,
     /// tool_exec 读到后用它替代通用的 "<tool> failed with X" 作为模型可见 detail。

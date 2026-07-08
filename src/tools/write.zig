@@ -71,6 +71,9 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         cache.put(ctx.progress_tool_id, old_content orelse "", content);
     }
 
+    // B/C 合并:memdir 记忆 markdown 自动入图(best-effort,失败仅 log 不影响写结果)。
+    @import("../kg/autosync.zig").maybeImportMemoryFile(ctx, path, content);
+
     return try renderResult(allocator, path, old_content orelse "", content);
 }
 
