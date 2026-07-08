@@ -33,11 +33,15 @@ pub fn maybeImportMemoryFile(ctx: *const ToolContext, path: []const u8, content:
     const base = std.fs.path.basename(path);
     if (std.mem.eql(u8, base, "MEMORY.md")) return; // 索引非记忆
     if (std.mem.trim(u8, content, " \t\r\n").len == 0) return; // 空文件无意义
-    if (!memdir.isAutoMemPath(ctx.allocator, ctx.memdir_abs, path)) return;
+    // canonical 判定 + 派生一体(Linus 复审严重条):stable_key 必须哈希 **canonical** 路径。
+    // 哈希裸 path 的话,同一文件的不同拼写(APFS 大小写不敏感 / /tmp vs /private/tmp /
+    // symlink / 相对路径)各算一个 key → 各建一个 document → 旧版本永久留在召回里。
+    const canon = memdir.canonicalAutoMemPath(ctx.allocator, ctx.memdir_abs, path) orelse return;
+    defer ctx.allocator.free(canon);
 
-    // 稳定 key = 文件路径 hash:同文件永远 upsert 同一 document(旧投影边被 tinykg 替换,
-    // 旧正文退出召回)。
-    const stable_key = std.hash.Wyhash.hash(0x9e3d, path);
+    // 稳定 key = canonical 路径 hash:同文件永远 upsert 同一 document(旧投影边被 tinykg
+    // 替换,旧正文退出召回)。
+    const stable_key = std.hash.Wyhash.hash(0x9e3d, canon);
     const doc_id = kg.importMarkdownDocStable(content, stable_key) catch |e| {
         log.warn("kg", "AutoMem markdown 入图失败({s}): {s}", .{ @errorName(e), base });
         return;

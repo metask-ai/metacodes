@@ -74,25 +74,40 @@ fn canonical(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 /// memdir_abs:App 算好的 memdir 绝对路径(已 realpath 或来自可信拼接)。
 /// candidate:工具 args 里的 file_path(可能相对/含 ..)。
 pub fn isAutoMemPath(allocator: std.mem.Allocator, memdir_abs: []const u8, candidate: []const u8) bool {
-    if (memdir_abs.len == 0 or candidate.len == 0) return false;
+    const canon = canonicalAutoMemPath(allocator, memdir_abs, candidate) orelse return false;
+    allocator.free(canon);
+    return true;
+}
+
+/// isAutoMemPath 的"返回 canonical"版:candidate 在 memdir 子树内 → 返回其 **canonical
+/// 绝对路径**(owned);否则 null。
+/// autosync 的 stable_key 必须哈希 **canonical** 而非模型传入的原始 path(Linus 复审严重条):
+/// 同一文件的不同拼写(APFS 大小写不敏感 `Lesson.md`/`lesson.md`、`/tmp` vs `/private/tmp`、
+/// symlink、相对路径)若各算一个 key → 各建一个 document → 旧版本永久留在召回里
+/// (召回污染从后门溜回)。防穿越与 key 派生用**同一份** canonical,单一基准。
+pub fn canonicalAutoMemPath(allocator: std.mem.Allocator, memdir_abs: []const u8, candidate: []const u8) ?[]u8 {
+    if (memdir_abs.len == 0 or candidate.len == 0) return null;
 
     // 归一化 candidate。新建文件 realpath 失败 → realpath 其父目录 + basename 重组。
-    const canon = canonicalForWrite(allocator, candidate) catch return false;
-    defer allocator.free(canon);
+    const canon = canonicalForWrite(allocator, candidate) catch return null;
 
     // 归一化 memdir 本身(防 memdir_abs 自身含 symlink/.. → 两侧同基准比较)。
-    const mem_canon = canonical(allocator, memdir_abs) catch return false;
+    const mem_canon = canonical(allocator, memdir_abs) catch {
+        allocator.free(canon);
+        return null;
+    };
     defer allocator.free(mem_canon);
 
     // 严格前缀 + 分隔符边界:canon == mem_canon(写 memdir 本身,罕见)或 canon 以 "mem_canon/" 开头。
-    if (std.mem.eql(u8, canon, mem_canon)) return true;
+    if (std.mem.eql(u8, canon, mem_canon)) return canon;
     if (canon.len > mem_canon.len and
         std.mem.startsWith(u8, canon, mem_canon) and
         canon[mem_canon.len] == '/')
     {
-        return true;
+        return canon;
     }
-    return false;
+    allocator.free(canon);
+    return null;
 }
 
 /// 为"将写入(可能尚不存在)的路径"做 realpath:

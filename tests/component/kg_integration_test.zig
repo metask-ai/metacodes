@@ -735,9 +735,9 @@ test "L2 KG: B/C 合并 — Write memdir markdown 自动入图,召回命中 sect
     defer a.free(out3);
     try std.testing.expectEqual(count_before_idx, kg.memoryCount());
 
-    // ④ **旧版本必删(Linus BLOCKER1 回归锁)**:同一记忆文件 Edit(内容变)→ 新 document
-    // 导入 + 旧 document 删除 → 召回只见新版内容,旧版独特词零命中(不删的话每次编辑都
-    // 往召回里追加一套近似副本,"KG 唯一真相"变全历史堆放场)。
+    // ④ **旧版本退出召回(Linus BLOCKER1 回归锁)**:同一记忆文件 Edit(内容变)→ 稳定 key
+    // upsert 同一 document(tinykg 增量合并替换旧投影边)→ 召回只见新版内容,旧版独特词
+    // 零命中(否则每次编辑都往召回里追加一套近似副本,"KG 唯一真相"变全历史堆放场)。
     const args4 = try std.fmt.allocPrint(a,
         \\{{"file_path":"{s}/memory/lesson-parser.md","content":"# parser lesson v2\n\n## root cause\n\nquokka tokenizer offset bug REVISED narwhal conclusion\n"}}
     , .{proj_dir});
@@ -752,7 +752,7 @@ test "L2 KG: B/C 合并 — Write memdir markdown 自动入图,召回命中 sect
         a.free(hits_new);
     }
     try std.testing.expect(hits_new.len >= 1);
-    // 旧版独特词(lesson body——v2 已不含)零命中:旧 document 已删,不残留召回。
+    // 旧版独特词(lesson body——v2 已不含)零命中:旧投影已被 upsert 替换,不残留召回。
     const hits_old = try kg.recall("lesson body", 10, false);
     defer {
         for (hits_old) |*h| h.deinit(a);
@@ -761,4 +761,17 @@ test "L2 KG: B/C 合并 — Write memdir markdown 自动入图,召回命中 sect
     for (hits_old) |h| {
         try std.testing.expect(std.mem.indexOf(u8, h.text, "lesson body") == null);
     }
+
+    // ⑤ **同文件不同拼写只产一个 document(canonical key 锁)**:经 `<memdir>/../memory/x.md`
+    // 之类非规范拼写再写同一文件 → stable_key 派生自 canonical → 仍 upsert 同 document,
+    // 全库节点计数不因拼写差异翻倍(裸 path hash 的话这里会新建一套子树)。
+    const count_before_alias = kg.memoryCount();
+    const args5 = try std.fmt.allocPrint(a,
+        \\{{"file_path":"{s}/memory/../memory/lesson-parser.md","content":"# parser lesson v2\n\n## root cause\n\nquokka tokenizer offset bug REVISED narwhal conclusion\n"}}
+    , .{proj_dir});
+    defer a.free(args5);
+    const out5 = try write_tool.execute(&ctx, args5);
+    defer a.free(out5);
+    try std.testing.expect(std.mem.indexOf(u8, out5, "\"success\":true") != null);
+    try std.testing.expectEqual(count_before_alias, kg.memoryCount());
 }

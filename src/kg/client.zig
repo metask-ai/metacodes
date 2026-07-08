@@ -117,6 +117,8 @@ pub const KgClient = struct {
     global_project_node_id: ?u64 = null,
     /// negative cache:读路径 lookup 确认"库中无该 project 节点"(scoped 自动召回每 turn 跑,
     /// 不缓存 miss 每 turn 白烧 spawn)。写路径 ensure 成功 / attach 失败缓存失效时复位。
+    /// **契约(session 级)**:别的 session 建了 project 节点后,本 session 读路径对它保持盲,
+    /// 直到自己发生一次写(ensure 复位)或重启——接受的权衡,不是 bug。
     project_miss: bool = false,
     global_project_miss: bool = false,
     /// abort 信号(M1:ESC 中断——穿进 spawn,避免锁竞争时最坏 13 分钟不可中断)。
