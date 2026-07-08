@@ -493,7 +493,7 @@ fn printLoginHelp() void {
         \\Use --no-browser to print the URL without launching a browser.
         \\OAuth token JSON must match the Metask token endpoint response:
         \\access_token, refresh_token, token_type=Bearer, expires_in.
-        \\Secrets are stored in ~/.cc-zig/auth.json with 0600 permissions.
+        \\Secrets are stored in ~/.metacodes/auth.json with 0600 permissions.
         \\
     , .{});
 }

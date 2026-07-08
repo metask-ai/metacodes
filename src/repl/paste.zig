@@ -3,7 +3,7 @@
 //! 终端 bracketed paste mode 下，粘贴内容被 ESC[200~ ... ESC[201~ 包裹。
 //! 驱动循环（loop.zig）收集这段字节后调 `process`：
 //!   - 小粘贴（行数/字节数都在阈值内）→ 原样内联插入。
-//!   - 大粘贴 → 写到 ~/.cc-zig/pastes/<n>.txt，buffer 里只放占位符
+//!   - 大粘贴 → 写到 ~/.metacodes/pastes/<n>.txt，buffer 里只放占位符
 //!     `[Pasted text #N +M lines]`，避免大段文字吃满 prompt + 终端刷屏。
 //!
 //! 占位符里的 #N 是本 session 内递增的粘贴编号；+M 是行数。
@@ -31,18 +31,18 @@ fn countLines(text: []const u8) usize {
     return n;
 }
 
-/// 把一段粘贴写到 ~/.cc-zig/pastes/<id>.txt。返回占位符（owned）。
+/// 把一段粘贴写到 ~/.metacodes/pastes/<id>.txt。返回占位符（owned）。
 /// id 由调用方维护（session 内递增）。失败时返回 null → 调用方退回内联。
 pub fn store(allocator: std.mem.Allocator, home: []const u8, id: usize, text: []const u8) !?[]u8 {
-    const dir_z = try std.fmt.allocPrintSentinel(allocator, "{s}/.cc-zig/pastes", .{home}, 0);
+    const dir_z = try std.fmt.allocPrintSentinel(allocator, "{s}/.metacodes/pastes", .{home}, 0);
     defer allocator.free(dir_z);
-    // mkdir -p：先建 .cc-zig，再建 pastes
-    const parent_z = try std.fmt.allocPrintSentinel(allocator, "{s}/.cc-zig", .{home}, 0);
+    // mkdir -p：先建 .metacodes，再建 pastes
+    const parent_z = try std.fmt.allocPrintSentinel(allocator, "{s}/.metacodes", .{home}, 0);
     defer allocator.free(parent_z);
     _ = std.c.mkdir(parent_z.ptr, 0o700);
     _ = std.c.mkdir(dir_z.ptr, 0o700);
 
-    const path_z = try std.fmt.allocPrintSentinel(allocator, "{s}/.cc-zig/pastes/{d}.txt", .{ home, id }, 0);
+    const path_z = try std.fmt.allocPrintSentinel(allocator, "{s}/.metacodes/pastes/{d}.txt", .{ home, id }, 0);
     defer allocator.free(path_z);
 
     const fd = std.c.open(path_z.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
@@ -61,7 +61,7 @@ pub fn store(allocator: std.mem.Allocator, home: []const u8, id: usize, text: []
 
 /// 读回某个粘贴文件的内容（提交时 expand 用）。
 pub fn load(allocator: std.mem.Allocator, home: []const u8, id: usize) !?[]u8 {
-    const path_z = try std.fmt.allocPrintSentinel(allocator, "{s}/.cc-zig/pastes/{d}.txt", .{ home, id }, 0);
+    const path_z = try std.fmt.allocPrintSentinel(allocator, "{s}/.metacodes/pastes/{d}.txt", .{ home, id }, 0);
     defer allocator.free(path_z);
     const fd = std.c.open(path_z.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return null;
@@ -151,7 +151,7 @@ test "store + load + expand round trip" {
     defer {
         // cleanup
         var pz: [256]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&pz, "{s}/.cc-zig/pastes/1.txt", .{home}) catch unreachable;
+        const p = std.fmt.bufPrintZ(&pz, "{s}/.metacodes/pastes/1.txt", .{home}) catch unreachable;
         _ = std.c.unlink(p.ptr);
     }
 
@@ -181,7 +181,7 @@ test "store placeholder count = lines - 1 (cc v2.1.172)" {
     defer {
         var pz: [256]u8 = undefined;
         inline for (.{ 4, 20 }) |id| {
-            const p = std.fmt.bufPrintZ(&pz, "{s}/.cc-zig/pastes/{d}.txt", .{ home, id }) catch unreachable;
+            const p = std.fmt.bufPrintZ(&pz, "{s}/.metacodes/pastes/{d}.txt", .{ home, id }) catch unreachable;
             _ = std.c.unlink(p.ptr);
         }
     }

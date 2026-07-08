@@ -48,7 +48,7 @@ def read_tool_uses(home):
     blocks 里 `{"type":"tool_use","id":..,"name":..,"input":"<json string>"}`。
     """
     uses = []
-    pattern = os.path.join(home, ".cc-zig", "projects", "*", "*", "transcript.jsonl")
+    pattern = os.path.join(home, ".metacodes", "projects", "*", "*", "transcript.jsonl")
     for path in glob.glob(pattern):
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -78,7 +78,7 @@ def read_tool_results(home):
     后台 subagent 的 TaskOutput 结果(含 status/stop_reason/turns/final_text 的 JSON)即在此。
     """
     results = []
-    pattern = os.path.join(home, ".cc-zig", "projects", "*", "*", "transcript.jsonl")
+    pattern = os.path.join(home, ".metacodes", "projects", "*", "*", "transcript.jsonl")
     for path in glob.glob(pattern):
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -109,7 +109,7 @@ def read_tool_results_with_error(home):
     这是补"声明=接线=测试"盲区:旧 assert_tool_e2e 只看工具被调用,不看执行成功与否。
     """
     results = []
-    pattern = os.path.join(home, ".cc-zig", "projects", "*", "*", "transcript.jsonl")
+    pattern = os.path.join(home, ".metacodes", "projects", "*", "*", "transcript.jsonl")
     for path in glob.glob(pattern):
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:

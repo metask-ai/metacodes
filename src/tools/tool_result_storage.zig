@@ -1,6 +1,6 @@
 //! 大工具结果落盘(批1C,对齐 cc toolResultStorage.ts)。
 //!
-//! 工具结果超过阈值 → 落盘 $HOME/.cc-zig/tool-results/<hash>.txt,返回 preview+路径
+//! 工具结果超过阈值 → 落盘 $HOME/.metacodes/tool-results/<hash>.txt,返回 preview+路径
 //! 替代 inline,防大结果(DB dump / 大文件)撑爆 context。FileRead 等已自限的工具不落盘。
 //! 失败降级:写盘失败 → 返回截断的 inline preview(不崩)。
 
@@ -46,11 +46,11 @@ pub fn persistForced(
     _ = name;
     const hash = std.hash.Wyhash.hash(0, content);
 
-    // 落盘路径:$HOME/.cc-zig/tool-results/<hash>.txt
+    // 落盘路径:$HOME/.metacodes/tool-results/<hash>.txt
     var pathbuf: [std.fs.max_path_bytes]u8 = undefined;
     const persisted: ?[]const u8 = blk: {
         if (home_dir.len == 0) break :blk null;
-        const dir = std.fmt.allocPrint(allocator, "{s}/.cc-zig/tool-results", .{home_dir}) catch break :blk null;
+        const dir = std.fmt.allocPrint(allocator, "{s}/.metacodes/tool-results", .{home_dir}) catch break :blk null;
         defer allocator.free(dir);
         @import("../util/fs.zig").mkdirParents(dir) catch break :blk null;
         const fpath = std.fmt.bufPrintZ(&pathbuf, "{s}/{x}.txt", .{ dir, hash }) catch break :blk null;

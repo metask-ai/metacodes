@@ -54,17 +54,17 @@ const testing = std.testing;
 
 test "build: contains memdir path + frontmatter + four types" {
     const a = testing.allocator;
-    const out = try build(a, "/home/u/.cc-zig/projects/abc/memory");
+    const out = try build(a, "/home/u/.metacodes/projects/abc/memory");
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "# Memory") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "/home/u/.cc-zig/projects/abc/memory") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "/home/u/.metacodes/projects/abc/memory") != null);
     try testing.expect(std.mem.indexOf(u8, out, "MEMORY.md") != null);
     try testing.expect(std.mem.indexOf(u8, out, "user | feedback | project | reference") != null);
     try testing.expect(std.mem.indexOf(u8, out, "name: <short-kebab-case-slug>") != null);
     // 两处都填了路径(模板 {s} 各一)
     var count: usize = 0;
     var i: usize = 0;
-    const needle = "/home/u/.cc-zig/projects/abc/memory";
+    const needle = "/home/u/.metacodes/projects/abc/memory";
     while (std.mem.indexOfPos(u8, out, i, needle)) |p| {
         count += 1;
         i = p + needle.len;

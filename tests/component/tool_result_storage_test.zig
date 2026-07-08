@@ -25,7 +25,7 @@ test "L2 落盘: 超阈值落盘 → preview+path,文件含全量" {
     try std.testing.expect(std.mem.indexOf(u8, r, "\"persisted\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "\"original_bytes\":60000") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "HEADER") != null); // preview 含开头
-    try std.testing.expect(std.mem.indexOf(u8, r, "/tmp/cc-trs-home/.cc-zig/tool-results/") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "/tmp/cc-trs-home/.metacodes/tool-results/") != null);
 
     // 落盘文件确实含全量(解析出 path,读回比对长度)
     const key = "\"path\":\"";

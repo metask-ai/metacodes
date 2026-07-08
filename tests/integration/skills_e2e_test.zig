@@ -287,7 +287,7 @@ test "Skills E2E: ${CLAUDE_SKILL_DIR} resolves to skill source path" {
     try std.testing.expect(std.mem.indexOf(u8, out, "My dir: /tmp/cc-zig-skills-dir/pathy/scripts") != null);
 }
 
-test "Skills E2E: project root cwd-walking loads .cc-zig/skills in repo root" {
+test "Skills E2E: project root cwd-walking loads .metacodes/skills in repo root" {
     const a = std.testing.allocator;
     const cwd = try cc.util_fs.getCwd(a);
     defer a.free(cwd);

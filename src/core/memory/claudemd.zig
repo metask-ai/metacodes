@@ -2,7 +2,7 @@
 //!
 //! 对齐 cc/src/utils/claudemd.ts:getMemoryFiles。职责:
 //!   1. 向上递归收集 cwd→root 每层的 CLAUDE.md / .claude/CLAUDE.md / CLAUDE.local.md
-//!   2. 加 User 级 ~/.claude/CLAUDE.md + ~/.cc-zig/CLAUDE.md + ~/.metacodes/AGENT.md(原生)
+//!   2. 加 User 级 ~/.claude/CLAUDE.md + ~/.metacodes/AGENT.md(原生)
 //!   3. 每个文件过 @import 递归内联(import.zig)
 //!   4. 每块带标签 `Contents of <abs> (<desc>):`
 //!   5. 顺序:User → Project(根→cwd) → Local,后加载者优先级最高(对齐 cc)
@@ -98,7 +98,7 @@ fn ancestorDirs(allocator: std.mem.Allocator, cwd: []const u8) ![][]u8 {
 /// 加载完整 CLAUDE.md 链,返回拼接好的纯文本(owned)。无内容返回空串(owned)。
 ///
 /// 顺序(后者优先级高,放后面):
-///   User(~/.claude/CLAUDE.md, ~/.cc-zig/CLAUDE.md)
+///   User(~/.claude/CLAUDE.md, ~/.metacodes/AGENT.md)
 ///   → Project(根→cwd 每层 CLAUDE.md + .claude/CLAUDE.md)
 ///   → Local(根→cwd 每层 CLAUDE.local.md)
 pub fn load(allocator: std.mem.Allocator, opts: LoadOptions) ![]u8 {
@@ -110,10 +110,6 @@ pub fn load(allocator: std.mem.Allocator, opts: LoadOptions) ![]u8 {
         const user_path = try std.fmt.allocPrint(allocator, "{s}/.claude/CLAUDE.md", .{opts.home});
         defer allocator.free(user_path);
         try appendFile(allocator, &out, user_path, DESC_USER, opts.home);
-
-        const cczig_path = try std.fmt.allocPrint(allocator, "{s}/.cc-zig/CLAUDE.md", .{opts.home});
-        defer allocator.free(cczig_path);
-        try appendFile(allocator, &out, cczig_path, DESC_USER, opts.home);
 
         // metacodes 原生用户级记忆(~/.metacodes/AGENT.md),放最后 = 用户级最高优先。
         const agent_path = try std.fmt.allocPrint(allocator, "{s}/.metacodes/AGENT.md", .{opts.home});

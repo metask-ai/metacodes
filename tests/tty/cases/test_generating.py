@@ -125,7 +125,7 @@ def test_T21_multiple_queued_autosubmit(bin_path):
 
     # 扫 transcript 的 user 消息,找含 BATCH 的文本块。
     user_batch_msgs = []
-    for path in glob.glob(os.path.join(home, ".cc-zig", "projects", "*", "*", "transcript.jsonl")):
+    for path in glob.glob(os.path.join(home, ".metacodes", "projects", "*", "*", "transcript.jsonl")):
         for line in open(path, encoding="utf-8", errors="replace"):
             try:
                 m = json.loads(line)

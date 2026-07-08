@@ -88,14 +88,14 @@ load_conf() {
 }
 
 # ============================================================================
-# fake HOME 夹具:建空 .claude / .cc-zig 骨架(默认纯净基线)。
+# fake HOME 夹具:建空 .claude / .metacodes 骨架(默认纯净基线)。
 # 场景可在调用后往里塞预置 agents/skills/settings。
 # ============================================================================
 setup_fake_home() {
   local home_dir="$1"
   mkdir -p "$home_dir/.claude/agents" \
            "$home_dir/.claude/skills" \
-           "$home_dir/.cc-zig"
+           "$home_dir/.metacodes"
 }
 
 # ============================================================================
@@ -193,9 +193,9 @@ run_session() {
   fi
 
   # --- 关联 transcript(Stage 0):从 fake HOME 把本场景 transcript.jsonl 拷出来 ---
-  # transcript 写在 $fake_home/.cc-zig/projects/<cwd_hash>/<session_id>/transcript.jsonl
+  # transcript 写在 $fake_home/.metacodes/projects/<cwd_hash>/<session_id>/transcript.jsonl
   local tpath
-  tpath="$(find "$fake_home/.cc-zig/projects" -name 'transcript.jsonl' -type f 2>/dev/null | head -1)"
+  tpath="$(find "$fake_home/.metacodes/projects" -name 'transcript.jsonl' -type f 2>/dev/null | head -1)"
   if [[ -n "$tpath" ]]; then
     cp -f "$tpath" "$workdir/transcript.jsonl" 2>/dev/null || true
   fi

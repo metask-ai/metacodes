@@ -154,7 +154,7 @@ def test_e2e_mcp_list_resources(bin_path):
     import json
     # 独立 HOME + config.json 声明 mock MCP server;模型应调 ListMcpResourcesTool。
     home = tempfile.mkdtemp(prefix="cc-e2e-mcp-home-")
-    cfg_dir = os.path.join(home, ".cc-zig")
+    cfg_dir = os.path.join(home, ".metacodes")
     os.makedirs(cfg_dir, exist_ok=True)
     with open(os.path.join(cfg_dir, "config.json"), "w") as f:
         json.dump({"mcp_servers": [{"name": "mock", "command": [_MOCK_MCP]}]}, f)

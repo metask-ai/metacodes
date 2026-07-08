@@ -243,7 +243,7 @@ test "EnterPlanMode 有 plan_file_path → 返回含 planFilePath + 引导写盘
         .allocator = a,
         .permission_ctx = &pctx,
         .plan_prev_mode = &prev,
-        .plan_file_path = "/home/u/.cc-zig/plans/cozy-canyon.md",
+        .plan_file_path = "/home/u/.metacodes/plans/cozy-canyon.md",
     };
     const r = try executeEnter(&ctx, "{}");
     defer a.free(r);

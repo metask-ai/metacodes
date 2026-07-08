@@ -2,11 +2,11 @@
 //!
 //! 加载顺序(对齐 Claude Code 优先级,**低优先级先加载,高的后覆盖**):
 //!   1. builtin(Explore / Plan / general-purpose)— 程序硬编码
-//!   2. plugin(~/.cc-zig/plugins/*/agents/ + project plugins;暂未实现,P3)
-//!   3. personal:~/.cc-zig/agents + ~/.claude/agents(后者优先)
-//!   4. project:沿 cwd 向上每级 .cc-zig/agents + .claude/agents
+//!   2. plugin(~/.metacodes/plugins/*/agents/ + project plugins;暂未实现,P3)
+//!   3. personal:~/.metacodes/agents + ~/.claude/agents(后者优先)
+//!   4. project:沿 cwd 向上每级 .metacodes/agents + .claude/agents
 //!   5. CLI --agents JSON(P3)
-//!   6. managed enterprise(P3,/etc/cc-zig/agents)
+//!   6. managed enterprise(P3,/etc/metacodes/agents)
 //!
 //! 重名:后加载覆盖先加载(同 skill)。
 
@@ -33,14 +33,14 @@ pub const AgentSet = struct {
         // 0. builtin
         try injectBuiltins(self);
 
-        // 1. personal: ~/.claude/agents 然后 ~/.cc-zig/agents
+        // 1. personal: ~/.claude/agents 然后 ~/.metacodes/agents
         if (std.c.getenv("HOME")) |home_c| {
             const home = std.mem.span(home_c);
             const claude_path = try std.fmt.allocPrint(self.allocator, "{s}/.claude/agents", .{home});
             defer self.allocator.free(claude_path);
             try self.loadFromDirRecursive(claude_path, .personal);
 
-            const cczig_path = try std.fmt.allocPrint(self.allocator, "{s}/.cc-zig/agents", .{home});
+            const cczig_path = try std.fmt.allocPrint(self.allocator, "{s}/.metacodes/agents", .{home});
             defer self.allocator.free(cczig_path);
             try self.loadFromDirRecursive(cczig_path, .personal);
         }
@@ -79,7 +79,7 @@ pub const AgentSet = struct {
         defer self.allocator.free(claude_path);
         try self.loadFromDirRecursive(claude_path, .project);
 
-        const cczig_path = try std.fmt.allocPrint(self.allocator, "{s}/.cc-zig/agents", .{dir});
+        const cczig_path = try std.fmt.allocPrint(self.allocator, "{s}/.metacodes/agents", .{dir});
         defer self.allocator.free(cczig_path);
         try self.loadFromDirRecursive(cczig_path, .project);
     }

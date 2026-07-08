@@ -163,9 +163,9 @@ def test_e2e_claudemd_disabled_env(bin_path):
 # ============================================================================
 
 def _memdir_files(home):
-    """列 memdir 下所有文件(home/.cc-zig/projects/*/memory/*)。"""
+    """列 memdir 下所有文件(home/.metacodes/projects/*/memory/*)。"""
     import glob
-    return glob.glob(os.path.join(home, ".cc-zig", "projects", "*", "memory", "*"))
+    return glob.glob(os.path.join(home, ".metacodes", "projects", "*", "memory", "*"))
 
 
 def test_e2e_memdir_write_carveout(bin_path):

@@ -36,7 +36,7 @@ def _no_crash(raw, home):
 
 def _answers(home):
     """从 transcript 取 AskUserQuestion 的 tool_result answers。"""
-    for path in glob.glob(os.path.join(home, ".cc-zig", "projects", "*", "*", "transcript.jsonl")):
+    for path in glob.glob(os.path.join(home, ".metacodes", "projects", "*", "*", "transcript.jsonl")):
         for line in open(path, encoding="utf-8", errors="replace"):
             if "tool_result" not in line:
                 continue
@@ -53,7 +53,7 @@ def _answers(home):
 def _all_tool_results(home):
     """拼接该 HOME 下所有 tool_result content(用于断言哨兵结果/排除字面 label)。"""
     out = []
-    for path in glob.glob(os.path.join(home, ".cc-zig", "projects", "*", "*", "transcript.jsonl")):
+    for path in glob.glob(os.path.join(home, ".metacodes", "projects", "*", "*", "transcript.jsonl")):
         for line in open(path, encoding="utf-8", errors="replace"):
             if "tool_result" not in line:
                 continue

@@ -24,9 +24,9 @@
 //!    以及 !`cmd` 行首注入和 ```! fenced 注入>
 //!
 //! 加载层级(覆盖优先级,高→低):
-//!   1. enterprise:    /etc/cc-zig/skills/<name>/
-//!   2. personal:      ~/.cc-zig/skills/<name>/  和  ~/.claude/skills/<name>/
-//!   3. project-root:  <repo-root>/.cc-zig/skills/<name>/  和  .claude/skills/<name>/
+//!   1. enterprise:    /etc/metacodes/skills/<name>/
+//!   2. personal:      ~/.metacodes/skills/<name>/  和  ~/.claude/skills/<name>/
+//!   3. project-root:  <repo-root>/.metacodes/skills/<name>/  和  .claude/skills/<name>/
 //!                     (沿 cwd 向上找 .git)
 //!   4. plugin:        <plugin>/skills/<name>/  (命名空间 <plugin>:<name>)
 //! 同名:高优先级覆盖低优先级。Plugin 不与其它级冲突。
@@ -91,7 +91,7 @@ pub const SkillSet = struct {
         self.skills.deinit(self.allocator);
     }
 
-    /// 标准 5 路径加载:enterprise / ~/.cc-zig / ~/.claude / repo-root/.cc-zig / repo-root/.claude。
+    /// 标准 5 路径加载:enterprise / ~/.metacodes / ~/.claude / repo-root/.metacodes / repo-root/.claude。
     /// 加载顺序 = 低优先到高优先,这样后加载的覆盖前面的。
     /// cwd 用于沿父目录找 .git 定位 repo root;""则跳过 project 级。
     pub fn loadFromStandardPaths(self: *SkillSet, cwd: []const u8) !void {
@@ -99,19 +99,19 @@ pub const SkillSet = struct {
         const enterprise = enterprisePath();
         try self.loadFromDir(enterprise);
 
-        // 2. personal — ~/.cc-zig 优先于 ~/.claude(后加载覆盖)
+        // 2. personal — ~/.metacodes 优先于 ~/.claude(后加载覆盖)
         if (std.c.getenv("HOME")) |home_c| {
             const home = std.mem.span(home_c);
             const claude_path = try std.fmt.allocPrint(self.allocator, "{s}/.claude/skills", .{home});
             defer self.allocator.free(claude_path);
             try self.loadFromDir(claude_path);
 
-            const cczig_path = try std.fmt.allocPrint(self.allocator, "{s}/.cc-zig/skills", .{home});
+            const cczig_path = try std.fmt.allocPrint(self.allocator, "{s}/.metacodes/skills", .{home});
             defer self.allocator.free(cczig_path);
             try self.loadFromDir(cczig_path);
         }
 
-        // 3. project — 沿 cwd 向上找 .git,逐级加载 .claude/skills 和 .cc-zig/skills。
+        // 3. project — 沿 cwd 向上找 .git,逐级加载 .claude/skills 和 .metacodes/skills。
         //    父级先加载、根级最后,保证近 cwd 的(更具体的)覆盖父级。
         if (cwd.len > 0) {
             const root = findRepoRoot(self.allocator, cwd) catch null;
@@ -126,7 +126,7 @@ pub const SkillSet = struct {
         }
     }
 
-    /// 从 root 一路走到 cwd(包含),每级加载 .claude/skills 和 .cc-zig/skills。
+    /// 从 root 一路走到 cwd(包含),每级加载 .claude/skills 和 .metacodes/skills。
     /// 越深(越接近 cwd)的覆盖越浅的。
     fn loadProjectChain(self: *SkillSet, root: []const u8, cwd: []const u8) !void {
         // root 必须是 cwd 的前缀
@@ -154,7 +154,7 @@ pub const SkillSet = struct {
         defer self.allocator.free(claude_path);
         try self.loadFromDir(claude_path);
 
-        const cczig_path = try std.fmt.allocPrint(self.allocator, "{s}/.cc-zig/skills", .{dir});
+        const cczig_path = try std.fmt.allocPrint(self.allocator, "{s}/.metacodes/skills", .{dir});
         defer self.allocator.free(cczig_path);
         try self.loadFromDir(cczig_path);
     }
@@ -226,7 +226,7 @@ pub const SkillSet = struct {
 
 /// 系统级 skill 路径(enterprise 分发用)。macOS / Linux 都用 /etc。
 fn enterprisePath() []const u8 {
-    return "/etc/cc-zig/skills";
+    return "/etc/metacodes/skills";
 }
 
 /// 从 start_dir 向上找 `.git` 目录(或文件,对应 git worktree)。

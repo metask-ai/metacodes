@@ -1,4 +1,4 @@
-//! 用户配置持久化：~/.cc-zig/config.json
+//! 用户配置持久化：~/.metacodes/config.json
 //!
 //! 字段（全部可选，缺失用默认）：
 //!   {
@@ -28,7 +28,7 @@ pub const FileConfig = struct {
     }
 };
 
-/// 从 ~/.cc-zig/config.json 加载。文件不存在返回全默认（null 字段）。
+/// 从 ~/.metacodes/config.json 加载。文件不存在返回全默认（null 字段）。
 pub fn loadFromHome(allocator: std.mem.Allocator) !FileConfig {
     const path = try homePath(allocator);
     defer allocator.free(path);
@@ -57,7 +57,7 @@ pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !FileConfig 
     return parseJson(allocator, contents.items);
 }
 
-/// 保存到 ~/.cc-zig/config.json（覆盖写 + fsync）。
+/// 保存到 ~/.metacodes/config.json（覆盖写 + fsync）。
 pub fn saveToHome(config: FileConfig, allocator: std.mem.Allocator) !void {
     const path = try homePath(allocator);
     defer allocator.free(path);
@@ -175,7 +175,7 @@ fn parseBoolField(data: []const u8, field: []const u8) ?bool {
 fn homePath(allocator: std.mem.Allocator) ![]u8 {
     const home_c = std.c.getenv("HOME") orelse return error.NoHome;
     const home = std.mem.span(home_c);
-    return std.fmt.allocPrint(allocator, "{s}/.cc-zig/config.json", .{home});
+    return std.fmt.allocPrint(allocator, "{s}/.metacodes/config.json", .{home});
 }
 
 // ============================================================================

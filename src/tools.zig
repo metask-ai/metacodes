@@ -210,7 +210,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "EnterWorktree",
-        .description = "Enter an isolated git worktree. Pass `path` to switch into an existing worktree, OR pass `name` (and optional `base` branch) to create a new worktree under .cc-zig/worktrees/<name>/. Changes the session's working directory. Returns {worktree, branch, entered, created}.",
+        .description = "Enter an isolated git worktree. Pass `path` to switch into an existing worktree, OR pass `name` (and optional `base` branch) to create a new worktree under .metacodes/worktrees/<name>/. Changes the session's working directory. Returns {worktree, branch, entered, created}.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "name", .type = "string", .description = "Name for a new worktree to create" },
             .{ .name = "path", .type = "string", .description = "Path of an existing worktree to switch into" },

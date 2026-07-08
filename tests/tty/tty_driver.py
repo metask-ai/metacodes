@@ -76,7 +76,7 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
     # keep the user's real env/OAuth credential resolution intact.
     if base_url:
         full_env.setdefault("METASK_API_KEY", "tty-dummy-key")
-    # HOME 隔离:不读用户真实 ~/.claude / ~/.cc-zig(settings/agents/skills),保证可重复。
+    # HOME 隔离:不读用户真实 ~/.claude / ~/.metacodes(settings/agents/skills),保证可重复。
     full_env.setdefault("HOME", "/tmp/cc-tty-home")
     os.makedirs(full_env["HOME"], exist_ok=True)
     if env:

@@ -1,7 +1,7 @@
 //! AgentDef:subagent 定义。对齐 Claude Code 官方 frontmatter 字段集。
 //! 详细设计见 doc/SUBAGENT_DESIGN.md。
 //!
-//! 来源:`.cc-zig/agents/<name>.md` 或 `~/.claude/agents/<name>.md` 等。
+//! 来源:`.metacodes/agents/<name>.md` 或 `~/.claude/agents/<name>.md` 等。
 //! 关键:**身份只看 frontmatter `name` 字段**,文件名/子目录路径仅控制位置发现,不影响调用名。
 
 const std = @import("std");
@@ -27,8 +27,8 @@ pub const MemoryScope = enum { none, user, project, local };
 
 pub const Origin = enum {
     builtin, // Explore/Plan/general-purpose
-    personal, // ~/.cc-zig/agents 或 ~/.claude/agents
-    project, // <repo>/.cc-zig/agents 或 <repo>/.claude/agents
+    personal, // ~/.metacodes/agents 或 ~/.claude/agents
+    project, // <repo>/.metacodes/agents 或 <repo>/.claude/agents
     plugin, // <plugin>/agents
     cli, // --agents JSON 临时定义
 };

@@ -110,7 +110,7 @@ fn injectClaudeMd(allocator: std.mem.Allocator, out: *std.Io.Writer.Allocating, 
     if (std.c.getenv("HOME")) |home_c| {
         const home = std.mem.span(home_c);
         try injectFile(allocator, out, home, ".claude/CLAUDE.md", "User CLAUDE.md");
-        try injectFile(allocator, out, home, ".cc-zig/CLAUDE.md", "User cc-zig CLAUDE.md");
+        try injectFile(allocator, out, home, ".metacodes/CLAUDE.md", "User cc-zig CLAUDE.md");
     }
     if (opts.project_dir.len > 0) {
         try injectFile(allocator, out, opts.project_dir, "CLAUDE.md", "Project CLAUDE.md");

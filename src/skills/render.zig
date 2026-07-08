@@ -535,10 +535,10 @@ test "substitute: \\${CLAUDE_SKILL_DIR}" {
     const out = try renderBody(
         testing.allocator,
         "cd ${CLAUDE_SKILL_DIR}/scripts && ./go.sh",
-        .{ .skill_dir = "/home/u/.cc-zig/skills/foo" },
+        .{ .skill_dir = "/home/u/.metacodes/skills/foo" },
     );
     defer testing.allocator.free(out);
-    try testing.expectEqualStrings("cd /home/u/.cc-zig/skills/foo/scripts && ./go.sh", out);
+    try testing.expectEqualStrings("cd /home/u/.metacodes/skills/foo/scripts && ./go.sh", out);
 }
 
 test "substitute: \\${CLAUDE_SESSION_ID} + \\${CLAUDE_PROJECT_DIR}" {

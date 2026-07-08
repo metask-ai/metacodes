@@ -56,7 +56,7 @@ tests/e2e/replay_e2e.sh runs/<ts>/02_html_game/cassette scenarios/02_html_game.t
   双写——精简 `<场景>.log`(stdout)+ 全量 `<场景>.debug.log`(请求体/SSE 行/工具入参/
   权限决策);REPORT 含失败时间线 + transcript 关联。
 - **环境隔离(Stage 1)**:每场景独立 fake HOME(`<workdir>/.home`),隔离 transcript /
-  history / agents/skills/settings → 可重复、不污染真实 `~/.cc-zig`。
+  history / agents/skills/settings → 可重复、不污染真实 `~/.metacodes`。
 - **`.conf` 场景配置**:同名 `scenarios/<name>.conf` 声明权限模式/settings/allowedTools/
   answers/git-init/EXPECT 断言/超时。无 `.conf` 的老场景行为不变(默认 bypass)。
 - **EXPECT 断言(Stage 8)**:`EXPECT_FILE` / `EXPECT_CONTAINS` / `EXPECT_MIN_LINES` /

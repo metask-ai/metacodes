@@ -1,4 +1,4 @@
-//! ~/.cc-zig/config.json 的 TUI 相关读写。
+//! ~/.metacodes/config.json 的 TUI 相关读写。
 //!
 //! 现在管 1 个字段:`theme`("auto"/"dark"/"light"/"mono")。
 //!
@@ -10,11 +10,11 @@
 const std = @import("std");
 const theme_mod = @import("theme.zig");
 
-/// 读取 home 目录下 ~/.cc-zig/config.json 的 theme 字段。
+/// 读取 home 目录下 ~/.metacodes/config.json 的 theme 字段。
 /// 返回:成功且字段存在合法 → Variant;否则 null。
 pub fn loadTheme(alloc: std.mem.Allocator, home: []const u8) ?theme_mod.Variant {
     var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const path_z = std.fmt.bufPrint(&path_buf, "{s}/.cc-zig/config.json\x00", .{home}) catch return null;
+    const path_z = std.fmt.bufPrint(&path_buf, "{s}/.metacodes/config.json\x00", .{home}) catch return null;
     const path = path_z[0 .. path_z.len - 1];
 
     const content = readFile(alloc, path) catch return null;
@@ -30,15 +30,15 @@ pub fn loadTheme(alloc: std.mem.Allocator, home: []const u8) ?theme_mod.Variant 
 }
 
 /// 写入 theme 字段。原子读改写:读 → 改/插 → 写回。
-/// 文件不存在 → 自动 mkdir ~/.cc-zig + 创建。其它 IO 错误 → 返回 error。
+/// 文件不存在 → 自动 mkdir ~/.metacodes + 创建。其它 IO 错误 → 返回 error。
 pub fn saveTheme(alloc: std.mem.Allocator, home: []const u8, variant: theme_mod.Variant) !void {
-    // 确保 ~/.cc-zig 存在
+    // 确保 ~/.metacodes 存在
     var dir_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const dir_z = try std.fmt.bufPrint(&dir_buf, "{s}/.cc-zig\x00", .{home});
+    const dir_z = try std.fmt.bufPrint(&dir_buf, "{s}/.metacodes\x00", .{home});
     _ = std.c.mkdir(@ptrCast(dir_z.ptr), 0o755); // 已存在 EEXIST 忽略
 
     var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
-    const path_z = try std.fmt.bufPrint(&path_buf, "{s}/.cc-zig/config.json\x00", .{home});
+    const path_z = try std.fmt.bufPrint(&path_buf, "{s}/.metacodes/config.json\x00", .{home});
     const path = path_z[0 .. path_z.len - 1];
 
     // 读旧内容(可能没有);解析失败 → 直接覆盖
@@ -242,12 +242,12 @@ test "loadTheme + saveTheme 往返(临时 home)" {
     dir_z[dir.len] = 0;
     _ = std.c.mkdir(@ptrCast(&dir_z), 0o755);
     defer {
-        // 清理 ~/.cc-zig/config.json + ~/.cc-zig + tmp 目录
+        // 清理 ~/.metacodes/config.json + ~/.metacodes + tmp 目录
         var p1_buf: [256]u8 = undefined;
-        const p1 = std.fmt.bufPrint(&p1_buf, "{s}/.cc-zig/config.json\x00", .{dir}) catch unreachable;
+        const p1 = std.fmt.bufPrint(&p1_buf, "{s}/.metacodes/config.json\x00", .{dir}) catch unreachable;
         _ = std.c.unlink(@ptrCast(p1.ptr));
         var p2_buf: [256]u8 = undefined;
-        const p2 = std.fmt.bufPrint(&p2_buf, "{s}/.cc-zig\x00", .{dir}) catch unreachable;
+        const p2 = std.fmt.bufPrint(&p2_buf, "{s}/.metacodes\x00", .{dir}) catch unreachable;
         _ = std.c.rmdir(@ptrCast(p2.ptr));
         _ = std.c.rmdir(@ptrCast(&dir_z));
     }

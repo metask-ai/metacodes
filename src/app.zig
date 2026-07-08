@@ -142,7 +142,7 @@ pub const App = struct {
     agent_jobs: ?@import("core/agent_job_registry.zig").AgentJobRegistry = null,
     /// 进入 plan 模式前的原 mode；ExitPlanMode 用它恢复
     plan_prev_mode: ?types.PermissionMode = null,
-    /// 当前 session 的 plan 文件全路径(`{home}/.cc-zig/plans/{slug}.md`,owned)。
+    /// 当前 session 的 plan 文件全路径(`{home}/.metacodes/plans/{slug}.md`,owned)。
     /// init 时算一次,挂到 permission_ctx.plan_file_path(plan 模式特许写)+ ToolContext。
     /// 空串 = home 缺失,plan 文件机制降级(模型把计划写对话文本)。
     plan_file_path: []u8 = &.{},
@@ -242,8 +242,8 @@ pub const App = struct {
             app.gemini_client = gemini_mod.GeminiClient.init(allocator, io, api_key, config.model, config.base_url);
         }
 
-        // 启动时加载 skills:enterprise / ~/.cc-zig / ~/.claude / project chain。
-        // 沿 cwd 向上找 .git 定位 project root,沿途每级 .cc-zig/skills 都加载。
+        // 启动时加载 skills:enterprise / ~/.metacodes / ~/.claude / project chain。
+        // 沿 cwd 向上找 .git 定位 project root,沿途每级 .metacodes/skills 都加载。
         const cwd_for_skills = @import("util/fs.zig").getCwd(allocator) catch null;
         defer if (cwd_for_skills) |c| allocator.free(c);
         app.skills.loadFromStandardPaths(cwd_for_skills orelse "") catch {};
@@ -263,7 +263,7 @@ pub const App = struct {
         if (config.no_theme) {
             app.theme_variant = .monochrome;
         } else {
-            // ~/.cc-zig/config.json 的 theme 字段覆盖默认 auto
+            // ~/.metacodes/config.json 的 theme 字段覆盖默认 auto
             const home_for_theme: ?[]const u8 = blk: {
                 const h = std.c.getenv("HOME") orelse break :blk null;
                 break :blk std.mem.span(h);
@@ -1080,13 +1080,13 @@ pub const App = struct {
         try app.loadSettings();
     }
 
-    /// 从 ~/.cc-zig/config.json 读 permission_rules 数组。失败仅 log，不影响启动。
+    /// 从 ~/.metacodes/config.json 读 permission_rules 数组。失败仅 log，不影响启动。
     /// 同时把加载的 rule_set 绑到 permission_ctx.rules。
     fn loadPermissionRules(app: *App) !void {
         const home_c = std.c.getenv("HOME") orelse return error.NoHome;
         const home = std.mem.span(home_c);
         var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
-        const path = try std.fmt.bufPrint(&pbuf, "{s}/.cc-zig/config.json\x00", .{home});
+        const path = try std.fmt.bufPrint(&pbuf, "{s}/.metacodes/config.json\x00", .{home});
         const fd = std.c.open(@ptrCast(path.ptr), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) return error.NotFound;
         defer _ = std.c.close(fd);
@@ -1151,7 +1151,7 @@ pub const App = struct {
         @import("util/log.zig").info("permission", "loaded {d} rule(s) from config", .{app.rule_set.?.rules.items.len});
     }
 
-    /// 启动时连接 ~/.cc-zig/config.json 里 mcp_servers 数组里声明的每个 server。
+    /// 启动时连接 ~/.metacodes/config.json 里 mcp_servers 数组里声明的每个 server。
     /// Schema：
     ///   {"mcp_servers": [
     ///       {"name": "github", "command": ["/usr/local/bin/mcp-github", "--token=..."]},
@@ -1163,7 +1163,7 @@ pub const App = struct {
         const home_c = std.c.getenv("HOME") orelse return error.NoHome;
         const home = std.mem.span(home_c);
         var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
-        const path = try std.fmt.bufPrint(&pbuf, "{s}/.cc-zig/config.json\x00", .{home});
+        const path = try std.fmt.bufPrint(&pbuf, "{s}/.metacodes/config.json\x00", .{home});
         const fd = std.c.open(@ptrCast(path.ptr), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) return error.NotFound;
         defer _ = std.c.close(fd);

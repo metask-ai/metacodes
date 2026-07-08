@@ -1,4 +1,4 @@
-//! 命令历史：内存 ring（cap=1000） + `~/.cc-zig/history` 文件持久化。
+//! 命令历史：内存 ring（cap=1000） + `~/.metacodes/history` 文件持久化。
 //!
 //! 典型工作流：
 //! 1. REPL 启动：`History.init` → 从文件读已有行到内存

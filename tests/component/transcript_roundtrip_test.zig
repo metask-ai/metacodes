@@ -21,7 +21,7 @@ fn firstText(m: anytype) []const u8 {
 test "L2 transcript: 写 → loadTranscript 往返,消息数/角色/text 一致" {
     const a = std.testing.allocator;
 
-    // 隔离 HOME(Writer.init 写 $HOME/.cc-zig/projects/<hash>/<sid>/)
+    // 隔离 HOME(Writer.init 写 $HOME/.metacodes/projects/<hash>/<sid>/)
     const home = "/tmp/cc-transcript-l2";
     _ = std.c.mkdir(home, 0o755);
 

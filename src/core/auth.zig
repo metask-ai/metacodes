@@ -84,7 +84,7 @@ pub const StoredCredentials = struct {
 pub fn authFilePath(allocator: std.mem.Allocator) ![]u8 {
     if (std.c.getenv(AUTH_FILE_ENV)) |p| return allocator.dupe(u8, std.mem.span(p));
     const home_c = std.c.getenv("HOME") orelse return error.NoHome;
-    return std.fmt.allocPrint(allocator, "{s}/.cc-zig/auth.json", .{std.mem.span(home_c)});
+    return std.fmt.allocPrint(allocator, "{s}/.metacodes/auth.json", .{std.mem.span(home_c)});
 }
 
 pub fn resolveCredential(

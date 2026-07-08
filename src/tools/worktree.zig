@@ -3,7 +3,7 @@
 //! 两个工具:
 //!   EnterWorktree(name?, path?, base?)
 //!     - 若提供 path:切换到该已存在的 worktree(必须在 `git worktree list` 中)
-//!     - 否则:在 .cc-zig/worktrees/<name|random>/ 创建新 worktree,基于 base 分支
+//!     - 否则:在 .metacodes/worktrees/<name|random>/ 创建新 worktree,基于 base 分支
 //!       (base 缺省 = 当前 default branch,简化为 HEAD)
 //!     - 进入 = chdir + 在 ToolContext 上把 worktree 状态推到一个栈
 //!     - 返回 JSON: {"worktree":"...","branch":"...","entered":true}
@@ -61,10 +61,10 @@ pub fn enterExecute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     const base = common.extractJsonArg(args, "base") orelse "HEAD";
 
-    // 路径:<cwd>/.cc-zig/worktrees/<name>
+    // 路径:<cwd>/.metacodes/worktrees/<name>
     const cwd = try getCwd(a);
     defer a.free(cwd);
-    const wt_dir = try std.fmt.allocPrint(a, "{s}/.cc-zig/worktrees", .{cwd});
+    const wt_dir = try std.fmt.allocPrint(a, "{s}/.metacodes/worktrees", .{cwd});
     defer a.free(wt_dir);
     try mkdirP(wt_dir);
     const wt_path = try std.fmt.allocPrint(a, "{s}/{s}", .{ wt_dir, name });

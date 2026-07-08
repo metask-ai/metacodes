@@ -41,7 +41,7 @@ pub const Context = struct {
     /// memdir 绝对路径(通道 B 自动记忆目录;空串 = 禁用)。模型用 Write/Edit 自管记忆,
     /// 写此子树内的文件**任何模式都豁免**(对齐 cc isAutoMemPath)。
     /// 安全:豁免严格限于 memdir 子树(realpath + 分隔符边界,见 memdir.isAutoMemPath);
-    /// deny 规则 / protected paths 仍优先(memdir 在 ~/.cc-zig 下不与之重叠,原则上仍受约束)。
+    /// deny 规则 / protected paths 仍优先(memdir 在 ~/.metacodes 下不与之重叠,原则上仍受约束)。
     memdir_abs: []const u8 = "",
     /// memdir 豁免判定需要 allocator(realpath 归一化);null → 跳过豁免(降级:按常规决策)。
     memdir_allocator: ?std.mem.Allocator = null,
@@ -227,16 +227,16 @@ test "plan mode: read allowed, write/exec denied" {
 }
 
 test "plan mode: 特许写 plan 文件,其它 Write 仍 deny(对齐 cc isSessionPlanFile)" {
-    const plan_path = "/home/u/.cc-zig/plans/cozy-canyon.md";
+    const plan_path = "/home/u/.metacodes/plans/cozy-canyon.md";
     const ctx = Context{ .mode = .plan, .plan_file_path = plan_path };
     // 写 plan 文件 → allow。
-    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/home/u/.cc-zig/plans/cozy-canyon.md\",\"content\":\"x\"}") == .allow);
-    try std.testing.expect(check(&ctx, "Edit", "{\"file_path\":\"/home/u/.cc-zig/plans/cozy-canyon.md\"}") == .allow);
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/home/u/.metacodes/plans/cozy-canyon.md\",\"content\":\"x\"}") == .allow);
+    try std.testing.expect(check(&ctx, "Edit", "{\"file_path\":\"/home/u/.metacodes/plans/cozy-canyon.md\"}") == .allow);
     // 写别的文件 → 仍 deny(plan 文件是唯一例外)。
     try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/home/u/src/main.zig\",\"content\":\"x\"}") == .deny);
     // 无 plan_file_path 配置时,连 plan 路径也 deny(机制未启用)。
     const ctx_noplan = Context{ .mode = .plan };
-    try std.testing.expect(check(&ctx_noplan, "Write", "{\"file_path\":\"/home/u/.cc-zig/plans/cozy-canyon.md\"}") == .deny);
+    try std.testing.expect(check(&ctx_noplan, "Write", "{\"file_path\":\"/home/u/.metacodes/plans/cozy-canyon.md\"}") == .deny);
 }
 
 test "memdir 写豁免:子树内任何模式 allow,外部按常规;deny 仍优先(通道 B)" {

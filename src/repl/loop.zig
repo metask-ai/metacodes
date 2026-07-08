@@ -62,7 +62,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     var history = history_mod.History.init(allocator);
     defer history.deinit();
 
-    // 历史文件路径：~/.cc-zig/history
+    // 历史文件路径：~/.metacodes/history
     const hist_path = try historyPath(allocator);
     defer allocator.free(hist_path);
     history.loadFromFile(hist_path) catch {};
@@ -151,7 +151,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                 \\  /goal [cmd]      View/manage the session goal
                 \\  /loop [cmd]      View/control automatic continuation
                 \\  /doctor          Show environment/config diagnostics
-                \\  /config [show|path]  Inspect config (~/.cc-zig/config.json)
+                \\  /config [show|path]  Inspect config (~/.metacodes/config.json)
                 \\  /init            Analyze the codebase and write CLAUDE.md (model-driven)
                 \\  /mcp             List configured MCP servers
                 \\  /agents          List available sub-agent capabilities
@@ -317,7 +317,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         }
         if (std.mem.eql(u8, trimmed, "/skills")) {
             if (app.skills.len() == 0) {
-                std.debug.print("No skills installed. Put SKILL.md files under ~/.cc-zig/skills/<name>/ or <project>/.cc-zig/skills/<name>/\n", .{});
+                std.debug.print("No skills installed. Put SKILL.md files under ~/.metacodes/skills/<name>/ or <project>/.metacodes/skills/<name>/\n", .{});
             } else {
                 std.debug.print("Available skills ({d}):\n", .{app.skills.len()});
                 for (app.skills.skills.items) |s| {
@@ -766,7 +766,7 @@ fn readLineBuffered(allocator: std.mem.Allocator) ![]u8 {
 /// - Ctrl+C (buffer 空，连续第二次) → error.ExitRequested（退出 REPL）
 /// - Ctrl+D (buffer 空) → error.Eof（退出 REPL）
 /// 处理一次括号粘贴：从 paste_begin 之后读到 paste_end，累积原始文本。
-/// 小粘贴内联插入；大粘贴存 ~/.cc-zig/pastes/<N>.txt 并插入占位符。
+/// 小粘贴内联插入；大粘贴存 ~/.metacodes/pastes/<N>.txt 并插入占位符。
 fn handlePaste(
     fd: std.c.fd_t,
     editor: *input.LineEditor,
@@ -1687,7 +1687,7 @@ fn retryLast(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui
 fn historyPath(allocator: std.mem.Allocator) ![]u8 {
     const home_c = std.c.getenv("HOME") orelse return error.NoHome;
     const home = std.mem.span(home_c);
-    return std.fmt.allocPrint(allocator, "{s}/.cc-zig/history", .{home});
+    return std.fmt.allocPrint(allocator, "{s}/.metacodes/history", .{home});
 }
 
 // ============================================================================
@@ -1953,7 +1953,7 @@ fn handleConfigCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
         return;
     };
     const home = std.mem.span(home_c);
-    const cfg_path = try std.fmt.allocPrint(allocator, "{s}/.cc-zig/config.json", .{home});
+    const cfg_path = try std.fmt.allocPrint(allocator, "{s}/.metacodes/config.json", .{home});
     defer allocator.free(cfg_path);
 
     if (rest.len == 0 or std.mem.eql(u8, rest, "show")) {
@@ -2599,7 +2599,7 @@ fn handleMcp(app: *app_mod.App) !void {
         std.debug.print(
             \\MCP servers: (none connected)
             \\
-            \\Declare servers in ~/.cc-zig/config.json:
+            \\Declare servers in ~/.metacodes/config.json:
             \\  {{"mcp_servers":[{{"name":"foo","command":["/path/to/server","--flag"]}}]}}
             \\
         , .{});
@@ -2706,7 +2706,7 @@ fn handlePermissions(app: *app_mod.App) void {
             }
         }
     } else {
-        std.debug.print("rules: (none loaded — add a permission_rules array to ~/.cc-zig/config.json)\n", .{});
+        std.debug.print("rules: (none loaded — add a permission_rules array to ~/.metacodes/config.json)\n", .{});
     }
 
     // 新 schema settings 层(permissions.allow/ask/deny)
@@ -2749,7 +2749,7 @@ fn handleTheme(app: *app_mod.App, rest: []const u8) void {
     app.theme = theme_mod.select(variant, cap);
     std.debug.print("theme switched to \x1b[36m{s}\x1b[0m\n", .{theme_mod.variantName(variant)});
 
-    // 持久化到 ~/.cc-zig/config.json
+    // 持久化到 ~/.metacodes/config.json
     const tui_config = @import("tui/config.zig");
     const home = std.c.getenv("HOME");
     if (home) |h| {
@@ -2761,7 +2761,7 @@ fn handleTheme(app: *app_mod.App, rest: []const u8) void {
             std.debug.print("\x1b[2m(persist failed: {s})\x1b[0m\n", .{@errorName(e)});
             return;
         };
-        std.debug.print("\x1b[2m(saved to ~/.cc-zig/config.json)\x1b[0m\n", .{});
+        std.debug.print("\x1b[2m(saved to ~/.metacodes/config.json)\x1b[0m\n", .{});
     }
 }
 
@@ -2775,7 +2775,7 @@ fn c_system(command: [*:0]const u8) c_int {
 /// /memory:列出记忆文件槽位 + 用 $EDITOR 打开(对齐 cc /memory MemoryFileSelector)。
 ///   /memory               列出所有记忆文件槽位(User/Project/Local CLAUDE.md + 自动记忆目录)
 ///   /memory edit <slot>   用 $VISUAL/$EDITOR 打开指定槽位(user|project|local|auto);不存在则创建
-/// 旧的 `/memory add <text>` 写 ~/.cc-zig/memory.md 已废弃——那条链从不注入模型(死记忆),
+/// 旧的 `/memory add <text>` 写 ~/.metacodes/memory.md 已废弃——那条链从不注入模型(死记忆),
 /// 现对齐 cc:记忆 = CLAUDE.md 链(人写)+ memdir 自动记忆(模型写),都已真正喂给模型。
 fn handleMemory(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
     const home = app.homeDir();
