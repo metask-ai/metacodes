@@ -28,7 +28,7 @@ const ui_event = @import("protocol/ui_event.zig");
 const UiBackend = ui_backend.UiBackend;
 const CoreEvent = ui_event.CoreEvent;
 
-pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error, tool_loop, suspended, backgrounded };
+pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error, tool_loop, suspended, backgrounded, budget };
 
 /// 工具进度 trampoline:把工具的 progress 回调(WebSearch query/results)转成 CoreEvent,
 /// 经 backend 路由到归属 session 的 UI。per-run 实例(backend + session),progress_state 指它。
@@ -163,6 +163,9 @@ pub const Options = struct {
     /// auto-compact 压缩续接(codex 同构),防跑飞靠 MAX_SAME_TOOL_ERROR(错误型)+
     /// MAX_ZERO_GAIN_REPEAT(零增益重复,主防线)。故此值只当"真失控兜底",设高。
     max_turns: u32 = 400,
+    /// **成本次闸**(度量真实"烧钱"维度,与轮数正交)。本 run 累计成本(USD)达此值 → 停
+    /// (.budget),交互层询问用户是否继续(不自动续)。null = 不设预算(默认)。
+    cost_budget_usd: ?f64 = null,
     /// 本次 run 归属的会话(emit/poll 路由用)。默认 .single(N=1/TUI);M6 多 Session 时
     /// 由 SessionContext 传各自的 id。所有 backend.emitEvent 用它路由到对应 UI 视图。
     session: @import("session_id.zig").SessionId = @import("session_id.zig").SessionId.single,
@@ -423,6 +426,9 @@ pub fn run(
     // 零增益重复熔断(主防线),持有整个 run。
     var zero_gain = ZeroGainTracker.init(allocator);
     defer zero_gain.deinit();
+    // 成本次闸:累计本 run 成本(USD),达 opts.cost_budget_usd → 停(.budget)。
+    const cost_rates = @import("../util/pricing.zig").rateFor(provider.model());
+    var run_cost_usd: f64 = 0;
 
     // Prompt cache 击穿检测(批3):跨 turn 跟踪 cache_read 跌幅 + system/tools 指纹。
     var cache_detector = @import("cache_break.zig").CacheBreakDetector{};
@@ -434,6 +440,13 @@ pub fn run(
             log.warn("agent", "aborted before turn {d}", .{turns + 1});
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .aborted, .turns = turns, .tool_calls = total_tool_calls });
         };
+        // 成本次闸:本 run 累计成本达预算 → 停,交互层询问是否继续(不自动续)。
+        if (opts.cost_budget_usd) |budget| {
+            if (run_cost_usd >= budget) {
+                log.warn("agent", "cost budget reached: ${d:.4} >= ${d:.4}", .{ run_cost_usd, budget });
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .budget, .turns = turns, .tool_calls = total_tool_calls });
+            }
+        }
 
         // 转后台请求(Ctrl+B):turn 边界检查——此刻 conversation 干净(上轮 tool_result 已 append),
         // 返回 .backgrounded 让调用方深拷贝转后台续跑。**只在 turn 开头查**(run 是同步循环,无中途
@@ -678,6 +691,8 @@ pub fn run(
                         // L1:usage 走 CoreEvent 总线(顶层 TuiBackend 累加进 app.usage;
                         // JobEntry 后端累加进 .tokens 供进度树)——取代旧 opts.usage_sink 私有回调。
                         backend.emitEvent(sess, .{ .usage = u });
+                        // 成本次闸累计(本 run):按模型单价把本响应 usage 折算成本。
+                        run_cost_usd += @import("../util/pricing.zig").computeCost(cost_rates, u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens);
                         // usage 锚点:服务端实计 prompt tokens(in+cache_r+cache_w)。
                         // auto-compact 估算以此为基准,只对之后新 append 的消息做本地估算
                         // (估算器 vs 各家 tokenizer 偏差不再随会话放大;glm-5.2 262K 窗口

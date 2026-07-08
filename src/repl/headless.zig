@@ -153,6 +153,7 @@ pub fn buildResultLine(
         .tool_loop => "tool_loop",
         .suspended => "suspended",
         .backgrounded => "backgrounded", // headless 不会转后台,但 switch 须穷尽
+        .budget => "budget",
     };
     const cost = usage.costUsd(model);
 
@@ -170,7 +171,7 @@ pub fn buildResultLine(
 /// 其它(error/loop/aborted)→ 1。
 pub fn exitCodeFor(stop_reason: agent_loop.StopReason) u8 {
     return switch (stop_reason) {
-        .end_turn, .max_turns => 0,
+        .end_turn, .max_turns, .budget => 0, // budget/max_turns=受控停(非失败),同 end_turn
         .suspended => 2, // 挂起待恢复:区别于完成(0)与失败(1)
         else => 1,
     };

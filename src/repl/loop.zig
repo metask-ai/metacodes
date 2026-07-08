@@ -582,7 +582,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             app.provider(),
             app.tool_defs,
             &app.permission_ctx,
-            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = scoped_recall, .max_turns = maxTurnsFromEnv(), .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .model_switch_compact = app.pendingModelSwitchCompact(), .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
+            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = scoped_recall, .max_turns = maxTurnsFromEnv(), .cost_budget_usd = costBudgetFromEnv(), .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .model_switch_compact = app.pendingModelSwitchCompact(), .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
             effective_be,
             allocator,
         ) catch |err| {
@@ -637,6 +637,18 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // 打转熔断(零增益重复 / 连续同错):明确告知,非静默。
         if (result.stop_reason == .tool_loop) {
             std.debug.print("\x1b[33m检测到重复无效动作(同操作反复无信息增益,或连续同错),已中止本轮以防打转。\n调整方向后输入下一步可继续。\x1b[0m\n", .{});
+        }
+        // 模型 API 撞墙(重试耗尽 / 后端错误 / context 超限):明确告知,非静默。
+        if (result.stop_reason == .api_error) {
+            std.debug.print("\x1b[31m模型 API 请求失败(重试耗尽 / 后端错误 / 上下文超限),本轮中止。\n可直接重试,或换模型 / 精简上下文后继续。\x1b[0m\n", .{});
+        }
+        // 工具不可恢复错误撞墙:明确告知,非静默。
+        if (result.stop_reason == .tool_error) {
+            std.debug.print("\x1b[31m工具执行遇到不可恢复的错误,本轮中止。\n查看上方错误现场,调整后输入下一步可继续。\x1b[0m\n", .{});
+        }
+        // 成本预算撞墙(次闸):明确告知累计成本,非静默,不自动续——由用户决定是否继续烧钱。
+        if (result.stop_reason == .budget) {
+            std.debug.print("\x1b[33m已达成本预算上限(本会话累计 ${d:.4})。本轮中止——由你决定是否继续。\n直接输入\"继续\"可续接,或调高 METACODES_COST_BUDGET / 调整方向。\x1b[0m\n", .{app.usage.costUsd(app.config.model)});
         }
 
         // Ctrl+B 转后台:turn 边界返回 .backgrounded。深拷贝当前对话 → spawnBackground 续跑 →
@@ -2117,6 +2129,13 @@ fn maxTurnsFromEnv() u32 {
         return std.fmt.parseInt(u32, std.mem.span(v), 10) catch 400;
     }
     return 400;
+}
+
+/// 成本次闸预算(USD)可配(METACODES_COST_BUDGET;默认 null=不设)。非法/≤0 → null。
+fn costBudgetFromEnv() ?f64 {
+    const v = std.c.getenv("METACODES_COST_BUDGET") orelse return null;
+    const b = std.fmt.parseFloat(f64, std.mem.span(v)) catch return null;
+    return if (b > 0) b else null;
 }
 
 /// 统计对话里工具调用分类("31×Read · 13×Bash · 5×Grep"),撞 backstop 时展示,
