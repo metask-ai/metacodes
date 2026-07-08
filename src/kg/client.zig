@@ -613,7 +613,9 @@ pub const KgClient = struct {
         if (!self.ready) return 0;
         const out = self.runChecked(&.{ "stats", self.store_path }) catch return 0;
         defer self.freeOut(out);
-        const n = extractInfoField(out.stdout, "nodes") orelse return 0;
+        // **bug 修复**:stats 输出是**空格分隔单行** `nodes=3 edges=0`,不能用按行的 extractInfoField
+        // (它会返回 "3 edges=0" → parseInt 失败 → 恒 0 → "共 N 条持久记忆"注入锚永不出现)。
+        const n = extractStatField(out.stdout, "nodes") orelse return 0;
         return std.fmt.parseInt(usize, n, 10) catch 0;
     }
 
@@ -887,6 +889,18 @@ pub fn extractInfoField(stdout: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// 从**空格分隔**输出(如 stats `nodes=3 edges=0`)按 whitespace 切 token 提取 `key=值`。
+/// 区别于 extractInfoField(按**行**,用于 store-info 每行一字段);两种输出格式不同,不可混用。
+pub fn extractStatField(stdout: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.tokenizeAny(u8, stdout, " \t\r\n");
+    while (it.next()) |tok| {
+        if (tok.len > key.len + 1 and std.mem.startsWith(u8, tok, key) and tok[key.len] == '=') {
+            return tok[key.len + 1 ..];
+        }
+    }
+    return null;
+}
+
 fn jsonStr(v: ?std.json.Value) ?[]const u8 {
     const val = v orelse return null;
     return switch (val) {
@@ -1000,6 +1014,15 @@ test "unescapeTsv 容错:未知转义保留,尾部悬挂反斜杠保留" {
     const out = try unescapeTsv(a, "x\\qy\\");
     defer a.free(out);
     try testing.expectEqualStrings("x\\qy\\", out);
+}
+
+test "extractStatField 解析空格分隔 stats 行(memoryCount DoD,回归防注入死)" {
+    // stats 真实输出:空格分隔单行。旧 bug:memoryCount 用按行的 extractInfoField 返 "3 edges=0"
+    // → parseInt 失败 → 恒 0 → "共 N 条持久记忆"注入锚永不出现(启动注入静默半死)。
+    try testing.expectEqualStrings("3", extractStatField("nodes=3 edges=0", "nodes").?);
+    try testing.expectEqualStrings("0", extractStatField("nodes=3 edges=0", "edges").?);
+    try testing.expect(extractStatField("nodes=3 edges=0", "missing") == null);
+    try testing.expectEqual(@as(usize, 3), std.fmt.parseInt(usize, extractStatField("nodes=3 edges=0", "nodes").?, 10) catch 0);
 }
 
 test "extractInfoField 提取 store-info 键值" {
