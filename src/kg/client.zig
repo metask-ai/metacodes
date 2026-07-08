@@ -595,11 +595,68 @@ pub const KgClient = struct {
     /// 最近记忆列表(/kg mem:用户可检视性,设计 §7)。用空查询近似"全部",
     /// 客户端过滤同 recall(domain + 排除任务面)。返回 owned hits。
     pub fn listRecentMemories(self: *KgClient, limit: usize) KgError![]RecallHit {
-        // BM25 无"列全部"——用高频虚词兜底召回;更完整的列举 P2 走 tinyql query。
-        return self.recall("the a 的 是 用", limit, false) catch |e| switch (e) {
-            KgError.Data => &.{}, // 空 store 等 → 空列表,不算错误
-            else => e,
+        // 枚举不走全文检索:用 tinykg list-recent 按 id 降序(=创建序)原生枚举,
+        // 替换旧的虚词 search hack(受召回门槛/排序污染,实测仅列出部分且非最近)。
+        // 作用域对齐 recall:当前项目 domain + global,合并后按 id 降序取 limit。
+        var results: std.ArrayList(RecallHit) = .empty;
+        errdefer {
+            for (results.items) |*h| h.deinit(self.allocator);
+            results.deinit(self.allocator);
+        }
+        try self.appendRecentForDomain(&results, self.domain, limit);
+        if (!std.mem.eql(u8, self.domain, "global")) {
+            try self.appendRecentForDomain(&results, "global", limit);
+        }
+        std.mem.sort(RecallHit, results.items, {}, recallHitIdDescLessThan);
+        if (results.items.len > limit) {
+            for (results.items[limit..]) |*h| h.deinit(self.allocator);
+            results.shrinkRetainingCapacity(limit);
+        }
+        return results.toOwnedSlice(self.allocator) catch KgError.OutOfMemory;
+    }
+
+    fn recallHitIdDescLessThan(_: void, a: RecallHit, b: RecallHit) bool {
+        return a.node_id > b.node_id; // id 降序 = 最近在前
+    }
+
+    /// 把某 domain 的最近节点(list-recent TSV:id\tkind\ttext)解析成 owned RecallHit 追加到 results。
+    /// 任务面隔离(task/verification)对齐 recall(include_tasks=false)。空 domain/空 store 静默跳过。
+    fn appendRecentForDomain(self: *KgClient, results: *std.ArrayList(RecallHit), domain: []const u8, limit: usize) KgError!void {
+        var limbuf: [16]u8 = undefined;
+        const raw = std.fmt.bufPrint(&limbuf, "{d}", .{limit * 2 + 4}) catch unreachable;
+        const out = self.runChecked(&.{ "list-recent", self.store_path, "--domain", domain, "--limit", raw }) catch |e| switch (e) {
+            KgError.Data => return, // 空 store / 无此 domain → 跳过
+            else => return e,
         };
+        defer self.freeOut(out);
+        var it = std.mem.splitScalar(u8, out.stdout, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            var cols = std.mem.splitScalar(u8, line, '\t');
+            const id_str = cols.next() orelse continue;
+            const kind = cols.next() orelse continue;
+            const text_col = cols.rest();
+            const node_id = std.fmt.parseInt(u64, id_str, 10) catch continue;
+            if (std.mem.eql(u8, kind, "task") or std.mem.eql(u8, kind, "verification")) continue;
+
+            // L1:先 dupe 三字段到局部 + errdefer,再 append——避免部分成功泄漏(对齐 recall)。
+            const k_owned = self.allocator.dupe(u8, kind) catch return KgError.OutOfMemory;
+            errdefer self.allocator.free(k_owned);
+            const d_owned = self.allocator.dupe(u8, domain) catch return KgError.OutOfMemory;
+            errdefer self.allocator.free(d_owned);
+            const text_un = unescapeTsv(self.allocator, text_col) catch return KgError.OutOfMemory;
+            defer self.allocator.free(text_un);
+            const t_owned = self.allocator.dupe(u8, truncateBytes(text_un, 800)) catch return KgError.OutOfMemory;
+            errdefer self.allocator.free(t_owned);
+
+            results.append(self.allocator, .{
+                .node_id = node_id,
+                .kind = k_owned,
+                .domain = d_owned,
+                .text = t_owned,
+                .score = 0,
+            }) catch return KgError.OutOfMemory;
+        }
     }
 
     /// 节点是否存在且为 task kind(stale kg_root 防御,设计 §3)。

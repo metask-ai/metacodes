@@ -87,6 +87,41 @@ test "L2 KG: ensureReady 建店 + 版本门通过 + remember/recall 往返" {
     try std.testing.expect(std.mem.indexOf(u8, hits[0].text, "depends_on") != null);
 }
 
+test "L2 KG: listRecentMemories 按 id 降序枚举最近(替虚词 hack)" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/kgrecent.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-recent");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest; // 版本 skew 等环境问题不算失败
+
+    const id1 = try kg.remember(.decision, "第一条决策 alpha", "decision", false);
+    const id2 = try kg.remember(.decision, "第二条决策 beta", "decision", false);
+    const id3 = try kg.remember(.decision, "第三条决策 gamma", "decision", false);
+    try std.testing.expect(id3 > id2 and id2 > id1);
+
+    // list-recent 按 id 降序枚举:三条全在,最近(id3)在最前——旧虚词 search hack 做不到(受召回门槛污染)。
+    const hits = try kg.listRecentMemories(10);
+    defer {
+        for (hits) |*h| h.deinit(a);
+        a.free(hits);
+    }
+    try std.testing.expect(hits.len >= 3);
+    try std.testing.expectEqual(id3, hits[0].node_id);
+    try std.testing.expectEqual(id2, hits[1].node_id);
+    try std.testing.expectEqual(id1, hits[2].node_id);
+    try std.testing.expect(std.mem.indexOf(u8, hits[0].text, "gamma") != null);
+}
+
 test "L2 KG: recall 客户端 domain 隔离(别项目记忆不串味)" {
     const a = std.testing.allocator;
     const bin = findBin(a) orelse return error.SkipZigTest;
