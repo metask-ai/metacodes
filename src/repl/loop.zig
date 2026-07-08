@@ -574,12 +574,15 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         const usage_before = app.usage;
         const mode_before = app.permission_ctx.modeValue();
         const started_ns = util_time.nowNs();
+        // scoped 自动召回(一等公民 P1):按用户请求自动装配相关记忆到尾部(cache-safe,有命中才注入)。
+        const scoped_recall = if (app.kg) |*k| scoped_recall_mod.build(allocator, k, &app.conversation, &app.abort) else null;
+        defer if (scoped_recall) |s| allocator.free(s);
         const result = agent_loop.run(
             &app.conversation,
             app.provider(),
             app.tool_defs,
             &app.permission_ctx,
-            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .model_switch_compact = app.pendingModelSwitchCompact(), .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
+            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = scoped_recall, .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .model_switch_compact = app.pendingModelSwitchCompact(), .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
             effective_be,
             allocator,
         ) catch |err| {
@@ -2093,6 +2096,8 @@ fn firstLine(text: []const u8) []const u8 {
     while (n > 0 and (text[n - 1] & 0xC0) == 0x80) n -= 1; // 不切半个 CJK 字
     return text[0..n];
 }
+
+const scoped_recall_mod = @import("../kg/scoped_recall.zig");
 
 /// 渲染计划 markdown + 叠加进度标记(✓完成 / ○ready / ⊘阻塞)。
 /// 步骤行(列表项 `- ` / `* ` / `N. `)按文本匹配 open frontier:命中→○/⊘,未命中→✓ 完成。

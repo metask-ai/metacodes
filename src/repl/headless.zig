@@ -34,6 +34,9 @@ pub fn run(
     var wb = writer_backend.WriterBackend.initNullWithUsage(&app.usage);
     const be = wb.backend();
     const jobs_ptr = if (app.jobs) |*j| j else null;
+    // scoped 自动召回(一等公民 P1):headless 单次 prompt 也按请求装配相关记忆(cache-safe 尾注入)。
+    const scoped_recall = if (app.kg) |*k| @import("../kg/scoped_recall.zig").build(allocator, k, &app.conversation, &app.abort) else null;
+    defer if (scoped_recall) |s| allocator.free(s);
     const result = agent_loop.run(
         &app.conversation,
         app.provider(),
@@ -52,6 +55,7 @@ pub fn run(
             .tool_defs = app.tool_defs,
             .system_prompt = app.system_prompt,
             .inject_user_context = app.user_context,
+            .synthetic_user_input = scoped_recall,
             .dyn_registry = &app.dyn_registry,
             .host_services = app.hostServices(),
             .project_dir = app.project_dir_or_empty(),
