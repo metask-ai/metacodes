@@ -1,34 +1,47 @@
-//! scoped 自动召回(一等公民 P1):按用户末条消息自动 KgRecall top-3,格式化成尾部注入块,
-//! 让相关记忆**自动出现在上下文**——recall 从"模型主动调"升级为"harness 按请求装配"。
+//! scoped 自动召回(一等公民 P1):按用户末条消息自动 KgRecall,**相关性筛选**后把记忆装配进
+//! 上下文尾部——recall 从"模型主动调"升级为"harness 按请求装配"。
 //!
-//! 设计针对旧 proactive 否决:
-//! ① **cache-safe**——调用方走 agent_loop 的 synthetic_user_input(**首轮尾注入**,在 stable
-//!    prefix(system + user_context)之后),不使缓存前缀失效。
-//! ② **有命中才注入**(无命中 = 返 null = 零输出,不制造噪声)。
-//! ③ 琐碎消息(<12B)跳过(成本 + 噪声门)。
-//! ④ 标注"自动召回,可能不全",模型仍可 KgRecall 深挖(可加 type= 过滤)。
+//! 设计针对旧 proactive 三大否决(Linus + PM 双 review 收口):
+//! ① **cache-safe**——调用方走 agent_loop 的 synthetic_user_input(**首轮尾注入**,只在 turns==0
+//!    请求期拼进 api_messages、**从不写回 conversation**),在 stable prefix 之后,不破缓存前缀(已核实)。
+//! ② **相关性门(PM P0)**——读 BM25 score:绝对地板(top<floor→答案缺席→注入 0 条)+ 相对衰减
+//!    (只留 ≥top×REL 的),**动态 0-3 条**。"有命中"≠"有相关",硬凑 top-3 是旧否决原话。
+//! ③ **成本(Linus/PM P0)**——recall 走 search --include-text 一次 spawn 拿全,不再每 hit get;
+//!    query 上界截断,避免粘贴长文变巨型 BM25 query。
+//! ④ **可控 + 可观测**——METACODES_NO_AUTO_RECALL 开关(解耦 KG);每次注入打仪器(条数/top 分)。
+//! ⑤ 标注"可能不全",模型仍可 KgRecall 深挖(不主动 nudge 重复召回)。
 //!
-//! 不依赖 App(取 conversation/kg/abort 三件套)→ 交互(loop.zig)与 headless(headless.zig)共用,无循环 import。
+//! 不依赖 App(取 conversation/kg/abort 三件套)→ 交互 + headless 两路共用,无循环 import。
 
 const std = @import("std");
 const client_mod = @import("client.zig");
 const conv_mod = @import("../core/conversation.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
+const log = @import("../util/log.zig");
 
-const MIN_QUERY_LEN = 12; // 琐碎消息门
+const MIN_QUERY_LEN = 16; // 琐碎接话轮门(下界)
+const MAX_QUERY_LEN = 400; // BM25 query 上界(避免粘贴长文变噪声 query)
 const TOP_K = 3;
+const REL_RATIO: f64 = 0.5; // 相对门:只留 ≥ top×0.5 的命中
+// 绝对地板(BM25;启发式,可 METACODES_RECALL_FLOOR 校准)。实测数据定初值:相关 query top≈7,
+// 无关 query top≈2.7 → 3.0 分界(auto-inject 精度优先,宁漏勿噪——PM:注入无关记忆=负价值)。
+// BM25 分跨 query 不可比,固定地板固有不精确;仪器日志(injected/top_score)供持续校准。
+const DEFAULT_ABS_FLOOR: f64 = 3.0;
 
-/// best-effort:kg 未就绪 / 无末条 user 文本 / 消息琐碎 / 无命中 / 失败 → null(不注入,绝不阻塞 turn)。
-/// owned 返回,调用方 free。
+/// 相关性门 + 动态条数。best-effort:kg 未就绪 / 关闭 / 无末条 user 文本 / 消息琐碎 / 无相关命中
+/// → null(不注入)。返回 error 仅内部分配失败(调用方 `catch null` 兜底,等价不注入)。owned。
 pub fn build(
     allocator: std.mem.Allocator,
     kg: *client_mod.KgClient,
     conversation: *const conv_mod.Conversation,
     abort: *const AbortSignal,
-) ?[]u8 {
+) !?[]u8 {
+    if (disabled()) return null; // escape hatch(解耦 KG)
     if (!kg.ready) return null;
-    const query = lastUserText(conversation) orelse return null;
-    if (query.len < MIN_QUERY_LEN) return null;
+    const raw = lastUserText(conversation) orelse return null;
+    if (raw.len < MIN_QUERY_LEN) return null; // 琐碎轮不召回
+    const query = raw[0..@min(raw.len, MAX_QUERY_LEN)]; // 上界截断
+
     kg.setAbort(abort); // ESC 可中断
     const hits = kg.recall(query, TOP_K, false) catch return null;
     defer {
@@ -37,20 +50,52 @@ pub fn build(
     }
     if (hits.len == 0) return null;
 
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    out.appendSlice(allocator, "<system-reminder>\n# 相关持久记忆(按你的请求自动召回,可能不全)\n") catch return null;
+    // 相关性门:top 分做绝对地板(答案缺席→0 条)+ 相对衰减(留 ≥top×REL)。
+    var top: f64 = 0;
     for (hits) |h| {
-        const type_str = if (h.schema_type.len > 0) h.schema_type else h.kind;
-        const line = std.fmt.allocPrint(allocator, "- [{s}] {s}\n", .{ type_str, firstLine(h.text) }) catch return null;
-        defer allocator.free(line);
-        out.appendSlice(allocator, line) catch return null;
+        if (h.score > top) top = h.score;
     }
-    out.appendSlice(allocator, "需要更多或更深的记忆,用 KgRecall(可加 type= 过滤)。\n</system-reminder>") catch return null;
-    return out.toOwnedSlice(allocator) catch null;
+    const floor = absFloor();
+    if (top < floor) {
+        log.info("kg", "scoped_recall injected=0 top_score={d:.2} (below floor {d:.2})", .{ top, floor });
+        return null; // 最相关的都弱 → 判为答案缺席,不注入噪声
+    }
+    const keep_min = top * REL_RATIO;
+
+    var out: std.ArrayList(u8) = .empty;
+    var injected: usize = 0;
+    // 无 errdefer(本函数返回 !?[]u8;分配失败走 error 路径,显式 deinit 防泄漏——Linus 抓的死 errdefer)。
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "<system-reminder>\n# 相关持久记忆(按你的请求自动召回,可能不全)\n");
+    for (hits) |h| {
+        if (h.score < keep_min) continue; // 相对门:丢明显弱于最佳的
+        const type_str = if (h.schema_type.len > 0) h.schema_type else h.kind;
+        const line = try std.fmt.allocPrint(allocator, "- [{s}] {s}\n", .{ type_str, firstLine(h.text) });
+        defer allocator.free(line);
+        try out.appendSlice(allocator, line);
+        injected += 1;
+    }
+    try out.appendSlice(allocator, "</system-reminder>");
+
+    log.info("kg", "scoped_recall injected={d} top_score={d:.2} query_len={d}", .{ injected, top, query.len });
+    return try out.toOwnedSlice(allocator);
 }
 
-/// 末条 user 消息的首个 text block。
+fn disabled() bool {
+    return std.c.getenv("METACODES_NO_AUTO_RECALL") != null;
+}
+
+fn absFloor() f64 {
+    if (std.c.getenv("METACODES_RECALL_FLOOR")) |v| {
+        const s = std.mem.span(v);
+        return std.fmt.parseFloat(f64, s) catch DEFAULT_ABS_FLOOR;
+    }
+    return DEFAULT_ABS_FLOOR;
+}
+
+/// 末条 user 消息的首个 text block。倒扫跳过纯 tool_result 的 user 消息(无 .text block)。
+/// **刻意近似**:多 block 消息(图片/@引用把文件内容作为独立 text block)可能取到非问题文本;
+/// 召回质量的可接受降级,非 correctness bug。
 fn lastUserText(conversation: *const conv_mod.Conversation) ?[]const u8 {
     const msgs = conversation.messages.items;
     var i = msgs.len;
@@ -80,7 +125,6 @@ test "build:kg 未就绪 → null(不阻塞)" {
     defer conv.deinit();
     var kg = try client_mod.KgClient.init(a, .{ .home = "/tmp", .domain = "d", .env_bin = "", .env_store = "" });
     defer kg.deinit();
-    // 未 ensureReady → not ready → null。
-    var ab = AbortSignal{};
-    try std.testing.expect(build(a, &kg, &conv, &ab) == null);
+    var ab = AbortSignal.init();
+    try std.testing.expect((try build(a, &kg, &conv, &ab)) == null);
 }

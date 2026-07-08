@@ -122,6 +122,48 @@ test "L2 KG: listRecentMemories 按 id 降序枚举最近(替虚词 hack)" {
     try std.testing.expect(std.mem.indexOf(u8, hits[0].text, "gamma") != null);
 }
 
+test "L2 KG: scoped 自动召回 — 相关请求注入、无关请求不注入(相关性门,L0 双侧)" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/kgscoped.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-scoped");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    _ = try kg.remember(.observation, "src/kg/client.zig 用子进程驱动 tinykg 集成,进程隔离崩溃", "module", false);
+
+    var ab = cc.abort.AbortSignal.init();
+
+    // 正向:相关请求 → 注入且含记忆关键词。
+    {
+        var conv = cc.conversation.Conversation.init(a);
+        defer conv.deinit();
+        try conv.appendText(.user, "client.zig 是怎么和 tinykg 集成的?子进程还是嵌入库集成方式?");
+        const inj = try cc.kg_scoped_recall.build(a, &kg, &conv, &ab);
+        defer if (inj) |s| a.free(s);
+        try std.testing.expect(inj != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "子进程") != null);
+    }
+    // 负向:零重合无关请求 → 不注入(相关性门挡答案缺席噪声;PM P0 逼可证伪的两侧测试)。
+    {
+        var conv = cc.conversation.Conversation.init(a);
+        defer conv.deinit();
+        try conv.appendText(.user, "今天天气怎么样适合出去散步吗周末有什么安排");
+        const inj = try cc.kg_scoped_recall.build(a, &kg, &conv, &ab);
+        defer if (inj) |s| a.free(s);
+        try std.testing.expect(inj == null);
+    }
+}
+
 test "L2 KG: typed recall — module/bug/decision 按 schema_type 过滤(本体最小切片)" {
     const a = std.testing.allocator;
     const bin = findBin(a) orelse return error.SkipZigTest;

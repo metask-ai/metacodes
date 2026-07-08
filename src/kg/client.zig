@@ -463,7 +463,8 @@ pub const KgClient = struct {
         const oversample: usize = if (type_filter != null) limit * 8 + 8 else limit * 2 + 4;
         const raw_limit = std.fmt.bufPrint(&limbuf, "{d}", .{oversample}) catch unreachable;
         const out = try self.runChecked(&.{
-            "search", self.store_path, query, "--limit", raw_limit, "--profile", "agent-memory", "--format", "json",
+            "search",           self.store_path, query, "--limit", raw_limit, "--profile", "agent-memory",
+            "--format",         "json",          "--include-text", // node 带全文 → 省每 hit get spawn(成本修复)
         });
         defer self.freeOut(out);
 
@@ -519,11 +520,10 @@ pub const KgClient = struct {
                 .integer => |i| @floatFromInt(i),
                 else => 0,
             };
-            // 文本:search JSON 的 node **不含全文**(实证:只有 has_text 标志 + context_size),
-            // 全文经 `get <id>` 取(TSV:id\tkind\ttext)。对返回的每条 hit 补一次 get。
-            // 代价:每 hit 一次 spawn(recall 低频、limit≤8,可接受;P2 若上游给 search --include-text 可省)。
-            const text = self.fetchNodeText(node_id) catch "";
-            defer if (text.len > 0) self.allocator.free(text);
+            // 文本:search --include-text 让 node 直接带全文 → 无需每 hit get spawn(成本修复,
+            // Linus/PM P0:自动召回每 turn 都跑,旧的 per-hit get 4 spawn 前提已不成立)。
+            // text 借用 parsed JSON(存活到函数尾),下面 dupe 成 owned。
+            const text = jsonStr(node.get("text")) orelse "";
 
             // L1:先 dupe 三字段到局部 + errdefer,再 append——避免"kind 成功、domain 失败"泄漏。
             const k_owned = self.allocator.dupe(u8, kind) catch return KgError.OutOfMemory;
