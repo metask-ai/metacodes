@@ -54,7 +54,11 @@ pub fn buildSummary(
     projects_dir: []const u8,
 ) ?[]u8 {
     if (!kg.ready) return null;
-    const mem_count = kg.memoryCount();
+    // 类型 facet(domain 准确 + 按 schema_type 分布);替代旧 memoryCount(全库节点计数,含别项目+任务)。
+    const facet = kg.memoryFacet(allocator);
+    defer if (facet) |f| f.deinit(allocator);
+    const mem_count: usize = if (facet) |f| f.total else 0;
+    const breakdown: []const u8 = if (facet) |f| f.breakdown else "";
 
     // plan frontier(可选)。
     var rows: []client_mod.FrontierRow = &.{};
@@ -75,11 +79,11 @@ pub fn buildSummary(
 
     // 全空(无记忆 + 无 frontier)→ 空态零输出。
     if (mem_count == 0 and rows.len == 0) return null;
-    return renderSummary(allocator, root_id, rows, mem_count) catch null;
+    return renderSummary(allocator, root_id, rows, mem_count, breakdown) catch null;
 }
 
-/// 纯渲染(可单测):记忆数锚 + frontier rows → 注入段文本。
-pub fn renderSummary(allocator: std.mem.Allocator, root_id: u64, rows: []const client_mod.FrontierRow, mem_count: usize) ![]u8 {
+/// 纯渲染(可单测):记忆数锚(带类型 breakdown)+ frontier rows → 注入段文本。
+pub fn renderSummary(allocator: std.mem.Allocator, root_id: u64, rows: []const client_mod.FrontierRow, mem_count: usize, breakdown: []const u8) ![]u8 {
     var ready_count: usize = 0;
     var blocked_count: usize = 0;
     for (rows) |r| {
@@ -89,9 +93,13 @@ pub fn renderSummary(allocator: std.mem.Allocator, root_id: u64, rows: []const c
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "# Knowledge Graph\n");
-    // ① 记忆数锚(采用率:让模型知道"图里有货",recall 前先查——PM#3)。
+    // ① 记忆数锚 + 类型 facet(采用率:让模型知道"图里有货且有类型",recall 前先查、可按 type 过滤)。
     if (mem_count > 0) {
-        try appendPrint(&out, allocator, "本项目/全局共 {d} 条持久记忆——处理涉及既往决策/约定的任务前,先 KgRecall。\n", .{mem_count});
+        if (breakdown.len > 0) {
+            try appendPrint(&out, allocator, "本项目/全局共 {d} 条持久记忆({s})——处理涉及既往决策/约定的任务前,先 KgRecall(可加 type=<decision|module|bug|…> 过滤)。\n", .{ mem_count, breakdown });
+        } else {
+            try appendPrint(&out, allocator, "本项目/全局共 {d} 条持久记忆——处理涉及既往决策/约定的任务前,先 KgRecall。\n", .{mem_count});
+        }
     }
     // ② plan frontier(有活跃图时)。
     if (rows.len > 0) {
@@ -141,10 +149,12 @@ test "renderSummary 空态外的完整渲染:计数/ready 前3/快照声明" {
         .{ .task_id = 14, .readiness = .ready, .text = @constCast("步骤四") },
         .{ .task_id = 15, .readiness = .ready, .text = @constCast("步骤五") },
     };
-    const s = try renderSummary(a, 1, &rows, 5);
+    const s = try renderSummary(a, 1, &rows, 5, "3 decision · 2 module");
     defer a.free(s);
     try testing.expect(std.mem.indexOf(u8, s, "root 1") != null);
     try testing.expect(std.mem.indexOf(u8, s, "5 条持久记忆") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "3 decision · 2 module") != null); // 类型 breakdown 注入
+    try testing.expect(std.mem.indexOf(u8, s, "type=") != null); // 引导 typed recall
     try testing.expect(std.mem.indexOf(u8, s, "4 ready / 1 blocked(共 5)") != null);
     try testing.expect(std.mem.indexOf(u8, s, "[11] 步骤一:读代码") != null);
     try testing.expect(std.mem.indexOf(u8, s, "第二行不显示") == null); // 只取首行

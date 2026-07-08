@@ -619,6 +619,70 @@ pub const KgClient = struct {
         return std.fmt.parseInt(usize, n, 10) catch 0;
     }
 
+    pub const MemoryFacet = struct {
+        total: usize,
+        breakdown: []u8, // owned,如 "5 decision · 3 module · 2 bug"(空=无 typed 记忆)
+        pub fn deinit(self: *const MemoryFacet, allocator: std.mem.Allocator) void {
+            allocator.free(self.breakdown);
+        }
+    };
+
+    /// 记忆类型 facet:统计**当前 domain + global**的记忆按 schema_type 分布(排除任务面)。
+    /// 供启动注入把 typed 知识做成一等公民可见("本项目 N 条:X decision · Y module · Z bug")。
+    /// **domain 准确**——修 memoryCount 的"全库节点计数"seam(那个含别项目 + 任务节点)。
+    /// best-effort:失败/无记忆 → null。scan 上限 200/domain(agent 语料够;超出低估,facet 是信号非精确)。
+    pub fn memoryFacet(self: *KgClient, allocator: std.mem.Allocator) ?MemoryFacet {
+        if (!self.ready) return null;
+        const display = [_][]const u8{ "decision", "module", "bug", "user_preference", "observation" };
+        var counts = [_]usize{0} ** display.len;
+        var other: usize = 0;
+
+        self.facetScan(self.domain, display[0..], counts[0..], &other);
+        if (!std.mem.eql(u8, self.domain, "global")) self.facetScan("global", display[0..], counts[0..], &other);
+
+        var total: usize = other;
+        for (counts) |c| total += c;
+        if (total == 0) return null;
+
+        var b: std.ArrayList(u8) = .empty;
+        errdefer b.deinit(allocator);
+        var first = true;
+        for (display, 0..) |name, i| {
+            if (counts[i] == 0) continue;
+            if (!first) b.appendSlice(allocator, " · ") catch return null;
+            first = false;
+            const seg = std.fmt.allocPrint(allocator, "{d} {s}", .{ counts[i], name }) catch return null;
+            defer allocator.free(seg);
+            b.appendSlice(allocator, seg) catch return null;
+        }
+        const breakdown = b.toOwnedSlice(allocator) catch return null;
+        return .{ .total = total, .breakdown = breakdown };
+    }
+
+    /// 扫一个 domain 的 list-recent --with-type,按 schema_type 累加计数(排除 task/verification)。
+    fn facetScan(self: *KgClient, domain: []const u8, display: []const []const u8, counts: []usize, other: *usize) void {
+        const out = self.runChecked(&.{ "list-recent", self.store_path, "--domain", domain, "--with-type", "--limit", "200" }) catch return;
+        defer self.freeOut(out);
+        var it = std.mem.splitScalar(u8, out.stdout, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            var cols = std.mem.splitScalar(u8, line, '\t');
+            _ = cols.next() orelse continue; // id
+            const kind = cols.next() orelse continue;
+            const st = cols.next() orelse continue; // schema_type(--with-type 第 3 列)
+            if (std.mem.eql(u8, kind, "task") or std.mem.eql(u8, kind, "verification")) continue;
+            var matched = false;
+            for (display, 0..) |name, i| {
+                if (std.mem.eql(u8, st, name)) {
+                    counts[i] += 1;
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) other.* += 1;
+        }
+    }
+
     /// 删节点(/kg forget:用户删除权,投毒自救,设计 §7)。data 错(NotFound)透传。
     pub fn forget(self: *KgClient, node_id: u64) KgError!void {
         var idbuf: [24]u8 = undefined;
