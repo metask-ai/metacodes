@@ -146,13 +146,13 @@ pub const App = struct {
     /// init 时算一次,挂到 permission_ctx.plan_file_path(plan 模式特许写)+ ToolContext。
     /// 空串 = home 缺失,plan 文件机制降级(模型把计划写对话文本)。
     plan_file_path: []u8 = &.{},
-    /// 本 session 的 memdir 绝对路径(通道 B 自动记忆;`{home}/.cc-zig/projects/<hash>/memory`,
+    /// 本 session 的 memdir 绝对路径(通道 B 自动记忆;`{home}/.metacodes/projects/<hash>/memory`,
     /// owned)。init 时算一次,挂 permission_ctx.memdir_abs(写豁免)。空串=禁用/无 home。
     memdir_abs: []u8 = &.{},
     /// TinyKG 客户端(记忆/计划/DAG;设计 KG_DESIGN v3-final)。null = 未初始化
     /// (缺 home 等);non-null 但 !ready = degraded。工具经 ctx.kg 拿指针。
     kg: ?@import("kg/client.zig").KgClient = null,
-    /// per-project 指针目录 `{home}/.cc-zig/projects/<hash>`(kg_root/kg_inbox 落此)。owned。
+    /// per-project 指针目录 `{home}/.metacodes/projects/<hash>`(kg_root/kg_inbox 落此)。owned。
     kg_projects_dir: []u8 = &.{},
     /// KG 启动注入快照(kg/inject.zig;owned)。空串=空态(不注入)。
     kg_summary: []u8 = &.{},
@@ -717,7 +717,7 @@ pub const App = struct {
         // project_dir = findRepoRoot(沿 cwd 上溯 .git);非 git repo 退 cwd。
         const anchor = app.project_dir orelse cwd;
         const anchor_hash = @import("core/transcript.zig").hashCwd(anchor);
-        app.kg_projects_dir = std.fmt.allocPrint(app.allocator, "{s}/.cc-zig/projects/{s}", .{ home, anchor_hash[0..] }) catch return;
+        app.kg_projects_dir = std.fmt.allocPrint(app.allocator, "{s}/.metacodes/projects/{s}", .{ home, anchor_hash[0..] }) catch return;
         // **必须建目录**(Linus H1):否则从 git 子目录启动时 anchor_hash != cwd_hash,
         // projects/<anchor_hash> 无人 mkdir → plan 落图的 kg_root 指针 writeIdPointer 失败
         // 被 catch{} 吞 → frontier 永不呈现 → 整个 P2 跨会话恢复静默半死。逐级 mkdir。
@@ -770,10 +770,10 @@ pub const App = struct {
         }
     }
 
-    /// 逐级建 `{home}/.cc-zig/projects/<hash>`(Linus H1)。best-effort:失败静默
+    /// 逐级建 `{home}/.metacodes/projects/<hash>`(Linus H1)。best-effort:失败静默
     /// (下游 writeIdPointer 会 log.warn;此处仅尽量把目录建出来)。
     fn mkdirKgProjectsDir(allocator: std.mem.Allocator, home: []const u8, hash: [16]u8) void {
-        const parts = [_][]const u8{ ".cc-zig", ".cc-zig/projects" };
+        const parts = [_][]const u8{ ".metacodes", ".metacodes/projects" };
         for (parts) |p| {
             const dir = std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, p }) catch return;
             defer allocator.free(dir);
@@ -781,7 +781,7 @@ pub const App = struct {
             defer allocator.free(dz);
             _ = std.c.mkdir(dz, 0o700);
         }
-        const full = std.fmt.allocPrint(allocator, "{s}/.cc-zig/projects/{s}", .{ home, hash[0..] }) catch return;
+        const full = std.fmt.allocPrint(allocator, "{s}/.metacodes/projects/{s}", .{ home, hash[0..] }) catch return;
         defer allocator.free(full);
         const fz = allocator.dupeZ(u8, full) catch return;
         defer allocator.free(fz);

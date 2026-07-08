@@ -1,6 +1,6 @@
 //! 模型上下文窗口表(auto-compact 阈值用)。
 //!
-//! 源自 models.dev,精简成 ~/.metacode/models.toml(极简 TOML:`[models]` 段 + `"key" = N`)。
+//! 源自 models.dev,精简成 ~/.metacodes/models.toml(极简 TOML:`[models]` 段 + `"key" = N`)。
 //! 首次运行若文件缺失,把 bundled 默认(model_context_default.toml,@embedFile)写到该路径,
 //! 并直接解析 embedded bytes(避免读盘竞态)。
 //!
@@ -30,7 +30,7 @@ pub const ModelContext = struct {
         self.entries.deinit(self.allocator);
     }
 
-    /// 加载 ~/.metacode/models.toml;缺则写 bundled 默认 + 解析 embedded。
+    /// 加载 ~/.metacodes/models.toml;缺则写 bundled 默认 + 解析 embedded。
     /// best-effort:任何 IO 失败都退回解析 embedded(保证表非空)。用 std.c syscall(裁剪 std 无 std.fs.cwd)。
     pub fn loadOrBundle(self: *ModelContext) void {
         const home_c = std.c.getenv("HOME");
@@ -39,7 +39,7 @@ pub const ModelContext = struct {
             return;
         }
         const home = std.mem.span(home_c.?);
-        const dir = std.fmt.allocPrint(self.allocator, "{s}/.metacode", .{home}) catch {
+        const dir = std.fmt.allocPrint(self.allocator, "{s}/.metacodes", .{home}) catch {
             self.parse(BUNDLED);
             return;
         };
@@ -48,9 +48,9 @@ pub const ModelContext = struct {
             self.parse(BUNDLED);
             return;
         };
-        // 注意:path 用 .metacode/models.toml,上面 allocPrint 漏了子目录,下面重算。
+        // 注意:path 用 .metacodes/models.toml,上面 allocPrint 漏了子目录,下面重算。
         self.allocator.free(path);
-        const full = std.fmt.allocPrint(self.allocator, "{s}/.metacode/models.toml", .{home}) catch {
+        const full = std.fmt.allocPrint(self.allocator, "{s}/.metacodes/models.toml", .{home}) catch {
             self.parse(BUNDLED);
             return;
         };

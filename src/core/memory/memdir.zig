@@ -2,7 +2,7 @@
 //!
 //! 对齐 cc/src/memdir/*。模型用 Write/Read/Grep **自己管理**一个记忆目录(无专用 Memory 工具,
 //! 对齐 cc)。本模块只提供:
-//!   1. 路径解析:memdir = `{home}/.cc-zig/projects/<cwd_hash>/memory/`
+//!   1. 路径解析:memdir = `{home}/.metacodes/projects/<cwd_hash>/memory/`
 //!      (复用 transcript.hashCwd —— 与现有 transcript 布局并列;cc 用 sanitized-git-root,
 //!       zig-cc 沿用项目既有 cwd_hash 标准,见 spec §2.1 divergence)
 //!   2. MEMORY.md 索引:读取 + 截断(≤200 行 / ≤25KB,对齐 cc MAX_ENTRYPOINT_*)
@@ -10,7 +10,7 @@
 //!   4. enable 开关
 //!
 //! 安全(Linus 盯):isAutoMemPath 必须用 realpath 归一化 + 严格前缀(带分隔符边界),
-//! 否则 `~/.cc-zig/projects/<hash>/memory-evil` 或 `..` 穿越能骗过前缀匹配 → 任意写洞。
+//! 否则 `~/.metacodes/projects/<hash>/memory-evil` 或 `..` 穿越能骗过前缀匹配 → 任意写洞。
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -30,12 +30,12 @@ pub fn isEnabled() bool {
     return true;
 }
 
-/// memdir 目录全路径:`{home}/.cc-zig/projects/<cwd_hash>/memory`。写进 buf,返回 slice。
+/// memdir 目录全路径:`{home}/.metacodes/projects/<cwd_hash>/memory`。写进 buf,返回 slice。
 /// home/cwd 任一为空 → 返回空串(memdir 不可用)。
 pub fn memdirPath(home: []const u8, cwd: []const u8, buf: []u8) []const u8 {
     if (home.len == 0 or cwd.len == 0) return "";
     const cwd_hash = transcript.hashCwd(cwd);
-    return std.fmt.bufPrint(buf, "{s}/.cc-zig/projects/{s}/memory", .{ home, cwd_hash[0..] }) catch "";
+    return std.fmt.bufPrint(buf, "{s}/.metacodes/projects/{s}/memory", .{ home, cwd_hash[0..] }) catch "";
 }
 
 /// MEMORY.md 索引文件全路径:`{memdir}/MEMORY.md`。写进 buf,返回 slice。
@@ -240,7 +240,7 @@ const testing = std.testing;
 test "memdirPath: 拼路径 + 空 home/cwd 返空" {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const p = memdirPath("/home/u", "/repo/x", &buf);
-    try testing.expect(std.mem.startsWith(u8, p, "/home/u/.cc-zig/projects/"));
+    try testing.expect(std.mem.startsWith(u8, p, "/home/u/.metacodes/projects/"));
     try testing.expect(std.mem.endsWith(u8, p, "/memory"));
     try testing.expectEqualStrings("", memdirPath("", "/x", &buf));
     try testing.expectEqualStrings("", memdirPath("/h", "", &buf));

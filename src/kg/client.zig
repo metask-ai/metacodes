@@ -167,7 +167,7 @@ pub const KgClient = struct {
         if (opts.config_store) |v| {
             if (v.len > 0) return allocator.dupe(u8, v);
         }
-        return std.fmt.allocPrint(allocator, "{s}/.cc-zig/kg/store.kg", .{opts.home});
+        return std.fmt.allocPrint(allocator, "{s}/.metacodes/kg/store.kg", .{opts.home});
     }
 
     /// bin 查找顺序:env METACODES_KG_BIN > config kg_bin > **vendored**(自真实 exe 目录
@@ -1022,7 +1022,7 @@ fn dirExists(path: []const u8) bool {
 
 fn ensureParentDir(allocator: std.mem.Allocator, path: []const u8) !void {
     const parent = std.fs.path.dirname(path) orelse return;
-    // 逐级 mkdir(仿 memdir.ensureDir 精神;两级足够:~/.cc-zig/kg)。
+    // 逐级 mkdir(仿 memdir.ensureDir 精神;两级足够:~/.metacodes/kg)。
     const grand = std.fs.path.dirname(parent);
     if (grand) |g| {
         const gz = try allocator.dupeZ(u8, g);
@@ -1127,7 +1127,7 @@ test "路径解析优先级:env > config > 默认;显式 bin 不可用不静默�
 
     var c3 = try KgClient.init(a, .{ .home = "/home/u", .domain = "p", .env_store = "", .env_bin = "" });
     defer c3.deinit();
-    try testing.expectEqualStrings("/home/u/.cc-zig/kg/store.kg", c3.store_path);
+    try testing.expectEqualStrings("/home/u/.metacodes/kg/store.kg", c3.store_path);
 }
 
 test "bin 解析:dev 兜底默认关(opt-in),vendored 缺失不静默落 dev" {
