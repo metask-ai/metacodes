@@ -332,7 +332,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "KgRemember",
-        .description = "Persist a durable memory into the knowledge graph (survives across sessions). Use for: decisions made, user preferences/corrections, non-obvious project facts. Keep it short and structured; do NOT log transient task state.",
+        .description = "Persist a durable memory into the knowledge graph (survives across sessions). Use for SHORT ATOMIC facts: decisions made, user preferences/corrections, non-obvious project facts. Keep it short and structured; do NOT log transient task state. For long-form narrative use a memory markdown file instead (auto-imported into the same graph) — never store the same content both ways.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "text", .type = "string", .description = "The fact to remember. Short, self-contained; include Why when it is a correction or decision." },
             .{ .name = "kind", .type = "string", .description = "Memory type: decision | user_preference | module (a code module/component's responsibility or structure) | bug (a defect / wrong behavior) | observation (default, use only when none of the specific types fit). PREFER a specific type over observation — specific types make the memory retrievable by type." },

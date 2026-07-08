@@ -774,4 +774,22 @@ test "L2 KG: B/C 合并 — Write memdir markdown 自动入图,召回命中 sect
     defer a.free(out5);
     try std.testing.expect(std.mem.indexOf(u8, out5, "\"success\":true") != null);
     try std.testing.expectEqual(count_before_alias, kg.memoryCount());
+
+    // ⑥ **删除语义(PM P0-2 回归锁)**:Write 空内容 = 删除——空 upsert 清旧投影,
+    // 该文件的正文从召回消失(否则"删错误记忆"删不掉图里的幽灵版本)。
+    const args6 = try std.fmt.allocPrint(a,
+        \\{{"file_path":"{s}/memory/lesson-parser.md","content":""}}
+    , .{proj_dir});
+    defer a.free(args6);
+    const out6 = try write_tool.execute(&ctx, args6);
+    defer a.free(out6);
+    try std.testing.expect(std.mem.indexOf(u8, out6, "\"success\":true") != null);
+    const hits_deleted = try kg.recall("narwhal conclusion", 10, false);
+    defer {
+        for (hits_deleted) |*h| h.deinit(a);
+        a.free(hits_deleted);
+    }
+    for (hits_deleted) |h| {
+        try std.testing.expect(std.mem.indexOf(u8, h.text, "narwhal") == null);
+    }
 }

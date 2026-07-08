@@ -287,6 +287,7 @@ pub const KG_SECTION =
     \\
     \\When to KgRecall: the user refers to prior decisions or past work; you are continuing cross-session work; an ambiguous request likely depends on earlier project choices. Skip it for self-contained tasks.
     \\When to KgRemember: a decision was made and confirmed; the user corrected you (record the rule + why); you learned a non-obvious project fact. Write short, structured facts — never transient task chatter or raw logs.
+    \\Division of labor: KgRemember is for short atomic facts. For long-form narrative (investigation writeups, multi-step lessons) write a memory markdown file instead (see # Memory) — those files are auto-imported into this same graph and recalled through the same path, so never store the same content both ways.
 ;
 
 pub fn buildFull(

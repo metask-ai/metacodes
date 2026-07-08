@@ -32,7 +32,6 @@ pub fn maybeImportMemoryFile(ctx: *const ToolContext, path: []const u8, content:
     if (!std.mem.endsWith(u8, path, ".md")) return;
     const base = std.fs.path.basename(path);
     if (std.mem.eql(u8, base, "MEMORY.md")) return; // 索引非记忆
-    if (std.mem.trim(u8, content, " \t\r\n").len == 0) return; // 空文件无意义
     // canonical 判定 + 派生一体(Linus 复审严重条):stable_key 必须哈希 **canonical** 路径。
     // 哈希裸 path 的话,同一文件的不同拼写(APFS 大小写不敏感 / /tmp vs /private/tmp /
     // symlink / 相对路径)各算一个 key → 各建一个 document → 旧版本永久留在召回里。
@@ -42,6 +41,19 @@ pub fn maybeImportMemoryFile(ctx: *const ToolContext, path: []const u8, content:
     // 稳定 key = canonical 路径 hash:同文件永远 upsert 同一 document(旧投影边被 tinykg
     // 替换,旧正文退出召回)。
     const stable_key = std.hash.Wyhash.hash(0x9e3d, canon);
+
+    // **删除语义(PM P0-2)**:Write 空内容 = 删除记忆——空 upsert 让 tinykg 删旧投影边,
+    // 旧正文退出召回(否则"删错误记忆"这个被 prompt 明确鼓励的动作删不掉图里的幽灵版本,
+    // 错误记忆以最高置信形态持续注入未来 session)。Memory 段指引模型用 Write 清空而非 rm。
+    if (std.mem.trim(u8, content, " \t\r\n").len == 0) {
+        kg.clearMarkdownDocStable(stable_key) catch |e| {
+            log.warn("kg", "AutoMem markdown 图删除失败({s}): {s}", .{ @errorName(e), base });
+            return;
+        };
+        log.info("kg", "AutoMem markdown 图删除(空 upsert): {s}", .{base});
+        return;
+    }
+
     const doc_id = kg.importMarkdownDocStable(content, stable_key) catch |e| {
         log.warn("kg", "AutoMem markdown 入图失败({s}): {s}", .{ @errorName(e), base });
         return;

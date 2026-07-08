@@ -461,7 +461,7 @@ pub const KgClient = struct {
     /// (避开增量合并 order_key 撞车致 render 乱序);相同内容→真幂等。
     pub fn importMarkdownDoc(self: *KgClient, markdown: []const u8) KgError!u64 {
         const content_hash = std.hash.Wyhash.hash(0x7ac3, markdown);
-        return self.importMarkdownDocAt(markdown, content_hash);
+        return self.importMarkdownDocAt(markdown, content_hash, true);
     }
 
     /// **稳定 key 版(记忆文件用,Linus BLOCKER 修)**:同 key(如文件路径 hash)→ 同 source
@@ -472,10 +472,17 @@ pub const KgClient = struct {
     /// 子树——删旧 doc 根也断不开。稳定 upsert 让 tinykg 自己替换投影边,才是干净语义。
     /// 代价:order_key 撞车乱 render 顺序——记忆召回不 render(真相在磁盘 md 文件),无影响。
     pub fn importMarkdownDocStable(self: *KgClient, markdown: []const u8, stable_key: u64) KgError!u64 {
-        return self.importMarkdownDocAt(markdown, stable_key);
+        return self.importMarkdownDocAt(markdown, stable_key, true);
     }
 
-    fn importMarkdownDocAt(self: *KgClient, markdown: []const u8, path_key: u64) KgError!u64 {
+    /// 记忆文件删除语义(PM P0-2):同 stable_key 空内容 upsert → tinykg 增量合并把旧投影边
+    /// 全删(projection_edges_deleted,实证)→ 旧正文孤儿退出召回。document 空壳留图但无正文
+    /// 不可召回。不 attach(从未入图的文件清空时,新建的空壳保持 orphan 不进任何视图)。
+    pub fn clearMarkdownDocStable(self: *KgClient, stable_key: u64) KgError!void {
+        _ = try self.importMarkdownDocAt("", stable_key, false);
+    }
+
+    fn importMarkdownDocAt(self: *KgClient, markdown: []const u8, path_key: u64, attach: bool) KgError!u64 {
         const tmp_path = std.fmt.allocPrint(self.allocator, "{s}.mdimport.{x}.tmp", .{ self.store_path, path_key }) catch return KgError.OutOfMemory;
         defer self.allocator.free(tmp_path);
         writeTmpFile(self.allocator, tmp_path, markdown) catch return self.dataError("写 md 临时文件失败", .{});
@@ -488,6 +495,7 @@ pub const KgClient = struct {
         // stdout: `import_md_doc ... document=<id> nodes_imported=..`
         const doc_id = extractKvU64(out.stdout, "document=") orelse
             return self.dataError("import-md-doc 输出无 document id: {s}", .{trimForLog(out.stdout)});
+        if (!attach) return doc_id;
         // 挂接 document 根进项目子树(section 后代经 md:* 投影边可达,search --project 的
         // membership 沿 composition 下钻)。upsert 重复挂接被 tinykg link 去重吸收。
         self.attachToProject(doc_id, "document", false) catch |e| {
