@@ -582,7 +582,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             app.provider(),
             app.tool_defs,
             &app.permission_ctx,
-            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = scoped_recall, .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .model_switch_compact = app.pendingModelSwitchCompact(), .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
+            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = scoped_recall, .max_turns = maxTurnsFromEnv(), .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .model_switch_compact = app.pendingModelSwitchCompact(), .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
             effective_be,
             allocator,
         ) catch |err| {
@@ -628,7 +628,11 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // 撞 backstop(防呆兜底,非防跑飞主闸):非静默 + 续接出口,不自动续(把"是否失控"
         // 交给唯一持全局意图的人——对齐 codex 只在有 pending 输入才续)。
         if (result.stop_reason == .max_turns) {
-            std.debug.print("\x1b[33m已达 {d} 轮上限(共 {d} 次工具调用)。任务可能未完成——这可能是合法长任务,也可能在原地打转。\n直接输入你的下一步(如\"继续\")续接对话,或调整方向。\x1b[0m\n", .{ result.turns, result.tool_calls });
+            const bd = toolCallBreakdown(app, allocator);
+            defer if (bd) |b| allocator.free(b);
+            std.debug.print("\x1b[33m已达 {d} 轮上限(共 {d} 次工具调用)。任务可能未完成——这可能是合法长任务,也可能在原地打转。\x1b[0m\n", .{ result.turns, result.tool_calls });
+            if (bd) |b| std.debug.print("\x1b[33m  动作分布:{s}\x1b[0m\n", .{b});
+            std.debug.print("\x1b[33m直接输入你的下一步(如\"继续\")续接对话,或调整方向。\x1b[0m\n", .{});
         }
         // 打转熔断(零增益重复 / 连续同错):明确告知,非静默。
         if (result.stop_reason == .tool_loop) {
@@ -2105,6 +2109,53 @@ fn firstLine(text: []const u8) []const u8 {
     var n = @min(end, 100);
     while (n > 0 and (text[n - 1] & 0xC0) == 0x80) n -= 1; // 不切半个 CJK 字
     return text[0..n];
+}
+
+/// max_turns backstop 可配(METACODES_MAX_TURNS 覆盖;默认 400)。非法值退默认。
+fn maxTurnsFromEnv() u32 {
+    if (std.c.getenv("METACODES_MAX_TURNS")) |v| {
+        return std.fmt.parseInt(u32, std.mem.span(v), 10) catch 400;
+    }
+    return 400;
+}
+
+/// 统计对话里工具调用分类("31×Read · 13×Bash · 5×Grep"),撞 backstop 时展示,
+/// 让用户一眼判"合法长任务"(动作多样)vs"原地打转"(某工具霸榜)。owned;空→null。
+fn toolCallBreakdown(app: *app_mod.App, allocator: std.mem.Allocator) ?[]u8 {
+    const Pair = struct { name: []const u8, n: u32 };
+    var counts = std.StringHashMap(u32).init(allocator);
+    defer counts.deinit();
+    for (app.conversation.messages.items) |m| {
+        for (m.blocks) |b| {
+            switch (b) {
+                .tool_use => |tu| {
+                    const gop = counts.getOrPut(tu.name) catch continue;
+                    if (!gop.found_existing) gop.value_ptr.* = 0;
+                    gop.value_ptr.* += 1;
+                },
+                else => {},
+            }
+        }
+    }
+    if (counts.count() == 0) return null;
+    var list: std.ArrayList(Pair) = .empty;
+    defer list.deinit(allocator);
+    var it = counts.iterator();
+    while (it.next()) |e| list.append(allocator, .{ .name = e.key_ptr.*, .n = e.value_ptr.* }) catch return null;
+    std.mem.sort(Pair, list.items, {}, struct {
+        fn lt(_: void, a: Pair, c: Pair) bool {
+            return a.n > c.n;
+        }
+    }.lt);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (list.items, 0..) |e, i| {
+        if (i > 0) out.appendSlice(allocator, " · ") catch return null;
+        const seg = std.fmt.allocPrint(allocator, "{d}×{s}", .{ e.n, e.name }) catch return null;
+        defer allocator.free(seg);
+        out.appendSlice(allocator, seg) catch return null;
+    }
+    return out.toOwnedSlice(allocator) catch null;
 }
 
 const scoped_recall_mod = @import("../kg/scoped_recall.zig");
