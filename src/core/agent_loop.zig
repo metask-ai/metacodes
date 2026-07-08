@@ -59,6 +59,41 @@ const ProgressTramp = struct {
 /// 与"原地空参风暴";到达即注入明确终止现场并停。
 pub const MAX_SAME_TOOL_ERROR: u32 = 3;
 
+/// **零增益重复熔断(主防线,与轮数正交)**:同一 (tool, input) 产出**同一 result** 累计达此
+/// 次数 → 判定原地打转(错误型 MAX_SAME_TOOL_ERROR 熔断抓不到"成功但零信息增益"的重复:
+/// 反复 Read 同一 offset / 反复 Grep 同 pattern,每次成功→永不熔断→无限循环,50 轮帽曾是唯一
+/// 拦截)。分页(offset 递进)是不同 signature 不触发;结果变化(git status 状态变)→ result_hash
+/// 变 → 重置计数,不误杀合法 re-check。这才度量真实"打转",轮数只配当防呆 backstop。
+pub const MAX_ZERO_GAIN_REPEAT: u32 = 3;
+
+/// 零增益重复追踪器:sig_hash(tool name+input)→ {同结果累计次数}。同 sig **同 result** 累计
+/// 达 MAX_ZERO_GAIN_REPEAT = 原地打转。结果变化(result_hash 变)→ 重置(不误杀合法 re-check);
+/// 不同 sig(如分页 offset 递进)各自独立计数(不触发)。
+pub const ZeroGainTracker = struct {
+    const Entry = struct { result_hash: u64, count: u32 };
+    map: std.AutoHashMap(u64, Entry),
+
+    pub fn init(allocator: std.mem.Allocator) ZeroGainTracker {
+        return .{ .map = std.AutoHashMap(u64, Entry).init(allocator) };
+    }
+    pub fn deinit(self: *ZeroGainTracker) void {
+        self.map.deinit();
+    }
+    /// 记录一次并返回该 sig 的当前同结果累计次数。OOM → best-effort 返 0(不阻塞 run)。
+    pub fn record(self: *ZeroGainTracker, sig_hash: u64, result_hash: u64) u32 {
+        const gop = self.map.getOrPut(sig_hash) catch return 0;
+        if (gop.found_existing and gop.value_ptr.result_hash == result_hash) {
+            gop.value_ptr.count += 1;
+        } else {
+            gop.value_ptr.* = .{ .result_hash = result_hash, .count = 1 };
+        }
+        return gop.value_ptr.count;
+    }
+    pub fn tripped(self: *ZeroGainTracker, sig_hash: u64, result_hash: u64) bool {
+        return self.record(sig_hash, result_hash) >= MAX_ZERO_GAIN_REPEAT;
+    }
+};
+
 /// 工具失败签名:工具名 + 错误码 的哈希。用于检测"同工具同错连续 N 次"。
 /// 用哈希而非存切片:tu.name/code 生命周期随 turn 释放,存哈希避免悬挂。
 const ToolErrSig = struct {
@@ -124,7 +159,10 @@ pub const RunResult = struct {
 };
 
 pub const Options = struct {
-    max_turns: u32 = 50,
+    /// **防呆 backstop**,非防跑飞主闸(轮数不度量任何真实风险)。长任务靠 pre-sampling
+    /// auto-compact 压缩续接(codex 同构),防跑飞靠 MAX_SAME_TOOL_ERROR(错误型)+
+    /// MAX_ZERO_GAIN_REPEAT(零增益重复,主防线)。故此值只当"真失控兜底",设高。
+    max_turns: u32 = 400,
     /// 本次 run 归属的会话(emit/poll 路由用)。默认 .single(N=1/TUI);M6 多 Session 时
     /// 由 SessionContext 传各自的 id。所有 backend.emitEvent 用它路由到对应 UI 视图。
     session: @import("session_id.zig").SessionId = @import("session_id.zig").SessionId.single,
@@ -382,6 +420,9 @@ pub fn run(
     // /无错 → 重置。判定在 6d 内层循环**之后**(避免单轮多工具同错被误算多次)。
     var last_err_sig: ?ToolErrSig = null;
     var same_err_count: u32 = 0;
+    // 零增益重复熔断(主防线),持有整个 run。
+    var zero_gain = ZeroGainTracker.init(allocator);
+    defer zero_gain.deinit();
 
     // Prompt cache 击穿检测(批3):跨 turn 跟踪 cache_read 跌幅 + system/tools 指纹。
     var cache_detector = @import("cache_break.zig").CacheBreakDetector{};
@@ -1007,6 +1048,21 @@ pub fn run(
                 .content = content,
                 .is_error = s.is_error,
             } });
+
+            // 零增益重复熔断(主防线):同 (name,input) 产出同 result 累计 MAX_ZERO_GAIN_REPEAT 次
+            // → 原地打转 → 复用 tool_loop 停。分页(offset 异)= 异 signature 不触发;结果变 →
+            // result_hash 变 → 重置,不误杀 re-check。best-effort:getOrPut OOM 时跳过(不阻塞)。
+            {
+                var sh = std.hash.Wyhash.init(0);
+                sh.update(s.name);
+                sh.update(s.input);
+                const n = zero_gain.record(sh.final(), std.hash.Wyhash.hash(0, content));
+                if (n >= MAX_ZERO_GAIN_REPEAT) {
+                    log.warnId("agent", rid, "zero-gain repeat breaker: tool {s} identical input+result x{d}", .{ s.name, n });
+                    backend.emitEvent(sess, .{ .diag_breaker_tripped = .{ .trace_id = trace_id, .depth = depth, .same_err_count = n } });
+                    tool_loop_tripped = true;
+                }
+            }
 
             // 实时工具卡渲染(REPL):把结果经 backend 渲染到屏幕——Edit/Write diff 着色、
             // Grep/Glob 摘要、Read 摘要。headless/单测 tool_render_theme=null → 跳过(emit 仍发,
@@ -2194,6 +2250,35 @@ test "stream context-window recovery retries before assistant payload" {
     try std.testing.expectEqual(@as(usize, 3), c.len());
     try std.testing.expectEqualStrings("middle context", c.messages.items[0].blocks[0].text);
     try std.testing.expectEqualStrings("current request", c.messages.items[1].blocks[0].text);
+}
+
+test "ZeroGainTracker:同 sig 同 result 达 MAX 打转;分页/结果变化不误触发" {
+    const a = std.testing.allocator;
+    // 同 sig 同 result 累计:第 MAX_ZERO_GAIN_REPEAT(3)次才打转。
+    {
+        var z = ZeroGainTracker.init(a);
+        defer z.deinit();
+        try std.testing.expect(!z.tripped(1, 100)); // count=1
+        try std.testing.expect(!z.tripped(1, 100)); // count=2
+        try std.testing.expect(z.tripped(1, 100)); // count=3 → 打转
+    }
+    // 分页:不同 sig(offset 递进 → 不同 hash)各自独立,永不触发。
+    {
+        var z = ZeroGainTracker.init(a);
+        defer z.deinit();
+        try std.testing.expect(!z.tripped(10, 200));
+        try std.testing.expect(!z.tripped(11, 201));
+        try std.testing.expect(!z.tripped(12, 202));
+        try std.testing.expect(!z.tripped(13, 203));
+    }
+    // 结果变化:同 sig 但 result_hash 每次变(如 git status 状态变)→ 每次重置,不误杀 re-check。
+    {
+        var z = ZeroGainTracker.init(a);
+        defer z.deinit();
+        try std.testing.expect(!z.tripped(5, 10));
+        try std.testing.expect(!z.tripped(5, 20)); // result 变 → reset count=1
+        try std.testing.expect(!z.tripped(5, 30)); // 又变 → reset,不触发
+    }
 }
 
 test "context warning emits once only at medium pressure" {

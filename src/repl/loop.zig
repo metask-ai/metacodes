@@ -625,6 +625,16 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             app.abort.resetForTesting();
         }
 
+        // 撞 backstop(防呆兜底,非防跑飞主闸):非静默 + 续接出口,不自动续(把"是否失控"
+        // 交给唯一持全局意图的人——对齐 codex 只在有 pending 输入才续)。
+        if (result.stop_reason == .max_turns) {
+            std.debug.print("\x1b[33m已达 {d} 轮上限(共 {d} 次工具调用)。任务可能未完成——这可能是合法长任务,也可能在原地打转。\n直接输入你的下一步(如\"继续\")续接对话,或调整方向。\x1b[0m\n", .{ result.turns, result.tool_calls });
+        }
+        // 打转熔断(零增益重复 / 连续同错):明确告知,非静默。
+        if (result.stop_reason == .tool_loop) {
+            std.debug.print("\x1b[33m检测到重复无效动作(同操作反复无信息增益,或连续同错),已中止本轮以防打转。\n调整方向后输入下一步可继续。\x1b[0m\n", .{});
+        }
+
         // Ctrl+B 转后台:turn 边界返回 .backgrounded。深拷贝当前对话 → spawnBackground 续跑 →
         // 成功才 reset 前台开新会话。顺序铁律:先 clone 再 spawn 再 reset(失败不 reset,保留对话重试)。
         if (result.stop_reason == .backgrounded) {
