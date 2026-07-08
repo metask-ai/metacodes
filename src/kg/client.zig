@@ -57,15 +57,32 @@ pub const RecallHit = struct {
     node_id: u64,
     kind: []u8, // owned
     domain: []u8, // owned
+    schema_type: []u8, // owned(记忆类型维度:decision/module/bug/…;list-recent 路径为空)
     text: []u8, // owned(截断后)
     score: f64,
 
     pub fn deinit(self: *const RecallHit, allocator: std.mem.Allocator) void {
         allocator.free(self.kind);
         allocator.free(self.domain);
+        allocator.free(self.schema_type);
         allocator.free(self.text);
     }
 };
+
+/// 记忆类型(窄概念图谱最小切片)→ (node kind, schema_type 标签)。
+/// module/bug 是概念类型:落 **observation** node + schema_type 区分——**不建 concept kind**
+/// (concept+schema_type=concept 会变 observation 催收池转世,Linus BLOCKER)。
+/// 其余 kind 与 schema_type 同名。concept/未知 → null(调用方拒绝,不静默)。大小写不敏感 + trim。
+pub const ResolvedType = struct { node_kind: MemoryKind, schema_type: []const u8 };
+pub fn resolveMemoryType(raw: []const u8) ?ResolvedType {
+    const t = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.ascii.eqlIgnoreCase(t, "observation")) return .{ .node_kind = .observation, .schema_type = "observation" };
+    if (std.ascii.eqlIgnoreCase(t, "decision")) return .{ .node_kind = .decision, .schema_type = "decision" };
+    if (std.ascii.eqlIgnoreCase(t, "user_preference")) return .{ .node_kind = .user_preference, .schema_type = "user_preference" };
+    if (std.ascii.eqlIgnoreCase(t, "module")) return .{ .node_kind = .observation, .schema_type = "module" };
+    if (std.ascii.eqlIgnoreCase(t, "bug")) return .{ .node_kind = .observation, .schema_type = "bug" };
+    return null; // concept / 未知类型 → 拒绝
+}
 
 pub const FrontierRow = struct {
     task_id: u64,
@@ -433,9 +450,18 @@ pub const KgClient = struct {
     /// 与 schema_type=todo——记忆检索面与任务面隔离,设计 §2 治理)。
     /// 返回 owned slice(caller 逐项 deinit + free slice)。
     pub fn recall(self: *KgClient, query: []const u8, limit: usize, include_tasks: bool) KgError![]RecallHit {
+        return self.recallTyped(query, limit, include_tasks, null);
+    }
+
+    /// type_filter 非 null 时按 schema_type 过滤(typed recall)。
+    /// **best-effort 契约(Linus HIGH-2)**:BM25 按相关度排序不按类型,稀有类型可能全排在超采窗口外
+    /// → 库里有该类型却返空。拉高超采倍数缓解,但不保证:typed recall 可能少返相关度低的同类节点。
+    /// 正解是 tinykg server-side --schema-type 下推(本切片 defer)。空返 ≠ 库中无该类型。
+    pub fn recallTyped(self: *KgClient, query: []const u8, limit: usize, include_tasks: bool, type_filter: ?[]const u8) KgError![]RecallHit {
         var limbuf: [16]u8 = undefined;
-        // 2× 超采:客户端过滤后仍能凑满 limit。
-        const raw_limit = std.fmt.bufPrint(&limbuf, "{d}", .{limit * 2 + 4}) catch unreachable;
+        // 超采:客户端过滤后仍能凑满 limit。typed recall 多一道 schema_type 过滤 → 8× 超采抗稀有类型少返。
+        const oversample: usize = if (type_filter != null) limit * 8 + 8 else limit * 2 + 4;
+        const raw_limit = std.fmt.bufPrint(&limbuf, "{d}", .{oversample}) catch unreachable;
         const out = try self.runChecked(&.{
             "search", self.store_path, query, "--limit", raw_limit, "--profile", "agent-memory", "--format", "json",
         });
@@ -478,6 +504,10 @@ pub const KgClient = struct {
                 if (std.mem.eql(u8, kind, "task") or std.mem.eql(u8, kind, "verification")) continue;
                 if (std.mem.eql(u8, schema_type, "todo")) continue;
             }
+            // typed recall:按 schema_type 过滤(第三道客户端过滤,故上面 8× 超采)。
+            if (type_filter) |tf| {
+                if (!std.mem.eql(u8, schema_type, tf)) continue;
+            }
 
             const id_v = node.get("id") orelse continue;
             const node_id: u64 = switch (id_v) {
@@ -500,12 +530,15 @@ pub const KgClient = struct {
             errdefer self.allocator.free(k_owned);
             const d_owned = self.allocator.dupe(u8, domain) catch return KgError.OutOfMemory;
             errdefer self.allocator.free(d_owned);
+            const s_owned = self.allocator.dupe(u8, schema_type) catch return KgError.OutOfMemory;
+            errdefer self.allocator.free(s_owned);
             const t_owned = self.allocator.dupe(u8, truncateBytes(text, 800)) catch return KgError.OutOfMemory;
             errdefer self.allocator.free(t_owned);
             results.append(self.allocator, .{
                 .node_id = node_id,
                 .kind = k_owned,
                 .domain = d_owned,
+                .schema_type = s_owned,
                 .text = t_owned,
                 .score = score,
             }) catch return KgError.OutOfMemory;
@@ -644,6 +677,8 @@ pub const KgClient = struct {
             errdefer self.allocator.free(k_owned);
             const d_owned = self.allocator.dupe(u8, domain) catch return KgError.OutOfMemory;
             errdefer self.allocator.free(d_owned);
+            const s_owned = self.allocator.dupe(u8, "") catch return KgError.OutOfMemory; // list-recent TSV 无 schema_type
+            errdefer self.allocator.free(s_owned);
             const text_un = unescapeTsv(self.allocator, text_col) catch return KgError.OutOfMemory;
             defer self.allocator.free(text_un);
             const t_owned = self.allocator.dupe(u8, truncateBytes(text_un, 800)) catch return KgError.OutOfMemory;
@@ -653,6 +688,7 @@ pub const KgClient = struct {
                 .node_id = node_id,
                 .kind = k_owned,
                 .domain = d_owned,
+                .schema_type = s_owned,
                 .text = t_owned,
                 .score = 0,
             }) catch return KgError.OutOfMemory;
@@ -930,6 +966,27 @@ fn sleepMs(ms: u64) void {
 // ============================================================================
 
 const testing = std.testing;
+
+test "resolveMemoryType:sharp 类型映射 + 大小写不敏感 + 拒绝 concept/未知" {
+    // 概念类型 module/bug → observation node + schema_type 区分(不建 concept 催收池)。
+    const m = resolveMemoryType("module").?;
+    try testing.expectEqual(MemoryKind.observation, m.node_kind);
+    try testing.expectEqualStrings("module", m.schema_type);
+    const b = resolveMemoryType("bug").?;
+    try testing.expectEqual(MemoryKind.observation, b.node_kind);
+    try testing.expectEqualStrings("bug", b.schema_type);
+    // 记忆 kind:node kind 与 schema_type 同名。
+    try testing.expectEqual(MemoryKind.decision, resolveMemoryType("decision").?.node_kind);
+    try testing.expectEqualStrings("decision", resolveMemoryType("decision").?.schema_type);
+    try testing.expectEqual(MemoryKind.user_preference, resolveMemoryType("user_preference").?.node_kind);
+    // 大小写不敏感 + trim(Linus MEDIUM-1)。
+    try testing.expectEqualStrings("module", resolveMemoryType("Module").?.schema_type);
+    try testing.expectEqualStrings("bug", resolveMemoryType("  BUG ").?.schema_type);
+    // 拒绝 concept(催收池防线)+ 未知值 → null(调用方报错不静默)。
+    try testing.expect(resolveMemoryType("concept") == null);
+    try testing.expect(resolveMemoryType("function") == null);
+    try testing.expect(resolveMemoryType("") == null);
+}
 
 test "unescapeTsv 全转义表逆变换" {
     const a = testing.allocator;

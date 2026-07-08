@@ -122,6 +122,65 @@ test "L2 KG: listRecentMemories 按 id 降序枚举最近(替虚词 hack)" {
     try std.testing.expect(std.mem.indexOf(u8, hits[0].text, "gamma") != null);
 }
 
+test "L2 KG: typed recall — module/bug/decision 按 schema_type 过滤(本体最小切片)" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/kgonto.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-onto");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    // 模拟 executeRemember 映射:module/bug → observation node + schema_type;decision → decision。
+    _ = try kg.remember(.observation, "client.zig 用子进程 CLI 驱动 tinykg 集成", "module", false);
+    _ = try kg.remember(.observation, "共享 KgClient 被 subagent 线程共享导致数据竞态", "bug", false);
+    const dec_id = try kg.remember(.decision, "tinykg 用子进程集成而非嵌库,进程边界隔离崩溃", "decision", false);
+
+    // typed recall type=module:只返 schema_type=module。decision/bug 命中 query 也被过滤掉。
+    const mod_hits = try kg.recallTyped("tinykg 子进程 集成 驱动 client", 8, false, "module");
+    defer {
+        for (mod_hits) |*h| h.deinit(a);
+        a.free(mod_hits);
+    }
+    try std.testing.expect(mod_hits.len >= 1);
+    for (mod_hits) |h| try std.testing.expectEqualStrings("module", h.schema_type);
+
+    // type=decision:只返 decision,且目标 decision 节点在内。
+    const dec_hits = try kg.recallTyped("tinykg 集成 嵌库 隔离 进程", 8, false, "decision");
+    defer {
+        for (dec_hits) |*h| h.deinit(a);
+        a.free(dec_hits);
+    }
+    try std.testing.expect(dec_hits.len >= 1);
+    for (dec_hits) |h| try std.testing.expectEqualStrings("decision", h.schema_type);
+    var found = false;
+    for (dec_hits) |h| {
+        if (h.node_id == dec_id) found = true;
+    }
+    try std.testing.expect(found);
+
+    // 无 type:混合返回,schema_type 字段被**留住**(Linus HIGH-1 回归:解析后不丢弃)。
+    const all_hits = try kg.recallTyped("tinykg 集成", 8, false, null);
+    defer {
+        for (all_hits) |*h| h.deinit(a);
+        a.free(all_hits);
+    }
+    try std.testing.expect(all_hits.len >= 1);
+    var any_typed = false;
+    for (all_hits) |h| {
+        if (h.schema_type.len > 0) any_typed = true;
+    }
+    try std.testing.expect(any_typed);
+}
+
 test "L2 KG: recall 客户端 domain 隔离(别项目记忆不串味)" {
     const a = std.testing.allocator;
     const bin = findBin(a) orelse return error.SkipZigTest;

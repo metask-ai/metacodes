@@ -335,7 +335,7 @@ pub const registry: []const ToolEntry = &.{
         .description = "Persist a durable memory into the knowledge graph (survives across sessions). Use for: decisions made, user preferences/corrections, non-obvious project facts. Keep it short and structured; do NOT log transient task state.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "text", .type = "string", .description = "The fact to remember. Short, self-contained; include Why when it is a correction or decision." },
-            .{ .name = "kind", .type = "string", .description = "observation (default) | decision | user_preference | concept" },
+            .{ .name = "kind", .type = "string", .description = "Memory type: decision | user_preference | module (a code module/component's responsibility or structure) | bug (a defect / wrong behavior) | observation (default, use only when none of the specific types fit). PREFER a specific type over observation — specific types make the memory retrievable by type." },
             .{ .name = "scope", .type = "string", .description = "project (default) | global — global only for cross-project user preferences" },
         }, .required = &.{"text"} },
         .execute = kg_tools.executeRemember,
@@ -345,6 +345,7 @@ pub const registry: []const ToolEntry = &.{
         .description = "Search the knowledge graph for durable memories (decisions, preferences, project facts) from this and past sessions. Use when the user refers to prior decisions/context or when continuing cross-session work. Retrieval is LEXICAL (BM25, no embeddings) — you supply the semantics by expanding the query (see query field).",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "query", .type = "string", .description = "Search keywords. Because retrieval is LEXICAL (exact word/character match, no vector/semantic search), EXPAND the topic into a set of related keywords in ONE query: add synonyms, closely-related terms, and BOTH Chinese and English forms — a memory may be stored in either language or as code identifiers (e.g. crash↔崩溃, threshold↔阈值, panic↔报错/unreachable, retrieval↔召回/recall). Example: to recall why a process crashed → 'panic crash unreachable 崩溃 报错'. Extra keywords are safe — the most relevant memories rank first (coverage-first)." },
+            .{ .name = "type", .type = "string", .description = "Optional. Filter results to ONE memory type: decision | user_preference | module | bug | observation. The result header lists which types are present, so you can refine. Best-effort: an empty typed result does NOT prove the type is absent (lexical ranking may push same-type memories out of the window) — retry without type if unsure." },
         }, .required = &.{"query"} },
         .execute = kg_tools.executeRecall,
     },

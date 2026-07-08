@@ -11,6 +11,7 @@ const ToolContext = @import("context.zig").ToolContext;
 const kg_mod = @import("../kg/client.zig");
 const util_json = @import("../util/json.zig");
 const common = @import("common.zig");
+const log = @import("../util/log.zig");
 
 fn requireKg(ctx: *const ToolContext) ?*kg_mod.KgClient {
     return ctx.kg;
@@ -45,10 +46,12 @@ pub fn executeRemember(ctx: *const ToolContext, args: []const u8) anyerror![]u8 
     }
 
     // kind 白名单(默认 observation;白名单外报 data 错引导改参)。
-    const kind: kg_mod.MemoryKind = blk: {
-        const raw = util_json.extractStringField(args, "kind") orelse break :blk .observation;
-        break :blk kg_mod.MemoryKind.parse(raw) orelse {
-            common.setErrorDetail(ctx.error_detail, ctx.allocator, "kind 必须是 observation|decision|user_preference|concept 之一", .{});
+    // 记忆类型 → (node kind, schema_type)。module/bug 落 observation node + schema_type 区分
+    // (不建 concept 催收池,Linus BLOCKER)。concept/未知 → 报错不静默(Linus MEDIUM-1)。
+    const resolved: kg_mod.ResolvedType = blk: {
+        const raw = util_json.extractStringField(args, "kind") orelse break :blk .{ .node_kind = .observation, .schema_type = "observation" };
+        break :blk kg_mod.resolveMemoryType(raw) orelse {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "kind 必须是 decision|user_preference|module|bug|observation 之一(不接受 concept 或其他值)", .{});
             return error.InvalidKind;
         };
     };
@@ -75,8 +78,9 @@ pub fn executeRemember(ctx: *const ToolContext, args: []const u8) anyerror![]u8 
         }
     } else |_| {} // 近重复检查失败不阻塞写入
 
-    const schema_type = @tagName(kind);
-    const node_id = kg.remember(kind, text_owned, schema_type, scope_global) catch |e| {
+    // 写侧类型分布埋点(PM:kill-criterion 的 load-bearing 仪器,measure observation 是否仍霸榜)。
+    log.info("kg", "kg_remember type={s}", .{resolved.schema_type});
+    const node_id = kg.remember(resolved.node_kind, text_owned, resolved.schema_type, scope_global) catch |e| {
         return kgErrorResult(ctx, kg, e, "KgRemember");
     };
     // provenance(best-effort)。
@@ -85,7 +89,7 @@ pub fn executeRemember(ctx: *const ToolContext, args: []const u8) anyerror![]u8 
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(ctx.allocator);
-    const head = try std.fmt.allocPrint(ctx.allocator, "{{\"remembered\":{{\"node_id\":{d},\"kind\":\"{s}\",\"scope\":\"{s}\"}}", .{ node_id, @tagName(kind), if (scope_global) "global" else "project" });
+    const head = try std.fmt.allocPrint(ctx.allocator, "{{\"remembered\":{{\"node_id\":{d},\"type\":\"{s}\",\"scope\":\"{s}\"}}", .{ node_id, resolved.schema_type, if (scope_global) "global" else "project" });
     defer ctx.allocator.free(head);
     try out.appendSlice(ctx.allocator, head);
     if (dup_note) |n| {
@@ -108,7 +112,19 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const query_owned = try util_json.unescapeString(query, ctx.allocator);
     defer ctx.allocator.free(query_owned);
 
-    const hits = kg.recall(query_owned, 8, false) catch |e| {
+    // 可选 type 过滤:归一化 + 集合校验,菜单外报错**不静默空返**(Linus MEDIUM-1)。
+    var type_canon: ?[]const u8 = null;
+    if (util_json.extractStringField(args, "type")) |raw| {
+        const resolved = kg_mod.resolveMemoryType(raw) orelse {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "type 必须是 decision|user_preference|module|bug|observation 之一", .{});
+            return error.InvalidType;
+        };
+        type_canon = resolved.schema_type;
+    }
+    // 采用率埋点(PM:kill-criterion 的 load-bearing 仪器,measure 模型是否用 --type)。
+    log.info("kg", "kg_recall type_filter={s}", .{type_canon orelse "none"});
+
+    const hits = kg.recallTyped(query_owned, 8, false, type_canon) catch |e| {
         return kgErrorResult(ctx, kg, e, "KgRecall");
     };
     defer {
@@ -121,15 +137,33 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try out.appendSlice(ctx.allocator, "{\"hits\":[");
     for (hits, 0..) |h, i| {
         if (i > 0) try out.appendSlice(ctx.allocator, ",");
-        const row = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d},\"kind\":\"{s}\",\"scope\":\"{s}\",\"score\":{d:.2},\"text\":", .{
-            h.node_id, h.kind, if (std.mem.eql(u8, h.domain, "global")) "global" else "project", h.score,
+        const type_str = if (h.schema_type.len > 0) h.schema_type else h.kind;
+        const row = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d},\"type\":\"{s}\",\"scope\":\"{s}\",\"score\":{d:.2},\"text\":", .{
+            h.node_id, type_str, if (std.mem.eql(u8, h.domain, "global")) "global" else "project", h.score,
         });
         defer ctx.allocator.free(row);
         try out.appendSlice(ctx.allocator, row);
         try appendJsonString(&out, ctx.allocator, h.text);
         try out.appendSlice(ctx.allocator, "}");
     }
-    const tail = try std.fmt.allocPrint(ctx.allocator, "],\"count\":{d}}}", .{hits.len});
+    // 搭车 facet(PM:可见性,零额外调用):结果里各类型计数,让模型知道有哪些类型 → 可 --type 精化。
+    const known_types = [_][]const u8{ "decision", "module", "bug", "user_preference", "observation" };
+    var facet: std.ArrayList(u8) = .empty;
+    defer facet.deinit(ctx.allocator);
+    var facet_first = true;
+    for (known_types) |tname| {
+        var c: usize = 0;
+        for (hits) |h| {
+            if (std.mem.eql(u8, h.schema_type, tname)) c += 1;
+        }
+        if (c == 0) continue;
+        if (!facet_first) try facet.appendSlice(ctx.allocator, ",");
+        facet_first = false;
+        const kv = try std.fmt.allocPrint(ctx.allocator, "\"{s}\":{d}", .{ tname, c });
+        defer ctx.allocator.free(kv);
+        try facet.appendSlice(ctx.allocator, kv);
+    }
+    const tail = try std.fmt.allocPrint(ctx.allocator, "],\"count\":{d},\"types_in_results\":{{{s}}}}}", .{ hits.len, facet.items });
     defer ctx.allocator.free(tail);
     try out.appendSlice(ctx.allocator, tail);
     return out.toOwnedSlice(ctx.allocator);
