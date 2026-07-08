@@ -110,6 +110,11 @@ pub const KgClient = struct {
     degraded_reason: ?[]u8 = null,
     /// 最近一次 data 类错误的 detail(owned,透传给模型)。
     last_detail: ?[]u8 = null,
+    /// project-containment(tinykg ce3a7f0 起):本项目 project 节点 id(session 内缓存;
+    /// lazy find-or-create,写路径才建,读路径只 lookup)。null=未解析/库中无。
+    project_node_id: ?u64 = null,
+    /// 跨项目 "global" project 节点 id(用户偏好等 scope_global 记忆挂此)。
+    global_project_node_id: ?u64 = null,
     /// abort 信号(M1:ESC 中断——穿进 spawn,避免锁竞争时最坏 13 分钟不可中断)。
     /// 借用,不拥有;工具/​/kg 调用前 setAbort。
     abort: ?*const AbortSignal = null,
@@ -322,22 +327,95 @@ pub const KgClient = struct {
         return self.degraded_reason orelse "KG 未就绪";
     }
 
-    // ── 领域方法(P1:记忆 + 注入)─────────────────────────────────────
+    // ── project-containment(tinykg ce3a7f0:domain_id 移除,图拓扑隔离)────
+    // 项目隔离 = project 节点 + contain 子树。写路径:节点创建后 govern-node --parent 挂接
+    // (tinykg 已改增量 incremental_append,频繁写安全)。读路径:search/list-recent --project。
 
-    /// 写记忆节点。返回 node id。scope_global=true → domain=global。
-    pub fn remember(self: *KgClient, kind: MemoryKind, text: []const u8, schema_type: []const u8, scope_global: bool) KgError!u64 {
-        const domain = if (scope_global) "global" else self.domain;
+    /// 在库中按 text 精确匹配查 project 节点(list-recent --kind project)。找不到 → null。
+    /// 读路径专用:绝不创建(否则 recall/facet 会污染库)。
+    fn lookupProjectNodeId(self: *KgClient, name: []const u8) KgError!?u64 {
+        // --limit 上限 200(tinykg QueryBudget.max_results;>200 → InvalidLimit,实证:500 曾致
+        // lookup 恒失败 → 每次 remember 重复建 project 节点 + recall 端跳过子树返空)。
+        // 只把 Data 类(空 store 等)视作"没有";Degraded/Transient 必须传播——吞掉会把
+        // 降级伪装成"库中无记忆"(版本门测试抓的正是这个静默)。
+        const out = self.runChecked(&.{ "list-recent", self.store_path, "--kind", "project", "--limit", "200" }) catch |e| switch (e) {
+            KgError.Data => return null,
+            else => return e,
+        };
+        defer self.freeOut(out);
+        var it = std.mem.splitScalar(u8, out.stdout, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            var cols = std.mem.splitScalar(u8, line, '\t');
+            const id_str = cols.next() orelse continue;
+            _ = cols.next() orelse continue; // kind(恒 project,--kind 已过滤)
+            const text_col = cols.rest();
+            if (!std.mem.eql(u8, text_col, name)) continue;
+            return std.fmt.parseInt(u64, id_str, 10) catch continue;
+        }
+        return null;
+    }
+
+    /// 解析(scope_global ? "global" : 本项目)的 project 节点 id。
+    /// create=true(写路径):无则 add-node 创建;create=false(读路径):无则返 null。
+    /// session 内缓存命中零 spawn。
+    fn projectNodeId(self: *KgClient, scope_global: bool, create: bool) KgError!?u64 {
+        const slot = if (scope_global) &self.global_project_node_id else &self.project_node_id;
+        if (slot.*) |cached| return cached;
+        const name = if (scope_global) "global" else self.domain;
+        if (try self.lookupProjectNodeId(name)) |found| {
+            slot.* = found;
+            return found;
+        }
+        if (!create) return null;
         const out = try self.runCheckedWrite(&.{
-            "add-node",         self.store_path, kind.label(), text,
-            "--domain",         domain,          "--schema-type", schema_type,
+            "add-node", self.store_path, "project", name, "--schema-type", "project",
         });
         defer self.freeOut(out);
-        // stdout: `node <id>`
-        const line = std.mem.trim(u8, out.stdout, " \r\n");
-        if (std.mem.startsWith(u8, line, "node ")) {
-            return std.fmt.parseInt(u64, line["node ".len..], 10) catch self.dataError("add-node 输出不可解析: {s}", .{line});
-        }
-        return self.dataError("add-node 输出不可解析: {s}", .{line});
+        const id = parseNodeIdLine(out.stdout) orelse return self.dataError("创建 project 节点输出不可解析: {s}", .{trimForLog(out.stdout)});
+        slot.* = id;
+        return id;
+    }
+
+    /// 把节点挂到 project 子树(govern-node --parent,tinykg 增量路径)。
+    /// **必带 --schema-type**:govern-node 无此参数时会用 kind_label 覆盖 schema_type
+    /// (module/bug 是 observation kind + schema_type 区分,漏传即类型信息丢失,实证)。
+    fn attachToProject(self: *KgClient, node_id: u64, schema_type: []const u8, scope_global: bool) KgError!void {
+        const pid = (try self.projectNodeId(scope_global, true)) orelse
+            return self.dataError("project 节点解析失败(node {d} 未挂接)", .{node_id});
+        var nbuf: [24]u8 = undefined;
+        var pbuf: [24]u8 = undefined;
+        const n_str = std.fmt.bufPrint(&nbuf, "{d}", .{node_id}) catch unreachable;
+        const p_str = std.fmt.bufPrint(&pbuf, "{d}", .{pid}) catch unreachable;
+        const out = try self.runCheckedWrite(&.{
+            "govern-node", self.store_path, n_str, "--parent", p_str, "--schema-type", schema_type,
+        });
+        self.freeOut(out);
+    }
+
+    /// `node <id>` 行 → id。解析失败 null。
+    fn parseNodeIdLine(stdout: []const u8) ?u64 {
+        const line = std.mem.trim(u8, stdout, " \r\n");
+        if (!std.mem.startsWith(u8, line, "node ")) return null;
+        return std.fmt.parseInt(u64, line["node ".len..], 10) catch null;
+    }
+
+    // ── 领域方法(P1:记忆 + 注入)─────────────────────────────────────
+
+    /// 写记忆节点。返回 node id。scope_global=true → 挂 "global" project 子树。
+    /// 两步:add-node(orphan)→ govern-node 挂接(增量)。挂接失败报 data 错并带 node id
+    /// (orphan 不进 --project 召回 = 静默丢失,必须让模型/用户可见可重试)。
+    pub fn remember(self: *KgClient, kind: MemoryKind, text: []const u8, schema_type: []const u8, scope_global: bool) KgError!u64 {
+        const out = try self.runCheckedWrite(&.{
+            "add-node", self.store_path, kind.label(), text, "--schema-type", schema_type,
+        });
+        defer self.freeOut(out);
+        const id = parseNodeIdLine(out.stdout) orelse return self.dataError("add-node 输出不可解析: {s}", .{trimForLog(out.stdout)});
+        self.attachToProject(id, schema_type, scope_global) catch |e| {
+            if (e == KgError.Data) return e; // last_detail 已含现场
+            return self.dataError("记忆节点 {d} 已建但挂接项目失败({s}),可重试或 /kg forget", .{ id, @errorName(e) });
+        };
+        return id;
     }
 
     // ── markdown 文档(P3:plan 人类可见,设计 D3)────────────────────
@@ -363,12 +441,20 @@ pub const KgClient = struct {
         defer deleteTmpFile(self.allocator, tmp_path);
 
         const out = try self.runCheckedWrite(&.{
-            "import-md-doc", self.store_path, tmp_path, "--domain", self.domain,
+            "import-md-doc", self.store_path, tmp_path,
         });
         defer self.freeOut(out);
         // stdout: `import_md_doc ... document=<id> nodes_imported=..`
-        if (extractKvU64(out.stdout, "document=")) |id| return id;
-        return self.dataError("import-md-doc 输出无 document id: {s}", .{trimForLog(out.stdout)});
+        const doc_id = extractKvU64(out.stdout, "document=") orelse
+            return self.dataError("import-md-doc 输出无 document id: {s}", .{trimForLog(out.stdout)});
+        // 挂接 document 根进项目子树(section 子节点经文档自身 contains 边可达;
+        // search --project 的 BFS 走 contain 关系,只保证 document 根可见——够用:
+        // 记忆召回以 document 根为入口,render-md-doc 展开全文)。
+        self.attachToProject(doc_id, "document", false) catch |e| {
+            if (e == KgError.Data) return e;
+            return self.dataError("document {d} 已导入但挂接项目失败({s})", .{ doc_id, @errorName(e) });
+        };
+        return doc_id;
     }
 
     /// 渲染文档回 markdown(/kg plan 人类可见)。owned。
@@ -384,17 +470,18 @@ pub const KgClient = struct {
     // 契约见设计 §9 核对表:depends_on 串行、单次 revise 闭合、frontier 单层。
 
     /// 建任务节点(schema_type=todo|plan_step)。返回 node id。best-effort provenance。
+    /// 挂接进项目子树(list-recent --project / search --project 可见)。
     pub fn createTask(self: *KgClient, text: []const u8, schema_type: []const u8) KgError!u64 {
         const out = try self.runCheckedWrite(&.{
-            "add-node",         self.store_path, "task",          text,
-            "--domain",         self.domain,     "--schema-type", schema_type,
+            "add-node", self.store_path, "task", text, "--schema-type", schema_type,
         });
         defer self.freeOut(out);
-        const line = std.mem.trim(u8, out.stdout, " \r\n");
-        if (std.mem.startsWith(u8, line, "node ")) {
-            return std.fmt.parseInt(u64, line["node ".len..], 10) catch self.dataError("createTask 输出不可解析: {s}", .{line});
-        }
-        return self.dataError("createTask 输出不可解析: {s}", .{line});
+        const id = parseNodeIdLine(out.stdout) orelse return self.dataError("createTask 输出不可解析: {s}", .{trimForLog(out.stdout)});
+        self.attachToProject(id, schema_type, false) catch |e| {
+            if (e == KgError.Data) return e;
+            return self.dataError("任务节点 {d} 已建但挂接项目失败({s})", .{ id, @errorName(e) });
+        };
+        return id;
     }
 
     /// 建边(contains/depends_on/blocks…)。环检测由 tinykg dag 层强制 → data 错透传。
@@ -411,10 +498,10 @@ pub const KgClient = struct {
     pub fn closeTask(self: *KgClient, task_id: u64, evidence: []const u8) KgError!void {
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{task_id}) catch unreachable;
+        // 新 tinykg revise 无 --domain(实证 UnknownOption);挂接沿袭原节点(revise 是版本追加)。
         const out = try self.runCheckedWrite(&.{
-            "revise",           self.store_path, id_str,          "verification",
-            evidence,           "--domain",      self.domain,     "--schema-type",
-            "verification",
+            "revise",        self.store_path, id_str, "verification",
+            evidence,        "--schema-type", "verification",
         });
         self.freeOut(out);
     }
@@ -458,12 +545,56 @@ pub const KgClient = struct {
     /// → 库里有该类型却返空。拉高超采倍数缓解,但不保证:typed recall 可能少返相关度低的同类节点。
     /// 正解是 tinykg server-side --schema-type 下推(本切片 defer)。空返 ≠ 库中无该类型。
     pub fn recallTyped(self: *KgClient, query: []const u8, limit: usize, include_tasks: bool, type_filter: ?[]const u8) KgError![]RecallHit {
+        // project-containment 召回:项目子树 + global 子树各一次 search --project(图拓扑隔离,
+        // 取代旧 domain_id 属性客户端过滤)。读路径不创建 project 节点:两个子树都不存在
+        // (库中无任何挂接记忆)→ 零 spawn 返空。
+        var results: std.ArrayList(RecallHit) = .empty;
+        errdefer {
+            for (results.items) |*h| h.deinit(self.allocator);
+            results.deinit(self.allocator);
+        }
+        const proj_id = try self.projectNodeId(false, false);
+        const glob_id = try self.projectNodeId(true, false);
+        if (proj_id) |pid| try self.searchSubtreeInto(&results, pid, self.domain, query, limit, include_tasks, type_filter);
+        if (glob_id) |gid| {
+            if (proj_id == null or gid != proj_id.?) // domain=="global" 时两者同节点,防重扫
+                try self.searchSubtreeInto(&results, gid, "global", query, limit, include_tasks, type_filter);
+        }
+        // 两路合并:按 BM25 分数降序(同库同查询,分数可比),截 limit。
+        std.mem.sort(RecallHit, results.items, {}, recallHitScoreDescLessThan);
+        if (results.items.len > limit) {
+            for (results.items[limit..]) |*h| h.deinit(self.allocator);
+            results.shrinkRetainingCapacity(limit);
+        }
+        return results.toOwnedSlice(self.allocator) catch KgError.OutOfMemory;
+    }
+
+    fn recallHitScoreDescLessThan(_: void, a: RecallHit, b: RecallHit) bool {
+        return a.score > b.score;
+    }
+
+    /// 单子树 search(--project)+ 解析 + 客户端过滤(任务面/typed),追加进 results。
+    /// domain_label 只做展示归属(RecallHit.domain);按 node_id 与已有结果去重
+    /// (节点理论上可挂多 project,防双计)。
+    fn searchSubtreeInto(
+        self: *KgClient,
+        results: *std.ArrayList(RecallHit),
+        project_id: u64,
+        domain_label: []const u8,
+        query: []const u8,
+        limit: usize,
+        include_tasks: bool,
+        type_filter: ?[]const u8,
+    ) KgError!void {
         var limbuf: [16]u8 = undefined;
+        var pbuf: [24]u8 = undefined;
         // 超采:客户端过滤后仍能凑满 limit。typed recall 多一道 schema_type 过滤 → 8× 超采抗稀有类型少返。
         const oversample: usize = if (type_filter != null) limit * 8 + 8 else limit * 2 + 4;
         const raw_limit = std.fmt.bufPrint(&limbuf, "{d}", .{oversample}) catch unreachable;
+        const p_str = std.fmt.bufPrint(&pbuf, "{d}", .{project_id}) catch unreachable;
         const out = try self.runChecked(&.{
-            "search",           self.store_path, query, "--limit", raw_limit, "--profile", "agent-memory",
+            "search",           self.store_path, query, "--project", p_str, "--limit", raw_limit,
+            "--profile",        "agent-memory",
             "--format",         "json",          "--include-text", // node 带全文 → 省每 hit get spawn(成本修复)
         });
         defer self.freeOut(out);
@@ -475,13 +606,7 @@ pub const KgClient = struct {
         const hits_v = parsed.value.object.get("hits") orelse return self.dataError("search JSON 无 hits", .{});
         if (hits_v != .array) return self.dataError("search hits 非数组", .{});
 
-        var results: std.ArrayList(RecallHit) = .empty;
-        errdefer {
-            for (results.items) |*h| h.deinit(self.allocator);
-            results.deinit(self.allocator);
-        }
         for (hits_v.array.items) |hit_v| {
-            if (results.items.len >= limit) break;
             if (hit_v != .object) continue;
             const node_v = hit_v.object.get("node") orelse continue;
             if (node_v != .object) continue;
@@ -489,23 +614,18 @@ pub const KgClient = struct {
 
             const kind = jsonStr(node.get("kind")) orelse continue;
             const schema_v = node.get("schema");
-            const domain = if (schema_v != null and schema_v.? == .object)
-                (jsonStr(schema_v.?.object.get("domain_id")) orelse "")
-            else
-                "";
             const schema_type = if (schema_v != null and schema_v.? == .object)
                 (jsonStr(schema_v.?.object.get("schema_type")) orelse "")
             else
                 "";
 
-            // domain 过滤:当前项目 + global(tinykg search 无 --domain,实证)。
-            if (!(std.mem.eql(u8, domain, self.domain) or std.mem.eql(u8, domain, "global"))) continue;
-            // 任务面隔离。
+            // 任务面隔离。project 节点自身也不进记忆召回(容器非内容)。
+            if (std.mem.eql(u8, kind, "project")) continue;
             if (!include_tasks) {
                 if (std.mem.eql(u8, kind, "task") or std.mem.eql(u8, kind, "verification")) continue;
                 if (std.mem.eql(u8, schema_type, "todo")) continue;
             }
-            // typed recall:按 schema_type 过滤(第三道客户端过滤,故上面 8× 超采)。
+            // typed recall:按 schema_type 过滤(第二道客户端过滤,故上面 8× 超采)。
             if (type_filter) |tf| {
                 if (!std.mem.eql(u8, schema_type, tf)) continue;
             }
@@ -515,6 +635,15 @@ pub const KgClient = struct {
                 .integer => |i| if (i >= 0) @intCast(i) else continue,
                 else => continue,
             };
+            // 跨子树去重(节点可挂多 project)。
+            var dup = false;
+            for (results.items) |r| {
+                if (r.node_id == node_id) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
             const score: f64 = switch (hit_v.object.get("score") orelse std.json.Value{ .float = 0 }) {
                 .float => |f| f,
                 .integer => |i| @floatFromInt(i),
@@ -525,10 +654,10 @@ pub const KgClient = struct {
             // text 借用 parsed JSON(存活到函数尾),下面 dupe 成 owned。
             const text = jsonStr(node.get("text")) orelse "";
 
-            // L1:先 dupe 三字段到局部 + errdefer,再 append——避免"kind 成功、domain 失败"泄漏。
+            // L1:先 dupe 各字段到局部 + errdefer,再 append——避免部分成功泄漏。
             const k_owned = self.allocator.dupe(u8, kind) catch return KgError.OutOfMemory;
             errdefer self.allocator.free(k_owned);
-            const d_owned = self.allocator.dupe(u8, domain) catch return KgError.OutOfMemory;
+            const d_owned = self.allocator.dupe(u8, domain_label) catch return KgError.OutOfMemory;
             errdefer self.allocator.free(d_owned);
             const s_owned = self.allocator.dupe(u8, schema_type) catch return KgError.OutOfMemory;
             errdefer self.allocator.free(s_owned);
@@ -543,7 +672,6 @@ pub const KgClient = struct {
                 .score = score,
             }) catch return KgError.OutOfMemory;
         }
-        return results.toOwnedSlice(self.allocator) catch KgError.OutOfMemory;
     }
 
     /// 取节点全文(`get <id>` TSV 第 3 列,已 unescape)。owned;NotFound 返 error.Data。
@@ -637,8 +765,13 @@ pub const KgClient = struct {
         var counts = [_]usize{0} ** display.len;
         var other: usize = 0;
 
-        self.facetScan(self.domain, display[0..], counts[0..], &other);
-        if (!std.mem.eql(u8, self.domain, "global")) self.facetScan("global", display[0..], counts[0..], &other);
+        // project-containment:项目 + global 子树各扫一次(读路径不建 project 节点)。
+        const proj_id: ?u64 = self.projectNodeId(false, false) catch null;
+        const glob_id: ?u64 = self.projectNodeId(true, false) catch null;
+        if (proj_id) |p| self.facetScan(p, display[0..], counts[0..], &other);
+        if (glob_id) |g| {
+            if (proj_id == null or g != proj_id.?) self.facetScan(g, display[0..], counts[0..], &other);
+        }
 
         var total: usize = other;
         for (counts) |c| total += c;
@@ -659,9 +792,12 @@ pub const KgClient = struct {
         return .{ .total = total, .breakdown = breakdown };
     }
 
-    /// 扫一个 domain 的 list-recent --with-type,按 schema_type 累加计数(排除 task/verification)。
-    fn facetScan(self: *KgClient, domain: []const u8, display: []const []const u8, counts: []usize, other: *usize) void {
-        const out = self.runChecked(&.{ "list-recent", self.store_path, "--domain", domain, "--with-type", "--limit", "200" }) catch return;
+    /// 扫一个 project 子树的 list-recent --project --with-type,按 schema_type 累加计数
+    /// (排除 task/verification/嵌套 project 容器)。`#` 诊断行天然被列解析跳过。
+    fn facetScan(self: *KgClient, project_id: u64, display: []const []const u8, counts: []usize, other: *usize) void {
+        var pbuf: [24]u8 = undefined;
+        const p_str = std.fmt.bufPrint(&pbuf, "{d}", .{project_id}) catch unreachable;
+        const out = self.runChecked(&.{ "list-recent", self.store_path, "--project", p_str, "--with-type", "--limit", "200" }) catch return;
         defer self.freeOut(out);
         var it = std.mem.splitScalar(u8, out.stdout, '\n');
         while (it.next()) |line| {
@@ -670,7 +806,7 @@ pub const KgClient = struct {
             _ = cols.next() orelse continue; // id
             const kind = cols.next() orelse continue;
             const st = cols.next() orelse continue; // schema_type(--with-type 第 3 列)
-            if (std.mem.eql(u8, kind, "task") or std.mem.eql(u8, kind, "verification")) continue;
+            if (std.mem.eql(u8, kind, "task") or std.mem.eql(u8, kind, "verification") or std.mem.eql(u8, kind, "project")) continue;
             var matched = false;
             for (display, 0..) |name, i| {
                 if (std.mem.eql(u8, st, name)) {
@@ -702,9 +838,12 @@ pub const KgClient = struct {
             for (results.items) |*h| h.deinit(self.allocator);
             results.deinit(self.allocator);
         }
-        try self.appendRecentForDomain(&results, self.domain, limit);
-        if (!std.mem.eql(u8, self.domain, "global")) {
-            try self.appendRecentForDomain(&results, "global", limit);
+        // project-containment:项目 + global 子树(读路径不建 project 节点;都无 → 空列表)。
+        const proj_id = try self.projectNodeId(false, false);
+        const glob_id = try self.projectNodeId(true, false);
+        if (proj_id) |p| try self.appendRecentForProject(&results, p, self.domain, limit);
+        if (glob_id) |g| {
+            if (proj_id == null or g != proj_id.?) try self.appendRecentForProject(&results, g, "global", limit);
         }
         std.mem.sort(RecallHit, results.items, {}, recallHitIdDescLessThan);
         if (results.items.len > limit) {
@@ -718,13 +857,16 @@ pub const KgClient = struct {
         return a.node_id > b.node_id; // id 降序 = 最近在前
     }
 
-    /// 把某 domain 的最近节点(list-recent TSV:id\tkind\ttext)解析成 owned RecallHit 追加到 results。
-    /// 任务面隔离(task/verification)对齐 recall(include_tasks=false)。空 domain/空 store 静默跳过。
-    fn appendRecentForDomain(self: *KgClient, results: *std.ArrayList(RecallHit), domain: []const u8, limit: usize) KgError!void {
+    /// 把某 project 子树的最近节点(list-recent --project TSV:id\tkind\ttext)解析成 owned
+    /// RecallHit 追加到 results。任务面隔离(task/verification/嵌套 project)对齐 recall。
+    /// domain_label 只做展示归属。`#` 诊断行 parseInt 失败自然跳过。
+    fn appendRecentForProject(self: *KgClient, results: *std.ArrayList(RecallHit), project_id: u64, domain_label: []const u8, limit: usize) KgError!void {
         var limbuf: [16]u8 = undefined;
+        var pbuf: [24]u8 = undefined;
         const raw = std.fmt.bufPrint(&limbuf, "{d}", .{limit * 2 + 4}) catch unreachable;
-        const out = self.runChecked(&.{ "list-recent", self.store_path, "--domain", domain, "--limit", raw }) catch |e| switch (e) {
-            KgError.Data => return, // 空 store / 无此 domain → 跳过
+        const p_str = std.fmt.bufPrint(&pbuf, "{d}", .{project_id}) catch unreachable;
+        const out = self.runChecked(&.{ "list-recent", self.store_path, "--project", p_str, "--limit", raw }) catch |e| switch (e) {
+            KgError.Data => return, // 空 store / 空子树 → 跳过
             else => return e,
         };
         defer self.freeOut(out);
@@ -736,12 +878,12 @@ pub const KgClient = struct {
             const kind = cols.next() orelse continue;
             const text_col = cols.rest();
             const node_id = std.fmt.parseInt(u64, id_str, 10) catch continue;
-            if (std.mem.eql(u8, kind, "task") or std.mem.eql(u8, kind, "verification")) continue;
+            if (std.mem.eql(u8, kind, "task") or std.mem.eql(u8, kind, "verification") or std.mem.eql(u8, kind, "project")) continue;
 
             // L1:先 dupe 三字段到局部 + errdefer,再 append——避免部分成功泄漏(对齐 recall)。
             const k_owned = self.allocator.dupe(u8, kind) catch return KgError.OutOfMemory;
             errdefer self.allocator.free(k_owned);
-            const d_owned = self.allocator.dupe(u8, domain) catch return KgError.OutOfMemory;
+            const d_owned = self.allocator.dupe(u8, domain_label) catch return KgError.OutOfMemory;
             errdefer self.allocator.free(d_owned);
             const s_owned = self.allocator.dupe(u8, "") catch return KgError.OutOfMemory; // list-recent TSV 无 schema_type
             errdefer self.allocator.free(s_owned);
