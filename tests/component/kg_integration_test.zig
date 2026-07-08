@@ -714,7 +714,9 @@ test "L2 KG: B/C 合并 — Write memdir markdown 自动入图,召回命中 sect
     }
     try std.testing.expect(found);
 
-    // ② MEMORY.md(索引)不入图:写后召回其独特词应零命中。
+    // ② MEMORY.md(索引)不入图:**全库节点计数不变**(比 project-scoped recall 强——
+    // "入了图但 attach 失败"那种假过也会被抓,Linus 次要7)。
+    const count_before_idx = kg.memoryCount();
     const args2 = try std.fmt.allocPrint(a,
         \\{{"file_path":"{s}/memory/MEMORY.md","content":"# Memory Index\n\n- xylophone unique index marker entry\n"}}
     , .{proj_dir});
@@ -722,24 +724,41 @@ test "L2 KG: B/C 合并 — Write memdir markdown 自动入图,召回命中 sect
     const out2 = try write_tool.execute(&ctx, args2);
     defer a.free(out2);
     try std.testing.expect(std.mem.indexOf(u8, out2, "\"success\":true") != null);
-    const hits2 = try kg.recall("xylophone unique index marker", 10, false);
-    defer {
-        for (hits2) |*h| h.deinit(a);
-        a.free(hits2);
-    }
-    try std.testing.expect(hits2.len == 0);
+    try std.testing.expectEqual(count_before_idx, kg.memoryCount());
 
-    // ③ memdir 外的 .md 不入图。
+    // ③ memdir 外的 .md 不入图(同样全库计数断言)。
     const args3 = try std.fmt.allocPrint(a,
         \\{{"file_path":"{s}/outside-note.md","content":"# outside\n\nzeppelin outside marker body\n"}}
     , .{proj_dir});
     defer a.free(args3);
     const out3 = try write_tool.execute(&ctx, args3);
     defer a.free(out3);
-    const hits3 = try kg.recall("zeppelin outside marker", 10, false);
+    try std.testing.expectEqual(count_before_idx, kg.memoryCount());
+
+    // ④ **旧版本必删(Linus BLOCKER1 回归锁)**:同一记忆文件 Edit(内容变)→ 新 document
+    // 导入 + 旧 document 删除 → 召回只见新版内容,旧版独特词零命中(不删的话每次编辑都
+    // 往召回里追加一套近似副本,"KG 唯一真相"变全历史堆放场)。
+    const args4 = try std.fmt.allocPrint(a,
+        \\{{"file_path":"{s}/memory/lesson-parser.md","content":"# parser lesson v2\n\n## root cause\n\nquokka tokenizer offset bug REVISED narwhal conclusion\n"}}
+    , .{proj_dir});
+    defer a.free(args4);
+    const out4 = try write_tool.execute(&ctx, args4);
+    defer a.free(out4);
+    try std.testing.expect(std.mem.indexOf(u8, out4, "\"success\":true") != null);
+    // 新版独特词命中。
+    const hits_new = try kg.recall("narwhal conclusion", 10, false);
     defer {
-        for (hits3) |*h| h.deinit(a);
-        a.free(hits3);
+        for (hits_new) |*h| h.deinit(a);
+        a.free(hits_new);
     }
-    try std.testing.expect(hits3.len == 0);
+    try std.testing.expect(hits_new.len >= 1);
+    // 旧版独特词(lesson body——v2 已不含)零命中:旧 document 已删,不残留召回。
+    const hits_old = try kg.recall("lesson body", 10, false);
+    defer {
+        for (hits_old) |*h| h.deinit(a);
+        a.free(hits_old);
+    }
+    for (hits_old) |h| {
+        try std.testing.expect(std.mem.indexOf(u8, h.text, "lesson body") == null);
+    }
 }

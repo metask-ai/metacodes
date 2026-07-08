@@ -2,23 +2,30 @@
 //!
 //! 模型用 Write/Edit 管理 memdir(`{home}/.metacodes/projects/<hash>/memory/*.md`)——通道 B。
 //! 本模块把落盘的记忆 markdown **自动** import 进 tinykg(通道 C):
-//! Write/Edit 成功后调 maybeImportMemoryFile → importMarkdownDoc(内容 hash 幂等,同内容不重导)
-//! → document 根自动挂进 project 子树(client.attachToProject)→ search --project 沿 md:* 投影
-//! 下钻 section 正文(tinykg c598e75)→ **KgRecall/scoped 自动召回同一条路覆盖结构化 + 叙事记忆**。
+//! Write/Edit 成功后调 maybeImportMemoryFile → **importMarkdownDocStable(文件路径 hash 做稳定
+//! key)** → tinykg 真 upsert(同文件同 document,增量合并删旧投影边 projection_edges_deleted)
+//! → document 根自动挂 project 子树 → search --project 沿 md:* 投影下钻 section 正文
+//! → **KgRecall/scoped 自动召回同一条路覆盖结构化 + 叙事记忆,且永远只见最新版**。
+//!
+//! 为什么必须稳定 upsert 而非"content-hash 新 doc + 删旧 doc"(Linus BLOCKER 的第一版修法):
+//! import 按 text 复用 section 节点(实证:v1/v2 共享 "## root cause" 节点),共享节点持旧
+//! md:* 出边把**旧正文接进新子树**——删旧 doc 根也断不开,旧版本永远在召回里。稳定 upsert 让
+//! tinykg 自己替换投影边(旧正文变孤儿退出 membership,gc-md-orphans 事后清),语义才干净。
+//! 代价:增量合并 order_key 撞车会乱 render 顺序——记忆召回不 render(真相在磁盘 md 文件),
+//! 无影响;render 顺序敏感的 plan 走 content-hash 版 importMarkdownDoc,不受影响。
 //!
 //! 纪律:
 //! - **best-effort,绝不影响工具结果**(KG 是增强非依赖):任何失败只 log warn。
 //! - MEMORY.md(索引文件)不入图——它是目录不是记忆内容,且每次记忆更新都会改它(噪声)。
 //! - 只处理 .md;isAutoMemPath realpath 归一化防穿越(复用权限豁免同一判定)。
-//! - 文件更新 = 新 document(旧成孤儿,gc-md-orphans 低频清;external_key 复用是后续优化)。
 
 const std = @import("std");
 const memdir = @import("../core/memory/memdir.zig");
 const log = @import("../util/log.zig");
 const ToolContext = @import("../tools/context.zig").ToolContext;
 
-/// Write/Edit 成功落盘后调用:若 path 是 memdir 内记忆 markdown → 自动入图。
-/// content = 落盘后的**全文**(Edit 调用方负责读盘)。所有失败静默降级(仅 log)。
+/// Write/Edit 成功落盘后调用:若 path 是 memdir 内记忆 markdown → 稳定 upsert 入图。
+/// content = 落盘后的**全文**(Edit 调用方负责传编辑后全文)。所有失败静默降级(仅 log)。
 pub fn maybeImportMemoryFile(ctx: *const ToolContext, path: []const u8, content: []const u8) void {
     const kg = ctx.kg orelse return;
     if (ctx.memdir_abs.len == 0) return;
@@ -28,9 +35,12 @@ pub fn maybeImportMemoryFile(ctx: *const ToolContext, path: []const u8, content:
     if (std.mem.trim(u8, content, " \t\r\n").len == 0) return; // 空文件无意义
     if (!memdir.isAutoMemPath(ctx.allocator, ctx.memdir_abs, path)) return;
 
-    const doc_id = kg.importMarkdownDoc(content) catch |e| {
+    // 稳定 key = 文件路径 hash:同文件永远 upsert 同一 document(旧投影边被 tinykg 替换,
+    // 旧正文退出召回)。
+    const stable_key = std.hash.Wyhash.hash(0x9e3d, path);
+    const doc_id = kg.importMarkdownDocStable(content, stable_key) catch |e| {
         log.warn("kg", "AutoMem markdown 入图失败({s}): {s}", .{ @errorName(e), base });
         return;
     };
-    log.info("kg", "AutoMem markdown 入图: {s} → document {d}", .{ base, doc_id });
+    log.info("kg", "AutoMem markdown 入图(upsert): {s} → document {d}", .{ base, doc_id });
 }

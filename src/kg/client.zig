@@ -115,6 +115,10 @@ pub const KgClient = struct {
     project_node_id: ?u64 = null,
     /// 跨项目 "global" project 节点 id(用户偏好等 scope_global 记忆挂此)。
     global_project_node_id: ?u64 = null,
+    /// negative cache:读路径 lookup 确认"库中无该 project 节点"(scoped 自动召回每 turn 跑,
+    /// 不缓存 miss 每 turn 白烧 spawn)。写路径 ensure 成功 / attach 失败缓存失效时复位。
+    project_miss: bool = false,
+    global_project_miss: bool = false,
     /// abort 信号(M1:ESC 中断——穿进 spawn,避免锁竞争时最坏 13 分钟不可中断)。
     /// 借用,不拥有;工具/​/kg 调用前 setAbort。
     abort: ?*const AbortSignal = null,
@@ -333,53 +337,59 @@ pub const KgClient = struct {
 
     /// 在库中按 text 精确匹配查 project 节点(list-recent --kind project)。找不到 → null。
     /// 读路径专用:绝不创建(否则 recall/facet 会污染库)。
+    /// server-side 精确 lookup(tinykg `find <db> project <text>`,原始 text 索引查)。
+    /// **不用 list-recent + 客户端比较**(Linus 严重2:TSV text 列是 escaped,basename 含
+    /// ,/:/\ 的项目会永远失配 → 召回静默全灭 + 重复 project 节点无上限增殖;且 --limit 有
+    /// 200 上限窗口)。只把 Data 类(空 store 等)视作"没有";Degraded/Transient 传播——
+    /// 吞掉会把降级伪装成"库中无记忆"(版本门测试抓的正是这个静默)。
     fn lookupProjectNodeId(self: *KgClient, name: []const u8) KgError!?u64 {
-        // --limit 上限 200(tinykg QueryBudget.max_results;>200 → InvalidLimit,实证:500 曾致
-        // lookup 恒失败 → 每次 remember 重复建 project 节点 + recall 端跳过子树返空)。
-        // 只把 Data 类(空 store 等)视作"没有";Degraded/Transient 必须传播——吞掉会把
-        // 降级伪装成"库中无记忆"(版本门测试抓的正是这个静默)。
-        const out = self.runChecked(&.{ "list-recent", self.store_path, "--kind", "project", "--limit", "200" }) catch |e| switch (e) {
+        const out = self.runChecked(&.{ "find", self.store_path, "project", name }) catch |e| switch (e) {
             KgError.Data => return null,
             else => return e,
         };
         defer self.freeOut(out);
-        var it = std.mem.splitScalar(u8, out.stdout, '\n');
-        while (it.next()) |line| {
-            if (line.len == 0) continue;
-            var cols = std.mem.splitScalar(u8, line, '\t');
-            const id_str = cols.next() orelse continue;
-            _ = cols.next() orelse continue; // kind(恒 project,--kind 已过滤)
-            const text_col = cols.rest();
-            if (!std.mem.eql(u8, text_col, name)) continue;
-            return std.fmt.parseInt(u64, id_str, 10) catch continue;
-        }
-        return null;
+        const line_end = std.mem.indexOfScalar(u8, out.stdout, '\n') orelse out.stdout.len;
+        const line = std.mem.trim(u8, out.stdout[0..line_end], " \r\n");
+        if (line.len == 0) return null; // find 未命中输出空
+        var cols = std.mem.splitScalar(u8, line, '\t');
+        const id_str = cols.next() orelse return null;
+        return std.fmt.parseInt(u64, id_str, 10) catch null;
     }
 
     /// 解析(scope_global ? "global" : 本项目)的 project 节点 id。
-    /// create=true(写路径):无则 add-node 创建;create=false(读路径):无则返 null。
-    /// session 内缓存命中零 spawn。
+    /// create=true(写路径):无则 **ensure-node 原子 find-or-create**(tinykg 单锁内,灭
+    /// 客户端 lookup/create 两次调用的竞态=同名双 project 节点记忆永久分裂,Linus 严重3);
+    /// create=false(读路径):无则返 null 并记 negative cache(scoped 自动召回每 turn 跑,
+    /// 不缓存 miss 会每 turn 白烧 spawn,Linus 次要5;写路径 ensure 成功后清除)。
     fn projectNodeId(self: *KgClient, scope_global: bool, create: bool) KgError!?u64 {
         const slot = if (scope_global) &self.global_project_node_id else &self.project_node_id;
+        const miss = if (scope_global) &self.global_project_miss else &self.project_miss;
         if (slot.*) |cached| return cached;
+        if (!create and miss.*) return null; // negative cache:本 session 已确认无
         const name = if (scope_global) "global" else self.domain;
-        if (try self.lookupProjectNodeId(name)) |found| {
-            slot.* = found;
-            return found;
+        if (!create) {
+            if (try self.lookupProjectNodeId(name)) |found| {
+                slot.* = found;
+                return found;
+            }
+            miss.* = true;
+            return null;
         }
-        if (!create) return null;
         const out = try self.runCheckedWrite(&.{
-            "add-node", self.store_path, "project", name, "--schema-type", "project",
+            "ensure-node", self.store_path, "project", name, "--schema-type", "project",
         });
         defer self.freeOut(out);
-        const id = parseNodeIdLine(out.stdout) orelse return self.dataError("创建 project 节点输出不可解析: {s}", .{trimForLog(out.stdout)});
+        const id = parseNodeIdLine(out.stdout) orelse return self.dataError("ensure project 节点输出不可解析: {s}", .{trimForLog(out.stdout)});
         slot.* = id;
+        miss.* = false;
         return id;
     }
 
     /// 把节点挂到 project 子树(govern-node --parent,tinykg 增量路径)。
     /// **必带 --schema-type**:govern-node 无此参数时会用 kind_label 覆盖 schema_type
     /// (module/bug 是 observation kind + schema_type 区分,漏传即类型信息丢失,实证)。
+    /// govern 失败 → 清 project 缓存槽(可能是缓存的 project 节点已被 forget → NotFound;
+    /// 不清则本 session 后续所有写全灭,Linus 严重4附赠)。
     fn attachToProject(self: *KgClient, node_id: u64, schema_type: []const u8, scope_global: bool) KgError!void {
         const pid = (try self.projectNodeId(scope_global, true)) orelse
             return self.dataError("project 节点解析失败(node {d} 未挂接)", .{node_id});
@@ -387,17 +397,29 @@ pub const KgClient = struct {
         var pbuf: [24]u8 = undefined;
         const n_str = std.fmt.bufPrint(&nbuf, "{d}", .{node_id}) catch unreachable;
         const p_str = std.fmt.bufPrint(&pbuf, "{d}", .{pid}) catch unreachable;
-        const out = try self.runCheckedWrite(&.{
+        const out = self.runCheckedWrite(&.{
             "govern-node", self.store_path, n_str, "--parent", p_str, "--schema-type", schema_type,
-        });
+        }) catch |e| {
+            // 缓存失效:下次写重新 ensure(stale project id 自愈)。
+            if (scope_global) {
+                self.global_project_node_id = null;
+                self.global_project_miss = false;
+            } else {
+                self.project_node_id = null;
+                self.project_miss = false;
+            }
+            return e;
+        };
         self.freeOut(out);
     }
 
-    /// `node <id>` 行 → id。解析失败 null。
+    /// `node <id>[ ...]` 行 → id(兼容 add-node `node 7` 与 ensure-node `node 7 created=1`)。
     fn parseNodeIdLine(stdout: []const u8) ?u64 {
         const line = std.mem.trim(u8, stdout, " \r\n");
         if (!std.mem.startsWith(u8, line, "node ")) return null;
-        return std.fmt.parseInt(u64, line["node ".len..], 10) catch null;
+        const rest = line["node ".len..];
+        const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+        return std.fmt.parseInt(u64, rest[0..end], 10) catch null;
     }
 
     // ── 领域方法(P1:记忆 + 注入)─────────────────────────────────────
@@ -412,8 +434,10 @@ pub const KgClient = struct {
         defer self.freeOut(out);
         const id = parseNodeIdLine(out.stdout) orelse return self.dataError("add-node 输出不可解析: {s}", .{trimForLog(out.stdout)});
         self.attachToProject(id, schema_type, scope_global) catch |e| {
-            if (e == KgError.Data) return e; // last_detail 已含现场
-            return self.dataError("记忆节点 {d} 已建但挂接项目失败({s}),可重试或 /kg forget", .{ id, @errorName(e) });
+            // **所有分支重包 detail 带 node id**(Linus 严重4:Data 分支的 last_detail 是 tinykg
+            // 裸 stderr,无孤儿 id,模型无法 /kg forget;重试 remember = 每次新建节点 → 孤儿堆积)。
+            const prior = if (self.last_detail) |d| d else "";
+            return self.dataError("记忆节点 {d} 已建但挂接项目失败({s}: {s})。请勿整体重试(会重复建节点);可 /kg forget {d} 清理后重试", .{ id, @errorName(e), prior, id });
         };
         return id;
     }
@@ -431,11 +455,26 @@ pub const KgClient = struct {
 
     /// 把 markdown 文本导入成文档图,返回 document node id。写临时 .md 文件喂 import-md-doc
     /// (它只接文件路径,不接 stdin)。best-effort:失败返 data 错。
+    /// **content-hash 版(plan 用,render 顺序敏感)**:不同内容→不同 path→全新 document
+    /// (避开增量合并 order_key 撞车致 render 乱序);相同内容→真幂等。
     pub fn importMarkdownDoc(self: *KgClient, markdown: []const u8) KgError!u64 {
-        // 内容 hash 后缀:保证"不同计划→不同 source path→不同 document 节点"(避开增量合并的
-        // order_key 撞车),"相同计划→同 path→真幂等"。
         const content_hash = std.hash.Wyhash.hash(0x7ac3, markdown);
-        const tmp_path = std.fmt.allocPrint(self.allocator, "{s}.mdimport.{x}.tmp", .{ self.store_path, content_hash }) catch return KgError.OutOfMemory;
+        return self.importMarkdownDocAt(markdown, content_hash);
+    }
+
+    /// **稳定 key 版(记忆文件用,Linus BLOCKER 修)**:同 key(如文件路径 hash)→ 同 source
+    /// path → 同 external_key → tinykg 真 upsert(增量合并,projection_edges_deleted 删旧投影)
+    /// → 旧正文变孤儿退出 --project membership,**召回永远只见最新版**。
+    /// 为何不能用 content-hash 版 + 删旧 doc:每次编辑产生全新 document,且 import 按 text 复用
+    /// section 节点(实证 "## root cause" 跨版本共享),共享节点持旧 md:* 出边把旧正文接进新
+    /// 子树——删旧 doc 根也断不开。稳定 upsert 让 tinykg 自己替换投影边,才是干净语义。
+    /// 代价:order_key 撞车乱 render 顺序——记忆召回不 render(真相在磁盘 md 文件),无影响。
+    pub fn importMarkdownDocStable(self: *KgClient, markdown: []const u8, stable_key: u64) KgError!u64 {
+        return self.importMarkdownDocAt(markdown, stable_key);
+    }
+
+    fn importMarkdownDocAt(self: *KgClient, markdown: []const u8, path_key: u64) KgError!u64 {
+        const tmp_path = std.fmt.allocPrint(self.allocator, "{s}.mdimport.{x}.tmp", .{ self.store_path, path_key }) catch return KgError.OutOfMemory;
         defer self.allocator.free(tmp_path);
         writeTmpFile(self.allocator, tmp_path, markdown) catch return self.dataError("写 md 临时文件失败", .{});
         defer deleteTmpFile(self.allocator, tmp_path);
@@ -447,12 +486,11 @@ pub const KgClient = struct {
         // stdout: `import_md_doc ... document=<id> nodes_imported=..`
         const doc_id = extractKvU64(out.stdout, "document=") orelse
             return self.dataError("import-md-doc 输出无 document id: {s}", .{trimForLog(out.stdout)});
-        // 挂接 document 根进项目子树(section 子节点经文档自身 contains 边可达;
-        // search --project 的 BFS 走 contain 关系,只保证 document 根可见——够用:
-        // 记忆召回以 document 根为入口,render-md-doc 展开全文)。
+        // 挂接 document 根进项目子树(section 后代经 md:* 投影边可达,search --project 的
+        // membership 沿 composition 下钻)。upsert 重复挂接被 tinykg link 去重吸收。
         self.attachToProject(doc_id, "document", false) catch |e| {
-            if (e == KgError.Data) return e;
-            return self.dataError("document {d} 已导入但挂接项目失败({s})", .{ doc_id, @errorName(e) });
+            const prior = if (self.last_detail) |d| d else "";
+            return self.dataError("document {d} 已导入但挂接项目失败({s}: {s})。可 /kg forget {d}", .{ doc_id, @errorName(e), prior, doc_id });
         };
         return doc_id;
     }
@@ -478,8 +516,8 @@ pub const KgClient = struct {
         defer self.freeOut(out);
         const id = parseNodeIdLine(out.stdout) orelse return self.dataError("createTask 输出不可解析: {s}", .{trimForLog(out.stdout)});
         self.attachToProject(id, schema_type, false) catch |e| {
-            if (e == KgError.Data) return e;
-            return self.dataError("任务节点 {d} 已建但挂接项目失败({s})", .{ id, @errorName(e) });
+            const prior = if (self.last_detail) |d| d else "";
+            return self.dataError("任务节点 {d} 已建但挂接项目失败({s}: {s})。请勿整体重试;可 /kg forget {d}", .{ id, @errorName(e), prior, id });
         };
         return id;
     }
