@@ -2,7 +2,7 @@
 //!
 //! 对齐 cc/src/utils/claudemd.ts:getMemoryFiles。职责:
 //!   1. 向上递归收集 cwd→root 每层的 CLAUDE.md / .claude/CLAUDE.md / CLAUDE.local.md
-//!   2. 加 User 级 ~/.claude/CLAUDE.md + ~/.metacodes/AGENT.md(原生)
+//!   2. 加 User 级 ~/.claude/CLAUDE.md + ~/.metacodes/AGENTS.md(原生)
 //!   3. 每个文件过 @import 递归内联(import.zig)
 //!   4. 每块带标签 `Contents of <abs> (<desc>):`
 //!   5. 顺序:User → Project(根→cwd) → Local,后加载者优先级最高(对齐 cc)
@@ -98,7 +98,7 @@ fn ancestorDirs(allocator: std.mem.Allocator, cwd: []const u8) ![][]u8 {
 /// 加载完整 CLAUDE.md 链,返回拼接好的纯文本(owned)。无内容返回空串(owned)。
 ///
 /// 顺序(后者优先级高,放后面):
-///   User(~/.claude/CLAUDE.md, ~/.metacodes/AGENT.md)
+///   User(~/.claude/CLAUDE.md, ~/.metacodes/AGENTS.md)
 ///   → Project(根→cwd 每层 CLAUDE.md + .claude/CLAUDE.md)
 ///   → Local(根→cwd 每层 CLAUDE.local.md)
 pub fn load(allocator: std.mem.Allocator, opts: LoadOptions) ![]u8 {
@@ -111,8 +111,9 @@ pub fn load(allocator: std.mem.Allocator, opts: LoadOptions) ![]u8 {
         defer allocator.free(user_path);
         try appendFile(allocator, &out, user_path, DESC_USER, opts.home);
 
-        // metacodes 原生用户级记忆(~/.metacodes/AGENT.md),放最后 = 用户级最高优先。
-        const agent_path = try std.fmt.allocPrint(allocator, "{s}/.metacodes/AGENT.md", .{opts.home});
+        // metacodes 原生用户级记忆(~/.metacodes/AGENTS.md,业界通用 AGENTS.md 约定),
+        // 放最后 = 用户级最高优先。
+        const agent_path = try std.fmt.allocPrint(allocator, "{s}/.metacodes/AGENTS.md", .{opts.home});
         defer allocator.free(agent_path);
         try appendFile(allocator, &out, agent_path, DESC_USER, opts.home);
     }
@@ -134,19 +135,16 @@ pub fn load(allocator: std.mem.Allocator, opts: LoadOptions) ![]u8 {
             defer allocator.free(p2);
             try appendFile(allocator, &out, p2, DESC_PROJECT, opts.home);
 
-            // 通用 AGENTS.md(互操作,如 codex/其它 agent 工具)。
+            // AGENTS.md:metacodes 原生 = 业界通用约定同一文件(codex/其它 agent 工具互操作)。
+            // 放 CLAUDE.md 之后 = 该层内 AGENTS.md 优先。
             const p3 = try std.fmt.allocPrint(allocator, "{s}/AGENTS.md", .{dir});
             defer allocator.free(p3);
             try appendFile(allocator, &out, p3, DESC_PROJECT, opts.home);
 
-            // metacodes 原生项目记忆(<dir>/AGENT.md + <dir>/.metacodes/AGENT.md),放最后 = 项目层最高。
-            const p4 = try std.fmt.allocPrint(allocator, "{s}/AGENT.md", .{dir});
+            // 收纳进原生目录的变体(<dir>/.metacodes/AGENTS.md),该层最高。
+            const p4 = try std.fmt.allocPrint(allocator, "{s}/.metacodes/AGENTS.md", .{dir});
             defer allocator.free(p4);
             try appendFile(allocator, &out, p4, DESC_PROJECT, opts.home);
-
-            const p5 = try std.fmt.allocPrint(allocator, "{s}/.metacodes/AGENT.md", .{dir});
-            defer allocator.free(p5);
-            try appendFile(allocator, &out, p5, DESC_PROJECT, opts.home);
         }
         // Local:每层 <dir>/CLAUDE.local.md(优先级最高,放最后)
         for (dirs) |dir| {
@@ -232,33 +230,37 @@ test "load: project CLAUDE.md with label" {
     try testing.expect(std.mem.indexOf(u8, out, "(project instructions, checked into the codebase):") != null);
 }
 
-test "load: 项目 AGENT.md + AGENTS.md 都加载,metacodes 原生 AGENT.md 优先于 CLAUDE.md" {
+test "load: 项目 AGENTS.md 与 CLAUDE.md 共存,AGENTS.md 优先;.metacodes/AGENTS.md 该层最高" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const dir = try tmpAbsPath(a, &tmp);
     defer a.free(dir);
     try writeFileAt(dir, "CLAUDE.md", "CLAUDE-CONTENT");
-    try writeFileAt(dir, "AGENTS.md", "AGENTS-GENERIC-CONTENT");
-    try writeFileAt(dir, "AGENT.md", "AGENT-NATIVE-CONTENT");
+    try writeFileAt(dir, "AGENTS.md", "AGENTS-CONTENT");
+    try mkdirAt(dir, ".metacodes");
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const meta_dir = try std.fmt.bufPrint(&buf, "{s}/.metacodes", .{dir});
+    try writeFileAt(meta_dir, "AGENTS.md", "META-AGENTS-CONTENT");
 
     const out = try load(a, .{ .cwd = dir, .home = "" });
     defer a.free(out);
-    // 三者共存都加载(decision:AGENT.md/CLAUDE.md/AGENTS.md 共存)。
+    // 共存都加载(decision:AGENTS.md 原生 + CLAUDE.md cc 互操作)。
     try testing.expect(std.mem.indexOf(u8, out, "CLAUDE-CONTENT") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "AGENTS-GENERIC-CONTENT") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "AGENT-NATIVE-CONTENT") != null);
-    // metacodes 原生 AGENT.md 放最后 = 优先级最高:在 CLAUDE.md 之后出现。
-    try testing.expect(std.mem.indexOf(u8, out, "AGENT-NATIVE-CONTENT").? > std.mem.indexOf(u8, out, "CLAUDE-CONTENT").?);
+    try testing.expect(std.mem.indexOf(u8, out, "AGENTS-CONTENT") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "META-AGENTS-CONTENT") != null);
+    // 同层优先级:CLAUDE.md < AGENTS.md < .metacodes/AGENTS.md(后加载覆盖)。
+    try testing.expect(std.mem.indexOf(u8, out, "AGENTS-CONTENT").? > std.mem.indexOf(u8, out, "CLAUDE-CONTENT").?);
+    try testing.expect(std.mem.indexOf(u8, out, "META-AGENTS-CONTENT").? > std.mem.indexOf(u8, out, "AGENTS-CONTENT").?);
 }
 
-test "load: 用户级 ~/.metacodes/AGENT.md 与 ~/.claude/CLAUDE.md 共存,原生最高优先" {
+test "load: 用户级 ~/.metacodes/AGENTS.md 与 ~/.claude/CLAUDE.md 共存,原生最高优先" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const home = try tmpAbsPath(a, &tmp);
     defer a.free(home);
-    // 建 ~/.claude/CLAUDE.md + ~/.metacodes/AGENT.md
+    // 建 ~/.claude/CLAUDE.md + ~/.metacodes/AGENTS.md
     try mkdirAt(home, ".claude");
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const claude_dir = try std.fmt.bufPrint(&buf, "{s}/.claude", .{home});
@@ -266,13 +268,13 @@ test "load: 用户级 ~/.metacodes/AGENT.md 与 ~/.claude/CLAUDE.md 共存,原�
     try mkdirAt(home, ".metacodes");
     var buf2: [std.fs.max_path_bytes]u8 = undefined;
     const meta_dir = try std.fmt.bufPrint(&buf2, "{s}/.metacodes", .{home});
-    try writeFileAt(meta_dir, "AGENT.md", "USER-AGENT-NATIVE-RULES");
+    try writeFileAt(meta_dir, "AGENTS.md", "USER-AGENT-NATIVE-RULES");
 
     const out = try load(a, .{ .cwd = "", .home = home });
     defer a.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "USER-CLAUDE-RULES") != null);
     try testing.expect(std.mem.indexOf(u8, out, "USER-AGENT-NATIVE-RULES") != null);
-    // 原生 AGENT.md 在 CLAUDE.md 之后 = 用户级最高优先。
+    // 原生 AGENTS.md 在 CLAUDE.md 之后 = 用户级最高优先。
     try testing.expect(std.mem.indexOf(u8, out, "USER-AGENT-NATIVE-RULES").? > std.mem.indexOf(u8, out, "USER-CLAUDE-RULES").?);
 }
 
