@@ -30,19 +30,25 @@ pub const SessionId = struct {
     pub const single: SessionId = .{ .bytes = .{'0'} ** 24 };
 };
 
-/// 生成 session id:ms 时间戳(可排序)+ monotonic ns 低 32 位(去重)。不用真随机
-/// (真随机会破坏 record-replay 确定性,见 recorder)。
+/// 生成 session id:ms 时间戳(可排序)+ monotonic ns 低 32 位 + 进程内原子计数(去重)。
+/// 不用真随机(真随机会破坏 record-replay 确定性,见 recorder)。
+/// 计数器的必要性:高负载下 clock_gettime(MONOTONIC) 连续两次可返回**相同读数**
+/// (粗粒度 tick;全测试套并发时 64 连发实测撞过)→ 纯 ms+monotonic 会产重复 id,
+/// 而 agent_ident(claim 租约)要求进程内每 loop 严格唯一。确定性自增序列,replay 安全。
+var gen_counter = std.atomic.Value(u32).init(0);
+
 pub fn gen() SessionId {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
     const ms: u64 = @intCast(@as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000));
     var ts2: std.c.timespec = undefined;
     _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts2);
-    const rand: u32 = @truncate(@as(u64, @bitCast(@as(i64, @intCast(ts2.nsec)))));
+    const mono: u32 = @truncate(@as(u64, @bitCast(@as(i64, @intCast(ts2.nsec)))));
+    const uniq = mono +% gen_counter.fetchAdd(1, .monotonic);
 
     var id: SessionId = undefined;
     _ = std.fmt.bufPrint(id.bytes[0..16], "{x:0>16}", .{ms}) catch unreachable;
-    _ = std.fmt.bufPrint(id.bytes[16..24], "{x:0>8}", .{rand}) catch unreachable;
+    _ = std.fmt.bufPrint(id.bytes[16..24], "{x:0>8}", .{uniq}) catch unreachable;
     return id;
 }
 

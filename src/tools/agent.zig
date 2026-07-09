@@ -152,6 +152,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .agent_type = subagent_type_raw,
             // subagent 只接 skill 激活(skillOnly 投影:不碰父 worktree 栈/ToolSearch 集)。
             .host_services = if (ctx.host_services) |hs| hs.skillOnly() else null,
+            // KG 透传:后台 subagent 参与任务 DAG(claim/闭合)。缺席=KgUnavailable
+            // (真模型 e2e 实锤:同步路径修了、后台路径漏了——两条 SpawnOptions 构造)。
+            .kg = ctx.kg,
+            .kg_projects_dir = ctx.kg_projects_dir,
         });
         return std.fmt.allocPrint(
             ctx.allocator,

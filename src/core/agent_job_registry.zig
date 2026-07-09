@@ -194,6 +194,10 @@ pub const SpawnParams = struct {
     agent_type: []const u8 = "",
     /// L5:后台 subagent 的宿主能力(通常 skillOnly 投影)。见 HostServices。
     host_services: ?@import("../tools/context.zig").HostServices = null,
+    /// KG 透传(subagent 参与任务 DAG:claim/闭合;真模型 e2e 抓过缺席=KgUnavailable)。
+    /// App 生命周期稳定,借用;KgClient 内部 detail 锁护并发。
+    kg: ?*@import("../kg/client.zig").KgClient = null,
+    kg_projects_dir: []const u8 = "",
     /// Ctrl+B 主对话转后台:预建对话副本(深拷贝,所有权转移给 registry → JobInput → spawnAgentSink)。
     /// null=普通 subagent(从 prompt 起新对话)。
     prebuilt_conversation: ?Conversation = null,
@@ -223,6 +227,8 @@ const JobInput = struct {
     dyn_registry: ?*const DynRegistry,
     skills: ?*const SkillSet,
     host_services: ?@import("../tools/context.zig").HostServices,
+    kg: ?*@import("../kg/client.zig").KgClient,
+    kg_projects_dir: []const u8,
     // 专属资源:
     io_runtime: *std.Io.Threaded,
     client: *client_mod.Client,
@@ -444,6 +450,8 @@ pub const AgentJobRegistry = struct {
             .dyn_registry = p.dyn_registry,
             .skills = p.skills,
             .host_services = p.host_services,
+            .kg = p.kg,
+            .kg_projects_dir = p.kg_projects_dir,
             .io_runtime = io_rt,
             .client = client,
             .prebuilt_conversation = p.prebuilt_conversation, // move(Ctrl+B 转后台);普通 subagent=null
@@ -848,6 +856,8 @@ fn jobThreadMain(input: *JobInput) void {
         .host_services = input.host_services,
         .project_dir = input.project_dir,
         .agent_jobs = input.registry, // 允许嵌套后台
+        .kg = input.kg,
+        .kg_projects_dir = input.kg_projects_dir,
         // Ctrl+B 转后台:move 预建对话给 spawnAgentSink(它 defer deinit)。**move 后立即置 null**:
         // 单一所有者不变式——此后只有 opts/spawnAgentSink 持有,input.cleanup 不再 deinit(防 double-free)。
         .prebuilt_conversation = input.prebuilt_conversation,
