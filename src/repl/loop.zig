@@ -2055,7 +2055,9 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
         // 重复 project 检测(旧 bug 时代增殖的同名节点让一半记忆召回不可见,用户自己不可能发现)。
         if (kg.duplicateProjectHint(allocator)) |hint| {
             defer allocator.free(hint);
-            std.debug.print("\x1b[33m检测到同名重复 project:{s} —— /kg projects 查看,/kg merge <输家> <赢家> 合并。\x1b[0m\n", .{hint});
+            // NO_COLOR 纪律(L1 血泪:Apple Terminal 系统级 NO_COLOR)。
+            const color = std.c.getenv("NO_COLOR") == null;
+            std.debug.print("{s}检测到同名重复 project:{s} —— /kg projects 查看,/kg merge <输家> <赢家> 合并。{s}\n", .{ if (color) "\x1b[33m" else "", hint, if (color) "\x1b[0m" else "" });
         }
         if (app.kg_projects_dir.len > 0) {
             // 两个 root 都显示,和模型侧 appendKgFrontier 对齐(P1-B:此前只读 kg_root,

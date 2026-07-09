@@ -813,4 +813,37 @@ test "L2 KG: B/C 合并 — Write memdir markdown 自动入图,召回命中 sect
         if (std.mem.eql(u8, h.source_label, "lesson-parser.md")) labeled = true;
     }
     try std.testing.expect(labeled);
+
+    // ⑧ **nodeMemorySource 三类判定(forget 防护安全闸的 L2 锁)**:document 根 → label+derived;
+    // section/正文(external_key md-doc:...#.../content:...)→ derived 无 label;
+    // 普通 KgRemember observation(无 external_key)→ 不误拦。PM 验收残留1:该判定此前仅人工
+    // 真二进制验证过——固化,防"测错面"血泪三度复发。
+    {
+        // document 根:recallTyped(document) 的首个 hit id 即 doc 根。
+        const doc_src = kg.nodeMemorySource(hits_doc[0].node_id);
+        defer if (doc_src.label) |l| a.free(l);
+        try std.testing.expect(doc_src.md_derived);
+        try std.testing.expect(doc_src.label != null);
+        // 正文节点:recall 命中 "quokka final"(observation kind,content: external_key)。
+        const hits_body = try kg.recall("quokka final lesson revision", 5, false);
+        defer {
+            for (hits_body) |*h| h.deinit(a);
+            a.free(hits_body);
+        }
+        var body_checked = false;
+        for (hits_body) |h| {
+            if (std.mem.indexOf(u8, h.text, "quokka final") == null) continue;
+            const body_src = kg.nodeMemorySource(h.node_id);
+            defer if (body_src.label) |l| a.free(l);
+            try std.testing.expect(body_src.md_derived); // section/正文同样受 forget 防护
+            try std.testing.expect(body_src.label == null);
+            body_checked = true;
+        }
+        try std.testing.expect(body_checked);
+        // 普通 typed 记忆:不误拦。
+        const plain_id = try kg.remember(.observation, "plain zorro fact not from markdown", "observation", false);
+        const plain_src = kg.nodeMemorySource(plain_id);
+        defer if (plain_src.label) |l| a.free(l);
+        try std.testing.expect(!plain_src.md_derived);
+    }
 }
