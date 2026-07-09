@@ -39,6 +39,7 @@ pub const kg_inject = @import("kg/inject.zig");
 pub const kg_scoped_recall = @import("kg/scoped_recall.zig");
 pub const abort = @import("util/abort.zig");
 pub const kg_plan_commit = @import("kg/plan_commit.zig");
+pub const kg_tools = @import("tools/kg_tools.zig");
 pub const core_goal = @import("core/goal.zig");
 pub const core_auth = auth;
 pub const core_read_state = @import("core/read_state.zig");

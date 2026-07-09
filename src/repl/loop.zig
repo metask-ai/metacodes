@@ -2060,10 +2060,15 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
             std.debug.print("{s}检测到同名重复 project:{s} —— /kg projects 查看,/kg merge <输家> <赢家> 合并。{s}\n", .{ if (color) "\x1b[33m" else "", hint, if (color) "\x1b[0m" else "" });
         }
         if (app.kg_projects_dir.len > 0) {
-            // 两个 root 都显示,和模型侧 appendKgFrontier 对齐(P1-B:此前只读 kg_root,
-            // ad-hoc todo 连 /kg 都不显示 → 用户面/模型面读不同子集)。
-            const shown_plan = printKgRootFrontier(allocator, kg, app.kg_projects_dir, "kg_root", "计划");
-            const shown_inbox = printKgRootFrontier(allocator, kg, app.kg_projects_dir, "kg_inbox", "待办");
+            // 12b 单入口:有 task 锚指针 → 一次深遍历看全(多计划+inbox,与模型侧
+            // appendKgFrontier 同源);存量店退回双指针(kg_root+kg_inbox)。
+            const inject_mod = @import("../kg/inject.zig");
+            const has_anchor = inject_mod.readIdPointer(allocator, app.kg_projects_dir, "kg_task_anchor") != null;
+            const shown_plan = if (has_anchor)
+                printKgRootFrontier(allocator, kg, app.kg_projects_dir, "kg_task_anchor", "任务面")
+            else
+                printKgRootFrontier(allocator, kg, app.kg_projects_dir, "kg_root", "计划");
+            const shown_inbox = if (has_anchor) false else printKgRootFrontier(allocator, kg, app.kg_projects_dir, "kg_inbox", "待办");
             if (!shown_plan and !shown_inbox) {
                 std.debug.print("(本项目无活跃计划图/待办;计划批准或 TaskCreate 后从此恢复)\n", .{});
             }
@@ -2110,7 +2115,9 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
             };
             defer allocator.free(md);
             // 取 kg_root frontier(开放步骤 + readiness)叠加进度标记。root 缺失/空 → 纯渲染。
-            const root = inject.readIdPointer(allocator, app.kg_projects_dir, "kg_root");
+            // overlay 匹配按步骤文本;锚根 rows 是超集(多计划+inbox),匹配语义不变。
+            const root = inject.readIdPointer(allocator, app.kg_projects_dir, "kg_task_anchor") orelse
+                inject.readIdPointer(allocator, app.kg_projects_dir, "kg_root");
             const rows: []@import("../kg/client.zig").FrontierRow = if (root) |r| (kg.frontier(r, 100) catch &.{}) else &.{};
             defer {
                 for (rows) |*fr| fr.deinit(allocator);

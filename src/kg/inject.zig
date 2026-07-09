@@ -60,26 +60,43 @@ pub fn buildSummary(
     const mem_count: usize = if (facet) |f| f.total else 0;
     const breakdown: []const u8 = if (facet) |f| f.breakdown else "";
 
-    // plan frontier(可选)。
+    // 任务面 frontier(可选)。12b 单入口:优先 task 锚(一次看全多计划+inbox),
+    // 存量店退回 kg_root。inbox root 是容器不是任务,滤掉其自身行(空时以 leaf 现身)。
     var rows: []client_mod.FrontierRow = &.{};
     var root_id: u64 = 0;
-    if (readIdPointer(allocator, projects_dir, "kg_root")) |rid| {
+    const anchor_ptr = readIdPointer(allocator, projects_dir, "kg_task_anchor");
+    if (anchor_ptr orelse readIdPointer(allocator, projects_dir, "kg_root")) |rid| {
         const is_task = kg.nodeIsTask(rid) catch false;
         if (!is_task) {
-            clearIdPointer(allocator, projects_dir, "kg_root"); // stale 防御
+            clearIdPointer(allocator, projects_dir, if (anchor_ptr != null) "kg_task_anchor" else "kg_root"); // stale 防御
         } else {
             rows = kg.frontier(rid, 50) catch &.{};
             root_id = rid;
         }
     }
+    // 释放持原始整片(free 的 len 必须等于分配时的 len);过滤只产生视图。
+    const rows_alloc = rows;
     defer {
-        for (rows) |*r| r.deinit(allocator);
-        if (rows.len > 0) allocator.free(rows);
+        for (rows_alloc) |*r| r.deinit(allocator);
+        if (rows_alloc.len > 0) allocator.free(rows_alloc);
+    }
+    var view: []const client_mod.FrontierRow = rows;
+    if (rows.len > 0) {
+        if (readIdPointer(allocator, projects_dir, "kg_inbox")) |inbox_id| {
+            // inbox root 行(容器残影)滤出视图;不 deinit(原片 defer 统一释放)。
+            var keep: usize = 0;
+            for (rows, 0..) |r, i| {
+                if (r.task_id == inbox_id) continue;
+                if (keep != i) std.mem.swap(client_mod.FrontierRow, &rows[keep], &rows[i]);
+                keep += 1;
+            }
+            view = rows[0..keep];
+        }
     }
 
     // 全空(无记忆 + 无 frontier)→ 空态零输出。
-    if (mem_count == 0 and rows.len == 0) return null;
-    return renderSummary(allocator, root_id, rows, mem_count, breakdown) catch null;
+    if (mem_count == 0 and view.len == 0) return null;
+    return renderSummary(allocator, root_id, view, mem_count, breakdown) catch null;
 }
 
 /// 纯渲染(可单测):记忆数锚(带类型 breakdown)+ frontier rows → 注入段文本。

@@ -114,6 +114,9 @@ def _seed_plan(home, bin_path, proj):
     _tinykg(store, "add-edge", ids["C"], "depends_on", ids["B"])
     with open(os.path.join(proj_dirs[0], "kg_root"), "w") as f:
         f.write(ids["root"] + "\n")
+    # 12b 单入口:锚指针在则 TaskList/inject 从锚深遍历(root 变 branch 行,叶子带 path)。
+    with open(os.path.join(proj_dirs[0], "kg_task_anchor"), "w") as f:
+        f.write(aid + "\n")
 
     # 预检①:图完整性——全部任务经锚可达(list-recent --project 下钻,不许孤儿)。
     lr = _tinykg(store, "list-recent", "--project", pid, "--limit", "10")

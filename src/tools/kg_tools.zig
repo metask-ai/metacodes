@@ -67,8 +67,9 @@ pub fn executeRemember(ctx: *const ToolContext, args: []const u8) anyerror![]u8 
     defer if (dup_note) |n| ctx.allocator.free(n);
     if (kg.recall(text_owned, 3, false)) |hits| {
         defer {
-            for (hits) |*h| h.deinit(ctx.allocator);
-            ctx.allocator.free(hits);
+            // kg 内存契约:hits 是 kg.allocator 分的(subagent 线程 ctx.allocator 不同源)。
+            for (hits) |*h| h.deinit(kg.allocator);
+            kg.allocator.free(hits);
         }
         for (hits) |h| {
             if (isNearDuplicate(text_owned, h.text)) {
@@ -86,6 +87,11 @@ pub fn executeRemember(ctx: *const ToolContext, args: []const u8) anyerror![]u8 
     // provenance(best-effort)。
     const sid = ctx.session.asSlice();
     if (sid.len > 0) kg.tagProvenance(node_id, sid);
+    // 溯源(乙方案第4条):任务执行中沉淀的记忆回链任务——本 session 有进行中的 kg 任务
+    // 时挂 derived_from(记忆是任务的产物;task-ancestry/packet 双向可导航)。best-effort。
+    if (activeKgTaskId(ctx)) |task_id| {
+        kg.addEdge(node_id, "derived_from", task_id) catch {};
+    }
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(ctx.allocator);
@@ -98,6 +104,18 @@ pub fn executeRemember(ctx: *const ToolContext, args: []const u8) anyerror![]u8 
     }
     try out.appendSlice(ctx.allocator, "}");
     return out.toOwnedSlice(ctx.allocator);
+}
+
+/// 本 session 进行中的 kg 任务(store 镜像里 status=in_progress 且 id 形如 kg-<n>)。
+/// 溯源锚:记忆/文档产物 derived_from 它。多个 in_progress 取第一个(主任务惯例)。
+fn activeKgTaskId(ctx: *const ToolContext) ?u64 {
+    const store = ctx.tasks orelse return null;
+    for (store.tasks.items) |t| {
+        if (t.status != .in_progress) continue;
+        if (!std.mem.startsWith(u8, t.id, "kg-")) continue;
+        return std.fmt.parseInt(u64, t.id["kg-".len..], 10) catch continue;
+    }
+    return null;
 }
 
 pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
@@ -128,8 +146,9 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         return kgErrorResult(ctx, kg, e, "KgRecall");
     };
     defer {
-        for (hits) |*h| h.deinit(ctx.allocator);
-        ctx.allocator.free(hits);
+        // kg 内存契约:hits 是 kg.allocator 分的(subagent 线程 ctx.allocator 不同源)。
+        for (hits) |*h| h.deinit(kg.allocator);
+        kg.allocator.free(hits);
     }
 
     var out: std.ArrayList(u8) = .empty;

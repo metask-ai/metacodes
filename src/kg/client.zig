@@ -109,6 +109,11 @@ pub const FrontierRow = struct {
 };
 
 pub const KgClient = struct {
+    /// **内存契约(血泪,真模型 e2e 抓的进程级 panic)**:本 client 所有返回 owned 内存
+    /// (frontier rows/fetchNodeText/recall hits/…)都以 `self.allocator` 分配,调用方必须用
+    /// **kg.allocator** 释放。主循环里 ctx.allocator 恰好同源(App gpa)侥幸工作;subagent
+    /// 后台线程的 ctx.allocator 是另一个 allocator——用它 free 会 ArenaAllocator null panic
+    /// 杀整个进程。新增调用点一律 `deinit(kg.allocator)` / `kg.allocator.free(...)`。
     allocator: std.mem.Allocator,
     /// tinykg 二进制绝对路径(owned)。null = 未解析到 → degraded。
     bin_path: ?[]u8 = null,
@@ -475,6 +480,12 @@ pub const KgClient = struct {
         }
     }
 
+    /// task 锚 id(写路径 lazy ensure + 缓存)。12b:frontier/TaskList 的单一查询根
+    /// ——锚=任务面总任务,深遍历一次看全(多计划树 + inbox todos)。
+    pub fn ensureTaskAnchorId(self: *KgClient) KgError!u64 {
+        return self.ensureAnchorId(false, .task);
+    }
+
     fn attachToProject(self: *KgClient, node_id: u64, schema_type: []const u8, scope_global: bool) KgError!void {
         const kind = anchorForSchemaType(schema_type);
         const aid = try self.ensureAnchorId(scope_global, kind);
@@ -680,6 +691,17 @@ pub const KgClient = struct {
         const d_str = std.fmt.bufPrint(&dbuf, "{d}", .{dst}) catch unreachable;
         const out = try self.runCheckedWrite(&.{ "add-edge", self.store_path, s_str, rel, d_str });
         self.freeOut(out);
+    }
+
+    /// 节点出边一览(neighbors 原文,owned)。溯源检视面:记忆/文档 derived_from 哪个任务。
+    pub fn neighborsText(self: *KgClient, node_id: u64, limit: usize) KgError![]u8 {
+        var idbuf: [24]u8 = undefined;
+        var limbuf: [16]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{node_id}) catch unreachable;
+        const lim_str = std.fmt.bufPrint(&limbuf, "{d}", .{limit}) catch unreachable;
+        const out = try self.runChecked(&.{ "neighbors", self.store_path, id_str, "--limit", lim_str });
+        defer self.freeOut(out);
+        return self.allocator.dupe(u8, out.stdout) catch KgError.OutOfMemory;
     }
 
     /// 闭合任务:`revise <id> verification "<evidence>"`(单步,解锁依赖链+出 frontier)。

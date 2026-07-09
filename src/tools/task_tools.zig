@@ -216,6 +216,10 @@ fn ensureInboxRoot(ctx: *const ToolContext, kg: *@import("../kg/client.zig").KgC
     }
     const root = kg.createTask("会话待办(ad-hoc todos)", "inbox_root") catch return null;
     inject.writeIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_inbox", root) catch {};
+    // 12b:inbox root 已挂 task 锚(createTask 路由)——顺手写锚指针(frontier 单入口)。
+    if (kg.ensureTaskAnchorId()) |aid| {
+        inject.writeIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_task_anchor", aid) catch {};
+    } else |_| {}
     return root;
 }
 
@@ -288,15 +292,34 @@ fn appendParallelHint(ctx: *const ToolContext, out: *std.ArrayList(u8), first: *
     try out.appendSlice(ctx.allocator, hint);
 }
 
-/// 把 KG **计划步骤** frontier(kg_root)作为任务项追加进 TaskList 输出。
-/// 计划步骤的 readiness(depends_on 解锁)是图**派生**的,必须每次从 frontier 读活值。
-/// inbox todos **不**走这里——它们已 write-through 镜像进内存 store(见 createKgTask),
-/// 由 executeList 的 store 遍历呈现;若也读 inbox frontier 会双列。
+/// 把 KG 任务面 frontier 作为任务项追加进 TaskList 输出。
+/// 12b 单入口:优先 kg_task_anchor(task 锚=总任务,深遍历一次看全多计划树+inbox);
+/// 无锚指针(存量店)退回 kg_root(单计划 legacy)。readiness 是图派生的,必须每次读活值。
+/// 双列防重:write-through 镜像过的 todo(store 里有 kg-<id>)跳过——由 store 遍历呈现;
+/// 空 inbox root 叶(全部 todo 闭合后的容器残影)按 kg_inbox 指针滤掉。
 /// 返回 ready 且无主的叶子数(并行 fan-out 信号源)。
 fn appendKgFrontier(ctx: *const ToolContext, out: *std.ArrayList(u8), first: *bool) !usize {
     const kg = ctx.kg orelse return 0;
     if (!kg.ready or ctx.kg_projects_dir.len == 0) return 0;
+    const inject = @import("../kg/inject.zig");
+    if (inject.readIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_task_anchor") != null) {
+        return try appendRootFrontier(ctx, out, first, "kg_task_anchor", true);
+    }
     return try appendRootFrontier(ctx, out, first, "kg_root", true);
+}
+
+/// 12b frontier 行过滤:镜像 todo 防双列 + 空 inbox root 容器残影。
+fn skipFrontierRow(ctx: *const ToolContext, r: @import("../kg/client.zig").FrontierRow, inbox_id: ?u64) bool {
+    if (inbox_id) |iid| {
+        // inbox root 无开放子时以 leaf 现身——它是容器不是任务,永不该上看板。
+        if (r.task_id == iid) return true;
+    }
+    if (ctx.tasks) |store| {
+        var idbuf: [24]u8 = undefined;
+        const kg_id = std.fmt.bufPrint(&idbuf, "kg-{d}", .{r.task_id}) catch return false;
+        if (store.get(kg_id) != null) return true; // write-through 镜像已呈现
+    }
+    return false;
 }
 
 /// 呈现单个 root 的 frontier。is_plan 标注 plan_step(true)vs inbox todo(false)。
@@ -310,18 +333,25 @@ fn appendRootFrontier(ctx: *const ToolContext, out: *std.ArrayList(u8), first: *
     const rows = kg.frontier(root, 50) catch return 0;
     if (rows.len == 0) {
         inject.clearIdPointer(ctx.allocator, ctx.kg_projects_dir, pointer_name);
-        ctx.allocator.free(rows);
+        kg.allocator.free(rows);
         return 0;
     }
     defer {
-        for (rows) |*r| r.deinit(ctx.allocator);
-        ctx.allocator.free(rows);
+        // kg 内存契约:rows 是 kg.allocator 分的,必须用它释放(subagent 线程 ctx.allocator 不同源)。
+        for (rows) |*r| r.deinit(kg.allocator);
+        kg.allocator.free(rows);
     }
+    // 12b 过滤器:发射侧 ① write-through 镜像过的 todo(store 有 kg-<id>)跳过防双列;
+    // ② 空 inbox root 叶(容器残影)按 kg_inbox 指针滤。
+    // **计数侧只滤容器**:镜像只是呈现渠道,任务本身仍 ready 无主——并行集不因镜像低估。
+    const inbox_id: ?u64 = inject.readIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_inbox");
     var ready_unclaimed: usize = 0;
     for (rows) |r| {
+        if (inbox_id != null and r.task_id == inbox_id.?) continue;
         if (r.role == .leaf and r.readiness == .ready and r.claimed_by == null) ready_unclaimed += 1;
     }
     for (rows) |r| {
+        if (skipFrontierRow(ctx, r, inbox_id)) continue;
         // branch = 开放复合节点(靠子树闭合),非可执行项;看板只列叶子/关联,
         // 结构上下文由叶子行的 path 面包屑承担。
         if (r.role == .branch) continue;
@@ -364,7 +394,7 @@ fn getKgTask(ctx: *const ToolContext, node_id_str: []const u8) anyerror![]u8 {
     if (!kg.ready) return error.KgUnavailable;
     const node_id = std.fmt.parseInt(u64, node_id_str, 10) catch return error.TaskNotFound;
     const text = kg.fetchNodeText(node_id) catch return error.TaskNotFound;
-    defer ctx.allocator.free(text);
+    defer kg.allocator.free(text); // kg 内存契约(见 KgClient 顶注)
     if (text.len == 0) return error.TaskNotFound;
     // 首行 = subject,全文 = description(与 createKgTask 的 subject\ndescription 对称)。
     const nl = std.mem.indexOfScalar(u8, text, '\n');
@@ -439,7 +469,18 @@ fn updateKgTask(ctx: *const ToolContext, node_id_str: []const u8, args: []const 
             if (ctx.tasks) |store| {
                 var idbuf: [24]u8 = undefined;
                 const kg_id = std.fmt.bufPrint(&idbuf, "kg-{d}", .{node_id}) catch return error.OutOfMemory;
-                store.updateStatus(kg_id, st) catch {};
+                if (store.get(kg_id) == null and st == .in_progress) {
+                    // 认领的计划步骤镜像上板:TaskTab 可见 + activeKgTaskId(溯源锚——
+                    // 任务执行中沉淀的记忆 derived_from 它)能找到。todo 早有镜像,此处专治计划步骤。
+                    if (kg.fetchNodeText(node_id)) |text| {
+                        defer kg.allocator.free(text); // kg 内存契约:subagent 线程 ctx.allocator 不同源
+                        const nl = std.mem.indexOfScalar(u8, text, '\n');
+                        const subject = if (nl) |i| text[0..i] else text;
+                        store.createWithId(kg_id, subject, text, .in_progress) catch {};
+                    } else |_| {}
+                } else {
+                    store.updateStatus(kg_id, st) catch {};
+                }
             }
             if (st == .in_progress) {
                 return try ctx.allocator.dupe(u8, "{\"ok\":true,\"claimed\":true,\"note\":\"已认领(租约落图,其他 session 不会重复领取);完成后 status=completed 闭合\"}");

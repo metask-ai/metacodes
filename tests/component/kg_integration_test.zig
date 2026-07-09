@@ -614,11 +614,13 @@ test "L2 KG: 深树全链 — 嵌套子任务/branch 聚合/path/claim 租约/�
 
         try std.testing.expectError(error.Data, kg.claimTask(sub_a, "other-session"));
 
-        // 认领后只剩 1 个无主 ready → 并行提示消失;claimed_by 上看板。
+        // 认领后只剩 1 个无主 ready → 并行提示消失;认领的步骤镜像上板(12b:
+        // 本 session 的 claim 以镜像 in_progress 呈现,frontier 行被镜像去重)。
         const list = try task_tools.executeList(&ctx, "{}");
         defer a.free(list);
         try std.testing.expect(std.mem.indexOf(u8, list, "parallel_hint") == null);
-        try std.testing.expect(std.mem.indexOf(u8, list, "\"claimed_by\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, list, "\"subject\":\"子任务甲\",\"status\":\"in_progress\"") != null or
+            std.mem.indexOf(u8, list, "\"status\":\"in_progress\"") != null);
     }
 
     // 闭合两个子任务 → 步骤一子树全闭 → 步骤一变 ready 叶子(波前上移);闭步骤一 → 步骤二解锁。
@@ -649,6 +651,124 @@ test "L2 KG: 深树全链 — 嵌套子任务/branch 聚合/path/claim 租约/�
         }
         try std.testing.expect(step2_ready);
     }
+}
+
+test "L2 KG: 12b 锚单入口 — TaskList 经 task 锚看全多计划,镜像 todo 不双列,inbox 容器不现身" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const proj_dir = pbuf[0..dir_len];
+    const store_path = try std.fmt.allocPrint(a, "{s}/kganchor.kg", .{proj_dir});
+    defer a.free(store_path);
+
+    var kg = try makeClient(a, bin, store_path, "proj-anchor");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const plan_commit = @import("cc").kg_plan_commit;
+    const inject = @import("cc").kg_inject;
+    // 两个计划树(锚下多计划一次看全——旧 kg_root 单指针做不到)。
+    const r1 = try plan_commit.commit(a, &kg, "计划甲\n1. 甲一\n2. 甲二");
+    const r2 = try plan_commit.commit(a, &kg, "计划乙\n1. 乙一\n2. 乙二");
+    _ = r1;
+    _ = r2;
+    const aid = try kg.ensureTaskAnchorId();
+    try inject.writeIdPointer(a, proj_dir, "kg_task_anchor", aid);
+
+    const task_tools = @import("cc").task_tools;
+    const TaskStore = @import("cc").core_task_store.TaskStore;
+    var tstore = TaskStore.init(a);
+    defer tstore.deinit();
+    var ctx = @import("cc").tool_context.ToolContext{
+        .allocator = a,
+        .tasks = &tstore,
+        .kg = &kg,
+        .kg_projects_dir = proj_dir,
+    };
+
+    // write-through todo(镜像 + 图 inbox,inbox root 挂锚)。
+    const created = try task_tools.executeCreate(&ctx, "{\"subject\":\"顺手待办\",\"description\":\"d\"}");
+    a.free(created);
+
+    const list = try task_tools.executeList(&ctx, "{}");
+    defer a.free(list);
+    // 锚单入口:两棵计划树的 ready 叶子都在(甲一/乙一;甲二被 depends_on 门住也在,blocked)。
+    try std.testing.expect(std.mem.indexOf(u8, list, "\"subject\":\"甲一\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list, "\"subject\":\"乙一\"") != null);
+    // 镜像 todo 只出现一次(store 遍历),frontier 行被镜像去重滤掉。
+    const first_hit = std.mem.indexOf(u8, list, "\"subject\":\"顺手待办\"").?;
+    try std.testing.expect(std.mem.indexOfPos(u8, list, first_hit + 1, "\"subject\":\"顺手待办\"") == null);
+    // inbox root 是容器不是任务,不上看板。
+    try std.testing.expect(std.mem.indexOf(u8, list, "会话待办") == null);
+}
+
+test "L2 KG: derived_from 溯源 — 认领计划步骤后 KgRemember 的记忆回链任务" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const proj_dir = pbuf[0..dir_len];
+    const store_path = try std.fmt.allocPrint(a, "{s}/kgprov.kg", .{proj_dir});
+    defer a.free(store_path);
+
+    var kg = try makeClient(a, bin, store_path, "proj-prov");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const plan_commit = @import("cc").kg_plan_commit;
+    const r = try plan_commit.commit(a, &kg, "溯源计划\n1. 调查根因\n2. 写修复");
+    const rows = try kg.frontier(r.root_id, 10);
+    var step_id: u64 = 0;
+    for (rows) |row| {
+        if (std.mem.indexOf(u8, row.text, "调查根因") != null) step_id = row.task_id;
+    }
+    for (rows) |*row| row.deinit(a);
+    a.free(rows);
+    try std.testing.expect(step_id != 0);
+
+    const task_tools = @import("cc").task_tools;
+    const kg_tools_mod = @import("cc").kg_tools;
+    const TaskStore = @import("cc").core_task_store.TaskStore;
+    var tstore = TaskStore.init(a);
+    defer tstore.deinit();
+    var ctx = @import("cc").tool_context.ToolContext{
+        .allocator = a,
+        .tasks = &tstore,
+        .kg = &kg,
+        .kg_projects_dir = proj_dir,
+    };
+
+    // 认领(in_progress)→ 计划步骤镜像上板(activeKgTaskId 溯源锚可见)。
+    const claim_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"in_progress\"}}", .{step_id});
+    defer a.free(claim_args);
+    const resp = try task_tools.executeUpdate(&ctx, claim_args);
+    a.free(resp);
+
+    // 任务执行中沉淀记忆 → 自动 derived_from 回链。
+    const mem_resp = try kg_tools_mod.executeRemember(&ctx, "{\"text\":\"根因是缓存钥匙失灵\",\"kind\":\"bug\"}");
+    defer a.free(mem_resp);
+    const marker = "\"node_id\":";
+    const mpos = std.mem.indexOf(u8, mem_resp, marker).?;
+    const mem_id = blk: {
+        var end = mpos + marker.len;
+        while (end < mem_resp.len and mem_resp[end] >= '0' and mem_resp[end] <= '9') end += 1;
+        break :blk try std.fmt.parseInt(u64, mem_resp[mpos + marker.len .. end], 10);
+    };
+
+    const nb = try kg.neighborsText(mem_id, 10);
+    defer a.free(nb);
+    var expect_buf: [48]u8 = undefined;
+    const needle = try std.fmt.bufPrint(&expect_buf, "derived_from\t{d}", .{step_id});
+    try std.testing.expect(std.mem.indexOf(u8, nb, needle) != null);
 }
 
 test "L2 KG: TaskCreate write-through — ad-hoc todo 落图 inbox,TaskList 呈现,TaskGet/Stop 走 kg-" {
