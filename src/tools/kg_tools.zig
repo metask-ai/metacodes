@@ -144,6 +144,12 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         defer ctx.allocator.free(row);
         try out.appendSlice(ctx.allocator, row);
         try appendJsonString(&out, ctx.allocator, h.text);
+        // 溯源(PM P0-2):hit 带 source 的是记忆 markdown 文件——模型该**更新该文件**而非
+        // 另存/KgRemember(否则 "update rather than duplicate" 指令不可执行)。
+        if (h.source_label.len > 0) {
+            try out.appendSlice(ctx.allocator, ",\"source\":");
+            try appendJsonString(&out, ctx.allocator, h.source_label);
+        }
         try out.appendSlice(ctx.allocator, "}");
     }
     // 搭车 facet(PM:可见性,零额外调用):结果里各类型计数,让模型知道有哪些类型 → 可 --type 精化。

@@ -132,7 +132,10 @@ fn readWholeFile(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
             out.deinit(allocator);
             return null;
         };
-        if (out.items.len > 8 << 20) break; // 8MB 防呆
+        if (out.items.len > 8 << 20) { // 超限:截断内容当真相 upsert 会污染图 → 按失败处理
+            out.deinit(allocator);
+            return null;
+        }
     }
     return out.toOwnedSlice(allocator) catch null;
 }

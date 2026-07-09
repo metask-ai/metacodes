@@ -771,22 +771,85 @@ pub const KgClient = struct {
         }
     }
 
-    /// 节点的 source_label(md 派生 document 根;/kg forget 溯源提示用)。无/失败 → null。
-    pub fn nodeSourceLabel(self: *KgClient, node_id: u64) ?[]u8 {
+    pub const MemorySource = struct {
+        /// 来源记忆文件名(document 根有;section/正文无 → null)。owned。
+        label: ?[]u8,
+        /// 是否 md 派生节点(document 根 label 判定,或 external_key 前缀 md-doc:/content:
+        /// ——section/正文节点无 label 但同样会被同文件 Write upsert 复活,防护必须同拦,
+        /// Linus 次要5:只拦 document 根是半扇门)。
+        md_derived: bool,
+    };
+
+    /// 节点的记忆来源(/kg forget 假删除防护 + 溯源提示)。查询失败 → 保守 .{null,false}。
+    pub fn nodeMemorySource(self: *KgClient, node_id: u64) MemorySource {
+        const none = MemorySource{ .label = null, .md_derived = false };
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{node_id}) catch unreachable;
-        const out = self.runChecked(&.{ "get", self.store_path, id_str, "--format", "json" }) catch return null;
+        const out = self.runChecked(&.{ "get", self.store_path, id_str, "--format", "json" }) catch return none;
         defer self.freeOut(out);
-        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, out.stdout, .{}) catch return null;
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, out.stdout, .{}) catch return none;
         defer parsed.deinit();
-        if (parsed.value != .object) return null;
-        const node_v = parsed.value.object.get("node") orelse return null;
-        if (node_v != .object) return null;
-        const schema_v = node_v.object.get("schema") orelse return null;
-        if (schema_v != .object) return null;
-        const label = jsonStr(schema_v.object.get("source_label")) orelse return null;
-        if (label.len == 0) return null;
-        return self.allocator.dupe(u8, label) catch null;
+        if (parsed.value != .object) return none;
+        const node_v = parsed.value.object.get("node") orelse return none;
+        if (node_v != .object) return none;
+        const schema_v = node_v.object.get("schema") orelse return none;
+        if (schema_v != .object) return none;
+        const label_raw = jsonStr(schema_v.object.get("source_label")) orelse "";
+        const ext_key = jsonStr(schema_v.object.get("external_key")) orelse "";
+        const md_derived = label_raw.len > 0 or
+            std.mem.startsWith(u8, ext_key, "md-doc:") or
+            std.mem.startsWith(u8, ext_key, "content:");
+        const label: ?[]u8 = if (label_raw.len > 0) (self.allocator.dupe(u8, label_raw) catch null) else null;
+        return .{ .label = label, .md_derived = md_derived };
+    }
+
+    /// project 节点列表("  id  名称\n" 多行,owned;/kg projects 用——merge 的 id 唯一出口)。
+    pub fn listProjects(self: *KgClient, allocator: std.mem.Allocator) KgError![]u8 {
+        const out = try self.runChecked(&.{ "list-recent", self.store_path, "--kind", "project", "--limit", "200" });
+        defer self.freeOut(out);
+        var b: std.ArrayList(u8) = .empty;
+        errdefer b.deinit(allocator);
+        var it = std.mem.splitScalar(u8, out.stdout, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            var cols = std.mem.splitScalar(u8, line, '\t');
+            const id_str = cols.next() orelse continue;
+            _ = cols.next() orelse continue; // kind
+            const text_col = cols.rest();
+            _ = std.fmt.parseInt(u64, id_str, 10) catch continue; // 跳过 `#` 诊断行
+            const row = std.fmt.allocPrint(allocator, "  {s}  {s}\n", .{ id_str, text_col }) catch return KgError.OutOfMemory;
+            defer allocator.free(row);
+            b.appendSlice(allocator, row) catch return KgError.OutOfMemory;
+        }
+        return b.toOwnedSlice(allocator) catch KgError.OutOfMemory;
+    }
+
+    /// 重复 project 检测(状态页提示):同名(escaped text)project ≥2 → 返回名字串(owned);无 → null。
+    /// 旧 bug 时代增殖的重复让一半记忆召回不可见,用户自己不可能发现,必须主动提示。
+    pub fn duplicateProjectHint(self: *KgClient, allocator: std.mem.Allocator) ?[]u8 {
+        const out = self.runChecked(&.{ "list-recent", self.store_path, "--kind", "project", "--limit", "200" }) catch return null;
+        defer self.freeOut(out);
+        var seen = std.StringHashMap(void).init(allocator);
+        defer {
+            var kit = seen.keyIterator();
+            while (kit.next()) |k| allocator.free(k.*);
+            seen.deinit();
+        }
+        var it = std.mem.splitScalar(u8, out.stdout, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            var cols = std.mem.splitScalar(u8, line, '\t');
+            const id_str = cols.next() orelse continue;
+            _ = cols.next() orelse continue;
+            const text_col = cols.rest();
+            _ = std.fmt.parseInt(u64, id_str, 10) catch continue;
+            const gop = seen.getOrPut(text_col) catch return null;
+            if (gop.found_existing) {
+                return allocator.dupe(u8, text_col) catch null; // 首个重复名即够提示
+            }
+            gop.key_ptr.* = allocator.dupe(u8, text_col) catch return null;
+        }
+        return null;
     }
 
     /// merge 原语接线:reparent-contain(重复 project 节点合并;/kg merge 用)。返回摘要(owned)。
