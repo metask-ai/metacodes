@@ -139,6 +139,9 @@ pub const KgClient = struct {
     /// 直到自己发生一次写(ensure 复位)或重启——接受的权衡,不是 bug。
     project_miss: bool = false,
     global_project_miss: bool = false,
+    /// project 三锚 id 缓存(乙方案):[scope_global 0/1][AnchorKind]。写路径 lazy ensure;
+    /// 失效纪律同 project 缓存:挂接失败清对应槽,下次写重新 ensure(stale 自愈)。
+    anchor_ids: [2][3]?u64 = .{ .{ null, null, null }, .{ null, null, null } },
     /// AutoMem 自动入图 session 内计数(PM P1:静默失败要有检视面;/kg 状态页展示)。
     autosync_ok: u32 = 0,
     autosync_fail: u32 = 0,
@@ -416,27 +419,90 @@ pub const KgClient = struct {
     /// (module/bug 是 observation kind + schema_type 区分,漏传即类型信息丢失,实证)。
     /// govern 失败 → 清 project 缓存槽(可能是缓存的 project 节点已被 forget → NotFound;
     /// 不清则本 session 后续所有写全灭,Linus 严重4附赠)。
-    fn attachToProject(self: *KgClient, node_id: u64, schema_type: []const u8, scope_global: bool) KgError!void {
+    /// project 三锚(乙方案):任务面/文档面/记忆面。成员挂各面的锚(或面内的根),
+    /// 不再全部直挂 project——孤儿是一个极端,拍平直挂是另一个极端;membership
+    /// 查询(search/list-recent --project)沿 composition 下钻,挂根即可达。
+    pub const AnchorKind = enum(u2) {
+        task,
+        docs,
+        memory,
+
+        fn cliName(self: AnchorKind) []const u8 {
+            return switch (self) {
+                .task => "task",
+                .docs => "docs",
+                .memory => "memory",
+            };
+        }
+    };
+
+    /// schema_type → 归属面。任务类(todo/plan_step/inbox_root)→ task 锚;
+    /// document → docs 锚;其余(记忆 schema_type,含 agent 自定义类型)→ memory 锚。
+    fn anchorForSchemaType(schema_type: []const u8) AnchorKind {
+        if (std.mem.eql(u8, schema_type, "todo") or
+            std.mem.eql(u8, schema_type, "plan_step") or
+            std.mem.eql(u8, schema_type, "inbox_root")) return .task;
+        if (std.mem.eql(u8, schema_type, "document")) return .docs;
+        return .memory;
+    }
+
+    /// 锚 id 解析(lazy ensure + session 缓存)。ensure-anchor 是 tinykg 原子 find-or-create,
+    /// 每类每 project 唯一由原语保证。
+    fn ensureAnchorId(self: *KgClient, scope_global: bool, kind: AnchorKind) KgError!u64 {
+        const slot = &self.anchor_ids[@intFromBool(scope_global)][@intFromEnum(kind)];
+        if (slot.*) |id| return id;
         const pid = (try self.projectNodeId(scope_global, true)) orelse
-            return self.dataError("project 节点解析失败(node {d} 未挂接)", .{node_id});
-        var nbuf: [24]u8 = undefined;
+            return self.dataError("project 节点解析失败({s} 锚不可得)", .{kind.cliName()});
         var pbuf: [24]u8 = undefined;
-        const n_str = std.fmt.bufPrint(&nbuf, "{d}", .{node_id}) catch unreachable;
         const p_str = std.fmt.bufPrint(&pbuf, "{d}", .{pid}) catch unreachable;
-        const out = self.runCheckedWrite(&.{
-            "govern-node", self.store_path, n_str, "--parent", p_str, "--schema-type", schema_type,
-        }) catch |e| {
-            // 缓存失效:下次写重新 ensure(stale project id 自愈)。
-            if (scope_global) {
-                self.global_project_node_id = null;
-                self.global_project_miss = false;
-            } else {
-                self.project_node_id = null;
-                self.project_miss = false;
-            }
-            return e;
-        };
-        self.freeOut(out);
+        const out = try self.runCheckedWrite(&.{ "ensure-anchor", self.store_path, p_str, kind.cliName() });
+        defer self.freeOut(out);
+        const id = parseNodeIdLine(out.stdout) orelse
+            return self.dataError("ensure-anchor 输出不可解析: {s}", .{trimForLog(out.stdout)});
+        slot.* = id;
+        return id;
+    }
+
+    fn invalidateAnchor(self: *KgClient, scope_global: bool, kind: AnchorKind) void {
+        self.anchor_ids[@intFromBool(scope_global)][@intFromEnum(kind)] = null;
+        // project id 也可能 stale(锚失效常因整店重写)——连带清,下次写全链重 ensure。
+        if (scope_global) {
+            self.global_project_node_id = null;
+            self.global_project_miss = false;
+        } else {
+            self.project_node_id = null;
+            self.project_miss = false;
+        }
+    }
+
+    fn attachToProject(self: *KgClient, node_id: u64, schema_type: []const u8, scope_global: bool) KgError!void {
+        const kind = anchorForSchemaType(schema_type);
+        const aid = try self.ensureAnchorId(scope_global, kind);
+        var nbuf: [24]u8 = undefined;
+        var abuf: [24]u8 = undefined;
+        const n_str = std.fmt.bufPrint(&nbuf, "{d}", .{node_id}) catch unreachable;
+        const a_str = std.fmt.bufPrint(&abuf, "{d}", .{aid}) catch unreachable;
+        switch (kind) {
+            // 任务面:锚=总任务,挂 contains(frontier(锚) 可深遍历全览;12b 指针退役的地基)。
+            // add-edge 幂等(同 src/rel/dst 去重),schema_type 已在 add-node 时写。
+            .task => {
+                const out = self.runCheckedWrite(&.{ "add-edge", self.store_path, a_str, "contains", n_str }) catch |e| {
+                    self.invalidateAnchor(scope_global, kind);
+                    return e;
+                };
+                self.freeOut(out);
+            },
+            // 文档/记忆面:治理归属 contain(govern-node 同时写 schema_type 属性)。
+            .docs, .memory => {
+                const out = self.runCheckedWrite(&.{
+                    "govern-node", self.store_path, n_str, "--parent", a_str, "--schema-type", schema_type,
+                }) catch |e| {
+                    self.invalidateAnchor(scope_global, kind);
+                    return e;
+                };
+                self.freeOut(out);
+            },
+        }
     }
 
     /// `node <id>[ ...]` 行 → id(兼容 add-node `node 7` 与 ensure-node `node 7 created=1`)。
@@ -587,6 +653,21 @@ pub const KgClient = struct {
         self.attachToProject(id, schema_type, false) catch |e| {
             const prior = if (self.last_detail) |d| d else "";
             return self.dataError("任务节点 {d} 已建但挂接项目失败({s}: {s})。请勿整体重试;可 /kg forget {d}", .{ id, @errorName(e), prior, id });
+        };
+        return id;
+    }
+
+    /// 建**子**任务:挂父任务(contains),**不**直挂 project/锚——归属经根传递
+    /// (membership 下钻),直挂是拍平反模式。深树子任务/计划步骤/inbox todo 用此。
+    pub fn createChildTask(self: *KgClient, parent_id: u64, text: []const u8, schema_type: []const u8) KgError!u64 {
+        const out = try self.runCheckedWrite(&.{
+            "add-node", self.store_path, "task", text, "--schema-type", schema_type,
+        });
+        defer self.freeOut(out);
+        const id = parseNodeIdLine(out.stdout) orelse return self.dataError("createChildTask 输出不可解析: {s}", .{trimForLog(out.stdout)});
+        self.addEdge(parent_id, "contains", id) catch |e| {
+            const prior = if (self.last_detail) |d| d else "";
+            return self.dataError("子任务 {d} 已建但挂接父 {d} 失败({s}: {s})。请勿整体重试;可 /kg forget {d}", .{ id, parent_id, @errorName(e), prior, id });
         };
         return id;
     }

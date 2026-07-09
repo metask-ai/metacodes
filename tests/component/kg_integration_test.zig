@@ -559,10 +559,9 @@ test "L2 KG: 深树全链 — 嵌套子任务/branch 聚合/path/claim 租约/�
     a.free(rows0);
     try std.testing.expect(step1_id != 0);
 
-    const sub_a = try kg.createTask("子任务甲", "task");
-    const sub_b = try kg.createTask("子任务乙", "task");
-    try kg.addEdge(step1_id, "contains", sub_a);
-    try kg.addEdge(step1_id, "contains", sub_b);
+    // 子任务原语:挂 step 下(不直挂 project——挂根即归属,深树不拍平)。
+    const sub_a = try kg.createChildTask(step1_id, "子任务甲", "todo");
+    const sub_b = try kg.createChildTask(step1_id, "子任务乙", "todo");
 
     // frontier 深遍历:步骤一变 branch(不可执行,等子树);甲/乙是 ready 叶子,path 带"步骤一"。
     {

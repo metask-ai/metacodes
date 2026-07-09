@@ -168,14 +168,12 @@ pub fn commit(
 
     var committed: usize = 0;
     for (parsed.steps, 0..) |step, i| {
-        // 节点 → contains 边 → depends_on 边(逐条;失败即停,前缀已是合法图)。
-        const sid = kg.createTask(step.text, "plan_step") catch {
+        // 子任务原语(节点+contains 一体):steps **不直挂 project**——root 已挂 task 锚,
+        // steps 经 root 可达(membership 下钻),直挂是拍平反模式。失败即停,前缀已是合法图。
+        const sid = kg.createChildTask(root, step.text, "plan_step") catch {
             return .{ .root_id = root, .steps_committed = committed, .total_steps = parsed.steps.len, .incomplete = true, .structured = true, .truncated = parsed.truncated };
         };
         step_ids[i] = sid;
-        kg.addEdge(root, "contains", sid) catch {
-            return .{ .root_id = root, .steps_committed = committed, .total_steps = parsed.steps.len, .incomplete = true, .structured = true, .truncated = parsed.truncated };
-        };
         for (step.deps) |dep_idx| {
             if (dep_idx < i) { // 只连已建的前驱
                 kg.addEdge(sid, "depends_on", step_ids[dep_idx]) catch {

@@ -99,12 +99,14 @@ def _seed_plan(home, bin_path, proj):
     anchor_hash = os.path.basename(proj_dirs[0])
     domain = f"{os.path.basename(proj)}-{anchor_hash[:8]}"
     pid = _node_id(_tinykg(store, "ensure-node", "project", domain, "--schema-type", "project"))
+    # 锚形状(乙方案生产同形):project ─contain→ task_anchor ─contains→ root ─contains→ 步骤。
+    # 成员挂根不直挂 project(拍平是反模式;membership 靠下钻)。
+    aid = _node_id(_tinykg(store, "ensure-anchor", pid, "task"))
 
     ids = {}
     for key, text in [("root", "发布演示 v1"), ("A", "整理甲清单"), ("B", "整理乙清单"), ("C", "汇总收尾")]:
-        nid = _node_id(_tinykg(store, "add-node", "task", text))
-        _tinykg(store, "govern-node", nid, "--parent", pid, "--schema-type", "plan_step")
-        ids[key] = nid
+        ids[key] = _node_id(_tinykg(store, "add-node", "task", text, "--schema-type", "plan_step"))
+    _tinykg(store, "add-edge", aid, "contains", ids["root"])
     _tinykg(store, "add-edge", ids["root"], "contains", ids["A"])
     _tinykg(store, "add-edge", ids["root"], "contains", ids["B"])
     _tinykg(store, "add-edge", ids["root"], "contains", ids["C"])
@@ -113,10 +115,10 @@ def _seed_plan(home, bin_path, proj):
     with open(os.path.join(proj_dirs[0], "kg_root"), "w") as f:
         f.write(ids["root"] + "\n")
 
-    # 预检①:图完整性——project 子树含全部 4 个任务(不许孤儿)。
-    nb = _tinykg(store, "neighbors", pid, "--limit", "10")
+    # 预检①:图完整性——全部任务经锚可达(list-recent --project 下钻,不许孤儿)。
+    lr = _tinykg(store, "list-recent", "--project", pid, "--limit", "10")
     for text in ("发布演示 v1", "整理甲清单", "整理乙清单", "汇总收尾"):
-        assert text in nb, f"任务未挂 project 子树(孤儿):{text}\n{nb}"
+        assert text in lr, f"任务不在 project 子树可达域(孤儿):{text}\n{lr}"
     # 预检②:frontier 形状 A/B ready + C missing(播种错就别烧模型)。
     fr = _tinykg(store, "task-frontier", ids["root"], "--limit", "10")
     assert "readiness=ready" in _frontier_row(fr, "整理甲清单"), fr

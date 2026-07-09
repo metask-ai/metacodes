@@ -183,10 +183,9 @@ fn createKgTask(ctx: *const ToolContext, subject: []const u8, description: []con
         ctx.allocator.dupe(u8, subject) catch return null;
     defer ctx.allocator.free(text);
 
-    const node = kg.createTask(text, "todo") catch return null;
-    // contains 边失败:节点已建但没挂进 inbox → 它仍是合法 task,只是不在 inbox frontier。
-    // 不回滚(delete 是全店重写,代价大);返回 node id,frontier 少显一条不致命。
-    kg.addEdge(inbox, "contains", node) catch {};
+    // 子任务原语:todo 挂 inbox root(contains),不直挂 project(inbox root 已挂 task 锚,
+    // 归属经下钻可达;旧 createTask+addEdge 是双挂拍平)。
+    const node = kg.createChildTask(inbox, text, "todo") catch return null;
 
     // **镜像进内存 store**(PM P0-A 回归修复):图是持久真相,store 是 TaskTab/TaskList 的
     // 同步显示缓存。不镜像 → TaskTab 只读 store → KG ready 时面板全黑(任务落图但面板不读图)。
