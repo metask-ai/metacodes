@@ -59,6 +59,15 @@ pub const SpawnOptions = struct {
     /// 后台 subagent registry(允许嵌套后台:子 agent 也能 Task(run_in_background)注册进同一 root)。
     /// null = 子 agent 不能再开后台(同步路径恒 null)。
     agent_jobs: ?*@import("agent_job_registry.zig").AgentJobRegistry = null,
+    /// KG 客户端透传(subagent 参与任务 DAG:frontier/claim/闭合)。null = 子 agent 无图。
+    /// 并发安全:KgClient 内部有 mutex 串行化调用(后台 subagent 多线程共享同一实例)。
+    kg: ?*@import("../kg/client.zig").KgClient = null,
+    kg_projects_dir: []const u8 = "",
+    /// 本 subagent loop 的对外身份(KG claim 租约)。null = spawn 时自动 gen 一个
+    /// 全局唯一 id——**身份由程序赋予**,每个独立 agent loop 一个,进程内并发 subagent
+    /// 互相防撞、跨进程靠 gen()(ms 时戳+monotonic ns)天然不撞。
+    /// Ctrl+B 主对话转后台续跑若需延续主 session 的租约,显式传父 id。
+    agent_ident: ?@import("session_id.zig").SessionId = null,
     /// 预建对话(Ctrl+B 主对话转后台用):非 null 时 spawnAgentSink **用它续跑**(忽略 prompt 参数),
     /// 而非从空 conversation + appendText(prompt) 起。**所有权转移给 spawnAgentSink**(它 defer deinit)。
     /// 普通 subagent 恒 null(从 prompt 起新对话)。
@@ -134,6 +143,10 @@ pub fn spawnAgentSink(
             .project_dir = opts.project_dir,
             .model_override = opts.model_override,
             .tasks = &sub_tasks,
+            .kg = opts.kg,
+            .kg_projects_dir = opts.kg_projects_dir,
+            // 每个 subagent loop 一个程序生成的全局唯一对外身份(claim 租约)。
+            .agent_ident = opts.agent_ident orelse @import("session_id.zig").gen(),
             // 后台 subagent 不应往父 stdout 喷 ANSI 着色(final_text/output 会混入 \x1b[32m)。
             // sink 是 NullWriter(同步)或 SinkWriter(后台)时都非交互终端 → 关着色。
             .colorize = false,

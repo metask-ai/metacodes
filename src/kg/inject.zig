@@ -84,11 +84,15 @@ pub fn buildSummary(
 
 /// 纯渲染(可单测):记忆数锚(带类型 breakdown)+ frontier rows → 注入段文本。
 pub fn renderSummary(allocator: std.mem.Allocator, root_id: u64, rows: []const client_mod.FrontierRow, mem_count: usize, breakdown: []const u8) ![]u8 {
+    // v2 深遍历:branch 行是结构上下文(开放复合节点),不算可执行任务;
+    // 计数与"ready 前 3"只看叶子/关联(frontier 的可执行集语义)。
     var ready_count: usize = 0;
     var blocked_count: usize = 0;
     for (rows) |r| {
+        if (r.role == .branch) continue;
         if (r.readiness == .ready) ready_count += 1 else blocked_count += 1;
     }
+    const actionable_count = ready_count + blocked_count;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -102,14 +106,23 @@ pub fn renderSummary(allocator: std.mem.Allocator, root_id: u64, rows: []const c
         }
     }
     // ② plan frontier(有活跃图时)。
-    if (rows.len > 0) {
-        try appendPrint(&out, allocator, "持久任务图(root {d}):{d} ready / {d} blocked(共 {d})\n", .{ root_id, ready_count, blocked_count, rows.len });
+    if (actionable_count > 0) {
+        try appendPrint(&out, allocator, "持久任务图(root {d}):{d} ready / {d} blocked(共 {d})\n", .{ root_id, ready_count, blocked_count, actionable_count });
         var shown: usize = 0;
         for (rows) |r| {
+            if (r.role == .branch) continue;
             if (r.readiness != .ready) continue;
             if (shown >= MAX_READY_SHOWN) break;
             shown += 1;
-            try appendPrint(&out, allocator, "- [{d}] {s}\n", .{ r.task_id, firstLineTrunc(r.text, 120) });
+            if (r.path) |p| {
+                try appendPrint(&out, allocator, "- [{d}] {s} › {s}", .{ r.task_id, p, firstLineTrunc(r.text, 120) });
+            } else {
+                try appendPrint(&out, allocator, "- [{d}] {s}", .{ r.task_id, firstLineTrunc(r.text, 120) });
+            }
+            if (r.claimed_by) |c| {
+                try appendPrint(&out, allocator, "(已被 {s} 认领)", .{c});
+            }
+            try out.appendSlice(allocator, "\n");
         }
         if (ready_count > MAX_READY_SHOWN) try appendPrint(&out, allocator, "- …还有 {d} 个 ready 任务\n", .{ready_count - MAX_READY_SHOWN});
         try out.appendSlice(allocator, "此为启动快照,以 TaskList 实时结果为准。\n");

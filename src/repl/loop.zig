@@ -2321,11 +2321,12 @@ fn printPlanWithProgress(md: []const u8, rows: []const @import("../kg/client.zig
     var it1 = std.mem.splitScalar(u8, md, '\n');
     while (it1.next()) |line| {
         if (stepContent(line)) |content| {
-            // 匹配 open frontier(readiness)。
+            // 匹配 open frontier(readiness)。v2 深遍历下 branch 行也在 frontier,
+            // "不在 frontier = 已完成"的推断对复合步骤同样成立。
             var mark: []const u8 = "✓"; // 默认:不在 frontier = 已完成
             for (rows) |r| {
                 if (frontierMatches(r.text, content)) {
-                    mark = switch (r.readiness) {
+                    mark = if (r.role == .branch) "▹" else switch (r.readiness) {
                         .ready => "○",
                         .blocked => "⊘",
                         .missing_dependencies => "…",
@@ -2376,14 +2377,25 @@ fn printKgRootFrontier(allocator: std.mem.Allocator, kg: anytype, projects_dir: 
         allocator.free(rows);
     }
     if (rows.len == 0) return false;
-    std.debug.print("{s} root {d} — {d} 个开放:\n", .{ label, root, rows.len });
+    var actionable: usize = 0;
     for (rows) |r| {
-        const mark = switch (r.readiness) {
+        if (r.role != .branch) actionable += 1;
+    }
+    std.debug.print("{s} root {d} — {d} 个开放:\n", .{ label, root, actionable });
+    for (rows) |r| {
+        // branch = 开放复合节点(等子树闭合)→ ▹;缩进按 depth 呈现树形。
+        const mark = if (r.role == .branch) "▹" else switch (r.readiness) {
             .ready => "○",
             .blocked => "⊘",
             .missing_dependencies => "…",
         };
-        std.debug.print("  {s} [{d}] {s}\n", .{ mark, r.task_id, firstLine(r.text) });
+        const depth = if (r.depth > 0) r.depth - 1 else 0;
+        var indent_buf: [16]u8 = undefined;
+        const indent_n = @min(depth * 2, indent_buf.len);
+        @memset(indent_buf[0..indent_n], ' ');
+        std.debug.print("  {s}{s} [{d}] {s}", .{ indent_buf[0..indent_n], mark, r.task_id, firstLine(r.text) });
+        if (r.claimed_by) |c| std.debug.print("(认领:{s})", .{c});
+        std.debug.print("\n", .{});
     }
     return true;
 }

@@ -761,6 +761,7 @@ pub const App = struct {
             app.allocator.free(rows);
         }
         for (rows) |r| {
+            if (r.role == .branch) continue; // 复合节点非可执行项,镜像只收叶子
             var idbuf: [24]u8 = undefined;
             const kg_id = std.fmt.bufPrint(&idbuf, "kg-{d}", .{r.task_id}) catch continue;
             const nl = std.mem.indexOfScalar(u8, r.text, '\n');

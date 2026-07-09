@@ -264,42 +264,68 @@ pub fn executeList(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // M3:原子——失败回滚 out 到追加前长度,绝不吐半截坏 JSON。
     const kg_mark = out.items.len;
     const kg_first_before = first;
-    appendKgFrontier(ctx, &out, &first) catch {
+    const parallel_ready = appendKgFrontier(ctx, &out, &first) catch blk: {
         out.shrinkRetainingCapacity(kg_mark);
         first = kg_first_before;
+        break :blk 0;
     };
+    appendParallelHint(ctx, &out, &first, parallel_ready) catch {};
     try out.append(ctx.allocator, ']');
     return try out.toOwnedSlice(ctx.allocator);
+}
+
+/// 并行信号:frontier 的 ready 无主叶子集按定义相互无序(有未闭合排序边就不会 ready)
+/// → k≥2 时是天然的 fan-out 候选。提示模型可起 subagent 各认领一叶,防串行浪费。
+fn appendParallelHint(ctx: *const ToolContext, out: *std.ArrayList(u8), first: *bool, ready_unclaimed: usize) !void {
+    if (ready_unclaimed < 2) return;
+    if (!first.*) try out.append(ctx.allocator, ',');
+    first.* = false;
+    const hint = try std.fmt.allocPrint(
+        ctx.allocator,
+        "{{\"parallel_hint\":\"{d} 个 ready 任务相互无依赖,可并行:可用 Task 工具起后台 subagent 分别处理;每个 subagent 开工前先 TaskUpdate(status=in_progress)认领(租约防撞车),完成后 status=completed 闭合。\"}}",
+        .{ready_unclaimed},
+    );
+    defer ctx.allocator.free(hint);
+    try out.appendSlice(ctx.allocator, hint);
 }
 
 /// 把 KG **计划步骤** frontier(kg_root)作为任务项追加进 TaskList 输出。
 /// 计划步骤的 readiness(depends_on 解锁)是图**派生**的,必须每次从 frontier 读活值。
 /// inbox todos **不**走这里——它们已 write-through 镜像进内存 store(见 createKgTask),
 /// 由 executeList 的 store 遍历呈现;若也读 inbox frontier 会双列。
-fn appendKgFrontier(ctx: *const ToolContext, out: *std.ArrayList(u8), first: *bool) !void {
-    const kg = ctx.kg orelse return;
-    if (!kg.ready or ctx.kg_projects_dir.len == 0) return;
-    try appendRootFrontier(ctx, out, first, "kg_root", true);
+/// 返回 ready 且无主的叶子数(并行 fan-out 信号源)。
+fn appendKgFrontier(ctx: *const ToolContext, out: *std.ArrayList(u8), first: *bool) !usize {
+    const kg = ctx.kg orelse return 0;
+    if (!kg.ready or ctx.kg_projects_dir.len == 0) return 0;
+    return try appendRootFrontier(ctx, out, first, "kg_root", true);
 }
 
 /// 呈现单个 root 的 frontier。is_plan 标注 plan_step(true)vs inbox todo(false)。
-fn appendRootFrontier(ctx: *const ToolContext, out: *std.ArrayList(u8), first: *bool, pointer_name: []const u8, is_plan: bool) !void {
+/// 返回 ready 且无主的叶子数(供并行 fan-out 提示)。
+fn appendRootFrontier(ctx: *const ToolContext, out: *std.ArrayList(u8), first: *bool, pointer_name: []const u8, is_plan: bool) !usize {
     const kg = ctx.kg.?;
     const inject = @import("../kg/inject.zig");
-    const root = inject.readIdPointer(ctx.allocator, ctx.kg_projects_dir, pointer_name) orelse return;
+    const root = inject.readIdPointer(ctx.allocator, ctx.kg_projects_dir, pointer_name) orelse return 0;
     // M2:省掉冗余 nodeIsTask spawn——task-frontier 对非 task/不存在的 root 本就空返;
     // 空 frontier 时顺手清 stale 指针。热路径少一次子进程。
-    const rows = kg.frontier(root, 50) catch return;
+    const rows = kg.frontier(root, 50) catch return 0;
     if (rows.len == 0) {
         inject.clearIdPointer(ctx.allocator, ctx.kg_projects_dir, pointer_name);
         ctx.allocator.free(rows);
-        return;
+        return 0;
     }
     defer {
         for (rows) |*r| r.deinit(ctx.allocator);
         ctx.allocator.free(rows);
     }
+    var ready_unclaimed: usize = 0;
     for (rows) |r| {
+        if (r.role == .leaf and r.readiness == .ready and r.claimed_by == null) ready_unclaimed += 1;
+    }
+    for (rows) |r| {
+        // branch = 开放复合节点(靠子树闭合),非可执行项;看板只列叶子/关联,
+        // 结构上下文由叶子行的 path 面包屑承担。
+        if (r.role == .branch) continue;
         if (!first.*) try out.append(ctx.allocator, ',');
         first.* = false;
         const status = if (r.readiness == .ready) "pending" else "blocked";
@@ -319,8 +345,18 @@ fn appendRootFrontier(ctx: *const ToolContext, out: *std.ArrayList(u8), first: *
         try out.appendSlice(ctx.allocator, if (is_plan) "plan_step" else "persisted");
         try out.appendSlice(ctx.allocator, "\":true,\"readiness\":\"");
         try out.appendSlice(ctx.allocator, @tagName(r.readiness));
-        try out.appendSlice(ctx.allocator, "\"}");
+        try out.appendSlice(ctx.allocator, "\"");
+        if (r.path) |p| {
+            try out.appendSlice(ctx.allocator, ",\"path\":");
+            try writeString(out, ctx.allocator, p);
+        }
+        if (r.claimed_by) |c| {
+            try out.appendSlice(ctx.allocator, ",\"claimed_by\":");
+            try writeString(out, ctx.allocator, c);
+        }
+        try out.appendSlice(ctx.allocator, "}");
     }
+    return ready_unclaimed;
 }
 
 /// KG 任务查询(TaskGet 的 kg-<node> 路由)。返回节点文本(首行 subject + 全文 description)。
@@ -369,12 +405,14 @@ fn updateKgTask(ctx: *const ToolContext, node_id_str: []const u8, args: []const 
             };
             removeKgMirror(ctx, node_id); // store 镜像同步消失(TaskTab/TaskList)
             // 搭车:返回更新后的 frontier(刷新看板——设计 §2.2 R2 幂等"看板"非"领任务")。
+            // 闭合正是选下一步的时刻:ready 无主叶子 ≥2 时同样给并行提示。
             var out: std.ArrayList(u8) = .empty;
             errdefer out.deinit(ctx.allocator);
             try out.appendSlice(ctx.allocator, "{\"ok\":true,\"closed\":true,\"next\":");
             var first = true;
             try out.append(ctx.allocator, '[');
-            appendKgFrontier(ctx, &out, &first) catch {};
+            const parallel_ready = appendKgFrontier(ctx, &out, &first) catch 0;
+            appendParallelHint(ctx, &out, &first, parallel_ready) catch {};
             try out.append(ctx.allocator, ']');
             try out.appendSlice(ctx.allocator, "}");
             return out.toOwnedSlice(ctx.allocator);
@@ -388,14 +426,26 @@ fn updateKgTask(ctx: *const ToolContext, node_id_str: []const u8, args: []const 
             return try ctx.allocator.dupe(u8, "{\"ok\":true,\"deleted\":true}");
         },
         else => {
-            // in_progress/pending 是易失 UI 态,不落图(设计 §2:UI 态仅缓存)。但要同步进
-            // store 镜像,让 TaskTab 显示 todo 的 in_progress(镜像缺失=计划步骤 → no-op)。
+            // in_progress/pending:状态本身是易失 UI 态(不落图),但**租约落图**——
+            // in_progress = 本 session 认领(多 agent 并行防撞车,TTL 读侧过期),
+            // pending = 释放租约(放回任务池)。撞他人未过期租约 → 明确报错引导换任务。
+            if (st == .in_progress) {
+                kg.claimTask(node_id, ctx.agent_ident.asSlice()) catch {
+                    common.setErrorDetail(ctx.error_detail, ctx.allocator, "任务 {d} 已被其他 session 认领(租约未过期): {s}。请用 TaskList 选择其他 ready 任务,或等租约过期。", .{ node_id, kg.detail() });
+                    return error.KgClaimHeld;
+                };
+            } else if (st == .pending) {
+                kg.releaseTask(node_id, ctx.agent_ident.asSlice()) catch {}; // best-effort:释放失败不阻塞看板
+            }
             if (ctx.tasks) |store| {
                 var idbuf: [24]u8 = undefined;
                 const kg_id = std.fmt.bufPrint(&idbuf, "kg-{d}", .{node_id}) catch return error.OutOfMemory;
                 store.updateStatus(kg_id, st) catch {};
             }
-            return try ctx.allocator.dupe(u8, "{\"ok\":true,\"note\":\"in_progress 是 UI 态,已更新看板(不持久化到图)\"}");
+            if (st == .in_progress) {
+                return try ctx.allocator.dupe(u8, "{\"ok\":true,\"claimed\":true,\"note\":\"已认领(租约落图,其他 session 不会重复领取);完成后 status=completed 闭合\"}");
+            }
+            return try ctx.allocator.dupe(u8, "{\"ok\":true,\"note\":\"已放回任务池(租约已释放)\"}");
         },
     }
 }

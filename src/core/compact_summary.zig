@@ -94,6 +94,39 @@ pub fn applySummaryPrefix(allocator: std.mem.Allocator, summary_suffix: []const 
     return std.fmt.allocPrint(allocator, "{s}\n{s}", .{ trimRightAscii(prefix, " \t\r\n"), summary_suffix });
 }
 
+/// 任务锚:把本 session 进行中的任务确定性写进 compact 摘要(不依赖模型自觉保留)。
+/// compact 最容易丢的就是"我正在做哪个任务、做完要闭合"的闭环纪律——摘要有损,
+/// 锚是硬保底。无 in_progress 任务 → null。返回 owned。
+pub fn buildTaskAnchor(allocator: std.mem.Allocator, tasks: *@import("task_store.zig").TaskStore) ?[]u8 {
+    var out = std.ArrayList(u8).empty;
+    var count: usize = 0;
+    for (tasks.tasks.items) |t| {
+        if (t.status != .in_progress) continue;
+        if (count >= 3) break; // 锚要小:最多 3 条
+        count += 1;
+        out.appendSlice(allocator, "- ") catch break;
+        out.appendSlice(allocator, t.id) catch break;
+        out.appendSlice(allocator, " ") catch break;
+        out.appendSlice(allocator, t.subject) catch break;
+        out.append(allocator, '\n') catch break;
+    }
+    defer out.deinit(allocator);
+    if (count == 0) return null;
+    return std.fmt.allocPrint(
+        allocator,
+        "\n\n## Active tasks(compact 任务锚)\n{s}继续推进以上进行中的任务;完成后用 TaskUpdate(status=completed)闭合,不要遗忘。",
+        .{out.items},
+    ) catch null;
+}
+
+/// 把任务锚拼到摘要尾部(summary owned 被消费,返回新 owned)。anchor null → 原样返回。
+pub fn appendTaskAnchor(allocator: std.mem.Allocator, summary: []u8, anchor: ?[]const u8) []u8 {
+    const a = anchor orelse return summary;
+    const joined = std.fmt.allocPrint(allocator, "{s}{s}", .{ summary, a }) catch return summary;
+    allocator.free(summary);
+    return joined;
+}
+
 fn loadTemplateOrDefault(allocator: std.mem.Allocator, env_name: [:0]const u8, default_text: []const u8) ![]u8 {
     if (std.c.getenv(env_name.ptr)) |path_c| {
         const path = std.mem.span(path_c);

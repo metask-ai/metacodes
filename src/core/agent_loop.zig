@@ -204,6 +204,10 @@ pub const Options = struct {
     tasks: ?*@import("task_store.zig").TaskStore = null,
     kg: ?*@import("../kg/client.zig").KgClient = null,
     kg_projects_dir: []const u8 = "",
+    /// 本 agent loop 的对外身份(KG claim 租约)。null = 沿用 session(主 loop:
+    /// App.session_id 跨进程唯一且跨 turn 稳定)。subagent spawn 时必须显式 gen——
+    /// 每个独立 agent loop 一个全局唯一 id,进程内并发 subagent 才互相有防撞。
+    agent_ident: ?@import("session_id.zig").SessionId = null,
     /// AutoMem memdir 绝对路径(B/C 合并 markdown 自动入图)。
     memdir_abs: []const u8 = "",
     /// 供 Agent 工具 spawn 子 agent 复用 api_client + tool_defs。
@@ -509,6 +513,7 @@ pub fn run(
                     sess,
                     &context_warning_emitted,
                     allocator,
+                    opts.tasks,
                 );
                 if (previous_model_compact_outcome == .api_error) {
                     return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
@@ -532,6 +537,7 @@ pub fn run(
                 sess,
                 &context_warning_emitted,
                 allocator,
+                opts.tasks,
             );
             if (pre_sampling_compact == .api_error) {
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
@@ -948,6 +954,7 @@ pub fn run(
         // 子进程心跳(Bash 长命令"仍在运行")per-session 通路:从 opts 透传到 ctx → spawn 层。
         base_ctx.spawn_tick_fn = opts.spawn_tick_fn;
         base_ctx.session = sess; // UiRequest 路由到本 session 视图(M5)
+        base_ctx.agent_ident = opts.agent_ident orelse sess; // 对外身份(claim);主 loop=session,subagent=spawn 时 gen
 
         // 6c. 分批并发执行。过程态(TTY 顶层):无条件 emit tool_start(每个 run slot);
         // **渲染决策(showStartCard/hasProgressCard/喂 spinner)全在 backend**——agent_loop
@@ -1155,6 +1162,7 @@ pub fn run(
             sess,
             &context_warning_emitted,
             allocator,
+            opts.tasks,
         );
         if (post_tool_compact == .api_error) {
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
@@ -1434,6 +1442,7 @@ fn runAutoCompactIfNeeded(
     sess: @import("session_id.zig").SessionId,
     context_warning_emitted: ?*bool,
     allocator: std.mem.Allocator,
+    tasks: ?*@import("task_store.zig").TaskStore,
 ) !AutoCompactOutcome {
     var outcome: AutoCompactOutcome = .not_needed;
     const tool_result_limit = conversation_mod.toolResultContextBytes(provider.maxInputTokens());
@@ -1460,14 +1469,18 @@ fn runAutoCompactIfNeeded(
 
     if (request_tokens_before >= auto_threshold) {
         const compact_summary = @import("compact_summary.zig");
-        const SummCtx = struct { provider: provider_mod.Provider, alloc: std.mem.Allocator, model_override: ?[]const u8 };
+        const SummCtx = struct { provider: provider_mod.Provider, alloc: std.mem.Allocator, model_override: ?[]const u8, task_anchor: ?[]const u8 };
         const summary_model = compact_model_override orelse model_override;
+        // 任务锚:进行中的任务确定性追加到摘要尾(压缩有损,闭环纪律硬保底)。
+        const task_anchor: ?[]u8 = if (tasks) |ts| compact_summary.buildTaskAnchor(allocator, ts) else null;
+        defer if (task_anchor) |a| allocator.free(a);
         var preview = try conversation.cloneForCompactPreview(allocator, keep_recent);
         defer preview.deinit();
         const before_len = preview.conversation.len();
-        const report = preview.conversation.compactWithSummaryReport(keep_recent, SummCtx{ .provider = provider, .alloc = allocator, .model_override = summary_model }, struct {
+        const report = preview.conversation.compactWithSummaryReport(keep_recent, SummCtx{ .provider = provider, .alloc = allocator, .model_override = summary_model, .task_anchor = task_anchor }, struct {
             fn f(c: SummCtx, drop_msgs: []const msg.Message) ?[]u8 {
-                return compact_summary.summarizeWithModel(c.alloc, c.provider, drop_msgs, c.model_override);
+                const summary = compact_summary.summarizeWithModel(c.alloc, c.provider, drop_msgs, c.model_override) orelse return null;
+                return compact_summary.appendTaskAnchor(c.alloc, summary, c.task_anchor);
             }
         }.f) catch Conversation.CompactReport{
             .dropped = preview.conversation.compactKeepRecent(keep_recent),
@@ -1947,6 +1960,7 @@ test "usage anchor suppresses false blocking-limit nuke (glm-5.2 并发工具风
         .single,
         null,
         a,
+        null,
     );
 
     // est = 13522 + 20×(32768/4) + 信封 ≈ 178K < 229144 → 不触发;结果全部保留。
@@ -2074,6 +2088,7 @@ test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool s
         .single,
         null,
         a,
+        null,
     );
 
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
@@ -2082,6 +2097,79 @@ test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool s
     try std.testing.expectEqualStrings("post_tool_follow_up_threshold", cap.cause.?);
     try std.testing.expect(c.messages.items[c.messages.items.len - 2].blocks[0] == .tool_use);
     try std.testing.expect(c.messages.items[c.messages.items.len - 1].blocks[0] == .tool_result);
+}
+
+test "auto-compact summary carries in_progress task anchor through compaction" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    const chunk = try a.alloc(u8, 8192);
+    defer a.free(chunk);
+    @memset(chunk, 'x');
+    var i: usize = 0;
+    while (i < 30) : (i += 1) {
+        try c.appendText(.user, chunk);
+    }
+
+    var store = @import("task_store.zig").TaskStore.init(a);
+    defer store.deinit();
+    try store.createWithId("kg-42", "修复解析器", "细节", .in_progress);
+    try store.createWithId("kg-43", "已完成的不进锚", "细节", .completed);
+
+    var provider_state = TestProviderState{
+        .allocator = a,
+        .compact_summary_response = "small summary",
+        .max_input_tokens = 200_000,
+        .max_tokens = 32_000,
+    };
+    const provider = testProvider(&provider_state);
+
+    const Capture = struct {
+        fn emit(_: *anyopaque, _: @import("session_id.zig").SessionId, _: CoreEvent) void {}
+        fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = Capture.emit, .poll = Capture.poll };
+
+    const outcome = try runAutoCompactIfNeeded(
+        &c,
+        provider,
+        null,
+        null,
+        null,
+        &.{},
+        null,
+        null,
+        32_000,
+        2,
+        "post_tool_follow_up_threshold",
+        &backend,
+        .single,
+        null,
+        a,
+        &store,
+    );
+    try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
+
+    // 摘要消息里必须带确定性任务锚(进行中任务 + 闭合指引),completed 不进锚。
+    var found_anchor = false;
+    var found_completed = false;
+    for (c.messages.items) |m| {
+        for (m.blocks) |b| switch (b) {
+            .text => |t| {
+                if (std.mem.indexOf(u8, t, "compact 任务锚") != null and
+                    std.mem.indexOf(u8, t, "kg-42 修复解析器") != null and
+                    std.mem.indexOf(u8, t, "small summary") != null) found_anchor = true;
+                if (std.mem.indexOf(u8, t, "kg-43") != null) found_completed = true;
+            },
+            else => {},
+        };
+    }
+    try std.testing.expect(found_anchor);
+    try std.testing.expect(!found_completed);
 }
 
 test "previous-model compact uses old model override before smaller-window sampling" {
@@ -2139,6 +2227,7 @@ test "previous-model compact uses old model override before smaller-window sampl
         .single,
         null,
         a,
+        null,
     );
 
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);

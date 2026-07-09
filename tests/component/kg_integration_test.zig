@@ -527,6 +527,131 @@ test "L2 KG: DAG 驱动闭环经工具 — TaskList 呈现 frontier + TaskUpdate
     try std.testing.expect(std.mem.indexOf(u8, list2, "\"subject\":\"B\"") != null);
 }
 
+test "L2 KG: 深树全链 — 嵌套子任务/branch 聚合/path/claim 租约/并行提示/闭合波前前进" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const proj_dir = pbuf[0..dir_len];
+    const store = try std.fmt.allocPrint(a, "{s}/kgdeep.kg", .{proj_dir});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-deep");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    // 计划:步骤一/步骤二串行;运行中给步骤一拆两个**并行**子任务(挂步骤一下,不拍平)。
+    const plan_commit = @import("cc").kg_plan_commit;
+    const inject = @import("cc").kg_inject;
+    const r = try plan_commit.commit(a, &kg, "深树计划\n1. 步骤一\n2. 步骤二");
+    try inject.writeIdPointer(a, proj_dir, "kg_root", r.root_id);
+
+    const rows0 = try kg.frontier(r.root_id, 10);
+    var step1_id: u64 = 0;
+    for (rows0) |row| {
+        if (std.mem.indexOf(u8, row.text, "步骤一") != null) step1_id = row.task_id;
+    }
+    for (rows0) |*row| row.deinit(a);
+    a.free(rows0);
+    try std.testing.expect(step1_id != 0);
+
+    const sub_a = try kg.createTask("子任务甲", "task");
+    const sub_b = try kg.createTask("子任务乙", "task");
+    try kg.addEdge(step1_id, "contains", sub_a);
+    try kg.addEdge(step1_id, "contains", sub_b);
+
+    // frontier 深遍历:步骤一变 branch(不可执行,等子树);甲/乙是 ready 叶子,path 带"步骤一"。
+    {
+        const rows = try kg.frontier(r.root_id, 10);
+        defer {
+            for (rows) |*row| row.deinit(a);
+            a.free(rows);
+        }
+        var step1_is_branch = false;
+        var sub_a_ok = false;
+        var sub_b_ready = false;
+        for (rows) |row| {
+            if (row.task_id == step1_id and row.role == .branch) step1_is_branch = true;
+            if (row.task_id == sub_a and row.role == .leaf and row.readiness == .ready) {
+                if (row.path) |p| sub_a_ok = std.mem.indexOf(u8, p, "步骤一") != null;
+            }
+            if (row.task_id == sub_b and row.readiness == .ready) sub_b_ready = true;
+        }
+        try std.testing.expect(step1_is_branch);
+        try std.testing.expect(sub_a_ok); // 叶子 + path 面包屑
+        try std.testing.expect(sub_b_ready);
+    }
+
+    // TaskList:两个 ready 无主叶子 → 并行 fan-out 提示;branch 不上看板;path 字段在。
+    const task_tools = @import("cc").task_tools;
+    const TaskStore = @import("cc").core_task_store.TaskStore;
+    var tstore = TaskStore.init(a);
+    defer tstore.deinit();
+    const ctx = @import("cc").tool_context.ToolContext{
+        .allocator = a,
+        .tasks = &tstore,
+        .kg = &kg,
+        .kg_projects_dir = proj_dir,
+    };
+    {
+        const list = try task_tools.executeList(&ctx, "{}");
+        defer a.free(list);
+        try std.testing.expect(std.mem.indexOf(u8, list, "parallel_hint") != null);
+        try std.testing.expect(std.mem.indexOf(u8, list, "\"path\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, list, "\"subject\":\"步骤一\"") == null);
+    }
+
+    // TaskUpdate in_progress → 认领落图(租约);他人 session 认领同任务被拒(Data 不重试)。
+    {
+        const claim_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"in_progress\"}}", .{sub_a});
+        defer a.free(claim_args);
+        const resp = try task_tools.executeUpdate(&ctx, claim_args);
+        defer a.free(resp);
+        try std.testing.expect(std.mem.indexOf(u8, resp, "\"claimed\":true") != null);
+
+        try std.testing.expectError(error.Data, kg.claimTask(sub_a, "other-session"));
+
+        // 认领后只剩 1 个无主 ready → 并行提示消失;claimed_by 上看板。
+        const list = try task_tools.executeList(&ctx, "{}");
+        defer a.free(list);
+        try std.testing.expect(std.mem.indexOf(u8, list, "parallel_hint") == null);
+        try std.testing.expect(std.mem.indexOf(u8, list, "\"claimed_by\":") != null);
+    }
+
+    // 闭合两个子任务 → 步骤一子树全闭 → 步骤一变 ready 叶子(波前上移);闭步骤一 → 步骤二解锁。
+    try kg.closeTask(sub_a, "甲完成");
+    try kg.closeTask(sub_b, "乙完成");
+    {
+        const rows = try kg.frontier(r.root_id, 10);
+        defer {
+            for (rows) |*row| row.deinit(a);
+            a.free(rows);
+        }
+        var step1_leaf_ready = false;
+        for (rows) |row| {
+            if (row.task_id == step1_id and row.role == .leaf and row.readiness == .ready) step1_leaf_ready = true;
+        }
+        try std.testing.expect(step1_leaf_ready);
+    }
+    try kg.closeTask(step1_id, "步骤一整体完成");
+    {
+        const rows = try kg.frontier(r.root_id, 10);
+        defer {
+            for (rows) |*row| row.deinit(a);
+            a.free(rows);
+        }
+        var step2_ready = false;
+        for (rows) |row| {
+            if (std.mem.indexOf(u8, row.text, "步骤二") != null and row.readiness == .ready) step2_ready = true;
+        }
+        try std.testing.expect(step2_ready);
+    }
+}
+
 test "L2 KG: TaskCreate write-through — ad-hoc todo 落图 inbox,TaskList 呈现,TaskGet/Stop 走 kg-" {
     const a = std.testing.allocator;
     const bin = findBin(a) orelse return error.SkipZigTest;

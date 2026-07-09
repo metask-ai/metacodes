@@ -165,6 +165,12 @@ pub const ToolContext = struct {
     explicit_invocation: bool = false,
     /// 当前 session id(${CLAUDE_SESSION_ID} 替换 + 日志相关)。
     session_id: []const u8 = "",
+    /// 本 agent loop 的**对外身份**(全局唯一,程序注入):KG claim 租约等跨进程/跨 loop
+    /// 协调用。与 `session`(UI 事件路由键)是不同概念——主 loop 两者恰好同值
+    /// (App.session_id,跨进程唯一:ms 时戳+monotonic ns);subagent 每次 spawn 独立
+    /// gen(路由仍归父视图,身份必须独立,否则并发 subagent 共享 sentinel 互相无防撞)。
+    /// **身份由程序赋予,绝不指望模型手填。**
+    agent_ident: @import("../core/session_id.zig").SessionId = @import("../core/session_id.zig").SessionId.single,
     /// 当前 project root(${CLAUDE_PROJECT_DIR} 替换)。
     project_dir: []const u8 = "",
     /// 全局 disable-shell-execution 开关(settings.json `disableSkillShellExecution`)。

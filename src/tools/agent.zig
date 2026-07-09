@@ -210,6 +210,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .model_override = model_override,
             .host_services = if (ctx.host_services) |hs| hs.skillOnly() else null,
             .project_dir = ctx.project_dir,
+            .kg = ctx.kg,
+            .kg_projects_dir = ctx.kg_projects_dir,
         },
         &be,
     );

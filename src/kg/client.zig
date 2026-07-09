@@ -90,12 +90,21 @@ pub fn resolveMemoryType(raw: []const u8) ?ResolvedType {
 pub const FrontierRow = struct {
     task_id: u64,
     readiness: Readiness,
+    /// v2 深遍历角色:leaf=可执行叶子(child_task)/ branch=开放复合节点(branch_task,
+    /// 有开放子任务,靠子树闭合而闭合)/ related=关联任务(related_task,单层)。
+    role: Role = .leaf,
+    depth: usize = 1,
+    claimed_by: ?[]u8 = null, // owned;null=无主(行内 "-" 或租约已过期)
+    path: ?[]u8 = null, // owned 面包屑(祖先链);null=根直下
     text: []u8, // owned(unescaped)
 
     pub const Readiness = enum { ready, blocked, missing_dependencies };
+    pub const Role = enum { leaf, branch, related };
 
     pub fn deinit(self: *const FrontierRow, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
+        if (self.claimed_by) |c| allocator.free(c);
+        if (self.path) |p| allocator.free(p);
     }
 };
 
@@ -113,6 +122,12 @@ pub const KgClient = struct {
     degraded_reason: ?[]u8 = null,
     /// 最近一次 data 类错误的 detail(owned,透传给模型)。
     last_detail: ?[]u8 = null,
+    /// last_detail 的 alloc/free 配对锁(pthread,全仓惯例——裁剪版 std 无 Thread.Mutex)。
+    /// 多 agent loop(后台 subagent 线程)共享同一 KgClient:两线程并发 setDetail 会读到
+    /// 同一旧指针 → double-free。锁只护配对;detail() 返回借用切片,约定**失败调用同线程
+    /// 立即消费**(跨线程读 detail 是 best-effort 错误文案,不做数据依赖)。store 一致性
+    /// 由 tinykg CliStoreLock 保证,调用本身无需串行。
+    detail_mu: std.c.pthread_mutex_t = .{},
     /// project-containment(tinykg ce3a7f0 起):本项目 project 节点 id(session 内缓存;
     /// lazy find-or-create,写路径才建,读路径只 lookup)。null=未解析/库中无。
     project_node_id: ?u64 = null,
@@ -558,7 +573,8 @@ pub const KgClient = struct {
     }
 
     // ── 任务 DAG(P2:write-through + plan 落图 + 图驱动)──────────────
-    // 契约见设计 §9 核对表:depends_on 串行、单次 revise 闭合、frontier 单层。
+    // 契约见设计 §9 核对表:depends_on 串行、单次 revise 闭合;frontier v2 深遍历
+    // (可执行叶子集:branch/leaf 角色 + 祖先聚合 readiness + path + claim 租约)。
 
     /// 建任务节点(schema_type=todo|plan_step)。返回 node id。best-effort provenance。
     /// 挂接进项目子树(list-recent --project / search --project 可见)。
@@ -902,15 +918,22 @@ pub const KgClient = struct {
         }
         var it = std.mem.splitScalar(u8, out.stdout, '\n');
         while (it.next()) |line| {
-            // 行格式(实证):child_task\t<edge>\t<rel>\t<task_id>\treadiness=<r>\t<escaped text>
-            if (!std.mem.startsWith(u8, line, "child_task\t") and !std.mem.startsWith(u8, line, "related_task\t")) continue;
+            // 行格式 v2(深遍历):<role>\t<edge>\t<rel>\t<task_id>\treadiness=<r>\tdepth=<n>\tclaimed_by=<v>\tpath=<v>\t<escaped text>
+            // v1 兼容:readiness 后直接是 text(缺 depth= 列)。
+            const role: FrontierRow.Role = if (std.mem.startsWith(u8, line, "child_task\t"))
+                .leaf
+            else if (std.mem.startsWith(u8, line, "branch_task\t"))
+                .branch
+            else if (std.mem.startsWith(u8, line, "related_task\t"))
+                .related
+            else
+                continue;
             var cols = std.mem.splitScalar(u8, line, '\t');
             _ = cols.next(); // role
             _ = cols.next(); // edge id
             _ = cols.next(); // rel
             const id_col = cols.next() orelse continue;
             const ready_col = cols.next() orelse continue;
-            const text_col = cols.rest();
 
             const task_id = std.fmt.parseInt(u64, id_col, 10) catch continue;
             const readiness: FrontierRow.Readiness = blk: {
@@ -919,13 +942,66 @@ pub const KgClient = struct {
                 if (std.mem.eql(u8, v, "blocked")) break :blk .blocked;
                 break :blk .missing_dependencies;
             };
+
+            var depth: usize = 1;
+            var claimed_by: ?[]u8 = null;
+            errdefer if (claimed_by) |c| self.allocator.free(c);
+            var path: ?[]u8 = null;
+            errdefer if (path) |p| self.allocator.free(p);
+            var text_col: []const u8 = undefined;
+            const after_ready = cols.rest();
+            if (std.mem.startsWith(u8, after_ready, "depth=")) {
+                const depth_col = cols.next() orelse continue;
+                depth = std.fmt.parseInt(usize, depth_col["depth=".len..], 10) catch 1;
+                const claim_col = cols.next() orelse continue;
+                if (std.mem.startsWith(u8, claim_col, "claimed_by=")) {
+                    const v = claim_col["claimed_by=".len..];
+                    if (v.len > 0 and !std.mem.eql(u8, v, "-")) claimed_by = try unescapeTsv(self.allocator, v);
+                }
+                const path_col = cols.next() orelse continue;
+                if (std.mem.startsWith(u8, path_col, "path=")) {
+                    const v = path_col["path=".len..];
+                    if (v.len > 0 and !std.mem.eql(u8, v, "-")) path = try unescapeTsv(self.allocator, v);
+                }
+                text_col = cols.rest();
+            } else {
+                text_col = after_ready;
+            }
+
             const text = try unescapeTsv(self.allocator, text_col);
-            rows.append(self.allocator, .{ .task_id = task_id, .readiness = readiness, .text = text }) catch {
+            rows.append(self.allocator, .{
+                .task_id = task_id,
+                .readiness = readiness,
+                .role = role,
+                .depth = depth,
+                .claimed_by = claimed_by,
+                .path = path,
+                .text = text,
+            }) catch {
                 self.allocator.free(text);
                 return KgError.OutOfMemory;
             };
         }
         return rows.toOwnedSlice(self.allocator) catch KgError.OutOfMemory;
+    }
+
+    /// 认领任务租约(task-claim --by)。多 agent 并行防撞车:干活前 claim,
+    /// TTL 到期自动视为无主(读侧过期,崩掉的 session 不会永久占坑)。
+    /// 他人未过期租约 → KgError(detail 含 holder)。
+    pub fn claimTask(self: *KgClient, task_id: u64, agent: []const u8) KgError!void {
+        var idbuf: [24]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{task_id}) catch unreachable;
+        const out = try self.runChecked(&.{ "task-claim", self.store_path, id_str, "--by", agent });
+        self.freeOut(out);
+    }
+
+    /// 释放租约(task-release --by;租约立即过期)。身份对称:只能放自己的活租约,
+    /// 他人活租约会被 CLI 拒(ClaimHeld)。闭合任务后无需调用——闭合本身出 frontier。
+    pub fn releaseTask(self: *KgClient, task_id: u64, agent: []const u8) KgError!void {
+        var idbuf: [24]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{task_id}) catch unreachable;
+        const out = try self.runChecked(&.{ "task-release", self.store_path, id_str, "--by", agent });
+        self.freeOut(out);
     }
 
     /// 本项目记忆节点数(启动锚:注入段告诉模型"存在 N 条记忆",提升 recall 采用率
@@ -1212,7 +1288,8 @@ pub const KgClient = struct {
     }
 
     fn classifyCliError(name: []const u8) ErrClass {
-        const data_errors = [_][]const u8{ "NotFound", "InvalidId", "InvalidNodeKind", "InvalidRelKind", "CycleDetected", "WouldCreateCycle", "InvalidRecord" };
+        // ClaimHeld 归 data:租约被他人持有是明确业务事实,重试只会白等 3 轮。
+        const data_errors = [_][]const u8{ "NotFound", "InvalidId", "InvalidNodeKind", "InvalidRelKind", "CycleDetected", "WouldCreateCycle", "InvalidRecord", "ClaimHeld" };
         for (data_errors) |d| {
             if (std.ascii.eqlIgnoreCase(name, d)) return .data;
         }
@@ -1225,7 +1302,10 @@ pub const KgClient = struct {
     }
 
     fn setDetail(self: *KgClient, comptime fmt: []const u8, args: anytype) void {
+        // 注意:args 可能借用旧 last_detail(prior 重包模式)——必须先 allocPrint 再换指针。
         const d = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
+        _ = std.c.pthread_mutex_lock(&self.detail_mu);
+        defer _ = std.c.pthread_mutex_unlock(&self.detail_mu);
         if (self.last_detail) |old| self.allocator.free(old);
         self.last_detail = d;
     }

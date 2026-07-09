@@ -60,3 +60,18 @@ test "gen 产 24-char id,全 hex 字符" {
     }
 }
 
+
+test "gen 连发唯一(agent_ident 防撞地基:进程内并发 subagent 各持一 id)" {
+    // claim 租约身份 = per-agent-loop gen();同进程紧邻两次 gen 必须不同
+    // (ms 时戳相同时靠 monotonic ns 低位区分)。
+    var seen = std.AutoHashMap(u64, void).init(testing.allocator);
+    defer seen.deinit();
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        const id = gen();
+        const key = std.hash.XxHash64.hash(0, id.asSlice());
+        const gop = try seen.getOrPut(key);
+        try testing.expect(!gop.found_existing);
+        try testing.expect(!std.mem.eql(u8, id.asSlice(), SessionId.single.asSlice()));
+    }
+}
