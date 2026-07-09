@@ -2043,6 +2043,16 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
     if (arg.len == 0) {
         // 状态:store 路径 + domain + frontier(有 kg_root 时)。
         std.debug.print("KG store: {s}\ndomain:   {s}\n", .{ kg.store_path, kg.domain });
+        // 记忆同步检视面(PM P1:autosync 静默失败要可见)。
+        if (kg.autosync_ok + kg.autosync_fail > 0) {
+            std.debug.print("记忆同步: {d} ok / {d} fail{s}{s}\n", .{
+                kg.autosync_ok,                              kg.autosync_fail,
+                if (kg.autosync_last_err != null) "(最近: " else "",
+                if (kg.autosync_last_err) |e| e else "",
+            });
+            if (kg.autosync_last_err != null) std.debug.print(")\n", .{});
+        }
+        std.debug.print("(手工编辑过记忆文件?/kg sync 重新同步入图)\n", .{});
         if (app.kg_projects_dir.len > 0) {
             // 两个 root 都显示,和模型侧 appendKgFrontier 对齐(P1-B:此前只读 kg_root,
             // ad-hoc todo 连 /kg 都不显示 → 用户面/模型面读不同子集)。
@@ -2070,7 +2080,11 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
         }
         std.debug.print("最近记忆({d} 条):\n", .{hits.len});
         for (hits) |h| {
-            std.debug.print("  [{d}] {s}: {s}\n", .{ h.node_id, h.kind, firstLine(h.text) });
+            if (h.source_label.len > 0) {
+                std.debug.print("  [{d}] {s}({s}): {s}\n", .{ h.node_id, h.kind, h.source_label, firstLine(h.text) });
+            } else {
+                std.debug.print("  [{d}] {s}: {s}\n", .{ h.node_id, h.kind, firstLine(h.text) });
+            }
         }
         return;
     }
@@ -2099,10 +2113,57 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
         return;
     }
 
-    if (std.mem.startsWith(u8, arg, "forget ")) {
-        const id_str = std.mem.trim(u8, arg["forget ".len..], " \t");
+    if (std.mem.eql(u8, arg, "sync")) {
+        // PM P1:手工编辑(vim)不经 Write 钩子 → 图里旧版;sync 遍历 memdir 重跑幂等 upsert。
+        const autosync = @import("../kg/autosync.zig");
+        const stats = autosync.syncAll(allocator, kg, app.memdir_abs);
+        std.debug.print("记忆同步完成:{d} 个文件已入图,{d} 失败,{d} 跳过(索引/非法路径)。\n", .{ stats.synced, stats.failed, stats.skipped });
+        return;
+    }
+
+    if (std.mem.eql(u8, arg, "gc")) {
+        // Linus 次要1:gc-md-orphans 接线——清 upsert 留下的孤儿 markdown 派生节点。
+        const summary = kg.gcMdOrphans(true) catch |e| {
+            std.debug.print("gc 失败({s}): {s}\n", .{ @errorName(e), kg.detail() });
+            return;
+        };
+        defer allocator.free(summary);
+        std.debug.print("{s}\n", .{summary});
+        return;
+    }
+
+    if (std.mem.startsWith(u8, arg, "merge ")) {
+        // 存量重复 project 节点合并(reparent-contain 增量迁移;输家空壳可再 forget)。
+        var it2 = std.mem.tokenizeAny(u8, arg["merge ".len..], " \t");
+        const from_s = it2.next() orelse "";
+        const to_s = it2.next() orelse "";
+        const from = std.fmt.parseInt(u64, from_s, 10) catch 0;
+        const to = std.fmt.parseInt(u64, to_s, 10) catch 0;
+        if (from == 0 or to == 0) {
+            std.debug.print("用法:/kg merge <输家-project-id> <赢家-project-id>\n", .{});
+            return;
+        }
+        const summary = kg.reparentContain(from, to) catch |e| {
+            std.debug.print("merge 失败({s}): {s}\n", .{ @errorName(e), kg.detail() });
+            return;
+        };
+        defer allocator.free(summary);
+        std.debug.print("{s}\n(输家 {d} 已空,可 /kg forget {d} 删除)\n", .{ summary, from, from });
+        return;
+    }
+
+    if (std.mem.startsWith(u8, arg, "forget ") or std.mem.startsWith(u8, arg, "forget! ")) {
+        const force = std.mem.startsWith(u8, arg, "forget! ");
+        const raw_id = if (force) arg["forget! ".len..] else arg["forget ".len..];
+        const id_str = std.mem.trim(u8, raw_id, " \t");
         const id = std.fmt.parseInt(u64, id_str, 10) catch {
-            std.debug.print("用法:/kg forget <node-id>\n", .{});
+            std.debug.print("用法:/kg forget <node-id>(md 派生节点强删用 forget!)\n", .{});
+            return;
+        };
+        // md 派生节点假删除防护(PM P1):forget 后下次 Write 该文件会 upsert 复活——提示改源文件。
+        if (!force) if (kg.nodeSourceLabel(id)) |label| {
+            defer allocator.free(label);
+            std.debug.print("注意:node {d} 来自记忆文件 {s} —— 直接 forget 会在下次写该文件时复活。\n正确删法:用 Write 清空 {s}(自动从图中移除)。仍要强删:/kg forget! {d}\n", .{ id, label, label, id });
             return;
         };
         kg.forget(id) catch |e| {
@@ -2113,7 +2174,7 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
         return;
     }
 
-    std.debug.print("用法:/kg(状态)| /kg mem(记忆)| /kg plan(计划 markdown)| /kg forget <id>(删除)\n", .{});
+    std.debug.print("用法:/kg(状态)| /kg mem(记忆)| /kg plan(计划)| /kg sync(重同步记忆文件)| /kg gc(清孤儿节点)| /kg merge <from> <to>(合并重复 project)| /kg forget <id>(删除)\n", .{});
 }
 
 fn firstLine(text: []const u8) []const u8 {

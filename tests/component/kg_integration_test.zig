@@ -792,4 +792,25 @@ test "L2 KG: B/C 合并 — Write memdir markdown 自动入图,召回命中 sect
     for (hits_deleted) |h| {
         try std.testing.expect(std.mem.indexOf(u8, h.text, "narwhal") == null);
     }
+
+    // ⑦ **schema_type 下推 + source_label 溯源**:重建记忆文件 → typed recall(type=document,
+    // server-side --schema-type 成员集)命中 document 根,且 hit 带来源文件名(PM P1 溯源)。
+    const args7 = try std.fmt.allocPrint(a,
+        \\{{"file_path":"{s}/memory/lesson-parser.md","content":"# parser lesson v3\n\nquokka final lesson revision\n"}}
+    , .{proj_dir});
+    defer a.free(args7);
+    const out7 = try write_tool.execute(&ctx, args7);
+    defer a.free(out7);
+    const hits_doc = try kg.recallTyped("parser lesson", 10, false, "document");
+    defer {
+        for (hits_doc) |*h| h.deinit(a);
+        a.free(hits_doc);
+    }
+    try std.testing.expect(hits_doc.len >= 1);
+    var labeled = false;
+    for (hits_doc) |h| {
+        try std.testing.expectEqualStrings("document", h.schema_type); // server-side 过滤生效
+        if (std.mem.eql(u8, h.source_label, "lesson-parser.md")) labeled = true;
+    }
+    try std.testing.expect(labeled);
 }

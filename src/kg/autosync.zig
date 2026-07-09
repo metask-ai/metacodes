@@ -48,15 +48,91 @@ pub fn maybeImportMemoryFile(ctx: *const ToolContext, path: []const u8, content:
     if (std.mem.trim(u8, content, " \t\r\n").len == 0) {
         kg.clearMarkdownDocStable(stable_key) catch |e| {
             log.warn("kg", "AutoMem markdown 图删除失败({s}): {s}", .{ @errorName(e), base });
+            kg.noteAutosync(@errorName(e), base);
             return;
         };
         log.info("kg", "AutoMem markdown 图删除(空 upsert): {s}", .{base});
+        kg.noteAutosync(null, base);
         return;
     }
 
-    const doc_id = kg.importMarkdownDocStable(content, stable_key) catch |e| {
+    const doc_id = kg.importMarkdownDocLabeled(content, stable_key, base) catch |e| {
         log.warn("kg", "AutoMem markdown 入图失败({s}): {s}", .{ @errorName(e), base });
+        kg.noteAutosync(@errorName(e), base);
         return;
     };
     log.info("kg", "AutoMem markdown 入图(upsert): {s} → document {d}", .{ base, doc_id });
+    kg.noteAutosync(null, base);
+}
+
+pub const SyncStats = struct { synced: u32 = 0, failed: u32 = 0, skipped: u32 = 0 };
+
+/// /kg sync:遍历 memdir/*.md 重跑稳定 upsert(PM P1:手工 vim 编辑文件不经 Write 工具
+/// → 图里永远旧版;本命令给用户一个明确的 reconcile 出口)。upsert 幂等:未变的文件
+/// tinykg 侧 nodes_imported=0,重跑无害。MEMORY.md/隐藏文件/非 .md 跳过。
+pub fn syncAll(allocator: std.mem.Allocator, kg: *@import("client.zig").KgClient, memdir_abs: []const u8) SyncStats {
+    var stats = SyncStats{};
+    if (memdir_abs.len == 0) return stats;
+    const dir_z = allocator.dupeZ(u8, memdir_abs) catch return stats;
+    defer allocator.free(dir_z);
+    const dir = std.c.opendir(dir_z) orelse return stats; // memdir 不存在即 no-op
+    defer _ = std.c.closedir(dir);
+
+    while (std.c.readdir(dir)) |entry_ptr| {
+        const entry = entry_ptr.*;
+        const name = std.mem.sliceTo(&entry.name, 0);
+        if (name.len == 0 or name[0] == '.') continue;
+        if (!std.mem.endsWith(u8, name, ".md")) continue;
+        if (std.mem.eql(u8, name, "MEMORY.md")) {
+            stats.skipped += 1;
+            continue;
+        }
+        const full = std.fmt.allocPrint(allocator, "{s}/{s}", .{ memdir_abs, name }) catch return stats;
+        defer allocator.free(full);
+        const content = readWholeFile(allocator, full) orelse {
+            stats.failed += 1;
+            continue;
+        };
+        defer allocator.free(content);
+        // 与 Write 钩子同一套 canonical key 派生(单一基准)。
+        const canon = memdir.canonicalAutoMemPath(allocator, memdir_abs, full) orelse {
+            stats.skipped += 1;
+            continue;
+        };
+        defer allocator.free(canon);
+        const stable_key = std.hash.Wyhash.hash(0x9e3d, canon);
+        if (std.mem.trim(u8, content, " \t\r\n").len == 0) {
+            kg.clearMarkdownDocStable(stable_key) catch {
+                stats.failed += 1;
+                continue;
+            };
+        } else {
+            _ = kg.importMarkdownDocLabeled(content, stable_key, name) catch {
+                stats.failed += 1;
+                continue;
+            };
+        }
+        stats.synced += 1;
+    }
+    return stats;
+}
+
+fn readWholeFile(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
+    const path_z = allocator.dupeZ(u8, path) catch return null;
+    defer allocator.free(path_z);
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path_z, .{ .ACCMODE = .RDONLY }, 0) catch return null;
+    defer _ = std.c.close(fd);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const n = std.c.read(fd, &buf, buf.len);
+        if (n <= 0) break;
+        out.appendSlice(allocator, buf[0..@intCast(n)]) catch {
+            out.deinit(allocator);
+            return null;
+        };
+        if (out.items.len > 8 << 20) break; // 8MB 防呆
+    }
+    return out.toOwnedSlice(allocator) catch null;
 }

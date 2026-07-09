@@ -60,12 +60,15 @@ pub const RecallHit = struct {
     schema_type: []u8, // owned(记忆类型维度:decision/module/bug/…;list-recent 路径为空)
     text: []u8, // owned(截断后)
     score: f64,
+    /// 来源记忆文件(md 派生 document 根带;section/typed 节点为空)。owned。
+    source_label: []u8 = &.{},
 
     pub fn deinit(self: *const RecallHit, allocator: std.mem.Allocator) void {
         allocator.free(self.kind);
         allocator.free(self.domain);
         allocator.free(self.schema_type);
         allocator.free(self.text);
+        if (self.source_label.len > 0) allocator.free(self.source_label);
     }
 };
 
@@ -121,6 +124,11 @@ pub const KgClient = struct {
     /// 直到自己发生一次写(ensure 复位)或重启——接受的权衡,不是 bug。
     project_miss: bool = false,
     global_project_miss: bool = false,
+    /// AutoMem 自动入图 session 内计数(PM P1:静默失败要有检视面;/kg 状态页展示)。
+    autosync_ok: u32 = 0,
+    autosync_fail: u32 = 0,
+    /// 最近一次 autosync 失败摘要(owned;/kg 状态页展示)。
+    autosync_last_err: ?[]u8 = null,
     /// abort 信号(M1:ESC 中断——穿进 spawn,避免锁竞争时最坏 13 分钟不可中断)。
     /// 借用,不拥有;工具/​/kg 调用前 setAbort。
     abort: ?*const AbortSignal = null,
@@ -136,6 +144,7 @@ pub const KgClient = struct {
         self.allocator.free(self.domain);
         if (self.degraded_reason) |r| self.allocator.free(r);
         if (self.last_detail) |d| self.allocator.free(d);
+        if (self.autosync_last_err) |e| self.allocator.free(e);
     }
 
     // ── 路径解析(设计 §1 D2)─────────────────────────────────────────
@@ -472,7 +481,12 @@ pub const KgClient = struct {
     /// 子树——删旧 doc 根也断不开。稳定 upsert 让 tinykg 自己替换投影边,才是干净语义。
     /// 代价:order_key 撞车乱 render 顺序——记忆召回不 render(真相在磁盘 md 文件),无影响。
     pub fn importMarkdownDocStable(self: *KgClient, markdown: []const u8, stable_key: u64) KgError!u64 {
-        return self.importMarkdownDocAt(markdown, stable_key, true);
+        return self.importMarkdownDocLabeled(markdown, stable_key, null);
+    }
+
+    /// 带来源标注版(autosync 传记忆文件 basename;召回 hit / forget 可溯源)。
+    pub fn importMarkdownDocLabeled(self: *KgClient, markdown: []const u8, stable_key: u64, source_label: ?[]const u8) KgError!u64 {
+        return self.importMarkdownDocAtLabeled(markdown, stable_key, true, source_label);
     }
 
     /// 记忆文件删除语义(PM P0-2):同 stable_key 空内容 upsert → tinykg 增量合并把旧投影边
@@ -482,15 +496,44 @@ pub const KgClient = struct {
         _ = try self.importMarkdownDocAt("", stable_key, false);
     }
 
+    /// autosync 结果计数(检视面:/kg 状态页"记忆同步"行)。err_name=null 表示成功。
+    pub fn noteAutosync(self: *KgClient, err_name: ?[]const u8, file_base: []const u8) void {
+        if (err_name) |en| {
+            self.autosync_fail += 1;
+            const msg = std.fmt.allocPrint(self.allocator, "{s}: {s}", .{ en, file_base }) catch return;
+            if (self.autosync_last_err) |old_e| self.allocator.free(old_e);
+            self.autosync_last_err = msg;
+        } else {
+            self.autosync_ok += 1;
+        }
+    }
+
+    /// 跑 tinykg gc-md-orphans(清 upsert 产生的孤儿 markdown 派生节点)。apply=false 干跑。
+    /// 返回 tinykg 输出摘要(owned)。
+    pub fn gcMdOrphans(self: *KgClient, apply: bool) KgError![]u8 {
+        const out = if (apply)
+            try self.runCheckedWrite(&.{ "gc-md-orphans", self.store_path, "--apply" })
+        else
+            try self.runChecked(&.{ "gc-md-orphans", self.store_path });
+        defer self.freeOut(out);
+        return self.allocator.dupe(u8, std.mem.trim(u8, out.stdout, " \r\n")) catch KgError.OutOfMemory;
+    }
+
     fn importMarkdownDocAt(self: *KgClient, markdown: []const u8, path_key: u64, attach: bool) KgError!u64 {
+        return self.importMarkdownDocAtLabeled(markdown, path_key, attach, null);
+    }
+
+    fn importMarkdownDocAtLabeled(self: *KgClient, markdown: []const u8, path_key: u64, attach: bool, source_label: ?[]const u8) KgError!u64 {
         const tmp_path = std.fmt.allocPrint(self.allocator, "{s}.mdimport.{x}.tmp", .{ self.store_path, path_key }) catch return KgError.OutOfMemory;
         defer self.allocator.free(tmp_path);
         writeTmpFile(self.allocator, tmp_path, markdown) catch return self.dataError("写 md 临时文件失败", .{});
         defer deleteTmpFile(self.allocator, tmp_path);
 
-        const out = try self.runCheckedWrite(&.{
-            "import-md-doc", self.store_path, tmp_path,
-        });
+        var argv = std.ArrayList([]const u8).empty;
+        defer argv.deinit(self.allocator);
+        argv.appendSlice(self.allocator, &.{ "import-md-doc", self.store_path, tmp_path }) catch return KgError.OutOfMemory;
+        if (source_label) |sl| argv.appendSlice(self.allocator, &.{ "--source-label", sl }) catch return KgError.OutOfMemory;
+        const out = try self.runCheckedWrite(argv.items);
         defer self.freeOut(out);
         // stdout: `import_md_doc ... document=<id> nodes_imported=..`
         const doc_id = extractKvU64(out.stdout, "document=") orelse
@@ -636,15 +679,19 @@ pub const KgClient = struct {
     ) KgError!void {
         var limbuf: [16]u8 = undefined;
         var pbuf: [24]u8 = undefined;
-        // 超采:客户端过滤后仍能凑满 limit。typed recall 多一道 schema_type 过滤 → 8× 超采抗稀有类型少返。
-        const oversample: usize = if (type_filter != null) limit * 8 + 8 else limit * 2 + 4;
+        // 超采:任务面等客户端过滤后仍能凑满 limit(schema_type 已 server-side 下推,
+        // 旧 8× 超采的"稀有类型排窗口外"问题由 tinykg --schema-type 成员集根治)。
+        const oversample: usize = limit * 2 + 4;
         const raw_limit = std.fmt.bufPrint(&limbuf, "{d}", .{oversample}) catch unreachable;
         const p_str = std.fmt.bufPrint(&pbuf, "{d}", .{project_id}) catch unreachable;
-        const out = try self.runChecked(&.{
-            "search",           self.store_path, query, "--project", p_str, "--limit", raw_limit,
-            "--profile",        "agent-memory",
-            "--format",         "json",          "--include-text", // node 带全文 → 省每 hit get spawn(成本修复)
-        });
+        var argv = std.ArrayList([]const u8).empty;
+        defer argv.deinit(self.allocator);
+        argv.appendSlice(self.allocator, &.{
+            "search",    self.store_path, query,    "--project",      p_str, "--limit", raw_limit,
+            "--profile", "agent-memory",  "--format", "json",         "--include-text",
+        }) catch return KgError.OutOfMemory;
+        if (type_filter) |tf| argv.appendSlice(self.allocator, &.{ "--schema-type", tf }) catch return KgError.OutOfMemory;
+        const out = try self.runChecked(argv.items);
         defer self.freeOut(out);
 
         var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, out.stdout, .{}) catch
@@ -666,6 +713,10 @@ pub const KgClient = struct {
                 (jsonStr(schema_v.?.object.get("schema_type")) orelse "")
             else
                 "";
+            const src_label = if (schema_v != null and schema_v.? == .object)
+                (jsonStr(schema_v.?.object.get("source_label")) orelse "")
+            else
+                "";
 
             // 任务面隔离。project 节点自身也不进记忆召回(容器非内容)。
             if (std.mem.eql(u8, kind, "project")) continue;
@@ -673,11 +724,6 @@ pub const KgClient = struct {
                 if (std.mem.eql(u8, kind, "task") or std.mem.eql(u8, kind, "verification")) continue;
                 if (std.mem.eql(u8, schema_type, "todo")) continue;
             }
-            // typed recall:按 schema_type 过滤(第二道客户端过滤,故上面 8× 超采)。
-            if (type_filter) |tf| {
-                if (!std.mem.eql(u8, schema_type, tf)) continue;
-            }
-
             const id_v = node.get("id") orelse continue;
             const node_id: u64 = switch (id_v) {
                 .integer => |i| if (i >= 0) @intCast(i) else continue,
@@ -711,6 +757,8 @@ pub const KgClient = struct {
             errdefer self.allocator.free(s_owned);
             const t_owned = self.allocator.dupe(u8, truncateBytes(text, 800)) catch return KgError.OutOfMemory;
             errdefer self.allocator.free(t_owned);
+            const sl_owned: []u8 = if (src_label.len > 0) (self.allocator.dupe(u8, src_label) catch return KgError.OutOfMemory) else @constCast(&[_]u8{});
+            errdefer if (sl_owned.len > 0) self.allocator.free(sl_owned);
             results.append(self.allocator, .{
                 .node_id = node_id,
                 .kind = k_owned,
@@ -718,8 +766,38 @@ pub const KgClient = struct {
                 .schema_type = s_owned,
                 .text = t_owned,
                 .score = score,
+                .source_label = sl_owned,
             }) catch return KgError.OutOfMemory;
         }
+    }
+
+    /// 节点的 source_label(md 派生 document 根;/kg forget 溯源提示用)。无/失败 → null。
+    pub fn nodeSourceLabel(self: *KgClient, node_id: u64) ?[]u8 {
+        var idbuf: [24]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{node_id}) catch unreachable;
+        const out = self.runChecked(&.{ "get", self.store_path, id_str, "--format", "json" }) catch return null;
+        defer self.freeOut(out);
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, out.stdout, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const node_v = parsed.value.object.get("node") orelse return null;
+        if (node_v != .object) return null;
+        const schema_v = node_v.object.get("schema") orelse return null;
+        if (schema_v != .object) return null;
+        const label = jsonStr(schema_v.object.get("source_label")) orelse return null;
+        if (label.len == 0) return null;
+        return self.allocator.dupe(u8, label) catch null;
+    }
+
+    /// merge 原语接线:reparent-contain(重复 project 节点合并;/kg merge 用)。返回摘要(owned)。
+    pub fn reparentContain(self: *KgClient, from: u64, to: u64) KgError![]u8 {
+        var fbuf: [24]u8 = undefined;
+        var tbuf: [24]u8 = undefined;
+        const f_str = std.fmt.bufPrint(&fbuf, "{d}", .{from}) catch unreachable;
+        const t_str = std.fmt.bufPrint(&tbuf, "{d}", .{to}) catch unreachable;
+        const out = try self.runCheckedWrite(&.{ "reparent-contain", self.store_path, f_str, t_str });
+        defer self.freeOut(out);
+        return self.allocator.dupe(u8, std.mem.trim(u8, out.stdout, " \r\n")) catch KgError.OutOfMemory;
     }
 
     /// 取节点全文(`get <id>` TSV 第 3 列,已 unescape)。owned;NotFound 返 error.Data。
@@ -927,6 +1005,8 @@ pub const KgClient = struct {
             const text_col = cols.rest();
             const node_id = std.fmt.parseInt(u64, id_str, 10) catch continue;
             if (std.mem.eql(u8, kind, "task") or std.mem.eql(u8, kind, "verification") or std.mem.eql(u8, kind, "project")) continue;
+            // 空壳 document(记忆文件被清空后留下的 upsert 空根)不进 /kg mem(PM 验收观察①)。
+            if (std.mem.eql(u8, kind, "document") and std.mem.indexOf(u8, text_col, "title=\"\"") != null) continue;
 
             // L1:先 dupe 三字段到局部 + errdefer,再 append——避免部分成功泄漏(对齐 recall)。
             const k_owned = self.allocator.dupe(u8, kind) catch return KgError.OutOfMemory;
