@@ -252,6 +252,30 @@ test "load: 项目 AGENT.md + AGENTS.md 都加载,metacodes 原生 AGENT.md 优�
     try testing.expect(std.mem.indexOf(u8, out, "AGENT-NATIVE-CONTENT").? > std.mem.indexOf(u8, out, "CLAUDE-CONTENT").?);
 }
 
+test "load: 用户级 ~/.metacodes/AGENT.md 与 ~/.claude/CLAUDE.md 共存,原生最高优先" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpAbsPath(a, &tmp);
+    defer a.free(home);
+    // 建 ~/.claude/CLAUDE.md + ~/.metacodes/AGENT.md
+    try mkdirAt(home, ".claude");
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const claude_dir = try std.fmt.bufPrint(&buf, "{s}/.claude", .{home});
+    try writeFileAt(claude_dir, "CLAUDE.md", "USER-CLAUDE-RULES");
+    try mkdirAt(home, ".metacodes");
+    var buf2: [std.fs.max_path_bytes]u8 = undefined;
+    const meta_dir = try std.fmt.bufPrint(&buf2, "{s}/.metacodes", .{home});
+    try writeFileAt(meta_dir, "AGENT.md", "USER-AGENT-NATIVE-RULES");
+
+    const out = try load(a, .{ .cwd = "", .home = home });
+    defer a.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "USER-CLAUDE-RULES") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "USER-AGENT-NATIVE-RULES") != null);
+    // 原生 AGENT.md 在 CLAUDE.md 之后 = 用户级最高优先。
+    try testing.expect(std.mem.indexOf(u8, out, "USER-AGENT-NATIVE-RULES").? > std.mem.indexOf(u8, out, "USER-CLAUDE-RULES").?);
+}
+
 test "load: upward recursion root->cwd order" {
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
