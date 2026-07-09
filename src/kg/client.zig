@@ -133,6 +133,10 @@ pub const KgClient = struct {
     /// 立即消费**(跨线程读 detail 是 best-effort 错误文案,不做数据依赖)。store 一致性
     /// 由 tinykg CliStoreLock 保证,调用本身无需串行。
     detail_mu: std.c.pthread_mutex_t = .{},
+    /// 缓存槽锁(project_node_id/global/miss/anchor_ids):多 subagent 线程共享本 client,
+    /// ?u64 是 tag+payload 两次 store——无锁撕裂读会拿垃圾 id 去建边(挂错节点=数据损坏)。
+    /// 纪律:锁只护槽读写,**绝不跨 spawn 持有**(子进程毫秒~秒级)。
+    cache_mu: std.c.pthread_mutex_t = .{},
     /// project-containment(tinykg ce3a7f0 起):本项目 project 节点 id(session 内缓存;
     /// lazy find-or-create,写路径才建,读路径只 lookup)。null=未解析/库中无。
     project_node_id: ?u64 = null,
@@ -395,17 +399,32 @@ pub const KgClient = struct {
     /// 客户端 lookup/create 两次调用的竞态=同名双 project 节点记忆永久分裂,Linus 严重3);
     /// create=false(读路径):无则返 null 并记 negative cache(scoped 自动召回每 turn 跑,
     /// 不缓存 miss 会每 turn 白烧 spawn,Linus 次要5;写路径 ensure 成功后清除)。
+    fn cacheLock(self: *KgClient) void {
+        _ = std.c.pthread_mutex_lock(&self.cache_mu);
+    }
+    fn cacheUnlock(self: *KgClient) void {
+        _ = std.c.pthread_mutex_unlock(&self.cache_mu);
+    }
+
     fn projectNodeId(self: *KgClient, scope_global: bool, create: bool) KgError!?u64 {
         const slot = if (scope_global) &self.global_project_node_id else &self.project_node_id;
         const miss = if (scope_global) &self.global_project_miss else &self.project_miss;
-        if (slot.*) |cached| return cached;
-        if (!create and miss.*) return null; // negative cache:本 session 已确认无
+        {
+            self.cacheLock();
+            defer self.cacheUnlock();
+            if (slot.*) |cached| return cached;
+            if (!create and miss.*) return null; // negative cache:本 session 已确认无
+        }
         const name = if (scope_global) "global" else self.domain;
         if (!create) {
             if (try self.lookupProjectNodeId(name)) |found| {
+                self.cacheLock();
+                defer self.cacheUnlock();
                 slot.* = found;
                 return found;
             }
+            self.cacheLock();
+            defer self.cacheUnlock();
             miss.* = true;
             return null;
         }
@@ -414,6 +433,8 @@ pub const KgClient = struct {
         });
         defer self.freeOut(out);
         const id = parseNodeIdLine(out.stdout) orelse return self.dataError("ensure project 节点输出不可解析: {s}", .{trimForLog(out.stdout)});
+        self.cacheLock();
+        defer self.cacheUnlock();
         slot.* = id;
         miss.* = false;
         return id;
@@ -443,6 +464,8 @@ pub const KgClient = struct {
 
     /// schema_type → 归属面。任务类(todo/plan_step/inbox_root)→ task 锚;
     /// document → docs 锚;其余(记忆 schema_type,含 agent 自定义类型)→ memory 锚。
+    /// **锋利边(Linus)**:新增任务类 schema_type 忘了加进这张表 → 该任务被静默归入
+    /// memory 锚(frontier(task锚) 看不见它)。加任务类型必改此表,DoD 含 L2 断言。
     fn anchorForSchemaType(schema_type: []const u8) AnchorKind {
         if (std.mem.eql(u8, schema_type, "todo") or
             std.mem.eql(u8, schema_type, "plan_step") or
@@ -455,7 +478,11 @@ pub const KgClient = struct {
     /// 每类每 project 唯一由原语保证。
     fn ensureAnchorId(self: *KgClient, scope_global: bool, kind: AnchorKind) KgError!u64 {
         const slot = &self.anchor_ids[@intFromBool(scope_global)][@intFromEnum(kind)];
-        if (slot.*) |id| return id;
+        {
+            self.cacheLock();
+            defer self.cacheUnlock();
+            if (slot.*) |id| return id;
+        }
         const pid = (try self.projectNodeId(scope_global, true)) orelse
             return self.dataError("project 节点解析失败({s} 锚不可得)", .{kind.cliName()});
         var pbuf: [24]u8 = undefined;
@@ -464,11 +491,16 @@ pub const KgClient = struct {
         defer self.freeOut(out);
         const id = parseNodeIdLine(out.stdout) orelse
             return self.dataError("ensure-anchor 输出不可解析: {s}", .{trimForLog(out.stdout)});
+        // 双线程同 miss → 两次 ensure(幂等同 id)→ 谁后写都一样。锁只防撕裂。
+        self.cacheLock();
+        defer self.cacheUnlock();
         slot.* = id;
         return id;
     }
 
     fn invalidateAnchor(self: *KgClient, scope_global: bool, kind: AnchorKind) void {
+        self.cacheLock();
+        defer self.cacheUnlock();
         self.anchor_ids[@intFromBool(scope_global)][@intFromEnum(kind)] = null;
         // project id 也可能 stale(锚失效常因整店重写)——连带清,下次写全链重 ensure。
         if (scope_global) {

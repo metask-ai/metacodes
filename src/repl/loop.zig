@@ -2120,8 +2120,9 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
                 inject.readIdPointer(allocator, app.kg_projects_dir, "kg_root");
             const rows: []@import("../kg/client.zig").FrontierRow = if (root) |r| (kg.frontier(r, 100) catch &.{}) else &.{};
             defer {
-                for (rows) |*fr| fr.deinit(allocator);
-                if (rows.len > 0) allocator.free(rows);
+                // kg 内存契约:kg.allocator 释放(见 KgClient 顶注)。
+                for (rows) |*fr| fr.deinit(kg.allocator);
+                if (rows.len > 0) kg.allocator.free(rows);
             }
             printPlanWithProgress(md, rows);
         } else {
@@ -2380,8 +2381,9 @@ fn printKgRootFrontier(allocator: std.mem.Allocator, kg: anytype, projects_dir: 
     const root = inject.readIdPointer(allocator, projects_dir, pointer) orelse return false;
     const rows = kg.frontier(root, 30) catch return false;
     defer {
-        for (rows) |*r| r.deinit(allocator);
-        allocator.free(rows);
+        // kg 内存契约:kg.allocator 释放(见 KgClient 顶注)。
+        for (rows) |*r| r.deinit(kg.allocator);
+        kg.allocator.free(rows);
     }
     if (rows.len == 0) return false;
     var actionable: usize = 0;

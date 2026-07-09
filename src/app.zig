@@ -757,8 +757,9 @@ pub const App = struct {
         const kg = &app.kg.?;
         const rows = kg.frontier(inbox, 50) catch return;
         defer {
-            for (rows) |*r| r.deinit(app.allocator);
-            app.allocator.free(rows);
+            // kg 内存契约:kg.allocator 释放(见 KgClient 顶注)。
+            for (rows) |*r| r.deinit(kg.allocator);
+            kg.allocator.free(rows);
         }
         for (rows) |r| {
             if (r.role == .branch) continue; // 复合节点非可执行项,镜像只收叶子

@@ -75,10 +75,12 @@ pub fn buildSummary(
         }
     }
     // 释放持原始整片(free 的 len 必须等于分配时的 len);过滤只产生视图。
+    // kg 内存契约:rows 是 kg.allocator 分的,用它释放(本函数主线程调用时两者同源,
+    // 但契约要处处成立——见 KgClient 顶注)。
     const rows_alloc = rows;
     defer {
-        for (rows_alloc) |*r| r.deinit(allocator);
-        if (rows_alloc.len > 0) allocator.free(rows_alloc);
+        for (rows_alloc) |*r| r.deinit(kg.allocator);
+        if (rows_alloc.len > 0) kg.allocator.free(rows_alloc);
     }
     var view: []const client_mod.FrontierRow = rows;
     if (rows.len > 0) {
