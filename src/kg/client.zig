@@ -843,11 +843,16 @@ pub const KgClient = struct {
             _ = cols.next() orelse continue;
             const text_col = cols.rest();
             _ = std.fmt.parseInt(u64, id_str, 10) catch continue;
-            const gop = seen.getOrPut(text_col) catch return null;
-            if (gop.found_existing) {
+            // 借用 key 不进 map(Linus:dupe 失败时 map 持有指向 out.stdout 的借用指针 →
+            // defer 清理循环 invalid free):先 contains,miss 才 dupe 后 put。
+            if (seen.contains(text_col)) {
                 return allocator.dupe(u8, text_col) catch null; // 首个重复名即够提示
             }
-            gop.key_ptr.* = allocator.dupe(u8, text_col) catch return null;
+            const key_owned = allocator.dupe(u8, text_col) catch return null;
+            seen.put(key_owned, {}) catch {
+                allocator.free(key_owned);
+                return null;
+            };
         }
         return null;
     }
