@@ -2218,7 +2218,9 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
                     }
                     // 源文件已不存在 → 放行删除。
                 } else {
-                    std.debug.print("注意:node {d} 是记忆文件的派生节点(section/正文)—— forget 会在下次写该文件时复活。\n正确删法:修改/清空源记忆文件(/kg mem 查看 document 及其来源)。仍要强删:/kg forget! {d}\n", .{ id, id });
+                    // content: 前缀无法区分"md 文件正文"(会复活)与"KgRemember 投影节点"(不会)
+                    // —— 文案不武断(Linus:安全闸给错误操作指引是半个 bug)。
+                    std.debug.print("注意:node {d} 是派生投影节点(记忆文件正文,或 KgRemember 投影)。\n若来自记忆文件:forget 会在下次写该文件时复活,应修改/清空源文件(/kg mem 查 document 来源)。\n确认无源文件或仍要强删:/kg forget! {d}\n", .{ id, id });
                     return;
                 }
             }
