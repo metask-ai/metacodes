@@ -54,6 +54,14 @@ pub fn isTransientNetworkError(err: anyerror) bool {
         error.NetworkUnreachable,
         error.ConnectionRefused,
         error.TemporaryNameServerFailure,
+        // std.Io.Writer/Reader 把底层 broken-pipe/reset **包装成通用 WriteFailed/ReadFailed**,
+        // 丢了具体 errno。写 HTTP 请求体 / 读响应头时它必是连接问题(尤其长驻 daemon 撞到
+        // 服务端已关的 pooled keep-alive 连接)→ 该重试(重连拿新连接)。非连接场景的
+        // 请求体写失败不存在,retry 幂等(body 没发出去,重发无副作用)。
+        // 病根:web 长驻进程复用 std.http.Client 连接池,空闲后连接被服务端关,首个 sendBody
+        // WriteFailed 若不归瞬态就"1 attempt"放弃 → 用户见 api_error。headless 每次新进程无此问题。
+        error.WriteFailed,
+        error.ReadFailed,
         => true,
         else => false,
     };

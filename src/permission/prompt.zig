@@ -28,9 +28,11 @@ pub fn ask(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bo
         return askText(tool_name, args);
     }
 
-    // TTY + 已注入 runner → 经 UiRequest 让前端渲染对话框。
+    // 已注入 runner → 经 UiRequest 让前端渲染对话框。**不 gate 在 isatty 上**:
+    // UiRequester 是 UI 中立抽象,web/GUI 前端无 tty 也能渲染(旧 isatty gate 是 TUI
+    // 时代的泄漏——web 模式非 tty 启动会掉进 fd 0 文字 prompt 死等)。
     // 无 runner(库消费者未接 UI / 无 watcher 场景)→ 落到下方文字 prompt。
-    if ((std.c.isatty(0) != 0)) {
+    if (ctx.ui_requester != null or std.c.isatty(0) != 0) {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const choice_opt: ?PermissionChoice = blk: {
@@ -78,6 +80,10 @@ pub fn ask(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bo
                 },
             }
         }
+        // requester 存在但未给出答案(异常/pending/取消)且无 tty 可回落 → 安全 deny。
+        // 绝不读 fd 0:web/GUI daemon 的 fd 0 不属于权限系统(读它 = 死等或吞别人的输入)。
+        // tty 场景保留 askText 回落(TUI dialog Esc 的存量语义不动)。
+        if (std.c.isatty(0) == 0) return false;
         // dialog 返回 null(意外非 TTY)→ 落到文字
     }
 

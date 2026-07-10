@@ -58,6 +58,18 @@ test "L2: receiveHead 断连分类为 TransientNetwork(可重试,不塌缩)" {
     try std.testing.expect(cc.client_mod.isTransientNetworkError(error.HttpConnectionClosing));
 }
 
+// 回归:std.Io.Writer/Reader 把 broken-pipe 包装成通用 WriteFailed/ReadFailed,必须归瞬态。
+// 病根:web 长驻 daemon 复用 std.http.Client 连接池,空闲后服务端关连接,首个 sendBody
+// 返 WriteFailed;旧分类漏它 → "1 attempt" 放弃 → 用户见 api_error(headless 每次新进程无恙)。
+test "L2: WriteFailed/ReadFailed 归瞬态可重试(失效 keep-alive 重连,不塌缩 api_error)" {
+    try std.testing.expect(cc.client_mod.isTransientNetworkError(error.WriteFailed));
+    try std.testing.expect(cc.client_mod.isTransientNetworkError(error.ReadFailed));
+    try std.testing.expect(cc.client_mod.isRetriableError(error.WriteFailed));
+    try std.testing.expect(cc.client_mod.isRetriableError(error.ReadFailed));
+    // 反向守卫:真·非瞬态(如 Unauthorized)仍不可重试,别把修复扩大成"什么都重试"。
+    try std.testing.expect(!cc.client_mod.isTransientNetworkError(error.Unauthorized));
+}
+
 // ② 建连重试成功:断一次,sendMessageStreamFullRetry 第 2 连接成功拿到完整流。
 test "L2: 建连断一次 → 重试包装第2次成功(短退避)" {
     const a = std.testing.allocator;

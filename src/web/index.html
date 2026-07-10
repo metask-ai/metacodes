@@ -1,0 +1,627 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>metacodes web</title>
+<style>
+  :root {
+    --bg: #1e1e1e; --fg: #d4d4d4; --dim: #808080; --accent: #4ec9b0;
+    --user: #569cd6; --tool: #ce9178; --err: #f48771; --ok: #6a9955;
+    --card: #252526; --border: #3c3c3c; --add-bg: #1e3a24; --add-fg: #6ac077;
+    --del-bg: #3a1e1e; --del-fg: #e06c6c; --link: #4ea1d3; --code-bg: #2d2d2d;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 14px/1.55 "SF Mono", Menlo, Consolas, monospace;
+         display: flex; flex-direction: column; height: 100vh; }
+  #statusbar { padding: 6px 12px; background: var(--card); border-bottom: 1px solid var(--border);
+               color: var(--dim); font-size: 12px; display: flex; gap: 16px; flex-shrink: 0;
+               flex-wrap: wrap; align-items: center; }
+  #statusbar .on { color: var(--accent); }
+  #scroll { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 12px 14px; }
+  .msg-user { color: var(--user); white-space: pre-wrap; margin: 12px 0 4px; word-break: break-word; }
+  .msg-user::before { content: "❯ "; }
+  .msg-assistant { margin: 4px 0 8px; word-break: break-word; }
+  /* markdown-rendered assistant text */
+  .md p { margin: 4px 0; } .md h1,.md h2,.md h3 { margin: 10px 0 4px; color: var(--fg); font-size: 1.05em; }
+  .md ul,.md ol { margin: 4px 0; padding-left: 22px; } .md li { margin: 2px 0; }
+  .md code { background: var(--code-bg); padding: 1px 4px; border-radius: 3px; font-size: .92em; }
+  .md pre { background: var(--code-bg); padding: 8px 10px; border-radius: 5px; overflow-x: auto; margin: 6px 0; }
+  .md pre code { background: none; padding: 0; }
+  .md a { color: var(--link); text-decoration: none; } .md a:hover { text-decoration: underline; }
+  .md strong { color: #e8e8e8; } .md blockquote { border-left: 3px solid var(--border); margin: 4px 0; padding-left: 10px; color: var(--dim); }
+
+  .tool-card { background: var(--card); border-left: 3px solid var(--tool);
+               margin: 8px 0; padding: 5px 10px; font-size: 13px; border-radius: 0 4px 4px 0; }
+  .tool-card .thead { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .tool-card .tname { color: var(--tool); font-weight: bold; }
+  .tool-card .targ { color: var(--dim); word-break: break-all; flex: 1; min-width: 0; }
+  .tool-card .telapsed { color: var(--dim); font-size: 11px; white-space: nowrap; }
+  .tool-card.error { border-left-color: var(--err); }
+  .tool-card.running { border-left-color: var(--accent); }
+  .tool-card.running .tname::after { content: " ⋯"; color: var(--accent); }
+  .tbody { margin-top: 4px; }
+  .tsummary { color: var(--ok); } .tsummary.err { color: var(--err); }
+  .tprogress { color: var(--accent); font-size: 12px; margin-top: 2px; }
+  .tout { white-space: pre-wrap; color: var(--fg); font-size: 12px; margin-top: 3px;
+          max-height: 22em; overflow: auto; word-break: break-word; }
+  .tout.stderr { color: var(--err); }
+  .texit { color: var(--dim); font-size: 11px; margin-top: 2px; }
+  details.tdetails { margin-top: 3px; } details.tdetails > summary { cursor: pointer; color: var(--dim); font-size: 12px; }
+  details.tdetails[open] > summary { color: var(--accent); }
+  /* diff */
+  .diff { font-size: 12px; margin-top: 3px; overflow-x: auto; }
+  .diff .dl { white-space: pre; display: flex; }
+  .diff .dnum { color: var(--dim); width: 3.5em; text-align: right; padding-right: 8px;
+                flex-shrink: 0; user-select: none; }
+  .diff .dtext { flex: 1; }
+  .diff .add { background: var(--add-bg); } .diff .add .dtext { color: var(--add-fg); }
+  .diff .del { background: var(--del-bg); } .diff .del .dtext { color: var(--del-fg); }
+  .diff .ctx .dtext { color: var(--dim); }
+  .searchlist { margin-top: 3px; font-size: 12px; } .searchlist a { color: var(--link); text-decoration: none; }
+  .searchlist a:hover { text-decoration: underline; }
+  .sysline { color: var(--dim); font-style: italic; margin: 4px 0; font-size: 12px; }
+  .sysline.warn { color: var(--err); font-style: normal; }
+
+  #dialog-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.55);
+                    display: none; align-items: center; justify-content: center; z-index: 10; }
+  #dialog { background: var(--card); border: 1px solid var(--accent); border-radius: 8px;
+            max-width: 660px; width: 92%; max-height: 82vh; overflow-y: auto; padding: 16px; }
+  #dialog h3 { margin: 0 0 8px; color: var(--accent); font-size: 14px; }
+  #dialog pre { background: var(--bg); padding: 8px; overflow-x: auto; white-space: pre-wrap;
+                border-radius: 4px; max-height: 40vh; }
+  #dialog button { display: block; width: 100%; text-align: left; margin: 6px 0; padding: 8px 10px;
+                   background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+                   border-radius: 4px; cursor: pointer; font: inherit; }
+  #dialog button:hover { border-color: var(--accent); color: var(--accent); }
+  #dialog label { display: block; margin: 4px 0; cursor: pointer; }
+  #inputbar { display: flex; gap: 8px; padding: 10px 12px; background: var(--card);
+              border-top: 1px solid var(--border); flex-shrink: 0; }
+  #input { flex: 1; background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+           border-radius: 4px; padding: 8px 10px; font: inherit; resize: none; min-height: 38px; max-height: 40vh; }
+  #input:focus { outline: none; border-color: var(--accent); }
+  button.act { background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+               border-radius: 4px; padding: 0 14px; cursor: pointer; font: inherit; }
+  button.act:hover { border-color: var(--accent); color: var(--accent); }
+  #stop { display: none; } #stop.visible { display: block; color: var(--err); }
+  .spinner { color: var(--accent); }
+  #st-mode { cursor: pointer; } #st-mode:hover { color: var(--accent); }
+  /* slash command palette */
+  #palette { position: absolute; bottom: 60px; left: 12px; right: 12px; max-width: 620px;
+             background: var(--card); border: 1px solid var(--accent); border-radius: 6px;
+             max-height: 40vh; overflow-y: auto; display: none; z-index: 8; }
+  #palette .pcmd { padding: 6px 12px; cursor: pointer; display: flex; gap: 10px; align-items: baseline; }
+  #palette .pcmd.sel { background: var(--bg); }
+  #palette .pname { color: var(--accent); font-weight: bold; white-space: nowrap; }
+  #palette .pdesc { color: var(--dim); font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="statusbar">
+  <span id="st-model">model: —</span>
+  <span id="st-mode">mode: —</span>
+  <span id="st-turn"></span>
+  <span id="st-tokens">tokens: —</span>
+  <span id="st-phase"></span>
+  <span id="st-conn"></span>
+</div>
+<div id="scroll"></div>
+<div id="dialog-overlay"><div id="dialog"></div></div>
+<div id="palette"></div>
+<div id="inputbar">
+  <textarea id="input" placeholder="Message… (Enter to send, / for commands, Shift+Enter for newline)"></textarea>
+  <button class="act" id="send">Send</button>
+  <button class="act" id="stop">Stop</button>
+</div>
+<script>
+"use strict";
+const scroll = document.getElementById("scroll");
+const input = document.getElementById("input");
+const overlay = document.getElementById("dialog-overlay");
+const dialog = document.getElementById("dialog");
+
+let lastSeq = -1;          // 已消费的最大 SSE id
+let curText = null;        // 正在流式追加的 assistant 文本(累积原始 markdown 源)
+let curTextRaw = "";       // 当前 assistant 段的 markdown 源
+let toolCards = {};        // tool_use id → {el, bodyEl}
+let curTurn = 0, curToolCalls = 0;
+
+function atBottom() { return scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 80; }
+function stick(fn) { const b = atBottom(); fn(); if (b) scroll.scrollTop = scroll.scrollHeight; }
+function el(cls, text) { const d = document.createElement("div"); if (cls) d.className = cls; if (text != null) d.textContent = text; return d; }
+function basename(p) { p = String(p || ""); const i = p.lastIndexOf("/"); return i < 0 ? p : p.slice(i + 1); }
+function esc(s) { const d = document.createElement("div"); d.textContent = String(s ?? ""); return d.innerHTML; }
+function jparse(s) { try { return JSON.parse(s); } catch { return null; } }
+
+// ── SSE ─────────────────────────────────────────────────────────────────────
+function connect() {
+  const es = new EventSource("/events?since=" + (lastSeq + 1));
+  document.getElementById("st-conn").textContent = "";
+  es.onmessage = (m) => {
+    lastSeq = parseInt(m.lastEventId, 10);
+    const ev = jparse(m.data); if (!ev) return;
+    stick(() => dispatch(ev));
+  };
+  es.addEventListener("session_closed", () => { es.close(); sysline("· session closed"); });
+  es.onerror = () => {
+    document.getElementById("st-conn").textContent = "reconnecting…";
+    es.close(); setTimeout(connect, 1000);
+  };
+}
+
+// ── 顶层信封分发:处理每一种响应 ─────────────────────────────────────────────
+function dispatch(ev) {
+  if ("core_event" in ev) return coreEvent(ev.core_event);
+  if ("user_message" in ev) { endAssistant(); scroll.appendChild(el("msg-user", ev.user_message)); return; }
+  if ("run_done" in ev) { endAssistant(); setGenerating(false);
+    const sr = ev.run_done.stop_reason || "done";
+    if (sr !== "end_turn") sysline("· " + sr + (ev.run_done.err ? ": " + ev.run_done.err : "")); return; }
+  if ("ui_request" in ev) return showDialog(ev.ui_request.id, ev.ui_request.request);
+  if ("ui_request_done" in ev || "ui_request_cancelled" in ev) return hideDialog();
+  if ("command_result" in ev) { const r = ev.command_result; sysline((r.ok ? "· " : "⚠ ") + (r.message || ""), !r.ok); if (r.ok) refreshState(); return; }
+}
+
+function coreEvent(ce) {
+  const tag = Object.keys(ce)[0], p = ce[tag];
+  switch (tag) {
+    case "text_chunk": appendAssistant(p); break;
+    case "stream_begin": endAssistant(); break;
+    case "stream_done": endAssistant(); break;
+    case "phase_change": setGenerating(p === "generating" || p === 1); break;
+
+    case "tool_start": endAssistant(); startToolCard(p); break;
+    case "tool_progress": toolProgress(p); break;
+    case "tool_result": finishToolCard(p); break;
+
+    case "set_current_tool": setPhaseLabel("✻ " + p.name + "…"); break;
+    case "clear_current_tool": break; // 由 tool_result / run_done 收尾
+    case "progress":
+      curTurn = p.turn; curToolCalls = p.tool_calls;
+      document.getElementById("st-turn").textContent = "turn " + p.turn + " · " + p.tool_calls + " tools";
+      break;
+
+    case "usage": refreshStateSoon(); break;
+    case "context_warning":
+      sysline("⚠ context " + p.level + " — " + p.current_tokens + " / " + p.auto_compact_threshold + " tokens", true); break;
+    case "auto_compact":
+      sysline("✻ compacted history: dropped " + p.dropped + ", kept " + p.kept +
+              (p.before_tokens ? " (" + p.before_tokens + "→" + p.after_tokens + " tok)" : "") + " · " + (p.cause || "")); break;
+    case "retry_notice":
+      sysline("↻ retrying connection " + p.attempt + "/" + p.max + " (backoff " + p.delay_ms + "ms)…"); break;
+    case "ui_request_pending": break; // 同步前端走 ui_request 信封,此为异步前端预留
+    // 诊断事件:顶层页面不渲染(turn 计数已由 progress 提供)
+    case "diag_turn_begin": case "diag_turn_end": case "diag_run_end":
+    case "diag_breaker_tripped": case "diag_cache_break": case "diag_continuation": break;
+    default: console.warn("unhandled core_event:", tag, p); break;
+  }
+}
+
+// ── assistant 文本(流式 markdown)────────────────────────────────────────────
+function appendAssistant(chunk) {
+  if (!curText) { curText = el("msg-assistant md"); curTextRaw = ""; scroll.appendChild(curText); }
+  curTextRaw += chunk;
+  curText.innerHTML = renderMarkdown(curTextRaw);
+}
+function endAssistant() { curText = null; curTextRaw = ""; }
+
+// ── 工具卡:起始 ──────────────────────────────────────────────────────────────
+const TOOL_TITLE = { Edit: "Update", WebSearch: "Web Search" };
+function toolTitle(name) { return TOOL_TITLE[name] || name; }
+
+function argSummary(name, inputStr) {
+  const inp = jparse(inputStr) || {};
+  switch (name) {
+    case "Bash": case "BashOutput": return inp.command ? "$ " + inp.command : "";
+    case "Read": case "Edit": case "Write": case "NotebookEdit":
+      return basename(inp.file_path || inp.path || inp.notebook_path || "");
+    case "Grep": return inp.pattern ? 'pattern: "' + inp.pattern + '"' : "";
+    case "Glob": return inp.pattern || "";
+    case "WebSearch": return inp.query ? '"' + inp.query + '"' : "";
+    case "WebFetch": return inp.url || "";
+    case "Task": case "Agent": return inp.description || inp.prompt || inp.subagent_type || "";
+    case "TaskCreate": return inp.subject || "";
+    default: {
+      // 通用:第一个短 string 字段
+      for (const k of Object.keys(inp)) { const v = inp[k]; if (typeof v === "string" && v.length <= 120) return v; }
+      return "";
+    }
+  }
+}
+
+function startToolCard(p) {
+  const card = el("tool-card running");
+  const head = el("thead");
+  head.appendChild(el("tname", toolTitle(p.name)));
+  const arg = argSummary(p.name, p.input);
+  if (arg) head.appendChild(el("targ", arg));
+  card.appendChild(head);
+  const body = el("tbody");
+  card.appendChild(body);
+  toolCards[p.id] = { el: card, body };
+  scroll.appendChild(card);
+}
+
+function toolProgress(p) {
+  const c = toolCards[p.id]; if (!c) return;
+  let pr = c.body.querySelector(".tprogress");
+  if (!pr) { pr = el("tprogress"); c.body.appendChild(pr); }
+  pr.textContent = p.text;
+}
+
+// ── 工具卡:完成(每工具专属渲染,镜像 TUI tool_card.zig)────────────────────────
+function finishToolCard(p) {
+  // agent_loop 双发 tool_result(先空 content 后实 content)——空且非错只保持 running。
+  if (!p.content && !p.is_error) return;
+  let c = toolCards[p.id];
+  if (!c) { // 无起始卡(hidden 工具的结果)→ 现建
+    const card = el("tool-card"); const head = el("thead");
+    head.appendChild(el("tname", toolTitle(p.name)));
+    const arg = argSummary(p.name, p.input); if (arg) head.appendChild(el("targ", arg));
+    card.appendChild(head); const body = el("tbody"); card.appendChild(body);
+    scroll.appendChild(card); c = { el: card, body };
+  }
+  c.el.classList.remove("running");
+  const pr = c.body.querySelector(".tprogress"); if (pr) pr.remove();
+  if (p.elapsed_ms) c.el.querySelector(".thead").appendChild(el("telapsed", fmtElapsed(p.elapsed_ms)));
+
+  if (p.is_error) { renderToolError(c.body, p.content); c.el.classList.add("error"); }
+  else renderToolResult(c.body, p.name, p.input, p.content);
+  delete toolCards[p.id];
+}
+
+function renderToolError(body, content) {
+  const j = jparse(content);
+  let msg = null;
+  if (j) {
+    if (j.code === "Aborted") { body.appendChild(sumline("Interrupted · What should Claude do instead?", false, "dim")); return; }
+    msg = j.detail || j.message || j.error?.message || j.error?.detail;
+  }
+  if (!msg) { const t = String(content || "").trim(); msg = (t && t[0] !== "{" && t[0] !== "[") ? t : "[tool error]"; }
+  const d = el("tout stderr"); d.textContent = unesc(msg); body.appendChild(d);
+}
+
+function renderToolResult(body, name, inputStr, content) {
+  switch (name) {
+    case "Bash": case "BashOutput": return renderBash(body, content);
+    case "Write": return renderWrite(body, content);
+    case "Edit": return renderDiff(body, content, false, null);
+    case "NotebookEdit": return renderNotebook(body, content);
+    case "Grep": case "Glob": return renderSearch(body, content);
+    case "Read": return renderRead(body, content);
+    case "WebSearch": return renderWebSearch(body, content);
+    case "WebFetch": return renderWebFetch(body, content);
+    case "Task": case "Agent": case "TaskCreate": case "TaskUpdate":
+    case "TaskStop": case "TaskOutput": case "TaskList": case "TaskGet":
+      return renderTask(body, name, content);
+    default: return renderGeneric(body, name, content);
+  }
+}
+
+// summary headline
+function sumline(text, isErr, cls) {
+  const d = el("tsummary" + (isErr ? " err" : "")); if (cls === "dim") d.style.color = "var(--dim)";
+  d.textContent = text; return d;
+}
+// collapsible detail block with pre content
+function detailBlock(label, text, stderr) {
+  const det = document.createElement("details"); det.className = "tdetails";
+  const sum = document.createElement("summary"); sum.textContent = label; det.appendChild(sum);
+  const pre = el("tout" + (stderr ? " stderr" : "")); pre.textContent = text; det.appendChild(pre);
+  return det;
+}
+
+function renderBash(body, content) {
+  const j = jparse(content);
+  if (!j || (j.stdout === undefined && j.exit_code === undefined)) {
+    // 后台/纯文本
+    if (j && (j.background || j.job_id)) { body.appendChild(sumline("↳ running in background" + (j.job_id ? " (" + j.job_id + ")" : ""), false, "dim")); return; }
+    return renderGeneric(body, "Bash", content);
+  }
+  const out = String(j.stdout || ""), err = String(j.stderr || ""), code = j.exit_code;
+  if (out.trim()) { const d = el("tout"); d.textContent = out.replace(/\n$/, ""); body.appendChild(d); }
+  if (err.trim()) { const d = el("tout stderr"); d.textContent = err.replace(/\n$/, ""); body.appendChild(d); }
+  if (!out.trim() && !err.trim()) body.appendChild(sumline("(no output)", false, "dim"));
+  if (code !== undefined && code !== 0) body.appendChild(el("texit", "exit code " + code));
+}
+
+function countLines(s) { s = String(s || ""); if (!s) return 0; return s.split("\n").filter((l, i, a) => l.length || i < a.length - 1).length; }
+
+function renderWrite(body, content) {
+  const j = jparse(content) || {};
+  const path = j.file_path || j.path || "";
+  if (j.gitDiff) {
+    const n = countDiffAdds(j.gitDiff);
+    if (path) body.appendChild(sumline("Wrote " + n + " line" + (n === 1 ? "" : "s") + " to " + basename(path), false, "dim"));
+    return renderDiffText(body, j.gitDiff, true);
+  }
+  renderGeneric(body, "Write", content);
+}
+
+function renderNotebook(body, content) {
+  const j = jparse(content) || {};
+  if (j.gitDiff) {
+    const path = j.path || j.file_path || "notebook", mode = j.mode || "edit";
+    body.appendChild(sumline(mode + " cell in " + basename(path), false, "dim"));
+    return renderDiffText(body, j.gitDiff, false);
+  }
+  body.appendChild(sumline((j.mode || "edited") + " " + basename(j.path || "notebook"), false, "dim"));
+}
+
+function renderDiff(body, content, plain) {
+  const j = jparse(content);
+  if (!j || !j.gitDiff) return renderGeneric(body, "Edit", content);
+  renderDiffText(body, j.gitDiff, plain);
+}
+function countDiffAdds(diff) { return String(diff || "").split("\n").filter(l => l[0] === "+" && !l.startsWith("+++")).length; }
+
+// 解析 unified diff → 彩色行(带行号,镜像 TUI renderEditDiffImpl)
+function renderDiffText(body, diff, plain) {
+  const wrap = el("diff");
+  let oldLn = 0, newLn = 0;
+  for (const line of String(diff).split("\n")) {
+    if (line.startsWith("+++") || line.startsWith("---")) continue;
+    const hm = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hm) { oldLn = +hm[1]; newLn = +hm[2]; continue; }
+    let kind = "ctx", num = newLn;
+    if (line[0] === "+") { kind = plain ? "ctx" : "add"; num = newLn; newLn++; if (kind === "ctx") oldLn++; }
+    else if (line[0] === "-") { kind = "del"; num = oldLn; oldLn++; }
+    else { oldLn++; newLn++; }
+    const row = el("dl " + kind);
+    row.appendChild(el("dnum", String(num)));
+    const txt = el("dtext"); txt.textContent = plain ? line : (line[0] === "+" || line[0] === "-" ? line.slice(1) : line.slice(1));
+    row.appendChild(txt);
+    wrap.appendChild(row);
+  }
+  body.appendChild(wrap);
+}
+
+function renderSearch(body, content) {
+  const lines = String(content || "").split("\n").filter(l => l.trim());
+  const n = lines.length;
+  body.appendChild(sumline("Found " + n + " result" + (n === 1 ? "" : "s")));
+  if (n) body.appendChild(detailBlock("show matches", lines.join("\n"), false));
+}
+
+function renderRead(body, content) {
+  const txt = String(content || "");
+  const first = txt.split("\n")[0] || "";
+  let summary;
+  if (/image|PDF/i.test(first)) summary = first;
+  else { const n = countLines(txt); summary = "Read " + n + " line" + (n === 1 ? "" : "s"); }
+  body.appendChild(sumline(summary, false, "dim"));
+  if (txt.trim() && !/image|PDF/i.test(first)) body.appendChild(detailBlock("show file", txt, false));
+}
+
+function renderWebSearch(body, content) {
+  const txt = String(content || "");
+  const n = (txt.match(/Web search results for query/g) || []).length || 1;
+  body.appendChild(sumline("Did " + n + " search" + (n === 1 ? "" : "es")));
+  // 提取链接渲染为可点列表
+  const links = [...txt.matchAll(/https?:\/\/[^\s)"'\]]+/g)].map(m => m[0]);
+  const uniq = [...new Set(links)].slice(0, 30);
+  if (uniq.length) {
+    const det = document.createElement("details"); det.className = "tdetails";
+    const sum = document.createElement("summary"); sum.textContent = uniq.length + " sources"; det.appendChild(sum);
+    const list = el("searchlist");
+    for (const u of uniq) { const a = document.createElement("a"); a.href = u; a.target = "_blank"; a.rel = "noopener"; a.textContent = u; const row = el(); row.appendChild(a); list.appendChild(row); }
+    det.appendChild(list); body.appendChild(det);
+  }
+}
+
+function renderWebFetch(body, content) {
+  const j = jparse(content) || {};
+  if (j.bytes !== undefined) {
+    body.appendChild(sumline("Received " + j.bytes + " bytes" + (j.truncated ? " (truncated)" : "")));
+    if (j.content) body.appendChild(detailBlock("show content", unesc(j.content), false));
+  } else body.appendChild(sumline("Fetched"));
+}
+
+function renderTask(body, name, content) {
+  const j = jparse(content) || {};
+  if (name === "TaskCreate") { body.appendChild(sumline("✓ created task #" + (j.id ?? j.task?.id ?? "?") + ": " + (j.subject ?? j.task?.subject ?? ""), false, "dim")); return; }
+  if ((name === "Task" || name === "Agent")) {
+    if (j.agent_job_id) { body.appendChild(sumline("◆ " + (j.subagent_type || "subagent") + " started (" + j.agent_job_id + ")", false, "dim")); return; }
+    if (j.final_text !== undefined || j.tool_calls !== undefined) {
+      let s = "Done (" + (j.tool_calls || 0) + " tool use" + (j.tool_calls === 1 ? "" : "s");
+      if (j.tokens) s += " · " + fmtTokens(j.tokens) + " tokens";
+      if (j.elapsed_ms) s += " · " + Math.round(j.elapsed_ms / 1000) + "s";
+      s += ")"; body.appendChild(sumline(s, false, "dim"));
+      if (j.final_text) body.appendChild(detailBlock("subagent output", unesc(j.final_text), false));
+      return;
+    }
+  }
+  if (name === "TaskOutput") { body.appendChild(sumline((j.status || "?") + " · " + (j.turns || 0) + " turns", false, "dim")); if (j.final_text) body.appendChild(detailBlock("output", unesc(j.final_text), false)); return; }
+  if (j.ok === true || j.ok === "true") { body.appendChild(sumline("✓ done", false, "dim")); return; }
+  renderGeneric(body, name, content);
+}
+
+function renderGeneric(body, name, content) {
+  const j = jparse(content);
+  if (j && typeof j === "object") {
+    // JSON:提关键字段拼一行,而非裸吐
+    const keys = ["status", "message", "detail", "count", "sent", "deleted", "recurring", "worktree", "description"];
+    const parts = [];
+    for (const k of keys) if (j[k] !== undefined) parts.push(k + "=" + j[k]);
+    body.appendChild(sumline(parts.length ? parts.join(" · ") : "done", false, "dim"));
+    body.appendChild(detailBlock("raw", JSON.stringify(j, null, 2), false));
+    return;
+  }
+  const txt = unesc(String(content || ""));
+  const d = el("tout"); d.textContent = txt; body.appendChild(d);
+}
+
+// ── UI 请求对话框(permission / ask_question / plan_approval / custom)──────────
+let pendingReqId = 0;
+function showDialog(id, req) {
+  pendingReqId = id; dialog.innerHTML = "";
+  const tag = Object.keys(req)[0], p = req[tag];
+  if (tag === "permission") {
+    dialog.appendChild(Object.assign(document.createElement("h3"), { textContent: "Permission: " + p.tool }));
+    const pre = document.createElement("pre"); pre.textContent = trunc(p.args, 1200); dialog.appendChild(pre);
+    choiceButtons([
+      ["Yes (once)", "allow_once"], ["Yes, always allow " + p.tool, "allow_always"],
+      ["No (once)", "deny_once"], ["No, don't ask again this session", "deny_tool_session"],
+    ], (c) => respond({ id, choice: c }));
+  } else if (tag === "plan_approval") {
+    dialog.appendChild(Object.assign(document.createElement("h3"), { textContent: "Plan approval" + (p.kg_step_count ? " (" + p.kg_step_count + " steps → task graph)" : "") }));
+    const md = el("md"); md.innerHTML = renderMarkdown(p.plan_md || ""); md.style.cssText = "background:var(--bg);padding:8px;border-radius:4px;max-height:40vh;overflow:auto"; dialog.appendChild(md);
+    choiceButtons([
+      ["Yes, proceed", "approve_default"], ["Yes, and auto-accept edits", "approve_accept_edits"],
+      ["No, keep planning", "reject"],
+    ], (c) => respond({ id, choice: c }));
+  } else if (tag === "ask_question") { renderAsk(id, p); }
+  else { dialog.appendChild(Object.assign(document.createElement("h3"), { textContent: "Unsupported UI request: " + tag }));
+    choiceButtons([["Dismiss", "x"]], () => respond({ id, result: null })); }
+  overlay.style.display = "flex";
+}
+function choiceButtons(pairs, cb) { for (const [label, val] of pairs) { const b = document.createElement("button"); b.textContent = label; b.onclick = () => cb(val); dialog.appendChild(b); } }
+function renderAsk(id, questions) {
+  const answers = new Array(questions.length).fill(null); let idx = 0;
+  const step = () => {
+    dialog.innerHTML = ""; const q = questions[idx];
+    dialog.appendChild(Object.assign(document.createElement("h3"), { textContent: (questions.length > 1 ? (idx + 1) + "/" + questions.length + " · " : "") + (q.header ? q.header + " · " : "") + q.question }));
+    if (q.multi) {
+      const boxes = [];
+      for (const o of q.options) { const lab = document.createElement("label"); const cb = document.createElement("input"); cb.type = "checkbox"; cb.value = o.label; lab.appendChild(cb); lab.appendChild(document.createTextNode(" " + o.label + (o.description ? " — " + o.description : ""))); dialog.appendChild(lab); boxes.push(cb); }
+      const done = document.createElement("button"); done.textContent = "Submit"; done.onclick = () => { answers[idx] = boxes.filter(b => b.checked).map(b => b.value).join(", "); next(); }; dialog.appendChild(done);
+    } else { choiceButtons(q.options.map(o => [o.label + (o.description ? " — " + o.description : ""), o.label]), (v) => { answers[idx] = v; next(); }); }
+    const other = document.createElement("input"); other.placeholder = "Other (type + Enter)…";
+    other.style.cssText = "width:100%;margin-top:8px;background:var(--bg);color:var(--fg);border:1px solid var(--border);padding:6px;font:inherit;border-radius:4px";
+    other.onkeydown = (e) => { if (e.key === "Enter" && other.value.trim()) { answers[idx] = other.value.trim(); next(); } };
+    dialog.appendChild(other);
+  };
+  const next = () => { idx++; if (idx < questions.length) step(); else respond({ id, answers }); };
+  step();
+}
+function respond(payload) { fetch("/respond", { method: "POST", body: JSON.stringify(payload) }).then(r => { if (!r.ok && r.status !== 409) sysline("respond failed: " + r.status, true); }); hideDialog(); }
+function hideDialog() { overlay.style.display = "none"; pendingReqId = 0; }
+
+// ── 输入 / 命令 / 历史 / 中断 ─────────────────────────────────────────────────
+// 斜杠命令表(对齐 TUI 子集)。backend=经 POST /command;client=纯前端。
+const COMMANDS = [
+  { name: "/help", desc: "Show commands", kind: "client" },
+  { name: "/clear", desc: "Clear the screen", kind: "client" },
+  { name: "/cost", desc: "Show token usage & cost", kind: "client" },
+  { name: "/mode", desc: "Cycle permission mode (default→acceptEdits→plan→bypass)", kind: "backend" },
+  { name: "/compact", desc: "Compact old conversation history", kind: "backend" },
+  { name: "/model", desc: "Show or switch the active model (/model <name>)", kind: "backend" },
+];
+const palette = document.getElementById("palette");
+let palSel = 0, palItems = [];
+const history = []; let histIdx = -1;
+
+function updatePalette() {
+  const v = input.value;
+  if (!v.startsWith("/") || v.includes("\n")) { palette.style.display = "none"; palItems = []; return; }
+  const q = v.slice(1).split(" ")[0].toLowerCase();
+  palItems = COMMANDS.filter(c => c.name.slice(1).startsWith(q));
+  if (!palItems.length) { palette.style.display = "none"; return; }
+  palSel = Math.min(palSel, palItems.length - 1);
+  palette.innerHTML = "";
+  palItems.forEach((c, i) => {
+    const row = el("pcmd" + (i === palSel ? " sel" : ""));
+    row.appendChild(el("pname", c.name)); row.appendChild(el("pdesc", c.desc));
+    row.onclick = () => { input.value = c.name + " "; palette.style.display = "none"; input.focus(); autoResize(); };
+    palette.appendChild(row);
+  });
+  palette.style.display = "block";
+}
+
+function runCommand(text) {
+  const name = text.split(" ")[0];
+  const spec = COMMANDS.find(c => c.name === name);
+  if (!spec) { sysline("unknown command: " + name, true); return; }
+  if (spec.kind === "client") {
+    if (name === "/clear") { scroll.innerHTML = ""; return; }
+    if (name === "/help") { const d = el("md"); d.innerHTML = renderMarkdown("**Commands**\n" + COMMANDS.map(c => "- `" + c.name + "` — " + c.desc).join("\n")); scroll.appendChild(d); return; }
+    if (name === "/cost") { fetch("/state").then(r => r.json()).then(s => sysline("tokens: " + (s.input_tokens || 0) + " in / " + (s.output_tokens || 0) + " out · $" + Number(s.cost_usd || 0).toFixed(4))); return; }
+  }
+  // backend command:入队,真实结果经 journal command_result 事件异步回(见 dispatch)。
+  fetch("/command", { method: "POST", body: JSON.stringify({ cmd: text }) })
+    .then(r => { if (!r.ok) sysline("command failed: " + r.status, true); })
+    .catch(() => sysline("command failed", true));
+}
+
+function send() {
+  const text = input.value.trim(); if (!text) return;
+  palette.style.display = "none"; input.value = ""; autoResize();
+  history.push(text); histIdx = history.length;
+  if (text.startsWith("/")) { runCommand(text); return; } // 斜杠命令不进对话
+  fetch("/message", { method: "POST", body: JSON.stringify({ text }) }).then(r => { if (!r.ok) sysline("send failed: " + r.status, true); });
+}
+function autoResize() { input.style.height = "auto"; input.style.height = Math.min(input.scrollHeight, window.innerHeight * 0.4) + "px"; }
+
+document.getElementById("send").onclick = send;
+document.getElementById("stop").onclick = () => fetch("/interrupt", { method: "POST" });
+document.getElementById("st-mode").onclick = () => fetch("/command", { method: "POST", body: JSON.stringify({ cmd: "/mode" }) }); // 结果经 journal command_result 回
+
+input.addEventListener("input", () => { autoResize(); updatePalette(); });
+input.addEventListener("keydown", (e) => {
+  const palOpen = palette.style.display === "block";
+  if (palOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+    e.preventDefault(); palSel = (palSel + (e.key === "ArrowDown" ? 1 : palItems.length - 1)) % palItems.length; updatePalette(); return;
+  }
+  if (palOpen && e.key === "Tab") { e.preventDefault(); if (palItems[palSel]) { input.value = palItems[palSel].name + " "; palette.style.display = "none"; autoResize(); } return; }
+  if (palOpen && e.key === "Escape") { palette.style.display = "none"; return; }
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    // palette 开着且还在打命令名(无空格/参数)→ Enter 补全为高亮命令再发
+    if (palOpen && palItems[palSel] && !input.value.includes(" ")) input.value = palItems[palSel].name;
+    send(); return;
+  }
+  // 命令历史 ↑↓(仅单行且光标在首/末时,避免与多行编辑冲突)
+  if (e.key === "ArrowUp" && !palOpen && !input.value.includes("\n") && histIdx > 0) { e.preventDefault(); histIdx--; input.value = history[histIdx]; autoResize(); }
+  else if (e.key === "ArrowDown" && !palOpen && !input.value.includes("\n") && histIdx < history.length - 1) { e.preventDefault(); histIdx++; input.value = history[histIdx]; autoResize(); }
+});
+
+function sysline(t, warn) { scroll.appendChild(el("sysline" + (warn ? " warn" : ""), t)); }
+function setGenerating(on) { document.getElementById("stop").classList.toggle("visible", on); setPhaseLabel(on ? "✻ generating…" : ""); }
+function setPhaseLabel(t) { const e = document.getElementById("st-phase"); e.innerHTML = t ? '<span class="spinner">' + esc(t) + '</span>' : ""; }
+let stateTimer = 0;
+function refreshStateSoon() { clearTimeout(stateTimer); stateTimer = setTimeout(refreshState, 300); }
+function refreshState() {
+  fetch("/state").then(r => r.json()).then(s => {
+    document.getElementById("st-model").textContent = "model: " + (s.model || "—");
+    document.getElementById("st-mode").textContent = "mode: " + (s.permission_mode || "—");
+    document.getElementById("st-tokens").textContent = "tokens: " + (s.input_tokens || 0) + " in / " + (s.output_tokens || 0) + " out" + (s.cost_usd != null ? " · $" + Number(s.cost_usd).toFixed(4) : "");
+    setGenerating(!!s.generating);
+  }).catch(() => {});
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+function trunc(s, n) { s = String(s ?? ""); return s.length > n ? s.slice(0, n) + " …" : s; }
+function unesc(s) { s = String(s ?? ""); if (s.indexOf("\\n") < 0 && s.indexOf("\\t") < 0 && s.indexOf('\\"') < 0) return s; try { return JSON.parse('"' + s.replace(/"/g, '\\"').replace(/\\\\/g, "\\\\") + '"'); } catch { return s.replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\"/g, '"').replace(/\\\\/g, "\\"); } }
+function fmtElapsed(ms) { return ms < 1000 ? ms + "ms" : (ms / 1000).toFixed(1) + "s"; }
+function fmtTokens(n) { return n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n); }
+
+// 最小安全 markdown:先 HTML 转义,再套 inline/block。无第三方依赖。
+function renderMarkdown(src) {
+  const lines = String(src).split("\n"); let html = "", inCode = false, codeBuf = [], listType = null;
+  const closeList = () => { if (listType) { html += "</" + listType + ">"; listType = null; } };
+  const inline = (t) => esc(t)
+    .replace(/`([^`]+)`/g, (m, c) => "<code>" + c + "</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    .replace(/(^|[\s(])((?:https?:\/\/)[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
+  for (const line of lines) {
+    if (line.trim().startsWith("```")) { if (inCode) { html += "<pre><code>" + esc(codeBuf.join("\n")) + "</code></pre>"; codeBuf = []; inCode = false; } else { closeList(); inCode = true; } continue; }
+    if (inCode) { codeBuf.push(line); continue; }
+    const h = line.match(/^(#{1,3})\s+(.*)$/);
+    if (h) { closeList(); html += "<h" + h[1].length + ">" + inline(h[2]) + "</h" + h[1].length + ">"; continue; }
+    const ul = line.match(/^\s*[-*]\s+(.*)$/), ol = line.match(/^\s*\d+\.\s+(.*)$/);
+    if (ul) { if (listType !== "ul") { closeList(); html += "<ul>"; listType = "ul"; } html += "<li>" + inline(ul[1]) + "</li>"; continue; }
+    if (ol) { if (listType !== "ol") { closeList(); html += "<ol>"; listType = "ol"; } html += "<li>" + inline(ol[1]) + "</li>"; continue; }
+    if (line.trim() === "") { closeList(); continue; }
+    if (line.startsWith(">")) { closeList(); html += "<blockquote>" + inline(line.slice(1).trim()) + "</blockquote>"; continue; }
+    closeList(); html += "<p>" + inline(line) + "</p>";
+  }
+  if (inCode) html += "<pre><code>" + esc(codeBuf.join("\n")) + "</code></pre>";
+  closeList();
+  return html;
+}
+
+connect(); refreshState(); setInterval(refreshState, 5000);
+</script>
+</body>
+</html>

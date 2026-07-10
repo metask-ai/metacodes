@@ -94,6 +94,10 @@ pub const suspend_state = @import("core/suspend_state.zig");
 pub const tee_backend = @import("core/tee_backend.zig");
 pub const diagnostics_backend = @import("core/diagnostics_backend.zig");
 pub const repl_msg_queue = @import("repl/msg_queue.zig");
+pub const web_journal = @import("web/journal.zig");
+pub const web_backend = @import("web/backend.zig");
+pub const web_server = @import("web/server.zig");
+pub const web_session = @import("web/session.zig");
 pub const tui_status_bar = @import("repl/tui/widget/status_bar.zig");
 pub const tui_verbs = @import("repl/tui/verbs.zig");
 pub const tui_ui_state = @import("repl/tui/ui_state.zig");
@@ -256,6 +260,15 @@ pub fn main(init: std.process.Init) !void {
     // 不发网络、不需有效 key。用于验证提示词×工具复刻(工具长描述 + 动态裁剪)。
     if (config.dump_prompt) {
         dumpPromptAndExit(app);
+    }
+
+    // Web 模式:`--web [port]` → 起 HTTP+SSE 服务器驱动 agent loop,不进 TUI REPL。
+    if (config.web_port) |port| {
+        const code = @import("web/session.zig").run(app, allocator, port) catch |err| blk: {
+            log.err("web", "web session failed: {s}", .{@errorName(err)});
+            break :blk 1;
+        };
+        std.process.exit(code);
     }
 
     // Headless 模式：`-p "..."` / stdin pipe → 跑单次 prompt 后退出，不进 REPL。
@@ -745,6 +758,17 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             if (args.next()) |p| config.prompt = allocator.dupe(u8, p) catch p;
         } else if (std.mem.eql(u8, arg, "--json")) {
             config.json_output = true;
+        } else if (std.mem.eql(u8, arg, "--web")) {
+            // 可选端口参数:下一个 arg 是数字才吃掉(否则它是别的 flag,留给循环)。
+            // Iterator 无 peek → 值拷贝试探(POSIX iterator 是纯索引 struct,拷贝安全)。
+            config.web_port = 7777;
+            var probe = args.*;
+            if (probe.next()) |maybe_port| {
+                if (std.fmt.parseInt(u16, maybe_port, 10)) |p| {
+                    config.web_port = p;
+                    _ = args.next();
+                } else |_| {}
+            }
         } else if (std.mem.eql(u8, arg, "--dump-prompt")) {
             config.dump_prompt = true;
         } else if (std.mem.eql(u8, arg, "-")) {
@@ -786,6 +810,7 @@ fn printHelp() void {
         \\  -p, --print <prompt>  Headless: run one prompt and exit (no REPL)
         \\  -                     Headless: read prompt from stdin
         \\  --json                Headless: emit NDJSON result event
+        \\  --web [port]          Serve a web UI (HTTP+SSE) instead of the TUI (default port 7777)
         \\  --model <model>       Model (default: claude-sonnet-4-20250514)
         \\  --reasoning-effort <e> none|minimal|low|medium|high|xhigh
         \\  --api-key <key>       API key (overrides stored credentials by default)
@@ -913,4 +938,8 @@ test {
     _ = &@import("app/config.zig");
     _ = &@import("core/subagent.zig");
     _ = &@import("core/patch.zig");
+    _ = &@import("web/journal.zig");
+    _ = &@import("web/backend.zig");
+    _ = &@import("web/server.zig");
+    _ = &@import("web/session.zig");
 }

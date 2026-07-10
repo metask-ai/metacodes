@@ -22,6 +22,9 @@ pub const Config = struct {
     /// `--dump-prompt`：构造完 system prompt + 工具 defs 后打印到 stdout 并退出，
     /// 不发网络、不需 API key。用于验证提示词×工具复刻。
     dump_prompt: bool = false,
+    /// `--web [port]`:起 web UI(HTTP+SSE)驱动 agent loop,不进 TUI REPL。
+    /// null = 不启用;0 = 内核分配端口(启动时打印真实端口)。
+    web_port: ?u16 = null,
     /// `--settings <path>`:显式 settings 文件(CLI 层,优先级仅次于 managed)。
     settings_path: ?[]const u8 = null,
     /// `--allowedTools "Tool,Tool(spec),..."`:逗号分隔,注入 CLI 层 allow。
