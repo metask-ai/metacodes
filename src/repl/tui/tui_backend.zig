@@ -48,6 +48,7 @@ const perm_dialog = @import("dialog/permission.zig");
 const exit_plan_dialog = @import("dialog/exit_plan_mode.zig");
 const tool_ctx = @import("../../tools/context.zig");
 const ui_request = @import("../../core/protocol/ui_request.zig");
+const terminal_title = @import("terminal_title.zig");
 
 const RenderRegion = render_region.RenderRegion;
 const Theme = theme_mod.Theme;
@@ -402,6 +403,11 @@ pub const TuiBackend = struct {
         req: *const ui_request.UiRequest,
         out: *ui_request.UiResponse,
     ) anyerror!void {
+        // tab 标题:进入需要用户操作(权限/问题/计划审批)→ 标 needs input;返回时恢复 working。
+        // (最有用的信号:切走到别的 tab 时,标签栏提示"这个 session 在等你"。)
+        const title_app = self.input_ctx.snapshot().app;
+        if (title_app) |a| terminal_title.setFromApp(a, .action_required);
+        defer if (title_app) |a| terminal_title.setFromApp(a, .working);
         switch (req.*) {
             .ask_question => |questions| {
                 // ask_question 的 answers 挂调用方传入的 allocator;不能用 withTerminalTakeover

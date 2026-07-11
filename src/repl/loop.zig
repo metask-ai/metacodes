@@ -32,6 +32,7 @@ const writer_backend_mod = @import("../core/writer_backend.zig");
 const tee_backend_mod = @import("../core/tee_backend.zig");
 const diagnostics_backend_mod = @import("../core/diagnostics_backend.zig");
 const tui_backend_mod = @import("tui/tui_backend.zig");
+const terminal_title = @import("tui/terminal_title.zig");
 const goal_mod = @import("../core/goal.zig");
 const usage_mod = @import("../core/usage.zig");
 const types_mod = @import("../types.zig");
@@ -70,6 +71,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
 
     const stdin_fd: std.c.fd_t = 0;
     const tty = std.c.isatty(stdin_fd) != 0;
+
+    // 终端 tab 标题反映 session 状态(idle/working/需要输入)。仅 tty;退出时清空。
+    if (tty) terminal_title.setFromApp(app, .idle);
+    defer if (tty) terminal_title.clear();
 
     // 工具 progress 心跳:tty 下经 agent_loop Options.spawn_tick_fn 传入(per-session,非全局)。
     // 非 TTY 不接(避免污染 pipe 输出)。具体在每次 run() 的 Options 里设 .spawn_tick_fn。
@@ -515,6 +520,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             null;
         defer if (gen_region) |*r| r.deinit();
         if (gen_region) |*r| r.enterGenerating(app, &msg_queue);
+        if (tty) terminal_title.setFromApp(app, .working); // tab:生成中
 
         var region_writer: ?render_region_mod.RegionWriter =
             if (gen_region) |*r| .{ .region = r } else null;
@@ -589,6 +595,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             // 停 watcher + 清 stdin 缓冲
             if (tui_be) |*tb| tb.stopInput();
             if (gen_region) |*r| r.leaveGenerating(app);
+            if (tty) terminal_title.setFromApp(app, .idle); // tab:回空闲
             if (tty) drainStdin(stdin_fd);
             app.clearPendingModelSwitchCompact();
             std.debug.print("\x1b[31mError: {s}\x1b[0m\n", .{@errorName(err)});
@@ -599,6 +606,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // 停 watcher + 清 stdin 缓冲（生成期间用户可能误按的键，别污染下一轮）
         if (tui_be) |*tb| tb.stopInput();
         if (gen_region) |*r| r.leaveGenerating(app);
+        if (tty) terminal_title.setFromApp(app, .idle); // tab:回空闲
         if (tty) drainStdin(stdin_fd);
 
         // 每轮结束 flush transcript（含错误 / abort 路径；只要有变动都想落盘）
