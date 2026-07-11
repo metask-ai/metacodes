@@ -16,6 +16,42 @@ const TaskStatus = task_store.TaskStatus;
 const Task = task_store.Task;
 const util_json = @import("../util/json.zig");
 const common = @import("common.zig");
+const log = @import("../util/log.zig");
+const KgClient = @import("../kg/client.zig").KgClient;
+
+/// 任务闭合结构化投影(改动一 —— 分类的"结晶点"):把模型在闭合时提供的
+/// acts_on/uses/produces 写成 concept 节点 + ref 边(默认 tentative)。任务开始时的分类是猜的,
+/// 闭合时才知道真实用了什么——这是"伴随执行浮现、闭合时质量最高"原则的落点。
+/// **写入失败不得阻塞任务闭合**(degraded 非依赖):任一步失败 log+continue,任务已闭合。
+fn writeClosureProjection(ctx: *const ToolContext, kg: *KgClient, task_node: u64, args: []const u8) void {
+    const Field = struct { field: []const u8, rel: []const u8 };
+    const fields = [_]Field{
+        .{ .field = "acts_on", .rel = "acts_on" },
+        .{ .field = "uses", .rel = "uses" },
+        .{ .field = "produces", .rel = "produces" },
+    };
+    var wrote_any = false;
+    for (fields) |f| {
+        const items = (extractStringArray(ctx.allocator, args, f.field) catch continue) orelse continue;
+        defer freeStringArray(ctx.allocator, items);
+        for (items) |raw| {
+            const name = std.mem.trim(u8, raw, " \t\r\n");
+            if (name.len == 0 or name.len > 200) continue;
+            const concept = kg.ensureConcept(name) catch |e| {
+                log.warn("kg", "closure projection ensureConcept({s}) failed: {s}", .{ name, @errorName(e) });
+                continue;
+            };
+            // tentative(confirmed=false):agent 执行中打的,人类确认/纠正才落 confirmed。
+            kg.addRefEdge(task_node, f.rel, concept, false) catch |e| {
+                log.warn("kg", "closure projection {s}→{d} failed: {s}", .{ f.rel, concept, @errorName(e) });
+                continue;
+            };
+            wrote_any = true;
+        }
+    }
+    // 发现面:登记有待确认分类的任务,/kg 状态页提示人类去 /kg refs 审阅结晶。
+    if (wrote_any) kg.notePendingRefTask(task_node);
+}
 
 fn requireStore(ctx: *const ToolContext) !*task_store.TaskStore {
     return ctx.tasks orelse return error.TaskStoreUnavailable;
@@ -424,7 +460,10 @@ fn updateKgTask(ctx: *const ToolContext, node_id_str: []const u8, args: []const 
     const st = TaskStatus.fromString(status_str) orelse return error.InvalidStatus;
     switch (st) {
         .completed => {
-            const evidence = (try extractUnescaped(ctx.allocator, args, "evidence")) orelse
+            // 一句话结论优先作闭合证据(改动一的"结晶":闭合时质量最高的一句总结);
+            // 无 conclusion 才退回 evidence/description。
+            const evidence = (try extractUnescaped(ctx.allocator, args, "conclusion")) orelse
+                (try extractUnescaped(ctx.allocator, args, "evidence")) orelse
                 (try extractUnescaped(ctx.allocator, args, "description")) orelse
                 try ctx.allocator.dupe(u8, "completed");
             defer ctx.allocator.free(evidence);
@@ -432,6 +471,9 @@ fn updateKgTask(ctx: *const ToolContext, node_id_str: []const u8, args: []const 
                 common.setErrorDetail(ctx.error_detail, ctx.allocator, "闭合计划步骤失败({s}): {s}", .{ @errorName(e), kg.detail() });
                 return error.KgCloseFailed;
             };
+            // 结构化投影(acts_on/uses/produces → ref 边,tentative)。**degraded 非依赖**:
+            // 任务已闭合,投影失败只 log 不回滚(catch 全在 writeClosureProjection 内部)。
+            writeClosureProjection(ctx, kg, node_id, args);
             removeKgMirror(ctx, node_id); // store 镜像同步消失(TaskTab/TaskList)
             // 搭车:返回更新后的 frontier(刷新看板——设计 §2.2 R2 幂等"看板"非"领任务")。
             // 闭合正是选下一步的时刻:ready 无主叶子 ≥2 时同样给并行提示。
@@ -604,10 +646,18 @@ pub fn executeStop(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         const kg = ctx.kg orelse return error.KgUnavailable;
         if (!kg.ready) return error.KgUnavailable;
         const node_id = std.fmt.parseInt(u64, id["kg-".len..], 10) catch return error.TaskNotFound;
-        kg.closeTask(node_id, "completed") catch |e| {
+        // conclusion 优先作闭合证据(与 updateKgTask 对齐)。
+        const evidence = (try extractUnescaped(ctx.allocator, args, "conclusion")) orelse
+            try ctx.allocator.dupe(u8, "completed");
+        defer ctx.allocator.free(evidence);
+        kg.closeTask(node_id, evidence) catch |e| {
             common.setErrorDetail(ctx.error_detail, ctx.allocator, "闭合任务失败({s})", .{@errorName(e)});
             return error.KgCloseFailed;
         };
+        // TaskStop 自称"等价 TaskUpdate completed"——闭合投影必须同路径,否则模型走哪个
+        // 闭合动词决定分类结晶是否发生(静默分叉)。args 通常无 acts_on/uses/produces → 空投影
+        // (degraded 无害),但若模型确实传了就同样生效。
+        writeClosureProjection(ctx, kg, node_id, args);
         removeKgMirror(ctx, node_id); // store 镜像同步消失
         return try ctx.allocator.dupe(u8, "{\"ok\":true,\"status\":\"completed\"}");
     }

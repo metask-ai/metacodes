@@ -2052,6 +2052,24 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
             }
         }
         if (app.memdir_abs.len > 0) std.debug.print("(手工编辑过记忆文件?/kg sync 重新同步入图)\n", .{});
+        // 分类结晶发现面(PM 终审:tentative 边无人知晓就永远不结晶)。本 session 有任务
+        // 产出待确认分类 → 提示人类去审阅(concept id 只能从 /kg refs 取,这是唯一入口)。
+        {
+            const pend = kg.pendingRefTasks(allocator);
+            defer if (pend.len > 0) allocator.free(pend);
+            if (pend.len > 0) {
+                const color = std.c.getenv("NO_COLOR") == null;
+                std.debug.print("{s}待确认分类:{d} 个任务产出了 tentative 分类投影(闭合时 agent 打的,待人类结晶)。{s}\n  审阅:", .{ if (color) "\x1b[36m" else "", pend.len, if (color) "\x1b[0m" else "" });
+                for (pend, 0..) |t, i| {
+                    if (i >= 8) {
+                        std.debug.print(" …(共 {d})", .{pend.len});
+                        break;
+                    }
+                    std.debug.print("{s}/kg refs {d}", .{ if (i == 0) "" else " · ", t });
+                }
+                std.debug.print("\n", .{});
+            }
+        }
         // 重复 project 检测(旧 bug 时代增殖的同名节点让一半记忆召回不可见,用户自己不可能发现)。
         if (kg.duplicateProjectHint(allocator)) |hint| {
             defer allocator.free(hint);
@@ -2241,7 +2259,104 @@ fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !
         return;
     }
 
-    std.debug.print("用法:/kg(状态)| /kg mem(记忆)| /kg plan(计划)| /kg projects(project 列表)| /kg sync(重同步记忆文件)| /kg gc(孤儿预览,gc! 清理)| /kg merge <from> <to>(合并重复 project)| /kg forget <id>(删除,md 派生强删用 forget!)\n", .{});
+    // /kg refs（无参）—— 列出本 session 有待确认分类的任务,作为发现入口。
+    if (std.mem.eql(u8, arg, "refs")) {
+        const pend = kg.pendingRefTasks(allocator);
+        defer if (pend.len > 0) allocator.free(pend);
+        if (pend.len == 0) {
+            std.debug.print("(本 session 无待确认分类;任务闭合填 acts_on/uses/produces 后在此出现)\n用法:/kg refs <task-id> 看单个任务的分类投影\n", .{});
+            return;
+        }
+        std.debug.print("本 session 产出待确认分类的任务(/kg refs <id> 展开):\n", .{});
+        for (pend) |t| std.debug.print("  /kg refs {d}\n", .{t});
+        return;
+    }
+
+    // /kg refs <task-id> —— 看某任务的分类投影(acts_on/uses/produces/about + concept id + 两态)。
+    // confirm/correct 需要 concept id,此视图是**获取 id 的唯一入口**——没它这两个命令没法用。
+    if (std.mem.startsWith(u8, arg, "refs ")) {
+        var id_str = std.mem.trim(u8, arg["refs ".len..], " \t");
+        if (std.mem.startsWith(u8, id_str, "kg-")) id_str = id_str["kg-".len..]; // 容忍 TaskList 的 kg-<id> 形式
+        const task = std.fmt.parseInt(u64, id_str, 10) catch {
+            std.debug.print("用法:/kg refs <task-id>(task id 从 /kg plan 或 TaskList 的 kg-<id> 取)\n", .{});
+            return;
+        };
+        const nb = kg.neighborsJson(task, 200) catch |e| {
+            std.debug.print("查询失败({s}): {s}\n", .{ @errorName(e), kg.detail() });
+            return;
+        };
+        defer kg.allocator.free(nb); // neighborsJson 用 kg.allocator 分配(契约,勿依赖实例同一)
+        const Edge = struct { rel: []const u8, dst: u64, props: struct { state: ?[]const u8 = null } = .{} };
+        const Doc = struct { edges: []const Edge };
+        const parsed = std.json.parseFromSlice(Doc, allocator, nb, .{ .ignore_unknown_fields = true }) catch {
+            std.debug.print("(neighbors 解析失败)\n", .{});
+            return;
+        };
+        defer parsed.deinit();
+        std.debug.print("task {d} 的分类投影:\n", .{task});
+        var any = false;
+        for (parsed.value.edges) |e| {
+            if (!isRefRel(e.rel)) continue;
+            any = true;
+            const state = e.props.state orelse "tentative";
+            var subject: []const u8 = "";
+            const dtext = kg.fetchNodeText(e.dst) catch null;
+            defer if (dtext) |t| kg.allocator.free(t);
+            if (dtext) |t| {
+                const nl = std.mem.indexOfScalar(u8, t, '\n');
+                subject = if (nl) |i| t[0..i] else t;
+            }
+            std.debug.print("  {s:<9} concept {d} [{s}]  {s}\n", .{ e.rel, e.dst, state, subject });
+        }
+        if (!any) std.debug.print("(无——任务闭合时填 acts_on/uses/produces 才会产生)\n", .{});
+        std.debug.print("确认:/kg confirm {d} <rel> <concept-id>  |  纠正:/kg correct {d} <rel> <old-concept-id> <new-name>\n", .{ task, task });
+        return;
+    }
+
+    // /kg confirm <task-id> <rel> <concept-id> —— 人类背书一个分类(tentative→confirmed,改动三)。
+    if (std.mem.startsWith(u8, arg, "confirm ")) {
+        var it = std.mem.tokenizeScalar(u8, arg["confirm ".len..], ' ');
+        const task = if (it.next()) |t| (std.fmt.parseInt(u64, t, 10) catch null) else null;
+        const rel = it.next();
+        const concept = if (it.next()) |c| (std.fmt.parseInt(u64, c, 10) catch null) else null;
+        if (task == null or rel == null or concept == null or !isRefRel(rel.?)) {
+            std.debug.print("用法:/kg confirm <task-id> <acts_on|uses|produces|about> <concept-id>\n", .{});
+            return;
+        }
+        kg.confirmClassification(task.?, rel.?, concept.?) catch |e| {
+            std.debug.print("确认失败({s}): {s}(该分类边不存在?先由任务闭合投影产生)\n", .{ @errorName(e), kg.detail() });
+            return;
+        };
+        std.debug.print("已确认:task {d} {s} concept {d}(confirmed)。\n", .{ task.?, rel.?, concept.? });
+        return;
+    }
+
+    // /kg correct <task-id> <rel> <old-concept-id> <new-name...> —— 纠正分类(改动四:覆盖+留痕)。
+    if (std.mem.startsWith(u8, arg, "correct ")) {
+        var it = std.mem.tokenizeScalar(u8, arg["correct ".len..], ' ');
+        const task = if (it.next()) |t| (std.fmt.parseInt(u64, t, 10) catch null) else null;
+        const rel = it.next();
+        const old_concept = if (it.next()) |c| (std.fmt.parseInt(u64, c, 10) catch null) else null;
+        const new_name = std.mem.trim(u8, it.rest(), " \t");
+        if (task == null or rel == null or old_concept == null or new_name.len == 0 or !isRefRel(rel.?)) {
+            std.debug.print("用法:/kg correct <task-id> <acts_on|uses|produces|about> <old-concept-id> <new-name>\n", .{});
+            return;
+        }
+        kg.correctClassification(task.?, rel.?, old_concept.?, new_name) catch |e| {
+            std.debug.print("纠正失败({s}): {s}\n", .{ @errorName(e), kg.detail() });
+            return;
+        };
+        std.debug.print("已纠正:task {d} {s} {d} → \"{s}\"(旧边删除+confirmed 新边+error_event/fix 留痕)。\n", .{ task.?, rel.?, old_concept.?, new_name });
+        return;
+    }
+
+    std.debug.print("用法:/kg(状态)| /kg mem(记忆)| /kg plan(计划)| /kg projects(project 列表)| /kg sync(重同步记忆文件)| /kg gc(孤儿预览,gc! 清理)| /kg merge <from> <to>(合并重复 project)| /kg forget <id>(删除,md 派生强删用 forget!)| /kg refs <task>(看分类投影)| /kg confirm <task> <rel> <concept>(背书分类)| /kg correct <task> <rel> <old> <new-name>(纠正分类)\n", .{});
+}
+
+/// ref 关系白名单(改动二的 3+1)。confirm/correct 只作用于分类性引用边。
+fn isRefRel(rel: []const u8) bool {
+    return std.mem.eql(u8, rel, "acts_on") or std.mem.eql(u8, rel, "uses") or
+        std.mem.eql(u8, rel, "produces") or std.mem.eql(u8, rel, "about");
 }
 
 /// gc 输出提取计数("candidates=N"/"deleted=N")。解析失败返 0。

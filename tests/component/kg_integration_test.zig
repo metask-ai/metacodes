@@ -264,6 +264,45 @@ test "L2 KG: recall 客户端 domain 隔离(别项目记忆不串味)" {
     }
 }
 
+test "L2 KG: 项目级 schema 隔离 — 自定义类型跨项目用被 block + 清晰错误 + 孤儿自清" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/kgscope.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    // proj-alpha 引入自定义类型 "migration" → auto-scope block 政策 scope 到 alpha。
+    {
+        var kg_a = try makeClient(a, bin, store, "proj-alpha");
+        defer kg_a.deinit();
+        kg_a.ensureReady();
+        if (!kg_a.ready) return error.SkipZigTest;
+        const resolved = cc.kg_client.resolveMemoryType("migration") orelse return error.SkipZigTest;
+        const id_a = try kg_a.remember(resolved.node_kind, "alpha 做了一次 schema migration", resolved.schema_type, false);
+        try std.testing.expect(id_a > 0); // 首次引入成功(演化本体:类型能长出来)
+    }
+    // proj-beta 用同一自定义类型 → tinykg block-at-write 拒绝 → KgError.Data(不是 Transient!)
+    // + detail 点名类型(清晰可行动)+ 孤儿已自清。
+    {
+        var kg_b = try makeClient(a, bin, store, "proj-beta");
+        defer kg_b.deinit();
+        kg_b.ensureReady();
+        if (!kg_b.ready) return error.SkipZigTest;
+        const resolved = cc.kg_client.resolveMemoryType("migration") orelse return error.SkipZigTest;
+        const res = kg_b.remember(resolved.node_kind, "beta 也想用 migration 类型", resolved.schema_type, false);
+        // 关键断言:归 Data(分类修好了),不是 Transient(修前的 bug——agent 收到空的 "(Transient: )")。
+        try std.testing.expectError(cc.kg_client.KgError.Data, res);
+        // detail 点名了类型 "migration"(清晰错误,不是裸 SchemaProjectScopeViolation 或空串)。
+        const d = kg_b.detail();
+        try std.testing.expect(std.mem.indexOf(u8, d, "migration") != null);
+    }
+}
+
 test "L2 KG: global scope 记忆跨项目可见" {
     const a = std.testing.allocator;
     const bin = findBin(a) orelse return error.SkipZigTest;
@@ -1090,4 +1129,180 @@ test "L2 KG: B/C 合并 — Write memdir markdown 自动入图,召回命中 sect
         defer if (plain_src.label) |l| a.free(l);
         try std.testing.expect(!plain_src.md_derived);
     }
+}
+
+test "L2 KG: 目标导向投影 — 任务闭合经工具写 acts_on/uses/produces ref 边(tentative,改动一/三)" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const proj_dir = pbuf[0..dir_len];
+    const store = try std.fmt.allocPrint(a, "{s}/kgproj.kg", .{proj_dir});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-projection");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const plan_commit = @import("cc").kg_plan_commit;
+    const inject = @import("cc").kg_inject;
+    const r = try plan_commit.commit(a, &kg, "计划\n1. A\n2. B");
+    try inject.writeIdPointer(a, proj_dir, "kg_root", r.root_id);
+
+    const task_tools = @import("cc").task_tools;
+    const TaskStore = @import("cc").core_task_store.TaskStore;
+    var tstore = TaskStore.init(a);
+    defer tstore.deinit();
+    const ctx = @import("cc").tool_context.ToolContext{
+        .allocator = a,
+        .tasks = &tstore,
+        .kg = &kg,
+        .kg_projects_dir = proj_dir,
+    };
+
+    // 找步骤 A 的 kg id。
+    const rows = try kg.frontier(r.root_id, 10);
+    defer {
+        for (rows) |*row| row.deinit(a);
+        a.free(rows);
+    }
+    var a_id: u64 = 0;
+    for (rows) |row| {
+        if (std.mem.eql(u8, std.mem.trim(u8, row.text, " "), "A")) a_id = row.task_id;
+    }
+    try std.testing.expect(a_id != 0);
+
+    // 闭合 A + 结构化投影:实际作用/使用/产出。
+    const upd_args = try std.fmt.allocPrint(a,
+        \\{{"taskId":"kg-{d}","status":"completed","conclusion":"重构完成,分层清晰",
+        \\"acts_on":["src/kg/client.zig"],"uses":["tree-sitter","ref-edge"],"produces":["projection-v1"]}}
+    , .{a_id});
+    defer a.free(upd_args);
+    const upd = try task_tools.executeUpdate(&ctx, upd_args);
+    defer a.free(upd);
+    try std.testing.expect(std.mem.indexOf(u8, upd, "\"closed\":true") != null);
+
+    // 投影必须落图:acts_on/uses/produces ref 边,每条 state=tentative(写入容忍模糊)。
+    const nb = try kg.neighborsJson(a_id, 50);
+    defer a.free(nb);
+    try std.testing.expect(std.mem.indexOf(u8, nb, "\"rel\":\"acts_on\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nb, "\"rel\":\"uses\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nb, "\"rel\":\"produces\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nb, "\"state\":\"tentative\"") != null);
+    // 闭合投影绝不会自己标 confirmed(那是人类确认/纠正专属)。
+    try std.testing.expect(std.mem.indexOf(u8, nb, "\"state\":\"confirmed\"") == null);
+    // uses 有两个目标 → 至少两条 tentative(证明数组每个元素都建了边)。
+    var tentative_count: usize = 0;
+    var scan: usize = 0;
+    while (std.mem.indexOfPos(u8, nb, scan, "\"state\":\"tentative\"")) |pos| {
+        tentative_count += 1;
+        scan = pos + 1;
+    }
+    try std.testing.expect(tentative_count >= 4); // 1 acts_on + 2 uses + 1 produces
+
+    // 发现面(PM 终审):闭合投影登记任务为"待确认",/kg 状态页/bare `/kg refs` 据此提示人类结晶。
+    const pend = kg.pendingRefTasks(a);
+    defer if (pend.len > 0) a.free(pend);
+    var found = false;
+    for (pend) |t| {
+        if (t == a_id) found = true;
+    }
+    try std.testing.expect(found);
+
+    // **第二闭合动词 TaskStop 也投影**(PM 终审:两个等价闭合动词不能分叉)。A 闭合后 B ready,
+    // 用 executeStop(kg-B) 带 acts_on → 断言 ref 边同样落图(不是只 TaskUpdate 才结晶)。
+    const rows_b = try kg.frontier(r.root_id, 10);
+    defer {
+        for (rows_b) |*row| row.deinit(a);
+        a.free(rows_b);
+    }
+    var b_id: u64 = 0;
+    for (rows_b) |row| {
+        if (std.mem.eql(u8, std.mem.trim(u8, row.text, " "), "B")) b_id = row.task_id;
+    }
+    try std.testing.expect(b_id != 0);
+    const stop_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"acts_on\":[\"src/repl/loop.zig\"]}}", .{b_id});
+    defer a.free(stop_args);
+    const stopped = try task_tools.executeStop(&ctx, stop_args);
+    defer a.free(stopped);
+    const nb_b = try kg.neighborsJson(b_id, 50);
+    defer a.free(nb_b);
+    try std.testing.expect(std.mem.indexOf(u8, nb_b, "\"rel\":\"acts_on\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nb_b, "\"state\":\"tentative\"") != null);
+}
+
+test "L2 KG: 分类纠正入图 — 覆盖不并存 + error_event/fix 留痕(改动四)" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/kgcorrect.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-correct");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    // 建"任务"节点 + 旧分类目标 + tentative acts_on 边(裸 add-edge 不校验端点 kind,可用 concept 代任务)。
+    const task = try kg.ensureConcept("task-node");
+    const old_c = try kg.ensureConcept("old-target");
+    try kg.addRefEdge(task, "acts_on", old_c, false); // tentative
+
+    // 纠正前打 marker:确定性推 error_event/fix 的 id(fresh store 顺序分配)。
+    const marker = try kg.ensureConcept("__marker__");
+    // correctClassification 内部顺序:ensureConcept(new)=marker+1 → err=marker+2 → fix=marker+3。
+    try kg.correctClassification(task, "acts_on", old_c, "new-target");
+    const new_c = try kg.ensureConcept("new-target"); // 幂等:返上面刚建的 id
+    try std.testing.expectEqual(marker + 1, new_c);
+
+    // ① 覆盖不并存:旧边删除(task 邻居里不再有 dst=old_c),新边到 new_c 且 confirmed。
+    const nb = try kg.neighborsJson(task, 50);
+    defer a.free(nb);
+    var dbuf: [32]u8 = undefined;
+    const old_dst = try std.fmt.bufPrint(&dbuf, "\"dst\":{d},", .{old_c});
+    try std.testing.expect(std.mem.indexOf(u8, nb, old_dst) == null); // 旧分类没了
+    var dbuf2: [32]u8 = undefined;
+    const new_dst = try std.fmt.bufPrint(&dbuf2, "\"dst\":{d},", .{new_c});
+    try std.testing.expect(std.mem.indexOf(u8, nb, new_dst) != null); // 新分类在
+    try std.testing.expect(std.mem.indexOf(u8, nb, "\"state\":\"confirmed\"") != null); // 人类纠正=confirmed
+    try std.testing.expect(std.mem.indexOf(u8, nb, "\"state\":\"tentative\"") == null);
+
+    // ② 留痕:error_event(marker+2)记旧分类,derived_from 任务(来源);resolved_by fix(marker+3)。
+    const err_id = marker + 2;
+    const fix_id = marker + 3;
+    const err_text = try kg.fetchNodeText(err_id);
+    defer kg.allocator.free(err_text);
+    try std.testing.expect(std.mem.indexOf(u8, err_text, "misclassified") != null);
+    const fix_text = try kg.fetchNodeText(fix_id);
+    defer kg.allocator.free(fix_text);
+    try std.testing.expect(std.mem.indexOf(u8, fix_text, "reclassified") != null);
+    // error_event 出边:derived_from 任务 + resolved_by fix(审计对成链)。
+    const err_nb = try kg.neighborsJson(err_id, 20);
+    defer a.free(err_nb);
+    try std.testing.expect(std.mem.indexOf(u8, err_nb, "\"rel\":\"derived_from\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_nb, "\"rel\":\"resolved_by\"") != null);
+
+    // ③ **幂等重试**(Linus #1):模拟"上次删旧失败"的半成品(旧 tentative 边又在),再纠正一次。
+    // add-edge 对 concept 不去重,若盲加会叠出第二条 confirmed 新边——幂等分支必须探到既有新边只翻位。
+    try kg.addRefEdge(task, "acts_on", old_c, false); // 旧边复现(tentative)
+    try kg.correctClassification(task, "acts_on", old_c, "new-target"); // 重试
+    const nb2 = try kg.neighborsJson(task, 50);
+    defer a.free(nb2);
+    try std.testing.expect(std.mem.indexOf(u8, nb2, old_dst) == null); // 旧边再次被删
+    // 恰一条 confirmed 新边(未因重试叠出重复)——若盲 addRefEdge 会变两条。
+    var confirmed_count: usize = 0;
+    var s: usize = 0;
+    while (std.mem.indexOfPos(u8, nb2, s, "\"state\":\"confirmed\"")) |p| {
+        confirmed_count += 1;
+        s = p + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), confirmed_count);
 }

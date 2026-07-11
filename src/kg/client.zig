@@ -72,10 +72,14 @@ pub const RecallHit = struct {
     }
 };
 
-/// 记忆类型(窄概念图谱最小切片)→ (node kind, schema_type 标签)。
-/// module/bug 是概念类型:落 **observation** node + schema_type 区分——**不建 concept kind**
-/// (concept+schema_type=concept 会变 observation 催收池转世,Linus BLOCKER)。
-/// 其余 kind 与 schema_type 同名。concept/未知 → null(调用方拒绝,不静默)。大小写不敏感 + trim。
+/// 记忆类型 → (node kind, schema_type 标签)。**项目本体随项目深入演化**:项目可引入
+/// 自定义类型(migration/gui_feature/schema_review…),落 **observation** node + 自定义
+/// schema_type 区分——**不建新 node kind**(concept+schema_type 催收池转世,Linus BLOCKER)。
+/// 内置基类型全局共用;自定义类型由 tinykg 的项目级 schema(schema-scope)按 project 治理隔离。
+///
+/// 规则:内置基类型(observation/decision/user_preference/module/bug)→ 固定映射;
+///   concept → 仍拒绝(Linus BLOCKER);其余合法自定义类型 → observation + 该 schema_type;
+///   空/非法字符/tinykg 保留字 → null(调用方拒绝,不静默)。大小写:基类型不敏感,自定义保留原样。
 pub const ResolvedType = struct { node_kind: MemoryKind, schema_type: []const u8 };
 pub fn resolveMemoryType(raw: []const u8) ?ResolvedType {
     const t = std.mem.trim(u8, raw, " \t\r\n");
@@ -84,7 +88,23 @@ pub fn resolveMemoryType(raw: []const u8) ?ResolvedType {
     if (std.ascii.eqlIgnoreCase(t, "user_preference")) return .{ .node_kind = .user_preference, .schema_type = "user_preference" };
     if (std.ascii.eqlIgnoreCase(t, "module")) return .{ .node_kind = .observation, .schema_type = "module" };
     if (std.ascii.eqlIgnoreCase(t, "bug")) return .{ .node_kind = .observation, .schema_type = "bug" };
-    return null; // concept / 未知类型 → 拒绝
+    if (std.ascii.eqlIgnoreCase(t, "concept")) return null; // concept kind 转世,仍拒绝
+    // 项目级演化本体:允许自定义类型(observation node + 自定义 schema_type)。
+    if (isValidCustomSchemaType(t)) return .{ .node_kind = .observation, .schema_type = t };
+    return null; // 空 / 非法字符 / tinykg 保留字 → 拒绝
+}
+
+/// 自定义 schema_type 合法性:与 tinykg propertyKeyNameValid 对齐([A-Za-z0-9_-:.],长度 1-64),
+/// 排除 tinykg 保留字(schema_scope=政策节点标识 / project=结构类型)。
+fn isValidCustomSchemaType(t: []const u8) bool {
+    if (t.len == 0 or t.len > 64) return false;
+    if (std.mem.eql(u8, t, "schema_scope") or std.mem.eql(u8, t, "project")) return false;
+    for (t) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '_' or c == '-' or c == ':' or c == '.';
+        if (!ok) return false;
+    }
+    return true;
 }
 
 pub const FrontierRow = struct {
@@ -148,6 +168,13 @@ pub const KgClient = struct {
     /// 直到自己发生一次写(ensure 复位)或重启——接受的权衡,不是 bug。
     project_miss: bool = false,
     global_project_miss: bool = false,
+    /// 演化本体 auto-scope:本 session 已声明 scope 的自定义 schema_type(避免每写起子进程)。
+    /// key owned;cache_mu 保护(多 subagent 线程共享 client)。init 建、deinit 释放全部 key。
+    scoped_types: std.StringHashMap(void) = undefined,
+    /// 本 session 产出过 tentative 分类投影的任务 node（发现面:闭合投影是 agent 打的模糊分类,
+    /// 人类需知道"有料可结晶"才会去 /kg refs 审阅/确认,否则 tentative 边永远无人 crystallize）。
+    /// cache_mu 保护;over-inclusive 无害(是"去看看"的提示,真相以 /kg refs 当场查为准)。
+    pending_ref_tasks: std.AutoHashMap(u64, void) = undefined,
     /// project 三锚 id 缓存(乙方案):[scope_global 0/1][AnchorKind]。写路径 lazy ensure;
     /// 失效纪律同 project 缓存:挂接失败清对应槽,下次写重新 ensure(stale 自愈)。
     anchor_ids: [2][3]?u64 = .{ .{ null, null, null }, .{ null, null, null } },
@@ -172,6 +199,10 @@ pub const KgClient = struct {
         if (self.degraded_reason) |r| self.allocator.free(r);
         if (self.last_detail) |d| self.allocator.free(d);
         if (self.autosync_last_err) |e| self.allocator.free(e);
+        var kit = self.scoped_types.keyIterator();
+        while (kit.next()) |k| self.allocator.free(k.*);
+        self.scoped_types.deinit();
+        self.pending_ref_tasks.deinit();
     }
 
     // ── 路径解析(设计 §1 D2)─────────────────────────────────────────
@@ -204,7 +235,30 @@ pub const KgClient = struct {
             .bin_path = bin,
             .store_path = store,
             .domain = domain,
+            .scoped_types = std.StringHashMap(void).init(allocator),
+            .pending_ref_tasks = std.AutoHashMap(u64, void).init(allocator),
         };
+    }
+
+    /// 登记一个产出待确认分类的任务(发现面)。best-effort：OOM 静默丢(提示不是关键路径)。
+    /// cache_mu 保护(多 subagent 线程共享 client)。
+    pub fn notePendingRefTask(self: *KgClient, task_node: u64) void {
+        self.cacheLock();
+        defer self.cacheUnlock();
+        self.pending_ref_tasks.put(task_node, {}) catch {};
+    }
+
+    /// 待确认分类任务的快照(owned slice，调用方 free）。空 = 本 session 无待审阅投影。
+    pub fn pendingRefTasks(self: *KgClient, allocator: std.mem.Allocator) []u64 {
+        self.cacheLock();
+        defer self.cacheUnlock();
+        const n = self.pending_ref_tasks.count();
+        if (n == 0) return &.{};
+        const out = allocator.alloc(u64, n) catch return &.{};
+        var i: usize = 0;
+        var it = self.pending_ref_tasks.keyIterator();
+        while (it.next()) |k| : (i += 1) out[i] = k.*;
+        return out;
     }
 
     fn resolveStorePath(allocator: std.mem.Allocator, opts: ResolveOptions) ![]u8 {
@@ -546,6 +600,51 @@ pub const KgClient = struct {
                 self.freeOut(out);
             },
         }
+        // **演化本体自动隔离(引入即 scope)**:项目 scope 下引入的自定义类型(非内置基类型),
+        // 自动声明 scope 到当前 project(--if-absent,不覆盖已有;默认 report:类型归属其源 project、
+        // 跨项目用由 governance 暴露,不硬拦 agent 写)。base 类型/global scope 保持全局共享。
+        if (!scope_global and !isBaseMemoryType(schema_type)) {
+            self.autoScopeCustomType(schema_type) catch |e| {
+                // 自动 scope 失败不该让记忆写整体失败(隔离是增强,不是硬前提);记 warn 继续。
+                log.warn("kg", "auto-scope custom type {s} failed: {s}", .{ schema_type, @errorName(e) });
+            };
+        }
+    }
+
+    /// 内置基类型(全局共用,不 auto-scope)。**单一真相源**:与 resolveMemoryType 的基类型
+    /// 分支同表,避免双写漂移(Linus:双真相源风险)。
+    const base_memory_types = [_][]const u8{ "observation", "decision", "user_preference", "module", "bug" };
+    fn isBaseMemoryType(schema_type: []const u8) bool {
+        for (base_memory_types) |b| if (std.mem.eql(u8, schema_type, b)) return true;
+        return false;
+    }
+
+    /// 自定义类型 auto-scope 到当前 project(--if-absent 幂等,不覆盖已有 scope)。
+    /// **默认 enforce=block(有牙齿)**:用户选严格精确=硬隔离。首次引入建 block 政策 scope 到源
+    /// project;之后在别的 project 用同类型 → tinykg block-at-write 在 govern-node 阶段拒绝
+    /// (SchemaProjectScopeViolation)→ remember 返带 node-id + /kg forget 引导的清晰错误。
+    /// 消费侧因此活着:政策被 tinykg 写路径读回并强制,agent 当场收到反馈,不是"有账无牙"。
+    /// session 缓存已声明的类型,避免每次写都起子进程(项目本体类型数有限,缓存命中率高)。
+    fn autoScopeCustomType(self: *KgClient, schema_type: []const u8) KgError!void {
+        {
+            self.cacheLock();
+            defer self.cacheUnlock();
+            if (self.scoped_types.contains(schema_type)) return; // 本 session 已声明
+        }
+        const pid = (try self.projectNodeId(false, true)) orelse return; // 无 project 无从 scope
+        var pbuf: [24]u8 = undefined;
+        const p_str = std.fmt.bufPrint(&pbuf, "{d}", .{pid}) catch unreachable;
+        const out = try self.runCheckedWrite(&.{
+            "schema-scope", self.store_path, schema_type, "--project", p_str, "--if-absent", "--enforce", "block",
+        });
+        self.freeOut(out);
+        // 入 session 缓存(key 深拷贝,owned)。
+        self.cacheLock();
+        defer self.cacheUnlock();
+        if (!self.scoped_types.contains(schema_type)) {
+            const key = self.allocator.dupe(u8, schema_type) catch return;
+            self.scoped_types.put(key, {}) catch self.allocator.free(key);
+        }
     }
 
     /// `node <id>[ ...]` 行 → id(兼容 add-node `node 7` 与 ensure-node `node 7 created=1`)。
@@ -572,6 +671,13 @@ pub const KgClient = struct {
             // **所有分支重包 detail 带 node id**(Linus 严重4:Data 分支的 last_detail 是 tinykg
             // 裸 stderr,无孤儿 id,模型无法 /kg forget;重试 remember = 每次新建节点 → 孤儿堆积)。
             const prior = if (self.last_detail) |d| d else "";
+            // **项目级 schema 隔离命中**(PM 终审:block 默认不该留孤儿)。tinykg block-at-write 拒绝
+            // = 该类型属于别的 project,本 project 不可用。**自动 forget 刚建的孤儿**(不累积),
+            // 给点名类型+隔离原因的可行动错误(比裸 SchemaProjectScopeViolation 清晰)。
+            if (std.mem.indexOf(u8, prior, "SchemaProjectScopeViolation") != null) {
+                self.forget(id) catch {}; // best-effort 清理,失败也不掩盖主错误
+                return self.dataError("类型 '{s}' 是别的 project 的专属本体,本 project 不可用(严格精确隔离,无继承)。已自动清理未挂接节点 {d}。改用内置类型(observation/decision/…)或换一个本 project 的类型名", .{ schema_type, id });
+            }
             return self.dataError("记忆节点 {d} 已建但挂接项目失败({s}: {s})。请勿整体重试(会重复建节点);可 /kg forget {d} 清理后重试", .{ id, @errorName(e), prior, id });
         };
         return id;
@@ -725,6 +831,149 @@ pub const KgClient = struct {
         self.freeOut(out);
     }
 
+    /// `edge <id>` 行 → edge id(add-edge 输出;幂等去重时也返已存在边 id)。
+    fn parseEdgeIdLine(stdout: []const u8) ?u64 {
+        const line = std.mem.trim(u8, stdout, " \r\n");
+        if (!std.mem.startsWith(u8, line, "edge ")) return null;
+        const rest = line["edge ".len..];
+        const end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+        return std.fmt.parseInt(u64, rest[0..end], 10) catch null;
+    }
+
+    /// 分类性引用边(acts_on/uses/produces/about)+ 两态 state 标记(改动一/三)。
+    /// **写入容忍模糊**:闭合投影默认 tentative(agent 执行中打的);人类确认/纠正后落 confirmed。
+    /// 拿回 add-edge 返回的 edge id 后 set-edge-property state。
+    /// state 是**一个 bit 的两态**(tentative|confirmed),不是连续置信度(禁)。
+    /// 注:add-edge 去重按节点 external key,concept 节点未必有 → 同 (src,rel,dst) 可能重复建边;
+    /// 闭合投影每任务一次,可接受;确认既有分类走 correctClassification(old==new 分支)以定位原边。
+    pub fn addRefEdge(self: *KgClient, src: u64, rel: []const u8, dst: u64, confirmed: bool) KgError!void {
+        var sbuf: [24]u8 = undefined;
+        var dbuf: [24]u8 = undefined;
+        const s_str = std.fmt.bufPrint(&sbuf, "{d}", .{src}) catch unreachable;
+        const d_str = std.fmt.bufPrint(&dbuf, "{d}", .{dst}) catch unreachable;
+        const out = try self.runCheckedWrite(&.{ "add-edge", self.store_path, s_str, rel, d_str });
+        defer self.freeOut(out);
+        const edge_id = parseEdgeIdLine(out.stdout) orelse return self.dataError("add-edge 输出不可解析: {s}", .{trimForLog(out.stdout)});
+        try self.setEdgeState(edge_id, confirmed);
+    }
+
+    fn setEdgeState(self: *KgClient, edge_id: u64, confirmed: bool) KgError!void {
+        var ebuf: [24]u8 = undefined;
+        const e_str = std.fmt.bufPrint(&ebuf, "{d}", .{edge_id}) catch unreachable;
+        const state: []const u8 = if (confirmed) "confirmed" else "tentative";
+        const sp = try self.runCheckedWrite(&.{ "set-edge-property", self.store_path, e_str, "state", state });
+        self.freeOut(sp);
+    }
+
+    /// 人类背书一个既有分类(tentative→confirmed,改动三):**就地翻位**,不新建边。
+    /// (add-edge 去重不可靠 → 必须先定位原边再翻,否则会留一条 tentative 加一条 confirmed。)
+    pub fn confirmClassification(self: *KgClient, src: u64, rel: []const u8, dst: u64) KgError!void {
+        const edge_id = try self.resolveEdgeId(src, rel, dst);
+        try self.setEdgeState(edge_id, true);
+    }
+
+    /// find-or-create concept 节点(ref 边的目标:对象/方法/概念/产物)。返回 node id。
+    /// 走 ensure-node concept <name>(kind+text 定身份,单锁内幂等)——**绕开 resolveMemoryType**
+    /// (那个拒 concept 是**记忆 remember 路径**防催收池;投影目标是本体实体,concept 正确)。
+    pub fn ensureConcept(self: *KgClient, name: []const u8) KgError!u64 {
+        const out = try self.runCheckedWrite(&.{
+            "ensure-node", self.store_path, "concept", name, "--schema-type", "concept",
+        });
+        defer self.freeOut(out);
+        return parseNodeIdLine(out.stdout) orelse self.dataError("ensure concept 输出不可解析: {s}", .{trimForLog(out.stdout)});
+    }
+
+    fn addKindNode(self: *KgClient, kind_label: []const u8, text: []const u8) KgError!u64 {
+        const out = try self.runCheckedWrite(&.{ "add-node", self.store_path, kind_label, text });
+        defer self.freeOut(out);
+        return parseNodeIdLine(out.stdout) orelse self.dataError("add-node {s} 输出不可解析: {s}", .{ kind_label, trimForLog(out.stdout) });
+    }
+
+    /// 查 (src,rel,dst) 出边 id。null=无此边(非错误——供幂等探测,不污染 last_detail);
+    /// 仅 subprocess/JSON 解析失败才返 error。**不能靠 add-edge 幂等**(去重按节点 external key,
+    /// concept 节点未必有 → 盲加会重复建边)。**按 rel 过滤 neighbors**:只回该 rel 类的边,
+    /// 高出度任务(结构边多)也不会把 ref 边挤出 --limit 预算(Linus #4)。
+    fn findEdgeId(self: *KgClient, src: u64, rel: []const u8, dst: u64) KgError!?u64 {
+        var idbuf: [24]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{src}) catch unreachable;
+        const out = try self.runChecked(&.{ "neighbors", self.store_path, id_str, rel, "--limit", "200", "--format", "json" });
+        defer self.freeOut(out);
+        const Edge = struct { id: u64, rel: []const u8, dst: u64 };
+        const Doc = struct { edges: []const Edge };
+        const parsed = std.json.parseFromSlice(Doc, self.allocator, out.stdout, .{ .ignore_unknown_fields = true }) catch
+            return self.dataError("findEdgeId 解析 neighbors 失败", .{});
+        defer parsed.deinit();
+        for (parsed.value.edges) |e| {
+            if (e.dst == dst and std.mem.eql(u8, e.rel, rel)) return e.id;
+        }
+        return null;
+    }
+
+    /// 定位既有边 id(找不到 → data 错,带 src/rel/dst)。幂等探测用 findEdgeId。
+    fn resolveEdgeId(self: *KgClient, src: u64, rel: []const u8, dst: u64) KgError!u64 {
+        return (try self.findEdgeId(src, rel, dst)) orelse self.dataError("未找到边 {d} -{s}-> {d}", .{ src, rel, dst });
+    }
+
+    fn deleteEdge(self: *KgClient, edge_id: u64) KgError!void {
+        var ebuf: [24]u8 = undefined;
+        const e_str = std.fmt.bufPrint(&ebuf, "{d}", .{edge_id}) catch unreachable;
+        const out = try self.runCheckedWrite(&.{ "delete-edge", self.store_path, e_str });
+        self.freeOut(out);
+    }
+
+    /// 人类纠正一个分类(改动四):**矛盾覆盖不并存** + 留痕(error_event→fix 审计对)。
+    /// 旧边删除,新分类以 confirmed 落库;记 error_event(旧,derived_from 任务=来源)
+    /// resolved_by fix(新)。复用既有 error_event/fix node kind + derived_from/resolved_by
+    /// 关系,是**接线非新子系统**。幂等:old==new 退化为"确认"(仅翻 confirmed,不留错误痕)。
+    pub fn correctClassification(
+        self: *KgClient,
+        task_node: u64,
+        rel: []const u8,
+        old_concept: u64,
+        new_name: []const u8,
+    ) KgError!void {
+        // **先定位旧边**:旧分类不存在就直接报错,不创建任何新节点——否则 ensureConcept 已建的
+        // 新 concept 会成零边孤儿(只能 gc 回收)。Linus #3。
+        // 注:纠正**完全成功后**重跑同一命令会报"未找到边 old"(旧边已删)——这是安全的:数据已在
+        // 正确终态,前置条件"旧分类存在"确实为假,非损坏。重试只在**部分失败**后幂等补齐。
+        const old_edge = try self.resolveEdgeId(task_node, rel, old_concept);
+        const new_concept = try self.ensureConcept(new_name);
+        // old==new:这不是纠错而是确认(人类背书既有分类)——就地翻 confirmed,不写错误痕。
+        if (old_concept == new_concept) {
+            return self.setEdgeState(old_edge, true);
+        }
+        // **顺序 + 幂等**(非原子——每步独立子进程,任何一步可能瞬时失败被人类重试):
+        // 1. 新分类以 confirmed 落库,**幂等**:若已存在(上次重试的半成品/裸边)只翻 confirmed,
+        //    绝不盲 addRefEdge——add-edge 对 concept 节点不去重,盲加会在重试时叠出重复 confirmed 边
+        //    (Linus #1/#2,直接违背"矛盾覆盖不并存")。
+        if (try self.findEdgeId(task_node, rel, new_concept)) |existing| {
+            try self.setEdgeState(existing, true);
+        } else {
+            try self.addRefEdge(task_node, rel, new_concept, true);
+        }
+        // 2. 删旧边(矛盾覆盖不并存)。到此新分类已在;删失败留"新 confirmed+旧 tentative"可辨并存,
+        //    重试幂等完成(步骤1 探到新边不重复建,只补删)。
+        try self.deleteEdge(old_edge);
+        // 3. 审计对留痕(**纠正完成才记**,故中途失败不会留半截审计;重试成功后补齐)。
+        //    best-effort:核心覆盖(1、2)已成,留痕失败不回滚。
+        var tbuf: [512]u8 = undefined;
+        const err_text = std.fmt.bufPrint(&tbuf, "misclassified: task {d} {s} concept {d} (corrected by human)", .{ task_node, rel, old_concept }) catch "misclassified (corrected)";
+        const err_id = self.addKindNode("error_event", err_text) catch |e| {
+            log.warn("kg", "correction audit: error_event 建节点失败(覆盖已成,仅缺留痕): {s}", .{@errorName(e)});
+            return;
+        };
+        self.addEdge(err_id, "derived_from", task_node) catch |e|
+            log.warn("kg", "correction audit: derived_from 边失败: {s}", .{@errorName(e)}); // 来源=任务闭合
+        var fbuf: [512]u8 = undefined;
+        const fix_text = std.fmt.bufPrint(&fbuf, "reclassified: task {d} {s} -> concept {d}", .{ task_node, rel, new_concept }) catch "reclassified";
+        const fix_id = self.addKindNode("fix", fix_text) catch |e| {
+            log.warn("kg", "correction audit: fix 建节点失败: {s}", .{@errorName(e)});
+            return;
+        };
+        self.addEdge(err_id, "resolved_by", fix_id) catch |e|
+            log.warn("kg", "correction audit: resolved_by 边失败: {s}", .{@errorName(e)});
+    }
+
     /// 节点出边一览(neighbors 原文,owned)。溯源检视面:记忆/文档 derived_from 哪个任务。
     pub fn neighborsText(self: *KgClient, node_id: u64, limit: usize) KgError![]u8 {
         var idbuf: [24]u8 = undefined;
@@ -732,6 +981,17 @@ pub const KgClient = struct {
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{node_id}) catch unreachable;
         const lim_str = std.fmt.bufPrint(&limbuf, "{d}", .{limit}) catch unreachable;
         const out = try self.runChecked(&.{ "neighbors", self.store_path, id_str, "--limit", lim_str });
+        defer self.freeOut(out);
+        return self.allocator.dupe(u8, out.stdout) catch KgError.OutOfMemory;
+    }
+
+    /// 节点出边 JSON(含边 props,即 state 两态位)。用于分类投影的检视/断言。
+    pub fn neighborsJson(self: *KgClient, node_id: u64, limit: usize) KgError![]u8 {
+        var idbuf: [24]u8 = undefined;
+        var limbuf: [16]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{node_id}) catch unreachable;
+        const lim_str = std.fmt.bufPrint(&limbuf, "{d}", .{limit}) catch unreachable;
+        const out = try self.runChecked(&.{ "neighbors", self.store_path, id_str, "--limit", lim_str, "--format", "json" });
         defer self.freeOut(out);
         return self.allocator.dupe(u8, out.stdout) catch KgError.OutOfMemory;
     }
@@ -1424,7 +1684,11 @@ pub const KgClient = struct {
 
     fn classifyCliError(name: []const u8) ErrClass {
         // ClaimHeld 归 data:租约被他人持有是明确业务事实,重试只会白等 3 轮。
-        const data_errors = [_][]const u8{ "NotFound", "InvalidId", "InvalidNodeKind", "InvalidRelKind", "CycleDetected", "WouldCreateCycle", "InvalidRecord", "ClaimHeld" };
+        // SchemaProjectScopeViolation/ProjectTreeViolation 归 data:确定性结构违规(该类型属别的
+        // project / project 树约束),**重试无用**,且必须让 .data 分支 setDetail 把原因写进
+        // last_detail,否则 remember 的 scope 违规检测(找 "SchemaProjectScopeViolation" 串)匹配
+        // 不上 → 孤儿清理+清晰错误全失效,agent 只收到空的 "(Transient: )"(PM 终审抓的接线漏)。
+        const data_errors = [_][]const u8{ "NotFound", "InvalidId", "InvalidNodeKind", "InvalidRelKind", "CycleDetected", "WouldCreateCycle", "InvalidRecord", "ClaimHeld", "SchemaProjectScopeViolation", "ProjectTreeViolation" };
         for (data_errors) |d| {
             if (std.ascii.eqlIgnoreCase(name, d)) return .data;
         }
@@ -1613,10 +1877,34 @@ test "resolveMemoryType:sharp 类型映射 + 大小写不敏感 + 拒绝 concept
     // 大小写不敏感 + trim(Linus MEDIUM-1)。
     try testing.expectEqualStrings("module", resolveMemoryType("Module").?.schema_type);
     try testing.expectEqualStrings("bug", resolveMemoryType("  BUG ").?.schema_type);
-    // 拒绝 concept(催收池防线)+ 未知值 → null(调用方报错不静默)。
+    // 拒绝 concept(催收池防线)+ 空 + tinykg 保留字 → null(调用方报错不静默)。
     try testing.expect(resolveMemoryType("concept") == null);
-    try testing.expect(resolveMemoryType("function") == null);
     try testing.expect(resolveMemoryType("") == null);
+    try testing.expect(resolveMemoryType("schema_scope") == null); // tinykg 政策节点保留
+    try testing.expect(resolveMemoryType("project") == null); // tinykg 结构类型保留
+    // 项目级演化本体:自定义类型现在被接受(observation node + 自定义 schema_type)。
+    const mig = resolveMemoryType("migration").?;
+    try testing.expectEqual(MemoryKind.observation, mig.node_kind);
+    try testing.expectEqualStrings("migration", mig.schema_type);
+    try testing.expectEqualStrings("gui_feature", resolveMemoryType("gui_feature").?.schema_type);
+    try testing.expectEqualStrings("schema_review", resolveMemoryType("  schema_review ").?.schema_type); // trim
+    // 非法字符 / 超长 → 拒绝(不静默)。
+    try testing.expect(resolveMemoryType("has space") == null);
+    try testing.expect(resolveMemoryType("bad/slash") == null);
+    try testing.expect(resolveMemoryType("x" ** 65) == null);
+}
+
+test "isBaseMemoryType:内置基类型不 auto-scope,自定义类型 auto-scope" {
+    // 基类型(全局共用)→ true(不触发 auto-scope)。
+    try testing.expect(KgClient.isBaseMemoryType("observation"));
+    try testing.expect(KgClient.isBaseMemoryType("decision"));
+    try testing.expect(KgClient.isBaseMemoryType("user_preference"));
+    try testing.expect(KgClient.isBaseMemoryType("module"));
+    try testing.expect(KgClient.isBaseMemoryType("bug"));
+    // 自定义类型 → false(触发 auto-scope 到源 project,演化本体隔离)。
+    try testing.expect(!KgClient.isBaseMemoryType("migration"));
+    try testing.expect(!KgClient.isBaseMemoryType("gui_feature"));
+    try testing.expect(!KgClient.isBaseMemoryType("schema_review"));
 }
 
 test "unescapeTsv 全转义表逆变换" {
@@ -1718,6 +2006,10 @@ test "classifyCliError 三类归一" {
     try testing.expectEqual(KgClient.ErrClass.data, KgClient.classifyCliError("WouldCreateCycle"));
     try testing.expectEqual(KgClient.ErrClass.transient, KgClient.classifyCliError("Timeout"));
     try testing.expectEqual(KgClient.ErrClass.transient, KgClient.classifyCliError("SomethingNew"));
+    // 项目级 schema:确定性结构违规归 data(重试无用 + 让 .data 分支 setDetail 兜住原因,
+    // 否则 remember 的 scope 违规检测匹配不上 → agent 收到空 Transient。PM 终审接线漏抓)。
+    try testing.expectEqual(KgClient.ErrClass.data, KgClient.classifyCliError("SchemaProjectScopeViolation"));
+    try testing.expectEqual(KgClient.ErrClass.data, KgClient.classifyCliError("ProjectTreeViolation"));
 }
 
 test "parseCliError 提取错误名" {

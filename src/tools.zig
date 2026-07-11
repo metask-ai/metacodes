@@ -375,7 +375,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskUpdate",
-        .description = "Update a task's status (pending/in_progress/completed/deleted) and/or fields (subject, description, activeForm, owner) and/or addBlocks/addBlockedBy id lists.",
+        .description = "Update a task's status (pending/in_progress/completed/deleted) and/or fields (subject, description, activeForm, owner) and/or addBlocks/addBlockedBy id lists. When closing a KG plan step (status=completed), also fill conclusion + acts_on/uses/produces so the graph records what the task ACTUALLY touched — you know this best at closure, not at start.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "taskId", .type = "string", .description = "The id of the task to update" },
             .{ .name = "status", .type = "string", .description = "New status", .enum_values = &.{ "pending", "in_progress", "completed", "deleted" } },
@@ -385,6 +385,10 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "owner", .type = "string", .description = "New owner (agent name)" },
             .{ .name = "addBlocks", .type = "array", .description = "Task ids that this task blocks", .items_type = "string" },
             .{ .name = "addBlockedBy", .type = "array", .description = "Task ids that block this task", .items_type = "string" },
+            .{ .name = "conclusion", .type = "string", .description = "On completion: one-line summary of what this task accomplished (used as closure evidence)." },
+            .{ .name = "acts_on", .type = "array", .description = "On completion: objects/files/modules this task actually acted on (KG projection).", .items_type = "string" },
+            .{ .name = "uses", .type = "array", .description = "On completion: methods/concepts/tools this task actually used (KG projection).", .items_type = "string" },
+            .{ .name = "produces", .type = "array", .description = "On completion: artifacts/outputs this task produced (KG projection).", .items_type = "string" },
         }, .required = &.{"taskId"} },
         .execute = task_tools.executeUpdate,
     },
