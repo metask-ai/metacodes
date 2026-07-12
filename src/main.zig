@@ -24,6 +24,7 @@ pub const json_mod = @import("json.zig");
 pub const util_abort = @import("util/abort.zig");
 pub const util_fs = @import("util/fs.zig");
 pub const conversation = @import("core/conversation.zig");
+pub const message = @import("core/message.zig");
 pub const compact_summary = @import("core/compact_summary.zig");
 pub const agent_loop = @import("core/agent_loop.zig");
 pub const core_subagent = @import("core/subagent.zig");
@@ -45,6 +46,7 @@ pub const core_auth = auth;
 pub const core_read_state = @import("core/read_state.zig");
 pub const core_edit_hl_cache = @import("core/edit_hl_cache.zig");
 pub const tool_exec = @import("core/tool_exec.zig");
+pub const message_repair = @import("core/message_repair.zig");
 pub const tool_result_storage = @import("tools/tool_result_storage.zig");
 pub const cache_break = @import("core/cache_break.zig");
 pub const core_message = @import("core/message.zig");
@@ -78,6 +80,7 @@ pub const agents_set = @import("agents/set.zig");
 pub const agents_filter = @import("agents/filter.zig");
 pub const agents_preload = @import("agents/preload.zig");
 pub const tools_dynamic = @import("tools/dynamic.zig");
+pub const tools_task_batch = @import("tools/task_batch.zig");
 pub const system_prompt = @import("core/system_prompt.zig");
 pub const user_context = @import("core/memory/user_context.zig");
 pub const memdir = @import("core/memory/memdir.zig");
@@ -151,6 +154,18 @@ test "compact summary module tests are reachable from root" {
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
+
+    // SIGPIPE 全局忽略:向已关闭的 pipe/socket 写(hook 子进程 stdin、web SSE、子进程管道)默认会
+    // 收 SIGPIPE 直接杀进程;改成 SIG_IGN → write 返 EPIPE(n<0)由各处的 `n<=0` 分支优雅处理。
+    // 必须在任何 spawn/网络之前设一次,覆盖所有模式(TUI/web/headless/subagent)。(Linus H1)
+    {
+        var act: std.posix.Sigaction = .{
+            .handler = .{ .handler = std.posix.SIG.IGN },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.PIPE, &act, null);
+    }
 
     // export-symbols 子命令(层三机制):在 App init *之前*处理——不发网络、不需 key。
     //   metacodes export-symbols <dir> [-o <file>]

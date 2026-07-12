@@ -29,7 +29,13 @@ pub const DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP: usize = 2;
 pub const Conversation = struct {
     allocator: std.mem.Allocator,
     messages: std.ArrayList(msg.Message),
-    ghost_snapshots: std.ArrayList(msg.Message),
+    /// P1.5 纯投影压缩:**原始消息永不删除**(供 transcript/resume/查看历史全量保留)。压缩=推进
+    /// 这个 boundary 游标 + 存一条 compact_summary。发给模型 / token 估算都只看 [boundary..] + summary
+    /// (见 activeStart/totalTokens/buildApiMessages)。对齐 cc 的 getMessagesAfterCompactBoundary。
+    /// **一致性铁律**:任何"发给模型"的投影和"token 估算"的投影必须用同一 boundary+summary,否则
+    /// 压缩后估算不降→死循环,或估算降了实际发全量→爆 context。
+    compact_boundary: usize = 0,
+    compact_summary: ?[]u8 = null, // owned;压缩摘要,投影时作为边界前的一条 assistant 消息注入
     mutation_version: u64 = 0,
     /// API usage 锚点:上次请求服务端实际计的 prompt tokens(in+cache_r+cache_w)。
     /// auto-compact 的 token 估算以它为基准,只对锚点之后新 append 的消息做本地估算,
@@ -43,14 +49,30 @@ pub const Conversation = struct {
     snapshot_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
 
     pub fn init(allocator: std.mem.Allocator) Conversation {
-        return .{ .allocator = allocator, .messages = .empty, .ghost_snapshots = .empty };
+        return .{ .allocator = allocator, .messages = .empty };
     }
 
     pub fn deinit(self: *Conversation) void {
         for (self.messages.items) |m| m.deinit(self.allocator);
         self.messages.deinit(self.allocator);
-        for (self.ghost_snapshots.items) |m| m.deinit(self.allocator);
-        self.ghost_snapshots.deinit(self.allocator);
+        if (self.compact_summary) |s| self.allocator.free(s);
+    }
+
+    /// 投影起点:活跃窗口 = messages[activeStart()..]。boundary 若越界(消息被 reset)则回 0。
+    pub fn activeStart(self: *const Conversation) usize {
+        return @min(self.compact_boundary, self.messages.items.len);
+    }
+
+    /// 活跃(投影后)消息切片:发给模型 / token 估算都基于它 + compact_summary。
+    pub fn activeMessages(self: *const Conversation) []const msg.Message {
+        return self.messages.items[self.activeStart()..];
+    }
+
+    /// 压缩摘要作为边界前一条虚拟 assistant 消息注入(P1.5:投影时才拼,不改原始 messages)。
+    /// 设 compact_summary(替换旧摘要,owned 转移;传 null 清除)。
+    fn setCompactSummary(self: *Conversation, s: ?[]u8) void {
+        if (self.compact_summary) |old| self.allocator.free(old);
+        self.compact_summary = s;
     }
 
     /// transcript 快照读前后持锁——与 append 互斥,防遍历 messages.items 时被 realloc 抽走。
@@ -138,12 +160,10 @@ pub const Conversation = struct {
             errdefer mc.deinit(dst);
             try out.messages.append(dst, mc);
         }
-        try out.ghost_snapshots.ensureTotalCapacity(dst, self.ghost_snapshots.items.len);
-        for (self.ghost_snapshots.items) |m| {
-            const mc = try m.dupe(dst);
-            errdefer mc.deinit(dst);
-            try out.ghost_snapshots.append(dst, mc);
-        }
+        // P1.5 投影:后台续跑必须继承压缩状态(boundary+summary),否则后台 job 会发全量历史 +
+        // 无摘要 → 爆 context/丢压缩。summary dupe 到 dst;errdefer out.deinit() 失败时释放。
+        out.compact_boundary = self.compact_boundary;
+        if (self.compact_summary) |s| out.compact_summary = try dst.dupe(u8, s);
         return out;
     }
 
@@ -185,12 +205,6 @@ pub const Conversation = struct {
             const mc = try m.dupe(dst);
             errdefer mc.deinit(dst);
             try out.messages.append(dst, mc);
-        }
-        try out.ghost_snapshots.ensureTotalCapacity(dst, self.ghost_snapshots.items.len);
-        for (self.ghost_snapshots.items) |m| {
-            const mc = try m.dupe(dst);
-            errdefer mc.deinit(dst);
-            try out.ghost_snapshots.append(dst, mc);
         }
 
         const suffix_len = self.messages.items.len - start_index;
@@ -239,12 +253,16 @@ pub const Conversation = struct {
         if (!sameAllocator(self.allocator, replacement.allocator)) return false;
         for (self.messages.items) |m| m.deinit(self.allocator);
         self.messages.deinit(self.allocator);
-        for (self.ghost_snapshots.items) |m| m.deinit(self.allocator);
-        self.ghost_snapshots.deinit(self.allocator);
         self.messages = replacement.messages;
-        self.ghost_snapshots = replacement.ghost_snapshots;
         replacement.messages = .empty;
-        replacement.ghost_snapshots = .empty;
+        // P1.5 投影:整体采用 replacement 的消息集时,也必须采用它的投影状态(boundary/summary)——
+        // 否则 self.compact_boundary 会指向旧消息数(越界)、compact_summary 描述已被替换的消息(错乱)。
+        // sameAllocator 已校验,summary 指针可安全 move。释放 self 旧摘要防泄漏,replacement 侧置 null 防 double-free。
+        if (self.compact_summary) |old| self.allocator.free(old);
+        self.compact_summary = replacement.compact_summary;
+        self.compact_boundary = replacement.compact_boundary;
+        replacement.compact_summary = null;
+        replacement.compact_boundary = 0;
         self.mutation_version +%= 1;
         self.usage_anchor = null; // 前缀被丢弃/替换,实计锚点作废
         return true;
@@ -269,10 +287,12 @@ pub const Conversation = struct {
         return (ascii + 3) / 4 + other;
     }
 
-    /// 全部消息的 text block 字节数估算总和。tool_use/tool_result 的 JSON 也算入。
+    /// **投影后**消息的 token 估算(P1.5:只算 compact_summary + 活跃窗口 [boundary..],与发给模型的
+    /// 完全一致)。压缩后 boundary 前移 → 此值下降 → 不再死循环压缩。tool_use/tool_result JSON 也算入。
     pub fn totalTokens(self: *const Conversation) usize {
         var total: usize = 0;
-        for (self.messages.items) |m| {
+        if (self.compact_summary) |s| total += estimateTokens(s);
+        for (self.activeMessages()) |m| {
             for (m.blocks) |b| switch (b) {
                 .text => |t| total += estimateTokens(t),
                 .tool_use => |tu| total += estimateTokens(tu.input) + estimateTokens(tu.name),
@@ -297,21 +317,18 @@ pub const Conversation = struct {
     pub fn compact(self: *Conversation, threshold: usize) !usize {
         if (!self.isOverThreshold(threshold)) return 0;
 
-        const total = self.messages.items.len;
-        if (total < 4) return 0;
-
-        const drop_count = total / 2;
         _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
         defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
-        var i: usize = 0;
-        while (i < drop_count) : (i += 1) {
-            self.appendGhostSnapshotLocked(self.messages.items[0]);
-            const m = self.messages.orderedRemove(0);
-            m.deinit(self.allocator);
-        }
+        const start = self.activeStart();
+        const active = self.messages.items.len - start;
+        if (active < 4) return 0;
+        // P1.5 投影:推进 boundary 到活跃窗口的中点(丢活跃前一半),不删消息。
+        const new_boundary = start + active / 2;
+        const dropped = new_boundary - self.compact_boundary;
+        self.compact_boundary = new_boundary;
         self.mutation_version +%= 1;
-        self.usage_anchor = null; // 前缀被丢弃/替换,实计锚点作废
-        return drop_count;
+        self.usage_anchor = null;
+        return dropped;
     }
 
     /// 保留最近 keep_n 条 message，丢前面的。对 tool_use/tool_result 配对友好：
@@ -321,19 +338,16 @@ pub const Conversation = struct {
     /// 注意：仍会丢老的 user 消息 + 它们对应的 assistant 回答；这是故意的（这是 compact 的本意）。
     /// 只保证 *边界处* 不留孤儿。
     pub fn compactKeepRecent(self: *Conversation, keep_n: usize) usize {
-        const drop_count = self.compactBoundary(keep_n);
-        if (drop_count == 0) return 0;
         _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
         defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
-        var i: usize = 0;
-        while (i < drop_count) : (i += 1) {
-            self.appendGhostSnapshotLocked(self.messages.items[0]);
-            const m = self.messages.orderedRemove(0);
-            m.deinit(self.allocator);
-        }
+        // P1.5 投影:新 boundary=全量保留最近 keep_n 的边界(单调前移)。无摘要降级(老消息投影掉不总结)。
+        const new_boundary = self.compactBoundary(keep_n);
+        if (new_boundary <= self.compact_boundary) return 0;
+        const dropped = new_boundary - self.compact_boundary;
+        self.compact_boundary = new_boundary;
         self.mutation_version +%= 1;
-        self.usage_anchor = null; // 前缀被丢弃/替换,实计锚点作废
-        return drop_count;
+        self.usage_anchor = null;
+        return dropped;
     }
 
     /// Context-window-exceeded recovery: remove the oldest history item and
@@ -343,22 +357,19 @@ pub const Conversation = struct {
     pub fn removeOldestForContextRecovery(self: *Conversation) usize {
         _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
         defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
-        if (self.messages.items.len <= 1) return 0;
+        // P1.5 投影:推进 boundary 丢最老活跃消息 + 紧邻孤儿 tool_result,不删原始。
+        const total = self.messages.items.len;
+        if (total - self.activeStart() <= 1) return 0;
 
         var dropped: usize = 0;
-        self.appendGhostSnapshotLocked(self.messages.items[0]);
-        const first = self.messages.orderedRemove(0);
-        first.deinit(self.allocator);
+        self.compact_boundary += 1;
         dropped += 1;
-
-        while (self.messages.items.len > 1 and isLeadingOrphanToolResult(self.messages.items[0])) {
-            self.appendGhostSnapshotLocked(self.messages.items[0]);
-            const m = self.messages.orderedRemove(0);
-            m.deinit(self.allocator);
+        while ((total - self.compact_boundary) > 1 and isLeadingOrphanToolResult(self.messages.items[self.compact_boundary])) {
+            self.compact_boundary += 1;
             dropped += 1;
         }
         self.mutation_version +%= 1;
-        self.usage_anchor = null; // 前缀被丢弃/替换,实计锚点作废
+        self.usage_anchor = null;
         return dropped;
     }
 
@@ -404,19 +415,22 @@ pub const Conversation = struct {
         ctx: anytype,
         comptime summarize_fn: fn (@TypeOf(ctx), []const msg.Message) ?[]u8,
     ) !CompactReport {
-        var drop_count: usize = 0;
+        // P1.5 纯投影:新 boundary = 保留最近 keep_n 的前缀边界(全量算,单调前移;原始不删)。
+        var new_boundary: usize = 0;
         var summary_input: []msg.Message = &.{};
         {
             _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
             defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
-            drop_count = self.compactBoundary(keep_n);
-            if (drop_count == 0) return .{ .dropped = 0, .summary_used = false };
+            new_boundary = self.compactBoundary(keep_n);
+            if (new_boundary <= self.compact_boundary) return .{ .dropped = 0, .summary_used = false };
 
-            summary_input = try self.allocator.alloc(msg.Message, drop_count);
+            // 总结**全部**被投影掉的前缀 [0, new_boundary)(原始都在 → 完整摘要,替换旧摘要)。
+            // dupe owned snapshot,不借用 messages.items(防 summarize 期间 append/realloc 悬挂)。
+            summary_input = try self.allocator.alloc(msg.Message, new_boundary);
             errdefer self.allocator.free(summary_input);
             var copied: usize = 0;
             errdefer for (summary_input[0..copied]) |m| m.deinit(self.allocator);
-            for (self.messages.items[0..drop_count], 0..) |m, i| {
+            for (self.messages.items[0..new_boundary], 0..) |m, i| {
                 summary_input[i] = try m.dupe(self.allocator);
                 copied = i + 1;
             }
@@ -426,31 +440,18 @@ pub const Conversation = struct {
             self.allocator.free(summary_input);
         }
 
-        // 先总结要丢的 [0, drop_count)。这里传 owned snapshot,不借用
-        // self.messages.items,避免 summarize 期间 append/realloc 让 slice 悬挂。
         const summary = summarize_fn(ctx, summary_input);
         errdefer if (summary) |s| self.allocator.free(s);
 
-        // 丢老消息。
+        // **投影**:不删任何消息,只推进 boundary + 替换摘要。原始永久保留供 transcript/resume/查看。
         _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
         defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
-        var i: usize = 0;
-        while (i < drop_count) : (i += 1) {
-            self.appendGhostSnapshotLocked(self.messages.items[0]);
-            const m = self.messages.orderedRemove(0);
-            m.deinit(self.allocator);
-        }
-
-        // 有 summary → prepend 一条 assistant 消息(text block)到队首。
-        if (summary) |s| {
-            const blocks = try self.allocator.alloc(msg.Block, 1);
-            errdefer self.allocator.free(blocks);
-            blocks[0] = .{ .text = s }; // s 已是 owned(summarize_fn dupe 的),转移给 block
-            try self.messages.insert(self.allocator, 0, .{ .role = .assistant, .blocks = blocks });
-        }
+        const old_boundary = self.compact_boundary;
+        self.compact_boundary = new_boundary;
+        if (summary) |s| self.setCompactSummary(s); // s owned → 转移
         self.mutation_version +%= 1;
-        self.usage_anchor = null; // 前缀被丢弃/替换,实计锚点作废
-        return .{ .dropped = drop_count, .summary_used = summary != null };
+        self.usage_anchor = null; // 投影窗口变了,实计锚点作废
+        return .{ .dropped = new_boundary - old_boundary, .summary_used = summary != null };
     }
 
     /// Microcompact(批4,对齐 cc 的工具结果清理):把"较老"消息里的 tool_result 内容
@@ -565,13 +566,6 @@ pub const Conversation = struct {
         return true;
     }
 
-    fn appendGhostSnapshotLocked(self: *Conversation, m: msg.Message) void {
-        const copy = m.dupe(self.allocator) catch return;
-        self.ghost_snapshots.append(self.allocator, copy) catch {
-            copy.deinit(self.allocator);
-            return;
-        };
-    }
 };
 
 fn isLeadingOrphanToolResult(m: msg.Message) bool {
@@ -860,7 +854,9 @@ test "compact drops oldest half when over threshold" {
     const before = c.len();
     const dropped = try c.compact(1);
     try std.testing.expect(dropped == before / 2);
-    try std.testing.expect(c.len() == before - dropped);
+    // 投影语义:原始消息永不删除,len() 仍全量;活跃窗口收缩 before-dropped。
+    try std.testing.expect(c.len() == before);
+    try std.testing.expect(c.activeMessages().len == before - dropped);
 }
 
 test "compact is no-op for short conversation even over threshold" {
@@ -920,11 +916,15 @@ test "compactKeepRecent keeps last N" {
 
     const dropped = c.compactKeepRecent(2);
     try std.testing.expect(dropped == 3);
-    try std.testing.expect(c.len() == 2);
-    try std.testing.expectEqual(@as(usize, 3), c.ghost_snapshots.items.len);
-    try std.testing.expectEqualStrings("m1", c.ghost_snapshots.items[0].blocks[0].text);
-    try std.testing.expectEqualStrings("m4", c.messages.items[0].blocks[0].text);
-    try std.testing.expectEqualStrings("m5", c.messages.items[1].blocks[0].text);
+    // 投影:全量保留,活跃窗口=最近 2 条。
+    try std.testing.expect(c.len() == 5);
+    try std.testing.expectEqual(@as(usize, 3), c.activeStart());
+    const active = c.activeMessages();
+    try std.testing.expectEqual(@as(usize, 2), active.len);
+    try std.testing.expectEqualStrings("m4", active[0].blocks[0].text);
+    try std.testing.expectEqualStrings("m5", active[1].blocks[0].text);
+    // 被投影掉的老消息仍原样保留在 messages 头部(供 transcript/resume)。
+    try std.testing.expectEqualStrings("m1", c.messages.items[0].blocks[0].text);
 }
 
 test "compactKeepRecent no-op when under keep_n" {
@@ -965,10 +965,14 @@ test "compactKeepRecent avoids orphan tool_result at boundary" {
     // keep_n=3 → 理论上应丢前 2，留最后 3（tool_result + answer + follow-up）
     // 但 tool_result 是 orphan（其 tool_use 在 index=1 被丢）→ 应该往右挪一个
     const dropped = c.compactKeepRecent(3);
-    try std.testing.expect(dropped == 3); // 多丢一个 tool_result
-    try std.testing.expect(c.len() == 2);
-    try std.testing.expectEqualStrings("answer", c.messages.items[0].blocks[0].text);
-    try std.testing.expectEqualStrings("follow up", c.messages.items[1].blocks[0].text);
+    try std.testing.expect(dropped == 3); // 多丢一个 orphan tool_result
+    // 投影:全量保留,活跃窗口首条不是孤儿 tool_result。
+    try std.testing.expect(c.len() == 5);
+    try std.testing.expectEqual(@as(usize, 3), c.activeStart());
+    const active = c.activeMessages();
+    try std.testing.expectEqual(@as(usize, 2), active.len);
+    try std.testing.expectEqualStrings("answer", active[0].blocks[0].text);
+    try std.testing.expectEqualStrings("follow up", active[1].blocks[0].text);
 }
 
 test "removeOldestForContextRecovery drops orphan tool_result boundary" {
@@ -994,8 +998,12 @@ test "removeOldestForContextRecovery drops orphan tool_result boundary" {
 
     const dropped = c.removeOldestForContextRecovery();
     try std.testing.expectEqual(@as(usize, 2), dropped);
-    try std.testing.expectEqual(@as(usize, 1), c.len());
-    try std.testing.expectEqualStrings("after", c.messages.items[0].blocks[0].text);
+    // 投影:全量保留,活跃窗口=最后一条 "after"。
+    try std.testing.expectEqual(@as(usize, 3), c.len());
+    try std.testing.expectEqual(@as(usize, 2), c.activeStart());
+    const active = c.activeMessages();
+    try std.testing.expectEqual(@as(usize, 1), active.len);
+    try std.testing.expectEqualStrings("after", active[0].blocks[0].text);
 }
 
 test "replaceWithOwned swaps only after preview succeeds" {
@@ -1048,10 +1056,15 @@ test "replaceWithOwnedIfSuffixUnchanged accepts unchanged suffix" {
     try preview.conversation.appendText(.assistant, "summary");
 
     try std.testing.expect(live.replaceWithOwnedIfSuffixUnchanged(&preview.suffix, &preview.conversation));
-    try std.testing.expectEqual(@as(usize, 2), live.len());
+    // 投影:preview 的 boundary 一并被采用(replaceWithOwnedLocked 的 P1.5 修复);live 全量保留,
+    // 活跃窗口 = keep + summary。boundary 未采用 → 压缩会白做(这条正是回归防线)。
+    try std.testing.expectEqual(@as(usize, 4), live.len());
     try std.testing.expectEqual(@as(usize, 0), preview.conversation.len());
-    try std.testing.expectEqualStrings("keep", live.messages.items[0].blocks[0].text);
-    try std.testing.expectEqualStrings("summary", live.messages.items[1].blocks[0].text);
+    try std.testing.expectEqual(@as(usize, 2), live.activeStart());
+    const active = live.activeMessages();
+    try std.testing.expectEqual(@as(usize, 2), active.len);
+    try std.testing.expectEqualStrings("keep", active[0].blocks[0].text);
+    try std.testing.expectEqualStrings("summary", active[1].blocks[0].text);
 }
 
 test "replaceWithOwnedIfSuffixUnchanged rejects concurrent append" {
@@ -1101,23 +1114,29 @@ test "cloneInto 深拷贝独立 + 源 reset 不影响副本 + 无泄漏" {
     try std.testing.expectEqualStrings("out", copy.messages.items[2].blocks[0].tool_result.content);
 }
 
-test "ghost snapshots survive clone and are not live messages" {
+test "cloneInto 继承投影状态(boundary+summary)供后台续跑" {
     const a = std.testing.allocator;
     var src = Conversation.init(a);
     defer src.deinit();
     try src.appendText(.user, "m1");
     try src.appendText(.assistant, "m2");
     try src.appendText(.user, "m3");
-    _ = src.compactKeepRecent(1);
+    _ = src.compactKeepRecent(1); // boundary → 2,活跃 = [m3]
+    src.setCompactSummary(try a.dupe(u8, "prior summary"));
 
-    try std.testing.expectEqual(@as(usize, 1), src.len());
-    try std.testing.expectEqual(@as(usize, 2), src.ghost_snapshots.items.len);
+    try std.testing.expectEqual(@as(usize, 3), src.len()); // 投影:全量保留
+    try std.testing.expectEqual(@as(usize, 2), src.activeStart());
 
     var copy = try src.cloneInto(a);
     defer copy.deinit();
-    try std.testing.expectEqual(@as(usize, 1), copy.len());
-    try std.testing.expectEqual(@as(usize, 2), copy.ghost_snapshots.items.len);
-    try std.testing.expect(src.ghost_snapshots.items[0].blocks[0].text.ptr != copy.ghost_snapshots.items[0].blocks[0].text.ptr);
-    try std.testing.expectEqualStrings("m1", copy.ghost_snapshots.items[0].blocks[0].text);
-    try std.testing.expectEqualStrings("m3", copy.messages.items[0].blocks[0].text);
+    // 全量消息 + 投影状态都随 clone 转移,后台 job 才不会重发已压缩的历史。
+    try std.testing.expectEqual(@as(usize, 3), copy.len());
+    try std.testing.expectEqual(@as(usize, 2), copy.compact_boundary);
+    try std.testing.expect(copy.compact_summary != null);
+    try std.testing.expectEqualStrings("prior summary", copy.compact_summary.?);
+    // summary 深拷贝:字节地址不共享。
+    try std.testing.expect(src.compact_summary.?.ptr != copy.compact_summary.?.ptr);
+    const active = copy.activeMessages();
+    try std.testing.expectEqual(@as(usize, 1), active.len);
+    try std.testing.expectEqualStrings("m3", active[0].blocks[0].text);
 }

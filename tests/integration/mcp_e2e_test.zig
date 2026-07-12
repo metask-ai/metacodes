@@ -26,6 +26,43 @@ test "MCP: full cycle initialize + listTools + callTool echo" {
     try std.testing.expect(std.mem.indexOf(u8, result, "hello mcp") != null);
 }
 
+fn elicitAcceptHandler(ctx: *anyopaque, _: []const u8, alloc: std.mem.Allocator) ?[]u8 {
+    const called: *bool = @ptrCast(ctx);
+    called.* = true;
+    return alloc.dupe(u8, "{\"answer\":\"yes\"}") catch null;
+}
+
+test "MCP P0.3: elicitation 往返 — server 发 elicitation/create,client handler accept,tool 完成" {
+    const a = std.testing.allocator;
+    const mock_path: [*:0]const u8 = "zig-out/bin/mock_mcp_server";
+    const argv = [_]?[*:0]const u8{ mock_path, null };
+    var client = cc.mcp_client.McpClient.connect(a, argv[0..]) catch |err| {
+        std.debug.print("connect failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer client.close();
+
+    var handler_called = false;
+    client.elicit = .{ .ctx = @ptrCast(&handler_called), .handleFn = elicitAcceptHandler };
+    // callTool "elicit" → server 中途发 elicitation/create → client handler 应答 accept → server 回结果。
+    const result = try client.callTool("elicit", "{}");
+    defer a.free(result);
+    try std.testing.expect(handler_called); // 回调确实被调
+    try std.testing.expect(std.mem.indexOf(u8, result, "elicited:accept") != null); // server 收到 accept 并完成
+}
+
+test "MCP P0.3: 无 elicitation handler → 自动 decline,tool 仍完成(不 hang,不破协议)" {
+    const a = std.testing.allocator;
+    const mock_path: [*:0]const u8 = "zig-out/bin/mock_mcp_server";
+    const argv = [_]?[*:0]const u8{ mock_path, null };
+    var client = cc.mcp_client.McpClient.connect(a, argv[0..]) catch return;
+    defer client.close();
+    // 不设 handler → elicitation/create 被自动 decline。tool 仍拿到响应(不因未处理 server 请求而卡死)。
+    const result = try client.callTool("elicit", "{}");
+    defer a.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "elicited:decline") != null);
+}
+
 test "MCP: dispatch via DynRegistry routes mock__echo to MCP server" {
     const a = std.testing.allocator;
     const mock_path: [*:0]const u8 = "zig-out/bin/mock_mcp_server";

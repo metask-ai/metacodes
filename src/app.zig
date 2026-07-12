@@ -375,7 +375,7 @@ pub const App = struct {
 
         // 初始化后台 subagent registry（Task run_in_background）。每个 job 内部自建
         // 专属 Client（指向同 endpoint），故这里只需 api_key/base_url/model。
-        app.agent_jobs = @import("core/agent_job_registry.zig").AgentJobRegistry.init(allocator, app.api_key, config.base_url, app.config.model) catch |err| blk: {
+        app.agent_jobs = @import("core/agent_job_registry.zig").AgentJobRegistry.init(allocator, app.api_key, config.base_url, app.config.model, app.config.provider_kind) catch |err| blk: {
             @import("util/log.zig").warn("agent", "agent_jobs registry init failed: {s}", .{@errorName(err)});
             break :blk null;
         };
@@ -418,6 +418,15 @@ pub const App = struct {
             .anthropic => app.api_client.provider(),
             .openai => app.openai_client.?.provider(),
             .gemini => app.gemini_client.?.provider(),
+        };
+    }
+
+    /// 供 subagent ctx.api_client(web_search 是 Anthropic server tool,只 Anthropic 用)。
+    /// 非 Anthropic provider → null(subagent 不能用 web_search,其余工具照常)。
+    pub fn anthropicClientOrNull(app: *App) ?*client_mod.Client {
+        return switch (app.config.provider_kind) {
+            .anthropic => &app.api_client,
+            else => null,
         };
     }
 
@@ -1004,10 +1013,18 @@ pub const App = struct {
         };
     }
 
-    /// 收集 project/user settings 的 hooks.PreToolUse,合并成一个 HookSet。
-    /// 简化:取第一个非空 source(优先 project 覆盖 user)。完整跨层合并留后续。
+    /// 收集 project + user settings 的 hooks(Pre+Post),**跨层合并**成一个 HookSet(不再首个覆盖)。
+    /// 合并语义:各层 matcher entry 全部并入(project 与 user 的 hook 并存,org 全局 hook 不被项目覆盖)。
     fn loadHooks(app: *App, home: ?[]const u8) !void {
         const hooks_mod = @import("permission/hooks.zig");
+        var pre: std.ArrayList(hooks_mod.HookEntry) = .empty;
+        var post: std.ArrayList(hooks_mod.HookEntry) = .empty;
+        errdefer {
+            for (pre.items) |e| freeHookEntry(app.allocator, e);
+            pre.deinit(app.allocator);
+            for (post.items) |e| freeHookEntry(app.allocator, e);
+            post.deinit(app.allocator);
+        }
         const candidates = [_]?[]const u8{
             if (app.project_dir) |r| (std.fmt.allocPrint(app.allocator, "{s}/.claude/settings.json", .{r}) catch null) else null,
             if (home) |h| (std.fmt.allocPrint(app.allocator, "{s}/.claude/settings.json", .{h}) catch null) else null,
@@ -1020,15 +1037,33 @@ pub const App = struct {
             defer app.allocator.free(content);
             var parsed = std.json.parseFromSlice(std.json.Value, app.allocator, content, .{}) catch continue;
             defer parsed.deinit();
-            var hs = hooks_mod.parse(app.allocator, parsed.value) catch continue;
-            if (!hs.isEmpty()) {
-                app.hooks = hs;
-                app.permission_ctx.hooks = &app.hooks.?;
-                @import("util/log.zig").info("hook", "PreToolUse loaded {d} matcher(s) (from {s})", .{ hs.pre_tool_use.len, path });
-                return;
-            }
-            hs.deinit();
+            const hs = hooks_mod.parse(app.allocator, parsed.value) catch continue;
+            // 把该层 entry **移入**合并列表(appendSlice 拷 HookEntry 结构,其内 matcher/commands 指针
+            // 转由合并列表持有);故只 free 外层切片数组,**不** hs.deinit()(那会 free 掉已转移的内层)。
+            pre.appendSlice(app.allocator, hs.pre_tool_use) catch {};
+            post.appendSlice(app.allocator, hs.post_tool_use) catch {};
+            app.allocator.free(hs.pre_tool_use);
+            app.allocator.free(hs.post_tool_use);
         }
+
+        if (pre.items.len == 0 and post.items.len == 0) {
+            pre.deinit(app.allocator);
+            post.deinit(app.allocator);
+            return;
+        }
+        app.hooks = .{
+            .pre_tool_use = try pre.toOwnedSlice(app.allocator),
+            .post_tool_use = try post.toOwnedSlice(app.allocator),
+            .allocator = app.allocator,
+        };
+        app.permission_ctx.hooks = &app.hooks.?;
+        @import("util/log.zig").info("hook", "loaded PreToolUse={d} PostToolUse={d} matcher(s) (merged across layers)", .{ app.hooks.?.pre_tool_use.len, app.hooks.?.post_tool_use.len });
+    }
+
+    fn freeHookEntry(alloc: std.mem.Allocator, e: @import("permission/hooks.zig").HookEntry) void {
+        alloc.free(e.matcher);
+        for (e.commands) |c| alloc.free(c);
+        alloc.free(e.commands);
     }
 
     /// 读 project/.claude/settings.json + ~/.claude/settings.json 的 sandbox 段,
@@ -1221,6 +1256,10 @@ pub const App = struct {
                 continue;
             };
 
+            // **诚实登记(elicitation UI 未接线)**:client.elicit 回调机制已实现+测试(见 mcp/client.zig),
+            // 但此处**不设** handler → 生产中 MCP server 发 elicitation/create 一律安全 decline(协议正确闭合,
+            // tool 继续/优雅失败,不 hang)。接真 UI 需一个 elicitation 渲染器(同 custom UiRequest,TUI 暂无);
+            // 有渲染器后在此 per-session 设 client_heap.elicit=路由到 ui_requester 即可,MCP 层零改。
             var session = McpSession.init(app.allocator, client_heap);
             // 注册 server tools + resource tools；任一失败回滚本 server
             session.registerTools(&app.dyn_registry, name_v.string) catch |err| {

@@ -85,7 +85,12 @@ test "L2 并发: unsafe 工具串行单跑(未知工具→错误,不崩)" {
     const ctx = cc.tool_context.ToolContext{ .allocator = a };
     tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
     try std.testing.expect(slots[0].is_error);
-    try std.testing.expect(slots[0].content != null and std.mem.indexOf(u8, slots[0].content.?, "UnknownTool") != null);
+    // P0.6:UnknownTool 错误现在附"does not exist + 可用工具清单"引导(而非旧的裸 "UnknownTool"),
+    // 弱模型据此自纠。断言错误码(unknown_tool)在,且含引导文案 + 至少一个真工具名。
+    const content = slots[0].content.?;
+    try std.testing.expect(std.mem.indexOf(u8, content, "unknown_tool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "does not exist") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "Read") != null); // 可用工具清单含 Read
 }
 
 test "L2 并发: per-message 聚合预算(多大结果合计超 200k → 落盘最大的)" {

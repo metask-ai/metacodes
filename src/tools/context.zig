@@ -151,7 +151,11 @@ pub const ToolContext = struct {
     /// Task 清单：TaskCreate/Get/List/Update/Stop 共享的 scratchpad
     tasks: ?*TaskStore = null,
     /// 用于 Agent 工具 spawn 子 agent：共享 API client + tool defs + permission ctx
+    /// api_client 仅 Anthropic 具体 client(web_search server tool 用);非 Anthropic → null。
     api_client: ?*Client = null,
+    /// P0.5:父 loop 的中立 Provider。skill/agent 同步 spawn 的子 loop 据此继承父 provider
+    /// (跨 provider 也正确);null = 无(纯单测)→ spawn 降级用 api_client.provider() 兜底。
+    provider: ?@import("../api/provider.zig").Provider = null,
     tool_defs: ?[]const ToolDefinition = null,
     /// 当前 agent 嵌套深度（父=0，子=1，孙=2…）。Agent 工具用它限制递归。
     agent_depth: u8 = 0,

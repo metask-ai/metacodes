@@ -162,6 +162,7 @@ fn tryForkSpawn(
 
     const result = try subagent.spawnAgent(
         ctx.allocator,
+        ctx.provider orelse api_client.provider(), // 继承父 provider(跨 provider);兜底用 anthropic
         api_client,
         tool_defs,
         perm,

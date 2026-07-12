@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const client_mod = @import("../client.zig");
+const provider_mod = @import("../api/provider.zig");
 const json_mod = @import("../json.zig");
 const permission_mod = @import("../permission.zig");
 const agent_loop = @import("agent_loop.zig");
@@ -76,7 +77,8 @@ pub const SpawnOptions = struct {
 
 pub fn spawnAgent(
     allocator: std.mem.Allocator,
-    api_client: *client_mod.Client, // *Client(非 Provider):subagent 内部 .provider() 化后传给子 run();见 P1 职责边界
+    prov: provider_mod.Provider, // P0.5:中立 Provider 驱动子 loop(不再必须 Anthropic 具体 client)
+    anthropic_client: ?*client_mod.Client, // 供子 ctx.api_client(web_search 是 Anthropic server tool);非 Anthropic provider → null
     tool_defs: []const json_mod.ToolDefinition,
     permission_ctx: *const permission_mod.PermissionContext,
     abort: ?*const AbortSignal,
@@ -85,14 +87,15 @@ pub fn spawnAgent(
 ) !SubagentResult {
     var wb = writer_backend.WriterBackend.initNull();
     const be = wb.backend();
-    return spawnAgentSink(allocator, api_client, tool_defs, permission_ctx, abort, prompt, opts, &be);
+    return spawnAgentSink(allocator, prov, anthropic_client, tool_defs, permission_ctx, abort, prompt, opts, &be);
 }
 
 /// 与 spawnAgent 相同,但允许注入一个 UiBackend(后台 job 用 WriterBackend 把流式
 /// text 导进可查询缓冲;同步路径用 null backend,行为不变)。
 pub fn spawnAgentSink(
     allocator: std.mem.Allocator,
-    api_client: *client_mod.Client,
+    prov: provider_mod.Provider, // 中立 Provider 驱动子 loop
+    anthropic_client: ?*client_mod.Client, // 子 ctx.api_client(web_search 用;非 Anthropic → null)
     tool_defs: []const json_mod.ToolDefinition,
     permission_ctx: *const permission_mod.PermissionContext,
     abort: ?*const AbortSignal,
@@ -127,14 +130,14 @@ pub fn spawnAgentSink(
 
     const result = try agent_loop.run(
         &conv,
-        api_client.provider(),
+        prov,
         effective_tool_defs,
         ctx_to_use,
         .{
             .max_turns = opts.max_turns,
             .system_prompt = opts.system_prompt,
             .abort = abort,
-            .api_client = api_client,
+            .api_client = anthropic_client,
             .tool_defs = effective_tool_defs,
             .agent_depth = opts.agent_depth,
             .dyn_registry = opts.dyn_registry,

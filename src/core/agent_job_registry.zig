@@ -20,6 +20,8 @@
 
 const std = @import("std");
 const client_mod = @import("../client.zig");
+const pf = @import("../api/provider_factory.zig");
+const types_mod = @import("../types.zig");
 const json_mod = @import("../json.zig");
 const permission_mod = @import("../permission.zig");
 const subagent = @import("subagent.zig");
@@ -229,9 +231,8 @@ const JobInput = struct {
     host_services: ?@import("../tools/context.zig").HostServices,
     kg: ?*@import("../kg/client.zig").KgClient,
     kg_projects_dir: []const u8,
-    // 专属资源:
-    io_runtime: *std.Io.Threaded,
-    client: *client_mod.Client,
+    // 专属资源:P0.5 换成 OwnedProvider(据 provider_kind 造对应具体 client + io,统一 deinit)。
+    owned: pf.OwnedProvider,
     /// Ctrl+B 主对话转后台:预建对话(深拷贝副本,所有权在此)。jobThreadMain move 进 SpawnOptions
     /// 后立即置 null(单一所有者);仅 spawn 失败回滚时 cleanup 命中 deinit。null=普通 subagent(从 prompt 起)。
     prebuilt_conversation: ?Conversation = null,
@@ -249,10 +250,7 @@ const JobInput = struct {
         a.free(self.parent_model);
         if (self.model_override) |m| a.free(m);
         if (self.prebuilt_conversation) |*c| c.deinit(); // 仅 spawn 失败回滚命中(jobThreadMain 成功路径已 move 置 null)
-        self.client.deinit();
-        a.destroy(self.client);
-        self.io_runtime.deinit();
-        a.destroy(self.io_runtime);
+        self.owned.deinit();
         a.destroy(self);
     }
 };
@@ -262,10 +260,12 @@ pub const AgentJobRegistry = struct {
     list_mutex: std.c.pthread_mutex_t = .{},
     entries: std.ArrayList(*JobEntry) = .empty,
     index: std.AutoHashMap([16]u8, *JobEntry),
-    // 造 per-job Client 用(dupe 自 App):
+    // 造 per-job provider 用(dupe 自 App):
     api_key: []u8,
     base_url: ?[]u8,
     model: []u8,
+    /// P0.5:parent 的 provider 协议 → per-job provider 据此造对应具体 client(子继承父 provider)。
+    provider_kind: types_mod.ProviderKind = .anthropic,
     seq: u32 = 0,
 
     pub fn init(
@@ -273,6 +273,7 @@ pub const AgentJobRegistry = struct {
         api_key: []const u8,
         base_url: ?[]const u8,
         model: []const u8,
+        provider_kind: types_mod.ProviderKind,
     ) !AgentJobRegistry {
         const key_owned = try allocator.dupe(u8, api_key);
         errdefer allocator.free(key_owned);
@@ -286,6 +287,7 @@ pub const AgentJobRegistry = struct {
             .api_key = key_owned,
             .base_url = url_owned,
             .model = model_owned,
+            .provider_kind = provider_kind,
         };
     }
 
@@ -393,16 +395,14 @@ pub const AgentJobRegistry = struct {
         entry.agent_type = a.dupe(u8, p.agent_type[0..@min(p.agent_type.len, 32)]) catch &.{};
         errdefer if (!committed and entry.agent_type.len > 0) a.free(entry.agent_type);
 
-        // 2) 专属 io_runtime + Client(堆分配,所有权给 JobInput)
-        const io_rt = try a.create(std.Io.Threaded);
-        errdefer if (!committed) a.destroy(io_rt);
-        io_rt.* = std.Io.Threaded.init(a, .{});
-        errdefer if (!committed) io_rt.deinit();
-
-        const client = try a.create(client_mod.Client);
-        errdefer if (!committed) a.destroy(client);
-        client.* = client_mod.Client.initWithBaseUrl(a, io_rt.io(), self.api_key, self.model, self.base_url);
-        errdefer if (!committed) client.deinit();
+        // 2) 专属 OwnedProvider(据 provider_kind 造对应具体 client + io,所有权给 JobInput)。
+        //    **必须用 self.allocator**(与 jobThreadMain 传给 spawnAgentSink 的 input.allocator 一致):
+        //    provider 的流式事件(tool_use/text)所有权会转移进 subagent 的 agent_loop,两者 allocator
+        //    不一致 → Invalid free(GPA 实测)。后台单/多 job 用 registry.allocator 全程一致,已验证能跑。
+        //    ⚠️ 线程安全存疑(见 HANDOFF):后台 job 线程用 registry.allocator 做 HTTP,若 App gpa 非线程安全
+        //    且与 io_runtime worker 并发理论上有 TaskBatch 同款风险,但后台测试历来通过、未实测崩溃,留查。
+        var owned = try pf.makeProvider(self.allocator, self.provider_kind, self.api_key, self.model, self.base_url);
+        errdefer if (!committed) owned.deinit();
 
         // 3) dupe 所有借用内存进 JobInput(必须在 spawn 之前)
         const input = try a.create(JobInput);
@@ -452,8 +452,7 @@ pub const AgentJobRegistry = struct {
             .host_services = p.host_services,
             .kg = p.kg,
             .kg_projects_dir = p.kg_projects_dir,
-            .io_runtime = io_rt,
-            .client = client,
+            .owned = owned,
             .prebuilt_conversation = p.prebuilt_conversation, // move(Ctrl+B 转后台);普通 subagent=null
             .registry = self,
         };
@@ -663,30 +662,15 @@ pub const AgentJobRegistry = struct {
         return n;
     }
 
-    /// 造一个专属 io_runtime + Client(堆分配,所有权归调用者)。供同步前台 Task
-    /// 并发执行时每个 spawn 用独立 Client,避免跨线程共享 App.api_client。
-    /// 调用者用完: client.deinit(); destroy(client); io.deinit(); destroy(io)。
-    pub const OwnedClient = struct {
-        io: *std.Io.Threaded,
-        client: *client_mod.Client,
-        allocator: std.mem.Allocator,
-        pub fn deinit(self: OwnedClient) void {
-            self.client.deinit();
-            self.allocator.destroy(self.client);
-            self.io.deinit();
-            self.allocator.destroy(self.io);
-        }
-    };
-    pub fn makeClient(self: *AgentJobRegistry) !OwnedClient {
-        const a = self.allocator;
-        const io_rt = try a.create(std.Io.Threaded);
-        errdefer a.destroy(io_rt);
-        io_rt.* = std.Io.Threaded.init(a, .{});
-        errdefer io_rt.deinit();
-        const client = try a.create(client_mod.Client);
-        errdefer a.destroy(client);
-        client.* = client_mod.Client.initWithBaseUrl(a, io_rt.io(), self.api_key, self.model, self.base_url);
-        return .{ .io = io_rt, .client = client, .allocator = a };
+    /// 造一个专属 OwnedProvider(据 parent 的 provider_kind 造对应具体 client + 独立 io_runtime,
+    /// 堆分配,所有权归调用者)。供同步前台 Task 并发执行时每个 spawn 用独立 provider,避免跨线程
+    /// 共享 App 的单例 client。调用者用完 `.deinit()`。P0.5:构造路径 provider-neutral。
+    pub fn makeProvider(self: *AgentJobRegistry) !pf.OwnedProvider {
+        // **线程安全铁律**:makeProvider 造的 Client 会在 **worker 线程**做 HTTP(后台 subagent /
+        // TaskBatch 并发 worker),且主线程造它时可能与 App 的 io_runtime worker 线程并发。App 的
+        // gpa(self.allocator)非线程安全并发访问会损坏(假 OOM/unreachable → SIGABRT,真机实测)。
+        // 故用 c_allocator(malloc,线程安全)隔离。OwnedProvider 自带此 allocator,deinit 也用它,一致。
+        return pf.makeProvider(std.heap.c_allocator, self.provider_kind, self.api_key, self.model, self.base_url);
     }
 
     /// 前台(同步)job 注册:堆分配一个无线程的 running entry,返回稳定 *JobEntry
@@ -866,7 +850,8 @@ fn jobThreadMain(input: *JobInput) void {
 
     const result = subagent.spawnAgentSink(
         input.allocator,
-        input.client,
+        input.owned.provider(),
+        input.owned.anthropicClient(),
         input.tool_defs_owned,
         &ctx_override,
         &e.abort,
@@ -895,20 +880,21 @@ fn jobThreadMain(input: *JobInput) void {
 
 const testing = std.testing;
 
-test "AgentJobRegistry setModel updates future clients" {
-    var reg = try AgentJobRegistry.init(testing.allocator, "test-key", "http://127.0.0.1:1", "old-model");
+test "AgentJobRegistry setModel updates future providers" {
+    var reg = try AgentJobRegistry.init(testing.allocator, "test-key", "http://127.0.0.1:1", "old-model", .anthropic);
     defer reg.deinit();
     try reg.setModel("new-model");
-    var owned = try reg.makeClient();
+    var owned = try reg.makeProvider();
     defer owned.deinit();
-    try testing.expectEqualStrings("new-model", owned.client.model);
+    // provider() 出中立 vtable,model 经具体 client 透传。
+    try testing.expectEqualStrings("new-model", owned.provider().model());
 }
 
 test "JobEntry backend 消费 CoreEvent.progress 实时回写 tool_calls(L1:#6 进度=事件)" {
     // #6 修复:执行中进度必须实时回写 tool_calls,否则 subagent 树恒显 `· 0 tools ·`。
     // L1 后:进度走 backend.emit(.progress)(取代旧 progressTrampoline 回调)。本测试经
     // JobEntry.backend() 的 emit 驱动,端到端验证 CoreEvent.progress → 树字段的接线。
-    var reg = try AgentJobRegistry.init(testing.allocator, "test-key", "http://127.0.0.1:1", "test-model");
+    var reg = try AgentJobRegistry.init(testing.allocator, "test-key", "http://127.0.0.1:1", "test-model", .anthropic);
     defer reg.deinit();
 
     try reg.pushTestEntry("count files", 1, "", "");
@@ -953,7 +939,7 @@ test "spawnBackground prebuilt_conversation consume-on-call:失败路径不泄�
     // conversation。填满 registry 触发 TooManyBackgroundJobs 早退,断言 testing.allocator 不报
     // 泄漏/double-free(=失败路径正确 deinit 了 prebuilt copy)。
     const a = testing.allocator;
-    var reg = try AgentJobRegistry.init(a, "test-key", "http://127.0.0.1:1", "test-model");
+    var reg = try AgentJobRegistry.init(a, "test-key", "http://127.0.0.1:1", "test-model", .anthropic);
     defer reg.deinit();
 
     var i: usize = 0;
@@ -978,7 +964,7 @@ test "abortAllRunning:esc 中断 abort 所有 running agent job(非阻塞)" {
     // 用户实测 bug:启动多 agent 后 esc 不终止。根因:后台/嵌套 agent job 持自己的 entry.abort,
     // app.abort 不触达。esc 现调 abortAllRunning() 补齐。验证:对所有 running entry 置 abort、返回数量。
     const a = testing.allocator;
-    var reg = try AgentJobRegistry.init(a, "k", "http://127.0.0.1:1", "m");
+    var reg = try AgentJobRegistry.init(a, "k", "http://127.0.0.1:1", "m", .anthropic);
     defer reg.deinit();
     // pushTestEntry 造无线程的 running entry(状态 .running)。
     try reg.pushTestEntry("agent A", 1, "", "");
@@ -1009,7 +995,7 @@ test "spawnBackground committed-flag:input.* 建好后失败也无泄漏(Failing
         var fa = std.testing.FailingAllocator.init(base, .{ .fail_index = n });
         const a = fa.allocator();
         // registry 自身 init 也要 alloc;init 失败就跳过该 index(本测试只关心 spawnBackground 内部回滚)。
-        var reg = AgentJobRegistry.init(a, "k", "http://127.0.0.1:1", "m") catch continue;
+        var reg = AgentJobRegistry.init(a, "k", "http://127.0.0.1:1", "m", .anthropic) catch continue;
         defer reg.deinit();
 
         var copy = Conversation.init(a);
@@ -1045,7 +1031,7 @@ test "spawnBackground committed-flag:input.* 建好后失败也无泄漏(Failing
 }
 
 test "copyOutputBuf: prompt_preview + output_buf 完整流;缺 id 返 null" {
-    var reg = try AgentJobRegistry.init(testing.allocator, "test-key", "http://127.0.0.1:1", "test-model");
+    var reg = try AgentJobRegistry.init(testing.allocator, "test-key", "http://127.0.0.1:1", "test-model", .anthropic);
     defer reg.deinit();
     try reg.pushTestEntry("inspect repo", 1, "", "");
     const entry = reg.entries.items[0];

@@ -94,7 +94,7 @@ test "L2 后台A: run_in_background=true 立即返回 agent_job_id 且不阻塞"
     try agents.loadFromStandardPaths(""); // 注入 builtin(含 general-purpose),"" 跳过 project 扫描
 
     const perm = cc.permission.createContext(.bypass_permissions, a);
-    var reg = try cc.agent_job_registry.AgentJobRegistry.init(a, "k", url, "claude-sonnet-4-20250514");
+    var reg = try cc.agent_job_registry.AgentJobRegistry.init(a, "k", url, "claude-sonnet-4-20250514", .anthropic);
     defer reg.deinit(); // abort+join 所有 job —— 也回归 deinit 安全性
 
     const ctx = makeCtx(a, &client, &agents, &perm, &reg);
@@ -129,7 +129,7 @@ test "L2 后台B: TaskOutput running→done 拿到 final_text + stop_reason" {
     try agents.loadFromStandardPaths("");
 
     const perm = cc.permission.createContext(.bypass_permissions, a);
-    var reg = try cc.agent_job_registry.AgentJobRegistry.init(a, "k", url, "claude-sonnet-4-20250514");
+    var reg = try cc.agent_job_registry.AgentJobRegistry.init(a, "k", url, "claude-sonnet-4-20250514", .anthropic);
     defer reg.deinit();
 
     const ctx = makeCtx(a, &client, &agents, &perm, &reg);
@@ -194,7 +194,7 @@ test "L2 后台 registry: deinit 在有 running job 时 abort+join 不崩不泄�
     try agents.loadFromStandardPaths("");
 
     const perm = cc.permission.createContext(.bypass_permissions, a);
-    var reg = try cc.agent_job_registry.AgentJobRegistry.init(a, "k", url, "claude-sonnet-4-20250514");
+    var reg = try cc.agent_job_registry.AgentJobRegistry.init(a, "k", url, "claude-sonnet-4-20250514", .anthropic);
 
     const ctx = makeCtx(a, &client, &agents, &perm, &reg);
     const out = try cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"general-purpose\",\"prompt\":\"hi\",\"run_in_background\":true}");
@@ -223,7 +223,7 @@ test "L2 后台并发: 多 job 各得不同 id 且都可查;MAX_BG_JOBS 上限�
     try agents.loadFromStandardPaths("");
 
     const perm = cc.permission.createContext(.bypass_permissions, a);
-    var reg = try cc.agent_job_registry.AgentJobRegistry.init(a, "k", url, "claude-sonnet-4-20250514");
+    var reg = try cc.agent_job_registry.AgentJobRegistry.init(a, "k", url, "claude-sonnet-4-20250514", .anthropic);
     defer reg.deinit(); // 多 running job 一起 abort+join
 
     const ctx = makeCtx(a, &client, &agents, &perm, &reg);
@@ -284,7 +284,7 @@ test "L2 回归: subagent 单轮多 TaskCreate 不熔断,正常完成(治 tasks=
     try agents.loadFromStandardPaths("");
 
     const perm = cc.permission.createContext(.bypass_permissions, a);
-    var reg = try cc.agent_job_registry.AgentJobRegistry.init(a, "k", url, "claude-sonnet-4-20250514");
+    var reg = try cc.agent_job_registry.AgentJobRegistry.init(a, "k", url, "claude-sonnet-4-20250514", .anthropic);
     defer reg.deinit();
 
     const ctx = makeCtx(a, &client, &agents, &perm, &reg);
@@ -337,7 +337,7 @@ test "L2 接线: subagent 调 TaskCreate 真成功(独立 store 接通,计数=3)
     const perm = cc.permission.createContext(.bypass_permissions, a);
     const empty_defs: []const cc.json_mod.ToolDefinition = &.{};
 
-    const result = try cc.core_subagent.spawnAgent(a, &client, empty_defs, &perm, null, "plan and do", .{ .max_turns = 5 });
+    const result = try cc.core_subagent.spawnAgent(a, client.provider(), &client, empty_defs, &perm, null, "plan and do", .{ .max_turns = 5 });
     defer result.deinit();
 
     // 接线证明:3 个 TaskCreate 全部成功落进 subagent 独立 store。tasks=null 时此值=0。

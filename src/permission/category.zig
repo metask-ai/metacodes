@@ -14,7 +14,9 @@ pub fn getToolCategory(tool_name: []const u8) ToolCategory {
     {
         return .read;
     }
-    if (std.mem.eql(u8, tool_name, "Write") or std.mem.eql(u8, tool_name, "Edit")) {
+    if (std.mem.eql(u8, tool_name, "Write") or std.mem.eql(u8, tool_name, "Edit") or
+        std.mem.eql(u8, tool_name, "ApplyPatch") or std.mem.eql(u8, tool_name, "NotebookEdit"))
+    {
         return .write;
     }
     // KgRemember 是持久写(跨会话 store);plan 模式(只读探索)不该静默放行(M5)。

@@ -148,6 +148,7 @@ test "L2 production path: spawnAgent(model_override=haiku) → 请求体 model �
     const empty_tool_defs: []const cc.json_mod.ToolDefinition = &.{};
     var result = cc.core_subagent.spawnAgent(
         a,
+        client.provider(),
         &client,
         empty_tool_defs,
         &perm_ctx,
@@ -190,7 +191,7 @@ test "L2: spawnAgent(tool_defs_override) → 请求体 tools 收窄" {
     };
 
     var result = cc.core_subagent.spawnAgent(
-        a, &client, empty, &perm_ctx, null, "hi",
+        a, client.provider(), &client, empty, &perm_ctx, null, "hi",
         .{ .max_turns = 2, .tool_defs_override = &override },
     ) catch return error.SkipZigTest;
     defer result.deinit();
@@ -222,7 +223,7 @@ test "L2: spawnAgent(permission_mode_override=plan) 生效" {
     const perm_ctx = cc.permission.PermissionContext{ .mode = .init(.bypass_permissions), .allocator = a };
     const empty: []const cc.json_mod.ToolDefinition = &.{};
     var result = cc.core_subagent.spawnAgent(
-        a, &client, empty, &perm_ctx, null, "hi",
+        a, client.provider(), &client, empty, &perm_ctx, null, "hi",
         .{ .max_turns = 2, .permission_mode_override = .plan },
     ) catch return error.SkipZigTest;
     defer result.deinit();

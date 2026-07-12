@@ -62,6 +62,21 @@ pub fn serializeNotification(
     );
 }
 
+/// 序列化对 server→client 请求的成功响应：`{"jsonrpc","id","result":<result_json>}`。
+pub fn serializeResult(alloc: std.mem.Allocator, id: RequestId, result_json: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{{\"jsonrpc\":\"{s}\",\"id\":{d},\"result\":{s}}}", .{ JSONRPC_VERSION, id, result_json });
+}
+
+/// 序列化错误响应(如 method_not_found)。message 只用 ASCII 简单文本(不转义)。
+pub fn serializeErrorResponse(alloc: std.mem.Allocator, id: RequestId, code: i32, message: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{{\"jsonrpc\":\"{s}\",\"id\":{d},\"error\":{{\"code\":{d},\"message\":\"{s}\"}}}}", .{ JSONRPC_VERSION, id, code, message });
+}
+
+/// 取顶层 "method" 字段字符串值(区分 server→client 请求/通知 vs 响应)。null=无 method=响应。
+pub fn extractMethod(data: []const u8) ?[]const u8 {
+    return extractStringField(data, "method");
+}
+
 /// 解析响应：返回 id + result_json slice（借 data）或 error。
 /// result_json 是响应中 "result" 对应的完整 JSON（含括号/引号），caller 不得释放。
 pub const ParsedResponse = struct {
@@ -154,7 +169,7 @@ pub fn findObjectField(data: []const u8, field: []const u8) ?[]const u8 {
     return null;
 }
 
-fn parseUintField(data: []const u8, field: []const u8) ?u64 {
+pub fn parseUintField(data: []const u8, field: []const u8) ?u64 {
     var buf: [128]u8 = undefined;
     if (field.len > 100) return null;
     buf[0] = '"';
@@ -213,8 +228,11 @@ fn extractStringField(data: []const u8, field: []const u8) ?[]const u8 {
 
 /// 构造 initialize 请求的 params（最小：protocolVersion + capabilities + clientInfo）
 pub fn initializeParams(allocator: std.mem.Allocator) ![]u8 {
+    // 声明 client 支持 elicitation(server 据此才会发 elicitation/create;client.handleServerRequest 应答)。
+    // protocolVersion 用 2025-06-18(elicitation 引入的版本)——与所声明的 elicitation capability 一致
+    // (旧的 2024-11-05 无 elicitation,两者矛盾;server 会协商降级到它支持的版本)。
     return try std.fmt.allocPrint(allocator,
-        \\{{"protocolVersion":"2024-11-05","capabilities":{{}},"clientInfo":{{"name":"cc-zig","version":"0.1.0"}}}}
+        \\{{"protocolVersion":"2025-06-18","capabilities":{{"elicitation":{{}}}},"clientInfo":{{"name":"cc-zig","version":"0.1.0"}}}}
     , .{});
 }
 

@@ -35,17 +35,20 @@ test "L2 compact摘要: 丢老消息 + summary prepend 队首 + 保留最近 N" 
         }
     }.f);
 
-    // 10 条留 3 → 丢 7
+    // P1.5 投影语义:原始消息**不删**,压缩=推进 boundary + 存 summary。
+    // 10 条留 3 → boundary=7(投影掉 7 条),dropped=7。
     try std.testing.expectEqual(@as(usize, 7), dropped);
-    // 队首是 summary(assistant + text 含 "SUMMARY of 7")
-    const head = conv.messages.items[0];
-    try std.testing.expectEqual(cc.types_mod.MessageRole.assistant, head.role);
-    try std.testing.expect(std.mem.indexOf(u8, head.blocks[0].text, "SUMMARY of 7 dropped") != null);
-    // 总数 = 1(summary) + 3(保留) = 4
-    try std.testing.expectEqual(@as(usize, 4), conv.messages.items.len);
-    // 最近的"message number 9"还在
-    const last = conv.messages.items[conv.messages.items.len - 1];
-    try std.testing.expect(std.mem.indexOf(u8, last.blocks[0].text, "message number 9") != null);
+    try std.testing.expectEqual(@as(usize, 7), conv.compact_boundary);
+    // summary 在 compact_summary 字段(不再 insert 进 messages)。
+    try std.testing.expect(conv.compact_summary != null);
+    try std.testing.expect(std.mem.indexOf(u8, conv.compact_summary.?, "SUMMARY of 7 dropped") != null);
+    // 原始 10 条全保留(供 transcript/resume/查看历史)。
+    try std.testing.expectEqual(@as(usize, 10), conv.messages.items.len);
+    // 活跃窗口(投影后发给模型的)= 最近 3 条:message 7,8,9。
+    const active = conv.activeMessages();
+    try std.testing.expectEqual(@as(usize, 3), active.len);
+    try std.testing.expect(std.mem.indexOf(u8, active[0].blocks[0].text, "message number 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, active[active.len - 1].blocks[0].text, "message number 9") != null);
 }
 
 test "L2 compact摘要: summarizer 返 null → 降级纯丢(无 prepend)" {
@@ -63,8 +66,11 @@ test "L2 compact摘要: summarizer 返 null → 降级纯丢(无 prepend)" {
         }
     }.f);
     try std.testing.expectEqual(@as(usize, 6), dropped);
-    // 无 summary prepend → 只剩保留的 2 条
-    try std.testing.expectEqual(@as(usize, 2), conv.messages.items.len);
+    // P1.5 投影降级:boundary 前进但无 summary(summarizer 返 null);原始 8 条全保留,活跃剩 2。
+    try std.testing.expectEqual(@as(usize, 6), conv.compact_boundary);
+    try std.testing.expect(conv.compact_summary == null);
+    try std.testing.expectEqual(@as(usize, 8), conv.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 2), conv.activeMessages().len);
 }
 
 test "L2 compact摘要: 消息少于 keep_n → 不丢不总结" {
@@ -79,4 +85,5 @@ test "L2 compact摘要: 消息少于 keep_n → 不丢不总结" {
     }.f);
     try std.testing.expectEqual(@as(usize, 0), dropped);
     try std.testing.expectEqual(@as(usize, 1), conv.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), conv.compact_boundary); // 未压缩
 }

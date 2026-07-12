@@ -194,9 +194,16 @@ test "L2 AutoCompact: agent_loop recovers from SSE context-window-exceeded befor
     const text = try rec.joinedText(a);
     defer a.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "hello world") != null);
-    try std.testing.expectEqual(@as(usize, 3), conv.len());
-    try std.testing.expectEqualStrings("middle context", conv.messages.items[0].blocks[0].text);
-    try std.testing.expectEqualStrings("current request", conv.messages.items[1].blocks[0].text);
+    // P1.5 纯投影:context 恢复=推进 boundary 投影掉 oldest,**原始永不删**。原始 3 条全保留 +
+    // 恢复后 retry 成功追加 1 条 assistant 回复 → len=4(不是旧破坏性语义的 3)。
+    try std.testing.expectEqual(@as(usize, 4), conv.len());
+    try std.testing.expect(conv.compact_boundary >= 1); // oldest 被投影出发送窗口
+    try std.testing.expectEqualStrings("oldest context", conv.messages.items[0].blocks[0].text); // 原始保留
+    var oldest_in_active = false;
+    for (conv.activeMessages()) |m| {
+        if (m.blocks.len > 0 and std.mem.indexOf(u8, m.blocks[0].text, "oldest") != null) oldest_in_active = true;
+    }
+    try std.testing.expect(!oldest_in_active); // 发送窗口不含 oldest
 }
 
 // M6(还 M4 欠条):传**非 .single** session → emit 端到端带同一个(证路由真透传,

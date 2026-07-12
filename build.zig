@@ -252,6 +252,8 @@ pub fn build(b: *std.Build) void {
         "tests/component/diff_highlight_test.zig",
         "tests/component/prompt_override_test.zig",
         "tests/component/web_ui_test.zig",
+        "tests/component/weak_model_test.zig",
+        "tests/component/task_batch_test.zig",
     };
     for (integ_files) |f| {
         const m = b.createModule(.{
@@ -336,6 +338,8 @@ pub fn build(b: *std.Build) void {
         "tests/component/edit_syntaxcheck_test.zig",
         "tests/component/diff_highlight_test.zig",
         "tests/component/prompt_override_test.zig",
+        "tests/component/weak_model_test.zig",
+        "tests/component/task_batch_test.zig",
     };
     for (new_files) |f| {
         const m = b.createModule(.{

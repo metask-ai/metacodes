@@ -20,7 +20,9 @@
 //! **诚实登记——以下未做(文件头,别假装支持)**:
 //!   - **显式 createCachedContent**:MVP 只实现句柄表机制 + 隐式缓存读命中(cachedContentTokenCount)。
 //!     主动建缓存对象(POST cachedContents)+ 404 重建留 hook(prepareCacheExplicit 签名留,不实现)。
-//!   - **并行 functionCall**:同 OpenAI,只认单个 functionCall/turn(检测多个 warn,不静默丢)。
+//!   - **并行 functionCall(P0.1 已实现)**:一个 chunk 的 parts 多个 functionCall 全部 emit
+//!     (首个返回、其余排队 drain);functionResponse.name 按 tool_use_id 从全量消息找回真实工具名
+//!     配对(Gemini 靠 name 配对)。见 parseChunk functionCall 循环 / serializeGeminiContent。
 //!   - **建连重试 / 非流式 / thinking(thought parts)/ 多模态 inline_data**:未做。
 //!   - **max_tokens/context_window**:硬编码,未按 model 区分(Gemini 1.5 Pro 2M 等)。
 //!
@@ -243,7 +245,10 @@ const GeminiStream = struct {
     done: bool = false,
     last_stop: StopReason = .unknown,
     fc_counter: u32 = 0, // functionCall 计数(Gemini 无 id,自生成 call_N)
-    warned_parallel: bool = false,
+    /// 并行 functionCall 队列(P0.1):一个 Gemini chunk 的 parts 可含多个 functionCall。
+    /// 一次 next() 只能吐一个事件,故首个直接返回、其余排队,后续 next() 逐个 drain。
+    fc_queue: std.ArrayList(StreamEvent) = .empty,
+    fc_pos: usize = 0,
     /// pending usage 槽:Gemini 常把 usageMetadata 与末 content chunk 合并(text+finishReason+usage 同 chunk)。
     /// 一个 chunk 只能 emit 一个 StreamEvent,故先 emit 内容、把 usage 存这里,下次 next() 先吐它。
     /// 不这样做 → usage 在最常见的"内容+usage 同 chunk"路径被静默丢(E 类 bug)。
@@ -268,11 +273,20 @@ const GeminiStream = struct {
         return @as(*GeminiStream, @ptrCast(@alignCast(ctx))).id;
     }
     fn deinit(self: *GeminiStream) void {
+        // 未 drain 的并行 functionCall 事件持 owned id/name/input_json → 释放防泄漏。
+        for (self.fc_queue.items[self.fc_pos..]) |ev| freeToolUseStart(self.allocator, ev);
+        self.fc_queue.deinit(self.allocator);
         self.request.deinit();
         self.allocator.destroy(self.request);
     }
 
     fn next(self: *GeminiStream) anyerror!?StreamEvent {
+        // 并行 functionCall 队列优先 drain(一个 chunk 多个 functionCall 的其余)。
+        if (self.fc_pos < self.fc_queue.items.len) {
+            const ev = self.fc_queue.items[self.fc_pos];
+            self.fc_pos += 1;
+            return ev;
+        }
         // pending usage 优先吐(上一个 chunk 内容+usage 合并时存的)。
         if (self.pending_usage) |u| {
             self.pending_usage = null;
@@ -330,23 +344,36 @@ const GeminiStream = struct {
         }
 
         // functionCall → 中立 tool_use_start。Gemini: parts:[{functionCall:{name,args:{...}}}]
+        // P0.1 并行:一个 chunk 的 parts 可含多个 functionCall,**全部** emit(首个返回、其余排队)。
         if (std.mem.indexOf(u8, data, "\"functionCall\"") != null) {
-            const fc_count = countOccurrences(data, "\"functionCall\"");
-            if (fc_count > 1 and !self.warned_parallel) {
-                self.warned_parallel = true;
-                log.warnId("gemini", self.id, "并行 functionCall 未实现:单 chunk 含多个,仅执行第一个(MVP)", .{});
+            var first_ev: ?StreamEvent = null;
+            // OOM 时释放已建首事件(未入队、未返回)——不留孤儿 owned 分配(Linus #2)。
+            errdefer if (first_ev) |ev| freeToolUseStart(self.allocator, ev);
+            var search: usize = 0;
+            while (std.mem.indexOfPos(u8, data, search, "\"functionCall\":")) |fc_at| {
+                // 取 "functionCall": 后的 {...} 对象(括号配平),拿到对象文本 + 结束偏移。
+                const bo = braceObject(data, fc_at + "\"functionCall\":".len) orelse {
+                    search = fc_at + 1;
+                    continue;
+                };
+                search = bo.end; // 跳过本对象继续找下一个 functionCall
+                const obj = bo.obj;
+                const name = util_json.extractStringField(obj, "name") orelse continue;
+                const args = extractArgsObject(obj) orelse "{}";
+                self.fc_counter += 1;
+                var id_buf: [32]u8 = undefined;
+                const id_str = std.fmt.bufPrint(&id_buf, "call_{d}", .{self.fc_counter}) catch "call_1";
+                // 逐段 dupe + 逐段 errdefer:任一 dupe/append 失败都释放本迭代已 owned 的段(无泄漏)。
+                const id_dup = try self.allocator.dupe(u8, id_str);
+                errdefer self.allocator.free(id_dup);
+                const name_dup = try self.allocator.dupe(u8, name);
+                errdefer self.allocator.free(name_dup);
+                const args_dup = try self.allocator.dupe(u8, args);
+                errdefer self.allocator.free(args_dup);
+                const ev = StreamEvent{ .tool_use_start = .{ .id = id_dup, .name = name_dup, .input_json = args_dup } };
+                if (first_ev == null) first_ev = ev else try self.fc_queue.append(self.allocator, ev);
             }
-            const name = util_json.extractStringField(data, "name") orelse return null;
-            // args:{...} 子对象 → input_json。提取 functionCall.args 的对象文本。
-            const args = extractArgsObject(data) orelse "{}";
-            self.fc_counter += 1;
-            var id_buf: [32]u8 = undefined;
-            const id_str = std.fmt.bufPrint(&id_buf, "call_{d}", .{self.fc_counter}) catch "call_1";
-            return StreamEvent{ .tool_use_start = .{
-                .id = try self.allocator.dupe(u8, id_str),
-                .name = try self.allocator.dupe(u8, name),
-                .input_json = try self.allocator.dupe(u8, args),
-            } };
+            if (first_ev) |ev| return ev;
         }
         // text part → 中立 text。Gemini: parts:[{text:"..."}]
         if (util_json.extractStringField(data, "text")) |text| {
@@ -367,6 +394,42 @@ fn mapGeminiFinish(fr: []const u8) StopReason {
     return .unknown;
 }
 
+/// 释放一个 tool_use_start 事件的 owned 字段(id/name/input_json)。其它变体 no-op。
+fn freeToolUseStart(allocator: std.mem.Allocator, ev: StreamEvent) void {
+    switch (ev) {
+        .tool_use_start => |tu| {
+            allocator.free(tu.id);
+            allocator.free(tu.name);
+            allocator.free(tu.input_json);
+        },
+        else => {},
+    }
+}
+
+/// 从 `from` 起跳空白,取一个 {...} 对象(括号配平,跳字符串)。返回对象文本 + 结束偏移(供续找)。
+fn braceObject(data: []const u8, from: usize) ?struct { obj: []const u8, end: usize } {
+    var i = from;
+    while (i < data.len and (data[i] == ' ' or data[i] == '\t' or data[i] == '\n' or data[i] == '\r')) : (i += 1) {}
+    if (i >= data.len or data[i] != '{') return null;
+    const start = i;
+    var depth: usize = 0;
+    var in_str = false;
+    var esc = false;
+    while (i < data.len) : (i += 1) {
+        const c = data[i];
+        if (in_str) {
+            // 正确的转义状态机(对齐 OpenAI 侧):区分 `\"` 与 `\\"`,否则尾随反斜杠的字符串误闭合。
+            if (esc) esc = false else if (c == '\\') esc = true else if (c == '"') in_str = false;
+            continue;
+        }
+        if (c == '"') in_str = true else if (c == '{') depth += 1 else if (c == '}') {
+            depth -= 1;
+            if (depth == 0) return .{ .obj = data[start .. i + 1], .end = i + 1 };
+        }
+    }
+    return null;
+}
+
 /// 提取 functionCall.args 的对象文本(`"args":{...}` 的 {...} 部分,含嵌套)。null=无。
 /// 简易括号配平(args 值是 JSON 对象);够 MVP 用,复杂嵌套/字符串内含括号未完全鲁棒(诚实登记)。
 fn extractArgsObject(data: []const u8) ?[]const u8 {
@@ -378,10 +441,11 @@ fn extractArgsObject(data: []const u8) ?[]const u8 {
     const start = i;
     var depth: usize = 0;
     var in_str = false;
+    var esc = false;
     while (i < data.len) : (i += 1) {
         const c = data[i];
         if (in_str) {
-            if (c == '"' and data[i - 1] != '\\') in_str = false;
+            if (esc) esc = false else if (c == '\\') esc = true else if (c == '"') in_str = false;
             continue;
         }
         if (c == '"') in_str = true else if (c == '{') depth += 1 else if (c == '}') {
@@ -390,18 +454,6 @@ fn extractArgsObject(data: []const u8) ?[]const u8 {
         }
     }
     return null;
-}
-
-/// 数 needle 在 haystack 中的(非重叠)出现次数(并行 functionCall 检测用)。
-fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
-    if (needle.len == 0) return 0;
-    var n: usize = 0;
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, haystack, i, needle)) |pos| {
-        n += 1;
-        i = pos + needle.len;
-    }
-    return n;
 }
 
 /// prefix 哈希(model + system + tool 名做 FNV-1a)。缓存查表 key——model+system+tools 稳定则哈希稳定。
@@ -461,7 +513,7 @@ pub fn serializeGeminiRequest(allocator: std.mem.Allocator, messages: []const ty
     for (messages) |m| {
         if (!first_msg) try out.append(allocator, ',');
         first_msg = false;
-        try serializeGeminiContent(allocator, &out, m);
+        try serializeGeminiContent(allocator, &out, m, messages);
     }
     try out.append(allocator, ']');
     // tools:[{function_declarations:[...]}]
@@ -479,26 +531,44 @@ pub fn serializeGeminiRequest(allocator: std.mem.Allocator, messages: []const ty
     return out.toOwnedSlice(allocator);
 }
 
-fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8), m: types.ApiMessage) !void {
+/// 从全量消息里按 tool_use_id 找回原 functionCall 的真实 name(Gemini functionResponse 靠 name 配对)。
+/// 找不到 → null(调用方退回用 id 占位)。
+fn findToolUseName(messages: []const types.ApiMessage, id: []const u8) ?[]const u8 {
+    for (messages) |mm| for (mm.content) |c| switch (c) {
+        .tool_use => |tu| if (std.mem.eql(u8, tu.id, id)) return tu.name,
+        else => {},
+    };
+    return null;
+}
+
+fn serializeGeminiContent(allocator: std.mem.Allocator, out: *std.ArrayList(u8), m: types.ApiMessage, all_messages: []const types.ApiMessage) !void {
     // tool_result → user 角色的 functionResponse part(Gemini 特有)。
     var has_tool_result = false;
     for (m.content) |c| if (c == .tool_result) {
         has_tool_result = true;
     };
     if (has_tool_result) {
+        // P0.1 并行:一轮多个 tool_result → **全部**作为同一 user content 的多个 functionResponse
+        // parts(旧版只发首个 → 并行回合下一次请求缺 functionResponse 配对)。
+        // functionResponse.name 必须是**原 functionCall 的真实名**(Gemini 靠 name 配对,非 id);
+        // 从全量消息按 tool_use_id 找回真名,找不到才退回 id 占位。
+        try out.appendSlice(allocator, "{\"role\":\"user\",\"parts\":[");
+        var first_fr = true;
         for (m.content) |c| switch (c) {
             .tool_result => |tr| {
-                // Gemini functionResponse 需 name;tool_use_id 不是 name,但 MVP 用 id 占位
-                // (单工具足够证明;真多工具需把 name 透传——诚实登记简化)。
-                try out.appendSlice(allocator, "{\"role\":\"user\",\"parts\":[{\"functionResponse\":{\"name\":");
-                try util_json.serializeString(tr.tool_use_id, out, allocator);
+                if (!first_fr) try out.append(allocator, ',');
+                first_fr = false;
+                const fname = findToolUseName(all_messages, tr.tool_use_id) orelse tr.tool_use_id;
+                try out.appendSlice(allocator, "{\"functionResponse\":{\"name\":");
+                try util_json.serializeString(fname, out, allocator);
                 try out.appendSlice(allocator, ",\"response\":{\"result\":");
                 try util_json.serializeString(tr.content, out, allocator);
-                try out.appendSlice(allocator, "}}}]}");
-                return;
+                try out.appendSlice(allocator, "}}}");
             },
             else => {},
         };
+        try out.appendSlice(allocator, "]}");
+        return;
     }
     // role:assistant→"model",user→"user"
     const role_str = switch (m.role) {
@@ -589,4 +659,19 @@ test "extractArgsObject 嵌套对象" {
     const data = "{\"functionCall\":{\"name\":\"f\",\"args\":{\"a\":1,\"b\":{\"c\":2}}}}";
     const args = extractArgsObject(data).?;
     try std.testing.expectEqualStrings("{\"a\":1,\"b\":{\"c\":2}}", args);
+}
+
+test "braceObject/extractArgsObject 转义状态机:值尾随转义反斜杠不误闭合(Linus #1)" {
+    // args 值 = "a\\"(JSON 里 a + 一个反斜杠):闭合 `"` 前一字节是 `\`,旧启发式 data[i-1]!='\\'
+    // 会误判成转义引号 → 字符串不闭合 → 括号跑到 EOF → functionCall 被丢/args 变 {}。
+    // 字面量字节:{"functionCall":{"name":"w","args":{"p":"a\\"}}}
+    const chunk = "{\"functionCall\":{\"name\":\"w\",\"args\":{\"p\":\"a\\\\\"}}}";
+    const fc = std.mem.indexOf(u8, chunk, "\"functionCall\":").?;
+    const bo = braceObject(chunk, fc + "\"functionCall\":".len).?;
+    // functionCall 对象完整闭合(含 args 的两层 }),不跑到 EOF。
+    try std.testing.expect(std.mem.endsWith(u8, bo.obj, "}"));
+    try std.testing.expectEqualStrings("w", util_json.extractStringField(bo.obj, "name").?);
+    // args 对象完整提取,尾随反斜杠保留。
+    const args = extractArgsObject(bo.obj).?;
+    try std.testing.expectEqualStrings("{\"p\":\"a\\\\\"}", args);
 }

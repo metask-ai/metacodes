@@ -551,6 +551,17 @@ fn renderResultBody(
     if (std.mem.eql(u8, tool_name, "Edit")) {
         return renderEditDiffImpl(alloc, th, output_text, out, opts, false); // plain=false(diff +/-)
     }
+    if (std.mem.eql(u8, tool_name, "ApplyPatch")) {
+        // 多文件 patch:结果 gitDiff 逐文件拼接。摘要行 A/M/D 计数 + diff 渲染(+/-)。
+        // tree-sitter 高亮仅覆盖首个改动文件(edit_hl_cache 单对);其余按纯 +/- 着色。
+        const a_n = extractJsonNumberField(output_text, "added") orelse 0;
+        const m_n = extractJsonNumberField(output_text, "modified") orelse 0;
+        const d_n = extractJsonNumberField(output_text, "deleted") orelse 0;
+        try out.appendSlice(alloc, "  ");
+        try out.print(alloc, "Applied patch: {d} added, {d} modified, {d} deleted", .{ a_n, m_n, d_n });
+        try out.append(alloc, '\n');
+        return renderEditDiffImpl(alloc, th, output_text, out, opts, false);
+    }
     if (std.mem.eql(u8, tool_name, "NotebookEdit")) {
         // cell 改动有 gitDiff → 摘要行 + diff 渲染(tree-sitter 高亮,lang 从结果取);
         // 无 gitDiff(纯结构改/patch 失败)→ 退回 JSON 摘要。
@@ -1475,6 +1486,24 @@ pub fn actionLabelColon(alloc: std.mem.Allocator, tool_name: []const u8, input: 
 }
 
 /// 极简 JSON 顶层 string 字段提取(unescape 不做,只为预览)。
+/// 提取 `"key":<number>` 的无符号整数值(值不带引号)。找不到/非数字 → null。
+fn extractJsonNumberField(args: []const u8, key: []const u8) ?usize {
+    var pat_buf: [64]u8 = undefined;
+    if (key.len + 4 > pat_buf.len) return null;
+    pat_buf[0] = '"';
+    @memcpy(pat_buf[1..][0..key.len], key);
+    pat_buf[1 + key.len] = '"';
+    pat_buf[2 + key.len] = ':';
+    const pat = pat_buf[0 .. 3 + key.len];
+    const idx = std.mem.indexOf(u8, args, pat) orelse return null;
+    var p = idx + pat.len;
+    while (p < args.len and (args[p] == ' ' or args[p] == '\t')) : (p += 1) {}
+    const start = p;
+    while (p < args.len and args[p] >= '0' and args[p] <= '9') : (p += 1) {}
+    if (p == start) return null;
+    return std.fmt.parseInt(usize, args[start..p], 10) catch null;
+}
+
 fn extractField(args: []const u8, key: []const u8) ?[]const u8 {
     var pat_buf: [64]u8 = undefined;
     if (key.len + 4 > pat_buf.len) return null;

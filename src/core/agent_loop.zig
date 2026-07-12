@@ -13,6 +13,8 @@ const provider_mod = @import("../api/provider.zig");
 const json_mod = @import("../json.zig");
 const tools_mod = @import("../tools.zig");
 const permission_mod = @import("../permission.zig");
+const message_repair_mod = @import("message_repair.zig");
+const hooks_mod = @import("../permission/hooks.zig");
 const msg = @import("message.zig");
 const conversation_mod = @import("conversation.zig");
 const Conversation = conversation_mod.Conversation;
@@ -115,6 +117,30 @@ const ToolErrSig = struct {
 pub const MIN_AUTO_COMPACT_THRESHOLD: usize = 32_000;
 pub const COMPACT_MIN_SAVED_PERCENT: usize = 5;
 
+/// 强制 auto-compact 阈值(测试/power-user 旋钮)。设 `METACODES_FORCE_COMPACT_AT=<tokens>` 后,
+/// **直接**把 auto/micro 阈值钉到该值,绕过 formula(≈window-reserve)和 32K 下限——让真模型 e2e
+/// 能在短对话里触发真实压缩+投影(否则 glm 262K 窗口下要灌 ~200K token 才够)。
+/// 生产默认不设此 env → null → 走正常 formula+floor,行为不变。非法/0/空 → null(坏 env 不改行为)。
+pub fn forcedAutoCompactThreshold() ?usize {
+    const raw = std.c.getenv("METACODES_FORCE_COMPACT_AT") orelse return null;
+    return parseForcedAutoCompactThreshold(std.mem.span(raw));
+}
+
+/// 纯解析(可单测,不碰 env):非法/0/空 → null。
+fn parseForcedAutoCompactThreshold(raw: []const u8) ?usize {
+    const v = std.fmt.parseInt(usize, raw, 10) catch return null;
+    if (v == 0) return null;
+    return v;
+}
+
+/// 强制 keep_recent(测试旋钮):`METACODES_FORCE_COMPACT_KEEP=<n>`。默认 keep_recent=10 需要 >10 条
+/// 消息才有可丢的;调小它让"大的早期消息 + 几轮小追问"就能触发真实 summary 压缩(e2e 用)。
+/// 生产默认不设 → null → 用正常 keep_recent。非法/0/空 → null。
+pub fn forcedAutoCompactKeep() ?usize {
+    const raw = std.c.getenv("METACODES_FORCE_COMPACT_KEEP") orelse return null;
+    return parseForcedAutoCompactThreshold(std.mem.span(raw)); // 同款解析:非法/0/空 → null
+}
+
 /// L3 挂起信息:stop_reason==.suspended 时非空,带出挂起点供调用方落盘 + 恢复。
 /// owned by run() 的 allocator;调用方用后 free(deinit)。
 ///
@@ -210,11 +236,10 @@ pub const Options = struct {
     agent_ident: ?@import("session_id.zig").SessionId = null,
     /// AutoMem memdir 绝对路径(B/C 合并 markdown 自动入图)。
     memdir_abs: []const u8 = "",
-    /// 供 Agent 工具 spawn 子 agent 复用 api_client + tool_defs。
-    /// **职责边界(P1)**:这是工具/subagent **构造** per-call client(initWithBaseUrl/makeClient)用的
-    /// *Client,与 run() 第一参数收的 Provider(已 provider 化的"用 LLM"路径)**不同职责**——Provider
-    /// vtable 是"用",不含构造能力。工具层(web_search 隔离子请求 / Agent spawn)的 provider 化是
-    /// P2/P3 待办;在此之前这里保持 *Client。见 metaknow「多 Provider 分离架构设计」。
+    /// Anthropic 具体 *Client(仅 web_search server tool 用;非 Anthropic provider → null)。
+    /// **职责边界**:P0.5 后 subagent **构造** per-call client 已走 provider_factory.makeProvider
+    /// (provider-neutral),此字段只剩 web_search 这个 Anthropic 专有 server tool 的入口——它必须
+    /// 是 Anthropic 具体 client 才能发 server-tool 请求,故保持 *Client 而非 Provider。
     api_client: ?*@import("../client.zig").Client = null,
     tool_defs: ?[]const @import("../json.zig").ToolDefinition = null,
     /// 本次 run 对应的 agent 嵌套深度（父=0，子=1…）
@@ -581,6 +606,34 @@ pub fn run(
         var tool_uses = std.ArrayList(msg.ToolUse).empty;
         defer tool_uses.deinit(allocator);
 
+        // P0.4 流式预取:纯只读工具(Read/Grep/Glob)在其 tool_use_start 到达时就开线程执行,流末
+        // executeSlots 直接用结果。仅当无 PreToolUse hook(避免 ModifyInput 让预取输入过时)时启用。
+        const sp = @import("stream_prefetch.zig");
+        var prefetch = sp.Prefetch.init(allocator);
+        defer prefetch.deinit();
+        const prefetch_enabled = if (permission_ctx.hooks) |h| !h.hasPre() else true;
+        // 流期权限判定用的无 hook 上下文副本(不 mid-stream 跑 hook 副作用)。
+        var pc_prefetch = permission_ctx.*;
+        pc_prefetch.hooks = null;
+        // 预取用 ToolContext:与主 base_ctx **同源** opts.*(避免行为分叉——dispatch 要能路由 dyn 工具,
+        // read_state/cwd/home/sandbox 与主执行一致)。只读工具不碰的字段留默认无害。
+        var prefetch_ctx = tools_mod.ToolContext{
+            .allocator = allocator,
+            .abort = opts.abort,
+            .read_state = opts.read_state,
+            .cwd_abs = opts.cwd_abs,
+            .home_dir = opts.home_dir,
+            .sandbox = opts.sandbox,
+            .tool_defs = opts.tool_defs,
+            .dyn_registry = opts.dyn_registry,
+            .host_services = opts.host_services,
+            .session_id = opts.session_id,
+            .project_dir = opts.project_dir,
+            .agent_depth = opts.agent_depth,
+            .parent_model = opts.parent_model,
+            .disable_shell_execution = opts.disable_shell_execution,
+        };
+
         request_recovery: while (true) {
             var stream: api_stream.StreamHandle = undefined;
             var api_messages = try buildApiMessages(conversation, allocator, opts.inject_user_context, synthetic_user_input);
@@ -671,7 +724,18 @@ pub fn run(
                         // text bytes 是 stream 分配的 owned——用完必须 free，否则泄漏
                         allocator.free(text);
                     },
-                    .tool_use_start => |tu| {
+                    .tool_use_start => |tu_in| {
+                        var tu = tu_in;
+                        // P0.6 弱模型健壮性:tool input 非法 JSON(markdown 围栏/trailing comma/括号不
+                        // 配平/前置噪声)→ 尽力 salvage,兜底 {}。单一 choke point 覆盖所有 provider。
+                        // tu.input_json 是 owned(stream 转移),修复则 free 旧、换 owned repaired。
+                        if (!message_repair_mod.isValidJson(tu.input_json)) {
+                            if (message_repair_mod.repairToolArgs(allocator, tu.input_json)) |repaired| {
+                                log.warnId("agent", rid, "tool input repaired name={s}: {s} → {s}", .{ tu.name, tu.input_json, repaired });
+                                allocator.free(tu.input_json);
+                                tu.input_json = repaired;
+                            } else |_| {} // repair OOM → 用原始(下游 tool 报错自纠)
+                        }
                         // verbose 的 `[Tool: name]` 行移到 backend(在 tool_start 渲染时打,
                         // 见 TuiBackend/WriterBackend);此处只入队 tool_use。
                         log.infoId("agent", rid, "tool_use queued id={s} name={s} input_bytes={d}", .{ tu.id, tu.name, tu.input_json.len });
@@ -681,6 +745,16 @@ pub fn run(
                             .name = tu.name,
                             .input = tu.input_json,
                         });
+                        // P0.4 流式预取:只读 + 并发安全 + 权限 allow(纯判定不 prompt)→ 立即开线程执行。
+                        // borrow 刚 append 的 tool_uses 里的稳定堆切片(ArrayList 扩容搬结构体不动堆内容)。
+                        const not_aborted = if (opts.abort) |ab| !ab.isAborted() else true;
+                        if (prefetch_enabled and not_aborted and sp.isPrefetchable(tu.name) and
+                            tools_mod.isConcurrencySafeInput(tu.name, tu.input_json) and
+                            permission_mod.checkPermission(&pc_prefetch, tu.name, tu.input_json) == .allow)
+                        {
+                            const last = &tool_uses.items[tool_uses.items.len - 1];
+                            prefetch.start(&prefetch_ctx, last.id, last.name, last.input);
+                        }
                     },
                     .web_search_result => |w| {
                         // 主对话:照打 UI 装饰(⏺ Web Search ...),TUI 字节与旧版一致。
@@ -733,6 +807,9 @@ pub fn run(
             if (aborted_during_stream) {
                 // 保留已流出的 partial assistant text（对齐 TS 原版 `onCancel` 行为）：
                 // 让用户看到已生成的内容；下次用 /retry 能继续。
+                // **先 join 预取线程**:它们 borrow tool_uses 的 id/name/input 字节,必须在下面 free
+                // 之前 join,否则在飞 Read/Grep 读已释放内存(Linus HIGH-1 UAF)。
+                prefetch.joinAll();
                 // tool_uses 累了一半但没收齐 content_block_stop 时可能残缺——弃掉（不 commit）。
                 for (tool_uses.items) |tu| {
                     allocator.free(tu.id);
@@ -764,6 +841,8 @@ pub fn run(
                     assistant_text.items.len == 0 and
                     tool_uses.items.len == 0 and
                     assistant_blocks.items.len == 0;
+                // 先 join 预取线程再释放 tool_uses(它们 borrow 其字节),防 UAF(Linus HIGH-1)。
+                prefetch.joinAll();
                 for (tool_uses.items) |tu| {
                     allocator.free(tu.id);
                     allocator.free(tu.name);
@@ -859,15 +938,44 @@ pub fn run(
         const tool_exec = @import("tool_exec.zig");
         var slots = std.ArrayList(tool_exec.Slot).empty;
         defer slots.deinit(allocator);
+        // P0.2 PreToolUse ModifyInput/Block:hook 在此**统一跑一次**(拿 block + updatedInput 改写);
+        // 为避免 checkPermission 内 decision.check 再跑一次 hook(重复副作用),给它一份 hooks=null 的
+        // 上下文副本。改写后的输入(owned)挂 mod_inputs,turn 作用域统一释放;slot.input 指向它。
+        const hookset: ?*const hooks_mod.HookSet = permission_ctx.hooks;
+        var pc_nohooks = permission_ctx.*;
+        pc_nohooks.hooks = null;
+        var mod_inputs: std.ArrayList([]u8) = .empty;
+        defer {
+            for (mod_inputs.items) |mi| allocator.free(mi);
+            mod_inputs.deinit(allocator);
+        }
         for (last_msg.blocks) |b| {
             const tu = switch (b) {
                 .tool_use => |t| t,
                 else => continue,
             };
             total_tool_calls += 1;
-            const perm_result = permission_mod.checkPermission(permission_ctx, tu.name, tu.input);
+            // PreToolUse hook(有配置才跑):可 block(拒)或 updatedInput(改写工具输入)。
+            var eff_input = tu.input;
+            if (hookset) |hs| if (hs.hasPre()) {
+                const pre = hooks_mod.runPreToolUseFull(hs, allocator, tu.name, tu.input);
+                if (pre.modified_input) |mi| {
+                    mod_inputs.append(allocator, mi) catch allocator.free(mi);
+                    // append 成功才用改写值;失败(OOM)已 free,退回原 input。
+                    if (mod_inputs.items.len > 0 and mod_inputs.items[mod_inputs.items.len - 1].ptr == mi.ptr) eff_input = mi;
+                }
+                if (pre.decision == .block) {
+                    log.warnId("permission", rid, "PreToolUse hook blocked tool={s}", .{tu.name});
+                    var dslot = tool_exec.Slot{ .decision = .denied, .name = tu.name, .id = tu.id, .input = eff_input };
+                    dslot.content = try tool_error.errorToJson("PreToolUseBlocked", "tool '{s}' blocked by PreToolUse hook", .{tu.name}, allocator);
+                    dslot.is_error = true;
+                    try slots.append(allocator, dslot);
+                    continue;
+                }
+            };
+            const perm_result = permission_mod.checkPermission(&pc_nohooks, tu.name, eff_input);
             log.infoId("permission", rid, "tool={s} decision={s}", .{ tu.name, @tagName(perm_result) });
-            var slot = tool_exec.Slot{ .decision = .run, .name = tu.name, .id = tu.id, .input = tu.input };
+            var slot = tool_exec.Slot{ .decision = .run, .name = tu.name, .id = tu.id, .input = eff_input };
             switch (perm_result) {
                 .deny => {
                     log.warnId("permission", rid, "DENY tool={s} input={s}", .{ tu.name, tu.input });
@@ -878,7 +986,7 @@ pub fn run(
                 .ask => {
                     // ctx constCast:promptUser 写 session 记忆(有副作用)。同 plan_mode 分支
                     // 的 @constCast 先例——agent_loop 持 *const 但权限交互本就改 per-session 状态。
-                    const allowed = permission_mod.promptUser(@constCast(permission_ctx), tu.name, tu.input) catch false;
+                    const allowed = permission_mod.promptUser(@constCast(permission_ctx), tu.name, eff_input) catch false;
                     log.infoId("permission", rid, "prompt tool={s} user_allowed={}", .{ tu.name, allowed });
                     if (!allowed) {
                         slot.decision = .denied;
@@ -917,6 +1025,7 @@ pub fn run(
             .kg_projects_dir = opts.kg_projects_dir,
             .memdir_abs = opts.memdir_abs,
             .api_client = opts.api_client,
+            .provider = provider, // P0.5:子 spawn 继承父 provider(跨 provider 正确)
             .tool_defs = opts.tool_defs,
             .agent_depth = opts.agent_depth,
             .dyn_registry = opts.dyn_registry,
@@ -972,6 +1081,16 @@ pub fn run(
             if (s.decision == .run) {
                 emitProgress(backend, sess, turns + 1, s.name, s.input, total_tool_calls);
                 break;
+            }
+        }
+        // P0.4:流式预取命中的 slot 直接填结果(executeSlots 会跳过 prefetched 的,不重复执行)。
+        for (slots.items) |*s| {
+            if (s.decision != .run) continue;
+            if (prefetch.take(s.id)) |pf| {
+                s.content = pf.content;
+                s.is_error = pf.is_error;
+                s.elapsed_ms = pf.elapsed_ms;
+                s.prefetched = true;
             }
         }
         tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
@@ -1055,6 +1174,9 @@ pub fn run(
         var turn_uniform_err = true; // 本轮 error slot 是否全是同一签名
         var turn_any_error = false; // 本轮是否有 error slot
         var turn_any_success = false; // 本轮是否有成功 slot
+        // P0.2 PostToolUse:执行后 hook 产出的 additionalContext,拼成一段注入本轮 user 消息(下轮模型可见)。
+        var post_ctx: std.ArrayList(u8) = .empty;
+        defer post_ctx.deinit(allocator);
         for (slots.items) |*s| {
             const content = s.content orelse try tool_error.errorToJson("InternalError", "tool {s} produced no result", .{s.name}, allocator);
             if (s.is_error) {
@@ -1073,6 +1195,17 @@ pub fn run(
                 .content = content,
                 .is_error = s.is_error,
             } });
+
+            // PostToolUse hook(执行后,仅真跑过的 slot):收集 additionalContext 注入下轮上下文。
+            if (s.decision == .run) {
+                if (hookset) |hs| if (hs.hasPost()) {
+                    if (hooks_mod.runPostToolUse(hs, allocator, s.name, s.input, content)) |ac| {
+                        defer allocator.free(ac);
+                        if (post_ctx.items.len > 0) post_ctx.append(allocator, '\n') catch {};
+                        post_ctx.appendSlice(allocator, ac) catch {};
+                    }
+                };
+            }
 
             // 零增益重复熔断(主防线):同 (name,input) 产出同 result 累计 MAX_ZERO_GAIN_REPEAT 次
             // → 原地打转 → 复用 tool_loop 停。分页(offset 异)= 异 signature 不触发;结果变 →
@@ -1129,6 +1262,12 @@ pub fn run(
         if (result_blocks.items.len == 0) {
             result_blocks.deinit(allocator);
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_error, .turns = turns + 1, .tool_calls = total_tool_calls });
+        }
+
+        // PostToolUse additionalContext → 同一 user 消息追加一个 text block(下轮模型可见)。
+        if (post_ctx.items.len > 0) {
+            const ctx_text = try std.fmt.allocPrint(allocator, "[PostToolUse hook]\n{s}", .{post_ctx.items});
+            try result_blocks.append(allocator, .{ .text = ctx_text });
         }
 
         const blocks_owned = try result_blocks.toOwnedSlice(allocator);
@@ -1261,7 +1400,17 @@ fn buildApiMessages(
         }
     }
 
-    for (conversation.messages.items) |m| {
+    // P1.5 纯投影:压缩摘要作为边界前一条 assistant 消息注入(原始消息仍全量留在 conversation,
+    // 只是不发)。发给模型 = [inject_ctx] + [summary] + activeMessages()。与 totalTokens 投影一致。
+    if (conversation.compact_summary) |summ| {
+        if (summ.len > 0) {
+            const contents = try allocator.alloc(types.ApiContent, 1);
+            contents[0] = .{ .text = summ }; // 借用 conversation 拥有的摘要字节
+            try out.append(allocator, .{ .role = .assistant, .content = contents });
+        }
+    }
+
+    for (conversation.activeMessages()) |m| {
         // thinking block 不回 API(模型自己产);先算实际要回的 block 数
         var n_actual: usize = 0;
         for (m.blocks) |b| {
@@ -1292,6 +1441,9 @@ fn buildApiMessages(
             try out.append(allocator, .{ .role = .user, .content = contents });
         }
     }
+    // P0.6 弱模型健壮性层:发请求前规范化——剥孤儿 tool_result + 补缺失结果 + 合并连续同角色。
+    // 维持 content 数组 owned / block 借用的内存契约(见 message_repair 顶注)。
+    try @import("message_repair.zig").normalizeApiMessages(allocator, &out);
     return out;
 }
 
@@ -1408,17 +1560,19 @@ fn recoverContextWindowExceeded(
     // 实录 2026-07-06 fix4.log:dropped=1 before=203081 after=415469)。
     conversation.invalidateUsageAnchor();
     const before_tokens = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
-    const before_len = conversation.len();
+    // 投影:removeOldest 推进 boundary(原始不删),收缩的是活跃窗口 → 遥测用活跃计数,否则 N->N。
+    const before_active = conversation.activeMessages().len;
     const dropped = conversation.removeOldestForContextRecovery();
     if (dropped == 0) {
-        log.err("agent", "context-window recovery impossible turn={d} msgs={d}", .{ turn_number, conversation.len() });
+        log.err("agent", "context-window recovery impossible turn={d} active_msgs={d}", .{ turn_number, conversation.activeMessages().len });
         return false;
     }
     const after_tokens = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
-    log.warn("agent", "context-window recovery: dropped={d} msgs={d}->{d} before_tokens={d} after_tokens={d} attempt={d}", .{ dropped, before_len, conversation.len(), before_tokens, after_tokens, attempts.* });
+    const kept_active = conversation.activeMessages().len;
+    log.warn("agent", "context-window recovery: dropped={d} active_msgs={d}->{d} before_tokens={d} after_tokens={d} attempt={d}", .{ dropped, before_active, kept_active, before_tokens, after_tokens, attempts.* });
     backend.emitEvent(sess, .{ .auto_compact = .{
         .dropped = @as(u32, @intCast(dropped)),
-        .kept = @as(u32, @intCast(conversation.len())),
+        .kept = @as(u32, @intCast(kept_active)),
         .before_tokens = @intCast(before_tokens),
         .after_tokens = @intCast(after_tokens),
         .cause = "context_window_exceeded_recovery",
@@ -1455,8 +1609,13 @@ fn runAutoCompactIfNeeded(
     var request_tokens_before = estimateNextRequestTokensOrFallback(allocator, provider, conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
     var pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), configured_threshold, request_tokens_before);
     emitContextWarningIfNeeded(backend, sess, pressure, context_warning_emitted);
-    const auto_threshold: usize = @max(pressure.auto_compact_threshold, MIN_AUTO_COMPACT_THRESHOLD);
-    const micro_threshold = @max(@min(pressure.warning_threshold, auto_threshold), MIN_AUTO_COMPACT_THRESHOLD);
+    // 正常:auto=max(formula, 32K floor);micro=其下一档。强制旋钮(仅测试/power-user)存在时,
+    // auto/micro 一起钉到强制值——让短对话也能触发真实 summary 压缩+投影。一次 getenv,不在热路径重复读。
+    const forced_threshold = forcedAutoCompactThreshold();
+    const auto_threshold: usize = forced_threshold orelse
+        @max(pressure.auto_compact_threshold, MIN_AUTO_COMPACT_THRESHOLD);
+    const micro_threshold = forced_threshold orelse
+        @max(@min(pressure.warning_threshold, auto_threshold), MIN_AUTO_COMPACT_THRESHOLD);
     if (request_tokens_before > micro_threshold and request_tokens_before <= auto_threshold) {
         const reduced = conversation.microcompactToolResultsByRecentResults(conversation_mod.DEFAULT_RECENT_TOOL_RESULTS_TO_KEEP);
         if (reduced.changed()) {
@@ -1471,19 +1630,20 @@ fn runAutoCompactIfNeeded(
         const compact_summary = @import("compact_summary.zig");
         const SummCtx = struct { provider: provider_mod.Provider, alloc: std.mem.Allocator, model_override: ?[]const u8, task_anchor: ?[]const u8 };
         const summary_model = compact_model_override orelse model_override;
+        const eff_keep_recent = forcedAutoCompactKeep() orelse keep_recent;
         // 任务锚:进行中的任务确定性追加到摘要尾(压缩有损,闭环纪律硬保底)。
         const task_anchor: ?[]u8 = if (tasks) |ts| compact_summary.buildTaskAnchor(allocator, ts) else null;
         defer if (task_anchor) |a| allocator.free(a);
-        var preview = try conversation.cloneForCompactPreview(allocator, keep_recent);
+        var preview = try conversation.cloneForCompactPreview(allocator, eff_keep_recent);
         defer preview.deinit();
         const before_len = preview.conversation.len();
-        const report = preview.conversation.compactWithSummaryReport(keep_recent, SummCtx{ .provider = provider, .alloc = allocator, .model_override = summary_model, .task_anchor = task_anchor }, struct {
+        const report = preview.conversation.compactWithSummaryReport(eff_keep_recent, SummCtx{ .provider = provider, .alloc = allocator, .model_override = summary_model, .task_anchor = task_anchor }, struct {
             fn f(c: SummCtx, drop_msgs: []const msg.Message) ?[]u8 {
                 const summary = compact_summary.summarizeWithModel(c.alloc, c.provider, drop_msgs, c.model_override) orelse return null;
                 return compact_summary.appendTaskAnchor(c.alloc, summary, c.task_anchor);
             }
         }.f) catch Conversation.CompactReport{
-            .dropped = preview.conversation.compactKeepRecent(keep_recent),
+            .dropped = preview.conversation.compactKeepRecent(eff_keep_recent),
             .summary_used = false,
         };
         if (report.dropped > 0) {
@@ -1506,10 +1666,12 @@ fn runAutoCompactIfNeeded(
                     log.warn("agent", "auto-compact aborted: conversation suffix changed during summary generation cause={s}", .{trigger_cause});
                     return .api_error;
                 }
-                log.info("agent", "auto-compact: dropped {d} old messages ({d} -> {d}) threshold={d} before_tokens={d} after_tokens={d} saved_percent={d} cause={s}", .{ report.dropped, before_len, conversation.len(), auto_threshold, request_tokens_before, request_tokens_after, saved_percent, cause });
+                // 投影:len() 不变(原始不删),真正收缩的是活跃窗口——日志/事件的"after/kept"用活跃计数。
+                const kept_active = conversation.activeMessages().len;
+                log.info("agent", "auto-compact: dropped {d} old messages (active {d} -> {d}) threshold={d} before_tokens={d} after_tokens={d} saved_percent={d} cause={s}", .{ report.dropped, before_len, kept_active, auto_threshold, request_tokens_before, request_tokens_after, saved_percent, cause });
                 backend.emitEvent(sess, .{ .auto_compact = .{
                     .dropped = @as(u32, @intCast(report.dropped)),
-                    .kept = @as(u32, @intCast(conversation.len())),
+                    .kept = @as(u32, @intCast(kept_active)),
                     .before_tokens = @intCast(request_tokens_before),
                     .after_tokens = @intCast(request_tokens_after),
                     .cause = cause,
@@ -1759,11 +1921,13 @@ test "buildApiMessages appends one-shot synthetic user input without mutating co
     defer freeApiMessages(&api, a);
 
     try std.testing.expectEqual(@as(usize, 1), c.len());
-    try std.testing.expectEqual(@as(usize, 2), api.items.len);
+    // P0.6 normalizeApiMessages 合并相邻同角色:real user + synthetic 都是 user →
+    // 合成 1 条 user 消息(2 个 text block),满足 OpenAI/Gemini 严格角色交替。conversation 不被改动。
+    try std.testing.expectEqual(@as(usize, 1), api.items.len);
     try std.testing.expect(api.items[0].role == .user);
+    try std.testing.expectEqual(@as(usize, 2), api.items[0].content.len);
     try std.testing.expectEqualStrings("real user", api.items[0].content[0].text);
-    try std.testing.expect(api.items[1].role == .user);
-    try std.testing.expectEqualStrings("synthetic steering", api.items[1].content[0].text);
+    try std.testing.expectEqualStrings("synthetic steering", api.items[0].content[1].text);
 }
 
 const TestProviderState = struct {
@@ -1976,6 +2140,15 @@ test "auto-compact preflight truncates huge recent tool_result before next reque
     defer c.deinit();
     try c.appendText(.user, "inspect large output");
 
+    // 配对的 tool_use:否则 tool_result 是孤儿,P0.6 normalizeApiMessages 会剥掉它 → 巨内容不进估算。
+    const tu_blocks = try a.alloc(msg.Block, 1);
+    tu_blocks[0] = .{ .tool_use = .{
+        .id = try a.dupe(u8, "toolu_huge"),
+        .name = try a.dupe(u8, "Read"),
+        .input = try a.dupe(u8, "{}"),
+    } };
+    try c.append(.{ .role = .assistant, .blocks = tu_blocks });
+
     const limit = conversation_mod.toolResultContextBytes(200_000);
     const blocks = try a.alloc(msg.Block, 1);
     const huge = try a.alloc(u8, limit * 4);
@@ -2071,7 +2244,7 @@ test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool s
     var cap = Capture{};
     const backend = UiBackend{ .ctx = @ptrCast(&cap), .emit = Capture.emit, .poll = Capture.poll };
 
-    const before_len = c.len();
+    const before_active = c.activeMessages().len;
     const outcome = try runAutoCompactIfNeeded(
         &c,
         provider,
@@ -2093,10 +2266,13 @@ test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool s
 
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
     try std.testing.expect(cap.dropped > 0);
-    try std.testing.expect(c.len() < before_len);
+    // 投影:原始消息全量保留(len 不变),收缩的是活跃窗口。
+    const active = c.activeMessages();
+    try std.testing.expect(active.len < before_active);
     try std.testing.expectEqualStrings("post_tool_follow_up_threshold", cap.cause.?);
-    try std.testing.expect(c.messages.items[c.messages.items.len - 2].blocks[0] == .tool_use);
-    try std.testing.expect(c.messages.items[c.messages.items.len - 1].blocks[0] == .tool_result);
+    // 保住工具后缀:活跃窗口末尾仍是配对的 tool_use / tool_result(不留孤儿)。
+    try std.testing.expect(active[active.len - 2].blocks[0] == .tool_use);
+    try std.testing.expect(active[active.len - 1].blocks[0] == .tool_result);
 }
 
 test "auto-compact summary carries in_progress task anchor through compaction" {
@@ -2154,22 +2330,14 @@ test "auto-compact summary carries in_progress task anchor through compaction" {
     );
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
 
-    // 摘要消息里必须带确定性任务锚(进行中任务 + 闭合指引),completed 不进锚。
-    var found_anchor = false;
-    var found_completed = false;
-    for (c.messages.items) |m| {
-        for (m.blocks) |b| switch (b) {
-            .text => |t| {
-                if (std.mem.indexOf(u8, t, "compact 任务锚") != null and
-                    std.mem.indexOf(u8, t, "kg-42 修复解析器") != null and
-                    std.mem.indexOf(u8, t, "small summary") != null) found_anchor = true;
-                if (std.mem.indexOf(u8, t, "kg-43") != null) found_completed = true;
-            },
-            else => {},
-        };
-    }
-    try std.testing.expect(found_anchor);
-    try std.testing.expect(!found_completed);
+    // 投影:摘要存在 compact_summary(投影时作边界前一条 assistant 消息注入),不在 messages.items。
+    // 里面必须带确定性任务锚(进行中任务 + 闭合指引),completed 不进锚。
+    try std.testing.expect(c.compact_summary != null);
+    const summ = c.compact_summary.?;
+    try std.testing.expect(std.mem.indexOf(u8, summ, "compact 任务锚") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summ, "kg-42 修复解析器") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summ, "small summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, summ, "kg-43") == null); // completed 不进锚
 }
 
 test "previous-model compact uses old model override before smaller-window sampling" {
@@ -2354,9 +2522,15 @@ test "stream context-window recovery retries before assistant payload" {
     try std.testing.expectEqual(@as(u32, 2), fp.sends);
     try std.testing.expectEqual(@as(u32, 1), cap.auto_compacts);
     try std.testing.expectEqualStrings("ok", cap.text.items);
-    try std.testing.expectEqual(@as(usize, 3), c.len());
-    try std.testing.expectEqualStrings("middle context", c.messages.items[0].blocks[0].text);
-    try std.testing.expectEqualStrings("current request", c.messages.items[1].blocks[0].text);
+    // 投影:context-window recovery 推进 boundary 丢 "oldest context",不删原始。
+    // 全量 = [oldest, middle, current, ok(assistant 回复)];活跃窗口从 middle 起。
+    try std.testing.expectEqual(@as(usize, 4), c.len());
+    try std.testing.expectEqual(@as(usize, 1), c.activeStart());
+    const active = c.activeMessages();
+    try std.testing.expectEqualStrings("middle context", active[0].blocks[0].text);
+    try std.testing.expectEqualStrings("current request", active[1].blocks[0].text);
+    // 被投影掉的 oldest 仍原样保留在头部(供 transcript/resume)。
+    try std.testing.expectEqualStrings("oldest context", c.messages.items[0].blocks[0].text);
 }
 
 test "ZeroGainTracker:同 sig 同 result 达 MAX 打转;分页/结果变化不误触发" {
@@ -2453,6 +2627,15 @@ test "auto-compact preflight keeps serialized request valid UTF-8 after multibyt
         try payload.appendSlice(a, "路径/中文/🙂/");
     }
 
+    // 配对 tool_use:否则 tool_result 是孤儿,normalizeApiMessages 会剥掉 → body 里就没有它。
+    const tu_blocks = try a.alloc(msg.Block, 1);
+    tu_blocks[0] = .{ .tool_use = .{
+        .id = try a.dupe(u8, "toolu_utf8"),
+        .name = try a.dupe(u8, "Read"),
+        .input = try a.dupe(u8, "{}"),
+    } };
+    try c.append(.{ .role = .assistant, .blocks = tu_blocks });
+
     const blocks = try a.alloc(msg.Block, 1);
     blocks[0] = .{ .tool_result = .{
         .tool_use_id = try a.dupe(u8, "toolu_utf8"),
@@ -2463,7 +2646,7 @@ test "auto-compact preflight keeps serialized request valid UTF-8 after multibyt
 
     const reduced = c.truncateLargeToolResults(limit);
     try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
-    try std.testing.expect(std.unicode.utf8ValidateSlice(c.messages.items[0].blocks[0].tool_result.content));
+    try std.testing.expect(std.unicode.utf8ValidateSlice(c.messages.items[1].blocks[0].tool_result.content));
 
     var state = TestProviderState{};
     const provider = testProvider(&state);
@@ -2523,4 +2706,14 @@ test "auto-compact 阈值用 input context window 而非 output max_tokens(防�
     // 全额输出预留(服务端校验 in+max_tokens ≤ window):200K-32K-13K = 155K。
     try std.testing.expectEqual(@as(usize, 155_000), context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 0).auto_compact_threshold);
     try std.testing.expect(MIN_AUTO_COMPACT_THRESHOLD >= 32_000);
+}
+
+test "parseForcedAutoCompactThreshold: 合法强制值 + 坏值回退 null" {
+    // 合法:e2e 用它在短对话直接钉低阈值触发真实压缩+投影。
+    try std.testing.expectEqual(@as(?usize, 3000), parseForcedAutoCompactThreshold("3000"));
+    // 空 / 0 / 非法 → null(坏 env 绝不改压缩行为)。
+    try std.testing.expectEqual(@as(?usize, null), parseForcedAutoCompactThreshold(""));
+    try std.testing.expectEqual(@as(?usize, null), parseForcedAutoCompactThreshold("0"));
+    try std.testing.expectEqual(@as(?usize, null), parseForcedAutoCompactThreshold("garbage"));
+    // 无 env 时 getenv 返回 null → 走正常 formula+floor(wiring 由真模型 e2e 验证)。
 }

@@ -4,6 +4,8 @@ const json = @import("json.zig");
 const read_tool = @import("tools/read.zig");
 const write_tool = @import("tools/write.zig");
 const edit_tool = @import("tools/edit.zig");
+const apply_patch_tool = @import("tools/apply_patch.zig");
+const task_batch_tool = @import("tools/task_batch.zig");
 const glob_tool = @import("tools/glob.zig");
 const bash_tool = @import("tools/bash.zig");
 const grep_tool = @import("tools/grep.zig");
@@ -96,6 +98,14 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "replace_all", .type = "boolean", .description = "Replace all occurrences of old_string (default false)" },
         }, .required = &.{ "file_path", "old_string", "new_string" } },
         .execute = edit_tool.execute,
+    },
+    .{
+        .name = "ApplyPatch",
+        .description = "Apply a codex-style patch envelope to add/delete/update/rename one or more files in a single call. The patch format uses '*** Begin Patch' / '*** End Patch' with '*** Add File:', '*** Delete File:', '*** Update File:' (and optional '*** Move to:') sections; update hunks use '@@' context markers plus ' '/'-'/'+' lines (no line numbers — context is located fuzzily). Transactional: if any hunk fails to apply, no files are written.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "patch", .type = "string", .description = "The full patch text, from '*** Begin Patch' to '*** End Patch'." },
+        }, .required = &.{"patch"} },
+        .execute = apply_patch_tool.execute,
     },
     .{
         .name = "Glob",
@@ -431,6 +441,17 @@ pub const registry: []const ToolEntry = &.{
         .execute = agent_tool.execute,
     },
     .{
+        .name = "TaskBatch",
+        .description = "Fan out a batch of subagents in parallel: one subagent per item, each running the same prompt template with the item's fields substituted. Use `{field}` placeholders in prompt_template (e.g. \"Review the file {path} for {concern}\") and pass items as an array of objects. Prefer this over emitting many individual Task calls when running the SAME task over a list of inputs — it guarantees parallel fan-out, avoids repeating the prompt, and returns aggregated results. Runs up to 8 concurrently; max 32 items. Results are returned inline (not persisted); for long-running detached work use Task with run_in_background.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "prompt_template", .type = "string", .description = "Prompt with {field} placeholders substituted per item. {{ }} are literal braces." },
+            .{ .name = "items", .type = "array", .description = "Array of objects; each spawns one subagent with the template filled from its fields." },
+            .{ .name = "subagent_type", .type = "string", .description = "Agent type for all items (Explore/Plan/general-purpose/custom); defaults to general-purpose" },
+            .{ .name = "max_turns", .type = "integer", .description = "Max agent loop turns per subagent (default 20)" },
+        }, .required = &.{ "prompt_template", "items" } },
+        .execute = task_batch_tool.execute,
+    },
+    .{
         // 兼容别名:某些上下文可能用 "Agent"。路由到同一 execute。主工具 name 是 "Task"
         // (SFT 锚点)。
         .name = "Agent",
@@ -706,7 +727,8 @@ fn jsonValueKind(args: []const u8, key: []const u8) ?JsonKind {
 }
 
 /// 统一派发：先查静态注册表，未命中查 ctx.dyn_registry。
-/// 找不到返 error.UnknownTool —— 由 agent_loop 转 tool_error 给模型。
+/// 找不到时先做 P0.6 弱模型工具名修复(归一化 + 模糊匹配),命中则改派到真工具;仍找不到
+/// 返 error.UnknownTool —— 由 agent_loop 转 tool_error 给模型。
 pub fn dispatch(ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror![]u8 {
     if (getTool(name)) |t| {
         try validateRequired(name, args); // schema 层:缺 required 字段 → 早拦
@@ -716,7 +738,180 @@ pub fn dispatch(ctx: *const ToolContext, name: []const u8, args: []const u8) any
     if (ctx.dyn_registry) |dr| {
         if (dr.find(name)) |de| return de.execute(ctx, args, de.ctx_ptr);
     }
+    // P0.6:弱模型幻觉工具名修复。**只**用确定性无损归一化(大小写/`-`/空格/CamelCase→snake/剥
+    // `_tool` 尾缀)自动改派——这些是安全的等价变换。**不**用模糊编辑距离自动执行(那会把 "Wrote"
+    // 静默路由到 Write 真跑,用更坏的错误替换诚实的 UnknownTool)。模糊匹配只在错误里当"你是不是
+    // 想调 X?"的建议(见 tool_exec.zig 的 suggestToolName),由模型确认后自纠。
+    if (resolveToolNameExact(ctx, name)) |repaired| {
+        if (!std.mem.eql(u8, repaired, name)) {
+            @import("util/log.zig").warn("tool", "工具名归一化: '{s}' → '{s}'", .{ name, repaired });
+            if (getTool(repaired)) |t| {
+                try validateRequired(repaired, args);
+                try validateTypes(repaired, args);
+                return t.execute(ctx, args);
+            }
+            if (ctx.dyn_registry) |dr| {
+                if (dr.find(repaired)) |de| return de.execute(ctx, args, de.ctx_ptr);
+            }
+        }
+    }
     return error.UnknownTool;
+}
+
+/// 逗号分隔的所有真实工具名(静态 + dyn),供 UnknownTool 错误引导模型。caller free。
+pub fn availableToolNames(ctx: *const ToolContext, allocator: std.mem.Allocator) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var it = ToolNameIter.init(ctx);
+    var first = true;
+    while (it.next()) |nm| {
+        if (!first) try out.appendSlice(allocator, ", ");
+        try out.appendSlice(allocator, nm);
+        first = false;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// 确定性工具名归一化解析:把大小写/分隔符/CamelCase/`_tool` 尾缀走样的名字解析回真工具名。
+/// **只做无损等价变换**——归一化后精确相等才算命中,绝不做模糊猜测(那是 suggestToolName 的活)。
+/// 返回借用的真工具名(dispatch 作用域内有效),无精确匹配 → null。安全到可以自动改派执行。
+pub fn resolveToolNameExact(ctx: *const ToolContext, name: []const u8) ?[]const u8 {
+    if (name.len == 0) return null;
+    var buf: [128]u8 = undefined;
+    const norm = normalizeToolName(&buf, name) orelse return null;
+    var it = ToolNameIter.init(ctx);
+    while (it.next()) |real| {
+        var rbuf: [128]u8 = undefined;
+        if (normalizeToolName(&rbuf, real)) |rnorm| {
+            if (std.mem.eql(u8, norm, rnorm) or normEqualsStripTool(norm, rnorm)) return real;
+        }
+    }
+    return null;
+}
+
+/// 模糊建议:归一化解析不中时,用编辑距离相似度(≥0.7,对齐 hermes difflib cutoff)找最接近的真
+/// 工具名——**仅供 UnknownTool 错误的"你是不是想调 X?"提示**,绝不自动执行(防把 "Wrote" 静默
+/// 路由到 Write 真跑)。返回借用真工具名或 null。
+pub fn suggestToolName(ctx: *const ToolContext, name: []const u8) ?[]const u8 {
+    if (name.len == 0) return null;
+    var best: ?[]const u8 = null;
+    var best_score: f32 = 0.7;
+    var it = ToolNameIter.init(ctx);
+    while (it.next()) |real| {
+        const score = similarity(name, real);
+        if (score > best_score) {
+            best_score = score;
+            best = real;
+        }
+    }
+    return best;
+}
+
+/// 归一化:小写 + `-`/空格→`_` + CamelCase 边界插 `_`。写入 buf,返回 slice;超长返 null。
+fn normalizeToolName(buf: []u8, name: []const u8) ?[]const u8 {
+    var n: usize = 0;
+    for (name, 0..) |c, i| {
+        if (c >= 'A' and c <= 'Z') {
+            // CamelCase 边界 = **lower→Upper** 或 **digit→Upper** 过渡才插 `_`(用原文前一字符判定)。
+            // 连续大写(缩写 "READ"/"HTML")不插——否则 "READ"→"r_e_a_d" 匹配不上 "read"。
+            const prev = if (i > 0) name[i - 1] else 0;
+            const boundary = (prev >= 'a' and prev <= 'z') or (prev >= '0' and prev <= '9');
+            if (boundary and n > 0 and buf[n - 1] != '_') {
+                if (n >= buf.len) return null;
+                buf[n] = '_';
+                n += 1;
+            }
+            if (n >= buf.len) return null;
+            buf[n] = c - 'A' + 'a';
+            n += 1;
+        } else if (c == '-' or c == ' ') {
+            if (n >= buf.len) return null;
+            buf[n] = '_';
+            n += 1;
+        } else {
+            if (n >= buf.len) return null;
+            buf[n] = c;
+            n += 1;
+        }
+    }
+    return buf[0..n];
+}
+
+/// 剥掉 `_tool` 尾缀(≤2 次)后比较是否相等(a 或 b 任一剥后等于另一)。
+fn normEqualsStripTool(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, stripToolSuffix(a), stripToolSuffix(b));
+}
+
+fn stripToolSuffix(s: []const u8) []const u8 {
+    var cur = s;
+    var rounds: u8 = 0;
+    while (rounds < 2) : (rounds += 1) {
+        if (std.mem.endsWith(u8, cur, "_tool")) {
+            cur = cur[0 .. cur.len - 5];
+        } else if (std.mem.endsWith(u8, cur, "tool") and cur.len > 4) {
+            cur = cur[0 .. cur.len - 4];
+        } else break;
+    }
+    return cur;
+}
+
+/// 遍历所有真实工具名(静态 registry + dyn_registry)。
+const ToolNameIter = struct {
+    ctx: *const ToolContext,
+    static_idx: usize = 0,
+    dyn_idx: usize = 0,
+
+    fn init(ctx: *const ToolContext) ToolNameIter {
+        return .{ .ctx = ctx };
+    }
+    fn next(self: *ToolNameIter) ?[]const u8 {
+        if (self.static_idx < registry.len) {
+            const nm = registry[self.static_idx].name;
+            self.static_idx += 1;
+            return nm;
+        }
+        if (self.ctx.dyn_registry) |dr| {
+            if (self.dyn_idx < dr.entries.items.len) {
+                const nm = dr.entries.items[self.dyn_idx].name;
+                self.dyn_idx += 1;
+                return nm;
+            }
+        }
+        return null;
+    }
+};
+
+/// 大小写无关的相似度 [0,1]:1 - 归一化 Levenshtein 距离。对短工具名足够(hermes 用 difflib
+/// SequenceMatcher,量级近似)。用栈上定长 DP 行(工具名 < 64)。
+fn similarity(a: []const u8, b: []const u8) f32 {
+    var abuf: [64]u8 = undefined;
+    var bbuf: [64]u8 = undefined;
+    if (a.len >= abuf.len or b.len >= bbuf.len) return 0;
+    for (a, 0..) |c, i| abuf[i] = std.ascii.toLower(c);
+    for (b, 0..) |c, i| bbuf[i] = std.ascii.toLower(c);
+    const la = a.len;
+    const lb = b.len;
+    if (la == 0 and lb == 0) return 1;
+    var prev: [65]usize = undefined;
+    var curr: [65]usize = undefined;
+    var j: usize = 0;
+    while (j <= lb) : (j += 1) prev[j] = j;
+    var i: usize = 1;
+    while (i <= la) : (i += 1) {
+        curr[0] = i;
+        j = 1;
+        while (j <= lb) : (j += 1) {
+            const cost: usize = if (abuf[i - 1] == bbuf[j - 1]) 0 else 1;
+            const del = prev[j] + 1;
+            const ins = curr[j - 1] + 1;
+            const sub = prev[j - 1] + cost;
+            curr[j] = @min(del, @min(ins, sub));
+        }
+        @memcpy(prev[0 .. lb + 1], curr[0 .. lb + 1]);
+    }
+    const dist: f32 = @floatFromInt(prev[lb]);
+    const maxlen: f32 = @floatFromInt(@max(la, lb));
+    return 1.0 - dist / maxlen;
 }
 
 /// 工具是否可与同批工具并发执行(对齐 cc isConcurrencySafe)。
@@ -925,6 +1120,57 @@ test "dispatch falls back to dyn_registry" {
 test "dispatch returns UnknownTool when missing everywhere" {
     var ctx = ToolContext.simple(std.testing.allocator);
     try std.testing.expectError(error.UnknownTool, dispatch(&ctx, "NoSuchTool", "{}"));
+}
+
+test "resolveToolNameExact: 大小写/分隔归一化命中真工具" {
+    var ctx = ToolContext.simple(std.testing.allocator);
+    // 小写、全大写、连字符/空格 → 归一化命中(无损等价变换)。
+    try std.testing.expectEqualStrings("Read", resolveToolNameExact(&ctx, "read").?);
+    try std.testing.expectEqualStrings("Read", resolveToolNameExact(&ctx, "READ").?);
+    try std.testing.expectEqualStrings("Grep", resolveToolNameExact(&ctx, "grep").?);
+    try std.testing.expectEqualStrings("Bash", resolveToolNameExact(&ctx, "bash").?);
+}
+
+test "resolveToolNameExact: 剥 _tool 尾缀" {
+    var ctx = ToolContext.simple(std.testing.allocator);
+    // "bash_tool"/"BashTool" 归一 → "bash_tool" 剥尾 → "bash" == "Bash" 归一。
+    try std.testing.expectEqualStrings("Bash", resolveToolNameExact(&ctx, "bash_tool").?);
+    try std.testing.expectEqualStrings("Bash", resolveToolNameExact(&ctx, "BashTool").?);
+}
+
+test "resolveToolNameExact: 模糊近似**不**自动命中(只归一化,不猜测)" {
+    var ctx = ToolContext.simple(std.testing.allocator);
+    // "Red" 归一后 ≠ 任何真工具归一名 → exact 返 null(不会静默路由到 Read)。
+    try std.testing.expect(resolveToolNameExact(&ctx, "Red") == null);
+    try std.testing.expect(resolveToolNameExact(&ctx, "xyzzy_frobnicate") == null);
+    try std.testing.expect(resolveToolNameExact(&ctx, "") == null);
+}
+
+test "suggestToolName: 模糊近似作建议(≥0.7),差太远返 null" {
+    var ctx = ToolContext.simple(std.testing.allocator);
+    // "Red" → 建议 "Read"(编辑距离 1/4 = 0.75 ≥ 0.7),但仅供错误提示,不执行。
+    try std.testing.expectEqualStrings("Read", suggestToolName(&ctx, "Red").?);
+    try std.testing.expect(suggestToolName(&ctx, "xyzzy_frobnicate") == null);
+    try std.testing.expect(suggestToolName(&ctx, "") == null);
+}
+
+test "dispatch: 确定性归一化幻觉名改派到真工具(端到端)" {
+    // "grep"(大小写幻觉,归一化无损)→ resolveToolNameExact → "Grep" → 真执行。Grep 缺 pattern
+    // 会返错,但**不是 UnknownTool**——证明改派发生了(名字被归一化,进了 Grep 的执行/校验)。
+    var ctx = ToolContext.simple(std.testing.allocator);
+    ctx.cwd_abs = ".";
+    const err = dispatch(&ctx, "grep", "{}");
+    if (err) |r| {
+        std.testing.allocator.free(r);
+    } else |e| {
+        try std.testing.expect(e != error.UnknownTool);
+    }
+}
+
+test "dispatch: 模糊近似名**不**自动执行,仍 UnknownTool(诚实报错留给模型自纠)" {
+    // "Wrote"(≈Write,0.8)→ resolveToolNameExact 不中 → UnknownTool(不静默路由到 Write 真跑)。
+    var ctx = ToolContext.simple(std.testing.allocator);
+    try std.testing.expectError(error.UnknownTool, dispatch(&ctx, "Wrote", "{}"));
 }
 
 test {

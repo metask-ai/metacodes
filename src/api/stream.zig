@@ -964,17 +964,17 @@ pub const EventIterator = struct {
                 .content_block_stop => {
                     // 若有 pending tool，这就是 emit 时机
                     if (self.pending_tool) |*pt| {
-                        // 收齐的 input_buf 应是合法 JSON object；若累加结果为空，用 "{}" fallback
+                        // 收齐的 input_buf 应是合法 JSON object；若累加结果为空，用 "{}" fallback。
+                        // 非法 input 不在此修——agent_loop 收 tool_use_start 时统一 repair(覆盖所有
+                        // provider,单一 choke point,见 message_repair.repairToolArgs)。此处仅记录。
                         const full_input = if (pt.input_buf.items.len == 0)
                             try allocator.dupe(u8, "{}")
                         else
                             try pt.input_buf.toOwnedSlice(allocator);
                         errdefer allocator.free(full_input);
 
-                        // 用 std.json.Scanner 做完整性校验（不阻塞事件流——即使格式错仍 emit，
-                        // 让下游 tool 返错给 LLM 自纠。这里只记录一下是否合法）
                         validateJsonObject(full_input) catch {
-                            self.logWarn("tool input invalid JSON (emitted anyway): {s}", .{full_input});
+                            self.logWarn("tool input invalid JSON (emitted anyway, repaired downstream): {s}", .{full_input});
                         };
 
                         const id = pt.id;

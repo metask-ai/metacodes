@@ -5,10 +5,12 @@
 //! 暴露。**agent_loop / Conversation / 中立 IR / provider.zig 一行不改**就能用它跑。这是"真多协议"
 //! (区别于 cc 全归一成 Anthropic SDK)的端到端兑现。
 //!
-//! 范围(P3 最小证明,非生产级 OpenAI client):文本流 + 单个 tool_call(function calling)
-//! + usage(含缓存命中 cached_tokens,经 stream_options.include_usage)。**诚实登记——以下未做**:
-//!   - **并行 tool_calls**:一个 turn 只认单个 tool_call。OpenAI 并行 function calling(一个
-//!     delta 多个 index/id)未实现;检测到第二个不同 id → log.warn 一声(不静默丢),只执行第一个。
+//! 范围(P3+,非生产级 OpenAI client):文本流 + **并行 tool_calls**(function calling)
+//! + usage(含缓存命中 cached_tokens,经 stream_options.include_usage)。
+//!   - **并行 tool_calls(P0.1 已实现)**:按 delta 的 `index` 分槽累积(ToolCallAcc),done 时
+//!     每槽 flush 一个 tool_use_start,executeSlots 真并发执行;请求侧每个 tool_result 独立
+//!     {role:"tool"} 回传。见 parseChunk tool_calls 分支 / buildFlush / serializeOpenAIMessage。
+//! **诚实登记——以下未做**:
 //!   - **跨 chunk arguments 转义**:arguments 提取按"单 chunk 内是完整字符串值"假设。OpenAI
 //!     流式可能把 arguments 切成多 chunk、单 chunk 内引号不配对——那种情况下转义层数会错。
 //!     本测试 cassette 用简单 arguments(""/"{}"),真实复杂参数(含路径/嵌套引号且跨 chunk)未覆盖。
@@ -187,12 +189,14 @@ const OpenAIStream = struct {
     id: log.RequestId,
     done: bool = false,
     last_stop: StopReason = .unknown,
-    // tool_calls 增量累积(OpenAI 分块发 name+arguments)。
-    tc_id: std.ArrayList(u8) = .empty,
-    tc_name: std.ArrayList(u8) = .empty,
-    tc_args: std.ArrayList(u8) = .empty,
+    // 并行 tool_calls 增量累积(P0.1):OpenAI 流式把每个 tool_call 按 `index` 分槽分块发
+    // (id/name 一次,arguments 跨 chunk 拼)。按 index 找槽累积,done 时把每个槽 flush 成一个
+    // tool_use_start 事件排队,next() 逐个 drain → executeSlots 收到多 slot 真并发。
+    tcs: std.ArrayList(ToolCallAcc) = .empty,
     tc_active: bool = false,
-    tc_warned_parallel: bool = false, // 已对并行 tool_calls 告警过(只警一次)
+    flush_q: std.ArrayList(StreamEvent) = .empty, // done 时排队的 tool_use_start
+    flush_pos: usize = 0,
+    flushed: bool = false,
 
     fn handle(self: *OpenAIStream) StreamHandle {
         return .{ .ctx = @ptrCast(self), .nextFn = &hNext, .deinitFn = &hDeinit, .stopReasonFn = &hStop, .requestIdFn = &hRid };
@@ -214,15 +218,30 @@ const OpenAIStream = struct {
     }
 
     fn deinit(self: *OpenAIStream) void {
-        self.tc_id.deinit(self.allocator);
-        self.tc_name.deinit(self.allocator);
-        self.tc_args.deinit(self.allocator);
+        for (self.tcs.items) |*tc| tc.deinit(self.allocator);
+        self.tcs.deinit(self.allocator);
+        // 异常拆解时未 drain 的 flush 事件仍持 owned id/name/input_json → 释放,防泄漏。
+        for (self.flush_q.items[self.flush_pos..]) |ev| switch (ev) {
+            .tool_use_start => |tu| {
+                self.allocator.free(tu.id);
+                self.allocator.free(tu.name);
+                self.allocator.free(tu.input_json);
+            },
+            else => {},
+        };
+        self.flush_q.deinit(self.allocator);
         self.request.deinit();
         self.allocator.destroy(self.request);
     }
 
     /// 读下一个中立事件。逐行读 SSE,翻译 OpenAI chunk → StreamEvent。
     fn next(self: *OpenAIStream) anyerror!?StreamEvent {
+        // 先把已排队的 flush 事件(并行 tool_use_start)逐个吐出。
+        if (self.flush_pos < self.flush_q.items.len) {
+            const ev = self.flush_q.items[self.flush_pos];
+            self.flush_pos += 1;
+            return ev;
+        }
         if (self.done) return null;
         if (self.reader == null) {
             self.reader = self.response.reader(&self.transfer_buf);
@@ -234,7 +253,7 @@ const OpenAIStream = struct {
             const line_opt = try r.takeDelimiter('\n');
             const line = line_opt orelse {
                 self.done = true;
-                return try self.flushPendingToolCall();
+                return self.finishFlush();
             };
             const trimmed = std.mem.trim(u8, line, " \r\n");
             if (trimmed.len == 0) continue;
@@ -242,7 +261,7 @@ const OpenAIStream = struct {
             const data = std.mem.trim(u8, trimmed[5..], " ");
             if (std.mem.eql(u8, data, "[DONE]")) {
                 self.done = true;
-                if (try self.flushPendingToolCall()) |ev| return ev;
+                if (self.finishFlush()) |ev| return ev;
                 return StreamEvent{ .done = {} };
             }
             if (try self.parseChunk(data)) |ev| return ev;
@@ -280,67 +299,164 @@ const OpenAIStream = struct {
                 return StreamEvent{ .text = owned };
             }
         }
-        // delta.tool_calls 增量:累积 id/name/arguments(下一段 finish 时 flush)。
-        // **MVP 限制(诚实登记,非 silent drop)**:只支持单个 tool_call/turn。OpenAI 并行
-        // function calling 一个 delta 里能有多个 tool_call(各带不同 index/id),但本累积器是
-        // 单组 ArrayList。检测到第二个不同 id 的 tool_call(tc_id 已填又来新 id)→ warn 一声,
-        // 不静默丢(CLAUDE.md「no silent caps」死罪)。真并行支持是后续工作。
-        if (std.mem.indexOf(u8, data, "\"tool_calls\"") != null) {
+        // delta.tool_calls 增量(P0.1 并行):按 `index` 分槽累积。OpenAI 流式对每个并行 tool_call
+        // 用独立 index;同一 chunk 的 tool_calls array 可含多个元素,元素跨 chunk 续拼 arguments。
+        // 逐元素定位/新建对应 index 的槽,追加 id/name/arguments 片段。done 时全部 flush。
+        if (findToolCallsArray(data)) |arr| {
             self.tc_active = true;
-            // extractStringField 取**首个**匹配 → 首个 tool_call 的 id/name/args 落到 tc_*。
-            // 这是我们要执行的那一个,无论是否并行都要捕获。
-            if (util_json.extractStringField(data, "id")) |id| {
-                if (self.tc_id.items.len == 0) {
-                    try self.tc_id.appendSlice(self.allocator, id);
-                } else if (!std.mem.eql(u8, self.tc_id.items, id) and !self.tc_warned_parallel) {
-                    // 跨 chunk:已有首个 id,又来一个不同 id = 第二个 tool_call(并行)。
-                    self.tc_warned_parallel = true;
-                    log.warnId("openai", self.id, "并行 tool_calls 未实现:第二个 tool_call id={s} 被忽略(MVP 仅单 tool_call/turn)", .{id});
+            var it = ElemIter{ .s = arr };
+            while (it.next()) |elem| {
+                const idx = util_json.extractIntField(elem, "index"); // OpenAI 恒发 index;缺失→0
+                const acc = self.accFor(idx) catch continue;
+                // id:整个 tool_call 只发一次;仅在本槽尚未填时写(防重复拼接)。
+                if (util_json.extractStringField(elem, "id")) |id| {
+                    if (id.len > 0 and acc.id.items.len == 0) acc.id.appendSlice(self.allocator, id) catch {};
                 }
-            }
-            // 只在尚未判定并行时追加 name/args(首个 tool_call 的字段)。判定并行后,
-            // 后续 chunk 的 name/args 属于第二个 tool_call,不能拼到第一个上。
-            if (!self.tc_warned_parallel) {
-                if (util_json.extractStringField(data, "name")) |name| {
-                    try self.tc_name.appendSlice(self.allocator, name);
+                // name = function.name(元素内首个 "name");arguments = function.arguments 片段。
+                // 复用与旧单工具路径同一提取语义(raw slice,含转义),保证每个 tool_call 行为不变。
+                if (util_json.extractStringField(elem, "name")) |name| {
+                    acc.name.appendSlice(self.allocator, name) catch {};
                 }
-                if (extractArgumentsDelta(data)) |args| {
-                    try self.tc_args.appendSlice(self.allocator, args);
+                if (util_json.extractStringField(elem, "arguments")) |args| {
+                    acc.args.appendSlice(self.allocator, args) catch {};
                 }
-            }
-            // 同一 chunk 内多个 tool_call(array 里 ≥2 个 `"index":`):首个已捕获到 tc_*(上面
-            // extractStringField 取首个),现在标记并行 → 警告 + 阻止后续 chunk 继续追加。
-            // 必须放在追加之后,否则会跳过首个 tool_call 的 name/args 捕获。
-            if (!self.tc_warned_parallel and countOccurrences(data, "\"index\":") > 1) {
-                self.tc_warned_parallel = true;
-                log.warnId("openai", self.id, "并行 tool_calls 未实现:单 delta 含多个 tool_call,仅执行第一个(MVP 仅单 tool_call/turn)", .{});
             }
         }
         return null;
     }
 
-    /// 把累积的 tool_call flush 成中立 tool_use_start(若有)。done 时调。
-    /// **所有权契约(对齐 Anthropic stream)**:id/name/input_json 必须是 owned slice,
-    /// agent_loop 接管所有权(不 dupe,后续随 tool_uses 释放)。故这里 toOwnedSlice 转移,
-    /// 不借用 self 的 ArrayList——否则 stream.deinit free 一次 + agent_loop free 一次 = double-free。
-    fn flushPendingToolCall(self: *OpenAIStream) !?StreamEvent {
-        if (!self.tc_active or self.tc_name.items.len == 0) return null;
-        self.tc_active = false;
+    /// 按 index 找累积槽,没有则新建。返回稳定指针(ToolCallAcc 的三个 ArrayList 后备内存在堆,
+    /// tcs 扩容搬移结构体不影响其后备指针)。
+    fn accFor(self: *OpenAIStream, idx: u64) !*ToolCallAcc {
+        for (self.tcs.items) |*tc| if (tc.index == idx) return tc;
+        try self.tcs.append(self.allocator, .{ .index = idx });
+        return &self.tcs.items[self.tcs.items.len - 1];
+    }
+
+    /// done 时:把每个累积槽 flush 成一个 tool_use_start 事件排队(仅 name 非空的);之后
+    /// next() 逐个 drain。**所有权契约(对齐 Anthropic stream)**:id/name/input_json 是 owned
+    /// slice,agent_loop 接管(不 dupe,随 tool_uses 释放),故 toOwnedSlice 转移所有权。
+    fn buildFlush(self: *OpenAIStream) void {
         const a = self.allocator;
-        const id = try self.tc_id.toOwnedSlice(a);
-        errdefer a.free(id);
-        const name = try self.tc_name.toOwnedSlice(a);
-        errdefer a.free(name);
-        // arguments 空 → owned "{}"(也必须 owned,agent_loop 一视同仁 free)。
-        const args = if (self.tc_args.items.len > 0)
-            try self.tc_args.toOwnedSlice(a)
-        else
-            try a.dupe(u8, "{}");
-        return StreamEvent{ .tool_use_start = .{
-            .id = id,
-            .name = name,
-            .input_json = args,
-        } };
+        for (self.tcs.items) |*tc| {
+            if (tc.name.items.len == 0) continue; // 无 name = 不完整,跳过
+            const id = tc.id.toOwnedSlice(a) catch continue;
+            const name = tc.name.toOwnedSlice(a) catch {
+                a.free(id);
+                continue;
+            };
+            const args = if (tc.args.items.len > 0)
+                (tc.args.toOwnedSlice(a) catch {
+                    a.free(id);
+                    a.free(name);
+                    continue;
+                })
+            else
+                (a.dupe(u8, "{}") catch {
+                    a.free(id);
+                    a.free(name);
+                    continue;
+                });
+            self.flush_q.append(a, StreamEvent{ .tool_use_start = .{ .id = id, .name = name, .input_json = args } }) catch {
+                a.free(id);
+                a.free(name);
+                a.free(args);
+            };
+        }
+    }
+
+    /// 构建(一次)并返回队列里下一个 flush 事件;耗尽返 null。
+    fn finishFlush(self: *OpenAIStream) ?StreamEvent {
+        if (!self.flushed) {
+            if (self.tc_active) self.buildFlush();
+            self.flushed = true;
+        }
+        if (self.flush_pos < self.flush_q.items.len) {
+            const ev = self.flush_q.items[self.flush_pos];
+            self.flush_pos += 1;
+            return ev;
+        }
+        return null;
+    }
+};
+
+/// 单个并行 tool_call 的按-index 累积槽。
+const ToolCallAcc = struct {
+    index: u64,
+    id: std.ArrayList(u8) = .empty,
+    name: std.ArrayList(u8) = .empty,
+    args: std.ArrayList(u8) = .empty,
+    fn deinit(self: *ToolCallAcc, a: std.mem.Allocator) void {
+        self.id.deinit(a);
+        self.name.deinit(a);
+        self.args.deinit(a);
+    }
+};
+
+/// 定位 `"tool_calls":` 后的 array,返回 `[` 与配对 `]` 之间的内容(深度感知,跳字符串)。
+/// 分块未闭合(部分 chunk)时返回剩余部分。找不到返 null。
+fn findToolCallsArray(data: []const u8) ?[]const u8 {
+    const key = "\"tool_calls\":";
+    const start = std.mem.indexOf(u8, data, key) orelse return null;
+    var i = start + key.len;
+    while (i < data.len and data[i] != '[') : (i += 1) {}
+    if (i >= data.len) return null;
+    const arr_open = i;
+    var depth: i32 = 0;
+    var in_str = false;
+    var esc = false;
+    while (i < data.len) : (i += 1) {
+        const c = data[i];
+        if (in_str) {
+            if (esc) esc = false else if (c == '\\') esc = true else if (c == '"') in_str = false;
+            continue;
+        }
+        switch (c) {
+            '"' => in_str = true,
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if (depth == 0) return data[arr_open + 1 .. i];
+            },
+            else => {},
+        }
+    }
+    return data[arr_open + 1 ..]; // 未闭合:返回剩余
+}
+
+/// 迭代 JSON array slice 里的顶层 `{...}` 对象(深度感知,跳字符串)。
+const ElemIter = struct {
+    s: []const u8,
+    i: usize = 0,
+    fn next(self: *ElemIter) ?[]const u8 {
+        while (self.i < self.s.len and self.s[self.i] != '{') : (self.i += 1) {}
+        if (self.i >= self.s.len) return null;
+        const obj_start = self.i;
+        var depth: i32 = 0;
+        var in_str = false;
+        var esc = false;
+        while (self.i < self.s.len) : (self.i += 1) {
+            const c = self.s[self.i];
+            if (in_str) {
+                if (esc) esc = false else if (c == '\\') esc = true else if (c == '"') in_str = false;
+                continue;
+            }
+            switch (c) {
+                '"' => in_str = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if (depth == 0) {
+                        self.i += 1;
+                        return self.s[obj_start..self.i];
+                    }
+                },
+                else => {},
+            }
+        }
+        const rest = self.s[obj_start..];
+        self.i = self.s.len;
+        return rest; // 未闭合元素(部分 chunk)
     }
 };
 
@@ -351,26 +467,10 @@ fn mapFinish(fr: []const u8) StopReason {
     return .unknown;
 }
 
-/// 数 needle 在 haystack 中的(非重叠)出现次数。用于检测一个 delta chunk 里有几个 tool_call。
-fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
-    if (needle.len == 0) return 0;
-    var n: usize = 0;
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, haystack, i, needle)) |pos| {
-        n += 1;
-        i = pos + needle.len;
-    }
-    return n;
-}
-
 /// 提取 OpenAI delta.content(简易:找 `"content":"..."`,反转义)。null=本 chunk 无 content。
 fn extractDeltaContent(data: []const u8) ?[]const u8 {
     // delta 里的 content;避免误命中其它 content(本测试 chunk 简单, 取首个 "content")。
     return util_json.extractStringField(data, "content");
-}
-/// 提取 tool_calls delta 的 arguments 片段。
-fn extractArgumentsDelta(data: []const u8) ?[]const u8 {
-    return util_json.extractStringField(data, "arguments");
 }
 
 /// 中立 Conversation/tools → OpenAI chat/completions 请求 body。caller free。
@@ -420,18 +520,23 @@ fn serializeOpenAIMessage(allocator: std.mem.Allocator, out: *std.ArrayList(u8),
         has_tool_result = true;
     };
     if (has_tool_result) {
-        // OpenAI 要求每个 tool_result 是独立 message;这里取第一个(MVP 单工具足够证明)。
+        // OpenAI 要求每个 tool_result 是独立 {role:"tool"} message。并行工具一轮有多个
+        // tool_result,**全部展开**成逗号分隔的多条 message(P0.1:旧版只发首个 → 并行回合
+        // 下一次请求缺 tool_call_id 配对被 OpenAI 400)。调用方在本消息前已加分隔逗号。
+        var first_tr = true;
         for (m.content) |c| switch (c) {
             .tool_result => |tr| {
+                if (!first_tr) try out.append(allocator, ',');
+                first_tr = false;
                 try out.appendSlice(allocator, "{\"role\":\"tool\",\"tool_call_id\":");
                 try util_json.serializeString(tr.tool_use_id, out, allocator);
                 try out.appendSlice(allocator, ",\"content\":");
                 try util_json.serializeString(tr.content, out, allocator);
                 try out.append(allocator, '}');
-                return;
             },
             else => {},
         };
+        return;
     }
     const role_str = switch (m.role) {
         .user => "user",

@@ -179,17 +179,24 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // per-call client:并发同步 Task(executeSlots 把多个 Task 放 worker 线程)各用独立
     // Client,绝不跨线程共享 ctx.api_client 的 http.Client。无 registry(headless)则退回
     // ctx.api_client(headless 无 TUI,串行可接受)。
-    var owned_client: ?@import("../core/agent_job_registry.zig").AgentJobRegistry.OwnedClient = null;
-    defer if (owned_client) |oc| oc.deinit();
-    const call_client: *@import("../client.zig").Client = blk: {
-        if (ctx.agent_jobs) |reg| {
-            if (reg.makeClient()) |oc| {
-                owned_client = oc;
-                break :blk oc.client;
-            } else |_| {}
-        }
-        break :blk api_client;
-    };
+    // P0.5:per-call **OwnedProvider**(据 parent provider_kind 造对应具体 client)→ 子 agent 继承
+    // 父 provider(不再一律 Anthropic)。无 registry(headless)退回 ctx 的 Anthropic client。
+    const pf = @import("../api/provider_factory.zig");
+    var owned_prov: ?pf.OwnedProvider = null;
+    defer if (owned_prov) |*o| o.deinit();
+    if (ctx.agent_jobs) |reg| {
+        // best-effort:makeProvider 仅在 OOM 时失败。失败 → 回退共享 ctx.provider(provider 语义
+        // 仍正确,不会退回 Anthropic),但**丢掉 per-call 独立 client** → 并发 worker 会共享同一
+        // http.Client(可接受的串行降级,非硬保证)。故 OOM 时 warn,别静默掩盖并发退化。
+        owned_prov = reg.makeProvider() catch |err| blk: {
+            @import("../util/log.zig").warn("agent", "makeProvider failed ({s}) — 退回共享 client(并发降级)", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+    const call_prov: @import("../api/provider.zig").Provider =
+        if (owned_prov) |*o| o.provider() else (ctx.provider orelse api_client.provider());
+    const call_anthropic: ?*@import("../client.zig").Client =
+        if (owned_prov) |*o| o.anthropicClient() else api_client;
 
     // L1:前台进度/token/流式 text 走 JobEntry backend(取代旧 progress_reporter/usage_sink
     // 两通道)。无 fg_entry(无 registry/headless)→ null-writer backend(丢弃流式输出)。
@@ -197,9 +204,16 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     var null_wb = @import("../core/writer_backend.zig").WriterBackend.initNull();
     const be: @import("../core/protocol/ui_backend.zig").UiBackend =
         if (fg_entry) |e| e.backend() else null_wb.backend();
+    // **allocator 一致铁律**:spawnAgentSink 的 allocator 必须与 call_prov 的 allocator 一致 ——
+    // provider 的流式事件(tool_use/text)所有权转移进 subagent 的 agent_loop,不一致 → Invalid free
+    // (后台路径已用 GPA panic 实测过同款机制)。owned_prov 用 c_allocator(见 registry.makeProvider),
+    // 故这里也用 c_allocator;它还顺带线程安全(并发前台 Task 在 worker 线程跑)。final_text 后面
+    // serializeString 拷进 ctx.allocator 的输出 JSON(拷贝非转移),result.deinit 用 c_allocator 释放,一致。
+    const call_allocator: std.mem.Allocator = if (owned_prov != null) std.heap.c_allocator else ctx.allocator;
     const result = try subagent.spawnAgentSink(
-        ctx.allocator,
-        call_client,
+        call_allocator,
+        call_prov,
+        call_anthropic,
         tool_defs, // 父 tool_defs (override 通过 SpawnOptions 传)
         perm,
         ctx.abort,

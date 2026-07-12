@@ -336,9 +336,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/compact")) {
-            const before = app.conversation.len();
+            // 投影:len() 不变(原始不删),真正收缩的是活跃窗口 → 显示活跃计数,否则 N→N 误导用户。
+            const before = app.conversation.activeMessages().len;
             const dropped = app.conversation.compact(100_000) catch 0;
-            std.debug.print("Compacted {d} old messages ({d} → {d}).\n", .{ dropped, before, app.conversation.len() });
+            std.debug.print("Compacted {d} old messages ({d} → {d} active).\n", .{ dropped, before, app.conversation.activeMessages().len });
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/goal") or std.mem.startsWith(u8, trimmed, "/goal ")) {
@@ -588,7 +589,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             app.provider(),
             app.tool_defs,
             &app.permission_ctx,
-            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = scoped_recall, .max_turns = maxTurnsFromEnv(), .cost_budget_usd = costBudgetFromEnv(), .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .model_switch_compact = app.pendingModelSwitchCompact(), .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
+            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = scoped_recall, .max_turns = maxTurnsFromEnv(), .cost_budget_usd = costBudgetFromEnv(), .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .model_switch_compact = app.pendingModelSwitchCompact(), .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
             effective_be,
             allocator,
         ) catch |err| {
@@ -1675,7 +1676,7 @@ fn retryLast(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui
         app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .model_switch_compact = app.pendingModelSwitchCompact(), .dyn_registry = &app.dyn_registry },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .model_switch_compact = app.pendingModelSwitchCompact(), .dyn_registry = &app.dyn_registry },
         backend,
         allocator,
     ) catch |err| {
@@ -2817,7 +2818,8 @@ fn runEphemeral(app: *app_mod.App, allocator: std.mem.Allocator, prompt: []const
     const subagent = @import("../core/subagent.zig");
     const result = try subagent.spawnAgent(
         allocator,
-        &app.api_client,
+        app.provider(),
+        app.anthropicClientOrNull(),
         app.tool_defs,
         &app.permission_ctx,
         &app.abort,
@@ -3257,7 +3259,7 @@ fn handleSkillInvocation(app: *app_mod.App, allocator: std.mem.Allocator, rest: 
         app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .model_switch_compact = app.pendingModelSwitchCompact(), .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .project_dir = app.project_dir_or_empty(), .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .model_switch_compact = app.pendingModelSwitchCompact(), .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .project_dir = app.project_dir_or_empty(), .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true },
         &be,
         allocator,
     ) catch |err| {
@@ -3493,7 +3495,7 @@ fn runInjectedAgentWithSynthetic(app: *app_mod.App, allocator: std.mem.Allocator
         app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = &app.api_client, .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = synthetic_user_input, .model_switch_compact = app.pendingModelSwitchCompact(), .dyn_registry = &app.dyn_registry },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = synthetic_user_input, .model_switch_compact = app.pendingModelSwitchCompact(), .dyn_registry = &app.dyn_registry },
         backend,
         allocator,
     ) catch |err| {

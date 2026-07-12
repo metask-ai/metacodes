@@ -36,6 +36,8 @@ pub const Slot = struct {
     pending: bool = false,
     pending_kind: ?[]u8 = null,
     pending_payload: ?[]u8 = null,
+    /// P0.4:该 slot 的结果已由流式预取(stream_prefetch)填好 → executeSlots 跳过,不重复执行。
+    prefetched: bool = false,
 };
 
 /// 一个并发 job 的输入(safe 批用)。
@@ -82,10 +84,19 @@ fn runJob(job: *Job) void {
         const code = if (err == error.UnknownTool) "UnknownTool" else @errorName(err);
         const tool_error = @import("tool_error.zig");
         // 错误 json 用父 allocator(逃逸 arena)。工具填了 detail 用之,否则通用文案。
+        // P0.6:UnknownTool 附可用工具清单(hermes 式引导),弱模型据此自纠而非空转烧 turn。
         const ej = if (err_detail) |d|
             tool_error.errorToJson(code, "{s}", .{d}, job.parent_allocator) catch null
-        else
-            tool_error.errorToJson(code, "{s} failed with {s}", .{ s.name, @errorName(err) }, job.parent_allocator) catch null;
+        else if (err == error.UnknownTool) blk: {
+            const names = tools_mod.availableToolNames(&job_ctx, job.parent_allocator) catch null;
+            defer if (names) |nm| job.parent_allocator.free(nm);
+            // 模糊建议(仅提示,不执行):有则加 "Did you mean 'X'?"。
+            const guess = tools_mod.suggestToolName(&job_ctx, s.name);
+            break :blk if (guess) |g|
+                tool_error.errorToJson(code, "Tool '{s}' does not exist. Did you mean '{s}'? Available tools: {s}", .{ s.name, g, if (names) |nm| nm else "(unavailable)" }, job.parent_allocator) catch null
+            else
+                tool_error.errorToJson(code, "Tool '{s}' does not exist. Available tools: {s}", .{ s.name, if (names) |nm| nm else "(unavailable)" }, job.parent_allocator) catch null;
+        } else tool_error.errorToJson(code, "{s} failed with {s}", .{ s.name, @errorName(err) }, job.parent_allocator) catch null;
         s.content = ej;
         s.is_error = true;
         s.elapsed_ms = @intCast(@max(util_time.nowMs() - t_start, 0));
@@ -115,8 +126,8 @@ fn runJob(job: *Job) void {
 
 /// per-slot 并发安全判定:在 isConcurrencySafeInput 之上叠加同步 Task 特例。
 /// 同步 Task/Agent(非 run_in_background)各自 spawn 独立子 agent + 独立 TaskStore,
-/// 唯一共享风险是 http.Client——agent.zig 同步路径用 registry.makeClient 造 per-call
-/// client 规避。故仅当有 agent_jobs(能造独立 client)时才允许 Task 并发,否则保守串行
+/// 唯一共享风险是 http.Client——agent.zig 同步路径用 registry.makeProvider 造 per-call
+/// provider(独立 client)规避。故仅当有 agent_jobs(能造独立 client)时才允许 Task 并发,否则保守串行
 /// (headless 无 TUI,串行无碍)。对齐 cc:多个 Task 在一轮内并行跑(独立计时器)。
 fn slotSafe(ctx: *const ToolContext, s: Slot) bool {
     if ((std.mem.eql(u8, s.name, "Task") or std.mem.eql(u8, s.name, "Agent")) and ctx.agent_jobs != null) {
@@ -137,7 +148,8 @@ pub fn executeSlots(
 ) void {
     var i: usize = 0;
     while (i < slots.len) {
-        if (slots[i].decision == .denied) {
+        // denied(已填错误)或 prefetched(结果已由流式预取填好)→ 跳过,不执行。
+        if (slots[i].decision == .denied or slots[i].prefetched) {
             i += 1;
             continue;
         }
@@ -145,7 +157,7 @@ pub fn executeSlots(
         // Task 同步 spawn 仅当有 agent_jobs 可造 per-call client 时算 safe,见 slotSafe)。
         const safe = slotSafe(base_ctx, slots[i]);
         var j = i;
-        while (j < slots.len and slots[j].decision == .run and slotSafe(base_ctx, slots[j]) == safe) : (j += 1) {}
+        while (j < slots.len and slots[j].decision == .run and !slots[j].prefetched and slotSafe(base_ctx, slots[j]) == safe) : (j += 1) {}
         // slots[i..j] 是一批(同安全性)。
         if (safe and (j - i) > 1) {
             runConcurrentBatch(slots[i..j], base_ctx, parent_allocator, rid);
@@ -202,6 +214,28 @@ fn enforceMessageBudget(slots: []Slot, base_ctx: *const ToolContext, parent_allo
             s.content = p;
         } else break; // 落盘失败 → 停(避免死循环)
     }
+}
+
+test "executeSlots 跳过 prefetched slot(不重复执行,P0.4 无双执行铁证)" {
+    const a = std.testing.allocator;
+    // prefetched slot:内容预填,名字是不存在的工具——若被执行会 dispatch 失败并覆写成错误 json;
+    // 跳过则 content 原样保留。故"content 未变"= 确实跳过(没重复执行)。
+    const marker = try a.dupe(u8, "PREFETCHED_CONTENT");
+    var slots = [_]Slot{.{
+        .decision = .run,
+        .name = "NonExistentToolXYZ",
+        .id = "s1",
+        .input = "{}",
+        .content = marker,
+        .prefetched = true,
+    }};
+    defer if (slots[0].content) |c| a.free(c);
+    var ctx = tools_mod.ToolContext{ .allocator = a };
+    executeSlots(&slots, &ctx, a, .{ .bytes = [_]u8{'0'} ** 12 });
+    // prefetched → 未执行 → content 仍是预填值(未被 UnknownTool 错误覆写)。
+    try std.testing.expect(slots[0].content != null);
+    try std.testing.expectEqualStrings("PREFETCHED_CONTENT", slots[0].content.?);
+    try std.testing.expect(!slots[0].is_error);
 }
 
 /// 一批 safe slot 并发执行(每个独立线程,cap MAX_TOOL_CONCURRENCY)。

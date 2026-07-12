@@ -9,9 +9,11 @@
 //! - `recvLine(allocator)` 读一行（阻塞，返 []u8 owned）
 //! - `close()` 关 pipe，wait 子进程收尾
 //!
-//! 非 abortable 版本（server 本身长寿，短时间收发；future 扩展可加 abort）。
+//! abort-aware:设 `abort` 后,recvLine 用 poll(100ms)守卫阻塞 read,超时查 abort → error.Aborted。
+//! 让挂死的 MCP server 能被 Ctrl+C(AbortSignal)打断,不再无限 wedge agent。未设 abort → 退回纯阻塞。
 
 const std = @import("std");
+const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
 pub const StdioTransport = struct {
     pid: std.c.pid_t,
@@ -20,6 +22,8 @@ pub const StdioTransport = struct {
     read_buf: std.ArrayList(u8),
     read_buf_pos: usize = 0,
     allocator: std.mem.Allocator,
+    /// 可选中断信号(callTool 期设);null=纯阻塞(如 initialize 短握手)。
+    abort: ?*const AbortSignal = null,
 
     /// spawn 子进程。argv 以 null 结尾，argv[0] 是绝对路径或在 PATH 内。
     pub fn spawn(allocator: std.mem.Allocator, argv: []const ?[*:0]const u8) !StdioTransport {
@@ -99,6 +103,17 @@ pub const StdioTransport = struct {
                     self.read_buf_pos = 0;
                 }
                 return owned;
+            }
+            // abort-aware:有 abort 时 poll 守卫阻塞 read——超时(100ms)回查 abort,被中断即返 error.Aborted。
+            if (self.abort) |ab| {
+                while (true) {
+                    if (ab.isAborted()) return error.Aborted;
+                    var pfds = [_]std.c.pollfd{.{ .fd = self.stdout_fd, .events = std.c.POLL.IN, .revents = 0 }};
+                    const prc = std.c.poll(&pfds, 1, 100);
+                    if (prc > 0) break; // 有数据可读 → 下面 read
+                    if (prc < 0) break; // EINTR/错误 → 让 read 处理
+                    // prc==0 超时 → 回查 abort 后再 poll
+                }
             }
             // 读更多
             const n = std.c.read(self.stdout_fd, &chunk, chunk.len);

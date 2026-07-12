@@ -39,7 +39,14 @@ test "L2 auto-compact request: summary enters next request without compact promp
         for (api_messages.items) |m| a.free(m.content);
         api_messages.deinit(a);
     }
-    for (conv.messages.items) |m| {
+    // P1.5 纯投影:发给模型 = [compact_summary(若有)] + activeMessages()(边界后)。原始全量仍在
+    // conv.messages(供 transcript/resume),但**不发**。这里模拟 buildApiMessages 的投影构造。
+    if (conv.compact_summary) |s| {
+        const content = try a.alloc(cc.types_mod.ApiContent, 1);
+        content[0] = .{ .text = s };
+        try api_messages.append(a, .{ .role = .assistant, .content = content });
+    }
+    for (conv.activeMessages()) |m| {
         const content = try a.alloc(cc.types_mod.ApiContent, m.blocks.len);
         for (m.blocks, 0..) |b, bi| {
             content[bi] = switch (b) {

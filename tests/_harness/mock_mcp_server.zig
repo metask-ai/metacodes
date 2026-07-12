@@ -32,12 +32,29 @@ pub fn main() !void {
     }
 }
 
+// elicitation 往返:tools/call name="elicit" → 挂起,发 elicitation/create;收 client 回复后据 action 应答。
+var pending_elicit_id: ?u64 = null;
+
 fn handleLine(alloc: std.mem.Allocator, line: []const u8) !void {
     // notifications 无 id 也不需回复
     if (std.mem.indexOf(u8, line, "\"method\":\"notifications/") != null) return;
 
+    const method_opt = extractStringField(line, "method");
+    if (method_opt == null) {
+        // 无 method = client→server 响应(elicitation 回复)。据 action 完成挂起的 tools/call。
+        if (pending_elicit_id) |eid| {
+            const action = extractStringField(line, "action") orelse "decline";
+            const payload = try std.fmt.allocPrint(alloc,
+                \\{{"content":[{{"type":"text","text":"elicited:{s}"}}]}}
+            , .{action});
+            defer alloc.free(payload);
+            try writeResponse(alloc, eid, payload);
+            pending_elicit_id = null;
+        }
+        return;
+    }
+    const method = method_opt.?;
     const id = parseId(line) orelse return;
-    const method = extractStringField(line, "method") orelse return;
 
     if (std.mem.eql(u8, method, "initialize")) {
         try writeResponse(alloc, id,
@@ -45,12 +62,24 @@ fn handleLine(alloc: std.mem.Allocator, line: []const u8) !void {
         );
     } else if (std.mem.eql(u8, method, "tools/list")) {
         try writeResponse(alloc, id,
-            \\{"tools":[{"name":"echo","description":"echo back input","inputSchema":{"type":"object"}}]}
+            \\{"tools":[{"name":"echo","description":"echo back input","inputSchema":{"type":"object"}},{"name":"elicit","description":"asks user via elicitation","inputSchema":{"type":"object"}}]}
         );
     } else if (std.mem.eql(u8, method, "tools/call")) {
-        // 解析 params.arguments.message
+        const tool = extractStringField(line, "name") orelse "";
+        if (std.mem.eql(u8, tool, "elicit")) {
+            // 挂起 tools/call,发 server→client elicitation/create;等 client 回复(下一行处理)。
+            pending_elicit_id = id;
+            // requestedSchema 故意含名为 "result"/"error" 的属性 + 嵌套 "id":任 → 触发 client 分类器的
+            // 陷阱:全文子串扫会把本请求误当响应(死锁)。正确分类器按顶层 method 判 → 仍识别为请求。
+            const req =
+                \\{"jsonrpc":"2.0","id":9001,"method":"elicitation/create","params":{"message":"need input","requestedSchema":{"type":"object","properties":{"result":{"type":"string","default":"id"},"error":{"type":"string"}}}}}
+            ;
+            const wbuf = try std.fmt.allocPrint(alloc, "{s}\n", .{req});
+            defer alloc.free(wbuf);
+            _ = std.c.write(1, wbuf.ptr, wbuf.len);
+            return;
+        }
         const msg = extractNestedStringField(line, "message") orelse "<nothing>";
-        // 构造 content
         const payload = try std.fmt.allocPrint(alloc,
             \\{{"content":[{{"type":"text","text":"{s}"}}]}}
         , .{msg});

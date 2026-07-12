@@ -115,8 +115,10 @@ pub const McpToolBinding = struct {
 
 fn executeMcpTool(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anyerror![]u8 {
     const binding: *McpToolBinding = @ptrCast(@alignCast(ctx_ptr orelse return error.MissingMcpBinding));
-    // args 应是 JSON object；直接透传
-    _ = ctx; // abort 未在本版本传给 MCP 请求——future 扩展
+    // 透传中断信号:挂死的 MCP server 可被 Ctrl+C 打断(transport poll 查 abort)。callTool 后清,
+    // 避免悬垂指向本次 turn 的 abort。
+    binding.client.abort = ctx.abort;
+    defer binding.client.abort = null;
     return try binding.client.callTool(binding.mcp_tool_name, args);
 }
 
