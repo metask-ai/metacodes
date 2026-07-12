@@ -4,6 +4,7 @@ const toolchain = @import("../util/toolchain.zig");
 const ToolContext = @import("context.zig").ToolContext;
 const path_mod = @import("../util/path.zig");
 const read_state = @import("../core/read_state.zig");
+const util_json = @import("../util/json.zig");
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
@@ -62,18 +63,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try out.appendSlice(allocator, "{\"filenames\":[");
     for (files.items[0..display], 0..) |f, i| {
         if (i > 0) try out.append(allocator, ',');
-        try out.append(allocator, '"');
-        for (f) |c| {
-            switch (c) {
-                '"' => try out.appendSlice(allocator, "\\\""),
-                '\\' => try out.appendSlice(allocator, "\\\\"),
-                '\n' => try out.appendSlice(allocator, "\\n"),
-                '\r' => try out.appendSlice(allocator, "\\r"),
-                '\t' => try out.appendSlice(allocator, "\\t"),
-                else => try out.append(allocator, c),
-            }
-        }
-        try out.append(allocator, '"');
+        try util_json.serializeString(f, &out, allocator);
     }
     try out.appendSlice(allocator, "],\"numFiles\":");
     var num_buf: [32]u8 = undefined;

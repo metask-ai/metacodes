@@ -1051,6 +1051,7 @@ pub const EventIterator = struct {
                     // "API 主动报错" vs "网络/解析失败"(避免三类错误塌缩成 RequestFailed)。
                     const err_obj = findTopLevelObjectField(data, "error") orelse data;
                     self.logWarn("API error event: {s}", .{err_obj});
+                    @import("last_error.zig").recordNamed("API 错误帧", err_obj);
                     self.done_flag = true;
                     if (error_class.isContextWindowExceeded(err_obj)) return error.ContextWindowExceededEvent;
                     return error.ApiErrorEvent;

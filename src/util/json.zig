@@ -128,20 +128,79 @@ fn parseHex4(s: []const u8) ?u16 {
     return v;
 }
 
-/// 序列化字符串为 JSON，追加到 buf。转义 `" \ \n \r \t`。
+/// JSON 字符串内容转义核心——仓库唯一实现,别再手搓副本(2026-07-12 已合并 5 份散落
+/// 拷贝,其中 3 份+本函数原版共 4 份漏转义控制字符——请求体非法 JSON → API 400 的病根)。
+/// 保证输出满足 RFC 8259:`" \` 和 0x00-0x1F 全转义(\n \r \t 用短形式,其余 \u00XX);
+/// 非法 UTF-8 序列替换为 U+FFFD——JSON 文档必须是合法 UTF-8,垃圾字节不许污染整个请求体。
+/// sink 只需提供 writeAll([]const u8)(*std.Io.Writer 天然满足)。
+fn encodeStringInner(s: []const u8, sink: anytype) !void {
+    var i: usize = 0;
+    var plain_start: usize = 0; // 连续可透传字节段的起点,批量 flush 而非逐字节写
+    while (i < s.len) {
+        const c = s[i];
+        if (c >= 0x20 and c < 0x80 and c != '"' and c != '\\') {
+            i += 1;
+            continue;
+        }
+        if (c >= 0x80) {
+            const seq_len: ?usize = if (std.unicode.utf8ByteSequenceLength(c)) |l| l else |_| null;
+            if (seq_len) |l| {
+                if (i + l <= s.len and std.unicode.utf8ValidateSlice(s[i .. i + l])) {
+                    i += l; // 合法多字节序列,并入透传段
+                    continue;
+                }
+            }
+            // 非法 UTF-8(孤立 continuation/截断/overlong/surrogate):逐字节替换 U+FFFD
+            try sink.writeAll(s[plain_start..i]);
+            try sink.writeAll("\u{FFFD}");
+            i += 1;
+            plain_start = i;
+            continue;
+        }
+        try sink.writeAll(s[plain_start..i]);
+        switch (c) {
+            '"' => try sink.writeAll("\\\""),
+            '\\' => try sink.writeAll("\\\\"),
+            '\n' => try sink.writeAll("\\n"),
+            '\r' => try sink.writeAll("\\r"),
+            '\t' => try sink.writeAll("\\t"),
+            else => {
+                var tmp: [6]u8 = undefined;
+                const esc = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable;
+                try sink.writeAll(esc);
+            },
+        }
+        i += 1;
+        plain_start = i;
+    }
+    try sink.writeAll(s[plain_start..]);
+}
+
+const ListSink = struct {
+    list: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    fn writeAll(self: ListSink, bytes: []const u8) !void {
+        try self.list.appendSlice(self.allocator, bytes);
+    }
+};
+
+/// 序列化字符串为 JSON(含引号),追加到 buf。转义语义见 encodeStringInner。
 pub fn serializeString(s: []const u8, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
     try buf.append(allocator, '"');
-    for (s) |c| {
-        switch (c) {
-            '"' => try buf.appendSlice(allocator, "\\\""),
-            '\\' => try buf.appendSlice(allocator, "\\\\"),
-            '\n' => try buf.appendSlice(allocator, "\\n"),
-            '\r' => try buf.appendSlice(allocator, "\\r"),
-            '\t' => try buf.appendSlice(allocator, "\\t"),
-            else => try buf.append(allocator, c),
-        }
-    }
+    try encodeStringInner(s, ListSink{ .list = buf, .allocator = allocator });
     try buf.append(allocator, '"');
+}
+
+/// serializeString 去引号版:只写转义后的字符串内容(调用方自己拼引号/片段)。
+pub fn serializeStringContents(s: []const u8, buf: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    try encodeStringInner(s, ListSink{ .list = buf, .allocator = allocator });
+}
+
+/// serializeString 的 writer 版(含引号)。转义语义见 encodeStringInner。
+pub fn writeJsonString(w: *std.Io.Writer, s: []const u8) !void {
+    try w.writeByte('"');
+    try encodeStringInner(s, w);
+    try w.writeByte('"');
 }
 
 /// 从 JSON 对象字符串中查找 `"field":"value"` 形式的字符串值。
@@ -287,6 +346,105 @@ test "serializeString escapes quote" {
     defer buf.deinit(std.testing.allocator);
     try serializeString("say \"hi\"", &buf, std.testing.allocator);
     try std.testing.expectEqualStrings("\"say \\\"hi\\\"\"", buf.items);
+}
+
+test "serializeString escapes control chars as \\u00XX" {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(std.testing.allocator);
+    try serializeString("a\x00b\x1bc\x07d", &buf, std.testing.allocator);
+    try std.testing.expectEqualStrings("\"a\\u0000b\\u001bc\\u0007d\"", buf.items);
+}
+
+test "serializeString control chars round-trip via unescapeString" {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(std.testing.allocator);
+    const original = "x\x00\x01\x1f\ny";
+    try serializeString(original, &buf, std.testing.allocator);
+    const back = try unescapeString(buf.items[1 .. buf.items.len - 1], std.testing.allocator);
+    defer std.testing.allocator.free(back);
+    try std.testing.expectEqualStrings(original, back);
+}
+
+test "serializeString leaves ascii, utf8 and bare DEL untouched" {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(std.testing.allocator);
+    // 0x7f(DEL)不是 printable,但 RFC 8259 只强制转义 <0x20——DEL 裸放是故意的。
+    try serializeString("普通文本 ok ~\x7f", &buf, std.testing.allocator);
+    try std.testing.expectEqualStrings("\"普通文本 ok ~\x7f\"", buf.items);
+}
+
+test "serializeString replaces invalid utf8 with U+FFFD" {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(std.testing.allocator);
+    // 孤立 continuation + 截断的 3 字节序列开头 + 合法字节
+    try serializeString("a\x80b\xe4\xbdok", &buf, std.testing.allocator);
+    try std.testing.expectEqualStrings("\"a\u{FFFD}b\u{FFFD}\u{FFFD}ok\"", buf.items);
+}
+
+test "writeJsonString matches serializeString output" {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(std.testing.allocator);
+    const input = "mix\x00\"quote\"\\slash 中文\x80tail";
+    try serializeString(input, &buf, std.testing.allocator);
+
+    var wbuf: [256]u8 = undefined;
+    var fw = std.Io.Writer.fixed(&wbuf);
+    try writeJsonString(&fw, input);
+    try std.testing.expectEqualStrings(buf.items, fw.buffered());
+}
+
+/// differential 裁判:输出必须被 std.json 接受;输出必须是合法 UTF-8;
+/// 合法 UTF-8 输入必须逐字节 round-trip;两个公开入口(list/writer)输出必须逐字节一致。
+fn diffCheckAgainstStdJson(input: []const u8) !void {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(std.testing.allocator);
+    try serializeString(input, &buf, std.testing.allocator);
+    const parsed = std.json.parseFromSlice([]const u8, std.testing.allocator, buf.items, .{}) catch |e| {
+        std.debug.print("std.json rejected our output: input={x} output={s}\n", .{ input, buf.items });
+        return e;
+    };
+    defer parsed.deinit();
+    try std.testing.expect(std.unicode.utf8ValidateSlice(parsed.value));
+    if (std.unicode.utf8ValidateSlice(input)) {
+        try std.testing.expectEqualSlices(u8, input, parsed.value);
+    }
+    // writer 入口与 list 入口必须同像素(最坏膨胀 6x + 2 引号,fuzz 输入 ≤ 64 字节)。
+    var wbuf: [512]u8 = undefined;
+    var fw = std.Io.Writer.fixed(&wbuf);
+    try writeJsonString(&fw, input);
+    try std.testing.expectEqualStrings(buf.items, fw.buffered());
+}
+
+test "serializeString differential vs std.json: all single bytes" {
+    var byte: usize = 0;
+    while (byte < 256) : (byte += 1) {
+        const b = [_]u8{@intCast(byte)};
+        try diffCheckAgainstStdJson(&b);
+    }
+}
+
+test "serializeString differential vs std.json: random byte strings" {
+    var prng = std.Random.DefaultPrng.init(0x5eed_cafe);
+    const rand = prng.random();
+    var iter: usize = 0;
+    while (iter < 1000) : (iter += 1) {
+        var data: [64]u8 = undefined;
+        const len = rand.intRangeAtMost(usize, 0, data.len);
+        rand.bytes(data[0..len]);
+        try diffCheckAgainstStdJson(data[0..len]);
+    }
+}
+
+test "serializeString differential vs std.json: adversarial cases" {
+    const cases = [_][]const u8{
+        "", "\x00", "\"", "\\", "\\u0000", "a\x1f\x7fb",
+        "\xed\xa0\x80", // CESU-8 surrogate 编码(非法)
+        "\xc0\x80", // overlong NUL(非法)
+        "\xf4\x90\x80\x80", // 超出 U+10FFFF(非法)
+        "\xf0\x9f\x92\xa9", // 合法 4 字节 emoji
+        "结尾截断\xe4\xbd",
+    };
+    for (cases) |c| try diffCheckAgainstStdJson(c);
 }
 
 test "extractStringField basic" {

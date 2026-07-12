@@ -5,6 +5,7 @@ const types = @import("types.zig");
 const json_mod = @import("json.zig");
 const api_stream = @import("api/stream.zig");
 const error_class = @import("api/error_class.zig");
+const last_error = @import("api/last_error.zig");
 const Catalog = @import("api/catalog.zig").Catalog;
 const AbortSignal = @import("util/abort.zig").AbortSignal;
 const provider_mod = @import("api/provider.zig");
@@ -423,6 +424,16 @@ pub const Client = struct {
                 attempt += 1;
                 if (!isRetriableError(err) or attempt >= max_retries) {
                     log.err("client", "stream connect failed after {d} attempt(s): {s}", .{ attempt, @errorName(err) });
+                    // (Aborted 不在 sendMessageStreamFull 的 error set 里,编译器背书,无需分支。)
+                    switch (err) {
+                        // HTTP 状态类:logErrorBody 已记 body,只补尝试次数。
+                        error.Unauthorized, error.RateLimited, error.ServerError, error.BadGateway, error.ServiceUnavailable, error.HttpError, error.ContextWindowExceeded => last_error.noteAttempts(attempt),
+                        // 连接类:无 HTTP 响应没走 logErrorBody,现场在这里补记。
+                        else => {
+                            last_error.recordNamed("连接失败", @errorName(err));
+                            last_error.noteAttempts(attempt);
+                        },
+                    }
                     return err;
                 }
                 const delay = retryDelayMs(attempt, base_ms);
@@ -513,7 +524,9 @@ pub const Client = struct {
         });
 
         switch (status) {
-            .ok => {},
+            // 成功即清陈旧错误现场——否则后续无记录的失败路径(如 mid-stream 断连)
+            // 会把几轮前的无关错误当死因端给用户。
+            .ok => last_error.clear(),
             // 错误分支:读 body 进 log 后直接 return error。
             // 清理交给 errdefer(:253 destroy + :266 deinit)——分支内**不要**手动
             // deinit/destroy,否则与 errdefer 双重释放 → segfault(这些路径过去无测试
@@ -609,6 +622,7 @@ fn logErrorBody(
     log.errId("client", rid, "HTTP {d} {s}: body={s}", .{
         @intFromEnum(status), @tagName(status), preview,
     });
+    last_error.recordHttp(@intFromEnum(status), preview);
     return .{ .context_window_exceeded = error_class.isContextWindowExceeded(preview) };
 }
 

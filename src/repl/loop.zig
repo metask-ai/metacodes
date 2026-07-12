@@ -647,9 +647,16 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         if (result.stop_reason == .tool_loop) {
             std.debug.print("\x1b[33m检测到重复无效动作(同操作反复无信息增益,或连续同错),已中止本轮以防打转。\n调整方向后输入下一步可继续。\x1b[0m\n", .{});
         }
-        // 模型 API 撞墙(重试耗尽 / 后端错误 / context 超限):明确告知,非静默。
+        // 模型 API 撞墙:带真实错误现场告知(HTTP 状态 + body 摘要),不许塌缩成猜谜文案——
+        // 2026-07-12 NUL 字节 bug 排障靠抓包才看到 "Failed to parse request body" 的教训。
         if (result.stop_reason == .api_error) {
-            std.debug.print("\x1b[31m模型 API 请求失败(重试耗尽 / 后端错误 / 上下文超限),本轮中止。\n可直接重试,或换模型 / 精简上下文后继续。\x1b[0m\n", .{});
+            const last_error = @import("../api/last_error.zig");
+            var detail_buf: [last_error.SUMMARY_BUF_LEN]u8 = undefined;
+            if (last_error.take(&detail_buf)) |detail| {
+                std.debug.print("\x1b[31m模型 API 请求失败,本轮中止。\n  {s}\n可直接重试,或换模型 / 精简上下文后继续。\x1b[0m\n", .{detail});
+            } else {
+                std.debug.print("\x1b[31m模型 API 请求失败(重试耗尽 / 后端错误 / 上下文超限),本轮中止。\n可直接重试,或换模型 / 精简上下文后继续。\x1b[0m\n", .{});
+            }
         }
         // 工具不可恢复错误撞墙:明确告知,非静默。
         if (result.stop_reason == .tool_error) {

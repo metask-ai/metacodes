@@ -208,17 +208,10 @@ fn writeAllowWithRule(out: *std.ArrayList(u8), alloc: std.mem.Allocator, allow: 
     try out.append(alloc, ']');
 }
 
+const util_json = @import("../util/json.zig");
+
 fn writeEscaped(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u8) !void {
-    for (s) |c| {
-        switch (c) {
-            '"' => try out.appendSlice(alloc, "\\\""),
-            '\\' => try out.appendSlice(alloc, "\\\\"),
-            '\n' => try out.appendSlice(alloc, "\\n"),
-            '\r' => try out.appendSlice(alloc, "\\r"),
-            '\t' => try out.appendSlice(alloc, "\\t"),
-            else => try out.append(alloc, c),
-        }
-    }
+    try util_json.serializeStringContents(s, out, alloc);
 }
 
 fn writeValue(out: *std.ArrayList(u8), alloc: std.mem.Allocator, v: std.json.Value) !void {
