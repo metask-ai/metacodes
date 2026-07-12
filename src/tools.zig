@@ -73,7 +73,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "file_path", .type = "string", .description = "The absolute path to the file to read" },
             .{ .name = "offset", .type = "integer", .description = "The line number to start reading from (1-based)" },
             .{ .name = "limit", .type = "integer", .description = "The number of lines to read" },
-            .{ .name = "outline", .type = "boolean", .description = "Return a symbol outline (functions/types with line numbers) instead of file contents. Supported for zig/ts/tsx/python/c/bash." },
+            .{ .name = "outline", .type = "boolean", .description = "Return a symbol outline (functions/types with line numbers) instead of file contents. Requires --lsp and an installed language server for the file's language; falls back to normal reading otherwise." },
         }, .required = &.{"file_path"} },
         .execute = read_tool.execute,
     },
@@ -131,23 +131,23 @@ pub const registry: []const ToolEntry = &.{
         }, .required = &.{"pattern"} },
         .execute = grep_tool.execute,
     },
-    // CodeMap:代码结构大纲(tree-sitter)。排在搜索工具之后、Bash 之前——和 Grep/Glob
-    // 同属"专用搜索/导航工具",比整文件 Read 省 token,引导模型优先用它定位定义。
+    // CodeMap:代码结构大纲(LSP documentSymbol,Y2 砍 tree-sitter 后)。排在搜索工具之后、Bash
+    // 之前——和 Grep/Glob 同属"专用搜索/导航工具",比整文件 Read 省 token,引导模型优先用它定位定义。
     .{
         .name = "CodeMap",
         .description = "Produce a structural outline of source code: functions, types, classes, " ++
             "constants with line numbers and signatures. Operates on SOURCE CODE only (not " ++
             "plain-text, config, JSON, or docs). Pass a file path for one file, or a glob (e.g. " ++
             "src/**/*) to map many files. Far cheaper than reading whole files when you only " ++
-            "need to find where things are defined. Supports zig, typescript, tsx, python, c, bash.",
+            "need to find where things are defined. Requires --lsp and an installed language " ++
+            "server (zls, pyright, typescript-language-server, gopls, rust-analyzer, clangd).",
         .describe_fn = descriptions.describeCodeMap,
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "path", .type = "string", .description = "A file path OR a glob pattern (e.g. src/**/*)" },
-            .{ .name = "lang", .type = "string", .description = "Force a language; default infers from extension", .enum_values = &.{ "zig", "typescript", "tsx", "python", "c", "bash" } },
         }, .required = &.{"path"} },
         .execute = code_map_tool.execute,
     },
-    // FindSymbol:跨文件找符号*定义*(tree-sitter)。常驻默认工具菜单——A/B 实验(2026-06-08,
+    // FindSymbol:跨文件找符号*定义*(LSP documentSymbol)。常驻默认工具菜单——A/B 实验(2026-06-08,
     // 192 次真模型)证明 deferred(藏 ToolSearch 后)致"找定义题"压不动(命中率仅 17%,
     // p=0.156 不显著),模型大量退回 Grep/ToolSearch。提为默认后无需激活即可直接调。
     .{
@@ -155,8 +155,8 @@ pub const registry: []const ToolEntry = &.{
         .description = "Find where a symbol is DEFINED across the codebase (SOURCE CODE only). " ++
             "Unlike Grep (which returns all occurrences), this returns only definitions, with " ++
             "file:line and signature. Use this to jump to a function/type/class definition by " ++
-            "name when you don't know which file it lives in. Supports zig, typescript, tsx, " ++
-            "python, c, bash.",
+            "name when you don't know which file it lives in. Requires --lsp and an installed " ++
+            "language server (zls, pyright, typescript-language-server, gopls, rust-analyzer, clangd).",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "name", .type = "string", .description = "The symbol name to find the definition of" },
             .{ .name = "kind", .type = "string", .description = "Optional kind filter", .enum_values = &.{ "function", "method", "struct", "enum", "union", "type", "constant", "variable", "class", "interface" } },
@@ -1193,4 +1193,7 @@ test {
     _ = &plan_mode_tool;
     _ = &task_tools;
     _ = &agent_tool;
+    _ = &code_map_tool;
+    _ = &find_symbol_tool;
+    _ = &@import("tools/symbol_provider.zig");
 }

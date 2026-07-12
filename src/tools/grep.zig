@@ -493,12 +493,20 @@ test "isBareIdentifier 仅接受裸标识符,拒绝正则/空格/点号" {
     try std.testing.expect(!isBareIdentifier("a" ** 129)); // 超长
 }
 
-test "Grep 搭车:裸标识符前置 FindSymbol 定义块;正则不触发" {
-    const ctx = testCtx();
-    // 写一个真 .zig fixture(含 clamp 定义),用 per-pid 唯一目录避免并发撞车。
+test "Grep 搭车:裸标识符前置 FindSymbol 定义块;正则不触发(需 zls,Y2 LSP 符号)" {
+    const a = std.testing.allocator;
+    // Y2 砍 tree-sitter 后:FindSymbol 走 LSP documentSymbol,搭车需 ctx.lsp + git workspace + zls。
+    const lsp_servers = @import("../lsp/servers.zig");
+    var zbuf: [std.fs.max_path_bytes]u8 = undefined;
+    if (lsp_servers.which("zls", &zbuf) == null) return; // 未装 zls → skip
+
+    // per-pid 唯一目录 + fake .git 过 workspace gate。
     var dbuf: [256]u8 = undefined;
-    const dir = tt.path(&dbuf, "grep-hitch"); // per-pid 子目录
+    const dir = tt.path(&dbuf, "grep-hitch");
     _ = std.c.mkdir(dir.ptr, 0o755);
+    var gbuf: [320]u8 = undefined;
+    const gdir = std.fmt.bufPrintZ(&gbuf, "{s}/.git", .{dir}) catch unreachable;
+    _ = std.c.mkdir(gdir.ptr, 0o755);
     var fbuf: [320]u8 = undefined;
     const fpath = std.fmt.bufPrintZ(&fbuf, "{s}/sample.zig", .{dir}) catch unreachable;
     defer _ = std.c.unlink(fpath.ptr);
@@ -510,15 +518,20 @@ test "Grep 搭车:裸标识符前置 FindSymbol 定义块;正则不触发" {
         _ = std.c.close(fd);
     }
 
-    // ① 裸标识符 "clamp" → 应前置定义块
+    const Service = @import("../lsp/service.zig").Service;
+    var svc = Service.create(a, dir, null) catch return;
+    defer svc.shutdown();
+    var ctx = testCtx();
+    ctx.lsp = svc;
+
+    // ① 裸标识符 "clamp" → 应前置定义块(zls documentSymbol 报 clamp Function)
     {
         var abuf: [320]u8 = undefined;
         const args = try std.fmt.bufPrint(&abuf, "{{\"pattern\":\"clamp\",\"path\":\"{s}\",\"output_mode\":\"content\"}}", .{dir});
         const r = try execute(&ctx, args);
-        defer std.testing.allocator.free(r);
+        defer a.free(r);
         try std.testing.expect(std.mem.indexOf(u8, r, "via FindSymbol") != null);
         try std.testing.expect(std.mem.indexOf(u8, r, "all grep matches below") != null);
-        // 定义块在 grep 结果之前
         const def_pos = std.mem.indexOf(u8, r, "via FindSymbol").?;
         const sep_pos = std.mem.indexOf(u8, r, "all grep matches below").?;
         try std.testing.expect(def_pos < sep_pos);
@@ -528,7 +541,7 @@ test "Grep 搭车:裸标识符前置 FindSymbol 定义块;正则不触发" {
         var abuf: [320]u8 = undefined;
         const args = try std.fmt.bufPrint(&abuf, "{{\"pattern\":\"clamp.*i32\",\"path\":\"{s}\",\"output_mode\":\"content\"}}", .{dir});
         const r = try execute(&ctx, args);
-        defer std.testing.allocator.free(r);
+        defer a.free(r);
         try std.testing.expect(std.mem.indexOf(u8, r, "via FindSymbol") == null);
     }
 }

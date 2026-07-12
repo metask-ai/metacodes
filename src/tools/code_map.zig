@@ -10,8 +10,8 @@ const std = @import("std");
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
 const toolchain = @import("../util/toolchain.zig");
-const ts = @import("../treesitter/ts.zig");
-const symbols = @import("../treesitter/symbols.zig");
+const symbols = @import("../symbols/symbol.zig");
+const symbol_provider = @import("symbol_provider.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
 /// 单次 CodeMap 最多处理的文件数(glob 命中很多时防失控)。
@@ -22,26 +22,23 @@ const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 /// 读到此上限就 killpg 止血。路径均长 ~80B × MAX_FILES=200 ≈ 16KB,256KB 给足余量。
 const LIST_BYTE_CAP: usize = 256 * 1024;
 
-/// 渲染单文件大纲为缩进文本树(供 Read 工具的 outline 模式复用)。
-/// 调用方拥有返回串。lang 已知、source 已读。空符号 → "(no symbols)\n"。
+/// 渲染单文件大纲为缩进文本树(供 Read 工具的 outline 模式复用)。调用方拥有返回串。
+/// **无符号/解析失败 → 返回 null**(Linus S1:让 Read 回退正常
+/// 读取,而非把 "(no symbols)" 当内容返回——纯 LSP 语言遇 flaky server 不会退化成空大纲)。
 pub fn renderOutlineForSource(
+    ctx: *const ToolContext,
     allocator: std.mem.Allocator,
     file: []const u8,
     source: []const u8,
-    lang: ts.Lang,
-) ![]u8 {
+) !?[]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     const w = &out.writer;
 
-    var syms = symbols.extractSymbols(allocator, file, source, lang) catch {
-        return try allocator.dupe(u8, "(outline unavailable: parse failed)\n");
-    };
+    var syms = symbol_provider.extractSymbols(ctx, allocator, file, source) catch return null;
     defer syms.deinit();
 
-    if (syms.items.len == 0) {
-        return try allocator.dupe(u8, "(no symbols)\n");
-    }
+    if (syms.items.len == 0) return null;
     try renderTree(w, syms.items);
     return try out.toOwnedSlice();
 }
@@ -54,12 +51,6 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // ** 不被词法折叠影响;~ 必须展开(openat/rg 都不认)。
     const path = try path_mod.normalizeChecked(allocator, path_raw, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
     defer allocator.free(path);
-
-    // lang 覆盖(可选);否则按扩展名推断。显式给了但不认识 → 报错(不静默忽略 typo)。
-    const lang_override: ?ts.Lang = if (common.extractJsonArg(args, "lang")) |l|
-        (langFromName(l) orelse return error.UnsupportedLanguage)
-    else
-        null;
 
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
@@ -85,11 +76,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
                 break;
             }
             try ctx.throwIfAborted();
-            try mapOneFile(allocator, w, f, lang_override);
+            try mapOneFile(ctx, allocator, w, f);
             shown += 1;
         }
     } else {
-        try mapOneFile(allocator, w, path, lang_override);
+        try mapOneFile(ctx, allocator, w, path);
     }
 
     if (out.written().len == 0) {
@@ -101,15 +92,15 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 /// 处理单个文件:读盘 → 推断语言 → 抽符号 → 渲染缩进树。
 /// 失败(读不了/不支持的语言/解析空)只输出一行说明,不中断整体。
 fn mapOneFile(
+    ctx: *const ToolContext,
     allocator: std.mem.Allocator,
     w: *std.Io.Writer,
     file: []const u8,
-    lang_override: ?ts.Lang,
 ) !void {
-    const lang = lang_override orelse ts.Lang.fromPath(file) orelse {
-        try w.print("{s}\n  (unsupported language)\n", .{file});
+    if (!symbol_provider.hasSymbolsFor(ctx, file)) {
+        try w.print("{s}\n  (no LSP server for this file; run with --lsp and install the language server)\n", .{file});
         return;
-    };
+    }
 
     const source = readFile(allocator, file) catch |e| {
         try w.print("{s}\n  (cannot read: {s})\n", .{ file, @errorName(e) });
@@ -122,7 +113,7 @@ fn mapOneFile(
         return;
     }
 
-    var syms = symbols.extractSymbols(allocator, file, source, lang) catch |e| {
+    var syms = symbol_provider.extractSymbols(ctx, allocator, file, source) catch |e| {
         try w.print("{s}\n  (parse failed: {s})\n", .{ file, @errorName(e) });
         return;
     };
@@ -231,18 +222,3 @@ fn listFiles(allocator: std.mem.Allocator, glob: []const u8, ctx: *const ToolCon
     return try files.toOwnedSlice(allocator);
 }
 
-fn langFromName(name: []const u8) ?ts.Lang {
-    const Pair = struct { n: []const u8, l: ts.Lang };
-    const table = [_]Pair{
-        .{ .n = "zig", .l = .zig },
-        .{ .n = "typescript", .l = .typescript },
-        .{ .n = "tsx", .l = .tsx },
-        .{ .n = "python", .l = .python },
-        .{ .n = "c", .l = .c },
-        .{ .n = "bash", .l = .bash },
-    };
-    for (table) |p| {
-        if (std.mem.eql(u8, name, p.n)) return p.l;
-    }
-    return null;
-}

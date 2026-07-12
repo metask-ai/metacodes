@@ -12,6 +12,8 @@ pub const Config = struct {
     permission_mode: PermissionMode = .prompt,
     no_theme: bool = false,
     verbose: bool = false,
+    /// LSP 被动诊断(Y2):`--lsp` 开启。opt-in——默认关,保持零依赖 + 零启动开销。
+    lsp_enabled: bool = false,
     /// 编辑器模式:false=emacs(默认) / true=vim。`/vim` 命令切换。
     vim_mode: bool = false,
     /// Headless 模式：非 null 时跑单次 prompt 后退出，不进 REPL。

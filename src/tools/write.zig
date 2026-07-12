@@ -66,7 +66,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (st) |s| rs.recordHashed(path, s.mtime_ns, s.size, std.hash.Wyhash.hash(0, content)) catch {};
     }
 
-    // 旁路缓存新旧全文(供 diff 工具卡 tree-sitter 高亮;不进对话历史)。新建文件 old="".
+    // 旁路缓存新旧全文(供 diff 工具卡 hl-zig 高亮;不进对话历史)。新建文件 old="".
     if (ctx.edit_hl_cache) |cache| {
         cache.put(ctx.progress_tool_id, old_content orelse "", content);
     }
@@ -74,7 +74,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // B/C 合并:memdir 记忆 markdown 自动入图(best-effort,失败仅 log 不影响写结果)。
     @import("../kg/autosync.zig").maybeImportMemoryFile(ctx, path, content);
 
-    return try renderResult(allocator, path, old_content orelse "", content);
+    // M2:LSP baseline 移到盘写后(新建文件 old="")——盘写不被 LSP 阻塞,只结果等诊断。
+    @import("lsp_diag.zig").snapshotBaseline(ctx, path, old_content orelse "");
+
+    return try renderResult(ctx, allocator, path, old_content orelse "", content);
 }
 
 /// 读已存在文件全文（不存在返 error）。供 Write 计算 diff。
@@ -84,8 +87,8 @@ fn readExisting(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     return try common.readAllFromFd(fd, allocator);
 }
 
-/// 渲染 Write 成功结果：success + path + structuredPatch + gitDiff。
-fn renderResult(allocator: std.mem.Allocator, path: []const u8, old_content: []const u8, new_content: []const u8) ![]u8 {
+/// 渲染 Write 成功结果：success + path + structuredPatch + gitDiff (+ lspDiagnostics)。
+fn renderResult(ctx: *const ToolContext, allocator: std.mem.Allocator, path: []const u8, old_content: []const u8, new_content: []const u8) ![]u8 {
     const patch_mod = @import("../core/patch.zig");
     var patch = patch_mod.compute(allocator, old_content, new_content) catch {
         // diff 失败不致命：退回最简结果
@@ -106,6 +109,8 @@ fn renderResult(allocator: std.mem.Allocator, path: []const u8, old_content: []c
     try out.writer.writeAll(structured);
     try out.writer.writeAll(",\"gitDiff\":");
     try std.json.Stringify.encodeJsonString(git_diff, .{}, &out.writer);
+    // LSP 被动诊断:写后 delta 诊断附进结果(新建文件的诊断也报)。
+    try @import("lsp_diag.zig").appendToResult(ctx, allocator, &out.writer, path, new_content);
     try out.writer.writeByte('}');
     return try out.toOwnedSlice();
 }

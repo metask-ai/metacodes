@@ -70,7 +70,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     if (cells_ptr.* != .array) return error.InvalidCellsField;
     var cells_list = &cells_ptr.array; // ArrayList Managed
 
-    // 操作 cells。同时记录 old/new source(供 diff 展示 + tree-sitter 高亮)。
+    // 操作 cells。同时记录 old/new source(供 diff 展示 + hl-zig 高亮)。
     var old_src: []const u8 = "";
     var new_src: []const u8 = "";
     var is_markdown = std.mem.eql(u8, cell_type, "markdown");
@@ -115,7 +115,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // cell 语言(供高亮):markdown cell 不高亮代码;code cell 用 notebook language_info.name(默认 python)。
     const lang: []const u8 = if (is_markdown) "" else notebookLang(root);
 
-    // 旁路缓存 cell 新旧 source(供工具卡 tree-sitter 高亮;不进对话历史)。
+    // 旁路缓存 cell 新旧 source(供工具卡 hl-zig 高亮;不进对话历史)。
     if (ctx.edit_hl_cache) |cache| {
         cache.put(ctx.progress_tool_id, old_src, new_src);
     }

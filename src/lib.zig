@@ -8,8 +8,9 @@
 //!
 //! 接入方式见 doc/LIB_API.md;最小示例见 example/main.zig。
 //!
-//! 注意:库经 tools/* 用到 tree-sitter(CodeMap/FindSymbol/Edit 语法检查/Read outline),
-//! 消费方的 build.zig 须给该 module 接 tree-sitter C(见 doc/LIB_API.md 安装节)。
+//! 注意:库经 tools/* 用到 hl-zig 高亮 module(diff 着色);消费方的 build.zig 须给该 module
+//! 接 hl-zig(addImport("hl", ...),纯 Zig 零 C 依赖)。CodeMap/FindSymbol/Read outline 的符号
+//! 来自 LSP(运行时 --lsp,无编译期依赖)。tree-sitter 已于 2026-07-13 整体移除。
 
 const std = @import("std");
 

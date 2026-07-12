@@ -1,15 +1,15 @@
 //! FindSymbol 工具(默认常驻;2026-06-08 从 deferred 提出):跨文件找符号*定义*位置。
 //! 不同于 Grep(返回所有出现),只返回定义,带 file:line + 签名。
 //!
-//! 先快后准:rg -l -w <name> 找候选文件 → 逐个 tree-sitter 抽符号、留 name 匹配的定义。
-//! 输出 JSON 数组,便于模型/上层解析。
+//! 先快后准:rg -l -w <name> 找候选文件 → 逐个经 LSP documentSymbol 抽符号、留 name 匹配的定义。
+//! 需 `--lsp` + 对应 language server(Y2 砍 tree-sitter 后)。输出 JSON 数组,便于模型/上层解析。
 const std = @import("std");
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
 const read_state = @import("../core/read_state.zig");
 const toolchain = @import("../util/toolchain.zig");
-const ts = @import("../treesitter/ts.zig");
-const symbols = @import("../treesitter/symbols.zig");
+const symbols = @import("../symbols/symbol.zig");
+const symbol_provider = @import("symbol_provider.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
 const MAX_CANDIDATE_FILES: usize = 300;
@@ -22,6 +22,13 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
     const name = common.extractJsonArg(args, "name") orelse return error.MissingName;
     if (name.len == 0) return error.EmptyName;
+
+    // Y2 砍 tree-sitter 后符号只来自 LSP。无 --lsp → 带提示的空结果,别用裸 `[]` 把"能力缺失"
+    // 伪装成"查无定义"(否则模型误判该符号不存在走错路;对齐 CodeMap 的 "(no LSP server...)" 提示)。
+    if (ctx.lsp == null) {
+        return try allocator.dupe(u8, "[]\n(FindSymbol needs --lsp and an installed language server to resolve definitions; none is configured. This empty result does NOT mean the symbol is undefined — use Grep to search text, or restart with --lsp.)");
+    }
+
     const path_raw = common.extractJsonArg(args, "path") orelse ".";
     // 归一化(展开 ~、折叠、查 traversal)。rg 经 execve 不认 ~。
     const path = try path_mod.normalizeChecked(allocator, path_raw, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
@@ -76,7 +83,7 @@ pub fn findDefinitions(
     var processed: usize = 0;
     for (files) |file| {
         if (processed >= MAX_CANDIDATE_FILES) break;
-        const lang = ts.Lang.fromPath(file) orelse continue;
+        if (!symbol_provider.hasSymbolsFor(ctx, file)) continue; // 有 LSP server 才抽符号(--lsp)
         processed += 1;
         try ctx.throwIfAborted();
 
@@ -84,7 +91,7 @@ pub fn findDefinitions(
         defer allocator.free(source);
         if (source.len > MAX_SOURCE_BYTES) continue;
 
-        var syms = symbols.extractSymbols(allocator, file, source, lang) catch continue;
+        var syms = symbol_provider.extractSymbols(ctx, allocator, file, source) catch continue;
         defer syms.deinit();
 
         for (syms.items) |s| {
@@ -110,7 +117,6 @@ fn dupeSymbol(allocator: std.mem.Allocator, s: symbols.Symbol) !symbols.Symbol {
         .signature = try allocator.dupe(u8, s.signature),
         .parent = if (s.parent) |p| try allocator.dupe(u8, p) else null,
         .doc = if (s.doc) |d| try allocator.dupe(u8, d) else null,
-        .lang = s.lang,
     };
 }
 
@@ -193,4 +199,14 @@ fn listCandidateFiles(
         cursor = nl + 1;
     }
     return try files.toOwnedSlice(allocator);
+}
+
+test "FindSymbol 无 --lsp → 带提示的空结果(非裸 [],不伪装查无)" {
+    const a = std.testing.allocator;
+    const ctx = ToolContext.simple(a); // 无 lsp
+    const r = try execute(&ctx, "{\"name\":\"Foo\"}");
+    defer a.free(r);
+    // 不是裸 "[]";含引导 --lsp 的提示,模型能区分"能力缺失"vs"查无定义"。
+    try std.testing.expect(std.mem.indexOf(u8, r, "--lsp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "does NOT mean") != null);
 }

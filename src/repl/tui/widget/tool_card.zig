@@ -23,8 +23,8 @@ const theme_mod = @import("../theme.zig");
 const layout = @import("../layout.zig");
 const term = @import("../term.zig");
 const render_mod = @import("../../render.zig");
-const ts = @import("../../../treesitter/ts.zig");
-const highlight = @import("../../../treesitter/highlight.zig");
+const highlight = @import("../../../highlight/highlight.zig");
+const hl_adapter = @import("../../../highlight/hl_adapter.zig");
 const Theme = theme_mod.Theme;
 
 pub const RenderOpts = struct {
@@ -38,7 +38,7 @@ pub const RenderOpts = struct {
     verbose: bool = false,
     /// transcript 历史视图(对齐 cc isTranscriptMode):语义同 verbose(展开)。
     transcript: bool = false,
-    /// Edit/Write diff 的 tree-sitter 高亮缓存(按 tool_id 取新旧全文)。null → 退回关键字表。
+    /// Edit/Write diff 的 hl-zig 高亮缓存(按 tool_id 取新旧全文)。null → 退回关键字表。
     edit_hl_cache: ?*@import("../../../core/edit_hl_cache.zig").EditHlCache = null,
     /// 本次 tool_use id(查 edit_hl_cache 用)。
     tool_id: []const u8 = "",
@@ -553,7 +553,7 @@ fn renderResultBody(
     }
     if (std.mem.eql(u8, tool_name, "ApplyPatch")) {
         // 多文件 patch:结果 gitDiff 逐文件拼接。摘要行 A/M/D 计数 + diff 渲染(+/-)。
-        // tree-sitter 高亮仅覆盖首个改动文件(edit_hl_cache 单对);其余按纯 +/- 着色。
+        // hl-zig 高亮仅覆盖首个改动文件(edit_hl_cache 单对);其余按纯 +/- 着色。
         const a_n = extractJsonNumberField(output_text, "added") orelse 0;
         const m_n = extractJsonNumberField(output_text, "modified") orelse 0;
         const d_n = extractJsonNumberField(output_text, "deleted") orelse 0;
@@ -563,7 +563,7 @@ fn renderResultBody(
         return renderEditDiffImpl(alloc, th, output_text, out, opts, false);
     }
     if (std.mem.eql(u8, tool_name, "NotebookEdit")) {
-        // cell 改动有 gitDiff → 摘要行 + diff 渲染(tree-sitter 高亮,lang 从结果取);
+        // cell 改动有 gitDiff → 摘要行 + diff 渲染(hl-zig 高亮,lang 从结果取);
         // 无 gitDiff(纯结构改/patch 失败)→ 退回 JSON 摘要。
         if (extractJsonStringField(output_text, "gitDiff") != null) {
             const mode = extractJsonStringField(output_text, "mode") orelse "edit";
@@ -869,17 +869,17 @@ fn renderEditDiffImpl(alloc: std.mem.Allocator, th: Theme, output_text: []const 
     const explicit_lang = extractField(output_text, "lang");
     const lang = if (explicit_lang) |l| l else langFromPath(fpath);
 
-    // tree-sitter 高亮:从旁路缓存按 tool_id 取新文件全文 → 整文件解析 → 按行 span 索引。
-    // 命中失败/不支持语言/解析失败 → hl_opt 保持 null,appendDiffLine 退回关键字表(零回归)。
+    // Y2:hl-zig 轻量高亮(替换 tree-sitter)。从旁路缓存按 tool_id 取新文件全文 → tokenize → 按行 span。
+    // 命中失败/不支持语言/tokenize 失败 → hl_opt 保持 null,appendDiffLine 退回关键字表(零回归)。
     var hl_opt: ?highlight.Highlights = null;
     defer if (hl_opt) |*h| h.deinit();
     if (opts.edit_hl_cache) |cache| {
         if (cache.get(opts.tool_id)) |entry| {
-            // ts.Lang:显式 lang 字段优先(langFromTsName),否则按文件扩展名。
-            const tslang_opt = if (explicit_lang) |l| tsLangFromName(l) else ts.Lang.fromPath(fpath);
-            if (tslang_opt) |tslang| {
-                hl_opt = highlight.highlightFile(alloc, entry.new, tslang) catch null;
-            }
+            // 显式 lang 字段(如 NotebookEdit)优先按名查,否则按文件扩展名。
+            hl_opt = if (explicit_lang) |l|
+                hl_adapter.highlightFileByName(alloc, entry.new, l) catch null
+            else
+                hl_adapter.highlightFileByPath(alloc, entry.new, fpath) catch null;
         }
     }
     const hl_ptr: ?*const highlight.Highlights = if (hl_opt) |*h| h else null;
@@ -1018,7 +1018,7 @@ fn appendDiffLine(alloc: std.mem.Allocator, th: Theme, out: *std.ArrayList(u8), 
     try out.append(alloc, '\n');
 }
 
-/// 给 diff 行内容着色。优先 tree-sitter span(add/ctx 行,缓存命中且行文本字节匹配),
+/// 给 diff 行内容着色。优先 hl-zig span(add/ctx 行,缓存命中且行文本字节匹配),
 /// 否则退回关键字表 highlightCodeLine(del 行/无缓存/不匹配 → 零回归)。
 /// num = 该行行号(add/ctx 的 new 行号);base = token 间重铺的底色(含 bg + del 的 dim)。
 fn colorLineContent(
@@ -1032,7 +1032,7 @@ fn colorLineContent(
     num: usize,
     kind: DiffLineKind,
 ) !void {
-    // tree-sitter span 路径:仅 add/ctx(在新文件,有 new 行号)且行文本与缓存内容字节相等。
+    // hl-zig span 路径:仅 add/ctx(在新文件,有 new 行号)且行文本与缓存内容字节相等。
     if (hl) |h| {
         if (kind != .del) {
             if (h.textForLine(num)) |file_line| {
@@ -1094,23 +1094,6 @@ fn groupColor(th: Theme, group: highlight.Group) []const u8 {
         .punctuation => th.syntax.punctuation,
         .none => "",
     };
-}
-
-/// 语言名(结果 "lang" 字段)→ ts.Lang。供 NotebookEdit 等显式带语言的工具。
-fn tsLangFromName(name: []const u8) ?ts.Lang {
-    const Pair = struct { n: []const u8, l: ts.Lang };
-    const table = [_]Pair{
-        .{ .n = "zig", .l = .zig },
-        .{ .n = "python", .l = .python },
-        .{ .n = "typescript", .l = .typescript },
-        .{ .n = "tsx", .l = .tsx },
-        .{ .n = "c", .l = .c },
-        .{ .n = "bash", .l = .bash },
-    };
-    for (table) |p| {
-        if (std.mem.eql(u8, name, p.n)) return p.l;
-    }
-    return null;
 }
 
 /// 文件扩展名 → 语法高亮语言标记(render.classifyLang 能认的名)。

@@ -142,7 +142,7 @@ pub fn describeCodeMap(allocator: std.mem.Allocator, ctx: *const PromptContext) 
         \\Produce a structural outline of SOURCE CODE — every function, type, class, constant, and method with its line number and signature — without reading the file bodies.
         \\
         \\Usage:
-        \\- This tool is for source code only (zig, typescript, tsx, python, c, bash). For plain-text, config, JSON, Markdown, or other non-code files, fall back to Read or Grep.
+        \\- This tool is for source code only and requires --lsp plus an installed language server (zls, pyright, typescript-language-server, gopls, rust-analyzer, clangd, …). For plain-text, config, JSON, Markdown, non-code files, or when no server is available, fall back to Read or Grep.
         \\- ALWAYS prefer CodeMap over reading a whole file when your goal is to LOCATE definitions (where is function X? what methods does this type have? what's the shape of this module?). It returns just the skeleton, costing a fraction of the tokens of a full Read.
         \\- Pass a single file path to map one file, or a glob (e.g. `src/**/*`) to map many files at once — ideal for getting your bearings in an unfamiliar module or directory. The language of each file is inferred from its extension.
         \\- Typical workflow: CodeMap to find WHERE something is defined → Read with offset+limit to pull just that range → Edit. Reserve a full-file Read for when you genuinely need the entire contents.

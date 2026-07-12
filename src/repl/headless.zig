@@ -46,6 +46,7 @@ pub fn run(
             .verbose = app.config.verbose,
             .abort = &app.abort,
             .read_state = &app.read_state,
+            .lsp = app.lsp_service, // Y2:headless 也接 LSP 诊断
             .jobs = jobs_ptr,
             .agent_jobs = if (app.agent_jobs) |*aj| aj else null,
             .plan_prev_mode = &app.plan_prev_mode,

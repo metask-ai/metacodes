@@ -114,9 +114,11 @@ pub const App = struct {
     background_request: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     skills: SkillSet,
     read_state: ReadState,
-    /// Edit/Write 旁路高亮缓存(tool_id → 新旧全文)。供 diff 工具卡 tree-sitter 着色;
+    /// Edit/Write 旁路高亮缓存(tool_id → 新旧全文)。供 diff 工具卡 hl-zig 着色;
     /// 不进对话历史。session 退出 deinit。
     edit_hl_cache: @import("core/edit_hl_cache.zig").EditHlCache,
+    /// LSP 被动诊断服务(Y2;仅 --lsp 开启时非 null)。Edit/Write finalizeWrite 用。session 退出 shutdown。
+    lsp_service: ?*@import("lsp/service.zig").Service = null,
     /// Session transcript writer；失败初始化则保持 null（日志落盘 fallback）
     transcript_writer: ?transcript.Writer = null,
     /// 本 session 累计用量（跨多 turn）
@@ -380,6 +382,24 @@ pub const App = struct {
             break :blk null;
         };
 
+        // LSP 被动诊断服务(Y2;仅 --lsp)。best-effort:创建失败仅 log,不阻断启动。
+        // abort 适配:app.abort(AbortSignal)→ LSP 中立 AbortCheck,让 LSP 等待可 Ctrl+C 中断(M2)。
+        if (config.lsp_enabled) {
+            const lsp_abort = @import("lsp/transport.zig").AbortCheck{
+                .ctx = @ptrCast(&app.abort),
+                .isAbortedFn = struct {
+                    fn f(c: *anyopaque) bool {
+                        return @as(*const AbortSignal, @ptrCast(@alignCast(c))).isAborted();
+                    }
+                }.f,
+            };
+            app.lsp_service = @import("lsp/service.zig").Service.create(allocator, app.cwdAbs(), lsp_abort) catch |err| blk: {
+                @import("util/log.zig").warn("lsp", "service init failed: {s} (LSP disabled)", .{@errorName(err)});
+                break :blk null;
+            };
+            if (app.lsp_service != null) @import("util/log.zig").info("lsp", "LSP passive diagnostics enabled (--lsp)", .{});
+        }
+
         // 构造 system prompt（依赖 config.model）。# Using your tools 段按 enabled_tool_names
         // 动态裁剪（对应 cc getUsingYourToolsSection(enabledTools)）。失败仅 log，保持 null。
         app.system_prompt = system_prompt_mod.buildFull(allocator, app.config.model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady()) catch |err| blk: {
@@ -458,6 +478,7 @@ pub const App = struct {
         app.skills.deinit();
         app.read_state.deinit();
         app.edit_hl_cache.deinit();
+        if (app.lsp_service) |svc| svc.shutdown(); // 关所有 language server + reaper 线程
         app.tasks.deinit();
         app.goal_state.deinit();
         // MCP：先 session（释放 binding 内存）再 client（关 transport + reap 子进程）

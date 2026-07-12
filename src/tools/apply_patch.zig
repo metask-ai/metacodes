@@ -529,7 +529,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         }
     }
 
-    // 首个修改文件存 edit_hl_cache(供工具卡 tree-sitter 高亮;多文件仅首个)。
+    // 首个修改文件存 edit_hl_cache(供工具卡 hl-zig 高亮;多文件仅首个)。
     if (ctx.edit_hl_cache) |cache| {
         for (plans.items) |pl| {
             if (pl.kind == .add or pl.kind == .update or pl.kind == .move) {

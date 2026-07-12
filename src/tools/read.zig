@@ -2,9 +2,8 @@ const std = @import("std");
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
 const read_state = @import("../core/read_state.zig");
-const ts = @import("../treesitter/ts.zig");
-const registry = @import("../treesitter/registry.zig");
 const code_map = @import("code_map.zig");
+const symbol_provider = @import("symbol_provider.zig");
 const ToolContext = @import("context.zig").ToolContext;
 const tt = @import("test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 
@@ -38,10 +37,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // outline 模式(opt-in):返回符号大纲(函数/类型/类 + 行号 + 签名)而非文件内容。
     // 仅对**有 symbols 查询**的语言(json/yaml 等仅高亮语言无大纲 → 回退正常读取,向后兼容)。
     if (isTrue(common.extractJsonArg(args, "outline"))) {
-        if (ts.Lang.fromPath(path)) |lang| {
-            if (registry.hasSymbols(lang)) return try readOutline(allocator, path, lang);
+        // LSP server 能出符号 → 大纲;无符号(flaky server/无 server 语言)→ null → 回退正常读。
+        if (symbol_provider.hasSymbolsFor(ctx, path)) {
+            if (try readOutline(allocator, ctx, path)) |outline| return outline;
         }
-        // 不支持/无 symbols 的语言 → 落到正常读取路径
+        // 不支持/无 symbols/大纲为空 → 落到正常读取路径
     }
 
     const has_offset = common.extractJsonArg(args, "offset") != null;
@@ -63,14 +63,13 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const st = read_state.statFd(fd) catch null;
 
     // 大文件守卫:整读(未显式传 offset/limit)且 > MAX_FILE_BYTES → 不再死胡同报错;
-    // 若是 tree-sitter 支持的语言,返回符号大纲 + 提示(用 offset/limit 读具体范围);
-    // 否则维持原"too large"错误串(不支持的语言无法出大纲)。显式 offset/limit 放行。
+    // 若有 LSP server(--lsp),返回符号大纲 + 提示(用 offset/limit 读具体范围);
+    // 否则维持原"too large"错误串(无 server 无法出大纲)。显式 offset/limit 放行。
     if (!has_offset and !has_limit) {
         if (st) |s| {
             if (s.size > MAX_FILE_BYTES) {
-                if (ts.Lang.fromPath(path)) |lang| {
-                    if (registry.hasSymbols(lang)) {
-                        const outline = try readOutlineFromFd(allocator, path, lang, fd);
+                if (symbol_provider.hasSymbolsFor(ctx, path)) {
+                    if (try readOutlineFromFd(allocator, ctx, path, fd)) |outline| {
                         defer allocator.free(outline);
                         return try std.fmt.allocPrint(allocator, "File too large to show in full ({d} bytes, limit {d}). Outline below; Read a range with offset+limit for bodies.\n\n{s}", .{ s.size, MAX_FILE_BYTES, outline });
                     }
@@ -113,52 +112,41 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     const rendered = try renderWithLineNumbers(full[line_start..end], offset_1based, allocator);
 
-    // 弱提示(搭车):整读(无 offset/limit)一个**能被 tree-sitter 解析出符号**的源码文件时,
-    // 在结果末尾追加一句 system-reminder,引导"定位定义可用 CodeMap/FindSymbol 更快"。
-    // 频控:同一文件本 session 只提一次(read_state.hinted),避免反复读同文件时唠叨。
-    // 触发条件(全满足):无 offset/limit + tree-sitter 支持的语言 + >150 行 + 能抽出符号 + 没提过。
-    // "能抽出符号"避免对空文件/纯注释/解析失败的源码误提("对它 CodeMap 也没用")。
-    if (!has_offset and !has_limit) {
-        if (ts.Lang.fromPath(path)) |lang| {
-            const total_lines = std.mem.count(u8, full, "\n") + 1;
-            const already = if (ctx.read_state) |rs| rs.wasHinted(path) else false;
-            if (total_lines > 150 and !already and sourceHasSymbols(allocator, path, full, lang)) {
-                if (ctx.read_state) |rs| rs.markHinted(path);
-                defer allocator.free(rendered);
-                return try std.fmt.allocPrint(allocator,
-                    "{s}\n\n<system-reminder>This is a {d}-line source file. If you only need to find where something is defined, CodeMap (a structural outline) or FindSymbol (jump to a named definition) would be faster and cheaper than reading the whole file.</system-reminder>",
-                    .{ rendered, total_lines });
-            }
+    // 弱提示(搭车):整读(无 offset/limit)一个**有 LSP server 的**大源码文件时,在结果末尾追加
+    // system-reminder,引导"定位定义可用 CodeMap/FindSymbol 更快"。频控:同一文件本 session 只提
+    // 一次(read_state.hinted)。触发(全满足):无 offset/limit + hasSymbolsFor(有 server)+ >150 行 +
+    // 没提过。Y2 砍 tree-sitter 后不再廉价解析验"真有符号"(为 hint 起 LSP server 太浪费)——用
+    // "有 server" 作 CodeMap/FindSymbol 可用的代理,过度提示的代价仅一句软提醒。
+    if (!has_offset and !has_limit and symbol_provider.hasSymbolsFor(ctx, path)) {
+        const total_lines = std.mem.count(u8, full, "\n") + 1;
+        const already = if (ctx.read_state) |rs| rs.wasHinted(path) else false;
+        if (total_lines > 150 and !already) {
+            if (ctx.read_state) |rs| rs.markHinted(path);
+            defer allocator.free(rendered);
+            return try std.fmt.allocPrint(allocator,
+                "{s}\n\n<system-reminder>This is a {d}-line source file. If you only need to find where something is defined, CodeMap (a structural outline) or FindSymbol (jump to a named definition) would be faster and cheaper than reading the whole file.</system-reminder>",
+                .{ rendered, total_lines });
         }
     }
     return rendered;
-}
-
-/// 试 tree-sitter 抽符号,有 ≥1 个定义则 true。供 Read 弱提示门控:只对"CodeMap 真能出东西"
-/// 的源码文件提示。解析失败/无符号 → false(不提)。
-fn sourceHasSymbols(allocator: std.mem.Allocator, path: []const u8, source: []const u8, lang: ts.Lang) bool {
-    const symbols = @import("../treesitter/symbols.zig");
-    var syms = symbols.extractSymbols(allocator, path, source, lang) catch return false;
-    defer syms.deinit();
-    return syms.items.len > 0;
 }
 
 fn isTrue(s: ?[]const u8) bool {
     return s != null and std.mem.eql(u8, s.?, "true");
 }
 
-/// outline 模式:打开文件、读全量、渲染符号大纲。调用方拥有返回串。
-fn readOutline(allocator: std.mem.Allocator, path: []const u8, lang: ts.Lang) ![]u8 {
+/// outline 模式:打开文件、读全量、渲染符号大纲。**无符号 → null**(调用方回退正常读)。
+fn readOutline(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []const u8) !?[]u8 {
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
     defer _ = std.c.close(fd);
-    return try readOutlineFromFd(allocator, path, lang, fd);
+    return try readOutlineFromFd(allocator, ctx, path, fd);
 }
 
-/// 已有 fd 时渲染大纲(大文件守卫路径复用,避免重开)。
-fn readOutlineFromFd(allocator: std.mem.Allocator, path: []const u8, lang: ts.Lang, fd: std.posix.fd_t) ![]u8 {
+/// 已有 fd 时渲染大纲(大文件守卫路径复用,避免重开)。无符号 → null。
+fn readOutlineFromFd(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []const u8, fd: std.posix.fd_t) !?[]u8 {
     const source = try common.readAllFromFd(fd, allocator);
     defer allocator.free(source);
-    return try code_map.renderOutlineForSource(allocator, path, source, lang);
+    return try code_map.renderOutlineForSource(ctx, allocator, path, source);
 }
 
 
@@ -467,9 +455,17 @@ test "ReadTool 超长单行被截断 + 标记" {
     try std.testing.expect(xcount <= MAX_LINE_BYTES);
 }
 
-test "Read 弱提示:>150行源码末尾追加 CodeMap reminder;小文件不追加" {
-    const ctx = testCtx();
-    // 大源码文件(200 行 .zig)→ 应带 reminder
+test "Read 弱提示:--lsp 开 + >150行有 server 语言 → CodeMap reminder;小文件/非源码/无 --lsp 不追加" {
+    const a = std.testing.allocator;
+    // Y2 砍 tree-sitter 后:hint 由 hasSymbolsFor gate(需 ctx.lsp 开 + 该扩展名有注册 server;
+    // findServerForFile 是纯扩展名注册表查,不需真装 server)。
+    const Service = @import("../lsp/service.zig").Service;
+    var svc = Service.create(a, "/tmp", null) catch return;
+    defer svc.shutdown();
+    var ctx = testCtx();
+    ctx.lsp = svc;
+
+    // 大源码文件(200 行 .zig,有 zls server 注册)→ 带 reminder
     {
         const path = "/tmp/cc-zig-read-hint-big.zig";
         const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
@@ -483,7 +479,7 @@ test "Read 弱提示:>150行源码末尾追加 CodeMap reminder;小文件不追�
         defer _ = std.c.unlink(path);
 
         const r = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-read-hint-big.zig\"}");
-        defer std.testing.allocator.free(r);
+        defer a.free(r);
         try std.testing.expect(std.mem.indexOf(u8, r, "<system-reminder>") != null);
         try std.testing.expect(std.mem.indexOf(u8, r, "CodeMap") != null);
     }
@@ -498,10 +494,10 @@ test "Read 弱提示:>150行源码末尾追加 CodeMap reminder;小文件不追�
         defer _ = std.c.unlink(path);
 
         const r = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-read-hint-small.zig\"}");
-        defer std.testing.allocator.free(r);
+        defer a.free(r);
         try std.testing.expect(std.mem.indexOf(u8, r, "<system-reminder>") == null);
     }
-    // 大的非源码文件(.txt 200 行)→ 不带 reminder(仅源码触发)
+    // 大的非源码文件(.txt 200 行,无 server)→ 不带 reminder
     {
         const path = "/tmp/cc-zig-read-hint-big.txt";
         const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
@@ -515,37 +511,44 @@ test "Read 弱提示:>150行源码末尾追加 CodeMap reminder;小文件不追�
         defer _ = std.c.unlink(path);
 
         const r = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-read-hint-big.txt\"}");
-        defer std.testing.allocator.free(r);
+        defer a.free(r);
         try std.testing.expect(std.mem.indexOf(u8, r, "<system-reminder>") == null);
     }
-}
-
-test "Read 弱提示:无符号源码不提 + 同 session 同文件只提一次" {
-    // 大源码文件但**无符号**(200 行纯注释)→ 不提(CodeMap 对它出不了东西)
+    // **无 --lsp**(ctx.lsp==null):即便大源码文件也不 hint(Y2 砍 tree-sitter 后 hint 依赖 LSP)。
     {
-        const ctx = testCtx();
-        const path = "/tmp/cc-zig-read-hint-nosym.zig";
+        const noctx = testCtx();
+        const path = "/tmp/cc-zig-read-hint-nolsp.zig";
         const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try std.testing.expect(fd >= 0);
         var i: usize = 0;
         while (i < 200) : (i += 1) {
-            const line = "// just a comment line\n";
+            const line = "const x = 1;\n";
             _ = std.c.write(fd, line.ptr, line.len);
         }
         _ = std.c.close(fd);
         defer _ = std.c.unlink(path);
 
-        const r = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-read-hint-nosym.zig\"}");
-        defer std.testing.allocator.free(r);
+        const r = try execute(&noctx, "{\"path\":\"/tmp/cc-zig-read-hint-nolsp.zig\"}");
+        defer a.free(r);
         try std.testing.expect(std.mem.indexOf(u8, r, "<system-reminder>") == null);
     }
+}
+
+test "Read 弱提示:同 session 同文件只提一次(dedup)" {
+    // Y2 砍 tree-sitter 后 hint 不再廉价验"真有符号"(为 hint 起 LSP server 太浪费),简化为
+    // hasSymbolsFor(有 server)+ >150 行——纯注释源码也会提(轻微 over-hint,登记的取舍)。
+    const a = std.testing.allocator;
+    const Service = @import("../lsp/service.zig").Service;
+    var svc = Service.create(a, "/tmp", null) catch return;
+    defer svc.shutdown();
 
     // 带真 ReadState 的 ctx:同一文件读两次,只有第一次带 reminder(session 去重)
     {
-        var rs = read_state.ReadState.init(std.testing.allocator);
+        var rs = read_state.ReadState.init(a);
         defer rs.deinit();
         var ctx = testCtx();
         ctx.read_state = &rs;
+        ctx.lsp = svc;
 
         const path = "/tmp/cc-zig-read-hint-dedup.zig";
         const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
@@ -559,11 +562,11 @@ test "Read 弱提示:无符号源码不提 + 同 session 同文件只提一次" 
         defer _ = std.c.unlink(path);
 
         const r1 = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-read-hint-dedup.zig\"}");
-        defer std.testing.allocator.free(r1);
+        defer a.free(r1);
         try std.testing.expect(std.mem.indexOf(u8, r1, "<system-reminder>") != null);
 
         const r2 = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-read-hint-dedup.zig\"}");
-        defer std.testing.allocator.free(r2);
+        defer a.free(r2);
         try std.testing.expect(std.mem.indexOf(u8, r2, "<system-reminder>") == null); // 第二次不再提
     }
 }
@@ -609,4 +612,61 @@ test "ReadTool 含 .. 的合法文件名不被误杀" {
     const r = try execute(&ctx, args); // 不应 PathTraversal
     defer a.free(r);
     try std.testing.expect(std.mem.indexOf(u8, r, "ok") != null);
+}
+
+test "Read outline e2e: 真 zls documentSymbol → 大纲(需装 zls)" {
+    const a = std.testing.allocator;
+    const lsp_servers = @import("../lsp/servers.zig");
+    var zbuf: [std.fs.max_path_bytes]u8 = undefined;
+    if (lsp_servers.which("zls", &zbuf) == null) return; // 未装 → skip
+
+    const base = std.fmt.allocPrint(a, "/tmp/cc_lsp_read_{d}", .{std.c.getpid()}) catch return;
+    defer a.free(base);
+    e2eMkdir(base);
+    const gitdir = std.fmt.allocPrint(a, "{s}/.git", .{base}) catch return;
+    defer a.free(gitdir);
+    e2eMkdir(gitdir);
+    const file = std.fmt.allocPrint(a, "{s}/mod.zig", .{base}) catch return;
+    defer a.free(file);
+    e2eWrite(file,
+        \\pub const Widget = struct {
+        \\    id: u32,
+        \\};
+        \\
+        \\pub fn build() Widget {
+        \\    return .{ .id = 0 };
+        \\}
+        \\
+    );
+
+    const Service = @import("../lsp/service.zig").Service;
+    var svc = Service.create(a, base, null) catch return;
+    defer svc.shutdown();
+
+    var ctx = ToolContext.simple(a);
+    ctx.lsp = svc;
+    ctx.cwd_abs = base;
+
+    var abuf: [512]u8 = undefined;
+    const args = std.fmt.bufPrint(&abuf, "{{\"file_path\":\"{s}\",\"outline\":true}}", .{file}) catch unreachable;
+    const r = try execute(&ctx, args);
+    defer a.free(r);
+
+    // 大纲应含 zls 报出的 Widget 与 build 符号(证 read→provider→LSP→真 zls 全链)。
+    try std.testing.expect(std.mem.indexOf(u8, r, "Widget") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "build") != null);
+}
+
+fn e2eMkdir(path: []const u8) void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return;
+    _ = std.c.mkdir(z.ptr, 0o755);
+}
+fn e2eWrite(path: []const u8, content: []const u8) void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return;
+    const fd = std.c.open(z.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+    _ = std.c.write(fd, content.ptr, content.len);
 }

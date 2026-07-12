@@ -1,5 +1,5 @@
-//! L2 组件测试:Edit/Write diff 的 tree-sitter 语法高亮(旁路缓存路径)。
-//! DoD:证明"缓存命中 → tree-sitter span 着色生效";"无缓存 → 退回关键字表(零回归)"。
+//! L2 组件测试:Edit/Write diff 的 hl-zig 语法高亮(旁路缓存路径)。
+//! DoD:证明"缓存命中 → hl-zig span 着色生效";"无缓存 → 退回关键字表(零回归)"。
 //!
 //! 走 tool_card.renderResult(传 opts.edit_hl_cache + opts.tool_id),断言着色字节。
 
@@ -16,7 +16,7 @@ const YELLOW = "\x1b[33m"; // number/constant
 const GREEN = "\x1b[32m"; // string
 const BLUE = "\x1b[34m"; // type
 
-test "diff 高亮: 缓存命中 → tree-sitter span 着色(zig const=magenta, 数字=yellow)" {
+test "diff 高亮: 缓存命中 → hl-zig span 着色(zig const=magenta, 数字=yellow)" {
     const a = std.testing.allocator;
     const th = theme_mod.dark;
 
@@ -37,7 +37,7 @@ test "diff 高亮: 缓存命中 → tree-sitter span 着色(zig const=magenta, �
     });
     defer a.free(s);
 
-    // tree-sitter 路径:const → keyword(magenta),42 → number(yellow)。
+    // hl-zig 路径:const → keyword(magenta),42 → number(yellow)。
     try std.testing.expect(std.mem.indexOf(u8, s, MAGENTA) != null); // const
     try std.testing.expect(std.mem.indexOf(u8, s, YELLOW) != null); // 42
     // 内容词仍在。
@@ -79,7 +79,7 @@ test "diff 高亮: 缓存命中但行文本不匹配 → 退回关键字表" {
     try std.testing.expect(std.mem.indexOf(u8, s, "20") != null);
 }
 
-test "diff 高亮: 非 tree-sitter 语言(.md)→ 退回关键字表不崩" {
+test "diff 高亮: 无 hl 规则的语言(.md)→ 退回关键字表不崩" {
     const a = std.testing.allocator;
     const th = theme_mod.dark;
 
@@ -97,14 +97,13 @@ test "diff 高亮: 非 tree-sitter 语言(.md)→ 退回关键字表不崩" {
     try std.testing.expect(std.mem.indexOf(u8, s, "Title") != null);
 }
 
-test "diff 高亮: truecolor theme → type 用 teal RGB(basic-16 给不出的区分色)" {
+test "diff 高亮: truecolor theme → keyword 用 truecolor RGB(Y2:hl-zig 4 类,type/function 不区分)" {
     const a = std.testing.allocator;
     // select(.dark,.truecolor) 的 syntax 是 RGB 调色板。
     const th = theme_mod.select(.dark, .truecolor);
 
     var cache = EditHlCache.init(a);
     defer cache.deinit();
-    // 新文件含一个类型名(zig:Point 在 struct 上下文是 type)+ 函数返回类型。
     const new_full = "pub fn dist(a: Point) void {}\n";
     cache.put("tt", "old\n", new_full);
 
@@ -116,15 +115,16 @@ test "diff 高亮: truecolor theme → type 用 teal RGB(basic-16 给不出的�
     });
     defer a.free(s);
 
-    // truecolor:keyword(pub/fn)用 RGB 紫 #C586C0,而非 basic-16 的 \x1b[35m。
+    // truecolor:keyword(pub/fn)用 RGB 紫 #C586C0,而非 basic-16 的 \x1b[35m——证明走了 truecolor 调色板。
     try std.testing.expect(std.mem.indexOf(u8, s, "38;2;197;134;192") != null);
-    // type(Point/void)用 teal RGB #4EC9B0(basic-16 给不出的区分色)。
-    try std.testing.expect(std.mem.indexOf(u8, s, "38;2;78;201;176") != null);
-    // 不应再出现 basic-16 的裸 keyword 紫(\x1b[35m),证明走了 truecolor 调色板。
+    // Y2 取舍:hl-zig 只产 keyword/string/comment/number 4 类,**不区分** type/function/variable。
+    // 故 Point/void 不再有 teal type 色(#4EC9B0)——这是"小二进制换广覆盖"的明确降级,登记于此。
+    try std.testing.expect(std.mem.indexOf(u8, s, "38;2;78;201;176") == null);
+    // 仍不应出现 basic-16 裸紫(走 truecolor 调色板)。
     try std.testing.expect(std.mem.indexOf(u8, s, "\x1b[35m") == null);
 }
 
-test "NotebookEdit: replace cell → diff + tree-sitter 高亮(lang=python)" {
+test "NotebookEdit: replace cell → diff + hl-zig 高亮(lang=python)" {
     const a = std.testing.allocator;
     const th = theme_mod.select(.dark, .truecolor);
 
@@ -145,7 +145,7 @@ test "NotebookEdit: replace cell → diff + tree-sitter 高亮(lang=python)" {
     // 摘要行 "replace cell in n.ipynb"。
     try std.testing.expect(std.mem.indexOf(u8, s, "replace cell") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "n.ipynb") != null);
-    // diff 内容行(add 的 print)+ tree-sitter 高亮:python number 42 用 truecolor RGB。
+    // diff 内容行(add 的 print)+ hl-zig 高亮:python number 42 用 truecolor RGB。
     try std.testing.expect(std.mem.indexOf(u8, s, "print") != null);
     try std.testing.expect(std.mem.indexOf(u8, s, "38;2;181;206;168") != null); // number RGB
     // 不再裸吐 JSON 字段。

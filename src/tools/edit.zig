@@ -135,10 +135,14 @@ fn finalizeWrite(
         if (st) |s| rs.recordHashed(file_path, s.mtime_ns, s.size, std.hash.Wyhash.hash(0, content)) catch {};
     }
 
-    // 旁路缓存新旧全文(供 diff 工具卡 tree-sitter 高亮;不进对话历史)。key=本次 tool_use id。
+    // 旁路缓存新旧全文(供 diff 工具卡 hl-zig 高亮;不进对话历史)。key=本次 tool_use id。
     if (ctx.edit_hl_cache) |cache| {
         cache.put(ctx.progress_tool_id, old_content, content);
     }
+
+    // M2:LSP baseline snapshot 移到**盘写之后**——LSP 用 in-memory old_content 分析(不读盘),故语义
+    // 不变,但盘写不再被 LSP initialize(最长 12s)阻塞。写已完成,只有工具**结果**等诊断。
+    @import("lsp_diag.zig").snapshotBaseline(ctx, file_path, old_content);
 
     // B/C 合并:memdir 记忆 markdown 自动入图(best-effort;content=编辑后全文)。
     @import("../kg/autosync.zig").maybeImportMemoryFile(ctx, file_path, content);
@@ -164,34 +168,13 @@ fn finalizeWrite(
     try out.writer.writeAll(structured);
     try out.writer.writeAll(",\"gitDiff\":");
     try std.json.Stringify.encodeJsonString(git_diff, .{}, &out.writer);
-    // 改后语法检查(非致命,纯咨询):tree-sitter 支持的语言,若新内容引入语法错误
-    // 而旧内容本是干净的,追加一条 syntaxWarning。不回滚——只提醒模型可能改坏了。
-    if (syntaxRegressed(file_path, old_content, content)) {
-        try out.writer.writeAll(",\"syntaxWarning\":\"This edit may have introduced a syntax error (the file did not parse cleanly after the change). Review the result.\"");
-    }
+    // 改后诊断:Y2 砍 tree-sitter 后,原 tree-sitter 语法检查(syntaxWarning)由 LSP 被动诊断取代
+    // ——更准(真类型/未声明/语法错)。**取舍登记**:未开 `--lsp` 时编辑不再有免费语法警告
+    // (tree-sitter 时代无条件提供);开 `--lsp` 则得 server 级诊断,更强。option A 已知代价。
+    // 写后用**新内容**取 delta 诊断(vs 写前 baseline),非空则附进结果给模型。
+    try @import("lsp_diag.zig").appendToResult(ctx, allocator, &out.writer, file_path, content);
     try out.writer.writeByte('}');
     return try out.toOwnedSlice();
-}
-
-/// 旧内容 parse 干净、新内容 parse 出错 → true(语法回退)。
-/// 文件 >512KB 或不支持的语言 → false(不检查)。永不抛错(咨询性)。
-fn syntaxRegressed(file_path: []const u8, old_content: []const u8, new_content: []const u8) bool {
-    const ts = @import("../treesitter/ts.zig");
-    const SYNTAX_CHECK_MAX: usize = 512 * 1024;
-    if (new_content.len > SYNTAX_CHECK_MAX) return false;
-    const lang = ts.Lang.fromPath(file_path) orelse return false;
-
-    var parser = ts.Parser.init(lang) catch return false;
-    defer parser.deinit();
-
-    var new_tree = parser.parse(new_content) catch return false;
-    defer new_tree.deinit();
-    if (!new_tree.hasError()) return false; // 新内容干净 → 无需警告
-
-    // 新内容有错;仅当旧内容本来干净才算"这次改坏了"。
-    var old_tree = parser.parse(old_content) catch return true;
-    defer old_tree.deinit();
-    return !old_tree.hasError();
 }
 
 /// 写入工具富错误 detail(经 ctx.error_detail 通道传给模型)。无通道则静默。

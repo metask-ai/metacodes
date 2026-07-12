@@ -1,31 +1,14 @@
 const std = @import("std");
-const grammars = @import("vendor/tree-sitter/grammars.zig");
 
-// 把 vendored tree-sitter runtime + grammar 的 C 源接到一个 module 上。
-// C 源挂在 module(非 exe)上,所以每个 root=src/main.zig 的 module 都要调一次:
-// release/debug exe + test_module + integ/new 循环里的 cc_mod。
-//
-// 关键:只编 runtime/src/lib.c(摊销头,#include 其余运行时 .c;逐个编会重复符号)。
-// 生成的 parser.c/scanner.c 会触发 UBSan → -fno-sanitize=undefined。
-// scanner 全是纯 C(.c),无 C++,故不需要 link_libcpp。
-//
-// grammar 列表来自 `vendor/tree-sitter/grammars.zig`(单一真理源)——加语言只改那里。
-fn addTreeSitter(b: *std.Build, mod: *std.Build.Module) void {
-    const ts = "vendor/tree-sitter";
-    mod.addIncludePath(b.path(ts ++ "/runtime/include"));
-    mod.addIncludePath(b.path(ts ++ "/runtime/src"));
-    const flags = &[_][]const u8{ "-std=c11", "-D_GNU_SOURCE", "-D_DEFAULT_SOURCE", "-fno-sanitize=undefined" };
-    mod.addCSourceFile(.{ .file = b.path(ts ++ "/runtime/src/lib.c"), .flags = flags });
-    inline for (grammars.GRAMMARS) |g| {
-        mod.addIncludePath(b.path(ts ++ "/grammars/" ++ g.dir ++ "/src"));
-        mod.addCSourceFile(.{ .file = b.path(ts ++ "/grammars/" ++ g.dir ++ "/src/parser.c"), .flags = flags });
-        if (g.has_scanner) {
-            mod.addCSourceFile(.{ .file = b.path(ts ++ "/grammars/" ++ g.dir ++ "/src/scanner.c"), .flags = flags });
-        }
-        inline for (g.extra_csources) |extra| {
-            mod.addCSourceFile(.{ .file = b.path(ts ++ "/grammars/" ++ g.dir ++ "/src/" ++ extra), .flags = flags });
-        }
+// hl-zig 轻量高亮模块(Y2:已取代 tree-sitter 做 diff 高亮)。纯 Zig + 嵌入 rules_blob.zlib,
+// 零 C 依赖,200+ 语言。共享一个 Module(每个 root 各按自身 optimize 编译其源;未用的 import 零成本)。
+// 需要高亮/符号的 module(经 tools/* 与 tui diff)都调一次。tree-sitter 已于 2026-07-13 整体移除。
+var g_hl_mod: ?*std.Build.Module = null;
+fn addHl(b: *std.Build, mod: *std.Build.Module) void {
+    if (g_hl_mod == null) {
+        g_hl_mod = b.createModule(.{ .root_source_file = b.path("vendor/hl-zig/src/lib.zig") });
     }
+    mod.addImport("hl", g_hl_mod.?);
 }
 
 pub fn build(b: *std.Build) void {
@@ -40,7 +23,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSmall,
         .link_libc = true,
     });
-    addTreeSitter(b, release_mod);
+    addHl(b, release_mod);
     const exe = b.addExecutable(.{
         .name = "metacodes",
         .root_module = release_mod,
@@ -53,7 +36,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
         .link_libc = true,
     });
-    addTreeSitter(b, debug_mod);
+    addHl(b, debug_mod);
     const debug_exe = b.addExecutable(.{
         .name = "metacodes-debug",
         .root_module = debug_mod,
@@ -100,14 +83,14 @@ pub fn build(b: *std.Build) void {
 
     // ── metacodes-core 可复用库 module(root=src/lib.zig,UI 图不可达)──────────
     // 供其他 Zig 项目经 build.zig.zon 依赖 `@import("metacodes-core")`。
-    // 经 tools/* 用 tree-sitter → 必须 addTreeSitter。
+    // 经 tools/* 用 hl-zig 高亮 module → 必须 addHl。
     const core_mod = b.addModule("metacodes-core", .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    addTreeSitter(b, core_mod);
+    addHl(b, core_mod);
 
     // test:lib —— 编译库全图(refAllDeclsRecursive),绿即证库与 UI 物理隔离。
     const core_test_mod = b.createModule(.{
@@ -116,10 +99,21 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    addTreeSitter(b, core_test_mod);
+    addHl(b, core_test_mod);
     const core_test = b.addTest(.{ .name = "metacodes-core-test", .root_module = core_test_mod });
     const core_test_step = b.step("test:lib", "Test/compile the metacodes-core library module (proves UI isolation)");
     core_test_step.dependOn(&b.addRunArtifact(core_test).step);
+
+    // test:lsp —— LSP 子系统(Y2 Step2:被动诊断)隔离测试。
+    const lsp_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/lsp/lsp.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const lsp_test = b.addTest(.{ .name = "lsp-test", .root_module = lsp_test_mod });
+    const lsp_test_step = b.step("test:lsp", "Test the LSP subsystem in isolation (Y2 Step2)");
+    lsp_test_step.dependOn(&b.addRunArtifact(lsp_test).step);
 
     // example —— 独立消费者,经 module 用库跑一轮 agent loop(见 example/main.zig)。
     const example_mod = b.createModule(.{
@@ -129,7 +123,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     example_mod.addImport("metacodes-core", core_mod);
-    // 注:不在 example_mod 上 addTreeSitter —— C 对象随 core_mod 传入,重复接会 duplicate symbol。
+    // 注:不在 example_mod 上 addHl —— hl module 随 core_mod 传入,无需重复接。
     const example_exe = b.addExecutable(.{ .name = "example", .root_module = example_mod });
     const example_step = b.step("example", "Build & run the metacodes-core example");
     example_step.dependOn(&b.addRunArtifact(example_exe).step);
@@ -155,7 +149,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    addTreeSitter(b, test_module);
+    addHl(b, test_module);
     const tfilter = b.option([]const u8, "tfilter", "test filter");
     const test_obj = b.addTest(.{
         .name = "cc-test",
@@ -244,11 +238,6 @@ pub fn build(b: *std.Build) void {
         "tests/component/gemini_provider_test.zig",
         "tests/component/background_main_test.zig",
         "tests/component/suspend_resume_test.zig",
-        "tests/component/code_map_test.zig",
-        "tests/component/find_symbol_test.zig",
-        "tests/component/read_outline_test.zig",
-        "tests/component/export_symbols_test.zig",
-        "tests/component/edit_syntaxcheck_test.zig",
         "tests/component/diff_highlight_test.zig",
         "tests/component/prompt_override_test.zig",
         "tests/component/web_ui_test.zig",
@@ -276,7 +265,7 @@ pub fn build(b: *std.Build) void {
         });
         m.addImport("harness", harness_mod);
         m.addImport("cc", cc_mod);
-        addTreeSitter(b, cc_mod);
+        addHl(b, cc_mod);
         const t = b.addTest(.{
             .name = "integration",
             .root_module = m,
@@ -331,11 +320,6 @@ pub fn build(b: *std.Build) void {
         "tests/component/gemini_provider_test.zig",
         "tests/component/background_main_test.zig",
         "tests/component/suspend_resume_test.zig",
-        "tests/component/code_map_test.zig",
-        "tests/component/find_symbol_test.zig",
-        "tests/component/read_outline_test.zig",
-        "tests/component/export_symbols_test.zig",
-        "tests/component/edit_syntaxcheck_test.zig",
         "tests/component/diff_highlight_test.zig",
         "tests/component/prompt_override_test.zig",
         "tests/component/weak_model_test.zig",
@@ -362,7 +346,7 @@ pub fn build(b: *std.Build) void {
         });
         m.addImport("harness", harness_mod);
         m.addImport("cc", cc_mod);
-        addTreeSitter(b, cc_mod);
+        addHl(b, cc_mod);
         const t = b.addTest(.{
             .name = "new-l2",
             .root_module = m,
@@ -400,7 +384,7 @@ pub fn build(b: *std.Build) void {
             });
             m.addImport("harness", harness_mod);
             m.addImport("cc", cc_mod);
-            addTreeSitter(b, cc_mod);
+            addHl(b, cc_mod);
             const t = b.addTest(.{
                 .name = "mem-l2",
                 .root_module = m,
@@ -408,25 +392,6 @@ pub fn build(b: *std.Build) void {
             });
             mem_step.dependOn(&b.addRunArtifact(t).step);
         }
-    }
-
-    // test:ts —— 只跑 tree-sitter 相关 L1 单测(隔离 artifact,绕开主套件 integration 挂起)。
-    // root=src/treesitter/test_root.zig 聚合 ts/symbols 等,接 addTreeSitter 链 C。
-    const ts_step = b.step("test:ts", "Run tree-sitter L1 unit tests (isolated)");
-    {
-        const m = b.createModule(.{
-            .root_source_file = b.path("src/treesitter/test_root.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        addTreeSitter(b, m);
-        const t = b.addTest(.{
-            .name = "ts-l1",
-            .root_module = m,
-            .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
-        });
-        ts_step.dependOn(&b.addRunArtifact(t).step);
     }
 
     // 注:TTY 渲染测试(tests/tty/)用独立 python runner 跑,**不接 zig build**——

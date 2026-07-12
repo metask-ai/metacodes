@@ -1,0 +1,4 @@
+vendored from ~/prj/cc-t2z/hl-zig (not a standalone git repo)
+date: 2026-07-12
+languages: 200+ (rules_blob.zlib, zlib-compressed)
+api: tokenize/colorize/colorizeSource/lookupByExtension/lookupByName/ruleCount

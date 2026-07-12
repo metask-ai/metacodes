@@ -3,11 +3,9 @@ const types = @import("types.zig");
 const client = @import("client.zig");
 const app_mod = @import("app.zig");
 const repl = @import("repl/loop.zig");
-const ts_export = @import("treesitter/export.zig");
 const auth = @import("core/auth.zig");
 const api_keys_mod = @import("api/api_keys.zig");
 const catalog_mod = @import("api/catalog.zig");
-pub const treesitter_export = ts_export;
 
 pub const VERSION = "0.1.0";
 
@@ -167,12 +165,6 @@ pub fn main(init: std.process.Init) !void {
         std.posix.sigaction(std.posix.SIG.PIPE, &act, null);
     }
 
-    // export-symbols 子命令(层三机制):在 App init *之前*处理——不发网络、不需 key。
-    //   metacodes export-symbols <dir> [-o <file>]
-    // walk <dir>,抽所有支持语言的符号,写 JSONL(供外围 metaknow skill 灌 KG)。
-    if (try maybeRunExportSymbols(init, allocator)) |code| {
-        std.process.exit(code);
-    }
     if (try maybeRunAuthCommand(init, allocator)) |code| {
         std.process.exit(code);
     }
@@ -331,37 +323,6 @@ fn dumpPromptAndExit(app: *app_mod.App) noreturn {
     }
     dumpWrite("\n");
     std.process.exit(0);
-}
-
-/// 检测并执行 export-symbols 子命令。返回 null = 非该子命令(继续正常流程);
-/// 返回退出码 = 已执行,调用方应 exit。
-///   metacodes export-symbols <dir> [-o <file>] [--output <file>]
-fn maybeRunExportSymbols(init: std.process.Init, allocator: std.mem.Allocator) !?u8 {
-    var args = std.process.Args.iterate(init.minimal.args);
-    _ = args.next(); // 跳过 argv[0](程序名)
-
-    const first = args.next() orelse return null;
-    if (!std.mem.eql(u8, first, "export-symbols")) return null;
-
-    var dir: ?[]const u8 = null;
-    var out_path: ?[]const u8 = null;
-    while (args.next()) |s| {
-        if (std.mem.eql(u8, s, "-o") or std.mem.eql(u8, s, "--output")) {
-            const v = args.next() orelse {
-                std.debug.print("export-symbols: -o requires a path\n", .{});
-                return 2;
-            };
-            out_path = v;
-        } else if (dir == null) {
-            dir = s;
-        }
-    }
-
-    const target = dir orelse {
-        std.debug.print("usage: metacodes export-symbols <dir> [-o <file>]\n", .{});
-        return 2;
-    };
-    return try ts_export.run(allocator, target, out_path);
 }
 
 fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u8 {
@@ -769,6 +730,8 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             config.no_theme = true;
         } else if (std.mem.eql(u8, arg, "--verbose")) {
             config.verbose = true;
+        } else if (std.mem.eql(u8, arg, "--lsp")) {
+            config.lsp_enabled = true; // Y2:开 LSP 被动诊断(Edit/Write 后附类型诊断)
         } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--print")) {
             if (args.next()) |p| config.prompt = allocator.dupe(u8, p) catch p;
         } else if (std.mem.eql(u8, arg, "--json")) {
@@ -840,6 +803,7 @@ fn printHelp() void {
         \\  --record <dir>        Record requests + SSE responses to dir (cassette)
         \\  --no-theme            Disable colors
         \\  --verbose             Verbose output
+        \\  --lsp                 Enable LSP passive diagnostics on Edit/Write (needs zls/pyright/etc on PATH)
         \\  -h, --help            This help
         \\
     , .{});
@@ -853,9 +817,8 @@ test {
     _ = &@import("json.zig");
     _ = &@import("client.zig");
     _ = &@import("tools.zig");
-    _ = &@import("treesitter/ts.zig");
-    _ = &@import("treesitter/symbols.zig");
-    _ = &@import("treesitter/export.zig");
+    _ = &@import("symbols/symbol.zig");
+    _ = &@import("tools/symbol_provider.zig");
     _ = &@import("core/edit_hl_cache.zig");
     _ = &@import("core/goal.zig");
     _ = &@import("core/auth.zig");
