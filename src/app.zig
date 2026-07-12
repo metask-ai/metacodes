@@ -1017,53 +1017,33 @@ pub const App = struct {
     /// 合并语义:各层 matcher entry 全部并入(project 与 user 的 hook 并存,org 全局 hook 不被项目覆盖)。
     fn loadHooks(app: *App, home: ?[]const u8) !void {
         const hooks_mod = @import("permission/hooks.zig");
-        var pre: std.ArrayList(hooks_mod.HookEntry) = .empty;
-        var post: std.ArrayList(hooks_mod.HookEntry) = .empty;
-        errdefer {
-            for (pre.items) |e| freeHookEntry(app.allocator, e);
-            pre.deinit(app.allocator);
-            for (post.items) |e| freeHookEntry(app.allocator, e);
-            post.deinit(app.allocator);
-        }
         const candidates = [_]?[]const u8{
             if (app.project_dir) |r| (std.fmt.allocPrint(app.allocator, "{s}/.claude/settings.json", .{r}) catch null) else null,
             if (home) |h| (std.fmt.allocPrint(app.allocator, "{s}/.claude/settings.json", .{h}) catch null) else null,
         };
         defer for (candidates) |p| if (p) |x| app.allocator.free(x);
 
+        // 读各层文件内容 → 交给可测 seam parseAndMerge(5 类事件跨层合并)。
+        var contents: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (contents.items) |c| app.allocator.free(c);
+            contents.deinit(app.allocator);
+        }
         for (candidates) |maybe_path| {
             const path = maybe_path orelse continue;
             const content = readFileAlloc(app.allocator, path) catch continue;
-            defer app.allocator.free(content);
-            var parsed = std.json.parseFromSlice(std.json.Value, app.allocator, content, .{}) catch continue;
-            defer parsed.deinit();
-            const hs = hooks_mod.parse(app.allocator, parsed.value) catch continue;
-            // 把该层 entry **移入**合并列表(appendSlice 拷 HookEntry 结构,其内 matcher/commands 指针
-            // 转由合并列表持有);故只 free 外层切片数组,**不** hs.deinit()(那会 free 掉已转移的内层)。
-            pre.appendSlice(app.allocator, hs.pre_tool_use) catch {};
-            post.appendSlice(app.allocator, hs.post_tool_use) catch {};
-            app.allocator.free(hs.pre_tool_use);
-            app.allocator.free(hs.post_tool_use);
+            contents.append(app.allocator, content) catch app.allocator.free(content);
         }
+        if (contents.items.len == 0) return;
 
-        if (pre.items.len == 0 and post.items.len == 0) {
-            pre.deinit(app.allocator);
-            post.deinit(app.allocator);
+        var hs = try hooks_mod.parseAndMerge(app.allocator, contents.items);
+        if (hs.isEmpty()) {
+            hs.deinit();
             return;
         }
-        app.hooks = .{
-            .pre_tool_use = try pre.toOwnedSlice(app.allocator),
-            .post_tool_use = try post.toOwnedSlice(app.allocator),
-            .allocator = app.allocator,
-        };
+        app.hooks = hs;
         app.permission_ctx.hooks = &app.hooks.?;
-        @import("util/log.zig").info("hook", "loaded PreToolUse={d} PostToolUse={d} matcher(s) (merged across layers)", .{ app.hooks.?.pre_tool_use.len, app.hooks.?.post_tool_use.len });
-    }
-
-    fn freeHookEntry(alloc: std.mem.Allocator, e: @import("permission/hooks.zig").HookEntry) void {
-        alloc.free(e.matcher);
-        for (e.commands) |c| alloc.free(c);
-        alloc.free(e.commands);
+        @import("util/log.zig").info("hook", "loaded hooks: Pre={d} Post={d} Stop={d} PreCompact={d} PostCompact={d} (merged across layers)", .{ app.hooks.?.pre_tool_use.len, app.hooks.?.post_tool_use.len, app.hooks.?.stop.len, app.hooks.?.pre_compact.len, app.hooks.?.post_compact.len });
     }
 
     /// 读 project/.claude/settings.json + ~/.claude/settings.json 的 sandbox 段,

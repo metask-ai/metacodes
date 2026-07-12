@@ -539,6 +539,7 @@ pub fn run(
                     &context_warning_emitted,
                     allocator,
                     opts.tasks,
+                    permission_ctx.hooks,
                 );
                 if (previous_model_compact_outcome == .api_error) {
                     return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
@@ -563,6 +564,7 @@ pub fn run(
                 &context_warning_emitted,
                 allocator,
                 opts.tasks,
+                permission_ctx.hooks,
             );
             if (pre_sampling_compact == .api_error) {
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
@@ -920,6 +922,8 @@ pub fn run(
             // L4 诊断:本轮无 tool_use → turn 结束(span 平衡:每个 turn_begin 都配一个
             // turn_end,无论有无工具)。紧接 run_end(end_turn)收口。
             backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+            // Stop hook:顶层 agent 自然结束 → 触发(记忆提取挂载点)。
+            fireStopHook(permission_ctx.hooks, allocator, conversation, "end_turn", depth);
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls });
         }
 
@@ -1095,13 +1099,11 @@ pub fn run(
         }
         tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
         if (opts.emit_tool_cards and opts.agent_depth == 0) {
+            // P2.1:只发 clear_current_tool 清运行态动态卡。**不再**为每个 slot 补发一条空 content
+            // 的 tool_result——那是历史"双发",逼每个 backend 靠 content.len>0 去重(tui gate / web JS dedup /
+            // WebSearch 靠真 emit 也会 clearToolCard)。真结果由下方每 slot 的单条 tool_result(真 content)
+            // 承载,backend 收敛为"每工具一条干净 tool_result"。
             backend.emitEvent(sess, .clear_current_tool);
-            // 进度卡工具的清卡也无条件发(backend 据 name 自决 clearToolCard)。
-            for (slots.items) |*s| {
-                if (s.decision == .run) {
-                    backend.emitEvent(sess, .{ .tool_result = .{ .id = s.id, .name = s.name, .input = s.input, .content = "", .is_error = s.is_error } });
-                }
-            }
         }
 
         // 6c.5 L3 挂起:本轮有工具返 error.UiPending(异步 custom UI 未完成)→ 整轮挂起。
@@ -1302,6 +1304,7 @@ pub fn run(
             &context_warning_emitted,
             allocator,
             opts.tasks,
+            permission_ctx.hooks,
         );
         if (post_tool_compact == .api_error) {
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
@@ -1580,6 +1583,57 @@ fn recoverContextWindowExceeded(
     return true;
 }
 
+/// 构造 PostCompact hook 的 stdin JSON(summary 是自由文本须 JSON 转义)。
+fn buildPostCompactStdin(allocator: std.mem.Allocator, trigger: []const u8, summary: []const u8) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try aw.writer.writeAll("{\"hook_event_name\":\"PostCompact\",\"trigger\":");
+    try std.json.Stringify.encodeJsonString(trigger, .{}, &aw.writer);
+    try aw.writer.writeAll(",\"summary\":");
+    try std.json.Stringify.encodeJsonString(summary, .{}, &aw.writer);
+    try aw.writer.writeAll("}");
+    return try aw.toOwnedSlice();
+}
+
+/// 构造 Stop hook 的 stdin JSON(last_message 自由文本须转义)。供记忆提取等 side-effect hook 用。
+fn buildStopStdin(allocator: std.mem.Allocator, stop_reason: []const u8, last_message: []const u8, num_messages: usize) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try aw.writer.writeAll("{\"hook_event_name\":\"Stop\",\"stop_reason\":");
+    try std.json.Stringify.encodeJsonString(stop_reason, .{}, &aw.writer);
+    try aw.writer.writeAll(",\"last_message\":");
+    try std.json.Stringify.encodeJsonString(last_message, .{}, &aw.writer);
+    try aw.writer.print(",\"num_messages\":{d}}}", .{num_messages});
+    return try aw.toOwnedSlice();
+}
+
+/// Stop hook(顶层 agent 自然结束时触发):喂最后一条 assistant 文本(截断)+ 消息数,供
+/// 记忆提取等 side-effect hook 用。depth!=0(subagent)不触发;无 Stop hook 直接返回。非阻塞。
+fn fireStopHook(hookset: ?*const hooks_mod.HookSet, allocator: std.mem.Allocator, conversation: *const Conversation, stop_reason: []const u8, depth: u8) void {
+    if (depth != 0) return;
+    const hs = hookset orelse return;
+    if (!hs.hasStop()) return;
+    var last_text: []const u8 = "";
+    var i = conversation.messages.items.len;
+    while (i > 0) : (i -= 1) {
+        const m = conversation.messages.items[i - 1];
+        if (m.role != .assistant) continue;
+        for (m.blocks) |b| switch (b) {
+            .text => |t| {
+                last_text = t;
+                break;
+            },
+            else => {},
+        };
+        if (last_text.len > 0) break;
+    }
+    const MAX_STOP_TEXT = 4000;
+    const trimmed = if (last_text.len > MAX_STOP_TEXT) last_text[0..MAX_STOP_TEXT] else last_text;
+    const stdin_json = buildStopStdin(allocator, stop_reason, trimmed, conversation.messages.items.len) catch return;
+    defer allocator.free(stdin_json);
+    if (hooks_mod.runLifecycleHooks(hs.stop, allocator, "Stop", stdin_json)) |ac| allocator.free(ac);
+}
+
 fn runAutoCompactIfNeeded(
     conversation: *Conversation,
     provider: provider_mod.Provider,
@@ -1597,6 +1651,7 @@ fn runAutoCompactIfNeeded(
     context_warning_emitted: ?*bool,
     allocator: std.mem.Allocator,
     tasks: ?*@import("task_store.zig").TaskStore,
+    hookset: ?*const hooks_mod.HookSet,
 ) !AutoCompactOutcome {
     var outcome: AutoCompactOutcome = .not_needed;
     const tool_result_limit = conversation_mod.toolResultContextBytes(provider.maxInputTokens());
@@ -1627,6 +1682,14 @@ fn runAutoCompactIfNeeded(
     }
 
     if (request_tokens_before >= auto_threshold) {
+        // PreCompact hook(压缩前):喂 {trigger, active_msgs, tokens},side-effect(如存盘/记忆快照),非阻塞。
+        if (hookset) |hs| if (hs.hasPreCompact()) {
+            const pre_json = std.fmt.allocPrint(allocator, "{{\"hook_event_name\":\"PreCompact\",\"trigger\":\"{s}\",\"active_messages\":{d},\"tokens\":{d}}}", .{ trigger_cause, conversation.activeMessages().len, request_tokens_before }) catch null;
+            if (pre_json) |pj| {
+                defer allocator.free(pj);
+                if (hooks_mod.runLifecycleHooks(hs.pre_compact, allocator, "PreCompact", pj)) |ac| allocator.free(ac);
+            }
+        };
         const compact_summary = @import("compact_summary.zig");
         const SummCtx = struct { provider: provider_mod.Provider, alloc: std.mem.Allocator, model_override: ?[]const u8, task_anchor: ?[]const u8 };
         const summary_model = compact_model_override orelse model_override;
@@ -1666,6 +1729,18 @@ fn runAutoCompactIfNeeded(
                     log.warn("agent", "auto-compact aborted: conversation suffix changed during summary generation cause={s}", .{trigger_cause});
                     return .api_error;
                 }
+                // PostCompact hook(压缩后):喂 {trigger, summary},其 additionalContext 拼进投影摘要
+                // → 模型下轮读得到(条目 I 的挂载点:重注入 active skill/plan/MCP)。非阻塞。
+                if (hookset) |hs| if (hs.hasPostCompact()) {
+                    const pj = buildPostCompactStdin(allocator, trigger_cause, conversation.compact_summary orelse "") catch null;
+                    if (pj) |json| {
+                        defer allocator.free(json);
+                        if (hooks_mod.runLifecycleHooks(hs.post_compact, allocator, "PostCompact", json)) |extra| {
+                            defer allocator.free(extra);
+                            conversation.appendToCompactSummary(extra);
+                        }
+                    }
+                };
                 // 投影:len() 不变(原始不删),真正收缩的是活跃窗口——日志/事件的"after/kept"用活跃计数。
                 const kept_active = conversation.activeMessages().len;
                 log.info("agent", "auto-compact: dropped {d} old messages (active {d} -> {d}) threshold={d} before_tokens={d} after_tokens={d} saved_percent={d} cause={s}", .{ report.dropped, before_len, kept_active, auto_threshold, request_tokens_before, request_tokens_after, saved_percent, cause });
@@ -2125,6 +2200,7 @@ test "usage anchor suppresses false blocking-limit nuke (glm-5.2 并发工具风
         null,
         a,
         null,
+        null,
     );
 
     // est = 13522 + 20×(32768/4) + 信封 ≈ 178K < 229144 → 不触发;结果全部保留。
@@ -2262,6 +2338,7 @@ test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool s
         null,
         a,
         null,
+        null,
     );
 
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
@@ -2327,6 +2404,7 @@ test "auto-compact summary carries in_progress task anchor through compaction" {
         null,
         a,
         &store,
+        null,
     );
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
 
@@ -2338,6 +2416,86 @@ test "auto-compact summary carries in_progress task anchor through compaction" {
     try std.testing.expect(std.mem.indexOf(u8, summ, "kg-42 修复解析器") != null);
     try std.testing.expect(std.mem.indexOf(u8, summ, "small summary") != null);
     try std.testing.expect(std.mem.indexOf(u8, summ, "kg-43") == null); // completed 不进锚
+}
+
+test "auto-compact 触发 PreCompact + PostCompact hook(G-rest 接线,端到端)" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    const chunk = try a.alloc(u8, 8192);
+    defer a.free(chunk);
+    @memset(chunk, 'x');
+    var i: usize = 0;
+    while (i < 30) : (i += 1) try c.appendText(.user, chunk);
+
+    var provider_state = TestProviderState{ .allocator = a, .compact_summary_response = "small summary", .max_input_tokens = 200_000, .max_tokens = 32_000 };
+    const provider = testProvider(&provider_state);
+    const Capture = struct {
+        fn emit(_: *anyopaque, _: @import("session_id.zig").SessionId, _: CoreEvent) void {}
+        fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = Capture.emit, .poll = Capture.poll };
+
+    // PreCompact hook 写 marker(证明压缩前触发);PostCompact hook 回 additionalContext(模拟重注入 skill)。
+    const pre_marker: [:0]const u8 = "/tmp/cc_precompact_fired.marker";
+    _ = std.c.unlink(@ptrCast(pre_marker.ptr));
+    const pre_cmds = [_][]const u8{"touch /tmp/cc_precompact_fired.marker"};
+    const pre_entries = [_]hooks_mod.HookEntry{.{ .matcher = "*", .commands = &pre_cmds }};
+    const post_cmds = [_][]const u8{"echo '{\"additionalContext\":\"ACTIVE_SKILL_REINJECTED\"}'"};
+    const post_entries = [_]hooks_mod.HookEntry{.{ .matcher = "*", .commands = &post_cmds }};
+    const hs = hooks_mod.HookSet{ .pre_tool_use = &.{}, .pre_compact = &pre_entries, .post_compact = &post_entries, .allocator = a };
+
+    const outcome = try runAutoCompactIfNeeded(&c, provider, null, null, null, &.{}, null, null, 32_000, 2, "post_tool_follow_up_threshold", &backend, .single, null, a, null, &hs);
+    try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
+
+    // PreCompact 真触发:marker 文件存在。
+    const pre_fd = std.c.open(@ptrCast(pre_marker.ptr), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    try std.testing.expect(pre_fd >= 0);
+    if (pre_fd >= 0) _ = std.c.close(pre_fd);
+    _ = std.c.unlink(@ptrCast(pre_marker.ptr));
+
+    // PostCompact 的 additionalContext 拼进投影摘要 → 模型下轮读得到。
+    try std.testing.expect(c.compact_summary != null);
+    try std.testing.expect(std.mem.indexOf(u8, c.compact_summary.?, "ACTIVE_SKILL_REINJECTED") != null);
+}
+
+test "fireStopHook:顶层触发 + 传入 last_message;subagent(depth!=0)不触发(G-rest)" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "do something");
+    try c.appendText(.assistant, "DONE_MARKER_ANSWER");
+
+    const marker: [:0]const u8 = "/tmp/cc_stop_hook_fired.marker";
+    _ = std.c.unlink(@ptrCast(marker.ptr));
+    const cmds = [_][]const u8{"cat > /tmp/cc_stop_hook_fired.marker"};
+    const entries = [_]hooks_mod.HookEntry{.{ .matcher = "*", .commands = &cmds }};
+    const hs = hooks_mod.HookSet{ .pre_tool_use = &.{}, .stop = &entries, .allocator = a };
+
+    // 顶层(depth=0)触发:hook 收到含 Stop/last_message/stop_reason 的 stdin。
+    fireStopHook(&hs, a, &c, "end_turn", 0);
+    {
+        const fd = std.c.open(@ptrCast(marker.ptr), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        try std.testing.expect(fd >= 0);
+        defer _ = std.c.close(fd);
+        var buf: [1024]u8 = undefined;
+        const n = std.c.read(fd, &buf, buf.len);
+        try std.testing.expect(n > 0);
+        const got = buf[0..@intCast(n)];
+        try std.testing.expect(std.mem.indexOf(u8, got, "\"Stop\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "DONE_MARKER_ANSWER") != null);
+        try std.testing.expect(std.mem.indexOf(u8, got, "end_turn") != null);
+    }
+
+    // 负向:subagent(depth=1)不触发(marker 删后不重现)。
+    _ = std.c.unlink(@ptrCast(marker.ptr));
+    fireStopHook(&hs, a, &c, "end_turn", 1);
+    const fd2 = std.c.open(@ptrCast(marker.ptr), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    try std.testing.expect(fd2 < 0); // 不触发 → 文件不存在
+    if (fd2 >= 0) _ = std.c.close(fd2);
 }
 
 test "previous-model compact uses old model override before smaller-window sampling" {
@@ -2395,6 +2553,7 @@ test "previous-model compact uses old model override before smaller-window sampl
         .single,
         null,
         a,
+        null,
         null,
     );
 

@@ -1,10 +1,20 @@
-//! Tool hook 系统:PreToolUse + PostToolUse(对齐 Claude Code hooks)。
+//! Tool hook 系统:PreToolUse + PostToolUse + 生命周期 Stop/PreCompact/PostCompact(对齐 Claude Code hooks)。
 //!
 //! settings.json:
 //!   "hooks": {
 //!     "PreToolUse":  [ { "matcher": "Bash",       "hooks": [ {"type":"command","command":"./check.sh"} ] } ],
-//!     "PostToolUse": [ { "matcher": "Write|Edit", "hooks": [ {"type":"command","command":"./lint.sh"}  ] } ]
+//!     "PostToolUse": [ { "matcher": "Write|Edit", "hooks": [ {"type":"command","command":"./lint.sh"}  ] } ],
+//!     "Stop":        [ { "hooks": [ {"type":"command","command":"./extract_memory.sh"} ] } ],
+//!     "PreCompact":  [ { "hooks": [ {"type":"command","command":"./snapshot.sh"} ] } ],
+//!     "PostCompact": [ { "hooks": [ {"type":"command","command":"./reinject.sh"} ] } ]
 //!   }
+//!
+//! **生命周期 hook**(无 tool matcher,全触发,非阻塞——block 仅 advisory):
+//!   - **Stop**(顶层 agent 自然 end_turn 结束):stdin `{hook_event_name,stop_reason,last_message,num_messages}`——
+//!     记忆提取挂载点(hook 自行读 last_message/transcript 写 KG)。subagent(depth!=0)不触发。
+//!   - **PreCompact**(自动压缩前):stdin `{hook_event_name,trigger,active_messages,tokens}`——side-effect(存盘/快照)。
+//!   - **PostCompact**(压缩成功后):stdin `{hook_event_name,trigger,summary}`;stdout `additionalContext` 拼进
+//!     投影摘要 → 模型下轮读得到(条目 I 挂载点:重注入 active skill/plan/MCP)。
 //!
 //! **PreToolUse**(工具执行前,匹配 matcher 的 hook 被 spawn):
 //!   - stdin 喂 `{"hook_event_name":"PreToolUse","tool_name","tool_input"}`(一行 JSON)
@@ -24,7 +34,8 @@
 //!
 //! **诚实登记——未做**:①PreToolUse 不支持 `permissionDecision:"allow"` 覆盖放行(只能 block 或落后续链);
 //! ②PostToolUse block 不回喂模型 blocking error(只 advisory additionalContext);③`continue:false` 停整轮未建模;
-//! ④Stop/UserPromptSubmit/SessionStart/PreCompact 等事件未做(cc 有 ~30);⑤配置加载 project 覆盖 user(非 5 层合并,见 app.loadHooks)。
+//! ④Stop hook 不支持 `decision:"block"` 阻止停止/续跑(仅 side-effect,不 gate 控制流);UserPromptSubmit/
+//!   SessionStart/SubagentStop/Notification 等事件仍未做(cc 有 ~30);⑤配置加载见 app.loadHooks。
 
 const std = @import("std");
 const log = @import("../util/log.zig");
@@ -51,21 +62,39 @@ pub const HookEntry = struct {
 pub const HookSet = struct {
     pre_tool_use: []const HookEntry,
     post_tool_use: []const HookEntry = &.{},
+    /// 生命周期 hook(无 tool matcher):Stop(turn 结束)/PreCompact(压缩前)/PostCompact(压缩后)。
+    /// 配置结构同 Pre/PostToolUse(`[{hooks:[{command}]}]`),matcher 缺省即"*"(全触发)。
+    stop: []const HookEntry = &.{},
+    pre_compact: []const HookEntry = &.{},
+    post_compact: []const HookEntry = &.{},
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *HookSet) void {
         freeEntries(self.allocator, self.pre_tool_use);
         freeEntries(self.allocator, self.post_tool_use);
+        freeEntries(self.allocator, self.stop);
+        freeEntries(self.allocator, self.pre_compact);
+        freeEntries(self.allocator, self.post_compact);
     }
 
     pub fn isEmpty(self: *const HookSet) bool {
-        return self.pre_tool_use.len == 0 and self.post_tool_use.len == 0;
+        return self.pre_tool_use.len == 0 and self.post_tool_use.len == 0 and
+            self.stop.len == 0 and self.pre_compact.len == 0 and self.post_compact.len == 0;
     }
     pub fn hasPre(self: *const HookSet) bool {
         return self.pre_tool_use.len != 0;
     }
     pub fn hasPost(self: *const HookSet) bool {
         return self.post_tool_use.len != 0;
+    }
+    pub fn hasStop(self: *const HookSet) bool {
+        return self.stop.len != 0;
+    }
+    pub fn hasPreCompact(self: *const HookSet) bool {
+        return self.pre_compact.len != 0;
+    }
+    pub fn hasPostCompact(self: *const HookSet) bool {
+        return self.post_compact.len != 0;
     }
 };
 
@@ -85,16 +114,108 @@ pub fn parse(alloc: std.mem.Allocator, root: std.json.Value) !HookSet {
     var post: []const HookEntry = &.{};
     errdefer freeEntries(alloc, post);
 
+    var stop: []const HookEntry = &.{};
+    errdefer freeEntries(alloc, stop);
+    var pre_compact: []const HookEntry = &.{};
+    errdefer freeEntries(alloc, pre_compact);
+    var post_compact: []const HookEntry = &.{};
+    errdefer freeEntries(alloc, post_compact);
+
     if (root == .object) {
         if (root.object.get("hooks")) |hooks_v| {
             if (hooks_v == .object) {
                 pre = try parseEventArray(alloc, hooks_v.object.get("PreToolUse"));
                 post = try parseEventArray(alloc, hooks_v.object.get("PostToolUse"));
+                stop = try parseEventArray(alloc, hooks_v.object.get("Stop"));
+                pre_compact = try parseEventArray(alloc, hooks_v.object.get("PreCompact"));
+                post_compact = try parseEventArray(alloc, hooks_v.object.get("PostCompact"));
             }
         }
     }
 
-    return HookSet{ .pre_tool_use = pre, .post_tool_use = post, .allocator = alloc };
+    return HookSet{
+        .pre_tool_use = pre,
+        .post_tool_use = post,
+        .stop = stop,
+        .pre_compact = pre_compact,
+        .post_compact = post_compact,
+        .allocator = alloc,
+    };
+}
+
+/// 跨层合并:把多层 settings JSON 文本各自 parse 后,5 类事件的 entry 全部并入一个 HookSet
+/// (project 与 user 的 hook 并存,不互相覆盖)。解析失败的层跳过。owned,调用方 deinit。
+/// 这是 app.loadHooks 的可测 seam——避免"parse 支持但 loadHooks 漏合并某类事件"静默失效。
+pub fn parseAndMerge(alloc: std.mem.Allocator, layer_contents: []const []const u8) !HookSet {
+    var pre: std.ArrayList(HookEntry) = .empty;
+    var post: std.ArrayList(HookEntry) = .empty;
+    var stop_l: std.ArrayList(HookEntry) = .empty;
+    var pre_c: std.ArrayList(HookEntry) = .empty;
+    var post_c: std.ArrayList(HookEntry) = .empty;
+    errdefer {
+        for (pre.items) |e| freeOneEntry(alloc, e);
+        pre.deinit(alloc);
+        for (post.items) |e| freeOneEntry(alloc, e);
+        post.deinit(alloc);
+        for (stop_l.items) |e| freeOneEntry(alloc, e);
+        stop_l.deinit(alloc);
+        for (pre_c.items) |e| freeOneEntry(alloc, e);
+        pre_c.deinit(alloc);
+        for (post_c.items) |e| freeOneEntry(alloc, e);
+        post_c.deinit(alloc);
+    }
+    for (layer_contents) |content| {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, content, .{}) catch continue;
+        defer parsed.deinit();
+        var hs = parse(alloc, parsed.value) catch continue;
+        // **先预留容量(唯一可失败步),在任何 move 之前**——若 OOM,此时 hs 仍完整未移动,整份 deinit
+        // 干净返回(不留"半移动"态致泄漏)。之后 appendSliceAssumeCapacity 不会失败。
+        pre.ensureUnusedCapacity(alloc, hs.pre_tool_use.len) catch {
+            hs.deinit();
+            return error.OutOfMemory;
+        };
+        post.ensureUnusedCapacity(alloc, hs.post_tool_use.len) catch {
+            hs.deinit();
+            return error.OutOfMemory;
+        };
+        stop_l.ensureUnusedCapacity(alloc, hs.stop.len) catch {
+            hs.deinit();
+            return error.OutOfMemory;
+        };
+        pre_c.ensureUnusedCapacity(alloc, hs.pre_compact.len) catch {
+            hs.deinit();
+            return error.OutOfMemory;
+        };
+        post_c.ensureUnusedCapacity(alloc, hs.post_compact.len) catch {
+            hs.deinit();
+            return error.OutOfMemory;
+        };
+        // move 各类 entry 进合并列表(内层 matcher/commands 指针转移);只 free 外层数组,不 hs.deinit()。
+        pre.appendSliceAssumeCapacity(hs.pre_tool_use);
+        post.appendSliceAssumeCapacity(hs.post_tool_use);
+        stop_l.appendSliceAssumeCapacity(hs.stop);
+        pre_c.appendSliceAssumeCapacity(hs.pre_compact);
+        post_c.appendSliceAssumeCapacity(hs.post_compact);
+        alloc.free(hs.pre_tool_use);
+        alloc.free(hs.post_tool_use);
+        alloc.free(hs.stop);
+        alloc.free(hs.pre_compact);
+        alloc.free(hs.post_compact);
+    }
+    return HookSet{
+        .pre_tool_use = try pre.toOwnedSlice(alloc),
+        .post_tool_use = try post.toOwnedSlice(alloc),
+        .stop = try stop_l.toOwnedSlice(alloc),
+        .pre_compact = try pre_c.toOwnedSlice(alloc),
+        .post_compact = try post_c.toOwnedSlice(alloc),
+        .allocator = alloc,
+    };
+}
+
+fn freeOneEntry(alloc: std.mem.Allocator, e: HookEntry) void {
+    alloc.free(e.matcher);
+    for (e.commands) |c| alloc.free(c);
+    alloc.free(e.commands);
 }
 
 /// 解析一个 hook 事件数组([{matcher, hooks:[{command}]}])为 HookEntry 切片。null/非数组 → 空。
@@ -242,6 +363,38 @@ pub fn runPostToolUse(
             }
             if (r.decision == .block) {
                 log.warn("hook", "PostToolUse hook requested block (post-exec, advisory) tool={s}", .{tool_name});
+            }
+        }
+    }
+    if (acc.items.len == 0) return null;
+    return acc.toOwnedSlice(alloc) catch null;
+}
+
+/// 生命周期 hook 通用 runner(Stop / PreCompact / PostCompact —— 无 tool matcher,全触发)。
+/// `stdin_json` 由调用方按事件构造(含 hook_event_name)。所有 entry 的所有 command 都 spawn,
+/// 收集各自 stdout 的 additionalContext 拼接返回(owned,调用方 free;无则 null)。
+/// **非阻塞**:block 决策仅记 warn(生命周期 hook 不拦控制流,side-effect 为主)。
+/// Stop 通常忽略返回值(纯 side-effect 如记忆提取);PostCompact 消费返回值(注入下轮上下文)。
+pub fn runLifecycleHooks(
+    entries: []const HookEntry,
+    alloc: std.mem.Allocator,
+    event_name: []const u8,
+    stdin_json: []const u8,
+) ?[]u8 {
+    if (entries.len == 0) return null;
+    var acc: std.ArrayList(u8) = .empty;
+    defer acc.deinit(alloc);
+    for (entries) |entry| {
+        for (entry.commands) |cmd| {
+            const r = runOneHookFull(alloc, cmd, stdin_json);
+            defer if (r.updated_input) |ui| alloc.free(ui); // 生命周期 hook 不消费 updatedInput
+            if (r.additional_context) |ac| {
+                defer alloc.free(ac);
+                if (acc.items.len > 0) acc.append(alloc, '\n') catch {};
+                acc.appendSlice(alloc, ac) catch {};
+            }
+            if (r.decision == .block) {
+                log.warn("hook", "{s} hook requested block (advisory, lifecycle hook does not gate)", .{event_name});
             }
         }
     }
@@ -590,4 +743,68 @@ test "runPostToolUse: 无 post hook / 不匹配 → null" {
     // 完全无 post hook → null
     const empty = HookSet{ .pre_tool_use = &.{}, .allocator = alloc };
     try testing.expect(runPostToolUse(&empty, alloc, "Write", "{}", "{}") == null);
+}
+
+// ── G-rest:生命周期 hook(Stop / PreCompact / PostCompact) ─────────────────
+
+test "parse: 生命周期 hook Stop/PreCompact/PostCompact" {
+    const src =
+        \\{"hooks":{
+        \\  "Stop":[{"hooks":[{"type":"command","command":"mem.sh"}]}],
+        \\  "PreCompact":[{"hooks":[{"type":"command","command":"snap.sh"}]}],
+        \\  "PostCompact":[{"hooks":[{"type":"command","command":"reinject.sh"}]}]
+        \\}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, src, .{});
+    defer parsed.deinit();
+    var set = try parse(testing.allocator, parsed.value);
+    defer set.deinit();
+    try testing.expect(set.hasStop());
+    try testing.expect(set.hasPreCompact());
+    try testing.expect(set.hasPostCompact());
+    try testing.expect(!set.isEmpty());
+    try testing.expectEqualStrings("mem.sh", set.stop[0].commands[0]);
+    try testing.expectEqualStrings("snap.sh", set.pre_compact[0].commands[0]);
+    try testing.expectEqualStrings("reinject.sh", set.post_compact[0].commands[0]);
+}
+
+test "runLifecycleHooks: 收集 additionalContext + hook 真收到 stdin(含事件名/trigger)" {
+    const alloc = testing.allocator;
+    // hook 读 stdin(单次 grep,双 grep 会因 stdin 被第一个吃光而误判):同行含 PostCompact...test_cause
+    // → 回 GOT,否则 MISS。证明 stdin 真传入 + 返回收集。
+    const cmd = "grep -qE 'PostCompact.*test_cause' && echo '{\"additionalContext\":\"GOT\"}' || echo '{\"additionalContext\":\"MISS\"}'";
+    const cmds = [_][]const u8{cmd};
+    const entries = [_]HookEntry{.{ .matcher = "*", .commands = &cmds }};
+    const ac = runLifecycleHooks(&entries, alloc, "PostCompact", "{\"hook_event_name\":\"PostCompact\",\"trigger\":\"test_cause\"}");
+    try testing.expect(ac != null);
+    defer if (ac) |a| alloc.free(a);
+    try testing.expectEqualStrings("GOT", ac.?);
+}
+
+test "runLifecycleHooks: 空 entries → null(无 hook 不 spawn)" {
+    try testing.expect(runLifecycleHooks(&.{}, testing.allocator, "Stop", "{}") == null);
+}
+
+test "parseAndMerge: 跨层合并 5 类事件不丢生命周期 hook(loadHooks 接线回归)" {
+    const alloc = testing.allocator;
+    // project 层:PreToolUse + Stop;user 层:PreCompact + PostCompact。合并后各类都要在(不丢/不覆盖)。
+    const layer_project =
+        \\{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"pre.sh"}]}],
+        \\          "Stop":[{"hooks":[{"type":"command","command":"mem.sh"}]}]}}
+    ;
+    const layer_user =
+        \\{"hooks":{"PreCompact":[{"hooks":[{"type":"command","command":"snap.sh"}]}],
+        \\          "PostCompact":[{"hooks":[{"type":"command","command":"reinject.sh"}]}]}}
+    ;
+    const layers = [_][]const u8{ layer_project, layer_user };
+    var set = try parseAndMerge(alloc, &layers);
+    defer set.deinit();
+    try testing.expect(set.hasPre());
+    try testing.expect(set.hasStop());
+    try testing.expect(set.hasPreCompact());
+    try testing.expect(set.hasPostCompact());
+    try testing.expectEqualStrings("pre.sh", set.pre_tool_use[0].commands[0]);
+    try testing.expectEqualStrings("mem.sh", set.stop[0].commands[0]);
+    try testing.expectEqualStrings("snap.sh", set.pre_compact[0].commands[0]);
+    try testing.expectEqualStrings("reinject.sh", set.post_compact[0].commands[0]);
 }

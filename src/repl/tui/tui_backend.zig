@@ -214,14 +214,13 @@ pub const TuiBackend = struct {
                 self.spinner_fed = false; // 本轮结束,重置喂 spinner 标志。
             },
             .tool_result => |r| {
-                // backend 自决三分支:
+                // backend 自决三分支(P2.1:agent_loop 现每工具只发一条真 content 的 tool_result,
+                // 不再有空 content 双发 → 无需 content.len>0 去重):
                 //  ① 类A(usesLiveCard):commit 动态卡进 scrollback(过去式标题)。
-                //     agent_loop 对每工具发两次 tool_result(:632 空 content / :668 真 content)——
-                //     只认 content.len>0(:668)做 commit,:632 空事件 no-op,防双 commit。
                 //  ② WebSearch(hasProgressCard):完成只移除动态卡(结果走助手文本)。
                 //  ③ 其余(类B 等):renderResult 写 scrollback(不变)。
                 if (tool_card.usesLiveCard(r.name)) {
-                    if (r.content.len > 0) self.commitToolCard(r);
+                    self.commitToolCard(r);
                 } else if (tool_card.hasProgressCard(r.name)) {
                     self.region.clearToolCard(r.id);
                 } else {

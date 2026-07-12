@@ -75,6 +75,30 @@ pub const Conversation = struct {
         self.compact_summary = s;
     }
 
+    /// resume 恢复投影状态(A:transcript 持久化 boundary/summary)。boundary 防御性 cap 到已加载
+    /// 消息数(meta 陈旧/损坏时不越界);summary dupe 成 owned(传 null 清)。释放旧 summary 防泄漏。
+    pub fn restoreCompactState(self: *Conversation, boundary: usize, summary: ?[]const u8) !void {
+        self.compact_boundary = @min(boundary, self.messages.items.len);
+        if (self.compact_summary) |old| self.allocator.free(old);
+        self.compact_summary = if (summary) |s| try self.allocator.dupe(u8, s) else null;
+    }
+
+    /// 把一段文本追加到 compact_summary 末尾(PostCompact hook 注入 skill/plan/MCP 上下文用)。
+    /// 无摘要则直接设为该文本。失败(OOM)静默保持原摘要不变(注入是增强,非正确性)。
+    pub fn appendToCompactSummary(self: *Conversation, extra: []const u8) void {
+        if (extra.len == 0) return;
+        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        if (self.compact_summary) |old| {
+            const merged = std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ old, extra }) catch return;
+            self.allocator.free(old);
+            self.compact_summary = merged;
+        } else {
+            self.compact_summary = self.allocator.dupe(u8, extra) catch return;
+        }
+        self.mutation_version +%= 1;
+    }
+
     /// transcript 快照读前后持锁——与 append 互斥,防遍历 messages.items 时被 realloc 抽走。
     pub fn lockSnapshot(self: *Conversation) void {
         _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);

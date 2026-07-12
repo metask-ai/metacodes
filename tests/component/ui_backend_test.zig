@@ -154,10 +154,10 @@ test "TuiBackend.emit: tool_start(WebSearch) → backend 自决进度卡 addTool
     try testing.expectEqual(@as(u8, 0), region.ui.tools.cards_len);
 }
 
-test "TuiBackend.emit: 类A(Bash)live card 两态 + 双 tool_result 只 commit 一次(R1 守卫)" {
+test "TuiBackend.emit: 类A(Bash)live card 两态 + 单条 tool_result 即 commit(P2.1 收敛)" {
     // 对齐 cc 2.1.165:Bash 执行期动态卡,完成 commit 进 scrollback(过去式标题)。
-    // 关键:agent_loop 对每工具发两次 tool_result——:632 空 content / :668 真 content。
-    // 只认 content.len>0 做 commit,:632 空事件 no-op,防双 commit。本测守卫这个坑。
+    // P2.1:agent_loop 每工具只发**一条**真 content 的 tool_result(不再空+实双发),backend
+    // 无需 content.len>0 去重——每条 tool_result 都 commit 一次。本测守卫"单发即 commit"。
     var region = try makeRegion(testing.allocator);
     defer region.deinit();
     var tb = tui_backend.TuiBackend.init(&region);
@@ -174,19 +174,35 @@ test "TuiBackend.emit: 类A(Bash)live card 两态 + 双 tool_result 只 commit �
     try testing.expectEqualStrings("Bash", region.ui.tools.cards[0].nameSlice());
     try testing.expectEqualStrings("Bash", region.ui.tools.currentSlice()); // spinner 也喂了
 
-    // 第一次 tool_result(agent_loop:632 空事件):content="" → no-op,卡不动。
-    be.emitEvent(S, .{ .tool_result = .{ .id = "b1", .name = "Bash", .input =
-        \\{"command":"echo hi"}
-    , .content = "", .is_error = false } });
-    try testing.expectEqual(@as(u8, 1), region.ui.tools.cards_len); // 卡仍在,未 commit
-
-    // 第二次 tool_result(agent_loop:668 真事件):content 非空 → commit + 清卡。
+    // 单条 tool_result(真 content)→ commit + 清卡。
     be.emitEvent(S, .{ .tool_result = .{ .id = "b1", .name = "Bash", .input =
         \\{"command":"echo hi"}
     , .content =
         \\{"stdout":"hi\n","exit_code":0}
     , .is_error = false, .elapsed_ms = 100 } });
     try testing.expectEqual(@as(u8, 0), region.ui.tools.cards_len); // 卡已 commit 移除
+}
+
+test "TuiBackend.emit: 空 content 的类A tool_result 也 commit(P2.1 修空输出工具不渲染的潜藏坑)" {
+    // 旧的 content.len>0 门槛会把"空输出工具"(如 echo 无输出)的结果卡吞掉不 commit。
+    // P2.1 去门槛后,空 content 也 commit——空输出工具的卡也进 scrollback(两侧齐全)。
+    var region = try makeRegion(testing.allocator);
+    defer region.deinit();
+    var tb = tui_backend.TuiBackend.init(&region);
+    tb.theme = &region.theme;
+    tb.alloc = testing.allocator;
+    const be = tb.backend();
+
+    be.emitEvent(S, .{ .tool_start = .{ .id = "b2", .name = "Bash", .input =
+        \\{"command":"true"}
+    } });
+    try testing.expectEqual(@as(u8, 1), region.ui.tools.cards_len);
+
+    // 空 content 的单条 tool_result 也应 commit(不再被吞)。
+    be.emitEvent(S, .{ .tool_result = .{ .id = "b2", .name = "Bash", .input =
+        \\{"command":"true"}
+    , .content = "", .is_error = false, .elapsed_ms = 5 } });
+    try testing.expectEqual(@as(u8, 0), region.ui.tools.cards_len); // 空输出也 commit 移除
 }
 
 test "TuiBackend.emit: usage 累加进 usage_acc" {

@@ -138,7 +138,7 @@ pub const Writer = struct {
             try self.writeMessage(&m);
         }
 
-        try self.writeMeta(messages);
+        try self.writeMeta(conversation);
     }
 
     fn writeMessage(self: *Writer, m: *const msg_mod.Message) !void {
@@ -187,7 +187,8 @@ pub const Writer = struct {
         if (n < 0 or @as(usize, @intCast(n)) != bytes.len) return error.WriteFailed;
     }
 
-    fn writeMeta(self: *Writer, messages: []const msg_mod.Message) !void {
+    fn writeMeta(self: *Writer, conversation: *const Conversation) !void {
+        const messages = conversation.messages.items;
         // title_guess：首条 user text 的前 80 字节
         var title: []const u8 = "";
         for (messages) |m| {
@@ -205,6 +206,14 @@ pub const Writer = struct {
         try std.json.Stringify.encodeJsonString(self.model, .{}, &aw.writer);
         try aw.writer.print(",\"last_modified_ns\":{d},\"message_count\":{d},\"title_guess\":", .{ util_time.nowWallNs(), messages.len });
         try std.json.Stringify.encodeJsonString(title, .{}, &aw.writer);
+        // A(P1.5 投影持久化):存 compact_boundary + compact_summary,resume 时恢复投影窗口,
+        // 避免重放全量历史 + 首个请求重复压缩(对齐 cc 的 compact boundary 持久化)。
+        try aw.writer.print(",\"compact_boundary\":{d},\"compact_summary\":", .{conversation.compact_boundary});
+        if (conversation.compact_summary) |s| {
+            try std.json.Stringify.encodeJsonString(s, .{}, &aw.writer);
+        } else {
+            try aw.writer.writeAll("null");
+        }
         try aw.writer.writeAll("}\n");
 
         // 原子替换：写到 meta.json.tmp 再 rename
@@ -267,6 +276,42 @@ pub fn loadTranscript(conversation: *Conversation, session_dir: []const u8, allo
         const msg = try parseMessageLine(line, allocator);
         try conversation.append(msg);
     }
+
+    // A:恢复投影状态(compact_boundary/summary)。失败非致命——退回全量重放(旧行为),不阻断 resume。
+    loadCompactStateFromMeta(conversation, session_dir, allocator) catch |err| {
+        log.warn("transcript", "compact state restore skipped: {s}", .{@errorName(err)});
+    };
+}
+
+/// 从 meta.json 恢复 compact_boundary + compact_summary 到 conversation(A:投影持久化)。
+/// meta 不存在/无这些字段(旧 session)→ boundary=0/summary=null(无投影,全量重放,与旧行为一致)。
+fn loadCompactStateFromMeta(conversation: *Conversation, session_dir: []const u8, allocator: std.mem.Allocator) !void {
+    var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pbuf, "{s}/meta.json\x00", .{session_dir});
+    const fd = std.c.open(@ptrCast(path.ptr), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return; // 无 meta → 无投影状态,静默(旧 session 兼容)
+    defer _ = std.c.close(fd);
+
+    var all = std.ArrayList(u8).empty;
+    defer all.deinit(allocator);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.read(fd, &buf, buf.len);
+        if (n <= 0) break;
+        try all.appendSlice(allocator, buf[0..@intCast(n)]);
+    }
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, all.items, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const boundary_v = parsed.value.object.get("compact_boundary");
+    const boundary: usize = if (boundary_v) |bv| (if (bv == .integer and bv.integer >= 0) @intCast(bv.integer) else 0) else 0;
+    const summary: ?[]const u8 = blk: {
+        const sv = parsed.value.object.get("compact_summary") orelse break :blk null;
+        break :blk if (sv == .string) sv.string else null;
+    };
+    if (boundary == 0 and summary == null) return; // 无投影,保持默认
+    try conversation.restoreCompactState(boundary, summary);
 }
 
 /// 解析一行 JSONL 为 Message。字符串字段 dupe 成 owned。
@@ -511,6 +556,63 @@ test "write then load roundtrip" {
     try std.testing.expectEqualStrings("hello", conv2.messages.items[0].blocks[0].text);
     try std.testing.expectEqualStrings("hi there", conv2.messages.items[1].blocks[0].text);
     try std.testing.expectEqualStrings("follow up", conv2.messages.items[2].blocks[0].text);
+}
+
+test "A:compact 投影状态 round-trip(flush 存 meta → load 恢复 boundary/summary)" {
+    const a = std.testing.allocator;
+    const tmp_home = try std.fmt.allocPrint(a, "/tmp/cc-zig-transcript-compact-{d}", .{util_time.nowMs()});
+    defer {
+        util_fs.testing.rmrfBestEffort(tmp_home);
+        a.free(tmp_home);
+    }
+    var writer = try Writer.init(a, "/dummy/cwd", tmp_home, "claude-sonnet", genSessionId());
+    defer writer.deinit();
+
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    var i: usize = 0;
+    while (i < 5) : (i += 1) try conv.appendText(.user, "msg");
+    // 直接设投影状态(不经 restoreCompactState 避免自证):boundary=3 + summary。
+    conv.compact_boundary = 3;
+    conv.compact_summary = try a.dupe(u8, "PROJECTED_SUMMARY_XYZ");
+
+    writer.flush(&conv);
+
+    // 全新 conversation 从盘恢复:全量消息重放 + 投影状态恢复。
+    var conv2 = Conversation.init(a);
+    defer conv2.deinit();
+    try loadTranscript(&conv2, writer.dir, a);
+
+    try std.testing.expectEqual(@as(usize, 5), conv2.len()); // 原始全量
+    try std.testing.expectEqual(@as(usize, 3), conv2.compact_boundary); // 投影 boundary 恢复
+    try std.testing.expect(conv2.compact_summary != null);
+    try std.testing.expectEqualStrings("PROJECTED_SUMMARY_XYZ", conv2.compact_summary.?);
+    try std.testing.expectEqual(@as(usize, 2), conv2.activeMessages().len); // 活跃窗口=最后 2
+}
+
+test "A:未压缩 session 兼容(meta 无投影字段 → boundary=0/summary=null,不崩)" {
+    const a = std.testing.allocator;
+    const tmp_home = try std.fmt.allocPrint(a, "/tmp/cc-zig-transcript-nocompact-{d}", .{util_time.nowMs()});
+    defer {
+        util_fs.testing.rmrfBestEffort(tmp_home);
+        a.free(tmp_home);
+    }
+    var writer = try Writer.init(a, "/dummy/cwd", tmp_home, "claude-sonnet", genSessionId());
+    defer writer.deinit();
+
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "just chatting");
+    try conv.appendText(.assistant, "ok");
+    writer.flush(&conv); // 无压缩 → meta 写 boundary=0/summary=null
+
+    var conv2 = Conversation.init(a);
+    defer conv2.deinit();
+    try loadTranscript(&conv2, writer.dir, a);
+    try std.testing.expectEqual(@as(usize, 2), conv2.len());
+    try std.testing.expectEqual(@as(usize, 0), conv2.compact_boundary);
+    try std.testing.expect(conv2.compact_summary == null);
+    try std.testing.expectEqual(@as(usize, 2), conv2.activeMessages().len); // 无投影=全量活跃
 }
 
 test "write tool_use and tool_result roundtrip" {
