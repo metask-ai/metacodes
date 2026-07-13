@@ -172,61 +172,29 @@ fn spawnCaptureStdoutAbortableTimedCapped(
     max_bytes: usize,
 ) ![]u8 {
     logSpawnArgv(argv, timeout_ms);
-    const t_start = nowMs();
-
-    var pipefd: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&pipefd) != 0) return error.SpawnError;
-
-    const pid = std.c.fork();
-    if (pid < 0) {
-        _ = std.c.close(pipefd[0]);
-        _ = std.c.close(pipefd[1]);
-        log.err("spawn", "fork failed", .{});
-        return error.SpawnError;
-    }
-
-    if (pid == 0) {
-        // 子进程
-        _ = std.c.setpgid(0, 0); // 新进程组；killpg 可杀整组
-        _ = std.c.close(pipefd[0]);
-        _ = std.c.dup2(pipefd[1], 1);
-        // stderr → /dev/null：本函数是 stdout-only 捕获，子进程(git/rg/...)的 stderr
-        // 绝不能泄漏到终端污染 TUI(实测:非 git 目录跑 `git log` → `fatal: not a git
-        // repository` 直接打到屏上)。要 stderr 的调用方用 *WithStderr 变体。
-        const devnull = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
-        if (devnull >= 0) {
-            _ = std.c.dup2(devnull, 2);
-            if (devnull != 2) _ = std.c.close(devnull);
+    // 委托可移植 platform/process.zig。stdout-only(want_stderr=false → 子进程 stderr→null/NUL,
+    // 不泄漏污染 TUI)。abort 包 opaque 回调。行为对齐:timeout→error.Timeout/abort→error.Aborted/
+    // cap→Ok部分/error.SpawnError。
+    const AbortBridge = struct {
+        fn poll(ctx: ?*const anyopaque) bool {
+            const a: *const AbortSignal = @ptrCast(@alignCast(ctx.?));
+            return a.isAborted();
         }
-        _ = std.c.close(pipefd[1]);
-
-        const argv0 = argv[0] orelse std.c._exit(127);
-        _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), &.{null});
-        std.c._exit(127);
-    }
-
-    log.debug("spawn", "forked pid={d}", .{pid});
-
-    // 父进程
-    _ = std.c.close(pipefd[1]);
-    // 父端也设一次 setpgid，避免竞态（子进程可能还没 setpgid）
-    _ = std.c.setpgid(pid, pid);
-
-    const result = readAbortableTimedCapped(pipefd[0], allocator, pid, abort, timeout_ms, max_bytes);
-    _ = std.c.close(pipefd[0]);
-
-    // 如果是 abort/timeout，上面已经 kill 过；reap
-    var status: c_int = 0;
-    _ = std.c.waitpid(pid, &status, 0);
-
-    const dt_ms = nowMs() - t_start;
-    if (result) |out| {
-        log.debug("spawn", "pid={d} exit={d} stdout_bytes={d} duration_ms={d}", .{ pid, exitCode(status), out.len, dt_ms });
-    } else |err| {
-        log.warn("spawn", "pid={d} failed err={s} duration_ms={d}", .{ pid, @errorName(err), dt_ms });
-    }
-
-    return result;
+    };
+    const r = process.capture(argv, allocator, .{
+        .timeout_ms = timeout_ms,
+        .max_bytes = if (max_bytes == 0) std.math.maxInt(usize) else max_bytes,
+        .want_stderr = false,
+        .abort_ctx = @ptrCast(abort),
+        .abort_poll = if (abort != null) AbortBridge.poll else null,
+    }) catch |e| switch (e) {
+        error.Timeout => return error.Timeout,
+        error.Aborted => return error.Aborted,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.SpawnError,
+    };
+    allocator.free(r.stderr); // want_stderr=false → 空 slice，defensive free
+    return r.stdout;
 }
 
 /// 把 argv 打印成可读形式，最多取前 N 个参数防止日志爆炸。
