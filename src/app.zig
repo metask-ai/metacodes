@@ -6,6 +6,8 @@
 //! M1.5 起加入 AbortSignal + SIGINT 绑定。signal handler 只做 atomic store，async-signal-safe。
 
 const std = @import("std");
+const platform_signal = @import("platform/signal.zig");
+const platform_paths = @import("platform/paths.zig");
 const types = @import("types.zig");
 const client_mod = @import("client.zig");
 const api_keys_mod = @import("api/api_keys.zig");
@@ -946,11 +948,10 @@ pub const App = struct {
         return app.cwd_abs orelse "";
     }
 
-    /// HOME(sandbox ~/ 展开)。
+    /// HOME(sandbox ~/ 展开)。可移植:POSIX=$HOME,Windows=$USERPROFILE 回退(见 platform/paths.zig)。
     pub fn homeDir(app: *const App) []const u8 {
         _ = app;
-        const h = std.c.getenv("HOME") orelse return "";
-        return std.mem.span(h);
+        return platform_paths.homeDir() orelse "";
     }
 
     /// EnterWorktree 工具用:把新 worktree 入栈。
@@ -1298,15 +1299,17 @@ pub const App = struct {
     /// (不预包 requestStop wrapper:GUI 真来时直接调 abort.abort + 那时定确切语义,避孤儿 API。)
     pub fn installSigintHandler(app: *App) !void {
         g_abort_signal = &app.abort;
-
-        var act: std.posix.Sigaction = .{
-            .handler = .{ .handler = sigintHandler },
-            .mask = std.posix.sigemptyset(),
-            .flags = 0,
-        };
-        std.posix.sigaction(std.posix.SIG.INT, &act, null);
+        // 可移植:POSIX=SIGINT sigaction;Windows=SetConsoleCtrlHandler(见 platform/signal.zig)。
+        platform_signal.installInterrupt(onSigint);
     }
 };
+
+/// 中断回调(async-signal-safe:只置 abort 原子)。取代旧 sigintHandler(sig)。
+fn onSigint() void {
+    if (g_abort_signal) |s| {
+        s.abort(.user_ctrl_c);
+    }
+}
 
 pub fn shouldQueueModelSwitchCompact(
     previous_model: []const u8,
@@ -1336,14 +1339,6 @@ fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
         try all.appendSlice(alloc, buf[0..@intCast(n)]);
     }
     return try all.toOwnedSlice(alloc);
-}
-
-/// Signal handler: async-signal-safe (仅 atomic store)。
-fn sigintHandler(sig: std.posix.SIG) callconv(.c) void {
-    _ = sig;
-    if (g_abort_signal) |s| {
-        s.abort(.user_ctrl_c);
-    }
 }
 
 test "App init/deinit" {

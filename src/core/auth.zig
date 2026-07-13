@@ -6,6 +6,7 @@
 //! recovery.
 
 const std = @import("std");
+const rng = @import("../platform/rng.zig");
 const fs_util = @import("../util/fs.zig");
 const time = @import("../util/time.zig");
 const types = @import("../types.zig");
@@ -280,15 +281,7 @@ fn randomBase64Url(allocator: std.mem.Allocator, nbytes: usize) ![]u8 {
         @memset(bytes, 0);
         allocator.free(bytes);
     }
-    const fd = std.c.open("/dev/urandom", std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-    if (fd < 0) return error.RandomFailed;
-    defer _ = std.c.close(fd);
-    var read_total: usize = 0;
-    while (read_total < nbytes) {
-        const n = std.c.read(fd, bytes.ptr + read_total, nbytes - read_total);
-        if (n <= 0) return error.RandomFailed;
-        read_total += @intCast(n);
-    }
+    if (!rng.randomBytes(bytes[0..nbytes])) return error.RandomFailed;
     const encoded_len = std.base64.url_safe_no_pad.Encoder.calcSize(nbytes);
     const out = try allocator.alloc(u8, encoded_len);
     _ = std.base64.url_safe_no_pad.Encoder.encode(out, bytes);

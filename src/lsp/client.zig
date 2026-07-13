@@ -13,6 +13,7 @@
 //! push_counter,任何 increment 都重查 version 谓词(published_version >= sent_version)。
 //! **seed-on-first-push**(TS 系):首个 publishDiagnostics 只存不 signal,防 waiter 命中 pre-edit 旧诊断。
 const std = @import("std");
+const sync = @import("../platform/sync.zig");
 const transport_mod = @import("transport.zig");
 const protocol = @import("protocol.zig");
 const reporter = @import("reporter.zig");
@@ -50,8 +51,8 @@ pub const Client = struct {
     transport: Transport,
     reader_thread: ?std.Thread = null,
 
-    mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
-    cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
+    mutex: sync.Mutex = .{},
+    cond: sync.Condition = .{},
 
     pending: std.AutoHashMap(i64, *Pending),
     next_id: i64 = 1,
@@ -91,10 +92,10 @@ pub const Client = struct {
     }
 
     fn lock(self: *Client) void {
-        _ = std.c.pthread_mutex_lock(&self.mutex);
+        _ = self.mutex.lock();
     }
     fn unlock(self: *Client) void {
-        _ = std.c.pthread_mutex_unlock(&self.mutex);
+        _ = self.mutex.unlock();
     }
 
     // ── reader 线程 ────────────────────────────────────────────────────────
@@ -104,7 +105,7 @@ pub const Client = struct {
                 // EOF/Aborted/ReadFailed → server 死了。唤醒所有 waiter,退出。
                 self.lock();
                 self.running = false;
-                _ = std.c.pthread_cond_broadcast(&self.cond);
+                _ = self.cond.broadcast();
                 self.unlock();
                 return;
             };
@@ -131,7 +132,7 @@ pub const Client = struct {
         if (self.pending.get(id)) |p| {
             p.result = self.allocator.dupe(u8, msg) catch null;
             p.done = true;
-            _ = std.c.pthread_cond_broadcast(&self.cond);
+            _ = self.cond.broadcast();
         }
     }
 
@@ -163,14 +164,14 @@ pub const Client = struct {
             const k = self.allocator.dupe(u8, path) catch {
                 // dupe 失败 → 保守当作已 seed(不再吞),直接 signal。
                 self.push_counter += 1;
-                _ = std.c.pthread_cond_broadcast(&self.cond);
+                _ = self.cond.broadcast();
                 return;
             };
             self.seeded_paths.put(k, {}) catch self.allocator.free(k);
             return; // 吞掉首 push,不 signal
         }
         self.push_counter += 1;
-        _ = std.c.pthread_cond_broadcast(&self.cond);
+        _ = self.cond.broadcast();
     }
 
     /// 持锁调用:存 path→ds,free 旧 DiagSet;key owned(首次 dupe)。
@@ -220,8 +221,7 @@ pub const Client = struct {
         // 分片轮询:每 WAIT_POLL_MS 查一次 abort(Ctrl+C 可中断),总不超 timeout_ms。
         var steps_left = timeout_ms / WAIT_POLL_MS + 1;
         while (!p.done and self.running and steps_left > 0 and !self.abortedDuringWait()) : (steps_left -= 1) {
-            var step_ts = absDeadline(WAIT_POLL_MS);
-            _ = std.c.pthread_cond_timedwait(&self.cond, &self.mutex, &step_ts);
+            _ = self.cond.timedWait(&self.mutex, WAIT_POLL_MS * std.time.ns_per_ms);
         }
         _ = self.pending.remove(id);
         const result = p.result;
@@ -358,8 +358,7 @@ pub const Client = struct {
         defer self.unlock();
         var steps_left = timeout_ms / WAIT_POLL_MS + 1;
         while (self.running and self.push_counter <= wait_token and steps_left > 0 and !self.abortedDuringWait()) : (steps_left -= 1) {
-            var step_ts = absDeadline(WAIT_POLL_MS);
-            _ = std.c.pthread_cond_timedwait(&self.cond, &self.mutex, &step_ts);
+            _ = self.cond.timedWait(&self.mutex, WAIT_POLL_MS * std.time.ns_per_ms);
         }
     }
 
@@ -523,21 +522,6 @@ fn appendJsonStr(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u
     defer aw.deinit();
     try std.json.Stringify.encodeJsonString(s, .{}, &aw.writer);
     try out.appendSlice(alloc, aw.written());
-}
-
-/// 现在 + timeout_ms 的绝对时刻(pthread_cond_timedwait 需 CLOCK_REALTIME 绝对时间)。
-fn absDeadline(timeout_ms: u64) std.c.timespec {
-    var now: std.c.timeval = undefined;
-    _ = std.c.gettimeofday(&now, null);
-    var ts: std.c.timespec = .{
-        .sec = now.sec + @as(@TypeOf(now.sec), @intCast(timeout_ms / 1000)),
-        .nsec = @as(@TypeOf((std.c.timespec{ .sec = 0, .nsec = 0 }).nsec), @intCast(@as(u64, @intCast(now.usec)) * 1000 + (timeout_ms % 1000) * 1_000_000)),
-    };
-    if (ts.nsec >= 1_000_000_000) {
-        ts.sec += 1;
-        ts.nsec -= 1_000_000_000;
-    }
-    return ts;
 }
 
 // ============================================================================

@@ -15,6 +15,7 @@
 //!     log.warn("stream", "event_iter error: {s}", .{@errorName(err)});
 
 const std = @import("std");
+const sync = @import("../platform/sync.zig");
 
 pub const Level = enum(u3) {
     debug = 0,
@@ -44,7 +45,7 @@ pub const Level = enum(u3) {
 /// 全局配置。初始化前读环境变量；运行时可调 `enableVerbose` / `setLevel` 调整。
 var g_default_level: Level = .err;
 var g_module_filters: []const ModuleFilter = &.{};
-var g_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
+var g_mutex: sync.Mutex = .{};
 var g_log_file_fd: ?std.c.fd_t = null;
 var g_initialized: bool = false;
 /// 是否往 stderr(fd 2)写日志。交互式 TUI 拥有终端时**必须关掉**——否则任何 err/warn 直接
@@ -58,10 +59,10 @@ var g_reqid_seed: u32 = 0;
 var g_reqid_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 
 fn lock() void {
-    _ = std.c.pthread_mutex_lock(&g_mutex);
+    _ = g_mutex.lock();
 }
 fn unlock() void {
-    _ = std.c.pthread_mutex_unlock(&g_mutex);
+    _ = g_mutex.unlock();
 }
 
 pub const ModuleFilter = struct {

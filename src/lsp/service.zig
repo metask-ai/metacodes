@@ -18,6 +18,7 @@
 //!    snapshotBaseline(≤8s)+getDiagnostics(≤6s);盘写本身不被阻塞(安全第一),但 tool 结果返回
 //!    多等 ≤14s(warm)/≤26s(冷 spawn)。可被 abort 打断。未来若嫌重可换 didChange delta 免全等。
 const std = @import("std");
+const sync = @import("../platform/sync.zig");
 const client_mod = @import("client.zig");
 const servers = @import("servers.zig");
 const workspace = @import("workspace.zig");
@@ -51,8 +52,8 @@ pub const Service = struct {
     cwd: []const u8, // owned;git workspace 门用
     abort: ?transport.AbortCheck = null, // M2:透传给每个 client 的等待,Ctrl+C 可中断
 
-    mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
-    reaper_cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER, // reaper 间隔等待,shutdown 立即唤醒
+    mutex: sync.Mutex = .{},
+    reaper_cond: sync.Condition = .{}, // reaper 间隔等待,shutdown 立即唤醒
     clients: std.StringHashMap(ClientEntry), // key="server_id\x00root"(owned)
     broken: std.StringHashMap(void), // key 同上(owned);永久
     baselines: std.StringHashMap(Baseline), // path(owned) → baseline
@@ -76,10 +77,10 @@ pub const Service = struct {
     }
 
     fn lock(self: *Service) void {
-        _ = std.c.pthread_mutex_lock(&self.mutex);
+        _ = self.mutex.lock();
     }
     fn unlock(self: *Service) void {
-        _ = std.c.pthread_mutex_unlock(&self.mutex);
+        _ = self.mutex.unlock();
     }
 
     /// 该文件是否应启动 LSP:git workspace 内 + 有对应 server + 未 broken。
@@ -320,10 +321,9 @@ pub const Service = struct {
             // 等 REAP_INTERVAL 或被 shutdown 立即唤醒(cond timedwait,非 nanosleep——否则 shutdown
             // 要等满一个 30s 周期,join 阻塞)。
             self.lock();
-            var ts = absDeadline(REAP_INTERVAL_MS);
             while (!self.stop) {
-                const rc = std.c.pthread_cond_timedwait(&self.reaper_cond, &self.mutex, &ts);
-                if (rc != .SUCCESS) break; // 超时 → 做一轮 reap
+                // 相对超时：被 shutdown signal 唤醒(true)→重查 !self.stop 退出；超时(false)→做一轮 reap。
+                if (!self.reaper_cond.timedWait(&self.mutex, REAP_INTERVAL_MS * std.time.ns_per_ms)) break;
             }
             if (self.stop) {
                 self.unlock();
@@ -356,7 +356,7 @@ pub const Service = struct {
     pub fn shutdown(self: *Service) void {
         self.lock();
         self.stop = true;
-        _ = std.c.pthread_cond_broadcast(&self.reaper_cond); // 立即唤醒 reaper(不等满 30s 周期)
+        _ = self.reaper_cond.broadcast(); // 立即唤醒 reaper(不等满 30s 周期)
         self.unlock();
         if (self.reaper) |t| t.join();
 
@@ -392,20 +392,6 @@ fn nowMs() i64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
     return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
-}
-
-fn absDeadline(timeout_ms: u64) std.c.timespec {
-    var now: std.c.timeval = undefined;
-    _ = std.c.gettimeofday(&now, null);
-    var ts: std.c.timespec = .{
-        .sec = now.sec + @as(@TypeOf(now.sec), @intCast(timeout_ms / 1000)),
-        .nsec = @as(@TypeOf((std.c.timespec{ .sec = 0, .nsec = 0 }).nsec), @intCast(@as(u64, @intCast(now.usec)) * 1000 + (timeout_ms % 1000) * 1_000_000)),
-    };
-    if (ts.nsec >= 1_000_000_000) {
-        ts.sec += 1;
-        ts.nsec -= 1_000_000_000;
-    }
-    return ts;
 }
 
 // ============================================================================

@@ -30,6 +30,7 @@
 //! 卡渲染用 alloc(堆),渲染完即 free,TuiBackend 不持有跨调用。
 
 const std = @import("std");
+const sync = @import("../../platform/sync.zig");
 const render_region = @import("render_region.zig");
 const ui_backend = @import("../../core/protocol/ui_backend.zig");
 const ui_event = @import("../../core/protocol/ui_event.zig");
@@ -64,7 +65,7 @@ const SessionId = ui_backend.SessionId;
 /// 读者(watcher / 主线程接管前)统一 `snapshot()` 拷出栈局部后立即放锁,后续全用局部(对齐 L1
 /// "syscall 参数先快照")。详见 TuiBackend.input_ctx 字段上的并发不变量 + 半截真相注释。
 const InputCtx = struct {
-    mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    mutex: sync.Mutex = .{},
     fd: std.c.fd_t = 0,
     app: ?*app_mod.App = null,
     alloc: ?std.mem.Allocator = null,
@@ -73,15 +74,15 @@ const InputCtx = struct {
 
     /// 持锁拷出三字段到栈,立即放锁返回。leaf-lock:调用方拿到 Snapshot 后才做 IO/取 R 锁。
     fn snapshot(self: *InputCtx) Snapshot {
-        _ = std.c.pthread_mutex_lock(&self.mutex);
-        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
         return .{ .fd = self.fd, .app = self.app, .alloc = self.alloc };
     }
 
     /// 持锁写三字段(startInput 注入)。
     fn set(self: *InputCtx, fd: std.c.fd_t, app: *app_mod.App, alloc: std.mem.Allocator) void {
-        _ = std.c.pthread_mutex_lock(&self.mutex);
-        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
         self.fd = fd;
         self.app = app;
         self.alloc = alloc;

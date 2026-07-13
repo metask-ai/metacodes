@@ -19,6 +19,8 @@
 //! App.deinit 必须在共享 allocator 释放之前调本 deinit。
 
 const std = @import("std");
+const rng = @import("../platform/rng.zig");
+const sync = @import("../platform/sync.zig");
 const client_mod = @import("../client.zig");
 const pf = @import("../api/provider_factory.zig");
 const types_mod = @import("../types.zig");
@@ -44,7 +46,7 @@ pub const JobEntry = struct {
     id: [16]u8 = undefined, // "agent_" + 8 hex + NUL pad
     id_len: u8 = 0,
     /// 保护下列 status/output_buf/final_text/stop_reason/turns/tool_calls/err_name。
-    mutex: std.c.pthread_mutex_t = .{},
+    mutex: sync.Mutex = .{},
     status: JobStatus = .running,
     /// 增量输出缓冲。线程边跑边 append(持锁);TaskOutput since_byte 增量读。
     output_buf: std.ArrayList(u8) = .empty,
@@ -89,17 +91,17 @@ pub const JobEntry = struct {
     }
 
     pub fn lockPublic(self: *JobEntry) void {
-        _ = std.c.pthread_mutex_lock(&self.mutex);
+        _ = self.mutex.lock();
     }
     pub fn unlockPublic(self: *JobEntry) void {
-        _ = std.c.pthread_mutex_unlock(&self.mutex);
+        _ = self.mutex.unlock();
     }
 
     fn lock(self: *JobEntry) void {
-        _ = std.c.pthread_mutex_lock(&self.mutex);
+        _ = self.mutex.lock();
     }
     fn unlock(self: *JobEntry) void {
-        _ = std.c.pthread_mutex_unlock(&self.mutex);
+        _ = self.mutex.unlock();
     }
 
     /// 线程持锁写一段流式输出。
@@ -257,7 +259,7 @@ const JobInput = struct {
 
 pub const AgentJobRegistry = struct {
     allocator: std.mem.Allocator,
-    list_mutex: std.c.pthread_mutex_t = .{},
+    list_mutex: sync.Mutex = .{},
     entries: std.ArrayList(*JobEntry) = .empty,
     index: std.AutoHashMap([16]u8, *JobEntry),
     // 造 per-job provider 用(dupe 自 App):
@@ -315,10 +317,10 @@ pub const AgentJobRegistry = struct {
     }
 
     fn listLock(self: *AgentJobRegistry) void {
-        _ = std.c.pthread_mutex_lock(&self.list_mutex);
+        _ = self.list_mutex.lock();
     }
     fn listUnlock(self: *AgentJobRegistry) void {
-        _ = std.c.pthread_mutex_unlock(&self.list_mutex);
+        _ = self.list_mutex.unlock();
     }
 
     /// running job 计数(持 list 锁)。TUI(TaskTab)用。
@@ -343,12 +345,8 @@ pub const AgentJobRegistry = struct {
     fn genId(self: *AgentJobRegistry) [16]u8 {
         self.seq +%= 1;
         var raw: [4]u8 = undefined;
-        const fd = std.c.open("/dev/urandom", std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-        if (fd >= 0) {
-            defer _ = std.c.close(fd);
-            _ = std.c.read(fd, &raw, raw.len);
-        } else {
-            // 退化:用 seq + 时间低位
+        if (!rng.randomBytes(&raw)) {
+            // 退化:用 seq + 时间低位(可移植熵源不可用时)
             const t: u32 = @truncate(@as(u64, @bitCast(util_time.nowMs())));
             raw = @bitCast(t ^ self.seq);
         }

@@ -11,6 +11,7 @@
 //! 线程安全:并发工具执行(批1)下 put 可能在工具线程,渲染在主线程 → 加锁。
 
 const std = @import("std");
+const sync = @import("../platform/sync.zig");
 
 /// 单条:某次 Edit/Write 的新旧全文(owned)。
 pub const Entry = struct {
@@ -27,7 +28,7 @@ pub const MAX_ENTRIES: usize = 16;
 pub const EditHlCache = struct {
     allocator: std.mem.Allocator,
     map: std.StringHashMap(Entry),
-    mutex: std.c.pthread_mutex_t = .{},
+    mutex: sync.Mutex = .{},
     next_seq: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator) EditHlCache {
@@ -49,10 +50,10 @@ pub const EditHlCache = struct {
     }
 
     fn lock(self: *EditHlCache) void {
-        _ = std.c.pthread_mutex_lock(&self.mutex);
+        _ = self.mutex.lock();
     }
     fn unlock(self: *EditHlCache) void {
-        _ = std.c.pthread_mutex_unlock(&self.mutex);
+        _ = self.mutex.unlock();
     }
 
     /// 存一次 Edit/Write 的新旧全文。深拷贝 key+old+new。超 CAP 静默跳过。

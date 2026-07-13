@@ -21,6 +21,7 @@
 //! poll 恒 null(生产路径无人消费 poll,与 TuiBackend 现状一致)。
 
 const std = @import("std");
+const sync = @import("../platform/sync.zig");
 const ui_backend = @import("../core/protocol/ui_backend.zig");
 const ui_event = @import("../core/protocol/ui_event.zig");
 const ui_request = @import("../core/protocol/ui_request.zig");
@@ -53,8 +54,8 @@ pub const WebBackend = struct {
     usage_totals: ?*usage_mod.UsageTotals = null,
 
     // ── pending UI request 槽(一次一个:agent_loop 单线程同步问答;subagent 无 requester)──
-    mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
-    cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
+    mutex: sync.Mutex = .{},
+    cond: sync.Condition = .{},
     next_req_id: u64 = 1,
     /// 0 = 无挂起请求。
     pending_id: u64 = 0,
@@ -73,10 +74,10 @@ pub const WebBackend = struct {
     }
 
     fn lock(self: *WebBackend) void {
-        _ = std.c.pthread_mutex_lock(&self.mutex);
+        _ = self.mutex.lock();
     }
     fn unlock(self: *WebBackend) void {
-        _ = std.c.pthread_mutex_unlock(&self.mutex);
+        _ = self.mutex.unlock();
     }
 
     pub fn backend(self: *WebBackend) UiBackend {
@@ -152,8 +153,7 @@ pub const WebBackend = struct {
                 self.announceDone("ui_request_cancelled", id);
                 return cancelOutcome(req, out);
             };
-            var ts = journal_mod.absDeadline(200);
-            _ = std.c.pthread_cond_timedwait(&self.cond, &self.mutex, &ts);
+            _ = self.cond.timedWait(&self.mutex, 200 * std.time.ns_per_ms);
         }
         const resp_json = self.response_json.?;
         self.response_json = null;
@@ -182,7 +182,7 @@ pub const WebBackend = struct {
             return false;
         }
         self.response_json = owned;
-        _ = std.c.pthread_cond_broadcast(&self.cond);
+        _ = self.cond.broadcast();
         return true;
     }
 };

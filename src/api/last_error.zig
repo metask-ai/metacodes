@@ -19,6 +19,7 @@
 //! web 模式多线程(HTTP 线程 + agent 线程)→ mutex 保护;buf 定长静态,零分配。
 
 const std = @import("std");
+const sync = @import("../platform/sync.zig");
 
 const BODY_CAP = 512;
 const KIND_CAP = 48;
@@ -27,13 +28,13 @@ const KIND_CAP = 48;
 /// 读侧用它声明栈 buf,别自己拍魔数。
 pub const SUMMARY_BUF_LEN = KIND_CAP + BODY_CAP + 80;
 
-var mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
+var mutex: sync.Mutex = .{};
 
 fn lock() void {
-    _ = std.c.pthread_mutex_lock(&mutex);
+    _ = mutex.lock();
 }
 fn unlock() void {
-    _ = std.c.pthread_mutex_unlock(&mutex);
+    _ = mutex.unlock();
 }
 var has_value: bool = false;
 var status_code: u16 = 0; // 0 = 非 HTTP 状态错误(连接失败/SSE 错误帧)

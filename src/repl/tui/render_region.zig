@@ -13,6 +13,7 @@
 //! mutex 只管"擦/画"这组动作的逻辑原子性,不用裸 writeAll(2) 绕过。
 
 const std = @import("std");
+const sync = @import("../../platform/sync.zig");
 const app_mod = @import("../../app.zig");
 const types = @import("../../types.zig");
 const ansi = @import("ansi.zig");
@@ -104,13 +105,13 @@ pub const RenderRegion = struct {
     // 阶段1:overlay 逻辑态(help/transcript)由 UiState 承载;机制态(prev_rows 等)仍在上面。
     ui: ui_state_mod.UiState = .{},
 
-    mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    mutex: sync.Mutex = .{},
 
     fn lock(self: *RenderRegion) void {
-        _ = std.c.pthread_mutex_lock(&self.mutex);
+        _ = self.mutex.lock();
     }
     fn unlock(self: *RenderRegion) void {
-        _ = std.c.pthread_mutex_unlock(&self.mutex);
+        _ = self.mutex.unlock();
     }
 
     /// 生成期 overlay(全屏 transcript viewer,alt-screen)用:持渲染锁,使 agent_loop emit 线程

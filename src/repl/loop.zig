@@ -8,6 +8,7 @@
 //! - Ctrl+C：输入阶段 → 清 buffer（ISIG=false 让字节 0x03 落到 LineEditor）；生成阶段 → SIGINT → app.abort
 
 const std = @import("std");
+const platform_signal = @import("../platform/signal.zig");
 const posix = std.posix;
 const app_mod = @import("../app.zig");
 const Conversation = @import("../core/conversation.zig").Conversation;
@@ -861,18 +862,13 @@ var g_paste_id: usize = 0;
 /// readLineRaw 的 poll 循环超时时观察它 → 立即重画输入框自适应新宽度。
 var g_winch = std.atomic.Value(bool).init(false);
 
-fn sigwinchHandler(sig: std.posix.SIG) callconv(.c) void {
-    _ = sig;
+fn onWinch() void {
     g_winch.store(true, .release);
 }
 
 fn installSigwinch() void {
-    var act: std.posix.Sigaction = .{
-        .handler = .{ .handler = sigwinchHandler },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.WINCH, &act, null);
+    // 可移植:POSIX=SIGWINCH sigaction;Windows no-op(resize 归 W4 ConsoleInput,见 platform/signal.zig)。
+    platform_signal.installResize(onWinch);
 }
 
 /// 把提交的输入回显到 scrollback(复刻 Claude Code:提交后历史里留 "❯ <内容>")。

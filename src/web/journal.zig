@@ -12,13 +12,14 @@
 //! 后续加环形淘汰 + "重放起点晚于请求 seq"信号,协议上 SSE 天然支持。
 
 const std = @import("std");
+const sync = @import("../platform/sync.zig");
 const log = @import("../util/log.zig");
 
 pub const EventJournal = struct {
     allocator: std.mem.Allocator,
     lines: std.ArrayList([]u8) = .empty,
-    mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
-    cond: std.c.pthread_cond_t = std.c.PTHREAD_COND_INITIALIZER,
+    mutex: sync.Mutex = .{},
+    cond: sync.Condition = .{},
     closed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) EventJournal {
@@ -33,10 +34,10 @@ pub const EventJournal = struct {
     }
 
     fn lock(self: *EventJournal) void {
-        _ = std.c.pthread_mutex_lock(&self.mutex);
+        _ = self.mutex.lock();
     }
     fn unlock(self: *EventJournal) void {
-        _ = std.c.pthread_mutex_unlock(&self.mutex);
+        _ = self.mutex.unlock();
     }
 
     /// 追加一行(dupe,owned by journal)并唤醒所有等待者。
@@ -53,7 +54,7 @@ pub const EventJournal = struct {
             log.warn("web", "journal dropped line (OOM)", .{});
             return;
         };
-        _ = std.c.pthread_cond_broadcast(&self.cond);
+        _ = self.cond.broadcast();
     }
 
     /// 当前行数(下一个新事件的 seq)。
@@ -68,7 +69,7 @@ pub const EventJournal = struct {
         self.lock();
         defer self.unlock();
         self.closed = true;
-        _ = std.c.pthread_cond_broadcast(&self.cond);
+        _ = self.cond.broadcast();
     }
 
     pub fn isClosed(self: *EventJournal) bool {
@@ -85,10 +86,10 @@ pub const EventJournal = struct {
         defer self.unlock();
         if (self.lines.items.len <= since) {
             if (self.closed) return null;
-            var ts = absDeadline(timeout_ms);
             while (self.lines.items.len <= since and !self.closed) {
-                const rc = std.c.pthread_cond_timedwait(&self.cond, &self.mutex, &ts);
-                if (rc != .SUCCESS) break; // ETIMEDOUT(或罕见错误)→ 按超时处理
+                // 相对超时等待；超时/错误 → break 按超时处理。SSE 各 client 独立 since 游标
+                // 且不消费行，谓词一旦 lines.len>since 即恒真，无"信号后谓词仍假"重等场景。
+                if (!self.cond.timedWait(&self.mutex, timeout_ms * std.time.ns_per_ms)) break;
             }
             if (self.lines.items.len <= since) return null;
         }
@@ -106,22 +107,6 @@ pub const EventJournal = struct {
         return out;
     }
 };
-
-/// 现在 + timeout_ms 的绝对时刻(pthread_cond_timedwait 需要 CLOCK_REALTIME 绝对时间)。
-/// pub:backend.zig 的 requester 等待共用(同一 web 模块内唯一实现)。
-pub fn absDeadline(timeout_ms: u64) std.c.timespec {
-    var now: std.c.timeval = undefined;
-    _ = std.c.gettimeofday(&now, null);
-    var ts: std.c.timespec = .{
-        .sec = now.sec + @as(@TypeOf(now.sec), @intCast(timeout_ms / 1000)),
-        .nsec = @as(@TypeOf((std.c.timespec{ .sec = 0, .nsec = 0 }).nsec), @intCast(@as(u64, @intCast(now.usec)) * 1000 + (timeout_ms % 1000) * 1_000_000)),
-    };
-    if (ts.nsec >= 1_000_000_000) {
-        ts.sec += 1;
-        ts.nsec -= 1_000_000_000;
-    }
-    return ts;
-}
 
 // ============================================================================
 // Tests

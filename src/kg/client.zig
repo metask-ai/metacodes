@@ -15,6 +15,7 @@
 //! permanent(二进制缺/版本不符 → degraded)、data(环/NotFound → 透传模型改参)。
 
 const std = @import("std");
+const sync = @import("../platform/sync.zig");
 const common = @import("../tools/common.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const log = @import("../util/log.zig");
@@ -152,11 +153,11 @@ pub const KgClient = struct {
     /// 同一旧指针 → double-free。锁只护配对;detail() 返回借用切片,约定**失败调用同线程
     /// 立即消费**(跨线程读 detail 是 best-effort 错误文案,不做数据依赖)。store 一致性
     /// 由 tinykg CliStoreLock 保证,调用本身无需串行。
-    detail_mu: std.c.pthread_mutex_t = .{},
+    detail_mu: sync.Mutex = .{},
     /// 缓存槽锁(project_node_id/global/miss/anchor_ids):多 subagent 线程共享本 client,
     /// ?u64 是 tag+payload 两次 store——无锁撕裂读会拿垃圾 id 去建边(挂错节点=数据损坏)。
     /// 纪律:锁只护槽读写,**绝不跨 spawn 持有**(子进程毫秒~秒级)。
-    cache_mu: std.c.pthread_mutex_t = .{},
+    cache_mu: sync.Mutex = .{},
     /// project-containment(tinykg ce3a7f0 起):本项目 project 节点 id(session 内缓存;
     /// lazy find-or-create,写路径才建,读路径只 lookup)。null=未解析/库中无。
     project_node_id: ?u64 = null,
@@ -454,10 +455,10 @@ pub const KgClient = struct {
     /// create=false(读路径):无则返 null 并记 negative cache(scoped 自动召回每 turn 跑,
     /// 不缓存 miss 会每 turn 白烧 spawn,Linus 次要5;写路径 ensure 成功后清除)。
     fn cacheLock(self: *KgClient) void {
-        _ = std.c.pthread_mutex_lock(&self.cache_mu);
+        _ = self.cache_mu.lock();
     }
     fn cacheUnlock(self: *KgClient) void {
-        _ = std.c.pthread_mutex_unlock(&self.cache_mu);
+        _ = self.cache_mu.unlock();
     }
 
     fn projectNodeId(self: *KgClient, scope_global: bool, create: bool) KgError!?u64 {
@@ -1703,8 +1704,8 @@ pub const KgClient = struct {
     fn setDetail(self: *KgClient, comptime fmt: []const u8, args: anytype) void {
         // 注意:args 可能借用旧 last_detail(prior 重包模式)——必须先 allocPrint 再换指针。
         const d = std.fmt.allocPrint(self.allocator, fmt, args) catch return;
-        _ = std.c.pthread_mutex_lock(&self.detail_mu);
-        defer _ = std.c.pthread_mutex_unlock(&self.detail_mu);
+        _ = self.detail_mu.lock();
+        defer _ = self.detail_mu.unlock();
         if (self.last_detail) |old| self.allocator.free(old);
         self.last_detail = d;
     }

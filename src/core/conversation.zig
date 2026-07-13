@@ -7,6 +7,7 @@
 //! `deinit` 释放所有 blocks。不做 compact 的实现（留给未来 M6）。
 
 const std = @import("std");
+const sync = @import("../platform/sync.zig");
 const msg = @import("message.zig");
 
 pub const TOOL_RESULT_CLEARED_STUB = "[tool result cleared to save context]";
@@ -46,7 +47,7 @@ pub const Conversation = struct {
     // 与主线程 agent_loop 的 append 并发——append 触发 ArrayList realloc 会使遍历中的旧
     // items slice 失效(UAF)。append 与 lockSnapshot/unlockSnapshot 包裹的快照读持同一锁。
     // 竞争极低:append 一轮几次、快照仅 Ctrl+O 时,故用粗粒度锁无性能问题。
-    snapshot_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    snapshot_mutex: sync.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator) Conversation {
         return .{ .allocator = allocator, .messages = .empty };
@@ -87,8 +88,8 @@ pub const Conversation = struct {
     /// 无摘要则直接设为该文本。失败(OOM)静默保持原摘要不变(注入是增强,非正确性)。
     pub fn appendToCompactSummary(self: *Conversation, extra: []const u8) void {
         if (extra.len == 0) return;
-        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
-        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
         if (self.compact_summary) |old| {
             const merged = std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ old, extra }) catch return;
             self.allocator.free(old);
@@ -101,10 +102,10 @@ pub const Conversation = struct {
 
     /// transcript 快照读前后持锁——与 append 互斥,防遍历 messages.items 时被 realloc 抽走。
     pub fn lockSnapshot(self: *Conversation) void {
-        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
+        _ = self.snapshot_mutex.lock();
     }
     pub fn unlockSnapshot(self: *Conversation) void {
-        _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        _ = self.snapshot_mutex.unlock();
     }
 
     pub const UsageAnchor = struct {
@@ -118,8 +119,8 @@ pub const Conversation = struct {
     /// context_tokens=0 视为后端不报 usage,不建锚点。
     pub fn setUsageAnchor(self: *Conversation, context_tokens: usize) void {
         if (context_tokens == 0) return;
-        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
-        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
         self.usage_anchor = .{
             .context_tokens = context_tokens,
             .msg_count = self.messages.items.len,
@@ -145,15 +146,15 @@ pub const Conversation = struct {
     /// 显式作废锚点。context-window recovery 进入时调:让 before/after 遥测同用
     /// 冷路径基准(否则 before 锚点实计、after 冷估算,删一条消息数字反而翻倍)。
     pub fn invalidateUsageAnchor(self: *Conversation) void {
-        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
-        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
         self.usage_anchor = null;
     }
 
     /// 追加消息（转移所有权）。传入的 Message 不得再手动 deinit。
     pub fn append(self: *Conversation, m: msg.Message) !void {
-        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
-        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
         try self.messages.append(self.allocator, m);
         self.mutation_version +%= 1; // append 只 bump mutation,不 bump shrink(不改前缀)
     }
@@ -174,8 +175,8 @@ pub const Conversation = struct {
     /// 持快照锁:防拷贝遍历时被并发 append realloc 抽走 items(同 transcript 快照纪律)。
     /// 失败回收已拷部分,不泄漏。
     pub fn cloneInto(self: *Conversation, dst: std.mem.Allocator) !Conversation {
-        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
-        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
         var out = Conversation.init(dst);
         errdefer out.deinit();
         try out.messages.ensureTotalCapacity(dst, self.messages.items.len);
@@ -218,8 +219,8 @@ pub const Conversation = struct {
     /// suffix snapshot is later used to reject replacing history if another
     /// turn/tool path appended or edited the active suffix while summarizing.
     pub fn cloneForCompactPreview(self: *Conversation, dst: std.mem.Allocator, keep_n: usize) !CompactPreview {
-        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
-        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
 
         const start_index = compactBoundaryForItems(self.messages.items, keep_n);
         var out = Conversation.init(dst);
@@ -256,14 +257,14 @@ pub const Conversation = struct {
     /// side. Used by compact preview paths so the live history is only mutated
     /// after savings/boundary checks pass. `replacement` is drained on success.
     pub fn replaceWithOwned(self: *Conversation, replacement: *Conversation) bool {
-        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
-        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
         return self.replaceWithOwnedLocked(replacement);
     }
 
     pub fn replaceWithOwnedIfSuffixUnchanged(self: *Conversation, snapshot: *const SuffixSnapshot, replacement: *Conversation) bool {
-        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
-        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
         if (self.mutation_version != snapshot.version) return false;
         if (snapshot.start_index > self.messages.items.len) return false;
         if (self.messages.items.len - snapshot.start_index != snapshot.items.len) return false;
@@ -341,8 +342,8 @@ pub const Conversation = struct {
     pub fn compact(self: *Conversation, threshold: usize) !usize {
         if (!self.isOverThreshold(threshold)) return 0;
 
-        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
-        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
         const start = self.activeStart();
         const active = self.messages.items.len - start;
         if (active < 4) return 0;
@@ -362,8 +363,8 @@ pub const Conversation = struct {
     /// 注意：仍会丢老的 user 消息 + 它们对应的 assistant 回答；这是故意的（这是 compact 的本意）。
     /// 只保证 *边界处* 不留孤儿。
     pub fn compactKeepRecent(self: *Conversation, keep_n: usize) usize {
-        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
-        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
         // P1.5 投影:新 boundary=全量保留最近 keep_n 的边界(单调前移)。无摘要降级(老消息投影掉不总结)。
         const new_boundary = self.compactBoundary(keep_n);
         if (new_boundary <= self.compact_boundary) return 0;
@@ -379,8 +380,8 @@ pub const Conversation = struct {
     /// recovery path's one-item-at-a-time shrink while preserving Anthropic's
     /// tool_use/tool_result pairing invariant at the retained boundary.
     pub fn removeOldestForContextRecovery(self: *Conversation) usize {
-        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
-        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
         // P1.5 投影:推进 boundary 丢最老活跃消息 + 紧邻孤儿 tool_result,不删原始。
         const total = self.messages.items.len;
         if (total - self.activeStart() <= 1) return 0;
@@ -443,8 +444,8 @@ pub const Conversation = struct {
         var new_boundary: usize = 0;
         var summary_input: []msg.Message = &.{};
         {
-            _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
-            defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+            _ = self.snapshot_mutex.lock();
+            defer _ = self.snapshot_mutex.unlock();
             new_boundary = self.compactBoundary(keep_n);
             if (new_boundary <= self.compact_boundary) return .{ .dropped = 0, .summary_used = false };
 
@@ -468,8 +469,8 @@ pub const Conversation = struct {
         errdefer if (summary) |s| self.allocator.free(s);
 
         // **投影**:不删任何消息,只推进 boundary + 替换摘要。原始永久保留供 transcript/resume/查看。
-        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
-        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
         const old_boundary = self.compact_boundary;
         self.compact_boundary = new_boundary;
         if (summary) |s| self.setCompactSummary(s); // s owned → 转移
@@ -487,8 +488,8 @@ pub const Conversation = struct {
         const total = self.messages.items.len;
         if (total <= keep_recent_n) return 0;
         const boundary = total - keep_recent_n; // [0, boundary) 是"老"消息
-        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
-        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
 
         var cleared: usize = 0;
         var mi: usize = 0;
@@ -516,8 +517,8 @@ pub const Conversation = struct {
     /// the common failure mode where "recent N messages" preserves many old tool
     /// outputs in a dense tool turn and full compact keeps firing with low savings.
     pub fn microcompactToolResultsByRecentResults(self: *Conversation, keep_recent_results: usize) ToolResultReduction {
-        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
-        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
         var out = ToolResultReduction{};
         var seen_recent: usize = 0;
         var mi = self.messages.items.len;
@@ -550,8 +551,8 @@ pub const Conversation = struct {
     /// intentionally independent of full compact: a single recent tool result
     /// can be enough to exceed the context window.
     pub fn truncateLargeToolResults(self: *Conversation, max_bytes: usize) ToolResultReduction {
-        _ = std.c.pthread_mutex_lock(&self.snapshot_mutex);
-        defer _ = std.c.pthread_mutex_unlock(&self.snapshot_mutex);
+        _ = self.snapshot_mutex.lock();
+        defer _ = self.snapshot_mutex.unlock();
         var out = ToolResultReduction{};
         if (max_bytes == 0) return out;
         for (self.messages.items, 0..) |m, mi| {

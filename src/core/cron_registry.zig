@@ -11,6 +11,7 @@
 //! 不会打断正在进行的生成。这是有意的简化(避免并发复杂度)。
 
 const std = @import("std");
+const rng = @import("../platform/rng.zig");
 const util_time = @import("../util/time.zig");
 
 pub const CronJob = struct {
@@ -129,15 +130,7 @@ pub const CronRegistry = struct {
 
     fn genId() ![12]u8 {
         var raw: [6]u8 = undefined;
-        const fd = std.c.open("/dev/urandom", std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-        if (fd < 0) return error.RandomFailed;
-        defer _ = std.c.close(fd);
-        var pos: usize = 0;
-        while (pos < raw.len) {
-            const n = std.c.read(fd, raw[pos..].ptr, raw.len - pos);
-            if (n <= 0) return error.RandomFailed;
-            pos += @intCast(n);
-        }
+        if (!rng.randomBytes(&raw)) return error.RandomFailed;
         var id: [12]u8 = undefined;
         _ = std.fmt.bufPrint(&id, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{ raw[0], raw[1], raw[2], raw[3], raw[4], raw[5] }) catch unreachable;
         return id;

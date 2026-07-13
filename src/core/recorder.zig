@@ -12,6 +12,7 @@
 //! 为不存在的需求加复杂度。真要并发录多会话时再按 session_id 分文件名(低优先级)。
 
 const std = @import("std");
+const sync = @import("../platform/sync.zig");
 const log = @import("../util/log.zig");
 
 var g_dir: ?[]const u8 = null;
@@ -20,13 +21,13 @@ var g_seq: u32 = 0;
 /// 当前轮的 SSE 累积 buffer(recordSseLine 追加,finishSse 落盘)。
 var g_sse_buf: [256 * 1024]u8 = undefined;
 var g_sse_len: usize = 0;
-var g_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
+var g_mutex: sync.Mutex = .{};
 
 fn lock() void {
-    _ = std.c.pthread_mutex_lock(&g_mutex);
+    _ = g_mutex.lock();
 }
 fn unlock() void {
-    _ = std.c.pthread_mutex_unlock(&g_mutex);
+    _ = g_mutex.unlock();
 }
 
 pub fn setDir(dir: []const u8) void {

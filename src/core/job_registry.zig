@@ -16,6 +16,8 @@
 //! - 不持久化；App 重启丢所有 job
 
 const std = @import("std");
+const sync = @import("../platform/sync.zig");
+const rng = @import("../platform/rng.zig");
 const log = @import("../util/log.zig");
 const util_fs = @import("../util/fs.zig");
 const util_time = @import("../util/time.zig");
@@ -49,13 +51,13 @@ pub const JobRegistry = struct {
     /// 线程安全锁:并发工具线程(executeSlots 并发批 + stream_prefetch 边流边执行的只读 Bash/
     /// BashOutput)会并发 spawnBackground(append+put)/get/reapExited/kill → 无锁则 ArrayList/HashMap
     /// 数据竞争 + 堆损坏(Linus HIGH-1)。全仓惯例 std.c.pthread_*(裁剪 std 无 Thread.Mutex)。
-    mu: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    mu: sync.Mutex = .{},
 
     fn lock(self: *JobRegistry) void {
-        _ = std.c.pthread_mutex_lock(&self.mu);
+        _ = self.mu.lock();
     }
     fn unlock(self: *JobRegistry) void {
-        _ = std.c.pthread_mutex_unlock(&self.mu);
+        _ = self.mu.unlock();
     }
 
     pub fn init(allocator: std.mem.Allocator) !JobRegistry {
@@ -108,29 +110,14 @@ pub const JobRegistry = struct {
         self.allocator.free(self.base_dir);
     }
 
-    /// 生成新 job id：12 hex = 6 byte，从 `/dev/urandom` 读熵。
-    /// 之所以不走 `std.posix.getrandom`：Zig 0.16 stable 没有该绑定；macOS libc 也没有
-    /// `getrandom(2)` 系统调用。`/dev/urandom` 在 Linux / macOS / BSD 都可用，纯 POSIX。
-    /// 失败 fatal：进程启不了 bg job 比 id 碰撞强。JobRegistry 的使用方已有兜底
-    /// （spawnBackground 失败回退同步执行）。
+    /// 生成新 job id：12 hex = 6 byte，走可移植熵源 `platform/rng.zig`
+    /// （POSIX=/dev/urandom，Windows=RtlGenRandom）。失败 fatal：进程启不了 bg job 比 id 碰撞强，
+    /// JobRegistry 使用方已有兜底（spawnBackground 失败回退同步执行）。
     fn genId() error{RandomFailed}![12]u8 {
         var raw: [6]u8 = undefined;
-        const fd = std.c.open("/dev/urandom", std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-        if (fd < 0) {
-            const errno = std.c._errno().*;
-            log.err("job", "open /dev/urandom failed errno={d}", .{errno});
+        if (!rng.randomBytes(&raw)) {
+            log.err("job", "randomBytes failed (entropy source unavailable)", .{});
             return error.RandomFailed;
-        }
-        defer _ = std.c.close(fd);
-        var pos: usize = 0;
-        while (pos < raw.len) {
-            const n = std.c.read(fd, raw[pos..].ptr, raw.len - pos);
-            if (n <= 0) {
-                const errno = std.c._errno().*;
-                log.err("job", "read /dev/urandom failed rc={d} errno={d}", .{ n, errno });
-                return error.RandomFailed;
-            }
-            pos += @as(usize, @intCast(n));
         }
         var id: [12]u8 = undefined;
         _ = std.fmt.bufPrint(&id, "{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{ raw[0], raw[1], raw[2], raw[3], raw[4], raw[5] }) catch unreachable;

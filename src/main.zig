@@ -1,4 +1,5 @@
 const std = @import("std");
+const platform_signal = @import("platform/signal.zig");
 const types = @import("types.zig");
 const client = @import("client.zig");
 const app_mod = @import("app.zig");
@@ -156,14 +157,8 @@ pub fn main(init: std.process.Init) !void {
     // SIGPIPE 全局忽略:向已关闭的 pipe/socket 写(hook 子进程 stdin、web SSE、子进程管道)默认会
     // 收 SIGPIPE 直接杀进程;改成 SIG_IGN → write 返 EPIPE(n<0)由各处的 `n<=0` 分支优雅处理。
     // 必须在任何 spawn/网络之前设一次,覆盖所有模式(TUI/web/headless/subagent)。(Linus H1)
-    {
-        var act: std.posix.Sigaction = .{
-            .handler = .{ .handler = std.posix.SIG.IGN },
-            .mask = std.posix.sigemptyset(),
-            .flags = 0,
-        };
-        std.posix.sigaction(std.posix.SIG.PIPE, &act, null);
-    }
+    // 可移植:Windows 无 SIGPIPE → no-op(socket 写返 WSAECONNRESET,各处 n<=0 分支已处理)。
+    platform_signal.ignoreBrokenPipe();
 
     if (try maybeRunAuthCommand(init, allocator)) |code| {
         std.process.exit(code);

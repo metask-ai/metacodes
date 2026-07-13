@@ -17,6 +17,7 @@
 //!   const meta = rs.get(path);             // Write/Edit 查询
 
 const std = @import("std");
+const sync = @import("../platform/sync.zig");
 const builtin = @import("builtin");
 const util_time = @import("../util/time.zig");
 
@@ -37,7 +38,7 @@ pub const ReadState = struct {
     // path (owned, heap) → Entry
     map: std.StringHashMap(Entry),
     /// 并发工具执行(批1)下,Read 在其它线程也会 record。record/get 持锁。
-    mutex: std.c.pthread_mutex_t = .{},
+    mutex: sync.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator) ReadState {
         return .{
@@ -54,10 +55,10 @@ pub const ReadState = struct {
     }
 
     fn lock(self: *ReadState) void {
-        _ = std.c.pthread_mutex_lock(&self.mutex);
+        _ = self.mutex.lock();
     }
     fn unlock(self: *ReadState) void {
-        _ = std.c.pthread_mutex_unlock(&self.mutex);
+        _ = self.mutex.unlock();
     }
 
     /// Read 成功后调用:记录 mtime/size/content_hash/read_at。path 会被 dupe 到内部存储。

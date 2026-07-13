@@ -7,11 +7,12 @@
 //! 自带 pthread mutex(不复用 RenderRegion.mutex,避免锁顺序耦合)。
 
 const std = @import("std");
+const sync = @import("../platform/sync.zig");
 
 pub const MsgQueue = struct {
     items: std.ArrayList([]u8) = .empty, // 每条 owned text(入队 dupe,出队转移所有权给调用者)
     allocator: std.mem.Allocator,
-    mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+    mutex: sync.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator) MsgQueue {
         return .{ .allocator = allocator };
@@ -23,10 +24,10 @@ pub const MsgQueue = struct {
     }
 
     fn lock(self: *MsgQueue) void {
-        _ = std.c.pthread_mutex_lock(&self.mutex);
+        _ = self.mutex.lock();
     }
     fn unlock(self: *MsgQueue) void {
-        _ = std.c.pthread_mutex_unlock(&self.mutex);
+        _ = self.mutex.unlock();
     }
 
     /// 入队(dupe text,owned by queue)。返回是否成功(OOM 时 false)。
