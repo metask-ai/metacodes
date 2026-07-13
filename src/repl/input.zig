@@ -9,6 +9,7 @@
 //! 测试策略：LineEditor 全部用 fake keystream 驱动。termios 只做 "不崩" 测试（真 tty 行为难在 CI 里验证）。
 
 const std = @import("std");
+const process = @import("../platform/process.zig");
 
 // ============================================================================
 // Key 抽象
@@ -398,15 +399,9 @@ pub fn externalEdit(allocator: std.mem.Allocator, current: []const u8) ![]u8 {
     defer allocator.free(sh_cmd);
     argv[2] = sh_cmd.ptr;
 
-    const pid = std.c.fork();
-    if (pid == 0) {
-        _ = std.c.execve("/bin/sh", @ptrCast(&argv), @ptrCast(std.c.environ));
-        std.c._exit(127);
-    } else if (pid < 0) {
-        return error.ForkFailed;
-    }
-    var status: c_int = 0;
-    _ = std.c.waitpid(pid, &status, 0);
+    // $EDITOR 交互式:继承 stdio（编辑器接管终端）+ wait，走可移植 platform/process。
+    // Windows 的 /bin/sh 依赖 git-bash（roadmap shell 决策 node 8871）。
+    _ = process.runInherit(argv[0..], true) catch return error.ForkFailed;
 
     const rfd = std.c.open(path_z.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (rfd < 0) return error.ReadFailed;

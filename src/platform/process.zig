@@ -56,6 +56,67 @@ pub fn captureStdout(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator,
     return capture(argv, allocator, .{ .timeout_ms = timeout_ms, .max_bytes = max_bytes, .want_stderr = false });
 }
 
+/// spawn argv、**继承父进程 stdio**（交互式，如 $EDITOR）、等待，返回 exit code。
+/// POSIX：fork+execve(inherit fd 0/1/2)+waitpid；Windows：CreateProcessW(继承 console)+Wait。
+pub fn runInherit(argv: []const ?[*:0]const u8, inherit_env: bool) CaptureError!i32 {
+    if (is_windows) {
+        const a = std.heap.page_allocator;
+        const cmdline = buildWindowsCmdline(a, argv) catch return error.SpawnFailed;
+        defer a.free(cmdline);
+        var si = std.mem.zeroes(win.STARTUPINFOW);
+        si.cb = @sizeOf(win.STARTUPINFOW); // 不设 USESTDHANDLES → 子进程继承本进程 console
+        var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
+        if (win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(0), .{}, null, null, &si, &pi) == .FALSE) return error.SpawnFailed;
+        _ = WaitForSingleObject(pi.hProcess, INFINITE);
+        var code: win.DWORD = 0;
+        _ = GetExitCodeProcess(pi.hProcess, &code);
+        win.CloseHandle(pi.hProcess);
+        win.CloseHandle(pi.hThread);
+        return @bitCast(code);
+    }
+    const pid = std.c.fork();
+    if (pid < 0) return error.SpawnFailed;
+    if (pid == 0) {
+        const argv0 = argv[0] orelse std.c._exit(127);
+        const envp: [*:null]const ?[*:0]const u8 = if (inherit_env) @ptrCast(std.c.environ) else &.{null};
+        _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), envp);
+        std.c._exit(127);
+    }
+    var status: c_int = 0;
+    _ = std.c.waitpid(pid, &status, 0);
+    return posixExitCode(status);
+}
+
+/// spawn argv、**detached**（关闭 stdio、不等待，fire-and-forget，如打开浏览器）。
+/// POSIX：fork+setpgid+close(0/1/2)+execve，父不 waitpid；Windows：CreateProcessW(DETACHED_PROCESS)。
+pub fn spawnDetached(argv: []const ?[*:0]const u8, inherit_env: bool) CaptureError!void {
+    if (is_windows) {
+        const a = std.heap.page_allocator;
+        const cmdline = buildWindowsCmdline(a, argv) catch return error.SpawnFailed;
+        defer a.free(cmdline);
+        var si = std.mem.zeroes(win.STARTUPINFOW);
+        si.cb = @sizeOf(win.STARTUPINFOW);
+        var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
+        if (win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(0), .{ .detached_process = true }, null, null, &si, &pi) == .FALSE) return error.SpawnFailed;
+        win.CloseHandle(pi.hProcess);
+        win.CloseHandle(pi.hThread);
+        return;
+    }
+    const pid = std.c.fork();
+    if (pid < 0) return error.SpawnFailed;
+    if (pid == 0) {
+        _ = std.c.setpgid(0, 0);
+        _ = std.c.close(0);
+        _ = std.c.close(1);
+        _ = std.c.close(2);
+        const argv0 = argv[0] orelse std.c._exit(127);
+        const envp: [*:null]const ?[*:0]const u8 = if (inherit_env) @ptrCast(std.c.environ) else &.{null};
+        _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), envp);
+        std.c._exit(127);
+    }
+    // 父：fire-and-forget，不 waitpid（对齐原 openBrowser）。
+}
+
 fn labelOf(argv: []const ?[*:0]const u8) []const u8 {
     const a0 = argv[0] orelse return "?";
     const full = std.mem.span(a0);
@@ -536,6 +597,24 @@ test "capture 超时返 error.Timeout（有缓冲输出，验不 double-free）"
     else
         &.{ "/bin/sh", "-c", "echo before; sleep 10", null };
     try std.testing.expectError(error.Timeout, capture(argv, a, .{ .timeout_ms = 400 }));
+}
+
+test "runInherit 返回 exit code" {
+    if (!procSpawnTestsEnabled()) return error.SkipZigTest;
+    const argv: []const ?[*:0]const u8 = if (is_windows)
+        &.{ "cmd.exe", "/c", "exit 7", null }
+    else
+        &.{ "/bin/sh", "-c", "exit 7", null };
+    try std.testing.expectEqual(@as(i32, 7), try runInherit(argv, true));
+}
+
+test "spawnDetached 不阻塞不报错" {
+    if (!procSpawnTestsEnabled()) return error.SkipZigTest;
+    const argv: []const ?[*:0]const u8 = if (is_windows)
+        &.{ "cmd.exe", "/c", "exit 0", null }
+    else
+        &.{ "/bin/sh", "-c", "true", null };
+    try spawnDetached(argv, true);
 }
 
 test "buildWindowsCmdline quoting" {

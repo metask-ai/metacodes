@@ -7,6 +7,8 @@
 
 const std = @import("std");
 const rng = @import("../platform/rng.zig");
+const process = @import("../platform/process.zig");
+const builtin = @import("builtin");
 const fs_util = @import("../util/fs.zig");
 const time = @import("../util/time.zig");
 const types = @import("../types.zig");
@@ -555,16 +557,14 @@ fn openBrowser(allocator: std.mem.Allocator, url: []const u8) !void {
     defer allocator.free(opener_z);
     const url_z = try allocator.dupeZ(u8, url);
     defer allocator.free(url_z);
-    const pid = std.c.fork();
-    if (pid < 0) return error.ForkFailed;
-    if (pid == 0) {
-        _ = std.c.setpgid(0, 0);
-        _ = std.c.close(0);
-        _ = std.c.close(1);
-        _ = std.c.close(2);
-        const argv = [_:null]?[*:0]const u8{ env_z.ptr, opener_z.ptr, url_z.ptr };
-        _ = std.c.execve(env_z.ptr, @ptrCast(&argv), @ptrCast(std.c.environ));
-        std.c._exit(127);
+    // detached fire-and-forget（关 stdio、不 wait），走可移植 platform/process。
+    // POSIX：/usr/bin/env <opener> <url>；Windows：cmd /c start "" <url>（ShellExecute 语义）。
+    if (builtin.os.tag == .windows) {
+        var argv = [_]?[*:0]const u8{ "cmd.exe", "/c", "start", "", url_z.ptr, null };
+        process.spawnDetached(&argv, true) catch return error.ForkFailed;
+    } else {
+        var argv = [_]?[*:0]const u8{ env_z.ptr, opener_z.ptr, url_z.ptr, null };
+        process.spawnDetached(&argv, true) catch return error.ForkFailed;
     }
 }
 
