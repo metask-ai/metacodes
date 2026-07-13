@@ -139,7 +139,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer allocator.free(cmd_z);
     const argv0: [*:0]const u8 = "/bin/sh";
     var argv: [4]?[*:0]const u8 = .{ argv0, "-c", cmd_z.ptr, null };
-    const out = try common.spawnCaptureWithStderrTimed(argv[0..argv.len], allocator, ctx.abort, timeout_ms, ctx.spawn_tick_fn);
+    const out = try common.spawnCaptureWithStderrTimed(argv[0..argv.len], allocator, ctx.abort, timeout_ms, ctx.spawn_tick_fn, common.MAX_SPAWN_CAPTURE_BYTES);
     defer allocator.free(out.stdout);
     defer allocator.free(out.stderr);
 
@@ -206,9 +206,9 @@ fn runAutoBackgroundable(
 }
 
 fn readJobAsSync(allocator: std.mem.Allocator, j: *const @import("../core/job_registry.zig").JobEntry) ![]u8 {
-    const out_bytes = readWholeFile(j.stdout_path, allocator) catch try allocator.dupe(u8, "");
+    const out_bytes = readWholeFile(j.stdout_path, allocator, common.MAX_SPAWN_CAPTURE_BYTES) catch try allocator.dupe(u8, "");
     defer allocator.free(out_bytes);
-    const err_bytes = readWholeFile(j.stderr_path, allocator) catch try allocator.dupe(u8, "");
+    const err_bytes = readWholeFile(j.stderr_path, allocator, common.MAX_SPAWN_CAPTURE_BYTES) catch try allocator.dupe(u8, "");
     defer allocator.free(err_bytes);
 
     const out_trunc = try truncateHead(allocator, out_bytes);
@@ -227,9 +227,9 @@ fn readJobAsSync(allocator: std.mem.Allocator, j: *const @import("../core/job_re
 }
 
 fn formatAutoBackgrounded(allocator: std.mem.Allocator, j: *const @import("../core/job_registry.zig").JobEntry) ![]u8 {
-    const out_bytes = readWholeFile(j.stdout_path, allocator) catch try allocator.dupe(u8, "");
+    const out_bytes = readWholeFile(j.stdout_path, allocator, common.MAX_SPAWN_CAPTURE_BYTES) catch try allocator.dupe(u8, "");
     defer allocator.free(out_bytes);
-    const err_bytes = readWholeFile(j.stderr_path, allocator) catch try allocator.dupe(u8, "");
+    const err_bytes = readWholeFile(j.stderr_path, allocator, common.MAX_SPAWN_CAPTURE_BYTES) catch try allocator.dupe(u8, "");
     defer allocator.free(err_bytes);
 
     const out_trunc = try truncateHead(allocator, out_bytes);
@@ -249,7 +249,9 @@ fn formatAutoBackgrounded(allocator: std.mem.Allocator, j: *const @import("../co
     return try aw.toOwnedSlice();
 }
 
-fn readWholeFile(path: []const u8, allocator: std.mem.Allocator) ![]u8 {
+/// 读文件到内存,**上限 max_bytes**(轴A OOM 防线):job 输出文件可能很大(命令疯产 GB 落盘),
+/// 但同步返回只需前 MAX_OUTPUT_BYTES(30KB)展示 → 读够 cap 就停,防整读 OOM。max_bytes=0 不限。
+fn readWholeFile(path: []const u8, allocator: std.mem.Allocator, max_bytes: usize) ![]u8 {
     var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
     if (path.len >= pbuf.len) return error.PathTooLong;
     @memcpy(pbuf[0..path.len], path);
@@ -265,6 +267,7 @@ fn readWholeFile(path: []const u8, allocator: std.mem.Allocator) ![]u8 {
         const n = std.c.read(fd, &buf, buf.len);
         if (n <= 0) break;
         try out.appendSlice(allocator, buf[0..@intCast(n)]);
+        if (max_bytes > 0 and out.items.len >= max_bytes) break; // 轴A:读够上限止血
     }
     return try out.toOwnedSlice(allocator);
 }

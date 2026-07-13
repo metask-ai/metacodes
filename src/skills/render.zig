@@ -447,7 +447,8 @@ fn runInjection(allocator: std.mem.Allocator, cmd: []const u8, opts: RenderOptio
     var argv: [4]?[*:0]const u8 = .{ sh_z, flag_z, cmd_z.ptr, null };
 
     log.debug("skill.inject", "running: {s}", .{cmd});
-    const result = common.spawnCaptureStdoutAbortableTimed(argv[0..], allocator, opts.abort, opts.inject_timeout_ms) catch |err| {
+    // 轴A:skill 注入命令输出封顶 16MB(skill 半可信,一句 `cat hugefile` 就是 OOM 类;Linus P0 遗漏补)。
+    const result = common.spawnCaptureStdoutCapped(argv[0..], allocator, opts.abort, opts.inject_timeout_ms, common.MAX_SPAWN_CAPTURE_BYTES) catch |err| {
         log.warn("skill.inject", "failed: {s}: {s}", .{ cmd, @errorName(err) });
         return try std.fmt.allocPrint(allocator, "[shell command failed: {s}]", .{@errorName(err)});
     };

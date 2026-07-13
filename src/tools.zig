@@ -292,7 +292,7 @@ pub const registry: []const ToolEntry = &.{
         .description = "Fetch a URL and return its text content (HTML stripped). Use for reading web pages, API docs, articles.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "url", .type = "string", .description = "The URL to fetch content from" },
-            .{ .name = "prompt", .type = "string", .description = "Optional prompt to run against the fetched content" },
+            .{ .name = "prompt", .type = "string", .description = "Optional note about what you're looking for (currently NOT applied server-side — the full page text is returned for you to analyze directly)." },
         }, .required = &.{"url"} },
         .execute = web_fetch_tool.execute,
     },

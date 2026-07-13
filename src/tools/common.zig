@@ -76,6 +76,8 @@ pub fn extractJsonArg(data: []const u8, field: []const u8) ?[]const u8 {
 ///
 /// 读到 EOF（read 返回 0）为止。单次 read 错误返回 `error.ReadError`。
 /// 调用方负责 `allocator.free(result)`。
+/// **注意(轴A)**:本函数**无界**——整读进内存。新代码若读的是用户可控大小的文件,用
+/// `readAllFromFdCapped` 而非本函数,否则巨型文件 OOM。仅在文件大小已被上游守卫/已知有界时用本函数。
 pub fn readAllFromFd(fd: std.posix.fd_t, allocator: std.mem.Allocator) ![]u8 {
     var buf: [65536]u8 = undefined;
     var result = std.ArrayList(u8).empty;
@@ -85,6 +87,26 @@ pub fn readAllFromFd(fd: std.posix.fd_t, allocator: std.mem.Allocator) ![]u8 {
         const n = std.posix.read(fd, &buf) catch return error.ReadError;
         if (n == 0) break;
         try result.appendSlice(allocator, buf[0..@as(usize, @intCast(n))]);
+    }
+
+    return try result.toOwnedSlice(allocator);
+}
+
+/// **轴A 单一入口:有界整读文件**。累积超 max_bytes → 释放已读 + 返回 `error.FileTooLarge`(内存
+/// 上限 = max_bytes + 一个 chunk)。所有"读用户可控大小文件"的工具应走此函数,而非无界 readAllFromFd
+/// ——建立文件读的统一摄取预算(消除 Write/NotebookEdit 等各自裸读绕过守卫的假象)。max_bytes=0 = 不限。
+pub fn readAllFromFdCapped(fd: std.posix.fd_t, allocator: std.mem.Allocator, max_bytes: usize) ![]u8 {
+    var buf: [65536]u8 = undefined;
+    var result = std.ArrayList(u8).empty;
+    errdefer result.deinit(allocator);
+
+    while (true) {
+        const n = std.posix.read(fd, &buf) catch return error.ReadError;
+        if (n == 0) break;
+        try result.appendSlice(allocator, buf[0..@as(usize, @intCast(n))]);
+        if (max_bytes > 0 and result.items.len > max_bytes) {
+            return error.FileTooLarge; // errdefer 释放 result(勿再显式 deinit → 双 free)
+        }
     }
 
     return try result.toOwnedSlice(allocator);
@@ -251,6 +273,11 @@ pub const SpawnOut = struct {
 /// 区别只在于多了一条 stderr pipe。给 Bash tool 使用，让模型能看到错误信息。
 ///
 /// timeout_ms == 0 无超时；>0 时超时返 error.Timeout（已发 kill）。abort 触发返 error.Aborted。
+/// 子进程输出捕获的字节上限(轴A OOM 防线):stdout+stderr 合计达此值 → killpg 止血,返回已读部分。
+/// 16MB 远超任何合法命令/网页展示需求(Bash 展示只 30KB、WebFetch 8KB),只堵"疯产命令/巨型下载
+/// 在超时窗口内产 GB → OOM"。8 并发 job × 16MB = 128MB 上界,可控。0 = 不限(危险,勿用)。
+pub const MAX_SPAWN_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
+
 pub fn spawnCaptureWithStderrTimed(
     argv: []const ?[*:0]const u8,
     allocator: std.mem.Allocator,
@@ -259,6 +286,8 @@ pub fn spawnCaptureWithStderrTimed(
     /// 子进程"仍在运行"心跳(每 2s),per-session 经 ToolContext.spawn_tick_fn 传入。
     /// null = 不显示心跳。替代旧进程全局 g_progress_cb(多 Session 串台)。
     tick_fn: ?*const fn (elapsed_ms: u64, argv0: []const u8) void,
+    /// 捕获字节上限(stdout+stderr 合计);达此值 killpg + 返回已读部分。0 = 不限。
+    max_bytes: usize,
 ) !SpawnOut {
     logSpawnArgv(argv, timeout_ms);
     const t_start = nowMs();
@@ -312,7 +341,7 @@ pub fn spawnCaptureWithStderrTimed(
         const slash = std.mem.lastIndexOfScalar(u8, full, '/');
         break :blk if (slash) |i| full[i + 1 ..] else full;
     };
-    const result = readTwoFdsAbortableTimed(out_pipe[0], err_pipe[0], allocator, pid, abort, timeout_ms, tick_fn, cmd_label);
+    const result = readTwoFdsAbortableTimed(out_pipe[0], err_pipe[0], allocator, pid, abort, timeout_ms, tick_fn, cmd_label, max_bytes);
     _ = std.c.close(out_pipe[0]);
     _ = std.c.close(err_pipe[0]);
 
@@ -342,6 +371,7 @@ fn readTwoFdsAbortableTimed(
     timeout_ms: u64,
     tick_fn: ?*const fn (elapsed_ms: u64, argv0: []const u8) void,
     cmd_label: []const u8,
+    max_bytes: usize,
 ) !TwoBufs {
     var buf: [4096]u8 = undefined;
     var out_list = std.ArrayList(u8).empty;
@@ -398,6 +428,13 @@ fn readTwoFdsAbortableTimed(
             } else if ((pfds[1].revents & (std.c.POLL.HUP | std.c.POLL.ERR)) != 0) {
                 err_done = true;
             }
+        }
+        // 摄取上限(轴A OOM 防线):stdout+stderr 合计达 max_bytes → killpg 止血 + 结束读循环,返回
+        // 已读部分。堵"疯产命令(`find /`/`yes`)/巨型 URL 在超时窗口内产 GB → 整读进内存 OOM"。
+        if (max_bytes > 0 and out_list.items.len + err_list.items.len >= max_bytes) {
+            killGroup(pgid);
+            log.warn("spawn", "capture hit {d}B cap → killed pgid={d}, returning partial output", .{ max_bytes, pgid });
+            break;
         }
     }
 
@@ -602,4 +639,57 @@ test "spawnCaptureStdoutCapped 截断无限输出且不挂死" {
     // 读到了内容,且被 cap 截断在合理范围(cap + 一次 read buffer 4KB 余量内)
     try std.testing.expect(out.len >= 8 * 1024);
     try std.testing.expect(out.len < 8 * 1024 + 8 * 1024);
+}
+
+test "readAllFromFdCapped:超 cap 返 FileTooLarge、cap 内正常读(轴A 统一入口)" {
+    const a = std.testing.allocator;
+    const path = "/tmp/cc-readcapped-test.txt";
+    const fd_w = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    try std.testing.expect(fd_w >= 0);
+    var payload: [10000]u8 = undefined;
+    @memset(&payload, 'z');
+    _ = std.c.write(fd_w, &payload, payload.len); // 10KB
+    _ = std.c.close(fd_w);
+    defer _ = std.c.unlink(path);
+
+    // cap=5KB < 10KB → FileTooLarge。
+    {
+        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch unreachable;
+        defer _ = std.c.close(fd);
+        try std.testing.expectError(error.FileTooLarge, readAllFromFdCapped(fd, a, 5 * 1024));
+    }
+    // cap=1MB > 10KB → 正常读全。
+    {
+        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch unreachable;
+        defer _ = std.c.close(fd);
+        const r = try readAllFromFdCapped(fd, a, 1024 * 1024);
+        defer a.free(r);
+        try std.testing.expectEqual(@as(usize, 10000), r.len);
+    }
+    // cap=0 → 不限,读全。
+    {
+        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch unreachable;
+        defer _ = std.c.close(fd);
+        const r = try readAllFromFdCapped(fd, a, 0);
+        defer a.free(r);
+        try std.testing.expectEqual(@as(usize, 10000), r.len);
+    }
+}
+
+test "spawnCaptureWithStderrTimed:max_bytes 封顶无限输出 killpg 止血不挂死(P0 轴A)" {
+    const a = std.testing.allocator;
+    const t0 = nowMs();
+    // `yes` 无限打印 stdout;无 cap 会挂到 timeout;cap=32KB → 读够即 killpg,快速返回 ≤ 略多于 32KB。
+    var argv = [_]?[*:0]const u8{ "/usr/bin/yes", "abcdefgh", null };
+    const out = spawnCaptureWithStderrTimed(argv[0..argv.len], a, null, 8000, null, 32 * 1024) catch |e| {
+        if (e == error.SpawnError) return; // 环境无 yes → 跳过
+        return e;
+    };
+    defer a.free(out.stdout);
+    defer a.free(out.stderr);
+    const dt = nowMs() - t0;
+    // 封顶:stdout 读到 ~32KB 就止血(cap + 4KB read buffer 余量),不是无限;killGroup 含 2s sleep。
+    try std.testing.expect(out.stdout.len >= 32 * 1024);
+    try std.testing.expect(out.stdout.len < 32 * 1024 + 8 * 1024);
+    try std.testing.expect(dt < 5000); // 远快于 8000ms timeout → 证明是 cap 而非超时才停
 }

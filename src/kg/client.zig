@@ -1623,7 +1623,7 @@ pub const KgClient = struct {
             };
         }
         try argv.append(self.allocator, null);
-        return common.spawnCaptureWithStderrTimed(argv.items, self.allocator, self.abort, SPAWN_TIMEOUT_MS, null);
+        return common.spawnCaptureWithStderrTimed(argv.items, self.allocator, self.abort, SPAWN_TIMEOUT_MS, null, common.MAX_SPAWN_CAPTURE_BYTES);
     }
 
     /// ready 检查 + 瞬时重试 + 错误分类。exit!=0 时按 stderr 分类:

@@ -224,18 +224,15 @@ fn serializeNotebook(allocator: std.mem.Allocator, root: std.json.Value) ![]u8 {
     return try aw.toOwnedSlice();
 }
 
+/// notebook 整读上限(轴A):notebook 必须整读进内存解析 JSON(std.json 再翻倍),巨型必 OOM →
+/// 超此值拒绝(readAllFromFdCapped 返 error.FileTooLarge)。50MB 对任何真实 notebook 都绰绰,只堵病态巨型。
+const MAX_NOTEBOOK_SIZE: usize = 50 * 1024 * 1024;
+
+/// 走轴A统一入口 readAllFromFdCapped(消除各工具本地裸读绕过守卫)。
 fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
     defer _ = std.c.close(fd);
-    var buf: [65536]u8 = undefined;
-    var result = std.ArrayList(u8).empty;
-    errdefer result.deinit(allocator);
-    while (true) {
-        const n = std.posix.read(fd, &buf) catch return error.ReadError;
-        if (n == 0) break;
-        try result.appendSlice(allocator, buf[0..@as(usize, @intCast(n))]);
-    }
-    return try result.toOwnedSlice(allocator);
+    return try @import("common.zig").readAllFromFdCapped(fd, allocator, MAX_NOTEBOOK_SIZE);
 }
 
 fn writeFile(path: []const u8, content: []const u8) !void {

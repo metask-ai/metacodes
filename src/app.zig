@@ -427,6 +427,10 @@ pub const App = struct {
             break :blk null;
         };
 
+        // P0.5:启动时清理 tool-results 落盘缓存(TTL 7 天 + 500MB LRU,节流 6h)。best-effort:
+        // 补"落盘缓存只增不删 → 磁盘无界"的洞。失败静默,绝不阻断启动。
+        @import("tools/tool_result_storage.zig").cleanupCache(allocator, app.homeDir());
+
         return app;
     }
 

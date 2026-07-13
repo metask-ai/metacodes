@@ -17,6 +17,17 @@ pub const MAX_FILE_BYTES: usize = 256 * 1024;
 /// 单行字节上限:超长行(如压缩成一行的 minified 文件)截断到此 + 标记,防"1 行几 MB"撑爆。
 pub const MAX_LINE_BYTES: usize = 2000;
 
+/// 流式区间读门槛(对齐 cc readFileInRange FAST_PATH_MAX_SIZE=10MB):< 此值整读+内存切片(快);
+/// ≥ 此值走流式 chunk 读——只累积区间内的行,区间外计数丢弃,**O(区间) 内存**,防巨型文件整读 OOM。
+/// 只有显式 offset/limit 能到这(默认无参路径已被 MAX_FILE_BYTES=256KB 守卫拦)。
+pub const STREAM_PATH_MIN_SIZE: u64 = 10 * 1024 * 1024;
+
+/// 单次 Read 返回内容的字节上限(≈ cc 25K-token 后置封顶的字节代理:~4 字节/token × 25K ≈ 100KB)。
+/// **为什么不是 256KB**:Read 豁免 50K 落盘兜底,返回内容直接进上下文;256KB≈64K token 对小窗口
+/// 模型(glm-5.2 262K)一次吃 ~24% 窗口。100KB≈25K token 对齐 cc,占 glm ~10%,对主流窗口都安全。
+/// 超出:截到最后完整行 + 带**精确续读行号**的提示(模型 Read(offset=续读行) 分页取剩余=三件套第③件)。
+pub const MAX_READ_OUTPUT_BYTES: usize = 100 * 1024;
+
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
     // 兼容：优先 file_path（TS 原版），回退 path（历史）
@@ -56,7 +67,14 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         DEFAULT_LIMIT_LINES;
     if (offset_1based == 0) return error.InvalidOffset;
 
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
+    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch {
+        // 缓存失效优雅提示:tool-results 落盘缓存被 TTL/LRU 清理后,transcript 里的旧 path → 打不开。
+        // 返回可操作提示(而非裸 FileNotFound),消除"文件被清了 vs 路径错了"的神秘失败。
+        if (std.mem.indexOf(u8, path, "/.metacodes/tool-results/") != null) {
+            return try allocator.dupe(u8, "{\"error\":\"This cached tool-result file no longer exists (expired by cache TTL or evicted by size limit). Re-run the original tool to regenerate its output.\"}");
+        }
+        return error.FileNotFound;
+    };
     defer _ = std.c.close(fd);
 
     // 在读之前 fstat 一次拿 mtime/size，供 ReadState 记录用（must-read-first/staleness 校验）
@@ -79,6 +97,15 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         }
     }
 
+    // 大文件(≥10MB)走流式区间读(O(区间) 内存,对齐 cc readFileInRange 流式路径)。只有显式
+    // offset/limit 能到这——默认无参路径已被 256KB 守卫拦。
+    if (st) |s| {
+        if (s.size >= STREAM_PATH_MIN_SIZE) {
+            return try readRangeStreaming(allocator, ctx, path, fd, s, offset_1based, limit);
+        }
+    }
+
+    // fast path(< 10MB):整读 + 内存切片(快)。
     const full = try common.readAllFromFd(fd, allocator);
     defer allocator.free(full);
 
@@ -110,7 +137,20 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (st) |s| rs.recordHashed(path, s.mtime_ns, s.size, std.hash.Wyhash.hash(0, full)) catch {};
     }
 
-    const rendered = try renderWithLineNumbers(full[line_start..end], offset_1based, allocator);
+    // 输出封顶(对齐 cc maxBytes):区间内容超 MAX_READ_OUTPUT_BYTES → 截到最后完整行 + 提示。
+    // 覆盖显式 limit=huge 在 <10MB 文件上绕过守卫返回过多的情形。
+    const capd = capToLastLine(full[line_start..end], MAX_READ_OUTPUT_BYTES);
+    var rendered = try renderWithLineNumbers(capd.slice, offset_1based, allocator);
+    if (capd.truncated) {
+        // 有完整行 → 给精确续读行号(offset 分页);无完整行(单行超 cap)→ 长行提示(offset 会死循环)。
+        const lines_shown = countLines(capd.slice);
+        const noted = if (lines_shown > 0)
+            try appendTruncNote(allocator, rendered, offset_1based + lines_shown)
+        else
+            try appendLongLineNote(allocator, rendered);
+        allocator.free(rendered);
+        rendered = noted;
+    }
 
     // 弱提示(搭车):整读(无 offset/limit)一个**有 LSP server 的**大源码文件时,在结果末尾追加
     // system-reminder,引导"定位定义可用 CodeMap/FindSymbol 更快"。频控:同一文件本 session 只提
@@ -127,6 +167,97 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
                 "{s}\n\n<system-reminder>This is a {d}-line source file. If you only need to find where something is defined, CodeMap (a structural outline) or FindSymbol (jump to a named definition) would be faster and cheaper than reading the whole file.</system-reminder>",
                 .{ rendered, total_lines });
         }
+    }
+    return rendered;
+}
+
+const CapResult = struct { slice: []const u8, truncated: bool };
+/// 截到 ≤max 内最后一个完整行(保留末尾 '\n');无换行则硬截到 max。
+fn capToLastLine(content: []const u8, max: usize) CapResult {
+    if (content.len <= max) return .{ .slice = content, .truncated = false };
+    const nl = std.mem.lastIndexOfScalar(u8, content[0..max], '\n');
+    const cut = if (nl) |i| i + 1 else max;
+    return .{ .slice = content[0..cut], .truncated = true };
+}
+
+/// 截断提示带**精确续读行号**(三件套第③件:分页导引)。resume_line = 已展示的最后一行的下一行,
+/// 模型 `Read(offset=resume_line)` 即从截断处无缝续读。比"narrow the range"猜测式提示精确得多。
+fn appendTruncNote(allocator: std.mem.Allocator, rendered: []const u8, resume_line: usize) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}\n… [output truncated at {d} bytes to protect the context window. To continue, Read this file again with offset={d} (and an optional limit). Or use Grep to jump to specific content.]",
+        .{ rendered, MAX_READ_OUTPUT_BYTES, resume_line },
+    );
+}
+
+/// 数一段内容里的行数(\n 数),用于算续读行号。
+fn countLines(s: []const u8) usize {
+    return std.mem.count(u8, s, "\n");
+}
+
+/// 单行超 cap(无完整行边界)的截断提示:**不给 offset**(续读行号不前进 → 模型死循环)。改引导 Grep。
+fn appendLongLineNote(allocator: std.mem.Allocator, rendered: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}\n… [output truncated: this content is a single line longer than {d} bytes (each line is also per-line-truncated). offset paging can't advance within one line — use Grep to find specific content.]",
+        .{ rendered, MAX_READ_OUTPUT_BYTES },
+    );
+}
+
+/// 大文件(≥10MB)流式区间读:chunk 读,只累积 [offset, offset+limit) 行,区间外计数丢弃(**O(区间)
+/// 内存**,不整读)。输出封顶 MAX_READ_OUTPUT_BYTES。ReadState content_hash=0(未读全文件 → mtime
+/// staleness 兜底,保守)。对齐 cc readFileInRange 的 createReadStream 流式路径。
+fn readRangeStreaming(
+    allocator: std.mem.Allocator,
+    ctx: *const ToolContext,
+    path: []const u8,
+    fd: std.posix.fd_t,
+    st: read_state.StatInfo,
+    offset_1based: usize,
+    limit: usize,
+) ![]u8 {
+    var chunk: [65536]u8 = undefined;
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+    var line_no: usize = 1;
+    const end_line = offset_1based +| limit; // saturating:limit 巨大不溢出
+    var capped = false;
+    stream: while (true) {
+        const n = std.posix.read(fd, &chunk) catch return error.ReadError;
+        if (n == 0) break;
+        for (chunk[0..@intCast(n)]) |b| {
+            if (line_no >= offset_1based and line_no < end_line) {
+                if (out.items.len < MAX_READ_OUTPUT_BYTES) {
+                    try out.append(allocator, b);
+                } else {
+                    capped = true;
+                }
+            }
+            if (b == '\n') {
+                line_no += 1;
+                if (line_no >= end_line) break :stream;
+            }
+        }
+        if (capped) break;
+    }
+    // offset 超文件行数 → 空(与 fast path 一致)。
+    if (out.items.len == 0) return try allocator.dupe(u8, "");
+    // 字节封顶可能停在半行——对齐 fast path 的 capToLastLine:有完整行则裁回最后一个 '\n'(半行不
+    // 伪装成完整行、续读行号精确);无 '\n'(单行超 cap)保留,交 renderWithLineNumbers 的 MAX_LINE_BYTES。
+    if (capped) {
+        if (std.mem.lastIndexOfScalar(u8, out.items, '\n')) |nl| out.items.len = nl + 1;
+    }
+    // 流式未读全文件 → content_hash=0(保守:mtime 变即 stale,强制重读)。
+    if (ctx.read_state) |rs| rs.recordHashed(path, st.mtime_ns, st.size, 0) catch {};
+    var rendered = try renderWithLineNumbers(out.items, offset_1based, allocator);
+    if (capped) {
+        const lines_shown = countLines(out.items);
+        const noted = if (lines_shown > 0)
+            try appendTruncNote(allocator, rendered, offset_1based + lines_shown)
+        else
+            try appendLongLineNote(allocator, rendered);
+        allocator.free(rendered);
+        rendered = noted;
     }
     return rendered;
 }
@@ -453,6 +584,154 @@ test "ReadTool 超长单行被截断 + 标记" {
         if (c == 'x') xcount += 1;
     }
     try std.testing.expect(xcount <= MAX_LINE_BYTES);
+}
+
+test "Read 缓存失效提示:tool-results 下不存在的 path → 可操作提示,非裸 FileNotFound" {
+    const ctx = testCtx();
+    // tool-results 缓存被 TTL/LRU 清理后的旧 path → 提示重跑原工具(非神秘 FileNotFound)。
+    const r = try execute(&ctx, "{\"file_path\":\"/tmp/nope-xyz/.metacodes/tool-results/deadbeef.txt\"}");
+    defer std.testing.allocator.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "no longer exists") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "Re-run") != null);
+    // 普通不存在路径(不在 tool-results 下)仍是 FileNotFound。
+    try std.testing.expectError(error.FileNotFound, execute(&ctx, "{\"file_path\":\"/tmp/nope-xyz/regular-missing.txt\"}"));
+}
+
+test "Read 输出封顶:显式 limit=huge 在 <10MB 文件上超 256KB → 截到最后完整行 + 提示" {
+    const a = std.testing.allocator;
+    const ctx = testCtx();
+    const path = "/tmp/cc-zig-read-outcap.txt";
+    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    try std.testing.expect(fd >= 0);
+    // 写 ~320KB(8000 行 × 40 字节,编号可区分),<10MB 走 fast path。显式 limit 绕过 256KB 整读守卫。
+    // 每行 = "L" + 6 位编号 + 32 个 '.' + '\n' = 40 字节。
+    var lbuf: [40]u8 = undefined;
+    var i: usize = 0;
+    while (i < 8000) : (i += 1) {
+        _ = std.fmt.bufPrint(&lbuf, "L{d:0>6}", .{i}) catch unreachable; // "L000000"
+        @memset(lbuf[7..39], '.');
+        lbuf[39] = '\n';
+        _ = std.c.write(fd, &lbuf, 40);
+    }
+    _ = std.c.close(fd);
+    defer _ = std.c.unlink(path);
+
+    const r = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-read-outcap.txt\",\"limit\":999999}");
+    defer a.free(r);
+    // 封顶:输出被截 + 精确续读提示。100KB/40 ≈ 2560 行 → 早行在、晚行被截掉。
+    try std.testing.expect(std.mem.indexOf(u8, r, "output truncated") != null);
+    // 精确续读行号:100KB/40字节=2560 行整除 → 展示 1..2560 → 续读 offset=2561(pin 死数值防 render 改动漂移)。
+    try std.testing.expect(std.mem.indexOf(u8, r, "offset=2561") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "L000100") != null); // 早行在
+    try std.testing.expect(std.mem.indexOf(u8, r, "L003000") == null); // 晚行被截(第 3000 行 > 2560)
+}
+
+test "Read 输出封顶:单行 >100KB → 长行提示不给 offset(防死循环)" {
+    const a = std.testing.allocator;
+    const ctx = testCtx();
+    const path = "/tmp/cc-zig-read-longline-cap.txt";
+    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    try std.testing.expect(fd >= 0);
+    // 一整行 150KB(无 '\n',>MAX_READ_OUTPUT_BYTES=100KB),<256KB 不触发大文件守卫。
+    var payload: [150 * 1024]u8 = undefined;
+    @memset(&payload, 'q');
+    _ = std.c.write(fd, &payload, payload.len);
+    _ = std.c.close(fd);
+    defer _ = std.c.unlink(path);
+
+    const r = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-read-longline-cap.txt\"}");
+    defer a.free(r);
+    // capToLastLine 无 '\n' → countLines=0 → 走长行提示:引导 Grep,**绝不**给 offset(否则模型死循环)。
+    try std.testing.expect(std.mem.indexOf(u8, r, "single line longer") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "offset=") == null); // 无 offset 续读指引
+}
+
+test "Read 流式:≥10MB 文件读中间区间不 OOM,返回正确的中间行" {
+    const a = std.testing.allocator;
+    const ctx = testCtx();
+    const path = "/tmp/cc-zig-read-stream.txt";
+    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    try std.testing.expect(fd >= 0);
+    // 写 ~11MB(>10MB 触发流式路径):每行 "L<编号>\n"。用 1000 行/块的缓冲减少 syscall。
+    var buf: [64 * 1024]u8 = undefined;
+    var n_lines: usize = 0;
+    while (n_lines < 400_000) { // 400k 行 × ~28 字节 ≈ 11MB
+        var w: usize = 0;
+        while (w < buf.len - 32 and n_lines < 400_000) {
+            const s = std.fmt.bufPrint(buf[w..], "L{d}\n", .{n_lines}) catch break;
+            w += s.len;
+            n_lines += 1;
+        }
+        _ = std.c.write(fd, &buf, w);
+    }
+    _ = std.c.close(fd);
+    defer _ = std.c.unlink(path);
+
+    // 读中间:offset=200000, limit=3 → 应返回 L199999/L200000/L200001(1-based offset=200000 = 第 200000 行)。
+    const r = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-read-stream.txt\",\"offset\":200000,\"limit\":3}");
+    defer a.free(r);
+    // 第 200000 行内容是 "L199999"(0-based 编号,1-based 行号差 1)。
+    try std.testing.expect(std.mem.indexOf(u8, r, "L199999") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "L200001") != null);
+    // 不应含开头/结尾行(证明只读了中间区间,没整读)。
+    try std.testing.expect(std.mem.indexOf(u8, r, "L0\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "L399999") == null);
+}
+
+test "Read 流式:≥10MB 大范围触发 100KB 封顶 → 裁到完整行 + 精确续读 offset" {
+    const a = std.testing.allocator;
+    const ctx = testCtx();
+    const path = "/tmp/cc-zig-read-stream-cap.txt";
+    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    try std.testing.expect(fd >= 0);
+    // ~11MB(>10MB 流式);读大范围 → 累积到 100KB 封顶。行 "R<6位>....\n" = 40 字节。
+    var buf: [64 * 1024]u8 = undefined;
+    var n: usize = 0;
+    while (n < 300_000) {
+        var w: usize = 0;
+        while (w + 40 <= buf.len and n < 300_000) {
+            var lb: [40]u8 = undefined;
+            _ = std.fmt.bufPrint(&lb, "R{d:0>6}", .{n}) catch unreachable;
+            @memset(lb[7..39], '.');
+            lb[39] = '\n';
+            @memcpy(buf[w .. w + 40], &lb);
+            w += 40;
+            n += 1;
+        }
+        _ = std.c.write(fd, &buf, w);
+    }
+    _ = std.c.close(fd);
+    defer _ = std.c.unlink(path);
+
+    // offset=1 大 limit → 流式从头累积到 100KB(2560 行)封顶。
+    const r = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-read-stream-cap.txt\",\"offset\":1,\"limit\":9999999}");
+    defer a.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "output truncated") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "offset=2561") != null); // 裁到完整行 → 续读精确
+    try std.testing.expect(std.mem.indexOf(u8, r, "R000010") != null); // 早行在
+    try std.testing.expect(std.mem.indexOf(u8, r, "R003000") == null); // 封顶后不在
+    // 裁到完整行 → 末尾不是半行(不含伪装成完整行的半行)。
+    try std.testing.expect(std.mem.indexOf(u8, r, "line truncated") == null);
+}
+
+test "Read 流式:offset 超文件行数 → 空" {
+    const a = std.testing.allocator;
+    const ctx = testCtx();
+    const path = "/tmp/cc-zig-read-stream-eof.txt";
+    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    try std.testing.expect(fd >= 0);
+    // ~11MB 文件,offset 远超行数。
+    var buf: [64 * 1024]u8 = undefined;
+    @memset(&buf, 'a');
+    buf[buf.len - 1] = '\n';
+    var w: usize = 0;
+    while (w < 176) : (w += 1) _ = std.c.write(fd, &buf, buf.len); // ~11MB,~176 行(每行 64KB)
+    _ = std.c.close(fd);
+    defer _ = std.c.unlink(path);
+
+    const r = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-read-stream-eof.txt\",\"offset\":9999999,\"limit\":5}");
+    defer a.free(r);
+    try std.testing.expectEqualStrings("", r);
 }
 
 test "Read 弱提示:--lsp 开 + >150行有 server 语言 → CodeMap reminder;小文件/非源码/无 --lsp 不追加" {

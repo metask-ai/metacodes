@@ -80,11 +80,15 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     return try renderResult(ctx, allocator, path, old_content orelse "", content);
 }
 
-/// 读已存在文件全文（不存在返 error）。供 Write 计算 diff。
+/// 旧文件读的 size 守卫(轴A):旧内容仅供 diff 展示,巨型文件的 diff 无意义且整读 OOM →
+/// 超此值 readAllFromFdCapped 返 error → caller catch null → 无 diff,Write 仍正常写。10MB 对齐 Read 快路径门槛。
+const MAX_WRITE_OLD_SIZE: usize = 10 * 1024 * 1024;
+
+/// 读已存在文件全文（不存在/过大返 error）。供 Write 计算 diff。走轴A统一入口 readAllFromFdCapped。
 fn readExisting(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
     defer _ = std.c.close(fd);
-    return try common.readAllFromFd(fd, allocator);
+    return try common.readAllFromFdCapped(fd, allocator, MAX_WRITE_OLD_SIZE);
 }
 
 /// 渲染 Write 成功结果：success + path + structuredPatch + gitDiff (+ lspDiagnostics)。

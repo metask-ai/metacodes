@@ -15,6 +15,10 @@
 const std = @import("std");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
+/// 单行(一条 JSON-RPC 响应/resource)字节上限(轴A OOM 防线)。MCP resource 可合法较大(文件内容),
+/// 64MB 对真实响应绰绰;超此值必是无 `\n` 的病态/恶意巨型行 → 断帧报错 error.McpLineTooLarge。
+const MAX_MCP_LINE_BYTES: usize = 64 * 1024 * 1024;
+
 pub const StdioTransport = struct {
     pid: std.c.pid_t,
     stdin_fd: std.c.fd_t,
@@ -126,6 +130,9 @@ pub const StdioTransport = struct {
                 return tail;
             }
             try self.read_buf.appendSlice(self.allocator, chunk[0..@as(usize, @intCast(n))]);
+            // 轴A OOM 防线:单行(一条响应/resource)无换行时 read_buf 会无界增长。超上限断帧报错,
+            // 而非把 GB 级单行 JSON 全堆进内存(恶意/超大 MCP resource)。
+            if (self.read_buf.items.len - self.read_buf_pos > MAX_MCP_LINE_BYTES) return error.McpLineTooLarge;
         }
     }
 

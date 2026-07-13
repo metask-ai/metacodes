@@ -3,20 +3,20 @@
 //! 实现策略：
 //! - 用系统 curl（已有 vendor/curl 或 /usr/bin/curl）抓 HTML
 //! - 简单 HTML-to-text：strip <script>/<style>/标签 + HTML entity decode
-//! - 截断到 8000 字符（超长内容让模型让下一次 fetch 带 offset 参数，但一期不支持）
+//! - **返回全文**（受 16MB 捕获守卫上界）。**不再自截 8KB**——由 tool_exec 的通用 maybePersist
+//!   (50KB 落盘)统一处理三件套:小页 inline 全文、大页缓存到 tool-results 返回 preview+path,
+//!   模型用 Read(path,offset) 分页取剩余。WebFetch 遂从"特殊的 guard-and-drop"回归"普通工具走通用防线"。
 //!
 //! 不做：
 //! - JS 渲染页面（需要无头浏览器）
 //! - Markdown 格式保留（只做粗粒度文本提取）
 //! - 预批准域名（P2）
 //!
-//! 返回 JSON: {"url":"...","bytes":N,"content":"..."}
+//! 返回 JSON: {"url":"...","bytes":N,"content":"<全文>"}(大页由 tool_exec 落盘换成 persisted 信封)
 
 const std = @import("std");
 const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
-
-const MAX_CONTENT_BYTES: usize = 8000;
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
@@ -47,7 +47,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         url_z.ptr,
         null,
     };
-    const out = try common.spawnCaptureWithStderrTimed(argv[0..argv.len], allocator, ctx.abort, 20_000, ctx.spawn_tick_fn);
+    const out = try common.spawnCaptureWithStderrTimed(argv[0..argv.len], allocator, ctx.abort, 20_000, ctx.spawn_tick_fn, common.MAX_SPAWN_CAPTURE_BYTES);
     defer allocator.free(out.stdout);
     defer allocator.free(out.stderr);
 
@@ -55,19 +55,17 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         return error.FetchFailed;
     }
 
-    // HTML → text
+    // HTML → text(全文,受 16MB 捕获守卫上界)。
     const text = try htmlToText(out.stdout, allocator);
     defer allocator.free(text);
 
-    const truncated = text.len > MAX_CONTENT_BYTES;
-    const excerpt = if (truncated) text[0..MAX_CONTENT_BYTES] else text;
-
+    // 返回全文;大页由 tool_exec 的 maybePersist 统一落盘换成 preview+path(三件套),模型 Read(path) 取剩余。
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
     try aw.writer.writeAll("{\"url\":");
     try std.json.Stringify.encodeJsonString(url, .{}, &aw.writer);
-    try aw.writer.print(",\"bytes\":{d},\"truncated\":{s},\"content\":", .{ text.len, if (truncated) "true" else "false" });
-    try std.json.Stringify.encodeJsonString(excerpt, .{}, &aw.writer);
+    try aw.writer.print(",\"bytes\":{d},\"content\":", .{text.len});
+    try std.json.Stringify.encodeJsonString(text, .{}, &aw.writer);
     try aw.writer.writeAll("}");
     return try aw.toOwnedSlice();
 }
@@ -118,6 +116,12 @@ fn htmlToText(html: []const u8, allocator: std.mem.Allocator) ![]u8 {
                 try out.append(allocator, ' ');
                 last_was_space = true;
             }
+            i += 1;
+            continue;
+        }
+        // 控制字节(NUL 等 <0x20,\t\n\r 上面已处理)是提取文本里的垃圾,丢弃——顺带防
+        // 二进制 URL 的控制字节经 encodeJsonString 转 \u00XX 6x 膨胀(Linus 登记的内存尖峰)。
+        if (c < 0x20) {
             i += 1;
             continue;
         }

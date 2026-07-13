@@ -1188,15 +1188,16 @@ fn renderReadSummary(alloc: std.mem.Allocator, th: Theme, output_text: []const u
 /// WebFetch 结果:人话摘要 `Received N bytes[ (truncated)]`(对齐 cc `Received N bytes (status)`,
 /// zig 结果 JSON 无 HTTP status 故略);verbose/transcript 展开正文 content。**绝不裸吐 JSON。**
 fn renderWebFetchSummary(alloc: std.mem.Allocator, th: Theme, output_text: []const u8, out: *std.ArrayList(u8), opts: RenderOpts) !void {
-    const bytes = extractNumberField(output_text, "bytes");
-    const truncated = std.mem.indexOf(u8, output_text, "\"truncated\":true") != null;
+    // 小页:{...,"bytes":N,...};大页被 tool_exec 落盘换成 persisted 信封 → 读 original_bytes(全文字节)。
+    const bytes = extractNumberField(output_text, "bytes") orelse extractNumberField(output_text, "original_bytes");
+    const persisted = std.mem.indexOf(u8, output_text, "\"persisted\":true") != null;
     try out.appendSlice(alloc, "  ");
     try out.appendSlice(alloc, th.success);
     if (bytes) |b| {
         try out.print(alloc, "Received {d} bytes", .{b});
-        if (truncated) try out.appendSlice(alloc, " (truncated)");
+        if (persisted) try out.appendSlice(alloc, " (saved to file — Read the path for full content)");
     } else {
-        // 无 bytes 字段(异常结果)→ 仍给人话,不裸吐 JSON。
+        // 无 bytes/original_bytes 字段(异常结果)→ 仍给人话,不裸吐 JSON。
         try out.appendSlice(alloc, "Fetched");
     }
     try out.appendSlice(alloc, th.reset);
@@ -1854,15 +1855,25 @@ test "renderResult: WebFetch 人话摘要(真 JSON 契约,不裸吐)" {
     try testing.expect(std.mem.indexOf(u8, s, "Example Domain body text") == null);
 }
 
-test "renderResult: WebFetch truncated 标注 + verbose 展开正文" {
+test "renderResult: WebFetch 小页摘要 + verbose 展开正文" {
     const th = theme_mod.monochrome;
-    const out = "{\"url\":\"http://x\",\"bytes\":99999,\"truncated\":true,\"content\":\"long page body\"}";
+    // 小页(<50K):{url,bytes,content},无 truncated(已删)。
+    const out = "{\"url\":\"http://x\",\"bytes\":99999,\"content\":\"long page body\"}";
     const s = try renderResult(testing.allocator, th, "WebFetch", "{\"url\":\"http://x\"}", out, .ok, 80, .{ .verbose = true });
     defer testing.allocator.free(s);
     try capture.expectContains(s, "Received 99999 bytes");
-    try capture.expectContains(s, "(truncated)");
     try capture.expectContains(s, "long page body"); // verbose 展开正文
     try testing.expect(std.mem.indexOf(u8, s, "\"content\"") == null); // 仍不裸吐字段名
+}
+
+test "renderResult: WebFetch 大页(persisted 信封)读 original_bytes + 落盘标注" {
+    const th = theme_mod.monochrome;
+    // 大页被 tool_exec 落盘换成 persisted 信封;卡读 original_bytes,标注已落盘。
+    const out = "{\"persisted\":true,\"original_bytes\":123456,\"path\":\"/tmp/x/.metacodes/tool-results/ab.txt\",\"preview\":\"start of page\"}";
+    const s = try renderResult(testing.allocator, th, "WebFetch", "{\"url\":\"http://x\"}", out, .ok, 80, .{});
+    defer testing.allocator.free(s);
+    try capture.expectContains(s, "Received 123456 bytes"); // 不再退化成裸 Fetched
+    try capture.expectContains(s, "saved to file");
 }
 
 test "renderResult: Bash 仍走通用折叠(无专用渲染器)" {
