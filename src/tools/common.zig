@@ -1,4 +1,5 @@
 const std = @import("std");
+const process = @import("../platform/process.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
@@ -290,73 +291,38 @@ pub fn spawnCaptureWithStderrTimed(
     max_bytes: usize,
 ) !SpawnOut {
     logSpawnArgv(argv, timeout_ms);
-    const t_start = nowMs();
-
-    var out_pipe: [2]std.c.fd_t = undefined;
-    var err_pipe: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&out_pipe) != 0) return error.SpawnError;
-    if (std.c.pipe(&err_pipe) != 0) {
-        _ = std.c.close(out_pipe[0]);
-        _ = std.c.close(out_pipe[1]);
-        return error.SpawnError;
-    }
-
-    const pid = std.c.fork();
-    if (pid < 0) {
-        _ = std.c.close(out_pipe[0]);
-        _ = std.c.close(out_pipe[1]);
-        _ = std.c.close(err_pipe[0]);
-        _ = std.c.close(err_pipe[1]);
-        log.err("spawn", "fork failed", .{});
-        return error.SpawnError;
-    }
-
-    if (pid == 0) {
-        // 子进程
-        _ = std.c.setpgid(0, 0);
-        _ = std.c.close(out_pipe[0]);
-        _ = std.c.close(err_pipe[0]);
-        _ = std.c.dup2(out_pipe[1], 1);
-        _ = std.c.dup2(err_pipe[1], 2);
-        _ = std.c.close(out_pipe[1]);
-        _ = std.c.close(err_pipe[1]);
-
-        const argv0 = argv[0] orelse std.c._exit(127);
-        _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), &.{null});
-        std.c._exit(127);
-    }
-
-    log.debug("spawn", "forked pid={d} (stdout+stderr)", .{pid});
-
-    // 父进程
-    _ = std.c.close(out_pipe[1]);
-    _ = std.c.close(err_pipe[1]);
-    _ = std.c.setpgid(pid, pid);
-
-    // tick 显示的命令名:取 argv[0] 的 basename(旧代码硬编码 "bash",对 WebFetch/Worktree
-    // 等走本函数的工具是错的——它们不是 bash)。null argv[0] 兜底 "?"。
-    const cmd_label: []const u8 = blk: {
-        const a0 = argv[0] orelse break :blk "?";
-        const full = std.mem.span(a0);
-        const slash = std.mem.lastIndexOfScalar(u8, full, '/');
-        break :blk if (slash) |i| full[i + 1 ..] else full;
+    // 委托可移植 platform/process.zig(POSIX fork+poll / Windows CreateProcessW+reader线程)。
+    // AbortSignal / tick_fn 包成 opaque 回调(process 层不依赖 util/abort)。行为对齐:
+    // timeout→error.Timeout、abort→error.Aborted、cap 命中→Ok 部分、tick label=basename(argv0)。
+    const AbortBridge = struct {
+        fn poll(ctx: ?*const anyopaque) bool {
+            const a: *const AbortSignal = @ptrCast(@alignCast(ctx.?));
+            return a.isAborted();
+        }
     };
-    const result = readTwoFdsAbortableTimed(out_pipe[0], err_pipe[0], allocator, pid, abort, timeout_ms, tick_fn, cmd_label, max_bytes);
-    _ = std.c.close(out_pipe[0]);
-    _ = std.c.close(err_pipe[0]);
-
-    var status: c_int = 0;
-    _ = std.c.waitpid(pid, &status, 0);
-    const ec = exitCode(status);
-
-    const dt_ms = nowMs() - t_start;
-    if (result) |r| {
-        log.debug("spawn", "pid={d} exit={d} stdout_bytes={d} stderr_bytes={d} duration_ms={d}", .{ pid, ec, r.stdout.len, r.stderr.len, dt_ms });
-        return .{ .stdout = r.stdout, .stderr = r.stderr, .exit_code = ec };
-    } else |err| {
-        log.warn("spawn", "pid={d} failed err={s} duration_ms={d}", .{ pid, @errorName(err), dt_ms });
-        return err;
-    }
+    const TickBridge = struct {
+        f: *const fn (u64, []const u8) void,
+        fn cb(ctx: ?*const anyopaque, elapsed: u64, label: []const u8) void {
+            const self: *const @This() = @ptrCast(@alignCast(ctx.?));
+            self.f(elapsed, label);
+        }
+    };
+    var tick_bridge: ?TickBridge = if (tick_fn) |tf| .{ .f = tf } else null;
+    const r = process.capture(argv, allocator, .{
+        .timeout_ms = timeout_ms,
+        .max_bytes = if (max_bytes == 0) std.math.maxInt(usize) else max_bytes,
+        .want_stderr = true,
+        .abort_ctx = @ptrCast(abort),
+        .abort_poll = if (abort != null) AbortBridge.poll else null,
+        .tick_ctx = if (tick_bridge) |*t| @ptrCast(t) else null,
+        .tick_cb = if (tick_bridge != null) TickBridge.cb else null,
+    }) catch |e| switch (e) {
+        error.Timeout => return error.Timeout,
+        error.Aborted => return error.Aborted,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.SpawnError,
+    };
+    return .{ .stdout = r.stdout, .stderr = r.stderr, .exit_code = r.exit_code };
 }
 
 const TwoBufs = struct { stdout: []u8, stderr: []u8 };

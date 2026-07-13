@@ -192,11 +192,7 @@ fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts
     var status: c_int = 0;
     _ = std.c.waitpid(pid, &status, 0);
 
-    if (timed_out) {
-        out.deinit(allocator);
-        err.deinit(allocator);
-        return error.Timeout;
-    }
+    if (timed_out) return error.Timeout; // errdefer 释放 out/err（勿显式 deinit → 双 free）
     return .{
         .stdout = try out.toOwnedSlice(allocator),
         .stderr = try err.toOwnedSlice(allocator),
@@ -355,16 +351,8 @@ fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, op
     win.CloseHandle(pi.hThread);
 
     if (out_reader.oom) return error.OutOfMemory;
-    if (aborted) {
-        out.deinit(allocator);
-        err.deinit(allocator);
-        return error.Aborted;
-    }
-    if (timed_out) {
-        out.deinit(allocator);
-        err.deinit(allocator);
-        return error.Timeout;
-    }
+    if (aborted) return error.Aborted; // errdefer 释放 out/err（勿显式 deinit → 双 free）
+    if (timed_out) return error.Timeout;
     return .{
         .stdout = try out.toOwnedSlice(allocator),
         .stderr = try err.toOwnedSlice(allocator),
@@ -415,7 +403,15 @@ fn appendQuotedArg(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), arg: [
 // Tests
 // ============================================================================
 
+// 这 2 个测试 fork 真子进程。`zig build test` 的并行多-binary runner 下 fork 会崩
+// (与其它并行 test binary 争 stdout/资源);standalone `zig test` 与 CI 专用 job 都正常。
+// 故 env-gate:默认 skip，CI（cross-platform.yml 设 METACODES_PROC_TEST=1）与手动跑时启用。
+fn procSpawnTestsEnabled() bool {
+    return std.c.getenv("METACODES_PROC_TEST") != null;
+}
+
 test "capture stdout+stderr 分别捕获" {
+    if (!procSpawnTestsEnabled()) return error.SkipZigTest;
     const a = std.testing.allocator;
     const argv: []const ?[*:0]const u8 = if (is_windows)
         &.{ "cmd.exe", "/c", "echo out-line & echo err-line 1>&2", null }
@@ -430,6 +426,7 @@ test "capture stdout+stderr 分别捕获" {
 }
 
 test "captureStdout 便捷+非零 exit" {
+    if (!procSpawnTestsEnabled()) return error.SkipZigTest;
     const a = std.testing.allocator;
     const argv: []const ?[*:0]const u8 = if (is_windows)
         &.{ "cmd.exe", "/c", "echo hi & exit 3", null }
@@ -441,6 +438,17 @@ test "captureStdout 便捷+非零 exit" {
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "hi") != null);
     try std.testing.expectEqual(@as(i32, 3), r.exit_code);
     try std.testing.expectEqual(@as(usize, 0), r.stderr.len); // want_stderr=false
+}
+
+test "capture 超时返 error.Timeout（有缓冲输出，验不 double-free）" {
+    if (!procSpawnTestsEnabled()) return error.SkipZigTest;
+    const a = std.testing.allocator; // testing.allocator 会捕获 double-free/leak
+    // 先产出 "before"（进 out 缓冲）再长眠 → 400ms 超时命中带数据的 timeout 路径。
+    const argv: []const ?[*:0]const u8 = if (is_windows)
+        &.{ "cmd.exe", "/c", "echo before& ping -n 12 127.0.0.1 >nul", null }
+    else
+        &.{ "/bin/sh", "-c", "echo before; sleep 10", null };
+    try std.testing.expectError(error.Timeout, capture(argv, a, .{ .timeout_ms = 400 }));
 }
 
 test "buildWindowsCmdline quoting" {
