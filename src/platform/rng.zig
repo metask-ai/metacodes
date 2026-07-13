@@ -13,7 +13,9 @@ const is_windows = builtin.os.tag == .windows;
 const win = std.os.windows;
 
 // RtlGenRandom：BOOLEAN SystemFunction036(PVOID buf, ULONG len)。std 未绑定，自 extern。
-extern "advapi32" fn SystemFunction036(RandomBuffer: [*]u8, RandomBufferLength: win.ULONG) win.BOOLEAN;
+// 返回类型声明为 u8:BOOLEAN 的 ABI 就是单字节(BYTE),用 u8 可直接 `!= 0` 判真;
+// 若声明 win.BOOLEAN(=Bool(u8) 的 enum 包装)则无法与整数 0 比较（CI windows-latest 实测抓到）。
+extern "advapi32" fn SystemFunction036(RandomBuffer: [*]u8, RandomBufferLength: win.ULONG) u8;
 
 /// 用加密强随机字节填满 `buf`。返回 `true`=成功；`false`=熵源不可用（调用方决定报错/兜底）。
 pub fn randomBytes(buf: []u8) bool {
