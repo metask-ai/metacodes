@@ -215,15 +215,42 @@ pub fn isReadonlyCommand(cmd: []const u8) bool {
         const sp2 = std.mem.indexOfAny(u8, rest, " \t") orelse rest.len;
         const sub = rest[0..sp2];
         const READONLY_GIT = [_][]const u8{
-            "status", "log",  "diff",  "show",  "branch",
+            "status",    "log",      "diff",    "show", "branch",
             "rev-parse", "ls-files", "ls-tree", "describe",
-            "blame", "config", // config 单查询 -l/--get,粗算 readonly
-            "remote", // remote -v
+            "blame",
         };
         inline for (READONLY_GIT) |g| {
             if (std.mem.eql(u8, sub, g)) return true;
         }
+        // config / remote 是**双态**(读/写):`git config k v` 写 .git/config、`git remote add` 改
+        // remote。fail-closed(Linus MED-1:漏挡则并发/流式推测执行写命令,abort 后副作用已发生)——
+        // 仅带明确读标志/读子命令才算 readonly,否则 unsafe。
+        const gargs = std.mem.trim(u8, rest[sp2..], " \t");
+        if (std.mem.eql(u8, sub, "config")) return gitConfigReadonly(gargs);
+        if (std.mem.eql(u8, sub, "remote")) return gitRemoteReadonly(gargs);
     }
+    return false;
+}
+
+/// `git config` 仅当带明确读标志(-l/--list/--get*)才 readonly。裸 `git config k`(读)也保守判
+/// unsafe(宁可不预取也不误放写命令 `git config k v`)。
+fn gitConfigReadonly(args: []const u8) bool {
+    const READ_FLAGS = [_][]const u8{ "-l", "--list", "--get", "--get-all", "--get-regexp", "--get-urlall" };
+    var it = std.mem.tokenizeAny(u8, args, " \t");
+    while (it.next()) |tok| {
+        inline for (READ_FLAGS) |f| if (std.mem.eql(u8, tok, f)) return true;
+    }
+    return false;
+}
+
+/// `git remote` 仅当无参(列 remote)或读子命令(-v/--verbose/show/get-url)才 readonly;
+/// add/remove/rename/set-url 等写操作 → unsafe。
+fn gitRemoteReadonly(args: []const u8) bool {
+    if (args.len == 0) return true; // `git remote` 裸列
+    var it = std.mem.tokenizeAny(u8, args, " \t");
+    const first = it.next() orelse return true;
+    const READ_SUB = [_][]const u8{ "-v", "--verbose", "show", "get-url" };
+    inline for (READ_SUB) |s| if (std.mem.eql(u8, first, s)) return true;
     return false;
 }
 
@@ -232,6 +259,25 @@ pub fn isReadonlyCommand(cmd: []const u8) bool {
 // ============================================================================
 
 const testing = std.testing;
+
+test "isReadonlyCommand: git config/remote 双态(写命令 fail-closed unsafe · Linus MED-1)" {
+    // 读:明确读标志/子命令 → readonly。
+    try testing.expect(isReadonlyCommand("git config -l"));
+    try testing.expect(isReadonlyCommand("git config --get user.name"));
+    try testing.expect(isReadonlyCommand("git remote"));
+    try testing.expect(isReadonlyCommand("git remote -v"));
+    try testing.expect(isReadonlyCommand("git remote show origin"));
+    // 写:必须 unsafe(否则流式/并发推测执行写副作用)。
+    try testing.expect(!isReadonlyCommand("git config user.name foo")); // 写 .git/config
+    try testing.expect(!isReadonlyCommand("git config user.email a@b.c"));
+    try testing.expect(!isReadonlyCommand("git remote add origin url")); // 改 remote
+    try testing.expect(!isReadonlyCommand("git remote set-url origin url"));
+    // 裸 `git config key`(读)保守判 unsafe(不误放写)。
+    try testing.expect(!isReadonlyCommand("git config user.name"));
+    // 无条件只读子命令不受影响。
+    try testing.expect(isReadonlyCommand("git status"));
+    try testing.expect(isReadonlyCommand("git log --oneline"));
+}
 
 test "splitCompound: basic && || ; |" {
     const segs = try splitCompound(testing.allocator, "ls && cat foo || rm bar ; echo done | wc -l");

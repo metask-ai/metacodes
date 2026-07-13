@@ -49,16 +49,33 @@ const Job = struct {
     done: bool = false,
 };
 
-fn runJob(job: *Job) void {
-    const s = job.slot;
+/// 单个工具执行的结果(所有 owned 字段挂 parent_allocator,逃逸内部 arena)。
+pub const OneResult = union(enum) {
+    /// 正常完成(成功或工具级错误)。
+    done: struct { content: ?[]u8, is_error: bool, elapsed_ms: u64 },
+    /// L3 挂起:工具发起 custom UI(error.UiPending)。kind/payload owned by parent_allocator。
+    pending: struct { kind: ?[]u8, payload: ?[]u8, elapsed_ms: u64 },
+};
+
+/// **单一工具执行入口**——executeSlots(串行/并发批)与 stream_prefetch(边流边执行)共用,
+/// 保证两条路径的执行语义/错误处理**完全一致**(消除历史"行为分叉":富错误 detail、UnknownTool
+/// 引导、大结果落盘、UiPending 控制信号、计时)。每次自建 arena 规避 GPA 并发;结果 dupe 逃逸。
+/// id 用于 progress 路由(progress_tool_id);rid 用于日志。
+pub fn executeOne(
+    base_ctx: *const ToolContext,
+    name: []const u8,
+    input: []const u8,
+    id: []const u8,
+    parent_allocator: std.mem.Allocator,
+    rid: log.RequestId,
+) OneResult {
     const t_start = util_time.nowMs();
-    // 每 job 独立 arena,规避 GPA 并发;dispatch 的临时分配挂这里。
-    var arena = std.heap.ArenaAllocator.init(job.parent_allocator);
+    var arena = std.heap.ArenaAllocator.init(parent_allocator);
     defer arena.deinit();
-    var job_ctx = job.ctx.*;
+    var job_ctx = base_ctx.*;
     job_ctx.allocator = arena.allocator();
-    // per-toolUse 进度路由:盖上本 job 的 tool_use id,reportProgress 据此找对应卡。
-    job_ctx.progress_tool_id = s.id;
+    // per-toolUse 进度路由:盖上本 tool_use id,reportProgress 据此找对应卡。
+    job_ctx.progress_tool_id = id;
     // 富错误 detail 槽:工具可在抛错前写入,替代通用 "X failed with Y"。
     var err_detail: ?[]const u8 = null;
     job_ctx.error_detail = &err_detail;
@@ -66,61 +83,68 @@ fn runJob(job: *Job) void {
     var pending_req: ?tools_mod.PendingRequest = null;
     job_ctx.pending_request = &pending_req;
 
-    log.infoId("agent", job.rid, "tool.exec start(par) name={s} id={s}", .{ s.name, s.id });
-    const r = tools_mod.dispatch(&job_ctx, s.name, s.input) catch |err| {
-        // L3:UiPending 是控制信号(非工具错误)——置 pending 标志 + 把 kind/payload dupe 到父
-        // allocator 逃逸 arena(供 agent_loop emit + 落盘),不置 is_error、不产 tool_result。
+    log.infoId("agent", rid, "tool.exec start(par) name={s} id={s}", .{ name, id });
+    const r = tools_mod.dispatch(&job_ctx, name, input) catch |err| {
+        const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
+        // L3:UiPending 是控制信号(非工具错误)——kind/payload dupe 到父 allocator 逃逸 arena。
         if (err == error.UiPending) {
-            s.pending = true;
-            if (pending_req) |pr| {
-                s.pending_kind = job.parent_allocator.dupe(u8, pr.kind) catch null;
-                s.pending_payload = job.parent_allocator.dupe(u8, pr.payload_json) catch null;
-            }
-            s.elapsed_ms = @intCast(@max(util_time.nowMs() - t_start, 0));
-            log.infoId("agent", job.rid, "tool.exec PENDING(par) name={s} id={s} kind={s}", .{ s.name, s.id, if (pending_req) |pr| pr.kind else "" });
-            job.done = true;
-            return;
+            log.infoId("agent", rid, "tool.exec PENDING(par) name={s} id={s} kind={s}", .{ name, id, if (pending_req) |pr| pr.kind else "" });
+            return .{ .pending = .{
+                .kind = if (pending_req) |pr| parent_allocator.dupe(u8, pr.kind) catch null else null,
+                .payload = if (pending_req) |pr| parent_allocator.dupe(u8, pr.payload_json) catch null else null,
+                .elapsed_ms = elapsed,
+            } };
         }
         const code = if (err == error.UnknownTool) "UnknownTool" else @errorName(err);
         const tool_error = @import("tool_error.zig");
         // 错误 json 用父 allocator(逃逸 arena)。工具填了 detail 用之,否则通用文案。
         // P0.6:UnknownTool 附可用工具清单(hermes 式引导),弱模型据此自纠而非空转烧 turn。
         const ej = if (err_detail) |d|
-            tool_error.errorToJson(code, "{s}", .{d}, job.parent_allocator) catch null
+            tool_error.errorToJson(code, "{s}", .{d}, parent_allocator) catch null
         else if (err == error.UnknownTool) blk: {
-            const names = tools_mod.availableToolNames(&job_ctx, job.parent_allocator) catch null;
-            defer if (names) |nm| job.parent_allocator.free(nm);
+            const names = tools_mod.availableToolNames(&job_ctx, parent_allocator) catch null;
+            defer if (names) |nm| parent_allocator.free(nm);
             // 模糊建议(仅提示,不执行):有则加 "Did you mean 'X'?"。
-            const guess = tools_mod.suggestToolName(&job_ctx, s.name);
+            const guess = tools_mod.suggestToolName(&job_ctx, name);
             break :blk if (guess) |g|
-                tool_error.errorToJson(code, "Tool '{s}' does not exist. Did you mean '{s}'? Available tools: {s}", .{ s.name, g, if (names) |nm| nm else "(unavailable)" }, job.parent_allocator) catch null
+                tool_error.errorToJson(code, "Tool '{s}' does not exist. Did you mean '{s}'? Available tools: {s}", .{ name, g, if (names) |nm| nm else "(unavailable)" }, parent_allocator) catch null
             else
-                tool_error.errorToJson(code, "Tool '{s}' does not exist. Available tools: {s}", .{ s.name, if (names) |nm| nm else "(unavailable)" }, job.parent_allocator) catch null;
-        } else tool_error.errorToJson(code, "{s} failed with {s}", .{ s.name, @errorName(err) }, job.parent_allocator) catch null;
-        s.content = ej;
-        s.is_error = true;
-        s.elapsed_ms = @intCast(@max(util_time.nowMs() - t_start, 0));
-        log.warnId("agent", job.rid, "tool.exec FAILED(par) name={s} err={s} duration_ms={d} input={s}", .{ s.name, @errorName(err), util_time.nowMs() - t_start, s.input[0..@min(s.input.len, 200)] });
-        job.done = true;
-        return;
+                tool_error.errorToJson(code, "Tool '{s}' does not exist. Available tools: {s}", .{ name, if (names) |nm| nm else "(unavailable)" }, parent_allocator) catch null;
+        } else tool_error.errorToJson(code, "{s} failed with {s}", .{ name, @errorName(err) }, parent_allocator) catch null;
+        log.warnId("agent", rid, "tool.exec FAILED(par) name={s} err={s} duration_ms={d} input={s}", .{ name, @errorName(err), elapsed, input[0..@min(input.len, 200)] });
+        return .{ .done = .{ .content = ej, .is_error = true, .elapsed_ms = elapsed } };
     };
-    // dispatch 结果在 arena 里 → dupe 到父 allocator 逃逸。
-    const owned = job.parent_allocator.dupe(u8, r) catch null;
-    if (owned) |o| {
-        // 大结果落盘(批1C):超阈值 → 替换为 preview+path。
+    // dispatch 结果在 arena 里 → dupe 到父 allocator 逃逸;大结果落盘(超阈值 → preview+path)。
+    var content: ?[]u8 = null;
+    if (parent_allocator.dupe(u8, r) catch null) |o| {
         const storage = @import("../tools/tool_result_storage.zig");
-        if (storage.maybePersist(job.parent_allocator, s.name, o, job.ctx.home_dir) catch null) |preview| {
-            job.parent_allocator.free(o);
-            s.content = preview;
+        if (storage.maybePersist(parent_allocator, name, o, base_ctx.home_dir) catch null) |preview| {
+            parent_allocator.free(o);
+            content = preview;
         } else {
-            s.content = o;
+            content = o;
         }
-    } else {
-        s.content = null;
     }
-    s.is_error = false;
-    s.elapsed_ms = @intCast(@max(util_time.nowMs() - t_start, 0));
-    log.infoId("agent", job.rid, "tool.exec done(par) name={s} output_bytes={d} duration_ms={d}", .{ s.name, r.len, util_time.nowMs() - t_start });
+    const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
+    log.infoId("agent", rid, "tool.exec done(par) name={s} output_bytes={d} duration_ms={d}", .{ name, r.len, elapsed });
+    return .{ .done = .{ .content = content, .is_error = false, .elapsed_ms = elapsed } };
+}
+
+fn runJob(job: *Job) void {
+    const s = job.slot;
+    switch (executeOne(job.ctx, s.name, s.input, s.id, job.parent_allocator, job.rid)) {
+        .pending => |p| {
+            s.pending = true;
+            s.pending_kind = p.kind;
+            s.pending_payload = p.payload;
+            s.elapsed_ms = p.elapsed_ms;
+        },
+        .done => |d| {
+            s.content = d.content;
+            s.is_error = d.is_error;
+            s.elapsed_ms = d.elapsed_ms;
+        },
+    }
     job.done = true;
 }
 
@@ -236,6 +260,39 @@ test "executeSlots 跳过 prefetched slot(不重复执行,P0.4 无双执行铁�
     try std.testing.expect(slots[0].content != null);
     try std.testing.expectEqualStrings("PREFETCHED_CONTENT", slots[0].content.?);
     try std.testing.expect(!slots[0].is_error);
+}
+
+test "executeOne:成功路径返回 done+content(与 executeSlots 同一入口)" {
+    const a = std.testing.allocator;
+    var ctx = tools_mod.ToolContext{ .allocator = a, .cwd_abs = "." };
+    const r = executeOne(&ctx, "Glob", "{\"pattern\":\"*.zig\"}", "gid", a, .{ .bytes = [_]u8{'0'} ** 12 });
+    switch (r) {
+        .done => |d| {
+            try std.testing.expect(!d.is_error);
+            try std.testing.expect(d.content != null);
+            if (d.content) |c| a.free(c);
+        },
+        .pending => try std.testing.expect(false),
+    }
+}
+
+test "executeOne:UnknownTool → 富错误引导(prefetch/executeSlots 共享此路径)" {
+    const a = std.testing.allocator;
+    var ctx = tools_mod.ToolContext{ .allocator = a };
+    const r = executeOne(&ctx, "NoSuchTool", "{}", "x", a, .{ .bytes = [_]u8{'0'} ** 12 });
+    switch (r) {
+        .done => |d| {
+            try std.testing.expect(d.is_error);
+            try std.testing.expect(d.content != null);
+            if (d.content) |c| {
+                defer a.free(c);
+                // 富引导(非裸 "failed with"):列可用工具,弱模型据此自纠。
+                try std.testing.expect(std.mem.indexOf(u8, c, "does not exist") != null);
+                try std.testing.expect(std.mem.indexOf(u8, c, "Available tools") != null);
+            }
+        },
+        .pending => try std.testing.expect(false),
+    }
 }
 
 /// 一批 safe slot 并发执行(每个独立线程,cap MAX_TOOL_CONCURRENCY)。

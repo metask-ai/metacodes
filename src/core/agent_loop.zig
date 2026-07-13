@@ -619,23 +619,46 @@ pub fn run(
         // 流期权限判定用的无 hook 上下文副本(不 mid-stream 跑 hook 副作用)。
         var pc_prefetch = permission_ctx.*;
         pc_prefetch.hooks = null;
-        // 预取用 ToolContext:与主 base_ctx **同源** opts.*(避免行为分叉——dispatch 要能路由 dyn 工具,
-        // read_state/cwd/home/sandbox 与主执行一致)。只读工具不碰的字段留默认无害。
+        // 预取用 ToolContext:**忠实镜像下方 base_ctx 的 opts.* 字段**(广播到 concurrency-safe 全集后
+        // 只读 Bash/BashOutput/WebFetch 也流式,它们要 jobs/spawn_tick_fn/api_client 等——缺则行为分叉)。
+        // 刻意排除三类 mid-stream 不安全/流末派生的:progress_reporter+ui_requester(流中不驱动 TUI/不
+        // 弹询问,且 tool_start 卡尚未 emit)、last_proposed_plan(流末才提取,ExitPlanMode 非并发安全)、
+        // hooks(经 pc_prefetch 剥离,PreToolUse 可 ModifyInput)、session/agent_ident(UiRequest 路由/kg
+        // claim 身份,并发安全工具不用)。**维护约束**:base_ctx 新增字段若被并发安全工具读,须同步这里。
         var prefetch_ctx = tools_mod.ToolContext{
             .allocator = allocator,
             .abort = opts.abort,
             .read_state = opts.read_state,
-            .cwd_abs = opts.cwd_abs,
-            .home_dir = opts.home_dir,
-            .sandbox = opts.sandbox,
+            .edit_hl_cache = opts.edit_hl_cache,
+            .lsp = opts.lsp,
+            .jobs = opts.jobs,
+            .agent_jobs = opts.agent_jobs,
+            .permission_ctx = &pc_prefetch, // hooks 已剥离
+            .plan_prev_mode = opts.plan_prev_mode,
+            .tasks = opts.tasks,
+            .kg = opts.kg,
+            .kg_projects_dir = opts.kg_projects_dir,
+            .memdir_abs = opts.memdir_abs,
+            .api_client = opts.api_client,
+            .provider = provider,
             .tool_defs = opts.tool_defs,
+            .agent_depth = opts.agent_depth,
             .dyn_registry = opts.dyn_registry,
             .host_services = opts.host_services,
+            .explicit_invocation = opts.explicit_invocation,
             .session_id = opts.session_id,
             .project_dir = opts.project_dir,
-            .agent_depth = opts.agent_depth,
-            .parent_model = opts.parent_model,
             .disable_shell_execution = opts.disable_shell_execution,
+            .sandbox = opts.sandbox,
+            .cwd_abs = opts.cwd_abs,
+            .home_dir = opts.home_dir,
+            .plan_file_path = opts.plan_file_path,
+            .agents = opts.agents,
+            .parent_model = opts.parent_model,
+            .skills = opts.skills_set,
+            .mcp_sessions = opts.mcp_sessions,
+            .cron_registry = opts.cron_registry,
+            .spawn_tick_fn = opts.spawn_tick_fn, // Bash/WebFetch 长命令心跳
         };
 
         request_recovery: while (true) {
@@ -749,15 +772,17 @@ pub fn run(
                             .name = tu.name,
                             .input = tu.input_json,
                         });
-                        // P0.4 流式预取:只读 + 并发安全 + 权限 allow(纯判定不 prompt)→ 立即开线程执行。
-                        // borrow 刚 append 的 tool_uses 里的稳定堆切片(ArrayList 扩容搬结构体不动堆内容)。
+                        // 流式执行(边流边跑):concurrency-safe(只读语义)+ 可流(非 WebSearch,不竞争
+                        // 模型 client)+ 权限 allow(纯判定不 prompt)+ 无 PreToolUse hook → 立即开线程执行,
+                        // 流末 executeSlots 直接用结果。广播自 P0.4 只读白名单(Read/Grep/Glob)到全 safe 集
+                        // (加只读 Bash `git status`/`ls`、BashOutput、WebFetch)。borrow 刚 append 的稳定堆切片。
                         const not_aborted = if (opts.abort) |ab| !ab.isAborted() else true;
-                        if (prefetch_enabled and not_aborted and sp.isPrefetchable(tu.name) and
+                        if (prefetch_enabled and not_aborted and sp.isStreamable(tu.name) and
                             tools_mod.isConcurrencySafeInput(tu.name, tu.input_json) and
                             permission_mod.checkPermission(&pc_prefetch, tu.name, tu.input_json) == .allow)
                         {
                             const last = &tool_uses.items[tool_uses.items.len - 1];
-                            prefetch.start(&prefetch_ctx, last.id, last.name, last.input);
+                            prefetch.start(&prefetch_ctx, last.id, last.name, last.input, rid);
                         }
                     },
                     .web_search_result => |w| {

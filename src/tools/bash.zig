@@ -186,10 +186,10 @@ fn runAutoBackgroundable(
         _ = std.c.nanosleep(&req, &rem);
 
         registry.reapExited();
-        const j = registry.get(job_id[0..]) orelse return error.JobNotFound;
+        const j = registry.get(job_id[0..]) orelse return error.JobNotFound; // 值快照
         if (j.status != .running) {
             // 正常退出：读文件构造完整输出
-            return try readJobAsSync(allocator, j);
+            return try readJobAsSync(allocator, &j);
         }
 
         const elapsed: u64 = @intCast(nowMs() - start);
@@ -200,7 +200,7 @@ fn runAutoBackgroundable(
         }
         if (elapsed >= effective_budget) {
             // 达到 auto-background 阈值但未到 timeout：返回 auto_backgrounded
-            return try formatAutoBackgrounded(allocator, j);
+            return try formatAutoBackgrounded(allocator, &j);
         }
     }
 }

@@ -46,6 +46,17 @@ pub const JobRegistry = struct {
     /// 任何指向 jobs[i].id 的 slice 都会悬挂。值语义完全规避这个问题。
     index: std.AutoHashMap([12]u8, usize),
     base_dir: []const u8, // owned，/tmp/metacodes-jobs/<uid>
+    /// 线程安全锁:并发工具线程(executeSlots 并发批 + stream_prefetch 边流边执行的只读 Bash/
+    /// BashOutput)会并发 spawnBackground(append+put)/get/reapExited/kill → 无锁则 ArrayList/HashMap
+    /// 数据竞争 + 堆损坏(Linus HIGH-1)。全仓惯例 std.c.pthread_*(裁剪 std 无 Thread.Mutex)。
+    mu: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+
+    fn lock(self: *JobRegistry) void {
+        _ = std.c.pthread_mutex_lock(&self.mu);
+    }
+    fn unlock(self: *JobRegistry) void {
+        _ = std.c.pthread_mutex_unlock(&self.mu);
+    }
 
     pub fn init(allocator: std.mem.Allocator) !JobRegistry {
         const uid = std.c.getuid();
@@ -186,16 +197,27 @@ pub const JobRegistry = struct {
             .command_preview = preview,
             .status = .running,
         };
-        try self.jobs.append(self.allocator, entry);
+        // 结构变更持锁(并发 spawnBackground/get/reapExited 安全)。
+        self.lock();
+        self.jobs.append(self.allocator, entry) catch |e| {
+            self.unlock();
+            return e;
+        };
         const new_idx = self.jobs.items.len - 1;
         // key 是 [12]u8 值拷贝，不依赖 jobs buffer 生命周期
-        try self.index.put(id, new_idx);
+        self.index.put(id, new_idx) catch |e| {
+            self.unlock();
+            return e;
+        };
+        self.unlock();
         log.info("job", "bg spawn id={s} pid={d} cmd={s}", .{ id[0..], pid, preview });
-        return entry;
+        return entry; // 值拷贝(非指针),caller 用快照安全
     }
 
     /// 当前 running 状态的 job 数(statusline 显示用)。
-    pub fn runningCount(self: *const JobRegistry) usize {
+    pub fn runningCount(self: *JobRegistry) usize {
+        self.lock();
+        defer self.unlock();
         var n: usize = 0;
         for (self.jobs.items) |*j| {
             if (j.status == .running) n += 1;
@@ -205,6 +227,13 @@ pub const JobRegistry = struct {
 
     /// 非阻塞 reap：对所有 running job waitpid(WNOHANG)，把已退出的状态更新。
     pub fn reapExited(self: *JobRegistry) void {
+        self.lock();
+        defer self.unlock();
+        self.reapExitedLocked();
+    }
+
+    /// 持锁内部版(kill 复用,避免自锁死锁)。
+    fn reapExitedLocked(self: *JobRegistry) void {
         for (self.jobs.items) |*j| {
             if (j.status != .running) continue;
             var status: c_int = 0;
@@ -218,9 +247,19 @@ pub const JobRegistry = struct {
         }
     }
 
-    /// 按 id 查；命中返回指针（指向内部存储，caller 仅读）。O(1)。
-    /// id slice 长度必须正好 12；否则返 null。
-    pub fn get(self: *JobRegistry, id: []const u8) ?*JobEntry {
+    /// 按 id 查；命中返回 **值快照**(JobEntry 拷贝,caller 仅读)。O(1)。
+    /// 返回值而非指针:并发 append 会 realloc jobs buffer 让内部指针悬挂(Linus HIGH-1)。
+    /// job 生命周期内 append-only(退出只改 status,不移除),故快照里的 owned slice(path/preview)
+    /// 在 caller 读取期间保持有效(直到 deinit)。id slice 长度必须正好 12;否则返 null。
+    pub fn get(self: *JobRegistry, id: []const u8) ?JobEntry {
+        self.lock();
+        defer self.unlock();
+        return if (self.getPtrLocked(id)) |p| p.* else null;
+    }
+
+    /// 持锁内部版:返回内部指针供 kill 就地改 status/exit_code。**调用方必须持锁**且不得
+    /// 让指针逃逸出临界区(realloc 会作废它)。
+    fn getPtrLocked(self: *JobRegistry, id: []const u8) ?*JobEntry {
         if (id.len != 12) return null;
         var key: [12]u8 = undefined;
         @memcpy(&key, id[0..12]);
@@ -236,43 +275,56 @@ pub const JobRegistry = struct {
         var pid: std.c.pid_t = undefined;
         var pgid: std.c.pid_t = undefined;
         {
-            const j = self.get(id) orelse return error.JobNotFound;
-            if (j.status != .running) return; // 已结束，幂等返回
-            pid = j.pid;
-            pgid = j.pgid;
+            // 锁仅护结构读快照;syscall 在锁外(不让 500ms sleep/blocking waitpid 钉住锁)。
+            self.lock();
+            const jp = self.getPtrLocked(id) orelse {
+                self.unlock();
+                return error.JobNotFound;
+            };
+            if (jp.status != .running) {
+                self.unlock();
+                return; // 已结束，幂等返回
+            }
+            pid = jp.pid;
+            pgid = jp.pgid;
+            self.unlock();
             _ = std.c.kill(-pgid, std.c.SIG.TERM);
         }
 
-        // 睡眠 + reap。reapExited 可能改 status/exit_code，但当前实现不动 jobs 数组。
-        // 即便将来 reapExited 移除已退出 entry，第二阶段的 pid 快照保证我们仍能 waitpid。
+        // 睡眠 + reap(reapExited 内部持锁)。第二阶段的 pid 快照保证即便 entry 状态变化仍能 waitpid。
         var req = std.c.timespec{ .sec = 0, .nsec = 500_000_000 };
         var rem: std.c.timespec = undefined;
         _ = std.c.nanosleep(&req, &rem);
         self.reapExited();
-        // POSIX 契约：reapExited 内部 waitpid(pid, WNOHANG)。若子进程已退，pid 被 reap
-        // 且 j.status 被置为 .exited/.killed；若还在跑，pid 未 reap 且 j.status 仍 .running。
-        // 所以下面 `j.status == .running` 为真时，pid **一定未被 reap**，
-        // waitpid(pid, 0) 阻塞等它死掉是安全的。**不要**把 reapExited 的 WNOHANG 改成 0。
+        // POSIX 契约：reapExited 内部 waitpid(pid, WNOHANG)。若子进程已退,status 被置 .exited/.killed;
+        // 还在跑则 pid 未 reap 且 status 仍 .running → 下面 waitpid(pid, 0) 阻塞等它死是安全的。
 
-        // 第二阶段：若 entry 还在且仍 running，补 KILL；否则用快照兜底 reap（防僵尸）。
-        if (self.get(id)) |j| {
-            if (j.status == .running) {
-                _ = std.c.kill(-pgid, std.c.SIG.KILL);
-                var status: c_int = 0;
-                _ = std.c.waitpid(pid, &status, 0);
-                j.exit_code = exitCode(status);
-                j.status = .killed;
+        // 第二阶段:锁内判"是否仍 running"(读快照),blocking waitpid 在锁外,再锁内写回 status。
+        self.lock();
+        const still_running = if (self.getPtrLocked(id)) |jp| jp.status == .running else false;
+        const entry_gone = self.getPtrLocked(id) == null;
+        self.unlock();
+        if (still_running) {
+            _ = std.c.kill(-pgid, std.c.SIG.KILL);
+            var status: c_int = 0;
+            _ = std.c.waitpid(pid, &status, 0); // 锁外阻塞
+            self.lock();
+            if (self.getPtrLocked(id)) |jp| {
+                jp.exit_code = exitCode(status);
+                jp.status = .killed;
             }
-        } else {
-            // entry 不在 registry 了（当前实现不会发生，但防御性兜底）
-            // 发一次 KILL + blocking waitpid 回收 pid，避免僵尸。
+            self.unlock();
+        } else if (entry_gone) {
+            // entry 不在 registry(当前实现不会发生,防御性兜底):KILL + blocking waitpid 防僵尸。
             _ = std.c.kill(-pgid, std.c.SIG.KILL);
             var status: c_int = 0;
             _ = std.c.waitpid(pid, &status, 0);
         }
     }
 
-    pub fn activeCount(self: *const JobRegistry) usize {
+    pub fn activeCount(self: *JobRegistry) usize {
+        self.lock();
+        defer self.unlock();
         var n: usize = 0;
         for (self.jobs.items) |j| if (j.status == .running) { n += 1; };
         return n;
