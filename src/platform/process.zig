@@ -1,45 +1,60 @@
 //! W3 可移植子进程 spawn+capture（跨平台移植 roadmap，tinykg node 8867/8868）。
 //!
 //! 现状病灶：8 个 fork+execve 站点（common×2/auth/job_registry/input/mcp/lsp/hooks）。Windows
-//! 无 fork/exec/waitpid/killpg。本模块提供中立 `captureStdout`（spawn 命令、抽干 stdout、超时/
-//! 进程组 kill、返 exit code），首版覆盖 common.zig 的 stdout-capture 家族（最常用路径）。
+//! 无 fork/exec/waitpid/killpg。本模块提供中立 `capture`（spawn 命令、抽干 stdout[+stderr]、
+//! 超时/进程组 kill/abort、tick 进度、返 exit code），覆盖 common.zig 的 spawn-capture 家族。
 //!
-//! - **POSIX**：fork + pipe + dup2 + execve；poll 抽干带超时+字节上限；waitpid；超时 killpg 整组。
-//! - **Windows**：CreateProcessW + CreatePipe（stdout）+ **reader 线程抽干**（避免 pipe 满死锁）；
-//!   WaitForSingleObject 超时；GetExitCodeProcess；超时 TerminateProcess。git-bash 依赖见 roadmap。
+//! - **POSIX**：fork + pipe + dup2 + execve；poll 抽干双 fd 带超时+abort+字节上限；waitpid；kill killpg 整组。
+//! - **Windows**：CreateProcessW + CreatePipe + **reader 线程/fd 抽干**（避 pipe 满死锁）；
+//!   WaitForSingleObject 分片轮询超时+abort；GetExitCodeProcess；kill TerminateProcess。
 //!
-//! 未覆盖（后续增量，CI 验证）：stderr 双捕获、abort 回调、tick 进度、双向 pipe（MCP/LSP）、
-//! 落盘重定向（job_registry bg）、JobObject 进程树 kill（当前 Windows 单进程 Terminate）。
+//! **解耦**：abort/tick 走 opaque 回调（`?*const anyopaque` + fn 指针），platform/ 不依赖
+//! util/abort。调用方（common.zig）把自己的 AbortSignal 包成回调传入。
+//!
+//! 未覆盖（后续增量）：双向 pipe（MCP/LSP 长连接）、落盘重定向（job bg）、JobObject 进程树 kill。
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 const is_windows = builtin.os.tag == .windows;
 
-pub const CaptureResult = struct {
-    stdout: []u8, // owned by调用方 allocator
-    exit_code: i32, // 被信号/超时终止时为负或 259(Windows STILL_ACTIVE→terminated)
+pub const CaptureError = error{ SpawnFailed, PipeFailed, ReadError, OutOfMemory, Aborted, Timeout };
+
+/// abort 轮询回调：返 true=应中止。tick 回调：周期报告 elapsed_ms + 命令 label。
+pub const CaptureOpts = struct {
+    timeout_ms: u64 = 0,
+    max_bytes: usize = 16 << 20,
+    /// false → 子进程 stderr 丢弃（→/dev/null / NUL），结果 stderr 为空。
+    want_stderr: bool = true,
+    abort_ctx: ?*const anyopaque = null,
+    abort_poll: ?*const fn (?*const anyopaque) bool = null,
+    tick_ctx: ?*const anyopaque = null,
+    tick_cb: ?*const fn (?*const anyopaque, elapsed_ms: u64, label: []const u8) void = null,
+};
+
+pub const Captured = struct {
+    stdout: []u8, // owned
+    stderr: []u8, // owned（want_stderr=false 时为空 slice）
+    exit_code: i32,
     timed_out: bool = false,
 };
 
-pub const CaptureError = error{
-    SpawnFailed,
-    PipeFailed,
-    ReadError,
-    OutOfMemory,
-};
+/// spawn argv、抽干 stdout[+stderr]、返回结果。timeout_ms==0 无超时。
+pub fn capture(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts: CaptureOpts) CaptureError!Captured {
+    if (is_windows) return captureWindows(argv, allocator, opts);
+    return capturePosix(argv, allocator, opts);
+}
 
-/// spawn argv、抽干 stdout（stderr 丢弃），返回 stdout + exit code。
-/// `timeout_ms==0` 无超时；>0 超时则 kill 整组（POSIX killpg / Windows Terminate）并置 timed_out。
-/// `max_bytes` stdout 上限（轴A OOM 防线），达上限 kill 并返已读部分。
-pub fn captureStdout(
-    argv: []const ?[*:0]const u8,
-    allocator: std.mem.Allocator,
-    timeout_ms: u64,
-    max_bytes: usize,
-) CaptureError!CaptureResult {
-    if (is_windows) return captureStdoutWindows(argv, allocator, timeout_ms, max_bytes);
-    return captureStdoutPosix(argv, allocator, timeout_ms, max_bytes);
+/// 便捷：只捕 stdout（stderr 丢弃），无 abort/tick。
+pub fn captureStdout(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, timeout_ms: u64, max_bytes: usize) CaptureError!Captured {
+    return capture(argv, allocator, .{ .timeout_ms = timeout_ms, .max_bytes = max_bytes, .want_stderr = false });
+}
+
+fn labelOf(argv: []const ?[*:0]const u8) []const u8 {
+    const a0 = argv[0] orelse return "?";
+    const full = std.mem.span(a0);
+    const slash = std.mem.lastIndexOfScalar(u8, full, '/');
+    return if (slash) |i| full[i + 1 ..] else full;
 }
 
 // ============================================================================
@@ -47,6 +62,7 @@ pub fn captureStdout(
 // ============================================================================
 
 fn nowMs() i64 {
+    if (is_windows) return @intCast(GetTickCount64()); // 单调 ms（自开机），0.16 无 std.time.milliTimestamp
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
     return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
@@ -65,78 +81,124 @@ fn killGroupPosix(pgid: std.c.pid_t) void {
     _ = std.c.kill(-pgid, std.c.SIG.KILL);
 }
 
-fn captureStdoutPosix(
-    argv: []const ?[*:0]const u8,
-    allocator: std.mem.Allocator,
-    timeout_ms: u64,
-    max_bytes: usize,
-) CaptureError!CaptureResult {
-    var pipefd: [2]std.c.fd_t = undefined;
-    if (std.c.pipe(&pipefd) != 0) return error.PipeFailed;
+fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts: CaptureOpts) CaptureError!Captured {
+    var out_pipe: [2]std.c.fd_t = undefined;
+    if (std.c.pipe(&out_pipe) != 0) return error.PipeFailed;
+    var err_pipe: [2]std.c.fd_t = .{ -1, -1 };
+    if (opts.want_stderr) {
+        if (std.c.pipe(&err_pipe) != 0) {
+            _ = std.c.close(out_pipe[0]);
+            _ = std.c.close(out_pipe[1]);
+            return error.PipeFailed;
+        }
+    }
 
     const pid = std.c.fork();
     if (pid < 0) {
-        _ = std.c.close(pipefd[0]);
-        _ = std.c.close(pipefd[1]);
+        _ = std.c.close(out_pipe[0]);
+        _ = std.c.close(out_pipe[1]);
+        if (opts.want_stderr) {
+            _ = std.c.close(err_pipe[0]);
+            _ = std.c.close(err_pipe[1]);
+        }
         return error.SpawnFailed;
     }
     if (pid == 0) {
         _ = std.c.setpgid(0, 0);
-        _ = std.c.close(pipefd[0]);
-        _ = std.c.dup2(pipefd[1], 1);
-        const devnull = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
-        if (devnull >= 0) {
-            _ = std.c.dup2(devnull, 2);
-            if (devnull != 2) _ = std.c.close(devnull);
+        _ = std.c.close(out_pipe[0]);
+        _ = std.c.dup2(out_pipe[1], 1);
+        if (opts.want_stderr) {
+            _ = std.c.close(err_pipe[0]);
+            _ = std.c.dup2(err_pipe[1], 2);
+            _ = std.c.close(err_pipe[1]);
+        } else {
+            const devnull = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+            if (devnull >= 0) {
+                _ = std.c.dup2(devnull, 2);
+                if (devnull != 2) _ = std.c.close(devnull);
+            }
         }
-        _ = std.c.close(pipefd[1]);
+        _ = std.c.close(out_pipe[1]);
         const argv0 = argv[0] orelse std.c._exit(127);
         _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), &.{null});
         std.c._exit(127);
     }
 
-    _ = std.c.close(pipefd[1]);
+    _ = std.c.close(out_pipe[1]);
+    if (opts.want_stderr) _ = std.c.close(err_pipe[1]);
     _ = std.c.setpgid(pid, pid);
 
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
+    var err = std.ArrayList(u8).empty;
+    errdefer err.deinit(allocator);
+
     var buf: [4096]u8 = undefined;
     const start = nowMs();
+    var last_tick = start;
+    var out_done = false;
+    var err_done = !opts.want_stderr;
     var timed_out = false;
-    var done = false;
-    while (!done) {
-        if (timeout_ms > 0 and nowMs() - start >= @as(i64, @intCast(timeout_ms))) {
+    const label = labelOf(argv);
+
+    while (!(out_done and err_done)) {
+        if (opts.abort_poll) |poll| if (poll(opts.abort_ctx)) {
+            killGroupPosix(pid);
+            _ = std.c.close(out_pipe[0]);
+            if (opts.want_stderr) _ = std.c.close(err_pipe[0]);
+            var st: c_int = 0;
+            _ = std.c.waitpid(pid, &st, 0);
+            return error.Aborted;
+        };
+        const elapsed = nowMs() - start;
+        if (opts.timeout_ms > 0 and elapsed >= @as(i64, @intCast(opts.timeout_ms))) {
             killGroupPosix(pid);
             timed_out = true;
             break;
         }
-        var pfds = [_]std.c.pollfd{.{ .fd = pipefd[0], .events = std.c.POLL.IN, .revents = 0 }};
-        const rc = std.c.poll(&pfds, 1, 100);
+        if (opts.tick_cb) |cb| {
+            if (nowMs() - last_tick >= 2000) {
+                cb(opts.tick_ctx, @intCast(elapsed), label);
+                last_tick = nowMs();
+            }
+        }
+        var pfds = [_]std.c.pollfd{
+            .{ .fd = if (out_done) -1 else out_pipe[0], .events = std.c.POLL.IN, .revents = 0 },
+            .{ .fd = if (err_done) -1 else err_pipe[0], .events = std.c.POLL.IN, .revents = 0 },
+        };
+        const rc = std.c.poll(&pfds, 2, 100);
         if (rc < 0) {
-            _ = std.c.close(pipefd[0]);
+            _ = std.c.close(out_pipe[0]);
+            if (opts.want_stderr) _ = std.c.close(err_pipe[0]);
             return error.ReadError;
         }
         if (rc == 0) continue;
-        const n = std.c.read(pipefd[0], &buf, buf.len);
-        if (n <= 0) {
-            done = true;
-        } else {
-            const un: usize = @intCast(n);
-            try out.appendSlice(allocator, buf[0..un]);
-            if (out.items.len >= max_bytes) {
-                killGroupPosix(pid);
-                timed_out = true; // 用 timed_out 兼指"被截断 kill"
-                break;
-            }
+        if (!out_done and (pfds[0].revents & std.c.POLL.IN) != 0) {
+            const n = std.c.read(out_pipe[0], &buf, buf.len);
+            if (n <= 0) out_done = true else try out.appendSlice(allocator, buf[0..@intCast(n)]);
+        }
+        if (!err_done and (pfds[1].revents & std.c.POLL.IN) != 0) {
+            const n = std.c.read(err_pipe[0], &buf, buf.len);
+            if (n <= 0) err_done = true else try err.appendSlice(allocator, buf[0..@intCast(n)]);
+        }
+        if (out.items.len + err.items.len >= opts.max_bytes) {
+            killGroupPosix(pid);
+            timed_out = true;
+            break;
         }
     }
-    _ = std.c.close(pipefd[0]);
+    _ = std.c.close(out_pipe[0]);
+    if (opts.want_stderr) _ = std.c.close(err_pipe[0]);
 
     var status: c_int = 0;
     _ = std.c.waitpid(pid, &status, 0);
 
-    const owned = try out.toOwnedSlice(allocator);
-    return .{ .stdout = owned, .exit_code = posixExitCode(status), .timed_out = timed_out };
+    return .{
+        .stdout = try out.toOwnedSlice(allocator),
+        .stderr = try err.toOwnedSlice(allocator),
+        .exit_code = posixExitCode(status),
+        .timed_out = timed_out,
+    };
 }
 
 // ============================================================================
@@ -147,22 +209,18 @@ const win = std.os.windows;
 
 const HANDLE_FLAG_INHERIT: win.DWORD = 0x00000001;
 const INFINITE: win.DWORD = 0xFFFFFFFF;
-const WAIT_OBJECT_0: win.DWORD = 0;
 const WAIT_TIMEOUT_: win.DWORD = 0x00000102;
 
-extern "kernel32" fn CreatePipe(
-    hReadPipe: *win.HANDLE,
-    hWritePipe: *win.HANDLE,
-    lpPipeAttributes: ?*win.SECURITY_ATTRIBUTES,
-    nSize: win.DWORD,
-) callconv(.winapi) c_int;
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+extern "kernel32" fn CreatePipe(hReadPipe: *win.HANDLE, hWritePipe: *win.HANDLE, lpPipeAttributes: ?*win.SECURITY_ATTRIBUTES, nSize: win.DWORD) callconv(.winapi) c_int;
 extern "kernel32" fn SetHandleInformation(hObject: win.HANDLE, dwMask: win.DWORD, dwFlags: win.DWORD) callconv(.winapi) c_int;
 extern "kernel32" fn ReadFile(hFile: win.HANDLE, lpBuffer: [*]u8, nToRead: win.DWORD, lpRead: *win.DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) c_int;
 extern "kernel32" fn WaitForSingleObject(hHandle: win.HANDLE, dwMilliseconds: win.DWORD) callconv(.winapi) win.DWORD;
 extern "kernel32" fn GetExitCodeProcess(hProcess: win.HANDLE, lpExitCode: *win.DWORD) callconv(.winapi) c_int;
 extern "kernel32" fn TerminateProcess(hProcess: win.HANDLE, uExitCode: win.UINT) callconv(.winapi) c_int;
 
-/// reader 线程上下文：从 pipe 抽干到 list（避免 pipe 满死锁）。
+// 每个 reader 线程独占自己的 list（out_reader→out / err_reader→err），main 在 join 后才读，
+// 无跨线程并发访问同一 list → 无需锁。
 const WinReader = struct {
     handle: win.HANDLE,
     list: *std.ArrayList(u8),
@@ -175,7 +233,7 @@ const WinReader = struct {
         while (true) {
             var read_n: win.DWORD = 0;
             const ok = ReadFile(self.handle, &buf, buf.len, &read_n, null);
-            if (ok == 0 or read_n == 0) break; // EOF 或写端关闭(ERROR_BROKEN_PIPE)
+            if (ok == 0 or read_n == 0) break;
             self.list.appendSlice(self.allocator, buf[0..read_n]) catch {
                 self.oom = true;
                 break;
@@ -185,89 +243,126 @@ const WinReader = struct {
     }
 };
 
-fn captureStdoutWindows(
-    argv: []const ?[*:0]const u8,
-    allocator: std.mem.Allocator,
-    timeout_ms: u64,
-    max_bytes: usize,
-) CaptureError!CaptureResult {
-    // 1) stdout pipe（写端可继承，读端不可继承）
-    var sa = win.SECURITY_ATTRIBUTES{
-        .nLength = @sizeOf(win.SECURITY_ATTRIBUTES),
-        .lpSecurityDescriptor = null,
-        .bInheritHandle = @enumFromInt(1),
-    };
-    var rd: win.HANDLE = undefined;
-    var wr: win.HANDLE = undefined;
-    if (CreatePipe(&rd, &wr, &sa, 0) == 0) return error.PipeFailed;
-    if (SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0) == 0) {
-        win.CloseHandle(rd);
-        win.CloseHandle(wr);
+fn makeInheritablePipe(rd: *win.HANDLE, wr: *win.HANDLE) CaptureError!void {
+    var sa = win.SECURITY_ATTRIBUTES{ .nLength = @sizeOf(win.SECURITY_ATTRIBUTES), .lpSecurityDescriptor = null, .bInheritHandle = @enumFromInt(1) };
+    if (CreatePipe(rd, wr, &sa, 0) == 0) return error.PipeFailed;
+    if (SetHandleInformation(rd.*, HANDLE_FLAG_INHERIT, 0) == 0) {
+        win.CloseHandle(rd.*);
+        win.CloseHandle(wr.*);
         return error.PipeFailed;
     }
+}
 
-    // 2) 命令行 UTF-16（Windows 用单一 lpCommandLine，非 argv 数组）
+fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts: CaptureOpts) CaptureError!Captured {
+    var out_rd: win.HANDLE = undefined;
+    var out_wr: win.HANDLE = undefined;
+    try makeInheritablePipe(&out_rd, &out_wr);
+
+    // stderr:want_stderr 时独立 pipe;否则复用 stdout 写端（混入，首版简化）。
+    var err_rd: ?win.HANDLE = null;
+    var err_wr: win.HANDLE = out_wr;
+    if (opts.want_stderr) {
+        var rd: win.HANDLE = undefined;
+        var wr: win.HANDLE = undefined;
+        makeInheritablePipe(&rd, &wr) catch {
+            win.CloseHandle(out_rd);
+            win.CloseHandle(out_wr);
+            return error.PipeFailed;
+        };
+        err_rd = rd;
+        err_wr = wr;
+    }
+
     const cmdline = buildWindowsCmdline(allocator, argv) catch return error.SpawnFailed;
     defer allocator.free(cmdline);
 
     var si = std.mem.zeroes(win.STARTUPINFOW);
     si.cb = @sizeOf(win.STARTUPINFOW);
     si.dwFlags = win.STARTF_USESTDHANDLES;
-    si.hStdOutput = wr;
-    si.hStdError = wr; // stderr 也进同一 pipe（首版：stderr 不单独捕获，混入 stdout）
+    si.hStdOutput = out_wr;
+    si.hStdError = err_wr;
     si.hStdInput = null;
 
     var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
-
-    const created = win.kernel32.CreateProcessW(
-        null,
-        cmdline.ptr,
-        null,
-        null,
-        @enumFromInt(1), // bInheritHandles=TRUE
-        .{}, // CreateProcessFlags 默认
-        null,
-        null,
-        &si,
-        &pi,
-    );
-    win.CloseHandle(wr); // 父端关写端：reader 才能在子进程结束后收到 EOF
+    const created = win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{}, null, null, &si, &pi);
+    win.CloseHandle(out_wr);
+    if (opts.want_stderr) win.CloseHandle(err_wr);
     if (created == .FALSE) {
-        win.CloseHandle(rd);
+        win.CloseHandle(out_rd);
+        if (err_rd) |h| win.CloseHandle(h);
         return error.SpawnFailed;
     }
 
-    // 3) reader 线程抽干 stdout
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    var reader = WinReader{ .handle = rd, .list = &out, .allocator = allocator, .max_bytes = max_bytes };
-    const rthread = std.Thread.spawn(.{}, WinReader.run, .{&reader}) catch {
-        win.CloseHandle(rd);
+    var err = std.ArrayList(u8).empty;
+    errdefer err.deinit(allocator);
+
+    var out_reader = WinReader{ .handle = out_rd, .list = &out, .allocator = allocator, .max_bytes = opts.max_bytes };
+    const out_thread = std.Thread.spawn(.{}, WinReader.run, .{&out_reader}) catch {
+        win.CloseHandle(out_rd);
+        if (err_rd) |h| win.CloseHandle(h);
         win.CloseHandle(pi.hProcess);
         win.CloseHandle(pi.hThread);
         return error.SpawnFailed;
     };
-
-    // 4) 等进程（超时则 Terminate）
-    const wait_ms: win.DWORD = if (timeout_ms == 0) INFINITE else @intCast(@min(timeout_ms, @as(u64, INFINITE - 1)));
-    const w = WaitForSingleObject(pi.hProcess, wait_ms);
-    var timed_out = false;
-    if (w == WAIT_TIMEOUT_) {
-        _ = TerminateProcess(pi.hProcess, 1);
-        timed_out = true;
+    var err_reader: WinReader = undefined;
+    var err_thread: ?std.Thread = null;
+    if (err_rd) |h| {
+        err_reader = WinReader{ .handle = h, .list = &err, .allocator = allocator, .max_bytes = opts.max_bytes };
+        err_thread = std.Thread.spawn(.{}, WinReader.run, .{&err_reader}) catch null;
     }
 
-    rthread.join(); // reader 在写端全关后收 EOF 退出
-    win.CloseHandle(rd);
+    // 分片轮询等进程：每 100ms 查 abort/timeout/tick。
+    const start = nowMs();
+    var last_tick = start;
+    var timed_out = false;
+    var aborted = false;
+    const label = labelOf(argv);
+    while (true) {
+        const w = WaitForSingleObject(pi.hProcess, 100);
+        if (w != WAIT_TIMEOUT_) break; // 进程已退出
+        if (opts.abort_poll) |poll| if (poll(opts.abort_ctx)) {
+            _ = TerminateProcess(pi.hProcess, 1);
+            aborted = true;
+            break;
+        };
+        const elapsed = nowMs() - start;
+        if (opts.timeout_ms > 0 and elapsed >= @as(i64, @intCast(opts.timeout_ms))) {
+            _ = TerminateProcess(pi.hProcess, 1);
+            timed_out = true;
+            break;
+        }
+        if (opts.tick_cb) |cb| {
+            if (nowMs() - last_tick >= 2000) {
+                cb(opts.tick_ctx, @intCast(elapsed), label);
+                last_tick = nowMs();
+            }
+        }
+    }
+
+    out_thread.join();
+    if (err_thread) |t| t.join();
+    win.CloseHandle(out_rd);
+    if (err_rd) |h| win.CloseHandle(h);
 
     var code: win.DWORD = 0;
     _ = GetExitCodeProcess(pi.hProcess, &code);
     win.CloseHandle(pi.hProcess);
     win.CloseHandle(pi.hThread);
 
-    if (reader.oom) return error.OutOfMemory;
-    const owned = try out.toOwnedSlice(allocator);
-    return .{ .stdout = owned, .exit_code = @bitCast(code), .timed_out = timed_out };
+    if (out_reader.oom) return error.OutOfMemory;
+    if (aborted) {
+        out.deinit(allocator);
+        err.deinit(allocator);
+        return error.Aborted;
+    }
+    return .{
+        .stdout = try out.toOwnedSlice(allocator),
+        .stderr = try err.toOwnedSlice(allocator),
+        .exit_code = @bitCast(code),
+        .timed_out = timed_out,
+    };
 }
 
 /// argv(UTF-8 C 串) → Windows 命令行 UTF-16(带标准 quoting)。
@@ -277,15 +372,13 @@ fn buildWindowsCmdline(allocator: std.mem.Allocator, argv: []const ?[*:0]const u
     var first = true;
     for (argv) |a_opt| {
         const a = a_opt orelse break;
-        const arg = std.mem.span(a);
         if (!first) try u8buf.append(allocator, ' ');
         first = false;
-        try appendQuotedArg(allocator, &u8buf, arg);
+        try appendQuotedArg(allocator, &u8buf, std.mem.span(a));
     }
     return try std.unicode.utf8ToUtf16LeAllocZ(allocator, u8buf.items);
 }
 
-/// Windows 命令行参数 quoting（CommandLineToArgvW 的逆）：含空格/tab/引号则加双引号并转义。
 fn appendQuotedArg(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), arg: []const u8) !void {
     const needs_quote = arg.len == 0 or std.mem.indexOfAny(u8, arg, " \t\n\x0b\"") != null;
     if (!needs_quote) {
@@ -312,31 +405,35 @@ fn appendQuotedArg(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), arg: [
 }
 
 // ============================================================================
-// Tests（POSIX + Windows CI 真跑：spawn 命令、验捕获输出与 exit code）
+// Tests
 // ============================================================================
 
-test "captureStdout spawn echo 捕获输出" {
+test "capture stdout+stderr 分别捕获" {
     const a = std.testing.allocator;
     const argv: []const ?[*:0]const u8 = if (is_windows)
-        &.{ "cmd.exe", "/c", "echo hello-platform", null }
+        &.{ "cmd.exe", "/c", "echo out-line & echo err-line 1>&2", null }
     else
-        &.{ "/bin/sh", "-c", "echo hello-platform", null };
-    const r = try captureStdout(argv, a, 10_000, 1 << 20);
+        &.{ "/bin/sh", "-c", "echo out-line; echo err-line 1>&2", null };
+    const r = try capture(argv, a, .{ .timeout_ms = 10_000 });
     defer a.free(r.stdout);
-    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "hello-platform") != null);
+    defer a.free(r.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "out-line") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.stderr, "err-line") != null);
     try std.testing.expectEqual(@as(i32, 0), r.exit_code);
-    try std.testing.expect(!r.timed_out);
 }
 
-test "captureStdout 非零 exit code" {
+test "captureStdout 便捷+非零 exit" {
     const a = std.testing.allocator;
     const argv: []const ?[*:0]const u8 = if (is_windows)
-        &.{ "cmd.exe", "/c", "exit 3", null }
+        &.{ "cmd.exe", "/c", "echo hi & exit 3", null }
     else
-        &.{ "/bin/sh", "-c", "exit 3", null };
+        &.{ "/bin/sh", "-c", "echo hi; exit 3", null };
     const r = try captureStdout(argv, a, 10_000, 1 << 20);
     defer a.free(r.stdout);
+    defer a.free(r.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "hi") != null);
     try std.testing.expectEqual(@as(i32, 3), r.exit_code);
+    try std.testing.expectEqual(@as(usize, 0), r.stderr.len); // want_stderr=false
 }
 
 test "buildWindowsCmdline quoting" {
@@ -346,6 +443,5 @@ test "buildWindowsCmdline quoting" {
     defer a.free(w);
     const u8out = try std.unicode.utf16LeToUtf8Alloc(a, w);
     defer a.free(u8out);
-    // prog "a b" "c\"d"
     try std.testing.expectEqualStrings("prog \"a b\" \"c\\\"d\"", u8out);
 }
