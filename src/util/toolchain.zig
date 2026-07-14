@@ -1,61 +1,83 @@
 //! 外部工具链路径解析。
 //!
-//! 目前职责：找可用的 ripgrep 二进制（rg）。
+//! 目前职责：找可用的 ripgrep 二进制（rg / rg.exe）。
 //! 查找顺序：
 //!   1. 环境变量 RG_BIN（用户手动指定）
-//!   2. $PATH（PATH 第一个命中的 rg 真实路径——用 execlp 风格的 execvp 可以绕过，但我们
-//!      用 access 探测）
-//!   3. 几个常见路径的 fallback（vendored / apt / cargo / snap vscode）
+//!   2. $PATH 逐目录探测（POSIX ':' / Windows ';' 分隔;文件名 rg / rg.exe）
+//!   3. 几个常见路径的 fallback（vendored / apt / cargo / vscode / Windows 常见安装位）
 //!
-//! 未命中返回 error.RipgrepNotFound。
+//! 未命中返回 error.RipgrepNotFound。结果缓存(进程内不变;并发 Grep 线程安全)。
 
 const std = @import("std");
+const builtin = @import("builtin");
+const is_windows = builtin.os.tag == .windows;
+const pfs = @import("platform").fs;
 
-const FALLBACK_PATHS = [_][:0]const u8{
-    // vendored（将来）
+const RG_NAME = if (is_windows) "rg.exe" else "rg";
+
+const FALLBACK_PATHS = if (is_windows) [_][:0]const u8{
+    ".\\vendor\\ripgrep\\rg.exe",
+    "vendor\\ripgrep\\rg.exe",
+    // scoop / choco / winget 常见位(用户目录展开在 PATH 搜索兜住,这里放系统级)
+    "C:\\ProgramData\\chocolatey\\bin\\rg.exe",
+} else [_][:0]const u8{
     "./vendor/ripgrep/rg",
-    // apt 系统包
     "/usr/bin/rg",
     "/usr/local/bin/rg",
-    // homebrew
     "/opt/homebrew/bin/rg",
-    // cargo
     "/root/.cargo/bin/rg",
-    // vscode 内嵌
     "/usr/share/kiro/resources/app/node_modules/@vscode/ripgrep/bin/rg",
 };
 
-/// 返回一个可执行的 rg 路径。优先 RG_BIN，其次系统 PATH，其次 fallback。
-/// 返回值生命周期：静态字符串（无需释放）。
+// 缓存:rg 路径进程内不变。PATH 搜索命中的路径存这里(静态生命周期)。并发 Grep 用 atomic 守卫。
+var cache_done = std.atomic.Value(bool).init(false);
+var cached_path: [:0]const u8 = "";
+var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+/// 返回一个可执行的 rg 路径。优先 RG_BIN，其次 PATH，其次 fallback。返回值静态生命周期。
 pub fn ripgrepPath() error{RipgrepNotFound}![:0]const u8 {
-    // 先看环境变量（直接 libc getenv 避免 Zig 0.17 std.process.environ_map 的不稳定 API）
-    if (std.c.getenv("RG_BIN")) |env_c| {
-        const env = std.mem.span(env_c);
-        if (existsExecutable(env)) {
-            return env;
-        }
+    if (cache_done.load(.acquire)) {
+        if (cached_path.len == 0) return error.RipgrepNotFound;
+        return cached_path;
     }
-
-    // fallback 列表
-    for (FALLBACK_PATHS) |p| {
-        if (existsExecutable(p)) return p;
-    }
-
-    return error.RipgrepNotFound;
+    const result = resolve();
+    cached_path = result orelse "";
+    cache_done.store(true, .release);
+    return result orelse error.RipgrepNotFound;
 }
 
-fn existsExecutable(path: []const u8) bool {
-    // access(path, X_OK)
-    const X_OK: c_int = 1;
-    if (path.len == 0) return false;
-    // 需要 z-string；已知 FALLBACK_PATHS 是 [:0]；getenv 返回值也是 sentinel-terminated
-    // 构造一个临时 null-terminated 缓冲以防万一
-    var buf: [std.posix.PATH_MAX]u8 = undefined;
-    if (path.len >= buf.len) return false;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-    const z: [*:0]u8 = @ptrCast(&buf);
-    return std.c.access(z, X_OK) == 0;
+fn resolve() ?[:0]const u8 {
+    // 1. RG_BIN
+    if (std.c.getenv("RG_BIN")) |env_c| {
+        if (pfs.exists(env_c)) return std.mem.span(env_c);
+    }
+    // 2. PATH 逐目录探测
+    if (searchPath()) |p| return p;
+    // 3. fallback
+    for (FALLBACK_PATHS) |p| {
+        if (pfs.exists(p.ptr)) return p;
+    }
+    return null;
+}
+
+/// PATH 逐目录拼 <dir><sep>rg[.exe],存在即返回(写进 path_buf,静态)。
+fn searchPath() ?[:0]const u8 {
+    const path_env = std.c.getenv("PATH") orelse return null;
+    const path = std.mem.span(path_env);
+    const list_sep: u8 = if (is_windows) ';' else ':';
+    const dir_sep: u8 = if (is_windows) '\\' else '/';
+    var it = std.mem.splitScalar(u8, path, list_sep);
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        const need = dir.len + 1 + RG_NAME.len;
+        if (need + 1 > path_buf.len) continue;
+        @memcpy(path_buf[0..dir.len], dir);
+        path_buf[dir.len] = dir_sep;
+        @memcpy(path_buf[dir.len + 1 ..][0..RG_NAME.len], RG_NAME);
+        path_buf[need] = 0;
+        if (pfs.exists(@ptrCast(&path_buf))) return path_buf[0..need :0];
+    }
+    return null;
 }
 
 test "ripgrepPath finds some rg or returns NotFound" {
