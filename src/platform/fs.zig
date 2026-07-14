@@ -84,11 +84,15 @@ fn windowsOflag(flags: WindowsO) c_int {
 
 /// 打开文件，返回 fd（失败返 -1，errno 语义同各平台 CRT）。mode 为 CREAT 时的权限位。
 pub fn open(path: [*:0]const u8, flags: O, mode: c_uint) c_int {
+    // 显式 if/else(非 if-return 落穿):后者在 refAllDecls(zig test)下 POSIX 分支仍被分析,
+    // 而 std.c.open 的 `oflag: O` 在 windows 是 void(std.c.O=void)→ winapi void-param 报错。
+    // else 块保证该分支 comptime 死、不被分析(nowMs 同款,已验证)。
     if (is_windows) {
         // MSVCRT _open：第三变参是 pmode（_S_IREAD/_S_IWRITE），仅 CREAT 时生效。
         return _open(path, windowsOflag(flags), @as(c_int, @intCast(mode & 0o777)));
+    } else {
+        return std.c.open(path, flags, mode);
     }
-    return std.c.open(path, flags, mode);
 }
 
 /// `open` 的 error-union 包装:收编全仓 `std.posix.openat(AT.FDCWD, …) catch/try` 样板
