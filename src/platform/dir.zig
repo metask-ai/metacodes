@@ -65,7 +65,10 @@ const WindowsIter = struct {
     handle: win.HANDLE,
     find_data: WIN32_FIND_DATAW,
     pending_first: bool, // FindFirstFile 已拿到首项,首次 next 直接用它
-    name_buf: [520]u8, // 260 UTF-16 → 最多 780 UTF-8;520 够绝大多数(截断也不越界)
+    // cFileName 最多 259 UTF-16 code unit;U+0800–U+FFFF(全 CJK/多数非拉丁)每个编 3 UTF-8
+    // 字节 → 最坏 259×3=777。**必须 ≥777**:utf16LeToUtf8 不对输出做边界检查(0.16 源码实证),
+    // 缓冲不够会写越界 panic/堆损坏。260×3=780 覆盖最坏 + 有余量。
+    name_buf: [260 * 3]u8,
 
     fn next(self: *WindowsIter) ?Entry {
         // 循环而非递归:UTF-16 解码失败(极罕见的坏文件名)跳过该项继续,避免病态目录下
@@ -94,8 +97,11 @@ pub fn open(path_z: [*:0]const u8) ?Iter {
         // 路径补 `\*` 通配。UTF-8 → UTF-16。
         var wbuf: [win.PATH_MAX_WIDE + 4]u16 = undefined;
         const path_u8 = std.mem.span(path_z);
-        const wlen = std.unicode.utf8ToUtf16Le(&wbuf, path_u8) catch return null;
+        var wlen = std.unicode.utf8ToUtf16Le(&wbuf, path_u8) catch return null;
         if (wlen + 3 >= wbuf.len) return null;
+        // 去尾部分隔符(drive root "C:\" / 带斜杠目录)→ 否则 "C:\\*" 双分隔符,FindFirstFile
+        // 未必规范化。去后统一补 "\*"。
+        while (wlen > 0 and (wbuf[wlen - 1] == '\\' or wbuf[wlen - 1] == '/')) wlen -= 1;
         wbuf[wlen] = '\\';
         wbuf[wlen + 1] = '*';
         wbuf[wlen + 2] = 0;

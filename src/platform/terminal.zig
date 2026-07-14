@@ -15,7 +15,7 @@ const is_windows = builtin.os.tag == .windows;
 const win = std.os.windows;
 
 /// raw 模式前的原始状态（restoreMode 复原用）。POSIX=termios；Windows=进/出 console mode 对。
-pub const SavedMode = if (is_windows) struct { in_mode: win.DWORD, out_mode: win.DWORD } else std.c.termios;
+pub const SavedMode = if (is_windows) struct { in_mode: win.DWORD, out_mode: win.DWORD, out_valid: bool = false } else std.c.termios;
 
 // ── Windows console API（std 仅绑 ENABLE_VIRTUAL_TERMINAL_PROCESSING，其余自 extern）──────
 const STD_INPUT_HANDLE: win.DWORD = @bitCast(@as(i32, -10));
@@ -102,15 +102,15 @@ pub fn enterRaw(fd: c_int) ?SavedMode {
         var in_mode: win.DWORD = 0;
         var out_mode: win.DWORD = 0;
         if (GetConsoleMode(hin, &in_mode) == 0) return null;
-        _ = GetConsoleMode(hout, &out_mode); // 输出模式取不到也继续（尽力开 VT）
+        const out_valid = GetConsoleMode(hout, &out_mode) != 0; // 取不到也继续开 VT,但**别复原**它
         // 输入：关行输入/回显/processed，开 VT 输入（ANSI 键序）。
         var new_in = in_mode;
         new_in &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
         new_in |= ENABLE_VIRTUAL_TERMINAL_INPUT;
         if (SetConsoleMode(hin, new_in) == 0) return null;
-        // 输出：开 VT processing（使既有 ANSI 渲染层生效）。
-        _ = SetConsoleMode(hout, out_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
-        return .{ .in_mode = in_mode, .out_mode = out_mode };
+        // 输出：开 VT processing（使既有 ANSI 渲染层生效）。仅在原模式取到时才动/复原。
+        if (out_valid) _ = SetConsoleMode(hout, out_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        return .{ .in_mode = in_mode, .out_mode = out_mode, .out_valid = out_valid };
     }
     var orig: std.c.termios = undefined;
     if (std.c.tcgetattr(fd, &orig) != 0) return null;
@@ -134,7 +134,9 @@ pub fn enterRaw(fd: c_int) ?SavedMode {
 pub fn restoreMode(fd: c_int, saved: SavedMode) void {
     if (is_windows) {
         _ = SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), saved.in_mode);
-        _ = SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), saved.out_mode);
+        // 仅当原输出模式成功取到才复原——否则 out_mode=0 的 SetConsoleMode 会清掉 VT processing
+        // 等本来开着的输出标志(把终端弄哑)。
+        if (saved.out_valid) _ = SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), saved.out_mode);
     } else {
         _ = std.c.tcsetattr(fd, std.posix.TCSA.FLUSH, &saved);
     }
@@ -146,8 +148,8 @@ pub fn saveMode(fd: c_int) ?SavedMode {
         var in_mode: win.DWORD = 0;
         var out_mode: win.DWORD = 0;
         if (GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &in_mode) == 0) return null;
-        _ = GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &out_mode);
-        return .{ .in_mode = in_mode, .out_mode = out_mode };
+        const out_valid = GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &out_mode) != 0;
+        return .{ .in_mode = in_mode, .out_mode = out_mode, .out_valid = out_valid };
     }
     var orig: std.c.termios = undefined;
     if (std.c.tcgetattr(fd, &orig) != 0) return null;

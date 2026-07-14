@@ -60,6 +60,7 @@ extern "c" fn _read(fd: c_int, buf: [*]u8, count: c_uint) c_int;
 extern "c" fn _write(fd: c_int, buf: [*]const u8, count: c_uint) c_int;
 extern "c" fn _close(fd: c_int) c_int;
 extern "c" fn _lseek(fd: c_int, offset: c_long, origin: c_int) c_long;
+extern "c" fn _lseeki64(fd: c_int, offset: i64, origin: c_int) i64; // Win64:64 位 offset(_lseek 仅 32 位)
 extern "c" fn _commit(fd: c_int) c_int; // MSVCRT:等价 fsync(刷到磁盘)
 extern "c" fn _fullpath(absPath: ?[*]u8, relPath: [*:0]const u8, maxLength: usize) ?[*:0]u8; // MSVCRT:规范化路径
 
@@ -164,7 +165,10 @@ pub const Whence = enum(c_int) { set = 0, cur = 1, end = 2 };
 /// 定位，返回新偏移（<0=错误）。
 pub fn lseek(fd: c_int, offset: i64, whence: Whence) i64 {
     if (is_windows) {
-        return _lseek(fd, @intCast(offset), @intFromEnum(whence));
+        // **_lseeki64 非 _lseek**:Win64 LLP64 下 `long` 是 32 位,_lseek 的 offset/返回值截到
+        // ±2GB → 大后台 job 输出(>2GB)seek 到末尾时 @intCast(i64→i32) panic + total 静默截断。
+        // _lseeki64 offset/返回是 __int64,无此限。
+        return _lseeki64(fd, offset, @intFromEnum(whence));
     }
     return std.c.lseek(fd, @intCast(offset), @intFromEnum(whence));
 }

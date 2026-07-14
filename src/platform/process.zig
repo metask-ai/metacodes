@@ -347,7 +347,10 @@ pub const ReapStatus = union(enum) { running, exited: i32 };
 /// 非阻塞查子进程是否退出。POSIX=waitpid(WNOHANG)；Windows=WaitForSingleObject(0)+GetExitCodeProcess。
 pub fn reapNonblock(h: ProcHandle) ReapStatus {
     if (is_windows) {
-        if (WaitForSingleObject(h, 0) != 0) return .running; // WAIT_OBJECT_0=0
+        // 只有 WAIT_TIMEOUT(0x102)=仍运行;WAIT_OBJECT_0(0)=已退;WAIT_FAILED(0xFFFFFFFF)/
+        // WAIT_ABANDONED 等=异常,当已退处理(否则失败的 wait 让死 job 永远"运行中"卡看板)。
+        const w = WaitForSingleObject(h, 0);
+        if (w == WAIT_TIMEOUT_) return .running;
         var code: win.DWORD = 0;
         _ = GetExitCodeProcess(h, &code);
         return .{ .exited = @bitCast(code) };
@@ -585,6 +588,7 @@ const WAIT_TIMEOUT_: win.DWORD = 0x00000102;
 
 extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
 extern "kernel32" fn CreatePipe(hReadPipe: *win.HANDLE, hWritePipe: *win.HANDLE, lpPipeAttributes: ?*win.SECURITY_ATTRIBUTES, nSize: win.DWORD) callconv(.winapi) c_int;
+extern "kernel32" fn CreateFileW(lpFileName: [*:0]const u16, dwDesiredAccess: win.DWORD, dwShareMode: win.DWORD, lpSecurityAttributes: ?*win.SECURITY_ATTRIBUTES, dwCreationDisposition: win.DWORD, dwFlagsAndAttributes: win.DWORD, hTemplateFile: ?win.HANDLE) callconv(.winapi) win.HANDLE;
 extern "kernel32" fn SetHandleInformation(hObject: win.HANDLE, dwMask: win.DWORD, dwFlags: win.DWORD) callconv(.winapi) c_int;
 extern "kernel32" fn ReadFile(hFile: win.HANDLE, lpBuffer: [*]u8, nToRead: win.DWORD, lpRead: *win.DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) c_int;
 extern "kernel32" fn WriteFile(hFile: win.HANDLE, lpBuffer: [*]const u8, nToWrite: win.DWORD, lpWritten: *win.DWORD, lpOverlapped: ?*anyopaque) callconv(.winapi) c_int;
@@ -602,6 +606,10 @@ const WinReader = struct {
     allocator: std.mem.Allocator,
     max_bytes: usize,
     oom: bool = false,
+    /// 读满 max_bytes 时置真,让主循环 TerminateProcess——否则子进程继续写、pipe 满、子阻塞
+    /// 在 write,reader 已退,主循环 WaitForSingleObject 无限空转(无 timeout 时永挂)。对齐
+    /// POSIX 的 cap-kill 语义(cap 命中=Ok 返部分,非 Timeout)。
+    capped: *std.atomic.Value(bool),
 
     fn run(self: *WinReader) void {
         var buf: [4096]u8 = undefined;
@@ -613,7 +621,10 @@ const WinReader = struct {
                 self.oom = true;
                 break;
             };
-            if (self.list.items.len >= self.max_bytes) break;
+            if (self.list.items.len >= self.max_bytes) {
+                self.capped.store(true, .release);
+                break;
+            }
         }
     }
 };
@@ -628,14 +639,29 @@ fn makeInheritablePipe(rd: *win.HANDLE, wr: *win.HANDLE) CaptureError!void {
     }
 }
 
+/// 打开 NUL 设备的可继承写句柄(丢弃 stderr 用,等价 POSIX /dev/null)。
+fn openNulWrite() CaptureError!win.HANDLE {
+    const GENERIC_WRITE: win.DWORD = 0x4000_0000;
+    const FILE_SHARE_RW: win.DWORD = 0x1 | 0x2;
+    const OPEN_EXISTING: win.DWORD = 3;
+    var sa = win.SECURITY_ATTRIBUTES{ .nLength = @sizeOf(win.SECURITY_ATTRIBUTES), .lpSecurityDescriptor = null, .bInheritHandle = @enumFromInt(1) };
+    const nul_w = std.unicode.utf8ToUtf16LeStringLiteral("NUL");
+    const h = CreateFileW(nul_w, GENERIC_WRITE, FILE_SHARE_RW, &sa, OPEN_EXISTING, 0, null);
+    if (h == win.INVALID_HANDLE_VALUE) return error.PipeFailed;
+    return h;
+}
+
 fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts: CaptureOpts) CaptureError!Captured {
     var out_rd: win.HANDLE = undefined;
     var out_wr: win.HANDLE = undefined;
     try makeInheritablePipe(&out_rd, &out_wr);
 
-    // stderr:want_stderr 时独立 pipe;否则复用 stdout 写端（混入，首版简化）。
+    // stderr:want_stderr 时独立 pipe 收集;否则送 NUL 设备**丢弃**(而非复用 stdout 写端——
+    // 那会把 stderr 混进 stdout,污染 captureStdout 家族解析的命令输出,且违反 want_stderr=false
+    // 契约。对齐 POSIX 的 dup2(child_stderr, /dev/null))。
     var err_rd: ?win.HANDLE = null;
-    var err_wr: win.HANDLE = out_wr;
+    var err_wr: win.HANDLE = undefined;
+    var err_is_nul = false;
     if (opts.want_stderr) {
         var rd: win.HANDLE = undefined;
         var wr: win.HANDLE = undefined;
@@ -646,6 +672,13 @@ fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, op
         };
         err_rd = rd;
         err_wr = wr;
+    } else {
+        err_wr = openNulWrite() catch {
+            win.CloseHandle(out_rd);
+            win.CloseHandle(out_wr);
+            return error.PipeFailed;
+        };
+        err_is_nul = true;
     }
 
     // stdin pipe（若需喂入）：read 端可继承（子读），write 端不可继承（父写）——与 stdout 反。
@@ -659,7 +692,7 @@ fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, op
             win.CloseHandle(out_rd);
             win.CloseHandle(out_wr);
             if (err_rd) |h| win.CloseHandle(h);
-            if (opts.want_stderr) win.CloseHandle(err_wr);
+            win.CloseHandle(err_wr); // err_wr 恒有效(pipe wr 或 NUL),父端副本总要关
             return error.PipeFailed;
         }
         in_rd = rd;
@@ -693,7 +726,7 @@ fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, op
         }
         win.CloseHandle(in_wr);
     }
-    if (opts.want_stderr) win.CloseHandle(err_wr);
+    win.CloseHandle(err_wr); // err_wr 恒有效(pipe wr 或 NUL),父端副本总要关
     if (created == .FALSE) {
         win.CloseHandle(out_rd);
         if (err_rd) |h| win.CloseHandle(h);
@@ -705,7 +738,8 @@ fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, op
     var err = std.ArrayList(u8).empty;
     errdefer err.deinit(allocator);
 
-    var out_reader = WinReader{ .handle = out_rd, .list = &out, .allocator = allocator, .max_bytes = opts.max_bytes };
+    var capped = std.atomic.Value(bool).init(false);
+    var out_reader = WinReader{ .handle = out_rd, .list = &out, .allocator = allocator, .max_bytes = opts.max_bytes, .capped = &capped };
     const out_thread = std.Thread.spawn(.{}, WinReader.run, .{&out_reader}) catch {
         win.CloseHandle(out_rd);
         if (err_rd) |h| win.CloseHandle(h);
@@ -716,7 +750,7 @@ fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, op
     var err_reader: WinReader = undefined;
     var err_thread: ?std.Thread = null;
     if (err_rd) |h| {
-        err_reader = WinReader{ .handle = h, .list = &err, .allocator = allocator, .max_bytes = opts.max_bytes };
+        err_reader = WinReader{ .handle = h, .list = &err, .allocator = allocator, .max_bytes = opts.max_bytes, .capped = &capped };
         err_thread = std.Thread.spawn(.{}, WinReader.run, .{&err_reader}) catch null;
     }
 
@@ -729,6 +763,12 @@ fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, op
     while (true) {
         const w = WaitForSingleObject(pi.hProcess, 100);
         if (w != WAIT_TIMEOUT_) break; // 进程已退出
+        // reader 读满 max_bytes → kill 子进程(否则它继续写、pipe 满、阻塞在 write,主循环
+        // 无 timeout 时永挂)。cap 命中=Ok 返部分(非 aborted/timed_out),对齐 POSIX。
+        if (capped.load(.acquire)) {
+            _ = TerminateProcess(pi.hProcess, 1);
+            break;
+        }
         if (opts.abort_poll) |poll| if (poll(opts.abort_ctx)) {
             _ = TerminateProcess(pi.hProcess, 1);
             aborted = true;

@@ -95,10 +95,15 @@ fn newTcp() Error!Socket {
     return s;
 }
 
+// Windows 的 SO_REUSEADDR 语义 ≠ POSIX:它允许**别的进程**重绑同一 loopback 端口(本机劫持
+// 面——恶意进程抢 auth 回调/--web 端口)。Windows 正解是 SO_EXCLUSIVEADDRUSE(独占,防抢),
+// 值 = ~SO_REUSEADDR = ~4 = -5。POSIX 仍用 SO_REUSEADDR(仅 TIME_WAIT 快速重绑,无劫持语义)。
+const SO_EXCLUSIVEADDRUSE: i32 = ~@as(i32, 4);
+
 fn setReuseAddr(s: Socket) void {
     const yes: c_int = 1;
     if (is_windows) {
-        _ = sys.setsockopt(s, ws2.SOL.SOCKET, ws2.SO.REUSEADDR, @ptrCast(&yes), @sizeOf(c_int));
+        _ = sys.setsockopt(s, ws2.SOL.SOCKET, SO_EXCLUSIVEADDRUSE, @ptrCast(&yes), @sizeOf(c_int));
     } else {
         _ = std.c.setsockopt(s, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, &yes, @sizeOf(c_int));
     }
