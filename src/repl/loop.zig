@@ -509,8 +509,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         try history.append(final_input);
         // 粘贴占位符 [Pasted text #N] → 展开成真实内容再喂给模型；history 保留紧凑占位符。
         const expanded = blk: {
-            const home_c = std.c.getenv("HOME") orelse break :blk null;
-            break :blk paste_mod.expandPlaceholders(allocator, std.mem.span(home_c), final_input) catch null;
+            const home_c = @import("platform").paths.homeDir() orelse break :blk null;
+            break :blk paste_mod.expandPlaceholders(allocator, home_c, final_input) catch null;
         };
         defer if (expanded) |e| allocator.free(e);
         try app.conversation.appendText(.user, expanded orelse final_input);
@@ -829,9 +829,8 @@ fn handlePaste(
     if (text.len == 0) return;
 
     if (paste_mod.isLarge(text)) {
-        const home_c = std.c.getenv("HOME");
-        if (home_c) |hc| {
-            const home = std.mem.span(hc);
+        const home_c = @import("platform").paths.homeDir();
+        if (home_c) |home| {
             g_paste_id += 1;
             if (paste_mod.store(allocator, home, g_paste_id, text) catch null) |placeholder| {
                 defer allocator.free(placeholder);
@@ -1935,9 +1934,9 @@ fn handleDoctor(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     std.debug.print("  rules loaded:     {d}\n", .{if (app.rule_set) |r| r.rules.items.len else 0});
 
     // HOME + CWD + config file 检查
-    const home_c = std.c.getenv("HOME");
+    const home_c = @import("platform").paths.homeDir();
     if (home_c) |h| {
-        std.debug.print("  HOME:             {s}\n", .{std.mem.span(h)});
+        std.debug.print("  HOME:             {s}\n", .{h});
     } else {
         std.debug.print("  HOME:             UNSET\n", .{});
     }
@@ -1961,11 +1960,10 @@ fn injectCompactStressHistory(app: *app_mod.App, allocator: std.mem.Allocator) !
 }
 
 fn handleConfigCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
-    const home_c = std.c.getenv("HOME") orelse {
+    const home = @import("platform").paths.homeDir() orelse {
         std.debug.print("HOME not set\n", .{});
         return;
     };
-    const home = std.mem.span(home_c);
     const cfg_path = try std.fmt.allocPrint(allocator, "{s}/.metacodes/config.json", .{home});
     defer allocator.free(cfg_path);
 
@@ -3029,9 +3027,8 @@ fn handleTheme(app: *app_mod.App, rest: []const u8) void {
 
     // 持久化到 ~/.metacodes/config.json
     const tui_config = @import("tui/config.zig");
-    const home = std.c.getenv("HOME");
-    if (home) |h| {
-        const home_slice = std.mem.span(h);
+    const home = @import("platform").paths.homeDir();
+    if (home) |home_slice| {
         // 临时 arena 给 saveTheme 用
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
@@ -3518,11 +3515,10 @@ fn runInjectedAgentWithSynthetic(app: *app_mod.App, allocator: std.mem.Allocator
 
 /// /resume：rest == "" 时列出最近 session；rest 是 session id 时加载。
 fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
-    const home_c = std.c.getenv("HOME") orelse {
+    const home = @import("platform").paths.homeDir() orelse {
         std.debug.print("no HOME env set\n", .{});
         return;
     };
-    const home = std.mem.span(home_c);
 
     const cwd = util_fs.getCwd(allocator) catch {
         std.debug.print("getcwd failed\n", .{});
