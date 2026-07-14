@@ -411,24 +411,24 @@ test "spawnCaptureStdoutCapped 截断无限输出且不挂死" {
 test "readAllFromFdCapped:超 cap 返 FileTooLarge、cap 内正常读(轴A 统一入口)" {
     const a = std.testing.allocator;
     const path = "/tmp/cc-readcapped-test.txt";
-    const fd_w = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd_w = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     try std.testing.expect(fd_w >= 0);
     var payload: [10000]u8 = undefined;
     @memset(&payload, 'z');
-    _ = std.c.write(fd_w, &payload, payload.len); // 10KB
-    _ = std.c.close(fd_w);
+    _ = pfs.write(fd_w, &payload); // 10KB
+    _ = pfs.close(fd_w);
     defer _ = std.c.unlink(path);
 
     // cap=5KB < 10KB → FileTooLarge。
     {
         const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch unreachable;
-        defer _ = std.c.close(fd);
+        defer pfs.close(fd);
         try std.testing.expectError(error.FileTooLarge, readAllFromFdCapped(fd, a, 5 * 1024));
     }
     // cap=1MB > 10KB → 正常读全。
     {
         const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch unreachable;
-        defer _ = std.c.close(fd);
+        defer pfs.close(fd);
         const r = try readAllFromFdCapped(fd, a, 1024 * 1024);
         defer a.free(r);
         try std.testing.expectEqual(@as(usize, 10000), r.len);
@@ -436,7 +436,7 @@ test "readAllFromFdCapped:超 cap 返 FileTooLarge、cap 内正常读(轴A 统�
     // cap=0 → 不限,读全。
     {
         const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch unreachable;
-        defer _ = std.c.close(fd);
+        defer pfs.close(fd);
         const r = try readAllFromFdCapped(fd, a, 0);
         defer a.free(r);
         try std.testing.expectEqual(@as(usize, 10000), r.len);
