@@ -18,13 +18,12 @@
 //!   </system-reminder>
 
 const std = @import("std");
+const ppaths = @import("platform").paths;
 const pfs = @import("platform").fs;
 const claudemd = @import("claudemd.zig");
 const time = @import("../../util/time.zig");
 
 // libc env(0.16 std.c 无 setenv/unsetenv 包装;项目范式见 prompt_override.zig)。
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 /// env 关闭开关(对齐 cc CLAUDE_CODE_DISABLE_CLAUDE_MDS / --bare)。
 pub fn isDisabled() bool {
@@ -225,8 +224,8 @@ test "build: disabled via env CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 returns null" {
     const dir = try tmpAbsPath(a, &tmp);
     defer a.free(dir);
 
-    _ = setenv("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1", 1);
-    defer _ = unsetenv("CLAUDE_CODE_DISABLE_CLAUDE_MDS");
+    _ = ppaths.setEnv("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1");
+    defer _ = ppaths.unsetEnv("CLAUDE_CODE_DISABLE_CLAUDE_MDS");
     try testing.expect(isDisabled());
 
     // 即便项目根有 CLAUDE.md(向上递归会命中),disabled 也必须返回 null。
@@ -240,7 +239,7 @@ test "build: disabled via env CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 returns null" {
 test "build: enabled (env unset) with content returns non-null" {
     const a = testing.allocator;
     // disabled 测试的对偶:确保未 set env 时正常构建(防 isDisabled 误判恒真)。
-    _ = unsetenv("CLAUDE_CODE_DISABLE_CLAUDE_MDS");
+    _ = ppaths.unsetEnv("CLAUDE_CODE_DISABLE_CLAUDE_MDS");
     try testing.expect(!isDisabled());
     const out = try build(a, .{ .cwd = "", .home = "", .auto_mem = "MEMINDEX" });
     try testing.expect(out != null);

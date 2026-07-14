@@ -185,6 +185,7 @@ fn cleanupCacheImpl(allocator: std.mem.Allocator, home_dir: []const u8, ttl_sec:
 }
 
 test "cleanupCache:TTL 删旧留新 + 节流 + 无目录不崩(P0.5)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // 用 std.c.utimes 造旧 mtime,windows 无此 syscall
     const a = std.testing.allocator;
     // 隔离 fake home:/tmp/cc-cache-<pid>。
     const home = std.fmt.allocPrint(a, "/tmp/cc-cache-{d}", .{pprocess.currentPid()}) catch return;
@@ -237,6 +238,7 @@ test "cleanupCache:TTL 删旧留新 + 节流 + 无目录不崩(P0.5)" {
 }
 
 test "cleanupCacheImpl:size-cap LRU 淘汰最旧到达标(P0.5 覆盖 LRU 分支)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // std.c.utimes 造 mtime,windows 无
     const a = std.testing.allocator;
     const home = std.fmt.allocPrint(a, "/tmp/cc-cache-lru-{d}", .{pprocess.currentPid()}) catch return;
     defer a.free(home);
