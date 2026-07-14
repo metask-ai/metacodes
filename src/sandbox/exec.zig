@@ -11,6 +11,7 @@
 //! 只在 macOS 生效(builtin.os.tag == .macos)。其它平台返回 null(暂不实现 bubblewrap)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const builtin = @import("builtin");
 const profile_mod = @import("profile.zig");
 const config_mod = @import("config.zig");
@@ -216,13 +217,13 @@ fn writeTempProfile(alloc: std.mem.Allocator, content: []const u8) ![]u8 {
     const path_z = try std.fmt.bufPrint(&path_buf, "{s}/cczig_sb_{d}_{d}.sb\x00", .{ tmpdir, pid, n });
     const path = path_z[0 .. path_z.len - 1];
 
-    const fd = std.c.open(@ptrCast(path_z.ptr), std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    const fd = pfs.open(@ptrCast(path_z.ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
     if (fd < 0) return error.WriteProfileFailed;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
 
     var written: usize = 0;
     while (written < content.len) {
-        const n2 = std.c.write(fd, content.ptr + written, content.len - written);
+        const n2 = pfs.write(fd, content[written..][0..content.len - written]);
         if (n2 <= 0) return error.WriteProfileFailed;
         written += @intCast(n2);
     }

@@ -8,6 +8,7 @@
 //! - Ctrl+C：输入阶段 → 清 buffer（ISIG=false 让字节 0x03 落到 LineEditor）；生成阶段 → SIGINT → app.abort
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const platform_signal = @import("platform").signal;
 const posix = std.posix;
 const app_mod = @import("../app.zig");
@@ -751,7 +752,7 @@ fn drainStdin(fd: std.c.fd_t) void {
         if (rc <= 0) return;
         if ((pfd[0].revents & std.c.POLL.IN) == 0) return;
         var buf: [256]u8 = undefined;
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = pfs.read(fd, buf[0..buf.len]);
         if (n <= 0) return;
     }
 }
@@ -1982,16 +1983,16 @@ fn handleConfigCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
         // 尝试读全文
         const path_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{cfg_path}, 0);
         defer allocator.free(path_z);
-        const fd = std.c.open(path_z.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) {
             std.debug.print("(file does not exist — use /init to create one)\n", .{});
             return;
         }
-        defer _ = std.c.close(fd);
+        defer _ = pfs.close(fd);
         std.debug.print("\x1b[1mfile contents:\x1b[0m\n", .{});
         var buf: [8192]u8 = undefined;
         while (true) {
-            const n = std.c.read(fd, &buf, buf.len);
+            const n = pfs.read(fd, buf[0..buf.len]);
             if (n <= 0) break;
             std.debug.print("{s}", .{buf[0..@intCast(n)]});
         }
@@ -3128,8 +3129,8 @@ fn editMemorySlot(app: *app_mod.App, allocator: std.mem.Allocator, home: []const
             @memcpy(zb[0..path.len], path);
             zb[path.len] = 0;
             // O_CREAT|O_EXCL:已存在不动,不存在建空。
-            const fd = std.c.open(@ptrCast(&zb), std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, @as(std.c.mode_t, 0o644));
-            if (fd >= 0) _ = std.c.close(fd);
+            const fd = pfs.open(@ptrCast(&zb), .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true }, @as(std.c.mode_t, 0o644));
+            if (fd >= 0) _ = pfs.close(fd);
         }
     }
 

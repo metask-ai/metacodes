@@ -15,6 +15,7 @@
 //!     log.warn("stream", "event_iter error: {s}", .{@errorName(err)});
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const sync = @import("platform").sync;
 
 pub const Level = enum(u3) {
@@ -86,7 +87,7 @@ pub fn initFromEnv() void {
     }
 
     if (std.c.getenv("METACODES_LOG_FILE")) |path_c| {
-        const fd = std.c.open(path_c, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o644));
+        const fd = pfs.open(path_c, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o644));
         if (fd >= 0) {
             g_log_file_fd = fd;
         }
@@ -237,7 +238,7 @@ pub fn setStderrEnabled(enabled: bool) void {
 fn writeAll(fd: std.c.fd_t, bytes: []const u8) void {
     var total: usize = 0;
     while (total < bytes.len) {
-        const n = std.c.write(fd, bytes.ptr + total, bytes.len - total);
+        const n = pfs.write(fd, bytes[total..][0..bytes.len - total]);
         if (n <= 0) return;
         total += @as(usize, @intCast(n));
     }

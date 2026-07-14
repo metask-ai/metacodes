@@ -6,6 +6,7 @@
 //! M1.5 起加入 AbortSignal + SIGINT 绑定。signal handler 只做 atomic store，async-signal-safe。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const platform_signal = @import("platform").signal;
 const platform_paths = @import("platform").paths;
 const types = @import("types.zig");
@@ -1130,15 +1131,15 @@ pub const App = struct {
         const home = std.mem.span(home_c);
         var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
         const path = try std.fmt.bufPrint(&pbuf, "{s}/.metacodes/config.json\x00", .{home});
-        const fd = std.c.open(@ptrCast(path.ptr), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) return error.NotFound;
-        defer _ = std.c.close(fd);
+        defer _ = pfs.close(fd);
 
         var all = std.ArrayList(u8).empty;
         defer all.deinit(app.allocator);
         var buf: [4096]u8 = undefined;
         while (true) {
-            const n = std.c.read(fd, &buf, buf.len);
+            const n = pfs.read(fd, buf[0..buf.len]);
             if (n <= 0) break;
             try all.appendSlice(app.allocator, buf[0..@intCast(n)]);
         }
@@ -1207,15 +1208,15 @@ pub const App = struct {
         const home = std.mem.span(home_c);
         var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
         const path = try std.fmt.bufPrint(&pbuf, "{s}/.metacodes/config.json\x00", .{home});
-        const fd = std.c.open(@ptrCast(path.ptr), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) return error.NotFound;
-        defer _ = std.c.close(fd);
+        defer _ = pfs.close(fd);
 
         var all = std.ArrayList(u8).empty;
         defer all.deinit(app.allocator);
         var buf: [4096]u8 = undefined;
         while (true) {
-            const n = std.c.read(fd, &buf, buf.len);
+            const n = pfs.read(fd, buf[0..buf.len]);
             if (n <= 0) break;
             try all.appendSlice(app.allocator, buf[0..@intCast(n)]);
         }
@@ -1326,14 +1327,14 @@ fn readFileAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     if (path.len + 1 > pbuf.len) return error.PathTooLong;
     @memcpy(pbuf[0..path.len], path);
     pbuf[path.len] = 0;
-    const fd = std.c.open(@ptrCast(&pbuf), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.FileNotFound;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     var all: std.ArrayList(u8) = .empty;
     errdefer all.deinit(alloc);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = pfs.read(fd, buf[0..buf.len]);
         if (n < 0) return error.ReadFailed;
         if (n == 0) break;
         try all.appendSlice(alloc, buf[0..@intCast(n)]);

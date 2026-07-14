@@ -8,6 +8,7 @@
 //! 各用各的目录,物理隔离。本 helper 提供 path() 拼路径(首调时 mkdir 该目录)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 
 var dir_made: bool = false;
 
@@ -28,8 +29,8 @@ test "path: per-pid 唯一目录 + 可建文件" {
     var b: [256]u8 = undefined;
     const p = path(&b, "helper-selftest.txt");
     try std.testing.expect(std.mem.indexOf(u8, p, "/tmp/cc-zig-test-") != null);
-    const fd = std.c.open(p.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(p.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
-    _ = std.c.close(fd);
+    _ = pfs.close(fd);
     _ = std.c.unlink(p.ptr);
 }

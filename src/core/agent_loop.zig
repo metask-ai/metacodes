@@ -7,6 +7,7 @@
 //! 不再像旧版那样把所有东西扁平化成 text。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const types = @import("../types.zig");
 const client_mod = @import("../client.zig");
 const provider_mod = @import("../api/provider.zig");
@@ -2480,9 +2481,9 @@ test "auto-compact 触发 PreCompact + PostCompact hook(G-rest 接线,端到端)
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
 
     // PreCompact 真触发:marker 文件存在。
-    const pre_fd = std.c.open(@ptrCast(pre_marker.ptr), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const pre_fd = pfs.open(@ptrCast(pre_marker.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     try std.testing.expect(pre_fd >= 0);
-    if (pre_fd >= 0) _ = std.c.close(pre_fd);
+    if (pre_fd >= 0) _ = pfs.close(pre_fd);
     _ = std.c.unlink(@ptrCast(pre_marker.ptr));
 
     // PostCompact 的 additionalContext 拼进投影摘要 → 模型下轮读得到。
@@ -2506,11 +2507,11 @@ test "fireStopHook:顶层触发 + 传入 last_message;subagent(depth!=0)不触�
     // 顶层(depth=0)触发:hook 收到含 Stop/last_message/stop_reason 的 stdin。
     fireStopHook(&hs, a, &c, "end_turn", 0);
     {
-        const fd = std.c.open(@ptrCast(marker.ptr), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        const fd = pfs.open(@ptrCast(marker.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         try std.testing.expect(fd >= 0);
-        defer _ = std.c.close(fd);
+        defer _ = pfs.close(fd);
         var buf: [1024]u8 = undefined;
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = pfs.read(fd, buf[0..buf.len]);
         try std.testing.expect(n > 0);
         const got = buf[0..@intCast(n)];
         try std.testing.expect(std.mem.indexOf(u8, got, "\"Stop\"") != null);
@@ -2521,9 +2522,9 @@ test "fireStopHook:顶层触发 + 传入 last_message;subagent(depth!=0)不触�
     // 负向:subagent(depth=1)不触发(marker 删后不重现)。
     _ = std.c.unlink(@ptrCast(marker.ptr));
     fireStopHook(&hs, a, &c, "end_turn", 1);
-    const fd2 = std.c.open(@ptrCast(marker.ptr), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd2 = pfs.open(@ptrCast(marker.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     try std.testing.expect(fd2 < 0); // 不触发 → 文件不存在
-    if (fd2 >= 0) _ = std.c.close(fd2);
+    if (fd2 >= 0) _ = pfs.close(fd2);
 }
 
 test "previous-model compact uses old model override before smaller-window sampling" {

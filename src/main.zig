@@ -1,4 +1,5 @@
 const std = @import("std");
+const pfs = @import("platform").fs;
 const platform_signal = @import("platform").signal;
 const types = @import("types.zig");
 const client = @import("client.zig");
@@ -295,7 +296,7 @@ pub fn main(init: std.process.Init) !void {
 fn dumpWrite(bytes: []const u8) void {
     var pos: usize = 0;
     while (pos < bytes.len) {
-        const n = std.c.write(1, bytes.ptr + pos, bytes.len - pos);
+        const n = pfs.write(1, bytes[pos..][0..bytes.len - pos]);
         if (n <= 0) break;
         pos += @as(usize, @intCast(n));
     }
@@ -572,7 +573,7 @@ fn readLine(buf: []u8) !usize {
     var len: usize = 0;
     while (len < buf.len) {
         var ch: [1]u8 = undefined;
-        const n = std.c.read(0, &ch, 1);
+        const n = pfs.read(0, ch[0..1]);
         if (n < 0) return error.InputFailed;
         if (n == 0) break;
         if (ch[0] == '\n' or ch[0] == '\r') break;
@@ -635,14 +636,14 @@ fn printLoginStatus(allocator: std.mem.Allocator) !void {
 fn readFileArg(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    const fd = std.c.open(path_z.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.OpenFailed;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = pfs.read(fd, buf[0..buf.len]);
         if (n < 0) return error.ReadFailed;
         if (n == 0) break;
         try out.appendSlice(allocator, buf[0..@intCast(n)]);
@@ -757,7 +758,7 @@ fn readAllStdin(allocator: std.mem.Allocator) ![]const u8 {
     errdefer buf.deinit(allocator);
     var chunk: [4096]u8 = undefined;
     while (true) {
-        const n = std.c.read(0, &chunk, chunk.len);
+        const n = pfs.read(0, chunk[0..chunk.len]);
         if (n <= 0) break;
         try buf.appendSlice(allocator, chunk[0..@intCast(n)]);
     }
