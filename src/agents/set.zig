@@ -11,6 +11,7 @@
 //! 重名:后加载覆盖先加载(同 skill)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const def_mod = @import("def.zig");
 pub const AgentDef = def_mod.AgentDef;
 pub const Origin = def_mod.Origin;
@@ -147,7 +148,7 @@ pub const AgentSet = struct {
 
 fn readAllFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.ReadError;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     var buf: [65536]u8 = undefined;
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
@@ -390,9 +391,9 @@ fn makeAgentInDir(parent: []const u8, filename: []const u8, md: []const u8) !voi
     const a = testing.allocator;
     const md_path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ parent, filename }, 0);
     defer a.free(md_path);
-    const fd = std.c.open(md_path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    _ = std.c.write(fd, md.ptr, md.len);
-    _ = std.c.close(fd);
+    const fd = pfs.open(md_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    _ = pfs.write(fd, md[0..md.len]);
+    _ = pfs.close(fd);
 }
 
 fn cleanupDir(parent: []const u8) void {

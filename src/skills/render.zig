@@ -29,6 +29,7 @@
 //!      单文件上限 256KiB。不递归(读入内容不再扫 @/!)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const common = @import("../tools/common.zig");
 const log = @import("../util/log.zig");
 
@@ -273,15 +274,15 @@ fn readFileRef(allocator: std.mem.Allocator, raw: []const u8, opts: RenderOption
     }
 
     // 3) 读文件(libc,裁剪版 std),带 size cap。
-    const fd = std.c.open(real.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(real.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return null;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
 
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
     var chunk: [16 * 1024]u8 = undefined;
     while (true) {
-        const n = std.c.read(fd, &chunk, chunk.len);
+        const n = pfs.read(fd, chunk[0..chunk.len]);
         if (n <= 0) break;
         const un: usize = @intCast(n);
         if (buf.items.len + un > MAX_FILE_REF_BYTES) {

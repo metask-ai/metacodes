@@ -32,6 +32,7 @@
 //! 同名:高优先级覆盖低优先级。Plugin 不与其它级冲突。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 
 /// 调用上下文 — fork 时跑独立 subagent,inline 在主对话内联。
 pub const ExecContext = enum { inline_ctx, fork };
@@ -247,9 +248,9 @@ pub fn findRepoRoot(allocator: std.mem.Allocator, start_dir: []const u8) ![]u8 {
         buf[dir_len + git_suffix.len] = 0;
         const path_z: [*:0]const u8 = @ptrCast(&buf);
         // 用 open 试探(目录或文件都接受 — git worktree 的 .git 是文件)
-        const fd = std.c.open(path_z, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        const fd = pfs.open(path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd >= 0) {
-            _ = std.c.close(fd);
+            _ = pfs.close(fd);
             return try allocator.dupe(u8, buf[0..dir_len]);
         }
         // 向上一级
@@ -268,7 +269,7 @@ fn readAllFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
         error.FileNotFound => return error.FileNotFound,
         else => return error.ReadError,
     };
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     var buf: [65536]u8 = undefined;
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
@@ -640,9 +641,9 @@ fn makeTestSkill(parent: []const u8, name: []const u8, md: []const u8) !void {
     _ = std.c.mkdir(skill_dir, 0o755);
     const md_path = try std.fmt.allocPrintSentinel(allocator, "{s}/SKILL.md", .{skill_dir}, 0);
     defer allocator.free(md_path);
-    const fd = std.c.open(md_path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    _ = std.c.write(fd, md.ptr, md.len);
-    _ = std.c.close(fd);
+    const fd = pfs.open(md_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    _ = pfs.write(fd, md[0..md.len]);
+    _ = pfs.close(fd);
 }
 
 fn cleanupDir(parent: []const u8) void {

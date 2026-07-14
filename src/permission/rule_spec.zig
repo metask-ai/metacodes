@@ -23,6 +23,7 @@
 //! → 在 bash_parser.zig(下一步)
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 
 pub const Spec = union(enum) {
     /// 整工具(无 specifier 或 `*`)
@@ -778,9 +779,9 @@ test "matchesMode: symlink deny triggers if target matches (任一)" {
     const link_path = link[0 .. link.len - 1];
 
     // 创建 secret 文件
-    const fd = std.c.open(@ptrCast(secret.ptr), std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(@ptrCast(secret.ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     if (fd < 0) return error.SkipZigTest;
-    _ = std.c.close(fd);
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(@ptrCast(secret.ptr));
     // 创建 symlink link → secret
     _ = std.c.unlink(@ptrCast(link.ptr));

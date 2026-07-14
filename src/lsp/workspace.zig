@@ -4,6 +4,7 @@
 //! 里瞎跑 language server)。找 workspace root = 从 start 向上 walk ≤64 层找 `.git`(文件**或**目录
 //! ——worktree 的 .git 是文件)。路径规范化**不解析 symlink**(保守,避免跨 symlink 误判归属)。
 const std = @import("std");
+const pfs = @import("platform").fs;
 
 const MAX_WALK = 64;
 
@@ -134,8 +135,8 @@ fn mkd(path: []const u8) void {
 fn touch(path: []const u8) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return;
-    const fd = std.c.open(z.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    if (fd >= 0) _ = std.c.close(fd);
+    const fd = pfs.open(z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    if (fd >= 0) _ = pfs.close(fd);
 }
 
 test "findGitWorktree + nearestRoot: 真临时目录树(std.c FS)" {

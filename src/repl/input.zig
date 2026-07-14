@@ -9,6 +9,7 @@
 //! 测试策略：LineEditor 全部用 fake keystream 驱动。termios 只做 "不崩" 测试（真 tty 行为难在 CI 里验证）。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const process = @import("platform").process;
 
 // ============================================================================
@@ -356,11 +357,11 @@ pub fn enterRawMode(fd: std.c.fd_t) ?std.c.termios {
     if (!dumb) {
         // Kitty 键盘协议 + modifyOtherKeys 仅对白名单终端发(非白名单会乱码/键失常)。
         if (shouldEnableKittyKeyboard()) {
-            _ = std.c.write(fd, kbd_enable_seq.ptr, kbd_enable_seq.len);
+            _ = pfs.write(fd, kbd_enable_seq[0..kbd_enable_seq.len]);
         }
         // bracketed paste 兼容性好,所有非 dumb 终端都发(粘贴内容被 ESC[200~ ... ESC[201~ 包裹)。
         const enable_paste = "\x1b[?2004h";
-        _ = std.c.write(fd, enable_paste.ptr, enable_paste.len);
+        _ = pfs.write(fd, enable_paste[0..enable_paste.len]);
     }
 
     return orig;
@@ -370,9 +371,9 @@ pub fn restoreMode(fd: std.c.fd_t, orig: std.c.termios) void {
     // 关 bracketed paste(始终)+ 键盘协议(仅白名单——对称 enterRawMode,同进程 env 不变判定恒一致,
     // 不会发了 enable 没 disable;非白名单不发孤立 disable,避免 Apple Terminal honor 它出异常)。
     const disable_paste = "\x1b[?2004l";
-    _ = std.c.write(fd, disable_paste.ptr, disable_paste.len);
+    _ = pfs.write(fd, disable_paste[0..disable_paste.len]);
     if (shouldEnableKittyKeyboard()) {
-        _ = std.c.write(fd, kbd_disable_seq.ptr, kbd_disable_seq.len);
+        _ = pfs.write(fd, kbd_disable_seq[0..kbd_disable_seq.len]);
     }
     _ = std.c.tcsetattr(fd, std.posix.TCSA.FLUSH, &orig);
 }
@@ -386,10 +387,10 @@ pub fn externalEdit(allocator: std.mem.Allocator, current: []const u8) ![]u8 {
 
     const tmp_path = "/tmp/cc-zig-edit-buffer.txt";
     {
-        const fd = std.c.open(tmp_path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        const fd = pfs.open(tmp_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
         if (fd < 0) return error.WriteFailed;
-        defer _ = std.c.close(fd);
-        if (current.len > 0) _ = std.c.write(fd, current.ptr, current.len);
+        defer _ = pfs.close(fd);
+        if (current.len > 0) _ = pfs.write(fd, current[0..current.len]);
     }
 
     const path_z = try allocator.dupeZ(u8, tmp_path);
@@ -403,14 +404,14 @@ pub fn externalEdit(allocator: std.mem.Allocator, current: []const u8) ![]u8 {
     // Windows 的 /bin/sh 依赖 git-bash（roadmap shell 决策 node 8871）。
     _ = process.runInherit(argv[0..], true) catch return error.ForkFailed;
 
-    const rfd = std.c.open(path_z.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const rfd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (rfd < 0) return error.ReadFailed;
-    defer _ = std.c.close(rfd);
+    defer _ = pfs.close(rfd);
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = std.c.read(rfd, &buf, buf.len);
+        const n = pfs.read(rfd, buf[0..buf.len]);
         if (n <= 0) break;
         try out.appendSlice(allocator, buf[0..@intCast(n)]);
     }

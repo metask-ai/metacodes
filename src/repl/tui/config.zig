@@ -8,6 +8,7 @@
 //! 容错:文件不存在 → 写时自建;JSON 解析失败 → 读返 null / 写直接覆盖为 {"theme":"X"}。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const theme_mod = @import("theme.zig");
 
 /// 读取 home 目录下 ~/.metacodes/config.json 的 theme 字段。
@@ -77,15 +78,15 @@ fn readFile(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     if (path.len + 1 > pbuf.len) return error.PathTooLong;
     @memcpy(pbuf[0..path.len], path);
     pbuf[path.len] = 0;
-    const fd = std.c.open(@ptrCast(&pbuf), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.FileNotFound;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
 
     var all: std.ArrayList(u8) = .empty;
     errdefer all.deinit(alloc);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = pfs.read(fd, buf[0..buf.len]);
         if (n < 0) return error.ReadFailed;
         if (n == 0) break;
         try all.appendSlice(alloc, buf[0..@intCast(n)]);
@@ -98,13 +99,13 @@ fn writeFile(path: []const u8, bytes: []const u8) !void {
     if (path.len + 1 > pbuf.len) return error.PathTooLong;
     @memcpy(pbuf[0..path.len], path);
     pbuf[path.len] = 0;
-    const fd = std.c.open(@ptrCast(&pbuf), std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     if (fd < 0) return error.WriteFailed;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
 
     var written: usize = 0;
     while (written < bytes.len) {
-        const n = std.c.write(fd, bytes.ptr + written, bytes.len - written);
+        const n = pfs.write(fd, bytes[written..][0..bytes.len - written]);
         if (n < 0) return error.WriteFailed;
         if (n == 0) break;
         written += @intCast(n);
