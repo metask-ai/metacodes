@@ -263,7 +263,7 @@ fn readFileRef(allocator: std.mem.Allocator, raw: []const u8, opts: RenderOption
     var real_buf: [std.fs.max_path_bytes]u8 = undefined;
     const resolved_z = try allocator.dupeZ(u8, resolved);
     defer allocator.free(resolved_z);
-    const real_ptr = std.c.realpath(resolved_z, &real_buf);
+    const real_ptr = pfs.realpath(resolved_z, &real_buf);
     if (real_ptr == null) return null; // 不存在
     const real = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(real_ptr.?)), 0);
 
@@ -301,7 +301,7 @@ fn withinBoundary(allocator: std.mem.Allocator, real: []const u8, boundary: []co
     const bz = allocator.dupeZ(u8, boundary) catch return false;
     defer allocator.free(bz);
     var rb: [std.fs.max_path_bytes]u8 = undefined;
-    const bp = std.c.realpath(bz, &rb);
+    const bp = pfs.realpath(bz, &rb);
     if (bp == null) return false;
     const b = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(bp.?)), 0);
     if (!std.mem.startsWith(u8, real, b)) return false;

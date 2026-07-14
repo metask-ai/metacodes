@@ -63,7 +63,7 @@ pub const JobRegistry = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator) !JobRegistry {
-        const uid = std.c.getuid();
+        const uid = @import("platform").paths.uid();
         const base = try std.fmt.allocPrint(allocator, "/tmp/metacodes-jobs/{d}", .{uid});
         errdefer allocator.free(base);
         try util_fs.mkdirParents(base);

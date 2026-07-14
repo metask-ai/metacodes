@@ -60,14 +60,14 @@ fn resolveImportPath(
 }
 
 /// 规范化路径用于循环检测(realpath;失败回退原路径)。返回 owned。
-/// 用 std.c.realpath(项目统一范式,见 sandbox/profile.zig / skills/render.zig)。
+/// 用 pfs.realpath(项目统一范式,见 sandbox/profile.zig / skills/render.zig)。
 fn canonical(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     if (path.len + 1 > std.fs.max_path_bytes) return allocator.dupe(u8, path);
     var path_z: [std.fs.max_path_bytes]u8 = undefined;
     @memcpy(path_z[0..path.len], path);
     path_z[path.len] = 0;
     var out: [std.fs.max_path_bytes]u8 = undefined;
-    const res = std.c.realpath(@ptrCast(&path_z), &out);
+    const res = pfs.realpath(@ptrCast(&path_z), &out);
     if (res == null) return allocator.dupe(u8, path);
     const resolved = std.mem.span(@as([*:0]u8, @ptrCast(res.?)));
     return allocator.dupe(u8, resolved);

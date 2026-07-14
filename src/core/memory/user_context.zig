@@ -131,7 +131,7 @@ fn tmpAbsPath(allocator: std.mem.Allocator, tmp: *const std.testing.TmpDir) ![]u
     @memcpy(path_z[0..rel.len], rel);
     path_z[rel.len] = 0;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const res = std.c.realpath(@ptrCast(&path_z), &buf);
+    const res = pfs.realpath(@ptrCast(&path_z), &buf);
     if (res == null) return allocator.dupe(u8, rel);
     return allocator.dupe(u8, std.mem.span(@as([*:0]u8, @ptrCast(res.?))));
 }

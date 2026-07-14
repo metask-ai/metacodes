@@ -237,7 +237,7 @@ fn realpathZ(buf: []u8, file_path: []const u8) ?[]const u8 {
     @memcpy(pz[0..file_path.len], file_path);
     pz[file_path.len] = 0;
     var out: [std.fs.max_path_bytes]u8 = undefined;
-    const res = std.c.realpath(@ptrCast(&pz), &out);
+    const res = pfs.realpath(@ptrCast(&pz), &out);
     if (res == null) return null;
     const resolved = std.mem.span(@as([*:0]u8, @ptrCast(res.?)));
     if (resolved.len > buf.len) return null;

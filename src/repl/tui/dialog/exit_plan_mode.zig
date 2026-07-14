@@ -12,6 +12,7 @@
 //! 返回 ToolContext.PlanApproval。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const ansi = @import("../ansi.zig");
 const theme_mod = @import("../theme.zig");
 const layout = @import("../layout.zig");
@@ -122,11 +123,11 @@ pub fn renderWithKg(alloc: std.mem.Allocator, th: Theme, plan_md: []const u8, se
 /// out_fd:输出 fd(TuiBackend 接管用 stderr=2 与 region 同流)。
 /// 默认高亮第 3 项(No, keep planning)——安全默认偏向"不轻易放行"。
 /// 返回 null = 读失败(调用方按 .reject 兜底)。
-pub fn run(alloc: std.mem.Allocator, th: Theme, in_fd: std.c.fd_t, out_fd: std.c.fd_t, plan_md: []const u8) ?PlanApproval {
+pub fn run(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_int, plan_md: []const u8) ?PlanApproval {
     return runWithKg(alloc, th, in_fd, out_fd, plan_md, 0);
 }
 
-pub fn runWithKg(alloc: std.mem.Allocator, th: Theme, in_fd: std.c.fd_t, out_fd: std.c.fd_t, plan_md: []const u8, kg_steps: usize) ?PlanApproval {
+pub fn runWithKg(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_int, plan_md: []const u8, kg_steps: usize) ?PlanApproval {
     var selected: usize = 0; // 默认高亮第一项(Yes, proceed)——计划已展示,用户主动 review 后多数批准
     var prev_rows: usize = 0;
     while (true) {
@@ -141,7 +142,7 @@ pub fn runWithKg(alloc: std.mem.Allocator, th: Theme, in_fd: std.c.fd_t, out_fd:
         prev_rows = countRows(frame);
 
         var buf: [8]u8 = undefined;
-        const n = std.c.read(in_fd, &buf, buf.len);
+        const n = pfs.read(in_fd, &buf);
         if (n <= 0) return null;
         const b = buf[0];
 
@@ -177,10 +178,10 @@ fn countRows(frame: []const u8) usize {
     return rows;
 }
 
-fn writeAll(fd: std.c.fd_t, bytes: []const u8) void {
+fn writeAll(fd: c_int, bytes: []const u8) void {
     var total: usize = 0;
     while (total < bytes.len) {
-        const w = std.c.write(fd, bytes.ptr + total, bytes.len - total);
+        const w = pfs.write(fd, bytes[total..]);
         if (w <= 0) return;
         total += @as(usize, @intCast(w));
     }

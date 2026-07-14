@@ -19,6 +19,7 @@
 //! 本模块在生成时对每个路径做 realpath(失败则原样保留)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 
 pub const SandboxConfig = struct {
     /// 工作目录(绝对,必可写)
@@ -170,7 +171,7 @@ fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     path_z[path.len] = 0;
 
     var out: [std.fs.max_path_bytes]u8 = undefined;
-    const res = std.c.realpath(@ptrCast(&path_z), &out);
+    const res = pfs.realpath(@ptrCast(&path_z), &out);
     if (res == null) return error.RealpathFailed;
     const resolved = std.mem.span(@as([*:0]u8, @ptrCast(res.?)));
     return alloc.dupe(u8, resolved);

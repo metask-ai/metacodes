@@ -14,6 +14,7 @@
 //! - prompt():render + raw mode 读键循环(真 TTY 才用;非 TTY 由调用方退回文字)
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const ansi = @import("../ansi.zig");
 const theme_mod = @import("../theme.zig");
 const layout = @import("../layout.zig");
@@ -91,7 +92,7 @@ pub fn render(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: 
 /// input.zig 的 enterRawMode/restoreMode 复用。fd 默认 stdin(0),输出 fd 默认 stdout(1)。
 pub fn prompt(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: []const u8) ?PermissionChoice {
     const input = @import("../../input.zig");
-    const in_fd: std.c.fd_t = 0;
+    const in_fd: c_int = 0;
 
     if (!term.isatty(in_fd)) return null;
 
@@ -105,7 +106,7 @@ pub fn prompt(alloc: std.mem.Allocator, th: Theme, tool_name: []const u8, args: 
 /// 用于:① prompt() 自己进 raw mode 后调;② TuiBackend 终端接管(停 watcher+持锁)后调。
 /// out_fd 输出(prompt 用 stdout=1;TuiBackend 接管用 stderr=2 与 region 同流)。
 /// 重画用 render 实际行数(不再硬编码 8——参数长会折行变多行,硬编码会错位)。
-pub fn promptLoop(alloc: std.mem.Allocator, th: Theme, in_fd: std.c.fd_t, out_fd: std.c.fd_t, tool_name: []const u8, args: []const u8) ?PermissionChoice {
+pub fn promptLoop(alloc: std.mem.Allocator, th: Theme, in_fd: c_int, out_fd: c_int, tool_name: []const u8, args: []const u8) ?PermissionChoice {
     var selected: usize = 0;
     var prev_rows: usize = 0;
     while (true) {
@@ -120,7 +121,7 @@ pub fn promptLoop(alloc: std.mem.Allocator, th: Theme, in_fd: std.c.fd_t, out_fd
         prev_rows = countRows(frame);
 
         var buf: [8]u8 = undefined;
-        const n = std.c.read(in_fd, &buf, buf.len);
+        const n = pfs.read(in_fd, &buf);
         if (n <= 0) return .deny_once;
         const b = buf[0];
 
@@ -153,10 +154,10 @@ fn countRows(frame: []const u8) usize {
     return rows;
 }
 
-fn writeAll(fd: std.c.fd_t, bytes: []const u8) void {
+fn writeAll(fd: c_int, bytes: []const u8) void {
     var total: usize = 0;
     while (total < bytes.len) {
-        const w = std.c.write(fd, bytes.ptr + total, bytes.len - total);
+        const w = pfs.write(fd, bytes[total..]);
         if (w <= 0) return;
         total += @as(usize, @intCast(w));
     }

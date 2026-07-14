@@ -15,6 +15,7 @@
 //! permanent(二进制缺/版本不符 → degraded)、data(环/NotFound → 透传模型改参)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const time = @import("../util/time.zig");
 const sync = @import("platform").sync;
 const common = @import("../tools/common.zig");
@@ -335,7 +336,7 @@ pub const KgClient = struct {
             else => return null,
         };
         var rp: [std.fs.max_path_bytes]u8 = undefined;
-        const resolved = std.c.realpath(exe_path.ptr, &rp);
+        const resolved = pfs.realpath(exe_path.ptr, &rp);
         const full: []const u8 = if (resolved != null) std.mem.span(resolved.?) else exe_path;
         const dir = std.fs.path.dirname(full) orelse return null;
         if (dir.len == 0 or dir.len >= buf.len) return null;

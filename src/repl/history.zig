@@ -154,7 +154,7 @@ pub const History = struct {
             const bytes = line.written();
             _ = pfs.write(fd, bytes);
         }
-        _ = std.c.fsync(fd);
+        _ = pfs.fsync(fd);
     }
 
     pub fn len(self: *const History) usize {

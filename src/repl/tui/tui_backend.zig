@@ -30,7 +30,9 @@
 //! 卡渲染用 alloc(堆),渲染完即 free,TuiBackend 不持有跨调用。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const sync = @import("platform").sync;
+const platform_term = @import("platform").terminal;
 const render_region = @import("render_region.zig");
 const ui_backend = @import("../../core/protocol/ui_backend.zig");
 const ui_event = @import("../../core/protocol/ui_event.zig");
@@ -66,11 +68,11 @@ const SessionId = ui_backend.SessionId;
 /// "syscall 参数先快照")。详见 TuiBackend.input_ctx 字段上的并发不变量 + 半截真相注释。
 const InputCtx = struct {
     mutex: sync.Mutex = .{},
-    fd: std.c.fd_t = 0,
+    fd: c_int = 0,
     app: ?*app_mod.App = null,
     alloc: ?std.mem.Allocator = null,
 
-    const Snapshot = struct { fd: std.c.fd_t, app: ?*app_mod.App, alloc: ?std.mem.Allocator };
+    const Snapshot = struct { fd: c_int, app: ?*app_mod.App, alloc: ?std.mem.Allocator };
 
     /// 持锁拷出三字段到栈,立即放锁返回。leaf-lock:调用方拿到 Snapshot 后才做 IO/取 R 锁。
     fn snapshot(self: *InputCtx) Snapshot {
@@ -80,7 +82,7 @@ const InputCtx = struct {
     }
 
     /// 持锁写三字段(startInput 注入)。
-    fn set(self: *InputCtx, fd: std.c.fd_t, app: *app_mod.App, alloc: std.mem.Allocator) void {
+    fn set(self: *InputCtx, fd: c_int, app: *app_mod.App, alloc: std.mem.Allocator) void {
         _ = self.mutex.lock();
         defer _ = self.mutex.unlock();
         self.fd = fd;
@@ -345,7 +347,7 @@ pub const TuiBackend = struct {
     /// 启动生成期键盘监听线程(loop.zig 在 agent_loop.run 前调)。
     /// fd=stdin;app 供 spinner 重画;queue/input_abort 须已在 backend 上设好。
     /// 非 tty / 无 region 时不应调用(loop.zig 已门控)。
-    pub fn startInput(self: *TuiBackend, fd: std.c.fd_t, app: *app_mod.App, allocator: std.mem.Allocator) !void {
+    pub fn startInput(self: *TuiBackend, fd: c_int, app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // 护栏:start 前必须已 stop+join 上一个 watcher。**debug-only 安全网**——release 里 assert 蒸发,
         // 不是不变量的真正强制者(真正强制靠 input_thread 这个 optional 的存在性 + 调用纪律)。多 session
         // 若要硬保证,得让 start 在 input_thread!=null 时返回 error 或先内部 stop(Linus #3 认知项)。
@@ -375,7 +377,7 @@ pub const TuiBackend = struct {
     fn withTerminalTakeover(
         self: *TuiBackend,
         comptime R: type,
-        body: *const fn (fd: std.c.fd_t, th: Theme, a: std.mem.Allocator) R,
+        body: *const fn (fd: c_int, th: Theme, a: std.mem.Allocator) R,
     ) ?R {
         // 此读在 stopInput(join watcher)**之前** → 与存活 watcher 真并发,必须经 I 锁 snapshot。
         const snap = self.input_ctx.snapshot();
@@ -436,7 +438,7 @@ pub const TuiBackend = struct {
                 const Ctx = struct {
                     threadlocal var tool: []const u8 = "";
                     threadlocal var args: []const u8 = "";
-                    fn run(fd: std.c.fd_t, th: Theme, a: std.mem.Allocator) perm_dialog.PermissionChoice {
+                    fn run(fd: c_int, th: Theme, a: std.mem.Allocator) perm_dialog.PermissionChoice {
                         return perm_dialog.promptLoop(a, th, fd, 2, tool, args) orelse .deny_once;
                     }
                 };
@@ -449,7 +451,7 @@ pub const TuiBackend = struct {
                 const Ctx = struct {
                     threadlocal var plan_md: []const u8 = "";
                     threadlocal var kg_steps: usize = 0;
-                    fn run(fd: std.c.fd_t, th: Theme, a: std.mem.Allocator) tool_ctx.ToolContext.PlanApproval {
+                    fn run(fd: c_int, th: Theme, a: std.mem.Allocator) tool_ctx.ToolContext.PlanApproval {
                         return exit_plan_dialog.runWithKg(a, th, fd, 2, plan_md, kg_steps) orelse .reject;
                     }
                 };
@@ -500,8 +502,7 @@ pub const TuiBackend = struct {
         while (!self.input_stop.load(.acquire)) {
             // ESC 待决时用短超时(40ms)→ 孤立 ESC 快速兑现为中断;否则常规 100ms tick。
             const timeout_ms: i32 = if (parser.pendingEsc()) 40 else 100;
-            var pfd = [_]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
-            const rc = std.c.poll(&pfd, 1, timeout_ms);
+            const rc = platform_term.waitReadable(fd, timeout_ms); // 可移植 poll
             if (rc <= 0) {
                 // 超时:孤立 ESC 兑现 → 处理(可能中断);否则推进 spinner。
                 if (parser.flushEsc()) |k| {
@@ -511,10 +512,9 @@ pub const TuiBackend = struct {
                 }
                 continue;
             }
-            if ((pfd[0].revents & std.c.POLL.IN) == 0) continue;
 
             var b: [1]u8 = undefined;
-            const n = std.c.read(fd, &b, 1);
+            const n = pfs.read(fd, &b);
             if (n <= 0) continue;
 
             const key = parser.feed(b[0]) orelse continue; // 多字节(UTF-8/CSI)攒够再出 Key

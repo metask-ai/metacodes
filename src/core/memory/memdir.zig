@@ -62,7 +62,7 @@ fn canonical(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     @memcpy(path_z[0..path.len], path);
     path_z[path.len] = 0;
     var out: [std.fs.max_path_bytes]u8 = undefined;
-    const res = std.c.realpath(@ptrCast(&path_z), &out);
+    const res = pfs.realpath(@ptrCast(&path_z), &out);
     if (res == null) return allocator.dupe(u8, path);
     return allocator.dupe(u8, std.mem.span(@as([*:0]u8, @ptrCast(res.?))));
 }

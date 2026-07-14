@@ -14,6 +14,7 @@
 //! **seed-on-first-push**(TS 系):首个 publishDiagnostics 只存不 signal,防 waiter 命中 pre-edit 旧诊断。
 const std = @import("std");
 const sync = @import("platform").sync;
+const pprocess = @import("platform").process;
 const transport_mod = @import("transport.zig");
 const protocol = @import("protocol.zig");
 const reporter = @import("reporter.zig");
@@ -247,7 +248,7 @@ pub const Client = struct {
         defer pbuf.deinit(self.allocator);
         try pbuf.appendSlice(self.allocator, "{\"processId\":");
         var idbuf: [16]u8 = undefined;
-        try pbuf.appendSlice(self.allocator, try std.fmt.bufPrint(&idbuf, "{d}", .{std.c.getpid()}));
+        try pbuf.appendSlice(self.allocator, try std.fmt.bufPrint(&idbuf, "{d}", .{pprocess.currentPid()}));
         try pbuf.appendSlice(self.allocator, ",\"rootUri\":");
         try appendJsonStr(&pbuf, self.allocator, root_uri);
         // 声明支持 publishDiagnostics + utf-16(LSP 默认)。passive 模式能力最小化。

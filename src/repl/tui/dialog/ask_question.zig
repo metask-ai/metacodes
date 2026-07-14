@@ -11,6 +11,7 @@
 //! ESC / Ctrl+C → error.InputAborted(取消整个 AskUserQuestion,对齐 cc)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const platform_term = @import("platform").terminal;
 const ansi = @import("../ansi.zig");
 const input_mod = @import("../../input.zig");
@@ -502,10 +503,10 @@ pub fn renderSubmit(
     return .{ .frame = frame, .rows = rows };
 }
 
-fn writeAll(fd: std.c.fd_t, bytes: []const u8) void {
+fn writeAll(fd: c_int, bytes: []const u8) void {
     var total: usize = 0;
     while (total < bytes.len) {
-        const w = std.c.write(fd, bytes.ptr + total, bytes.len - total);
+        const w = pfs.write(fd, bytes[total..]);
         if (w <= 0) return;
         total += @as(usize, @intCast(w));
     }
@@ -543,12 +544,12 @@ const QState = struct {
 pub fn run(
     alloc: std.mem.Allocator,
     th: Theme,
-    in_fd: std.c.fd_t,
+    in_fd: c_int,
     questions: []const ctx.AskQuestion,
     out: *std.ArrayList([]const u8),
     cols: usize,
 ) !void {
-    const out_fd: std.c.fd_t = 2;
+    const out_fd: c_int = 2;
     const nq = questions.len;
     if (nq == 0) return;
     const multi_q = nq > 1;
@@ -611,7 +612,7 @@ pub fn run(
         prev_rows = r.rows;
 
         var buf: [8]u8 = undefined;
-        const n = std.c.read(in_fd, &buf, buf.len);
+        const n = pfs.read(in_fd, &buf);
         if (n <= 0) return error.InputAborted;
         const b = buf[0];
 
@@ -822,7 +823,7 @@ fn finalizeAll(alloc: std.mem.Allocator, questions: []const ctx.AskQuestion, qs:
 /// note 编辑态 Ctrl+G:暂退 raw → 唤起 $EDITOR/Vim 编辑当前选项 note → 重进 raw → 回填。
 /// 终端模式:对话框运行在生成期 raw(gen_raw_orig)下;编辑器需 cooked,故 save→restore→editor→re-enter。
 /// 失败(无 $EDITOR/spawn 失败)静默忽略(note 保持原样,不崩)。
-fn editNoteInEditor(alloc: std.mem.Allocator, fd: std.c.fd_t, st: *QState, oi: usize) void {
+fn editNoteInEditor(alloc: std.mem.Allocator, fd: c_int, st: *QState, oi: usize) void {
     if (oi >= MAX_OPT) return;
     // 1. 存当前(raw)模式,临时回 cooked 给编辑器(可移植:POSIX termios / Windows console mode)。
     const saved = platform_term.saveMode(fd) orelse return;

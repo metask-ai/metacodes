@@ -122,7 +122,7 @@ pub fn saveToFile(config: FileConfig, allocator: std.mem.Allocator, path: []cons
     try out.append(allocator, '}');
 
     _ = pfs.write(fd, out.items);
-    _ = std.c.fsync(fd);
+    _ = pfs.fsync(fd);
 }
 
 fn parseJson(allocator: std.mem.Allocator, data: []const u8) !FileConfig {

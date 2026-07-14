@@ -60,6 +60,8 @@ extern "c" fn _read(fd: c_int, buf: [*]u8, count: c_uint) c_int;
 extern "c" fn _write(fd: c_int, buf: [*]const u8, count: c_uint) c_int;
 extern "c" fn _close(fd: c_int) c_int;
 extern "c" fn _lseek(fd: c_int, offset: c_long, origin: c_int) c_long;
+extern "c" fn _commit(fd: c_int) c_int; // MSVCRT:等价 fsync(刷到磁盘)
+extern "c" fn _fullpath(absPath: ?[*]u8, relPath: [*:0]const u8, maxLength: usize) ?[*:0]u8; // MSVCRT:规范化路径
 
 fn windowsOflag(flags: WindowsO) c_int {
     var o: c_int = _O_BINARY;
@@ -128,6 +130,24 @@ pub fn write(fd: c_int, buf: []const u8) isize {
         return n;
     }
     return std.c.write(fd, buf.ptr, buf.len);
+}
+
+/// 刷盘。POSIX fsync / Windows _commit。
+pub fn fsync(fd: c_int) void {
+    if (is_windows) {
+        _ = _commit(fd);
+    } else {
+        _ = std.c.fsync(fd);
+    }
+}
+
+/// 规范化绝对路径。签名对齐 std.c.realpath(失败返 null)。POSIX realpath(解 symlink)/
+/// Windows _fullpath(规范化 . 与 .. 及分隔符;Windows symlink 罕见,不解也可接受)。
+pub fn realpath(file_name: [*:0]const u8, resolved_name: [*]u8) ?[*:0]u8 {
+    if (is_windows) {
+        return _fullpath(resolved_name, file_name, std.fs.max_path_bytes);
+    }
+    return std.c.realpath(file_name, resolved_name);
 }
 
 /// 关闭【文件】fd。禁用于 socket/pipe（见文件头边界说明）。

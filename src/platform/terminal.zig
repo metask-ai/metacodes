@@ -41,11 +41,32 @@ extern "kernel32" fn GetConsoleMode(hConsoleHandle: win.HANDLE, lpMode: *win.DWO
 extern "kernel32" fn SetConsoleMode(hConsoleHandle: win.HANDLE, dwMode: win.DWORD) callconv(.winapi) c_int;
 extern "kernel32" fn GetConsoleScreenBufferInfo(hConsoleOutput: win.HANDLE, lpInfo: *CONSOLE_SCREEN_BUFFER_INFO) callconv(.winapi) c_int;
 extern "c" fn _isatty(fd: c_int) c_int;
+extern "kernel32" fn WaitForSingleObject(hHandle: win.HANDLE, dwMilliseconds: win.DWORD) callconv(.winapi) win.DWORD;
 
 /// fd 是否连着终端。
 pub fn isatty(fd: c_int) bool {
     if (is_windows) return _isatty(fd) != 0;
     return std.c.isatty(fd) != 0;
+}
+
+/// 等 fd 可读,最多 timeout_ms。返回 >0=可读、0=超时、<0=错误。
+/// POSIX:poll(POLLIN)。Windows:WaitForSingleObject 控制台输入句柄(任意输入事件即就绪——
+/// 键盘/鼠标/焦点都算,REPL 读循环据实际字节再定夺,粗就绪无碍)。用于交互输入循环周期性
+/// 醒来查 resize/中断,不阻塞死等。
+pub fn waitReadable(fd: c_int, timeout_ms: i32) i32 {
+    if (is_windows) {
+        // fd(0=stdin)→ 控制台输入句柄。用 STD_INPUT_HANDLE 而非 _get_osfhandle:
+        // 交互输入恒是控制台。
+        const h = GetStdHandle(STD_INPUT_HANDLE);
+        const rc = WaitForSingleObject(h, @intCast(timeout_ms));
+        return switch (rc) {
+            0 => 1, // WAIT_OBJECT_0:就绪
+            0x102 => 0, // WAIT_TIMEOUT
+            else => -1,
+        };
+    }
+    var pfd = [_]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
+    return std.c.poll(&pfd, 1, timeout_ms);
 }
 
 pub const TermSize = struct { rows: u16, cols: u16 };

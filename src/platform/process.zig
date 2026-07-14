@@ -292,6 +292,14 @@ fn spawnPipesWindows(argv: []const ?[*:0]const u8) CaptureError!PipeChild {
 pub const ProcHandle = if (is_windows) win.HANDLE else std.c.pid_t;
 
 extern "c" fn _get_osfhandle(fd: c_int) callconv(.c) usize; // MSVCRT fd → HANDLE（intptr）
+extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) win.DWORD;
+
+/// 当前进程 pid。POSIX=getpid；Windows=GetCurrentProcessId(避开 std.c.getpid 在 windows
+/// 返回类型不宜 `{d}` 格式化的问题)。仅用于 LSP processId 等信息性字段。
+pub fn currentPid() i32 {
+    if (is_windows) return @intCast(GetCurrentProcessId());
+    return std.c.getpid();
+}
 
 /// spawn detached 子进程，stdout→out_fd、stderr→err_fd（已 open 的文件 fd），返回进程句柄。
 /// POSIX：fork+setpgid+dup2+execve；Windows：_get_osfhandle+CreateProcessW(DETACHED_PROCESS)。

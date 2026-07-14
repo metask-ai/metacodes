@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const platform_term = @import("platform").terminal;
 const pfs = @import("platform").fs;
 const platform_signal = @import("platform").signal;
@@ -125,6 +126,17 @@ pub fn parseArgsForTest(argv: []const [*:0]const u8, allocator: std.mem.Allocato
     return config;
 }
 
+/// 可移植 argv 迭代器。POSIX:`iterate`(vector,零分配);Windows:`iterateAllocator`——
+/// `std.process.Args.iterate` 在 Windows 是 @compileError(须 allocator 版解析 WTF-8 命令行)。
+/// 返回迭代器的 deinit 在 POSIX 无操作、Windows 释放内部缓冲 → 调用方一律 `defer it.deinit()`。
+fn argsIter(init: std.process.Init) std.process.Args.Iterator {
+    if (builtin.os.tag == .windows) {
+        return std.process.Args.iterateAllocator(init.minimal.args, init.gpa) catch |e|
+            std.debug.panic("args init failed: {s}", .{@errorName(e)});
+    }
+    return std.process.Args.iterate(init.minimal.args);
+}
+
 /// 据 model 名前缀推断 provider 协议(纯函数,无 env)。gpt*/o1*/o3* → openai,gemini* → gemini,
 /// 其余 anthropic。env METACODES_PROVIDER 在 main 里显式覆盖此推断。
 pub fn inferProviderKind(model: []const u8) types.ProviderKind {
@@ -171,13 +183,14 @@ pub fn main(init: std.process.Init) !void {
     // 捕获 argv[0] 解析可执行文件目录(供 KgClient 定位 vendor/tinykg;H1)。
     // argv[0] 含 '/' 才可定位;裸命令名(PATH 启动)→ null,回落 env/dev。realpath 解 symlink。
     {
-        var a0_it = std.process.Args.iterate(init.minimal.args);
+        var a0_it = argsIter(init);
+        defer a0_it.deinit();
         if (a0_it.next()) |argv0| {
             if (std.mem.indexOfScalar(u8, argv0, '/') != null) {
                 const z = allocator.dupeZ(u8, argv0) catch null;
                 if (z) |zz| {
                     var rbuf: [std.fs.max_path_bytes]u8 = undefined;
-                    const resolved = std.c.realpath(zz.ptr, &rbuf);
+                    const resolved = pfs.realpath(zz.ptr, &rbuf);
                     const full = if (resolved != null) std.mem.span(resolved.?) else argv0;
                     if (std.fs.path.dirname(full)) |d| config.exe_dir = allocator.dupe(u8, d) catch null;
                 }
@@ -323,7 +336,8 @@ fn dumpPromptAndExit(app: *app_mod.App) noreturn {
 }
 
 fn maybeRunAuthCommand(init: std.process.Init, allocator: std.mem.Allocator) !?u8 {
-    var args = std.process.Args.iterate(init.minimal.args);
+    var args = argsIter(init);
+    defer args.deinit();
     _ = args.next(); // 跳过 argv[0](程序名)
     const cmd = args.next() orelse return null;
     if (std.mem.eql(u8, cmd, "logout")) {
@@ -679,7 +693,8 @@ fn isUsableConfiguredSession(config: types.Config, source: auth.CredentialSource
 
 fn parseArgs(init: std.process.Init, allocator: std.mem.Allocator) types.Config {
     var config = types.Config{};
-    var args = std.process.Args.iterate(init.minimal.args);
+    var args = argsIter(init);
+    defer args.deinit();
     parseArgsInto(&config, &args, allocator);
     return config;
 }

@@ -17,6 +17,7 @@
 //!   - runWithTheme:alt-screen 交互循环(从 loop.zig / tui_backend 调,需要 tty)
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const Conversation = @import("../core/conversation.zig").Conversation;
 const Overlay = @import("tui/overlay.zig").Overlay;
 
@@ -200,20 +201,20 @@ pub fn freeLines(allocator: std.mem.Allocator, lines: [][]u8) void {
 
 /// 交互循环。fd = stdin。rows = 终端高度(末 2 行给 footer)。
 /// 进 alt-screen(ESC[?1049h)→ 全屏画 → 处理键 → 退出 ESC[?1049l 自动恢复主缓冲(见模块头注)。
-pub fn run(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const Conversation, rows: usize) !void {
+pub fn run(fd: c_int, allocator: std.mem.Allocator, conv: *const Conversation, rows: usize) !void {
     return runWithTheme(fd, allocator, conv, rows, @import("tui/theme.zig").dark);
 }
 
 /// 全屏 transcript viewer(2026-06-13 改 alt-screen,根治多 agent"显两份")。进 \x1b[?1049h 切独立
 /// 缓冲、全屏绝对定位画 transcript + 末2行 footer;退出 \x1b[?1049l 由终端**自动逐字节恢复主缓冲**
 /// (banner+对话+输入框原样回来,零漂移、零 scrollback 污染)。空缓冲 + 绝对定位 → 天然无两份。
-pub fn runWithTheme(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const Conversation, rows: usize, th: @import("tui/theme.zig").Theme) !void {
+pub fn runWithTheme(fd: c_int, allocator: std.mem.Allocator, conv: *const Conversation, rows: usize, th: @import("tui/theme.zig").Theme) !void {
     return runWithThemeAnchor(fd, allocator, conv, rows, 1, th);
 }
 
 /// anchor_hint:旧 inline 模式的区顶兜底行,alt-screen 不再需要(独立缓冲全屏绝对定位)。保留参数
 /// 仅为不动 caller 签名(tui_backend/loop 仍传它)——内部丢弃。
-pub fn runWithThemeAnchor(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *const Conversation, rows: usize, anchor_hint: usize, th: @import("tui/theme.zig").Theme) !void {
+pub fn runWithThemeAnchor(fd: c_int, allocator: std.mem.Allocator, conv: *const Conversation, rows: usize, anchor_hint: usize, th: @import("tui/theme.zig").Theme) !void {
     _ = anchor_hint; // alt-screen 全屏模式不需要区顶 anchor(独立缓冲,绝对定位)
     const lines = try renderToLinesWithTheme(allocator, conv, th);
     defer freeLines(allocator, lines);
@@ -244,29 +245,29 @@ pub fn runWithThemeAnchor(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *c
     while (true) {
         drawScreen(lines, top, view_rows, rows, cols, th);
         var b: [1]u8 = undefined;
-        const n = std.c.read(fd, &b, 1);
+        const n = pfs.read(fd, &b);
         if (n <= 0) break;
         const c = b[0];
         if (c == 0x1b) {
             // 可能是方向键 CSI 或单 Esc。读后续两字节判定。
             var s0: [1]u8 = undefined;
-            const n2 = std.c.read(fd, &s0, 1);
+            const n2 = pfs.read(fd, &s0);
             if (n2 <= 0) break; // 裸 Esc → 退出
             if (s0[0] == '[') {
                 var s1: [1]u8 = undefined;
-                const n3 = std.c.read(fd, &s1, 1);
+                const n3 = pfs.read(fd, &s1);
                 if (n3 <= 0) break;
                 switch (s1[0]) {
                     'A' => top = if (top > 0) top - 1 else 0, // ↑
                     'B' => top = @min(top + 1, max_top), // ↓
                     '5' => { // PageUp(ESC[5~)——读掉结尾 ~
                         var s2: [1]u8 = undefined;
-                        _ = std.c.read(fd, &s2, 1);
+                        _ = pfs.read(fd, &s2);
                         top = if (top > view_rows) top - view_rows else 0;
                     },
                     '6' => { // PageDown(ESC[6~)
                         var s2: [1]u8 = undefined;
-                        _ = std.c.read(fd, &s2, 1);
+                        _ = pfs.read(fd, &s2);
                         top = @min(top + view_rows, max_top);
                     },
                     '0'...'4', '7'...'9' => {
@@ -304,12 +305,12 @@ pub fn runWithThemeAnchor(fd: std.c.fd_t, allocator: std.mem.Allocator, conv: *c
 
 /// 读完一段 CSI 序列(已读到 ESC[<first_digit>),返回 ';' 前的 codepoint(如 Ctrl+O=111),
 /// 并把剩余字节(mod 数字 + 终止字母 u/~/letter)读干净,不污染下一轮 read。
-fn readCsiCodepoint(fd: std.c.fd_t, first_digit: u8) u32 {
+fn readCsiCodepoint(fd: c_int, first_digit: u8) u32 {
     var cp: u32 = first_digit;
     var in_mod = false; // 进入 ';' 后是 modifier 段,后续数字不计入 codepoint
     while (true) {
         var sx: [1]u8 = undefined;
-        const nx = std.c.read(fd, &sx, 1);
+        const nx = pfs.read(fd, &sx);
         if (nx <= 0) return cp;
         const ch = sx[0];
         if (ch >= '0' and ch <= '9') {
@@ -369,10 +370,10 @@ fn drawScreen(lines: []const []const u8, top: usize, view_rows: usize, rows: usi
     writeAll(1, th.reset);
 }
 
-fn writeAll(fd: std.c.fd_t, bytes: []const u8) void {
+fn writeAll(fd: c_int, bytes: []const u8) void {
     var total: usize = 0;
     while (total < bytes.len) {
-        const n = std.c.write(fd, bytes.ptr + total, bytes.len - total);
+        const n = pfs.write(fd, bytes[total..]);
         if (n <= 0) return;
         total += @intCast(n);
     }

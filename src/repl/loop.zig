@@ -746,12 +746,9 @@ fn firstUserLine(conv: *const Conversation) []const u8 {
 
 /// Drain stdin buffer: 非阻塞读尽剩余字节。生成结束后调用，避免用户在 LLM 输出时
 /// 误按的字符进入下一轮输入缓冲。
-fn drainStdin(fd: std.c.fd_t) void {
+fn drainStdin(fd: c_int) void {
     while (true) {
-        var pfd = [_]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
-        const rc = std.c.poll(&pfd, 1, 0); // timeout=0 → 立即返回
-        if (rc <= 0) return;
-        if ((pfd[0].revents & std.c.POLL.IN) == 0) return;
+        if (platform_term.waitReadable(fd, 0) <= 0) return; // 可移植:timeout=0 立即返回
         var buf: [256]u8 = undefined;
         const n = pfs.read(fd, buf[0..buf.len]);
         if (n <= 0) return;
@@ -787,7 +784,7 @@ fn readLineBuffered(allocator: std.mem.Allocator) ![]u8 {
 /// 处理一次括号粘贴：从 paste_begin 之后读到 paste_end，累积原始文本。
 /// 小粘贴内联插入；大粘贴存 ~/.metacodes/pastes/<N>.txt 并插入占位符。
 fn handlePaste(
-    fd: std.c.fd_t,
+    fd: c_int,
     editor: *input.LineEditor,
     parser: *input.KeyParser,
     allocator: std.mem.Allocator,
@@ -800,7 +797,7 @@ fn handlePaste(
     // 其它控制键在粘贴内罕见，按其原始字节收集（保留 \n \t 等）。
     while (true) {
         var b: [1]u8 = undefined;
-        const n = posix.read(fd, &b) catch break;
+        const n = pfs.readZ(fd, &b) catch break;
         if (n == 0) break;
         const key = parser.feed(b[0]) orelse {
             // parser 处于 CSI 中间态——字节已被吞，等下一个
@@ -980,8 +977,7 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
             if (g_winch.swap(false, .acquire)) {
                 redraw(&region, &editor, app); // resize → 重测宽度重画
             }
-            var pfd = [_]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
-            const rc = std.c.poll(&pfd, 1, 200); // 200ms 超时
+            const rc = platform_term.waitReadable(fd, 200); // 可移植:200ms 超时等可读
             if (rc <= 0) {
                 // 超时/EINTR:若 parser 卡在 esc_seen(收到孤立 ESC 等后续字节),
                 // 此时无后续字节到来 → 兑现为 .esc(否则 Esc 永远到不了 dispatch/editor)。
@@ -991,13 +987,13 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                 }
                 continue; // <0=EINTR(被 SIGWINCH 中断) / 0=超时 → 回头查 flag
             }
-            if ((pfd[0].revents & std.c.POLL.IN) != 0) break; // 有字节可读
+            if (rc > 0) break; // 有字节可读
         };
 
         // 取键:合成键(孤立 ESC 超时兑现)优先;否则读一字节喂 parser。
         // parser.feed 返 null = 序列未完成(如刚收 ESC / CSI 中段)→ 回头继续读。
         const key = if (synthetic_key) |sk| sk else blk: {
-            const n = posix.read(fd, &b) catch return error.ReadError;
+            const n = pfs.readZ(fd, &b) catch return error.ReadError;
             if (n == 0) return error.Eof;
 
             // vim 模式 + NORMAL/VISUAL:字节路由到 vim 状态机(Enter/Esc 例外)
@@ -1405,7 +1401,7 @@ fn applyCompletion(editor: *input.LineEditor, allocator: std.mem.Allocator, star
 
 /// Ctrl+R 反向历史搜索：读字节构建 query，实时显示首个匹配；Enter 接受，Esc/Ctrl+C 取消。
 fn handleReverseSearch(
-    fd: std.c.fd_t,
+    fd: c_int,
     editor: *input.LineEditor,
     parser: *input.KeyParser,
     history: *history_mod.History,
@@ -1421,7 +1417,7 @@ fn handleReverseSearch(
         std.debug.print("\r\x1b[2K(reverse-search)`{s}': {s}", .{ query.items, match orelse "" });
 
         var b: [1]u8 = undefined;
-        const n = posix.read(fd, &b) catch return;
+        const n = pfs.readZ(fd, &b) catch return;
         if (n == 0) return;
         const c = b[0];
 
@@ -1430,7 +1426,7 @@ fn handleReverseSearch(
             // 非 '[' → 裸 Esc 取消;'[' → 解析 CSI codepoint(27=Esc 取消 / 13=Enter 接受 / 其余忽略并吞掉序列)。
             // 不解析会把 `[27u` 等字节漏给下一轮 read 成乱码(白名单终端 reverse-search 的 CSI-u 盲区)。
             var nb: [1]u8 = undefined;
-            const nn = posix.read(fd, &nb) catch return;
+            const nn = pfs.readZ(fd, &nb) catch return;
             if (nn == 0 or nb[0] != '[') {
                 std.debug.print("\r\x1b[2K", .{}); // 裸 Esc → 取消
                 return;
@@ -1440,7 +1436,7 @@ fn handleReverseSearch(
             var in_mod = false;
             while (true) {
                 var sx: [1]u8 = undefined;
-                const sn = posix.read(fd, &sx) catch break;
+                const sn = pfs.readZ(fd, &sx) catch break;
                 if (sn == 0) break;
                 const ch = sx[0];
                 if (ch >= '0' and ch <= '9') {

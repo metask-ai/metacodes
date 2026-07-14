@@ -48,6 +48,14 @@ test "homeDir 在 POSIX 返回 $HOME（测试环境设了 HOME）" {
     }
 }
 
+/// 当前用户 id。POSIX getuid;Windows 无 uid 概念 → 用 GetCurrentProcessId 做进程私有目录
+/// 区分符(job 落盘目录仅需一个每进程/每用户稳定隔离前缀,非安全边界)。
+pub fn uid() u32 {
+    if (is_windows) return GetCurrentProcessId();
+    return std.c.getuid();
+}
+extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+
 test "null_device 平台正确" {
     const nd = std.mem.span(null_device);
     if (is_windows) {
