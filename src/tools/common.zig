@@ -366,6 +366,7 @@ test "spawnCaptureStdoutAbortable without abort behaves same as base" {
 }
 
 test "spawnCaptureStdoutAbortable returns error.Aborted when abort pre-set" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // spawn /bin/sleep 等 POSIX 命令
     var sig = AbortSignal.init();
     sig.abort(.user_ctrl_c);
     const argv = [_]?[*:0]const u8{ "/bin/sleep", "10", null };
@@ -374,6 +375,7 @@ test "spawnCaptureStdoutAbortable returns error.Aborted when abort pre-set" {
 }
 
 test "spawnCaptureStdoutAbortable: abort mid-run kills process" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // spawn /bin/sleep 等 POSIX 命令
     var sig = AbortSignal.init();
     const argv = [_]?[*:0]const u8{ "/bin/sleep", "5", null };
 
@@ -396,6 +398,7 @@ test "spawnCaptureStdoutAbortable: abort mid-run kills process" {
 }
 
 test "spawnCaptureStdoutCapped 截断无限输出且不挂死" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // spawn /bin/sleep 等 POSIX 命令
     const a = std.testing.allocator;
     // `yes` 无限打印,无 cap 会挂死;cap=8KB 必须很快返回 ≤ 略多于 8KB。
     var argv = [_]?[*:0]const u8{ "/usr/bin/yes", "abcdefgh", null };
@@ -446,6 +449,7 @@ test "readAllFromFdCapped:超 cap 返 FileTooLarge、cap 内正常读(轴A 统�
 }
 
 test "spawnCaptureWithStderrTimed:max_bytes 封顶无限输出 killpg 止血不挂死(P0 轴A)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // spawn /bin/sleep 等 POSIX 命令
     const a = std.testing.allocator;
     const t0 = nowMs();
     // `yes` 无限打印 stdout;无 cap 会挂到 timeout;cap=32KB → 读够即 killpg,快速返回 ≤ 略多于 32KB。

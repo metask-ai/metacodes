@@ -167,8 +167,8 @@ pub const State = struct {
         defer self.allocator.free(bytes);
         const fd = pfs.open(tmp_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
         if (fd < 0) return error.OpenFailed;
-        defer _ = pfs.close(fd);
         const n = pfs.write(fd, bytes);
+        pfs.close(fd); // **rename 前必须关**:Windows MoveFileEx 遇源文件仍打开会共享冲突失败(POSIX 容忍)。
         if (n < 0 or @as(usize, @intCast(n)) != bytes.len) return error.WriteFailed;
         if (pfs.renameReplace(tmp_z.ptr, path_z.ptr) != 0) return error.RenameFailed;
     }

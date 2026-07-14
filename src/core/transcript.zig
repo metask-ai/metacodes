@@ -223,10 +223,10 @@ pub const Writer = struct {
         const tpath = try std.fmt.bufPrint(&tpath_buf, "{s}/meta.json.tmp\x00", .{self.dir});
         const tfd = pfs.open(@ptrCast(tpath.ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
         if (tfd < 0) return error.OpenFailed;
-        defer _ = pfs.close(tfd);
 
         const bytes = aw.written();
         const n = pfs.write(tfd, bytes);
+        pfs.close(tfd); // **rename 前关**:Windows MoveFileEx 遇源仍打开会共享冲突(POSIX 容忍)。
         if (n < 0 or @as(usize, @intCast(n)) != bytes.len) return error.WriteFailed;
 
         var fpath_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
@@ -527,7 +527,7 @@ test "hashCwd deterministic" {
 test "write then load roundtrip" {
     const a = std.testing.allocator;
     // 用 /tmp 模拟 HOME
-    const tmp_home = try std.fmt.allocPrint(a, "/tmp/cc-zig-transcript-test-{d}", .{util_time.nowMs()});
+    const tmp_home = blk_home: { var _tb: [512]u8 = undefined; break :blk_home try std.fmt.allocPrint(a, "{s}/cc-zig-transcript-test-{d}", .{ @import("../tools/test_tmp.zig").dir(&_tb), util_time.nowMs() }); };
     defer {
         util_fs.testing.rmrfBestEffort(tmp_home);
         a.free(tmp_home);
@@ -560,7 +560,7 @@ test "write then load roundtrip" {
 
 test "A:compact 投影状态 round-trip(flush 存 meta → load 恢复 boundary/summary)" {
     const a = std.testing.allocator;
-    const tmp_home = try std.fmt.allocPrint(a, "/tmp/cc-zig-transcript-compact-{d}", .{util_time.nowMs()});
+    const tmp_home = blk_home: { var _tb: [512]u8 = undefined; break :blk_home try std.fmt.allocPrint(a, "{s}/cc-zig-transcript-compact-{d}", .{ @import("../tools/test_tmp.zig").dir(&_tb), util_time.nowMs() }); };
     defer {
         util_fs.testing.rmrfBestEffort(tmp_home);
         a.free(tmp_home);
@@ -592,7 +592,7 @@ test "A:compact 投影状态 round-trip(flush 存 meta → load 恢复 boundary/
 
 test "A:未压缩 session 兼容(meta 无投影字段 → boundary=0/summary=null,不崩)" {
     const a = std.testing.allocator;
-    const tmp_home = try std.fmt.allocPrint(a, "/tmp/cc-zig-transcript-nocompact-{d}", .{util_time.nowMs()});
+    const tmp_home = blk_home: { var _tb: [512]u8 = undefined; break :blk_home try std.fmt.allocPrint(a, "{s}/cc-zig-transcript-nocompact-{d}", .{ @import("../tools/test_tmp.zig").dir(&_tb), util_time.nowMs() }); };
     defer {
         util_fs.testing.rmrfBestEffort(tmp_home);
         a.free(tmp_home);
@@ -617,7 +617,7 @@ test "A:未压缩 session 兼容(meta 无投影字段 → boundary=0/summary=nul
 
 test "write tool_use and tool_result roundtrip" {
     const a = std.testing.allocator;
-    const tmp_home = try std.fmt.allocPrint(a, "/tmp/cc-zig-transcript-test-tu-{d}", .{util_time.nowMs()});
+    const tmp_home = blk_home: { var _tb: [512]u8 = undefined; break :blk_home try std.fmt.allocPrint(a, "{s}/cc-zig-transcript-test-tu-{d}", .{ @import("../tools/test_tmp.zig").dir(&_tb), util_time.nowMs() }); };
     defer {
         util_fs.testing.rmrfBestEffort(tmp_home);
         a.free(tmp_home);
