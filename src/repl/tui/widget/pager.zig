@@ -206,7 +206,7 @@ fn nextCharBytes(s: []const u8, i: usize) usize {
 fn writeAll(fd: c_int, bytes: []const u8) void {
     var total: usize = 0;
     while (total < bytes.len) {
-        const w = std.c.write(fd, bytes.ptr + total, bytes.len - total);
+        const w = pfs.write(fd, bytes[total..]);
         if (w <= 0) return;
         total += @as(usize, @intCast(w));
     }

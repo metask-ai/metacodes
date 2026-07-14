@@ -60,6 +60,7 @@ test "Monitor: no jobs registry → JobsUnavailable" {
 }
 
 test "Monitor: launches background job and returns job_id" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // 用 std.posix.poll 等子进程,POSIX 专属
     const a = testing.allocator;
     const JobRegistry = @import("../core/job_registry.zig").JobRegistry;
     var jobs = try JobRegistry.init(a);

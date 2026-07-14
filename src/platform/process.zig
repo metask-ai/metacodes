@@ -403,10 +403,15 @@ fn labelOf(argv: []const ?[*:0]const u8) []const u8 {
 // ============================================================================
 
 fn nowMs() i64 {
-    if (is_windows) return @intCast(GetTickCount64()); // 单调 ms（自开机），0.16 无 std.time.milliTimestamp
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
+    // 显式 if/else(非 if-return 落穿):后者在 refAllDecls(zig test)下 POSIX 分支仍被分析,
+    // std.c.clock_gettime 的 clockid_t=void 在 windows winapi 报错。else 块保证 comptime 死分支。
+    if (is_windows) {
+        return @intCast(GetTickCount64()); // 单调 ms（自开机），0.16 无 std.time.milliTimestamp
+    } else {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+        return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
+    }
 }
 
 fn posixExitCode(status: c_int) i32 {

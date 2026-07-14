@@ -1099,6 +1099,7 @@ test "render: 多选不显 preview(preview 仅单选)" {
 }
 
 test "run: 单问 enter 后正常结束(回归:advanceView 推过末尾不越界 questions[view])" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // 用 std.c.pipe/dup 驱动 run() 假 stdin,POSIX 专属
     // 真 tty 实测崩点:单问选完 enter → advanceView 设 view=nq=1 → 旧代码 questions[1] OOB。
     // 修复:loop 顶 !multi_q and view>=nq → finalize 返回。用管道喂 enter 验证不崩 + 返回答案。
     const a = std.testing.allocator;
@@ -1124,6 +1125,7 @@ test "run: 单问 enter 后正常结束(回归:advanceView 推过末尾不越界
 }
 
 test "run: 重画前 clear-to-end-of-screen 抹旧帧足迹(回归:残字乱码 + 多余输入框)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // 用 std.c.pipe/dup 驱动 run() 假 stdin,POSIX 专属
     // 真 tty 实测 bug:redraw 只 cursor.up + \r 不擦 → 旧帧残字漏出(`Esc to cancelt in Vim`)
     // + 旧 REPL 输入框/分隔线残影(看似"多一个输入框")。修:回顶后 ESC[0J 抹整帧足迹。
     // 验证:喂 ↓ 触发一次重画 → 截获 fd2 输出含 \x1b[0J(且只在第 2 帧起出现)。
