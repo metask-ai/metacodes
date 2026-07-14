@@ -11,6 +11,7 @@
 //! ESC / Ctrl+C → error.InputAborted(取消整个 AskUserQuestion,对齐 cc)。
 
 const std = @import("std");
+const platform_term = @import("platform").terminal;
 const ansi = @import("../ansi.zig");
 const input_mod = @import("../../input.zig");
 const theme_mod = @import("../theme.zig");
@@ -823,25 +824,20 @@ fn finalizeAll(alloc: std.mem.Allocator, questions: []const ctx.AskQuestion, qs:
 /// 失败(无 $EDITOR/spawn 失败)静默忽略(note 保持原样,不崩)。
 fn editNoteInEditor(alloc: std.mem.Allocator, fd: std.c.fd_t, st: *QState, oi: usize) void {
     if (oi >= MAX_OPT) return;
-    // 1. 存当前(raw)termios,临时回 cooked(ECHO+ICANON)给编辑器。
-    var saved: std.c.termios = undefined;
-    if (std.c.tcgetattr(fd, &saved) != 0) return;
-    var cooked = saved;
-    cooked.lflag.ECHO = true;
-    cooked.lflag.ICANON = true;
-    cooked.lflag.ISIG = true;
-    _ = std.c.tcsetattr(fd, std.posix.TCSA.FLUSH, &cooked);
+    // 1. 存当前(raw)模式,临时回 cooked 给编辑器(可移植:POSIX termios / Windows console mode)。
+    const saved = platform_term.saveMode(fd) orelse return;
+    platform_term.setCooked(fd);
 
     // 2. 唤起编辑器(前台阻塞),传入当前 note 文本。
     const cur = st.note_buf[oi][0..st.note_len[oi]];
     const edited = input_mod.externalEdit(alloc, cur) catch {
-        _ = std.c.tcsetattr(fd, std.posix.TCSA.FLUSH, &saved); // 失败也要恢复 raw
+        platform_term.restoreMode(fd, saved); // 失败也要恢复 raw
         return;
     };
     defer alloc.free(edited);
 
-    // 3. 恢复 raw termios(对话框继续读键)。
-    _ = std.c.tcsetattr(fd, std.posix.TCSA.FLUSH, &saved);
+    // 3. 恢复 raw 模式(对话框继续读键)。
+    platform_term.restoreMode(fd, saved);
 
     // 4. 回填编辑结果(截断到 buf 上限;只取首行,note 是单行语义)。
     const line_end = std.mem.indexOfScalar(u8, edited, '\n') orelse edited.len;

@@ -60,15 +60,9 @@ fn isHex(c: u8) bool {
 pub fn probeBackground(fd: std.c.fd_t) ?Rgb {
     if (!platform_term.isatty(fd)) return null;
 
-    var orig: std.c.termios = undefined;
-    if (std.c.tcgetattr(fd, &orig) != 0) return null;
-    var raw = orig;
-    raw.lflag.ECHO = false;
-    raw.lflag.ICANON = false;
-    raw.cc[@intFromEnum(std.c.V.MIN)] = 0;
-    raw.cc[@intFromEnum(std.c.V.TIME)] = 0;
-    if (std.c.tcsetattr(fd, std.posix.TCSA.FLUSH, &raw) != 0) return null;
-    defer _ = std.c.tcsetattr(fd, std.posix.TCSA.FLUSH, &orig);
+    // 临时进 raw(可移植:POSIX termios / Windows console mode)。读走下方 poll 守卫,MIN 差异无碍。
+    const orig = platform_term.enterRaw(fd) orelse return null;
+    defer platform_term.restoreMode(fd, orig);
 
     const query = "\x1b]11;?\x07";
     if (std.c.write(fd, query.ptr, query.len) < 0) return null;

@@ -117,6 +117,37 @@ pub fn restoreMode(fd: c_int, saved: SavedMode) void {
     }
 }
 
+/// 保存当前终端模式（不改变），供 restoreMode 复原。用于"临时切 cooked 再复原"场景。
+pub fn saveMode(fd: c_int) ?SavedMode {
+    if (is_windows) {
+        var in_mode: win.DWORD = 0;
+        var out_mode: win.DWORD = 0;
+        if (GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &in_mode) == 0) return null;
+        _ = GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &out_mode);
+        return .{ .in_mode = in_mode, .out_mode = out_mode };
+    }
+    var orig: std.c.termios = undefined;
+    if (std.c.tcgetattr(fd, &orig) != 0) return null;
+    return orig;
+}
+
+/// 临时切 cooked 模式（行输入 + 回显 + 信号），供唤起外部编辑器等。复原走 restoreMode(saved)。
+pub fn setCooked(fd: c_int) void {
+    if (is_windows) {
+        const hin = GetStdHandle(STD_INPUT_HANDLE);
+        var m: win.DWORD = 0;
+        if (GetConsoleMode(hin, &m) == 0) return;
+        _ = SetConsoleMode(hin, m | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+        return;
+    }
+    var t: std.c.termios = undefined;
+    if (std.c.tcgetattr(fd, &t) != 0) return;
+    t.lflag.ECHO = true;
+    t.lflag.ICANON = true;
+    t.lflag.ISIG = true;
+    _ = std.c.tcsetattr(fd, std.posix.TCSA.FLUSH, &t);
+}
+
 // ============================================================================
 // Tests
 // ============================================================================

@@ -3287,9 +3287,9 @@ fn printStartupBanner(app: *const app_mod.App) void {
         return;
     }
     const cols: usize = blk: {
-        var ws: std.c.winsize = undefined;
-        const TIOCGWINSZ: c_ulong = if (@import("builtin").os.tag == .macos) 0x40087468 else 0x5413;
-        if (std.c.ioctl(1, TIOCGWINSZ, @intFromPtr(&ws)) == 0 and ws.col > 0) break :blk ws.col;
+        if (platform_term.windowSize(1)) |sz| {
+            if (sz.cols > 0) break :blk sz.cols;
+        }
         break :blk 80;
     };
     // welcome 框宽度对齐输入分隔线:框总宽 = box_tl + inner×box_h + box_tr = inner+2,
@@ -3351,9 +3351,9 @@ fn printStartupSuggestion(allocator: std.mem.Allocator) void {
 
 /// 取终端行数(失败回退 24)。
 fn termRows() usize {
-    var ws: std.c.winsize = undefined;
-    const TIOCGWINSZ: c_ulong = if (@import("builtin").os.tag == .macos) 0x40087468 else 0x5413;
-    if (std.c.ioctl(1, TIOCGWINSZ, &ws) == 0 and ws.row > 0) return ws.row;
+    if (platform_term.windowSize(1)) |sz| {
+        if (sz.rows > 0) return sz.rows;
+    }
     return 24;
 }
 
