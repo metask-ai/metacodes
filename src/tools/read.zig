@@ -1,4 +1,5 @@
 const std = @import("std");
+const pprocess = @import("platform").process;
 const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
@@ -572,7 +573,7 @@ test "ReadTool 超长单行被截断 + 标记" {
     // 一行 5000 个 'x'(超过 MAX_LINE_BYTES=2000),文件总字节 < 256KB 不触发大文件守卫。
     const big_line = "x" ** 5000;
     _ = pfs.write(fd, big_line);
-    _ = std.c.write(fd, "\n", 1);
+    _ = pfs.write(fd, "\n");
     _ = pfs.close(fd);
     defer _ = std.c.unlink(path);
 
@@ -866,7 +867,7 @@ test "ReadTool ~ 展开端到端(主 bug 回归)" {
 
     // home_dir = /tmp/cc-zig-test-<pid>;故 ~/tilde-expand-read.txt 展开到 fixture。
     var hbuf: [128]u8 = undefined;
-    const home = std.fmt.bufPrint(&hbuf, "/tmp/cc-zig-test-{d}", .{@as(i64, std.c.getpid())}) catch unreachable;
+    const home = std.fmt.bufPrint(&hbuf, "/tmp/cc-zig-test-{d}", .{@as(i64, pprocess.currentPid())}) catch unreachable;
     var ctx = ToolContext.simple(a);
     ctx.home_dir = home;
 
@@ -882,7 +883,7 @@ test "ReadTool 含 .. 的合法文件名不被误杀" {
     const fpath = tt.path(&pbuf, "my..legit..file.txt");
     const fd = pfs.open(fpath.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
-    _ = std.c.write(fd, "ok", 2);
+    _ = pfs.write(fd, "ok");
     _ = pfs.close(fd);
     defer _ = std.c.unlink(fpath.ptr);
 
@@ -900,7 +901,7 @@ test "Read outline e2e: 真 zls documentSymbol → 大纲(需装 zls)" {
     var zbuf: [std.fs.max_path_bytes]u8 = undefined;
     if (lsp_servers.which("zls", &zbuf) == null) return; // 未装 → skip
 
-    const base = std.fmt.allocPrint(a, "/tmp/cc_lsp_read_{d}", .{std.c.getpid()}) catch return;
+    const base = std.fmt.allocPrint(a, "/tmp/cc_lsp_read_{d}", .{pprocess.currentPid()}) catch return;
     defer a.free(base);
     e2eMkdir(base);
     const gitdir = std.fmt.allocPrint(a, "{s}/.git", .{base}) catch return;

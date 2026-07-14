@@ -14,6 +14,7 @@
 //! 容错:文件不存在 → 创建 + 完整 JSON;parse 失败 → log + 不写(避免覆盖损坏的 settings)。
 
 const std = @import("std");
+const pprocess = @import("platform").process;
 const pfs = @import("platform").fs;
 
 /// 把 rule 加入 settings.local.json 的 permissions.allow 数组。
@@ -305,7 +306,7 @@ test "rewriteWithAllow: 保留其它顶层字段" {
 }
 
 test "addAllowRule: 端到端创建文件" {
-    const pid: i64 = std.c.getpid();
+    const pid: i64 = pprocess.currentPid();
     var home_buf: [128]u8 = undefined;
     const home = try std.fmt.bufPrint(&home_buf, "/tmp/cczig_psave_{d}", .{pid});
     var home_z: [129]u8 = undefined;

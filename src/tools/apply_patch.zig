@@ -798,7 +798,7 @@ test "execute e2e: Update File 真写盘" {
     {
         const fd = pfs.open(fpath.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try testing.expect(fd >= 0);
-        _ = std.c.write(fd, "foo\nbar\n", 8);
+        _ = pfs.write(fd, "foo\nbar\n");
         _ = pfs.close(fd);
     }
     defer _ = std.c.unlink(fpath.ptr);
@@ -830,7 +830,7 @@ test "execute e2e: Add + Delete 事务性(context 失败则整批不落盘)" {
     {
         const fd = pfs.open(existing.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try testing.expect(fd >= 0);
-        _ = std.c.write(fd, "keep\n", 5);
+        _ = pfs.write(fd, "keep\n");
         _ = pfs.close(fd);
     }
     defer _ = std.c.unlink(existing.ptr);
@@ -865,7 +865,7 @@ test "execute e2e: Move(重命名到新目录)写新 + 删旧(codex fixture 004)
     {
         const fd = pfs.open(src.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try testing.expect(fd >= 0);
-        _ = std.c.write(fd, "old content\n", 12);
+        _ = pfs.write(fd, "old content\n");
         _ = pfs.close(fd);
     }
     defer _ = std.c.unlink(src.ptr);
@@ -898,7 +898,7 @@ test "execute e2e: Add File 撞已存在文件 → 报错不覆盖(比 codex 更
     {
         const fd = pfs.open(fpath.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try testing.expect(fd >= 0);
-        _ = std.c.write(fd, "PRECIOUS\n", 9);
+        _ = pfs.write(fd, "PRECIOUS\n");
         _ = pfs.close(fd);
     }
     defer _ = std.c.unlink(fpath.ptr);
@@ -925,7 +925,7 @@ test "execute: protected path(.env)拦住 ApplyPatch(不再绕过细粒度权限
     {
         const fd = pfs.open(fpath.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try testing.expect(fd >= 0);
-        _ = std.c.write(fd, "SECRET=1\n", 9);
+        _ = pfs.write(fd, "SECRET=1\n");
         _ = pfs.close(fd);
     }
     defer _ = std.c.unlink(fpath.ptr);

@@ -143,7 +143,7 @@ fn writeFileAt(dir_abs: []const u8, name: []const u8, data: []const u8) !void {
     defer pfs.close(fd);
     var written: usize = 0;
     while (written < data.len) {
-        const n = std.c.write(fd, data[written..].ptr, data.len - written);
+        const n = pfs.write(fd, data[written..]);
         if (n < 0) return error.WriteFailed;
         written += @intCast(n);
     }

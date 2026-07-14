@@ -442,7 +442,7 @@ test "GrepTool 默认 head_limit=250:不传时宽匹配被截断(防撑爆)" {
     try std.testing.expect(fd >= 0);
     // 写 300 行全匹配 → 不传 head_limit → 应只返 250 行 + appliedLimit 提示。
     var i: usize = 0;
-    while (i < 300) : (i += 1) _ = std.c.write(fd, "match\n", 6);
+    while (i < 300) : (i += 1) _ = pfs.write(fd, "match\n");
     _ = pfs.close(fd);
     defer _ = std.c.unlink(path);
 
@@ -464,7 +464,7 @@ test "GrepTool head_limit=0 显式无限:返回全部不截断" {
     const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     var i: usize = 0;
-    while (i < 300) : (i += 1) _ = std.c.write(fd, "match\n", 6);
+    while (i < 300) : (i += 1) _ = pfs.write(fd, "match\n");
     _ = pfs.close(fd);
     defer _ = std.c.unlink(path);
 

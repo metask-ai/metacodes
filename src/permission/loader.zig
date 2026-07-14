@@ -4,6 +4,7 @@
 //! 单层文件不存在 / 解析失败 → 只 log,不阻塞其它层和启动。
 
 const std = @import("std");
+const pprocess = @import("platform").process;
 const pfs = @import("platform").fs;
 const settings = @import("settings.zig");
 const log = @import("../util/log.zig");
@@ -147,7 +148,7 @@ test "load: cli layer parse + evaluate" {
     const alloc = testing.allocator;
 
     // 用 pid + 时间拼一个唯一路径(规避 0.16 std.c 无 mkstemp)
-    const pid: i64 = std.c.getpid();
+    const pid: i64 = pprocess.currentPid();
     var path_buf: [128]u8 = undefined;
     const path_with_nul = try std.fmt.bufPrint(&path_buf, "/tmp/cczig_settings_{d}.json\x00", .{pid});
     const path = path_with_nul[0 .. path_with_nul.len - 1];

@@ -109,7 +109,7 @@ test "GlobTool brace pattern (*.{ts,tsx})" {
     const txt_path: [*:0]const u8 = "/tmp/cc-zig-glob-brace-a.txt";
     for ([_][*:0]const u8{ ts_path, tsx_path, txt_path }) |p| {
         const fd = pfs.open(p, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-        _ = std.c.write(fd, "x\n", 2);
+        _ = pfs.write(fd, "x\n");
         _ = pfs.close(fd);
     }
     defer _ = std.c.unlink(ts_path);

@@ -492,7 +492,7 @@ test "EditTool not-read-first rejects" {
     defer _ = std.c.unlink(path);
 
     const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    _ = std.c.write(fd, "hello", 5);
+    _ = pfs.write(fd, "hello");
     _ = pfs.close(fd);
 
     var rs = @import("../core/read_state.zig").ReadState.init(a);
@@ -509,7 +509,7 @@ test "EditTool stale rejected" {
     defer _ = std.c.unlink(path.ptr);
 
     const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    _ = std.c.write(fd, "hello", 5);
+    _ = pfs.write(fd, "hello");
     _ = pfs.close(fd);
 
     var rs = @import("../core/read_state.zig").ReadState.init(a);
@@ -528,7 +528,7 @@ test "EditTool after read succeeds" {
     defer _ = std.c.unlink(path.ptr);
 
     const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    _ = std.c.write(fd, "foo", 3);
+    _ = pfs.write(fd, "foo");
     _ = pfs.close(fd);
 
     var rs = @import("../core/read_state.zig").ReadState.init(a);

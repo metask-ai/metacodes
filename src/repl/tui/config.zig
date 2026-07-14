@@ -8,6 +8,7 @@
 //! 容错:文件不存在 → 写时自建;JSON 解析失败 → 读返 null / 写直接覆盖为 {"theme":"X"}。
 
 const std = @import("std");
+const pprocess = @import("platform").process;
 const pfs = @import("platform").fs;
 const theme_mod = @import("theme.zig");
 
@@ -228,7 +229,7 @@ test "writeWithTheme: 字段不存在时追加" {
 }
 
 test "loadTheme + saveTheme 往返(临时 home)" {
-    const pid: i64 = std.c.getpid();
+    const pid: i64 = pprocess.currentPid();
     var dir_buf: [128]u8 = undefined;
     const dir = try std.fmt.bufPrint(&dir_buf, "/tmp/cczig_thtest_{d}", .{pid});
     var dir_z: [129]u8 = undefined;

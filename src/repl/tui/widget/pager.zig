@@ -25,6 +25,7 @@
 //! 6. 退出:恢复
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const ansi = @import("../ansi.zig");
 const theme_mod = @import("../theme.zig");
 const term = @import("../term.zig");
@@ -149,7 +150,7 @@ pub fn page(alloc: std.mem.Allocator, th: Theme, content: []const u8, opts: Page
 
         // 读键
         var buf: [8]u8 = undefined;
-        const n = std.c.read(in_fd, &buf, buf.len);
+        const n = pfs.read(in_fd, &buf);
         if (n <= 0) break;
         const b = buf[0];
 
