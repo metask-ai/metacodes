@@ -769,6 +769,7 @@ test "matches: Bash with wrapper stripped before match" {
 }
 
 test "matchesMode: symlink deny triggers if target matches (任一)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // 用 POSIX symlink() 造真符号链接测拒绝,windows 无此 syscall
     // 建一个真 symlink: /tmp/cczig_link_<pid> → /tmp/cczig_secret_<pid>
     const pid = pprocess.currentPid();
     var secret_buf: [128]u8 = undefined;

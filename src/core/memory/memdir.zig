@@ -327,6 +327,7 @@ test "isAutoMemPath: 真实 memdir 内放行,外部拒绝(含分隔符边界 + �
 }
 
 test "isAutoMemPath: memdir 内 symlink 末段指向外部(悬空目标)→ 拒绝(Linus #1 TOCTOU)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // 用 POSIX symlink() 造真符号链接测拒绝,windows 无此 syscall
     const a = testing.allocator;
     const util_time = @import("../../util/time.zig");
     var home_buf: [128]u8 = undefined;
