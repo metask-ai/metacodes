@@ -11,3 +11,4 @@ pub const signal = @import("signal.zig");
 pub const rng = @import("rng.zig");
 pub const paths = @import("paths.zig");
 pub const terminal = @import("terminal.zig");
+pub const net = @import("net.zig");

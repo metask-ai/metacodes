@@ -19,6 +19,7 @@ const backend_mod = @import("backend.zig");
 const msg_queue_mod = @import("../repl/msg_queue.zig");
 const abort_mod = @import("../util/abort.zig");
 const log = @import("../util/log.zig");
+const net = @import("platform").net;
 
 const EventJournal = journal_mod.EventJournal;
 const WebBackend = backend_mod.WebBackend;
@@ -54,7 +55,7 @@ pub const Deps = struct {
 pub const WebServer = struct {
     /// 必须线程安全(连接线程并发分配)。
     allocator: std.mem.Allocator,
-    listen_fd: std.c.fd_t,
+    listen_fd: net.Socket,
     port: u16,
     accept_thread: std.Thread = undefined,
     /// 活跃连接线程数(detached)。stop() 等它归零再释放 self——否则连接线程
@@ -68,32 +69,16 @@ pub const WebServer = struct {
 
     /// 绑 127.0.0.1:port(0 = 内核分配,读回真实端口)并起 accept 线程。
     pub fn start(allocator: std.mem.Allocator, port: u16, deps: Deps) !*WebServer {
-        const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
-        if (fd < 0) return error.SocketFailed;
-        errdefer _ = std.c.close(fd);
-
-        const yes: c_int = 1;
-        _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, &yes, @sizeOf(c_int));
-
-        var addr = std.c.sockaddr.in{
-            .family = std.c.AF.INET,
-            .port = std.mem.nativeToBig(u16, port),
-            .addr = 0x0100007f, // 127.0.0.1
-            .zero = [_]u8{0} ** 8,
-        };
-        if (std.c.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) < 0) return error.BindFailed;
-        if (std.c.listen(fd, 16) < 0) return error.ListenFailed;
-
-        var bound: std.c.sockaddr.in = undefined;
-        var blen: std.c.socklen_t = @sizeOf(@TypeOf(bound));
-        if (std.c.getsockname(fd, @ptrCast(&bound), &blen) < 0) return error.GetSocknameFailed;
+        // 可移植 loopback listen(POSIX socket/Windows WSAStartup+ws2_32),内部含 REUSEADDR+getsockname。
+        const l = try net.listenLoopback(port, 16);
+        errdefer net.closeSocket(l.sock);
 
         const self = try allocator.create(WebServer);
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
-            .listen_fd = fd,
-            .port = std.mem.bigToNative(u16, bound.port),
+            .listen_fd = l.sock,
+            .port = l.port,
             .deps = deps,
         };
         self.accept_thread = try std.Thread.spawn(.{}, acceptLoop, .{self});
@@ -104,7 +89,7 @@ pub const WebServer = struct {
     /// journal.close() 醒来收尾——调用方(session driver)须**先 close journal 再 stop**。
     pub fn stop(self: *WebServer) void {
         self.closing.store(true, .release); // 先标记再 close:accept 醒来据它判定主动退出
-        _ = std.c.close(self.listen_fd);
+        net.closeSocket(self.listen_fd);
         self.accept_thread.join();
         // 等 detached 连接线程退净。**上限须 > socket 超时(SO_RCVTIMEO/SNDTIMEO=10s)**:
         // 卡在读/写的连接线程最长被超时唤醒需 10s;SSE 阻塞线程由 journal.close 立即唤醒。
@@ -129,10 +114,7 @@ pub const WebServer = struct {
 
     fn acceptLoop(self: *WebServer) void {
         while (true) {
-            var client_addr: std.c.sockaddr = undefined;
-            var alen: std.c.socklen_t = @sizeOf(@TypeOf(client_addr));
-            const conn_fd = std.c.accept(self.listen_fd, &client_addr, &alen);
-            if (conn_fd < 0) {
+            const conn_fd = net.acceptConn(self.listen_fd) orelse {
                 if (self.closing.load(.acquire)) return; // 主动 stop:listen_fd 已关,退出
                 // 瞬时错误(EINTR/ECONNABORTED/EMFILE 等):短憩后重试,绝不让 server 哑掉。
                 // 10ms 兜底防万一 EBADF-但-未标记-closing 忙循环烧满 CPU。
@@ -140,29 +122,27 @@ pub const WebServer = struct {
                 var rem: std.c.timespec = undefined;
                 _ = std.c.nanosleep(&req, &rem);
                 continue;
-            }
+            };
             // 计数在 spawn 前加(accept 线程侧):避免"已 accept 未及计数"时 stop 误判 0。
             _ = self.live_conns.fetchAdd(1, .acq_rel);
             const t = std.Thread.spawn(.{}, handleConn, .{ self, conn_fd }) catch {
                 _ = self.live_conns.fetchSub(1, .acq_rel);
-                _ = std.c.close(conn_fd);
+                net.closeSocket(conn_fd);
                 continue;
             };
             t.detach();
         }
     }
 
-    fn handleConn(self: *WebServer, fd: std.c.fd_t) void {
+    fn handleConn(self: *WebServer, fd: net.Socket) void {
         defer _ = self.live_conns.fetchSub(1, .acq_rel); // 配对 acceptLoop 的 fetchAdd
-        defer _ = std.c.close(fd);
+        defer net.closeSocket(fd);
         // 读超时 10s:半截请求(slow-loris)不许无限占线程+buffer。
-        const rcv_tv = std.c.timeval{ .sec = 10, .usec = 0 };
-        _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, &rcv_tv, @sizeOf(std.c.timeval));
+        net.setRecvTimeoutMs(fd, 10_000);
         // 写超时 10s:SSE 是持续写,卡死的客户端(TCP 接收窗口满、不读)会让 writeAll
         // **永久阻塞**,钉住连接线程 → live_conns 永不归零 → stop() 无法干净退出。
         // 写超时 → writeAll 返 false → 线程退出。SSE 空闲(无事件不写)不受影响。
-        const snd_tv = std.c.timeval{ .sec = 10, .usec = 0 };
-        _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.SNDTIMEO, &snd_tv, @sizeOf(std.c.timeval));
+        net.setSendTimeoutMs(fd, 10_000);
         // 读请求(headers + Content-Length body)。1MB 上限(消息/应答都是小 JSON)。
         const cap: usize = 1024 * 1024;
         const buf = self.allocator.alloc(u8, cap) catch return;
@@ -172,7 +152,7 @@ pub const WebServer = struct {
         var headers_end: ?usize = null;
         var content_length: usize = 0;
         while (total < cap and headers_end == null) {
-            const n = std.c.read(fd, buf.ptr + total, cap - total);
+            const n = net.recv(fd, buf[total..cap]);
             if (n <= 0) return;
             total += @intCast(n);
             if (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n")) |i| {
@@ -188,7 +168,7 @@ pub const WebServer = struct {
             return;
         }
         while ((total - he) < content_length) {
-            const n = std.c.read(fd, buf.ptr + total, he + content_length - total);
+            const n = net.recv(fd, buf[total .. he + content_length]);
             if (n <= 0) return;
             total += @intCast(n);
         }
@@ -203,7 +183,7 @@ pub const WebServer = struct {
         self.route(fd, line, head, body);
     }
 
-    fn route(self: *WebServer, fd: std.c.fd_t, line: RequestLine, head: []const u8, body: []const u8) void {
+    fn route(self: *WebServer, fd: net.Socket, line: RequestLine, head: []const u8, body: []const u8) void {
         // CSRF 防线:状态变更(POST)必须同源。浏览器跨域 POST 强制带 Origin 头——
         // 恶意网页 fetch('http://127.0.0.1:<port>/message',{method:'POST'}) 是简单请求、
         // 能发出(读不到响应但副作用已生效:让模型跑命令、抢答权限对话框)。检查 Origin
@@ -300,7 +280,7 @@ pub const WebServer = struct {
 
     /// SSE 长连接:从 since 重放 + 阻塞推新。since 来源优先级:?since=N > Last-Event-ID 头 > 0。
     /// id 语义:该行的 seq(0-based);浏览器重连带 Last-Event-ID=最后收到的 seq → 从 seq+1 续。
-    fn serveSse(self: *WebServer, fd: std.c.fd_t, line: RequestLine, head: []const u8) void {
+    fn serveSse(self: *WebServer, fd: net.Socket, line: RequestLine, head: []const u8) void {
         var since = resolveSince(line.query, head);
 
         if (!writeAll(fd, "HTTP/1.1 200 OK\r\n" ++
@@ -459,7 +439,7 @@ pub fn extractRespondId(body: []const u8) ?u64 {
     };
 }
 
-fn writeSimple(fd: std.c.fd_t, comptime status: []const u8, comptime content_type: []const u8, body: []const u8) void {
+fn writeSimple(fd: net.Socket, comptime status: []const u8, comptime content_type: []const u8, body: []const u8) void {
     var head_buf: [256]u8 = undefined;
     const head = std.fmt.bufPrint(&head_buf, "HTTP/1.1 " ++ status ++ "\r\n" ++
         "Content-Type: " ++ content_type ++ "\r\n" ++
@@ -469,10 +449,10 @@ fn writeSimple(fd: std.c.fd_t, comptime status: []const u8, comptime content_typ
     _ = writeAll(fd, body);
 }
 
-fn writeAll(fd: std.c.fd_t, bytes: []const u8) bool {
+fn writeAll(fd: net.Socket, bytes: []const u8) bool {
     var pos: usize = 0;
     while (pos < bytes.len) {
-        const n = std.c.write(fd, bytes.ptr + pos, bytes.len - pos);
+        const n = net.send(fd, bytes[pos..]);
         if (n <= 0) return false;
         pos += @intCast(n);
     }
@@ -692,23 +672,14 @@ fn httpRoundtrip(allocator: std.mem.Allocator, port: u16, raw: []const u8) ![]u8
 
 /// until 非空:读到包含该子串即返回(SSE 长连接不会关);null:读到 EOF。
 fn httpRoundtripPartial(allocator: std.mem.Allocator, port: u16, raw: []const u8, until: ?[]const u8) ![]u8 {
-    const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
-    if (fd < 0) return error.SocketFailed;
-    defer _ = std.c.close(fd);
-    var addr = std.c.sockaddr.in{
-        .family = std.c.AF.INET,
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = 0x0100007f,
-        .zero = [_]u8{0} ** 8,
-    };
-    if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) < 0) return error.ConnectFailed;
+    const fd = try net.connectLoopback(port);
+    defer net.closeSocket(fd);
     // 2s 读超时:失败测试快速失败而非挂死
-    const tv = std.c.timeval{ .sec = 2, .usec = 0 };
-    _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, &tv, @sizeOf(std.c.timeval));
+    net.setRecvTimeoutMs(fd, 2_000);
 
     var pos: usize = 0;
     while (pos < raw.len) {
-        const n = std.c.write(fd, raw.ptr + pos, raw.len - pos);
+        const n = net.send(fd, raw[pos..]);
         if (n <= 0) return error.WriteFailed;
         pos += @intCast(n);
     }
@@ -716,7 +687,7 @@ fn httpRoundtripPartial(allocator: std.mem.Allocator, port: u16, raw: []const u8
     errdefer out.deinit(allocator);
     var chunk: [4096]u8 = undefined;
     while (true) {
-        const n = std.c.read(fd, &chunk, chunk.len);
+        const n = net.recv(fd, &chunk);
         if (n <= 0) break;
         try out.appendSlice(allocator, chunk[0..@intCast(n)]);
         if (until) |u| {

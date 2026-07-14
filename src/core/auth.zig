@@ -9,6 +9,7 @@ const std = @import("std");
 const rng = @import("platform").rng;
 const process = @import("platform").process;
 const pfs = @import("platform").fs;
+const net = @import("platform").net;
 const builtin = @import("builtin");
 const fs_util = @import("../util/fs.zig");
 const time = @import("../util/time.zig");
@@ -339,7 +340,7 @@ fn buildAuthorizeUrl(
 }
 
 const CallbackServer = struct {
-    fd: std.c.fd_t,
+    sock: net.Socket,
     port: u16,
 
     fn bind(preferred_port: u16) !CallbackServer {
@@ -350,39 +351,19 @@ const CallbackServer = struct {
     }
 
     fn bindOnPort(port: u16) !CallbackServer {
-        const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
-        if (fd < 0) return error.SocketFailed;
-        errdefer _ = std.c.close(fd);
-        const yes: c_int = 1;
-        _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.REUSEADDR, &yes, @sizeOf(c_int));
-        var addr = std.c.sockaddr.in{
-            .family = std.c.AF.INET,
-            .port = std.mem.nativeToBig(u16, port),
-            .addr = 0x0100007f,
-            .zero = [_]u8{0} ** 8,
-        };
-        if (std.c.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) < 0) return error.BindFailed;
-        if (std.c.listen(fd, 4) < 0) return error.ListenFailed;
-        var bound: std.c.sockaddr.in = undefined;
-        var blen: std.c.socklen_t = @sizeOf(@TypeOf(bound));
-        if (std.c.getsockname(fd, @ptrCast(&bound), &blen) < 0) return error.GetSocknameFailed;
-        return .{ .fd = fd, .port = std.mem.bigToNative(u16, bound.port) };
+        // 可移植 loopback listen(POSIX socket/Windows WSAStartup+ws2_32),内部含 REUSEADDR+getsockname。
+        const l = try net.listenLoopback(port, 4);
+        return .{ .sock = l.sock, .port = l.port };
     }
 
     fn close(self: *CallbackServer) void {
-        if (self.fd >= 0) {
-            _ = std.c.close(self.fd);
-            self.fd = -1;
-        }
+        net.closeSocket(self.sock);
     }
 
     fn waitForAuthorizationCode(self: *CallbackServer, allocator: std.mem.Allocator, expected_state: []const u8) ![]u8 {
         while (true) {
-            var client_addr: std.c.sockaddr = undefined;
-            var alen: std.c.socklen_t = @sizeOf(@TypeOf(client_addr));
-            const conn_fd = std.c.accept(self.fd, &client_addr, &alen);
-            if (conn_fd < 0) return error.AcceptFailed;
-            defer _ = std.c.close(conn_fd);
+            const conn_fd = net.acceptConn(self.sock) orelse return error.AcceptFailed;
+            defer net.closeSocket(conn_fd);
             const req = readHttpRequest(allocator, conn_fd) catch {
                 sendHttpResponse(conn_fd, 400, "Bad Request", "Bad Request");
                 continue;
@@ -407,12 +388,12 @@ const CallbackServer = struct {
     }
 };
 
-fn readHttpRequest(allocator: std.mem.Allocator, fd: std.c.fd_t) ![]u8 {
+fn readHttpRequest(allocator: std.mem.Allocator, fd: net.Socket) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     var buf: [4096]u8 = undefined;
     while (out.items.len < 64 * 1024) {
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = net.recv(fd, &buf);
         if (n < 0) return error.ReadFailed;
         if (n == 0) break;
         try out.appendSlice(allocator, buf[0..@intCast(n)]);
@@ -421,15 +402,15 @@ fn readHttpRequest(allocator: std.mem.Allocator, fd: std.c.fd_t) ![]u8 {
     return try out.toOwnedSlice(allocator);
 }
 
-fn sendHttpResponse(fd: std.c.fd_t, status: u16, reason: []const u8, body: []const u8) void {
+fn sendHttpResponse(fd: net.Socket, status: u16, reason: []const u8, body: []const u8) void {
     var header_buf: [512]u8 = undefined;
     const header = std.fmt.bufPrint(
         &header_buf,
         "HTTP/1.1 {d} {s}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
         .{ status, reason, body.len },
     ) catch return;
-    _ = std.c.write(fd, header.ptr, header.len);
-    _ = std.c.write(fd, body.ptr, body.len);
+    _ = net.send(fd, header);
+    _ = net.send(fd, body);
 }
 
 pub fn parseCallbackRequestForTest(allocator: std.mem.Allocator, req: []const u8, expected_state: []const u8) ![]u8 {
