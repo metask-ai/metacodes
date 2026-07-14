@@ -186,6 +186,24 @@ const BASH_READONLY_NOTE =
 pub fn describeBash(allocator: std.mem.Allocator, ctx: *const PromptContext) anyerror![]u8 {
     const git_section = if (ctx.include_git and !ctx.isReadonlyAgent()) BASH_GIT_SECTION else "";
     const readonly_note = if (ctx.isReadonlyAgent()) BASH_READONLY_NOTE else "";
+    // 复刻 codex 第③层:平台化工具描述。Windows 上用系统自带 PowerShell 跑(零 git-bash),
+    // 故告诉模型产 **PowerShell** cmdlet 而非 bash 命令(codex 实证:比 bash→ps 翻译层更稳)。
+    if (@import("builtin").os.tag == .windows) {
+        return std.fmt.allocPrint(allocator,
+            \\Runs a PowerShell command (Windows) in a persistent shell session with an optional timeout, ensuring proper handling and security measures.
+            \\
+            \\Usage:
+            \\- The command argument is required. Write **PowerShell** syntax (this runs via `powershell -NoProfile -Command`, not bash).
+            \\- You can specify an optional timeout in milliseconds. If not specified, commands will time out after the default.
+            \\- It is very helpful if you write a clear, concise description of what this command does in 5-10 words.
+            \\- Use the `run_in_background` parameter to run in the background; do not append '&'.
+            \\- VERY IMPORTANT: avoid search/read via the shell — use Grep, Glob, Read, LS tools instead of `Select-String`/`Get-Content`/`Get-ChildItem` for finding and reading files. If you still must grep, prefer ripgrep at `rg`.
+            \\- Chain multiple commands with ';'. DO NOT use newlines.
+            \\- PowerShell examples: list all incl hidden → `Get-ChildItem -Force`; recursive by name → `Get-ChildItem -Recurse -Filter *.py`; set env var → `$env:FOO='bar'; echo $env:FOO`.
+            \\- Windows safety: use one shell end-to-end (do not enumerate in PowerShell then pipe to cmd/batch for delete/move); prefer `Remove-Item`/`Move-Item -LiteralPath`; verify absolute target stays in workspace before any recursive delete/move; pass `Start-Process -WindowStyle Hidden` for background helpers.
+            \\- Output (stdout/stderr) is truncated to ~30KB; a "[N lines truncated]" marker indicates this.{s}{s}
+        , .{ git_section, readonly_note });
+    }
     return std.fmt.allocPrint(allocator,
         \\Executes a given bash command in a persistent shell session with an optional timeout, ensuring proper handling and security measures.
         \\

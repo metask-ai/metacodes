@@ -16,10 +16,8 @@ const is_windows = builtin.os.tag == .windows;
 /// null 设备路径（丢弃写入的目标，如子进程 stderr 重定向）。
 pub const null_device: [*:0]const u8 = if (is_windows) "NUL" else "/dev/null";
 
-/// Bash 工具的 shell。POSIX 绝对 `/bin/sh`;Windows 用裸 `sh`——CreateProcessW 会搜 PATH
-/// 命中 git-bash 的 sh.exe(cc 同款依赖 git-bash;shell 决策见 metaknow node 8871)。无
-/// git-bash 时 spawn 失败并回错误,不静默。
-pub const shell_path: [*:0]const u8 = if (is_windows) "sh" else "/bin/sh";
+// shell 选择已移到 core/shell.zig(复刻 codex 三层策略:Windows 用系统自带 PowerShell/cmd,
+// 零 git-bash)。此前的 shell_path="sh" 依赖 git-bash,已退役。
 
 fn envNonEmpty(name: [*:0]const u8) ?[]const u8 {
     const v = std.c.getenv(name) orelse return null;

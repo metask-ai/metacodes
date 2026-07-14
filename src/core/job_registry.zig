@@ -24,6 +24,7 @@ const log = @import("../util/log.zig");
 const util_fs = @import("../util/fs.zig");
 const util_time = @import("../util/time.zig");
 const ppaths = @import("platform").paths;
+const shell_mod = @import("shell.zig");
 
 pub const JobStatus = enum { running, exited, killed, failed };
 
@@ -139,8 +140,11 @@ pub const JobRegistry = struct {
         defer self.allocator.free(cmd_z);
 
         // 走可移植 platform/process.spawnToFiles(POSIX fork+dup2 / Windows CreateProcessW DETACHED
-        // + _get_osfhandle 把落盘 fd 转 HANDLE)。Windows 的 /bin/sh 依赖 git-bash(shell 决策 node 8871)。
-        var argv: [4]?[*:0]const u8 = .{ ppaths.shell_path, "-c", cmd_z.ptr, null };
+        // + _get_osfhandle 把落盘 fd 转 HANDLE)。可移植 shell(复刻 codex):POSIX /bin/sh -c;
+        // Windows 原生 PowerShell/cmd,零 git-bash。
+        const shell = shell_mod.detectDefault();
+        var argv: [5]?[*:0]const u8 = undefined;
+        shell_mod.deriveExecArgs(shell, cmd_z.ptr, &argv);
         const proc = process.spawnToFiles(argv[0..], out_fd, err_fd) catch {
             _ = pfs.close(out_fd);
             _ = pfs.close(err_fd);
