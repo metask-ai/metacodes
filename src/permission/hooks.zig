@@ -38,6 +38,7 @@
 //!   SessionStart/SubagentStop/Notification 等事件仍未做(cc 有 ~30);⑤配置加载见 app.loadHooks。
 
 const std = @import("std");
+const process = @import("platform").process;
 const log = @import("../util/log.zig");
 const util_json = @import("../util/json.zig");
 const util_time = @import("../util/time.zig");
@@ -413,104 +414,30 @@ const OneHookResult = struct {
 /// exit 2 → block;exit 0 → 看 stdout decision;其它 → proceed(非阻塞错误)。
 /// stdout JSON 可含 updatedInput(改写工具输入)/ additionalContext(注入模型的补充上下文)。
 fn runOneHookFull(alloc: std.mem.Allocator, cmd: []const u8, stdin_json: []const u8) OneHookResult {
-    var in_pipe: [2]std.c.fd_t = undefined; // 父写 → 子读
-    var out_pipe: [2]std.c.fd_t = undefined; // 子写 → 父读
-    // spawn/pipe/fork 失败 → fail-open(proceed)但**记 warn**:否则坏 hook 配置与"没 hook"无从区分(调试陷阱)。
-    if (std.c.pipe(&in_pipe) != 0) {
-        log.warn("hook", "pipe() failed, skipping hook: {s}", .{cmd});
-        return .{};
-    }
-    if (std.c.pipe(&out_pipe) != 0) {
-        _ = std.c.close(in_pipe[0]);
-        _ = std.c.close(in_pipe[1]);
-        log.warn("hook", "pipe() failed, skipping hook: {s}", .{cmd});
-        return .{};
-    }
-
-    const cmd_z = alloc.dupeZ(u8, cmd) catch {
-        closeAll(&in_pipe, &out_pipe);
+    const cmd_z = alloc.dupeZ(u8, cmd) catch return .{};
+    defer alloc.free(cmd_z);
+    const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", cmd_z.ptr };
+    // 走可移植 platform/process.capture(POSIX fork / Windows CreateProcessW+git-bash):喂 stdin
+    // JSON、捕 stdout(≤4KB)、继承 env(hook 需 $HOME/$PATH)。**timeout_partial 安全语义**:慢但已
+    // 产 block 决策的 hook 超时也保留其部分输出判决,避免 fail-open 漏判(Linus/PM 红线)。cap 命中同理
+    // 返部分。spawn/pipe/fork 失败 → fail-open(proceed)但记 warn(坏 hook 与"没 hook"须可区分)。
+    const r = process.capture(argv[0..], alloc, .{
+        .stdin_data = stdin_json,
+        .want_stderr = false,
+        .inherit_env = true,
+        .timeout_ms = @intCast(HOOK_TIMEOUT_MS),
+        .max_bytes = 4096,
+        .timeout_partial = true,
+    }) catch {
+        log.warn("hook", "spawn failed, skipping hook: {s}", .{cmd});
         return .{};
     };
-    defer alloc.free(cmd_z);
-
-    const pid = std.c.fork();
-    if (pid < 0) {
-        closeAll(&in_pipe, &out_pipe);
-        log.warn("hook", "fork() failed, skipping hook: {s}", .{cmd});
-        return .{};
-    }
-    if (pid == 0) {
-        // 子进程:stdin ← in_pipe[0],stdout → out_pipe[1]
-        _ = std.c.setpgid(0, 0);
-        _ = std.c.dup2(in_pipe[0], 0);
-        _ = std.c.dup2(out_pipe[1], 1);
-        _ = std.c.close(in_pipe[0]);
-        _ = std.c.close(in_pipe[1]);
-        _ = std.c.close(out_pipe[0]);
-        _ = std.c.close(out_pipe[1]);
-        const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", cmd_z.ptr };
-        _ = std.c.execve("/bin/sh", @ptrCast(&argv), @ptrCast(std.c.environ));
-        std.c._exit(127);
-    }
-
-    // 父进程。**不 defer 关 in_pipe[1]/out_pipe[0]**——各自在下方显式关(避免 defer + 显式双关同一 fd:
-    // 并发线程可能已 open 复用该 fd 号,defer 会误关别人的 fd,Linus M2)。
-    _ = std.c.close(in_pipe[0]);
-    _ = std.c.close(out_pipe[1]);
-
-    // 写 stdin_json 给 hook,然后关写端(发 EOF)。SIGPIPE 已全局 SIG_IGN(main),
-    // 子进程不读 stdin 且写超 pipe 缓冲时 write 返 EPIPE(n<0)而非杀进程(Linus H1)。
-    var written: usize = 0;
-    while (written < stdin_json.len) {
-        const n = std.c.write(in_pipe[1], stdin_json.ptr + written, stdin_json.len - written);
-        if (n <= 0) break;
-        written += @intCast(n);
-    }
-    _ = std.c.close(in_pipe[1]);
-
-    // 读 hook stdout(最多 4KB,够 decision JSON)——**poll 有界**,HOOK_TIMEOUT_MS 内没读完就
-    // 超时 killpg(子进程 setpgid(0,0),负 pid 杀整组),防 hook 卡死阻塞 agent loop。
-    var out_buf: [4096]u8 = undefined;
-    var out_len: usize = 0;
-    var timed_out = false;
-    const start_ms: i64 = @intCast(util_time.nowMs());
-    while (out_len < out_buf.len) {
-        const elapsed: i64 = @as(i64, @intCast(util_time.nowMs())) - start_ms;
-        if (elapsed >= HOOK_TIMEOUT_MS) {
-            timed_out = true;
-            break;
-        }
-        var pfds = [_]std.c.pollfd{.{ .fd = out_pipe[0], .events = std.c.POLL.IN, .revents = 0 }};
-        const prc = std.c.poll(&pfds, 1, @intCast(HOOK_TIMEOUT_MS - elapsed));
-        if (prc == 0) {
-            timed_out = true;
-            break;
-        }
-        if (prc < 0) break; // EINTR/poll 错误 → 停读
-        if ((pfds[0].revents & std.c.POLL.IN) != 0) {
-            const n = std.c.read(out_pipe[0], (&out_buf).ptr + out_len, out_buf.len - out_len);
-            if (n <= 0) break; // EOF / 读错误
-            out_len += @intCast(n);
-        } else if ((pfds[0].revents & (std.c.POLL.HUP | std.c.POLL.ERR)) != 0) {
-            break; // 子进程关了写端
-        }
-    }
-    // 读满 4KB(截断):子进程可能还在写 → 若不处理,下方 waitpid 会与"pipe 满、子进程阻塞在 write"
-    // 死锁(Linus C2)。截断也当作"该杀":kill 整组,子进程 write 得 EPIPE/被杀而退,waitpid 才有界。
-    const truncated = (out_len == out_buf.len);
-    // **先关读端**:即便不 kill,子进程后续 write 也会 EPIPE(SIGPIPE 全局 ignore)→ 自行退出。
-    _ = std.c.close(out_pipe[0]);
-    if (timed_out or truncated) {
-        _ = std.c.kill(-pid, std.c.SIG.KILL);
-        if (timed_out) log.warn("hook", "hook 超时 {d}ms 被杀: {s}", .{ HOOK_TIMEOUT_MS, cmd });
-        if (truncated) log.warn("hook", "hook stdout 超 {d}B 被截断+杀(updatedInput 可能丢弃): {s}", .{ out_buf.len, cmd });
-    }
-    const stdout = out_buf[0..out_len];
-
-    // 等子进程,拿 exit code(超时/截断已 kill;读端已关,子进程 write EPIPE 会自退 → waitpid 有界)。
-    var status: c_int = 0;
-    _ = std.c.waitpid(pid, &status, 0);
-    const exit_code: u8 = if (timed_out or truncated) 1 else if (wifexited(status)) wexitstatus(status) else 1;
+    defer alloc.free(r.stdout);
+    defer alloc.free(r.stderr);
+    if (r.timed_out) log.warn("hook", "hook 超时 {d}ms 被杀(保留部分输出判决): {s}", .{ HOOK_TIMEOUT_MS, cmd });
+    const stdout = r.stdout;
+    // 超时/被 kill(exit_code 负)→ 非 exit-2,走 stdout 决策;正常退出取实 exit code(exit 2 = block)。
+    const exit_code: u8 = if (r.timed_out) 1 else if (r.exit_code >= 0 and r.exit_code <= 255) @intCast(r.exit_code) else 1;
 
     var result = OneHookResult{};
 

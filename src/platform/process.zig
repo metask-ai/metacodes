@@ -26,6 +26,10 @@ pub const CaptureOpts = struct {
     max_bytes: usize = 16 << 20,
     /// false → 子进程 stderr 丢弃（→/dev/null / NUL），结果 stderr 为空。
     want_stderr: bool = true,
+    /// true → 超时时返回**已读部分输出**（Ok，timed_out=true，进程已 kill）而非 error.Timeout。
+    /// 安全语义场景用（如 permission hook：慢但已产出 block 决策的 hook 超时也要保留其部分输出判决，
+    /// 否则 fail-open 漏判）。默认 false（超时=error.Timeout，丢弃输出）。
+    timeout_partial: bool = false,
     /// 非 null → 喂给子进程 stdin 后关闭（发 EOF）。**仅适合小数据**（≤ pipe 缓冲，如 hook JSON）：
     /// 首版在 drain 前一次性写完，大 stdin 会与子进程大 stdout 互阻死锁。
     stdin_data: ?[]const u8 = null,
@@ -42,7 +46,8 @@ pub const Captured = struct {
     stdout: []u8, // owned
     stderr: []u8, // owned（want_stderr=false 时为空 slice）
     exit_code: i32,
-    // 超时 → error.Timeout；abort → error.Aborted；cap 命中 → Ok（返部分，进程已 kill）。
+    timed_out: bool = false, // 仅 timeout_partial=true 时有意义：超时被 kill 但返了部分输出。
+    // 超时(非 timeout_partial) → error.Timeout；abort → error.Aborted；cap 命中 → Ok（返部分，进程已 kill）。
 };
 
 /// spawn argv、抽干 stdout[+stderr]、返回结果。timeout_ms==0 无超时。
@@ -455,11 +460,12 @@ fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts
     var status: c_int = 0;
     _ = std.c.waitpid(pid, &status, 0);
 
-    if (timed_out) return error.Timeout; // errdefer 释放 out/err（勿显式 deinit → 双 free）
+    if (timed_out and !opts.timeout_partial) return error.Timeout; // errdefer 释放 out/err（勿显式 deinit → 双 free）
     return .{
         .stdout = try out.toOwnedSlice(allocator),
         .stderr = try err.toOwnedSlice(allocator),
         .exit_code = posixExitCode(status),
+        .timed_out = timed_out,
     };
 }
 
@@ -650,11 +656,12 @@ fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, op
 
     if (out_reader.oom) return error.OutOfMemory;
     if (aborted) return error.Aborted; // errdefer 释放 out/err（勿显式 deinit → 双 free）
-    if (timed_out) return error.Timeout;
+    if (timed_out and !opts.timeout_partial) return error.Timeout;
     return .{
         .stdout = try out.toOwnedSlice(allocator),
         .stderr = try err.toOwnedSlice(allocator),
         .exit_code = @bitCast(code),
+        .timed_out = timed_out,
     };
 }
 
