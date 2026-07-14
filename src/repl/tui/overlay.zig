@@ -62,7 +62,7 @@ const testing = std.testing;
 
 test "Overlay: 双 enter 幂等" {
     // 用 /dev/null fd 避免污染终端
-    const dev_null = pfs.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+    const dev_null = pfs.open(@import("platform").paths.null_device, .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
     defer { if (dev_null >= 0) _ = pfs.close(dev_null); }
     if (dev_null < 0) return error.SkipZigTest;
 
@@ -79,7 +79,7 @@ test "Overlay: 双 enter 幂等" {
 }
 
 test "Overlay: hide_cursor=false 不写 hide/show" {
-    const dev_null = pfs.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+    const dev_null = pfs.open(@import("platform").paths.null_device, .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
     defer { if (dev_null >= 0) _ = pfs.close(dev_null); }
     if (dev_null < 0) return error.SkipZigTest;
 
