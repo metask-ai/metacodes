@@ -155,6 +155,26 @@ pub fn realpath(file_name: [*:0]const u8, resolved_name: [*]u8) ?[*:0]u8 {
     return std.c.realpath(file_name, resolved_name);
 }
 
+/// 原子重命名(**替换**已存在目标)。POSIX rename(本就替换)/ Windows MoveFileExW +
+/// MOVEFILE_REPLACE_EXISTING(裸 rename 在 Windows 遇目标已存在会失败,非替换语义)。
+/// 返回 0 成功、非 0 失败。
+pub fn renameReplace(from: [*:0]const u8, to: [*:0]const u8) c_int {
+    if (is_windows) {
+        var fbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        var tbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        const fl = std.unicode.utf8ToUtf16Le(&fbuf, std.mem.span(from)) catch return -1;
+        const tl = std.unicode.utf8ToUtf16Le(&tbuf, std.mem.span(to)) catch return -1;
+        if (fl >= fbuf.len or tl >= tbuf.len) return -1;
+        fbuf[fl] = 0;
+        tbuf[tl] = 0;
+        const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+        return if (MoveFileExW(@ptrCast(&fbuf), @ptrCast(&tbuf), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) 0 else -1;
+    }
+    return std.c.rename(from, to);
+}
+extern "kernel32" fn MoveFileExW(lpExistingFileName: [*:0]const u16, lpNewFileName: [*:0]const u16, dwFlags: u32) callconv(.winapi) c_int;
+
 /// 路径是否存在(文件**或目录**)。POSIX access(F_OK) / Windows GetFileAttributesW。
 /// **勿用 open() 判存在**:Windows `_open` 打不开目录(返 -1),会把存在的目录误判成不存在。
 pub fn exists(path: [*:0]const u8) bool {

@@ -25,11 +25,22 @@ pub fn path(buf: []u8, name: []const u8) [:0]const u8 {
     const tmp = if (@import("builtin").os.tag == .windows) fwd(&tmpbuf, ppaths.tempDir()) else "/tmp";
     if (!dir_made) {
         var dirbuf: [std.fs.max_path_bytes]u8 = undefined;
-        const dir = std.fmt.bufPrint(&dirbuf, "{s}/cc-zig-test-{d}", .{ tmp, pid }) catch return "";
-        @import("../util/fs.zig").mkdirParents(dir) catch {}; // 已存在/建成都无害
+        const dpath = std.fmt.bufPrint(&dirbuf, "{s}/cc-zig-test-{d}", .{ tmp, pid }) catch return "";
+        @import("../util/fs.zig").mkdirParents(dpath) catch {}; // 已存在/建成都无害
         dir_made = true;
     }
     return std.fmt.bufPrintZ(buf, "{s}/cc-zig-test-{d}/{s}", .{ tmp, pid, name }) catch unreachable;
+}
+
+/// 返回 per-pid 临时目录 `<tempdir>/cc-zig-test-<pid>`(NUL 结尾,写进 buf,可移植正斜杠)。
+/// 供需要"目录本身"的测试用(如 Read ~ 展开把 home 设成它)。首调建目录。
+pub fn dir(buf: []u8) [:0]const u8 {
+    var b: [512]u8 = undefined;
+    _ = path(&b, "."); // 触发建目录
+    const pid = pprocess.currentPid();
+    var tmpbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp = if (@import("builtin").os.tag == .windows) fwd(&tmpbuf, ppaths.tempDir()) else "/tmp";
+    return std.fmt.bufPrintZ(buf, "{s}/cc-zig-test-{d}", .{ tmp, pid }) catch unreachable;
 }
 
 /// 反斜杠 → 正斜杠(拷进 out,返回 slice)。

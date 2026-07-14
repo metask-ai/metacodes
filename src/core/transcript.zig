@@ -231,7 +231,7 @@ pub const Writer = struct {
 
         var fpath_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
         const fpath = try std.fmt.bufPrint(&fpath_buf, "{s}/meta.json\x00", .{self.dir});
-        if (std.c.rename(@ptrCast(tpath.ptr), @ptrCast(fpath.ptr)) != 0) return error.RenameFailed;
+        if (pfs.renameReplace(@ptrCast(tpath.ptr), @ptrCast(fpath.ptr)) != 0) return error.RenameFailed;
     }
 };
 
@@ -658,7 +658,9 @@ test "write tool_use and tool_result roundtrip" {
 
 test "listSessions orders by last_modified desc" {
     const a = std.testing.allocator;
-    const tmp_home = try std.fmt.allocPrint(a, "/tmp/cc-zig-transcript-list-test-{d}", .{util_time.nowMs()});
+    // 可移植临时目录(POSIX /tmp / Windows TEMP,正斜杠)。
+    var _tb: [512]u8 = undefined;
+    const tmp_home = try std.fmt.allocPrint(a, "{s}/cc-zig-transcript-list-test-{d}", .{ @import("../tools/test_tmp.zig").dir(&_tb), util_time.nowMs() });
     defer {
         util_fs.testing.rmrfBestEffort(tmp_home);
         a.free(tmp_home);

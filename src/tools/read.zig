@@ -870,9 +870,9 @@ test "ReadTool ~ 展开端到端(主 bug 回归)" {
     _ = pfs.close(fd);
     defer _ = std.c.unlink(fpath.ptr);
 
-    // home_dir = /tmp/cc-zig-test-<pid>;故 ~/tilde-expand-read.txt 展开到 fixture。
-    var hbuf: [128]u8 = undefined;
-    const home = std.fmt.bufPrint(&hbuf, "/tmp/cc-zig-test-{d}", .{@as(i64, pprocess.currentPid())}) catch unreachable;
+    // home_dir = per-pid 临时目录(可移植);故 ~/tilde-expand-read.txt 展开到 fixture。
+    var hbuf: [512]u8 = undefined;
+    const home = tt.dir(&hbuf);
     var ctx = ToolContext.simple(a);
     ctx.home_dir = home;
 

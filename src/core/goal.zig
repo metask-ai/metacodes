@@ -170,7 +170,7 @@ pub const State = struct {
         defer _ = pfs.close(fd);
         const n = pfs.write(fd, bytes);
         if (n < 0 or @as(usize, @intCast(n)) != bytes.len) return error.WriteFailed;
-        if (std.c.rename(tmp_z.ptr, path_z.ptr) != 0) return error.RenameFailed;
+        if (pfs.renameReplace(tmp_z.ptr, path_z.ptr) != 0) return error.RenameFailed;
     }
 
     fn touch(self: *State) void {
