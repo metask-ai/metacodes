@@ -8,6 +8,7 @@
 //! 与 request 的 response 交织。故 readMessage 只负责"读一条完整帧",分发(response by id vs
 //! notification by method)由上层 client 处理。abort-aware poll 守卫防阻塞 agent loop。
 const std = @import("std");
+const process = @import("platform").process;
 
 /// 中立 abort 检查(LSP 子系统自包含,不依赖 core 内部;集成时由 core.AbortSignal 适配)。
 pub const AbortCheck = struct {
@@ -20,62 +21,16 @@ pub const AbortCheck = struct {
 
 pub const Transport = struct {
     allocator: std.mem.Allocator,
-    pid: std.c.pid_t,
-    stdin_fd: std.c.fd_t, // 父写 → 子读
-    stdout_fd: std.c.fd_t, // 子写 → 父读
+    child: process.PipeChild,
     read_buf: std.ArrayList(u8) = .empty,
     read_pos: usize = 0,
     abort: ?AbortCheck = null,
 
-    /// spawn language server。argv null 结尾,argv[0] 绝对路径或在 PATH。
-    /// server 的 stderr **重定向到 /dev/null**(M1:gopls/rust-analyzer/clangd/tsserver 会往 stderr 狂打
-    /// 进度/索引日志,继承父进程会糊花交互式 TUI 画面。诊断走 stdout 的 publishDiagnostics,不需 stderr)。
+    /// spawn language server。argv null 结尾,argv[0] 绝对路径或在 PATH。走可移植 platform/process.spawnPipes
+    /// (server stderr → null/NUL:M1 防 chatty server 日志糊花 TUI;inherit_env=true:server 需 PATH/HOME 找 node/python)。
     pub fn spawn(allocator: std.mem.Allocator, argv: []const ?[*:0]const u8) !Transport {
-        var in_pipe: [2]std.c.fd_t = undefined; // [0] read, [1] write
-        var out_pipe: [2]std.c.fd_t = undefined;
-        if (std.c.pipe(&in_pipe) != 0) return error.PipeFailed;
-        errdefer {
-            _ = std.c.close(in_pipe[0]);
-            _ = std.c.close(in_pipe[1]);
-        }
-        if (std.c.pipe(&out_pipe) != 0) return error.PipeFailed;
-        errdefer {
-            _ = std.c.close(out_pipe[0]);
-            _ = std.c.close(out_pipe[1]);
-        }
-
-        const pid = std.c.fork();
-        if (pid < 0) return error.ForkFailed;
-        if (pid == 0) {
-            // 子进程:独立进程组(便于 killpg 清整个 server 及其子进程)。
-            _ = std.c.setpgid(0, 0);
-            _ = std.c.dup2(in_pipe[0], 0); // stdin ← in_pipe[0]
-            _ = std.c.dup2(out_pipe[1], 1); // stdout → out_pipe[1]
-            // M1:stderr → /dev/null,防 chatty server 日志糊花交互式 TUI。打不开也无妨(继承)。
-            const devnull = std.c.open("/dev/null", std.c.O{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
-            if (devnull >= 0) {
-                _ = std.c.dup2(devnull, 2);
-                _ = std.c.close(devnull);
-            }
-            _ = std.c.close(in_pipe[0]);
-            _ = std.c.close(in_pipe[1]);
-            _ = std.c.close(out_pipe[0]);
-            _ = std.c.close(out_pipe[1]);
-            // execve 不搜 PATH:argv[0] 须绝对路径(servers.zig 已 which 解析)。继承父 environ
-            // (LSP server 需 PATH/HOME 找 node/python 等)。
-            _ = std.c.execve(argv[0].?, @ptrCast(argv.ptr), @ptrCast(std.c.environ));
-            std.c._exit(127); // execve 失败
-        }
-
-        // 父进程:关子端。
-        _ = std.c.close(in_pipe[0]);
-        _ = std.c.close(out_pipe[1]);
-        return .{
-            .allocator = allocator,
-            .pid = pid,
-            .stdin_fd = in_pipe[1],
-            .stdout_fd = out_pipe[0],
-        };
+        const child = process.spawnPipes(argv, true) catch return error.SpawnFailed;
+        return .{ .allocator = allocator, .child = child };
     }
 
     /// 发一条 JSON-RPC 消息(自动加 Content-Length header)。
@@ -89,7 +44,7 @@ pub const Transport = struct {
     fn writeAll(self: *Transport, bytes: []const u8) !void {
         var total: usize = 0;
         while (total < bytes.len) {
-            const n = std.c.write(self.stdin_fd, bytes.ptr + total, bytes.len - total);
+            const n = self.child.write(bytes[total..]);
             if (n <= 0) return error.WriteFailed;
             total += @intCast(n);
         }
@@ -135,15 +90,11 @@ pub const Transport = struct {
         if (self.abort) |ab| {
             while (true) {
                 if (ab.isAborted()) return error.Aborted;
-                var pfds = [_]std.c.pollfd{.{ .fd = self.stdout_fd, .events = std.c.POLL.IN, .revents = 0 }};
-                const prc = std.c.poll(&pfds, 1, 100);
-                if (prc > 0) break;
-                if (prc < 0) break; // EINTR → 让 read 处理
-                // prc==0 超时 → 回查 abort
+                if (self.child.pollReadable(100)) break; // 有数据/EOF/错误 → 下面 read;超时回查 abort
             }
         }
         var chunk: [8192]u8 = undefined;
-        const n = std.c.read(self.stdout_fd, &chunk, chunk.len);
+        const n = self.child.read(&chunk);
         if (n < 0) return error.ReadFailed;
         if (n == 0) return error.Eof;
         try self.read_buf.appendSlice(self.allocator, chunk[0..@intCast(n)]);
@@ -166,24 +117,13 @@ pub const Transport = struct {
     /// ——那两个还被 reader 线程用着;子进程死后其 stdout 关闭 → reader 的 read 返 EOF 自然退出。
     /// 调用顺序(client.shutdown):terminate() → join(reader) → deinit()。
     pub fn terminate(self: *Transport) void {
-        _ = std.c.close(self.stdin_fd); // 关 stdin:良性 server 收到 EOF 自退
-        _ = std.c.kill(-self.pid, std.c.SIG.TERM);
-        const req = std.c.timespec{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
-        var rem: std.c.timespec = undefined;
-        _ = std.c.nanosleep(&req, &rem);
-        var status: c_int = 0;
-        const WNOHANG: c_int = 1;
-        const rc = std.c.waitpid(self.pid, &status, WNOHANG);
-        if (rc == 0) {
-            // 顽固 server(ignore SIGTERM)→ SIGKILL 强杀 + 阻塞 waitpid,保证子进程死 → reader EOF 有界。
-            _ = std.c.kill(-self.pid, std.c.SIG.KILL);
-            _ = std.c.waitpid(self.pid, &status, 0);
-        }
+        self.child.closeStdin(); // 关 stdin:良性 server 收 EOF 自退
+        self.child.terminate(); // SIGTERM→等→WNOHANG→顽固 SIGKILL→收尸（见 PipeChild.terminate）
     }
 
-    /// 关 stdout_fd + 释放 read_buf。**必须在 reader 线程 join 之后调**(否则 UAF)。
+    /// 关 stdout + 释放 read_buf。**必须在 reader 线程 join 之后调**(否则 UAF)。
     pub fn deinit(self: *Transport) void {
-        _ = std.c.close(self.stdout_fd);
+        self.child.closeStdout();
         self.read_buf.deinit(self.allocator);
     }
 

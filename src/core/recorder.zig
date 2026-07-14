@@ -12,7 +12,7 @@
 //! 为不存在的需求加复杂度。真要并发录多会话时再按 session_id 分文件名(低优先级)。
 
 const std = @import("std");
-const sync = @import("../platform/sync.zig");
+const sync = @import("platform").sync;
 const log = @import("../util/log.zig");
 
 var g_dir: ?[]const u8 = null;

@@ -7,7 +7,7 @@
 //! `deinit` 释放所有 blocks。不做 compact 的实现（留给未来 M6）。
 
 const std = @import("std");
-const sync = @import("../platform/sync.zig");
+const sync = @import("platform").sync;
 const msg = @import("message.zig");
 
 pub const TOOL_RESULT_CLEARED_STUB = "[tool result cleared to save context]";

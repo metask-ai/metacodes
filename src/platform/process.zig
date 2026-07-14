@@ -117,6 +117,168 @@ pub fn spawnDetached(argv: []const ?[*:0]const u8, inherit_env: bool) CaptureErr
     // 父：fire-and-forget，不 waitpid（对齐原 openBrowser）。
 }
 
+// ============================================================================
+// 长连接双向 pipe 子进程（MCP/LSP stdio transport：spawn + 持久 stdin/stdout + terminate）
+// ============================================================================
+
+/// 长连接子进程句柄：持有进程 + stdin(父写)/stdout(父读) 端点。POSIX=pid+fd；Windows=HANDLE。
+pub const PipeChild = struct {
+    proc: if (is_windows) win.HANDLE else std.c.pid_t,
+    stdin_h: if (is_windows) win.HANDLE else std.c.fd_t,
+    stdout_h: if (is_windows) win.HANDLE else std.c.fd_t,
+
+    /// 写子进程 stdin。返回写出字节数（<0=错误）。
+    pub fn write(self: *const PipeChild, data: []const u8) isize {
+        if (is_windows) {
+            var wrote: win.DWORD = 0;
+            if (WriteFile(self.stdin_h, data.ptr, @intCast(@min(data.len, std.math.maxInt(win.DWORD))), &wrote, null) == 0) return -1;
+            return @intCast(wrote);
+        }
+        return std.c.write(self.stdin_h, data.ptr, data.len);
+    }
+
+    /// 读子进程 stdout。返回读到字节数（0=EOF，<0=错误）。
+    pub fn read(self: *const PipeChild, buf: []u8) isize {
+        if (is_windows) {
+            var got: win.DWORD = 0;
+            if (ReadFile(self.stdout_h, buf.ptr, @intCast(@min(buf.len, std.math.maxInt(win.DWORD))), &got, null) == 0) return -1; // ERROR_BROKEN_PIPE 等
+            return @intCast(got);
+        }
+        return std.c.read(self.stdout_h, buf.ptr, buf.len);
+    }
+
+    /// stdout 是否在 timeout_ms 内可读（abort-aware 守卫用：超时回查 abort 再 poll）。
+    /// 返 true=有数据可读 or EOF/错误（read 不会无限阻塞）；false=超时无数据。
+    /// POSIX=poll；Windows=PeekNamedPipe 轮询（pipe HANDLE 无 poll）。
+    pub fn pollReadable(self: *const PipeChild, timeout_ms: u32) bool {
+        if (is_windows) {
+            const deadline = nowMs() + @as(i64, timeout_ms);
+            while (true) {
+                var avail: win.DWORD = 0;
+                if (PeekNamedPipe(self.stdout_h, null, 0, null, &avail, null) == 0) return true; // 错误/EOF → 交给 read
+                if (avail > 0) return true;
+                if (nowMs() >= deadline) return false;
+                Sleep(10);
+            }
+        }
+        var pfds = [_]std.c.pollfd{.{ .fd = self.stdout_h, .events = std.c.POLL.IN, .revents = 0 }};
+        return std.c.poll(&pfds, 1, @intCast(timeout_ms)) > 0;
+    }
+
+    /// 关闭 stdin 端（发 EOF 给子进程，如 LSP shutdown）。
+    pub fn closeStdin(self: *const PipeChild) void {
+        if (is_windows) win.CloseHandle(self.stdin_h) else _ = std.c.close(self.stdin_h);
+    }
+
+    /// 关闭 stdout 端。
+    pub fn closeStdout(self: *const PipeChild) void {
+        if (is_windows) win.CloseHandle(self.stdout_h) else _ = std.c.close(self.stdout_h);
+    }
+
+    /// 终止子进程并回收。POSIX：SIGTERM→200ms→WNOHANG 查→顽固则 SIGKILL→阻塞收尸（防 ignore-TERM
+    /// 的 server 令 waitpid 永挂）；Windows：TerminateProcess+WaitForSingleObject+CloseHandle。
+    pub fn terminate(self: *const PipeChild) void {
+        if (is_windows) {
+            _ = TerminateProcess(self.proc, 1);
+            _ = WaitForSingleObject(self.proc, 2000);
+            win.CloseHandle(self.proc);
+        } else {
+            _ = std.c.kill(-self.proc, std.c.SIG.TERM);
+            const req = std.c.timespec{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
+            var rem: std.c.timespec = undefined;
+            _ = std.c.nanosleep(&req, &rem);
+            var status: c_int = 0;
+            const WNOHANG: c_int = 1;
+            if (std.c.waitpid(self.proc, &status, WNOHANG) == 0) {
+                _ = std.c.kill(-self.proc, std.c.SIG.KILL);
+                _ = std.c.waitpid(self.proc, &status, 0);
+            }
+        }
+    }
+};
+
+/// spawn 长连接子进程，返回持久 stdin(父写)/stdout(父读) 端点。stderr 丢弃（→null/NUL）。
+pub fn spawnPipes(argv: []const ?[*:0]const u8, inherit_env: bool) CaptureError!PipeChild {
+    if (is_windows) return spawnPipesWindows(argv);
+    return spawnPipesPosix(argv, inherit_env);
+}
+
+fn spawnPipesPosix(argv: []const ?[*:0]const u8, inherit_env: bool) CaptureError!PipeChild {
+    var in_pipe: [2]std.c.fd_t = undefined; // 父写 → 子读
+    var out_pipe: [2]std.c.fd_t = undefined; // 子写 → 父读
+    if (std.c.pipe(&in_pipe) != 0) return error.PipeFailed;
+    if (std.c.pipe(&out_pipe) != 0) {
+        _ = std.c.close(in_pipe[0]);
+        _ = std.c.close(in_pipe[1]);
+        return error.PipeFailed;
+    }
+    const pid = std.c.fork();
+    if (pid < 0) {
+        _ = std.c.close(in_pipe[0]);
+        _ = std.c.close(in_pipe[1]);
+        _ = std.c.close(out_pipe[0]);
+        _ = std.c.close(out_pipe[1]);
+        return error.SpawnFailed;
+    }
+    if (pid == 0) {
+        _ = std.c.setpgid(0, 0);
+        _ = std.c.dup2(in_pipe[0], 0);
+        _ = std.c.dup2(out_pipe[1], 1);
+        _ = std.c.close(in_pipe[0]);
+        _ = std.c.close(in_pipe[1]);
+        _ = std.c.close(out_pipe[0]);
+        _ = std.c.close(out_pipe[1]);
+        const devnull = std.c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+        if (devnull >= 0) {
+            _ = std.c.dup2(devnull, 2);
+            if (devnull != 2) _ = std.c.close(devnull);
+        }
+        const argv0 = argv[0] orelse std.c._exit(127);
+        const envp: [*:null]const ?[*:0]const u8 = if (inherit_env) @ptrCast(std.c.environ) else &.{null};
+        _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), envp);
+        std.c._exit(127);
+    }
+    _ = std.c.close(in_pipe[0]); // 父不读 stdin pipe
+    _ = std.c.close(out_pipe[1]); // 父不写 stdout pipe
+    _ = std.c.setpgid(pid, pid);
+    return .{ .proc = pid, .stdin_h = in_pipe[1], .stdout_h = out_pipe[0] };
+}
+
+fn spawnPipesWindows(argv: []const ?[*:0]const u8) CaptureError!PipeChild {
+    // stdin：read 端可继承（子读）、write 端父写；stdout：write 端可继承（子写）、read 端父读。
+    var in_rd: win.HANDLE = undefined;
+    var in_wr: win.HANDLE = undefined;
+    var sa = win.SECURITY_ATTRIBUTES{ .nLength = @sizeOf(win.SECURITY_ATTRIBUTES), .lpSecurityDescriptor = null, .bInheritHandle = @enumFromInt(1) };
+    if (CreatePipe(&in_rd, &in_wr, &sa, 0) == 0 or SetHandleInformation(in_wr, HANDLE_FLAG_INHERIT, 0) == 0) return error.PipeFailed;
+    var out_rd: win.HANDLE = undefined;
+    var out_wr: win.HANDLE = undefined;
+    if (CreatePipe(&out_rd, &out_wr, &sa, 0) == 0 or SetHandleInformation(out_rd, HANDLE_FLAG_INHERIT, 0) == 0) {
+        win.CloseHandle(in_rd);
+        win.CloseHandle(in_wr);
+        return error.PipeFailed;
+    }
+    const a = std.heap.page_allocator;
+    const cmdline = buildWindowsCmdline(a, argv) catch return error.SpawnFailed;
+    defer a.free(cmdline);
+    var si = std.mem.zeroes(win.STARTUPINFOW);
+    si.cb = @sizeOf(win.STARTUPINFOW);
+    si.dwFlags = win.STARTF_USESTDHANDLES;
+    si.hStdInput = in_rd;
+    si.hStdOutput = out_wr;
+    si.hStdError = null;
+    var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
+    const created = win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{}, null, null, &si, &pi);
+    win.CloseHandle(in_rd); // 父端关子进程侧
+    win.CloseHandle(out_wr);
+    if (created == .FALSE) {
+        win.CloseHandle(in_wr);
+        win.CloseHandle(out_rd);
+        return error.SpawnFailed;
+    }
+    win.CloseHandle(pi.hThread);
+    return .{ .proc = pi.hProcess, .stdin_h = in_wr, .stdout_h = out_rd };
+}
+
 fn labelOf(argv: []const ?[*:0]const u8) []const u8 {
     const a0 = argv[0] orelse return "?";
     const full = std.mem.span(a0);
@@ -319,6 +481,8 @@ extern "kernel32" fn WriteFile(hFile: win.HANDLE, lpBuffer: [*]const u8, nToWrit
 extern "kernel32" fn WaitForSingleObject(hHandle: win.HANDLE, dwMilliseconds: win.DWORD) callconv(.winapi) win.DWORD;
 extern "kernel32" fn GetExitCodeProcess(hProcess: win.HANDLE, lpExitCode: *win.DWORD) callconv(.winapi) c_int;
 extern "kernel32" fn TerminateProcess(hProcess: win.HANDLE, uExitCode: win.UINT) callconv(.winapi) c_int;
+extern "kernel32" fn PeekNamedPipe(hNamedPipe: win.HANDLE, lpBuffer: ?[*]u8, nBufferSize: win.DWORD, lpBytesRead: ?*win.DWORD, lpTotalBytesAvail: ?*win.DWORD, lpBytesLeftThisMessage: ?*win.DWORD) callconv(.winapi) c_int;
+extern "kernel32" fn Sleep(dwMilliseconds: win.DWORD) callconv(.winapi) void;
 
 // 每个 reader 线程独占自己的 list（out_reader→out / err_reader→err），main 在 join 后才读，
 // 无跨线程并发访问同一 list → 无需锁。
@@ -597,6 +761,28 @@ test "capture 超时返 error.Timeout（有缓冲输出，验不 double-free）"
     else
         &.{ "/bin/sh", "-c", "echo before; sleep 10", null };
     try std.testing.expectError(error.Timeout, capture(argv, a, .{ .timeout_ms = 400 }));
+}
+
+test "spawnPipes 双向 echo（写 stdin 读回 stdout）" {
+    if (!procSpawnTestsEnabled()) return error.SkipZigTest;
+    const argv: []const ?[*:0]const u8 = if (is_windows)
+        &.{ "cmd.exe", "/c", "more", null }
+    else
+        &.{ "/bin/sh", "-c", "cat", null };
+    const child = try spawnPipes(argv, true);
+    const msg = "ping-pong-99\n";
+    _ = child.write(msg);
+    child.closeStdin(); // EOF → cat/more 回显后退出
+    var buf: [128]u8 = undefined;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const n = child.read(buf[total..]);
+        if (n <= 0) break;
+        total += @intCast(n);
+    }
+    child.closeStdout();
+    child.terminate();
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..total], "ping-pong-99") != null);
 }
 
 test "runInherit 返回 exit code" {

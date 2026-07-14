@@ -7,7 +7,7 @@
 //! 自带 pthread mutex(不复用 RenderRegion.mutex,避免锁顺序耦合)。
 
 const std = @import("std");
-const sync = @import("../platform/sync.zig");
+const sync = @import("platform").sync;
 
 pub const MsgQueue = struct {
     items: std.ArrayList([]u8) = .empty, // 每条 owned text(入队 dupe,出队转移所有权给调用者)

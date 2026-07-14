@@ -21,7 +21,7 @@
 //! poll 恒 null(生产路径无人消费 poll,与 TuiBackend 现状一致)。
 
 const std = @import("std");
-const sync = @import("../platform/sync.zig");
+const sync = @import("platform").sync;
 const ui_backend = @import("../core/protocol/ui_backend.zig");
 const ui_event = @import("../core/protocol/ui_event.zig");
 const ui_request = @import("../core/protocol/ui_request.zig");

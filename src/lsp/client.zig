@@ -13,7 +13,7 @@
 //! push_counter,任何 increment 都重查 version 谓词(published_version >= sent_version)。
 //! **seed-on-first-push**(TS 系):首个 publishDiagnostics 只存不 signal,防 waiter 命中 pre-edit 旧诊断。
 const std = @import("std");
-const sync = @import("../platform/sync.zig");
+const sync = @import("platform").sync;
 const transport_mod = @import("transport.zig");
 const protocol = @import("protocol.zig");
 const reporter = @import("reporter.zig");

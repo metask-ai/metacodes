@@ -11,7 +11,7 @@
 //! 线程安全:并发工具执行(批1)下 put 可能在工具线程,渲染在主线程 → 加锁。
 
 const std = @import("std");
-const sync = @import("../platform/sync.zig");
+const sync = @import("platform").sync;
 
 /// 单条:某次 Edit/Write 的新旧全文(owned)。
 pub const Entry = struct {

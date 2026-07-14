@@ -11,7 +11,7 @@
 //! 不会打断正在进行的生成。这是有意的简化(避免并发复杂度)。
 
 const std = @import("std");
-const rng = @import("../platform/rng.zig");
+const rng = @import("platform").rng;
 const util_time = @import("../util/time.zig");
 
 pub const CronJob = struct {

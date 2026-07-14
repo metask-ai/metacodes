@@ -6,8 +6,8 @@
 //! recovery.
 
 const std = @import("std");
-const rng = @import("../platform/rng.zig");
-const process = @import("../platform/process.zig");
+const rng = @import("platform").rng;
+const process = @import("platform").process;
 const builtin = @import("builtin");
 const fs_util = @import("../util/fs.zig");
 const time = @import("../util/time.zig");

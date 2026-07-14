@@ -19,8 +19,8 @@
 //! App.deinit 必须在共享 allocator 释放之前调本 deinit。
 
 const std = @import("std");
-const rng = @import("../platform/rng.zig");
-const sync = @import("../platform/sync.zig");
+const rng = @import("platform").rng;
+const sync = @import("platform").sync;
 const client_mod = @import("../client.zig");
 const pf = @import("../api/provider_factory.zig");
 const types_mod = @import("../types.zig");

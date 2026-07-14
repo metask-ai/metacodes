@@ -13,6 +13,7 @@
 //! 让挂死的 MCP server 能被 Ctrl+C(AbortSignal)打断,不再无限 wedge agent。未设 abort → 退回纯阻塞。
 
 const std = @import("std");
+const process = @import("platform").process;
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
 /// 单行(一条 JSON-RPC 响应/resource)字节上限(轴A OOM 防线)。MCP resource 可合法较大(文件内容),
@@ -20,9 +21,7 @@ const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const MAX_MCP_LINE_BYTES: usize = 64 * 1024 * 1024;
 
 pub const StdioTransport = struct {
-    pid: std.c.pid_t,
-    stdin_fd: std.c.fd_t,
-    stdout_fd: std.c.fd_t,
+    child: process.PipeChild,
     read_buf: std.ArrayList(u8),
     read_buf_pos: usize = 0,
     allocator: std.mem.Allocator,
@@ -30,48 +29,11 @@ pub const StdioTransport = struct {
     abort: ?*const AbortSignal = null,
 
     /// spawn 子进程。argv 以 null 结尾，argv[0] 是绝对路径或在 PATH 内。
+    /// 走可移植 platform/process.spawnPipes（POSIX fork+pipe / Windows CreateProcessW+CreatePipe）。
     pub fn spawn(allocator: std.mem.Allocator, argv: []const ?[*:0]const u8) !StdioTransport {
-        // 两对 pipe：一对给子 stdin（父写 → 子读），一对给子 stdout（子写 → 父读）
-        var in_pipe: [2]std.c.fd_t = undefined; // [0] read, [1] write
-        var out_pipe: [2]std.c.fd_t = undefined;
-        if (std.c.pipe(&in_pipe) != 0) return error.PipeFailed;
-        errdefer {
-            _ = std.c.close(in_pipe[0]);
-            _ = std.c.close(in_pipe[1]);
-        }
-        if (std.c.pipe(&out_pipe) != 0) return error.PipeFailed;
-        errdefer {
-            _ = std.c.close(out_pipe[0]);
-            _ = std.c.close(out_pipe[1]);
-        }
-
-        const pid = std.c.fork();
-        if (pid < 0) return error.ForkFailed;
-        if (pid == 0) {
-            // 子进程
-            _ = std.c.setpgid(0, 0);
-            // stdin ← in_pipe[0]
-            _ = std.c.dup2(in_pipe[0], 0);
-            _ = std.c.close(in_pipe[0]);
-            _ = std.c.close(in_pipe[1]);
-            // stdout → out_pipe[1]
-            _ = std.c.dup2(out_pipe[1], 1);
-            _ = std.c.close(out_pipe[0]);
-            _ = std.c.close(out_pipe[1]);
-
-            const argv0 = argv[0] orelse std.c._exit(127);
-            _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), &.{null});
-            std.c._exit(127);
-        }
-
-        // 父进程：关掉不用的一端
-        _ = std.c.close(in_pipe[0]); // 父不读 stdin pipe
-        _ = std.c.close(out_pipe[1]); // 父不写 stdout pipe
-
+        const child = process.spawnPipes(argv, false) catch return error.SpawnFailed;
         return .{
-            .pid = pid,
-            .stdin_fd = in_pipe[1],
-            .stdout_fd = out_pipe[0],
+            .child = child,
             .read_buf = .empty,
             .allocator = allocator,
         };
@@ -81,13 +43,11 @@ pub const StdioTransport = struct {
     pub fn send(self: *StdioTransport, json: []const u8) !void {
         var total: usize = 0;
         while (total < json.len) {
-            const n = std.c.write(self.stdin_fd, json.ptr + total, json.len - total);
+            const n = self.child.write(json[total..]);
             if (n <= 0) return error.WriteFailed;
             total += @as(usize, @intCast(n));
         }
-        const nl = [_]u8{'\n'};
-        const w = std.c.write(self.stdin_fd, &nl, 1);
-        if (w <= 0) return error.WriteFailed;
+        if (self.child.write("\n") <= 0) return error.WriteFailed;
     }
 
     /// 读一行（不含 '\n'）。阻塞直到拿到一行或 EOF。
@@ -108,19 +68,17 @@ pub const StdioTransport = struct {
                 }
                 return owned;
             }
-            // abort-aware:有 abort 时 poll 守卫阻塞 read——超时(100ms)回查 abort,被中断即返 error.Aborted。
+            // abort-aware:有 abort 时 pollReadable 守卫阻塞 read——超时(100ms)回查 abort,中断即返 error.Aborted。
+            // 可移植:POSIX poll / Windows PeekNamedPipe(见 platform/process.PipeChild.pollReadable)。
             if (self.abort) |ab| {
                 while (true) {
                     if (ab.isAborted()) return error.Aborted;
-                    var pfds = [_]std.c.pollfd{.{ .fd = self.stdout_fd, .events = std.c.POLL.IN, .revents = 0 }};
-                    const prc = std.c.poll(&pfds, 1, 100);
-                    if (prc > 0) break; // 有数据可读 → 下面 read
-                    if (prc < 0) break; // EINTR/错误 → 让 read 处理
-                    // prc==0 超时 → 回查 abort 后再 poll
+                    if (self.child.pollReadable(100)) break; // 有数据/EOF/错误 → 下面 read
+                    // 超时 → 回查 abort 后再 poll
                 }
             }
             // 读更多
-            const n = std.c.read(self.stdout_fd, &chunk, chunk.len);
+            const n = self.child.read(&chunk);
             if (n < 0) return error.ReadFailed;
             if (n == 0) {
                 if (self.read_buf_pos >= self.read_buf.items.len) return error.Eof;
@@ -137,15 +95,9 @@ pub const StdioTransport = struct {
     }
 
     pub fn close(self: *StdioTransport) void {
-        _ = std.c.close(self.stdin_fd);
-        _ = std.c.close(self.stdout_fd);
-        // 让子进程收到 EOF 后正常退出；给 1s 宽限再强杀
-        const req = std.c.timespec{ .sec = 1, .nsec = 0 };
-        var rem: std.c.timespec = undefined;
-        _ = std.c.nanosleep(&req, &rem);
-        _ = std.c.kill(-self.pid, std.c.SIG.TERM);
-        var status: c_int = 0;
-        _ = std.c.waitpid(self.pid, &status, 0);
+        self.child.closeStdin(); // EOF → 子进程正常退出
+        self.child.closeStdout();
+        self.child.terminate(); // kill 整组 + 回收（closeStdin 的 EOF 已让多数 server 自退，此为兜底）
         self.read_buf.deinit(self.allocator);
     }
 };

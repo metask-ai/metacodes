@@ -15,7 +15,7 @@
 //!     log.warn("stream", "event_iter error: {s}", .{@errorName(err)});
 
 const std = @import("std");
-const sync = @import("../platform/sync.zig");
+const sync = @import("platform").sync;
 
 pub const Level = enum(u3) {
     debug = 0,

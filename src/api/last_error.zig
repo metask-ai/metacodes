@@ -19,7 +19,7 @@
 //! web 模式多线程(HTTP 线程 + agent 线程)→ mutex 保护;buf 定长静态,零分配。
 
 const std = @import("std");
-const sync = @import("../platform/sync.zig");
+const sync = @import("platform").sync;
 
 const BODY_CAP = 512;
 const KIND_CAP = 48;

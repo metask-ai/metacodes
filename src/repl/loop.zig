@@ -8,7 +8,7 @@
 //! - Ctrl+C：输入阶段 → 清 buffer（ISIG=false 让字节 0x03 落到 LineEditor）；生成阶段 → SIGINT → app.abort
 
 const std = @import("std");
-const platform_signal = @import("../platform/signal.zig");
+const platform_signal = @import("platform").signal;
 const posix = std.posix;
 const app_mod = @import("../app.zig");
 const Conversation = @import("../core/conversation.zig").Conversation;

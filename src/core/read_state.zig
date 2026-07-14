@@ -17,7 +17,7 @@
 //!   const meta = rs.get(path);             // Write/Edit 查询
 
 const std = @import("std");
-const sync = @import("../platform/sync.zig");
+const sync = @import("platform").sync;
 const builtin = @import("builtin");
 const util_time = @import("../util/time.zig");
 

@@ -30,7 +30,7 @@
 //! 卡渲染用 alloc(堆),渲染完即 free,TuiBackend 不持有跨调用。
 
 const std = @import("std");
-const sync = @import("../../platform/sync.zig");
+const sync = @import("platform").sync;
 const render_region = @import("render_region.zig");
 const ui_backend = @import("../../core/protocol/ui_backend.zig");
 const ui_event = @import("../../core/protocol/ui_event.zig");

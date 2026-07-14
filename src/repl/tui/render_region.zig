@@ -13,7 +13,7 @@
 //! mutex 只管"擦/画"这组动作的逻辑原子性,不用裸 writeAll(2) 绕过。
 
 const std = @import("std");
-const sync = @import("../../platform/sync.zig");
+const sync = @import("platform").sync;
 const app_mod = @import("../../app.zig");
 const types = @import("../../types.zig");
 const ansi = @import("ansi.zig");

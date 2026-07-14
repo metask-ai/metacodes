@@ -16,8 +16,8 @@
 //! - 不持久化；App 重启丢所有 job
 
 const std = @import("std");
-const sync = @import("../platform/sync.zig");
-const rng = @import("../platform/rng.zig");
+const sync = @import("platform").sync;
+const rng = @import("platform").rng;
 const log = @import("../util/log.zig");
 const util_fs = @import("../util/fs.zig");
 const util_time = @import("../util/time.zig");

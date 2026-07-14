@@ -9,6 +9,17 @@ fn addHl(b: *std.Build, mod: *std.Build.Module) void {
         g_hl_mod = b.createModule(.{ .root_source_file = b.path("vendor/hl-zig/src/lib.zig") });
     }
     mod.addImport("hl", g_hl_mod.?);
+    addPlatform(b, mod); // platform 底座与 hl 同套模块（凡编译 app 代码者都需要）
+}
+
+// platform —— 可移植系统抽象层(sync/process/fs/signal/rng/paths)。作为命名模块暴露,
+// 让 test:lsp 隔离模块(根在 src/lsp/,无法相对 import 上层 ../platform/)也能用。
+var g_platform_mod: ?*std.Build.Module = null;
+fn addPlatform(b: *std.Build, mod: *std.Build.Module) void {
+    if (g_platform_mod == null) {
+        g_platform_mod = b.createModule(.{ .root_source_file = b.path("src/platform/platform.zig") });
+    }
+    mod.addImport("platform", g_platform_mod.?);
 }
 
 pub fn build(b: *std.Build) void {
@@ -111,9 +122,22 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    addPlatform(b, lsp_test_mod); // lsp/ 依赖 platform（sync/process），隔离测试也需
     const lsp_test = b.addTest(.{ .name = "lsp-test", .root_module = lsp_test_mod });
     const lsp_test_step = b.step("test:lsp", "Test the LSP subsystem in isolation (Y2 Step2)");
     lsp_test_step.dependOn(&b.addRunArtifact(lsp_test).step);
+
+    // test:platform —— 可移植抽象层(sync/process/fs/signal/rng/paths)。platform 成独立命名模块后
+    // 其测试不再聚合进 cc-test，故独立入口。process fork 真子进程测试需 METACODES_PROC_TEST=1 启用。
+    const platform_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/platform/platform.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const platform_test = b.addTest(.{ .name = "platform-test", .root_module = platform_test_mod });
+    const platform_test_step = b.step("test:platform", "Test the portable platform abstraction layer");
+    platform_test_step.dependOn(&b.addRunArtifact(platform_test).step);
 
     // example —— 独立消费者,经 module 用库跑一轮 agent loop(见 example/main.zig)。
     const example_mod = b.createModule(.{

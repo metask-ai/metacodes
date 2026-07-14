@@ -12,7 +12,7 @@
 //! 后续加环形淘汰 + "重放起点晚于请求 seq"信号,协议上 SSE 天然支持。
 
 const std = @import("std");
-const sync = @import("../platform/sync.zig");
+const sync = @import("platform").sync;
 const log = @import("../util/log.zig");
 
 pub const EventJournal = struct {

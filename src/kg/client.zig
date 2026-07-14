@@ -15,7 +15,7 @@
 //! permanent(二进制缺/版本不符 → degraded)、data(环/NotFound → 透传模型改参)。
 
 const std = @import("std");
-const sync = @import("../platform/sync.zig");
+const sync = @import("platform").sync;
 const common = @import("../tools/common.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const log = @import("../util/log.zig");

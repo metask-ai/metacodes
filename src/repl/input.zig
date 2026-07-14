@@ -9,7 +9,7 @@
 //! 测试策略：LineEditor 全部用 fake keystream 驱动。termios 只做 "不崩" 测试（真 tty 行为难在 CI 里验证）。
 
 const std = @import("std");
-const process = @import("../platform/process.zig");
+const process = @import("platform").process;
 
 // ============================================================================
 // Key 抽象

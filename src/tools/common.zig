@@ -1,5 +1,5 @@
 const std = @import("std");
-const process = @import("../platform/process.zig");
+const process = @import("platform").process;
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");

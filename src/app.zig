@@ -6,8 +6,8 @@
 //! M1.5 起加入 AbortSignal + SIGINT 绑定。signal handler 只做 atomic store，async-signal-safe。
 
 const std = @import("std");
-const platform_signal = @import("platform/signal.zig");
-const platform_paths = @import("platform/paths.zig");
+const platform_signal = @import("platform").signal;
+const platform_paths = @import("platform").paths;
 const types = @import("types.zig");
 const client_mod = @import("client.zig");
 const api_keys_mod = @import("api/api_keys.zig");

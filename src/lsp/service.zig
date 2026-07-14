@@ -18,7 +18,7 @@
 //!    snapshotBaseline(≤8s)+getDiagnostics(≤6s);盘写本身不被阻塞(安全第一),但 tool 结果返回
 //!    多等 ≤14s(warm)/≤26s(冷 spawn)。可被 abort 打断。未来若嫌重可换 didChange delta 免全等。
 const std = @import("std");
-const sync = @import("../platform/sync.zig");
+const sync = @import("platform").sync;
 const client_mod = @import("client.zig");
 const servers = @import("servers.zig");
 const workspace = @import("workspace.zig");

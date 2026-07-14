@@ -1,5 +1,5 @@
 const std = @import("std");
-const platform_signal = @import("platform/signal.zig");
+const platform_signal = @import("platform").signal;
 const types = @import("types.zig");
 const client = @import("client.zig");
 const app_mod = @import("app.zig");
