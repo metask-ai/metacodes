@@ -23,6 +23,7 @@ const rng = @import("platform").rng;
 const log = @import("../util/log.zig");
 const util_fs = @import("../util/fs.zig");
 const util_time = @import("../util/time.zig");
+const ppaths = @import("platform").paths;
 
 pub const JobStatus = enum { running, exited, killed, failed };
 
@@ -63,14 +64,19 @@ pub const JobRegistry = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator) !JobRegistry {
-        const uid = @import("platform").paths.uid();
-        const base = try std.fmt.allocPrint(allocator, "/tmp/metacodes-jobs/{d}", .{uid});
+        const uid = ppaths.uid();
+        // 可移植临时目录(POSIX TMPDIR|/tmp / Windows TEMP|TMP)——不再硬编码 /tmp(windows 无)。
+        const base = try std.fmt.allocPrint(allocator, "{s}/metacodes-jobs/{d}", .{ ppaths.tempDir(), uid });
         errdefer allocator.free(base);
         try util_fs.mkdirParents(base);
-        var zbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
-        @memcpy(zbuf[0..base.len], base);
-        zbuf[base.len] = 0;
-        _ = std.c.chmod(@ptrCast(&zbuf), 0o700);
+        // POSIX 收紧目录权限 0700(bg job stdout/stderr 落盘,防他用户偷读);Windows 无 POSIX
+        // mode 概念(ACL 走 TEMP 默认的每用户隔离),跳过。
+        if (@import("builtin").os.tag != .windows) {
+            var zbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
+            @memcpy(zbuf[0..base.len], base);
+            zbuf[base.len] = 0;
+            _ = std.c.chmod(@ptrCast(&zbuf), 0o700);
+        }
 
         return .{
             .allocator = allocator,
@@ -134,7 +140,7 @@ pub const JobRegistry = struct {
 
         // 走可移植 platform/process.spawnToFiles(POSIX fork+dup2 / Windows CreateProcessW DETACHED
         // + _get_osfhandle 把落盘 fd 转 HANDLE)。Windows 的 /bin/sh 依赖 git-bash(shell 决策 node 8871)。
-        var argv: [4]?[*:0]const u8 = .{ "/bin/sh", "-c", cmd_z.ptr, null };
+        var argv: [4]?[*:0]const u8 = .{ ppaths.shell_path, "-c", cmd_z.ptr, null };
         const proc = process.spawnToFiles(argv[0..], out_fd, err_fd) catch {
             _ = pfs.close(out_fd);
             _ = pfs.close(err_fd);

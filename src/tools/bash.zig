@@ -1,4 +1,5 @@
 const std = @import("std");
+const ppaths = @import("platform").paths;
 const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const security = @import("security.zig");
@@ -138,7 +139,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // jobs 不可用（老/单测路径）：回退到原始 pipe 捕获
     const cmd_z = try allocator.dupeZ(u8, command);
     defer allocator.free(cmd_z);
-    const argv0: [*:0]const u8 = "/bin/sh";
+    const argv0: [*:0]const u8 = ppaths.shell_path;
     var argv: [4]?[*:0]const u8 = .{ argv0, "-c", cmd_z.ptr, null };
     const out = try common.spawnCaptureWithStderrTimed(argv[0..argv.len], allocator, ctx.abort, timeout_ms, ctx.spawn_tick_fn, common.MAX_SPAWN_CAPTURE_BYTES);
     defer allocator.free(out.stdout);

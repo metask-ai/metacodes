@@ -15,6 +15,7 @@
 //! 返回 JSON: {"url":"...","bytes":N,"content":"<全文>"}(大页由 tool_exec 落盘换成 persisted 信封)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
@@ -35,7 +36,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer allocator.free(url_z);
 
     // curl -s -L --max-time 15 --user-agent "..." "<url>"
-    const argv0: [*:0]const u8 = "/usr/bin/curl";
+    const argv0: [*:0]const u8 = if (builtin.os.tag == .windows) "curl" else "/usr/bin/curl";
     var argv: [9]?[*:0]const u8 = .{
         argv0,
         "-s", // silent
