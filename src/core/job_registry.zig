@@ -136,14 +136,13 @@ pub const JobRegistry = struct {
             return error.OpenFailed;
         };
 
-        const cmd_z = try self.allocator.dupeZ(u8, command);
-        defer self.allocator.free(cmd_z);
-
         // 走可移植 platform/process.spawnToFiles(POSIX fork+dup2 / Windows CreateProcessW DETACHED
         // + _get_osfhandle 把落盘 fd 转 HANDLE)。可移植 shell(复刻 codex):POSIX /bin/sh -c;
-        // Windows 原生 PowerShell/cmd,零 git-bash。
+        // Windows 原生 PowerShell/cmd,零 git-bash。wrapCommand:PowerShell 前置 UTF-8 输出编码。
         const shell = shell_mod.detectDefault();
-        var argv: [5]?[*:0]const u8 = undefined;
+        const cmd_z = try shell_mod.wrapCommand(self.allocator, shell, command);
+        defer self.allocator.free(cmd_z);
+        var argv: [6]?[*:0]const u8 = undefined;
         shell_mod.deriveExecArgs(shell, cmd_z.ptr, &argv);
         const proc = process.spawnToFiles(argv[0..], out_fd, err_fd) catch {
             _ = pfs.close(out_fd);

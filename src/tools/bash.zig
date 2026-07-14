@@ -136,12 +136,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         return try runAutoBackgroundable(allocator, registry, command, timeout_ms, ctx.abort);
     }
 
-    // jobs 不可用（老/单测路径）：回退到原始 pipe 捕获
-    const cmd_z = try allocator.dupeZ(u8, command);
-    defer allocator.free(cmd_z);
     // 可移植 shell(复刻 codex):POSIX /bin/sh -c;Windows 原生 PowerShell/cmd,零 git-bash。
+    // wrapCommand:PowerShell 前置 UTF-8 输出编码(否则非 ASCII 输出乱码/stringify 失败)。
     const shell = shell_mod.detectDefault();
-    var argv: [5]?[*:0]const u8 = undefined;
+    const cmd_z = try shell_mod.wrapCommand(allocator, shell, command);
+    defer allocator.free(cmd_z);
+    var argv: [6]?[*:0]const u8 = undefined;
     shell_mod.deriveExecArgs(shell, cmd_z.ptr, &argv);
     const out = try common.spawnCaptureWithStderrTimed(argv[0..], allocator, ctx.abort, timeout_ms, ctx.spawn_tick_fn, common.MAX_SPAWN_CAPTURE_BYTES);
     defer allocator.free(out.stdout);
