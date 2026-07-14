@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
+const platform_term = @import("platform").terminal;
 const process = @import("platform").process;
 
 // ============================================================================
@@ -332,24 +333,9 @@ pub fn newlineHint() []const u8 {
     return if (shouldEnableKittyKeyboard()) "shift + \xe2\x8f\x8e for newline" else "\\ + \xe2\x8f\x8e for newline";
 }
 
-pub fn enterRawMode(fd: std.c.fd_t) ?std.c.termios {
-    var orig: std.c.termios = undefined;
-    if (std.c.tcgetattr(fd, &orig) != 0) return null;
-
-    var raw = orig;
-    raw.lflag.ECHO = false;
-    raw.lflag.ICANON = false;
-    raw.lflag.ISIG = false;
-    raw.lflag.IEXTEN = false;
-    raw.iflag.IXON = false;
-    raw.iflag.ICRNL = false;
-    raw.iflag.BRKINT = false;
-    raw.iflag.INPCK = false;
-    raw.iflag.ISTRIP = false;
-    raw.cc[@intFromEnum(std.c.V.MIN)] = 1;
-    raw.cc[@intFromEnum(std.c.V.TIME)] = 0;
-
-    if (std.c.tcsetattr(fd, std.posix.TCSA.FLUSH, &raw) != 0) return null;
+pub fn enterRawMode(fd: std.c.fd_t) ?platform_term.SavedMode {
+    // 模式切换走可移植 platform/terminal(POSIX termios / Windows console mode)。
+    const orig = platform_term.enterRaw(fd) orelse return null;
 
     // 哑终端(TERM=dumb 或空)不发任何键盘协议/粘贴序列,避免乱码回显。
     const term = std.c.getenv("TERM");
@@ -367,7 +353,7 @@ pub fn enterRawMode(fd: std.c.fd_t) ?std.c.termios {
     return orig;
 }
 
-pub fn restoreMode(fd: std.c.fd_t, orig: std.c.termios) void {
+pub fn restoreMode(fd: std.c.fd_t, orig: platform_term.SavedMode) void {
     // 关 bracketed paste(始终)+ 键盘协议(仅白名单——对称 enterRawMode,同进程 env 不变判定恒一致,
     // 不会发了 enable 没 disable;非白名单不发孤立 disable,避免 Apple Terminal honor 它出异常)。
     const disable_paste = "\x1b[?2004l";
@@ -375,7 +361,7 @@ pub fn restoreMode(fd: std.c.fd_t, orig: std.c.termios) void {
     if (shouldEnableKittyKeyboard()) {
         _ = pfs.write(fd, kbd_disable_seq[0..kbd_disable_seq.len]);
     }
-    _ = std.c.tcsetattr(fd, std.posix.TCSA.FLUSH, &orig);
+    platform_term.restoreMode(fd, orig); // POSIX tcsetattr / Windows SetConsoleMode
 }
 
 /// 把 `current` 写临时文件,开 $VISUAL/$EDITOR(前台阻塞)编辑,读回(owned,去尾换行)。

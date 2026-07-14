@@ -531,7 +531,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // 生成期间也要 raw mode:readLineRaw 返回时已 restoreMode(回 cooked),
         // cooked 下内核按行缓冲,未按 Enter 的键不会被 watcher 的 read 读到 → 边等边打字被吞。
         // 重进 raw 让 watcher 能逐字节读到输入(编辑 / 回车入队 / Esc 中断)。
-        const gen_raw_orig: ?std.c.termios = if (tty) input.enterRawMode(stdin_fd) else null;
+        const gen_raw_orig = if (tty) input.enterRawMode(stdin_fd) else null; // ?platform.terminal.SavedMode
         defer if (gen_raw_orig) |o| input.restoreMode(stdin_fd, o);
 
         const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*j| j else null;
