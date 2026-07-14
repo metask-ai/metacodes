@@ -148,15 +148,28 @@ fn canonicalForWrite(allocator: std.mem.Allocator, candidate: []const u8) ![]u8 
 /// macOS arm64 ABI 符号为裸 `lstat`($INODE64 后缀是 x86_64 legacy)。
 extern "c" fn lstat(path: [*:0]const u8, buf: *std.c.Stat) c_int;
 
+// Windows:symlink/junction/mount-point 统一是 **reparse point**(NTFS 概念),
+// GetFileAttributesW 的 FILE_ATTRIBUTE_REPARSE_POINT(0x400) 位标识。GetFileAttributesW
+// 本身**不跟随** reparse(返回链接自身属性),故等价 lstat 语义——正是防 TOCTOU 逃逸所需。
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
+extern "kernel32" fn GetFileAttributesW(lpFileName: [*:0]const u16) callconv(.winapi) u32;
+
 fn isSymlink(path: []const u8) bool {
     if (path.len + 1 > std.fs.max_path_bytes) return false;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
-    // Windows:符号链接/reparse-point 检测机制不同(GetFileAttributes REPARSE_POINT),
-    // 且创建符号链接需管理员权限。此处保守返 false(非符号链接)——windows reparse 防护
-    // 属后续工作(TODO:跨平台移植 roadmap)。
-    if (builtin.os.tag == .windows) return false;
+    if (builtin.os.tag == .windows) {
+        // UTF-8 → UTF-16,GetFileAttributesW 查 REPARSE_POINT 位(不跟随 → lstat 语义)。
+        var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        const wlen = std.unicode.utf8ToUtf16Le(&wbuf, path) catch return false;
+        if (wlen >= wbuf.len) return false;
+        wbuf[wlen] = 0;
+        const attrs = GetFileAttributesW(@ptrCast(&wbuf));
+        if (attrs == INVALID_FILE_ATTRIBUTES) return false; // 不存在/出错 → 非 symlink
+        return (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    }
     if (builtin.os.tag == .linux) {
         var stx: std.os.linux.Statx = undefined;
         const flags: u32 = std.os.linux.AT.SYMLINK_NOFOLLOW;
