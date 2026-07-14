@@ -12,6 +12,7 @@
 //! 并按码点数上限截断。逻辑与消毒范围逐条对齐 codex。
 
 const std = @import("std");
+const platform_term = @import("platform").terminal;
 const app_mod = @import("../../app.zig");
 
 /// REPL 三态:空闲等输入 / 生成中 / 需要用户操作(权限·问题·计划审批)。
@@ -45,13 +46,13 @@ fn buildSequence(out: []u8, sanitized: []const u8) ?[]const u8 {
 
 /// 清空我们写的标题(退出 REPL 时)。不恢复 shell/前一个程序设的原标题(不可移植)。
 pub fn clear() void {
-    if (std.c.isatty(1) == 0) return;
+    if (!platform_term.isatty(1)) return;
     writeAll(1, "\x1b]0;\x07");
 }
 
 /// 门控:stdout 是 tty 且未经 METACODES_NO_TERMINAL_TITLE 关闭。
 fn enabled() bool {
-    if (std.c.isatty(1) == 0) return false;
+    if (!platform_term.isatty(1)) return false;
     if (std.c.getenv("METACODES_NO_TERMINAL_TITLE") != null) return false;
     return true;
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const platform_term = @import("platform").terminal;
 const pfs = @import("platform").fs;
 const platform_signal = @import("platform").signal;
 const types = @import("types.zig");
@@ -284,7 +285,7 @@ pub fn main(init: std.process.Init) !void {
     // std.debug.print→fd 2)字节级交错,把固定区写花、滚屏 desync。日志仍写文件(METACODES_LOG_FILE)。
     // **gate 必须查渲染所在的 fd 2**(不是 fd 1):`metacodes >file` 只重定向 stdout、TUI 仍渲染到 fd 2 的
     // 终端,此时也要抑制日志。verbose(用户显式要日志)/ fd 2 非 tty(无终端可写花)不关。
-    if (!config.verbose and std.c.isatty(2) != 0) {
+    if (!config.verbose and platform_term.isatty(2)) {
         log.setStderrEnabled(false);
     }
 
@@ -549,7 +550,7 @@ fn replaceStoredApiKey(allocator: std.mem.Allocator, stored: *auth.StoredCredent
 }
 
 fn requireInteractiveLogin() !void {
-    if (std.c.isatty(0) == 0 or std.c.isatty(2) == 0) return error.InteractiveTerminalRequired;
+    if (!platform_term.isatty(0) or !platform_term.isatty(2)) return error.InteractiveTerminalRequired;
 }
 
 fn promptChoice(allocator: std.mem.Allocator, count: usize) !usize {

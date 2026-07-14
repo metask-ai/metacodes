@@ -11,6 +11,7 @@
 //! 返回: {"answers":["label" 或 "labelA, labelB"]}
 
 const std = @import("std");
+const platform_term = @import("platform").terminal;
 const common = @import("common.zig");
 const util_json = @import("../util/json.zig");
 const answer_queue = @import("../core/answer_queue.zig");
@@ -69,7 +70,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     // 非 TTY 且应答队列从未加载**且无 UI 回调** → 拒绝(否则会吞掉 pipe 输入或死等)。
     // 有 ui_requester 时不看 tty:web/GUI 前端无 tty 也能渲染问答对话框(接口分离)。
-    if (std.c.isatty(0) == 0 and !answer_queue.wasLoaded() and ctx.ui_requester == null) return error.NotATty;
+    if (!platform_term.isatty(0) and !answer_queue.wasLoaded() and ctx.ui_requester == null) return error.NotATty;
 
     var answers = std.ArrayList([]const u8).empty;
     defer {

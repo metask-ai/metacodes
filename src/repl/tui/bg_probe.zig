@@ -7,6 +7,7 @@
 //! 谨慎:① 只在交互 tty 启动期调一次;② 超时短(~120ms)不拖慢启动;③ 还原 termios;
 //! ④ 管道/NO_PROBE/非 tty 由调用方跳过(本模块也自带非 tty 守卫)。
 const std = @import("std");
+const platform_term = @import("platform").terminal;
 
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
 
@@ -57,7 +58,7 @@ fn isHex(c: u8) bool {
 
 /// 探测终端背景色。非 tty / 不支持 / 超时 → null。会临时进 raw 再还原。
 pub fn probeBackground(fd: std.c.fd_t) ?Rgb {
-    if (std.c.isatty(fd) == 0) return null;
+    if (!platform_term.isatty(fd)) return null;
 
     var orig: std.c.termios = undefined;
     if (std.c.tcgetattr(fd, &orig) != 0) return null;

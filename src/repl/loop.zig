@@ -10,6 +10,7 @@
 const std = @import("std");
 const pfs = @import("platform").fs;
 const platform_signal = @import("platform").signal;
+const platform_term = @import("platform").terminal;
 const posix = std.posix;
 const app_mod = @import("../app.zig");
 const Conversation = @import("../core/conversation.zig").Conversation;
@@ -72,7 +73,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     defer history.saveToFile(hist_path) catch {};
 
     const stdin_fd: std.c.fd_t = 0;
-    const tty = std.c.isatty(stdin_fd) != 0;
+    const tty = platform_term.isatty(stdin_fd);
 
     // 终端 tab 标题反映 session 状态(idle/working/需要输入)。仅 tty;退出时清空。
     if (tty) terminal_title.setFromApp(app, .idle);
@@ -3281,7 +3282,7 @@ fn handleSkillInvocation(app: *app_mod.App, allocator: std.mem.Allocator, rest: 
 /// 非 TTY 退化为纯文本两行(pipe 友好)。box 内宽固定取 min(cols-2, 64)。
 fn printStartupBanner(app: *const app_mod.App) void {
     const th = app.theme;
-    if (std.c.isatty(1) == 0) {
+    if (!platform_term.isatty(1)) {
         std.debug.print("cc-zig\nType your message or /help for commands\n\n", .{});
         return;
     }
@@ -3334,7 +3335,7 @@ fn displayWidthAscii(s: []const u8) usize {
 
 /// 启动建议:跑 `git log` 找最近改动文件,给一条灰色提示。失败静默。
 fn printStartupSuggestion(allocator: std.mem.Allocator) void {
-    if (std.c.isatty(1) == 0) return; // 非 TTY 不显示
+    if (!platform_term.isatty(1)) return; // 非 TTY 不显示
     const argv = [_]?[*:0]const u8{ "/usr/bin/env", "git", "log", "-1", "--name-only", "--pretty=format:", null };
     const out = @import("../tools/common.zig").spawnCaptureStdoutAbortableTimed(argv[0..], allocator, null, 2000) catch return;
     defer allocator.free(out);
