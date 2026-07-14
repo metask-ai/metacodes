@@ -17,6 +17,7 @@
 //! 不做 must-read-first(notebook 通常不大,Read 单独读 cells)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
 const ToolContext = @import("context.zig").ToolContext;
@@ -231,16 +232,16 @@ const MAX_NOTEBOOK_SIZE: usize = 50 * 1024 * 1024;
 /// 走轴A统一入口 readAllFromFdCapped(消除各工具本地裸读绕过守卫)。
 fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     return try @import("common.zig").readAllFromFdCapped(fd, allocator, MAX_NOTEBOOK_SIZE);
 }
 
 fn writeFile(path: []const u8, content: []const u8) !void {
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return error.WriteError;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     var pos: usize = 0;
     while (pos < content.len) {
-        const n = std.c.write(fd, content.ptr + pos, content.len - pos);
+        const n = pfs.write(fd, content[pos..][0..content.len - pos]);
         if (n <= 0) return error.WriteError;
         pos += @intCast(n);
     }
@@ -266,9 +267,9 @@ const SAMPLE_NB =
 fn writeNb(path: []const u8, body: []const u8) !void {
     const path_z = try testing.allocator.dupeZ(u8, path);
     defer testing.allocator.free(path_z);
-    const fd = std.c.open(path_z, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    _ = std.c.write(fd, body.ptr, body.len);
-    _ = std.c.close(fd);
+    const fd = pfs.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    _ = pfs.write(fd, body);
+    _ = pfs.close(fd);
 }
 
 test "NotebookEdit: missing path" {

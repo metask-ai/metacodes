@@ -19,6 +19,7 @@
 //! meta.json 用 rename() 原子替换。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const msg_mod = @import("message.zig");
 const Conversation = @import("conversation.zig").Conversation;
 const types = @import("../types.zig");
@@ -109,7 +110,7 @@ pub const Writer = struct {
     }
 
     pub fn deinit(self: *Writer) void {
-        if (self.fd != FD_UNSET) _ = std.c.close(self.fd);
+        if (self.fd != FD_UNSET) _ = pfs.close(self.fd);
         self.allocator.free(self.dir);
     }
 
@@ -125,7 +126,7 @@ pub const Writer = struct {
         if (self.fd == FD_UNSET) {
             var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
             const path = try std.fmt.bufPrint(&pbuf, "{s}/transcript.jsonl\x00", .{self.dir});
-            self.fd = std.c.open(@ptrCast(path.ptr), std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o600));
+            self.fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o600));
             if (self.fd < 0) {
                 self.fd = FD_UNSET; // 保持 sentinel 语义；下次 flush 会再试
                 return error.OpenFailed;
@@ -183,7 +184,7 @@ pub const Writer = struct {
         try aw.writer.writeAll("]}\n");
 
         const bytes = aw.written();
-        const n = std.c.write(self.fd, bytes.ptr, bytes.len);
+        const n = pfs.write(self.fd, bytes);
         if (n < 0 or @as(usize, @intCast(n)) != bytes.len) return error.WriteFailed;
     }
 
@@ -219,12 +220,12 @@ pub const Writer = struct {
         // 原子替换：写到 meta.json.tmp 再 rename
         var tpath_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
         const tpath = try std.fmt.bufPrint(&tpath_buf, "{s}/meta.json.tmp\x00", .{self.dir});
-        const tfd = std.c.open(@ptrCast(tpath.ptr), std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        const tfd = pfs.open(@ptrCast(tpath.ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
         if (tfd < 0) return error.OpenFailed;
-        defer _ = std.c.close(tfd);
+        defer _ = pfs.close(tfd);
 
         const bytes = aw.written();
-        const n = std.c.write(tfd, bytes.ptr, bytes.len);
+        const n = pfs.write(tfd, bytes);
         if (n < 0 or @as(usize, @intCast(n)) != bytes.len) return error.WriteFailed;
 
         var fpath_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
@@ -251,16 +252,16 @@ fn roleStr(r: types.MessageRole) []const u8 {
 pub fn loadTranscript(conversation: *Conversation, session_dir: []const u8, allocator: std.mem.Allocator) !void {
     var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
     const path = try std.fmt.bufPrint(&pbuf, "{s}/transcript.jsonl\x00", .{session_dir});
-    const fd = std.c.open(@ptrCast(path.ptr), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.OpenFailed;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
 
     // 读整文件
     var all = std.ArrayList(u8).empty;
     defer all.deinit(allocator);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = pfs.read(fd, &buf);
         if (n <= 0) break;
         try all.appendSlice(allocator, buf[0..@intCast(n)]);
     }
@@ -288,15 +289,15 @@ pub fn loadTranscript(conversation: *Conversation, session_dir: []const u8, allo
 fn loadCompactStateFromMeta(conversation: *Conversation, session_dir: []const u8, allocator: std.mem.Allocator) !void {
     var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
     const path = try std.fmt.bufPrint(&pbuf, "{s}/meta.json\x00", .{session_dir});
-    const fd = std.c.open(@ptrCast(path.ptr), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return; // 无 meta → 无投影状态,静默(旧 session 兼容)
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
 
     var all = std.ArrayList(u8).empty;
     defer all.deinit(allocator);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = pfs.read(fd, &buf);
         if (n <= 0) break;
         try all.appendSlice(allocator, buf[0..@intCast(n)]);
     }
@@ -462,15 +463,15 @@ fn readMeta(session_dir: []const u8, allocator: std.mem.Allocator) !struct {
 } {
     var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
     const path = try std.fmt.bufPrint(&pbuf, "{s}/meta.json\x00", .{session_dir});
-    const fd = std.c.open(@ptrCast(path.ptr), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.OpenFailed;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
 
     var all = std.ArrayList(u8).empty;
     defer all.deinit(allocator);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = pfs.read(fd, &buf);
         if (n <= 0) break;
         try all.appendSlice(allocator, buf[0..@intCast(n)]);
     }

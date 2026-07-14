@@ -9,6 +9,7 @@
 //! 安全:isPlanFile 用 realpath 归一化前缀匹配防 `..` 穿越(对齐 cc isSessionPlanFile)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const fs = @import("../util/fs.zig");
 
 /// 形容词词库(slug 第一段)。自建精简版。
@@ -63,14 +64,14 @@ pub fn readPlan(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
     if (path.len >= pbuf.len) return null;
     @memcpy(pbuf[0..path.len], path);
     pbuf[path.len] = 0;
-    const fd = std.c.open(@ptrCast(&pbuf), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return null;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var rb: [4096]u8 = undefined;
     while (true) {
-        const n = std.c.read(fd, &rb, rb.len);
+        const n = pfs.read(fd, &rb);
         if (n < 0) {
             out.deinit(allocator);
             return null;
@@ -159,11 +160,11 @@ test "ensureDir + readPlan 往返" {
     var wpath: [std.fs.max_path_bytes]u8 = undefined;
     @memcpy(wpath[0..path.len], path);
     wpath[path.len] = 0;
-    const fd = std.c.open(@ptrCast(&wpath), std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(@ptrCast(&wpath), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try testing.expect(fd >= 0);
     const body = "# Plan\n1. do X\n";
-    _ = std.c.write(fd, body, body.len);
-    _ = std.c.close(fd);
+    _ = pfs.write(fd, body);
+    _ = pfs.close(fd);
     // 读回。
     const got = readPlan(a, path) orelse return error.ReadBack;
     defer a.free(got);

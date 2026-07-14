@@ -5,6 +5,7 @@
 //! 失败降级:写盘失败 → 返回截断的 inline preview(不崩)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 
 /// 默认单结果落盘阈值(对齐 cc DEFAULT_MAX_RESULT_SIZE_CHARS)。
 pub const DEFAULT_MAX_RESULT_CHARS: usize = 50_000;
@@ -54,12 +55,12 @@ pub fn persistForced(
         defer allocator.free(dir);
         @import("../util/fs.zig").mkdirParents(dir) catch break :blk null;
         const fpath = std.fmt.bufPrintZ(&pathbuf, "{s}/{x}.txt", .{ dir, hash }) catch break :blk null;
-        const fd = std.c.open(fpath.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        const fd = pfs.open(fpath.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         if (fd < 0) break :blk null;
-        defer _ = std.c.close(fd);
+        defer _ = pfs.close(fd);
         var pos: usize = 0;
         while (pos < content.len) {
-            const n = std.c.write(fd, content.ptr + pos, content.len - pos);
+            const n = pfs.write(fd, content[pos..][0..content.len - pos]);
             if (n <= 0) break :blk null;
             pos += @intCast(n);
         }
@@ -104,9 +105,9 @@ fn nowSec() i64 {
 /// stat 一个路径(裁剪 std 无 std.c.stat 路径版 → open+fstat+close,复用 read_state.statFd 跨平台)。
 /// 返回 {mtime 秒, size 字节};打不开/stat 失败 → null。
 fn statPathZ(path_z: [*:0]const u8) ?struct { mtime: i64, size: u64 } {
-    const fd = std.c.open(path_z, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return null;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     const info = @import("../core/read_state.zig").statFd(fd) catch return null;
     return .{ .mtime = @intCast(@divFloor(info.mtime_ns, std.time.ns_per_s)), .size = info.size };
 }
@@ -179,8 +180,8 @@ fn cleanupCacheImpl(allocator: std.mem.Allocator, home_dir: []const u8, ttl_sec:
     }
 
     // 更新 .last-gc 节流标记(touch)。
-    const mfd = std.c.open(mark.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    if (mfd >= 0) _ = std.c.close(mfd);
+    const mfd = pfs.open(mark.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    if (mfd >= 0) _ = pfs.close(mfd);
 }
 
 test "cleanupCache:TTL 删旧留新 + 节流 + 无目录不崩(P0.5)" {
@@ -202,10 +203,10 @@ test "cleanupCache:TTL 删旧留新 + 节流 + 无目录不崩(P0.5)" {
         fn go(d: []const u8, name: []const u8) void {
             var pb: [std.fs.max_path_bytes]u8 = undefined;
             const p = std.fmt.bufPrintZ(&pb, "{s}/{s}", .{ d, name }) catch return;
-            const fd = std.c.open(p.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+            const fd = pfs.open(p.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
             if (fd < 0) return;
-            _ = std.c.write(fd, "x", 1);
-            _ = std.c.close(fd);
+            _ = pfs.write(fd, "x");
+            _ = pfs.close(fd);
         }
     }.go;
     writeF(dir, "old.txt");
@@ -250,12 +251,12 @@ test "cleanupCacheImpl:size-cap LRU 淘汰最旧到达标(P0.5 覆盖 LRU 分支
     for (names, 0..) |nm, i| {
         var pb: [std.fs.max_path_bytes]u8 = undefined;
         const p = std.fmt.bufPrintZ(&pb, "{s}/{s}", .{ dir, nm }) catch return;
-        const fd = std.c.open(p.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        const fd = pfs.open(p.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         if (fd < 0) return;
         var payload: [100]u8 = undefined;
         @memset(&payload, 'x');
-        _ = std.c.write(fd, &payload, payload.len);
-        _ = std.c.close(fd);
+        _ = pfs.write(fd, &payload);
+        _ = pfs.close(fd);
         // backdate mtime:a=100s前, b=50s前, c=现在(a 最旧)。
         const t: std.c.timeval = .{ .sec = @intCast(now - @as(i64, @intCast((names.len - i) * 50))), .usec = 0 };
         var times = [2]std.c.timeval{ t, t };

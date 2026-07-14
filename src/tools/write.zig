@@ -1,4 +1,5 @@
 const std = @import("std");
+const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
 const util_json = @import("../util/json.zig");
@@ -50,12 +51,12 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer if (old_content) |oc| allocator.free(oc);
 
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o666) catch return error.WriteError;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
 
     var pos: usize = 0;
     while (pos < content.len) {
         const remaining = content.len - pos;
-        const n = std.c.write(fd, content.ptr + pos, remaining);
+        const n = pfs.write(fd, content[pos..][0..remaining]);
         if (n <= 0) return error.WriteError;
         pos += @as(usize, @intCast(n));
     }
@@ -87,7 +88,7 @@ const MAX_WRITE_OLD_SIZE: usize = 10 * 1024 * 1024;
 /// 读已存在文件全文（不存在/过大返 error）。供 Write 计算 diff。走轴A统一入口 readAllFromFdCapped。
 fn readExisting(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     return try common.readAllFromFdCapped(fd, allocator, MAX_WRITE_OLD_SIZE);
 }
 
@@ -203,9 +204,9 @@ test "WriteTool not-read-first rejects existing file" {
     const path = tt.path(&pbuf, "write-mrf-test.txt");
     defer _ = std.c.unlink(path.ptr);
     // 先存在一个文件（外部创建）
-    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    _ = std.c.write(fd, "old", 3);
-    _ = std.c.close(fd);
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    _ = pfs.write(fd, "old");
+    _ = pfs.close(fd);
 
     var rs = @import("../core/read_state.zig").ReadState.init(a);
     defer rs.deinit();
@@ -240,9 +241,9 @@ test "WriteTool stale file rejected" {
     const path = tt.path(&pbuf, "write-stale-test.txt");
     defer _ = std.c.unlink(path.ptr);
 
-    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    _ = std.c.write(fd, "v1", 2);
-    _ = std.c.close(fd);
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    _ = pfs.write(fd, "v1");
+    _ = pfs.close(fd);
 
     var rs = @import("../core/read_state.zig").ReadState.init(a);
     defer rs.deinit();
@@ -277,7 +278,7 @@ test "WriteTool ~ 展开端到端" {
     var pbuf: [256]u8 = undefined;
     const real = std.fmt.bufPrintZ(&pbuf, "{s}/tilde-write-test.txt", .{home}) catch unreachable;
     defer _ = std.c.unlink(real.ptr);
-    const fd = std.c.open(real.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(real.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     try std.testing.expect(fd >= 0); // 文件存在 = ~ 已展开
-    _ = std.c.close(fd);
+    _ = pfs.close(fd);
 }

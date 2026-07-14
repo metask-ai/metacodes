@@ -17,6 +17,7 @@
 //!   const meta = rs.get(path);             // Write/Edit 查询
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const sync = @import("platform").sync;
 const builtin = @import("builtin");
 const util_time = @import("../util/time.zig");
@@ -126,13 +127,13 @@ pub fn hashFileContent(path: []const u8) u64 {
     if (path.len >= pbuf.len) return 0;
     @memcpy(pbuf[0..path.len], path);
     pbuf[path.len] = 0;
-    const fd = std.c.open(@ptrCast(&pbuf), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return 0;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     var h = std.hash.Wyhash.init(0);
     var buf: [16 * 1024]u8 = undefined;
     while (true) {
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = pfs.read(fd, &buf);
         if (n <= 0) break;
         h.update(buf[0..@intCast(n)]);
     }
@@ -186,9 +187,9 @@ pub fn statPath(path: []const u8) !StatInfo {
         return .{ .mtime_ns = sec * std.time.ns_per_s + nsec, .size = stx.size };
     } else {
         // macOS arm64: std.c.stat 绑定缺失（private.stat 未声明）。改为 open + fstat。
-        const fd = std.c.open(path_z, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        const fd = pfs.open(path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) return error.StatFailed;
-        defer _ = std.c.close(fd);
+        defer _ = pfs.close(fd);
         return statFd(fd);
     }
 }
@@ -238,10 +239,10 @@ test "clearAll" {
 
 test "statPath real file" {
     const path = "/tmp/cc-zig-readstate-stat-test.txt";
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     defer _ = std.c.unlink(path);
-    _ = std.c.write(fd, "hello", 5);
-    _ = std.c.close(fd);
+    _ = pfs.write(fd, "hello");
+    _ = pfs.close(fd);
 
     const s = try statPath(path);
     try std.testing.expect(s.size == 5);
