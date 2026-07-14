@@ -162,6 +162,17 @@ const Stat64 = extern struct {
 };
 extern "c" fn _fstat64(fd: c_int, buf: *Stat64) c_int;
 
+// Windows 路径 stat(对目录也有效)。
+const WIN32_FILE_ATTRIBUTE_DATA = extern struct {
+    dwFileAttributes: u32,
+    ftCreationTime: [2]u32,
+    ftLastAccessTime: [2]u32,
+    ftLastWriteTime: [2]u32,
+    nFileSizeHigh: u32,
+    nFileSizeLow: u32,
+};
+extern "kernel32" fn GetFileAttributesExW(lpFileName: [*:0]const u16, fInfoLevelId: i32, lpFileInformation: *WIN32_FILE_ATTRIBUTE_DATA) callconv(.winapi) c_int;
+
 pub fn statFd(fd: pfs.Fd) !StatInfo {
     if (builtin.os.tag == .windows) {
         var st: Stat64 = undefined;
@@ -199,6 +210,21 @@ pub fn statPath(path: []const u8) !StatInfo {
     buf[path.len] = 0;
     const path_z: [*:0]const u8 = @ptrCast(&buf);
 
+    if (builtin.os.tag == .windows) {
+        // **GetFileAttributesExW 而非 open+fstat**:Windows _open 打不开目录 → 对目录路径
+        // (Grep/Glob 的搜索目录参数)会误判 StatFailed。GetFileAttributesEx 对文件/目录都работает。
+        var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        const wlen = std.unicode.utf8ToUtf16Le(&wbuf, path) catch return error.StatFailed;
+        if (wlen >= wbuf.len) return error.StatFailed;
+        wbuf[wlen] = 0;
+        var data: WIN32_FILE_ATTRIBUTE_DATA = undefined;
+        if (GetFileAttributesExW(@ptrCast(&wbuf), 0, &data) == 0) return error.StatFailed;
+        // FILETIME(100ns since 1601)→ unix ns
+        const ticks: i128 = (@as(i128, data.ftLastWriteTime[1]) << 32) | @as(i128, data.ftLastWriteTime[0]);
+        const mtime_ns = (ticks - 116_444_736_000_000_000) * 100;
+        const size: u64 = (@as(u64, data.nFileSizeHigh) << 32) | @as(u64, data.nFileSizeLow);
+        return .{ .mtime_ns = mtime_ns, .size = size };
+    }
     if (builtin.os.tag == .linux) {
         var stx: std.os.linux.Statx = undefined;
         const AT_FDCWD: std.c.fd_t = -100;

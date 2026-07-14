@@ -105,42 +105,57 @@ pub fn normalize(allocator: std.mem.Allocator, path: []const u8, opts: Normalize
 /// 词法折叠:split on sep → 丢空段和 "." → ".." 弹栈(保留越根的 ..)→ 重组。
 /// 保留绝对性(首字符是 sep)。不碰文件系统(不解析 symlink,路径不存在也能折叠)。
 fn foldLexical(allocator: std.mem.Allocator, path: []const u8) PathError![]u8 {
-    const is_abs = path.len > 0 and path[0] == sep;
+    const win = @import("builtin").os.tag == .windows;
+    // Windows 段分隔符认 '/' 与 '\\'(模型多传 '/');可选驱动器前缀 "X:"。输出统一用 '/'
+    // (Windows 也接受,且避免下游 JSON 转义)。POSIX:win=false → 只认 '/',行为与旧版一致。
+    var body = path;
+    var drive: []const u8 = "";
+    if (win and path.len >= 2 and std.ascii.isAlphabetic(path[0]) and path[1] == ':') {
+        drive = path[0..2];
+        body = path[2..];
+    }
+    const is_abs = body.len > 0 and isSepChar(body[0], win);
+    const rooted = is_abs or drive.len > 0;
 
-    // 收集结果段。容量上界 = 原段数。
     var segs = std.ArrayList([]const u8).empty;
     defer segs.deinit(allocator);
 
-    var it = std.mem.splitScalar(u8, path, sep);
-    while (it.next()) |s| {
-        if (s.len == 0) continue; // 重复/前导/尾随 sep 产生的空段
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= body.len) : (i += 1) {
+        if (i != body.len and !isSepChar(body[i], win)) continue;
+        const s = body[start..i];
+        start = i + 1;
+        if (s.len == 0) continue; // 重复/前导/尾随分隔符
         if (std.mem.eql(u8, s, ".")) continue; // "." 段移除
         if (std.mem.eql(u8, s, "..")) {
-            // 弹栈,除非:① 绝对路径已到根(丢弃,根的父还是根);
-            //          ② 相对路径栈顶已是 ".."(越根,继续累积,留给 traversal 抓)
             if (segs.items.len > 0 and !std.mem.eql(u8, segs.items[segs.items.len - 1], "..")) {
                 _ = segs.pop();
                 continue;
             }
-            if (is_abs) continue; // 绝对路径越根 → 丢弃(/.. == /)
+            if (rooted) continue; // 已到根/驱动器根 → 丢弃
             // 相对越根:保留 ".." 段
         }
         try segs.append(allocator, s);
     }
 
-    // 重组。
+    // 重组(输出 '/')。
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
-    if (is_abs) try out.append(allocator, sep);
-    for (segs.items, 0..) |s, i| {
-        if (i > 0) try out.append(allocator, sep);
+    if (drive.len > 0) try out.appendSlice(allocator, drive);
+    if (rooted) try out.append(allocator, '/');
+    for (segs.items, 0..) |s, k| {
+        if (k > 0) try out.append(allocator, '/');
         try out.appendSlice(allocator, s);
     }
-    // 全部消解后:绝对 → "/",相对 → "."
     if (out.items.len == 0) {
-        return allocator.dupe(u8, if (is_abs) &[_]u8{sep} else ".");
+        return allocator.dupe(u8, if (is_abs) "/" else ".");
     }
     return out.toOwnedSlice(allocator);
+}
+
+inline fn isSepChar(c: u8, win: bool) bool {
+    return c == '/' or (win and c == '\\');
 }
 
 /// 解析 base_dir:opts.base_dir 非空用它,否则 getCwd。返回 owned。
