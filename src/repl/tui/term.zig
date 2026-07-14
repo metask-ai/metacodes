@@ -93,8 +93,10 @@ pub fn detectFromEnv(fd: c_int) ColorCapability {
 // TTY 检测 + 终端尺寸
 // ============================================================================
 
+const platform_term = @import("platform").terminal;
+
 pub fn isatty(fd: c_int) bool {
-    return std.c.isatty(fd) != 0;
+    return platform_term.isatty(fd);
 }
 
 pub const TermSize = struct {
@@ -102,27 +104,12 @@ pub const TermSize = struct {
     cols: u16,
 };
 
-/// 查终端尺寸(TIOCGWINSZ ioctl)。非 TTY / ioctl 失败 → null。
+/// 查终端尺寸。非 TTY / 失败 / 0 尺寸 → null。可移植:POSIX ioctl(TIOCGWINSZ)/
+/// Windows GetConsoleScreenBufferInfo(见 platform/terminal.zig)。
 pub fn getSize(fd: c_int) ?TermSize {
-    // struct winsize { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel; }
-    // TIOCGWINSZ 在 macOS/Linux 都是 0x40087468(macOS) / 0x5413(Linux)。
-    // 简化:用 std.c.ioctl + 平台分支。
-    var ws: extern struct {
-        row: u16,
-        col: u16,
-        xpixel: u16,
-        ypixel: u16,
-    } = undefined;
-
-    const TIOCGWINSZ: c_ulong = switch (@import("builtin").os.tag) {
-        .macos, .ios => 0x40087468,
-        .linux => 0x5413,
-        else => return null,
-    };
-
-    if (std.c.ioctl(fd, TIOCGWINSZ, &ws) != 0) return null;
-    if (ws.row == 0 or ws.col == 0) return null;
-    return .{ .rows = ws.row, .cols = ws.col };
+    const sz = platform_term.windowSize(fd) orelse return null;
+    if (sz.rows == 0 or sz.cols == 0) return null;
+    return .{ .rows = sz.rows, .cols = sz.cols };
 }
 
 // ============================================================================
