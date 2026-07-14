@@ -13,6 +13,7 @@
 //! 否则 `~/.metacodes/projects/<hash>/memory-evil` 或 `..` 穿越能骗过前缀匹配 → 任意写洞。
 
 const std = @import("std");
+const ppaths = @import("platform").paths;
 const pfs = @import("platform").fs;
 const builtin = @import("builtin");
 const transcript = @import("../transcript.zig");
@@ -437,20 +438,18 @@ test "readIndexTruncated: 字节超限退到行边界不腰斩(Linus #2)" {
 
 test "isEnabled: 默认 ON;env=1 关;env=0 仍开" {
     // 默认(未 set)
-    _ = unsetenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY");
+    _ = ppaths.unsetEnv("CLAUDE_CODE_DISABLE_AUTO_MEMORY");
     try testing.expect(isEnabled());
     // set=1 → 关
-    _ = setenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1", 1);
-    defer _ = unsetenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY");
+    _ = ppaths.setEnv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
+    defer _ = ppaths.unsetEnv("CLAUDE_CODE_DISABLE_AUTO_MEMORY");
     try testing.expect(!isEnabled());
     // set=0 → 仍开(对齐 isDisabled 反语义:0/空当未禁用)
-    _ = setenv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "0", 1);
+    _ = ppaths.setEnv("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "0");
     try testing.expect(isEnabled());
 }
 
 // libc env(0.16 std.c 无 setenv/unsetenv 包装;见 prompt_override.zig 范式)。
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 fn writeFileZ(path: []const u8, data: []const u8) !void {
     const fd = try pfs.openZ(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);

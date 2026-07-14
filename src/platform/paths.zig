@@ -53,6 +53,28 @@ test "homeDir 在 POSIX 返回 $HOME（测试环境设了 HOME）" {
     }
 }
 
+// 进程环境变量写入(主要测试用:设/清一个 env 再验行为)。POSIX setenv/unsetenv;
+// Windows msvcrt _putenv_s(name,value)(空 value = 删除)。
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+extern "c" fn _putenv_s(name: [*:0]const u8, value: [*:0]const u8) c_int;
+
+pub fn setEnv(name: [*:0]const u8, value: [*:0]const u8) void {
+    if (is_windows) {
+        _ = _putenv_s(name, value);
+    } else {
+        _ = setenv(name, value, 1);
+    }
+}
+
+pub fn unsetEnv(name: [*:0]const u8) void {
+    if (is_windows) {
+        _ = _putenv_s(name, ""); // 空值 = 删除
+    } else {
+        _ = unsetenv(name);
+    }
+}
+
 /// 当前用户 id。POSIX getuid;Windows 无 uid 概念 → 用 GetCurrentProcessId 做进程私有目录
 /// 区分符(job 落盘目录仅需一个每进程/每用户稳定隔离前缀,非安全边界)。
 pub fn uid() u32 {

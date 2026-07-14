@@ -14,11 +14,10 @@
 //! - env 未设 / base64 解码失败 / 空 → 一律返回 null(视作未覆盖,绝不崩)。
 
 const std = @import("std");
+const ppaths = @import("platform").paths;
 
-// std.c 在本 Zig 版本只导出 getenv,没导出 setenv/unsetenv(测试设环境用)。
+// std.c 在本 Zig 版本只导出 getenv,没导出 setenv/ppaths.unsetEnv(测试设环境用)。
 // 直接 extern 声明 POSIX 原型。
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 /// env 变量名前缀。完整名 = PREFIX ++ <SLOT>。
 const PREFIX = "METACODES_PROMPT_OVERRIDE_";
@@ -87,8 +86,8 @@ test "lookup decodes base64 env when set" {
     var val_buf: [160]u8 = undefined;
     const val = try std.fmt.bufPrintZ(&val_buf, "{s}", .{b64});
 
-    _ = setenv(name.ptr, val.ptr, 1);
-    defer _ = unsetenv(name.ptr);
+    _ = ppaths.setEnv(name.ptr, val.ptr);
+    defer _ = ppaths.unsetEnv(name.ptr);
 
     const got = lookup(testing.allocator, slot) orelse return error.ExpectedOverride;
     defer testing.allocator.free(got);
@@ -99,7 +98,7 @@ test "lookup returns null on invalid base64" {
     const slot = "UNIT_TEST_BADB64";
     var name_buf: [128]u8 = undefined;
     const name = try std.fmt.bufPrintZ(&name_buf, "{s}{s}", .{ PREFIX, slot });
-    _ = setenv(name.ptr, "!!!not-base64!!!", 1);
-    defer _ = unsetenv(name.ptr);
+    _ = ppaths.setEnv(name.ptr, "!!!not-base64!!!");
+    defer _ = ppaths.unsetEnv(name.ptr);
     try testing.expect(lookup(testing.allocator, slot) == null);
 }
