@@ -57,18 +57,17 @@ pub const Listener = struct {
 };
 
 /// Windows 首次 socket 调用前必须 WSAStartup。refcounted 且可重入,进程生命周期不 cleanup。
-/// 单次守卫防重复 startup 泄漏 refcount(启动期单线程,atomic 兜并发)。
 var wsa_started = std.atomic.Value(bool).init(false);
 
 fn ensureStartup() Error!void {
     if (!is_windows) return;
-    if (wsa_started.swap(true, .acq_rel)) return; // 已 startup
+    if (wsa_started.load(.acquire)) return; // 已 startup 完成
+    // **不**预置标志:必须 WSAStartup 真正返回成功后才置真——否则并发线程见"预置真"会
+    // 在 WSAStartup 未完成时就 socket() → WSANOTINITIALISED。并发首调重复 WSAStartup 无害
+    // (refcounted),置真幂等。
     var data: WSADATA = undefined;
-    // MAKEWORD(2,2) = 0x0202
-    if (sys.WSAStartup(0x0202, &data) != 0) {
-        wsa_started.store(false, .release);
-        return error.WsaStartupFailed;
-    }
+    if (sys.WSAStartup(0x0202, &data) != 0) return error.WsaStartupFailed; // MAKEWORD(2,2)=0x0202
+    wsa_started.store(true, .release);
 }
 
 fn isValid(s: Socket) bool {
