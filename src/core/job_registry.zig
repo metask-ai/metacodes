@@ -17,6 +17,8 @@
 
 const std = @import("std");
 const sync = @import("platform").sync;
+const process = @import("platform").process;
+const pfs = @import("platform").fs;
 const rng = @import("platform").rng;
 const log = @import("../util/log.zig");
 const util_fs = @import("../util/fs.zig");
@@ -26,8 +28,8 @@ pub const JobStatus = enum { running, exited, killed, failed };
 
 pub const JobEntry = struct {
     id: [12]u8,
-    pid: std.c.pid_t,
-    pgid: std.c.pid_t,
+    /// 进程句柄（POSIX=pid，Windows=HANDLE）。走可移植 platform/process。
+    proc: process.ProcHandle,
     started_ms: util_time.Millis,
     stdout_path: []const u8, // owned
     stderr_path: []const u8, // owned
@@ -79,25 +81,11 @@ pub const JobRegistry = struct {
     }
 
     pub fn deinit(self: *JobRegistry) void {
-        // 杀所有 running job 并 reap（防孤儿进程）
+        // 杀所有 running job 并 reap（防孤儿进程）。可移植:killJob(TERM→等→KILL)+reapBlocking(收尸)。
         for (self.jobs.items) |*j| {
             if (j.status == .running) {
-                _ = std.c.kill(-j.pgid, std.c.SIG.TERM);
-            }
-        }
-        // 短等让 TERM 生效（与 kill() 一样的策略），再补 KILL + waitpid
-        const req = std.c.timespec{ .sec = 0, .nsec = 200_000_000 };
-        var rem: std.c.timespec = undefined;
-        _ = std.c.nanosleep(&req, &rem);
-        for (self.jobs.items) |*j| {
-            if (j.status == .running) {
-                var status: c_int = 0;
-                const WNOHANG: c_int = 1;
-                const rc = std.c.waitpid(j.pid, &status, WNOHANG);
-                if (rc == 0) {
-                    _ = std.c.kill(-j.pgid, std.c.SIG.KILL);
-                    _ = std.c.waitpid(j.pid, &status, 0);
-                }
+                process.killJob(j.proc);
+                process.reapBlocking(j.proc);
             }
         }
         for (self.jobs.items) |j| {
@@ -137,37 +125,24 @@ pub const JobRegistry = struct {
         // 预创建空文件（0600）让 reader 能立刻打开
         const out_fd = createFile(stdout_path) orelse return error.OpenFailed;
         const err_fd = createFile(stderr_path) orelse {
-            _ = std.c.close(out_fd);
+            _ = pfs.close(out_fd);
             return error.OpenFailed;
         };
 
         const cmd_z = try self.allocator.dupeZ(u8, command);
         defer self.allocator.free(cmd_z);
 
-        const pid = std.c.fork();
-        if (pid < 0) {
-            _ = std.c.close(out_fd);
-            _ = std.c.close(err_fd);
+        // 走可移植 platform/process.spawnToFiles(POSIX fork+dup2 / Windows CreateProcessW DETACHED
+        // + _get_osfhandle 把落盘 fd 转 HANDLE)。Windows 的 /bin/sh 依赖 git-bash(shell 决策 node 8871)。
+        var argv: [4]?[*:0]const u8 = .{ "/bin/sh", "-c", cmd_z.ptr, null };
+        const proc = process.spawnToFiles(argv[0..], out_fd, err_fd) catch {
+            _ = pfs.close(out_fd);
+            _ = pfs.close(err_fd);
             return error.SpawnFailed;
-        }
+        };
 
-        if (pid == 0) {
-            // 子进程
-            _ = std.c.setpgid(0, 0);
-            _ = std.c.dup2(out_fd, 1);
-            _ = std.c.dup2(err_fd, 2);
-            _ = std.c.close(out_fd);
-            _ = std.c.close(err_fd);
-
-            const argv0: [*:0]const u8 = "/bin/sh";
-            var argv: [4]?[*:0]const u8 = .{ argv0, "-c", cmd_z.ptr, null };
-            _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(&argv)), &.{null});
-            std.c._exit(127);
-        }
-
-        _ = std.c.close(out_fd);
-        _ = std.c.close(err_fd);
-        _ = std.c.setpgid(pid, pid);
+        _ = pfs.close(out_fd);
+        _ = pfs.close(err_fd);
 
         const started_ms: util_time.Millis = util_time.nowMs();
 
@@ -176,8 +151,7 @@ pub const JobRegistry = struct {
 
         const entry = JobEntry{
             .id = id,
-            .pid = pid,
-            .pgid = pid,
+            .proc = proc,
             .started_ms = started_ms,
             .stdout_path = stdout_path,
             .stderr_path = stderr_path,
@@ -197,7 +171,7 @@ pub const JobRegistry = struct {
             return e;
         };
         self.unlock();
-        log.info("job", "bg spawn id={s} pid={d} cmd={s}", .{ id[0..], pid, preview });
+        log.info("job", "bg spawn id={s} cmd={s}", .{ id[0..], preview });
         return entry; // 值拷贝(非指针),caller 用快照安全
     }
 
@@ -223,13 +197,13 @@ pub const JobRegistry = struct {
     fn reapExitedLocked(self: *JobRegistry) void {
         for (self.jobs.items) |*j| {
             if (j.status != .running) continue;
-            var status: c_int = 0;
-            const WNOHANG: c_int = 1;
-            const rc = std.c.waitpid(j.pid, &status, WNOHANG);
-            if (rc == j.pid) {
-                j.exit_code = exitCode(status);
-                j.status = if ((status & 0x7f) != 0) .killed else .exited;
-                log.info("job", "bg exit id={s} pid={d} code={d} status={s}", .{ j.id[0..], j.pid, j.exit_code.?, @tagName(j.status) });
+            switch (process.reapNonblock(j.proc)) { // 可移植:waitpid(WNOHANG) / WaitForSingleObject(0)
+                .running => {},
+                .exited => |code| {
+                    j.exit_code = code;
+                    j.status = if (code < 0) .killed else .exited; // 负=被信号杀(posixExitCode)
+                    log.info("job", "bg exit id={s} code={d} status={s}", .{ j.id[0..], code, @tagName(j.status) });
+                },
             }
         }
     }
@@ -256,13 +230,11 @@ pub const JobRegistry = struct {
 
     /// killGroup：向 pgid 发 SIGTERM → 0.5s → SIGKILL。
     pub fn kill(self: *JobRegistry, id: []const u8) !void {
-        // 第一阶段：查 job，读快照，发 TERM。作用域结束后指针作废。
-        // 保留 pid + pgid 快照：无论 registry 后续状态变化，我们都要能正确 reap。
-        // 这是"不让数据结构生命周期绑架 syscall 正确性"的铁律。
-        var pid: std.c.pid_t = undefined;
-        var pgid: std.c.pid_t = undefined;
+        // 读 proc 句柄快照(锁内),kill+reap 在锁外(不让 blocking 收尸钉住锁)。可移植:
+        // process.killJob(TERM→200ms→WNOHANG→KILL)+ reapBlocking(收尸)。**不让数据结构生命周期
+        // 绑架 syscall 正确性**:proc 快照保证即便 entry 状态变化仍能正确 kill/reap。
+        var proc: process.ProcHandle = undefined;
         {
-            // 锁仅护结构读快照;syscall 在锁外(不让 500ms sleep/blocking waitpid 钉住锁)。
             self.lock();
             const jp = self.getPtrLocked(id) orelse {
                 self.unlock();
@@ -272,41 +244,19 @@ pub const JobRegistry = struct {
                 self.unlock();
                 return; // 已结束，幂等返回
             }
-            pid = jp.pid;
-            pgid = jp.pgid;
+            proc = jp.proc;
             self.unlock();
-            _ = std.c.kill(-pgid, std.c.SIG.TERM);
         }
-
-        // 睡眠 + reap(reapExited 内部持锁)。第二阶段的 pid 快照保证即便 entry 状态变化仍能 waitpid。
-        var req = std.c.timespec{ .sec = 0, .nsec = 500_000_000 };
-        var rem: std.c.timespec = undefined;
-        _ = std.c.nanosleep(&req, &rem);
-        self.reapExited();
-        // POSIX 契约：reapExited 内部 waitpid(pid, WNOHANG)。若子进程已退,status 被置 .exited/.killed;
-        // 还在跑则 pid 未 reap 且 status 仍 .running → 下面 waitpid(pid, 0) 阻塞等它死是安全的。
-
-        // 第二阶段:锁内判"是否仍 running"(读快照),blocking waitpid 在锁外,再锁内写回 status。
+        process.killJob(proc); // TERM→等→KILL（锁外）
+        process.reapBlocking(proc); // 收尸（锁外，防僵尸）
         self.lock();
-        const still_running = if (self.getPtrLocked(id)) |jp| jp.status == .running else false;
-        const entry_gone = self.getPtrLocked(id) == null;
-        self.unlock();
-        if (still_running) {
-            _ = std.c.kill(-pgid, std.c.SIG.KILL);
-            var status: c_int = 0;
-            _ = std.c.waitpid(pid, &status, 0); // 锁外阻塞
-            self.lock();
-            if (self.getPtrLocked(id)) |jp| {
-                jp.exit_code = exitCode(status);
+        if (self.getPtrLocked(id)) |jp| {
+            if (jp.status == .running) {
                 jp.status = .killed;
+                jp.exit_code = -9; // SIGKILL 语义
             }
-            self.unlock();
-        } else if (entry_gone) {
-            // entry 不在 registry(当前实现不会发生,防御性兜底):KILL + blocking waitpid 防僵尸。
-            _ = std.c.kill(-pgid, std.c.SIG.KILL);
-            var status: c_int = 0;
-            _ = std.c.waitpid(pid, &status, 0);
         }
+        self.unlock();
     }
 
     pub fn activeCount(self: *JobRegistry) usize {
@@ -323,7 +273,7 @@ fn createFile(path: []const u8) ?std.c.fd_t {
     if (path.len >= buf.len) return null;
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
-    const fd = std.c.open(@ptrCast(&buf), std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    const fd = pfs.open(@ptrCast(&buf), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
     if (fd < 0) return null;
     return fd;
 }

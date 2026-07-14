@@ -284,6 +284,100 @@ fn spawnPipesWindows(argv: []const ?[*:0]const u8) CaptureError!PipeChild {
     return .{ .proc = pi.hProcess, .stdin_h = in_wr, .stdout_h = out_rd };
 }
 
+// ============================================================================
+// 后台 job 进程（Bash bg：spawn detached、stdout/stderr 落盘 fd、非阻塞 reap、kill）
+// ============================================================================
+
+/// 进程句柄：POSIX=pid；Windows=进程 HANDLE。
+pub const ProcHandle = if (is_windows) win.HANDLE else std.c.pid_t;
+
+extern "c" fn _get_osfhandle(fd: c_int) callconv(.c) usize; // MSVCRT fd → HANDLE（intptr）
+
+/// spawn detached 子进程，stdout→out_fd、stderr→err_fd（已 open 的文件 fd），返回进程句柄。
+/// POSIX：fork+setpgid+dup2+execve；Windows：_get_osfhandle+CreateProcessW(DETACHED_PROCESS)。
+/// inherit_env=true（bg job 需 PATH 等）。argv 须 null 结尾。
+pub fn spawnToFiles(argv: []const ?[*:0]const u8, out_fd: c_int, err_fd: c_int) CaptureError!ProcHandle {
+    if (is_windows) {
+        const out_h: win.HANDLE = @ptrFromInt(_get_osfhandle(out_fd));
+        const err_h: win.HANDLE = @ptrFromInt(_get_osfhandle(err_fd));
+        _ = SetHandleInformation(out_h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        _ = SetHandleInformation(err_h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        const a = std.heap.page_allocator;
+        const cmdline = buildWindowsCmdline(a, argv) catch return error.SpawnFailed;
+        defer a.free(cmdline);
+        var si = std.mem.zeroes(win.STARTUPINFOW);
+        si.cb = @sizeOf(win.STARTUPINFOW);
+        si.dwFlags = win.STARTF_USESTDHANDLES;
+        si.hStdOutput = out_h;
+        si.hStdError = err_h;
+        si.hStdInput = null;
+        var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
+        if (win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{ .detached_process = true }, null, null, &si, &pi) == .FALSE) return error.SpawnFailed;
+        win.CloseHandle(pi.hThread);
+        return pi.hProcess;
+    }
+    const pid = std.c.fork();
+    if (pid < 0) return error.SpawnFailed;
+    if (pid == 0) {
+        _ = std.c.setpgid(0, 0);
+        _ = std.c.dup2(out_fd, 1);
+        _ = std.c.dup2(err_fd, 2);
+        _ = std.c.close(out_fd);
+        _ = std.c.close(err_fd);
+        const argv0 = argv[0] orelse std.c._exit(127);
+        _ = std.c.execve(argv0, @as([*:null]const ?[*:0]const u8, @ptrCast(argv.ptr)), @ptrCast(std.c.environ));
+        std.c._exit(127);
+    }
+    _ = std.c.setpgid(pid, pid);
+    return pid;
+}
+
+pub const ReapStatus = union(enum) { running, exited: i32 };
+
+/// 非阻塞查子进程是否退出。POSIX=waitpid(WNOHANG)；Windows=WaitForSingleObject(0)+GetExitCodeProcess。
+pub fn reapNonblock(h: ProcHandle) ReapStatus {
+    if (is_windows) {
+        if (WaitForSingleObject(h, 0) != 0) return .running; // WAIT_OBJECT_0=0
+        var code: win.DWORD = 0;
+        _ = GetExitCodeProcess(h, &code);
+        return .{ .exited = @bitCast(code) };
+    }
+    var status: c_int = 0;
+    const WNOHANG: c_int = 1;
+    const rc = std.c.waitpid(h, &status, WNOHANG);
+    if (rc == 0) return .running;
+    return .{ .exited = posixExitCode(status) };
+}
+
+/// 杀子进程。POSIX killpg（-pid=杀整组，因 spawnToFiles 已 setpgid(pid,pid) 使 pgid==pid）；
+/// Windows TerminateProcess（单进程）。之后须 reapBlocking 收尸。
+pub fn killJob(h: ProcHandle) void {
+    if (is_windows) {
+        _ = TerminateProcess(h, 1);
+    } else {
+        _ = std.c.kill(-h, std.c.SIG.TERM);
+        const req = std.c.timespec{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
+        var rem: std.c.timespec = undefined;
+        _ = std.c.nanosleep(&req, &rem);
+        var status: c_int = 0;
+        const WNOHANG: c_int = 1;
+        if (std.c.waitpid(h, &status, WNOHANG) == 0) {
+            _ = std.c.kill(-h, std.c.SIG.KILL);
+        }
+    }
+}
+
+/// 阻塞 reap（收尸，防僵尸）。POSIX waitpid(0)；Windows CloseHandle（已 Terminate/退出）。
+pub fn reapBlocking(h: ProcHandle) void {
+    if (is_windows) {
+        _ = WaitForSingleObject(h, 2000);
+        win.CloseHandle(h);
+    } else {
+        var status: c_int = 0;
+        _ = std.c.waitpid(h, &status, 0);
+    }
+}
+
 fn labelOf(argv: []const ?[*:0]const u8) []const u8 {
     const a0 = argv[0] orelse return "?";
     const full = std.mem.span(a0);
