@@ -12,6 +12,7 @@
 //! 字符串边界(持久化路径)用 `asSlice()` 取 []const u8。
 
 const std = @import("std");
+const time = @import("../util/time.zig");
 
 /// 会话标识。24 个 hex 字符 = 16(ms 时间戳) + 8(monotonic ns 低位),自然可排序、唯一。
 /// 值类型:可拷贝,无外部生命周期依赖。
@@ -38,12 +39,10 @@ pub const SessionId = struct {
 var gen_counter = std.atomic.Value(u32).init(0);
 
 pub fn gen() SessionId {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
-    const ms: u64 = @intCast(@as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000));
-    var ts2: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts2);
-    const mono: u32 = @truncate(@as(u64, @bitCast(@as(i64, @intCast(ts2.nsec)))));
+    // ms:墙钟毫秒(id 前缀按真实时间排序)。mono:单调纳秒低位做唯一性(可移植 util/time)。
+    const wall_ms = @divTrunc(time.nowWallNs(), 1_000_000);
+    const ms: u64 = if (wall_ms < 0) 0 else @intCast(wall_ms);
+    const mono: u32 = @truncate(@as(u128, @bitCast(time.nowNs())));
     const uniq = mono +% gen_counter.fetchAdd(1, .monotonic);
 
     var id: SessionId = undefined;

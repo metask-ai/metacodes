@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
+const pdir = @import("platform").dir;
 const msg_mod = @import("message.zig");
 const Conversation = @import("conversation.zig").Conversation;
 const types = @import("../types.zig");
@@ -56,13 +57,13 @@ pub const Writer = struct {
     /// session 目录（owned）。basename 就是 session_id，想展示给用户时从这里 parse。
     dir: []const u8,
     /// transcript 文件 fd；FD_UNSET 表未打开（首次 flush 时懒打开）
-    fd: std.c.fd_t = FD_UNSET,
+    fd: pfs.Fd = FD_UNSET,
     /// 已刷盘的 message 数；下次 flush 从这里开始
     flushed_count: usize = 0,
     model: []const u8, // borrowed (session 期间不变)
 
     /// "fd 未打开" 哨兵值。POSIX 约定负 fd 无效。
-    const FD_UNSET: std.c.fd_t = -1;
+    const FD_UNSET: pfs.Fd = -1;
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -400,13 +401,12 @@ pub fn listSessions(cwd: []const u8, home: []const u8, allocator: std.mem.Alloca
     var root_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
     const root_path = try std.fmt.bufPrint(&root_buf, "{s}/.metacodes/projects/{s}\x00", .{ home, cwd_hash[0..] });
 
-    // 打开目录（用 opendir/readdir）
-    const dirp = std.c.opendir(@ptrCast(root_path.ptr));
-    if (dirp == null) {
+    // 打开目录(可移植遍历)
+    var it = pdir.open(@ptrCast(root_path.ptr)) orelse {
         // 没目录 = 没 session
         return try allocator.alloc(SessionListEntry, 0);
-    }
-    defer _ = std.c.closedir(dirp.?);
+    };
+    defer pdir.close(&it);
 
     var list = std.ArrayList(SessionListEntry).empty;
     errdefer {
@@ -419,11 +419,10 @@ pub fn listSessions(cwd: []const u8, home: []const u8, allocator: std.mem.Alloca
         list.deinit(allocator);
     }
 
-    while (std.c.readdir(dirp.?)) |ent| {
-        const name_ptr: [*:0]const u8 = @ptrCast(&ent.name);
-        const name = std.mem.span(name_ptr);
+    while (pdir.next(&it)) |ent| {
+        const name = ent.name;
         if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-        // 不判断 d_type 兼容性——后面 readMeta 失败会跳过
+        // 不判断 is_dir 兼容性——后面 readMeta 失败会跳过
 
         const full_path = try std.fmt.allocPrint(allocator, "{s}/.metacodes/projects/{s}/{s}", .{ home, cwd_hash[0..], name });
         errdefer allocator.free(full_path);
@@ -677,9 +676,7 @@ test "listSessions orders by last_modified desc" {
         try conv.appendText(.user, fmt_buf);
         w.flush(&conv);
         // 保证时间戳不同(Zig 0.16 无 std.time.sleep,用 std.c.nanosleep)。
-        var req = std.c.timespec{ .sec = 0, .nsec = 2_000_000 };
-        var rem: std.c.timespec = undefined;
-        _ = std.c.nanosleep(&req, &rem);
+        util_time.sleepMs(2);
     }
 
     const list = try listSessions("/project-X", tmp_home, a);

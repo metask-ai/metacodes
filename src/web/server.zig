@@ -14,6 +14,7 @@
 //! 安全边界:只绑 127.0.0.1;无鉴权(本机单用户 MVP,与 TUI 同信任级)。
 
 const std = @import("std");
+const time = @import("../util/time.zig");
 const journal_mod = @import("journal.zig");
 const backend_mod = @import("backend.zig");
 const msg_queue_mod = @import("../repl/msg_queue.zig");
@@ -98,9 +99,7 @@ pub const WebServer = struct {
         // 会 UAF)。3s 旧上限 < 10s socket 超时 = 有漏网窗口,已修。
         var waited_ms: u64 = 0;
         while (self.live_conns.load(.acquire) > 0 and waited_ms < 12_000) {
-            var req: std.c.timespec = .{ .sec = 0, .nsec = 10_000_000 };
-            var rem: std.c.timespec = undefined;
-            _ = std.c.nanosleep(&req, &rem);
+            time.sleepMs(10);
             waited_ms += 10;
         }
         if (self.live_conns.load(.acquire) > 0) {
@@ -118,9 +117,7 @@ pub const WebServer = struct {
                 if (self.closing.load(.acquire)) return; // 主动 stop:listen_fd 已关,退出
                 // 瞬时错误(EINTR/ECONNABORTED/EMFILE 等):短憩后重试,绝不让 server 哑掉。
                 // 10ms 兜底防万一 EBADF-但-未标记-closing 忙循环烧满 CPU。
-                var req: std.c.timespec = .{ .sec = 0, .nsec = 10_000_000 };
-                var rem: std.c.timespec = undefined;
-                _ = std.c.nanosleep(&req, &rem);
+                time.sleepMs(10);
                 continue;
             };
             // 计数在 spawn 前加(accept 线程侧):避免"已 accept 未及计数"时 stop 误判 0。

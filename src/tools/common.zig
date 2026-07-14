@@ -1,4 +1,5 @@
 const std = @import("std");
+const pfs = @import("platform").fs;
 const process = @import("platform").process;
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const log = @import("../util/log.zig");
@@ -79,13 +80,13 @@ pub fn extractJsonArg(data: []const u8, field: []const u8) ?[]const u8 {
 /// 调用方负责 `allocator.free(result)`。
 /// **注意(轴A)**:本函数**无界**——整读进内存。新代码若读的是用户可控大小的文件,用
 /// `readAllFromFdCapped` 而非本函数,否则巨型文件 OOM。仅在文件大小已被上游守卫/已知有界时用本函数。
-pub fn readAllFromFd(fd: std.posix.fd_t, allocator: std.mem.Allocator) ![]u8 {
+pub fn readAllFromFd(fd: pfs.Fd, allocator: std.mem.Allocator) ![]u8 {
     var buf: [65536]u8 = undefined;
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
 
     while (true) {
-        const n = std.posix.read(fd, &buf) catch return error.ReadError;
+        const n = pfs.readZ(fd, &buf) catch return error.ReadError;
         if (n == 0) break;
         try result.appendSlice(allocator, buf[0..@as(usize, @intCast(n))]);
     }
@@ -96,13 +97,13 @@ pub fn readAllFromFd(fd: std.posix.fd_t, allocator: std.mem.Allocator) ![]u8 {
 /// **轴A 单一入口:有界整读文件**。累积超 max_bytes → 释放已读 + 返回 `error.FileTooLarge`(内存
 /// 上限 = max_bytes + 一个 chunk)。所有"读用户可控大小文件"的工具应走此函数,而非无界 readAllFromFd
 /// ——建立文件读的统一摄取预算(消除 Write/NotebookEdit 等各自裸读绕过守卫的假象)。max_bytes=0 = 不限。
-pub fn readAllFromFdCapped(fd: std.posix.fd_t, allocator: std.mem.Allocator, max_bytes: usize) ![]u8 {
+pub fn readAllFromFdCapped(fd: pfs.Fd, allocator: std.mem.Allocator, max_bytes: usize) ![]u8 {
     var buf: [65536]u8 = undefined;
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
 
     while (true) {
-        const n = std.posix.read(fd, &buf) catch return error.ReadError;
+        const n = pfs.readZ(fd, &buf) catch return error.ReadError;
         if (n == 0) break;
         try result.appendSlice(allocator, buf[0..@as(usize, @intCast(n))]);
         if (max_bytes > 0 and result.items.len > max_bytes) {
@@ -378,9 +379,7 @@ test "spawnCaptureStdoutAbortable: abort mid-run kills process" {
     const t0 = nowMs();
     const trigger = try std.Thread.spawn(.{}, struct {
         fn run(s: *AbortSignal) void {
-            const req = std.c.timespec{ .sec = 0, .nsec = 200 * 1000 * 1000 };
-            var rem: std.c.timespec = undefined;
-            _ = std.c.nanosleep(&req, &rem);
+            util_time.sleepMs(200);
             s.abort(.user_ctrl_c);
         }
     }.run, .{&sig});
@@ -422,13 +421,13 @@ test "readAllFromFdCapped:超 cap 返 FileTooLarge、cap 内正常读(轴A 统�
 
     // cap=5KB < 10KB → FileTooLarge。
     {
-        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch unreachable;
+        const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch unreachable;
         defer _ = std.c.close(fd);
         try std.testing.expectError(error.FileTooLarge, readAllFromFdCapped(fd, a, 5 * 1024));
     }
     // cap=1MB > 10KB → 正常读全。
     {
-        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch unreachable;
+        const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch unreachable;
         defer _ = std.c.close(fd);
         const r = try readAllFromFdCapped(fd, a, 1024 * 1024);
         defer a.free(r);
@@ -436,7 +435,7 @@ test "readAllFromFdCapped:超 cap 返 FileTooLarge、cap 内正常读(轴A 统�
     }
     // cap=0 → 不限,读全。
     {
-        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch unreachable;
+        const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch unreachable;
         defer _ = std.c.close(fd);
         const r = try readAllFromFdCapped(fd, a, 0);
         defer a.free(r);

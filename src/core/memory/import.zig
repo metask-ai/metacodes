@@ -12,6 +12,7 @@
 //! 单一拼接缓冲更简单,语义等价——模型看到的最终文本一致)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 
 pub const MAX_INCLUDE_DEPTH = 5;
 
@@ -76,14 +77,14 @@ fn canonical(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path_z, .{ .ACCMODE = .RDONLY }, 0) catch return error.NotFound;
-    defer _ = std.c.close(fd);
+    const fd = pfs.openZ(path_z, .{ .ACCMODE = .RDONLY }, 0) catch return error.NotFound;
+    defer pfs.close(fd);
     var buf: [65536]u8 = undefined;
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
     var total: usize = 0;
     while (true) {
-        const n = std.posix.read(fd, &buf) catch return error.ReadError;
+        const n = pfs.readZ(fd, &buf) catch return error.ReadError;
         if (n == 0) break;
         total += n;
         if (total > 4 * 1024 * 1024) return error.FileTooLarge; // 4MB 上限
@@ -282,8 +283,8 @@ fn tmpAbsPath(allocator: std.mem.Allocator, tmp: *const std.testing.TmpDir) ![]u
 fn writeFileAt(dir_abs: []const u8, name: []const u8, data: []const u8) !void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir_abs, name });
-    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
-    defer _ = std.c.close(fd);
+    const fd = try pfs.openZ(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    defer pfs.close(fd);
     var written: usize = 0;
     while (written < data.len) {
         const n = std.c.write(fd, data[written..].ptr, data.len - written);

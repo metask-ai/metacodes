@@ -135,6 +135,7 @@ fn getKnowledgeCutoff(model: []const u8) ?[]const u8 {
 
 /// 读 /proc/self/exe 的同目录下 uname。用 uname(2) syscall 更直接。
 fn readUnameSR(buf: *[256]u8) []const u8 {
+    if (@import("builtin").os.tag == .windows) return "Windows"; // 无 POSIX uname(2);utsname 在 windows 是 void
     var un: std.c.utsname = undefined;
     if (std.c.uname(&un) != 0) return "unknown";
     const sys = std.mem.sliceTo(&un.sysname, 0);

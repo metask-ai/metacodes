@@ -7,6 +7,7 @@
 //! 谨慎:① 只在交互 tty 启动期调一次;② 超时短(~120ms)不拖慢启动;③ 还原 termios;
 //! ④ 管道/NO_PROBE/非 tty 由调用方跳过(本模块也自带非 tty 守卫)。
 const std = @import("std");
+const builtin = @import("builtin");
 const platform_term = @import("platform").terminal;
 
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
@@ -57,7 +58,10 @@ fn isHex(c: u8) bool {
 }
 
 /// 探测终端背景色。非 tty / 不支持 / 超时 → null。会临时进 raw 再还原。
-pub fn probeBackground(fd: std.c.fd_t) ?Rgb {
+/// Windows console 不走这套 OSC 11 + poll 机制(等价 unsupported)→ 直接 null 回退默认主题;
+/// 早退让下方 POSIX 专属 std.posix.poll/std.c.read 成 comptime 死分支不被分析。
+pub fn probeBackground(fd: c_int) ?Rgb {
+    if (builtin.os.tag == .windows) return null;
     if (!platform_term.isatty(fd)) return null;
 
     // 临时进 raw(可移植:POSIX termios / Windows console mode)。读走下方 poll 守卫,MIN 差异无碍。

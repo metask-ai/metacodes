@@ -12,6 +12,7 @@
 //! 后续加环形淘汰 + "重放起点晚于请求 seq"信号,协议上 SSE 天然支持。
 
 const std = @import("std");
+const time = @import("../util/time.zig");
 const sync = @import("platform").sync;
 const log = @import("../util/log.zig");
 
@@ -163,9 +164,7 @@ test "close 唤醒等待者并返回 null;isClosed 可见" {
     };
     const t = try std.Thread.spawn(.{}, Waiter.run, .{&j});
     // 给 waiter 一点进入等待的时间(非严格同步,close 的 broadcast 对未入等者也安全)
-    var req: std.c.timespec = .{ .sec = 0, .nsec = 20_000_000 };
-    var rem: std.c.timespec = undefined;
-    _ = std.c.nanosleep(&req, &rem);
+    time.sleepMs(20);
     j.close();
     t.join();
     try testing.expect(j.isClosed());

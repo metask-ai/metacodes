@@ -11,6 +11,7 @@
 //! 调用方:`tools/agent.zig` 在 spawnAgent 前调本函数生成 sys_prompt。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const AgentDef = @import("def.zig").AgentDef;
 const SkillSet = @import("../skills/skill.zig").SkillSet;
 const render_mod = @import("../skills/render.zig");
@@ -134,13 +135,13 @@ fn injectFile(
 }
 
 fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.NotFound;
-    defer _ = std.c.close(fd);
+    const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch return error.NotFound;
+    defer pfs.close(fd);
     var buf: [65536]u8 = undefined;
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
     while (true) {
-        const n = std.posix.read(fd, &buf) catch return error.ReadError;
+        const n = pfs.readZ(fd, &buf) catch return error.ReadError;
         if (n == 0) break;
         try result.appendSlice(allocator, buf[0..@as(usize, @intCast(n))]);
     }

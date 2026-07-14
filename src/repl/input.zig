@@ -333,7 +333,7 @@ pub fn newlineHint() []const u8 {
     return if (shouldEnableKittyKeyboard()) "shift + \xe2\x8f\x8e for newline" else "\\ + \xe2\x8f\x8e for newline";
 }
 
-pub fn enterRawMode(fd: std.c.fd_t) ?platform_term.SavedMode {
+pub fn enterRawMode(fd: c_int) ?platform_term.SavedMode {
     // 模式切换走可移植 platform/terminal(POSIX termios / Windows console mode)。
     const orig = platform_term.enterRaw(fd) orelse return null;
 
@@ -353,7 +353,7 @@ pub fn enterRawMode(fd: std.c.fd_t) ?platform_term.SavedMode {
     return orig;
 }
 
-pub fn restoreMode(fd: std.c.fd_t, orig: platform_term.SavedMode) void {
+pub fn restoreMode(fd: c_int, orig: platform_term.SavedMode) void {
     // 关 bracketed paste(始终)+ 键盘协议(仅白名单——对称 enterRawMode,同进程 env 不变判定恒一致,
     // 不会发了 enable 没 disable;非白名单不发孤立 disable,避免 Apple Terminal honor 它出异常)。
     const disable_paste = "\x1b[?2004l";

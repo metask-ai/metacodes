@@ -4,6 +4,7 @@
 //! 先快后准:rg -l -w <name> 找候选文件 → 逐个经 LSP documentSymbol 抽符号、留 name 匹配的定义。
 //! 需 `--lsp` + 对应 language server(Y2 砍 tree-sitter 后)。输出 JSON 数组,便于模型/上层解析。
 const std = @import("std");
+const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
 const read_state = @import("../core/read_state.zig");
@@ -155,8 +156,8 @@ fn writeSymbolJson(w: *std.Io.Writer, s: symbols.Symbol) !void {
 const writeJsonString = @import("../util/json.zig").writeJsonString;
 
 fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
-    defer _ = std.c.close(fd);
+    const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
+    defer pfs.close(fd);
     return try common.readAllFromFd(fd, allocator);
 }
 

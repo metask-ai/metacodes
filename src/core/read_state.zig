@@ -162,7 +162,7 @@ const Stat64 = extern struct {
 };
 extern "c" fn _fstat64(fd: c_int, buf: *Stat64) c_int;
 
-pub fn statFd(fd: std.c.fd_t) !StatInfo {
+pub fn statFd(fd: pfs.Fd) !StatInfo {
     if (builtin.os.tag == .windows) {
         var st: Stat64 = undefined;
         if (_fstat64(fd, &st) != 0) return error.StatFailed;

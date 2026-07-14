@@ -42,7 +42,7 @@ pub const RenderRegion = struct {
     /// "按住"连发,又远小于人为"开→关→再开"的有意间隔 → 不误伤故意快速 toggle。见 noteCtrloAndShouldSuppressReopen。
     const OVERLAY_REOPEN_DEBOUNCE_MS: i64 = 120;
 
-    fd: std.c.fd_t,
+    fd: c_int,
     cols: u16 = 80,
     rows: u16 = 24,
     prev_rows: u16 = 0, // 上一帧固定区总行数;0=未画。eraseRegion 用它擦旧区。
@@ -229,7 +229,7 @@ pub const RenderRegion = struct {
         }
     }
 
-    pub fn init(allocator: std.mem.Allocator, fd: std.c.fd_t, theme: Theme, cap: ColorCapability) RenderRegion {
+    pub fn init(allocator: std.mem.Allocator, fd: c_int, theme: Theme, cap: ColorCapability) RenderRegion {
         const sz = term.getSize(fd) orelse term.TermSize{ .rows = 24, .cols = 80 };
         return .{
             .fd = fd,

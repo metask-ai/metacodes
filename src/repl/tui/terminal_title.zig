@@ -12,6 +12,7 @@
 //! 并按码点数上限截断。逻辑与消毒范围逐条对齐 codex。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const platform_term = @import("platform").terminal;
 const app_mod = @import("../../app.zig");
 
@@ -136,10 +137,10 @@ fn isDisallowed(cp: u21) bool {
     };
 }
 
-fn writeAll(fd: std.c.fd_t, bytes: []const u8) void {
+fn writeAll(fd: c_int, bytes: []const u8) void {
     var total: usize = 0;
     while (total < bytes.len) {
-        const n = std.c.write(fd, bytes.ptr + total, bytes.len - total);
+        const n = pfs.write(fd, bytes[total..]);
         if (n <= 0) return; // 写不进就放弃(标题非关键)
         total += @as(usize, @intCast(n));
     }

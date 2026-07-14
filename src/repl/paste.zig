@@ -71,7 +71,7 @@ pub fn load(allocator: std.mem.Allocator, home: []const u8, id: usize) !?[]u8 {
     errdefer buf.deinit(allocator);
     var chunk: [4096]u8 = undefined;
     while (true) {
-        const n = std.posix.read(fd, &chunk) catch break;
+        const n = pfs.readZ(fd, &chunk) catch break;
         if (n == 0) break;
         try buf.appendSlice(allocator, chunk[0..@intCast(n)]);
     }

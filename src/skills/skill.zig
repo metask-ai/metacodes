@@ -33,6 +33,7 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
+const pdir = @import("platform").dir;
 
 /// 调用上下文 — fork 时跑独立 subagent,inline 在主对话内联。
 pub const ExecContext = enum { inline_ctx, fork };
@@ -162,12 +163,11 @@ pub const SkillSet = struct {
     pub fn loadFromDir(self: *SkillSet, dir_path: []const u8) !void {
         const path_z = try self.allocator.dupeZ(u8, dir_path);
         defer self.allocator.free(path_z);
-        const dir = std.c.opendir(path_z) orelse return; // 不存在即 no-op
-        defer _ = std.c.closedir(dir);
+        var it = pdir.open(path_z) orelse return; // 不存在即 no-op
+        defer pdir.close(&it);
 
-        while (std.c.readdir(dir)) |entry_ptr| {
-            const entry = entry_ptr.*;
-            const name_slice = std.mem.sliceTo(&entry.name, 0);
+        while (pdir.next(&it)) |entry| {
+            const name_slice = entry.name;
             if (name_slice.len == 0) continue;
             if (name_slice[0] == '.') continue; // . / ..
 
@@ -264,16 +264,21 @@ pub fn findRepoRoot(allocator: std.mem.Allocator, start_dir: []const u8) ![]u8 {
 }
 
 fn readAllFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch |err| switch (err) {
-        error.FileNotFound => return error.FileNotFound,
-        else => return error.ReadError,
-    };
+    var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= pbuf.len) return error.ReadError;
+    @memcpy(pbuf[0..path.len], path);
+    pbuf[path.len] = 0;
+    // 可移植 open(POSIX/Windows 统一 c_int fd)。pfs 不区分 errno,故失败一律当 FileNotFound
+    // (skill 路径的 open 失败绝大多数即不存在;调用方本就把 else 也降级成 ReadError)。
+    const fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .RDONLY }, 0);
+    if (fd < 0) return error.FileNotFound;
     defer _ = pfs.close(fd);
     var buf: [65536]u8 = undefined;
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
     while (true) {
-        const n = std.posix.read(fd, &buf) catch return error.ReadError;
+        const n = pfs.read(fd, &buf); // 可移植(POSIX read / Windows _read),fd 是 pfs c_int
+        if (n < 0) return error.ReadError;
         if (n == 0) break;
         try result.appendSlice(allocator, buf[0..@as(usize, @intCast(n))]);
     }
@@ -649,12 +654,11 @@ fn cleanupDir(parent: []const u8) void {
     const allocator = testing.allocator;
     const parent_z = allocator.dupeZ(u8, parent) catch return;
     defer allocator.free(parent_z);
-    const dir = std.c.opendir(parent_z) orelse return;
-    defer _ = std.c.closedir(dir);
+    var it = pdir.open(parent_z) orelse return;
+    defer pdir.close(&it);
 
-    while (std.c.readdir(dir)) |entry_ptr| {
-        const entry = entry_ptr.*;
-        const name = std.mem.sliceTo(&entry.name, 0);
+    while (pdir.next(&it)) |entry| {
+        const name = entry.name;
         if (name.len == 0 or name[0] == '.') continue;
         const md = std.fmt.allocPrintSentinel(allocator, "{s}/{s}/SKILL.md", .{ parent, name }, 0) catch continue;
         defer allocator.free(md);

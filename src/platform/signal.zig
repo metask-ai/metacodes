@@ -44,12 +44,12 @@ pub fn installInterrupt(comptime callback: fn () void) void {
             fn ctrl(ctrl_type: win.DWORD) callconv(.winapi) win.BOOL {
                 if (ctrl_type == CTRL_C_EVENT or ctrl_type == CTRL_BREAK_EVENT) {
                     callback();
-                    return win.TRUE;
+                    return .TRUE;
                 }
-                return win.FALSE;
+                return .FALSE;
             }
         };
-        _ = SetConsoleCtrlHandler(W.ctrl, win.TRUE);
+        _ = SetConsoleCtrlHandler(W.ctrl, .TRUE);
     } else {
         const P = struct {
             fn h(_: std.posix.SIG) callconv(.c) void {

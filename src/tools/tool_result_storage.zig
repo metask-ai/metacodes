@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
+const pdir = @import("platform").dir;
 
 /// 默认单结果落盘阈值(对齐 cc DEFAULT_MAX_RESULT_SIZE_CHARS)。
 pub const DEFAULT_MAX_RESULT_CHARS: usize = 50_000;
@@ -135,16 +136,16 @@ fn cleanupCacheImpl(allocator: std.mem.Allocator, home_dir: []const u8, ttl_sec:
 
     var dz: [std.fs.max_path_bytes]u8 = undefined;
     const dirz = std.fmt.bufPrintZ(&dz, "{s}", .{dir}) catch return;
-    const dp = std.c.opendir(dirz.ptr) orelse return; // 目录不存在(还没落过盘)→ 无事
-    defer _ = std.c.closedir(dp);
+    var it = pdir.open(dirz.ptr) orelse return; // 目录不存在(还没落过盘)→ 无事
+    defer pdir.close(&it);
 
     const Ent = struct { name: [128]u8, name_len: usize, mtime: i64, size: u64 };
     var ents = std.ArrayList(Ent).empty;
     defer ents.deinit(allocator);
     var total: u64 = 0;
 
-    while (std.c.readdir(dp)) |ent| {
-        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.name)));
+    while (pdir.next(&it)) |ent| {
+        const name = ent.name;
         if (name.len == 0 or name[0] == '.') continue; // . / .. / .last-gc
         if (!std.mem.endsWith(u8, name, ".txt")) continue; // 只碰 <hash>.txt
         if (name.len >= 128) continue;

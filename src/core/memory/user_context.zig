@@ -18,6 +18,7 @@
 //!   </system-reminder>
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const claudemd = @import("claudemd.zig");
 const time = @import("../../util/time.zig");
 
@@ -138,8 +139,8 @@ fn tmpAbsPath(allocator: std.mem.Allocator, tmp: *const std.testing.TmpDir) ![]u
 fn writeFileAt(dir_abs: []const u8, name: []const u8, data: []const u8) !void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir_abs, name });
-    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
-    defer _ = std.c.close(fd);
+    const fd = try pfs.openZ(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    defer pfs.close(fd);
     var written: usize = 0;
     while (written < data.len) {
         const n = std.c.write(fd, data[written..].ptr, data.len - written);

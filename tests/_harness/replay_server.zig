@@ -6,6 +6,7 @@
 //!   把它喂给 metacodes --base-url → 确定性回放该场景的真实模型响应(不连网络)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const harness = @import("harness");
 const Cassette = @import("cassette").Cassette;
 
@@ -17,7 +18,7 @@ pub fn main(init: std.process.Init) !void {
     _ = args.next(); // argv[0]
     const dir_arg = args.next() orelse {
         const msg = "usage: replay_server <cassette_dir>\n";
-        _ = std.c.write(2, msg.ptr, msg.len);
+        _ = pfs.write(2, msg);
         std.process.exit(2);
     };
     const dir: []const u8 = dir_arg;
@@ -39,7 +40,7 @@ pub fn main(init: std.process.Init) !void {
     // 打印 base_url(首行,shell 捕获)
     var buf: [256]u8 = undefined;
     const line = try std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}/v1/messages\n", .{srv.port});
-    _ = std.c.write(1, line.ptr, line.len);
+    _ = pfs.write(1, line);
 
     // 阻塞直到被杀(shell 跑完场景后 kill 本进程)
     while (true) {

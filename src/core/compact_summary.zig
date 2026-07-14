@@ -7,6 +7,7 @@
 //! 失败/无 client → 返 null,caller 退回纯 compactKeepRecent(降级不阻断)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const types = @import("../types.zig");
 const msg = @import("message.zig");
 const log = @import("../util/log.zig");
@@ -143,13 +144,13 @@ fn loadTemplateOrDefault(allocator: std.mem.Allocator, env_name: [:0]const u8, d
 fn readFileAllocLimited(allocator: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path_z, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
-    defer _ = std.c.close(fd);
+    const fd = pfs.openZ(path_z, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
+    defer pfs.close(fd);
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = std.posix.read(fd, &buf) catch return error.ReadFailed;
+        const n = pfs.readZ(fd, &buf) catch return error.ReadFailed;
         if (n == 0) break;
         if (out.items.len + n > limit) return error.FileTooLarge;
         try out.appendSlice(allocator, buf[0..n]);

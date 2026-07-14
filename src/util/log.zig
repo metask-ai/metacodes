@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
+const time = @import("time.zig");
 const sync = @import("platform").sync;
 
 pub const Level = enum(u3) {
@@ -47,7 +48,7 @@ pub const Level = enum(u3) {
 var g_default_level: Level = .err;
 var g_module_filters: []const ModuleFilter = &.{};
 var g_mutex: sync.Mutex = .{};
-var g_log_file_fd: ?std.c.fd_t = null;
+var g_log_file_fd: ?pfs.Fd = null;
 var g_initialized: bool = false;
 /// 是否往 stderr(fd 2)写日志。交互式 TUI 拥有终端时**必须关掉**——否则任何 err/warn 直接
 /// 注入渲染流(fd 1/2 同一终端),把固定区写花、滚屏 desync(实测:web 搜索的 HTTP err 注入
@@ -93,16 +94,10 @@ pub fn initFromEnv() void {
         }
     }
 
-    // 为 request_id 生成 seed：用 monotonic 时钟 sec ^ nsec 截到 u32。
+    // 为 request_id 生成 seed：用 monotonic 时钟纳秒截到 u32(可移植 util/time)。
     // 不追求密码学强度，只是让不同进程启动的日志 id 前缀不同，便于 grep。
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) == 0) {
-        const sec: u64 = @bitCast(@as(i64, ts.sec));
-        const nsec: u64 = @bitCast(@as(i64, ts.nsec));
-        g_reqid_seed = @truncate(sec ^ nsec);
-    } else {
-        g_reqid_seed = 0xDEADBEEF;
-    }
+    const seed_ns = time.nowNs();
+    g_reqid_seed = if (seed_ns == 0) 0xDEADBEEF else @truncate(@as(u128, @bitCast(seed_ns)));
     unlock();
 
     // 初始化后写一条 banner——也方便确认 logger 本身工作
@@ -127,7 +122,7 @@ pub fn setLevel(level: Level) void {
 /// 测试钩子:直接注入日志文件 fd(绕过 METACODES_LOG_FILE 的一次性 init)。
 /// 用于 L2 测试断言 errId/warnId 落盘内容(如 Stage 6 HTTP 错误 body)。
 /// 同时把 g_initialized 置 1,避免后续 logImpl 触发 initFromEnv 覆盖。
-pub fn setLogFileFdForTest(fd: std.c.fd_t) void {
+pub fn setLogFileFdForTest(fd: pfs.Fd) void {
     lock();
     defer unlock();
     g_initialized = true;
@@ -235,7 +230,7 @@ pub fn setStderrEnabled(enabled: bool) void {
     g_stderr_enabled = enabled;
 }
 
-fn writeAll(fd: std.c.fd_t, bytes: []const u8) void {
+fn writeAll(fd: pfs.Fd, bytes: []const u8) void {
     var total: usize = 0;
     while (total < bytes.len) {
         const n = pfs.write(fd, bytes[total..][0..bytes.len - total]);

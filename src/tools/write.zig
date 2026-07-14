@@ -50,7 +50,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const old_content = readExisting(allocator, path) catch null;
     defer if (old_content) |oc| allocator.free(oc);
 
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o666) catch return error.WriteError;
+    const fd = pfs.openZ(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o666) catch return error.WriteError;
     defer _ = pfs.close(fd);
 
     var pos: usize = 0;
@@ -87,7 +87,7 @@ const MAX_WRITE_OLD_SIZE: usize = 10 * 1024 * 1024;
 
 /// 读已存在文件全文（不存在/过大返 error）。供 Write 计算 diff。走轴A统一入口 readAllFromFdCapped。
 fn readExisting(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
+    const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
     defer _ = pfs.close(fd);
     return try common.readAllFromFdCapped(fd, allocator, MAX_WRITE_OLD_SIZE);
 }

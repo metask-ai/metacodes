@@ -68,7 +68,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         DEFAULT_LIMIT_LINES;
     if (offset_1based == 0) return error.InvalidOffset;
 
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch {
+    const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch {
         // 缓存失效优雅提示:tool-results 落盘缓存被 TTL/LRU 清理后,transcript 里的旧 path → 打不开。
         // 返回可操作提示(而非裸 FileNotFound),消除"文件被清了 vs 路径错了"的神秘失败。
         if (std.mem.indexOf(u8, path, "/.metacodes/tool-results/") != null) {
@@ -212,7 +212,7 @@ fn readRangeStreaming(
     allocator: std.mem.Allocator,
     ctx: *const ToolContext,
     path: []const u8,
-    fd: std.posix.fd_t,
+    fd: pfs.Fd,
     st: read_state.StatInfo,
     offset_1based: usize,
     limit: usize,
@@ -224,7 +224,7 @@ fn readRangeStreaming(
     const end_line = offset_1based +| limit; // saturating:limit 巨大不溢出
     var capped = false;
     stream: while (true) {
-        const n = std.posix.read(fd, &chunk) catch return error.ReadError;
+        const n = pfs.readZ(fd, &chunk) catch return error.ReadError;
         if (n == 0) break;
         for (chunk[0..@intCast(n)]) |b| {
             if (line_no >= offset_1based and line_no < end_line) {
@@ -269,13 +269,13 @@ fn isTrue(s: ?[]const u8) bool {
 
 /// outline 模式:打开文件、读全量、渲染符号大纲。**无符号 → null**(调用方回退正常读)。
 fn readOutline(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []const u8) !?[]u8 {
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
+    const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
     defer _ = pfs.close(fd);
     return try readOutlineFromFd(allocator, ctx, path, fd);
 }
 
 /// 已有 fd 时渲染大纲(大文件守卫路径复用,避免重开)。无符号 → null。
-fn readOutlineFromFd(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []const u8, fd: std.posix.fd_t) !?[]u8 {
+fn readOutlineFromFd(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []const u8, fd: pfs.Fd) !?[]u8 {
     const source = try common.readAllFromFd(fd, allocator);
     defer allocator.free(source);
     return try code_map.renderOutlineForSource(ctx, allocator, path, source);
@@ -370,7 +370,7 @@ const MAX_IMAGE_BYTES: usize = 3_750_000;
 /// 读图像 → base64 → 返回结构化 JSON：{"type":"image","media_type":"...","data":"<b64>"}。
 /// api/request.zig 的 serializeContent 检测到此形态会发成真正的 image content block。
 fn readImage(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []const u8, media_type: []const u8) ![]u8 {
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
+    const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
     defer _ = pfs.close(fd);
 
     const st = read_state.statFd(fd) catch null;

@@ -61,6 +61,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    addPlatform(b, mock_mcp_mod); // stdin/stdout 走可移植 pfs
     const mock_mcp_exe = b.addExecutable(.{
         .name = "mock_mcp_server",
         .root_module = mock_mcp_mod,
@@ -68,29 +69,36 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(mock_mcp_exe);
 
     // replay_server 二进制(Stage 7):从 cassette 起 mock,供 e2e replay。测试专用。
-    const replay_mod = b.createModule(.{
-        .root_source_file = b.path("tests/_harness/replay_server.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    replay_mod.addImport("harness", b.createModule(.{
-        .root_source_file = b.path("tests/_harness/mock_sse_server.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    }));
-    replay_mod.addImport("cassette", b.createModule(.{
-        .root_source_file = b.path("tests/_harness/cassette.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    }));
-    const replay_exe = b.addExecutable(.{
-        .name = "replay_server",
-        .root_module = replay_mod,
-    });
-    b.installArtifact(replay_exe);
+    // **仅非 Windows**:此工装用真 TCP socket 服务器(mock_sse_server)+ std.process.args
+    // 做 e2e replay,是 POSIX-only 测试基建(CI 只在 ubuntu/macos 跑 e2e)。未移植到
+    // Windows(socket server→net.zig / args→initAllocator / `{d}` on HANDLE 三处),
+    // 属跨平台 roadmap 的测试工装尾项——不阻塞 app 本体的 Windows 交叉编译。
+    if (target.result.os.tag != .windows) {
+        const replay_mod = b.createModule(.{
+            .root_source_file = b.path("tests/_harness/replay_server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        replay_mod.addImport("harness", b.createModule(.{
+            .root_source_file = b.path("tests/_harness/mock_sse_server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }));
+        replay_mod.addImport("cassette", b.createModule(.{
+            .root_source_file = b.path("tests/_harness/cassette.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }));
+        addPlatform(b, replay_mod); // stdout/stderr 走可移植 pfs
+        const replay_exe = b.addExecutable(.{
+            .name = "replay_server",
+            .root_module = replay_mod,
+        });
+        b.installArtifact(replay_exe);
+    }
 
     // ── metacodes-core 可复用库 module(root=src/lib.zig,UI 图不可达)──────────
     // 供其他 Zig 项目经 build.zig.zon 依赖 `@import("metacodes-core")`。

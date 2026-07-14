@@ -92,7 +92,7 @@ pub const History = struct {
     /// 格式：JSONL——每行一个 JSON 字符串（`"cmd with \n newline"`）。
     /// 向后兼容：不以 `"` 开头的行按旧版纯文本整行处理（自动迁移，下次 save 会写成 JSONL）。
     pub fn loadFromFile(self: *History, path: []const u8) !void {
-        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return;
+        const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch return;
         defer _ = pfs.close(fd);
 
         var buf = std.ArrayList(u8).empty;
@@ -100,7 +100,7 @@ pub const History = struct {
 
         var chunk: [4096]u8 = undefined;
         while (true) {
-            const n = std.posix.read(fd, &chunk) catch return error.ReadError;
+            const n = pfs.readZ(fd, &chunk) catch return error.ReadError;
             if (n == 0) break;
             try buf.appendSlice(self.allocator, chunk[0..@as(usize, @intCast(n))]);
         }

@@ -182,9 +182,7 @@ fn runAutoBackgroundable(
             registry.kill(job_id[0..]) catch {};
             return error.Aborted;
         };
-        var req = std.c.timespec{ .sec = 0, .nsec = 100_000_000 };
-        var rem: std.c.timespec = undefined;
-        _ = std.c.nanosleep(&req, &rem);
+        util_time.sleepMs(100);
 
         registry.reapExited();
         const j = registry.get(job_id[0..]) orelse return error.JobNotFound; // 值快照

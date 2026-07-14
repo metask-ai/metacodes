@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
+const pdir = @import("platform").dir;
 const def_mod = @import("def.zig");
 pub const AgentDef = def_mod.AgentDef;
 pub const Origin = def_mod.Origin;
@@ -89,12 +90,11 @@ pub const AgentSet = struct {
     pub fn loadFromDirRecursive(self: *AgentSet, dir_path: []const u8, origin: Origin) !void {
         const path_z = try self.allocator.dupeZ(u8, dir_path);
         defer self.allocator.free(path_z);
-        const dir = std.c.opendir(path_z) orelse return;
-        defer _ = std.c.closedir(dir);
+        var it = pdir.open(path_z) orelse return;
+        defer pdir.close(&it);
 
-        while (std.c.readdir(dir)) |entry_ptr| {
-            const entry = entry_ptr.*;
-            const name_slice = std.mem.sliceTo(&entry.name, 0);
+        while (pdir.next(&it)) |entry| {
+            const name_slice = entry.name;
             if (name_slice.len == 0) continue;
             if (name_slice[0] == '.') continue;
 
@@ -146,13 +146,13 @@ pub const AgentSet = struct {
 };
 
 fn readAllFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.ReadError;
+    const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch return error.ReadError;
     defer _ = pfs.close(fd);
     var buf: [65536]u8 = undefined;
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
     while (true) {
-        const n = std.posix.read(fd, &buf) catch return error.ReadError;
+        const n = pfs.readZ(fd, &buf) catch return error.ReadError;
         if (n == 0) break;
         try result.appendSlice(allocator, buf[0..@as(usize, @intCast(n))]);
     }
@@ -399,11 +399,10 @@ fn cleanupDir(parent: []const u8) void {
     const a = testing.allocator;
     const parent_z = a.dupeZ(u8, parent) catch return;
     defer a.free(parent_z);
-    const dir = std.c.opendir(parent_z) orelse return;
-    defer _ = std.c.closedir(dir);
-    while (std.c.readdir(dir)) |entry_ptr| {
-        const entry = entry_ptr.*;
-        const name = std.mem.sliceTo(&entry.name, 0);
+    var it = pdir.open(parent_z) orelse return;
+    defer pdir.close(&it);
+    while (pdir.next(&it)) |entry| {
+        const name = entry.name;
         if (name.len == 0 or name[0] == '.') continue;
         const sub = std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ parent, name }, 0) catch continue;
         defer a.free(sub);

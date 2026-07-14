@@ -7,6 +7,7 @@
 //! PermissionContext 携带(每 session 一份),不再用进程全局——多 Session 不串台。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const platform_term = @import("platform").terminal;
 const category = @import("category.zig");
 const PermissionChoice = @import("../core/protocol/permission_choice.zig").PermissionChoice;
@@ -119,7 +120,7 @@ fn askText(tool_name: []const u8, args: []const u8) !bool {
     std.debug.print("Allow? [y/N]: ", .{});
 
     var buf: [10]u8 = undefined;
-    const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch return false;
+    const n = pfs.readZ(0, &buf) catch return false;
     if (n > 0 and (buf[0] == 'y' or buf[0] == 'Y')) return true;
     return false;
 }

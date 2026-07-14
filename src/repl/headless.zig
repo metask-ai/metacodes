@@ -9,6 +9,7 @@
 //! 退出码：end_turn / max_turns → 0；api_error / tool_error / aborted → 1。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const writer_backend = @import("../core/writer_backend.zig");
@@ -181,7 +182,7 @@ pub fn exitCodeFor(stop_reason: agent_loop.StopReason) u8 {
 fn writeStdout(bytes: []const u8) void {
     var pos: usize = 0;
     while (pos < bytes.len) {
-        const n = std.c.write(1, bytes.ptr + pos, bytes.len - pos);
+        const n = pfs.write(1, bytes[pos..]); // 可移植(POSIX write / Windows _write),fd 1=stdout
         if (n <= 0) break;
         pos += @as(usize, @intCast(n));
     }

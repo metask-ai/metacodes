@@ -15,6 +15,7 @@
 //! permanent(二进制缺/版本不符 → degraded)、data(环/NotFound → 透传模型改参)。
 
 const std = @import("std");
+const time = @import("../util/time.zig");
 const sync = @import("platform").sync;
 const common = @import("../tools/common.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
@@ -1853,8 +1854,7 @@ fn ensureParentDir(allocator: std.mem.Allocator, path: []const u8) !void {
 }
 
 fn sleepMs(ms: u64) void {
-    var ts: std.c.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * 1_000_000) };
-    _ = std.c.nanosleep(&ts, null);
+    time.sleepMs(ms); // 可移植(POSIX nanosleep / Windows Sleep)
 }
 
 // ============================================================================

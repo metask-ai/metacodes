@@ -13,6 +13,7 @@
 //! 否则 `~/.metacodes/projects/<hash>/memory-evil` 或 `..` 穿越能骗过前缀匹配 → 任意写洞。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const builtin = @import("builtin");
 const transcript = @import("../transcript.zig");
 
@@ -152,6 +153,10 @@ fn isSymlink(path: []const u8) bool {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     @memcpy(buf[0..path.len], path);
     buf[path.len] = 0;
+    // Windows:符号链接/reparse-point 检测机制不同(GetFileAttributes REPARSE_POINT),
+    // 且创建符号链接需管理员权限。此处保守返 false(非符号链接)——windows reparse 防护
+    // 属后续工作(TODO:跨平台移植 roadmap)。
+    if (builtin.os.tag == .windows) return false;
     if (builtin.os.tag == .linux) {
         var stx: std.os.linux.Statx = undefined;
         const flags: u32 = std.os.linux.AT.SYMLINK_NOFOLLOW;
@@ -230,14 +235,14 @@ pub fn readIndexTruncated(allocator: std.mem.Allocator, home: []const u8, cwd: [
 fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path_z, .{ .ACCMODE = .RDONLY }, 0) catch return error.NotFound;
-    defer _ = std.c.close(fd);
+    const fd = pfs.openZ(path_z, .{ .ACCMODE = .RDONLY }, 0) catch return error.NotFound;
+    defer pfs.close(fd);
     var buf: [65536]u8 = undefined;
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
     var total: usize = 0;
     while (true) {
-        const n = std.posix.read(fd, &buf) catch return error.ReadError;
+        const n = pfs.readZ(fd, &buf) catch return error.ReadError;
         if (n == 0) break;
         total += n;
         if (total > 4 * 1024 * 1024) return error.FileTooLarge;
@@ -434,8 +439,8 @@ extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 fn writeFileZ(path: []const u8, data: []const u8) !void {
-    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
-    defer _ = std.c.close(fd);
+    const fd = try pfs.openZ(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    defer pfs.close(fd);
     var written: usize = 0;
     while (written < data.len) {
         const n = std.c.write(fd, data[written..].ptr, data.len - written);

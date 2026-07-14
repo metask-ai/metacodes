@@ -21,7 +21,11 @@ const builtin = @import("builtin");
 
 const is_windows = builtin.os.tag == .windows;
 
-pub const invalid_fd: c_int = -1;
+/// 文件 fd 类型。两平台皆 c_int:POSIX 天然 fd;Windows 走 MSVCRT `_open`(返回 CRT 层
+/// int fd,非内核 HANDLE),故模型一致。**勿用 `std.c.fd_t`**——它在 Windows 是 HANDLE
+/// (*anyopaque),会与 pfs.open 返回的 c_int 冲突(-1 哨兵无法赋值)。
+pub const Fd = c_int;
+pub const invalid_fd: Fd = -1;
 
 // ============================================================================
 // O flags：POSIX 直通 std.c.O；Windows 镜像本代码实际用到的字段子集
@@ -82,6 +86,30 @@ pub fn open(path: [*:0]const u8, flags: O, mode: c_uint) c_int {
         return _open(path, windowsOflag(flags), @as(c_int, @intCast(mode & 0o777)));
     }
     return std.c.open(path, flags, mode);
+}
+
+/// `open` 的 error-union 包装:收编全仓 `std.posix.openat(AT.FDCWD, …) catch/try` 样板
+/// (std.posix.openat 在 Windows 无 AT.FDCWD、返回 HANDLE 而非 c_int fd)。语义等价:失败
+/// 返 error.OpenFailed(不区分 errno——原调用方几乎都 blanket `catch return error.X`,
+/// 无一按 errno 分支)。返回 pfs c_int fd,与 pfs.read/write/close 直接配套。
+pub fn openZ(path: []const u8, flags: O, mode: c_uint) error{OpenFailed}!Fd {
+    // 接受**非**哨兵 slice(对齐 std.posix.openat 契约:它也收 []const u8 内部补 NUL),
+    // 故所有旧 openat 站点无论传 slice 还是 [:0] 都直接通过。
+    var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= pbuf.len) return error.OpenFailed;
+    @memcpy(pbuf[0..path.len], path);
+    pbuf[path.len] = 0;
+    const fd = open(@ptrCast(&pbuf), flags, mode);
+    if (fd < 0) return error.OpenFailed;
+    return fd;
+}
+
+/// `read` 的 error-union 包装:收编 `std.posix.read(fd, buf) catch …` 样板。返回读到字节
+/// 数(0=EOF);<0 → error.ReadFailed。
+pub fn readZ(fd: Fd, buf: []u8) error{ReadFailed}!usize {
+    const n = read(fd, buf);
+    if (n < 0) return error.ReadFailed;
+    return @intCast(n);
 }
 
 /// 读取，返回读到字节数（0=EOF，<0=错误）。

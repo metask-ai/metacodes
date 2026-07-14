@@ -18,6 +18,7 @@
 //!    snapshotBaseline(≤8s)+getDiagnostics(≤6s);盘写本身不被阻塞(安全第一),但 tool 结果返回
 //!    多等 ≤14s(warm)/≤26s(冷 spawn)。可被 abort 打断。未来若嫌重可换 didChange delta 免全等。
 const std = @import("std");
+const time = @import("../util/time.zig");
 const pfs = @import("platform").fs;
 const sync = @import("platform").sync;
 const client_mod = @import("client.zig");
@@ -390,9 +391,7 @@ fn diagKey(buf: []u8, d: reporter.Diagnostic) []const u8 {
 }
 
 fn nowMs() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * 1000 + @divTrunc(ts.nsec, 1_000_000);
+    return time.nowMs(); // 可移植 monotonic 毫秒(util/time)
 }
 
 // ============================================================================

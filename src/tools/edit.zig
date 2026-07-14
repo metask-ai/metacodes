@@ -50,7 +50,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const new_stripped = try stripLineNumberPrefix(new_unesc, allocator);
     defer allocator.free(new_stripped);
 
-    const fd = std.posix.openat(std.posix.AT.FDCWD, file_path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
+    const fd = pfs.openZ(file_path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
     const original = blk: {
         defer _ = pfs.close(fd);
         const sz = read_state.statFd(fd) catch null;
@@ -124,7 +124,7 @@ fn finalizeWrite(
     old_raw: []const u8,
     new_raw: []const u8,
 ) ![]u8 {
-    const write_fd = std.posix.openat(std.posix.AT.FDCWD, file_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return error.WriteError;
+    const write_fd = pfs.openZ(file_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return error.WriteError;
     defer _ = pfs.close(write_fd);
 
     const written = pfs.write(write_fd, content);

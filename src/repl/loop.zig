@@ -72,7 +72,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     history.loadFromFile(hist_path) catch {};
     defer history.saveToFile(hist_path) catch {};
 
-    const stdin_fd: std.c.fd_t = 0;
+    const stdin_fd: c_int = 0;
     const tty = platform_term.isatty(stdin_fd);
 
     // 终端 tab 标题反映 session 状态(idle/working/需要输入)。仅 tty;退出时清空。
@@ -764,7 +764,7 @@ fn readLineBuffered(allocator: std.mem.Allocator) ![]u8 {
     var len: usize = 0;
     while (len < buf.len) {
         var b: [1]u8 = undefined;
-        const n = posix.read(posix.STDIN_FILENO, &b) catch return error.ReadError;
+        const n = pfs.readZ(0, &b) catch return error.ReadError;
         if (n == 0) {
             if (len == 0) return error.Eof;
             break;
@@ -925,7 +925,7 @@ fn wrapPointAt(s: []const u8, start: usize, max_w: usize) usize {
     return i;
 }
 
-fn readLineRaw(fd: std.c.fd_t, allocator: std.mem.Allocator, history: *history_mod.History, app: *app_mod.App) ![]u8 {
+fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.History, app: *app_mod.App) ![]u8 {
     const orig = input.enterRawMode(fd) orelse {
         // 无法进 raw mode：退化
         return readLineBuffered(allocator);

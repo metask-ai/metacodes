@@ -1,4 +1,5 @@
 const std = @import("std");
+const time = @import("util/time.zig");
 const log = @import("util/log.zig");
 const http = std.http;
 const types = @import("types.zig");
@@ -116,11 +117,7 @@ pub fn interruptibleSleepMs(total_ms: u64, abort: ?*const AbortSignal) bool {
     while (slept < total_ms) {
         if (abort) |a| if (a.isAborted()) return false;
         const chunk = @min(step_ms, total_ms - slept);
-        // chunk ≤ 50ms < 1s → sec=0;nsec=chunk*1e6(用字面量风格,运行时值经 @as 显式标注)。
-        const ns: i64 = @as(i64, @intCast(chunk)) * 1_000_000;
-        var req = std.c.timespec{ .sec = 0, .nsec = ns };
-        var rem: std.c.timespec = undefined;
-        _ = std.c.nanosleep(&req, &rem);
+        time.sleepMs(@intCast(chunk)); // 可移植睡眠(POSIX nanosleep / Windows Sleep)
         slept += chunk;
     }
     if (abort) |a| if (a.isAborted()) return false;
@@ -595,11 +592,10 @@ fn secureFree(allocator: std.mem.Allocator, buf: []u8) void {
     allocator.free(buf);
 }
 
-/// 毫秒时间戳（monotonic），用于测量请求延迟。失败返 0。
+/// 毫秒时间戳（monotonic），用于测量请求延迟。失败返 0。可移植走 util/time。
 fn timestampMs() u64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) != 0) return 0;
-    return @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / 1_000_000;
+    const ms = time.nowMs();
+    return if (ms < 0) 0 else @intCast(ms);
 }
 
 /// HTTP 错误现场:读响应 body(截断 2KB)以 err 级打日志。

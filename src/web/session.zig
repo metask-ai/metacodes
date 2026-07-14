@@ -15,6 +15,7 @@
 //! repl/loop.zig 里与 TTY 耦合,是"会话编排层未分离"的存量债,不在本次 scope。
 
 const std = @import("std");
+const time = @import("../util/time.zig");
 const app_mod = @import("../app.zig");
 const agent_loop = @import("../core/agent_loop.zig");
 const journal_mod = @import("journal.zig");
@@ -169,9 +170,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
                 if (app.abort.reason() == .user_ctrl_c) break :outer;
                 app.abort.resetForTesting(); // 残留 interrupt,不退出
             }
-            var req: std.c.timespec = .{ .sec = 0, .nsec = 50_000_000 };
-            var rem: std.c.timespec = undefined;
-            _ = std.c.nanosleep(&req, &rem);
+            time.sleepMs(50);
             continue;
         };
         defer web_alloc.free(msg);

@@ -19,6 +19,7 @@
 //! truncated=true 表示本次没读完，需要提高 since_byte（或 max_bytes）。
 
 const std = @import("std");
+const time = @import("../util/time.zig");
 const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
@@ -103,16 +104,14 @@ fn readFileRange(path: []const u8, since: usize, max: usize, allocator: std.mem.
     if (fd < 0) return error.OpenFailed;
     defer _ = pfs.close(fd);
 
-    // lseek 到 end 取 total_bytes
-    const SEEK_END: c_int = 2;
-    const SEEK_SET: c_int = 0;
-    const total = std.c.lseek(fd, 0, SEEK_END);
+    // lseek 到 end 取 total_bytes(可移植 pfs.lseek,POSIX lseek / Windows _lseek)
+    const total = pfs.lseek(fd, 0, .end);
     if (total < 0) return error.SeekFailed;
     const total_u: u64 = @intCast(total);
 
     if (since >= total_u) return .{ .total_bytes = total_u };
 
-    _ = std.c.lseek(fd, @intCast(since), SEEK_SET);
+    _ = pfs.lseek(fd, @intCast(since), .set);
 
     const available = total_u - since;
     const to_read: usize = @intCast(@min(@as(u64, max), available));
@@ -159,9 +158,7 @@ test "BashOutput returns stdout after exit" {
     const j = try r.spawnBackground("echo hello; exit 0");
 
     // 等子进程结束
-    var req = std.c.timespec{ .sec = 0, .nsec = 200_000_000 };
-    var rem: std.c.timespec = undefined;
-    _ = std.c.nanosleep(&req, &rem);
+    time.sleepMs(200);
 
     var args_buf: [128]u8 = undefined;
     const args = try std.fmt.bufPrint(&args_buf, "{{\"job_id\":\"{s}\"}}", .{j.id[0..]});
@@ -182,9 +179,7 @@ test "BashOutput since_byte skips prefix" {
     defer r.deinit();
     const j = try r.spawnBackground("printf 'ABCDEFG'; exit 0");
 
-    var req = std.c.timespec{ .sec = 0, .nsec = 200_000_000 };
-    var rem: std.c.timespec = undefined;
-    _ = std.c.nanosleep(&req, &rem);
+    time.sleepMs(200);
 
     var args_buf: [128]u8 = undefined;
     const args = try std.fmt.bufPrint(&args_buf, "{{\"job_id\":\"{s}\",\"stdout_since_byte\":\"3\"}}", .{j.id[0..]});
@@ -203,9 +198,7 @@ test "BashOutput max_bytes truncates" {
     defer r.deinit();
     const j = try r.spawnBackground("printf 'ABCDEFGHIJ'; exit 0");
 
-    var req = std.c.timespec{ .sec = 0, .nsec = 200_000_000 };
-    var rem: std.c.timespec = undefined;
-    _ = std.c.nanosleep(&req, &rem);
+    time.sleepMs(200);
 
     var args_buf: [128]u8 = undefined;
     const args = try std.fmt.bufPrint(&args_buf, "{{\"job_id\":\"{s}\",\"max_bytes\":\"3\"}}", .{j.id[0..]});

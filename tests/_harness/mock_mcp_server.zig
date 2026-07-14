@@ -7,6 +7,7 @@
 //! - tools/call → 如果 name="echo"，返回 content [{type:"text",text:<message>}]
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 
 pub fn main() !void {
     const alloc = std.heap.page_allocator;
@@ -17,7 +18,7 @@ pub fn main() !void {
     outer: while (true) {
         // 按行读 stdin（阻塞）
         while (std.mem.indexOfScalar(u8, buf.items, '\n') == null) {
-            const n = std.c.read(0, &chunk, chunk.len);
+            const n = pfs.read(0, &chunk);
             if (n <= 0) break :outer;
             try buf.appendSlice(alloc, chunk[0..@as(usize, @intCast(n))]);
         }
@@ -76,7 +77,7 @@ fn handleLine(alloc: std.mem.Allocator, line: []const u8) !void {
             ;
             const wbuf = try std.fmt.allocPrint(alloc, "{s}\n", .{req});
             defer alloc.free(wbuf);
-            _ = std.c.write(1, wbuf.ptr, wbuf.len);
+            _ = pfs.write(1, wbuf);
             return;
         }
         const msg = extractNestedStringField(line, "message") orelse "<nothing>";
@@ -93,13 +94,13 @@ fn handleLine(alloc: std.mem.Allocator, line: []const u8) !void {
 fn writeResponse(alloc: std.mem.Allocator, id: u64, result_json: []const u8) !void {
     const resp = try std.fmt.allocPrint(alloc, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{s}}}\n", .{ id, result_json });
     defer alloc.free(resp);
-    _ = std.c.write(1, resp.ptr, resp.len);
+    _ = pfs.write(1, resp);
 }
 
 fn writeError(alloc: std.mem.Allocator, id: u64, code: i32, message: []const u8) !void {
     const resp = try std.fmt.allocPrint(alloc, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"error\":{{\"code\":{d},\"message\":\"{s}\"}}}}\n", .{ id, code, message });
     defer alloc.free(resp);
-    _ = std.c.write(1, resp.ptr, resp.len);
+    _ = pfs.write(1, resp);
 }
 
 fn parseId(data: []const u8) ?u64 {

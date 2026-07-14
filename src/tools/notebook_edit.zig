@@ -231,13 +231,13 @@ const MAX_NOTEBOOK_SIZE: usize = 50 * 1024 * 1024;
 
 /// 走轴A统一入口 readAllFromFdCapped(消除各工具本地裸读绕过守卫)。
 fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
+    const fd = pfs.openZ(path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
     defer _ = pfs.close(fd);
     return try @import("common.zig").readAllFromFdCapped(fd, allocator, MAX_NOTEBOOK_SIZE);
 }
 
 fn writeFile(path: []const u8, content: []const u8) !void {
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return error.WriteError;
+    const fd = pfs.openZ(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return error.WriteError;
     defer _ = pfs.close(fd);
     var pos: usize = 0;
     while (pos < content.len) {

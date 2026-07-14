@@ -12,3 +12,4 @@ pub const rng = @import("rng.zig");
 pub const paths = @import("paths.zig");
 pub const terminal = @import("terminal.zig");
 pub const net = @import("net.zig");
+pub const dir = @import("dir.zig");

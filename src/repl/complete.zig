@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
+const pdir = @import("platform").dir;
 
 pub const SlashCmd = struct { name: []const u8, desc: []const u8 };
 
@@ -178,10 +179,10 @@ fn pathCandidates(allocator: std.mem.Allocator, token: []const u8, tok_start: us
     @memcpy(dbuf[0..dir_for_open.len], dir_for_open);
     dbuf[dir_for_open.len] = 0;
 
-    const dirp = std.c.opendir(@ptrCast(&dbuf)) orelse {
+    var it = pdir.open(@ptrCast(&dbuf)) orelse {
         return .{ .candidates = &.{}, .replace_start = replace_start, .owns_candidates = false };
     };
-    defer _ = std.c.closedir(dirp);
+    defer pdir.close(&it);
 
     var list = std.ArrayList([]const u8).empty;
     errdefer {
@@ -189,12 +190,11 @@ fn pathCandidates(allocator: std.mem.Allocator, token: []const u8, tok_start: us
         list.deinit(allocator);
     }
 
-    while (std.c.readdir(dirp)) |ent| {
-        const name_ptr: [*:0]const u8 = @ptrCast(&ent.name);
-        const name = std.mem.span(name_ptr);
+    while (pdir.next(&it)) |ent| {
+        const name = ent.name;
         if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
         if (!std.mem.startsWith(u8, name, base)) continue;
-        const is_dir = ent.type == std.c.DT.DIR;
+        const is_dir = ent.is_dir;
         const owned = if (is_dir)
             try std.fmt.allocPrint(allocator, "{s}/", .{name})
         else

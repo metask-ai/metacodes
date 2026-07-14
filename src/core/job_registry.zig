@@ -268,7 +268,7 @@ pub const JobRegistry = struct {
     }
 };
 
-fn createFile(path: []const u8) ?std.c.fd_t {
+fn createFile(path: []const u8) ?pfs.Fd {
     var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
     if (path.len >= buf.len) return null;
     @memcpy(buf[0..path.len], path);
@@ -296,9 +296,7 @@ test "spawn and reap echo" {
     try std.testing.expect(j.status == .running);
 
     // 等一会儿让子进程退出
-    var req = std.c.timespec{ .sec = 0, .nsec = 200_000_000 };
-    var rem: std.c.timespec = undefined;
-    _ = std.c.nanosleep(&req, &rem);
+    util_time.sleepMs(200);
 
     r.reapExited();
     const j2 = r.get(j.idSlice()).?;

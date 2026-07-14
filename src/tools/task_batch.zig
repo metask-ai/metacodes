@@ -124,9 +124,7 @@ fn watchdogMain(wd: *Watchdog) void {
             }
         }
         if (all_done) break;
-        var req = std.c.timespec{ .sec = 0, .nsec = 200 * std.time.ns_per_ms };
-        var rem: std.c.timespec = undefined;
-        _ = std.c.nanosleep(&req, &rem);
+        util_time.sleepMs(200);
     }
 }
 
@@ -486,9 +484,7 @@ test "watchdog 线程真触发超时 abort(started_ms 远早于 now → 超 dead
     // 轮询等 watchdog 把 abort_sig 砍掉(≤200ms 一轮;给 2s 上限防挂)。
     var waited: usize = 0;
     while (!jobs[0].abort_sig.isAborted() and waited < 20) : (waited += 1) {
-        var req = std.c.timespec{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
-        var rem: std.c.timespec = undefined;
-        _ = std.c.nanosleep(&req, &rem);
+        util_time.sleepMs(100);
     }
     // 让 watchdog 退出。
     jobs[0].done.store(true, .release);
@@ -507,9 +503,7 @@ test "watchdog 线程中继父 abort(未超 deadline 但父 abort → 砍 job)" 
     parent.abort(.user_ctrl_c); // 触发父 abort
     var waited: usize = 0;
     while (!jobs[0].abort_sig.isAborted() and waited < 20) : (waited += 1) {
-        var req = std.c.timespec{ .sec = 0, .nsec = 100 * std.time.ns_per_ms };
-        var rem: std.c.timespec = undefined;
-        _ = std.c.nanosleep(&req, &rem);
+        util_time.sleepMs(100);
     }
     jobs[0].done.store(true, .release);
     wd.stop.store(true, .release);

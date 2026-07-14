@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const log = @import("log.zig");
+const pdir = @import("platform").dir;
 
 pub const MkdirError = error{
     PathTooLong,
@@ -121,7 +122,7 @@ pub const testing = struct {
         if (path.len >= pbuf.len) return;
         @memcpy(pbuf[0..path.len], path);
         pbuf[path.len] = 0;
-        const dirp = std.c.opendir(@ptrCast(&pbuf)) orelse {
+        var it = pdir.open(@ptrCast(&pbuf)) orelse {
             _ = std.c.unlink(@ptrCast(&pbuf));
             return;
         };
@@ -133,9 +134,8 @@ pub const testing = struct {
         var names: [MAX_CHILDREN][MAX_NAME]u8 = undefined;
         var name_lens: [MAX_CHILDREN]usize = undefined;
         var count: usize = 0;
-        while (std.c.readdir(dirp)) |ent| {
-            const name_ptr: [*:0]const u8 = @ptrCast(&ent.name);
-            const name = std.mem.span(name_ptr);
+        while (pdir.next(&it)) |ent| {
+            const name = ent.name;
             if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
             if (count >= MAX_CHILDREN) break;
             if (name.len >= MAX_NAME) continue;
@@ -143,7 +143,7 @@ pub const testing = struct {
             name_lens[count] = name.len;
             count += 1;
         }
-        _ = std.c.closedir(dirp); // fd 在递归前释放
+        pdir.close(&it); // 句柄在递归前释放
 
         // 递归处理每个 child
         var k: usize = 0;

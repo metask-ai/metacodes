@@ -572,7 +572,7 @@ fn buildResult(allocator: std.mem.Allocator, arena: std.mem.Allocator, plans: []
 
 // ── 文件 IO helpers ──────────────────────────────────────────────────────────
 fn readFileArena(arena: std.mem.Allocator, abs: []const u8) ![]u8 {
-    const fd = std.posix.openat(std.posix.AT.FDCWD, abs, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
+    const fd = pfs.openZ(abs, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
     defer _ = pfs.close(fd);
     if (read_state.statFd(fd) catch null) |s| {
         if (s.size > MAX_PATCH_FILE_SIZE) return error.FileTooLarge;
@@ -582,7 +582,7 @@ fn readFileArena(arena: std.mem.Allocator, abs: []const u8) ![]u8 {
 
 fn writeFileMkParents(content: []const u8, abs: []const u8) !void {
     mkdirParents(abs) catch {}; // best-effort;失败交给 openat 暴露
-    const fd = std.posix.openat(std.posix.AT.FDCWD, abs, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return error.WriteError;
+    const fd = pfs.openZ(abs, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return error.WriteError;
     defer _ = pfs.close(fd);
     // 循环写:write(2) 允许短写(EINTR / ENOSPC 写到一半返回部分字节数,非负)。不循环会静默截断
     // 文件却报成功(对齐 write.zig 的正确写法)。

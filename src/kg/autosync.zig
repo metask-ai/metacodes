@@ -20,8 +20,10 @@
 //! - 只处理 .md;isAutoMemPath realpath 归一化防穿越(复用权限豁免同一判定)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const memdir = @import("../core/memory/memdir.zig");
 const log = @import("../util/log.zig");
+const pdir = @import("platform").dir;
 const ToolContext = @import("../tools/context.zig").ToolContext;
 
 /// Write/Edit 成功落盘后调用:若 path 是 memdir 内记忆 markdown → 稳定 upsert 入图。
@@ -75,12 +77,11 @@ pub fn syncAll(allocator: std.mem.Allocator, kg: *@import("client.zig").KgClient
     if (memdir_abs.len == 0) return stats;
     const dir_z = allocator.dupeZ(u8, memdir_abs) catch return stats;
     defer allocator.free(dir_z);
-    const dir = std.c.opendir(dir_z) orelse return stats; // memdir 不存在即 no-op
-    defer _ = std.c.closedir(dir);
+    var it = pdir.open(dir_z) orelse return stats; // memdir 不存在即 no-op
+    defer pdir.close(&it);
 
-    while (std.c.readdir(dir)) |entry_ptr| {
-        const entry = entry_ptr.*;
-        const name = std.mem.sliceTo(&entry.name, 0);
+    while (pdir.next(&it)) |entry| {
+        const name = entry.name;
         if (name.len == 0 or name[0] == '.') continue;
         if (!std.mem.endsWith(u8, name, ".md")) continue;
         if (std.mem.eql(u8, name, "MEMORY.md")) {
@@ -120,13 +121,13 @@ pub fn syncAll(allocator: std.mem.Allocator, kg: *@import("client.zig").KgClient
 fn readWholeFile(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
     const path_z = allocator.dupeZ(u8, path) catch return null;
     defer allocator.free(path_z);
-    const fd = std.posix.openat(std.posix.AT.FDCWD, path_z, .{ .ACCMODE = .RDONLY }, 0) catch return null;
-    defer _ = std.c.close(fd);
+    const fd = pfs.openZ(path_z, .{ .ACCMODE = .RDONLY }, 0) catch return null;
+    defer pfs.close(fd);
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     var buf: [8192]u8 = undefined;
     while (true) {
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = pfs.read(fd, &buf);
         if (n <= 0) break;
         out.appendSlice(allocator, buf[0..@intCast(n)]) catch {
             out.deinit(allocator);
