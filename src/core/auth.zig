@@ -8,6 +8,7 @@
 const std = @import("std");
 const rng = @import("platform").rng;
 const process = @import("platform").process;
+const pfs = @import("platform").fs;
 const builtin = @import("builtin");
 const fs_util = @import("../util/fs.zig");
 const time = @import("../util/time.zig");
@@ -197,11 +198,11 @@ pub fn saveToPath(allocator: std.mem.Allocator, path: []const u8, creds: StoredC
     defer secureFree(allocator, json);
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    const fd = std.c.open(path_z.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
     if (fd < 0) return error.OpenFailed;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     _ = std.c.chmod(path_z.ptr, 0o600);
-    const n = std.c.write(fd, json.ptr, json.len);
+    const n = pfs.write(fd, json);
     if (n < 0 or @as(usize, @intCast(n)) != json.len) return error.WriteFailed;
 }
 
@@ -695,13 +696,13 @@ fn serializeStoredCredentials(allocator: std.mem.Allocator, creds: StoredCredent
 fn checkFilePrivate(path: []const u8) !void {
     const path_z = try std.heap.c_allocator.dupeZ(u8, path);
     defer std.heap.c_allocator.free(path_z);
-    const fd = std.c.open(path_z.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) {
         const e: std.c.E = @enumFromInt(std.c._errno().*);
         if (e == .NOENT) return error.NotFound;
         return error.OpenFailed;
     }
-    _ = std.c.close(fd);
+    _ = pfs.close(fd);
 }
 
 fn refreshOAuthCredential(allocator: std.mem.Allocator, old: *const OAuthCredential) !OAuthCredential {
@@ -816,14 +817,14 @@ fn parseOAuthErrorCode(body: []const u8) ?[]u8 {
 fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    const fd = std.c.open(path_z.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.NotFound;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = pfs.read(fd, buf[0..buf.len]);
         if (n < 0) return error.ReadFailed;
         if (n == 0) break;
         try out.appendSlice(allocator, buf[0..@intCast(n)]);
