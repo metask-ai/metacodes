@@ -36,17 +36,21 @@ const PWSH7 = "C:\\Program Files\\PowerShell\\7\\pwsh.exe";
 const WINPS = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
 const WINCMD = "C:\\Windows\\System32\\cmd.exe";
 
-// 检测结果缓存:一个进程内 shell 不会变,避免每条 Bash 命令重复 stat 探测(Linus perf)。
-// 值幂等(确定性检测),并发首访重复计算无害;单一 optional 足够,不需锁。
-var cached: ?Shell = null;
+// 检测结果缓存:一个进程内 shell 不变,避免每条 Bash 命令重复探测(Linus perf)。并发工具
+// 线程(executeSlots 批量)会并发调 detectDefault,故用 atomic 标志(release/acquire)守卫:
+// 读到 done=true 时 cached_shell 已完整可见(release 配对)。竞态首访多线程重复写 cached_shell
+// 无害——检测确定性、值恒等,release fence 保最终一致(无锁,lock-free)。
+var cache_done = std.atomic.Value(bool).init(false);
+var cached_shell: Shell = undefined;
 
 /// 默认 shell。POSIX=/bin/sh(sh);Windows 优先 pwsh7 → Windows PowerShell → cmd。
 /// **零 git-bash**——全用系统自带 shell(复刻 codex shell_detect default_user_shell)。
 /// 结果缓存(进程内不变)。
 pub fn detectDefault() Shell {
-    if (cached) |s| return s;
+    if (cache_done.load(.acquire)) return cached_shell;
     const s = detectUncached();
-    cached = s;
+    cached_shell = s;
+    cache_done.store(true, .release);
     return s;
 }
 
