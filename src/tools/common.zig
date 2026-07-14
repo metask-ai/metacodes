@@ -350,6 +350,7 @@ test "extractJsonArg field ordering" {
 }
 
 test "spawnCaptureStdout echo" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const argv = [_]?[*:0]const u8{ "/bin/echo", "hello", null };
     const out = try spawnCaptureStdout(argv[0..argv.len], std.testing.allocator);
     defer std.testing.allocator.free(out);
@@ -357,6 +358,7 @@ test "spawnCaptureStdout echo" {
 }
 
 test "spawnCaptureStdoutAbortable without abort behaves same as base" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const argv = [_]?[*:0]const u8{ "/bin/echo", "world", null };
     const out = try spawnCaptureStdoutAbortable(argv[0..argv.len], std.testing.allocator, null);
     defer std.testing.allocator.free(out);

@@ -454,6 +454,7 @@ test "ReadTool path traversal blocked (file_path)" {
 }
 
 test "ReadTool read /etc/hosts via file_path" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属:读 /etc/hosts 系统文件 / inline shell 执行
     const ctx = testCtx();
     const r = try execute(&ctx, "{\"file_path\":\"/etc/hosts\"}");
     defer std.testing.allocator.free(r);
@@ -461,6 +462,7 @@ test "ReadTool read /etc/hosts via file_path" {
 }
 
 test "ReadTool read /etc/hosts via legacy path" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属:读 /etc/hosts 系统文件 / inline shell 执行
     const ctx = testCtx();
     const r = try execute(&ctx, "{\"path\":\"/etc/hosts\"}");
     defer std.testing.allocator.free(r);
@@ -468,6 +470,7 @@ test "ReadTool read /etc/hosts via legacy path" {
 }
 
 test "ReadTool offset beyond file returns empty" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属:读 /etc/hosts 系统文件 / inline shell 执行
     const ctx = testCtx();
     const r = try execute(&ctx, "{\"file_path\":\"/etc/hosts\",\"offset\":1000}");
     defer std.testing.allocator.free(r);
@@ -527,6 +530,7 @@ test "ReadTool file without trailing newline still gets prefix" {
 }
 
 test "ReadTool limit caps very large file" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属:读 /etc/hosts 系统文件 / inline shell 执行
     const ctx = testCtx();
     // /etc/hosts 一般 1 行；limit=10000 不会报错
     const r = try execute(&ctx, "{\"file_path\":\"/etc/hosts\",\"limit\":10000}");
@@ -535,6 +539,7 @@ test "ReadTool limit caps very large file" {
 }
 
 test "ReadTool default limit reads at least first line" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属:读 /etc/hosts 系统文件 / inline shell 执行
     const ctx = testCtx();
     const r = try execute(&ctx, "{\"file_path\":\"/etc/hosts\"}");
     defer std.testing.allocator.free(r);

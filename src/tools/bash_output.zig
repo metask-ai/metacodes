@@ -152,6 +152,7 @@ test "BashOutput on nonexistent job" {
 }
 
 test "BashOutput returns stdout after exit" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const a = std.testing.allocator;
     var r = try @import("../core/job_registry.zig").JobRegistry.init(a);
     defer r.deinit();
@@ -174,6 +175,7 @@ test "BashOutput returns stdout after exit" {
 }
 
 test "BashOutput since_byte skips prefix" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const a = std.testing.allocator;
     var r = try @import("../core/job_registry.zig").JobRegistry.init(a);
     defer r.deinit();
@@ -193,6 +195,7 @@ test "BashOutput since_byte skips prefix" {
 }
 
 test "BashOutput max_bytes truncates" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const a = std.testing.allocator;
     var r = try @import("../core/job_registry.zig").JobRegistry.init(a);
     defer r.deinit();

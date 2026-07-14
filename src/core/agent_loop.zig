@@ -2448,6 +2448,7 @@ test "auto-compact summary carries in_progress task anchor through compaction" {
 }
 
 test "auto-compact 触发 PreCompact + PostCompact hook(G-rest 接线,端到端)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const a = std.testing.allocator;
     var c = Conversation.init(a);
     defer c.deinit();
@@ -2492,6 +2493,7 @@ test "auto-compact 触发 PreCompact + PostCompact hook(G-rest 接线,端到端)
 }
 
 test "fireStopHook:顶层触发 + 传入 last_message;subagent(depth!=0)不触发(G-rest)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const a = std.testing.allocator;
     var c = Conversation.init(a);
     defer c.deinit();

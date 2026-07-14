@@ -555,6 +555,7 @@ test "parse: no hooks → empty set" {
 }
 
 test "runPreToolUse: exit 2 blocks" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const alloc = testing.allocator;
     // 一个 matcher=Bash 的 hook,命令 exit 2 → block
     const cmds = [_][]const u8{"exit 2"};
@@ -574,6 +575,7 @@ test "runPreToolUse: exit 0 proceeds" {
 }
 
 test "runPreToolUse: stdout decision=block blocks even on exit 0" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const alloc = testing.allocator;
     const cmds = [_][]const u8{"echo '{\"decision\":\"block\"}'; exit 0"};
     const entries = [_]HookEntry{.{ .matcher = "Bash", .commands = &cmds }};
@@ -582,6 +584,7 @@ test "runPreToolUse: stdout decision=block blocks even on exit 0" {
 }
 
 test "runPreToolUse: hook receives tool info on stdin" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const alloc = testing.allocator;
     // hook 读 stdin,若含 "rm -rf" 就 block(exit 2),否则 proceed
     const cmds = [_][]const u8{"grep -q 'rm -rf' && exit 2 || exit 0"};
@@ -620,6 +623,7 @@ test "extractObjectField: 嵌套对象 + 字符串内含括号/转义引号" {
 }
 
 test "runPreToolUseFull: updatedInput 改写工具输入" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const alloc = testing.allocator;
     const cmds = [_][]const u8{"echo '{\"updatedInput\":{\"command\":\"ls -la\"}}'"};
     const entries = [_]HookEntry{.{ .matcher = "Bash", .commands = &cmds }};
@@ -632,6 +636,7 @@ test "runPreToolUseFull: updatedInput 改写工具输入" {
 }
 
 test "runPostToolUse: 收集 additionalContext" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const alloc = testing.allocator;
     const cmds = [_][]const u8{"echo '{\"additionalContext\":\"lint passed\"}'"};
     const entries = [_]HookEntry{.{ .matcher = "*", .commands = &cmds }};
@@ -661,6 +666,7 @@ test "大 stdout 不死锁(截断+killpg,poll 有界)" {
 }
 
 test "runPostToolUse: 无 post hook / 不匹配 → null" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const alloc = testing.allocator;
     const cmds = [_][]const u8{"echo '{\"additionalContext\":\"x\"}'"};
     const entries = [_]HookEntry{.{ .matcher = "Bash", .commands = &cmds }};
@@ -696,6 +702,7 @@ test "parse: 生命周期 hook Stop/PreCompact/PostCompact" {
 }
 
 test "runLifecycleHooks: 收集 additionalContext + hook 真收到 stdin(含事件名/trigger)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const alloc = testing.allocator;
     // hook 读 stdin(单次 grep,双 grep 会因 stdin 被第一个吃光而误判):同行含 PostCompact...test_cause
     // → 回 GOT,否则 MISS。证明 stdin 真传入 + 返回收集。
@@ -709,6 +716,7 @@ test "runLifecycleHooks: 收集 additionalContext + hook 真收到 stdin(含事�
 }
 
 test "runLifecycleHooks: 空 entries → null(无 hook 不 spawn)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     try testing.expect(runLifecycleHooks(&.{}, testing.allocator, "Stop", "{}") == null);
 }
 

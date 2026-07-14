@@ -163,6 +163,7 @@ test "parseContentLength: 大小写不敏感 + 多 header" {
 }
 
 test "Transport: cat 回显 Content-Length 帧往返" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const a = testing.allocator;
     // cat 把我们写的字节原样回吐(含 header)。我们发一条 framed 消息,cat 回吐同样字节,
     // readMessage 解析出 body。
@@ -177,6 +178,7 @@ test "Transport: cat 回显 Content-Length 帧往返" {
 }
 
 test "Transport: 超大 Content-Length → MessageTooLarge(DoS 防护)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const a = testing.allocator;
     // 子进程只吐一个超大 Content-Length header,不给 body → 应立即 MessageTooLarge,不无限缓冲。
     const argv = [_]?[*:0]const u8{ "/bin/sh", "-c", "printf 'Content-Length: 99999999999\\r\\n\\r\\n'", null };
@@ -186,6 +188,7 @@ test "Transport: 超大 Content-Length → MessageTooLarge(DoS 防护)" {
 }
 
 test "Transport: 超长无终止 header → HeaderTooLarge(不无限缓冲)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const a = testing.allocator;
     // 吐 >8KB 无 \r\n\r\n 的垃圾 → HeaderTooLarge。
     const argv = [_]?[*:0]const u8{ "/bin/sh", "-c", "yes X | head -c 20000", null };
@@ -195,6 +198,7 @@ test "Transport: 超长无终止 header → HeaderTooLarge(不无限缓冲)" {
 }
 
 test "Transport: 多条 framed 消息保序 + 粘包切分" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const a = testing.allocator;
     const argv = [_]?[*:0]const u8{ "/bin/cat", null };
     var t = try Transport.spawn(a, argv[0..]);

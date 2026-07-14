@@ -575,6 +575,7 @@ test "present \\$ARGUMENTS placeholder: does NOT append" {
 }
 
 test "inject: line-start !`cmd` runs and replaces" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属:读 /etc/hosts 系统文件 / inline shell 执行
     const out = try renderBody(
         testing.allocator,
         "Output: !`echo hello`",
@@ -607,6 +608,7 @@ test "inject: disabled by policy emits placeholder text" {
 }
 
 test "inject: fenced ```! multi-line block" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属:读 /etc/hosts 系统文件 / inline shell 执行
     const body = "Before\n```!\necho first\necho second\n```\nAfter";
     const out = try renderBody(testing.allocator, body, .{});
     defer testing.allocator.free(out);

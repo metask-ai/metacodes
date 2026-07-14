@@ -141,6 +141,7 @@ test "findServerForFile: 按扩展名选 server" {
 }
 
 test "which: 找得到 /bin/sh,找不到瞎名" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     // sh 一定在 PATH。
     const sh = which("sh", &buf);

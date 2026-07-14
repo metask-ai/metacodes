@@ -184,6 +184,7 @@ fn realpathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
 const testing = std.testing;
 
 test "generate: basic profile structure" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const cfg = SandboxConfig{ .cwd = "/tmp", .home = "/Users/foo" };
     const p = try generate(testing.allocator, cfg);
     defer testing.allocator.free(p);
@@ -197,6 +198,7 @@ test "generate: basic profile structure" {
 }
 
 test "generate: allowWrite + denyWrite + denyRead" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const cfg = SandboxConfig{
         .cwd = "/private/tmp",
         .home = "/Users/foo",

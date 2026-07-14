@@ -109,6 +109,7 @@ pub const StdioTransport = struct {
 const testing = std.testing;
 
 test "StdioTransport: cat echoes lines" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const allocator = testing.allocator;
     const argv = [_]?[*:0]const u8{ "/bin/cat", null };
     var t = try StdioTransport.spawn(allocator, argv[0..]);
@@ -121,6 +122,7 @@ test "StdioTransport: cat echoes lines" {
 }
 
 test "StdioTransport: multiple lines preserve order" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const allocator = testing.allocator;
     const argv = [_]?[*:0]const u8{ "/bin/cat", null };
     var t = try StdioTransport.spawn(allocator, argv[0..]);
@@ -141,6 +143,7 @@ test "StdioTransport: multiple lines preserve order" {
 }
 
 test "StdioTransport: EOF after close returns error" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const allocator = testing.allocator;
     const argv = [_]?[*:0]const u8{ "/bin/true", null };
     var t = try StdioTransport.spawn(allocator, argv[0..]);

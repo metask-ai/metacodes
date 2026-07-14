@@ -188,6 +188,7 @@ fn isValidJson(alloc: std.mem.Allocator, s: []const u8) bool {
 const testing = std.testing;
 
 test "McpClient: connect to nonexistent command fails clean" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
     const argv = [_]?[*:0]const u8{ "/nonexistent/mcp-server", null };
     if (McpClient.connect(testing.allocator, argv[0..])) |_| {
         // 不应成功

@@ -294,7 +294,8 @@ test "goal state set/edit/status/budget/account" {
 
 test "goal state persist/load roundtrip" {
     const a = std.testing.allocator;
-    const dir = "/tmp/cc-zig-goal-test";
+    var _db: [512]u8 = undefined;
+    const dir = @import("../tools/test_tmp.zig").path(&_db, "goal-roundtrip");
     ensureTestDir(dir) catch {};
     var st = State.init(a);
     defer st.deinit();

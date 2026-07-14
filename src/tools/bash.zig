@@ -298,6 +298,7 @@ test "BashTool echo" {
 }
 
 test "BashTool stderr captured separately" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // bash 语法命令经 PowerShell 输出/stderr 语义不同,POSIX 专属
     const ctx = testCtx();
     const result = try execute(&ctx, "{\"command\":\"echo out; echo err 1>&2; exit 7\"}");
     defer std.testing.allocator.free(result);
@@ -378,6 +379,7 @@ test "truncateHead: 小输出原样,大输出截断 + 标记" {
 }
 
 test "BashTool 大输出被截断(防撑爆上下文)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // bash 语法命令经 PowerShell 输出/stderr 语义不同,POSIX 专属
     const a = std.testing.allocator;
     const ctx = ToolContext{ .allocator = a };
     // seq 到很大 → stdout 远超 30K → 应截断 + 含 truncated 标记。
