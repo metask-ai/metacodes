@@ -248,7 +248,11 @@ test "GrepTool invalid output_mode" {
 test "GrepTool files_with_matches default" {
     // pattern 只需不崩即可，rg 可能返空
     const ctx = testCtx();
-    const r = try execute(&ctx, "{\"pattern\":\"zzzzzz-nonexistent-zzzzzz\",\"path\":\"/tmp\"}");
+    var dbuf: [512]u8 = undefined;
+    const dpath = tt.path(&dbuf, "."); // per-pid 临时目录本身
+    const djson = try std.fmt.allocPrint(std.testing.allocator, "{{\"pattern\":\"zzzzzz-nonexistent-zzzzzz\",\"path\":\"{s}\"}}", .{dpath});
+    defer std.testing.allocator.free(djson);
+    const r = try execute(&ctx, djson);
     defer std.testing.allocator.free(r);
 }
 
@@ -422,31 +426,37 @@ test "paginate: offset beyond total returns just notice" {
 
 test "GrepTool global head_limit across content" {
     const ctx = testCtx();
-    const path = "/tmp/cc-zig-grep-headlimit.txt";
-    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    var pbuf: [512]u8 = undefined;
+    const path = tt.path(&pbuf, "grep-headlimit.txt");
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     const text = "m\nm\nm\nm\nm\n";
     _ = pfs.write(fd, text);
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path);
+    defer _ = std.c.unlink(path.ptr);
 
-    const r = try execute(&ctx, "{\"pattern\":\"m\",\"path\":\"/tmp/cc-zig-grep-headlimit.txt\",\"output_mode\":\"content\",\"head_limit\":2}");
+    const json = try std.fmt.allocPrint(std.testing.allocator, "{{\"pattern\":\"m\",\"path\":\"{s}\",\"output_mode\":\"content\",\"head_limit\":2}}", .{path});
+    defer std.testing.allocator.free(json);
+    const r = try execute(&ctx, json);
     defer std.testing.allocator.free(r);
     try std.testing.expect(std.mem.indexOf(u8, r, "appliedLimit") != null);
 }
 
 test "GrepTool 默认 head_limit=250:不传时宽匹配被截断(防撑爆)" {
     const ctx = testCtx();
-    const path = "/tmp/cc-zig-grep-default-cap.txt";
-    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    var pbuf: [512]u8 = undefined;
+    const path = tt.path(&pbuf, "grep-default-cap.txt");
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     // 写 300 行全匹配 → 不传 head_limit → 应只返 250 行 + appliedLimit 提示。
     var i: usize = 0;
     while (i < 300) : (i += 1) _ = pfs.write(fd, "match\n");
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path);
+    defer _ = std.c.unlink(path.ptr);
 
-    const r = try execute(&ctx, "{\"pattern\":\"match\",\"path\":\"/tmp/cc-zig-grep-default-cap.txt\",\"output_mode\":\"content\"}");
+    const json = try std.fmt.allocPrint(std.testing.allocator, "{{\"pattern\":\"match\",\"path\":\"{s}\",\"output_mode\":\"content\"}}", .{path});
+    defer std.testing.allocator.free(json);
+    const r = try execute(&ctx, json);
     defer std.testing.allocator.free(r);
     try std.testing.expect(std.mem.indexOf(u8, r, "appliedLimit") != null); // 被截断
     // 数 match 行数应 ≤ 250(+提示行)。
@@ -460,15 +470,18 @@ test "GrepTool 默认 head_limit=250:不传时宽匹配被截断(防撑爆)" {
 
 test "GrepTool head_limit=0 显式无限:返回全部不截断" {
     const ctx = testCtx();
-    const path = "/tmp/cc-zig-grep-unlimited.txt";
-    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    var pbuf: [512]u8 = undefined;
+    const path = tt.path(&pbuf, "grep-unlimited.txt");
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     var i: usize = 0;
     while (i < 300) : (i += 1) _ = pfs.write(fd, "match\n");
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path);
+    defer _ = std.c.unlink(path.ptr);
 
-    const r = try execute(&ctx, "{\"pattern\":\"match\",\"path\":\"/tmp/cc-zig-grep-unlimited.txt\",\"output_mode\":\"content\",\"head_limit\":0}");
+    const json = try std.fmt.allocPrint(std.testing.allocator, "{{\"pattern\":\"match\",\"path\":\"{s}\",\"output_mode\":\"content\",\"head_limit\":0}}", .{path});
+    defer std.testing.allocator.free(json);
+    const r = try execute(&ctx, json);
     defer std.testing.allocator.free(r);
     var count: usize = 0;
     var it = std.mem.splitScalar(u8, r, '\n');

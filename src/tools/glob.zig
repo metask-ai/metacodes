@@ -1,4 +1,5 @@
 const std = @import("std");
+const tt = @import("test_tmp.zig");
 const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const toolchain = @import("../util/toolchain.zig");
@@ -93,7 +94,11 @@ test "GlobTool path traversal blocked" {
 
 test "GlobTool returns valid json" {
     const ctx = testCtx();
-    const result = try execute(&ctx, "{\"pattern\":\"*\",\"path\":\"/tmp\"}");
+    var dbuf: [512]u8 = undefined;
+    const dir = tt.path(&dbuf, "."); // per-pid 临时目录(可移植,替 /tmp)
+    const json = try std.fmt.allocPrint(std.testing.allocator, "{{\"pattern\":\"*\",\"path\":\"{s}\"}}", .{dir});
+    defer std.testing.allocator.free(json);
+    const result = try execute(&ctx, json);
     defer std.testing.allocator.free(result);
     try std.testing.expect(result[0] == '{');
     try std.testing.expect(result[result.len - 1] == '}');
@@ -103,20 +108,27 @@ test "GlobTool returns valid json" {
 
 test "GlobTool brace pattern (*.{ts,tsx})" {
     const ctx = testCtx();
-    // 先造 2 个 .ts / .tsx，1 个 .txt
-    const ts_path: [*:0]const u8 = "/tmp/cc-zig-glob-brace-a.ts";
-    const tsx_path: [*:0]const u8 = "/tmp/cc-zig-glob-brace-a.tsx";
-    const txt_path: [*:0]const u8 = "/tmp/cc-zig-glob-brace-a.txt";
-    for ([_][*:0]const u8{ ts_path, tsx_path, txt_path }) |p| {
-        const fd = pfs.open(p, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    // 先造 2 个 .ts / .tsx，1 个 .txt(可移植临时目录)
+    var b1: [512]u8 = undefined;
+    var b2: [512]u8 = undefined;
+    var b3: [512]u8 = undefined;
+    var bd: [512]u8 = undefined;
+    const ts_path = tt.path(&b1, "cc-zig-glob-brace-a.ts");
+    const tsx_path = tt.path(&b2, "cc-zig-glob-brace-a.tsx");
+    const txt_path = tt.path(&b3, "cc-zig-glob-brace-a.txt");
+    const dir = tt.path(&bd, ".");
+    for ([_][:0]const u8{ ts_path, tsx_path, txt_path }) |p| {
+        const fd = pfs.open(p.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         _ = pfs.write(fd, "x\n");
         _ = pfs.close(fd);
     }
-    defer _ = std.c.unlink(ts_path);
-    defer _ = std.c.unlink(tsx_path);
-    defer _ = std.c.unlink(txt_path);
+    defer _ = std.c.unlink(ts_path.ptr);
+    defer _ = std.c.unlink(tsx_path.ptr);
+    defer _ = std.c.unlink(txt_path.ptr);
 
-    const result = try execute(&ctx, "{\"pattern\":\"cc-zig-glob-brace-*.{ts,tsx}\",\"path\":\"/tmp\"}");
+    const json = try std.fmt.allocPrint(std.testing.allocator, "{{\"pattern\":\"cc-zig-glob-brace-*.{{ts,tsx}}\",\"path\":\"{s}\"}}", .{dir});
+    defer std.testing.allocator.free(json);
+    const result = try execute(&ctx, json);
     defer std.testing.allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "cc-zig-glob-brace-a.ts") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "cc-zig-glob-brace-a.tsx") != null);
