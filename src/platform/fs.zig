@@ -155,6 +155,21 @@ pub fn realpath(file_name: [*:0]const u8, resolved_name: [*]u8) ?[*:0]u8 {
     return std.c.realpath(file_name, resolved_name);
 }
 
+/// 路径是否存在(文件**或目录**)。POSIX access(F_OK) / Windows GetFileAttributesW。
+/// **勿用 open() 判存在**:Windows `_open` 打不开目录(返 -1),会把存在的目录误判成不存在。
+pub fn exists(path: [*:0]const u8) bool {
+    if (is_windows) {
+        var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        const u8p = std.mem.span(path);
+        const wlen = std.unicode.utf8ToUtf16Le(&wbuf, u8p) catch return false;
+        if (wlen >= wbuf.len) return false;
+        wbuf[wlen] = 0;
+        return GetFileAttributesW(@ptrCast(&wbuf)) != 0xFFFF_FFFF; // INVALID_FILE_ATTRIBUTES
+    }
+    return std.c.access(path, std.c.F_OK) == 0;
+}
+extern "kernel32" fn GetFileAttributesW(lpFileName: [*:0]const u16) callconv(.winapi) u32;
+
 /// 关闭【文件】fd。禁用于 socket/pipe（见文件头边界说明）。
 pub fn close(fd: c_int) void {
     if (is_windows) {

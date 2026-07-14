@@ -236,31 +236,34 @@ pub fn findRepoRoot(allocator: std.mem.Allocator, start_dir: []const u8) ![]u8 {
     if (start_dir.len >= buf.len) return error.PathTooLong;
     @memcpy(buf[0..start_dir.len], start_dir);
     var dir_len = start_dir.len;
-    // 去掉尾部 /
-    while (dir_len > 1 and buf[dir_len - 1] == '/') dir_len -= 1;
+    // 去掉尾部分隔符(POSIX '/' + Windows '\')
+    while (dir_len > 1 and isSep(buf[dir_len - 1])) dir_len -= 1;
 
     while (dir_len > 0) {
-        // 构造 <dir>/.git\0
+        // 构造 <dir>/.git\0(Windows 也接受 '/' 分隔符)
         const git_suffix = "/.git";
         if (dir_len + git_suffix.len + 1 >= buf.len) return error.PathTooLong;
         @memcpy(buf[dir_len .. dir_len + git_suffix.len], git_suffix);
         buf[dir_len + git_suffix.len] = 0;
         const path_z: [*:0]const u8 = @ptrCast(&buf);
-        // 用 open 试探(目录或文件都接受 — git worktree 的 .git 是文件)
-        const fd = pfs.open(path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-        if (fd >= 0) {
-            _ = pfs.close(fd);
+        // **pfs.exists 而非 open**:.git 是目录,Windows _open 打不开目录会误判不存在
+        // (worktree 的 .git 是文件,exists 对文件/目录都真)。
+        if (pfs.exists(path_z)) {
             return try allocator.dupe(u8, buf[0..dir_len]);
         }
-        // 向上一级
-        if (dir_len == 1) break; // 已经是 "/"
+        // 向上一级(两种分隔符都算)
+        if (dir_len == 1) break;
         var new_len = dir_len;
-        while (new_len > 1 and buf[new_len - 1] != '/') new_len -= 1;
-        while (new_len > 1 and buf[new_len - 1] == '/') new_len -= 1;
+        while (new_len > 1 and !isSep(buf[new_len - 1])) new_len -= 1;
+        while (new_len > 1 and isSep(buf[new_len - 1])) new_len -= 1;
         if (new_len == dir_len) break;
         dir_len = new_len;
     }
     return error.NotInGitRepo;
+}
+
+inline fn isSep(c: u8) bool {
+    return c == '/' or c == '\\';
 }
 
 fn readAllFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {

@@ -164,9 +164,18 @@ fn normalizeWindowsPrefix(allocator: std.mem.Allocator, path: []const u8, out_bu
 /// traversal 校验:只匹配作为**完整路径段**的 ".."(段首/段尾/被 sep 包裹)。
 /// 对齐真 cc 的 /(?:^|[\\/])\.\.(?:[\\/]|$)/。不误杀 `my..file.txt`、`a..b`、`foo..`(单段)。
 pub fn containsTraversal(path: []const u8) bool {
-    var it = std.mem.splitScalar(u8, path, sep);
-    while (it.next()) |s| {
-        if (std.mem.eql(u8, s, "..")) return true;
+    // 安全:`..` 段用 **/ 和(Windows 上)\\** 两种分隔符边界判定。原来只按平台 sep 切,
+    // Windows 上 sep='\\' 会漏掉 `/`-分隔路径的 `..`(如 "../x" 整段不等 ".." → 漏判穿越)。
+    // POSIX 上 '\\' 是合法文件名字符,不当分隔符。
+    const win = @import("builtin").os.tag == .windows;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i <= path.len) : (i += 1) {
+        const at_sep = i == path.len or path[i] == '/' or (win and path[i] == '\\');
+        if (at_sep) {
+            if (std.mem.eql(u8, path[start..i], "..")) return true;
+            start = i + 1;
+        }
     }
     return false;
 }

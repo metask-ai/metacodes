@@ -193,7 +193,12 @@ test "getCwd returns non-empty absolute path" {
     const cwd = try getCwd(std.testing.allocator);
     defer std.testing.allocator.free(cwd);
     try std.testing.expect(cwd.len > 0);
-    try std.testing.expect(cwd[0] == '/');
+    // 绝对路径:POSIX 以 '/' 开头;Windows 以盘符 'X:' 开头。
+    if (@import("builtin").os.tag == .windows) {
+        try std.testing.expect(cwd.len >= 2 and cwd[1] == ':');
+    } else {
+        try std.testing.expect(cwd[0] == '/');
+    }
     // 不应包含 NUL 字节
     try std.testing.expect(std.mem.indexOfScalar(u8, cwd, 0) == null);
 }
