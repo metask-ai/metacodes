@@ -8,6 +8,7 @@
 //! 各用各的目录,物理隔离。本 helper 提供 path() 拼路径(首调时 mkdir 该目录)。
 
 const std = @import("std");
+const pprocess = @import("platform").process;
 const pfs = @import("platform").fs;
 
 var dir_made: bool = false;
@@ -15,7 +16,7 @@ var dir_made: bool = false;
 /// 返回 `/tmp/cc-zig-test-<pid>/<name>`(NUL 结尾,写进 buf)。首调时建 per-pid 目录。
 /// buf 须够大(建议 256)。返回不含 NUL 的 slice;`ptr` 可直接喂 std.c.open。
 pub fn path(buf: []u8, name: []const u8) [:0]const u8 {
-    const pid = std.c.getpid();
+    const pid = pprocess.currentPid();
     var dirbuf: [128]u8 = undefined;
     const dir = std.fmt.bufPrintZ(&dirbuf, "/tmp/cc-zig-test-{d}", .{pid}) catch unreachable;
     if (!dir_made) {

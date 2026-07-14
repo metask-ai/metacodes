@@ -23,6 +23,7 @@
 //! → 在 bash_parser.zig(下一步)
 
 const std = @import("std");
+const pprocess = @import("platform").process;
 const pfs = @import("platform").fs;
 
 pub const Spec = union(enum) {
@@ -769,7 +770,7 @@ test "matches: Bash with wrapper stripped before match" {
 
 test "matchesMode: symlink deny triggers if target matches (任一)" {
     // 建一个真 symlink: /tmp/cczig_link_<pid> → /tmp/cczig_secret_<pid>
-    const pid = std.c.getpid();
+    const pid = pprocess.currentPid();
     var secret_buf: [128]u8 = undefined;
     const secret = try std.fmt.bufPrint(&secret_buf, "/tmp/cczig_secret_{d}.env\x00", .{pid});
     const secret_path = secret[0 .. secret.len - 1];

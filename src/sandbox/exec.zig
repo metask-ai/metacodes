@@ -11,6 +11,7 @@
 //! 只在 macOS 生效(builtin.os.tag == .macos)。其它平台返回 null(暂不实现 bubblewrap)。
 
 const std = @import("std");
+const pprocess = @import("platform").process;
 const pfs = @import("platform").fs;
 const builtin = @import("builtin");
 const profile_mod = @import("profile.zig");
@@ -205,7 +206,7 @@ fn shellSingleQuote(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
 var profile_counter: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 
 fn writeTempProfile(alloc: std.mem.Allocator, content: []const u8) ![]u8 {
-    const pid: i64 = std.c.getpid();
+    const pid: i64 = pprocess.currentPid();
     const n = profile_counter.fetchAdd(1, .monotonic);
     const tmpdir_raw = if (std.c.getenv("TMPDIR")) |t| std.mem.span(t) else "/tmp";
     // 去掉末尾 / ,统一用 fmt 的显式 / 拼
@@ -310,7 +311,7 @@ test "e2e: sandbox blocks write outside cwd, allows inside" {
     const alloc = testing.allocator;
 
     // 临时工作目录 /private/tmp/cczig_sbe2e_<pid>
-    const pid: i64 = std.c.getpid();
+    const pid: i64 = pprocess.currentPid();
     var dir_buf: [128]u8 = undefined;
     const dir = try std.fmt.bufPrint(&dir_buf, "/private/tmp/cczig_sbe2e_{d}", .{pid});
     var dir_z: [129]u8 = undefined;

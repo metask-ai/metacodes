@@ -18,6 +18,7 @@
 //!    snapshotBaseline(≤8s)+getDiagnostics(≤6s);盘写本身不被阻塞(安全第一),但 tool 结果返回
 //!    多等 ≤14s(warm)/≤26s(冷 spawn)。可被 abort 打断。未来若嫌重可换 didChange delta 免全等。
 const std = @import("std");
+const pprocess = @import("platform").process;
 const time = @import("../util/time.zig");
 const pfs = @import("platform").fs;
 const sync = @import("platform").sync;
@@ -440,7 +441,7 @@ test "Service e2e: 真 zls 报类型错误的 delta 诊断(需装 zls)" {
     if (servers.which("zls", &zbuf) == null) return; // 未装 zls → skip
 
     // 建 /tmp/cc_lsp_zls_<pid>/{.git, main.zig}。fake .git 让 workspace gate 过。
-    const base = std.fmt.allocPrint(a, "/tmp/cc_lsp_zls_{d}", .{std.c.getpid()}) catch return;
+    const base = std.fmt.allocPrint(a, "/tmp/cc_lsp_zls_{d}", .{pprocess.currentPid()}) catch return;
     defer a.free(base);
     mkdirZ(base);
     const gitdir = std.fmt.allocPrint(a, "{s}/.git", .{base}) catch return;
@@ -477,7 +478,7 @@ test "Service e2e: 真 zls documentSymbol 抽 struct/function 符号(需装 zls)
     var zbuf: [std.fs.max_path_bytes]u8 = undefined;
     if (servers.which("zls", &zbuf) == null) return; // 未装 → skip
 
-    const base = std.fmt.allocPrint(a, "/tmp/cc_lsp_sym_{d}", .{std.c.getpid()}) catch return;
+    const base = std.fmt.allocPrint(a, "/tmp/cc_lsp_sym_{d}", .{pprocess.currentPid()}) catch return;
     defer a.free(base);
     mkdirZ(base);
     const gitdir = std.fmt.allocPrint(a, "{s}/.git", .{base}) catch return;

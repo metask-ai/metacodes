@@ -5,6 +5,7 @@
 //! 失败降级:写盘失败 → 返回截断的 inline preview(不崩)。
 
 const std = @import("std");
+const pprocess = @import("platform").process;
 const pfs = @import("platform").fs;
 const pdir = @import("platform").dir;
 
@@ -98,9 +99,7 @@ const CACHE_MAX_BYTES: u64 = 500 * 1024 * 1024; // 500MB
 const GC_THROTTLE_SEC: i64 = 6 * 3600; // 6 小时
 
 fn nowSec() i64 {
-    var tv: std.c.timeval = undefined;
-    _ = std.c.gettimeofday(&tv, null);
-    return @intCast(tv.sec);
+    return @import("../util/time.zig").nowUnix(); // 可移植墙钟秒(POSIX/Windows,替 gettimeofday)
 }
 
 /// stat 一个路径(裁剪 std 无 std.c.stat 路径版 → open+fstat+close,复用 read_state.statFd 跨平台)。
@@ -188,7 +187,7 @@ fn cleanupCacheImpl(allocator: std.mem.Allocator, home_dir: []const u8, ttl_sec:
 test "cleanupCache:TTL 删旧留新 + 节流 + 无目录不崩(P0.5)" {
     const a = std.testing.allocator;
     // 隔离 fake home:/tmp/cc-cache-<pid>。
-    const home = std.fmt.allocPrint(a, "/tmp/cc-cache-{d}", .{std.c.getpid()}) catch return;
+    const home = std.fmt.allocPrint(a, "/tmp/cc-cache-{d}", .{pprocess.currentPid()}) catch return;
     defer a.free(home);
     const dir = std.fmt.allocPrint(a, "{s}/.metacodes/tool-results", .{home}) catch return;
     defer a.free(dir);
@@ -239,7 +238,7 @@ test "cleanupCache:TTL 删旧留新 + 节流 + 无目录不崩(P0.5)" {
 
 test "cleanupCacheImpl:size-cap LRU 淘汰最旧到达标(P0.5 覆盖 LRU 分支)" {
     const a = std.testing.allocator;
-    const home = std.fmt.allocPrint(a, "/tmp/cc-cache-lru-{d}", .{std.c.getpid()}) catch return;
+    const home = std.fmt.allocPrint(a, "/tmp/cc-cache-lru-{d}", .{pprocess.currentPid()}) catch return;
     defer a.free(home);
     const dir = std.fmt.allocPrint(a, "{s}/.metacodes/tool-results", .{home}) catch return;
     defer a.free(dir);

@@ -4,6 +4,7 @@
 //! 里瞎跑 language server)。找 workspace root = 从 start 向上 walk ≤64 层找 `.git`(文件**或**目录
 //! ——worktree 的 .git 是文件)。路径规范化**不解析 symlink**(保守,避免跨 symlink 误判归属)。
 const std = @import("std");
+const pprocess = @import("platform").process;
 const pfs = @import("platform").fs;
 
 const MAX_WALK = 64;
@@ -142,7 +143,7 @@ fn touch(path: []const u8) void {
 test "findGitWorktree + nearestRoot: 真临时目录树(std.c FS)" {
     const a = testing.allocator;
     // 建 /tmp/cc_ws_test_<pid>/repo/{.git, pkg/sub, pkg/package.json}
-    const base = try std.fmt.allocPrint(a, "/tmp/cc_ws_test_{d}", .{std.c.getpid()});
+    const base = try std.fmt.allocPrint(a, "/tmp/cc_ws_test_{d}", .{pprocess.currentPid()});
     defer a.free(base);
     const repo = try std.fmt.allocPrint(a, "{s}/repo", .{base});
     defer a.free(repo);

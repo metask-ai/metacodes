@@ -7,6 +7,7 @@
 //! 纯数据 JSON,放 session_dir/suspend.json(与 transcript.jsonl 同目录)。
 
 const std = @import("std");
+const pprocess = @import("platform").process;
 const pfs = @import("platform").fs;
 const log = @import("../util/log.zig");
 
@@ -111,7 +112,7 @@ test "suspend state 落盘往返 + clear" {
     const a = std.testing.allocator;
     // per-pid 临时目录(避免并发 test artifact 撞固定路径,见 tools/test_tmp.zig 教训)。
     var dirbuf: [128]u8 = undefined;
-    const dir = std.fmt.bufPrintZ(&dirbuf, "/tmp/cc-zig-suspend-test-{d}", .{std.c.getpid()}) catch unreachable;
+    const dir = std.fmt.bufPrintZ(&dirbuf, "/tmp/cc-zig-suspend-test-{d}", .{pprocess.currentPid()}) catch unreachable;
     _ = std.c.mkdir(dir.ptr, 0o700);
 
     try write(dir, .{ .tool_use_id = "tu_42", .kind = "video_timeline", .payload_json = "{\"clips\":3}" }, a);
