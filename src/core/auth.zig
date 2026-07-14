@@ -87,8 +87,8 @@ pub const StoredCredentials = struct {
 
 pub fn authFilePath(allocator: std.mem.Allocator) ![]u8 {
     if (std.c.getenv(AUTH_FILE_ENV)) |p| return allocator.dupe(u8, std.mem.span(p));
-    const home_c = std.c.getenv("HOME") orelse return error.NoHome;
-    return std.fmt.allocPrint(allocator, "{s}/.metacodes/auth.json", .{std.mem.span(home_c)});
+    const home = @import("platform").paths.homeDir() orelse return error.NoHome; // HOME / Windows USERPROFILE
+    return std.fmt.allocPrint(allocator, "{s}/.metacodes/auth.json", .{home});
 }
 
 pub fn resolveCredential(

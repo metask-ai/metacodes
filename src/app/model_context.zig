@@ -34,12 +34,10 @@ pub const ModelContext = struct {
     /// 加载 ~/.metacodes/models.toml;缺则写 bundled 默认 + 解析 embedded。
     /// best-effort:任何 IO 失败都退回解析 embedded(保证表非空)。用 std.c syscall(裁剪 std 无 std.fs.cwd)。
     pub fn loadOrBundle(self: *ModelContext) void {
-        const home_c = std.c.getenv("HOME");
-        if (home_c == null) {
+        const home = @import("platform").paths.homeDir() orelse { // HOME / Windows USERPROFILE
             self.parse(BUNDLED);
             return;
-        }
-        const home = std.mem.span(home_c.?);
+        };
         const dir = std.fmt.allocPrint(self.allocator, "{s}/.metacodes", .{home}) catch {
             self.parse(BUNDLED);
             return;

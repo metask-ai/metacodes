@@ -174,8 +174,7 @@ fn parseBoolField(data: []const u8, field: []const u8) ?bool {
 }
 
 fn homePath(allocator: std.mem.Allocator) ![]u8 {
-    const home_c = std.c.getenv("HOME") orelse return error.NoHome;
-    const home = std.mem.span(home_c);
+    const home = @import("platform").paths.homeDir() orelse return error.NoHome; // HOME / Windows USERPROFILE
     return std.fmt.allocPrint(allocator, "{s}/.metacodes/config.json", .{home});
 }
 

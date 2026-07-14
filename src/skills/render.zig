@@ -245,8 +245,7 @@ fn readFileRef(allocator: std.mem.Allocator, raw: []const u8, opts: RenderOption
             break :blk try allocator.dupe(u8, raw);
         } else if (raw[0] == '~') {
             // ~ 或 ~/...
-            const home_c = std.c.getenv("HOME") orelse return null;
-            const home = std.mem.span(home_c);
+            const home = @import("platform").paths.homeDir() orelse return null; // HOME / Windows USERPROFILE
             const rest = if (raw.len > 1 and raw[1] == '/') raw[2..] else raw[1..];
             break :blk try std.fs.path.join(allocator, &.{ home, rest });
         } else {

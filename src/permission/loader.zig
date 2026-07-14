@@ -62,10 +62,8 @@ pub fn load(alloc: std.mem.Allocator, paths: Paths) !settings.MergedSettings {
         if (shared) |p| try maybePushFile(alloc, &layers, .shared_project, p);
     }
 
-    const home_path = paths.home orelse blk: {
-        const h = std.c.getenv("HOME") orelse break :blk null;
-        break :blk std.mem.span(h);
-    };
+    // HOME / Windows USERPROFILE(paths.home 优先,回退可移植 homeDir)。
+    const home_path = paths.home orelse @import("platform").paths.homeDir();
     if (home_path) |h| {
         var buf3: [std.fs.max_path_bytes]u8 = undefined;
         const user = std.fmt.bufPrint(&buf3, "{s}/.claude/settings.json", .{h}) catch null;
