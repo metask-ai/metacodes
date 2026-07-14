@@ -145,7 +145,29 @@ pub const StatInfo = struct { mtime_ns: i128, size: u64 };
 /// 从 fd stat 出 mtime_ns 和 size。
 /// Linux：std.c.fstat 为 void，必须走 statx。
 /// macOS/BSD：std.c.Stat 可用，直接 fstat。
+// Windows：MSVCRT _fstat64 → struct _stat64（st_mtime 为 unix 秒，st_size i64）。std.c.fstat 在
+// Windows 不可用，故自 extern。mtime 秒精度（无 nsec）——比 POSIX 粗，但配合 size 检查足够判 staleness。
+const Stat64 = extern struct {
+    st_dev: u32,
+    st_ino: u16,
+    st_mode: u16,
+    st_nlink: i16,
+    st_uid: i16,
+    st_gid: i16,
+    st_rdev: u32,
+    st_size: i64,
+    st_atime: i64,
+    st_mtime: i64,
+    st_ctime: i64,
+};
+extern "c" fn _fstat64(fd: c_int, buf: *Stat64) c_int;
+
 pub fn statFd(fd: std.c.fd_t) !StatInfo {
+    if (builtin.os.tag == .windows) {
+        var st: Stat64 = undefined;
+        if (_fstat64(fd, &st) != 0) return error.StatFailed;
+        return .{ .mtime_ns = @as(i128, st.st_mtime) * std.time.ns_per_s, .size = @intCast(st.st_size) };
+    }
     if (builtin.os.tag == .linux) {
         var stx: std.os.linux.Statx = undefined;
         const empty_path: [*:0]const u8 = "";
