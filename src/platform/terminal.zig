@@ -58,7 +58,9 @@ pub fn waitReadable(fd: c_int, timeout_ms: i32) i32 {
         // fd(0=stdin)→ 控制台输入句柄。用 STD_INPUT_HANDLE 而非 _get_osfhandle:
         // 交互输入恒是控制台。
         const h = GetStdHandle(STD_INPUT_HANDLE);
-        const rc = WaitForSingleObject(h, @intCast(timeout_ms));
+        // @max(…,0):负超时(POSIX 语义=无限)在 windows @intCast 会 panic;调用方目前只传
+        // 非负,防御性钳到 0(立即返回)而非误判 INFINITE。
+        const rc = WaitForSingleObject(h, @intCast(@max(timeout_ms, 0)));
         return switch (rc) {
             0 => 1, // WAIT_OBJECT_0:就绪
             0x102 => 0, // WAIT_TIMEOUT

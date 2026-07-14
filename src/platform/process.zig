@@ -297,7 +297,9 @@ extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) win.DWORD;
 /// 当前进程 pid。POSIX=getpid；Windows=GetCurrentProcessId(避开 std.c.getpid 在 windows
 /// 返回类型不宜 `{d}` 格式化的问题)。仅用于 LSP processId 等信息性字段。
 pub fn currentPid() i32 {
-    if (is_windows) return @intCast(GetCurrentProcessId());
+    // @bitCast(非 @intCast):Windows PID 是 DWORD(u32),理论可 > i32 max → @intCast 在
+    // ReleaseSafe 会 panic;processId 仅信息性,位模式重解释即可(负值也无碍)。
+    if (is_windows) return @bitCast(GetCurrentProcessId());
     return std.c.getpid();
 }
 

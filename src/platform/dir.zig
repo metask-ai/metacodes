@@ -68,15 +68,19 @@ const WindowsIter = struct {
     name_buf: [520]u8, // 260 UTF-16 → 最多 780 UTF-8;520 够绝大多数(截断也不越界)
 
     fn next(self: *WindowsIter) ?Entry {
-        if (self.pending_first) {
-            self.pending_first = false;
-        } else {
-            if (winsys.FindNextFileW(self.handle, &self.find_data) == 0) return null;
+        // 循环而非递归:UTF-16 解码失败(极罕见的坏文件名)跳过该项继续,避免病态目录下
+        // 无界递归爆栈。
+        while (true) {
+            if (self.pending_first) {
+                self.pending_first = false;
+            } else {
+                if (winsys.FindNextFileW(self.handle, &self.find_data) == 0) return null;
+            }
+            const w = std.mem.sliceTo(&self.find_data.cFileName, 0);
+            const n = std.unicode.utf16LeToUtf8(&self.name_buf, w) catch continue;
+            const is_dir = (self.find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            return .{ .name = self.name_buf[0..n], .is_dir = is_dir };
         }
-        const w = std.mem.sliceTo(&self.find_data.cFileName, 0);
-        const n = std.unicode.utf16LeToUtf8(&self.name_buf, w) catch return self.next();
-        const is_dir = (self.find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-        return .{ .name = self.name_buf[0..n], .is_dir = is_dir };
     }
 
     fn close(self: *WindowsIter) void {
