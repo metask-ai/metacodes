@@ -270,8 +270,7 @@ pub const App = struct {
         } else {
             // ~/.metacodes/config.json 的 theme 字段覆盖默认 auto
             const home_for_theme: ?[]const u8 = blk: {
-                const h = std.c.getenv("HOME") orelse break :blk null;
-                break :blk std.mem.span(h);
+                break :blk @import("platform").paths.homeDir();
             };
             const persisted = if (home_for_theme) |h| tui_config.loadTheme(allocator, h) else null;
             app.theme_variant = persisted orelse .auto;
@@ -651,8 +650,7 @@ pub const App = struct {
 
     fn initTranscriptWriter(app: *App) !void {
         // HOME
-        const home_z = std.c.getenv("HOME") orelse return error.NoHome;
-        const home = std.mem.span(home_z);
+        const home = @import("platform").paths.homeDir() orelse return error.NoHome;
 
         const cwd = try @import("util/fs.zig").getCwd(app.allocator);
         defer app.allocator.free(cwd);
@@ -994,8 +992,7 @@ pub const App = struct {
     /// 挂到 permission_ctx.settings,并填 match_ctx(cwd/project_root/home)。
     fn loadSettings(app: *App) !void {
         const loader = @import("permission/loader.zig");
-        const home_c = std.c.getenv("HOME");
-        const home: ?[]const u8 = if (home_c) |h| std.mem.span(h) else null;
+        const home: ?[]const u8 = @import("platform").paths.homeDir();
 
         const ms = try loader.load(app.allocator, .{
             .managed = null,
@@ -1127,8 +1124,7 @@ pub const App = struct {
     /// 从 ~/.metacodes/config.json 读 permission_rules 数组。失败仅 log，不影响启动。
     /// 同时把加载的 rule_set 绑到 permission_ctx.rules。
     fn loadPermissionRules(app: *App) !void {
-        const home_c = std.c.getenv("HOME") orelse return error.NoHome;
-        const home = std.mem.span(home_c);
+        const home = @import("platform").paths.homeDir() orelse return error.NoHome;
         var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
         const path = try std.fmt.bufPrint(&pbuf, "{s}/.metacodes/config.json\x00", .{home});
         const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
@@ -1204,8 +1200,7 @@ pub const App = struct {
     /// 每个 server 失败仅 log,不影响其它 server 或 App 启动。
     /// 成功的 session 注册的工具进 dyn_registry,naming: `<name>__<tool>`。
     fn connectMcpServers(app: *App) !void {
-        const home_c = std.c.getenv("HOME") orelse return error.NoHome;
-        const home = std.mem.span(home_c);
+        const home = @import("platform").paths.homeDir() orelse return error.NoHome;
         var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
         const path = try std.fmt.bufPrint(&pbuf, "{s}/.metacodes/config.json\x00", .{home});
         const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));

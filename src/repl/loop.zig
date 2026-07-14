@@ -1699,8 +1699,7 @@ fn retryLast(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui
 }
 
 fn historyPath(allocator: std.mem.Allocator) ![]u8 {
-    const home_c = std.c.getenv("HOME") orelse return error.NoHome;
-    const home = std.mem.span(home_c);
+    const home = @import("platform").paths.homeDir() orelse return error.NoHome;
     return std.fmt.allocPrint(allocator, "{s}/.metacodes/history", .{home});
 }
 

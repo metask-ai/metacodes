@@ -101,8 +101,7 @@ pub const SkillSet = struct {
         try self.loadFromDir(enterprise);
 
         // 2. personal — ~/.metacodes 优先于 ~/.claude(后加载覆盖)
-        if (std.c.getenv("HOME")) |home_c| {
-            const home = std.mem.span(home_c);
+        if (@import("platform").paths.homeDir()) |home| {
             const claude_path = try std.fmt.allocPrint(self.allocator, "{s}/.claude/skills", .{home});
             defer self.allocator.free(claude_path);
             try self.loadFromDir(claude_path);

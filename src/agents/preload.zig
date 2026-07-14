@@ -107,8 +107,7 @@ pub fn buildSubagentContext(
 /// 读 ~/.claude/CLAUDE.md + <project>/CLAUDE.md + <project>/CLAUDE.local.md,顺序追加。
 /// 缺失静默跳过。
 fn injectClaudeMd(allocator: std.mem.Allocator, out: *std.Io.Writer.Allocating, opts: ContextOptions) !void {
-    if (std.c.getenv("HOME")) |home_c| {
-        const home = std.mem.span(home_c);
+    if (@import("platform").paths.homeDir()) |home| {
         try injectFile(allocator, out, home, ".claude/CLAUDE.md", "User CLAUDE.md");
         try injectFile(allocator, out, home, ".metacodes/CLAUDE.md", "User cc-zig CLAUDE.md");
     }

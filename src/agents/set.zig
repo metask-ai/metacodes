@@ -35,8 +35,7 @@ pub const AgentSet = struct {
         try injectBuiltins(self);
 
         // 1. personal: ~/.claude/agents 然后 ~/.metacodes/agents
-        if (std.c.getenv("HOME")) |home_c| {
-            const home = std.mem.span(home_c);
+        if (@import("platform").paths.homeDir()) |home| {
             const claude_path = try std.fmt.allocPrint(self.allocator, "{s}/.claude/agents", .{home});
             defer self.allocator.free(claude_path);
             try self.loadFromDirRecursive(claude_path, .personal);
