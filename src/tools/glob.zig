@@ -1,4 +1,5 @@
 const std = @import("std");
+const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const toolchain = @import("../util/toolchain.zig");
 const ToolContext = @import("context.zig").ToolContext;
@@ -107,9 +108,9 @@ test "GlobTool brace pattern (*.{ts,tsx})" {
     const tsx_path: [*:0]const u8 = "/tmp/cc-zig-glob-brace-a.tsx";
     const txt_path: [*:0]const u8 = "/tmp/cc-zig-glob-brace-a.txt";
     for ([_][*:0]const u8{ ts_path, tsx_path, txt_path }) |p| {
-        const fd = std.c.open(p, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        const fd = pfs.open(p, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         _ = std.c.write(fd, "x\n", 2);
-        _ = std.c.close(fd);
+        _ = pfs.close(fd);
     }
     defer _ = std.c.unlink(ts_path);
     defer _ = std.c.unlink(tsx_path);

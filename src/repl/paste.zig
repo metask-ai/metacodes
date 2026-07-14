@@ -10,6 +10,7 @@
 //! 占位符 → 真实内容的还原由调用方在提交时做（expandPlaceholders）。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 
 /// 触发外部存储的阈值：行数 > 此值 或 字节数 > 此值。
 /// 真 cc v2.1.172 实测(record_input_behavior.py threshold.txt):≤3 行内联,≥4 行转占位符
@@ -45,12 +46,12 @@ pub fn store(allocator: std.mem.Allocator, home: []const u8, id: usize, text: []
     const path_z = try std.fmt.allocPrintSentinel(allocator, "{s}/.metacodes/pastes/{d}.txt", .{ home, id }, 0);
     defer allocator.free(path_z);
 
-    const fd = std.c.open(path_z.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
     if (fd < 0) return null;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     var pos: usize = 0;
     while (pos < text.len) {
-        const n = std.c.write(fd, text.ptr + pos, text.len - pos);
+        const n = pfs.write(fd, text[pos..][0..text.len - pos]);
         if (n <= 0) return null;
         pos += @intCast(n);
     }
@@ -63,9 +64,9 @@ pub fn store(allocator: std.mem.Allocator, home: []const u8, id: usize, text: []
 pub fn load(allocator: std.mem.Allocator, home: []const u8, id: usize) !?[]u8 {
     const path_z = try std.fmt.allocPrintSentinel(allocator, "{s}/.metacodes/pastes/{d}.txt", .{ home, id }, 0);
     defer allocator.free(path_z);
-    const fd = std.c.open(path_z.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return null;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
     var chunk: [4096]u8 = undefined;

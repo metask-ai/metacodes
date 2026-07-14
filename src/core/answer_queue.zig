@@ -15,6 +15,7 @@
 //! 队列耗尽 → pop() 返 null,调用方用安全默认(权限=deny,AskUserQuestion=NotATty)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const log = @import("../util/log.zig");
 
 /// 应答列表,借用 loader 的 allocator(main 里是 arena,进程级存活)。
@@ -56,14 +57,14 @@ pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !void {
     if (path.len + 1 > pbuf.len) return error.PathTooLong;
     @memcpy(pbuf[0..path.len], path);
     pbuf[path.len] = 0;
-    const fd = std.c.open(@ptrCast(&pbuf), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.FileNotFound;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     var all: std.ArrayList(u8) = .empty;
     defer all.deinit(allocator);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = pfs.read(fd, &buf);
         if (n < 0) return error.ReadFailed;
         if (n == 0) break;
         try all.appendSlice(allocator, buf[0..@intCast(n)]);

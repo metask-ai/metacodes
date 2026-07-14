@@ -1,4 +1,5 @@
 const std = @import("std");
+const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const tt = @import("test_tmp.zig"); // 测试 fixture 唯一路径(并发隔离)
 const toolchain = @import("../util/toolchain.zig");
@@ -256,11 +257,11 @@ test "GrepTool content mode with -n" {
     // 准备一个包含 "needle" 的临时文件(per-pid 唯一路径,避免并发撞车)
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "grep-content-test.txt");
-    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     const text = "pre\nneedle line\npost\n";
-    _ = std.c.write(fd, text.ptr, text.len);
-    _ = std.c.close(fd);
+    _ = pfs.write(fd, text);
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path.ptr);
 
     var abuf: [320]u8 = undefined;
@@ -276,11 +277,11 @@ test "GrepTool count mode" {
     const ctx = testCtx();
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "grep-count-test.txt");
-    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     const text = "x\nx\ny\nx\n";
-    _ = std.c.write(fd, text.ptr, text.len);
-    _ = std.c.close(fd);
+    _ = pfs.write(fd, text);
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path.ptr);
 
     var abuf: [320]u8 = undefined;
@@ -296,11 +297,11 @@ test "GrepTool case insensitive" {
     const ctx = testCtx();
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "grep-i-test.txt");
-    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     const text = "HELLO\nworld\n";
-    _ = std.c.write(fd, text.ptr, text.len);
-    _ = std.c.close(fd);
+    _ = pfs.write(fd, text);
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path.ptr);
 
     var abuf: [320]u8 = undefined;
@@ -314,11 +315,11 @@ test "GrepTool -B -A context" {
     const ctx = testCtx();
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "grep-ctx-test.txt");
-    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     const text = "before\nmatch\nafter\nother\n";
-    _ = std.c.write(fd, text.ptr, text.len);
-    _ = std.c.close(fd);
+    _ = pfs.write(fd, text);
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path.ptr);
 
     var abuf: [360]u8 = undefined;
@@ -334,11 +335,11 @@ test "GrepTool -C context shorthand" {
     const ctx = testCtx();
     var pbuf: [256]u8 = undefined;
     const path = tt.path(&pbuf, "grep-cC-test.txt");
-    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     const text = "a\nb\nHIT\nc\nd\n";
-    _ = std.c.write(fd, text.ptr, text.len);
-    _ = std.c.close(fd);
+    _ = pfs.write(fd, text);
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path.ptr);
 
     var abuf: [360]u8 = undefined;
@@ -359,12 +360,12 @@ test "GrepTool glob filter" {
     const txt_path = tt.path(&tbuf, "grep-glob.txt");
     const text = "hello\n";
 
-    const fd1 = std.c.open(zig_path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    _ = std.c.write(fd1, text.ptr, text.len);
-    _ = std.c.close(fd1);
-    const fd2 = std.c.open(txt_path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    _ = std.c.write(fd2, text.ptr, text.len);
-    _ = std.c.close(fd2);
+    const fd1 = pfs.open(zig_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    _ = pfs.write(fd1, text);
+    _ = pfs.close(fd1);
+    const fd2 = pfs.open(txt_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    _ = pfs.write(fd2, text);
+    _ = pfs.close(fd2);
     defer _ = std.c.unlink(zig_path.ptr);
     defer _ = std.c.unlink(txt_path.ptr);
 
@@ -422,11 +423,11 @@ test "paginate: offset beyond total returns just notice" {
 test "GrepTool global head_limit across content" {
     const ctx = testCtx();
     const path = "/tmp/cc-zig-grep-headlimit.txt";
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     const text = "m\nm\nm\nm\nm\n";
-    _ = std.c.write(fd, text.ptr, text.len);
-    _ = std.c.close(fd);
+    _ = pfs.write(fd, text);
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path);
 
     const r = try execute(&ctx, "{\"pattern\":\"m\",\"path\":\"/tmp/cc-zig-grep-headlimit.txt\",\"output_mode\":\"content\",\"head_limit\":2}");
@@ -437,12 +438,12 @@ test "GrepTool global head_limit across content" {
 test "GrepTool 默认 head_limit=250:不传时宽匹配被截断(防撑爆)" {
     const ctx = testCtx();
     const path = "/tmp/cc-zig-grep-default-cap.txt";
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     // 写 300 行全匹配 → 不传 head_limit → 应只返 250 行 + appliedLimit 提示。
     var i: usize = 0;
     while (i < 300) : (i += 1) _ = std.c.write(fd, "match\n", 6);
-    _ = std.c.close(fd);
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path);
 
     const r = try execute(&ctx, "{\"pattern\":\"match\",\"path\":\"/tmp/cc-zig-grep-default-cap.txt\",\"output_mode\":\"content\"}");
@@ -460,11 +461,11 @@ test "GrepTool 默认 head_limit=250:不传时宽匹配被截断(防撑爆)" {
 test "GrepTool head_limit=0 显式无限:返回全部不截断" {
     const ctx = testCtx();
     const path = "/tmp/cc-zig-grep-unlimited.txt";
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     var i: usize = 0;
     while (i < 300) : (i += 1) _ = std.c.write(fd, "match\n", 6);
-    _ = std.c.close(fd);
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path);
 
     const r = try execute(&ctx, "{\"pattern\":\"match\",\"path\":\"/tmp/cc-zig-grep-unlimited.txt\",\"output_mode\":\"content\",\"head_limit\":0}");
@@ -511,11 +512,11 @@ test "Grep 搭车:裸标识符前置 FindSymbol 定义块;正则不触发(需 zl
     const fpath = std.fmt.bufPrintZ(&fbuf, "{s}/sample.zig", .{dir}) catch unreachable;
     defer _ = std.c.unlink(fpath.ptr);
     {
-        const fd = std.c.open(fpath.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        const fd = pfs.open(fpath.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try std.testing.expect(fd >= 0);
         const text = "pub fn clamp(v: i32) i32 { return v; }\nconst x = clamp(3);\n";
-        _ = std.c.write(fd, text.ptr, text.len);
-        _ = std.c.close(fd);
+        _ = pfs.write(fd, text);
+        _ = pfs.close(fd);
     }
 
     const Service = @import("../lsp/service.zig").Service;

@@ -19,6 +19,7 @@
 //! truncated=true 表示本次没读完，需要提高 since_byte（或 max_bytes）。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
@@ -98,9 +99,9 @@ fn readFileRange(path: []const u8, since: usize, max: usize, allocator: std.mem.
     if (path.len >= pbuf.len) return error.PathTooLong;
     @memcpy(pbuf[0..path.len], path);
     pbuf[path.len] = 0;
-    const fd = std.c.open(@ptrCast(&pbuf), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.OpenFailed;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
 
     // lseek 到 end 取 total_bytes
     const SEEK_END: c_int = 2;
@@ -125,7 +126,7 @@ fn readFileRange(path: []const u8, since: usize, max: usize, allocator: std.mem.
     var remaining = to_read;
     while (remaining > 0) {
         const chunk_size = @min(remaining, buf.len);
-        const n = std.c.read(fd, &buf, chunk_size);
+        const n = pfs.read(fd, buf[0..chunk_size]);
         if (n <= 0) break;
         try out.appendSlice(allocator, buf[0..@intCast(n)]);
         remaining -= @intCast(n);

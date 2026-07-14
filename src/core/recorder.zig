@@ -12,6 +12,7 @@
 //! 为不存在的需求加复杂度。真要并发录多会话时再按 session_id 分文件名(低优先级)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const sync = @import("platform").sync;
 const log = @import("../util/log.zig");
 
@@ -89,15 +90,15 @@ fn writeFile(path: []const u8, bytes: []const u8) void {
     if (path.len + 1 > pbuf.len) return;
     @memcpy(pbuf[0..path.len], path);
     pbuf[path.len] = 0;
-    const fd = std.c.open(@ptrCast(&pbuf), std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     if (fd < 0) {
         log.warn("recorder", "create {s} failed", .{path});
         return;
     }
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     var off: usize = 0;
     while (off < bytes.len) {
-        const n = std.c.write(fd, bytes.ptr + off, bytes.len - off);
+        const n = pfs.write(fd, bytes[off..][0..bytes.len - off]);
         if (n <= 0) break;
         off += @intCast(n);
     }

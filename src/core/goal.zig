@@ -6,6 +6,7 @@
 //! explicit status transitions, and secret-free JSON persistence.
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const session_id = @import("session_id.zig");
 const time = @import("../util/time.zig");
 
@@ -164,10 +165,10 @@ pub const State = struct {
 
         const bytes = try serializeGoal(self.allocator, self.current.?);
         defer self.allocator.free(bytes);
-        const fd = std.c.open(tmp_z.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        const fd = pfs.open(tmp_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
         if (fd < 0) return error.OpenFailed;
-        defer _ = std.c.close(fd);
-        const n = std.c.write(fd, bytes.ptr, bytes.len);
+        defer _ = pfs.close(fd);
+        const n = pfs.write(fd, bytes);
         if (n < 0 or @as(usize, @intCast(n)) != bytes.len) return error.WriteFailed;
         if (std.c.rename(tmp_z.ptr, path_z.ptr) != 0) return error.RenameFailed;
     }
@@ -252,14 +253,14 @@ fn getOptionalU64(obj: std.json.ObjectMap, key: []const u8) !?u64 {
 fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
-    const fd = std.c.open(path_z.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.NotFound;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = pfs.read(fd, &buf);
         if (n < 0) return error.ReadFailed;
         if (n == 0) break;
         try out.appendSlice(allocator, buf[0..@intCast(n)]);

@@ -14,6 +14,7 @@
 //! 容错:文件不存在 → 创建 + 完整 JSON;parse 失败 → log + 不写(避免覆盖损坏的 settings)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 
 /// 把 rule 加入 settings.local.json 的 permissions.allow 数组。
 /// project_dir 非 null → 优先用 project local;否则用 ~/.claude/settings.json。
@@ -83,14 +84,14 @@ fn readFile(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     if (path.len + 1 > pbuf.len) return error.PathTooLong;
     @memcpy(pbuf[0..path.len], path);
     pbuf[path.len] = 0;
-    const fd = std.c.open(@ptrCast(&pbuf), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.FileNotFound;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     var all: std.ArrayList(u8) = .empty;
     errdefer all.deinit(alloc);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = pfs.read(fd, &buf);
         if (n < 0) return error.ReadFailed;
         if (n == 0) break;
         try all.appendSlice(alloc, buf[0..@intCast(n)]);
@@ -103,12 +104,12 @@ fn writeFile(path: []const u8, bytes: []const u8) !void {
     if (path.len + 1 > pbuf.len) return error.PathTooLong;
     @memcpy(pbuf[0..path.len], path);
     pbuf[path.len] = 0;
-    const fd = std.c.open(@ptrCast(&pbuf), std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     if (fd < 0) return error.WriteFailed;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     var written: usize = 0;
     while (written < bytes.len) {
-        const n = std.c.write(fd, bytes.ptr + written, bytes.len - written);
+        const n = pfs.write(fd, bytes[written..][0..bytes.len - written]);
         if (n < 0) return error.WriteFailed;
         if (n == 0) break;
         written += @intCast(n);

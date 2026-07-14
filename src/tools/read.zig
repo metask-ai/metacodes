@@ -1,4 +1,5 @@
 const std = @import("std");
+const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
 const read_state = @import("../core/read_state.zig");
@@ -75,7 +76,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         }
         return error.FileNotFound;
     };
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
 
     // 在读之前 fstat 一次拿 mtime/size，供 ReadState 记录用（must-read-first/staleness 校验）
     const st = read_state.statFd(fd) catch null;
@@ -269,7 +270,7 @@ fn isTrue(s: ?[]const u8) bool {
 /// outline 模式:打开文件、读全量、渲染符号大纲。**无符号 → null**(调用方回退正常读)。
 fn readOutline(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []const u8) !?[]u8 {
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     return try readOutlineFromFd(allocator, ctx, path, fd);
 }
 
@@ -370,7 +371,7 @@ const MAX_IMAGE_BYTES: usize = 3_750_000;
 /// api/request.zig 的 serializeContent 检测到此形态会发成真正的 image content block。
 fn readImage(allocator: std.mem.Allocator, ctx: *const ToolContext, path: []const u8, media_type: []const u8) ![]u8 {
     const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
 
     const st = read_state.statFd(fd) catch null;
     if (st) |s| {
@@ -425,12 +426,12 @@ test "ReadTool device path blocked via execute" {
 test "ReadTool image returns structured json" {
     const ctx = testCtx();
     const path = "/tmp/cc-zig-read-img-test.png";
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     // 4 字节假 PNG header
     const bytes = [_]u8{ 0x89, 0x50, 0x4E, 0x47 };
-    _ = std.c.write(fd, &bytes, bytes.len);
-    _ = std.c.close(fd);
+    _ = pfs.write(fd, &bytes);
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path);
 
     const r = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-read-img-test.png\"}");
@@ -481,11 +482,11 @@ test "ReadTool offset/limit extracts correct slice" {
     const ctx = testCtx();
     // 直接用 libc 写一个 10 行的文件（绕过 write 工具的 JSON 转义差异）
     const path_cstr = "/tmp/cc-zig-read-offset-test.txt";
-    const fd = std.c.open(path_cstr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path_cstr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     const text = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n";
-    _ = std.c.write(fd, text.ptr, text.len);
-    _ = std.c.close(fd);
+    _ = pfs.write(fd, text);
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path_cstr);
 
     // offset=3, limit=2 → 带 cat -n 前缀，行号从 3 开始
@@ -497,11 +498,11 @@ test "ReadTool offset/limit extracts correct slice" {
 test "ReadTool first line has line-number prefix 1" {
     const ctx = testCtx();
     const path_cstr = "/tmp/cc-zig-read-ln1-test.txt";
-    const fd = std.c.open(path_cstr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path_cstr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     const text = "hello\nworld\n";
-    _ = std.c.write(fd, text.ptr, text.len);
-    _ = std.c.close(fd);
+    _ = pfs.write(fd, text);
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path_cstr);
 
     const r = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-read-ln1-test.txt\"}");
@@ -512,11 +513,11 @@ test "ReadTool first line has line-number prefix 1" {
 test "ReadTool file without trailing newline still gets prefix" {
     const ctx = testCtx();
     const path_cstr = "/tmp/cc-zig-read-noeol-test.txt";
-    const fd = std.c.open(path_cstr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path_cstr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     const text = "noeol";
-    _ = std.c.write(fd, text.ptr, text.len);
-    _ = std.c.close(fd);
+    _ = pfs.write(fd, text);
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path_cstr);
 
     const r = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-read-noeol-test.txt\"}");
@@ -542,13 +543,13 @@ test "ReadTool default limit reads at least first line" {
 test "ReadTool 大文件整读被拒(防撑爆);带 offset/limit 放行" {
     const ctx = testCtx();
     const path = "/tmp/cc-zig-read-toobig.txt";
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     // 写 > 256KB(每行短,行数也多)。
     const line = "abcdefghij\n"; // 11 bytes
     var i: usize = 0;
-    while (i < 30000) : (i += 1) _ = std.c.write(fd, line.ptr, line.len); // ~330KB
-    _ = std.c.close(fd);
+    while (i < 30000) : (i += 1) _ = pfs.write(fd, line); // ~330KB
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path);
 
     // 整读(无 offset/limit)→ 拒读 + too large 提示。
@@ -566,13 +567,13 @@ test "ReadTool 大文件整读被拒(防撑爆);带 offset/limit 放行" {
 test "ReadTool 超长单行被截断 + 标记" {
     const ctx = testCtx();
     const path = "/tmp/cc-zig-read-longline.txt";
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     // 一行 5000 个 'x'(超过 MAX_LINE_BYTES=2000),文件总字节 < 256KB 不触发大文件守卫。
     const big_line = "x" ** 5000;
-    _ = std.c.write(fd, big_line.ptr, big_line.len);
+    _ = pfs.write(fd, big_line);
     _ = std.c.write(fd, "\n", 1);
-    _ = std.c.close(fd);
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path);
 
     const r = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-read-longline.txt\"}");
@@ -601,7 +602,7 @@ test "Read 输出封顶:显式 limit=huge 在 <10MB 文件上超 256KB → 截�
     const a = std.testing.allocator;
     const ctx = testCtx();
     const path = "/tmp/cc-zig-read-outcap.txt";
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     // 写 ~320KB(8000 行 × 40 字节,编号可区分),<10MB 走 fast path。显式 limit 绕过 256KB 整读守卫。
     // 每行 = "L" + 6 位编号 + 32 个 '.' + '\n' = 40 字节。
@@ -611,9 +612,9 @@ test "Read 输出封顶:显式 limit=huge 在 <10MB 文件上超 256KB → 截�
         _ = std.fmt.bufPrint(&lbuf, "L{d:0>6}", .{i}) catch unreachable; // "L000000"
         @memset(lbuf[7..39], '.');
         lbuf[39] = '\n';
-        _ = std.c.write(fd, &lbuf, 40);
+        _ = pfs.write(fd, &lbuf);
     }
-    _ = std.c.close(fd);
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path);
 
     const r = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-read-outcap.txt\",\"limit\":999999}");
@@ -630,13 +631,13 @@ test "Read 输出封顶:单行 >100KB → 长行提示不给 offset(防死循环
     const a = std.testing.allocator;
     const ctx = testCtx();
     const path = "/tmp/cc-zig-read-longline-cap.txt";
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     // 一整行 150KB(无 '\n',>MAX_READ_OUTPUT_BYTES=100KB),<256KB 不触发大文件守卫。
     var payload: [150 * 1024]u8 = undefined;
     @memset(&payload, 'q');
-    _ = std.c.write(fd, &payload, payload.len);
-    _ = std.c.close(fd);
+    _ = pfs.write(fd, &payload);
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path);
 
     const r = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-read-longline-cap.txt\"}");
@@ -650,7 +651,7 @@ test "Read 流式:≥10MB 文件读中间区间不 OOM,返回正确的中间行"
     const a = std.testing.allocator;
     const ctx = testCtx();
     const path = "/tmp/cc-zig-read-stream.txt";
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     // 写 ~11MB(>10MB 触发流式路径):每行 "L<编号>\n"。用 1000 行/块的缓冲减少 syscall。
     var buf: [64 * 1024]u8 = undefined;
@@ -662,9 +663,9 @@ test "Read 流式:≥10MB 文件读中间区间不 OOM,返回正确的中间行"
             w += s.len;
             n_lines += 1;
         }
-        _ = std.c.write(fd, &buf, w);
+        _ = pfs.write(fd, buf[0..w]);
     }
-    _ = std.c.close(fd);
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path);
 
     // 读中间:offset=200000, limit=3 → 应返回 L199999/L200000/L200001(1-based offset=200000 = 第 200000 行)。
@@ -682,7 +683,7 @@ test "Read 流式:≥10MB 大范围触发 100KB 封顶 → 裁到完整行 + 精
     const a = std.testing.allocator;
     const ctx = testCtx();
     const path = "/tmp/cc-zig-read-stream-cap.txt";
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     // ~11MB(>10MB 流式);读大范围 → 累积到 100KB 封顶。行 "R<6位>....\n" = 40 字节。
     var buf: [64 * 1024]u8 = undefined;
@@ -698,9 +699,9 @@ test "Read 流式:≥10MB 大范围触发 100KB 封顶 → 裁到完整行 + 精
             w += 40;
             n += 1;
         }
-        _ = std.c.write(fd, &buf, w);
+        _ = pfs.write(fd, buf[0..w]);
     }
-    _ = std.c.close(fd);
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path);
 
     // offset=1 大 limit → 流式从头累积到 100KB(2560 行)封顶。
@@ -718,15 +719,15 @@ test "Read 流式:offset 超文件行数 → 空" {
     const a = std.testing.allocator;
     const ctx = testCtx();
     const path = "/tmp/cc-zig-read-stream-eof.txt";
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     // ~11MB 文件,offset 远超行数。
     var buf: [64 * 1024]u8 = undefined;
     @memset(&buf, 'a');
     buf[buf.len - 1] = '\n';
     var w: usize = 0;
-    while (w < 176) : (w += 1) _ = std.c.write(fd, &buf, buf.len); // ~11MB,~176 行(每行 64KB)
-    _ = std.c.close(fd);
+    while (w < 176) : (w += 1) _ = pfs.write(fd, &buf); // ~11MB,~176 行(每行 64KB)
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path);
 
     const r = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-read-stream-eof.txt\",\"offset\":9999999,\"limit\":5}");
@@ -747,14 +748,14 @@ test "Read 弱提示:--lsp 开 + >150行有 server 语言 → CodeMap reminder;�
     // 大源码文件(200 行 .zig,有 zls server 注册)→ 带 reminder
     {
         const path = "/tmp/cc-zig-read-hint-big.zig";
-        const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try std.testing.expect(fd >= 0);
         var i: usize = 0;
         while (i < 200) : (i += 1) {
             const line = "const x = 1;\n";
-            _ = std.c.write(fd, line.ptr, line.len);
+            _ = pfs.write(fd, line);
         }
-        _ = std.c.close(fd);
+        _ = pfs.close(fd);
         defer _ = std.c.unlink(path);
 
         const r = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-read-hint-big.zig\"}");
@@ -765,11 +766,11 @@ test "Read 弱提示:--lsp 开 + >150行有 server 语言 → CodeMap reminder;�
     // 小源码文件(10 行)→ 不带 reminder
     {
         const path = "/tmp/cc-zig-read-hint-small.zig";
-        const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try std.testing.expect(fd >= 0);
         const text = "const a = 1;\nconst b = 2;\n";
-        _ = std.c.write(fd, text.ptr, text.len);
-        _ = std.c.close(fd);
+        _ = pfs.write(fd, text);
+        _ = pfs.close(fd);
         defer _ = std.c.unlink(path);
 
         const r = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-read-hint-small.zig\"}");
@@ -779,14 +780,14 @@ test "Read 弱提示:--lsp 开 + >150行有 server 语言 → CodeMap reminder;�
     // 大的非源码文件(.txt 200 行,无 server)→ 不带 reminder
     {
         const path = "/tmp/cc-zig-read-hint-big.txt";
-        const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try std.testing.expect(fd >= 0);
         var i: usize = 0;
         while (i < 200) : (i += 1) {
             const line = "plain text line\n";
-            _ = std.c.write(fd, line.ptr, line.len);
+            _ = pfs.write(fd, line);
         }
-        _ = std.c.close(fd);
+        _ = pfs.close(fd);
         defer _ = std.c.unlink(path);
 
         const r = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-read-hint-big.txt\"}");
@@ -797,14 +798,14 @@ test "Read 弱提示:--lsp 开 + >150行有 server 语言 → CodeMap reminder;�
     {
         const noctx = testCtx();
         const path = "/tmp/cc-zig-read-hint-nolsp.zig";
-        const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try std.testing.expect(fd >= 0);
         var i: usize = 0;
         while (i < 200) : (i += 1) {
             const line = "const x = 1;\n";
-            _ = std.c.write(fd, line.ptr, line.len);
+            _ = pfs.write(fd, line);
         }
-        _ = std.c.close(fd);
+        _ = pfs.close(fd);
         defer _ = std.c.unlink(path);
 
         const r = try execute(&noctx, "{\"path\":\"/tmp/cc-zig-read-hint-nolsp.zig\"}");
@@ -830,14 +831,14 @@ test "Read 弱提示:同 session 同文件只提一次(dedup)" {
         ctx.lsp = svc;
 
         const path = "/tmp/cc-zig-read-hint-dedup.zig";
-        const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try std.testing.expect(fd >= 0);
         var i: usize = 0;
         while (i < 200) : (i += 1) {
             const line = "pub fn f() void {}\n";
-            _ = std.c.write(fd, line.ptr, line.len);
+            _ = pfs.write(fd, line);
         }
-        _ = std.c.close(fd);
+        _ = pfs.close(fd);
         defer _ = std.c.unlink(path);
 
         const r1 = try execute(&ctx, "{\"path\":\"/tmp/cc-zig-read-hint-dedup.zig\"}");
@@ -856,11 +857,11 @@ test "ReadTool ~ 展开端到端(主 bug 回归)" {
     const a = std.testing.allocator;
     var pbuf: [256]u8 = undefined;
     const fpath = tt.path(&pbuf, "tilde-expand-read.txt");
-    const fd = std.c.open(fpath.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(fpath.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     const text = "tilde-needle-content";
-    _ = std.c.write(fd, text.ptr, text.len);
-    _ = std.c.close(fd);
+    _ = pfs.write(fd, text);
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(fpath.ptr);
 
     // home_dir = /tmp/cc-zig-test-<pid>;故 ~/tilde-expand-read.txt 展开到 fixture。
@@ -879,10 +880,10 @@ test "ReadTool 含 .. 的合法文件名不被误杀" {
     const a = std.testing.allocator;
     var pbuf: [256]u8 = undefined;
     const fpath = tt.path(&pbuf, "my..legit..file.txt");
-    const fd = std.c.open(fpath.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(fpath.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     _ = std.c.write(fd, "ok", 2);
-    _ = std.c.close(fd);
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(fpath.ptr);
 
     var abuf: [320]u8 = undefined;
@@ -944,8 +945,8 @@ fn e2eMkdir(path: []const u8) void {
 fn e2eWrite(path: []const u8, content: []const u8) void {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return;
-    const fd = std.c.open(z.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     if (fd < 0) return;
-    defer _ = std.c.close(fd);
-    _ = std.c.write(fd, content.ptr, content.len);
+    defer _ = pfs.close(fd);
+    _ = pfs.write(fd, content);
 }

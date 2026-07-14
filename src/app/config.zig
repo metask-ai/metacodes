@@ -13,6 +13,7 @@
 //! 本模块只负责"从文件加载" + "保存到文件"。CLI 和 env 合并由 main.zig 控制。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const util_json = @import("../util/json.zig");
 
 pub const FileConfig = struct {
@@ -39,17 +40,17 @@ pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !FileConfig 
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
 
-    const fd = std.c.open(path_z, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return .{}; // 不存在 = 空配置
 
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
 
     var buf: [16384]u8 = undefined;
     var contents = std.ArrayList(u8).empty;
     defer contents.deinit(allocator);
 
     while (true) {
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = pfs.read(fd, &buf);
         if (n <= 0) break;
         try contents.appendSlice(allocator, buf[0..@as(usize, @intCast(n))]);
     }
@@ -78,9 +79,9 @@ pub fn saveToFile(config: FileConfig, allocator: std.mem.Allocator, path: []cons
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
 
-    const fd = std.c.open(path_z, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    const fd = pfs.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
     if (fd < 0) return error.WriteError;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
@@ -120,7 +121,7 @@ pub fn saveToFile(config: FileConfig, allocator: std.mem.Allocator, path: []cons
     }
     try out.append(allocator, '}');
 
-    _ = std.c.write(fd, out.items.ptr, out.items.len);
+    _ = pfs.write(fd, out.items);
     _ = std.c.fsync(fd);
 }
 

@@ -34,6 +34,7 @@
 //! **复用**:path 归一化 / read_state 刷新 / patch.zig 的 gitDiff 生成 / edit_hl_cache(首文件高亮)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
 const util_json = @import("../util/json.zig");
@@ -572,7 +573,7 @@ fn buildResult(allocator: std.mem.Allocator, arena: std.mem.Allocator, plans: []
 // ── 文件 IO helpers ──────────────────────────────────────────────────────────
 fn readFileArena(arena: std.mem.Allocator, abs: []const u8) ![]u8 {
     const fd = std.posix.openat(std.posix.AT.FDCWD, abs, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     if (read_state.statFd(fd) catch null) |s| {
         if (s.size > MAX_PATCH_FILE_SIZE) return error.FileTooLarge;
     }
@@ -582,12 +583,12 @@ fn readFileArena(arena: std.mem.Allocator, abs: []const u8) ![]u8 {
 fn writeFileMkParents(content: []const u8, abs: []const u8) !void {
     mkdirParents(abs) catch {}; // best-effort;失败交给 openat 暴露
     const fd = std.posix.openat(std.posix.AT.FDCWD, abs, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return error.WriteError;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     // 循环写:write(2) 允许短写(EINTR / ENOSPC 写到一半返回部分字节数,非负)。不循环会静默截断
     // 文件却报成功(对齐 write.zig 的正确写法)。
     var pos: usize = 0;
     while (pos < content.len) {
-        const n = std.c.write(fd, content.ptr + pos, content.len - pos);
+        const n = pfs.write(fd, content[pos..][0..content.len - pos]);
         if (n < 0) {
             if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
             return error.WriteError;
@@ -783,9 +784,9 @@ test "codex fixtures: Update 场景逐字对齐(016/021/022/003)" {
 const tt = @import("test_tmp.zig");
 
 fn readWhole(a: std.mem.Allocator, abs: [:0]const u8) ![]u8 {
-    const fd = std.c.open(abs.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(abs.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.FileNotFound;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     return common.readAllFromFd(fd, a);
 }
 
@@ -795,10 +796,10 @@ test "execute e2e: Update File 真写盘" {
     const fpath = tt.path(&pb, "ap_update.txt");
     // 建初始文件。
     {
-        const fd = std.c.open(fpath.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        const fd = pfs.open(fpath.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try testing.expect(fd >= 0);
         _ = std.c.write(fd, "foo\nbar\n", 8);
-        _ = std.c.close(fd);
+        _ = pfs.close(fd);
     }
     defer _ = std.c.unlink(fpath.ptr);
 
@@ -827,10 +828,10 @@ test "execute e2e: Add + Delete 事务性(context 失败则整批不落盘)" {
     const existing = tt.path(&pb1, "ap_tx_existing.txt");
     const to_add = tt.path(&pb2, "ap_tx_added.txt");
     {
-        const fd = std.c.open(existing.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        const fd = pfs.open(existing.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try testing.expect(fd >= 0);
         _ = std.c.write(fd, "keep\n", 5);
-        _ = std.c.close(fd);
+        _ = pfs.close(fd);
     }
     defer _ = std.c.unlink(existing.ptr);
     defer _ = std.c.unlink(to_add.ptr);
@@ -862,10 +863,10 @@ test "execute e2e: Move(重命名到新目录)写新 + 删旧(codex fixture 004)
     const src = tt.path(&pb1, "ap_move_src.txt");
     const dst = tt.path(&pb2, "ap_move_dst.txt");
     {
-        const fd = std.c.open(src.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        const fd = pfs.open(src.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try testing.expect(fd >= 0);
         _ = std.c.write(fd, "old content\n", 12);
-        _ = std.c.close(fd);
+        _ = pfs.close(fd);
     }
     defer _ = std.c.unlink(src.ptr);
     defer _ = std.c.unlink(dst.ptr);
@@ -895,10 +896,10 @@ test "execute e2e: Add File 撞已存在文件 → 报错不覆盖(比 codex 更
     var pb: [256]u8 = undefined;
     const fpath = tt.path(&pb, "ap_add_exists.txt");
     {
-        const fd = std.c.open(fpath.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        const fd = pfs.open(fpath.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try testing.expect(fd >= 0);
         _ = std.c.write(fd, "PRECIOUS\n", 9);
-        _ = std.c.close(fd);
+        _ = pfs.close(fd);
     }
     defer _ = std.c.unlink(fpath.ptr);
 
@@ -922,10 +923,10 @@ test "execute: protected path(.env)拦住 ApplyPatch(不再绕过细粒度权限
     // 名为 .env 的 protected 文件(isProtectedPath 命中)。旧版 ApplyPatch 会绕过 protected 直接改。
     const fpath = tt.path(&pb, ".env");
     {
-        const fd = std.c.open(fpath.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        const fd = pfs.open(fpath.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         try testing.expect(fd >= 0);
         _ = std.c.write(fd, "SECRET=1\n", 9);
-        _ = std.c.close(fd);
+        _ = pfs.close(fd);
     }
     defer _ = std.c.unlink(fpath.ptr);
 

@@ -10,6 +10,7 @@
 //! 不在 append 时立即写盘——一次 session 的批量追加更省 IO；崩溃时最多丢当前 session。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 
 pub const MAX_ENTRIES: usize = 1000;
 
@@ -92,7 +93,7 @@ pub const History = struct {
     /// 向后兼容：不以 `"` 开头的行按旧版纯文本整行处理（自动迁移，下次 save 会写成 JSONL）。
     pub fn loadFromFile(self: *History, path: []const u8) !void {
         const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch return;
-        defer _ = std.c.close(fd);
+        defer _ = pfs.close(fd);
 
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(self.allocator);
@@ -141,9 +142,9 @@ pub const History = struct {
         const path_z = try allocatorDupeZ(self.allocator, path);
         defer self.allocator.free(path_z);
 
-        const fd = std.c.open(path_z, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        const fd = pfs.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
         if (fd < 0) return error.WriteError;
-        defer _ = std.c.close(fd);
+        defer _ = pfs.close(fd);
 
         for (self.entries.items) |entry| {
             var line: std.Io.Writer.Allocating = .init(self.allocator);
@@ -151,7 +152,7 @@ pub const History = struct {
             std.json.Stringify.encodeJsonString(entry, .{}, &line.writer) catch continue;
             line.writer.writeByte('\n') catch continue;
             const bytes = line.written();
-            _ = std.c.write(fd, bytes.ptr, bytes.len);
+            _ = pfs.write(fd, bytes);
         }
         _ = std.c.fsync(fd);
     }
@@ -274,10 +275,10 @@ test "History: legacy plain-text file auto-migrates" {
     const path = "/tmp/cc-zig-history-legacy.txt";
     defer _ = std.c.unlink(path);
     // 手写旧版纯文本（无引号）
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
     const legacy = "oldcmd1\noldcmd2\n";
-    _ = std.c.write(fd, legacy.ptr, legacy.len);
-    _ = std.c.close(fd);
+    _ = pfs.write(fd, legacy);
+    _ = pfs.close(fd);
 
     var h = History.init(testing.allocator);
     defer h.deinit();

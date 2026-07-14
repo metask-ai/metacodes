@@ -8,6 +8,7 @@
 //! 调用方（loop.zig）负责：唯一候选直接补全；多候选打印列表 + 补到公共前缀。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 
 pub const SlashCmd = struct { name: []const u8, desc: []const u8 };
 
@@ -253,8 +254,8 @@ test "commonPrefix" {
 test "path completion finds known file" {
     // /tmp 一定存在；造一个唯一前缀文件
     const path = "/tmp/cc-zig-complete-uniq-xyz.txt";
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    _ = std.c.close(fd);
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path);
 
     var r = try compute(testing.allocator, "cat /tmp/cc-zig-complete-uniq-", 30);
@@ -269,8 +270,8 @@ test "path completion finds known file" {
 
 test "@-mention completion finds file" {
     const path = "/tmp/cc-zig-atmention-uniq.txt";
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    _ = std.c.close(fd);
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    _ = pfs.close(fd);
     defer _ = std.c.unlink(path);
 
     // 输入 "review @/tmp/cc-zig-atmention-" → 补全应找到文件,replace_start 在 @ 之后

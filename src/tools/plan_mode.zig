@@ -11,6 +11,7 @@
 //! 子 agent)→ answer_queue 兜底 → 都无则安全默认 reject(绝不静默放行)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const ToolContext = @import("context.zig").ToolContext;
 const PlanApproval = ToolContext.PlanApproval;
 
@@ -386,11 +387,11 @@ test "ExitPlanMode 模型未传 plan → 从 plan 文件读盘兜底(对齐 cc n
     var wpath: [std.fs.max_path_bytes]u8 = undefined;
     @memcpy(wpath[0..path.len], path);
     wpath[path.len] = 0;
-    const fd = std.c.open(@ptrCast(&wpath), std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(@ptrCast(&wpath), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     const body = "# Plan from disk\n1. step one\n";
-    _ = std.c.write(fd, body, body.len);
-    _ = std.c.close(fd);
+    _ = pfs.write(fd, body);
+    _ = pfs.close(fd);
 
     var pctx = permission.PermissionContext{ .mode = .init(.plan), .allocator = a };
     var prev: ?types.PermissionMode = .default;

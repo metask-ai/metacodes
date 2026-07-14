@@ -8,6 +8,7 @@
 //! precedence(见 client.resolveMaxInputTokens):本表命中 > /v1/models probe > 200K 默认。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const log = @import("../util/log.zig");
 
 const BUNDLED = @embedFile("model_context_default.toml");
@@ -72,14 +73,14 @@ pub const ModelContext = struct {
     fn readFileBytes(self: *ModelContext, path: []const u8) ?[]u8 {
         const path_z = self.allocator.dupeZ(u8, path) catch return null;
         defer self.allocator.free(path_z);
-        const fd = std.c.open(path_z, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        const fd = pfs.open(path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) return null;
-        defer _ = std.c.close(fd);
+        defer _ = pfs.close(fd);
         var buf: [4096]u8 = undefined;
         var out = std.ArrayList(u8).empty;
         errdefer out.deinit(self.allocator);
         while (true) {
-            const n = std.c.read(fd, &buf, buf.len);
+            const n = pfs.read(fd, &buf);
             if (n <= 0) break;
             out.appendSlice(self.allocator, buf[0..@as(usize, @intCast(n))]) catch {
                 out.deinit(self.allocator);
@@ -96,10 +97,10 @@ pub const ModelContext = struct {
         _ = std.c.mkdir(dir_z, 0o700);
         const path_z = self.allocator.dupeZ(u8, path) catch return;
         defer self.allocator.free(path_z);
-        const fd = std.c.open(path_z, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        const fd = pfs.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         if (fd < 0) return;
-        defer _ = std.c.close(fd);
-        _ = std.c.write(fd, bytes.ptr, bytes.len);
+        defer _ = pfs.close(fd);
+        _ = pfs.write(fd, bytes);
         log.info("model_ctx", "wrote default model context table to {s}", .{path});
     }
 

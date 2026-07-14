@@ -18,6 +18,7 @@
 //!       Enter 时 push,Exit 时 pop。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
 const ToolContext = @import("context.zig").ToolContext;
@@ -210,9 +211,9 @@ fn worktreeExists(allocator: std.mem.Allocator, path: []const u8) bool {
     // 简单 stat:目录存在即认为是 worktree(更严格的方法是 git worktree list 然后匹配)
     const path_z = allocator.dupeZ(u8, path) catch return false;
     defer allocator.free(path_z);
-    const fd = std.c.open(path_z, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(path_z, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return false;
-    _ = std.c.close(fd);
+    _ = pfs.close(fd);
     return true;
 }
 

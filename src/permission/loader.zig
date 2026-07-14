@@ -4,6 +4,7 @@
 //! 单层文件不存在 / 解析失败 → 只 log,不阻塞其它层和启动。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const settings = @import("settings.zig");
 const log = @import("../util/log.zig");
 
@@ -122,15 +123,15 @@ fn readFile(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     if (path.len + 1 > pbuf.len) return error.PathTooLong;
     @memcpy(pbuf[0..path.len], path);
     pbuf[path.len] = 0;
-    const fd = std.c.open(@ptrCast(&pbuf), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.FileNotFound;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
 
     var all: std.ArrayList(u8) = .empty;
     errdefer all.deinit(alloc);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = pfs.read(fd, &buf);
         if (n < 0) return error.ReadFailed;
         if (n == 0) break;
         try all.appendSlice(alloc, buf[0..@intCast(n)]);
@@ -153,13 +154,13 @@ test "load: cli layer parse + evaluate" {
     const path_with_nul = try std.fmt.bufPrint(&path_buf, "/tmp/cczig_settings_{d}.json\x00", .{pid});
     const path = path_with_nul[0 .. path_with_nul.len - 1];
 
-    const fd = std.c.open(@ptrCast(path_with_nul.ptr), std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(@ptrCast(path_with_nul.ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     if (fd < 0) return error.WriteFailed;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     defer _ = std.c.unlink(@ptrCast(path_with_nul.ptr));
 
     const json_body = "{\"permissions\":{\"allow\":[\"Bash(git *)\"],\"deny\":[\"Bash(git push)\"]}}";
-    _ = std.c.write(fd, json_body.ptr, json_body.len);
+    _ = pfs.write(fd, json_body);
 
     var ms = try load(alloc, .{ .cli = path, .home = "", .project_root = null, .managed = null });
     defer ms.deinit();

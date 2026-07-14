@@ -1,4 +1,5 @@
 const std = @import("std");
+const pfs = @import("platform").fs;
 const common = @import("common.zig");
 const path_mod = @import("../util/path.zig");
 const util_json = @import("../util/json.zig");
@@ -51,7 +52,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     const fd = std.posix.openat(std.posix.AT.FDCWD, file_path, .{ .ACCMODE = .RDONLY }, 0) catch return error.FileNotFound;
     const original = blk: {
-        defer _ = std.c.close(fd);
+        defer _ = pfs.close(fd);
         const sz = read_state.statFd(fd) catch null;
         if (sz) |s| {
             if (s.size > MAX_EDIT_FILE_SIZE) return error.FileTooLarge;
@@ -124,9 +125,9 @@ fn finalizeWrite(
     new_raw: []const u8,
 ) ![]u8 {
     const write_fd = std.posix.openat(std.posix.AT.FDCWD, file_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644) catch return error.WriteError;
-    defer _ = std.c.close(write_fd);
+    defer _ = pfs.close(write_fd);
 
-    const written = std.c.write(write_fd, content.ptr, content.len);
+    const written = pfs.write(write_fd, content);
     if (written < 0) return error.WriteError;
 
     // 写完后刷新 ReadState 的 mtime + content_hash，避免紧接着再次 Edit 报 stale
@@ -490,9 +491,9 @@ test "EditTool not-read-first rejects" {
     const path = "/tmp/cc-zig-edit-mrf-test.txt";
     defer _ = std.c.unlink(path);
 
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     _ = std.c.write(fd, "hello", 5);
-    _ = std.c.close(fd);
+    _ = pfs.close(fd);
 
     var rs = @import("../core/read_state.zig").ReadState.init(a);
     defer rs.deinit();
@@ -507,9 +508,9 @@ test "EditTool stale rejected" {
     const path = tt.path(&pbuf, "edit-stale-test.txt");
     defer _ = std.c.unlink(path.ptr);
 
-    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     _ = std.c.write(fd, "hello", 5);
-    _ = std.c.close(fd);
+    _ = pfs.close(fd);
 
     var rs = @import("../core/read_state.zig").ReadState.init(a);
     defer rs.deinit();
@@ -526,9 +527,9 @@ test "EditTool after read succeeds" {
     const path = tt.path(&pbuf, "edit-after-read-test.txt");
     defer _ = std.c.unlink(path.ptr);
 
-    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     _ = std.c.write(fd, "foo", 3);
-    _ = std.c.close(fd);
+    _ = pfs.close(fd);
 
     var rs = @import("../core/read_state.zig").ReadState.init(a);
     defer rs.deinit();
@@ -629,10 +630,10 @@ test "EditTool smart-quote fallback replaces curly with straight" {
     const path = tt.path(&pbuf, "edit-smartquote.txt");
     defer _ = std.c.unlink(path.ptr);
     // 文件含弯引号
-    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     const content = "const s = \xE2\x80\x9Chello\xE2\x80\x9D;\n";
-    _ = std.c.write(fd, content.ptr, content.len);
-    _ = std.c.close(fd);
+    _ = pfs.write(fd, content);
+    _ = pfs.close(fd);
 
     var rs = @import("../core/read_state.zig").ReadState.init(a);
     defer rs.deinit();
@@ -649,9 +650,9 @@ test "EditTool smart-quote fallback replaces curly with straight" {
     try std.testing.expect(std.mem.indexOf(u8, result, "\"success\":true") != null);
 
     // 验证文件内容已替换
-    const vfd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const vfd = pfs.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     var rbuf: [128]u8 = undefined;
-    const n = std.c.read(vfd, &rbuf, rbuf.len);
-    _ = std.c.close(vfd);
+    const n = pfs.read(vfd, &rbuf);
+    _ = pfs.close(vfd);
     try std.testing.expect(std.mem.indexOf(u8, rbuf[0..@intCast(n)], "world") != null);
 }

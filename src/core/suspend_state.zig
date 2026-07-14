@@ -7,6 +7,7 @@
 //! 纯数据 JSON,放 session_dir/suspend.json(与 transcript.jsonl 同目录)。
 
 const std = @import("std");
+const pfs = @import("platform").fs;
 const log = @import("../util/log.zig");
 
 pub const SuspendState = struct {
@@ -29,12 +30,12 @@ pub fn write(session_dir: []const u8, state: SuspendState, allocator: std.mem.Al
     const path = try std.fmt.bufPrint(&pbuf, "{s}/suspend.json\x00", .{session_dir});
     const json = try std.json.Stringify.valueAlloc(allocator, state, .{});
     defer allocator.free(json);
-    const fd = std.c.open(@ptrCast(path.ptr), std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
     if (fd < 0) return error.OpenFailed;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     var off: usize = 0;
     while (off < json.len) {
-        const n = std.c.write(fd, json.ptr + off, json.len - off);
+        const n = pfs.write(fd, json[off..][0..json.len - off]);
         if (n <= 0) return error.WriteFailed;
         off += @intCast(n);
     }
@@ -45,14 +46,14 @@ pub fn write(session_dir: []const u8, state: SuspendState, allocator: std.mem.Al
 pub fn read(session_dir: []const u8, allocator: std.mem.Allocator) !SuspendState {
     var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
     const path = try std.fmt.bufPrint(&pbuf, "{s}/suspend.json\x00", .{session_dir});
-    const fd = std.c.open(@ptrCast(path.ptr), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(@ptrCast(path.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     if (fd < 0) return error.OpenFailed;
-    defer _ = std.c.close(fd);
+    defer _ = pfs.close(fd);
     var all = std.ArrayList(u8).empty;
     defer all.deinit(allocator);
     var buf: [4096]u8 = undefined;
     while (true) {
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = pfs.read(fd, &buf);
         if (n <= 0) break;
         try all.appendSlice(allocator, buf[0..@intCast(n)]);
     }
