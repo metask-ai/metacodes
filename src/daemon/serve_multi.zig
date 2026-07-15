@@ -35,6 +35,7 @@ const server_mod = @import("../web/server.zig");
 const WebBackend = @import("../web/backend.zig").WebBackend;
 const WebServer = server_mod.WebServer;
 const SessionView = server_mod.SessionView;
+const UdsServer = @import("uds.zig").UdsServer;
 
 const SessionRegistry = registry.SessionRegistry;
 const SessionHost = registry.SessionHost;
@@ -178,9 +179,29 @@ fn wireSlot(slot: *SessionSlot, reg: *SessionRegistry, web_alloc: std.mem.Alloca
     slot.wired = true; // 成功:host 归 reg,errdefer 不再 fire(无后续 error)
 }
 
+/// **UDS `list` op**:NDJSON `{"sessions":["<id>",...]}`(列 wired slot 的 session id)。OOM 返 null。
+fn udsList(ctx: *anyopaque, allocator: std.mem.Allocator) ?[]u8 {
+    const md: *MultiDaemon = @ptrCast(@alignCast(ctx));
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    buf.appendSlice(allocator, "{\"sessions\":[") catch return null;
+    var first = true;
+    for (md.slots) |*slot| {
+        if (!slot.wired) continue;
+        if (!first) buf.appendSlice(allocator, ",") catch return null;
+        first = false;
+        buf.appendSlice(allocator, "\"") catch return null;
+        buf.appendSlice(allocator, slot.app.session_id.asSlice()) catch return null; // 24 hex,无需转义
+        buf.appendSlice(allocator, "\"") catch return null;
+    }
+    buf.appendSlice(allocator, "]}") catch return null;
+    return buf.toOwnedSlice(allocator) catch null;
+}
+
 /// 跑 daemon(静态 N session)直到 SIGINT。返回进程退出码。app0=main 预建 app(作 slot[0])。
 /// config 用 anytype(避免 daemon 层依赖 types.Config 具体形状;App.init 按值接收)。
-pub fn serveMulti(app0: *app_mod.App, allocator: std.mem.Allocator, config: anytype, api_key: []const u8, port: u16, n: usize) !u8 {
+/// uds_path 非 null → 附加一条 UDS+NDJSON 绑定(U10-B,与 web 并存,同 registry)。
+pub fn serveMulti(app0: *app_mod.App, allocator: std.mem.Allocator, config: anytype, api_key: []const u8, port: u16, n: usize, uds_path: ?[]const u8) !u8 {
     _ = allocator; // 每 App 用自己的 arena;daemon 基建用 c_allocator(跨线程)
     std.debug.assert(n >= 1);
     const web_alloc = std.heap.c_allocator;
@@ -255,14 +276,33 @@ pub fn serveMulti(app0: *app_mod.App, allocator: std.mem.Allocator, config: anyt
     std.debug.print("metacodes daemon ({d} sessions): http://127.0.0.1:{d}  (Ctrl+C to quit)\n", .{ n, srv.port });
     log.info("daemon", "serve-multi listening on 127.0.0.1:{d} ({d} sessions)", .{ srv.port, n });
 
+    // ── 可选 UDS+NDJSON 绑定(U10-B,与 web 共享 registry/resolver)────────────────
+    const uds: ?*UdsServer = if (uds_path) |p| blk: {
+        const u = UdsServer.start(web_alloc, p, .{
+            .allocator = web_alloc,
+            .resolver = &resolveSession,
+            .resolver_ctx = @ptrCast(&md),
+            .list_fn = &udsList,
+            .list_ctx = @ptrCast(&md),
+        }) catch |err| {
+            // UDS 起不来(路径太长/权限)不致命:web 仍服务,记 warn 继续。
+            log.warn("daemon", "UDS bind {s} failed: {s}; web-only", .{ p, @errorName(err) });
+            break :blk null;
+        };
+        std.debug.print("metacodes daemon UDS: {s}\n", .{p});
+        log.info("daemon", "serve-multi UDS listening on {s}", .{p});
+        break :blk u;
+    } else null;
+
     // ── 主循环:poll 进程级停机 ────────────────────────────────────────────────
     while (!shutdown.requested()) time.sleepMs(50);
 
     // ── 关停(显式顺序,非 defer)──────────────────────────────────────────────
     // ① 每 slot journal.close(唤醒该 session 的 SSE waitSince)。
     for (md.slots) |*slot| slot.host.journal.close();
-    // ② transport 停(HTTP 线程不再碰任何 host)。
+    // ② transport 停(HTTP + UDS 线程不再碰任何 host)。journal 已 close → attach/SSE 流被唤醒收尾。
     srv.stop();
+    if (uds) |u| u.stop();
     // ③ 每 slot lifecycle.closed(journal 已 close,append 仍记 seq 供已连 SSE 收尾)。
     for (md.slots) |*slot| web_session.journalSessionLifecycle(&slot.host.journal, web_alloc, .{ .closed = slot.app.session_id.asSlice() });
     // ④ reg.shutdownAll:join 所有 driver(driver 停止用各自 app)+ 释放 host.journal/inbox。

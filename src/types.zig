@@ -46,6 +46,9 @@ pub const Config = struct {
     /// >1 → serveMulti(N 个独立 App/journal/driver,WebServer resolver 按 /s/<id>/* 路由)。静态 N,
     /// 无 dynamic create/destroy(见 doc/U9_U10_DAEMON_TIER_DESIGN.md §4/§5)。
     serve_sessions: usize = 1,
+    /// **U10-B:`serve --uds <path>`**:daemon 附加一条 UDS+NDJSON 本地绑定(gui/语音 UI 首选,与 web
+    /// 并存)。非 null 即启用(强制走 serveMulti,即便 N=1)。POSIX only(Windows 走 web)。null=不启用。
+    uds_path: ?[]const u8 = null,
     /// **U8:`--resume-response <json|@file>`**:恢复一个挂起(suspend.json)的 session。
     /// 值 = 挂起工具(AskUserQuestion/ExitPlanMode/custom)的迟来结果 JSON(`@path` 从文件读)。
     /// 走 headless.resumeSuspended(read suspend.json→resumeRun→清/重写)。需同 session_id

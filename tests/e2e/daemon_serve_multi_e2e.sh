@@ -32,9 +32,10 @@ http.server.ThreadingHTTPServer.allow_reuse_address=True
 http.server.ThreadingHTTPServer(("127.0.0.1",int(sys.argv[1])),H).serve_forever()
 PY
 
+usock="$TMP/daemon.sock"
 python3 "$TMP/mock.py" $mport & mpid=$!
 sleep 1
-NO_PROBE=1 METACODES_NO_PROBE=1 "$BIN" serve $dport --sessions 2 --api-key test --base-url "http://127.0.0.1:$mport" >"$out" 2>&1 & dpid=$!
+NO_PROBE=1 METACODES_NO_PROBE=1 "$BIN" serve $dport --sessions 2 --uds "$usock" --api-key test --base-url "http://127.0.0.1:$mport" >"$out" 2>&1 & dpid=$!
 sleep 2
 
 grep -q "daemon.*http://127.0.0.1:$dport" "$out" || { echo "FAIL: daemon 未监听"; cat "$out"; exit 1; }
@@ -80,6 +81,46 @@ echo "$ackB" | grep -q '"ok":true' || { echo "FAIL: /s/$B/message 未接受: $ac
 evB2=$(curl -s --max-time 3 "http://127.0.0.1:$dport/s/$B/events")
 echo "$evB2" | grep -q "DAEMON_OK" || { echo "FAIL: B 发消息后仍无生成(B driver 死?)"; echo "$evB2"; exit 1; }
 
+# U10-B:UDS+NDJSON 绑定(与 web 共享 registry)。此时 A/B 均已跑完 → 空闲。
+[ -S "$usock" ] || { echo "FAIL: UDS socket 未创建: $usock"; cat "$out"; exit 1; }
+uds_out=$(python3 - "$usock" "$A" "$B" <<'PY'
+import socket, sys, json
+path, A, B = sys.argv[1], sys.argv[2], sys.argv[3]
+def req(obj):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(path)
+    s.sendall((json.dumps(obj)+"\n").encode()); s.settimeout(3)
+    try: data = s.recv(65536).decode()
+    except socket.timeout: data = ""
+    s.close(); return data
+# list：两个 session id 都在
+lst = req({"op":"list"})
+assert A in lst and B in lst, "list 缺 session id: "+lst
+# 未知 session → 错误(路由隔离)
+unk = req({"op":"message","session":"deadbeefdeadbeefdeadbeef","text":"x"})
+assert '"ok":false' in unk and "unknown session" in unk, "未知 session 未拒: "+unk
+# 空闲期 interrupt B → generating 门挡(not generating)
+it = req({"op":"interrupt","session":B})
+assert '"ok":false' in it and "not generating" in it, "interrupt 门(S1)失效: "+it
+# message via UDS 到 A → ok:true
+m = req({"op":"message","session":A,"text":"uds-hello"})
+assert '"ok":true' in m, "UDS message 未接受: "+m
+# attach A since=0 → 流式回放 journal(含既有 DAEMON_OK),证 attach streaming 工作
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(path)
+s.sendall((json.dumps({"op":"attach","session":A,"since":0})+"\n").encode()); s.settimeout(4)
+buf=""
+try:
+    while "DAEMON_OK" not in buf:
+        d = s.recv(65536)
+        if not d: break
+        buf += d.decode()
+except socket.timeout: pass
+s.close()
+assert "DAEMON_OK" in buf, "UDS attach 流无 DAEMON_OK: "+buf[:200]
+print("UDS_OK")
+PY
+) || { echo "FAIL: UDS 检查异常"; echo "$uds_out"; exit 1; }
+echo "$uds_out" | grep -q "UDS_OK" || { echo "FAIL: UDS+NDJSON 检查未过: $uds_out"; exit 1; }
+
 # SIGINT → 两 driver 优雅 join,退出码 0。
 kill -INT $dpid
 for i in $(seq 1 60); do kill -0 $dpid 2>/dev/null || break; sleep 0.1; done
@@ -88,4 +129,4 @@ wait $dpid; rc=$?
 [ "$rc" = 0 ] || { echo "FAIL: daemon 退出码 $rc(非 0)"; exit 1; }
 grep -q "daemon closed" "$out" || { echo "FAIL: 无 'daemon closed'"; exit 1; }
 
-echo "PASS: serve-multi e2e — 2 session 路由隔离 + 未知 404 + 双 driver 并发 + SIGINT 优雅关停"
+echo "PASS: serve-multi e2e — 2 session 路由隔离 + 未知 404 + 双 driver 并发 + UDS(list/message/attach/interrupt门) + SIGINT 优雅关停"

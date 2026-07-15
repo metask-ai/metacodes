@@ -163,6 +163,65 @@ pub fn connectLoopback(port: u16) Error!Socket {
     return s;
 }
 
+// ============================================================================
+// UDS(Unix domain socket)—— **POSIX only**(U10-B 本地绑定;设计:Windows 走 web 绑定)。
+// 复用 acceptConn/recv/send/closeSocket/set*Timeout(POSIX 下 UDS fd 与 TCP fd 同接口)。
+// ============================================================================
+
+/// sun_path 上限(macOS 104,含结尾 NUL)。超限 path 直接 BindFailed。
+const SUN_PATH_MAX = 104;
+
+// path([]const u8)→ 栈上 NUL 结尾 C 串(unlink/chmod 用)。越界返 null。
+fn pathZ(path: []const u8, buf: *[SUN_PATH_MAX + 1]u8) ?[*:0]const u8 {
+    if (path.len == 0 or path.len >= SUN_PATH_MAX) return null;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    return @ptrCast(buf);
+}
+
+fn unixAddr(path: []const u8) std.c.sockaddr.un {
+    var addr = std.c.sockaddr.un{ .family = std.c.AF.UNIX, .path = undefined };
+    @memset(&addr.path, 0);
+    @memcpy(addr.path[0..path.len], path);
+    return addr;
+}
+
+/// 绑 UDS <path>:unlink 陈旧文件 → socket → bind → chmod 0600(文件权限即鉴权,仅属主可连)→ listen。
+/// **POSIX only**——Windows 直接 SocketFailed(comptime gate,不编译 posix 分支)。
+pub fn listenUnix(path: []const u8, backlog: u31) Error!Socket {
+    if (is_windows) return error.SocketFailed;
+    var zbuf: [SUN_PATH_MAX + 1]u8 = undefined;
+    const pz = pathZ(path, &zbuf) orelse return error.BindFailed;
+    _ = std.c.unlink(pz); // best-effort 清陈旧 socket(存在则 bind EADDRINUSE)
+    const s = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+    if (!isValid(s)) return error.SocketFailed;
+    errdefer closeSocket(s);
+    var addr = unixAddr(path);
+    if (std.c.bind(s, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) < 0) return error.BindFailed;
+    _ = std.c.chmod(pz, 0o600); // 鉴权:仅属主可连(best-effort)
+    if (std.c.listen(s, backlog) < 0) return error.ListenFailed;
+    return s;
+}
+
+/// 连 UDS <path>(POSIX only)。测试/客户端用。
+pub fn connectUnix(path: []const u8) Error!Socket {
+    if (is_windows) return error.ConnectFailed;
+    if (path.len == 0 or path.len >= SUN_PATH_MAX) return error.ConnectFailed;
+    const s = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+    if (!isValid(s)) return error.SocketFailed;
+    errdefer closeSocket(s);
+    var addr = unixAddr(path);
+    if (std.c.connect(s, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) < 0) return error.ConnectFailed;
+    return s;
+}
+
+/// unlink 一个 UDS path(关停时清 socket 文件)。best-effort。
+pub fn unlinkUnixPath(path: []const u8) void {
+    var zbuf: [SUN_PATH_MAX + 1]u8 = undefined;
+    const pz = pathZ(path, &zbuf) orelse return;
+    _ = std.c.unlink(pz);
+}
+
 /// 收。返回读到字节数;0=对端关闭;<0=错误(含超时)。语义同 POSIX read。
 pub fn recv(s: Socket, buf: []u8) isize {
     if (is_windows) {
@@ -250,6 +309,35 @@ test "loopback listen/connect/send/recv roundtrip" {
     var buf: [16]u8 = undefined;
     const n = recv(conn, &buf);
     try testing.expectEqual(@as(isize, 4), n);
+    try testing.expectEqualSlices(u8, msg, buf[0..@intCast(n)]);
+}
+
+test "UDS listen/connect/send/recv roundtrip(POSIX)" {
+    if (is_windows) return; // UDS 仅 POSIX(此早退不影响 windows 分析:上面 pub fn 已被 acceptConn 等引用)
+    // 唯一 path,避免并发测试撞(用 nanoTimestamp 低位)。
+    var pbuf: [64]u8 = undefined;
+    const ts: u64 = @bitCast(std.time.nanoTimestamp());
+    const path = try std.fmt.bufPrint(&pbuf, "/tmp/cc-zig-uds-test-{x}.sock", .{ts & 0xffffffff});
+
+    const listener = listenUnix(path, 4) catch |e| {
+        std.debug.print("listenUnix failed: {s}\n", .{@errorName(e)});
+        return e;
+    };
+    defer {
+        closeSocket(listener);
+        unlinkUnixPath(path);
+    }
+
+    const client = try connectUnix(path);
+    defer closeSocket(client);
+    const conn = acceptConn(listener) orelse return error.AcceptFailed;
+    defer closeSocket(conn);
+
+    const msg = "ndjson\n";
+    try testing.expectEqual(@as(isize, msg.len), send(client, msg));
+    var buf: [32]u8 = undefined;
+    const n = recv(conn, &buf);
+    try testing.expectEqual(@as(isize, msg.len), n);
     try testing.expectEqualSlices(u8, msg, buf[0..@intCast(n)]);
 }
 

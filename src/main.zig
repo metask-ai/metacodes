@@ -312,8 +312,9 @@ pub fn main(init: std.process.Init) !void {
     // U10-D:`serve [port]` daemon 模式 → 经 registry/host/app_driver 跑 session,SIGINT 优雅关停。
     // --sessions N>1 → serveMulti(N 个独立 session,WebServer resolver 按 /s/<id>/* 路由,U10-C)。
     if (config.serve_port) |port| {
-        if (config.serve_sessions > 1) {
-            const code = @import("daemon/serve_multi.zig").serveMulti(app, allocator, config, api_key, port, config.serve_sessions) catch |err| blk: {
+        // serve-multi 路径:N>1(多 session)或设了 --uds(附加 UDS 绑定,即便 N=1)。
+        if (config.serve_sessions > 1 or config.uds_path != null) {
+            const code = @import("daemon/serve_multi.zig").serveMulti(app, allocator, config, api_key, port, config.serve_sessions, config.uds_path) catch |err| blk: {
                 log.err("daemon", "serve-multi failed: {s}", .{@errorName(err)});
                 break :blk @as(u8, 1);
             };
@@ -842,6 +843,9 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
                 config.serve_sessions = std.fmt.parseInt(usize, v, 10) catch 1;
                 if (config.serve_sessions < 1) config.serve_sessions = 1;
             }
+        } else if (std.mem.eql(u8, arg, "--uds")) {
+            // U10-B:daemon 附加 UDS+NDJSON 绑定(路径)。设置即启用(强制走 serveMulti)。
+            if (args.next()) |v| config.uds_path = allocator.dupe(u8, v) catch null;
         } else if (std.mem.eql(u8, arg, "--resume-response")) {
             // U8:值 = 迟来结果 JSON;`@path` 前缀从文件读(大结果/含引号免 shell 转义)。
             if (args.next()) |v| {
@@ -1062,5 +1066,6 @@ test {
     _ = &@import("daemon/app_driver.zig"); // U10-D:强制编译分析(否则死代码藏编译错)
     _ = &@import("daemon/serve.zig"); // U10-D
     _ = &@import("daemon/serve_multi.zig"); // U10-C:强制编译分析(否则死代码藏编译错)
+    _ = &@import("daemon/uds.zig"); // U10-B:UDS+NDJSON 绑定
     _ = &@import("core/shutdown.zig");
 }
