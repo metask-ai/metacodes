@@ -18,6 +18,7 @@ pub const VERSION = "0.1.0";
 
 // ── 引擎 ─────────────────────────────────────────────────────────────────
 pub const agent_loop = @import("core/agent_loop.zig"); // run(), Options, RunResult, StopReason
+pub const agent_session = @import("core/agent_session.zig");
 pub const conversation = @import("core/conversation.zig");
 pub const compact_summary = @import("core/compact_summary.zig");
 pub const message = @import("core/message.zig");
