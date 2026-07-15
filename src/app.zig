@@ -145,6 +145,9 @@ pub const App = struct {
     jobs: ?JobRegistry = null,
     /// 后台 subagent 作业注册表（Task run_in_background）。失败初始化则 null。
     agent_jobs: ?@import("core/agent_job_registry.zig").AgentJobRegistry = null,
+    /// Swarm 会话状态（teams/teammates）。lead(主 App)持有;TeamCreate 时惰性建 teammates
+    /// registry。teammate 不 spawn teammate → subagent 侧不挂 swarm。
+    swarm: @import("swarm/context.zig").SwarmContext = undefined,
     /// 进入 plan 模式前的原 mode；ExitPlanMode 用它恢复
     plan_prev_mode: ?types.PermissionMode = null,
     /// 当前 session 的 plan 文件全路径(`{home}/.metacodes/plans/{slug}.md`,owned)。
@@ -305,7 +308,10 @@ pub const App = struct {
         // 先构造一次拿到全部工具名（含动态），据此建 PromptContext，再带 context 重建——
         // 让核心工具拿到动态长描述（对应 cc tool.prompt(ctx)）。
         // arena allocator：第一次的临时 defs 随 session 释放，不单独 free。
-        const probe_defs = try tools_mod.toToolDefinitionsWithDyn(allocator, &app.dyn_registry);
+        // probe pass 用 teams-aware bootstrap ctx,让 enabled_names 与最终 tool_defs 的
+        // swarm 门控一致(否则 --agent-teams 开时 "Using your tools" 段漏列 swarm 工具)。
+        const probe_ctx = tools_mod.PromptContext{ .agent_teams = config.agent_teams };
+        const probe_defs = try tools_mod.toToolDefinitionsFull(allocator, &app.dyn_registry, &probe_ctx);
         const enabled_names = try allocator.alloc([]const u8, probe_defs.len);
         for (probe_defs, 0..) |d, i| enabled_names[i] = d.name;
         app.enabled_tool_names = enabled_names;
@@ -315,6 +321,7 @@ pub const App = struct {
             .enabled_tool_names = enabled_names,
             .agent_type = "", // 主对话
             .include_git = true,
+            .agent_teams = config.agent_teams, // F5:门控 swarm 工具进 tool_defs
         };
         app.tool_defs = try tools_mod.toToolDefinitionsFull(allocator, &app.dyn_registry, &prompt_ctx);
         errdefer allocator.free(app.tool_defs);
@@ -382,6 +389,18 @@ pub const App = struct {
         app.agent_jobs = @import("core/agent_job_registry.zig").AgentJobRegistry.init(allocator, app.api_key, config.base_url, app.config.model, app.config.provider_kind) catch |err| blk: {
             @import("util/log.zig").warn("agent", "agent_jobs registry init failed: {s}", .{@errorName(err)});
             break :blk null;
+        };
+
+        // Swarm 会话状态(lead 视角)。teammates registry 惰性(TeamCreate 才建);此处只装
+        // 构造参数 + home。api_key/base_url/model 借 App 生命周期稳定内存(App 存活期不变)。
+        app.swarm = .{
+            .allocator = allocator,
+            .home = app.homeDir(),
+            .api_key = app.api_key,
+            .base_url = config.base_url,
+            .model = app.config.model,
+            .provider_kind = app.config.provider_kind,
+            .out_of_process = config.teammate_out_of_process, // SW6:--teammate-mode process
         };
 
         // LSP 被动诊断服务(Y2;仅 --lsp)。best-effort:创建失败仅 log,不阻断启动。
@@ -461,6 +480,8 @@ pub const App = struct {
         // 必须早于任何共享资源（agents/dyn_registry/skills/allocator）释放，
         // 否则在跑的后台线程会触碰已释放内存（UAF）。job 用专属 Client，不依赖 api_client。
         if (app.agent_jobs) |*aj| aj.deinit();
+        // Swarm:abort+join 全 teammate → free（必须早于共享资源释放，同 agent_jobs 理由）。
+        app.swarm.deinit();
         if (app.transcript_writer) |*w| w.deinit();
         app.api_client.deinit();
         if (app.oauth_token_for_catalog) |tok| {

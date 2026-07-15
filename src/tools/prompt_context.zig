@@ -19,6 +19,10 @@ pub const PromptContext = struct {
     agent_type: []const u8 = "",
     /// 是否在 Bash 描述里包含 Git 协议段(对应 TS shouldIncludeGitInstructions)。
     include_git: bool = true,
+    /// Swarm(teams/teammates)是否启用(--agent-teams)。false 时 TeamCreate/TeamDelete/
+    /// SendMessage 不进 advertised tool_defs——避免污染单 agent 会话的工具菜单(对齐 cc
+    /// agentSwarmsEnabled 门,Linus/PM SW2 F5)。
+    agent_teams: bool = false,
 
     /// 便利:某工具名是否在当前启用集里。
     pub fn hasTool(self: *const PromptContext, name: []const u8) bool {

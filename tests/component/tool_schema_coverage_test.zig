@@ -71,6 +71,7 @@ test "L2 端到端: 序列化请求体里每个有 required 的工具 properties
     // 对每个 registry 工具:若有 required 字段,其在请求体里的字段定义必须出现为
     // `"<field>":{"type":` 形态(证明 properties 不是空 {} 且字段带类型)。
     for (tools.registry) |entry| {
+        if (entry.swarm_gated) continue; // swarm 工具仅 --agent-teams 时进 body(此处默认 off)
         const required = entry.input_schema.required orelse continue;
         if (required.len == 0) continue;
         for (required) |field| {

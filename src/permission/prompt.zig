@@ -24,6 +24,11 @@ pub fn ask(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bo
         if (sr.isDenied(tool_name)) return false;
     }
 
+    // Swarm teammate:非交互强制拒(PM SW4 3c)——无 ui_requester 时**绝不读 fd 0**(teammate
+    // 线程与 lead REPL 共享 fd 0,isatty(0) 为真会争抢/卡死)。有 ui_requester(SW7 权限代理)则
+    // 正常走下面的 runner 路径。fail-closed:模型据工具错经 SendMessage 请 lead 代办。
+    if (ctx.no_interactive_prompt and ctx.ui_requester == null) return false;
+
     // 预置应答队列曾加载(Stage 3 e2e)→ 强制走文字路径(askText 从队列弹/耗尽则
     // 安全默认 deny,**绝不**退回读 fd 0——它被 REPL 行流独占,会死等)。
     if (@import("../core/answer_queue.zig").wasLoaded()) {
@@ -126,4 +131,14 @@ fn askText(tool_name: []const u8, args: []const u8) !bool {
 }
 
 // session 记忆的单测在 session_rules.zig;ask 的真链路(answer_queue → ask → askText)
-// 在 tests/component/answer_queue_test.zig 覆盖。本模块不再放占位测试。
+// 在 tests/component/answer_queue_test.zig 覆盖。
+
+test "no_interactive_prompt: 无 ui_requester 时 .ask 直接 deny(绝不读 fd 0,PM SW4 3c)" {
+    const testing = std.testing;
+    // teammate 场景:no_interactive_prompt=true + ui_requester=null → ask 必 return false,
+    // 不落 askText 读 fd 0(此测试在无 tty/CI 环境跑,若真读 fd 0 会 hang/EOF)。
+    var ctx = PermissionContext{ .allocator = testing.allocator, .no_interactive_prompt = true };
+    ctx.setMode(.default);
+    const allowed = try ask(&ctx, "Write", "{\"file_path\":\"/x\"}");
+    try testing.expect(!allowed); // fail-closed deny
+}

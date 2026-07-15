@@ -143,6 +143,10 @@ pub const ToolContext = struct {
     /// LSP 被动诊断服务(Y2 Step3):Edit/Write finalizeWrite 写前 snapshotBaseline + 写后
     /// getDiagnostics,把类型诊断 delta 附进工具结果给模型。null = 未开(默认;--lsp 才开)。
     lsp: ?*@import("../lsp/service.zig").Service = null,
+    /// Swarm 会话状态(teams/teammates):TeamCreate/TeamDelete/SendMessage + Task 的
+    /// name+team_name spawn 分支用。null = 非 swarm-enabled 上下文(subagent/headless 恒 null:
+    /// teammate 不 spawn teammate,扁平 roster)。见 swarm/context.zig。
+    swarm: ?*@import("../swarm/context.zig").SwarmContext = null,
     /// Bash 后台作业注册表：run_in_background + BashOutput + KillShell 用
     jobs: ?*JobRegistry = null,
     /// 后台 subagent 作业注册表：Task(run_in_background) + TaskOutput + TaskStop(agent_ id) 用

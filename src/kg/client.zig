@@ -243,6 +243,24 @@ pub const KgClient = struct {
         };
     }
 
+    /// 为工作线程克隆一个独立 KgClient(同 store/domain/bin,但**独立 allocator**)。
+    /// 用途(Linus SW3 H1):swarm teammate 各线程定时 poll frontier/claim,共享一个 client 会在
+    /// **非线程安全的 App arena** 上并发 alloc/free(runRaw dupeZ + frontier 行解析都在 self.allocator
+    /// 外锁)→ 堆损坏。每线程一个 c_allocator 客户端隔离 arena;tinykg 的 store-dir 锁仍串行化跨
+    /// 客户端的执行,数据一致。self 的 store_path/domain/bin_path init 后不可变,并发读安全。
+    /// 返回的 client 由调用线程 own(deinit 释放);未 ensureReady——调用方自行 ensureReady。
+    pub fn cloneForThread(self: *const KgClient, allocator: std.mem.Allocator, home: []const u8) !KgClient {
+        return KgClient.init(allocator, .{
+            .home = home,
+            .domain = self.domain,
+            .config_bin = self.bin_path,
+            .config_store = self.store_path,
+            .env_bin = "", // 屏蔽 env 重解析,直接用 self 已解析的路径
+            .env_store = "",
+            .env_dev = "",
+        });
+    }
+
     /// 登记一个产出待确认分类的任务(发现面)。best-effort：OOM 静默丢(提示不是关键路径)。
     /// cache_mu 保护(多 subagent 线程共享 client)。
     pub fn notePendingRefTask(self: *KgClient, task_node: u64) void {

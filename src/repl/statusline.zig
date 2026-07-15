@@ -35,15 +35,21 @@ pub fn render(app: *const app_mod.App) void {
     const bg_count = if (app.jobs) |*j| j.runningCount() else 0;
     const cron_count = app.cron_registry.count();
 
-    var extra_buf: [64]u8 = undefined;
+    var extra_buf: [96]u8 = undefined;
     var extra: []const u8 = "";
+    var jb: [40]u8 = undefined;
+    var jobs_seg: []const u8 = "";
     if (bg_count > 0 and cron_count > 0) {
-        extra = std.fmt.bufPrint(&extra_buf, " | {d}bg | {d}cron", .{ bg_count, cron_count }) catch "";
+        jobs_seg = std.fmt.bufPrint(&jb, " | {d}bg | {d}cron", .{ bg_count, cron_count }) catch "";
     } else if (bg_count > 0) {
-        extra = std.fmt.bufPrint(&extra_buf, " | {d}bg", .{bg_count}) catch "";
+        jobs_seg = std.fmt.bufPrint(&jb, " | {d}bg", .{bg_count}) catch "";
     } else if (cron_count > 0) {
-        extra = std.fmt.bufPrint(&extra_buf, " | {d}cron", .{cron_count}) catch "";
+        jobs_seg = std.fmt.bufPrint(&jb, " | {d}cron", .{cron_count}) catch "";
     }
+    // SW5:有 team 时显示 roster 段(N 活着,M 忙)。计数排除已终止尸体(误导 8👥 0⚙)。
+    var tb: [40]u8 = undefined;
+    const team_seg = teamSegmentFor(app.swarm.teammates, &tb);
+    extra = std.fmt.bufPrint(&extra_buf, "{s}{s}", .{ jobs_seg, team_seg }) catch jobs_seg;
 
     // 一次性拼接成一行(theme.dim + 内容 + reset + 换行)再写
     const th = app.theme;
@@ -58,6 +64,22 @@ pub fn render(app: *const app_mod.App) void {
         th.reset,
     }) catch return; // 超 buf 截断:静默跳过渲染
     writeAll(2, line);
+}
+
+/// SW5:roster 状态段(纯函数,可测)。`" | 3👥 2⚙"` = 3 活着,2 在忙。
+/// total=0 → 空段(无 team 不显示)。
+pub fn swarmSegment(buf: []u8, total: usize, working: usize) []const u8 {
+    if (total == 0) return "";
+    return std.fmt.bufPrint(buf, " | {d}\u{1F465} {d}\u{2699}", .{ total, working }) catch "";
+}
+
+/// render 的 roster 段接线(可测):无 registry / 无活着队友 → 空;否则 liveCount👥 workingCount⚙。
+/// teammates 是 ?*Registry(const 浅层),值捕获即拿到可用指针,无需 @constCast。
+pub fn teamSegmentFor(teammates: ?*@import("../swarm/teammate.zig").TeammateRegistry, buf: []u8) []const u8 {
+    const reg = teammates orelse return "";
+    const live = reg.liveCount();
+    if (live == 0) return "";
+    return swarmSegment(buf, live, reg.workingCount());
 }
 
 /// 循环写入直到完成或 write 返 0/错误。保证不短写造成行混乱。
@@ -91,4 +113,34 @@ test "formatTokens ranges" {
     try std.testing.expectEqualStrings("1.0K", formatTokens(&buf, 1000));
     try std.testing.expectEqualStrings("12.3K", formatTokens(&buf, 12345));
     try std.testing.expectEqualStrings("1.23M", formatTokens(&buf, 1_234_567));
+}
+
+test "swarmSegment: 有 team 显示 roster 段;空 team 空段" {
+    var buf: [40]u8 = undefined;
+    const seg = swarmSegment(&buf, 3, 2);
+    try std.testing.expect(std.mem.indexOf(u8, seg, "3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seg, "2") != null);
+    try std.testing.expectEqualStrings("", swarmSegment(&buf, 0, 0));
+}
+
+test "teamSegmentFor: 接线路径(真 registry + 假 entry)渲染 roster 段" {
+    const TeammateRegistry = @import("../swarm/teammate.zig").TeammateRegistry;
+    var buf: [40]u8 = undefined;
+    // 无 registry → 空。
+    try std.testing.expectEqualStrings("", teamSegmentFor(null, &buf));
+    // 有 registry 但无队友 → 空。
+    var reg = try TeammateRegistry.init(std.testing.allocator, "k", null, "m", .anthropic, "/tmp");
+    defer reg.deinit();
+    try std.testing.expectEqualStrings("", teamSegmentFor(&reg, &buf));
+    // 2 队友(1 working + 1 idle)→ 段显示 "2👥 1⚙"。
+    try reg.pushTestEntry("alice", .working);
+    try reg.pushTestEntry("bob", .idle);
+    const seg = teamSegmentFor(&reg, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, seg, "2") != null); // 2 live
+    try std.testing.expect(std.mem.indexOf(u8, seg, "1") != null); // 1 working
+    try std.testing.expect(std.mem.indexOf(u8, seg, "\u{1F465}") != null); // 👥
+    // terminated 尸体不计入 live。
+    try reg.pushTestEntry("dead", .terminated);
+    const seg2 = teamSegmentFor(&reg, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, seg2, "2") != null); // 仍 2 live(dead 不算)
 }

@@ -227,6 +227,9 @@ pub const Options = struct {
     jobs: ?*@import("job_registry.zig").JobRegistry = null,
     /// 后台 subagent 作业注册表（Task run_in_background + TaskOutput + TaskStop agent_ 分流用）
     agent_jobs: ?*@import("agent_job_registry.zig").AgentJobRegistry = null,
+    /// Swarm 会话状态（TeamCreate/TeamDelete/SendMessage + Task name+team_name spawn）。
+    /// null = 非 lead 上下文（subagent/headless）。透传进 base_ctx.swarm。
+    swarm: ?*@import("../swarm/context.zig").SwarmContext = null,
     /// Plan mode 前的原始 mode 存储；EnterPlanMode/ExitPlanMode 用
     plan_prev_mode: ?*?types.PermissionMode = null,
     /// 模型 Task 清单（TaskCreate/Get/List/Update/Stop 共享）
@@ -502,10 +505,15 @@ pub fn run(
         var sys_prompt_owned: ?[]u8 = null;
         defer if (sys_prompt_owned) |p| allocator.free(p);
         const effective_system_prompt: ?[]const u8 = blk: {
-            if (permission_ctx.modeValue() != .plan) break :blk opts.system_prompt;
-            const plan_mode = @import("../tools/plan_mode.zig");
+            const in_plan = permission_ctx.modeValue() == .plan;
+            // swarm 纪律:有 team 时追加 addendum(裸文本对 teammate 不可见,必须用 SendMessage;
+            // 对齐 cc teammate addendum,Linus/PM SW2 F3)。lead 与 teammate 都注入。
+            const in_swarm = if (opts.swarm) |s| s.hasTeam() else false;
+            if (!in_plan and !in_swarm) break :blk opts.system_prompt;
             const base = opts.system_prompt orelse "";
-            sys_prompt_owned = std.fmt.allocPrint(allocator, "{s}\n\n# Plan Mode (active)\n{s}", .{ base, plan_mode.PLAN_MODE_INSTRUCTIONS }) catch null;
+            const plan_seg = if (in_plan) "\n\n# Plan Mode (active)\n" ++ @import("../tools/plan_mode.zig").PLAN_MODE_INSTRUCTIONS else "";
+            const swarm_seg = if (in_swarm) "\n\n" ++ @import("../swarm/tools.zig").SWARM_ADDENDUM else "";
+            sys_prompt_owned = std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ base, plan_seg, swarm_seg }) catch null;
             break :blk if (sys_prompt_owned) |p| p else opts.system_prompt;
         };
 
@@ -1051,6 +1059,7 @@ pub fn run(
             .lsp = opts.lsp,
             .jobs = opts.jobs,
             .agent_jobs = opts.agent_jobs,
+            .swarm = opts.swarm,
             .permission_ctx = @constCast(permission_ctx),
             .plan_prev_mode = opts.plan_prev_mode,
             .tasks = opts.tasks,

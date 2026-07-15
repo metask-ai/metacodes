@@ -50,6 +50,7 @@ pub fn run(
             .lsp = app.lsp_service, // Y2:headless 也接 LSP 诊断
             .jobs = jobs_ptr,
             .agent_jobs = if (app.agent_jobs) |*aj| aj else null,
+            .swarm = &app.swarm, // SW7:headless 也接 swarm(TeamCreate/Task(name)/SendMessage 可用)
             .plan_prev_mode = &app.plan_prev_mode,
             .tasks = &app.tasks,
             .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs,

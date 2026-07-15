@@ -11,6 +11,7 @@ const bash_tool = @import("tools/bash.zig");
 const grep_tool = @import("tools/grep.zig");
 const bash_output_tool = @import("tools/bash_output.zig");
 const task_output_tool = @import("tools/task_output.zig");
+const swarm_tools = @import("swarm/tools.zig");
 const kill_shell_tool = @import("tools/kill_shell.zig");
 const monitor_tool = @import("tools/monitor.zig");
 const notebook_edit_tool = @import("tools/notebook_edit.zig");
@@ -62,6 +63,9 @@ pub const ToolEntry = struct {
     /// 用户可见名(对齐 cc userFacingName):TUI 工具卡标题用它而非 registry 名。
     /// null = 用 name。如 WebSearch → "Web Search"(带空格)。
     display_name: ?[]const u8 = null,
+    /// Swarm 门控工具(TeamCreate/TeamDelete/SendMessage):仅 --agent-teams 时进 advertised
+    /// tool_defs(F5)。默认 false=常规工具不受门控。
+    swarm_gated: bool = false,
 };
 
 pub const registry: []const ToolEntry = &.{
@@ -437,6 +441,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "max_turns", .type = "integer", .description = "Max agent loop turns" },
             .{ .name = "model", .type = "string", .description = "Model override for the subagent" },
             .{ .name = "run_in_background", .type = "boolean", .description = "Run async; returns agent_job_id immediately" },
+            .{ .name = "name", .type = "string", .description = "Spawn a persistent teammate with this name (requires an active team via TeamCreate) instead of a one-shot subagent. The teammate joins the team, works, then idles waiting for SendMessage." },
         }, .required = &.{"prompt"} },
         .execute = agent_tool.execute,
     },
@@ -486,6 +491,36 @@ pub const registry: []const ToolEntry = &.{
         }, .required = &.{"query"} },
         .execute = web_search_tool.execute,
         .display_name = "Web Search",
+    },
+    // ── Swarm(teams/teammates)。仅在 swarm-enabled(TUI lead)上下文注册;subagent/headless
+    //    的 ToolContext.swarm=null → execute 返 SwarmUnavailable。deferred=false(lead 常驻)。
+    .{
+        .name = "TeamCreate",
+        .description = "Create a team so you can delegate work to teammate agents that run in parallel and coordinate through a shared task list and mailbox. You become the team lead (not a teammate). One team per lead. After creating a team, spawn a teammate by calling the Task tool with a `name` argument (the team is implicit — one team per lead), then talk to teammates with SendMessage. Args: name (team name), description (optional).",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "name", .type = "string", .description = "Team name" },
+            .{ .name = "description", .type = "string", .description = "Optional team description" },
+        }, .required = &.{"name"} },
+        .execute = swarm_tools.executeTeamCreate,
+        .swarm_gated = true,
+    },
+    .{
+        .name = "TeamDelete",
+        .description = "Delete the current team and clean up its directory. Refuses while any teammate is still active — shut teammates down first (SendMessage a shutdown request and wait for approval). Takes no arguments.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{}, .required = &.{} },
+        .execute = swarm_tools.executeTeamDelete,
+        .swarm_gated = true,
+    },
+    .{
+        .name = "SendMessage",
+        .description = "Send a message to a teammate (or the team lead). Plain prose is delivered to the recipient's mailbox and injected into their turn. Args: to (teammate name, or \"*\" to broadcast to all teammates), message (the text), summary (optional 5-10 word preview). Your plain assistant text is NOT visible to teammates — you MUST use this tool to communicate with them.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "to", .type = "string", .description = "Recipient teammate name, or \"*\" to broadcast" },
+            .{ .name = "message", .type = "string", .description = "The message text" },
+            .{ .name = "summary", .type = "string", .description = "Optional 5-10 word preview shown in the UI" },
+        }, .required = &.{ "to", "message" } },
+        .execute = swarm_tools.executeSendMessage,
+        .swarm_gated = true,
     },
 };
 
@@ -562,7 +597,11 @@ pub fn toToolDefinitionsFull(
     var defs = try std.ArrayList(json.ToolDefinition).initCapacity(allocator, registry.len + 1);
     defer defs.deinit(allocator);
 
+    // Swarm 工具门控(F5):未开 --agent-teams 时不广告 TeamCreate/TeamDelete/SendMessage。
+    const teams_on = if (prompt_ctx) |pc| pc.agent_teams else false;
+
     for (registry) |*tool| {
+        if (tool.swarm_gated and !teams_on) continue;
         const desc: []const u8 = blk: {
             // env override(slot "TOOL_DESC_<UPPER_NAME>")优先于 describe_fn / 静态描述。
             // 用于提示词 A/B 实验:同一二进制按 env 切换工具描述,无需重编译。

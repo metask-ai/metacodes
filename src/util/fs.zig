@@ -98,6 +98,78 @@ pub fn getCwd(allocator: std.mem.Allocator) GetCwdError![]u8 {
 // ============================================================================
 // Testing helpers（命名空间隔离，生产代码误用不了）
 // ============================================================================
+// 生产安全递归删除(swarm team 目录清理:orphan cleanup / TeamDelete)。
+// ============================================================================
+
+/// std.c.lstat 在 zig 0.16 std 无绑定(同 memdir.zig)——自声明 extern,防跟随 symlink 逃逸。
+extern "c" fn lstat(path: [*:0]const u8, buf: *std.c.Stat) c_int;
+
+/// 一个路径是否 symlink(lstat,不跟随)。stat 失败/非 symlink → false。
+fn isSymlink(path_z: [*:0]const u8) bool {
+    var st: std.c.Stat = undefined;
+    if (lstat(path_z, &st) != 0) return false;
+    return (st.mode & std.c.S.IFMT) == std.c.S.IFLNK;
+}
+
+/// **生产安全**递归删除 swarm team 目录。**双重护栏**:
+///   ① 路径必须含 `/.metacodes/teams/`(拒删任意目录)且不含 `..`(拒穿越);
+///   ② 递归中遇 symlink **不跟随**(unlink 链接本身,绝不删目标)——防对抗性 symlink 逃逸。
+/// best-effort:遇错跳过。Linus SW4 HIGH-1:旧代码误用 testing.rmrfBestEffort(仅 /tmp/cc-zig-
+/// 前缀生效)→ orphan cleanup/TeamDelete 在生产是静默 no-op(~/.metacodes/teams 僵尸目录堆积)。
+pub fn removeTeamDirTree(path: []const u8) void {
+    if (std.mem.indexOf(u8, path, "/.metacodes/teams/") == null) return; // 护栏①:必须在 teams 下
+    if (std.mem.indexOf(u8, path, "..") != null) return; // 护栏①:拒穿越
+    if (path.len == 0) return;
+    rmrfSafeImpl(path, 64);
+}
+
+/// 递归实现(symlink-aware):先收集子项名 + closedir,再逐个 lstat 分类——symlink→unlink 链接、
+/// 目录→递归、其它→unlink。fd 只占当前 readdir 一个(同 testing 版)。
+fn rmrfSafeImpl(path: []const u8, depth_left: u32) void {
+    if (depth_left == 0) return;
+    var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
+    if (path.len >= pbuf.len) return;
+    @memcpy(pbuf[0..path.len], path);
+    pbuf[path.len] = 0;
+    // 目录本身若是 symlink,只 unlink 链接、不进入。
+    if (isSymlink(@ptrCast(&pbuf))) {
+        _ = std.c.unlink(@ptrCast(&pbuf));
+        return;
+    }
+    var it = pdir.open(@ptrCast(&pbuf)) orelse {
+        _ = std.c.unlink(@ptrCast(&pbuf));
+        return;
+    };
+    const MAX_CHILDREN = 512;
+    const MAX_NAME = 256;
+    var names: [MAX_CHILDREN][MAX_NAME]u8 = undefined;
+    var name_lens: [MAX_CHILDREN]usize = undefined;
+    var count: usize = 0;
+    while (pdir.next(&it)) |ent| {
+        const name = ent.name;
+        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+        if (count >= MAX_CHILDREN) break;
+        if (name.len >= MAX_NAME) continue;
+        @memcpy(names[count][0..name.len], name);
+        name_lens[count] = name.len;
+        count += 1;
+    }
+    pdir.close(&it);
+    var k: usize = 0;
+    while (k < count) : (k += 1) {
+        const name = names[k][0..name_lens[k]];
+        var child_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        const child = std.fmt.bufPrint(&child_buf, "{s}/{s}", .{ path, name }) catch continue;
+        if (child.len >= child_buf.len) continue;
+        child_buf[child.len] = 0;
+        if (isSymlink(@ptrCast(&child_buf))) {
+            _ = std.c.unlink(@ptrCast(&child_buf)); // symlink:删链接不跟随
+        } else {
+            rmrfSafeImpl(child, depth_left - 1); // 目录递归 / 文件在其内部 unlink
+        }
+    }
+    _ = std.c.rmdir(@ptrCast(&pbuf));
+}
 
 /// 测试专用 helpers。放在命名空间里，避免 pub API 鼓励生产误用。
 pub const testing = struct {
@@ -163,6 +235,53 @@ pub const testing = struct {
 // ============================================================================
 // Tests
 // ============================================================================
+
+const pfs = @import("platform").fs;
+
+test "removeTeamDirTree: 删 teams 子树 + 护栏拒非 teams 路径 + 不跟随 symlink" {
+    const util_time = @import("time.zig");
+    var hb: [128]u8 = undefined;
+    // 造 {home}/.metacodes/teams/proj/{config.json, inboxes/bob.json}(home 在 /tmp/cc-zig-)。
+    const home = std.fmt.bufPrint(&hb, "/tmp/cc-zig-rmteam-{d}", .{util_time.nowNs()}) catch unreachable;
+    var db: [512]u8 = undefined;
+    const teamdir = std.fmt.bufPrint(&db, "{s}/.metacodes/teams/proj", .{home}) catch unreachable;
+    var ib: [600]u8 = undefined;
+    const inboxdir = std.fmt.bufPrint(&ib, "{s}/inboxes", .{teamdir}) catch unreachable;
+    mkdirParents(inboxdir) catch unreachable;
+    // 写两个文件。
+    inline for (.{ "config.json", "inboxes/bob.json" }) |rel| {
+        var fb: [700:0]u8 = undefined;
+        const fp = std.fmt.bufPrintZ(&fb, "{s}/{s}", .{ teamdir, rel }) catch unreachable;
+        const fd = pfs.open(fp.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c_uint, 0o644));
+        if (fd >= 0) {
+            _ = pfs.write(fd, "{}");
+            pfs.close(fd);
+        }
+    }
+    // 护栏:非 teams 路径拒删(home 本身不含 /.metacodes/teams/)。
+    removeTeamDirTree(home);
+    var hz: [200:0]u8 = undefined;
+    @memcpy(hz[0..home.len], home);
+    hz[home.len] = 0;
+    try std.testing.expect(pfs.exists(&hz)); // home 仍在(护栏生效)
+
+    // 删 team 子树 → 目录没了。
+    removeTeamDirTree(teamdir);
+    var tz: [512:0]u8 = undefined;
+    @memcpy(tz[0..teamdir.len], teamdir);
+    tz[teamdir.len] = 0;
+    try std.testing.expect(!pfs.exists(&tz));
+
+    // 收尾。
+    testing.rmrfBestEffort(home);
+}
+
+test "removeTeamDirTree: `..` 穿越被拒" {
+    // 含 .. 的路径即便含 /.metacodes/teams/ 也拒(护栏②)。
+    removeTeamDirTree("/tmp/cc-zig-x/.metacodes/teams/../../../etc");
+    // 不崩即通过(无副作用);/etc 显然还在。
+    try std.testing.expect(pfs.exists("/etc"));
+}
 
 test "mkdirParents creates nested dirs" {
     const root = "/tmp/cc-zig-mkdirp-test-root";

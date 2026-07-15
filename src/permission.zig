@@ -57,6 +57,11 @@ pub const PermissionContext = struct {
     /// (多 Session 会串台 + 指向已失效 TuiBackend 的 UAF)。现挂 per-session ctx。
     /// null = 无 runner → ask 退回文字 prompt。见 UiRequester。
     ui_requester: ?@import("core/protocol/ui_request.zig").UiRequester = null,
+    /// **非交互强制拒**(swarm teammate 用):true 时 ask() 命中 `.ask` 且无 ui_requester →
+    /// 直接 deny,**绝不读 fd 0**。teammate 线程与 lead REPL 共享进程 fd 0,isatty(0) 为真会
+    /// 让 ask() 落到 askText 读 stdin,和 lead 行读争抢/卡死(PM SW4 3c)。fail-closed:
+    /// teammate 拿不到权限就报工具错,由模型经 SendMessage 请 lead 代办(SW7 权限代理)。
+    no_interactive_prompt: bool = false,
     /// 本 ctx 归属的会话(权限对话框路由到对应 session 视图)。默认 .single(N=1)。
     /// **M6 待办**:这与 ToolContext.session 是同一概念的两份拷贝(权限路径走 PermissionContext,
     /// 工具路径走 ToolContext)。M6 拆 SessionContext 后,两者都从 SessionContext.id 取,这俩

@@ -127,6 +127,57 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         sys_prompt = "You are a subagent. Complete the task and return a concise summary.\n";
     }
 
+    // Swarm 分支:给了 `name` → spawn 一个持久 teammate(而非一次性 subagent)。
+    // 对齐 cc AgentTool 的 name+team_name 分支,但 metacodes 一 lead 一队(team 隐含在
+    // SwarmContext),故只需 name 触发。
+    if (util_json.extractStringField(args, "name")) |name_raw| {
+        const sw = ctx.swarm orelse return error.SwarmUnavailable;
+        if (!sw.is_lead) return error.NotTeamLead; // teammate 不 spawn teammate(扁平 roster)
+        if (!sw.hasTeam()) return error.NoActiveTeam;
+        if (sw.teammates == null) return error.NoActiveTeam; // lead 无 registry(不该发生)
+        const name = try util_json.unescapeString(name_raw, ctx.allocator);
+        defer ctx.allocator.free(name);
+
+        // SW6:进程外 backend(--teammate-mode process)→ fork+exec + worktree 隔离。
+        if (sw.out_of_process) {
+            const tp = @import("../swarm/teammate_process.zig");
+            // worktree 路径 = {home}/.metacodes/worktrees/{team}-{name};repo = project_dir(git 根)。
+            var name_buf: [64]u8 = undefined;
+            const name_s = @import("../swarm/team.zig").sanitizeAgentName(name, &name_buf);
+            var wt_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const wt: []const u8 = if (ctx.home_dir.len > 0 and ctx.project_dir.len > 0)
+                (std.fmt.bufPrint(&wt_buf, "{s}/.metacodes/worktrees/{s}-{s}", .{ ctx.home_dir, sw.team_sanitized, name_s }) catch "")
+            else
+                "";
+            const pid = tp.spawnTeammateProcess(sw, name, wt, if (wt.len > 0) "HEAD" else "", ctx.project_dir, ctx.abort, &tp.forkExecTeammate) catch |err| return err;
+            return std.fmt.allocPrint(ctx.allocator, "{{\"teammate\":\"{s}\",\"pid\":{d},\"backend\":\"process\",\"status\":\"spawned\"}}", .{ name_s, pid });
+        }
+
+        const reg = &sw.teammates.?; // ctx *const 浅层,pointee 可变,无需 @constCast
+        const entry = reg.spawnTeammate(.{
+            .name = name,
+            .team = sw.team_sanitized,
+            .prompt = prompt,
+            .system_prompt = sys_prompt,
+            .tool_defs = effective_tool_defs,
+            .permission_ctx = perm.*,
+            .agent_type = subagent_type_raw,
+            .model_override = model_override,
+            .perm_override = perm_override,
+            .project_dir = ctx.project_dir,
+            .cwd = ctx.cwd_abs,
+            .dyn_registry = ctx.dyn_registry,
+            .host_services = if (ctx.host_services) |hs| hs.skillOnly() else null,
+            .kg = ctx.kg,
+            .kg_projects_dir = ctx.kg_projects_dir,
+        }) catch |err| return err;
+        return std.fmt.allocPrint(
+            ctx.allocator,
+            "{{\"teammate\":\"{s}\",\"agent_id\":\"{s}\",\"status\":\"spawned\"}}",
+            .{ entry.name, entry.agent_id },
+        );
+    }
+
     // run_in_background:true → 不阻塞,spawn 后台线程,立即返回 agent-job-id。
     // 后续用 TaskOutput(agent_job_id) 轮询增量输出 / TaskStop(agent_job_id) 终止。
     const bg = util_json.extractBoolField(args, "run_in_background") orelse false;

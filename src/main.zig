@@ -33,11 +33,21 @@ pub const core_subagent = @import("core/subagent.zig");
 pub const agent_job_registry = @import("core/agent_job_registry.zig");
 pub const util_time = @import("util/time.zig");
 pub const tools = @import("tools.zig");
+pub const tool_prompt_ctx = @import("tools/prompt_context.zig");
 pub const task_tools = @import("tools/task_tools.zig");
 pub const task_output_tool = @import("tools/task_output.zig");
 pub const agent_tool = @import("tools/agent.zig");
 pub const core_task_store = @import("core/task_store.zig");
 pub const kg_client = @import("kg/client.zig");
+pub const swarm_team = @import("swarm/team.zig");
+pub const swarm_mailbox = @import("swarm/mailbox.zig");
+pub const swarm_teammate = @import("swarm/teammate.zig");
+pub const swarm_file_lock = @import("swarm/file_lock.zig");
+pub const swarm_context = @import("swarm/context.zig");
+pub const swarm_tools = @import("swarm/tools.zig");
+pub const swarm_teammate_process = @import("swarm/teammate_process.zig");
+pub const tools_common = @import("tools/common.zig");
+pub const platform_fs = @import("platform").fs;
 pub const kg_inject = @import("kg/inject.zig");
 pub const kg_scoped_recall = @import("kg/scoped_recall.zig");
 pub const abort = @import("util/abort.zig");
@@ -277,6 +287,21 @@ pub fn main(init: std.process.Init) !void {
     // 不发网络、不需有效 key。用于验证提示词×工具复刻(工具长描述 + 动态裁剪)。
     if (config.dump_prompt) {
         dumpPromptAndExit(app);
+    }
+
+    // SW6 进程外 teammate 模式:`--teammate --agent-name X --team-name Y` → 跑 mailbox 消息循环,
+    // 不进 TUI REPL。身份经 CLI args 注入,可 chdir 进 worktree(cwd 隔离)。
+    if (config.teammate_name.len > 0) {
+        const code = @import("swarm/teammate_process.zig").run(app, allocator, .{
+            .name = config.teammate_name,
+            .team = config.teammate_team,
+            .parent_session = config.teammate_parent_session,
+            .cwd = config.teammate_cwd,
+        }) catch |err| blk: {
+            log.err("swarm", "teammate process failed: {s}", .{@errorName(err)});
+            break :blk 1;
+        };
+        std.process.exit(code);
     }
 
     // Web 模式:`--web [port]` → 起 HTTP+SSE 服务器驱动 agent loop,不进 TUI REPL。
@@ -744,6 +769,20 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
             config.verbose = true;
         } else if (std.mem.eql(u8, arg, "--lsp")) {
             config.lsp_enabled = true; // Y2:开 LSP 被动诊断(Edit/Write 后附类型诊断)
+        } else if (std.mem.eql(u8, arg, "--agent-teams")) {
+            config.agent_teams = true; // SW2:开 teams/teammates(TeamCreate/SendMessage 等)
+        } else if (std.mem.eql(u8, arg, "--teammate")) {
+            config.agent_teams = true; // SW6:进程外 teammate 模式(隐含 teams 开)
+        } else if (std.mem.eql(u8, arg, "--agent-name")) {
+            if (args.next()) |v| config.teammate_name = allocator.dupe(u8, v) catch v;
+        } else if (std.mem.eql(u8, arg, "--team-name")) {
+            if (args.next()) |v| config.teammate_team = allocator.dupe(u8, v) catch v;
+        } else if (std.mem.eql(u8, arg, "--parent-session-id")) {
+            if (args.next()) |v| config.teammate_parent_session = allocator.dupe(u8, v) catch v;
+        } else if (std.mem.eql(u8, arg, "--teammate-cwd")) {
+            if (args.next()) |v| config.teammate_cwd = allocator.dupe(u8, v) catch v;
+        } else if (std.mem.eql(u8, arg, "--teammate-mode")) {
+            if (args.next()) |v| config.teammate_out_of_process = std.mem.eql(u8, v, "process");
         } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--print")) {
             if (args.next()) |p| config.prompt = allocator.dupe(u8, p) catch p;
         } else if (std.mem.eql(u8, arg, "--json")) {
@@ -816,6 +855,8 @@ fn printHelp() void {
         \\  --no-theme            Disable colors
         \\  --verbose             Verbose output
         \\  --lsp                 Enable LSP passive diagnostics on Edit/Write (needs zls/pyright/etc on PATH)
+        \\  --agent-teams         Enable teams/teammates (TeamCreate/SendMessage; delegate to parallel teammate agents)
+        \\  --teammate-mode <m>   Teammate spawn backend: "process" (out-of-process, worktree-isolated) or "thread" (default, in-process)
         \\  -h, --help            This help
         \\
     , .{});
@@ -849,6 +890,13 @@ test {
     _ = &@import("core/agent_loop.zig");
     _ = &@import("core/proposed_plan.zig");
     _ = &@import("core/plan_file.zig");
+    _ = &@import("swarm/file_lock.zig");
+    _ = &@import("swarm/team.zig");
+    _ = &@import("swarm/mailbox.zig");
+    _ = &@import("swarm/teammate.zig");
+    _ = &@import("swarm/context.zig");
+    _ = &@import("swarm/tools.zig");
+    _ = &@import("swarm/teammate_process.zig");
     _ = &@import("core/memory/import.zig");
     _ = &@import("core/memory/claudemd.zig");
     _ = &@import("core/memory/user_context.zig");

@@ -14,6 +14,18 @@ pub const Config = struct {
     verbose: bool = false,
     /// LSP 被动诊断(Y2):`--lsp` 开启。opt-in——默认关,保持零依赖 + 零启动开销。
     lsp_enabled: bool = false,
+    /// Swarm(teams/teammates):`--agent-teams` 开启。opt-in——默认关,不污染单 agent 会话
+    /// 的工具菜单(对齐 cc agentSwarmsEnabled 门)。
+    agent_teams: bool = false,
+    /// SW6 进程外 teammate 身份(lead fork+exec 时经 CLI 注入;非 null → 进 teammate 进程模式,
+    /// 不进 REPL)。teammate_name 非空即触发。cwd 非空则启动时 chdir(worktree 隔离)。
+    teammate_name: []const u8 = "",
+    teammate_team: []const u8 = "",
+    teammate_parent_session: []const u8 = "",
+    teammate_cwd: []const u8 = "",
+    /// SW6:lead 用 `--teammate-mode process` 让 Task(name) spawn 进程外 teammate(fork+exec +
+    /// worktree 隔离)而非进程内线程。默认 false(进程内,SW1)。
+    teammate_out_of_process: bool = false,
     /// 编辑器模式:false=emacs(默认) / true=vim。`/vim` 命令切换。
     vim_mode: bool = false,
     /// Headless 模式：非 null 时跑单次 prompt 后退出，不进 REPL。

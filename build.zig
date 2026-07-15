@@ -275,6 +275,11 @@ pub fn build(b: *std.Build) void {
         "tests/component/web_ui_test.zig",
         "tests/component/weak_model_test.zig",
         "tests/component/task_batch_test.zig",
+        "tests/component/teammate_runtime_test.zig",
+        "tests/component/swarm_tools_test.zig",
+        "tests/component/swarm_dag_test.zig",
+        "tests/component/swarm_security_test.zig",
+        "tests/component/swarm_process_test.zig",
     };
     for (integ_files) |f| {
         const m = b.createModule(.{
@@ -356,6 +361,11 @@ pub fn build(b: *std.Build) void {
         "tests/component/prompt_override_test.zig",
         "tests/component/weak_model_test.zig",
         "tests/component/task_batch_test.zig",
+        "tests/component/teammate_runtime_test.zig",
+        "tests/component/swarm_tools_test.zig",
+        "tests/component/swarm_dag_test.zig",
+        "tests/component/swarm_security_test.zig",
+        "tests/component/swarm_process_test.zig",
     };
     for (new_files) |f| {
         const m = b.createModule(.{
