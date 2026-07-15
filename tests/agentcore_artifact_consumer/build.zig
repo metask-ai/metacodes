@@ -65,6 +65,19 @@ pub fn build(b: *std.Build) void {
     app.addObjectFile(.{ .cwd_relative = lib_path });
     const exe = b.addExecutable(.{ .name = "agentcore-artifact-consumer", .root_module = app });
     const run = b.addRunArtifact(exe);
+
+    const c_app = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    });
+    c_app.addCSourceFile(.{ .file = b.path("consumer.c"), .flags = &.{"-std=c11"} });
+    c_app.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ bundle_root, "include" }) });
+    c_app.addObjectFile(.{ .cwd_relative = lib_path });
+    const c_exe = b.addExecutable(.{ .name = "agentcore-artifact-c-consumer", .root_module = c_app });
+    const c_run = b.addRunArtifact(c_exe);
+
     const test_step = b.step("test", "Link and run using only the installed AgentCore bundle");
     test_step.dependOn(&run.step);
+    test_step.dependOn(&c_run.step);
 }

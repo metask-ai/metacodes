@@ -26,6 +26,18 @@ const JobRegistry = @import("job_registry.zig").JobRegistry;
 const SessionRules = @import("../permission/session_rules.zig").SessionRules;
 
 pub const DEFAULT_BUILTIN_TOOLS = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Grep", "Bash", "BashOutput", "KillShell" };
+/// Built-ins whose complete execution dependencies are owned by AgentSession.
+/// Process-level tools (Task, Cron, KG, MCP, worktree, notifications, etc.) are
+/// deliberately rejected at Runtime creation instead of being advertised with
+/// null Host state.
+pub const SESSION_BUILTIN_TOOLS = DEFAULT_BUILTIN_TOOLS ++ [_][]const u8{"AskUserQuestion"};
+
+pub fn isSessionBuiltin(name: []const u8) bool {
+    for (SESSION_BUILTIN_TOOLS) |supported| {
+        if (std.mem.eql(u8, supported, name)) return true;
+    }
+    return false;
+}
 
 pub const RuntimeConfig = struct {
     builtin_tools: []const []const u8 = &DEFAULT_BUILTIN_TOOLS,
@@ -52,6 +64,9 @@ pub const AgentRuntime = struct {
     state: RuntimeState = .active,
 
     pub fn create(allocator: std.mem.Allocator, config: RuntimeConfig) !*AgentRuntime {
+        for (config.builtin_tools) |name| {
+            if (!isSessionBuiltin(name)) return error.UnsupportedBuiltinTool;
+        }
         const self = try allocator.create(AgentRuntime);
         errdefer allocator.destroy(self);
         const catalog = try tool_catalog.Catalog.init(allocator, config.builtin_tools, config.host_sync_tools);
@@ -168,6 +183,7 @@ pub const AgentSession = struct {
     jobs: ?JobRegistry,
     session_rules: SessionRules,
     permission_ctx: permission.PermissionContext,
+    host_ui_requester: ?UiRequester,
     abort_signal: AbortSignal,
     active_sink: ?EventSink = null,
 
@@ -236,10 +252,14 @@ pub const AgentSession = struct {
             .jobs = jobs,
             .session_rules = .{},
             .permission_ctx = permission_ctx,
+            .host_ui_requester = config.ui_requester,
             .abort_signal = AbortSignal.init(),
         };
         self.permission_ctx.session_rules = &self.session_rules;
-        self.permission_ctx.ui_requester = config.ui_requester;
+        self.permission_ctx.ui_requester = if (config.ui_requester != null)
+            .{ .ctx = self, .requestFn = requestHostUi }
+        else
+            null;
         // A UI-neutral library must never fall back to process stdin. Until a
         // Host requester is attached, `.ask` decisions fail closed.
         self.permission_ctx.no_interactive_prompt = true;
@@ -457,6 +477,30 @@ pub const AgentSession = struct {
             }
             self.mutex.unlock();
         }
+    }
+
+    fn requestHostUi(
+        raw: *anyopaque,
+        session_id: SessionId,
+        response_allocator: std.mem.Allocator,
+        req: *const ui_request.UiRequest,
+        out: *ui_request.UiResponse,
+    ) anyerror!ui_request.RequestOutcome {
+        const self: *AgentSession = @ptrCast(@alignCast(raw));
+        const requester = self.host_ui_requester orelse return .unavailable;
+        return requester.request(session_id, response_allocator, req, out) catch |err| {
+            // A Host UI transport/decoding error is infrastructure failure,
+            // not a model-visible tool error. Abort the current Run and let
+            // finishRunLifecycle poison the Session consistently with event
+            // callback failure.
+            self.mutex.lock();
+            if (!self.callback_failed) {
+                self.callback_failed = true;
+                self.abort_signal.abort(.host_failure);
+            }
+            self.mutex.unlock();
+            return err;
+        };
     }
 
     fn backendPoll(_: *anyopaque, _: SessionId) ?UiEvent {
@@ -757,6 +801,57 @@ test "AgentRuntime refuses destruction while Sessions are live" {
     try std.testing.expectError(error.RuntimeBusy, runtime.destroy());
     try second.destroy();
     try runtime.destroy();
+}
+
+test "AgentRuntime rejects process-only built-ins that AgentSession cannot wire" {
+    try std.testing.expectError(error.UnsupportedBuiltinTool, AgentRuntime.create(std.testing.allocator, .{
+        .builtin_tools = &.{"TaskCreate"},
+    }));
+}
+
+test "Host UI requester failure aborts and poisons the active Run" {
+    const FailingUi = struct {
+        fn request(
+            _: *anyopaque,
+            _: SessionId,
+            _: std.mem.Allocator,
+            _: *const ui_request.UiRequest,
+            _: *ui_request.UiResponse,
+        ) anyerror!ui_request.RequestOutcome {
+            return error.HostUiFailed;
+        }
+    };
+
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{"AskUserQuestion"} });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    var ui_state: u8 = 0;
+    const self = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"AskUserQuestion"},
+        .ui_requester = .{ .ctx = &ui_state, .requestFn = FailingUi.request },
+    });
+    defer self.destroy() catch unreachable;
+    var sink_probe = SinkProbe{};
+    try self.beginRun(11, sink_probe.sink());
+
+    const req = ui_request.UiRequest{ .permission = .{ .tool = "Write", .args = "{}" } };
+    var response: ui_request.UiResponse = undefined;
+    try std.testing.expectError(error.HostUiFailed, self.permission_ctx.ui_requester.?.request(
+        self.session_id,
+        std.testing.allocator,
+        &req,
+        &response,
+    ));
+    try std.testing.expect(self.abort_signal.isAborted());
+    try std.testing.expectEqual(abort_mod.Reason.host_failure, self.abort_signal.reason());
+    const completion = self.finishRunLifecycle();
+    try std.testing.expect(completion.callback_failed);
+    try std.testing.expectEqual(State.poisoned, self.state);
 }
 
 test "Workspace shell policy is an authority ceiling for Session tools" {

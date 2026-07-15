@@ -24,6 +24,13 @@ const AbiHostTool = struct {
                 else => error.HostToolFailed,
             };
         }
+        if (!canonicalOwned(out)) {
+            // Preserve the exact Host descriptor on failure. Converting a
+            // non-null zero-length allocation to a slice would lose its
+            // release pointer permanently.
+            self.release_fn(self.ctx, &out);
+            return error.HostToolFailed;
+        }
         const bytes = ownedSlice(out) catch {
             self.release_fn(self.ctx, &out);
             return error.HostToolFailed;
@@ -49,6 +56,7 @@ const AbiRuntime = struct {
 
 const AbiSession = struct {
     callbacks: wire.SessionCallbacksV1,
+    callback_status: std.atomic.Value(u32),
     core_session: *core.agent_session.AgentSession,
 
     fn handle(self: *AbiSession) *wire.SessionHandle {
@@ -58,30 +66,60 @@ const AbiSession = struct {
     fn emit(raw: *anyopaque, _: core.session_id.SessionId, run_id: u64, event: core.protocol.ui_event.CoreEvent) bool {
         const self: *AbiSession = @ptrCast(@alignCast(raw));
         const callback = self.callbacks.on_event orelse return true;
-        const json = std.json.Stringify.valueAlloc(allocator, event, .{}) catch return false;
+        const json = std.json.Stringify.valueAlloc(allocator, event, .{}) catch {
+            self.recordCallbackStatus(wire.STATUS_OUT_OF_MEMORY);
+            return false;
+        };
         defer allocator.free(json);
-        return callback(self.callbacks.ctx, self.handle(), run_id, view(json)) == wire.CALLBACK_CONTINUE;
+        const accepted = callback(self.callbacks.ctx, self.handle(), run_id, view(json)) == wire.CALLBACK_CONTINUE;
+        if (!accepted) self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
+        return accepted;
     }
 
     fn requestUi(raw: *anyopaque, _: core.session_id.SessionId, response_allocator: std.mem.Allocator, req: *const ui_request.UiRequest, out: *ui_request.UiResponse) anyerror!ui_request.RequestOutcome {
         const self: *AbiSession = @ptrCast(@alignCast(raw));
         const callback = self.callbacks.on_ui_request orelse return .unavailable;
         const release_fn = self.callbacks.release_response orelse return error.HostUiFailed;
-        const request_json = try ui_request.serializeUiRequest(response_allocator, req);
+        const request_json = ui_request.serializeUiRequest(response_allocator, req) catch |err| {
+            self.recordCallbackStatus(if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_INTERNAL_ERROR);
+            return err;
+        };
         defer response_allocator.free(request_json);
         var response = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
         const status = callback(self.callbacks.ctx, self.handle(), view(request_json), &response);
         const must_release = status == wire.UI_ANSWERED or response.ptr != null or response.len != 0;
         defer if (must_release) release_fn(self.callbacks.ctx, &response);
+        if (!canonicalOwned(response)) {
+            self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
+            return error.HostUiFailed;
+        }
         return switch (status) {
             wire.UI_UNAVAILABLE => .unavailable,
             wire.UI_ANSWERED => blk: {
-                const bytes = try ownedSlice(response);
-                try parseUiResponse(response_allocator, req, bytes, out);
+                const bytes = ownedSlice(response) catch |err| {
+                    self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
+                    return err;
+                };
+                parseUiResponse(response_allocator, req, bytes, out) catch |err| {
+                    self.recordCallbackStatus(if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_CALLBACK_FAILED);
+                    return err;
+                };
                 break :blk .answered;
             },
-            else => error.HostUiFailed,
+            else => {
+                self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
+                return error.HostUiFailed;
+            },
         };
+    }
+
+    fn recordCallbackStatus(self: *AbiSession, status: u32) void {
+        _ = self.callback_status.cmpxchgStrong(wire.STATUS_OK, status, .release, .monotonic);
+    }
+
+    fn callbackFailureStatus(self: *const AbiSession) u32 {
+        const status = self.callback_status.load(.acquire);
+        return if (status == wire.STATUS_OK) wire.STATUS_CALLBACK_FAILED else status;
     }
 };
 
@@ -110,6 +148,10 @@ fn text(v: wire.BytesViewV1) ![]const u8 {
 
 fn ownedSlice(v: wire.OwnedBytesV1) error{ InvalidArgument, Overflow }![]const u8 {
     return borrowed(.{ .ptr = v.ptr, .len = v.len });
+}
+
+fn canonicalOwned(v: wire.OwnedBytesV1) bool {
+    return (v.len == 0) == (v.ptr == null);
 }
 
 fn allZero(values: anytype) bool {
@@ -149,6 +191,27 @@ fn statusText(status: u32) []const u8 {
 
 fn inputErrorStatus(err: anyerror) u32 {
     return if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_INVALID_ARGUMENT;
+}
+
+fn runtimeErrorStatus(err: anyerror) u32 {
+    return if (err == error.OutOfMemory)
+        wire.STATUS_OUT_OF_MEMORY
+    else if (err == error.UnknownBuiltinTool or err == error.UnsupportedBuiltinTool or
+        err == error.DuplicateToolName or err == error.InvalidHostTool)
+        wire.STATUS_INVALID_ARGUMENT
+    else
+        wire.STATUS_CORE_ERROR;
+}
+
+fn runErrorStatus(self: *const AbiSession, err: anyerror) u32 {
+    return switch (err) {
+        error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
+        error.SessionBusy => wire.STATUS_BUSY,
+        error.StaleRun => wire.STATUS_STALE_RUN,
+        error.InvalidSessionState => wire.STATUS_INVALID_STATE,
+        error.CallbackFailed => self.callbackFailureStatus(),
+        else => wire.STATUS_CORE_ERROR,
+    };
 }
 
 fn provider(code: u32) ?core.types.ProviderKind {
@@ -301,7 +364,7 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
         native_tools[i] = .{ .definition = .{ .name = name, .description = description, .input_schema = schema }, .ctx = &self.host_tools[i], .execute = AbiHostTool.execute };
     }
     self.core_runtime = core.agent_session.AgentRuntime.create(allocator, .{ .builtin_tools = builtin_names, .host_sync_tools = native_tools }) catch |err| {
-        return failError(if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_CORE_ERROR, err, out_error);
+        return failError(runtimeErrorStatus(err), err, out_error);
     };
     out.* = self.handle();
     keep_host_tools = true;
@@ -343,6 +406,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
 
     const self = allocator.create(AbiSession) catch return fail(wire.STATUS_OUT_OF_MEMORY, "allocating Session failed", out_error);
     self.callbacks = callbacks.*;
+    self.callback_status = .init(wire.STATUS_OK);
     self.core_session = runtime.core_runtime.createSession(.{
         .provider_kind = kind,
         .api_key = api_key,
@@ -377,16 +441,8 @@ fn sessionRun(handle: ?*wire.SessionHandle, run_id: u64, prompt_view: wire.Bytes
     if (run_id == 0 or options.struct_size != @sizeOf(wire.RunOptionsV1) or options.max_turns == 0 or !allZero(options.reserved))
         return fail(wire.STATUS_INVALID_ARGUMENT, "invalid run id or RunOptionsV1", out_error);
     const prompt = text(prompt_view) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
-    const result = self.core_session.runText(run_id, prompt, options.max_turns, .{ .ctx = self, .emit = AbiSession.emit }) catch |err| {
-        const status: u32 = switch (err) {
-            error.SessionBusy => wire.STATUS_BUSY,
-            error.StaleRun => wire.STATUS_STALE_RUN,
-            error.InvalidSessionState => wire.STATUS_INVALID_STATE,
-            error.CallbackFailed => wire.STATUS_CALLBACK_FAILED,
-            else => wire.STATUS_CORE_ERROR,
-        };
-        return failError(status, err, out_error);
-    };
+    const result = self.core_session.runText(run_id, prompt, options.max_turns, .{ .ctx = self, .emit = AbiSession.emit }) catch |err|
+        return failError(runErrorStatus(self, err), err, out_error);
     defer if (result.suspend_info) |suspend_info| suspend_info.deinit();
     out.* = .{ .struct_size = @sizeOf(wire.RunResultV1), .stop_reason_code = stopReason(result.stop_reason), .turns = result.turns, .tool_calls = result.tool_calls, .reserved = [_]u64{0} ** 4 };
     return wire.STATUS_OK;
@@ -466,4 +522,50 @@ test "UI response parser rejects an answer count mismatch" {
     const req = ui_request.UiRequest{ .ask_question = &questions };
     var out: ui_request.UiResponse = undefined;
     try std.testing.expectError(error.InvalidUiResponse, parseUiResponse(std.testing.allocator, &req, "{\"answers\":[]}", &out));
+}
+
+test "Host zero-length result must use a null pointer and preserves release descriptor on rejection" {
+    const Probe = struct {
+        var byte: u8 = 0;
+        var releases: usize = 0;
+        var released_ptr: ?[*]u8 = null;
+
+        fn execute(_: ?*anyopaque, _: wire.BytesViewV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+            (out orelse return wire.HOST_FAILED).* = .{ .ptr = @ptrCast(&byte), .len = 0 };
+            return wire.HOST_OK;
+        }
+
+        fn release(_: ?*anyopaque, out: ?*wire.OwnedBytesV1) callconv(.c) void {
+            releases += 1;
+            released_ptr = (out orelse return).ptr;
+        }
+    };
+    Probe.releases = 0;
+    Probe.released_ptr = null;
+    var host = AbiHostTool{ .ctx = null, .execute_fn = Probe.execute, .release_fn = Probe.release };
+    try std.testing.expectError(error.HostToolFailed, AbiHostTool.execute(&host, "session", "{}"));
+    try std.testing.expectEqual(@as(usize, 1), Probe.releases);
+    try std.testing.expect(Probe.released_ptr == @as(?[*]u8, @ptrCast(&Probe.byte)));
+}
+
+test "Run OutOfMemory maps to the public OOM status" {
+    var fake = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .core_session = undefined,
+    };
+    try std.testing.expectEqual(wire.STATUS_OUT_OF_MEMORY, runErrorStatus(&fake, error.OutOfMemory));
+}
+
+test "ABI Runtime rejects process-only built-ins as invalid input" {
+    const names = [_]wire.BytesViewV1{view("TaskCreate")};
+    var config = std.mem.zeroes(wire.RuntimeConfigV1);
+    config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    config.builtin_tools = &names;
+    config.builtin_tool_count = names.len;
+    var runtime: ?*wire.RuntimeHandle = null;
+    var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+    defer bufferRelease(&diagnostic);
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, runtimeCreate(&config, &runtime, &diagnostic));
+    try std.testing.expect(runtime == null);
 }

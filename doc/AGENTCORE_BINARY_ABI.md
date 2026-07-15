@@ -58,6 +58,18 @@ Permission also accepts `allow_always`, `deny_once`, and
 `reject`. Host tool input schemas use the existing AgentCore object-schema
 subset: `type`, `properties`, and `required`.
 
+ABI v1 supports these built-in tools: `Read`, `Write`, `Edit`, `Glob`, `Grep`,
+`Bash`, `BashOutput`, `KillShell`, and `AskUserQuestion`. Runtime creation
+rejects process-level tools whose dependencies are not owned by AgentSession,
+including Task, Cron, KG, MCP, worktree, and notification tools. Adding those
+requires a future explicit Host capability contract; they are not silently
+advertised with missing state.
+
+All empty `mc_owned_bytes_v1` values use the canonical `{NULL, 0}` form. Host
+UI fatal/invalid responses are infrastructure failures: they abort the active
+Run, poison the Session, and surface as `MC_STATUS_CALLBACK_FAILED` (or
+`MC_STATUS_OUT_OF_MEMORY` when response processing exhausts memory).
+
 ABI v1 deliberately does not add session persistence/restore, asynchronous UI
 continuations, strict Workspace security, or additional platforms. Those are
 separate contracts, not hidden behavior in the library facade.

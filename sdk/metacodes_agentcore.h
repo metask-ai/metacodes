@@ -2,6 +2,7 @@
 #define METACODES_AGENTCORE_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -74,6 +75,9 @@ typedef struct {
     uint8_t *ptr;
     uint64_t len;
 } mc_owned_bytes_v1;
+
+/* Canonical empty owned buffers are {NULL, 0}. A non-NULL pointer with zero
+ * length is invalid because the ABI must preserve the exact release token. */
 
 /* Host tool inputs are borrowed for the callback. On MC_HOST_OK, out_result
  * remains Host-owned until release_result is called exactly once. */
@@ -179,11 +183,19 @@ const void *metacodes_agentcore_get_api(uint32_t requested_abi);
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 _Static_assert(sizeof(mc_bytes_view_v1) == 16, "mc_bytes_view_v1 layout");
+_Static_assert(sizeof(mc_owned_bytes_v1) == 16, "mc_owned_bytes_v1 layout");
 _Static_assert(sizeof(mc_host_tool_v1) == 96, "mc_host_tool_v1 layout");
 _Static_assert(sizeof(mc_runtime_config_v1) == 72, "mc_runtime_config_v1 layout");
 _Static_assert(sizeof(mc_session_callbacks_v1) == 72, "mc_session_callbacks_v1 layout");
 _Static_assert(sizeof(mc_session_config_v1) == 144, "mc_session_config_v1 layout");
+_Static_assert(sizeof(mc_run_options_v1) == 40, "mc_run_options_v1 layout");
+_Static_assert(sizeof(mc_run_result_v1) == 48, "mc_run_result_v1 layout");
 _Static_assert(sizeof(mc_agentcore_api_v1) == 104, "mc_agentcore_api_v1 layout");
+_Static_assert(offsetof(mc_host_tool_v1, ctx) == 8, "mc_host_tool_v1.ctx offset");
+_Static_assert(offsetof(mc_session_config_v1, api_key) == 16, "mc_session_config_v1.api_key offset");
+_Static_assert(offsetof(mc_session_config_v1, allowed_tools) == 96, "mc_session_config_v1.allowed_tools offset");
+_Static_assert(offsetof(mc_agentcore_api_v1, runtime_create) == 16, "mc_agentcore_api_v1.runtime_create offset");
+_Static_assert(offsetof(mc_agentcore_api_v1, session_run) == 48, "mc_agentcore_api_v1.session_run offset");
 #endif
 
 #ifdef __cplusplus

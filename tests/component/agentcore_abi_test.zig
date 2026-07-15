@@ -77,6 +77,18 @@ const Probe = struct {
     }
 };
 
+const FatalUiProbe = struct {
+    calls: usize = 0,
+
+    fn ui(raw: ?*anyopaque, _: ?*wire.SessionHandle, _: wire.BytesViewV1, _: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+        const self: *FatalUiProbe = @ptrCast(@alignCast(raw orelse return wire.UI_FATAL));
+        self.calls += 1;
+        return wire.UI_FATAL;
+    }
+
+    fn release(_: ?*anyopaque, _: ?*wire.OwnedBytesV1) callconv(.c) void {}
+};
+
 fn rootPath(tmp: *std.testing.TmpDir, buffer: []u8) ![]const u8 {
     const len = try tmp.dir.realPath(std.testing.io, buffer);
     return buffer[0..len];
@@ -171,6 +183,71 @@ test "L2 opaque ABI routes Host UI, Host tools and CoreEvent JSON through AgentS
     try std.testing.expect(std.mem.indexOf(u8, body, "Yes") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "host-ok") != null);
     try std.testing.expectEqual(wire.STATUS_TOO_LATE, api.sessionAbort()(session, 1, wire.ABORT_USER_REQUEST, &diagnostic));
+    api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
+    session = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
+    runtime = null;
+}
+
+test "L2 Host UI fatal aborts the Run and poisons the ABI Session" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ASK_SSE};
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const raw_api = abi.metacodes_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    const builtins = [_]wire.BytesViewV1{sdk.bytesView("AskUserQuestion")};
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    runtime_config.builtin_tools = &builtins;
+    runtime_config.builtin_tool_count = builtins.len;
+    var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+    defer api.bufferRelease()(&diagnostic);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreate()(&runtime_config, &runtime, &diagnostic));
+    defer {
+        if (runtime) |handle| _ = api.runtimeDestroy()(handle, &diagnostic);
+    }
+
+    const allowed = [_]wire.BytesViewV1{sdk.bytesView("AskUserQuestion")};
+    var session_config = std.mem.zeroes(wire.SessionConfigV1);
+    session_config.struct_size = @sizeOf(wire.SessionConfigV1);
+    session_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    session_config.permission_mode_code = wire.PERMISSION_BYPASS;
+    session_config.shell_policy_code = wire.SHELL_DISABLED;
+    session_config.api_key = sdk.bytesView("test-key");
+    session_config.model = sdk.bytesView("test-model");
+    session_config.base_url = sdk.bytesView(url);
+    session_config.workspace_root = sdk.bytesView(root);
+    session_config.workspace_home = sdk.bytesView(root);
+    session_config.allowed_tools = &allowed;
+    session_config.allowed_tool_count = allowed.len;
+    var probe = FatalUiProbe{};
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_ui_request = FatalUiProbe.ui;
+    callbacks.release_response = FatalUiProbe.release;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionCreate()(runtime, &session_config, &callbacks, &session, &diagnostic));
+    defer {
+        if (session) |handle| _ = api.sessionDestroy()(handle, &diagnostic);
+    }
+
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .reserved = [_]u64{0} ** 4 };
+    var result: wire.RunResultV1 = undefined;
+    try std.testing.expectEqual(wire.STATUS_CALLBACK_FAILED, api.sessionRun()(session, 1, sdk.bytesView("ask through broken UI"), &options, &result, &diagnostic));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(wire.STATUS_INVALID_STATE, api.sessionRun()(session, 2, sdk.bytesView("must stay poisoned"), &options, &result, &diagnostic));
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
     session = null;

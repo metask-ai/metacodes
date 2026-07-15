@@ -169,9 +169,17 @@ pub const ApiV1 = extern struct {
 test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     const std = @import("std");
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(BytesViewV1));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(OwnedBytesV1));
     try std.testing.expectEqual(@as(usize, 96), @sizeOf(HostToolV1));
     try std.testing.expectEqual(@as(usize, 72), @sizeOf(RuntimeConfigV1));
     try std.testing.expectEqual(@as(usize, 72), @sizeOf(SessionCallbacksV1));
     try std.testing.expectEqual(@as(usize, 144), @sizeOf(SessionConfigV1));
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(RunOptionsV1));
+    try std.testing.expectEqual(@as(usize, 48), @sizeOf(RunResultV1));
     try std.testing.expectEqual(@as(usize, 104), @sizeOf(ApiV1));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(HostToolV1, "ctx"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(SessionConfigV1, "api_key"));
+    try std.testing.expectEqual(@as(usize, 96), @offsetOf(SessionConfigV1, "allowed_tools"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(ApiV1, "runtime_create"));
+    try std.testing.expectEqual(@as(usize, 48), @offsetOf(ApiV1, "session_run"));
 }
