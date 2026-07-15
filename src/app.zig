@@ -1611,8 +1611,11 @@ pub const App = struct {
     }
 };
 
-/// 中断回调(async-signal-safe:只置 abort 原子)。取代旧 sigintHandler(sig)。
+/// 中断回调(async-signal-safe:只置原子,不分配/不锁/不 IO)。取代旧 sigintHandler(sig)。
+/// **U9**:置进程级 shutdown flag(daemon 主循环 poll 它优雅关所有 session)+ 戳 g_abort_signal
+/// (唤醒 N=1 宿主的 run,兼容既有行为;daemon 未绑单 session 时此指针为 null,靠 accept EINTR 醒)。
 fn onSigint() void {
+    @import("core/shutdown.zig").request();
     if (g_abort_signal) |s| {
         s.abort(.user_ctrl_c);
     }
