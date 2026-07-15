@@ -38,6 +38,19 @@ pub const StateFn = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) an
 pub const CommandFn = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator, cmd: []const u8) anyerror![]u8;
 
 /// server 的借用依赖(session driver 拥有,生命周期须覆盖 server)。
+/// **U10-C:一个 session 的 per-request 视图**(handler 用它,而非直接 self.deps)。单 session 模式
+/// 从 Deps 直取(singleView);多 session 模式经 resolver 按 /s/<id>/ 的 id 解析。
+pub const SessionView = struct {
+    journal: *EventJournal,
+    web_backend: *WebBackend,
+    inbox: *MsgQueue,
+    abort: *abort_mod.AbortSignal,
+    generating: ?*const std.atomic.Value(bool) = null,
+    state_ctx: *anyopaque,
+    state_fn: StateFn,
+    command_fn: ?CommandFn = null,
+};
+
 pub const Deps = struct {
     journal: *EventJournal,
     web_backend: *WebBackend,
@@ -51,6 +64,10 @@ pub const Deps = struct {
     state_fn: StateFn,
     /// 斜杠命令处理(可空:单测不接)。ctx 复用 state_ctx。
     command_fn: ?CommandFn = null,
+    /// **U10-C:多 session 解析器**。非 null 时,路径 `/s/<id>/rest` 按 id 解析 SessionView(null=未知
+    /// session→404);无 /s/ 前缀的非 `/` 路径→404。null=单 session 模式(--web,直用上面字段,向后兼容)。
+    resolver: ?*const fn (ctx: *anyopaque, id: []const u8) ?SessionView = null,
+    resolver_ctx: *anyopaque = undefined,
 };
 
 pub const WebServer = struct {
@@ -194,11 +211,29 @@ pub const WebServer = struct {
             writeSimple(fd, "200 OK", "text/html; charset=utf-8", INDEX_HTML);
             return;
         }
-        if (std.mem.eql(u8, line.method, "GET") and std.mem.eql(u8, line.path, "/events")) {
-            self.serveSse(fd, line, head);
+        // U10-C:解析 session view + 有效路径。单 session(resolver=null)直取 self.deps(向后兼容
+        // --web);多 session 路径 /s/<id>/rest 经 resolver 按 id 解析(未知→404),rest 作有效路径。
+        var eff_path = line.path;
+        var sv: SessionView = undefined;
+        if (self.deps.resolver) |r| {
+            const sp = parseSessionPrefix(line.path) orelse {
+                writeSimple(fd, "404 Not Found", "application/json", "{\"error\":\"session path required (/s/<id>/...)\"}");
+                return;
+            };
+            sv = r(self.deps.resolver_ctx, sp.id) orelse {
+                writeSimple(fd, "404 Not Found", "application/json", "{\"error\":\"unknown session\"}");
+                return;
+            };
+            eff_path = sp.rest;
+        } else {
+            sv = self.singleView();
+        }
+
+        if (std.mem.eql(u8, line.method, "GET") and std.mem.eql(u8, eff_path, "/events")) {
+            self.serveSse(fd, line, head, sv);
             return;
         }
-        if (std.mem.eql(u8, line.method, "POST") and std.mem.eql(u8, line.path, "/message")) {
+        if (std.mem.eql(u8, line.method, "POST") and std.mem.eql(u8, eff_path, "/message")) {
             const text = extractMessageText(self.allocator, body) orelse {
                 writeSimple(fd, "400 Bad Request", "application/json", "{\"error\":\"empty message\"}");
                 return;
@@ -208,38 +243,38 @@ pub const WebServer = struct {
             const echo = std.json.Stringify.valueAlloc(self.allocator, .{ .user_message = text }, .{}) catch null;
             if (echo) |e| {
                 defer self.allocator.free(e);
-                self.deps.journal.append(e);
+                sv.journal.append(e);
             }
-            if (!self.deps.inbox.push(text)) {
+            if (!sv.inbox.push(text)) {
                 writeSimple(fd, "500 Internal Server Error", "application/json", "{\"error\":\"queue push failed\"}");
                 return;
             }
             writeSimple(fd, "200 OK", "application/json", "{\"ok\":true}");
             return;
         }
-        if (std.mem.eql(u8, line.method, "POST") and std.mem.eql(u8, line.path, "/respond")) {
+        if (std.mem.eql(u8, line.method, "POST") and std.mem.eql(u8, eff_path, "/respond")) {
             const id = extractRespondId(body) orelse {
                 writeSimple(fd, "400 Bad Request", "application/json", "{\"error\":\"missing id\"}");
                 return;
             };
-            if (self.deps.web_backend.respond(id, body)) {
+            if (sv.web_backend.respond(id, body)) {
                 writeSimple(fd, "200 OK", "application/json", "{\"ok\":true}");
             } else {
                 writeSimple(fd, "409 Conflict", "application/json", "{\"error\":\"no pending request with this id\"}");
             }
             return;
         }
-        if (std.mem.eql(u8, line.method, "POST") and std.mem.eql(u8, line.path, "/command")) {
+        if (std.mem.eql(u8, line.method, "POST") and std.mem.eql(u8, eff_path, "/command")) {
             const cmd = extractStringKey(self.allocator, body, "cmd") orelse {
                 writeSimple(fd, "400 Bad Request", "application/json", "{\"error\":\"missing cmd\"}");
                 return;
             };
             defer self.allocator.free(cmd);
-            const cf = self.deps.command_fn orelse {
+            const cf = sv.command_fn orelse {
                 writeSimple(fd, "501 Not Implemented", "application/json", "{\"error\":\"commands unavailable\"}");
                 return;
             };
-            const res = cf(self.deps.state_ctx, self.allocator, cmd) catch {
+            const res = cf(sv.state_ctx, self.allocator, cmd) catch {
                 writeSimple(fd, "500 Internal Server Error", "application/json", "{\"ok\":false,\"message\":\"command failed\"}");
                 return;
             };
@@ -247,11 +282,11 @@ pub const WebServer = struct {
             writeSimple(fd, "200 OK", "application/json", res);
             return;
         }
-        if (std.mem.eql(u8, line.method, "POST") and std.mem.eql(u8, line.path, "/interrupt")) {
+        if (std.mem.eql(u8, line.method, "POST") and std.mem.eql(u8, eff_path, "/interrupt")) {
             // 只在生成期放行:/interrupt 的语义是"停止当前生成",不是"退出进程"。
             // 空闲期误打 abort 会被 driver 的空闲循环当 SIGINT 优雅退出信号 → 浏览器
             // Stop 按钮击杀整个 daemon(Round 1 review P0)。有门用门;无门(单测)直打。
-            if (self.deps.generating) |g| {
+            if (sv.generating) |g| {
                 if (!g.load(.acquire)) {
                     writeSimple(fd, "409 Conflict", "application/json", "{\"error\":\"not generating\"}");
                     return;
@@ -259,12 +294,12 @@ pub const WebServer = struct {
             }
             // user_interrupt(非 user_ctrl_c):driver 据此只中断当前 run、不退出进程。
             // 真进程退出是 SIGINT 专属(user_ctrl_c),浏览器无权触发。
-            self.deps.abort.abort(.user_interrupt);
+            sv.abort.abort(.user_interrupt);
             writeSimple(fd, "200 OK", "application/json", "{\"ok\":true}");
             return;
         }
-        if (std.mem.eql(u8, line.method, "GET") and std.mem.eql(u8, line.path, "/state")) {
-            const json = self.deps.state_fn(self.deps.state_ctx, self.allocator) catch {
+        if (std.mem.eql(u8, line.method, "GET") and std.mem.eql(u8, eff_path, "/state")) {
+            const json = sv.state_fn(sv.state_ctx, self.allocator) catch {
                 writeSimple(fd, "500 Internal Server Error", "application/json", "{\"error\":\"state snapshot failed\"}");
                 return;
             };
@@ -275,9 +310,23 @@ pub const WebServer = struct {
         writeSimple(fd, "404 Not Found", "application/json", "{\"error\":\"not found\"}");
     }
 
+    /// U10-C:从 self.deps 单 session 字段构 SessionView(resolver=null 时用)。
+    fn singleView(self: *WebServer) SessionView {
+        return .{
+            .journal = self.deps.journal,
+            .web_backend = self.deps.web_backend,
+            .inbox = self.deps.inbox,
+            .abort = self.deps.abort,
+            .generating = self.deps.generating,
+            .state_ctx = self.deps.state_ctx,
+            .state_fn = self.deps.state_fn,
+            .command_fn = self.deps.command_fn,
+        };
+    }
+
     /// SSE 长连接:从 since 重放 + 阻塞推新。since 来源优先级:?since=N > Last-Event-ID 头 > 0。
     /// id 语义:该行的 seq(0-based);浏览器重连带 Last-Event-ID=最后收到的 seq → 从 seq+1 续。
-    fn serveSse(self: *WebServer, fd: net.Socket, line: RequestLine, head: []const u8) void {
+    fn serveSse(self: *WebServer, fd: net.Socket, line: RequestLine, head: []const u8, sv: SessionView) void {
         var since = resolveSince(line.query, head);
 
         if (!writeAll(fd, "HTTP/1.1 200 OK\r\n" ++
@@ -291,7 +340,7 @@ pub const WebServer = struct {
             // [since, start) 已被环形淘汰(客户端落后保留窗)→ 发 resync 让客户端重拉 /state
             // (config/roster 幂等可重建;丢的是瞬态渲染事件)。frame id 用 start+i(逻辑 seq)。
             var eff_start: usize = since;
-            const batch = self.deps.journal.waitSinceFrom(self.allocator, since, 15_000, &eff_start) catch return;
+            const batch = sv.journal.waitSinceFrom(self.allocator, since, 15_000, &eff_start) catch return;
             if (eff_start > since) {
                 const rsx = std.fmt.allocPrint(self.allocator, "event: resync\ndata: {{\"dropped_to\":{d}}}\n\n", .{eff_start}) catch return;
                 defer self.allocator.free(rsx);
@@ -310,7 +359,7 @@ pub const WebServer = struct {
                 }
                 since += lines.len;
             } else {
-                if (self.deps.journal.isClosed()) {
+                if (sv.journal.isClosed()) {
                     _ = writeAll(fd, "event: session_closed\ndata: {}\n\n");
                     return;
                 }
@@ -324,6 +373,16 @@ pub const WebServer = struct {
 /// CSRF 门:POST 的 Origin 必须是本机同源(http://127.0.0.1:<port> 或 localhost),
 /// 或无 Origin(非浏览器客户端)。返回 true=放行。
 /// 只做前缀+端口精确匹配,不解析 URL——Origin 无路径,形如 "scheme://host:port"。
+/// U10-C:从 `/s/<id>/rest` 解析 {id, rest}(rest 含前导 /)。非此前缀 / id 空 / 无 rest → null。
+pub fn parseSessionPrefix(path: []const u8) ?struct { id: []const u8, rest: []const u8 } {
+    const pfx = "/s/";
+    if (!std.mem.startsWith(u8, path, pfx)) return null;
+    const after = path[pfx.len..];
+    const slash = std.mem.indexOfScalar(u8, after, '/') orelse return null; // 必须有 id 后的 /rest
+    if (slash == 0) return null; // 空 id
+    return .{ .id = after[0..slash], .rest = after[slash..] };
+}
+
 pub fn originAllowed(head: []const u8, port: u16) bool {
     const origin = headerValue(head, "origin") orelse return true; // 无 Origin=非浏览器,放行
     var buf: [64]u8 = undefined;
