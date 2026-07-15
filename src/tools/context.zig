@@ -218,6 +218,12 @@ pub const ToolContext = struct {
     /// id = 该工具的 tool_use id(per-toolUse 多卡按它路由;tool_exec runJob 盖入)。flat 保留(per-job 数据非闭包)。
     progress_tool_id: []const u8 = "",
 
+    /// **U6 A2:工具→父 backend 通知通路**。Task 生 subagent → emit agent_lifecycle;
+    /// TaskUpdate 改 DAG → emit tasks_changed。agent_loop(depth==0)注入,转发到 backend.emitEvent
+    /// (mirror progress_reporter/ProgressTramp)。null = 无(headless/子 agent/纯单测)→ 工具跳过 emit。
+    /// 限定子集(见 EventReporter):只能发 agent_lifecycle/tasks_changed,类型上禁发表达类事件。
+    event_reporter: ?@import("../core/protocol/ui_event.zig").EventReporter = null,
+
     /// 子进程"仍在运行"心跳回调(spawn 层每 2s 调,Bash/WebFetch/Worktree 长命令用)。
     /// 重构前是 tools/common.zig 的进程全局 g_progress_cb(多 Session 串台)。现 per-session 挂
     /// ToolContext,传给 spawnCaptureWithStderrTimed。null = 不显示心跳(headless/非 tty)。

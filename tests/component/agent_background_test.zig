@@ -345,3 +345,66 @@ test "L2 接线: subagent 调 TaskCreate 真成功(独立 store 接通,计数=3)
     // 顺带:不熔断、走到收尾。
     try std.testing.expect(result.stop_reason != .tool_loop);
 }
+
+test "U6 A2: 前台 Task → agent_lifecycle spawned(foreground)+done 经 event_reporter 端到端" {
+    // DoD(声明=接线=测试):agent.execute 前台路径必须真发 spawned+done。构造带 recording
+    // reporter 的 ctx,跑同步子 agent(单轮 end_turn),断言两事件各一次 + 顺序 spawned→done。
+    const a = std.testing.allocator;
+    const ui_event = cc.ui_event;
+
+    const bodies = [_][]const u8{BG_DONE_SSE};
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "k", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    var agents = cc.agents_set.AgentSet.init(a);
+    defer agents.deinit();
+    try agents.loadFromStandardPaths("");
+
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var reg = try cc.agent_job_registry.AgentJobRegistry.init(a, "k", url, "claude-sonnet-4-20250514", .anthropic);
+    defer reg.deinit();
+
+    // recording reporter:按序记事件 tag(spawned/done),验 foreground=true。
+    const Rec = struct {
+        seq: std.ArrayList(u8) = .empty, // 's'=spawned 'd'=done
+        alloc: std.mem.Allocator,
+        fg_spawned: bool = false,
+        fn agentCb(c: *anyopaque, ev: ui_event.AgentLifecycle) void {
+            const self: *@This() = @ptrCast(@alignCast(c));
+            switch (ev) {
+                .spawned => |s| {
+                    self.seq.append(self.alloc, 's') catch {};
+                    self.fg_spawned = s.foreground;
+                },
+                .done => self.seq.append(self.alloc, 'd') catch {},
+                .status => self.seq.append(self.alloc, '?') catch {},
+            }
+        }
+        fn tasksCb(c: *anyopaque, ev: ui_event.TasksChanged) void {
+            _ = c;
+            _ = ev;
+        }
+        fn reporter(self: *@This()) ui_event.EventReporter {
+            return .{ .ctx = @ptrCast(self), .agentFn = &agentCb, .tasksFn = &tasksCb };
+        }
+    };
+    var rec = Rec{ .alloc = a };
+    defer rec.seq.deinit(a);
+
+    var ctx = makeCtx(a, &client, &agents, &perm, &reg);
+    ctx.event_reporter = rec.reporter();
+
+    // 前台(无 run_in_background)→ 阻塞跑完 → spawned 先、done 后。
+    const out = try cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"general-purpose\",\"prompt\":\"hi\",\"description\":\"d\"}");
+    defer a.free(out);
+
+    try std.testing.expectEqualStrings("sd", rec.seq.items); // 恰好 spawned 后 done
+    try std.testing.expect(rec.fg_spawned); // 前台路径 foreground=true
+}

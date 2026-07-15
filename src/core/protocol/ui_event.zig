@@ -112,6 +112,25 @@ pub const ConfigEventSink = struct {
     }
 };
 
+/// **工具→父 backend 的通知通路**(U6 A2)。工具(Task 生 subagent / TaskUpdate 改 DAG)是**单向
+/// 通知**发起方,该上 CoreEvent 跨进程总线,但 ToolContext 原本只有请求-响应 UiRequester +
+/// 工具内 ToolProgressReporter,没有发通知类 CoreEvent 的通路。EventReporter 补这条,**限定子集**
+/// (只 agent_lifecycle / tasks_changed,用两个具名方法而非裸 CoreEvent → 类型上禁止工具乱发
+/// text_chunk/tool_result 等表达类事件;"make illegal states unrepresentable")。
+/// **线程/借用契约**:与 ToolProgressReporter 同——reportFn 转发到 backend.emitEvent,threading
+/// 由 backend 契约兜底(precedent:tool_progress 已从并发工具发);payload slice borrow,emit 同步消费。
+pub const EventReporter = struct {
+    ctx: *anyopaque,
+    agentFn: *const fn (ctx: *anyopaque, ev: AgentLifecycle) void,
+    tasksFn: *const fn (ctx: *anyopaque, ev: TasksChanged) void,
+    pub fn agentLifecycle(self: EventReporter, ev: AgentLifecycle) void {
+        self.agentFn(self.ctx, ev);
+    }
+    pub fn tasksChanged(self: EventReporter, ev: TasksChanged) void {
+        self.tasksFn(self.ctx, ev);
+    }
+};
+
 /// core → UI:agent_loop 产出的事件。在 agent_loop 线程(及工具线程,见 tool_progress)调。
 ///
 /// JSON 序列化:union(enum) 默认有 tag,所有 payload 字段均为值/slice,可直接

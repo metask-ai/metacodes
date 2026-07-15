@@ -19,6 +19,13 @@ const common = @import("common.zig");
 const log = @import("../util/log.zig");
 const KgClient = @import("../kg/client.zig").KgClient;
 
+/// U6 A2:任务 DAG frontier 变更 → 经 event_reporter 发 tasks_changed 信号(默认轻量
+/// invalidated,UI 重拉 frontier)。无 reporter(headless/子 agent/单测)→ no-op。在每个
+/// **成功 mutation** 出口调(create/update/status/delete/stop-todo)。best-effort 不阻塞工具。
+fn noteTasksChanged(ctx: *const ToolContext) void {
+    if (ctx.event_reporter) |r| r.tasksChanged(.invalidated);
+}
+
 /// 任务闭合结构化投影(改动一 —— 分类的"结晶点"):把模型在闭合时提供的
 /// acts_on/uses/produces 写成 concept 节点 + ref 边(默认 tentative)。任务开始时的分类是猜的,
 /// 闭合时才知道真实用了什么——这是"伴随执行浮现、闭合时质量最高"原则的落点。
@@ -189,6 +196,7 @@ pub fn executeCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         try out.appendSlice(ctx.allocator, "\",\"subject\":");
         try writeString(&out, ctx.allocator, subject);
         try out.appendSlice(ctx.allocator, ",\"persisted\":true}}");
+        noteTasksChanged(ctx); // U6:新任务入 frontier
         return try out.toOwnedSlice(ctx.allocator);
     }
 
@@ -201,6 +209,7 @@ pub fn executeCreate(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try out.appendSlice(ctx.allocator, ",\"subject\":");
     try writeString(&out, ctx.allocator, t.subject);
     try out.appendSlice(ctx.allocator, "}}");
+    noteTasksChanged(ctx); // U6:新任务入 frontier
     return try out.toOwnedSlice(ctx.allocator);
 }
 
@@ -486,6 +495,7 @@ fn updateKgTask(ctx: *const ToolContext, node_id_str: []const u8, args: []const 
             appendParallelHint(ctx, &out, &first, parallel_ready) catch {};
             try out.append(ctx.allocator, ']');
             try out.appendSlice(ctx.allocator, "}");
+            noteTasksChanged(ctx); // U6:闭合 → frontier 变(解锁下游)
             return out.toOwnedSlice(ctx.allocator);
         },
         .deleted => {
@@ -494,6 +504,7 @@ fn updateKgTask(ctx: *const ToolContext, node_id_str: []const u8, args: []const 
                 return error.KgDeleteFailed;
             };
             removeKgMirror(ctx, node_id); // store 镜像同步消失
+            noteTasksChanged(ctx); // U6:删除 → frontier 变
             return try ctx.allocator.dupe(u8, "{\"ok\":true,\"deleted\":true}");
         },
         else => {
@@ -524,6 +535,7 @@ fn updateKgTask(ctx: *const ToolContext, node_id_str: []const u8, args: []const 
                     store.updateStatus(kg_id, st) catch {};
                 }
             }
+            noteTasksChanged(ctx); // U6:claim(in_progress)/release(pending) → frontier 变
             if (st == .in_progress) {
                 return try ctx.allocator.dupe(u8, "{\"ok\":true,\"claimed\":true,\"note\":\"已认领(租约落图,其他 session 不会重复领取);完成后 status=completed 闭合\"}");
             }
@@ -552,6 +564,7 @@ pub fn executeUpdate(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         try store.updateStatus(id, st);
         if (st == .deleted) {
             // 删除后不能再拿 id 查找；提前返回避免后续字段更新。
+            noteTasksChanged(ctx); // U6:frontier 变
             return try ctx.allocator.dupe(u8, "{\"ok\":true,\"deleted\":true}");
         }
     }
@@ -610,6 +623,7 @@ pub fn executeUpdate(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         try store.addBlockedBy(id, items);
     }
 
+    noteTasksChanged(ctx); // U6:status/字段/blocks 任一变 → frontier 信号
     return try ctx.allocator.dupe(u8, "{\"ok\":true}");
 }
 
@@ -659,9 +673,11 @@ pub fn executeStop(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         // (degraded 无害),但若模型确实传了就同样生效。
         writeClosureProjection(ctx, kg, node_id, args);
         removeKgMirror(ctx, node_id); // store 镜像同步消失
+        noteTasksChanged(ctx); // U6:TaskStop 闭合 → frontier 变
         return try ctx.allocator.dupe(u8, "{\"ok\":true,\"status\":\"completed\"}");
     }
     try store.updateStatus(id, .completed);
+    noteTasksChanged(ctx); // U6:TaskStop 闭合 → frontier 变
     return try ctx.allocator.dupe(u8, "{\"ok\":true,\"status\":\"completed\"}");
 }
 
@@ -748,6 +764,48 @@ const testing = std.testing;
 
 fn testCtx(store: *task_store.TaskStore) ToolContext {
     return ToolContext{ .allocator = testing.allocator, .tasks = store };
+}
+
+test "U6 A2: tasks_changed 经 event_reporter 在 create/update/stop 各发一次(DoD 端到端接线)" {
+    const ui_event = @import("../core/protocol/ui_event.zig");
+    // 记录型 reporter:数 tasksChanged 次数;agentLifecycle 不该被 task 工具触发。
+    const Rec = struct {
+        tasks: usize = 0,
+        agents: usize = 0,
+        fn tasksCb(c: *anyopaque, ev: ui_event.TasksChanged) void {
+            _ = ev;
+            const self: *@This() = @ptrCast(@alignCast(c));
+            self.tasks += 1;
+        }
+        fn agentCb(c: *anyopaque, ev: ui_event.AgentLifecycle) void {
+            _ = ev;
+            const self: *@This() = @ptrCast(@alignCast(c));
+            self.agents += 1;
+        }
+        fn reporter(self: *@This()) ui_event.EventReporter {
+            return .{ .ctx = @ptrCast(self), .agentFn = &agentCb, .tasksFn = &tasksCb };
+        }
+    };
+    var rec = Rec{};
+    var store = task_store.TaskStore.init(testing.allocator);
+    defer store.deinit();
+    var ctx = testCtx(&store);
+    ctx.event_reporter = rec.reporter();
+
+    testing.allocator.free(try executeCreate(&ctx, "{\"subject\":\"A\",\"description\":\"Da\"}"));
+    try testing.expectEqual(@as(usize, 1), rec.tasks); // create → 1
+
+    testing.allocator.free(try executeUpdate(&ctx, "{\"taskId\":\"1\",\"status\":\"in_progress\"}"));
+    try testing.expectEqual(@as(usize, 2), rec.tasks); // update → 2
+
+    testing.allocator.free(try executeStop(&ctx, "{\"taskId\":\"1\"}"));
+    try testing.expectEqual(@as(usize, 3), rec.tasks); // stop → 3
+
+    // 删除也发。
+    testing.allocator.free(try executeUpdate(&ctx, "{\"taskId\":\"1\",\"status\":\"deleted\"}"));
+    try testing.expectEqual(@as(usize, 4), rec.tasks); // delete → 4
+
+    try testing.expectEqual(@as(usize, 0), rec.agents); // task 工具绝不发 agent_lifecycle
 }
 
 test "TaskCreate + TaskList roundtrip" {

@@ -208,6 +208,14 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .kg = ctx.kg,
             .kg_projects_dir = ctx.kg_projects_dir,
         });
+        // U6 A2:父 session 广播"后台 agent 起了"(spawned)。后台 done 在 job 线程晚发,
+        // 不在此站点(存量债 task#18:cross-thread done → 走 snapshotJobs 轮询或 web journal)。
+        if (ctx.event_reporter) |r| r.agentLifecycle(.{ .spawned = .{
+            .id = job_id,
+            .agent_type = subagent_type_raw,
+            .desc = util_json.extractStringField(args, "description") orelse subagent_type_raw,
+            .foreground = false,
+        } });
         return std.fmt.allocPrint(
             ctx.allocator,
             "{{\"agent_job_id\":\"{s}\",\"status\":\"running\",\"subagent_type\":\"{s}\"}}",
@@ -222,6 +230,13 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     if (ctx.agent_jobs) |reg| {
         fg_entry = reg.registerForeground(subagent_type_raw, fg_desc, prompt);
     }
+    // U6 A2:父 session 广播"前台 agent 起了"(spawned)。同步路径 → done 在本函数末发。
+    if (ctx.event_reporter) |r| r.agentLifecycle(.{ .spawned = .{
+        .id = if (fg_entry) |e| e.idSlice() else "",
+        .agent_type = subagent_type_raw,
+        .desc = fg_desc,
+        .foreground = true,
+    } });
     // 父轮把 Region 1 进度树视为 transient:tool_result 返回后移除该前台 entry。
     defer if (fg_entry) |e| {
         if (ctx.agent_jobs) |reg| reg.removeForeground(e);
@@ -299,6 +314,15 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         const now = @import("../util/time.zig").nowMs();
         fg_elapsed_ms = @intCast(@max(now - start, 0));
     }
+
+    // U6 A2:前台 agent 结束 → done(同步路径,本站点即终态,threading 与 spawned 同)。
+    if (ctx.event_reporter) |r| r.agentLifecycle(.{ .done = .{
+        .id = if (fg_entry) |e| e.idSlice() else "",
+        .state = @tagName(result.stop_reason),
+        .turns = result.turns,
+        .tool_calls = result.tool_calls,
+        .tokens = fg_tokens,
+    } });
 
     // 输出 JSON
     var out: std.ArrayList(u8) = .empty;

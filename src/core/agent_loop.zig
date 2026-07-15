@@ -56,6 +56,22 @@ const ProgressTramp = struct {
     }
 };
 
+/// **U6 A2:工具→父 backend 通知 trampoline**。Task 生 subagent / TaskUpdate 改 DAG 时,工具经
+/// ctx.event_reporter 把 agent_lifecycle / tasks_changed 转发到父 backend.emitEvent。生命周期同
+/// ProgressTramp(栈变量活过 executeSlots;若工具执行改异步跨 turn 持有 ctx,须移到更长寿存储)。
+const EventTramp = struct {
+    be: *const UiBackend,
+    session: @import("session_id.zig").SessionId,
+    fn agentCb(state: *anyopaque, ev: @import("protocol/ui_event.zig").AgentLifecycle) void {
+        const self: *@This() = @ptrCast(@alignCast(state));
+        self.be.emitEvent(self.session, .{ .agent_lifecycle = ev });
+    }
+    fn tasksCb(state: *anyopaque, ev: @import("protocol/ui_event.zig").TasksChanged) void {
+        const self: *@This() = @ptrCast(@alignCast(state));
+        self.be.emitEvent(self.session, .{ .tasks_changed = ev });
+    }
+};
+
 /// 同一工具连续返回同样错误码达到此次数 → 判定模型陷入死循环,熔断中止本轮 run。
 /// 实战痛点(e2e 实测):MiniMax 端点对 Task/TaskCreate 反复发空参 `{}`,触发同一
 /// MissingField 错误,从 ~46 turn 烧到 max_turns=50 才停。3 次足以区分"偶发重试"
@@ -1054,6 +1070,7 @@ pub fn run(
         // 工具进度 trampoline 的 per-run 存储(backend + session),供 progress_state 指向。
         // 声明在 base_ctx 同作用域,生命周期覆盖整个工具执行。
         var progress_tramp: ProgressTramp = undefined;
+        var event_tramp: EventTramp = undefined; // U6 A2:agent_lifecycle/tasks_changed 通知
         var base_ctx = tools_mod.ToolContext{
             .allocator = allocator,
             .abort = opts.abort,
@@ -1099,6 +1116,14 @@ pub fn run(
         if (opts.agent_depth == 0) {
             progress_tramp = .{ .be = backend, .session = sess };
             base_ctx.progress_reporter = .{ .ctx = @ptrCast(&progress_tramp), .reportFn = &ProgressTramp.cb };
+            // U6 A2:同 depth==0 注入 agent_lifecycle/tasks_changed 通知通路。子 agent 不驱动顶层
+            // UI(WebBackend/TuiBackend 对这俩事件 journal/no-op,子 agent 发也无害但语义上父级才广播)。
+            event_tramp = .{ .be = backend, .session = sess };
+            base_ctx.event_reporter = .{
+                .ctx = @ptrCast(&event_tramp),
+                .agentFn = &EventTramp.agentCb,
+                .tasksFn = &EventTramp.tasksCb,
+            };
         }
 
         // 统一 UI 请求回调(AskUserQuestion/权限/plan 审批共用):仅顶层 TUI(depth==0)接——
