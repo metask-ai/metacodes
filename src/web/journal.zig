@@ -139,15 +139,21 @@ pub const EventJournal = struct {
         defer self.unlock();
         // effective start = max(since, base_seq):落后保留窗则夹到 base_seq;领先则等到该 seq 出现。
         var eff = @max(since, self.base_seq);
-        // 等到逻辑 seq eff 有行可返回,即 base_seq + len > eff。等待中 base_seq 可能前进(并发淘汰),
-        // 每次醒来重算 eff(不回退:eff 单调不减,因 base_seq 单调增、since 固定)。
+        // 等到逻辑 seq eff 有行可返回,即 base_seq + len > eff。signal 醒来重算 eff 后重判谓词;
+        // timeout → break(下方无条件重算兜底)。
         while (self.base_seq + self.lines.items.len <= eff and !self.closed) {
             if (!self.cond.timedWait(&self.mutex, timeout_ms * std.time.ns_per_ms)) break;
             eff = @max(since, self.base_seq);
         }
+        // **U7 BLOCKER 修(review)**:timeout-break 路径原不重算 eff → 若并发淘汰使 base_seq 越过旧
+        // eff,下方 phys=eff-base_seq 下溢(usize)→ OOB 崩。故循环退出后**无条件用当前 base_seq 重算
+        // eff**(锁仍持,base_seq 稳定)→ eff>=base_seq 恒成立,不下溢。**注**:此 bug 仅在
+        // ETIMEDOUT-与-signal-同刻(POSIX 允许)的罕见窗触发,无法确定性 red-light;修是把
+        // "eff>=base_seq 后置条件"变成**所有退出路径无条件成立**的防御式不变式(可推理证明,非靠运气)。
+        eff = @max(since, self.base_seq);
         start_out.* = eff;
         if (self.base_seq + self.lines.items.len <= eff) return null; // 超时/closed 且无新行
-        const phys = eff - self.base_seq; // 物理下标(eff >= base_seq 恒成立)
+        const phys = eff - self.base_seq; // 物理下标(eff >= base_seq 恒成立,不下溢)
         const n = self.lines.items.len - phys;
         const out = try allocator.alloc([]u8, n);
         var filled: usize = 0;
@@ -278,6 +284,45 @@ test "U7: 落后保留窗 → waitSinceFrom 报 effective start(SSE resync 信�
     try testing.expectEqual(@as(usize, 2), b.len);
     try testing.expectEqualStrings("e3", b[0]);
     try testing.expectEqualStrings("e4", b[1]);
+}
+
+test "U7 BLOCKER 回归: 等待者在 base_seq 越过其 eff 时不下溢/不 OOB(并发淘汰 vs 超时-break)" {
+    // review BLOCKER:waitSinceFrom 的 timeout-break 路径原不重算 eff → 并发淘汰把 base_seq 推过
+    // 旧 eff 后,phys=eff-base_seq 下溢 → OOB 崩。本测复现:小窗 journal,一个等待者从 since 起等
+    // (进 wait),producer 狂 append+evict 把 base_seq 推到远超 since → 等待者醒来必须夹到当前
+    // base_seq(start_out>=base_seq),绝不下溢/崩。
+    var j = EventJournal.initWithLimits(testing.allocator, 2, 1 << 30); // 只留 2 行
+    defer j.deinit();
+    j.append("seed"); // seq0
+
+    const Producer = struct {
+        fn run(jj: *EventJournal) void {
+            var buf: [16]u8 = undefined;
+            var i: usize = 0;
+            while (i < 500) : (i += 1) {
+                jj.append(std.fmt.bufPrint(&buf, "p{d}", .{i}) catch unreachable);
+            }
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Producer.run, .{&j});
+    // 消费者从 since=0 反复拉:base_seq 会被 producer 推到 ~499。每次拿到的 start_out 必 >= base_seq
+    // 当时值(单调不减),且 phys 不下溢(不崩)。拉到逻辑 seq 追上 count 即停。
+    var cursor: usize = 0;
+    var iters: usize = 0;
+    while (cursor < 500 and iters < 5000) : (iters += 1) {
+        var start: usize = undefined;
+        const batch = (try j.waitSinceFrom(testing.allocator, cursor, 5, &start)) orelse continue;
+        defer {
+            for (batch) |l| testing.allocator.free(l);
+            testing.allocator.free(batch);
+        }
+        // start_out 必 >= cursor(夹到保留窗)且 = 返回批次首行逻辑 seq。不下溢的直接证据:
+        // start >= j.firstSeq 当时(>=0),且 batch.len>0。
+        try testing.expect(start >= cursor);
+        cursor = start + batch.len; // 逻辑 seq 前进(可能因 resync 跳)
+    }
+    t.join();
+    try testing.expectEqual(@as(usize, 501), j.count()); // seed + 500
 }
 
 test "U7: 无淘汰时 base_seq=0,行为与旧版逐字节等价(向后兼容)" {
