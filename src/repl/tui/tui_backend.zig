@@ -238,6 +238,12 @@ pub const TuiBackend = struct {
                         .session_lifecycle => {
                 // U5:TUI 单 session,生命周期由 loop 编排(banner/resume 提示),此处 no-op。
             },
+            .agent_lifecycle => {
+                // U6:TUI 的 agent roster/进度树走 snapshotJobs 轮询路径,不消费此外层事件。no-op。
+            },
+            .tasks_changed => {
+                // U6:TUI 看板走既有 task frontier 注入路径,不消费此信号。no-op。
+            },
 .config_changed => {
                 // U4 A1a:变体就位。A4 接 TUI statusline 重绘(config 变更反映到状态行)。
                 // 当前 no-op(TUI config 变更本就走各自 handler 的直接重绘;A4 统一到 sink)。

@@ -56,6 +56,47 @@ pub const SessionLifecycle = union(enum) {
     closed: []const u8, // session_id
 };
 
+/// **agent 生命周期事件**(U6,诉求②"agent 切换")。父 session 事件流上广播子 agent(Task/subagent)
+/// 的 spawn/状态跃迁/结束,供进程外 UI 画 agent roster/切换。**非** subagent 内层事件转发
+/// (那是 JobEntry.backend 的活)——这是外层"有个 agent 起了/变了/完了"通知。
+/// **state 用 tagName 字符串而非 JobStatus enum**:JobStatus 定义在 agent_job_registry(非 core/protocol),
+/// core 事件不能依赖它(会把 registry 拖进 lib UI-free 图);投影成字符串,同 diag_run_end.stop_reason_name。
+/// payload slice 全 borrow(sink 跨线程留存须 dup,同 config_changed 契约)。
+pub const AgentLifecycle = union(enum) {
+    spawned: struct {
+        id: []const u8, // job id
+        agent_type: []const u8, // "Explore"/"Plan"/…
+        desc: []const u8, // 描述预览
+        foreground: bool, // 前台同步 job vs 后台
+    },
+    status: struct {
+        id: []const u8,
+        state: []const u8, // JobStatus tagName(running/…)
+        turns: u32,
+        tool_calls: u32,
+    },
+    done: struct {
+        id: []const u8,
+        state: []const u8, // 终态(done/failed/aborted)
+        turns: u32,
+        tool_calls: u32,
+        tokens: u64,
+    },
+};
+
+/// **任务 DAG 变更事件**(U6,诉求②"任务完成的 DAG 可视化")。tinykg task frontier 变化时发,
+/// UI 据此重拉/增量更新看板。**默认轻信号 invalidated**(不把整棵 DAG 塞进每次事件——带宽 + journal
+/// 膨胀;全量走 attach 快照 + /tasks 端点);`task` 富载可选(单跃迁便宜,UI 增量)。
+/// payload slice 全 borrow(sink 跨线程留存须 dup)。
+pub const TasksChanged = union(enum) {
+    invalidated: void, // frontier 变了,UI 去拉全量
+    task: struct {
+        id: []const u8, // task 节点 id
+        state: []const u8, // pending/in_progress/completed/…(tagName)
+        claimed_by: []const u8, // agent_ident 或空
+    },
+};
+
 /// **配置变更事件出口**(U4)。App **持有**(非借生成期 backend——config 变更在 run 外的
 /// 空闲点),生命周期=session。各轴的**单写侧**(model→syncModelMirrors、mode→
 /// permission_ctx.setMode、dirs/reasoning→App 方法)在 mutate 后经它 emit。driver 单线程 emit。
@@ -138,6 +179,14 @@ pub const CoreEvent = union(enum) {
     /// **session 生命周期**(U5)。created(seq 0)/loaded(/resume)/closed。进 journal seq 流，
     /// 附着客户端据此见 session 边界起止。
     session_lifecycle: SessionLifecycle,
+
+    /// **agent 生命周期**(U6)。父 session 上广播子 agent spawn/status/done,进程外 UI 画 roster/切换。
+    /// TUI/Writer no-op(TUI 进度树走 snapshotJobs 轮询);web journal → SSE。
+    agent_lifecycle: AgentLifecycle,
+
+    /// **任务 DAG 变更**(U6)。tinykg frontier 变化信号,UI 重拉/增量画看板。TUI/Writer no-op
+    /// (TUI 看板走既有注入路径);web journal → SSE。
+    tasks_changed: TasksChanged,
 
     /// 上下文接近 auto-compact 阈值的主动提示。每个 run 至多发一次。
     context_warning: struct {
