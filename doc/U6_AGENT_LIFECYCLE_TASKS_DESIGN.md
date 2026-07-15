@@ -112,6 +112,17 @@ attach 之前的 spawned/tasks_changed 已反映在快照,之后的走流)。emi
 5. **A5 端到端测试**:MockServer 假模型 spawn subagent → journal 见 agent_lifecycle spawned→done;
    TaskUpdate → journal 见 tasks_changed。+ 附着快照含当前 roster。真模型 e2e(可选,Task 系已有 e2e)。
 
+## 实施状态(2026-07-15)
+
+- ✅ **A1**(9a11b76):中立事件 + CoreEvent 变体 + tui/writer no-op + WebBackend 泛型序列化。test:lib 隔离保持。
+- ✅ **A2**(916f141):EventReporter(限定子集,两具名方法)+ ToolContext.event_reporter + agent_loop EventTramp
+  注入(depth==0)+ agent.zig agent_lifecycle(前台 spawned+done、后台 spawned)+ task_tools.zig tasks_changed
+  (全 mutation 出口)。测试:task_tools 单测 + agent_background 全链组件测。
+- ✅ **A4**(1160011):StateSource.snapshot 加 agents roster(snapshotJobs 线程安全)+ session.zig 测试。
+- ⬜ **A3 富载 task 变体**:当前只发 invalidated(轻信号);task{id,state,claimed_by} 富载未发(设计说可选)。
+- ⬜ **A5 web e2e**:agent_background 组件测已覆盖全链;web SSE JS handler + 真 --web e2e 未做(低优先)。
+- **存量债**:task#18(后台 done/status 跨线程)、task#19(task frontier 进快照,需 U5-式发布缓存)。
+
 ## 5. 待核实(实施前)
 
 - [x] **父 backend 注入点 → 已定位真正的设计缺口**。核实结论:
