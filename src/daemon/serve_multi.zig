@@ -12,9 +12,11 @@
 //! - io_runtime:对齐 agent_job_registry「每 job 独立 Client + 独立 std.Io.Threaded」的**已证并发模式**
 //!   (共享 App io_runtime 跨线程是 agent_job_registry:401 标注的未证风险)。
 //!
-//! **slot[0] 复用 main 预建 app**(已 probe + SIGINT 已装):其 arena=main、io=main、app 由 main 的
-//! `defer app.deinit()` 释放(owns_app=false);slot[1..N] 全新建(own arena+io,serveMulti 释放)。
-//! slot[0] 的 main arena/io 在 serve 期**仅** slot[0] driver 用(主线程只 poll shutdown)→ 无共享竞争。
+//! **slot[0] 复用 main 预建 app**(已 probe + SIGINT 已装):其 arena=main、io=main;但 **app.deinit
+//! 由 serveMulti 做**(owns_app=true)——main 在 serveMulti 返回后走 `std.process.exit` **跳过**其
+//! `defer app.deinit()`(Linus L-low),不 deinit 会漏 reap slot[0] 的 MCP/LSP 子进程(孤儿)。arena/io
+//! 不释放(main 的,OS 退出回收)。slot[1..N] 全新建(own arena+io,serveMulti 全释放)。slot[0] 的 main
+//! arena/io 在 serve 期**仅** slot[0] driver 用(主线程只 poll shutdown)→ 无共享竞争。
 //!
 //! **关停顺序(关键正确性,踩 App.deinit 线程 join 雷)**:App.deinit join 后台 subagent/swarm/LSP/MCP
 //! + 关 api_client → **必在该 session driver join 之后**(否则 driver 还用 client=UAF),又**必在
@@ -45,7 +47,10 @@ const SessionSlot = struct {
     /// null = slot[0](用 main io)。
     io_rt: ?*std.Io.Threaded,
     app: *app_mod.App,
-    /// false = slot[0](main 的 defer app.deinit 负责)。
+    /// true = serveMulti 负责 `app.deinit()`(join 后台线程 + reap MCP/LSP 子进程 + 关 client)。
+    /// **全 slot 均 true**——含 slot[0]:main.zig 在 serveMulti 返回后走 `std.process.exit`,**跳过**其
+    /// `defer app.deinit()`(Linus L-low),故 slot[0] 的子进程 reap 也须由 serveMulti 做,否则孤儿。
+    /// arena/io 是否释放另由 arena/io_rt 是否 null 决定(slot[0] 均 null=main 的,OS 退出回收)。
     owns_app: bool,
     /// wireSlot 成功后为 true;失败/未建时 false(teardown 据此跳过 wb/host)。
     wired: bool = false,
@@ -65,6 +70,34 @@ fn trivialState(_: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
     return allocator.dupe(u8, "{}");
 }
 
+/// **诚实落地页(PM M1)**:多 session 下内嵌单 session SPA 的无前缀 fetch 全 404,故 `GET /` 不返 SPA,
+/// 而返一张列出各 session id + API 端点的说明页(明说浏览器 SPA 仅 --web 单 session,此处为 API 级路由)。
+/// 失败(OOM)返 null → route 兜底返 SPA(至少不炸)。
+fn rootPage(ctx: *anyopaque, allocator: std.mem.Allocator) ?[]u8 {
+    const md: *MultiDaemon = @ptrCast(@alignCast(ctx));
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    buf.appendSlice(allocator, "<!doctype html><meta charset=utf-8><title>metacodes daemon</title>" ++
+        "<body style=\"font-family:system-ui;max-width:52rem;margin:2rem auto;padding:0 1rem\">" ++
+        "<h1>metacodes daemon — multi-session</h1>" ++
+        "<p><b>注意</b>:内嵌浏览器 SPA 仅在单 session <code>--web</code> 模式可用。此处为多 session " ++
+        "<b>API 级路由</b>,浏览器 SPA(<code>/events</code>、<code>/message</code> 等无前缀端点)在本模式不工作。</p>" ++
+        "<h2>Sessions</h2><ul>") catch return null;
+    for (md.slots) |*slot| {
+        if (!slot.wired) continue;
+        buf.appendSlice(allocator, "<li><code>") catch return null;
+        buf.appendSlice(allocator, slot.app.session_id.asSlice()) catch return null; // 24 hex,无需转义
+        buf.appendSlice(allocator, "</code></li>") catch return null;
+    }
+    buf.appendSlice(allocator, "</ul><h2>API</h2><pre>" ++
+        "POST /s/&lt;id&gt;/message   {\"text\":\"...\"}\n" ++
+        "GET  /s/&lt;id&gt;/events    (SSE)\n" ++
+        "POST /s/&lt;id&gt;/interrupt\n" ++
+        "GET  /s/&lt;id&gt;/state     (MVP: {})\n" ++
+        "</pre></body>") catch return null;
+    return buf.toOwnedSlice(allocator) catch null;
+}
+
 /// **resolver(已测机制)**:线性扫 slots 匹配 session_id → 建 SessionView(裸指针指向 slot 的
 /// host.journal/wb/inbox + app.abort)。未匹配 → null(WebServer 回 404)。
 /// slots 静态不 destroy → SessionView 指针满 §4 生命周期契约。
@@ -78,6 +111,7 @@ fn resolveSession(ctx: *anyopaque, id: []const u8) ?SessionView {
                 .web_backend = &slot.wb,
                 .inbox = &slot.host.inbox,
                 .abort = &slot.app.abort,
+                .generating = &slot.host.generating, // S1:/interrupt 生成期门(driver 维护)
                 .state_ctx = @ptrCast(&md.dummy),
                 .state_fn = &trivialState,
             };
@@ -86,8 +120,8 @@ fn resolveSession(ctx: *anyopaque, id: []const u8) ?SessionView {
     return null;
 }
 
-/// 释放 slot 的 App 层资源(**必在其 host 已 destroy=driver join 之后**调):owns 则 app.deinit +
-/// io_runtime + arena。slot[0](owns_app=false)只跳过 app.deinit(main 负责),不碰 io/arena(均 null)。
+/// 释放 slot 的 App 层资源(**必在其 host 已 destroy=driver join 之后**调):owns 则 app.deinit(全
+/// slot 均 owns,含 slot[0])+ io_runtime + arena(slot[0] 的 io/arena=null 跳过,均 main 的 OS 回收)。
 fn freeAppResources(slot: *SessionSlot, web_alloc: std.mem.Allocator) void {
     if (slot.owns_app) slot.app.deinit();
     if (slot.io_rt) |rt| {
@@ -115,6 +149,10 @@ fn teardownSlot(slot: *SessionSlot, web_alloc: std.mem.Allocator) void {
 /// 就位(slot.wired=true);失败 → host 已 destroy、wb 已 deinit、钩子已 reset(slot 仅剩 app/io/arena
 /// 待 caller 经 freeAppResources 收)。**errdefer 顺序**:先注册 wb/钩子清理(LIFO 后跑),后注册
 /// host.destroy(LIFO 先跑)→ 保证失败时**先 join driver 再 deinit wb**(反之 = wb UAF)。
+///
+/// **诚实声明(PM S3)**:此错误路径(host.start/reg.put 失败)由 code review(Linus)+ 上面散文核验,
+/// **无测试触发**——这些失败仅在资源耗尽/session_id 碰撞(近乎不可能)时发生,注入困难。happy-path 由
+/// tests/e2e/daemon_serve_multi_e2e.sh 覆盖。若日后引入更易失败的 wire 步骤,须补错误注入测试。
 fn wireSlot(slot: *SessionSlot, reg: *SessionRegistry, web_alloc: std.mem.Allocator) !void {
     const host = try SessionHost.create(web_alloc, slot.app.session_id, @ptrCast(&slot.dctx), app_driver.driverFn, null, app_driver.abortFn);
     slot.host = host;
@@ -170,7 +208,9 @@ pub fn serveMulti(app0: *app_mod.App, allocator: std.mem.Allocator, config: anyt
     while (i < n) : (i += 1) {
         const slot = &md.slots[i];
         if (i == 0) {
-            slot.* = .{ .arena = null, .io_rt = null, .app = app0, .owns_app = false, .wired = false, .host = undefined, .wb = undefined, .config_sink = undefined, .dctx = undefined };
+            // slot[0]:复用 main 预建 app(arena/io=main 的,不释放);但 **owns_app=true**——main 走
+            // process.exit 跳过 defer app.deinit,serveMulti 须 deinit 它(reap 子进程,消 slot0 孤儿不对称)。
+            slot.* = .{ .arena = null, .io_rt = null, .app = app0, .owns_app = true, .wired = false, .host = undefined, .wb = undefined, .config_sink = undefined, .dctx = undefined };
         } else {
             // 全新 App:独立 arena(page-backed)+ 独立 io_runtime(c_allocator backing,线程安全)。
             const arena = try web_alloc.create(std.heap.ArenaAllocator);
@@ -208,6 +248,8 @@ pub fn serveMulti(app0: *app_mod.App, allocator: std.mem.Allocator, config: anyt
         .state_fn = &trivialState,
         .resolver = &resolveSession,
         .resolver_ctx = @ptrCast(&md),
+        .root_fn = &rootPage, // GET / → 诚实落地页(列 session id + API),非死 SPA(PM M1)
+        .root_ctx = @ptrCast(&md),
     });
 
     std.debug.print("metacodes daemon ({d} sessions): http://127.0.0.1:{d}  (Ctrl+C to quit)\n", .{ n, srv.port });
@@ -225,7 +267,8 @@ pub fn serveMulti(app0: *app_mod.App, allocator: std.mem.Allocator, config: anyt
     for (md.slots) |*slot| web_session.journalSessionLifecycle(&slot.host.journal, web_alloc, .{ .closed = slot.app.session_id.asSlice() });
     // ④ reg.shutdownAll:join 所有 driver(driver 停止用各自 app)+ 释放 host.journal/inbox。
     reg.shutdownAll();
-    // ⑤ 每 slot teardown(driver 已 join,安全 app.deinit)。slot[0] 的 app 由 main defer 收(owns_app=false)。
+    // ⑤ 每 slot teardown(driver 已 join,安全 app.deinit)。全 slot owns_app=true(含 slot[0]:main
+    //    process.exit 跳过其 defer app.deinit,须在此 reap 子进程);slot[0] 的 arena/io=null 不释放(main 的)。
     for (md.slots) |*slot| teardownSlot(slot, web_alloc);
 
     std.debug.print("\ndaemon closed.\n", .{});

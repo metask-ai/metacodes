@@ -41,6 +41,10 @@ pub const SessionHost = struct {
     inbox: MsgQueue, // 客户端消息;driver 线程消费(绑定层如何 push 待其定义)
 
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// **生成期标志**(driver 维护:一轮 agent_loop.run 期间 true,空闲 false)。transport 的
+    /// SessionView.generating 指它:`/interrupt` 只在生成期打 abort(空闲期误打会让下一条消息被
+    /// already-aborted 信号即刻吞掉——PM review S1)。单/多 session daemon 共用此门。
+    generating: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
     driver_ctx: *anyopaque,
     driver_fn: *const fn (host: *SessionHost, ctx: *anyopaque) void,

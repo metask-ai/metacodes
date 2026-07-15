@@ -48,6 +48,12 @@ echo "session A=$A  B=$B"
 code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$dport/s/deadbeefdeadbeefdeadbeef/events")
 [ "$code" = 404 ] || { echo "FAIL: 未知 session 应 404,实得 $code"; exit 1; }
 
+# M1:多 session GET / 返回**诚实落地页**(非死 SPA):标注多 session + API 级路由 + 列出 session id。
+root=$(curl -s "http://127.0.0.1:$dport/")
+echo "$root" | grep -q "multi-session" || { echo "FAIL: GET / 未返多 session 落地页(疑返死 SPA)"; echo "$root" | head -c 300; exit 1; }
+echo "$root" | grep -q "$A" || { echo "FAIL: 落地页未列 session A"; exit 1; }
+echo "$root" | grep -q "$B" || { echo "FAIL: 落地页未列 session B"; exit 1; }
+
 # **只**给 A 发消息(证隔离:B 不应收到)。
 ack=$(curl -s -X POST "http://127.0.0.1:$dport/s/$A/message" -H "Origin: http://127.0.0.1:$dport" -d '{"text":"hi-A"}')
 echo "$ack" | grep -q '"ok":true' || { echo "FAIL: /s/$A/message 未接受: $ack"; exit 1; }
@@ -62,7 +68,13 @@ evB=$(curl -s --max-time 3 "http://127.0.0.1:$dport/s/$B/events")
 echo "$evB" | grep -q "DAEMON_OK" && { echo "FAIL: 路由串台!A 的消息进了 B 的 journal"; echo "$evB"; exit 1; }
 echo "$evB" | grep -q '"run_done"' && { echo "FAIL: 路由串台!B 出现 run_done(未发消息却跑了)"; echo "$evB"; exit 1; }
 
-# B 独立可用:给 B 发消息 → B 的 /events 现出 DAEMON_OK(证 B driver 也真跑,非死 session)。
+# S1:B 空闲期误打 /interrupt 应被 generating 门挡(409),**绝不吞掉随后的消息**。
+# 真牙:若 SessionView 丢 generating 门(回归),此 interrupt 会 abort → 下面 B 的消息被 already-aborted
+# 即刻中断 → 无 DAEMON_OK → 后续断言 FAIL。
+icode=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$dport/s/$B/interrupt" -H "Origin: http://127.0.0.1:$dport")
+[ "$icode" = 409 ] || { echo "FAIL: 空闲期 /interrupt 应 409(generating 门缺失=S1 回归),实得 $icode"; exit 1; }
+
+# B 独立可用:给 B 发消息 → B 的 /events 现出 DAEMON_OK(证 B driver 真跑 + 上面误 interrupt 未吞消息)。
 ackB=$(curl -s -X POST "http://127.0.0.1:$dport/s/$B/message" -H "Origin: http://127.0.0.1:$dport" -d '{"text":"hi-B"}')
 echo "$ackB" | grep -q '"ok":true' || { echo "FAIL: /s/$B/message 未接受: $ackB"; exit 1; }
 evB2=$(curl -s --max-time 3 "http://127.0.0.1:$dport/s/$B/events")

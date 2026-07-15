@@ -114,7 +114,23 @@ persist transcript → ③ destroy registry → 退出。**逐 session 优雅**,
 - [ ] U9 是否值得独立先落:若 U10 紧接做,U9 可作为 U10-A 的第一步(避免孤儿 shutdown 抽象无消费者)。
   倾向**U9 与 U10 同批**(shutdown 信号第一个消费者 = daemon),TUI/web 兼容重构随之。
 
-## 5. serve-multi 实施计划(U10-C 消费者,下一迭代 —— 已 code-level 勘定)
+## 5. serve-multi(U10-C 消费者)—— ✅ 已落地(5e66ef7 + review 收口)
+
+**状态**:`metacodes serve --sessions N [port]` 已实现并 e2e 证明(路由隔离 + 未知→404 + 双 driver 并发
++ SIGINT 优雅关停 + M1 落地页 + S1 /interrupt 门)。Linus review LGTM(8 次真跑含 3-session SSE 横跨
+SIGINT 无 UAF);PM review 收口后达标。**下方为原始 code-level 勘定 + review 收口的诚实能力边界**。
+
+**⚠️ 能力边界(诚实披露,勿误读为"完整多 session web 应用")**:
+- **多 session 无浏览器 SPA**:内嵌 `index.html` 的 fetch 全走**无前缀**端点(`/events`/`/message`),
+  多 session(resolver≠null)下这些路径 404。故 `GET /` 在多 session 下返**诚实落地页**(列 session id
+  + curl-level API 端点),**不**返死 SPA。浏览器 SPA 仅单 session `--web` 可用。SPA 多 session 化(读
+  URL 前缀改写 fetch)= 后续迭代。
+- **`/state` = trivial `"{}"`**(无 rich attach:seq/roster/config)、**`/command` = 501**(无 slash
+  命令 over HTTP):均 MVP 降级,honest 标注在 serve_multi.zig。
+- **`/interrupt` 有 generating 门**(S1 修:SessionHost.generating,driver 维护)——空闲期误打不吞下条消息。
+- **静态 N**:无 dynamic create/destroy/idle-reap(§4 borrow-UAF 硬约束)。
+
+### 5.1 原始 code-level 勘定(实现依据,保留)
 
 **目标**:用已测的 resolver 起**静态 N-session** daemon(MVP N=2),端到端证明 2 个独立 session
 经 `/s/<id>/*` 路由互不干扰。补上"resolver 只有单测、无 e2e"缺口(PM review #2)。

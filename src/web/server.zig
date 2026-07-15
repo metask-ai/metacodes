@@ -75,6 +75,11 @@ pub const Deps = struct {
     /// lock-hold(见 doc/U9_U10_DAEMON_TIER_DESIGN.md §4)。否则 = 重现 U10-A 删掉的 borrow-UAF。
     resolver: ?*const fn (ctx: *anyopaque, id: []const u8) ?SessionView = null,
     resolver_ctx: *anyopaque = undefined,
+    /// **U10-C:`GET /` 落地页覆盖**。非 null → `GET /` 调它取 HTML(caller-allocated,route 用完 free);
+    /// null → 返内嵌单 session SPA(INDEX_HTML)。多 session(resolver≠null)下 SPA 的 fetch 全走无前缀
+    /// 路径会 404(PM M1),故 serve-multi 用它回一张**诚实落地页**(列 session id + API 端点,不假装 SPA 可用)。
+    root_fn: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator) ?[]u8 = null,
+    root_ctx: *anyopaque = undefined,
 };
 
 pub const WebServer = struct {
@@ -215,6 +220,14 @@ pub const WebServer = struct {
             return;
         }
         if (std.mem.eql(u8, line.method, "GET") and std.mem.eql(u8, line.path, "/")) {
+            // 落地页:root_fn 覆盖(多 session 诚实落地页)优先,否则内嵌单 session SPA。
+            if (self.deps.root_fn) |rf| {
+                if (rf(self.deps.root_ctx, self.allocator)) |html| {
+                    defer self.allocator.free(html);
+                    writeSimple(fd, "200 OK", "text/html; charset=utf-8", html);
+                    return;
+                }
+            }
             writeSimple(fd, "200 OK", "text/html; charset=utf-8", INDEX_HTML);
             return;
         }

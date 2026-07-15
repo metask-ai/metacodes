@@ -77,6 +77,7 @@ pub fn serve(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
         .web_backend = &wb,
         .inbox = &host.inbox, // POST /message → host.inbox(driver 消费)
         .abort = &app.abort,
+        .generating = &host.generating, // S1:/interrupt 生成期门(driver 维护),空闲期误打不吞下条消息
         .state_ctx = @ptrCast(&dummy),
         .state_fn = &trivialState,
     });
