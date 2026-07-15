@@ -74,39 +74,27 @@ fn reply(allocator: std.mem.Allocator, ok: bool, msg: []const u8) ![]u8 {
 
 /// driver 线程执行一个命令(独占 conversation/config/app.allocator,无并发)。
 /// 结果经 journal `{"command_result":{ok,message}}` 事件发回浏览器(异步)。
+///
+/// U2 S3:**不再有独立命令实现**——全走共享 SessionService.exec(与 loop.zig 同一命令面)。
+/// 旧版手抄的 /mode /compact /model 4 条已废(逐字重复的存量债)。web 由此还白捡了
+/// /add-dir /theme /vim + /model 的 provider 守卫(旧 web /model 漏守卫)。
 fn execCommand(app: *app_mod.App, journal: *EventJournal, web_alloc: std.mem.Allocator, cmd: []const u8) void {
+    const session_service = @import("../session_service.zig");
     const trimmed = std.mem.trim(u8, cmd, " \t\r\n");
-    var ok = true;
+    // 拆 verb / args:去前导 `/`,首个空格分界。
+    const body = if (std.mem.startsWith(u8, trimmed, "/")) trimmed[1..] else trimmed;
+    const sp = std.mem.indexOfScalar(u8, body, ' ');
+    const verb = if (sp) |i| body[0..i] else body;
+    const args = if (sp) |i| std.mem.trim(u8, body[i + 1 ..], " \t") else "";
+
+    var svc = session_service.SessionService.init(app);
+    const outcome = svc.exec(app.allocator, verb, args);
     var buf: [256]u8 = undefined;
-    const msg: []const u8 = blk: {
-        if (std.mem.eql(u8, trimmed, "/mode")) {
-            app.cyclePermMode();
-            break :blk std.fmt.bufPrint(&buf, "permission mode → {s}", .{@tagName(app.permMode())}) catch "mode changed";
-        }
-        if (std.mem.eql(u8, trimmed, "/compact")) {
-            // U2 S1:与 loop.zig 共用 App.compactWindow(消除逐字重复)。
-            const r = app.compactWindow();
-            break :blk std.fmt.bufPrint(&buf, "compacted {d} messages ({d} → {d} active)", .{ r.dropped, r.before, r.after }) catch "compacted";
-        }
-        if (std.mem.eql(u8, trimmed, "/model")) {
-            break :blk std.fmt.bufPrint(&buf, "model: {s}", .{app.activeModel()}) catch "model";
-        }
-        if (std.mem.startsWith(u8, trimmed, "/model ")) {
-            const name = std.mem.trim(u8, trimmed[7..], " \t");
-            if (name.len == 0) { ok = false; break :blk "usage: /model <name>"; }
-            // U3:走单一 mutation 入口 switchModel(更新 client=请求真理源 + transcript +
-            // agent_jobs + system_prompt),而非旧的半吊子只写 config.model(那样请求仍用旧
-            // model,是 config.model 漂移 footgun 的实例)。命令在 driver 线程执行,与 loop.zig
-            // 的 /model 同线程模型,调 switchModel 安全。
-            app.switchModel(name) catch |e| {
-                ok = false;
-                break :blk std.fmt.bufPrint(&buf, "model switch failed: {s}", .{@errorName(e)}) catch "model switch failed";
-            };
-            break :blk std.fmt.bufPrint(&buf, "model → {s}", .{app.activeModel()}) catch "model changed";
-        }
-        ok = false;
-        break :blk std.fmt.bufPrint(&buf, "unknown command: {s}", .{trimmed}) catch "unknown command";
+    const msg: []const u8 = switch (outcome.kind) {
+        .unhandled => std.fmt.bufPrint(&buf, "unknown command: {s}", .{trimmed}) catch "unknown command",
+        else => outcome.render(&buf),
     };
+    const ok = outcome.ok and outcome.kind != .unhandled;
     const line = std.json.Stringify.valueAlloc(web_alloc, .{ .command_result = .{ .ok = ok, .message = msg } }, .{}) catch return;
     defer web_alloc.free(line);
     journal.append(line);

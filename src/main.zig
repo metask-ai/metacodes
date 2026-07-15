@@ -904,6 +904,7 @@ test {
     _ = &@import("core/memory/memdir.zig");
     _ = &@import("core/memory/memory_section.zig");
     _ = &@import("app.zig");
+    _ = &@import("session_service.zig");
     _ = &@import("repl/loop.zig");
     _ = &@import("util/abort.zig");
     _ = &@import("util/toolchain.zig");

@@ -111,6 +111,20 @@ pub const CommandOutcome = struct {
 
 U4 在 S3 之后接 event_sink（本设计不含），emit 只放 mutation 方法（不在 exec 再 emit，防双发）。
 
+## 7. S3 实现结论（App 方法=真 choke point）
+
+实现时确认：**真正的 mutation 单一入口是 App 方法**（switchModel/cyclePermMode/compactWindow/
+addDirectory/setTheme/toggleVim/setReasoningEffort）。loop.zig 富 dispatch（/model 查询解析、
+/theme 列变体）与 web（经 svc.exec）**都汇聚到同一批 App 方法**。SessionService 是"命令字符串
+路由 façade"给 web/daemon/GUI；TUI 保留自己的富 dispatch 调同一批 App 方法（不强搬进 svc，
+否则丢 /model 查询等富功能）。
+- **grep-guard PASS**：config.vim_mode/theme/conversation.compact() 写侧各只在对应 App 方法；
+  switchModel/cyclePermMode/addDirectory/setReasoningEffort 直调点全在 loop.zig/tui_backend/svc，
+  无一绕过 App 方法。不变式"所有 session mutation 汇 App 方法"grep 可验且成立。
+- **web 主交付**：execCommand 手抄 4 命令实现整体废弃 → svc.exec；web 白捡 /add-dir /theme /vim
+  + /model provider 守卫（旧 web 漏）。
+- **U4 emit 放 App 方法**（两 UI 都经过的真 choke point），不放 svc（否则 loop.zig 直调 mutation 不 emit）。
+
 ## 6. Linus 拍板结论（已定）
 
 1. **借 *App（定）**。host 层命令路由天然摸 App 多子系统，穿单字段指针只适合叶子 seam。**caveat**：choke point 是**约定非类型强制**，任何拿 *App 的代码仍能绕过 → **S4 必加 grep-guard**：全仓 mutation 写侧除 SessionService/App-seam 外应为 0。
