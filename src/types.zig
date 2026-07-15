@@ -42,6 +42,10 @@ pub const Config = struct {
     /// **U10-D:`serve [port]`**:daemon 模式(经 SessionRegistry+SessionHost 跑 session,SIGINT 优雅
     /// 关停)。当前单 session MVP(多 session /s/<id>/* = U10-C)。null=不启用;0=内核分配端口。
     serve_port: ?u16 = null,
+    /// **U10-C:`serve --sessions N`**:daemon 宿主的静态 session 数(默认 1=单 session serve)。
+    /// >1 → serveMulti(N 个独立 App/journal/driver,WebServer resolver 按 /s/<id>/* 路由)。静态 N,
+    /// 无 dynamic create/destroy(见 doc/U9_U10_DAEMON_TIER_DESIGN.md §4/§5)。
+    serve_sessions: usize = 1,
     /// **U8:`--resume-response <json|@file>`**:恢复一个挂起(suspend.json)的 session。
     /// 值 = 挂起工具(AskUserQuestion/ExitPlanMode/custom)的迟来结果 JSON(`@path` 从文件读)。
     /// 走 headless.resumeSuspended(read suspend.json→resumeRun→清/重写)。需同 session_id
