@@ -66,6 +66,13 @@ pub const Deps = struct {
     command_fn: ?CommandFn = null,
     /// **U10-C:多 session 解析器**。非 null 时,路径 `/s/<id>/rest` 按 id 解析 SessionView(null=未知
     /// session→404);无 /s/ 前缀的非 `/` 路径→404。null=单 session 模式(--web,直用上面字段,向后兼容)。
+    ///
+    /// **⚠️ 生命周期契约(PM/Linus review,必守)**:返回的 SessionView 是 **borrow 快照**(裸指针指向
+    /// 该 session 的 journal/inbox/wb/abort)。handler 在**整个请求期**持这些指针——**尤其 serveSse 阻塞
+    /// waitSinceFrom 最多 15s**。故 resolver **必须保证:被解析的 session 活过所有在飞请求**,即 host
+    /// 绝不可在某连接持其指针时被 destroy。**MVP 满足此约束靠 session 静态**(fixed-N at startup,无
+    /// per-session destroy);引入 dynamic destroy / idle-reap 前**必须**先把签名改成 refcount handle /
+    /// lock-hold(见 doc/U9_U10_DAEMON_TIER_DESIGN.md §4)。否则 = 重现 U10-A 删掉的 borrow-UAF。
     resolver: ?*const fn (ctx: *anyopaque, id: []const u8) ?SessionView = null,
     resolver_ctx: *anyopaque = undefined,
 };
@@ -540,6 +547,21 @@ test "parseRequestLine: 方法/路径/query 拆分" {
     try testing.expectEqualStrings("/message", l2.path);
     try testing.expectEqualStrings("", l2.query);
     try testing.expectEqual(@as(?RequestLine, null), parseRequestLine(""));
+}
+
+test "U10-C: parseSessionPrefix 拆 /s/<id>/rest(边界)" {
+    // 正常:/s/<id>/rest → {id, rest 含前导 /}(rest 保留后续段 + query 由 RequestLine 另拆)。
+    const ok = parseSessionPrefix("/s/abc/events").?;
+    try testing.expectEqualStrings("abc", ok.id);
+    try testing.expectEqualStrings("/events", ok.rest);
+    const nested = parseSessionPrefix("/s/xy/events/state").?; // rest 保留多段
+    try testing.expectEqualStrings("xy", nested.id);
+    try testing.expectEqualStrings("/events/state", nested.rest);
+    // 边界 → null:非 /s/ 前缀 / id 后无 / / 空 id。
+    try testing.expectEqual(@as(?@TypeOf(ok), null), parseSessionPrefix("/events")); // 非前缀
+    try testing.expectEqual(@as(?@TypeOf(ok), null), parseSessionPrefix("/s/abc")); // id 后无 /rest
+    try testing.expectEqual(@as(?@TypeOf(ok), null), parseSessionPrefix("/s/")); // 无 id 无 /
+    try testing.expectEqual(@as(?@TypeOf(ok), null), parseSessionPrefix("/s//events")); // 空 id
 }
 
 test "originAllowed: 同源放行 / 无 Origin 放行(CLI)/ 跨域拒绝(CSRF)" {

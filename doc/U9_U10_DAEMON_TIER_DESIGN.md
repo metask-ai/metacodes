@@ -87,6 +87,16 @@ persist transcript → ③ destroy registry → 退出。**逐 session 优雅**,
 - **U10-E**:e2e(两 session 并发跑、各自 attach/interrupt 互不影响、SIGINT 优雅关全部)。
 
 ## 4. 风险 / 待核实
+- [ ] **⚠️ resolver 的 SessionView-借用生命周期契约(U10-C 机制 063fe4f 引入,PM review 抓)**:
+  WebServer 的 resolver 返回 `SessionView`(**by value = borrow 快照**:裸指针指向 session 的
+  journal/inbox/wb/app.abort)。handler 在**整个请求期**持这些指针——**尤其 serveSse 在
+  `waitSinceFrom(…15_000…)` 无界流式循环里阻塞最多 15s**。这**在 WebServer 层重新引入了 U10-A 精简版
+  删掉的 borrow/UAF 形态**。**当前安全的唯一理由**:单 session(--web)/serve-multi MVP 是**静态
+  session**(fixed-N at startup,无 per-session destroy)→ session 活满 daemon 生命周期 → 无并发销毁 →
+  无 UAF。**硬约束**:serve-multi **绝不可**引入任何 per-session destroy / idle-reap / `/close` 路径,
+  直到 resolver 的生命周期安全解决(refcount handle / lock-hold closure——即 §4 下一条的 access-API
+  决策;届时 resolver **签名会从 by-value 改为 handle**)。整个 daemon 关停仍安全(serve `srv.stop()`
+  drain 所有连接 → `live_conns→0` 后才 `reg.shutdownAll()`)。task#22 登记。
 - [ ] **按 id 借用 host 的访问 API + refcount(option B 已删,待 U10-C/D 消费者按真实需求加)**:
   a570c36 的 lean registry 只做生命周期(create/put/remove/shutdownAll)+ abort_fn,**无 borrow
   API(acquire/get)⇒ 无跨线程借用 ⇒ 无 UAF ⇒ 现在不需要 refcount**。当 U10-C/D 引入绑定层(UDS/web
