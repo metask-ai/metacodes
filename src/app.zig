@@ -142,6 +142,10 @@ pub const App = struct {
     /// permission match_ctx.additional_dirs(accept_edits scope 门)+ ToolContext.additional_dirs
     /// (sandbox 可写白名单)。null = 无。
     additional_dirs_abs: ?[]const []const u8 = null,
+    /// **配置变更事件出口(U4)**:driver(TUI/web)经 setConfigEventSink 设。model/dirs/reasoning
+    /// 单写侧(switchModel/addDirectory/setReasoningEffort)经它 emit config_changed;mode 走
+    /// permission_ctx.event_sink(setConfigEventSink 同步设)。null = 无 UI/headless(不 emit)。
+    config_event_sink: ?@import("core/protocol/ui_event.zig").ConfigEventSink = null,
     /// 当前 TUI 主题(启动时根据 --no-theme + ColorCapability 选;/theme 可改)。
     theme: @import("repl/tui/theme.zig").Theme = @import("repl/tui/theme.zig").dark,
     /// 当前主题 variant(/theme 命令读它显示当前)。
@@ -677,6 +681,9 @@ pub const App = struct {
         app.pending_previous_model_context_window = if (needs_previous_model_compact) previous_window else null;
         app.pending_current_model_context_window = if (needs_previous_model_compact) current_window else null;
 
+        // U4:model 单写侧 emit(syncModelMirrors 后,activeModel() 已是新值)。
+        app.emitConfig(.{ .model = app.activeModel() });
+
         if (new_system_prompt) |sp| {
             if (app.system_prompt) |old| app.allocator.free(old);
             app.system_prompt = sp;
@@ -702,6 +709,7 @@ pub const App = struct {
     pub fn setReasoningEffort(app: *App, effort: types.ReasoningEffort) void {
         app.config.reasoning_effort = effort;
         app.api_client.reasoning_effort = effort;
+        app.emitConfig(.{ .reasoning = effort }); // U4:reasoning 单写侧 emit
     }
 
     pub fn persistLoginSelection(app: *App) void {
@@ -1199,6 +1207,19 @@ pub const App = struct {
         return app.additional_dirs_abs orelse &.{};
     }
 
+    /// **配置变更事件 sink 装配(U4)**:driver(TUI/web)在 session 装配时调。同步设 App 的
+    /// sink(model/dirs/reasoning emit)+ permission_ctx.event_sink(mode emit),两者一致。
+    /// null 清除(deinit / 无 UI)。
+    pub fn setConfigEventSink(app: *App, sink: ?@import("core/protocol/ui_event.zig").ConfigEventSink) void {
+        app.config_event_sink = sink;
+        app.permission_ctx.event_sink = sink;
+    }
+
+    /// 内部:向 config 事件 sink emit 一条(有 sink 才发)。model/dirs/reasoning 单写侧调。
+    fn emitConfig(app: *App, ev: @import("core/protocol/ui_event.zig").ConfigChange) void {
+        if (app.config_event_sink) |s| s.emit(ev);
+    }
+
     /// 收集 project + user settings 的 hooks(Pre+Post),**跨层合并**成一个 HookSet(不再首个覆盖)。
     /// 合并语义:各层 matcher entry 全部并入(project 与 user 的 hook 并存,org 全局 hook 不被项目覆盖)。
     fn loadHooks(app: *App, home: ?[]const u8) !void {
@@ -1281,6 +1302,8 @@ pub const App = struct {
         app.settings = null;
         app.permission_ctx.settings = null;
         try app.loadSettings();
+        // U4:dirs 单写侧 emit(dir 借调用方瞬态 arg,sink 跨线程留存须 dup——见 ConfigEventSink 契约)。
+        app.emitConfig(.{ .dirs = dir });
     }
 
     /// 从 ~/.metacodes/config.json 读 permission_rules 数组。失败仅 log，不影响启动。
@@ -1523,6 +1546,51 @@ test "nextPermMode: Shift+Tab 循环状态机(对齐 cc)" {
         types.PermissionMode.default,
         App.nextPermMode(App.nextPermMode(App.nextPermMode(.default))),
     );
+}
+
+test "U4 A3: reasoning/dirs 单写侧 emit config_changed;setConfigEventSink 同步 mode sink" {
+    const ui_event = @import("core/protocol/ui_event.zig");
+    const Recorder = struct {
+        last: ?ui_event.ConfigChange = null,
+        count: usize = 0,
+        fn emit(ctx: *anyopaque, ev: ui_event.ConfigChange) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.last = ev;
+            self.count += 1;
+        }
+    };
+    var rec = Recorder{};
+    const sink = ui_event.ConfigEventSink{ .ctx = @ptrCast(&rec), .emitFn = &Recorder.emit };
+
+    // 只初始化 setConfigEventSink/setReasoningEffort/emitConfig 触及的字段(undefined App 技巧)。
+    var app: App = undefined;
+    app.config = types.Config{};
+    app.config_event_sink = null;
+    app.permission_ctx = permission_mod.createContext(.default, std.testing.allocator);
+    // api_client 被 setReasoningEffort 写 reasoning_effort 字段——需真 Client。
+    var io_rt = std.Io.Threaded.init(std.testing.allocator, .{});
+    defer io_rt.deinit();
+    app.api_client = client_mod.Client.initWithBaseUrl(std.testing.allocator, io_rt.io(), "k", "m", null);
+    defer app.api_client.deinit();
+
+    // 装配 sink:App + permission_ctx 两处同步设。
+    app.setConfigEventSink(sink);
+    try std.testing.expect(app.permission_ctx.event_sink != null); // mode sink 同步设了
+
+    // reasoning 单写侧 → emit .reasoning
+    app.setReasoningEffort(.high);
+    try std.testing.expectEqual(types.ReasoningEffort.high, rec.last.?.reasoning.?);
+    try std.testing.expectEqual(@as(usize, 1), rec.count);
+
+    // mode 走 permission_ctx.setMode(setConfigEventSink 已同步)→ emit .mode
+    app.permission_ctx.setMode(.plan);
+    try std.testing.expectEqual(types.PermissionMode.plan, rec.last.?.mode);
+    try std.testing.expectEqual(@as(usize, 2), rec.count);
+
+    // 清 sink:不再 emit
+    app.setConfigEventSink(null);
+    app.setReasoningEffort(.low);
+    try std.testing.expectEqual(@as(usize, 2), rec.count); // 无变化
 }
 
 test "U2 S1: toggleVim 翻转 config.vim_mode 返回新值" {
