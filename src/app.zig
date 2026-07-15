@@ -9,6 +9,82 @@ const std = @import("std");
 const pfs = @import("platform").fs;
 const platform_signal = @import("platform").signal;
 const platform_paths = @import("platform").paths;
+const sync = @import("platform").sync;
+
+/// **U5 B1:slice-safe snapshot 发布缓存(A')**。UAF-critical、运行时会 free+reassign 的 slice
+/// 字段(model/dirs)的 owned dup，mutex 守护。核心不变式：这些 slice 的 free+reassign（driver 侧
+/// switchModel/addDirectory）与任何跨线程 读+dup（HTTP /state）**必须经本 mutex 互斥**——否则
+/// HTTP 线程读 live slice 撞 driver 无锁 free = UAF。
+/// **refresh 骑 emit（App.emitConfig）**：emit⟺refresh 一个不变式，因"所有 mutation 都 emit"
+/// (U4 grep-guard 单写侧) 自动保证"所有 mutation 都刷 cache"，零新增枚举义务（不手工 per-mutation refresh）。
+/// 标量(mode/reasoning/usage/generating)不进 cache——值语义无 UAF，跨字段良性 skew（display）。
+/// snapshotSlices/readOwned 返回的 owned slice 束（命名类型：匿名 struct 跨函数不 unify）。
+/// caller free：model + 每个 dirs 元素 + dirs slice。
+pub const SnapshotSlices = struct { model: []u8, dirs: [][]u8 };
+
+const SnapshotCache = struct {
+    mutex: sync.Mutex = .{},
+    allocator: std.mem.Allocator,
+    model: []u8 = &.{}, // owned dup
+    dirs: [][]u8 = &.{}, // owned dup（slice-of-owned）
+
+    fn deinit(self: *SnapshotCache) void {
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
+        self.freeDirsLocked();
+        if (self.model.len > 0) self.allocator.free(self.model);
+        self.model = &.{};
+    }
+    fn freeDirsLocked(self: *SnapshotCache) void {
+        for (self.dirs) |d| self.allocator.free(d);
+        if (self.dirs.len > 0) self.allocator.free(self.dirs);
+        self.dirs = &.{};
+    }
+    /// 刷 model（emitConfig(.model) 骑此）。锁内 free 旧 + dup 新。
+    fn setModel(self: *SnapshotCache, m: []const u8) void {
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
+        const dup = self.allocator.dupe(u8, m) catch return; // OOM:保留旧值(降级不崩)
+        if (self.model.len > 0) self.allocator.free(self.model);
+        self.model = dup;
+    }
+    /// 刷 dirs（emitConfig(.dirs) 骑此）。锁内 free 旧 + dup 新（全量）。
+    fn setDirs(self: *SnapshotCache, dirs: []const []const u8) void {
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
+        var out = self.allocator.alloc([]u8, dirs.len) catch return;
+        var n: usize = 0;
+        for (dirs) |d| {
+            out[n] = self.allocator.dupe(u8, d) catch {
+                for (out[0..n]) |x| self.allocator.free(x);
+                self.allocator.free(out);
+                return; // OOM:保留旧
+            };
+            n += 1;
+        }
+        self.freeDirsLocked();
+        self.dirs = out;
+    }
+    /// 读侧（HTTP /state）：锁内 dup 出 model + dirs 给调用方（caller free）。
+    /// 单次持锁读全部 slice → 这批 slice 彼此一致且都安全（driver free 被锁挡）。
+    fn readOwned(self: *SnapshotCache, alloc: std.mem.Allocator) !SnapshotSlices {
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
+        const m = try alloc.dupe(u8, self.model);
+        errdefer alloc.free(m);
+        var d = try alloc.alloc([]u8, self.dirs.len);
+        var n: usize = 0;
+        errdefer {
+            for (d[0..n]) |x| alloc.free(x);
+            alloc.free(d);
+        }
+        for (self.dirs) |src| {
+            d[n] = try alloc.dupe(u8, src);
+            n += 1;
+        }
+        return .{ .model = m, .dirs = d };
+    }
+};
 const types = @import("types.zig");
 const client_mod = @import("client.zig");
 const api_keys_mod = @import("api/api_keys.zig");
@@ -146,6 +222,10 @@ pub const App = struct {
     /// 单写侧(switchModel/addDirectory/setReasoningEffort)经它 emit config_changed;mode 走
     /// permission_ctx.event_sink(setConfigEventSink 同步设)。null = 无 UI/headless(不 emit)。
     config_event_sink: ?@import("core/protocol/ui_event.zig").ConfigEventSink = null,
+    /// **U5 B1:slice-safe snapshot 发布缓存**。UAF-critical slice(model/dirs)的 mutex 守护 owned dup，
+    /// refresh 骑 emitConfig；/state(HTTP 线程)经 snapshotSlices 安全读。setConfigEventSink 装配时
+    /// seed + 每 emit refresh。null 化在 deinit。见 SnapshotCache。
+    snapshot_cache: ?SnapshotCache = null,
     /// 当前 TUI 主题(启动时根据 --no-theme + ColorCapability 选;/theme 可改)。
     theme: @import("repl/tui/theme.zig").Theme = @import("repl/tui/theme.zig").dark,
     /// 当前主题 variant(/theme 命令读它显示当前)。
@@ -560,6 +640,7 @@ pub const App = struct {
         if (app.rule_set) |*r| r.deinit();
         if (app.settings) |*s| s.deinit();
         app.freeAdditionalDirs();
+        if (app.snapshot_cache) |*c| c.deinit(); // U5 B1
         if (app.sandbox_settings) |*s| s.deinit();
         if (app.hooks) |*h| h.deinit();
         if (app.cwd_abs) |c| app.allocator.free(c);
@@ -1213,11 +1294,46 @@ pub const App = struct {
     pub fn setConfigEventSink(app: *App, sink: ?@import("core/protocol/ui_event.zig").ConfigEventSink) void {
         app.config_event_sink = sink;
         app.permission_ctx.event_sink = sink;
+        // U5 B1:装配 sink 时 seed slice-safe 缓存(首个 emit 前 /state 也有值可读)。
+        if (sink != null) {
+            if (app.snapshot_cache == null) app.snapshot_cache = .{ .allocator = app.allocator };
+            app.snapshot_cache.?.setModel(app.activeModel());
+            app.snapshot_cache.?.setDirs(app.additionalDirs());
+        }
     }
 
     /// 内部:向 config 事件 sink emit 一条(有 sink 才发)。model/dirs/reasoning 单写侧调。
+    /// **U5 B1:refresh 骑 emit**——slice 轴(model/dirs)顺手刷 snapshot_cache(emit⟺refresh 一个
+    /// 不变式,不手工 per-mutation refresh,零枚举债)。
     fn emitConfig(app: *App, ev: @import("core/protocol/ui_event.zig").ConfigChange) void {
+        if (app.snapshot_cache) |*c| switch (ev) {
+            .model => |m| c.setModel(m),
+            .dirs => c.setDirs(app.additionalDirs()), // dirs 全量刷(ev.dirs 只是新增项)
+            else => {}, // mode/reasoning 标量不进 cache
+        };
         if (app.config_event_sink) |s| s.emit(ev);
+    }
+
+    /// **U5 B1:/state(HTTP 线程)安全读 UAF-critical slice**。锁内 dup 出 model+dirs(caller free)。
+    /// driver 的 free+reassign 被 cache mutex 挡 → 无 torn read/UAF。无 cache(未装 sink)→ 直读
+    /// (单线程/无 HTTP 竞争)。
+    pub fn snapshotSlices(app: *App, alloc: std.mem.Allocator) !SnapshotSlices {
+        if (app.snapshot_cache) |*c| return c.readOwned(alloc);
+        // 无 cache:直读(单线程场景,无竞争)
+        const m = try alloc.dupe(u8, app.activeModel());
+        errdefer alloc.free(m);
+        const src = app.additionalDirs();
+        var d = try alloc.alloc([]u8, src.len);
+        var n: usize = 0;
+        errdefer {
+            for (d[0..n]) |x| alloc.free(x);
+            alloc.free(d);
+        }
+        for (src) |s| {
+            d[n] = try alloc.dupe(u8, s);
+            n += 1;
+        }
+        return .{ .model = m, .dirs = d };
     }
 
     /// 收集 project + user settings 的 hooks(Pre+Post),**跨层合并**成一个 HookSet(不再首个覆盖)。
@@ -1591,6 +1707,46 @@ test "U4 A3: reasoning/dirs 单写侧 emit config_changed;setConfigEventSink 同
     app.setConfigEventSink(null);
     app.setReasoningEffort(.low);
     try std.testing.expectEqual(@as(usize, 2), rec.count); // 无变化
+}
+
+test "U5 B1: snapshot_cache slice-safe 并发读——狂 setModel/setDirs 时另线程读+dup 无 UAF/无撕裂" {
+    const a = std.testing.allocator;
+    var cache = SnapshotCache{ .allocator = a };
+    defer cache.deinit();
+    cache.setModel("model-A");
+    const d0 = [_][]const u8{"/proj"};
+    cache.setDirs(&d0);
+
+    // writer 线程:狂 setModel/setDirs(free+reassign 旧 owned)。
+    const Writer = struct {
+        fn run(c: *SnapshotCache) void {
+            var i: usize = 0;
+            while (i < 2000) : (i += 1) {
+                c.setModel(if (i % 2 == 0) "claude-opus-4-8" else "claude-sonnet-5");
+                const dirs = [_][]const u8{ "/a/b/c", "/d/e/f/g" };
+                c.setDirs(&dirs);
+            }
+        }
+    };
+    var th = try std.Thread.spawn(.{}, Writer.run, .{&cache});
+
+    // reader 线程(本线程):同时锁内 dup 读——每次读出的 model/dirs 必须是完整合法值(不 UAF、
+    // 不半新半旧)。若 free vs 读无互斥,这里会崩(UAF)或读到垃圾长度。
+    var j: usize = 0;
+    while (j < 2000) : (j += 1) {
+        const s = try cache.readOwned(a);
+        defer {
+            a.free(s.model);
+            for (s.dirs) |x| a.free(x);
+            a.free(s.dirs);
+        }
+        // model 必是两个合法值之一(完整,非撕裂)。
+        try std.testing.expect(std.mem.eql(u8, s.model, "claude-opus-4-8") or
+            std.mem.eql(u8, s.model, "claude-sonnet-5") or std.mem.eql(u8, s.model, "model-A"));
+        // dirs 每项非空合法(要么初始 /proj，要么新的两项)。
+        for (s.dirs) |dir| try std.testing.expect(dir.len > 0);
+    }
+    th.join();
 }
 
 test "U2 S1: toggleVim 翻转 config.vim_mode 返回新值" {

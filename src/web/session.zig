@@ -49,24 +49,38 @@ const WebConfigSink = struct {
     }
 };
 
-/// /state 快照的数据源:driver 拥有,server 经回调读。
+/// /state 快照的数据源:driver 拥有,server 经回调读(HTTP 线程)。
 const StateSource = struct {
     app: *app_mod.App,
     wb: *WebBackend,
     cmdbox: *MsgQueue, // 斜杠命令队列(HTTP 入队,driver 执行)
+    journal: *EventJournal, // U5 B1:快照带 seq(锁内 count())供附着握手
     generating: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
+    /// **U5 B1:附着快照**（HTTP 线程调）。核心：
+    /// - **seq = journal.count()（锁内，Linus ① 定死）**：语义=下界，客户端订阅 `?since=seq` 严格续接。
+    /// - **slice 字段(model/dirs) 经 app.snapshotSlices 锁内 dup 读**：避免撞 driver free 的 UAF(§1.4)。
+    /// - 标量(mode/usage/generating)直读(值语义良性 skew)。
     fn snapshot(ctx: *anyopaque, allocator: std.mem.Allocator) anyerror![]u8 {
         const self: *StateSource = @ptrCast(@alignCast(ctx));
-        // usage 是 u64 无锁读:与生成线程有良性竞态(至多读到相差一个 delta 的旧值),
-        // 展示用途可接受;不为状态条引入跨线程锁。
-        const u = &self.app.usage;
+        const seq = self.journal.count(); // 锁内取（Linus ①：seq 定序 + 跨线程可见性）
+        // slice-safe 读（cache mutex 内 dup）：model + dirs。
+        const slices = try self.app.snapshotSlices(allocator);
+        defer {
+            allocator.free(slices.model);
+            for (slices.dirs) |d| allocator.free(d);
+            allocator.free(slices.dirs);
+        }
+        const u = &self.app.usage; // u64 无锁读，良性 skew（poll-based）
         return std.json.Stringify.valueAlloc(allocator, .{
-            .model = self.app.activeModel(),
+            .seq = seq,
+            .session_id = self.app.session_id.asSlice(),
+            .model = slices.model,
+            .additional_dirs = slices.dirs,
             .permission_mode = @tagName(self.app.permMode()),
             .input_tokens = u.input_tokens,
             .output_tokens = u.output_tokens,
-            .cost_usd = u.costUsd(self.app.activeModel()),
+            .cost_usd = u.costUsd(slices.model),
             .generating = self.generating.load(.acquire),
             .pending_request_id = self.wb.pendingId(),
         }, .{});
@@ -136,7 +150,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
     defer inbox.deinit();
     var cmdbox = MsgQueue.init(web_alloc);
     defer cmdbox.deinit();
-    var state_src = StateSource{ .app = app, .wb = &wb, .cmdbox = &cmdbox };
+    var state_src = StateSource{ .app = app, .wb = &wb, .cmdbox = &cmdbox, .journal = &journal };
 
     const srv = try WebServer.start(web_alloc, port, .{
         .journal = &journal,
