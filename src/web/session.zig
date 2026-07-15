@@ -43,7 +43,7 @@ const StateSource = struct {
         const u = &self.app.usage;
         return std.json.Stringify.valueAlloc(allocator, .{
             .model = self.app.activeModel(),
-            .permission_mode = @tagName(self.app.config.permission_mode),
+            .permission_mode = @tagName(self.app.permMode()),
             .input_tokens = u.input_tokens,
             .output_tokens = u.output_tokens,
             .cost_usd = u.costUsd(self.app.activeModel()),
@@ -81,7 +81,7 @@ fn execCommand(app: *app_mod.App, journal: *EventJournal, web_alloc: std.mem.All
     const msg: []const u8 = blk: {
         if (std.mem.eql(u8, trimmed, "/mode")) {
             app.cyclePermMode();
-            break :blk std.fmt.bufPrint(&buf, "permission mode → {s}", .{@tagName(app.config.permission_mode)}) catch "mode changed";
+            break :blk std.fmt.bufPrint(&buf, "permission mode → {s}", .{@tagName(app.permMode())}) catch "mode changed";
         }
         if (std.mem.eql(u8, trimmed, "/compact")) {
             // 投影:len() 不变,收缩的是活跃窗口 → 显示活跃计数(否则 N→N 误导)。

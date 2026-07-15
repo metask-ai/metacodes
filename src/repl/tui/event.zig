@@ -48,7 +48,7 @@ pub const LoopAction = enum {
     /// Ctrl+B 生成期把当前主对话转后台续跑(调用方深拷贝 conversation → spawnBackground →
     /// reset 前台)。仅生成期上抛;输入期无意义,dispatch gate 掉。
     background_main,
-    /// Shift+Tab 循环权限模式(调用方改 app.config.permission_mode/permission_ctx)。
+    /// Shift+Tab 循环权限模式(调用方 App.cyclePermMode 只写 permission_ctx.mode=单一源;U2 S2)。
     cycle_perm_mode,
     /// slash 菜单选中(Enter):调用方把 editor buffer 换成选中命令名后**提交**。
     /// 选中项 = complete.slashNthMatch(view, state.slash_sel)。

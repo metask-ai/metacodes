@@ -636,11 +636,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             }
         }
 
-        // 工具可能改了权限模式(EnterPlanMode/ExitPlanMode 写 permission_ctx.mode)。
-        // footer/border 读的是 config.permission_mode → 回同步,否则 TUI 不反映 plan 模式。
-        if (app.config.permission_mode != app.permission_ctx.modeValue()) {
-            app.config.permission_mode = app.permission_ctx.modeValue();
-        }
+        // U2 S2:删掉 config←ctx sync-back hack。permission_mode 单一源=permission_ctx.mode,
+        // footer/border/statusline 都读 app.permMode()(=ctx),工具改 ctx 即时反映,无需回同步。
+        // (旧版双存储靠此 hack 补,web 侧漏了它→/state 陈旧 bug task#14;单一源后根治。)
 
         if (result.stop_reason == .aborted) {
             std.debug.print("\x1b[33m^C (cancelled)\x1b[0m\n", .{});
@@ -1977,7 +1975,7 @@ fn handleConfigCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
         // 当前生效配置(menu-style 摘要)
         std.debug.print("\x1b[1mActive configuration\x1b[0m\n", .{});
         std.debug.print("  model:           \x1b[36m{s}\x1b[0m\n", .{app.activeModel()});
-        std.debug.print("  permission mode: \x1b[36m{s}\x1b[0m  \x1b[2m(Shift+Tab to cycle)\x1b[0m\n", .{@tagName(app.config.permission_mode)});
+        std.debug.print("  permission mode: \x1b[36m{s}\x1b[0m  \x1b[2m(Shift+Tab to cycle)\x1b[0m\n", .{@tagName(app.permMode())});
         std.debug.print("  verbose:         {}\n", .{app.config.verbose});
         std.debug.print("  no_theme:        {}\n", .{app.config.no_theme});
         std.debug.print("  skills loaded:   {d}\n", .{app.skills.len()});

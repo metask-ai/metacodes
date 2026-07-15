@@ -17,7 +17,7 @@ pub fn render(app: *const app_mod.App) void {
     const total_tokens = u.input_tokens + u.output_tokens;
     const cost = u.costUsd(app.activeModel());
 
-    const mode_str = switch (app.config.permission_mode) {
+    const mode_str = switch (app.permMode()) {
         .default => "default",
         .accept_edits => "acceptEdits",
         .plan => "plan",

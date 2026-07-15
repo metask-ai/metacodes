@@ -455,7 +455,7 @@ pub const RenderRegion = struct {
         w.writeAll(ansi.cursor.column(1, &nbuf)) catch {};
 
         const inner_w: usize = self.innerWidth();
-        const border_color = self.borderColor(app.config.permission_mode);
+        const border_color = self.borderColor(app.permMode());
 
         // shell 模式(对齐 cc DIFF#3):buffer 以 `!` 开头 → 前缀 `!`(替 ❯),内容去掉 `!`、footer
         // 变 `! for shell mode`、placeholder 变。`! ` 与 `❯ ` 同宽(2 列),layout 用 body 不偏移。
@@ -1768,7 +1768,7 @@ pub const RenderRegion = struct {
         w.writeAll(ansi.clear.to_end_of_screen) catch {};
 
         const inner_w: usize = self.innerWidth();
-        const border_color = self.borderColor(app.config.permission_mode);
+        const border_color = self.borderColor(app.permMode());
         const content = self.gen_view;
 
         var vlines = VisualLines.init();

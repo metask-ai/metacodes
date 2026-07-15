@@ -925,10 +925,19 @@ pub const App = struct {
         };
     }
 
+    /// **当前权限模式的单一运行时真理源(U2 S2)**:permission_ctx.mode(atomic load)。
+    /// `config.permission_mode` 降级为**启动快照**(parseArgs 设 → init 经 createContext 播种
+    /// ctx.mode),运行时一律读 permMode(),不读 config.permission_mode。套 U3 config.model 模式,
+    /// 从构造上消除 config/ctx 双存储 desync——旧版靠 loop.zig sync-back hack + web 漏 sync 致
+    /// /state 陈旧 bug(task#14),根因就是两份真理源。ctx.mode 是 atomic → 此读是 atomic load。
+    pub fn permMode(app: *const App) types.PermissionMode {
+        return app.permission_ctx.modeValue();
+    }
+
     /// Shift+Tab:循环权限模式 default → acceptEdits → plan → default(对齐 Claude Code)。
-    /// 改 config + permission_ctx;footer 读 live permission_ctx.mode 即反映。两期(loop/tui_backend)共用。
+    /// **只写 permission_ctx.mode(单一源,U2 S2)**;所有读方(footer/statusline/web /state)走 permMode()。
     pub fn cyclePermMode(app: *App) void {
-        const from = app.config.permission_mode;
+        const from = app.permMode();
         const to = nextPermMode(from);
         // 经 Shift+Tab 进/出 plan 时同步维护 plan_prev_mode,使 ExitPlanMode(approve)能恢复
         // 到进 plan 前的真实模式(否则回退 default)。进 plan:记 from;离开 plan:清。
@@ -937,7 +946,6 @@ pub const App = struct {
         } else if (from == .plan and to != .plan) {
             app.plan_prev_mode = null;
         }
-        app.config.permission_mode = to;
         app.permission_ctx.setMode(to);
     }
 
@@ -1104,15 +1112,14 @@ pub const App = struct {
 
         // disableBypassPermissionsMode / disableAutoMode 强制:若 settings 禁用了某模式
         // 而当前正处于该模式,降级到 default + 警告(对齐官方:这两个开关是硬约束)。
-        const canon = @import("permission/mode.zig").canonical(app.config.permission_mode);
+        // U2 S2:读走 permMode()(单一源),降级只写 ctx。init 时 ctx 已由 createContext 播种。
+        const canon = @import("permission/mode.zig").canonical(app.permMode());
         if (app.settings.?.isBypassDisabled() and canon == .bypass_permissions) {
             @import("util/log.zig").warn("permission", "bypassPermissions disabled by settings → downgraded to default", .{});
-            app.config.permission_mode = .default;
             app.permission_ctx.setMode(.default);
         }
         if (app.settings.?.isAutoModeDisabled() and canon == .auto) {
             @import("util/log.zig").warn("permission", "auto mode disabled by settings → downgraded to default", .{});
-            app.config.permission_mode = .default;
             app.permission_ctx.setMode(.default);
         }
 
@@ -1481,6 +1488,29 @@ test "nextPermMode: Shift+Tab 循环状态机(对齐 cc)" {
         types.PermissionMode.default,
         App.nextPermMode(App.nextPermMode(App.nextPermMode(.default))),
     );
+}
+
+test "U2 S2: permission_mode 单一源 — permMode 读 ctx,cyclePermMode 只写 ctx,工具 setMode 即时反映" {
+    // cyclePermMode 只触及 permission_ctx + plan_prev_mode → 用 undefined App 只初始化这两个字段
+    // (其余字段永不被读,安全)。锁住"config.permission_mode 不再是运行时真理源"这个不变式。
+    var app: App = undefined;
+    app.permission_ctx = permission_mod.createContext(.default, std.testing.allocator);
+    app.plan_prev_mode = null;
+
+    try std.testing.expectEqual(types.PermissionMode.default, app.permMode());
+    app.cyclePermMode(); // default → accept_edits
+    try std.testing.expectEqual(types.PermissionMode.accept_edits, app.permMode());
+    app.cyclePermMode(); // accept_edits → plan:记 plan_prev_mode=from
+    try std.testing.expectEqual(types.PermissionMode.plan, app.permMode());
+    try std.testing.expectEqual(types.PermissionMode.accept_edits, app.plan_prev_mode.?);
+    app.cyclePermMode(); // plan → default:清 plan_prev_mode
+    try std.testing.expectEqual(types.PermissionMode.default, app.permMode());
+    try std.testing.expect(app.plan_prev_mode == null);
+
+    // task#14 修复机制:工具(EnterPlanMode/ExitPlanMode)只写 permission_ctx.mode,
+    // permMode()=ctx 即时反映(旧版靠 loop.zig sync-back 补 config,web 漏了它致 /state 陈旧)。
+    app.permission_ctx.setMode(.plan);
+    try std.testing.expectEqual(types.PermissionMode.plan, app.permMode()); // web /state 现在读这个,不陈旧
 }
 
 test "U3 syncModelMirrors: 所有 model 镜像同步(含 swarm.model,Linus U3 抓的第7点)" {

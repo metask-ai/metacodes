@@ -25,7 +25,7 @@ pub const StatusBar = struct {
         const u = app.usage;
         const total_tokens = u.input_tokens + u.output_tokens;
         const cost = u.costUsd(app.activeModel());
-        const mode_str = modeName(app.config.permission_mode);
+        const mode_str = modeName(app.permMode());
 
         var tok_buf: [16]u8 = undefined;
         const tok_str = formatTokens(&tok_buf, total_tokens);
