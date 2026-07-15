@@ -1023,4 +1023,6 @@ test {
     _ = &@import("web/backend.zig");
     _ = &@import("web/server.zig");
     _ = &@import("web/session.zig");
+    _ = &@import("daemon/registry.zig"); // U10:否则其 test 被 lazy analysis 跳过(Linus 抓的"测试从不跑")
+    _ = &@import("core/shutdown.zig");
 }
