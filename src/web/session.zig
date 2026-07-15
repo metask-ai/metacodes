@@ -84,10 +84,9 @@ fn execCommand(app: *app_mod.App, journal: *EventJournal, web_alloc: std.mem.All
             break :blk std.fmt.bufPrint(&buf, "permission mode → {s}", .{@tagName(app.permMode())}) catch "mode changed";
         }
         if (std.mem.eql(u8, trimmed, "/compact")) {
-            // 投影:len() 不变,收缩的是活跃窗口 → 显示活跃计数(否则 N→N 误导)。
-            const before = app.conversation.activeMessages().len;
-            const dropped = app.conversation.compact(100_000) catch 0;
-            break :blk std.fmt.bufPrint(&buf, "compacted {d} messages ({d} → {d} active)", .{ dropped, before, app.conversation.activeMessages().len }) catch "compacted";
+            // U2 S1:与 loop.zig 共用 App.compactWindow(消除逐字重复)。
+            const r = app.compactWindow();
+            break :blk std.fmt.bufPrint(&buf, "compacted {d} messages ({d} → {d} active)", .{ r.dropped, r.before, r.after }) catch "compacted";
         }
         if (std.mem.eql(u8, trimmed, "/model")) {
             break :blk std.fmt.bufPrint(&buf, "model: {s}", .{app.activeModel()}) catch "model";

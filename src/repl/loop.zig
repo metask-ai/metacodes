@@ -349,10 +349,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/compact")) {
+            // U2 S1:压缩逻辑下沉 App.compactWindow(与 web 共用),渲染留此。
             // 投影:len() 不变(原始不删),真正收缩的是活跃窗口 → 显示活跃计数,否则 N→N 误导用户。
-            const before = app.conversation.activeMessages().len;
-            const dropped = app.conversation.compact(100_000) catch 0;
-            std.debug.print("Compacted {d} old messages ({d} → {d} active).\n", .{ dropped, before, app.conversation.activeMessages().len });
+            const r = app.compactWindow();
+            std.debug.print("Compacted {d} old messages ({d} → {d} active).\n", .{ r.dropped, r.before, r.after });
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/goal") or std.mem.startsWith(u8, trimmed, "/goal ")) {
@@ -434,8 +434,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/vim")) {
-            app.config.vim_mode = !app.config.vim_mode;
-            std.debug.print("editor mode: \x1b[36m{s}\x1b[0m\n", .{if (app.config.vim_mode) "vim" else "emacs"});
+            const on = app.toggleVim(); // U2 S1:状态下沉 App.toggleVim,渲染留此
+            std.debug.print("editor mode: \x1b[36m{s}\x1b[0m\n", .{if (on) "vim" else "emacs"});
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/agents")) {
@@ -3009,7 +3009,6 @@ fn handlePermissions(app: *app_mod.App) void {
 /// /theme:列当前 / 切预设(dark / light / mono / auto)
 fn handleTheme(app: *app_mod.App, rest: []const u8) void {
     const theme_mod = @import("tui/theme.zig");
-    const tui_term = @import("tui/term.zig");
     if (rest.len == 0) {
         const variants = [_][]const u8{ "auto", "dark", "light", "mono" };
         std.debug.print("current theme: \x1b[36m{s}\x1b[0m\n", .{theme_mod.variantName(app.theme_variant)});
@@ -3024,24 +3023,13 @@ fn handleTheme(app: *app_mod.App, rest: []const u8) void {
         std.debug.print("unknown theme '{s}'. try: auto, dark, light, mono\n", .{rest});
         return;
     };
-    app.theme_variant = variant;
-    const cap = tui_term.detectFromEnv(1);
-    app.theme = theme_mod.select(variant, cap);
+    // U2 S1:状态操作(变体/theme/持久化)下沉 App.setTheme,渲染留此。
     std.debug.print("theme switched to \x1b[36m{s}\x1b[0m\n", .{theme_mod.variantName(variant)});
-
-    // 持久化到 ~/.metacodes/config.json
-    const tui_config = @import("tui/config.zig");
-    const home = @import("platform").paths.homeDir();
-    if (home) |home_slice| {
-        // 临时 arena 给 saveTheme 用
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
-        tui_config.saveTheme(arena.allocator(), home_slice, variant) catch |e| {
-            std.debug.print("\x1b[2m(persist failed: {s})\x1b[0m\n", .{@errorName(e)});
-            return;
-        };
-        std.debug.print("\x1b[2m(saved to ~/.metacodes/config.json)\x1b[0m\n", .{});
-    }
+    const persisted = app.setTheme(variant) catch |e| {
+        std.debug.print("\x1b[2m(persist failed: {s})\x1b[0m\n", .{@errorName(e)});
+        return;
+    };
+    if (persisted) std.debug.print("\x1b[2m(saved to ~/.metacodes/config.json)\x1b[0m\n", .{});
 }
 
 /// libc system(3)(0.16 std.c 无绑定):fork + /bin/sh -c + waitpid,stdio 继承父进程。

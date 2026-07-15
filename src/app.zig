@@ -949,6 +949,41 @@ pub const App = struct {
         app.permission_ctx.setMode(to);
     }
 
+    /// 设置 TUI 主题(变体 → 派生 theme → 持久化 ~/.metacodes/config.json)。U2 S1:抽出
+    /// 原 loop.zig handleTheme 的**状态操作**(变体/theme/持久化),渲染留调用方。
+    /// 返回 true=已持久化，false=无 HOME 跳过持久化(theme 仍已切);持久化 IO 失败返 error。
+    /// cap 探测走 term(UI 环境)——init 也这么做。
+    pub fn setTheme(app: *App, variant: @import("repl/tui/theme.zig").Variant) !bool {
+        const theme_mod = @import("repl/tui/theme.zig");
+        const tui_term = @import("repl/tui/term.zig");
+        app.theme_variant = variant;
+        const cap = tui_term.detectFromEnv(1);
+        app.theme = theme_mod.select(variant, cap);
+        const tui_config = @import("repl/tui/config.zig");
+        const home = @import("platform").paths.homeDir() orelse return false;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        try tui_config.saveTheme(arena.allocator(), home, variant);
+        return true;
+    }
+
+    /// 翻转 editor vim 模式,返回新值。U2 S1:抽出原 loop.zig /vim 内联翻转。
+    pub fn toggleVim(app: *App) bool {
+        app.config.vim_mode = !app.config.vim_mode;
+        return app.config.vim_mode;
+    }
+
+    pub const CompactResult = struct { dropped: usize, before: usize, after: usize };
+
+    /// 压缩上下文窗口(投影语义:原始消息不删,推进 boundary)。返回结构化结果供各 UI 渲染。
+    /// U2 S1:抽出原 loop.zig /compact 与 web execCommand /compact 的**逐字重复**逻辑,两源共用。
+    pub fn compactWindow(app: *App) CompactResult {
+        const before = app.conversation.activeMessages().len;
+        const dropped = app.conversation.compact(100_000) catch 0;
+        const after = app.conversation.activeMessages().len;
+        return .{ .dropped = dropped, .before = before, .after = after };
+    }
+
     /// Ctrl+X Ctrl+K:杀所有 running 后台任务,返回 killed 数。两期共用。
     pub fn killAllBackground(app: *App) usize {
         const jobs = if (app.jobs) |*j| j else return 0;
@@ -1488,6 +1523,27 @@ test "nextPermMode: Shift+Tab 循环状态机(对齐 cc)" {
         types.PermissionMode.default,
         App.nextPermMode(App.nextPermMode(App.nextPermMode(.default))),
     );
+}
+
+test "U2 S1: toggleVim 翻转 config.vim_mode 返回新值" {
+    var app: App = undefined;
+    app.config = types.Config{}; // 默认 vim_mode=false
+    try std.testing.expect(!app.config.vim_mode);
+    try std.testing.expect(app.toggleVim()); // → true
+    try std.testing.expect(app.config.vim_mode);
+    try std.testing.expect(!app.toggleVim()); // → false
+    try std.testing.expect(!app.config.vim_mode);
+}
+
+test "U2 S1: compactWindow 结构化返回 {dropped,before,after}(loop/web 共用)" {
+    const a = std.testing.allocator;
+    var app: App = undefined;
+    app.conversation = Conversation.init(a);
+    defer app.conversation.deinit();
+    // 空对话:compact 无可丢 → dropped=0, before=after=0(投影语义,活跃计数)
+    const r = app.compactWindow();
+    try std.testing.expectEqual(@as(usize, 0), r.dropped);
+    try std.testing.expectEqual(r.before, r.after); // 空窗口不缩
 }
 
 test "U2 S2: permission_mode 单一源 — permMode 读 ctx,cyclePermMode 只写 ctx,工具 setMode 即时反映" {
