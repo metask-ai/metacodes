@@ -24,7 +24,7 @@ pub const StatusBar = struct {
     ) !usize {
         const u = app.usage;
         const total_tokens = u.input_tokens + u.output_tokens;
-        const cost = u.costUsd(app.config.model);
+        const cost = u.costUsd(app.activeModel());
         const mode_str = modeName(app.config.permission_mode);
 
         var tok_buf: [16]u8 = undefined;
@@ -45,7 +45,7 @@ pub const StatusBar = struct {
 
         try writer.print("{s}{s} · {s} · {s} tok · ${d:.4}{s}{s}", .{
             theme.dim,
-            app.config.model,
+            app.activeModel(),
             mode_str,
             tok_str,
             cost,

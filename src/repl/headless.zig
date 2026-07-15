@@ -66,7 +66,7 @@ pub fn run(
             .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(),
             .home_dir = app.homeDir(),
             .agents = &app.agents,
-            .parent_model = app.config.model,
+            .parent_model = app.activeModel(),
             .skills_set = &app.skills,
             .mcp_sessions = &app.mcp_sessions.items,
             .cron_registry = &app.cron_registry,
@@ -96,7 +96,7 @@ pub fn run(
     defer if (final_text.len > 0) allocator.free(final_text);
 
     if (json_output) {
-        try emitJson(allocator, final_text, result, &app.usage, app.config.model);
+        try emitJson(allocator, final_text, result, &app.usage, app.activeModel());
     } else {
         // 纯文本：直接打模型最终回复 + 结尾换行
         writeStdout(final_text);

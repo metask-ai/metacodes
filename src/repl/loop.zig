@@ -376,7 +376,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         }
         if (std.mem.eql(u8, trimmed, "/cost")) {
             const u = app.usage;
-            const cost = u.costUsd(app.config.model);
+            const cost = u.costUsd(app.activeModel());
             std.debug.print(
                 \\Usage ({s}):
                 \\  input         {d} tokens
@@ -385,7 +385,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                 \\  cache create  {d} tokens
                 \\  total cost    ${d:.6} USD
                 \\
-            , .{ app.config.model, u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, cost });
+            , .{ app.activeModel(), u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, cost });
             continue;
         }
         if (std.mem.eql(u8, trimmed, "/models")) {
@@ -602,7 +602,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             app.provider(),
             app.tool_defs,
             &app.permission_ctx,
-            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .lsp = app.lsp_service, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .swarm = &app.swarm, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = scoped_recall, .max_turns = maxTurnsFromEnv(), .cost_budget_usd = costBudgetFromEnv(), .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.config.model, .model_switch_compact = app.pendingModelSwitchCompact(), .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
+            .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .background_request = &app.background_request, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .lsp = app.lsp_service, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .swarm = &app.swarm, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = scoped_recall, .max_turns = maxTurnsFromEnv(), .cost_budget_usd = costBudgetFromEnv(), .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .activated_tools = &app.activated_tools, .project_dir = app.project_dir_or_empty(), .agents = &app.agents, .parent_model = app.activeModel(), .model_switch_compact = app.pendingModelSwitchCompact(), .skills_set = &app.skills, .ui_requester = if (tui_be) |*tb| .{ .ctx = @as(*anyopaque, @ptrCast(tb)), .requestFn = &tui_backend_mod.TuiBackend.uiRequestTrampoline } else null, .mcp_sessions = &app.mcp_sessions.items, .cron_registry = &app.cron_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true, .spawn_tick_fn = spawn_tick },
             effective_be,
             allocator,
         ) catch |err| {
@@ -677,7 +677,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         }
         // 成本预算撞墙(次闸):明确告知累计成本,非静默,不自动续——由用户决定是否继续烧钱。
         if (result.stop_reason == .budget) {
-            std.debug.print("\x1b[33m已达成本预算上限(本会话累计 ${d:.4})。本轮中止——由你决定是否继续。\n直接输入\"继续\"可续接,或调高 METACODES_COST_BUDGET / 调整方向。\x1b[0m\n", .{app.usage.costUsd(app.config.model)});
+            std.debug.print("\x1b[33m已达成本预算上限(本会话累计 ${d:.4})。本轮中止——由你决定是否继续。\n直接输入\"继续\"可续接,或调高 METACODES_COST_BUDGET / 调整方向。\x1b[0m\n", .{app.usage.costUsd(app.activeModel())});
         }
 
         // Ctrl+B 转后台:turn 边界返回 .backgrounded。深拷贝当前对话 → spawnBackground 续跑 →
@@ -725,7 +725,7 @@ fn backgroundCurrentSession(app: *app_mod.App) !void {
         .dyn_registry = &app.dyn_registry,
         .skills = &app.skills,
         .agent_depth = 0,
-        .parent_model = app.config.model,
+        .parent_model = app.activeModel(),
         .desc = desc,
         .agent_type = "main",
         .host_services = app.hostServices(),
@@ -1824,7 +1824,7 @@ fn printModelList(
     group_filter: ?[]const u8,
     cap_filter: ?model_command.Capability,
 ) void {
-    std.debug.print("current model: \x1b[36m{s}\x1b[0m  provider={s}\n", .{ app.config.model, @tagName(app.config.provider_kind) });
+    std.debug.print("current model: \x1b[36m{s}\x1b[0m  provider={s}\n", .{ app.activeModel(), @tagName(app.config.provider_kind) });
     if (group_filter) |g| std.debug.print("filter group: {s}\n", .{g});
     if (cap_filter) |cap| std.debug.print("filter capability: {s}\n", .{model_command.capabilityLabel(cap)});
 
@@ -1837,7 +1837,7 @@ fn printModelList(
             last_group = c.group;
             std.debug.print("\n{s}:\n", .{c.group});
         }
-        printModelCandidate(c, std.mem.eql(u8, c.id, app.config.model));
+        printModelCandidate(c, std.mem.eql(u8, c.id, app.activeModel()));
         listed += 1;
     }
 
@@ -1920,14 +1920,14 @@ fn switchModel(
     };
     app.persistLoginSelection();
 
-    std.debug.print("switched to \x1b[36m{s}\x1b[0m", .{app.config.model});
+    std.debug.print("switched to \x1b[36m{s}\x1b[0m", .{app.activeModel()});
     if (app.config.reasoning_effort) |effort| std.debug.print(" reasoning={s}", .{effort.name()});
     std.debug.print(" (max_output={d})\n", .{app.provider().maxTokens()});
 }
 
 fn handleDoctor(app: *app_mod.App, allocator: std.mem.Allocator) !void {
     std.debug.print("\x1b[1mcc-zig doctor\x1b[0m\n", .{});
-    std.debug.print("  model:            {s}\n", .{app.config.model});
+    std.debug.print("  model:            {s}\n", .{app.activeModel()});
     std.debug.print("  permission mode:  {s}\n", .{@tagName(app.permission_ctx.modeValue())});
     std.debug.print("  auth token:       {s}\n", .{if (app.api_key.len > 0) "set" else "MISSING"});
     std.debug.print("  max_tokens cfg:   {any}\n", .{app.config.max_tokens});
@@ -1976,7 +1976,7 @@ fn handleConfigCmd(app: *app_mod.App, allocator: std.mem.Allocator, rest: []cons
     if (rest.len == 0 or std.mem.eql(u8, rest, "show")) {
         // 当前生效配置(menu-style 摘要)
         std.debug.print("\x1b[1mActive configuration\x1b[0m\n", .{});
-        std.debug.print("  model:           \x1b[36m{s}\x1b[0m\n", .{app.config.model});
+        std.debug.print("  model:           \x1b[36m{s}\x1b[0m\n", .{app.activeModel()});
         std.debug.print("  permission mode: \x1b[36m{s}\x1b[0m  \x1b[2m(Shift+Tab to cycle)\x1b[0m\n", .{@tagName(app.config.permission_mode)});
         std.debug.print("  verbose:         {}\n", .{app.config.verbose});
         std.debug.print("  no_theme:        {}\n", .{app.config.no_theme});
@@ -3307,7 +3307,7 @@ fn printStartupBanner(app: *const app_mod.App) void {
     std.debug.print("{s}{s}\n", .{ th.box_tr, th.reset });
 
     // 内容行:模型 + cwd。
-    printBannerLine(th, inner, app.config.model);
+    printBannerLine(th, inner, app.activeModel());
     printBannerLine(th, inner, app.cwdAbs());
 
     // 底边框。
@@ -3602,7 +3602,7 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     const new_writer = transcript_mod.Writer.openExisting(
         app.allocator,
         dir_owned,
-        app.config.model,
+        app.activeModel(),
         staged.len(),
     );
 

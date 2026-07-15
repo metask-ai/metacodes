@@ -471,6 +471,20 @@ pub const App = struct {
         };
     }
 
+    /// **当前活跃 model 的单一运行时真理源(U3)**:活跃 provider 的 client.model。
+    /// client.model 是请求真正发送的 model(resolveMaxTokens/capability/请求体都读它),
+    /// 故它是运行时真理;`config.model` 仅剩**启动快照**语义(parseArgs 设 → init 构造
+    /// client/agent_jobs/system_prompt 的种子),**运行时一律读 activeModel(),不读 config.model**,
+    /// 消除 switchModel"改一处漏一处"的 model 漂移。切换只更新 client,config.model 不再
+    /// 跟着变。直接读活跃 client 的 .model 字段(const-safe,不走 provider() vtable——那要 *App)。
+    pub fn activeModel(app: *const App) []const u8 {
+        return switch (app.config.provider_kind) {
+            .anthropic => app.api_client.model,
+            .openai => app.openai_client.?.model,
+            .gemini => app.gemini_client.?.model,
+        };
+    }
+
     /// 供 subagent ctx.api_client(web_search 是 Anthropic server tool,只 Anthropic 用)。
     /// 非 Anthropic provider → null(subagent 不能用 web_search,其余工具照常)。
     pub fn anthropicClientOrNull(app: *App) ?*client_mod.Client {
@@ -589,8 +603,37 @@ pub const App = struct {
         app.models_picker_key_index = idx;
     }
 
+    /// **U3 单一真理源写侧 seam**:把 model 同步到全部值镜像。抽成独立函数(不依赖 io/App
+    /// 整体)以便 L2 锁"所有镜像同步"不变式——纯 grep 验证会漏(swarm.model 就漏过,Linus U3 抓)。
+    /// 镜像清单(加/删 model 存储处必改此表 + 对应断言):
+    ///   api_client / openai_client / gemini_client —— 各 provider 的 client.model(请求真理源,借用)
+    ///   transcript_writer.model —— meta.json 记 flush 时 model(借用)
+    ///   agent_jobs —— subagent 用(内部 dupe 自持;OOM 可失败,故放最前)
+    ///   swarm.model —— teammate spawn 无 override 时的 provider model(借用;U3 前漏同步→teammate 跑陈旧启动 model)
+    /// **不含**:config.model(启动快照,运行时不读)/system_prompt(派生,switchModel 重建)/usage anchor(作废重建)。
+    /// model 必须是调用方持有、App 生命周期稳定的串(switchModel 传 model_switch_owned)。
+    fn syncModelMirrors(
+        model: []const u8,
+        api_client: *client_mod.Client,
+        openai_client: ?*openai_mod.OpenAIClient,
+        gemini_client: ?*gemini_mod.GeminiClient,
+        transcript_writer: ?*transcript.Writer,
+        agent_jobs: ?*@import("core/agent_job_registry.zig").AgentJobRegistry,
+        swarm: *@import("swarm/context.zig").SwarmContext,
+    ) !void {
+        // agent_jobs 内部 dupe，可 OOM → 最前，失败时其它镜像未动(最小一致)。
+        if (agent_jobs) |aj| try aj.setModel(model);
+        api_client.model = model;
+        if (openai_client) |oc| oc.model = model;
+        if (gemini_client) |gc| gc.model = model;
+        if (transcript_writer) |w| w.model = model;
+        swarm.model = model;
+    }
+
     pub fn switchModel(app: *App, model_id: []const u8) !void {
-        const previous_model = app.config.model;
+        // U3:运行时当前 model 读 activeModel()(活跃 client),非 config.model(仅启动快照)。
+        // 必须在更新 client 前读——此刻 activeModel() 返回旧 model(client 未更新)。
+        const previous_model = app.activeModel();
         const previous_window = app.api_client.resolveMaxInputTokens();
         const current_window = app.api_client.resolveMaxInputTokensFor(model_id);
         const needs_previous_model_compact = shouldQueueModelSwitchCompact(previous_model, model_id, previous_window, current_window);
@@ -603,17 +646,28 @@ pub const App = struct {
             null;
         errdefer if (previous_model_copy) |m| app.allocator.free(m);
 
-        if (app.agent_jobs) |*aj| try aj.setModel(model);
         const sp_mod = @import("core/system_prompt.zig");
         const new_system_prompt = sp_mod.buildFull(app.allocator, model, &app.skills, &app.agents, app.enabled_tool_names, app.memdir_abs, app.kgReady()) catch null;
 
+        // U3:先同步全部 model 值镜像(seam,不含 config.model=启动快照/system_prompt=派生重建/
+        // usage anchor=作废重建),**再** free 旧 model_switch_owned。
+        // **顺序关键(Linus U3 nitpick,消 freed-read UAF)**:旧 model_switch_owned(X)= 当前
+        // api_client.model 指向的串;若先 free(X) 再由 seam 改指针,中间 HTTP 线程读 activeModel()
+        // (=api_client.model)会读到**已 free 内存**(UB,非仅陈旧值)。seam 先把所有镜像刷成
+        // 新 model → X 只剩 model_switch_owned 引用 → 此后 free 才安全。agent_jobs.setModel 可
+        // OOM(放 seam 最前),失败时其它镜像与旧 X 都未动,errdefer 只释放新 dupe。
+        try syncModelMirrors(
+            model,
+            &app.api_client,
+            if (app.openai_client) |*oc| oc else null,
+            if (app.gemini_client) |*gc| gc else null,
+            if (app.transcript_writer) |*w| w else null,
+            if (app.agent_jobs) |*aj| aj else null,
+            &app.swarm,
+        );
+        // 镜像已全指向新 model → 旧 X 只剩此引用,现在 free 安全(无 freed-read 窗口)。
         if (app.model_switch_owned) |old| app.allocator.free(old);
         app.model_switch_owned = model;
-        app.config.model = model;
-        app.api_client.model = model;
-        if (app.openai_client) |*oc| oc.model = model;
-        if (app.gemini_client) |*gc| gc.model = model;
-        if (app.transcript_writer) |*w| w.model = model;
         // usage 锚点是旧模型 tokenizer 实计的,跨模型不可比(tokenizer 差异可达 ±20%)
         // → 作废,下一轮新模型的 usage 自动重建。
         app.conversation.invalidateUsageAnchor();
@@ -668,7 +722,7 @@ pub const App = struct {
             stored.api_key = app.allocator.dupe(u8, k) catch return;
         }
         if (stored.selected_model) |old| app.allocator.free(old);
-        stored.selected_model = app.allocator.dupe(u8, app.config.model) catch return;
+        stored.selected_model = app.allocator.dupe(u8, app.activeModel()) catch return; // U3:持久化当前 model
         stored.reasoning_effort = app.config.reasoning_effort;
         auth_mod.saveDefault(app.allocator, stored) catch |err| {
             @import("util/log.zig").warn("auth", "persist selection failed: {s}", .{@errorName(err)});
@@ -683,7 +737,7 @@ pub const App = struct {
         defer app.allocator.free(cwd);
 
         // session_id 传入,使 transcript 目录名 == App.session_id(统一,不再两个独立 gen)。
-        const w = try transcript.Writer.init(app.allocator, cwd, home, app.config.model, app.session_id);
+        const w = try transcript.Writer.init(app.allocator, cwd, home, app.activeModel(), app.session_id);
         app.transcript_writer = w;
     }
 
@@ -1427,6 +1481,27 @@ test "nextPermMode: Shift+Tab 循环状态机(对齐 cc)" {
         types.PermissionMode.default,
         App.nextPermMode(App.nextPermMode(App.nextPermMode(.default))),
     );
+}
+
+test "U3 syncModelMirrors: 所有 model 镜像同步(含 swarm.model,Linus U3 抓的第7点)" {
+    const a = std.testing.allocator;
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    const io = io_rt.io();
+
+    // client(借用镜像)+ agent_jobs(dupe 自持镜像)+ swarm(借用镜像,U3 前漏同步)。
+    var client = client_mod.Client.initWithBaseUrl(a, io, "test-key", "model-A", null);
+    defer client.deinit();
+    var jobs = try @import("core/agent_job_registry.zig").AgentJobRegistry.init(a, "test-key", null, "model-A", .anthropic);
+    defer jobs.deinit();
+    var swarm = @import("swarm/context.zig").SwarmContext{ .allocator = a, .model = "model-A" };
+
+    // 切到 model-B:seam 必须把全部镜像刷成 B。
+    try App.syncModelMirrors("model-B", &client, null, null, null, &jobs, &swarm);
+
+    try std.testing.expectEqualStrings("model-B", client.model);
+    try std.testing.expectEqualStrings("model-B", jobs.model); // agent_jobs 内部 dupe
+    try std.testing.expectEqualStrings("model-B", swarm.model); // 第7镜像:teammate provider 用它
 }
 
 test "model switch compact is queued only when switching to smaller context window" {

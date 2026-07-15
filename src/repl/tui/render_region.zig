@@ -774,7 +774,7 @@ pub const RenderRegion = struct {
         for (entries, 0..) |entry, i| {
             if (shown >= MAX_ROWS) break;
             const selected = i == selected_idx;
-            const current = std.mem.eql(u8, entry.model_id, app.config.model);
+            const current = std.mem.eql(u8, entry.model_id, app.activeModel());
             const color = if (selected or current) th.accent else th.dim;
             var caps_buf: [96]u8 = undefined;
             const caps = capabilityChips(app.config.provider_kind, entry.model_id, &caps_buf);

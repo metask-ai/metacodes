@@ -15,7 +15,7 @@ const app_mod = @import("../app.zig");
 pub fn render(app: *const app_mod.App) void {
     const u = app.usage;
     const total_tokens = u.input_tokens + u.output_tokens;
-    const cost = u.costUsd(app.config.model);
+    const cost = u.costUsd(app.activeModel());
 
     const mode_str = switch (app.config.permission_mode) {
         .default => "default",
@@ -56,7 +56,7 @@ pub fn render(app: *const app_mod.App) void {
     var line_buf: [384]u8 = undefined;
     const line = std.fmt.bufPrint(&line_buf, "{s}[{s} | {s} | {s} tok | ${d:.4}{s}]{s}\n", .{
         th.dim,
-        app.config.model,
+        app.activeModel(),
         mode_str,
         tok_str,
         cost,

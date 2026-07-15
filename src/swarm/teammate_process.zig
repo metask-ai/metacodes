@@ -173,7 +173,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
                 .kg_projects_dir = app.kg_projects_dir,
                 .dyn_registry = &app.dyn_registry,
                 .agents = &app.agents,
-                .parent_model = app.config.model,
+                .parent_model = app.activeModel(),
                 .project_dir = app.project_dir_or_empty(),
                 .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(),
                 .home_dir = home,

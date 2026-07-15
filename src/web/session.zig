@@ -42,11 +42,11 @@ const StateSource = struct {
         // 展示用途可接受;不为状态条引入跨线程锁。
         const u = &self.app.usage;
         return std.json.Stringify.valueAlloc(allocator, .{
-            .model = self.app.config.model,
+            .model = self.app.activeModel(),
             .permission_mode = @tagName(self.app.config.permission_mode),
             .input_tokens = u.input_tokens,
             .output_tokens = u.output_tokens,
-            .cost_usd = u.costUsd(self.app.config.model),
+            .cost_usd = u.costUsd(self.app.activeModel()),
             .generating = self.generating.load(.acquire),
             .pending_request_id = self.wb.pendingId(),
         }, .{});
@@ -90,16 +90,20 @@ fn execCommand(app: *app_mod.App, journal: *EventJournal, web_alloc: std.mem.All
             break :blk std.fmt.bufPrint(&buf, "compacted {d} messages ({d} → {d} active)", .{ dropped, before, app.conversation.activeMessages().len }) catch "compacted";
         }
         if (std.mem.eql(u8, trimmed, "/model")) {
-            break :blk std.fmt.bufPrint(&buf, "model: {s}", .{app.config.model}) catch "model";
+            break :blk std.fmt.bufPrint(&buf, "model: {s}", .{app.activeModel()}) catch "model";
         }
         if (std.mem.startsWith(u8, trimmed, "/model ")) {
             const name = std.mem.trim(u8, trimmed[7..], " \t");
             if (name.len == 0) { ok = false; break :blk "usage: /model <name>"; }
-            const owned = app.allocator.dupe(u8, name) catch { ok = false; break :blk "out of memory"; };
-            if (app.model_switch_owned) |old| app.allocator.free(old);
-            app.model_switch_owned = owned;
-            app.config.model = owned;
-            break :blk std.fmt.bufPrint(&buf, "model → {s}", .{owned}) catch "model changed";
+            // U3:走单一 mutation 入口 switchModel(更新 client=请求真理源 + transcript +
+            // agent_jobs + system_prompt),而非旧的半吊子只写 config.model(那样请求仍用旧
+            // model,是 config.model 漂移 footgun 的实例)。命令在 driver 线程执行,与 loop.zig
+            // 的 /model 同线程模型,调 switchModel 安全。
+            app.switchModel(name) catch |e| {
+                ok = false;
+                break :blk std.fmt.bufPrint(&buf, "model switch failed: {s}", .{@errorName(e)}) catch "model switch failed";
+            };
+            break :blk std.fmt.bufPrint(&buf, "model → {s}", .{app.activeModel()}) catch "model changed";
         }
         ok = false;
         break :blk std.fmt.bufPrint(&buf, "unknown command: {s}", .{trimmed}) catch "unknown command";
@@ -215,7 +219,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
                 .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(),
                 .home_dir = app.homeDir(),
                 .agents = &app.agents,
-                .parent_model = app.config.model,
+                .parent_model = app.activeModel(),
                 .model_switch_compact = app.pendingModelSwitchCompact(),
                 .skills_set = &app.skills,
                 .ui_requester = wb.requester(),
