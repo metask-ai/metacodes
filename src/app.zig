@@ -137,6 +137,11 @@ pub const App = struct {
     hooks: ?@import("permission/hooks.zig").HookSet = null,
     /// 缓存的 cwd 绝对路径(供 permission match_ctx 用,session 期不变)。
     cwd_abs: ?[]u8 = null,
+    /// 额外工作目录(--add-dir / settings additionalDirectories),已解析为**绝对路径**、
+    /// owned(app.allocator)。loadSettings 每次重建(先 free 旧);消费点:
+    /// permission match_ctx.additional_dirs(accept_edits scope 门)+ ToolContext.additional_dirs
+    /// (sandbox 可写白名单)。null = 无。
+    additional_dirs_abs: ?[]const []const u8 = null,
     /// 当前 TUI 主题(启动时根据 --no-theme + ColorCapability 选;/theme 可改)。
     theme: @import("repl/tui/theme.zig").Theme = @import("repl/tui/theme.zig").dark,
     /// 当前主题 variant(/theme 命令读它显示当前)。
@@ -536,6 +541,7 @@ pub const App = struct {
         app.model_context.deinit();
         if (app.rule_set) |*r| r.deinit();
         if (app.settings) |*s| s.deinit();
+        app.freeAdditionalDirs();
         if (app.sandbox_settings) |*s| s.deinit();
         if (app.hooks) |*h| h.deinit();
         if (app.cwd_abs) |c| app.allocator.free(c);
@@ -1026,10 +1032,19 @@ pub const App = struct {
         });
         app.settings = ms;
         app.permission_ctx.settings = &app.settings.?;
+        // additionalDirectories:收集全层 + 解析为绝对路径(owned)。旧列表先 free
+        // (addDirectory 重载路径)。失败不致命:降级为空集(add-dir 语义静默失效比崩溃好,
+        // 但 warn 出来)。
+        app.rebuildAdditionalDirs(home) catch |e| {
+            @import("util/log.zig").warn("permission", "additionalDirectories resolve failed: {s}", .{@errorName(e)});
+        };
         app.permission_ctx.match_ctx = .{
             .cwd = app.cwd_abs orelse "",
             .project_root = app.project_dir orelse (app.cwd_abs orelse ""),
             .home = home orelse "",
+            .additional_dirs = app.additionalDirs(),
+            // B1:路径规则匹配前 canonicalize(unescape + 折叠 ..)需要 allocator。
+            .alloc = app.allocator,
         };
         @import("util/log.zig").info("permission", "settings loaded: {d} layer(s)", .{app.settings.?.layers.len});
 
@@ -1056,6 +1071,36 @@ pub const App = struct {
         app.loadHooks(home) catch |e| {
             @import("util/log.zig").debug("hook", "no hooks: {s}", .{@errorName(e)});
         };
+    }
+
+    /// 重建 additional_dirs_abs:settings 全层 additionalDirectories → 绝对路径 owned 列表。
+    /// 解析逻辑在可测 seam settings.resolveAdditionalDirs(L2 组件测试直驱)。
+    fn rebuildAdditionalDirs(app: *App, home: ?[]const u8) !void {
+        app.freeAdditionalDirs();
+        if (app.settings == null) return;
+        const raw = try app.settings.?.collectAdditionalDirs(app.allocator);
+        defer app.allocator.free(raw); // 元素 borrow settings,不 free
+        if (raw.len == 0) return;
+        const settings_mod = @import("permission/settings.zig");
+        app.additional_dirs_abs = try settings_mod.resolveAdditionalDirs(
+            app.allocator,
+            raw,
+            app.cwd_abs orelse "",
+            home orelse "",
+        );
+    }
+
+    fn freeAdditionalDirs(app: *App) void {
+        if (app.additional_dirs_abs) |dirs| {
+            for (dirs) |d| app.allocator.free(d);
+            app.allocator.free(dirs);
+            app.additional_dirs_abs = null;
+        }
+    }
+
+    /// 额外工作目录(绝对路径)。供 agent_loop Options / ToolContext 透传。
+    pub fn additionalDirs(app: *const App) []const []const u8 {
+        return app.additional_dirs_abs orelse &.{};
     }
 
     /// 收集 project + user settings 的 hooks(Pre+Post),**跨层合并**成一个 HookSet(不再首个覆盖)。

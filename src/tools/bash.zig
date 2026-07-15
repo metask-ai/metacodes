@@ -85,6 +85,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .cwd = cwd,
             .home = ctx.home_dir,
             .sandbox = sb,
+            .additional_dirs = ctx.additional_dirs,
             .disable_for_this_command = disable_sb,
         }) catch |e| {
             // failIfUnavailable=true 时沙箱不可用 → 拒绝执行(不降级裸跑)

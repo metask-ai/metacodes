@@ -45,7 +45,30 @@ pub const Context = struct {
     memdir_abs: []const u8 = "",
     /// memdir 豁免判定需要 allocator(realpath 归一化);null → 跳过豁免(降级:按常规决策)。
     memdir_allocator: ?std.mem.Allocator = null,
+    /// **安全关键**:路径判定(protected / accept_edits scope / memdir 豁免)前把 JSON
+    /// 转义原文 unescape,与工具层(write.zig/edit.zig 落盘前 unescapeString)逐字节等价。
+    /// null → 降级为原始转义字节(仅单测/库最小上下文,那里路径不含转义,无绕过面)。
+    /// 见 extractCheckedPath 注释与 B1 绕过。shim 填 ctx.allocator。
+    path_check_allocator: ?std.mem.Allocator = null,
 };
+
+/// 提取路径参数(file_path/notebook_path/path)并 **unescape**——与工具层落盘前的
+/// `util_json.unescapeString` 逐字节等价。owned,caller free;alloc=null / 无路径 / unescape
+/// 失败 → null。
+///
+/// **为何必须 unescape(B1 绕过)**:rule_spec.extractPath 返回 JSON 字符串里的转义原文
+/// (`\uXXXX`/`\"`/`\/` 未还原)。工具层(write.zig:21)先 `unescapeString` 再归一化落盘。
+/// 若权限层直接拿转义原文判 scope/protected,`{"file_path":"/proj/../etc/x"}`
+/// 里的 `..` 不等于字面 `..` → 骗过 isInWorkingDirs/isProtectedPath 判 allow,
+/// 而工具还原成真 `..` 折叠后逃出工作目录集。unescape 消除这条分歧。
+fn extractCheckedPath(alloc: ?std.mem.Allocator, args: []const u8) ?[]u8 {
+    const a = alloc orelse return null;
+    const raw = rule_spec.extractPath(args);
+    if (raw.len == 0) return null;
+    return util_json_mod.unescapeString(raw, a) catch null;
+}
+
+const util_json_mod = @import("../util/json.zig");
 
 /// 根据模式 + 工具名决定:允许 / 拒绝 / 询问。
 pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decision {
@@ -83,7 +106,7 @@ pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decis
             },
             .allow => {
                 // 但 protected paths 始终需要 ask(即便 allow 规则命中也不豁免)
-                if (isProtectedTarget(tool_name, args)) {
+                if (isProtectedTarget(ctx, tool_name, args)) {
                     log.debug("permission", "settings allow OVERRIDDEN by protected path tool={s}", .{tool_name});
                     return .ask;
                 }
@@ -99,7 +122,7 @@ pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decis
     }
 
     // 2. Protected paths:Edit/Write/NotebookEdit 到 .git/.env/.ssh/* 永远 ask
-    if (isProtectedTarget(tool_name, args)) {
+    if (isProtectedTarget(ctx, tool_name, args)) {
         log.debug("permission", "protected path tool={s} -> ask", .{tool_name});
         return .ask;
     }
@@ -111,9 +134,11 @@ pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decis
     if (ctx.memdir_abs.len > 0) {
         if (std.mem.eql(u8, tool_name, "Write") or std.mem.eql(u8, tool_name, "Edit")) {
             if (ctx.memdir_allocator) |ma| {
-                const util_json = @import("../util/json.zig");
                 const memdir = @import("../core/memory/memdir.zig");
-                if (util_json.extractStringField(args, "file_path")) |target| {
+                // unescape 与工具层等价(见 extractCheckedPath):否则转义路径既进不了豁免
+                // 又可能借分歧绕过——统一 unescape 后再判 memdir 子树。
+                if (extractCheckedPath(ctx.path_check_allocator orelse ma, args)) |target| {
+                    defer (ctx.path_check_allocator orelse ma).free(target);
                     if (memdir.isAutoMemPath(ma, ctx.memdir_abs, target)) {
                         log.debug("permission", "memdir auto-mem write allow: {s}", .{target});
                         return .allow;
@@ -180,7 +205,31 @@ pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decis
         if (m == .dont_ask) break :blk .deny;
         if (m == .accept_edits) {
             if (cat == .read) break :blk .allow;
-            if (std.mem.eql(u8, tool_name, "Write") or std.mem.eql(u8, tool_name, "Edit") or std.mem.eql(u8, tool_name, "NotebookEdit")) break :blk .allow;
+            if (std.mem.eql(u8, tool_name, "Write") or std.mem.eql(u8, tool_name, "Edit") or std.mem.eql(u8, tool_name, "NotebookEdit")) {
+                // 对齐 cc:acceptEdits 只自动接受**工作目录集**(cwd + additionalDirectories)
+                // 内的编辑;集外 → ask。/add-dir 由此获得真实语义(扩集)。
+                // 无 cwd 信息(单测/库最小上下文)或无路径参数(malformed,execute 会报
+                // MissingRequiredField)→ 保持旧 allow,不为无意义调用打扰用户。
+                if (ctx.match_ctx.cwd.len > 0) {
+                    // **B1 修复**:必须 unescape 后再判(与工具层落盘等价),否则
+                    // `/proj/../etc/x` 骗过 scope 门却被工具还原成真 `..` 逃逸。
+                    // 有 allocator → unescape 判定;无(单测)→ 降级用原始字节(那里无转义)。
+                    if (extractCheckedPath(ctx.path_check_allocator, args)) |target| {
+                        defer (ctx.path_check_allocator.?).free(target);
+                        if (!rule_spec.isInWorkingDirs(&ctx.match_ctx, target)) {
+                            log.debug("permission", "accept_edits: {s} outside working dirs -> ask", .{target});
+                            break :blk .ask;
+                        }
+                    } else {
+                        const target = rule_spec.extractPath(args);
+                        if (target.len > 0 and !rule_spec.isInWorkingDirs(&ctx.match_ctx, target)) {
+                            log.debug("permission", "accept_edits: {s} outside working dirs -> ask", .{target});
+                            break :blk .ask;
+                        }
+                    }
+                }
+                break :blk .allow;
+            }
             break :blk .ask;
         }
         break :blk if (cat == .read) .allow else .ask;
@@ -197,10 +246,17 @@ pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decis
 }
 
 /// 工具是否在写一个 protected path?仅 Edit/Write/NotebookEdit 关心。
-fn isProtectedTarget(tool_name: []const u8, args: []const u8) bool {
+/// **B1 修复**:路径先 unescape(与工具层落盘等价),否则 `..`/`\/` 等转义
+/// 骗过 basename/段匹配却被工具还原后写进 .ssh/.git 等——该绕过跨所有模式,故此处统一修。
+fn isProtectedTarget(ctx: *const Context, tool_name: []const u8, args: []const u8) bool {
     if (!(std.mem.eql(u8, tool_name, "Write") or
         std.mem.eql(u8, tool_name, "Edit") or
         std.mem.eql(u8, tool_name, "NotebookEdit"))) return false;
+    if (extractCheckedPath(ctx.path_check_allocator, args)) |path| {
+        defer (ctx.path_check_allocator.?).free(path);
+        return settings_mod.isProtectedPath(path);
+    }
+    // 降级(无 allocator:单测/最小上下文,路径无转义):原始字节判定
     const path = rule_spec.extractPath(args);
     if (path.len == 0) return false;
     return settings_mod.isProtectedPath(path);
@@ -339,6 +395,57 @@ test "settings allow grants Bash in default mode" {
     try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"npm test\"}") == .ask);
 }
 
+test "B1 绕过修复(第4镜像点·规则匹配器): allow 规则 Write(/**) 圈 /proj 不放行 .. 逃逸" {
+    const alloc = std.testing.allocator;
+    // 用户最常见配置:放行整个项目源码树。
+    const src = "{\"permissions\":{\"allow\":[\"Write(/**)\"]}}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, src, .{});
+    defer parsed.deinit();
+    const L = try settings_mod.parseLayer(alloc, .user, parsed.value);
+    const layers = try alloc.alloc(settings_mod.Layer, 1);
+    layers[0] = L;
+    var ms = settings_mod.MergedSettings{ .layers = layers, .allocator = alloc };
+    defer ms.deinit();
+
+    // match_ctx.alloc 必须填(否则规则匹配退回原始字节,不折叠 ..)
+    const ctx = Context{
+        .mode = .default,
+        .settings = &ms,
+        .match_ctx = .{ .cwd = "/proj", .project_root = "/proj", .alloc = alloc },
+        .path_check_allocator = alloc,
+    };
+    // sanity:圈内正常文件 allow(规则真生效)
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/src/a.zig\"}") == .allow);
+    // 明文 .. 逃逸:折叠成 /etc/passwd 不在 /proj → 规则不命中 → 落 mode default → ask(修复前 allow)
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/../../etc/passwd\"}") == .ask);
+    // 转义 .. 逃逸:unescape+折叠 同样 ask
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/\\u002e\\u002e/\\u002e\\u002e/etc/passwd\"}") == .ask);
+}
+
+test "B1 绕过修复(第4镜像点·deny 不被 .. 降级): deny Edit(/secrets/**) 折叠后仍 deny" {
+    const alloc = std.testing.allocator;
+    // project 锚 deny:禁编辑项目内 secrets/ 子树。
+    const src = "{\"permissions\":{\"deny\":[\"Edit(/secrets/**)\"]}}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, src, .{});
+    defer parsed.deinit();
+    const L = try settings_mod.parseLayer(alloc, .user, parsed.value);
+    const layers = try alloc.alloc(settings_mod.Layer, 1);
+    layers[0] = L;
+    var ms = settings_mod.MergedSettings{ .layers = layers, .allocator = alloc };
+    defer ms.deinit();
+
+    const ctx = Context{
+        .mode = .bypass_permissions, // 即便 bypass,deny 仍优先
+        .settings = &ms,
+        .match_ctx = .{ .cwd = "/proj", .project_root = "/proj", .alloc = alloc },
+        .path_check_allocator = alloc,
+    };
+    // 直接编辑 /proj/secrets/key → deny(sanity)
+    try std.testing.expect(check(&ctx, "Edit", "{\"file_path\":\"/proj/secrets/key\"}") == .deny);
+    // 经 /proj/src/../secrets 折回 secrets 子树 → 折叠后仍命中 → deny 不被 `..` 降级
+    try std.testing.expect(check(&ctx, "Edit", "{\"file_path\":\"/proj/src/../secrets/key\"}") == .deny);
+}
+
 test "protected path forces ask even with allow rule" {
     const alloc = std.testing.allocator;
     // 用户允许 Write 整个 cwd,但 .env 仍要 ask
@@ -394,4 +501,65 @@ test "autoAllowBashIfSandboxed allows non-readonly bash" {
     // 没开 autoAllow 时同命令 ask
     const ctx2 = Context{ .mode = .default, .sandbox_enabled = true, .auto_allow_bash_if_sandboxed = false };
     try std.testing.expect(check(&ctx2, "Bash", "{\"command\":\"npm install\"}") == .ask);
+}
+
+test "accept_edits: 工作目录集 scope 门(cwd 内 allow / add-dir 内 allow / 集外 ask / .. 逃逸 ask)" {
+    const extra = [_][]const u8{"/extra/lib"};
+    const ctx = Context{
+        .mode = .accept_edits,
+        .match_ctx = .{ .cwd = "/proj", .additional_dirs = &extra },
+    };
+    // cwd 子树内 → 自动放行
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/src/a.zig\"}") == .allow);
+    try std.testing.expect(check(&ctx, "Edit", "{\"file_path\":\"/proj/b.txt\"}") == .allow);
+    // additional dir 内 → 自动放行(/add-dir 的真实语义)
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/extra/lib/c.md\"}") == .allow);
+    // 集外 → ask(不再无条件放行)
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/etc/hosts.new\"}") == .ask);
+    try std.testing.expect(check(&ctx, "Edit", "{\"file_path\":\"/other/proj/x\"}") == .ask);
+    // `..` 词法逃逸 → ask
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/../etc/x\"}") == .ask);
+    // NotebookEdit 走 notebook_path,同样受 scope 门
+    try std.testing.expect(check(&ctx, "NotebookEdit", "{\"notebook_path\":\"/proj/n.ipynb\"}") == .allow);
+    try std.testing.expect(check(&ctx, "NotebookEdit", "{\"notebook_path\":\"/tmp2/n.ipynb\"}") == .ask);
+    // read 类不受影响
+    try std.testing.expect(check(&ctx, "Read", "{\"file_path\":\"/etc/hosts\"}") == .allow);
+}
+
+test "B1 绕过修复: accept_edits 下 JSON 转义的 .. 逃逸被 unescape 后拦成 ask" {
+    const a = std.testing.allocator;
+    const extra = [_][]const u8{"/extra/lib"};
+    const ctx = Context{
+        .mode = .accept_edits,
+        .match_ctx = .{ .cwd = "/proj", .additional_dirs = &extra },
+        .path_check_allocator = a,
+    };
+    // `..` = ".." 的 JSON 转义;`/` = "/"。unescape 前 startsWith /proj/ 骗过 scope;
+    // unescape 后折叠成 /etc/cron.d/pwn 逃出工作目录集 → 必须 ask。
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/\\u002e\\u002e/\\u002e\\u002e/etc/cron.d/pwn\",\"content\":\"x\"}") == .ask);
+    // 明文 .. 同样拦(normalizeLexical 兜底)。
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/../../etc/x\",\"content\":\"x\"}") == .ask);
+    // 转义但仍在集内 → allow(unescape 不误伤合法路径)。
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/proj/\\u0073rc/a.zig\",\"content\":\"x\"}") == .allow);
+}
+
+test "B1 绕过修复: protected path 的转义绕过被拦(跨模式,default 模式验证)" {
+    const a = std.testing.allocator;
+    // `.ssh` 明文能被 protected 段匹配拦;但 `.ssh` 之类转义原文过去骗过匹配。
+    // 修复后 default 模式写 ~/.ssh/id_rsa(转义写法)仍判 protected → ask(而非 allow)。
+    const ctx = Context{ .mode = .default, .path_check_allocator = a };
+    // 明文基线:protected → ask
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/home/u/.ssh/id_rsa\"}") == .ask);
+    // 转义 `.ssh`(`.ssh`):unescape 后 = .ssh → 仍判 protected → ask(未修前会漏判)
+    try std.testing.expect(check(&ctx, "Write", "{\"file_path\":\"/home/u/\\u002essh/id_rsa\"}") == .ask);
+}
+
+test "accept_edits: 无 cwd 信息或无路径参数保持旧 allow(最小上下文兼容)" {
+    // 无 cwd(单测/库消费者):行为与收窄前一致
+    const ctx_nocwd = Context{ .mode = .accept_edits };
+    try std.testing.expect(check(&ctx_nocwd, "Write", "{\"file_path\":\"/anywhere/x\"}") == .allow);
+    try std.testing.expect(check(&ctx_nocwd, "Write", "") == .allow);
+    // 有 cwd 但无路径参数(malformed,execute 层会报 MissingRequiredField)→ allow 不打扰用户
+    const ctx = Context{ .mode = .accept_edits, .match_ctx = .{ .cwd = "/proj" } };
+    try std.testing.expect(check(&ctx, "Write", "{\"content\":\"x\"}") == .allow);
 }

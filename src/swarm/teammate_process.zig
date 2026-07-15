@@ -175,7 +175,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
                 .agents = &app.agents,
                 .parent_model = app.config.model,
                 .project_dir = app.project_dir_or_empty(),
-                .cwd_abs = app.cwdAbs(),
+                .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(),
                 .home_dir = home,
                 // agent_ident = 进程自己的 session id(24-hex 值类型,存不下 name@team)。
                 // Linus MED-3:in-process 的 self-claim 用 e.agent_id(name@team 字符串)是**另一条**

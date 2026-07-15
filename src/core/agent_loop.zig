@@ -267,6 +267,8 @@ pub const Options = struct {
     /// cwd 绝对路径 + HOME(sandbox profile 用)。
     cwd_abs: []const u8 = "",
     home_dir: []const u8 = "",
+    /// 额外工作目录(--add-dir / additionalDirectories,绝对路径;sandbox 可写白名单)。
+    additional_dirs: []const []const u8 = &.{},
     /// 当前 session plan 文件路径(ExitPlanMode 读盘兜底用;仅顶层接)。
     plan_file_path: []const u8 = "",
     /// 子 agent 定义集合(Task 工具据此找 subagent_type)。
@@ -661,6 +663,7 @@ pub fn run(
             .sandbox = opts.sandbox,
             .cwd_abs = opts.cwd_abs,
             .home_dir = opts.home_dir,
+            .additional_dirs = opts.additional_dirs,
             .plan_file_path = opts.plan_file_path,
             .agents = opts.agents,
             .parent_model = opts.parent_model,
@@ -1079,6 +1082,7 @@ pub fn run(
             .sandbox = opts.sandbox,
             .cwd_abs = opts.cwd_abs,
             .home_dir = opts.home_dir,
+            .additional_dirs = opts.additional_dirs,
             .plan_file_path = opts.plan_file_path,
             .last_proposed_plan = if (proposed_plan_buf) |p| p else "",
             .agents = opts.agents,

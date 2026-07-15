@@ -90,6 +90,38 @@ pub const MergedSettings = struct {
     }
 };
 
+/// 把 raw additionalDirectories 解析为绝对路径 owned 列表(元素与外层 slice 都由
+/// alloc 分配,caller 逐项 free)。规则:绝对原样 / `~` `~/x` 按 home / 相对按 cwd
+/// join;无 cwd 可锚定的相对路径**跳过**(留在集外比猜错安全)。不 realpath
+/// (目录可以尚不存在;词法归一化由消费侧 rule_spec.isInWorkingDirs 做)。
+/// App.rebuildAdditionalDirs 的可测 seam。
+pub fn resolveAdditionalDirs(
+    alloc: std.mem.Allocator,
+    raw: []const []const u8,
+    cwd: []const u8,
+    home: []const u8,
+) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (out.items) |d| alloc.free(d);
+        out.deinit(alloc);
+    }
+    for (raw) |d| {
+        if (d.len == 0) continue;
+        const abs: []const u8 = blk: {
+            if (d[0] == '/') break :blk try alloc.dupe(u8, d);
+            if (std.mem.eql(u8, d, "~") and home.len > 0) break :blk try alloc.dupe(u8, home);
+            if (std.mem.startsWith(u8, d, "~/") and home.len > 0)
+                break :blk try std.fmt.allocPrint(alloc, "{s}/{s}", .{ home, d[2..] });
+            if (cwd.len > 0)
+                break :blk try std.fmt.allocPrint(alloc, "{s}/{s}", .{ cwd, d });
+            continue;
+        };
+        try out.append(alloc, abs);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
 // ============================================================================
 // Protected paths(内建,不可被 settings 覆盖)
 // ============================================================================

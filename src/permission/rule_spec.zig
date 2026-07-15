@@ -173,6 +173,15 @@ pub const MatchContext = struct {
     project_root: []const u8 = "",
     /// HOME 目录
     home: []const u8 = "",
+    /// 额外工作目录(--add-dir / settings additionalDirectories,已解析为绝对路径)。
+    /// 与 cwd 共同构成"工作目录集":accept_edits 自动放行 scope + sandbox 可写白名单。
+    additional_dirs: []const []const u8 = &.{},
+    /// **安全关键(B1)**:路径规则匹配(allow/ask/deny 的 path_pattern)前把待匹配路径
+    /// canonicalize——**unescape**(与工具层 write.zig 落盘等价)+ **词法折叠 `..`**——
+    /// 否则 `allow: Write(/**)` 圈定 /proj 却自动放行 `/proj/../../etc/passwd`(明文 `..`
+    /// 不折叠即绕过,转义 `..` a fortiori)。null → 降级为原始字节(仅单测/无 alloc:那里
+    /// 路径是干净字面量,无绕过面)。shim/App 填 ctx.allocator。
+    alloc: ?std.mem.Allocator = null,
 };
 
 pub fn matches(spec: *const RuleSpec, mctx: *const MatchContext, tool_name: []const u8, args: []const u8) bool {
@@ -212,15 +221,31 @@ pub fn matchesMode(spec: *const RuleSpec, mctx: *const MatchContext, tool_name: 
 /// symlink 双路径匹配。原路径 + realpath 解析后的路径。
 /// allow:两者都匹配才命中(更严);deny/ask:任一匹配即命中(更宽)。
 /// realpath 失败(文件不存在 / 非链接)→ 只用原路径单匹配。
-fn matchesPathDual(pp: PathPattern, mctx: *const MatchContext, file_path: []const u8, mode: RuleMode) bool {
+fn matchesPathDual(pp: PathPattern, mctx: *const MatchContext, file_path_raw: []const u8, mode: RuleMode) bool {
+    // **B1 修复**:先 canonicalize(unescape + 词法折叠 `..`)再匹配。realpath 分支只在
+    // 路径**物理存在**时兜住 `..`;新建文件 / 不存在的父目录 realpath 失败 → 退回纯词法
+    // orig_match,若不折叠 `..` 则 allow 规则被绕过、deny 规则被降级。故词法折叠是主防线,
+    // realpath 是 symlink 的额外一层。unescape 用 util_json.unescapeString(与工具层同函数)。
+    var canon_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var unesc_owned: ?[]u8 = null;
+    defer if (unesc_owned) |u| (mctx.alloc.?).free(u);
+    const file_path: []const u8 = blk: {
+        const a = mctx.alloc orelse break :blk file_path_raw; // 降级:无 alloc(单测干净字面量)
+        const unesc = util_json_mod.unescapeString(file_path_raw, a) catch break :blk file_path_raw;
+        unesc_owned = unesc;
+        var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const abs = resolveAbs(&abs_buf, unesc, mctx) orelse break :blk unesc;
+        break :blk normalizeLexical(&canon_buf, abs) orelse unesc;
+    };
+
     const orig_match = matchesPathPattern(pp, mctx, file_path);
 
-    // 尝试 realpath 解析
+    // 尝试 realpath 解析(symlink 额外一层;用 canonicalize 后的路径,escaped 原文 realpath 会失败)
     var rp_buf: [std.fs.max_path_bytes]u8 = undefined;
     const resolved = realpathZ(&rp_buf, file_path);
 
     if (resolved == null or std.mem.eql(u8, resolved.?, file_path)) {
-        // 无链接 / 解析失败:单路径语义
+        // 无链接 / 解析失败:单路径语义(此时 orig_match 已基于折叠后路径,`..` 不再漏)
         return orig_match;
     }
     const target_match = matchesPathPattern(pp, mctx, resolved.?);
@@ -230,6 +255,8 @@ fn matchesPathDual(pp: PathPattern, mctx: *const MatchContext, file_path: []cons
         .deny, .ask => orig_match or target_match, // 任一匹配即触发
     };
 }
+
+const util_json_mod = @import("../util/json.zig");
 
 /// realpath(file_path) 写入 buf,返回 slice。失败返 null。
 fn realpathZ(buf: []u8, file_path: []const u8) ?[]const u8 {
@@ -404,6 +431,148 @@ fn resolveAbs(buf: []u8, path: []const u8, mctx: *const MatchContext) ?[]const u
     return joinPath(buf, mctx.cwd, path);
 }
 
+// ============================================================================
+// 工作目录集(cwd + additional_dirs)成员判定
+// ============================================================================
+
+/// file_path 是否落在工作目录集(cwd + additional_dirs)内。
+/// 用途:accept_edits 模式下 Write/Edit 自动放行的 scope 门(对齐 cc:acceptEdits
+/// 只自动接受工作目录内的编辑,/add-dir 扩展该集合)。
+///
+/// 语义(allow 侧,对齐 matchesPathDual 的 allow):
+///   - 路径先词法归一化(消 `.`/`..`/`//`),防 `..` 逃逸绕过前缀判定;
+///   - 原路径与 realpath(若解析出不同路径)**都**必须在集内——指向区外的
+///     symlink 不自动放行;
+///   - 相对路径按 cwd 解析,`~/` 按 home;cwd 为空时恒 false(无 scope 信息)。
+pub fn isInWorkingDirs(mctx: *const MatchContext, file_path: []const u8) bool {
+    if (file_path.len == 0) return false;
+    if (mctx.cwd.len == 0) return false;
+    if (!pathInWorkingDirs(mctx, file_path)) return false;
+    // symlink:realpath 解析出不同路径 → 目标也必须在集内。
+    var rp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (realpathZ(&rp_buf, file_path)) |resolved| {
+        if (!std.mem.eql(u8, resolved, file_path)) {
+            if (!pathInWorkingDirs(mctx, resolved)) return false;
+        }
+    }
+    return true;
+}
+
+fn pathInWorkingDirs(mctx: *const MatchContext, path: []const u8) bool {
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = resolveAbs(&abs_buf, path, mctx) orelse return false;
+    var norm_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const norm = normalizeLexical(&norm_buf, abs) orelse return false;
+    if (dirContains(mctx.cwd, norm)) return true;
+    for (mctx.additional_dirs) |d| {
+        if (dirContains(d, norm)) return true;
+    }
+    return false;
+}
+
+/// path(已归一化)是否在 dir 子树内(含 dir 自身)。dir 亦先归一化
+/// (配置可能带尾 `/` 或 `.` 段);前缀命中后要求段边界(防 /proj 匹配 /project)。
+fn dirContains(dir_in: []const u8, path: []const u8) bool {
+    if (dir_in.len == 0) return false;
+    var dbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = normalizeLexical(&dbuf, dir_in) orelse return false;
+    if (!std.mem.startsWith(u8, path, dir)) return false;
+    if (path.len == dir.len) return true;
+    if (std.mem.eql(u8, dir, "/")) return true;
+    return path[dir.len] == '/';
+}
+
+/// 词法归一化绝对路径:消 `//`、`.` 段;`..` 弹出上一段(根处 clamp)。
+/// 不触盘(纯词法);非绝对路径返 null。输出写进 buf。
+fn normalizeLexical(buf: []u8, path: []const u8) ?[]const u8 {
+    if (path.len == 0 or path[0] != '/') return null;
+    if (path.len > buf.len) return null;
+    var len: usize = 0; // buf 中已写入长度;不含尾 /(根除外)
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
+        if (std.mem.eql(u8, seg, "..")) {
+            // 弹出上一段(根处 clamp 不再弹)
+            if (len > 0) {
+                const prev = std.mem.lastIndexOfScalar(u8, buf[0..len], '/') orelse 0;
+                len = prev;
+            }
+            continue;
+        }
+        if (len + 1 + seg.len > buf.len) return null;
+        buf[len] = '/';
+        @memcpy(buf[len + 1 .. len + 1 + seg.len], seg);
+        len += 1 + seg.len;
+    }
+    if (len == 0) {
+        buf[0] = '/';
+        return buf[0..1]; // 全消光 → 根
+    }
+    return buf[0..len];
+}
+
+/// 词法折叠 `.`/`..`/`//`,**支持绝对与相对路径**(相对时保留无法抵消的前导 `../`)。
+/// 用途:旧 rule_matcher(config.json permission_rules)对**未锚定**的 path_glob 做匹配,
+/// 路径可能是相对的(`src/foo`),无 cwd 可 resolveAbs——故用相对折叠:`src/../../etc/x`
+/// → `../etc/x`(不再匹配 `src/**`),消除 B1 `..` 逃逸。绝对路径 `/proj/../etc` → `/etc`。
+/// 输出写进 buf;path 超出 buf 或空 → null。语义对齐 Go filepath.Clean / Rust Path 词法。
+pub fn foldLexicalRel(buf: []u8, path: []const u8) ?[]const u8 {
+    if (path.len == 0) return null;
+    if (path.len > buf.len) return null;
+    const absolute = path[0] == '/';
+    var len: usize = 0; // 已写入长度(不含前导 / 的隐式根)
+    // 段栈用 buf 本身;相对路径无法抵消的前导 `..` 段原样保留(has_poppable 判 last_seg==".."
+    // 阻止后续段错误抵消它)。
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
+        if (std.mem.eql(u8, seg, "..")) {
+            // 能否弹出上一段?能弹的条件:存在一个"非前导 .."的已写段。
+            const has_poppable = blk: {
+                if (len == 0) break :blk false;
+                // 最后一段起点
+                const last_start = std.mem.lastIndexOfScalar(u8, buf[0..len], '/');
+                const seg_start = if (last_start) |i| i + 1 else 0;
+                const last_seg = buf[seg_start..len];
+                if (std.mem.eql(u8, last_seg, "..")) break :blk false; // 前导 ..,不可抵消
+                break :blk true;
+            };
+            if (has_poppable) {
+                const prev = std.mem.lastIndexOfScalar(u8, buf[0..len], '/') orelse 0;
+                len = prev;
+                continue;
+            }
+            // 不可抵消:绝对路径在根处 clamp(丢弃);相对路径保留前导 ..
+            if (absolute) continue;
+            const piece = if (len == 0) ".." else "/..";
+            if (len + piece.len > buf.len) return null;
+            @memcpy(buf[len .. len + piece.len], piece);
+            len += piece.len;
+            continue;
+        }
+        const piece_len = seg.len + 1; // "/seg" 或(相对首段)"seg"
+        if (len == 0 and !absolute) {
+            if (seg.len > buf.len) return null;
+            @memcpy(buf[0..seg.len], seg);
+            len = seg.len;
+        } else {
+            if (len + piece_len > buf.len) return null;
+            buf[len] = '/';
+            @memcpy(buf[len + 1 .. len + 1 + seg.len], seg);
+            len += piece_len;
+        }
+    }
+    if (len == 0) {
+        if (absolute) {
+            buf[0] = '/';
+            return buf[0..1];
+        }
+        buf[0] = '.'; // 相对全消光 → "."(当前目录)
+        return buf[0..1];
+    }
+    return buf[0..len];
+}
+
 fn joinPath(buf: []u8, a: []const u8, b: []const u8) ?[]const u8 {
     const total = a.len + 1 + b.len;
     if (total > buf.len) return null;
@@ -552,7 +721,9 @@ pub fn extractCommand(args: []const u8) []const u8 {
 }
 
 pub fn extractPath(args: []const u8) []const u8 {
-    return extractStringField(args, "file_path") orelse extractStringField(args, "path") orelse "";
+    return extractStringField(args, "file_path") orelse
+        extractStringField(args, "notebook_path") orelse
+        extractStringField(args, "path") orelse "";
 }
 
 fn extractStringField(args: []const u8, field: []const u8) ?[]const u8 {
@@ -805,4 +976,97 @@ test "matchesMode: symlink deny triggers if target matches (任一)" {
 
     // deny 模式:link basename 不匹配,但 realpath(secret) basename 匹配 → 任一即触发
     try testing.expect(matchesMode(&r, &mctx, "Read", args, .deny));
+}
+
+test "normalizeLexical: 消 . .. // 与根 clamp" {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    try testing.expectEqualStrings("/a/b", normalizeLexical(&buf, "/a/b").?);
+    try testing.expectEqualStrings("/a/b", normalizeLexical(&buf, "/a//b/").?);
+    try testing.expectEqualStrings("/a/b", normalizeLexical(&buf, "/a/./b").?);
+    try testing.expectEqualStrings("/etc/passwd", normalizeLexical(&buf, "/proj/../etc/passwd").?);
+    try testing.expectEqualStrings("/", normalizeLexical(&buf, "/..").?);
+    try testing.expectEqualStrings("/", normalizeLexical(&buf, "/a/..").?);
+    // 非绝对路径 → null
+    try testing.expect(normalizeLexical(&buf, "a/b") == null);
+    try testing.expect(normalizeLexical(&buf, "") == null);
+}
+
+test "isInWorkingDirs: cwd 内/外 + additional_dirs + .. 逃逸 + 边界" {
+    const extra = [_][]const u8{ "/extra/lib", "/opt/data/" };
+    const mctx = MatchContext{ .cwd = "/proj", .additional_dirs = &extra };
+
+    // cwd 子树内(不存在的路径:realpath 失败 → 只词法判定)
+    try testing.expect(isInWorkingDirs(&mctx, "/proj/src/cczig_wd_nonexistent.zig"));
+    try testing.expect(isInWorkingDirs(&mctx, "/proj"));
+    // additional dir 内(含尾 / 配置的归一化)
+    try testing.expect(isInWorkingDirs(&mctx, "/extra/lib/cczig_wd_x.txt"));
+    try testing.expect(isInWorkingDirs(&mctx, "/opt/data/cczig_wd_y.bin"));
+    // 集外
+    try testing.expect(!isInWorkingDirs(&mctx, "/etc/passwd"));
+    try testing.expect(!isInWorkingDirs(&mctx, "/extra/other/z"));
+    // `..` 逃逸:词法归一化后指向集外 → 拒
+    try testing.expect(!isInWorkingDirs(&mctx, "/proj/../etc/passwd"));
+    try testing.expect(!isInWorkingDirs(&mctx, "/extra/lib/../../etc/x"));
+    // 前缀非段边界:/proj 不匹配 /project
+    try testing.expect(!isInWorkingDirs(&mctx, "/project/file"));
+    // 相对路径按 cwd 解析
+    try testing.expect(isInWorkingDirs(&mctx, "src/cczig_wd_rel.zig"));
+    try testing.expect(!isInWorkingDirs(&mctx, "../outside.txt"));
+    // cwd 空 → 恒 false(无 scope 信息)
+    const mctx_nocwd = MatchContext{ .additional_dirs = &extra };
+    try testing.expect(!isInWorkingDirs(&mctx_nocwd, "/extra/lib/f"));
+    // 空路径
+    try testing.expect(!isInWorkingDirs(&mctx, ""));
+}
+
+test "isInWorkingDirs: 指向区外的 symlink 不放行(allow 双匹配语义)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const pid = std.c.getpid();
+    // /tmp 里造 dir + 指向 /etc/hosts 的 symlink
+    var dir_buf: [128]u8 = undefined;
+    const dirz = try std.fmt.bufPrint(&dir_buf, "/tmp/cczig_wd_{d}\x00", .{pid});
+    const dir = dirz[0 .. dirz.len - 1];
+    _ = std.c.mkdir(@ptrCast(dirz.ptr), 0o755);
+    defer _ = std.c.rmdir(@ptrCast(dirz.ptr));
+    var link_buf: [160]u8 = undefined;
+    const linkz = try std.fmt.bufPrint(&link_buf, "{s}/esc.txt\x00", .{dir});
+    const link = linkz[0 .. linkz.len - 1];
+    _ = std.c.unlink(@ptrCast(linkz.ptr));
+    if (std.c.symlink("/etc/hosts", @ptrCast(linkz.ptr)) != 0) return error.SkipZigTest;
+    defer _ = std.c.unlink(@ptrCast(linkz.ptr));
+
+    // dir 为唯一工作目录:link 词法在内,但 realpath 指向 /etc/hosts(集外)→ 拒
+    const mctx = MatchContext{ .cwd = dir };
+    try testing.expect(!isInWorkingDirs(&mctx, link));
+    // 对照:dir 内真实文件放行(不存在的普通路径,realpath 失败走词法)
+    var f_buf: [160]u8 = undefined;
+    const f = try std.fmt.bufPrint(&f_buf, "{s}/normal.txt", .{dir});
+    try testing.expect(isInWorkingDirs(&mctx, f));
+}
+
+test "extractPath: notebook_path 也可提取(NotebookEdit protected/scope 门用)" {
+    try testing.expectEqualStrings(
+        "/x/n.ipynb",
+        extractPath("{\"notebook_path\":\"/x/n.ipynb\",\"new_source\":\"y\"}"),
+    );
+}
+
+test "foldLexicalRel: 绝对 + 相对 + 前导 .. 保留 + 全消光" {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    // 绝对
+    try testing.expectEqualStrings("/a/b", foldLexicalRel(&buf, "/a/b").?);
+    try testing.expectEqualStrings("/etc/passwd", foldLexicalRel(&buf, "/proj/../etc/passwd").?);
+    try testing.expectEqualStrings("/etc", foldLexicalRel(&buf, "/proj/../../etc").?); // 根 clamp
+    try testing.expectEqualStrings("/", foldLexicalRel(&buf, "/..").?);
+    // 相对:.. 抵消 + 无法抵消的前导 .. 保留
+    try testing.expectEqualStrings("etc/passwd", foldLexicalRel(&buf, "src/../etc/passwd").?);
+    try testing.expectEqualStrings("../etc/passwd", foldLexicalRel(&buf, "src/../../etc/passwd").?);
+    try testing.expectEqualStrings("../../x", foldLexicalRel(&buf, "../../x").?);
+    try testing.expectEqualStrings("a/b", foldLexicalRel(&buf, "a/./b").?);
+    try testing.expectEqualStrings("a/b", foldLexicalRel(&buf, "a//b/").?);
+    // 全消光
+    try testing.expectEqualStrings(".", foldLexicalRel(&buf, "a/..").?);
+    try testing.expectEqualStrings(".", foldLexicalRel(&buf, ".").?);
+    // 空 → null
+    try testing.expect(foldLexicalRel(&buf, "") == null);
 }

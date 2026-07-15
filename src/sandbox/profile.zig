@@ -36,6 +36,8 @@ pub const SandboxConfig = struct {
     home: []const u8 = "",
     /// 主 repo .git 路径(worktree 场景:允许写主 repo 的 .git 以便 git commit)
     main_git_dir: ?[]const u8 = null,
+    /// 额外工作目录(--add-dir / additionalDirectories,已绝对):与 cwd 同级可写。
+    additional_dirs: []const []const u8 = &.{},
 };
 
 /// 标准可写设备/路径(无论何时都 allow,否则普通命令跑不起来)。
@@ -64,6 +66,9 @@ pub fn generate(alloc: std.mem.Allocator, cfg: SandboxConfig) ![]u8 {
 
     // 工作目录(realpath)
     try emitSubpath(alloc, &buf, cfg.cwd);
+
+    // 额外工作目录(--add-dir):与 cwd 同级可写
+    for (cfg.additional_dirs) |d| try emitSubpath(alloc, &buf, d);
 
     // worktree:主 repo .git
     if (cfg.main_git_dir) |g| try emitSubpath(alloc, &buf, g);
@@ -216,6 +221,25 @@ test "generate: allowWrite + denyWrite + denyRead" {
     // denyRead 段
     try testing.expect(std.mem.indexOf(u8, p, "(deny file-read*") != null);
     try testing.expect(std.mem.indexOf(u8, p, "/Users/foo/.ssh") != null);
+}
+
+test "generate: additional_dirs 进可写白名单(add-dir 沙箱语义)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架(spawn 命令/shell hook/系统文件/Seatbelt)
+    const extra = [_][]const u8{ "/private/tmp/cczig_extra_a", "/opt/cczig_extra_b" };
+    const cfg = SandboxConfig{
+        .cwd = "/private/tmp",
+        .home = "/Users/foo",
+        .additional_dirs = &extra,
+    };
+    const p = try generate(testing.allocator, cfg);
+    defer testing.allocator.free(p);
+    // 两个 add-dir 都出现在 allow file-write* 段(不存在的路径 realpath 失败 → 原样保留)
+    try testing.expect(std.mem.indexOf(u8, p, "(subpath \"/private/tmp/cczig_extra_a\")") != null);
+    try testing.expect(std.mem.indexOf(u8, p, "(subpath \"/opt/cczig_extra_b\")") != null);
+    // 且在 deny file-write* 之后的 allow 段里(粗校验:allow 段起点在 deny 全局之后)
+    const deny_at = std.mem.indexOf(u8, p, "(deny file-write*)").?;
+    const extra_at = std.mem.indexOf(u8, p, "cczig_extra_a").?;
+    try testing.expect(extra_at > deny_at);
 }
 
 test "writeSbplString escapes quotes and backslashes" {

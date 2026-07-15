@@ -63,7 +63,7 @@ pub fn run(
             .host_services = app.hostServices(),
             .project_dir = app.project_dir_or_empty(),
             .sandbox = app.sandboxPtr(),
-            .cwd_abs = app.cwdAbs(),
+            .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(),
             .home_dir = app.homeDir(),
             .agents = &app.agents,
             .parent_model = app.config.model,

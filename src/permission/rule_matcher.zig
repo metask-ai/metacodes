@@ -24,6 +24,8 @@
 const std = @import("std");
 const common = @import("../tools/common.zig");
 const Decision = @import("decision.zig").Decision;
+const util_json = @import("../util/json.zig");
+const rule_spec = @import("rule_spec.zig");
 
 pub const Rule = struct {
     tool: []const u8,
@@ -67,9 +69,16 @@ pub const RuleSet = struct {
 
             if (r.path_glob) |pattern| {
                 // 优先 file_path（Edit），回退 path（Write）
-                const path = common.extractJsonArg(args, "file_path") orelse
+                const path_raw = common.extractJsonArg(args, "file_path") orelse
                     common.extractJsonArg(args, "path") orelse continue;
-                if (!globMatch(pattern, path)) continue;
+                // **B1 修复(第5镜像点)**:globMatch 前 canonicalize——unescape(与工具层落盘
+                // 同函数)+ 词法折叠 `..`(相对折叠,本匹配器无 cwd 锚)。否则 allow 规则
+                // path_glob `src/**` 对 `src/../../etc/passwd` 匹配 → 静默放行逃逸写。
+                // 折叠后 `../etc/passwd` 不再匹配 `src/**`。canonicalize 失败 → 保守用原文
+                // (仅 OOM / 超长病态路径,工具层同样会拒)。
+                const canon = canonicalizeForGlob(self.allocator, path_raw);
+                defer if (canon.owned) |o| self.allocator.free(o);
+                if (!globMatch(pattern, canon.path)) continue;
             }
 
             return r.decision;
@@ -77,6 +86,23 @@ pub const RuleSet = struct {
         return null;
     }
 };
+
+/// canonicalize 一个路径供 glob 匹配:unescape(util_json,与工具层同函数)+ 词法折叠 `..`
+/// (rule_spec.foldLexicalRel,相对折叠——本匹配器无 cwd)。返回 {path, owned}:owned 非 null
+/// 时 caller 须 free。任一步失败(OOM / 超长)→ 保守退回原文(owned=null)。
+const Canon = struct { path: []const u8, owned: ?[]u8 };
+fn canonicalizeForGlob(alloc: std.mem.Allocator, path_raw: []const u8) Canon {
+    const unesc = util_json.unescapeString(path_raw, alloc) catch return .{ .path = path_raw, .owned = null };
+    var fold_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const folded = rule_spec.foldLexicalRel(&fold_buf, unesc) orelse {
+        // 折叠失败(超长):至少用 unescape 后的(owned),仍消除转义分歧
+        return .{ .path = unesc, .owned = unesc };
+    };
+    // folded 指向栈 buf,需 dupe 逃逸;dupe 失败退回 unesc
+    const owned = alloc.dupe(u8, folded) catch return .{ .path = unesc, .owned = unesc };
+    alloc.free(unesc);
+    return .{ .path = owned, .owned = owned };
+}
 
 /// 简化 glob 匹配：
 /// - `?` 任意单个非 `/` 字符
@@ -200,6 +226,25 @@ test "RuleSet match Write path_glob" {
     try std.testing.expect(rs.match("Write", "{\"path\":\"src/foo.zig\"}") == .allow);
     try std.testing.expect(rs.match("Write", "{\"path\":\"other/foo.zig\"}") == null);
     try std.testing.expect(rs.match("Write", "{\"file_path\":\"src/bar.zig\"}") == .allow);
+}
+
+test "B1 绕过修复(第5镜像点·旧 rule_matcher): allow path_glob src/** 不放行 .. 逃逸" {
+    const a = std.testing.allocator;
+    var rs = RuleSet.init(a);
+    defer rs.deinit();
+    try rs.append(.{
+        .tool = try a.dupe(u8, "Write"),
+        .path_glob = try a.dupe(u8, "src/**"),
+        .decision = .allow,
+    });
+    // sanity:src 内正常文件 allow(规则生效)
+    try std.testing.expect(rs.match("Write", "{\"file_path\":\"src/foo.zig\"}") == .allow);
+    // 明文 .. 逃逸:折叠成 ../etc/passwd 不再匹配 src/** → null(修复前 == .allow → 写 /etc/passwd)
+    try std.testing.expect(rs.match("Write", "{\"file_path\":\"src/../../etc/passwd\"}") == null);
+    // 转义 .. 逃逸:unescape + 折叠 同样 null
+    try std.testing.expect(rs.match("Write", "{\"file_path\":\"src/\\u002e\\u002e/\\u002e\\u002e/etc/passwd\"}") == null);
+    // src 内经 . / 冗余仍 allow(canonicalize 不误伤)
+    try std.testing.expect(rs.match("Write", "{\"file_path\":\"src/./sub/foo.zig\"}") == .allow);
 }
 
 test "RuleSet order: first match wins" {

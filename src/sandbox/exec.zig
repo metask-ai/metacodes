@@ -44,6 +44,8 @@ pub const WrapOptions = struct {
     sandbox: *const config_mod.SandboxSettings,
     /// worktree 场景下的主 repo .git(允许写)
     main_git_dir: ?[]const u8 = null,
+    /// 额外工作目录(--add-dir / additionalDirectories,绝对路径):与 cwd 同级可写。
+    additional_dirs: []const []const u8 = &.{},
     /// 单次调用显式禁用沙箱(dangerouslyDisableSandbox 逃生口)
     disable_for_this_command: bool = false,
 };
@@ -89,6 +91,7 @@ pub fn wrapCommand(alloc: std.mem.Allocator, cmd: []const u8, opts: WrapOptions)
         .allow_read = sb.allow_read,
         .deny_read = sb.deny_read,
         .main_git_dir = opts.main_git_dir,
+        .additional_dirs = opts.additional_dirs,
     });
     defer alloc.free(prof);
 

@@ -190,6 +190,9 @@ pub const ToolContext = struct {
     sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
     /// 当前 cwd 绝对路径(sandbox profile 工作目录写权限)。空 = 用 process cwd。
     cwd_abs: []const u8 = "",
+    /// 额外工作目录(--add-dir / additionalDirectories,绝对路径)。sandbox profile
+    /// 与 cwd 同级可写;权限侧由 permission_ctx.match_ctx.additional_dirs 消费。
+    additional_dirs: []const []const u8 = &.{},
     /// HOME(sandbox profile ~/ 展开)。
     home_dir: []const u8 = "",
     /// 当前 session plan 文件全路径(ExitPlanMode 模型未传 plan 时从此读回兜底)。空=无。

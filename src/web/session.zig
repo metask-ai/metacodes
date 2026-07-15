@@ -212,7 +212,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
                 .activated_tools = &app.activated_tools,
                 .project_dir = app.project_dir_or_empty(),
                 .sandbox = app.sandboxPtr(),
-                .cwd_abs = app.cwdAbs(),
+                .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(),
                 .home_dir = app.homeDir(),
                 .agents = &app.agents,
                 .parent_model = app.config.model,

@@ -83,12 +83,18 @@ pub fn createContext(mode: types.PermissionMode, allocator: std.mem.Allocator) P
 }
 
 pub fn checkPermission(ctx: *const PermissionContext, tool_name: []const u8, args: []const u8) PermissionResult {
+    // B1 防御:规则匹配器(matchesPathDual)用 match_ctx.alloc 做路径 canonicalize
+    // (unescape + 折叠 ..)。生产里 App.loadSettings 已填 .alloc,但那与 settings!=null 是
+    // 隐式耦合;此处兜底——PermissionContext.allocator 非可选,恒填,消除"某路径设了 settings
+    // 却漏填 match_ctx.alloc → 规则匹配退回原始字节被 .. 绕过"的窗口。
+    var mctx = ctx.match_ctx;
+    if (mctx.alloc == null) mctx.alloc = ctx.allocator;
     const d_ctx = decision_mod.Context{
         .mode = ctx.modeValue(),
         .rules = ctx.rules,
         .active_skill = ctx.active_skill,
         .settings = ctx.settings,
-        .match_ctx = ctx.match_ctx,
+        .match_ctx = mctx,
         .sandbox_enabled = ctx.sandbox_enabled,
         .auto_allow_bash_if_sandboxed = ctx.auto_allow_bash_if_sandboxed,
         .hooks = ctx.hooks,
@@ -96,6 +102,7 @@ pub fn checkPermission(ctx: *const PermissionContext, tool_name: []const u8, arg
         .plan_file_path = ctx.plan_file_path,
         .memdir_abs = ctx.memdir_abs,
         .memdir_allocator = ctx.allocator,
+        .path_check_allocator = ctx.allocator,
     };
     return decision_mod.check(&d_ctx, tool_name, args);
 }
