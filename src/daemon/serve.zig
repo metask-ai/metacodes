@@ -62,8 +62,15 @@ pub fn serve(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
 
     try reg.put(host);
     try host.start(); // driver 线程起,读 dctx(已填)
+    // **Linus NIT 修**:driver 已起后,若下方 WebServer.start 失败(如端口占用)→ error 返回,defer LIFO
+    // 会先跑 wb.deinit(defer#2)再 reg.deinit(defer#1 join driver)——顺序倒置(happy-path 的显式顺序
+    // 只覆盖成功路径)。errdefer 在此(注册于 wb defer 之后)→ 错误路径**先** join driver 再 wb.deinit,
+    // 消除潜在 UAF(今天靠 wb 栈分配侥幸无害,不赌运气)。成功路径不触发(走末尾显式 shutdownAll)。
+    errdefer reg.shutdownAll();
 
     // ── transport(复用 WebServer,绑本 session)──────────────────────────────
+    // **U10-C 待补**:command_fn(slash 命令 over HTTP,web run 有 StateSource.command,MVP 未接)+
+    // rich state_fn(StateSource:seq/roster/config)。MVP 用 trivialState "{}"。见 task#22。
     var dummy: u8 = 0;
     const srv = try WebServer.start(web_alloc, port, .{
         .journal = &host.journal,

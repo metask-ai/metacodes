@@ -330,29 +330,28 @@ test "U8: --resume-response 解析进 config.resume_response(内联 + @file)" {
         // 内联 JSON 直接进 config。
         const argv = [_][*:0]const u8{ "metacodes", "--resume-response", "{\"choice\":\"Red\"}" };
         const cfg = cc.parseArgsForTest(&argv, a);
+        defer if (cfg.resume_response) |r| a.free(r); // owned dupe,须释放(否则泄漏)
         try std.testing.expect(cfg.resume_response != null);
         try std.testing.expectEqualStrings("{\"choice\":\"Red\"}", cfg.resume_response.?);
     }
     {
         // @file:从文件读。写临时文件后解析。
+        // 用 std.c 直接读写(web_ui_test.zig 在主 test 目标是 root 模块,无 platform dep;裁剪 std
+        // 无 std.fs.cwd)。对齐其它组件测试惯例(http_error_test 等)。U8 原用 @import("platform") 编译
+        // 错(仅 test:new 有 platform dep),PM review 抓到。
         const path = "/tmp/cc-zig-u8-resume-resp.json";
-        const pfs = @import("platform").fs;
         var pbuf: [128]u8 = undefined;
         @memcpy(pbuf[0..path.len], path);
         pbuf[path.len] = 0;
-        const fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        const fd = std.c.open(@ptrCast(&pbuf), std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
         try std.testing.expect(fd >= 0);
         const content = "{\"answer\":42}";
-        _ = pfs.write(fd, content);
-        _ = pfs.close(fd);
-        defer {
-            var db: [128]u8 = undefined;
-            @memcpy(db[0..path.len], path);
-            db[path.len] = 0;
-            _ = pfs.unlink(@ptrCast(&db));
-        }
+        _ = std.c.write(fd, content.ptr, content.len);
+        _ = std.c.close(fd);
+        defer _ = std.c.unlink(@ptrCast(&pbuf));
         const argv = [_][*:0]const u8{ "metacodes", "--resume-response", "@/tmp/cc-zig-u8-resume-resp.json" };
         const cfg = cc.parseArgsForTest(&argv, a);
+        defer if (cfg.resume_response) |r| a.free(r); // owned(readFileAll dupe),须释放
         try std.testing.expect(cfg.resume_response != null);
         try std.testing.expectEqualStrings(content, cfg.resume_response.?);
     }
