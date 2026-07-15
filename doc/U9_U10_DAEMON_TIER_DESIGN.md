@@ -113,3 +113,43 @@ persist transcript → ③ destroy registry → 退出。**逐 session 优雅**,
   (本地基座定位)。
 - [ ] U9 是否值得独立先落:若 U10 紧接做,U9 可作为 U10-A 的第一步(避免孤儿 shutdown 抽象无消费者)。
   倾向**U9 与 U10 同批**(shutdown 信号第一个消费者 = daemon),TUI/web 兼容重构随之。
+
+## 5. serve-multi 实施计划(U10-C 消费者,下一迭代 —— 已 code-level 勘定)
+
+**目标**:用已测的 resolver 起**静态 N-session** daemon(MVP N=2),端到端证明 2 个独立 session
+经 `/s/<id>/*` 路由互不干扰。补上"resolver 只有单测、无 e2e"缺口(PM review #2)。
+
+**形态**:`metacodes serve --sessions <N> [port]`(config.serve_sessions,默认 1 → 走现有单
+session `serve()`;>1 → `serveMulti()`)。**静态 N**:启动即建 N 个 session,**无 dynamic
+create/destroy/idle-reap**(§4 硬约束:borrow-UAF 未解前 host 不可中途 destroy)。
+
+**每 session 资源(SessionSlot,堆分配保地址稳)**:
+- `arena: *ArenaAllocator`(page/c backing)——**每 App 独立 arena**:App agent_loop 在 app.allocator
+  上分配,各自 driver 线程独占 → arena 非线程安全但**单线程独占**不竞争。**绝不共享 arena**。
+- `app: *App`(App.init(arena.allocator(), io, config, api_key);session_id 自动 gen 唯一)。
+- `host: *SessionHost`、`wb: WebBackend`(绑 host.journal)、`config_sink`、`dctx: DriverCtx`——同
+  单 session serve.zig 逐字段。
+
+**resolver**(已测机制):`fn(ctx,id) → 线性扫 slots 匹配 slot.app.session_id.asSlice()==id → 建
+SessionView{&host.journal,&wb,&host.inbox,&app.abort, state=trivial}`;未匹配→null(WebServer 回 404)。
+slots 静态 → SessionView 裸指针满 §4 生命周期契约。Deps 的单 session 字段(journal/wb/…)填 slot[0]
+占位(resolver 非 null 时 route 走 resolver 路径,singleView 永不调,占位不被读)。
+
+**关停顺序(关键正确性,踩 App.deinit 线程 join 雷)**:App.deinit 会 join 后台 subagent/swarm/LSP/
+MCP 线程 + 关 api_client——**必在该 session 的 driver 线程 join 之后**(否则 driver 还在用 api_client
+→ UAF),又**必在 arena.deinit 之前**(deinit 用 app.allocator)。故:
+1. `shutdown.trigger`(SIGINT)。
+2. 每 session:`host.journal.close()` + 全局 `srv.stop()`(transport 线程不再碰任何 host)。
+3. `reg.shutdownAll()` —— join **所有** driver 线程(driver 停止用各自 app)+ 释放 host.journal/inbox
+   (ctx_deinit_fn=null,serve 外管 wb/app)。
+4. 每 session:`app.deinit()`(driver 已 join,安全 join 其后台线程 + 关 client)。
+5. 每 session:`wb.deinit()` → `arena.deinit()`(App 全部内存批量释放)→ `slot.arena` free。
+
+**e2e(daemon_serve_multi_e2e.sh)**:python mock backend 按 session 回不同标识(或单 body);起
+`serve --sessions 2`;打印/发现两 session id(启动日志各印一行 `session <id> ready`);对 sid_A POST
+`/s/<A>/message` + 对 sid_B POST `/s/<B>/message`,各自 SSE 只收到自己的回；SIGINT→exit 0 无 hang。
+**证明点**:A 的消息绝不出现在 B 的 journal(路由隔离)+ 两 driver 真并发跑。
+
+**未做(留后续迭代)**:dynamic session 创建(op=new,需 App 按需构造 + 可能触网络 probe)、
+rich StateSource(seq/roster/config attach)、command_fn over HTTP、idle-reap/max-sessions(全 §4 治理,
+待 refcount handle)。task#22 主体在此闭环;U10-B(UDS/NDJSON)、U10-E(mid-run interrupt/reconnect e2e)独立。
