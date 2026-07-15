@@ -134,6 +134,13 @@ fn readLockWallMs(lock: *Lock) ?i128 {
 }
 
 fn pid() i64 {
+    // Windows std.c.getpid 返回 HANDLE(*anyopaque),不能 @intCast;用 kernel32 GetCurrentProcessId。
+    if (@import("builtin").os.tag == .windows) {
+        const w = struct {
+            extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+        };
+        return @intCast(w.GetCurrentProcessId());
+    }
     return @intCast(std.c.getpid());
 }
 

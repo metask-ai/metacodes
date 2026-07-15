@@ -105,7 +105,19 @@ pub fn getCwd(allocator: std.mem.Allocator) GetCwdError![]u8 {
 extern "c" fn lstat(path: [*:0]const u8, buf: *std.c.Stat) c_int;
 
 /// 一个路径是否 symlink(lstat,不跟随)。stat 失败/非 symlink → false。
+/// Windows:GetFileAttributesW 的 REPARSE_POINT 位(不跟随,等价 lstat 语义)。comptime 平台分支
+/// 让 POSIX 的 lstat/std.c.S 分支在 Windows 编译时被剔除(否则 std.c.S=void 报错)。
 fn isSymlink(path_z: [*:0]const u8) bool {
+    if (@import("builtin").os.tag == .windows) {
+        const w = struct {
+            extern "kernel32" fn GetFileAttributesA(lpFileName: [*:0]const u8) callconv(.winapi) u32;
+        };
+        const REPARSE: u32 = 0x400;
+        const INVALID: u32 = 0xFFFF_FFFF;
+        const attr = w.GetFileAttributesA(path_z);
+        if (attr == INVALID) return false;
+        return (attr & REPARSE) != 0;
+    }
     var st: std.c.Stat = undefined;
     if (lstat(path_z, &st) != 0) return false;
     return (st.mode & std.c.S.IFMT) == std.c.S.IFLNK;

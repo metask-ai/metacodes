@@ -72,7 +72,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
     // 光 chdir 没用——所有路径工具用 ctx.cwd_abs(App.init 时捕获的启动 cwd)解析相对路径,不是
     // 进程 cwd。必须 chdir 后**同步更新 app.cwd_abs + project_dir 到 worktree**,否则 teammate
     // 被告知在 worktree 干活却实际读写 lead 原仓(两 teammate 撞同一原目录,隔离形同虚设)。
-    if (id.cwd.len > 0) {
+    // Windows 无 std.c.chdir POSIX 绑定 + 进程外 teammate 在 Windows 不可用 → comptime 剔除。
+    if (id.cwd.len > 0 and @import("builtin").os.tag != .windows) {
         var cwd_z: [std.fs.max_path_bytes:0]u8 = undefined;
         if (id.cwd.len < cwd_z.len) {
             @memcpy(cwd_z[0..id.cwd.len], id.cwd);
@@ -404,7 +405,7 @@ pub fn removeWorktree(a: std.mem.Allocator, wt_path: []const u8, repo: []const u
 }
 
 /// spawn 函数签名(DI):生产 = forkExecTeammate;测试注入 mock(不真 fork)验证接线。
-pub const SpawnFn = *const fn (a: std.mem.Allocator, p: SpawnProcessParams) anyerror!std.c.pid_t;
+pub const SpawnFn = *const fn (a: std.mem.Allocator, p: SpawnProcessParams) anyerror!i64;
 
 /// **lead 侧:spawn 一个进程外 teammate**(C1 接线)。步骤:
 ///   ① 有 worktree_base → createWorktree(隔离 cwd);② 登记 config 成员(backend_type=process +
@@ -419,7 +420,7 @@ pub fn spawnTeammateProcess(
     repo: []const u8, // git repo 根(git -C;lead 的 project_dir)。空退回进程 cwd
     abort: anytype,
     spawn_fn: SpawnFn,
-) !std.c.pid_t {
+) !i64 {
     const a = sw.allocator;
     var name_buf: [64]u8 = undefined;
     const name_s = team_mod.sanitizeAgentName(name_raw[0..@min(name_raw.len, 64)], &name_buf);
@@ -490,7 +491,11 @@ pub fn spawnTeammateProcess(
 /// fork+exec 一个 detached teammate 子进程。返回子 pid(>0)。失败返回 error。
 /// setsid 脱离控制终端(不被 lead 的 Ctrl+C 直杀;lead 经 mailbox shutdown 优雅关);
 /// stdin/out/err 重定向 /dev/null(headless teammate 绝不碰终端)。
-pub fn forkExecTeammate(a: std.mem.Allocator, p: SpawnProcessParams) !std.c.pid_t {
+pub fn forkExecTeammate(a: std.mem.Allocator, p: SpawnProcessParams) !i64 {
+    // 进程外 teammate 是 POSIX-only(fork/setsid/execve)。Windows 不支持(要 CreateProcessW,
+    // 完全不同)——comptime gate 让下方 POSIX 分支在 Windows 编译时被剔除,swarm 进程外后端
+    // 在 Windows 降级不可用(--teammate-mode process 报 Unsupported)。in-process teammate 仍可用。
+    if (@import("builtin").os.tag == .windows) return error.Unsupported;
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe = selfExePath(&exe_buf) orelse return error.NoSelfExe;
     // **全部分配在 fork 之前**(Linus SW6:fork 与 execve 之间只允许 async-signal-safe 调用,
@@ -515,7 +520,7 @@ pub fn forkExecTeammate(a: std.mem.Allocator, p: SpawnProcessParams) !std.c.pid_
         _ = std.c.execve(exe_path_z, @ptrCast(argv.ptr), @ptrCast(std.c.environ));
         std.c._exit(127); // execve 失败
     }
-    return pid; // 父进程:返回子 pid
+    return @intCast(pid); // 父进程:返回子 pid(i64 平台中立)
 }
 
 // ============================================================================

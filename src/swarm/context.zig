@@ -11,7 +11,7 @@ const types_mod = @import("../types.zig");
 
 /// 一个进程外 teammate 的 lead 侧记录(owned strings)。
 pub const ProcessTeammate = struct {
-    pid: std.c.pid_t,
+    pid: i64, // 平台中立(Windows std.c.pid_t 是 HANDLE=*anyopaque,不能格式化/@intCast)
     name: []u8, // sanitized
     worktree_path: []u8, // 空 = 无 worktree
     repo: []u8, // git repo 根(removeWorktree 的 git -C);空 = 用进程 cwd
@@ -46,7 +46,10 @@ pub const SwarmContext = struct {
     pub fn deinit(self: *SwarmContext) void {
         // SW6:先关进程外 teammate(SIGTERM + removeWorktree),再收 in-process。
         for (self.process_teammates.items) |*pt| {
-            _ = std.c.kill(pt.pid, std.c.SIG.TERM);
+            // POSIX kill(Windows 无 std.c.kill/SIG;进程外 teammate 在 Windows 不可用,列表恒空)。
+            if (@import("builtin").os.tag != .windows) {
+                _ = std.c.kill(@intCast(pt.pid), std.c.SIG.TERM);
+            }
             if (pt.worktree_path.len > 0) {
                 @import("teammate_process.zig").removeWorktree(self.allocator, pt.worktree_path, pt.repo, null);
             }
