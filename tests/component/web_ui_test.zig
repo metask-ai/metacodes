@@ -324,6 +324,45 @@ test "L2 web: --web 解析(带端口/裸 flag 默认 7777/后跟别的 flag 不�
     }
 }
 
+test "U8: --resume-response 解析进 config.resume_response(内联 + @file)" {
+    const a = std.testing.allocator;
+    {
+        // 内联 JSON 直接进 config。
+        const argv = [_][*:0]const u8{ "metacodes", "--resume-response", "{\"choice\":\"Red\"}" };
+        const cfg = cc.parseArgsForTest(&argv, a);
+        try std.testing.expect(cfg.resume_response != null);
+        try std.testing.expectEqualStrings("{\"choice\":\"Red\"}", cfg.resume_response.?);
+    }
+    {
+        // @file:从文件读。写临时文件后解析。
+        const path = "/tmp/cc-zig-u8-resume-resp.json";
+        const pfs = @import("platform").fs;
+        var pbuf: [128]u8 = undefined;
+        @memcpy(pbuf[0..path.len], path);
+        pbuf[path.len] = 0;
+        const fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+        try std.testing.expect(fd >= 0);
+        const content = "{\"answer\":42}";
+        _ = pfs.write(fd, content);
+        _ = pfs.close(fd);
+        defer {
+            var db: [128]u8 = undefined;
+            @memcpy(db[0..path.len], path);
+            db[path.len] = 0;
+            _ = pfs.unlink(@ptrCast(&db));
+        }
+        const argv = [_][*:0]const u8{ "metacodes", "--resume-response", "@/tmp/cc-zig-u8-resume-resp.json" };
+        const cfg = cc.parseArgsForTest(&argv, a);
+        try std.testing.expect(cfg.resume_response != null);
+        try std.testing.expectEqualStrings(content, cfg.resume_response.?);
+    }
+    {
+        // 无 flag → null(不启用 resume)。
+        const argv = [_][*:0]const u8{"metacodes"};
+        try std.testing.expectEqual(@as(?[]const u8, null), cc.parseArgsForTest(&argv, a).resume_response);
+    }
+}
+
 // P0#1 回归:恶意 Content-Length(usize max,可 parse)不得溢出/panic,应 413。
 test "L2 web: 巨型 Content-Length → 413(整数溢出回归)" {
     const a = std.testing.allocator;

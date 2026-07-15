@@ -314,6 +314,12 @@ pub fn main(init: std.process.Init) !void {
         std.process.exit(code);
     }
 
+    // U8:`--resume-response <json>` → 恢复挂起的 session(read suspend.json→resumeRun),不进 REPL。
+    if (config.resume_response) |resp| {
+        const code = @import("repl/headless.zig").resumeSuspended(app, allocator, resp, config.json_output) catch 1;
+        std.process.exit(code);
+    }
+
     // Headless 模式：`-p "..."` / stdin pipe → 跑单次 prompt 后退出，不进 REPL。
     if (config.prompt) |p| {
         const code = @import("repl/headless.zig").run(app, allocator, p, config.json_output) catch 1;
@@ -799,6 +805,18 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
                     _ = args.next();
                 } else |_| {}
             }
+        } else if (std.mem.eql(u8, arg, "--resume-response")) {
+            // U8:值 = 迟来结果 JSON;`@path` 前缀从文件读(大结果/含引号免 shell 转义)。
+            if (args.next()) |v| {
+                if (v.len > 0 and v[0] == '@') {
+                    config.resume_response = readFileAll(allocator, v[1..]) catch |e| blk: {
+                        std.debug.print("error: 读 --resume-response 文件失败: {s}\n", .{@errorName(e)});
+                        break :blk null;
+                    };
+                } else {
+                    config.resume_response = allocator.dupe(u8, v) catch v;
+                }
+            }
         } else if (std.mem.eql(u8, arg, "--dump-prompt")) {
             config.dump_prompt = true;
         } else if (std.mem.eql(u8, arg, "-")) {
@@ -815,6 +833,26 @@ fn readAllStdin(allocator: std.mem.Allocator) ![]const u8 {
     var chunk: [4096]u8 = undefined;
     while (true) {
         const n = pfs.read(0, chunk[0..chunk.len]);
+        if (n <= 0) break;
+        try buf.appendSlice(allocator, chunk[0..@intCast(n)]);
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+/// U8:读整个文件(--resume-response @path 用)。owned by allocator。
+fn readFileAll(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    var pbuf: [4096]u8 = undefined;
+    if (path.len >= pbuf.len) return error.PathTooLong;
+    @memcpy(pbuf[0..path.len], path);
+    pbuf[path.len] = 0;
+    const fd = pfs.open(@ptrCast(&pbuf), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.FileNotFound;
+    defer _ = pfs.close(fd);
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var chunk: [4096]u8 = undefined;
+    while (true) {
+        const n = pfs.read(fd, chunk[0..chunk.len]);
         if (n <= 0) break;
         try buf.appendSlice(allocator, chunk[0..@intCast(n)]);
     }
@@ -841,6 +879,7 @@ fn printHelp() void {
         \\  -                     Headless: read prompt from stdin
         \\  --json                Headless: emit NDJSON result event
         \\  --web [port]          Serve a web UI (HTTP+SSE) instead of the TUI (default port 7777)
+        \\  --resume-response <j> Resume a suspended session with a late tool response (@file to read from a file)
         \\  --model <model>       Model (default: claude-sonnet-4-20250514)
         \\  --reasoning-effort <e> none|minimal|low|medium|high|xhigh
         \\  --api-key <key>       API key (overrides stored credentials by default)

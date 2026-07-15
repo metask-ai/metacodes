@@ -39,6 +39,11 @@ pub const Config = struct {
     /// `--web [port]`:起 web UI(HTTP+SSE)驱动 agent loop,不进 TUI REPL。
     /// null = 不启用;0 = 内核分配端口(启动时打印真实端口)。
     web_port: ?u16 = null,
+    /// **U8:`--resume-response <json|@file>`**:恢复一个挂起(suspend.json)的 session。
+    /// 值 = 挂起工具(AskUserQuestion/ExitPlanMode/custom)的迟来结果 JSON(`@path` 从文件读)。
+    /// 走 headless.resumeSuspended(read suspend.json→resumeRun→清/重写)。需同 session_id
+    /// (--session / 持久化 transcript 目录一致)。null = 不启用。
+    resume_response: ?[]const u8 = null,
     /// `--settings <path>`:显式 settings 文件(CLI 层,优先级仅次于 managed)。
     settings_path: ?[]const u8 = null,
     /// `--allowedTools "Tool,Tool(spec),..."`:逗号分隔,注入 CLI 层 allow。

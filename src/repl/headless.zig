@@ -34,7 +34,6 @@ pub fn run(
 
     var wb = writer_backend.WriterBackend.initNullWithUsage(&app.usage);
     const be = wb.backend();
-    const jobs_ptr = if (app.jobs) |*j| j else null;
     // scoped 自动召回(一等公民 P1):headless 单次 prompt 也按请求装配相关记忆(cache-safe 尾注入)。
     const scoped_recall = if (app.kg) |*k| (@import("../kg/scoped_recall.zig").build(allocator, k, &app.conversation, &app.abort) catch null) else null;
     defer if (scoped_recall) |s| allocator.free(s);
@@ -43,34 +42,7 @@ pub fn run(
         app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        .{
-            .verbose = app.config.verbose,
-            .abort = &app.abort,
-            .read_state = &app.read_state,
-            .lsp = app.lsp_service, // Y2:headless 也接 LSP 诊断
-            .jobs = jobs_ptr,
-            .agent_jobs = if (app.agent_jobs) |*aj| aj else null,
-            .swarm = &app.swarm, // SW7:headless 也接 swarm(TeamCreate/Task(name)/SendMessage 可用)
-            .plan_prev_mode = &app.plan_prev_mode,
-            .tasks = &app.tasks,
-            .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs,
-            .api_client = &app.api_client,
-            .tool_defs = app.tool_defs,
-            .system_prompt = app.system_prompt,
-            .inject_user_context = app.user_context,
-            .synthetic_user_input = scoped_recall,
-            .dyn_registry = &app.dyn_registry,
-            .host_services = app.hostServices(),
-            .project_dir = app.project_dir_or_empty(),
-            .sandbox = app.sandboxPtr(),
-            .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(),
-            .home_dir = app.homeDir(),
-            .agents = &app.agents,
-            .parent_model = app.activeModel(),
-            .skills_set = &app.skills,
-            .mcp_sessions = &app.mcp_sessions.items,
-            .cron_registry = &app.cron_registry,
-        },
+        buildOptions(app, scoped_recall),
         &be,
         allocator,
     ) catch |err| {
@@ -103,6 +75,131 @@ pub fn run(
         if (final_text.len == 0 or final_text[final_text.len - 1] != '\n') writeStdout("\n");
     }
 
+    return exitCodeFor(result.stop_reason);
+}
+
+/// 构造 agent_loop.Options(run + resumeSuspended 共用,消两份字段漂移)。
+/// scoped_recall = 本轮尾注入的召回记忆(fresh run 传;resume 传 null——续跑不重新召回)。
+fn buildOptions(app: *app_mod.App, scoped_recall: ?[]const u8) agent_loop.Options {
+    return .{
+        .verbose = app.config.verbose,
+        .abort = &app.abort,
+        .read_state = &app.read_state,
+        .lsp = app.lsp_service, // Y2:headless 也接 LSP 诊断
+        .jobs = if (app.jobs) |*j| j else null,
+        .agent_jobs = if (app.agent_jobs) |*aj| aj else null,
+        .swarm = &app.swarm, // SW7:headless 也接 swarm
+        .plan_prev_mode = &app.plan_prev_mode,
+        .tasks = &app.tasks,
+        .kg = if (app.kg) |*k| k else null,
+        .kg_projects_dir = app.kg_projects_dir,
+        .memdir_abs = app.memdir_abs,
+        .api_client = &app.api_client,
+        .tool_defs = app.tool_defs,
+        .system_prompt = app.system_prompt,
+        .inject_user_context = app.user_context,
+        .synthetic_user_input = scoped_recall,
+        .dyn_registry = &app.dyn_registry,
+        .host_services = app.hostServices(),
+        .project_dir = app.project_dir_or_empty(),
+        .sandbox = app.sandboxPtr(),
+        .cwd_abs = app.cwdAbs(),
+        .additional_dirs = app.additionalDirs(),
+        .home_dir = app.homeDir(),
+        .agents = &app.agents,
+        .parent_model = app.activeModel(),
+        .skills_set = &app.skills,
+        .mcp_sessions = &app.mcp_sessions.items,
+        .cron_registry = &app.cron_registry,
+    };
+}
+
+/// **U8:suspend/resume 生产接线 —— read→resumeRun 闭环**。异步前端(Slack/邮件/工作流)的
+/// UI 请求返 error.UiPending → run 挂起落 suspend.json + 退出码 2。响应 out-of-band 到达后,
+/// 新进程带 response_json 调本函数:loadTranscript 重建对话 → suspend_state.read 取挂起点
+/// (tool_use_id/completed_results)→ resumeRun 注入迟来结果续跑 → 完成清 suspend.json,再挂起则
+/// 重写(resume 可链式)。**这是把此前只有 write 侧的挂起机制补成完整闭环**(read 侧原零调用者)。
+///
+/// 前置:app 已用与挂起时**同一 session_id** init(transcript 目录一致);response_json 是挂起工具
+/// (AskUserQuestion/ExitPlanMode/custom)的迟来结果(工具结果 JSON,直接作 tool_result content)。
+pub fn resumeSuspended(
+    app: *app_mod.App,
+    allocator: std.mem.Allocator,
+    response_json: []const u8,
+    json_output: bool,
+) !u8 {
+    const suspend_state = @import("../core/suspend_state.zig");
+    const transcript = @import("../core/transcript.zig");
+    const dir = app.sessionDir() orelse {
+        std.debug.print("error: resume 需要 session 目录(--session/持久化 transcript)\n", .{});
+        return 1;
+    };
+
+    // 读挂起点(tool_use_id/kind/completed_results)。缺 suspend.json = 无挂起可恢复。
+    const state = suspend_state.read(dir, allocator) catch |e| {
+        std.debug.print("error: 读 suspend.json 失败({s})——该 session 无待恢复挂起?\n", .{@errorName(e)});
+        return 1;
+    };
+    defer suspend_state.freeState(state, allocator);
+
+    // 重建对话(挂起前的完整历史;transcript 是持久真相)。app.conversation 由 init 已建空,
+    // loadTranscript 追加历史消息。
+    transcript.loadTranscript(&app.conversation, dir, allocator) catch |e| {
+        std.debug.print("error: loadTranscript 失败({s})\n", .{@errorName(e)});
+        return 1;
+    };
+
+    var wb = writer_backend.WriterBackend.initNullWithUsage(&app.usage);
+    const be = wb.backend();
+
+    // suspend_state.CompletedResult → agent_loop.SuspendInfo.CompletedResult(同形状,异 nominal 类型)。
+    const CR = agent_loop.SuspendInfo.CompletedResult;
+    const crs = allocator.alloc(CR, state.completed_results.len) catch {
+        std.debug.print("error: resume OOM\n", .{});
+        return 1;
+    };
+    defer allocator.free(crs);
+    for (state.completed_results, 0..) |src, i| {
+        crs[i] = .{ .tool_use_id = src.tool_use_id, .content = src.content, .is_error = src.is_error };
+    }
+
+    const result = agent_loop.resumeRun(
+        &app.conversation,
+        app.provider(),
+        app.tool_defs,
+        &app.permission_ctx,
+        state.tool_use_id,
+        response_json,
+        crs,
+        buildOptions(app, null), // resume 不重新召回
+        &be,
+        allocator,
+    ) catch |err| {
+        std.debug.print("error: resumeRun 失败({s})\n", .{@errorName(err)});
+        return 1;
+    };
+
+    app.persistTranscript();
+
+    // 完成 → 清 suspend.json;再次挂起(resume 链式)→ 重写新挂起点。
+    if (result.suspend_info) |si| {
+        defer si.deinit();
+        suspend_state.writeFromSuspendInfo(dir, si, allocator) catch |e| {
+            std.debug.print("warning: suspend.json 重写失败: {s}\n", .{@errorName(e)});
+        };
+        std.debug.print("⏸ 再次挂起 (kind={s}) — 续 resume from: {s}\n", .{ si.kind, dir });
+    } else {
+        suspend_state.clear(dir); // 恢复完成,挂起点作废
+    }
+
+    const final_text = lastAssistantText(&app.conversation, allocator) catch "";
+    defer if (final_text.len > 0) allocator.free(final_text);
+    if (json_output) {
+        try emitJson(allocator, final_text, result, &app.usage, app.activeModel());
+    } else {
+        writeStdout(final_text);
+        if (final_text.len == 0 or final_text[final_text.len - 1] != '\n') writeStdout("\n");
+    }
     return exitCodeFor(result.stop_reason);
 }
 
