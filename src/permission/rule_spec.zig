@@ -148,7 +148,11 @@ fn normalizeColonStarSuffix(s: []const u8) []const u8 {
 /// 解析路径 pattern 的锚点 + glob 体。
 fn parsePathPattern(raw: []const u8) PathPattern {
     if (std.mem.startsWith(u8, raw, "//")) {
-        return .{ .anchor = .absolute, .glob = raw[1..] }; // 留单个 / 让 glob 自然匹配
+        // **P1 修复(安全)**:glob 必须剥掉**两个**前导 `/`,与 matchesPathPattern 的
+        // rel(base="/" 后 abs 剥前导 `/`,无前导斜杠)对齐。旧版 raw[1..] 留 `/etc/**`,
+        // 而 rel 是 `etc/passwd` → matchGitignoreGlob 前导斜杠恒对不上 → 绝对锚规则**永不匹配**
+        // = deny 规则静默 fail-open(硬边界失效,无条件,连 payload 都不用)。
+        return .{ .anchor = .absolute, .glob = raw[2..] };
     }
     if (std.mem.startsWith(u8, raw, "~/")) {
         return .{ .anchor = .home, .glob = raw[2..] };
@@ -1069,4 +1073,32 @@ test "foldLexicalRel: 绝对 + 相对 + 前导 .. 保留 + 全消光" {
     try testing.expectEqualStrings(".", foldLexicalRel(&buf, ".").?);
     // 空 → null
     try testing.expect(foldLexicalRel(&buf, "") == null);
+}
+
+test "P1 修复: 绝对锚 //etc/** deny 规则不再 fail-open(实际匹配 /etc/passwd)" {
+    // 修复前:glob=/etc/**(留前导 /)vs rel=etc/passwd → 恒不匹配 → deny 静默失效。
+    const r = try parseRule("Edit(//etc/**)");
+    try testing.expect(r.spec.path_pattern.anchor == .absolute);
+    try testing.expectEqualStrings("etc/**", r.spec.path_pattern.glob); // 剥两个前导 /
+
+    const mctx = MatchContext{ .cwd = "/proj", .project_root = "/proj" };
+    var abuf: [256]u8 = undefined;
+    // /etc/passwd 命中 → deny 模式真触发(修复前 false=fail-open)
+    const args = try std.fmt.bufPrint(&abuf, "{{\"file_path\":\"/etc/passwd\"}}", .{});
+    try testing.expect(matchesMode(&r, &mctx, "Edit", args, .deny));
+    // 非 /etc 路径不误伤
+    const args2 = try std.fmt.bufPrint(&abuf, "{{\"file_path\":\"/proj/src/a.zig\"}}", .{});
+    try testing.expect(!matchesMode(&r, &mctx, "Edit", args2, .deny));
+}
+
+test "P1 修复: 绝对锚 allow //Users/x/secrets/** 命中" {
+    const r = try parseRule("Write(//Users/x/secrets/**)");
+    try testing.expectEqualStrings("Users/x/secrets/**", r.spec.path_pattern.glob);
+    const mctx = MatchContext{ .cwd = "/proj", .project_root = "/proj" };
+    var abuf: [256]u8 = undefined;
+    const args = try std.fmt.bufPrint(&abuf, "{{\"file_path\":\"/Users/x/secrets/key.pem\"}}", .{});
+    try testing.expect(matchesMode(&r, &mctx, "Write", args, .allow));
+    // project 内不误命中绝对锚 /Users 规则
+    const args2 = try std.fmt.bufPrint(&abuf, "{{\"file_path\":\"/proj/Users/x/secrets/k\"}}", .{});
+    try testing.expect(!matchesMode(&r, &mctx, "Write", args2, .allow));
 }
