@@ -287,7 +287,17 @@ pub const WebServer = struct {
             "retry: 1000\n\n")) return;
 
         while (true) {
-            const batch = self.deps.journal.waitSince(self.allocator, since, 15_000) catch return;
+            // U7:waitSinceFrom 报出 effective start(批次首行逻辑 seq)。若 > since,说明
+            // [since, start) 已被环形淘汰(客户端落后保留窗)→ 发 resync 让客户端重拉 /state
+            // (config/roster 幂等可重建;丢的是瞬态渲染事件)。frame id 用 start+i(逻辑 seq)。
+            var eff_start: usize = since;
+            const batch = self.deps.journal.waitSinceFrom(self.allocator, since, 15_000, &eff_start) catch return;
+            if (eff_start > since) {
+                const rsx = std.fmt.allocPrint(self.allocator, "event: resync\ndata: {{\"dropped_to\":{d}}}\n\n", .{eff_start}) catch return;
+                defer self.allocator.free(rsx);
+                if (!writeAll(fd, rsx)) return;
+                since = eff_start; // 跳到保留窗起点,后续 frame id 与 since 一致
+            }
             if (batch) |lines| {
                 defer {
                     for (lines) |l| self.allocator.free(l);
