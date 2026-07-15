@@ -235,7 +235,10 @@ pub const TuiBackend = struct {
             // L1:轮/工具级进度事件——顶层 TUI 进度走 spinner + set_current_tool,不消费 .progress
             // (它是 subagent 进度树用,由 JobEntry 后端消费)。顶层 no-op。
             .progress => {},
-            .config_changed => {
+                        .session_lifecycle => {
+                // U5:TUI 单 session,生命周期由 loop 编排(banner/resume 提示),此处 no-op。
+            },
+.config_changed => {
                 // U4 A1a:变体就位。A4 接 TUI statusline 重绘(config 变更反映到状态行)。
                 // 当前 no-op(TUI config 变更本就走各自 handler 的直接重绘;A4 统一到 sink)。
             },

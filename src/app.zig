@@ -1680,8 +1680,11 @@ test "U4 A3: reasoning/dirs 单写侧 emit config_changed;setConfigEventSink 同
 
     // 只初始化 setConfigEventSink/setReasoningEffort/emitConfig 触及的字段(undefined App 技巧)。
     var app: App = undefined;
+    app.allocator = std.testing.allocator; // U5 B1:cache seed 用 app.allocator dup
     app.config = types.Config{};
     app.config_event_sink = null;
+    app.snapshot_cache = null; // U5 B1:setConfigEventSink 会 seed cache，需初始化
+    app.additional_dirs_abs = null; // setConfigEventSink seed 读 additionalDirs()
     app.permission_ctx = permission_mod.createContext(.default, std.testing.allocator);
     // api_client 被 setReasoningEffort 写 reasoning_effort 字段——需真 Client。
     var io_rt = std.Io.Threaded.init(std.testing.allocator, .{});
@@ -1707,6 +1710,9 @@ test "U4 A3: reasoning/dirs 单写侧 emit config_changed;setConfigEventSink 同
     app.setConfigEventSink(null);
     app.setReasoningEffort(.low);
     try std.testing.expectEqual(@as(usize, 2), rec.count); // 无变化
+
+    // setConfigEventSink 已 seed cache(dup model/dirs);undefined-App 无 deinit,手动释。
+    if (app.snapshot_cache) |*c| c.deinit();
 }
 
 test "U5 B1: snapshot_cache slice-safe 并发读——狂 setModel/setDirs 时另线程读+dup 无 UAF/无撕裂" {

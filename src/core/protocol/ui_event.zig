@@ -44,6 +44,18 @@ pub const ConfigChange = union(enum) {
     reasoning: ?types.ReasoningEffort, // 值语义
 };
 
+/// **session 生命周期事件**(U5)。进 journal seq 流(附着重放可见 session 边界)。同 config_changed
+/// 用 union → CoreEvent 只加 1 case,加变体时内层 exhaustive switch 编译期强制消费者处理。
+/// created="session 诞生"一次性,挂**事件流建立点作 seq 0**(非 App 装配/attach——那样丢/重复);
+/// closed 在 session 结束。payload=session_id(borrow;sink 跨线程留存须 dup,同 config_changed 契约)。
+/// **loaded(/resume)暂不列**:它需 SessionId.fromSlice(M1 未实现)+ 修 session_id 漂移
+/// (handleResume 换 conversation 但不改 session_id,task#16)——待那个 bounded fix 落地再加
+/// loaded 变体(遵"声明=接线=测试":不声明未接线的变体)。
+pub const SessionLifecycle = union(enum) {
+    created: []const u8, // session_id
+    closed: []const u8, // session_id
+};
+
 /// **配置变更事件出口**(U4)。App **持有**(非借生成期 backend——config 变更在 run 外的
 /// 空闲点),生命周期=session。各轴的**单写侧**(model→syncModelMirrors、mode→
 /// permission_ctx.setMode、dirs/reasoning→App 方法)在 mutate 后经它 emit。driver 单线程 emit。
@@ -122,6 +134,10 @@ pub const CoreEvent = union(enum) {
     /// **跨 UI session 配置变更**(U4)。命令/键盘触发的 model/mode/dirs/reasoning 变更后，
     /// 从该轴的单写侧 emit。多 UI 消费者据此更新状态显示(TUI statusline / web /state 广播)。
     config_changed: ConfigChange,
+
+    /// **session 生命周期**(U5)。created(seq 0)/loaded(/resume)/closed。进 journal seq 流，
+    /// 附着客户端据此见 session 边界起止。
+    session_lifecycle: SessionLifecycle,
 
     /// 上下文接近 auto-compact 阈值的主动提示。每个 run 至多发一次。
     context_warning: struct {

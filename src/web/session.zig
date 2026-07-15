@@ -49,6 +49,14 @@ const WebConfigSink = struct {
     }
 };
 
+/// U5 B2:把一条 session_lifecycle 事件序列化进 journal（进 seq 流，附着重放可见 session 边界）。
+/// created 挂 journal init 后（seq 0），closed 挂 journal.close 前。best-effort（OOM 静默丢）。
+fn journalSessionLifecycle(journal: *EventJournal, alloc: std.mem.Allocator, ev: ui_event.SessionLifecycle) void {
+    const line = std.json.Stringify.valueAlloc(alloc, .{ .session_lifecycle = ev }, .{}) catch return;
+    defer alloc.free(line);
+    journal.append(line);
+}
+
 /// /state 快照的数据源:driver 拥有,server 经回调读(HTTP 线程)。
 const StateSource = struct {
     app: *app_mod.App,
@@ -142,6 +150,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
 
     var journal = EventJournal.init(web_alloc);
     defer journal.deinit();
+    // U5 B2:session_lifecycle.created 作 journal 第一条(seq 0)——事件流建立点，
+    // 任何后来 attach 的客户端(since=0/快照重放)都见 session 边界起点。
+    journalSessionLifecycle(&journal, web_alloc, .{ .created = app.session_id.asSlice() });
     var wb = WebBackend.init(web_alloc, &journal);
     defer wb.deinit();
     wb.abort = &app.abort;
@@ -167,6 +178,9 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
     // 关停顺序契约(见 WebServer.stop doc):先 close journal 唤醒 SSE,再 stop。
     defer srv.stop();
     defer journal.close();
+    // U5 B2:closed 在 journal.close() **之前** emit(LIFO:此 defer 后注册→先运行)——
+    // SSE 客户端在 session_closed 传输帧前先收到 journal 里的 lifecycle.closed 事件。
+    defer journalSessionLifecycle(&journal, web_alloc, .{ .closed = app.session_id.asSlice() });
 
     std.debug.print("metacodes web UI: http://127.0.0.1:{d}  (Ctrl+C to quit)\n", .{srv.port});
     log.info("web", "listening on 127.0.0.1:{d}", .{srv.port});
@@ -318,4 +332,30 @@ test "U4 A5: web config sink 跨线程留存 dup(emit 后覆写源串,journal �
     try std.testing.expect(std.mem.indexOf(u8, lines[0], "model-A") != null);
     try std.testing.expect(std.mem.indexOf(u8, lines[0], "ZZZZZZZ") == null);
     try std.testing.expect(std.mem.indexOf(u8, lines[0], "config_changed") != null);
+}
+
+test "U5 B2: session_lifecycle.created 落 journal seq 0；closed 可 journal" {
+    const a = std.testing.allocator;
+    var journal = EventJournal.init(a);
+    defer journal.deinit();
+
+    // created 作第一条 → seq 0。
+    journalSessionLifecycle(&journal, a, .{ .created = "abc123session" });
+    try std.testing.expectEqual(@as(usize, 1), journal.count()); // 一条，下一 seq=1
+
+    const maybe = try journal.waitSince(a, 0, 0);
+    try std.testing.expect(maybe != null);
+    const lines = maybe.?;
+    defer {
+        for (lines) |l| a.free(l);
+        a.free(lines);
+    }
+    try std.testing.expect(lines.len == 1);
+    try std.testing.expect(std.mem.indexOf(u8, lines[0], "session_lifecycle") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines[0], "created") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines[0], "abc123session") != null);
+
+    // closed 可 journal（收尾）。
+    journalSessionLifecycle(&journal, a, .{ .closed = "abc123session" });
+    try std.testing.expectEqual(@as(usize, 2), journal.count());
 }

@@ -126,7 +126,7 @@ pub const WriterBackend = struct {
             // print-only sink 不收这些(旧 @hasDecl 守卫即编译期消失):
             // ui_request_pending:异步前端专属;print-only(headless/后台 job)不投递,no-op。
             // diag_*:L4 诊断事件,DiagnosticsBackend 专属,渲染后端 no-op。
-            .set_current_tool, .clear_current_tool, .tool_progress, .progress, .tool_result, .config_changed, .ui_request_pending, .diag_turn_begin, .diag_turn_end, .diag_breaker_tripped, .diag_cache_break, .diag_continuation, .diag_run_end => {},
+            .set_current_tool, .clear_current_tool, .tool_progress, .progress, .tool_result, .config_changed, .session_lifecycle, .ui_request_pending, .diag_turn_begin, .diag_turn_end, .diag_breaker_tripped, .diag_cache_break, .diag_continuation, .diag_run_end => {},
         }
     }
 };
