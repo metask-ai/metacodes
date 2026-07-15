@@ -68,13 +68,34 @@ pub const PermissionContext = struct {
     /// 字段消失。在此之前 M6 必须**同时**填这俩,否则权限框/工具框路由到不同 session(不一致)。
     session: @import("core/session_id.zig").SessionId = @import("core/session_id.zig").SessionId.single,
 
+    /// **配置变更事件出口(U4)**:permission_mode 是 setMode 单写侧(model/dirs/reasoning
+    /// 各在 App 方法 emit)。App 只给 `app.permission_ctx` 设 sink;setMode 有 sink 才 emit,
+    /// 故 mode 变更(含 plan_mode 工具直写 ctx.setMode——最该出事件的转移)自动广播。
+    /// **scoped 值拷贝(subagent/agent_loop/agent)必须 null sink**——用 scopedDerive() 单 seam
+    /// 保证(不手工 null N 点,清单会漏)。null = 不 emit(无 UI / 单测 / scoped 拷贝)。
+    event_sink: ?@import("core/protocol/ui_event.zig").ConfigEventSink = null,
+
     /// 读 mode(acquire:看到其它线程的 setMode release 写)。
     pub fn modeValue(self: *const PermissionContext) types.PermissionMode {
         return self.mode.load(.acquire);
     }
-    /// 写 mode(release:让读线程 acquire 时看到)。
+    /// 写 mode(release:让读线程 acquire 时看到)。**U4 单写侧**:有 event_sink 则 emit
+    /// mode_changed(读回 store 后的值,保证事件与状态一致)。
     pub fn setMode(self: *PermissionContext, m: types.PermissionMode) void {
         self.mode.store(m, .release);
+        if (self.event_sink) |sink| sink.emit(.{ .mode = m });
+    }
+
+    /// **scoped 派生的唯一入口(U4)**:值拷贝本 ctx + **null 掉 event_sink**(scoped ctx 不是
+    /// session ctx,其 mode override 绝不 emit 到 session sink),可选覆盖 mode。所有"值拷贝
+    /// permission_ctx 做 override"必须走它(subagent/agent_loop prefetch·nohooks/agent)。
+    /// grep-guard(S4):src 里除本函数外无裸 `permission_ctx.*` / `perm.*` 值拷贝——null 逻辑
+    /// 塌成一处不可能漏(手工枚举 N 点已被证伪漏 4 个)。
+    pub fn scopedDerive(self: *const PermissionContext, mode_override: ?types.PermissionMode) PermissionContext {
+        var derived = self.*;
+        derived.event_sink = null; // scoped 拷贝绝不 emit 到 session sink
+        if (mode_override) |m| derived.mode = std.atomic.Value(types.PermissionMode).init(m);
+        return derived;
     }
 };
 
@@ -155,4 +176,57 @@ test "PermissionContext.mode 原子跨线程 write-read(无撕裂,release-acquir
     }
     th.join();
     try std.testing.expectEqual(types.PermissionMode.plan, ctx.modeValue()); // 末态可见
+}
+
+test "U4 A2: setMode 有 sink 则 emit mode_changed;无 sink 不 emit" {
+    const ui_event = @import("core/protocol/ui_event.zig");
+    const Recorder = struct {
+        got: ?ui_event.ConfigChange = null,
+        fn emit(ctx: *anyopaque, ev: ui_event.ConfigChange) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.got = ev;
+        }
+    };
+    var rec = Recorder{};
+    var ctx = PermissionContext{ .allocator = std.testing.allocator };
+    // 无 sink:setMode 不 emit
+    ctx.setMode(.plan);
+    try std.testing.expect(rec.got == null);
+    // 挂 sink:setMode emit mode_changed，值=store 后的 mode
+    ctx.event_sink = .{ .ctx = @ptrCast(&rec), .emitFn = &Recorder.emit };
+    ctx.setMode(.accept_edits);
+    try std.testing.expect(rec.got != null);
+    try std.testing.expectEqual(types.PermissionMode.accept_edits, rec.got.?.mode);
+    // 关键:工具路径(plan_mode 直写 ctx.setMode)同样 emit（这就是 task#14/plan 转移的事件源）
+    ctx.setMode(.plan);
+    try std.testing.expectEqual(types.PermissionMode.plan, rec.got.?.mode);
+}
+
+test "U4 A2: scopedDerive null 掉 sink(scoped 拷贝的 override 绝不 emit 到 session sink)" {
+    const ui_event = @import("core/protocol/ui_event.zig");
+    const Recorder = struct {
+        count: usize = 0,
+        fn emit(ctx: *anyopaque, _: ui_event.ConfigChange) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.count += 1;
+        }
+    };
+    var rec = Recorder{};
+    var session_ctx = PermissionContext{ .allocator = std.testing.allocator };
+    session_ctx.event_sink = .{ .ctx = @ptrCast(&rec), .emitFn = &Recorder.emit };
+
+    // scopedDerive:值拷贝 + null sink + 可选 override。
+    var derived = session_ctx.scopedDerive(.bypass_permissions);
+    try std.testing.expect(derived.event_sink == null); // sink 被 null
+    try std.testing.expectEqual(types.PermissionMode.bypass_permissions, derived.modeValue()); // override 生效
+    // derived.setMode 不 emit 到 session sink（scoped override 不污染 session 事件）
+    derived.setMode(.plan);
+    try std.testing.expectEqual(@as(usize, 0), rec.count);
+    // 对照:session_ctx.setMode 才 emit
+    session_ctx.setMode(.plan);
+    try std.testing.expectEqual(@as(usize, 1), rec.count);
+    // scopedDerive(null):无 override，保留原 mode，仍 null sink
+    var derived2 = session_ctx.scopedDerive(null);
+    try std.testing.expect(derived2.event_sink == null);
+    try std.testing.expectEqual(session_ctx.modeValue(), derived2.modeValue());
 }

@@ -160,7 +160,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .prompt = prompt,
             .system_prompt = sys_prompt,
             .tool_defs = effective_tool_defs,
-            .permission_ctx = perm.*,
+            .permission_ctx = perm.scopedDerive(null), // U4:单 seam
             .agent_type = subagent_type_raw,
             .model_override = model_override,
             .perm_override = perm_override,
@@ -187,7 +187,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .prompt = prompt,
             .system_prompt = sys_prompt,
             .tool_defs = effective_tool_defs,
-            .permission_ctx = perm.*,
+            .permission_ctx = perm.scopedDerive(null), // U4:单 seam
             .agents = ctx.agents,
             .dyn_registry = ctx.dyn_registry,
             .skills = ctx.skills,

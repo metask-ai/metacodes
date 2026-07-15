@@ -44,6 +44,21 @@ pub const ConfigChange = union(enum) {
     reasoning: ?types.ReasoningEffort, // 值语义
 };
 
+/// **配置变更事件出口**(U4)。App **持有**(非借生成期 backend——config 变更在 run 外的
+/// 空闲点),生命周期=session。各轴的**单写侧**(model→syncModelMirrors、mode→
+/// permission_ctx.setMode、dirs/reasoning→App 方法)在 mutate 后经它 emit。driver 单线程 emit。
+///
+/// **借用契约**:传入的 ConfigChange 里 .model/.dirs 是 borrow，**只在本 emit 调用同步窗口有效**。
+/// sink 实现若跨线程留存（web journal 落盘供 SSE 线程读）**必须在 emitFn 内 dup**；同步消费
+/// （TUI 立即重绘）即用即弃。此契约与 CoreEvent 其余 borrow slice 一致（消费者留存自负拷贝）。
+pub const ConfigEventSink = struct {
+    ctx: *anyopaque,
+    emitFn: *const fn (ctx: *anyopaque, ev: ConfigChange) void,
+    pub fn emit(self: ConfigEventSink, ev: ConfigChange) void {
+        self.emitFn(self.ctx, ev);
+    }
+};
+
 /// core → UI:agent_loop 产出的事件。在 agent_loop 线程(及工具线程,见 tool_progress)调。
 ///
 /// JSON 序列化:union(enum) 默认有 tag,所有 payload 字段均为值/slice,可直接

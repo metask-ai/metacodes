@@ -115,9 +115,10 @@ pub fn spawnAgentSink(
     // 选择实际用的 tool_defs:override > 父
     const effective_tool_defs = opts.tool_defs_override orelse tool_defs;
 
-    // 选择实际用的 permission_ctx
-    var ctx_override: permission_mod.PermissionContext = permission_ctx.*;
-    if (opts.permission_mode_override) |m| ctx_override.setMode(m);
+    // 选择实际用的 permission_ctx。U4:override 走 scopedDerive 单 seam(值拷贝+null sink,
+    // scoped 的 mode override 绝不 emit 到 session sink)。无 override 用父 ctx 指针(pointer-share,
+    // 见 U4 裁定 task#15)。
+    var ctx_override: permission_mod.PermissionContext = permission_ctx.scopedDerive(opts.permission_mode_override);
     const ctx_to_use: *const permission_mod.PermissionContext = if (opts.permission_mode_override != null) &ctx_override else permission_ctx;
 
     // subagent 是隔离上下文:给它**自己的** TaskStore。早先未挂 store(opts 无 tasks 字段)→

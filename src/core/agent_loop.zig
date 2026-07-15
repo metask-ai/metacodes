@@ -628,7 +628,7 @@ pub fn run(
         defer prefetch.deinit();
         const prefetch_enabled = if (permission_ctx.hooks) |h| !h.hasPre() else true;
         // 流期权限判定用的无 hook 上下文副本(不 mid-stream 跑 hook 副作用)。
-        var pc_prefetch = permission_ctx.*;
+        var pc_prefetch = permission_ctx.scopedDerive(null); // U4:单 seam 值拷贝+null sink
         pc_prefetch.hooks = null;
         // 预取用 ToolContext:**忠实镜像下方 base_ctx 的 opts.* 字段**(广播到 concurrency-safe 全集后
         // 只读 Bash/BashOutput/WebFetch 也流式,它们要 jobs/spawn_tick_fn/api_client 等——缺则行为分叉)。
@@ -985,7 +985,7 @@ pub fn run(
         // 为避免 checkPermission 内 decision.check 再跑一次 hook(重复副作用),给它一份 hooks=null 的
         // 上下文副本。改写后的输入(owned)挂 mod_inputs,turn 作用域统一释放;slot.input 指向它。
         const hookset: ?*const hooks_mod.HookSet = permission_ctx.hooks;
-        var pc_nohooks = permission_ctx.*;
+        var pc_nohooks = permission_ctx.scopedDerive(null); // U4:单 seam 值拷贝+null sink
         pc_nohooks.hooks = null;
         var mod_inputs: std.ArrayList([]u8) = .empty;
         defer {
