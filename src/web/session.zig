@@ -163,6 +163,16 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
     defer cmdbox.deinit();
     var state_src = StateSource{ .app = app, .wb = &wb, .cmdbox = &cmdbox, .journal = &journal };
 
+    // U4 A4:装配 config 变更 sink(model/mode/dirs/reasoning 变更 → journal → SSE)。
+    // setConfigEventSink 同步设 App sink + permission_ctx.event_sink(mode),并 **seed snapshot_cache**。
+    // **U5 review MINOR#3:必须在 WebServer.start **之前**装配**——否则 [start, setSink) 窗口内 HTTP
+    // 线程 snapshot() 撞 null-cache fallback(直读 app.additionalDirs(),driver 若此刻 mutate 则 UAF)。
+    // 提前 seed 关死该窗口:server 起来时 cache 必已就位。defer setConfigEventSink(null) 注册在
+    // srv.stop 之前 → LIFO 保证它在 server 停后才清(无 HTTP 线程读已清 sink)。
+    var config_sink = WebConfigSink{ .journal = &journal, .alloc = web_alloc };
+    app.setConfigEventSink(config_sink.sink());
+    defer app.setConfigEventSink(null);
+
     const srv = try WebServer.start(web_alloc, port, .{
         .journal = &journal,
         .web_backend = &wb,
@@ -188,12 +198,6 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
     // 权限询问也走 web 对话框(prompt.ask 读 permission_ctx.ui_requester)。
     app.permission_ctx.ui_requester = wb.requester();
     defer app.permission_ctx.ui_requester = null;
-
-    // U4 A4:装配 config 变更 sink(model/mode/dirs/reasoning 变更 → journal → SSE)。
-    // setConfigEventSink 同步设 App sink + permission_ctx.event_sink(mode)。
-    var config_sink = WebConfigSink{ .journal = &journal, .alloc = web_alloc };
-    app.setConfigEventSink(config_sink.sink());
-    defer app.setConfigEventSink(null);
 
     const be = wb.backend();
     var exit_code: u8 = 0;
@@ -257,7 +261,8 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
                 .activated_tools = &app.activated_tools,
                 .project_dir = app.project_dir_or_empty(),
                 .sandbox = app.sandboxPtr(),
-                .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(),
+                .cwd_abs = app.cwdAbs(),
+                .additional_dirs = app.additionalDirs(),
                 .home_dir = app.homeDir(),
                 .agents = &app.agents,
                 .parent_model = app.activeModel(),

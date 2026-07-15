@@ -44,7 +44,13 @@ const SnapshotCache = struct {
     fn setModel(self: *SnapshotCache, m: []const u8) void {
         _ = self.mutex.lock();
         defer _ = self.mutex.unlock();
-        const dup = self.allocator.dupe(u8, m) catch return; // OOM:保留旧值(降级不崩)
+        // OOM:保留旧值(降级不崩)。但 emitConfig 仍会 journal.append 推进 seq → 快照留
+        // (旧 model, 新 seq)= U5 B3 无缺口不变式在此 OOM 下降级(同 journal.append 自身 OOM 丢行,
+        // 整层 best-effort)。故 warn(不静默),对齐 journal.zig:48 的 drop 记账。
+        const dup = self.allocator.dupe(u8, m) catch {
+            @import("util/log.zig").warn("web", "snapshot cache model refresh dropped (OOM) — attach 快照可能暂缺此变更", .{});
+            return;
+        };
         if (self.model.len > 0) self.allocator.free(self.model);
         self.model = dup;
     }
@@ -52,12 +58,16 @@ const SnapshotCache = struct {
     fn setDirs(self: *SnapshotCache, dirs: []const []const u8) void {
         _ = self.mutex.lock();
         defer _ = self.mutex.unlock();
-        var out = self.allocator.alloc([]u8, dirs.len) catch return;
+        var out = self.allocator.alloc([]u8, dirs.len) catch {
+            @import("util/log.zig").warn("web", "snapshot cache dirs refresh dropped (OOM) — attach 快照可能暂缺此变更", .{});
+            return; // OOM:保留旧(同 setModel:best-effort,warn 不静默)
+        };
         var n: usize = 0;
         for (dirs) |d| {
             out[n] = self.allocator.dupe(u8, d) catch {
                 for (out[0..n]) |x| self.allocator.free(x);
                 self.allocator.free(out);
+                @import("util/log.zig").warn("web", "snapshot cache dirs refresh dropped (OOM) — attach 快照可能暂缺此变更", .{});
                 return; // OOM:保留旧
             };
             n += 1;
@@ -1768,6 +1778,9 @@ test "U5 B3: 附着无缺口不变式——快照(seq,model)绝不撕出漏读�
     //   已完成 ⇒ 其前的 setModel(S-1) 对读者可见 ⇒ 读者随后读 cache 得 idx ≥ S-1。故 m ≥ S-1
     //   恒成立(m 可能=S,若第 S 次刷缓存已跑但 append 未落 → 良性双应用,config 事件幂等)。
     //   唯一被禁的组合 (m<S-1) = 漏读,本测断言它永不出现。
+    //   **OOM 例外(Linus review MINOR)**:setModel 的 dup OOM 时保留旧值但 emit 仍推进 seq →
+    //   降级出 (旧 model, 新 seq) 缺口(同 journal.append 自身 OOM 丢行,整层 best-effort)。本测
+    //   在充足内存下证不变式;OOM 路径 setModel 已 warn 记账(不静默)。
     const a = std.testing.allocator;
     const EventJournal = @import("web/journal.zig").EventJournal; // test-scoped:不进 app.zig 非测试面
     const N: usize = 3000;
