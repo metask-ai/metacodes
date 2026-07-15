@@ -87,6 +87,13 @@ persist transcript → ③ destroy registry → 退出。**逐 session 优雅**,
 - **U10-E**:e2e(两 session 并发跑、各自 attach/interrupt 互不影响、SIGINT 优雅关全部)。
 
 ## 4. 风险 / 待核实
+- [ ] **按 id 借用 host 的访问 API + refcount(option B 已删,待 U10-C/D 消费者按真实需求加)**:
+  a570c36 的 lean registry 只做生命周期(create/put/remove/shutdownAll)+ abort_fn,**无 borrow
+  API(acquire/get)⇒ 无跨线程借用 ⇒ 无 UAF ⇒ 现在不需要 refcount**。当 U10-C/D 引入绑定层(UDS/web
+  accept 线程按 session id 路由消息 / 附着 streaming-attach 跨阻塞调用持有 host)时,才按其真实形态决定:
+  do-everything-under-lock 闭包(postMessage 式)还是 refcount borrow。**血泪**:上一版(v2)在零消费者时
+  就建了 borrow+refcount+治理,被双 re-review 判过度工程 + 那套 UAF 红灯是假绿(testing.allocator 无
+  页保护)→ 收缩到 lean core。相关:task#21(shutdownAll 的 closing 守卫,accept 循环落地时补)。
 - [ ] WebServer 当前单 session 硬编码 state_ctx/journal → 多 session 化是最大改造面(path 路由 +
   per-session 依赖查表)。评估:抽 `WebServer.Deps` 为"按 session id 解析"的回调,而非单份指针。
 - [ ] UDS 在 Windows:AF_UNIX 有 Win10+ 支持但 std 覆盖不确定 → daemon 首版可 POSIX-only(Windows
