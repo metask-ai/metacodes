@@ -115,6 +115,8 @@ pub const web_backend = @import("web/backend.zig");
 pub const web_server = @import("web/server.zig");
 pub const web_session = @import("web/session.zig");
 pub const daemon_registry = @import("daemon/registry.zig"); // U10:SessionRegistry + SessionHost
+pub const daemon_app_driver = @import("daemon/app_driver.zig"); // U10-D:真 App driver
+pub const daemon_serve = @import("daemon/serve.zig"); // U10-D:serve(单 session daemon MVP)
 pub const core_shutdown = @import("core/shutdown.zig"); // U9:进程级停机信号
 pub const tui_status_bar = @import("repl/tui/widget/status_bar.zig");
 pub const tui_verbs = @import("repl/tui/verbs.zig");
@@ -302,6 +304,15 @@ pub fn main(init: std.process.Init) !void {
             .cwd = config.teammate_cwd,
         }) catch |err| blk: {
             log.err("swarm", "teammate process failed: {s}", .{@errorName(err)});
+            break :blk 1;
+        };
+        std.process.exit(code);
+    }
+
+    // U10-D:`serve [port]` daemon 模式 → 经 registry/host/app_driver 跑 session,SIGINT 优雅关停。
+    if (config.serve_port) |port| {
+        const code = @import("daemon/serve.zig").serve(app, allocator, port) catch |err| blk: {
+            log.err("daemon", "serve failed: {s}", .{@errorName(err)});
             break :blk 1;
         };
         std.process.exit(code);
@@ -807,6 +818,16 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
                     _ = args.next();
                 } else |_| {}
             }
+        } else if (std.mem.eql(u8, arg, "serve")) {
+            // U10-D:`serve [port]` daemon 模式(位置子命令)。可选端口(下一个 arg 是数字才吃)。
+            config.serve_port = 7777;
+            var probe = args.*;
+            if (probe.next()) |maybe_port| {
+                if (std.fmt.parseInt(u16, maybe_port, 10)) |p| {
+                    config.serve_port = p;
+                    _ = args.next();
+                } else |_| {}
+            }
         } else if (std.mem.eql(u8, arg, "--resume-response")) {
             // U8:值 = 迟来结果 JSON;`@path` 前缀从文件读(大结果/含引号免 shell 转义)。
             if (args.next()) |v| {
@@ -1024,5 +1045,7 @@ test {
     _ = &@import("web/server.zig");
     _ = &@import("web/session.zig");
     _ = &@import("daemon/registry.zig"); // U10:否则其 test 被 lazy analysis 跳过(Linus 抓的"测试从不跑")
+    _ = &@import("daemon/app_driver.zig"); // U10-D:强制编译分析(否则死代码藏编译错)
+    _ = &@import("daemon/serve.zig"); // U10-D
     _ = &@import("core/shutdown.zig");
 }

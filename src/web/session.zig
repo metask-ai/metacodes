@@ -35,7 +35,7 @@ const ui_event = @import("../core/protocol/ui_event.zig");
 /// 分开(config_changed 是状态广播,任何来源都发;command_result 只是命令 ack)。
 /// **借用契约**:emit 在 driver 线程同步序列化 ev(含 borrow .model/.dirs)→ journal.append **dup**
 /// 进 journal 串,SSE 线程后读的是 dup,borrow 释放安全(dup 发生在 emit 调用内,早于下一次 mutation)。
-const WebConfigSink = struct {
+pub const WebConfigSink = struct { // U10-D:daemon app_driver 复用
     journal: *EventJournal,
     alloc: std.mem.Allocator,
     fn emitThunk(ctx: *anyopaque, ev: ui_event.ConfigChange) void {
@@ -44,14 +44,14 @@ const WebConfigSink = struct {
         defer self.alloc.free(line);
         self.journal.append(line); // journal dup → borrow 同步序列化后即可释放
     }
-    fn sink(self: *WebConfigSink) ui_event.ConfigEventSink {
+    pub fn sink(self: *WebConfigSink) ui_event.ConfigEventSink { // U10-D 复用
         return .{ .ctx = @ptrCast(self), .emitFn = &emitThunk };
     }
 };
 
 /// U5 B2:把一条 session_lifecycle 事件序列化进 journal（进 seq 流，附着重放可见 session 边界）。
 /// created 挂 journal init 后（seq 0），closed 挂 journal.close 前。best-effort（OOM 静默丢）。
-fn journalSessionLifecycle(journal: *EventJournal, alloc: std.mem.Allocator, ev: ui_event.SessionLifecycle) void {
+pub fn journalSessionLifecycle(journal: *EventJournal, alloc: std.mem.Allocator, ev: ui_event.SessionLifecycle) void { // U10-D 复用
     const line = std.json.Stringify.valueAlloc(alloc, .{ .session_lifecycle = ev }, .{}) catch return;
     defer alloc.free(line);
     journal.append(line);
@@ -179,6 +179,47 @@ fn execCommand(app: *app_mod.App, journal: *EventJournal, web_alloc: std.mem.All
     journal.append(line);
 }
 
+/// **U10-D**:构造 web/daemon session 的 agent_loop.Options(web run() 与 daemon app_driver 共用
+/// 一份,消两份漂移)。wb=该 session 的 WebBackend(ui_requester 用);scoped_recall=本轮尾注入召回。
+pub fn buildWebOptions(app: *app_mod.App, wb: *WebBackend, scoped_recall: ?[]const u8) agent_loop.Options {
+    return .{
+        .session = app.session_id,
+        .verbose = app.config.verbose,
+        .abort = &app.abort,
+        .read_state = &app.read_state,
+        .edit_hl_cache = &app.edit_hl_cache,
+        .jobs = if (app.jobs) |*j| j else null,
+        .agent_jobs = if (app.agent_jobs) |*aj| aj else null,
+        .plan_prev_mode = &app.plan_prev_mode,
+        .tasks = &app.tasks,
+        .kg = if (app.kg) |*k| k else null,
+        .kg_projects_dir = app.kg_projects_dir,
+        .memdir_abs = app.memdir_abs,
+        .api_client = &app.api_client,
+        .tool_defs = app.tool_defs,
+        .system_prompt = app.system_prompt,
+        .inject_user_context = app.user_context,
+        .synthetic_user_input = scoped_recall,
+        .dyn_registry = &app.dyn_registry,
+        .host_services = app.hostServices(),
+        .activated_tools = &app.activated_tools,
+        .project_dir = app.project_dir_or_empty(),
+        .sandbox = app.sandboxPtr(),
+        .cwd_abs = app.cwdAbs(),
+        .additional_dirs = app.additionalDirs(),
+        .home_dir = app.homeDir(),
+        .agents = &app.agents,
+        .parent_model = app.activeModel(),
+        .model_switch_compact = app.pendingModelSwitchCompact(),
+        .skills_set = &app.skills,
+        .ui_requester = wb.requester(),
+        .mcp_sessions = &app.mcp_sessions.items,
+        .cron_registry = &app.cron_registry,
+        .plan_file_path = app.plan_file_path,
+        .emit_tool_cards = true,
+    };
+}
+
 /// 跑 web 会话直到退出(空闲期 SIGINT)。返回进程退出码。
 pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
     // web 侧资源统一 c_allocator:emit/journal/HTTP 连接线程并发分配,必须线程安全
@@ -269,48 +310,12 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
         const scoped_recall = if (app.kg) |*k| (@import("../kg/scoped_recall.zig").build(allocator, k, &app.conversation, &app.abort) catch null) else null;
         defer if (scoped_recall) |s| allocator.free(s);
 
-        const jobs_ptr = if (app.jobs) |*j| j else null;
         const result = agent_loop.run(
             &app.conversation,
             app.provider(),
             app.tool_defs,
             &app.permission_ctx,
-            .{
-                .session = app.session_id,
-                .verbose = app.config.verbose,
-                .abort = &app.abort,
-                .read_state = &app.read_state,
-                .edit_hl_cache = &app.edit_hl_cache,
-                .jobs = jobs_ptr,
-                .agent_jobs = if (app.agent_jobs) |*aj| aj else null,
-                .plan_prev_mode = &app.plan_prev_mode,
-                .tasks = &app.tasks,
-                .kg = if (app.kg) |*k| k else null,
-                .kg_projects_dir = app.kg_projects_dir,
-                .memdir_abs = app.memdir_abs,
-                .api_client = &app.api_client,
-                .tool_defs = app.tool_defs,
-                .system_prompt = app.system_prompt,
-                .inject_user_context = app.user_context,
-                .synthetic_user_input = scoped_recall,
-                .dyn_registry = &app.dyn_registry,
-                .host_services = app.hostServices(),
-                .activated_tools = &app.activated_tools,
-                .project_dir = app.project_dir_or_empty(),
-                .sandbox = app.sandboxPtr(),
-                .cwd_abs = app.cwdAbs(),
-                .additional_dirs = app.additionalDirs(),
-                .home_dir = app.homeDir(),
-                .agents = &app.agents,
-                .parent_model = app.activeModel(),
-                .model_switch_compact = app.pendingModelSwitchCompact(),
-                .skills_set = &app.skills,
-                .ui_requester = wb.requester(),
-                .mcp_sessions = &app.mcp_sessions.items,
-                .cron_registry = &app.cron_registry,
-                .plan_file_path = app.plan_file_path,
-                .emit_tool_cards = true,
-            },
+            buildWebOptions(app, &wb, scoped_recall),
             &be,
             allocator,
         ) catch |err| {
@@ -335,7 +340,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
     return exit_code;
 }
 
-fn announceRunDone(journal: *EventJournal, allocator: std.mem.Allocator, stop_reason: []const u8, err_name: ?[]const u8) void {
+pub fn announceRunDone(journal: *EventJournal, allocator: std.mem.Allocator, stop_reason: []const u8, err_name: ?[]const u8) void { // U10-D 复用
     const line = std.json.Stringify.valueAlloc(allocator, .{
         .run_done = .{ .stop_reason = stop_reason, .err = err_name },
     }, .{}) catch return;

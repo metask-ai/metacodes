@@ -1,0 +1,88 @@
+//! **daemon 真 App driver(U10-D)** —— SessionHost 的 driver_fn:跑真 agent_loop,消费 host.inbox
+//! → host.journal。**复用 web/session.zig 的 buildWebOptions**(与 web run() 同一份 Options,不漂移)。
+//!
+//! **职责边界(与 serve 分工)**:driver **只跑循环**(消息→run→journal)。per-session 资源
+//! (wb/config_sink/ui_requester/lifecycle)由 **serve 建**——因为 wb 是 driver↔transport **共享**
+//! 资源(transport 的 StateSource 要 wb.pendingId() + /respond 路由回本 wb),必须 serve 建、经
+//! DriverCtx.wb 传给 driver + 同时给 WebServer。setup/teardown 顺序对齐 web run() 的 defer 契约,
+//! 集中在 serve(见 serve.zig)。
+//!
+//! **allocator 分裂(与 web run() 一致,'allocator 一致铁律')**:
+//! - **app.allocator**(App arena,与 app.conversation 同源)→ agent_loop.run + scoped_recall。
+//! - **host.allocator**(serve 建 host 时的 web_alloc/c_allocator,线程安全)→ msg free / announceRunDone。
+//!
+//! **线程**:driver_fn 在 SessionHost 线程跑。App arena 单线程(每 session 一个 App,本 driver 唯一
+//! toucher);host.journal/wb 线程安全(c_alloc)。
+
+const std = @import("std");
+const app_mod = @import("../app.zig");
+const agent_loop = @import("../core/agent_loop.zig");
+const web_session = @import("../web/session.zig");
+const WebBackend = @import("../web/backend.zig").WebBackend;
+const registry = @import("registry.zig");
+const SessionHost = registry.SessionHost;
+const abort = @import("../util/abort.zig");
+const time = @import("../util/time.zig");
+const log = @import("../util/log.zig");
+
+/// driver 注入上下文:该 session 的 App + 共享 wb(serve 建)。
+pub const DriverCtx = struct {
+    app: *app_mod.App,
+    wb: *WebBackend, // serve 建、绑 host.journal,driver 取 backend() 喂 agent_loop
+};
+
+/// SessionHost.abort_fn:中断该 session 的 in-flight run(戳 app.abort)。requestStop 调它 → agent_loop
+/// 的网络 IO 阻塞立即返回,join 不挂(见 registry.SessionHost.destroy)。
+pub fn abortFn(ctx: *anyopaque, reason: abort.Reason) void {
+    const dctx: *DriverCtx = @ptrCast(@alignCast(ctx));
+    dctx.app.abort.abort(reason);
+}
+
+/// SessionHost.driver_fn:真 App 驱动循环(mirror web/session.zig run() 的 outer 循环,用 host 资源)。
+/// 退出:host.stopRequested()。**wb/config_sink/lifecycle 由 serve 建/拆,不在此**。
+pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
+    const dctx: *DriverCtx = @ptrCast(@alignCast(ctx));
+    const app = dctx.app;
+    const app_alloc = app.allocator; // agent_loop + scoped_recall(与 conversation 同源)
+    const infra = host.allocator; // msg free / announceRunDone(线程安全 c_alloc)
+    const be = dctx.wb.backend();
+
+    while (!host.stopRequested()) {
+        const msg = host.inbox.popFront() orelse {
+            time.sleepMs(50);
+            continue;
+        };
+        defer infra.free(msg); // msg 来自 host.inbox(infra alloc)
+
+        app.conversation.appendText(.user, msg) catch |e| {
+            log.warn("daemon", "appendText failed: {s}", .{@errorName(e)});
+            continue;
+        };
+
+        const scoped_recall = if (app.kg) |*k| (@import("../kg/scoped_recall.zig").build(app_alloc, k, &app.conversation, &app.abort) catch null) else null;
+        defer if (scoped_recall) |s| app_alloc.free(s);
+
+        const result = agent_loop.run(
+            &app.conversation,
+            app.provider(),
+            app.tool_defs,
+            &app.permission_ctx,
+            web_session.buildWebOptions(app, dctx.wb, scoped_recall),
+            &be,
+            app_alloc, // 与 conversation 同源
+        ) catch |err| {
+            log.err("daemon", "agent_loop failed: {s}", .{@errorName(err)});
+            web_session.announceRunDone(&host.journal, infra, "error", @errorName(err));
+            continue;
+        };
+
+        app.persistTranscript();
+        web_session.announceRunDone(&host.journal, infra, @tagName(result.stop_reason), null);
+
+        // abort 复位:user_interrupt(前端 Stop)复位继续下一条;user_ctrl_c(host 停)由循环条件
+        // stopRequested() 处理(serve 关停时 requestStop 置 stop_flag),不在此复位。
+        if (result.stop_reason == .aborted and app.abort.reason() == .user_interrupt) {
+            app.abort.resetForTesting();
+        }
+    }
+}
