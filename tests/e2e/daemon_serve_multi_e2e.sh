@@ -15,7 +15,7 @@ cleanup(){ kill -9 "${dpid:-0}" "${mpid:-0}" 2>/dev/null; rm -rf "$TMP"; }
 trap cleanup EXIT
 
 cat > "$TMP/mock.py" <<'PY'
-import http.server, sys
+import http.server, sys, time
 SSE=(b'data: {"type":"message_start","message":{"id":"m","role":"assistant","model":"x","usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
  b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
  b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"DAEMON_OK"}}\n\n'
@@ -24,7 +24,11 @@ SSE=(b'data: {"type":"message_start","message":{"id":"m","role":"assistant","mod
  b'data: {"type":"message_stop"}\n\n')
 class H(http.server.BaseHTTPRequestHandler):
     def do_POST(s):
-        s.rfile.read(int(s.headers.get('Content-Length',0)))
+        body = s.rfile.read(int(s.headers.get('Content-Length',0)))
+        # body 含 SLOWGEN 标记 → 延 2s 再回(保持该 session generating,供 UDS interrupt 真打进来)。
+        # 只对 interrupt 测试那一发生效,其余生成保持瞬时,不拖慢主体。
+        if b'SLOWGEN' in body:
+            time.sleep(2.0)
         s.send_response(200); s.send_header('Content-Type','text/event-stream'); s.end_headers()
         s.wfile.write(SSE); s.wfile.flush()
     def log_message(s,*a): pass
@@ -84,38 +88,61 @@ echo "$evB2" | grep -q "DAEMON_OK" || { echo "FAIL: B 发消息后仍无生成(B
 # U10-B:UDS+NDJSON 绑定(与 web 共享 registry)。此时 A/B 均已跑完 → 空闲。
 [ -S "$usock" ] || { echo "FAIL: UDS socket 未创建: $usock"; cat "$out"; exit 1; }
 uds_out=$(python3 - "$usock" "$A" "$B" <<'PY'
-import socket, sys, json
+import socket, sys, json, time
 path, A, B = sys.argv[1], sys.argv[2], sys.argv[3]
-def req(obj):
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(path)
-    s.sendall((json.dumps(obj)+"\n").encode()); s.settimeout(3)
+def conn():
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(path); return s
+def req(obj):  # 一发一收(单响应 op)
+    s = conn(); s.sendall((json.dumps(obj)+"\n").encode()); s.settimeout(3)
     try: data = s.recv(65536).decode()
     except socket.timeout: data = ""
     s.close(); return data
+def attach_lines(sid, since, secs):  # attach 流,读 secs 秒内的所有 NDJSON 行
+    s = conn(); s.sendall((json.dumps({"op":"attach","session":sid,"since":since})+"\n").encode())
+    s.settimeout(secs); buf=""
+    try:
+        while True:
+            d = s.recv(65536)
+            if not d: break
+            buf += d.decode()
+    except socket.timeout: pass
+    s.close()
+    return [ln for ln in buf.split("\n") if ln]
+
 # list：两个 session id 都在
-lst = req({"op":"list"})
-assert A in lst and B in lst, "list 缺 session id: "+lst
-# 未知 session → 错误(路由隔离)
+lst = req({"op":"list"}); assert A in lst and B in lst, "list 缺 session id: "+lst
+# 未知 session → 拒
 unk = req({"op":"message","session":"deadbeefdeadbeefdeadbeef","text":"x"})
 assert '"ok":false' in unk and "unknown session" in unk, "未知 session 未拒: "+unk
-# 空闲期 interrupt B → generating 门挡(not generating)
+
+# ── M1:since / streaming / 消息投递 / 路由隔离 全部给牙 ──────────────────────────
+# 基线:attach A since=0 数出当前 journal 行数 n0。
+base = attach_lines(A, 0, 2); n0 = len(base)
+assert n0 > 0, "A 基线 journal 为空"
+# UDS 发一条**唯一标记**消息到 A(标记不会来自早先 web 流量 → 无 vacuous)。
+MARK = "uds-mark-A-7f3c9"
+m = req({"op":"message","session":A,"text":MARK}); assert '"ok":true' in m, "UDS message 未接受: "+m
+# 投递+streaming+since:attach A since=n0 只收 n0 之后的新行,必须含 MARK 的 echo。
+newl = attach_lines(A, n0, 3); joined = "\n".join(newl)
+assert MARK in joined, "since=n0 未流式收到 UDS 新消息 echo(投递/streaming/since 失效): "+joined[:300]
+# since 真被尊重:attach A since=n0+1000(远超) → MARK 不该出现(否则 since 被忽略当 0 回放)。
+far = attach_lines(A, n0+1000, 2)
+assert MARK not in "\n".join(far), "since 被忽略:远期 since 仍回放了旧标记"
+# 路由隔离(UDS 侧):A 的标记消息绝不进 B 的 journal。
+bl = attach_lines(B, 0, 2)
+assert MARK not in "\n".join(bl), "UDS 路由串台:A 的消息出现在 B 的 journal"
+
+# ── M2:interrupt 成功分支(真打到 generating 的 session,非仅门挡)─────────────────
+# 空闲期 interrupt B → generating 门挡(not generating,409 语义)。
 it = req({"op":"interrupt","session":B})
-assert '"ok":false' in it and "not generating" in it, "interrupt 门(S1)失效: "+it
-# message via UDS 到 A → ok:true
-m = req({"op":"message","session":A,"text":"uds-hello"})
-assert '"ok":true' in m, "UDS message 未接受: "+m
-# attach A since=0 → 流式回放 journal(含既有 DAEMON_OK),证 attach streaming 工作
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(path)
-s.sendall((json.dumps({"op":"attach","session":A,"since":0})+"\n").encode()); s.settimeout(4)
-buf=""
-try:
-    while "DAEMON_OK" not in buf:
-        d = s.recv(65536)
-        if not d: break
-        buf += d.decode()
-except socket.timeout: pass
-s.close()
-assert "DAEMON_OK" in buf, "UDS attach 流无 DAEMON_OK: "+buf[:200]
+assert '"ok":false' in it and "not generating" in it, "空闲 interrupt 门(S1)失效: "+it
+# 发 SLOWGEN 消息到 B → driver POST 到 mock,mock 延 2s → B 进入 generating。
+sg = req({"op":"message","session":B,"text":"SLOWGEN interrupt-me"}); assert '"ok":true' in sg
+time.sleep(0.7)  # 等 driver 起 POST、mock 开始 sleep(B generating=true)
+# 此刻 interrupt B → 命中成功分支(generating→abort→ok:true),非 409。
+it2 = req({"op":"interrupt","session":B})
+assert '"ok":true' in it2, "generating 期 interrupt 未走成功分支(仍被门挡?): "+it2
+
 print("UDS_OK")
 PY
 ) || { echo "FAIL: UDS 检查异常"; echo "$uds_out"; exit 1; }

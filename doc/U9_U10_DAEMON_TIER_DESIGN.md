@@ -50,10 +50,13 @@ session"语义)——**而是把两个被 g_abort_signal 混同的概念拆开**
 一个 App 实例 + 一个 SessionService(U2 中立命令面)+ 一个 EventJournal(U7 有界)。**不进 TUI**。
 
 ### 2.2 绑定层(两条,复用现有,不引 HTTP/2/WebSocket)
-- **UDS + NDJSON**(本地进程间,新):Unix domain socket,每行一个 JSON 消息(NDJSON)。请求
-  `{"session":"<id>","op":"message|command|interrupt|attach","...}`;响应/事件 NDJSON 回推。
-  UDS = 本机、文件权限即鉴权(0600)、无 CSRF/Origin 顾虑(非浏览器可达)。这是 gui/imui/语音 UI 的
-  首选本地绑定(低延迟、双向、无 HTTP 开销)。
+- **UDS + NDJSON**(本地进程间)—— ✅ **已落地(U10-B,948d871 + review 收口)**:Unix domain socket,
+  每行一个 JSON(NDJSON)。**实现的 op**:`list`(枚举 session id)/ `message`(入 inbox)/ `interrupt`
+  (生成期门,同 web)/ `attach`(从 seq 起流式 journal)。**与原设计的差异(诚实登记)**:增了 `list`
+  (客户端发现 session);`command`(slash 命令 over NDJSON)**未做**(同 web /command=501,后续迭代)。
+  鉴权 = UDS 文件权限 chmod 0600(**best-effort,非硬鉴权**:bind→chmod 有 TOCTOU 窗口、传统 BSD 忽略
+  socket 权限;本地单用户可用,见 net.zig listenUnix 注释)。无 CSRF/Origin 顾虑(非浏览器可达)。gui/
+  imui/语音 UI 首选本地绑定。见 src/daemon/uds.zig。
 - **SSE + POST**(web,复用 U5-U7 的 WebServer):保留。daemon 下 WebServer 需**按 session 多路**
   (path 带 session id:`/s/<id>/events`、`/s/<id>/message`)。当前 WebServer 是单 session
   (state_ctx/journal 单份)→ U10 需让它按 session id 查 SessionService + journal。
@@ -81,7 +84,8 @@ persist transcript → ③ destroy registry → 退出。**逐 session 优雅**,
 - **U9-B**:TUI/web/headless 宿主把 app.abort 挂 shutdown 观察者(N=1 行为不变,红灯 e2e)。
   删 g_abort_signal 单指针语义(改 g_shutdown)。
 - **U10-A**:SessionRegistry + SessionHost(create/lookup/destroy + driver 线程 + lifecycle 事件)。
-- **U10-B**:UDS + NDJSON 绑定(listen/accept/per-conn 线程/NDJSON 编解码/按 session 路由)。
+- **U10-B** ✅ 已落地:UDS + NDJSON 绑定(net.listenUnix + uds.zig UdsServer;list/message/interrupt/
+  attach;与 web 并存同 registry;e2e 有牙:since/streaming/投递/路由隔离/interrupt 成功分支)。`command` op 未做。
 - **U10-C**:WebServer 多 session 化(path `/s/<id>/*` → registry 查 SessionService/journal)。
 - **U10-D**:`metacodes serve` CLI + 关停顺序接 U9 shutdown。
 - **U10-E**:e2e(两 session 并发跑、各自 attach/interrupt 互不影响、SIGINT 优雅关全部)。
@@ -167,5 +171,6 @@ MCP 线程 + 关 api_client——**必在该 session 的 driver 线程 join 之�
 **证明点**:A 的消息绝不出现在 B 的 journal(路由隔离)+ 两 driver 真并发跑。
 
 **未做(留后续迭代)**:dynamic session 创建(op=new,需 App 按需构造 + 可能触网络 probe)、
-rich StateSource(seq/roster/config attach)、command_fn over HTTP、idle-reap/max-sessions(全 §4 治理,
-待 refcount handle)。task#22 主体在此闭环;U10-B(UDS/NDJSON)、U10-E(mid-run interrupt/reconnect e2e)独立。
+rich StateSource(seq/roster/config attach)、command_fn over HTTP/NDJSON、idle-reap/max-sessions(全 §4
+治理,待 refcount handle)。task#22 主体在此闭环。**U10-B(UDS/NDJSON)✅ 已落地**(见 §2.2/§3)。
+**U10 剩余**:U10-E(mid-run interrupt / 断线重连 / 多消息 e2e)、dynamic create/destroy、idle-reap。

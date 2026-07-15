@@ -186,21 +186,41 @@ fn unixAddr(path: []const u8) std.c.sockaddr.un {
     return addr;
 }
 
-/// 绑 UDS <path>:unlink 陈旧文件 → socket → bind → chmod 0600(文件权限即鉴权,仅属主可连)→ listen。
-/// **POSIX only**——Windows 直接 SocketFailed(comptime gate,不编译 posix 分支)。
+/// 绑 UDS <path>:(仅陈旧 socket 才)unlink → socket → bind → chmod 0600 → listen。**POSIX only**
+/// (Windows 直接 SocketFailed,comptime gate 不编译 posix 分支)。
+///
+/// **鉴权诚实说明**:UDS 的唯一访问控制 = 文件权限。chmod 0600 让仅属主可连,但存在两点边界(Linus
+/// review B/C):① **bind→chmod 有 TOCTOU 窗口**——bind 按 `0666 & ~umask` 建文件,chmod 之后才收紧;
+/// 默认 umask 022 下窗口内是 0644(无 o+w,connect 需写权限 → 仍连不上,无害),仅在**极宽松 umask(0)**
+/// 才短暂可利用。真正 race-free 需 0700 私有父目录(推荐把 socket 放在如 `~/.metacodes/`);② 传统 BSD
+/// 曾忽略 socket 文件权限(靠父目录),Linux/现代 macOS 在 connect 检查故 0600 有效。**结论**:0600 是
+/// best-effort 收紧,不是跨所有 POSIX 的硬鉴权;本地单用户可用,勿当强安全边界。
 pub fn listenUnix(path: []const u8, backlog: u31) Error!Socket {
     if (is_windows) return error.SocketFailed;
     var zbuf: [SUN_PATH_MAX + 1]u8 = undefined;
     const pz = pathZ(path, &zbuf) orelse return error.BindFailed;
-    _ = std.c.unlink(pz); // best-effort 清陈旧 socket(存在则 bind EADDRINUSE)
+    // **仅当 path 已是 socket 才 unlink**(footgun 防护,Linus-C):`--uds /some/regular/file` 绝不该删
+    // 用户的普通文件。非 socket 存在 → 不删,后续 bind 报 BindFailed(EADDRINUSE),不静默毁数据。
+    var st: std.c.Stat = undefined;
+    if (std.c.fstatat(std.c.AT.FDCWD, pz, &st, 0) == 0) { // macOS 用 fstatat(std.c.stat 是 INODE64 桩)
+        if (std.c.S.ISSOCK(st.mode)) _ = std.c.unlink(pz);
+    } // 不存在(fstatat!=0):无需 unlink
     const s = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
     if (!isValid(s)) return error.SocketFailed;
     errdefer closeSocket(s);
     var addr = unixAddr(path);
     if (std.c.bind(s, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) < 0) return error.BindFailed;
-    _ = std.c.chmod(pz, 0o600); // 鉴权:仅属主可连(best-effort)
+    _ = std.c.chmod(pz, 0o600); // 收紧到属主(best-effort;窗口/BSD 边界见上)
     if (std.c.listen(s, backlog) < 0) return error.ListenFailed;
     return s;
+}
+
+/// recv 返回 <0 后判定:是超时(EAGAIN/EWOULDBLOCK)或被信号打断(EINTR)= 可重试,而非真错误(应关连接)。
+/// POSIX;Windows 恒 true(UDS 不在 Windows 跑,此分支不可达但须编译)。
+pub fn recvRetriable() bool {
+    if (is_windows) return true;
+    const e = std.c._errno().*;
+    return e == @intFromEnum(std.c.E.AGAIN) or e == @intFromEnum(std.c.E.INTR);
 }
 
 /// 连 UDS <path>(POSIX only)。测试/客户端用。
@@ -326,6 +346,16 @@ test "UDS listen/connect/send/recv roundtrip(POSIX)" {
     defer {
         closeSocket(listener);
         unlinkUnixPath(path);
+    }
+
+    // 鉴权:socket 文件应为 0600(chmod)——S2 给"文件权限即鉴权"这条声明加牙。
+    {
+        var zbuf: [SUN_PATH_MAX + 1]u8 = undefined;
+        const pz = pathZ(path, &zbuf).?;
+        var st: std.c.Stat = undefined;
+        try testing.expect(std.c.fstatat(std.c.AT.FDCWD, pz, &st, 0) == 0);
+        try testing.expect(std.c.S.ISSOCK(st.mode)); // 是 socket
+        try testing.expectEqual(@as(u32, 0o600), st.mode & 0o777); // 仅属主 rw(chmod 生效)
     }
 
     const client = try connectUnix(path);

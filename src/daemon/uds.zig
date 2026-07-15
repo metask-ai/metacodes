@@ -108,7 +108,10 @@ pub const UdsServer = struct {
         while (!self.closing.load(.acquire)) {
             const n = net.recv(conn, &rbuf);
             if (n == 0) return; // 对端关闭
-            if (n < 0) continue; // 超时/错误 → 回顶查 closing(超时是空闲常态)
+            if (n < 0) {
+                if (net.recvRetriable()) continue; // 超时(EAGAIN)/EINTR:回顶查 closing(空闲常态)
+                return; // 真 socket 错误:关连接(Linus-A:不把真错误当超时忙旋)
+            }
             accum.appendSlice(self.allocator, rbuf[0..@intCast(n)]) catch return;
             while (std.mem.indexOfScalar(u8, accum.items, '\n')) |nl| {
                 const took_over = self.dispatch(conn, accum.items[0..nl]);
