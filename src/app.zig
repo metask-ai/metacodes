@@ -1755,6 +1755,134 @@ test "U5 B1: snapshot_cache slice-safe 并发读——狂 setModel/setDirs 时�
     th.join();
 }
 
+test "U5 B3: 附着无缺口不变式——快照(seq,model)绝不撕出漏读的 config 事件(跨双 mutex happens-before)" {
+    // ── 证的东西:附着协议的**无缺口**属性。客户端拿 /state 快照(seq=S)后订阅 `?since=S`,
+    // 只会收到 journal 位置 ≥S 的事件;位置 <S 的事件必须**已反映在快照的 model 里**。若快照给出
+    // (旧 model, 新 seq),客户端既没在快照里、也不会在流里拿到那次变更 → 永久陈旧(GAP)。
+    //
+    // ── 不变式靠两个生产排序(本测精确复刻):
+    //   写侧 emitConfig(.model):**cache.setModel(m) 先于 journal.append**(app.zig:1310→1314,
+    //     WebConfigSink.emit 落 journal)。刷缓存骑 emit。
+    //   读侧 StateSource.snapshot:**seq=journal.count() 先于 cache 读**(session.zig:74→76)。
+    //   合起来(跨两把锁,靠 journal.mutex 携带 happens-before):快照见 S 条 journal ⇒ append(S-1)
+    //   已完成 ⇒ 其前的 setModel(S-1) 对读者可见 ⇒ 读者随后读 cache 得 idx ≥ S-1。故 m ≥ S-1
+    //   恒成立(m 可能=S,若第 S 次刷缓存已跑但 append 未落 → 良性双应用,config 事件幂等)。
+    //   唯一被禁的组合 (m<S-1) = 漏读,本测断言它永不出现。
+    const a = std.testing.allocator;
+    const EventJournal = @import("web/journal.zig").EventJournal; // test-scoped:不进 app.zig 非测试面
+    const N: usize = 3000;
+
+    var journal = EventJournal.init(a);
+    defer journal.deinit();
+    var cache = SnapshotCache{ .allocator = a };
+    defer cache.deinit();
+    cache.setModel("m0000"); // seed(seq 0 前的初值)
+
+    // 写侧:严格复刻 emitConfig(.model) 排序——先刷缓存,再落 journal。model 名定宽 "mNNNN"
+    // 使字符串序==数值序,idx 可解析。
+    const Driver = struct {
+        fn run(c: *SnapshotCache, j: *EventJournal, n: usize) void {
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                var buf: [8]u8 = undefined;
+                const m = std.fmt.bufPrint(&buf, "m{d:0>4}", .{i}) catch unreachable;
+                c.setModel(m); // ← emitConfig 步①:刷缓存(app.zig:1310)
+                j.append(m); //   ← emitConfig 步②:落 journal(app.zig:1314 sink.emit)
+            }
+        }
+    };
+    var th = try std.Thread.spawn(.{}, Driver.run, .{ &cache, &journal, N });
+
+    // 读侧:严格复刻 StateSource.snapshot 读序——先取 seq,再读 cache。狂读到 driver 跑完,
+    // 每次断言 m ≥ S-1(无缺口)。
+    while (true) {
+        const seq = journal.count(); // ← snapshot 步①:先取 seq(session.zig:74)
+        const s = try cache.readOwned(a); // ← snapshot 步②:后读 cache(session.zig:76)
+        defer {
+            a.free(s.model);
+            for (s.dirs) |x| a.free(x);
+            a.free(s.dirs);
+        }
+        // 解析 model idx("mNNNN" → NNNN)。
+        try std.testing.expectEqual(@as(usize, 5), s.model.len);
+        const m_idx = try std.fmt.parseInt(usize, s.model[1..], 10);
+        // 无缺口:m_idx + 1 ≥ seq(即 m_idx ≥ seq-1)。seq==0 时无约束(m_idx≥0 恒真)。
+        if (seq >= 1) try std.testing.expect(m_idx + 1 >= seq);
+        if (seq >= N) break; // driver 跑满
+    }
+    th.join();
+
+    // 终态一致:全部落定后 seq==N,cache==最后一个 model。
+    try std.testing.expectEqual(N, journal.count());
+    const fin = try cache.readOwned(a);
+    defer {
+        a.free(fin.model);
+        for (fin.dirs) |x| a.free(x);
+        a.free(fin.dirs);
+    }
+    var ebuf: [8]u8 = undefined;
+    const expect_last = try std.fmt.bufPrint(&ebuf, "m{d:0>4}", .{N - 1});
+    try std.testing.expectEqualStrings(expect_last, fin.model);
+}
+
+test "U5 B3(判别性): 确定性证明读序**必须** seq→cache——正序永不缺口,逆序会缺口" {
+    // 上一条并发压测只证"无崩溃/无撕裂";它**不判别**读序(逆序在锁竞争+窄窗口下也几乎不缺口)。
+    // 本条用**手动步进**驱动器消除竞态,确定性地证明:
+    //   · 正序(seq 先) → 即便驱动器随后猛进,快照 m_idx ≥ seq-1 恒成立(无缺口)。
+    //   · 逆序(cache 先) → 驱动器在两读之间步进 → 快照给出(旧 model, 新 seq)= 缺口。
+    // 这是"读序 load-bearing"的真凭据,非并发运气。
+    const a = std.testing.allocator;
+    const EventJournal = @import("web/journal.zig").EventJournal;
+
+    var journal = EventJournal.init(a);
+    defer journal.deinit();
+    var cache = SnapshotCache{ .allocator = a };
+    defer cache.deinit();
+
+    // 手动步进 = emitConfig(.model) 一次:先刷缓存,再落 journal。
+    const step = struct {
+        fn do(c: *SnapshotCache, j: *EventJournal, i: usize) void {
+            var buf: [8]u8 = undefined;
+            const m = std.fmt.bufPrint(&buf, "m{d:0>4}", .{i}) catch unreachable;
+            c.setModel(m);
+            j.append(m);
+        }
+    }.do;
+    const readIdx = struct {
+        fn go(c: *SnapshotCache, alloc: std.mem.Allocator) usize {
+            const s = c.readOwned(alloc) catch unreachable;
+            defer {
+                alloc.free(s.model);
+                for (s.dirs) |x| alloc.free(x);
+                alloc.free(s.dirs);
+            }
+            return std.fmt.parseInt(usize, s.model[1..], 10) catch unreachable;
+        }
+    }.go;
+
+    step(&cache, &journal, 0); // cache=m0, count=1
+    step(&cache, &journal, 1); // cache=m1, count=2
+
+    // ── 正序:seq 先,cache 后。两读之间驱动器猛进 2 步 → model 只会更新,绝不缺口。
+    {
+        const seq = journal.count(); // =2
+        step(&cache, &journal, 2); // 驱动器插进(cache=m2,count=3)
+        step(&cache, &journal, 3); // (cache=m3,count=4)
+        const m_idx = readIdx(&cache, a); // 读到 m3(=3)
+        try std.testing.expect(m_idx + 1 >= seq); // 3+1 ≥ 2 ✓ 无缺口(model 反而超前)
+    }
+
+    // ── 逆序:cache 先,seq 后。两读之间驱动器插进 2 步 → 快照(旧 model, 新 seq)= 缺口。
+    {
+        const m_idx = readIdx(&cache, a); // 此刻 cache=m3 → 3
+        step(&cache, &journal, 4); // 驱动器插进(count=5)
+        step(&cache, &journal, 5); // (count=6)
+        const seq = journal.count(); // =6
+        // 逆序下 m_idx(3)+1=4 < seq(6) → 缺口成立。断言"逆序确实撕出缺口"(证读序 load-bearing)。
+        try std.testing.expect(m_idx + 1 < seq);
+    }
+}
+
 test "U2 S1: toggleVim 翻转 config.vim_mode 返回新值" {
     var app: App = undefined;
     app.config = types.Config{}; // 默认 vim_mode=false
