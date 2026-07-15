@@ -27,11 +27,21 @@
 const std = @import("std");
 const api_stream = @import("../../api/stream.zig");
 const abort = @import("../../util/abort.zig");
+const types = @import("../../types.zig"); // UI-free 核心类型(PermissionMode/ReasoningEffort)
 
-/// UI 当前所处阶段(对齐 RenderRegion 的 generating/input 双态)。
-pub const Phase = enum(u8) {
-    input = 0, // 等待用户输入
-    generating = 1, // 正在跑一轮 agent_loop
+/// **跨 UI session 配置变更**(U4)。多 UI 附着同一 session 时的状态广播源。
+/// 只含**跨 UI 关心的 session 级配置**——model/mode/dirs/reasoning;theme/vim 是
+/// TUI 呈现层本地态(web/gui 各有自己的),不进核心事件(且 theme.Variant 是 UI 类型,
+/// 进核心会破坏 lib UI-free 边界)。用 union → CoreEvent 只加 1 个 case,加轴时内层
+/// exhaustive switch 编译期强制所有消费者处理。
+///
+/// **借用契约(Linus U4 定)**:.model/.dirs 是 borrow slice,**只在 emit 同步窗口有效**;
+/// sink 若跨线程留存(web journal)必须落地时 dup。.mode/.reasoning 值语义,安全。
+pub const ConfigChange = union(enum) {
+    model: []const u8, // 新 model(borrow;sink 跨线程留存须 dup)
+    mode: types.PermissionMode, // 值语义
+    dirs: []const u8, // 新增/变更的目录(borrow;sink 跨线程留存须 dup)
+    reasoning: ?types.ReasoningEffort, // 值语义
 };
 
 /// core → UI:agent_loop 产出的事件。在 agent_loop 线程(及工具线程,见 tool_progress)调。
@@ -94,8 +104,9 @@ pub const CoreEvent = union(enum) {
     /// token 计数增量。
     usage: api_stream.UsageDelta,
 
-    /// 阶段切换(input ↔ generating)。
-    phase_change: Phase,
+    /// **跨 UI session 配置变更**(U4)。命令/键盘触发的 model/mode/dirs/reasoning 变更后，
+    /// 从该轴的单写侧 emit。多 UI 消费者据此更新状态显示(TUI statusline / web /state 广播)。
+    config_changed: ConfigChange,
 
     /// 上下文接近 auto-compact 阈值的主动提示。每个 run 至多发一次。
     context_warning: struct {

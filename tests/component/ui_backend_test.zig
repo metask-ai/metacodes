@@ -381,7 +381,6 @@ test "WriterBackend: 卡/spinner/progress/usage 事件全 no-op(print-only 不�
     be.emitEvent(S, .clear_current_tool);
     be.emitEvent(S, .{ .tool_result = .{ .id = "t", .name = "Bash", .input = "{}", .content = "ok", .is_error = false, .elapsed_ms = 10 } });
     be.emitEvent(S, .{ .usage = .{ .input_tokens = 5 } });
-    be.emitEvent(S, .{ .phase_change = .generating });
     // verbose=false tool_start(card=false) 也不发 → 全程零字节。
     try testing.expectEqual(@as(usize, 0), cap.buf.items.len);
 }

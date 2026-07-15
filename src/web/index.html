@@ -168,7 +168,6 @@ function coreEvent(ce) {
     case "text_chunk": appendAssistant(p); break;
     case "stream_begin": endAssistant(); break;
     case "stream_done": endAssistant(); break;
-    case "phase_change": setGenerating(p === "generating" || p === 1); break;
 
     case "tool_start": endAssistant(); startToolCard(p); break;
     case "tool_progress": toolProgress(p); break;

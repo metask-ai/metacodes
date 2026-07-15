@@ -76,7 +76,7 @@ pub const sandbox_config = @import("sandbox/config.zig");
 // ── 协议(core ↔ UI 契约;实现自定义前端只需这几个)────────────────────────
 pub const protocol = struct {
     pub const ui_backend = @import("core/protocol/ui_backend.zig"); // UiBackend vtable
-    pub const ui_event = @import("core/protocol/ui_event.zig"); // CoreEvent, UiEvent, Phase
+    pub const ui_event = @import("core/protocol/ui_event.zig"); // CoreEvent, UiEvent, ConfigChange
     pub const ui_request = @import("core/protocol/ui_request.zig"); // UiRequest, UiResponse, UiRequestFn
     pub const PermissionChoice = @import("core/protocol/permission_choice.zig").PermissionChoice;
     pub const CHAT_SENTINEL = @import("core/protocol/chat_sentinel.zig").CHAT_SENTINEL;

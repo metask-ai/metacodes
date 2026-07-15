@@ -16,7 +16,6 @@
 //!   .tool_result{card=t}→ region.clearToolCard
 //!   .tool_result{card=f}→ tool_card.renderResult → writeGenText
 //!   .usage              → 累加进 usage_acc(主路径置 null,走 usage_sink)
-//!   .phase_change       → no-op(enter/leaveGenerating 由 loop 编排)
 //!   .auto_compact       → writeGenText(格式化提示行)
 //!   .retry_notice       → [门控] writeGenText("Retrying in Ns…")
 //!   .stream_done        → writeGenText(colorize ? "\x1b[0m\n" : "\n")
@@ -236,8 +235,9 @@ pub const TuiBackend = struct {
             // L1:轮/工具级进度事件——顶层 TUI 进度走 spinner + set_current_tool,不消费 .progress
             // (它是 subagent 进度树用,由 JobEntry 后端消费)。顶层 no-op。
             .progress => {},
-            .phase_change => {
-                // enter/leaveGenerating 仍由 loop 编排(需 *App)。此处 no-op。
+            .config_changed => {
+                // U4 A1a:变体就位。A4 接 TUI statusline 重绘(config 变更反映到状态行)。
+                // 当前 no-op(TUI config 变更本就走各自 handler 的直接重绘;A4 统一到 sink)。
             },
             .auto_compact => |c| {
                 var buf: [256]u8 = undefined;
