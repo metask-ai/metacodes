@@ -25,6 +25,7 @@ fn addPlatform(b: *std.Build, mod: *std.Build.Module) void {
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const tfilter = b.option([]const u8, "tfilter", "test filter");
 
     // 固定产出两个二进制：metacodes (ReleaseSmall) 和 metacodes-debug (Debug)。
     // 不受 -Doptimize 影响，一次 build 同时得到发布版和调试版。
@@ -119,7 +120,11 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addHl(b, core_test_mod);
-    const core_test = b.addTest(.{ .name = "metacodes-core-test", .root_module = core_test_mod });
+    const core_test = b.addTest(.{
+        .name = "metacodes-core-test",
+        .root_module = core_test_mod,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+    });
     const core_test_step = b.step("test:lib", "Test/compile the metacodes-core library module (proves UI isolation)");
     core_test_step.dependOn(&b.addRunArtifact(core_test).step);
 
@@ -182,7 +187,6 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addHl(b, test_module);
-    const tfilter = b.option([]const u8, "tfilter", "test filter");
     const test_obj = b.addTest(.{
         .name = "cc-test",
         .root_module = test_module,
@@ -228,6 +232,7 @@ pub fn build(b: *std.Build) void {
         "tests/component/subagent_model_test.zig",
         "tests/component/web_search_test.zig",
         "tests/component/allowed_tools_test.zig",
+        "tests/component/agent_session_tools_test.zig",
         "tests/component/skill_fork_test.zig",
         "tests/component/prompt_tool_coupling_test.zig",
         "tests/component/http_error_test.zig",
@@ -320,6 +325,7 @@ pub fn build(b: *std.Build) void {
     const new_step = b.step("test:new", "Run only the new e2e-framework L2 component tests");
     const new_files = [_][]const u8{
         "tests/component/user_context_inject_test.zig",
+        "tests/component/agent_session_tools_test.zig",
         "tests/component/http_error_test.zig",
         "tests/component/answer_queue_test.zig",
         "tests/component/base_url_flag_test.zig",

@@ -1,8 +1,8 @@
-//! UI-neutral owner for one stateful AgentCore session.
+//! UI-neutral Runtime and stateful AgentCore Session owners.
 //!
-//! `AgentSession` owns provider, conversation, permission and Run lifecycle
-//! state. This first contract is deliberately text-only: tool execution,
-//! suspend/resume and UI request channels are added as separate capabilities.
+//! `AgentRuntime` owns the immutable built-in tool catalog and outlives all
+//! Sessions. `AgentSession` owns provider, credentials, workspace, tool
+//! selection, conversation, permission memory, jobs and Run lifecycle state.
 
 const std = @import("std");
 const sync = @import("platform").sync;
@@ -18,14 +18,94 @@ const UiEvent = ui_backend.UiEvent;
 const SessionId = ui_backend.SessionId;
 const agent_loop = @import("agent_loop.zig");
 const secure = @import("../util/secure.zig");
+const tool_catalog = @import("tool_catalog.zig");
+const workspace_mod = @import("workspace_policy.zig");
+const ReadState = @import("read_state.zig").ReadState;
+const JobRegistry = @import("job_registry.zig").JobRegistry;
+const SessionRules = @import("../permission/session_rules.zig").SessionRules;
 
-pub const Config = struct {
+pub const DEFAULT_BUILTIN_TOOLS = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Grep", "Bash", "BashOutput", "KillShell" };
+
+pub const RuntimeConfig = struct {
+    builtin_tools: []const []const u8 = &DEFAULT_BUILTIN_TOOLS,
+};
+
+pub const RuntimeError = error{
+    RuntimeBusy,
+    RuntimeUnavailable,
+};
+
+const RuntimeState = enum { active, destroying };
+
+pub const AgentRuntime = struct {
+    allocator: std.mem.Allocator,
+    catalog: tool_catalog.Catalog,
+    mutex: sync.Mutex = .{},
+    live_sessions: usize = 0,
+    state: RuntimeState = .active,
+
+    pub fn create(allocator: std.mem.Allocator, config: RuntimeConfig) !*AgentRuntime {
+        const self = try allocator.create(AgentRuntime);
+        errdefer allocator.destroy(self);
+        const catalog = try tool_catalog.Catalog.initBuiltins(allocator, config.builtin_tools);
+        self.* = .{ .allocator = allocator, .catalog = catalog };
+        return self;
+    }
+
+    pub fn destroy(self: *AgentRuntime) RuntimeError!void {
+        self.mutex.lock();
+        if (self.state != .active) {
+            self.mutex.unlock();
+            return error.RuntimeUnavailable;
+        }
+        if (self.live_sessions != 0) {
+            self.mutex.unlock();
+            return error.RuntimeBusy;
+        }
+        self.state = .destroying;
+        self.mutex.unlock();
+
+        const allocator = self.allocator;
+        self.catalog.deinit();
+        self.* = undefined;
+        allocator.destroy(self);
+    }
+
+    pub fn createSession(self: *AgentRuntime, config: SessionConfig) !*AgentSession {
+        return AgentSession.create(self, config);
+    }
+
+    fn retainSession(self: *AgentRuntime) RuntimeError!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.state != .active) return error.RuntimeUnavailable;
+        self.live_sessions += 1;
+    }
+
+    fn releaseSession(self: *AgentRuntime) void {
+        self.mutex.lock();
+        std.debug.assert(self.live_sessions > 0);
+        self.live_sessions -= 1;
+        self.mutex.unlock();
+    }
+};
+
+pub const WorkspaceConfig = workspace_mod.Config;
+pub const ShellPolicy = workspace_mod.ShellPolicy;
+
+pub const SessionConfig = struct {
     provider_kind: types.ProviderKind,
     api_key: []const u8,
     model: []const u8,
     base_url: ?[]const u8 = null,
     permission_mode: types.PermissionMode = .default,
+    workspace: WorkspaceConfig,
+    /// Explicit authority ceiling. It can only select names present in the
+    /// Runtime catalog; an empty list creates a text-only Session deliberately.
+    allowed_tools: []const []const u8,
 };
+
+pub const Config = SessionConfig;
 
 pub const EventSink = struct {
     ctx: *anyopaque,
@@ -65,12 +145,18 @@ pub const LifecycleError = error{
 
 pub const AgentSession = struct {
     allocator: std.mem.Allocator,
+    runtime: *AgentRuntime,
     session_id: SessionId,
     api_key: []u8,
     model: []u8,
     base_url: ?[]u8,
     provider: provider_factory.OwnedProvider,
     conversation: Conversation,
+    workspace: workspace_mod.WorkspacePolicy,
+    tools: tool_catalog.Selection,
+    read_state: ReadState,
+    jobs: ?JobRegistry,
+    session_rules: SessionRules,
     permission_ctx: permission.PermissionContext,
     abort_signal: AbortSignal,
     active_sink: ?EventSink = null,
@@ -85,9 +171,25 @@ pub const AgentSession = struct {
     /// Allocate directly at the final address. This avoids the invalid
     /// init-by-value + bind(self) pattern where a later move leaves backend ctx
     /// pointing at stale storage.
-    pub fn create(allocator: std.mem.Allocator, config: Config) !*AgentSession {
+    pub fn create(runtime: *AgentRuntime, config: SessionConfig) !*AgentSession {
+        try runtime.retainSession();
+        errdefer runtime.releaseSession();
+        const allocator = runtime.allocator;
         const self = try allocator.create(AgentSession);
         errdefer allocator.destroy(self);
+
+        var workspace = try workspace_mod.WorkspacePolicy.init(allocator, config.workspace);
+        errdefer workspace.deinit();
+        var selected_tools = try tool_catalog.Selection.init(allocator, &runtime.catalog, config.allowed_tools);
+        errdefer selected_tools.deinit();
+        for (selected_tools.entries) |entry| {
+            if (!workspace.allowsTool(entry.definition.name)) return error.ShellToolDisabled;
+        }
+        var jobs: ?JobRegistry = null;
+        if (selected_tools.contains("Bash") or selected_tools.contains("BashOutput") or selected_tools.contains("KillShell")) {
+            jobs = try JobRegistry.init(allocator);
+        }
+        errdefer if (jobs) |*registry| registry.deinit();
 
         const api_key = try allocator.dupe(u8, config.api_key);
         errdefer secureFree(allocator, api_key);
@@ -111,15 +213,32 @@ pub const AgentSession = struct {
 
         self.* = .{
             .allocator = allocator,
+            .runtime = runtime,
             .session_id = session_id,
             .api_key = api_key,
             .model = model,
             .base_url = base_url,
             .provider = owned_provider,
             .conversation = Conversation.init(allocator),
+            .workspace = workspace,
+            .tools = selected_tools,
+            .read_state = ReadState.init(allocator),
+            .jobs = jobs,
+            .session_rules = .{},
             .permission_ctx = permission_ctx,
             .abort_signal = AbortSignal.init(),
         };
+        self.permission_ctx.session_rules = &self.session_rules;
+        // A UI-neutral library must never fall back to process stdin. Until a
+        // Host requester is attached, `.ask` decisions fail closed.
+        self.permission_ctx.no_interactive_prompt = true;
+        self.permission_ctx.match_ctx = .{
+            .cwd = self.workspace.root,
+            .project_root = self.workspace.root,
+            .home = self.workspace.home,
+        };
+        self.permission_ctx.sandbox_enabled = self.workspace.shell == .sandboxed;
+        self.permission_ctx.auto_allow_bash_if_sandboxed = self.workspace.shell == .sandboxed;
         return self;
     }
 
@@ -142,13 +261,19 @@ pub const AgentSession = struct {
         self.mutex.unlock();
 
         const allocator = self.allocator;
+        const runtime = self.runtime;
         self.provider.deinit();
         self.conversation.deinit();
+        if (self.jobs) |*registry| registry.deinit();
+        self.read_state.deinit();
+        self.tools.deinit();
+        self.workspace.deinit();
         if (self.base_url) |url| allocator.free(url);
         allocator.free(self.model);
         secureFree(allocator, self.api_key);
         self.* = undefined;
         allocator.destroy(self);
+        runtime.releaseSession();
     }
 
     /// Run one text turn while preserving Conversation across successful Runs.
@@ -168,12 +293,22 @@ pub const AgentSession = struct {
         var native_result = agent_loop.run(
             &self.conversation,
             self.provider.provider(),
-            &.{},
+            self.tools.definitions,
             &self.permission_ctx,
             .{
                 .max_turns = max_turns,
                 .session = self.session_id,
                 .abort = &self.abort_signal,
+                .read_state = &self.read_state,
+                .jobs = if (self.jobs) |*registry| registry else null,
+                .tool_defs = self.tools.definitions,
+                .tool_dispatcher = self.tools.dispatcher(),
+                .project_dir = self.workspace.root,
+                .cwd_abs = self.workspace.root,
+                .home_dir = self.workspace.home,
+                .sandbox = self.workspace.sandbox(),
+                .parent_model = self.model,
+                .colorize = false,
             },
             &backend,
             self.allocator,
@@ -327,6 +462,8 @@ const EraseObservingAllocator = struct {
     backing: std.mem.Allocator,
     target_len: usize,
     fail_index: ?usize = null,
+    fail_after_target: bool = false,
+    failed_after_target: bool = false,
     allocations: usize = 0,
     target_ptr: ?[*]u8 = null,
     target_freed: bool = false,
@@ -338,6 +475,11 @@ const EraseObservingAllocator = struct {
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
         const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (self.fail_after_target and self.target_ptr != null and !self.failed_after_target) {
+            self.failed_after_target = true;
+            self.allocations += 1;
+            return null;
+        }
         if (self.fail_index == self.allocations) {
             self.allocations += 1;
             return null;
@@ -396,12 +538,22 @@ const SinkProbe = struct {
     }
 };
 
-fn createTestSession(mode: types.PermissionMode) !*AgentSession {
-    return AgentSession.create(std.testing.allocator, .{
+fn createTestRuntime(allocator: std.mem.Allocator) !*AgentRuntime {
+    return AgentRuntime.create(allocator, .{ .builtin_tools = &.{"Read"} });
+}
+
+fn testCwd() ![]u8 {
+    return @import("../util/fs.zig").getCwd(std.testing.allocator);
+}
+
+fn createTestSession(runtime: *AgentRuntime, mode: types.PermissionMode, root: []const u8) !*AgentSession {
+    return runtime.createSession(.{
         .provider_kind = .anthropic,
         .api_key = "test-key",
         .model = "test-model",
         .permission_mode = mode,
+        .workspace = .{ .root = root },
+        .allowed_tools = &.{"Read"},
     });
 }
 
@@ -414,11 +566,17 @@ test "secureClear uses optimizer-resistant zeroing" {
 test "AgentSession zeroes the copied API key before normal free" {
     const key = "normal-destroy-key-with-unique-length-37";
     var observer = EraseObservingAllocator{ .backing = std.testing.allocator, .target_len = key.len };
-    const self = try AgentSession.create(observer.allocator(), .{
+    const runtime = try AgentRuntime.create(observer.allocator(), .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try runtime.createSession(.{
         .provider_kind = .anthropic,
         .api_key = key,
         .model = "m",
         .base_url = null,
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
     });
     try self.destroy();
     try std.testing.expect(observer.target_freed);
@@ -427,32 +585,46 @@ test "AgentSession zeroes the copied API key before normal free" {
 
 test "AgentSession zeroes the copied API key when later construction fails" {
     const key = "failed-create-key-with-unique-length-41---";
-    // create(Session)=0, dupe(api_key)=1, dupe(model)=2 -> fail after the
-    // sensitive copy exists and force its errdefer cleanup.
+    // Fail the first allocation after the sensitive copy, independent of how
+    // many Workspace/catalog allocations Session construction adds before it.
     var observer = EraseObservingAllocator{
         .backing = std.testing.allocator,
         .target_len = key.len,
-        .fail_index = 2,
+        .fail_after_target = true,
     };
-    try std.testing.expectError(error.OutOfMemory, AgentSession.create(observer.allocator(), .{
+    const runtime = try AgentRuntime.create(observer.allocator(), .{ .builtin_tools = &.{} });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    try std.testing.expectError(error.OutOfMemory, runtime.createSession(.{
         .provider_kind = .anthropic,
         .api_key = key,
         .model = "m",
         .base_url = null,
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
     }));
     try std.testing.expect(observer.target_freed);
     try std.testing.expect(observer.target_was_zero);
 }
 
 test "AgentSession initializes per-session permission state" {
-    const self = try createTestSession(.plan);
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .plan, cwd);
     defer self.destroy() catch unreachable;
     try std.testing.expectEqual(types.PermissionMode.plan, self.permission_ctx.modeValue());
     try std.testing.expectEqualSlices(u8, self.session_id.asSlice(), self.permission_ctx.session.asSlice());
 }
 
 test "AgentSession enforces one active Run and monotonic nonzero run ids" {
-    const self = try createTestSession(.default);
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
     var probe = SinkProbe{};
 
     try std.testing.expectError(error.StaleRun, self.beginRun(0, probe.sink()));
@@ -473,7 +645,11 @@ test "AgentSession enforces one active Run and monotonic nonzero run ids" {
 }
 
 test "AgentSession abort is run-scoped, idempotent and reports late requests" {
-    const self = try createTestSession(.default);
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
     var probe = SinkProbe{};
 
     try std.testing.expectError(error.StaleRun, self.abort(0, .user_interrupt));
@@ -497,7 +673,11 @@ test "AgentSession abort is run-scoped, idempotent and reports late requests" {
 }
 
 test "AgentSession callback failure aborts delivery and poisons the Session" {
-    const self = try createTestSession(.default);
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
     var probe = SinkProbe{ .accept = false };
     try self.beginRun(7, probe.sink());
 
@@ -518,11 +698,17 @@ test "AgentSession callback failure aborts delivery and poisons the Session" {
 
 test "unexpected pre-run allocation failure poisons the Session" {
     const allocator = std.testing.allocator;
-    const self = try AgentSession.create(allocator, .{
+    const runtime = try createTestRuntime(allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try runtime.createSession(.{
         .provider_kind = .anthropic,
         .api_key = "test-key",
         .model = "test-model",
         .base_url = "http://127.0.0.1:1/v1/messages",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"Read"},
     });
     defer self.destroy() catch unreachable;
 
@@ -544,4 +730,71 @@ test "unexpected pre-run allocation failure poisons the Session" {
         .emit = Sink.emit,
     }));
     try std.testing.expectError(error.InvalidSessionState, self.abort(1, .user_interrupt));
+}
+
+test "AgentRuntime refuses destruction while Sessions are live" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const first = try createTestSession(runtime, .default, cwd);
+    const second = try createTestSession(runtime, .default, cwd);
+    try std.testing.expectError(error.RuntimeBusy, runtime.destroy());
+    try first.destroy();
+    try std.testing.expectError(error.RuntimeBusy, runtime.destroy());
+    try second.destroy();
+    try runtime.destroy();
+}
+
+test "Workspace shell policy is an authority ceiling for Session tools" {
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{ "Read", "Bash" } });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    try std.testing.expectError(error.ShellToolDisabled, runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd, .shell = .disabled },
+        .allowed_tools = &.{ "Read", "Bash" },
+    }));
+
+    const session = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd, .shell = .disabled },
+        .allowed_tools = &.{"Read"},
+    });
+    defer session.destroy() catch unreachable;
+    try std.testing.expect(session.tools.contains("Read"));
+    try std.testing.expect(!session.tools.contains("Bash"));
+}
+
+test "Sessions sharing one Runtime keep independent tool selections" {
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{ "Read", "Grep" } });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const read_session = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "read-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"Read"},
+    });
+    defer read_session.destroy() catch unreachable;
+    const grep_session = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "grep-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"Grep"},
+    });
+    defer grep_session.destroy() catch unreachable;
+
+    try std.testing.expect(read_session.tools.contains("Read"));
+    try std.testing.expect(!read_session.tools.contains("Grep"));
+    try std.testing.expect(grep_session.tools.contains("Grep"));
+    try std.testing.expect(!grep_session.tools.contains("Read"));
+    try std.testing.expect(!std.mem.eql(u8, read_session.session_id.asSlice(), grep_session.session_id.asSlice()));
 }

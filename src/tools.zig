@@ -31,6 +31,7 @@ const code_map_tool = @import("tools/code_map.zig");
 const find_symbol_tool = @import("tools/find_symbol.zig");
 
 pub const ToolContext = @import("tools/context.zig").ToolContext;
+pub const ToolDispatcher = @import("tools/context.zig").ToolDispatcher;
 pub const HostServices = @import("tools/context.zig").HostServices;
 pub const PendingRequest = @import("tools/context.zig").PendingRequest;
 pub const ToolProgressReporter = @import("tools/context.zig").ToolProgressReporter;
@@ -769,6 +770,9 @@ fn jsonValueKind(args: []const u8, key: []const u8) ?JsonKind {
 /// 找不到时先做 P0.6 弱模型工具名修复(归一化 + 模糊匹配),命中则改派到真工具;仍找不到
 /// 返 error.UnknownTool —— 由 agent_loop 转 tool_error 给模型。
 pub fn dispatch(ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror![]u8 {
+    // An embedding Session's immutable directory is an authority boundary, not
+    // a lookup hint. Do not fall through to the process-wide registry on miss.
+    if (ctx.tool_dispatcher) |dispatcher| return dispatcher.dispatch(ctx, name, args);
     if (getTool(name)) |t| {
         try validateRequired(name, args); // schema 层:缺 required 字段 → 早拦
         try validateTypes(name, args); // schema 层:字段类型不匹配 → 早拦
@@ -904,6 +908,11 @@ const ToolNameIter = struct {
         return .{ .ctx = ctx };
     }
     fn next(self: *ToolNameIter) ?[]const u8 {
+        if (self.ctx.tool_dispatcher) |dispatcher| {
+            const name = dispatcher.nameAt(self.static_idx) orelse return null;
+            self.static_idx += 1;
+            return name;
+        }
         if (self.static_idx < registry.len) {
             const nm = registry[self.static_idx].name;
             self.static_idx += 1;

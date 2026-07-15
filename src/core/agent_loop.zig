@@ -252,6 +252,10 @@ pub const Options = struct {
     agent_depth: u8 = 0,
     /// 运行时工具（Skill/MCP）注册表。null = 仅静态工具。
     dyn_registry: ?*const @import("../tools/dynamic.zig").DynRegistry = null,
+    /// Embedding Sessions set this to route execution through the same
+    /// immutable selection that produced `tool_defs`. Null preserves the App's
+    /// existing process registry behavior.
+    tool_dispatcher: ?tools_mod.ToolDispatcher = null,
     /// L5:宿主能力聚合(Skill 激活 / ToolSearch 激活 / Worktree push-pop)。透传到 ToolContext。
     /// 见 ToolContext.HostServices。
     host_services: ?tools_mod.HostServices = null,
@@ -653,6 +657,7 @@ pub fn run(
             .tool_defs = opts.tool_defs,
             .agent_depth = opts.agent_depth,
             .dyn_registry = opts.dyn_registry,
+            .tool_dispatcher = opts.tool_dispatcher,
             .host_services = opts.host_services,
             .explicit_invocation = opts.explicit_invocation,
             .session_id = opts.session_id,
@@ -787,6 +792,7 @@ pub fn run(
                         // (加只读 Bash `git status`/`ls`、BashOutput、WebFetch)。borrow 刚 append 的稳定堆切片。
                         const not_aborted = if (opts.abort) |ab| !ab.isAborted() else true;
                         if (prefetch_enabled and not_aborted and sp.isStreamable(tu.name) and
+                            prefetch_ctx.isPrefetchSafe(tu.name) and
                             tools_mod.isConcurrencySafeInput(tu.name, tu.input_json) and
                             permission_mod.checkPermission(&pc_prefetch, tu.name, tu.input_json) == .allow)
                         {
@@ -1071,6 +1077,7 @@ pub fn run(
             .tool_defs = opts.tool_defs,
             .agent_depth = opts.agent_depth,
             .dyn_registry = opts.dyn_registry,
+            .tool_dispatcher = opts.tool_dispatcher,
             .host_services = opts.host_services,
             .explicit_invocation = opts.explicit_invocation,
             .session_id = opts.session_id,

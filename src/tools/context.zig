@@ -112,6 +112,30 @@ pub const ToolProgressReporter = struct {
     }
 };
 
+/// Session-scoped tool directory used by embedders. The directory owns the
+/// advertised definitions and routes execution back to the exact selected
+/// entry, so a provider cannot escape a Session allowlist through the global
+/// built-in registry. Legacy App paths leave this null and keep using the
+/// process registry below `tools.zig`.
+pub const ToolDispatcher = struct {
+    ctx: *const anyopaque,
+    dispatchFn: *const fn (ctx: *const anyopaque, tool_ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror![]u8,
+    prefetchSafeFn: *const fn (ctx: *const anyopaque, name: []const u8) bool,
+    nameAtFn: *const fn (ctx: *const anyopaque, index: usize) ?[]const u8,
+
+    pub fn dispatch(self: ToolDispatcher, tool_ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror![]u8 {
+        return self.dispatchFn(self.ctx, tool_ctx, name, args);
+    }
+
+    pub fn prefetchSafe(self: ToolDispatcher, name: []const u8) bool {
+        return self.prefetchSafeFn(self.ctx, name);
+    }
+
+    pub fn nameAt(self: ToolDispatcher, index: usize) ?[]const u8 {
+        return self.nameAtFn(self.ctx, index);
+    }
+};
+
 pub const ToolContext = struct {
     allocator: std.mem.Allocator,
     abort: ?*const AbortSignal = null,
@@ -168,6 +192,10 @@ pub const ToolContext = struct {
     agent_depth: u8 = 0,
     /// 运行时工具表（Skill/MCP）。agent_loop 在静态注册表未命中时回退到此。
     dyn_registry: ?*const DynRegistry = null,
+    /// Optional immutable Session directory. When present it is the only
+    /// dispatch authority; tools not selected into it remain unexecutable even
+    /// though they exist in the process-wide built-in registry.
+    tool_dispatcher: ?ToolDispatcher = null,
     /// L5:宿主能力聚合(Skill 激活 / ToolSearch 激活 / Worktree push-pop)——三类"工具改宿主
     /// 状态"的请求-响应回调收成一个接口。null = 无宿主(纯单测)。各能力可空,见 HostServices。
     host_services: ?HostServices = null,
@@ -247,6 +275,10 @@ pub const ToolContext = struct {
     /// id 自动用 self.progress_tool_id(per-toolUse 多卡路由)。
     pub fn reportProgress(self: *const ToolContext, phase: ProgressPhase, text: []const u8, count: u32) void {
         if (self.progress_reporter) |r| r.report(self.progress_tool_id, phase, text, count);
+    }
+
+    pub fn isPrefetchSafe(self: *const ToolContext, name: []const u8) bool {
+        return if (self.tool_dispatcher) |d| d.prefetchSafe(name) else true;
     }
 
     /// 发一个统一 UI 请求(同步阻塞)。有回调 + state → 调它写 out 返回 true;否则返回 false
