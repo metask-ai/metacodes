@@ -24,6 +24,7 @@ fn addPlatform(b: *std.Build, mod: *std.Build.Module) void {
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
+    const target_was_explicit = b.user_input_options.contains("target");
     const optimize = b.standardOptimizeOption(.{});
     const tfilter = b.option([]const u8, "tfilter", "test filter");
 
@@ -159,6 +160,54 @@ pub fn build(b: *std.Build) void {
     agentcore_contract_mod.addImport("agentcore-sdk", agentcore_sdk_mod);
     const agentcore_contract_test = b.addTest(.{ .name = "agentcore-abi-contract", .root_module = agentcore_contract_mod });
     agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_contract_test).step);
+
+    const agentcore_lib = b.addLibrary(.{
+        .name = "metacodes_agentcore",
+        .linkage = .static,
+        .root_module = agentcore_abi_mod,
+    });
+    const install_agentcore_lib = b.addInstallArtifact(agentcore_lib, .{});
+    const install_agentcore_header = b.addInstallFileWithDir(b.path("sdk/metacodes_agentcore.h"), .header, "metacodes_agentcore.h");
+    const install_agentcore_sdk = b.addInstallFileWithDir(b.path("sdk/metacodes_agentcore.zig"), .prefix, "sdk/metacodes_agentcore.zig");
+    const install_agentcore_types = b.addInstallFileWithDir(b.path("sdk/metacodes_agentcore_types.zig"), .prefix, "sdk/metacodes_agentcore_types.zig");
+    const agentcore_install_root = b.getInstallPath(.prefix, "");
+    const resolved_agentcore_target = target.result.zigTriple(b.allocator) catch @panic("OOM");
+    const validate_agentcore_target = b.addSystemCommand(&.{ "sh", "scripts/validate_agentcore_target.sh" });
+    validate_agentcore_target.addArgs(&.{ if (target_was_explicit) "true" else "false", resolved_agentcore_target });
+    validate_agentcore_target.setCwd(b.path("."));
+    install_agentcore_lib.step.dependOn(&validate_agentcore_target.step);
+    install_agentcore_header.step.dependOn(&validate_agentcore_target.step);
+    install_agentcore_sdk.step.dependOn(&validate_agentcore_target.step);
+    install_agentcore_types.step.dependOn(&validate_agentcore_target.step);
+    const manifest_cmd = b.addSystemCommand(&.{ "sh", "scripts/write_agentcore_manifest.sh" });
+    manifest_cmd.addArgs(&.{
+        agentcore_install_root,
+        resolved_agentcore_target,
+        @tagName(optimize),
+        b.graph.zig_exe,
+        if (target_was_explicit) "true" else "false",
+    });
+    manifest_cmd.setCwd(b.path("."));
+    manifest_cmd.step.dependOn(&install_agentcore_lib.step);
+    manifest_cmd.step.dependOn(&install_agentcore_header.step);
+    manifest_cmd.step.dependOn(&install_agentcore_sdk.step);
+    manifest_cmd.step.dependOn(&install_agentcore_types.step);
+    const agentcore_bundle_step = b.step("agentcore:bundle", "Build the macOS arm64 AgentCore static bundle");
+    agentcore_bundle_step.dependOn(&manifest_cmd.step);
+
+    const consumer_cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
+    consumer_cmd.addArgs(&.{
+        "--build-file",
+        "tests/agentcore_artifact_consumer/build.zig",
+        "test",
+        b.fmt("-Doptimize={s}", .{@tagName(optimize)}),
+        b.fmt("-Dtarget={s}", .{resolved_agentcore_target}),
+        b.fmt("-Dbundle-root={s}", .{agentcore_install_root}),
+    });
+    consumer_cmd.setCwd(b.path("."));
+    consumer_cmd.step.dependOn(&manifest_cmd.step);
+    const agentcore_consumer_step = b.step("agentcore:consumer", "Run the source-free AgentCore bundle consumer");
+    agentcore_consumer_step.dependOn(&consumer_cmd.step);
 
     // test:lib —— 编译库全图(refAllDeclsRecursive),绿即证库与 UI 物理隔离。
     const core_test_mod = b.createModule(.{
