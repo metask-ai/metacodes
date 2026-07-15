@@ -13,6 +13,7 @@ const permission = @import("../permission.zig");
 const abort_mod = @import("../util/abort.zig");
 const AbortSignal = abort_mod.AbortSignal;
 const ui_backend = @import("protocol/ui_backend.zig");
+const ui_request = @import("protocol/ui_request.zig");
 const CoreEvent = ui_backend.CoreEvent;
 const UiEvent = ui_backend.UiEvent;
 const SessionId = ui_backend.SessionId;
@@ -34,6 +35,7 @@ pub const RuntimeConfig = struct {
 pub const HostSyncTool = tool_catalog.HostSyncTool;
 pub const HostToolResult = tool_catalog.HostToolResult;
 pub const HostToolError = tool_catalog.HostToolError;
+pub const UiRequester = ui_request.UiRequester;
 
 pub const RuntimeError = error{
     RuntimeBusy,
@@ -108,6 +110,9 @@ pub const SessionConfig = struct {
     /// Explicit authority ceiling. It can only select names present in the
     /// Runtime catalog; an empty list creates a text-only Session deliberately.
     allowed_tools: []const []const u8,
+    /// Optional synchronous Host UI bridge. The Host-owned callback context
+    /// must outlive this Session.
+    ui_requester: ?UiRequester = null,
 };
 
 pub const Config = SessionConfig;
@@ -234,6 +239,7 @@ pub const AgentSession = struct {
             .abort_signal = AbortSignal.init(),
         };
         self.permission_ctx.session_rules = &self.session_rules;
+        self.permission_ctx.ui_requester = config.ui_requester;
         // A UI-neutral library must never fall back to process stdin. Until a
         // Host requester is attached, `.ask` decisions fail closed.
         self.permission_ctx.no_interactive_prompt = true;
@@ -309,6 +315,7 @@ pub const AgentSession = struct {
                 .jobs = if (self.jobs) |*registry| registry else null,
                 .tool_defs = self.tools.definitions,
                 .tool_dispatcher = self.tools.dispatcher(),
+                .ui_requester = self.permission_ctx.ui_requester,
                 .project_dir = self.workspace.root,
                 .cwd_abs = self.workspace.root,
                 .home_dir = self.workspace.home,
