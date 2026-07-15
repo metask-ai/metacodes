@@ -28,6 +28,26 @@ const EventJournal = journal_mod.EventJournal;
 const WebBackend = backend_mod.WebBackend;
 const WebServer = server_mod.WebServer;
 const MsgQueue = msg_queue_mod.MsgQueue;
+const ui_event = @import("../core/protocol/ui_event.zig");
+
+/// **U4 A4:web 配置变更 sink**。config 变更(model/mode/dirs/reasoning 任一 UI/工具触发)→
+/// journal.append 一条 `{"config_changed":{...}}` → 浏览器 SSE 收到更新状态。与 command_result
+/// 分开(config_changed 是状态广播,任何来源都发;command_result 只是命令 ack)。
+/// **借用契约**:emit 在 driver 线程同步序列化 ev(含 borrow .model/.dirs)→ journal.append **dup**
+/// 进 journal 串,SSE 线程后读的是 dup,borrow 释放安全(dup 发生在 emit 调用内,早于下一次 mutation)。
+const WebConfigSink = struct {
+    journal: *EventJournal,
+    alloc: std.mem.Allocator,
+    fn emitThunk(ctx: *anyopaque, ev: ui_event.ConfigChange) void {
+        const self: *WebConfigSink = @ptrCast(@alignCast(ctx));
+        const line = std.json.Stringify.valueAlloc(self.alloc, .{ .config_changed = ev }, .{}) catch return;
+        defer self.alloc.free(line);
+        self.journal.append(line); // journal dup → borrow 同步序列化后即可释放
+    }
+    fn sink(self: *WebConfigSink) ui_event.ConfigEventSink {
+        return .{ .ctx = @ptrCast(self), .emitFn = &emitThunk };
+    }
+};
 
 /// /state 快照的数据源:driver 拥有,server 经回调读。
 const StateSource = struct {
@@ -141,6 +161,12 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, port: u16) !u8 {
     app.permission_ctx.ui_requester = wb.requester();
     defer app.permission_ctx.ui_requester = null;
 
+    // U4 A4:装配 config 变更 sink(model/mode/dirs/reasoning 变更 → journal → SSE)。
+    // setConfigEventSink 同步设 App sink + permission_ctx.event_sink(mode)。
+    var config_sink = WebConfigSink{ .journal = &journal, .alloc = web_alloc };
+    app.setConfigEventSink(config_sink.sink());
+    defer app.setConfigEventSink(null);
+
     const be = wb.backend();
     var exit_code: u8 = 0;
 
@@ -249,4 +275,33 @@ fn announceRunDone(journal: *EventJournal, allocator: std.mem.Allocator, stop_re
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "U4 A5: web config sink 跨线程留存 dup(emit 后覆写源串,journal 仍旧值不悬挂)" {
+    const a = std.testing.allocator;
+    var journal = EventJournal.init(a);
+    defer journal.deinit();
+    var config_sink = WebConfigSink{ .journal = &journal, .alloc = a };
+    const sink = config_sink.sink();
+
+    // 可变缓冲当 model 源串(模拟 app.activeModel() 借用会被 switchModel free/覆写)。
+    var model_buf: [16]u8 = undefined;
+    @memcpy(model_buf[0..7], "model-A");
+    sink.emit(.{ .model = model_buf[0..7] });
+
+    // emit 后覆写源串(模拟 switchModel free 旧 model_switch_owned + 指向新串)。
+    @memcpy(model_buf[0..7], "ZZZZZZZ");
+
+    // journal 里那条应是 dup 的 "model-A",不是被覆写的 "ZZZZZZZ"(证 dup/序列化在 emit 内)。
+    const maybe = try journal.waitSince(a, 0, 0);
+    try std.testing.expect(maybe != null);
+    const lines = maybe.?;
+    defer {
+        for (lines) |l| a.free(l);
+        a.free(lines);
+    }
+    try std.testing.expect(lines.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, lines[0], "model-A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, lines[0], "ZZZZZZZ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, lines[0], "config_changed") != null);
 }
