@@ -233,6 +233,7 @@ pub fn build(b: *std.Build) void {
         "tests/component/web_search_test.zig",
         "tests/component/allowed_tools_test.zig",
         "tests/component/agent_session_tools_test.zig",
+        "tests/component/agent_session_host_tools_test.zig",
         "tests/component/skill_fork_test.zig",
         "tests/component/prompt_tool_coupling_test.zig",
         "tests/component/http_error_test.zig",
@@ -326,6 +327,7 @@ pub fn build(b: *std.Build) void {
     const new_files = [_][]const u8{
         "tests/component/user_context_inject_test.zig",
         "tests/component/agent_session_tools_test.zig",
+        "tests/component/agent_session_host_tools_test.zig",
         "tests/component/http_error_test.zig",
         "tests/component/answer_queue_test.zig",
         "tests/component/base_url_flag_test.zig",

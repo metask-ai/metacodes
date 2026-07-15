@@ -1,9 +1,9 @@
-//! Immutable built-in tool catalog and per-Session selection.
+//! Immutable Runtime tool catalog and per-Session selection.
 //!
 //! The Runtime owns `Catalog`; each Session owns a `Selection` derived from it.
 //! Definitions, admission and dispatch therefore resolve through the same
-//! selected `Entry`. Host executors will extend the tagged executor union later
-//! without creating a parallel registry.
+//! selected `Entry`. Built-in and Host executors deliberately share this one
+//! directory so advertisement, admission and execution cannot drift apart.
 
 const std = @import("std");
 const json = @import("../json.zig");
@@ -13,10 +13,52 @@ pub const CatalogError = error{
     UnknownBuiltinTool,
     DuplicateToolName,
     ToolNotInRuntime,
+    InvalidHostTool,
+};
+
+pub const HostToolResult = struct {
+    bytes: []const u8,
+    release_ctx: *anyopaque,
+    releaseFn: *const fn (ctx: *anyopaque, bytes: []const u8) void,
+
+    pub fn release(self: HostToolResult) void {
+        self.releaseFn(self.release_ctx, self.bytes);
+    }
+};
+
+pub const HostToolError = error{
+    HostToolFailed,
+    HostToolRejected,
+    OutOfMemory,
+};
+
+pub const HostSyncExecuteFn = *const fn (
+    ctx: *anyopaque,
+    session_id: []const u8,
+    args: []const u8,
+) HostToolError!HostToolResult;
+
+/// Runtime copies `definition` recursively. `ctx` remains Host-owned and must
+/// outlive the Runtime. The thin library contract accepts completed results
+/// only. Callbacks may run concurrently for different Sessions; the Host owns
+/// `ctx` locking.
+/// `args` is the provider-produced JSON envelope; the Host owns its validation.
+/// Session lifecycle locks are not held, but abort is the only supported
+/// reentrant AgentSession operation.
+pub const HostSyncTool = struct {
+    definition: json.ToolDefinition,
+    ctx: *anyopaque,
+    execute: HostSyncExecuteFn,
+};
+
+pub const HostSyncExecutor = struct {
+    ctx: *anyopaque,
+    execute: HostSyncExecuteFn,
 };
 
 pub const Executor = union(enum) {
     builtin: *const tools.ToolEntry,
+    host_sync: HostSyncExecutor,
 };
 
 pub const Entry = struct {
@@ -27,18 +69,25 @@ pub const Entry = struct {
 
 pub const Catalog = struct {
     allocator: std.mem.Allocator,
+    arena: *std.heap.ArenaAllocator,
     entries: []Entry,
 
     pub fn initBuiltins(allocator: std.mem.Allocator, names: []const []const u8) !Catalog {
-        var entries = try std.ArrayList(Entry).initCapacity(allocator, names.len);
-        errdefer entries.deinit(allocator);
+        return init(allocator, names, &.{});
+    }
 
-        for (names) |name| {
-            for (entries.items) |existing| {
-                if (std.mem.eql(u8, existing.definition.name, name)) return error.DuplicateToolName;
-            }
+    pub fn init(allocator: std.mem.Allocator, builtin_names: []const []const u8, host_tools: []const HostSyncTool) !Catalog {
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = .init(allocator);
+        errdefer arena.deinit();
+        const owned = arena.allocator();
+        var entries = try std.ArrayList(Entry).initCapacity(owned, builtin_names.len + host_tools.len);
+
+        for (builtin_names) |name| {
+            if (findEntry(entries.items, name) != null) return error.DuplicateToolName;
             const builtin = tools.getTool(name) orelse return error.UnknownBuiltinTool;
-            try entries.append(allocator, .{
+            try entries.append(owned, .{
                 .definition = .{
                     .name = builtin.name,
                     .description = builtin.description,
@@ -57,21 +106,106 @@ pub const Catalog = struct {
                 .prefetch_safe = true,
             });
         }
-        return .{ .allocator = allocator, .entries = try entries.toOwnedSlice(allocator) };
+
+        for (host_tools) |host| {
+            if (host.definition.name.len == 0 or
+                !std.mem.eql(u8, host.definition.input_schema.type, "object") or
+                host.definition.server_type != null or
+                host.definition.deferred) return error.InvalidHostTool;
+            if (findEntry(entries.items, host.definition.name) != null) return error.DuplicateToolName;
+            try entries.append(owned, .{
+                .definition = try cloneDefinition(owned, host.definition),
+                .executor = .{ .host_sync = .{ .ctx = host.ctx, .execute = host.execute } },
+                .prefetch_safe = false,
+            });
+        }
+        return .{ .allocator = allocator, .arena = arena, .entries = try entries.toOwnedSlice(owned) };
     }
 
     pub fn deinit(self: *Catalog) void {
-        self.allocator.free(self.entries);
+        self.arena.deinit();
+        self.allocator.destroy(self.arena);
         self.* = undefined;
     }
 
     pub fn find(self: *const Catalog, name: []const u8) ?*const Entry {
-        for (self.entries) |*entry| {
-            if (std.mem.eql(u8, entry.definition.name, name)) return entry;
-        }
-        return null;
+        return findEntry(self.entries, name);
     }
 };
+
+fn findEntry(entries: []const Entry, name: []const u8) ?*const Entry {
+    for (entries) |*entry| if (std.mem.eql(u8, entry.definition.name, name)) return entry;
+    return null;
+}
+
+fn cloneDefinition(allocator: std.mem.Allocator, source: json.ToolDefinition) std.mem.Allocator.Error!json.ToolDefinition {
+    return .{
+        .name = try allocator.dupe(u8, source.name),
+        .description = try allocator.dupe(u8, source.description),
+        .input_schema = try cloneInputSchema(allocator, source.input_schema),
+        .server_type = null,
+        .deferred = false,
+    };
+}
+
+fn cloneInputSchema(allocator: std.mem.Allocator, source: json.InputSchema) std.mem.Allocator.Error!json.InputSchema {
+    return .{
+        .type = try allocator.dupe(u8, source.type),
+        .properties = if (source.properties) |properties| try cloneObject(allocator, properties) else null,
+        .prop_specs = if (source.prop_specs) |specs| try clonePropSpecs(allocator, specs) else null,
+        .required = if (source.required) |required| try cloneStrings(allocator, required) else null,
+    };
+}
+
+fn cloneStrings(allocator: std.mem.Allocator, source: []const []const u8) std.mem.Allocator.Error![]const []const u8 {
+    const out = try allocator.alloc([]const u8, source.len);
+    for (source, 0..) |value, i| out[i] = try allocator.dupe(u8, value);
+    return out;
+}
+
+fn clonePropSpecs(allocator: std.mem.Allocator, source: []const json.PropSpec) std.mem.Allocator.Error![]const json.PropSpec {
+    const out = try allocator.alloc(json.PropSpec, source.len);
+    for (source, 0..) |spec, i| {
+        out[i] = .{
+            .name = try allocator.dupe(u8, spec.name),
+            .type = try allocator.dupe(u8, spec.type),
+            .description = try allocator.dupe(u8, spec.description),
+            .items_type = if (spec.items_type) |value| try allocator.dupe(u8, value) else null,
+            .enum_values = if (spec.enum_values) |values| try cloneStrings(allocator, values) else null,
+            .items_props = if (spec.items_props) |values| try clonePropSpecs(allocator, values) else null,
+            .items_required = if (spec.items_required) |values| try cloneStrings(allocator, values) else null,
+            .object_props = if (spec.object_props) |values| try clonePropSpecs(allocator, values) else null,
+            .object_required = if (spec.object_required) |values| try cloneStrings(allocator, values) else null,
+        };
+    }
+    return out;
+}
+
+fn cloneObject(allocator: std.mem.Allocator, source: std.json.ObjectMap) std.mem.Allocator.Error!std.json.ObjectMap {
+    var out: std.json.ObjectMap = .empty;
+    var it = source.iterator();
+    while (it.next()) |item| {
+        try out.put(allocator, try allocator.dupe(u8, item.key_ptr.*), try cloneValue(allocator, item.value_ptr.*));
+    }
+    return out;
+}
+
+fn cloneValue(allocator: std.mem.Allocator, source: std.json.Value) std.mem.Allocator.Error!std.json.Value {
+    return switch (source) {
+        .null => .null,
+        .bool => |value| .{ .bool = value },
+        .integer => |value| .{ .integer = value },
+        .float => |value| .{ .float = value },
+        .number_string => |value| .{ .number_string = try allocator.dupe(u8, value) },
+        .string => |value| .{ .string = try allocator.dupe(u8, value) },
+        .array => |array| blk: {
+            var out = std.json.Array.init(allocator);
+            for (array.items) |value| try out.append(try cloneValue(allocator, value));
+            break :blk .{ .array = out };
+        },
+        .object => |object| .{ .object = try cloneObject(allocator, object) },
+    };
+}
 
 pub const Selection = struct {
     allocator: std.mem.Allocator,
@@ -133,6 +267,11 @@ pub const Selection = struct {
                 try tools.validateTypes(builtin.name, args);
                 break :blk try builtin.execute(tool_ctx, args);
             },
+            .host_sync => |host| blk: {
+                const result = try host.execute(host.ctx, tool_ctx.session_id, args);
+                defer result.release();
+                break :blk try tool_ctx.allocator.dupe(u8, result.bytes);
+            },
         };
     }
 
@@ -165,4 +304,97 @@ test "Selection rejects names outside Runtime and dispatches only selected entri
     defer std.testing.allocator.free(names);
     try std.testing.expectEqualStrings("Read", names);
     try std.testing.expect(tools.suggestToolName(&ctx, "Grepp") == null);
+}
+
+const HostProbe = struct {
+    calls: usize = 0,
+    releases: usize = 0,
+    last_session: []const u8 = "",
+
+    fn execute(raw: *anyopaque, session_id: []const u8, args: []const u8) HostToolError!HostToolResult {
+        const self: *HostProbe = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        self.last_session = session_id;
+        return .{ .bytes = args, .release_ctx = raw, .releaseFn = release };
+    }
+
+    fn release(raw: *anyopaque, _: []const u8) void {
+        const self: *HostProbe = @ptrCast(@alignCast(raw));
+        self.releases += 1;
+    }
+};
+
+fn hostTool(name: []const u8, probe: *HostProbe) HostSyncTool {
+    return .{
+        .definition = .{
+            .name = name,
+            .description = "Host echo",
+            .input_schema = .{
+                .type = "object",
+                .prop_specs = &.{.{ .name = "text", .type = "string" }},
+                .required = &.{"text"},
+            },
+        },
+        .ctx = probe,
+        .execute = HostProbe.execute,
+    };
+}
+
+test "Host sync entry is Runtime-owned, selected once and released once" {
+    var probe = HostProbe{};
+    var name = [_]u8{ 'H', 'o', 's', 't', 'E', 'c', 'h', 'o' };
+    var catalog = try Catalog.init(std.testing.allocator, &.{"Read"}, &.{hostTool(&name, &probe)});
+    defer catalog.deinit();
+    name[0] = 'X';
+
+    var selection = try Selection.init(std.testing.allocator, &catalog, &.{"HostEcho"});
+    defer selection.deinit();
+    const dispatcher = selection.dispatcher();
+    try std.testing.expect(!dispatcher.prefetchSafe("HostEcho"));
+    var ctx = tools.ToolContext{
+        .allocator = std.testing.allocator,
+        .session_id = "session-a",
+        .tool_dispatcher = dispatcher,
+    };
+    const result = try tools.dispatch(&ctx, "HostEcho", "{\"text\":\"ok\"}");
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("{\"text\":\"ok\"}", result);
+    try std.testing.expectEqualStrings("session-a", probe.last_session);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(@as(usize, 1), probe.releases);
+}
+
+test "Host sync names cannot duplicate built-ins or each other" {
+    var first = HostProbe{};
+    var second = HostProbe{};
+    try std.testing.expectError(error.DuplicateToolName, Catalog.init(std.testing.allocator, &.{"Read"}, &.{hostTool("Read", &first)}));
+    try std.testing.expectError(error.DuplicateToolName, Catalog.init(std.testing.allocator, &.{}, &.{ hostTool("HostEcho", &first), hostTool("HostEcho", &second) }));
+}
+
+test "Host sync registration rejects non-object tool schemas" {
+    var probe = HostProbe{};
+    var invalid = hostTool("HostArray", &probe);
+    invalid.definition.input_schema.type = "array";
+    try std.testing.expectError(error.InvalidHostTool, Catalog.init(std.testing.allocator, &.{}, &.{invalid}));
+}
+
+test "Host sync selections sharing one Runtime keep executors isolated" {
+    var first = HostProbe{};
+    var second = HostProbe{};
+    var catalog = try Catalog.init(std.testing.allocator, &.{}, &.{ hostTool("HostA", &first), hostTool("HostB", &second) });
+    defer catalog.deinit();
+    var selection_a = try Selection.init(std.testing.allocator, &catalog, &.{"HostA"});
+    defer selection_a.deinit();
+    var selection_b = try Selection.init(std.testing.allocator, &catalog, &.{"HostB"});
+    defer selection_b.deinit();
+
+    var ctx_a = tools.ToolContext{ .allocator = std.testing.allocator, .tool_dispatcher = selection_a.dispatcher() };
+    var ctx_b = tools.ToolContext{ .allocator = std.testing.allocator, .tool_dispatcher = selection_b.dispatcher() };
+    const result_a = try tools.dispatch(&ctx_a, "HostA", "{\"text\":\"a\"}");
+    defer std.testing.allocator.free(result_a);
+    const result_b = try tools.dispatch(&ctx_b, "HostB", "{\"text\":\"b\"}");
+    defer std.testing.allocator.free(result_b);
+    try std.testing.expectError(error.UnknownTool, tools.dispatch(&ctx_a, "HostB", "{\"text\":\"x\"}"));
+    try std.testing.expectEqual(@as(usize, 1), first.calls);
+    try std.testing.expectEqual(@as(usize, 1), second.calls);
 }

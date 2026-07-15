@@ -28,7 +28,12 @@ pub const DEFAULT_BUILTIN_TOOLS = [_][]const u8{ "Read", "Write", "Edit", "Glob"
 
 pub const RuntimeConfig = struct {
     builtin_tools: []const []const u8 = &DEFAULT_BUILTIN_TOOLS,
+    host_sync_tools: []const tool_catalog.HostSyncTool = &.{},
 };
+
+pub const HostSyncTool = tool_catalog.HostSyncTool;
+pub const HostToolResult = tool_catalog.HostToolResult;
+pub const HostToolError = tool_catalog.HostToolError;
 
 pub const RuntimeError = error{
     RuntimeBusy,
@@ -47,7 +52,7 @@ pub const AgentRuntime = struct {
     pub fn create(allocator: std.mem.Allocator, config: RuntimeConfig) !*AgentRuntime {
         const self = try allocator.create(AgentRuntime);
         errdefer allocator.destroy(self);
-        const catalog = try tool_catalog.Catalog.initBuiltins(allocator, config.builtin_tools);
+        const catalog = try tool_catalog.Catalog.init(allocator, config.builtin_tools, config.host_sync_tools);
         self.* = .{ .allocator = allocator, .catalog = catalog };
         return self;
     }
@@ -298,6 +303,7 @@ pub const AgentSession = struct {
             .{
                 .max_turns = max_turns,
                 .session = self.session_id,
+                .session_id = self.session_id.asSlice(),
                 .abort = &self.abort_signal,
                 .read_state = &self.read_state,
                 .jobs = if (self.jobs) |*registry| registry else null,
