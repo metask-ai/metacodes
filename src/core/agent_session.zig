@@ -316,6 +316,7 @@ pub const AgentSession = struct {
                 .tool_defs = self.tools.definitions,
                 .tool_dispatcher = self.tools.dispatcher(),
                 .ui_requester = self.permission_ctx.ui_requester,
+                .emit_tool_cards = true,
                 .project_dir = self.workspace.root,
                 .cwd_abs = self.workspace.root,
                 .home_dir = self.workspace.home,

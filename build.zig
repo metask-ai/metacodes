@@ -112,6 +112,54 @@ pub fn build(b: *std.Build) void {
     });
     addHl(b, core_mod);
 
+    const agentcore_types_mod = b.createModule(.{
+        .root_source_file = b.path("sdk/metacodes_agentcore_types.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const agentcore_sdk_mod = b.createModule(.{
+        .root_source_file = b.path("sdk/metacodes_agentcore.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    agentcore_sdk_mod.addImport("metacodes_agentcore_types", agentcore_types_mod);
+    const agentcore_abi_mod = b.createModule(.{
+        .root_source_file = b.path("src/agentcore/abi_v1.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addHl(b, agentcore_abi_mod);
+    agentcore_abi_mod.addImport("metacodes-core", core_mod);
+    agentcore_abi_mod.addImport("metacodes_agentcore_types", agentcore_types_mod);
+
+    const agentcore_test_step = b.step("agentcore:test", "Run AgentCore binary ABI v1 tests");
+    const agentcore_abi_test = b.addTest(.{ .name = "agentcore-abi-unit", .root_module = agentcore_abi_mod });
+    agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_abi_test).step);
+    const agentcore_types_test = b.addTest(.{ .name = "agentcore-types-unit", .root_module = agentcore_types_mod });
+    agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_types_test).step);
+    const agentcore_sdk_test = b.addTest(.{ .name = "agentcore-sdk-unit", .root_module = agentcore_sdk_mod });
+    agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_sdk_test).step);
+    const agentcore_header_test = b.addSystemCommand(&.{ "cc", "-std=c11", "-fsyntax-only", "-Isdk", "tests/agentcore_header_compile.c" });
+    agentcore_header_test.setCwd(b.path("."));
+    agentcore_test_step.dependOn(&agentcore_header_test.step);
+    const agentcore_contract_mod = b.createModule(.{
+        .root_source_file = b.path("tests/component/agentcore_abi_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    agentcore_contract_mod.addImport("harness", b.createModule(.{
+        .root_source_file = b.path("tests/_harness/mock_sse_server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }));
+    agentcore_contract_mod.addImport("agentcore-abi", agentcore_abi_mod);
+    agentcore_contract_mod.addImport("agentcore-sdk", agentcore_sdk_mod);
+    const agentcore_contract_test = b.addTest(.{ .name = "agentcore-abi-contract", .root_module = agentcore_contract_mod });
+    agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_contract_test).step);
+
     // test:lib —— 编译库全图(refAllDeclsRecursive),绿即证库与 UI 物理隔离。
     const core_test_mod = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
