@@ -186,10 +186,17 @@ test "L2 SW2 F1/F2: teammate SendMessage 回 lead 送达 lead 邮箱" {
 
     const perm = cc.permission.createContext(.bypass_permissions, a);
     // teammate 需要 SendMessage 在工具集里(--agent-teams 门,组件测试直接给全量含 swarm)。
-    const tool_defs = try cc.tools.toToolDefinitionsFull(a, null, &cc.tool_prompt_ctx.PromptContext{ .agent_teams = true });
-    defer a.free(tool_defs);
+    // **ctx.allocator 用 scoped arena(对齐生产 App arena)**:tool 执行内部(toToolDefinitionsFull 的
+    // describe_fn 动态描述串、agent_tool 的 redescribeForContext)按 arena 生命周期分配、**无 per-desc
+    // free 助手**——生产靠 App arena 批量释放。测试若用 testing.allocator 会漏 ~15 描述串 + redescribe
+    // 分配。teammate 线程走 owned_prov=c_allocator(agent.zig:291),不碰 ctx.allocator → arena 仅主线程
+    // 用,无跨线程竞争。结果串(r1/spawn_out/…)亦 arena 所有,不再逐个 free。
+    var ctx_arena = std.heap.ArenaAllocator.init(a);
+    defer ctx_arena.deinit();
+    const ca = ctx_arena.allocator();
+    const tool_defs = try cc.tools.toToolDefinitionsFull(ca, null, &cc.tool_prompt_ctx.PromptContext{ .agent_teams = true });
     const ctx = cc.tool_context.ToolContext{
-        .allocator = a,
+        .allocator = ca,
         .api_client = &client,
         .tool_defs = tool_defs,
         .permission_ctx = @constCast(&perm),
@@ -197,10 +204,8 @@ test "L2 SW2 F1/F2: teammate SendMessage 回 lead 送达 lead 邮箱" {
         .swarm = &sw,
         .parent_model = "claude-sonnet-4-20250514",
     };
-    const r1 = try cc.swarm_tools.executeTeamCreate(&ctx, "{\"name\":\"proj\"}");
-    a.free(r1);
-    const spawn_out = try cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"general-purpose\",\"prompt\":\"solve it\",\"name\":\"solver\"}");
-    a.free(spawn_out);
+    _ = try cc.swarm_tools.executeTeamCreate(&ctx, "{\"name\":\"proj\"}");
+    _ = try cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"general-purpose\",\"prompt\":\"solve it\",\"name\":\"solver\"}");
 
     // teammate 的 SendMessage → lead 邮箱含 "my final answer is 42"。
     var inbox_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -220,10 +225,10 @@ test "L2 SW2 F1/F2: teammate SendMessage 回 lead 送达 lead 邮箱" {
     try std.testing.expect(got);
     // F3 回归:teammate 的请求体带 SWARM_ADDENDUM(有 team 时 system prompt 追加)。
     if (srv.lastRequest()) |req| {
-        try std.testing.expect(std.mem.indexOf(u8, req.body, "Team collaboration (active team)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, req.body(), "Team collaboration (active team)") != null);
     }
     // 收尾:shutdown 让 teammate 退出,便于 sw.deinit join。
-    _ = a.free(try cc.swarm_tools.executeSendMessage(&ctx, "{\"to\":\"solver\",\"message\":\"{\\\"type\\\":\\\"shutdown_request\\\",\\\"request_id\\\":\\\"r1\\\"}\",\"summary\":\"stop\"}"));
+    _ = try cc.swarm_tools.executeSendMessage(&ctx, "{\"to\":\"solver\",\"message\":\"{\\\"type\\\":\\\"shutdown_request\\\",\\\"request_id\\\":\\\"r1\\\"}\",\"summary\":\"stop\"}");
     waited = 0;
     while (waited < 5000) : (waited += 30) {
         if (sw.teammates.?.liveCount() == 0) break;

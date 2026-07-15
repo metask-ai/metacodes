@@ -16,7 +16,7 @@ var g_mock_name: [64]u8 = undefined;
 var g_mock_name_len: usize = 0;
 var g_mock_cwd: [256]u8 = undefined;
 var g_mock_cwd_len: usize = 0;
-fn mockSpawn(a: std.mem.Allocator, p: tp.SpawnProcessParams) anyerror!std.c.pid_t {
+fn mockSpawn(a: std.mem.Allocator, p: tp.SpawnProcessParams) anyerror!i64 {
     _ = a;
     g_mock_name_len = @min(p.name.len, g_mock_name.len);
     @memcpy(g_mock_name[0..g_mock_name_len], p.name[0..g_mock_name_len]);
@@ -43,7 +43,7 @@ test "L2 SW6 D: 无 worktree base 时 lead-spawn 接线(登记 member=process + 
 
     g_mock_name_len = 0;
     const pid = try tp.spawnTeammateProcess(&sw, "worker", "", "", "", null, &mockSpawn);
-    try std.testing.expectEqual(@as(std.c.pid_t, 99999), pid);
+    try std.testing.expectEqual(@as(i64, 99999), pid);
     // mock 收到 name。
     try std.testing.expectEqualStrings("worker", g_mock_name[0..g_mock_name_len]);
     // config 里登记了 process backend 成员。
@@ -54,7 +54,7 @@ test "L2 SW6 D: 无 worktree base 时 lead-spawn 接线(登记 member=process + 
     try std.testing.expectEqualStrings("process", m.backend_type);
     // 追踪表有记录(deinit 会清)。
     try std.testing.expectEqual(@as(usize, 1), sw.process_teammates.items.len);
-    try std.testing.expectEqual(@as(std.c.pid_t, 99999), sw.process_teammates.items[0].pid);
+    try std.testing.expectEqual(@as(i64, 99999), sw.process_teammates.items[0].pid);
 }
 
 test "L2 SW6 D2: 保留名 team-lead 不能 spawn 进程外" {

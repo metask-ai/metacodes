@@ -1092,8 +1092,14 @@ test "getTool by name" {
 test "toToolDefinitions creates all registry tools (WebSearch is a normal function tool)" {
     const defs = try toToolDefinitions(std.testing.allocator);
     defer std.testing.allocator.free(defs);
-    // 不再追加 server-tool 形态的 web_search(异形毒化后端,已删)。defs == registry。
-    try std.testing.expect(defs.len == registry.len);
+    // 不再追加 server-tool 形态的 web_search(异形毒化后端,已删)。defs == registry 中**非 swarm-gated**
+    // 部分:toToolDefinitions 走 prompt_ctx=null → teams_on=false → TeamCreate/TeamDelete/SendMessage
+    // 被门控排除(F5)。动态计非门控数,勿硬编码(加 swarm 工具不破测)。
+    var non_gated: usize = 0;
+    for (registry) |t| {
+        if (!t.swarm_gated) non_gated += 1;
+    }
+    try std.testing.expect(defs.len == non_gated);
     // WebSearch 作为普通函数工具在 registry 里,带 input_schema、无 server_type。
     // 内置工具全常驻(对齐 cc:只 defer MCP),故 WebSearch 不 deferred。
     const ws = getTool("WebSearch").?;
@@ -1124,7 +1130,12 @@ test "toToolDefinitionsWithDyn appends dynamic tools after static (no server-too
     const defs = try toToolDefinitionsWithDyn(std.testing.allocator, &dyn);
     defer std.testing.allocator.free(defs);
 
-    try std.testing.expect(defs.len == registry.len + 1); // static + 1 dyn(无 web_search)
+    // 非 swarm-gated 静态 + 1 dyn(无 web_search);prompt_ctx=null 门控排除 swarm 工具(F5)。
+    var non_gated: usize = 0;
+    for (registry) |t| {
+        if (!t.swarm_gated) non_gated += 1;
+    }
+    try std.testing.expect(defs.len == non_gated + 1);
     // 动态工具在末尾。
     try std.testing.expectEqualStrings("MySkill", defs[defs.len - 1].name);
 }
