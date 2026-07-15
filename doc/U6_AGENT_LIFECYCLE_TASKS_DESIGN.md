@@ -122,6 +122,16 @@ attach 之前的 spawned/tasks_changed 已反映在快照,之后的走流)。emi
 - ⬜ **A3 富载 task 变体**:当前只发 invalidated(轻信号);task{id,state,claimed_by} 富载未发(设计说可选)。
 - ⬜ **A5 web e2e**:agent_background 组件测已覆盖全链;web SSE JS handler + 真 --web e2e 未做(低优先)。
 - **存量债**:task#18(后台 done/status 跨线程)、task#19(task frontier 进快照,需 U5-式发布缓存)。
+- ✅ **F1 修**(review MINOR):前台子 agent **失败**也发 done{failed}(errdefer + done_emitted 抑制双发)——
+  否则 spawned 无对应 done,SSE 客户端永久卡 running。红灯测试:400 响应逼子 agent 失败,断言 spawned 后
+  必有恰一个 done。
+- **已知 gap(review F3,登记非修)**:event_reporter 只在 depth==0 注入 → **swarm teammate/subagent(depth>0)
+  完成共享 kg_inbox 任务(解锁下游)不发 tasks_changed 到 lead 的 SSE 流**,lead UI 要等下次 /state 重拉才见。
+  与"lead 广播"设计一致,但 SSE-驱动看板对 teammate 任务闭合是延迟的。若要实时,需 depth>0 也注入 reporter
+  (但 teammate 的父 backend 路由 + 线程安全需另设计,同 task#18 的 cross-thread 顾虑)。
+- **NIT(review F4/F5,未修)**:F4=no-op TaskUpdate/吞掉的 release 失败也发 invalidated(幂等无害,"每个成功
+  mutation 出口"措辞略宽);F5=snapshotJobs dup 5 串但 A4 只用 id/agent_type(每次 /state 多 dup desc/tool,
+  无泄漏,微 churn)。
 
 ## 5. 待核实(实施前)
 

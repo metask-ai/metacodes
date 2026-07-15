@@ -408,3 +408,71 @@ test "U6 A2: 前台 Task → agent_lifecycle spawned(foreground)+done 经 event_
     try std.testing.expectEqualStrings("sd", rec.seq.items); // 恰好 spawned 后 done
     try std.testing.expect(rec.fg_spawned); // 前台路径 foreground=true
 }
+
+test "U6 F1: 前台 Task 子 agent 失败也发 done(SSE 不卡 running)——spawned 后必有 done" {
+    // review F1:done 原只在 spawnAgentSink 成功后发,失败则 spawned 无对应 done → SSE 客户端
+    // 永久卡 running。修:errdefer 在 error 路径补发 done{failed}(done_emitted 抑制成功路径双发)。
+    // 本测用 400 响应逼子 agent 失败,断言事件序列以 spawned 起、以 done 收(不 stuck)。
+    const a = std.testing.allocator;
+    const ui_event = cc.ui_event;
+
+    // 400 → 子 agent run 失败(graceful api_error result 或 Zig error,两路都必须收尾 done)。
+    var srv = try harness.MockServer.startWithStatus("{\"error\":\"bad\"}", 0, "HTTP/1.1 400 Bad Request");
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "k", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    var agents = cc.agents_set.AgentSet.init(a);
+    defer agents.deinit();
+    try agents.loadFromStandardPaths("");
+
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var reg = try cc.agent_job_registry.AgentJobRegistry.init(a, "k", url, "claude-sonnet-4-20250514", .anthropic);
+    defer reg.deinit();
+
+    const Rec = struct {
+        seq: std.ArrayList(u8) = .empty,
+        alloc: std.mem.Allocator,
+        fn agentCb(c: *anyopaque, ev: ui_event.AgentLifecycle) void {
+            const self: *@This() = @ptrCast(@alignCast(c));
+            switch (ev) {
+                .spawned => self.seq.append(self.alloc, 's') catch {},
+                .done => self.seq.append(self.alloc, 'd') catch {},
+                .status => self.seq.append(self.alloc, '?') catch {},
+            }
+        }
+        fn tasksCb(c: *anyopaque, ev: ui_event.TasksChanged) void {
+            _ = c;
+            _ = ev;
+        }
+        fn reporter(self: *@This()) ui_event.EventReporter {
+            return .{ .ctx = @ptrCast(self), .agentFn = &agentCb, .tasksFn = &tasksCb };
+        }
+    };
+    var rec = Rec{ .alloc = a };
+    defer rec.seq.deinit(a);
+
+    var ctx = makeCtx(a, &client, &agents, &perm, &reg);
+    ctx.event_reporter = rec.reporter();
+
+    // execute 可能返回 error(Zig error 路径)或 ok(graceful api_error result)——两路都可接受,
+    // 关键不变式:**spawned 之后必有 done**(不 stuck running)。
+    const out = cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"general-purpose\",\"prompt\":\"hi\",\"description\":\"d\"}") catch null;
+    if (out) |o| a.free(o);
+
+    // 事件序列以 's' 起、以 'd' 收(无论中间;最后一个必是 done)。
+    try std.testing.expect(rec.seq.items.len >= 2);
+    try std.testing.expectEqual(@as(u8, 's'), rec.seq.items[0]);
+    try std.testing.expectEqual(@as(u8, 'd'), rec.seq.items[rec.seq.items.len - 1]);
+    // 且恰好一个 done(errdefer 与正常 done 不双发)。
+    var dcount: usize = 0;
+    for (rec.seq.items) |ch| {
+        if (ch == 'd') dcount += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), dcount);
+}

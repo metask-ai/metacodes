@@ -237,6 +237,19 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         .desc = fg_desc,
         .foreground = true,
     } });
+    // **U6 F1(review MINOR)**:前台 spawn/run **失败**也必须发 done——否则 spawned 已发但
+    // execute 提前 error 返回,SSE 客户端永久卡"running"(entry 又被下方 defer 移除,/state 也
+    // 对不上)。errdefer 只在 error 路径 fire;成功路径由 done_emitted 抑制(防与正常 done 双发)。
+    var done_emitted = false;
+    errdefer if (!done_emitted) {
+        if (ctx.event_reporter) |r| r.agentLifecycle(.{ .done = .{
+            .id = if (fg_entry) |e| e.idSlice() else "",
+            .state = "failed",
+            .turns = 0,
+            .tool_calls = 0,
+            .tokens = 0,
+        } });
+    };
     // 父轮把 Region 1 进度树视为 transient:tool_result 返回后移除该前台 entry。
     defer if (fg_entry) |e| {
         if (ctx.agent_jobs) |reg| reg.removeForeground(e);
@@ -323,6 +336,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         .tool_calls = result.tool_calls,
         .tokens = fg_tokens,
     } });
+    done_emitted = true; // U6 F1:正常 done 已发 → 抑制 errdefer 的失败兜底 done(防双发)
 
     // 输出 JSON
     var out: std.ArrayList(u8) = .empty;
