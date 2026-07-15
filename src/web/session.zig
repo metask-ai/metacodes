@@ -79,6 +79,42 @@ const StateSource = struct {
             for (slices.dirs) |d| allocator.free(d);
             allocator.free(slices.dirs);
         }
+        // **U6 A4:附着 agent roster**。attach 客户端据此见 attach 前已 spawn 的 agent(之后靠
+        // agent_lifecycle SSE 增量)。snapshotJobs **线程安全**(registry mutex 内 dup 值语义),
+        // 比 U5 model/dirs 更省心(JobSnapshot 本就是 owned 值拷贝,非裸跨线程 slice)。
+        // **注**:task frontier 未进快照——TaskStore 无 mutex(driver-only),HTTP 线程直读是
+        // race,需 U5-式 driver 发布缓存(task#19)。故 attach 拿不到 mid-session 已有 task,只能
+        // 靠 tasks_changed 事件之后的重拉(近似,非完整 attach)。
+        const AgentView = struct {
+            id: []const u8,
+            agent_type: []const u8,
+            state: []const u8,
+            turns: u32,
+            tool_calls: u32,
+            foreground: bool,
+        };
+        const RegT = @import("../core/agent_job_registry.zig").AgentJobRegistry;
+        var job_snaps: []RegT.JobSnapshot = &.{};
+        var agent_views: []AgentView = &.{};
+        if (self.app.agentJobsPtr()) |reg| {
+            job_snaps = reg.snapshotJobs(allocator) catch &.{};
+            agent_views = allocator.alloc(AgentView, job_snaps.len) catch &.{};
+            for (job_snaps, 0..) |js, i| {
+                if (i >= agent_views.len) break; // alloc 失败降级(agent_views 空)
+                agent_views[i] = .{
+                    .id = js.id,
+                    .agent_type = js.agent_type,
+                    .state = @tagName(js.status), // JobStatus tagName(静态串)
+                    .turns = js.turns,
+                    .tool_calls = js.tool_calls,
+                    .foreground = js.foreground,
+                };
+            }
+        }
+        defer {
+            if (agent_views.len > 0) allocator.free(agent_views);
+            if (job_snaps.len > 0) RegT.freeSnapshots(allocator, job_snaps);
+        }
         const u = &self.app.usage; // u64 无锁读，良性 skew（poll-based）
         return std.json.Stringify.valueAlloc(allocator, .{
             .seq = seq,
@@ -91,6 +127,7 @@ const StateSource = struct {
             .cost_usd = u.costUsd(slices.model),
             .generating = self.generating.load(.acquire),
             .pending_request_id = self.wb.pendingId(),
+            .agents = agent_views, // U6 A4:附着 roster
         }, .{});
     }
 
@@ -363,4 +400,48 @@ test "U5 B2: session_lifecycle.created 落 journal seq 0；closed 可 journal" {
     // closed 可 journal（收尾）。
     journalSessionLifecycle(&journal, a, .{ .closed = "abc123session" });
     try std.testing.expectEqual(@as(usize, 2), journal.count());
+}
+
+test "U6 A4: /state 快照含 agent roster(attach 见已 spawn 的 agent)" {
+    const a = std.testing.allocator;
+    const RegT = @import("../core/agent_job_registry.zig").AgentJobRegistry;
+    const session_id = @import("../core/session_id.zig");
+
+    var journal = EventJournal.init(a);
+    defer journal.deinit();
+    var wb = WebBackend.init(a, &journal);
+    defer wb.deinit();
+
+    // 最小 App(undefined trick):只初始化 snapshot() 触及的字段。
+    var app: app_mod.App = undefined;
+    app.allocator = a;
+    app.config = @import("../types.zig").Config{}; // provider_kind=.anthropic(activeModel 读它)
+    app.snapshot_cache = null; // → snapshotSlices 走 activeModel/additionalDirs 直读
+    app.additional_dirs_abs = null;
+    app.usage = .{};
+    app.session_id = session_id.SessionId.single;
+    app.permission_ctx = @import("../permission.zig").createContext(.default, a);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    app.api_client = @import("../client.zig").Client.initWithBaseUrl(a, io_rt.io(), "k", "m", null);
+    defer app.api_client.deinit();
+    // agent_jobs:直接赋值(勿经 copied local——registry 含 mutex/ArrayList,值拷会双释)。
+    app.agent_jobs = try RegT.init(a, "k", null, "m", .anthropic);
+    defer app.agent_jobs.?.deinit();
+    try app.agent_jobs.?.pushTestEntryFull("Explore", "scan files", 3, 100, "Grep", "{}", .running);
+
+    var cmdbox = MsgQueue.init(a);
+    defer cmdbox.deinit();
+    var src = StateSource{ .app = &app, .wb = &wb, .cmdbox = &cmdbox, .journal = &journal };
+
+    const json = try StateSource.snapshot(@ptrCast(&src), a);
+    defer a.free(json);
+
+    // roster 里那条 Explore agent(agent_type/state 投影)。
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"agents\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"agent_type\":\"Explore\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"state\":\"running\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"tool_calls\":3") != null);
+    // seq 也在(附着握手)。
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"seq\":") != null);
 }
