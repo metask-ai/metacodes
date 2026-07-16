@@ -166,6 +166,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .perm_override = perm_override,
             .project_dir = ctx.project_dir,
             .cwd = ctx.cwd_abs,
+            // task#12(Linus review):teammate 也透传父 sandbox(cwd 已传,补 sandbox/home/dirs)。
+            .sandbox = ctx.sandbox,
+            .home_dir = ctx.home_dir,
+            .additional_dirs = ctx.additional_dirs,
             .dyn_registry = ctx.dyn_registry,
             .host_services = if (ctx.host_services) |hs| hs.skillOnly() else null,
             .kg = ctx.kg,

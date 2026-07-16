@@ -379,9 +379,10 @@ pub const Client = struct {
     }
 
     /// 完整签名:支持 per-call model_override(subagent 用 def.zig 的 model 字段覆盖父 model)。
-    /// model_override = null → 用 client.model;非 null → 用 override。
-    /// 注意 max_tokens 仍走 client.resolveMaxTokens(),因为 model→max_tokens 表查的是 client.model;
-    /// 若 override 后想用 override 的 max_tokens,需扩展 catalog 查询。本期保守:沿用 client max_tokens。
+    /// model_override = null → 用 client.modelSnapshot();非 null → 用 override。
+    /// **task#13**:max_tokens 用与 .model **同一** effective_model(catalog.maxTokensFor(effective_model,…)),
+    /// 即请求内一致(override 时 max_tokens 也按 override model 查,与实际发送的 model 匹配,更正确);
+    /// 且不再在 .model 快照后紧接着单独裸读 client.model(避免跨线程撕裂 {new_ptr,old_len} OOB)。
     pub fn sendMessageStreamFull(
         client: *Client,
         messages: []const types.ApiMessage,

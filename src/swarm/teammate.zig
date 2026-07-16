@@ -205,6 +205,12 @@ pub const SpawnTeammateParams = struct {
     perm_override: ?types_mod.PermissionMode = null,
     project_dir: []const u8 = "",
     cwd: []const u8 = "",
+    // **task#12(Linus review):sandbox 透传到 teammate**——in-process teammate 也跑 agent_loop + Bash,
+    // 缺 sandbox = 第三处后门(同 subagent 同步/后台路径)。sandbox 借 App 生命周期;home_dir/additional_dirs
+    // 深拷贝(cwd 已有,复用作 sandbox cwd_abs)。
+    sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
+    home_dir: []const u8 = "",
+    additional_dirs: []const []const u8 = &.{},
     // 借用(App 生命周期):
     dyn_registry: ?*const @import("../tools/dynamic.zig").DynRegistry = null,
     host_services: ?@import("../tools/context.zig").HostServices = null,
@@ -230,6 +236,11 @@ const TeammateInput = struct {
     host_services: ?@import("../tools/context.zig").HostServices,
     kg: ?*@import("../kg/client.zig").KgClient,
     kg_projects_dir: []const u8,
+    // task#12:sandbox 借 App 生命周期(deinit 先 join teammates);cwd_abs/home_dir/additional_dirs 深拷贝。
+    sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings,
+    cwd_abs: []u8,
+    home_dir: []u8,
+    additional_dirs: [][]u8,
     owned: pf.OwnedProvider,
 
     fn cleanup(self: *TeammateInput) void {
@@ -241,6 +252,10 @@ const TeammateInput = struct {
         a.free(self.tool_defs_owned);
         a.free(self.project_dir);
         a.free(self.home);
+        a.free(self.cwd_abs); // task#12
+        a.free(self.home_dir);
+        for (self.additional_dirs) |d| a.free(d);
+        a.free(self.additional_dirs);
         if (self.model_override) |m| a.free(m);
         self.owned.deinit();
         a.destroy(self);
@@ -549,6 +564,19 @@ pub const TeammateRegistry = struct {
         errdefer if (!committed) a.free(home_owned);
         const mover_owned: ?[]u8 = if (p.model_override) |m| try a.dupe(u8, m) else null;
         errdefer if (!committed) if (mover_owned) |m| a.free(m);
+        // task#12:sandbox 快照(cwd_abs 用 p.cwd;home_dir dupe;additional_dirs 深拷贝防 realloc 悬挂)。
+        const cwd_sb_owned = try a.dupe(u8, p.cwd);
+        errdefer if (!committed) a.free(cwd_sb_owned);
+        const home_sb_owned = try a.dupe(u8, p.home_dir);
+        errdefer if (!committed) a.free(home_sb_owned);
+        const adirs_sb_owned = try a.alloc([]u8, p.additional_dirs.len);
+        errdefer if (!committed) a.free(adirs_sb_owned);
+        var nad_sb: usize = 0;
+        errdefer if (!committed) for (adirs_sb_owned[0..nad_sb]) |d| a.free(d);
+        for (p.additional_dirs, 0..) |d, di| {
+            adirs_sb_owned[di] = try a.dupe(u8, d);
+            nad_sb = di + 1;
+        }
 
         input.* = .{
             .allocator = a,
@@ -567,6 +595,10 @@ pub const TeammateRegistry = struct {
             .host_services = p.host_services,
             .kg = p.kg,
             .kg_projects_dir = p.kg_projects_dir,
+            .sandbox = p.sandbox, // task#12:borrow(App-lifetime)
+            .cwd_abs = cwd_sb_owned,
+            .home_dir = home_sb_owned,
+            .additional_dirs = adirs_sb_owned,
             .owned = owned,
         };
 
@@ -934,6 +966,11 @@ fn teammateThreadMain(input: *TeammateInput) void {
                 .swarm = &teammate_sw, // teammate→lead/peer SendMessage(Linus/PM F1)
                 .agent_ident = e.agent_ident, // 跨 turn 稳定(KG 租约连续)
                 .colorize = false,
+                // task#12(Linus review):teammate Bash 继承父 sandbox(第三处后门堵上)。
+                .sandbox = input.sandbox,
+                .cwd_abs = input.cwd_abs,
+                .home_dir = input.home_dir,
+                .additional_dirs = input.additional_dirs,
             },
             &be,
             a,

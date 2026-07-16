@@ -1058,10 +1058,11 @@ test "spawnBackground committed-flag:input.* 建好后失败也无泄漏(Failing
     // 成功路径起真线程在失败 allocator 上跑出无关 OOM 泄漏。验证 committed-flag 模型在每个早期失败点
     // 都不泄漏、不 double-free(对照旧 spawn-fail 路径手动 cleanup+errdefer 共存的 double-free)。
     const base = testing.allocator;
-    // spawnBackground 成功前的 alloc 次数(entry/io/client/input/各 dupe)约 13-18 次;扫 1..13 确保
-    // 每次失败都落在 input.* 之前或 entries.append 处,**绝不到 Thread.spawn**(线程从不起)。
+    // spawnBackground 成功前的 alloc 次数(entry/io/client/input/各 dupe + task#12 的 cwd/home/
+    // additional_dirs 深拷贝)约 20+ 次;扫 1..18 确保每次失败都落在 spawn 之前,**绝不到 Thread.spawn**。
+    // 传非空 additional_dirs → 覆盖 task#12 深拷贝**循环中途失败**的 nad 计数回滚(Linus review DoD)。
     var n: usize = 1;
-    while (n <= 13) : (n += 1) {
+    while (n <= 18) : (n += 1) {
         var fa = std.testing.FailingAllocator.init(base, .{ .fail_index = n });
         const a = fa.allocator();
         // registry 自身 init 也要 alloc;init 失败就跳过该 index(本测试只关心 spawnBackground 内部回滚)。
@@ -1086,6 +1087,10 @@ test "spawnBackground committed-flag:input.* 建好后失败也无泄漏(Failing
             .permission_ctx = permission_mod.createContext(.bypass_permissions, a),
             .desc = "main",
             .agent_type = "main",
+            // task#12:非空 additional_dirs → 驱动深拷贝循环中途失败,验 nad 计数回滚无泄漏。
+            .cwd_abs = "/cwd",
+            .home_dir = "/home",
+            .additional_dirs = &.{ "/dir/a", "/dir/b" },
             .prebuilt_conversation = copy,
         });
         // **硬警报**(Linus):本扫描区间(1..13)按设计 fail_index 永远落在 Thread.spawn 之前 → 必失败。
