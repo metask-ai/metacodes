@@ -6,8 +6,9 @@ export LANG=C
 prefix=$1
 resolved_target=$2
 optimize=$3
-zig_exe=$4
-target_was_explicit=$5
+strip=$4
+zig_exe=$5
+target_was_explicit=$6
 
 if [ "$target_was_explicit" != true ]; then
     echo "AgentCore release bundle requires explicit -Dtarget=aarch64-macos.13.0" >&2
@@ -24,12 +25,13 @@ esac
 lib="$prefix/lib/libmetacodes_agentcore.a"
 header="$prefix/include/metacodes_agentcore.h"
 sdk="$prefix/sdk/metacodes_agentcore.zig"
+protocol="$prefix/sdk/metacodes_agentcore_protocol.zig"
 types="$prefix/sdk/metacodes_agentcore_types.zig"
 manifest="$prefix/manifest.json"
 manifest_tmp="$manifest.tmp.$$"
 trap 'rm -f "$manifest_tmp"' EXIT HUP INT TERM
 
-for file in "$lib" "$header" "$sdk" "$types"; do
+for file in "$lib" "$header" "$sdk" "$protocol" "$types"; do
     if [ ! -f "$file" ]; then
         echo "AgentCore manifest: missing installed file: $file" >&2
         exit 1
@@ -95,7 +97,7 @@ cat > "$manifest_tmp" <<EOF
   "name": "metacodes-agentcore",
   "version": "$version",
   "source": {
-    "cc_zig_commit": "$commit",
+    "commit": "$commit",
     "dirty": $dirty,
     "dirty_source_sha256": "$source_digest"
   },
@@ -105,7 +107,8 @@ cat > "$manifest_tmp" <<EOF
     "architecture": "aarch64",
     "os": "macos",
     "macos_deployment_target": "13.0",
-    "optimize": "$optimize"
+    "optimize": "$optimize",
+    "strip": $strip
   },
   "contract": {
     "binary_abi_version": 1,
@@ -116,6 +119,7 @@ cat > "$manifest_tmp" <<EOF
     "lib/libmetacodes_agentcore.a": {"sha256": "$(sha "$lib")"},
     "include/metacodes_agentcore.h": {"sha256": "$(sha "$header")"},
     "sdk/metacodes_agentcore.zig": {"sha256": "$(sha "$sdk")"},
+    "sdk/metacodes_agentcore_protocol.zig": {"sha256": "$(sha "$protocol")"},
     "sdk/metacodes_agentcore_types.zig": {"sha256": "$(sha "$types")"}
   }
 }

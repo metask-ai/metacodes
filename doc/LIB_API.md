@@ -38,13 +38,14 @@
 zig-out/lib/libmetacodes_agentcore.a    ← 静态库
 zig-out/include/metacodes_agentcore.h   ← C 头
 zig-out/sdk/metacodes_agentcore.zig     ← Zig 便利层(source-free,不 import core 源)
+zig-out/sdk/metacodes_agentcore_protocol.zig
 zig-out/sdk/metacodes_agentcore_types.zig
         + manifest(scripts/write_agentcore_manifest.sh 生成)
 ```
 - 引用:C/Rust/Go/… link `.a` + include `.h` → 调 **单入口** `metacodes_agentcore_get_api(1)` 拿函数指针表(vtable):`runtime_create/destroy`、`session_create/destroy`、`session_run`(=agent loop)、`session_abort`、`buffer_release`。
-- 机制:**单符号 + 版本协商** = 稳定 ABI(加能力只往 vtable 加槽,不破坏既有 consumer);富数据(事件流/UI 请求/工具结果)**JSON**,配置/结果走 **POD struct**(头文件 `_Static_assert` 锁布局)。
+- 机制:**单符号 + 版本协商** = 稳定 ABI；当前 v1 要求精确 struct size，破坏性扩展须新增 v2 table，不能在 v1 静默追加槽。富数据(事件流/UI 请求/工具结果)走独立冻结的 **AgentCore protocol v1 JSON**，不直接暴露内部 frontend/daemon `CoreEvent`；配置/结果走 **POD struct**(头文件 `_Static_assert` 锁布局)。
 - source-free Zig:经 `sdk/metacodes_agentcore.zig`(`extern fn` link 预编译 `.a`,不要 core 源)。`agentcore:consumer` step 测这条。
-- 契约测试:`agentcore:test`(ABI v1 布局 + C 头编译 + Zig↔C 往返)。
+- 契约测试:`agentcore:test`(ABI v1 布局 + typed protocol + C 头编译 + Zig↔C 往返)。正式 ReleaseSafe bundle 默认 strip DWARF，manifest 记录并校验 strip 设置。
 
 > **选型一句话**:Zig 且在意零开销 → 吃源码包 `metacodes-core`;一切"不编源码"(跨语言 + source-free Zig)→ 走二进制包 `metacodes_agentcore`。
 

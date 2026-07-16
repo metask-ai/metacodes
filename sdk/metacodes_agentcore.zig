@@ -2,6 +2,20 @@
 //! implementation source is imported (source-free binary consumption).
 
 pub const types = @import("metacodes_agentcore_types");
+pub const protocol = @import("metacodes_agentcore_protocol");
+
+pub const Status = types.Status;
+pub const StopReason = types.StopReason;
+pub const CoreEvent = protocol.CoreEvent;
+pub const UiRequest = protocol.UiRequest;
+pub const UiResponse = protocol.UiResponse;
+pub const ParsedCoreEvent = protocol.ParsedCoreEvent;
+pub const ParsedUiRequest = protocol.ParsedUiRequest;
+pub const DecodeError = protocol.DecodeError;
+pub const EncodeError = protocol.EncodeError;
+pub const decodeCoreEvent = protocol.decodeCoreEvent;
+pub const decodeUiRequest = protocol.decodeUiRequest;
+pub const encodeUiResponse = protocol.encodeUiResponse;
 
 pub extern fn metacodes_agentcore_get_api(requested_abi: u32) callconv(.c) ?*const anyopaque;
 

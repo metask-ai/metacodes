@@ -2,16 +2,45 @@
 
 pub const ABI_VERSION_V1: u32 = 1;
 
-pub const STATUS_OK: u32 = 0;
-pub const STATUS_INVALID_ARGUMENT: u32 = 1;
-pub const STATUS_OUT_OF_MEMORY: u32 = 2;
-pub const STATUS_BUSY: u32 = 3;
-pub const STATUS_STALE_RUN: u32 = 4;
-pub const STATUS_TOO_LATE: u32 = 5;
-pub const STATUS_INVALID_STATE: u32 = 6;
-pub const STATUS_CORE_ERROR: u32 = 7;
-pub const STATUS_CALLBACK_FAILED: u32 = 8;
-pub const STATUS_INTERNAL_ERROR: u32 = 9;
+pub const Status = enum(u32) {
+    ok = 0,
+    invalid_argument = 1,
+    out_of_memory = 2,
+    busy = 3,
+    stale_run = 4,
+    too_late = 5,
+    invalid_state = 6,
+    core_error = 7,
+    callback_failed = 8,
+    internal_error = 9,
+
+    pub fn fromCode(code: u32) error{UnknownStatus}!Status {
+        return switch (code) {
+            @intFromEnum(Status.ok) => .ok,
+            @intFromEnum(Status.invalid_argument) => .invalid_argument,
+            @intFromEnum(Status.out_of_memory) => .out_of_memory,
+            @intFromEnum(Status.busy) => .busy,
+            @intFromEnum(Status.stale_run) => .stale_run,
+            @intFromEnum(Status.too_late) => .too_late,
+            @intFromEnum(Status.invalid_state) => .invalid_state,
+            @intFromEnum(Status.core_error) => .core_error,
+            @intFromEnum(Status.callback_failed) => .callback_failed,
+            @intFromEnum(Status.internal_error) => .internal_error,
+            else => error.UnknownStatus,
+        };
+    }
+};
+
+pub const STATUS_OK: u32 = @intFromEnum(Status.ok);
+pub const STATUS_INVALID_ARGUMENT: u32 = @intFromEnum(Status.invalid_argument);
+pub const STATUS_OUT_OF_MEMORY: u32 = @intFromEnum(Status.out_of_memory);
+pub const STATUS_BUSY: u32 = @intFromEnum(Status.busy);
+pub const STATUS_STALE_RUN: u32 = @intFromEnum(Status.stale_run);
+pub const STATUS_TOO_LATE: u32 = @intFromEnum(Status.too_late);
+pub const STATUS_INVALID_STATE: u32 = @intFromEnum(Status.invalid_state);
+pub const STATUS_CORE_ERROR: u32 = @intFromEnum(Status.core_error);
+pub const STATUS_CALLBACK_FAILED: u32 = @intFromEnum(Status.callback_failed);
+pub const STATUS_INTERNAL_ERROR: u32 = @intFromEnum(Status.internal_error);
 
 pub const PROVIDER_ANTHROPIC: u32 = 1;
 pub const PROVIDER_OPENAI: u32 = 2;
@@ -31,16 +60,45 @@ pub const SHELL_UNRESTRICTED: u32 = 3;
 pub const ABORT_USER_REQUEST: u32 = 1;
 pub const ABORT_TIMEOUT: u32 = 2;
 
-pub const STOP_INVALID: u32 = 0;
-pub const STOP_END_TURN: u32 = 1;
-pub const STOP_MAX_TURNS: u32 = 2;
-pub const STOP_ABORTED: u32 = 3;
-pub const STOP_TOOL_ERROR: u32 = 4;
-pub const STOP_API_ERROR: u32 = 5;
-pub const STOP_TOOL_LOOP: u32 = 6;
-pub const STOP_SUSPENDED: u32 = 7;
-pub const STOP_BACKGROUNDED: u32 = 8;
-pub const STOP_BUDGET: u32 = 9;
+pub const StopReason = enum(u32) {
+    invalid = 0,
+    end_turn = 1,
+    max_turns = 2,
+    aborted = 3,
+    tool_error = 4,
+    api_error = 5,
+    tool_loop = 6,
+    suspended = 7,
+    backgrounded = 8,
+    budget = 9,
+
+    pub fn fromCode(code: u32) error{UnknownStopReason}!StopReason {
+        return switch (code) {
+            @intFromEnum(StopReason.invalid) => .invalid,
+            @intFromEnum(StopReason.end_turn) => .end_turn,
+            @intFromEnum(StopReason.max_turns) => .max_turns,
+            @intFromEnum(StopReason.aborted) => .aborted,
+            @intFromEnum(StopReason.tool_error) => .tool_error,
+            @intFromEnum(StopReason.api_error) => .api_error,
+            @intFromEnum(StopReason.tool_loop) => .tool_loop,
+            @intFromEnum(StopReason.suspended) => .suspended,
+            @intFromEnum(StopReason.backgrounded) => .backgrounded,
+            @intFromEnum(StopReason.budget) => .budget,
+            else => error.UnknownStopReason,
+        };
+    }
+};
+
+pub const STOP_INVALID: u32 = @intFromEnum(StopReason.invalid);
+pub const STOP_END_TURN: u32 = @intFromEnum(StopReason.end_turn);
+pub const STOP_MAX_TURNS: u32 = @intFromEnum(StopReason.max_turns);
+pub const STOP_ABORTED: u32 = @intFromEnum(StopReason.aborted);
+pub const STOP_TOOL_ERROR: u32 = @intFromEnum(StopReason.tool_error);
+pub const STOP_API_ERROR: u32 = @intFromEnum(StopReason.api_error);
+pub const STOP_TOOL_LOOP: u32 = @intFromEnum(StopReason.tool_loop);
+pub const STOP_SUSPENDED: u32 = @intFromEnum(StopReason.suspended);
+pub const STOP_BACKGROUNDED: u32 = @intFromEnum(StopReason.backgrounded);
+pub const STOP_BUDGET: u32 = @intFromEnum(StopReason.budget);
 
 pub const CALLBACK_CONTINUE: u32 = 0;
 pub const CALLBACK_FATAL: u32 = 1;
@@ -182,4 +240,20 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 96), @offsetOf(SessionConfigV1, "allowed_tools"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(ApiV1, "runtime_create"));
     try std.testing.expectEqual(@as(usize, 48), @offsetOf(ApiV1, "session_run"));
+}
+
+test "typed status and stop reason validate every public code" {
+    const std = @import("std");
+    inline for (std.meta.fields(Status)) |field| {
+        const value: Status = @enumFromInt(field.value);
+        try std.testing.expectEqual(value, try Status.fromCode(field.value));
+    }
+    inline for (std.meta.fields(StopReason)) |field| {
+        const value: StopReason = @enumFromInt(field.value);
+        try std.testing.expectEqual(value, try StopReason.fromCode(field.value));
+    }
+    try std.testing.expectError(error.UnknownStatus, Status.fromCode(10));
+    try std.testing.expectError(error.UnknownStatus, Status.fromCode(std.math.maxInt(u32)));
+    try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(10));
+    try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(std.math.maxInt(u32)));
 }

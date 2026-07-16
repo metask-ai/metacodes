@@ -4,6 +4,7 @@ const std = @import("std");
 const wire = @import("metacodes_agentcore_types");
 const core = @import("metacodes-core");
 const ui_request = core.protocol.ui_request;
+pub const protocol_v1 = @import("protocol_v1.zig");
 
 const allocator = std.heap.c_allocator;
 
@@ -66,7 +67,8 @@ const AbiSession = struct {
     fn emit(raw: *anyopaque, _: core.session_id.SessionId, run_id: u64, event: core.protocol.ui_event.CoreEvent) bool {
         const self: *AbiSession = @ptrCast(@alignCast(raw));
         const callback = self.callbacks.on_event orelse return true;
-        const json = std.json.Stringify.valueAlloc(allocator, event, .{}) catch {
+        const public_event = protocol_v1.event(event) orelse return true;
+        const json = std.json.Stringify.valueAlloc(allocator, public_event, .{}) catch {
             self.recordCallbackStatus(wire.STATUS_OUT_OF_MEMORY);
             return false;
         };
@@ -80,7 +82,7 @@ const AbiSession = struct {
         const self: *AbiSession = @ptrCast(@alignCast(raw));
         const callback = self.callbacks.on_ui_request orelse return .unavailable;
         const release_fn = self.callbacks.release_response orelse return error.HostUiFailed;
-        const request_json = ui_request.serializeUiRequest(response_allocator, req) catch |err| {
+        const request_json = protocol_v1.encodeUiRequest(response_allocator, req) catch |err| {
             self.recordCallbackStatus(if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_INTERNAL_ERROR);
             return err;
         };
@@ -100,7 +102,7 @@ const AbiSession = struct {
                     self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
                     return err;
                 };
-                parseUiResponse(response_allocator, req, bytes, out) catch |err| {
+                protocol_v1.decodeUiResponse(response_allocator, req, bytes, out) catch |err| {
                     self.recordCallbackStatus(if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_CALLBACK_FAILED);
                     return err;
                 };
@@ -289,45 +291,6 @@ fn parseSchema(arena: std.mem.Allocator, encoded: []const u8) !core.json.InputSc
     return schema;
 }
 
-fn parseUiResponse(a: std.mem.Allocator, req: *const ui_request.UiRequest, encoded: []const u8, out: *ui_request.UiResponse) !void {
-    var parsed = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidUiResponse;
-    switch (req.*) {
-        .ask_question => |questions| {
-            const value = parsed.value.object.get("answers") orelse return error.InvalidUiResponse;
-            if (value != .array or value.array.items.len != questions.len) return error.InvalidUiResponse;
-            const answers = try a.alloc([]const u8, value.array.items.len);
-            var copied: usize = 0;
-            errdefer {
-                for (answers[0..copied]) |answer| a.free(@constCast(answer));
-                a.free(answers);
-            }
-            for (value.array.items, 0..) |item, i| {
-                if (item != .string) return error.InvalidUiResponse;
-                answers[i] = try a.dupe(u8, item.string);
-                copied += 1;
-            }
-            out.* = .{ .answers = answers };
-        },
-        .permission => {
-            const value = parsed.value.object.get("permission") orelse return error.InvalidUiResponse;
-            if (value != .string) return error.InvalidUiResponse;
-            out.* = .{ .permission = if (std.mem.eql(u8, value.string, "allow_once")) .allow_once else if (std.mem.eql(u8, value.string, "allow_always")) .allow_always else if (std.mem.eql(u8, value.string, "deny_once")) .deny_once else if (std.mem.eql(u8, value.string, "deny_tool_session")) .deny_tool_session else return error.InvalidUiResponse };
-        },
-        .plan_approval => {
-            const value = parsed.value.object.get("plan_approval") orelse return error.InvalidUiResponse;
-            if (value != .string) return error.InvalidUiResponse;
-            out.* = .{ .plan_approval = if (std.mem.eql(u8, value.string, "approve_default")) .approve_default else if (std.mem.eql(u8, value.string, "approve_accept_edits")) .approve_accept_edits else if (std.mem.eql(u8, value.string, "reject")) .reject else return error.InvalidUiResponse };
-        },
-        .custom => {
-            const value = parsed.value.object.get("custom") orelse return error.InvalidUiResponse;
-            if (value != .string) return error.InvalidUiResponse;
-            out.* = .{ .custom = try a.dupe(u8, value.string) };
-        },
-    }
-}
-
 fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire.RuntimeHandle, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
     if (out_runtime) |out| out.* = null;
     emptyError(out_error);
@@ -506,7 +469,7 @@ test "UI response parser owns AskUserQuestion answers" {
     const questions = [_]core.tool_context.AskQuestion{.{ .question = "continue?", .header = "choice", .multi = false, .options = &.{} }};
     const req = ui_request.UiRequest{ .ask_question = &questions };
     var out: ui_request.UiResponse = undefined;
-    try parseUiResponse(std.testing.allocator, &req, "{\"answers\":[\"yes\"]}", &out);
+    try protocol_v1.decodeUiResponse(std.testing.allocator, &req, "{\"answers\":[\"yes\"]}", &out);
     switch (out) {
         .answers => |answers| {
             defer std.testing.allocator.free(answers);
@@ -521,7 +484,7 @@ test "UI response parser rejects an answer count mismatch" {
     const questions = [_]core.tool_context.AskQuestion{.{ .question = "continue?", .header = "choice", .multi = false, .options = &.{} }};
     const req = ui_request.UiRequest{ .ask_question = &questions };
     var out: ui_request.UiResponse = undefined;
-    try std.testing.expectError(error.InvalidUiResponse, parseUiResponse(std.testing.allocator, &req, "{\"answers\":[]}", &out));
+    try std.testing.expectError(error.InvalidUiResponse, protocol_v1.decodeUiResponse(std.testing.allocator, &req, "{\"answers\":[]}", &out));
 }
 
 test "Host zero-length result must use a null pointer and preserves release descriptor on rejection" {
