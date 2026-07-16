@@ -143,6 +143,27 @@ time.sleep(0.7)  # 等 driver 起 POST、mock 开始 sleep(B generating=true)
 it2 = req({"op":"interrupt","session":B})
 assert '"ok":true' in it2, "generating 期 interrupt 未走成功分支(仍被门挡?): "+it2
 
+# ── U10-E:mid-run interrupt **真中断**(不止返 ok,run 要真以 aborted 收尾)────────────
+# mock 延 2s 后送数据,client 在 SSE 事件检查点见 abort → run 以 aborted 结束(agent_loop 751)。
+import time as _t
+deadline = _t.time() + 6; aborted_done = False
+while _t.time() < deadline:
+    if any('"run_done"' in l and '"aborted"' in l for l in attach_lines(B, 0, 1)):
+        aborted_done = True; break
+    _t.sleep(0.3)
+assert aborted_done, "SLOWGEN interrupt 未使 B 的 run 真以 aborted 收尾(仅返 ok 不够)"
+
+# ── U10-E:多消息连续对话(daemon driver 多轮)──────────────────────────────────
+rd_before = sum(1 for l in attach_lines(A, 0, 1) if '"run_done"' in l)
+assert '"ok":true' in req({"op":"message","session":A,"text":"multi-one-abc"})
+_t.sleep(0.5)
+assert '"ok":true' in req({"op":"message","session":A,"text":"multi-two-def"})
+_t.sleep(1.0)
+allA = attach_lines(A, 0, 2); joinedA = "\n".join(allA)
+rd_after = sum(1 for l in allA if '"run_done"' in l)
+assert rd_after >= rd_before + 2, "多消息未各产 run_done: %d→%d" % (rd_before, rd_after)
+assert "multi-one-abc" in joinedA and "multi-two-def" in joinedA, "多消息 echo 缺失"
+
 print("UDS_OK")
 PY
 ) || { echo "FAIL: UDS 检查异常"; echo "$uds_out"; exit 1; }
@@ -156,4 +177,4 @@ wait $dpid; rc=$?
 [ "$rc" = 0 ] || { echo "FAIL: daemon 退出码 $rc(非 0)"; exit 1; }
 grep -q "daemon closed" "$out" || { echo "FAIL: 无 'daemon closed'"; exit 1; }
 
-echo "PASS: serve-multi e2e — 2 session 路由隔离 + 未知 404 + 双 driver 并发 + UDS(list/message/attach/interrupt门) + SIGINT 优雅关停"
+echo "PASS: serve-multi e2e — 路由隔离 + UDS(list/message/attach/interrupt) + U10-E(真中断/多消息连续) + SIGINT 优雅关停"
