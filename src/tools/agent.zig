@@ -309,6 +309,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .project_dir = ctx.project_dir,
             .kg = ctx.kg,
             .kg_projects_dir = ctx.kg_projects_dir,
+            // task#12:透传父 sandbox 到 subagent(Bash 继承,不给绕过后门)。
+            .sandbox = ctx.sandbox,
+            .cwd_abs = ctx.cwd_abs,
+            .home_dir = ctx.home_dir,
+            .additional_dirs = ctx.additional_dirs,
         },
         &be,
     );

@@ -73,6 +73,13 @@ pub const SpawnOptions = struct {
     /// 而非从空 conversation + appendText(prompt) 起。**所有权转移给 spawnAgentSink**(它 defer deinit)。
     /// 普通 subagent 恒 null(从 prompt 起新对话)。
     prebuilt_conversation: ?Conversation = null,
+    /// **Sandbox 透传(task#12,安全)**:subagent 的 Bash 必须继承父的 sandbox,否则 subagent 成为
+    /// 绕过用户 sandbox 配置的后门。调用方(agent_tool)从 ctx.sandbox/cwd_abs/home_dir/additional_dirs 传入。
+    /// 默认 null/空 = 无 sandbox(与 agent_loop.Options 默认一致)。
+    sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
+    cwd_abs: []const u8 = "",
+    home_dir: []const u8 = "",
+    additional_dirs: []const []const u8 = &.{},
 };
 
 pub fn spawnAgent(
@@ -154,6 +161,11 @@ pub fn spawnAgentSink(
             // 后台 subagent 不应往父 stdout 喷 ANSI 着色(final_text/output 会混入 \x1b[32m)。
             // sink 是 NullWriter(同步)或 SinkWriter(后台)时都非交互终端 → 关着色。
             .colorize = false,
+            // task#12:sandbox 透传——subagent Bash 继承父 sandbox(否则绕过用户配置的后门)。
+            .sandbox = opts.sandbox,
+            .cwd_abs = opts.cwd_abs,
+            .home_dir = opts.home_dir,
+            .additional_dirs = opts.additional_dirs,
         },
         backend,
         allocator,

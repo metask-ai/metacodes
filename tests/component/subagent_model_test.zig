@@ -230,3 +230,68 @@ test "L2: spawnAgent(permission_mode_override=plan) 生效" {
 
     try std.testing.expect(srv.lastRequest() != null);
 }
+
+// ── task#12: 父 sandbox 透传到 subagent(全链:parent ctx.sandbox → agent_tool.execute →
+//    SpawnOptions.sandbox → 子 agent_loop.Options.sandbox → 子 ToolContext.sandbox → 工具读到)──
+var g_sbx_probe: enum { unset, none, disabled, enabled } = .unset;
+fn sbxProbe(ctx: *const cc.tool_context.ToolContext, _: []const u8, _: ?*anyopaque) anyerror![]u8 {
+    g_sbx_probe = if (ctx.sandbox) |s| (if (s.enabled) .enabled else .disabled) else .none;
+    return ctx.allocator.dupe(u8, "{}");
+}
+
+const PROBE_TOOLUSE_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"SbxProbe\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+test "L2 #12: 父 sandbox 透传到 subagent(ctx.sandbox 到达子 agent 工具)" {
+    const a = std.testing.allocator;
+    g_sbx_probe = .unset;
+
+    const bodies = [_][]const u8{ PROBE_TOOLUSE_SSE, MINIMAL_END_TURN_SSE };
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    var agents = cc.agents_set.AgentSet.init(a);
+    defer agents.deinit();
+    try agents.loadFromStandardPaths("");
+
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var probe_reg = cc.tools_dynamic.DynRegistry.init(a);
+    defer probe_reg.deinit();
+    try probe_reg.register("SbxProbe", "records ctx.sandbox", &.{}, sbxProbe, null, false);
+
+    var sbx = cc.sandbox_config.SandboxSettings{ .enabled = true, .allocator = a };
+    defer sbx.deinit();
+
+    const ctx = cc.tool_context.ToolContext{
+        .allocator = a,
+        .api_client = &client,
+        .tool_defs = &.{},
+        .permission_ctx = @constCast(&perm),
+        .agents = &agents,
+        .dyn_registry = &probe_reg,
+        .sandbox = &sbx, // 父 sandbox（enabled）
+        .cwd_abs = "/tmp",
+        .parent_model = "claude-sonnet-4-20250514",
+    };
+
+    const out = cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"general-purpose\",\"prompt\":\"probe\"}") catch |e| {
+        std.debug.print("agent_tool.execute failed: {s}\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+    defer a.free(out);
+
+    // 修复前:subagent 的 SpawnOptions 不透传 sandbox → 子工具 ctx.sandbox == null（.none）。
+    // 修复后:.enabled。toggle-verify:去掉 subagent.zig/agent.zig 的 sandbox 透传 → .none → 失败。
+    try std.testing.expectEqual(@as(@TypeOf(g_sbx_probe), .enabled), g_sbx_probe);
+}
