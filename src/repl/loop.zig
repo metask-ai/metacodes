@@ -727,6 +727,12 @@ fn backgroundCurrentSession(app: *app_mod.App) !void {
         .desc = desc,
         .agent_type = "main",
         .host_services = app.hostServices(),
+        // task#12(Linus review 第四处):Ctrl+B 转后台的是**主会话**(全权限+Bash),更不能丢 sandbox。
+        // 前台 agent_loop 有 sandbox,转后台若不透传则主会话 Bash 突然脱离 sandbox。
+        .sandbox = app.sandboxPtr(),
+        .cwd_abs = app.cwdAbs(),
+        .home_dir = app.homeDir(),
+        .additional_dirs = app.additionalDirs(),
         .prebuilt_conversation = copy,
     });
 
@@ -1684,7 +1690,7 @@ fn retryLast(app: *app_mod.App, allocator: std.mem.Allocator, backend: *const ui
         app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .model_switch_compact = app.pendingModelSwitchCompact(), .dyn_registry = &app.dyn_registry },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .model_switch_compact = app.pendingModelSwitchCompact(), .dyn_registry = &app.dyn_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .additional_dirs = app.additionalDirs() }, // task#12:辅助 REPL 路径也套 sandbox
         backend,
         allocator,
     ) catch |err| {
@@ -3488,7 +3494,7 @@ fn runInjectedAgentWithSynthetic(app: *app_mod.App, allocator: std.mem.Allocator
         app.provider(),
         app.tool_defs,
         &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = synthetic_user_input, .model_switch_compact = app.pendingModelSwitchCompact(), .dyn_registry = &app.dyn_registry },
+        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .synthetic_user_input = synthetic_user_input, .model_switch_compact = app.pendingModelSwitchCompact(), .dyn_registry = &app.dyn_registry, .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .home_dir = app.homeDir(), .additional_dirs = app.additionalDirs() }, // task#12:injected/synthetic 路径也套 sandbox
         backend,
         allocator,
     ) catch |err| {

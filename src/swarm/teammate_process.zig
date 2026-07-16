@@ -175,6 +175,10 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator, id: Identity) !u8 {
                 .agents = &app.agents,
                 .parent_model = app.activeModel(),
                 .project_dir = app.project_dir_or_empty(),
+                // task#12(Linus review 第五处):进程外 teammate 的 Bash 也须套 sandbox。此前只传
+                // cwd_abs/home_dir/additional_dirs,漏 .sandbox → ctx.sandbox=null → wrapCommand 被跳过,
+                // Bash 脱管("共享 App 就以为共享沙箱"的假设缺口)。App 已从 settings 载 sandbox,直接接上。
+                .sandbox = app.sandboxPtr(),
                 .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(),
                 .home_dir = home,
                 // agent_ident = 进程自己的 session id(24-hex 值类型,存不下 name@team)。
