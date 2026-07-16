@@ -32,7 +32,7 @@ from tty_driver import run as _run  # noqa: E402
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # tests/tty
 CCZIG_ROOT = os.path.dirname(os.path.dirname(HERE))  # cc-zig/
-TINYKG = os.path.join(CCZIG_ROOT, "vendor", "tinykg", "tinykg")
+TINYKG = os.path.join(CCZIG_ROOT, "zig-out", "vendor", "tinykg", "tinykg")
 
 REAL_AUTH = os.path.expanduser("~/.metacodes/auth.json")
 

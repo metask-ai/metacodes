@@ -11,14 +11,13 @@
 ## 构建与运行
 
 ```bash
-git clone --recurse-submodules <repo>        # highlight-zig 走 submodule
-# 或已 clone 后:
-git submodule update --init metacodes/lib/highlight-zig
-
+git clone <repo>                             # 无 submodule:依赖源码已 vendored 在 lib/
 cd metacodes
-zig build                                    # 产出 zig-out/bin/metacodes
+zig build                                     # 产出 zig-out/bin/metacodes + zig-out/vendor/tinykg/tinykg
 ./zig-out/bin/metacodes --api-key <KEY>
 ```
+
+**零下载依赖**:`highlight-zig`(高亮)与 `tinykg`(KG 记忆引擎)的源码作为**快照 vendored 在 `lib/`**(非 submodule,因更新频度低——plain clone 即可构建)。`zig build` 从这份源随 `-Dtarget` **交叉编译**它们:tinykg 装到 `zig-out/vendor/tinykg/tinykg`。更新依赖用 `scripts/vendor-deps.sh`。跳过 tinykg 构建:`-Dtinykg=false`。
 
 常用构建目标:
 
@@ -58,10 +57,10 @@ metacodes/
 │   ├── platform/               # 可移植系统抽象(POSIX + NT 双后端)
 │   ├── agentcore/              # C ABI v1 边界(见下)
 │   └── lib.zig                 # metacodes-core 库 root
-├── lib/
-│   └── highlight-zig/          # git submodule:纯 Zig 语法高亮库
+├── lib/                        # vendored 依赖【源码快照】(非 submodule),build.zig 交叉编译
+│   ├── highlight-zig/          #   纯 Zig 语法高亮库
+│   └── tinykg/                 #   KG 记忆/计划/DAG 引擎(subprocess CLI)
 ├── sdk/                        # AgentCore C 头 + Zig SDK
-├── vendor/                     # 冻结第三方(ripgrep / tinykg 二进制)
 └── example/                    # metacodes-core 库消费示例
 ```
 

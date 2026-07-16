@@ -396,7 +396,7 @@ pub const KgClient = struct {
     pub fn ensureReady(self: *KgClient) void {
         if (self.ready) return;
         const bin = self.bin_path orelse {
-            self.setDegraded("tinykg 二进制未找到。跑 scripts/build-tinykg.sh 生成 vendor/tinykg/tinykg,或设 METACODES_KG_BIN=<path>(dev 树用 METACODES_KG_DEV=1 显式开启)", .{});
+            self.setDegraded("tinykg 二进制未找到。跑 `zig build`(会从 lib/tinykg 源交叉编译到 <prefix>/vendor/tinykg/tinykg),或设 METACODES_KG_BIN=<path>(dev 树用 METACODES_KG_DEV=1 显式开启)", .{});
             return;
         };
         // store 缺 → init(先建父目录)。

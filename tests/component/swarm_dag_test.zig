@@ -20,7 +20,7 @@ fn findBin(a: std.mem.Allocator) ?[]u8 {
     }
     const home_c = std.c.getenv("HOME") orelse return null;
     const home = std.mem.span(home_c);
-    const cands = [_][]const u8{ "prj/cc-t2z/metacodes/vendor/tinykg/tinykg", "prj/tinykg/zig-out/bin/tinykg", "bin/tinykg" };
+    const cands = [_][]const u8{ "prj/cc-t2z/metacodes/zig-out/vendor/tinykg/tinykg", "prj/tinykg/zig-out/bin/tinykg", "bin/tinykg" };
     for (cands) |rel| {
         const full = std.fmt.allocPrint(a, "{s}/{s}", .{ home, rel }) catch continue;
         if (isX(full)) return full;

@@ -1,7 +1,7 @@
 //! L2 组件测试:KgClient 端到端打真 tinykg 二进制 + 临时 store(设计 v3-final §8 P1)。
 //!
 //! DoD(声明=接线=测试):每条断言把"KgClient 方法 X → tinykg store 状态 Y"焊死。
-//! 用真 tinykg(非 mock)——本地可得,格式版本由 build-tinykg.sh 锁定。
+//! 用真 tinykg(非 mock)——本地可得,格式版本由 lib/tinykg 源快照 pin(zig build 交叉编译)。
 //! 找不到二进制(CI 无 tinykg)→ SkipZigTest(不是失败:KG 是增强非依赖)。
 
 const std = @import("std");
@@ -18,7 +18,7 @@ fn findBin(allocator: std.mem.Allocator) ?[]u8 {
     const home_c = std.c.getenv("HOME") orelse return null;
     const home = std.mem.span(home_c);
     const candidates = [_][]const u8{
-        "prj/cc-t2z/metacodes/vendor/tinykg/tinykg",
+        "prj/cc-t2z/metacodes/zig-out/vendor/tinykg/tinykg",
         "prj/tinykg/zig-out/bin/tinykg",
     };
     for (candidates) |rel| {

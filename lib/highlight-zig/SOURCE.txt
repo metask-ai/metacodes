@@ -1,0 +1,3 @@
+vendored from: https://github.com/shuzuan-org/highlight-zig
+commit: 1645c82e0300dbaeba2e6515256cc37eabcc785c
+note: 源码快照(非 submodule)。更新用 scripts/vendor-deps.sh。

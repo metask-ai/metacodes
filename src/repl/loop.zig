@@ -2052,7 +2052,7 @@ pub fn parseGoalCommand(rest_raw: []const u8) GoalCommand {
 /// 无参=状态;`mem`=最近记忆;`forget <id>`=删除(投毒自救);`export`=导出 markdown。
 fn handleKg(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !void {
     const kg = if (app.kg) |*k| k else {
-        std.debug.print("KG 未配置(缺 tinykg 二进制)。运行 scripts/build-tinykg.sh 生成。\n", .{});
+        std.debug.print("KG 未配置(缺 tinykg 二进制)。运行 `zig build`(从 lib/tinykg 源交叉编译生成)。\n", .{});
         return;
     };
     if (!kg.ready) {

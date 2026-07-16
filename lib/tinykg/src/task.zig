@@ -1,0 +1,820 @@
+const std = @import("std");
+const core = @import("core.zig");
+const dag = @import("dag.zig");
+const graph_mod = @import("graph.zig");
+const index = @import("index.zig");
+const query = @import("query.zig");
+const storage = @import("storage.zig");
+
+pub fn isDagRelation(rel: core.RelKind) bool {
+    return dag.isDagRelation(rel);
+}
+
+pub fn wouldCreateCycle(graph: *const graph_mod.Graph, src: core.NodeId, dst: core.NodeId, rel: core.RelKind, budget: core.QueryBudget) !bool {
+    return dag.wouldCreateCycle(graph, src, dst, rel, budget);
+}
+
+pub const ReadyState = enum {
+    ready,
+    blocked,
+    missing_dependencies,
+};
+
+fn isReservedNodeId(id: core.NodeId) bool {
+    return id == .none or id.toInt() == std.math.maxInt(u64);
+}
+
+pub fn readyState(graph: *const graph_mod.Graph, task_id: core.NodeId) !ReadyState {
+    var mem_index = try index.MemoryIndex.init(graph.allocator, graph);
+    defer mem_index.deinit();
+    return readyStateWithIndex(graph, &mem_index, task_id);
+}
+
+pub fn readyStateWithIndex(graph: *const graph_mod.Graph, mem_index: *index.MemoryIndex, task_id: core.NodeId) !ReadyState {
+    return readyStateWithCursor(graph.allocator, graph, mem_index, .{ .memory = .{ .mem_index = mem_index } }, task_id);
+}
+
+pub fn readyStateWithCursor(
+    allocator: std.mem.Allocator,
+    graph: *const graph_mod.Graph,
+    mem_index: *index.MemoryIndex,
+    edge_cursor: query.EdgeCursor,
+    task_id: core.NodeId,
+) !ReadyState {
+    _ = allocator;
+    if (isReservedNodeId(task_id)) return core.Error.InvalidId;
+    const task_node = mem_index.getNode(graph, task_id) orelse return core.Error.NotFound;
+    if (task_node.kind != .task) return core.Error.InvalidId;
+
+    var node_reader = ReadyNodeReader{ .memory = .{ .graph = graph, .mem_index = mem_index } };
+    var blocker_ctx = ReadyBlockerContext{
+        .node_reader = &node_reader,
+        .blocked = false,
+    };
+    _ = try edge_cursor.forEachIncomingRelation(task_id, .blocks, &blocker_ctx, detectBlocker);
+    if (blocker_ctx.blocked) return .blocked;
+
+    var dep_ctx = ReadyDependencyContext{
+        .node_reader = &node_reader,
+        .has_missing_dep = false,
+    };
+    _ = try edge_cursor.forEachOutgoingRelation(task_id, .depends_on, &dep_ctx, detectMissingDependency);
+    if (dep_ctx.has_missing_dep) return .missing_dependencies;
+
+    var pred_ctx = ReadyPredecessorContext{
+        .node_reader = &node_reader,
+        .has_open_predecessor = false,
+    };
+    _ = try edge_cursor.forEachIncomingRelation(task_id, .precedes, &pred_ctx, detectOpenPredecessor);
+    return if (pred_ctx.has_open_predecessor) .missing_dependencies else .ready;
+}
+
+const ReadyBlockerContext = struct {
+    node_reader: *ReadyNodeReader,
+    blocked: bool,
+    budget: ?core.QueryBudget = null,
+    nodes_visited: ?*usize = null,
+    edges_visited: ?*usize = null,
+    deadline: core.QueryDeadline = .none,
+};
+
+fn detectBlocker(ctx: *ReadyBlockerContext, edge: index.EdgeRef) !bool {
+    try chargeReadyContextEdge(ctx.edges_visited, ctx.budget, ctx.deadline);
+    if (edge.rel == .blocks) {
+        try chargeReadyContextNode(ctx.nodes_visited, ctx.budget);
+        const blocker = (try ctx.node_reader.read(edge.src)) orelse return false;
+        defer blocker.deinit();
+        if (blocker.kind != .task) return false;
+        ctx.blocked = true;
+        return true;
+    }
+    return false;
+}
+
+const ReadyDependencyContext = struct {
+    node_reader: *ReadyNodeReader,
+    has_missing_dep: bool,
+    budget: ?core.QueryBudget = null,
+    nodes_visited: ?*usize = null,
+    edges_visited: ?*usize = null,
+    deadline: core.QueryDeadline = .none,
+};
+
+fn detectMissingDependency(ctx: *ReadyDependencyContext, edge: index.EdgeRef) !bool {
+    try chargeReadyContextEdge(ctx.edges_visited, ctx.budget, ctx.deadline);
+    if (edge.rel != .depends_on) return false;
+    try chargeReadyContextNode(ctx.nodes_visited, ctx.budget);
+    const dep = (try ctx.node_reader.read(edge.dst)) orelse return core.Error.NotFound;
+    defer dep.deinit();
+    if (dep.kind == .verification) return false;
+    ctx.has_missing_dep = true;
+    return false;
+}
+
+const ReadyPredecessorContext = struct {
+    node_reader: *ReadyNodeReader,
+    has_open_predecessor: bool,
+    budget: ?core.QueryBudget = null,
+    nodes_visited: ?*usize = null,
+    edges_visited: ?*usize = null,
+    deadline: core.QueryDeadline = .none,
+};
+
+/// precedes 前驱调度语义(与 blocker 同风格:只有 task 参与调度)。
+/// X ─precedes→ T 且 X 仍是开放 task(未经 revise 闭合为 verification)→ T 未就绪。
+fn detectOpenPredecessor(ctx: *ReadyPredecessorContext, edge: index.EdgeRef) !bool {
+    try chargeReadyContextEdge(ctx.edges_visited, ctx.budget, ctx.deadline);
+    if (edge.rel != .precedes) return false;
+    try chargeReadyContextNode(ctx.nodes_visited, ctx.budget);
+    const pred = (try ctx.node_reader.read(edge.src)) orelse return false;
+    defer pred.deinit();
+    if (pred.kind != .task) return false;
+    ctx.has_open_predecessor = true;
+    return true;
+}
+
+const ReadyNodeReader = union(enum) {
+    const direct_reads_before_view = 2;
+
+    memory: struct {
+        graph: *const graph_mod.Graph,
+        mem_index: *index.MemoryIndex,
+    },
+    persistent_store: struct {
+        allocator: std.mem.Allocator,
+        store: storage.Store,
+        missing_is_invalid: bool = false,
+        node_view: ?storage.Store.NodeRecordView = null,
+        direct_reads: usize = 0,
+    },
+
+    const BorrowedNode = struct {
+        kind: core.NodeKind,
+        stored: ?storage.StoredNode = null,
+        allocator: ?std.mem.Allocator = null,
+
+        fn deinit(self: BorrowedNode) void {
+            if (self.stored) |stored| {
+                var node = stored;
+                node.deinit(self.allocator.?);
+            }
+        }
+    };
+
+    fn deinit(self: *ReadyNodeReader) void {
+        switch (self.*) {
+            .persistent_store => |*reader| {
+                if (reader.node_view) |*view| view.deinit();
+            },
+            .memory => {},
+        }
+    }
+
+    fn read(self: *ReadyNodeReader, id: core.NodeId) !?BorrowedNode {
+        return switch (self.*) {
+            .memory => |reader| {
+                const node = reader.mem_index.getNode(reader.graph, id) orelse return null;
+                return .{ .kind = node.kind };
+            },
+            .persistent_store => |*reader| {
+                if (reader.node_view == null and reader.direct_reads < direct_reads_before_view) {
+                    reader.direct_reads += 1;
+                    const stored = (try reader.store.readNodeById(reader.allocator, id)) orelse {
+                        if (reader.missing_is_invalid) return error.InvalidRecord;
+                        return null;
+                    };
+                    return .{ .kind = stored.kind, .stored = stored, .allocator = reader.allocator };
+                }
+                if (reader.node_view == null) reader.node_view = try reader.store.openNodeRecordView();
+                const stored = (try reader.node_view.?.readNodeById(reader.allocator, id)) orelse {
+                    if (reader.missing_is_invalid) return error.InvalidRecord;
+                    return null;
+                };
+                return .{ .kind = stored.kind, .stored = stored, .allocator = reader.allocator };
+            },
+        };
+    }
+};
+
+pub fn readyStateWithPersistentStore(allocator: std.mem.Allocator, store: storage.Store, task_id: core.NodeId) !ReadyState {
+    return readyStateWithPersistentStoreBudget(allocator, store, task_id, .{});
+}
+
+pub fn readyStateWithPersistentStoreBudget(allocator: std.mem.Allocator, store: storage.Store, task_id: core.NodeId, budget: core.QueryBudget) !ReadyState {
+    var repaired = false;
+    while (true) {
+        return readyStateWithPersistentStoreOnce(allocator, store, task_id, budget) catch |err| switch (err) {
+            error.FileNotFound, error.InvalidRecord => {
+                if (repaired) return err;
+                repaired = true;
+                try store.repairPersistentIndexesFromLog();
+                continue;
+            },
+            else => |e| return e,
+        };
+    }
+}
+
+fn readyStateWithPersistentStoreOnce(allocator: std.mem.Allocator, store: storage.Store, task_id: core.NodeId, budget: core.QueryBudget) !ReadyState {
+    if (isReservedNodeId(task_id)) return core.Error.InvalidId;
+    const deadline = core.QueryDeadline.fromIo(store.io, budget.timeout_ms);
+    if (deadline.expired()) return core.Error.BudgetExceeded;
+    var nodes_visited: usize = 0;
+    var edges_visited: usize = 0;
+    try chargeReadyNode(&nodes_visited, budget);
+    var task_node = (try store.readNodeById(allocator, task_id)) orelse return core.Error.NotFound;
+    defer task_node.deinit(allocator);
+    if (task_node.kind != .task) return core.Error.InvalidId;
+
+    const cursor = query.EdgeCursor{ .persistent_store = .{
+        .allocator = allocator,
+        .store = store,
+    } };
+    var node_reader = ReadyNodeReader{ .persistent_store = .{ .allocator = allocator, .store = store, .missing_is_invalid = true } };
+    defer node_reader.deinit();
+    var blocker_ctx = ReadyBlockerContext{
+        .node_reader = &node_reader,
+        .blocked = false,
+        .budget = budget,
+        .nodes_visited = &nodes_visited,
+        .edges_visited = &edges_visited,
+        .deadline = deadline,
+    };
+    _ = try cursor.forEachIncomingRelation(task_id, .blocks, &blocker_ctx, detectBlocker);
+    if (blocker_ctx.blocked) return .blocked;
+
+    var dep_ctx = ReadyDependencyContext{
+        .node_reader = &node_reader,
+        .has_missing_dep = false,
+        .budget = budget,
+        .nodes_visited = &nodes_visited,
+        .edges_visited = &edges_visited,
+        .deadline = deadline,
+    };
+    _ = try cursor.forEachOutgoingRelation(task_id, .depends_on, &dep_ctx, detectMissingDependency);
+    if (dep_ctx.has_missing_dep) return .missing_dependencies;
+
+    var pred_ctx = ReadyPredecessorContext{
+        .node_reader = &node_reader,
+        .has_open_predecessor = false,
+        .budget = budget,
+        .nodes_visited = &nodes_visited,
+        .edges_visited = &edges_visited,
+        .deadline = deadline,
+    };
+    _ = try cursor.forEachIncomingRelation(task_id, .precedes, &pred_ctx, detectOpenPredecessor);
+    return if (pred_ctx.has_open_predecessor) .missing_dependencies else .ready;
+}
+
+fn chargeReadyContextNode(nodes_visited: ?*usize, budget: ?core.QueryBudget) !void {
+    const visited = nodes_visited orelse return;
+    try chargeReadyNode(visited, budget orelse return core.Error.Unsupported);
+}
+
+fn chargeReadyContextEdge(edges_visited: ?*usize, budget: ?core.QueryBudget, deadline: core.QueryDeadline) !void {
+    if (deadline.expired()) return core.Error.BudgetExceeded;
+    const visited = edges_visited orelse return;
+    try chargeReadyEdge(visited, budget orelse return core.Error.Unsupported);
+}
+
+fn chargeReadyNode(nodes_visited: *usize, budget: core.QueryBudget) !void {
+    if (nodes_visited.* >= budget.max_visited_nodes) return core.Error.BudgetExceeded;
+    nodes_visited.* += 1;
+}
+
+fn chargeReadyEdge(edges_visited: *usize, budget: core.QueryBudget) !void {
+    if (edges_visited.* >= budget.max_visited_edges) return core.Error.BudgetExceeded;
+    edges_visited.* += 1;
+}
+
+test "DAG relation cycle check detects simple cycle" {
+    var graph = graph_mod.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    const a = try graph.addNode(.task, "a");
+    const b = try graph.addNode(.task, "b");
+    _ = try graph.addEdgeUnchecked(a, .depends_on, b);
+
+    try std.testing.expect(try wouldCreateCycle(&graph, b, a, .depends_on, .{}));
+    try std.testing.expect(!try wouldCreateCycle(&graph, b, a, .calls, .{}));
+}
+
+test "ready state detects blockers before dependencies" {
+    var graph = graph_mod.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    const task = try graph.addNode(.task, "ship");
+    const dep = try graph.addNode(.task, "write tests");
+    _ = try graph.addEdgeUnchecked(task, .depends_on, dep);
+    try std.testing.expectEqual(ReadyState.missing_dependencies, try readyState(&graph, task));
+
+    const blocker = try graph.addNode(.task, "blocked");
+    _ = try graph.addEdgeUnchecked(blocker, .blocks, task);
+    try std.testing.expectEqual(ReadyState.blocked, try readyState(&graph, task));
+}
+
+test "ready state does not treat tasks blocked by focus as blockers of focus" {
+    var graph = graph_mod.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    const task = try graph.addNode(.task, "ship");
+    const blocked_other = try graph.addNode(.task, "blocked other");
+    _ = try graph.addEdgeUnchecked(task, .blocks, blocked_other);
+
+    try std.testing.expectEqual(ReadyState.ready, try readyState(&graph, task));
+    try std.testing.expectEqual(ReadyState.blocked, try readyState(&graph, blocked_other));
+}
+
+test "ready state ignores non-task blocker endpoints" {
+    var graph = graph_mod.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    const task = try graph.addNode(.task, "ship");
+    const file = try graph.addNode(.file, "src/main.zig");
+    _ = try graph.addEdgeUnchecked(file, .blocks, task);
+
+    try std.testing.expectEqual(ReadyState.ready, try readyState(&graph, task));
+}
+
+test "ready state skips dangling incoming blocker endpoints" {
+    var graph = graph_mod.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    const task = try graph.addNode(.task, "ship");
+    try graph.edges.append(std.testing.allocator, .{
+        .id = .fromInt(1),
+        .src = .fromInt(99),
+        .dst = task,
+        .rel = .blocks,
+    });
+
+    try std.testing.expectEqual(ReadyState.ready, try readyState(&graph, task));
+}
+
+test "ready state streams edge cursor without materializing adjacency" {
+    var graph = graph_mod.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    const task = try graph.addNode(.task, "ship");
+    const dep = try graph.addNode(.task, "write tests");
+    _ = try graph.addEdgeUnchecked(task, .depends_on, dep);
+
+    var mem_index = try index.MemoryIndex.init(std.testing.allocator, &graph);
+    defer mem_index.deinit();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectEqual(
+        ReadyState.missing_dependencies,
+        try readyStateWithCursor(failing.allocator(), &graph, &mem_index, .{ .memory = .{ .mem_index = &mem_index } }, task),
+    );
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+}
+
+test "ready state rejects non-task nodes" {
+    var graph = graph_mod.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    const file = try graph.addNode(.file, "src/main.zig");
+    try std.testing.expectError(core.Error.InvalidId, readyState(&graph, file));
+}
+
+test "ready state rejects reserved task ids before missing-node checks" {
+    var graph = graph_mod.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    try std.testing.expectError(core.Error.InvalidId, readyState(&graph, .none));
+    try std.testing.expectError(core.Error.InvalidId, readyState(&graph, .fromInt(std.math.maxInt(u64))));
+    try std.testing.expectError(core.Error.NotFound, readyState(&graph, .fromInt(99)));
+}
+
+test "ready state uses store-backed edge cursor" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+
+    var graph = graph_mod.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    const task_id = try graph.addNode(.task, "ship");
+    const dep = try graph.addNode(.task, "write tests");
+    const blocker = try graph.addNode(.task, "blocked");
+    const dep_edge = try graph.addEdgeUnchecked(task_id, .depends_on, dep);
+    const block_edge = try graph.addEdgeUnchecked(blocker, .blocks, task_id);
+    try store.appendNode(graph.nodes.items[0]);
+    try store.appendNode(graph.nodes.items[1]);
+    try store.appendNode(graph.nodes.items[2]);
+    try store.appendEdge(graph.edges.items[dep_edge.toInt() - 1]);
+    try store.appendEdge(graph.edges.items[block_edge.toInt() - 1]);
+
+    var loaded = try store.loadGraph();
+    defer loaded.deinit();
+    var mem_index = try index.MemoryIndex.init(std.testing.allocator, &loaded);
+    defer mem_index.deinit();
+
+    const cursor: query.EdgeCursor = .{ .store = .{ .allocator = std.testing.allocator, .store = store, .graph = &loaded } };
+    try std.testing.expectEqual(ReadyState.blocked, try readyStateWithCursor(std.testing.allocator, &loaded, &mem_index, cursor, task_id));
+}
+
+test "ready state can use persistent store without graph argument" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+
+    var graph = graph_mod.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    const task_id = try graph.addNode(.task, "ship");
+    const dep = try graph.addNode(.task, "write tests");
+    const blocker = try graph.addNode(.task, "blocked");
+    const dep_edge = try graph.addEdgeUnchecked(task_id, .depends_on, dep);
+    const block_edge = try graph.addEdgeUnchecked(blocker, .blocks, task_id);
+    try store.appendNode(graph.nodes.items[0]);
+    try store.appendNode(graph.nodes.items[1]);
+    try store.appendNode(graph.nodes.items[2]);
+    try store.appendEdge(graph.edges.items[dep_edge.toInt() - 1]);
+    try store.appendEdge(graph.edges.items[block_edge.toInt() - 1]);
+    try store.ensurePersistentEdgeIndexes(&graph);
+
+    try std.testing.expectEqual(ReadyState.blocked, try readyStateWithPersistentStore(std.testing.allocator, store, task_id));
+    try std.testing.expectError(core.Error.BudgetExceeded, readyStateWithPersistentStoreBudget(std.testing.allocator, store, task_id, .{ .timeout_ms = 0 }));
+    try std.testing.expectError(core.Error.BudgetExceeded, readyStateWithPersistentStoreBudget(std.testing.allocator, store, task_id, .{ .max_visited_nodes = 0 }));
+    try std.testing.expectError(core.Error.BudgetExceeded, readyStateWithPersistentStoreBudget(std.testing.allocator, store, task_id, .{ .max_visited_edges = 0 }));
+}
+
+test "persistent ready state routes blocker scan through published edge segment before index fallback" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+    const segment_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "edge-s000001" });
+    defer std.testing.allocator.free(segment_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+
+    const task_id = core.NodeId.fromInt(1);
+    const blocker = core.NodeId.fromInt(2);
+    try store.appendNode(.{ .id = task_id, .kind = .task, .text = "ship" });
+    try store.appendNode(.{ .id = blocker, .kind = .task, .text = "blocked" });
+    try store.appendEdge(.{ .id = .fromInt(1), .src = blocker, .dst = task_id, .rel = .blocks });
+    try std.testing.expectEqual(@as(u64, 1), try store.publishEdgeAdjacencySegment(segment_path));
+
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, store.edge_by_dst_path);
+    try std.testing.expectEqual(ReadyState.blocked, try readyStateWithPersistentStore(std.testing.allocator, store, task_id));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(std.testing.io, store.edge_by_dst_path, .{}));
+}
+
+test "ready node reader opens persistent node view after direct read threshold" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .task, .text = "one" });
+    try store.appendNode(.{ .id = .fromInt(2), .kind = .task, .text = "two" });
+    try store.appendNode(.{ .id = .fromInt(3), .kind = .task, .text = "three" });
+
+    var reader = ReadyNodeReader{ .persistent_store = .{ .allocator = std.testing.allocator, .store = store } };
+    defer reader.deinit();
+
+    var first = (try reader.read(.fromInt(1))).?;
+    defer first.deinit();
+    try std.testing.expectEqual(core.NodeKind.task, first.kind);
+    try std.testing.expectEqual(@as(usize, 1), reader.persistent_store.direct_reads);
+    try std.testing.expect(reader.persistent_store.node_view == null);
+
+    var second = (try reader.read(.fromInt(2))).?;
+    defer second.deinit();
+    try std.testing.expectEqual(core.NodeKind.task, second.kind);
+    try std.testing.expectEqual(@as(usize, 2), reader.persistent_store.direct_reads);
+    try std.testing.expect(reader.persistent_store.node_view == null);
+
+    var third = (try reader.read(.fromInt(3))).?;
+    defer third.deinit();
+    try std.testing.expectEqual(core.NodeKind.task, third.kind);
+    try std.testing.expectEqual(@as(usize, 2), reader.persistent_store.direct_reads);
+    try std.testing.expect(reader.persistent_store.node_view != null);
+}
+
+test "ready state persistent path uses relation-bounded incoming edge budget" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+
+    const task_id = core.NodeId.fromInt(1);
+    const note = core.NodeId.fromInt(2);
+    const blocker = core.NodeId.fromInt(3);
+    try store.appendNode(.{ .id = task_id, .kind = .task, .text = "ship" });
+    try store.appendNode(.{ .id = note, .kind = .task, .text = "note" });
+    try store.appendNode(.{ .id = blocker, .kind = .task, .text = "blocked" });
+    try store.appendEdge(.{ .id = .fromInt(1), .src = note, .dst = task_id, .rel = .mentions });
+    try store.appendEdge(.{ .id = .fromInt(2), .src = blocker, .dst = task_id, .rel = .blocks });
+
+    try std.testing.expectEqual(.blocked, try readyStateWithPersistentStoreBudget(std.testing.allocator, store, task_id, .{ .max_visited_edges = 1 }));
+}
+
+test "ready state persistent path uses relation-bounded outgoing edge budget" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+
+    const task_id = core.NodeId.fromInt(1);
+    const note = core.NodeId.fromInt(2);
+    const dep = core.NodeId.fromInt(3);
+    try store.appendNode(.{ .id = task_id, .kind = .task, .text = "ship" });
+    try store.appendNode(.{ .id = note, .kind = .task, .text = "note" });
+    try store.appendNode(.{ .id = dep, .kind = .task, .text = "dependency" });
+    try store.appendEdge(.{ .id = .fromInt(1), .src = task_id, .dst = note, .rel = .defines });
+    try store.appendEdge(.{ .id = .fromInt(2), .src = task_id, .dst = dep, .rel = .depends_on });
+
+    try std.testing.expectEqual(.missing_dependencies, try readyStateWithPersistentStoreBudget(std.testing.allocator, store, task_id, .{ .max_visited_edges = 1 }));
+}
+
+test "ready state persistent path ignores non-task blocker endpoints" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+
+    var graph = graph_mod.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    const task_id = try graph.addNode(.task, "ship");
+    const file = try graph.addNode(.file, "src/main.zig");
+    const edge = try graph.addEdgeUnchecked(file, .blocks, task_id);
+    for (graph.nodes.items) |node| try store.appendNode(node);
+    try store.appendEdge(graph.edges.items[edge.toInt() - 1]);
+    try store.ensurePersistentEdgeIndexes(&graph);
+
+    try std.testing.expectEqual(ReadyState.ready, try readyStateWithPersistentStore(std.testing.allocator, store, task_id));
+}
+
+test "ready state persistent path repairs dangling incoming blocker endpoint" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    store.options.validate_indexes_on_read = false;
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .task, .text = "ship" });
+    try store.appendNode(.{ .id = .fromInt(2), .kind = .task, .text = "note source" });
+    try store.appendEdge(.{ .id = .fromInt(1), .src = .fromInt(2), .dst = .fromInt(1), .rel = .mentions });
+
+    const edge_index_header_len = storage.EdgeIndexHeader.encoded_len;
+    const edge_index_record_len = 34;
+    var bytes: [edge_index_header_len + edge_index_record_len]u8 = undefined;
+    @memcpy(bytes[0..4], "TKGX");
+    std.mem.writeInt(u16, bytes[4..6], 2, .little);
+    std.mem.writeInt(u16, bytes[6..8], edge_index_header_len, .little);
+    bytes[8] = @intFromEnum(storage.EdgeIndexOrder.dst);
+    @memset(bytes[9..16], 0);
+    std.mem.writeInt(u64, bytes[16..24], 1, .little);
+    std.mem.writeInt(u64, bytes[24..32], 0, .little);
+    const record_offset = edge_index_header_len;
+    std.mem.writeInt(u64, bytes[record_offset + 0 .. record_offset + 8], 99, .little);
+    std.mem.writeInt(u64, bytes[record_offset + 8 .. record_offset + 16], 1, .little);
+    std.mem.writeInt(u64, bytes[record_offset + 16 .. record_offset + 24], 1, .little);
+    std.mem.writeInt(u16, bytes[record_offset + 24 .. record_offset + 26], @intFromEnum(core.RelKind.blocks), .little);
+    @memset(bytes[record_offset + 26 .. record_offset + 34], 0);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = store.edge_by_dst_path,
+        .data = &bytes,
+        .flags = .{ .truncate = true },
+    });
+
+    try std.testing.expectEqual(ReadyState.ready, try readyStateWithPersistentStore(std.testing.allocator, store, .fromInt(1)));
+}
+
+test "ready state persistent path repairs dangling dependency endpoint" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    store.options.validate_indexes_on_read = false;
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .task, .text = "ship" });
+    try store.appendNode(.{ .id = .fromInt(2), .kind = .verification, .text = "tests pass" });
+    try store.appendEdge(.{ .id = .fromInt(1), .src = .fromInt(1), .dst = .fromInt(2), .rel = .depends_on });
+
+    const edge_index_header_len = storage.EdgeIndexHeader.encoded_len;
+    const edge_index_record_len = 34;
+    var bytes: [edge_index_header_len + edge_index_record_len]u8 = undefined;
+    @memcpy(bytes[0..4], "TKGX");
+    std.mem.writeInt(u16, bytes[4..6], 2, .little);
+    std.mem.writeInt(u16, bytes[6..8], edge_index_header_len, .little);
+    bytes[8] = @intFromEnum(storage.EdgeIndexOrder.src);
+    @memset(bytes[9..16], 0);
+    std.mem.writeInt(u64, bytes[16..24], 1, .little);
+    std.mem.writeInt(u64, bytes[24..32], 0, .little);
+    const record_offset = edge_index_header_len;
+    std.mem.writeInt(u64, bytes[record_offset + 0 .. record_offset + 8], 1, .little);
+    std.mem.writeInt(u64, bytes[record_offset + 8 .. record_offset + 16], 99, .little);
+    std.mem.writeInt(u64, bytes[record_offset + 16 .. record_offset + 24], 1, .little);
+    std.mem.writeInt(u16, bytes[record_offset + 24 .. record_offset + 26], @intFromEnum(core.RelKind.depends_on), .little);
+    @memset(bytes[record_offset + 26 .. record_offset + 34], 0);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = store.edge_by_src_path,
+        .data = &bytes,
+        .flags = .{ .truncate = true },
+    });
+
+    try std.testing.expectEqual(ReadyState.ready, try readyStateWithPersistentStore(std.testing.allocator, store, .fromInt(1)));
+}
+
+test "ready state persistent path repairs corrupt edge index" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    store.options.validate_indexes_on_read = true;
+    defer store.deinit();
+    try store.createEmpty();
+
+    var graph = graph_mod.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    const task_id = try graph.addNode(.task, "ship");
+    const blocker = try graph.addNode(.task, "blocked");
+    const block_edge = try graph.addEdgeUnchecked(blocker, .blocks, task_id);
+    try store.appendNode(graph.nodes.items[0]);
+    try store.appendNode(graph.nodes.items[1]);
+    try store.appendEdge(graph.edges.items[block_edge.toInt() - 1]);
+
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = store.edge_by_dst_path,
+        .data = "bad",
+        .flags = .{ .truncate = true },
+    });
+    try std.testing.expectError(
+        error.InvalidRecord,
+        store.readEdgeIndexRecordsByNode(std.testing.allocator, .dst, task_id),
+    );
+
+    try std.testing.expectEqual(ReadyState.blocked, try readyStateWithPersistentStore(std.testing.allocator, store, task_id));
+}
+
+test "ready state persistent path rejects non-task nodes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .file, .text = "src/main.zig" });
+
+    try std.testing.expectError(core.Error.InvalidId, readyStateWithPersistentStore(std.testing.allocator, store, .fromInt(1)));
+}
+
+test "ready state persistent path rejects reserved task ids before missing-node checks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+
+    try std.testing.expectError(core.Error.InvalidId, readyStateWithPersistentStore(std.testing.allocator, store, .none));
+    try std.testing.expectError(core.Error.InvalidId, readyStateWithPersistentStore(std.testing.allocator, store, .fromInt(std.math.maxInt(u64))));
+    try std.testing.expectError(core.Error.NotFound, readyStateWithPersistentStore(std.testing.allocator, store, .fromInt(99)));
+}
+
+test "open precedes predecessor gates readiness on memory path" {
+    var graph = graph_mod.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    const pred = try graph.addNode(.task, "design schema");
+    const succ = try graph.addNode(.task, "implement schema");
+    _ = try graph.addEdgeUnchecked(pred, .precedes, succ);
+
+    var mem_index = try index.MemoryIndex.init(std.testing.allocator, &graph);
+    defer mem_index.deinit();
+    try std.testing.expectEqual(ReadyState.missing_dependencies, try readyStateWithIndex(&graph, &mem_index, succ));
+    // 前驱本身无前驱 → ready(precedes 只看入边)。
+    try std.testing.expectEqual(ReadyState.ready, try readyStateWithIndex(&graph, &mem_index, pred));
+}
+
+test "closed precedes predecessor releases readiness on memory path" {
+    var graph = graph_mod.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    // 闭合 = kind 已变 verification(update-node in-place 语义)。
+    const pred = try graph.addNode(.verification, "design schema (closed)");
+    const succ = try graph.addNode(.task, "implement schema");
+    _ = try graph.addEdgeUnchecked(pred, .precedes, succ);
+
+    var mem_index = try index.MemoryIndex.init(std.testing.allocator, &graph);
+    defer mem_index.deinit();
+    try std.testing.expectEqual(ReadyState.ready, try readyStateWithIndex(&graph, &mem_index, succ));
+}
+
+test "precedes predecessor gates readiness on persistent path both sides" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+
+    const open_pred = core.NodeId.fromInt(1);
+    const gated = core.NodeId.fromInt(2);
+    const closed_pred = core.NodeId.fromInt(3);
+    const released = core.NodeId.fromInt(4);
+    try store.appendNode(.{ .id = open_pred, .kind = .task, .text = "design" });
+    try store.appendNode(.{ .id = gated, .kind = .task, .text = "implement" });
+    try store.appendNode(.{ .id = closed_pred, .kind = .verification, .text = "design done" });
+    try store.appendNode(.{ .id = released, .kind = .task, .text = "ship" });
+    try store.appendEdge(.{ .id = .fromInt(1), .src = open_pred, .dst = gated, .rel = .precedes });
+    try store.appendEdge(.{ .id = .fromInt(2), .src = closed_pred, .dst = released, .rel = .precedes });
+
+    try std.testing.expectEqual(ReadyState.missing_dependencies, try readyStateWithPersistentStore(std.testing.allocator, store, gated));
+    try std.testing.expectEqual(ReadyState.ready, try readyStateWithPersistentStore(std.testing.allocator, store, released));
+}

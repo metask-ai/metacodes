@@ -44,6 +44,32 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    // tinykg —— KG 记忆/计划/任务 DAG 引擎(subprocess CLI)。从 **vendored 源**(lib/tinykg,
+    // 源码快照非 submodule → plain clone 即可构建)交叉编译到当前 -Dtarget,装到
+    // <prefix>/vendor/tinykg/tinykg —— KgClient 从 exe 目录向上逐级搜此相对路径(见 kg/client.zig
+    // resolveBinPath)。跨平台随 target 自动对齐;数据完整性工具恒 ReleaseSafe(不随 app optimize)。
+    // 版本 pin 见 lib/tinykg/SOURCE.txt;格式版本门在 kg/client.zig EXPECTED_STORAGE_FORMAT_VERSION 运行时守。
+    const build_tinykg = b.option(bool, "tinykg", "Build & install the vendored tinykg KG engine (default true)") orelse true;
+    // install step 提到外层:kg/swarm 集成测试需要真 tinykg 二进制,故 test step 也依赖它
+    // (让 `zig build test` 自包含地把 tinykg 建到 zig-out/vendor/tinykg/tinykg,测试候选路径命中)。
+    var tinykg_install_step: ?*std.Build.Step = null;
+    if (build_tinykg) {
+        const tinykg_exe = b.addExecutable(.{
+            .name = "tinykg",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("lib/tinykg/src/main.zig"),
+                .target = target,
+                .optimize = .ReleaseSafe,
+                .link_libc = true,
+            }),
+        });
+        const install_tinykg = b.addInstallArtifact(tinykg_exe, .{
+            .dest_dir = .{ .override = .{ .custom = "vendor/tinykg" } },
+        });
+        b.getInstallStep().dependOn(&install_tinykg.step);
+        tinykg_install_step = &install_tinykg.step;
+    }
+
     const debug_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -291,6 +317,8 @@ pub fn build(b: *std.Build) void {
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     const test_run = b.addRunArtifact(test_obj);
+    // kg/swarm 集成测试用真 tinykg → 先把它建到 zig-out/vendor/tinykg/tinykg(测试候选路径)。
+    if (tinykg_install_step) |s| test_run.step.dependOn(s);
     test_step.dependOn(&test_run.step);
 
     // ------------------------------------------------------------------
