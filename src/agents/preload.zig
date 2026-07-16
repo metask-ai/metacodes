@@ -27,6 +27,11 @@ pub const ContextOptions = struct {
     skip_codebase_context: bool = false,
     /// AbortSignal 透传给 skill 渲染时的 bash 注入
     abort: ?*const @import("../util/abort.zig").AbortSignal = null,
+    /// 沙箱上下文:preload 的 skill body 也含 `!cmd` 注入 shell,同样须沙箱包裹(task#25)。
+    sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
+    cwd_abs: []const u8 = "",
+    home_dir: []const u8 = "",
+    additional_dirs: []const []const u8 = &.{},
 };
 
 pub fn buildSubagentContext(
@@ -92,6 +97,11 @@ pub fn buildSubagentContext(
                 .session_id = opts.session_id,
                 .shell = skill.shell,
                 .abort = opts.abort,
+                // task#25:preload skill 注入 shell 也走沙箱
+                .sandbox = opts.sandbox,
+                .cwd_abs = opts.cwd_abs,
+                .home_dir = opts.home_dir,
+                .additional_dirs = opts.additional_dirs,
             };
             const rendered = render_mod.renderBody(allocator, skill.body, ropts) catch |err| {
                 log.warn("agent.preload", "render failed for {s}: {s}", .{ skill_name, @errorName(err) });

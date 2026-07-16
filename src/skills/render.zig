@@ -45,6 +45,13 @@ pub const RenderOptions = struct {
     disable_shell_execution: bool = false,
     /// AbortSignal 透传到 bash 注入
     abort: ?*const @import("../util/abort.zig").AbortSignal = null,
+    /// 沙箱上下文:skill 注入的 `!cmd` shell 走 sandbox-exec 包裹,防
+    /// **Write→SKILL.md→activate** 长链让模型自造 SKILL.md 经注入 shell 逃逸沙箱(task#25)。
+    /// null / 未 enabled → 不包裹(与 Bash ctx.sandbox 缺省一致);enabled 但沙箱不可用 → 拒跑。
+    sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
+    cwd_abs: []const u8 = "",
+    home_dir: []const u8 = "",
+    additional_dirs: []const []const u8 = &.{},
 };
 
 /// 渲染 body。返回 owned bytes,caller free。
@@ -439,8 +446,36 @@ fn runInjection(allocator: std.mem.Allocator, cmd: []const u8, opts: RenderOptio
     if (std.mem.eql(u8, opts.shell, "powershell")) {
         return try allocator.dupe(u8, "[powershell shell not supported in cc-zig]");
     }
-    // /bin/sh -c <cmd>
-    const cmd_z = try allocator.dupeZ(u8, cmd);
+    // 沙箱包裹（task#25:防 Write→SKILL.md→activate 自造 skill 经注入 shell 逃逸沙箱）。
+    // 复用 Bash/Monitor 同款 wrapAsShellString 范式:enabled → sandbox-exec 包;
+    // SandboxUnavailable → **拒跑**（绝不降级裸跑）;其它 error（profile 写失败）→ passthrough。
+    var sandbox_wrap: ?@import("../sandbox/exec.zig").ShellWrap = null;
+    defer if (sandbox_wrap) |*sw| sw.deinit();
+    const eff_cmd: []const u8 = blk: {
+        const sb = opts.sandbox orelse break :blk cmd;
+        if (!sb.enabled) break :blk cmd;
+        const sandbox_exec = @import("../sandbox/exec.zig");
+        const cwd = if (opts.cwd_abs.len > 0) opts.cwd_abs else ".";
+        const maybe = sandbox_exec.wrapAsShellString(allocator, cmd, .{
+            .cwd = cwd,
+            .home = opts.home_dir,
+            .sandbox = sb,
+            .additional_dirs = opts.additional_dirs,
+            .disable_for_this_command = false, // skill 注入无 readonly 豁免:enabled 恒包
+        }) catch |e| {
+            if (e == error.SandboxUnavailable)
+                return try allocator.dupe(u8, "[skill shell blocked: sandbox unavailable]");
+            break :blk cmd; // profile 写失败等 → passthrough
+        };
+        if (maybe) |sw| {
+            sandbox_wrap = sw;
+            break :blk sw.command;
+        }
+        break :blk cmd;
+    };
+
+    // /bin/sh -c <eff_cmd>（eff_cmd 已含 sandbox-exec 包裹层，或原样）
+    const cmd_z = try allocator.dupeZ(u8, eff_cmd);
     defer allocator.free(cmd_z);
     const sh_z: [*:0]const u8 = "/bin/sh";
     const flag_z: [*:0]const u8 = "-c";
@@ -583,6 +618,28 @@ test "inject: line-start !`cmd` runs and replaces" {
     );
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "Output: hello") != null);
+}
+
+test "inject: sandbox 开 → cwd 外写被拦(task#25:Write→SKILL.md→activate 逃逸防御 toggle-verify)" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest; // Seatbelt 仅 macOS
+    const a = testing.allocator;
+    const SandboxSettings = @import("../sandbox/config.zig").SandboxSettings;
+    var sbx = SandboxSettings{ .enabled = true, .allocator = a };
+    defer sbx.deinit();
+    // /Users/Shared 世界可写但**不在** sandbox 白名单(cwd=/tmp/dev/home 之外)→ 逃逸标靶。
+    const escape_z: [*:0]const u8 = "/Users/Shared/cc-skill-sbx-escape-test";
+    _ = std.c.unlink(escape_z);
+    defer _ = std.c.unlink(escape_z);
+    // 模型自造 SKILL.md 的等价:body 含注入 shell touch cwd 外文件。
+    const out = try renderBody(a, "!`touch /Users/Shared/cc-skill-sbx-escape-test`", .{
+        .sandbox = &sbx,
+        .cwd_abs = "/tmp",
+        .home_dir = "/tmp",
+    });
+    defer a.free(out);
+    // sandbox 开 → touch 被 sandbox-exec 拦 → 文件不存在。
+    // **toggle-verify**:去掉 runInjection 的 wrap(直投 raw cmd)→ touch 不受限 → 文件被创建 → 测试红。
+    try testing.expect(!pfs.exists(escape_z));
 }
 
 test "inject: mid-line after letter is NOT recognized (KEY=!`cmd`)" {

@@ -66,6 +66,11 @@ fn execute(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anye
         .shell = skill.shell,
         .abort = ctx.abort,
         .disable_shell_execution = ctx.disable_shell_execution,
+        // task#25:skill 注入 shell 走沙箱(防 Write→SKILL.md→activate 逃逸)
+        .sandbox = ctx.sandbox,
+        .cwd_abs = ctx.cwd_abs,
+        .home_dir = ctx.home_dir,
+        .additional_dirs = ctx.additional_dirs,
     };
 
     const rendered = try render_mod.renderBody(ctx.allocator, skill.body, opts);
@@ -148,6 +153,11 @@ fn tryForkSpawn(
             .skills = ctx.skills,
             .skip_codebase_context = preload_mod.shouldSkipCodebaseContext(d.name),
             .abort = ctx.abort,
+            // task#25:preload skill 注入 shell 走沙箱
+            .sandbox = ctx.sandbox,
+            .cwd_abs = ctx.cwd_abs,
+            .home_dir = ctx.home_dir,
+            .additional_dirs = ctx.additional_dirs,
         });
         sys_prompt_owned = sp;
         sys_prompt = sp;
