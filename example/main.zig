@@ -15,7 +15,7 @@ const UiBackend = mc.protocol.ui_backend.UiBackend;
 
 /// 最小自定义前端:把语义 CoreEvent 打印到 stdout。真实前端在此渲染 TUI/GUI/网页。
 const PrintBackend = struct {
-    fn emit(ctx: *anyopaque, ev: CoreEvent) void {
+    fn emit(ctx: *anyopaque, _: mc.session_id.SessionId, ev: CoreEvent) void {
         _ = ctx;
         switch (ev) {
             .text_chunk => |t| std.debug.print("{s}", .{t}),
@@ -25,7 +25,7 @@ const PrintBackend = struct {
             else => {}, // usage/phase_change/retry/auto_compact/… 此 demo 略
         }
     }
-    fn poll(ctx: *anyopaque) ?UiEvent {
+    fn poll(ctx: *anyopaque, _: mc.session_id.SessionId) ?UiEvent {
         _ = ctx;
         return null; // 无输入注入(不打断、不续发消息)
     }
@@ -39,8 +39,12 @@ pub fn main(init: std.process.Init) !void {
 
     const api_key = if (std.c.getenv("METACODES_API_KEY")) |k|
         std.mem.span(k)
-    else
-        mc.client.ANTHROPIC_AUTH_TOKEN; // 仓库内置 demo token
+    else {
+        // 内置 demo token 已随多 provider 重构移除(不再仓库内置密钥);
+        // 例子演示库消费,需真跑请设 METACODES_API_KEY。
+        std.debug.print("set METACODES_API_KEY to run this example against a live endpoint\n", .{});
+        return;
+    };
 
     var client = mc.client.Client.init(a, init.io, api_key, "claude-3-5-haiku-20241022");
 
@@ -57,7 +61,7 @@ pub fn main(init: std.process.Init) !void {
 
     const result = mc.agent_loop.run(
         &conv,
-        &client,
+        client.provider(), // 中立 Provider vtable(多 provider 重构后 run 收值非 *Client)
         tool_defs,
         &perm,
         .{ .max_turns = 2, .emit_tool_cards = false, .colorize = false },

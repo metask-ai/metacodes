@@ -739,7 +739,7 @@ test "AgentSession callback failure aborts delivery and poisons the Session" {
     var probe = SinkProbe{ .accept = false };
     try self.beginRun(7, probe.sink());
 
-    AgentSession.backendEmit(self, self.session_id, .{ .phase_change = .generating });
+    AgentSession.backendEmit(self, self.session_id, .stream_begin);
     AgentSession.backendEmit(self, self.session_id, .stream_done);
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expectEqual(@as(u64, 7), probe.run_id);
