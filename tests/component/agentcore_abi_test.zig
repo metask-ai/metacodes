@@ -109,6 +109,87 @@ fn rootPath(tmp: *std.testing.TmpDir, buffer: []u8) ![]const u8 {
     return buffer[0..len];
 }
 
+fn expectInvalidSessionConfig(
+    api: sdk.Api,
+    runtime: *wire.RuntimeHandle,
+    config: *const wire.SessionConfigV1,
+    callbacks: *const wire.SessionCallbacksV1,
+    diagnostic: *wire.OwnedBytesV1,
+) !void {
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        api.sessionCreate()(runtime, config, callbacks, &session, diagnostic),
+    );
+    try std.testing.expect(session == null);
+    try std.testing.expect(diagnostic.ptr != null and diagnostic.len != 0);
+    api.bufferRelease()(diagnostic);
+    try std.testing.expect(diagnostic.ptr == null and diagnostic.len == 0);
+}
+
+test "L2 ABI Session create rejects invalid Host configuration without publishing a handle" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+
+    const raw_api = abi.metacodes_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    const builtins = [_]wire.BytesViewV1{ sdk.bytesView("Read"), sdk.bytesView("Bash") };
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    runtime_config.builtin_tools = &builtins;
+    runtime_config.builtin_tool_count = builtins.len;
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreate()(&runtime_config, &runtime, &diagnostic));
+    defer if (runtime) |handle| {
+        _ = api.runtimeDestroy()(handle, &diagnostic);
+    };
+
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    const read_only = [_]wire.BytesViewV1{sdk.bytesView("Read")};
+    var config = std.mem.zeroes(wire.SessionConfigV1);
+    config.struct_size = @sizeOf(wire.SessionConfigV1);
+    config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    config.permission_mode_code = wire.PERMISSION_BYPASS;
+    config.shell_policy_code = wire.SHELL_DISABLED;
+    config.api_key = sdk.bytesView("test-key");
+    config.model = sdk.bytesView("test-model");
+    config.workspace_root = sdk.bytesView(root);
+    config.workspace_home = sdk.bytesView(root);
+    config.allowed_tools = &read_only;
+    config.allowed_tool_count = read_only.len;
+
+    config.workspace_root = sdk.bytesView(".");
+    try expectInvalidSessionConfig(api, runtime.?, &config, &callbacks, &diagnostic);
+    config.workspace_root = sdk.bytesView(root);
+
+    config.workspace_home = sdk.bytesView(".");
+    try expectInvalidSessionConfig(api, runtime.?, &config, &callbacks, &diagnostic);
+    config.workspace_home = sdk.bytesView(root);
+
+    const missing = [_]wire.BytesViewV1{sdk.bytesView("Grep")};
+    config.allowed_tools = &missing;
+    config.allowed_tool_count = missing.len;
+    try expectInvalidSessionConfig(api, runtime.?, &config, &callbacks, &diagnostic);
+
+    const duplicate = [_]wire.BytesViewV1{ sdk.bytesView("Read"), sdk.bytesView("Read") };
+    config.allowed_tools = &duplicate;
+    config.allowed_tool_count = duplicate.len;
+    try expectInvalidSessionConfig(api, runtime.?, &config, &callbacks, &diagnostic);
+
+    const disabled_shell = [_]wire.BytesViewV1{sdk.bytesView("Bash")};
+    config.allowed_tools = &disabled_shell;
+    config.allowed_tool_count = disabled_shell.len;
+    try expectInvalidSessionConfig(api, runtime.?, &config, &callbacks, &diagnostic);
+
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
+    runtime = null;
+}
+
 test "L2 opaque ABI routes Host UI, Host tools and CoreEvent JSON through AgentSession" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

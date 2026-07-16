@@ -14,7 +14,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const path_raw = common.extractJsonArg(args, "path") orelse ".";
     if (pattern.len == 0) return error.EmptyPattern;
     // 归一化(展开 ~、折叠、查 traversal)。替代旧 validateNoTraversal。
-    const path = try path_mod.normalizeChecked(allocator, path_raw, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
+    const path = try path_mod.normalizeChecked(allocator, path_raw, .{
+        .home = ctx.home_dir,
+        .base_dir = ctx.cwd_abs,
+        .resolve_relative = ctx.resolve_relative_paths,
+    });
     defer allocator.free(path);
     // 存在性检查:--no-messages 会把"路径不存在"静默成空结果 → 先拦给明确错误。
     _ = read_state.statPath(path) catch {

@@ -126,6 +126,11 @@ typedef struct {
     uint64_t reserved[4];
 } mc_session_callbacks_v1;
 
+/* workspace_root is the execution base for relative paths used by the
+ * supported built-in file tools and shell commands. It is not a filesystem
+ * containment boundary: absolute paths remain valid unless the Host applies
+ * a separate sandbox/policy. workspace_root must identify an existing
+ * absolute path; workspace_home must be absolute. */
 typedef struct {
     uint32_t struct_size;
     uint32_t provider_kind_code;

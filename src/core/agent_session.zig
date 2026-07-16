@@ -339,6 +339,7 @@ pub const AgentSession = struct {
                 .emit_tool_cards = true,
                 .project_dir = self.workspace.root,
                 .cwd_abs = self.workspace.root,
+                .resolve_relative_paths = true,
                 .home_dir = self.workspace.home,
                 .sandbox = self.workspace.sandbox(),
                 .parent_model = self.model,

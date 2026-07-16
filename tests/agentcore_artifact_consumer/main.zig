@@ -115,11 +115,15 @@ pub fn main(init: std.process.Init) !void {
     const api = try sdk.Api.discover();
     if (sdk.metacodes_agentcore_get_api(2) != null) return error.UnexpectedAbi;
 
+    var name_buf: [128]u8 = undefined;
+    const file_name = try std.fmt.bufPrint(&name_buf, "metacodes-agentcore-{d}.txt", .{std.c.getpid()});
     var path_buf: [256]u8 = undefined;
-    const file_path = try std.fmt.bufPrintZ(&path_buf, "/tmp/metacodes-agentcore-{d}.txt", .{std.c.getpid()});
+    const file_path = try std.fmt.bufPrintZ(&path_buf, "/tmp/{s}", .{file_name});
     defer _ = std.c.unlink(file_path.ptr);
     try writeFile(file_path.ptr, "artifact-read-ok");
-    const read_sse = try readToolSse(a, file_path);
+    // Source-free proof: the model supplies a relative file path and the
+    // binary facade resolves it against workspace_root, not process cwd.
+    const read_sse = try readToolSse(a, file_name);
     const bodies = [_][]const u8{ ASK_SSE, read_sse, HOST_SSE, FINAL_SSE };
     const server = try Server.start(&bodies);
     defer server.stop();

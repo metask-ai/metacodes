@@ -205,6 +205,20 @@ fn runtimeErrorStatus(err: anyerror) u32 {
         wire.STATUS_CORE_ERROR;
 }
 
+fn sessionCreateErrorStatus(err: anyerror) u32 {
+    return switch (err) {
+        error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
+        error.InvalidWorkspaceRoot,
+        error.InvalidWorkspaceHome,
+        error.ToolNotInRuntime,
+        error.DuplicateToolName,
+        error.ShellToolDisabled,
+        => wire.STATUS_INVALID_ARGUMENT,
+        error.RuntimeUnavailable => wire.STATUS_INVALID_STATE,
+        else => wire.STATUS_CORE_ERROR,
+    };
+}
+
 fn runErrorStatus(self: *const AbiSession, err: anyerror) u32 {
     return switch (err) {
         error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
@@ -381,7 +395,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
         .ui_requester = if (callbacks.on_ui_request != null) .{ .ctx = self, .requestFn = AbiSession.requestUi } else null,
     }) catch |err| {
         allocator.destroy(self);
-        return failError(if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_CORE_ERROR, err, out_error);
+        return failError(sessionCreateErrorStatus(err), err, out_error);
     };
     out.* = self.handle();
     return wire.STATUS_OK;
@@ -518,6 +532,21 @@ test "Run OutOfMemory maps to the public OOM status" {
         .core_session = undefined,
     };
     try std.testing.expectEqual(wire.STATUS_OUT_OF_MEMORY, runErrorStatus(&fake, error.OutOfMemory));
+}
+
+test "Session create maps caller configuration errors to invalid argument" {
+    inline for (.{
+        error.InvalidWorkspaceRoot,
+        error.InvalidWorkspaceHome,
+        error.ToolNotInRuntime,
+        error.DuplicateToolName,
+        error.ShellToolDisabled,
+    }) |err| {
+        try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, sessionCreateErrorStatus(err));
+    }
+    try std.testing.expectEqual(wire.STATUS_OUT_OF_MEMORY, sessionCreateErrorStatus(error.OutOfMemory));
+    try std.testing.expectEqual(wire.STATUS_INVALID_STATE, sessionCreateErrorStatus(error.RuntimeUnavailable));
+    try std.testing.expectEqual(wire.STATUS_CORE_ERROR, sessionCreateErrorStatus(error.Unexpected));
 }
 
 test "ABI Runtime rejects process-only built-ins as invalid input" {

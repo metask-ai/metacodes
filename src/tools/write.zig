@@ -24,7 +24,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer allocator.free(content);
     if (path_unesc.len == 0) return error.EmptyPath;
     // 归一化(展开 ~、折叠、查 traversal)。openat 不认 ~。
-    const path = try path_mod.normalizeChecked(allocator, path_unesc, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
+    const path = try path_mod.normalizeChecked(allocator, path_unesc, .{
+        .home = ctx.home_dir,
+        .base_dir = ctx.cwd_abs,
+        .resolve_relative = ctx.resolve_relative_paths,
+    });
     defer allocator.free(path);
 
     // must-read-first 校验：若挂了 ReadState（正式 agent 路径），文件存在但没读过 → 拒绝

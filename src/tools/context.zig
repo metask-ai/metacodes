@@ -218,6 +218,8 @@ pub const ToolContext = struct {
     sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
     /// 当前 cwd 绝对路径(sandbox profile 工作目录写权限)。空 = 用 process cwd。
     cwd_abs: []const u8 = "",
+    /// 相对文件工具路径是否以 cwd_abs 为基准。AgentSession 开启；CLI 默认关闭以维持既有契约。
+    resolve_relative_paths: bool = false,
     /// 额外工作目录(--add-dir / additionalDirectories,绝对路径)。sandbox profile
     /// 与 cwd 同级可写;权限侧由 permission_ctx.match_ctx.additional_dirs 消费。
     additional_dirs: []const []const u8 = &.{},

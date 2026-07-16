@@ -33,7 +33,7 @@ pub const NormalizeOptions = struct {
     home: []const u8,
     /// 调用方传 ctx.cwd_abs(可空)。resolve_relative 时用;空则回退 getCwd。
     base_dir: []const u8 = "",
-    /// 当前全部调用点传 false(只展开 ~ + 词法折叠)。true → 相对路径 resolve 成绝对。
+    /// 默认 false(只展开 ~ + 词法折叠)；embedding AgentSession 开启后，相对路径 resolve 成绝对。
     resolve_relative: bool = false,
 };
 

@@ -18,7 +18,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     if (pattern.len == 0) return error.EmptyPattern;
 
     // 归一化路径(展开 ~、折叠 //、查 traversal)。execve 不经 shell,~ 必须自己展开。
-    const path = try path_mod.normalizeChecked(allocator, path_raw, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
+    const path = try path_mod.normalizeChecked(allocator, path_raw, .{
+        .home = ctx.home_dir,
+        .base_dir = ctx.cwd_abs,
+        .resolve_relative = ctx.resolve_relative_paths,
+    });
     defer allocator.free(path);
     // 存在性检查:rg 的 --no-messages 会把"路径不存在"静默成空结果。这里先拦,给模型明确错误。
     _ = read_state.statPath(path) catch {

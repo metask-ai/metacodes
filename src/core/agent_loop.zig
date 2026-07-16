@@ -286,6 +286,9 @@ pub const Options = struct {
     sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
     /// cwd 绝对路径 + HOME(sandbox profile 用)。
     cwd_abs: []const u8 = "",
+    /// 相对工具路径是否以 cwd_abs 为基准解析。默认 false 保持 CLI 既有输出/路径语义；
+    /// embedding AgentSession 显式开启，使 Host 提供的 Workspace 真正成为工具执行基准。
+    resolve_relative_paths: bool = false,
     home_dir: []const u8 = "",
     /// 额外工作目录(--add-dir / additionalDirectories,绝对路径;sandbox 可写白名单)。
     additional_dirs: []const []const u8 = &.{},
@@ -683,6 +686,7 @@ pub fn run(
             .disable_shell_execution = opts.disable_shell_execution,
             .sandbox = opts.sandbox,
             .cwd_abs = opts.cwd_abs,
+            .resolve_relative_paths = opts.resolve_relative_paths,
             .home_dir = opts.home_dir,
             .additional_dirs = opts.additional_dirs,
             .plan_file_path = opts.plan_file_path,
@@ -1105,6 +1109,7 @@ pub fn run(
             .disable_shell_execution = opts.disable_shell_execution,
             .sandbox = opts.sandbox,
             .cwd_abs = opts.cwd_abs,
+            .resolve_relative_paths = opts.resolve_relative_paths,
             .home_dir = opts.home_dir,
             .additional_dirs = opts.additional_dirs,
             .plan_file_path = opts.plan_file_path,

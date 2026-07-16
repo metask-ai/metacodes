@@ -96,11 +96,21 @@ Runtime owns Host tool callback references and must outlive every Session.
 Session owns provider credentials, workspace inputs, tool selection,
 Conversation, permission memory, jobs, and Run state.
 
+Relative paths supplied to `Read`, `Write`, `Edit`, `Glob`, and `Grep` resolve
+against `workspace_root`; Bash also runs with that directory as its cwd.
+`workspace_root` is an execution context, not a filesystem jail: absolute
+paths remain usable unless the Host selects and configures a separate sandbox
+policy. Invalid workspace paths, unavailable/duplicate selected tools, and a
+shell tool selected under the disabled shell policy fail Session creation with
+`MC_STATUS_INVALID_ARGUMENT` and do not publish a Session handle.
+
 Event/request views are borrowed for the callback duration. Host tool results
 and answered UI responses remain Host-owned until their paired release
 callback is invoked exactly once. Callbacks may request abort but must not
 re-enter Run or destroy. Different Sessions may invoke shared Host callbacks
 concurrently, so the Host owns synchronization of shared callback state.
+The Host may call abort concurrently with the matching synchronous Run; it
+must serialize create/destroy and all other operations on the same handle.
 
 ABI v1 UI response JSON is one of:
 

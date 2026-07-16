@@ -16,7 +16,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     if (file_path_raw.len == 0) return error.EmptyFilePath;
     if (old_raw.len == 0) return error.EmptyOldString;
     // 归一化(展开 ~、折叠、查 traversal)。openat 不认 ~,必须自己展开。
-    const file_path = try path_mod.normalizeChecked(allocator, file_path_raw, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
+    const file_path = try path_mod.normalizeChecked(allocator, file_path_raw, .{
+        .home = ctx.home_dir,
+        .base_dir = ctx.cwd_abs,
+        .resolve_relative = ctx.resolve_relative_paths,
+    });
     defer allocator.free(file_path);
 
     // must-read-first：Edit 必须先 Read 过；挂了 ReadState 才校验。

@@ -38,7 +38,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         return error.MissingPath;
     if (path_raw.len == 0) return error.EmptyPath;
     // 归一化(展开 ~、折叠、查 traversal)。execve 不经 shell,~ 必须自己展开;openat 同样不认 ~。
-    const path = try path_mod.normalizeChecked(allocator, path_raw, .{ .home = ctx.home_dir, .base_dir = ctx.cwd_abs });
+    const path = try path_mod.normalizeChecked(allocator, path_raw, .{
+        .home = ctx.home_dir,
+        .base_dir = ctx.cwd_abs,
+        .resolve_relative = ctx.resolve_relative_paths,
+    });
     defer allocator.free(path);
     try rejectDevicePath(path);
 
