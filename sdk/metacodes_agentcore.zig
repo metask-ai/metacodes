@@ -1,5 +1,5 @@
-//! Typed Zig convenience layer shipped beside the binary ABI. No cc-zig
-//! implementation source is imported.
+//! Typed Zig convenience layer shipped beside the binary ABI. No metacodes
+//! implementation source is imported (source-free binary consumption).
 
 pub const types = @import("metacodes_agentcore_types");
 
