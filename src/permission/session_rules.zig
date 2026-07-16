@@ -7,11 +7,15 @@
 //!
 //! 固定上限 + 内联存储(无堆分配):工具名拷进固定 buf,值语义,无外部生命周期依赖。
 //!
-//! **线程契约**:M6 前假设**单线程访问**(rememberAllow/Deny 改 buf_used 非原子)。
-//! M6 多 Session 多线程化时,要么给本类型加 mutex(仿 ReadState),要么保证每 session 的
-//! ask 串行。当前 TUI(N=1)单线程,安全。
+//! **线程契约(task#15)**:实例经 `PermissionContext.session_rules` 指针共享;后台 subagent/teammate
+//! 的 scopedDerive 是**浅拷贝**,复制的是这个指针 → 与 lead 共享同一 SessionRules 实例。lead 前台
+//! 批准规则(rememberAllow/Deny 改 buf_used/count/buf)与后台 subagent 的 isAllowed/isDenied 读并发
+//! → 数据竞争(读到 torn slice / count 与 slot 不同步)。**修:加 mutex 串行化**(session_rules.zig:11
+//! 早登记的两选项之一,mirror ReadState)。读方法改非 const(需锁)——调用方(prompt.zig)持 `*SessionRules`
+//! 可满足。**注意**:实例永不值拷贝(只指针共享),故 mutex 不被复制。
 
 const std = @import("std");
+const sync = @import("platform").sync;
 
 pub const MAX_REMEMBERED = 64;
 const MAX_NAME = 64;
@@ -23,7 +27,10 @@ pub const SessionRules = struct {
     session_deny_count: usize = 0,
     buf: [MAX_REMEMBERED * 2][MAX_NAME]u8 = undefined,
     buf_used: usize = 0,
+    /// 串行化并发 remember(lead 前台批准)vs isAllowed/isDenied(后台 subagent 读)。task#15。
+    mutex: sync.Mutex = .{},
 
+    // 无锁内部实现(调用方已持锁)。
     fn remember(self: *SessionRules, list: *[MAX_REMEMBERED][]const u8, count: *usize, name: []const u8) void {
         if (count.* >= MAX_REMEMBERED) return;
         if (self.buf_used >= self.buf.len or name.len > MAX_NAME) return;
@@ -35,18 +42,26 @@ pub const SessionRules = struct {
     }
 
     pub fn rememberAllow(self: *SessionRules, name: []const u8) void {
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
         self.remember(&self.always_allow, &self.always_allow_count, name);
     }
 
     pub fn rememberDeny(self: *SessionRules, name: []const u8) void {
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
         self.remember(&self.session_deny, &self.session_deny_count, name);
     }
 
-    pub fn isAllowed(self: *const SessionRules, name: []const u8) bool {
+    pub fn isAllowed(self: *SessionRules, name: []const u8) bool {
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
         return contains(self.always_allow[0..self.always_allow_count], name);
     }
 
-    pub fn isDenied(self: *const SessionRules, name: []const u8) bool {
+    pub fn isDenied(self: *SessionRules, name: []const u8) bool {
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
         return contains(self.session_deny[0..self.session_deny_count], name);
     }
 };

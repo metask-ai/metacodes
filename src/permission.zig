@@ -222,6 +222,9 @@ test "U4 A2: scopedDerive null 掉 sink(scoped 拷贝的 override 绝不 emit �
     // derived.setMode 不 emit 到 session sink（scoped override 不污染 session 事件）
     derived.setMode(.plan);
     try std.testing.expectEqual(@as(usize, 0), rec.count);
+    // **task#15 核心:mode 隔离**——derived(后台 subagent/teammate)改 mode 绝不回灌 lead。
+    // scopedDerive 值拷贝 → derived.mode 是独立 atomic,session_ctx.mode 不受影响(仍默认 .prompt)。
+    try std.testing.expectEqual(types.PermissionMode.prompt, session_ctx.modeValue());
     // 对照:session_ctx.setMode 才 emit
     session_ctx.setMode(.plan);
     try std.testing.expectEqual(@as(usize, 1), rec.count);
