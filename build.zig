@@ -49,7 +49,13 @@ pub fn build(b: *std.Build) void {
     // <prefix>/vendor/tinykg/tinykg —— KgClient 从 exe 目录向上逐级搜此相对路径(见 kg/client.zig
     // resolveBinPath)。跨平台随 target 自动对齐;数据完整性工具恒 ReleaseSafe(不随 app optimize)。
     // 版本 pin 见 lib/tinykg/SOURCE.txt;格式版本门在 kg/client.zig EXPECTED_STORAGE_FORMAT_VERSION 运行时守。
-    const build_tinykg = b.option(bool, "tinykg", "Build & install the vendored tinykg KG engine (default true)") orelse true;
+    //
+    // **Windows 排除**:KgClient 的运行时解析(findVendoredUpward 搜无后缀 `tinykg`、
+    // isExecutable 用 POSIX `X_OK`)尚未 windows 化 —— 在 windows 上就算编出 `tinykg.exe`
+    // 也找不到/不可用。故不为 windows 编它(避免造一个 app 消费不了的死制品);windows KG
+    // 保持 degraded(与本次改动前一致)。macOS/Linux 正常(纯 Zig 交叉编译 + POSIX 解析可用)。
+    const tinykg_supported = target.result.os.tag != .windows;
+    const build_tinykg = (b.option(bool, "tinykg", "Build & install the vendored tinykg KG engine (default true; auto-off on Windows)") orelse true) and tinykg_supported;
     // install step 提到外层:kg/swarm 集成测试需要真 tinykg 二进制,故 test step 也依赖它
     // (让 `zig build test` 自包含地把 tinykg 建到 zig-out/vendor/tinykg/tinykg,测试候选路径命中)。
     var tinykg_install_step: ?*std.Build.Step = null;
