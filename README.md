@@ -72,9 +72,10 @@ agent 循环核心可作为库被外部消费:
 | 消费方 | 用什么 | 序列化开销 |
 |--------|--------|-----------|
 | 同进程 Zig | `metacodes-core` 模块(`b.addModule`) | **零**(直传 CoreEvent 结构) |
+| source-free Zig | `metacodes_agentcore` 静态库 + typed Zig SDK | AgentCore protocol v1 JSON |
 | C / Rust / 跨版本 | `metacodes_agentcore` 静态库 | 富数据 JSON,配置 POD 结构 |
 
-C ABI(`sdk/metacodes_agentcore.h`)刻意只导出单入口 `metacodes_agentcore_get_api(abi_version)`,返回函数指针表(vtable):`runtime_create/destroy`、`session_create/destroy`、`session_run`(agent 循环)、`session_abort`、`buffer_release`。单符号 + 版本协商 = 稳定 ABI,加能力只往 vtable 加槽不破坏既有 consumer。
+C ABI(`sdk/metacodes_agentcore.h`)刻意只导出单入口 `metacodes_agentcore_get_api(abi_version)`,返回函数指针表(vtable):`runtime_create/destroy`、`session_create/destroy`、`session_run`(agent 循环)、`session_abort`、`buffer_release`。当前 v1 要求精确结构体大小；破坏性扩展新增 v2 table，不能静默修改 v1。事件/UI JSON 由独立的 AgentCore protocol v1 冻结，不直接暴露内部 frontend/daemon `CoreEvent`。
 
 ## 技术栈
 
