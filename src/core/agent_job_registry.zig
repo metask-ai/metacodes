@@ -205,6 +205,14 @@ pub const SpawnParams = struct {
     /// App 生命周期稳定,借用;KgClient 内部 detail 锁护并发。
     kg: ?*@import("../kg/client.zig").KgClient = null,
     kg_projects_dir: []const u8 = "",
+    /// **task#12(安全):sandbox 透传到后台 subagent**——否则后台 Bash 绕过父 sandbox(Linus review
+    /// 抓:同步路径修了、后台路径漏了,同 KG 字段的两构造点陷阱)。sandbox 指针借 App 生命周期(稳定,
+    /// App.deinit 先 join jobs);cwd_abs/home_dir/additional_dirs 由 JobInput 深拷贝(additional_dirs 会被
+    /// /add-dir realloc,借用悬挂 → 快照)。
+    sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
+    cwd_abs: []const u8 = "",
+    home_dir: []const u8 = "",
+    additional_dirs: []const []const u8 = &.{},
     /// Ctrl+B 主对话转后台:预建对话副本(深拷贝,所有权转移给 registry → JobInput → spawnAgentSink)。
     /// null=普通 subagent(从 prompt 起新对话)。
     prebuilt_conversation: ?Conversation = null,
@@ -236,6 +244,12 @@ const JobInput = struct {
     host_services: ?@import("../tools/context.zig").HostServices,
     kg: ?*@import("../kg/client.zig").KgClient,
     kg_projects_dir: []const u8,
+    // task#12:sandbox 借 App 生命周期(App.deinit 先 join jobs,指针稳定);cwd_abs/home_dir/additional_dirs
+    // 深拷贝(job-owned;additional_dirs 深拷贝外层+每条,防 /add-dir realloc 悬挂)。cleanup 释放。
+    sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings,
+    cwd_abs: []u8,
+    home_dir: []u8,
+    additional_dirs: [][]u8,
     // 专属资源:P0.5 换成 OwnedProvider(据 provider_kind 造对应具体 client + io,统一 deinit)。
     owned: pf.OwnedProvider,
     /// Ctrl+B 主对话转后台:预建对话(深拷贝副本,所有权在此)。jobThreadMain move 进 SpawnOptions
@@ -253,6 +267,10 @@ const JobInput = struct {
         a.free(self.tool_defs_owned);
         a.free(self.project_dir);
         a.free(self.parent_model);
+        a.free(self.cwd_abs); // task#12
+        a.free(self.home_dir);
+        for (self.additional_dirs) |d| a.free(d);
+        a.free(self.additional_dirs);
         if (self.model_override) |m| a.free(m);
         if (self.prebuilt_conversation) |*c| c.deinit(); // 仅 spawn 失败回滚命中(jobThreadMain 成功路径已 move 置 null)
         self.owned.deinit();
@@ -432,6 +450,19 @@ pub const AgentJobRegistry = struct {
         errdefer if (!committed) a.free(pmodel_owned);
         const mover_owned: ?[]u8 = if (p.model_override) |m| try a.dupe(u8, m) else null;
         errdefer if (!committed) if (mover_owned) |m| a.free(m);
+        // task#12:sandbox 快照(cwd_abs/home_dir dupe;additional_dirs 深拷贝防 /add-dir realloc 悬挂)。
+        const cwd_owned = try a.dupe(u8, p.cwd_abs);
+        errdefer if (!committed) a.free(cwd_owned);
+        const home_owned = try a.dupe(u8, p.home_dir);
+        errdefer if (!committed) a.free(home_owned);
+        const adirs_owned = try a.alloc([]u8, p.additional_dirs.len);
+        errdefer if (!committed) a.free(adirs_owned);
+        var nad: usize = 0;
+        errdefer if (!committed) for (adirs_owned[0..nad]) |d| a.free(d);
+        for (p.additional_dirs, 0..) |d, di| {
+            adirs_owned[di] = try a.dupe(u8, d);
+            nad = di + 1;
+        }
 
         input.* = .{
             .allocator = a,
@@ -453,6 +484,10 @@ pub const AgentJobRegistry = struct {
             .host_services = p.host_services,
             .kg = p.kg,
             .kg_projects_dir = p.kg_projects_dir,
+            .sandbox = p.sandbox, // task#12:borrow(App-lifetime)
+            .cwd_abs = cwd_owned,
+            .home_dir = home_owned,
+            .additional_dirs = adirs_owned,
             .owned = owned,
             .prebuilt_conversation = p.prebuilt_conversation, // move(Ctrl+B 转后台);普通 subagent=null
             .registry = self,
@@ -872,6 +907,11 @@ fn jobThreadMain(input: *JobInput) void {
         .agent_jobs = input.registry, // 允许嵌套后台
         .kg = input.kg,
         .kg_projects_dir = input.kg_projects_dir,
+        // task#12:后台 subagent 继承父 sandbox(否则 Bash 绕过用户 sandbox 配置)。
+        .sandbox = input.sandbox,
+        .cwd_abs = input.cwd_abs,
+        .home_dir = input.home_dir,
+        .additional_dirs = input.additional_dirs,
         // Ctrl+B 转后台:move 预建对话给 spawnAgentSink(它 defer deinit)。**move 后立即置 null**:
         // 单一所有者不变式——此后只有 opts/spawnAgentSink 持有,input.cleanup 不再 deinit(防 double-free)。
         .prebuilt_conversation = input.prebuilt_conversation,

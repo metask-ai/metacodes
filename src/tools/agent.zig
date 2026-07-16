@@ -207,6 +207,11 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             // (真模型 e2e 实锤:同步路径修了、后台路径漏了——两条 SpawnOptions 构造)。
             .kg = ctx.kg,
             .kg_projects_dir = ctx.kg_projects_dir,
+            // task#12(Linus review):后台 subagent 也透传父 sandbox(此前只同步路径修了,后台漏了)。
+            .sandbox = ctx.sandbox,
+            .cwd_abs = ctx.cwd_abs,
+            .home_dir = ctx.home_dir,
+            .additional_dirs = ctx.additional_dirs,
         });
         // U6 A2:父 session 广播"后台 agent 起了"(spawned)。后台 done 在 job 线程晚发,
         // 不在此站点(存量债 task#18:cross-thread done → 走 snapshotJobs 轮询或 web journal)。

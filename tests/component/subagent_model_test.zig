@@ -295,3 +295,66 @@ test "L2 #12: 父 sandbox 透传到 subagent(ctx.sandbox 到达子 agent 工具)
     // 修复后:.enabled。toggle-verify:去掉 subagent.zig/agent.zig 的 sandbox 透传 → .none → 失败。
     try std.testing.expectEqual(@as(@TypeOf(g_sbx_probe), .enabled), g_sbx_probe);
 }
+
+test "L2 #12(Linus review): 后台 subagent 也继承父 sandbox(run_in_background 路径)" {
+    const a = std.testing.allocator;
+    g_sbx_probe = .unset;
+
+    const bodies = [_][]const u8{ PROBE_TOOLUSE_SSE, MINIMAL_END_TURN_SSE };
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    var agents = cc.agents_set.AgentSet.init(a);
+    defer agents.deinit();
+    try agents.loadFromStandardPaths("");
+
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var probe_reg = cc.tools_dynamic.DynRegistry.init(a);
+    defer probe_reg.deinit();
+    try probe_reg.register("SbxProbe", "records ctx.sandbox", &.{}, sbxProbe, null, false);
+
+    var sbx = cc.sandbox_config.SandboxSettings{ .enabled = true, .allocator = a };
+    defer sbx.deinit();
+
+    // 后台 job registry(job 用 owned_prov 连 mock url)。
+    var jobs = try cc.agent_job_registry.AgentJobRegistry.init(a, "k", url, "claude-sonnet-4-20250514", .anthropic);
+    defer jobs.deinit(); // abort+join 所有 job
+
+    const ctx = cc.tool_context.ToolContext{
+        .allocator = a,
+        .api_client = &client,
+        .tool_defs = &.{},
+        .permission_ctx = @constCast(&perm),
+        .agents = &agents,
+        .dyn_registry = &probe_reg,
+        .agent_jobs = &jobs,
+        .sandbox = &sbx, // 父 sandbox（enabled）
+        .cwd_abs = "/tmp",
+        .parent_model = "claude-sonnet-4-20250514",
+    };
+
+    const out = cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"general-purpose\",\"prompt\":\"probe\",\"run_in_background\":true}") catch |e| {
+        std.debug.print("bg execute failed: {s}\n", .{@errorName(e)});
+        return error.SkipZigTest;
+    };
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "agent_job_id") != null);
+
+    // 等后台 job 跑完(调 SbxProbe)。≤3s。
+    var waited: u32 = 0;
+    while (waited < 3000) : (waited += 20) {
+        if (g_sbx_probe != .unset) break;
+        var ts = std.c.timespec{ .sec = 0, .nsec = 20 * 1_000_000 };
+        var rem: std.c.timespec = undefined;
+        _ = std.c.nanosleep(&ts, &rem);
+    }
+    // 修前:后台 SpawnOptions 不透传 sandbox → 后台工具 ctx.sandbox==null(.none)。修后:.enabled。
+    try std.testing.expectEqual(@as(@TypeOf(g_sbx_probe), .enabled), g_sbx_probe);
+}
