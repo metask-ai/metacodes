@@ -12,6 +12,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
 const pfs = @import("platform").fs;
+const sync = @import("platform").sync;
 
 const RG_NAME = if (is_windows) "rg.exe" else "rg";
 
@@ -29,13 +30,25 @@ const FALLBACK_PATHS = if (is_windows) [_][:0]const u8{
     "/usr/share/kiro/resources/app/node_modules/@vscode/ripgrep/bin/rg",
 };
 
-// 缓存:rg 路径进程内不变。PATH 搜索命中的路径存这里(静态生命周期)。并发 Grep 用 atomic 守卫。
+// 缓存:rg 路径进程内不变。PATH 搜索命中的路径存这里(静态生命周期)。
+// **task#24 并发修**:cache_done atomic 只护"已缓存"读——首次 init 时多线程(并发后台 subagent
+// 的 Glob)会同时进 resolve()→searchPath(),并发写**共享静态 path_buf** → 互相踩,返回的
+// path_buf[0..need :0] sentinel 位是别的线程的字符 → sentinel mismatch 崩(test:new 后台 Glob 实证)。
+// 修:init_mutex 双检锁串行首次 resolve;缓存后走无锁快路径(cache_done),path_buf 首次后不再写。
 var cache_done = std.atomic.Value(bool).init(false);
 var cached_path: [:0]const u8 = "";
 var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+var init_mutex: sync.Mutex = .{};
 
 /// 返回一个可执行的 rg 路径。优先 RG_BIN，其次 PATH，其次 fallback。返回值静态生命周期。
 pub fn ripgrepPath() error{RipgrepNotFound}![:0]const u8 {
+    if (cache_done.load(.acquire)) {
+        if (cached_path.len == 0) return error.RipgrepNotFound;
+        return cached_path;
+    }
+    // 首次 init:串行(双检)——否则并发 searchPath 踩共享 path_buf。
+    _ = init_mutex.lock();
+    defer _ = init_mutex.unlock();
     if (cache_done.load(.acquire)) {
         if (cached_path.len == 0) return error.RipgrepNotFound;
         return cached_path;
