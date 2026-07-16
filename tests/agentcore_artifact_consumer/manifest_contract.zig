@@ -1,5 +1,10 @@
 const std = @import("std");
 
+pub const FileEntry = struct {
+    path: []const u8,
+    sha256: []const u8,
+};
+
 pub const Manifest = struct {
     schema_version: u32,
     name: []const u8,
@@ -14,7 +19,7 @@ pub const Manifest = struct {
         resolved_target: []const u8,
         architecture: []const u8,
         os: []const u8,
-        macos_deployment_target: []const u8,
+        abi: []const u8,
         optimize: []const u8,
         strip: bool,
     },
@@ -23,17 +28,14 @@ pub const Manifest = struct {
         required_system_link_inputs: []const []const u8,
         ui_request_mode: []const u8,
     },
-    files: struct {
-        @"lib/libmetacodes_agentcore.a": struct { sha256: []const u8 },
-        @"include/metacodes_agentcore.h": struct { sha256: []const u8 },
-        @"sdk/metacodes_agentcore.zig": struct { sha256: []const u8 },
-        @"sdk/metacodes_agentcore_protocol.zig": struct { sha256: []const u8 },
-        @"sdk/metacodes_agentcore_types.zig": struct { sha256: []const u8 },
-    },
+    files: []const FileEntry,
 };
 
 pub const Expected = struct {
     resolved_target: []const u8,
+    architecture: []const u8,
+    os: []const u8,
+    abi: []const u8,
     optimize: []const u8,
     strip: bool,
     zig_version: []const u8,
@@ -54,11 +56,15 @@ pub const Error = error{
     ExpectedCommitRequired,
     ZigVersionMismatch,
     TargetMismatch,
+    ArchitectureMismatch,
+    OsMismatch,
+    TargetAbiMismatch,
     OptimizeMismatch,
     StripMismatch,
     AbiMismatch,
     UiModeMismatch,
     LinkInputsMismatch,
+    InvalidSha256,
     UnexpectedFile,
     DuplicateFile,
     MissingFile,
@@ -68,15 +74,13 @@ pub const Error = error{
     UnexpectedEntryKind,
 };
 
-pub const manifest_files = [_][]const u8{
-    "lib/libmetacodes_agentcore.a",
+pub const fixed_artifact_files = [_][]const u8{
     "include/metacodes_agentcore.h",
     "sdk/metacodes_agentcore.zig",
     "sdk/metacodes_agentcore_protocol.zig",
     "sdk/metacodes_agentcore_types.zig",
 };
 
-pub const bundle_files = manifest_files ++ [_][]const u8{"manifest.json"};
 pub const bundle_directories = [_][]const u8{ "include", "lib", "sdk" };
 
 pub fn validateManifest(manifest: Manifest, expected: Expected) Error!void {
@@ -91,11 +95,10 @@ pub fn validateManifest(manifest: Manifest, expected: Expected) Error!void {
     try validateVersion(manifest);
     if (expected.require_clean and manifest.source.dirty) return error.DirtyBundle;
     if (!std.mem.eql(u8, manifest.toolchain.zig_version, expected.zig_version)) return error.ZigVersionMismatch;
-    if (!std.mem.eql(u8, manifest.build.resolved_target, expected.resolved_target) or
-        !std.mem.eql(u8, manifest.build.architecture, "aarch64") or
-        !std.mem.eql(u8, manifest.build.os, "macos") or
-        !std.mem.eql(u8, manifest.build.macos_deployment_target, "13.0"))
-        return error.TargetMismatch;
+    if (!std.mem.eql(u8, manifest.build.resolved_target, expected.resolved_target)) return error.TargetMismatch;
+    if (!std.mem.eql(u8, manifest.build.architecture, expected.architecture)) return error.ArchitectureMismatch;
+    if (!std.mem.eql(u8, manifest.build.os, expected.os)) return error.OsMismatch;
+    if (!std.mem.eql(u8, manifest.build.abi, expected.abi)) return error.TargetAbiMismatch;
     if (!std.mem.eql(u8, manifest.build.optimize, expected.optimize)) return error.OptimizeMismatch;
     if (manifest.build.strip != expected.strip) return error.StripMismatch;
     if (manifest.contract.binary_abi_version != 1) return error.AbiMismatch;
@@ -129,31 +132,35 @@ fn isLowerHex(bytes: []const u8) bool {
     return true;
 }
 
-pub fn validateManifestFiles(paths: []const []const u8) Error!void {
-    return validateExactFiles(paths, &manifest_files);
-}
-
-fn validateExactFiles(paths: []const []const u8, comptime expected: []const []const u8) Error!void {
-    var seen = [_]bool{false} ** expected.len;
-    for (paths) |path| {
-        const index = find(expected, path) orelse return error.UnexpectedFile;
+pub fn validateManifestFiles(files: []const FileEntry, library_path: []const u8) Error!void {
+    var seen = [_]bool{false} ** (fixed_artifact_files.len + 1);
+    for (files) |file| {
+        const index = artifactFileIndex(file.path, library_path) orelse return error.UnexpectedFile;
         if (seen[index]) return error.DuplicateFile;
+        if (file.sha256.len != 64 or !isLowerHex(file.sha256)) return error.InvalidSha256;
         seen[index] = true;
     }
     for (seen) |present| if (!present) return error.MissingFile;
 }
 
-pub fn validateBundleEntries(entries: []const BundleEntry) Error!void {
-    var seen_files = [_]bool{false} ** bundle_files.len;
+pub fn fileSha256(files: []const FileEntry, path: []const u8) ?[]const u8 {
+    for (files) |file| {
+        if (std.mem.eql(u8, file.path, path)) return file.sha256;
+    }
+    return null;
+}
+
+pub fn validateBundleEntries(entries: []const BundleEntry, library_path: []const u8) Error!void {
+    var seen_files = [_]bool{false} ** (fixed_artifact_files.len + 2);
     var seen_directories = [_]bool{false} ** bundle_directories.len;
     for (entries) |entry| switch (entry.kind) {
         .file => {
-            const index = find(&bundle_files, entry.path) orelse return error.UnexpectedFile;
+            const index = bundleFileIndex(entry.path, library_path) orelse return error.UnexpectedFile;
             if (seen_files[index]) return error.DuplicateFile;
             seen_files[index] = true;
         },
         .directory => {
-            const index = find(&bundle_directories, entry.path) orelse return error.UnexpectedDirectory;
+            const index = findFixed(&bundle_directories, entry.path) orelse return error.UnexpectedDirectory;
             if (seen_directories[index]) return error.DuplicateDirectory;
             seen_directories[index] = true;
         },
@@ -163,15 +170,35 @@ pub fn validateBundleEntries(entries: []const BundleEntry) Error!void {
     for (seen_directories) |present| if (!present) return error.MissingDirectory;
 }
 
-fn find(comptime expected: []const []const u8, actual: []const u8) ?usize {
+fn artifactFileIndex(path: []const u8, library_path: []const u8) ?usize {
+    if (std.mem.eql(u8, path, library_path)) return 0;
+    const index = findFixed(&fixed_artifact_files, path) orelse return null;
+    return index + 1;
+}
+
+fn bundleFileIndex(path: []const u8, library_path: []const u8) ?usize {
+    if (std.mem.eql(u8, path, "manifest.json")) return fixed_artifact_files.len + 1;
+    return artifactFileIndex(path, library_path);
+}
+
+fn findFixed(comptime expected: []const []const u8, actual: []const u8) ?usize {
     inline for (expected, 0..) |candidate, index| {
         if (std.mem.eql(u8, candidate, actual)) return index;
     }
     return null;
 }
 
+const hash = "0000000000000000000000000000000000000000000000000000000000000000";
+const macos_library_path = "lib/libmetacodes_agentcore.a";
+const valid_files = [_]FileEntry{
+    .{ .path = macos_library_path, .sha256 = hash },
+    .{ .path = fixed_artifact_files[0], .sha256 = hash },
+    .{ .path = fixed_artifact_files[1], .sha256 = hash },
+    .{ .path = fixed_artifact_files[2], .sha256 = hash },
+    .{ .path = fixed_artifact_files[3], .sha256 = hash },
+};
+
 fn validManifest() Manifest {
-    const hash = "0000000000000000000000000000000000000000000000000000000000000000";
     return .{
         .schema_version = 1,
         .name = "metacodes-agentcore",
@@ -186,7 +213,7 @@ fn validManifest() Manifest {
             .resolved_target = "aarch64-macos.13.0...15.6-none",
             .architecture = "aarch64",
             .os = "macos",
-            .macos_deployment_target = "13.0",
+            .abi = "none",
             .optimize = "ReleaseSafe",
             .strip = true,
         },
@@ -195,18 +222,15 @@ fn validManifest() Manifest {
             .required_system_link_inputs = &.{"libc"},
             .ui_request_mode = "synchronous",
         },
-        .files = .{
-            .@"lib/libmetacodes_agentcore.a" = .{ .sha256 = hash },
-            .@"include/metacodes_agentcore.h" = .{ .sha256 = hash },
-            .@"sdk/metacodes_agentcore.zig" = .{ .sha256 = hash },
-            .@"sdk/metacodes_agentcore_protocol.zig" = .{ .sha256 = hash },
-            .@"sdk/metacodes_agentcore_types.zig" = .{ .sha256 = hash },
-        },
+        .files = &valid_files,
     };
 }
 
 const valid_expected = Expected{
     .resolved_target = "aarch64-macos.13.0...15.6-none",
+    .architecture = "aarch64",
+    .os = "macos",
+    .abi = "none",
     .optimize = "ReleaseSafe",
     .strip = true,
     .zig_version = "0.16.0",
@@ -221,23 +245,31 @@ test "manifest identity accepts valid clean and dirty development bundles" {
     try validateManifest(dirty, valid_expected);
 }
 
+test "manifest accepts target-neutral Linux build metadata" {
+    var manifest = validManifest();
+    manifest.build.resolved_target = "x86_64-linux.6.5...6.5-gnu.2.36";
+    manifest.build.architecture = "x86_64";
+    manifest.build.os = "linux";
+    manifest.build.abi = "gnu";
+    var expected = valid_expected;
+    expected.resolved_target = manifest.build.resolved_target;
+    expected.architecture = manifest.build.architecture;
+    expected.os = manifest.build.os;
+    expected.abi = manifest.build.abi;
+    try validateManifest(manifest, expected);
+}
+
 test "release identity rejects dirty and wrong-commit bundles" {
     var dirty = validManifest();
     dirty.source.dirty = true;
     dirty.source.dirty_source_sha256 = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
     dirty.version = "0.0.0-dev+0123456789ab-dirty.abcdefabcdef";
-    const clean_expected = Expected{
-        .resolved_target = valid_expected.resolved_target,
-        .optimize = valid_expected.optimize,
-        .strip = valid_expected.strip,
-        .zig_version = valid_expected.zig_version,
-        .require_clean = true,
-        .commit = "0123456789abcdef0123456789abcdef01234567",
-    };
+    var clean_expected = valid_expected;
+    clean_expected.require_clean = true;
+    clean_expected.commit = "0123456789abcdef0123456789abcdef01234567";
     try std.testing.expectError(error.DirtyBundle, validateManifest(dirty, clean_expected));
-    var wrong_commit = clean_expected;
-    wrong_commit.commit = "ffffffffffffffffffffffffffffffffffffffff";
-    try std.testing.expectError(error.CommitMismatch, validateManifest(validManifest(), wrong_commit));
+    clean_expected.commit = "ffffffffffffffffffffffffffffffffffffffff";
+    try std.testing.expectError(error.CommitMismatch, validateManifest(validManifest(), clean_expected));
 }
 
 test "manifest contract rejects toolchain target optimize and ABI drift" {
@@ -247,6 +279,15 @@ test "manifest contract rejects toolchain target optimize and ABI drift" {
     manifest = validManifest();
     manifest.build.resolved_target = "x86_64-macos.13.0...15.6-none";
     try std.testing.expectError(error.TargetMismatch, validateManifest(manifest, valid_expected));
+    manifest = validManifest();
+    manifest.build.architecture = "x86_64";
+    try std.testing.expectError(error.ArchitectureMismatch, validateManifest(manifest, valid_expected));
+    manifest = validManifest();
+    manifest.build.os = "linux";
+    try std.testing.expectError(error.OsMismatch, validateManifest(manifest, valid_expected));
+    manifest = validManifest();
+    manifest.build.abi = "gnu";
+    try std.testing.expectError(error.TargetAbiMismatch, validateManifest(manifest, valid_expected));
     manifest = validManifest();
     manifest.build.optimize = "Debug";
     try std.testing.expectError(error.OptimizeMismatch, validateManifest(manifest, valid_expected));
@@ -258,32 +299,46 @@ test "manifest contract rejects toolchain target optimize and ABI drift" {
     try std.testing.expectError(error.AbiMismatch, validateManifest(manifest, valid_expected));
 }
 
-test "manifest file set rejects extra and missing entries" {
-    try validateManifestFiles(&manifest_files);
-    try std.testing.expectError(error.MissingFile, validateManifestFiles(manifest_files[0 .. manifest_files.len - 1]));
-    const extra = manifest_files ++ [_][]const u8{"sdk/unlisted.zig"};
-    try std.testing.expectError(error.UnexpectedFile, validateManifestFiles(&extra));
+test "manifest file set validates dynamic library name hashes and exact entries" {
+    try validateManifestFiles(&valid_files, macos_library_path);
+    var windows_files = valid_files;
+    windows_files[0].path = "lib/metacodes_agentcore.lib";
+    try validateManifestFiles(&windows_files, windows_files[0].path);
+    try std.testing.expectEqualStrings(hash, fileSha256(&valid_files, macos_library_path).?);
+    try std.testing.expect(fileSha256(&valid_files, "lib/missing.lib") == null);
+    try std.testing.expectError(error.MissingFile, validateManifestFiles(valid_files[0 .. valid_files.len - 1], macos_library_path));
+    const extra = valid_files ++ [_]FileEntry{.{ .path = "sdk/unlisted.zig", .sha256 = hash }};
+    try std.testing.expectError(error.UnexpectedFile, validateManifestFiles(&extra, macos_library_path));
+    var duplicate = valid_files;
+    duplicate[4] = duplicate[0];
+    try std.testing.expectError(error.DuplicateFile, validateManifestFiles(&duplicate, macos_library_path));
+    var invalid_hash = valid_files;
+    invalid_hash[0].sha256 = "ABCDEF";
+    try std.testing.expectError(error.InvalidSha256, validateManifestFiles(&invalid_hash, macos_library_path));
 }
 
-test "bundle entry set rejects extra files directories and entry kinds" {
+test "bundle entry set validates a dynamic library name and exact tree" {
     const valid = [_]BundleEntry{
         .{ .path = "include", .kind = .directory },
         .{ .path = "lib", .kind = .directory },
         .{ .path = "sdk", .kind = .directory },
-        .{ .path = bundle_files[0], .kind = .file },
-        .{ .path = bundle_files[1], .kind = .file },
-        .{ .path = bundle_files[2], .kind = .file },
-        .{ .path = bundle_files[3], .kind = .file },
-        .{ .path = bundle_files[4], .kind = .file },
-        .{ .path = bundle_files[5], .kind = .file },
+        .{ .path = macos_library_path, .kind = .file },
+        .{ .path = fixed_artifact_files[0], .kind = .file },
+        .{ .path = fixed_artifact_files[1], .kind = .file },
+        .{ .path = fixed_artifact_files[2], .kind = .file },
+        .{ .path = fixed_artifact_files[3], .kind = .file },
+        .{ .path = "manifest.json", .kind = .file },
     };
-    try validateBundleEntries(&valid);
-    try std.testing.expectError(error.MissingFile, validateBundleEntries(valid[0 .. valid.len - 1]));
-    var extra_file = valid ++ [_]BundleEntry{.{ .path = "sdk/unlisted.zig", .kind = .file }};
-    try std.testing.expectError(error.UnexpectedFile, validateBundleEntries(&extra_file));
-    var extra_directory = valid ++ [_]BundleEntry{.{ .path = "stale", .kind = .directory }};
-    try std.testing.expectError(error.UnexpectedDirectory, validateBundleEntries(&extra_directory));
+    try validateBundleEntries(&valid, macos_library_path);
+    var windows = valid;
+    windows[3].path = "lib/metacodes_agentcore.lib";
+    try validateBundleEntries(&windows, windows[3].path);
+    try std.testing.expectError(error.MissingFile, validateBundleEntries(valid[0 .. valid.len - 1], macos_library_path));
+    const extra_file = valid ++ [_]BundleEntry{.{ .path = "sdk/unlisted.zig", .kind = .file }};
+    try std.testing.expectError(error.UnexpectedFile, validateBundleEntries(&extra_file, macos_library_path));
+    const extra_directory = valid ++ [_]BundleEntry{.{ .path = "stale", .kind = .directory }};
+    try std.testing.expectError(error.UnexpectedDirectory, validateBundleEntries(&extra_directory, macos_library_path));
     var symlink = valid;
     symlink[3].kind = .other;
-    try std.testing.expectError(error.UnexpectedEntryKind, validateBundleEntries(&symlink));
+    try std.testing.expectError(error.UnexpectedEntryKind, validateBundleEntries(&symlink, macos_library_path));
 }

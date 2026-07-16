@@ -5,24 +5,25 @@ export LANG=C
 
 prefix=$1
 resolved_target=$2
-optimize=$3
-strip=$4
-zig_exe=$5
-target_was_explicit=$6
+architecture=$3
+os=$4
+abi=$5
+optimize=$6
+strip=$7
+zig_exe=$8
+target_was_explicit=$9
+library_file=${10}
 
 if [ "$target_was_explicit" != true ]; then
-    echo "AgentCore release bundle requires explicit -Dtarget=aarch64-macos.13.0" >&2
+    echo "AgentCore release bundle requires explicit -Dtarget=<triple>" >&2
     exit 1
 fi
-case "$resolved_target" in
-    aarch64-macos.13.0*) ;;
-    *)
-        echo "AgentCore v1 bundle target must be aarch64-macos.13.0 (resolved: $resolved_target)" >&2
-        exit 1
-        ;;
-esac
+if [ -z "$resolved_target" ] || [ -z "$architecture" ] || [ -z "$os" ] || [ -z "$abi" ] || [ -z "$library_file" ]; then
+    echo "AgentCore manifest requires non-empty target metadata and library filename" >&2
+    exit 1
+fi
 
-lib="$prefix/lib/libmetacodes_agentcore.a"
+lib="$prefix/lib/$library_file"
 header="$prefix/include/metacodes_agentcore.h"
 sdk="$prefix/sdk/metacodes_agentcore.zig"
 protocol="$prefix/sdk/metacodes_agentcore_protocol.zig"
@@ -104,9 +105,9 @@ cat > "$manifest_tmp" <<EOF
   "toolchain": {"zig_version": "$zig_version"},
   "build": {
     "resolved_target": "$resolved_target",
-    "architecture": "aarch64",
-    "os": "macos",
-    "macos_deployment_target": "13.0",
+    "architecture": "$architecture",
+    "os": "$os",
+    "abi": "$abi",
     "optimize": "$optimize",
     "strip": $strip
   },
@@ -115,13 +116,13 @@ cat > "$manifest_tmp" <<EOF
     "required_system_link_inputs": ["libc"],
     "ui_request_mode": "synchronous"
   },
-  "files": {
-    "lib/libmetacodes_agentcore.a": {"sha256": "$(sha "$lib")"},
-    "include/metacodes_agentcore.h": {"sha256": "$(sha "$header")"},
-    "sdk/metacodes_agentcore.zig": {"sha256": "$(sha "$sdk")"},
-    "sdk/metacodes_agentcore_protocol.zig": {"sha256": "$(sha "$protocol")"},
-    "sdk/metacodes_agentcore_types.zig": {"sha256": "$(sha "$types")"}
-  }
+  "files": [
+    {"path": "lib/$library_file", "sha256": "$(sha "$lib")"},
+    {"path": "include/metacodes_agentcore.h", "sha256": "$(sha "$header")"},
+    {"path": "sdk/metacodes_agentcore.zig", "sha256": "$(sha "$sdk")"},
+    {"path": "sdk/metacodes_agentcore_protocol.zig", "sha256": "$(sha "$protocol")"},
+    {"path": "sdk/metacodes_agentcore_types.zig", "sha256": "$(sha "$types")"}
+  ]
 }
 EOF
 mv "$manifest_tmp" "$manifest"

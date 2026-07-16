@@ -13,22 +13,7 @@ fn verifySha256(b: *std.Build, path: []const u8, expected: []const u8) void {
     if (!std.mem.eql(u8, &actual, expected)) @panic("AgentCore bundle SHA-256 mismatch");
 }
 
-fn verifyManifestFileSet(b: *std.Build, manifest_bytes: []const u8) void {
-    const parsed = std.json.parseFromSlice(std.json.Value, b.allocator, manifest_bytes, .{
-        .duplicate_field_behavior = .@"error",
-    }) catch @panic("invalid AgentCore manifest JSON");
-    defer parsed.deinit();
-    if (parsed.value != .object) @panic("AgentCore manifest root must be an object");
-    const files = parsed.value.object.get("files") orelse @panic("AgentCore manifest files object is required");
-    if (files != .object) @panic("AgentCore manifest files must be an object");
-    var paths = std.ArrayList([]const u8).empty;
-    var iterator = files.object.iterator();
-    while (iterator.next()) |entry| paths.append(b.allocator, entry.key_ptr.*) catch @panic("OOM");
-    manifest_contract.validateManifestFiles(paths.items) catch |err|
-        std.debug.panic("invalid AgentCore manifest file set: {s}", .{@errorName(err)});
-}
-
-fn verifyBundleEntries(b: *std.Build, bundle_root: []const u8) void {
+fn verifyBundleEntries(b: *std.Build, bundle_root: []const u8, library_path: []const u8) void {
     var dir = std.Io.Dir.cwd().openDir(b.graph.io, bundle_root, .{ .iterate = true }) catch
         @panic("cannot open AgentCore bundle root");
     defer dir.close(b.graph.io);
@@ -44,7 +29,7 @@ fn verifyBundleEntries(b: *std.Build, bundle_root: []const u8) void {
         const path = b.allocator.dupe(u8, entry.path) catch @panic("OOM");
         entries.append(b.allocator, .{ .path = path, .kind = kind }) catch @panic("OOM");
     }
-    manifest_contract.validateBundleEntries(entries.items) catch |err|
+    manifest_contract.validateBundleEntries(entries.items, library_path) catch |err|
         std.debug.panic("invalid AgentCore bundle entry set: {s}", .{@errorName(err)});
 }
 
@@ -53,11 +38,14 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const bundle_root = b.option([]const u8, "bundle-root", "Installed AgentCore bundle root") orelse
         @panic("-Dbundle-root is required");
+    const library_file = b.option([]const u8, "library-file", "Target AgentCore static library filename") orelse
+        @panic("-Dlibrary-file is required");
     const require_clean = b.option(bool, "require-clean-bundle", "Require a clean bundle with the expected commit") orelse false;
     const expected_commit = b.option([]const u8, "expected-commit", "Expected full metacodes commit for a clean bundle");
     const expected_strip = b.option(bool, "expected-strip", "Expected AgentCore strip setting") orelse
         @panic("-Dexpected-strip is required");
-    const lib_path = b.pathJoin(&.{ bundle_root, "lib", "libmetacodes_agentcore.a" });
+    const library_rel_path = b.fmt("lib/{s}", .{library_file});
+    const lib_path = b.pathJoin(&.{ bundle_root, "lib", library_file });
     const header_path = b.pathJoin(&.{ bundle_root, "include", "metacodes_agentcore.h" });
     const sdk_path = b.pathJoin(&.{ bundle_root, "sdk", "metacodes_agentcore.zig" });
     const protocol_path = b.pathJoin(&.{ bundle_root, "sdk", "metacodes_agentcore_protocol.zig" });
@@ -74,20 +62,24 @@ pub fn build(b: *std.Build) void {
     const resolved_target = target.result.zigTriple(b.allocator) catch @panic("OOM");
     manifest_contract.validateManifest(manifest.value, .{
         .resolved_target = resolved_target,
+        .architecture = @tagName(target.result.cpu.arch),
+        .os = @tagName(target.result.os.tag),
+        .abi = @tagName(target.result.abi),
         .optimize = @tagName(optimize),
         .strip = expected_strip,
         .zig_version = builtin.zig_version_string,
         .require_clean = require_clean,
         .commit = expected_commit,
     }) catch |err| std.debug.panic("invalid AgentCore manifest identity: {s}", .{@errorName(err)});
-    verifyManifestFileSet(b, manifest_bytes);
-    verifyBundleEntries(b, bundle_root);
+    manifest_contract.validateManifestFiles(manifest.value.files, library_rel_path) catch |err|
+        std.debug.panic("invalid AgentCore manifest file set: {s}", .{@errorName(err)});
+    verifyBundleEntries(b, bundle_root, library_rel_path);
 
-    verifySha256(b, lib_path, manifest.value.files.@"lib/libmetacodes_agentcore.a".sha256);
-    verifySha256(b, header_path, manifest.value.files.@"include/metacodes_agentcore.h".sha256);
-    verifySha256(b, sdk_path, manifest.value.files.@"sdk/metacodes_agentcore.zig".sha256);
-    verifySha256(b, protocol_path, manifest.value.files.@"sdk/metacodes_agentcore_protocol.zig".sha256);
-    verifySha256(b, types_path, manifest.value.files.@"sdk/metacodes_agentcore_types.zig".sha256);
+    verifySha256(b, lib_path, manifest_contract.fileSha256(manifest.value.files, library_rel_path).?);
+    verifySha256(b, header_path, manifest_contract.fileSha256(manifest.value.files, "include/metacodes_agentcore.h").?);
+    verifySha256(b, sdk_path, manifest_contract.fileSha256(manifest.value.files, "sdk/metacodes_agentcore.zig").?);
+    verifySha256(b, protocol_path, manifest_contract.fileSha256(manifest.value.files, "sdk/metacodes_agentcore_protocol.zig").?);
+    verifySha256(b, types_path, manifest_contract.fileSha256(manifest.value.files, "sdk/metacodes_agentcore_types.zig").?);
     const link_libc = true;
 
     const types = b.createModule(.{ .root_source_file = .{ .cwd_relative = types_path }, .target = target, .optimize = optimize });
@@ -95,6 +87,27 @@ pub fn build(b: *std.Build) void {
     const sdk = b.createModule(.{ .root_source_file = .{ .cwd_relative = sdk_path }, .target = target, .optimize = optimize });
     sdk.addImport("metacodes_agentcore_types", types);
     sdk.addImport("metacodes_agentcore_protocol", protocol);
+
+    const zig_link_probe = b.createModule(.{
+        .root_source_file = b.path("link_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    });
+    zig_link_probe.addImport("metacodes_agentcore", sdk);
+    zig_link_probe.addObjectFile(.{ .cwd_relative = lib_path });
+    const zig_link_exe = b.addExecutable(.{ .name = "agentcore-artifact-zig-link-probe", .root_module = zig_link_probe });
+
+    const c_link_probe = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    });
+    c_link_probe.addCSourceFile(.{ .file = b.path("link_probe.c"), .flags = &.{"-std=c11"} });
+    c_link_probe.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ bundle_root, "include" }) });
+    c_link_probe.addObjectFile(.{ .cwd_relative = lib_path });
+    const c_link_exe = b.addExecutable(.{ .name = "agentcore-artifact-c-link-probe", .root_module = c_link_probe });
+
     const app = b.createModule(.{
         .root_source_file = b.path("main.zig"),
         .target = target,
@@ -116,6 +129,10 @@ pub fn build(b: *std.Build) void {
     c_app.addObjectFile(.{ .cwd_relative = lib_path });
     const c_exe = b.addExecutable(.{ .name = "agentcore-artifact-c-consumer", .root_module = c_app });
     const c_run = b.addRunArtifact(c_exe);
+
+    const link_step = b.step("link", "Link source-free Zig and C consumers without running them");
+    link_step.dependOn(&zig_link_exe.step);
+    link_step.dependOn(&c_link_exe.step);
 
     const test_step = b.step("test", "Link and run using only the installed AgentCore bundle");
     test_step.dependOn(&run.step);

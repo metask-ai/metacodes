@@ -229,6 +229,10 @@ pub fn build(b: *std.Build) void {
     const install_agentcore_types = b.addInstallFileWithDir(b.path("sdk/metacodes_agentcore_types.zig"), .prefix, "sdk/metacodes_agentcore_types.zig");
     const agentcore_install_root = b.getInstallPath(.prefix, "");
     const resolved_agentcore_target = target.result.zigTriple(b.allocator) catch @panic("OOM");
+    const agentcore_architecture = @tagName(target.result.cpu.arch);
+    const agentcore_os = @tagName(target.result.os.tag);
+    const agentcore_abi = @tagName(target.result.abi);
+    const agentcore_library_file = agentcore_lib.out_filename;
     const validate_agentcore_target = b.addSystemCommand(&.{ "sh", "scripts/validate_agentcore_target.sh" });
     validate_agentcore_target.addArgs(&.{ if (target_was_explicit) "true" else "false", resolved_agentcore_target });
     validate_agentcore_target.setCwd(b.path("."));
@@ -241,10 +245,14 @@ pub fn build(b: *std.Build) void {
     manifest_cmd.addArgs(&.{
         agentcore_install_root,
         resolved_agentcore_target,
+        agentcore_architecture,
+        agentcore_os,
+        agentcore_abi,
         @tagName(optimize),
         if (agentcore_strip) "true" else "false",
         b.graph.zig_exe,
         if (target_was_explicit) "true" else "false",
+        agentcore_library_file,
     });
     manifest_cmd.setCwd(b.path("."));
     manifest_cmd.step.dependOn(&install_agentcore_lib.step);
@@ -252,8 +260,23 @@ pub fn build(b: *std.Build) void {
     manifest_cmd.step.dependOn(&install_agentcore_sdk.step);
     manifest_cmd.step.dependOn(&install_agentcore_protocol.step);
     manifest_cmd.step.dependOn(&install_agentcore_types.step);
-    const agentcore_bundle_step = b.step("agentcore:bundle", "Build the macOS arm64 AgentCore static bundle");
-    agentcore_bundle_step.dependOn(&manifest_cmd.step);
+    const consumer_link_cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
+    consumer_link_cmd.addArgs(&.{
+        "--build-file",
+        "tests/agentcore_artifact_consumer/build.zig",
+        "link",
+        b.fmt("-Doptimize={s}", .{@tagName(optimize)}),
+        b.fmt("-Dtarget={s}", .{resolved_agentcore_target}),
+        b.fmt("-Dbundle-root={s}", .{agentcore_install_root}),
+        b.fmt("-Dlibrary-file={s}", .{agentcore_library_file}),
+        b.fmt("-Dexpected-strip={s}", .{if (agentcore_strip) "true" else "false"}),
+    });
+    if (agentcore_require_clean_bundle) consumer_link_cmd.addArg("-Drequire-clean-bundle=true");
+    if (agentcore_expected_commit) |commit| consumer_link_cmd.addArg(b.fmt("-Dexpected-commit={s}", .{commit}));
+    consumer_link_cmd.setCwd(b.path("."));
+    consumer_link_cmd.step.dependOn(&manifest_cmd.step);
+    const agentcore_bundle_step = b.step("agentcore:bundle", "Build and link-check an AgentCore static bundle for an explicit target");
+    agentcore_bundle_step.dependOn(&consumer_link_cmd.step);
 
     const consumer_cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
     consumer_cmd.addArgs(&.{
@@ -263,6 +286,7 @@ pub fn build(b: *std.Build) void {
         b.fmt("-Doptimize={s}", .{@tagName(optimize)}),
         b.fmt("-Dtarget={s}", .{resolved_agentcore_target}),
         b.fmt("-Dbundle-root={s}", .{agentcore_install_root}),
+        b.fmt("-Dlibrary-file={s}", .{agentcore_library_file}),
         b.fmt("-Dexpected-strip={s}", .{if (agentcore_strip) "true" else "false"}),
     });
     if (agentcore_require_clean_bundle) consumer_cmd.addArg("-Drequire-clean-bundle=true");

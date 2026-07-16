@@ -6,7 +6,8 @@ implementation source to their build graph, and the Host owns all UI.
 
 ## Build and verify
 
-Use the repository-pinned Zig toolchain and the fixed v1 release target:
+Use the repository-pinned Zig toolchain and an explicit target. The command
+below is the currently verified native consumer configuration:
 
 ```sh
 zig build agentcore:test
@@ -32,7 +33,7 @@ zig build agentcore:consumer --prefix /absolute/new/empty/prefix \
 
 ```text
 <prefix>/
-├── lib/libmetacodes_agentcore.a
+├── lib/<target static-library filename>
 ├── include/metacodes_agentcore.h
 ├── sdk/metacodes_agentcore.zig
 ├── sdk/metacodes_agentcore_protocol.zig
@@ -40,13 +41,23 @@ zig build agentcore:consumer --prefix /absolute/new/empty/prefix \
 └── manifest.json
 ```
 
-The manifest records source and toolchain identity, target/deployment
-baseline, optimization and strip settings, ABI version, required system link inputs, and SHA-256 for every
-shipped file. The source-free consumer validates those fields, the exact
-manifest file keys, and the complete on-disk file/directory allowlist. Release
-bundles require an explicit `aarch64-macos.13.0` target. Build a distributable
-bundle into a new empty `--prefix`; a clean Git tree does not make a reused
-output directory free of stale, unlisted files.
+The manifest records source and toolchain identity, resolved target,
+architecture, OS, target ABI, optimization and strip settings, binary ABI
+version, required system link inputs, and SHA-256 for every shipped file. The
+source-free consumer validates those fields, the exact manifest file entries,
+and the complete on-disk file/directory allowlist. Bundles require an explicit
+`-Dtarget=<triple>` so an artifact cannot silently inherit the build host. Build
+a distributable bundle into a new empty `--prefix`; a clean Git tree does not
+make a reused output directory free of stale, unlisted files.
+
+`agentcore:bundle` cross-compiles one bundle per explicit target and link-checks
+source-free Zig and C consumers without running them. The static library
+filename comes from Zig for that target (`.a` or `.lib`) and is recorded in the
+manifest. `agentcore:consumer` additionally runs the resulting programs, so a
+cross-target runtime check needs a compatible runner; native CI should run it
+on every released platform. At present only macOS arm64 has completed that
+native end-to-end verification. This is a validation status, not an ABI
+restriction.
 
 Schema version 1 is the first formal bundle layout. Earlier pre-release
 development manifests are unsupported.
@@ -139,5 +150,6 @@ Run, poison the Session, and surface as `MC_STATUS_CALLBACK_FAILED` (or
 `MC_STATUS_OUT_OF_MEMORY` when response processing exhausts memory).
 
 ABI v1 deliberately does not add session persistence/restore, asynchronous UI
-continuations, strict Workspace security, or additional platforms. Those are
-separate contracts, not hidden behavior in the library facade.
+continuations, strict Workspace security, or a multi-platform universal
+bundle. Those are separate contracts, not hidden behavior in the library
+facade.
