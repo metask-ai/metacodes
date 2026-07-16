@@ -28,6 +28,11 @@ pub fn build(b: *std.Build) void {
     const target_was_explicit = b.user_input_options.contains("target");
     const optimize = b.standardOptimizeOption(.{});
     const tfilter = b.option([]const u8, "tfilter", "test filter");
+    const agentcore_strip = b.option(bool, "agentcore-strip", "Strip AgentCore library debug information") orelse (optimize != .Debug);
+    const agentcore_require_clean_bundle = b.option(bool, "agentcore-require-clean-bundle", "Require the AgentCore consumer bundle to be clean") orelse false;
+    const agentcore_expected_commit = b.option([]const u8, "agentcore-expected-commit", "Expected full metacodes commit for the AgentCore bundle");
+    if (agentcore_require_clean_bundle and agentcore_expected_commit == null)
+        @panic("-Dagentcore-require-clean-bundle=true requires -Dagentcore-expected-commit=<full hash>");
 
     // 固定产出两个二进制：metacodes (ReleaseSmall) 和 metacodes-debug (Debug)。
     // 不受 -Doptimize 影响，一次 build 同时得到发布版和调试版。
@@ -119,29 +124,46 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const agentcore_protocol_mod = b.createModule(.{
+        .root_source_file = b.path("sdk/metacodes_agentcore_protocol.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const agentcore_sdk_mod = b.createModule(.{
         .root_source_file = b.path("sdk/metacodes_agentcore.zig"),
         .target = target,
         .optimize = optimize,
     });
     agentcore_sdk_mod.addImport("metacodes_agentcore_types", agentcore_types_mod);
+    agentcore_sdk_mod.addImport("metacodes_agentcore_protocol", agentcore_protocol_mod);
     const agentcore_abi_mod = b.createModule(.{
         .root_source_file = b.path("src/agentcore/abi_v1.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = agentcore_strip,
         .link_libc = true,
     });
     addHl(b, agentcore_abi_mod);
     agentcore_abi_mod.addImport("metacodes-core", core_mod);
     agentcore_abi_mod.addImport("metacodes_agentcore_types", agentcore_types_mod);
+    agentcore_abi_mod.addImport("metacodes_agentcore_protocol", agentcore_protocol_mod);
 
     const agentcore_test_step = b.step("agentcore:test", "Run AgentCore binary ABI v1 tests");
     const agentcore_abi_test = b.addTest(.{ .name = "agentcore-abi-unit", .root_module = agentcore_abi_mod });
     agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_abi_test).step);
     const agentcore_types_test = b.addTest(.{ .name = "agentcore-types-unit", .root_module = agentcore_types_mod });
     agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_types_test).step);
+    const agentcore_protocol_test = b.addTest(.{ .name = "agentcore-protocol-unit", .root_module = agentcore_protocol_mod });
+    agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_protocol_test).step);
     const agentcore_sdk_test = b.addTest(.{ .name = "agentcore-sdk-unit", .root_module = agentcore_sdk_mod });
     agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_sdk_test).step);
+    const agentcore_manifest_contract_mod = b.createModule(.{
+        .root_source_file = b.path("tests/agentcore_artifact_consumer/manifest_contract.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const agentcore_manifest_contract_test = b.addTest(.{ .name = "agentcore-manifest-contract", .root_module = agentcore_manifest_contract_mod });
+    agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_manifest_contract_test).step);
     const agentcore_header_test = b.addSystemCommand(&.{ "cc", "-std=c11", "-fsyntax-only", "-Isdk", "tests/agentcore_header_compile.c" });
     agentcore_header_test.setCwd(b.path("."));
     agentcore_test_step.dependOn(&agentcore_header_test.step);
@@ -159,6 +181,7 @@ pub fn build(b: *std.Build) void {
     }));
     agentcore_contract_mod.addImport("agentcore-abi", agentcore_abi_mod);
     agentcore_contract_mod.addImport("agentcore-sdk", agentcore_sdk_mod);
+    agentcore_contract_mod.addImport("metacodes-core", core_mod);
     const agentcore_contract_test = b.addTest(.{ .name = "agentcore-abi-contract", .root_module = agentcore_contract_mod });
     agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_contract_test).step);
 
@@ -170,6 +193,7 @@ pub fn build(b: *std.Build) void {
     const install_agentcore_lib = b.addInstallArtifact(agentcore_lib, .{});
     const install_agentcore_header = b.addInstallFileWithDir(b.path("sdk/metacodes_agentcore.h"), .header, "metacodes_agentcore.h");
     const install_agentcore_sdk = b.addInstallFileWithDir(b.path("sdk/metacodes_agentcore.zig"), .prefix, "sdk/metacodes_agentcore.zig");
+    const install_agentcore_protocol = b.addInstallFileWithDir(b.path("sdk/metacodes_agentcore_protocol.zig"), .prefix, "sdk/metacodes_agentcore_protocol.zig");
     const install_agentcore_types = b.addInstallFileWithDir(b.path("sdk/metacodes_agentcore_types.zig"), .prefix, "sdk/metacodes_agentcore_types.zig");
     const agentcore_install_root = b.getInstallPath(.prefix, "");
     const resolved_agentcore_target = target.result.zigTriple(b.allocator) catch @panic("OOM");
@@ -179,12 +203,14 @@ pub fn build(b: *std.Build) void {
     install_agentcore_lib.step.dependOn(&validate_agentcore_target.step);
     install_agentcore_header.step.dependOn(&validate_agentcore_target.step);
     install_agentcore_sdk.step.dependOn(&validate_agentcore_target.step);
+    install_agentcore_protocol.step.dependOn(&validate_agentcore_target.step);
     install_agentcore_types.step.dependOn(&validate_agentcore_target.step);
     const manifest_cmd = b.addSystemCommand(&.{ "sh", "scripts/write_agentcore_manifest.sh" });
     manifest_cmd.addArgs(&.{
         agentcore_install_root,
         resolved_agentcore_target,
         @tagName(optimize),
+        if (agentcore_strip) "true" else "false",
         b.graph.zig_exe,
         if (target_was_explicit) "true" else "false",
     });
@@ -192,6 +218,7 @@ pub fn build(b: *std.Build) void {
     manifest_cmd.step.dependOn(&install_agentcore_lib.step);
     manifest_cmd.step.dependOn(&install_agentcore_header.step);
     manifest_cmd.step.dependOn(&install_agentcore_sdk.step);
+    manifest_cmd.step.dependOn(&install_agentcore_protocol.step);
     manifest_cmd.step.dependOn(&install_agentcore_types.step);
     const agentcore_bundle_step = b.step("agentcore:bundle", "Build the macOS arm64 AgentCore static bundle");
     agentcore_bundle_step.dependOn(&manifest_cmd.step);
@@ -204,7 +231,10 @@ pub fn build(b: *std.Build) void {
         b.fmt("-Doptimize={s}", .{@tagName(optimize)}),
         b.fmt("-Dtarget={s}", .{resolved_agentcore_target}),
         b.fmt("-Dbundle-root={s}", .{agentcore_install_root}),
+        b.fmt("-Dexpected-strip={s}", .{if (agentcore_strip) "true" else "false"}),
     });
+    if (agentcore_require_clean_bundle) consumer_cmd.addArg("-Drequire-clean-bundle=true");
+    if (agentcore_expected_commit) |commit| consumer_cmd.addArg(b.fmt("-Dexpected-commit={s}", .{commit}));
     consumer_cmd.setCwd(b.path("."));
     consumer_cmd.step.dependOn(&manifest_cmd.step);
     const agentcore_consumer_step = b.step("agentcore:consumer", "Run the source-free AgentCore bundle consumer");

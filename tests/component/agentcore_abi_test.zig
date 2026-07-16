@@ -2,6 +2,7 @@ const std = @import("std");
 const harness = @import("harness");
 const abi = @import("agentcore-abi");
 const sdk = @import("agentcore-sdk");
+const core = @import("metacodes-core");
 const wire = sdk.types;
 
 const FINAL_SSE =
@@ -39,25 +40,39 @@ const Probe = struct {
     fn event(raw: ?*anyopaque, _: ?*wire.SessionHandle, _: u64, event_json: wire.BytesViewV1) callconv(.c) u32 {
         const self: *Probe = @ptrCast(@alignCast(raw orelse return wire.CALLBACK_FATAL));
         const bytes = sdk.borrowedBytes(event_json) catch return wire.CALLBACK_FATAL;
-        if (std.mem.indexOf(u8, bytes, "tool_start") != null) self.saw_tool_start = true;
-        if (std.mem.indexOf(u8, bytes, "tool_result") != null) self.saw_tool_result = true;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, bytes) catch return wire.CALLBACK_FATAL;
+        defer parsed.deinit();
+        switch (parsed.value) {
+            .tool_start => self.saw_tool_start = true,
+            .tool_result => self.saw_tool_result = true,
+            else => {},
+        }
         return wire.CALLBACK_CONTINUE;
     }
 
     fn ui(raw: ?*anyopaque, _: ?*wire.SessionHandle, request_json: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
         const self: *Probe = @ptrCast(@alignCast(raw orelse return wire.UI_FATAL));
         const bytes = sdk.borrowedBytes(request_json) catch return wire.UI_FATAL;
-        if (std.mem.indexOf(u8, bytes, "ask_question") == null) return wire.UI_FATAL;
+        const parsed = sdk.decodeUiRequest(std.heap.c_allocator, bytes) catch return wire.UI_FATAL;
+        defer parsed.deinit();
+        if (parsed.value != .ask_question) return wire.UI_FATAL;
         self.ui_calls += 1;
-        const response = "{\"answers\":[\"Yes\"]}";
-        (out orelse return wire.UI_FATAL).* = .{ .ptr = @constCast(response.ptr), .len = response.len };
+        const answers = [_][]const u8{"Yes"};
+        const response = sdk.encodeUiResponse(std.heap.c_allocator, parsed.value, .{ .answers = &answers }) catch return wire.UI_FATAL;
+        (out orelse {
+            std.heap.c_allocator.free(response);
+            return wire.UI_FATAL;
+        }).* = .{ .ptr = response.ptr, .len = response.len };
         return wire.UI_ANSWERED;
     }
 
     fn uiRelease(raw: ?*anyopaque, out: ?*wire.OwnedBytesV1) callconv(.c) void {
         const self: *Probe = @ptrCast(@alignCast(raw orelse return));
         self.ui_releases += 1;
-        if (out) |value| value.* = .{ .ptr = null, .len = 0 };
+        if (out) |value| {
+            if (value.ptr) |ptr| std.heap.c_allocator.free(ptr[0..@intCast(value.len)]);
+            value.* = .{ .ptr = null, .len = 0 };
+        }
     }
 
     fn host(raw: ?*anyopaque, session_id: wire.BytesViewV1, args: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
@@ -253,4 +268,71 @@ test "L2 Host UI fatal aborts the Run and poisons the ABI Session" {
     session = null;
     try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
     runtime = null;
+}
+
+fn expectMappedEventDecodes(event: core.protocol.ui_event.CoreEvent) !void {
+    const mapped = abi.protocol_v1.event(event) orelse return error.UnexpectedInternalOnlyEvent;
+    const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, mapped, .{});
+    defer std.testing.allocator.free(encoded);
+    const parsed = try sdk.decodeCoreEvent(std.testing.allocator, encoded);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        @tagName(std.meta.activeTag(event)),
+        @tagName(std.meta.activeTag(parsed.value)),
+    );
+}
+
+test "L2 every public AgentCoreEventV1 mapping is accepted by the source-free SDK" {
+    const trace_id = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+    try expectMappedEventDecodes(.{ .text_chunk = "hello" });
+    try expectMappedEventDecodes(.stream_begin);
+    try expectMappedEventDecodes(.{ .tool_start = .{ .id = "t1", .name = "Read", .input = "{}" } });
+    try expectMappedEventDecodes(.{ .set_current_tool = .{ .name = "Read" } });
+    try expectMappedEventDecodes(.{ .tool_progress = .{ .id = "t1", .text = "working" } });
+    try expectMappedEventDecodes(.{ .progress = .{ .turn = 1, .tool_name = "Read", .tool_input = "{}", .tool_calls = 2 } });
+    try expectMappedEventDecodes(.clear_current_tool);
+    try expectMappedEventDecodes(.{ .tool_result = .{ .id = "t1", .name = "Read", .input = "{}", .content = "ok", .is_error = false, .elapsed_ms = 3 } });
+    try expectMappedEventDecodes(.{ .usage = .{ .input_tokens = 1, .output_tokens = 2, .cache_read_input_tokens = 3, .cache_creation_input_tokens = 4 } });
+    try expectMappedEventDecodes(.{ .context_warning = .{ .current_tokens = 1, .warning_threshold = 2, .auto_compact_threshold = 3, .blocking_limit = 4, .level = "medium" } });
+    try expectMappedEventDecodes(.{ .auto_compact = .{ .dropped = 1, .kept = 2, .before_tokens = 3, .after_tokens = 4, .cause = "trigger" } });
+    try expectMappedEventDecodes(.{ .retry_notice = .{ .attempt = 1, .max = 2, .delay_ms = 3 } });
+    try expectMappedEventDecodes(.stream_done);
+    try expectMappedEventDecodes(.{ .diag_turn_begin = .{ .trace_id = trace_id, .depth = 0, .turn = 1 } });
+    try expectMappedEventDecodes(.{ .diag_turn_end = .{ .trace_id = trace_id, .depth = 0, .turn = 1, .tool_calls = 2 } });
+    try expectMappedEventDecodes(.{ .diag_breaker_tripped = .{ .trace_id = trace_id, .depth = 0, .same_err_count = 3 } });
+    try expectMappedEventDecodes(.{ .diag_cache_break = .{ .trace_id = trace_id, .depth = 0, .cache_read = 4, .cache_creation = 5 } });
+    try expectMappedEventDecodes(.{ .diag_continuation = .{ .trace_id = trace_id, .depth = 0, .n = 1, .max = 2 } });
+    try expectMappedEventDecodes(.{ .diag_run_end = .{ .trace_id = trace_id, .depth = 0, .turns = 1, .tool_calls = 2, .stop_reason_name = "end_turn" } });
+}
+
+fn expectMappedUiRequestDecodes(request: *const core.protocol.ui_request.UiRequest) !void {
+    const encoded = try abi.protocol_v1.encodeUiRequest(std.testing.allocator, request);
+    defer std.testing.allocator.free(encoded);
+    const parsed = try sdk.decodeUiRequest(std.testing.allocator, encoded);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        @tagName(std.meta.activeTag(request.*)),
+        @tagName(std.meta.activeTag(parsed.value)),
+    );
+}
+
+test "L2 every UiRequestV1 mapping is accepted by the source-free SDK" {
+    const options = [_]core.tool_context.AskOption{
+        .{ .label = "Yes", .description = "Proceed", .preview = "preview" },
+        .{ .label = "No", .description = "Stop" },
+    };
+    const questions = [_]core.tool_context.AskQuestion{.{
+        .question = "Continue?",
+        .header = "Choice",
+        .multi = false,
+        .options = &options,
+    }};
+    const ask = core.protocol.ui_request.UiRequest{ .ask_question = &questions };
+    const permission = core.protocol.ui_request.UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
+    const plan = core.protocol.ui_request.UiRequest{ .plan_approval = .{ .plan_md = "Do it", .kg_step_count = 2 } };
+    const custom = core.protocol.ui_request.UiRequest{ .custom = .{ .kind = "video_timeline", .payload_json = "{\"clips\":[]}" } };
+    try expectMappedUiRequestDecodes(&ask);
+    try expectMappedUiRequestDecodes(&permission);
+    try expectMappedUiRequestDecodes(&plan);
+    try expectMappedUiRequestDecodes(&custom);
 }
