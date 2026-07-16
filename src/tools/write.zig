@@ -128,18 +128,23 @@ fn renderResult(ctx: *const ToolContext, allocator: std.mem.Allocator, path: []c
 /// 为 path 创建所有缺失的父目录（等价 mkdir -p 到 dirname）。已存在的目录忽略。
 /// 失败（权限等）静默返回——后续 openat 会以 WriteError 暴露真正问题。
 fn mkdirParents(path: []const u8) !void {
-    // 找最后一个 '/'，其左侧即父目录路径
-    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return; // 无目录分量
+    const is_windows = @import("builtin").os.tag == .windows;
+    // 找最后一个分隔符,其左侧即父目录路径(Windows 两种分隔符都认)
+    const slash = (if (is_windows) std.mem.lastIndexOfAny(u8, path, "/\\") else std.mem.lastIndexOfScalar(u8, path, '/')) orelse return; // 无目录分量
     if (slash == 0) return; // 直接在根目录下，无需建
     const dir = path[0..slash];
 
     var buf: [std.fs.max_path_bytes + 1]u8 = undefined;
     if (dir.len >= buf.len) return error.PathTooLong;
 
-    // 逐级建：对每个 '/' 位置，把到该处的前缀 mkdir 一次
+    // 逐级建：对每个分隔符位置，把到该处的前缀 mkdir 一次
+    // Windows 从盘符根后开始("C:/x" 的首段前缀 "C:" 会 mkdir 失败且 errno 非 EEXIST,
+    // 触发下面的 early-return → 真正的父目录一层都没建 → 后续 openZ ENOENT。实测复现。
+    // UNC("\\server\share\...")不支持:首段 mkdir 同样非 EEXIST 早退,交给 openZ 报错(review F1)。
     var i: usize = 1;
+    if (is_windows and dir.len >= 2 and dir[1] == ':') i = 3;
     while (i <= dir.len) : (i += 1) {
-        if (i == dir.len or dir[i] == '/') {
+        if (i == dir.len or dir[i] == '/' or (is_windows and dir[i] == '\\')) {
             @memcpy(buf[0..i], dir[0..i]);
             buf[i] = 0;
             const seg_z: [*:0]const u8 = @ptrCast(&buf);

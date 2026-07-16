@@ -73,17 +73,30 @@ def test_at_menu_tab_inserts(bin_path):
 
 
 def test_at_menu_down_moves_highlight(bin_path):
-    import re
     wd = _mkdir_with_files()
     try:
         _, raw = _cap(bin_path, wd, ["type:@", "sleep:0.2", "key:down", "sleep:0.3"])
-        s = raw[-6000:].decode("latin-1")
-        # 收集每个候选项的颜色 class:accent=\x1b[36m,dim=\x1b[2m
-        accent = []
-        for m in re.finditer(r"(\x1b\[[0-9;]*m)\s*\+ ([A-Za-z./]+)", s):
-            if m.group(1) == "\x1b[36m":
-                accent.append(m.group(2))
-        # Down 后高亮应落在第 2 项(main.py),不是第 1 项
-        assert accent and accent[-1] == "main.py", f"Down 后应高亮 main.py,实得 accent={accent}"
+        # 终态判定(而非 raw 字节顺序推断):ConPTY 会整屏重合成,"最后出现的 accent 序列"
+        # 与"当前高亮"不再一一对应(尾窗可横跨两帧);POSIX 增量渲染下终态判定同样成立。
+        from screen import Screen
+        sc = Screen(24, 80)
+        sc.feed(raw)
+
+        # 目录枚举顺序平台相关(POSIX=创建序 README 在前;Windows FindFirstFile=字母序
+        # main.py 在前)——不硬编码文件名,按**屏幕行序**断言:Down 后高亮在第 2 项,非第 1 项。
+        items = []  # (row, name, class) 按行序
+        for r in range(sc.rows):
+            t = sc.line_text(r)
+            for name in ("main.py", "README.md"):
+                if "+ " + name in t:
+                    cls = None
+                    for cell in sc.grid[r]:
+                        if cell.ch and not cell.ch.isspace():
+                            cls = cell.border_class
+                            break
+                    items.append((r, name, cls))
+        assert len(items) == 2, f"应列出两个候选,实得 {items}"
+        assert items[1][2] == "accent", f"Down 后第 2 项应高亮(accent),实得 {items}"
+        assert items[0][2] != "accent", f"第 1 项不应仍是 accent,实得 {items}"
     finally:
         shutil.rmtree(wd, ignore_errors=True)

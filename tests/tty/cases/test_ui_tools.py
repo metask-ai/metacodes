@@ -25,7 +25,8 @@ from asserts import TTYAssert
 # __file__ = cc-zig/tests/tty/cases/test_ui_tools.py → 上溯 3 级到 cc-zig。
 # (此前误写 "..","..",落到 cc-zig/tests,REPLAY_BIN 永不存在 → T35-T38 静默 skip。)
 ZIG_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-REPLAY_BIN = os.path.join(ZIG_ROOT, "zig-out", "bin", "replay_server")
+REPLAY_BIN = os.path.join(ZIG_ROOT, "zig-out", "bin",
+                          "replay_server.exe" if os.name == "nt" else "replay_server")
 
 
 def _write_cassette(cdir, target_file):

@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const cc = @import("cc");
+const pfs = @import("platform").fs; // 可移植文件 IO(std.c.open 的 O 在 Windows 是 void)
 
 const tool_exec = cc.tool_exec;
 const tools = cc.tools;
@@ -25,8 +26,8 @@ fn mkdir(p: [*:0]const u8) void {
     _ = std.c.mkdir(p, 0o755);
 }
 fn touch(p: [*:0]const u8) void {
-    const fd = std.c.open(p, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    if (fd >= 0) _ = std.c.close(fd);
+    const fd = pfs.open(p, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    if (fd >= 0) pfs.close(fd);
 }
 
 test "L2 并发: 3 个 Glob safe 批并发执行,结果按原顺序回填" {

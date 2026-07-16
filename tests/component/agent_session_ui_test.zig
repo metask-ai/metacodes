@@ -78,6 +78,11 @@ const Sink = struct {
 
 fn rootPath(tmp: *std.testing.TmpDir, buffer: []u8) ![]const u8 {
     const len = try tmp.dir.realPath(std.testing.io, buffer);
+    // 归一正斜杠:此路径会拼进 SSE JSON 字符串字面量,Windows 反斜杠在 JSON 里是
+    // 非法转义(\p 等)→ 工具拿到坏路径。CRT/工具层两种分隔符都认,统一 '/'。
+    for (buffer[0..len]) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
     return buffer[0..len];
 }
 

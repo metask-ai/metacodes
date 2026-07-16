@@ -55,12 +55,10 @@ pub fn build(b: *std.Build) void {
     // resolveBinPath)。跨平台随 target 自动对齐;数据完整性工具恒 ReleaseSafe(不随 app optimize)。
     // 版本 pin 见 lib/tinykg/SOURCE.txt;格式版本门在 kg/client.zig EXPECTED_STORAGE_FORMAT_VERSION 运行时守。
     //
-    // **Windows 排除**:KgClient 的运行时解析(findVendoredUpward 搜无后缀 `tinykg`、
-    // isExecutable 用 POSIX `X_OK`)尚未 windows 化 —— 在 windows 上就算编出 `tinykg.exe`
-    // 也找不到/不可用。故不为 windows 编它(避免造一个 app 消费不了的死制品);windows KG
-    // 保持 degraded(与本次改动前一致)。macOS/Linux 正常(纯 Zig 交叉编译 + POSIX 解析可用)。
-    const tinykg_supported = target.result.os.tag != .windows;
-    const build_tinykg = (b.option(bool, "tinykg", "Build & install the vendored tinykg KG engine (default true; auto-off on Windows)") orelse true) and tinykg_supported;
+    // Windows 已解锁:KgClient 运行时解析已 windows 化(findVendoredUpward 搜 tinykg.exe、
+    // isExecutable 走 F_OK、selfExeDir 走 platform.paths.selfExePath/GetModuleFileNameW),
+    // 三端均构建并可被 app 找到。跳过构建用 -Dtinykg=false。
+    const build_tinykg = b.option(bool, "tinykg", "Build & install the vendored tinykg KG engine (default true)") orelse true;
     // install step 提到外层:kg/swarm 集成测试需要真 tinykg 二进制,故 test step 也依赖它
     // (让 `zig build test` 自包含地把 tinykg 建到 zig-out/vendor/tinykg/tinykg,测试候选路径命中)。
     var tinykg_install_step: ?*std.Build.Step = null;
@@ -94,6 +92,31 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(debug_exe);
 
+    // ── 共享测试模块────────────────────────────────────────────────────────
+    // cc(全 src 树)与 harness(mock SSE server)被单测/spike/integ/new/mem/agentcore/
+    // replay 多处消费,收敛为单例(platform/hl 全局单例是既有同款)。诚实注解(review-2
+    // F10):共享的是模块**描述**而非编译产物——每个测试二进制仍各自分析/编译整棵依赖树,
+    // 收益是砍掉模块图重复节点与配置漂移面;并发内存压力靠 -j 上限控制(满核 28 路 LLVM
+    // 链接在 32GB 上实测 OOM,win_verify.sh 用 -j12,全量 ≈200s)。optimize==Debug 时 cc
+    // 复用 debug_mod(少一个模块实例,非少一次编译)。
+    const test_cc_mod = if (optimize == .Debug) debug_mod else blk: {
+        const m2 = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        addHl(b, m2);
+        break :blk m2;
+    };
+    const test_harness_mod = b.createModule(.{
+        .root_source_file = b.path("tests/_harness/mock_sse_server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addPlatform(b, test_harness_mod); // harness socket 层走 platform/net(POSIX+Winsock 双后端)
+
     // mock MCP server 二进制：测试专用，不 install。
     const mock_mcp_mod = b.createModule(.{
         .root_source_file = b.path("tests/_harness/mock_mcp_server.zig"),
@@ -109,29 +132,24 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(mock_mcp_exe);
 
     // replay_server 二进制(Stage 7):从 cassette 起 mock,供 e2e replay。测试专用。
-    // **仅非 Windows**:此工装用真 TCP socket 服务器(mock_sse_server)+ std.process.args
-    // 做 e2e replay,是 POSIX-only 测试基建(CI 只在 ubuntu/macos 跑 e2e)。未移植到
-    // Windows(socket server→net.zig / args→initAllocator / `{d}` on HANDLE 三处),
-    // 属跨平台 roadmap 的测试工装尾项——不阻塞 app 本体的 Windows 交叉编译。
-    if (target.result.os.tag != .windows) {
+    // 三端可编:曾经的三个 Windows blocker 已清(socket server→platform/net、
+    // args→iterateAllocator、cassette 文件 IO→pfs)。TTY ui_tools 用例依赖它。
+    {
         const replay_mod = b.createModule(.{
             .root_source_file = b.path("tests/_harness/replay_server.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
-        replay_mod.addImport("harness", b.createModule(.{
-            .root_source_file = b.path("tests/_harness/mock_sse_server.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }));
-        replay_mod.addImport("cassette", b.createModule(.{
+        replay_mod.addImport("harness", test_harness_mod); // 共享模块(perf,见上)
+        const replay_cassette_mod = b.createModule(.{
             .root_source_file = b.path("tests/_harness/cassette.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
-        }));
+        });
+        addPlatform(b, replay_cassette_mod); // 文件 IO 走 pfs
+        replay_mod.addImport("cassette", replay_cassette_mod);
         addPlatform(b, replay_mod); // stdout/stderr 走可移植 pfs
         const replay_exe = b.addExecutable(.{
             .name = "replay_server",
@@ -196,21 +214,28 @@ pub fn build(b: *std.Build) void {
     });
     const agentcore_manifest_contract_test = b.addTest(.{ .name = "agentcore-manifest-contract", .root_module = agentcore_manifest_contract_mod });
     agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_manifest_contract_test).step);
-    const agentcore_header_test = b.addSystemCommand(&.{ "cc", "-std=c11", "-fsyntax-only", "-Isdk", "tests/agentcore_header_compile.c" });
-    agentcore_header_test.setCwd(b.path("."));
-    agentcore_test_step.dependOn(&agentcore_header_test.step);
+    // header 可编译性检查:走 zig 构建系统原生 C 对象(不 install,只编译)。
+    // 不用系统 cc(Windows 没有),也不用 `zig cc -fsyntax-only`(zig 0.16 Windows 实测
+    // 对任何输入报 FileNotFound;`-c` 正常)。对象编译 = 语法+类型检查,跨平台等价。
+    const agentcore_header_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    agentcore_header_mod.addCSourceFile(.{
+        .file = b.path("tests/agentcore_header_compile.c"),
+        .flags = &.{"-std=c11"},
+    });
+    agentcore_header_mod.addIncludePath(b.path("sdk"));
+    const agentcore_header_obj = b.addObject(.{ .name = "agentcore-header-compile", .root_module = agentcore_header_mod });
+    agentcore_test_step.dependOn(&agentcore_header_obj.step);
     const agentcore_contract_mod = b.createModule(.{
         .root_source_file = b.path("tests/component/agentcore_abi_test.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    agentcore_contract_mod.addImport("harness", b.createModule(.{
-        .root_source_file = b.path("tests/_harness/mock_sse_server.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    }));
+    agentcore_contract_mod.addImport("harness", test_harness_mod); // 共享模块(perf,见 debug exe 后注释)
     agentcore_contract_mod.addImport("agentcore-abi", agentcore_abi_mod);
     agentcore_contract_mod.addImport("agentcore-sdk", agentcore_sdk_mod);
     agentcore_contract_mod.addImport("metacodes-core", core_mod);
@@ -313,8 +338,10 @@ pub fn build(b: *std.Build) void {
     core_test_step.dependOn(&b.addRunArtifact(core_test).step);
 
     // test:lsp —— LSP 子系统(Y2 Step2:被动诊断)隔离测试。
+    // 根在 src/ 层(而非 src/lsp/lsp.zig):service.zig 相对引 ../util/time.zig,
+    // 根在 src/lsp/ 会越出 module path(见 src/lsp_test_root.zig 顶部说明)。
     const lsp_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/lsp/lsp.zig"),
+        .root_source_file = b.path("src/lsp_test_root.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -364,16 +391,9 @@ pub fn build(b: *std.Build) void {
     }
 
     const test_step = b.step("test", "Run tests");
-    const test_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    addHl(b, test_module);
     const test_obj = b.addTest(.{
         .name = "cc-test",
-        .root_module = test_module,
+        .root_module = test_cc_mod, // 共享模块(perf,见 debug exe 后注释)
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     const test_run = b.addRunArtifact(test_obj);
@@ -389,16 +409,20 @@ pub fn build(b: *std.Build) void {
     const spike_step = b.step("test:spike", "Run spike / harness tests");
     const spike_files = [_][]const u8{
         "tests/unit/stream_reader_spike.zig",
-        "tests/unit/termios_spike.zig",
+        "tests/unit/termios_spike.zig", // POSIX-only(termios)——Windows 目标下面跳过
         "tests/_harness/mock_sse_server.zig",
     };
     for (spike_files) |f| {
-        const m = b.createModule(.{
+        if (target.result.os.tag == .windows and std.mem.endsWith(u8, f, "termios_spike.zig")) continue;
+        // mock_sse_server 复用共享 harness 模块做 root(它就是同一份编译);其余 spike 各自建。
+        const shared_harness = std.mem.endsWith(u8, f, "mock_sse_server.zig");
+        const m = if (shared_harness) test_harness_mod else b.createModule(.{
             .root_source_file = b.path(f),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
+        if (!shared_harness) addPlatform(b, m);
         const t = b.addTest(.{
             .name = "spike",
             .root_module = m,
@@ -482,21 +506,9 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         });
-        const harness_mod = b.createModule(.{
-            .root_source_file = b.path("tests/_harness/mock_sse_server.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        const cc_mod = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        m.addImport("harness", harness_mod);
-        m.addImport("cc", cc_mod);
-        addHl(b, cc_mod);
+        m.addImport("harness", test_harness_mod);
+        m.addImport("cc", test_cc_mod);
+        addPlatform(b, m); // 测试文件用 platform 的可移植 env/net 封装(setEnv、clientRoundtrip)
         const t = b.addTest(.{
             .name = "integration",
             .root_module = m,
@@ -572,21 +584,9 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         });
-        const harness_mod = b.createModule(.{
-            .root_source_file = b.path("tests/_harness/mock_sse_server.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        const cc_mod = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        });
-        m.addImport("harness", harness_mod);
-        m.addImport("cc", cc_mod);
-        addHl(b, cc_mod);
+        m.addImport("harness", test_harness_mod); // 共享模块(见 integ 循环前注释:perf)
+        m.addImport("cc", test_cc_mod);
+        addPlatform(b, m); // 测试文件用 platform 的可移植 env/net 封装(setEnv、clientRoundtrip)
         const t = b.addTest(.{
             .name = "new-l2",
             .root_module = m,
@@ -610,21 +610,9 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
                 .link_libc = true,
             });
-            const harness_mod = b.createModule(.{
-                .root_source_file = b.path("tests/_harness/mock_sse_server.zig"),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = true,
-            });
-            const cc_mod = b.createModule(.{
-                .root_source_file = b.path("src/main.zig"),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = true,
-            });
-            m.addImport("harness", harness_mod);
-            m.addImport("cc", cc_mod);
-            addHl(b, cc_mod);
+            m.addImport("harness", test_harness_mod); // 共享模块(见 integ 循环前注释:perf)
+            m.addImport("cc", test_cc_mod);
+            addPlatform(b, m); // 测试文件用 platform 的可移植 env/net 封装
             const t = b.addTest(.{
                 .name = "mem-l2",
                 .root_module = m,
@@ -647,10 +635,13 @@ pub fn build(b: *std.Build) void {
     // 跳过(CI/离线);显式 `TTY_SKIP_MODEL= zig build test:e2e-tty` 才真打模型、真副作用
     // (真联网/真排程/真发通知/真改 git)。先 build debug 二进制 + mock_mcp_server。
     const e2e_tty_step = b.step("test:e2e-tty", "Run tty real-model tool e2e (打真模型, 设 TTY_SKIP_MODEL=1 跳过)");
+    // python 命令名:Windows 官方发行版只有 python(无 python3 别名);POSIX 惯例 python3。
+    const python_exe = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    const tty_bin = if (@import("builtin").os.tag == .windows) "zig-out/bin/metacodes-debug.exe" else "zig-out/bin/metacodes-debug";
     const e2e_tty_cmd = b.addSystemCommand(&.{
-        "python3", "tests/tty/run_tty_tests.py",
-        "--bin",   "zig-out/bin/metacodes-debug",
-        "-k",      "e2e_",
+        python_exe, "tests/tty/run_tty_tests.py",
+        "--bin",    tty_bin,
+        "-k",       "e2e_",
     });
     e2e_tty_cmd.step.dependOn(b.getInstallStep()); // 确保 metacodes-debug + mock_mcp_server 已 build
     e2e_tty_step.dependOn(&e2e_tty_cmd.step);

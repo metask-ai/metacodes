@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
+const platform_term = @import("platform").terminal; // console 宽读统一入口(review-2 F4)
 const Conversation = @import("../core/conversation.zig").Conversation;
 const Overlay = @import("tui/overlay.zig").Overlay;
 
@@ -245,29 +246,29 @@ pub fn runWithThemeAnchor(fd: c_int, allocator: std.mem.Allocator, conv: *const 
     while (true) {
         drawScreen(lines, top, view_rows, rows, cols, th);
         var b: [1]u8 = undefined;
-        const n = pfs.read(fd, &b);
+        const n = platform_term.readInput(fd, &b);
         if (n <= 0) break;
         const c = b[0];
         if (c == 0x1b) {
             // 可能是方向键 CSI 或单 Esc。读后续两字节判定。
             var s0: [1]u8 = undefined;
-            const n2 = pfs.read(fd, &s0);
+            const n2 = platform_term.readInput(fd, &s0);
             if (n2 <= 0) break; // 裸 Esc → 退出
             if (s0[0] == '[') {
                 var s1: [1]u8 = undefined;
-                const n3 = pfs.read(fd, &s1);
+                const n3 = platform_term.readInput(fd, &s1);
                 if (n3 <= 0) break;
                 switch (s1[0]) {
                     'A' => top = if (top > 0) top - 1 else 0, // ↑
                     'B' => top = @min(top + 1, max_top), // ↓
                     '5' => { // PageUp(ESC[5~)——读掉结尾 ~
                         var s2: [1]u8 = undefined;
-                        _ = pfs.read(fd, &s2);
+                        _ = platform_term.readInput(fd, &s2);
                         top = if (top > view_rows) top - view_rows else 0;
                     },
                     '6' => { // PageDown(ESC[6~)
                         var s2: [1]u8 = undefined;
-                        _ = pfs.read(fd, &s2);
+                        _ = platform_term.readInput(fd, &s2);
                         top = @min(top + view_rows, max_top);
                     },
                     '0'...'4', '7'...'9' => {
@@ -310,7 +311,7 @@ fn readCsiCodepoint(fd: c_int, first_digit: u8) u32 {
     var in_mod = false; // 进入 ';' 后是 modifier 段,后续数字不计入 codepoint
     while (true) {
         var sx: [1]u8 = undefined;
-        const nx = pfs.read(fd, &sx);
+        const nx = platform_term.readInput(fd, &sx);
         if (nx <= 0) return cp;
         const ch = sx[0];
         if (ch >= '0' and ch <= '9') {

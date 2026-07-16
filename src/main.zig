@@ -140,8 +140,24 @@ pub const recorder = @import("core/recorder.zig");
 /// 注意:不要传 --help(会 std.process.exit 杀测试)。
 pub fn parseArgsForTest(argv: []const [*:0]const u8, allocator: std.mem.Allocator) types.Config {
     var config = types.Config{};
-    var args = std.process.Args.iterate(.{ .vector = argv });
-    parseArgsInto(&config, &args, allocator);
+    if (builtin.os.tag == .windows) {
+        // Windows 的 Args.Vector 是整条 WTF-16 命令行(非 argv 数组):用平台层
+        // buildWindowsCmdline 拼接(引号规则与 CommandLineToArgvW 往返一致),
+        // 再走 allocator 版迭代器。parseArgsInto 对存入 Config 的字符串都 dupe,
+        // 迭代器 deinit 后不悬垂。
+        const opt_argv = allocator.alloc(?[*:0]const u8, argv.len) catch @panic("OOM");
+        defer allocator.free(opt_argv);
+        for (argv, opt_argv) |src, *dst| dst.* = src;
+        const cmdline_w = @import("platform").process.buildWindowsCmdline(allocator, opt_argv) catch @panic("OOM");
+        defer allocator.free(cmdline_w);
+        var args = std.process.Args.iterateAllocator(.{ .vector = cmdline_w }, allocator) catch
+            @panic("args iterate failed");
+        defer args.deinit();
+        parseArgsInto(&config, &args, allocator);
+    } else {
+        var args = std.process.Args.iterate(.{ .vector = argv });
+        parseArgsInto(&config, &args, allocator);
+    }
     return config;
 }
 
@@ -192,6 +208,11 @@ pub fn main(init: std.process.Init) !void {
     // 必须在任何 spawn/网络之前设一次,覆盖所有模式(TUI/web/headless/subagent)。(Linus H1)
     // 可移植:Windows 无 SIGPIPE → no-op(socket 写返 WSAECONNRESET,各处 n<=0 分支已处理)。
     platform_signal.ignoreBrokenPipe();
+
+    // Windows console 代码页切 UTF-8(任何输出前;否则 GBK 等代码页下启动 banner/日志乱码)。
+    // POSIX no-op。正常退出还原;exit()/崩溃路径不还原属可接受残留(Windows Terminal 每 tab 独立)。
+    platform_term.initConsoleUtf8();
+    defer platform_term.restoreConsoleCp();
 
     if (try maybeRunAuthCommand(init, allocator)) |code| {
         std.process.exit(code);

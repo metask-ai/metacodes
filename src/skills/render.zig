@@ -32,6 +32,7 @@ const std = @import("std");
 const pfs = @import("platform").fs;
 const common = @import("../tools/common.zig");
 const log = @import("../util/log.zig");
+const shell_mod = @import("../core/shell.zig");
 
 pub const RenderOptions = struct {
     arguments: []const []const u8 = &.{},
@@ -313,7 +314,9 @@ fn withinBoundary(allocator: std.mem.Allocator, real: []const u8, boundary: []co
     const b = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(bp.?)), 0);
     if (!std.mem.startsWith(u8, real, b)) return false;
     // 防 /a/bc 误配 /a/b:边界后必须是路径分隔符或字符串结束。
-    return real.len == b.len or real[b.len] == '/';
+    // Windows realpath(_fullpath)产反斜杠,两种分隔符都认。
+    return real.len == b.len or real[b.len] == '/' or
+        (@import("builtin").os.tag == .windows and real[b.len] == '\\');
 }
 
 // ============================================================================
@@ -474,12 +477,13 @@ fn runInjection(allocator: std.mem.Allocator, cmd: []const u8, opts: RenderOptio
         break :blk cmd;
     };
 
-    // /bin/sh -c <eff_cmd>（eff_cmd 已含 sandbox-exec 包裹层，或原样）
-    const cmd_z = try allocator.dupeZ(u8, eff_cmd);
+    // 可移植 shell(与 Bash 工具同款 core/shell 检测:POSIX sh -c / Windows PowerShell/cmd)。
+    // eff_cmd 已含 sandbox-exec 包裹层,或原样。
+    const sys_shell = shell_mod.detectDefault();
+    const cmd_z = try shell_mod.wrapCommand(allocator, sys_shell, eff_cmd);
     defer allocator.free(cmd_z);
-    const sh_z: [*:0]const u8 = "/bin/sh";
-    const flag_z: [*:0]const u8 = "-c";
-    var argv: [4]?[*:0]const u8 = .{ sh_z, flag_z, cmd_z.ptr, null };
+    var argv: [6]?[*:0]const u8 = undefined;
+    shell_mod.deriveExecArgs(sys_shell, cmd_z.ptr, &argv);
 
     log.debug("skill.inject", "running: {s}", .{cmd});
     // 轴A:skill 注入命令输出封顶 16MB(skill 半可信,一句 `cat hugefile` 就是 OOM 类;Linus P0 遗漏补)。

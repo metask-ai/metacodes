@@ -342,24 +342,10 @@ pub fn freeArgv(a: std.mem.Allocator, argv: []?[*:0]const u8) void {
 }
 
 /// 自身可执行文件路径(fork+exec teammate 用)。写进 buf,返回 slice;失败 null。
+/// 实现收敛在 platform.paths(KgClient 等共用,三 OS 一份)。
 pub fn selfExePath(buf: []u8) ?[]const u8 {
-    const builtin = @import("builtin");
-    switch (builtin.os.tag) {
-        .macos, .ios => {
-            var size: u32 = @intCast(buf.len);
-            if (_NSGetExecutablePath(buf.ptr, &size) != 0) return null;
-            const len = std.mem.indexOfScalar(u8, buf[0..@min(buf.len, size + 1)], 0) orelse return null;
-            return buf[0..len];
-        },
-        .linux => {
-            const n = std.c.readlink("/proc/self/exe", buf.ptr, buf.len);
-            if (n <= 0) return null;
-            return buf[0..@intCast(n)];
-        },
-        else => return null,
-    }
+    return @import("platform").paths.selfExePath(buf);
 }
-extern "c" fn _NSGetExecutablePath(buf: [*]u8, size: *u32) c_int;
 
 /// git worktree add <path> -b <branch> <base>,在 repo 里执行(Linus SW6 MED-2:用 `git -C <repo>`
 /// 显式指定 repo,不依赖多线程 lead 的进程全局 cwd)。repo 为空则退回进程 cwd(测试自 chdir)。
@@ -587,7 +573,7 @@ test "buildTeammateArgv: 无 parent/cwd 时省略对应 flag" {
     try testing.expect(!found_parent and !found_cwd);
 }
 
-test "selfExePath 返回非空(macos/linux)" {
+test "selfExePath 返回非空(macos/linux/windows)" {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const p = selfExePath(&buf);
     try testing.expect(p != null);

@@ -28,9 +28,7 @@ const T1 = std.fmt.comptimePrint(TURN_FMT, .{"TEAMMATE TURN1"});
 const T2 = std.fmt.comptimePrint(TURN_FMT, .{"TEAMMATE TURN2"});
 
 fn sleepMs(ms: u32) void {
-    var req = std.c.timespec{ .sec = 0, .nsec = @as(isize, @intCast(ms)) * 1_000_000 };
-    var rem: std.c.timespec = undefined;
-    _ = std.c.nanosleep(&req, &rem);
+    cc.util_time.sleepMs(ms); // 可移植(POSIX nanosleep / Windows Sleep)
 }
 
 test "L2 SW2 端到端: TeamCreate → Task spawn teammate → SendMessage → pollLeadInbox" {

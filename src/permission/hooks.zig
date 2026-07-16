@@ -39,6 +39,7 @@
 
 const std = @import("std");
 const process = @import("platform").process;
+const shell_mod = @import("../core/shell.zig");
 const log = @import("../util/log.zig");
 const util_json = @import("../util/json.zig");
 const util_time = @import("../util/time.zig");
@@ -414,9 +415,13 @@ const OneHookResult = struct {
 /// exit 2 → block;exit 0 → 看 stdout decision;其它 → proceed(非阻塞错误)。
 /// stdout JSON 可含 updatedInput(改写工具输入)/ additionalContext(注入模型的补充上下文)。
 fn runOneHookFull(alloc: std.mem.Allocator, cmd: []const u8, stdin_json: []const u8) OneHookResult {
-    const cmd_z = alloc.dupeZ(u8, cmd) catch return .{};
+    // 可移植 shell(与 Bash 工具同款 core/shell 检测:POSIX sh -c / Windows PowerShell/cmd)。
+    // 硬编码 /bin/sh 在 Windows 无此文件 → 所有 hook 静默 fail-open(实测 openai P0.2 红)。
+    const sys_shell = shell_mod.detectDefault();
+    const cmd_z = shell_mod.wrapCommand(alloc, sys_shell, cmd) catch return .{};
     defer alloc.free(cmd_z);
-    const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", cmd_z.ptr };
+    var argv: [6]?[*:0]const u8 = undefined;
+    shell_mod.deriveExecArgs(sys_shell, cmd_z.ptr, &argv);
     // 走可移植 platform/process.capture(POSIX fork / Windows CreateProcessW+git-bash):喂 stdin
     // JSON、捕 stdout(≤4KB)、继承 env(hook 需 $HOME/$PATH)。**timeout_partial 安全语义**:慢但已
     // 产 block 决策的 hook 超时也保留其部分输出判决,避免 fail-open 漏判(Linus/PM 红线)。cap 命中同理

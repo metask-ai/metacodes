@@ -36,9 +36,7 @@ fn isX(path: []const u8) bool {
     return std.c.access(buf[0..path.len :0].ptr, std.c.X_OK) == 0;
 }
 fn sleepMs(ms: u32) void {
-    var req = std.c.timespec{ .sec = 0, .nsec = @as(isize, @intCast(ms)) * 1_000_000 };
-    var rem: std.c.timespec = undefined;
-    _ = std.c.nanosleep(&req, &rem);
+    cc.util_time.sleepMs(ms); // 可移植(POSIX nanosleep / Windows Sleep)
 }
 
 const TURN =

@@ -4,6 +4,7 @@
 const std = @import("std");
 const harness = @import("harness");
 const cc = @import("cc");
+const pfs = @import("platform").fs; // 可移植文件 IO(std.c.open 的 O 在 Windows 是 void)
 
 const FINAL_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_2\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
@@ -40,12 +41,12 @@ fn bashToolSse(allocator: std.mem.Allocator, command: []const u8) ![]u8 {
 }
 
 fn writeFile(path: [*:0]const u8, content: []const u8) !void {
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
     if (fd < 0) return error.OpenFailed;
-    defer _ = std.c.close(fd);
+    defer pfs.close(fd);
     var written: usize = 0;
     while (written < content.len) {
-        const n = std.c.write(fd, content.ptr + written, content.len - written);
+        const n = pfs.write(fd, content[written..]);
         if (n <= 0) return error.WriteFailed;
         written += @intCast(n);
     }
@@ -63,6 +64,10 @@ test "L2 AgentSession resolves selected built-in file tools against its workspac
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    // 归一正斜杠:file_path 会拼进 SSE JSON 字符串,Windows 反斜杠是非法 JSON 转义。
+    for (root_buf[0..root_len]) |*c| {
+        if (c.* == '\\') c.* = '/';
+    }
     const root = root_buf[0..root_len];
     const file_path = try std.fmt.allocPrintSentinel(a, "{s}/sample.txt", .{root}, 0);
     defer a.free(file_path);

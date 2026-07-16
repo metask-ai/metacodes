@@ -308,8 +308,11 @@ test "L3: 多工具同轮(A pending + B done)→ 挂起不拆 turn,resume 同条
 // ── helpers ──────────────────────────────────────────────────────────────
 
 fn makeSessionDir(buf: []u8) []const u8 {
-    const pid = std.c.getpid();
-    const dir = std.fmt.bufPrintZ(buf, "/tmp/cc-zig-l3-{d}", .{pid}) catch unreachable;
+    // currentPid 而非 std.c.getpid:Windows 上 pid_t 是 *anyopaque,不能 {d} 格式化。
+    // 路径走 tempDir 而非硬编码 /tmp:Windows 无 /tmp(靠盘根 \tmp 恰好存在是假绿,review F2)。
+    const pid = @import("platform").process.currentPid();
+    const tmp = @import("platform").paths.tempDir();
+    const dir = std.fmt.bufPrintZ(buf, "{s}/cc-zig-l3-{d}", .{ tmp, pid }) catch unreachable;
     _ = std.c.mkdir(dir.ptr, 0o755);
     return dir;
 }

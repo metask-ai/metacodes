@@ -36,9 +36,13 @@ pub fn mkdirParents(dir: []const u8) MkdirError!void {
     // 记录中间层第一个非 EEXIST 错误（用于日志；返回路径用 mid_failed bool）
     var mid_failed = false;
     var mid_errno: std.c.E = .SUCCESS;
+    // Windows:跳过盘符前缀——mkdir("C:") 报非 EEXIST 错会把 mid_failed 置真,
+    // 使"目录已存在"的重复调用(final EEXIST + mid_failed)返回假 MkdirFailed。
+    const is_windows = @import("builtin").os.tag == .windows;
     var i: usize = 1;
+    if (is_windows and dir.len >= 2 and dir[1] == ':') i = 3;
     while (i < dir.len) : (i += 1) {
-        if (dir[i] != '/') continue;
+        if (dir[i] != '/' and !(is_windows and dir[i] == '\\')) continue;
         buf[i] = 0;
         if (std.c.mkdir(@ptrCast(&buf), 0o700) != 0) {
             const e = currentErrno();
@@ -48,7 +52,7 @@ pub fn mkdirParents(dir: []const u8) MkdirError!void {
                 log.warn("fs", "mkdirParents: intermediate mkdir failed errno={s} at prefix={s}", .{ @tagName(e), buf[0..i] });
             }
         }
-        buf[i] = '/';
+        buf[i] = dir[i]; // 还原原分隔符(Windows 可能是 '\\')
     }
 
     // 最终完整路径
@@ -275,8 +279,9 @@ test "removeTeamDirTree: 删 teams 子树 + 护栏拒非 teams 路径 + 不跟�
 test "removeTeamDirTree: `..` 穿越被拒" {
     // 含 .. 的路径即便含 /.metacodes/teams/ 也拒(护栏②)。
     removeTeamDirTree("/tmp/cc-zig-x/.metacodes/teams/../../../etc");
-    // 不崩即通过(无副作用);/etc 显然还在。
-    try std.testing.expect(pfs.exists("/etc"));
+    // 不崩即通过(无副作用);拿各平台必存在的目录做"世界还在"锚点(Windows 无 /etc)。
+    const anchor = if (@import("builtin").os.tag == .windows) "C:\\Windows" else "/etc";
+    try std.testing.expect(pfs.exists(anchor));
 }
 
 test "mkdirParents creates nested dirs" {

@@ -125,7 +125,7 @@ fn askText(tool_name: []const u8, args: []const u8) !bool {
     std.debug.print("Allow? [y/N]: ", .{});
 
     var buf: [10]u8 = undefined;
-    const n = pfs.readZ(0, &buf) catch return false;
+    const n = platform_term.readInput(0, &buf); // console 宽读统一入口(review-2 F4)
     if (n > 0 and (buf[0] == 'y' or buf[0] == 'Y')) return true;
     return false;
 }

@@ -244,6 +244,14 @@ fn matchesPathDual(pp: PathPattern, mctx: *const MatchContext, file_path_raw: []
 
     const orig_match = matchesPathPattern(pp, mctx, file_path);
 
+    // ⚠️ Windows 已知限制(review F6):realpath 层整个跳过。pfs.realpath 走 CRT
+    // `_fullpath`——**纯词法**,不解 symlink/junction,该层在 Windows 提供不了任何
+    // symlink 防护;反而因"①分隔符/盘符词法改写 ②相对路径按进程 cwd(≠mctx.cwd)展开"
+    // 制造假分歧,把所有 allow 规则打进双匹配分支误杀。真解析需
+    // GetFinalPathNameByHandle(roadmap)。缓解:Windows 创建 symlink 需管理员/开发者
+    // 模式,攻击面有限。POSIX 语义零变化。
+    if (@import("builtin").os.tag == .windows) return orig_match;
+
     // 尝试 realpath 解析(symlink 额外一层;用 canonicalize 后的路径,escaped 原文 realpath 会失败)
     var rp_buf: [std.fs.max_path_bytes]u8 = undefined;
     const resolved = realpathZ(&rp_buf, file_path);
@@ -390,13 +398,27 @@ fn matchGlobImpl(p: []const u8, pi: usize, s: []const u8, si: usize) bool {
 // ============================================================================
 
 fn matchesPathPattern(pp: PathPattern, mctx: *const MatchContext, file_path_in: []const u8) bool {
+    const is_windows = @import("builtin").os.tag == .windows;
     var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const abs = resolveAbs(&abs_buf, file_path_in, mctx) orelse return false;
+    const abs_raw = resolveAbs(&abs_buf, file_path_in, mctx) orelse return false;
+    // Windows:词法规范化成 "X:/a/b"(正斜杠、盘符大写)再比对——否则 "D:\x" 对
+    // "D:/x" 前缀永假,所有路径规则失效。POSIX 原样零变化。
+    var wnorm_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = if (is_windows) (normalizeLexical(&wnorm_buf, abs_raw) orelse return false) else abs_raw;
 
-    var base_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = anchorBase(&base_buf, pp.anchor, mctx) orelse return false;
+    var wbase_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base: []const u8 = blk: {
+        const raw = anchorBase(pp.anchor, mctx) orelse return false;
+        if (!is_windows) break :blk raw;
+        if (pp.anchor == .absolute) {
+            // 绝对锚 = 文件系统根:盘符路径的根是 "X:/";POSIX 形("/x")保持 "/"。
+            if (abs.len >= 3 and abs[1] == ':') break :blk abs[0..3];
+            break :blk "/";
+        }
+        break :blk normalizeLexical(&wbase_buf, raw) orelse return false;
+    };
 
-    if (!std.mem.startsWith(u8, abs, base)) return false;
+    if (!pathStartsWith(abs, base)) return false;
 
     var rel: []const u8 = abs[base.len..];
     if (rel.len > 0 and rel[0] == '/') rel = rel[1..];
@@ -416,8 +438,7 @@ fn basenameMatchesAnyDepth(pattern: []const u8, rel: []const u8) bool {
     return matchGitignoreGlob(pattern, name);
 }
 
-fn anchorBase(buf: []u8, anchor: PathAnchor, mctx: *const MatchContext) ?[]const u8 {
-    _ = buf; // 暂未用 buf
+fn anchorBase(anchor: PathAnchor, mctx: *const MatchContext) ?[]const u8 {
     return switch (anchor) {
         .absolute => "/",
         .home => mctx.home,
@@ -426,9 +447,22 @@ fn anchorBase(buf: []u8, anchor: PathAnchor, mctx: *const MatchContext) ?[]const
     };
 }
 
+/// 路径前缀比较。Windows 文件系统大小写不敏感 → ASCII 折叠比较;POSIX 精确。
+fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
+    if (@import("builtin").os.tag != .windows) return std.mem.startsWith(u8, path, prefix);
+    if (path.len < prefix.len) return false;
+    return std.ascii.eqlIgnoreCase(path[0..prefix.len], prefix);
+}
+
 fn resolveAbs(buf: []u8, path: []const u8, mctx: *const MatchContext) ?[]const u8 {
     if (path.len == 0) return null;
     if (path[0] == '/') return path; // 已是绝对
+    if (@import("builtin").os.tag == .windows) {
+        // 盘符绝对("C:\x"/"C:/x")与 UNC/根相对("\x")也算绝对——否则会被当
+        // 相对路径拼到 cwd 后面,产出垃圾路径(review F7)。
+        if (path.len >= 2 and path[1] == ':') return path;
+        if (path[0] == '\\') return path;
+    }
     if (std.mem.startsWith(u8, path, "~/")) {
         return joinPath(buf, mctx.home, path[2..]);
     }
@@ -453,6 +487,9 @@ pub fn isInWorkingDirs(mctx: *const MatchContext, file_path: []const u8) bool {
     if (mctx.cwd.len == 0) return false;
     if (!pathInWorkingDirs(mctx, file_path)) return false;
     // symlink:realpath 解析出不同路径 → 目标也必须在集内。
+    // Windows 跳过该层:_fullpath 纯词法不解 symlink(防护为零),且相对路径按
+    // **进程 cwd** 展开(≠mctx.cwd)会制造假分歧误拒——与 matchesPathDual 同款取舍。
+    if (@import("builtin").os.tag == .windows) return true;
     var rp_buf: [std.fs.max_path_bytes]u8 = undefined;
     if (realpathZ(&rp_buf, file_path)) |resolved| {
         if (!std.mem.eql(u8, resolved, file_path)) {
@@ -480,26 +517,47 @@ fn dirContains(dir_in: []const u8, path: []const u8) bool {
     if (dir_in.len == 0) return false;
     var dbuf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = normalizeLexical(&dbuf, dir_in) orelse return false;
-    if (!std.mem.startsWith(u8, path, dir)) return false;
+    if (!pathStartsWith(path, dir)) return false;
     if (path.len == dir.len) return true;
-    if (std.mem.eql(u8, dir, "/")) return true;
+    if (dir[dir.len - 1] == '/') return true; // 根("/"、Windows "C:/")自带尾分隔符
     return path[dir.len] == '/';
 }
 
 /// 词法归一化绝对路径:消 `//`、`.` 段;`..` 弹出上一段(根处 clamp)。
 /// 不触盘(纯词法);非绝对路径返 null。输出写进 buf。
+///
+/// Windows 扩展(POSIX 分支零变化):
+///   - 盘符绝对("C:\x"/"c:/x")→ 规范形 "C:/x"(盘符大写、全正斜杠);
+///   - 两种分隔符都认,`..` clamp 在盘符根("C:/")不再弹;
+///   - 盘符相对("C:foo")语义依赖每盘独立 cwd → 拒绝(null);
+///   - UNC("\\server\share")不支持:退化为 '/'-根处理,share 语义丢失——已知限制,
+///     permission 规则不建议对 UNC 路径下断言(review F1)。
 fn normalizeLexical(buf: []u8, path: []const u8) ?[]const u8 {
-    if (path.len == 0 or path[0] != '/') return null;
+    if (path.len == 0) return null;
+    const is_windows = @import("builtin").os.tag == .windows;
+    var prefix_len: usize = 0;
+    var rest = path;
+    if (is_windows and path.len >= 2 and path[1] == ':') {
+        if (path.len < 3 or (path[2] != '/' and path[2] != '\\')) return null; // 盘符相对
+        if (buf.len < 2) return null;
+        buf[0] = std.ascii.toUpper(path[0]);
+        buf[1] = ':';
+        prefix_len = 2;
+        rest = path[2..];
+    } else if (path[0] != '/' and !(is_windows and path[0] == '\\')) {
+        return null;
+    }
     if (path.len > buf.len) return null;
-    var len: usize = 0; // buf 中已写入长度;不含尾 /(根除外)
-    var it = std.mem.splitScalar(u8, path, '/');
+    var len: usize = prefix_len; // buf 中已写入长度;不含尾 /(根除外)
+    const seps = if (is_windows) "/\\" else "/";
+    var it = std.mem.splitAny(u8, rest, seps);
     while (it.next()) |seg| {
         if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
         if (std.mem.eql(u8, seg, "..")) {
             // 弹出上一段(根处 clamp 不再弹)
-            if (len > 0) {
-                const prev = std.mem.lastIndexOfScalar(u8, buf[0..len], '/') orelse 0;
-                len = prev;
+            if (len > prefix_len) {
+                const prev = std.mem.lastIndexOfScalar(u8, buf[prefix_len..len], '/') orelse 0;
+                len = prefix_len + prev;
             }
             continue;
         }
@@ -508,9 +566,10 @@ fn normalizeLexical(buf: []u8, path: []const u8) ?[]const u8 {
         @memcpy(buf[len + 1 .. len + 1 + seg.len], seg);
         len += 1 + seg.len;
     }
-    if (len == 0) {
-        buf[0] = '/';
-        return buf[0..1]; // 全消光 → 根
+    if (len == prefix_len) {
+        if (len + 1 > buf.len) return null;
+        buf[len] = '/';
+        return buf[0 .. len + 1]; // 全消光 → 根("/" 或 "C:/")
     }
     return buf[0..len];
 }
@@ -1089,6 +1148,40 @@ test "P1 修复: 绝对锚 //etc/** deny 规则不再 fail-open(实际匹配 /et
     // 非 /etc 路径不误伤
     const args2 = try std.fmt.bufPrint(&abuf, "{{\"file_path\":\"/proj/src/a.zig\"}}", .{});
     try testing.expect(!matchesMode(&r, &mctx, "Edit", args2, .deny));
+}
+
+test "Windows: normalizeLexical 盘符/反斜杠/大小写规范化" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings("D:/a/b", normalizeLexical(&buf, "d:\\a\\.\\c\\..\\b").?);
+    try testing.expectEqualStrings("C:/", normalizeLexical(&buf, "C:\\").?);
+    try testing.expectEqualStrings("C:/", normalizeLexical(&buf, "C:/x/../..").?); // 盘符根 clamp
+    try testing.expect(normalizeLexical(&buf, "C:foo") == null); // 盘符相对拒绝
+    try testing.expectEqualStrings("/tmp/x", normalizeLexical(&buf, "/tmp//x/.").?); // POSIX 形原语义
+}
+
+test "Windows: 盘符绝对路径规则命中(cwd 锚 + 绝对锚 + 大小写不敏感)" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    // cwd 锚:allow Write(./src/**),cwd=D:\proj → D:/proj/src 命中(分隔符/大小写混用)
+    {
+        const r = try parseRule("Write(./src/**)");
+        const mctx = MatchContext{ .cwd = "D:\\proj", .project_root = "D:\\proj" };
+        var abuf: [256]u8 = undefined;
+        const args = try std.fmt.bufPrint(&abuf, "{{\"file_path\":\"D:/proj/src/a.zig\"}}", .{});
+        try testing.expect(matchesMode(&r, &mctx, "Write", args, .allow));
+        const args_case = try std.fmt.bufPrint(&abuf, "{{\"file_path\":\"d:/PROJ/src/b.zig\"}}", .{});
+        try testing.expect(matchesMode(&r, &mctx, "Write", args_case, .allow));
+        const args_out = try std.fmt.bufPrint(&abuf, "{{\"file_path\":\"D:/other/src/c.zig\"}}", .{});
+        try testing.expect(!matchesMode(&r, &mctx, "Write", args_out, .allow));
+    }
+    // 绝对锚:deny //Users/x/** → 任意盘符根下的 Users/x 命中(盘符根即文件系统根)
+    {
+        const r = try parseRule("Write(//Users/x/**)");
+        const mctx = MatchContext{ .cwd = "D:\\proj", .project_root = "D:\\proj" };
+        var abuf: [256]u8 = undefined;
+        const args = try std.fmt.bufPrint(&abuf, "{{\"file_path\":\"C:/Users/x/key.pem\"}}", .{});
+        try testing.expect(matchesMode(&r, &mctx, "Write", args, .deny));
+    }
 }
 
 test "P1 修复: 绝对锚 allow //Users/x/secrets/** 命中" {

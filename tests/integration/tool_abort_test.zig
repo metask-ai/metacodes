@@ -14,9 +14,7 @@ test "Bash tool aborts sleep within 3s" {
     // 200ms 后触发 abort
     const trigger = try std.Thread.spawn(.{}, struct {
         fn run(s: *cc.util_abort.AbortSignal) void {
-            const req = std.c.timespec{ .sec = 0, .nsec = 200 * 1000 * 1000 };
-            var rem: std.c.timespec = undefined;
-            _ = std.c.nanosleep(&req, &rem);
+            cc.util_time.sleepMs(200);
             s.abort(.user_ctrl_c);
         }
     }.run, .{&sig});
@@ -32,7 +30,6 @@ test "Bash tool aborts sleep within 3s" {
 }
 
 fn nowMs() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
-    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+    // 测的是"几秒量级的耗时上界",wall clock 足够;std.c.clock_gettime 在 Windows 编不过。
+    return cc.util_time.nowMs();
 }

@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const cc = @import("cc");
+const pfs = @import("platform").fs; // 可移植文件 IO(std.c.open 的 O 在 Windows 是 void)
 
 const tp = cc.swarm_teammate_process;
 const team = cc.swarm_team;
@@ -109,10 +110,10 @@ test "L2 SW6 B: worktree 隔离 create + remove(真 git)" {
     // 建个文件 + commit。
     var fb: [200:0]u8 = undefined;
     const fp = try std.fmt.bufPrintZ(&fb, "{s}/README", .{root});
-    const fd = std.c.open(fp.ptr, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(fp.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     if (fd >= 0) {
-        _ = std.c.write(fd, "hi", 2);
-        _ = std.c.close(fd);
+        _ = pfs.write(fd, "hi");
+        pfs.close(fd);
     }
     _ = runGit(a, root, &.{ "add", "-A" });
     if (!runGit(a, root, &.{ "commit", "-q", "-m", "init" })) return error.SkipZigTest;

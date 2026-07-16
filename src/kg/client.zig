@@ -328,47 +328,33 @@ pub const KgClient = struct {
         return null;
     }
 
-    extern "c" fn _NSGetExecutablePath(buf: [*]u8, bufsize: *u32) c_int;
-
     /// OS 级真实 exe 目录(**不依赖 argv[0]**,PATH 裸名启动也可靠——修 exe_dir=null 静默落 dev
-    /// 的根)。macOS `_NSGetExecutablePath` / Linux `/proc/self/exe`,realpath 解 symlink(安装
-    /// 常经 /usr/local/bin symlink)。失败/不支持平台 → null。返回 slice 承接在 buf。
+    /// 的根)。三 OS 实现收敛在 platform.paths.selfExePath(macOS/Linux/Windows),此处补
+    /// realpath 解 symlink(安装常经 /usr/local/bin symlink)+ 取 dirname。失败 → null。
     fn selfExeDir(buf: []u8) ?[]const u8 {
-        const builtin = @import("builtin");
-        var raw: [std.fs.max_path_bytes:0]u8 = undefined;
-        const exe_path: [:0]const u8 = switch (builtin.os.tag) {
-            .macos, .ios, .tvos, .watchos => blk: {
-                var size: u32 = @intCast(raw.len);
-                if (_NSGetExecutablePath(&raw, &size) != 0) return null;
-                const len = std.mem.indexOfScalar(u8, raw[0..], 0) orelse return null;
-                break :blk raw[0..len :0];
-            },
-            .linux => blk: {
-                const n = std.c.readlink("/proc/self/exe", &raw, raw.len);
-                if (n <= 0) return null;
-                const un: usize = @intCast(n);
-                if (un >= raw.len) return null;
-                raw[un] = 0;
-                break :blk raw[0..un :0];
-            },
-            else => return null,
-        };
+        var raw: [std.fs.max_path_bytes]u8 = undefined;
+        const exe_slice = @import("platform").paths.selfExePath(&raw) orelse return null;
+        var exe_z_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
+        if (exe_slice.len >= exe_z_buf.len) return null;
+        @memcpy(exe_z_buf[0..exe_slice.len], exe_slice);
+        exe_z_buf[exe_slice.len] = 0;
         var rp: [std.fs.max_path_bytes]u8 = undefined;
-        const resolved = pfs.realpath(exe_path.ptr, &rp);
-        const full: []const u8 = if (resolved != null) std.mem.span(resolved.?) else exe_path;
+        const resolved = pfs.realpath(@ptrCast(&exe_z_buf), &rp);
+        const full: []const u8 = if (resolved != null) std.mem.span(resolved.?) else exe_slice;
         const dir = std.fs.path.dirname(full) orelse return null;
         if (dir.len == 0 or dir.len >= buf.len) return null;
         @memcpy(buf[0..dir.len], dir);
         return buf[0..dir.len];
     }
 
-    /// 自 start_dir 向上逐级(≤6 级)找 `<dir>/vendor/tinykg/tinykg`。
+    /// 自 start_dir 向上逐级(≤6 级)找 `<dir>/vendor/tinykg/tinykg[.exe]`。
     /// zig-out/bin 布局需上溯两级到 cc-zig/vendor;安装布局 <prefix>/bin 上溯一级到 <prefix>/vendor。
     fn findVendoredUpward(allocator: std.mem.Allocator, start_dir: []const u8) !?[]u8 {
+        const bin_name = if (@import("builtin").os.tag == .windows) "tinykg.exe" else "tinykg";
         var cur: []const u8 = start_dir;
         var level: usize = 0;
         while (level < 6) : (level += 1) {
-            const cand = try std.fmt.allocPrint(allocator, "{s}/vendor/tinykg/tinykg", .{cur});
+            const cand = try std.fmt.allocPrint(allocator, "{s}/vendor/tinykg/{s}", .{ cur, bin_name });
             if (isExecutable(cand)) return cand;
             allocator.free(cand);
             cur = std.fs.path.dirname(cur) orelse break;
@@ -386,7 +372,9 @@ pub const KgClient = struct {
         if (path.len >= buf.len) return false;
         @memcpy(buf[0..path.len], path);
         buf[path.len] = 0;
-        return std.c.access(buf[0..path.len :0].ptr, std.c.X_OK) == 0;
+        // Windows:CRT _access 无 X_OK 概念(mode 1 非法)→ 存在即可执行(.exe 语义)。
+        const mode: c_uint = if (@import("builtin").os.tag == .windows) std.c.F_OK else std.c.X_OK;
+        return std.c.access(buf[0..path.len :0].ptr, mode) == 0;
     }
 
     // ── 就绪与版本门(设计 §1 D2、§6)────────────────────────────────

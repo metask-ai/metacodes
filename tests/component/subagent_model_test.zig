@@ -351,9 +351,7 @@ test "L2 #12(Linus review): 后台 subagent 也继承父 sandbox(run_in_backgrou
     var waited: u32 = 0;
     while (waited < 3000) : (waited += 20) {
         if (g_sbx_probe != .unset) break;
-        var ts = std.c.timespec{ .sec = 0, .nsec = 20 * 1_000_000 };
-        var rem: std.c.timespec = undefined;
-        _ = std.c.nanosleep(&ts, &rem);
+        cc.util_time.sleepMs(20); // 可移植(POSIX nanosleep / Windows Sleep)
     }
     // 修前:后台 SpawnOptions 不透传 sandbox → 后台工具 ctx.sandbox==null(.none)。修后:.enabled。
     try std.testing.expectEqual(@as(@TypeOf(g_sbx_probe), .enabled), g_sbx_probe);

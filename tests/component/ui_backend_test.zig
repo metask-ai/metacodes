@@ -12,6 +12,8 @@
 const std = @import("std");
 const testing = std.testing;
 const cc = @import("cc");
+const pfs = @import("platform").fs; // 可移植文件 IO(std.c.open 的 O 在 Windows 是 void)
+const ppaths = @import("platform").paths;
 
 const ui_event = cc.ui_event;
 const ui_backend = cc.ui_backend;
@@ -105,7 +107,7 @@ test "mock backend: poll 按序产出 UiEvent" {
 
 fn makeRegion(allocator: std.mem.Allocator) !render_region.RenderRegion {
     // /dev/null fd:getSize 失败回退 24x80;generating=false 故 emit 不写终端。
-    const fd = std.c.open("/dev/null", std.c.O{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(ppaths.null_device, .{ .ACCMODE = .WRONLY }, 0);
     if (fd < 0) return error.OpenDevNull;
     const th = theme_mod.select(.dark, .none);
     return render_region.RenderRegion.init(allocator, fd, th, .none);

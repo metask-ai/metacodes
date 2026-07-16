@@ -10,6 +10,8 @@
 const std = @import("std");
 const harness = @import("harness");
 const cc = @import("cc");
+const pfs = @import("platform").fs; // 可移植文件 IO(std.c.open 的 O 在 Windows 是 void)
+const ppaths = @import("platform").paths;
 
 const MINIMAL_END_TURN_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
@@ -37,11 +39,12 @@ test "L2 Stage6: HTTP 401 → error.Unauthorized 且 body 进日志" {
     const a = std.testing.allocator;
 
     // 1) 准备临时日志文件 + 注入(绕过 METACODES_LOG_FILE 一次性 init)
-    const full_path = "/tmp/cc-zig-http-error-test.log";
-    const fd = std.c.open(full_path, std.c.O{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    var lp_buf: [512]u8 = undefined;
+    const full_path = try std.fmt.bufPrintZ(&lp_buf, "{s}/cc-zig-http-error-test.log", .{ppaths.tempDir()});
+    const fd = pfs.open(full_path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .TRUNC = true }, 0o644);
     try std.testing.expect(fd >= 0);
-    defer _ = std.c.close(fd);
-    defer _ = std.c.unlink(full_path);
+    defer pfs.close(fd);
+    defer _ = std.c.unlink(full_path.ptr);
     cc.util_log.setLogFileFdForTest(fd);
     cc.util_log.setLevel(.debug);
 
@@ -69,8 +72,8 @@ test "L2 Stage6: HTTP 401 → error.Unauthorized 且 body 进日志" {
 
     // 4) 读日志文件,断言含 body 摘要
     var read_buf: [8192]u8 = undefined;
-    _ = std.c.lseek(fd, 0, std.c.SEEK.SET);
-    const n = std.c.read(fd, &read_buf, read_buf.len);
+    _ = pfs.lseek(fd, 0, .set);
+    const n = pfs.read(fd, &read_buf);
     try std.testing.expect(n > 0);
     const log_content = read_buf[0..@intCast(n)];
     try std.testing.expect(std.mem.indexOf(u8, log_content, "body=") != null);

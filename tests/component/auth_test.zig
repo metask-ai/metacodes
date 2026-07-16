@@ -6,8 +6,18 @@ const std = @import("std");
 const harness = @import("harness");
 const cc = @import("cc");
 
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+// 可移植 env 写入走 platform.paths(POSIX setenv / Windows _putenv_s)。
+// 保留 POSIX 调用形状的薄壳,免改下面二十多个调用点。
+const ppaths = @import("platform").paths;
+fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int {
+    _ = overwrite;
+    ppaths.setEnv(name, value);
+    return 0;
+}
+fn unsetenv(name: [*:0]const u8) c_int {
+    ppaths.unsetEnv(name);
+    return 0;
+}
 
 const OK_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
@@ -262,27 +272,16 @@ const CallbackInput = struct {
 };
 
 fn sendCallback(input: CallbackInput) void {
-    var req_ts = std.c.timespec{ .sec = 0, .nsec = 150 * 1000 * 1000 };
-    _ = std.c.nanosleep(&req_ts, null);
-    const sock = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
-    if (sock < 0) return;
-    defer _ = std.c.close(sock);
-    var addr = std.c.sockaddr.in{
-        .family = std.c.AF.INET,
-        .port = std.mem.nativeToBig(u16, input.port),
-        .addr = 0x0100007f,
-        .zero = [_]u8{0} ** 8,
-    };
-    if (std.c.connect(sock, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) return;
+    cc.util_time.sleepMs(150);
     var buf: [1024]u8 = undefined;
     const req = std.fmt.bufPrint(
         &buf,
         "GET /auth/callback?code={s}&state={s} HTTP/1.1\r\nHost: localhost:{d}\r\nConnection: close\r\n\r\n",
         .{ input.code, input.state, input.port },
     ) catch return;
-    _ = std.c.write(sock, req.ptr, req.len);
-    var tmp: [256]u8 = undefined;
-    _ = std.c.read(sock, &tmp, tmp.len);
+    // fire-and-forget:响应内容不重要,只要请求送达回调 server。
+    const resp = harness.clientRoundtrip(std.heap.page_allocator, input.port, req, null) catch return;
+    std.heap.page_allocator.free(resp);
 }
 
 test "L2 auth: browser OAuth callback exchanges code for stored OAuth credentials" {

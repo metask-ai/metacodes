@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const pfs = @import("platform").fs;
+const psync = @import("platform").sync;
 const harness = @import("harness");
 const Cassette = @import("cassette").Cassette;
 
@@ -14,7 +15,9 @@ pub fn main(init: std.process.Init) !void {
     const a = std.heap.page_allocator;
 
     // argv[1] = cassette 目录(走 std.process.Init,与主二进制同入口约定)。
-    var args = std.process.Args.iterate(init.minimal.args);
+    // iterateAllocator:Windows 上 iterate 是 @compileError(须 allocator 版解析 WTF-8 命令行)。
+    var args = std.process.Args.iterateAllocator(init.minimal.args, a) catch std.process.exit(2);
+    defer args.deinit();
     _ = args.next(); // argv[0]
     const dir_arg = args.next() orelse {
         const msg = "usage: replay_server <cassette_dir>\n";
@@ -44,8 +47,6 @@ pub fn main(init: std.process.Init) !void {
 
     // 阻塞直到被杀(shell 跑完场景后 kill 本进程)
     while (true) {
-        const req = std.c.timespec{ .sec = 1, .nsec = 0 };
-        var rem: std.c.timespec = undefined;
-        _ = std.c.nanosleep(&req, &rem);
+        psync.sleepMs(1000); // 可移植(POSIX nanosleep / Windows Sleep)
     }
 }

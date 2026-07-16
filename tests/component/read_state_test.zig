@@ -5,14 +5,15 @@
 
 const std = @import("std");
 const cc = @import("cc");
+const pfs = @import("platform").fs; // 可移植文件 IO(std.c.open 的 O 在 Windows 是 void)
 
 const ReadState = cc.core_read_state.ReadState;
 
 fn writeFile(path: [*:0]const u8, content: []const u8) void {
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+    const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
     if (fd < 0) return;
-    defer _ = std.c.close(fd);
-    _ = std.c.write(fd, content.ptr, content.len);
+    defer pfs.close(fd);
+    _ = pfs.write(fd, content);
 }
 
 test "L2 read_state: hashFileContent 一致 + 内容变则哈希变" {

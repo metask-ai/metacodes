@@ -4,12 +4,29 @@
 乱码/键失常。改成白名单 gate(对齐真 cc terminal.ts:167)。这些 case 验 cc-zig **发什么字节**
 (pty 能测);真终端如何响应需用户真机抓。
 """
+import sys
+
 from tty_driver import run
 from asserts import TTYAssert
 from screen import Screen
 
+try:
+    from e2e_helpers import SkipTest
+except Exception:  # noqa: BLE001
+    class SkipTest(Exception):
+        pass
+
+
+def _skip_if_conpty():
+    """Windows/ConPTY 重合成输出流:应用发出的私有模式(?2004h、kitty >1u/=4;2m)被
+    conhost 消费不透传,此层观测不到"发了什么字节"——这些断言是 POSIX-pty 专属。
+    (Windows 上 paste/键协议功能本身由 console 模式 + VT input 提供,另有用例覆盖。)"""
+    if sys.platform == "win32":
+        raise SkipTest("ConPTY 不透传应用私有模式序列,字节级断言仅 POSIX-pty 可测")
+
 
 def test_apple_terminal_no_kitty(bin_path):
+    _skip_if_conpty()
     # Apple Terminal:不发 Kitty 协议(\x1b[>1u / >4;2m),但 bracketed paste 仍发。
     raw = run(bin_path, ["sleep:0.8"], env={"TERM_PROGRAM": "Apple_Terminal", "TERM": "xterm-256color"})
     assert b"\x1b[>1u" not in raw, "Apple Terminal 不应发 Kitty enable \\x1b[>1u"
@@ -18,12 +35,14 @@ def test_apple_terminal_no_kitty(bin_path):
 
 
 def test_warp_sends_kitty(bin_path):
+    _skip_if_conpty()
     # Warp(白名单):发 Kitty enable —— 实测其默认未开,需 cc-zig 主动发才能 Shift+Enter 换行。
     raw = run(bin_path, ["sleep:0.8"], env={"TERM_PROGRAM": "WarpTerminal", "TERM": "xterm-256color"})
     assert b"\x1b[>1u" in raw, "Warp 应发 Kitty enable \\x1b[>1u"
 
 
 def test_iterm_sends_kitty(bin_path):
+    _skip_if_conpty()
     raw = run(bin_path, ["sleep:0.8"], env={"TERM_PROGRAM": "iTerm.app", "TERM": "xterm-256color"})
     assert b"\x1b[>1u" in raw, "iTerm 应发 Kitty enable"
 

@@ -11,6 +11,7 @@
 //!   var srv = try MockServer.startCassette(cas.bodies, 0);
 
 const std = @import("std");
+const pfs = @import("platform").fs; // 可移植文件 IO(std.c.open 的 O 在 Windows 是 void)
 
 // libc dirent(macOS/Linux 通用最小声明)。
 const DIR = opaque {};
@@ -82,14 +83,14 @@ pub const Cassette = struct {
 fn readFileAlloc(allocator: std.mem.Allocator, dir: []const u8, name: []const u8) ![]u8 {
     var pbuf: [std.fs.max_path_bytes + 1]u8 = undefined;
     const full = try std.fmt.bufPrint(&pbuf, "{s}/{s}\x00", .{ dir, name });
-    const fd = std.c.open(@ptrCast(full.ptr), std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(@ptrCast(full.ptr), .{ .ACCMODE = .RDONLY }, 0);
     if (fd < 0) return error.FileNotFound;
-    defer _ = std.c.close(fd);
+    defer pfs.close(fd);
     var all: std.ArrayList(u8) = .empty;
     errdefer all.deinit(allocator);
     var buf: [8192]u8 = undefined;
     while (true) {
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = pfs.read(fd, &buf);
         if (n < 0) return error.ReadFailed;
         if (n == 0) break;
         try all.appendSlice(allocator, buf[0..@intCast(n)]);

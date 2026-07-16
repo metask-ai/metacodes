@@ -336,20 +336,20 @@ test "U8: --resume-response 解析进 config.resume_response(内联 + @file)" {
     }
     {
         // @file:从文件读。写临时文件后解析。
-        // 用 std.c 直接读写(web_ui_test.zig 在主 test 目标是 root 模块,无 platform dep;裁剪 std
-        // 无 std.fs.cwd)。对齐其它组件测试惯例(http_error_test 等)。U8 原用 @import("platform") 编译
-        // 错(仅 test:new 有 platform dep),PM review 抓到。
-        const path = "/tmp/cc-zig-u8-resume-resp.json";
-        var pbuf: [128]u8 = undefined;
-        @memcpy(pbuf[0..path.len], path);
-        pbuf[path.len] = 0;
-        const fd = std.c.open(@ptrCast(&pbuf), std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
-        try std.testing.expect(fd >= 0);
+        // 文件 IO 走 platform.fs + 路径走 paths.tempDir:std.c.open 的 `O` 在 Windows 是 void
+        // (编不过),"/tmp" 在 Windows 不存在。所有测试模块现已接 platform dep(build.zig)。
+        const ppaths = @import("platform").paths;
+        const pfs = @import("platform").fs;
+        var pbuf: [512]u8 = undefined;
+        const path = try std.fmt.bufPrintZ(&pbuf, "{s}/cc-zig-u8-resume-resp.json", .{ppaths.tempDir()});
+        const fd = try pfs.openZ(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o600);
         const content = "{\"answer\":42}";
-        _ = std.c.write(fd, content.ptr, content.len);
-        _ = std.c.close(fd);
-        defer _ = std.c.unlink(@ptrCast(&pbuf));
-        const argv = [_][*:0]const u8{ "metacodes", "--resume-response", "@/tmp/cc-zig-u8-resume-resp.json" };
+        _ = pfs.write(fd, content);
+        pfs.close(fd);
+        defer _ = std.c.unlink(path.ptr);
+        var argbuf: [600]u8 = undefined;
+        const at_arg = try std.fmt.bufPrintZ(&argbuf, "@{s}", .{path});
+        const argv = [_][*:0]const u8{ "metacodes", "--resume-response", at_arg.ptr };
         const cfg = cc.parseArgsForTest(&argv, a);
         defer if (cfg.resume_response) |r| a.free(r); // owned(readFileAll dupe),须释放
         try std.testing.expect(cfg.resume_response != null);
@@ -435,35 +435,6 @@ fn httpPost(a: std.mem.Allocator, port: u16, path: []const u8, body: []const u8)
 }
 
 fn roundtrip(a: std.mem.Allocator, port: u16, raw: []const u8, until: ?[]const u8) ![]u8 {
-    const fd = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
-    if (fd < 0) return error.SocketFailed;
-    defer _ = std.c.close(fd);
-    var addr = std.c.sockaddr.in{
-        .family = std.c.AF.INET,
-        .port = std.mem.nativeToBig(u16, port),
-        .addr = 0x0100007f,
-        .zero = [_]u8{0} ** 8,
-    };
-    if (std.c.connect(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) < 0) return error.ConnectFailed;
-    const tv = std.c.timeval{ .sec = 5, .usec = 0 };
-    _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.RCVTIMEO, &tv, @sizeOf(std.c.timeval));
-
-    var pos: usize = 0;
-    while (pos < raw.len) {
-        const n = std.c.write(fd, raw.ptr + pos, raw.len - pos);
-        if (n <= 0) return error.WriteFailed;
-        pos += @intCast(n);
-    }
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(a);
-    var chunk: [4096]u8 = undefined;
-    while (true) {
-        const n = std.c.read(fd, &chunk, chunk.len);
-        if (n <= 0) break;
-        try out.appendSlice(a, chunk[0..@intCast(n)]);
-        if (until) |u| {
-            if (std.mem.indexOf(u8, out.items, u) != null) break;
-        }
-    }
-    return out.toOwnedSlice(a);
+    // 收敛到 harness.clientRoundtrip(platform/net 双后端;裸 std.c socket 在 Windows 编不过)。
+    return harness.clientRoundtrip(a, port, raw, until);
 }

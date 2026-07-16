@@ -523,7 +523,7 @@ pub const TuiBackend = struct {
             }
 
             var b: [1]u8 = undefined;
-            const n = pfs.read(fd, &b);
+            const n = platform_term.readInput(fd, &b); // console 宽读统一入口(review-2 F4)
             if (n <= 0) continue;
 
             const key = parser.feed(b[0]) orelse continue; // 多字节(UTF-8/CSI)攒够再出 Key

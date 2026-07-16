@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const cc = @import("cc");
+const pfs = @import("platform").fs; // 可移植文件 IO(std.c.open 的 O 在 Windows 是 void)
 
 fn makeAgent(parent: []const u8, filename: []const u8, md: []const u8) !void {
     const a = std.testing.allocator;
@@ -10,9 +11,9 @@ fn makeAgent(parent: []const u8, filename: []const u8, md: []const u8) !void {
     _ = std.c.mkdir(parent_z, 0o755);
     const md_path = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ parent, filename }, 0);
     defer a.free(md_path);
-    const fd = std.c.open(md_path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
-    _ = std.c.write(fd, md.ptr, md.len);
-    _ = std.c.close(fd);
+    const fd = pfs.open(md_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    _ = pfs.write(fd, md);
+    pfs.close(fd);
 }
 
 fn rmAgent(parent: []const u8, filename: []const u8) void {

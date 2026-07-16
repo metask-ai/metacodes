@@ -11,9 +11,18 @@
 const std = @import("std");
 const cc = @import("cc");
 
-// std.c 未导出 setenv/unsetenv,直接 extern。
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+// 可移植 env 写入走 platform.paths(POSIX setenv / Windows _putenv_s)。
+// 保留 POSIX 调用形状的薄壳,免改下面的调用点。
+const ppaths = @import("platform").paths;
+fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int {
+    _ = overwrite;
+    ppaths.setEnv(name, value);
+    return 0;
+}
+fn unsetenv(name: [*:0]const u8) c_int {
+    ppaths.unsetEnv(name);
+    return 0;
+}
 
 const PREFIX = "METACODES_PROMPT_OVERRIDE_";
 

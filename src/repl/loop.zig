@@ -764,7 +764,7 @@ fn drainStdin(fd: c_int) void {
     while (true) {
         if (platform_term.waitReadable(fd, 0) <= 0) return; // 可移植:timeout=0 立即返回
         var buf: [256]u8 = undefined;
-        const n = pfs.read(fd, buf[0..buf.len]);
+        const n = platform_term.readInput(fd, buf[0..buf.len]);
         if (n <= 0) return;
     }
 }
@@ -775,7 +775,9 @@ fn readLineBuffered(allocator: std.mem.Allocator) ![]u8 {
     var len: usize = 0;
     while (len < buf.len) {
         var b: [1]u8 = undefined;
-        const n = pfs.readZ(0, &b) catch return error.ReadError;
+        const n_i = platform_term.readInput(0, &b);
+        if (n_i < 0) return error.ReadError;
+        const n: usize = @intCast(n_i);
         if (n == 0) {
             if (len == 0) return error.Eof;
             break;
@@ -811,8 +813,8 @@ fn handlePaste(
     // 其它控制键在粘贴内罕见，按其原始字节收集（保留 \n \t 等）。
     while (true) {
         var b: [1]u8 = undefined;
-        const n = pfs.readZ(fd, &b) catch break;
-        if (n == 0) break;
+        const n = platform_term.readInput(fd, &b);
+        if (n <= 0) break;
         const key = parser.feed(b[0]) orelse {
             // parser 处于 CSI 中间态——字节已被吞，等下一个
             continue;
@@ -873,6 +875,8 @@ var g_paste_id: usize = 0;
 /// SIGWINCH(终端 resize)标志。handler 只 atomic-store(async-signal-safe),
 /// readLineRaw 的 poll 循环超时时观察它 → 立即重画输入框自适应新宽度。
 var g_winch = std.atomic.Value(bool).init(false);
+/// Windows resize 轮询的上次尺寸(无 SIGWINCH,poll 超时 tick 比对;仅 REPL 单线程读写)。
+var g_last_ws: ?platform_term.TermSize = null;
 
 fn onWinch() void {
     g_winch.store(true, .release);
@@ -999,6 +1003,18 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                     synthetic_key = k;
                     break;
                 }
+                // Windows 无 SIGWINCH:超时 tick(200ms)轮询 console 尺寸,变化置
+                // g_winch 走同一重画路径(W4 ConsoleInput resize 事件的轻量替代)。
+                if (@import("builtin").os.tag == .windows) {
+                    if (platform_term.windowSize(fd)) |ws| {
+                        if (g_last_ws == null) {
+                            g_last_ws = ws;
+                        } else if (ws.rows != g_last_ws.?.rows or ws.cols != g_last_ws.?.cols) {
+                            g_last_ws = ws;
+                            g_winch.store(true, .release);
+                        }
+                    }
+                }
                 continue; // <0=EINTR(被 SIGWINCH 中断) / 0=超时 → 回头查 flag
             }
             if (rc > 0) break; // 有字节可读
@@ -1007,7 +1023,8 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
         // 取键:合成键(孤立 ESC 超时兑现)优先;否则读一字节喂 parser。
         // parser.feed 返 null = 序列未完成(如刚收 ESC / CSI 中段)→ 回头继续读。
         const key = if (synthetic_key) |sk| sk else blk: {
-            const n = pfs.readZ(fd, &b) catch return error.ReadError;
+            const n = platform_term.readInput(fd, &b);
+            if (n < 0) return error.ReadError;
             if (n == 0) return error.Eof;
 
             // vim 模式 + NORMAL/VISUAL:字节路由到 vim 状态机(Enter/Esc 例外)
@@ -1431,8 +1448,8 @@ fn handleReverseSearch(
         std.debug.print("\r\x1b[2K(reverse-search)`{s}': {s}", .{ query.items, match orelse "" });
 
         var b: [1]u8 = undefined;
-        const n = pfs.readZ(fd, &b) catch return;
-        if (n == 0) return;
+        const n = platform_term.readInput(fd, &b);
+        if (n <= 0) return;
         const c = b[0];
 
         if (c == 0x1b) {
@@ -1440,7 +1457,9 @@ fn handleReverseSearch(
             // 非 '[' → 裸 Esc 取消;'[' → 解析 CSI codepoint(27=Esc 取消 / 13=Enter 接受 / 其余忽略并吞掉序列)。
             // 不解析会把 `[27u` 等字节漏给下一轮 read 成乱码(白名单终端 reverse-search 的 CSI-u 盲区)。
             var nb: [1]u8 = undefined;
-            const nn = pfs.readZ(fd, &nb) catch return;
+            const nn_i = platform_term.readInput(fd, &nb);
+            if (nn_i <= 0) return;
+            const nn: usize = @intCast(nn_i);
             if (nn == 0 or nb[0] != '[') {
                 std.debug.print("\r\x1b[2K", .{}); // 裸 Esc → 取消
                 return;
@@ -1450,7 +1469,9 @@ fn handleReverseSearch(
             var in_mod = false;
             while (true) {
                 var sx: [1]u8 = undefined;
-                const sn = pfs.readZ(fd, &sx) catch break;
+                const sn_i = platform_term.readInput(fd, &sx);
+                if (sn_i <= 0) break;
+                const sn: usize = @intCast(sn_i);
                 if (sn == 0) break;
                 const ch = sx[0];
                 if (ch >= '0' and ch <= '9') {

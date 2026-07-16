@@ -125,7 +125,13 @@ def test_tty_auto_compact_event_is_visible(bin_path):
             "type:trigger auto compact",
             "key:enter",
             "sleep:2.0",
-        ], base_url=base_url, env={"METACODES_TEST_HOOKS": "1"})
+        ], base_url=base_url, env={
+            "METACODES_TEST_HOOKS": "1",
+            # 钉死 auto-compact 阈值(该旋钮即为测试而设):真实阈值随模型上下文表浮动
+            # (隔离 HOME 初始化的 bundled 表首项是 200k 窗口,12×12KB 注入 ≈36K tokens
+            # 远够不到),不钉则用例在任何平台都依赖本机模型表——假环境耦合。
+            "METACODES_FORCE_COMPACT_AT": "8000",
+        })
     finally:
         server.shutdown()
     a = TTYAssert(raw)

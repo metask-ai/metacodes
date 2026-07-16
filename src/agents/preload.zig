@@ -161,18 +161,11 @@ fn readFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 /// 跑 `git status --porcelain` 拿当前快照,带 5s 超时。失败/非 git repo 静默。
 fn injectGitStatus(allocator: std.mem.Allocator, out: *std.Io.Writer.Allocating, opts: ContextOptions) !void {
     if (opts.project_dir.len == 0) return;
-    // 走 /usr/bin/env 让 git 跟随 PATH
-    const env_z: [*:0]const u8 = "/usr/bin/env";
-    const git_z: [*:0]const u8 = "git";
-    const opt1: [*:0]const u8 = "-C";
+    // 走 /usr/bin/env 让 git 跟随 PATH(Windows 后端在 buildWindowsCmdline 剥掉 env 前缀,
+    // 由 CreateProcessW 原生 PATH 搜索接管——平台差异收敛在 platform/process,这里保持统一形态)。
     const cwd_z = try allocator.dupeZ(u8, opts.project_dir);
     defer allocator.free(cwd_z);
-    const opt2: [*:0]const u8 = "status";
-    const opt3: [*:0]const u8 = "--porcelain";
-    var argv: [6]?[*:0]const u8 = .{ env_z, git_z, opt1, cwd_z.ptr, opt2, opt3 };
-    var argv_full: [7]?[*:0]const u8 = undefined;
-    @memcpy(argv_full[0..6], argv[0..6]);
-    argv_full[6] = null;
+    const argv_full = [_]?[*:0]const u8{ "/usr/bin/env", "git", "-C", cwd_z.ptr, "status", "--porcelain", null };
 
     const common = @import("../tools/common.zig");
     const status_out = common.spawnCaptureStdoutAbortableTimed(argv_full[0..], allocator, opts.abort, 5_000) catch return;

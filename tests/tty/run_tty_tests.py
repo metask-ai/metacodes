@@ -17,6 +17,12 @@ import time
 import importlib.util
 import traceback
 
+# Windows 控制台默认代码页(GBK 等)编不了 ▶/✓/⊘ → UnicodeEncodeError 直接带崩 runner。
+# 统一强制 UTF-8(POSIX 上本来就是,无变化);errors=replace 兜底任何环境。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)  # 让 cases 能 import screen/asserts/tty_driver
 

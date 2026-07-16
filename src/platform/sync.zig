@@ -93,6 +93,21 @@ extern "ntdll" fn RtlSleepConditionVariableSRW(
     Flags: win.ULONG,
 ) win.NTSTATUS;
 
+/// 可移植睡眠(毫秒)。POSIX nanosleep / Windows kernel32 Sleep。
+/// zig 0.16 std 已无 std.Thread.sleep;测试/harness 一律用这个(或 cc 模块内的
+/// util/time.sleepMs——那份为支持"单文件 zig test"保持自包含,两处实现语义一致)。
+pub fn sleepMs(ms: u64) void {
+    if (is_windows) {
+        Sleep(@intCast(@min(ms, std.math.maxInt(u32)))); // clamp:超 u32 上限的 ms 不 panic
+    } else {
+        var req: std.c.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * 1_000_000) };
+        var rem: std.c.timespec = undefined;
+        // EINTR 重试:信号打断时用 rem 续睡,保证时长语义。
+        while (std.c.nanosleep(&req, &rem) != 0) req = rem;
+    }
+}
+extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
+
 const WindowsMutex = struct {
     inner: win.SRWLOCK = .{},
 

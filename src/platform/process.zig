@@ -17,6 +17,15 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const is_windows = builtin.os.tag == .windows;
+const psync = @import("sync.zig");
+
+// Windows spawn 串行锁。bInheritHandles=TRUE 的 CreateProcessW 会把**并发线程**同窗口期
+// 创建的全部可继承句柄(别人的管道写端/落盘句柄)一并塞给本次子进程。长命子进程(MCP
+// server、bg job、teammate)握着别人 stdout 管道的写端 → 那条 capture 的 ReadFile 永不
+// EOF → reader join 永挂(全套件多线程 spawn 实测挂死,agent/swarm/skill-fork 组必现)。
+// 临界区 = 创建可继承句柄 → CreateProcessW → 关父端可继承副本;锁外做 stdin 写/等待/读。
+// 正解是 PROC_THREAD_ATTRIBUTE_HANDLE_LIST 白名单(roadmap);串行化是小而正确的第一刀。
+var g_spawn_serial: psync.Mutex = .{};
 
 pub const CaptureError = error{ SpawnFailed, PipeFailed, ReadError, OutOfMemory, Aborted, Timeout };
 
@@ -250,6 +259,16 @@ fn spawnPipesPosix(argv: []const ?[*:0]const u8, inherit_env: bool) CaptureError
 }
 
 fn spawnPipesWindows(argv: []const ?[*:0]const u8) CaptureError!PipeChild {
+    // cmdline 在建任何可继承句柄**之前**构造(review-2 F1):它可失败(argv 含非法
+    // UTF-8 即可,非只 OOM),若在句柄之后 early-return 会把可继承写端永久泄漏——
+    // 之后任何 bInheritHandles spawn 都会把它塞给不相干子进程,capture 永不 EOF。
+    const a = std.heap.page_allocator;
+    const cmdline = buildWindowsCmdline(a, argv) catch return error.SpawnFailed;
+    defer a.free(cmdline);
+    // 可继承句柄窗口期串行(见 g_spawn_serial)。
+    g_spawn_serial.lock();
+    var spawn_locked = true;
+    defer if (spawn_locked) g_spawn_serial.unlock();
     // stdin：read 端可继承（子读）、write 端父写；stdout：write 端可继承（子写）、read 端父读。
     var in_rd: win.HANDLE = undefined;
     var in_wr: win.HANDLE = undefined;
@@ -262,9 +281,6 @@ fn spawnPipesWindows(argv: []const ?[*:0]const u8) CaptureError!PipeChild {
         win.CloseHandle(in_wr);
         return error.PipeFailed;
     }
-    const a = std.heap.page_allocator;
-    const cmdline = buildWindowsCmdline(a, argv) catch return error.SpawnFailed;
-    defer a.free(cmdline);
     var si = std.mem.zeroes(win.STARTUPINFOW);
     si.cb = @sizeOf(win.STARTUPINFOW);
     si.dwFlags = win.STARTF_USESTDHANDLES;
@@ -275,6 +291,8 @@ fn spawnPipesWindows(argv: []const ?[*:0]const u8) CaptureError!PipeChild {
     const created = win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{}, null, null, &si, &pi);
     win.CloseHandle(in_rd); // 父端关子进程侧
     win.CloseHandle(out_wr);
+    g_spawn_serial.unlock(); // 可继承句柄的父端副本已全关
+    spawn_locked = false;
     if (created == .FALSE) {
         win.CloseHandle(in_wr);
         win.CloseHandle(out_rd);
@@ -310,11 +328,14 @@ pub fn spawnToFiles(argv: []const ?[*:0]const u8, out_fd: c_int, err_fd: c_int) 
     if (is_windows) {
         const out_h: win.HANDLE = @ptrFromInt(_get_osfhandle(out_fd));
         const err_h: win.HANDLE = @ptrFromInt(_get_osfhandle(err_fd));
-        _ = SetHandleInformation(out_h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-        _ = SetHandleInformation(err_h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
         const a = std.heap.page_allocator;
         const cmdline = buildWindowsCmdline(a, argv) catch return error.SpawnFailed;
         defer a.free(cmdline);
+        // 可继承句柄窗口期串行(见 g_spawn_serial);spawn 后立即撤销落盘 fd 的可继承标记
+        // ——fd 生命周期远长于本次 spawn,留着会泄给后续任何 bInheritHandles 子进程。
+        g_spawn_serial.lock();
+        _ = SetHandleInformation(out_h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        _ = SetHandleInformation(err_h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
         var si = std.mem.zeroes(win.STARTUPINFOW);
         si.cb = @sizeOf(win.STARTUPINFOW);
         si.dwFlags = win.STARTF_USESTDHANDLES;
@@ -322,7 +343,11 @@ pub fn spawnToFiles(argv: []const ?[*:0]const u8, out_fd: c_int, err_fd: c_int) 
         si.hStdError = err_h;
         si.hStdInput = null;
         var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
-        if (win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{ .detached_process = true }, null, null, &si, &pi) == .FALSE) return error.SpawnFailed;
+        const created = win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{ .detached_process = true }, null, null, &si, &pi);
+        _ = SetHandleInformation(out_h, HANDLE_FLAG_INHERIT, 0);
+        _ = SetHandleInformation(err_h, HANDLE_FLAG_INHERIT, 0);
+        g_spawn_serial.unlock();
+        if (created == .FALSE) return error.SpawnFailed;
         win.CloseHandle(pi.hThread);
         return pi.hProcess;
     }
@@ -657,6 +682,14 @@ fn openNulWrite() CaptureError!win.HANDLE {
 }
 
 fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts: CaptureOpts) CaptureError!Captured {
+    // cmdline 在建任何可继承句柄之前构造(review-2 F1):可失败(argv 非法 UTF-8/OOM),
+    // 若在句柄之后 early-return 会把可继承写端永久泄漏 → 后续任意 capture 永不 EOF。
+    const cmdline = buildWindowsCmdline(allocator, argv) catch return error.SpawnFailed;
+    defer allocator.free(cmdline);
+    // 可继承句柄窗口期串行(见 g_spawn_serial);锁外做 stdin 写与读取/等待。
+    g_spawn_serial.lock();
+    var spawn_locked = true;
+    defer if (spawn_locked) g_spawn_serial.unlock();
     var out_rd: win.HANDLE = undefined;
     var out_wr: win.HANDLE = undefined;
     try makeInheritablePipe(&out_rd, &out_wr);
@@ -704,9 +737,6 @@ fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, op
         in_wr = wr;
     }
 
-    const cmdline = buildWindowsCmdline(allocator, argv) catch return error.SpawnFailed;
-    defer allocator.free(cmdline);
-
     var si = std.mem.zeroes(win.STARTUPINFOW);
     si.cb = @sizeOf(win.STARTUPINFOW);
     si.dwFlags = win.STARTF_USESTDHANDLES;
@@ -716,10 +746,15 @@ fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, op
 
     var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
     const created = win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{}, null, null, &si, &pi);
+    // 父端**先**关掉全部可继承句柄副本(out_wr/in_rd/err_wr)再解串行锁——锁窗口 = 可继承
+    // 句柄存活期。stdin 写(in_wr 不可继承)移到锁外,大输入阻塞不占全局锁。
     win.CloseHandle(out_wr);
-    if (in_rd) |h| {
-        win.CloseHandle(h); // 父端关 stdin read 端（子已继承副本）
-        // 写 stdin_data 后关 write 端（发 EOF）。created 失败也要关，走下方 created 分支前先写。
+    if (in_rd) |h| win.CloseHandle(h); // 父端关 stdin read 端（子已继承副本）
+    win.CloseHandle(err_wr); // err_wr 恒有效(pipe wr 或 NUL),父端副本总要关
+    g_spawn_serial.unlock();
+    spawn_locked = false;
+    if (in_rd != null) {
+        // 写 stdin_data 后关 write 端（发 EOF）。created 失败也要关 in_wr。
         if (created != .FALSE) {
             const data = opts.stdin_data.?;
             var w: usize = 0;
@@ -731,7 +766,6 @@ fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, op
         }
         win.CloseHandle(in_wr);
     }
-    win.CloseHandle(err_wr); // err_wr 恒有效(pipe wr 或 NUL),父端副本总要关
     if (created == .FALSE) {
         win.CloseHandle(out_rd);
         if (err_rd) |h| win.CloseHandle(h);
@@ -815,14 +849,44 @@ fn captureWindows(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, op
 }
 
 /// argv(UTF-8 C 串) → Windows 命令行 UTF-16(带标准 quoting)。
-fn buildWindowsCmdline(allocator: std.mem.Allocator, argv: []const ?[*:0]const u8) ![:0]u16 {
+/// argv → 整条 WTF-16 命令行(CreateProcessW 参数形式;引号规则与 CommandLineToArgvW 往返一致)。
+///
+/// ⚠️ 本函数含 **exec 语义变换**,不是通用 argv→cmdline 序列化:
+///   ① 剥离 "/usr/bin/env" 前缀(翻译成 CreateProcessW 原生 PATH 搜索);
+///   ② argv[0] 正斜杠→反斜杠(CreateProcessW 不认相对路径正斜杠,实测 ERROR_FILE_NOT_FOUND)。
+/// pub 消费方 parseArgsForTest 依赖"argv[0] 恒为裸名(如 \"metacodes\")"这一前提——
+/// 若未来测试 argv[0] 含 '/' 或为 env,请改用纯 quoting 变体而非静默吞变换(review F9)。
+pub fn buildWindowsCmdline(allocator: std.mem.Allocator, argv: []const ?[*:0]const u8) ![:0]u16 {
     var u8buf = std.ArrayList(u8).empty;
     defer u8buf.deinit(allocator);
+    // "/usr/bin/env prog args" 的语义 = 按 PATH 解析 prog 再 exec——CreateProcessW 原生就
+    // 按 PATH 搜索模块。POSIX 调用方统一用 env 前缀,Windows 后端在此剥掉,免得每个
+    // 调用点各写一份 if(windows)。注意:不支持 `env KEY=VAL prog` 形态(仓内无此用法)。
+    var args = argv;
+    if (args.len > 0) {
+        if (args[0]) |a0| {
+            if (std.mem.eql(u8, std.mem.span(a0), "/usr/bin/env")) args = args[1..];
+        }
+    }
     var first = true;
-    for (argv) |a_opt| {
+    for (args) |a_opt| {
         const a = a_opt orelse break;
         if (!first) try u8buf.append(allocator, ' ');
-        first = false;
+        if (first) {
+            // argv[0](模块路径)正斜杠 → 反斜杠:CreateProcessW 对**相对路径**里的
+            // 正斜杠直接 ERROR_FILE_NOT_FOUND(ctypes 实测;绝对路径两种都认)。
+            // POSIX 风格相对路径("zig-out/bin/x")是跨平台调用方的常态,平台层归一。
+            var norm_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const span = std.mem.span(a);
+            if (span.len <= norm_buf.len and std.mem.indexOfScalar(u8, span, '/') != null) {
+                for (span, 0..) |c, i| norm_buf[i] = if (c == '/') '\\' else c;
+                try appendQuotedArg(allocator, &u8buf, norm_buf[0..span.len]);
+            } else {
+                try appendQuotedArg(allocator, &u8buf, span);
+            }
+            first = false;
+            continue;
+        }
         try appendQuotedArg(allocator, &u8buf, std.mem.span(a));
     }
     return try std.unicode.utf8ToUtf16LeAllocZ(allocator, u8buf.items);
@@ -967,4 +1031,14 @@ test "buildWindowsCmdline quoting" {
     const u8out = try std.unicode.utf16LeToUtf8Alloc(a, w);
     defer a.free(u8out);
     try std.testing.expectEqualStrings("prog \"a b\" \"c\\\"d\"", u8out);
+}
+
+test "buildWindowsCmdline: env 前缀剥离 + argv0 正斜杠归一(非 argv0 参数不动)" {
+    const a = std.testing.allocator;
+    const argv: []const ?[*:0]const u8 = &.{ "/usr/bin/env", "zig-out/bin/tool", "arg/with/slash", null };
+    const w = try buildWindowsCmdline(a, argv);
+    defer a.free(w);
+    const u8out = try std.unicode.utf16LeToUtf8Alloc(a, w);
+    defer a.free(u8out);
+    try std.testing.expectEqualStrings("zig-out\\bin\\tool arg/with/slash", u8out);
 }

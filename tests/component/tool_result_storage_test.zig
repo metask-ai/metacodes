@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const cc = @import("cc");
+const pfs = @import("platform").fs; // 可移植文件 IO(std.c.open 的 O 在 Windows 是 void)
 
 const storage = cc.tool_result_storage;
 
@@ -33,13 +34,13 @@ test "L2 落盘: 超阈值落盘 → preview+path,文件含全量" {
     const j = std.mem.indexOfScalarPos(u8, r, i, '"').?;
     const path = try a.dupeZ(u8, r[i..j]);
     defer a.free(path);
-    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = pfs.open(path.ptr, .{ .ACCMODE = .RDONLY }, 0);
     try std.testing.expect(fd >= 0);
-    defer _ = std.c.close(fd);
+    defer pfs.close(fd);
     var total: usize = 0;
     var buf: [8192]u8 = undefined;
     while (true) {
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = pfs.read(fd, &buf);
         if (n <= 0) break;
         total += @intCast(n);
     }

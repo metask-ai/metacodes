@@ -29,9 +29,7 @@ const TURN1_SSE = std.fmt.comptimePrint(TURN_SSE_FMT, .{"TURN1 DONE"});
 const TURN2_SSE = std.fmt.comptimePrint(TURN_SSE_FMT, .{"TURN2 DONE"});
 
 fn sleepMs(ms: u32) void {
-    var req = std.c.timespec{ .sec = 0, .nsec = @as(isize, @intCast(ms)) * 1_000_000 };
-    var rem: std.c.timespec = undefined;
-    _ = std.c.nanosleep(&req, &rem);
+    cc.util_time.sleepMs(ms); // 可移植(POSIX nanosleep / Windows Sleep)
 }
 
 /// 建隔离 HOME + team 目录 + config.json(lead 成员为空 roster)。返回 home(owned by buf)。

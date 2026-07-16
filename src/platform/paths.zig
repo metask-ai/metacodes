@@ -73,6 +73,39 @@ pub fn unsetEnv(name: [*:0]const u8) void {
     }
 }
 
+/// 本进程可执行文件绝对路径(**不依赖 argv[0]**,PATH 裸名启动也可靠)。写进 buf,返回 slice;
+/// 失败/不支持平台 → null。macOS `_NSGetExecutablePath` / Linux `/proc/self/exe` /
+/// Windows `GetModuleFileNameW`。消费方:swarm teammate fork-exec、KgClient vendored 定位。
+pub fn selfExePath(buf: []u8) ?[]const u8 {
+    switch (builtin.os.tag) {
+        .macos, .ios => {
+            var size: u32 = @intCast(buf.len);
+            if (_NSGetExecutablePath(buf.ptr, &size) != 0) return null;
+            const len = std.mem.indexOfScalar(u8, buf[0..@min(buf.len, size + 1)], 0) orelse return null;
+            return buf[0..len];
+        },
+        .linux => {
+            const n = std.c.readlink("/proc/self/exe", buf.ptr, buf.len);
+            if (n <= 0) return null;
+            // 恰好塞满 = 可能被截断(readlink 不补 NUL 也不报错)→ 拒绝,勿返回截断路径。
+            if (@as(usize, @intCast(n)) >= buf.len) return null;
+            return buf[0..@intCast(n)];
+        },
+        .windows => {
+            var wbuf: [4096]u16 = undefined;
+            const n = GetModuleFileNameW(null, &wbuf, wbuf.len);
+            if (n == 0 or n >= wbuf.len) return null;
+            // utf16LeToUtf8 不做输出边界检查(见 platform/dir.zig 同款注释):先保证最坏 3x 放得下。
+            if (buf.len < @as(usize, n) * 3) return null;
+            const len = std.unicode.utf16LeToUtf8(buf, wbuf[0..n]) catch return null;
+            return buf[0..len];
+        },
+        else => return null,
+    }
+}
+extern "c" fn _NSGetExecutablePath(buf: [*]u8, size: *u32) c_int;
+extern "kernel32" fn GetModuleFileNameW(hModule: ?*anyopaque, lpFilename: [*]u16, nSize: u32) callconv(.winapi) u32;
+
 /// 当前用户 id。POSIX getuid;Windows 无 uid 概念 → 用 GetCurrentProcessId 做进程私有目录
 /// 区分符(job 落盘目录仅需一个每进程/每用户稳定隔离前缀,非安全边界)。
 pub fn uid() u32 {

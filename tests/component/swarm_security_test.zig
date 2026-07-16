@@ -23,9 +23,7 @@ const TURN =
     "data: {\"type\":\"message_stop\"}\n\n";
 
 fn sleepMs(ms: u32) void {
-    var req = std.c.timespec{ .sec = 0, .nsec = @as(isize, @intCast(ms)) * 1_000_000 };
-    var rem: std.c.timespec = undefined;
-    _ = std.c.nanosleep(&req, &rem);
+    cc.util_time.sleepMs(ms); // 可移植(POSIX nanosleep / Windows Sleep)
 }
 
 fn setup(a: std.mem.Allocator, home_buf: []u8, url: []const u8) !swctx.SwarmContext {
