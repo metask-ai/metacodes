@@ -530,8 +530,8 @@ fn appendJsonStr(out: *std.ArrayList(u8), alloc: std.mem.Allocator, s: []const u
 // ============================================================================
 
 const testing = std.testing;
-const MOCK_LSP = "/Users/david/prj/cc-t2z/cc-zig/tests/_harness/mock_lsp_server.py";
-const MOCK_LSP_STUBBORN = "/Users/david/prj/cc-t2z/cc-zig/tests/_harness/mock_lsp_stubborn.py";
+const MOCK_LSP = "/Users/david/prj/cc-t2z/metacodes/tests/_harness/mock_lsp_server.py";
+const MOCK_LSP_STUBBORN = "/Users/david/prj/cc-t2z/metacodes/tests/_harness/mock_lsp_stubborn.py";
 const X_OK: c_int = 1;
 
 test "Client: initialize + didOpen → publishDiagnostics 端到端(mock LSP server)" {

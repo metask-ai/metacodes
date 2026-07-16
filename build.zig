@@ -1,12 +1,13 @@
 const std = @import("std");
 
-// hl-zig 轻量高亮模块(Y2:已取代 tree-sitter 做 diff 高亮)。纯 Zig + 嵌入 rules_blob.zlib,
-// 零 C 依赖,200+ 语言。共享一个 Module(每个 root 各按自身 optimize 编译其源;未用的 import 零成本)。
-// 需要高亮/符号的 module(经 tools/* 与 tui diff)都调一次。tree-sitter 已于 2026-07-13 整体移除。
+// highlight-zig 轻量高亮库(Y2:已取代 tree-sitter 做 diff 高亮)。纯 Zig + 嵌入 rules_blob.zlib,
+// 零 C 依赖,200+ 语言。作为 git submodule 位于 lib/highlight-zig(独立 repo
+// github.com/shuzuan-org/highlight-zig),纯 Zig 模块方式消费其源(每个 root 各按自身
+// optimize 编译;未用的 import 零成本)。tree-sitter 已于 2026-07-13 整体移除。
 var g_hl_mod: ?*std.Build.Module = null;
 fn addHl(b: *std.Build, mod: *std.Build.Module) void {
     if (g_hl_mod == null) {
-        g_hl_mod = b.createModule(.{ .root_source_file = b.path("vendor/hl-zig/src/lib.zig") });
+        g_hl_mod = b.createModule(.{ .root_source_file = b.path("lib/highlight-zig/src/lib.zig") });
     }
     mod.addImport("hl", g_hl_mod.?);
     addPlatform(b, mod); // platform 底座与 hl 同套模块（凡编译 app 代码者都需要）
@@ -104,7 +105,7 @@ pub fn build(b: *std.Build) void {
 
     // ── metacodes-core 可复用库 module(root=src/lib.zig,UI 图不可达)──────────
     // 供其他 Zig 项目经 build.zig.zon 依赖 `@import("metacodes-core")`。
-    // 经 tools/* 用 hl-zig 高亮 module → 必须 addHl。
+    // 经 tools/* 用 highlight-zig 高亮 module → 必须 addHl。
     const core_mod = b.addModule("metacodes-core", .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,

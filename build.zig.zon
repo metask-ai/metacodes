@@ -8,6 +8,7 @@
         "build.zig.zon",
         "src",
         "vendor",
+        "lib",
         "example",
         "doc/LIB_API.md",
     },

@@ -18,7 +18,7 @@ fn findBin(allocator: std.mem.Allocator) ?[]u8 {
     const home_c = std.c.getenv("HOME") orelse return null;
     const home = std.mem.span(home_c);
     const candidates = [_][]const u8{
-        "prj/cc-t2z/cc-zig/vendor/tinykg/tinykg",
+        "prj/cc-t2z/metacodes/vendor/tinykg/tinykg",
         "prj/tinykg/zig-out/bin/tinykg",
     };
     for (candidates) |rel| {
