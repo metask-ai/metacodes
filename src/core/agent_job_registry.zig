@@ -48,6 +48,9 @@ pub const JobEntry = struct {
     /// 保护下列 status/output_buf/final_text/stop_reason/turns/tool_calls/err_name。
     mutex: sync.Mutex = .{},
     status: JobStatus = .running,
+    /// **task#18**:done lifecycle 事件是否已发。job 线程只置 status(不能安全用父栈 trampoline
+    /// reporter);主/driver 线程 drainNewlyDone reap 时据此一次性发 done,避免重复。锁内读写。
+    done_emitted: bool = false,
     /// 增量输出缓冲。线程边跑边 append(持锁);TaskOutput since_byte 增量读。
     output_buf: std.ArrayList(u8) = .empty,
     final_text: ?[]u8 = null, // owned by allocator;done 后非空
@@ -623,6 +626,35 @@ pub const AgentJobRegistry = struct {
         return out;
     }
 
+    /// **task#18:后台 job done 事件的跨线程发射**。job 线程只置 e.status(终态),**不能**用父的栈
+    /// trampoline reporter(其生命周期=父轮,job 后台续跑时早失效 → 悬挂)。改由**主/driver 线程**周期
+    /// reap:排出"终态且 done 未发"的 job(锁内标 done_emitted 防重复,值语义 dup),caller 据此发
+    /// agent_lifecycle.done 到 session journal。返回 owned;freeDoneInfos 释放。
+    pub const DoneInfo = struct { id: []u8, status: JobStatus, turns: u32, tool_calls: u32, tokens: u64 };
+    pub fn drainNewlyDone(self: *AgentJobRegistry, allocator: std.mem.Allocator) ![]DoneInfo {
+        self.listLock();
+        defer self.listUnlock();
+        var list: std.ArrayList(DoneInfo) = .empty;
+        errdefer {
+            for (list.items) |d| allocator.free(d.id);
+            list.deinit(allocator);
+        }
+        for (self.entries.items) |e| {
+            e.lock();
+            defer e.unlock();
+            if (e.status == .running or e.done_emitted) continue;
+            const id = try allocator.dupe(u8, e.idSlice()); // 唯一需 dup 的
+            errdefer allocator.free(id);
+            try list.append(allocator, .{ .id = id, .status = e.status, .turns = e.turns, .tool_calls = e.tool_calls, .tokens = e.tokens });
+            e.done_emitted = true; // 成功入队后才标记(append/dupe OOM 则留 false,下轮重试,不丢事件)
+        }
+        return list.toOwnedSlice(allocator);
+    }
+    pub fn freeDoneInfos(allocator: std.mem.Allocator, infos: []DoneInfo) void {
+        for (infos) |d| allocator.free(d.id);
+        allocator.free(infos);
+    }
+
     pub fn freeSnapshots(allocator: std.mem.Allocator, snaps: []JobSnapshot) void {
         for (snaps) |s| {
             allocator.free(s.id);
@@ -1046,4 +1078,25 @@ test "copyOutputBuf: prompt_preview + output_buf 完整流;缺 id 返 null" {
 
     // 缺失 id → null。
     try testing.expect((try reg.copyOutputBuf("agent_deadbeef", testing.allocator)) == null);
+}
+
+test "task#18: drainNewlyDone 排终态 job 一次(done_emitted 防重复)+ 跳 running" {
+    const a = std.testing.allocator;
+    var reg = try AgentJobRegistry.init(a, "k", null, "m", .anthropic);
+    defer reg.deinit();
+    // 一个 running + 两个终态(done/failed)。
+    try reg.pushTestEntryFull("Explore", "r", 2, 50, "Grep", "{}", .running);
+    try reg.pushTestEntryFull("Plan", "d1", 3, 100, "Read", "{}", .done);
+    try reg.pushTestEntryFull("Task", "d2", 1, 20, "Bash", "{}", .failed);
+
+    // 首次 drain:返回 2 个终态(done+failed),不含 running。
+    const first = try reg.drainNewlyDone(a);
+    defer AgentJobRegistry.freeDoneInfos(a, first);
+    try std.testing.expectEqual(@as(usize, 2), first.len);
+    for (first) |d| try std.testing.expect(d.status == .done or d.status == .failed);
+
+    // 二次 drain:同样两个已 done_emitted → 返回空(不重复发)。
+    const second = try reg.drainNewlyDone(a);
+    defer AgentJobRegistry.freeDoneInfos(a, second);
+    try std.testing.expectEqual(@as(usize, 0), second.len);
 }

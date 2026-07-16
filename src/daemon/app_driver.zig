@@ -40,6 +40,24 @@ pub fn abortFn(ctx: *anyopaque, reason: abort.Reason) void {
 
 /// SessionHost.driver_fn:真 App 驱动循环(mirror web/session.zig run() 的 outer 循环,用 host 资源)。
 /// 退出:host.stopRequested()。**wb/config_sink/lifecycle 由 serve 建/拆,不在此**。
+/// **task#18:driver 线程 reap 后台 job 的 done 事件**。job 线程只置 e.status(不能安全用父栈
+/// trampoline reporter,后台续跑时早失效)。driver(session 线程)周期排出新终态 job,发
+/// agent_lifecycle.done 到 session journal → attach/SSE 客户端实时见后台 agent 完成(不必再轮询 roster)。
+fn reapAgentDone(app: *app_mod.App, be: *const @import("../core/protocol/ui_backend.zig").UiBackend, session: @import("../core/session_id.zig").SessionId, infra: std.mem.Allocator) void {
+    const aj = if (app.agent_jobs) |*a| a else return;
+    const infos = aj.drainNewlyDone(infra) catch return;
+    defer @import("../core/agent_job_registry.zig").AgentJobRegistry.freeDoneInfos(infra, infos);
+    for (infos) |d| {
+        be.emitEvent(session, .{ .agent_lifecycle = .{ .done = .{
+            .id = d.id,
+            .state = @tagName(d.status),
+            .turns = d.turns,
+            .tool_calls = d.tool_calls,
+            .tokens = d.tokens,
+        } } });
+    }
+}
+
 pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
     const dctx: *DriverCtx = @ptrCast(@alignCast(ctx));
     const app = dctx.app;
@@ -49,6 +67,7 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
 
     while (!host.stopRequested()) {
         const msg = host.inbox.popFront() orelse {
+            reapAgentDone(app, &be, host.id, infra); // 空闲期也 reap:后台 job 可能在无新消息时完成
             time.sleepMs(50);
             continue;
         };
@@ -82,6 +101,7 @@ pub fn driverFn(host: *SessionHost, ctx: *anyopaque) void {
 
         app.persistTranscript();
         web_session.announceRunDone(&host.journal, infra, @tagName(result.stop_reason), null);
+        reapAgentDone(app, &be, host.id, infra); // 本轮内完成的后台 job → 发 done
 
         // abort 复位:user_interrupt(前端 Stop)复位继续下一条;user_ctrl_c(host 停)由循环条件
         // stopRequested() 处理(serve 关停时 requestStop 置 stop_flag),不在此复位。
