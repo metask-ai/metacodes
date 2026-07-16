@@ -132,11 +132,11 @@ test "Monitor: sandbox 开启时命令被 sandbox-exec 包裹(cwd 外写被拦,t
     try testing.expect(std.mem.indexOf(u8, out, "\"job_id\":") != null);
 
     // 等 job 退出(≤2s;touch 快,sandbox 拦则失败退,不拦则成功退)。
-    var st: std.c.Stat = undefined;
+    const pfs = @import("platform").fs; // 可移植 exists（std.c.fstatat 在 linux 下 void）
     var waited: u32 = 0;
     while (waited < 2000) : (waited += 20) {
         jobs.reapExited();
-        if (std.c.fstatat(std.c.AT.FDCWD, escape, &st, 0) == 0) break; // 出现(不该)
+        if (pfs.exists(escape)) break; // 出现(不该)
         var ts = std.c.timespec{ .sec = 0, .nsec = 20 * 1_000_000 };
         var rem: std.c.timespec = undefined;
         _ = std.c.nanosleep(&ts, &rem);
@@ -144,5 +144,5 @@ test "Monitor: sandbox 开启时命令被 sandbox-exec 包裹(cwd 外写被拦,t
     jobs.reapExited();
     // sandbox 开 → touch cwd 外被 sandbox-exec 拦 → 文件不存在。
     // **toggle-verify**:去掉 monitor 的 wrap(直投 raw command)→ touch 不受限 → 文件被创建 → 测试红。
-    try testing.expect(std.c.fstatat(std.c.AT.FDCWD, escape, &st, 0) != 0);
+    try testing.expect(!pfs.exists(escape));
 }

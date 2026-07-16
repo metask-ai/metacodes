@@ -10,6 +10,8 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const pfs = @import("fs.zig"); // 可移植 stat（isSocket 等）——避免 std.c.Stat（linux 下 void）
+const pproc = @import("process.zig"); // currentPid（跨平台;测试唯一 path 用，std.time.nanoTimestamp 在此 Zig 0.16 缺失）
 const is_windows = builtin.os.tag == .windows;
 const win = std.os.windows;
 const ws2 = win.ws2_32; // 只用它的常量/struct(AF/SOCK/SOL/SO/IPPROTO/sockaddr);zig 0.16 未导出函数
@@ -201,10 +203,7 @@ pub fn listenUnix(path: []const u8, backlog: u31) Error!Socket {
     const pz = pathZ(path, &zbuf) orelse return error.BindFailed;
     // **仅当 path 已是 socket 才 unlink**(footgun 防护,Linus-C):`--uds /some/regular/file` 绝不该删
     // 用户的普通文件。非 socket 存在 → 不删,后续 bind 报 BindFailed(EADDRINUSE),不静默毁数据。
-    var st: std.c.Stat = undefined;
-    if (std.c.fstatat(std.c.AT.FDCWD, pz, &st, 0) == 0) { // macOS 用 fstatat(std.c.stat 是 INODE64 桩)
-        if (std.c.S.ISSOCK(st.mode)) _ = std.c.unlink(pz);
-    } // 不存在(fstatat!=0):无需 unlink
+    if (pfs.isSocket(pz)) _ = std.c.unlink(pz); // 可移植 stat（非 socket / 不存在 → 不删）
     const s = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
     if (!isValid(s)) return error.SocketFailed;
     errdefer closeSocket(s);
@@ -334,9 +333,9 @@ test "loopback listen/connect/send/recv roundtrip" {
 
 test "UDS listen/connect/send/recv roundtrip(POSIX)" {
     if (is_windows) return; // UDS 仅 POSIX(此早退不影响 windows 分析:上面 pub fn 已被 acceptConn 等引用)
-    // 唯一 path,避免并发测试撞(用 nanoTimestamp 低位)。
+    // 唯一 path,避免并发测试撞(pid + 栈地址熵;此 Zig 0.16 无 std.time.nanoTimestamp)。
     var pbuf: [64]u8 = undefined;
-    const ts: u64 = @bitCast(std.time.nanoTimestamp());
+    const ts: u64 = @as(u64, @intCast(pproc.currentPid())) ^ @intFromPtr(&pbuf);
     const path = try std.fmt.bufPrint(&pbuf, "/tmp/cc-zig-uds-test-{x}.sock", .{ts & 0xffffffff});
 
     const listener = listenUnix(path, 4) catch |e| {
@@ -352,10 +351,9 @@ test "UDS listen/connect/send/recv roundtrip(POSIX)" {
     {
         var zbuf: [SUN_PATH_MAX + 1]u8 = undefined;
         const pz = pathZ(path, &zbuf).?;
-        var st: std.c.Stat = undefined;
-        try testing.expect(std.c.fstatat(std.c.AT.FDCWD, pz, &st, 0) == 0);
-        try testing.expect(std.c.S.ISSOCK(st.mode)); // 是 socket
-        try testing.expectEqual(@as(u32, 0o600), st.mode & 0o777); // 仅属主 rw(chmod 生效)
+        const mode = pfs.statMode(pz, true) orelse return error.TestUnexpectedResult;
+        try testing.expect((mode & 0o170000) == 0o140000); // S_IFSOCK:是 socket
+        try testing.expectEqual(@as(u32, 0o600), mode & 0o777); // 仅属主 rw(chmod 生效)
     }
 
     const client = try connectUnix(path);

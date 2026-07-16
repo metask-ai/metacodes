@@ -190,6 +190,57 @@ pub fn exists(path: [*:0]const u8) bool {
 }
 extern "kernel32" fn GetFileAttributesW(lpFileName: [*:0]const u16) callconv(.winapi) u32;
 
+// ── 可移植 stat（文件类型探测）─────────────────────────────────────────────
+// POSIX 文件类型位（S_IFMT 家族，macOS/Linux 值一致）。用字面量避开 `std.posix.S`
+// （此 Zig 0.16 下 windows 时为 void，会硬编译错）。
+const S_IFMT: u32 = 0o170000;
+const S_IFSOCK: u32 = 0o140000;
+const S_IFLNK: u32 = 0o120000;
+
+/// 取 path 的 st_mode（含 S_IFMT 类型位），无法 stat 返 null。
+/// follow=true 跟随 symlink（stat 语义），false 不跟随（lstat 语义）。
+/// 跨平台:macOS/BSD `std.c.fstatat`（switch 自动处理 x86_64 的 $INODE64 桩）;Linux `statx`;
+/// Windows 无 POSIX 文件类型（socket/symlink 语义不同）→ null。
+/// **裁剪 std 背景**:此 Zig 0.16 的 `std.posix.Stat`/`std.c.Stat` 对 linux=void（改用 statx），
+/// 故 `std.c.fstatat` 不能直用于 linux。分支同 read_state.zig statFd。
+pub fn statMode(path_z: [*:0]const u8, follow: bool) ?u32 {
+    if (is_windows) return null;
+    if (builtin.os.tag == .linux) {
+        var stx: std.os.linux.Statx = undefined;
+        const AT_FDCWD: i32 = -100;
+        const flags: u32 = if (follow) 0 else 0x100; // AT_SYMLINK_NOFOLLOW (linux)
+        const rc = std.os.linux.statx(AT_FDCWD, path_z, flags, std.os.linux.STATX.BASIC_STATS, &stx);
+        if (@as(isize, @bitCast(rc)) < 0) return null;
+        return @intCast(stx.mode);
+    }
+    var st: std.c.Stat = undefined;
+    const flags: u32 = if (follow) 0 else @as(u32, std.c.AT.SYMLINK_NOFOLLOW);
+    if (std.c.fstatat(std.c.AT.FDCWD, path_z, &st, flags) != 0) return null;
+    return @intCast(st.mode);
+}
+
+/// path 是否 symlink（**不跟随**，lstat 语义；防 symlink 逃逸）。
+/// Windows:GetFileAttributesW 的 REPARSE_POINT 位（不跟随，等价 lstat 语义）。
+pub fn isSymlink(path_z: [*:0]const u8) bool {
+    if (is_windows) {
+        var wbuf: [std.os.windows.PATH_MAX_WIDE + 1]u16 = undefined;
+        const wlen = std.unicode.utf8ToUtf16Le(&wbuf, std.mem.span(path_z)) catch return false;
+        if (wlen >= wbuf.len) return false;
+        wbuf[wlen] = 0;
+        const attr = GetFileAttributesW(@ptrCast(&wbuf));
+        if (attr == 0xFFFF_FFFF) return false; // INVALID_FILE_ATTRIBUTES
+        return (attr & 0x400) != 0; // FILE_ATTRIBUTE_REPARSE_POINT
+    }
+    const m = statMode(path_z, false) orelse return false;
+    return (m & S_IFMT) == S_IFLNK;
+}
+
+/// path 是否 unix domain socket（跟随 symlink）。Windows→false。
+pub fn isSocket(path_z: [*:0]const u8) bool {
+    const m = statMode(path_z, true) orelse return false;
+    return (m & S_IFMT) == S_IFSOCK;
+}
+
 /// 关闭【文件】fd。禁用于 socket/pipe（见文件头边界说明）。
 pub fn close(fd: c_int) void {
     if (is_windows) {
