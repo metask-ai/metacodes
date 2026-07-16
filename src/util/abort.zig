@@ -23,6 +23,9 @@ pub const Reason = enum(u8) {
     /// 与 user_ctrl_c(进程级 SIGINT,退出)区分——两者都中断 agent_loop,但宿主对
     /// "run 结束后是否继续 REPL"的决策相反。见 web/session.zig handleAbortAfterRun。
     user_interrupt = 5,
+    /// Host-side infrastructure/callback failure. This must not be reported as
+    /// a user cancellation by binary-library consumers.
+    host_failure = 6,
 };
 
 pub const AbortSignal = struct {
@@ -145,7 +148,7 @@ test "cross-thread: worker observes flag set by main" {
 }
 
 test "all reasons round-trip" {
-    inline for (.{ .user_ctrl_c, .timeout, .max_turns, .api_error, .user_interrupt }) |r| {
+    inline for (.{ .user_ctrl_c, .timeout, .max_turns, .api_error, .user_interrupt, .host_failure }) |r| {
         var s = AbortSignal.init();
         s.abort(r);
         try std.testing.expect(s.reason() == r);

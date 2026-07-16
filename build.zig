@@ -24,7 +24,9 @@ fn addPlatform(b: *std.Build, mod: *std.Build.Module) void {
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
+    const target_was_explicit = b.user_input_options.contains("target");
     const optimize = b.standardOptimizeOption(.{});
+    const tfilter = b.option([]const u8, "tfilter", "test filter");
 
     // 固定产出两个二进制：metacodes (ReleaseSmall) 和 metacodes-debug (Debug)。
     // 不受 -Doptimize 影响，一次 build 同时得到发布版和调试版。
@@ -111,6 +113,102 @@ pub fn build(b: *std.Build) void {
     });
     addHl(b, core_mod);
 
+    const agentcore_types_mod = b.createModule(.{
+        .root_source_file = b.path("sdk/metacodes_agentcore_types.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const agentcore_sdk_mod = b.createModule(.{
+        .root_source_file = b.path("sdk/metacodes_agentcore.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    agentcore_sdk_mod.addImport("metacodes_agentcore_types", agentcore_types_mod);
+    const agentcore_abi_mod = b.createModule(.{
+        .root_source_file = b.path("src/agentcore/abi_v1.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addHl(b, agentcore_abi_mod);
+    agentcore_abi_mod.addImport("metacodes-core", core_mod);
+    agentcore_abi_mod.addImport("metacodes_agentcore_types", agentcore_types_mod);
+
+    const agentcore_test_step = b.step("agentcore:test", "Run AgentCore binary ABI v1 tests");
+    const agentcore_abi_test = b.addTest(.{ .name = "agentcore-abi-unit", .root_module = agentcore_abi_mod });
+    agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_abi_test).step);
+    const agentcore_types_test = b.addTest(.{ .name = "agentcore-types-unit", .root_module = agentcore_types_mod });
+    agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_types_test).step);
+    const agentcore_sdk_test = b.addTest(.{ .name = "agentcore-sdk-unit", .root_module = agentcore_sdk_mod });
+    agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_sdk_test).step);
+    const agentcore_header_test = b.addSystemCommand(&.{ "cc", "-std=c11", "-fsyntax-only", "-Isdk", "tests/agentcore_header_compile.c" });
+    agentcore_header_test.setCwd(b.path("."));
+    agentcore_test_step.dependOn(&agentcore_header_test.step);
+    const agentcore_contract_mod = b.createModule(.{
+        .root_source_file = b.path("tests/component/agentcore_abi_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    agentcore_contract_mod.addImport("harness", b.createModule(.{
+        .root_source_file = b.path("tests/_harness/mock_sse_server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }));
+    agentcore_contract_mod.addImport("agentcore-abi", agentcore_abi_mod);
+    agentcore_contract_mod.addImport("agentcore-sdk", agentcore_sdk_mod);
+    const agentcore_contract_test = b.addTest(.{ .name = "agentcore-abi-contract", .root_module = agentcore_contract_mod });
+    agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_contract_test).step);
+
+    const agentcore_lib = b.addLibrary(.{
+        .name = "metacodes_agentcore",
+        .linkage = .static,
+        .root_module = agentcore_abi_mod,
+    });
+    const install_agentcore_lib = b.addInstallArtifact(agentcore_lib, .{});
+    const install_agentcore_header = b.addInstallFileWithDir(b.path("sdk/metacodes_agentcore.h"), .header, "metacodes_agentcore.h");
+    const install_agentcore_sdk = b.addInstallFileWithDir(b.path("sdk/metacodes_agentcore.zig"), .prefix, "sdk/metacodes_agentcore.zig");
+    const install_agentcore_types = b.addInstallFileWithDir(b.path("sdk/metacodes_agentcore_types.zig"), .prefix, "sdk/metacodes_agentcore_types.zig");
+    const agentcore_install_root = b.getInstallPath(.prefix, "");
+    const resolved_agentcore_target = target.result.zigTriple(b.allocator) catch @panic("OOM");
+    const validate_agentcore_target = b.addSystemCommand(&.{ "sh", "scripts/validate_agentcore_target.sh" });
+    validate_agentcore_target.addArgs(&.{ if (target_was_explicit) "true" else "false", resolved_agentcore_target });
+    validate_agentcore_target.setCwd(b.path("."));
+    install_agentcore_lib.step.dependOn(&validate_agentcore_target.step);
+    install_agentcore_header.step.dependOn(&validate_agentcore_target.step);
+    install_agentcore_sdk.step.dependOn(&validate_agentcore_target.step);
+    install_agentcore_types.step.dependOn(&validate_agentcore_target.step);
+    const manifest_cmd = b.addSystemCommand(&.{ "sh", "scripts/write_agentcore_manifest.sh" });
+    manifest_cmd.addArgs(&.{
+        agentcore_install_root,
+        resolved_agentcore_target,
+        @tagName(optimize),
+        b.graph.zig_exe,
+        if (target_was_explicit) "true" else "false",
+    });
+    manifest_cmd.setCwd(b.path("."));
+    manifest_cmd.step.dependOn(&install_agentcore_lib.step);
+    manifest_cmd.step.dependOn(&install_agentcore_header.step);
+    manifest_cmd.step.dependOn(&install_agentcore_sdk.step);
+    manifest_cmd.step.dependOn(&install_agentcore_types.step);
+    const agentcore_bundle_step = b.step("agentcore:bundle", "Build the macOS arm64 AgentCore static bundle");
+    agentcore_bundle_step.dependOn(&manifest_cmd.step);
+
+    const consumer_cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
+    consumer_cmd.addArgs(&.{
+        "--build-file",
+        "tests/agentcore_artifact_consumer/build.zig",
+        "test",
+        b.fmt("-Doptimize={s}", .{@tagName(optimize)}),
+        b.fmt("-Dtarget={s}", .{resolved_agentcore_target}),
+        b.fmt("-Dbundle-root={s}", .{agentcore_install_root}),
+    });
+    consumer_cmd.setCwd(b.path("."));
+    consumer_cmd.step.dependOn(&manifest_cmd.step);
+    const agentcore_consumer_step = b.step("agentcore:consumer", "Run the source-free AgentCore bundle consumer");
+    agentcore_consumer_step.dependOn(&consumer_cmd.step);
+
     // test:lib —— 编译库全图(refAllDeclsRecursive),绿即证库与 UI 物理隔离。
     const core_test_mod = b.createModule(.{
         .root_source_file = b.path("src/lib.zig"),
@@ -119,7 +217,11 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addHl(b, core_test_mod);
-    const core_test = b.addTest(.{ .name = "metacodes-core-test", .root_module = core_test_mod });
+    const core_test = b.addTest(.{
+        .name = "metacodes-core-test",
+        .root_module = core_test_mod,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+    });
     const core_test_step = b.step("test:lib", "Test/compile the metacodes-core library module (proves UI isolation)");
     core_test_step.dependOn(&b.addRunArtifact(core_test).step);
 
@@ -182,7 +284,6 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     addHl(b, test_module);
-    const tfilter = b.option([]const u8, "tfilter", "test filter");
     const test_obj = b.addTest(.{
         .name = "cc-test",
         .root_module = test_module,
@@ -228,6 +329,9 @@ pub fn build(b: *std.Build) void {
         "tests/component/subagent_model_test.zig",
         "tests/component/web_search_test.zig",
         "tests/component/allowed_tools_test.zig",
+        "tests/component/agent_session_tools_test.zig",
+        "tests/component/agent_session_host_tools_test.zig",
+        "tests/component/agent_session_ui_test.zig",
         "tests/component/skill_fork_test.zig",
         "tests/component/prompt_tool_coupling_test.zig",
         "tests/component/http_error_test.zig",
@@ -321,6 +425,9 @@ pub fn build(b: *std.Build) void {
     const new_step = b.step("test:new", "Run only the new e2e-framework L2 component tests");
     const new_files = [_][]const u8{
         "tests/component/user_context_inject_test.zig",
+        "tests/component/agent_session_tools_test.zig",
+        "tests/component/agent_session_host_tools_test.zig",
+        "tests/component/agent_session_ui_test.zig",
         "tests/component/http_error_test.zig",
         "tests/component/answer_queue_test.zig",
         "tests/component/base_url_flag_test.zig",
