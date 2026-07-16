@@ -24,6 +24,15 @@ pub const SessionId = struct {
         return self.bytes[0..];
     }
 
+    /// 从字符串重建 SessionId(协议读回 / `/resume` 切换路由键)。仅接受 24-char id(gen() 产物 /
+    /// transcript 目录名);长度不符返 null(caller 保持原 id)。**M5 承诺的读回能力,由 /resume 真需要时补。**
+    pub fn fromSlice(s: []const u8) ?SessionId {
+        if (s.len != 24) return null;
+        var id: SessionId = undefined;
+        @memcpy(&id.bytes, s[0..24]);
+        return id;
+    }
+
     /// 单 Session(N=1 / TUI)默认占位 id。多 Session 路由前,所有事件都归属它。
     /// **用 ASCII '0'(0x30)不是 \0(0x00)**:bytes 当 hex 字符串用(asSlice 喂持久化路径),
     /// 全 \0 会让路径含 NUL 字节炸掉;"000…0" 是合法 24-char hex。gen() 永远产不出它
@@ -65,6 +74,17 @@ test "gen 产 24-char id,全 hex 字符" {
     }
 }
 
+
+test "fromSlice round-trip:gen → asSlice → fromSlice 复原,非 24-char 返 null" {
+    const id = gen();
+    const back = SessionId.fromSlice(id.asSlice()).?;
+    try testing.expectEqualStrings(id.asSlice(), back.asSlice());
+    try testing.expect(std.mem.eql(u8, &id.bytes, &back.bytes));
+    // 长度不符 → null(caller 保持原 id,不误切路由键)
+    try testing.expectEqual(@as(?SessionId, null), SessionId.fromSlice("tooshort"));
+    try testing.expectEqual(@as(?SessionId, null), SessionId.fromSlice("this-is-way-too-long-to-be-an-id"));
+    try testing.expectEqual(@as(?SessionId, null), SessionId.fromSlice(""));
+}
 
 test "gen 连发唯一(agent_ident 防撞地基:进程内并发 subagent 各持一 id)" {
     // claim 租约身份 = per-agent-loop gen();同进程紧邻两次 gen 必须不同

@@ -3548,15 +3548,20 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     defer transcript_mod.freeSessionList(list, allocator);
 
     var target_path: ?[]const u8 = null;
+    var target_id: ?[]const u8 = null; // 会话身份:resume 后须切 app.session_id(路由键,#16)
     // 先尝试解析成数字
     if (std.fmt.parseInt(usize, rest, 10) catch null) |n| {
-        if (n >= 1 and n <= list.len) target_path = list[n - 1].path;
+        if (n >= 1 and n <= list.len) {
+            target_path = list[n - 1].path;
+            target_id = list[n - 1].id;
+        }
     }
     if (target_path == null) {
         // 按 id 精确匹配 / 前缀匹配
         for (list) |e| {
             if (std.mem.eql(u8, e.id, rest) or std.mem.startsWith(u8, e.id, rest)) {
                 target_path = e.path;
+                target_id = e.id;
                 break;
             }
         }
@@ -3599,6 +3604,16 @@ fn handleResume(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u
     if (app.transcript_writer) |*w| w.deinit();
     app.transcript_writer = new_writer;
     app.loadGoalFromSessionDir(path);
+
+    // #16:切换会话身份——路由键(permission_ctx.session)与 transcript 落点必须一致。resume 前
+    // app.session_id 是启动时 gen 的旧 id,writer 已指向 resumed 目录,但 session_id 没变 → 后续
+    // agent_loop 的 Options.session / 权限对话框路由仍用旧 id(漂移)。同步切到 resumed session id。
+    if (target_id) |tid| {
+        if (@import("../core/session_id.zig").SessionId.fromSlice(tid)) |sid| {
+            app.session_id = sid;
+            app.permission_ctx.session = sid; // 权限对话框路由到本会话视图(M5/M6)
+        }
+    }
 
     std.debug.print("Resumed session ({d} messages). Continue by sending a message.\n", .{app.conversation.len()});
 }
@@ -3689,6 +3704,47 @@ test "/loop command parser covers user input command surface" {
     try std.testing.expectEqual(@as(std.meta.Tag(LoopCommand), .invalid), std.meta.activeTag(parseLoopCommand("on 0")));
     try std.testing.expectEqual(@as(std.meta.Tag(LoopCommand), .invalid), std.meta.activeTag(parseLoopCommand("on nope")));
     try std.testing.expectEqual(@as(std.meta.Tag(LoopCommand), .invalid), std.meta.activeTag(parseLoopCommand("forever")));
+}
+
+test "L2 #16: /resume 切 app.session_id + permission_ctx.session(路由键随会话)" {
+    const a = std.testing.allocator;
+    const ppaths = @import("platform").paths;
+    const home = "/tmp/cc-resume-l2-16";
+    _ = std.c.mkdir(home, 0o755);
+    // handleResume 走 homeDir()(env);setEnv HOME 后 defer 还原,免污染同 binary 其它测试(单线程顺序跑)。
+    const old_home = std.c.getenv("HOME");
+    ppaths.setEnv("HOME", home);
+    defer if (old_home) |h| ppaths.setEnv("HOME", h) else ppaths.unsetEnv("HOME");
+    ppaths.setEnv("METACODES_NO_PROBE", "1"); // 跳过 App.init 的终端背景 probe
+
+    // App 用独立 arena(App 是 arena 生命周期设计,避免 testing.allocator 噪声);测试自身用 a。
+    var app_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer app_arena.deinit();
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    const cfg = types_mod.Config{ .model = "claude-sonnet-4-20250514" };
+    const app = try app_mod.App.init(app_arena.allocator(), io_rt.io(), cfg, "test-key");
+    defer app.deinit();
+    const old_id = app.session_id; // 启动时 gen 的旧 id
+
+    // 造一个磁盘 session(与 handleResume 的 getCwd()+home 对齐 → listSessions 能找到)。
+    const cwd = try util_fs.getCwd(a);
+    defer a.free(cwd);
+    var conv = Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "resume me");
+    const sid = transcript_mod.genSessionId();
+    var w = try transcript_mod.Writer.init(a, cwd, home, "claude-sonnet-4-20250514", sid);
+    w.flush(&conv);
+    w.deinit();
+
+    // resume by id → 修复前 app.session_id 仍是 old_id(漂移);修复后切到 sid。
+    // 传 app.allocator(生产同款:staged conversation 用 app.allocator,loadTranscript 须同源,否则
+    // conversation 消息块 alloc/free 跨 allocator 泄漏)。
+    try handleResume(app, app_arena.allocator(), sid.asSlice());
+    try std.testing.expect(!std.mem.eql(u8, &old_id.bytes, &app.session_id.bytes)); // 变了
+    try std.testing.expectEqualStrings(sid.asSlice(), app.session_id.asSlice()); // 切到 resumed
+    try std.testing.expectEqualStrings(sid.asSlice(), app.permission_ctx.session.asSlice()); // 路由键同步
 }
 
 test "/goal accounting delta charges only input plus output usage" {
