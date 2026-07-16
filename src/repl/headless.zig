@@ -80,8 +80,27 @@ pub fn run(
 
 /// 构造 agent_loop.Options(run + resumeSuspended 共用,消两份字段漂移)。
 /// scoped_recall = 本轮尾注入的召回记忆(fresh run 传;resume 传 null——续跑不重新召回)。
+/// **task#20:headless 挂起 requester**。恒返 .pending → UI 工具(ask_user/plan_mode)返 error.UiPending
+/// → agent_loop 挂起(写 suspend.json)。out 不写(响应经 subprocess resume 的 --resume-response 迟来)。
+const ui_request_mod = @import("../core/protocol/ui_request.zig");
+fn pendingRequestFn(
+    _: *anyopaque,
+    _: @import("../core/session_id.zig").SessionId,
+    _: std.mem.Allocator,
+    _: *const ui_request_mod.UiRequest,
+    _: *ui_request_mod.UiResponse,
+) anyerror!ui_request_mod.RequestOutcome {
+    return .pending;
+}
+var pending_requester_dummy: u8 = 0;
+
 fn buildOptions(app: *app_mod.App, scoped_recall: ?[]const u8) agent_loop.Options {
     return .{
+        // task#20:--suspendable 时装恒 .pending requester → headless 遇 UI 工具挂起而非 NotATty。
+        .ui_requester = if (app.config.suspendable)
+            .{ .ctx = @ptrCast(&pending_requester_dummy), .requestFn = &pendingRequestFn }
+        else
+            null,
         .verbose = app.config.verbose,
         .abort = &app.abort,
         .read_state = &app.read_state,

@@ -847,6 +847,12 @@ fn parseArgsInto(config: *types.Config, args: *std.process.Args.Iterator, alloca
         } else if (std.mem.eql(u8, arg, "--uds")) {
             // U10-B:daemon 附加 UDS+NDJSON 绑定(路径)。设置即启用(强制走 serveMulti)。
             if (args.next()) |v| config.uds_path = allocator.dupe(u8, v) catch null;
+        } else if (std.mem.eql(u8, arg, "--session")) {
+            // task#20:显式 session id(subprocess resume 复用挂起 session 目录)。
+            if (args.next()) |v| config.session_id = allocator.dupe(u8, v) catch null;
+        } else if (std.mem.eql(u8, arg, "--suspendable")) {
+            config.suspendable = true; // task#20:headless 遇 UI 工具挂起(写 suspend.json)而非 NotATty
+
         } else if (std.mem.eql(u8, arg, "--resume-response")) {
             // U8:值 = 迟来结果 JSON;`@path` 前缀从文件读(大结果/含引号免 shell 转义)。
             if (args.next()) |v| {

@@ -49,6 +49,14 @@ pub const Config = struct {
     /// **U10-B:`serve --uds <path>`**:daemon 附加一条 UDS+NDJSON 本地绑定(gui/语音 UI 首选,与 web
     /// 并存)。非 null 即启用(强制走 serveMulti,即便 N=1)。POSIX only(Windows 走 web)。null=不启用。
     uds_path: ?[]const u8 = null,
+    /// **task#20:`--session <id>`**:显式指定 session id(24-char)。App.init 用它替代 gen()。
+    /// 用途:subprocess resume——B 进程用挂起 session 的 id 复用其 transcript 目录 + suspend.json。
+    /// null = gen 新 id。非 24-char 回退 gen。
+    session_id: ?[]const u8 = null,
+    /// **task#20:`--suspendable`**:headless 遇 UI 工具(AskUserQuestion/ExitPlanMode)时**挂起**
+    /// (写 suspend.json 退出)而非 NotATty 报错。装一个恒返 .pending 的 requester。默认 false(保持旧
+    /// headless 语义:无 requester → NotATty)。用于 subprocess suspend/resume 闭环(外部工具据 suspend.json 应答)。
+    suspendable: bool = false,
     /// **U8:`--resume-response <json|@file>`**:恢复一个挂起(suspend.json)的 session。
     /// 值 = 挂起工具(AskUserQuestion/ExitPlanMode/custom)的迟来结果 JSON(`@path` 从文件读)。
     /// 走 headless.resumeSuspended(read suspend.json→resumeRun→清/重写)。需同 session_id

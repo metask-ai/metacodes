@@ -317,7 +317,12 @@ pub const App = struct {
             .config = config,
             .api_key = api_key,
             .api_key_catalog = api_keys_mod.Catalog.init(allocator),
-            .session_id = @import("core/session_id.zig").gen(), // 本会话身份(路由用)
+            // 本会话身份(路由 + transcript 目录)。`--session <id>` 显式指定(subprocess resume 复用
+            // 挂起 session 的目录,task#20);否则 gen 新的。非法/非 24-char id 回退 gen。
+            .session_id = if (config.session_id) |s|
+                (@import("core/session_id.zig").SessionId.fromSlice(s) orelse @import("core/session_id.zig").gen())
+            else
+                @import("core/session_id.zig").gen(),
             .conversation = Conversation.init(allocator),
             .api_client = client_mod.Client.initWithBaseUrl(allocator, io, api_key, config.model, config.base_url),
             .tool_defs = &.{}, // 占位，下面重建
