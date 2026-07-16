@@ -10,6 +10,7 @@ const last_error = @import("api/last_error.zig");
 const Catalog = @import("api/catalog.zig").Catalog;
 const AbortSignal = @import("util/abort.zig").AbortSignal;
 const provider_mod = @import("api/provider.zig");
+const sync = @import("platform").sync;
 
 pub const VERSION = "0.1.0";
 
@@ -129,7 +130,11 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     http_client: http.Client,
     api_key: []const u8,
+    /// **写务必走 setModel、跨线程读走 modelSnapshot(task#13)**:model 是 []const u8(ptr+len 两字),
+    /// 非原子写。lead 主线程 switchModel(app.setModel→api_client.setModel)与后台 subagent 降级路径
+    /// (owned_prov OOM 回退共享 api_client)的请求体读并发 → 撕裂 {new_ptr,old_len} 可致 OOB。mutex 串行。
     model: []const u8,
+    model_mutex: sync.Mutex = .{},
     /// 完整的 messages endpoint URL。生产 = ANTHROPIC_API_URL;测试 = mock server URL。
     /// 通过 init 的 base_url_override 注入(L2 测试用)。
     base_url: []const u8,
@@ -186,7 +191,7 @@ pub const Client = struct {
         };
     }
     fn pModel(ctx: *anyopaque) []const u8 {
-        return asClient(ctx).model;
+        return asClient(ctx).modelSnapshot(); // task#13:一致读(避免撕裂)
     }
     fn pSendStream(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, user_query: []const u8) anyerror!provider_mod.StreamHandle {
         const c = asClient(ctx);
@@ -233,6 +238,20 @@ pub const Client = struct {
     /// 设置 CLI max_tokens 覆盖。null 恢复自动。
     pub fn setMaxTokensOverride(client: *Client, v: ?u32) void {
         client.max_tokens_override = v;
+    }
+
+    /// **切换 model(task#13)**:锁内写 {ptr,len} 一对,避免与跨线程读撕裂。app.setModel 唯一入口调它。
+    pub fn setModel(client: *Client, m: []const u8) void {
+        _ = client.model_mutex.lock();
+        client.model = m;
+        _ = client.model_mutex.unlock();
+    }
+
+    /// **跨线程一致读 model(task#13)**:锁内取 {ptr,len} 一对返回(避免撕裂)。请求体构造走它。
+    pub fn modelSnapshot(client: *Client) []const u8 {
+        _ = client.model_mutex.lock();
+        defer _ = client.model_mutex.unlock();
+        return client.model;
     }
 
     /// 按当前 model 解析真实使用的 max_tokens。
@@ -315,7 +334,7 @@ pub const Client = struct {
         tools: ?[]const json_mod.ToolDefinition,
         model_override: ?[]const u8,
     ) !ApiResponse {
-        const effective_model = model_override orelse client.model;
+        const effective_model = model_override orelse client.modelSnapshot();
         const req_body = try json_mod.serializeMessagesRequest(.{
             .model = effective_model,
             .max_tokens = client.resolveMaxTokens(),
@@ -372,7 +391,7 @@ pub const Client = struct {
         model_override: ?[]const u8,
         tool_choice: ?json_mod.ToolChoice,
     ) !StreamResponse {
-        const effective_model = model_override orelse client.model;
+        const effective_model = model_override orelse client.modelSnapshot();
         const req_body = try json_mod.serializeMessagesRequest(.{
             .model = effective_model,
             .max_tokens = client.resolveMaxTokens(),
@@ -1045,4 +1064,42 @@ test "doGetModels uses sendBodiless (no sendBodyComplete on GET)" {
     try std.testing.expect(std.mem.indexOf(u8, src, "req.sendBodiless()") != null);
     // 确认没人回退到 sendBodyComplete("") 模式
     try std.testing.expect(std.mem.indexOf(u8, src, "sendBodyComplete(@constCast(\"\"))") == null);
+}
+
+test "task#13: setModel/modelSnapshot round-trip + 并发无撕裂(mutex 串行)" {
+    const a = std.testing.allocator;
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-3-5-haiku-20241022", "http://x");
+    defer client.deinit();
+
+    // round-trip:setModel 写 → modelSnapshot 读回。
+    try std.testing.expectEqualStrings("claude-3-5-haiku-20241022", client.modelSnapshot());
+    client.setModel("claude-sonnet-4-20250514");
+    try std.testing.expectEqualStrings("claude-sonnet-4-20250514", client.modelSnapshot());
+
+    // 并发 hammer:writer 在**两个不同长度** model 间切,reader 每次 snapshot 必是完整一个。
+    // 撕裂({new_ptr,old_len} 等)会得到既非 A 又非 B 的 slice(甚至 OOB 越读)。mutex 串行 → 永远一致。
+    const A = "m"; // len 1
+    const B = "claude-sonnet-4-longname-xyz"; // len 28(与 A 差异大,撕裂立显)
+    const Ctx = struct {
+        c: *Client,
+        stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        fn writer(s: *@This()) void {
+            var i: usize = 0;
+            while (!s.stop.load(.acquire)) : (i += 1) {
+                s.c.setModel(if (i & 1 == 0) A else B);
+            }
+        }
+    };
+    client.setModel(A); // 起点置 A,避免 reader 读到初始 model(既非 A 又非 B)误报
+    var wctx = Ctx{ .c = &client };
+    const th = try std.Thread.spawn(.{}, Ctx.writer, .{&wctx});
+    defer th.join();
+    defer wctx.stop.store(true, .release);
+    var n: usize = 0;
+    while (n < 50_000) : (n += 1) {
+        const m = client.modelSnapshot();
+        if (!std.mem.eql(u8, m, A) and !std.mem.eql(u8, m, B)) return error.TornModelRead;
+    }
 }

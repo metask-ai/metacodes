@@ -718,7 +718,7 @@ pub const App = struct {
     ) !void {
         // agent_jobs 内部 dupe，可 OOM → 最前，失败时其它镜像未动(最小一致)。
         if (agent_jobs) |aj| try aj.setModel(model);
-        api_client.model = model;
+        api_client.setModel(model); // task#13:锁内写 {ptr,len},不与后台降级路径读撕裂
         if (openai_client) |oc| oc.model = model;
         if (gemini_client) |gc| gc.model = model;
         if (transcript_writer) |w| w.model = model;
