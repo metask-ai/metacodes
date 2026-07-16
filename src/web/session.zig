@@ -82,9 +82,8 @@ const StateSource = struct {
         // **U6 A4:附着 agent roster**。attach 客户端据此见 attach 前已 spawn 的 agent(之后靠
         // agent_lifecycle SSE 增量)。snapshotJobs **线程安全**(registry mutex 内 dup 值语义),
         // 比 U5 model/dirs 更省心(JobSnapshot 本就是 owned 值拷贝,非裸跨线程 slice)。
-        // **注**:task frontier 未进快照——TaskStore 无 mutex(driver-only),HTTP 线程直读是
-        // race,需 U5-式 driver 发布缓存(task#19)。故 attach 拿不到 mid-session 已有 task,只能
-        // 靠 tasks_changed 事件之后的重拉(近似,非完整 attach)。
+        // **task#19 已修**:TaskStore 加 mutex 后,task 列表进快照(下方 snapshotTasks 锁内 dup 读)。
+        // attach 客户端由此见 mid-session 已有 task(完整 attach),不再只靠 tasks_changed 增量近似。
         const AgentView = struct {
             id: []const u8,
             agent_type: []const u8,
@@ -115,6 +114,25 @@ const StateSource = struct {
             if (agent_views.len > 0) allocator.free(agent_views);
             if (job_snaps.len > 0) RegT.freeSnapshots(allocator, job_snaps);
         }
+        // **task#19:附着快照带 task 列表**。TaskStore 加 mutex 后 HTTP 线程可安全读(snapshotTasks
+        // 锁内 dup 值语义)。attach 客户端由此见 attach 前 mid-session 已有 task,不再只靠 tasks_changed 增量。
+        const TaskView = struct { id: []const u8, subject: []const u8, state: []const u8 };
+        const raw_tasks = self.app.tasks.snapshotTasks(allocator) catch &.{};
+        defer {
+            for (raw_tasks) |t| {
+                allocator.free(t.id);
+                allocator.free(t.subject);
+            }
+            if (raw_tasks.len > 0) allocator.free(raw_tasks);
+        }
+        var task_views: []TaskView = &.{};
+        if (raw_tasks.len > 0) task_views = allocator.alloc(TaskView, raw_tasks.len) catch &.{};
+        defer if (task_views.len > 0) allocator.free(task_views);
+        for (raw_tasks, 0..) |t, i| {
+            if (i >= task_views.len) break;
+            task_views[i] = .{ .id = t.id, .subject = t.subject, .state = t.status.toString() };
+        }
+
         const u = &self.app.usage; // u64 无锁读，良性 skew（poll-based）
         return std.json.Stringify.valueAlloc(allocator, .{
             .seq = seq,
@@ -128,6 +146,7 @@ const StateSource = struct {
             .generating = self.generating.load(.acquire),
             .pending_request_id = self.wb.pendingId(),
             .agents = agent_views, // U6 A4:附着 roster
+            .tasks = task_views, // task#19:mid-session task 列表进快照
         }, .{});
     }
 

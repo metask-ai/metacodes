@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const util_time = @import("../util/time.zig");
+const sync = @import("platform").sync;
 
 pub const TaskStatus = enum {
     pending,
@@ -67,9 +68,37 @@ pub const TaskStore = struct {
     allocator: std.mem.Allocator,
     tasks: std.ArrayList(*Task), // pointers so addresses stable across growth
     next_id: u64 = 1,
+    /// **task#19**:driver 单线程改 tasks;attach 快照(HTTP 线程)要跨线程读 → mutex 串行,免
+    /// grow-during-iterate 悬挂 / torn 读 task 内容。所有**改 tasks / 改 task 内容**的公开方法锁内跑;
+    /// get() 无锁(driver 内部/单线程用 + 被上锁方法内部调,不能重入)。snapshotTasks 锁内 dup 值语义。
+    mutex: sync.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator) TaskStore {
         return .{ .allocator = allocator, .tasks = .empty };
+    }
+
+    /// **task#19 跨线程读**:锁内把当前任务快照成 owned 值(id/subject/status),供 attach 快照。
+    /// caller free 每个 .id/.subject + 外层 slice。
+    pub const TaskView = struct { id: []u8, subject: []u8, status: TaskStatus };
+    pub fn snapshotTasks(self: *TaskStore, allocator: std.mem.Allocator) ![]TaskView {
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
+        const out = try allocator.alloc(TaskView, self.tasks.items.len);
+        errdefer allocator.free(out);
+        var n: usize = 0;
+        errdefer for (out[0..n]) |v| {
+            allocator.free(v.id);
+            allocator.free(v.subject);
+        };
+        for (self.tasks.items) |t| {
+            out[n] = .{
+                .id = try allocator.dupe(u8, t.id),
+                .subject = try allocator.dupe(u8, t.subject),
+                .status = t.status,
+            };
+            n += 1;
+        }
+        return out;
     }
 
     pub fn deinit(self: *TaskStore) void {
@@ -87,6 +116,8 @@ pub const TaskStore = struct {
         description: []const u8,
         active_form: ?[]const u8,
     ) !*Task {
+        _ = self.mutex.lock(); // task#19:与 attach 快照读串行
+        defer _ = self.mutex.unlock();
         const t = try self.allocator.create(Task);
         errdefer self.allocator.destroy(t);
 
@@ -119,7 +150,9 @@ pub const TaskStore = struct {
         description: []const u8,
         status: TaskStatus,
     ) !void {
-        if (self.get(id) != null) return; // 幂等
+        _ = self.mutex.lock(); // task#19
+        defer _ = self.mutex.unlock();
+        if (self.get(id) != null) return; // 幂等(get 无锁,不重入)
         const t = try self.allocator.create(Task);
         errdefer self.allocator.destroy(t);
         const id_owned = try self.allocator.dupe(u8, id);
@@ -142,6 +175,8 @@ pub const TaskStore = struct {
 
     /// 更新 status。若 deleted 则实际从列表删除并释放。
     pub fn updateStatus(self: *TaskStore, id: []const u8, status: TaskStatus) !void {
+        _ = self.mutex.lock(); // task#19
+        defer _ = self.mutex.unlock();
         for (self.tasks.items, 0..) |t, i| {
             if (!std.mem.eql(u8, t.id, id)) continue;
             if (status == .deleted) {
@@ -182,6 +217,8 @@ pub const TaskStore = struct {
             owner: ?[]u8 = null,
         },
     ) !void {
+        _ = self.mutex.lock(); // task#19
+        defer _ = self.mutex.unlock();
         // 先用可变局部变量接管所有权。任一错误路径由 errdefer 释放。
         var subject = opts.subject;
         errdefer if (subject) |s| self.allocator.free(s);
@@ -220,6 +257,8 @@ pub const TaskStore = struct {
 
     /// 添加 blocks/blockedBy 依赖（深拷贝 ID）。
     pub fn addBlocks(self: *TaskStore, id: []const u8, blocked_ids: []const []const u8) !void {
+        _ = self.mutex.lock(); // task#19(一致性:虽 snapshot 暂不读 blocks)
+        defer _ = self.mutex.unlock();
         const t = self.get(id) orelse return error.TaskNotFound;
         for (blocked_ids) |bid| {
             const s = try self.allocator.dupe(u8, bid);
@@ -229,6 +268,8 @@ pub const TaskStore = struct {
     }
 
     pub fn addBlockedBy(self: *TaskStore, id: []const u8, blocker_ids: []const []const u8) !void {
+        _ = self.mutex.lock(); // task#19
+        defer _ = self.mutex.unlock();
         const t = self.get(id) orelse return error.TaskNotFound;
         for (blocker_ids) |bid| {
             const s = try self.allocator.dupe(u8, bid);
@@ -329,4 +370,59 @@ test "TaskStore: completed 记 completed_ms,转出 completed 清零" {
     // 转回 in_progress(返工)→ 时戳清零,TTL 重置。
     try store.updateStatus(t.id, .in_progress);
     try testing.expectEqual(@as(i64, 0), t.completed_ms);
+}
+
+test "task#19: snapshotTasks 正确性 + 并发 create/snapshot 不崩(mutex 串行)" {
+    const a = testing.allocator;
+    var store = TaskStore.init(a);
+    defer store.deinit();
+    _ = try store.create("subj-A", "d", null);
+    const t2 = try store.create("subj-B", "d", null);
+    try store.updateStatus(t2.id, .in_progress);
+
+    // 正确性:snapshotTasks 返回 owned 值(id/subject/status),与 store 一致。
+    {
+        const snap = try store.snapshotTasks(a);
+        defer {
+            for (snap) |v| {
+                a.free(v.id);
+                a.free(v.subject);
+            }
+            a.free(snap);
+        }
+        try testing.expectEqual(@as(usize, 2), snap.len);
+        try testing.expectEqualStrings("subj-A", snap[0].subject);
+        try testing.expectEqualStrings("subj-B", snap[1].subject);
+        try testing.expectEqual(TaskStatus.in_progress, snap[1].status);
+    }
+
+    // 并发:writer 线程持续 create(grow tasks.items,realloc),reader 持续 snapshotTasks(迭代)。
+    // 无 mutex → grow-during-iterate 悬挂/堆损坏。mutex 串行 → 干净。best-effort 竞争窗口。
+    const Ctx = struct {
+        s: *TaskStore,
+        stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        fn writer(c: *@This()) void {
+            while (!c.stop.load(.acquire)) {
+                // create(append/grow)后立即 delete(orderedRemove)——保持 store 有界,避免 O(n²)
+                // 快照 + 内存爆炸,同时仍对 tasks.items 做并发 grow/remove 压 snapshot 的迭代。
+                const t = c.s.create("x", "y", null) catch continue;
+                const id = std.fmt.allocPrint(c.s.allocator, "{s}", .{t.id}) catch continue;
+                defer c.s.allocator.free(id);
+                c.s.updateStatus(id, .deleted) catch {};
+            }
+        }
+    };
+    var wctx = Ctx{ .s = &store };
+    const th = try std.Thread.spawn(.{}, Ctx.writer, .{&wctx});
+    var n: usize = 0;
+    while (n < 2000) : (n += 1) {
+        const snap = store.snapshotTasks(a) catch continue;
+        for (snap) |v| {
+            a.free(v.id);
+            a.free(v.subject);
+        }
+        a.free(snap);
+    }
+    wctx.stop.store(true, .release);
+    th.join();
 }
