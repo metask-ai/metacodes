@@ -122,6 +122,10 @@ pub const SessionRegistry = struct {
     allocator: std.mem.Allocator,
     mutex: sync.Mutex = .{},
     hosts: std.AutoHashMapUnmanaged(SessionId, *SessionHost) = .{},
+    /// 关停已发起(shutdownAll 置位,mutex 保护)。**put 守卫**:关停期(尤其未来 dynamic op=new 由绑定层
+    /// accept 线程并发建 session)拒绝新 put——否则 shutdownAll 快照+清 map 后进来的 host 永不被 destroy
+    /// (泄漏 + driver 跑在已拆 registry 上)。task#21:accept 循环已落地(WebServer/UdsServer),补此守卫。
+    closing: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) SessionRegistry {
         return .{ .allocator = allocator };
@@ -135,10 +139,11 @@ pub const SessionRegistry = struct {
         _ = self.mutex.unlock();
     }
 
-    /// 插入(id 已存在 → AlreadyExists,caller 不泄漏 host)。加锁短临界区。
+    /// 插入(关停已发起 → ShuttingDown;id 已存在 → AlreadyExists,caller 不泄漏 host)。加锁短临界区。
     pub fn put(self: *SessionRegistry, host: *SessionHost) !void {
         _ = self.mutex.lock();
         defer _ = self.mutex.unlock();
+        if (self.closing) return error.ShuttingDown; // 关停期拒新 session(task#21,防泄漏+UAF)
         if (self.hosts.contains(host.id)) return error.AlreadyExists;
         try self.hosts.put(self.allocator, host.id, host);
     }
@@ -163,6 +168,7 @@ pub const SessionRegistry = struct {
     /// requestStop(并行触发退出,中断各自 in-flight)再逐个 destroy(join+释放)。join/destroy 全在锁外。
     pub fn shutdownAll(self: *SessionRegistry) void {
         _ = self.mutex.lock();
+        self.closing = true; // 置于锁内、快照前:此后并发 put 一律 ShuttingDown,无 host 漏出快照(task#21)
         const n = self.hosts.count();
         if (n == 0) {
             _ = self.mutex.unlock();
@@ -332,6 +338,23 @@ test "U10-A: remove 单个 session 优雅摘除,其余不受影响" {
 
     reg.remove(idFrom('X'));
     try testing.expectEqual(@as(usize, 1), reg.count());
+}
+
+test "U10-A: 关停后 put → ShuttingDown(task#21 守卫:关停期不收新 session)" {
+    const a = testing.allocator;
+    var reg = SessionRegistry.init(a);
+    defer reg.deinit();
+    var dummy: u8 = 0;
+    const h1 = try SessionHost.create(a, idFrom('P'), @ptrCast(&dummy), echoDriver, null, null);
+    try reg.put(h1);
+    try h1.start();
+    reg.shutdownAll(); // 置 closing,清空并关停 h1
+    try testing.expectEqual(@as(usize, 0), reg.count());
+    // 关停后新 host 被拒(caller 自行释放,不入 registry → 不泄漏 / 不 UAF)。
+    const h2 = try SessionHost.create(a, idFrom('Q'), @ptrCast(&dummy), echoDriver, null, null);
+    try testing.expectError(error.ShuttingDown, reg.put(h2));
+    h2.destroy();
+    try testing.expectEqual(@as(usize, 0), reg.count());
 }
 
 test "U10-A: put 重复 id → AlreadyExists(不覆盖不泄漏)" {
