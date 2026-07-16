@@ -270,53 +270,153 @@ test "L2 Host UI fatal aborts the Run and poisons the ABI Session" {
     runtime = null;
 }
 
-fn expectMappedEventDecodes(event: core.protocol.ui_event.CoreEvent) !void {
+fn expectMappedEventEquals(event: core.protocol.ui_event.CoreEvent, expected: sdk.CoreEvent) !void {
     const mapped = abi.protocol_v1.event(event) orelse return error.UnexpectedInternalOnlyEvent;
+    try std.testing.expectEqualDeep(expected, mapped);
     const encoded = try std.json.Stringify.valueAlloc(std.testing.allocator, mapped, .{});
     defer std.testing.allocator.free(encoded);
     const parsed = try sdk.decodeCoreEvent(std.testing.allocator, encoded);
     defer parsed.deinit();
-    try std.testing.expectEqualStrings(
-        @tagName(std.meta.activeTag(event)),
-        @tagName(std.meta.activeTag(parsed.value)),
+    try std.testing.expectEqualDeep(expected, parsed.value);
+}
+
+test "L2 every public AgentCoreEventV1 mapping preserves its complete payload" {
+    const trace_id = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+    try expectMappedEventEquals(.{ .text_chunk = "text-sentinel" }, .{ .text_chunk = "text-sentinel" });
+    try expectMappedEventEquals(.stream_begin, .stream_begin);
+    try expectMappedEventEquals(
+        .{ .tool_start = .{ .id = "tool-id", .name = "ToolName", .input = "input-json" } },
+        .{ .tool_start = .{ .id = "tool-id", .name = "ToolName", .input = "input-json" } },
+    );
+    try expectMappedEventEquals(
+        .{ .set_current_tool = .{ .name = "CurrentTool" } },
+        .{ .set_current_tool = .{ .name = "CurrentTool" } },
+    );
+    try expectMappedEventEquals(
+        .{ .tool_progress = .{ .id = "progress-id", .text = "progress-text" } },
+        .{ .tool_progress = .{ .id = "progress-id", .text = "progress-text" } },
+    );
+    try expectMappedEventEquals(
+        .{ .progress = .{ .turn = 11, .tool_name = "ProgressTool", .tool_input = "progress-input", .tool_calls = 22 } },
+        .{ .progress = .{ .turn = 11, .tool_name = "ProgressTool", .tool_input = "progress-input", .tool_calls = 22 } },
+    );
+    try expectMappedEventEquals(.clear_current_tool, .clear_current_tool);
+    try expectMappedEventEquals(
+        .{ .tool_result = .{
+            .id = "result-id",
+            .name = "ResultTool",
+            .input = "result-input",
+            .content = "result-content",
+            .is_error = true,
+            .elapsed_ms = 33,
+        } },
+        .{ .tool_result = .{
+            .id = "result-id",
+            .name = "ResultTool",
+            .input = "result-input",
+            .content = "result-content",
+            .is_error = true,
+            .elapsed_ms = 33,
+        } },
+    );
+    try expectMappedEventEquals(
+        .{ .usage = .{
+            .input_tokens = 101,
+            .output_tokens = 202,
+            .cache_read_input_tokens = 303,
+            .cache_creation_input_tokens = 404,
+        } },
+        .{ .usage = .{
+            .input_tokens = 101,
+            .output_tokens = 202,
+            .cache_read_input_tokens = 303,
+            .cache_creation_input_tokens = 404,
+        } },
+    );
+    try expectMappedEventEquals(
+        .{ .context_warning = .{
+            .current_tokens = 1001,
+            .warning_threshold = 2002,
+            .auto_compact_threshold = 3003,
+            .blocking_limit = 4004,
+            .level = "warning-level",
+        } },
+        .{ .context_warning = .{
+            .current_tokens = 1001,
+            .warning_threshold = 2002,
+            .auto_compact_threshold = 3003,
+            .blocking_limit = 4004,
+            .level = "warning-level",
+        } },
+    );
+    try expectMappedEventEquals(
+        .{ .auto_compact = .{
+            .dropped = 12,
+            .kept = 23,
+            .before_tokens = 3400,
+            .after_tokens = 4500,
+            .cause = "compact-cause",
+        } },
+        .{ .auto_compact = .{
+            .dropped = 12,
+            .kept = 23,
+            .before_tokens = 3400,
+            .after_tokens = 4500,
+            .cause = "compact-cause",
+        } },
+    );
+    try expectMappedEventEquals(
+        .{ .retry_notice = .{ .attempt = 13, .max = 24, .delay_ms = 3500 } },
+        .{ .retry_notice = .{ .attempt = 13, .max = 24, .delay_ms = 3500 } },
+    );
+    try expectMappedEventEquals(.stream_done, .stream_done);
+    try expectMappedEventEquals(
+        .{ .diag_turn_begin = .{ .trace_id = trace_id, .depth = 31, .turn = 41 } },
+        .{ .diag_turn_begin = .{ .trace_id = trace_id, .depth = 31, .turn = 41 } },
+    );
+    try expectMappedEventEquals(
+        .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = 32, .turn = 42, .tool_calls = 52 } },
+        .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = 32, .turn = 42, .tool_calls = 52 } },
+    );
+    try expectMappedEventEquals(
+        .{ .diag_breaker_tripped = .{ .trace_id = trace_id, .depth = 33, .same_err_count = 43 } },
+        .{ .diag_breaker_tripped = .{ .trace_id = trace_id, .depth = 33, .same_err_count = 43 } },
+    );
+    try expectMappedEventEquals(
+        .{ .diag_cache_break = .{ .trace_id = trace_id, .depth = 34, .cache_read = 4400, .cache_creation = 5500 } },
+        .{ .diag_cache_break = .{ .trace_id = trace_id, .depth = 34, .cache_read = 4400, .cache_creation = 5500 } },
+    );
+    try expectMappedEventEquals(
+        .{ .diag_continuation = .{ .trace_id = trace_id, .depth = 35, .n = 45, .max = 55 } },
+        .{ .diag_continuation = .{ .trace_id = trace_id, .depth = 35, .n = 45, .max = 55 } },
+    );
+    try expectMappedEventEquals(
+        .{ .diag_run_end = .{
+            .trace_id = trace_id,
+            .depth = 36,
+            .turns = 46,
+            .tool_calls = 56,
+            .stop_reason_name = "stop-sentinel",
+        } },
+        .{ .diag_run_end = .{
+            .trace_id = trace_id,
+            .depth = 36,
+            .turns = 46,
+            .tool_calls = 56,
+            .stop_reason_name = "stop-sentinel",
+        } },
     );
 }
 
-test "L2 every public AgentCoreEventV1 mapping is accepted by the source-free SDK" {
-    const trace_id = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
-    try expectMappedEventDecodes(.{ .text_chunk = "hello" });
-    try expectMappedEventDecodes(.stream_begin);
-    try expectMappedEventDecodes(.{ .tool_start = .{ .id = "t1", .name = "Read", .input = "{}" } });
-    try expectMappedEventDecodes(.{ .set_current_tool = .{ .name = "Read" } });
-    try expectMappedEventDecodes(.{ .tool_progress = .{ .id = "t1", .text = "working" } });
-    try expectMappedEventDecodes(.{ .progress = .{ .turn = 1, .tool_name = "Read", .tool_input = "{}", .tool_calls = 2 } });
-    try expectMappedEventDecodes(.clear_current_tool);
-    try expectMappedEventDecodes(.{ .tool_result = .{ .id = "t1", .name = "Read", .input = "{}", .content = "ok", .is_error = false, .elapsed_ms = 3 } });
-    try expectMappedEventDecodes(.{ .usage = .{ .input_tokens = 1, .output_tokens = 2, .cache_read_input_tokens = 3, .cache_creation_input_tokens = 4 } });
-    try expectMappedEventDecodes(.{ .context_warning = .{ .current_tokens = 1, .warning_threshold = 2, .auto_compact_threshold = 3, .blocking_limit = 4, .level = "medium" } });
-    try expectMappedEventDecodes(.{ .auto_compact = .{ .dropped = 1, .kept = 2, .before_tokens = 3, .after_tokens = 4, .cause = "trigger" } });
-    try expectMappedEventDecodes(.{ .retry_notice = .{ .attempt = 1, .max = 2, .delay_ms = 3 } });
-    try expectMappedEventDecodes(.stream_done);
-    try expectMappedEventDecodes(.{ .diag_turn_begin = .{ .trace_id = trace_id, .depth = 0, .turn = 1 } });
-    try expectMappedEventDecodes(.{ .diag_turn_end = .{ .trace_id = trace_id, .depth = 0, .turn = 1, .tool_calls = 2 } });
-    try expectMappedEventDecodes(.{ .diag_breaker_tripped = .{ .trace_id = trace_id, .depth = 0, .same_err_count = 3 } });
-    try expectMappedEventDecodes(.{ .diag_cache_break = .{ .trace_id = trace_id, .depth = 0, .cache_read = 4, .cache_creation = 5 } });
-    try expectMappedEventDecodes(.{ .diag_continuation = .{ .trace_id = trace_id, .depth = 0, .n = 1, .max = 2 } });
-    try expectMappedEventDecodes(.{ .diag_run_end = .{ .trace_id = trace_id, .depth = 0, .turns = 1, .tool_calls = 2, .stop_reason_name = "end_turn" } });
-}
-
-fn expectMappedUiRequestDecodes(request: *const core.protocol.ui_request.UiRequest) !void {
+fn expectMappedUiRequestEquals(request: *const core.protocol.ui_request.UiRequest, expected: sdk.UiRequest) !void {
     const encoded = try abi.protocol_v1.encodeUiRequest(std.testing.allocator, request);
     defer std.testing.allocator.free(encoded);
     const parsed = try sdk.decodeUiRequest(std.testing.allocator, encoded);
     defer parsed.deinit();
-    try std.testing.expectEqualStrings(
-        @tagName(std.meta.activeTag(request.*)),
-        @tagName(std.meta.activeTag(parsed.value)),
-    );
+    try std.testing.expectEqualDeep(expected, parsed.value);
 }
 
-test "L2 every UiRequestV1 mapping is accepted by the source-free SDK" {
+test "L2 every UiRequestV1 mapping preserves its complete payload" {
     const options = [_]core.tool_context.AskOption{
         .{ .label = "Yes", .description = "Proceed", .preview = "preview" },
         .{ .label = "No", .description = "Stop" },
@@ -331,8 +431,18 @@ test "L2 every UiRequestV1 mapping is accepted by the source-free SDK" {
     const permission = core.protocol.ui_request.UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
     const plan = core.protocol.ui_request.UiRequest{ .plan_approval = .{ .plan_md = "Do it", .kg_step_count = 2 } };
     const custom = core.protocol.ui_request.UiRequest{ .custom = .{ .kind = "video_timeline", .payload_json = "{\"clips\":[]}" } };
-    try expectMappedUiRequestDecodes(&ask);
-    try expectMappedUiRequestDecodes(&permission);
-    try expectMappedUiRequestDecodes(&plan);
-    try expectMappedUiRequestDecodes(&custom);
+    const public_options = [_]sdk.protocol.AskOption{
+        .{ .label = "Yes", .description = "Proceed", .preview = "preview" },
+        .{ .label = "No", .description = "Stop", .preview = "" },
+    };
+    const public_questions = [_]sdk.protocol.AskQuestion{.{
+        .question = "Continue?",
+        .header = "Choice",
+        .multi = false,
+        .options = &public_options,
+    }};
+    try expectMappedUiRequestEquals(&ask, .{ .ask_question = &public_questions });
+    try expectMappedUiRequestEquals(&permission, .{ .permission = .{ .tool = "Bash", .args = "{}" } });
+    try expectMappedUiRequestEquals(&plan, .{ .plan_approval = .{ .plan_md = "Do it", .kg_step_count = 2 } });
+    try expectMappedUiRequestEquals(&custom, .{ .custom = .{ .kind = "video_timeline", .payload_json = "{\"clips\":[]}" } });
 }

@@ -97,7 +97,7 @@ cat > "$manifest_tmp" <<EOF
   "name": "metacodes-agentcore",
   "version": "$version",
   "source": {
-    "cc_zig_commit": "$commit",
+    "commit": "$commit",
     "dirty": $dirty,
     "dirty_source_sha256": "$source_digest"
   },

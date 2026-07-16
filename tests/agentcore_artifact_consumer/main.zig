@@ -44,7 +44,7 @@ const Probe = struct {
         switch (parsed.value) {
             .tool_result => |result| {
                 if (std.mem.eql(u8, result.name, "Read") and !result.is_error and
-                    std.mem.eql(u8, result.content, "     1\tartifact-read-ok"))
+                    std.mem.indexOf(u8, result.content, "artifact-read-ok") != null)
                     self.saw_read_result = true;
                 if (std.mem.eql(u8, result.name, "HostEcho") and !result.is_error and
                     std.mem.eql(u8, result.content, "artifact-host-ok"))

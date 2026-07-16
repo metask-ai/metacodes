@@ -5,7 +5,7 @@ pub const Manifest = struct {
     name: []const u8,
     version: []const u8,
     source: struct {
-        cc_zig_commit: []const u8,
+        commit: []const u8,
         dirty: bool,
         dirty_source_sha256: []const u8,
     },
@@ -82,9 +82,9 @@ pub const bundle_directories = [_][]const u8{ "include", "lib", "sdk" };
 pub fn validateManifest(manifest: Manifest, expected: Expected) Error!void {
     if (manifest.schema_version != 1) return error.InvalidSchema;
     if (!std.mem.eql(u8, manifest.name, "metacodes-agentcore")) return error.InvalidName;
-    if (manifest.source.cc_zig_commit.len != 40 or !isLowerHex(manifest.source.cc_zig_commit)) return error.InvalidCommit;
+    if (manifest.source.commit.len != 40 or !isLowerHex(manifest.source.commit)) return error.InvalidCommit;
     if (expected.commit) |commit| {
-        if (!std.mem.eql(u8, manifest.source.cc_zig_commit, commit)) return error.CommitMismatch;
+        if (!std.mem.eql(u8, manifest.source.commit, commit)) return error.CommitMismatch;
     } else if (expected.require_clean) {
         return error.ExpectedCommitRequired;
     }
@@ -107,7 +107,7 @@ pub fn validateManifest(manifest: Manifest, expected: Expected) Error!void {
 
 fn validateVersion(manifest: Manifest) Error!void {
     const prefix = "0.0.0-dev+";
-    const commit_short = manifest.source.cc_zig_commit[0..12];
+    const commit_short = manifest.source.commit[0..12];
     if (!std.mem.startsWith(u8, manifest.version, prefix)) return error.InvalidVersion;
     const suffix = manifest.version[prefix.len..];
     if (!std.mem.startsWith(u8, suffix, commit_short)) return error.InvalidVersion;
@@ -177,7 +177,7 @@ fn validManifest() Manifest {
         .name = "metacodes-agentcore",
         .version = "0.0.0-dev+0123456789ab",
         .source = .{
-            .cc_zig_commit = "0123456789abcdef0123456789abcdef01234567",
+            .commit = "0123456789abcdef0123456789abcdef01234567",
             .dirty = false,
             .dirty_source_sha256 = "",
         },

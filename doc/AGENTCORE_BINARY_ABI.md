@@ -48,6 +48,9 @@ bundles require an explicit `aarch64-macos.13.0` target. Build a distributable
 bundle into a new empty `--prefix`; a clean Git tree does not make a reused
 output directory free of stale, unlisted files.
 
+Schema version 1 is the first formal bundle layout. Earlier pre-release
+development manifests are unsupported.
+
 ReleaseSafe bundles strip DWARF by default; the explicit
 `-Dagentcore-strip=true` in the release command pins that policy in build
 automation. Debug symbols belong in a separately retained symbols artifact,
