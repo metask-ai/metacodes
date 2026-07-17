@@ -61,18 +61,22 @@ metacodes/
 │   ├── highlight-zig/          #   纯 Zig 语法高亮库
 │   └── tinykg/                 #   KG 记忆/计划/DAG 引擎(subprocess CLI)
 ├── sdk/                        # AgentCore C 头 + Zig SDK
-└── example/                    # metacodes-core 库消费示例
+└── example/                    # metacodes-core 内部 dogfood 示例
 ```
 
-## 库形态:两条消费路径
+## 库形态:外部只交付 AgentCore 二进制
 
-agent 循环核心可作为库被外部消费:
+第三方 Host 不直接编译 metacodes core 源码；Zig Host 也使用 source-free SDK：
 
-| 消费方 | 用什么 | 序列化开销 |
-|--------|--------|-----------|
-| 同进程 Zig | `metacodes-core` 模块(`b.addModule`) | **零**(直传 CoreEvent 结构) |
-| source-free Zig | `metacodes_agentcore` 静态库 + typed Zig SDK | AgentCore protocol v1 JSON |
-| C / Rust / 跨版本 | `metacodes_agentcore` 静态库 | 富数据 JSON,配置 POD 结构 |
+| 消费方 | 受支持的交付物 | 序列化开销 |
+|--------|----------------|-----------|
+| Zig | `metacodes_agentcore` 静态库 + typed Zig SDK | AgentCore protocol v1 JSON |
+| C / C++ | `metacodes_agentcore` 静态库 + C 头文件 | 富数据 JSON,配置 POD 结构 |
+| Rust / Go / 其他语言 | 经 C ABI 绑定 AgentCore bundle | 富数据 JSON,配置 POD 结构 |
+
+仓库内的 `metacodes-core` module 只服务内部模块化、UI 隔离验证和 dogfood；它不是
+第三方发行物，也不承诺源码兼容。交付布局、Windows 工具链边界与发布门禁见
+`doc/LIB_API.md`。
 
 C ABI(`sdk/metacodes_agentcore.h`)刻意只导出单入口 `metacodes_agentcore_get_api(abi_version)`,返回函数指针表(vtable):`runtime_create/destroy`、`session_create/destroy`、`session_run`(agent 循环)、`session_abort`、`buffer_release`。ABI v1 已于 2026-07-17 冻结，要求精确结构体大小与 reserved 全零；bug/security fix 必须保持 v1 可观察行为，任何扩展新增 v2 table，不能静默修改 v1。事件/UI JSON 由独立 AgentCore protocol v1 定义，不直接暴露内部 frontend/daemon `CoreEvent`；未知观察事件可忽略，UI/control 消息严格校验。完整契约见 `doc/AGENTCORE_BINARY_ABI.md`。
 

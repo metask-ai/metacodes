@@ -169,8 +169,13 @@ CoreEvent/UiEvent/UiBackend 纯数据 + 函数指针,不碰 fd。因此:
 
 ## 8. 库抽取:metacodes-core(2026-06-07)
 
+> **交付状态更新（2026-07-17）**：本节保留当时的架构演进记录；其中“供外部项目
+> 直接消费源码”的设想已被 AgentCore 二进制交付边界取代。`metacodes-core` 现为仓库内部
+> module，第三方契约见 `doc/LIB_API.md` 与 `doc/AGENTCORE_BINARY_ABI.md`。
+
 UI 解耦(A–E)证明了 agent 循环层只经 UiBackend/CoreEvent 与 UI 通信。本次把循环层正式
-**抽成独立 Zig 库 `metacodes-core`**,供其他项目复用。库对外接口契约见 `doc/LIB_API.md`。
+**抽成独立 Zig module `metacodes-core`**。它当前用于仓库内部复用和边界验证；第三方由
+`doc/LIB_API.md` 定义的 AgentCore 二进制接口接入。
 
 **做法(物理分离,库留原地、移协议、断泄漏)**:
 - **协议落中立位**:`ui_backend`/`ui_event`/`ui_request` 从 `repl/`(UI 目录)`git mv` 到
@@ -191,8 +196,8 @@ UI 解耦(A–E)证明了 agent 循环层只经 UiBackend/CoreEvent 与 UI 通�
 图物理够不到 UI 层。库子树 `grep '../repl|../app|../tui|tui/dialog|tui/theme|tui/term'` = 0。
 
 **关键决策**:库留原地、只移 3 协议文件(~80 行 churn,而非移 116 库文件几百处);
-`cc`=main.zig 不变(app + 52 测试零 churn);app 暂走相对路径,metacodes-core 并行供外部
-+ example 用(P4 dogfood 未做——test:lib 已强制边界,P4 动 cc 聚合器风险大无新增收益)。
+`cc`=main.zig 不变(app + 52 测试零 churn);app 暂走相对路径,metacodes-core 供内部 app
++ example dogfood(P4 未做——test:lib 已强制边界,P4 动 cc 聚合器风险大无新增收益)。
 
 **关键文件**:`src/lib.zig`、`src/core/protocol/*`、`src/core/mcp_session.zig`、
 `example/main.zig`、`doc/LIB_API.md`、`build.zig`(module + test:lib + example step)、`build.zig.zon`。

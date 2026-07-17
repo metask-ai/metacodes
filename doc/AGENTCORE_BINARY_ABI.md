@@ -15,33 +15,49 @@ extension requires `metacodes_agentcore_get_api(2)` and v2 types.
 
 ## Build and verify
 
-Use the repository-pinned Zig toolchain and an explicit target. The command
-below is the currently verified native consumer configuration:
+Use the repository-pinned Zig toolchain and an explicit target. A cross-target
+bundle build compiles and link-checks source-free Zig, C, and C++17 consumers
+without trying to execute foreign binaries:
 
 ```sh
-zig build agentcore:test
-prefix=$(mktemp -d)
-zig build agentcore:consumer --prefix "$prefix" \
-  -Dtarget=aarch64-macos.13.0 -Doptimize=ReleaseSafe \
-  -Dagentcore-strip=true
+zig build agentcore:bundle \
+  -Dtarget=x86_64-windows-gnu \
+  -Doptimize=ReleaseSmall
 ```
 
+On a matching native host, the delivery gate runs the ABI tests, creates the
+bundle, links the source-free consumers, and executes them:
+
+```sh
+zig build agentcore:gate \
+  -Dtarget=x86_64-windows-gnu \
+  -Doptimize=ReleaseSmall
+```
+
+`agentcore:gate` and `agentcore:consumer` require an explicit target that can
+run on the current host. They fail during graph construction for a foreign
+target and direct cross-target validation to `agentcore:bundle`.
+
 The final release check must use a new empty prefix and bind the manifest to
-the clean commit being released:
+the clean commit being released. For example, on a native macOS arm64 host:
 
 ```sh
 commit=$(git rev-parse HEAD)
-zig build agentcore:consumer --prefix /absolute/new/empty/prefix \
-  -Dtarget=aarch64-macos.13.0 -Doptimize=ReleaseSafe \
+prefix=$(mktemp -d)
+zig build agentcore:gate --prefix "$prefix" \
+  -Dtarget=aarch64-macos.13.0 \
+  -Doptimize=ReleaseSafe \
   -Dagentcore-strip=true \
   -Dagentcore-require-clean-bundle=true \
   -Dagentcore-expected-commit="$commit"
 ```
 
-`--prefix /absolute/path` changes the bundle root. The installed files are:
+`--prefix /absolute/path` changes the install prefix. The target-specific
+bundle root is nested below it so different resolved targets cannot overwrite
+each other:
 
 ```text
-<prefix>/
+<prefix>/agentcore/<resolved-target>/
 ├── lib/<target static-library filename>
 ├── include/metacodes_agentcore.h
 ├── sdk/metacodes_agentcore.zig
@@ -62,13 +78,17 @@ clean Git tree does not make a reused output directory free of stale, unlisted
 files.
 
 `agentcore:bundle` cross-compiles one bundle per explicit target and link-checks
-source-free Zig, C, and C++17 consumers against the installed artifacts.
-The static library filename comes from Zig for that target (`.a` or `.lib`) and
-is recorded in the manifest. `agentcore:consumer` additionally runs the
-resulting Zig, C, and C++ programs, so a cross-target runtime check needs a compatible
-runner; native CI should run it on every released platform. At present only
-macOS arm64 has completed that native end-to-end verification. This is a
-validation status, not an ABI restriction.
+source-free Zig, C, and C++17 consumers against the installed artifacts. The
+static library filename comes from Zig `out_filename` for that target (`.a` or
+`.lib`) and is recorded in the manifest. `agentcore:consumer` additionally runs
+the resulting programs, while `agentcore:gate` combines that native consumer
+check with the ABI test suite.
+
+Native end-to-end verification currently covers macOS arm64 and
+`x86_64-windows-gnu`. The Windows GNU result does not claim compatibility with
+an MSVC-target bundle, `link.exe`, or `clang-cl`; those require a separately
+produced `x86_64-windows-msvc` bundle and native consumer gate before they can
+be listed as supported. This validation status is not an ABI restriction.
 
 Schema version 1 is the first formal bundle layout. Earlier pre-release
 development manifests are unsupported.

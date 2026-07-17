@@ -1,10 +1,12 @@
-# metacodes-core — 架构参考
+# metacodes-core — 内部架构参考
 
-> 面向在 core 之上构建前端的开发者:GUI、语音、IM 机器人、Web、工作流、嵌入式实体按钮。
-> 快速接入(装依赖 + 跑 example)见 `doc/LIB_API.md`;本文是**架构契约 + 设计不变式**参考。
+> 面向 metacodes 仓库内部维护者，说明 TUI、Web、daemon 等 frontend 与 core 的模块边界。
+> 本文是**内部架构契约 + 设计不变式**参考；第三方接入见 `doc/LIB_API.md`。
 >
 > 字段级 API 以源码为准(本文与源码同步于 2026-06-09);模块名 `metacodes_core`,
-> `@import("metacodes-core")`。版本 `lib.VERSION = "0.1.0"`。
+> 本文仅描述仓库内部模块边界，不是第三方源码 API。外部 Host 只消费预编译
+> AgentCore bundle；交付契约见 `doc/LIB_API.md`。内部 module 版本为
+> `lib.VERSION = "0.1.0"`。
 
 ---
 
@@ -333,7 +335,7 @@ zig build example         # 跑 example/ 最小前端(真端点;离线见 LIB_AP
 
 ## 9. 导航
 
-- 快速接入(装依赖 + 跑 example):`doc/LIB_API.md`
+- 第三方 AgentCore 二进制接入:`doc/LIB_API.md`
 - 最小前端示例:`example/main.zig`(`zig build example`)
 - 多 session 设计:metaknow scope metask_business `MULTI_SESSION_REFACTOR`
 - 设计文档总入口:metaknow scope `metask_business`(PLAN/SUBAGENT/PERMISSION/TOOLS 等根)
