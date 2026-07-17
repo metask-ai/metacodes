@@ -57,7 +57,7 @@ const AbiRuntime = struct {
 const AbiSession = struct {
     callbacks: wire.SessionCallbacksV1,
     callback_status: std.atomic.Value(u32),
-    contract_failed: std.atomic.Value(bool),
+    facade_poisoned: std.atomic.Value(bool),
     core_session: *core.agent_session.AgentSession,
 
     fn handle(self: *AbiSession) *wire.SessionHandle {
@@ -291,7 +291,7 @@ fn stopReason(self: *AbiSession, reason: core.agent_loop.StopReason) error{Unsup
             // The stateful Run has already committed Conversation changes.
             // Returning an error while leaving the facade reusable would make
             // a Host retry ambiguous and could repeat side effects.
-            self.contract_failed.store(true, .release);
+            self.facade_poisoned.store(true, .release);
             return error.UnsupportedStopReason;
         },
     };
@@ -474,7 +474,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     const self = allocator.create(AbiSession) catch return fail(wire.STATUS_OUT_OF_MEMORY, "allocating Session failed", out_error);
     self.callbacks = callbacks.*;
     self.callback_status = .init(wire.STATUS_OK);
-    self.contract_failed = .init(false);
+    self.facade_poisoned = .init(false);
     self.core_session = runtime.core_runtime.createSession(.{
         .provider_kind = kind,
         .api_key = api_key,
@@ -501,11 +501,12 @@ fn sessionDestroy(handle: ?*wire.SessionHandle, out_error: ?*wire.OwnedBytesV1) 
 }
 
 fn sessionRun(handle: ?*wire.SessionHandle, run_id: u64, prompt_view: wire.BytesViewV1, options_ptr: ?*const wire.RunOptionsV1, out_result: ?*wire.RunResultV1, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+    // Defensive hygiene only. ABI v1 defines RunResult fields only on OK.
     if (out_result) |out| out.* = std.mem.zeroes(wire.RunResultV1);
     emptyError(out_error);
     const self = sessionFrom(handle orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
-    if (self.contract_failed.load(.acquire))
-        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by an AgentCore ABI contract failure", out_error);
+    if (self.facade_poisoned.load(.acquire))
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
     const options = options_ptr orelse return fail(wire.STATUS_INVALID_ARGUMENT, "run options are required", out_error);
     const out = out_result orelse return fail(wire.STATUS_INVALID_ARGUMENT, "out_result is required", out_error);
     if (run_id == 0 or options.struct_size != @sizeOf(wire.RunOptionsV1) or options.max_turns == 0 or !allZero(options.reserved))
@@ -513,8 +514,11 @@ fn sessionRun(handle: ?*wire.SessionHandle, run_id: u64, prompt_view: wire.Bytes
     if (options.max_turns > wire.MAX_TURNS_V1)
         return fail(wire.STATUS_RESOURCE_LIMIT, "max_turns exceeds AgentCore ABI v1 limit", out_error);
     const prompt = text(prompt_view) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
-    const result = self.core_session.runText(run_id, prompt, options.max_turns, .{ .ctx = self, .emit = AbiSession.emit }) catch |err|
-        return failError(runErrorStatus(self, err), err, out_error);
+    const result = self.core_session.runText(run_id, prompt, options.max_turns, .{ .ctx = self, .emit = AbiSession.emit }) catch |err| {
+        const status = runErrorStatus(self, err);
+        if (self.core_session.isPoisoned()) self.facade_poisoned.store(true, .release);
+        return failError(status, err, out_error);
+    };
     defer if (result.suspend_info) |suspend_info| suspend_info.deinit();
     const stop_code = stopReason(self, result.stop_reason) catch
         return fail(wire.STATUS_INTERNAL_ERROR, "core returned a stop reason unsupported by AgentCore ABI v1", out_error);
@@ -525,8 +529,8 @@ fn sessionRun(handle: ?*wire.SessionHandle, run_id: u64, prompt_view: wire.Bytes
 fn sessionAbort(handle: ?*wire.SessionHandle, run_id: u64, reason_code: u32, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
     emptyError(out_error);
     const self = sessionFrom(handle orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
-    if (self.contract_failed.load(.acquire))
-        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by an AgentCore ABI contract failure", out_error);
+    if (self.facade_poisoned.load(.acquire))
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
     const reason: core.agent_session.AbortReason = switch (reason_code) {
         wire.ABORT_USER_REQUEST => .user_interrupt,
         wire.ABORT_TIMEOUT => .timeout,
@@ -734,7 +738,7 @@ test "Host UI descriptor ownership is independent of callback status" {
             .reserved = [_]u64{0} ** 4,
         },
         .callback_status = .init(wire.STATUS_OK),
-        .contract_failed = .init(false),
+        .facade_poisoned = .init(false),
         .core_session = undefined,
     };
 
@@ -870,7 +874,7 @@ test "oversized Host UI responses are released and classified as callback failur
             .reserved = [_]u64{0} ** 4,
         },
         .callback_status = .init(wire.STATUS_OK),
-        .contract_failed = .init(false),
+        .facade_poisoned = .init(false),
         .core_session = undefined,
     };
     try std.testing.expectError(
@@ -903,7 +907,7 @@ test "Run OutOfMemory maps to the public OOM status" {
     var fake = AbiSession{
         .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
         .callback_status = .init(wire.STATUS_OK),
-        .contract_failed = .init(false),
+        .facade_poisoned = .init(false),
         .core_session = undefined,
     };
     try std.testing.expectEqual(wire.STATUS_OUT_OF_MEMORY, runErrorStatus(&fake, error.OutOfMemory));
@@ -922,17 +926,17 @@ test "internal continuation states poison the ABI facade" {
     var fake = AbiSession{
         .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
         .callback_status = .init(wire.STATUS_OK),
-        .contract_failed = .init(false),
+        .facade_poisoned = .init(false),
         .core_session = undefined,
     };
     try std.testing.expectError(error.UnsupportedStopReason, stopReason(&fake, .suspended));
-    try std.testing.expect(fake.contract_failed.load(.acquire));
-    fake.contract_failed.store(false, .release);
+    try std.testing.expect(fake.facade_poisoned.load(.acquire));
+    fake.facade_poisoned.store(false, .release);
     try std.testing.expectError(error.UnsupportedStopReason, stopReason(&fake, .backgrounded));
-    try std.testing.expect(fake.contract_failed.load(.acquire));
-    fake.contract_failed.store(false, .release);
+    try std.testing.expect(fake.facade_poisoned.load(.acquire));
+    fake.facade_poisoned.store(false, .release);
     try std.testing.expectError(error.UnsupportedStopReason, stopReason(&fake, .budget));
-    try std.testing.expect(fake.contract_failed.load(.acquire));
+    try std.testing.expect(fake.facade_poisoned.load(.acquire));
 }
 
 test "metadata limits enforce per-field and aggregate budgets" {

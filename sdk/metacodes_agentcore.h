@@ -8,6 +8,8 @@
 extern "C" {
 #endif
 
+/* ABI v1 is frozen. Bug/security fixes must preserve observable v1 behavior;
+ * extensions require metacodes_agentcore_get_api(2) and v2 types. */
 #define MC_AGENTCORE_ABI_V1 1u
 
 #define MC_STATUS_OK 0u
@@ -218,15 +220,40 @@ typedef uint32_t (*mc_runtime_create_fn_v1)(const mc_runtime_config_v1 *, mc_run
 typedef uint32_t (*mc_runtime_destroy_fn_v1)(mc_runtime *, mc_owned_bytes_v1 *);
 typedef uint32_t (*mc_session_create_fn_v1)(mc_runtime *, const mc_session_config_v1 *, const mc_session_callbacks_v1 *, mc_session **, mc_owned_bytes_v1 *);
 typedef uint32_t (*mc_session_destroy_fn_v1)(mc_session *, mc_owned_bytes_v1 *);
-typedef uint32_t (*mc_session_run_fn_v1)(mc_session *, uint64_t, mc_bytes_view_v1, const mc_run_options_v1 *, mc_run_result_v1 *, mc_owned_bytes_v1 *);
-typedef uint32_t (*mc_session_abort_fn_v1)(mc_session *, uint64_t, uint32_t, mc_owned_bytes_v1 *);
+
+/* run_id is Host-assigned, non-zero, and scoped to one Session. Each admitted
+ * Run must use a value strictly greater than that Session's previously
+ * admitted run_id. Values may skip. Pre-admission rejection never advances the
+ * last admitted ID, so an otherwise valid greater value remains available for
+ * retry; zero and stale values do not. Admitted values must not be reused or
+ * wrapped. After admitting UINT64_MAX, the Host must create a new Session. */
+typedef uint32_t (*mc_session_run_fn_v1)(
+    mc_session *session,
+    uint64_t run_id,
+    mc_bytes_view_v1 prompt,
+    const mc_run_options_v1 *options,
+    mc_run_result_v1 *out_result,
+    mc_owned_bytes_v1 *out_diagnostic);
+
+/* On a usable Session, zero is INVALID_ARGUMENT and abort requests must
+ * identify the active Run. A different active run_id is STALE_RUN. When idle,
+ * the last admitted run_id is TOO_LATE and every other value is STALE_RUN.
+ * Poisoned Sessions return INVALID_STATE regardless of the supplied ID. */
+typedef uint32_t (*mc_session_abort_fn_v1)(
+    mc_session *session,
+    uint64_t run_id,
+    uint32_t reason_code,
+    mc_owned_bytes_v1 *out_diagnostic);
 
 /* session_run failures before admission (invalid input, resource limit, busy,
  * or stale run id) leave the Session reusable. Once a Run is admitted, an
  * OUT_OF_MEMORY, CORE_ERROR, CALLBACK_FAILED, or INTERNAL_ERROR result poisons
  * the Session; subsequent run/abort calls return INVALID_STATE and destroy
  * remains valid. STATUS_OK, including STOP_ABORTED, returns the Session to
- * idle. TOO_LATE from abort also leaves an idle Session reusable. */
+ * idle. TOO_LATE from abort also leaves an idle Session reusable. Given a
+ * valid Session handle, poisoned state takes precedence over remaining run or
+ * abort argument validation. V1 has no recovery or Conversation/history import
+ * for a poisoned Session; the Host must destroy it and create a new Session. */
 
 /* The final mc_owned_bytes_v1 * parameter on AgentCore API calls is an
  * optional, write-only diagnostic output. The library never reads or releases

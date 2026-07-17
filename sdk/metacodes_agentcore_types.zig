@@ -1,5 +1,7 @@
 //! Stable declarations for the source-free AgentCore binary ABI v1.
 
+/// ABI v1 is frozen. Bug/security fixes must preserve observable v1 behavior;
+/// extensions require `metacodes_agentcore_get_api(2)` and v2 types.
 pub const ABI_VERSION_V1: u32 = 1;
 
 pub const Status = enum(u32) {
@@ -228,6 +230,8 @@ pub const RunOptionsV1 = extern struct {
     reserved: [4]u64,
 };
 
+/// Terminal Run summary. Fields are defined only when `session_run` returns
+/// `STATUS_OK`; on any other status they are unspecified and must not be read.
 pub const RunResultV1 = extern struct {
     struct_size: u32,
     stop_reason_code: u32,
@@ -247,8 +251,32 @@ pub const SessionDestroyFnV1 = *const fn (?*SessionHandle, ?*OwnedBytesV1) callc
 /// Pre-admission validation, resource-limit, busy, and stale-run failures leave
 /// the Session reusable. Once admitted, OOM/core/callback/internal failure
 /// poisons it; successful completion, including STOP_ABORTED, returns it idle.
-pub const SessionRunFnV1 = *const fn (?*SessionHandle, u64, BytesViewV1, ?*const RunOptionsV1, ?*RunResultV1, ?*OwnedBytesV1) callconv(.c) u32;
-pub const SessionAbortFnV1 = *const fn (?*SessionHandle, u64, u32, ?*OwnedBytesV1) callconv(.c) u32;
+/// Given a valid handle, poisoned state precedes remaining argument validation.
+/// V1 cannot recover or import Conversation/history into a poisoned Session.
+/// `run_id` is Host-assigned, non-zero, and scoped to one Session. Each
+/// admitted Run must use a value strictly greater than the Session's previous
+/// admitted value. Pre-admission rejection never advances that value, so an
+/// otherwise valid greater ID remains available for retry; zero and stale IDs
+/// do not. After admitting `maxInt(u64)`, the Host must create a new Session.
+pub const SessionRunFnV1 = *const fn (
+    session: ?*SessionHandle,
+    run_id: u64,
+    prompt: BytesViewV1,
+    options: ?*const RunOptionsV1,
+    out_result: ?*RunResultV1,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
+
+/// On a usable Session, zero is invalid. The matching active `run_id` requests
+/// cooperative abort; another active ID is stale. While idle, the last admitted
+/// ID is too late and every other ID is stale. A poisoned Session returns
+/// invalid state regardless of the supplied ID.
+pub const SessionAbortFnV1 = *const fn (
+    session: ?*SessionHandle,
+    run_id: u64,
+    reason_code: u32,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
 /// Releases only library-owned diagnostics, never Host-owned tool or UI
 /// callback buffers.
 pub const BufferReleaseFnV1 = *const fn (?*OwnedBytesV1) callconv(.c) void;

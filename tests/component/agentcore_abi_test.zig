@@ -141,6 +141,7 @@ const FatalEventProbe = struct {
 const AbortEventProbe = struct {
     api: sdk.Api,
     calls: usize = 0,
+    stale_abort_status: u32 = std.math.maxInt(u32),
     abort_status: u32 = std.math.maxInt(u32),
 
     fn event(raw: ?*anyopaque, session: ?*wire.SessionHandle, run_id: u64, _: wire.BytesViewV1) callconv(.c) u32 {
@@ -148,6 +149,9 @@ const AbortEventProbe = struct {
         self.calls += 1;
         if (self.calls == 1) {
             var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+            const wrong_run_id: u64 = 2;
+            self.stale_abort_status = self.api.sessionAbort()(session, wrong_run_id, wire.ABORT_USER_REQUEST, &diagnostic);
+            self.api.bufferRelease()(&diagnostic);
             self.abort_status = self.api.sessionAbort()(session, run_id, wire.ABORT_USER_REQUEST, &diagnostic);
             self.api.bufferRelease()(&diagnostic);
         }
@@ -300,13 +304,13 @@ test "L2 invalid Session configuration publishes no handle and diagnostics never
     runtime = null;
 }
 
-test "L2 opaque ABI routes Host UI, Host tools and CoreEvent JSON through AgentSession" {
+test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try rootPath(&tmp, &root_buf);
-    const bodies = [_][]const u8{ ASK_SSE, HOST_SSE, FINAL_SSE, FINAL_SSE };
+    const bodies = [_][]const u8{ ASK_SSE, HOST_SSE, FINAL_SSE, FINAL_SSE, FINAL_SSE, FINAL_SSE, FINAL_SSE };
     var server = try harness.MockServer.startCassette(&bodies, 0);
     defer server.stop();
     const url = try server.urlOwned(a);
@@ -378,6 +382,13 @@ test "L2 opaque ABI routes Host UI, Host tools and CoreEvent JSON through AgentS
 
     var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 5, .reserved = [_]u64{0} ** 4 };
     var result: wire.RunResultV1 = undefined;
+    try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, api.sessionAbort()(session, 0, wire.ABORT_USER_REQUEST, &diagnostic));
+    api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        api.sessionRun()(session, 0, sdk.bytesView("zero is not a Run identifier"), &options, &result, &diagnostic),
+    );
+    api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(wire.STATUS_OK, api.sessionRun()(session, 1, sdk.bytesView("exercise ABI"), &options, &result, &diagnostic));
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     try std.testing.expectEqual(@as(usize, 1), probe.ui_calls);
@@ -393,7 +404,6 @@ test "L2 opaque ABI routes Host UI, Host tools and CoreEvent JSON through AgentS
         wire.STATUS_RESOURCE_LIMIT,
         api.sessionRun()(session, 2, sdk.bytesView("must not start"), &options, &result, &diagnostic),
     );
-    try std.testing.expectEqual(@as(u32, 0), result.struct_size);
     api.bufferRelease()(&diagnostic);
     options.max_turns = 5;
     try std.testing.expectEqual(
@@ -403,6 +413,53 @@ test "L2 opaque ABI routes Host UI, Host tools and CoreEvent JSON through AgentS
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     try std.testing.expectEqual(wire.STATUS_TOO_LATE, api.sessionAbort()(session, 2, wire.ABORT_USER_REQUEST, &diagnostic));
     api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(wire.STATUS_STALE_RUN, api.sessionAbort()(session, 1, wire.ABORT_USER_REQUEST, &diagnostic));
+    api.bufferRelease()(&diagnostic);
+
+    try std.testing.expectEqual(
+        wire.STATUS_STALE_RUN,
+        api.sessionRun()(session, 2, sdk.bytesView("accepted identifiers cannot be reused"), &options, &result, &diagnostic),
+    );
+    api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(
+        wire.STATUS_STALE_RUN,
+        api.sessionRun()(session, 1, sdk.bytesView("accepted identifiers cannot move backwards"), &options, &result, &diagnostic),
+    );
+    api.bufferRelease()(&diagnostic);
+
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRun()(session, 20, sdk.bytesView("Run identifiers may skip"), &options, &result, &diagnostic),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    const max_run_id = std.math.maxInt(u64);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRun()(session, max_run_id, sdk.bytesView("consume the final Run identifier"), &options, &result, &diagnostic),
+    );
+    try std.testing.expectEqual(
+        wire.STATUS_STALE_RUN,
+        api.sessionRun()(session, max_run_id, sdk.bytesView("UINT64_MAX cannot repeat"), &options, &result, &diagnostic),
+    );
+    api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(
+        wire.STATUS_STALE_RUN,
+        api.sessionRun()(session, 1, sdk.bytesView("UINT64_MAX cannot wrap to a low identifier"), &options, &result, &diagnostic),
+    );
+    api.bufferRelease()(&diagnostic);
+
+    var second_session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionCreate()(runtime, &session_config, &callbacks, &second_session, &diagnostic));
+    defer if (second_session) |handle| {
+        _ = api.sessionDestroy()(handle, &diagnostic);
+    };
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRun()(second_session, max_run_id, sdk.bytesView("Run identifiers are scoped to a Session"), &options, &result, &diagnostic),
+    );
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(second_session, &diagnostic));
+    second_session = null;
+
     try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
     session = null;
     try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
@@ -555,6 +612,8 @@ test "L2 Event callback fatal aborts the Run and poisons the ABI Session" {
     );
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(wire.STATUS_INVALID_STATE, api.sessionAbort()(session, 0, wire.ABORT_USER_REQUEST, &diagnostic));
+    api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_INVALID_STATE,
         api.sessionRun()(session, 2, sdk.bytesView("must stay poisoned"), &options, &result, &diagnostic),
@@ -617,6 +676,7 @@ test "L2 Event callback may cooperatively abort without poisoning the ABI Sessio
         wire.STATUS_OK,
         api.sessionRun()(session, 1, sdk.bytesView("abort from callback"), &options, &result, &diagnostic),
     );
+    try std.testing.expectEqual(wire.STATUS_STALE_RUN, probe.stale_abort_status);
     try std.testing.expectEqual(wire.STATUS_OK, probe.abort_status);
     try std.testing.expectEqual(wire.STOP_ABORTED, result.stop_reason_code);
 
@@ -626,6 +686,10 @@ test "L2 Event callback may cooperatively abort without poisoning the ABI Sessio
         api.sessionRun()(session, 2, sdk.bytesView("run after abort"), &options, &result, &diagnostic),
     );
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(wire.STATUS_STALE_RUN, api.sessionAbort()(session, 1, wire.ABORT_USER_REQUEST, &diagnostic));
+    api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(wire.STATUS_TOO_LATE, api.sessionAbort()(session, 2, wire.ABORT_USER_REQUEST, &diagnostic));
+    api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
     session = null;
     try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));

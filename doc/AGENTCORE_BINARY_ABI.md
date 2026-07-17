@@ -8,6 +8,11 @@ ABI v1 is the first stable in-process embedding contract for synchronous,
 stateful AgentSession execution. It is not a generation label for
 `metacodes-core`, and it does not define a Workbench product model.
 
+**Status: frozen on 2026-07-17.** V1 layouts, numeric values, function-table
+order, ownership/lifecycle semantics, and protocol control messages are
+normative. Bug and security fixes must preserve observable v1 behavior; any
+extension requires `metacodes_agentcore_get_api(2)` and v2 types.
+
 ## Build and verify
 
 Use the repository-pinned Zig toolchain and an explicit target. The command
@@ -161,6 +166,18 @@ not a new public stop code. Because the stateful Run may already have committed
 Conversation changes, that failure poisons the ABI facade and subsequent Run or
 abort calls return `MC_STATUS_INVALID_STATE`; destroy remains valid.
 
+`run_id` is a non-zero `uint64_t` Run identifier assigned by the Host and
+scoped to one Session. Each admitted Run must have a `run_id` strictly greater
+than that of the previously admitted Run in the same Session. Values need not
+be contiguous, and different Sessions may use the same values. An admitted
+`run_id` is consumed even if that Run is later aborted or fails during
+execution; it must never be reused or wrapped. Rejection before admission never
+advances the Session's last admitted `run_id`. An otherwise valid proposed
+value strictly greater than the last admitted ID therefore remains available
+for retry; zero and stale values do not become valid through retry. After
+admitting `UINT64_MAX`, the Session cannot admit another Run and the Host must
+create a new Session.
+
 Run admission is the lifecycle boundary. Validation failures
 (`MC_STATUS_INVALID_ARGUMENT` / `MC_STATUS_RESOURCE_LIMIT`) and admission
 failures (`MC_STATUS_BUSY` / `MC_STATUS_STALE_RUN`) do not mutate the
@@ -173,11 +190,31 @@ is poisoned. Subsequent Run and abort calls return
 terminal `MC_STOP_ABORTED`, returns the Session to idle. A too-late abort also
 leaves the already-idle Session reusable.
 
+Given a valid Session handle, the poisoned-state check takes precedence over
+remaining `session_run` and `session_abort` argument validation. ABI v1 does
+not define status precedence when multiple other input or admission errors are
+present in the same call.
+
+ABI v1 provides no in-place recovery, Conversation export/import, or history
+hydration for a poisoned Session. The Host must destroy it and create a new
+Session; previously committed Conversation state cannot be restored through
+ABI v1.
+
+On a usable Session, `session_abort` requires a non-zero `run_id`; zero returns
+`MC_STATUS_INVALID_ARGUMENT`. While a Run is active, its exact `run_id`
+requests cooperative abort and any other value returns
+`MC_STATUS_STALE_RUN`. While the Session is idle, the most recently admitted
+`run_id` returns `MC_STATUS_TOO_LATE` and any other value returns
+`MC_STATUS_STALE_RUN`. A poisoned Session returns
+`MC_STATUS_INVALID_STATE` regardless of the supplied ID.
+
 Assistant text and other execution output are delivered through `on_event`.
 `RunResultV1` is a terminal summary containing stop reason, turns, and tool
-calls; it is not an output buffer. `on_event` is optional: without it the Run
-still executes, but observation output is discarded. SDK-level aggregation is
-a consumer convenience and does not change the ABI.
+calls; it is not an output buffer. Its fields are defined only when
+`session_run` returns `MC_STATUS_OK`. On any non-OK status their contents are
+unspecified and the Host must not inspect them. `on_event` is optional: without
+it the Run still executes, but observation output is discarded. SDK-level
+aggregation is a consumer convenience and does not change the ABI.
 
 Relative paths supplied to `Read`, `Write`, `Edit`, `Glob`, and `Grep` resolve
 against `workspace_root`; Bash also runs with that directory as its cwd.

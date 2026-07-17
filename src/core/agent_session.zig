@@ -191,6 +191,8 @@ pub const AgentSession = struct {
     callback_mutex: sync.Mutex = .{},
     state: State = .idle,
     active_run_id: u64 = 0,
+    /// Highest admitted Run ID. Zero is the no-Run sentinel; admission only
+    /// replaces it with a strictly greater value, preventing ABA reuse.
     last_run_id: u64 = 0,
     callback_failed: bool = false,
 
@@ -307,6 +309,14 @@ pub const AgentSession = struct {
         runtime.releaseSession();
     }
 
+    /// Return the core state machine's poison decision. Poisoned is terminal
+    /// for a live Session, so callers may safely mirror a true result.
+    pub fn isPoisoned(self: *AgentSession) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.state == .poisoned;
+    }
+
     /// Run one text turn while preserving Conversation across successful Runs.
     pub fn runText(self: *AgentSession, run_id: u64, prompt: []const u8, max_turns: u32, sink: EventSink) anyerror!agent_loop.RunResult {
         try self.beginRun(run_id, sink);
@@ -413,6 +423,8 @@ pub const AgentSession = struct {
         }
     }
 
+    /// Admission linearization point for the public nonzero, strictly
+    /// increasing, Session-scoped Run ID contract.
     fn beginRun(self: *AgentSession, run_id: u64, sink: EventSink) LifecycleError!void {
         self.mutex.lock();
         switch (self.state) {
@@ -685,6 +697,7 @@ test "AgentSession enforces one active Run and monotonic nonzero run ids" {
     defer std.testing.allocator.free(cwd);
     const self = try createTestSession(runtime, .default, cwd);
     var probe = SinkProbe{};
+    try std.testing.expect(!self.isPoisoned());
 
     try std.testing.expectError(error.StaleRun, self.beginRun(0, probe.sink()));
     try self.beginRun(1, probe.sink());
@@ -700,6 +713,14 @@ test "AgentSession enforces one active Run and monotonic nonzero run ids" {
 
     try self.beginRun(2, probe.sink());
     _ = self.finishRunLifecycle();
+    try self.beginRun(20, probe.sink());
+    _ = self.finishRunLifecycle();
+    const max_run_id = std.math.maxInt(u64);
+    try self.beginRun(max_run_id, probe.sink());
+    _ = self.finishRunLifecycle();
+    try std.testing.expectError(error.StaleRun, self.beginRun(1, probe.sink()));
+    try std.testing.expectError(error.StaleRun, self.beginRun(max_run_id, probe.sink()));
+    try std.testing.expect(!self.isPoisoned());
     try self.destroy();
 }
 
@@ -751,6 +772,7 @@ test "AgentSession callback failure aborts delivery and poisons the Session" {
     const completion = self.finishRunLifecycle();
     try std.testing.expect(completion.callback_failed);
     try std.testing.expectEqual(State.poisoned, self.state);
+    try std.testing.expect(self.isPoisoned());
     try std.testing.expectError(error.InvalidSessionState, self.beginRun(8, probe.sink()));
     try self.destroy();
 }
