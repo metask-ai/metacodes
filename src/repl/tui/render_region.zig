@@ -70,6 +70,9 @@ pub const RenderRegion = struct {
     text_pending_newline: bool = false,
     pending_col: u16 = 0, // 半行 chunk 累计显示列(消息穿过续接用)
     region_drawn: bool = false, // 生成期固定区当前是否画在屏上(true ⟹ 光标钉区顶行首)
+    /// 帧内标志:true 时 eraseRegion/drawGenRegion 不各自 reset/flush,由外层 frame 统一
+    /// 一次 flush(并用 DEC 2026 同步输出包裹)→ 擦除+重画成原子帧,消除 Windows 闪烁。
+    frame_active: bool = false,
     // Ctrl+O alt-screen toggle 去抖时戳(单调 ms;0=从未)。见 noteCtrloAndShouldSuppressReopen。
     last_overlay_ctrlo_ms: i64 = 0,
     // 画区时对续接点的快照:eraseRegion 必须按"画区那一刻"的半行状态还原,
@@ -223,8 +226,7 @@ pub const RenderRegion = struct {
         // 立即重画(用 enterGenerating 存的 gen_app),让进度行至少渲染一帧。
         if (self.generating) {
             if (self.gen_app) |app| {
-                if (self.region_drawn) self.eraseRegion();
-                self.drawGenRegion(app);
+                self.redrawFrameLocked(app);
             }
         }
     }
@@ -1216,8 +1218,7 @@ pub const RenderRegion = struct {
         self.ui.editor = .{ .view = ed_view, .cursor = ed_cursor };
         const eff = ui_mod.dispatch(&self.ui, .{ .key = .{ .key = key } });
         if (eff.redraw_region and self.generating) {
-            if (self.region_drawn) self.eraseRegion();
-            self.drawGenRegion(app);
+            self.redrawFrameLocked(app);
         }
         return eff;
     }
@@ -1352,12 +1353,25 @@ pub const RenderRegion = struct {
     }
 
     /// 生成期重画(watcher 按键 / 入队后调):擦旧区(若在)+ 画新区。持锁。
+    /// 原子重画固定区(擦除+重画包成一帧,DEC 2026 同步输出):消除 Windows Terminal 在
+    /// erase→draw 两步之间呈现"空白帧"导致的输入框闪烁 + 分隔线分段。所有"擦了立刻重画
+    /// 固定区"的路径统一走这里。**须已持锁**。
+    fn redrawFrameLocked(self: *RenderRegion, app: *const app_mod.App) void {
+        self.resetScratch();
+        self.scratch.writer.writeAll(ansi.sync.begin) catch {};
+        self.frame_active = true;
+        if (self.region_drawn) self.eraseRegion(); // frame 内:不 reset 不 flush
+        self.drawGenRegion(app); //                  frame 内:不 reset 不 flush
+        self.frame_active = false;
+        self.scratch.writer.writeAll(ansi.sync.end) catch {};
+        self.flush(); // 整帧一次性呈现
+    }
+
     pub fn redrawGen(self: *RenderRegion, app: *const app_mod.App) void {
         self.lock();
         defer self.unlock();
         if (!self.generating) return;
-        if (self.region_drawn) self.eraseRegion();
-        self.drawGenRegion(app);
+        self.redrawFrameLocked(app);
     }
 
     /// spinner tick(watcher 每 ~100ms)——推进帧 + 擦旧区(若在)+ 重画区。
@@ -1366,8 +1380,7 @@ pub const RenderRegion = struct {
         defer self.unlock();
         if (!self.generating) return;
         self.ui.spinner.frame +%= 1;
-        if (self.region_drawn) self.eraseRegion();
-        self.drawGenRegion(app);
+        self.redrawFrameLocked(app);
     }
 
     /// 生成期文本输出(RegionWriter 经此):**按行缓冲**——逐 token 攒进 line_buf,
@@ -1692,15 +1705,23 @@ pub const RenderRegion = struct {
     fn emitToScroll(self: *RenderRegion, text: []const u8) void {
         if (text.len == 0) return;
         const was_drawn = self.region_drawn;
-        if (self.region_drawn) self.eraseRegion(); // 擦掉固定区 + 回文本续接点(半行末尾/新行首)
+        // 区在屏时:擦区 + 文本流入 scrollback + 重画区 三步包成一帧(DEC 2026 同步输出),
+        // 否则 Windows 会先呈现"擦掉区的空白"再刷文本再刷区 → 输入框闪。区不在屏时纯输出文本。
         const w = &self.scratch.writer;
         self.resetScratch();
+        if (was_drawn) {
+            w.writeAll(ansi.sync.begin) catch {};
+            self.frame_active = true;
+            self.eraseRegion(); // frame 内:不 reset 不 flush,续接 scratch
+        }
         w.writeAll(text) catch {}; // 文本直接流入 scrollback
-        self.flush();
         self.updatePendingTail(text);
         if (was_drawn) {
-            if (self.gen_app) |a| self.drawGenRegion(a); // 区本在屏 → print 后立即重画(持续可见)
+            if (self.gen_app) |a| self.drawGenRegion(a); // frame 内:不 reset 不 flush
+            self.frame_active = false;
+            w.writeAll(ansi.sync.end) catch {};
         }
+        self.flush(); // 整帧(或纯文本)一次性呈现
     }
 
     /// 擦掉固定区(R 行),光标回"文本续接点"。
@@ -1715,7 +1736,7 @@ pub const RenderRegion = struct {
             return;
         }
         const w = &self.scratch.writer;
-        self.resetScratch();
+        if (!self.frame_active) self.resetScratch(); // 帧内:接续 frame 已写的 sync_begin,勿清
         var nb: [16]u8 = undefined;
         w.writeAll(ansi.cursor.hide) catch {};
         // 光标当前在区内 cursor_in_region_row 行(编辑点)→ 先回区顶行首。
@@ -1737,7 +1758,7 @@ pub const RenderRegion = struct {
             if (self.region_drawn_pending_col > 0) w.writeAll(ansi.cursor.forward(self.region_drawn_pending_col, &nb)) catch {};
         }
         w.writeAll(ansi.cursor.show) catch {};
-        self.flush();
+        if (!self.frame_active) self.flush(); // 帧内:由外层 frame 统一 flush(原子帧)
         self.region_drawn = false;
     }
 
@@ -1747,7 +1768,7 @@ pub const RenderRegion = struct {
     fn drawGenRegion(self: *RenderRegion, app: *const app_mod.App) void {
         self.measureSize();
         const w = &self.scratch.writer;
-        self.resetScratch();
+        if (!self.frame_active) self.resetScratch(); // 帧内:接续 frame(sync_begin + erase),勿清
         var nb: [16]u8 = undefined;
 
         w.writeAll(ansi.cursor.hide) catch {};
@@ -1872,7 +1893,7 @@ pub const RenderRegion = struct {
         self.prev_rows = R;
         self.cursor_in_region_row = edit_row;
         self.region_drawn = true;
-        self.flush();
+        if (!self.frame_active) self.flush(); // 帧内:由外层 frame 统一 flush(原子帧)
     }
 
     /// 生成期 transcript 模态帧(对应输入期 renderOverlayInner,但记 cursor_in_region_row 而非

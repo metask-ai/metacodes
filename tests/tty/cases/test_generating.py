@@ -439,3 +439,55 @@ def test_T34_gen_shift_tab_cycles_mode(bin_path):
     if not ok:
         a._fail("生成期 Shift+Tab 未切换权限模式(footer 无 accept edits/plan mode)")
 
+
+def test_generation_frames_are_synchronized(bin_path):
+    """回归:生成期固定区重画(spinner tick / 文本流入)必须用 DEC 2026 同步输出包裹,
+    否则 Windows Terminal 在 erase→draw 两步间呈现空白帧 → 输入框闪烁 + 分隔线分段。
+    慢流 mock 触发多次重画,断言字节流里同步帧成对出现——screen.py 终态回放测不到闪动,
+    故直接断言字节流的同步标记(这是"闪烁"这类帧间时序缺陷唯一可自动化的护栏)。"""
+    import http.server
+    import threading
+    import time
+
+    parts = [
+        b'data: {"type":"message_start","message":{"id":"m","role":"assistant","model":"x","usage":{"input_tokens":1,"output_tokens":1}}}\n\n',
+        b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+        b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello "}}\n\n',
+        b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world"}}\n\n',
+        b'data: {"type":"content_block_stop","index":0}\n\n',
+        b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+        b'data: {"type":"message_stop"}\n\n',
+    ]
+
+    class _Mock(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            return
+
+        def do_POST(self):
+            n = int(self.headers.get("content-length", "0"))
+            self.rfile.read(n)
+            body = b"".join(parts)
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            for p in parts:  # 分块慢发 → 多次 spinner tick / 文本重画
+                try:
+                    self.wfile.write(p)
+                    self.wfile.flush()
+                except OSError:
+                    return
+                time.sleep(0.15)
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), _Mock)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_port}/v1/messages"
+    try:
+        raw = run(bin_path, ["sleep:0.8", "type:hi", "key:enter", "sleep:2.5"], base_url=url)
+    finally:
+        srv.shutdown()
+
+    nb = raw.count(b"\x1b[?2026h")
+    ne = raw.count(b"\x1b[?2026l")
+    assert nb > 0 and nb == ne, f"生成期重画帧应被 DEC2026 同步输出成对包裹: begin={nb} end={ne}"
+

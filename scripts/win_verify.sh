@@ -68,7 +68,9 @@ fi
 echo ""
 echo "===== E. 虚拟 TTY 渲染测试(ConPTY;需 python + pywinpty,缺依赖跳过) ====="
 if command -v python >/dev/null 2>&1 && python -c "import winpty" 2>/dev/null; then
-  python tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug.exe 2>&1 | tail -22
+  # TTY_SKIP_MODEL=1:e2e_*/generating 系列打真模型(真联网/真副作用),离线验证一律跳过。
+  # 要真打模型,显式 TTY_SKIP_MODEL= python tests/tty/run_tty_tests.py ...
+  TTY_SKIP_MODEL="${TTY_SKIP_MODEL-1}" python tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug.exe 2>&1 | tail -22
   echo "[E exit=${PIPESTATUS[0]}]"
 else
   echo "(python/pywinpty 不可用,跳过——pip install pywinpty)"
