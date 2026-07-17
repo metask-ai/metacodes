@@ -23,6 +23,31 @@ fn addPlatform(b: *std.Build, mod: *std.Build.Module) void {
     mod.addImport("platform", g_platform_mod.?);
 }
 
+/// Every Zig test executable that can run on Windows shares the same legacy
+/// `/tmp` compatibility prerequisite. Keep that policy at test-run creation so
+/// new isolated suites cannot silently forget it.
+fn addTestRunArtifact(
+    b: *std.Build,
+    artifact: *std.Build.Step.Compile,
+    windows_prelude: ?*std.Build.Step.Run,
+) *std.Build.Step.Run {
+    const run = b.addRunArtifact(artifact);
+    if (windows_prelude) |prelude| run.step.dependOn(&prelude.step);
+    return run;
+}
+
+/// A nested `zig build` is part of the caller's build graph, so it must honor
+/// the caller-selected local and global caches instead of creating an implicit
+/// second cache under the consumer fixture.
+fn addNestedBuildCacheArgs(b: *std.Build, run: *std.Build.Step.Run) void {
+    run.addArgs(&.{
+        "--cache-dir",
+        b.cache_root.path orelse ".",
+        "--global-cache-dir",
+        b.graph.global_cache_root.path orelse ".",
+    });
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const target_was_explicit = b.user_input_options.contains("target");
@@ -33,6 +58,23 @@ pub fn build(b: *std.Build) void {
     const agentcore_expected_commit = b.option([]const u8, "agentcore-expected-commit", "Expected full metacodes commit for the AgentCore bundle");
     if (agentcore_require_clean_bundle and agentcore_expected_commit == null)
         @panic("-Dagentcore-require-clean-bundle=true requires -Dagentcore-expected-commit=<full hash>");
+
+    // Compatibility prelude for the remaining tests that spell temporary
+    // paths as `/tmp/...`. On Windows that means `\tmp` at the current drive
+    // root. Every Windows test run depends on this host-native step so a fresh
+    // machine cannot fail merely because the legacy directory is absent.
+    const windows_test_prelude = if (target.result.os.tag == .windows) blk: {
+        const prelude_mod = b.createModule(.{
+            .root_source_file = b.path("scripts/windows_test_prelude.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        });
+        const prelude_exe = b.addExecutable(.{
+            .name = "windows-test-prelude",
+            .root_module = prelude_mod,
+        });
+        break :blk b.addRunArtifact(prelude_exe);
+    } else null;
 
     // 固定产出两个二进制：metacodes (ReleaseSmall) 和 metacodes-debug (Debug)。
     // 不受 -Doptimize 影响，一次 build 同时得到发布版和调试版。
@@ -200,20 +242,20 @@ pub fn build(b: *std.Build) void {
 
     const agentcore_test_step = b.step("agentcore:test", "Run AgentCore binary ABI v1 tests");
     const agentcore_abi_test = b.addTest(.{ .name = "agentcore-abi-unit", .root_module = agentcore_abi_mod });
-    agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_abi_test).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_abi_test, windows_test_prelude).step);
     const agentcore_types_test = b.addTest(.{ .name = "agentcore-types-unit", .root_module = agentcore_types_mod });
-    agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_types_test).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_types_test, windows_test_prelude).step);
     const agentcore_protocol_test = b.addTest(.{ .name = "agentcore-protocol-unit", .root_module = agentcore_protocol_mod });
-    agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_protocol_test).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_protocol_test, windows_test_prelude).step);
     const agentcore_sdk_test = b.addTest(.{ .name = "agentcore-sdk-unit", .root_module = agentcore_sdk_mod });
-    agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_sdk_test).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_sdk_test, windows_test_prelude).step);
     const agentcore_manifest_contract_mod = b.createModule(.{
         .root_source_file = b.path("tests/agentcore_artifact_consumer/manifest_contract.zig"),
         .target = target,
         .optimize = optimize,
     });
     const agentcore_manifest_contract_test = b.addTest(.{ .name = "agentcore-manifest-contract", .root_module = agentcore_manifest_contract_mod });
-    agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_manifest_contract_test).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_manifest_contract_test, windows_test_prelude).step);
     const agentcore_manifest_tool_mod = b.createModule(.{
         .root_source_file = b.path("scripts/agentcore_manifest.zig"),
         .target = b.graph.host,
@@ -227,7 +269,7 @@ pub fn build(b: *std.Build) void {
         .name = "agentcore-manifest-unit",
         .root_module = agentcore_manifest_tool_mod,
     });
-    agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_manifest_tool_test).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_manifest_tool_test, windows_test_prelude).step);
     // header 可编译性检查:走 zig 构建系统原生 C 对象(不 install,只编译)。
     // 不用系统 cc(Windows 没有),也不用 `zig cc -fsyntax-only`(zig 0.16 Windows 实测
     // 对任何输入报 FileNotFound;`-c` 正常)。对象编译 = 语法+类型检查,跨平台等价。
@@ -266,7 +308,7 @@ pub fn build(b: *std.Build) void {
     agentcore_contract_mod.addImport("agentcore-sdk", agentcore_sdk_mod);
     agentcore_contract_mod.addImport("metacodes-core", core_mod);
     const agentcore_contract_test = b.addTest(.{ .name = "agentcore-abi-contract", .root_module = agentcore_contract_mod });
-    agentcore_test_step.dependOn(&b.addRunArtifact(agentcore_contract_test).step);
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_contract_test, windows_test_prelude).step);
 
     const agentcore_lib = b.addLibrary(.{
         .name = "metacodes_agentcore",
@@ -327,6 +369,7 @@ pub fn build(b: *std.Build) void {
     manifest_cmd.step.dependOn(&install_agentcore_protocol.step);
     manifest_cmd.step.dependOn(&install_agentcore_types.step);
     const consumer_link_cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
+    addNestedBuildCacheArgs(b, consumer_link_cmd);
     consumer_link_cmd.addArgs(&.{
         "--build-file",
         "tests/agentcore_artifact_consumer/build.zig",
@@ -345,6 +388,7 @@ pub fn build(b: *std.Build) void {
     agentcore_bundle_step.dependOn(&consumer_link_cmd.step);
 
     const consumer_cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
+    addNestedBuildCacheArgs(b, consumer_cmd);
     consumer_cmd.addArgs(&.{
         "--build-file",
         "tests/agentcore_artifact_consumer/build.zig",
@@ -360,7 +404,37 @@ pub fn build(b: *std.Build) void {
     consumer_cmd.setCwd(b.path("."));
     consumer_cmd.step.dependOn(&manifest_cmd.step);
     const agentcore_consumer_step = b.step("agentcore:consumer", "Run the source-free AgentCore bundle consumer");
-    agentcore_consumer_step.dependOn(&consumer_cmd.step);
+    const host_agentcore_target = b.graph.host.result;
+    const agentcore_cpu_is_native = switch (target.query.cpu_model) {
+        .baseline, .determined_by_arch_os, .native => true,
+        .explicit => host_agentcore_target.cpu.features.isSuperSetOf(target.result.cpu.features),
+    } and host_agentcore_target.cpu.features.isSuperSetOf(target.query.cpu_features_add);
+    const agentcore_target_is_native = target.result.cpu.arch == host_agentcore_target.cpu.arch and
+        target.result.os.tag == host_agentcore_target.os.tag and
+        target.result.abi == host_agentcore_target.abi and
+        agentcore_cpu_is_native;
+    const host_agentcore_triple = host_agentcore_target.zigTriple(b.allocator) catch @panic("OOM");
+    const native_agentcore_failure = if (!target_was_explicit)
+        b.addFail("AgentCore native execution requires explicit -Dtarget=<triple>")
+    else if (!agentcore_target_is_native)
+        b.addFail(b.fmt(
+            "AgentCore native gate cannot run target {s} on host {s}; use agentcore:bundle for cross-target validation",
+            .{ resolved_agentcore_target, host_agentcore_triple },
+        ))
+    else
+        null;
+    if (native_agentcore_failure) |failure|
+        agentcore_consumer_step.dependOn(&failure.step)
+    else
+        agentcore_consumer_step.dependOn(&consumer_cmd.step);
+
+    const agentcore_gate_step = b.step("agentcore:gate", "Build, link and run the native source-free AgentCore delivery gate");
+    if (native_agentcore_failure) |failure| {
+        agentcore_gate_step.dependOn(&failure.step);
+    } else {
+        agentcore_gate_step.dependOn(agentcore_test_step);
+        agentcore_gate_step.dependOn(&consumer_cmd.step);
+    }
 
     // test:lib —— 编译库全图(refAllDeclsRecursive),绿即证库与 UI 物理隔离。
     const core_test_mod = b.createModule(.{
@@ -376,7 +450,7 @@ pub fn build(b: *std.Build) void {
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     const core_test_step = b.step("test:lib", "Test/compile the metacodes-core library module (proves UI isolation)");
-    core_test_step.dependOn(&b.addRunArtifact(core_test).step);
+    core_test_step.dependOn(&addTestRunArtifact(b, core_test, windows_test_prelude).step);
 
     // test:lsp —— LSP 子系统(Y2 Step2:被动诊断)隔离测试。
     // 根在 src/ 层(而非 src/lsp/lsp.zig):service.zig 相对引 ../util/time.zig,
@@ -390,7 +464,7 @@ pub fn build(b: *std.Build) void {
     addPlatform(b, lsp_test_mod); // lsp/ 依赖 platform（sync/process），隔离测试也需
     const lsp_test = b.addTest(.{ .name = "lsp-test", .root_module = lsp_test_mod });
     const lsp_test_step = b.step("test:lsp", "Test the LSP subsystem in isolation (Y2 Step2)");
-    lsp_test_step.dependOn(&b.addRunArtifact(lsp_test).step);
+    lsp_test_step.dependOn(&addTestRunArtifact(b, lsp_test, windows_test_prelude).step);
 
     // test:platform —— 可移植抽象层(sync/process/fs/signal/rng/paths)。platform 成独立命名模块后
     // 其测试不再聚合进 cc-test，故独立入口。process fork 真子进程测试需 METACODES_PROC_TEST=1 启用。
@@ -402,7 +476,8 @@ pub fn build(b: *std.Build) void {
     });
     const platform_test = b.addTest(.{ .name = "platform-test", .root_module = platform_test_mod });
     const platform_test_step = b.step("test:platform", "Test the portable platform abstraction layer");
-    platform_test_step.dependOn(&b.addRunArtifact(platform_test).step);
+    const platform_test_run = addTestRunArtifact(b, platform_test, windows_test_prelude);
+    platform_test_step.dependOn(&platform_test_run.step);
 
     // example —— 独立消费者,经 module 用库跑一轮 agent loop(见 example/main.zig)。
     const example_mod = b.createModule(.{
@@ -437,7 +512,7 @@ pub fn build(b: *std.Build) void {
         .root_module = test_cc_mod, // 共享模块(perf,见 debug exe 后注释)
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
-    const test_run = b.addRunArtifact(test_obj);
+    const test_run = addTestRunArtifact(b, test_obj, windows_test_prelude);
     // kg/swarm 集成测试用真 tinykg → 先把它建到 zig-out/vendor/tinykg/tinykg(测试候选路径)。
     if (tinykg_install_step) |s| test_run.step.dependOn(s);
     test_step.dependOn(&test_run.step);
@@ -469,7 +544,8 @@ pub fn build(b: *std.Build) void {
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
         });
-        spike_step.dependOn(&b.addRunArtifact(t).step);
+        const run_t = addTestRunArtifact(b, t, windows_test_prelude);
+        spike_step.dependOn(&run_t.step);
     }
 
     // Integration / Component 测试:都需要 cc + harness imports,共享构建配置。
@@ -555,7 +631,7 @@ pub fn build(b: *std.Build) void {
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
         });
-        const run_t = b.addRunArtifact(t);
+        const run_t = addTestRunArtifact(b, t, windows_test_prelude);
         run_t.step.dependOn(b.getInstallStep()); // 确保 mock_mcp_server 被 build
         spike_step.dependOn(&run_t.step);
     }
@@ -633,7 +709,7 @@ pub fn build(b: *std.Build) void {
             .root_module = m,
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
         });
-        new_step.dependOn(&b.addRunArtifact(t).step);
+        new_step.dependOn(&addTestRunArtifact(b, t, windows_test_prelude).step);
     }
 
     // test:mem —— 记忆系统 L2 组件测试(隔离 artifact,绕开主套件 integration 挂起)。
@@ -659,7 +735,7 @@ pub fn build(b: *std.Build) void {
                 .root_module = m,
                 .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
             });
-            mem_step.dependOn(&b.addRunArtifact(t).step);
+            mem_step.dependOn(&addTestRunArtifact(b, t, windows_test_prelude).step);
         }
     }
 
@@ -686,6 +762,44 @@ pub fn build(b: *std.Build) void {
     });
     e2e_tty_cmd.step.dependOn(b.getInstallStep()); // 确保 metacodes-debug + mock_mcp_server 已 build
     e2e_tty_step.dependOn(&e2e_tty_cmd.step);
+
+    const windows_gate_failure = if (!target_was_explicit)
+        b.addFail("windows:gate and windows:tty require explicit -Dtarget=x86_64-windows-gnu")
+    else if (target.result.os.tag != .windows or !agentcore_target_is_native)
+        b.addFail(b.fmt(
+            "Windows native gate cannot run target {s} on host {s}",
+            .{ resolved_agentcore_target, host_agentcore_triple },
+        ))
+    else
+        null;
+    const windows_gate_step = b.step(
+        "windows:gate",
+        "Run native Windows platform keystones + CLI smoke (full suite: zig build test)",
+    );
+    const windows_tty_step = b.step("windows:tty", "Run optional offline Windows ConPTY tests (requires python + pywinpty)");
+    if (windows_gate_failure) |failure| {
+        windows_gate_step.dependOn(&failure.step);
+        windows_tty_step.dependOn(&failure.step);
+    } else {
+        const windows_help_cmd = b.addRunArtifact(exe);
+        windows_help_cmd.addArg("--help");
+        windows_help_cmd.step.dependOn(b.getInstallStep());
+        // This gate proves the Windows portability layer and installed CLI can
+        // execute natively. The repository-wide suite remains the independent
+        // `zig build test -Dtarget=x86_64-windows-gnu` gate; do not couple its
+        // unrelated subsystem timing/concurrency failures to this platform gate.
+        windows_gate_step.dependOn(platform_test_step);
+        windows_gate_step.dependOn(&windows_help_cmd.step);
+
+        const windows_tty_cmd = b.addSystemCommand(&.{
+            "python", "tests/tty/run_tty_tests.py",
+            "--bin",  "zig-out/bin/metacodes-debug.exe",
+        });
+        windows_tty_cmd.setEnvironmentVariable("TTY_SKIP_MODEL", "1");
+        windows_tty_cmd.step.dependOn(b.getInstallStep());
+        if (windows_test_prelude) |prelude| windows_tty_cmd.step.dependOn(&prelude.step);
+        windows_tty_step.dependOn(&windows_tty_cmd.step);
+    }
 
     _ = b.addFmt(.{
         .paths = &.{"src/"},
