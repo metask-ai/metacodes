@@ -85,6 +85,12 @@ pub const bundle_directories = [_][]const u8{ "include", "lib", "sdk" };
 pub const default_system_link_inputs = [_][]const u8{"libc"};
 pub const windows_system_link_inputs = [_][]const u8{ "libc", "crypt32" };
 
+pub fn normalizePathSeparators(path: []u8) void {
+    for (path) |*byte| {
+        if (byte.* == '\\') byte.* = '/';
+    }
+}
+
 pub fn validateManifest(manifest: Manifest, expected: Expected) Error!void {
     if (manifest.schema_version != 1) return error.InvalidSchema;
     if (!std.mem.eql(u8, manifest.name, "metacodes-agentcore")) return error.InvalidName;
@@ -375,4 +381,10 @@ test "bundle entry set validates a dynamic library name and exact tree" {
     var symlink = valid;
     symlink[3].kind = .other;
     try std.testing.expectError(error.UnexpectedEntryKind, validateBundleEntries(&symlink, macos_library_path));
+}
+
+test "bundle paths use manifest separators on Windows" {
+    var path = [_]u8{ 's', 'd', 'k', '\\', 'm', 'e', 't', 'a', '.', 'z', 'i', 'g' };
+    normalizePathSeparators(&path);
+    try std.testing.expectEqualStrings("sdk/meta.zig", &path);
 }

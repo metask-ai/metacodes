@@ -118,17 +118,16 @@ pub fn main(init: std.process.Init) !void {
     const api = try sdk.Api.discover();
     if (sdk.metacodes_agentcore_get_api(2) != null) return error.UnexpectedAbi;
 
+    const workspace = try std.process.currentPathAlloc(init.io, a);
     var name_buf: [128]u8 = undefined;
-    const file_name = try std.fmt.bufPrint(&name_buf, "metacodes-agentcore-{d}.txt", .{std.c.getpid()});
-    var path_buf: [256]u8 = undefined;
-    const file_path = try std.fmt.bufPrintZ(&path_buf, "/tmp/{s}", .{file_name});
-    defer _ = std.c.unlink(file_path.ptr);
-    try writeFile(file_path.ptr, "artifact-read-ok");
+    const file_name = try std.fmt.bufPrint(&name_buf, "metacodes-agentcore-{d}.txt", .{std.Thread.getCurrentId()});
+    defer std.Io.Dir.cwd().deleteFile(init.io, file_name) catch {};
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = file_name, .data = "artifact-read-ok" });
     // Source-free proof: the model supplies a relative file path and the
     // binary facade resolves it against workspace_root, not process cwd.
     const read_sse = try readToolSse(a, file_name);
     const bodies = [_][]const u8{ ASK_SSE, read_sse, HOST_SSE, FINAL_SSE };
-    const server = try Server.start(&bodies);
+    const server = try Server.start(init.io, &bodies);
     defer server.stop();
     const url = try server.url(a);
 
@@ -171,8 +170,8 @@ pub fn main(init: std.process.Init) !void {
         .api_key = sdk.bytesView("artifact-key"),
         .model = sdk.bytesView("artifact-model"),
         .base_url = sdk.bytesView(url),
-        .workspace_root = sdk.bytesView("/tmp"),
-        .workspace_home = sdk.bytesView("/tmp"),
+        .workspace_root = sdk.bytesView(workspace),
+        .workspace_home = sdk.bytesView(workspace),
         .allowed_tools = &allowed,
         .allowed_tool_count = allowed.len,
         .reserved = [_]u64{0} ** 4,
@@ -211,13 +210,6 @@ fn readToolSse(a: std.mem.Allocator, path: []const u8) ![]u8 {
         "data: {{\"type\":\"content_block_stop\",\"index\":0}}\n\n" ++
         "data: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"tool_use\"}},\"usage\":{{\"output_tokens\":1}}}}\n\n" ++
         "data: {{\"type\":\"message_stop\"}}\n\n", .{path});
-}
-
-fn writeFile(path: [*:0]const u8, content: []const u8) !void {
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o600));
-    if (fd < 0) return error.OpenFailed;
-    defer _ = std.c.close(fd);
-    if (std.c.write(fd, content.ptr, content.len) != content.len) return error.WriteFailed;
 }
 
 fn expectStatus(expected: sdk.Status, actual_code: u32, diagnostic: wire.OwnedBytesV1) !void {

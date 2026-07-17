@@ -1,16 +1,36 @@
 #include "metacodes_agentcore.h"
 
 #include <limits.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <poll.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <direct.h>
+typedef SOCKET socket_handle;
+typedef HANDLE thread_handle;
+#define INVALID_SOCKET_HANDLE INVALID_SOCKET
+#define SHUTDOWN_BOTH SD_BOTH
+#define getcwd _getcwd
+#ifndef PATH_MAX
+#define PATH_MAX MAX_PATH
+#endif
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+typedef int socket_handle;
+typedef pthread_t thread_handle;
+#define INVALID_SOCKET_HANDLE (-1)
+#define SHUTDOWN_BOTH SHUT_RDWR
+#endif
 
 static const char RESPONSE_BODY[] =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"c1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
@@ -21,16 +41,48 @@ static const char RESPONSE_BODY[] =
     "data: {\"type\":\"message_stop\"}\n\n";
 
 struct test_server {
-    int fd;
+    socket_handle fd;
     uint16_t port;
-    pthread_t thread;
+    thread_handle thread;
     int result;
 };
 
-static int write_all(int fd, const void *bytes, size_t len) {
+static int socket_is_valid(socket_handle fd) {
+    return fd != INVALID_SOCKET_HANDLE;
+}
+
+static void close_socket(socket_handle fd) {
+#ifdef _WIN32
+    closesocket(fd);
+#else
+    close(fd);
+#endif
+}
+
+static int socket_read(socket_handle fd, void *bytes, size_t len) {
+    size_t chunk = len > INT_MAX ? INT_MAX : len;
+#ifdef _WIN32
+    return recv(fd, (char *)bytes, (int)chunk, 0);
+#else
+    ssize_t count = recv(fd, bytes, chunk, 0);
+    return count < 0 || count > INT_MAX ? -1 : (int)count;
+#endif
+}
+
+static int socket_write(socket_handle fd, const void *bytes, size_t len) {
+    size_t chunk = len > INT_MAX ? INT_MAX : len;
+#ifdef _WIN32
+    return send(fd, (const char *)bytes, (int)chunk, 0);
+#else
+    ssize_t count = send(fd, bytes, chunk, 0);
+    return count < 0 || count > INT_MAX ? -1 : (int)count;
+#endif
+}
+
+static int write_all(socket_handle fd, const void *bytes, size_t len) {
     const char *cursor = (const char *)bytes;
     while (len != 0) {
-        ssize_t written = write(fd, cursor, len);
+        int written = socket_write(fd, cursor, len);
         if (written <= 0) return -1;
         cursor += (size_t)written;
         len -= (size_t)written;
@@ -38,12 +90,12 @@ static int write_all(int fd, const void *bytes, size_t len) {
     return 0;
 }
 
-static int read_request(int fd) {
+static int read_request(socket_handle fd) {
     char header[64 * 1024 + 1];
     size_t total = 0;
     char *end = NULL;
     while (total < sizeof(header) - 1 && end == NULL) {
-        ssize_t count = read(fd, header + total, sizeof(header) - 1 - total);
+        int count = socket_read(fd, header + total, sizeof(header) - 1 - total);
         if (count <= 0) return -1;
         total += (size_t)count;
         header[total] = '\0';
@@ -58,33 +110,43 @@ static int read_request(int fd) {
     char discard[8192];
     while (body_read < content_len) {
         size_t needed = content_len - body_read;
-        ssize_t count = read(fd, discard, needed < sizeof(discard) ? needed : sizeof(discard));
+        int count = socket_read(fd, discard, needed < sizeof(discard) ? needed : sizeof(discard));
         if (count <= 0) return -1;
         body_read += (size_t)count;
     }
     return 0;
 }
 
+#ifdef _WIN32
+static DWORD WINAPI serve_once(LPVOID raw) {
+#define THREAD_RETURN return 0
+#else
 static void *serve_once(void *raw) {
+#define THREAD_RETURN return NULL
+#endif
     struct test_server *server = (struct test_server *)raw;
-    struct pollfd ready = {.fd = server->fd, .events = POLLIN};
-    if (poll(&ready, 1, 10000) <= 0) {
-        server->result = -1;
-        return NULL;
-    }
-    int client = accept(server->fd, NULL, NULL);
+    socket_handle client = accept(server->fd, NULL, NULL);
+#ifdef _WIN32
+    DWORD timeout = 10000;
+    if (socket_is_valid(client) &&
+        (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout,
+                    sizeof(timeout)) != 0 ||
+         setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout,
+                    sizeof(timeout)) != 0)) {
+#else
     struct timeval timeout = {.tv_sec = 10, .tv_usec = 0};
-    if (client >= 0 &&
+    if (socket_is_valid(client) &&
         (setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
          setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0)) {
-        close(client);
+#endif
+        close_socket(client);
         server->result = -1;
-        return NULL;
+        THREAD_RETURN;
     }
-    if (client < 0 || read_request(client) != 0) {
-        if (client >= 0) close(client);
+    if (!socket_is_valid(client) || read_request(client) != 0) {
+        if (socket_is_valid(client)) close_socket(client);
         server->result = -1;
-        return NULL;
+        THREAD_RETURN;
     }
     char header[256];
     int header_len = snprintf(header, sizeof(header),
@@ -98,43 +160,85 @@ static void *serve_once(void *raw) {
                              write_all(client, RESPONSE_BODY, sizeof(RESPONSE_BODY) - 1) == 0
                          ? 0
                          : -1;
-    close(client);
-    return NULL;
+    close_socket(client);
+    THREAD_RETURN;
+#undef THREAD_RETURN
 }
 
 static int start_server(struct test_server *server) {
     memset(server, 0, sizeof(*server));
+#ifdef _WIN32
+    WSADATA winsock;
+    if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0) return -1;
+#endif
     server->fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server->fd < 0) return -1;
+    if (!socket_is_valid(server->fd)) {
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return -1;
+    }
     int yes = 1;
-    setsockopt(server->fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    setsockopt(server->fd, SOL_SOCKET, SO_REUSEADDR,
+#ifdef _WIN32
+               (const char *)&yes,
+#else
+               &yes,
+#endif
+               sizeof(yes));
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (bind(server->fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
         listen(server->fd, 1) != 0) {
-        close(server->fd);
+        close_socket(server->fd);
+#ifdef _WIN32
+        WSACleanup();
+#endif
         return -1;
     }
+#ifdef _WIN32
+    int length = sizeof(address);
+#else
     socklen_t length = sizeof(address);
+#endif
     if (getsockname(server->fd, (struct sockaddr *)&address, &length) != 0) {
-        close(server->fd);
+        close_socket(server->fd);
+#ifdef _WIN32
+        WSACleanup();
+#endif
         return -1;
     }
     server->port = ntohs(address.sin_port);
+#ifdef _WIN32
+    server->thread = CreateThread(NULL, 0, serve_once, server, 0, NULL);
+    if (server->thread == NULL) {
+#else
     if (pthread_create(&server->thread, NULL, serve_once, server) != 0) {
-        close(server->fd);
+#endif
+        close_socket(server->fd);
+#ifdef _WIN32
+        WSACleanup();
+#endif
         return -1;
     }
     return 0;
 }
 
 static void stop_server(struct test_server *server) {
-    shutdown(server->fd, SHUT_RDWR);
+    shutdown(server->fd, SHUTDOWN_BOTH);
+    close_socket(server->fd);
+    server->fd = INVALID_SOCKET_HANDLE;
+#ifdef _WIN32
+    WaitForSingleObject(server->thread, INFINITE);
+    CloseHandle(server->thread);
+#else
     pthread_join(server->thread, NULL);
-    close(server->fd);
-    server->fd = -1;
+#endif
+#ifdef _WIN32
+    WSACleanup();
+#endif
 }
 
 static unsigned event_calls = 0;

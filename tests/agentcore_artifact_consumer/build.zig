@@ -27,6 +27,7 @@ fn verifyBundleEntries(b: *std.Build, bundle_root: []const u8, library_path: []c
             else => .other,
         };
         const path = b.allocator.dupe(u8, entry.path) catch @panic("OOM");
+        manifest_contract.normalizePathSeparators(path);
         entries.append(b.allocator, .{ .path = path, .kind = kind }) catch @panic("OOM");
     }
     manifest_contract.validateBundleEntries(entries.items, library_path) catch |err|
@@ -147,6 +148,10 @@ pub fn build(b: *std.Build) void {
     c_app.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ bundle_root, "include" }) });
     c_app.addObjectFile(.{ .cwd_relative = lib_path });
     applySystemLinkInputs(c_app, manifest.value.contract.required_system_link_inputs);
+    // The C test's loopback mock server uses Winsock directly. This is a test
+    // dependency, not an AgentCore library link input recorded in the manifest.
+    if (target.result.os.tag == .windows)
+        c_app.linkSystemLibrary("ws2_32", .{ .use_pkg_config = .no });
     const c_exe = b.addExecutable(.{ .name = "agentcore-artifact-c-consumer", .root_module = c_app });
     const c_run = b.addRunArtifact(c_exe);
 
