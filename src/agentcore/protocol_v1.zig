@@ -20,9 +20,7 @@ const InternalUiResponse = core.protocol.ui_request.UiResponse;
 pub fn event(value: InternalEvent) ?public.CoreEvent {
     return switch (value) {
         .text_chunk => |v| .{ .text_chunk = v },
-        .stream_begin => .stream_begin,
         .tool_start => |v| .{ .tool_start = .{ .id = v.id, .name = v.name, .input = v.input } },
-        .set_current_tool => |v| .{ .set_current_tool = .{ .name = v.name } },
         .tool_progress => |v| .{ .tool_progress = .{ .id = v.id, .text = v.text } },
         .progress => |v| .{ .progress = .{
             .turn = v.turn,
@@ -30,7 +28,6 @@ pub fn event(value: InternalEvent) ?public.CoreEvent {
             .tool_input = v.tool_input,
             .tool_calls = v.tool_calls,
         } },
-        .clear_current_tool => .clear_current_tool,
         .tool_result => |v| .{ .tool_result = .{
             .id = v.id,
             .name = v.name,
@@ -65,42 +62,25 @@ pub fn event(value: InternalEvent) ?public.CoreEvent {
             .delay_ms = v.delay_ms,
         } },
         .stream_done => .stream_done,
-        .diag_turn_begin => |v| .{ .diag_turn_begin = .{ .trace_id = v.trace_id, .depth = v.depth, .turn = v.turn } },
-        .diag_turn_end => |v| .{ .diag_turn_end = .{
-            .trace_id = v.trace_id,
-            .depth = v.depth,
-            .turn = v.turn,
-            .tool_calls = v.tool_calls,
-        } },
-        .diag_breaker_tripped => |v| .{ .diag_breaker_tripped = .{
-            .trace_id = v.trace_id,
-            .depth = v.depth,
-            .same_err_count = v.same_err_count,
-        } },
-        .diag_cache_break => |v| .{ .diag_cache_break = .{
-            .trace_id = v.trace_id,
-            .depth = v.depth,
-            .cache_read = v.cache_read,
-            .cache_creation = v.cache_creation,
-        } },
-        .diag_continuation => |v| .{ .diag_continuation = .{
-            .trace_id = v.trace_id,
-            .depth = v.depth,
-            .n = v.n,
-            .max = v.max,
-        } },
-        .diag_run_end => |v| .{ .diag_run_end = .{
-            .trace_id = v.trace_id,
-            .depth = v.depth,
-            .turns = v.turns,
-            .tool_calls = v.tool_calls,
-            .stop_reason_name = v.stop_reason_name,
-        } },
 
-        // These events belong to App/daemon coordination. AgentCore v1 owns
-        // immutable Session configuration and does not expose Task/KG agents,
-        // so exporting them would promise capabilities the facade cannot use.
-        .config_changed, .session_lifecycle, .agent_lifecycle, .tasks_changed, .ui_request_pending => null,
+        // Presentation hints, diagnostics and App/daemon coordination remain
+        // internal. Exporting them would freeze UI policy or implementation
+        // details rather than AgentSession observations.
+        .stream_begin,
+        .set_current_tool,
+        .clear_current_tool,
+        .diag_turn_begin,
+        .diag_turn_end,
+        .diag_breaker_tripped,
+        .diag_cache_break,
+        .diag_continuation,
+        .diag_run_end,
+        .config_changed,
+        .session_lifecycle,
+        .agent_lifecycle,
+        .tasks_changed,
+        .ui_request_pending,
+        => null,
     };
 }
 
@@ -133,11 +113,7 @@ pub fn encodeUiRequest(allocator: std.mem.Allocator, request: *const InternalUiR
             break :blk .{ .ask_question = out };
         },
         .permission => |v| .{ .permission = .{ .tool = v.tool, .args = v.args } },
-        .plan_approval => |v| .{ .plan_approval = .{
-            .plan_md = v.plan_md,
-            .kg_step_count = std.math.cast(u64, v.kg_step_count) orelse return error.IntegerOverflow,
-        } },
-        .custom => |v| .{ .custom = .{ .kind = v.kind, .payload_json = v.payload_json } },
+        .plan_approval, .custom => return error.UnsupportedUiRequest,
     };
     return std.json.Stringify.valueAlloc(allocator, mapped, .{});
 }
@@ -180,22 +156,21 @@ pub fn decodeUiResponse(
             } },
             else => return error.InvalidUiResponse,
         },
-        .plan_approval => switch (parsed.value) {
-            .plan_approval => |choice| out.* = .{ .plan_approval = switch (choice) {
-                .approve_default => .approve_default,
-                .approve_accept_edits => .approve_accept_edits,
-                .reject => .reject,
-            } },
-            else => return error.InvalidUiResponse,
-        },
-        .custom => switch (parsed.value) {
-            .custom => |value| out.* = .{ .custom = try allocator.dupe(u8, value) },
-            else => return error.InvalidUiResponse,
-        },
+        .plan_approval, .custom => return error.UnsupportedUiRequest,
     }
 }
 
 test "internal-only events are explicitly excluded from ABI v1" {
+    try std.testing.expect(event(.stream_begin) == null);
+    try std.testing.expect(event(.{ .set_current_tool = .{ .name = "Read" } }) == null);
+    try std.testing.expect(event(.clear_current_tool) == null);
+    const trace_id = [_]u8{0} ** 12;
+    try std.testing.expect(event(.{ .diag_turn_begin = .{ .trace_id = trace_id, .depth = 0, .turn = 1 } }) == null);
+    try std.testing.expect(event(.{ .diag_turn_end = .{ .trace_id = trace_id, .depth = 0, .turn = 1, .tool_calls = 0 } }) == null);
+    try std.testing.expect(event(.{ .diag_breaker_tripped = .{ .trace_id = trace_id, .depth = 0, .same_err_count = 1 } }) == null);
+    try std.testing.expect(event(.{ .diag_cache_break = .{ .trace_id = trace_id, .depth = 0, .cache_read = 1, .cache_creation = 2 } }) == null);
+    try std.testing.expect(event(.{ .diag_continuation = .{ .trace_id = trace_id, .depth = 0, .n = 1, .max = 2 } }) == null);
+    try std.testing.expect(event(.{ .diag_run_end = .{ .trace_id = trace_id, .depth = 0, .turns = 1, .tool_calls = 0, .stop_reason_name = "end_turn" } }) == null);
     try std.testing.expect(event(.{ .config_changed = .{ .model = "x" } }) == null);
     try std.testing.expect(event(.{ .session_lifecycle = .{ .created = "s" } }) == null);
     try std.testing.expect(event(.{ .agent_lifecycle = .{ .status = .{
@@ -206,4 +181,20 @@ test "internal-only events are explicitly excluded from ABI v1" {
     } } }) == null);
     try std.testing.expect(event(.{ .tasks_changed = .{ .invalidated = {} } }) == null);
     try std.testing.expect(event(.{ .ui_request_pending = .{ .tool_use_id = "t", .request_json = "{}" } }) == null);
+}
+
+test "plan and custom UI requests are not part of ABI v1" {
+    const plan = InternalUiRequest{ .plan_approval = .{ .plan_md = "example" } };
+    const custom = InternalUiRequest{ .custom = .{ .kind = "example", .payload_json = "{}" } };
+    try std.testing.expectError(error.UnsupportedUiRequest, encodeUiRequest(std.testing.allocator, &plan));
+    try std.testing.expectError(error.UnsupportedUiRequest, encodeUiRequest(std.testing.allocator, &custom));
+    var out: InternalUiResponse = undefined;
+    try std.testing.expectError(
+        error.UnsupportedUiRequest,
+        decodeUiResponse(std.testing.allocator, &plan, "{\"answers\":[]}", &out),
+    );
+    try std.testing.expectError(
+        error.UnsupportedUiRequest,
+        decodeUiResponse(std.testing.allocator, &custom, "{\"answers\":[]}", &out),
+    );
 }

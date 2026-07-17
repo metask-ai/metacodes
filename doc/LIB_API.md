@@ -43,7 +43,7 @@ zig-out/sdk/metacodes_agentcore_types.zig
         + manifest(scripts/write_agentcore_manifest.sh 生成，记录 target/实际库文件名/hash)
 ```
 - 引用:C/Rust/Go/… link 目标平台静态库 + include `.h` → 调 **单入口** `metacodes_agentcore_get_api(1)` 拿函数指针表(vtable):`runtime_create/destroy`、`session_create/destroy`、`session_run`(=agent loop)、`session_abort`、`buffer_release`。
-- 机制:**单符号 + 版本协商** = 稳定 ABI；当前 v1 要求精确 struct size，破坏性扩展须新增 v2 table，不能在 v1 静默追加槽。富数据(事件流/UI 请求/工具结果)走独立冻结的 **AgentCore protocol v1 JSON**，不直接暴露内部 frontend/daemon `CoreEvent`；配置/结果走 **POD struct**(头文件 `_Static_assert` 锁布局)。
+- 机制:**单符号 + 版本协商** = 稳定 ABI；当前 v1 要求精确 struct size + reserved 全零，布局/函数表扩展须新增 v2 table。富数据走独立的 **AgentCore protocol v1 JSON**，不直接暴露内部 frontend/daemon `CoreEvent`；观察事件允许未知新 tag 被忽略/保留，UI/control 请求仍严格 fail-closed；配置/结果走 **POD struct**(头文件静态断言锁布局)。完整语义见 `doc/AGENTCORE_BINARY_ABI.md`。
 - source-free Zig:经 `sdk/metacodes_agentcore.zig`(`extern fn` link 目标平台的预编译静态库,不要 core 源)。`agentcore:consumer` step 测这条。
 - 契约测试:`agentcore:test`(ABI v1 布局 + typed protocol + C 头编译 + Zig↔C 往返)。正式 ReleaseSafe bundle 默认 strip DWARF，manifest 记录并校验 strip 设置。
 - 交付边界:每个显式 target 单独一个 bundle；`agentcore:bundle` 会交叉编译并链接 source-free Zig/C consumer，但不运行。当前 macOS arm64 已完成 native consumer 运行验证，Linux/Windows 仍需分别在对应 CI runner 上完成运行验证。

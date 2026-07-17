@@ -169,12 +169,18 @@ int main(void) {
         (const mc_agentcore_api_v1 *)metacodes_agentcore_get_api(MC_AGENTCORE_ABI_V1);
     if (api == NULL || api->struct_size != sizeof(*api) ||
         api->abi_version != MC_AGENTCORE_ABI_V1 ||
-        (api->capabilities & MC_CAP_RUNTIME) == 0 ||
+        (api->capabilities & MC_REQUIRED_CAPABILITIES_V1) !=
+            MC_REQUIRED_CAPABILITIES_V1 ||
         api->runtime_create == NULL || api->runtime_destroy == NULL ||
         api->session_create == NULL || api->session_destroy == NULL ||
         api->session_run == NULL || api->session_abort == NULL ||
         api->buffer_release == NULL) {
         return 10;
+    }
+    for (size_t i = 0; i < sizeof(api->reserved) / sizeof(api->reserved[0]); ++i) {
+        if (api->reserved[i] != 0) {
+            return 10;
+        }
     }
     if (metacodes_agentcore_get_api(MC_AGENTCORE_ABI_V1 + 1) != NULL) {
         return 11;

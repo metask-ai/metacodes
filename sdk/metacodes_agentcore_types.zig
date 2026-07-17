@@ -13,6 +13,7 @@ pub const Status = enum(u32) {
     core_error = 7,
     callback_failed = 8,
     internal_error = 9,
+    resource_limit = 10,
 
     pub fn fromCode(code: u32) error{UnknownStatus}!Status {
         return switch (code) {
@@ -26,6 +27,7 @@ pub const Status = enum(u32) {
             @intFromEnum(Status.core_error) => .core_error,
             @intFromEnum(Status.callback_failed) => .callback_failed,
             @intFromEnum(Status.internal_error) => .internal_error,
+            @intFromEnum(Status.resource_limit) => .resource_limit,
             else => error.UnknownStatus,
         };
     }
@@ -41,6 +43,7 @@ pub const STATUS_INVALID_STATE: u32 = @intFromEnum(Status.invalid_state);
 pub const STATUS_CORE_ERROR: u32 = @intFromEnum(Status.core_error);
 pub const STATUS_CALLBACK_FAILED: u32 = @intFromEnum(Status.callback_failed);
 pub const STATUS_INTERNAL_ERROR: u32 = @intFromEnum(Status.internal_error);
+pub const STATUS_RESOURCE_LIMIT: u32 = @intFromEnum(Status.resource_limit);
 
 pub const PROVIDER_ANTHROPIC: u32 = 1;
 pub const PROVIDER_OPENAI: u32 = 2;
@@ -48,10 +51,9 @@ pub const PROVIDER_GEMINI: u32 = 3;
 
 pub const PERMISSION_DEFAULT: u32 = 1;
 pub const PERMISSION_ACCEPT_EDITS: u32 = 2;
-pub const PERMISSION_PLAN: u32 = 3;
-pub const PERMISSION_AUTO: u32 = 4;
-pub const PERMISSION_DONT_ASK: u32 = 5;
-pub const PERMISSION_BYPASS: u32 = 6;
+pub const PERMISSION_AUTO: u32 = 3;
+pub const PERMISSION_DONT_ASK: u32 = 4;
+pub const PERMISSION_BYPASS: u32 = 5;
 
 pub const SHELL_DISABLED: u32 = 1;
 pub const SHELL_SANDBOXED: u32 = 2;
@@ -61,44 +63,45 @@ pub const ABORT_USER_REQUEST: u32 = 1;
 pub const ABORT_TIMEOUT: u32 = 2;
 
 pub const StopReason = enum(u32) {
-    invalid = 0,
     end_turn = 1,
     max_turns = 2,
     aborted = 3,
     tool_error = 4,
     api_error = 5,
     tool_loop = 6,
-    suspended = 7,
-    backgrounded = 8,
-    budget = 9,
 
     pub fn fromCode(code: u32) error{UnknownStopReason}!StopReason {
         return switch (code) {
-            @intFromEnum(StopReason.invalid) => .invalid,
             @intFromEnum(StopReason.end_turn) => .end_turn,
             @intFromEnum(StopReason.max_turns) => .max_turns,
             @intFromEnum(StopReason.aborted) => .aborted,
             @intFromEnum(StopReason.tool_error) => .tool_error,
             @intFromEnum(StopReason.api_error) => .api_error,
             @intFromEnum(StopReason.tool_loop) => .tool_loop,
-            @intFromEnum(StopReason.suspended) => .suspended,
-            @intFromEnum(StopReason.backgrounded) => .backgrounded,
-            @intFromEnum(StopReason.budget) => .budget,
             else => error.UnknownStopReason,
         };
     }
 };
 
-pub const STOP_INVALID: u32 = @intFromEnum(StopReason.invalid);
 pub const STOP_END_TURN: u32 = @intFromEnum(StopReason.end_turn);
 pub const STOP_MAX_TURNS: u32 = @intFromEnum(StopReason.max_turns);
 pub const STOP_ABORTED: u32 = @intFromEnum(StopReason.aborted);
 pub const STOP_TOOL_ERROR: u32 = @intFromEnum(StopReason.tool_error);
 pub const STOP_API_ERROR: u32 = @intFromEnum(StopReason.api_error);
 pub const STOP_TOOL_LOOP: u32 = @intFromEnum(StopReason.tool_loop);
-pub const STOP_SUSPENDED: u32 = @intFromEnum(StopReason.suspended);
-pub const STOP_BACKGROUNDED: u32 = @intFromEnum(StopReason.backgrounded);
-pub const STOP_BUDGET: u32 = @intFromEnum(StopReason.budget);
+
+/// V1 resource limits guard allocation-amplifying Host inputs. They are part
+/// of the public contract, not a claim that the same-process Host is untrusted.
+pub const MAX_TOOL_COUNT_V1: u64 = 1024;
+pub const MAX_TOOL_SCHEMA_BYTES_V1: u64 = 1024 * 1024;
+pub const MAX_TOOL_SCHEMA_DEPTH_V1: u32 = 32;
+pub const MAX_TOOL_SCHEMA_PROPERTIES_V1: u64 = 1024;
+pub const MAX_UI_RESPONSE_BYTES_V1: u64 = 1024 * 1024;
+pub const MAX_HOST_TOOL_RESULT_BYTES_V1: u64 = 16 * 1024 * 1024;
+pub const MAX_METADATA_STRING_BYTES_V1: u64 = 1024 * 1024;
+pub const MAX_RUNTIME_METADATA_BYTES_V1: u64 = 16 * 1024 * 1024;
+pub const MAX_SESSION_METADATA_BYTES_V1: u64 = 4 * 1024 * 1024;
+pub const MAX_TURNS_V1: u32 = 1000;
 
 pub const CALLBACK_CONTINUE: u32 = 0;
 pub const CALLBACK_FATAL: u32 = 1;
@@ -117,6 +120,9 @@ pub const CAP_CORE_EVENTS_JSON: u64 = 1 << 4;
 pub const CAP_ABORT: u64 = 1 << 5;
 pub const REQUIRED_CAPABILITIES_V1: u64 = CAP_RUNTIME | CAP_BUILTIN_TOOLS | CAP_HOST_SYNC_TOOLS | CAP_HOST_UI | CAP_CORE_EVENTS_JSON | CAP_ABORT;
 
+/// V1 is a rigid ABI: every struct_size is exact and every reserved field is
+/// zero. capabilities describes the returned library table, not per-instance
+/// negotiation. Layout or table extensions require a new discovery version.
 pub const RuntimeHandle = opaque {};
 pub const SessionHandle = opaque {};
 
@@ -130,9 +136,21 @@ pub const OwnedBytesV1 = extern struct {
     len: u64,
 };
 
-/// Inputs are borrowed. A HOST_OK result stays Host-owned until release_result.
-pub const HostExecuteFnV1 = *const fn (?*anyopaque, BytesViewV1, BytesViewV1, ?*OwnedBytesV1) callconv(.c) u32;
-pub const HostReleaseFnV1 = *const fn (?*anyopaque, ?*OwnedBytesV1) callconv(.c) void;
+/// Canonical empty has no release token. Every other Host callback descriptor
+/// is passed to its paired release function exactly once, independent of the
+/// callback status. Host owns `host_ctx` through successful Runtime destroy;
+/// `session_id` and provider-produced `arguments_json` are borrowed for the
+/// callback. Only a HOST_OK result is consumed as UTF-8 text.
+pub const HostExecuteFnV1 = *const fn (
+    host_ctx: ?*anyopaque,
+    session_id: BytesViewV1,
+    arguments_json: BytesViewV1,
+    out_result: ?*OwnedBytesV1,
+) callconv(.c) u32;
+pub const HostReleaseFnV1 = *const fn (
+    host_ctx: ?*anyopaque,
+    result: ?*OwnedBytesV1,
+) callconv(.c) void;
 
 pub const HostToolV1 = extern struct {
     struct_size: u32,
@@ -157,12 +175,28 @@ pub const RuntimeConfigV1 = extern struct {
 };
 
 /// Tagged CoreEvent JSON is borrowed for this synchronous callback only.
-pub const OnEventFnV1 = *const fn (?*anyopaque, ?*SessionHandle, u64, BytesViewV1) callconv(.c) u32;
-/// ABI v1 UI requests are synchronous; an answered JSON buffer is released
-/// exactly once through ReleaseResponseFnV1.
-pub const OnUiRequestFnV1 = *const fn (?*anyopaque, ?*SessionHandle, BytesViewV1, ?*OwnedBytesV1) callconv(.c) u32;
-pub const ReleaseResponseFnV1 = *const fn (?*anyopaque, ?*OwnedBytesV1) callconv(.c) void;
+/// Different Sessions may call the same function concurrently.
+pub const OnEventFnV1 = *const fn (
+    session_ctx: ?*anyopaque,
+    session: ?*SessionHandle,
+    run_id: u64,
+    event_json: BytesViewV1,
+) callconv(.c) u32;
+/// ABI v1 UI requests are synchronous. Only UI_ANSWERED consumes the JSON;
+/// descriptor ownership follows the same status-independent rule above.
+pub const OnUiRequestFnV1 = *const fn (
+    session_ctx: ?*anyopaque,
+    session: ?*SessionHandle,
+    request_json: BytesViewV1,
+    out_response: ?*OwnedBytesV1,
+) callconv(.c) u32;
+pub const ReleaseResponseFnV1 = *const fn (
+    session_ctx: ?*anyopaque,
+    response: ?*OwnedBytesV1,
+) callconv(.c) void;
 
+/// Host owns `ctx` through successful Session destroy. AgentCore copies this
+/// descriptor during Session creation but never frees `ctx`.
 pub const SessionCallbacksV1 = extern struct {
     struct_size: u32,
     reserved0: u32,
@@ -202,12 +236,21 @@ pub const RunResultV1 = extern struct {
     reserved: [4]u64,
 };
 
+/// The final OwnedBytesV1 pointer on each AgentCore operation is an optional,
+/// write-only diagnostic output. Release a prior diagnostic before reusing
+/// its variable. Diagnostic allocation is best-effort and never changes the
+/// operation's primary status.
 pub const RuntimeCreateFnV1 = *const fn (?*const RuntimeConfigV1, ?*?*RuntimeHandle, ?*OwnedBytesV1) callconv(.c) u32;
 pub const RuntimeDestroyFnV1 = *const fn (?*RuntimeHandle, ?*OwnedBytesV1) callconv(.c) u32;
 pub const SessionCreateFnV1 = *const fn (?*RuntimeHandle, ?*const SessionConfigV1, ?*const SessionCallbacksV1, ?*?*SessionHandle, ?*OwnedBytesV1) callconv(.c) u32;
 pub const SessionDestroyFnV1 = *const fn (?*SessionHandle, ?*OwnedBytesV1) callconv(.c) u32;
+/// Pre-admission validation, resource-limit, busy, and stale-run failures leave
+/// the Session reusable. Once admitted, OOM/core/callback/internal failure
+/// poisons it; successful completion, including STOP_ABORTED, returns it idle.
 pub const SessionRunFnV1 = *const fn (?*SessionHandle, u64, BytesViewV1, ?*const RunOptionsV1, ?*RunResultV1, ?*OwnedBytesV1) callconv(.c) u32;
 pub const SessionAbortFnV1 = *const fn (?*SessionHandle, u64, u32, ?*OwnedBytesV1) callconv(.c) u32;
+/// Releases only library-owned diagnostics, never Host-owned tool or UI
+/// callback buffers.
 pub const BufferReleaseFnV1 = *const fn (?*OwnedBytesV1) callconv(.c) void;
 
 pub const ApiV1 = extern struct {
@@ -252,8 +295,9 @@ test "typed status and stop reason validate every public code" {
         const value: StopReason = @enumFromInt(field.value);
         try std.testing.expectEqual(value, try StopReason.fromCode(field.value));
     }
-    try std.testing.expectError(error.UnknownStatus, Status.fromCode(10));
+    try std.testing.expectError(error.UnknownStatus, Status.fromCode(11));
     try std.testing.expectError(error.UnknownStatus, Status.fromCode(std.math.maxInt(u32)));
-    try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(10));
+    try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(0));
+    try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(7));
     try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(std.math.maxInt(u32)));
 }

@@ -2,7 +2,8 @@
 //!
 //! This module is source-free: it mirrors the stable wire contract without
 //! importing metacodes implementation modules. Known payloads ignore additive
-//! fields, while unknown top-level tags and invalid known fields fail closed.
+//! fields. Unknown observation events are preserved for forward compatibility;
+//! unknown UI/control messages and invalid known payloads fail closed.
 
 const std = @import("std");
 
@@ -15,14 +16,10 @@ pub const UsageDelta = struct {
 
 pub const CoreEvent = union(enum) {
     text_chunk: []const u8,
-    stream_begin,
     tool_start: struct {
         id: []const u8,
         name: []const u8,
         input: []const u8,
-    },
-    set_current_tool: struct {
-        name: []const u8,
     },
     tool_progress: struct {
         id: []const u8,
@@ -34,7 +31,6 @@ pub const CoreEvent = union(enum) {
         tool_input: []const u8,
         tool_calls: u32,
     },
-    clear_current_tool,
     tool_result: struct {
         id: []const u8,
         name: []const u8,
@@ -64,12 +60,18 @@ pub const CoreEvent = union(enum) {
         delay_ms: u64,
     },
     stream_done,
-    diag_turn_begin: struct { trace_id: [12]u8, depth: u8, turn: u32 },
-    diag_turn_end: struct { trace_id: [12]u8, depth: u8, turn: u32, tool_calls: u32 },
-    diag_breaker_tripped: struct { trace_id: [12]u8, depth: u8, same_err_count: u32 },
-    diag_cache_break: struct { trace_id: [12]u8, depth: u8, cache_read: u64, cache_creation: u64 },
-    diag_continuation: struct { trace_id: [12]u8, depth: u8, n: u32, max: u32 },
-    diag_run_end: struct { trace_id: [12]u8, depth: u8, turns: u32, tool_calls: u32, stop_reason_name: []const u8 },
+};
+
+/// A valid, single-tag observation event added after this SDK was shipped.
+/// `payload_json` is an owned, normalized JSON encoding of the tag payload.
+pub const UnknownCoreEvent = struct {
+    tag: []const u8,
+    payload_json: []const u8,
+};
+
+pub const DecodedCoreEvent = union(enum) {
+    known: CoreEvent,
+    unknown: UnknownCoreEvent,
 };
 
 pub const AskOption = struct {
@@ -92,27 +94,17 @@ pub const PermissionChoice = enum {
     deny_tool_session,
 };
 
-pub const PlanApproval = enum {
-    approve_default,
-    approve_accept_edits,
-    reject,
-};
-
 pub const UiRequest = union(enum) {
     ask_question: []const AskQuestion,
     permission: struct { tool: []const u8, args: []const u8 },
-    plan_approval: struct { plan_md: []const u8, kg_step_count: u64 = 0 },
-    custom: struct { kind: []const u8, payload_json: []const u8 },
 };
 
 pub const UiResponse = union(enum) {
     answers: []const []const u8,
     permission: PermissionChoice,
-    plan_approval: PlanApproval,
-    custom: []const u8,
 };
 
-pub const ParsedCoreEvent = std.json.Parsed(CoreEvent);
+pub const ParsedCoreEvent = std.json.Parsed(DecodedCoreEvent);
 pub const ParsedUiRequest = std.json.Parsed(UiRequest);
 pub const ParsedUiResponse = std.json.Parsed(UiResponse);
 
@@ -130,7 +122,53 @@ pub const EncodeError = error{
 };
 
 pub fn decodeCoreEvent(allocator: std.mem.Allocator, encoded: []const u8) DecodeError!ParsedCoreEvent {
-    return decode(CoreEvent, allocator, encoded);
+    const arena = allocator.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
+    errdefer allocator.destroy(arena);
+    arena.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    // The known-event path is hot (especially text_chunk/tool_progress), so
+    // inspect only the first object key before doing one typed parse. Building
+    // a complete dynamic Value and then a second typed representation doubled
+    // allocation and copying for every event.
+    var scanner = std.json.Scanner.initCompleteInput(a, encoded);
+    defer scanner.deinit();
+    const begin = scanner.next() catch |err| return normalizeDecodeError(err);
+    if (begin != .object_begin) return error.InvalidPayload;
+    const tag_token = scanner.nextAllocMax(a, .alloc_if_needed, encoded.len) catch |err|
+        return normalizeDecodeError(err);
+    const tag = switch (tag_token) {
+        .string => |value| value,
+        .allocated_string => |value| value,
+        else => return error.InvalidPayload,
+    };
+    if (std.meta.stringToEnum(std.meta.Tag(CoreEvent), tag) != null) {
+        const known = std.json.parseFromSliceLeaky(CoreEvent, a, encoded, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+            .duplicate_field_behavior = .@"error",
+        }) catch |err| return normalizeDecodeError(err);
+        return .{ .arena = arena, .value = .{ .known = known } };
+    }
+
+    // Unknown observation tags are rare and need an owned normalized payload,
+    // so only this compatibility path pays for a dynamic JSON tree.
+    const root = std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    }) catch |err| return normalizeDecodeError(err);
+    if (root != .object or root.object.count() != 1) return error.InvalidPayload;
+    var fields = root.object.iterator();
+    const field = fields.next() orelse return error.InvalidPayload;
+    const payload_json = std.json.Stringify.valueAlloc(a, field.value_ptr.*, .{}) catch return error.OutOfMemory;
+    return .{
+        .arena = arena,
+        .value = .{ .unknown = .{
+            .tag = field.key_ptr.*,
+            .payload_json = payload_json,
+        } },
+    };
 }
 
 pub fn decodeUiRequest(allocator: std.mem.Allocator, encoded: []const u8) DecodeError!ParsedUiRequest {
@@ -150,8 +188,6 @@ pub fn encodeUiResponse(allocator: std.mem.Allocator, request: UiRequest, respon
             else => return error.MismatchedResponse,
         },
         .permission => if (response != .permission) return error.MismatchedResponse,
-        .plan_approval => if (response != .plan_approval) return error.MismatchedResponse,
-        .custom => if (response != .custom) return error.MismatchedResponse,
     }
     return std.json.Stringify.valueAlloc(allocator, response, .{}) catch error.OutOfMemory;
 }
@@ -161,7 +197,11 @@ fn decode(comptime T: type, allocator: std.mem.Allocator, encoded: []const u8) D
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
         .duplicate_field_behavior = .@"error",
-    }) catch |err| return switch (err) {
+    }) catch |err| return normalizeDecodeError(err);
+}
+
+fn normalizeDecodeError(err: anyerror) DecodeError {
+    return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.SyntaxError, error.UnexpectedEndOfInput, error.BufferUnderrun => error.MalformedJson,
         error.UnknownField => error.UnknownTag,
@@ -172,24 +212,15 @@ fn decode(comptime T: type, allocator: std.mem.Allocator, encoded: []const u8) D
 test "CoreEvent decoder covers every ABI v1 tag" {
     const cases = [_][]const u8{
         "{\"text_chunk\":\"hello\"}",
-        "{\"stream_begin\":{}}",
         "{\"tool_start\":{\"id\":\"t1\",\"name\":\"Read\",\"input\":\"{}\"}}",
-        "{\"set_current_tool\":{\"name\":\"Read\"}}",
         "{\"tool_progress\":{\"id\":\"t1\",\"text\":\"working\"}}",
         "{\"progress\":{\"turn\":1,\"tool_name\":\"Read\",\"tool_input\":\"{}\",\"tool_calls\":2}}",
-        "{\"clear_current_tool\":{}}",
         "{\"tool_result\":{\"id\":\"t1\",\"name\":\"Read\",\"input\":\"{}\",\"content\":\"ok\",\"is_error\":false,\"elapsed_ms\":18446744073709551615}}",
         "{\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"cache_read_input_tokens\":3,\"cache_creation_input_tokens\":4}}",
         "{\"context_warning\":{\"current_tokens\":1,\"warning_threshold\":2,\"auto_compact_threshold\":3,\"blocking_limit\":4,\"level\":\"medium\"}}",
         "{\"auto_compact\":{\"dropped\":1,\"kept\":2,\"before_tokens\":3,\"after_tokens\":4,\"cause\":\"trigger\"}}",
         "{\"retry_notice\":{\"attempt\":1,\"max\":2,\"delay_ms\":3}}",
         "{\"stream_done\":{}}",
-        "{\"diag_turn_begin\":{\"trace_id\":[0,1,2,3,4,5,6,7,8,9,10,11],\"depth\":0,\"turn\":1}}",
-        "{\"diag_turn_end\":{\"trace_id\":[0,1,2,3,4,5,6,7,8,9,10,11],\"depth\":0,\"turn\":1,\"tool_calls\":2}}",
-        "{\"diag_breaker_tripped\":{\"trace_id\":[0,1,2,3,4,5,6,7,8,9,10,11],\"depth\":0,\"same_err_count\":3}}",
-        "{\"diag_cache_break\":{\"trace_id\":[0,1,2,3,4,5,6,7,8,9,10,11],\"depth\":0,\"cache_read\":4,\"cache_creation\":5}}",
-        "{\"diag_continuation\":{\"trace_id\":[0,1,2,3,4,5,6,7,8,9,10,11],\"depth\":0,\"n\":1,\"max\":2}}",
-        "{\"diag_run_end\":{\"trace_id\":[0,1,2,3,4,5,6,7,8,9,10,11],\"depth\":0,\"turns\":1,\"tool_calls\":2,\"stop_reason_name\":\"end_turn\"}}",
     };
     try std.testing.expectEqual(std.meta.fields(std.meta.Tag(CoreEvent)).len, cases.len);
     for (cases) |encoded| {
@@ -205,13 +236,19 @@ test "decoded strings are owned independently of callback input" {
     @memset(encoded, 'x');
     allocator.free(encoded);
     defer parsed.deinit();
-    try std.testing.expectEqualStrings("owned", parsed.value.text_chunk);
+    switch (parsed.value) {
+        .known => |event| try std.testing.expectEqualStrings("owned", event.text_chunk),
+        .unknown => return error.UnexpectedUnknownEvent,
+    }
 }
 
 test "known payloads accept additive fields" {
     var parsed = try decodeCoreEvent(std.testing.allocator, "{\"retry_notice\":{\"attempt\":1,\"max\":2,\"delay_ms\":3,\"future_hint\":true}}");
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(u64, 3), parsed.value.retry_notice.delay_ms);
+    switch (parsed.value) {
+        .known => |event| try std.testing.expectEqual(@as(u64, 3), event.retry_notice.delay_ms),
+        .unknown => return error.UnexpectedUnknownEvent,
+    }
 
     var ui = try decodeUiRequest(std.testing.allocator, "{\"permission\":{\"tool\":\"Bash\",\"args\":\"{}\",\"future_hint\":true}}");
     defer ui.deinit();
@@ -221,21 +258,35 @@ test "known payloads accept additive fields" {
 test "wire integers accept full u32 and u64 ranges" {
     var parsed = try decodeCoreEvent(std.testing.allocator, "{\"progress\":{\"turn\":4294967295,\"tool_name\":\"Read\",\"tool_input\":\"{}\",\"tool_calls\":4294967295}}");
     defer parsed.deinit();
-    try std.testing.expectEqual(std.math.maxInt(u32), parsed.value.progress.turn);
-    try std.testing.expectEqual(std.math.maxInt(u32), parsed.value.progress.tool_calls);
+    switch (parsed.value) {
+        .known => |event| {
+            try std.testing.expectEqual(std.math.maxInt(u32), event.progress.turn);
+            try std.testing.expectEqual(std.math.maxInt(u32), event.progress.tool_calls);
+        },
+        .unknown => return error.UnexpectedUnknownEvent,
+    }
+}
+
+test "CoreEvent decoder preserves unknown observation tags" {
+    var parsed = try decodeCoreEvent(std.testing.allocator, "{\"future_event\":{\"answer\":42}}");
+    defer parsed.deinit();
+    switch (parsed.value) {
+        .known => return error.UnexpectedKnownEvent,
+        .unknown => |event| {
+            try std.testing.expectEqualStrings("future_event", event.tag);
+            try std.testing.expectEqualStrings("{\"answer\":42}", event.payload_json);
+        },
+    }
 }
 
 test "CoreEvent decoder normalizes malformed and invalid inputs" {
     const a = std.testing.allocator;
     try std.testing.expectError(error.MalformedJson, decodeCoreEvent(a, "{"));
-    try std.testing.expectError(error.UnknownTag, decodeCoreEvent(a, "{\"future_event\":{}}"));
-    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"stream_begin\":{},\"stream_done\":{}}"));
-    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"stream_begin\":{},\"future_event\":{}}"));
-    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"stream_begin\":{},\"stream_begin\":{}}"));
+    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"stream_done\":{},\"future_event\":{}}"));
+    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"stream_done\":{},\"stream_done\":{}}"));
     try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"retry_notice\":{\"attempt\":1,\"max\":2}}"));
     try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"retry_notice\":{\"attempt\":-1,\"max\":2,\"delay_ms\":3}}"));
     try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"retry_notice\":{\"attempt\":1,\"max\":2,\"delay_ms\":18446744073709551616}}"));
-    try std.testing.expectError(error.InvalidPayload, decodeCoreEvent(a, "{\"diag_turn_begin\":{\"trace_id\":[0],\"depth\":0,\"turn\":1}}"));
 }
 
 test "UiRequest decoder covers every tag and response encoder enforces pairing" {
@@ -243,11 +294,9 @@ test "UiRequest decoder covers every tag and response encoder enforces pairing" 
     const requests = [_][]const u8{
         "{\"ask_question\":[{\"question\":\"Continue?\",\"header\":\"Choice\",\"multi\":false,\"options\":[{\"label\":\"Yes\",\"description\":\"Proceed\",\"preview\":\"\"}]}]}",
         "{\"permission\":{\"tool\":\"Bash\",\"args\":\"{}\"}}",
-        "{\"plan_approval\":{\"plan_md\":\"Do it\",\"kg_step_count\":2}}",
-        "{\"custom\":{\"kind\":\"video_timeline\",\"payload_json\":\"{\\\"clips\\\":[]}\"}}",
     };
     try std.testing.expectEqual(std.meta.fields(std.meta.Tag(UiRequest)).len, requests.len);
-    try std.testing.expectEqual(@as(usize, 4), std.meta.fields(std.meta.Tag(UiResponse)).len);
+    try std.testing.expectEqual(@as(usize, 2), std.meta.fields(std.meta.Tag(UiResponse)).len);
     for (requests) |encoded| {
         const parsed = try decodeUiRequest(a, encoded);
         parsed.deinit();
@@ -266,14 +315,6 @@ test "UiRequest decoder covers every tag and response encoder enforces pairing" 
     const permission = try encodeUiResponse(a, permission_request, .{ .permission = .allow_always });
     defer a.free(permission);
     try std.testing.expectEqualStrings("{\"permission\":\"allow_always\"}", permission);
-    const plan_request = UiRequest{ .plan_approval = .{ .plan_md = "Do it" } };
-    const plan = try encodeUiResponse(a, plan_request, .{ .plan_approval = .approve_accept_edits });
-    defer a.free(plan);
-    try std.testing.expectEqualStrings("{\"plan_approval\":\"approve_accept_edits\"}", plan);
-    const custom_request = UiRequest{ .custom = .{ .kind = "test", .payload_json = "{}" } };
-    const custom = try encodeUiResponse(a, custom_request, .{ .custom = "{\"value\":\"quoted\"}" });
-    defer a.free(custom);
-    try std.testing.expectEqualStrings("{\"custom\":\"{\\\"value\\\":\\\"quoted\\\"}\"}", custom);
     try std.testing.expectError(error.MismatchedResponse, encodeUiResponse(a, permission_request, .{ .answers = &answers }));
     try std.testing.expectError(error.InvalidResponse, encodeUiResponse(a, ask_request, .{ .answers = answers[0..1] }));
 }
@@ -283,10 +324,9 @@ test "UiRequest decoder rejects unknown tags and invalid payloads" {
     try std.testing.expectError(error.MalformedJson, decodeUiRequest(a, "{"));
     try std.testing.expectError(error.UnknownTag, decodeUiRequest(a, "{\"future\":{}}"));
     try std.testing.expectError(error.InvalidPayload, decodeUiRequest(a, "{\"permission\":{\"tool\":\"Bash\"}}"));
-    try std.testing.expectError(error.InvalidPayload, decodeUiRequest(a, "{\"permission\":{\"tool\":\"Bash\",\"args\":\"{}\"},\"custom\":{\"kind\":\"x\",\"payload_json\":\"{}\"}}"));
+    try std.testing.expectError(error.InvalidPayload, decodeUiRequest(a, "{\"permission\":{\"tool\":\"Bash\",\"args\":\"{}\"},\"future\":{}}"));
     try std.testing.expectError(error.InvalidPayload, decodeUiRequest(a, "{\"permission\":{\"tool\":\"Bash\",\"args\":\"{}\"},\"permission\":{\"tool\":\"Bash\",\"args\":\"{}\"}}"));
     try std.testing.expectError(error.InvalidPayload, decodeUiRequest(a, "{\"ask_question\":{}}"));
-    try std.testing.expectError(error.InvalidPayload, decodeUiRequest(a, "{\"plan_approval\":{\"plan_md\":\"x\",\"kg_step_count\":18446744073709551616}}"));
 }
 
 test "UiResponse decoder rejects unknown tags and invalid payloads" {
@@ -296,7 +336,7 @@ test "UiResponse decoder rejects unknown tags and invalid payloads" {
     try std.testing.expectEqual(PermissionChoice.allow_once, permission.value.permission);
     try std.testing.expectError(error.UnknownTag, decodeUiResponse(a, "{\"future\":{}}"));
     try std.testing.expectError(error.InvalidPayload, decodeUiResponse(a, "{\"permission\":\"future\"}"));
-    try std.testing.expectError(error.InvalidPayload, decodeUiResponse(a, "{\"permission\":\"allow_once\",\"custom\":\"{}\"}"));
+    try std.testing.expectError(error.InvalidPayload, decodeUiResponse(a, "{\"permission\":\"allow_once\",\"answers\":[]}"));
 }
 
 test "decoder and encoder normalize allocation failure" {

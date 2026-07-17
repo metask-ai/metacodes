@@ -7,6 +7,8 @@ pub const protocol = @import("metacodes_agentcore_protocol");
 pub const Status = types.Status;
 pub const StopReason = types.StopReason;
 pub const CoreEvent = protocol.CoreEvent;
+pub const DecodedCoreEvent = protocol.DecodedCoreEvent;
+pub const UnknownCoreEvent = protocol.UnknownCoreEvent;
 pub const UiRequest = protocol.UiRequest;
 pub const UiResponse = protocol.UiResponse;
 pub const ParsedCoreEvent = protocol.ParsedCoreEvent;
@@ -40,6 +42,7 @@ pub const Api = struct {
     pub fn validate(raw: *const types.ApiV1) error{UnsupportedAbi}!Api {
         if (raw.struct_size != @sizeOf(types.ApiV1) or raw.abi_version != types.ABI_VERSION_V1 or
             raw.capabilities & types.REQUIRED_CAPABILITIES_V1 != types.REQUIRED_CAPABILITIES_V1 or
+            !allZero(raw.reserved) or
             raw.runtime_create == null or raw.runtime_destroy == null or raw.session_create == null or
             raw.session_destroy == null or raw.session_run == null or raw.session_abort == null or raw.buffer_release == null)
             return error.UnsupportedAbi;
@@ -68,6 +71,11 @@ pub const Api = struct {
         return self.raw.buffer_release.?;
     }
 };
+
+fn allZero(values: anytype) bool {
+    for (values) |value| if (value != 0) return false;
+    return true;
+}
 
 const std = @import("std");
 

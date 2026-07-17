@@ -17,8 +17,8 @@ const AbiHostTool = struct {
         const self: *AbiHostTool = @ptrCast(@alignCast(raw));
         var out = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
         const status = self.execute_fn(self.ctx, view(session_id), view(args), &out);
+        errdefer if (hasReleaseToken(out)) self.release_fn(self.ctx, &out);
         if (status != wire.HOST_OK) {
-            if (out.ptr != null or out.len != 0) self.release_fn(self.ctx, &out);
             return switch (status) {
                 wire.HOST_REJECTED => error.HostToolRejected,
                 wire.HOST_FAILED => error.HostToolFailed,
@@ -29,19 +29,18 @@ const AbiHostTool = struct {
             // Preserve the exact Host descriptor on failure. Converting a
             // non-null zero-length allocation to a slice would lose its
             // release pointer permanently.
-            self.release_fn(self.ctx, &out);
             return error.HostToolFailed;
         }
-        const bytes = ownedSlice(out) catch {
-            self.release_fn(self.ctx, &out);
-            return error.HostToolFailed;
-        };
+        if (out.len > wire.MAX_HOST_TOOL_RESULT_BYTES_V1) return error.HostToolFailed;
+        const bytes = ownedSlice(out) catch return error.HostToolFailed;
+        if (!std.unicode.utf8ValidateSlice(bytes)) return error.HostToolFailed;
         return .{ .bytes = bytes, .release_ctx = self, .releaseFn = release };
     }
 
     fn release(raw: *anyopaque, bytes: []const u8) void {
+        if (bytes.len == 0) return;
         const self: *AbiHostTool = @ptrCast(@alignCast(raw));
-        var out = wire.OwnedBytesV1{ .ptr = if (bytes.len == 0) null else @constCast(bytes.ptr), .len = bytes.len };
+        var out = wire.OwnedBytesV1{ .ptr = @constCast(bytes.ptr), .len = bytes.len };
         self.release_fn(self.ctx, &out);
     }
 };
@@ -58,6 +57,7 @@ const AbiRuntime = struct {
 const AbiSession = struct {
     callbacks: wire.SessionCallbacksV1,
     callback_status: std.atomic.Value(u32),
+    contract_failed: std.atomic.Value(bool),
     core_session: *core.agent_session.AgentSession,
 
     fn handle(self: *AbiSession) *wire.SessionHandle {
@@ -89,8 +89,7 @@ const AbiSession = struct {
         defer response_allocator.free(request_json);
         var response = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
         const status = callback(self.callbacks.ctx, self.handle(), view(request_json), &response);
-        const must_release = status == wire.UI_ANSWERED or response.ptr != null or response.len != 0;
-        defer if (must_release) release_fn(self.callbacks.ctx, &response);
+        defer if (hasReleaseToken(response)) release_fn(self.callbacks.ctx, &response);
         if (!canonicalOwned(response)) {
             self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
             return error.HostUiFailed;
@@ -98,6 +97,10 @@ const AbiSession = struct {
         return switch (status) {
             wire.UI_UNAVAILABLE => .unavailable,
             wire.UI_ANSWERED => blk: {
+                if (response.len > wire.MAX_UI_RESPONSE_BYTES_V1) {
+                    self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
+                    return error.HostUiFailed;
+                }
                 const bytes = ownedSlice(response) catch |err| {
                     self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
                     return err;
@@ -156,6 +159,10 @@ fn canonicalOwned(v: wire.OwnedBytesV1) bool {
     return (v.len == 0) == (v.ptr == null);
 }
 
+fn hasReleaseToken(v: wire.OwnedBytesV1) bool {
+    return v.ptr != null or v.len != 0;
+}
+
 fn allZero(values: anytype) bool {
     for (values) |value| if (value != 0) return false;
     return true;
@@ -165,10 +172,17 @@ fn emptyError(out_error: ?*wire.OwnedBytesV1) void {
     if (out_error) |out| out.* = .{ .ptr = null, .len = 0 };
 }
 
-fn fail(status: u32, message: []const u8, out_error: ?*wire.OwnedBytesV1) u32 {
-    const out = out_error orelse return status;
-    const copy = allocator.dupe(u8, message) catch return wire.STATUS_OUT_OF_MEMORY;
+fn writeDiagnostic(diagnostic_allocator: std.mem.Allocator, message: []const u8, out_error: ?*wire.OwnedBytesV1) void {
+    const out = out_error orelse return;
+    // Diagnostics are best-effort side output. Failure to allocate human-readable
+    // text must never replace the machine-readable status of the operation.
+    out.* = .{ .ptr = null, .len = 0 };
+    const copy = diagnostic_allocator.dupe(u8, message) catch return;
     out.* = .{ .ptr = copy.ptr, .len = copy.len };
+}
+
+fn fail(status: u32, message: []const u8, out_error: ?*wire.OwnedBytesV1) u32 {
+    writeDiagnostic(allocator, message, out_error);
     return status;
 }
 
@@ -187,12 +201,18 @@ fn statusText(status: u32) []const u8 {
         wire.STATUS_TOO_LATE => "abort too late",
         wire.STATUS_INVALID_STATE => "invalid state",
         wire.STATUS_CALLBACK_FAILED => "callback failed",
+        wire.STATUS_RESOURCE_LIMIT => "resource limit",
         else => "AgentCore error",
     };
 }
 
 fn inputErrorStatus(err: anyerror) u32 {
-    return if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_INVALID_ARGUMENT;
+    return if (err == error.OutOfMemory)
+        wire.STATUS_OUT_OF_MEMORY
+    else if (err == error.ResourceLimit)
+        wire.STATUS_RESOURCE_LIMIT
+    else
+        wire.STATUS_INVALID_ARGUMENT;
 }
 
 fn runtimeErrorStatus(err: anyerror) u32 {
@@ -243,7 +263,6 @@ fn permissionMode(code: u32) ?core.types.PermissionMode {
     return switch (code) {
         wire.PERMISSION_DEFAULT => .default,
         wire.PERMISSION_ACCEPT_EDITS => .accept_edits,
-        wire.PERMISSION_PLAN => .plan,
         wire.PERMISSION_AUTO => .auto,
         wire.PERMISSION_DONT_ASK => .dont_ask,
         wire.PERMISSION_BYPASS => .bypass_permissions,
@@ -260,7 +279,7 @@ fn shellPolicy(code: u32) ?core.agent_session.ShellPolicy {
     };
 }
 
-fn stopReason(reason: core.agent_loop.StopReason) u32 {
+fn stopReason(self: *AbiSession, reason: core.agent_loop.StopReason) error{UnsupportedStopReason}!u32 {
     return switch (reason) {
         .end_turn => wire.STOP_END_TURN,
         .max_turns => wire.STOP_MAX_TURNS,
@@ -268,33 +287,57 @@ fn stopReason(reason: core.agent_loop.StopReason) u32 {
         .tool_error => wire.STOP_TOOL_ERROR,
         .api_error => wire.STOP_API_ERROR,
         .tool_loop => wire.STOP_TOOL_LOOP,
-        .suspended => wire.STOP_SUSPENDED,
-        .backgrounded => wire.STOP_BACKGROUNDED,
-        .budget => wire.STOP_BUDGET,
+        .suspended, .backgrounded, .budget => {
+            // The stateful Run has already committed Conversation changes.
+            // Returning an error while leaving the facade reusable would make
+            // a Host retry ambiguous and could repeat side effects.
+            self.contract_failed.store(true, .release);
+            return error.UnsupportedStopReason;
+        },
     };
 }
 
-fn borrowedViews(arena: std.mem.Allocator, ptr: ?[*]const wire.BytesViewV1, count64: u64) ![]const []const u8 {
+fn addMetadata(total: *u64, len: u64, total_limit: u64) error{ResourceLimit}!void {
+    if (len > wire.MAX_METADATA_STRING_BYTES_V1) return error.ResourceLimit;
+    total.* = std.math.add(u64, total.*, len) catch return error.ResourceLimit;
+    if (total.* > total_limit) return error.ResourceLimit;
+}
+
+fn borrowedViews(
+    arena: std.mem.Allocator,
+    ptr: ?[*]const wire.BytesViewV1,
+    count64: u64,
+    metadata_total: *u64,
+    metadata_limit: u64,
+) ![]const []const u8 {
+    if (count64 > wire.MAX_TOOL_COUNT_V1) return error.ResourceLimit;
     const count = std.math.cast(usize, count64) orelse return error.Overflow;
     if (count == 0) return &.{};
     const values = (ptr orelse return error.InvalidArgument)[0..count];
     const out = try arena.alloc([]const u8, count);
-    for (values, 0..) |value, i| out[i] = try text(value);
+    for (values, 0..) |value, i| {
+        try addMetadata(metadata_total, value.len, metadata_limit);
+        out[i] = try text(value);
+    }
     return out;
 }
 
 fn parseSchema(arena: std.mem.Allocator, encoded: []const u8) !core.json.InputSchema {
+    if (encoded.len > wire.MAX_TOOL_SCHEMA_BYTES_V1) return error.ResourceLimit;
     const root = try std.json.parseFromSliceLeaky(std.json.Value, arena, encoded, .{});
+    try validateSchemaDepth(root, 1);
     if (root != .object) return error.InvalidSchema;
     const type_value = root.object.get("type") orelse return error.InvalidSchema;
     if (type_value != .string or !std.mem.eql(u8, type_value.string, "object")) return error.InvalidSchema;
     var schema = core.json.InputSchema{ .type = type_value.string };
     if (root.object.get("properties")) |properties| {
         if (properties != .object) return error.InvalidSchema;
+        if (properties.object.count() > wire.MAX_TOOL_SCHEMA_PROPERTIES_V1) return error.ResourceLimit;
         schema.properties = properties.object;
     }
     if (root.object.get("required")) |required| {
         if (required != .array) return error.InvalidSchema;
+        if (required.array.items.len > wire.MAX_TOOL_SCHEMA_PROPERTIES_V1) return error.ResourceLimit;
         const names = try arena.alloc([]const u8, required.array.items.len);
         for (required.array.items, 0..) |item, i| {
             if (item != .string) return error.InvalidSchema;
@@ -303,6 +346,18 @@ fn parseSchema(arena: std.mem.Allocator, encoded: []const u8) !core.json.InputSc
         schema.required = names;
     }
     return schema;
+}
+
+fn validateSchemaDepth(value: std.json.Value, depth: u32) !void {
+    if (depth > wire.MAX_TOOL_SCHEMA_DEPTH_V1) return error.ResourceLimit;
+    switch (value) {
+        .array => |array| for (array.items) |child| try validateSchemaDepth(child, depth + 1),
+        .object => |object| {
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| try validateSchemaDepth(entry.value_ptr.*, depth + 1);
+        },
+        else => {},
+    }
 }
 
 fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire.RuntimeHandle, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
@@ -316,8 +371,18 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
     const a = scratch.allocator();
-    const builtin_names = borrowedViews(a, config.builtin_tools, config.builtin_tool_count) catch |err|
+    var runtime_metadata: u64 = 0;
+    const builtin_names = borrowedViews(
+        a,
+        config.builtin_tools,
+        config.builtin_tool_count,
+        &runtime_metadata,
+        wire.MAX_RUNTIME_METADATA_BYTES_V1,
+    ) catch |err|
         return failError(inputErrorStatus(err), err, out_error);
+    if (config.host_tool_count > wire.MAX_TOOL_COUNT_V1 or
+        config.builtin_tool_count > wire.MAX_TOOL_COUNT_V1 - config.host_tool_count)
+        return fail(wire.STATUS_RESOURCE_LIMIT, "Runtime tool count exceeds AgentCore ABI v1 limit", out_error);
     const host_count = std.math.cast(usize, config.host_tool_count) orelse
         return fail(wire.STATUS_INVALID_ARGUMENT, "host tool count overflow", out_error);
     const host_descriptors = if (host_count == 0) &.{} else (config.host_tools orelse
@@ -333,6 +398,14 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
     for (host_descriptors, 0..) |descriptor, i| {
         if (descriptor.struct_size != @sizeOf(wire.HostToolV1) or descriptor.reserved0 != 0 or !allZero(descriptor.reserved) or descriptor.execute == null or descriptor.release_result == null)
             return fail(wire.STATUS_INVALID_ARGUMENT, "invalid HostToolV1", out_error);
+        if (descriptor.input_schema_json.len > wire.MAX_TOOL_SCHEMA_BYTES_V1)
+            return fail(wire.STATUS_RESOURCE_LIMIT, "Host tool schema exceeds AgentCore ABI v1 limit", out_error);
+        addMetadata(&runtime_metadata, descriptor.name.len, wire.MAX_RUNTIME_METADATA_BYTES_V1) catch |err|
+            return failError(inputErrorStatus(err), err, out_error);
+        addMetadata(&runtime_metadata, descriptor.description.len, wire.MAX_RUNTIME_METADATA_BYTES_V1) catch |err|
+            return failError(inputErrorStatus(err), err, out_error);
+        addMetadata(&runtime_metadata, descriptor.input_schema_json.len, wire.MAX_RUNTIME_METADATA_BYTES_V1) catch |err|
+            return failError(inputErrorStatus(err), err, out_error);
         const name = text(descriptor.name) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
         const description = text(descriptor.description) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
         const schema_json = text(descriptor.input_schema_json) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
@@ -370,6 +443,17 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     const kind = provider(config.provider_kind_code) orelse return fail(wire.STATUS_INVALID_ARGUMENT, "unknown provider", out_error);
     const mode = permissionMode(config.permission_mode_code) orelse return fail(wire.STATUS_INVALID_ARGUMENT, "unknown permission mode", out_error);
     const shell = shellPolicy(config.shell_policy_code) orelse return fail(wire.STATUS_INVALID_ARGUMENT, "unknown shell policy", out_error);
+    var session_metadata: u64 = 0;
+    for ([_]wire.BytesViewV1{
+        config.api_key,
+        config.model,
+        config.base_url,
+        config.workspace_root,
+        config.workspace_home,
+    }) |value| {
+        addMetadata(&session_metadata, value.len, wire.MAX_SESSION_METADATA_BYTES_V1) catch |err|
+            return failError(inputErrorStatus(err), err, out_error);
+    }
     const api_key = text(config.api_key) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
     const model = text(config.model) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
     const base_url = text(config.base_url) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
@@ -378,12 +462,19 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     if (api_key.len == 0 or model.len == 0 or root.len == 0) return fail(wire.STATUS_INVALID_ARGUMENT, "api_key, model and workspace_root are required", out_error);
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
-    const allowed = borrowedViews(scratch.allocator(), config.allowed_tools, config.allowed_tool_count) catch |err|
+    const allowed = borrowedViews(
+        scratch.allocator(),
+        config.allowed_tools,
+        config.allowed_tool_count,
+        &session_metadata,
+        wire.MAX_SESSION_METADATA_BYTES_V1,
+    ) catch |err|
         return failError(inputErrorStatus(err), err, out_error);
 
     const self = allocator.create(AbiSession) catch return fail(wire.STATUS_OUT_OF_MEMORY, "allocating Session failed", out_error);
     self.callbacks = callbacks.*;
     self.callback_status = .init(wire.STATUS_OK);
+    self.contract_failed = .init(false);
     self.core_session = runtime.core_runtime.createSession(.{
         .provider_kind = kind,
         .api_key = api_key,
@@ -413,21 +504,29 @@ fn sessionRun(handle: ?*wire.SessionHandle, run_id: u64, prompt_view: wire.Bytes
     if (out_result) |out| out.* = std.mem.zeroes(wire.RunResultV1);
     emptyError(out_error);
     const self = sessionFrom(handle orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    if (self.contract_failed.load(.acquire))
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by an AgentCore ABI contract failure", out_error);
     const options = options_ptr orelse return fail(wire.STATUS_INVALID_ARGUMENT, "run options are required", out_error);
     const out = out_result orelse return fail(wire.STATUS_INVALID_ARGUMENT, "out_result is required", out_error);
     if (run_id == 0 or options.struct_size != @sizeOf(wire.RunOptionsV1) or options.max_turns == 0 or !allZero(options.reserved))
         return fail(wire.STATUS_INVALID_ARGUMENT, "invalid run id or RunOptionsV1", out_error);
+    if (options.max_turns > wire.MAX_TURNS_V1)
+        return fail(wire.STATUS_RESOURCE_LIMIT, "max_turns exceeds AgentCore ABI v1 limit", out_error);
     const prompt = text(prompt_view) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
     const result = self.core_session.runText(run_id, prompt, options.max_turns, .{ .ctx = self, .emit = AbiSession.emit }) catch |err|
         return failError(runErrorStatus(self, err), err, out_error);
     defer if (result.suspend_info) |suspend_info| suspend_info.deinit();
-    out.* = .{ .struct_size = @sizeOf(wire.RunResultV1), .stop_reason_code = stopReason(result.stop_reason), .turns = result.turns, .tool_calls = result.tool_calls, .reserved = [_]u64{0} ** 4 };
+    const stop_code = stopReason(self, result.stop_reason) catch
+        return fail(wire.STATUS_INTERNAL_ERROR, "core returned a stop reason unsupported by AgentCore ABI v1", out_error);
+    out.* = .{ .struct_size = @sizeOf(wire.RunResultV1), .stop_reason_code = stop_code, .turns = result.turns, .tool_calls = result.tool_calls, .reserved = [_]u64{0} ** 4 };
     return wire.STATUS_OK;
 }
 
 fn sessionAbort(handle: ?*wire.SessionHandle, run_id: u64, reason_code: u32, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
     emptyError(out_error);
     const self = sessionFrom(handle orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    if (self.contract_failed.load(.acquire))
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by an AgentCore ABI contract failure", out_error);
     const reason: core.agent_session.AbortReason = switch (reason_code) {
         wire.ABORT_USER_REQUEST => .user_interrupt,
         wire.ABORT_TIMEOUT => .timeout,
@@ -525,13 +624,330 @@ test "Host zero-length result must use a null pointer and preserves release desc
     try std.testing.expect(Probe.released_ptr == @as(?[*]u8, @ptrCast(&Probe.byte)));
 }
 
+test "canonical empty Host tool results never call release" {
+    const Probe = struct {
+        var status: u32 = wire.HOST_OK;
+        var releases: usize = 0;
+
+        fn execute(_: ?*anyopaque, _: wire.BytesViewV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+            (out orelse return wire.HOST_FAILED).* = .{ .ptr = null, .len = 0 };
+            return status;
+        }
+
+        fn release(_: ?*anyopaque, _: ?*wire.OwnedBytesV1) callconv(.c) void {
+            releases += 1;
+        }
+    };
+    var host = AbiHostTool{ .ctx = null, .execute_fn = Probe.execute, .release_fn = Probe.release };
+
+    Probe.status = wire.HOST_OK;
+    Probe.releases = 0;
+    const result = try AbiHostTool.execute(&host, "session", "{}");
+    try std.testing.expectEqual(@as(usize, 0), result.bytes.len);
+    result.release();
+    try std.testing.expectEqual(@as(usize, 0), Probe.releases);
+
+    inline for (.{ wire.HOST_FAILED, wire.HOST_REJECTED, @as(u32, 0xffff_ffff) }) |status| {
+        Probe.status = status;
+        Probe.releases = 0;
+        if (status == wire.HOST_REJECTED) {
+            try std.testing.expectError(error.HostToolRejected, AbiHostTool.execute(&host, "session", "{}"));
+        } else {
+            try std.testing.expectError(error.HostToolFailed, AbiHostTool.execute(&host, "session", "{}"));
+        }
+        try std.testing.expectEqual(@as(usize, 0), Probe.releases);
+    }
+}
+
+test "non-success Host tool buffers are ignored and released exactly once" {
+    const Probe = struct {
+        var status: u32 = wire.HOST_FAILED;
+        var bytes = [_]u8{ 'n', 'o', 't', ' ', 'a', ' ', 'r', 'e', 's', 'u', 'l', 't' };
+        var releases: usize = 0;
+        var released_ptr: ?[*]u8 = null;
+        var released_len: u64 = 0;
+
+        fn execute(_: ?*anyopaque, _: wire.BytesViewV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+            (out orelse return wire.HOST_FAILED).* = .{ .ptr = &bytes, .len = bytes.len };
+            return status;
+        }
+
+        fn release(_: ?*anyopaque, out: ?*wire.OwnedBytesV1) callconv(.c) void {
+            const value = out orelse return;
+            releases += 1;
+            released_ptr = value.ptr;
+            released_len = value.len;
+        }
+    };
+    const cases = [_]struct {
+        status: u32,
+        expected: anyerror,
+    }{
+        .{ .status = wire.HOST_FAILED, .expected = error.HostToolFailed },
+        .{ .status = wire.HOST_REJECTED, .expected = error.HostToolRejected },
+        .{ .status = 0xffff_ffff, .expected = error.HostToolFailed },
+    };
+    var host = AbiHostTool{ .ctx = null, .execute_fn = Probe.execute, .release_fn = Probe.release };
+    for (cases) |case| {
+        Probe.status = case.status;
+        Probe.releases = 0;
+        Probe.released_ptr = null;
+        Probe.released_len = 0;
+        try std.testing.expectError(case.expected, AbiHostTool.execute(&host, "session", "{}"));
+        try std.testing.expectEqual(@as(usize, 1), Probe.releases);
+        try std.testing.expect(Probe.released_ptr == @as(?[*]u8, @ptrCast(&Probe.bytes)));
+        try std.testing.expectEqual(@as(u64, Probe.bytes.len), Probe.released_len);
+    }
+}
+
+test "Host UI descriptor ownership is independent of callback status" {
+    const Probe = struct {
+        var status: u32 = wire.UI_ANSWERED;
+        var with_buffer: bool = false;
+        var releases: usize = 0;
+        const response_json = "{\"answers\":[\"yes\"]}";
+
+        fn request(_: ?*anyopaque, _: ?*wire.SessionHandle, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+            const result = out orelse return wire.UI_FATAL;
+            result.* = if (with_buffer)
+                .{ .ptr = @constCast(response_json.ptr), .len = response_json.len }
+            else
+                .{ .ptr = null, .len = 0 };
+            return status;
+        }
+
+        fn release(_: ?*anyopaque, _: ?*wire.OwnedBytesV1) callconv(.c) void {
+            releases += 1;
+        }
+    };
+    const questions = [_]core.tool_context.AskQuestion{.{ .question = "continue?", .header = "choice", .multi = false, .options = &.{} }};
+    const request = ui_request.UiRequest{ .ask_question = &questions };
+    var response: ui_request.UiResponse = undefined;
+    var fake = AbiSession{
+        .callbacks = .{
+            .struct_size = @sizeOf(wire.SessionCallbacksV1),
+            .reserved0 = 0,
+            .ctx = null,
+            .on_event = null,
+            .on_ui_request = Probe.request,
+            .release_response = Probe.release,
+            .reserved = [_]u64{0} ** 4,
+        },
+        .callback_status = .init(wire.STATUS_OK),
+        .contract_failed = .init(false),
+        .core_session = undefined,
+    };
+
+    Probe.status = wire.UI_ANSWERED;
+    Probe.with_buffer = false;
+    Probe.releases = 0;
+    try std.testing.expectError(
+        error.MalformedJson,
+        AbiSession.requestUi(&fake, .single, std.testing.allocator, &request, &response),
+    );
+    try std.testing.expectEqual(@as(usize, 0), Probe.releases);
+
+    Probe.status = wire.UI_UNAVAILABLE;
+    Probe.with_buffer = false;
+    Probe.releases = 0;
+    try std.testing.expectEqual(
+        ui_request.RequestOutcome.unavailable,
+        try AbiSession.requestUi(&fake, .single, std.testing.allocator, &request, &response),
+    );
+    try std.testing.expectEqual(@as(usize, 0), Probe.releases);
+
+    Probe.status = wire.UI_ANSWERED;
+    Probe.with_buffer = true;
+    Probe.releases = 0;
+    try std.testing.expectEqual(
+        ui_request.RequestOutcome.answered,
+        try AbiSession.requestUi(&fake, .single, std.testing.allocator, &request, &response),
+    );
+    try std.testing.expectEqual(@as(usize, 1), Probe.releases);
+    switch (response) {
+        .answers => |answers| {
+            for (answers) |answer| std.testing.allocator.free(@constCast(answer));
+            std.testing.allocator.free(@constCast(answers));
+        },
+        else => unreachable,
+    }
+
+    inline for (.{ wire.UI_UNAVAILABLE, wire.UI_FATAL, @as(u32, 0xffff_ffff) }) |status| {
+        Probe.status = status;
+        Probe.with_buffer = true;
+        Probe.releases = 0;
+        if (status == wire.UI_UNAVAILABLE) {
+            try std.testing.expectEqual(
+                ui_request.RequestOutcome.unavailable,
+                try AbiSession.requestUi(&fake, .single, std.testing.allocator, &request, &response),
+            );
+        } else {
+            try std.testing.expectError(
+                error.HostUiFailed,
+                AbiSession.requestUi(&fake, .single, std.testing.allocator, &request, &response),
+            );
+        }
+        try std.testing.expectEqual(@as(usize, 1), Probe.releases);
+    }
+}
+
+test "oversized Host tool results are released exactly once" {
+    const Probe = struct {
+        var byte: u8 = 0;
+        var releases: usize = 0;
+        var released_len: u64 = 0;
+
+        fn execute(_: ?*anyopaque, _: wire.BytesViewV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+            (out orelse return wire.HOST_FAILED).* = .{
+                .ptr = @ptrCast(&byte),
+                .len = wire.MAX_HOST_TOOL_RESULT_BYTES_V1 + 1,
+            };
+            return wire.HOST_OK;
+        }
+
+        fn release(_: ?*anyopaque, out: ?*wire.OwnedBytesV1) callconv(.c) void {
+            releases += 1;
+            released_len = (out orelse return).len;
+        }
+    };
+    Probe.releases = 0;
+    Probe.released_len = 0;
+    var host = AbiHostTool{ .ctx = null, .execute_fn = Probe.execute, .release_fn = Probe.release };
+    try std.testing.expectError(error.HostToolFailed, AbiHostTool.execute(&host, "session", "{}"));
+    try std.testing.expectEqual(@as(usize, 1), Probe.releases);
+    try std.testing.expectEqual(wire.MAX_HOST_TOOL_RESULT_BYTES_V1 + 1, Probe.released_len);
+}
+
+test "invalid UTF-8 Host tool results are released exactly once" {
+    const Probe = struct {
+        var bytes = [_]u8{0xff};
+        var releases: usize = 0;
+
+        fn execute(_: ?*anyopaque, _: wire.BytesViewV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+            (out orelse return wire.HOST_FAILED).* = .{ .ptr = &bytes, .len = bytes.len };
+            return wire.HOST_OK;
+        }
+
+        fn release(_: ?*anyopaque, _: ?*wire.OwnedBytesV1) callconv(.c) void {
+            releases += 1;
+        }
+    };
+    Probe.releases = 0;
+    var host = AbiHostTool{ .ctx = null, .execute_fn = Probe.execute, .release_fn = Probe.release };
+    try std.testing.expectError(error.HostToolFailed, AbiHostTool.execute(&host, "session", "{}"));
+    try std.testing.expectEqual(@as(usize, 1), Probe.releases);
+}
+
+test "oversized Host UI responses are released and classified as callback failures" {
+    const Probe = struct {
+        var byte: u8 = 0;
+        var releases: usize = 0;
+
+        fn request(_: ?*anyopaque, _: ?*wire.SessionHandle, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+            (out orelse return wire.UI_FATAL).* = .{
+                .ptr = @ptrCast(&byte),
+                .len = wire.MAX_UI_RESPONSE_BYTES_V1 + 1,
+            };
+            return wire.UI_ANSWERED;
+        }
+
+        fn release(_: ?*anyopaque, _: ?*wire.OwnedBytesV1) callconv(.c) void {
+            releases += 1;
+        }
+    };
+    Probe.releases = 0;
+    const questions = [_]core.tool_context.AskQuestion{.{ .question = "continue?", .header = "choice", .multi = false, .options = &.{} }};
+    const request = ui_request.UiRequest{ .ask_question = &questions };
+    var response: ui_request.UiResponse = undefined;
+    var fake = AbiSession{
+        .callbacks = .{
+            .struct_size = @sizeOf(wire.SessionCallbacksV1),
+            .reserved0 = 0,
+            .ctx = null,
+            .on_event = null,
+            .on_ui_request = Probe.request,
+            .release_response = Probe.release,
+            .reserved = [_]u64{0} ** 4,
+        },
+        .callback_status = .init(wire.STATUS_OK),
+        .contract_failed = .init(false),
+        .core_session = undefined,
+    };
+    try std.testing.expectError(
+        error.HostUiFailed,
+        AbiSession.requestUi(&fake, .single, std.testing.allocator, &request, &response),
+    );
+    try std.testing.expectEqual(@as(usize, 1), Probe.releases);
+    try std.testing.expectEqual(wire.STATUS_CALLBACK_FAILED, fake.callback_status.load(.acquire));
+}
+
+test "Host schema limits reject excessive size and nesting" {
+    const too_large = try std.testing.allocator.alloc(u8, @as(usize, @intCast(wire.MAX_TOOL_SCHEMA_BYTES_V1)) + 1);
+    defer std.testing.allocator.free(too_large);
+    @memset(too_large, ' ');
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectError(error.ResourceLimit, parseSchema(arena.allocator(), too_large));
+
+    var nested = std.ArrayList(u8).empty;
+    defer nested.deinit(std.testing.allocator);
+    try nested.appendSlice(std.testing.allocator, "{\"type\":\"object\",\"properties\":{\"x\":");
+    for (0..wire.MAX_TOOL_SCHEMA_DEPTH_V1 + 1) |_| try nested.appendSlice(std.testing.allocator, "{\"x\":");
+    try nested.appendSlice(std.testing.allocator, "{}");
+    for (0..wire.MAX_TOOL_SCHEMA_DEPTH_V1 + 1) |_| try nested.append(std.testing.allocator, '}');
+    try nested.appendSlice(std.testing.allocator, "}}");
+    try std.testing.expectError(error.ResourceLimit, parseSchema(arena.allocator(), nested.items));
+}
+
 test "Run OutOfMemory maps to the public OOM status" {
     var fake = AbiSession{
         .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
         .callback_status = .init(wire.STATUS_OK),
+        .contract_failed = .init(false),
         .core_session = undefined,
     };
     try std.testing.expectEqual(wire.STATUS_OUT_OF_MEMORY, runErrorStatus(&fake, error.OutOfMemory));
+}
+
+test "diagnostic allocation failure leaves canonical empty output" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var sentinel: u8 = 0;
+    var diagnostic = wire.OwnedBytesV1{ .ptr = @ptrCast(&sentinel), .len = 1 };
+    writeDiagnostic(failing.allocator(), "invalid input", &diagnostic);
+    try std.testing.expect(diagnostic.ptr == null);
+    try std.testing.expectEqual(@as(u64, 0), diagnostic.len);
+}
+
+test "internal continuation states poison the ABI facade" {
+    var fake = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .contract_failed = .init(false),
+        .core_session = undefined,
+    };
+    try std.testing.expectError(error.UnsupportedStopReason, stopReason(&fake, .suspended));
+    try std.testing.expect(fake.contract_failed.load(.acquire));
+    fake.contract_failed.store(false, .release);
+    try std.testing.expectError(error.UnsupportedStopReason, stopReason(&fake, .backgrounded));
+    try std.testing.expect(fake.contract_failed.load(.acquire));
+    fake.contract_failed.store(false, .release);
+    try std.testing.expectError(error.UnsupportedStopReason, stopReason(&fake, .budget));
+    try std.testing.expect(fake.contract_failed.load(.acquire));
+}
+
+test "metadata limits enforce per-field and aggregate budgets" {
+    var total: u64 = 0;
+    try addMetadata(&total, wire.MAX_METADATA_STRING_BYTES_V1, wire.MAX_RUNTIME_METADATA_BYTES_V1);
+    try std.testing.expectEqual(wire.MAX_METADATA_STRING_BYTES_V1, total);
+    try std.testing.expectError(
+        error.ResourceLimit,
+        addMetadata(&total, wire.MAX_METADATA_STRING_BYTES_V1 + 1, wire.MAX_RUNTIME_METADATA_BYTES_V1),
+    );
+    total = wire.MAX_SESSION_METADATA_BYTES_V1;
+    try std.testing.expectError(
+        error.ResourceLimit,
+        addMetadata(&total, 1, wire.MAX_SESSION_METADATA_BYTES_V1),
+    );
 }
 
 test "Session create maps caller configuration errors to invalid argument" {
@@ -559,5 +975,36 @@ test "ABI Runtime rejects process-only built-ins as invalid input" {
     var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
     defer bufferRelease(&diagnostic);
     try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, runtimeCreate(&config, &runtime, &diagnostic));
+    try std.testing.expect(runtime == null);
+}
+
+test "ABI Runtime reports oversized Host schemas as resource limits" {
+    const Probe = struct {
+        var byte: u8 = 0;
+
+        fn execute(_: ?*anyopaque, _: wire.BytesViewV1, _: wire.BytesViewV1, _: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+            return wire.HOST_FAILED;
+        }
+
+        fn release(_: ?*anyopaque, _: ?*wire.OwnedBytesV1) callconv(.c) void {}
+    };
+    var host = std.mem.zeroes(wire.HostToolV1);
+    host.struct_size = @sizeOf(wire.HostToolV1);
+    host.name = view("OversizedSchema");
+    host.description = view("test");
+    host.input_schema_json = .{
+        .ptr = @ptrCast(&Probe.byte),
+        .len = wire.MAX_TOOL_SCHEMA_BYTES_V1 + 1,
+    };
+    host.execute = Probe.execute;
+    host.release_result = Probe.release;
+    var config = std.mem.zeroes(wire.RuntimeConfigV1);
+    config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    config.host_tools = @ptrCast(&host);
+    config.host_tool_count = 1;
+    var runtime: ?*wire.RuntimeHandle = null;
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer bufferRelease(&diagnostic);
+    try std.testing.expectEqual(wire.STATUS_RESOURCE_LIMIT, runtimeCreate(&config, &runtime, &diagnostic));
     try std.testing.expect(runtime == null);
 }

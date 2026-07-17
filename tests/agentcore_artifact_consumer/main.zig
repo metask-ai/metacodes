@@ -42,18 +42,21 @@ const Probe = struct {
         const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, json) catch return wire.CALLBACK_FATAL;
         defer parsed.deinit();
         switch (parsed.value) {
-            .tool_result => |result| {
-                if (std.mem.eql(u8, result.name, "Read") and !result.is_error and
-                    std.mem.indexOf(u8, result.content, "artifact-read-ok") != null)
-                    self.saw_read_result = true;
-                if (std.mem.eql(u8, result.name, "HostEcho") and !result.is_error and
-                    std.mem.eql(u8, result.content, "artifact-host-ok"))
-                    self.saw_host_result = true;
+            .known => |known_event| switch (known_event) {
+                .tool_result => |result| {
+                    if (std.mem.eql(u8, result.name, "Read") and !result.is_error and
+                        std.mem.indexOf(u8, result.content, "artifact-read-ok") != null)
+                        self.saw_read_result = true;
+                    if (std.mem.eql(u8, result.name, "HostEcho") and !result.is_error and
+                        std.mem.eql(u8, result.content, "artifact-host-ok"))
+                        self.saw_host_result = true;
+                },
+                .text_chunk => |text| {
+                    if (std.mem.eql(u8, text, "artifact done")) self.saw_final_text = true;
+                },
+                else => {},
             },
-            .text_chunk => |text| {
-                if (std.mem.eql(u8, text, "artifact done")) self.saw_final_text = true;
-            },
-            else => {},
+            .unknown => {},
         }
         return wire.CALLBACK_CONTINUE;
     }
