@@ -47,21 +47,23 @@ zig build agentcore:consumer --prefix /absolute/new/empty/prefix \
 
 The manifest records source and toolchain identity, resolved target,
 architecture, OS, target ABI, optimization and strip settings, binary ABI
-version, required system link inputs, and SHA-256 for every shipped file. The
-source-free consumer validates those fields, the exact manifest file entries,
-and the complete on-disk file/directory allowlist. Bundles require an explicit
-`-Dtarget=<triple>` so an artifact cannot silently inherit the build host. Build
-a distributable bundle into a new empty `--prefix`; a clean Git tree does not
-make a reused output directory free of stale, unlisted files.
+version, target-specific required system link inputs, and SHA-256 for every
+shipped file. The source-free consumer validates those fields, applies the
+declared link inputs to every language probe, validates the exact manifest file
+entries, and checks the complete on-disk file/directory allowlist. Bundles
+require an explicit `-Dtarget=<triple>` so an artifact cannot silently inherit
+the build host. Build a distributable bundle into a new empty `--prefix`; a
+clean Git tree does not make a reused output directory free of stale, unlisted
+files.
 
 `agentcore:bundle` cross-compiles one bundle per explicit target and link-checks
-source-free Zig and C consumers without running them. The static library
-filename comes from Zig for that target (`.a` or `.lib`) and is recorded in the
-manifest. `agentcore:consumer` additionally runs the resulting programs, so a
-cross-target runtime check needs a compatible runner; native CI should run it
-on every released platform. At present only macOS arm64 has completed that
-native end-to-end verification. This is a validation status, not an ABI
-restriction.
+source-free Zig, C, and C++17 consumers against the installed artifacts.
+The static library filename comes from Zig for that target (`.a` or `.lib`) and
+is recorded in the manifest. `agentcore:consumer` additionally runs the
+resulting Zig, C, and C++ programs, so a cross-target runtime check needs a compatible
+runner; native CI should run it on every released platform. At present only
+macOS arm64 has completed that native end-to-end verification. This is a
+validation status, not an ABI restriction.
 
 Schema version 1 is the first formal bundle layout. Earlier pre-release
 development manifests are unsupported.

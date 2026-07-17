@@ -90,6 +90,11 @@ if [ "$dirty" = true ]; then
     version="$version-dirty.$(printf '%s' "$source_digest" | cut -c1-12)"
 fi
 
+case "$os" in
+    windows) required_system_link_inputs='["libc", "crypt32"]' ;;
+    *) required_system_link_inputs='["libc"]' ;;
+esac
+
 sha() { shasum -a 256 "$1" | awk '{print $1}'; }
 
 cat > "$manifest_tmp" <<EOF
@@ -113,7 +118,7 @@ cat > "$manifest_tmp" <<EOF
   },
   "contract": {
     "binary_abi_version": 1,
-    "required_system_link_inputs": ["libc"],
+    "required_system_link_inputs": $required_system_link_inputs,
     "ui_request_mode": "synchronous"
   },
   "files": [

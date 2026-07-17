@@ -33,6 +33,16 @@ fn verifyBundleEntries(b: *std.Build, bundle_root: []const u8, library_path: []c
         std.debug.panic("invalid AgentCore bundle entry set: {s}", .{@errorName(err)});
 }
 
+fn applySystemLinkInputs(module: *std.Build.Module, inputs: []const []const u8) void {
+    for (inputs) |input| {
+        if (std.mem.eql(u8, input, "libc")) {
+            module.link_libc = true;
+        } else {
+            module.linkSystemLibrary(input, .{ .use_pkg_config = .no });
+        }
+    }
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -80,7 +90,6 @@ pub fn build(b: *std.Build) void {
     verifySha256(b, sdk_path, manifest_contract.fileSha256(manifest.value.files, "sdk/metacodes_agentcore.zig").?);
     verifySha256(b, protocol_path, manifest_contract.fileSha256(manifest.value.files, "sdk/metacodes_agentcore_protocol.zig").?);
     verifySha256(b, types_path, manifest_contract.fileSha256(manifest.value.files, "sdk/metacodes_agentcore_types.zig").?);
-    const link_libc = true;
 
     const types = b.createModule(.{ .root_source_file = .{ .cwd_relative = types_path }, .target = target, .optimize = optimize });
     const protocol = b.createModule(.{ .root_source_file = .{ .cwd_relative = protocol_path }, .target = target, .optimize = optimize });
@@ -92,49 +101,62 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("link_probe.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = link_libc,
     });
     zig_link_probe.addImport("metacodes_agentcore", sdk);
     zig_link_probe.addObjectFile(.{ .cwd_relative = lib_path });
+    applySystemLinkInputs(zig_link_probe, manifest.value.contract.required_system_link_inputs);
     const zig_link_exe = b.addExecutable(.{ .name = "agentcore-artifact-zig-link-probe", .root_module = zig_link_probe });
 
     const c_link_probe = b.createModule(.{
         .target = target,
         .optimize = optimize,
-        .link_libc = link_libc,
     });
     c_link_probe.addCSourceFile(.{ .file = b.path("link_probe.c"), .flags = &.{"-std=c11"} });
     c_link_probe.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ bundle_root, "include" }) });
     c_link_probe.addObjectFile(.{ .cwd_relative = lib_path });
+    applySystemLinkInputs(c_link_probe, manifest.value.contract.required_system_link_inputs);
     const c_link_exe = b.addExecutable(.{ .name = "agentcore-artifact-c-link-probe", .root_module = c_link_probe });
+
+    const cpp_link_probe = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+    });
+    cpp_link_probe.addCSourceFile(.{ .file = b.path("link_probe.cpp"), .flags = &.{"-std=c++17"} });
+    cpp_link_probe.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ bundle_root, "include" }) });
+    cpp_link_probe.addObjectFile(.{ .cwd_relative = lib_path });
+    applySystemLinkInputs(cpp_link_probe, manifest.value.contract.required_system_link_inputs);
+    const cpp_link_exe = b.addExecutable(.{ .name = "agentcore-artifact-cpp-link-probe", .root_module = cpp_link_probe });
+    const cpp_run = b.addRunArtifact(cpp_link_exe);
 
     const app = b.createModule(.{
         .root_source_file = b.path("main.zig"),
         .target = target,
         .optimize = optimize,
-        .link_libc = link_libc,
     });
     app.addImport("metacodes_agentcore", sdk);
     app.addObjectFile(.{ .cwd_relative = lib_path });
+    applySystemLinkInputs(app, manifest.value.contract.required_system_link_inputs);
     const exe = b.addExecutable(.{ .name = "agentcore-artifact-consumer", .root_module = app });
     const run = b.addRunArtifact(exe);
 
     const c_app = b.createModule(.{
         .target = target,
         .optimize = optimize,
-        .link_libc = link_libc,
     });
     c_app.addCSourceFile(.{ .file = b.path("consumer.c"), .flags = &.{"-std=c11"} });
     c_app.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ bundle_root, "include" }) });
     c_app.addObjectFile(.{ .cwd_relative = lib_path });
+    applySystemLinkInputs(c_app, manifest.value.contract.required_system_link_inputs);
     const c_exe = b.addExecutable(.{ .name = "agentcore-artifact-c-consumer", .root_module = c_app });
     const c_run = b.addRunArtifact(c_exe);
 
-    const link_step = b.step("link", "Link source-free Zig and C consumers without running them");
+    const link_step = b.step("link", "Link source-free Zig, C and C++ consumers");
     link_step.dependOn(&zig_link_exe.step);
     link_step.dependOn(&c_link_exe.step);
+    link_step.dependOn(&cpp_link_exe.step);
 
     const test_step = b.step("test", "Link and run using only the installed AgentCore bundle");
     test_step.dependOn(&run.step);
     test_step.dependOn(&c_run.step);
+    test_step.dependOn(&cpp_run.step);
 }

@@ -82,6 +82,8 @@ pub const fixed_artifact_files = [_][]const u8{
 };
 
 pub const bundle_directories = [_][]const u8{ "include", "lib", "sdk" };
+pub const default_system_link_inputs = [_][]const u8{"libc"};
+pub const windows_system_link_inputs = [_][]const u8{ "libc", "crypt32" };
 
 pub fn validateManifest(manifest: Manifest, expected: Expected) Error!void {
     if (manifest.schema_version != 1) return error.InvalidSchema;
@@ -103,9 +105,20 @@ pub fn validateManifest(manifest: Manifest, expected: Expected) Error!void {
     if (manifest.build.strip != expected.strip) return error.StripMismatch;
     if (manifest.contract.binary_abi_version != 1) return error.AbiMismatch;
     if (!std.mem.eql(u8, manifest.contract.ui_request_mode, "synchronous")) return error.UiModeMismatch;
-    if (manifest.contract.required_system_link_inputs.len != 1 or
-        !std.mem.eql(u8, manifest.contract.required_system_link_inputs[0], "libc"))
+    const expected_link_inputs: []const []const u8 = if (std.mem.eql(u8, expected.os, "windows"))
+        &windows_system_link_inputs
+    else
+        &default_system_link_inputs;
+    if (!equalStrings(manifest.contract.required_system_link_inputs, expected_link_inputs))
         return error.LinkInputsMismatch;
+}
+
+fn equalStrings(actual: []const []const u8, expected: []const []const u8) bool {
+    if (actual.len != expected.len) return false;
+    for (actual, expected) |left, right| {
+        if (!std.mem.eql(u8, left, right)) return false;
+    }
+    return true;
 }
 
 fn validateVersion(manifest: Manifest) Error!void {
@@ -219,7 +232,7 @@ fn validManifest() Manifest {
         },
         .contract = .{
             .binary_abi_version = 1,
-            .required_system_link_inputs = &.{"libc"},
+            .required_system_link_inputs = &default_system_link_inputs,
             .ui_request_mode = "synchronous",
         },
         .files = &valid_files,
@@ -257,6 +270,27 @@ test "manifest accepts target-neutral Linux build metadata" {
     expected.os = manifest.build.os;
     expected.abi = manifest.build.abi;
     try validateManifest(manifest, expected);
+}
+
+test "manifest requires target-specific system link inputs" {
+    var windows = validManifest();
+    windows.build.resolved_target = "x86_64-windows.win10...win11_dt-gnu";
+    windows.build.architecture = "x86_64";
+    windows.build.os = "windows";
+    windows.build.abi = "gnu";
+    windows.contract.required_system_link_inputs = &windows_system_link_inputs;
+    var expected = valid_expected;
+    expected.resolved_target = windows.build.resolved_target;
+    expected.architecture = windows.build.architecture;
+    expected.os = windows.build.os;
+    expected.abi = windows.build.abi;
+    try validateManifest(windows, expected);
+
+    windows.contract.required_system_link_inputs = &default_system_link_inputs;
+    try std.testing.expectError(error.LinkInputsMismatch, validateManifest(windows, expected));
+    const reversed = [_][]const u8{ "crypt32", "libc" };
+    windows.contract.required_system_link_inputs = &reversed;
+    try std.testing.expectError(error.LinkInputsMismatch, validateManifest(windows, expected));
 }
 
 test "release identity rejects dirty and wrong-commit bundles" {

@@ -229,6 +229,18 @@ pub fn build(b: *std.Build) void {
     agentcore_header_mod.addIncludePath(b.path("sdk"));
     const agentcore_header_obj = b.addObject(.{ .name = "agentcore-header-compile", .root_module = agentcore_header_mod });
     agentcore_test_step.dependOn(&agentcore_header_obj.step);
+    const agentcore_cpp_header_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    agentcore_cpp_header_mod.addCSourceFile(.{
+        .file = b.path("tests/agentcore_artifact_consumer/link_probe.cpp"),
+        .flags = &.{"-std=c++17"},
+    });
+    agentcore_cpp_header_mod.addIncludePath(b.path("sdk"));
+    const agentcore_cpp_header_obj = b.addObject(.{ .name = "agentcore-cpp-header-compile", .root_module = agentcore_cpp_header_mod });
+    agentcore_test_step.dependOn(&agentcore_cpp_header_obj.step);
     const agentcore_contract_mod = b.createModule(.{
         .root_source_file = b.path("tests/component/agentcore_abi_test.zig"),
         .target = target,
