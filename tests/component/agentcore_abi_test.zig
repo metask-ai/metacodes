@@ -3,6 +3,7 @@ const harness = @import("harness");
 const abi = @import("agentcore-abi");
 const sdk = @import("agentcore-sdk");
 const core = @import("metacodes-core");
+const sync = @import("platform").sync;
 const wire = sdk.types;
 
 const FINAL_SSE =
@@ -29,7 +30,42 @@ const HOST_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+/// Test Host registry implementing the consumer-side §4 contract. The binding
+/// is keyed by opaque Session handle, deep-copies session_id, and performs the
+/// first bind and every comparison under the same per-registry mutex.
+const HostIdentityRegistry = struct {
+    const Entry = struct {
+        session: ?*wire.SessionHandle = null,
+        len: u8 = 0,
+        bytes: [wire.MAX_SESSION_ID_BYTES_V1]u8 = undefined,
+    };
+
+    mutex: sync.Mutex = .{},
+    entries: [2]Entry = .{ .{}, .{} },
+
+    fn accept(self: *HostIdentityRegistry, session: *wire.SessionHandle, session_id: []const u8) bool {
+        if (session_id.len == 0 or session_id.len > wire.MAX_SESSION_ID_BYTES_V1) return false;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (&self.entries) |*entry| {
+            if (entry.session == session) {
+                return entry.len == session_id.len and std.mem.eql(u8, entry.bytes[0..entry.len], session_id);
+            }
+        }
+        for (&self.entries) |*entry| {
+            if (entry.session == null) {
+                entry.session = session;
+                entry.len = @intCast(session_id.len);
+                @memcpy(entry.bytes[0..session_id.len], session_id);
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
 const Probe = struct {
+    registry: HostIdentityRegistry = .{},
     expected_session: ?*wire.SessionHandle = null,
     expected_run_id: u64 = 1,
     ui_calls: usize = 0,
@@ -39,10 +75,11 @@ const Probe = struct {
     saw_tool_start: bool = false,
     saw_tool_result: bool = false,
 
-    fn context(self: *const Probe, run_ptr: ?*const wire.RunContextV1) ?sdk.RunContext {
+    fn context(self: *Probe, run_ptr: ?*const wire.RunContextV1) ?sdk.RunContext {
         const run = sdk.validateRunContext(run_ptr) catch return null;
         if (run.session != self.expected_session or run.run_id != self.expected_run_id or run.session_id.len != 24)
             return null;
+        if (!self.registry.accept(run.session, run.session_id)) return null;
         return run;
     }
 
@@ -601,6 +638,54 @@ test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
     session = null;
     try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
     runtime = null;
+}
+
+test "Host registry first identity binding is atomic under concurrent callbacks" {
+    const Worker = struct {
+        registry: *HostIdentityRegistry,
+        session: *wire.SessionHandle,
+        session_id: []const u8,
+        ready: *std.atomic.Value(u32),
+        start: *std.atomic.Value(bool),
+        accepted: bool = false,
+
+        fn run(self: *@This()) void {
+            _ = self.ready.fetchAdd(1, .acq_rel);
+            while (!self.start.load(.acquire)) std.Thread.yield() catch {};
+            self.accepted = self.registry.accept(self.session, self.session_id);
+        }
+    };
+    const Race = struct {
+        fn run(first_id: []const u8, second_id: []const u8) ![2]bool {
+            var session_storage: u8 = 0;
+            const session: *wire.SessionHandle = @ptrCast(&session_storage);
+            var registry = HostIdentityRegistry{};
+            var ready = std.atomic.Value(u32).init(0);
+            var start = std.atomic.Value(bool).init(false);
+            var first = Worker{ .registry = &registry, .session = session, .session_id = first_id, .ready = &ready, .start = &start };
+            var second = Worker{ .registry = &registry, .session = session, .session_id = second_id, .ready = &ready, .start = &start };
+            const first_thread = try std.Thread.spawn(.{}, Worker.run, .{&first});
+            errdefer {
+                start.store(true, .release);
+                first_thread.join();
+            }
+            const second_thread = try std.Thread.spawn(.{}, Worker.run, .{&second});
+            while (ready.load(.acquire) != 2) std.Thread.yield() catch {};
+            start.store(true, .release);
+            first_thread.join();
+            second_thread.join();
+            return .{ first.accepted, second.accepted };
+        }
+    };
+
+    const id_a = "000000000000000000000001";
+    const id_b = "000000000000000000000002";
+    for (0..64) |_| {
+        const same = try Race.run(id_a, id_a);
+        try std.testing.expect(same[0] and same[1]);
+        const competing = try Race.run(id_a, id_b);
+        try std.testing.expect(competing[0] != competing[1]);
+    }
 }
 
 test "L2 invalid UTF-8 Host tool result is released and does not poison Session" {

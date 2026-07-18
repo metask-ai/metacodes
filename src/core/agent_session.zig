@@ -1012,6 +1012,142 @@ test "Host UI requester failure aborts and poisons the active Run" {
     try std.testing.expectEqual(State.poisoned, self.state);
 }
 
+test "run-aware Host UI adapter snapshots identity and allows callback abort" {
+    const Probe = struct {
+        session: ?*AgentSession = null,
+        calls: usize = 0,
+        seen: ?RunIdentity = null,
+
+        fn request(
+            raw: *anyopaque,
+            identity: RunIdentity,
+            _: std.mem.Allocator,
+            _: *const ui_request.UiRequest,
+            _: *ui_request.UiResponse,
+        ) anyerror!ui_request.RequestOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.seen = identity;
+            try self.session.?.abort(identity.run_id, .user_interrupt);
+            return .unavailable;
+        }
+    };
+
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{"AskUserQuestion"} });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    var probe = Probe{};
+    const self = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"AskUserQuestion"},
+        .run_ui_requester = .{ .ctx = &probe, .requestFn = Probe.request },
+    });
+    defer self.destroy() catch unreachable;
+    probe.session = self;
+    const req = ui_request.UiRequest{ .permission = .{ .tool = "Write", .args = "{}" } };
+    var response: ui_request.UiResponse = undefined;
+
+    // Idle state is defensive failure and never enters Host code.
+    try std.testing.expectError(error.HostUiFailed, self.permission_ctx.ui_requester.?.request(
+        self.session_id,
+        std.testing.allocator,
+        &req,
+        &response,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+
+    var sink_probe = SinkProbe{};
+    const admitted = try self.beginRun(41, sink_probe.sink());
+    try std.testing.expectEqual(
+        ui_request.RequestOutcome.unavailable,
+        try self.permission_ctx.ui_requester.?.request(self.session_id, std.testing.allocator, &req, &response),
+    );
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(@as(u64, 41), probe.seen.?.run_id);
+    try std.testing.expectEqualSlices(u8, admitted.session_id.asSlice(), probe.seen.?.session_id.asSlice());
+    const completion = self.finishRunLifecycle();
+    try std.testing.expect(completion.abort_requested);
+    try std.testing.expect(!completion.callback_failed);
+    try std.testing.expectEqual(State.idle, self.state);
+}
+
+test "run-aware Host UI adapter rejects cross-Session identity and poisons only the target" {
+    const Probe = struct {
+        calls: usize = 0,
+
+        fn request(
+            raw: *anyopaque,
+            _: RunIdentity,
+            _: std.mem.Allocator,
+            _: *const ui_request.UiRequest,
+            _: *ui_request.UiResponse,
+        ) anyerror!ui_request.RequestOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return .unavailable;
+        }
+    };
+
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{"AskUserQuestion"} });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    var probe_a = Probe{};
+    var probe_b = Probe{};
+    const common = SessionConfig{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"AskUserQuestion"},
+    };
+    var config_a = common;
+    config_a.run_ui_requester = .{ .ctx = &probe_a, .requestFn = Probe.request };
+    const session_a = try runtime.createSession(config_a);
+    defer session_a.destroy() catch unreachable;
+    var config_b = common;
+    config_b.run_ui_requester = .{ .ctx = &probe_b, .requestFn = Probe.request };
+    const session_b = try runtime.createSession(config_b);
+    defer session_b.destroy() catch unreachable;
+
+    var sink_a = SinkProbe{};
+    _ = try session_a.beginRun(51, sink_a.sink());
+    const req = ui_request.UiRequest{ .permission = .{ .tool = "Write", .args = "{}" } };
+    var response: ui_request.UiResponse = undefined;
+    try std.testing.expectError(error.HostUiFailed, session_a.permission_ctx.ui_requester.?.request(
+        session_b.session_id,
+        std.testing.allocator,
+        &req,
+        &response,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), probe_a.calls);
+    try std.testing.expect(session_a.abort_signal.isAborted());
+    try std.testing.expectEqual(abort_mod.Reason.host_failure, session_a.abort_signal.reason());
+    const completion = session_a.finishRunLifecycle();
+    try std.testing.expect(completion.callback_failed);
+    try std.testing.expectEqual(State.poisoned, session_a.state);
+    try std.testing.expectEqual(State.idle, session_b.state);
+    try std.testing.expectEqual(@as(usize, 0), probe_b.calls);
+
+    // Poisoned state remains a defensive short circuit with no callback.
+    try std.testing.expectError(error.HostUiFailed, session_a.permission_ctx.ui_requester.?.request(
+        session_a.session_id,
+        std.testing.allocator,
+        &req,
+        &response,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), probe_a.calls);
+
+    var sink_b = SinkProbe{};
+    _ = try session_b.beginRun(1, sink_b.sink());
+    _ = session_b.finishRunLifecycle();
+    try std.testing.expectEqual(State.idle, session_b.state);
+}
+
 test "Workspace shell policy is an authority ceiling for Session tools" {
     const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{ "Read", "Bash" } });
     defer runtime.destroy() catch unreachable;
