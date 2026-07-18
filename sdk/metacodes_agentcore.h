@@ -8,8 +8,12 @@
 extern "C" {
 #endif
 
-/* ABI v1 is frozen. Bug/security fixes must preserve observable v1 behavior;
- * extensions require metacodes_agentcore_get_api(2) and v2 types. */
+/* ABI v1 is experimental; the 2026-07-17 freeze was retracted (see
+ * doc/AGENTCORE_BINARY_ABI.md Status). Re-freezing is gated on the open items
+ * in doc/AGENTCORE_V1_EXPERIMENTAL_LEDGER.md plus a reference-closure audit
+ * and a real-consumer gate. No stability promise: layouts and semantics may
+ * change incompatibly between commits. Pin an exact bundle; its manifest
+ * records the commit. */
 #define MC_AGENTCORE_ABI_V1 1u
 
 #define MC_STATUS_OK 0u

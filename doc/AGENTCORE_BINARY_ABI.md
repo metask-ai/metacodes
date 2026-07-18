@@ -4,14 +4,36 @@ The AgentCore bundle is a thin binary facade over the existing metacodes
 `AgentRuntime` / `AgentSession` / `AgentLoop`. Consumers do not add metacodes
 implementation source to their build graph, and the Host owns all UI.
 
-ABI v1 is the first stable in-process embedding contract for synchronous,
+ABI v1 is an experimental in-process embedding contract for synchronous,
 stateful AgentSession execution. It is not a generation label for
 `metacodes-core`, and it does not define a Workbench product model.
 
-**Status: frozen on 2026-07-17.** V1 layouts, numeric values, function-table
-order, ownership/lifecycle semantics, and protocol control messages are
-normative. Bug and security fixes must preserve observable v1 behavior; any
-extension requires `metacodes_agentcore_get_api(2)` and v2 types.
+**Status: experimental — freeze retracted on 2026-07-17.** V1 was frozen on
+2026-07-17 and unfrozen the same week: consumer feedback exposed a design gap
+in the callback identity surface (Host tools receive a `session_id`
+correlation key that no v1 API lets the Host obtain, and callbacks do not
+carry a unified admitted-Run context). Freezing a surface with a dangling
+reference was premature; retracting the label now, while exposure is minimal,
+was judged cheaper than carrying the flaw forever.
+
+While experimental, v1 makes no stability promise: layouts, numeric values,
+function-table order, and semantics may change incompatibly between commits.
+Consumers must pin an exact bundle (the manifest records the source commit)
+and treat every update as potentially breaking. No near-term re-freeze is
+planned.
+
+Re-freeze first requires closure of the open items tracked in
+`doc/AGENTCORE_V1_EXPERIMENTAL_LEDGER.md` (group A closed; every group B item
+with an explicit disposition, B1/B3 fixed or formally argued). Only then do
+the two independent gates apply:
+
+1. **Reference-closure audit** — every identifier, handle, or key the ABI
+   hands to the Host must have a documented way for the Host to obtain or
+   resolve it. Any dangling reference fails the audit.
+2. **Real-consumer gate** — at least one consumer not written by the library
+   authors exercises the claimed capability matrix (multiple concurrent
+   Sessions × runtime-level Host tools × cross-thread abort) against the
+   candidate surface.
 
 ## Build and verify
 

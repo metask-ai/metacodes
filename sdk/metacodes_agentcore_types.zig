@@ -1,7 +1,8 @@
-//! Stable declarations for the source-free AgentCore binary ABI v1.
+//! Declarations for the source-free AgentCore binary ABI v1 (experimental).
 
-/// ABI v1 is frozen. Bug/security fixes must preserve observable v1 behavior;
-/// extensions require `metacodes_agentcore_get_api(2)` and v2 types.
+/// ABI v1 is experimental; the 2026-07-17 freeze was retracted (see
+/// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
+/// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
 
 pub const Status = enum(u32) {

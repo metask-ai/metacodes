@@ -10,7 +10,8 @@
 这样做同时守住两个边界：
 
 - 安全边界：实现细节、依赖图和内部状态机不成为第三方可直接耦合的接口。
-- 兼容边界：Host 只依赖冻结的 C ABI v1 和独立的 AgentCore protocol v1，内部 Zig 类型可以继续演进。
+- 兼容边界：Host 只依赖 C ABI v1（**实验版**，冻结已于 2026-07-17 撤回、短期不复冻，见
+  `doc/AGENTCORE_BINARY_ABI.md` Status 节）和独立的 AgentCore protocol v1，内部 Zig 类型可以继续演进。
 
 仓库中的 `metacodes-core` module、`src/lib.zig`、`example/` 和 `zig build test:lib`
 仅用于 metacodes 自身的模块化、隔离验证与内部 dogfood。它们不是发行物，不承诺源码兼容，
@@ -109,5 +110,7 @@ GNU/COFF “理论上应该兼容”推导支持。
 - 发布必须使用显式 target 和新的空 prefix，避免旧文件污染 exact-file allowlist。
 - 正式 bundle 使用 `-Dagentcore-require-clean-bundle=true`，并用
   `-Dagentcore-expected-commit=<full hash>` 绑定源码身份。
-- ABI v1 已冻结。bug/security fix 必须保持 v1 可观察行为；任何扩展使用 v2 table/types。
+- ABI v1 为**实验版**：2026-07-17 的冻结已撤回（回调身份面存在悬空引用），短期不复冻，
+  复冻门槛见 `doc/AGENTCORE_BINARY_ABI.md` Status 节。实验期不承诺稳定：布局与语义可能
+  在 commit 间不兼容变更，消费者必须 pin 具体 bundle（manifest 记录源码 commit）。
 - 不向第三方分发或承诺 `metacodes-core` 源码 API。

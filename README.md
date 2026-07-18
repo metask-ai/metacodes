@@ -78,7 +78,7 @@ metacodes/
 第三方发行物，也不承诺源码兼容。交付布局、Windows 工具链边界与发布门禁见
 `doc/LIB_API.md`。
 
-C ABI(`sdk/metacodes_agentcore.h`)刻意只导出单入口 `metacodes_agentcore_get_api(abi_version)`,返回函数指针表(vtable):`runtime_create/destroy`、`session_create/destroy`、`session_run`(agent 循环)、`session_abort`、`buffer_release`。ABI v1 已于 2026-07-17 冻结，要求精确结构体大小与 reserved 全零；bug/security fix 必须保持 v1 可观察行为，任何扩展新增 v2 table，不能静默修改 v1。事件/UI JSON 由独立 AgentCore protocol v1 定义，不直接暴露内部 frontend/daemon `CoreEvent`；未知观察事件可忽略，UI/control 消息严格校验。完整契约见 `doc/AGENTCORE_BINARY_ABI.md`。
+C ABI(`sdk/metacodes_agentcore.h`)刻意只导出单入口 `metacodes_agentcore_get_api(abi_version)`,返回函数指针表(vtable):`runtime_create/destroy`、`session_create/destroy`、`session_run`(agent 循环)、`session_abort`、`buffer_release`。ABI v1 为实验版（2026-07-17 的冻结已撤回、短期不复冻，原因与复冻门槛见 `doc/AGENTCORE_BINARY_ABI.md` Status 节），要求精确结构体大小与 reserved 全零；实验期不承诺稳定，布局与语义可能不兼容变更，消费者应 pin 具体 bundle（manifest 记录源码 commit）。事件/UI JSON 由独立 AgentCore protocol v1 定义，不直接暴露内部 frontend/daemon `CoreEvent`；未知观察事件可忽略，UI/control 消息严格校验。完整契约见 `doc/AGENTCORE_BINARY_ABI.md`。
 
 ## 技术栈
 
