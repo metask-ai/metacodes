@@ -25,6 +25,7 @@ pub const Manifest = struct {
     },
     contract: struct {
         binary_abi_version: u32,
+        binary_abi_revision: u32,
         required_system_link_inputs: []const []const u8,
         ui_request_mode: []const u8,
     },
@@ -109,7 +110,8 @@ pub fn validateManifest(manifest: Manifest, expected: Expected) Error!void {
     if (!std.mem.eql(u8, manifest.build.abi, expected.abi)) return error.TargetAbiMismatch;
     if (!std.mem.eql(u8, manifest.build.optimize, expected.optimize)) return error.OptimizeMismatch;
     if (manifest.build.strip != expected.strip) return error.StripMismatch;
-    if (manifest.contract.binary_abi_version != 1) return error.AbiMismatch;
+    if (manifest.contract.binary_abi_version != 1 or manifest.contract.binary_abi_revision != 2)
+        return error.AbiMismatch;
     if (!std.mem.eql(u8, manifest.contract.ui_request_mode, "synchronous")) return error.UiModeMismatch;
     const expected_link_inputs: []const []const u8 = if (std.mem.eql(u8, expected.os, "windows"))
         &windows_system_link_inputs
@@ -238,6 +240,7 @@ fn validManifest() Manifest {
         },
         .contract = .{
             .binary_abi_version = 1,
+            .binary_abi_revision = 2,
             .required_system_link_inputs = &default_system_link_inputs,
             .ui_request_mode = "synchronous",
         },
@@ -336,6 +339,9 @@ test "manifest contract rejects toolchain target optimize and ABI drift" {
     try std.testing.expectError(error.StripMismatch, validateManifest(manifest, valid_expected));
     manifest = validManifest();
     manifest.contract.binary_abi_version = 2;
+    try std.testing.expectError(error.AbiMismatch, validateManifest(manifest, valid_expected));
+    manifest = validManifest();
+    manifest.contract.binary_abi_revision = 1;
     try std.testing.expectError(error.AbiMismatch, validateManifest(manifest, valid_expected));
 }
 

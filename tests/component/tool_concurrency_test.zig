@@ -52,7 +52,7 @@ test "L2 并发: 3 个 Glob safe 批并发执行,结果按原顺序回填" {
         .{ .decision = .run, .name = "Glob", .id = "t2", .input = "{\"pattern\":\"*.txt\",\"path\":\"/tmp/cc-conc/d2\"}" },
     };
     const ctx = cc.tool_context.ToolContext{ .allocator = a };
-    tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
+    try tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
     defer for (&slots) |*s| if (s.content) |c| a.free(c);
 
     // 每个 slot 拿到自己目录的结果(顺序未乱:t0→aaa,t1→bbb,t2→ccc)
@@ -71,7 +71,7 @@ test "L2 并发: denied slot 不执行,content 保留" {
     };
     defer for (&slots) |*s| if (s.content) |c| a.free(c);
     const ctx = cc.tool_context.ToolContext{ .allocator = a };
-    tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
+    try tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
     // denied 的 content 没被覆盖
     try std.testing.expectEqualStrings("{\"error\":\"denied\"}", slots[0].content.?);
     try std.testing.expect(slots[0].is_error);
@@ -84,7 +84,7 @@ test "L2 并发: unsafe 工具串行单跑(未知工具→错误,不崩)" {
     };
     defer for (&slots) |*s| if (s.content) |c| a.free(c);
     const ctx = cc.tool_context.ToolContext{ .allocator = a };
-    tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
+    try tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
     try std.testing.expect(slots[0].is_error);
     // P0.6:UnknownTool 错误现在附"does not exist + 可用工具清单"引导(而非旧的裸 "UnknownTool"),
     // 弱模型据此自纠。断言错误码(unknown_tool)在,且含引导文案 + 至少一个真工具名。
@@ -108,7 +108,7 @@ test "L2 并发: per-message 聚合预算(多大结果合计超 200k → 落盘�
     };
     defer for (&slots) |*s| if (s.content) |c| a.free(c);
     const ctx = cc.tool_context.ToolContext{ .allocator = a, .home_dir = "/tmp/cc-budget-home" };
-    tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
+    try tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
 
     // 合计 240k > 200k → 至少一个被落盘(preview)
     var persisted_count: usize = 0;
@@ -147,7 +147,7 @@ test "L2 并发: per-message 预算跳过 Read(防 Read→file→Read 环)" {
     };
     defer for (&slots) |*s| if (s.content) |c| a.free(c);
     const ctx = cc.tool_context.ToolContext{ .allocator = a, .home_dir = "/tmp/cc-budget-home2" };
-    tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
+    try tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
 
     // Read 结果未被落盘(仍是原始 90k 'R')
     try std.testing.expect(std.mem.indexOf(u8, slots[0].content.?, "\"persisted\":true") == null);

@@ -28,6 +28,7 @@ const Manifest = struct {
     },
     contract: struct {
         binary_abi_version: u32 = 1,
+        binary_abi_revision: u32 = 2,
         required_system_link_inputs: []const []const u8,
         ui_request_mode: []const u8 = "synchronous",
     },

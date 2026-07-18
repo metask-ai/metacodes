@@ -42,6 +42,17 @@ fn makeClient(a: std.mem.Allocator, io: std.Io, url: []const u8) cc.client_mod.C
     return cc.client_mod.Client.initWithBaseUrl(a, io, "test-key", "claude-3-5-haiku-20241022", url);
 }
 
+fn dispatchOk(ctx: *const cc.tools.ToolContext, name: []const u8, args: []const u8) ![]u8 {
+    var outcome = try cc.tools.dispatch(ctx, name, args);
+    return switch (outcome) {
+        .ok => |bytes| bytes,
+        else => {
+            outcome.deinit(ctx.allocator);
+            return error.UnexpectedDispatchOutcome;
+        },
+    };
+}
+
 test "L2: WebSearch 子请求带 forced tool_choice + server tool" {
     const a = std.testing.allocator;
 
@@ -56,7 +67,7 @@ test "L2: WebSearch 子请求带 forced tool_choice + server tool" {
     defer client.deinit();
 
     var ctx = cc.tools.ToolContext{ .allocator = a, .api_client = &client };
-    const out = cc.tools.dispatch(&ctx, "WebSearch", "{\"query\":\"zig language\"}") catch |e| {
+    const out = dispatchOk(&ctx, "WebSearch", "{\"query\":\"zig language\"}") catch |e| {
         std.debug.print("WebSearch dispatch failed: {s}\n", .{@errorName(e)});
         return error.SkipZigTest;
     };
@@ -91,7 +102,7 @@ test "L2: WebSearch content:[] 时靠模型摘要作答(非 no-results)" {
     defer client.deinit();
 
     var ctx = cc.tools.ToolContext{ .allocator = a, .api_client = &client };
-    const out = cc.tools.dispatch(&ctx, "WebSearch", "{\"query\":\"q\"}") catch return error.SkipZigTest;
+    const out = dispatchOk(&ctx, "WebSearch", "{\"query\":\"q\"}") catch return error.SkipZigTest;
     defer a.free(out);
 
     try std.testing.expect(std.mem.indexOf(u8, out, "Summary from model only.") != null);
@@ -137,7 +148,7 @@ test "L2: WebSearch 两阶段驱动 progress 回调(query_update + results_recei
         .api_client = &client,
         .progress_reporter = .{ .ctx = @ptrCast(&dummy), .reportFn = &ProgressCapture.cb },
     };
-    const out = cc.tools.dispatch(&ctx, "WebSearch", "{\"query\":\"zig language\"}") catch return error.SkipZigTest;
+    const out = dispatchOk(&ctx, "WebSearch", "{\"query\":\"zig language\"}") catch return error.SkipZigTest;
     defer a.free(out);
 
     // 应至少有 query_update + results_received 两个 phase。

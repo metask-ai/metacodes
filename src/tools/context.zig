@@ -112,6 +112,65 @@ pub const ToolProgressReporter = struct {
     }
 };
 
+/// Admission-fixed Run identity, passed by value down the execution chain.
+/// Immutable for the duration of one Run; never looked up from mutable state.
+pub const RunIdentity = struct {
+    session_id: @import("../core/session_id.zig").SessionId,
+    run_id: u64,
+};
+
+/// Library-internal identity for Host tool execution. `host_session_ctx` is a
+/// type-erased anchor owned by whichever adapter registered it (the ABI facade
+/// registers its AbiSession); core only forwards it and never dereferences.
+/// Deliberately NOT named `session_ctx` (public callback ctx) nor
+/// `abi_session_ctx` (core must not name its consumers).
+pub const HostRunIdentity = struct {
+    identity: RunIdentity,
+    host_session_ctx: *anyopaque,
+};
+
+/// Typed dispatch boundary result. Slices are owned by `tool_ctx.allocator`
+/// (NOT implicitly an arena: ToolDispatcher is an independently callable core
+/// interface; tool_exec's arena caller merely degenerates deinit to arena
+/// lifetime). Callers release via `deinit(allocator)`.
+pub const ToolDispatchOutcome = union(enum) {
+    ok: []u8,
+    host_failed: ?[]u8,
+    host_rejected: ?[]u8,
+    host_fatal,
+
+    /// Frees owned slices and poisons the union; a second deinit is a bug and
+    /// must trap in Debug rather than silently double-free.
+    pub fn deinit(self: *ToolDispatchOutcome, allocator: std.mem.Allocator) void {
+        switch (self.*) {
+            .ok => |bytes| allocator.free(bytes),
+            .host_failed, .host_rejected => |maybe| if (maybe) |bytes| allocator.free(bytes),
+            .host_fatal => {},
+        }
+        self.* = undefined;
+    }
+};
+
+test "ToolDispatchOutcome.deinit releases every owned payload branch" {
+    const allocator = std.testing.allocator;
+
+    var ok: ToolDispatchOutcome = .{ .ok = try allocator.dupe(u8, "ok") };
+    ok.deinit(allocator);
+
+    var failed_detail: ToolDispatchOutcome = .{ .host_failed = try allocator.dupe(u8, "failed") };
+    failed_detail.deinit(allocator);
+    var failed_empty: ToolDispatchOutcome = .{ .host_failed = null };
+    failed_empty.deinit(allocator);
+
+    var rejected_detail: ToolDispatchOutcome = .{ .host_rejected = try allocator.dupe(u8, "rejected") };
+    rejected_detail.deinit(allocator);
+    var rejected_empty: ToolDispatchOutcome = .{ .host_rejected = null };
+    rejected_empty.deinit(allocator);
+
+    var fatal: ToolDispatchOutcome = .host_fatal;
+    fatal.deinit(allocator);
+}
+
 /// Session-scoped tool directory used by embedders. The directory owns the
 /// advertised definitions and routes execution back to the exact selected
 /// entry, so a provider cannot escape a Session allowlist through the global
@@ -119,11 +178,15 @@ pub const ToolProgressReporter = struct {
 /// process registry below `tools.zig`.
 pub const ToolDispatcher = struct {
     ctx: *const anyopaque,
-    dispatchFn: *const fn (ctx: *const anyopaque, tool_ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror![]u8,
+    dispatchFn: *const fn (ctx: *const anyopaque, tool_ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror!ToolDispatchOutcome,
     prefetchSafeFn: *const fn (ctx: *const anyopaque, name: []const u8) bool,
     nameAtFn: *const fn (ctx: *const anyopaque, index: usize) ?[]const u8,
+    /// Explicit concurrency metadata: host_sync entries are declared
+    /// concurrency-capable by executor kind (shipped header contract), never
+    /// guessed from tool names.
+    hostSyncFn: *const fn (ctx: *const anyopaque, name: []const u8) bool,
 
-    pub fn dispatch(self: ToolDispatcher, tool_ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror![]u8 {
+    pub fn dispatch(self: ToolDispatcher, tool_ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror!ToolDispatchOutcome {
         return self.dispatchFn(self.ctx, tool_ctx, name, args);
     }
 
@@ -133,6 +196,10 @@ pub const ToolDispatcher = struct {
 
     pub fn nameAt(self: ToolDispatcher, index: usize) ?[]const u8 {
         return self.nameAtFn(self.ctx, index);
+    }
+
+    pub fn isHostSync(self: ToolDispatcher, name: []const u8) bool {
+        return self.hostSyncFn(self.ctx, name);
     }
 };
 
@@ -204,6 +271,9 @@ pub const ToolContext = struct {
     explicit_invocation: bool = false,
     /// 当前 session id(${CLAUDE_SESSION_ID} 替换 + 日志相关)。
     session_id: []const u8 = "",
+    /// Host tool 执行身份(admission 处固定,经 opts 显式传值)。可选字段 + null 默认:
+    /// 共享基础设施扩展规则——非 Host-tool 消费者(TUI/普通 loop/单测)零感知。
+    host_run: ?HostRunIdentity = null,
     /// 本 agent loop 的**对外身份**(全局唯一,程序注入):KG claim 租约等跨进程/跨 loop
     /// 协调用。与 `session`(UI 事件路由键)是不同概念——主 loop 两者恰好同值
     /// (App.session_id,跨进程唯一:ms 时戳+monotonic ns);subagent 每次 spawn 独立
@@ -277,8 +347,6 @@ pub const ToolContext = struct {
     /// - approve_accept_edits:批准并自动接受编辑 → 切 accept_edits。
     /// - reject:留在 plan 模式,模型继续打磨计划(不执行)。
     pub const PlanApproval = enum { approve_default, approve_accept_edits, reject };
-
-
     /// 工具进度阶段(对齐 cc WebSearchProgress 两态)。
     pub const ProgressPhase = enum { query_update, results_received };
 

@@ -31,6 +31,27 @@ pub fn borrowedBytes(view: types.BytesViewV1) error{InvalidBytesView}![]const u8
     return (view.ptr orelse return error.InvalidBytesView)[0..len];
 }
 
+pub const RunContext = struct {
+    session: *types.SessionHandle,
+    run_id: u64,
+    session_id: []const u8,
+};
+
+/// Validation order is part of the ABI defense: bound the Host-provided length
+/// before constructing a slice from its pointer.
+pub fn validateRunContext(raw: ?*const types.RunContextV1) error{InvalidRunContext}!RunContext {
+    const run = raw orelse return error.InvalidRunContext;
+    if (run.struct_size != @sizeOf(types.RunContextV1) or run.reserved0 != 0 or
+        run.session == null or run.run_id == 0 or !allZero(run.reserved))
+        return error.InvalidRunContext;
+    if (run.session_id.len == 0 or run.session_id.len > types.MAX_SESSION_ID_BYTES_V1)
+        return error.InvalidRunContext;
+    const len: usize = @intCast(run.session_id.len);
+    const bytes = (run.session_id.ptr orelse return error.InvalidRunContext)[0..len];
+    if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidRunContext;
+    return .{ .session = run.session.?, .run_id = run.run_id, .session_id = bytes };
+}
+
 pub const Api = struct {
     raw: *const types.ApiV1,
 
@@ -40,7 +61,11 @@ pub const Api = struct {
     }
 
     pub fn validate(raw: *const types.ApiV1) error{UnsupportedAbi}!Api {
-        if (raw.struct_size != @sizeOf(types.ApiV1) or raw.abi_version != types.ABI_VERSION_V1 or
+        // Offsets 0..7 are the stable discovery prefix. Never read revision or
+        // later fields from a legacy 104-byte table before the exact size check.
+        if (raw.struct_size != @sizeOf(types.ApiV1) or raw.abi_version != types.ABI_VERSION_V1)
+            return error.UnsupportedAbi;
+        if (raw.abi_revision != types.ABI_REVISION or raw.reserved0 != 0 or
             raw.capabilities & types.REQUIRED_CAPABILITIES_V1 != types.REQUIRED_CAPABILITIES_V1 or
             !allZero(raw.reserved) or
             raw.runtime_create == null or raw.runtime_destroy == null or raw.session_create == null or
@@ -82,4 +107,35 @@ const std = @import("std");
 test "SDK rejects incomplete API tables" {
     var raw: types.ApiV1 = std.mem.zeroes(types.ApiV1);
     try std.testing.expectError(error.UnsupportedAbi, Api.validate(&raw));
+}
+
+test "RunContext validator bounds length before pointer slicing" {
+    var session_byte: u8 = 0;
+    const session: *types.SessionHandle = @ptrCast(&session_byte);
+    var run = std.mem.zeroes(types.RunContextV1);
+    run.struct_size = @sizeOf(types.RunContextV1);
+    run.session = session;
+    run.run_id = 9;
+    run.session_id = .{ .ptr = null, .len = std.math.maxInt(u64) };
+    try std.testing.expectError(error.InvalidRunContext, validateRunContext(&run));
+
+    const id = "0123456789abcdef01234567";
+    run.session_id = bytesView(id);
+    const valid = try validateRunContext(&run);
+    try std.testing.expectEqual(@as(u64, 9), valid.run_id);
+    try std.testing.expectEqualStrings(id, valid.session_id);
+}
+
+test "SDK rejects legacy pre-revision API size from the stable prefix" {
+    const LegacyApi = extern struct {
+        struct_size: u32,
+        abi_version: u32,
+        capabilities: u64,
+        tail: [88]u8,
+    };
+    var legacy = std.mem.zeroes(LegacyApi);
+    legacy.struct_size = 104;
+    legacy.abi_version = types.ABI_VERSION_V1;
+    const raw: *const types.ApiV1 = @ptrCast(&legacy);
+    try std.testing.expectError(error.UnsupportedAbi, Api.validate(raw));
 }

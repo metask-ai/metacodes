@@ -4,14 +4,53 @@ The AgentCore bundle is a thin binary facade over the existing metacodes
 `AgentRuntime` / `AgentSession` / `AgentLoop`. Consumers do not add metacodes
 implementation source to their build graph, and the Host owns all UI.
 
-ABI v1 is the first stable in-process embedding contract for synchronous,
+ABI v1 is an experimental in-process embedding contract for synchronous,
 stateful AgentSession execution. It is not a generation label for
 `metacodes-core`, and it does not define a Workbench product model.
 
-**Status: frozen on 2026-07-17.** V1 layouts, numeric values, function-table
-order, ownership/lifecycle semantics, and protocol control messages are
-normative. Bug and security fixes must preserve observable v1 behavior; any
-extension requires `metacodes_agentcore_get_api(2)` and v2 types.
+**Status: experimental — freeze retracted on 2026-07-17.** V1 was frozen on
+2026-07-17 and unfrozen the same week: consumer feedback exposed a design gap
+in the callback identity surface (Host tools receive a `session_id`
+correlation key that no v1 API lets the Host obtain, and callbacks do not
+carry a unified admitted-Run context). Freezing a surface with a dangling
+reference was premature; retracting the label now, while exposure is minimal,
+was judged cheaper than carrying the flaw forever.
+
+While experimental, v1 makes no stability promise: layouts, numeric values,
+function-table order, and semantics may change incompatibly between commits.
+Consumers must pin an exact bundle (the manifest records the source commit)
+and treat every update as potentially breaking. No near-term re-freeze is
+planned.
+
+The current experimental bundle is **ABI v1 revision 2**. Revision 2 is an
+in-place breaking supplement to the withdrawn pre-revision 104-byte table:
+
+- `mc_agentcore_api_v1` is 112 bytes and adds `abi_revision == 2`;
+- event, UI, and Host-tool callbacks receive `const mc_run_context_v1 *`;
+- `MC_CALLBACK_*` was removed in favor of `MC_EVENT_*` (no aliases);
+- Host tools may return `MC_HOST_FATAL` and FAILED/REJECTED detail;
+- `manifest.json` records `binary_abi_revision: 2`.
+
+Consumers migrating from the pre-revision bundle must update the header and
+library atomically, validate the stable `struct_size`/`abi_version` prefix
+before reading later fields, then require exact revision equality. A 104-byte
+table and a 112-byte table with any revision other than 2 are both rejected;
+there is no compatibility fallback. Every per-Run callback must validate and
+copy any retained `RunContext` fields during the callback, and Host registries
+must bind/compare `session_id` atomically under their per-Session lock.
+
+Re-freeze first requires closure of the open items tracked in
+`doc/AGENTCORE_V1_EXPERIMENTAL_LEDGER.md` (every group A item closed; every
+group B item given an explicit disposition, with B1/B3 fixed or formally
+argued). Only then do the two independent gates apply:
+
+1. **Reference-closure audit** — every identifier, handle, or key the ABI
+   hands to the Host must have a documented way for the Host to obtain or
+   resolve it. Any dangling reference fails the audit.
+2. **Real-consumer gate** — at least one consumer not written by the library
+   authors exercises the claimed capability matrix (multiple concurrent
+   Sessions × runtime-level Host tools × cross-thread abort) against the
+   candidate surface.
 
 ## Build and verify
 
@@ -186,6 +225,16 @@ not a new public stop code. Because the stateful Run may already have committed
 Conversation changes, that failure poisons the ABI facade and subsequent Run or
 abort calls return `MC_STATUS_INVALID_STATE`; destroy remains valid.
 
+The synchronous `session_run` return is a quiescence boundary: every callback
+started for that Run, and every paired release callback for its Host-owned
+outputs, has completed before the call returns. Callbacks from the next Run on
+the same Session therefore cannot overlap callbacks from the completed Run.
+The facade keeps the Session call gate through result/diagnostic publication;
+an overlapping Run or destroy returns `MC_STATUS_BUSY`. Releasing that gate is
+the completion linearization point, after which the completed call no longer
+reads Session storage and destroy may free it. Matching `session_abort` bypasses
+this gate so it can remain useful while the synchronous Run is active.
+
 `run_id` is a non-zero `uint64_t` Run identifier assigned by the Host and
 scoped to one Session. Each admitted Run must have a `run_id` strictly greater
 than that of the previously admitted Run in the same Session. Values need not
@@ -197,6 +246,16 @@ value strictly greater than the last admitted ID therefore remains available
 for retry; zero and stale values do not become valid through retry. After
 admitting `UINT64_MAX`, the Session cannot admit another Run and the Host must
 create a new Session.
+
+Every per-Run callback receives a borrowed `mc_run_context_v1`. Its `session`
+is the original public Session handle, its `run_id` is the admitted Run ID, and
+its non-empty `session_id` is stable for that Session's lifetime and distinct
+from every other live Session. The context and its `session_id` bytes are valid
+only until that callback returns. A Host that retains identity must deep-copy
+the bytes; pointer identity across callbacks is never promised. A shared Host
+registry must bind the first observed ID and compare all later IDs atomically
+under the same per-Session lock. A missing/invalid ID, unknown Session handle,
+wrong active Run ID, or binding mismatch is a fatal callback-channel failure.
 
 Run admission is the lifecycle boundary. Validation failures
 (`MC_STATUS_INVALID_ARGUMENT` / `MC_STATUS_RESOURCE_LIMIT`) and admission
@@ -243,6 +302,8 @@ paths remain usable unless the Host selects and configures a separate sandbox
 policy. Invalid workspace paths, unavailable/duplicate selected tools, and a
 shell tool selected under the disabled shell policy fail Session creation with
 `MC_STATUS_INVALID_ARGUMENT` and do not publish a Session handle.
+`workspace_home` may be empty, in which case it defaults to the canonicalized
+`workspace_root`; a non-empty value must be absolute.
 
 ABI v1 has three ownership classes:
 
@@ -253,9 +314,11 @@ ABI v1 has three ownership classes:
 | AgentCore API diagnostics | Library-owned write-only output | Released only with the discovered `buffer_release` function |
 
 Status controls whether callback output is consumed, not whether it is
-released. Only `MC_HOST_OK` consumes Host tool text and only `MC_UI_ANSWERED`
-consumes UI response JSON; output returned with any other status is ignored.
-No callback or release callback has thread affinity.
+released. `MC_HOST_OK` consumes success text. `MC_HOST_FAILED` and
+`MC_HOST_REJECTED` may consume UTF-8 detail for a model-visible ordinary tool
+error; `MC_HOST_FATAL` and unknown Host status codes ignore output after its
+mandatory release and poison the Session. Only `MC_UI_ANSWERED` consumes UI
+response JSON. No callback or release callback has thread affinity.
 
 The final `mc_owned_bytes_v1 *` argument on AgentCore API calls is an optional,
 write-only diagnostic output. AgentCore never reads or releases its previous
@@ -265,23 +328,26 @@ empty. Diagnostic allocation is best-effort and never changes the primary
 operation status. Host-owned callback output must never be passed to
 `buffer_release`.
 
-Host tool `execute` receives two borrowed views: the current AgentSession
-identifier and the provider-produced tool arguments JSON. Neither remains valid
-after the callback returns.
+Host tool `execute` receives a borrowed `RunContext` and the provider-produced
+tool arguments JSON. The context, its `session_id` view, and arguments view do
+not remain valid after the callback returns.
 
 ### Callback and concurrency matrix
 
 | Path | Concurrency/ordering | Failure semantics |
 |---|---|---|
-| `on_event` | Serialized within one Session; different Sessions may call shared Host state concurrently | Any value other than `MC_CALLBACK_CONTINUE` aborts the Run and poisons the Session |
-| Host tool `execute` | Different Sessions and parallel tool calls in one Session may invoke it concurrently | `MC_HOST_FAILED`/`MC_HOST_REJECTED` becomes a normal tool result and does not by itself poison the Session |
-| `on_ui_request` | Synchronous in the Run path | Fatal, invalid, mismatched, or oversized responses abort the Run and poison the Session |
+| `on_event` | Serialized within one Session; different Sessions may call shared Host state concurrently | Any value other than `MC_EVENT_CONTINUE` aborts the Run and poisons the Session |
+| Host tool `execute` | Different Sessions and parallel tool calls in one Session may invoke it concurrently | `MC_HOST_FAILED`/`MC_HOST_REJECTED` becomes a normal tool result; `MC_HOST_FATAL` aborts and poisons without a model-visible tool result |
+| `on_ui_request` | Synchronous in the Run path | `MC_UI_UNAVAILABLE` is an ordinary reusable outcome; fatal/unknown status or invalid, mismatched, or oversized response aborts and poisons |
 | release callbacks | Exactly once for every accepted Host-owned buffer; no thread affinity | Must not re-enter Run or destroy |
 | `session_abort` | May run concurrently with the matching synchronous Run, including from a callback | Cooperative; callback or provider code that blocks can delay completion |
 
-Callbacks may request abort but must not re-enter Run or destroy. The Host must
-serialize create/destroy and all operations other than matching abort on the
-same handle.
+Callbacks may request abort. A callback attempt to re-enter Run or destroy on
+the same handle returns `MC_STATUS_BUSY`; callers must not spin or wait for that
+operation from inside the callback. The Host must serialize create/destroy and
+all operations other than matching abort on the same handle. C++ exceptions,
+`longjmp`, and other non-local control transfers must never cross an AgentCore
+callback or release-callback boundary.
 
 ABI v1 UI response JSON is one of:
 
@@ -310,7 +376,8 @@ advertised with missing state.
 
 ### Resource limits
 
-V1 limits only Host inputs that amplify library allocations or unbounded work:
+V1 applies these limits to inputs or identities that amplify library
+allocations or unbounded work:
 
 | Limit | Value |
 |---|---:|
@@ -319,7 +386,9 @@ V1 limits only Host inputs that amplify library allocations or unbounded work:
 | Host tool schema nesting | 32 levels |
 | top-level schema properties/required entries | 1024 |
 | one synchronous UI response | 1 MiB |
-| one Host tool result | 16 MiB |
+| one raw Host tool success result or failure/rejection detail | 16 MiB |
+| one encoded model-visible Host tool error payload | 1 MiB |
+| one Session ID | 64 bytes |
 | one Runtime/Session metadata string | 1 MiB |
 | total Runtime metadata | 16 MiB |
 | total Session metadata | 4 MiB |
@@ -343,6 +412,17 @@ becomes an ordinary Host tool failure. Binary output requires an explicit
 textual encoding such as base64 or a future attachment contract; arbitrary
 bytes must not be smuggled through JSON strings.
 
+FAILED/REJECTED detail enters structured JSON only through AgentCore's
+serializer. After decoding that JSON, the detail equals the Host's original
+UTF-8 text, including quotes, backslashes, newlines, and control characters.
+The 1 MiB error-payload limit is measured after escaping and serialization. If
+the complete encoded payload would exceed it, AgentCore releases the Host
+buffer and emits a bounded generic ordinary tool error instead; this does not
+upgrade the outcome to fatal. Hosts must not place credentials in detail.
+An encoded Host error payload is semantic model input: generic tool-result
+persistence and per-message bulk-result budgets must not replace it with a
+persisted or truncated envelope.
+
 All empty `mc_owned_bytes_v1` values use the canonical `{NULL, 0}` form. Host
 UI fatal/invalid responses are infrastructure failures: they abort the active
 Run, poison the Session, and surface as `MC_STATUS_CALLBACK_FAILED` (or
@@ -361,16 +441,25 @@ reliable automatic classification.
 ### ABI evolution
 
 All v1 POD descriptors and the API table require their exact documented
-`struct_size`; every reserved field must be zero. Reserved storage is not
-permission to extend v1 layouts. Any layout, function-table, or control-message
-extension requires `metacodes_agentcore_get_api(2)` and v2 types.
+`struct_size`; every reserved field must be zero. During the current unfrozen
+experimental period, a breaking v1 bundle increments `abi_revision` and
+consumers accept only the exact revision they were built against. Reserved
+storage is not permission to infer compatibility. After v1 is genuinely
+re-frozen, later layout, function-table, or control-message extensions require
+`metacodes_agentcore_get_api(2)` and v2 types.
+
+Revision 2's published POD offsets and sizes require a 64-bit pointer ABI.
+The header rejects 32-bit consumers at compile time; a future 32-bit contract
+would need separately specified layouts and consumer gates.
 
 `capabilities` reports the API surface implemented by the returned library
 table. It is not per-Runtime or per-Session negotiation; concrete Runtime and
 Session configuration still determines which tools and callbacks are active.
 
 ABI v1 deliberately does not add session persistence/restore, asynchronous UI
-continuations, background operations, resume/checkpoint, strict Workspace
+continuations, ABI-level asynchronous operations, resume/checkpoint, strict Workspace
 security, Workbench `Output`/`FileChange`/plan-progress models, or a
 multi-platform universal bundle. Those are separate contracts, not hidden
-behavior in the library facade.
+behavior in the library facade. This does not remove Bash's existing
+tool-managed background jobs, which remain reachable synchronously through
+`Bash`, `BashOutput`, and `KillShell`.

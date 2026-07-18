@@ -307,6 +307,7 @@ pub fn build(b: *std.Build) void {
     agentcore_contract_mod.addImport("agentcore-abi", agentcore_abi_mod);
     agentcore_contract_mod.addImport("agentcore-sdk", agentcore_sdk_mod);
     agentcore_contract_mod.addImport("metacodes-core", core_mod);
+    addPlatform(b, agentcore_contract_mod);
     const agentcore_contract_test = b.addTest(.{ .name = "agentcore-abi-contract", .root_module = agentcore_contract_mod });
     agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_contract_test, windows_test_prelude).step);
 

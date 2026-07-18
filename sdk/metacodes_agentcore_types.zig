@@ -1,8 +1,15 @@
-//! Stable declarations for the source-free AgentCore binary ABI v1.
+//! Declarations for the source-free AgentCore binary ABI v1 (experimental).
 
-/// ABI v1 is frozen. Bug/security fixes must preserve observable v1 behavior;
-/// extensions require `metacodes_agentcore_get_api(2)` and v2 types.
+/// ABI v1 is experimental; the 2026-07-17 freeze was retracted (see
+/// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
+/// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
+pub const ABI_REVISION: u32 = 2;
+
+comptime {
+    if (@sizeOf(usize) != 8)
+        @compileError("AgentCore ABI v1 revision 2 requires a 64-bit pointer ABI");
+}
 
 pub const Status = enum(u32) {
     ok = 0,
@@ -100,19 +107,22 @@ pub const MAX_TOOL_SCHEMA_DEPTH_V1: u32 = 32;
 pub const MAX_TOOL_SCHEMA_PROPERTIES_V1: u64 = 1024;
 pub const MAX_UI_RESPONSE_BYTES_V1: u64 = 1024 * 1024;
 pub const MAX_HOST_TOOL_RESULT_BYTES_V1: u64 = 16 * 1024 * 1024;
+pub const MAX_TOOL_ERROR_PAYLOAD_BYTES_V1: u64 = 1024 * 1024;
+pub const MAX_SESSION_ID_BYTES_V1: u64 = 64;
 pub const MAX_METADATA_STRING_BYTES_V1: u64 = 1024 * 1024;
 pub const MAX_RUNTIME_METADATA_BYTES_V1: u64 = 16 * 1024 * 1024;
 pub const MAX_SESSION_METADATA_BYTES_V1: u64 = 4 * 1024 * 1024;
 pub const MAX_TURNS_V1: u32 = 1000;
 
-pub const CALLBACK_CONTINUE: u32 = 0;
-pub const CALLBACK_FATAL: u32 = 1;
+pub const EVENT_CONTINUE: u32 = 0;
+pub const EVENT_FATAL: u32 = 1;
 pub const UI_ANSWERED: u32 = 0;
 pub const UI_UNAVAILABLE: u32 = 1;
 pub const UI_FATAL: u32 = 2;
 pub const HOST_OK: u32 = 0;
 pub const HOST_FAILED: u32 = 1;
 pub const HOST_REJECTED: u32 = 2;
+pub const HOST_FATAL: u32 = 3;
 
 pub const CAP_RUNTIME: u64 = 1 << 0;
 pub const CAP_BUILTIN_TOOLS: u64 = 1 << 1;
@@ -138,14 +148,28 @@ pub const OwnedBytesV1 = extern struct {
     len: u64,
 };
 
+/// Borrowed identity tuple for one admitted Run. A fresh stack-local value may
+/// be used for each callback; consumers compare fields, never pointer identity.
+pub const RunContextV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    session: ?*SessionHandle,
+    run_id: u64,
+    session_id: BytesViewV1,
+    reserved: [2]u64,
+};
+
 /// Canonical empty has no release token. Every other Host callback descriptor
 /// is passed to its paired release function exactly once, independent of the
 /// callback status. Host owns `host_ctx` through successful Runtime destroy;
-/// `session_id` and provider-produced `arguments_json` are borrowed for the
-/// callback. Only a HOST_OK result is consumed as UTF-8 text.
+/// `run`, its `session_id`, and provider-produced `arguments_json` are borrowed
+/// for the callback. HOST_OK carries result text; HOST_FAILED/HOST_REJECTED may
+/// carry up to MAX_HOST_TOOL_RESULT_BYTES_V1 of raw error detail, which is
+/// subject to MAX_TOOL_ERROR_PAYLOAD_BYTES_V1 after serialization. HOST_FATAL
+/// and unknown codes are fatal.
 pub const HostExecuteFnV1 = *const fn (
     host_ctx: ?*anyopaque,
-    session_id: BytesViewV1,
+    run: ?*const RunContextV1,
     arguments_json: BytesViewV1,
     out_result: ?*OwnedBytesV1,
 ) callconv(.c) u32;
@@ -180,15 +204,14 @@ pub const RuntimeConfigV1 = extern struct {
 /// Different Sessions may call the same function concurrently.
 pub const OnEventFnV1 = *const fn (
     session_ctx: ?*anyopaque,
-    session: ?*SessionHandle,
-    run_id: u64,
+    run: ?*const RunContextV1,
     event_json: BytesViewV1,
 ) callconv(.c) u32;
 /// ABI v1 UI requests are synchronous. Only UI_ANSWERED consumes the JSON;
 /// descriptor ownership follows the same status-independent rule above.
 pub const OnUiRequestFnV1 = *const fn (
     session_ctx: ?*anyopaque,
-    session: ?*SessionHandle,
+    run: ?*const RunContextV1,
     request_json: BytesViewV1,
     out_response: ?*OwnedBytesV1,
 ) callconv(.c) u32;
@@ -284,6 +307,8 @@ pub const BufferReleaseFnV1 = *const fn (?*OwnedBytesV1) callconv(.c) void;
 pub const ApiV1 = extern struct {
     struct_size: u32,
     abi_version: u32,
+    abi_revision: u32,
+    reserved0: u32,
     capabilities: u64,
     runtime_create: ?RuntimeCreateFnV1,
     runtime_destroy: ?RuntimeDestroyFnV1,
@@ -299,18 +324,24 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     const std = @import("std");
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(BytesViewV1));
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(OwnedBytesV1));
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(RunContextV1));
     try std.testing.expectEqual(@as(usize, 96), @sizeOf(HostToolV1));
     try std.testing.expectEqual(@as(usize, 72), @sizeOf(RuntimeConfigV1));
     try std.testing.expectEqual(@as(usize, 72), @sizeOf(SessionCallbacksV1));
     try std.testing.expectEqual(@as(usize, 144), @sizeOf(SessionConfigV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(RunOptionsV1));
     try std.testing.expectEqual(@as(usize, 48), @sizeOf(RunResultV1));
-    try std.testing.expectEqual(@as(usize, 104), @sizeOf(ApiV1));
+    try std.testing.expectEqual(@as(usize, 112), @sizeOf(ApiV1));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(RunContextV1, "session"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(RunContextV1, "run_id"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(RunContextV1, "session_id"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(HostToolV1, "ctx"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(SessionConfigV1, "api_key"));
     try std.testing.expectEqual(@as(usize, 96), @offsetOf(SessionConfigV1, "allowed_tools"));
-    try std.testing.expectEqual(@as(usize, 16), @offsetOf(ApiV1, "runtime_create"));
-    try std.testing.expectEqual(@as(usize, 48), @offsetOf(ApiV1, "session_run"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(ApiV1, "abi_revision"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(ApiV1, "capabilities"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(ApiV1, "runtime_create"));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(ApiV1, "session_run"));
 }
 
 test "typed status and stop reason validate every public code" {
