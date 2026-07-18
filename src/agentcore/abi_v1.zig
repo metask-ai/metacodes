@@ -1,6 +1,8 @@
 //! Thin C ABI v1 facade over AgentRuntime and AgentSession.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const sync = @import("platform").sync;
 const wire = @import("metacodes_agentcore_types");
 const core = @import("metacodes-core");
 const ui_request = core.protocol.ui_request;
@@ -99,10 +101,14 @@ const AbiRuntime = struct {
 };
 
 const AbiSession = struct {
+    const CallState = enum { idle, running, destroying };
+
     callbacks: wire.SessionCallbacksV1,
     callback_status: std.atomic.Value(u32),
     facade_poisoned: std.atomic.Value(bool),
     core_session: *core.agent_session.AgentSession,
+    call_mutex: sync.Mutex = .{},
+    call_state: CallState = .idle,
 
     fn handle(self: *AbiSession) *wire.SessionHandle {
         return @ptrCast(self);
@@ -177,7 +183,55 @@ const AbiSession = struct {
         const status = self.callback_status.load(.acquire);
         return if (status == wire.STATUS_OK) wire.STATUS_CALLBACK_FAILED else status;
     }
+
+    fn tryBeginRun(self: *AbiSession) bool {
+        self.call_mutex.lock();
+        defer self.call_mutex.unlock();
+        if (self.call_state != .idle) return false;
+        self.call_state = .running;
+        return true;
+    }
+
+    fn finishRun(self: *AbiSession) void {
+        self.call_mutex.lock();
+        defer self.call_mutex.unlock();
+        std.debug.assert(self.call_state == .running);
+        self.call_state = .idle;
+    }
+
+    fn tryBeginDestroy(self: *AbiSession) bool {
+        self.call_mutex.lock();
+        defer self.call_mutex.unlock();
+        if (self.call_state != .idle) return false;
+        self.call_state = .destroying;
+        return true;
+    }
+
+    fn cancelDestroy(self: *AbiSession) void {
+        self.call_mutex.lock();
+        defer self.call_mutex.unlock();
+        std.debug.assert(self.call_state == .destroying);
+        self.call_state = .idle;
+    }
 };
+
+pub const TestEpilogueHook = struct {
+    ctx: *anyopaque,
+    runFn: *const fn (ctx: *anyopaque, run_id: u64) void,
+};
+
+var test_epilogue_hook: if (builtin.is_test) ?TestEpilogueHook else void = if (builtin.is_test) null else {};
+
+pub fn setTestEpilogueHook(hook: ?TestEpilogueHook) void {
+    if (comptime !builtin.is_test) @compileError("test epilogue hooks are unavailable in production builds");
+    test_epilogue_hook = hook;
+}
+
+fn invokeTestEpilogueHook(run_id: u64) void {
+    if (comptime builtin.is_test) {
+        if (test_epilogue_hook) |hook| hook.runFn(hook.ctx, run_id);
+    }
+}
 
 fn makeRunContext(session: *wire.SessionHandle, identity: *const core.agent_session.RunIdentity) wire.RunContextV1 {
     return .{
@@ -537,6 +591,8 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     self.callbacks = callbacks.*;
     self.callback_status = .init(wire.STATUS_OK);
     self.facade_poisoned = .init(false);
+    self.call_mutex = .{};
+    self.call_state = .idle;
     self.core_session = runtime.core_runtime.createSession(.{
         .provider_kind = kind,
         .api_key = api_key,
@@ -559,7 +615,11 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
 fn sessionDestroy(handle: ?*wire.SessionHandle, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
     emptyError(out_error);
     const self = sessionFrom(handle orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
-    self.core_session.destroy() catch |err| return failError(if (err == error.SessionBusy) wire.STATUS_BUSY else wire.STATUS_INVALID_STATE, err, out_error);
+    if (!self.tryBeginDestroy()) return fail(wire.STATUS_BUSY, "Session has an active facade call", out_error);
+    self.core_session.destroy() catch |err| {
+        self.cancelDestroy();
+        return failError(if (err == error.SessionBusy) wire.STATUS_BUSY else wire.STATUS_INVALID_STATE, err, out_error);
+    };
     allocator.destroy(self);
     return wire.STATUS_OK;
 }
@@ -569,6 +629,11 @@ fn sessionRun(handle: ?*wire.SessionHandle, run_id: u64, prompt_view: wire.Bytes
     if (out_result) |out| out.* = std.mem.zeroes(wire.RunResultV1);
     emptyError(out_error);
     const self = sessionFrom(handle orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    if (!self.tryBeginRun()) return fail(wire.STATUS_BUSY, "Session has an active facade call", out_error);
+    // This defer is the facade completion linearization point. Everything that
+    // reads AbiSession or publishes RunResult/diagnostics happens before it;
+    // after it releases the gate, sessionDestroy may immediately free `self`.
+    defer self.finishRun();
     if (self.facade_poisoned.load(.acquire))
         return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
     const options = options_ptr orelse return fail(wire.STATUS_INVALID_ARGUMENT, "run options are required", out_error);
@@ -584,6 +649,7 @@ fn sessionRun(handle: ?*wire.SessionHandle, run_id: u64, prompt_view: wire.Bytes
         return failError(status, err, out_error);
     };
     defer if (result.suspend_info) |suspend_info| suspend_info.deinit();
+    invokeTestEpilogueHook(run_id);
     const stop_code = stopReason(self, result.stop_reason) catch
         return fail(wire.STATUS_INTERNAL_ERROR, "core returned a stop reason unsupported by AgentCore ABI v1", out_error);
     out.* = .{ .struct_size = @sizeOf(wire.RunResultV1), .stop_reason_code = stop_code, .turns = result.turns, .tool_calls = result.tool_calls, .reserved = [_]u64{0} ** 4 };

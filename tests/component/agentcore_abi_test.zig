@@ -492,6 +492,117 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
     runtime = null;
 }
 
+test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
+    const Barrier = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        seen_run_id: std.atomic.Value(u64) = .init(0),
+
+        fn hook(raw: *anyopaque, run_id: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.seen_run_id.store(run_id, .release);
+            self.entered.store(true, .release);
+            while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+        }
+
+        fn wait(self: *@This()) !void {
+            for (0..1_000_000) |_| {
+                if (self.entered.load(.acquire)) return;
+                std.Thread.yield() catch {};
+            }
+            return error.EpilogueHookTimeout;
+        }
+    };
+    const RunWorker = struct {
+        api: sdk.Api,
+        session: *wire.SessionHandle,
+        status: u32 = std.math.maxInt(u32),
+        result: wire.RunResultV1 = undefined,
+        diagnostic: wire.OwnedBytesV1 = .{ .ptr = null, .len = 0 },
+
+        fn run(self: *@This()) void {
+            var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .reserved = [_]u64{0} ** 4 };
+            self.status = self.api.sessionRun()(self.session, 1, sdk.bytesView("pause in facade epilogue"), &options, &self.result, &self.diagnostic);
+        }
+    };
+
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    var server = try harness.MockServer.start(FINAL_SSE, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const raw_api = abi.metacodes_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreate()(&runtime_config, &runtime, &diagnostic));
+    defer if (runtime) |handle| {
+        _ = api.runtimeDestroy()(handle, &diagnostic);
+    };
+
+    var session_config = std.mem.zeroes(wire.SessionConfigV1);
+    session_config.struct_size = @sizeOf(wire.SessionConfigV1);
+    session_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    session_config.permission_mode_code = wire.PERMISSION_BYPASS;
+    session_config.shell_policy_code = wire.SHELL_DISABLED;
+    session_config.api_key = sdk.bytesView("test-key");
+    session_config.model = sdk.bytesView("test-model");
+    session_config.base_url = sdk.bytesView(url);
+    session_config.workspace_root = sdk.bytesView(root);
+    session_config.workspace_home = sdk.bytesView(root);
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionCreate()(runtime, &session_config, &callbacks, &session, &diagnostic));
+    defer if (session) |handle| {
+        _ = api.sessionDestroy()(handle, &diagnostic);
+    };
+
+    var barrier = Barrier{};
+    abi.setTestEpilogueHook(.{ .ctx = &barrier, .runFn = Barrier.hook });
+    defer abi.setTestEpilogueHook(null);
+    var worker = RunWorker{ .api = api, .session = session.? };
+    const run_thread = try std.Thread.spawn(.{}, RunWorker.run, .{&worker});
+    var joined = false;
+    defer if (!joined) {
+        barrier.release.store(true, .release);
+        run_thread.join();
+    };
+    try barrier.wait();
+    try std.testing.expectEqual(@as(u64, 1), barrier.seen_run_id.load(.acquire));
+
+    var competing_result: wire.RunResultV1 = undefined;
+    var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .reserved = [_]u64{0} ** 4 };
+    try std.testing.expectEqual(
+        wire.STATUS_BUSY,
+        api.sessionRun()(session, 2, sdk.bytesView("must not enter during epilogue"), &options, &competing_result, &diagnostic),
+    );
+    api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(wire.STATUS_BUSY, api.sessionDestroy()(session, &diagnostic));
+    api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(wire.STATUS_TOO_LATE, api.sessionAbort()(session, 1, wire.ABORT_USER_REQUEST, &diagnostic));
+    api.bufferRelease()(&diagnostic);
+
+    barrier.release.store(true, .release);
+    run_thread.join();
+    joined = true;
+    defer api.bufferRelease()(&worker.diagnostic);
+    try std.testing.expectEqual(wire.STATUS_OK, worker.status);
+    try std.testing.expectEqual(wire.STOP_END_TURN, worker.result.stop_reason_code);
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
+    session = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
+    runtime = null;
+}
+
 test "L2 invalid UTF-8 Host tool result is released and does not poison Session" {
     const FailureProbe = struct {
         calls: usize = 0,
