@@ -464,12 +464,14 @@ test "Host sync selections sharing one Runtime keep executors isolated" {
 test "Host outcome detail is copied, released once and typed through dispatch" {
     const DetailProbe = struct {
         releases: usize = 0,
-        mode: enum { failed_with_detail, rejected_null, fatal } = .failed_with_detail,
+        mode: enum { failed_with_detail, failed_null, rejected_with_detail, rejected_null, fatal } = .failed_with_detail,
 
         fn execute(raw: *anyopaque, _: HostRunIdentity, _: []const u8) error{OutOfMemory}!HostToolOutcome {
             const self: *@This() = @ptrCast(@alignCast(raw));
             return switch (self.mode) {
                 .failed_with_detail => .{ .failed = .{ .bytes = "field 'x' is invalid", .release_ctx = raw, .releaseFn = release } },
+                .failed_null => .{ .failed = null },
+                .rejected_with_detail => .{ .rejected = .{ .bytes = "policy rejected", .release_ctx = raw, .releaseFn = release } },
                 .rejected_null => .{ .rejected = null },
                 .fatal => .fatal,
             };
@@ -500,13 +502,72 @@ test "Host outcome detail is copied, released once and typed through dispatch" {
     try std.testing.expectEqualStrings("field 'x' is invalid", failed.host_failed.?);
     try std.testing.expectEqual(@as(usize, 1), probe.releases); // 详情复制后恰好释放一次
 
+    probe.mode = .failed_null;
+    var failed_null = try tools.dispatch(&ctx, "HostDetail", "{}");
+    defer failed_null.deinit(std.testing.allocator);
+    try std.testing.expect(failed_null.host_failed == null);
+    try std.testing.expectEqual(@as(usize, 1), probe.releases);
+
+    probe.mode = .rejected_with_detail;
+    var rejected_detail = try tools.dispatch(&ctx, "HostDetail", "{}");
+    defer rejected_detail.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("policy rejected", rejected_detail.host_rejected.?);
+    try std.testing.expectEqual(@as(usize, 2), probe.releases);
+
     probe.mode = .rejected_null;
     var rejected = try tools.dispatch(&ctx, "HostDetail", "{}");
     defer rejected.deinit(std.testing.allocator);
     try std.testing.expect(rejected.host_rejected == null);
-    try std.testing.expectEqual(@as(usize, 1), probe.releases); // null 详情无描述符可释放
+    try std.testing.expectEqual(@as(usize, 2), probe.releases); // null 详情无描述符可释放
 
     probe.mode = .fatal;
-    const fatal = try tools.dispatch(&ctx, "HostDetail", "{}");
+    var fatal = try tools.dispatch(&ctx, "HostDetail", "{}");
+    defer fatal.deinit(std.testing.allocator);
     try std.testing.expect(fatal == .host_fatal); // fatal 无 payload
+}
+
+test "Host descriptors release exactly once when dispatch copy runs out of memory" {
+    const CopyProbe = struct {
+        releases: usize = 0,
+        mode: enum { ok, failed } = .ok,
+
+        fn execute(raw: *anyopaque, _: HostRunIdentity, _: []const u8) error{OutOfMemory}!HostToolOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const result = HostToolResult{ .bytes = "owned by host", .release_ctx = raw, .releaseFn = release };
+            return switch (self.mode) {
+                .ok => .{ .ok = result },
+                .failed => .{ .failed = result },
+            };
+        }
+
+        fn release(raw: *anyopaque, _: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.releases += 1;
+        }
+    };
+
+    var probe = CopyProbe{};
+    var catalog = try Catalog.init(std.testing.allocator, &.{}, &.{.{
+        .definition = .{
+            .name = "HostCopyOom",
+            .description = "copy OOM probe",
+            .input_schema = .{ .type = "object", .prop_specs = &.{}, .required = &.{} },
+        },
+        .ctx = &probe,
+        .execute = CopyProbe.execute,
+    }});
+    defer catalog.deinit();
+    var selection = try Selection.init(std.testing.allocator, &catalog, &.{"HostCopyOom"});
+    defer selection.deinit();
+
+    var failing_ok = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var ok_ctx = tools.ToolContext{ .allocator = failing_ok.allocator(), .host_run = testIdentity(@ptrCast(&probe)), .tool_dispatcher = selection.dispatcher() };
+    try std.testing.expectError(error.OutOfMemory, tools.dispatch(&ok_ctx, "HostCopyOom", "{}"));
+    try std.testing.expectEqual(@as(usize, 1), probe.releases);
+
+    probe.mode = .failed;
+    var failing_detail = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var detail_ctx = tools.ToolContext{ .allocator = failing_detail.allocator(), .host_run = testIdentity(@ptrCast(&probe)), .tool_dispatcher = selection.dispatcher() };
+    try std.testing.expectError(error.OutOfMemory, tools.dispatch(&detail_ctx, "HostCopyOom", "{}"));
+    try std.testing.expectEqual(@as(usize, 2), probe.releases);
 }

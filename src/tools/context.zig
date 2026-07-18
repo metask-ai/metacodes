@@ -151,6 +151,26 @@ pub const ToolDispatchOutcome = union(enum) {
     }
 };
 
+test "ToolDispatchOutcome.deinit releases every owned payload branch" {
+    const allocator = std.testing.allocator;
+
+    var ok: ToolDispatchOutcome = .{ .ok = try allocator.dupe(u8, "ok") };
+    ok.deinit(allocator);
+
+    var failed_detail: ToolDispatchOutcome = .{ .host_failed = try allocator.dupe(u8, "failed") };
+    failed_detail.deinit(allocator);
+    var failed_empty: ToolDispatchOutcome = .{ .host_failed = null };
+    failed_empty.deinit(allocator);
+
+    var rejected_detail: ToolDispatchOutcome = .{ .host_rejected = try allocator.dupe(u8, "rejected") };
+    rejected_detail.deinit(allocator);
+    var rejected_empty: ToolDispatchOutcome = .{ .host_rejected = null };
+    rejected_empty.deinit(allocator);
+
+    var fatal: ToolDispatchOutcome = .host_fatal;
+    fatal.deinit(allocator);
+}
+
 /// Session-scoped tool directory used by embedders. The directory owns the
 /// advertised definitions and routes execution back to the exact selected
 /// entry, so a provider cannot escape a Session allowlist through the global
