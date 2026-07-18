@@ -30,13 +30,22 @@ const Probe = struct {
     last_session_id: cc.session_id.SessionId = cc.session_id.SessionId.single,
     last_run_id: u64 = 0,
     last_host_ctx: ?*anyopaque = null,
+    observed_session_ids: [4]cc.session_id.SessionId = .{cc.session_id.SessionId.single} ** 4,
+    observed_run_ids: [4]u64 = .{0} ** 4,
+    observed_host_ctxs: [4]?*anyopaque = .{null} ** 4,
 
     fn execute(raw: *anyopaque, identity: cc.agent_session.HostRunIdentity, _: []const u8) error{OutOfMemory}!cc.agent_session.HostToolOutcome {
         const self: *Probe = @ptrCast(@alignCast(raw));
+        const call_index = self.calls;
         self.calls += 1;
         self.last_session_id = identity.identity.session_id;
         self.last_run_id = identity.identity.run_id;
         self.last_host_ctx = identity.host_session_ctx;
+        if (call_index < self.observed_session_ids.len) {
+            self.observed_session_ids[call_index] = identity.identity.session_id;
+            self.observed_run_ids[call_index] = identity.identity.run_id;
+            self.observed_host_ctxs[call_index] = identity.host_session_ctx;
+        }
         if (self.mode == .fatal) return .fatal;
         if (self.abort_session) |session| session.abort(self.abort_run_id, .user_interrupt) catch return .fatal;
         return .{ .ok = .{ .bytes = "host-sync-ok", .release_ctx = raw, .releaseFn = release } };
@@ -113,6 +122,70 @@ test "L2 selected Host sync tool is advertised, executed and released exactly on
     const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
     try std.testing.expect(std.mem.indexOf(u8, body, "HostEcho") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "host-sync-ok") != null);
+}
+
+test "L2 Host identity is admission-fixed across two Runs and distinct across two Sessions" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{
+        HOST_TOOL_SSE,
+        FINAL_SSE,
+        HOST_TOOL_SSE,
+        FINAL_SSE,
+        HOST_TOOL_SSE,
+        FINAL_SSE,
+    };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(allocator);
+    defer allocator.free(url);
+
+    var probe = Probe{};
+    var anchor_a: u8 = 1;
+    var anchor_b: u8 = 2;
+    const runtime = try cc.agent_session.AgentRuntime.create(allocator, .{ .builtin_tools = &.{}, .host_sync_tools = &.{probe.tool()} });
+    defer runtime.destroy() catch unreachable;
+    const session_a = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = url,
+        .permission_mode = .bypass_permissions,
+        .workspace = .{ .root = root },
+        .allowed_tools = &.{"HostEcho"},
+        .host_identity_ctx = &anchor_a,
+    });
+    defer session_a.destroy() catch unreachable;
+    const session_b = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = url,
+        .permission_mode = .bypass_permissions,
+        .workspace = .{ .root = root },
+        .allowed_tools = &.{"HostEcho"},
+        .host_identity_ctx = &anchor_b,
+    });
+    defer session_b.destroy() catch unreachable;
+
+    var sink_state: u8 = 0;
+    _ = try session_a.runText(10, "first A run", 4, .{ .ctx = &sink_state, .emit = Sink.emit });
+    _ = try session_a.runText(11, "second A run", 4, .{ .ctx = &sink_state, .emit = Sink.emit });
+    _ = try session_b.runText(20, "first B run", 4, .{ .ctx = &sink_state, .emit = Sink.emit });
+
+    try std.testing.expectEqual(@as(usize, 3), probe.calls);
+    try std.testing.expectEqual(@as(usize, 3), probe.releases);
+    try std.testing.expectEqualStrings(session_a.session_id.asSlice(), probe.observed_session_ids[0].asSlice());
+    try std.testing.expectEqualStrings(session_a.session_id.asSlice(), probe.observed_session_ids[1].asSlice());
+    try std.testing.expectEqualStrings(session_b.session_id.asSlice(), probe.observed_session_ids[2].asSlice());
+    try std.testing.expect(!std.mem.eql(u8, probe.observed_session_ids[0].asSlice(), probe.observed_session_ids[2].asSlice()));
+    try std.testing.expectEqualSlices(u64, &.{ 10, 11, 20 }, probe.observed_run_ids[0..3]);
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(&anchor_a)), probe.observed_host_ctxs[0]);
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(&anchor_a)), probe.observed_host_ctxs[1]);
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(&anchor_b)), probe.observed_host_ctxs[2]);
 }
 
 test "L2 unadvertised Host tool is rejected without invoking callback" {

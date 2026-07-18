@@ -58,6 +58,31 @@ pub const RuntimeError = error{
 
 const RuntimeState = enum { active, destroying };
 
+const SessionIdSource = struct {
+    ctx: ?*anyopaque = null,
+    nextFn: *const fn (ctx: ?*anyopaque) SessionId = systemNext,
+
+    fn next(self: SessionIdSource) SessionId {
+        return self.nextFn(self.ctx);
+    }
+
+    fn systemNext(_: ?*anyopaque) SessionId {
+        return @import("session_id.zig").gen();
+    }
+};
+
+/// Private construction seams make collision and rollback paths deterministic
+/// without exposing test controls through the public Runtime/Session config.
+const SessionCreateHooks = struct {
+    session_id_source: SessionIdSource = .{},
+    ctx: ?*anyopaque = null,
+    after_id_registered_fn: ?*const fn (ctx: ?*anyopaque) anyerror!void = null,
+
+    fn afterIdRegistered(self: SessionCreateHooks) !void {
+        if (self.after_id_registered_fn) |hook| try hook(self.ctx);
+    }
+};
+
 pub const AgentRuntime = struct {
     allocator: std.mem.Allocator,
     catalog: tool_catalog.Catalog,
@@ -117,7 +142,7 @@ pub const AgentRuntime = struct {
     fn unregisterSessionId(self: *AgentRuntime, sid: SessionId) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        _ = self.session_ids.remove(sid.bytes);
+        std.debug.assert(self.session_ids.remove(sid.bytes));
     }
 
     pub fn createSession(self: *AgentRuntime, config: SessionConfig) !*AgentSession {
@@ -234,6 +259,10 @@ pub const AgentSession = struct {
     /// init-by-value + bind(self) pattern where a later move leaves backend ctx
     /// pointing at stale storage.
     pub fn create(runtime: *AgentRuntime, config: SessionConfig) !*AgentSession {
+        return createWithHooks(runtime, config, .{});
+    }
+
+    fn createWithHooks(runtime: *AgentRuntime, config: SessionConfig, hooks: SessionCreateHooks) !*AgentSession {
         try runtime.retainSession();
         errdefer runtime.releaseSession();
         const allocator = runtime.allocator;
@@ -277,12 +306,13 @@ pub const AgentSession = struct {
         const session_id = blk: {
             var attempts: usize = 0;
             while (attempts < AgentRuntime.MAX_SESSION_ID_RETRIES) : (attempts += 1) {
-                const candidate = @import("session_id.zig").gen();
+                const candidate = hooks.session_id_source.next();
                 if (try runtime.registerSessionId(candidate)) break :blk candidate;
             }
             return error.SessionIdGeneratorBroken;
         };
         errdefer runtime.unregisterSessionId(session_id);
+        try hooks.afterIdRegistered();
         var permission_ctx = permission.createContext(config.permission_mode, allocator);
         permission_ctx.session = session_id;
 
@@ -370,17 +400,17 @@ pub const AgentSession = struct {
 
     /// Run one text turn while preserving Conversation across successful Runs.
     pub fn runText(self: *AgentSession, run_id: u64, prompt: []const u8, max_turns: u32, sink: EventSink) anyerror!agent_loop.RunResult {
-        try self.beginRun(run_id, sink);
+        const identity = try self.beginRun(run_id, sink);
 
         self.conversation.appendText(.user, prompt) catch |err| {
             _ = self.poisonRun();
             return err;
         };
 
-        return self.runLoop(max_turns);
+        return self.runLoop(identity, max_turns);
     }
 
-    fn runLoop(self: *AgentSession, max_turns: u32) anyerror!agent_loop.RunResult {
+    fn runLoop(self: *AgentSession, identity: RunIdentity, max_turns: u32) anyerror!agent_loop.RunResult {
         var backend = ui_backend.UiBackend{ .ctx = @ptrCast(self), .emit = backendEmit, .poll = backendPoll };
         var native_result = agent_loop.run(
             &self.conversation,
@@ -389,17 +419,16 @@ pub const AgentSession = struct {
             &self.permission_ctx,
             .{
                 .max_turns = max_turns,
-                .session = self.session_id,
-                .session_id = self.session_id.asSlice(),
+                .session = identity.session_id,
+                .session_id = identity.session_id.asSlice(),
                 .abort = &self.abort_signal,
                 .read_state = &self.read_state,
                 .jobs = if (self.jobs) |*registry| registry else null,
                 .tool_defs = self.tools.definitions,
                 .tool_dispatcher = self.tools.dispatcher(),
                 // admission 处固定的 Run 身份,显式传值贯穿至 Host tool 执行点。
-                // active_run_id 在 beginRun 锁下写入、Run 期间稳定(运行线程读)。
                 .host_run = if (self.host_identity_ctx) |hctx| .{
-                    .identity = .{ .session_id = self.session_id, .run_id = self.active_run_id },
+                    .identity = identity,
                     .host_session_ctx = hctx,
                 } else null,
                 .ui_requester = self.permission_ctx.ui_requester,
@@ -487,7 +516,7 @@ pub const AgentSession = struct {
 
     /// Admission linearization point for the public nonzero, strictly
     /// increasing, Session-scoped Run ID contract.
-    fn beginRun(self: *AgentSession, run_id: u64, sink: EventSink) LifecycleError!void {
+    fn beginRun(self: *AgentSession, run_id: u64, sink: EventSink) LifecycleError!RunIdentity {
         self.mutex.lock();
         switch (self.state) {
             .idle => {},
@@ -510,7 +539,9 @@ pub const AgentSession = struct {
         self.last_run_id = run_id;
         self.callback_failed = false;
         self.active_sink = sink;
+        const identity = RunIdentity{ .session_id = self.session_id, .run_id = run_id };
         self.mutex.unlock();
+        return identity;
     }
 
     /// Poison a failed Run and return whether delivery failure was the cause.
@@ -762,7 +793,9 @@ test "AgentSession enforces one active Run and monotonic nonzero run ids" {
     try std.testing.expect(!self.isPoisoned());
 
     try std.testing.expectError(error.StaleRun, self.beginRun(0, probe.sink()));
-    try self.beginRun(1, probe.sink());
+    const first_identity = try self.beginRun(1, probe.sink());
+    try std.testing.expectEqual(@as(u64, 1), first_identity.run_id);
+    try std.testing.expectEqualSlices(u8, self.session_id.asSlice(), first_identity.session_id.asSlice());
     try std.testing.expectEqual(State.running, self.state);
     try std.testing.expectError(error.SessionBusy, self.beginRun(2, probe.sink()));
     try std.testing.expectError(error.SessionBusy, self.destroy());
@@ -773,12 +806,12 @@ test "AgentSession enforces one active Run and monotonic nonzero run ids" {
     try std.testing.expectEqual(State.idle, self.state);
     try std.testing.expectError(error.StaleRun, self.beginRun(1, probe.sink()));
 
-    try self.beginRun(2, probe.sink());
+    _ = try self.beginRun(2, probe.sink());
     _ = self.finishRunLifecycle();
-    try self.beginRun(20, probe.sink());
+    _ = try self.beginRun(20, probe.sink());
     _ = self.finishRunLifecycle();
     const max_run_id = std.math.maxInt(u64);
-    try self.beginRun(max_run_id, probe.sink());
+    _ = try self.beginRun(max_run_id, probe.sink());
     _ = self.finishRunLifecycle();
     try std.testing.expectError(error.StaleRun, self.beginRun(1, probe.sink()));
     try std.testing.expectError(error.StaleRun, self.beginRun(max_run_id, probe.sink()));
@@ -795,7 +828,7 @@ test "AgentSession abort is run-scoped, idempotent and reports late requests" {
     var probe = SinkProbe{};
 
     try std.testing.expectError(error.StaleRun, self.abort(0, .user_interrupt));
-    try self.beginRun(3, probe.sink());
+    _ = try self.beginRun(3, probe.sink());
     try std.testing.expectError(error.StaleRun, self.abort(4, .user_interrupt));
     try self.abort(3, .timeout);
     try std.testing.expectEqual(State.abort_requested, self.state);
@@ -821,7 +854,7 @@ test "AgentSession callback failure aborts delivery and poisons the Session" {
     defer std.testing.allocator.free(cwd);
     const self = try createTestSession(runtime, .default, cwd);
     var probe = SinkProbe{ .accept = false };
-    try self.beginRun(7, probe.sink());
+    _ = try self.beginRun(7, probe.sink());
 
     AgentSession.backendEmit(self, self.session_id, .stream_begin);
     AgentSession.backendEmit(self, self.session_id, .stream_done);
@@ -922,7 +955,7 @@ test "Host UI requester failure aborts and poisons the active Run" {
     });
     defer self.destroy() catch unreachable;
     var sink_probe = SinkProbe{};
-    try self.beginRun(11, sink_probe.sink());
+    _ = try self.beginRun(11, sink_probe.sink());
 
     const req = ui_request.UiRequest{ .permission = .{ .tool = "Write", .args = "{}" } };
     var response: ui_request.UiResponse = undefined;
@@ -1017,6 +1050,127 @@ test "Runtime session registry:原子注册、destroy 注销、Runtime destroy �
     try std.testing.expect(!runtime.session_ids.contains(a_id.bytes));
     try b.destroy();
     try std.testing.expectEqual(@as(usize, 0), runtime.session_ids.count());
+}
+
+test "Runtime session registry retries an injected collision and registers the next value" {
+    const SequenceSource = struct {
+        ids: []const SessionId,
+        calls: usize = 0,
+
+        fn next(raw: ?*anyopaque) SessionId {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const index = @min(self.calls, self.ids.len - 1);
+            self.calls += 1;
+            return self.ids[index];
+        }
+    };
+
+    const ids = [_]SessionId{
+        SessionId.fromSlice("000000000000000000000001").?,
+        SessionId.fromSlice("000000000000000000000001").?,
+        SessionId.fromSlice("000000000000000000000002").?,
+    };
+    var source = SequenceSource{ .ids = &ids };
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{"Read"} });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const config = SessionConfig{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"Read"},
+    };
+    const hooks = SessionCreateHooks{ .session_id_source = .{
+        .ctx = &source,
+        .nextFn = SequenceSource.next,
+    } };
+
+    const first = try AgentSession.createWithHooks(runtime, config, hooks);
+    var first_live = true;
+    defer if (first_live) first.destroy() catch {};
+    const second = try AgentSession.createWithHooks(runtime, config, hooks);
+    var second_live = true;
+    defer if (second_live) second.destroy() catch {};
+
+    try std.testing.expectEqual(@as(usize, 3), source.calls);
+    try std.testing.expectEqualStrings(ids[0].asSlice(), first.session_id.asSlice());
+    try std.testing.expectEqualStrings(ids[2].asSlice(), second.session_id.asSlice());
+    try std.testing.expectEqual(@as(usize, 2), runtime.session_ids.count());
+
+    try first.destroy();
+    first_live = false;
+    try second.destroy();
+    second_live = false;
+}
+
+test "Runtime session registry bounds repeated collisions without leaking registration or liveness" {
+    const ConstantSource = struct {
+        id: SessionId,
+        calls: usize = 0,
+
+        fn next(raw: ?*anyopaque) SessionId {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.calls += 1;
+            return self.id;
+        }
+    };
+
+    var source = ConstantSource{ .id = SessionId.fromSlice("000000000000000000000003").? };
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{"Read"} });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const config = SessionConfig{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"Read"},
+    };
+    const hooks = SessionCreateHooks{ .session_id_source = .{
+        .ctx = &source,
+        .nextFn = ConstantSource.next,
+    } };
+    const first = try AgentSession.createWithHooks(runtime, config, hooks);
+    defer first.destroy() catch unreachable;
+
+    try std.testing.expectError(error.SessionIdGeneratorBroken, AgentSession.createWithHooks(runtime, config, hooks));
+    try std.testing.expectEqual(@as(usize, 1 + AgentRuntime.MAX_SESSION_ID_RETRIES), source.calls);
+    try std.testing.expectEqual(@as(usize, 1), runtime.session_ids.count());
+    try std.testing.expectEqual(@as(usize, 1), runtime.live_sessions);
+}
+
+test "Session creation failure after ID registration rolls the registry and live count back" {
+    const FailingHook = struct {
+        fn run(_: ?*anyopaque) anyerror!void {
+            return error.InjectedCreationFailure;
+        }
+    };
+
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{"Read"} });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const config = SessionConfig{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"Read"},
+    };
+
+    try std.testing.expectError(error.InjectedCreationFailure, AgentSession.createWithHooks(runtime, config, .{
+        .after_id_registered_fn = FailingHook.run,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), runtime.session_ids.count());
+    try std.testing.expectEqual(@as(usize, 0), runtime.live_sessions);
+
+    const recovered = try runtime.createSession(config);
+    defer recovered.destroy() catch unreachable;
+    try std.testing.expectEqual(@as(usize, 1), runtime.session_ids.count());
+    try std.testing.expectEqual(@as(usize, 1), runtime.live_sessions);
 }
 
 test "选择 Host tool 而无 host_identity_ctx → 创建拒绝且 registry 无残留" {
