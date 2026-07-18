@@ -69,8 +69,9 @@ def test_T16_queued_autosubmits_after_gen(bin_path):
         return
     # 生成期打第二句 + 回车入队;第一轮自然结束 → 队列自动续发跑第二轮。
     # 第一句须生成够久(长查询),保证 DONE2 在生成窗口内入队(否则被 drainStdin 丢弃,属正确行为)。
+    # 尾窗须容纳完整两轮(数到 60 慢模型一轮即 >10s);settle 下 cap 放宽零成本。
     raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
-                         "sleep:0.6", "type:DONE2", "key:enter", "sleep:10"],
+                         "sleep:0.6", "type:DONE2", "key:enter", "sleep:35"],
               per_key_drain=0.06)
     a = TTYAssert(raw)
     # queued "DONE2" 回车入队 → 第一轮结束后自动续发 → ❯ 回显进 scrollback。
@@ -121,7 +122,7 @@ def test_T21_multiple_queued_autosubmit(bin_path):
     home = fresh_home()
     run_live(bin_path, ["sleep:0.8", "type:请从 1 数到 50,每个数字单独占一行,慢慢来", "key:enter",
                         "sleep:0.5", "type:BATCHA", "key:enter",
-                        "sleep:0.3", "type:BATCHB", "key:enter", "sleep:22"],
+                        "sleep:0.3", "type:BATCHB", "key:enter", "sleep:45"],
              home, per_key_drain=0.05)
 
     # 扫 transcript 的 user 消息,找含 BATCH 的文本块。

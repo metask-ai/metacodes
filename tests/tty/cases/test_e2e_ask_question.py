@@ -74,8 +74,10 @@ def test_e2e_ask_single_select(bin_path):
     prompt = ('Use the AskUserQuestion tool now: ONE single-select question header "Color" '
               '"Which color?" options Red/Green/Blue, each with a short description. Call immediately.')
     home = fresh_home()
+    # 尾窗要容纳:答案提交 → 第二轮生成起步 → answers tool_result 落 transcript。
+    # settle 语义下 cap 放宽零成本;3s 会在慢模型下把 answers 掐在落盘前(2026-07-18 实证)。
     keys = ["sleep:1.0", "type:" + prompt, "key:enter", "sleep:%d" % WAIT,
-            "key:down", "key:down", "sleep:0.5", "key:enter", "sleep:3"]
+            "key:down", "key:down", "sleep:0.5", "key:enter", "sleep:20"]
     raw = run_live(bin_path, keys, home,
                    permission="bypassPermissions", per_key_drain=0.06, startup_drain=1.2)
     _no_crash(raw, home)
@@ -188,7 +190,7 @@ def test_e2e_ask_chat_about_free_response(bin_path):
     home = fresh_home()
     # Chat about this 在 idx3(第4项=最后)。↓↓↓ 到 Chat,enter 提交。
     keys = ["sleep:1.0", "type:" + prompt, "key:enter", "sleep:%d" % WAIT,
-            "key:down", "key:down", "key:down", "sleep:0.4", "key:enter", "sleep:3"]
+            "key:down", "key:down", "key:down", "sleep:0.4", "key:enter", "sleep:20"]
     raw = run_live(bin_path, keys, home,
                    permission="bypassPermissions", per_key_drain=0.06, startup_drain=1.2)
     _no_crash(raw, home)
