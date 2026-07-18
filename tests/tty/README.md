@@ -22,8 +22,13 @@ python3 tests/tty/run_tty_tests.py --bin zig-out/bin/metacodes-debug -k T07 -v
 - `screen.py` —— 终端模拟器:最小 ANSI 解释器(CSI A/C/G/K/H/m + \r\n 底部上滚)
   → 虚拟 grid + 光标 + SGR border_class;`char_width` 复刻 `src/repl/tui/term.zig` 的 CJK/emoji 宽度表。
 - `tty_driver.py` —— `run(bin, key_events, term_size)`:fork pty + TIOCSWINSZ + 键名映射
-  (`type:文本`/`key:shift_enter|backspace|left|right|shift_tab|ctrl_u|enter`/`sleep:N`/`resize:RxC`)。
-  锁 `FORCE_COLOR=1` 让 accent/warn SGR 稳定可断言。
+  (`type:文本`/`key:shift_enter|backspace|left|right|shift_tab|ctrl_u|enter`/`sleep:N`/
+  `strictsleep:N`/`wait:PATTERN:N`/`resize:RxC`)。锁 `FORCE_COLOR=1` 让 accent/warn SGR 稳定可断言。
+  **等待语义(事件+上限结合)**:`sleep:N` 是 settle 睡眠——至多 N 秒,输出流静默 0.8s 即提前返回
+  (生成/工具执行期 spinner 每 100ms 重画,流不静默 → 静默 ⇔ turn 结束/等输入,N 只是最坏兜底);
+  逐帧时序断言、"N 秒内不出现 X"类否定窗口必须用 `strictsleep:N`(睡满);已知等待内容时用
+  `wait:PATTERN:N`(等屏幕出现 PATTERN,命中后短 settle 防半帧)。两后端(POSIX pty/ConPTY)
+  共享同一份 `_Capture` 实现,平台差异只在"读一片字节"原语内。
 - `asserts.py` —— 切帧(`ESC[?25l`..`ESC[?25h` 光标对)+ `TTYAssert`
   (box_at_bottom/no_jitter/input_echo/border_class/footer_mode/box_height/clean_exit/...)。
 - `cases/*.py` —— T01-T13 用例(每个 `def test_*(bin_path)`)。
