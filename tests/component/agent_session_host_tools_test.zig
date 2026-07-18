@@ -22,6 +22,7 @@ const HOST_TOOL_SSE =
     "data: {\"type\":\"message_stop\"}\n\n";
 
 const Probe = struct {
+    mode: enum { ok, fatal } = .ok,
     calls: usize = 0,
     releases: usize = 0,
     abort_session: ?*cc.agent_session.AgentSession = null,
@@ -36,6 +37,7 @@ const Probe = struct {
         self.last_session_id = identity.identity.session_id;
         self.last_run_id = identity.identity.run_id;
         self.last_host_ctx = identity.host_session_ctx;
+        if (self.mode == .fatal) return .fatal;
         if (self.abort_session) |session| session.abort(self.abort_run_id, .user_interrupt) catch return .fatal;
         return .{ .ok = .{ .bytes = "host-sync-ok", .release_ctx = raw, .releaseFn = release } };
     }
@@ -180,4 +182,44 @@ test "L2 Host sync callback may reenter abort without lifecycle deadlock" {
     try std.testing.expectEqual(cc.agent_loop.StopReason.aborted, result.stop_reason);
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expectEqual(@as(usize, 1), probe.releases);
+}
+
+test "L2 Host fatal poisons the Session and maps to CallbackFailed without a tool result turn" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    var server = try harness.MockServer.start(HOST_TOOL_SSE, 0);
+    defer server.stop();
+    const url = try server.urlOwned(allocator);
+    defer allocator.free(url);
+
+    var probe = Probe{ .mode = .fatal };
+    const runtime = try cc.agent_session.AgentRuntime.create(allocator, .{ .builtin_tools = &.{}, .host_sync_tools = &.{probe.tool()} });
+    defer runtime.destroy() catch unreachable;
+    const session = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = url,
+        .permission_mode = .bypass_permissions,
+        .workspace = .{ .root = root },
+        .allowed_tools = &.{"HostEcho"},
+        .host_identity_ctx = &probe,
+    });
+    defer session.destroy() catch unreachable;
+
+    var sink_state: u8 = 0;
+    try std.testing.expectError(
+        error.CallbackFailed,
+        session.runText(11, "fatal host callback", 4, .{ .ctx = &sink_state, .emit = Sink.emit }),
+    );
+    try std.testing.expect(session.isPoisoned());
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.releases);
+    try std.testing.expectError(
+        error.InvalidSessionState,
+        session.runText(12, "must stay poisoned", 1, .{ .ctx = &sink_state, .emit = Sink.emit }),
+    );
 }

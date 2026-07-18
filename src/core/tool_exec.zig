@@ -11,12 +11,14 @@
 //! 不写共享态。每个并发 job 用独立 ArenaAllocator 规避 GPA 非线程安全;结果 dupe 回父。
 
 const std = @import("std");
+const platform = @import("platform");
 const tools_mod = @import("../tools.zig");
 const ToolContext = tools_mod.ToolContext;
 const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
 
 pub const MAX_TOOL_CONCURRENCY: usize = 8;
+pub const MAX_TOOL_ERROR_PAYLOAD_BYTES_V1: usize = 1024 * 1024;
 
 /// 单个 tool 的执行决定 + 结果槽位。
 pub const Slot = struct {
@@ -68,6 +70,8 @@ const Job = struct {
     done: bool = false,
     /// Host 工具 fatal:runJob 置位,executeSlots join 后汇聚为 error.HostToolFatal。
     fatal: bool = false,
+    /// 本地复制/编码 OOM 是 Run 级失败，不得伪装成模型可见 tool error。
+    out_of_memory: bool = false,
 };
 
 /// 单个工具执行的结果(所有 owned 字段挂 parent_allocator,逃逸内部 arena)。
@@ -92,7 +96,7 @@ pub fn executeOne(
     id: []const u8,
     parent_allocator: std.mem.Allocator,
     rid: log.RequestId,
-) OneResult {
+) error{OutOfMemory}!OneResult {
     const t_start = util_time.nowMs();
     var arena = std.heap.ArenaAllocator.init(parent_allocator);
     defer arena.deinit();
@@ -109,13 +113,17 @@ pub fn executeOne(
 
     log.infoId("agent", rid, "tool.exec start(par) name={s} id={s}", .{ name, id });
     const r = tools_mod.dispatch(&job_ctx, name, input) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
         const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
         // L3:UiPending 是控制信号(非工具错误)——kind/payload dupe 到父 allocator 逃逸 arena。
         if (err == error.UiPending) {
             log.infoId("agent", rid, "tool.exec PENDING(par) name={s} id={s} kind={s}", .{ name, id, if (pending_req) |pr| pr.kind else "" });
+            const kind = if (pending_req) |pr| try parent_allocator.dupe(u8, pr.kind) else null;
+            errdefer if (kind) |bytes| parent_allocator.free(bytes);
+            const payload = if (pending_req) |pr| try parent_allocator.dupe(u8, pr.payload_json) else null;
             return .{ .pending = .{
-                .kind = if (pending_req) |pr| parent_allocator.dupe(u8, pr.kind) catch null else null,
-                .payload = if (pending_req) |pr| parent_allocator.dupe(u8, pr.payload_json) catch null else null,
+                .kind = kind,
+                .payload = payload,
                 .elapsed_ms = elapsed,
             } };
         }
@@ -124,17 +132,17 @@ pub fn executeOne(
         // 错误 json 用父 allocator(逃逸 arena)。工具填了 detail 用之,否则通用文案。
         // P0.6:UnknownTool 附可用工具清单(hermes 式引导),弱模型据此自纠而非空转烧 turn。
         const ej = if (err_detail) |d|
-            tool_error.errorToJson(code, "{s}", .{d}, parent_allocator) catch null
+            tool_error.errorToJson(code, "{s}", .{d}, parent_allocator) catch return error.OutOfMemory
         else if (err == error.UnknownTool) blk: {
             const names = tools_mod.availableToolNames(&job_ctx, parent_allocator) catch null;
             defer if (names) |nm| parent_allocator.free(nm);
             // 模糊建议(仅提示,不执行):有则加 "Did you mean 'X'?"。
             const guess = tools_mod.suggestToolName(&job_ctx, name);
             break :blk if (guess) |g|
-                tool_error.errorToJson(code, "Tool '{s}' does not exist. Did you mean '{s}'? Available tools: {s}", .{ name, g, if (names) |nm| nm else "(unavailable)" }, parent_allocator) catch null
+                tool_error.errorToJson(code, "Tool '{s}' does not exist. Did you mean '{s}'? Available tools: {s}", .{ name, g, if (names) |nm| nm else "(unavailable)" }, parent_allocator) catch return error.OutOfMemory
             else
-                tool_error.errorToJson(code, "Tool '{s}' does not exist. Available tools: {s}", .{ name, if (names) |nm| nm else "(unavailable)" }, parent_allocator) catch null;
-        } else tool_error.errorToJson(code, "{s} failed with {s}", .{ name, @errorName(err) }, parent_allocator) catch null;
+                tool_error.errorToJson(code, "Tool '{s}' does not exist. Available tools: {s}", .{ name, if (names) |nm| nm else "(unavailable)" }, parent_allocator) catch return error.OutOfMemory;
+        } else tool_error.errorToJson(code, "{s} failed with {s}", .{ name, @errorName(err) }, parent_allocator) catch return error.OutOfMemory;
         log.warnId("agent", rid, "tool.exec FAILED(par) name={s} err={s} duration_ms={d} input={s}", .{ name, @errorName(err), elapsed, input[0..@min(input.len, 200)] });
         return .{ .done = .{ .content = ej, .is_error = true, .elapsed_ms = elapsed } };
     };
@@ -147,37 +155,45 @@ pub fn executeOne(
         .host_failed, .host_rejected => |maybe_detail| {
             const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
             const code: []const u8 = if (r == .host_failed) "HostToolFailed" else "HostToolRejected";
-            const tool_error = @import("tool_error.zig");
-            // 详情非空 → 逐字作为模型可见 detail(A2);空 → 保持既有通用文案。
-            const ej = if (maybe_detail) |d| blk: {
-                if (d.len > 0) break :blk tool_error.errorToJson(code, "{s}", .{d}, parent_allocator) catch null;
-                break :blk tool_error.errorToJson(code, "{s} failed with {s}", .{ name, code }, parent_allocator) catch null;
-            } else tool_error.errorToJson(code, "{s} failed with {s}", .{ name, code }, parent_allocator) catch null;
+            const ej = try hostToolErrorJson(code, name, maybe_detail, parent_allocator);
             log.warnId("agent", rid, "tool.exec HOST-{s}(par) name={s} duration_ms={d}", .{ code, name, elapsed });
             return .{ .done = .{ .content = ej, .is_error = true, .elapsed_ms = elapsed } };
         },
         .ok => {},
     }
     const ok_bytes = r.ok;
-    // dispatch 结果在 arena 里 → dupe 到父 allocator 逃逸;大结果落盘(超阈值 → preview+path)。
-    var content: ?[]u8 = null;
-    if (parent_allocator.dupe(u8, ok_bytes) catch null) |o| {
-        const storage = @import("../tools/tool_result_storage.zig");
-        if (storage.maybePersist(parent_allocator, name, o, base_ctx.home_dir) catch null) |preview| {
-            parent_allocator.free(o);
-            content = preview;
-        } else {
-            content = o;
-        }
-    }
+    // dispatch 结果在 arena 里 → dupe 到父 allocator 逃逸。落盘必须延迟到
+    // executeSlots 确认整批无 fatal 之后，否则 fatal 会留下无人引用的 transient 文件。
+    const content = try parent_allocator.dupe(u8, ok_bytes);
     const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
     log.infoId("agent", rid, "tool.exec done(par) name={s} output_bytes={d} duration_ms={d}", .{ name, ok_bytes.len, elapsed });
     return .{ .done = .{ .content = content, .is_error = false, .elapsed_ms = elapsed } };
 }
 
+fn hostToolErrorJson(
+    code: []const u8,
+    name: []const u8,
+    maybe_detail: ?[]const u8,
+    allocator: std.mem.Allocator,
+) error{OutOfMemory}![]u8 {
+    const tool_error = @import("tool_error.zig");
+    if (maybe_detail) |detail| {
+        if (detail.len != 0) {
+            if (try tool_error.errorToJsonCapped(code, detail, MAX_TOOL_ERROR_PAYLOAD_BYTES_V1, allocator)) |encoded|
+                return encoded;
+        }
+    }
+    return tool_error.errorToJson(code, "{s} failed with {s}", .{ name, code }, allocator) catch error.OutOfMemory;
+}
+
 fn runJob(job: *Job) void {
     const s = job.slot;
-    switch (executeOne(job.ctx, s.name, s.input, s.id, job.parent_allocator, job.rid)) {
+    const result = executeOne(job.ctx, s.name, s.input, s.id, job.parent_allocator, job.rid) catch {
+        job.out_of_memory = true;
+        job.done = true;
+        return;
+    };
+    switch (result) {
         .pending => |p| {
             s.pending = true;
             s.pending_kind = p.kind;
@@ -225,7 +241,7 @@ pub fn executeSlots(
     base_ctx: *const ToolContext,
     parent_allocator: std.mem.Allocator,
     rid: log.RequestId,
-) error{HostToolFatal}!void {
+) error{ HostToolFatal, OutOfMemory }!void {
     var i: usize = 0;
     while (i < slots.len) {
         // denied(已填错误)或 prefetched(结果已由流式预取填好)→ 跳过,不执行。
@@ -248,15 +264,30 @@ pub fn executeSlots(
                 var job = Job{ .slot = s, .ctx = base_ctx, .parent_allocator = parent_allocator, .rid = rid };
                 runJob(&job);
                 if (job.fatal) return error.HostToolFatal;
+                if (job.out_of_memory) return error.OutOfMemory;
             }
         }
         i = j;
     }
 
+    // 只有整批确认无 fatal/OOM 后才允许产生持久化副作用。
+    persistCompletedResults(slots, base_ctx, parent_allocator);
+
     // per-message 聚合预算(对齐 cc MAX_TOOL_RESULTS_PER_MESSAGE_CHARS):一轮多个工具
     // 结果合计超 200k → 按大小降序把最大的落盘(替成 preview)直到达标。批1A 并发后
-    // 多工具同时产大结果更易触发;单结果落盘(maybePersist)已在 runJob 做,这里管"合计"。
+    // 多工具同时产大结果更易触发;单结果落盘由上方确认整批成功后统一做,这里管"合计"。
     enforceMessageBudget(slots, base_ctx, parent_allocator);
+}
+
+fn persistCompletedResults(slots: []Slot, base_ctx: *const ToolContext, parent_allocator: std.mem.Allocator) void {
+    const storage = @import("../tools/tool_result_storage.zig");
+    for (slots) |*slot| {
+        const content = slot.content orelse continue;
+        if (storage.maybePersist(parent_allocator, slot.name, content, base_ctx.home_dir) catch null) |preview| {
+            parent_allocator.free(content);
+            slot.content = preview;
+        }
+    }
 }
 
 const MAX_TOOL_RESULTS_PER_MESSAGE: usize = 200_000;
@@ -322,7 +353,7 @@ test "executeSlots 跳过 prefetched slot(不重复执行,P0.4 无双执行铁�
 test "executeOne:成功路径返回 done+content(与 executeSlots 同一入口)" {
     const a = std.testing.allocator;
     var ctx = tools_mod.ToolContext{ .allocator = a, .cwd_abs = "." };
-    const r = executeOne(&ctx, "Glob", "{\"pattern\":\"*.zig\"}", "gid", a, .{ .bytes = [_]u8{'0'} ** 12 });
+    const r = try executeOne(&ctx, "Glob", "{\"pattern\":\"*.zig\"}", "gid", a, .{ .bytes = [_]u8{'0'} ** 12 });
     switch (r) {
         .done => |d| {
             try std.testing.expect(!d.is_error);
@@ -336,7 +367,7 @@ test "executeOne:成功路径返回 done+content(与 executeSlots 同一入口)"
 test "executeOne:UnknownTool → 富错误引导(prefetch/executeSlots 共享此路径)" {
     const a = std.testing.allocator;
     var ctx = tools_mod.ToolContext{ .allocator = a };
-    const r = executeOne(&ctx, "NoSuchTool", "{}", "x", a, .{ .bytes = [_]u8{'0'} ** 12 });
+    const r = try executeOne(&ctx, "NoSuchTool", "{}", "x", a, .{ .bytes = [_]u8{'0'} ** 12 });
     switch (r) {
         .done => |d| {
             try std.testing.expect(d.is_error);
@@ -354,7 +385,7 @@ test "executeOne:UnknownTool → 富错误引导(prefetch/executeSlots 共享此
 
 /// 一批 safe slot 并发执行(每个独立线程,cap MAX_TOOL_CONCURRENCY)。
 /// fatal 语义:当前窗口的 worker **全部 join** 后才检查/返回;fatal 后不启动下一窗口。
-fn runConcurrentBatch(batch: []Slot, base_ctx: *const ToolContext, parent_allocator: std.mem.Allocator, rid: log.RequestId) error{HostToolFatal}!void {
+fn runConcurrentBatch(batch: []Slot, base_ctx: *const ToolContext, parent_allocator: std.mem.Allocator, rid: log.RequestId) error{ HostToolFatal, OutOfMemory }!void {
     return runConcurrentBatchWithSpawner(batch, base_ctx, parent_allocator, rid, spawnJob);
 }
 
@@ -372,13 +403,14 @@ fn runConcurrentBatchWithSpawner(
     parent_allocator: std.mem.Allocator,
     rid: log.RequestId,
     spawn_job: SpawnJobFn,
-) error{HostToolFatal}!void {
+) error{ HostToolFatal, OutOfMemory }!void {
     var jobs = parent_allocator.alloc(Job, batch.len) catch {
         // 分配失败 → 退化串行
         for (batch) |*s| {
             var job = Job{ .slot = s, .ctx = base_ctx, .parent_allocator = parent_allocator, .rid = rid };
             runJob(&job);
             if (job.fatal) return error.HostToolFatal;
+            if (job.out_of_memory) return error.OutOfMemory;
         }
         return;
     };
@@ -389,6 +421,7 @@ fn runConcurrentBatchWithSpawner(
         for (jobs) |*job| {
             runJob(job);
             if (job.fatal) return error.HostToolFatal;
+            if (job.out_of_memory) return error.OutOfMemory;
         }
         return;
     };
@@ -407,7 +440,7 @@ fn runConcurrentBatchWithSpawner(
                 // 启动窗口内剩余 job；之前已启动的线程仍在下方全部 join。
                 runJob(&jobs[k]);
                 k += 1;
-                if (jobs[k - 1].fatal) break;
+                if (jobs[k - 1].fatal or jobs[k - 1].out_of_memory) break;
             } else {
                 k += 1;
             }
@@ -420,6 +453,9 @@ fn runConcurrentBatchWithSpawner(
         // join 完整个窗口后才检查 fatal——不撕裂在飞 worker;fatal 则不再开下一窗口。
         for (jobs[started..launched_end]) |*job| {
             if (job.fatal) return error.HostToolFatal;
+        }
+        for (jobs[started..launched_end]) |*job| {
+            if (job.out_of_memory) return error.OutOfMemory;
         }
         started = window_end;
     }
@@ -526,6 +562,139 @@ test "thread spawn fallback observes fatal before starting the next job" {
         runConcurrentBatchWithSpawner(&slots, &ctx, a, .{ .bytes = [_]u8{'0'} ** 12 }, alwaysFailSpawn),
     );
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
+}
+
+test "serial host fatal stops before the next slot" {
+    const SerialProbe = struct {
+        calls: usize = 0,
+
+        fn dispatch(raw: *const anyopaque, tool_ctx: *const tools_mod.ToolContext, name: []const u8, args: []const u8) anyerror!tools_mod.ToolDispatchOutcome {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (std.mem.eql(u8, name, "FatalSerial")) return .host_fatal;
+            return .{ .ok = try tool_ctx.allocator.dupe(u8, args) };
+        }
+        fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+        fn nameAt(_: *const anyopaque, _: usize) ?[]const u8 {
+            return null;
+        }
+        fn hostSync(_: *const anyopaque, _: []const u8) bool {
+            return false; // force the serial path
+        }
+        fn dispatcher(self: *@This()) tools_mod.ToolDispatcher {
+            return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .prefetchSafeFn = prefetchSafe, .nameAtFn = nameAt, .hostSyncFn = hostSync };
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var probe = SerialProbe{};
+    var ctx = tools_mod.ToolContext{ .allocator = allocator, .tool_dispatcher = probe.dispatcher() };
+    var slots = [_]Slot{
+        .{ .decision = .run, .name = "FatalSerial", .id = "1", .input = "{}" },
+        .{ .decision = .run, .name = "AfterSerial", .id = "2", .input = "{}" },
+    };
+    defer for (&slots) |*slot| slot.deinit(allocator);
+    try std.testing.expectError(error.HostToolFatal, executeSlots(&slots, &ctx, allocator, .{ .bytes = [_]u8{'0'} ** 12 }));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+}
+
+test "concurrent host fatal joins started workers and skips the next window" {
+    const ConcurrentProbe = struct {
+        slow_done: std.atomic.Value(bool) = .init(false),
+        after_started: std.atomic.Value(bool) = .init(false),
+
+        fn dispatch(raw: *const anyopaque, tool_ctx: *const tools_mod.ToolContext, name: []const u8, args: []const u8) anyerror!tools_mod.ToolDispatchOutcome {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (std.mem.startsWith(u8, name, "Slow")) {
+                platform.sync.sleepMs(20);
+                self.slow_done.store(true, .release);
+                return .{ .ok = try tool_ctx.allocator.dupe(u8, args) };
+            }
+            if (std.mem.eql(u8, name, "FatalConcurrent")) return .host_fatal;
+            if (std.mem.eql(u8, name, "AfterWindow")) self.after_started.store(true, .release);
+            return .{ .ok = try tool_ctx.allocator.dupe(u8, args) };
+        }
+        fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+        fn nameAt(_: *const anyopaque, _: usize) ?[]const u8 {
+            return null;
+        }
+        fn hostSync(_: *const anyopaque, _: []const u8) bool {
+            return true;
+        }
+        fn dispatcher(self: *@This()) tools_mod.ToolDispatcher {
+            return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .prefetchSafeFn = prefetchSafe, .nameAtFn = nameAt, .hostSyncFn = hostSync };
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var probe = ConcurrentProbe{};
+    var ctx = tools_mod.ToolContext{ .allocator = allocator, .tool_dispatcher = probe.dispatcher() };
+    var slots = [_]Slot{
+        .{ .decision = .run, .name = "Slow0", .id = "0", .input = "{}" },
+        .{ .decision = .run, .name = "FatalConcurrent", .id = "1", .input = "{}" },
+        .{ .decision = .run, .name = "Slow2", .id = "2", .input = "{}" },
+        .{ .decision = .run, .name = "Slow3", .id = "3", .input = "{}" },
+        .{ .decision = .run, .name = "Slow4", .id = "4", .input = "{}" },
+        .{ .decision = .run, .name = "Slow5", .id = "5", .input = "{}" },
+        .{ .decision = .run, .name = "Slow6", .id = "6", .input = "{}" },
+        .{ .decision = .run, .name = "Slow7", .id = "7", .input = "{}" },
+        .{ .decision = .run, .name = "AfterWindow", .id = "8", .input = "{}" },
+    };
+    defer for (&slots) |*slot| slot.deinit(allocator);
+    try std.testing.expectError(error.HostToolFatal, executeSlots(&slots, &ctx, allocator, .{ .bytes = [_]u8{'0'} ** 12 }));
+    try std.testing.expect(probe.slow_done.load(.acquire));
+    try std.testing.expect(!probe.after_started.load(.acquire));
+}
+
+test "fatal batch does not persist a completed transient result" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var home_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const home_len = try tmp.dir.realPath(std.testing.io, &home_buffer);
+    const home = home_buffer[0..home_len];
+    const result_dir = try std.fmt.allocPrintSentinel(allocator, "{s}/.metacodes/tool-results", .{home}, 0);
+    defer allocator.free(result_dir);
+
+    const large = try allocator.alloc(u8, 60_000);
+    defer allocator.free(large);
+    @memset(large, 'x');
+    var ctx = tools_mod.ToolContext{ .allocator = allocator, .home_dir = home, .tool_dispatcher = StubDispatcher.dispatcher() };
+    var slots = [_]Slot{
+        .{ .decision = .run, .name = "LargeResult", .id = "1", .input = large },
+        .{ .decision = .run, .name = "FatalTool", .id = "2", .input = "{}" },
+    };
+    defer for (&slots) |*slot| slot.deinit(allocator);
+
+    try std.testing.expectError(error.HostToolFatal, executeSlots(&slots, &ctx, allocator, .{ .bytes = [_]u8{'0'} ** 12 }));
+    try std.testing.expect(!platform.fs.exists(result_dir.ptr));
+}
+
+test "Host detail JSON is exact when valid and falls back when encoded payload exceeds cap" {
+    const allocator = std.testing.allocator;
+    const detail = "quote=\" slash=\\ line=\n nul=\x00";
+    const encoded = try hostToolErrorJson("HostToolFailed", "HostX", detail, allocator);
+    defer allocator.free(encoded);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(detail, parsed.value.object.get("error").?.object.get("detail").?.string);
+
+    const hostile = try allocator.alloc(u8, 200 * 1024);
+    defer allocator.free(hostile);
+    @memset(hostile, 0);
+    const fallback = try hostToolErrorJson("HostToolRejected", "HostX", hostile, allocator);
+    defer allocator.free(fallback);
+    try std.testing.expect(fallback.len <= MAX_TOOL_ERROR_PAYLOAD_BYTES_V1);
+    var fallback_parsed = try std.json.parseFromSlice(std.json.Value, allocator, fallback, .{});
+    defer fallback_parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "HostX failed with HostToolRejected",
+        fallback_parsed.value.object.get("error").?.object.get("detail").?.string,
+    );
 }
 
 test "Slot.takeContent 转移即置空,与 deinit 无双释放" {

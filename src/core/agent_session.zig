@@ -415,6 +415,11 @@ pub const AgentSession = struct {
             &backend,
             self.allocator,
         ) catch |err| {
+            if (err == error.HostToolFatal) {
+                self.mutex.lock();
+                self.callback_failed = true;
+                self.mutex.unlock();
+            }
             const callback_failed = self.poisonRun();
             if (callback_failed) return error.CallbackFailed;
             return err;

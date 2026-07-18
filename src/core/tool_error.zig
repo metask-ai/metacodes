@@ -81,18 +81,22 @@ pub const ToolError = struct {
         allocator.free(self.detail);
     }
 
+    fn writeJson(self: *const ToolError, writer: *std.Io.Writer) !void {
+        try writer.writeAll("{\"error\":{\"code\":\"");
+        try writer.writeAll(self.code.name());
+        try writer.writeAll("\",\"category\":\"");
+        try writer.writeAll(self.category.name());
+        try writer.writeAll("\",\"detail\":");
+        try std.json.Stringify.encodeJsonString(self.detail, .{}, writer);
+        try writer.print(",\"recoverable\":{s}}}}}", .{if (self.recoverable) "true" else "false"});
+    }
+
     /// 序列化成 JSON 字符串（owned）。形如：
     ///   {"error":{"code":"not_read","category":"user_error","detail":"...","recoverable":true}}
     pub fn toJson(self: *const ToolError, allocator: std.mem.Allocator) ![]u8 {
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
-        try aw.writer.writeAll("{\"error\":{\"code\":\"");
-        try aw.writer.writeAll(self.code.name());
-        try aw.writer.writeAll("\",\"category\":\"");
-        try aw.writer.writeAll(self.category.name());
-        try aw.writer.writeAll("\",\"detail\":");
-        try std.json.Stringify.encodeJsonString(self.detail, .{}, &aw.writer);
-        try aw.writer.print(",\"recoverable\":{s}}}}}", .{if (self.recoverable) "true" else "false"});
+        try self.writeJson(&aw.writer);
         return try aw.toOwnedSlice();
     }
 };
@@ -129,31 +133,38 @@ const ERROR_MAP = [_]ErrorSpec{
 /// 改成"以任一 prefix 开头"的匹配 —— Missing* / Empty* / Invalid* 都归入 invalid_args。
 const INVALID_ARGS_PREFIXES = [_][]const u8{ "Missing", "Empty", "Invalid" };
 
-pub fn fromErrorName(err_name: []const u8, detail_owned: []const u8) ToolError {
-    // 精确匹配 ERROR_MAP
+const Classification = struct {
+    code: Code,
+    category: Category,
+    recoverable: bool,
+};
+
+fn classifyErrorName(err_name: []const u8) Classification {
     for (ERROR_MAP) |spec| {
-        if (std.mem.eql(u8, err_name, spec.name)) {
-            return .{
-                .code = spec.code,
-                .category = spec.category,
-                .detail = detail_owned,
-                .recoverable = spec.recoverable,
-            };
-        }
+        if (std.mem.eql(u8, err_name, spec.name)) return .{
+            .code = spec.code,
+            .category = spec.category,
+            .recoverable = spec.recoverable,
+        };
     }
-    // 前缀匹配 invalid_args
     for (INVALID_ARGS_PREFIXES) |prefix| {
-        if (std.mem.startsWith(u8, err_name, prefix)) {
-            return .{
-                .code = .invalid_args,
-                .category = .user_error,
-                .detail = detail_owned,
-                .recoverable = true,
-            };
-        }
+        if (std.mem.startsWith(u8, err_name, prefix)) return .{
+            .code = .invalid_args,
+            .category = .user_error,
+            .recoverable = true,
+        };
     }
-    // fallback
-    return .{ .code = .other, .category = .system_error, .detail = detail_owned, .recoverable = true };
+    return .{ .code = .other, .category = .system_error, .recoverable = true };
+}
+
+pub fn fromErrorName(err_name: []const u8, detail_owned: []const u8) ToolError {
+    const classification = classifyErrorName(err_name);
+    return .{
+        .code = classification.code,
+        .category = classification.category,
+        .detail = detail_owned,
+        .recoverable = classification.recoverable,
+    };
 }
 
 /// 便利：给 agent_loop 用——从 Zig error 直接生成 JSON。allocator 负责 detail 和返回值。
@@ -172,6 +183,40 @@ pub fn errorToJson(err_name: []const u8, comptime detail_fmt: []const u8, detail
     return try e.toJson(allocator);
 }
 
+/// Serialize a borrowed external detail only if the complete encoded JSON fits
+/// `max_bytes`. The first pass writes into a fixed-buffer discarding writer, so
+/// hostile escaping expansion is measured without allocating. The second pass
+/// allocates exactly the measured size; `null` means invalid UTF-8 or over cap.
+pub fn errorToJsonCapped(
+    err_name: []const u8,
+    detail: []const u8,
+    max_bytes: usize,
+    allocator: std.mem.Allocator,
+) error{OutOfMemory}!?[]u8 {
+    if (!std.unicode.utf8ValidateSlice(detail)) return null;
+    const classification = classifyErrorName(err_name);
+    const borrowed = ToolError{
+        .code = classification.code,
+        .category = classification.category,
+        .detail = detail,
+        .recoverable = classification.recoverable,
+    };
+
+    var count_buffer: [256]u8 = undefined;
+    var discarding: std.Io.Writer.Discarding = .init(&count_buffer);
+    borrowed.writeJson(&discarding.writer) catch unreachable;
+    const encoded_len_u64 = discarding.fullCount();
+    if (encoded_len_u64 > max_bytes or encoded_len_u64 > std.math.maxInt(usize)) return null;
+    const encoded_len: usize = @intCast(encoded_len_u64);
+
+    var aw = try std.Io.Writer.Allocating.initCapacity(allocator, encoded_len);
+    defer aw.deinit();
+    borrowed.writeJson(&aw.writer) catch return error.OutOfMemory;
+    const encoded = try aw.toOwnedSlice();
+    std.debug.assert(encoded.len == encoded_len);
+    return encoded;
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -187,6 +232,30 @@ test "toJson basic" {
         "{\"error\":{\"code\":\"not_read\",\"category\":\"user_error\",\"detail\":\"file src/x.zig not read\",\"recoverable\":true}}",
         j,
     );
+}
+
+test "capped serializer preserves external detail and rejects escaping expansion before allocation" {
+    const allocator = std.testing.allocator;
+    const detail = "quote=\" slash=\\ line=\n nul=\x00 end";
+    const encoded = (try errorToJsonCapped("HostToolFailed", detail, 1024 * 1024, allocator)).?;
+    defer allocator.free(encoded);
+    try std.testing.expect(encoded.len <= 1024 * 1024);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, encoded, .{});
+    defer parsed.deinit();
+    const decoded = parsed.value.object.get("error").?.object.get("detail").?.string;
+    try std.testing.expectEqualStrings(detail, decoded);
+
+    // 200 KiB of NUL expands to roughly 1.2 MiB (`\\u0000` each). A failing
+    // output allocator proves the rejection path performs no allocation.
+    const hostile = try allocator.alloc(u8, 200 * 1024);
+    defer allocator.free(hostile);
+    @memset(hostile, 0);
+    var no_alloc = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expect((try errorToJsonCapped("HostToolFailed", hostile, 1024 * 1024, no_alloc.allocator())) == null);
+
+    var fail_small = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, errorToJsonCapped("HostToolFailed", "small", 1024 * 1024, fail_small.allocator()));
 }
 
 test "fromErrorName maps common errors" {

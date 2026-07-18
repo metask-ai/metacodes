@@ -56,7 +56,13 @@ const Job = struct {
 fn runJob(job: *Job) void {
     // **与 executeSlots 共用同一 executeOne**:执行语义/错误处理/大结果落盘完全一致(无分叉)。
     const tool_exec = @import("tool_exec.zig");
-    switch (tool_exec.executeOne(job.ctx, job.name, job.input, job.entry.id, job.parent_allocator, job.rid)) {
+    const result = tool_exec.executeOne(job.ctx, job.name, job.input, job.entry.id, job.parent_allocator, job.rid) catch {
+        // Speculation may fail under pressure; the authoritative executeSlots
+        // path retries and applies the Run-level OOM contract.
+        job.entry.skip = true;
+        return;
+    };
+    switch (result) {
         .pending => |p| {
             // 并发安全工具不该发起 custom UI;保守丢弃 + 标 skip → executeSlots 正常重跑。
             if (p.kind) |k| job.parent_allocator.free(k);
