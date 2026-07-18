@@ -48,6 +48,33 @@ fn addNestedBuildCacheArgs(b: *std.Build, run: *std.Build.Step.Run) void {
     });
 }
 
+const AgentCoreAbiModuleOptions = struct {
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    strip: bool,
+    core_mod: *std.Build.Module,
+    types_mod: *std.Build.Module,
+    protocol_mod: *std.Build.Module,
+};
+
+/// Create a fresh AgentCore ABI module for one artifact policy. Tests and the
+/// distributable library deliberately use distinct module instances: strip is
+/// a delivery concern and must never leak into in-tree test executables.
+fn createAgentCoreAbiModule(b: *std.Build, options: AgentCoreAbiModuleOptions) *std.Build.Module {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/agentcore/abi_v1.zig"),
+        .target = options.target,
+        .optimize = options.optimize,
+        .strip = options.strip,
+        .link_libc = true,
+    });
+    addHl(b, mod);
+    mod.addImport("metacodes-core", options.core_mod);
+    mod.addImport("metacodes_agentcore_types", options.types_mod);
+    mod.addImport("metacodes_agentcore_protocol", options.protocol_mod);
+    return mod;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const target_was_explicit = b.user_input_options.contains("target");
@@ -228,33 +255,58 @@ pub fn build(b: *std.Build) void {
     });
     agentcore_sdk_mod.addImport("metacodes_agentcore_types", agentcore_types_mod);
     agentcore_sdk_mod.addImport("metacodes_agentcore_protocol", agentcore_protocol_mod);
-    const agentcore_abi_mod = b.createModule(.{
-        .root_source_file = b.path("src/agentcore/abi_v1.zig"),
+    const agentcore_abi_test_mod = createAgentCoreAbiModule(b, .{
+        .target = target,
+        .optimize = optimize,
+        .strip = false,
+        .core_mod = core_mod,
+        .types_mod = agentcore_types_mod,
+        .protocol_mod = agentcore_protocol_mod,
+    });
+    const agentcore_abi_bundle_mod = createAgentCoreAbiModule(b, .{
         .target = target,
         .optimize = optimize,
         .strip = agentcore_strip,
-        .link_libc = true,
+        .core_mod = core_mod,
+        .types_mod = agentcore_types_mod,
+        .protocol_mod = agentcore_protocol_mod,
     });
-    addHl(b, agentcore_abi_mod);
-    agentcore_abi_mod.addImport("metacodes-core", core_mod);
-    agentcore_abi_mod.addImport("metacodes_agentcore_types", agentcore_types_mod);
-    agentcore_abi_mod.addImport("metacodes_agentcore_protocol", agentcore_protocol_mod);
 
     const agentcore_test_step = b.step("agentcore:test", "Run AgentCore binary ABI v1 tests");
-    const agentcore_abi_test = b.addTest(.{ .name = "agentcore-abi-unit", .root_module = agentcore_abi_mod });
+    const agentcore_abi_test = b.addTest(.{
+        .name = "agentcore-abi-unit",
+        .root_module = agentcore_abi_test_mod,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+    });
     agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_abi_test, windows_test_prelude).step);
-    const agentcore_types_test = b.addTest(.{ .name = "agentcore-types-unit", .root_module = agentcore_types_mod });
+    const agentcore_types_test = b.addTest(.{
+        .name = "agentcore-types-unit",
+        .root_module = agentcore_types_mod,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+    });
     agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_types_test, windows_test_prelude).step);
-    const agentcore_protocol_test = b.addTest(.{ .name = "agentcore-protocol-unit", .root_module = agentcore_protocol_mod });
+    const agentcore_protocol_test = b.addTest(.{
+        .name = "agentcore-protocol-unit",
+        .root_module = agentcore_protocol_mod,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+    });
     agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_protocol_test, windows_test_prelude).step);
-    const agentcore_sdk_test = b.addTest(.{ .name = "agentcore-sdk-unit", .root_module = agentcore_sdk_mod });
+    const agentcore_sdk_test = b.addTest(.{
+        .name = "agentcore-sdk-unit",
+        .root_module = agentcore_sdk_mod,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+    });
     agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_sdk_test, windows_test_prelude).step);
     const agentcore_manifest_contract_mod = b.createModule(.{
         .root_source_file = b.path("tests/agentcore_artifact_consumer/manifest_contract.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const agentcore_manifest_contract_test = b.addTest(.{ .name = "agentcore-manifest-contract", .root_module = agentcore_manifest_contract_mod });
+    const agentcore_manifest_contract_test = b.addTest(.{
+        .name = "agentcore-manifest-contract",
+        .root_module = agentcore_manifest_contract_mod,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+    });
     agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_manifest_contract_test, windows_test_prelude).step);
     const agentcore_manifest_tool_mod = b.createModule(.{
         .root_source_file = b.path("scripts/agentcore_manifest.zig"),
@@ -268,6 +320,7 @@ pub fn build(b: *std.Build) void {
     const agentcore_manifest_tool_test = b.addTest(.{
         .name = "agentcore-manifest-unit",
         .root_module = agentcore_manifest_tool_mod,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_manifest_tool_test, windows_test_prelude).step);
     // header 可编译性检查:走 zig 构建系统原生 C 对象(不 install,只编译)。
@@ -304,17 +357,21 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     agentcore_contract_mod.addImport("harness", test_harness_mod); // 共享模块(perf,见 debug exe 后注释)
-    agentcore_contract_mod.addImport("agentcore-abi", agentcore_abi_mod);
+    agentcore_contract_mod.addImport("agentcore-abi", agentcore_abi_test_mod);
     agentcore_contract_mod.addImport("agentcore-sdk", agentcore_sdk_mod);
     agentcore_contract_mod.addImport("metacodes-core", core_mod);
     addPlatform(b, agentcore_contract_mod);
-    const agentcore_contract_test = b.addTest(.{ .name = "agentcore-abi-contract", .root_module = agentcore_contract_mod });
+    const agentcore_contract_test = b.addTest(.{
+        .name = "agentcore-abi-contract",
+        .root_module = agentcore_contract_mod,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+    });
     agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_contract_test, windows_test_prelude).step);
 
     const agentcore_lib = b.addLibrary(.{
         .name = "metacodes_agentcore",
         .linkage = .static,
-        .root_module = agentcore_abi_mod,
+        .root_module = agentcore_abi_bundle_mod,
     });
     const resolved_agentcore_target = target.result.zigTriple(b.allocator) catch @panic("OOM");
     const agentcore_architecture = @tagName(target.result.cpu.arch);
@@ -436,6 +493,9 @@ pub fn build(b: *std.Build) void {
         agentcore_gate_step.dependOn(agentcore_test_step);
         agentcore_gate_step.dependOn(&consumer_cmd.step);
     }
+    if (tfilter != null) agentcore_gate_step.dependOn(&b.addFail(
+        "agentcore:gate does not accept -Dtfilter; use agentcore:test for filtered diagnostics",
+    ).step);
 
     // test:lib —— 编译库全图(refAllDeclsRecursive),绿即证库与 UI 物理隔离。
     const core_test_mod = b.createModule(.{
