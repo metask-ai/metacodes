@@ -51,6 +51,21 @@ pub const RunIdentity = tool_catalog.RunIdentity;
 pub const HostRunIdentity = tool_catalog.HostRunIdentity;
 pub const UiRequester = ui_request.UiRequester;
 
+pub const AgentSessionUiRequester = struct {
+    ctx: *anyopaque,
+    requestFn: *const fn (
+        ctx: *anyopaque,
+        identity: RunIdentity,
+        allocator: std.mem.Allocator,
+        req: *const ui_request.UiRequest,
+        out: *ui_request.UiResponse,
+    ) anyerror!ui_request.RequestOutcome,
+
+    fn request(self: AgentSessionUiRequester, identity: RunIdentity, response_allocator: std.mem.Allocator, req: *const ui_request.UiRequest, out: *ui_request.UiResponse) anyerror!ui_request.RequestOutcome {
+        return self.requestFn(self.ctx, identity, response_allocator, req, out);
+    }
+};
+
 pub const RuntimeError = error{
     RuntimeBusy,
     RuntimeUnavailable,
@@ -180,6 +195,7 @@ pub const SessionConfig = struct {
     /// Optional synchronous Host UI bridge. The Host-owned callback context
     /// must outlive this Session.
     ui_requester: ?UiRequester = null,
+    run_ui_requester: ?AgentSessionUiRequester = null,
     /// Host tool 身份锚点(type-erased,注册方 adapter 才可解释;core 只透传不解引用)。
     /// 合法状态:未选任何 Host tool → 允许 null;选了 Host tool 而 null → create 拒绝
     /// (admission 校验,不留"理论上不可能"的运行期空态)。owner 为创建方,须活到
@@ -241,6 +257,7 @@ pub const AgentSession = struct {
     session_rules: SessionRules,
     permission_ctx: permission.PermissionContext,
     host_ui_requester: ?UiRequester,
+    host_run_ui_requester: ?AgentSessionUiRequester,
     /// Host tool 身份锚点(SessionConfig.host_identity_ctx,core 只透传)。
     host_identity_ctx: ?*anyopaque = null,
     abort_signal: AbortSignal,
@@ -332,11 +349,12 @@ pub const AgentSession = struct {
             .session_rules = .{},
             .permission_ctx = permission_ctx,
             .host_ui_requester = config.ui_requester,
+            .host_run_ui_requester = config.run_ui_requester,
             .host_identity_ctx = config.host_identity_ctx,
             .abort_signal = AbortSignal.init(),
         };
         self.permission_ctx.session_rules = &self.session_rules;
-        self.permission_ctx.ui_requester = if (config.ui_requester != null)
+        self.permission_ctx.ui_requester = if (config.ui_requester != null or config.run_ui_requester != null)
             .{ .ctx = self, .requestFn = requestHostUi }
         else
             null;
@@ -593,8 +611,30 @@ pub const AgentSession = struct {
         out: *ui_request.UiResponse,
     ) anyerror!ui_request.RequestOutcome {
         const self: *AgentSession = @ptrCast(@alignCast(raw));
-        const requester = self.host_ui_requester orelse return .unavailable;
-        return requester.request(session_id, response_allocator, req, out) catch |err| {
+        self.mutex.lock();
+        const identity = switch (self.state) {
+            .running, .abort_requested => if (std.mem.eql(u8, session_id.asSlice(), self.session_id.asSlice()) and self.active_run_id != 0)
+                RunIdentity{ .session_id = self.session_id, .run_id = self.active_run_id }
+            else
+                null,
+            .idle, .poisoned, .destroying => null,
+        };
+        if (identity == null and (self.state == .running or self.state == .abort_requested)) {
+            if (!self.callback_failed) {
+                self.callback_failed = true;
+                self.abort_signal.abort(.host_failure);
+            }
+        }
+        self.mutex.unlock();
+        const admitted = identity orelse return error.HostUiFailed;
+
+        const result = if (self.host_run_ui_requester) |requester|
+            requester.request(admitted, response_allocator, req, out)
+        else if (self.host_ui_requester) |requester|
+            requester.request(session_id, response_allocator, req, out)
+        else
+            return .unavailable;
+        return result catch |err| {
             // A Host UI transport/decoding error is infrastructure failure,
             // not a model-visible tool error. Abort the current Run and let
             // finishRunLifecycle poison the Session consistently with event

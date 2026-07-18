@@ -30,6 +30,8 @@ const HOST_SSE =
     "data: {\"type\":\"message_stop\"}\n\n";
 
 const Probe = struct {
+    expected_session: ?*wire.SessionHandle = null,
+    expected_run_id: u64 = 1,
     ui_calls: usize = 0,
     ui_releases: usize = 0,
     host_calls: usize = 0,
@@ -37,10 +39,18 @@ const Probe = struct {
     saw_tool_start: bool = false,
     saw_tool_result: bool = false,
 
-    fn event(raw: ?*anyopaque, _: ?*wire.SessionHandle, _: u64, event_json: wire.BytesViewV1) callconv(.c) u32 {
-        const self: *Probe = @ptrCast(@alignCast(raw orelse return wire.CALLBACK_FATAL));
-        const bytes = sdk.borrowedBytes(event_json) catch return wire.CALLBACK_FATAL;
-        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, bytes) catch return wire.CALLBACK_FATAL;
+    fn context(self: *const Probe, run_ptr: ?*const wire.RunContextV1) ?sdk.RunContext {
+        const run = sdk.validateRunContext(run_ptr) catch return null;
+        if (run.session != self.expected_session or run.run_id != self.expected_run_id or run.session_id.len != 24)
+            return null;
+        return run;
+    }
+
+    fn event(raw: ?*anyopaque, run_ptr: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *Probe = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        _ = self.context(run_ptr) orelse return wire.EVENT_FATAL;
+        const bytes = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, bytes) catch return wire.EVENT_FATAL;
         defer parsed.deinit();
         switch (parsed.value) {
             .known => |known_event| switch (known_event) {
@@ -50,11 +60,12 @@ const Probe = struct {
             },
             .unknown => {},
         }
-        return wire.CALLBACK_CONTINUE;
+        return wire.EVENT_CONTINUE;
     }
 
-    fn ui(raw: ?*anyopaque, _: ?*wire.SessionHandle, request_json: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+    fn ui(raw: ?*anyopaque, run_ptr: ?*const wire.RunContextV1, request_json: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
         const self: *Probe = @ptrCast(@alignCast(raw orelse return wire.UI_FATAL));
+        _ = self.context(run_ptr) orelse return wire.UI_FATAL;
         const bytes = sdk.borrowedBytes(request_json) catch return wire.UI_FATAL;
         const parsed = sdk.decodeUiRequest(std.heap.c_allocator, bytes) catch return wire.UI_FATAL;
         defer parsed.deinit();
@@ -78,9 +89,9 @@ const Probe = struct {
         }
     }
 
-    fn host(raw: ?*anyopaque, session_id: wire.BytesViewV1, args: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+    fn host(raw: ?*anyopaque, run_ptr: ?*const wire.RunContextV1, args: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
         const self: *Probe = @ptrCast(@alignCast(raw orelse return wire.HOST_FAILED));
-        if ((sdk.borrowedBytes(session_id) catch return wire.HOST_FAILED).len != 24) return wire.HOST_FAILED;
+        _ = self.context(run_ptr) orelse return wire.HOST_FATAL;
         if (std.mem.indexOf(u8, sdk.borrowedBytes(args) catch return wire.HOST_FAILED, "hello") == null) return wire.HOST_FAILED;
         self.host_calls += 1;
         const result = "host-ok";
@@ -106,7 +117,7 @@ const UiFailureProbe = struct {
     releases: usize = 0,
     byte: u8 = 0,
 
-    fn ui(raw: ?*anyopaque, _: ?*wire.SessionHandle, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+    fn ui(raw: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
         const self: *UiFailureProbe = @ptrCast(@alignCast(raw orelse return wire.UI_FATAL));
         self.calls += 1;
         return switch (self.mode) {
@@ -131,10 +142,10 @@ const UiFailureProbe = struct {
 const FatalEventProbe = struct {
     calls: usize = 0,
 
-    fn event(raw: ?*anyopaque, _: ?*wire.SessionHandle, _: u64, _: wire.BytesViewV1) callconv(.c) u32 {
-        const self: *FatalEventProbe = @ptrCast(@alignCast(raw orelse return wire.CALLBACK_FATAL));
+    fn event(raw: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *FatalEventProbe = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
         self.calls += 1;
-        return wire.CALLBACK_FATAL;
+        return wire.EVENT_FATAL;
     }
 };
 
@@ -144,18 +155,19 @@ const AbortEventProbe = struct {
     stale_abort_status: u32 = std.math.maxInt(u32),
     abort_status: u32 = std.math.maxInt(u32),
 
-    fn event(raw: ?*anyopaque, session: ?*wire.SessionHandle, run_id: u64, _: wire.BytesViewV1) callconv(.c) u32 {
-        const self: *AbortEventProbe = @ptrCast(@alignCast(raw orelse return wire.CALLBACK_FATAL));
+    fn event(raw: ?*anyopaque, run_ptr: ?*const wire.RunContextV1, _: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *AbortEventProbe = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const run = sdk.validateRunContext(run_ptr) catch return wire.EVENT_FATAL;
         self.calls += 1;
         if (self.calls == 1) {
             var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
             const wrong_run_id: u64 = 2;
-            self.stale_abort_status = self.api.sessionAbort()(session, wrong_run_id, wire.ABORT_USER_REQUEST, &diagnostic);
+            self.stale_abort_status = self.api.sessionAbort()(run.session, wrong_run_id, wire.ABORT_USER_REQUEST, &diagnostic);
             self.api.bufferRelease()(&diagnostic);
-            self.abort_status = self.api.sessionAbort()(session, run_id, wire.ABORT_USER_REQUEST, &diagnostic);
+            self.abort_status = self.api.sessionAbort()(run.session, run.run_id, wire.ABORT_USER_REQUEST, &diagnostic);
             self.api.bufferRelease()(&diagnostic);
         }
-        return wire.CALLBACK_CONTINUE;
+        return wire.EVENT_CONTINUE;
     }
 };
 
@@ -193,6 +205,14 @@ test "L2 SDK rejects API tables that violate rigid v1 discovery" {
     var nonzero_reserved = actual.*;
     nonzero_reserved.reserved[0] = 1;
     try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(&nonzero_reserved));
+
+    var wrong_revision = actual.*;
+    wrong_revision.abi_revision = wire.ABI_REVISION - 1;
+    try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(&wrong_revision));
+
+    var nonzero_header_reserved = actual.*;
+    nonzero_header_reserved.reserved0 = 1;
+    try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(&nonzero_header_reserved));
 
     inline for (.{
         wire.CAP_RUNTIME,
@@ -374,6 +394,7 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
     };
     var session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(wire.STATUS_OK, api.sessionCreate()(runtime, &session_config, &callbacks, &session, &diagnostic));
+    probe.expected_session = session;
     defer {
         if (session) |handle| _ = api.sessionDestroy()(handle, &diagnostic);
     }
@@ -406,6 +427,7 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
     );
     api.bufferRelease()(&diagnostic);
     options.max_turns = 5;
+    probe.expected_run_id = 2;
     try std.testing.expectEqual(
         wire.STATUS_OK,
         api.sessionRun()(session, 2, sdk.bytesView("run after pre-admission rejection"), &options, &result, &diagnostic),
@@ -427,12 +449,14 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
     );
     api.bufferRelease()(&diagnostic);
 
+    probe.expected_run_id = 20;
     try std.testing.expectEqual(
         wire.STATUS_OK,
         api.sessionRun()(session, 20, sdk.bytesView("Run identifiers may skip"), &options, &result, &diagnostic),
     );
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     const max_run_id = std.math.maxInt(u64);
+    probe.expected_run_id = max_run_id;
     try std.testing.expectEqual(
         wire.STATUS_OK,
         api.sessionRun()(session, max_run_id, sdk.bytesView("consume the final Run identifier"), &options, &result, &diagnostic),
@@ -453,6 +477,8 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
     defer if (second_session) |handle| {
         _ = api.sessionDestroy()(handle, &diagnostic);
     };
+    probe.expected_session = second_session;
+    probe.expected_run_id = max_run_id;
     try std.testing.expectEqual(
         wire.STATUS_OK,
         api.sessionRun()(second_session, max_run_id, sdk.bytesView("Run identifiers are scoped to a Session"), &options, &result, &diagnostic),
@@ -472,7 +498,7 @@ test "L2 invalid UTF-8 Host tool result is released and does not poison Session"
         releases: usize = 0,
         invalid_utf8: [1]u8 = .{0xff},
 
-        fn host(raw: ?*anyopaque, _: wire.BytesViewV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+        fn host(raw: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
             const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.HOST_FAILED));
             self.calls += 1;
             (out orelse return wire.HOST_FAILED).* = .{ .ptr = &self.invalid_utf8, .len = self.invalid_utf8.len };

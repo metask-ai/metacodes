@@ -13,40 +13,72 @@ const AbiHostTool = struct {
     execute_fn: wire.HostExecuteFnV1,
     release_fn: wire.HostReleaseFnV1,
 
-    /// T1 机械适配:typed outcome 通道就位,可观察行为与旧版一致(FAILED/REJECTED/
-    /// 形状违规均折 null-detail 业务失败,不产生 fatal)。T3 接管语义升级:
-    /// MC_HOST_FATAL/未知状态码/非法 descriptor → .fatal,合法详情经受限编码消费。
+    /// HOST_FATAL and unknown statuses are infrastructure-fatal. FAILED and
+    /// REJECTED may carry bounded UTF-8 detail; malformed detail degrades to a
+    /// null-detail business failure. An invalid HOST_OK descriptor is fatal.
     fn execute(raw: *anyopaque, identity: core.agent_session.HostRunIdentity, args: []const u8) error{OutOfMemory}!core.agent_session.HostToolOutcome {
         const self: *AbiHostTool = @ptrCast(@alignCast(raw));
+        const session: *wire.SessionHandle = @ptrCast(identity.host_session_ctx);
+        const run = makeRunContext(session, &identity.identity);
         var out = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
-        const status = self.execute_fn(self.ctx, view(identity.identity.session_id.asSlice()), view(args), &out);
-        if (status != wire.HOST_OK) {
+        const status = self.execute_fn(self.ctx, &run, view(args), &out);
+        if (status == wire.HOST_FATAL or
+            (status != wire.HOST_OK and status != wire.HOST_FAILED and status != wire.HOST_REJECTED))
+        {
             if (hasReleaseToken(out)) self.release_fn(self.ctx, &out);
-            return switch (status) {
-                wire.HOST_REJECTED => .{ .rejected = null },
-                else => .{ .failed = null },
-            };
+            return .fatal;
         }
         if (!canonicalOwned(out)) {
-            // Preserve the exact Host descriptor on failure. Converting a
-            // non-null zero-length allocation to a slice would lose its
-            // release pointer permanently.
             if (hasReleaseToken(out)) self.release_fn(self.ctx, &out);
-            return .{ .failed = null };
+            return outcomeWithoutDetail(status);
         }
-        if (out.len > wire.MAX_HOST_TOOL_RESULT_BYTES_V1) {
+        if (out.len == 0) {
+            if (status == wire.HOST_OK) {
+                return .{ .ok = .{ .bytes = "", .release_ctx = self, .releaseFn = release } };
+            }
+            return outcomeWithoutDetail(status);
+        }
+
+        const max_len = if (status == wire.HOST_OK)
+            wire.MAX_HOST_TOOL_RESULT_BYTES_V1
+        else
+            wire.MAX_TOOL_ERROR_PAYLOAD_BYTES_V1;
+        if (out.len > max_len) {
             if (hasReleaseToken(out)) self.release_fn(self.ctx, &out);
-            return .{ .failed = null };
+            return outcomeWithInvalidPayload(status);
         }
         const bytes = ownedSlice(out) catch {
             if (hasReleaseToken(out)) self.release_fn(self.ctx, &out);
-            return .{ .failed = null };
+            return outcomeWithInvalidPayload(status);
         };
         if (!std.unicode.utf8ValidateSlice(bytes)) {
             if (hasReleaseToken(out)) self.release_fn(self.ctx, &out);
-            return .{ .failed = null };
+            return outcomeWithInvalidPayload(status);
         }
-        return .{ .ok = .{ .bytes = bytes, .release_ctx = self, .releaseFn = release } };
+        const result = core.agent_session.HostToolResult{ .bytes = bytes, .release_ctx = self, .releaseFn = release };
+        return switch (status) {
+            wire.HOST_OK => .{ .ok = result },
+            wire.HOST_FAILED => .{ .failed = result },
+            wire.HOST_REJECTED => .{ .rejected = result },
+            else => unreachable,
+        };
+    }
+
+    fn outcomeWithoutDetail(status: u32) core.agent_session.HostToolOutcome {
+        return switch (status) {
+            wire.HOST_OK => .fatal,
+            wire.HOST_FAILED => .{ .failed = null },
+            wire.HOST_REJECTED => .{ .rejected = null },
+            else => .fatal,
+        };
+    }
+
+    fn outcomeWithInvalidPayload(status: u32) core.agent_session.HostToolOutcome {
+        return switch (status) {
+            wire.HOST_OK, wire.HOST_FAILED => .{ .failed = null },
+            wire.HOST_REJECTED => .{ .rejected = null },
+            else => .fatal,
+        };
     }
 
     fn release(raw: *anyopaque, bytes: []const u8) void {
@@ -76,7 +108,11 @@ const AbiSession = struct {
         return @ptrCast(self);
     }
 
-    fn emit(raw: *anyopaque, _: core.session_id.SessionId, run_id: u64, event: core.protocol.ui_event.CoreEvent) bool {
+    fn runContext(self: *AbiSession, identity: *const core.agent_session.RunIdentity) wire.RunContextV1 {
+        return makeRunContext(self.handle(), identity);
+    }
+
+    fn emit(raw: *anyopaque, session_id: core.session_id.SessionId, run_id: u64, event: core.protocol.ui_event.CoreEvent) bool {
         const self: *AbiSession = @ptrCast(@alignCast(raw));
         const callback = self.callbacks.on_event orelse return true;
         const public_event = protocol_v1.event(event) orelse return true;
@@ -85,12 +121,14 @@ const AbiSession = struct {
             return false;
         };
         defer allocator.free(json);
-        const accepted = callback(self.callbacks.ctx, self.handle(), run_id, view(json)) == wire.CALLBACK_CONTINUE;
+        const identity = core.agent_session.RunIdentity{ .session_id = session_id, .run_id = run_id };
+        const run = self.runContext(&identity);
+        const accepted = callback(self.callbacks.ctx, &run, view(json)) == wire.EVENT_CONTINUE;
         if (!accepted) self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
         return accepted;
     }
 
-    fn requestUi(raw: *anyopaque, _: core.session_id.SessionId, response_allocator: std.mem.Allocator, req: *const ui_request.UiRequest, out: *ui_request.UiResponse) anyerror!ui_request.RequestOutcome {
+    fn requestUi(raw: *anyopaque, identity: core.agent_session.RunIdentity, response_allocator: std.mem.Allocator, req: *const ui_request.UiRequest, out: *ui_request.UiResponse) anyerror!ui_request.RequestOutcome {
         const self: *AbiSession = @ptrCast(@alignCast(raw));
         const callback = self.callbacks.on_ui_request orelse return .unavailable;
         const release_fn = self.callbacks.release_response orelse return error.HostUiFailed;
@@ -100,7 +138,8 @@ const AbiSession = struct {
         };
         defer response_allocator.free(request_json);
         var response = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
-        const status = callback(self.callbacks.ctx, self.handle(), view(request_json), &response);
+        const run = self.runContext(&identity);
+        const status = callback(self.callbacks.ctx, &run, view(request_json), &response);
         defer if (hasReleaseToken(response)) release_fn(self.callbacks.ctx, &response);
         if (!canonicalOwned(response)) {
             self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
@@ -139,6 +178,17 @@ const AbiSession = struct {
         return if (status == wire.STATUS_OK) wire.STATUS_CALLBACK_FAILED else status;
     }
 };
+
+fn makeRunContext(session: *wire.SessionHandle, identity: *const core.agent_session.RunIdentity) wire.RunContextV1 {
+    return .{
+        .struct_size = @sizeOf(wire.RunContextV1),
+        .reserved0 = 0,
+        .session = session,
+        .run_id = identity.run_id,
+        .session_id = view(identity.session_id.asSlice()),
+        .reserved = [_]u64{0} ** 2,
+    };
+}
 
 fn runtimeFrom(handle: *wire.RuntimeHandle) *AbiRuntime {
     return @ptrCast(@alignCast(handle));
@@ -495,7 +545,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
         .permission_mode = mode,
         .workspace = .{ .root = root, .home = home, .shell = shell },
         .allowed_tools = allowed,
-        .ui_requester = if (callbacks.on_ui_request != null) .{ .ctx = self, .requestFn = AbiSession.requestUi } else null,
+        .run_ui_requester = if (callbacks.on_ui_request != null) .{ .ctx = self, .requestFn = AbiSession.requestUi } else null,
         // Host tool 身份锚点 = 本 AbiSession;仅 AbiHostTool 适配层可解释此指针。
         .host_identity_ctx = self,
     }) catch |err| {
@@ -573,6 +623,8 @@ fn bufferRelease(buffer: ?*wire.OwnedBytesV1) callconv(.c) void {
 const api_v1 = wire.ApiV1{
     .struct_size = @sizeOf(wire.ApiV1),
     .abi_version = wire.ABI_VERSION_V1,
+    .abi_revision = wire.ABI_REVISION,
+    .reserved0 = 0,
     .capabilities = wire.REQUIRED_CAPABILITIES_V1,
     .runtime_create = runtimeCreate,
     .runtime_destroy = runtimeDestroy,
@@ -631,7 +683,7 @@ test "Host zero-length result must use a null pointer and preserves release desc
         var releases: usize = 0;
         var released_ptr: ?[*]u8 = null;
 
-        fn execute(_: ?*anyopaque, _: wire.BytesViewV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+        fn execute(_: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
             (out orelse return wire.HOST_FAILED).* = .{ .ptr = @ptrCast(&byte), .len = 0 };
             return wire.HOST_OK;
         }
@@ -645,7 +697,7 @@ test "Host zero-length result must use a null pointer and preserves release desc
     Probe.released_ptr = null;
     var host = AbiHostTool{ .ctx = null, .execute_fn = Probe.execute, .release_fn = Probe.release };
     const outcome = try AbiHostTool.execute(&host, testHostIdent(@ptrCast(&host)), "{}");
-    try std.testing.expect(outcome == .failed and outcome.failed == null);
+    try std.testing.expect(outcome == .fatal);
     try std.testing.expectEqual(@as(usize, 1), Probe.releases);
     try std.testing.expect(Probe.released_ptr == @as(?[*]u8, @ptrCast(&Probe.byte)));
 }
@@ -655,7 +707,7 @@ test "canonical empty Host tool results never call release" {
         var status: u32 = wire.HOST_OK;
         var releases: usize = 0;
 
-        fn execute(_: ?*anyopaque, _: wire.BytesViewV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+        fn execute(_: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
             (out orelse return wire.HOST_FAILED).* = .{ .ptr = null, .len = 0 };
             return status;
         }
@@ -674,20 +726,22 @@ test "canonical empty Host tool results never call release" {
     result.release();
     try std.testing.expectEqual(@as(usize, 0), Probe.releases);
 
-    inline for (.{ wire.HOST_FAILED, wire.HOST_REJECTED, @as(u32, 0xffff_ffff) }) |status| {
+    inline for (.{ wire.HOST_FAILED, wire.HOST_REJECTED, wire.HOST_FATAL, @as(u32, 0xffff_ffff) }) |status| {
         Probe.status = status;
         Probe.releases = 0;
         const o = try AbiHostTool.execute(&host, testHostIdent(@ptrCast(&host)), "{}");
         if (status == wire.HOST_REJECTED) {
             try std.testing.expect(o == .rejected and o.rejected == null);
-        } else {
+        } else if (status == wire.HOST_FAILED) {
             try std.testing.expect(o == .failed and o.failed == null);
+        } else {
+            try std.testing.expect(o == .fatal);
         }
         try std.testing.expectEqual(@as(usize, 0), Probe.releases);
     }
 }
 
-test "non-success Host tool buffers are ignored and released exactly once" {
+test "Host failure detail is transferred while fatal buffers release immediately" {
     const Probe = struct {
         var status: u32 = wire.HOST_FAILED;
         var bytes = [_]u8{ 'n', 'o', 't', ' ', 'a', ' ', 'r', 'e', 's', 'u', 'l', 't' };
@@ -695,7 +749,7 @@ test "non-success Host tool buffers are ignored and released exactly once" {
         var released_ptr: ?[*]u8 = null;
         var released_len: u64 = 0;
 
-        fn execute(_: ?*anyopaque, _: wire.BytesViewV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+        fn execute(_: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
             (out orelse return wire.HOST_FAILED).* = .{ .ptr = &bytes, .len = bytes.len };
             return status;
         }
@@ -714,7 +768,8 @@ test "non-success Host tool buffers are ignored and released exactly once" {
     }{
         .{ .status = wire.HOST_FAILED, .expected = .failed },
         .{ .status = wire.HOST_REJECTED, .expected = .rejected },
-        .{ .status = 0xffff_ffff, .expected = .failed },
+        .{ .status = wire.HOST_FATAL, .expected = .fatal },
+        .{ .status = 0xffff_ffff, .expected = .fatal },
     };
     var host = AbiHostTool{ .ctx = null, .execute_fn = Probe.execute, .release_fn = Probe.release };
     for (cases) |case| {
@@ -724,6 +779,17 @@ test "non-success Host tool buffers are ignored and released exactly once" {
         Probe.released_len = 0;
         const o = try AbiHostTool.execute(&host, testHostIdent(@ptrCast(&host)), "{}");
         try std.testing.expectEqual(case.expected, std.meta.activeTag(o));
+        switch (o) {
+            .failed => |maybe| if (maybe) |result| {
+                try std.testing.expectEqualStrings(&Probe.bytes, result.bytes);
+                result.release();
+            },
+            .rejected => |maybe| if (maybe) |result| {
+                try std.testing.expectEqualStrings(&Probe.bytes, result.bytes);
+                result.release();
+            },
+            else => {},
+        }
         try std.testing.expectEqual(@as(usize, 1), Probe.releases);
         try std.testing.expect(Probe.released_ptr == @as(?[*]u8, @ptrCast(&Probe.bytes)));
         try std.testing.expectEqual(@as(u64, Probe.bytes.len), Probe.released_len);
@@ -737,7 +803,7 @@ test "Host UI descriptor ownership is independent of callback status" {
         var releases: usize = 0;
         const response_json = "{\"answers\":[\"yes\"]}";
 
-        fn request(_: ?*anyopaque, _: ?*wire.SessionHandle, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+        fn request(_: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
             const result = out orelse return wire.UI_FATAL;
             result.* = if (with_buffer)
                 .{ .ptr = @constCast(response_json.ptr), .len = response_json.len }
@@ -773,7 +839,7 @@ test "Host UI descriptor ownership is independent of callback status" {
     Probe.releases = 0;
     try std.testing.expectError(
         error.MalformedJson,
-        AbiSession.requestUi(&fake, .single, std.testing.allocator, &request, &response),
+        AbiSession.requestUi(&fake, .{ .session_id = .single, .run_id = 1 }, std.testing.allocator, &request, &response),
     );
     try std.testing.expectEqual(@as(usize, 0), Probe.releases);
 
@@ -782,7 +848,7 @@ test "Host UI descriptor ownership is independent of callback status" {
     Probe.releases = 0;
     try std.testing.expectEqual(
         ui_request.RequestOutcome.unavailable,
-        try AbiSession.requestUi(&fake, .single, std.testing.allocator, &request, &response),
+        try AbiSession.requestUi(&fake, .{ .session_id = .single, .run_id = 1 }, std.testing.allocator, &request, &response),
     );
     try std.testing.expectEqual(@as(usize, 0), Probe.releases);
 
@@ -791,7 +857,7 @@ test "Host UI descriptor ownership is independent of callback status" {
     Probe.releases = 0;
     try std.testing.expectEqual(
         ui_request.RequestOutcome.answered,
-        try AbiSession.requestUi(&fake, .single, std.testing.allocator, &request, &response),
+        try AbiSession.requestUi(&fake, .{ .session_id = .single, .run_id = 1 }, std.testing.allocator, &request, &response),
     );
     try std.testing.expectEqual(@as(usize, 1), Probe.releases);
     switch (response) {
@@ -809,12 +875,12 @@ test "Host UI descriptor ownership is independent of callback status" {
         if (status == wire.UI_UNAVAILABLE) {
             try std.testing.expectEqual(
                 ui_request.RequestOutcome.unavailable,
-                try AbiSession.requestUi(&fake, .single, std.testing.allocator, &request, &response),
+                try AbiSession.requestUi(&fake, .{ .session_id = .single, .run_id = 1 }, std.testing.allocator, &request, &response),
             );
         } else {
             try std.testing.expectError(
                 error.HostUiFailed,
-                AbiSession.requestUi(&fake, .single, std.testing.allocator, &request, &response),
+                AbiSession.requestUi(&fake, .{ .session_id = .single, .run_id = 1 }, std.testing.allocator, &request, &response),
             );
         }
         try std.testing.expectEqual(@as(usize, 1), Probe.releases);
@@ -827,7 +893,7 @@ test "oversized Host tool results are released exactly once" {
         var releases: usize = 0;
         var released_len: u64 = 0;
 
-        fn execute(_: ?*anyopaque, _: wire.BytesViewV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+        fn execute(_: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
             (out orelse return wire.HOST_FAILED).* = .{
                 .ptr = @ptrCast(&byte),
                 .len = wire.MAX_HOST_TOOL_RESULT_BYTES_V1 + 1,
@@ -854,7 +920,7 @@ test "invalid UTF-8 Host tool results are released exactly once" {
         var bytes = [_]u8{0xff};
         var releases: usize = 0;
 
-        fn execute(_: ?*anyopaque, _: wire.BytesViewV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+        fn execute(_: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
             (out orelse return wire.HOST_FAILED).* = .{ .ptr = &bytes, .len = bytes.len };
             return wire.HOST_OK;
         }
@@ -875,7 +941,7 @@ test "oversized Host UI responses are released and classified as callback failur
         var byte: u8 = 0;
         var releases: usize = 0;
 
-        fn request(_: ?*anyopaque, _: ?*wire.SessionHandle, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+        fn request(_: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
             (out orelse return wire.UI_FATAL).* = .{
                 .ptr = @ptrCast(&byte),
                 .len = wire.MAX_UI_RESPONSE_BYTES_V1 + 1,
@@ -907,7 +973,7 @@ test "oversized Host UI responses are released and classified as callback failur
     };
     try std.testing.expectError(
         error.HostUiFailed,
-        AbiSession.requestUi(&fake, .single, std.testing.allocator, &request, &response),
+        AbiSession.requestUi(&fake, .{ .session_id = .single, .run_id = 1 }, std.testing.allocator, &request, &response),
     );
     try std.testing.expectEqual(@as(usize, 1), Probe.releases);
     try std.testing.expectEqual(wire.STATUS_CALLBACK_FAILED, fake.callback_status.load(.acquire));
@@ -1014,7 +1080,7 @@ test "ABI Runtime reports oversized Host schemas as resource limits" {
     const Probe = struct {
         var byte: u8 = 0;
 
-        fn execute(_: ?*anyopaque, _: wire.BytesViewV1, _: wire.BytesViewV1, _: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+        fn execute(_: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1, _: ?*wire.OwnedBytesV1) callconv(.c) u32 {
             return wire.HOST_FAILED;
         }
 

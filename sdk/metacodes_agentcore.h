@@ -15,6 +15,7 @@ extern "C" {
  * change incompatibly between commits. Pin an exact bundle; its manifest
  * records the commit. */
 #define MC_AGENTCORE_ABI_V1 1u
+#define MC_AGENTCORE_ABI_REVISION 2u
 
 #define MC_STATUS_OK 0u
 #define MC_STATUS_INVALID_ARGUMENT 1u
@@ -55,19 +56,22 @@ extern "C" {
 #define MC_MAX_TOOL_SCHEMA_PROPERTIES_V1 UINT64_C(1024)
 #define MC_MAX_UI_RESPONSE_BYTES_V1 UINT64_C(1048576)
 #define MC_MAX_HOST_TOOL_RESULT_BYTES_V1 UINT64_C(16777216)
+#define MC_MAX_TOOL_ERROR_PAYLOAD_BYTES_V1 UINT64_C(1048576)
+#define MC_MAX_SESSION_ID_BYTES_V1 UINT64_C(64)
 #define MC_MAX_METADATA_STRING_BYTES_V1 UINT64_C(1048576)
 #define MC_MAX_RUNTIME_METADATA_BYTES_V1 UINT64_C(16777216)
 #define MC_MAX_SESSION_METADATA_BYTES_V1 UINT64_C(4194304)
 #define MC_MAX_TURNS_V1 1000u
 
-#define MC_CALLBACK_CONTINUE 0u
-#define MC_CALLBACK_FATAL 1u
+#define MC_EVENT_CONTINUE 0u
+#define MC_EVENT_FATAL 1u
 #define MC_UI_ANSWERED 0u
 #define MC_UI_UNAVAILABLE 1u
 #define MC_UI_FATAL 2u
 #define MC_HOST_OK 0u
 #define MC_HOST_FAILED 1u
 #define MC_HOST_REJECTED 2u
+#define MC_HOST_FATAL 3u
 
 #define MC_CAP_RUNTIME (UINT64_C(1) << 0)
 #define MC_CAP_BUILTIN_TOOLS (UINT64_C(1) << 1)
@@ -97,21 +101,33 @@ typedef struct {
     uint64_t len;
 } mc_owned_bytes_v1;
 
+typedef struct {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    mc_session *session;
+    uint64_t run_id;
+    mc_bytes_view_v1 session_id;
+    uint64_t reserved[2];
+} mc_run_context_v1;
+
 /* Canonical empty owned buffers are {NULL, 0}. A non-NULL pointer with zero
  * length is invalid because the ABI must preserve the exact release token.
  * Host callback outputs use one ownership rule independent of status:
  * {NULL, 0} is never released; every other descriptor is passed to its paired
  * Host release callback exactly once. */
 
-/* Host owns host_ctx and keeps it valid until runtime_destroy succeeds.
- * session_id and arguments_json are borrowed for this callback only;
- * arguments_json is the provider-produced tool-input JSON. Only MC_HOST_OK
- * consumes result text; it must be UTF-8. Results returned with any other
- * status are ignored. Invalid UTF-8 or results over
- * MC_MAX_HOST_TOOL_RESULT_BYTES_V1 are released and treated as Host failure. */
+/* Host owns host_ctx and keeps it valid until runtime_destroy succeeds. run,
+ * run->session_id, and arguments_json are borrowed for this callback only;
+ * arguments_json is the provider-produced tool-input JSON. MC_HOST_OK consumes
+ * up to MC_MAX_HOST_TOOL_RESULT_BYTES_V1 of UTF-8 result text. MC_HOST_FAILED
+ * and MC_HOST_REJECTED may provide up to MC_MAX_TOOL_ERROR_PAYLOAD_BYTES_V1 of
+ * UTF-8 detail. Invalid detail degrades to an empty business failure; an
+ * invalid MC_HOST_OK descriptor is fatal, while invalid success payload text
+ * is treated as Host failure. MC_HOST_FATAL and unknown status codes are
+ * fatal. */
 typedef uint32_t (*mc_host_execute_fn_v1)(
     void *host_ctx,
-    mc_bytes_view_v1 session_id,
+    const mc_run_context_v1 *run,
     mc_bytes_view_v1 arguments_json,
     mc_owned_bytes_v1 *out_result);
 typedef void (*mc_host_release_fn_v1)(
@@ -144,12 +160,11 @@ typedef struct {
 
 /* event_json is tagged CoreEvent JSON and is borrowed only for this
  * synchronous callback. Unknown observation tags may be ignored.
- * MC_CALLBACK_FATAL poisons the Session. Different Sessions may invoke the
+ * MC_EVENT_FATAL poisons the Session. Different Sessions may invoke the
  * same callback concurrently. */
 typedef uint32_t (*mc_on_event_fn_v1)(
     void *session_ctx,
-    mc_session *session,
-    uint64_t run_id,
+    const mc_run_context_v1 *run,
     mc_bytes_view_v1 event_json);
 /* UI requests are synchronous in ABI v1. The Host returns one JSON response:
  * {"answers":[...]} or {"permission":"allow_once"}.
@@ -158,7 +173,7 @@ typedef uint32_t (*mc_on_event_fn_v1)(
  * the Session. */
 typedef uint32_t (*mc_on_ui_request_fn_v1)(
     void *session_ctx,
-    mc_session *session,
+    const mc_run_context_v1 *run,
     mc_bytes_view_v1 request_json,
     mc_owned_bytes_v1 *out_response);
 typedef void (*mc_release_response_fn_v1)(
@@ -272,6 +287,8 @@ typedef void (*mc_buffer_release_fn_v1)(mc_owned_bytes_v1 *);
 typedef struct {
     uint32_t struct_size;
     uint32_t abi_version;
+    uint32_t abi_revision;
+    uint32_t reserved0;
     uint64_t capabilities;
     mc_runtime_create_fn_v1 runtime_create;
     mc_runtime_destroy_fn_v1 runtime_destroy;
@@ -288,6 +305,10 @@ typedef struct {
  * A Host tool may also be invoked concurrently within one Session. Callbacks
  * may request abort but must not re-enter run or destroy. No callback or
  * release callback has thread affinity. */
+/* requested_abi selects the major table shape. Consumers must additionally
+ * require struct_size == sizeof(mc_agentcore_api_v1), abi_version ==
+ * MC_AGENTCORE_ABI_V1, and abi_revision == MC_AGENTCORE_ABI_REVISION before
+ * using any function pointer. */
 const void *metacodes_agentcore_get_api(uint32_t requested_abi);
 
 #if defined(__cplusplus) && __cplusplus >= 201103L
@@ -300,18 +321,24 @@ const void *metacodes_agentcore_get_api(uint32_t requested_abi);
 
 MC_AGENTCORE_STATIC_ASSERT(sizeof(mc_bytes_view_v1) == 16, "mc_bytes_view_v1 layout");
 MC_AGENTCORE_STATIC_ASSERT(sizeof(mc_owned_bytes_v1) == 16, "mc_owned_bytes_v1 layout");
+MC_AGENTCORE_STATIC_ASSERT(sizeof(mc_run_context_v1) == 56, "mc_run_context_v1 layout");
 MC_AGENTCORE_STATIC_ASSERT(sizeof(mc_host_tool_v1) == 96, "mc_host_tool_v1 layout");
 MC_AGENTCORE_STATIC_ASSERT(sizeof(mc_runtime_config_v1) == 72, "mc_runtime_config_v1 layout");
 MC_AGENTCORE_STATIC_ASSERT(sizeof(mc_session_callbacks_v1) == 72, "mc_session_callbacks_v1 layout");
 MC_AGENTCORE_STATIC_ASSERT(sizeof(mc_session_config_v1) == 144, "mc_session_config_v1 layout");
 MC_AGENTCORE_STATIC_ASSERT(sizeof(mc_run_options_v1) == 40, "mc_run_options_v1 layout");
 MC_AGENTCORE_STATIC_ASSERT(sizeof(mc_run_result_v1) == 48, "mc_run_result_v1 layout");
-MC_AGENTCORE_STATIC_ASSERT(sizeof(mc_agentcore_api_v1) == 104, "mc_agentcore_api_v1 layout");
+MC_AGENTCORE_STATIC_ASSERT(sizeof(mc_agentcore_api_v1) == 112, "mc_agentcore_api_v1 layout");
+MC_AGENTCORE_STATIC_ASSERT(offsetof(mc_run_context_v1, session) == 8, "mc_run_context_v1.session offset");
+MC_AGENTCORE_STATIC_ASSERT(offsetof(mc_run_context_v1, run_id) == 16, "mc_run_context_v1.run_id offset");
+MC_AGENTCORE_STATIC_ASSERT(offsetof(mc_run_context_v1, session_id) == 24, "mc_run_context_v1.session_id offset");
 MC_AGENTCORE_STATIC_ASSERT(offsetof(mc_host_tool_v1, ctx) == 8, "mc_host_tool_v1.ctx offset");
 MC_AGENTCORE_STATIC_ASSERT(offsetof(mc_session_config_v1, api_key) == 16, "mc_session_config_v1.api_key offset");
 MC_AGENTCORE_STATIC_ASSERT(offsetof(mc_session_config_v1, allowed_tools) == 96, "mc_session_config_v1.allowed_tools offset");
-MC_AGENTCORE_STATIC_ASSERT(offsetof(mc_agentcore_api_v1, runtime_create) == 16, "mc_agentcore_api_v1.runtime_create offset");
-MC_AGENTCORE_STATIC_ASSERT(offsetof(mc_agentcore_api_v1, session_run) == 48, "mc_agentcore_api_v1.session_run offset");
+MC_AGENTCORE_STATIC_ASSERT(offsetof(mc_agentcore_api_v1, abi_revision) == 8, "mc_agentcore_api_v1.abi_revision offset");
+MC_AGENTCORE_STATIC_ASSERT(offsetof(mc_agentcore_api_v1, capabilities) == 16, "mc_agentcore_api_v1.capabilities offset");
+MC_AGENTCORE_STATIC_ASSERT(offsetof(mc_agentcore_api_v1, runtime_create) == 24, "mc_agentcore_api_v1.runtime_create offset");
+MC_AGENTCORE_STATIC_ASSERT(offsetof(mc_agentcore_api_v1, session_run) == 56, "mc_agentcore_api_v1.session_run offset");
 
 #undef MC_AGENTCORE_STATIC_ASSERT
 
