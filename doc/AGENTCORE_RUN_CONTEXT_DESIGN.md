@@ -128,6 +128,8 @@ encoded error <= MC_MAX_TOOL_ERROR_PAYLOAD_BYTES_V1      /* 新增，1 MiB */
 - 编码后超限：释放 Host descriptor（恰好一次），**回退通用错误文案**；
 - **不截断**——截断会破坏 UTF-8/JSON；
 - 超限仍按普通 `HOST_FAILED`/`HOST_REJECTED` 处理，**不自动 fatal**；
+- 编码完成的错误 payload 是模型自纠所需的语义输入，**不得**被通用 tool-result
+  persistence 或 per-message aggregate budget 替换为 persisted/truncated 信封；
 - Host 侧义务：详情不得含 credential；模型可见错误本应紧凑，超 1 MiB 的
   "详情"自身就是异味。
 
@@ -498,6 +500,7 @@ batch 确认无 fatal 之后**（首选），或追踪并在 fatal 清理时删�
 | `src/core/agent_session.zig` / `tool_catalog.zig` | SessionInit 增 `host_identity_ctx: ?*anyopaque`（选 Host tool 时非空校验）；`HostRunIdentity` 贯穿至 host tool 执行点（executor 签名/ToolContext 扩参）；executor 返回类型从 `HostToolError!HostToolResult` 改为 **typed outcome**（Zig error 不携带 payload，A2 详情必须有类型通道，见下）；Runtime session registry 增 session_id collision detection |
 | `src/tools/context.zig` / `src/tools.zig` | `dispatchFn` 与 `tools.dispatch` 换签名为 `anyerror!ToolDispatchOutcome`（两层缺一即假实现）；`ToolDispatchOutcome` 定义与 `deinit(allocator)` |
 | `src/core/tool_exec.zig` / `agent_loop.zig` | `OneResult` 增 `host_fatal` 分支；`executeSlots` 返回 `error{HostToolFatal}!void`；六条 fatal 规则（停 slot / join / release 一次 / 无 tool_result / 映射 CallbackFailed / slot-owned payload 全销毁）；`error.UiPending` 豁免模式仅作参考先例 |
+| `src/core/stream_prefetch.zig` | 适配 `executeOne` typed outcome；speculative OOM/UI/fatal 标记 `skip`，交回 authoritative `executeSlots` 重放并执行完整 Run 失败合同 |
 | `src/core/agent_session.zig`（UI adapter） | `AgentSessionUiRequester` + `requestHostUi` 锁内 snapshot adapter；通用 `UiRequester`（TUI/Web/daemon）签名零改动 |
 | `src/agentcore/abi_v1.zig` | **不做 session_id 缓存**——canonical 源唯一为 core `AgentSession.session_id`，三类回调各自从 core 送达的身份值（emit 的参数、UI 的 `RunIdentity`、工具的 `HostRunIdentity`）**在各自栈帧构造独立的** `mc_run_context_v1`；**admission 固定的是 tuple 值，不是共享指针**——只保证字段值一致，不保证不同回调收到相同 RunContext 指针（Host tool 可并发，共享指针本就不成立；与测试 6 的按字段比较一致）；三回调签名适配；`AbiHostTool` 经 `HostRunIdentity.host_session_ctx`（cast 回 AbiSession）记录 callback failure；未知 HOST/UI 状态码、非法 descriptor 自动 fatal |
 | `sdk/*.h` / `sdk/*_types.zig` | `mc_run_context_v1` + 三签名 + `MC_HOST_FATAL` + `MC_EVENT_*` 改名 + `abi_revision`（API 表新布局 sizeof 112 + 全部 STATIC_ASSERT 更新） |
@@ -596,6 +599,56 @@ batch 确认无 fatal 之后**（首选），或追踪并在 fatal 清理时删�
     consumer 引用旧名必须编译失败）；
 36. Runtime registry 生命周期：创建失败回滚、destroy 注销、Runtime destroy 时为空。
 
+### 7.1 实施证据映射
+
+下表记录每项合同的主要自动化证据。`组合`表示该合同跨两个层级断言，不伪造一个
+并不存在的“万能测试”；source-free 项由 `agentcore:gate` 编译或真实运行交付物。
+
+| # | 主要自动化证据（文件：精确测试名/门禁） |
+|---:|---|
+| 1 | `sdk/metacodes_agentcore_types.zig`: `ABI v1 public layouts are fixed on supported 64-bit targets`；C header static asserts 由 `agentcore:gate` 编译 |
+| 2 | `sdk/metacodes_agentcore.zig`: `RunContext validator bounds length before pointer slicing` |
+| 3 | `tests/component/agentcore_abi_test.zig`: `L2 opaque ABI routes Host callbacks and enforces Run admission identifiers` |
+| 4 | `tests/component/agent_session_host_tools_test.zig`: `L2 Host identity is admission-fixed across two Runs and distinct across two Sessions` |
+| 5 | 同 4；ABI facade 侧由 3 补充句柄相等断言 |
+| 6 | 组合：3 的 event/UI/Host callback 共用 `Probe.context` 字段校验；4 校验 core Host identity tuple |
+| 7 | 组合：`agentcore_abi_test.zig`: `Host registry first identity binding is atomic under concurrent callbacks`（异 ID 拒绝）+ `L2 Event callback fatal aborts the Run and poisons the ABI Session`（fatal 通道） |
+| 8 | `src/core/agent_session.zig`: `Runtime session registry retries an injected collision and registers the next value`；`Runtime session registry bounds repeated collisions without leaking registration or liveness` |
+| 9 | 组合：`agentcore_abi_test.zig`: `L2 facade gate covers the core-idle epilogue until sessionRun returns` + `tool_exec.zig`: `concurrent host fatal joins started workers and skips the next window` |
+| 10 | `agentcore_abi_test.zig`: `L2 opaque ABI routes Host callbacks and enforces Run admission identifiers`（zero/resource-limit pre-admission） |
+| 11 | `agentcore_abi_test.zig`: `L2 Host UI callback may repeat abort while nested run and destroy stay busy` |
+| 12 | 同 11（nested `session_run`/`session_destroy` 均断言 `BUSY`） |
+| 13 | `src/core/tool_exec.zig`: `concurrent host fatal joins started workers and skips the next window`；`thread spawn fallback observes fatal before starting the next job` |
+| 14 | `tests/component/agent_session_host_tools_test.zig`: `L2 Host fatal poisons the Session and maps to CallbackFailed without a tool result turn` |
+| 15 | `src/agentcore/abi_v1.zig`: `Host failure detail is transferred while fatal buffers release immediately`；`Host zero-length result must use a null pointer and preserves release descriptor on rejection` |
+| 16 | `src/core/tool_exec.zig`: `Host detail JSON is exact when valid and falls back when encoded payload exceeds cap`；`Host error detail bypasses result persistence and aggregate budget`；`agentcore_abi_test.zig`: `L2 invalid UTF-8 Host tool result is released and does not poison Session` |
+| 17 | `agentcore_abi_test.zig`: `L2 unavailable Host UI is a reusable business outcome`；`L2 Host UI fatal aborts the Run and poisons the ABI Session`；`L2 unknown Host UI status poisons the ABI Session` |
+| 18 | `src/agentcore/abi_v1.zig`: `Host failure detail is transferred while fatal buffers release immediately`；`Host UI descriptor ownership is independent of callback status` |
+| 19 | `agentcore_abi_test.zig`: `L2 Host UI callback may repeat abort while nested run and destroy stay busy`；`agent_session.zig`: `AgentSession abort is run-scoped, idempotent and reports late requests` |
+| 20 | `agentcore_abi_test.zig`: `L2 opaque ABI routes Host callbacks and enforces Run admission identifiers`；`L2 Event callback may cooperatively abort without poisoning the ABI Session` |
+| 21 | `src/core/agent_session.zig`: `AgentSession initializes per-session permission state`（无 Host tool/null anchor 正常创建） |
+| 22 | `src/core/agent_session.zig`: `选择 Host tool 而无 host_identity_ctx → 创建拒绝且 registry 无残留` |
+| 23 | `tests/component/agent_session_host_tools_test.zig`: `L2 selected Host sync tool is advertised, executed and released exactly once`；ABI facade 句柄断言见 3 |
+| 24 | `src/core/tool_exec.zig`: `矩阵24:host fatal 后无泄漏——已完成 slot 的 owned payload 由 Slot.deinit 全部回收`；`fatal batch does not persist a completed transient result` |
+| 25 | `src/core/tool_exec.zig`: `矩阵25:Host 工具并发判定走 executor metadata,不按名字猜` |
+| 26 | `src/core/agent_session.zig`: `run-aware Host UI adapter snapshots identity and allows callback abort`；`run-aware Host UI adapter rejects cross-Session identity and poisons only the target` |
+| 27 | `src/core/agent_session.zig`: `run-aware Host UI adapter snapshots identity and allows callback abort` |
+| 28 | 编译/回归门禁：`zig build test:lib` 与既有 TUI/Web UiRequester 测试套件 |
+| 29 | 组合：`src/core/tool_catalog.zig`: `Host descriptors release exactly once when dispatch copy runs out of memory` + `agent_session.zig`: `unexpected pre-run allocation failure poisons the Session` |
+| 30 | `src/core/tool_catalog.zig`: `Host outcome detail is copied, released once and typed through dispatch`；`tool_exec.zig`: `Slot.takeContent 转移即置空,与 deinit 无双释放` |
+| 30a | `src/core/tool_error.zig`: `capped serializer preserves external detail and rejects escaping expansion before allocation`；`tool_exec.zig`: `Host detail JSON is exact when valid and falls back when encoded payload exceeds cap` |
+| 30b | `src/core/agent_session.zig`: `run-aware Host UI adapter rejects cross-Session identity and poisons only the target` |
+| 31 | `src/agentcore/abi_v1.zig`: `ABI discovery is versioned`；`tests/component/agentcore_abi_test.zig`: `L2 SDK rejects API tables that violate rigid v1 discovery` |
+| 32 | `sdk/metacodes_agentcore.zig`: `SDK rejects legacy pre-revision API size from the stable prefix`；`agentcore_abi_test.zig`: `L2 SDK rejects API tables that violate rigid v1 discovery` |
+| 33 | `agentcore:gate`: source-free Zig/C/C++ link；native Zig/C consumer 真实运行 |
+| 34 | `src/core/agent_session.zig`: `AgentSession enforces one active Run and monotonic nonzero run ids`；ABI facade 回归见 3 |
+| 35 | `tests/agentcore_artifact_consumer/consumer.c` 旧宏 compile guard；`agentcore:gate` |
+| 36 | `src/core/agent_session.zig`: `Runtime session registry:原子注册、destroy 注销、Runtime destroy 时为空`；`Session creation failure after ID registration rolls the registry and live count back` |
+| 37 | `tests/component/agentcore_abi_test.zig`: `L2 facade gate covers the core-idle epilogue until sessionRun returns`（重叠 run） |
+| 38 | 同 37（重叠 destroy） |
+| 39 | 同 37（abort 绕过 facade gate） |
+| 40 | `tests/component/agentcore_abi_test.zig`: `Host registry first identity binding is atomic under concurrent callbacks`（64 轮同 ID/异 ID 竞争） |
+
 ## 8. 状态（两根轴分开记，决策关闭 ≠ 技术评审通过）
 
 **消费端决策轴——全部关闭（2026-07-18）**：
@@ -609,6 +662,12 @@ request（call gate linearization 合同、编码后边界双常量与失败语�
 SessionId 校验）折入 §3.1/§1.3/§6 与测试 37/30a/30b 后收口。签字语：
 "停止设计打磨，进入实现"；重开架构讨论的唯一条件：实现中出现 UAF、所有权冲突、
 ABI 布局或 wire 不可迁移问题。
+
+**实施后整批复审——待复核（2026-07-18）**：评审方发现通用结果落盘会在
+50 KiB/200 KiB 两条预算路径改写大体积 Host 错误详情，令 A2 的保真承诺在最终
+post-processing 层失效。本工作树已让错误 payload 绕过两条 bulk-result 路径，补充
+大错误详情与正常成功结果的对照回归，并补齐 §6 `stream_prefetch.zig` 行及 §7.1
+证据映射；在评审方复核前不冒充最终 accept。
 
 确认后实施顺序：core 管线 → facade/SDK → 文档 normative 化 → 测试矩阵 → consumer 迁移，
 单批交付；提交拆分届时连同工作区现存的撤冻文档一并规划。

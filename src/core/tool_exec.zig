@@ -282,6 +282,10 @@ pub fn executeSlots(
 fn persistCompletedResults(slots: []Slot, base_ctx: *const ToolContext, parent_allocator: std.mem.Allocator) void {
     const storage = @import("../tools/tool_result_storage.zig");
     for (slots) |*slot| {
+        // Error payloads are semantic model input, not bulk output. Replacing
+        // them with a persisted/truncated envelope would destroy the Host
+        // FAILED/REJECTED detail contract after it was safely serialized.
+        if (slot.is_error) continue;
         const content = slot.content orelse continue;
         if (storage.maybePersist(parent_allocator, slot.name, content, base_ctx.home_dir) catch null) |preview| {
             parent_allocator.free(content);
@@ -295,7 +299,12 @@ const MAX_TOOL_RESULTS_PER_MESSAGE: usize = 200_000;
 fn enforceMessageBudget(slots: []Slot, base_ctx: *const ToolContext, parent_allocator: std.mem.Allocator) void {
     const storage = @import("../tools/tool_result_storage.zig");
     var total: usize = 0;
-    for (slots) |s| total += if (s.content) |c| c.len else 0;
+    for (slots) |s| {
+        // Error payloads are deliberately outside the bulk-result budget: the
+        // encoded error cap bounds them, and persistence must not rewrite them.
+        if (s.is_error) continue;
+        total += if (s.content) |c| c.len else 0;
+    }
     if (total <= MAX_TOOL_RESULTS_PER_MESSAGE) return;
 
     // 反复挑当前最大且"还没落盘"的 slot 落盘,直到达标或没得落。
@@ -303,6 +312,7 @@ fn enforceMessageBudget(slots: []Slot, base_ctx: *const ToolContext, parent_allo
         var biggest: ?usize = null;
         var biggest_len: usize = 0;
         for (slots, 0..) |s, k| {
+            if (s.is_error) continue;
             const c = s.content orelse continue;
             // Read(maxResultChars==maxInt)永不落盘——它自有 maxTokens 上限,落盘会造
             // Read→file→Read 环(对齐 cc FileRead Infinity + per-message frozen/skip)。
@@ -672,6 +682,98 @@ test "fatal batch does not persist a completed transient result" {
 
     try std.testing.expectError(error.HostToolFatal, executeSlots(&slots, &ctx, allocator, .{ .bytes = [_]u8{'0'} ** 12 }));
     try std.testing.expect(!platform.fs.exists(result_dir.ptr));
+}
+
+test "Host error detail bypasses result persistence and aggregate budget" {
+    const FailureDispatcher = struct {
+        detail: []const u8,
+        fail: bool,
+
+        fn dispatch(raw: *const anyopaque, tool_ctx: *const tools_mod.ToolContext, tool_name: []const u8, args: []const u8) anyerror!tools_mod.ToolDispatchOutcome {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            if (self.fail or std.mem.eql(u8, tool_name, "HostFailureProbe"))
+                return .{ .host_failed = try tool_ctx.allocator.dupe(u8, self.detail) };
+            return .{ .ok = try tool_ctx.allocator.dupe(u8, args) };
+        }
+
+        fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+
+        fn nameAt(_: *const anyopaque, _: usize) ?[]const u8 {
+            return null;
+        }
+
+        fn hostSync(_: *const anyopaque, _: []const u8) bool {
+            return true;
+        }
+
+        fn dispatcher(self: *const @This()) tools_mod.ToolDispatcher {
+            return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .prefetchSafeFn = prefetchSafe, .nameAtFn = nameAt, .hostSyncFn = hostSync };
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var home_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const home_len = try tmp.dir.realPath(std.testing.io, &home_buffer);
+    const home = home_buffer[0..home_len];
+    const result_dir = try std.fmt.allocPrintSentinel(allocator, "{s}/.metacodes/tool-results", .{home}, 0);
+    defer allocator.free(result_dir);
+
+    const detail_60k = try allocator.alloc(u8, 60_000);
+    defer allocator.free(detail_60k);
+    @memset(detail_60k, 'a');
+    const detail_250k = try allocator.alloc(u8, 250_000);
+    defer allocator.free(detail_250k);
+    @memset(detail_250k, 'b');
+    const detail_40k = try allocator.alloc(u8, 40_000);
+    defer allocator.free(detail_40k);
+    @memset(detail_40k, 'c');
+
+    for ([_][]const u8{ detail_60k, detail_250k }) |detail| {
+        const probe = FailureDispatcher{ .detail = detail, .fail = true };
+        var ctx = tools_mod.ToolContext{ .allocator = allocator, .home_dir = home, .tool_dispatcher = probe.dispatcher() };
+        var slots = [_]Slot{.{ .decision = .run, .name = "HostPersistenceProbe", .id = "failure", .input = "{}" }};
+        defer slots[0].deinit(allocator);
+
+        try executeSlots(&slots, &ctx, allocator, .{ .bytes = [_]u8{'0'} ** 12 });
+        try std.testing.expect(slots[0].is_error);
+        const encoded = slots[0].content orelse return error.MissingHostError;
+        try std.testing.expect(std.mem.indexOf(u8, encoded, "\"persisted\":true") == null);
+        try std.testing.expect(std.mem.indexOf(u8, encoded, "\"truncated\":true") == null);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, encoded, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(detail, parsed.value.object.get("error").?.object.get("detail").?.string);
+    }
+
+    // A large error is outside the aggregate bulk budget: it must not force an
+    // otherwise sub-threshold successful sibling to disk.
+    const mixed_probe = FailureDispatcher{ .detail = detail_250k, .fail = false };
+    var mixed_ctx = tools_mod.ToolContext{ .allocator = allocator, .home_dir = home, .tool_dispatcher = mixed_probe.dispatcher() };
+    var mixed_slots = [_]Slot{
+        .{ .decision = .run, .name = "HostFailureProbe", .id = "failure", .input = "{}" },
+        .{ .decision = .run, .name = "HostPersistenceProbe", .id = "success", .input = detail_40k },
+    };
+    defer for (&mixed_slots) |*slot| slot.deinit(allocator);
+    try executeSlots(&mixed_slots, &mixed_ctx, allocator, .{ .bytes = [_]u8{'0'} ** 12 });
+    try std.testing.expect(mixed_slots[0].is_error);
+    try std.testing.expect(!mixed_slots[1].is_error);
+    try std.testing.expectEqualStrings(detail_40k, mixed_slots[1].content.?);
+    try std.testing.expect(std.mem.indexOf(u8, mixed_slots[0].content.?, "\"persisted\":true") == null);
+    try std.testing.expect(std.mem.indexOf(u8, mixed_slots[1].content.?, "\"persisted\":true") == null);
+    try std.testing.expect(!platform.fs.exists(result_dir.ptr));
+
+    // Normal bulk output still follows the existing persistence policy.
+    const success_probe = FailureDispatcher{ .detail = &.{}, .fail = false };
+    var success_ctx = tools_mod.ToolContext{ .allocator = allocator, .home_dir = home, .tool_dispatcher = success_probe.dispatcher() };
+    var success_slots = [_]Slot{.{ .decision = .run, .name = "HostPersistenceProbe", .id = "success", .input = detail_60k }};
+    defer success_slots[0].deinit(allocator);
+    try executeSlots(&success_slots, &success_ctx, allocator, .{ .bytes = [_]u8{'0'} ** 12 });
+    try std.testing.expect(!success_slots[0].is_error);
+    try std.testing.expect(std.mem.indexOf(u8, success_slots[0].content.?, "\"persisted\":true") != null);
+    try std.testing.expect(platform.fs.exists(result_dir.ptr));
 }
 
 test "Host detail JSON is exact when valid and falls back when encoded payload exceeds cap" {

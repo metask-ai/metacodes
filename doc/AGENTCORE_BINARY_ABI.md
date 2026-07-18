@@ -419,6 +419,9 @@ The 1 MiB error-payload limit is measured after escaping and serialization. If
 the complete encoded payload would exceed it, AgentCore releases the Host
 buffer and emits a bounded generic ordinary tool error instead; this does not
 upgrade the outcome to fatal. Hosts must not place credentials in detail.
+An encoded Host error payload is semantic model input: generic tool-result
+persistence and per-message bulk-result budgets must not replace it with a
+persisted or truncated envelope.
 
 All empty `mc_owned_bytes_v1` values use the canonical `{NULL, 0}` form. Host
 UI fatal/invalid responses are infrastructure failures: they abort the active
