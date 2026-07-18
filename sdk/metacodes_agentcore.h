@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#if !defined(UINTPTR_MAX) || !defined(UINT64_MAX) || UINTPTR_MAX != UINT64_MAX
+#error "AgentCore ABI v1 revision 2 requires a 64-bit pointer ABI"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -110,6 +114,12 @@ typedef struct {
     uint64_t reserved[2];
 } mc_run_context_v1;
 
+/* The context and session_id bytes are borrowed for one callback. session is
+ * the original public handle and run_id is the admitted Run. session_id is
+ * non-empty, at most MC_MAX_SESSION_ID_BYTES_V1 bytes, stable for the Session,
+ * and distinct across live Sessions. Retaining it requires a deep copy; Hosts
+ * must not infer pointer identity across callbacks. */
+
 /* Canonical empty owned buffers are {NULL, 0}. A non-NULL pointer with zero
  * length is invalid because the ABI must preserve the exact release token.
  * Host callback outputs use one ownership rule independent of status:
@@ -120,8 +130,10 @@ typedef struct {
  * run->session_id, and arguments_json are borrowed for this callback only;
  * arguments_json is the provider-produced tool-input JSON. MC_HOST_OK consumes
  * up to MC_MAX_HOST_TOOL_RESULT_BYTES_V1 of UTF-8 result text. MC_HOST_FAILED
- * and MC_HOST_REJECTED may provide up to MC_MAX_TOOL_ERROR_PAYLOAD_BYTES_V1 of
- * UTF-8 detail. Invalid detail degrades to an empty business failure; an
+ * and MC_HOST_REJECTED may provide the same raw amount of UTF-8 detail; after
+ * JSON serialization AgentCore limits the encoded tool-error payload to
+ * MC_MAX_TOOL_ERROR_PAYLOAD_BYTES_V1. Invalid or over-cap encoded detail
+ * degrades to a bounded generic business failure; an
  * invalid MC_HOST_OK descriptor is fatal, while invalid success payload text
  * is treated as Host failure. MC_HOST_FATAL and unknown status codes are
  * fatal. */
@@ -168,7 +180,8 @@ typedef uint32_t (*mc_on_event_fn_v1)(
     mc_bytes_view_v1 event_json);
 /* UI requests are synchronous in ABI v1. The Host returns one JSON response:
  * {"answers":[...]} or {"permission":"allow_once"}.
- * Only MC_UI_ANSWERED consumes the response; other statuses ignore it.
+ * Only MC_UI_ANSWERED consumes the response. MC_UI_UNAVAILABLE is an ordinary
+ * reusable outcome; fatal/unknown status poisons the Session.
  * Responses over MC_MAX_UI_RESPONSE_BYTES_V1 are callback failures and poison
  * the Session. */
 typedef uint32_t (*mc_on_ui_request_fn_v1)(
@@ -196,7 +209,8 @@ typedef struct {
  * supported built-in file tools and shell commands. It is not a filesystem
  * containment boundary: absolute paths remain valid unless the Host applies
  * a separate sandbox/policy. workspace_root must identify an existing
- * absolute path; workspace_home must be absolute. Provider credentials never
+ * absolute path. workspace_home may be empty to use workspace_root; otherwise
+ * it must be absolute. Provider credentials never
  * appear in event or diagnostic buffers. Prompts, model/tool/UI payloads may
  * contain sensitive data, so the Host owns logging and redaction. */
 typedef struct {
@@ -245,7 +259,11 @@ typedef uint32_t (*mc_session_destroy_fn_v1)(mc_session *, mc_owned_bytes_v1 *);
  * admitted run_id. Values may skip. Pre-admission rejection never advances the
  * last admitted ID, so an otherwise valid greater value remains available for
  * retry; zero and stale values do not. Admitted values must not be reused or
- * wrapped. After admitting UINT64_MAX, the Host must create a new Session. */
+ * wrapped. After admitting UINT64_MAX, the Host must create a new Session.
+ * Return is a quiescence boundary: callbacks and paired releases for this Run
+ * have completed. The facade gate remains held through result/diagnostic
+ * publication; overlapping run/destroy returns BUSY, while matching abort may
+ * proceed. */
 typedef uint32_t (*mc_session_run_fn_v1)(
     mc_session *session,
     uint64_t run_id,
@@ -303,8 +321,10 @@ typedef struct {
 /* Runtime outlives its Sessions. Runs are synchronous and one-at-a-time per
  * Session. Different Sessions may run and invoke shared callbacks concurrently.
  * A Host tool may also be invoked concurrently within one Session. Callbacks
- * may request abort but must not re-enter run or destroy. No callback or
- * release callback has thread affinity. */
+ * may request abort; re-entered run or destroy returns BUSY. A callback must
+ * not wait or spin for that operation. C++ exceptions, longjmp, and all other
+ * non-local control transfers must not cross callback or release-callback
+ * boundaries. No callback or release callback has thread affinity. */
 /* requested_abi selects the major table shape. Consumers must additionally
  * require struct_size == sizeof(mc_agentcore_api_v1), abi_version ==
  * MC_AGENTCORE_ABI_V1, and abi_revision == MC_AGENTCORE_ABI_REVISION before

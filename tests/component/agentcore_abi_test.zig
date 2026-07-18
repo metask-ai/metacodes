@@ -146,15 +146,23 @@ const Probe = struct {
 const UiFailureMode = enum {
     fatal,
     oversized,
+    unavailable,
+    unknown,
+    abort_twice,
 };
 
 const UiFailureProbe = struct {
     mode: UiFailureMode,
+    api: ?sdk.Api = null,
     calls: usize = 0,
     releases: usize = 0,
     byte: u8 = 0,
+    nested_run_status: u32 = std.math.maxInt(u32),
+    nested_destroy_status: u32 = std.math.maxInt(u32),
+    first_abort_status: u32 = std.math.maxInt(u32),
+    second_abort_status: u32 = std.math.maxInt(u32),
 
-    fn ui(raw: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+    fn ui(raw: ?*anyopaque, run_ptr: ?*const wire.RunContextV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
         const self: *UiFailureProbe = @ptrCast(@alignCast(raw orelse return wire.UI_FATAL));
         self.calls += 1;
         return switch (self.mode) {
@@ -165,6 +173,29 @@ const UiFailureProbe = struct {
                     .len = wire.MAX_UI_RESPONSE_BYTES_V1 + 1,
                 };
                 break :blk wire.UI_ANSWERED;
+            },
+            .unavailable => wire.UI_UNAVAILABLE,
+            .unknown => std.math.maxInt(u32),
+            .abort_twice => blk: {
+                const api = self.api orelse return wire.UI_FATAL;
+                const run = sdk.validateRunContext(run_ptr) catch return wire.UI_FATAL;
+                var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+                defer api.bufferRelease()(&diagnostic);
+                self.nested_run_status = api.sessionRun()(
+                    run.session,
+                    run.run_id + 1,
+                    sdk.bytesView("nested callback run"),
+                    null,
+                    null,
+                    &diagnostic,
+                );
+                api.bufferRelease()(&diagnostic);
+                self.nested_destroy_status = api.sessionDestroy()(run.session, &diagnostic);
+                api.bufferRelease()(&diagnostic);
+                self.first_abort_status = api.sessionAbort()(run.session, run.run_id, wire.ABORT_USER_REQUEST, &diagnostic);
+                api.bufferRelease()(&diagnostic);
+                self.second_abort_status = api.sessionAbort()(run.session, run.run_id, wire.ABORT_USER_REQUEST, &diagnostic);
+                break :blk wire.UI_UNAVAILABLE;
             },
         };
     }
@@ -918,13 +949,13 @@ test "L2 Event callback may cooperatively abort without poisoning the ABI Sessio
     runtime = null;
 }
 
-fn expectUiFailurePoisons(mode: UiFailureMode, expected_releases: usize) !void {
+fn expectUiOutcome(mode: UiFailureMode, expected_releases: usize, expected_status: u32, expected_stop: u32) !void {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try rootPath(&tmp, &root_buf);
-    const bodies = [_][]const u8{ASK_SSE};
+    const bodies = [_][]const u8{ ASK_SSE, FINAL_SSE, FINAL_SSE };
     var server = try harness.MockServer.startCassette(&bodies, 0);
     defer server.stop();
     const url = try server.urlOwned(a);
@@ -958,7 +989,7 @@ fn expectUiFailurePoisons(mode: UiFailureMode, expected_releases: usize) !void {
     session_config.workspace_home = sdk.bytesView(root);
     session_config.allowed_tools = &allowed;
     session_config.allowed_tool_count = allowed.len;
-    var probe = UiFailureProbe{ .mode = mode };
+    var probe = UiFailureProbe{ .mode = mode, .api = api };
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
     callbacks.ctx = &probe;
@@ -972,12 +1003,24 @@ fn expectUiFailurePoisons(mode: UiFailureMode, expected_releases: usize) !void {
 
     var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .reserved = [_]u64{0} ** 4 };
     var result: wire.RunResultV1 = undefined;
-    try std.testing.expectEqual(wire.STATUS_CALLBACK_FAILED, api.sessionRun()(session, 1, sdk.bytesView("ask through broken UI"), &options, &result, &diagnostic));
+    try std.testing.expectEqual(expected_status, api.sessionRun()(session, 1, sdk.bytesView("ask through Host UI"), &options, &result, &diagnostic));
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expectEqual(expected_releases, probe.releases);
     api.bufferRelease()(&diagnostic);
-    try std.testing.expectEqual(wire.STATUS_INVALID_STATE, api.sessionRun()(session, 2, sdk.bytesView("must stay poisoned"), &options, &result, &diagnostic));
-    api.bufferRelease()(&diagnostic);
+    if (expected_status == wire.STATUS_CALLBACK_FAILED) {
+        try std.testing.expectEqual(wire.STATUS_INVALID_STATE, api.sessionRun()(session, 2, sdk.bytesView("must stay poisoned"), &options, &result, &diagnostic));
+        api.bufferRelease()(&diagnostic);
+    } else {
+        try std.testing.expectEqual(expected_stop, result.stop_reason_code);
+        if (mode == .abort_twice) {
+            try std.testing.expectEqual(wire.STATUS_BUSY, probe.nested_run_status);
+            try std.testing.expectEqual(wire.STATUS_BUSY, probe.nested_destroy_status);
+            try std.testing.expectEqual(wire.STATUS_OK, probe.first_abort_status);
+            try std.testing.expectEqual(wire.STATUS_OK, probe.second_abort_status);
+        }
+        try std.testing.expectEqual(wire.STATUS_OK, api.sessionRun()(session, 2, sdk.bytesView("Session remains reusable"), &options, &result, &diagnostic));
+        try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    }
     try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
     session = null;
     try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
@@ -985,11 +1028,23 @@ fn expectUiFailurePoisons(mode: UiFailureMode, expected_releases: usize) !void {
 }
 
 test "L2 Host UI fatal aborts the Run and poisons the ABI Session" {
-    try expectUiFailurePoisons(.fatal, 0);
+    try expectUiOutcome(.fatal, 0, wire.STATUS_CALLBACK_FAILED, 0);
 }
 
 test "L2 oversized Host UI response is released and poisons the ABI Session" {
-    try expectUiFailurePoisons(.oversized, 1);
+    try expectUiOutcome(.oversized, 1, wire.STATUS_CALLBACK_FAILED, 0);
+}
+
+test "L2 unknown Host UI status poisons the ABI Session" {
+    try expectUiOutcome(.unknown, 0, wire.STATUS_CALLBACK_FAILED, 0);
+}
+
+test "L2 unavailable Host UI is a reusable business outcome" {
+    try expectUiOutcome(.unavailable, 0, wire.STATUS_OK, wire.STOP_END_TURN);
+}
+
+test "L2 Host UI callback may repeat abort while nested run and destroy stay busy" {
+    try expectUiOutcome(.abort_twice, 0, wire.STATUS_OK, wire.STOP_ABORTED);
 }
 
 fn expectMappedEventEquals(event: core.protocol.ui_event.CoreEvent, expected: sdk.CoreEvent) !void {

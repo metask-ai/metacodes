@@ -10,6 +10,11 @@ pub const protocol_v1 = @import("protocol_v1.zig");
 
 const allocator = std.heap.c_allocator;
 
+comptime {
+    if (wire.MAX_TOOL_ERROR_PAYLOAD_BYTES_V1 != @as(u64, core.tool_exec.MAX_TOOL_ERROR_PAYLOAD_BYTES_V1))
+        @compileError("AgentCore wire and core encoded Host-error limits must match");
+}
+
 const AbiHostTool = struct {
     ctx: ?*anyopaque,
     execute_fn: wire.HostExecuteFnV1,
@@ -41,11 +46,11 @@ const AbiHostTool = struct {
             return outcomeWithoutDetail(status);
         }
 
-        const max_len = if (status == wire.HOST_OK)
-            wire.MAX_HOST_TOOL_RESULT_BYTES_V1
-        else
-            wire.MAX_TOOL_ERROR_PAYLOAD_BYTES_V1;
-        if (out.len > max_len) {
+        // The wire descriptor has one raw-text limit for every business
+        // status. FAILED/REJECTED detail is later serialized under the smaller
+        // encoded-payload cap; applying that cap here would reject valid raw
+        // detail before escaping is measured.
+        if (out.len > wire.MAX_HOST_TOOL_RESULT_BYTES_V1) {
             if (hasReleaseToken(out)) self.release_fn(self.ctx, &out);
             return outcomeWithInvalidPayload(status);
         }
@@ -860,6 +865,34 @@ test "Host failure detail is transferred while fatal buffers release immediately
         try std.testing.expect(Probe.released_ptr == @as(?[*]u8, @ptrCast(&Probe.bytes)));
         try std.testing.expectEqual(@as(u64, Probe.bytes.len), Probe.released_len);
     }
+}
+
+test "Host failure raw detail is not capped by the encoded error payload limit" {
+    const a = std.testing.allocator;
+    const bytes = try a.alloc(u8, wire.MAX_TOOL_ERROR_PAYLOAD_BYTES_V1 + 1);
+    defer a.free(bytes);
+    @memset(bytes, 'x');
+    const Probe = struct {
+        var payload: []u8 = &.{};
+        var releases: usize = 0;
+
+        fn execute(_: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+            (out orelse return wire.HOST_FATAL).* = .{ .ptr = payload.ptr, .len = payload.len };
+            return wire.HOST_FAILED;
+        }
+
+        fn release(_: ?*anyopaque, _: ?*wire.OwnedBytesV1) callconv(.c) void {
+            releases += 1;
+        }
+    };
+    Probe.payload = bytes;
+    Probe.releases = 0;
+    var host = AbiHostTool{ .ctx = null, .execute_fn = Probe.execute, .release_fn = Probe.release };
+    const outcome = try AbiHostTool.execute(&host, testHostIdent(@ptrCast(&host)), "{}");
+    try std.testing.expect(outcome == .failed and outcome.failed != null);
+    try std.testing.expectEqual(bytes.len, outcome.failed.?.bytes.len);
+    outcome.failed.?.release();
+    try std.testing.expectEqual(@as(usize, 1), Probe.releases);
 }
 
 test "Host UI descriptor ownership is independent of callback status" {

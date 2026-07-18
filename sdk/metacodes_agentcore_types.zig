@@ -6,6 +6,11 @@
 pub const ABI_VERSION_V1: u32 = 1;
 pub const ABI_REVISION: u32 = 2;
 
+comptime {
+    if (@sizeOf(usize) != 8)
+        @compileError("AgentCore ABI v1 revision 2 requires a 64-bit pointer ABI");
+}
+
 pub const Status = enum(u32) {
     ok = 0,
     invalid_argument = 1,
@@ -159,7 +164,9 @@ pub const RunContextV1 = extern struct {
 /// callback status. Host owns `host_ctx` through successful Runtime destroy;
 /// `run`, its `session_id`, and provider-produced `arguments_json` are borrowed
 /// for the callback. HOST_OK carries result text; HOST_FAILED/HOST_REJECTED may
-/// carry bounded error detail. HOST_FATAL and unknown codes are fatal.
+/// carry up to MAX_HOST_TOOL_RESULT_BYTES_V1 of raw error detail, which is
+/// subject to MAX_TOOL_ERROR_PAYLOAD_BYTES_V1 after serialization. HOST_FATAL
+/// and unknown codes are fatal.
 pub const HostExecuteFnV1 = *const fn (
     host_ctx: ?*anyopaque,
     run: ?*const RunContextV1,
