@@ -8,6 +8,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tty_driver import run
 from asserts import TTYAssert
+from e2e_helpers import run_live_fresh  # 真模型用例:播种凭证隔离 HOME + 凭证回传 + 失效跳过
 
 # 这套用例打真实模型，需要 metacodes login 或 METASK_API_KEY；
 # 若想跳过(离线/CI),设 TTY_SKIP_MODEL=1。
@@ -19,8 +20,8 @@ def test_T14_generating_keeps_input_box(bin_path):
         return
     # 提交一句会产生输出的查询 → 生成期应有【多帧持续】同时有 spinner + 完整输入框 + footer
     # (不是"某一帧有",而是 spinner+框+❯+footer 共存于生成窗口的多个帧 → 区持续可见、不闪没)。
-    raw = run(bin_path, ["sleep:0.8", "type:慢慢数到十五,每行一个数字", "key:enter", "sleep:4"],
-              per_key_drain=0.05, base_url=None)
+    raw = run_live_fresh(bin_path, ["sleep:0.8", "type:慢慢数到十五,每行一个数字", "key:enter", "sleep:4"],
+              per_key_drain=0.05)
     a = TTYAssert(raw)
     coexist = sum(
         1 for sc in a.frame_screens
@@ -40,10 +41,10 @@ def test_T15_type_into_queued_during_gen(bin_path):
     if SKIP:
         return
     # 对齐 cc:生成期打 HELLO(不回车)→ 只停在输入框 ❯ 行,**不提交、不进 scrollback**。
-    raw = run(bin_path, ["sleep:0.8",
+    raw = run_live_fresh(bin_path, ["sleep:0.8",
                          "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
                          "sleep:0.6", "type:HELLO", "sleep:2.5"],
-              per_key_drain=0.06, base_url=None)
+              per_key_drain=0.06)
     a = TTYAssert(raw)
     # HELLO 出现在生成帧的 ❯ 内容行
     in_box = any(
@@ -68,9 +69,9 @@ def test_T16_queued_autosubmits_after_gen(bin_path):
         return
     # 生成期打第二句 + 回车入队;第一轮自然结束 → 队列自动续发跑第二轮。
     # 第一句须生成够久(长查询),保证 DONE2 在生成窗口内入队(否则被 drainStdin 丢弃,属正确行为)。
-    raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
+    raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
                          "sleep:0.6", "type:DONE2", "key:enter", "sleep:10"],
-              per_key_drain=0.06, base_url=None)
+              per_key_drain=0.06)
     a = TTYAssert(raw)
     # queued "DONE2" 回车入队 → 第一轮结束后自动续发 → ❯ 回显进 scrollback。
     a.assert_prose_contains("DONE2")
@@ -80,9 +81,9 @@ def test_T20_enter_enqueues_clears_box(bin_path):
     # 生成期打字 + 回车 → 输入框清空 + 队列预览出现(dim ⏳ QMSG),且未即时提交进 scrollback。
     if SKIP:
         return
-    raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独一行", "key:enter",
+    raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独一行", "key:enter",
                          "sleep:0.6", "type:QUEUEDMSG", "key:enter", "sleep:2.0"],
-              per_key_drain=0.05, base_url=None)
+              per_key_drain=0.05)
     a = TTYAssert(raw)
     # 回车后某生成帧:队列预览含 QUEUEDMSG(在框上方),且 ❯ 框已清空(不含 QUEUEDMSG)。
     found_preview = False
@@ -108,7 +109,7 @@ def test_T21_multiple_queued_autosubmit(bin_path):
     import json
     import shutil
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from e2e_helpers import fresh_home  # noqa: E402
+    from e2e_helpers import fresh_home, run_live  # noqa: E402
 
     # 时序要点(2026-06-11 修正):两条排队消息必须在**同一次**生成窗口内入队,否则首轮结束时
     # popAllJoined 只捞到 BATCHA、BATCHB 落入下一轮 → 不合并。故首查询够长(数到 50 + 慢慢来)+
@@ -118,10 +119,10 @@ def test_T21_multiple_queued_autosubmit(bin_path):
     # 这在 transcript 里确定记录,与屏幕回显时序无关。旧版查 scrollback prose 的 ❯ 回显——模型答题
     # 速度波动时回显可能没落到捕获窗口内 → flaky。transcript 是 popAllJoined 合并的权威证据。
     home = fresh_home()
-    run(bin_path, ["sleep:0.8", "type:请从 1 数到 50,每个数字单独占一行,慢慢来", "key:enter",
-                   "sleep:0.5", "type:BATCHA", "key:enter",
-                   "sleep:0.3", "type:BATCHB", "key:enter", "sleep:22"],
-        per_key_drain=0.05, base_url=None, env={"HOME": home})
+    run_live(bin_path, ["sleep:0.8", "type:请从 1 数到 50,每个数字单独占一行,慢慢来", "key:enter",
+                        "sleep:0.5", "type:BATCHA", "key:enter",
+                        "sleep:0.3", "type:BATCHB", "key:enter", "sleep:22"],
+             home, per_key_drain=0.05)
 
     # 扫 transcript 的 user 消息,找含 BATCH 的文本块。
     user_batch_msgs = []
@@ -154,9 +155,9 @@ def test_T22_esc_interrupts(bin_path):
         return
     import re
     from asserts import split_frames
-    raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60 每行一个数字", "key:enter",
+    raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请从 1 数到 60 每行一个数字", "key:enter",
                          "sleep:0.6", "type:TYPED", "key:esc", "sleep:3"],
-              per_key_drain=0.05, base_url=None)
+              per_key_drain=0.05)
     a = TTYAssert(raw)
     prose = re.sub(rb"\x1b\[[0-9;?>]*[A-Za-z]", b"",
                    b"".join(c for k, c in split_frames(raw) if k == "prose")).decode("utf-8", "replace")
@@ -177,9 +178,9 @@ def test_T23_cjk_ime_in_box(bin_path):
     # 中文(多字节)在生成期输入框完整显示;模拟 IME committed 文本逐字节到达。
     if SKIP:
         return
-    raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60 每行一个数字", "key:enter",
+    raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请从 1 数到 60 每行一个数字", "key:enter",
                          "sleep:0.6", "type:你好世界", "sleep:1.5"],
-              per_key_drain=0.05, base_url=None)
+              per_key_drain=0.05)
     a = TTYAssert(raw)
     found = any(
         sc.find_last_row("esc to interrupt") is not None
@@ -196,10 +197,10 @@ def test_T24_esc_interrupts_then_resends_queue(bin_path):
     # 数到 60 的较长查询确保 Esc 时生成仍在进行;短超时下 Esc 经 flushEsc 兑现为中断。
     if SKIP:
         return
-    raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
+    raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
                          "sleep:0.8", "type:打断后请回答你是谁", "key:enter",
                          "sleep:0.4", "key:esc", "sleep:8"],
-              per_key_drain=0.05, base_url=None)
+              per_key_drain=0.05)
     a = TTYAssert(raw)
     import re
     from asserts import split_frames
@@ -319,8 +320,8 @@ def test_A6_narrow_terminal_no_wrap(bin_path):
     if SKIP:
         return
     from screen import str_width
-    raw = run(bin_path, ["sleep:0.8", "type:数到八每行一个", "key:enter", "sleep:3"],
-              term_size=(24, 40), per_key_drain=0.05, base_url=None)
+    raw = run_live_fresh(bin_path, ["sleep:0.8", "type:数到八每行一个", "key:enter", "sleep:3"],
+              term_size=(24, 40), per_key_drain=0.05)
     a = TTYAssert(raw, rows=24, cols=40)
     bad = []
     for sc in a.frame_screens:
@@ -350,9 +351,9 @@ def test_T30_gen_help_nonmodal(bin_path):
     # 字面字符塞进输入框,生成期完全不响应。长查询保证 ? 落在生成窗口。
     if SKIP:
         return
-    raw = run(bin_path, ["sleep:0.8", "type:请用中文从 1 数到 200,每个数字单独占一行,不要省略任何数字", "key:enter",
+    raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请用中文从 1 数到 200,每个数字单独占一行,不要省略任何数字", "key:enter",
                          "sleep:0.6", "type:?", "sleep:0.5"],
-              per_key_drain=0.05, base_url=None)
+              per_key_drain=0.05)
     a = TTYAssert(raw)
     gen = _gen_frames(a)
     if not gen:
@@ -375,9 +376,9 @@ def test_T31_gen_help_esc_only_closes(bin_path):
     # esc 为末键,sleep 足够长靠 flushEsc 兑现;之后生成应继续(spinner 帧仍在)。
     if SKIP:
         return
-    raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
+    raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
                          "sleep:0.6", "type:?", "sleep:0.4", "key:esc", "sleep:3"],
-              per_key_drain=0.05, base_url=None)
+              per_key_drain=0.05)
     a = TTYAssert(raw)
     import re
     from asserts import split_frames
@@ -395,9 +396,9 @@ def test_T32_gen_ctrl_o_transcript(bin_path):
     # 先 sleep 让首轮 append 进 conversation,transcript 有内容。alt-screen 独立缓冲根治多 agent 显两份。
     if SKIP:
         return
-    raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
+    raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
                          "sleep:1.5", "key:ctrl_o", "sleep:0.8"],
-              per_key_drain=0.05, base_url=None)
+              per_key_drain=0.05)
     assert b"\x1b[?1049h" in raw, "生成期 Ctrl+O 全屏 transcript 应进 alt-screen"
     assert b"Showing detailed transcript" in raw, "生成期 Ctrl+O 应渲染 cc 风格 transcript footer"
 
@@ -406,9 +407,9 @@ def test_T33_gen_ctrl_o_toggle_close(bin_path):
     # 生成期 Ctrl+O 开全屏(alt-screen)→ 再 Ctrl+O 关(viewer 认 0x0f/CSI-u 退出)→ 终端自动恢复回生成区。
     if SKIP:
         return
-    raw = run(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
+    raw = run_live_fresh(bin_path, ["sleep:0.8", "type:请从 1 数到 60,每个数字单独占一行,不要省略", "key:enter",
                          "sleep:1.5", "key:ctrl_o", "sleep:0.6", "key:ctrl_o", "sleep:1"],
-              per_key_drain=0.05, base_url=None)
+              per_key_drain=0.05)
     a = TTYAssert(raw)
     assert b"\x1b[?1049h" in raw, "全屏 transcript 应进 alt-screen"
     assert b"Showing detailed transcript" in raw, "应一度显示 transcript footer"
@@ -427,9 +428,9 @@ def test_T34_gen_shift_tab_cycles_mode(bin_path):
         return
     # 用 default 模式启动(tty_driver 默认 bypassPermissions,其 cycle 是 bypass→default
     # 看不到 accept edits)。default 下 Shift+Tab → accept edits,可断言。
-    raw = run(bin_path, ["sleep:0.8", "type:数到30每行一个数字", "key:enter",
+    raw = run_live_fresh(bin_path, ["sleep:0.8", "type:数到30每行一个数字", "key:enter",
                          "sleep:0.6", "key:shift_tab", "sleep:1.5"],
-              per_key_drain=0.05, base_url=None, permission="default")
+              per_key_drain=0.05, permission="default")
     a = TTYAssert(raw)
     # 某帧 footer 出现非 default 模式(accept edits / plan mode)——Shift+Tab 在生成期切换生效。
     ok = any(

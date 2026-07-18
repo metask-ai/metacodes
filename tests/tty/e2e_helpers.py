@@ -17,6 +17,7 @@ import sys
 import json
 import glob
 import time
+import atexit
 import shutil
 import tempfile
 
@@ -36,9 +37,82 @@ class SkipTest(Exception):
     runner 识别本异常计入 skipped。"""
 
 
+# OAuth 迁移后凭证在 ~/.metacodes/auth.json(env token fallback 已删)。HOME 隔离会把它
+# 挡在门外 → 二进制启动即退(无凭证),真模型 attempt 秒失败且 transcript 全空。
+REAL_AUTH = os.path.expanduser("~/.metacodes/auth.json")
+
+# 播种 HOME 里躺着真实凭证拷贝,任何异常路径(SkipTest 中途逃逸、用例自身 raise)都不允许
+# 把它永久遗留在 /var/folders。janitor 兜底:fresh_home 登记,进程退出统一清;
+# 失败诊断要保留的 home 显式 keep_home() 摘牌(手工 rmtree 与 janitor 幂等共存)。
+_HOMES = []
+_KEEP = set()
+
+
+def keep_home(home):
+    """把 home 从 atexit janitor 摘牌(失败诊断需要死后验尸时用,与诊断消息里的路径配套)。"""
+    _KEEP.add(home)
+
+
+def _purge_homes():
+    for h in _HOMES:
+        if h not in _KEEP:
+            shutil.rmtree(h, ignore_errors=True)
+
+
+atexit.register(_purge_homes)
+
+
 def fresh_home():
-    """每个 attempt 用独立 HOME,transcript 隔离、易定位最新 session。"""
-    return tempfile.mkdtemp(prefix="cc-e2e-home-")
+    """每个 attempt 用独立 HOME,transcript 隔离、易定位最新 session。
+
+    自动播种真实 OAuth 凭证进隔离 HOME(对齐 test_e2e_dag_loop 先例);凭证与 env key
+    都缺时 SkipTest——环境无真模型,诚实跳过而非伪装成"模型未调工具"的假失败。
+
+    无差别播种对 dead-URL 用例安全:离线路径 _build_env 注入 METASK_API_KEY,而
+    resolveCredential **env key 优先于 stored oauth**(2026-07-18 实测:死端口 + dummy
+    env key + 播种已失效 oauth,REPL 正常起、无 OAuthLoginRequired)。
+    """
+    if not os.path.exists(REAL_AUTH) and not os.environ.get("METASK_API_KEY"):
+        raise SkipTest("真模型凭证不可得(无 ~/.metacodes/auth.json 且无 METASK_API_KEY)")
+    home = tempfile.mkdtemp(prefix="cc-e2e-home-")
+    _HOMES.append(home)
+    if os.path.exists(REAL_AUTH):
+        os.makedirs(os.path.join(home, ".metacodes"), exist_ok=True)
+        shutil.copy(REAL_AUTH, os.path.join(home, ".metacodes", "auth.json"))
+    return home
+
+
+def sync_auth_back(home, real_auth=None):
+    """把隔离 HOME 里被刷新过的 OAuth 凭证写回真实 ~/.metacodes/auth.json。
+
+    OAuth refresh token 是**轮换**的:seeded 拷贝触发刷新后,新 refresh token 只存在于
+    临时 HOME(跑完即删)→ 真实凭证作废,用户被迫重新 login(2026-07-18 血泪实证:
+    dag_loop 一次 e2e 就烧掉了真 refresh token)。每次 run() 后必须调本函数回传。
+    守卫:仅当 seeded 侧 oauth 完整且 expires_at 更新时才覆盖,不回传损坏/清空的状态;
+    只动 oauth 块,真实文件其余字段(selected_model 等)原样保留;0600 原子替换。
+    real_auth 参数仅供单测注入,生产调用一律走默认 REAL_AUTH。
+    """
+    real_auth = real_auth or REAL_AUTH
+    seeded = os.path.join(home, ".metacodes", "auth.json")
+    if not (os.path.exists(seeded) and os.path.exists(real_auth)):
+        return
+    try:
+        with open(seeded) as f:
+            s = json.load(f)
+        with open(real_auth) as f:
+            r = json.load(f)
+        so, ro = s.get("oauth") or {}, r.get("oauth") or {}
+        if so.get("refresh_token") and \
+                (so.get("expires_at") or 0) > (ro.get("expires_at") or 0):
+            r["oauth"] = so
+            tmp = real_auth + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(r, f, indent=2)
+            os.chmod(tmp, 0o600)  # O_CREAT 的 mode 只在创建时生效,防旧崩溃残留的 0644 tmp 被复用
+            os.replace(tmp, real_auth)
+    except (OSError, ValueError):
+        pass  # 回传是尽力而为,绝不让它带崩测试本身
 
 
 def read_tool_uses(home):
@@ -187,6 +261,47 @@ def screen_has_tool_card(raw, tool_name):
     return ("⚙" in text) and (tool_name in text)
 
 
+def run_live(bin_path, keys, home, **kw):
+    """真模型(base_url=None)直连 run 的唯一合法入口:跑完回传轮换凭证 + 凭证死亡即跳过。
+
+    绕开本函数裸调 run(base_url=None) 的用例会把刷新轮换后的 refresh token 遗留在
+    临时 HOME 里(随 cleanup 销毁)→ 真实凭证作废、用户被迫重新 login。
+    """
+    e = kw.pop("env", None) or {}
+    e.setdefault("HOME", home)
+    raw = run(bin_path, keys, base_url=None, env=e, **kw)
+    sync_auth_back(e["HOME"])
+    # 启动死亡双通道检测:
+    #   ① 字符串:Zig runtime 对 main 返回的 error 恒打印 `error: OAuthLoginRequired`
+    #     (error name 是运行时值,release 构建同样打印,2026-07-18 实测确认)。
+    #   ② 结构:成功启动的 REPL 必渲染 ❯ 输入框;raw 全程无 ❯ = 二进制未达 REPL。
+    #     必须有②:macOS pty 下子进程写完错误立即退出时,master 侧读取有丢失竞态
+    #     (2026-07-18 实证:同一死亡,单跑捕获全文、套件内批量跑约 1/3 attempt 只剩
+    #      trace 尾巴甚至全丢)→ 只靠①会把凭证死亡漏判成"模型未调工具"假失败。
+    #     产品级启动崩溃不会被此掩盖:全离线套件每条用例都要求 ❯,那里会红成一片;
+    #     skip 消息附 raw 尾巴,真 auth 回归在 skip 文本里仍可见。
+    # 凭证死亡 = 环境故障,重试无意义;home 里只有一份死凭证拷贝,立删。
+    died_before_repl = b"\xe2\x9d\xaf" not in raw  # ❯ (U+276F) 的 UTF-8
+    if b"OAuthLoginRequired" in raw or died_before_repl:
+        shutil.rmtree(e["HOME"], ignore_errors=True)
+        tail = raw[-200:].decode("utf-8", "replace") if died_before_repl else ""
+        raise SkipTest("凭证失效/二进制未达 REPL(环境故障,请重新 metacodes login)。"
+                       + ("raw 尾部:%r" % tail if tail else ""))
+    return raw
+
+
+def run_live_fresh(bin_path, keys, **kw):
+    """live run 便捷入口:自建播种 HOME,跑完即删(用例只断言屏幕、不读 transcript 时用)。
+
+    删除很重要:播种 HOME 里有真实凭证,不能在 /tmp 里越积越多。
+    """
+    home = fresh_home()
+    try:
+        return run_live(bin_path, keys, home, **kw)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def run_e2e_tool(bin_path, prompt, tool_name, required_keys=None,
                  extra_keys=None, wait_s=12, env=None, cwd=None, post_keys=None):
     """跑一次真模型 attempt:输入 prompt → 等模型调工具 → 收 (raw, home, uses)。
@@ -205,8 +320,8 @@ def run_e2e_tool(bin_path, prompt, tool_name, required_keys=None,
         keys += extra_keys
     if post_keys:
         keys += post_keys
-    raw = run(bin_path, keys, base_url=None, env=e, cwd=cwd,
-              per_key_drain=0.04, startup_drain=1.0)
+    raw = run_live(bin_path, keys, home, env=e, cwd=cwd,
+                   per_key_drain=0.04, startup_drain=1.0)
     uses = read_tool_uses(home)
     return raw, home, uses
 
@@ -270,6 +385,7 @@ def assert_tool_e2e(bin_path, prompt, tool_name, required_keys=None,
     diag = ("工具 %s%s 未被调用或执行失败(required_keys=%s)。%d 次 attempt 全失败。\n"
             "  transcript 实际调用的工具: %s%s\n"
             "  HOME(保留供调试): %s") % (tool_name, accepted, required_keys, n, names, ok_note, home)
+    keep_home(home)  # 诊断消息引用了该路径,从 atexit janitor 摘牌
     if cleanup_home:
         for h in homes[:-1]:
             shutil.rmtree(h, ignore_errors=True)

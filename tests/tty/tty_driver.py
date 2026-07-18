@@ -20,8 +20,10 @@
   两后端共享同一份实现(_Capture),只有"读一片字节"原语按平台实现——语义永不分叉。
 """
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 IS_WINDOWS = sys.platform == "win32"
@@ -191,18 +193,28 @@ def _build_env(base_url, env):
     if base_url:
         full_env.setdefault("METASK_API_KEY", "tty-dummy-key")
     # HOME 隔离:不读用户真实 ~/.claude / ~/.metacodes(settings/agents/skills),保证可重复。
-    full_env.setdefault("HOME", "/tmp/cc-tty-home")
-    os.makedirs(full_env["HOME"], exist_ok=True)
-    if IS_WINDOWS:
-        # Windows 侧 homeDir 走 USERPROFILE;与 HOME 指向同一隔离目录。
-        full_env["USERPROFILE"] = os.path.abspath(full_env["HOME"])
+    # 两条血泪(2026-07-18)都在这一行:
+    #   ① 必须无条件覆盖——os.environ 里 HOME 在 POSIX 恒存在,旧 setdefault 是 no-op
+    #     (隔离从未生效,model_menu 用例把假 api_key 写进了用户真实 auth.json;Windows 的
+    #      os.environ 常无 HOME,setdefault 恰好生效——同一行代码两平台两种行为)。
+    #   ② 必须每次 run() 全新目录——共享静态目录会跨用例/跨套件积累 task/kg/transcript
+    #     状态,产生顺序耦合的假失败(T37 的 kg 任务残留把 T27 的"无任务"前提打穿)。
+    # 需要指定 HOME 的用例(e2e 播种凭证)走下方 env 参数显式覆盖;ephemeral home 由
+    # run() 在 finally 里删除。
+    ephemeral_home = None
+    if not (env and env.get("HOME")):
+        ephemeral_home = tempfile.mkdtemp(prefix="cc-tty-home-")
+        full_env["HOME"] = ephemeral_home
     if env:
         for k, v in env.items():
             if v is None:
                 full_env.pop(k, None)
             else:
                 full_env[k] = v
-    return full_env
+    if IS_WINDOWS and full_env.get("HOME"):
+        # Windows 侧 homeDir 走 USERPROFILE;与 HOME 指向同一隔离目录(env 显式覆盖后再算)。
+        full_env["USERPROFILE"] = os.path.abspath(full_env["HOME"])
+    return full_env, ephemeral_home
 
 
 def _drive(key_events, write, cap, set_size, per_key_drain):
@@ -256,12 +268,22 @@ def run(bin_path, key_events, term_size=(24, 80), env=None,
     rows, cols = term_size
     # bin_path 转绝对路径:cwd 非 None 时子进程会 chdir,相对 bin_path 会失效。
     bin_path = os.path.abspath(bin_path)
-    full_env = _build_env(base_url, env)
+    full_env, ephemeral_home = _build_env(base_url, env)
+    try:
+        if IS_WINDOWS:
+            return _run_windows(bin_path, key_events, (rows, cols), full_env,
+                                permission, base_url, cwd, startup_drain, per_key_drain)
+        return _run_posix(bin_path, key_events, (rows, cols), full_env,
+                          permission, base_url, cwd, startup_drain, per_key_drain)
+    finally:
+        # ephemeral home 无凭证(live 用例都显式传播种 HOME),删失败无害,尽力而为。
+        if ephemeral_home:
+            shutil.rmtree(ephemeral_home, ignore_errors=True)
 
-    if IS_WINDOWS:
-        return _run_windows(bin_path, key_events, (rows, cols), full_env,
-                            permission, base_url, cwd, startup_drain, per_key_drain)
 
+def _run_posix(bin_path, key_events, term_size, full_env,
+               permission, base_url, cwd, startup_drain, per_key_drain):
+    rows, cols = term_size
     pid, fd = pty.fork()
     if pid == 0:
         # 子进程

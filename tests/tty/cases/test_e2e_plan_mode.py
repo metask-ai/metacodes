@@ -18,7 +18,7 @@ import shutil
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tty_driver import run  # noqa: E402
 from e2e_helpers import (  # noqa: E402
-    SKIP, SkipTest, RETRIES, fresh_home,
+    SKIP, SkipTest, RETRIES, fresh_home, run_live,
     read_tool_uses, read_tool_results_with_error, tool_called,
 )
 
@@ -38,7 +38,7 @@ def _run_plan_attempt(bin_path, prompt, approve_key, wait_s=16):
         "key:" + approve_key,  # 审批框选择(1=proceed / 2=accept_edits / 3=keep planning)
         "sleep:1.5",
     ]
-    raw = run(bin_path, keys, base_url=None, env={"HOME": home},
+    raw = run_live(bin_path, keys, home,
               permission="plan", per_key_drain=0.04, startup_drain=1.0)
     uses = read_tool_uses(home)
     return raw, home, uses
@@ -129,7 +129,7 @@ def test_e2e_plan_mode_readonly_tool_works(bin_path):
     for _ in range(RETRIES):
         home = fresh_home()
         keys = ["sleep:0.8", "type:" + prompt, "key:enter", "sleep:14"]
-        raw = run(bin_path, keys, base_url=None, env={"HOME": home},
+        raw = run_live(bin_path, keys, home,
                   permission="plan", per_key_drain=0.04, startup_drain=1.0)
         uses = read_tool_uses(home)
         homes.append(home)

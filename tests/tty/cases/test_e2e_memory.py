@@ -20,7 +20,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tty_driver import run  # noqa: E402
 from e2e_helpers import (  # noqa: E402
-    SKIP, SkipTest, RETRIES, fresh_home,
+    SKIP, SkipTest, RETRIES, fresh_home, run_live,
     read_tool_uses, tool_called,
 )
 
@@ -78,8 +78,8 @@ def test_e2e_claudemd_reaches_model(bin_path):
         projs.append(proj)
         keys = ["sleep:0.8", "type:" + prompt, "key:enter", "sleep:14"]
         # cwd=proj → 向上递归收集 proj/CLAUDE.md;HOME 隔离避免用户 ~/.claude/CLAUDE.md 干扰。
-        raw = run(bin_path, keys, base_url=None, env={"HOME": home}, cwd=proj,
-                  per_key_drain=0.04, startup_drain=1.0)
+        raw = run_live(bin_path, keys, home, cwd=proj,
+                       per_key_drain=0.04, startup_drain=1.0)
         last = (raw, home, proj)
         _assert_no_crash(raw, home)
         text = raw.decode("utf-8", "replace")
@@ -190,8 +190,8 @@ def test_e2e_memdir_write_carveout(bin_path):
         homes.append(home)
         keys = ["sleep:0.8", "type:" + prompt, "key:enter", "sleep:16"]
         # default 模式 + 自动应答:写 memdir 应被豁免(无需弹框);若错弹框,'y' 兜底放行不影响断言落盘。
-        raw = run(bin_path, keys, base_url=None, env={"HOME": home},
-                  permission="default", per_key_drain=0.04, startup_drain=1.0)
+        raw = run_live(bin_path, keys, home,
+                       permission="default", per_key_drain=0.04, startup_drain=1.0)
         uses = read_tool_uses(home)
         last = (raw, home, uses)
         _assert_no_crash(raw, home)
@@ -237,8 +237,8 @@ def test_e2e_init_writes_claudemd(bin_path):
         homes.append(home)
         projs.append(proj)
         keys = ["sleep:0.8", "type:/init", "key:enter", "sleep:30"]  # /init 要 explore 多轮
-        raw = run(bin_path, keys, base_url=None, env={"HOME": home}, cwd=proj,
-                  permission="bypassPermissions", per_key_drain=0.04, startup_drain=1.0)
+        raw = run_live(bin_path, keys, home, cwd=proj,
+                       permission="bypassPermissions", per_key_drain=0.04, startup_drain=1.0)
         uses = read_tool_uses(home)
         last = (raw, home, proj, uses)
         _assert_no_crash(raw, home)

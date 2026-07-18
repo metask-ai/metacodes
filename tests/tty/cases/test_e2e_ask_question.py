@@ -20,7 +20,7 @@ import shutil
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tty_driver import run  # noqa: E402
-from e2e_helpers import SKIP, SkipTest, fresh_home  # noqa: E402
+from e2e_helpers import SKIP, SkipTest, fresh_home, run_live  # noqa: E402
 
 WAIT = 42
 
@@ -76,8 +76,8 @@ def test_e2e_ask_single_select(bin_path):
     home = fresh_home()
     keys = ["sleep:1.0", "type:" + prompt, "key:enter", "sleep:%d" % WAIT,
             "key:down", "key:down", "sleep:0.5", "key:enter", "sleep:3"]
-    raw = run(bin_path, keys, base_url=None, env={"HOME": home},
-              permission="bypassPermissions", per_key_drain=0.06, startup_drain=1.2)
+    raw = run_live(bin_path, keys, home,
+                   permission="bypassPermissions", per_key_drain=0.06, startup_drain=1.2)
     _no_crash(raw, home)
     text = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", raw.decode("utf-8", "replace"))
     # 对话框被渲染过(像素元素:❯ + Type something + Chat about this)。漂移(没调工具)→ skip。
@@ -104,8 +104,8 @@ def test_e2e_ask_multi_question_nav(bin_path):
     home = fresh_home()
     keys = ["sleep:1.0", "type:" + prompt, "key:enter", "sleep:%d" % WAIT,
             "key:right", "sleep:0.6"]  # → 切第 2 问
-    raw = run(bin_path, keys, base_url=None, env={"HOME": home},
-              permission="bypassPermissions", per_key_drain=0.06, startup_drain=1.2)
+    raw = run_live(bin_path, keys, home,
+                   permission="bypassPermissions", per_key_drain=0.06, startup_drain=1.2)
     _no_crash(raw, home)
     text = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", raw.decode("utf-8", "replace"))
     if "Submit" not in text or ("☐" not in text and "[ ]" not in text):
@@ -138,8 +138,8 @@ def test_e2e_ask_preview_note_vim(bin_path):
     home = fresh_home()
     keys = ["sleep:1.0", "type:" + prompt, "key:enter", "sleep:%d" % WAIT,
             "type:n", "sleep:0.5", "raw:\\x07", "sleep:1.5"]  # n 进 note 编辑 → ctrl+g 唤起 editor
-    raw = run(bin_path, keys, base_url=None, env={"HOME": home, "EDITOR": ed},
-              permission="bypassPermissions", per_key_drain=0.06, startup_drain=1.2)
+    raw = run_live(bin_path, keys, home, env={"EDITOR": ed},
+                   permission="bypassPermissions", per_key_drain=0.06, startup_drain=1.2)
     _no_crash(raw, home)
     text = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", raw.decode("utf-8", "replace"))
     if "Notes:" not in text:
@@ -162,8 +162,8 @@ def test_e2e_ask_other_input_focus(bin_path):
     # 2 真实选项 → Other 在 idx2(第3项)。默认选 idx0,↓↓ 到 Other。再打字验证内联输入。
     keys = ["sleep:1.0", "type:" + prompt, "key:enter", "sleep:%d" % WAIT,
             "key:down", "key:down", "sleep:0.4", "type:hello", "sleep:0.6"]
-    raw = run(bin_path, keys, base_url=None, env={"HOME": home},
-              permission="bypassPermissions", per_key_drain=0.06, startup_drain=1.2)
+    raw = run_live(bin_path, keys, home,
+                   permission="bypassPermissions", per_key_drain=0.06, startup_drain=1.2)
     _no_crash(raw, home)
     text = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", raw.decode("utf-8", "replace"))
     if "Type something" not in text:
@@ -189,8 +189,8 @@ def test_e2e_ask_chat_about_free_response(bin_path):
     # Chat about this 在 idx3(第4项=最后)。↓↓↓ 到 Chat,enter 提交。
     keys = ["sleep:1.0", "type:" + prompt, "key:enter", "sleep:%d" % WAIT,
             "key:down", "key:down", "key:down", "sleep:0.4", "key:enter", "sleep:3"]
-    raw = run(bin_path, keys, base_url=None, env={"HOME": home},
-              permission="bypassPermissions", per_key_drain=0.06, startup_drain=1.2)
+    raw = run_live(bin_path, keys, home,
+                   permission="bypassPermissions", per_key_drain=0.06, startup_drain=1.2)
     _no_crash(raw, home)
     text = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", raw.decode("utf-8", "replace"))
     if "Chat about this" not in text:
@@ -221,8 +221,8 @@ def test_e2e_ask_max_questions_boundary(bin_path):
               '%s. Call immediately, do not use Bash or Task, do not write files.' % days)
     home = fresh_home()
     keys = ["sleep:1.0", "type:" + prompt, "key:enter", "sleep:%d" % WAIT]
-    raw = run(bin_path, keys, base_url=None, env={"HOME": home},
-              permission="bypassPermissions", per_key_drain=0.06, startup_drain=1.2)
+    raw = run_live(bin_path, keys, home,
+                   permission="bypassPermissions", per_key_drain=0.06, startup_drain=1.2)
     _no_crash(raw, home)
     blob = _all_tool_results(home)
     text = re.sub(r"\x1b\[[0-9;?]*[a-zA-Z]", "", raw.decode("utf-8", "replace"))

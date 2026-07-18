@@ -17,7 +17,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from e2e_helpers import (  # noqa: E402
-    SKIP, RETRIES, SkipTest, fresh_home, run_e2e_tool, read_tool_uses,
+    SKIP, RETRIES, SkipTest, fresh_home, run_e2e_tool, run_live, read_tool_uses,
     tool_called, any_tool_called,
 )
 from tty_driver import run  # noqa: E402
@@ -161,10 +161,10 @@ def test_e2e_bug6_subagent_tool_count_accumulates(bin_path):
     tree_seen = False  # subagent 树是否真出现过(被测路径触发)
     for _ in range(RETRIES):
         home = fresh_home()
-        raw = run(
+        raw = run_live(
             bin_path,
             ["sleep:1.0", "type:" + _BUG6_PROMPT, "key:enter", "sleep:32"],
-            base_url=None, env={"HOME": home}, term_size=(40, 100),
+            home, term_size=(40, 100),
             per_key_drain=0.04, startup_drain=1.2,
         )
         a = TTYAssert(raw, rows=40, cols=100)

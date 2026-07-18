@@ -27,7 +27,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from e2e_helpers import RETRIES, SKIP, SkipTest, fresh_home, read_tool_uses  # noqa: E402
+from e2e_helpers import RETRIES, SKIP, SkipTest, fresh_home, keep_home, read_tool_uses, run_live  # noqa: E402
 from tty_driver import run as _run  # noqa: E402
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # tests/tty
@@ -144,10 +144,9 @@ def test_e2e_dag_closed_loop(bin_path):
         proj = tempfile.mkdtemp(prefix="cc-e2e-dagproj-")
         store, ids = _seed_plan(home, bin_path, proj)
 
-        _run(bin_path,
-             ["sleep:1.2", "type:" + PROMPT, "key:enter", "sleep:150"],
-             base_url=None, env={"HOME": home}, cwd=proj,
-             per_key_drain=0.02, startup_drain=1.5)
+        run_live(bin_path,
+                 ["sleep:1.2", "type:" + PROMPT, "key:enter", "sleep:150"],
+                 home, cwd=proj, per_key_drain=0.02, startup_drain=1.5)
 
         # ── 权威层:店内波前 ──
         fr = _tinykg(store, "task-frontier", ids["root"], "--limit", "10")
@@ -180,6 +179,8 @@ def test_e2e_dag_closed_loop(bin_path):
         # 什么都没动 → 也重试。
 
     # 全部 attempt 后:若任一 attempt 闭合发生但 fan-out 从未出现 → 漂移(路径未触发)。
+    # (漂移 skip 不保留 home——凭证拷贝不留;硬失败保留最后一个供验尸,其余交 atexit janitor。)
     if any("a_closed=True b_closed=True" in d and "task_spawns=0" in d for d in diags):
         raise SkipTest("模型漂移:任务被闭合但未用 Task fan-out(顺序自做)。\n" + "\n".join(diags))
+    keep_home(home)
     raise AssertionError("DAG 闭环 e2e 全部 attempt 失败:\n" + "\n".join(diags))

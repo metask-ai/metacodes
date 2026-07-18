@@ -83,7 +83,7 @@ def _stream_errored(raw):
     return any(m in raw for m in _STREAM_ERR)
 
 
-def replay_run(cdir, key_events, term_size=(40, 100), bin_path="zig-out/bin/metacodes-debug", tries=6, before_each=None, success=None):
+def replay_run(cdir, key_events, term_size=(40, 100), bin_path="zig-out/bin/metacodes-debug", tries=6, before_each=None, success=None, env=None):
     """起 replay_server + run,瞬态失败则重跑(最多 tries 次)。
     before_each: 每次 attempt 前调(重置有状态场景,如 Edit 改文件的测试)。
     success(raw)->bool: 可选成功判据;给定时,未成功(且非最后一次)就重跑(覆盖 stream 错误外的瞬态,
@@ -101,7 +101,7 @@ def replay_run(cdir, key_events, term_size=(40, 100), bin_path="zig-out/bin/meta
             continue
         time.sleep(0.15)  # base_url 已打印(listen 成功);给 serveLoop 线程进 accept 的余量(防首连竞态)
         try:
-            raw = run(bin_path, key_events, term_size=term_size, per_key_drain=0.06, base_url=base_url)
+            raw = run(bin_path, key_events, term_size=term_size, per_key_drain=0.06, base_url=base_url, env=env)
         finally:
             proc.kill()
         last = attempt == tries - 1
@@ -235,7 +235,7 @@ def test_T36_edit_diff_live_inline(bin_path):
 
 
 
-def _run_cassette(steps_files, key_events, term_size=(30, 90)):
+def _run_cassette(steps_files, key_events, term_size=(30, 90), env=None):
     """通用:写 cassette(steps_files=[(name,sse_text)...]),起 replay(带瞬态重试),跑,返回 raw。"""
     if not os.path.isfile(REPLAY_BIN):
         return None
@@ -245,7 +245,7 @@ def _run_cassette(steps_files, key_events, term_size=(30, 90)):
     for i, (_, txt) in enumerate(steps_files, start=1):
         with open(os.path.join(cdir, f"sse-{i:03d}.txt"), "w") as f:
             f.write(txt)
-    return replay_run(cdir, key_events, term_size=term_size)
+    return replay_run(cdir, key_events, term_size=term_size, env=env)
 
 
 
@@ -270,13 +270,21 @@ def _sse_text(txt):
 
 
 def test_T37_taskcreate_shows_tasktab(bin_path):
-    """task 工具(TaskCreate+TaskUpdate in_progress)→ 输入框上方出现 ◼ activeForm 清单行(B3 多行面板)。"""
+    """task 工具(TaskCreate+TaskUpdate in_progress)→ 输入框上方出现 ◼ activeForm 清单行(B3 多行面板)。
+
+    kg 显式关闭(METACODES_KG_BIN 指向不存在路径 → degraded,绝不 throw):kg 可用时
+    TaskCreate 会把任务挂图并返回 kg-<node> id(node 号随 store 状态浮动),cassette 硬编码
+    的 taskId "1" 只在**本地 fallback 路径**确定成立。本用例测的是 TaskTab 渲染,非 kg 路由
+    (kg 路由由 test_e2e_dag_loop 守)。历史上它能绿是因为开发机真实 HOME 的 legacy kg store
+    恰好一直处于 degraded——HOME 隔离修好后(2026-07-18)假设崩塌,故显式钉死。
+    """
     raw = _run_cassette(
         [("a", _sse_tool("tu1", "TaskCreate", {"subject": "build the widget", "description": "d", "activeForm": "Building the widget"})),
          ("b", _sse_tool("tu2", "TaskUpdate", {"taskId": "1", "status": "in_progress"})),
          ("c", _sse_text("started"))],
         ["sleep:0.8", "type:make a task", "key:enter", "sleep:2.5"],
         term_size=(40, 100),
+        env={"METACODES_KG_BIN": "/nonexistent/kg-disabled-for-test"},
     )
     if raw is None:
         return

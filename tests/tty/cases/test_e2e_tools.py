@@ -12,7 +12,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from e2e_helpers import SKIP, assert_tool_e2e, read_tool_uses, tool_called  # noqa: E402
+from e2e_helpers import SKIP, assert_tool_e2e, read_tool_uses, tool_called, run_live, keep_home as _keep_home  # noqa: E402
 
 
 def test_e2e_write(bin_path):
@@ -159,12 +159,12 @@ def test_e2e_task_update_numeric_id(bin_path):
         home = fresh_home()
         homes.append(home)
         # 一轮内:建 3 任务的列表 → 提交 → 让模型"完成所有任务"(自然驱动 TaskUpdate)。
-        _run(bin_path,
-             ["sleep:0.8",
-              "type:用 TaskCreate 创建三个任务:整理核心架构、整理账号调度、整理协议转换,每个都给 description。",
-              "key:enter", "sleep:30",
-              "type:好,把所有任务都标记为 completed", "key:enter", "sleep:28"],
-             base_url=None, env={"HOME": home}, per_key_drain=0.04, startup_drain=1.2)
+        run_live(bin_path,
+                 ["sleep:0.8",
+                  "type:用 TaskCreate 创建三个任务:整理核心架构、整理账号调度、整理协议转换,每个都给 description。",
+                  "key:enter", "sleep:30",
+                  "type:好,把所有任务都标记为 completed", "key:enter", "sleep:28"],
+                 home, per_key_drain=0.04, startup_drain=1.2)
 
         uses = read_tool_uses(home)
         # 必须真有 TaskCreate + TaskUpdate 被调用(否则模型漂移,重试)。
@@ -194,6 +194,8 @@ def test_e2e_task_update_numeric_id(bin_path):
         last_diag = "TaskUpdate 被调但无 {\"ok\":true} 也无 MissingTaskId(结果:%r)" % (
             [c[:80] for (c, _e) in results][-3:])
 
+    if homes:
+        _keep_home(homes[-1])  # 诊断消息引用了该路径,从 atexit janitor 摘牌
     for h in homes[:-1]:
         _shutil.rmtree(h, ignore_errors=True)
     if last_diag and "MissingTaskId" in last_diag:
@@ -226,9 +228,9 @@ def test_e2e_task_subagent(bin_path):
     for _ in range(RETRIES):
         home = fresh_home()
         homes.append(home)
-        _run(bin_path,
-             ["sleep:0.8", "type:" + prompt, "key:enter", "sleep:32"],
-             base_url=None, env={"HOME": home}, per_key_drain=0.04, startup_drain=1.2)
+        run_live(bin_path,
+                 ["sleep:0.8", "type:" + prompt, "key:enter", "sleep:32"],
+                 home, per_key_drain=0.04, startup_drain=1.2)
         done = find_subagent_done(home)
         if done is not None:
             last_done = done
@@ -255,6 +257,8 @@ def test_e2e_task_subagent(bin_path):
     diag = ("subagent 出口断言未通过(%d attempts)。最后一次 done=%r\n"
             "  期望: stop_reason!=tool_loop, turns>=2, final_text 非空且含字母数字且无 ANSI\n"
             "  HOME(保留): %s") % (RETRIES, last_done, homes[-1] if homes else "?")
+    if homes:
+        _keep_home(homes[-1])
     for h in homes[:-1]:
         _shutil.rmtree(h, ignore_errors=True)
     raise AssertionError(diag)
@@ -286,10 +290,10 @@ def test_e2e_agent_tree_onscreen(bin_path):
     for _ in range(RETRIES):
         home = fresh_home()
         homes.append(home)
-        raw = _run(bin_path,
-                   ["sleep:0.8", "type:" + prompt, "key:enter", "sleep:32"],
-                   base_url=None, env={"HOME": home}, term_size=(40, 100),
-                   per_key_drain=0.04, startup_drain=1.2)
+        raw = run_live(bin_path,
+                       ["sleep:0.8", "type:" + prompt, "key:enter", "sleep:32"],
+                       home, term_size=(40, 100),
+                       per_key_drain=0.04, startup_drain=1.2)
         a = TTYAssert(raw, rows=40, cols=100)
         hit = False
         for sc in a.frame_screens:
@@ -304,6 +308,8 @@ def test_e2e_agent_tree_onscreen(bin_path):
             return
         last_diag = a.frame_screens[-1].render_ascii() if a.frame_screens else "(无帧)"
 
+    if homes:
+        _keep_home(homes[-1])
     for h in homes[:-1]:
         _shutil.rmtree(h, ignore_errors=True)
     raise AssertionError(

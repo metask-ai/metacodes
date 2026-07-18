@@ -79,7 +79,8 @@ def test_shell_submit_executes(bin_path):
     if SKIP:
         return
     import re
+    # !cmd 纯本地执行、零模型调用 → 走默认死端口 base_url(离线确定性,不依赖凭证)。
     raw = run(bin_path, ["sleep:0.8", "type:!echo SHELLMODEMARK", "key:enter", "sleep:1.5"],
-              per_key_drain=0.06, base_url=None)
+              per_key_drain=0.06)
     prose = re.sub(rb"\x1b\[[0-9;?>]*[A-Za-z]", b"", raw).decode("utf-8", "replace")
     assert "SHELLMODEMARK" in prose, "!cmd 未执行(输出缺 MARKER)"

@@ -124,7 +124,7 @@ def main():
     skip_note = f" / {len(skipped)} skipped" if skipped else ""
     _emit(f"\n=== 结果:{passed} passed / {len(failed)} failed{skip_note}  ({suite_dt:.0f}s) ===")
     if skipped:
-        _emit("跳过(模型漂移):" + ", ".join(skipped))
+        _emit("跳过(漂移/环境):" + ", ".join(skipped))  # 漂移=模型未触发被测路径;环境=凭证失效/依赖缺失
     if failed:
         _emit("失败:" + ", ".join(failed))
         return 1
