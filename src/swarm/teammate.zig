@@ -941,6 +941,11 @@ fn teammateThreadMain(input: *TeammateInput) void {
 
     while (true) {
         e.setStatus(.working);
+        // 首轮此写与 spawn 的 addMember(is_active=true)重复,曾试图"只在值变化时写"去重——
+        // 撤销(2026-07-18 实测):这次写恰好是 turn 前的天然停顿,满编 spawn 时把线程拖到
+        // deinit 的 abort 之后,agent_loop turn 开始的 abort 检查得以生效;去重后线程立即
+        // 进入**不可中断的 HTTP receiveHead**(慢 mock 下 deinit join 从 ~60s 恶化到 240s)。
+        // 真正的修法是 abort 感知的 HTTP 等待(登记存量债);在那之前保留此写(也对齐 cc)。
         setMemberActiveBestEffort(a, e.config_path, e.name, true);
 
         const result = agent_loop.run(

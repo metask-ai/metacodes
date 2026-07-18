@@ -349,7 +349,10 @@ test "L2 teammate MAX_TEAMMATES 上限强制执行 + working 期 is_active=true"
     const a = std.testing.allocator;
 
     const bodies = [_][]const u8{TURN1_SSE};
-    var srv = try harness.MockServer.startCassette(&bodies, 5000); // 慢:保证全体 working
+    // 慢:保证 t0 在断言窗口(≤3s poll)内保持 working。1500ms × 6 chunk = 9s/连接。
+    // 勿调大:server 串行 accept,而阻塞在 receiveHead 的线程感知不到 abort(存量债,
+    // 见 teammate.zig 线程循环注释)——deinit join 的最坏耗时 = 连接数 × 单连接流时长。
+    var srv = try harness.MockServer.startCassette(&bodies, 1500);
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
@@ -409,7 +412,7 @@ test "L2 teammate 重名拒绝 + 上限存在" {
     const a = std.testing.allocator;
 
     const bodies = [_][]const u8{TURN1_SSE};
-    var srv = try harness.MockServer.startCassette(&bodies, 3000); // 慢:保证首个 teammate 保持 working
+    var srv = try harness.MockServer.startCassette(&bodies, 1500); // 慢:保证首个 teammate 保持 working(9s/连接,勿调大——同 MAX_TEAMMATES 注释)
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);
