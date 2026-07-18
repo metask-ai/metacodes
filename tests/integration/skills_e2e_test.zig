@@ -4,6 +4,17 @@ const std = @import("std");
 const cc = @import("cc");
 const pfs = @import("platform").fs; // 可移植文件 IO(std.c.open 的 O 在 Windows 是 void)
 
+fn dispatchOk(ctx: *const cc.tools.ToolContext, name: []const u8, args: []const u8) ![]u8 {
+    var outcome = try cc.tools.dispatch(ctx, name, args);
+    return switch (outcome) {
+        .ok => |bytes| bytes,
+        else => {
+            outcome.deinit(ctx.allocator);
+            return error.UnexpectedDispatchOutcome;
+        },
+    };
+}
+
 fn makeSkill(parent: []const u8, name: []const u8, md: []const u8) !void {
     const a = std.testing.allocator;
     const parent_z = try a.dupeZ(u8, parent);
@@ -93,7 +104,7 @@ test "Skills E2E: tools.dispatch routes Skill tool through dyn_registry" {
     // 这才是真正的生产路径：模型通过 tools.dispatch 调用,而不是绕过 dispatch 直接 find
     var ctx = cc.tools.ToolContext.simple(a);
     ctx.dyn_registry = &reg;
-    const out = try cc.tools.dispatch(&ctx, "Skill", "{\"name\":\"demo\"}");
+    const out = try dispatchOk(&ctx, "Skill", "{\"name\":\"demo\"}");
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "# Skill: demo") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Demo body") != null);
@@ -153,7 +164,7 @@ test "Skills E2E: bash injection runs at activation time and emits stdout" {
 
     var ctx = cc.tools.ToolContext.simple(a);
     ctx.dyn_registry = &reg;
-    const out = try cc.tools.dispatch(&ctx, "Skill", "{\"name\":\"echoer\"}");
+    const out = try dispatchOk(&ctx, "Skill", "{\"name\":\"echoer\"}");
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "Output: hello-from-bash") != null);
 }
@@ -182,7 +193,7 @@ test "Skills E2E: disable-model-invocation blocks auto, allows explicit" {
     // 模型路径(explicit_invocation=false 默认):应被拒
     var ctx_auto = cc.tools.ToolContext.simple(a);
     ctx_auto.dyn_registry = &reg;
-    const out_auto = try cc.tools.dispatch(&ctx_auto, "Skill", "{\"name\":\"deploy\"}");
+    const out_auto = try dispatchOk(&ctx_auto, "Skill", "{\"name\":\"deploy\"}");
     defer a.free(out_auto);
     try std.testing.expect(std.mem.indexOf(u8, out_auto, "SkillRequiresExplicitInvocation") != null);
     try std.testing.expect(std.mem.indexOf(u8, out_auto, "Deploy steps") == null);
@@ -191,7 +202,7 @@ test "Skills E2E: disable-model-invocation blocks auto, allows explicit" {
     var ctx_explicit = cc.tools.ToolContext.simple(a);
     ctx_explicit.dyn_registry = &reg;
     ctx_explicit.explicit_invocation = true;
-    const out_explicit = try cc.tools.dispatch(&ctx_explicit, "Skill", "{\"name\":\"deploy\"}");
+    const out_explicit = try dispatchOk(&ctx_explicit, "Skill", "{\"name\":\"deploy\"}");
     defer a.free(out_explicit);
     try std.testing.expect(std.mem.indexOf(u8, out_explicit, "Deploy steps") != null);
 }
@@ -255,7 +266,7 @@ test "Skills E2E: $ARGUMENTS rendering through dispatch" {
 
     var ctx = cc.tools.ToolContext.simple(a);
     ctx.dyn_registry = &reg;
-    const out = try cc.tools.dispatch(&ctx, "Skill", "{\"name\":\"greet\",\"args\":[\"world\"]}");
+    const out = try dispatchOk(&ctx, "Skill", "{\"name\":\"greet\",\"args\":[\"world\"]}");
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "Hello world!") != null);
 }
@@ -283,7 +294,7 @@ test "Skills E2E: ${CLAUDE_SKILL_DIR} resolves to skill source path" {
 
     var ctx = cc.tools.ToolContext.simple(a);
     ctx.dyn_registry = &reg;
-    const out = try cc.tools.dispatch(&ctx, "Skill", "{\"name\":\"pathy\"}");
+    const out = try dispatchOk(&ctx, "Skill", "{\"name\":\"pathy\"}");
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "My dir: /tmp/cc-zig-skills-dir/pathy/scripts") != null);
 }

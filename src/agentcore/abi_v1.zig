@@ -13,28 +13,40 @@ const AbiHostTool = struct {
     execute_fn: wire.HostExecuteFnV1,
     release_fn: wire.HostReleaseFnV1,
 
-    fn execute(raw: *anyopaque, session_id: []const u8, args: []const u8) core.agent_session.HostToolError!core.agent_session.HostToolResult {
+    /// T1 机械适配:typed outcome 通道就位,可观察行为与旧版一致(FAILED/REJECTED/
+    /// 形状违规均折 null-detail 业务失败,不产生 fatal)。T3 接管语义升级:
+    /// MC_HOST_FATAL/未知状态码/非法 descriptor → .fatal,合法详情经受限编码消费。
+    fn execute(raw: *anyopaque, identity: core.agent_session.HostRunIdentity, args: []const u8) error{OutOfMemory}!core.agent_session.HostToolOutcome {
         const self: *AbiHostTool = @ptrCast(@alignCast(raw));
         var out = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
-        const status = self.execute_fn(self.ctx, view(session_id), view(args), &out);
-        errdefer if (hasReleaseToken(out)) self.release_fn(self.ctx, &out);
+        const status = self.execute_fn(self.ctx, view(identity.identity.session_id.asSlice()), view(args), &out);
         if (status != wire.HOST_OK) {
+            if (hasReleaseToken(out)) self.release_fn(self.ctx, &out);
             return switch (status) {
-                wire.HOST_REJECTED => error.HostToolRejected,
-                wire.HOST_FAILED => error.HostToolFailed,
-                else => error.HostToolFailed,
+                wire.HOST_REJECTED => .{ .rejected = null },
+                else => .{ .failed = null },
             };
         }
         if (!canonicalOwned(out)) {
             // Preserve the exact Host descriptor on failure. Converting a
             // non-null zero-length allocation to a slice would lose its
             // release pointer permanently.
-            return error.HostToolFailed;
+            if (hasReleaseToken(out)) self.release_fn(self.ctx, &out);
+            return .{ .failed = null };
         }
-        if (out.len > wire.MAX_HOST_TOOL_RESULT_BYTES_V1) return error.HostToolFailed;
-        const bytes = ownedSlice(out) catch return error.HostToolFailed;
-        if (!std.unicode.utf8ValidateSlice(bytes)) return error.HostToolFailed;
-        return .{ .bytes = bytes, .release_ctx = self, .releaseFn = release };
+        if (out.len > wire.MAX_HOST_TOOL_RESULT_BYTES_V1) {
+            if (hasReleaseToken(out)) self.release_fn(self.ctx, &out);
+            return .{ .failed = null };
+        }
+        const bytes = ownedSlice(out) catch {
+            if (hasReleaseToken(out)) self.release_fn(self.ctx, &out);
+            return .{ .failed = null };
+        };
+        if (!std.unicode.utf8ValidateSlice(bytes)) {
+            if (hasReleaseToken(out)) self.release_fn(self.ctx, &out);
+            return .{ .failed = null };
+        }
+        return .{ .ok = .{ .bytes = bytes, .release_ctx = self, .releaseFn = release } };
     }
 
     fn release(raw: *anyopaque, bytes: []const u8) void {
@@ -484,6 +496,8 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
         .workspace = .{ .root = root, .home = home, .shell = shell },
         .allowed_tools = allowed,
         .ui_requester = if (callbacks.on_ui_request != null) .{ .ctx = self, .requestFn = AbiSession.requestUi } else null,
+        // Host tool 身份锚点 = 本 AbiSession;仅 AbiHostTool 适配层可解释此指针。
+        .host_identity_ctx = self,
     }) catch |err| {
         allocator.destroy(self);
         return failError(sessionCreateErrorStatus(err), err, out_error);
@@ -604,6 +618,13 @@ test "UI response parser rejects an answer count mismatch" {
     try std.testing.expectError(error.InvalidUiResponse, protocol_v1.decodeUiResponse(std.testing.allocator, &req, "{\"answers\":[]}", &out));
 }
 
+fn testHostIdent(anchor: *anyopaque) core.agent_session.HostRunIdentity {
+    return .{
+        .identity = .{ .session_id = core.session_id.SessionId.single, .run_id = 1 },
+        .host_session_ctx = anchor,
+    };
+}
+
 test "Host zero-length result must use a null pointer and preserves release descriptor on rejection" {
     const Probe = struct {
         var byte: u8 = 0;
@@ -623,7 +644,8 @@ test "Host zero-length result must use a null pointer and preserves release desc
     Probe.releases = 0;
     Probe.released_ptr = null;
     var host = AbiHostTool{ .ctx = null, .execute_fn = Probe.execute, .release_fn = Probe.release };
-    try std.testing.expectError(error.HostToolFailed, AbiHostTool.execute(&host, "session", "{}"));
+    const outcome = try AbiHostTool.execute(&host, testHostIdent(@ptrCast(&host)), "{}");
+    try std.testing.expect(outcome == .failed and outcome.failed == null);
     try std.testing.expectEqual(@as(usize, 1), Probe.releases);
     try std.testing.expect(Probe.released_ptr == @as(?[*]u8, @ptrCast(&Probe.byte)));
 }
@@ -646,7 +668,8 @@ test "canonical empty Host tool results never call release" {
 
     Probe.status = wire.HOST_OK;
     Probe.releases = 0;
-    const result = try AbiHostTool.execute(&host, "session", "{}");
+    const outcome = try AbiHostTool.execute(&host, testHostIdent(@ptrCast(&host)), "{}");
+    const result = outcome.ok;
     try std.testing.expectEqual(@as(usize, 0), result.bytes.len);
     result.release();
     try std.testing.expectEqual(@as(usize, 0), Probe.releases);
@@ -654,10 +677,11 @@ test "canonical empty Host tool results never call release" {
     inline for (.{ wire.HOST_FAILED, wire.HOST_REJECTED, @as(u32, 0xffff_ffff) }) |status| {
         Probe.status = status;
         Probe.releases = 0;
+        const o = try AbiHostTool.execute(&host, testHostIdent(@ptrCast(&host)), "{}");
         if (status == wire.HOST_REJECTED) {
-            try std.testing.expectError(error.HostToolRejected, AbiHostTool.execute(&host, "session", "{}"));
+            try std.testing.expect(o == .rejected and o.rejected == null);
         } else {
-            try std.testing.expectError(error.HostToolFailed, AbiHostTool.execute(&host, "session", "{}"));
+            try std.testing.expect(o == .failed and o.failed == null);
         }
         try std.testing.expectEqual(@as(usize, 0), Probe.releases);
     }
@@ -683,13 +707,14 @@ test "non-success Host tool buffers are ignored and released exactly once" {
             released_len = value.len;
         }
     };
+    const OutcomeTag = std.meta.Tag(core.agent_session.HostToolOutcome);
     const cases = [_]struct {
         status: u32,
-        expected: anyerror,
+        expected: OutcomeTag,
     }{
-        .{ .status = wire.HOST_FAILED, .expected = error.HostToolFailed },
-        .{ .status = wire.HOST_REJECTED, .expected = error.HostToolRejected },
-        .{ .status = 0xffff_ffff, .expected = error.HostToolFailed },
+        .{ .status = wire.HOST_FAILED, .expected = .failed },
+        .{ .status = wire.HOST_REJECTED, .expected = .rejected },
+        .{ .status = 0xffff_ffff, .expected = .failed },
     };
     var host = AbiHostTool{ .ctx = null, .execute_fn = Probe.execute, .release_fn = Probe.release };
     for (cases) |case| {
@@ -697,7 +722,8 @@ test "non-success Host tool buffers are ignored and released exactly once" {
         Probe.releases = 0;
         Probe.released_ptr = null;
         Probe.released_len = 0;
-        try std.testing.expectError(case.expected, AbiHostTool.execute(&host, "session", "{}"));
+        const o = try AbiHostTool.execute(&host, testHostIdent(@ptrCast(&host)), "{}");
+        try std.testing.expectEqual(case.expected, std.meta.activeTag(o));
         try std.testing.expectEqual(@as(usize, 1), Probe.releases);
         try std.testing.expect(Probe.released_ptr == @as(?[*]u8, @ptrCast(&Probe.bytes)));
         try std.testing.expectEqual(@as(u64, Probe.bytes.len), Probe.released_len);
@@ -817,7 +843,8 @@ test "oversized Host tool results are released exactly once" {
     Probe.releases = 0;
     Probe.released_len = 0;
     var host = AbiHostTool{ .ctx = null, .execute_fn = Probe.execute, .release_fn = Probe.release };
-    try std.testing.expectError(error.HostToolFailed, AbiHostTool.execute(&host, "session", "{}"));
+    const o = try AbiHostTool.execute(&host, testHostIdent(@ptrCast(&host)), "{}");
+    try std.testing.expect(o == .failed and o.failed == null);
     try std.testing.expectEqual(@as(usize, 1), Probe.releases);
     try std.testing.expectEqual(wire.MAX_HOST_TOOL_RESULT_BYTES_V1 + 1, Probe.released_len);
 }
@@ -838,7 +865,8 @@ test "invalid UTF-8 Host tool results are released exactly once" {
     };
     Probe.releases = 0;
     var host = AbiHostTool{ .ctx = null, .execute_fn = Probe.execute, .release_fn = Probe.release };
-    try std.testing.expectError(error.HostToolFailed, AbiHostTool.execute(&host, "session", "{}"));
+    const o = try AbiHostTool.execute(&host, testHostIdent(@ptrCast(&host)), "{}");
+    try std.testing.expect(o == .failed and o.failed == null);
     try std.testing.expectEqual(@as(usize, 1), Probe.releases);
 }
 

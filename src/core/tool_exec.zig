@@ -38,6 +38,25 @@ pub const Slot = struct {
     pending_payload: ?[]u8 = null,
     /// P0.4:该 slot 的结果已由流式预取(stream_prefetch)填好 → executeSlots 跳过,不重复执行。
     prefetched: bool = false,
+
+    /// 释放全部 slot-owned payload(content/pending_kind/pending_payload)并置 null。
+    /// agent_loop 用单个 defer 遍历调用,覆盖**所有**退出路径(正常/挂起/fatal/错误);
+    /// 已转移 ownership 的字段(takeContent 置 null)天然跳过。
+    pub fn deinit(self: *Slot, allocator: std.mem.Allocator) void {
+        if (self.content) |c| allocator.free(c);
+        self.content = null;
+        if (self.pending_kind) |k| allocator.free(k);
+        self.pending_kind = null;
+        if (self.pending_payload) |p| allocator.free(p);
+        self.pending_payload = null;
+    }
+
+    /// 转移 content ownership 给调用方并置 null——转移即置空,杜绝与 deinit 双释放。
+    pub fn takeContent(self: *Slot) ?[]u8 {
+        const c = self.content;
+        self.content = null;
+        return c;
+    }
 };
 
 /// 一个并发 job 的输入(safe 批用)。
@@ -47,6 +66,8 @@ const Job = struct {
     parent_allocator: std.mem.Allocator,
     rid: log.RequestId,
     done: bool = false,
+    /// Host 工具 fatal:runJob 置位,executeSlots join 后汇聚为 error.HostToolFatal。
+    fatal: bool = false,
 };
 
 /// 单个工具执行的结果(所有 owned 字段挂 parent_allocator,逃逸内部 arena)。
@@ -55,6 +76,9 @@ pub const OneResult = union(enum) {
     done: struct { content: ?[]u8, is_error: bool, elapsed_ms: u64 },
     /// L3 挂起:工具发起 custom UI(error.UiPending)。kind/payload owned by parent_allocator。
     pending: struct { kind: ?[]u8, payload: ?[]u8, elapsed_ms: u64 },
+    /// Host 工具 fatal:类型化控制信号,无 payload——不组装 tool_result,逐层显式传递
+    /// 至 agent loop 映射为 error.HostToolFatal(→ poisonRun)。
+    host_fatal,
 };
 
 /// **单一工具执行入口**——executeSlots(串行/并发批)与 stream_prefetch(边流边执行)共用,
@@ -114,9 +138,30 @@ pub fn executeOne(
         log.warnId("agent", rid, "tool.exec FAILED(par) name={s} err={s} duration_ms={d} input={s}", .{ name, @errorName(err), elapsed, input[0..@min(input.len, 200)] });
         return .{ .done = .{ .content = ej, .is_error = true, .elapsed_ms = elapsed } };
     };
+    // outcome slice 挂 job_ctx.allocator(= 本函数 arena) → 随 arena 回收,无单独释放点。
+    switch (r) {
+        .host_fatal => {
+            log.warnId("agent", rid, "tool.exec HOST-FATAL name={s} id={s}", .{ name, id });
+            return .host_fatal;
+        },
+        .host_failed, .host_rejected => |maybe_detail| {
+            const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
+            const code: []const u8 = if (r == .host_failed) "HostToolFailed" else "HostToolRejected";
+            const tool_error = @import("tool_error.zig");
+            // 详情非空 → 逐字作为模型可见 detail(A2);空 → 保持既有通用文案。
+            const ej = if (maybe_detail) |d| blk: {
+                if (d.len > 0) break :blk tool_error.errorToJson(code, "{s}", .{d}, parent_allocator) catch null;
+                break :blk tool_error.errorToJson(code, "{s} failed with {s}", .{ name, code }, parent_allocator) catch null;
+            } else tool_error.errorToJson(code, "{s} failed with {s}", .{ name, code }, parent_allocator) catch null;
+            log.warnId("agent", rid, "tool.exec HOST-{s}(par) name={s} duration_ms={d}", .{ code, name, elapsed });
+            return .{ .done = .{ .content = ej, .is_error = true, .elapsed_ms = elapsed } };
+        },
+        .ok => {},
+    }
+    const ok_bytes = r.ok;
     // dispatch 结果在 arena 里 → dupe 到父 allocator 逃逸;大结果落盘(超阈值 → preview+path)。
     var content: ?[]u8 = null;
-    if (parent_allocator.dupe(u8, r) catch null) |o| {
+    if (parent_allocator.dupe(u8, ok_bytes) catch null) |o| {
         const storage = @import("../tools/tool_result_storage.zig");
         if (storage.maybePersist(parent_allocator, name, o, base_ctx.home_dir) catch null) |preview| {
             parent_allocator.free(o);
@@ -126,7 +171,7 @@ pub fn executeOne(
         }
     }
     const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
-    log.infoId("agent", rid, "tool.exec done(par) name={s} output_bytes={d} duration_ms={d}", .{ name, r.len, elapsed });
+    log.infoId("agent", rid, "tool.exec done(par) name={s} output_bytes={d} duration_ms={d}", .{ name, ok_bytes.len, elapsed });
     return .{ .done = .{ .content = content, .is_error = false, .elapsed_ms = elapsed } };
 }
 
@@ -144,6 +189,8 @@ fn runJob(job: *Job) void {
             s.is_error = d.is_error;
             s.elapsed_ms = d.elapsed_ms;
         },
+        // fatal 不组装 tool_result:slot 不填 content,信号经 Job.fatal 上传。
+        .host_fatal => job.fatal = true,
     }
     job.done = true;
 }
@@ -154,6 +201,12 @@ fn runJob(job: *Job) void {
 /// provider(独立 client)规避。故仅当有 agent_jobs(能造独立 client)时才允许 Task 并发,否则保守串行
 /// (headless 无 TUI,串行无碍)。对齐 cc:多个 Task 在一轮内并行跑(独立计时器)。
 fn slotSafe(ctx: *const ToolContext, s: Slot) bool {
+    // Host 工具:并发能力由 dispatcher 的显式 executor metadata 判定,不按名字猜
+    // ("叫 Read 就碰巧并发"是事故不是设计)。header 契约要求 Host callback 承受
+    // 同 Session 并发,Host owns ctx locking(tool_catalog 注释),故 host_sync 一律 safe。
+    if (ctx.tool_dispatcher) |d| {
+        if (d.isHostSync(s.name)) return true;
+    }
     if ((std.mem.eql(u8, s.name, "Task") or std.mem.eql(u8, s.name, "Agent")) and ctx.agent_jobs != null) {
         // run_in_background 的 Task 立即返回不阻塞,本就不进并发批语义;但即便并发也安全
         // (它只注册后台 job 即返回)。统一按 safe 处理。
@@ -164,12 +217,15 @@ fn slotSafe(ctx: *const ToolContext, s: Slot) bool {
 
 /// 执行 slots 中所有 decision==.run 的 tool(分批并发);denied 的不动。
 /// 结果写回 slot.content/is_error。base_ctx 是构造好的 ToolContext(allocator=父)。
+/// Host 工具 fatal → error.HostToolFatal:fatal 后不再启动后续 slot/批;已启动的并发
+/// worker 全部 join 后才返回;slot-owned payload 的销毁由调用方的 Slot.deinit defer
+/// 承担(覆盖所有退出路径);不组装 tool_result。
 pub fn executeSlots(
     slots: []Slot,
     base_ctx: *const ToolContext,
     parent_allocator: std.mem.Allocator,
     rid: log.RequestId,
-) void {
+) error{HostToolFatal}!void {
     var i: usize = 0;
     while (i < slots.len) {
         // denied(已填错误)或 prefetched(结果已由流式预取填好)→ 跳过,不执行。
@@ -184,13 +240,14 @@ pub fn executeSlots(
         while (j < slots.len and slots[j].decision == .run and !slots[j].prefetched and slotSafe(base_ctx, slots[j]) == safe) : (j += 1) {}
         // slots[i..j] 是一批(同安全性)。
         if (safe and (j - i) > 1) {
-            runConcurrentBatch(slots[i..j], base_ctx, parent_allocator, rid);
+            try runConcurrentBatch(slots[i..j], base_ctx, parent_allocator, rid);
         } else {
             // 单个 或 unsafe → 串行(复用并发 job 逻辑跑单个,保持错误处理一致)。
             for (slots[i..j]) |*s| {
                 if (s.decision != .run) continue;
                 var job = Job{ .slot = s, .ctx = base_ctx, .parent_allocator = parent_allocator, .rid = rid };
                 runJob(&job);
+                if (job.fatal) return error.HostToolFatal;
             }
         }
         i = j;
@@ -255,7 +312,7 @@ test "executeSlots 跳过 prefetched slot(不重复执行,P0.4 无双执行铁�
     }};
     defer if (slots[0].content) |c| a.free(c);
     var ctx = tools_mod.ToolContext{ .allocator = a };
-    executeSlots(&slots, &ctx, a, .{ .bytes = [_]u8{'0'} ** 12 });
+    try executeSlots(&slots, &ctx, a, .{ .bytes = [_]u8{'0'} ** 12 });
     // prefetched → 未执行 → content 仍是预填值(未被 UnknownTool 错误覆写)。
     try std.testing.expect(slots[0].content != null);
     try std.testing.expectEqualStrings("PREFETCHED_CONTENT", slots[0].content.?);
@@ -272,7 +329,7 @@ test "executeOne:成功路径返回 done+content(与 executeSlots 同一入口)"
             try std.testing.expect(d.content != null);
             if (d.content) |c| a.free(c);
         },
-        .pending => try std.testing.expect(false),
+        .pending, .host_fatal => try std.testing.expect(false),
     }
 }
 
@@ -291,17 +348,37 @@ test "executeOne:UnknownTool → 富错误引导(prefetch/executeSlots 共享此
                 try std.testing.expect(std.mem.indexOf(u8, c, "Available tools") != null);
             }
         },
-        .pending => try std.testing.expect(false),
+        .pending, .host_fatal => try std.testing.expect(false),
     }
 }
 
 /// 一批 safe slot 并发执行(每个独立线程,cap MAX_TOOL_CONCURRENCY)。
-fn runConcurrentBatch(batch: []Slot, base_ctx: *const ToolContext, parent_allocator: std.mem.Allocator, rid: log.RequestId) void {
+/// fatal 语义:当前窗口的 worker **全部 join** 后才检查/返回;fatal 后不启动下一窗口。
+fn runConcurrentBatch(batch: []Slot, base_ctx: *const ToolContext, parent_allocator: std.mem.Allocator, rid: log.RequestId) error{HostToolFatal}!void {
+    return runConcurrentBatchWithSpawner(batch, base_ctx, parent_allocator, rid, spawnJob);
+}
+
+const SpawnJobFn = *const fn (job: *Job) std.Thread.SpawnError!std.Thread;
+
+fn spawnJob(job: *Job) std.Thread.SpawnError!std.Thread {
+    return std.Thread.spawn(.{}, runJob, .{job});
+}
+
+/// Spawner injection exists solely to make the resource-exhaustion fallback
+/// deterministic in tests. Production always passes `spawnJob`.
+fn runConcurrentBatchWithSpawner(
+    batch: []Slot,
+    base_ctx: *const ToolContext,
+    parent_allocator: std.mem.Allocator,
+    rid: log.RequestId,
+    spawn_job: SpawnJobFn,
+) error{HostToolFatal}!void {
     var jobs = parent_allocator.alloc(Job, batch.len) catch {
         // 分配失败 → 退化串行
         for (batch) |*s| {
             var job = Job{ .slot = s, .ctx = base_ctx, .parent_allocator = parent_allocator, .rid = rid };
             runJob(&job);
+            if (job.fatal) return error.HostToolFatal;
         }
         return;
     };
@@ -309,7 +386,10 @@ fn runConcurrentBatch(batch: []Slot, base_ctx: *const ToolContext, parent_alloca
     for (batch, 0..) |*s, k| jobs[k] = .{ .slot = s, .ctx = base_ctx, .parent_allocator = parent_allocator, .rid = rid };
 
     var threads = parent_allocator.alloc(?std.Thread, batch.len) catch {
-        for (jobs) |*job| runJob(job);
+        for (jobs) |*job| {
+            runJob(job);
+            if (job.fatal) return error.HostToolFatal;
+        }
         return;
     };
     defer parent_allocator.free(threads);
@@ -320,16 +400,140 @@ fn runConcurrentBatch(batch: []Slot, base_ctx: *const ToolContext, parent_alloca
     while (started < jobs.len) {
         const window_end = @min(started + MAX_TOOL_CONCURRENCY, jobs.len);
         var k = started;
-        while (k < window_end) : (k += 1) {
-            threads[k] = std.Thread.spawn(.{}, runJob, .{&jobs[k]}) catch blk: {
-                runJob(&jobs[k]); // spawn 失败 → 当场串行跑
-                break :blk null;
-            };
+        while (k < window_end) {
+            threads[k] = spawn_job(&jobs[k]) catch null;
+            if (threads[k] == null) {
+                // spawn 失败 → 当场串行跑。若它观察到 fatal，立刻停止
+                // 启动窗口内剩余 job；之前已启动的线程仍在下方全部 join。
+                runJob(&jobs[k]);
+                k += 1;
+                if (jobs[k - 1].fatal) break;
+            } else {
+                k += 1;
+            }
         }
+        const launched_end = k;
         k = started;
-        while (k < window_end) : (k += 1) {
-            if (threads[k]) |t| t.join();
+        while (k < launched_end) : (k += 1) {
+            if (threads[k]) |thread| thread.join();
+        }
+        // join 完整个窗口后才检查 fatal——不撕裂在飞 worker;fatal 则不再开下一窗口。
+        for (jobs[started..launched_end]) |*job| {
+            if (job.fatal) return error.HostToolFatal;
         }
         started = window_end;
     }
+}
+
+// —— T1 矩阵测试:fatal 清理(24)与 host 并发 metadata(25) ——
+
+/// 测试用 dispatcher stub:按工具名返回 ok/fatal,并声明 host_sync metadata。
+const StubDispatcher = struct {
+    /// 名字以 "Fatal" 开头 → host_fatal;否则 .ok(内容为 input 的拷贝)。
+    fn dispatch(_: *const anyopaque, tool_ctx: *const tools_mod.ToolContext, name: []const u8, args: []const u8) anyerror!tools_mod.ToolDispatchOutcome {
+        if (std.mem.startsWith(u8, name, "Fatal")) return .host_fatal;
+        return .{ .ok = try tool_ctx.allocator.dupe(u8, args) };
+    }
+    fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
+        return false;
+    }
+    fn nameAt(_: *const anyopaque, _: usize) ?[]const u8 {
+        return null;
+    }
+    fn hostSync(_: *const anyopaque, _: []const u8) bool {
+        return true; // 全部按 host_sync 声明 → 并发判定走 metadata,不看名字
+    }
+    fn dispatcher() tools_mod.ToolDispatcher {
+        return .{ .ctx = @ptrCast(&sentinel), .dispatchFn = dispatch, .prefetchSafeFn = prefetchSafe, .nameAtFn = nameAt, .hostSyncFn = hostSync };
+    }
+    var sentinel: u8 = 0;
+};
+
+test "矩阵24:host fatal 后无泄漏——已完成 slot 的 owned payload 由 Slot.deinit 全部回收" {
+    const a = std.testing.allocator; // testing.allocator 自带泄漏检测:测试结束未释放即 fail
+    var slots = [_]Slot{
+        .{ .decision = .run, .name = "OkTool", .id = "s1", .input = "{\"x\":1}" },
+        .{ .decision = .run, .name = "FatalTool", .id = "s2", .input = "{}" },
+        .{ .decision = .denied, .name = "Denied", .id = "s3", .input = "{}" },
+    };
+    // denied slot 预填 owned 错误内容(agent_loop 的真实形态)。
+    slots[2].content = try a.dupe(u8, "{\"error\":\"denied\"}");
+    slots[2].is_error = true;
+    defer for (&slots) |*s| s.deinit(a); // 调用方职责:单 defer 覆盖所有退出路径
+    var ctx = tools_mod.ToolContext{ .allocator = a, .tool_dispatcher = StubDispatcher.dispatcher() };
+
+    // host_sync metadata → 三个 slot 同批;FatalTool fatal → error 返回。
+    try std.testing.expectError(error.HostToolFatal, executeSlots(&slots, &ctx, a, .{ .bytes = [_]u8{'0'} ** 12 }));
+    // fatal slot 不组装任何 tool_result。
+    try std.testing.expect(slots[1].content == null);
+}
+
+test "矩阵25:Host 工具并发判定走 executor metadata,不按名字猜" {
+    const a = std.testing.allocator;
+    var ctx = tools_mod.ToolContext{ .allocator = a, .tool_dispatcher = StubDispatcher.dispatcher() };
+    // "UnsafeSoundingName" 不在任何 builtin 并发白名单里;metadata 声明 host_sync → safe。
+    const s = Slot{ .decision = .run, .name = "UnsafeSoundingName", .id = "x", .input = "{}" };
+    try std.testing.expect(slotSafe(&ctx, s));
+    // 无 dispatcher(legacy 路径)→ 回退名字判定 → 该名字不安全。
+    var legacy_ctx = tools_mod.ToolContext{ .allocator = a };
+    try std.testing.expect(!slotSafe(&legacy_ctx, s));
+}
+
+test "thread spawn fallback observes fatal before starting the next job" {
+    const ProbeDispatcher = struct {
+        calls: usize = 0,
+
+        fn dispatch(raw: *const anyopaque, tool_ctx: *const tools_mod.ToolContext, name: []const u8, args: []const u8) anyerror!tools_mod.ToolDispatchOutcome {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            if (std.mem.eql(u8, name, "FatalFirst")) return .host_fatal;
+            return .{ .ok = try tool_ctx.allocator.dupe(u8, args) };
+        }
+
+        fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+
+        fn nameAt(_: *const anyopaque, _: usize) ?[]const u8 {
+            return null;
+        }
+
+        fn hostSync(_: *const anyopaque, _: []const u8) bool {
+            return true;
+        }
+
+        fn dispatcher(self: *@This()) tools_mod.ToolDispatcher {
+            return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .prefetchSafeFn = prefetchSafe, .nameAtFn = nameAt, .hostSyncFn = hostSync };
+        }
+    };
+    const alwaysFailSpawn = struct {
+        fn call(_: *Job) std.Thread.SpawnError!std.Thread {
+            return error.SystemResources;
+        }
+    }.call;
+
+    const a = std.testing.allocator;
+    var probe = ProbeDispatcher{};
+    var ctx = tools_mod.ToolContext{ .allocator = a, .tool_dispatcher = probe.dispatcher() };
+    var slots = [_]Slot{
+        .{ .decision = .run, .name = "FatalFirst", .id = "1", .input = "{}" },
+        .{ .decision = .run, .name = "MustNotStart", .id = "2", .input = "{}" },
+    };
+    defer for (&slots) |*slot| slot.deinit(a);
+
+    try std.testing.expectError(
+        error.HostToolFatal,
+        runConcurrentBatchWithSpawner(&slots, &ctx, a, .{ .bytes = [_]u8{'0'} ** 12 }, alwaysFailSpawn),
+    );
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+}
+
+test "Slot.takeContent 转移即置空,与 deinit 无双释放" {
+    const a = std.testing.allocator;
+    var s = Slot{ .decision = .run, .name = "T", .id = "i", .input = "{}" };
+    s.content = try a.dupe(u8, "payload");
+    const taken = s.takeContent();
+    try std.testing.expect(s.content == null);
+    a.free(taken.?); // 调用方持有
+    s.deinit(a); // 已置空 → no-op,无双释放(testing.allocator 会抓)
 }

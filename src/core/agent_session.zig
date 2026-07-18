@@ -46,7 +46,9 @@ pub const RuntimeConfig = struct {
 
 pub const HostSyncTool = tool_catalog.HostSyncTool;
 pub const HostToolResult = tool_catalog.HostToolResult;
-pub const HostToolError = tool_catalog.HostToolError;
+pub const HostToolOutcome = tool_catalog.HostToolOutcome;
+pub const RunIdentity = tool_catalog.RunIdentity;
+pub const HostRunIdentity = tool_catalog.HostRunIdentity;
 pub const UiRequester = ui_request.UiRequester;
 
 pub const RuntimeError = error{
@@ -62,6 +64,13 @@ pub const AgentRuntime = struct {
     mutex: sync.Mutex = .{},
     live_sessions: usize = 0,
     state: RuntimeState = .active,
+    /// 并存 Session 的 session_id 唯一性由本 registry 主动保证(collision detection),
+    /// 不是"生成两个 ID 然后断言不同"。key 为 [24]u8 **值语义**(SessionId.bytes 定长
+    /// 拷贝)——禁止借用 slice key(本仓吃过 HashMap slice key 悬挂的亏)。
+    session_ids: std.AutoHashMapUnmanaged([24]u8, void) = .empty,
+
+    /// collision 重试上限:生成器故障(恒返同值)时报不可达级错误而非无限循环。
+    const MAX_SESSION_ID_RETRIES: usize = 8;
 
     pub fn create(allocator: std.mem.Allocator, config: RuntimeConfig) !*AgentRuntime {
         for (config.builtin_tools) |name| {
@@ -85,12 +94,30 @@ pub const AgentRuntime = struct {
             return error.RuntimeBusy;
         }
         self.state = .destroying;
+        // 生命周期合同:live_sessions==0 时 registry 必须为空(创建失败已回滚、
+        // destroy 已注销)。非空即内部记账错误——Debug 下必炸。
+        std.debug.assert(self.session_ids.count() == 0);
         self.mutex.unlock();
 
         const allocator = self.allocator;
+        self.session_ids.deinit(allocator);
         self.catalog.deinit();
         self.* = undefined;
         allocator.destroy(self);
+    }
+
+    /// 原子注册:锁下 getOrPut,已存在 → false(调用方换新 ID 重试)。
+    fn registerSessionId(self: *AgentRuntime, sid: SessionId) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const gop = try self.session_ids.getOrPut(self.allocator, sid.bytes);
+        return !gop.found_existing;
+    }
+
+    fn unregisterSessionId(self: *AgentRuntime, sid: SessionId) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.session_ids.remove(sid.bytes);
     }
 
     pub fn createSession(self: *AgentRuntime, config: SessionConfig) !*AgentSession {
@@ -128,6 +155,11 @@ pub const SessionConfig = struct {
     /// Optional synchronous Host UI bridge. The Host-owned callback context
     /// must outlive this Session.
     ui_requester: ?UiRequester = null,
+    /// Host tool 身份锚点(type-erased,注册方 adapter 才可解释;core 只透传不解引用)。
+    /// 合法状态:未选任何 Host tool → 允许 null;选了 Host tool 而 null → create 拒绝
+    /// (admission 校验,不留"理论上不可能"的运行期空态)。owner 为创建方,须活到
+    /// destroy 成功。
+    host_identity_ctx: ?*anyopaque = null,
 };
 
 pub const Config = SessionConfig;
@@ -184,6 +216,8 @@ pub const AgentSession = struct {
     session_rules: SessionRules,
     permission_ctx: permission.PermissionContext,
     host_ui_requester: ?UiRequester,
+    /// Host tool 身份锚点(SessionConfig.host_identity_ctx,core 只透传)。
+    host_identity_ctx: ?*anyopaque = null,
     abort_signal: AbortSignal,
     active_sink: ?EventSink = null,
 
@@ -212,6 +246,9 @@ pub const AgentSession = struct {
         errdefer selected_tools.deinit();
         for (selected_tools.entries) |entry| {
             if (!workspace.allowsTool(entry.definition.name)) return error.ShellToolDisabled;
+            // 选了 Host tool 却没有身份锚点 → admission 拒绝,消灭运行期空态。
+            if (entry.executor == .host_sync and config.host_identity_ctx == null)
+                return error.HostIdentityRequired;
         }
         var jobs: ?JobRegistry = null;
         if (selected_tools.contains("Bash") or selected_tools.contains("BashOutput") or selected_tools.contains("KillShell")) {
@@ -235,7 +272,17 @@ pub const AgentSession = struct {
         );
         errdefer owned_provider.deinit();
 
-        const session_id = @import("session_id.zig").gen();
+        // collision detection:锁下原子注册,冲突则重新生成;重试超限 = 生成器故障,
+        // 报不可达级错误而非无限循环。创建失败由 errdefer 回滚注册。
+        const session_id = blk: {
+            var attempts: usize = 0;
+            while (attempts < AgentRuntime.MAX_SESSION_ID_RETRIES) : (attempts += 1) {
+                const candidate = @import("session_id.zig").gen();
+                if (try runtime.registerSessionId(candidate)) break :blk candidate;
+            }
+            return error.SessionIdGeneratorBroken;
+        };
+        errdefer runtime.unregisterSessionId(session_id);
         var permission_ctx = permission.createContext(config.permission_mode, allocator);
         permission_ctx.session = session_id;
 
@@ -255,6 +302,7 @@ pub const AgentSession = struct {
             .session_rules = .{},
             .permission_ctx = permission_ctx,
             .host_ui_requester = config.ui_requester,
+            .host_identity_ctx = config.host_identity_ctx,
             .abort_signal = AbortSignal.init(),
         };
         self.permission_ctx.session_rules = &self.session_rules;
@@ -295,6 +343,7 @@ pub const AgentSession = struct {
 
         const allocator = self.allocator;
         const runtime = self.runtime;
+        const sid = self.session_id;
         self.provider.deinit();
         self.conversation.deinit();
         if (self.jobs) |*registry| registry.deinit();
@@ -306,6 +355,8 @@ pub const AgentSession = struct {
         secureFree(allocator, self.api_key);
         self.* = undefined;
         allocator.destroy(self);
+        // destroy 成功必须注销(先于 releaseSession:live==0 时 registry 必须已空)。
+        runtime.unregisterSessionId(sid);
         runtime.releaseSession();
     }
 
@@ -345,6 +396,12 @@ pub const AgentSession = struct {
                 .jobs = if (self.jobs) |*registry| registry else null,
                 .tool_defs = self.tools.definitions,
                 .tool_dispatcher = self.tools.dispatcher(),
+                // admission 处固定的 Run 身份,显式传值贯穿至 Host tool 执行点。
+                // active_run_id 在 beginRun 锁下写入、Run 期间稳定(运行线程读)。
+                .host_run = if (self.host_identity_ctx) |hctx| .{
+                    .identity = .{ .session_id = self.session_id, .run_id = self.active_run_id },
+                    .host_session_ctx = hctx,
+                } else null,
                 .ui_requester = self.permission_ctx.ui_requester,
                 .emit_tool_cards = true,
                 .project_dir = self.workspace.root,
@@ -929,4 +986,77 @@ test "Sessions sharing one Runtime keep independent tool selections" {
     try std.testing.expect(grep_session.tools.contains("Grep"));
     try std.testing.expect(!grep_session.tools.contains("Read"));
     try std.testing.expect(!std.mem.eql(u8, read_session.session_id.asSlice(), grep_session.session_id.asSlice()));
+}
+
+// —— T1 矩阵测试:session_id registry 生命周期(31/36)与 host identity 校验 ——
+
+test "Runtime session registry:原子注册、destroy 注销、Runtime destroy 时为空" {
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{ .builtin_tools = &.{"Read"} });
+    defer runtime.destroy() catch unreachable; // destroy 内 assert registry 为空
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+
+    const a = try createTestSession(runtime, .default, cwd);
+    const b = try createTestSession(runtime, .default, cwd);
+    // 并存 Session 的 id 互异且均已注册(值语义 key)。
+    try std.testing.expect(!std.mem.eql(u8, &a.session_id.bytes, &b.session_id.bytes));
+    try std.testing.expectEqual(@as(usize, 2), runtime.session_ids.count());
+    // 原子注册:已存在的 id 二次注册 → false(collision detection 的判定分支)。
+    try std.testing.expect(!(try runtime.registerSessionId(a.session_id)));
+    try std.testing.expectEqual(@as(usize, 2), runtime.session_ids.count());
+
+    const a_id = a.session_id;
+    try a.destroy();
+    // destroy 成功必须注销。
+    try std.testing.expectEqual(@as(usize, 1), runtime.session_ids.count());
+    try std.testing.expect(!runtime.session_ids.contains(a_id.bytes));
+    try b.destroy();
+    try std.testing.expectEqual(@as(usize, 0), runtime.session_ids.count());
+}
+
+test "选择 Host tool 而无 host_identity_ctx → 创建拒绝且 registry 无残留" {
+    var probe_ctx: u8 = 0;
+    const HostFn = struct {
+        fn execute(_: *anyopaque, _: HostRunIdentity, _: []const u8) error{OutOfMemory}!HostToolOutcome {
+            return .{ .failed = null };
+        }
+    };
+    const runtime = try AgentRuntime.create(std.testing.allocator, .{
+        .builtin_tools = &.{"Read"},
+        .host_sync_tools = &.{.{
+            .definition = .{
+                .name = "HostX",
+                .description = "probe",
+                .input_schema = .{ .type = "object", .prop_specs = &.{}, .required = &.{} },
+            },
+            .ctx = &probe_ctx,
+            .execute = HostFn.execute,
+        }},
+    });
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+
+    // 选 Host tool + null ctx → admission 拒绝;registry 与 live_sessions 双双无残留。
+    try std.testing.expectError(error.HostIdentityRequired, runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "k",
+        .model = "m",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"HostX"},
+    }));
+    try std.testing.expectEqual(@as(usize, 0), runtime.session_ids.count());
+    try std.testing.expectEqual(@as(usize, 0), runtime.live_sessions);
+
+    // 带 ctx → 创建成功,runLoop 将以 admission 固定身份贯穿(此处验证接线存在)。
+    const ok = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "k",
+        .model = "m",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"HostX"},
+        .host_identity_ctx = &probe_ctx,
+    });
+    try std.testing.expectEqual(@as(?*anyopaque, &probe_ctx), ok.host_identity_ctx);
+    try ok.destroy();
 }

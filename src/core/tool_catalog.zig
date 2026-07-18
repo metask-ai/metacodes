@@ -26,17 +26,27 @@ pub const HostToolResult = struct {
     }
 };
 
-pub const HostToolError = error{
-    HostToolFailed,
-    HostToolRejected,
-    OutOfMemory,
+/// Typed Host tool outcome. Zig errors carry no payload, so business-failure
+/// detail must live in a union, not an error set. Ownership per branch:
+/// `ok` transfers to the caller (released via result.release() after copy);
+/// `failed`/`rejected` payloads are optional details, borrowed until the
+/// dispatch layer copies them, then released; `fatal` carries nothing —
+/// the fatal control flow owns everything downstream.
+pub const HostToolOutcome = union(enum) {
+    ok: HostToolResult,
+    failed: ?HostToolResult,
+    rejected: ?HostToolResult,
+    fatal,
 };
+
+pub const RunIdentity = tools.RunIdentity;
+pub const HostRunIdentity = tools.HostRunIdentity;
 
 pub const HostSyncExecuteFn = *const fn (
     ctx: *anyopaque,
-    session_id: []const u8,
+    identity: HostRunIdentity,
     args: []const u8,
-) HostToolError!HostToolResult;
+) error{OutOfMemory}!HostToolOutcome;
 
 /// Runtime copies `definition` recursively. `ctx` remains Host-owned and must
 /// outlive the Runtime. The thin library contract accepts completed results
@@ -255,30 +265,63 @@ pub const Selection = struct {
     }
 
     pub fn dispatcher(self: *const Selection) tools.ToolDispatcher {
-        return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .prefetchSafeFn = prefetchSafe, .nameAtFn = nameAt };
+        return .{ .ctx = @ptrCast(self), .dispatchFn = dispatch, .prefetchSafeFn = prefetchSafe, .nameAtFn = nameAt, .hostSyncFn = hostSync };
     }
 
-    fn dispatch(raw: *const anyopaque, tool_ctx: *const tools.ToolContext, name: []const u8, args: []const u8) anyerror![]u8 {
+    fn dispatch(raw: *const anyopaque, tool_ctx: *const tools.ToolContext, name: []const u8, args: []const u8) anyerror!tools.ToolDispatchOutcome {
         const self: *const Selection = @ptrCast(@alignCast(raw));
         const entry = self.find(name) orelse return error.UnknownTool;
-        return switch (entry.executor) {
-            .builtin => |builtin| blk: {
+        switch (entry.executor) {
+            .builtin => |builtin| {
                 try tools.validateRequired(builtin.name, args);
                 try tools.validateTypes(builtin.name, args);
-                break :blk try builtin.execute(tool_ctx, args);
+                return .{ .ok = try builtin.execute(tool_ctx, args) };
             },
-            .host_sync => |host| blk: {
-                const result = try host.execute(host.ctx, tool_ctx.session_id, args);
-                defer result.release();
-                break :blk try tool_ctx.allocator.dupe(u8, result.bytes);
+            .host_sync => |host| {
+                // Identity is admission-fixed and passed by value; a selected
+                // Host tool without identity is a wiring bug, not a tool error.
+                const identity = tool_ctx.host_run orelse return error.HostRunIdentityMissing;
+                const outcome = try host.execute(host.ctx, identity, args);
+                // Ownership chain: Host descriptor is copied into
+                // tool_ctx.allocator and released here exactly once — on the
+                // success path, the detail paths and the copy-OOM path alike.
+                switch (outcome) {
+                    .ok => |result| {
+                        defer result.release();
+                        return .{ .ok = try tool_ctx.allocator.dupe(u8, result.bytes) };
+                    },
+                    .failed => |maybe| {
+                        const detail = try copyDetail(tool_ctx.allocator, maybe);
+                        return .{ .host_failed = detail };
+                    },
+                    .rejected => |maybe| {
+                        const detail = try copyDetail(tool_ctx.allocator, maybe);
+                        return .{ .host_rejected = detail };
+                    },
+                    .fatal => return .host_fatal,
+                }
             },
-        };
+        }
+    }
+
+    /// Copies an optional Host detail into the caller allocator and releases
+    /// the Host descriptor exactly once, including on copy failure.
+    fn copyDetail(allocator: std.mem.Allocator, maybe: ?HostToolResult) error{OutOfMemory}!?[]u8 {
+        const result = maybe orelse return null;
+        defer result.release();
+        return try allocator.dupe(u8, result.bytes);
     }
 
     fn prefetchSafe(raw: *const anyopaque, name: []const u8) bool {
         const self: *const Selection = @ptrCast(@alignCast(raw));
         const entry = self.find(name) orelse return false;
         return entry.prefetch_safe;
+    }
+
+    fn hostSync(raw: *const anyopaque, name: []const u8) bool {
+        const self: *const Selection = @ptrCast(@alignCast(raw));
+        const entry = self.find(name) orelse return false;
+        return entry.executor == .host_sync;
     }
 
     fn nameAt(raw: *const anyopaque, index: usize) ?[]const u8 {
@@ -309,13 +352,19 @@ test "Selection rejects names outside Runtime and dispatches only selected entri
 const HostProbe = struct {
     calls: usize = 0,
     releases: usize = 0,
-    last_session: []const u8 = "",
+    last_session: SessionIdT = SessionIdT.single,
+    last_run_id: u64 = 0,
+    last_host_ctx: ?*anyopaque = null,
 
-    fn execute(raw: *anyopaque, session_id: []const u8, args: []const u8) HostToolError!HostToolResult {
+    const SessionIdT = @import("session_id.zig").SessionId;
+
+    fn execute(raw: *anyopaque, identity: HostRunIdentity, args: []const u8) error{OutOfMemory}!HostToolOutcome {
         const self: *HostProbe = @ptrCast(@alignCast(raw));
         self.calls += 1;
-        self.last_session = session_id;
-        return .{ .bytes = args, .release_ctx = raw, .releaseFn = release };
+        self.last_session = identity.identity.session_id;
+        self.last_run_id = identity.identity.run_id;
+        self.last_host_ctx = identity.host_session_ctx;
+        return .{ .ok = .{ .bytes = args, .release_ctx = raw, .releaseFn = release } };
     }
 
     fn release(raw: *anyopaque, _: []const u8) void {
@@ -323,6 +372,13 @@ const HostProbe = struct {
         self.releases += 1;
     }
 };
+
+fn testIdentity(anchor: *anyopaque) HostRunIdentity {
+    return .{
+        .identity = .{ .session_id = @import("session_id.zig").SessionId.single, .run_id = 7 },
+        .host_session_ctx = anchor,
+    };
+}
 
 fn hostTool(name: []const u8, probe: *HostProbe) HostSyncTool {
     return .{
@@ -351,17 +407,23 @@ test "Host sync entry is Runtime-owned, selected once and released once" {
     defer selection.deinit();
     const dispatcher = selection.dispatcher();
     try std.testing.expect(!dispatcher.prefetchSafe("HostEcho"));
+    try std.testing.expect(dispatcher.isHostSync("HostEcho"));
     var ctx = tools.ToolContext{
         .allocator = std.testing.allocator,
         .session_id = "session-a",
+        .host_run = testIdentity(@ptrCast(&probe)),
         .tool_dispatcher = dispatcher,
     };
-    const result = try tools.dispatch(&ctx, "HostEcho", "{\"text\":\"ok\"}");
-    defer std.testing.allocator.free(result);
-    try std.testing.expectEqualStrings("{\"text\":\"ok\"}", result);
-    try std.testing.expectEqualStrings("session-a", probe.last_session);
+    var outcome = try tools.dispatch(&ctx, "HostEcho", "{\"text\":\"ok\"}");
+    defer outcome.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("{\"text\":\"ok\"}", outcome.ok);
+    try std.testing.expectEqual(@as(u64, 7), probe.last_run_id);
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(&probe)), probe.last_host_ctx);
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expectEqual(@as(usize, 1), probe.releases);
+    // 身份缺失是接线 bug,不是工具错误——独立错误码,不落模型可见面。
+    ctx.host_run = null;
+    try std.testing.expectError(error.HostRunIdentityMissing, tools.dispatch(&ctx, "HostEcho", "{\"text\":\"x\"}"));
 }
 
 test "Host sync names cannot duplicate built-ins or each other" {
@@ -388,13 +450,63 @@ test "Host sync selections sharing one Runtime keep executors isolated" {
     var selection_b = try Selection.init(std.testing.allocator, &catalog, &.{"HostB"});
     defer selection_b.deinit();
 
-    var ctx_a = tools.ToolContext{ .allocator = std.testing.allocator, .tool_dispatcher = selection_a.dispatcher() };
-    var ctx_b = tools.ToolContext{ .allocator = std.testing.allocator, .tool_dispatcher = selection_b.dispatcher() };
-    const result_a = try tools.dispatch(&ctx_a, "HostA", "{\"text\":\"a\"}");
-    defer std.testing.allocator.free(result_a);
-    const result_b = try tools.dispatch(&ctx_b, "HostB", "{\"text\":\"b\"}");
-    defer std.testing.allocator.free(result_b);
+    var ctx_a = tools.ToolContext{ .allocator = std.testing.allocator, .host_run = testIdentity(@ptrCast(&first)), .tool_dispatcher = selection_a.dispatcher() };
+    var ctx_b = tools.ToolContext{ .allocator = std.testing.allocator, .host_run = testIdentity(@ptrCast(&second)), .tool_dispatcher = selection_b.dispatcher() };
+    var outcome_a = try tools.dispatch(&ctx_a, "HostA", "{\"text\":\"a\"}");
+    defer outcome_a.deinit(std.testing.allocator);
+    var outcome_b = try tools.dispatch(&ctx_b, "HostB", "{\"text\":\"b\"}");
+    defer outcome_b.deinit(std.testing.allocator);
     try std.testing.expectError(error.UnknownTool, tools.dispatch(&ctx_a, "HostB", "{\"text\":\"x\"}"));
     try std.testing.expectEqual(@as(usize, 1), first.calls);
     try std.testing.expectEqual(@as(usize, 1), second.calls);
+}
+
+test "Host outcome detail is copied, released once and typed through dispatch" {
+    const DetailProbe = struct {
+        releases: usize = 0,
+        mode: enum { failed_with_detail, rejected_null, fatal } = .failed_with_detail,
+
+        fn execute(raw: *anyopaque, _: HostRunIdentity, _: []const u8) error{OutOfMemory}!HostToolOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return switch (self.mode) {
+                .failed_with_detail => .{ .failed = .{ .bytes = "field 'x' is invalid", .release_ctx = raw, .releaseFn = release } },
+                .rejected_null => .{ .rejected = null },
+                .fatal => .fatal,
+            };
+        }
+
+        fn release(raw: *anyopaque, _: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.releases += 1;
+        }
+    };
+    var probe = DetailProbe{};
+    var catalog = try Catalog.init(std.testing.allocator, &.{}, &.{.{
+        .definition = .{
+            .name = "HostDetail",
+            .description = "detail probe",
+            .input_schema = .{ .type = "object", .prop_specs = &.{}, .required = &.{} },
+        },
+        .ctx = &probe,
+        .execute = DetailProbe.execute,
+    }});
+    defer catalog.deinit();
+    var selection = try Selection.init(std.testing.allocator, &catalog, &.{"HostDetail"});
+    defer selection.deinit();
+    var ctx = tools.ToolContext{ .allocator = std.testing.allocator, .host_run = testIdentity(@ptrCast(&probe)), .tool_dispatcher = selection.dispatcher() };
+
+    var failed = try tools.dispatch(&ctx, "HostDetail", "{}");
+    defer failed.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("field 'x' is invalid", failed.host_failed.?);
+    try std.testing.expectEqual(@as(usize, 1), probe.releases); // 详情复制后恰好释放一次
+
+    probe.mode = .rejected_null;
+    var rejected = try tools.dispatch(&ctx, "HostDetail", "{}");
+    defer rejected.deinit(std.testing.allocator);
+    try std.testing.expect(rejected.host_rejected == null);
+    try std.testing.expectEqual(@as(usize, 1), probe.releases); // null 详情无描述符可释放
+
+    probe.mode = .fatal;
+    const fatal = try tools.dispatch(&ctx, "HostDetail", "{}");
+    try std.testing.expect(fatal == .host_fatal); // fatal 无 payload
 }

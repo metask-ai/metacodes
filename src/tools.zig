@@ -32,6 +32,9 @@ const find_symbol_tool = @import("tools/find_symbol.zig");
 
 pub const ToolContext = @import("tools/context.zig").ToolContext;
 pub const ToolDispatcher = @import("tools/context.zig").ToolDispatcher;
+pub const ToolDispatchOutcome = @import("tools/context.zig").ToolDispatchOutcome;
+pub const RunIdentity = @import("tools/context.zig").RunIdentity;
+pub const HostRunIdentity = @import("tools/context.zig").HostRunIdentity;
 pub const HostServices = @import("tools/context.zig").HostServices;
 pub const PendingRequest = @import("tools/context.zig").PendingRequest;
 pub const ToolProgressReporter = @import("tools/context.zig").ToolProgressReporter;
@@ -769,17 +772,17 @@ fn jsonValueKind(args: []const u8, key: []const u8) ?JsonKind {
 /// 统一派发：先查静态注册表，未命中查 ctx.dyn_registry。
 /// 找不到时先做 P0.6 弱模型工具名修复(归一化 + 模糊匹配),命中则改派到真工具;仍找不到
 /// 返 error.UnknownTool —— 由 agent_loop 转 tool_error 给模型。
-pub fn dispatch(ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror![]u8 {
+pub fn dispatch(ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror!ToolDispatchOutcome {
     // An embedding Session's immutable directory is an authority boundary, not
     // a lookup hint. Do not fall through to the process-wide registry on miss.
     if (ctx.tool_dispatcher) |dispatcher| return dispatcher.dispatch(ctx, name, args);
     if (getTool(name)) |t| {
         try validateRequired(name, args); // schema 层:缺 required 字段 → 早拦
         try validateTypes(name, args); // schema 层:字段类型不匹配 → 早拦
-        return t.execute(ctx, args);
+        return .{ .ok = try t.execute(ctx, args) };
     }
     if (ctx.dyn_registry) |dr| {
-        if (dr.find(name)) |de| return de.execute(ctx, args, de.ctx_ptr);
+        if (dr.find(name)) |de| return .{ .ok = try de.execute(ctx, args, de.ctx_ptr) };
     }
     // P0.6:弱模型幻觉工具名修复。**只**用确定性无损归一化(大小写/`-`/空格/CamelCase→snake/剥
     // `_tool` 尾缀)自动改派——这些是安全的等价变换。**不**用模糊编辑距离自动执行(那会把 "Wrote"
@@ -791,10 +794,10 @@ pub fn dispatch(ctx: *const ToolContext, name: []const u8, args: []const u8) any
             if (getTool(repaired)) |t| {
                 try validateRequired(repaired, args);
                 try validateTypes(repaired, args);
-                return t.execute(ctx, args);
+                return .{ .ok = try t.execute(ctx, args) };
             }
             if (ctx.dyn_registry) |dr| {
-                if (dr.find(repaired)) |de| return de.execute(ctx, args, de.ctx_ptr);
+                if (dr.find(repaired)) |de| return .{ .ok = try de.execute(ctx, args, de.ctx_ptr) };
             }
         }
     }
@@ -1171,9 +1174,9 @@ test "dispatch falls back to dyn_registry" {
 
     var ctx = ToolContext.simple(std.testing.allocator);
     ctx.dyn_registry = &dyn;
-    const out = try dispatch(&ctx, "Echo", "hello");
-    defer std.testing.allocator.free(out);
-    try std.testing.expectEqualStrings("hello", out);
+    var out = try dispatch(&ctx, "Echo", "hello");
+    defer out.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("hello", out.ok);
 }
 
 test "dispatch returns UnknownTool when missing everywhere" {
@@ -1220,7 +1223,8 @@ test "dispatch: 确定性归一化幻觉名改派到真工具(端到端)" {
     ctx.cwd_abs = ".";
     const err = dispatch(&ctx, "grep", "{}");
     if (err) |r| {
-        std.testing.allocator.free(r);
+        var outcome = r;
+        outcome.deinit(std.testing.allocator);
     } else |e| {
         try std.testing.expect(e != error.UnknownTool);
     }

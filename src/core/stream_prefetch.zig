@@ -68,6 +68,9 @@ fn runJob(job: *Job) void {
             job.entry.is_error = d.is_error;
             job.entry.elapsed_ms = d.elapsed_ms;
         },
+        // Host 工具不进流式预取(prefetch_safe=false + isStreamable 白名单),此分支
+        // 防御性兜底:标 skip 让 executeSlots 正常路径重跑并走完整 fatal 控制流。
+        .host_fatal => job.entry.skip = true,
     }
 }
 

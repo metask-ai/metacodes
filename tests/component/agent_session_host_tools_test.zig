@@ -26,14 +26,18 @@ const Probe = struct {
     releases: usize = 0,
     abort_session: ?*cc.agent_session.AgentSession = null,
     abort_run_id: u64 = 0,
-    last_session_id: []const u8 = "",
+    last_session_id: cc.session_id.SessionId = cc.session_id.SessionId.single,
+    last_run_id: u64 = 0,
+    last_host_ctx: ?*anyopaque = null,
 
-    fn execute(raw: *anyopaque, session_id: []const u8, _: []const u8) cc.agent_session.HostToolError!cc.agent_session.HostToolResult {
+    fn execute(raw: *anyopaque, identity: cc.agent_session.HostRunIdentity, _: []const u8) error{OutOfMemory}!cc.agent_session.HostToolOutcome {
         const self: *Probe = @ptrCast(@alignCast(raw));
         self.calls += 1;
-        self.last_session_id = session_id;
-        if (self.abort_session) |session| session.abort(self.abort_run_id, .user_interrupt) catch return error.HostToolFailed;
-        return .{ .bytes = "host-sync-ok", .release_ctx = raw, .releaseFn = release };
+        self.last_session_id = identity.identity.session_id;
+        self.last_run_id = identity.identity.run_id;
+        self.last_host_ctx = identity.host_session_ctx;
+        if (self.abort_session) |session| session.abort(self.abort_run_id, .user_interrupt) catch return .fatal;
+        return .{ .ok = .{ .bytes = "host-sync-ok", .release_ctx = raw, .releaseFn = release } };
     }
 
     fn release(raw: *anyopaque, _: []const u8) void {
@@ -92,6 +96,7 @@ test "L2 selected Host sync tool is advertised, executed and released exactly on
         .permission_mode = .bypass_permissions,
         .workspace = .{ .root = root },
         .allowed_tools = &.{"HostEcho"},
+        .host_identity_ctx = &probe,
     });
     defer session.destroy() catch unreachable;
 
@@ -100,7 +105,9 @@ test "L2 selected Host sync tool is advertised, executed and released exactly on
     try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, result.stop_reason);
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expectEqual(@as(usize, 1), probe.releases);
-    try std.testing.expectEqualStrings(session.session_id.asSlice(), probe.last_session_id);
+    try std.testing.expectEqualStrings(session.session_id.asSlice(), probe.last_session_id.asSlice());
+    try std.testing.expectEqual(@as(u64, 1), probe.last_run_id);
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(&probe)), probe.last_host_ctx);
     const body = (server.lastRequest() orelse return error.NoRequestCaptured).body();
     try std.testing.expect(std.mem.indexOf(u8, body, "HostEcho") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "host-sync-ok") != null);
@@ -163,6 +170,7 @@ test "L2 Host sync callback may reenter abort without lifecycle deadlock" {
         .permission_mode = .bypass_permissions,
         .workspace = .{ .root = root },
         .allowed_tools = &.{"HostEcho"},
+        .host_identity_ctx = &probe,
     });
     defer session.destroy() catch unreachable;
     probe.abort_session = session;

@@ -272,6 +272,9 @@ pub const Options = struct {
     /// immutable selection that produced `tool_defs`. Null preserves the App's
     /// existing process registry behavior.
     tool_dispatcher: ?tools_mod.ToolDispatcher = null,
+    /// Host tool 执行身份(admission 处固定,AgentSession.runLoop 显式传值)。
+    /// 可选 + null 默认:非 Host-tool 消费者零感知(共享基础设施扩展规则)。
+    host_run: ?tools_mod.HostRunIdentity = null,
     /// L5:宿主能力聚合(Skill 激活 / ToolSearch 激活 / Worktree push-pop)。透传到 ToolContext。
     /// 见 ToolContext.HostServices。
     host_services: ?tools_mod.HostServices = null,
@@ -680,6 +683,7 @@ pub fn run(
             .dyn_registry = opts.dyn_registry,
             .tool_dispatcher = opts.tool_dispatcher,
             .host_services = opts.host_services,
+            .host_run = opts.host_run,
             .explicit_invocation = opts.explicit_invocation,
             .session_id = opts.session_id,
             .project_dir = opts.project_dir,
@@ -1006,7 +1010,12 @@ pub fn run(
         // 6a. 收集 tool_use + 主线程串行做权限检查 → slots。
         const tool_exec = @import("tool_exec.zig");
         var slots = std.ArrayList(tool_exec.Slot).empty;
-        defer slots.deinit(allocator);
+        // 单个 defer 覆盖所有退出路径(正常/挂起/fatal/错误):slot-owned payload 全部回收。
+        // 已转移 ownership 的字段(takeContent 置 null)天然跳过——转移必须走 takeContent。
+        defer {
+            for (slots.items) |*s| s.deinit(allocator);
+            slots.deinit(allocator);
+        }
         // P0.2 PreToolUse ModifyInput/Block:hook 在此**统一跑一次**(拿 block + updatedInput 改写);
         // 为避免 checkPermission 内 decision.check 再跑一次 hook(重复副作用),给它一份 hooks=null 的
         // 上下文副本。改写后的输入(owned)挂 mod_inputs,turn 作用域统一释放;slot.input 指向它。
@@ -1103,6 +1112,7 @@ pub fn run(
             .dyn_registry = opts.dyn_registry,
             .tool_dispatcher = opts.tool_dispatcher,
             .host_services = opts.host_services,
+            .host_run = opts.host_run,
             .explicit_invocation = opts.explicit_invocation,
             .session_id = opts.session_id,
             .project_dir = opts.project_dir,
@@ -1176,7 +1186,9 @@ pub fn run(
                 s.prefetched = true;
             }
         }
-        tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
+        // Host 工具 fatal → 直接上抛:不组装 tool_result(errdefer 释放 result_blocks,
+        // slot payload 由上方 defer 回收),AgentSession.runLoop 捕获后 poisonRun。
+        try tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
         if (opts.emit_tool_cards and opts.agent_depth == 0) {
             // P2.1:只发 clear_current_tool 清运行态动态卡。**不再**为每个 slot 补发一条空 content
             // 的 tool_result——那是历史"双发",逼每个 backend 靠 content.len>0 去重(tui gate / web JS dedup /
@@ -1259,7 +1271,14 @@ pub fn run(
         var post_ctx: std.ArrayList(u8) = .empty;
         defer post_ctx.deinit(allocator);
         for (slots.items) |*s| {
-            const content = s.content orelse try tool_error.errorToJson("InternalError", "tool {s} produced no result", .{s.name}, allocator);
+            // takeContent:ownership 转移给 result_blocks 并置空 slot 字段——
+            // 顶部 defer 的 Slot.deinit 不会再碰它(双释放防线)。
+            const content = s.takeContent() orelse try tool_error.errorToJson("InternalError", "tool {s} produced no result", .{s.name}, allocator);
+            // 已离开 slot、尚未进 result_blocks 的真空期:本迭代内 try 失败由此兜底。
+            // 旗标而非裸 errdefer:append 后 ownership 归 result_blocks(其 errdefer 接管),
+            // 本迭代若再加 try 也不会双释放。
+            var content_transferred = false;
+            errdefer if (!content_transferred) allocator.free(content);
             if (s.is_error) {
                 turn_any_error = true;
                 const sig = ToolErrSig.of(s.name, content);
@@ -1271,11 +1290,14 @@ pub fn run(
             } else {
                 turn_any_success = true;
             }
+            const tool_use_id = try allocator.dupe(u8, s.id);
+            errdefer if (!content_transferred) allocator.free(tool_use_id);
             try result_blocks.append(allocator, .{ .tool_result = .{
-                .tool_use_id = try allocator.dupe(u8, s.id),
+                .tool_use_id = tool_use_id,
                 .content = content,
                 .is_error = s.is_error,
             } });
+            content_transferred = true;
 
             // PostToolUse hook(执行后,仅真跑过的 slot):收集 additionalContext 注入下轮上下文。
             if (s.decision == .run) {

@@ -3,6 +3,17 @@
 const std = @import("std");
 const cc = @import("cc");
 
+fn dispatchOk(ctx: *const cc.tools.ToolContext, name: []const u8, args: []const u8) ![]u8 {
+    var outcome = try cc.tools.dispatch(ctx, name, args);
+    return switch (outcome) {
+        .ok => |bytes| bytes,
+        else => {
+            outcome.deinit(ctx.allocator);
+            return error.UnexpectedDispatchOutcome;
+        },
+    };
+}
+
 test "MCP: full cycle initialize + listTools + callTool echo" {
     const a = std.testing.allocator;
     const mock_path: [*:0]const u8 = "zig-out/bin/mock_mcp_server";
@@ -80,7 +91,7 @@ test "MCP: dispatch via DynRegistry routes mock__echo to MCP server" {
     // 现在 dispatch 应当能找到 mock__echo 并调用,得到包含 "hi via dispatch" 的结果
     var ctx = cc.tools.ToolContext.simple(a);
     ctx.dyn_registry = &dyn;
-    const out = try cc.tools.dispatch(&ctx, "mock__echo", "{\"message\":\"hi via dispatch\"}");
+    const out = try dispatchOk(&ctx, "mock__echo", "{\"message\":\"hi via dispatch\"}");
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "hi via dispatch") != null);
 }
