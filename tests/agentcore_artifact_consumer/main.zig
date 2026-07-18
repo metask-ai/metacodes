@@ -3,6 +3,11 @@ const sdk = @import("metacodes_agentcore");
 const wire = sdk.types;
 const Server = @import("mock_server.zig").Server;
 
+comptime {
+    if (@hasDecl(wire, "CALLBACK_CONTINUE") or @hasDecl(wire, "CALLBACK_FATAL"))
+        @compileError("revision 2 must not retain pre-revision callback aliases");
+}
+
 const ASK_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"ask\",\"name\":\"AskUserQuestion\",\"input\":{}}}\n\n" ++
@@ -27,7 +32,25 @@ const FINAL_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+const SpinMutex = struct {
+    state: std.atomic.Value(u8) = .init(0),
+
+    fn lock(self: *SpinMutex) void {
+        while (self.state.cmpxchgStrong(0, 1, .acquire, .monotonic) != null)
+            std.Thread.yield() catch {};
+    }
+
+    fn unlock(self: *SpinMutex) void {
+        self.state.store(0, .release);
+    }
+};
+
 const Probe = struct {
+    identity_mutex: SpinMutex = .{},
+    session: ?*wire.SessionHandle = null,
+    active_run_id: u64 = 0,
+    bound_session_id_len: u8 = 0,
+    bound_session_id: [wire.MAX_SESSION_ID_BYTES_V1]u8 = undefined,
     ui_calls: usize = 0,
     ui_releases: usize = 0,
     host_calls: usize = 0,
@@ -36,10 +59,46 @@ const Probe = struct {
     saw_host_result: bool = false,
     saw_final_text: bool = false,
 
-    fn event(raw: ?*anyopaque, _: ?*wire.SessionHandle, _: u64, json_view: wire.BytesViewV1) callconv(.c) u32 {
-        const self: *Probe = @ptrCast(@alignCast(raw orelse return wire.CALLBACK_FATAL));
-        const json = sdk.borrowedBytes(json_view) catch return wire.CALLBACK_FATAL;
-        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, json) catch return wire.CALLBACK_FATAL;
+    fn registerSession(self: *Probe, session: *wire.SessionHandle) !void {
+        self.identity_mutex.lock();
+        defer self.identity_mutex.unlock();
+        if (self.session != null) return error.SessionAlreadyRegistered;
+        self.session = session;
+    }
+
+    fn beginRun(self: *Probe, run_id: u64) !void {
+        self.identity_mutex.lock();
+        defer self.identity_mutex.unlock();
+        if (self.session == null or self.active_run_id != 0 or run_id == 0) return error.InvalidHostLifecycle;
+        self.active_run_id = run_id;
+    }
+
+    fn endRun(self: *Probe, run_id: u64) !void {
+        self.identity_mutex.lock();
+        defer self.identity_mutex.unlock();
+        if (self.active_run_id != run_id) return error.InvalidHostLifecycle;
+        self.active_run_id = 0;
+    }
+
+    fn acceptContext(self: *Probe, run_ptr: ?*const wire.RunContextV1) bool {
+        const run = sdk.validateRunContext(run_ptr) catch return false;
+        self.identity_mutex.lock();
+        defer self.identity_mutex.unlock();
+        if (run.session != self.session or run.run_id != self.active_run_id) return false;
+        if (self.bound_session_id_len == 0) {
+            self.bound_session_id_len = @intCast(run.session_id.len);
+            @memcpy(self.bound_session_id[0..run.session_id.len], run.session_id);
+            return true;
+        }
+        return self.bound_session_id_len == run.session_id.len and
+            std.mem.eql(u8, self.bound_session_id[0..self.bound_session_id_len], run.session_id);
+    }
+
+    fn event(raw: ?*anyopaque, run: ?*const wire.RunContextV1, json_view: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *Probe = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        if (!self.acceptContext(run)) return wire.EVENT_FATAL;
+        const json = sdk.borrowedBytes(json_view) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, json) catch return wire.EVENT_FATAL;
         defer parsed.deinit();
         switch (parsed.value) {
             .known => |known_event| switch (known_event) {
@@ -58,11 +117,12 @@ const Probe = struct {
             },
             .unknown => {},
         }
-        return wire.CALLBACK_CONTINUE;
+        return wire.EVENT_CONTINUE;
     }
 
-    fn ui(raw: ?*anyopaque, _: ?*wire.SessionHandle, request: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+    fn ui(raw: ?*anyopaque, run: ?*const wire.RunContextV1, request: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
         const self: *Probe = @ptrCast(@alignCast(raw orelse return wire.UI_FATAL));
+        if (!self.acceptContext(run)) return wire.UI_FATAL;
         const encoded = sdk.borrowedBytes(request) catch return wire.UI_FATAL;
         const parsed = sdk.decodeUiRequest(std.heap.c_allocator, encoded) catch return wire.UI_FATAL;
         defer parsed.deinit();
@@ -93,8 +153,9 @@ const Probe = struct {
         }
     }
 
-    fn host(raw: ?*anyopaque, _: wire.BytesViewV1, args: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+    fn host(raw: ?*anyopaque, run: ?*const wire.RunContextV1, args: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
         const self: *Probe = @ptrCast(@alignCast(raw orelse return wire.HOST_FAILED));
+        if (!self.acceptContext(run)) return wire.HOST_FATAL;
         const Args = struct { text: []const u8 };
         const encoded = sdk.borrowedBytes(args) catch return wire.HOST_FAILED;
         const parsed = std.json.parseFromSlice(Args, std.heap.c_allocator, encoded, .{}) catch return wire.HOST_FAILED;
@@ -116,7 +177,9 @@ const Probe = struct {
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
     const api = try sdk.Api.discover();
+    if (api.raw.abi_revision != wire.ABI_REVISION) return error.UnexpectedRevision;
     if (sdk.metacodes_agentcore_get_api(2) != null) return error.UnexpectedAbi;
+    try verifyRevisionMismatchRejection(api);
 
     const workspace = try std.process.currentPathAlloc(init.io, a);
     var name_buf: [128]u8 = undefined;
@@ -187,12 +250,15 @@ pub fn main(init: std.process.Init) !void {
     };
     var session: ?*wire.SessionHandle = null;
     try expectStatus(.ok, api.sessionCreate()(runtime, &config, &callbacks, &session, &diagnostic), diagnostic);
+    try probe.registerSession(session.?);
     defer if (session) |handle| {
         _ = api.sessionDestroy()(handle, &diagnostic);
     };
     var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 6, .reserved = [_]u64{0} ** 4 };
     var result: wire.RunResultV1 = undefined;
+    try probe.beginRun(1);
     try expectStatus(.ok, api.sessionRun()(session, 1, sdk.bytesView("exercise bundle"), &options, &result, &diagnostic), diagnostic);
+    try probe.endRun(1);
     if (try sdk.StopReason.fromCode(result.stop_reason_code) != .end_turn or result.tool_calls != 3) return error.UnexpectedRunResult;
     if (probe.ui_calls != 1 or probe.ui_releases != 1 or probe.host_calls != 1 or probe.host_releases != 1) return error.CallbackContractFailed;
     if (!probe.saw_read_result or !probe.saw_host_result or !probe.saw_final_text) return error.MissingCoreEvent;
@@ -201,6 +267,26 @@ pub fn main(init: std.process.Init) !void {
     try expectStatus(.ok, api.runtimeDestroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
     std.debug.print("AgentCore source-free consumer: real tool, Host tool, Host UI and events OK\n", .{});
+}
+
+fn verifyRevisionMismatchRejection(api: sdk.Api) !void {
+    const LegacyApi104 = extern struct {
+        struct_size: u32,
+        abi_version: u32,
+        tail: [96]u8,
+    };
+    var legacy: LegacyApi104 align(@alignOf(wire.ApiV1)) = std.mem.zeroes(LegacyApi104);
+    legacy.struct_size = @sizeOf(LegacyApi104);
+    legacy.abi_version = wire.ABI_VERSION_V1;
+    if (sdk.Api.validate(@ptrCast(&legacy))) |_| return error.LegacyTableAccepted else |err| {
+        if (err != error.UnsupportedAbi) return err;
+    }
+
+    var wrong_revision = api.raw.*;
+    wrong_revision.abi_revision = wire.ABI_REVISION - 1;
+    if (sdk.Api.validate(&wrong_revision)) |_| return error.WrongRevisionAccepted else |err| {
+        if (err != error.UnsupportedAbi) return err;
+    }
 }
 
 fn readToolSse(a: std.mem.Allocator, path: []const u8) ![]u8 {

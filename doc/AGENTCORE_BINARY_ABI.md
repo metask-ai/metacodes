@@ -22,6 +22,23 @@ Consumers must pin an exact bundle (the manifest records the source commit)
 and treat every update as potentially breaking. No near-term re-freeze is
 planned.
 
+The current experimental bundle is **ABI v1 revision 2**. Revision 2 is an
+in-place breaking supplement to the withdrawn pre-revision 104-byte table:
+
+- `mc_agentcore_api_v1` is 112 bytes and adds `abi_revision == 2`;
+- event, UI, and Host-tool callbacks receive `const mc_run_context_v1 *`;
+- `MC_CALLBACK_*` was removed in favor of `MC_EVENT_*` (no aliases);
+- Host tools may return `MC_HOST_FATAL` and FAILED/REJECTED detail;
+- `manifest.json` records `binary_abi_revision: 2`.
+
+Consumers migrating from the pre-revision bundle must update the header and
+library atomically, validate the stable `struct_size`/`abi_version` prefix
+before reading later fields, then require exact revision equality. A 104-byte
+table and a 112-byte table with any revision other than 2 are both rejected;
+there is no compatibility fallback. Every per-Run callback must validate and
+copy any retained `RunContext` fields during the callback, and Host registries
+must bind/compare `session_id` atomically under their per-Session lock.
+
 Re-freeze first requires closure of the open items tracked in
 `doc/AGENTCORE_V1_EXPERIMENTAL_LEDGER.md` (group A closed; every group B item
 with an explicit disposition, B1/B3 fixed or formally argued). Only then do
@@ -287,16 +304,16 @@ empty. Diagnostic allocation is best-effort and never changes the primary
 operation status. Host-owned callback output must never be passed to
 `buffer_release`.
 
-Host tool `execute` receives two borrowed views: the current AgentSession
-identifier and the provider-produced tool arguments JSON. Neither remains valid
-after the callback returns.
+Host tool `execute` receives a borrowed `RunContext` and the provider-produced
+tool arguments JSON. The context, its `session_id` view, and arguments view do
+not remain valid after the callback returns.
 
 ### Callback and concurrency matrix
 
 | Path | Concurrency/ordering | Failure semantics |
 |---|---|---|
-| `on_event` | Serialized within one Session; different Sessions may call shared Host state concurrently | Any value other than `MC_CALLBACK_CONTINUE` aborts the Run and poisons the Session |
-| Host tool `execute` | Different Sessions and parallel tool calls in one Session may invoke it concurrently | `MC_HOST_FAILED`/`MC_HOST_REJECTED` becomes a normal tool result and does not by itself poison the Session |
+| `on_event` | Serialized within one Session; different Sessions may call shared Host state concurrently | Any value other than `MC_EVENT_CONTINUE` aborts the Run and poisons the Session |
+| Host tool `execute` | Different Sessions and parallel tool calls in one Session may invoke it concurrently | `MC_HOST_FAILED`/`MC_HOST_REJECTED` becomes a normal tool result; `MC_HOST_FATAL` aborts and poisons without a model-visible tool result |
 | `on_ui_request` | Synchronous in the Run path | Fatal, invalid, mismatched, or oversized responses abort the Run and poison the Session |
 | release callbacks | Exactly once for every accepted Host-owned buffer; no thread affinity | Must not re-enter Run or destroy |
 | `session_abort` | May run concurrently with the matching synchronous Run, including from a callback | Cooperative; callback or provider code that blocks can delay completion |
@@ -383,9 +400,12 @@ reliable automatic classification.
 ### ABI evolution
 
 All v1 POD descriptors and the API table require their exact documented
-`struct_size`; every reserved field must be zero. Reserved storage is not
-permission to extend v1 layouts. Any layout, function-table, or control-message
-extension requires `metacodes_agentcore_get_api(2)` and v2 types.
+`struct_size`; every reserved field must be zero. During the current unfrozen
+experimental period, a breaking v1 bundle increments `abi_revision` and
+consumers accept only the exact revision they were built against. Reserved
+storage is not permission to infer compatibility. After v1 is genuinely
+re-frozen, later layout, function-table, or control-message extensions require
+`metacodes_agentcore_get_api(2)` and v2 types.
 
 `capabilities` reports the API surface implemented by the returned library
 table. It is not per-Runtime or per-Session negotiation; concrete Runtime and

@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(MC_CALLBACK_CONTINUE) || defined(MC_CALLBACK_FATAL)
+#error "revision 2 must not retain pre-revision callback aliases"
+#endif
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
@@ -242,16 +246,37 @@ static void stop_server(struct test_server *server) {
 }
 
 static unsigned event_calls = 0;
+static mc_session *registered_session = NULL;
+static uint64_t active_run_id = 0;
+static uint8_t bound_session_id[MC_MAX_SESSION_ID_BYTES_V1];
+static size_t bound_session_id_len = 0;
 
-static uint32_t on_event(void *ctx, mc_session *session, uint64_t run_id,
+static int accept_run_context(const mc_run_context_v1 *run) {
+    if (run == NULL || run->struct_size != sizeof(*run) || run->reserved0 != 0 ||
+        run->session != registered_session || run->run_id != active_run_id ||
+        run->session_id.ptr == NULL || run->session_id.len == 0 ||
+        run->session_id.len > MC_MAX_SESSION_ID_BYTES_V1 ||
+        run->reserved[0] != 0 || run->reserved[1] != 0) {
+        return 0;
+    }
+    size_t len = (size_t)run->session_id.len;
+    if (bound_session_id_len == 0) {
+        memcpy(bound_session_id, run->session_id.ptr, len);
+        bound_session_id_len = len;
+        return 1;
+    }
+    return bound_session_id_len == len &&
+           memcmp(bound_session_id, run->session_id.ptr, len) == 0;
+}
+
+static uint32_t on_event(void *ctx, const mc_run_context_v1 *run,
                          mc_bytes_view_v1 event_json) {
     (void)ctx;
-    (void)session;
-    if (run_id == 1 && event_json.ptr != NULL && event_json.len != 0) {
+    if (accept_run_context(run) && event_json.ptr != NULL && event_json.len != 0) {
         event_calls++;
-        return MC_CALLBACK_CONTINUE;
+        return MC_EVENT_CONTINUE;
     }
-    return MC_CALLBACK_FATAL;
+    return MC_EVENT_FATAL;
 }
 
 static mc_bytes_view_v1 view(const char *text) {
@@ -272,7 +297,10 @@ int main(void) {
     const mc_agentcore_api_v1 *api =
         (const mc_agentcore_api_v1 *)metacodes_agentcore_get_api(MC_AGENTCORE_ABI_V1);
     if (api == NULL || api->struct_size != sizeof(*api) ||
-        api->abi_version != MC_AGENTCORE_ABI_V1 ||
+        api->abi_version != MC_AGENTCORE_ABI_V1) {
+        return 10;
+    }
+    if (api->abi_revision != MC_AGENTCORE_ABI_REVISION || api->reserved0 != 0 ||
         (api->capabilities & MC_REQUIRED_CAPABILITIES_V1) !=
             MC_REQUIRED_CAPABILITIES_V1 ||
         api->runtime_create == NULL || api->runtime_destroy == NULL ||
@@ -336,6 +364,7 @@ int main(void) {
         api->runtime_destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 15);
     }
+    registered_session = session;
 
     uint32_t busy_status = api->runtime_destroy(runtime, &diagnostic);
     if (busy_status != MC_STATUS_BUSY ||
@@ -359,8 +388,10 @@ int main(void) {
     options.struct_size = sizeof(options);
     options.max_turns = 1;
     mc_run_result_v1 result = {0};
+    active_run_id = 1;
     uint32_t run_status = api->session_run(session, 1, view("exercise C ABI"),
                                            &options, &result, &diagnostic);
+    active_run_id = 0;
     stop_server(&server);
     if (run_status != MC_STATUS_OK || result.stop_reason_code != MC_STOP_END_TURN ||
         event_calls == 0 || server.result != 0) {
