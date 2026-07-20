@@ -17,7 +17,6 @@ const Manifest = struct {
     source: struct {
         commit: []const u8,
         dirty: bool,
-        dirty_source_sha256: []const u8,
     },
     toolchain: struct { zig_version: []const u8 },
     target: struct {
@@ -48,12 +47,6 @@ const Manifest = struct {
 const SourceIdentity = struct {
     commit: []const u8,
     dirty: bool,
-    dirty_digest: [64]u8,
-};
-
-const DigestEntry = struct {
-    path: []const u8,
-    digest: [32]u8,
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -78,7 +71,7 @@ pub fn main(init: std.process.Init) !void {
         return error.EmptyMetadata;
     const strip = parseBool(strip_text) orelse return error.InvalidBoolean;
 
-    const source = try sourceIdentity(allocator, init.io, bundle_root);
+    const source = try sourceIdentity(allocator, init.io);
     const sdk_version_bytes = try std.Io.Dir.cwd().readFileAlloc(
         init.io,
         "sdk/VERSION",
@@ -88,20 +81,25 @@ pub fn main(init: std.process.Init) !void {
     const sdk_version = std.mem.trim(u8, sdk_version_bytes, " \r\n\t");
     const version = try packageVersion(allocator, sdk_version, source);
     if (version.len > 32) return error.PackageVersionTooLong;
-    const sdk_semver = std.SemanticVersion.parse(sdk_version) catch return error.InvalidSdkVersion;
-    if (sdk_semver.pre == null)
-        try requireStableTag(allocator, init.io, sdk_version, source.commit);
-
     const target_id = try packageTargetId(allocator, architecture, os, abi);
     const rust_target = try rustTarget(architecture, os, abi);
+    const no_link_inputs = [_][]const u8{};
+    const windows_libraries = [_][]const u8{ "advapi32", "crypt32" };
+    const system_libraries: []const []const u8 = if (std.mem.eql(u8, os, "windows"))
+        &windows_libraries
+    else
+        &no_link_inputs;
+    const system_frameworks: []const []const u8 = &no_link_inputs;
     const readme = try renderReadme(allocator, version, target_id, resolved_target, rust_target, source.commit);
     const zon = try renderZon(allocator, version);
     const cargo = try renderCargoToml(allocator, version);
     const cargo_lock = try renderCargoLock(allocator, version);
+    const rust_link_config = try renderRustLinkConfig(allocator, rust_target, system_libraries, system_frameworks);
     try writeBundleFile(allocator, init.io, bundle_root, "README.md", readme);
     try writeBundleFile(allocator, init.io, bundle_root, "bindings/zig/build.zig.zon", zon);
     try writeBundleFile(allocator, init.io, bundle_root, "bindings/rust/Cargo.toml", cargo);
     try writeBundleFile(allocator, init.io, bundle_root, "bindings/rust/Cargo.lock", cargo_lock);
+    try writeBundleFile(allocator, init.io, bundle_root, "bindings/rust/link.cfg", rust_link_config);
 
     const library_rel = try std.fmt.allocPrint(allocator, "lib/{s}", .{library_file});
     const relative_paths = [_][]const u8{
@@ -114,6 +112,7 @@ pub fn main(init: std.process.Init) !void {
         "bindings/zig/src/types.zig",
         "bindings/rust/Cargo.toml",
         "bindings/rust/Cargo.lock",
+        "bindings/rust/link.cfg",
         "bindings/rust/build.rs",
         "bindings/rust/src/lib.rs",
         "bindings/rust/src/raw.rs",
@@ -129,19 +128,11 @@ pub fn main(init: std.process.Init) !void {
         files[index] = .{ .path = relative_path, .sha256 = &digests[index] };
     }
 
-    const no_link_inputs = [_][]const u8{};
-    const windows_libraries = [_][]const u8{ "advapi32", "crypt32" };
-    const system_libraries: []const []const u8 = if (std.mem.eql(u8, os, "windows"))
-        &windows_libraries
-    else
-        &no_link_inputs;
-
     const manifest = Manifest{
         .version = version,
         .source = .{
             .commit = source.commit,
             .dirty = source.dirty,
-            .dirty_source_sha256 = if (source.dirty) &source.dirty_digest else "",
         },
         .toolchain = .{ .zig_version = builtin.zig_version_string },
         .target = .{
@@ -158,7 +149,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .link = .{
             .system_libraries = system_libraries,
-            .system_frameworks = &no_link_inputs,
+            .system_frameworks = system_frameworks,
         },
         .contract = .{},
         .files = &files,
@@ -188,31 +179,13 @@ fn packageVersion(allocator: std.mem.Allocator, sdk_version: []const u8, source:
     const parsed = std.SemanticVersion.parse(sdk_version) catch return error.InvalidSdkVersion;
     if (parsed.build != null) return error.InvalidSdkVersion;
 
-    if (parsed.pre == null) {
-        if (source.dirty) return error.DirtyStableVersion;
-        return allocator.dupe(u8, sdk_version);
-    }
+    if (parsed.pre == null) return allocator.dupe(u8, sdk_version);
 
     const commit_short = source.commit[0..12];
     return if (source.dirty)
-        std.fmt.allocPrint(allocator, "{s}+{s}.dirty.{s}", .{ sdk_version, source.commit[0..7], source.dirty_digest[0..8] })
+        std.fmt.allocPrint(allocator, "{s}+{s}.dirty", .{ sdk_version, commit_short })
     else
         std.fmt.allocPrint(allocator, "{s}+{s}", .{ sdk_version, commit_short });
-}
-
-fn requireStableTag(allocator: std.mem.Allocator, io: std.Io, version: []const u8, commit: []const u8) !void {
-    const tag_ref = try stableTagRef(allocator, version);
-    const output = try runGit(allocator, io, &.{ "git", "rev-parse", "--verify", "--quiet", tag_ref });
-    const tag_commit = std.mem.trim(u8, output, " \r\n\t");
-    try validateStableTagCommit(commit, tag_commit);
-}
-
-fn stableTagRef(allocator: std.mem.Allocator, version: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(allocator, "refs/tags/agentcore-v{s}^{{commit}}", .{version});
-}
-
-fn validateStableTagCommit(commit: []const u8, tag_commit: []const u8) !void {
-    if (!std.mem.eql(u8, tag_commit, commit)) return error.StableTagMismatch;
 }
 
 fn packageTargetId(allocator: std.mem.Allocator, architecture: []const u8, os: []const u8, abi: []const u8) ![]const u8 {
@@ -248,7 +221,7 @@ fn renderReadme(
         \\# metask-agentcore {s}
         \\
         \\Target: `{s}`
-        \\Required Zig target: `{s}`
+        \\Producer Zig target: `{s}`
         \\Required Cargo target: `{s}`
         \\Source commit: `{s}`
         \\
@@ -305,6 +278,22 @@ fn renderCargoLock(allocator: std.mem.Allocator, version: []const u8) ![]const u
     , .{version});
 }
 
+fn renderRustLinkConfig(
+    allocator: std.mem.Allocator,
+    rust_target: []const u8,
+    system_libraries: []const []const u8,
+    system_frameworks: []const []const u8,
+) ![]const u8 {
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try output.writer.print("target={s}\n", .{rust_target});
+    for (system_libraries) |library|
+        try output.writer.print("library={s}\n", .{library});
+    for (system_frameworks) |framework|
+        try output.writer.print("framework={s}\n", .{framework});
+    return output.toOwnedSlice();
+}
+
 fn writeBundleFile(allocator: std.mem.Allocator, io: std.Io, bundle_root: []const u8, relative_path: []const u8, bytes: []const u8) !void {
     const path = try std.fs.path.join(allocator, &.{ bundle_root, relative_path });
     try writeAtomic(io, path, bytes);
@@ -327,64 +316,14 @@ fn fileSha256(io: std.Io, path: []const u8) ![32]u8 {
     return digest;
 }
 
-fn sourceIdentity(allocator: std.mem.Allocator, io: std.Io, bundle_root: []const u8) !SourceIdentity {
+fn sourceIdentity(allocator: std.mem.Allocator, io: std.Io) !SourceIdentity {
     const commit_output = try runGit(allocator, io, &.{ "git", "rev-parse", "HEAD" });
     const commit = std.mem.trim(u8, commit_output, " \r\n\t");
     if (commit.len != 40 or !isLowerHex(commit)) return error.InvalidGitCommit;
-
-    const repo_root_output = try runGit(allocator, io, &.{ "git", "rev-parse", "--show-toplevel" });
-    const repo_root = std.mem.trim(u8, repo_root_output, " \r\n\t");
-    const repo_prefix_output = try runGit(allocator, io, &.{ "git", "rev-parse", "--show-prefix" });
-    const repo_prefix = std.mem.trim(u8, repo_prefix_output, " \r\n\t");
-    const source_pathspec = try std.fmt.allocPrint(allocator, ":(top){s}**", .{repo_prefix});
-    const exclude_pathspec = try bundleExcludePathspec(allocator, repo_root, bundle_root);
-
-    var status_args = std.ArrayList([]const u8).empty;
-    try status_args.appendSlice(allocator, &.{ "git", "status", "--porcelain=v1", "-z", "--untracked-files=normal", "--", source_pathspec });
-    if (exclude_pathspec) |exclude| try status_args.append(allocator, exclude);
-    const status = try runGit(allocator, io, status_args.items);
-    if (status.len == 0) return .{ .commit = commit, .dirty = false, .dirty_digest = undefined };
-
-    var diff_args = std.ArrayList([]const u8).empty;
-    try diff_args.appendSlice(allocator, &.{ "git", "diff", "HEAD", "--binary", "--", source_pathspec });
-    if (exclude_pathspec) |exclude| try diff_args.append(allocator, exclude);
-    const diff = try runGit(allocator, io, diff_args.items);
-
-    var untracked_args = std.ArrayList([]const u8).empty;
-    try untracked_args.appendSlice(allocator, &.{ "git", "ls-files", "--others", "--exclude-standard", "-z", "--", source_pathspec });
-    if (exclude_pathspec) |exclude| try untracked_args.append(allocator, exclude);
-    const untracked_output = try runGit(allocator, io, untracked_args.items);
-    var untracked = std.ArrayList(DigestEntry).empty;
-    var names = std.mem.splitScalar(u8, untracked_output, 0);
-    while (names.next()) |path| {
-        if (path.len == 0) continue;
-        try untracked.append(allocator, .{ .path = path, .digest = try fileSha256(io, path) });
-    }
-    return .{
-        .commit = commit,
-        .dirty = true,
-        .dirty_digest = dirtySourceDigest(diff, untracked.items),
-    };
-}
-
-fn bundleExcludePathspec(allocator: std.mem.Allocator, repo_root: []const u8, bundle_root: []const u8) !?[]const u8 {
-    const bundle_absolute = if (std.fs.path.isAbsolute(bundle_root))
-        try allocator.dupe(u8, bundle_root)
-    else
-        try std.fs.path.resolve(allocator, &.{bundle_root});
-    defer allocator.free(bundle_absolute);
-    const relative = std.fs.path.relative(allocator, ".", null, repo_root, bundle_absolute) catch return null;
-    defer allocator.free(relative);
-    if (std.fs.path.isAbsolute(relative) or relative.len == 0 or std.mem.eql(u8, relative, ".") or
-        std.mem.eql(u8, relative, "..") or std.mem.startsWith(u8, relative, "../") or
-        std.mem.startsWith(u8, relative, "..\\"))
-        return null;
-    const normalized = try allocator.dupe(u8, relative);
-    defer allocator.free(normalized);
-    for (normalized) |*byte| {
-        if (byte.* == '\\') byte.* = '/';
-    }
-    return try std.fmt.allocPrint(allocator, ":(top,exclude){s}/**", .{normalized});
+    const status = try runGit(allocator, io, &.{
+        "git", "status", "--porcelain=v1", "-z", "--untracked-files=normal", "--", ".",
+    });
+    return .{ .commit = commit, .dirty = status.len != 0 };
 }
 
 fn runGit(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![]const u8 {
@@ -399,26 +338,6 @@ fn runGit(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8) ![
     }
     std.debug.print("AgentCore manifest: git command failed: {s}\n", .{result.stderr});
     return error.GitCommandFailed;
-}
-
-fn dirtySourceDigest(diff: []const u8, entries: []DigestEntry) [64]u8 {
-    std.mem.sort(DigestEntry, entries, {}, struct {
-        fn lessThan(_: void, left: DigestEntry, right: DigestEntry) bool {
-            return std.mem.order(u8, left.path, right.path) == .lt;
-        }
-    }.lessThan);
-    var hash = Sha256.init(.{});
-    hash.update("metask-agentcore-dirty-v1\x00diff\x00");
-    hash.update(diff);
-    for (entries) |entry| {
-        hash.update("\x00untracked\x00");
-        hash.update(entry.path);
-        hash.update("\x00");
-        hash.update(&entry.digest);
-    }
-    var digest: [32]u8 = undefined;
-    hash.final(&digest);
-    return std.fmt.bytesToHex(digest, .lower);
 }
 
 fn writeAtomic(io: std.Io, path: []const u8, bytes: []const u8) !void {
@@ -436,44 +355,6 @@ fn isLowerHex(bytes: []const u8) bool {
     return true;
 }
 
-test "dirty source digest is stable across untracked input order" {
-    const first_digest = [_]u8{1} ** 32;
-    const second_digest = [_]u8{2} ** 32;
-    var forward = [_]DigestEntry{
-        .{ .path = "z-last.txt", .digest = second_digest },
-        .{ .path = "a-first.txt", .digest = first_digest },
-    };
-    var reverse = [_]DigestEntry{
-        .{ .path = "a-first.txt", .digest = first_digest },
-        .{ .path = "z-last.txt", .digest = second_digest },
-    };
-    try std.testing.expectEqualSlices(u8, &dirtySourceDigest("diff", &forward), &dirtySourceDigest("diff", &reverse));
-}
-
-test "dirty source digest separates paths and contents" {
-    const digest = [_]u8{7} ** 32;
-    var left = [_]DigestEntry{.{ .path = "ab", .digest = digest }};
-    var right = [_]DigestEntry{.{ .path = "a", .digest = digest }};
-    try std.testing.expect(!std.mem.eql(u8, &dirtySourceDigest("c", &left), &dirtySourceDigest("bc", &right)));
-}
-
-test "bundle exclusion accepts Windows separators and rejects outside paths" {
-    const allocator = std.testing.allocator;
-    const repo_root = if (builtin.os.tag == .windows) "C:\\repo" else "/repo";
-    const bundle_root = if (builtin.os.tag == .windows)
-        "C:\\repo\\zig-out\\agentcore\\x86_64-windows-gnu"
-    else
-        "/repo/zig-out/agentcore/x86_64-windows-gnu";
-    const outside_root = if (builtin.os.tag == .windows) "D:\\release" else "/release";
-    const inside = try bundleExcludePathspec(allocator, repo_root, bundle_root);
-    defer allocator.free(inside.?);
-    try std.testing.expectEqualStrings(
-        ":(top,exclude)zig-out/agentcore/x86_64-windows-gnu/**",
-        inside.?,
-    );
-    try std.testing.expect((try bundleExcludePathspec(allocator, repo_root, outside_root)) == null);
-}
-
 test "strict boolean parser" {
     try std.testing.expectEqual(true, parseBool("true").?);
     try std.testing.expectEqual(false, parseBool("false").?);
@@ -485,7 +366,6 @@ test "package version is derived from sdk version and source identity" {
     const clean = SourceIdentity{
         .commit = "0123456789abcdef0123456789abcdef01234567",
         .dirty = false,
-        .dirty_digest = [_]u8{'0'} ** 64,
     };
     const clean_version = try packageVersion(allocator, "0.1.0-dev", clean);
     defer allocator.free(clean_version);
@@ -497,11 +377,12 @@ test "package version is derived from sdk version and source identity" {
 
     var dirty = clean;
     dirty.dirty = true;
-    dirty.dirty_digest = [_]u8{'a'} ** 64;
     const dirty_version = try packageVersion(allocator, "0.1.0-dev", dirty);
     defer allocator.free(dirty_version);
-    try std.testing.expectEqualStrings("0.1.0-dev+0123456.dirty.aaaaaaaa", dirty_version);
-    try std.testing.expectError(error.DirtyStableVersion, packageVersion(allocator, "0.1.0", dirty));
+    try std.testing.expectEqualStrings("0.1.0-dev+0123456789ab.dirty", dirty_version);
+    const dirty_stable_version = try packageVersion(allocator, "0.1.0", dirty);
+    defer allocator.free(dirty_stable_version);
+    try std.testing.expectEqualStrings("0.1.0", dirty_stable_version);
     try std.testing.expectError(error.InvalidSdkVersion, packageVersion(allocator, "0.1.0+local", clean));
 }
 
@@ -510,23 +391,8 @@ test "generated development versions fit the Zig package limit" {
     const source = SourceIdentity{
         .commit = "0123456789abcdef0123456789abcdef01234567",
         .dirty = true,
-        .dirty_digest = [_]u8{'a'} ** 64,
     };
     const version = try packageVersion(allocator, "0.1.0-dev", source);
     defer allocator.free(version);
     try std.testing.expect(version.len <= 32);
-}
-
-test "stable tag name and commit match are exact" {
-    const allocator = std.testing.allocator;
-    const commit = "0123456789abcdef0123456789abcdef01234567";
-    const tag_ref = try stableTagRef(allocator, "0.1.0");
-    defer allocator.free(tag_ref);
-    try std.testing.expectEqualStrings("refs/tags/agentcore-v0.1.0^{commit}", tag_ref);
-    try validateStableTagCommit(commit, commit);
-    try std.testing.expectError(
-        error.StableTagMismatch,
-        validateStableTagCommit(commit, "1123456789abcdef0123456789abcdef01234567"),
-    );
-    try std.testing.expectError(error.StableTagMismatch, validateStableTagCommit(commit, ""));
 }

@@ -5,7 +5,7 @@
 > 定位：公司内部使用的 AgentCore 原生静态库包
 > 当前 ABI：experimental v1 revision 3，短期内不冻结
 
-TinyKG 根任务 `438` 及其 DAG 是实施计划、进度和验收的唯一真源；本文件只同步已确认的目标态，不反向覆盖 TinyKG。代码层面的当前 ABI 契约以 [AGENTCORE_BINARY_ABI.md](./AGENTCORE_BINARY_ABI.md) 为准，落地时必须同步更新该文档。
+代码层面的当前 ABI 契约以 [AGENTCORE_BINARY_ABI.md](./AGENTCORE_BINARY_ABI.md) 为准，落地时必须同步更新该文档。
 
 ## 1. 范围
 
@@ -47,6 +47,7 @@ MC_STATUS_OK                -> METASK_AGENTCORE_STATUS_OK
 ```
 
 ABI 尚未正式发布，不保留旧名称兼容别名。公共产物中不得残留 `metacodes_agentcore_*`、`mc_*`、`MC_*` 或重复的 `metask_agentcore_agentcore_*`。
+旧 Header、bindings 或目录布局不属于兼容范围。消费者只认当前 manifest 白名单，归档也只收录该白名单；本地 staging 目录中的其他文件只是无效残留，不触发兼容逻辑，也不会进入产物。
 
 ## 3. 语言支持
 
@@ -93,6 +94,7 @@ metask-agentcore-<version>-<target>/
 |   `-- rust/
 |       |-- Cargo.toml
 |       |-- Cargo.lock
+|       |-- link.cfg
 |       |-- build.rs
 |       |-- examples/
 |       |   `-- link_probe.rs
@@ -105,9 +107,9 @@ metask-agentcore-<version>-<target>/
 
 `bindings/zig` 和 `bindings/rust` 各自是完整语言包根目录。内部源码仍保留 `src/agentcore/` 和 `sdk/`，由 `build.zig` 映射到上述导出结构，不为了打包搬动实现目录。
 
-Rust 包的 `Cargo.toml` 设置 `links = "metask_agentcore"`。`build.rs` 默认以 `CARGO_MANIFEST_DIR/../..` 为 bundle root，也允许 `METASK_AGENTCORE_BUNDLE_DIR` 覆盖；它从 `<bundle-root>/lib` 找静态库，将 Cargo `TARGET` 与同包 manifest 的 `target.rust_target` 比较，然后发出 static link 指令。路径缺失或 target 不匹配时必须失败。
+Rust 包的 `Cargo.toml` 设置 `links = "metask_agentcore"`。`build.rs` 默认以 `CARGO_MANIFEST_DIR/../..` 为 bundle root，也允许 `METASK_AGENTCORE_BUNDLE_DIR` 覆盖；它从 `<bundle-root>/lib` 找静态库，并读取构建时从 manifest 链接信息投影出的 `link.cfg`。`link.cfg` 使用简单行格式记录 Cargo target、系统库和 framework，不在 `build.rs` 中手写 JSON parser。路径缺失或 target 不匹配时必须失败。
 
-Zig 包的 `build.zig` 同样读取同包 manifest，将消费端 resolved target 与 `target.zig_target` 比较；target 不匹配时必须在链接前失败。
+Zig 包的 `build.zig` 同样读取同包 manifest，比较消费端与 bundle 的 architecture、OS 和 ABI；不要求 deployment target 或版本范围逐字符相同。三者不匹配时必须在链接前失败。
 
 Windows `.lib` 必须是包含实现 object 的完整 static archive，不是 DLL import library。静态 AgentCore 库仍可依赖系统 C runtime、系统库或 macOS framework，并在 manifest 中声明。
 
@@ -137,7 +139,7 @@ Windows `.lib` 必须是包含实现 object 的完整 static archive，不是 DL
 | `x86_64-macos` | cross bundle/link、tar.gz、SHA-256 已验证 | 待 macOS x86_64 原生 gate，不标记可用 |
 | `aarch64-macos` | cross bundle/link、tar.gz、SHA-256 已验证 | 当前 Rust bundle 变更后待 macOS arm64 原生复验，不标记可用 |
 
-这里的状态是当前代码证据投影；任务进度仍以 TinyKG 为准。macOS 的 `system_frameworks`
+这里的状态是当前代码证据投影。macOS 的 `system_frameworks`
 当前为空，只表示交叉链接没有发现额外 framework，必须由后续原生 gate 最终确认。
 
 暂不支持 Windows ARM64、Linux ARM64、musl 和 macOS Universal2。
@@ -166,14 +168,14 @@ sdk/VERSION = 0.1.0-dev
 package     = 0.1.0-dev+<commit-short>
 ```
 
-dirty build 必须追加 `.dirty.<digest-short>`。正式内部版本使用纯 SemVer，不追加 commit：
+dirty development build 追加 `.dirty`。正式内部版本使用纯 SemVer，不追加 commit：
 
 ```text
 sdk/VERSION = 0.1.0
 package     = 0.1.0
 ```
 
-完整 commit、dirty 状态和 digest 单独记录在 manifest provenance 中。稳定版 tag 格式为 `agentcore-v<version>`；稳定构建必须 checkout 该 tag 指向的 clean commit，否则失败。同一稳定版本的所有 target 必须从该 commit 构建。发布后，下一次开发应先把 `sdk/VERSION` 改为下一条 `-dev` 版本，禁止生成 `0.1.0+<commit>` 这样的伪稳定版本。
+完整 commit 和 dirty 状态单独记录在 manifest 中。当前 bundle 工具不承担 stable tag、clean-tree 或 expected-commit 发布策略；这些规则在真正建立稳定版发布流程时由发布 CI 统一定义，避免在实验阶段提前固化一套发布系统。
 
 同一包中的 manifest、Zig package、Cargo package、README、目录名和归档名必须使用相同 package version，全部由构建生成或校验。
 
@@ -206,8 +208,7 @@ package     = 0.1.0
   "version": "0.1.0-dev+0123456789ab",
   "source": {
     "commit": "<40-hex>",
-    "dirty": false,
-    "dirty_source_sha256": ""
+    "dirty": false
   },
   "toolchain": {
     "zig_version": "0.16.0"
@@ -238,7 +239,7 @@ package     = 0.1.0
 }
 ```
 
-公共命名迁移是 revision 2 之后的 ABI cut，因此当前值为 revision 3；实际值必须由 ABI 常量生成。`dirty_source_sha256` 在 clean build 中为空。dirty digest 沿用当前 manifest generator 的输入域：对整个 `metacodes/` source tree 执行 `git diff HEAD --binary`，加上按路径排序的 untracked 文件路径及各自内容 SHA-256，排除 bundle 输出后做带域分隔的最终 SHA-256。
+公共命名迁移是 revision 2 之后的 ABI cut，因此当前值为 revision 3；实际值必须由 ABI 常量生成。源码身份只记录 commit 和 dirty 状态，payload 的实际内容由 `files` 中的 SHA-256 描述。
 
 `files` 列出除 `manifest.json` 自身外的所有 payload 文件及 SHA-256。`libc` 不作为伪库名写进 `system_libraries`；用 `requires_c_runtime` 表达语义。
 

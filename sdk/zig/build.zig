@@ -4,7 +4,11 @@ const Manifest = struct {
     schema_version: u32,
     vendor: []const u8,
     name: []const u8,
-    target: struct { zig_target: []const u8 },
+    target: struct {
+        architecture: []const u8,
+        os: []const u8,
+        abi: []const u8,
+    },
     link: struct {
         requires_c_runtime: bool,
         system_libraries: []const []const u8,
@@ -31,11 +35,27 @@ pub fn build(b: *std.Build) void {
     validateManifestIdentity(parsed.value.schema_version, parsed.value.vendor, parsed.value.name) catch
         @panic("unexpected AgentCore bundle manifest identity");
 
-    const resolved_target = target.result.zigTriple(b.allocator) catch @panic("OOM");
-    validateTarget(resolved_target, parsed.value.target.zig_target) catch
+    const consumer_arch = @tagName(target.result.cpu.arch);
+    const consumer_os = @tagName(target.result.os.tag);
+    const consumer_abi = @tagName(target.result.abi);
+    validateTarget(
+        consumer_arch,
+        consumer_os,
+        consumer_abi,
+        parsed.value.target.architecture,
+        parsed.value.target.os,
+        parsed.value.target.abi,
+    ) catch
         std.debug.panic(
-            "AgentCore bundle target mismatch: consumer={s}, bundle={s}",
-            .{ resolved_target, parsed.value.target.zig_target },
+            "AgentCore bundle target mismatch: consumer={s}-{s}-{s}, bundle={s}-{s}-{s}",
+            .{
+                consumer_arch,
+                consumer_os,
+                consumer_abi,
+                parsed.value.target.architecture,
+                parsed.value.target.os,
+                parsed.value.target.abi,
+            },
         );
 
     const library_file = if (target.result.os.tag == .windows)
@@ -85,8 +105,18 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&check_exe.step);
 }
 
-fn validateTarget(consumer: []const u8, bundle: []const u8) error{TargetMismatch}!void {
-    if (!std.mem.eql(u8, consumer, bundle)) return error.TargetMismatch;
+fn validateTarget(
+    consumer_arch: []const u8,
+    consumer_os: []const u8,
+    consumer_abi: []const u8,
+    bundle_arch: []const u8,
+    bundle_os: []const u8,
+    bundle_abi: []const u8,
+) error{TargetMismatch}!void {
+    if (!std.mem.eql(u8, consumer_arch, bundle_arch) or
+        !std.mem.eql(u8, consumer_os, bundle_os) or
+        !std.mem.eql(u8, consumer_abi, bundle_abi))
+        return error.TargetMismatch;
 }
 
 fn validateManifestIdentity(schema_version: u32, vendor: []const u8, name: []const u8) error{InvalidManifestIdentity}!void {
@@ -94,11 +124,11 @@ fn validateManifestIdentity(schema_version: u32, vendor: []const u8, name: []con
         return error.InvalidManifestIdentity;
 }
 
-test "bundle target requires exact resolved Zig target" {
-    try validateTarget("x86_64-windows-msvc", "x86_64-windows-msvc");
+test "bundle target requires matching architecture OS and ABI" {
+    try validateTarget("x86_64", "windows", "msvc", "x86_64", "windows", "msvc");
     try std.testing.expectError(
         error.TargetMismatch,
-        validateTarget("x86_64-linux-gnu", "x86_64-windows-msvc"),
+        validateTarget("x86_64", "linux", "gnu", "x86_64", "windows", "msvc"),
     );
 }
 

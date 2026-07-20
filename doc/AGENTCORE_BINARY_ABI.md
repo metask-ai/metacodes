@@ -81,18 +81,15 @@ zig build agentcore:gate \
 run on the current host. They fail during graph construction for a foreign
 target and direct cross-target validation to `agentcore:bundle`.
 
-The final release check must use a new empty prefix and bind the manifest to
-the clean commit being released. For example, on a native macOS arm64 host:
+To keep a validation run isolated from previous output, use a new empty prefix.
+For example, on a native macOS arm64 host:
 
 ```sh
-commit=$(git rev-parse HEAD)
 prefix=$(mktemp -d)
 zig build agentcore:gate --prefix "$prefix" \
   -Dtarget=aarch64-macos.13.0 \
   -Doptimize=ReleaseSafe \
-  -Dagentcore-strip=true \
-  -Dagentcore-require-clean-bundle=true \
-  -Dagentcore-expected-commit="$commit"
+  -Dagentcore-strip=true
 ```
 
 `--prefix /absolute/path` changes the install prefix. The target-specific
@@ -110,6 +107,7 @@ each other:
 ├── bindings/rust/
 │   ├── Cargo.toml
 │   ├── Cargo.lock
+│   ├── link.cfg
 │   ├── build.rs
 │   ├── examples/link_probe.rs
 │   └── src/{lib,raw}.rs
@@ -118,27 +116,37 @@ each other:
 ```
 
 The manifest records vendor/component identity, package and source identity,
-the package target plus exact Zig/Rust targets, optimization and strip
+the package target plus producer Zig and Cargo targets, optimization and strip
 settings, binary ABI status/version/revision, system link requirements, and
-SHA-256 for every shipped file. The source-free consumer validates those fields, applies the
-declared link inputs to every language probe, validates the exact manifest file
-entries, and checks the complete on-disk file/directory allowlist. Bundles
-require an explicit `-Dtarget=<triple>` so an artifact cannot silently inherit
-the build host. Build a distributable bundle into a new empty `--prefix`; a
-clean Git tree does not make a reused output directory free of stale, unlisted
-files.
+SHA-256 for every shipped file. The source-free consumer validates those fields,
+the complete manifest file whitelist, and every declared payload hash, then
+applies the declared link inputs to every language probe. Bundles require an
+explicit `-Dtarget=<triple>` so an artifact cannot silently inherit the build
+host. Files outside the manifest are local staging residue, not compatibility
+surface: consumers ignore them and the archive command never includes them.
 
 `agentcore:bundle` cross-compiles one bundle per explicit target and link-checks
 source-free Zig, C, and C++17 consumers against the installed artifacts. The
 static library filename comes from Zig `out_filename` for that target (`.a` or
-`.lib`) and is recorded in the manifest. `agentcore:consumer` additionally runs
-the resulting programs, while `agentcore:gate` combines that native consumer
-check with the ABI test suite and runs the Rust ABI link probe.
+`.lib`) and is recorded in the manifest. The Windows/MSVC archive also exports
+the `unlink`, `mkdir`, `rmdir`, `access`, `chdir`, and `getcwd` CRT spelling
+shims needed by the current implementation. These six link-visible support
+symbols are not AgentCore ABI entry points and carry no consumer stability
+promise; consumers must not call or otherwise depend on them.
+`agentcore:consumer` additionally runs the resulting programs, while
+`agentcore:gate` combines that native consumer check with the ABI test suite
+and runs the Rust ABI link probe.
 
 `agentcore:rust` builds and links the bundled `metask-agentcore-sys` link probe.
-`agentcore:archive` creates a coordinate-rooted Windows zip or Unix tar.gz and
-an adjacent SHA-256 file; it rejects an existing coordinate instead of
-overwriting it.
+Its `build.rs` reads the generated `link.cfg` line format instead of parsing the
+full bundle manifest; the manifest remains the source of the projected target
+and system-link values.
+The checked-in raw Rust declarations are regenerated with bindgen 0.72.1 using
+the fixed `x86_64-unknown-linux-gnu` Clang layout target and hermetic minimal
+standard-type headers, so regeneration does not inherit the build host target.
+`agentcore:archive` creates a coordinate-rooted Windows zip or Unix tar.gz from
+only the manifest whitelist plus `manifest.json`, and writes an adjacent
+SHA-256 file; it rejects an existing coordinate instead of overwriting it.
 
 Current delivery status is intentionally target-specific:
 

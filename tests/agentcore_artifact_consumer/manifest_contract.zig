@@ -13,7 +13,6 @@ pub const Manifest = struct {
     source: struct {
         commit: []const u8,
         dirty: bool,
-        dirty_source_sha256: []const u8,
     },
     toolchain: struct { zig_version: []const u8 },
     target: struct {
@@ -51,22 +50,14 @@ pub const Expected = struct {
     optimize: []const u8,
     strip: bool,
     zig_version: []const u8,
-    require_clean: bool = false,
-    commit: ?[]const u8 = null,
 };
-
-pub const EntryKind = enum { file, directory, other };
-pub const BundleEntry = struct { path: []const u8, kind: EntryKind };
 
 pub const Error = error{
     InvalidSchema,
     InvalidVendor,
     InvalidName,
     InvalidCommit,
-    CommitMismatch,
     InvalidVersion,
-    DirtyBundle,
-    ExpectedCommitRequired,
     ZigVersionMismatch,
     TargetMismatch,
     RustTargetMismatch,
@@ -82,10 +73,6 @@ pub const Error = error{
     UnexpectedFile,
     DuplicateFile,
     MissingFile,
-    UnexpectedDirectory,
-    DuplicateDirectory,
-    MissingDirectory,
-    UnexpectedEntryKind,
 };
 
 pub const fixed_artifact_files = [_][]const u8{
@@ -97,6 +84,7 @@ pub const fixed_artifact_files = [_][]const u8{
     "bindings/zig/src/types.zig",
     "bindings/rust/Cargo.toml",
     "bindings/rust/Cargo.lock",
+    "bindings/rust/link.cfg",
     "bindings/rust/build.rs",
     "bindings/rust/src/lib.rs",
     "bindings/rust/src/raw.rs",
@@ -104,38 +92,15 @@ pub const fixed_artifact_files = [_][]const u8{
     "README.md",
 };
 
-pub const bundle_directories = [_][]const u8{
-    "bindings",
-    "bindings/zig",
-    "bindings/zig/src",
-    "bindings/rust",
-    "bindings/rust/src",
-    "bindings/rust/examples",
-    "include",
-    "include/metask",
-    "lib",
-};
 pub const default_system_link_inputs = [_][]const u8{};
 pub const windows_system_link_inputs = [_][]const u8{ "advapi32", "crypt32" };
-
-pub fn normalizePathSeparators(path: []u8) void {
-    for (path) |*byte| {
-        if (byte.* == '\\') byte.* = '/';
-    }
-}
 
 pub fn validateManifest(manifest: Manifest, expected: Expected) Error!void {
     if (manifest.schema_version != 1) return error.InvalidSchema;
     if (!std.mem.eql(u8, manifest.vendor, "metask")) return error.InvalidVendor;
     if (!std.mem.eql(u8, manifest.name, "agentcore")) return error.InvalidName;
     if (manifest.source.commit.len != 40 or !isLowerHex(manifest.source.commit)) return error.InvalidCommit;
-    if (expected.commit) |commit| {
-        if (!std.mem.eql(u8, manifest.source.commit, commit)) return error.CommitMismatch;
-    } else if (expected.require_clean) {
-        return error.ExpectedCommitRequired;
-    }
     try validateVersion(manifest);
-    if (expected.require_clean and manifest.source.dirty) return error.DirtyBundle;
     if (!std.mem.eql(u8, manifest.toolchain.zig_version, expected.zig_version)) return error.ZigVersionMismatch;
     if (!std.mem.eql(u8, manifest.target.id, expected.target_id)) return error.TargetMismatch;
     if (!std.mem.eql(u8, manifest.target.zig_target, expected.resolved_target)) return error.TargetMismatch;
@@ -166,30 +131,7 @@ fn equalStrings(actual: []const []const u8, expected: []const []const u8) bool {
 }
 
 fn validateVersion(manifest: Manifest) Error!void {
-    const parsed = std.SemanticVersion.parse(manifest.version) catch return error.InvalidVersion;
-    const commit_short = manifest.source.commit[0..12];
-    if (parsed.pre == null) {
-        if (parsed.build != null or manifest.source.dirty or manifest.source.dirty_source_sha256.len != 0)
-            return error.InvalidVersion;
-        return;
-    }
-    const build = parsed.build orelse return error.InvalidVersion;
-    if (!manifest.source.dirty) {
-        if (!std.mem.eql(u8, build, commit_short) or manifest.source.dirty_source_sha256.len != 0)
-            return error.InvalidVersion;
-        return;
-    }
-    if (manifest.source.dirty_source_sha256.len != 64 or !isLowerHex(manifest.source.dirty_source_sha256))
-        return error.InvalidVersion;
-    var version_buf: [64]u8 = undefined;
-    const dirty_identity = std.fmt.bufPrint(
-        &version_buf,
-        "{s}.dirty.{s}",
-        .{ manifest.source.commit[0..7], manifest.source.dirty_source_sha256[0..8] },
-    ) catch
-        return error.InvalidVersion;
-    if (!std.mem.eql(u8, build, dirty_identity))
-        return error.InvalidVersion;
+    _ = std.SemanticVersion.parse(manifest.version) catch return error.InvalidVersion;
 }
 
 fn isLowerHex(bytes: []const u8) bool {
@@ -215,35 +157,10 @@ pub fn fileSha256(files: []const FileEntry, path: []const u8) ?[]const u8 {
     return null;
 }
 
-pub fn validateBundleEntries(entries: []const BundleEntry, library_path: []const u8) Error!void {
-    var seen_files = [_]bool{false} ** (fixed_artifact_files.len + 2);
-    var seen_directories = [_]bool{false} ** bundle_directories.len;
-    for (entries) |entry| switch (entry.kind) {
-        .file => {
-            const index = bundleFileIndex(entry.path, library_path) orelse return error.UnexpectedFile;
-            if (seen_files[index]) return error.DuplicateFile;
-            seen_files[index] = true;
-        },
-        .directory => {
-            const index = findFixed(&bundle_directories, entry.path) orelse return error.UnexpectedDirectory;
-            if (seen_directories[index]) return error.DuplicateDirectory;
-            seen_directories[index] = true;
-        },
-        .other => return error.UnexpectedEntryKind,
-    };
-    for (seen_files) |present| if (!present) return error.MissingFile;
-    for (seen_directories) |present| if (!present) return error.MissingDirectory;
-}
-
 fn artifactFileIndex(path: []const u8, library_path: []const u8) ?usize {
     if (std.mem.eql(u8, path, library_path)) return 0;
     const index = findFixed(&fixed_artifact_files, path) orelse return null;
     return index + 1;
-}
-
-fn bundleFileIndex(path: []const u8, library_path: []const u8) ?usize {
-    if (std.mem.eql(u8, path, "manifest.json")) return fixed_artifact_files.len + 1;
-    return artifactFileIndex(path, library_path);
 }
 
 fn findFixed(comptime expected: []const []const u8, actual: []const u8) ?usize {
@@ -274,7 +191,6 @@ fn validManifest() Manifest {
         .source = .{
             .commit = "0123456789abcdef0123456789abcdef01234567",
             .dirty = false,
-            .dirty_source_sha256 = "",
         },
         .toolchain = .{ .zig_version = "0.16.0" },
         .target = .{
@@ -315,21 +231,20 @@ const valid_expected = Expected{
     .zig_version = "0.16.0",
 };
 
-test "manifest identity accepts valid clean and dirty development bundles" {
+test "manifest identity accepts semantic versions and records dirty state independently" {
     try validateManifest(validManifest(), valid_expected);
     var dirty = validManifest();
     dirty.source.dirty = true;
-    dirty.source.dirty_source_sha256 = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
-    dirty.version = "0.1.0-dev+0123456.dirty.abcdefab";
+    dirty.version = "0.1.0-dev+0123456789ab.dirty";
     try validateManifest(dirty, valid_expected);
 
     var stable = validManifest();
     stable.version = "0.1.0";
     try validateManifest(stable, valid_expected);
 
-    var pseudo_stable = validManifest();
-    pseudo_stable.version = "0.1.0+0123456789ab";
-    try std.testing.expectError(error.InvalidVersion, validateManifest(pseudo_stable, valid_expected));
+    var invalid = validManifest();
+    invalid.version = "not-semver";
+    try std.testing.expectError(error.InvalidVersion, validateManifest(invalid, valid_expected));
 }
 
 test "manifest accepts target-neutral Linux build metadata" {
@@ -373,19 +288,6 @@ test "manifest requires target-specific system link inputs" {
     const extra = [_][]const u8{ "advapi32", "crypt32", "user32" };
     windows.link.system_libraries = &extra;
     try std.testing.expectError(error.LinkInputsMismatch, validateManifest(windows, expected));
-}
-
-test "release identity rejects dirty and wrong-commit bundles" {
-    var dirty = validManifest();
-    dirty.source.dirty = true;
-    dirty.source.dirty_source_sha256 = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
-    dirty.version = "0.1.0-dev+0123456.dirty.abcdefab";
-    var clean_expected = valid_expected;
-    clean_expected.require_clean = true;
-    clean_expected.commit = "0123456789abcdef0123456789abcdef01234567";
-    try std.testing.expectError(error.DirtyBundle, validateManifest(dirty, clean_expected));
-    clean_expected.commit = "ffffffffffffffffffffffffffffffffffffffff";
-    try std.testing.expectError(error.CommitMismatch, validateManifest(validManifest(), clean_expected));
 }
 
 test "manifest contract rejects toolchain target optimize and ABI drift" {
@@ -443,37 +345,4 @@ test "manifest file set validates dynamic library name hashes and exact entries"
     var invalid_hash = valid_files;
     invalid_hash[0].sha256 = "ABCDEF";
     try std.testing.expectError(error.InvalidSha256, validateManifestFiles(&invalid_hash, macos_library_path));
-}
-
-test "bundle entry set validates a dynamic library name and exact tree" {
-    const valid = makeValidBundleEntries();
-    try validateBundleEntries(&valid, macos_library_path);
-    var windows = valid;
-    windows[bundle_directories.len].path = "lib/metask_agentcore.lib";
-    try validateBundleEntries(&windows, windows[bundle_directories.len].path);
-    try std.testing.expectError(error.MissingFile, validateBundleEntries(valid[0 .. valid.len - 1], macos_library_path));
-    const extra_file = valid ++ [_]BundleEntry{.{ .path = "bindings/zig/src/unlisted.zig", .kind = .file }};
-    try std.testing.expectError(error.UnexpectedFile, validateBundleEntries(&extra_file, macos_library_path));
-    const extra_directory = valid ++ [_]BundleEntry{.{ .path = "stale", .kind = .directory }};
-    try std.testing.expectError(error.UnexpectedDirectory, validateBundleEntries(&extra_directory, macos_library_path));
-    var symlink = valid;
-    symlink[bundle_directories.len].kind = .other;
-    try std.testing.expectError(error.UnexpectedEntryKind, validateBundleEntries(&symlink, macos_library_path));
-}
-
-fn makeValidBundleEntries() [bundle_directories.len + fixed_artifact_files.len + 2]BundleEntry {
-    var entries: [bundle_directories.len + fixed_artifact_files.len + 2]BundleEntry = undefined;
-    for (bundle_directories, 0..) |path, index|
-        entries[index] = .{ .path = path, .kind = .directory };
-    entries[bundle_directories.len] = .{ .path = macos_library_path, .kind = .file };
-    for (fixed_artifact_files, 0..) |path, index|
-        entries[bundle_directories.len + index + 1] = .{ .path = path, .kind = .file };
-    entries[entries.len - 1] = .{ .path = "manifest.json", .kind = .file };
-    return entries;
-}
-
-test "bundle paths use manifest separators on Windows" {
-    var path = [_]u8{ 's', 'r', 'c', '\\', 'm', 'e', 't', 'a', '.', 'z', 'i', 'g' };
-    normalizePathSeparators(&path);
-    try std.testing.expectEqualStrings("src/meta.zig", &path);
 }

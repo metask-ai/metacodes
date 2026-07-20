@@ -2,7 +2,7 @@
 
 > AgentCore 是公司内部使用的独立原生组件，不是 metacodes 产品 API。
 > ABI 的 normative 语义见 `doc/AGENTCORE_BINARY_ABI.md`；目标范围与当前验证状态见
-> `doc/AGENTCORE_NATIVE_SDK_DISTRIBUTION_PLAN.md`。实施进度以 TinyKG 根任务 `438` 为准。
+> `doc/AGENTCORE_NATIVE_SDK_DISTRIBUTION_PLAN.md`。
 
 ## 1. 交付边界
 
@@ -27,14 +27,15 @@ metask-agentcore-<version>-<target>/
 ├── include/metask/agentcore.h
 ├── lib/<target static library>
 ├── bindings/zig/{build.zig,build.zig.zon,src/}
-├── bindings/rust/{Cargo.toml,Cargo.lock,build.rs,examples/,src/}
+├── bindings/rust/{Cargo.toml,Cargo.lock,link.cfg,build.rs,examples/,src/}
 ├── README.md
 └── manifest.json
 ```
 
 Windows 使用 `metask_agentcore.lib`；Linux/macOS 使用 `libmetask_agentcore.a`。
-`manifest.json` 记录独立 package version、源码身份、精确 Zig/Rust target、ABI、链接输入和
-每个 payload 文件的 SHA-256。消费门禁拒绝缺失、多余、hash 不符或 target 不匹配的包。
+`manifest.json` 记录独立 package version、源码身份、生产端 Zig target、Cargo target、ABI、链接输入和
+每个 payload 文件的 SHA-256。消费门禁拒绝 manifest 清单缺失、重复、含未识别条目、hash
+不符或 target 不匹配的包；磁盘上未列入 manifest 的 staging 残留会被忽略，也不会进入归档。
 
 ## 3. 构建与门禁
 
@@ -63,9 +64,8 @@ zig build agentcore:archive \
   -Dagentcore-archive-dir=<empty-output-directory>
 ```
 
-归档坐标不可覆盖。正式 stable 构建还必须来自 `agentcore-v<version>` 指向的 clean commit，
-并使用 `-Dagentcore-require-clean-bundle=true` 与
-`-Dagentcore-expected-commit=<full-hash>` 绑定源码身份。
+归档坐标不可覆盖。当前工具只生成和校验内部 bundle；稳定版的 tag、clean-tree 和发布身份
+策略留到正式发布流程建立时由 CI 统一定义。
 
 ## 4. 消费入口
 

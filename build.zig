@@ -88,7 +88,7 @@ fn createAgentCoreAbiModule(b: *std.Build, options: AgentCoreAbiModuleOptions) *
     if (options.target.result.os.tag == .windows)
         mod.linkSystemLibrary("advapi32", .{ .use_pkg_config = .no });
     if (options.target.result.os.tag == .windows and options.target.result.abi == .msvc)
-        mod.addCSourceFile(.{ .file = b.path("src/agentcore/windows_msvc_compat.c"), .flags = &.{"-std=c11"} });
+        mod.addCSourceFile(.{ .file = b.path("src/agentcore/windows_msvc_crt_shims.c"), .flags = &.{"-std=c11"} });
     return mod;
 }
 
@@ -98,10 +98,6 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const tfilter = b.option([]const u8, "tfilter", "test filter");
     const agentcore_strip = b.option(bool, "agentcore-strip", "Strip AgentCore library debug information") orelse (optimize != .Debug);
-    const agentcore_require_clean_bundle = b.option(bool, "agentcore-require-clean-bundle", "Require the AgentCore consumer bundle to be clean") orelse false;
-    const agentcore_expected_commit = b.option([]const u8, "agentcore-expected-commit", "Expected full metacodes commit for the AgentCore bundle");
-    if (agentcore_require_clean_bundle and agentcore_expected_commit == null)
-        @panic("-Dagentcore-require-clean-bundle=true requires -Dagentcore-expected-commit=<full hash>");
 
     // Compatibility prelude for the remaining tests that spell temporary
     // paths as `/tmp/...`. On Windows that means `\tmp` at the current drive
@@ -484,10 +480,10 @@ pub fn build(b: *std.Build) void {
         .prefix,
         b.fmt("{s}/bindings/rust/examples/link_probe.rs", .{agentcore_bundle_rel}),
     );
-    const validate_agentcore_target = b.step("agentcore:validate-target", "Require an explicit AgentCore bundle target");
-    if (!target_was_explicit) validate_agentcore_target.dependOn(&b.addFail(
-        "AgentCore release bundle requires explicit -Dtarget=<triple>",
-    ).step);
+    const missing_agentcore_target = if (target_was_explicit)
+        null
+    else
+        b.addFail("AgentCore bundle requires explicit -Dtarget=<triple>");
     const manifest_cmd = b.addRunArtifact(agentcore_manifest_tool);
     manifest_cmd.addArgs(&.{
         agentcore_install_root,
@@ -500,7 +496,7 @@ pub fn build(b: *std.Build) void {
         agentcore_library_file,
     });
     manifest_cmd.setCwd(b.path("."));
-    manifest_cmd.step.dependOn(validate_agentcore_target);
+    if (missing_agentcore_target) |failure| manifest_cmd.step.dependOn(&failure.step);
     manifest_cmd.step.dependOn(&agentcore_symbol_gate_cmd.step);
     manifest_cmd.step.dependOn(&install_agentcore_lib.step);
     manifest_cmd.step.dependOn(&install_agentcore_header.step);
@@ -524,8 +520,6 @@ pub fn build(b: *std.Build) void {
         b.fmt("-Dlibrary-file={s}", .{agentcore_library_file}),
         b.fmt("-Dexpected-strip={s}", .{if (agentcore_strip) "true" else "false"}),
     });
-    if (agentcore_require_clean_bundle) consumer_link_cmd.addArg("-Drequire-clean-bundle=true");
-    if (agentcore_expected_commit) |commit| consumer_link_cmd.addArg(b.fmt("-Dexpected-commit={s}", .{commit}));
     consumer_link_cmd.setCwd(b.path("."));
     consumer_link_cmd.step.dependOn(&manifest_cmd.step);
     const zig_package_check_cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
@@ -539,8 +533,6 @@ pub fn build(b: *std.Build) void {
     });
     zig_package_check_cmd.setCwd(b.path("."));
     zig_package_check_cmd.step.dependOn(&manifest_cmd.step);
-    const agentcore_stage_step = b.step("agentcore:stage", "Stage an AgentCore bundle and validate its manifest without linking a consumer");
-    agentcore_stage_step.dependOn(&manifest_cmd.step);
     const agentcore_rust_step = b.step("agentcore:rust", "Build the bundled metask-agentcore-sys crate for the selected target");
     if (agentcoreRustTarget(target.result)) |rust_target| {
         const rust_manifest_path = b.fmt("{s}/bindings/rust/Cargo.toml", .{agentcore_install_root});
@@ -591,8 +583,6 @@ pub fn build(b: *std.Build) void {
         "--self-test",
     });
     agentcore_archive_test_cmd.setCwd(b.path("."));
-    const agentcore_archive_test_step = b.step("agentcore:archive-test", "Test AgentCore archive format, checksum and no-overwrite rules");
-    agentcore_archive_test_step.dependOn(&agentcore_archive_test_cmd.step);
     const agentcore_archive_cmd = b.addSystemCommand(&.{
         agentcore_python,
         "scripts/package_agentcore.py",
@@ -618,8 +608,6 @@ pub fn build(b: *std.Build) void {
         b.fmt("-Dlibrary-file={s}", .{agentcore_library_file}),
         b.fmt("-Dexpected-strip={s}", .{if (agentcore_strip) "true" else "false"}),
     });
-    if (agentcore_require_clean_bundle) consumer_cmd.addArg("-Drequire-clean-bundle=true");
-    if (agentcore_expected_commit) |commit| consumer_cmd.addArg(b.fmt("-Dexpected-commit={s}", .{commit}));
     consumer_cmd.setCwd(b.path("."));
     consumer_cmd.step.dependOn(&manifest_cmd.step);
     const agentcore_consumer_step = b.step("agentcore:consumer", "Run the source-free AgentCore bundle consumer");

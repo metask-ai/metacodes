@@ -1,8 +1,9 @@
 /*
  * Zig's Windows/MSVC libc exposes the underscored UCRT entry points, while
- * parts of metacodes-core intentionally retain POSIX spellings. Keep those
- * aliases private to the static archive instead of forcing every consumer to
- * locate a Visual C++ oldnames library.
+ * parts of metacodes-core intentionally retain POSIX spellings. Export these
+ * six CRT spelling shims from the MSVC archive so consumers do not need a
+ * Visual C++ oldnames library. They are link-visible support symbols, not
+ * AgentCore ABI entry points; consumers must not depend on them.
  */
 #include <limits.h>
 #include <stddef.h>

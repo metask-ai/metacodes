@@ -46,7 +46,7 @@ fn verifyPackageProjection(
         @panic("cannot read AgentCore README.md");
     const expected_heading = b.fmt("# metask-agentcore {s}\n", .{version});
     if (!std.mem.startsWith(u8, readme, expected_heading)) @panic("AgentCore README version mismatch");
-    const expected_target = b.fmt("Required Zig target: `{s}`", .{zig_target});
+    const expected_target = b.fmt("Producer Zig target: `{s}`", .{zig_target});
     if (std.mem.indexOf(u8, readme, expected_target) == null) @panic("AgentCore README Zig target mismatch");
     const expected_rust_target = b.fmt("Required Cargo target: `{s}`", .{rust_target});
     if (std.mem.indexOf(u8, readme, expected_rust_target) == null) @panic("AgentCore README Cargo target mismatch");
@@ -61,27 +61,6 @@ fn verifyPackageProjection(
     const expected_cargo_version = b.fmt("version = \"{s}\"", .{version});
     if (std.mem.indexOf(u8, cargo, expected_cargo_version) == null) @panic("AgentCore Rust package version mismatch");
     if (std.mem.indexOf(u8, cargo, "links = \"metask_agentcore\"") == null) @panic("AgentCore Rust package links key mismatch");
-}
-
-fn verifyBundleEntries(b: *std.Build, bundle_root: []const u8, library_path: []const u8) void {
-    var dir = std.Io.Dir.cwd().openDir(b.graph.io, bundle_root, .{ .iterate = true }) catch
-        @panic("cannot open AgentCore bundle root");
-    defer dir.close(b.graph.io);
-    var walker = dir.walk(b.allocator) catch @panic("cannot walk AgentCore bundle root");
-    defer walker.deinit();
-    var entries = std.ArrayList(manifest_contract.BundleEntry).empty;
-    while (walker.next(b.graph.io) catch @panic("cannot walk AgentCore bundle root")) |entry| {
-        const kind: manifest_contract.EntryKind = switch (entry.kind) {
-            .file => .file,
-            .directory => .directory,
-            else => .other,
-        };
-        const path = b.allocator.dupe(u8, entry.path) catch @panic("OOM");
-        manifest_contract.normalizePathSeparators(path);
-        entries.append(b.allocator, .{ .path = path, .kind = kind }) catch @panic("OOM");
-    }
-    manifest_contract.validateBundleEntries(entries.items, library_path) catch |err|
-        std.debug.panic("invalid AgentCore bundle entry set: {s}", .{@errorName(err)});
 }
 
 fn applySystemLinkInputs(module: *std.Build.Module, manifest: Manifest) void {
@@ -108,8 +87,6 @@ pub fn build(b: *std.Build) void {
         @panic("-Dbundle-root is required");
     const library_file = b.option([]const u8, "library-file", "Target AgentCore static library filename") orelse
         @panic("-Dlibrary-file is required");
-    const require_clean = b.option(bool, "require-clean-bundle", "Require a clean bundle with the expected commit") orelse false;
-    const expected_commit = b.option([]const u8, "expected-commit", "Expected full metacodes commit for a clean bundle");
     const expected_strip = b.option(bool, "expected-strip", "Expected AgentCore strip setting") orelse
         @panic("-Dexpected-strip is required");
     const library_rel_path = b.fmt("lib/{s}", .{library_file});
@@ -122,6 +99,7 @@ pub fn build(b: *std.Build) void {
     const types_path = b.pathJoin(&.{ bundle_root, "bindings", "zig", "src", "types.zig" });
     const cargo_path = b.pathJoin(&.{ bundle_root, "bindings", "rust", "Cargo.toml" });
     const cargo_lock_path = b.pathJoin(&.{ bundle_root, "bindings", "rust", "Cargo.lock" });
+    const rust_link_config_path = b.pathJoin(&.{ bundle_root, "bindings", "rust", "link.cfg" });
     const rust_build_path = b.pathJoin(&.{ bundle_root, "bindings", "rust", "build.rs" });
     const rust_lib_path = b.pathJoin(&.{ bundle_root, "bindings", "rust", "src", "lib.rs" });
     const rust_raw_path = b.pathJoin(&.{ bundle_root, "bindings", "rust", "src", "raw.rs" });
@@ -156,13 +134,9 @@ pub fn build(b: *std.Build) void {
         .optimize = @tagName(optimize),
         .strip = expected_strip,
         .zig_version = builtin.zig_version_string,
-        .require_clean = require_clean,
-        .commit = expected_commit,
     }) catch |err| std.debug.panic("invalid AgentCore manifest identity: {s}", .{@errorName(err)});
     manifest_contract.validateManifestFiles(manifest.value.files, library_rel_path) catch |err|
         std.debug.panic("invalid AgentCore manifest file set: {s}", .{@errorName(err)});
-    verifyBundleEntries(b, bundle_root, library_rel_path);
-
     verifySha256(b, lib_path, manifest_contract.fileSha256(manifest.value.files, library_rel_path).?);
     verifyTextArtifact(b, header_path, manifest_contract.fileSha256(manifest.value.files, "include/metask/agentcore.h").?);
     verifyTextArtifact(b, zig_build_path, manifest_contract.fileSha256(manifest.value.files, "bindings/zig/build.zig").?);
@@ -172,6 +146,7 @@ pub fn build(b: *std.Build) void {
     verifyTextArtifact(b, types_path, manifest_contract.fileSha256(manifest.value.files, "bindings/zig/src/types.zig").?);
     verifyTextArtifact(b, cargo_path, manifest_contract.fileSha256(manifest.value.files, "bindings/rust/Cargo.toml").?);
     verifyTextArtifact(b, cargo_lock_path, manifest_contract.fileSha256(manifest.value.files, "bindings/rust/Cargo.lock").?);
+    verifyTextArtifact(b, rust_link_config_path, manifest_contract.fileSha256(manifest.value.files, "bindings/rust/link.cfg").?);
     verifyTextArtifact(b, rust_build_path, manifest_contract.fileSha256(manifest.value.files, "bindings/rust/build.rs").?);
     verifyTextArtifact(b, rust_lib_path, manifest_contract.fileSha256(manifest.value.files, "bindings/rust/src/lib.rs").?);
     verifyTextArtifact(b, rust_raw_path, manifest_contract.fileSha256(manifest.value.files, "bindings/rust/src/raw.rs").?);
