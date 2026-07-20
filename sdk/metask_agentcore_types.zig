@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 2;
+pub const ABI_REVISION: u32 = 3;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 2 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 3 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {

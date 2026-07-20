@@ -57,10 +57,10 @@ pub fn build(b: *std.Build) void {
         @panic("-Dexpected-strip is required");
     const library_rel_path = b.fmt("lib/{s}", .{library_file});
     const lib_path = b.pathJoin(&.{ bundle_root, "lib", library_file });
-    const header_path = b.pathJoin(&.{ bundle_root, "include", "metacodes_agentcore.h" });
-    const sdk_path = b.pathJoin(&.{ bundle_root, "sdk", "metacodes_agentcore.zig" });
-    const protocol_path = b.pathJoin(&.{ bundle_root, "sdk", "metacodes_agentcore_protocol.zig" });
-    const types_path = b.pathJoin(&.{ bundle_root, "sdk", "metacodes_agentcore_types.zig" });
+    const header_path = b.pathJoin(&.{ bundle_root, "include", "metask_agentcore.h" });
+    const sdk_path = b.pathJoin(&.{ bundle_root, "sdk", "metask_agentcore.zig" });
+    const protocol_path = b.pathJoin(&.{ bundle_root, "sdk", "metask_agentcore_protocol.zig" });
+    const types_path = b.pathJoin(&.{ bundle_root, "sdk", "metask_agentcore_types.zig" });
     const manifest_path = b.pathJoin(&.{ bundle_root, "manifest.json" });
     const manifest_bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, manifest_path, b.allocator, .limited(1024 * 1024)) catch
         @panic("cannot read AgentCore manifest.json");
@@ -87,23 +87,23 @@ pub fn build(b: *std.Build) void {
     verifyBundleEntries(b, bundle_root, library_rel_path);
 
     verifySha256(b, lib_path, manifest_contract.fileSha256(manifest.value.files, library_rel_path).?);
-    verifySha256(b, header_path, manifest_contract.fileSha256(manifest.value.files, "include/metacodes_agentcore.h").?);
-    verifySha256(b, sdk_path, manifest_contract.fileSha256(manifest.value.files, "sdk/metacodes_agentcore.zig").?);
-    verifySha256(b, protocol_path, manifest_contract.fileSha256(manifest.value.files, "sdk/metacodes_agentcore_protocol.zig").?);
-    verifySha256(b, types_path, manifest_contract.fileSha256(manifest.value.files, "sdk/metacodes_agentcore_types.zig").?);
+    verifySha256(b, header_path, manifest_contract.fileSha256(manifest.value.files, "include/metask_agentcore.h").?);
+    verifySha256(b, sdk_path, manifest_contract.fileSha256(manifest.value.files, "sdk/metask_agentcore.zig").?);
+    verifySha256(b, protocol_path, manifest_contract.fileSha256(manifest.value.files, "sdk/metask_agentcore_protocol.zig").?);
+    verifySha256(b, types_path, manifest_contract.fileSha256(manifest.value.files, "sdk/metask_agentcore_types.zig").?);
 
     const types = b.createModule(.{ .root_source_file = .{ .cwd_relative = types_path }, .target = target, .optimize = optimize });
     const protocol = b.createModule(.{ .root_source_file = .{ .cwd_relative = protocol_path }, .target = target, .optimize = optimize });
     const sdk = b.createModule(.{ .root_source_file = .{ .cwd_relative = sdk_path }, .target = target, .optimize = optimize });
-    sdk.addImport("metacodes_agentcore_types", types);
-    sdk.addImport("metacodes_agentcore_protocol", protocol);
+    sdk.addImport("metask_agentcore_types", types);
+    sdk.addImport("metask_agentcore_protocol", protocol);
 
     const zig_link_probe = b.createModule(.{
         .root_source_file = b.path("link_probe.zig"),
         .target = target,
         .optimize = optimize,
     });
-    zig_link_probe.addImport("metacodes_agentcore", sdk);
+    zig_link_probe.addImport("metask_agentcore", sdk);
     zig_link_probe.addObjectFile(.{ .cwd_relative = lib_path });
     applySystemLinkInputs(zig_link_probe, manifest.value.contract.required_system_link_inputs);
     const zig_link_exe = b.addExecutable(.{ .name = "agentcore-artifact-zig-link-probe", .root_module = zig_link_probe });
@@ -134,7 +134,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    app.addImport("metacodes_agentcore", sdk);
+    app.addImport("metask_agentcore", sdk);
     app.addObjectFile(.{ .cwd_relative = lib_path });
     applySystemLinkInputs(app, manifest.value.contract.required_system_link_inputs);
     const exe = b.addExecutable(.{ .name = "agentcore-artifact-consumer", .root_module = app });

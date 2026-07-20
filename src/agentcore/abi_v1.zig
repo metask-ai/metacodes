@@ -3,7 +3,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const sync = @import("platform").sync;
-const wire = @import("metacodes_agentcore_types");
+const wire = @import("metask_agentcore_types");
 const core = @import("metacodes-core");
 const ui_request = core.protocol.ui_request;
 pub const protocol_v1 = @import("protocol_v1.zig");
@@ -707,14 +707,14 @@ const api_v1 = wire.ApiV1{
     .reserved = [_]u64{0} ** 4,
 };
 
-pub export fn metacodes_agentcore_get_api(requested_abi: u32) callconv(.c) ?*const anyopaque {
+pub export fn metask_agentcore_get_api(requested_abi: u32) callconv(.c) ?*const anyopaque {
     if (requested_abi != wire.ABI_VERSION_V1) return null;
     return @ptrCast(&api_v1);
 }
 
 test "ABI discovery is versioned" {
-    try std.testing.expect(metacodes_agentcore_get_api(0) == null);
-    const raw = metacodes_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    try std.testing.expect(metask_agentcore_get_api(0) == null);
+    const raw = metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api: *const wire.ApiV1 = @ptrCast(@alignCast(raw));
     try std.testing.expectEqual(wire.REQUIRED_CAPABILITIES_V1, api.capabilities);
 }

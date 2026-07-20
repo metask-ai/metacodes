@@ -1,12 +1,12 @@
-#include "metacodes_agentcore.h"
+#include "metask_agentcore.h"
 
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(MC_CALLBACK_CONTINUE) || defined(MC_CALLBACK_FATAL)
-#error "revision 2 must not retain pre-revision callback aliases"
+#if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
+#error "revision 3 must not retain pre-revision callback aliases"
 #endif
 
 #ifdef _WIN32
@@ -246,16 +246,16 @@ static void stop_server(struct test_server *server) {
 }
 
 static unsigned event_calls = 0;
-static mc_session *registered_session = NULL;
+static metask_agentcore_session *registered_session = NULL;
 static uint64_t active_run_id = 0;
-static uint8_t bound_session_id[MC_MAX_SESSION_ID_BYTES_V1];
+static uint8_t bound_session_id[METASK_AGENTCORE_MAX_SESSION_ID_BYTES_V1];
 static size_t bound_session_id_len = 0;
 
-static int accept_run_context(const mc_run_context_v1 *run) {
+static int accept_run_context(const metask_agentcore_run_context_v1 *run) {
     if (run == NULL || run->struct_size != sizeof(*run) || run->reserved0 != 0 ||
         run->session != registered_session || run->run_id != active_run_id ||
         run->session_id.ptr == NULL || run->session_id.len == 0 ||
-        run->session_id.len > MC_MAX_SESSION_ID_BYTES_V1 ||
+        run->session_id.len > METASK_AGENTCORE_MAX_SESSION_ID_BYTES_V1 ||
         run->reserved[0] != 0 || run->reserved[1] != 0) {
         return 0;
     }
@@ -269,40 +269,40 @@ static int accept_run_context(const mc_run_context_v1 *run) {
            memcmp(bound_session_id, run->session_id.ptr, len) == 0;
 }
 
-static uint32_t on_event(void *ctx, const mc_run_context_v1 *run,
-                         mc_bytes_view_v1 event_json) {
+static uint32_t on_event(void *ctx, const metask_agentcore_run_context_v1 *run,
+                         metask_agentcore_bytes_view_v1 event_json) {
     (void)ctx;
     if (accept_run_context(run) && event_json.ptr != NULL && event_json.len != 0) {
         event_calls++;
-        return MC_EVENT_CONTINUE;
+        return METASK_AGENTCORE_EVENT_CONTINUE;
     }
-    return MC_EVENT_FATAL;
+    return METASK_AGENTCORE_EVENT_FATAL;
 }
 
-static mc_bytes_view_v1 view(const char *text) {
-    mc_bytes_view_v1 out;
+static metask_agentcore_bytes_view_v1 view(const char *text) {
+    metask_agentcore_bytes_view_v1 out;
     out.ptr = (const uint8_t *)text;
     out.len = (uint64_t)strlen(text);
     return out;
 }
 
-static int release_error(const mc_agentcore_api_v1 *api,
-                         mc_owned_bytes_v1 *diagnostic,
+static int release_error(const metask_agentcore_api_v1 *api,
+                         metask_agentcore_owned_bytes_v1 *diagnostic,
                          int code) {
     api->buffer_release(diagnostic);
     return code;
 }
 
 int main(void) {
-    const mc_agentcore_api_v1 *api =
-        (const mc_agentcore_api_v1 *)metacodes_agentcore_get_api(MC_AGENTCORE_ABI_V1);
+    const metask_agentcore_api_v1 *api =
+        (const metask_agentcore_api_v1 *)metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1);
     if (api == NULL || api->struct_size != sizeof(*api) ||
-        api->abi_version != MC_AGENTCORE_ABI_V1) {
+        api->abi_version != METASK_AGENTCORE_ABI_V1) {
         return 10;
     }
-    if (api->abi_revision != MC_AGENTCORE_ABI_REVISION || api->reserved0 != 0 ||
-        (api->capabilities & MC_REQUIRED_CAPABILITIES_V1) !=
-            MC_REQUIRED_CAPABILITIES_V1 ||
+    if (api->abi_revision != METASK_AGENTCORE_ABI_REVISION || api->reserved0 != 0 ||
+        (api->capabilities & METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1) !=
+            METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1 ||
         api->runtime_create == NULL || api->runtime_destroy == NULL ||
         api->session_create == NULL || api->session_destroy == NULL ||
         api->session_run == NULL || api->session_abort == NULL ||
@@ -314,15 +314,15 @@ int main(void) {
             return 10;
         }
     }
-    if (metacodes_agentcore_get_api(MC_AGENTCORE_ABI_V1 + 1) != NULL) {
+    if (metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1 + 1) != NULL) {
         return 11;
     }
 
-    mc_owned_bytes_v1 diagnostic = {0};
-    mc_runtime_config_v1 runtime_config = {0};
+    metask_agentcore_owned_bytes_v1 diagnostic = {0};
+    metask_agentcore_runtime_config_v1 runtime_config = {0};
     runtime_config.struct_size = sizeof(runtime_config);
-    mc_runtime *runtime = NULL;
-    if (api->runtime_create(&runtime_config, &runtime, &diagnostic) != MC_STATUS_OK ||
+    metask_agentcore_runtime *runtime = NULL;
+    if (api->runtime_create(&runtime_config, &runtime, &diagnostic) != METASK_AGENTCORE_STATUS_OK ||
         runtime == NULL) {
         return release_error(api, &diagnostic, 12);
     }
@@ -341,23 +341,23 @@ int main(void) {
     snprintf(base_url, sizeof(base_url), "http://127.0.0.1:%u/v1/messages",
              (unsigned)server.port);
 
-    mc_session_callbacks_v1 callbacks = {0};
+    metask_agentcore_session_callbacks_v1 callbacks = {0};
     callbacks.struct_size = sizeof(callbacks);
     callbacks.on_event = on_event;
-    mc_session_config_v1 session_config = {0};
+    metask_agentcore_session_config_v1 session_config = {0};
     session_config.struct_size = sizeof(session_config);
-    session_config.provider_kind_code = MC_PROVIDER_ANTHROPIC;
-    session_config.permission_mode_code = MC_PERMISSION_BYPASS;
-    session_config.shell_policy_code = MC_SHELL_DISABLED;
+    session_config.provider_kind_code = METASK_AGENTCORE_PROVIDER_ANTHROPIC;
+    session_config.permission_mode_code = METASK_AGENTCORE_PERMISSION_BYPASS;
+    session_config.shell_policy_code = METASK_AGENTCORE_SHELL_DISABLED;
     session_config.api_key = view("c-consumer-key");
     session_config.model = view("c-consumer-model");
     session_config.base_url = view(base_url);
     session_config.workspace_root = view(cwd);
     session_config.workspace_home = view(cwd);
 
-    mc_session *session = NULL;
+    metask_agentcore_session *session = NULL;
     if (api->session_create(runtime, &session_config, &callbacks, &session,
-                            &diagnostic) != MC_STATUS_OK ||
+                            &diagnostic) != METASK_AGENTCORE_STATUS_OK ||
         session == NULL) {
         api->buffer_release(&diagnostic);
         stop_server(&server);
@@ -367,7 +367,7 @@ int main(void) {
     registered_session = session;
 
     uint32_t busy_status = api->runtime_destroy(runtime, &diagnostic);
-    if (busy_status != MC_STATUS_BUSY ||
+    if (busy_status != METASK_AGENTCORE_STATUS_BUSY ||
         diagnostic.ptr == NULL || diagnostic.len == 0) {
         stop_server(&server);
         api->buffer_release(&diagnostic);
@@ -375,7 +375,7 @@ int main(void) {
     }
     api->buffer_release(&diagnostic);
     if (diagnostic.ptr != NULL || diagnostic.len != 0) {
-        diagnostic = (mc_owned_bytes_v1){0};
+        diagnostic = (metask_agentcore_owned_bytes_v1){0};
         stop_server(&server);
         api->session_destroy(session, &diagnostic);
         api->buffer_release(&diagnostic);
@@ -384,16 +384,16 @@ int main(void) {
         return 17;
     }
 
-    mc_run_options_v1 options = {0};
+    metask_agentcore_run_options_v1 options = {0};
     options.struct_size = sizeof(options);
     options.max_turns = 1;
-    mc_run_result_v1 result = {0};
+    metask_agentcore_run_result_v1 result = {0};
     active_run_id = 1;
     uint32_t run_status = api->session_run(session, 1, view("exercise C ABI"),
                                            &options, &result, &diagnostic);
     active_run_id = 0;
     stop_server(&server);
-    if (run_status != MC_STATUS_OK || result.stop_reason_code != MC_STOP_END_TURN ||
+    if (run_status != METASK_AGENTCORE_STATUS_OK || result.stop_reason_code != METASK_AGENTCORE_STOP_END_TURN ||
         event_calls == 0 || server.result != 0) {
         api->buffer_release(&diagnostic);
         api->session_destroy(session, &diagnostic);
@@ -401,12 +401,12 @@ int main(void) {
         api->runtime_destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 18);
     }
-    if (api->session_destroy(session, &diagnostic) != MC_STATUS_OK) {
+    if (api->session_destroy(session, &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
         api->buffer_release(&diagnostic);
         api->runtime_destroy(runtime, &diagnostic);
         return release_error(api, &diagnostic, 19);
     }
-    if (api->runtime_destroy(runtime, &diagnostic) != MC_STATUS_OK) {
+    if (api->runtime_destroy(runtime, &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
         return release_error(api, &diagnostic, 20);
     }
     api->buffer_release(&diagnostic);

@@ -1,11 +1,11 @@
 const std = @import("std");
-const sdk = @import("metacodes_agentcore");
+const sdk = @import("metask_agentcore");
 const wire = sdk.types;
 const Server = @import("mock_server.zig").Server;
 
 comptime {
     if (@hasDecl(wire, "CALLBACK_CONTINUE") or @hasDecl(wire, "CALLBACK_FATAL"))
-        @compileError("revision 2 must not retain pre-revision callback aliases");
+        @compileError("revision 3 must not retain pre-revision callback aliases");
 }
 
 const ASK_SSE =
@@ -178,12 +178,12 @@ pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
     const api = try sdk.Api.discover();
     if (api.raw.abi_revision != wire.ABI_REVISION) return error.UnexpectedRevision;
-    if (sdk.metacodes_agentcore_get_api(2) != null) return error.UnexpectedAbi;
+    if (sdk.metask_agentcore_get_api(2) != null) return error.UnexpectedAbi;
     try verifyRevisionMismatchRejection(api);
 
     const workspace = try std.process.currentPathAlloc(init.io, a);
     var name_buf: [128]u8 = undefined;
-    const file_name = try std.fmt.bufPrint(&name_buf, "metacodes-agentcore-{d}.txt", .{std.Thread.getCurrentId()});
+    const file_name = try std.fmt.bufPrint(&name_buf, "metask-agentcore-{d}.txt", .{std.Thread.getCurrentId()});
     defer std.Io.Dir.cwd().deleteFile(init.io, file_name) catch {};
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = file_name, .data = "artifact-read-ok" });
     // Source-free proof: the model supplies a relative file path and the

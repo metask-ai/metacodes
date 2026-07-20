@@ -76,10 +76,10 @@ pub const Error = error{
 };
 
 pub const fixed_artifact_files = [_][]const u8{
-    "include/metacodes_agentcore.h",
-    "sdk/metacodes_agentcore.zig",
-    "sdk/metacodes_agentcore_protocol.zig",
-    "sdk/metacodes_agentcore_types.zig",
+    "include/metask_agentcore.h",
+    "sdk/metask_agentcore.zig",
+    "sdk/metask_agentcore_protocol.zig",
+    "sdk/metask_agentcore_types.zig",
 };
 
 pub const bundle_directories = [_][]const u8{ "include", "lib", "sdk" };
@@ -94,7 +94,7 @@ pub fn normalizePathSeparators(path: []u8) void {
 
 pub fn validateManifest(manifest: Manifest, expected: Expected) Error!void {
     if (manifest.schema_version != 1) return error.InvalidSchema;
-    if (!std.mem.eql(u8, manifest.name, "metacodes-agentcore")) return error.InvalidName;
+    if (!std.mem.eql(u8, manifest.name, "metask-agentcore")) return error.InvalidName;
     if (manifest.source.commit.len != 40 or !isLowerHex(manifest.source.commit)) return error.InvalidCommit;
     if (expected.commit) |commit| {
         if (!std.mem.eql(u8, manifest.source.commit, commit)) return error.CommitMismatch;
@@ -110,7 +110,7 @@ pub fn validateManifest(manifest: Manifest, expected: Expected) Error!void {
     if (!std.mem.eql(u8, manifest.build.abi, expected.abi)) return error.TargetAbiMismatch;
     if (!std.mem.eql(u8, manifest.build.optimize, expected.optimize)) return error.OptimizeMismatch;
     if (manifest.build.strip != expected.strip) return error.StripMismatch;
-    if (manifest.contract.binary_abi_version != 1 or manifest.contract.binary_abi_revision != 2)
+    if (manifest.contract.binary_abi_version != 1 or manifest.contract.binary_abi_revision != 3)
         return error.AbiMismatch;
     if (!std.mem.eql(u8, manifest.contract.ui_request_mode, "synchronous")) return error.UiModeMismatch;
     const expected_link_inputs: []const []const u8 = if (std.mem.eql(u8, expected.os, "windows"))
@@ -130,21 +130,26 @@ fn equalStrings(actual: []const []const u8, expected: []const []const u8) bool {
 }
 
 fn validateVersion(manifest: Manifest) Error!void {
-    const prefix = "0.0.0-dev+";
+    const parsed = std.SemanticVersion.parse(manifest.version) catch return error.InvalidVersion;
     const commit_short = manifest.source.commit[0..12];
-    if (!std.mem.startsWith(u8, manifest.version, prefix)) return error.InvalidVersion;
-    const suffix = manifest.version[prefix.len..];
-    if (!std.mem.startsWith(u8, suffix, commit_short)) return error.InvalidVersion;
-    const identity_suffix = suffix[commit_short.len..];
-    if (!manifest.source.dirty) {
-        if (identity_suffix.len != 0 or manifest.source.dirty_source_sha256.len != 0) return error.InvalidVersion;
+    if (parsed.pre == null) {
+        if (parsed.build != null or manifest.source.dirty or manifest.source.dirty_source_sha256.len != 0)
+            return error.InvalidVersion;
         return;
     }
-    const dirty_prefix = "-dirty.";
+    const build = parsed.build orelse return error.InvalidVersion;
+    if (!manifest.source.dirty) {
+        if (!std.mem.eql(u8, build, commit_short) or manifest.source.dirty_source_sha256.len != 0)
+            return error.InvalidVersion;
+        return;
+    }
+    var version_buf: [64]u8 = undefined;
+    const dirty_prefix = std.fmt.bufPrint(&version_buf, "{s}.dirty.", .{commit_short}) catch
+        return error.InvalidVersion;
     if (manifest.source.dirty_source_sha256.len != 64 or !isLowerHex(manifest.source.dirty_source_sha256) or
-        !std.mem.startsWith(u8, identity_suffix, dirty_prefix) or
-        identity_suffix.len != dirty_prefix.len + 12 or
-        !std.mem.eql(u8, identity_suffix[dirty_prefix.len..], manifest.source.dirty_source_sha256[0..12]))
+        !std.mem.startsWith(u8, build, dirty_prefix) or
+        build.len != dirty_prefix.len + 12 or
+        !std.mem.eql(u8, build[dirty_prefix.len..], manifest.source.dirty_source_sha256[0..12]))
         return error.InvalidVersion;
 }
 
@@ -210,7 +215,7 @@ fn findFixed(comptime expected: []const []const u8, actual: []const u8) ?usize {
 }
 
 const hash = "0000000000000000000000000000000000000000000000000000000000000000";
-const macos_library_path = "lib/libmetacodes_agentcore.a";
+const macos_library_path = "lib/libmetask_agentcore.a";
 const valid_files = [_]FileEntry{
     .{ .path = macos_library_path, .sha256 = hash },
     .{ .path = fixed_artifact_files[0], .sha256 = hash },
@@ -222,8 +227,8 @@ const valid_files = [_]FileEntry{
 fn validManifest() Manifest {
     return .{
         .schema_version = 1,
-        .name = "metacodes-agentcore",
-        .version = "0.0.0-dev+0123456789ab",
+        .name = "metask-agentcore",
+        .version = "0.1.0-dev+0123456789ab",
         .source = .{
             .commit = "0123456789abcdef0123456789abcdef01234567",
             .dirty = false,
@@ -240,7 +245,7 @@ fn validManifest() Manifest {
         },
         .contract = .{
             .binary_abi_version = 1,
-            .binary_abi_revision = 2,
+            .binary_abi_revision = 3,
             .required_system_link_inputs = &default_system_link_inputs,
             .ui_request_mode = "synchronous",
         },
@@ -263,8 +268,16 @@ test "manifest identity accepts valid clean and dirty development bundles" {
     var dirty = validManifest();
     dirty.source.dirty = true;
     dirty.source.dirty_source_sha256 = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
-    dirty.version = "0.0.0-dev+0123456789ab-dirty.abcdefabcdef";
+    dirty.version = "0.1.0-dev+0123456789ab.dirty.abcdefabcdef";
     try validateManifest(dirty, valid_expected);
+
+    var stable = validManifest();
+    stable.version = "0.1.0";
+    try validateManifest(stable, valid_expected);
+
+    var pseudo_stable = validManifest();
+    pseudo_stable.version = "0.1.0+0123456789ab";
+    try std.testing.expectError(error.InvalidVersion, validateManifest(pseudo_stable, valid_expected));
 }
 
 test "manifest accepts target-neutral Linux build metadata" {
@@ -306,7 +319,7 @@ test "release identity rejects dirty and wrong-commit bundles" {
     var dirty = validManifest();
     dirty.source.dirty = true;
     dirty.source.dirty_source_sha256 = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
-    dirty.version = "0.0.0-dev+0123456789ab-dirty.abcdefabcdef";
+    dirty.version = "0.1.0-dev+0123456789ab.dirty.abcdefabcdef";
     var clean_expected = valid_expected;
     clean_expected.require_clean = true;
     clean_expected.commit = "0123456789abcdef0123456789abcdef01234567";
@@ -348,7 +361,7 @@ test "manifest contract rejects toolchain target optimize and ABI drift" {
 test "manifest file set validates dynamic library name hashes and exact entries" {
     try validateManifestFiles(&valid_files, macos_library_path);
     var windows_files = valid_files;
-    windows_files[0].path = "lib/metacodes_agentcore.lib";
+    windows_files[0].path = "lib/metask_agentcore.lib";
     try validateManifestFiles(&windows_files, windows_files[0].path);
     try std.testing.expectEqualStrings(hash, fileSha256(&valid_files, macos_library_path).?);
     try std.testing.expect(fileSha256(&valid_files, "lib/missing.lib") == null);
@@ -377,7 +390,7 @@ test "bundle entry set validates a dynamic library name and exact tree" {
     };
     try validateBundleEntries(&valid, macos_library_path);
     var windows = valid;
-    windows[3].path = "lib/metacodes_agentcore.lib";
+    windows[3].path = "lib/metask_agentcore.lib";
     try validateBundleEntries(&windows, windows[3].path);
     try std.testing.expectError(error.MissingFile, validateBundleEntries(valid[0 .. valid.len - 1], macos_library_path));
     const extra_file = valid ++ [_]BundleEntry{.{ .path = "sdk/unlisted.zig", .kind = .file }};

@@ -70,8 +70,8 @@ fn createAgentCoreAbiModule(b: *std.Build, options: AgentCoreAbiModuleOptions) *
     });
     addHl(b, mod);
     mod.addImport("metacodes-core", options.core_mod);
-    mod.addImport("metacodes_agentcore_types", options.types_mod);
-    mod.addImport("metacodes_agentcore_protocol", options.protocol_mod);
+    mod.addImport("metask_agentcore_types", options.types_mod);
+    mod.addImport("metask_agentcore_protocol", options.protocol_mod);
     return mod;
 }
 
@@ -239,22 +239,22 @@ pub fn build(b: *std.Build) void {
     addHl(b, core_mod);
 
     const agentcore_types_mod = b.createModule(.{
-        .root_source_file = b.path("sdk/metacodes_agentcore_types.zig"),
+        .root_source_file = b.path("sdk/metask_agentcore_types.zig"),
         .target = target,
         .optimize = optimize,
     });
     const agentcore_protocol_mod = b.createModule(.{
-        .root_source_file = b.path("sdk/metacodes_agentcore_protocol.zig"),
+        .root_source_file = b.path("sdk/metask_agentcore_protocol.zig"),
         .target = target,
         .optimize = optimize,
     });
     const agentcore_sdk_mod = b.createModule(.{
-        .root_source_file = b.path("sdk/metacodes_agentcore.zig"),
+        .root_source_file = b.path("sdk/metask_agentcore.zig"),
         .target = target,
         .optimize = optimize,
     });
-    agentcore_sdk_mod.addImport("metacodes_agentcore_types", agentcore_types_mod);
-    agentcore_sdk_mod.addImport("metacodes_agentcore_protocol", agentcore_protocol_mod);
+    agentcore_sdk_mod.addImport("metask_agentcore_types", agentcore_types_mod);
+    agentcore_sdk_mod.addImport("metask_agentcore_protocol", agentcore_protocol_mod);
     const agentcore_abi_test_mod = createAgentCoreAbiModule(b, .{
         .target = target,
         .optimize = optimize,
@@ -323,6 +323,21 @@ pub fn build(b: *std.Build) void {
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_manifest_tool_test, windows_test_prelude).step);
+    const agentcore_symbol_gate_mod = b.createModule(.{
+        .root_source_file = b.path("scripts/agentcore_symbol_gate.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    const agentcore_symbol_gate_tool = b.addExecutable(.{
+        .name = "agentcore-symbol-gate",
+        .root_module = agentcore_symbol_gate_mod,
+    });
+    const agentcore_symbol_gate_test = b.addTest(.{
+        .name = "agentcore-symbol-gate-unit",
+        .root_module = agentcore_symbol_gate_mod,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+    });
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_symbol_gate_test, windows_test_prelude).step);
     // header 可编译性检查:走 zig 构建系统原生 C 对象(不 install,只编译)。
     // 不用系统 cc(Windows 没有),也不用 `zig cc -fsyntax-only`(zig 0.16 Windows 实测
     // 对任何输入报 FileNotFound;`-c` 正常)。对象编译 = 语法+类型检查,跨平台等价。
@@ -369,10 +384,13 @@ pub fn build(b: *std.Build) void {
     agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_contract_test, windows_test_prelude).step);
 
     const agentcore_lib = b.addLibrary(.{
-        .name = "metacodes_agentcore",
+        .name = "metask_agentcore",
         .linkage = .static,
         .root_module = agentcore_abi_bundle_mod,
     });
+    const agentcore_symbol_gate_cmd = b.addRunArtifact(agentcore_symbol_gate_tool);
+    agentcore_symbol_gate_cmd.addFileArg(agentcore_lib.getEmittedBin());
+    agentcore_test_step.dependOn(&agentcore_symbol_gate_cmd.step);
     const resolved_agentcore_target = target.result.zigTriple(b.allocator) catch @panic("OOM");
     const agentcore_architecture = @tagName(target.result.cpu.arch);
     const agentcore_os = @tagName(target.result.os.tag);
@@ -385,24 +403,24 @@ pub fn build(b: *std.Build) void {
         .dest_dir = .{ .override = .{ .custom = agentcore_lib_rel } },
     });
     const install_agentcore_header = b.addInstallFileWithDir(
-        b.path("sdk/metacodes_agentcore.h"),
+        b.path("sdk/metask_agentcore.h"),
         .prefix,
-        b.fmt("{s}/include/metacodes_agentcore.h", .{agentcore_bundle_rel}),
+        b.fmt("{s}/include/metask_agentcore.h", .{agentcore_bundle_rel}),
     );
     const install_agentcore_sdk = b.addInstallFileWithDir(
-        b.path("sdk/metacodes_agentcore.zig"),
+        b.path("sdk/metask_agentcore.zig"),
         .prefix,
-        b.fmt("{s}/sdk/metacodes_agentcore.zig", .{agentcore_bundle_rel}),
+        b.fmt("{s}/sdk/metask_agentcore.zig", .{agentcore_bundle_rel}),
     );
     const install_agentcore_protocol = b.addInstallFileWithDir(
-        b.path("sdk/metacodes_agentcore_protocol.zig"),
+        b.path("sdk/metask_agentcore_protocol.zig"),
         .prefix,
-        b.fmt("{s}/sdk/metacodes_agentcore_protocol.zig", .{agentcore_bundle_rel}),
+        b.fmt("{s}/sdk/metask_agentcore_protocol.zig", .{agentcore_bundle_rel}),
     );
     const install_agentcore_types = b.addInstallFileWithDir(
-        b.path("sdk/metacodes_agentcore_types.zig"),
+        b.path("sdk/metask_agentcore_types.zig"),
         .prefix,
-        b.fmt("{s}/sdk/metacodes_agentcore_types.zig", .{agentcore_bundle_rel}),
+        b.fmt("{s}/sdk/metask_agentcore_types.zig", .{agentcore_bundle_rel}),
     );
     const validate_agentcore_target = b.step("agentcore:validate-target", "Require an explicit AgentCore bundle target");
     if (!target_was_explicit) validate_agentcore_target.dependOn(&b.addFail(
@@ -421,6 +439,7 @@ pub fn build(b: *std.Build) void {
     });
     manifest_cmd.setCwd(b.path("."));
     manifest_cmd.step.dependOn(validate_agentcore_target);
+    manifest_cmd.step.dependOn(&agentcore_symbol_gate_cmd.step);
     manifest_cmd.step.dependOn(&install_agentcore_lib.step);
     manifest_cmd.step.dependOn(&install_agentcore_header.step);
     manifest_cmd.step.dependOn(&install_agentcore_sdk.step);

@@ -1,8 +1,8 @@
-//! Typed Zig convenience layer shipped beside the binary ABI. No metacodes
+//! Typed Zig convenience layer shipped beside the binary ABI. No AgentCore
 //! implementation source is imported (source-free binary consumption).
 
-pub const types = @import("metacodes_agentcore_types");
-pub const protocol = @import("metacodes_agentcore_protocol");
+pub const types = @import("metask_agentcore_types");
+pub const protocol = @import("metask_agentcore_protocol");
 
 pub const Status = types.Status;
 pub const StopReason = types.StopReason;
@@ -19,7 +19,7 @@ pub const decodeCoreEvent = protocol.decodeCoreEvent;
 pub const decodeUiRequest = protocol.decodeUiRequest;
 pub const encodeUiResponse = protocol.encodeUiResponse;
 
-pub extern fn metacodes_agentcore_get_api(requested_abi: u32) callconv(.c) ?*const anyopaque;
+pub extern fn metask_agentcore_get_api(requested_abi: u32) callconv(.c) ?*const anyopaque;
 
 pub fn bytesView(bytes: []const u8) types.BytesViewV1 {
     return .{ .ptr = if (bytes.len == 0) null else bytes.ptr, .len = bytes.len };
@@ -56,7 +56,7 @@ pub const Api = struct {
     raw: *const types.ApiV1,
 
     pub fn discover() error{UnsupportedAbi}!Api {
-        const ptr = metacodes_agentcore_get_api(types.ABI_VERSION_V1) orelse return error.UnsupportedAbi;
+        const ptr = metask_agentcore_get_api(types.ABI_VERSION_V1) orelse return error.UnsupportedAbi;
         return validate(@ptrCast(@alignCast(ptr)));
     }
 

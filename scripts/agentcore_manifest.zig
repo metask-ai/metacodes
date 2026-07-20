@@ -10,7 +10,7 @@ const FileEntry = struct {
 
 const Manifest = struct {
     schema_version: u32 = 1,
-    name: []const u8 = "metacodes-agentcore",
+    name: []const u8 = "metask-agentcore",
     version: []const u8,
     source: struct {
         commit: []const u8,
@@ -28,7 +28,7 @@ const Manifest = struct {
     },
     contract: struct {
         binary_abi_version: u32 = 1,
-        binary_abi_revision: u32 = 2,
+        binary_abi_revision: u32 = 3,
         required_system_link_inputs: []const []const u8,
         ui_request_mode: []const u8 = "synchronous",
     },
@@ -71,10 +71,10 @@ pub fn main(init: std.process.Init) !void {
     const library_rel = try std.fmt.allocPrint(allocator, "lib/{s}", .{library_file});
     const relative_paths = [_][]const u8{
         library_rel,
-        "include/metacodes_agentcore.h",
-        "sdk/metacodes_agentcore.zig",
-        "sdk/metacodes_agentcore_protocol.zig",
-        "sdk/metacodes_agentcore_types.zig",
+        "include/metask_agentcore.h",
+        "sdk/metask_agentcore.zig",
+        "sdk/metask_agentcore_protocol.zig",
+        "sdk/metask_agentcore_types.zig",
     };
 
     var digests: [relative_paths.len][64]u8 = undefined;
@@ -86,11 +86,17 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const source = try sourceIdentity(allocator, init.io, bundle_root);
-    const commit_short = source.commit[0..12];
-    const version = if (source.dirty)
-        try std.fmt.allocPrint(allocator, "0.0.0-dev+{s}-dirty.{s}", .{ commit_short, source.dirty_digest[0..12] })
-    else
-        try std.fmt.allocPrint(allocator, "0.0.0-dev+{s}", .{commit_short});
+    const sdk_version_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        "sdk/VERSION",
+        allocator,
+        .limited(256),
+    );
+    const sdk_version = std.mem.trim(u8, sdk_version_bytes, " \r\n\t");
+    const version = try packageVersion(allocator, sdk_version, source);
+    const sdk_semver = std.SemanticVersion.parse(sdk_version) catch return error.InvalidSdkVersion;
+    if (sdk_semver.pre == null)
+        try requireStableTag(allocator, init.io, sdk_version, source.commit);
     const default_link_inputs = [_][]const u8{"libc"};
     const windows_link_inputs = [_][]const u8{ "libc", "crypt32" };
     const required_link_inputs: []const []const u8 = if (std.mem.eql(u8, os, "windows"))
@@ -135,6 +141,30 @@ fn parseBool(value: []const u8) ?bool {
     if (std.mem.eql(u8, value, "true")) return true;
     if (std.mem.eql(u8, value, "false")) return false;
     return null;
+}
+
+fn packageVersion(allocator: std.mem.Allocator, sdk_version: []const u8, source: SourceIdentity) ![]const u8 {
+    if (sdk_version.len == 0) return error.InvalidSdkVersion;
+    const parsed = std.SemanticVersion.parse(sdk_version) catch return error.InvalidSdkVersion;
+    if (parsed.build != null) return error.InvalidSdkVersion;
+
+    if (parsed.pre == null) {
+        if (source.dirty) return error.DirtyStableVersion;
+        return allocator.dupe(u8, sdk_version);
+    }
+
+    const commit_short = source.commit[0..12];
+    return if (source.dirty)
+        std.fmt.allocPrint(allocator, "{s}+{s}.dirty.{s}", .{ sdk_version, commit_short, source.dirty_digest[0..12] })
+    else
+        std.fmt.allocPrint(allocator, "{s}+{s}", .{ sdk_version, commit_short });
+}
+
+fn requireStableTag(allocator: std.mem.Allocator, io: std.Io, version: []const u8, commit: []const u8) !void {
+    const tag_ref = try std.fmt.allocPrint(allocator, "refs/tags/agentcore-v{s}^{{commit}}", .{version});
+    const output = try runGit(allocator, io, &.{ "git", "rev-parse", "--verify", "--quiet", tag_ref });
+    const tag_commit = std.mem.trim(u8, output, " \r\n\t");
+    if (!std.mem.eql(u8, tag_commit, commit)) return error.StableTagMismatch;
 }
 
 fn fileSha256(io: std.Io, path: []const u8) ![32]u8 {
@@ -235,7 +265,7 @@ fn dirtySourceDigest(diff: []const u8, entries: []DigestEntry) [64]u8 {
         }
     }.lessThan);
     var hash = Sha256.init(.{});
-    hash.update("metacodes-agentcore-dirty-v1\x00diff\x00");
+    hash.update("metask-agentcore-dirty-v1\x00diff\x00");
     hash.update(diff);
     for (entries) |entry| {
         hash.update("\x00untracked\x00");
@@ -305,4 +335,29 @@ test "strict boolean parser" {
     try std.testing.expectEqual(true, parseBool("true").?);
     try std.testing.expectEqual(false, parseBool("false").?);
     try std.testing.expect(parseBool("TRUE") == null);
+}
+
+test "package version is derived from sdk version and source identity" {
+    const allocator = std.testing.allocator;
+    const clean = SourceIdentity{
+        .commit = "0123456789abcdef0123456789abcdef01234567",
+        .dirty = false,
+        .dirty_digest = [_]u8{'0'} ** 64,
+    };
+    const clean_version = try packageVersion(allocator, "0.1.0-dev", clean);
+    defer allocator.free(clean_version);
+    try std.testing.expectEqualStrings("0.1.0-dev+0123456789ab", clean_version);
+
+    const stable_version = try packageVersion(allocator, "0.1.0", clean);
+    defer allocator.free(stable_version);
+    try std.testing.expectEqualStrings("0.1.0", stable_version);
+
+    var dirty = clean;
+    dirty.dirty = true;
+    dirty.dirty_digest = [_]u8{'a'} ** 64;
+    const dirty_version = try packageVersion(allocator, "0.1.0-dev", dirty);
+    defer allocator.free(dirty_version);
+    try std.testing.expectEqualStrings("0.1.0-dev+0123456789ab.dirty.aaaaaaaaaaaa", dirty_version);
+    try std.testing.expectError(error.DirtyStableVersion, packageVersion(allocator, "0.1.0", dirty));
+    try std.testing.expectError(error.InvalidSdkVersion, packageVersion(allocator, "0.1.0+local", clean));
 }

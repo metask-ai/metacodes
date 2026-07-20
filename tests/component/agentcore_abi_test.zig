@@ -266,7 +266,7 @@ fn expectInvalidSessionConfig(
 }
 
 test "L2 SDK rejects API tables that violate rigid v1 discovery" {
-    const raw_api = abi.metacodes_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const actual: *const wire.ApiV1 = @ptrCast(@alignCast(raw_api));
     _ = try sdk.Api.validate(actual);
 
@@ -302,7 +302,7 @@ test "L2 invalid Session configuration publishes no handle and diagnostics never
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try rootPath(&tmp, &root_buf);
 
-    const raw_api = abi.metacodes_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
     const builtins = [_]wire.BytesViewV1{ sdk.bytesView("Read"), sdk.bytesView("Bash") };
     var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
@@ -404,7 +404,7 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
     const url = try server.urlOwned(a);
     defer a.free(url);
 
-    const raw_api = abi.metacodes_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
     var probe = Probe{};
     const builtins = [_]wire.BytesViewV1{sdk.bytesView("AskUserQuestion")};
@@ -604,7 +604,7 @@ test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
     const url = try server.urlOwned(a);
     defer a.free(url);
 
-    const raw_api = abi.metacodes_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
     var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
     runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
@@ -750,7 +750,7 @@ test "L2 invalid UTF-8 Host tool result is released and does not poison Session"
     const url = try server.urlOwned(a);
     defer a.free(url);
 
-    const raw_api = abi.metacodes_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
     var probe = FailureProbe{};
     var host = wire.HostToolV1{
@@ -824,7 +824,7 @@ test "L2 Event callback fatal aborts the Run and poisons the ABI Session" {
     const url = try server.urlOwned(a);
     defer a.free(url);
 
-    const raw_api = abi.metacodes_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
     var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
     runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
@@ -890,7 +890,7 @@ test "L2 Event callback may cooperatively abort without poisoning the ABI Sessio
     const url = try server.urlOwned(a);
     defer a.free(url);
 
-    const raw_api = abi.metacodes_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
     var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
     runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
@@ -961,7 +961,7 @@ fn expectUiOutcome(mode: UiFailureMode, expected_releases: usize, expected_statu
     const url = try server.urlOwned(a);
     defer a.free(url);
 
-    const raw_api = abi.metacodes_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
     const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
     const builtins = [_]wire.BytesViewV1{sdk.bytesView("AskUserQuestion")};
     var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);

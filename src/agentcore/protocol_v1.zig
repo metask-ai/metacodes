@@ -1,13 +1,13 @@
 //! Stable AgentCore ABI v1 wire adapter.
 //!
-//! Internal CoreEvent/UiRequest types may evolve with metacodes frontends and
-//! daemon features. This module is the explicit boundary that decides which
-//! values cross `metacodes_agentcore_get_api(1)`. The public DTOs live in the
+//! Internal CoreEvent/UiRequest types may evolve with the execution engine and
+//! Host integrations. This module is the explicit boundary that decides which
+//! values cross `metask_agentcore_get_api(1)`. The public DTOs live in the
 //! source-free SDK and are imported here as the single wire-schema truth.
 
 const std = @import("std");
 const core = @import("metacodes-core");
-const public = @import("metacodes_agentcore_protocol");
+const public = @import("metask_agentcore_protocol");
 
 const InternalEvent = core.protocol.ui_event.CoreEvent;
 const InternalUiRequest = core.protocol.ui_request.UiRequest;
