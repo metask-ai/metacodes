@@ -95,6 +95,12 @@ pub const fixed_artifact_files = [_][]const u8{
     "bindings/zig/src/root.zig",
     "bindings/zig/src/protocol.zig",
     "bindings/zig/src/types.zig",
+    "bindings/rust/Cargo.toml",
+    "bindings/rust/Cargo.lock",
+    "bindings/rust/build.rs",
+    "bindings/rust/src/lib.rs",
+    "bindings/rust/src/raw.rs",
+    "bindings/rust/examples/link_probe.rs",
     "README.md",
 };
 
@@ -102,6 +108,9 @@ pub const bundle_directories = [_][]const u8{
     "bindings",
     "bindings/zig",
     "bindings/zig/src",
+    "bindings/rust",
+    "bindings/rust/src",
+    "bindings/rust/examples",
     "include",
     "include/metask",
     "lib",
@@ -246,16 +255,15 @@ fn findFixed(comptime expected: []const []const u8, actual: []const u8) ?usize {
 
 const hash = "0000000000000000000000000000000000000000000000000000000000000000";
 const macos_library_path = "lib/libmetask_agentcore.a";
-const valid_files = [_]FileEntry{
-    .{ .path = macos_library_path, .sha256 = hash },
-    .{ .path = fixed_artifact_files[0], .sha256 = hash },
-    .{ .path = fixed_artifact_files[1], .sha256 = hash },
-    .{ .path = fixed_artifact_files[2], .sha256 = hash },
-    .{ .path = fixed_artifact_files[3], .sha256 = hash },
-    .{ .path = fixed_artifact_files[4], .sha256 = hash },
-    .{ .path = fixed_artifact_files[5], .sha256 = hash },
-    .{ .path = fixed_artifact_files[6], .sha256 = hash },
-};
+const valid_files = makeValidFiles();
+
+fn makeValidFiles() [fixed_artifact_files.len + 1]FileEntry {
+    var files: [fixed_artifact_files.len + 1]FileEntry = undefined;
+    files[0] = .{ .path = macos_library_path, .sha256 = hash };
+    for (fixed_artifact_files, 0..) |path, index|
+        files[index + 1] = .{ .path = path, .sha256 = hash };
+    return files;
+}
 
 fn validManifest() Manifest {
     return .{
@@ -438,35 +446,30 @@ test "manifest file set validates dynamic library name hashes and exact entries"
 }
 
 test "bundle entry set validates a dynamic library name and exact tree" {
-    const valid = [_]BundleEntry{
-        .{ .path = "bindings", .kind = .directory },
-        .{ .path = "bindings/zig", .kind = .directory },
-        .{ .path = "bindings/zig/src", .kind = .directory },
-        .{ .path = "include", .kind = .directory },
-        .{ .path = "include/metask", .kind = .directory },
-        .{ .path = "lib", .kind = .directory },
-        .{ .path = macos_library_path, .kind = .file },
-        .{ .path = fixed_artifact_files[0], .kind = .file },
-        .{ .path = fixed_artifact_files[1], .kind = .file },
-        .{ .path = fixed_artifact_files[2], .kind = .file },
-        .{ .path = fixed_artifact_files[3], .kind = .file },
-        .{ .path = fixed_artifact_files[4], .kind = .file },
-        .{ .path = fixed_artifact_files[5], .kind = .file },
-        .{ .path = fixed_artifact_files[6], .kind = .file },
-        .{ .path = "manifest.json", .kind = .file },
-    };
+    const valid = makeValidBundleEntries();
     try validateBundleEntries(&valid, macos_library_path);
     var windows = valid;
-    windows[6].path = "lib/metask_agentcore.lib";
-    try validateBundleEntries(&windows, windows[6].path);
+    windows[bundle_directories.len].path = "lib/metask_agentcore.lib";
+    try validateBundleEntries(&windows, windows[bundle_directories.len].path);
     try std.testing.expectError(error.MissingFile, validateBundleEntries(valid[0 .. valid.len - 1], macos_library_path));
     const extra_file = valid ++ [_]BundleEntry{.{ .path = "bindings/zig/src/unlisted.zig", .kind = .file }};
     try std.testing.expectError(error.UnexpectedFile, validateBundleEntries(&extra_file, macos_library_path));
     const extra_directory = valid ++ [_]BundleEntry{.{ .path = "stale", .kind = .directory }};
     try std.testing.expectError(error.UnexpectedDirectory, validateBundleEntries(&extra_directory, macos_library_path));
     var symlink = valid;
-    symlink[6].kind = .other;
+    symlink[bundle_directories.len].kind = .other;
     try std.testing.expectError(error.UnexpectedEntryKind, validateBundleEntries(&symlink, macos_library_path));
+}
+
+fn makeValidBundleEntries() [bundle_directories.len + fixed_artifact_files.len + 2]BundleEntry {
+    var entries: [bundle_directories.len + fixed_artifact_files.len + 2]BundleEntry = undefined;
+    for (bundle_directories, 0..) |path, index|
+        entries[index] = .{ .path = path, .kind = .directory };
+    entries[bundle_directories.len] = .{ .path = macos_library_path, .kind = .file };
+    for (fixed_artifact_files, 0..) |path, index|
+        entries[bundle_directories.len + index + 1] = .{ .path = path, .kind = .file };
+    entries[entries.len - 1] = .{ .path = "manifest.json", .kind = .file };
+    return entries;
 }
 
 test "bundle paths use manifest separators on Windows" {

@@ -33,7 +33,14 @@ fn verifyNoLegacyNames(path: []const u8, bytes: []const u8) void {
     }
 }
 
-fn verifyPackageVersionProjection(b: *std.Build, readme_path: []const u8, zon_path: []const u8, version: []const u8, zig_target: []const u8) void {
+fn verifyPackageProjection(
+    b: *std.Build,
+    readme_path: []const u8,
+    zon_path: []const u8,
+    cargo_path: []const u8,
+    version: []const u8,
+    zig_target: []const u8,
+) void {
     const readme = std.Io.Dir.cwd().readFileAlloc(b.graph.io, readme_path, b.allocator, .limited(1024 * 1024)) catch
         @panic("cannot read AgentCore README.md");
     const expected_heading = b.fmt("# metask-agentcore {s}\n", .{version});
@@ -45,6 +52,12 @@ fn verifyPackageVersionProjection(b: *std.Build, readme_path: []const u8, zon_pa
         @panic("cannot read AgentCore build.zig.zon");
     const expected_zon_version = b.fmt(".version = \"{s}\"", .{version});
     if (std.mem.indexOf(u8, zon, expected_zon_version) == null) @panic("AgentCore Zig package version mismatch");
+
+    const cargo = std.Io.Dir.cwd().readFileAlloc(b.graph.io, cargo_path, b.allocator, .limited(1024 * 1024)) catch
+        @panic("cannot read AgentCore Cargo.toml");
+    const expected_cargo_version = b.fmt("version = \"{s}\"", .{version});
+    if (std.mem.indexOf(u8, cargo, expected_cargo_version) == null) @panic("AgentCore Rust package version mismatch");
+    if (std.mem.indexOf(u8, cargo, "links = \"metask_agentcore\"") == null) @panic("AgentCore Rust package links key mismatch");
 }
 
 fn verifyBundleEntries(b: *std.Build, bundle_root: []const u8, library_path: []const u8) void {
@@ -104,6 +117,12 @@ pub fn build(b: *std.Build) void {
     const sdk_path = b.pathJoin(&.{ bundle_root, "bindings", "zig", "src", "root.zig" });
     const protocol_path = b.pathJoin(&.{ bundle_root, "bindings", "zig", "src", "protocol.zig" });
     const types_path = b.pathJoin(&.{ bundle_root, "bindings", "zig", "src", "types.zig" });
+    const cargo_path = b.pathJoin(&.{ bundle_root, "bindings", "rust", "Cargo.toml" });
+    const cargo_lock_path = b.pathJoin(&.{ bundle_root, "bindings", "rust", "Cargo.lock" });
+    const rust_build_path = b.pathJoin(&.{ bundle_root, "bindings", "rust", "build.rs" });
+    const rust_lib_path = b.pathJoin(&.{ bundle_root, "bindings", "rust", "src", "lib.rs" });
+    const rust_raw_path = b.pathJoin(&.{ bundle_root, "bindings", "rust", "src", "raw.rs" });
+    const rust_link_probe_path = b.pathJoin(&.{ bundle_root, "bindings", "rust", "examples", "link_probe.rs" });
     const readme_path = b.pathJoin(&.{ bundle_root, "README.md" });
     const manifest_path = b.pathJoin(&.{ bundle_root, "manifest.json" });
     const manifest_bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, manifest_path, b.allocator, .limited(1024 * 1024)) catch
@@ -148,8 +167,14 @@ pub fn build(b: *std.Build) void {
     verifyTextArtifact(b, sdk_path, manifest_contract.fileSha256(manifest.value.files, "bindings/zig/src/root.zig").?);
     verifyTextArtifact(b, protocol_path, manifest_contract.fileSha256(manifest.value.files, "bindings/zig/src/protocol.zig").?);
     verifyTextArtifact(b, types_path, manifest_contract.fileSha256(manifest.value.files, "bindings/zig/src/types.zig").?);
+    verifyTextArtifact(b, cargo_path, manifest_contract.fileSha256(manifest.value.files, "bindings/rust/Cargo.toml").?);
+    verifyTextArtifact(b, cargo_lock_path, manifest_contract.fileSha256(manifest.value.files, "bindings/rust/Cargo.lock").?);
+    verifyTextArtifact(b, rust_build_path, manifest_contract.fileSha256(manifest.value.files, "bindings/rust/build.rs").?);
+    verifyTextArtifact(b, rust_lib_path, manifest_contract.fileSha256(manifest.value.files, "bindings/rust/src/lib.rs").?);
+    verifyTextArtifact(b, rust_raw_path, manifest_contract.fileSha256(manifest.value.files, "bindings/rust/src/raw.rs").?);
+    verifyTextArtifact(b, rust_link_probe_path, manifest_contract.fileSha256(manifest.value.files, "bindings/rust/examples/link_probe.rs").?);
     verifyTextArtifact(b, readme_path, manifest_contract.fileSha256(manifest.value.files, "README.md").?);
-    verifyPackageVersionProjection(b, readme_path, zig_zon_path, manifest.value.version, manifest.value.target.zig_target);
+    verifyPackageProjection(b, readme_path, zig_zon_path, cargo_path, manifest.value.version, manifest.value.target.zig_target);
 
     const types = b.createModule(.{ .root_source_file = .{ .cwd_relative = types_path }, .target = target, .optimize = optimize });
     const protocol = b.createModule(.{ .root_source_file = .{ .cwd_relative = protocol_path }, .target = target, .optimize = optimize });

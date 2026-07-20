@@ -48,6 +48,19 @@ fn addNestedBuildCacheArgs(b: *std.Build, run: *std.Build.Step.Run) void {
     });
 }
 
+fn agentcoreRustTarget(target: std.Target) ?[]const u8 {
+    if (target.cpu.arch == .x86_64 and target.os.tag == .windows) return switch (target.abi) {
+        .msvc => "x86_64-pc-windows-msvc",
+        .gnu => "x86_64-pc-windows-gnu",
+        else => null,
+    };
+    if (target.cpu.arch == .x86_64 and target.os.tag == .linux and target.abi == .gnu)
+        return "x86_64-unknown-linux-gnu";
+    if (target.cpu.arch == .x86_64 and target.os.tag == .macos) return "x86_64-apple-darwin";
+    if (target.cpu.arch == .aarch64 and target.os.tag == .macos) return "aarch64-apple-darwin";
+    return null;
+}
+
 const AgentCoreAbiModuleOptions = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
@@ -422,6 +435,7 @@ pub fn build(b: *std.Build) void {
     const agentcore_bundle_rel = b.fmt("agentcore/{s}", .{resolved_agentcore_target});
     const agentcore_lib_rel = b.fmt("{s}/lib", .{agentcore_bundle_rel});
     const agentcore_install_root = b.getInstallPath(.prefix, agentcore_bundle_rel);
+    const agentcore_install_root_abs = b.pathFromRoot(agentcore_install_root);
     const install_agentcore_lib = b.addInstallArtifact(agentcore_lib, .{
         .dest_dir = .{ .override = .{ .custom = agentcore_lib_rel } },
     });
@@ -450,6 +464,26 @@ pub fn build(b: *std.Build) void {
         .prefix,
         b.fmt("{s}/bindings/zig/build.zig", .{agentcore_bundle_rel}),
     );
+    const install_agentcore_rust_build = b.addInstallFileWithDir(
+        b.path("sdk/rust/build.rs"),
+        .prefix,
+        b.fmt("{s}/bindings/rust/build.rs", .{agentcore_bundle_rel}),
+    );
+    const install_agentcore_rust_lib = b.addInstallFileWithDir(
+        b.path("sdk/rust/src/lib.rs"),
+        .prefix,
+        b.fmt("{s}/bindings/rust/src/lib.rs", .{agentcore_bundle_rel}),
+    );
+    const install_agentcore_rust_raw = b.addInstallFileWithDir(
+        b.path("sdk/rust/src/raw.rs"),
+        .prefix,
+        b.fmt("{s}/bindings/rust/src/raw.rs", .{agentcore_bundle_rel}),
+    );
+    const install_agentcore_rust_link_probe = b.addInstallFileWithDir(
+        b.path("sdk/rust/examples/link_probe.rs"),
+        .prefix,
+        b.fmt("{s}/bindings/rust/examples/link_probe.rs", .{agentcore_bundle_rel}),
+    );
     const validate_agentcore_target = b.step("agentcore:validate-target", "Require an explicit AgentCore bundle target");
     if (!target_was_explicit) validate_agentcore_target.dependOn(&b.addFail(
         "AgentCore release bundle requires explicit -Dtarget=<triple>",
@@ -474,6 +508,10 @@ pub fn build(b: *std.Build) void {
     manifest_cmd.step.dependOn(&install_agentcore_protocol.step);
     manifest_cmd.step.dependOn(&install_agentcore_types.step);
     manifest_cmd.step.dependOn(&install_agentcore_zig_build.step);
+    manifest_cmd.step.dependOn(&install_agentcore_rust_build.step);
+    manifest_cmd.step.dependOn(&install_agentcore_rust_lib.step);
+    manifest_cmd.step.dependOn(&install_agentcore_rust_raw.step);
+    manifest_cmd.step.dependOn(&install_agentcore_rust_link_probe.step);
     const consumer_link_cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
     addNestedBuildCacheArgs(b, consumer_link_cmd);
     consumer_link_cmd.addArgs(&.{
@@ -501,6 +539,42 @@ pub fn build(b: *std.Build) void {
     });
     zig_package_check_cmd.setCwd(b.path("."));
     zig_package_check_cmd.step.dependOn(&manifest_cmd.step);
+    const agentcore_stage_step = b.step("agentcore:stage", "Stage an AgentCore bundle and validate its manifest without linking a consumer");
+    agentcore_stage_step.dependOn(&manifest_cmd.step);
+    const agentcore_rust_step = b.step("agentcore:rust", "Build the bundled metask-agentcore-sys crate for the selected target");
+    if (agentcoreRustTarget(target.result)) |rust_target| {
+        const rust_manifest_path = b.fmt("{s}/bindings/rust/Cargo.toml", .{agentcore_install_root});
+        const rust_target_dir = b.getInstallPath(.prefix, b.fmt(".cargo-agentcore/{s}", .{resolved_agentcore_target}));
+        const rust_check_cmd = b.addSystemCommand(&.{ "cargo", "build", "--locked", "--example", "link_probe" });
+        rust_check_cmd.addArgs(&.{
+            "--manifest-path",
+            rust_manifest_path,
+            "--target",
+            rust_target,
+            "--target-dir",
+            rust_target_dir,
+        });
+        rust_check_cmd.setEnvironmentVariable("METASK_AGENTCORE_BUNDLE_DIR", agentcore_install_root_abs);
+        rust_check_cmd.setCwd(b.path("."));
+        rust_check_cmd.step.dependOn(&manifest_cmd.step);
+        agentcore_rust_step.dependOn(&rust_check_cmd.step);
+    } else {
+        agentcore_rust_step.dependOn(&b.addFail("selected target has no supported AgentCore Rust triple").step);
+    }
+
+    const bindgen_path = b.option([]const u8, "agentcore-bindgen", "bindgen 0.72.1 executable for the AgentCore Rust regen gate") orelse "bindgen";
+    const rust_bindgen_cmd = if (b.graph.host.result.os.tag == .windows) blk: {
+        const command = b.addSystemCommand(&.{ "powershell", "-NoProfile", "-File", "scripts/check_agentcore_rust_bindings.ps1" });
+        command.addArgs(&.{ "-Bindgen", bindgen_path });
+        break :blk command;
+    } else blk: {
+        const command = b.addSystemCommand(&.{ "sh", "scripts/check_agentcore_rust_bindings.sh" });
+        command.setEnvironmentVariable("BINDGEN", bindgen_path);
+        break :blk command;
+    };
+    rust_bindgen_cmd.setCwd(b.path("."));
+    const agentcore_rust_bindgen_step = b.step("agentcore:rust-bindgen-check", "Regenerate Rust raw bindings with bindgen 0.72.1 and require no diff");
+    agentcore_rust_bindgen_step.dependOn(&rust_bindgen_cmd.step);
     const agentcore_bundle_step = b.step("agentcore:bundle", "Build and link-check an AgentCore static bundle for an explicit target");
     agentcore_bundle_step.dependOn(&consumer_link_cmd.step);
     agentcore_bundle_step.dependOn(&zig_package_check_cmd.step);
@@ -531,11 +605,11 @@ pub fn build(b: *std.Build) void {
         target.result.os.tag == host_agentcore_target.os.tag and
         target.result.abi == host_agentcore_target.abi and
         agentcore_cpu_is_native;
-    const host_agentcore_triple = host_agentcore_target.zigTriple(b.allocator) catch @panic("OOM");
     const agentcore_bundle_target_is_native = agentcore_target_is_native or
         (target.result.cpu.arch == host_agentcore_target.cpu.arch and
             target.result.os.tag == .windows and host_agentcore_target.os.tag == .windows and
             agentcore_cpu_is_native);
+    const host_agentcore_triple = host_agentcore_target.zigTriple(b.allocator) catch @panic("OOM");
     const native_agentcore_failure = if (!target_was_explicit)
         b.addFail("AgentCore native execution requires explicit -Dtarget=<triple>")
     else if (!agentcore_bundle_target_is_native)

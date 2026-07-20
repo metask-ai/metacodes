@@ -92,7 +92,10 @@ metask-agentcore-<version>-<target>/
 |   |       `-- protocol.zig
 |   `-- rust/
 |       |-- Cargo.toml
+|       |-- Cargo.lock
 |       |-- build.rs
+|       |-- examples/
+|       |   `-- link_probe.rs
 |       `-- src/
 |           |-- lib.rs
 |           `-- raw.rs
