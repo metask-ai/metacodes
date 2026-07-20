@@ -11,6 +11,7 @@ if ($actualVersion -ne $expectedVersion) {
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $header = Join-Path $repoRoot "sdk\metask\agentcore.h"
+$bindgenIncludes = Join-Path $PSScriptRoot "agentcore_bindgen_include"
 $checkedIn = Join-Path $repoRoot "sdk\rust\src\raw.rs"
 $temporary = [System.IO.Path]::GetTempFileName()
 try {
@@ -20,7 +21,7 @@ try {
         --allowlist-type '^metask_agentcore_.*' `
         --allowlist-var '^METASK_AGENTCORE_.*' `
         --formatter rustfmt `
-        -- -std=c11
+        -- --target=x86_64-unknown-linux-gnu -std=c11 -nostdinc "-I$bindgenIncludes"
     if ($LASTEXITCODE -ne 0) {
         throw "bindgen failed with exit code $LASTEXITCODE"
     }
