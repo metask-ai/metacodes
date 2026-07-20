@@ -33,11 +33,13 @@ fn verifyNoLegacyNames(path: []const u8, bytes: []const u8) void {
     }
 }
 
-fn verifyPackageVersionProjection(b: *std.Build, readme_path: []const u8, zon_path: []const u8, version: []const u8) void {
+fn verifyPackageVersionProjection(b: *std.Build, readme_path: []const u8, zon_path: []const u8, version: []const u8, zig_target: []const u8) void {
     const readme = std.Io.Dir.cwd().readFileAlloc(b.graph.io, readme_path, b.allocator, .limited(1024 * 1024)) catch
         @panic("cannot read AgentCore README.md");
     const expected_heading = b.fmt("# metask-agentcore {s}\n", .{version});
     if (!std.mem.startsWith(u8, readme, expected_heading)) @panic("AgentCore README version mismatch");
+    const expected_target = b.fmt("Required Zig target: `{s}`", .{zig_target});
+    if (std.mem.indexOf(u8, readme, expected_target) == null) @panic("AgentCore README Zig target mismatch");
 
     const zon = std.Io.Dir.cwd().readFileAlloc(b.graph.io, zon_path, b.allocator, .limited(1024 * 1024)) catch
         @panic("cannot read AgentCore build.zig.zon");
@@ -147,7 +149,7 @@ pub fn build(b: *std.Build) void {
     verifyTextArtifact(b, protocol_path, manifest_contract.fileSha256(manifest.value.files, "bindings/zig/src/protocol.zig").?);
     verifyTextArtifact(b, types_path, manifest_contract.fileSha256(manifest.value.files, "bindings/zig/src/types.zig").?);
     verifyTextArtifact(b, readme_path, manifest_contract.fileSha256(manifest.value.files, "README.md").?);
-    verifyPackageVersionProjection(b, readme_path, zig_zon_path, manifest.value.version);
+    verifyPackageVersionProjection(b, readme_path, zig_zon_path, manifest.value.version, manifest.value.target.zig_target);
 
     const types = b.createModule(.{ .root_source_file = .{ .cwd_relative = types_path }, .target = target, .optimize = optimize });
     const protocol = b.createModule(.{ .root_source_file = .{ .cwd_relative = protocol_path }, .target = target, .optimize = optimize });

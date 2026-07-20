@@ -94,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
 
     const target_id = try packageTargetId(allocator, architecture, os, abi);
     const rust_target = try rustTarget(architecture, os, abi);
-    const readme = try renderReadme(allocator, version, target_id, source.commit);
+    const readme = try renderReadme(allocator, version, target_id, resolved_target, source.commit);
     const zon = try renderZon(allocator, version);
     try writeBundleFile(allocator, init.io, bundle_root, "README.md", readme);
     try writeBundleFile(allocator, init.io, bundle_root, "bindings/zig/build.zig.zon", zon);
@@ -218,11 +218,18 @@ fn rustTarget(architecture: []const u8, os: []const u8, abi: []const u8) ![]cons
     return error.UnsupportedAgentCoreTarget;
 }
 
-fn renderReadme(allocator: std.mem.Allocator, version: []const u8, target: []const u8, commit: []const u8) ![]const u8 {
+fn renderReadme(
+    allocator: std.mem.Allocator,
+    version: []const u8,
+    target: []const u8,
+    zig_target: []const u8,
+    commit: []const u8,
+) ![]const u8 {
     return std.fmt.allocPrint(allocator,
         \\# metask-agentcore {s}
         \\
         \\Target: `{s}`
+        \\Required Zig target: `{s}`
         \\Source commit: `{s}`
         \\
         \\C and C++ consumers include `<metask/agentcore.h>` and link the static library in `lib/`.
@@ -231,7 +238,7 @@ fn renderReadme(allocator: std.mem.Allocator, version: []const u8, target: []con
         \\The ABI is experimental and requires an exact revision match. Ownership, lifetime, concurrency,
         \\and failure contracts are defined by `doc/AGENTCORE_BINARY_ABI.md` at the source commit above.
         \\
-    , .{ version, target, commit });
+    , .{ version, target, zig_target, commit });
 }
 
 fn renderZon(allocator: std.mem.Allocator, version: []const u8) ![]const u8 {
