@@ -239,17 +239,17 @@ pub fn build(b: *std.Build) void {
     addHl(b, core_mod);
 
     const agentcore_types_mod = b.createModule(.{
-        .root_source_file = b.path("sdk/metask_agentcore_types.zig"),
+        .root_source_file = b.path("sdk/zig/types.zig"),
         .target = target,
         .optimize = optimize,
     });
     const agentcore_protocol_mod = b.createModule(.{
-        .root_source_file = b.path("sdk/metask_agentcore_protocol.zig"),
+        .root_source_file = b.path("sdk/zig/protocol.zig"),
         .target = target,
         .optimize = optimize,
     });
     const agentcore_sdk_mod = b.createModule(.{
-        .root_source_file = b.path("sdk/metask_agentcore.zig"),
+        .root_source_file = b.path("sdk/zig/root.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -297,6 +297,17 @@ pub fn build(b: *std.Build) void {
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
     });
     agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_sdk_test, windows_test_prelude).step);
+    const agentcore_zig_package_build_test_mod = b.createModule(.{
+        .root_source_file = b.path("sdk/zig/build.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+    const agentcore_zig_package_build_test = b.addTest(.{
+        .name = "agentcore-zig-package-build-unit",
+        .root_module = agentcore_zig_package_build_test_mod,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+    });
+    agentcore_test_step.dependOn(&addTestRunArtifact(b, agentcore_zig_package_build_test, windows_test_prelude).step);
     const agentcore_manifest_contract_mod = b.createModule(.{
         .root_source_file = b.path("tests/agentcore_artifact_consumer/manifest_contract.zig"),
         .target = target,
@@ -313,6 +324,12 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
     });
+    const agentcore_manifest_types_mod = b.createModule(.{
+        .root_source_file = b.path("sdk/zig/types.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    agentcore_manifest_tool_mod.addImport("metask_agentcore_types", agentcore_manifest_types_mod);
     const agentcore_manifest_tool = b.addExecutable(.{
         .name = "agentcore-manifest",
         .root_module = agentcore_manifest_tool_mod,
@@ -403,24 +420,29 @@ pub fn build(b: *std.Build) void {
         .dest_dir = .{ .override = .{ .custom = agentcore_lib_rel } },
     });
     const install_agentcore_header = b.addInstallFileWithDir(
-        b.path("sdk/metask_agentcore.h"),
+        b.path("sdk/metask/agentcore.h"),
         .prefix,
-        b.fmt("{s}/include/metask_agentcore.h", .{agentcore_bundle_rel}),
+        b.fmt("{s}/include/metask/agentcore.h", .{agentcore_bundle_rel}),
     );
     const install_agentcore_sdk = b.addInstallFileWithDir(
-        b.path("sdk/metask_agentcore.zig"),
+        b.path("sdk/zig/root.zig"),
         .prefix,
-        b.fmt("{s}/sdk/metask_agentcore.zig", .{agentcore_bundle_rel}),
+        b.fmt("{s}/bindings/zig/src/root.zig", .{agentcore_bundle_rel}),
     );
     const install_agentcore_protocol = b.addInstallFileWithDir(
-        b.path("sdk/metask_agentcore_protocol.zig"),
+        b.path("sdk/zig/protocol.zig"),
         .prefix,
-        b.fmt("{s}/sdk/metask_agentcore_protocol.zig", .{agentcore_bundle_rel}),
+        b.fmt("{s}/bindings/zig/src/protocol.zig", .{agentcore_bundle_rel}),
     );
     const install_agentcore_types = b.addInstallFileWithDir(
-        b.path("sdk/metask_agentcore_types.zig"),
+        b.path("sdk/zig/types.zig"),
         .prefix,
-        b.fmt("{s}/sdk/metask_agentcore_types.zig", .{agentcore_bundle_rel}),
+        b.fmt("{s}/bindings/zig/src/types.zig", .{agentcore_bundle_rel}),
+    );
+    const install_agentcore_zig_build = b.addInstallFileWithDir(
+        b.path("sdk/zig/build.zig"),
+        .prefix,
+        b.fmt("{s}/bindings/zig/build.zig", .{agentcore_bundle_rel}),
     );
     const validate_agentcore_target = b.step("agentcore:validate-target", "Require an explicit AgentCore bundle target");
     if (!target_was_explicit) validate_agentcore_target.dependOn(&b.addFail(
@@ -445,6 +467,7 @@ pub fn build(b: *std.Build) void {
     manifest_cmd.step.dependOn(&install_agentcore_sdk.step);
     manifest_cmd.step.dependOn(&install_agentcore_protocol.step);
     manifest_cmd.step.dependOn(&install_agentcore_types.step);
+    manifest_cmd.step.dependOn(&install_agentcore_zig_build.step);
     const consumer_link_cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
     addNestedBuildCacheArgs(b, consumer_link_cmd);
     consumer_link_cmd.addArgs(&.{
@@ -461,8 +484,20 @@ pub fn build(b: *std.Build) void {
     if (agentcore_expected_commit) |commit| consumer_link_cmd.addArg(b.fmt("-Dexpected-commit={s}", .{commit}));
     consumer_link_cmd.setCwd(b.path("."));
     consumer_link_cmd.step.dependOn(&manifest_cmd.step);
+    const zig_package_check_cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
+    addNestedBuildCacheArgs(b, zig_package_check_cmd);
+    zig_package_check_cmd.addArgs(&.{
+        "--build-file",
+        b.fmt("{s}/bindings/zig/build.zig", .{agentcore_install_root}),
+        "check",
+        b.fmt("-Doptimize={s}", .{@tagName(optimize)}),
+        b.fmt("-Dtarget={s}", .{resolved_agentcore_target}),
+    });
+    zig_package_check_cmd.setCwd(b.path("."));
+    zig_package_check_cmd.step.dependOn(&manifest_cmd.step);
     const agentcore_bundle_step = b.step("agentcore:bundle", "Build and link-check an AgentCore static bundle for an explicit target");
     agentcore_bundle_step.dependOn(&consumer_link_cmd.step);
+    agentcore_bundle_step.dependOn(&zig_package_check_cmd.step);
 
     const consumer_cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
     addNestedBuildCacheArgs(b, consumer_cmd);
@@ -502,8 +537,10 @@ pub fn build(b: *std.Build) void {
         null;
     if (native_agentcore_failure) |failure|
         agentcore_consumer_step.dependOn(&failure.step)
-    else
+    else {
         agentcore_consumer_step.dependOn(&consumer_cmd.step);
+        agentcore_consumer_step.dependOn(&zig_package_check_cmd.step);
+    }
 
     const agentcore_gate_step = b.step("agentcore:gate", "Build, link and run the native source-free AgentCore delivery gate");
     if (native_agentcore_failure) |failure| {
@@ -511,6 +548,7 @@ pub fn build(b: *std.Build) void {
     } else {
         agentcore_gate_step.dependOn(agentcore_test_step);
         agentcore_gate_step.dependOn(&consumer_cmd.step);
+        agentcore_gate_step.dependOn(&zig_package_check_cmd.step);
     }
     if (tfilter != null) agentcore_gate_step.dependOn(&b.addFail(
         "agentcore:gate does not accept -Dtfilter; use agentcore:test for filtered diagnostics",

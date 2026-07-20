@@ -13,6 +13,38 @@ fn verifySha256(b: *std.Build, path: []const u8, expected: []const u8) void {
     if (!std.mem.eql(u8, &actual, expected)) @panic("AgentCore bundle SHA-256 mismatch");
 }
 
+fn verifyTextArtifact(b: *std.Build, path: []const u8, expected_sha256: []const u8) void {
+    verifySha256(b, path, expected_sha256);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, path, b.allocator, .limited(16 * 1024 * 1024)) catch
+        @panic("cannot read AgentCore text artifact");
+    verifyNoLegacyNames(path, bytes);
+}
+
+fn verifyNoLegacyNames(path: []const u8, bytes: []const u8) void {
+    const forbidden = [_][]const u8{
+        "metacodes_agentcore",
+        "mc_",
+        "MC_",
+        "metask_agentcore_agentcore",
+    };
+    for (forbidden) |token| {
+        if (std.mem.indexOf(u8, bytes, token) != null)
+            std.debug.panic("legacy AgentCore name {s} remains in {s}", .{ token, path });
+    }
+}
+
+fn verifyPackageVersionProjection(b: *std.Build, readme_path: []const u8, zon_path: []const u8, version: []const u8) void {
+    const readme = std.Io.Dir.cwd().readFileAlloc(b.graph.io, readme_path, b.allocator, .limited(1024 * 1024)) catch
+        @panic("cannot read AgentCore README.md");
+    const expected_heading = b.fmt("# metask-agentcore {s}\n", .{version});
+    if (!std.mem.startsWith(u8, readme, expected_heading)) @panic("AgentCore README version mismatch");
+
+    const zon = std.Io.Dir.cwd().readFileAlloc(b.graph.io, zon_path, b.allocator, .limited(1024 * 1024)) catch
+        @panic("cannot read AgentCore build.zig.zon");
+    const expected_zon_version = b.fmt(".version = \"{s}\"", .{version});
+    if (std.mem.indexOf(u8, zon, expected_zon_version) == null) @panic("AgentCore Zig package version mismatch");
+}
+
 fn verifyBundleEntries(b: *std.Build, bundle_root: []const u8, library_path: []const u8) void {
     var dir = std.Io.Dir.cwd().openDir(b.graph.io, bundle_root, .{ .iterate = true }) catch
         @panic("cannot open AgentCore bundle root");
@@ -34,14 +66,21 @@ fn verifyBundleEntries(b: *std.Build, bundle_root: []const u8, library_path: []c
         std.debug.panic("invalid AgentCore bundle entry set: {s}", .{@errorName(err)});
 }
 
-fn applySystemLinkInputs(module: *std.Build.Module, inputs: []const []const u8) void {
-    for (inputs) |input| {
-        if (std.mem.eql(u8, input, "libc")) {
-            module.link_libc = true;
-        } else {
-            module.linkSystemLibrary(input, .{ .use_pkg_config = .no });
-        }
-    }
+fn applySystemLinkInputs(module: *std.Build.Module, manifest: Manifest) void {
+    module.link_libc = manifest.link.requires_c_runtime;
+    for (manifest.link.system_libraries) |library|
+        module.linkSystemLibrary(library, .{ .use_pkg_config = .no });
+    for (manifest.link.system_frameworks) |framework|
+        module.linkFramework(framework, .{});
+}
+
+fn rustTarget(arch: std.Target.Cpu.Arch, os: std.Target.Os.Tag, abi: std.Target.Abi) []const u8 {
+    if (arch == .x86_64 and os == .windows and abi == .msvc) return "x86_64-pc-windows-msvc";
+    if (arch == .x86_64 and os == .windows and abi == .gnu) return "x86_64-pc-windows-gnu";
+    if (arch == .x86_64 and os == .linux and abi == .gnu) return "x86_64-unknown-linux-gnu";
+    if (arch == .x86_64 and os == .macos) return "x86_64-apple-darwin";
+    if (arch == .aarch64 and os == .macos) return "aarch64-apple-darwin";
+    @panic("unsupported AgentCore target");
 }
 
 pub fn build(b: *std.Build) void {
@@ -57,13 +96,17 @@ pub fn build(b: *std.Build) void {
         @panic("-Dexpected-strip is required");
     const library_rel_path = b.fmt("lib/{s}", .{library_file});
     const lib_path = b.pathJoin(&.{ bundle_root, "lib", library_file });
-    const header_path = b.pathJoin(&.{ bundle_root, "include", "metask_agentcore.h" });
-    const sdk_path = b.pathJoin(&.{ bundle_root, "sdk", "metask_agentcore.zig" });
-    const protocol_path = b.pathJoin(&.{ bundle_root, "sdk", "metask_agentcore_protocol.zig" });
-    const types_path = b.pathJoin(&.{ bundle_root, "sdk", "metask_agentcore_types.zig" });
+    const header_path = b.pathJoin(&.{ bundle_root, "include", "metask", "agentcore.h" });
+    const zig_build_path = b.pathJoin(&.{ bundle_root, "bindings", "zig", "build.zig" });
+    const zig_zon_path = b.pathJoin(&.{ bundle_root, "bindings", "zig", "build.zig.zon" });
+    const sdk_path = b.pathJoin(&.{ bundle_root, "bindings", "zig", "src", "root.zig" });
+    const protocol_path = b.pathJoin(&.{ bundle_root, "bindings", "zig", "src", "protocol.zig" });
+    const types_path = b.pathJoin(&.{ bundle_root, "bindings", "zig", "src", "types.zig" });
+    const readme_path = b.pathJoin(&.{ bundle_root, "README.md" });
     const manifest_path = b.pathJoin(&.{ bundle_root, "manifest.json" });
     const manifest_bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, manifest_path, b.allocator, .limited(1024 * 1024)) catch
         @panic("cannot read AgentCore manifest.json");
+    verifyNoLegacyNames(manifest_path, manifest_bytes);
     const manifest = std.json.parseFromSlice(Manifest, b.allocator, manifest_bytes, .{
         .ignore_unknown_fields = true,
         .duplicate_field_behavior = .@"error",
@@ -71,11 +114,21 @@ pub fn build(b: *std.Build) void {
         @panic("invalid AgentCore manifest.json");
     defer manifest.deinit();
     const resolved_target = target.result.zigTriple(b.allocator) catch @panic("OOM");
+    const architecture = @tagName(target.result.cpu.arch);
+    const os = @tagName(target.result.os.tag);
+    const abi = @tagName(target.result.abi);
+    const target_id = if (target.result.os.tag == .macos)
+        b.fmt("{s}-macos", .{architecture})
+    else
+        b.fmt("{s}-{s}-{s}", .{ architecture, os, abi });
+    const rust_target = rustTarget(target.result.cpu.arch, target.result.os.tag, target.result.abi);
     manifest_contract.validateManifest(manifest.value, .{
+        .target_id = target_id,
         .resolved_target = resolved_target,
-        .architecture = @tagName(target.result.cpu.arch),
-        .os = @tagName(target.result.os.tag),
-        .abi = @tagName(target.result.abi),
+        .rust_target = rust_target,
+        .architecture = architecture,
+        .os = os,
+        .abi = abi,
         .optimize = @tagName(optimize),
         .strip = expected_strip,
         .zig_version = builtin.zig_version_string,
@@ -87,10 +140,14 @@ pub fn build(b: *std.Build) void {
     verifyBundleEntries(b, bundle_root, library_rel_path);
 
     verifySha256(b, lib_path, manifest_contract.fileSha256(manifest.value.files, library_rel_path).?);
-    verifySha256(b, header_path, manifest_contract.fileSha256(manifest.value.files, "include/metask_agentcore.h").?);
-    verifySha256(b, sdk_path, manifest_contract.fileSha256(manifest.value.files, "sdk/metask_agentcore.zig").?);
-    verifySha256(b, protocol_path, manifest_contract.fileSha256(manifest.value.files, "sdk/metask_agentcore_protocol.zig").?);
-    verifySha256(b, types_path, manifest_contract.fileSha256(manifest.value.files, "sdk/metask_agentcore_types.zig").?);
+    verifyTextArtifact(b, header_path, manifest_contract.fileSha256(manifest.value.files, "include/metask/agentcore.h").?);
+    verifyTextArtifact(b, zig_build_path, manifest_contract.fileSha256(manifest.value.files, "bindings/zig/build.zig").?);
+    verifyTextArtifact(b, zig_zon_path, manifest_contract.fileSha256(manifest.value.files, "bindings/zig/build.zig.zon").?);
+    verifyTextArtifact(b, sdk_path, manifest_contract.fileSha256(manifest.value.files, "bindings/zig/src/root.zig").?);
+    verifyTextArtifact(b, protocol_path, manifest_contract.fileSha256(manifest.value.files, "bindings/zig/src/protocol.zig").?);
+    verifyTextArtifact(b, types_path, manifest_contract.fileSha256(manifest.value.files, "bindings/zig/src/types.zig").?);
+    verifyTextArtifact(b, readme_path, manifest_contract.fileSha256(manifest.value.files, "README.md").?);
+    verifyPackageVersionProjection(b, readme_path, zig_zon_path, manifest.value.version);
 
     const types = b.createModule(.{ .root_source_file = .{ .cwd_relative = types_path }, .target = target, .optimize = optimize });
     const protocol = b.createModule(.{ .root_source_file = .{ .cwd_relative = protocol_path }, .target = target, .optimize = optimize });
@@ -105,7 +162,7 @@ pub fn build(b: *std.Build) void {
     });
     zig_link_probe.addImport("metask_agentcore", sdk);
     zig_link_probe.addObjectFile(.{ .cwd_relative = lib_path });
-    applySystemLinkInputs(zig_link_probe, manifest.value.contract.required_system_link_inputs);
+    applySystemLinkInputs(zig_link_probe, manifest.value);
     const zig_link_exe = b.addExecutable(.{ .name = "agentcore-artifact-zig-link-probe", .root_module = zig_link_probe });
 
     const c_link_probe = b.createModule(.{
@@ -115,7 +172,7 @@ pub fn build(b: *std.Build) void {
     c_link_probe.addCSourceFile(.{ .file = b.path("link_probe.c"), .flags = &.{"-std=c11"} });
     c_link_probe.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ bundle_root, "include" }) });
     c_link_probe.addObjectFile(.{ .cwd_relative = lib_path });
-    applySystemLinkInputs(c_link_probe, manifest.value.contract.required_system_link_inputs);
+    applySystemLinkInputs(c_link_probe, manifest.value);
     const c_link_exe = b.addExecutable(.{ .name = "agentcore-artifact-c-link-probe", .root_module = c_link_probe });
 
     const cpp_link_probe = b.createModule(.{
@@ -125,7 +182,7 @@ pub fn build(b: *std.Build) void {
     cpp_link_probe.addCSourceFile(.{ .file = b.path("link_probe.cpp"), .flags = &.{"-std=c++17"} });
     cpp_link_probe.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ bundle_root, "include" }) });
     cpp_link_probe.addObjectFile(.{ .cwd_relative = lib_path });
-    applySystemLinkInputs(cpp_link_probe, manifest.value.contract.required_system_link_inputs);
+    applySystemLinkInputs(cpp_link_probe, manifest.value);
     const cpp_link_exe = b.addExecutable(.{ .name = "agentcore-artifact-cpp-link-probe", .root_module = cpp_link_probe });
     const cpp_run = b.addRunArtifact(cpp_link_exe);
 
@@ -136,7 +193,7 @@ pub fn build(b: *std.Build) void {
     });
     app.addImport("metask_agentcore", sdk);
     app.addObjectFile(.{ .cwd_relative = lib_path });
-    applySystemLinkInputs(app, manifest.value.contract.required_system_link_inputs);
+    applySystemLinkInputs(app, manifest.value);
     const exe = b.addExecutable(.{ .name = "agentcore-artifact-consumer", .root_module = app });
     const run = b.addRunArtifact(exe);
 
@@ -147,7 +204,7 @@ pub fn build(b: *std.Build) void {
     c_app.addCSourceFile(.{ .file = b.path("consumer.c"), .flags = &.{"-std=c11"} });
     c_app.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ bundle_root, "include" }) });
     c_app.addObjectFile(.{ .cwd_relative = lib_path });
-    applySystemLinkInputs(c_app, manifest.value.contract.required_system_link_inputs);
+    applySystemLinkInputs(c_app, manifest.value);
     // The C test's loopback mock server uses Winsock directly. This is a test
     // dependency, not an AgentCore library link input recorded in the manifest.
     if (target.result.os.tag == .windows)

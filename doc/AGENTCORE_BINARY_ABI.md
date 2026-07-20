@@ -102,17 +102,19 @@ each other:
 ```text
 <prefix>/agentcore/<resolved-target>/
 ├── lib/<target static-library filename>
-├── include/metask_agentcore.h
-├── sdk/metask_agentcore.zig
-├── sdk/metask_agentcore_protocol.zig
-├── sdk/metask_agentcore_types.zig
+├── include/metask/agentcore.h
+├── bindings/zig/
+│   ├── build.zig
+│   ├── build.zig.zon
+│   └── src/{root,protocol,types}.zig
+├── README.md
 └── manifest.json
 ```
 
-The manifest records source and toolchain identity, resolved target,
-architecture, OS, target ABI, optimization and strip settings, binary ABI
-version, target-specific required system link inputs, and SHA-256 for every
-shipped file. The source-free consumer validates those fields, applies the
+The manifest records vendor/component identity, package and source identity,
+the package target plus exact Zig/Rust targets, optimization and strip
+settings, binary ABI status/version/revision, system link requirements, and
+SHA-256 for every shipped file. The source-free consumer validates those fields, applies the
 declared link inputs to every language probe, validates the exact manifest file
 entries, and checks the complete on-disk file/directory allowlist. Bundles
 require an explicit `-Dtarget=<triple>` so an artifact cannot silently inherit
@@ -143,11 +145,11 @@ not in the consumer bundle.
 
 ## Typed Zig SDK
 
-The shipped Zig SDK remains source-free. `metask_agentcore_types.zig`
+The shipped Zig SDK remains source-free. `bindings/zig/src/types.zig`
 contains the raw ABI declarations plus validated `Status` and `StopReason`
-enums. `metask_agentcore_protocol.zig` owns the ABI v1 `CoreEvent`,
+enums. `bindings/zig/src/protocol.zig` owns the ABI v1 `CoreEvent`,
 `UiRequest`, and `UiResponse` wire types, decoders, and the request-aware
-response encoder. `metask_agentcore.zig` re-exports both layers beside raw
+response encoder. `bindings/zig/src/root.zig` re-exports both layers beside raw
 API-table access.
 
 `decodeCoreEvent` returns an owned `ParsedCoreEvent` whose value is either

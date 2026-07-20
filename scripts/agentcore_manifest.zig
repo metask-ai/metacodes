@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const abi_types = @import("metask_agentcore_types");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
@@ -10,7 +11,8 @@ const FileEntry = struct {
 
 const Manifest = struct {
     schema_version: u32 = 1,
-    name: []const u8 = "metask-agentcore",
+    vendor: []const u8 = "metask",
+    name: []const u8 = "agentcore",
     version: []const u8,
     source: struct {
         commit: []const u8,
@@ -18,19 +20,27 @@ const Manifest = struct {
         dirty_source_sha256: []const u8,
     },
     toolchain: struct { zig_version: []const u8 },
-    build: struct {
-        resolved_target: []const u8,
+    target: struct {
+        id: []const u8,
         architecture: []const u8,
         os: []const u8,
         abi: []const u8,
+        zig_target: []const u8,
+        rust_target: []const u8,
+    },
+    build: struct {
         optimize: []const u8,
         strip: bool,
     },
+    link: struct {
+        requires_c_runtime: bool = true,
+        system_libraries: []const []const u8,
+        system_frameworks: []const []const u8,
+    },
     contract: struct {
-        binary_abi_version: u32 = 1,
-        binary_abi_revision: u32 = 3,
-        required_system_link_inputs: []const []const u8,
-        ui_request_mode: []const u8 = "synchronous",
+        binary_abi_status: []const u8 = "experimental",
+        binary_abi_version: u32 = abi_types.ABI_VERSION_V1,
+        binary_abi_revision: u32 = abi_types.ABI_REVISION,
     },
     files: []const FileEntry,
 };
@@ -68,13 +78,37 @@ pub fn main(init: std.process.Init) !void {
         return error.EmptyMetadata;
     const strip = parseBool(strip_text) orelse return error.InvalidBoolean;
 
+    const source = try sourceIdentity(allocator, init.io, bundle_root);
+    const sdk_version_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        init.io,
+        "sdk/VERSION",
+        allocator,
+        .limited(256),
+    );
+    const sdk_version = std.mem.trim(u8, sdk_version_bytes, " \r\n\t");
+    const version = try packageVersion(allocator, sdk_version, source);
+    if (version.len > 32) return error.PackageVersionTooLong;
+    const sdk_semver = std.SemanticVersion.parse(sdk_version) catch return error.InvalidSdkVersion;
+    if (sdk_semver.pre == null)
+        try requireStableTag(allocator, init.io, sdk_version, source.commit);
+
+    const target_id = try packageTargetId(allocator, architecture, os, abi);
+    const rust_target = try rustTarget(architecture, os, abi);
+    const readme = try renderReadme(allocator, version, target_id, source.commit);
+    const zon = try renderZon(allocator, version);
+    try writeBundleFile(allocator, init.io, bundle_root, "README.md", readme);
+    try writeBundleFile(allocator, init.io, bundle_root, "bindings/zig/build.zig.zon", zon);
+
     const library_rel = try std.fmt.allocPrint(allocator, "lib/{s}", .{library_file});
     const relative_paths = [_][]const u8{
         library_rel,
-        "include/metask_agentcore.h",
-        "sdk/metask_agentcore.zig",
-        "sdk/metask_agentcore_protocol.zig",
-        "sdk/metask_agentcore_types.zig",
+        "include/metask/agentcore.h",
+        "bindings/zig/build.zig",
+        "bindings/zig/build.zig.zon",
+        "bindings/zig/src/root.zig",
+        "bindings/zig/src/protocol.zig",
+        "bindings/zig/src/types.zig",
+        "README.md",
     };
 
     var digests: [relative_paths.len][64]u8 = undefined;
@@ -85,24 +119,12 @@ pub fn main(init: std.process.Init) !void {
         files[index] = .{ .path = relative_path, .sha256 = &digests[index] };
     }
 
-    const source = try sourceIdentity(allocator, init.io, bundle_root);
-    const sdk_version_bytes = try std.Io.Dir.cwd().readFileAlloc(
-        init.io,
-        "sdk/VERSION",
-        allocator,
-        .limited(256),
-    );
-    const sdk_version = std.mem.trim(u8, sdk_version_bytes, " \r\n\t");
-    const version = try packageVersion(allocator, sdk_version, source);
-    const sdk_semver = std.SemanticVersion.parse(sdk_version) catch return error.InvalidSdkVersion;
-    if (sdk_semver.pre == null)
-        try requireStableTag(allocator, init.io, sdk_version, source.commit);
-    const default_link_inputs = [_][]const u8{"libc"};
-    const windows_link_inputs = [_][]const u8{ "libc", "crypt32" };
-    const required_link_inputs: []const []const u8 = if (std.mem.eql(u8, os, "windows"))
-        &windows_link_inputs
+    const no_link_inputs = [_][]const u8{};
+    const windows_libraries = [_][]const u8{"crypt32"};
+    const system_libraries: []const []const u8 = if (std.mem.eql(u8, os, "windows"))
+        &windows_libraries
     else
-        &default_link_inputs;
+        &no_link_inputs;
 
     const manifest = Manifest{
         .version = version,
@@ -112,15 +134,23 @@ pub fn main(init: std.process.Init) !void {
             .dirty_source_sha256 = if (source.dirty) &source.dirty_digest else "",
         },
         .toolchain = .{ .zig_version = builtin.zig_version_string },
-        .build = .{
-            .resolved_target = resolved_target,
+        .target = .{
+            .id = target_id,
             .architecture = architecture,
             .os = os,
             .abi = abi,
+            .zig_target = resolved_target,
+            .rust_target = rust_target,
+        },
+        .build = .{
             .optimize = optimize,
             .strip = strip,
         },
-        .contract = .{ .required_system_link_inputs = required_link_inputs },
+        .link = .{
+            .system_libraries = system_libraries,
+            .system_frameworks = &no_link_inputs,
+        },
+        .contract = .{},
         .files = &files,
     };
     const json = try std.json.Stringify.valueAlloc(allocator, manifest, .{ .whitespace = .indent_2 });
@@ -155,7 +185,7 @@ fn packageVersion(allocator: std.mem.Allocator, sdk_version: []const u8, source:
 
     const commit_short = source.commit[0..12];
     return if (source.dirty)
-        std.fmt.allocPrint(allocator, "{s}+{s}.dirty.{s}", .{ sdk_version, commit_short, source.dirty_digest[0..12] })
+        std.fmt.allocPrint(allocator, "{s}+{s}.dirty.{s}", .{ sdk_version, source.commit[0..7], source.dirty_digest[0..8] })
     else
         std.fmt.allocPrint(allocator, "{s}+{s}", .{ sdk_version, commit_short });
 }
@@ -165,6 +195,62 @@ fn requireStableTag(allocator: std.mem.Allocator, io: std.Io, version: []const u
     const output = try runGit(allocator, io, &.{ "git", "rev-parse", "--verify", "--quiet", tag_ref });
     const tag_commit = std.mem.trim(u8, output, " \r\n\t");
     if (!std.mem.eql(u8, tag_commit, commit)) return error.StableTagMismatch;
+}
+
+fn packageTargetId(allocator: std.mem.Allocator, architecture: []const u8, os: []const u8, abi: []const u8) ![]const u8 {
+    return if (std.mem.eql(u8, os, "macos"))
+        std.fmt.allocPrint(allocator, "{s}-macos", .{architecture})
+    else
+        std.fmt.allocPrint(allocator, "{s}-{s}-{s}", .{ architecture, os, abi });
+}
+
+fn rustTarget(architecture: []const u8, os: []const u8, abi: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, architecture, "x86_64") and std.mem.eql(u8, os, "windows")) {
+        if (std.mem.eql(u8, abi, "msvc")) return "x86_64-pc-windows-msvc";
+        if (std.mem.eql(u8, abi, "gnu")) return "x86_64-pc-windows-gnu";
+    }
+    if (std.mem.eql(u8, architecture, "x86_64") and std.mem.eql(u8, os, "linux") and std.mem.eql(u8, abi, "gnu"))
+        return "x86_64-unknown-linux-gnu";
+    if (std.mem.eql(u8, architecture, "x86_64") and std.mem.eql(u8, os, "macos"))
+        return "x86_64-apple-darwin";
+    if (std.mem.eql(u8, architecture, "aarch64") and std.mem.eql(u8, os, "macos"))
+        return "aarch64-apple-darwin";
+    return error.UnsupportedAgentCoreTarget;
+}
+
+fn renderReadme(allocator: std.mem.Allocator, version: []const u8, target: []const u8, commit: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator,
+        \\# metask-agentcore {s}
+        \\
+        \\Target: `{s}`
+        \\Source commit: `{s}`
+        \\
+        \\C and C++ consumers include `<metask/agentcore.h>` and link the static library in `lib/`.
+        \\Zig consumers use the package in `bindings/zig` and import `metask_agentcore`.
+        \\
+        \\The ABI is experimental and requires an exact revision match. Ownership, lifetime, concurrency,
+        \\and failure contracts are defined by `doc/AGENTCORE_BINARY_ABI.md` at the source commit above.
+        \\
+    , .{ version, target, commit });
+}
+
+fn renderZon(allocator: std.mem.Allocator, version: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator,
+        \\.{{
+        \\    .name = .metask_agentcore,
+        \\    .version = "{s}",
+        \\    .fingerprint = 0xd94cf2aa2005a43c,
+        \\    .minimum_zig_version = "0.16.0",
+        \\    .paths = .{{ "build.zig", "build.zig.zon", "src" }},
+        \\    .dependencies = .{{}},
+        \\}}
+        \\
+    , .{version});
+}
+
+fn writeBundleFile(allocator: std.mem.Allocator, io: std.Io, bundle_root: []const u8, relative_path: []const u8, bytes: []const u8) !void {
+    const path = try std.fs.path.join(allocator, &.{ bundle_root, relative_path });
+    try writeAtomic(io, path, bytes);
 }
 
 fn fileSha256(io: std.Io, path: []const u8) ![32]u8 {
@@ -357,7 +443,19 @@ test "package version is derived from sdk version and source identity" {
     dirty.dirty_digest = [_]u8{'a'} ** 64;
     const dirty_version = try packageVersion(allocator, "0.1.0-dev", dirty);
     defer allocator.free(dirty_version);
-    try std.testing.expectEqualStrings("0.1.0-dev+0123456789ab.dirty.aaaaaaaaaaaa", dirty_version);
+    try std.testing.expectEqualStrings("0.1.0-dev+0123456.dirty.aaaaaaaa", dirty_version);
     try std.testing.expectError(error.DirtyStableVersion, packageVersion(allocator, "0.1.0", dirty));
     try std.testing.expectError(error.InvalidSdkVersion, packageVersion(allocator, "0.1.0+local", clean));
+}
+
+test "generated development versions fit the Zig package limit" {
+    const allocator = std.testing.allocator;
+    const source = SourceIdentity{
+        .commit = "0123456789abcdef0123456789abcdef01234567",
+        .dirty = true,
+        .dirty_digest = [_]u8{'a'} ** 64,
+    };
+    const version = try packageVersion(allocator, "0.1.0-dev", source);
+    defer allocator.free(version);
+    try std.testing.expect(version.len <= 32);
 }

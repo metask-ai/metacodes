@@ -7,6 +7,7 @@ pub const FileEntry = struct {
 
 pub const Manifest = struct {
     schema_version: u32,
+    vendor: []const u8,
     name: []const u8,
     version: []const u8,
     source: struct {
@@ -15,25 +16,35 @@ pub const Manifest = struct {
         dirty_source_sha256: []const u8,
     },
     toolchain: struct { zig_version: []const u8 },
-    build: struct {
-        resolved_target: []const u8,
+    target: struct {
+        id: []const u8,
         architecture: []const u8,
         os: []const u8,
         abi: []const u8,
+        zig_target: []const u8,
+        rust_target: []const u8,
+    },
+    build: struct {
         optimize: []const u8,
         strip: bool,
     },
+    link: struct {
+        requires_c_runtime: bool,
+        system_libraries: []const []const u8,
+        system_frameworks: []const []const u8,
+    },
     contract: struct {
+        binary_abi_status: []const u8,
         binary_abi_version: u32,
         binary_abi_revision: u32,
-        required_system_link_inputs: []const []const u8,
-        ui_request_mode: []const u8,
     },
     files: []const FileEntry,
 };
 
 pub const Expected = struct {
+    target_id: []const u8,
     resolved_target: []const u8,
+    rust_target: []const u8,
     architecture: []const u8,
     os: []const u8,
     abi: []const u8,
@@ -49,6 +60,7 @@ pub const BundleEntry = struct { path: []const u8, kind: EntryKind };
 
 pub const Error = error{
     InvalidSchema,
+    InvalidVendor,
     InvalidName,
     InvalidCommit,
     CommitMismatch,
@@ -57,13 +69,14 @@ pub const Error = error{
     ExpectedCommitRequired,
     ZigVersionMismatch,
     TargetMismatch,
+    RustTargetMismatch,
     ArchitectureMismatch,
     OsMismatch,
     TargetAbiMismatch,
     OptimizeMismatch,
     StripMismatch,
     AbiMismatch,
-    UiModeMismatch,
+    AbiStatusMismatch,
     LinkInputsMismatch,
     InvalidSha256,
     UnexpectedFile,
@@ -76,15 +89,25 @@ pub const Error = error{
 };
 
 pub const fixed_artifact_files = [_][]const u8{
-    "include/metask_agentcore.h",
-    "sdk/metask_agentcore.zig",
-    "sdk/metask_agentcore_protocol.zig",
-    "sdk/metask_agentcore_types.zig",
+    "include/metask/agentcore.h",
+    "bindings/zig/build.zig",
+    "bindings/zig/build.zig.zon",
+    "bindings/zig/src/root.zig",
+    "bindings/zig/src/protocol.zig",
+    "bindings/zig/src/types.zig",
+    "README.md",
 };
 
-pub const bundle_directories = [_][]const u8{ "include", "lib", "sdk" };
-pub const default_system_link_inputs = [_][]const u8{"libc"};
-pub const windows_system_link_inputs = [_][]const u8{ "libc", "crypt32" };
+pub const bundle_directories = [_][]const u8{
+    "bindings",
+    "bindings/zig",
+    "bindings/zig/src",
+    "include",
+    "include/metask",
+    "lib",
+};
+pub const default_system_link_inputs = [_][]const u8{};
+pub const windows_system_link_inputs = [_][]const u8{"crypt32"};
 
 pub fn normalizePathSeparators(path: []u8) void {
     for (path) |*byte| {
@@ -94,7 +117,8 @@ pub fn normalizePathSeparators(path: []u8) void {
 
 pub fn validateManifest(manifest: Manifest, expected: Expected) Error!void {
     if (manifest.schema_version != 1) return error.InvalidSchema;
-    if (!std.mem.eql(u8, manifest.name, "metask-agentcore")) return error.InvalidName;
+    if (!std.mem.eql(u8, manifest.vendor, "metask")) return error.InvalidVendor;
+    if (!std.mem.eql(u8, manifest.name, "agentcore")) return error.InvalidName;
     if (manifest.source.commit.len != 40 or !isLowerHex(manifest.source.commit)) return error.InvalidCommit;
     if (expected.commit) |commit| {
         if (!std.mem.eql(u8, manifest.source.commit, commit)) return error.CommitMismatch;
@@ -104,20 +128,23 @@ pub fn validateManifest(manifest: Manifest, expected: Expected) Error!void {
     try validateVersion(manifest);
     if (expected.require_clean and manifest.source.dirty) return error.DirtyBundle;
     if (!std.mem.eql(u8, manifest.toolchain.zig_version, expected.zig_version)) return error.ZigVersionMismatch;
-    if (!std.mem.eql(u8, manifest.build.resolved_target, expected.resolved_target)) return error.TargetMismatch;
-    if (!std.mem.eql(u8, manifest.build.architecture, expected.architecture)) return error.ArchitectureMismatch;
-    if (!std.mem.eql(u8, manifest.build.os, expected.os)) return error.OsMismatch;
-    if (!std.mem.eql(u8, manifest.build.abi, expected.abi)) return error.TargetAbiMismatch;
+    if (!std.mem.eql(u8, manifest.target.id, expected.target_id)) return error.TargetMismatch;
+    if (!std.mem.eql(u8, manifest.target.zig_target, expected.resolved_target)) return error.TargetMismatch;
+    if (!std.mem.eql(u8, manifest.target.rust_target, expected.rust_target)) return error.RustTargetMismatch;
+    if (!std.mem.eql(u8, manifest.target.architecture, expected.architecture)) return error.ArchitectureMismatch;
+    if (!std.mem.eql(u8, manifest.target.os, expected.os)) return error.OsMismatch;
+    if (!std.mem.eql(u8, manifest.target.abi, expected.abi)) return error.TargetAbiMismatch;
     if (!std.mem.eql(u8, manifest.build.optimize, expected.optimize)) return error.OptimizeMismatch;
     if (manifest.build.strip != expected.strip) return error.StripMismatch;
     if (manifest.contract.binary_abi_version != 1 or manifest.contract.binary_abi_revision != 3)
         return error.AbiMismatch;
-    if (!std.mem.eql(u8, manifest.contract.ui_request_mode, "synchronous")) return error.UiModeMismatch;
+    if (!std.mem.eql(u8, manifest.contract.binary_abi_status, "experimental")) return error.AbiStatusMismatch;
     const expected_link_inputs: []const []const u8 = if (std.mem.eql(u8, expected.os, "windows"))
         &windows_system_link_inputs
     else
         &default_system_link_inputs;
-    if (!equalStrings(manifest.contract.required_system_link_inputs, expected_link_inputs))
+    if (!manifest.link.requires_c_runtime or !equalStrings(manifest.link.system_libraries, expected_link_inputs) or
+        manifest.link.system_frameworks.len != 0)
         return error.LinkInputsMismatch;
 }
 
@@ -143,13 +170,16 @@ fn validateVersion(manifest: Manifest) Error!void {
             return error.InvalidVersion;
         return;
     }
-    var version_buf: [64]u8 = undefined;
-    const dirty_prefix = std.fmt.bufPrint(&version_buf, "{s}.dirty.", .{commit_short}) catch
+    if (manifest.source.dirty_source_sha256.len != 64 or !isLowerHex(manifest.source.dirty_source_sha256))
         return error.InvalidVersion;
-    if (manifest.source.dirty_source_sha256.len != 64 or !isLowerHex(manifest.source.dirty_source_sha256) or
-        !std.mem.startsWith(u8, build, dirty_prefix) or
-        build.len != dirty_prefix.len + 12 or
-        !std.mem.eql(u8, build[dirty_prefix.len..], manifest.source.dirty_source_sha256[0..12]))
+    var version_buf: [64]u8 = undefined;
+    const dirty_identity = std.fmt.bufPrint(
+        &version_buf,
+        "{s}.dirty.{s}",
+        .{ manifest.source.commit[0..7], manifest.source.dirty_source_sha256[0..8] },
+    ) catch
+        return error.InvalidVersion;
+    if (!std.mem.eql(u8, build, dirty_identity))
         return error.InvalidVersion;
 }
 
@@ -222,12 +252,16 @@ const valid_files = [_]FileEntry{
     .{ .path = fixed_artifact_files[1], .sha256 = hash },
     .{ .path = fixed_artifact_files[2], .sha256 = hash },
     .{ .path = fixed_artifact_files[3], .sha256 = hash },
+    .{ .path = fixed_artifact_files[4], .sha256 = hash },
+    .{ .path = fixed_artifact_files[5], .sha256 = hash },
+    .{ .path = fixed_artifact_files[6], .sha256 = hash },
 };
 
 fn validManifest() Manifest {
     return .{
         .schema_version = 1,
-        .name = "metask-agentcore",
+        .vendor = "metask",
+        .name = "agentcore",
         .version = "0.1.0-dev+0123456789ab",
         .source = .{
             .commit = "0123456789abcdef0123456789abcdef01234567",
@@ -235,26 +269,36 @@ fn validManifest() Manifest {
             .dirty_source_sha256 = "",
         },
         .toolchain = .{ .zig_version = "0.16.0" },
-        .build = .{
-            .resolved_target = "aarch64-macos.13.0...15.6-none",
+        .target = .{
+            .id = "aarch64-macos",
             .architecture = "aarch64",
             .os = "macos",
             .abi = "none",
+            .zig_target = "aarch64-macos.13.0...15.6-none",
+            .rust_target = "aarch64-apple-darwin",
+        },
+        .build = .{
             .optimize = "ReleaseSafe",
             .strip = true,
         },
+        .link = .{
+            .requires_c_runtime = true,
+            .system_libraries = &default_system_link_inputs,
+            .system_frameworks = &default_system_link_inputs,
+        },
         .contract = .{
+            .binary_abi_status = "experimental",
             .binary_abi_version = 1,
             .binary_abi_revision = 3,
-            .required_system_link_inputs = &default_system_link_inputs,
-            .ui_request_mode = "synchronous",
         },
         .files = &valid_files,
     };
 }
 
 const valid_expected = Expected{
+    .target_id = "aarch64-macos",
     .resolved_target = "aarch64-macos.13.0...15.6-none",
+    .rust_target = "aarch64-apple-darwin",
     .architecture = "aarch64",
     .os = "macos",
     .abi = "none",
@@ -268,7 +312,7 @@ test "manifest identity accepts valid clean and dirty development bundles" {
     var dirty = validManifest();
     dirty.source.dirty = true;
     dirty.source.dirty_source_sha256 = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
-    dirty.version = "0.1.0-dev+0123456789ab.dirty.abcdefabcdef";
+    dirty.version = "0.1.0-dev+0123456.dirty.abcdefab";
     try validateManifest(dirty, valid_expected);
 
     var stable = validManifest();
@@ -282,36 +326,44 @@ test "manifest identity accepts valid clean and dirty development bundles" {
 
 test "manifest accepts target-neutral Linux build metadata" {
     var manifest = validManifest();
-    manifest.build.resolved_target = "x86_64-linux.6.5...6.5-gnu.2.36";
-    manifest.build.architecture = "x86_64";
-    manifest.build.os = "linux";
-    manifest.build.abi = "gnu";
+    manifest.target.id = "x86_64-linux-gnu";
+    manifest.target.zig_target = "x86_64-linux.6.5...6.5-gnu.2.36";
+    manifest.target.rust_target = "x86_64-unknown-linux-gnu";
+    manifest.target.architecture = "x86_64";
+    manifest.target.os = "linux";
+    manifest.target.abi = "gnu";
     var expected = valid_expected;
-    expected.resolved_target = manifest.build.resolved_target;
-    expected.architecture = manifest.build.architecture;
-    expected.os = manifest.build.os;
-    expected.abi = manifest.build.abi;
+    expected.target_id = manifest.target.id;
+    expected.resolved_target = manifest.target.zig_target;
+    expected.rust_target = manifest.target.rust_target;
+    expected.architecture = manifest.target.architecture;
+    expected.os = manifest.target.os;
+    expected.abi = manifest.target.abi;
     try validateManifest(manifest, expected);
 }
 
 test "manifest requires target-specific system link inputs" {
     var windows = validManifest();
-    windows.build.resolved_target = "x86_64-windows.win10...win11_dt-gnu";
-    windows.build.architecture = "x86_64";
-    windows.build.os = "windows";
-    windows.build.abi = "gnu";
-    windows.contract.required_system_link_inputs = &windows_system_link_inputs;
+    windows.target.id = "x86_64-windows-gnu";
+    windows.target.zig_target = "x86_64-windows.win10...win11_dt-gnu";
+    windows.target.rust_target = "x86_64-pc-windows-gnu";
+    windows.target.architecture = "x86_64";
+    windows.target.os = "windows";
+    windows.target.abi = "gnu";
+    windows.link.system_libraries = &windows_system_link_inputs;
     var expected = valid_expected;
-    expected.resolved_target = windows.build.resolved_target;
-    expected.architecture = windows.build.architecture;
-    expected.os = windows.build.os;
-    expected.abi = windows.build.abi;
+    expected.target_id = windows.target.id;
+    expected.resolved_target = windows.target.zig_target;
+    expected.rust_target = windows.target.rust_target;
+    expected.architecture = windows.target.architecture;
+    expected.os = windows.target.os;
+    expected.abi = windows.target.abi;
     try validateManifest(windows, expected);
 
-    windows.contract.required_system_link_inputs = &default_system_link_inputs;
+    windows.link.system_libraries = &default_system_link_inputs;
     try std.testing.expectError(error.LinkInputsMismatch, validateManifest(windows, expected));
-    const reversed = [_][]const u8{ "crypt32", "libc" };
-    windows.contract.required_system_link_inputs = &reversed;
+    const extra = [_][]const u8{ "crypt32", "advapi32" };
+    windows.link.system_libraries = &extra;
     try std.testing.expectError(error.LinkInputsMismatch, validateManifest(windows, expected));
 }
 
@@ -319,7 +371,7 @@ test "release identity rejects dirty and wrong-commit bundles" {
     var dirty = validManifest();
     dirty.source.dirty = true;
     dirty.source.dirty_source_sha256 = "abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd";
-    dirty.version = "0.1.0-dev+0123456789ab.dirty.abcdefabcdef";
+    dirty.version = "0.1.0-dev+0123456.dirty.abcdefab";
     var clean_expected = valid_expected;
     clean_expected.require_clean = true;
     clean_expected.commit = "0123456789abcdef0123456789abcdef01234567";
@@ -330,19 +382,25 @@ test "release identity rejects dirty and wrong-commit bundles" {
 
 test "manifest contract rejects toolchain target optimize and ABI drift" {
     var manifest = validManifest();
+    manifest.vendor = "other";
+    try std.testing.expectError(error.InvalidVendor, validateManifest(manifest, valid_expected));
+    manifest = validManifest();
     manifest.toolchain.zig_version = "0.17.0";
     try std.testing.expectError(error.ZigVersionMismatch, validateManifest(manifest, valid_expected));
     manifest = validManifest();
-    manifest.build.resolved_target = "x86_64-macos.13.0...15.6-none";
+    manifest.target.zig_target = "x86_64-macos.13.0...15.6-none";
     try std.testing.expectError(error.TargetMismatch, validateManifest(manifest, valid_expected));
     manifest = validManifest();
-    manifest.build.architecture = "x86_64";
+    manifest.target.rust_target = "x86_64-apple-darwin";
+    try std.testing.expectError(error.RustTargetMismatch, validateManifest(manifest, valid_expected));
+    manifest = validManifest();
+    manifest.target.architecture = "x86_64";
     try std.testing.expectError(error.ArchitectureMismatch, validateManifest(manifest, valid_expected));
     manifest = validManifest();
-    manifest.build.os = "linux";
+    manifest.target.os = "linux";
     try std.testing.expectError(error.OsMismatch, validateManifest(manifest, valid_expected));
     manifest = validManifest();
-    manifest.build.abi = "gnu";
+    manifest.target.abi = "gnu";
     try std.testing.expectError(error.TargetAbiMismatch, validateManifest(manifest, valid_expected));
     manifest = validManifest();
     manifest.build.optimize = "Debug";
@@ -356,6 +414,9 @@ test "manifest contract rejects toolchain target optimize and ABI drift" {
     manifest = validManifest();
     manifest.contract.binary_abi_revision = 1;
     try std.testing.expectError(error.AbiMismatch, validateManifest(manifest, valid_expected));
+    manifest = validManifest();
+    manifest.contract.binary_abi_status = "stable";
+    try std.testing.expectError(error.AbiStatusMismatch, validateManifest(manifest, valid_expected));
 }
 
 test "manifest file set validates dynamic library name hashes and exact entries" {
@@ -366,7 +427,7 @@ test "manifest file set validates dynamic library name hashes and exact entries"
     try std.testing.expectEqualStrings(hash, fileSha256(&valid_files, macos_library_path).?);
     try std.testing.expect(fileSha256(&valid_files, "lib/missing.lib") == null);
     try std.testing.expectError(error.MissingFile, validateManifestFiles(valid_files[0 .. valid_files.len - 1], macos_library_path));
-    const extra = valid_files ++ [_]FileEntry{.{ .path = "sdk/unlisted.zig", .sha256 = hash }};
+    const extra = valid_files ++ [_]FileEntry{.{ .path = "bindings/zig/src/unlisted.zig", .sha256 = hash }};
     try std.testing.expectError(error.UnexpectedFile, validateManifestFiles(&extra, macos_library_path));
     var duplicate = valid_files;
     duplicate[4] = duplicate[0];
@@ -378,32 +439,38 @@ test "manifest file set validates dynamic library name hashes and exact entries"
 
 test "bundle entry set validates a dynamic library name and exact tree" {
     const valid = [_]BundleEntry{
+        .{ .path = "bindings", .kind = .directory },
+        .{ .path = "bindings/zig", .kind = .directory },
+        .{ .path = "bindings/zig/src", .kind = .directory },
         .{ .path = "include", .kind = .directory },
+        .{ .path = "include/metask", .kind = .directory },
         .{ .path = "lib", .kind = .directory },
-        .{ .path = "sdk", .kind = .directory },
         .{ .path = macos_library_path, .kind = .file },
         .{ .path = fixed_artifact_files[0], .kind = .file },
         .{ .path = fixed_artifact_files[1], .kind = .file },
         .{ .path = fixed_artifact_files[2], .kind = .file },
         .{ .path = fixed_artifact_files[3], .kind = .file },
+        .{ .path = fixed_artifact_files[4], .kind = .file },
+        .{ .path = fixed_artifact_files[5], .kind = .file },
+        .{ .path = fixed_artifact_files[6], .kind = .file },
         .{ .path = "manifest.json", .kind = .file },
     };
     try validateBundleEntries(&valid, macos_library_path);
     var windows = valid;
-    windows[3].path = "lib/metask_agentcore.lib";
-    try validateBundleEntries(&windows, windows[3].path);
+    windows[6].path = "lib/metask_agentcore.lib";
+    try validateBundleEntries(&windows, windows[6].path);
     try std.testing.expectError(error.MissingFile, validateBundleEntries(valid[0 .. valid.len - 1], macos_library_path));
-    const extra_file = valid ++ [_]BundleEntry{.{ .path = "sdk/unlisted.zig", .kind = .file }};
+    const extra_file = valid ++ [_]BundleEntry{.{ .path = "bindings/zig/src/unlisted.zig", .kind = .file }};
     try std.testing.expectError(error.UnexpectedFile, validateBundleEntries(&extra_file, macos_library_path));
     const extra_directory = valid ++ [_]BundleEntry{.{ .path = "stale", .kind = .directory }};
     try std.testing.expectError(error.UnexpectedDirectory, validateBundleEntries(&extra_directory, macos_library_path));
     var symlink = valid;
-    symlink[3].kind = .other;
+    symlink[6].kind = .other;
     try std.testing.expectError(error.UnexpectedEntryKind, validateBundleEntries(&symlink, macos_library_path));
 }
 
 test "bundle paths use manifest separators on Windows" {
-    var path = [_]u8{ 's', 'd', 'k', '\\', 'm', 'e', 't', 'a', '.', 'z', 'i', 'g' };
+    var path = [_]u8{ 's', 'r', 'c', '\\', 'm', 'e', 't', 'a', '.', 'z', 'i', 'g' };
     normalizePathSeparators(&path);
-    try std.testing.expectEqualStrings("sdk/meta.zig", &path);
+    try std.testing.expectEqualStrings("src/meta.zig", &path);
 }
