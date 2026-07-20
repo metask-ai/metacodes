@@ -76,6 +76,8 @@ def load_bundle(bundle_root: Path) -> tuple[dict, str, str, tuple[str, ...]]:
     for label, value in (("version", version), ("target.id", target_id)):
         if not isinstance(value, str) or not SAFE_COORDINATE.fullmatch(value):
             raise ValueError(f"manifest {label} is not archive-name safe")
+    if "-" not in version.partition("+")[0]:
+        raise ValueError("stable AgentCore archives are disabled until the release process is established")
     if target_os not in ("windows", "linux", "macos"):
         raise ValueError(f"unsupported AgentCore archive OS: {target_os}")
     if not isinstance(files, list):
@@ -259,6 +261,17 @@ class ArchiveTests(unittest.TestCase):
             manifest["vendor"] = "other"
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "not metask AgentCore"):
+                write_archive(bundle, root / "out")
+
+    def test_rejects_stable_version_before_release_setup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = _fixture(root, "windows", "x86_64-windows-msvc")
+            manifest_path = bundle / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["version"] = "0.1.0"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "stable AgentCore archives are disabled"):
                 write_archive(bundle, root / "out")
 
 

@@ -64,7 +64,7 @@ zig build agentcore:archive \
   -Dagentcore-archive-dir=<empty-output-directory>
 ```
 
-归档坐标不可覆盖。当前工具只生成和校验内部 bundle；稳定版的 tag、clean-tree 和发布身份
+归档坐标不可覆盖。当前归档命令只接受 prerelease 版本；稳定版的 tag、clean-tree 和发布身份
 策略留到正式发布流程建立时由 CI 统一定义。
 
 ## 4. 消费入口

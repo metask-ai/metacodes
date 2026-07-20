@@ -175,7 +175,7 @@ sdk/VERSION = 0.1.0
 package     = 0.1.0
 ```
 
-完整 commit 和 dirty 状态单独记录在 manifest 中。当前 bundle 工具不承担 stable tag、clean-tree 或 expected-commit 发布策略；这些规则在真正建立稳定版发布流程时由发布 CI 统一定义，避免在实验阶段提前固化一套发布系统。
+完整 commit 和 dirty 状态单独记录在 manifest 中。当前 bundle 工具不承担 stable tag、clean-tree 或 expected-commit 发布策略；正式发布流程建立前，归档命令拒绝不含 prerelease 的稳定版本。这些规则在真正建立稳定版发布流程时由发布 CI 统一定义，避免在实验阶段提前固化一套发布系统。
 
 同一包中的 manifest、Zig package、Cargo package、README、目录名和归档名必须使用相同 package version，全部由构建生成或校验。
 
