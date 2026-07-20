@@ -120,7 +120,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const no_link_inputs = [_][]const u8{};
-    const windows_libraries = [_][]const u8{"crypt32"};
+    const windows_libraries = [_][]const u8{ "advapi32", "crypt32" };
     const system_libraries: []const []const u8 = if (std.mem.eql(u8, os, "windows"))
         &windows_libraries
     else

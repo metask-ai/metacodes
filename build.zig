@@ -72,6 +72,10 @@ fn createAgentCoreAbiModule(b: *std.Build, options: AgentCoreAbiModuleOptions) *
     mod.addImport("metacodes-core", options.core_mod);
     mod.addImport("metask_agentcore_types", options.types_mod);
     mod.addImport("metask_agentcore_protocol", options.protocol_mod);
+    if (options.target.result.os.tag == .windows)
+        mod.linkSystemLibrary("advapi32", .{ .use_pkg_config = .no });
+    if (options.target.result.os.tag == .windows and options.target.result.abi == .msvc)
+        mod.addCSourceFile(.{ .file = b.path("src/agentcore/windows_msvc_compat.c"), .flags = &.{"-std=c11"} });
     return mod;
 }
 
@@ -405,6 +409,8 @@ pub fn build(b: *std.Build) void {
         .linkage = .static,
         .root_module = agentcore_abi_bundle_mod,
     });
+    // Non-Zig consumers do not implicitly link Zig's compiler_rt builtins.
+    agentcore_lib.bundle_compiler_rt = true;
     const agentcore_symbol_gate_cmd = b.addRunArtifact(agentcore_symbol_gate_tool);
     agentcore_symbol_gate_cmd.addFileArg(agentcore_lib.getEmittedBin());
     agentcore_test_step.dependOn(&agentcore_symbol_gate_cmd.step);
@@ -526,9 +532,13 @@ pub fn build(b: *std.Build) void {
         target.result.abi == host_agentcore_target.abi and
         agentcore_cpu_is_native;
     const host_agentcore_triple = host_agentcore_target.zigTriple(b.allocator) catch @panic("OOM");
+    const agentcore_bundle_target_is_native = agentcore_target_is_native or
+        (target.result.cpu.arch == host_agentcore_target.cpu.arch and
+            target.result.os.tag == .windows and host_agentcore_target.os.tag == .windows and
+            agentcore_cpu_is_native);
     const native_agentcore_failure = if (!target_was_explicit)
         b.addFail("AgentCore native execution requires explicit -Dtarget=<triple>")
-    else if (!agentcore_target_is_native)
+    else if (!agentcore_bundle_target_is_native)
         b.addFail(b.fmt(
             "AgentCore native gate cannot run target {s} on host {s}; use agentcore:bundle for cross-target validation",
             .{ resolved_agentcore_target, host_agentcore_triple },

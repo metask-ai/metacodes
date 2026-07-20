@@ -209,7 +209,7 @@ package     = 0.1.0
   },
   "link": {
     "requires_c_runtime": true,
-    "system_libraries": ["crypt32"],
+    "system_libraries": ["advapi32", "crypt32"],
     "system_frameworks": []
   },
   "contract": {

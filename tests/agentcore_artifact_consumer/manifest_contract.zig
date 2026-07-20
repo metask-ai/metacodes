@@ -107,7 +107,7 @@ pub const bundle_directories = [_][]const u8{
     "lib",
 };
 pub const default_system_link_inputs = [_][]const u8{};
-pub const windows_system_link_inputs = [_][]const u8{"crypt32"};
+pub const windows_system_link_inputs = [_][]const u8{ "advapi32", "crypt32" };
 
 pub fn normalizePathSeparators(path: []u8) void {
     for (path) |*byte| {
@@ -362,7 +362,7 @@ test "manifest requires target-specific system link inputs" {
 
     windows.link.system_libraries = &default_system_link_inputs;
     try std.testing.expectError(error.LinkInputsMismatch, validateManifest(windows, expected));
-    const extra = [_][]const u8{ "crypt32", "advapi32" };
+    const extra = [_][]const u8{ "advapi32", "crypt32", "user32" };
     windows.link.system_libraries = &extra;
     try std.testing.expectError(error.LinkInputsMismatch, validateManifest(windows, expected));
 }
