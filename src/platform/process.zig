@@ -11,7 +11,7 @@
 //! **解耦**：abort/tick 走 opaque 回调（`?*const anyopaque` + fn 指针），platform/ 不依赖
 //! util/abort。调用方（common.zig）把自己的 AbortSignal 包成回调传入。
 //!
-//! 未覆盖（后续增量）：双向 pipe（MCP/LSP 长连接）、落盘重定向（job bg）、JobObject 进程树 kill。
+//! 未覆盖（后续增量）：双向 pipe（MCP/LSP 长连接）、JobObject 进程树 kill。
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -321,21 +321,31 @@ pub fn currentPid() i32 {
     return std.c.getpid();
 }
 
-/// spawn detached 子进程，stdout→out_fd、stderr→err_fd（已 open 的文件 fd），返回进程句柄。
-/// POSIX：fork+setpgid+dup2+execve；Windows：_get_osfhandle+CreateProcessW(DETACHED_PROCESS)。
+/// spawn 后台子进程，stdout→out_fd、stderr→err_fd（已 open 的文件 fd），返回进程句柄。
+/// POSIX：fork+setpgid+dup2+execve；Windows：_get_osfhandle+CreateProcessW(CREATE_NO_WINDOW)。
 /// inherit_env=true（bg job 需 PATH 等）。argv 须 null 结尾。
 pub fn spawnToFiles(argv: []const ?[*:0]const u8, out_fd: c_int, err_fd: c_int) CaptureError!ProcHandle {
     if (is_windows) {
-        const out_h: win.HANDLE = @ptrFromInt(_get_osfhandle(out_fd));
-        const err_h: win.HANDLE = @ptrFromInt(_get_osfhandle(err_fd));
+        const out_raw = _get_osfhandle(out_fd);
+        const err_raw = _get_osfhandle(err_fd);
+        if (out_raw == std.math.maxInt(usize) or err_raw == std.math.maxInt(usize)) return error.SpawnFailed;
+        const out_h: win.HANDLE = @ptrFromInt(out_raw);
+        const err_h: win.HANDLE = @ptrFromInt(err_raw);
         const a = std.heap.page_allocator;
         const cmdline = buildWindowsCmdline(a, argv) catch return error.SpawnFailed;
         defer a.free(cmdline);
         // 可继承句柄窗口期串行(见 g_spawn_serial);spawn 后立即撤销落盘 fd 的可继承标记
         // ——fd 生命周期远长于本次 spawn,留着会泄给后续任何 bInheritHandles 子进程。
         g_spawn_serial.lock();
-        _ = SetHandleInformation(out_h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-        _ = SetHandleInformation(err_h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        if (SetHandleInformation(out_h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0) {
+            g_spawn_serial.unlock();
+            return error.SpawnFailed;
+        }
+        if (SetHandleInformation(err_h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0) {
+            _ = SetHandleInformation(out_h, HANDLE_FLAG_INHERIT, 0);
+            g_spawn_serial.unlock();
+            return error.SpawnFailed;
+        }
         var si = std.mem.zeroes(win.STARTUPINFOW);
         si.cb = @sizeOf(win.STARTUPINFOW);
         si.dwFlags = win.STARTF_USESTDHANDLES;
@@ -343,7 +353,7 @@ pub fn spawnToFiles(argv: []const ?[*:0]const u8, out_fd: c_int, err_fd: c_int) 
         si.hStdError = err_h;
         si.hStdInput = null;
         var pi = std.mem.zeroes(win.PROCESS.INFORMATION);
-        const created = win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{ .detached_process = true }, null, null, &si, &pi);
+        const created = win.kernel32.CreateProcessW(null, cmdline.ptr, null, null, @enumFromInt(1), .{ .create_no_window = true }, null, null, &si, &pi);
         _ = SetHandleInformation(out_h, HANDLE_FLAG_INHERIT, 0);
         _ = SetHandleInformation(err_h, HANDLE_FLAG_INHERIT, 0);
         g_spawn_serial.unlock();

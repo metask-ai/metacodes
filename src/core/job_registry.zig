@@ -136,7 +136,7 @@ pub const JobRegistry = struct {
             return error.OpenFailed;
         };
 
-        // 走可移植 platform/process.spawnToFiles(POSIX fork+dup2 / Windows CreateProcessW DETACHED
+        // 走可移植 platform/process.spawnToFiles(POSIX fork+dup2 / Windows CreateProcessW NO_WINDOW
         // + _get_osfhandle 把落盘 fd 转 HANDLE)。可移植 shell(复刻 codex):POSIX /bin/sh -c;
         // Windows 原生 PowerShell/cmd,零 git-bash。wrapCommand:PowerShell 前置 UTF-8 输出编码。
         const shell = shell_mod.detectDefault();
@@ -304,13 +304,29 @@ test "spawn and reap echo" {
     const j = try r.spawnBackground("echo hello; sleep 0.05");
     try std.testing.expect(j.status == .running);
 
-    // 等一会儿让子进程退出
-    util_time.sleepMs(200);
+    // Windows PowerShell cold start is not bounded by the old fixed 200 ms
+    // sleep. Poll with a finite deadline so the test verifies behavior without
+    // becoming timing-dependent on machine load.
+    var attempts: usize = 0;
+    while (attempts < 500) : (attempts += 1) {
+        util_time.sleepMs(10);
+        r.reapExited();
+        if (r.get(j.idSlice()).?.status != .running) break;
+    }
 
-    r.reapExited();
     const j2 = r.get(j.idSlice()).?;
     try std.testing.expect(j2.status == .exited);
     try std.testing.expect(j2.exit_code.? == 0);
+
+    // Exit code alone is not evidence that the requested shell command ran.
+    // In particular, the Windows detached-process path once returned 0 while
+    // producing neither output nor side effects.  Verify the redirected file
+    // that is the actual JobRegistry/Bash data path.
+    const fd = try pfs.openZ(j2.stdout_path, .{ .ACCMODE = .RDONLY }, 0);
+    defer _ = pfs.close(fd);
+    var buf: [64]u8 = undefined;
+    const n = try pfs.readZ(fd, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "hello") != null);
 }
 
 test "kill running job" {
