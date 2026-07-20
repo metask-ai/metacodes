@@ -18,6 +18,8 @@ import zipfile
 
 
 SAFE_COORDINATE = re.compile(r"^[0-9A-Za-z._+-]+$")
+ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+ZIP_COMPRESSION_LEVEL = 9
 
 
 def sha256_file(path: Path) -> str:
@@ -28,10 +30,34 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def load_bundle(bundle_root: Path) -> tuple[dict, str, str]:
+def sanitized_tar_info(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    """Remove build-host identity and timestamps from a tar member."""
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    info.mtime = 0
+    info.pax_headers = {}
+    return info
+
+
+def write_zip_file(archive: zipfile.ZipFile, source: Path, archive_name: str) -> None:
+    """Write a regular file without copying its host timestamp into the zip."""
+    info = zipfile.ZipInfo(archive_name, date_time=ZIP_EPOCH)
+    archive.writestr(
+        info,
+        source.read_bytes(),
+        compress_type=zipfile.ZIP_DEFLATED,
+        compresslevel=ZIP_COMPRESSION_LEVEL,
+    )
+
+
+def load_bundle(bundle_root: Path) -> tuple[dict, str, str, tuple[str, ...]]:
     if not bundle_root.is_dir():
         raise ValueError(f"bundle root is not a directory: {bundle_root}")
     manifest_path = bundle_root / "manifest.json"
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ValueError("manifest.json is not a regular file")
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         schema_version = manifest["schema_version"]
@@ -73,8 +99,12 @@ def load_bundle(bundle_root: Path) -> tuple[dict, str, str]:
             or relative_text != relative.as_posix()
         ):
             raise ValueError(f"unsafe manifest path: {relative_text}")
-        payload = bundle_root.joinpath(*relative.parts)
-        if payload.is_symlink() or not payload.is_file():
+        payload = bundle_root
+        for part in relative.parts:
+            payload /= part
+            if payload.is_symlink():
+                raise ValueError(f"manifest payload traverses a symlink: {relative_text}")
+        if not payload.is_file():
             raise ValueError(f"manifest payload is not a regular file: {relative_text}")
         if sha256_file(payload) != expected_hash:
             raise ValueError(f"manifest SHA-256 mismatch: {relative_text}")
@@ -82,17 +112,7 @@ def load_bundle(bundle_root: Path) -> tuple[dict, str, str]:
             raise ValueError(f"duplicate manifest path: {relative_text}")
         expected_paths.add(relative_text)
 
-    actual_paths: set[str] = set()
-    for path in bundle_root.rglob("*"):
-        if path.is_symlink():
-            raise ValueError(f"bundle contains a symlink: {path}")
-        if path.is_file():
-            actual_paths.add(path.relative_to(bundle_root).as_posix())
-    if actual_paths != expected_paths:
-        missing = sorted(expected_paths - actual_paths)
-        extra = sorted(actual_paths - expected_paths)
-        raise ValueError(f"bundle tree mismatch: missing={missing}, extra={extra}")
-    return manifest, target_os, f"metask-agentcore-{version}-{target_id}"
+    return manifest, target_os, f"metask-agentcore-{version}-{target_id}", tuple(sorted(expected_paths))
 
 
 def write_archive(bundle_root: Path, output_dir: Path) -> tuple[Path, Path]:
@@ -100,7 +120,7 @@ def write_archive(bundle_root: Path, output_dir: Path) -> tuple[Path, Path]:
     output_dir = output_dir.resolve()
     if output_dir == bundle_root or bundle_root in output_dir.parents:
         raise ValueError("archive output directory must not be inside the bundle root")
-    _, target_os, coordinate = load_bundle(bundle_root)
+    _, target_os, coordinate, archive_paths = load_bundle(bundle_root)
     suffix = ".zip" if target_os == "windows" else ".tar.gz"
     output_dir.mkdir(parents=True, exist_ok=True)
     archive_path = output_dir / f"{coordinate}{suffix}"
@@ -113,14 +133,25 @@ def write_archive(bundle_root: Path, output_dir: Path) -> tuple[Path, Path]:
     temporary = Path(temporary_name)
     try:
         if target_os == "windows":
-            with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-                for path in sorted(bundle_root.rglob("*")):
-                    if path.is_file():
-                        relative = path.relative_to(bundle_root).as_posix()
-                        archive.write(path, f"{coordinate}/{relative}")
+            with zipfile.ZipFile(
+                temporary,
+                "w",
+                zipfile.ZIP_DEFLATED,
+                compresslevel=ZIP_COMPRESSION_LEVEL,
+            ) as archive:
+                for relative in archive_paths:
+                    path = bundle_root.joinpath(*PurePosixPath(relative).parts)
+                    write_zip_file(archive, path, f"{coordinate}/{relative}")
         else:
             with tarfile.open(temporary, "w:gz", format=tarfile.PAX_FORMAT) as archive:
-                archive.add(bundle_root, arcname=coordinate, recursive=True)
+                for relative in archive_paths:
+                    path = bundle_root.joinpath(*PurePosixPath(relative).parts)
+                    archive.add(
+                        path,
+                        arcname=f"{coordinate}/{relative}",
+                        recursive=False,
+                        filter=sanitized_tar_info,
+                    )
 
         digest = sha256_file(temporary)
         archive_created = False
@@ -165,6 +196,9 @@ class ArchiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             bundle = _fixture(root, "windows", "x86_64-windows-msvc")
+            stale = bundle / "sdk" / "old-agentcore.zig"
+            stale.parent.mkdir()
+            stale.write_text("// ignored local residue\n", encoding="utf-8")
             archive, checksum = write_archive(bundle, root / "out")
             self.assertEqual(archive.suffix, ".zip")
             with zipfile.ZipFile(archive) as opened:
@@ -172,6 +206,9 @@ class ArchiveTests(unittest.TestCase):
                     "metask-agentcore-0.1.0-dev+0123456789ab-x86_64-windows-msvc/manifest.json",
                     opened.namelist(),
                 )
+                self.assertTrue(all(info.date_time == ZIP_EPOCH for info in opened.infolist()))
+                self.assertTrue(all(info.compress_type == zipfile.ZIP_DEFLATED for info in opened.infolist()))
+                self.assertFalse(any(name.endswith("sdk/old-agentcore.zig") for name in opened.namelist()))
             self.assertTrue(checksum.read_text(encoding="ascii").startswith(sha256_file(archive)))
             original_archive = archive.read_bytes()
             original_checksum = checksum.read_bytes()
@@ -191,6 +228,12 @@ class ArchiveTests(unittest.TestCase):
                     "metask-agentcore-0.1.0-dev+0123456789ab-aarch64-macos/manifest.json",
                     opened.getnames(),
                 )
+                for member in opened.getmembers():
+                    self.assertEqual(member.uid, 0)
+                    self.assertEqual(member.gid, 0)
+                    self.assertEqual(member.uname, "")
+                    self.assertEqual(member.gname, "")
+                    self.assertEqual(member.mtime, 0)
 
     def test_rejects_payload_hash_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
