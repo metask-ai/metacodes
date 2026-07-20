@@ -579,6 +579,33 @@ pub fn build(b: *std.Build) void {
     agentcore_bundle_step.dependOn(&consumer_link_cmd.step);
     agentcore_bundle_step.dependOn(&zig_package_check_cmd.step);
 
+    const agentcore_python = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    const agentcore_archive_dir = b.option(
+        []const u8,
+        "agentcore-archive-dir",
+        "Output directory for immutable AgentCore archives",
+    ) orelse b.getInstallPath(.prefix, "agentcore-archives");
+    const agentcore_archive_test_cmd = b.addSystemCommand(&.{
+        agentcore_python,
+        "scripts/package_agentcore.py",
+        "--self-test",
+    });
+    agentcore_archive_test_cmd.setCwd(b.path("."));
+    const agentcore_archive_test_step = b.step("agentcore:archive-test", "Test AgentCore archive format, checksum and no-overwrite rules");
+    agentcore_archive_test_step.dependOn(&agentcore_archive_test_cmd.step);
+    const agentcore_archive_cmd = b.addSystemCommand(&.{
+        agentcore_python,
+        "scripts/package_agentcore.py",
+        agentcore_install_root,
+        agentcore_archive_dir,
+    });
+    agentcore_archive_cmd.setCwd(b.path("."));
+    agentcore_archive_cmd.step.dependOn(&consumer_link_cmd.step);
+    agentcore_archive_cmd.step.dependOn(&zig_package_check_cmd.step);
+    agentcore_archive_cmd.step.dependOn(&agentcore_archive_test_cmd.step);
+    const agentcore_archive_step = b.step("agentcore:archive", "Create an immutable AgentCore zip or tar.gz plus SHA-256");
+    agentcore_archive_step.dependOn(&agentcore_archive_cmd.step);
+
     const consumer_cmd = b.addSystemCommand(&.{ b.graph.zig_exe, "build" });
     addNestedBuildCacheArgs(b, consumer_cmd);
     consumer_cmd.addArgs(&.{
@@ -633,6 +660,23 @@ pub fn build(b: *std.Build) void {
         agentcore_gate_step.dependOn(agentcore_test_step);
         agentcore_gate_step.dependOn(&consumer_cmd.step);
         agentcore_gate_step.dependOn(&zig_package_check_cmd.step);
+        if (agentcoreRustTarget(target.result)) |rust_target| {
+            const rust_native_cmd = b.addSystemCommand(&.{ "cargo", "run", "--locked", "--example", "link_probe" });
+            rust_native_cmd.addArgs(&.{
+                "--manifest-path",
+                b.fmt("{s}/bindings/rust/Cargo.toml", .{agentcore_install_root}),
+                "--target",
+                rust_target,
+                "--target-dir",
+                b.getInstallPath(.prefix, b.fmt(".cargo-agentcore-native/{s}", .{resolved_agentcore_target})),
+            });
+            rust_native_cmd.setEnvironmentVariable("METASK_AGENTCORE_BUNDLE_DIR", agentcore_install_root_abs);
+            rust_native_cmd.setCwd(b.path("."));
+            rust_native_cmd.step.dependOn(&manifest_cmd.step);
+            agentcore_gate_step.dependOn(&rust_native_cmd.step);
+        } else {
+            agentcore_gate_step.dependOn(&b.addFail("selected target has no supported AgentCore Rust triple").step);
+        }
     }
     if (tfilter != null) agentcore_gate_step.dependOn(&b.addFail(
         "agentcore:gate does not accept -Dtfilter; use agentcore:test for filtered diagnostics",

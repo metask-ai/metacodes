@@ -1,116 +1,83 @@
 # AgentCore 二进制库交付接口
 
-> 本文档定义 metacodes 核心能力对第三方 Host 的唯一受支持交付方式：
-> **预编译 `metacodes_agentcore` 静态库 + C 头文件或 source-free Zig SDK**。
-> ABI 的 normative 语义见 `doc/AGENTCORE_BINARY_ABI.md`。
+> AgentCore 是公司内部使用的独立原生组件，不是 metacodes 产品 API。
+> ABI 的 normative 语义见 `doc/AGENTCORE_BINARY_ABI.md`；目标范围与当前验证状态见
+> `doc/AGENTCORE_NATIVE_SDK_DISTRIBUTION_PLAN.md`。实施进度以 TinyKG 根任务 `438` 为准。
 
 ## 1. 交付边界
 
-第三方应用不把 metacodes 实现源码加入自己的构建图，即使 Host 使用 Zig。
-这样做同时守住两个边界：
+消费端不把 AgentCore 或 metacodes 实现源码加入构建图，只使用预编译静态库和同包 SDK：
 
-- 安全边界：实现细节、依赖图和内部状态机不成为第三方可直接耦合的接口。
-- 兼容边界：Host 只依赖 C ABI v1（**实验版**，冻结已于 2026-07-17 撤回、短期不复冻，见
-  `doc/AGENTCORE_BINARY_ABI.md` Status 节）和独立的 AgentCore protocol v1，内部 Zig 类型可以继续演进。
+| Host | 交付物 |
+|---|---|
+| C11 | `<metask/agentcore.h>` + 静态库 |
+| C++17 | 同一 C Header（带 `extern "C"`）+ 静态库 |
+| Zig 0.16.0 | `bindings/zig` + 静态库 |
+| Rust | `bindings/rust` 中的 `metask-agentcore-sys` + 静态库 |
 
-仓库中的 `metacodes-core` module、`src/lib.zig`、`example/` 和 `zig build test:lib`
-仅用于 metacodes 自身的模块化、隔离验证与内部 dogfood。它们不是发行物，不承诺源码兼容，
-也不是第三方接入路径。
-
-| Host | 受支持的交付物 | 是否编译 core 源码 |
-|------|----------------|:------------------:|
-| Zig | 静态库 + `sdk/metacodes_agentcore.zig` | 否 |
-| C / C++ | 静态库 + `include/metacodes_agentcore.h` | 否 |
-| Rust / Go / 其他语言 | 经 C ABI 绑定静态库和头文件 | 否 |
+`metacodes-core`、`src/lib.zig` 和 AgentLoop 都不是消费端接口。首期不提供动态库、托管语言
+FFI、C++ wrapper 或 Rust safe wrapper。
 
 ## 2. Bundle 布局
 
-每个 resolved target 对应一个隔离 bundle：
+归档解压后只有一个坐标根目录：
 
 ```text
-<prefix>/agentcore/<resolved-target>/
-├── lib/<target-specific out_filename>
-├── include/metacodes_agentcore.h
-├── sdk/metacodes_agentcore.zig
-├── sdk/metacodes_agentcore_protocol.zig
-├── sdk/metacodes_agentcore_types.zig
+metask-agentcore-<version>-<target>/
+├── include/metask/agentcore.h
+├── lib/<target static library>
+├── bindings/zig/{build.zig,build.zig.zon,src/}
+├── bindings/rust/{Cargo.toml,Cargo.lock,build.rs,examples/,src/}
+├── README.md
 └── manifest.json
 ```
 
-静态库文件名来自 Zig 的 `out_filename`，构建、manifest 和 consumer 都不猜测 `.lib`
-或 `.a`。`manifest.json` 记录 resolved target、toolchain/source identity、优化与 strip
-设置、系统链接输入，以及所有交付文件的 SHA-256；bundle 外多文件或缺文件都会被 consumer
-拒绝。
+Windows 使用 `metask_agentcore.lib`；Linux/macOS 使用 `libmetask_agentcore.a`。
+`manifest.json` 记录独立 package version、源码身份、精确 Zig/Rust target、ABI、链接输入和
+每个 payload 文件的 SHA-256。消费门禁拒绝缺失、多余、hash 不符或 target 不匹配的包。
 
 ## 3. 构建与门禁
 
-交叉构建并执行 source-free Zig/C/C++ link check：
+交叉构建和 source-free C/C++/Zig link check：
 
 ```sh
 zig build agentcore:bundle \
-  -Dtarget=x86_64-windows-gnu \
-  -Doptimize=ReleaseSmall
+  -Dtarget=x86_64-linux-gnu \
+  -Doptimize=ReleaseSafe
 ```
 
-在目标平台原生执行 ABI 测试、bundle、source-free link 和 consumer：
+在匹配原生 Host 上执行 ABI、C/C++、Zig 和 Rust 探针：
 
 ```sh
 zig build agentcore:gate \
-  -Dtarget=x86_64-windows-gnu \
-  -Doptimize=ReleaseSmall
+  -Dtarget=x86_64-windows-msvc \
+  -Doptimize=ReleaseSafe
 ```
 
-`agentcore:gate` 只接受可在当前 Host 原生运行的显式 target。交叉验证使用
-`agentcore:bundle`，不会等到执行 foreign consumer 时才报模糊错误。
-
-Windows 的平台抽象与 CLI smoke 由以下独立门禁负责：
+创建 Windows zip 或 Unix tar.gz，并写出相邻 SHA-256 文件：
 
 ```sh
-zig build windows:gate -Dtarget=x86_64-windows-gnu
+zig build agentcore:archive \
+  -Dtarget=x86_64-windows-msvc \
+  -Doptimize=ReleaseSafe \
+  -Dagentcore-archive-dir=<empty-output-directory>
 ```
 
-它不替代全仓测试。全量套件仍是独立命令：
-
-```sh
-zig build test -Dtarget=x86_64-windows-gnu
-```
+归档坐标不可覆盖。正式 stable 构建还必须来自 `agentcore-v<version>` 指向的 clean commit，
+并使用 `-Dagentcore-require-clean-bundle=true` 与
+`-Dagentcore-expected-commit=<full-hash>` 绑定源码身份。
 
 ## 4. 消费入口
 
-C 头文件只导出单入口：
+C ABI 只导出发现入口：
 
 ```c
-const McAgentCoreApiV1 *metacodes_agentcore_get_api(uint32_t abi_version);
+const metask_agentcore_api_v1 *metask_agentcore_get_api(uint32_t abi_version);
 ```
 
-Host 通过返回的 vtable 使用 `runtime_create/destroy`、`session_create/destroy`、
-`session_run`、`session_abort` 和 `buffer_release`。配置与结果使用固定布局 POD；富数据事件和
-UI request/response 使用 AgentCore protocol v1 JSON。
+Host 通过返回的 vtable 创建 Runtime/Session、执行和中止 Run，并释放 AgentCore 诊断缓冲区。
+ownership、lifetime、回调重入、并发、`run_id`、Session poison 和错误语义只以
+`doc/AGENTCORE_BINARY_ABI.md` 与同版本公共 Header 为准。
 
-Zig Host 使用 bundle 中的 `sdk/metacodes_agentcore.zig`。这个 SDK 只声明 ABI、校验 wire
-类型并提供便利封装，不 import `src/` 或 `metacodes-core`，仍然是 source-free consumer。
-
-所有权、回调重入、并发、`run_id`、毒化 Session、错误码优先级和 ABI 演进规则均由
-`doc/AGENTCORE_BINARY_ABI.md`、`sdk/metacodes_agentcore.h` 与 SDK doc comments 共同约束；
-本文不复制第二份语义。
-
-## 5. Windows 工具链边界
-
-当前已验证的 Windows 交付 target 是 `x86_64-windows-gnu`，并由原生 Windows CI 运行
-`agentcore:gate`。这只证明对应 GNU bundle 能被门禁中的 source-free consumers 正确链接
-和运行。
-
-没有验证 `x86_64-windows-msvc` bundle，也没有验证 MSVC `link.exe` 或 `clang-cl` 消费
-GNU bundle。因此这些组合不在当前支持声明内。未来若支持 MSVC，应单独生成
-`x86_64-windows-msvc` bundle，并用该工具链的 native consumer 门禁证明兼容性；不能从
-GNU/COFF “理论上应该兼容”推导支持。
-
-## 6. 发布约束
-
-- 发布必须使用显式 target 和新的空 prefix，避免旧文件污染 exact-file allowlist。
-- 正式 bundle 使用 `-Dagentcore-require-clean-bundle=true`，并用
-  `-Dagentcore-expected-commit=<full hash>` 绑定源码身份。
-- ABI v1 为**实验版**：2026-07-17 的冻结已撤回（回调身份面存在悬空引用），短期不复冻，
-  复冻门槛见 `doc/AGENTCORE_BINARY_ABI.md` Status 节。实验期不承诺稳定：布局与语义可能
-  在 commit 间不兼容变更，消费者必须 pin 具体 bundle（manifest 记录源码 commit）。
-- 不向第三方分发或承诺 `metacodes-core` 源码 API。
+当前只有 `x86_64-windows-msvc` 完成 C/C++/Zig/Rust 原生消费门禁；Linux GNU、Intel macOS
+和 arm64 macOS 已完成 cross bundle/link/archive，但在各自原生复验完成前不标记可用。

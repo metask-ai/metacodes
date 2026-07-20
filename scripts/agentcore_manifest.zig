@@ -94,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
 
     const target_id = try packageTargetId(allocator, architecture, os, abi);
     const rust_target = try rustTarget(architecture, os, abi);
-    const readme = try renderReadme(allocator, version, target_id, resolved_target, source.commit);
+    const readme = try renderReadme(allocator, version, target_id, resolved_target, rust_target, source.commit);
     const zon = try renderZon(allocator, version);
     const cargo = try renderCargoToml(allocator, version);
     const cargo_lock = try renderCargoLock(allocator, version);
@@ -201,9 +201,17 @@ fn packageVersion(allocator: std.mem.Allocator, sdk_version: []const u8, source:
 }
 
 fn requireStableTag(allocator: std.mem.Allocator, io: std.Io, version: []const u8, commit: []const u8) !void {
-    const tag_ref = try std.fmt.allocPrint(allocator, "refs/tags/agentcore-v{s}^{{commit}}", .{version});
+    const tag_ref = try stableTagRef(allocator, version);
     const output = try runGit(allocator, io, &.{ "git", "rev-parse", "--verify", "--quiet", tag_ref });
     const tag_commit = std.mem.trim(u8, output, " \r\n\t");
+    try validateStableTagCommit(commit, tag_commit);
+}
+
+fn stableTagRef(allocator: std.mem.Allocator, version: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "refs/tags/agentcore-v{s}^{{commit}}", .{version});
+}
+
+fn validateStableTagCommit(commit: []const u8, tag_commit: []const u8) !void {
     if (!std.mem.eql(u8, tag_commit, commit)) return error.StableTagMismatch;
 }
 
@@ -233,6 +241,7 @@ fn renderReadme(
     version: []const u8,
     target: []const u8,
     zig_target: []const u8,
+    rust_target: []const u8,
     commit: []const u8,
 ) ![]const u8 {
     return std.fmt.allocPrint(allocator,
@@ -240,6 +249,7 @@ fn renderReadme(
         \\
         \\Target: `{s}`
         \\Required Zig target: `{s}`
+        \\Required Cargo target: `{s}`
         \\Source commit: `{s}`
         \\
         \\C and C++ consumers include `<metask/agentcore.h>` and link the static library in `lib/`.
@@ -249,7 +259,7 @@ fn renderReadme(
         \\The ABI is experimental and requires an exact revision match. Ownership, lifetime, concurrency,
         \\and failure contracts are defined by `doc/AGENTCORE_BINARY_ABI.md` at the source commit above.
         \\
-    , .{ version, target, zig_target, commit });
+    , .{ version, target, zig_target, rust_target, commit });
 }
 
 fn renderZon(allocator: std.mem.Allocator, version: []const u8) ![]const u8 {
@@ -505,4 +515,18 @@ test "generated development versions fit the Zig package limit" {
     const version = try packageVersion(allocator, "0.1.0-dev", source);
     defer allocator.free(version);
     try std.testing.expect(version.len <= 32);
+}
+
+test "stable tag name and commit match are exact" {
+    const allocator = std.testing.allocator;
+    const commit = "0123456789abcdef0123456789abcdef01234567";
+    const tag_ref = try stableTagRef(allocator, "0.1.0");
+    defer allocator.free(tag_ref);
+    try std.testing.expectEqualStrings("refs/tags/agentcore-v0.1.0^{commit}", tag_ref);
+    try validateStableTagCommit(commit, commit);
+    try std.testing.expectError(
+        error.StableTagMismatch,
+        validateStableTagCommit(commit, "1123456789abcdef0123456789abcdef01234567"),
+    );
+    try std.testing.expectError(error.StableTagMismatch, validateStableTagCommit(commit, ""));
 }

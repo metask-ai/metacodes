@@ -64,7 +64,7 @@ without trying to execute foreign binaries:
 
 ```sh
 zig build agentcore:bundle \
-  -Dtarget=x86_64-windows-gnu \
+  -Dtarget=x86_64-windows-msvc \
   -Doptimize=ReleaseSmall
 ```
 
@@ -73,7 +73,7 @@ bundle, links the source-free consumers, and executes them:
 
 ```sh
 zig build agentcore:gate \
-  -Dtarget=x86_64-windows-gnu \
+  -Dtarget=x86_64-windows-msvc \
   -Doptimize=ReleaseSmall
 ```
 
@@ -107,6 +107,12 @@ each other:
 │   ├── build.zig
 │   ├── build.zig.zon
 │   └── src/{root,protocol,types}.zig
+├── bindings/rust/
+│   ├── Cargo.toml
+│   ├── Cargo.lock
+│   ├── build.rs
+│   ├── examples/link_probe.rs
+│   └── src/{lib,raw}.rs
 ├── README.md
 └── manifest.json
 ```
@@ -127,13 +133,25 @@ source-free Zig, C, and C++17 consumers against the installed artifacts. The
 static library filename comes from Zig `out_filename` for that target (`.a` or
 `.lib`) and is recorded in the manifest. `agentcore:consumer` additionally runs
 the resulting programs, while `agentcore:gate` combines that native consumer
-check with the ABI test suite.
+check with the ABI test suite and runs the Rust ABI link probe.
 
-Native end-to-end verification currently covers macOS arm64 and
-`x86_64-windows-gnu`. The Windows GNU result does not claim compatibility with
-an MSVC-target bundle, `link.exe`, or `clang-cl`; those require a separately
-produced `x86_64-windows-msvc` bundle and native consumer gate before they can
-be listed as supported. This validation status is not an ABI restriction.
+`agentcore:rust` builds and links the bundled `metask-agentcore-sys` link probe.
+`agentcore:archive` creates a coordinate-rooted Windows zip or Unix tar.gz and
+an adjacent SHA-256 file; it rejects an existing coordinate instead of
+overwriting it.
+
+Current delivery status is intentionally target-specific:
+
+| Target | Bundle/archive | Native source-free consumption |
+|---|---|---|
+| `x86_64-windows-msvc` | verified | C/C++/Zig/Rust verified; currently usable |
+| `x86_64-linux-gnu` | cross-build/link verified | pending native Linux gate |
+| `x86_64-macos` | cross-build/link verified | pending native Intel macOS gate |
+| `aarch64-macos` | cross-build/link verified | pending native re-verification after the Rust bundle addition |
+
+Cross-build success is not a support claim. In particular, the empty macOS
+framework list remains provisional until the corresponding native gates pass.
+This validation status is not an ABI restriction.
 
 Schema version 1 is the first formal bundle layout. Earlier pre-release
 development manifests are unsupported.

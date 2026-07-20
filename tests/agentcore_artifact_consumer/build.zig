@@ -40,6 +40,7 @@ fn verifyPackageProjection(
     cargo_path: []const u8,
     version: []const u8,
     zig_target: []const u8,
+    rust_target: []const u8,
 ) void {
     const readme = std.Io.Dir.cwd().readFileAlloc(b.graph.io, readme_path, b.allocator, .limited(1024 * 1024)) catch
         @panic("cannot read AgentCore README.md");
@@ -47,6 +48,8 @@ fn verifyPackageProjection(
     if (!std.mem.startsWith(u8, readme, expected_heading)) @panic("AgentCore README version mismatch");
     const expected_target = b.fmt("Required Zig target: `{s}`", .{zig_target});
     if (std.mem.indexOf(u8, readme, expected_target) == null) @panic("AgentCore README Zig target mismatch");
+    const expected_rust_target = b.fmt("Required Cargo target: `{s}`", .{rust_target});
+    if (std.mem.indexOf(u8, readme, expected_rust_target) == null) @panic("AgentCore README Cargo target mismatch");
 
     const zon = std.Io.Dir.cwd().readFileAlloc(b.graph.io, zon_path, b.allocator, .limited(1024 * 1024)) catch
         @panic("cannot read AgentCore build.zig.zon");
@@ -174,7 +177,15 @@ pub fn build(b: *std.Build) void {
     verifyTextArtifact(b, rust_raw_path, manifest_contract.fileSha256(manifest.value.files, "bindings/rust/src/raw.rs").?);
     verifyTextArtifact(b, rust_link_probe_path, manifest_contract.fileSha256(manifest.value.files, "bindings/rust/examples/link_probe.rs").?);
     verifyTextArtifact(b, readme_path, manifest_contract.fileSha256(manifest.value.files, "README.md").?);
-    verifyPackageProjection(b, readme_path, zig_zon_path, cargo_path, manifest.value.version, manifest.value.target.zig_target);
+    verifyPackageProjection(
+        b,
+        readme_path,
+        zig_zon_path,
+        cargo_path,
+        manifest.value.version,
+        manifest.value.target.zig_target,
+        manifest.value.target.rust_target,
+    );
 
     const types = b.createModule(.{ .root_source_file = .{ .cwd_relative = types_path }, .target = target, .optimize = optimize });
     const protocol = b.createModule(.{ .root_source_file = .{ .cwd_relative = protocol_path }, .target = target, .optimize = optimize });

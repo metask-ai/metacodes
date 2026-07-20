@@ -112,6 +112,8 @@ Zig 包的 `build.zig` 同样读取同包 manifest，将消费端 resolved targe
 Windows `.lib` 必须是包含实现 object 的完整 static archive，不是 DLL import library。静态 AgentCore 库仍可依赖系统 C runtime、系统库或 macOS framework，并在 manifest 中声明。
 
 内部归档格式固定为 Windows `.zip`、Linux/macOS `.tar.gz`。
+`zig build agentcore:archive` 从已经通过 bundle gate 的目录创建带坐标根目录的归档和相邻
+`.sha256` 文件；已存在的同名坐标拒绝覆盖。该命令只是内部构建工具，不是发布或 staging 系统。
 
 ## 5. Target 包
 
@@ -125,6 +127,18 @@ Windows `.lib` 必须是包含实现 object 的完整 static archive，不是 DL
 | `aarch64-macos` | `aarch64-macos.<minimum>` | `aarch64-apple-darwin` |
 
 四个包可以分阶段完成，不要求当前建设原子发布系统。交叉编译只能证明产物可生成；正式标记某个 target 可用前，必须在相应原生工具链上完成消费测试。
+
+当前实现状态：
+
+| 包目标 | 构建状态 | 原生消费状态 |
+|---|---|---|
+| `x86_64-windows-msvc` | bundle、zip、SHA-256 已验证 | C/C++/Zig/Rust 原生 gate 已通过，当前可用 |
+| `x86_64-linux-gnu` | cross bundle/link、tar.gz、SHA-256 已验证 | 待 Linux x86_64 原生 gate，不标记可用 |
+| `x86_64-macos` | cross bundle/link、tar.gz、SHA-256 已验证 | 待 macOS x86_64 原生 gate，不标记可用 |
+| `aarch64-macos` | cross bundle/link、tar.gz、SHA-256 已验证 | 当前 Rust bundle 变更后待 macOS arm64 原生复验，不标记可用 |
+
+这里的状态是当前代码证据投影；任务进度仍以 TinyKG 为准。macOS 的 `system_frameworks`
+当前为空，只表示交叉链接没有发现额外 framework，必须由后续原生 gate 最终确认。
 
 暂不支持 Windows ARM64、Linux ARM64、musl 和 macOS Universal2。
 
