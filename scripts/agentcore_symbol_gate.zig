@@ -100,6 +100,7 @@ fn validateBsdLinkerMember(data: []const u8) !void {
 }
 
 fn checkSymbol(raw_symbol: []const u8, found_discovery: *bool) !void {
+    if (std.mem.startsWith(u8, raw_symbol, "__imp_")) return error.ImportLibrarySymbol;
     const symbol = if (std.mem.startsWith(u8, raw_symbol, "_")) raw_symbol[1..] else raw_symbol;
     if (std.mem.eql(u8, symbol, "metask_agentcore_get_api")) found_discovery.* = true;
     if (std.mem.startsWith(u8, symbol, "metacodes_agentcore_") or
@@ -141,6 +142,15 @@ test "archive symbol gate rejects missing discovery symbol" {
     @memset(data[4..8], 0);
     @memcpy(data[8..], symbols);
     try std.testing.expectError(error.MissingDiscoverySymbol, validateGnuLinkerMember(&data));
+}
+
+test "archive symbol gate rejects COFF import-library symbols" {
+    const symbols = "metask_agentcore_get_api\x00__imp_metask_agentcore_get_api\x00";
+    var data: [4 + 2 * 4 + symbols.len]u8 = undefined;
+    std.mem.writeInt(u32, data[0..4], 2, .big);
+    @memset(data[4..12], 0);
+    @memcpy(data[12..], symbols);
+    try std.testing.expectError(error.ImportLibrarySymbol, validateGnuLinkerMember(&data));
 }
 
 test "BSD archive symbol gate accepts Mach-O leading underscore" {
