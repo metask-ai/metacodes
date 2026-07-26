@@ -173,3 +173,45 @@ fn runGit(a: std.mem.Allocator, cwd: []const u8, args: []const []const u8) bool 
     defer a.free(out.stderr);
     return out.exit_code == 0;
 }
+
+test "L2 SW6 F7: 进程外 teammate 先等死再收尸——已死收掉,存活拒删,terminate 不留僵尸" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX fork/waitpid
+    const a = std.testing.allocator;
+    var sw = swctx.SwarmContext{ .allocator = a, .home = "" };
+    defer sw.deinit();
+
+    // ① 立即退出的子进程:reap 应收尸并摘除记录(修 008 僵尸)。
+    const dead_pid = std.c.fork();
+    if (dead_pid == 0) std.c._exit(0);
+    try std.testing.expect(dead_pid > 0);
+    try sw.process_teammates.append(a, .{
+        .pid = dead_pid,
+        .name = try a.dupe(u8, "dead"),
+        .worktree_path = try a.dupe(u8, ""),
+        .repo = try a.dupe(u8, ""),
+    });
+    cc.util_time.sleepMs(100); // 让子进程退净成 zombie
+    try std.testing.expectEqual(@as(usize, 0), sw.reapDeadProcessTeammates());
+    try std.testing.expectEqual(@as(usize, 0), sw.process_teammates.items.len);
+    // 已收尸:再 waitpid 返 -1(ECHILD),无僵尸残留。
+    var st: c_int = 0;
+    try std.testing.expectEqual(@as(std.c.pid_t, -1), std.c.waitpid(dead_pid, &st, 1));
+
+    // ② 长活子进程:reap 判存活(TeamDelete 会据此拒删);terminate 杀死+收尸,不留僵尸。
+    const live_pid = std.c.fork();
+    if (live_pid == 0) {
+        // 子进程:睡等信号(默认 SIGTERM 动作=终止)。nanosleep 是 async-signal-safe。
+        while (true) cc.util_time.sleepMs(1000);
+    }
+    try std.testing.expect(live_pid > 0);
+    try sw.process_teammates.append(a, .{
+        .pid = live_pid,
+        .name = try a.dupe(u8, "live"),
+        .worktree_path = try a.dupe(u8, ""),
+        .repo = try a.dupe(u8, ""),
+    });
+    try std.testing.expectEqual(@as(usize, 1), sw.reapDeadProcessTeammates()); // 存活
+    sw.terminateProcessTeammates(2000); // SIGTERM → 等死 → 收尸
+    try std.testing.expectEqual(@as(usize, 0), sw.process_teammates.items.len);
+    try std.testing.expectEqual(@as(std.c.pid_t, -1), std.c.waitpid(live_pid, &st, 1));
+}

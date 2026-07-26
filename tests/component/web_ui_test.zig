@@ -420,6 +420,34 @@ test "L2 web: /interrupt 空闲期 409 不打 abort;生成期 200 打 abort" {
     }
 }
 
+test "L2 web:MAX_CONNS 连接上限——第 N+1 条被立即拒绝(close),存量连接不受影响" {
+    const a = std.testing.allocator;
+    const pnet = @import("platform").net;
+    const MAX = cc.web_server.MAX_CONNS;
+
+    var fx = Fixture.init(a);
+    defer fx.deinit();
+    try fx.start(a);
+
+    // 占满 MAX 条 idle 连接(不发请求,握手后挂着)。
+    var held: [cc.web_server.MAX_CONNS]pnet.Socket = undefined;
+    var opened: usize = 0;
+    defer for (held[0..opened]) |s| pnet.closeSocket(s); // 关客户端侧 → handleConn 读到 EOF 退净
+    while (opened < MAX) : (opened += 1) held[opened] = try pnet.connectLoopback(fx.srv.port);
+    // 等 accept 线程消化完 backlog(connect 返回 ≠ 已 accept)。
+    var waited: usize = 0;
+    while (fx.srv.live_conns.load(.acquire) < MAX and waited < 5000) : (waited += 10) cc.util_time.sleepMs(10);
+    try std.testing.expectEqual(MAX, fx.srv.live_conns.load(.acquire));
+
+    // 第 MAX+1 条:server 应直接 close(recv 读到 EOF=0),且 live_conns 不增。
+    const extra = try pnet.connectLoopback(fx.srv.port);
+    defer pnet.closeSocket(extra);
+    pnet.setRecvTimeoutMs(extra, 5000);
+    var b: [16]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, 0), pnet.recv(extra, &b));
+    try std.testing.expectEqual(MAX, fx.srv.live_conns.load(.acquire));
+}
+
 // ── 极简 HTTP 客户端(raw socket;哑读到含 needle / EOF)───────────────────────
 
 fn httpGetUntil(a: std.mem.Allocator, port: u16, path: []const u8, needle: []const u8) ![]u8 {

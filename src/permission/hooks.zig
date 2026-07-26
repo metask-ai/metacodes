@@ -47,6 +47,34 @@ const util_time = @import("../util/time.zig");
 /// hook 子进程超时(ms)。超时 → killpg + 当作非阻塞错误(proceed)。防挂死 agent loop。
 const HOOK_TIMEOUT_MS: i64 = 5000;
 
+/// 单次 hook 事件(一条工具/一个生命周期点)的**总预算**:N 个匹配 hook 串行跑,无总预算时
+/// 最坏 5N 秒钉死 agent_loop 主线程。预算耗尽 → 剩余 hook 跳过 + warn(与单 hook 超时同款
+/// fail-open 语义;已产出的 block/updatedInput 保留)。
+const HOOK_TOTAL_BUDGET_MS: i64 = 15_000;
+
+const AbortSignal = @import("../util/abort.zig").AbortSignal;
+
+/// 把 AbortSignal 包成 platform/process 的 opaque 回调(同 tools/common.zig AbortBridge)。
+const AbortBridge = struct {
+    fn poll(ctx: ?*const anyopaque) bool {
+        const a: *const AbortSignal = @ptrCast(@alignCast(ctx.?));
+        return a.isAborted();
+    }
+};
+
+/// 事件级预算:deadline 制。remaining()<=0 时调用方跳过剩余 hook。
+const Budget = struct {
+    deadline_ms: i64,
+    fn start() Budget {
+        return .{ .deadline_ms = util_time.nowMs() + HOOK_TOTAL_BUDGET_MS };
+    }
+    /// 单 hook 可用超时 = min(单 hook 上限, 预算余量)。<=0 = 预算耗尽。
+    fn perHookTimeoutMs(self: *const Budget) i64 {
+        const remaining = self.deadline_ms - util_time.nowMs();
+        return @min(HOOK_TIMEOUT_MS, remaining);
+    }
+};
+
 pub const HookDecision = enum {
     /// hook 放行(exit 0 且无 block 决策)— 继续后续权限链
     proceed,
@@ -288,6 +316,19 @@ pub fn runPreToolUseFull(
     alloc: std.mem.Allocator,
     tool_name: []const u8,
     args: []const u8,
+    abort: ?*const AbortSignal,
+) PreHookResult {
+    return runPreToolUseFullWithBudget(set, alloc, tool_name, args, abort, Budget.start());
+}
+
+/// 内部实现,budget 可注入(测试用过期 deadline 断言跳过语义,免真 sleep)。
+fn runPreToolUseFullWithBudget(
+    set: *const HookSet,
+    alloc: std.mem.Allocator,
+    tool_name: []const u8,
+    args: []const u8,
+    abort: ?*const AbortSignal,
+    budget: Budget,
 ) PreHookResult {
     var out = PreHookResult{};
     if (!set.hasPre()) return out;
@@ -302,7 +343,12 @@ pub fn runPreToolUseFull(
     for (set.pre_tool_use) |entry| {
         if (!matcherMatches(entry.matcher, tool_name)) continue;
         for (entry.commands) |cmd| {
-            var r = runOneHookFull(alloc, cmd, stdin_json);
+            const per_timeout = budget.perHookTimeoutMs();
+            if (per_timeout <= 0) {
+                log.warn("hook", "PreToolUse total budget exhausted, skipping remaining hooks (tool={s})", .{tool_name});
+                return out;
+            }
+            var r = runOneHookFull(alloc, cmd, stdin_json, per_timeout, abort);
             // 链式改写:新 updatedInput 覆盖旧的(释放旧)。
             if (r.updated_input) |ui| {
                 if (out.modified_input) |old| alloc.free(old);
@@ -327,7 +373,7 @@ pub fn runPreToolUse(
     tool_name: []const u8,
     args: []const u8,
 ) HookDecision {
-    const r = runPreToolUseFull(set, alloc, tool_name, args);
+    const r = runPreToolUseFull(set, alloc, tool_name, args, null);
     if (r.modified_input) |mi| alloc.free(mi);
     return r.decision;
 }
@@ -341,6 +387,7 @@ pub fn runPostToolUse(
     tool_name: []const u8,
     args: []const u8,
     tool_response: []const u8,
+    abort: ?*const AbortSignal,
 ) ?[]u8 {
     if (!set.hasPost()) return null;
 
@@ -351,12 +398,18 @@ pub fn runPostToolUse(
     ) catch return null;
     defer alloc.free(stdin_json);
 
+    const budget = Budget.start();
     var acc: std.ArrayList(u8) = .empty;
     defer acc.deinit(alloc);
-    for (set.post_tool_use) |entry| {
+    outer: for (set.post_tool_use) |entry| {
         if (!matcherMatches(entry.matcher, tool_name)) continue;
         for (entry.commands) |cmd| {
-            const r = runOneHookFull(alloc, cmd, stdin_json);
+            const per_timeout = budget.perHookTimeoutMs();
+            if (per_timeout <= 0) {
+                log.warn("hook", "PostToolUse total budget exhausted, skipping remaining hooks (tool={s})", .{tool_name});
+                break :outer;
+            }
+            const r = runOneHookFull(alloc, cmd, stdin_json, per_timeout, abort);
             defer if (r.updated_input) |ui| alloc.free(ui); // PostToolUse 不消费 updatedInput
             if (r.additional_context) |ac| {
                 defer alloc.free(ac);
@@ -384,11 +437,17 @@ pub fn runLifecycleHooks(
     stdin_json: []const u8,
 ) ?[]u8 {
     if (entries.len == 0) return null;
+    const budget = Budget.start();
     var acc: std.ArrayList(u8) = .empty;
     defer acc.deinit(alloc);
-    for (entries) |entry| {
+    outer: for (entries) |entry| {
         for (entry.commands) |cmd| {
-            const r = runOneHookFull(alloc, cmd, stdin_json);
+            const per_timeout = budget.perHookTimeoutMs();
+            if (per_timeout <= 0) {
+                log.warn("hook", "{s} total budget exhausted, skipping remaining hooks", .{event_name});
+                break :outer;
+            }
+            const r = runOneHookFull(alloc, cmd, stdin_json, per_timeout, null);
             defer if (r.updated_input) |ui| alloc.free(ui); // 生命周期 hook 不消费 updatedInput
             if (r.additional_context) |ac| {
                 defer alloc.free(ac);
@@ -414,7 +473,7 @@ const OneHookResult = struct {
 /// 跑单个 hook:`/bin/sh -c <cmd>`,把 stdin_json 写进它 stdin,读 exit code + stdout。
 /// exit 2 → block;exit 0 → 看 stdout decision;其它 → proceed(非阻塞错误)。
 /// stdout JSON 可含 updatedInput(改写工具输入)/ additionalContext(注入模型的补充上下文)。
-fn runOneHookFull(alloc: std.mem.Allocator, cmd: []const u8, stdin_json: []const u8) OneHookResult {
+fn runOneHookFull(alloc: std.mem.Allocator, cmd: []const u8, stdin_json: []const u8, timeout_ms: i64, abort: ?*const AbortSignal) OneHookResult {
     // 可移植 shell(与 Bash 工具同款 core/shell 检测:POSIX sh -c / Windows PowerShell/cmd)。
     // 硬编码 /bin/sh 在 Windows 无此文件 → 所有 hook 静默 fail-open(实测 openai P0.2 红)。
     const sys_shell = shell_mod.detectDefault();
@@ -430,16 +489,19 @@ fn runOneHookFull(alloc: std.mem.Allocator, cmd: []const u8, stdin_json: []const
         .stdin_data = stdin_json,
         .want_stderr = false,
         .inherit_env = true,
-        .timeout_ms = @intCast(HOOK_TIMEOUT_MS),
+        .timeout_ms = @intCast(timeout_ms), // 事件级预算裁剪(≤ HOOK_TIMEOUT_MS)
         .max_bytes = 4096,
         .timeout_partial = true,
+        // abort 接线:hook 期间 Ctrl+C 可中断(此前 5N 秒窗口打不断)。
+        .abort_ctx = if (abort) |a| @ptrCast(a) else null,
+        .abort_poll = if (abort != null) AbortBridge.poll else null,
     }) catch {
         log.warn("hook", "spawn failed, skipping hook: {s}", .{cmd});
         return .{};
     };
     defer alloc.free(r.stdout);
     defer alloc.free(r.stderr);
-    if (r.timed_out) log.warn("hook", "hook 超时 {d}ms 被杀(保留部分输出判决): {s}", .{ HOOK_TIMEOUT_MS, cmd });
+    if (r.timed_out) log.warn("hook", "hook 超时 {d}ms 被杀(保留部分输出判决): {s}", .{ timeout_ms, cmd });
     const stdout = r.stdout;
     // 超时/被 kill(exit_code 负)→ 非 exit-2,走 stdout 决策;正常退出取实 exit code(exit 2 = block)。
     const exit_code: u8 = if (r.timed_out) 1 else if (r.exit_code >= 0 and r.exit_code <= 255) @intCast(r.exit_code) else 1;
@@ -633,11 +695,34 @@ test "runPreToolUseFull: updatedInput 改写工具输入" {
     const cmds = [_][]const u8{"echo '{\"updatedInput\":{\"command\":\"ls -la\"}}'"};
     const entries = [_]HookEntry{.{ .matcher = "Bash", .commands = &cmds }};
     const set = HookSet{ .pre_tool_use = &entries, .allocator = alloc };
-    const r = runPreToolUseFull(&set, alloc, "Bash", "{\"command\":\"ls\"}");
+    const r = runPreToolUseFull(&set, alloc, "Bash", "{\"command\":\"ls\"}", null);
     defer if (r.modified_input) |mi| alloc.free(mi);
     try testing.expect(r.decision == .proceed);
     try testing.expect(r.modified_input != null);
     try testing.expectEqualStrings("{\"command\":\"ls -la\"}", r.modified_input.?);
+}
+
+test "Budget: perHookTimeoutMs = min(单hook上限, 余量);过期 deadline → <=0" {
+    const fresh = Budget.start();
+    const t = fresh.perHookTimeoutMs();
+    try testing.expect(t > 0 and t <= HOOK_TIMEOUT_MS);
+    const expired = Budget{ .deadline_ms = 0 }; // 单调钟远过去
+    try testing.expect(expired.perHookTimeoutMs() <= 0);
+}
+
+test "runPreToolUseFull: 总预算耗尽 → 跳过剩余 hook(fail-open,不 spawn)" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX 专属测试脚手架
+    const alloc = testing.allocator;
+    // 会 block 的 hook(exit 2);预算已耗尽 → 根本不 spawn,决策保持 proceed。
+    const cmds = [_][]const u8{"exit 2"};
+    const entries = [_]HookEntry{.{ .matcher = "Bash", .commands = &cmds }};
+    const set = HookSet{ .pre_tool_use = &entries, .allocator = alloc };
+    const r = runPreToolUseFullWithBudget(&set, alloc, "Bash", "{}", null, .{ .deadline_ms = 0 });
+    try testing.expect(r.decision == .proceed);
+    try testing.expect(r.modified_input == null);
+    // 对照:预算充足时同一 hook 正常 block(证明上面确因预算而跳)。
+    const r2 = runPreToolUseFullWithBudget(&set, alloc, "Bash", "{}", null, Budget.start());
+    try testing.expect(r2.decision == .block);
 }
 
 test "runPostToolUse: 收集 additionalContext" {
@@ -646,7 +731,7 @@ test "runPostToolUse: 收集 additionalContext" {
     const cmds = [_][]const u8{"echo '{\"additionalContext\":\"lint passed\"}'"};
     const entries = [_]HookEntry{.{ .matcher = "*", .commands = &cmds }};
     const set = HookSet{ .pre_tool_use = &.{}, .post_tool_use = &entries, .allocator = alloc };
-    const ctx = runPostToolUse(&set, alloc, "Write", "{\"file\":\"a\"}", "{\"ok\":true}");
+    const ctx = runPostToolUse(&set, alloc, "Write", "{\"file\":\"a\"}", "{\"ok\":true}", null);
     defer if (ctx) |c| alloc.free(c);
     try testing.expect(ctx != null);
     try testing.expectEqualStrings("lint passed", ctx.?);
@@ -677,10 +762,10 @@ test "runPostToolUse: 无 post hook / 不匹配 → null" {
     const entries = [_]HookEntry{.{ .matcher = "Bash", .commands = &cmds }};
     const set = HookSet{ .pre_tool_use = &.{}, .post_tool_use = &entries, .allocator = alloc };
     // matcher=Bash 不匹配 Write → null
-    try testing.expect(runPostToolUse(&set, alloc, "Write", "{}", "{}") == null);
+    try testing.expect(runPostToolUse(&set, alloc, "Write", "{}", "{}", null) == null);
     // 完全无 post hook → null
     const empty = HookSet{ .pre_tool_use = &.{}, .allocator = alloc };
-    try testing.expect(runPostToolUse(&empty, alloc, "Write", "{}", "{}") == null);
+    try testing.expect(runPostToolUse(&empty, alloc, "Write", "{}", "{}", null) == null);
 }
 
 // ── G-rest:生命周期 hook(Stop / PreCompact / PostCompact) ─────────────────

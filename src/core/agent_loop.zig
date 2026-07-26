@@ -1036,7 +1036,7 @@ pub fn run(
             // PreToolUse hook(有配置才跑):可 block(拒)或 updatedInput(改写工具输入)。
             var eff_input = tu.input;
             if (hookset) |hs| if (hs.hasPre()) {
-                const pre = hooks_mod.runPreToolUseFull(hs, allocator, tu.name, tu.input);
+                const pre = hooks_mod.runPreToolUseFull(hs, allocator, tu.name, tu.input, opts.abort);
                 if (pre.modified_input) |mi| {
                     mod_inputs.append(allocator, mi) catch allocator.free(mi);
                     // append 成功才用改写值;失败(OOM)已 free,退回原 input。
@@ -1302,7 +1302,7 @@ pub fn run(
             // PostToolUse hook(执行后,仅真跑过的 slot):收集 additionalContext 注入下轮上下文。
             if (s.decision == .run) {
                 if (hookset) |hs| if (hs.hasPost()) {
-                    if (hooks_mod.runPostToolUse(hs, allocator, s.name, s.input, content)) |ac| {
+                    if (hooks_mod.runPostToolUse(hs, allocator, s.name, s.input, content, opts.abort)) |ac| {
                         defer allocator.free(ac);
                         if (post_ctx.items.len > 0) post_ctx.append(allocator, '\n') catch {};
                         post_ctx.appendSlice(allocator, ac) catch {};

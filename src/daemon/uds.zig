@@ -67,8 +67,15 @@ pub const UdsServer = struct {
         // drain 连接线程(≤12s):journal 已 close 会唤醒 attach,普通请求线程靠 recv 超时查 closing。
         var waited: usize = 0;
         while (self.live_conns.load(.acquire) > 0 and waited < 12_000) : (waited += 10) time.sleepMs(10);
-        if (self.live_conns.load(.acquire) > 0)
+        if (self.live_conns.load(.acquire) > 0) {
+            // 兜底(理论上不达:12s > 1s recv 超时)。存活连接线程仍读 self.closing/self.deps,
+            // free/destroy 会 UAF → 泄漏 self(对齐 web/server.zig stop)。**只堵 self 这一个 UAF
+            // 源**:deps(journal/inbox 等)由调用方无条件释放,线程真 hang(非超时可醒)时照样死
+            // ——此路径只应在未定义环境触发。socket 文件仍 unlink 不残留。
             log.warn("uds", "stop: {d} conn thread(s) still live after 12s, leaking UdsServer", .{self.live_conns.load(.acquire)});
+            net.unlinkUnixPath(self.path);
+            return;
+        }
         net.unlinkUnixPath(self.path);
         self.allocator.free(self.path);
         self.allocator.destroy(self);
@@ -84,6 +91,12 @@ pub const UdsServer = struct {
             if (self.closing.load(.acquire)) {
                 net.closeSocket(conn);
                 return;
+            }
+            // 连接数上限(同 web/server.zig MAX_CONNS):每连接 1 线程,无界即 slow-loris。
+            if (self.live_conns.load(.acquire) >= @import("../web/server.zig").MAX_CONNS) {
+                log.warn("uds", "connection limit reached, rejecting", .{});
+                net.closeSocket(conn);
+                continue;
             }
             _ = self.live_conns.fetchAdd(1, .acq_rel);
             const t = std.Thread.spawn(.{}, handleConn, .{ self, conn }) catch {

@@ -331,6 +331,9 @@ pub fn main(init: std.process.Init) !void {
             log.err("swarm", "teammate process failed: {s}", .{@errorName(err)});
             break :blk 1;
         };
+        // 所有 run-mode 路径统一:process.exit 跳过 defer app.deinit → MCP/LSP 子进程变孤儿,
+        // exit 前显式 deinit(此时 mailbox 循环已退出,App quiescent)。
+        app.deinit();
         std.process.exit(code);
     }
 
@@ -349,6 +352,9 @@ pub fn main(init: std.process.Init) !void {
             log.err("daemon", "serve failed: {s}", .{@errorName(err)});
             break :blk 1;
         };
+        // process.exit 跳过 defer app.deinit → MCP/LSP 子进程不 terminate/reap 变孤儿
+        // (serve_multi 在 teardownSlot 自行 reap,此路径须显式)。serve 返回时 driver 已 join,安全。
+        app.deinit();
         std.process.exit(code);
     }
 
@@ -358,18 +364,22 @@ pub fn main(init: std.process.Init) !void {
             log.err("web", "web session failed: {s}", .{@errorName(err)});
             break :blk 1;
         };
+        // 同 serve:exit 前显式 deinit,reap MCP/LSP 子进程。run() 返回时连接线程已 drain,安全。
+        app.deinit();
         std.process.exit(code);
     }
 
     // U8:`--resume-response <json>` → 恢复挂起的 session(read suspend.json→resumeRun),不进 REPL。
     if (config.resume_response) |resp| {
         const code = @import("repl/headless.zig").resumeSuspended(app, allocator, resp, config.json_output) catch 1;
+        app.deinit(); // 同上:reap MCP/LSP 子进程(恢复运行已结束,quiescent)
         std.process.exit(code);
     }
 
     // Headless 模式：`-p "..."` / stdin pipe → 跑单次 prompt 后退出，不进 REPL。
     if (config.prompt) |p| {
         const code = @import("repl/headless.zig").run(app, allocator, p, config.json_output) catch 1;
+        app.deinit(); // 同上:headless 一样跑 MCP/LSP,同款孤儿病(agent loop 已结束,quiescent)
         std.process.exit(code);
     }
 

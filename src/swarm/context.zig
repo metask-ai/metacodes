@@ -43,20 +43,60 @@ pub const SwarmContext = struct {
     model: []const u8 = "",
     provider_kind: types_mod.ProviderKind = .anthropic,
 
-    pub fn deinit(self: *SwarmContext) void {
-        // SW6:先关进程外 teammate(SIGTERM + removeWorktree),再收 in-process。
+    /// 非阻塞 reap:对进程外 teammate waitpid(WNOHANG),已退出的收尸+removeWorktree+摘除记录。
+    /// 返回仍存活的数量。POSIX only(Windows 列表恒空)。
+    pub fn reapDeadProcessTeammates(self: *SwarmContext) usize {
+        if (@import("builtin").os.tag == .windows) return 0;
+        var i: usize = 0;
+        while (i < self.process_teammates.items.len) {
+            const pt = &self.process_teammates.items[i];
+            var status: c_int = 0;
+            const WNOHANG: c_int = 1;
+            const r = std.c.waitpid(@intCast(pt.pid), &status, WNOHANG);
+            // r==pid:已退出收尸完成。r==-1(ECHILD/ESRCH):非我子进程/已消失(如测试假 pid、
+            // 已被收过)→ 同样清记录,绝不当"存活"(否则 terminate 白等宽限期)。r==0:仍活着。
+            if (r == pt.pid or r == -1) {
+                // 进程已死/不存在 → 清 worktree(无写入竞态)+ 释放记录。
+                if (pt.worktree_path.len > 0)
+                    @import("teammate_process.zig").removeWorktree(self.allocator, pt.worktree_path, pt.repo, null);
+                self.allocator.free(pt.name);
+                self.allocator.free(pt.worktree_path);
+                self.allocator.free(pt.repo);
+                _ = self.process_teammates.swapRemove(i);
+                continue; // swapRemove 换入新元素,i 不动
+            }
+            i += 1;
+        }
+        return self.process_teammates.items.len;
+    }
+
+    /// 终止全部进程外 teammate:SIGTERM → 宽限期 poll waitpid(WNOHANG)→ 顽固 SIGKILL → 阻塞收尸
+    /// → removeWorktree。**必须先等死再删 worktree**:teammate 可能还在写,强删是竞态(旧 bug)。
+    pub fn terminateProcessTeammates(self: *SwarmContext, grace_ms: u64) void {
+        if (@import("builtin").os.tag == .windows) return;
+        if (self.process_teammates.items.len == 0) return;
+        const time = @import("../util/time.zig");
+        for (self.process_teammates.items) |*pt| _ = std.c.kill(@intCast(pt.pid), std.c.SIG.TERM);
+        var waited: u64 = 0;
+        while (self.reapDeadProcessTeammates() > 0 and waited < grace_ms) : (waited += 50) time.sleepMs(50);
+        // 宽限期后仍活着的:SIGKILL + 阻塞收尸(KILL 不可忽略,waitpid 必返)。
         for (self.process_teammates.items) |*pt| {
-            // POSIX kill(Windows 无 std.c.kill/SIG;进程外 teammate 在 Windows 不可用,列表恒空)。
-            if (@import("builtin").os.tag != .windows) {
-                _ = std.c.kill(@intCast(pt.pid), std.c.SIG.TERM);
-            }
-            if (pt.worktree_path.len > 0) {
+            _ = std.c.kill(@intCast(pt.pid), std.c.SIG.KILL);
+            var status: c_int = 0;
+            _ = std.c.waitpid(@intCast(pt.pid), &status, 0);
+            if (pt.worktree_path.len > 0)
                 @import("teammate_process.zig").removeWorktree(self.allocator, pt.worktree_path, pt.repo, null);
-            }
             self.allocator.free(pt.name);
             self.allocator.free(pt.worktree_path);
             self.allocator.free(pt.repo);
         }
+        self.process_teammates.clearRetainingCapacity();
+    }
+
+    pub fn deinit(self: *SwarmContext) void {
+        // SW6:先关进程外 teammate(SIGTERM→等死→收尸→removeWorktree;等死在删 worktree 之前,
+        // 否则与 teammate 写 worktree 竞态),再收 in-process。
+        self.terminateProcessTeammates(2000);
         self.process_teammates.deinit(self.allocator);
         // 先 abort+join 全 teammate 线程(它们可能在写 config/inbox),再清目录——顺序不可换。
         if (self.teammates) |*t| t.deinit();

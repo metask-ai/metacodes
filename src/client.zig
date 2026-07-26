@@ -300,6 +300,7 @@ pub const Client = struct {
         defer secureFree(client.allocator, auth_header);
 
         var req = client.http_client.request(.GET, uri, .{
+            .keep_alive = false, // 同 POST:不复用陈旧连接
             .extra_headers = &.{
                 .{ .name = "anthropic-version", .value = "2023-06-01" },
                 .{ .name = "authorization", .value = auth_header },
@@ -503,7 +504,10 @@ pub const Client = struct {
         };
         errdefer client.allocator.destroy(req_ptr);
 
+        // keep_alive=false:长驻(serve/--web)复用连接池,空闲后服务端关连接,首个 sendBody 撞
+        // WriteFailed → 重试风暴(isTransientNetworkError 注释的病根)。对齐 openai/gemini client 根除。
         req_ptr.* = client.http_client.request(.POST, uri, .{
+            .keep_alive = false,
             .extra_headers = &.{
                 .{ .name = "anthropic-version", .value = "2023-06-01" },
                 .{ .name = "content-type", .value = "application/json" },

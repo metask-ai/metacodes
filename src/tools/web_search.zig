@@ -22,6 +22,9 @@ const json_mod = @import("../json.zig");
 const api_stream = @import("../api/stream.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
+/// 子请求建连重试上限(< 主对话 defaultMaxRetries=10:工具内快速失败优于长时间钉死)。
+const WEB_SEARCH_MAX_RETRIES: u32 = 3;
+
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
     const query = common.extractJsonArg(args, "query") orelse return error.MissingQuery;
@@ -46,7 +49,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // tool_choice 强制 web_search(对齐 cc 弱模型路径):保证模型必发搜索。
     const tc = json_mod.ToolChoice{ .type = "tool", .name = "web_search" };
 
-    var stream = client.sendMessageStreamFull(&msgs, sys_prompt, &tools_one, ctx.abort, null, tc) catch |err| {
+    // retry 版:主对话有建连重试兜底,WebSearch 子请求原走无重试版,恰是最易撞瞬态网络错的路径。
+    // 次数按语义配比例:主对话 10 次(唯一的路,必须兜);子请求 3 次(网络真挂时快速失败让模型
+    // 换路子,不钉死工具调用两分钟)。
+    var stream = client.sendMessageStreamFullRetry(&msgs, sys_prompt, &tools_one, ctx.abort, null, tc, WEB_SEARCH_MAX_RETRIES, 0, null) catch |err| {
         setDetail(ctx, allocator, "web search request failed: {s}", .{@errorName(err)});
         return error.WebSearchFailed;
     };

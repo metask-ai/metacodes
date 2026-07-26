@@ -129,6 +129,9 @@ pub fn executeTeamDelete(ctx: *const ToolContext, args: []const u8) anyerror![]u
     if (sw.teammates) |*t| {
         if (t.liveCount() > 0) return error.TeammatesStillActive;
     }
+    // 进程外 teammate 同款检查(旧缺口:只查 in-process registry,活跃进程外成员时照样 rmrf
+    // 掉 team 目录抽走其邮箱)。先非阻塞收尸(已死的清掉),仍存活 → 拒绝。
+    if (sw.reapDeadProcessTeammates() > 0) return error.TeammatesStillActive;
 
     // 拆 registry(abort+join 已终止的尸体)。
     if (sw.teammates) |*t| {

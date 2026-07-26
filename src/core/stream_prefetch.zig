@@ -20,8 +20,9 @@ const ToolContext = tools_mod.ToolContext;
 const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
 
-/// 可流式执行的工具:除 **WebSearch** 外的一切。WebSearch 在其隔离子请求里用 `ctx.api_client`
-/// 发子 LLM 请求,会与"仍在跑的主 stream"竞争同一模型 client(数据竞争)→ 排除,留给流末 executeSlots。
+/// 可流式执行的工具:除 **WebSearch** 外的一切。WebSearch 在其隔离子请求里发子 LLM 请求,
+/// 是重量级付费调用——主 stream 后续还可能取消/改写本轮工具,投机预取的浪费远高于 Read/Grep
+/// (成本论;std.http.Client 连接池本身线程安全,并发不是排除理由)→ 留给流末 executeSlots。
 /// 真正能否边流边执行由调用方叠加 `isConcurrencySafeInput`(只读语义)+ 权限 allow + 无 PreToolUse hook。
 pub fn isStreamable(name: []const u8) bool {
     return !std.mem.eql(u8, name, "WebSearch");
@@ -91,9 +92,24 @@ pub const Prefetch = struct {
         return .{ .allocator = allocator };
     }
 
+    /// 已 spawn 未 join 的预取线程数。**刻意保守**:take/joinAll 只在流末发生,完成但未 join 的
+    /// 线程照样占坑 → 实际语义是"每个流最多 MAX_TOOL_CONCURRENCY 次预取",不是"最多 N 并发"。
+    /// 这也是 cap 测试确定性的前提(完成的 sleep 任务仍计数)——改成真在飞计数(done 标志)前
+    /// 必须同步改测试。超出 cap 的工具流末正常执行,只损失投机收益。
+    fn inflightCount(self: *const Prefetch) usize {
+        var n: usize = 0;
+        for (self.entries.items) |e| {
+            if (e.thread != null) n += 1;
+        }
+        return n;
+    }
+
     /// 开一个预取线程执行 (name,input),结果按 id 存。ctx 必须活过整个流(基于 turn 作用域的 ctx)。
     /// spawn 失败 → 静默跳过(该工具流末正常执行,无害)。
+    /// **并发上限**:在飞线程 ≥ MAX_TOOL_CONCURRENCY 时不预取(直接 return,take 返 null →
+    /// executeSlots 正常执行)——消费路径有 8 的滑动窗口,预取侧无界曾是疏漏。
     pub fn start(self: *Prefetch, ctx: *const ToolContext, id: []const u8, name: []const u8, input: []const u8, rid: log.RequestId) void {
+        if (self.inflightCount() >= @import("tool_exec.zig").MAX_TOOL_CONCURRENCY) return;
         const entry = self.allocator.create(Entry) catch return;
         entry.* = .{ .id = id };
         self.entries.append(self.allocator, entry) catch {
@@ -161,7 +177,7 @@ pub const Prefetch = struct {
     }
 };
 
-test "isStreamable 除 WebSearch 外皆可流(WebSearch 竞争模型 client 排除)" {
+test "isStreamable 除 WebSearch 外皆可流(WebSearch 重量级子请求,成本论排除)" {
     // 可流性只排 WebSearch;真正能否流由调用方叠加 isConcurrencySafeInput + 权限 + 无 hook。
     try std.testing.expect(isStreamable("Read"));
     try std.testing.expect(isStreamable("Bash"));
@@ -203,6 +219,25 @@ test "Prefetch start+take:真 builtin Glob 结果正确落地(执行路径端到
     // 再取同 id → null(已取走);随机 id → null。
     try std.testing.expect(p.take("gid") == null);
     try std.testing.expect(p.take("nope") == null);
+}
+
+test "Prefetch:在飞线程数被 MAX_TOOL_CONCURRENCY cap(一轮 20 个只起 ≤8 线程)" {
+    const a = std.testing.allocator;
+    var p = Prefetch.init(a);
+    defer p.deinit();
+    var ctx = ToolContext{ .allocator = a, .cwd_abs = ".", .home_dir = "/tmp" };
+    // sleep 0.3s 让前 8 个线程稳定在飞;后 12 次 start 撞 cap 直接拒绝(不建 entry)。
+    var i: usize = 0;
+    var ids: [20][2]u8 = undefined;
+    while (i < 20) : (i += 1) {
+        ids[i] = .{ 'p', @as(u8, @intCast('a' + i)) };
+        p.start(&ctx, &ids[i], "Bash", "{\"command\":\"sleep 0.3\"}", .{ .bytes = [_]u8{'0'} ** 12 });
+    }
+    const cap = @import("tool_exec.zig").MAX_TOOL_CONCURRENCY;
+    try std.testing.expect(p.entries.items.len <= cap);
+    try std.testing.expect(p.inflightCount() <= cap);
+    // 被拒绝的 id take 返 null → executeSlots 正常执行,语义无损。
+    try std.testing.expect(p.take(&ids[19]) == null);
 }
 
 test "Prefetch:未取走的 entry 由 deinit join+释放(无泄漏,MED-2 abort/discard 生命周期)" {

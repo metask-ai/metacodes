@@ -82,6 +82,9 @@ pub const Deps = struct {
     root_ctx: *anyopaque = undefined,
 };
 
+/// 并发连接硬上限(HTTP+UDS 各自计):每连接 1 detached 线程 + 1MB 缓冲,无界即 slow-loris DoS。
+pub const MAX_CONNS: usize = 64;
+
 pub const WebServer = struct {
     /// 必须线程安全(连接线程并发分配)。
     allocator: std.mem.Allocator,
@@ -149,6 +152,14 @@ pub const WebServer = struct {
                 time.sleepMs(10);
                 continue;
             };
+            // 连接数上限:防 slow-loris 打满线程(每连接 1 线程 + 1MB 请求缓冲,无界即 DoS)。
+            // 上限要容 SSE 长连接(每浏览器标签常驻一条)+ 突发短请求;64 对本机单用户富余。
+            // 直接 close 拒绝(不回 503:写响应也要占线程,极端场景反成放大器)。
+            if (self.live_conns.load(.acquire) >= MAX_CONNS) {
+                log.warn("web", "connection limit reached ({d}), rejecting", .{@as(usize, MAX_CONNS)});
+                net.closeSocket(conn_fd);
+                continue;
+            }
             // 计数在 spawn 前加(accept 线程侧):避免"已 accept 未及计数"时 stop 误判 0。
             _ = self.live_conns.fetchAdd(1, .acq_rel);
             const t = std.Thread.spawn(.{}, handleConn, .{ self, conn_fd }) catch {

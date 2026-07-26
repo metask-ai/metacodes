@@ -27,6 +27,7 @@ const servers = @import("servers.zig");
 const workspace = @import("workspace.zig");
 const reporter = @import("reporter.zig");
 const transport = @import("transport.zig");
+const log = @import("../util/log.zig");
 
 const Client = client_mod.Client;
 
@@ -34,6 +35,10 @@ const BASELINE_WAIT_MS: u64 = 8_000;
 const DIAGNOSTICS_WAIT_MS: u64 = 6_000;
 const IDLE_TIMEOUT_MS: u64 = 10 * 60 * 1000; // 10 分钟
 const REAP_INTERVAL_MS: u64 = 30 * 1000;
+/// 同时存活的 LSP client 硬上限:root 解析按 marker 上溯(C 项目每子目录 Makefile / JS monorepo
+/// 每包 package.json 各解析出一个 root),10 分钟 idle 窗口内可堆出十几个重量级 server
+/// (clangd --background-index / rust-analyzer 各吃几百 MB)。超限拒 spawn 走已有返空降级。
+pub const MAX_LSP_CLIENTS: usize = 6;
 
 /// baseline:某 path 上次的诊断集(owned),供 delta 去重。
 const Baseline = struct {
@@ -59,6 +64,9 @@ pub const Service = struct {
     reaper_cond: sync.Condition = .{}, // reaper 间隔等待,shutdown 立即唤醒
     clients: std.StringHashMap(ClientEntry), // key="server_id\x00root"(owned)
     broken: std.StringHashMap(void), // key 同上(owned);永久
+    /// 正在 spawn(已通过 cap 检查、尚未 put 进 clients)的预留数。mutex 保护。
+    /// cap 判定用 count()+spawning,堵"spawn 无锁窗口内不同 key 并发冲破上限"的 TOCTOU。
+    spawning: usize = 0,
     baselines: std.StringHashMap(Baseline), // path(owned) → baseline
 
     reaper: ?std.Thread = null,
@@ -120,7 +128,22 @@ pub const Service = struct {
             self.unlock();
             return c;
         }
+        // 数量上限:已满 → 不 spawn(**不标 broken**:idle reaper 腾位后同 key 还能再来)。
+        // **spawning 预留计数堵 TOCTOU**:spawn 期间无锁(最长 12s),不同 key 的并发 caller
+        // 都会通过裸 count() 检查 → cap 被冲破。预留后 defer 归还(成功路径 put 进 map 后归还,
+        // 瞬时双计只会保守拒绝,不会超限)。
+        if (self.clients.count() + self.spawning >= MAX_LSP_CLIENTS) {
+            self.unlock();
+            log.warn("lsp", "client limit reached ({d}), skipping spawn for {s}", .{ @as(usize, MAX_LSP_CLIENTS), def.server_id });
+            return null;
+        }
+        self.spawning += 1;
         self.unlock();
+        defer {
+            self.lock();
+            self.spawning -= 1;
+            self.unlock();
+        }
 
         // 解析 binary。
         var bin_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -419,6 +442,27 @@ test "Service: 无 git workspace → getDiagnostics 空串(graceful gate)" {
     const d = svc.getDiagnostics(a, "/nonexistent_xyz_cwd/foo.py", "x = 1\n");
     defer a.free(d);
     try testing.expectEqualStrings("", d);
+}
+
+test "Service: MAX_LSP_CLIENTS 满 → getOrSpawn 拒绝(返 null,不标 broken)" {
+    const a = testing.allocator;
+    var svc = try Service.create(a, "/nonexistent_xyz_cwd", null);
+    defer svc.shutdown();
+    // 填满 clients 表(dummy entry:client=undefined,断言后手动摘除,绝不让 shutdown 碰它)。
+    var i: usize = 0;
+    while (i < MAX_LSP_CLIENTS) : (i += 1) {
+        const key = try std.fmt.allocPrint(a, "dummy{d}\x00/r", .{i});
+        try svc.clients.put(key, .{ .client = undefined, .last_used_ms = nowMs() });
+    }
+    const def = &servers.SERVERS[0];
+    // 满员:cap 检查在 binary 解析之前 → 无论 def 二进制是否安装都直接 null。
+    try testing.expect(svc.getOrSpawn(def, "/tmp") == null);
+    // 不标 broken(reaper 腾位后同 key 还能 spawn)。
+    try testing.expectEqual(@as(usize, 0), svc.broken.count());
+    // 摘除 dummy(free key,client 是 undefined 不能被 shutdown 触碰)。
+    var it = svc.clients.iterator();
+    while (it.next()) |e| a.free(e.key_ptr.*);
+    svc.clients.clearRetainingCapacity();
 }
 
 fn mkdirZ(path: []const u8) void {

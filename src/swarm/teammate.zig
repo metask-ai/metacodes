@@ -732,6 +732,14 @@ fn sendIdleNotification(a: std.mem.Allocator, e: *TeammateEntry, reason: []const
 
 /// tinykg frontier 自领节流(subprocess 每次 fork+35s timeout 很贵,不能每 500ms 打)。
 pub const SELF_CLAIM_POLL_MS: i64 = 2500;
+/// 空 frontier 指数退避上限:8 个空闲 teammate 固定 2.5s poll = 稳态 3.2 fork/秒,还抢同一
+/// store 目录锁(30s 锁超时)。连续空手 → 间隔翻倍到此上限;领到任务/收到邮件即回落基准。
+pub const SELF_CLAIM_POLL_MAX_MS: i64 = 30_000;
+
+/// 下一次自领 poll 间隔:空手翻倍,cap 于 SELF_CLAIM_POLL_MAX_MS(纯函数,测试直断言)。
+pub fn nextClaimBackoffMs(cur: i64) i64 {
+    return @min(cur * 2, SELF_CLAIM_POLL_MAX_MS);
+}
 
 /// SW4:回 shutdown_approved 给 lead(echo request_id,对齐 cc handleShutdownApproval)。
 /// lead 的 pollLeadInbox 据此摘牌 + 标记 teammate 完成。best-effort。
@@ -755,6 +763,7 @@ fn waitForMail(a: std.mem.Allocator, e: *TeammateEntry, kg: ?*@import("../kg/cli
     // 未处理协议消息计数缓存:只在数量变化时记一次日志(否则每 500ms 刷屏)。
     var last_unhandled: usize = 0;
     var last_claim_poll_ms: i64 = 0;
+    var claim_backoff_ms: i64 = SELF_CLAIM_POLL_MS;
     while (true) {
         if (e.abort.isAborted()) return null;
 
@@ -809,7 +818,7 @@ fn waitForMail(a: std.mem.Allocator, e: *TeammateEntry, kg: ?*@import("../kg/cli
         // 【SW3】无邮件工作 → 节流 poll tinykg frontier 自领 ready 无主叶子(cc tryClaimNextTask
         // 等价)。claimTask 靠 tinykg 原子租约保证两 teammate 不撞车。
         const now_ms = util_time.nowMs();
-        if (kg != null and now_ms - last_claim_poll_ms >= SELF_CLAIM_POLL_MS) {
+        if (kg != null and now_ms - last_claim_poll_ms >= claim_backoff_ms) {
             last_claim_poll_ms = now_ms;
             // 用 human agent_id(name@team)做 claim 身份 → kanban 的 claimed_by 直接是队友名
             // (PM F3e:agent_ident 随机 hash 无法关联到人)。closeTask 不校验身份,完成正常。
@@ -820,6 +829,9 @@ fn waitForMail(a: std.mem.Allocator, e: *TeammateEntry, kg: ?*@import("../kg/cli
                 e.unlockPublic();
                 return claim.prompt;
             }
+            // 空手:指数退避(下次 poll 间隔翻倍,cap 30s)。返回路径(领到任务/来邮件)天然回落
+            // 基准——下次进 waitForMail 时 claim_backoff_ms 重新初始化。
+            claim_backoff_ms = nextClaimBackoffMs(claim_backoff_ms);
         }
 
         util_time.sleepMs(IDLE_POLL_MS);
@@ -1072,4 +1084,18 @@ test "spawnTeammate: team 不存在 → TeamNotFound 且无残留 entry" {
         .permission_ctx = perm,
     }));
     try testing.expectEqual(@as(usize, 0), reg.entries.items.len);
+}
+
+test "nextClaimBackoffMs: 空手翻倍 2500→5000→10000→20000→cap 30000" {
+    var b: i64 = SELF_CLAIM_POLL_MS;
+    b = nextClaimBackoffMs(b);
+    try std.testing.expectEqual(@as(i64, 5000), b);
+    b = nextClaimBackoffMs(b);
+    try std.testing.expectEqual(@as(i64, 10000), b);
+    b = nextClaimBackoffMs(b);
+    try std.testing.expectEqual(@as(i64, 20000), b);
+    b = nextClaimBackoffMs(b);
+    try std.testing.expectEqual(SELF_CLAIM_POLL_MAX_MS, b);
+    // cap 后不再涨。
+    try std.testing.expectEqual(SELF_CLAIM_POLL_MAX_MS, nextClaimBackoffMs(b));
 }
