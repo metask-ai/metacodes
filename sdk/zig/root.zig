@@ -62,14 +62,17 @@ pub const Api = struct {
 
     pub fn validate(raw: *const types.ApiV1) error{UnsupportedAbi}!Api {
         // Offsets 0..7 are the stable discovery prefix. Never read revision or
-        // later fields from a legacy 104-byte table before the exact size check.
+        // later fields from a differently sized table before the exact check.
         if (raw.struct_size != @sizeOf(types.ApiV1) or raw.abi_version != types.ABI_VERSION_V1)
             return error.UnsupportedAbi;
         if (raw.abi_revision != types.ABI_REVISION or raw.reserved0 != 0 or
             raw.capabilities & types.REQUIRED_CAPABILITIES_V1 != types.REQUIRED_CAPABILITIES_V1 or
             !allZero(raw.reserved) or
-            raw.runtime_create == null or raw.runtime_destroy == null or raw.session_create == null or
-            raw.session_destroy == null or raw.session_run == null or raw.session_abort == null or raw.buffer_release == null)
+            raw.runtime_create == null or raw.runtime_destroy == null or
+            raw.runtime_query_skill_catalog == null or raw.skill_catalog_release == null or
+            raw.session_create == null or raw.session_destroy == null or
+            raw.session_refresh_skill_catalog == null or raw.session_run_input == null or
+            raw.session_abort == null or raw.buffer_release == null)
             return error.UnsupportedAbi;
         return .{ .raw = raw };
     }
@@ -80,14 +83,79 @@ pub const Api = struct {
     pub fn runtimeDestroy(self: Api) types.RuntimeDestroyFnV1 {
         return self.raw.runtime_destroy.?;
     }
+    pub fn runtimeQuerySkillCatalog(self: Api) types.RuntimeQuerySkillCatalogFnV1 {
+        return self.raw.runtime_query_skill_catalog.?;
+    }
+    pub fn skillCatalogRelease(self: Api) types.SkillCatalogReleaseFnV1 {
+        return self.raw.skill_catalog_release.?;
+    }
     pub fn sessionCreate(self: Api) types.SessionCreateFnV1 {
         return self.raw.session_create.?;
     }
     pub fn sessionDestroy(self: Api) types.SessionDestroyFnV1 {
         return self.raw.session_destroy.?;
     }
-    pub fn sessionRun(self: Api) types.SessionRunFnV1 {
-        return self.raw.session_run.?;
+    pub fn sessionRefreshSkillCatalog(self: Api) types.SessionRefreshSkillCatalogFnV1 {
+        return self.raw.session_refresh_skill_catalog.?;
+    }
+    pub fn sessionRunInput(self: Api) types.SessionRunInputFnV1 {
+        return self.raw.session_run_input.?;
+    }
+    pub fn sessionRunText(
+        self: Api,
+        session: ?*types.SessionHandle,
+        run_id: u64,
+        prompt: types.BytesViewV1,
+        options: ?*const types.RunOptionsV1,
+        out_result: ?*types.RunResultV1,
+        out_diagnostic: ?*types.OwnedBytesV1,
+    ) u32 {
+        const input = types.RunInputV1{
+            .struct_size = @sizeOf(types.RunInputV1),
+            .kind_code = types.RUN_INPUT_TEXT,
+            .text = prompt,
+            .skill_id = bytesView(""),
+            .catalog_revision = bytesView(""),
+            .arguments_json = bytesView(""),
+            .reserved = [_]u64{0} ** 4,
+        };
+        return self.sessionRunInput()(
+            session,
+            run_id,
+            &input,
+            options,
+            out_result,
+            out_diagnostic,
+        );
+    }
+    pub fn sessionRunSkill(
+        self: Api,
+        session: ?*types.SessionHandle,
+        run_id: u64,
+        skill_id: types.BytesViewV1,
+        catalog_revision: types.BytesViewV1,
+        arguments_json: types.BytesViewV1,
+        options: ?*const types.RunOptionsV1,
+        out_result: ?*types.RunResultV1,
+        out_diagnostic: ?*types.OwnedBytesV1,
+    ) u32 {
+        const input = types.RunInputV1{
+            .struct_size = @sizeOf(types.RunInputV1),
+            .kind_code = types.RUN_INPUT_SKILL,
+            .text = bytesView(""),
+            .skill_id = skill_id,
+            .catalog_revision = catalog_revision,
+            .arguments_json = arguments_json,
+            .reserved = [_]u64{0} ** 4,
+        };
+        return self.sessionRunInput()(
+            session,
+            run_id,
+            &input,
+            options,
+            out_result,
+            out_diagnostic,
+        );
     }
     pub fn sessionAbort(self: Api) types.SessionAbortFnV1 {
         return self.raw.session_abort.?;
@@ -126,7 +194,7 @@ test "RunContext validator bounds length before pointer slicing" {
     try std.testing.expectEqualStrings(id, valid.session_id);
 }
 
-test "SDK rejects legacy pre-revision API size from the stable prefix" {
+test "SDK rejects a different revision API size from the stable prefix" {
     const LegacyApi = extern struct {
         struct_size: u32,
         abi_version: u32,

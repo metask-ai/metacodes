@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 3;
+pub const ABI_REVISION: u32 = 4;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 3 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 4 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -23,6 +23,12 @@ pub const Status = enum(u32) {
     callback_failed = 8,
     internal_error = 9,
     resource_limit = 10,
+    skill_catalog_invalid = 11,
+    stale_catalog = 12,
+    skill_not_found = 13,
+    invalid_skill_arguments = 14,
+    skill_policy_violation = 15,
+    skill_unavailable = 16,
 
     pub fn fromCode(code: u32) error{UnknownStatus}!Status {
         return switch (code) {
@@ -37,6 +43,12 @@ pub const Status = enum(u32) {
             @intFromEnum(Status.callback_failed) => .callback_failed,
             @intFromEnum(Status.internal_error) => .internal_error,
             @intFromEnum(Status.resource_limit) => .resource_limit,
+            @intFromEnum(Status.skill_catalog_invalid) => .skill_catalog_invalid,
+            @intFromEnum(Status.stale_catalog) => .stale_catalog,
+            @intFromEnum(Status.skill_not_found) => .skill_not_found,
+            @intFromEnum(Status.invalid_skill_arguments) => .invalid_skill_arguments,
+            @intFromEnum(Status.skill_policy_violation) => .skill_policy_violation,
+            @intFromEnum(Status.skill_unavailable) => .skill_unavailable,
             else => error.UnknownStatus,
         };
     }
@@ -53,6 +65,12 @@ pub const STATUS_CORE_ERROR: u32 = @intFromEnum(Status.core_error);
 pub const STATUS_CALLBACK_FAILED: u32 = @intFromEnum(Status.callback_failed);
 pub const STATUS_INTERNAL_ERROR: u32 = @intFromEnum(Status.internal_error);
 pub const STATUS_RESOURCE_LIMIT: u32 = @intFromEnum(Status.resource_limit);
+pub const STATUS_SKILL_CATALOG_INVALID: u32 = @intFromEnum(Status.skill_catalog_invalid);
+pub const STATUS_STALE_CATALOG: u32 = @intFromEnum(Status.stale_catalog);
+pub const STATUS_SKILL_NOT_FOUND: u32 = @intFromEnum(Status.skill_not_found);
+pub const STATUS_INVALID_SKILL_ARGUMENTS: u32 = @intFromEnum(Status.invalid_skill_arguments);
+pub const STATUS_SKILL_POLICY_VIOLATION: u32 = @intFromEnum(Status.skill_policy_violation);
+pub const STATUS_SKILL_UNAVAILABLE: u32 = @intFromEnum(Status.skill_unavailable);
 
 pub const PROVIDER_ANTHROPIC: u32 = 1;
 pub const PROVIDER_OPENAI: u32 = 2;
@@ -113,7 +131,12 @@ pub const MAX_METADATA_STRING_BYTES_V1: u64 = 1024 * 1024;
 pub const MAX_RUNTIME_METADATA_BYTES_V1: u64 = 16 * 1024 * 1024;
 pub const MAX_SESSION_METADATA_BYTES_V1: u64 = 4 * 1024 * 1024;
 pub const MAX_PROMPT_BYTES_V1: u64 = 16 * 1024 * 1024;
+pub const MAX_SKILL_ARGUMENT_VALUES_V1: u64 = 64;
+pub const MAX_SKILL_ARGUMENT_JSON_BYTES_V1: u64 = 1024 * 1024;
 pub const MAX_TURNS_V1: u32 = 1000;
+
+pub const RUN_INPUT_TEXT: u32 = 1;
+pub const RUN_INPUT_SKILL: u32 = 2;
 
 pub const EVENT_CONTINUE: u32 = 0;
 pub const EVENT_FATAL: u32 = 1;
@@ -132,13 +155,17 @@ pub const CAP_HOST_SYNC_TOOLS: u64 = 1 << 2;
 pub const CAP_HOST_UI: u64 = 1 << 3;
 pub const CAP_CORE_EVENTS_JSON: u64 = 1 << 4;
 pub const CAP_ABORT: u64 = 1 << 5;
-pub const REQUIRED_CAPABILITIES_V1: u64 = CAP_RUNTIME | CAP_BUILTIN_TOOLS | CAP_HOST_SYNC_TOOLS | CAP_HOST_UI | CAP_CORE_EVENTS_JSON | CAP_ABORT;
+pub const CAP_SKILL_CATALOG: u64 = 1 << 6;
+pub const CAP_TYPED_RUN_INPUT: u64 = 1 << 7;
+pub const REQUIRED_CAPABILITIES_V1: u64 = CAP_RUNTIME | CAP_BUILTIN_TOOLS | CAP_HOST_SYNC_TOOLS | CAP_HOST_UI | CAP_CORE_EVENTS_JSON | CAP_ABORT | CAP_SKILL_CATALOG | CAP_TYPED_RUN_INPUT;
 
-/// V1 is a rigid ABI: every struct_size is exact and every reserved field is
-/// zero. capabilities describes the returned library table, not per-instance
-/// negotiation. Layout or table extensions require a new discovery version.
+/// Each published v1 revision is rigid: every struct_size is exact and every
+/// reserved field is zero. A Host pins version, revision, table size, and
+/// capabilities together; revisions may intentionally be breaking while v1
+/// remains experimental.
 pub const RuntimeHandle = opaque {};
 pub const SessionHandle = opaque {};
+pub const SkillCatalogHandle = opaque {};
 
 pub const BytesViewV1 = extern struct {
     ptr: ?[*]const u8,
@@ -246,6 +273,26 @@ pub const SessionConfigV1 = extern struct {
     workspace_home: BytesViewV1,
     allowed_tools: ?[*]const BytesViewV1,
     allowed_tool_count: u64,
+    skill_catalog: ?*SkillCatalogHandle,
+    reserved: [4]u64,
+};
+
+pub const SkillCatalogQueryV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    workspace_root: BytesViewV1,
+    workspace_home: BytesViewV1,
+    workspace_epoch: BytesViewV1,
+    reserved: [3]u64,
+};
+
+pub const RunInputV1 = extern struct {
+    struct_size: u32,
+    kind_code: u32,
+    text: BytesViewV1,
+    skill_id: BytesViewV1,
+    catalog_revision: BytesViewV1,
+    arguments_json: BytesViewV1,
     reserved: [4]u64,
 };
 
@@ -255,7 +302,7 @@ pub const RunOptionsV1 = extern struct {
     reserved: [4]u64,
 };
 
-/// Terminal Run summary. Fields are defined only when `session_run` returns
+/// Terminal Run summary. Fields are defined only when `session_run_input` returns
 /// `STATUS_OK`; on any other status they are unspecified and must not be read.
 pub const RunResultV1 = extern struct {
     struct_size: u32,
@@ -271,11 +318,22 @@ pub const RunResultV1 = extern struct {
 /// operation's primary status.
 pub const RuntimeCreateFnV1 = *const fn (?*const RuntimeConfigV1, ?*?*RuntimeHandle, ?*OwnedBytesV1) callconv(.c) u32;
 pub const RuntimeDestroyFnV1 = *const fn (?*RuntimeHandle, ?*OwnedBytesV1) callconv(.c) u32;
+pub const RuntimeQuerySkillCatalogFnV1 = *const fn (
+    runtime: ?*RuntimeHandle,
+    query: ?*const SkillCatalogQueryV1,
+    out_catalog: ?*?*SkillCatalogHandle,
+    out_descriptor_json: ?*OwnedBytesV1,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
+pub const SkillCatalogReleaseFnV1 = *const fn (?*SkillCatalogHandle, ?*OwnedBytesV1) callconv(.c) u32;
 pub const SessionCreateFnV1 = *const fn (?*RuntimeHandle, ?*const SessionConfigV1, ?*const SessionCallbacksV1, ?*?*SessionHandle, ?*OwnedBytesV1) callconv(.c) u32;
 pub const SessionDestroyFnV1 = *const fn (?*SessionHandle, ?*OwnedBytesV1) callconv(.c) u32;
-/// Pre-admission validation, resource-limit, busy, and stale-run failures leave
-/// the Session reusable. Once admitted, OOM/core/callback/internal failure
-/// poisons it; successful completion, including STOP_ABORTED, returns it idle.
+pub const SessionRefreshSkillCatalogFnV1 = *const fn (?*SessionHandle, ?*SkillCatalogHandle, ?*OwnedBytesV1) callconv(.c) u32;
+/// Pre-admission validation, resource-limit, busy, and stale-run failures do
+/// not consume `run_id`. Post-admission Skill materialization failure consumes
+/// it but leaves the Session reusable after cleanup. Once Conversation or
+/// execution begins, OOM/core/callback/internal failure poisons the Session;
+/// successful completion, including STOP_ABORTED, returns it idle.
 /// Given a valid handle, poisoned state precedes remaining argument validation.
 /// V1 cannot recover or import Conversation/history into a poisoned Session.
 /// `run_id` is Host-assigned, non-zero, and scoped to one Session. Each
@@ -283,10 +341,10 @@ pub const SessionDestroyFnV1 = *const fn (?*SessionHandle, ?*OwnedBytesV1) callc
 /// admitted value. Pre-admission rejection never advances that value, so an
 /// otherwise valid greater ID remains available for retry; zero and stale IDs
 /// do not. After admitting `maxInt(u64)`, the Host must create a new Session.
-pub const SessionRunFnV1 = *const fn (
+pub const SessionRunInputFnV1 = *const fn (
     session: ?*SessionHandle,
     run_id: u64,
-    prompt: BytesViewV1,
+    input: ?*const RunInputV1,
     options: ?*const RunOptionsV1,
     out_result: ?*RunResultV1,
     out_diagnostic: ?*OwnedBytesV1,
@@ -314,9 +372,12 @@ pub const ApiV1 = extern struct {
     capabilities: u64,
     runtime_create: ?RuntimeCreateFnV1,
     runtime_destroy: ?RuntimeDestroyFnV1,
+    runtime_query_skill_catalog: ?RuntimeQuerySkillCatalogFnV1,
+    skill_catalog_release: ?SkillCatalogReleaseFnV1,
     session_create: ?SessionCreateFnV1,
     session_destroy: ?SessionDestroyFnV1,
-    session_run: ?SessionRunFnV1,
+    session_refresh_skill_catalog: ?SessionRefreshSkillCatalogFnV1,
+    session_run_input: ?SessionRunInputFnV1,
     session_abort: ?SessionAbortFnV1,
     buffer_release: ?BufferReleaseFnV1,
     reserved: [4]u64,
@@ -330,20 +391,27 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 96), @sizeOf(HostToolV1));
     try std.testing.expectEqual(@as(usize, 72), @sizeOf(RuntimeConfigV1));
     try std.testing.expectEqual(@as(usize, 72), @sizeOf(SessionCallbacksV1));
-    try std.testing.expectEqual(@as(usize, 144), @sizeOf(SessionConfigV1));
+    try std.testing.expectEqual(@as(usize, 80), @sizeOf(SkillCatalogQueryV1));
+    try std.testing.expectEqual(@as(usize, 104), @sizeOf(RunInputV1));
+    try std.testing.expectEqual(@as(usize, 152), @sizeOf(SessionConfigV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(RunOptionsV1));
     try std.testing.expectEqual(@as(usize, 48), @sizeOf(RunResultV1));
-    try std.testing.expectEqual(@as(usize, 112), @sizeOf(ApiV1));
+    try std.testing.expectEqual(@as(usize, 136), @sizeOf(ApiV1));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(RunContextV1, "session"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(RunContextV1, "run_id"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(RunContextV1, "session_id"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(HostToolV1, "ctx"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(SessionConfigV1, "api_key"));
     try std.testing.expectEqual(@as(usize, 96), @offsetOf(SessionConfigV1, "allowed_tools"));
+    try std.testing.expectEqual(@as(usize, 112), @offsetOf(SessionConfigV1, "skill_catalog"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(SkillCatalogQueryV1, "workspace_epoch"));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(RunInputV1, "arguments_json"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(ApiV1, "abi_revision"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(ApiV1, "capabilities"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(ApiV1, "runtime_create"));
-    try std.testing.expectEqual(@as(usize, 56), @offsetOf(ApiV1, "session_run"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(ApiV1, "runtime_query_skill_catalog"));
+    try std.testing.expectEqual(@as(usize, 72), @offsetOf(ApiV1, "session_refresh_skill_catalog"));
+    try std.testing.expectEqual(@as(usize, 80), @offsetOf(ApiV1, "session_run_input"));
 }
 
 test "typed status and stop reason validate every public code" {
@@ -356,7 +424,9 @@ test "typed status and stop reason validate every public code" {
         const value: StopReason = @enumFromInt(field.value);
         try std.testing.expectEqual(value, try StopReason.fromCode(field.value));
     }
-    try std.testing.expectError(error.UnknownStatus, Status.fromCode(11));
+    try std.testing.expectEqual(Status.skill_catalog_invalid, try Status.fromCode(11));
+    try std.testing.expectEqual(Status.skill_unavailable, try Status.fromCode(16));
+    try std.testing.expectError(error.UnknownStatus, Status.fromCode(17));
     try std.testing.expectError(error.UnknownStatus, Status.fromCode(std.math.maxInt(u32)));
     try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(0));
     try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(7));

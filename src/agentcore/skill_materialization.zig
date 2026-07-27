@@ -172,6 +172,32 @@ pub const Manager = struct {
         self.* = undefined;
     }
 
+    /// Final Runtime teardown has already proved that no Session or activation
+    /// can race this Manager. At that point the ABI handle must not become
+    /// half-destroyed merely because removing an empty private temp root fails.
+    /// Working-tree cleanup failures remain strict during Runs; this terminal
+    /// path only makes removal of the Manager-owned root best-effort.
+    pub fn deinitFinal(self: *Manager) void {
+        self.mutex.lock();
+        std.debug.assert(self.active_count == 0);
+        self.state = .destroying;
+        self.mutex.unlock();
+
+        if (self.root_open) {
+            self.root_dir.close(self.io);
+            self.root_open = false;
+        }
+        Dir.cwd().deleteTree(self.io, self.root_path) catch {};
+        const allocator = self.allocator;
+        const io_runtime = self.owned_io_runtime;
+        allocator.free(self.root_path);
+        if (io_runtime) |runtime| {
+            runtime.deinit();
+            allocator.destroy(runtime);
+        }
+        self.* = undefined;
+    }
+
     pub fn materialize(
         self: *Manager,
         record: *const catalog.SkillRecord,

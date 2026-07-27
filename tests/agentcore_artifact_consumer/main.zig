@@ -5,7 +5,7 @@ const Server = @import("mock_server.zig").Server;
 
 comptime {
     if (@hasDecl(wire, "CALLBACK_CONTINUE") or @hasDecl(wire, "CALLBACK_FATAL"))
-        @compileError("revision 3 must not retain pre-revision callback aliases");
+        @compileError("revision 4 must not retain pre-revision callback aliases");
 }
 
 const ASK_SSE =
@@ -182,11 +182,22 @@ pub fn main(init: std.process.Init) !void {
     if (sdk.metask_agentcore_get_api(2) != null) return error.UnexpectedAbi;
     try verifyRevisionMismatchRejection(api);
 
-    const workspace = try std.process.currentPathAlloc(init.io, a);
+    const process_root = try std.process.currentPathAlloc(init.io, a);
     var name_buf: [128]u8 = undefined;
-    const file_name = try std.fmt.bufPrint(&name_buf, "metask-agentcore-{d}.txt", .{std.Thread.getCurrentId()});
-    defer std.Io.Dir.cwd().deleteFile(init.io, file_name) catch {};
-    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = file_name, .data = "artifact-read-ok" });
+    const workspace_name = try std.fmt.bufPrint(&name_buf, ".agentcore-consumer-{d}", .{std.Thread.getCurrentId()});
+    const workspace = try std.fs.path.join(a, &.{ process_root, workspace_name });
+    try std.Io.Dir.cwd().createDirPath(init.io, workspace);
+    defer std.Io.Dir.cwd().deleteTree(init.io, workspace) catch {};
+    const file_name = "artifact-read.txt";
+    const file_path = try std.fs.path.join(a, &.{ workspace, file_name });
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = file_path, .data = "artifact-read-ok" });
+    const skill_dir = try std.fs.path.join(a, &.{ workspace, ".metacodes", "skills", "review" });
+    try std.Io.Dir.cwd().createDirPath(init.io, skill_dir);
+    const skill_path = try std.fs.path.join(a, &.{ skill_dir, "SKILL.md" });
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = skill_path,
+        .data = "---\nname: Review\ndescription: Source-free typed invocation fixture\n---\nexercise bundle",
+    });
     // Source-free proof: the model supplies a relative file path and the
     // binary facade resolves it against workspace_root, not process cwd.
     const read_sse = try readToolSse(a, file_name);
@@ -225,6 +236,36 @@ pub fn main(init: std.process.Init) !void {
         _ = api.runtimeDestroy()(handle, &diagnostic);
     };
 
+    var query = wire.SkillCatalogQueryV1{
+        .struct_size = @sizeOf(wire.SkillCatalogQueryV1),
+        .reserved0 = 0,
+        .workspace_root = sdk.bytesView(workspace),
+        .workspace_home = sdk.bytesView(workspace),
+        .workspace_epoch = sdk.bytesView("fixture-epoch"),
+        .reserved = [_]u64{0} ** 3,
+    };
+    var catalog: ?*wire.SkillCatalogHandle = null;
+    defer if (catalog) |handle| {
+        _ = api.skillCatalogRelease()(handle, &diagnostic);
+    };
+    var descriptor = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+    defer api.bufferRelease()(&descriptor);
+    try expectStatus(.ok, api.runtimeQuerySkillCatalog()(
+        runtime,
+        &query,
+        &catalog,
+        &descriptor,
+        &diagnostic,
+    ), diagnostic);
+    if (catalog == null or descriptor.ptr == null or descriptor.len == 0)
+        return error.MissingSkillCatalog;
+    const descriptor_bytes = try sdk.borrowedBytes(.{
+        .ptr = descriptor.ptr,
+        .len = descriptor.len,
+    });
+    const identities = try catalogIdentities(a, descriptor_bytes, "review");
+    api.bufferRelease()(&descriptor);
+
     const allowed = [_]wire.BytesViewV1{ sdk.bytesView("AskUserQuestion"), sdk.bytesView("Read"), sdk.bytesView("HostEcho") };
     var config = wire.SessionConfigV1{
         .struct_size = @sizeOf(wire.SessionConfigV1),
@@ -238,6 +279,7 @@ pub fn main(init: std.process.Init) !void {
         .workspace_home = sdk.bytesView(workspace),
         .allowed_tools = &allowed,
         .allowed_tool_count = allowed.len,
+        .skill_catalog = catalog,
         .reserved = [_]u64{0} ** 4,
     };
     var callbacks = wire.SessionCallbacksV1{
@@ -251,6 +293,8 @@ pub fn main(init: std.process.Init) !void {
     };
     var session: ?*wire.SessionHandle = null;
     try expectStatus(.ok, api.sessionCreate()(runtime, &config, &callbacks, &session, &diagnostic), diagnostic);
+    try expectStatus(.ok, api.skillCatalogRelease()(catalog, &diagnostic), diagnostic);
+    catalog = null;
     try probe.registerSession(session.?);
     defer if (session) |handle| {
         _ = api.sessionDestroy()(handle, &diagnostic);
@@ -258,7 +302,16 @@ pub fn main(init: std.process.Init) !void {
     var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 6, .reserved = [_]u64{0} ** 4 };
     var result: wire.RunResultV1 = undefined;
     try probe.beginRun(1);
-    try expectStatus(.ok, api.sessionRun()(session, 1, sdk.bytesView("exercise bundle"), &options, &result, &diagnostic), diagnostic);
+    try expectStatus(.ok, api.sessionRunSkill(
+        session,
+        1,
+        sdk.bytesView(identities.skill_id),
+        sdk.bytesView(identities.revision),
+        sdk.bytesView(""),
+        &options,
+        &result,
+        &diagnostic,
+    ), diagnostic);
     try probe.endRun(1);
     if (try sdk.StopReason.fromCode(result.stop_reason_code) != .end_turn or result.tool_calls != 3) return error.UnexpectedRunResult;
     if (probe.ui_calls != 1 or probe.ui_releases != 1 or probe.host_calls != 1 or probe.host_releases != 1) return error.CallbackContractFailed;
@@ -267,7 +320,44 @@ pub fn main(init: std.process.Init) !void {
     session = null;
     try expectStatus(.ok, api.runtimeDestroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
-    std.debug.print("AgentCore source-free consumer: real tool, Host tool, Host UI and events OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: catalog, typed Skill, tools, Host UI and events OK\n", .{});
+}
+
+const CatalogIdentities = struct {
+    revision: []const u8,
+    skill_id: []const u8,
+};
+
+fn catalogIdentities(
+    allocator: std.mem.Allocator,
+    descriptor_json: []const u8,
+    invocation_name: []const u8,
+) !CatalogIdentities {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, descriptor_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidCatalogDescriptor;
+    const revision_value = parsed.value.object.get("catalog_revision") orelse
+        return error.InvalidCatalogDescriptor;
+    if (revision_value != .string or revision_value.string.len != 64)
+        return error.InvalidCatalogDescriptor;
+    const skills_value = parsed.value.object.get("skills") orelse
+        return error.InvalidCatalogDescriptor;
+    if (skills_value != .array) return error.InvalidCatalogDescriptor;
+    for (skills_value.array.items) |skill_value| {
+        if (skill_value != .object) return error.InvalidCatalogDescriptor;
+        const name_value = skill_value.object.get("invocation_name") orelse
+            return error.InvalidCatalogDescriptor;
+        const id_value = skill_value.object.get("skill_id") orelse
+            return error.InvalidCatalogDescriptor;
+        if (name_value != .string or id_value != .string) return error.InvalidCatalogDescriptor;
+        if (std.mem.eql(u8, name_value.string, invocation_name)) {
+            return .{
+                .revision = try allocator.dupe(u8, revision_value.string),
+                .skill_id = try allocator.dupe(u8, id_value.string),
+            };
+        }
+    }
+    return error.SkillMissingFromCatalog;
 }
 
 fn verifyRevisionMismatchRejection(api: sdk.Api) !void {

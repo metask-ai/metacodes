@@ -23,25 +23,26 @@ Consumers must pin an exact bundle (the manifest records the source commit)
 and treat every update as potentially breaking. No near-term re-freeze is
 planned.
 
-The current experimental bundle is **ABI v1 revision 3**. Revision 3 is an
-in-place breaking namespace migration from revision 2. The 112-byte table and
-RunContext behavior introduced by revision 2 remain intact, but all public C
-identifiers now use the `metask_agentcore` / `METASK_AGENTCORE` namespace and
-the discovery symbol is `metask_agentcore_get_api`:
+The current experimental bundle is **ABI v1 revision 4**. Revision 4 is an
+in-place breaking cut that adds a Session-independent immutable Skill catalog
+and a typed `TextInput | SkillInvocation` Run entry while closing the A1/A3/A4
+and B1–B4 contract gaps:
 
-- `metask_agentcore_api_v1` is 112 bytes and requires `abi_revision == 3`;
-- event, UI, and Host-tool callbacks receive `const metask_agentcore_run_context_v1 *`;
-- `METASK_AGENTCORE_CALLBACK_*` was removed in favor of `METASK_AGENTCORE_EVENT_*` (no aliases);
-- Host tools may return `METASK_AGENTCORE_HOST_FATAL` and FAILED/REJECTED detail;
-- `manifest.json` records `binary_abi_revision: 3`.
+- `metask_agentcore_api_v1` is 136 bytes and requires `abi_revision == 4`;
+- `SkillCatalogQueryV1`, `RunInputV1`, and `SessionConfigV1` are respectively
+  80, 104, and 152 bytes;
+- `runtime_query_skill_catalog`, `skill_catalog_release`,
+  `session_refresh_skill_catalog`, and `session_run_input` are mandatory;
+- `CAP_SKILL_CATALOG` and `CAP_TYPED_RUN_INPUT` are required;
+- `manifest.json` records `binary_abi_revision: 4`.
 
-Consumers migrating from the pre-revision bundle must update the header and
-library atomically, validate the stable `struct_size`/`abi_version` prefix
-before reading later fields, then require exact revision equality. A 104-byte
-table and a 112-byte table with any revision other than 3 are both rejected;
-there is no compatibility fallback or old-name alias. Every per-Run callback must validate and
-copy any retained `RunContext` fields during the callback, and Host registries
-must bind/compare `session_id` atomically under their per-Session lock.
+Revision 4 provides no Revision 3 compatibility. Consumers update the header,
+SDK, manifest, and library atomically, validate the stable
+`struct_size`/`abi_version` prefix before reading later fields, then require
+exact revision, table size, capability, reserved-field, and function-identity
+matches. Every per-Run callback validates and copies any retained `RunContext`
+fields during the callback, and Host registries bind/compare `session_id`
+atomically under their per-Session lock.
 
 Re-freeze first requires closure of the open items tracked in
 `doc/AGENTCORE_V1_EXPERIMENTAL_LEDGER.md` (every group A item closed; every
@@ -235,22 +236,34 @@ Events describe observations, not commands. A Host may render, aggregate,
 persist, or ignore them; consuming an event never drives the core execution
 loop.
 
+`on_event` is mandatory in Revision 4. To reconstruct final visible assistant
+output, a Host accumulates only closed segments: `text_chunk` appends to the
+current segment and `stream_done` closes it. `tool_start` and `tool_result` are
+semantic boundaries that discard any unclosed segment and all previously
+closed accumulated segments; consecutive boundaries are idempotent and
+`tool_progress` is not a boundary. The final output is the concatenation of
+all closed segments after the last boundary, or all closed segments when no
+boundary occurred. This preserves max-token continuations while excluding
+pre-tool drafts. Usage events are exact deltas and must use checked arithmetic.
+
 ## Contract
 
 `metask_agentcore_get_api(1)` is the only discovery symbol. ABI v1 exposes
-opaque Runtime and Session handles, synchronous text Runs, abort, built-in and
-synchronous Host tools, tagged CoreEvent JSON, and synchronous Host UI JSON.
+opaque Runtime, Session, and Skill-catalog handles, synchronous typed Runs,
+abort, built-in and synchronous Host tools, tagged CoreEvent JSON, and
+synchronous Host UI JSON.
 Runtime copies Host tool metadata and callback references and must outlive every
 Session. The Host retains ownership of each Host tool `ctx` and keeps it valid
 until Runtime destruction succeeds. Session owns provider credentials,
 workspace inputs, tool selection, Conversation, permission memory, jobs, and
-Run state. Session callback descriptors are copied at creation; the Host retains
+Run state and an optional retained catalog snapshot. Session callback
+descriptors are copied at creation; the Host retains
 their `ctx` and keeps it valid until Session destruction succeeds.
 
 One Session accepts one active Run at a time. A successful Run returns to idle
 and the Host may start another Run on the same stateful Conversation. `Status`
 describes whether the ABI call itself succeeded. `StopReason` is meaningful
-only when `session_run` returns `METASK_AGENTCORE_STATUS_OK` and is one of `end_turn`,
+only when `session_run_input` returns `METASK_AGENTCORE_STATUS_OK` and is one of `end_turn`,
 `max_turns`, `aborted`, `tool_error`, `api_error`, or `tool_loop`. Internal
 `suspended`, `backgrounded`, and `budget` states are not representable in v1;
 if one becomes reachable through the facade it is an internal contract failure,
@@ -258,7 +271,7 @@ not a new public stop code. Because the stateful Run may already have committed
 Conversation changes, that failure poisons the ABI facade and subsequent Run or
 abort calls return `METASK_AGENTCORE_STATUS_INVALID_STATE`; destroy remains valid.
 
-The synchronous `session_run` return is a quiescence boundary: every callback
+The synchronous `session_run_input` return is a quiescence boundary: every callback
 started for that Run, and every paired release callback for its Host-owned
 outputs, has completed before the call returns. Callbacks from the next Run on
 the same Session therefore cannot overlap callbacks from the completed Run.
@@ -290,20 +303,26 @@ registry must bind the first observed ID and compare all later IDs atomically
 under the same per-Session lock. A missing/invalid ID, unknown Session handle,
 wrong active Run ID, or binding mismatch is a fatal callback-channel failure.
 
-Run admission is the lifecycle boundary. Validation failures
-(`METASK_AGENTCORE_STATUS_INVALID_ARGUMENT` / `METASK_AGENTCORE_STATUS_RESOURCE_LIMIT`) and admission
-failures (`METASK_AGENTCORE_STATUS_BUSY` / `METASK_AGENTCORE_STATUS_STALE_RUN`) do not mutate the
-Conversation and leave the Session in its previous usable state. Once a Run is
-admitted, `METASK_AGENTCORE_STATUS_OUT_OF_MEMORY`, `METASK_AGENTCORE_STATUS_CORE_ERROR`,
-`METASK_AGENTCORE_STATUS_CALLBACK_FAILED`, or `METASK_AGENTCORE_STATUS_INTERNAL_ERROR` means execution may
-have committed Conversation changes or external side effects, so the Session
-is poisoned. Subsequent Run and abort calls return
-`METASK_AGENTCORE_STATUS_INVALID_STATE`; destroy remains valid. `METASK_AGENTCORE_STATUS_OK`, including a
-terminal `METASK_AGENTCORE_STOP_ABORTED`, returns the Session to idle. A too-late abort also
-leaves the already-idle Session reusable.
+Run admission is the `run_id` lifecycle boundary. Validation failures
+(`METASK_AGENTCORE_STATUS_INVALID_ARGUMENT` /
+`METASK_AGENTCORE_STATUS_RESOURCE_LIMIT`) and admission failures
+(`METASK_AGENTCORE_STATUS_BUSY` / `METASK_AGENTCORE_STATUS_STALE_RUN`) do not
+mutate the Conversation or consume `run_id`. Skill materialization occurs
+after admission but before Conversation mutation: failure there consumes
+`run_id`, cleans the activation, and returns the Session to idle. Once
+Conversation mutation or provider/tool execution begins,
+`METASK_AGENTCORE_STATUS_OUT_OF_MEMORY`,
+`METASK_AGENTCORE_STATUS_CORE_ERROR`,
+`METASK_AGENTCORE_STATUS_CALLBACK_FAILED`, or
+`METASK_AGENTCORE_STATUS_INTERNAL_ERROR` poisons the Session because execution
+may have committed Conversation changes or external side effects. Subsequent
+Run and abort calls then return `METASK_AGENTCORE_STATUS_INVALID_STATE`;
+destroy remains valid. `METASK_AGENTCORE_STATUS_OK`, including a terminal
+`METASK_AGENTCORE_STOP_ABORTED`, returns the Session to idle. A too-late abort
+also leaves the already-idle Session reusable.
 
 Given a valid Session handle, the poisoned-state check takes precedence over
-remaining `session_run` and `session_abort` argument validation. ABI v1 does
+remaining `session_run_input` and `session_abort` argument validation. ABI v1 does
 not define status precedence when multiple other input or admission errors are
 present in the same call.
 
@@ -323,10 +342,8 @@ requests cooperative abort and any other value returns
 Assistant text and other execution output are delivered through `on_event`.
 `RunResultV1` is a terminal summary containing stop reason, turns, and tool
 calls; it is not an output buffer. Its fields are defined only when
-`session_run` returns `METASK_AGENTCORE_STATUS_OK`. On any non-OK status their contents are
-unspecified and the Host must not inspect them. `on_event` is optional: without
-it the Run still executes, but observation output is discarded. SDK-level
-aggregation is a consumer convenience and does not change the ABI.
+`session_run_input` returns `METASK_AGENTCORE_STATUS_OK`. On any non-OK status
+their contents are unspecified and the Host must not inspect them.
 
 Relative paths supplied to `Read`, `Write`, `Edit`, `Glob`, and `Grep` resolve
 against `workspace_root`; Bash also runs with that directory as its cwd.
@@ -338,13 +355,54 @@ shell tool selected under the disabled shell policy fail Session creation with
 `workspace_home` may be empty, in which case it defaults to the canonicalized
 `workspace_root`; a non-empty value must be absolute.
 
+### Skill catalog and typed input
+
+`runtime_query_skill_catalog` is independent of Session lifetime so a Host may
+render a Skill menu before creating its first Task or Session. A successful
+query returns both an immutable catalog handle and a library-owned descriptor
+using schema `metask.skill-catalog/v1`. The descriptor contains a Runtime-local
+`catalog_scope_id`, content-derived `catalog_revision`, health, valid
+`skills[]`, and typed `issues[]`; it never contains Skill bodies, physical
+paths, policy internals, or execution mode. Isolated invalid slots produce
+`OK + degraded`; failure to prove the whole snapshot returns
+`SKILL_CATALOG_INVALID` and no partial handle or descriptor.
+
+The Host releases its catalog handle exactly once with
+`skill_catalog_release`. Session create and idle-only refresh retain their own
+reference, so the Host may release its handle immediately after either call
+succeeds. A catalog must belong to the same Runtime and canonical Workspace
+binding. Refresh atomically replaces the bound snapshot and does not modify
+Conversation or `run_id`.
+
+`session_run_input` accepts exactly one tagged input:
+
+- `RUN_INPUT_TEXT`: only `text` is non-empty; it is bounded to 16 MiB before
+  pointer access or UTF-8 decoding. Slash-looking text has no special meaning.
+- `RUN_INPUT_SKILL`: `text` is canonical empty and the Session must have a
+  bound catalog. `skill_id`, `catalog_revision`, and `arguments_json` identify
+  an explicit Host invocation. Arguments are canonical empty or
+  `{"values":["..."]}`, with at most 64 values and 1 MiB encoded JSON.
+
+Malformed identity is `INVALID_ARGUMENT`; a mismatched pinned revision is
+`STALE_CATALOG`; missing Skill, invalid arguments, static policy failure, and
+unavailable execution capability use their dedicated statuses. These failures
+occur before Run admission and do not advance `run_id` or mutate Conversation.
+Materialization begins only after admission, is private to that activation,
+and is removed before terminal return. A Skill can only narrow the Session's
+tool, shell, and permission authority.
+
+AgentCore exposes no slash parser, Command registry, route field, or
+product-specific command. A consumer resolves its own Commands first, maps a
+catalog hit to typed Skill input, and treats an unresolved slash as its own
+product decision.
+
 ABI v1 has three ownership classes:
 
 | Value | Owner and lifetime | Release |
 |---|---|---|
 | `metask_agentcore_bytes_view_v1` inputs and event/request views | Borrowed for the current synchronous call or callback | Never released |
 | Host tool results and UI responses | Host-owned callback output | Canonical `{NULL,0}` is never released; every other descriptor is passed to its paired Host release callback exactly once, independent of status |
-| AgentCore API diagnostics | Library-owned write-only output | Released only with the discovered `buffer_release` function |
+| AgentCore catalog descriptors and API diagnostics | Library-owned output | Released only with the discovered `buffer_release` function |
 
 Status controls whether callback output is consumed, not whether it is
 released. `METASK_AGENTCORE_HOST_OK` consumes success text. `METASK_AGENTCORE_HOST_FAILED` and
@@ -389,8 +447,8 @@ ABI v1 UI response JSON is one of:
 {"permission":"allow_once"}
 ```
 
-Permission also accepts `allow_always`, `deny_once`, and
-`deny_tool_session`. ABI v1 does not expose plan mode or plan approval because
+Permission also accepts `allow_session`, `deny_once`, and
+`deny_session`. ABI v1 does not expose plan mode or plan approval because
 AgentSession does not own the complete `EnterPlanMode`/`ExitPlanMode`
 lifecycle. KG counts and Workbench plan-progress state are likewise not part
 of this protocol. There is no unversioned `custom` escape hatch. Host tool
@@ -425,6 +483,13 @@ allocations or unbounded work:
 | one Runtime/Session metadata string | 1 MiB |
 | total Runtime metadata | 16 MiB |
 | total Session metadata | 4 MiB |
+| one TextInput prompt | 16 MiB |
+| one Skill argument array / JSON | 64 values / 1 MiB |
+| one catalog descriptor | 4 MiB |
+| one catalog snapshot / Runtime live snapshots | 64 MiB / 256 MiB |
+| one Skill file / files per snapshot | 4 MiB / 16384 |
+| catalog traversal entries / depth | 65536 / 64 |
+| active materializations per Runtime | 256 MiB |
 | one Run | 1000 turns |
 
 Configuration and pre-admission Run limits return
@@ -432,8 +497,7 @@ Configuration and pre-admission Run limits return
 returns `METASK_AGENTCORE_STATUS_CALLBACK_FAILED`, and poisons the Session because the Host
 UI transport violated its callback contract. An oversized Host tool result is
 released exactly once and becomes an ordinary Host tool failure. Events are
-never silently truncated. V1 does not impose a universal prompt or event-size
-cap.
+never silently truncated. Event JSON has no universal size cap.
 
 Runtime metadata includes built-in names and Host tool names, descriptions, and
 schemas. Session metadata includes credentials, model/base URL, workspace
@@ -481,7 +545,7 @@ storage is not permission to infer compatibility. After v1 is genuinely
 re-frozen, later layout, function-table, or control-message extensions require
 `metask_agentcore_get_api(2)` and v2 types.
 
-Revision 2's published POD offsets and sizes require a 64-bit pointer ABI.
+Revision 4's published POD offsets and sizes require a 64-bit pointer ABI.
 The header rejects 32-bit consumers at compile time; a future 32-bit contract
 would need separately specified layouts and consumer gates.
 
@@ -489,7 +553,8 @@ would need separately specified layouts and consumer gates.
 table. It is not per-Runtime or per-Session negotiation; concrete Runtime and
 Session configuration still determines which tools and callbacks are active.
 
-ABI v1 deliberately does not add session persistence/restore, asynchronous UI
+ABI v1 deliberately does not add a slash/Command ABI, session
+persistence/restore, asynchronous UI
 continuations, ABI-level asynchronous operations, resume/checkpoint, strict Workspace
 security, Workbench `Output`/`FileChange`/plan-progress models, or a
 multi-platform universal bundle. Those are separate contracts, not hidden

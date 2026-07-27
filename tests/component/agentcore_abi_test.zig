@@ -284,7 +284,7 @@ const UiFailureProbe = struct {
                 const run = sdk.validateRunContext(run_ptr) catch return wire.UI_FATAL;
                 var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
                 defer api.bufferRelease()(&diagnostic);
-                self.nested_run_status = api.sessionRun()(
+                self.nested_run_status = api.sessionRunText(
                     run.session,
                     run.run_id + 1,
                     sdk.bytesView("nested callback run"),
@@ -345,6 +345,45 @@ const AbortEventProbe = struct {
 fn rootPath(tmp: *std.testing.TmpDir, buffer: []u8) ![]const u8 {
     const len = try tmp.dir.realPath(std.testing.io, buffer);
     return buffer[0..len];
+}
+
+const CatalogIdentities = struct {
+    revision: []u8,
+    skill_id: []u8,
+};
+
+fn extractCatalogIdentities(
+    allocator: std.mem.Allocator,
+    descriptor_json: []const u8,
+    invocation_name: []const u8,
+) !CatalogIdentities {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, descriptor_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidCatalogDescriptor;
+    const revision_value = parsed.value.object.get("catalog_revision") orelse
+        return error.InvalidCatalogDescriptor;
+    const skills_value = parsed.value.object.get("skills") orelse
+        return error.InvalidCatalogDescriptor;
+    if (revision_value != .string or skills_value != .array)
+        return error.InvalidCatalogDescriptor;
+    for (skills_value.array.items) |skill_value| {
+        if (skill_value != .object) return error.InvalidCatalogDescriptor;
+        const name_value = skill_value.object.get("invocation_name") orelse
+            return error.InvalidCatalogDescriptor;
+        const id_value = skill_value.object.get("skill_id") orelse
+            return error.InvalidCatalogDescriptor;
+        if (name_value != .string or id_value != .string)
+            return error.InvalidCatalogDescriptor;
+        if (std.mem.eql(u8, name_value.string, invocation_name)) {
+            const revision = try allocator.dupe(u8, revision_value.string);
+            errdefer allocator.free(revision);
+            return .{
+                .revision = revision,
+                .skill_id = try allocator.dupe(u8, id_value.string),
+            };
+        }
+    }
+    return error.SkillMissingFromCatalog;
 }
 
 fn expectInvalidSessionConfig(
@@ -614,13 +653,193 @@ test "L2 public events reconstruct continuation output and observable run usage"
     var result = std.mem.zeroes(wire.RunResultV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRun()(session, 1, sdk.bytesView("continue fixture"), &options, &result, &diagnostic),
+        api.sessionRunText(session, 1, sdk.bytesView("continue fixture"), &options, &result, &diagnostic),
     );
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     try std.testing.expectEqualStrings("headtail", probe.answer[0..probe.answer_len]);
     try std.testing.expectEqual(@as(usize, 2), probe.stream_done_count);
     try std.testing.expectEqual(@as(u64, 11), probe.usage.input_tokens);
     try std.testing.expectEqual(@as(u64, 5), probe.usage.output_tokens);
+}
+
+test "L2 Revision 4 catalog binds before Session and typed Skill failures remain pre-admission" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const skill_dir = try std.fs.path.join(a, &.{ root, ".metacodes", "skills", "review" });
+    defer a.free(skill_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, skill_dir);
+    const skill_path = try std.fs.path.join(a, &.{ skill_dir, "SKILL.md" });
+    defer a.free(skill_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = skill_path,
+        .data = "---\nname: Review\ndescription: Public typed invocation fixture\n---\nreview the target",
+    });
+
+    const bodies = [_][]const u8{FINAL_SSE};
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreate()(&runtime_config, &runtime, &diagnostic));
+    defer if (runtime) |handle| {
+        _ = api.runtimeDestroy()(handle, &diagnostic);
+    };
+
+    var query = wire.SkillCatalogQueryV1{
+        .struct_size = @sizeOf(wire.SkillCatalogQueryV1),
+        .reserved0 = 0,
+        .workspace_root = sdk.bytesView(root),
+        .workspace_home = sdk.bytesView(root),
+        .workspace_epoch = sdk.bytesView("epoch-1"),
+        .reserved = [_]u64{0} ** 3,
+    };
+    var catalog: ?*wire.SkillCatalogHandle = null;
+    defer if (catalog) |handle| {
+        _ = api.skillCatalogRelease()(handle, &diagnostic);
+    };
+    var descriptor = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&descriptor);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeQuerySkillCatalog()(runtime, &query, &catalog, &descriptor, &diagnostic),
+    );
+    const descriptor_bytes = try sdk.borrowedBytes(.{ .ptr = descriptor.ptr, .len = descriptor.len });
+    try std.testing.expect(std.mem.indexOf(u8, descriptor_bytes, "\"invocation_name\":\"review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, descriptor_bytes, "\"body\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, descriptor_bytes, "source_path") == null);
+    const ids = try extractCatalogIdentities(a, descriptor_bytes, "review");
+    defer a.free(ids.revision);
+    defer a.free(ids.skill_id);
+    api.bufferRelease()(&descriptor);
+
+    var session_config = std.mem.zeroes(wire.SessionConfigV1);
+    session_config.struct_size = @sizeOf(wire.SessionConfigV1);
+    session_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    session_config.permission_mode_code = wire.PERMISSION_BYPASS;
+    session_config.shell_policy_code = wire.SHELL_DISABLED;
+    session_config.api_key = sdk.bytesView("test-key");
+    session_config.model = sdk.bytesView("test-model");
+    session_config.base_url = sdk.bytesView(url);
+    session_config.workspace_root = sdk.bytesView(root);
+    session_config.workspace_home = sdk.bytesView(root);
+    session_config.skill_catalog = catalog;
+    var probe = ReconstructionProbe{};
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = ReconstructionProbe.event;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionCreate()(runtime, &session_config, &callbacks, &session, &diagnostic),
+    );
+    try std.testing.expectEqual(wire.STATUS_OK, api.skillCatalogRelease()(catalog, &diagnostic));
+    catalog = null;
+    defer if (session) |handle| {
+        _ = api.sessionDestroy()(handle, &diagnostic);
+    };
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeQuerySkillCatalog()(runtime, &query, &catalog, &descriptor, &diagnostic),
+    );
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRefreshSkillCatalog()(session, catalog, &diagnostic),
+    );
+    try std.testing.expectEqual(wire.STATUS_OK, api.skillCatalogRelease()(catalog, &diagnostic));
+    catalog = null;
+    api.bufferRelease()(&descriptor);
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    var stale: [64]u8 = undefined;
+    @memcpy(&stale, ids.revision);
+    stale[0] = if (stale[0] == '0') '1' else '0';
+    try std.testing.expectEqual(
+        wire.STATUS_STALE_CATALOG,
+        api.sessionRunSkill(
+            session,
+            1,
+            sdk.bytesView(ids.skill_id),
+            sdk.bytesView(&stale),
+            sdk.bytesView(""),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_SKILL_ARGUMENTS,
+        api.sessionRunSkill(
+            session,
+            1,
+            sdk.bytesView(ids.skill_id),
+            sdk.bytesView(ids.revision),
+            sdk.bytesView("{}"),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    api.bufferRelease()(&diagnostic);
+    var noncanonical_empty: u8 = 0;
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_SKILL_ARGUMENTS,
+        api.sessionRunSkill(
+            session,
+            1,
+            sdk.bytesView(ids.skill_id),
+            sdk.bytesView(ids.revision),
+            .{ .ptr = @ptrCast(&noncanonical_empty), .len = 0 },
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    api.bufferRelease()(&diagnostic);
+    const missing_id = [_]u8{'f'} ** 64;
+    try std.testing.expectEqual(
+        wire.STATUS_SKILL_NOT_FOUND,
+        api.sessionRunSkill(
+            session,
+            1,
+            sdk.bytesView(&missing_id),
+            sdk.bytesView(ids.revision),
+            sdk.bytesView(""),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRunSkill(
+            session,
+            1,
+            sdk.bytesView(ids.skill_id),
+            sdk.bytesView(ids.revision),
+            sdk.bytesView(""),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
 }
 
 test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers" {
@@ -680,6 +899,7 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
         .workspace_home = sdk.bytesView(root),
         .allowed_tools = &allowed,
         .allowed_tool_count = allowed.len,
+        .skill_catalog = null,
         .reserved = [_]u64{0} ** 4,
     };
     var callbacks = wire.SessionCallbacksV1{
@@ -706,13 +926,13 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
-        api.sessionRun()(session, 0, sdk.bytesView("zero is not a Run identifier"), &options, &result, &diagnostic),
+        api.sessionRunText(session, 0, sdk.bytesView("zero is not a Run identifier"), &options, &result, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
     var invalid_utf8: u8 = 0xff;
     try std.testing.expectEqual(
         wire.STATUS_RESOURCE_LIMIT,
-        api.sessionRun()(
+        api.sessionRunText(
             session,
             1,
             .{ .ptr = @ptrCast(&invalid_utf8), .len = wire.MAX_PROMPT_BYTES_V1 + 1 },
@@ -722,7 +942,7 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
         ),
     );
     api.bufferRelease()(&diagnostic);
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionRun()(session, 1, sdk.bytesView("exercise ABI"), &options, &result, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionRunText(session, 1, sdk.bytesView("exercise ABI"), &options, &result, &diagnostic));
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     try std.testing.expectEqual(@as(usize, 1), probe.ui_calls);
     try std.testing.expectEqual(@as(usize, 1), probe.ui_releases);
@@ -735,14 +955,14 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
     options.max_turns = wire.MAX_TURNS_V1 + 1;
     try std.testing.expectEqual(
         wire.STATUS_RESOURCE_LIMIT,
-        api.sessionRun()(session, 2, sdk.bytesView("must not start"), &options, &result, &diagnostic),
+        api.sessionRunText(session, 2, sdk.bytesView("must not start"), &options, &result, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
     options.max_turns = 5;
     probe.expected_run_id = 2;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRun()(session, 2, sdk.bytesView("run after pre-admission rejection"), &options, &result, &diagnostic),
+        api.sessionRunText(session, 2, sdk.bytesView("run after pre-admission rejection"), &options, &result, &diagnostic),
     );
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     try std.testing.expectEqual(wire.STATUS_TOO_LATE, api.sessionAbort()(session, 2, wire.ABORT_USER_REQUEST, &diagnostic));
@@ -752,35 +972,35 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
 
     try std.testing.expectEqual(
         wire.STATUS_STALE_RUN,
-        api.sessionRun()(session, 2, sdk.bytesView("accepted identifiers cannot be reused"), &options, &result, &diagnostic),
+        api.sessionRunText(session, 2, sdk.bytesView("accepted identifiers cannot be reused"), &options, &result, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_STALE_RUN,
-        api.sessionRun()(session, 1, sdk.bytesView("accepted identifiers cannot move backwards"), &options, &result, &diagnostic),
+        api.sessionRunText(session, 1, sdk.bytesView("accepted identifiers cannot move backwards"), &options, &result, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
 
     probe.expected_run_id = 20;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRun()(session, 20, sdk.bytesView("Run identifiers may skip"), &options, &result, &diagnostic),
+        api.sessionRunText(session, 20, sdk.bytesView("Run identifiers may skip"), &options, &result, &diagnostic),
     );
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     const max_run_id = std.math.maxInt(u64);
     probe.expected_run_id = max_run_id;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRun()(session, max_run_id, sdk.bytesView("consume the final Run identifier"), &options, &result, &diagnostic),
+        api.sessionRunText(session, max_run_id, sdk.bytesView("consume the final Run identifier"), &options, &result, &diagnostic),
     );
     try std.testing.expectEqual(
         wire.STATUS_STALE_RUN,
-        api.sessionRun()(session, max_run_id, sdk.bytesView("UINT64_MAX cannot repeat"), &options, &result, &diagnostic),
+        api.sessionRunText(session, max_run_id, sdk.bytesView("UINT64_MAX cannot repeat"), &options, &result, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_STALE_RUN,
-        api.sessionRun()(session, 1, sdk.bytesView("UINT64_MAX cannot wrap to a low identifier"), &options, &result, &diagnostic),
+        api.sessionRunText(session, 1, sdk.bytesView("UINT64_MAX cannot wrap to a low identifier"), &options, &result, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
 
@@ -793,7 +1013,7 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
     probe.expected_run_id = max_run_id;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRun()(second_session, max_run_id, sdk.bytesView("Run identifiers are scoped to a Session"), &options, &result, &diagnostic),
+        api.sessionRunText(second_session, max_run_id, sdk.bytesView("Run identifiers are scoped to a Session"), &options, &result, &diagnostic),
     );
     try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(second_session, &diagnostic));
     second_session = null;
@@ -834,7 +1054,7 @@ test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
 
         fn run(self: *@This()) void {
             var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .reserved = [_]u64{0} ** 4 };
-            self.status = self.api.sessionRun()(self.session, 1, sdk.bytesView("pause in facade epilogue"), &options, &self.result, &self.diagnostic);
+            self.status = self.api.sessionRunText(self.session, 1, sdk.bytesView("pause in facade epilogue"), &options, &self.result, &self.diagnostic);
         }
     };
 
@@ -896,7 +1116,7 @@ test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
     var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 1, .reserved = [_]u64{0} ** 4 };
     try std.testing.expectEqual(
         wire.STATUS_BUSY,
-        api.sessionRun()(session, 2, sdk.bytesView("must not enter during epilogue"), &options, &competing_result, &diagnostic),
+        api.sessionRunText(session, 2, sdk.bytesView("must not enter during epilogue"), &options, &competing_result, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(wire.STATUS_BUSY, api.sessionDestroy()(session, &diagnostic));
@@ -1045,12 +1265,12 @@ test "L2 invalid UTF-8 Host tool result is released and does not poison Session"
 
     var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 4, .reserved = [_]u64{0} ** 4 };
     var result: wire.RunResultV1 = undefined;
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionRun()(session, 1, sdk.bytesView("invoke failing host"), &options, &result, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionRunText(session, 1, sdk.bytesView("invoke failing host"), &options, &result, &diagnostic));
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expectEqual(@as(usize, 1), probe.releases);
 
-    try std.testing.expectEqual(wire.STATUS_OK, api.sessionRun()(session, 2, sdk.bytesView("run again"), &options, &result, &diagnostic));
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionRunText(session, 2, sdk.bytesView("run again"), &options, &result, &diagnostic));
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
     session = null;
@@ -1107,7 +1327,7 @@ test "L2 Event callback fatal aborts the Run and poisons the ABI Session" {
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(
         wire.STATUS_CALLBACK_FAILED,
-        api.sessionRun()(session, 1, sdk.bytesView("fail event delivery"), &options, &result, &diagnostic),
+        api.sessionRunText(session, 1, sdk.bytesView("fail event delivery"), &options, &result, &diagnostic),
     );
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     api.bufferRelease()(&diagnostic);
@@ -1115,7 +1335,7 @@ test "L2 Event callback fatal aborts the Run and poisons the ABI Session" {
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(
         wire.STATUS_INVALID_STATE,
-        api.sessionRun()(session, 2, sdk.bytesView("must stay poisoned"), &options, &result, &diagnostic),
+        api.sessionRunText(session, 2, sdk.bytesView("must stay poisoned"), &options, &result, &diagnostic),
     );
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
@@ -1173,7 +1393,7 @@ test "L2 Event callback may cooperatively abort without poisoning the ABI Sessio
     var result: wire.RunResultV1 = undefined;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRun()(session, 1, sdk.bytesView("abort from callback"), &options, &result, &diagnostic),
+        api.sessionRunText(session, 1, sdk.bytesView("abort from callback"), &options, &result, &diagnostic),
     );
     try std.testing.expectEqual(wire.STATUS_STALE_RUN, probe.stale_abort_status);
     try std.testing.expectEqual(wire.STATUS_OK, probe.abort_status);
@@ -1182,7 +1402,7 @@ test "L2 Event callback may cooperatively abort without poisoning the ABI Sessio
     probe.calls = 1;
     try std.testing.expectEqual(
         wire.STATUS_OK,
-        api.sessionRun()(session, 2, sdk.bytesView("run after abort"), &options, &result, &diagnostic),
+        api.sessionRunText(session, 2, sdk.bytesView("run after abort"), &options, &result, &diagnostic),
     );
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     try std.testing.expectEqual(wire.STATUS_STALE_RUN, api.sessionAbort()(session, 1, wire.ABORT_USER_REQUEST, &diagnostic));
@@ -1250,12 +1470,12 @@ fn expectUiOutcome(mode: UiFailureMode, expected_releases: usize, expected_statu
 
     var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 2, .reserved = [_]u64{0} ** 4 };
     var result: wire.RunResultV1 = undefined;
-    try std.testing.expectEqual(expected_status, api.sessionRun()(session, 1, sdk.bytesView("ask through Host UI"), &options, &result, &diagnostic));
+    try std.testing.expectEqual(expected_status, api.sessionRunText(session, 1, sdk.bytesView("ask through Host UI"), &options, &result, &diagnostic));
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expectEqual(expected_releases, probe.releases);
     api.bufferRelease()(&diagnostic);
     if (expected_status == wire.STATUS_CALLBACK_FAILED) {
-        try std.testing.expectEqual(wire.STATUS_INVALID_STATE, api.sessionRun()(session, 2, sdk.bytesView("must stay poisoned"), &options, &result, &diagnostic));
+        try std.testing.expectEqual(wire.STATUS_INVALID_STATE, api.sessionRunText(session, 2, sdk.bytesView("must stay poisoned"), &options, &result, &diagnostic));
         api.bufferRelease()(&diagnostic);
     } else {
         try std.testing.expectEqual(expected_stop, result.stop_reason_code);
@@ -1265,7 +1485,7 @@ fn expectUiOutcome(mode: UiFailureMode, expected_releases: usize, expected_statu
             try std.testing.expectEqual(wire.STATUS_OK, probe.first_abort_status);
             try std.testing.expectEqual(wire.STATUS_OK, probe.second_abort_status);
         }
-        try std.testing.expectEqual(wire.STATUS_OK, api.sessionRun()(session, 2, sdk.bytesView("Session remains reusable"), &options, &result, &diagnostic));
+        try std.testing.expectEqual(wire.STATUS_OK, api.sessionRunText(session, 2, sdk.bytesView("Session remains reusable"), &options, &result, &diagnostic));
         try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
     }
     try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));

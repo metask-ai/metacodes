@@ -6,7 +6,7 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 3 must not retain pre-revision callback aliases"
+#error "revision 4 must not retain pre-revision callback aliases"
 #endif
 
 #ifdef _WIN32
@@ -304,8 +304,11 @@ int main(void) {
         (api->capabilities & METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1) !=
             METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1 ||
         api->runtime_create == NULL || api->runtime_destroy == NULL ||
+        api->runtime_query_skill_catalog == NULL ||
+        api->skill_catalog_release == NULL ||
         api->session_create == NULL || api->session_destroy == NULL ||
-        api->session_run == NULL || api->session_abort == NULL ||
+        api->session_refresh_skill_catalog == NULL ||
+        api->session_run_input == NULL || api->session_abort == NULL ||
         api->buffer_release == NULL) {
         return 10;
     }
@@ -387,10 +390,14 @@ int main(void) {
     metask_agentcore_run_options_v1 options = {0};
     options.struct_size = sizeof(options);
     options.max_turns = 1;
+    metask_agentcore_run_input_v1 input = {0};
+    input.struct_size = sizeof(input);
+    input.kind_code = METASK_AGENTCORE_RUN_INPUT_TEXT;
+    input.text = view("exercise C ABI");
     metask_agentcore_run_result_v1 result = {0};
     active_run_id = 1;
-    uint32_t run_status = api->session_run(session, 1, view("exercise C ABI"),
-                                           &options, &result, &diagnostic);
+    uint32_t run_status = api->session_run_input(session, 1, &input, &options,
+                                                 &result, &diagnostic);
     active_run_id = 0;
     stop_server(&server);
     if (run_status != METASK_AGENTCORE_STATUS_OK || result.stop_reason_code != METASK_AGENTCORE_STOP_END_TURN ||

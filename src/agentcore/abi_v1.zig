@@ -149,6 +149,7 @@ const AbiRuntime = struct {
     core_runtime: *core.agent_session.AgentRuntime,
     host_tools: []AbiHostTool,
     catalogs: skill_catalog_handles.RuntimeCatalogs,
+    materializations: skill_materialization.Manager,
 
     fn handle(self: *AbiRuntime) *wire.RuntimeHandle {
         return @ptrCast(self);
@@ -726,6 +727,12 @@ fn runtimeFrom(handle: *wire.RuntimeHandle) *AbiRuntime {
 fn sessionFrom(handle: *wire.SessionHandle) *AbiSession {
     return @ptrCast(@alignCast(handle));
 }
+fn catalogFrom(handle: *wire.SkillCatalogHandle) *skill_catalog_handles.HostCatalog {
+    return @ptrCast(@alignCast(handle));
+}
+fn catalogHandle(catalog: *skill_catalog_handles.HostCatalog) *wire.SkillCatalogHandle {
+    return @ptrCast(catalog);
+}
 
 fn view(bytes: []const u8) wire.BytesViewV1 {
     return .{ .ptr = if (bytes.len == 0) null else bytes.ptr, .len = bytes.len };
@@ -749,6 +756,10 @@ fn ownedSlice(v: wire.OwnedBytesV1) error{ InvalidArgument, Overflow }![]const u
 
 fn canonicalOwned(v: wire.OwnedBytesV1) bool {
     return (v.len == 0) == (v.ptr == null);
+}
+
+fn canonicalEmpty(v: wire.BytesViewV1) bool {
+    return v.ptr == null and v.len == 0;
 }
 
 fn hasReleaseToken(v: wire.OwnedBytesV1) bool {
@@ -794,6 +805,12 @@ fn statusText(status: u32) []const u8 {
         wire.STATUS_INVALID_STATE => "invalid state",
         wire.STATUS_CALLBACK_FAILED => "callback failed",
         wire.STATUS_RESOURCE_LIMIT => "resource limit",
+        wire.STATUS_SKILL_CATALOG_INVALID => "Skill catalog invalid",
+        wire.STATUS_STALE_CATALOG => "stale Skill catalog",
+        wire.STATUS_SKILL_NOT_FOUND => "Skill not found",
+        wire.STATUS_INVALID_SKILL_ARGUMENTS => "invalid Skill arguments",
+        wire.STATUS_SKILL_POLICY_VIOLATION => "Skill policy violation",
+        wire.STATUS_SKILL_UNAVAILABLE => "Skill unavailable",
         else => "AgentCore error",
     };
 }
@@ -825,6 +842,32 @@ fn catalogLifecycleStatus(err: anyerror) u32 {
         error.RuntimeUnavailable, error.InvalidSessionState => wire.STATUS_INVALID_STATE,
         error.WrongRuntime, error.WrongWorkspace, error.InvalidWorkspace => wire.STATUS_INVALID_ARGUMENT,
         else => wire.STATUS_CORE_ERROR,
+    };
+}
+
+fn catalogQueryStatus(err: anyerror) u32 {
+    return switch (err) {
+        error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
+        error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
+        error.CatalogInvalid, error.InvalidScopeId => wire.STATUS_SKILL_CATALOG_INVALID,
+        error.RuntimeBusy => wire.STATUS_BUSY,
+        error.RuntimeUnavailable => wire.STATUS_INVALID_STATE,
+        error.InvalidWorkspace => wire.STATUS_INVALID_ARGUMENT,
+        else => wire.STATUS_CORE_ERROR,
+    };
+}
+
+fn skillRunErrorStatus(self: *const AbiSession, err: anyerror) u32 {
+    return switch (err) {
+        error.SkillCatalogNotBound, error.InvalidSessionState => wire.STATUS_INVALID_STATE,
+        error.InvalidCatalogRevision, error.InvalidSkillId => wire.STATUS_INVALID_ARGUMENT,
+        error.StaleCatalog => wire.STATUS_STALE_CATALOG,
+        error.SkillNotFound => wire.STATUS_SKILL_NOT_FOUND,
+        error.InvalidArguments => wire.STATUS_INVALID_SKILL_ARGUMENTS,
+        error.PolicyViolation => wire.STATUS_SKILL_POLICY_VIOLATION,
+        error.SkillUnavailable => wire.STATUS_SKILL_UNAVAILABLE,
+        error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
+        else => runErrorStatus(self, err),
     };
 }
 
@@ -1028,6 +1071,10 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
         self.catalogs.tryBeginDestroy() catch unreachable;
         self.catalogs.finishDestroy();
     };
+    self.materializations = skill_materialization.Manager.init(allocator) catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    var keep_materializations = false;
+    defer if (!keep_materializations) self.materializations.deinitFinal();
     self.host_tools = allocator.alloc(AbiHostTool, host_count) catch return fail(wire.STATUS_OUT_OF_MEMORY, "allocating Host tools failed", out_error);
     var keep_host_tools = false;
     defer if (!keep_host_tools) allocator.free(self.host_tools);
@@ -1056,6 +1103,7 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
     };
     out.* = self.handle();
     keep_host_tools = true;
+    keep_materializations = true;
     keep_catalogs = true;
     keep_self = true;
     return wire.STATUS_OK;
@@ -1070,10 +1118,89 @@ fn runtimeDestroy(handle: ?*wire.RuntimeHandle, out_error: ?*wire.OwnedBytesV1) 
     defer if (!destroy_committed) self.catalogs.cancelDestroy();
     self.core_runtime.destroy() catch |err|
         return failError(if (err == error.RuntimeBusy) wire.STATUS_BUSY else wire.STATUS_INVALID_STATE, err, out_error);
+    self.materializations.deinitFinal();
     self.catalogs.finishDestroy();
     destroy_committed = true;
     allocator.free(self.host_tools);
     allocator.destroy(self);
+    return wire.STATUS_OK;
+}
+
+fn runtimeQuerySkillCatalog(
+    runtime_handle: ?*wire.RuntimeHandle,
+    query_ptr: ?*const wire.SkillCatalogQueryV1,
+    out_catalog: ?*?*wire.SkillCatalogHandle,
+    out_descriptor_json: ?*wire.OwnedBytesV1,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    if (out_catalog) |out| out.* = null;
+    if (out_descriptor_json) |out| out.* = .{ .ptr = null, .len = 0 };
+    emptyError(out_error);
+    const runtime = runtimeFrom(runtime_handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "runtime is required", out_error));
+    var runtime_call = runtime.catalogs.enterCall() catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    defer runtime_call.deinit();
+    const query = query_ptr orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "SkillCatalogQueryV1 is required", out_error);
+    const catalog_out = out_catalog orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "out_catalog is required", out_error);
+    const descriptor_out = out_descriptor_json orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "out_descriptor_json is required", out_error);
+    if (query.struct_size != @sizeOf(wire.SkillCatalogQueryV1) or
+        query.reserved0 != 0 or !allZero(query.reserved))
+        return fail(wire.STATUS_INVALID_ARGUMENT, "invalid SkillCatalogQueryV1", out_error);
+
+    var metadata: u64 = 0;
+    for ([_]wire.BytesViewV1{
+        query.workspace_root,
+        query.workspace_home,
+        query.workspace_epoch,
+    }) |value| {
+        addMetadata(&metadata, value.len, wire.MAX_SESSION_METADATA_BYTES_V1) catch |err|
+            return failError(inputErrorStatus(err), err, out_error);
+    }
+    const root = text(query.workspace_root) catch |err|
+        return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+    const home = text(query.workspace_home) catch |err|
+        return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+    const epoch = text(query.workspace_epoch) catch |err|
+        return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+    if (root.len == 0)
+        return fail(wire.STATUS_INVALID_ARGUMENT, "workspace_root is required", out_error);
+
+    var workspace = skill_catalog_handles.CanonicalWorkspace.init(
+        allocator,
+        root,
+        home,
+    ) catch |err| return failError(catalogLifecycleStatus(err), err, out_error);
+    defer workspace.deinit();
+    const host = runtime.catalogs.queryDefault(
+        runtime.materializations.io,
+        &workspace,
+        epoch,
+        .{},
+    ) catch |err| return failError(catalogQueryStatus(err), err, out_error);
+    var keep_host = false;
+    defer if (!keep_host) host.release() catch {};
+
+    const descriptor = allocator.dupe(u8, host.snapshot().descriptor_json) catch
+        return fail(wire.STATUS_OUT_OF_MEMORY, "allocating Skill catalog descriptor failed", out_error);
+    descriptor_out.* = .{ .ptr = descriptor.ptr, .len = descriptor.len };
+    catalog_out.* = catalogHandle(host);
+    keep_host = true;
+    return wire.STATUS_OK;
+}
+
+fn skillCatalogRelease(
+    handle: ?*wire.SkillCatalogHandle,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    emptyError(out_error);
+    const catalog = catalogFrom(handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "Skill catalog is required", out_error));
+    catalog.release() catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
     return wire.STATUS_OK;
 }
 
@@ -1120,6 +1247,16 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     defer workspace.deinit();
     const workspace_scope_id = runtime.catalogs.scopeId(&workspace) catch |err|
         return failError(catalogLifecycleStatus(err), err, out_error);
+    const retained_catalog = if (config.skill_catalog) |catalog_handle|
+        runtime.catalogs.retainForSession(
+            catalogFrom(catalog_handle),
+            &workspace_scope_id,
+        ) catch |err| return failError(catalogLifecycleStatus(err), err, out_error)
+    else
+        null;
+    var keep_catalog = false;
+    defer if (!keep_catalog) if (retained_catalog) |cell|
+        runtime.catalogs.releaseSession(cell);
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
     const allowed = borrowedViews(
@@ -1144,7 +1281,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     self.facade_poisoned = .init(false);
     self.runtime = runtime;
     self.workspace_scope_id = workspace_scope_id;
-    self.skill_catalog_cell = null;
+    self.skill_catalog_cell = retained_catalog;
     self.policy_root = null;
     self.host_permission_rules = .{};
     self.call_mutex = .{};
@@ -1187,6 +1324,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
         );
     };
     out.* = self.handle();
+    keep_catalog = true;
     return wire.STATUS_OK;
 }
 
@@ -1216,7 +1354,31 @@ fn sessionDestroy(handle: ?*wire.SessionHandle, out_error: ?*wire.OwnedBytesV1) 
     return wire.STATUS_OK;
 }
 
-fn sessionRun(handle: ?*wire.SessionHandle, run_id: u64, prompt_view: wire.BytesViewV1, options_ptr: ?*const wire.RunOptionsV1, out_result: ?*wire.RunResultV1, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+fn sessionRefreshSkillCatalog(
+    handle: ?*wire.SessionHandle,
+    catalog_handle: ?*wire.SkillCatalogHandle,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    const catalog = catalogFrom(catalog_handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "Skill catalog is required", out_error));
+    if (self.facade_poisoned.load(.acquire))
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
+    self.refreshCatalog(catalog) catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    return wire.STATUS_OK;
+}
+
+fn sessionRunInput(
+    handle: ?*wire.SessionHandle,
+    run_id: u64,
+    input_ptr: ?*const wire.RunInputV1,
+    options_ptr: ?*const wire.RunOptionsV1,
+    out_result: ?*wire.RunResultV1,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
     // Defensive hygiene only. ABI v1 defines RunResult fields only on OK.
     if (out_result) |out| out.* = std.mem.zeroes(wire.RunResultV1);
     emptyError(out_error);
@@ -1233,19 +1395,81 @@ fn sessionRun(handle: ?*wire.SessionHandle, run_id: u64, prompt_view: wire.Bytes
     defer self.finishRun();
     if (self.facade_poisoned.load(.acquire))
         return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
+    const input = input_ptr orelse return fail(wire.STATUS_INVALID_ARGUMENT, "RunInputV1 is required", out_error);
     const options = options_ptr orelse return fail(wire.STATUS_INVALID_ARGUMENT, "run options are required", out_error);
     const out = out_result orelse return fail(wire.STATUS_INVALID_ARGUMENT, "out_result is required", out_error);
-    if (run_id == 0 or options.struct_size != @sizeOf(wire.RunOptionsV1) or options.max_turns == 0 or !allZero(options.reserved))
-        return fail(wire.STATUS_INVALID_ARGUMENT, "invalid run id or RunOptionsV1", out_error);
+    if (run_id == 0 or input.struct_size != @sizeOf(wire.RunInputV1) or
+        !allZero(input.reserved) or options.struct_size != @sizeOf(wire.RunOptionsV1) or
+        options.max_turns == 0 or !allZero(options.reserved))
+        return fail(wire.STATUS_INVALID_ARGUMENT, "invalid run id, RunInputV1, or RunOptionsV1", out_error);
     if (options.max_turns > wire.MAX_TURNS_V1)
         return fail(wire.STATUS_RESOURCE_LIMIT, "max_turns exceeds AgentCore ABI v1 limit", out_error);
-    if (prompt_view.len > wire.MAX_PROMPT_BYTES_V1)
-        return fail(wire.STATUS_RESOURCE_LIMIT, "prompt exceeds AgentCore ABI v1 limit", out_error);
-    const prompt = text(prompt_view) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
-    const result = self.core_session.runText(run_id, prompt, options.max_turns, .{ .ctx = self, .emit = AbiSession.emit }) catch |err| {
-        const status = runErrorStatus(self, err);
-        if (self.core_session.isPoisoned()) self.facade_poisoned.store(true, .release);
-        return failError(status, err, out_error);
+    const execution: SkillExecution = switch (input.kind_code) {
+        wire.RUN_INPUT_TEXT => text_run: {
+            if (!canonicalEmpty(input.skill_id) or !canonicalEmpty(input.catalog_revision) or
+                !canonicalEmpty(input.arguments_json))
+                return fail(wire.STATUS_INVALID_ARGUMENT, "TextInput Skill fields must be canonical empty", out_error);
+            if (input.text.len > wire.MAX_PROMPT_BYTES_V1)
+                return fail(wire.STATUS_RESOURCE_LIMIT, "prompt exceeds AgentCore ABI v1 limit", out_error);
+            const prompt = text(input.text) catch |err|
+                return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+            const result = self.core_session.runText(
+                run_id,
+                prompt,
+                options.max_turns,
+                .{ .ctx = self, .emit = AbiSession.emit },
+            ) catch |err| {
+                const status = runErrorStatus(self, err);
+                if (self.core_session.isPoisoned()) self.facade_poisoned.store(true, .release);
+                return failError(status, err, out_error);
+            };
+            break :text_run .{ .completed = result };
+        },
+        wire.RUN_INPUT_SKILL => skill_run: {
+            if (!canonicalEmpty(input.text))
+                return fail(wire.STATUS_INVALID_ARGUMENT, "SkillInvocation text must be canonical empty", out_error);
+            if (input.skill_id.len > 64 or input.catalog_revision.len > 64)
+                return fail(wire.STATUS_INVALID_ARGUMENT, "Skill identity exceeds its canonical length", out_error);
+            if (input.arguments_json.len > wire.MAX_SKILL_ARGUMENT_JSON_BYTES_V1)
+                return fail(wire.STATUS_RESOURCE_LIMIT, "Skill arguments exceed AgentCore ABI v1 limit", out_error);
+            if (input.arguments_json.len == 0 and input.arguments_json.ptr != null)
+                return fail(wire.STATUS_INVALID_SKILL_ARGUMENTS, "empty Skill arguments must be canonical", out_error);
+            const skill_id = text(input.skill_id) catch |err|
+                return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+            const revision = text(input.catalog_revision) catch |err|
+                return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+            const arguments = text(input.arguments_json) catch |err|
+                return failError(wire.STATUS_INVALID_SKILL_ARGUMENTS, err, out_error);
+            if (skill_id.len == 0 or revision.len == 0)
+                return fail(wire.STATUS_INVALID_ARGUMENT, "Skill id and catalog revision are required", out_error);
+            break :skill_run self.runSkill(
+                &runtime.materializations,
+                run_id,
+                revision,
+                skill_id,
+                arguments,
+                options.max_turns,
+            ) catch |err| {
+                const status = skillRunErrorStatus(self, err);
+                if (self.core_session.isPoisoned()) self.facade_poisoned.store(true, .release);
+                return failError(status, err, out_error);
+            };
+        },
+        else => return fail(wire.STATUS_INVALID_ARGUMENT, "unknown RunInputV1 kind", out_error),
+    };
+    const result = switch (execution) {
+        .aborted => {
+            out.* = .{
+                .struct_size = @sizeOf(wire.RunResultV1),
+                .stop_reason_code = wire.STOP_ABORTED,
+                .turns = 0,
+                .tool_calls = 0,
+                .reserved = [_]u64{0} ** 4,
+            };
+            invokeTestEpilogueHook(run_id);
+            return wire.STATUS_OK;
+        },
+        .completed => |completed| completed,
     };
     defer if (result.suspend_info) |suspend_info| suspend_info.deinit();
     invokeTestEpilogueHook(run_id);
@@ -1298,9 +1522,12 @@ const api_v1 = wire.ApiV1{
     .capabilities = wire.REQUIRED_CAPABILITIES_V1,
     .runtime_create = runtimeCreate,
     .runtime_destroy = runtimeDestroy,
+    .runtime_query_skill_catalog = runtimeQuerySkillCatalog,
+    .skill_catalog_release = skillCatalogRelease,
     .session_create = sessionCreate,
     .session_destroy = sessionDestroy,
-    .session_run = sessionRun,
+    .session_refresh_skill_catalog = sessionRefreshSkillCatalog,
+    .session_run_input = sessionRunInput,
     .session_abort = sessionAbort,
     .buffer_release = bufferRelease,
     .reserved = [_]u64{0} ** 4,
@@ -2019,6 +2246,7 @@ test "Session catalog refresh is idle-only atomic replacement with rollback" {
             std.testing.allocator,
             [_]u8{0x41} ** 32,
         ),
+        .materializations = undefined,
     };
     var other_runtime = AbiRuntime{
         .core_runtime = undefined,
@@ -2027,6 +2255,7 @@ test "Session catalog refresh is idle-only atomic replacement with rollback" {
             std.testing.allocator,
             [_]u8{0x42} ** 32,
         ),
+        .materializations = undefined,
     };
     const scope_id = try runtime.catalogs.scopeId(&workspace);
     const first_host = try runtime.catalogs.query(io, &workspace, "first", &.{}, .{});
