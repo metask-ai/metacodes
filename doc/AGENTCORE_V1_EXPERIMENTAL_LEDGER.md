@@ -30,13 +30,27 @@
 ## C 组：消费端观测清单（consumer gate 收集，不拍脑袋）
 
 仓内 source-free Zig/C/C++ 探针证明了 revision 2 的可编译、可链接与基础运行迁移，
-但没有提供独立产品负载反馈；以下五项仍全部开放，等待真实消费者数据：
+但没有提供独立产品负载反馈。C1–C8 是开放观测项；C9 是已经取得并可供
+revision 4 准入引用的真实消费者证据：
 
-1. RunResult 是否需要最终文本与累计 usage（联动 A1）；
-2. Provider 封闭品牌枚举 vs 协议族/字符串；API key 强制非空排除了无认证本地 endpoint（SDK 通用性问题）；
-3. UI 是否需要显式 cancelled（联动 B2）；
-4. 内置工具 schema/错误格式/行为是否入 ABI 稳定范围，还是独立版本化；
-5. prompt/event 合理硬上限（联动 B4）。
+1. **C1（开放）**：RunResult 是否需要最终文本与累计 usage（联动 A1）；
+2. **C2（开放）**：Provider 封闭品牌枚举 vs 协议族/字符串；API key 强制非空排除了无认证本地 endpoint（SDK 通用性问题）；
+3. **C3（开放）**：UI 是否需要显式 cancelled（联动 B2）；
+4. **C4（开放）**：内置工具 schema/错误格式/行为是否入 ABI 稳定范围，还是独立版本化；
+5. **C5（开放）**：prompt/event 合理硬上限（联动 B4）；
+6. **C6（开放）**：Runtime/Session config 的后续扩展机制；
+7. **C7（开放）**：异步/流式 Run；
+8. **C8（开放）**：Conversation 导出；
+9. **C9（已验证，2026-07-27）— MetaWork pre-session Skill discovery 与 typed invocation**：
+   - 消费方证据固定在 MetaWork commit
+     `4e0f30dfe44fea29288f35d334f2532ecf8df071`；
+   - `docs/workbench-ui-design.md` §5.1/§5.3 规定 New task 只打开 Renderer draft，
+     第一次发送才创建真实 Task；选择 Workspace 也只更新 draft，不得提前创建 Task；
+   - `docs/agentcore-abi-v1.md` §2/§4 记录当前 revision 3 只有 text-only 同步
+     `session_run`，没有 pre-session Skill catalog 或 typed Skill invocation；
+   - 因此 MetaWork 若不复制/绕过 AgentCore Skill loader，就无法在首次发送前列出
+     Skill，也无法通过 source-free bundle ABI 提交稳定的 Skill identity、catalog
+     revision 与 typed arguments。该阻塞构成 revision 4 S1 的消费者准入证据。
 
 ## D 组：文档卫生（随最近批次清理）
 
