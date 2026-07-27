@@ -25,6 +25,8 @@ const ReadState = @import("read_state.zig").ReadState;
 const JobRegistry = @import("job_registry.zig").JobRegistry;
 const SessionRules = @import("../permission/session_rules.zig").SessionRules;
 const ToolExecutionPolicy = @import("../tools.zig").ToolExecutionPolicy;
+const ToolDispatcher = @import("../tools.zig").ToolDispatcher;
+const ToolDefinition = @import("../json.zig").ToolDefinition;
 
 pub const DEFAULT_BUILTIN_TOOLS = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Grep", "Bash", "BashOutput", "KillShell" };
 /// Built-ins whose complete execution dependencies are owned by AgentSession.
@@ -212,6 +214,15 @@ pub const EventSink = struct {
     emit: *const fn (ctx: *anyopaque, session_id: SessionId, run_id: u64, event: CoreEvent) bool,
 };
 
+/// Borrowed, immutable tool surface for one admitted Run. Facades may add
+/// run-scoped tools without mutating the Session catalog or the shared agent
+/// loop. The owner must keep both fields alive until the synchronous Run and
+/// every tool worker have quiesced.
+pub const RunToolSurface = struct {
+    definitions: []const ToolDefinition,
+    dispatcher: ToolDispatcher,
+};
+
 const State = enum {
     idle,
     running,
@@ -327,6 +338,24 @@ pub const AdmittedRun = struct {
         max_turns: u32,
         execution_policy: ?ToolExecutionPolicy,
     ) anyerror!agent_loop.RunResult {
+        return self.runUserMessagesWithToolSurface(
+            prompts,
+            max_turns,
+            execution_policy,
+            null,
+        );
+    }
+
+    /// Continue an admitted Run with a caller-owned tool overlay. This is the
+    /// only shared-core seam needed by AgentCore's bound Skill catalog; it
+    /// changes neither provider behavior nor the agent-loop tool protocol.
+    pub fn runUserMessagesWithToolSurface(
+        self: *AdmittedRun,
+        prompts: []const []const u8,
+        max_turns: u32,
+        execution_policy: ?ToolExecutionPolicy,
+        tool_surface: ?RunToolSurface,
+    ) anyerror!agent_loop.RunResult {
         if (self.completed) return error.InvalidSessionState;
         if (prompts.len == 0) {
             _ = try self.finishWithoutConversation();
@@ -344,6 +373,7 @@ pub const AdmittedRun = struct {
             self.identity_value,
             max_turns,
             execution_policy,
+            tool_surface,
         );
     }
 
@@ -619,12 +649,21 @@ pub const AgentSession = struct {
         identity: RunIdentity,
         max_turns: u32,
         execution_policy: ?ToolExecutionPolicy,
+        tool_surface: ?RunToolSurface,
     ) anyerror!agent_loop.RunResult {
         var backend = ui_backend.UiBackend{ .ctx = @ptrCast(self), .emit = backendEmit, .poll = backendPoll };
+        const tool_definitions = if (tool_surface) |surface|
+            surface.definitions
+        else
+            self.tools.definitions;
+        const tool_dispatcher = if (tool_surface) |surface|
+            surface.dispatcher
+        else
+            self.tools.dispatcher();
         var native_result = agent_loop.run(
             &self.conversation,
             self.provider.provider(),
-            self.tools.definitions,
+            tool_definitions,
             &self.permission_ctx,
             .{
                 .max_turns = max_turns,
@@ -633,8 +672,8 @@ pub const AgentSession = struct {
                 .abort = &self.abort_signal,
                 .read_state = &self.read_state,
                 .jobs = if (self.jobs) |*registry| registry else null,
-                .tool_defs = self.tools.definitions,
-                .tool_dispatcher = self.tools.dispatcher(),
+                .tool_defs = tool_definitions,
+                .tool_dispatcher = tool_dispatcher,
                 .execution_policy = execution_policy,
                 // admission 处固定的 Run 身份,显式传值贯穿至 Host tool 执行点。
                 .host_run = if (self.host_identity_ctx) |hctx| .{

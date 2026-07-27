@@ -167,6 +167,8 @@ typedef struct {
     uint32_t struct_size;
     uint32_t reserved0;
     void *ctx;
+    /* "Skill" is reserved for AgentCore's Run-local projection of a bound
+     * catalog and is rejected as a Host tool name. */
     metask_agentcore_bytes_view_v1 name;
     metask_agentcore_bytes_view_v1 description;
     metask_agentcore_bytes_view_v1 input_schema_json;
@@ -258,7 +260,8 @@ typedef struct {
     const metask_agentcore_bytes_view_v1 *allowed_tools;
     uint64_t allowed_tool_count;
     /* NULL creates a text-only Session. A non-NULL catalog must belong to this
-     * Runtime and canonical Workspace binding. */
+     * Runtime and canonical Workspace binding. Model-invocable entries are
+     * projected through AgentCore's internal Skill tool on every Run. */
     metask_agentcore_skill_catalog *skill_catalog;
     uint64_t reserved[4];
 } metask_agentcore_session_config_v1;

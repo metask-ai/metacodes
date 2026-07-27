@@ -13,6 +13,7 @@ pub const skill_activation = @import("skill_activation.zig");
 pub const skill_materialization = @import("skill_materialization.zig");
 pub const policy_frame = @import("policy_frame.zig");
 pub const event_projection = @import("event_projection.zig");
+pub const model_skill_tool = @import("model_skill_tool.zig");
 const sandbox_admission = @import("sandbox_admission.zig");
 
 const allocator = std.heap.c_allocator;
@@ -415,6 +416,73 @@ const AbiSession = struct {
         };
     }
 
+    fn runTextWithBoundSkills(
+        self: *AbiSession,
+        materializations: *skill_materialization.Manager,
+        run_id: u64,
+        prompt: []const u8,
+        max_turns: u32,
+    ) anyerror!SkillExecution {
+        const cell = self.skill_catalog_cell orelse {
+            return .{ .completed = try self.core_session.runText(
+                run_id,
+                prompt,
+                max_turns,
+                .{ .ctx = self, .emit = AbiSession.emit },
+            ) };
+        };
+        if (!model_skill_tool.Environment.hasModelInvocable(cell.snapshot)) {
+            return .{ .completed = try self.core_session.runText(
+                run_id,
+                prompt,
+                max_turns,
+                .{ .ctx = self, .emit = AbiSession.emit },
+            ) };
+        }
+        const root_frame = self.policy_root orelse
+            return error.InvalidSessionState;
+        const identity = core.agent_session.RunIdentity{
+            .session_id = self.core_session.session_id,
+            .run_id = run_id,
+        };
+        var environment = try model_skill_tool.Environment.init(.{
+            .allocator = allocator,
+            .session = self.core_session,
+            .materializations = materializations,
+            .snapshot = cell.snapshot,
+            .identity = identity,
+            .base_frame = root_frame,
+            .abort = &self.core_session.abort_signal,
+            .event_sink = .{ .ctx = self, .emit = AbiSession.emit },
+            .max_turns = max_turns,
+        });
+        var environment_live = true;
+        defer if (environment_live) environment.deinit() catch {};
+
+        var admitted = try self.core_session.admitRun(
+            run_id,
+            .{ .ctx = self, .emit = AbiSession.emit },
+        );
+        const result = admitted.runUserMessagesWithToolSurface(
+            &.{prompt},
+            max_turns,
+            environment.executionPolicy(),
+            environment.surface(),
+        ) catch |run_error| {
+            const callback_failed = environment.callbackFailed();
+            environment.deinit() catch {};
+            environment_live = false;
+            if (callback_failed) return error.CallbackFailed;
+            return run_error;
+        };
+        environment.deinit() catch {
+            environment_live = false;
+            return error.AdmittedCleanupFailed;
+        };
+        environment_live = false;
+        return .{ .completed = result };
+    }
+
     /// Caller holds the facade Run gate and Runtime active-call guard. Pure
     /// ActivationPlan validation has already completed before this admitted
     /// boundary.
@@ -455,6 +523,8 @@ const AbiSession = struct {
             return .aborted;
         }
         return .{ .ready = .{
+            .facade = self,
+            .materializations = materializations,
             .admitted = admitted,
             .activation = activation,
         } };
@@ -472,6 +542,8 @@ const SkillExecution = union(enum) {
 };
 
 const MaterializedSkillRun = struct {
+    facade: *AbiSession,
+    materializations: *skill_materialization.Manager,
     admitted: core.agent_session.AdmittedRun,
     activation: skill_activation.Activation,
 
@@ -504,15 +576,65 @@ const MaterializedSkillRun = struct {
             return .aborted;
         }
 
-        const result = self.admitted.runUserMessagesWithPolicy(
-            &.{ invocation_record, body_record },
-            max_turns,
-            self.activation.frame.executionPolicy(),
-        ) catch |run_error| {
-            try self.releaseAssets();
+        const cell = self.facade.skill_catalog_cell orelse {
+            _ = try self.finishWithoutConversation();
+            return error.InvalidSessionState;
+        };
+        var environment: ?model_skill_tool.Environment =
+            if (model_skill_tool.Environment.hasModelInvocable(cell.snapshot))
+                model_skill_tool.Environment.init(.{
+                    .allocator = allocator,
+                    .session = self.admitted.session,
+                    .materializations = self.materializations,
+                    .snapshot = cell.snapshot,
+                    .identity = self.admitted.identity(),
+                    .base_frame = self.activation.frame,
+                    .abort = @constCast(self.admitted.abortSignal()),
+                    .event_sink = .{
+                        .ctx = self.facade,
+                        .emit = AbiSession.emit,
+                    },
+                    .max_turns = max_turns,
+                }) catch |environment_error| {
+                    _ = try self.finishWithoutConversation();
+                    return environment_error;
+                }
+            else
+                null;
+        var environment_live = environment != null;
+        defer if (environment_live) environment.?.deinit() catch {};
+        const result = (if (environment) |*env|
+            self.admitted.runUserMessagesWithToolSurface(
+                &.{ invocation_record, body_record },
+                max_turns,
+                env.executionPolicy(),
+                env.surface(),
+            )
+        else
+            self.admitted.runUserMessagesWithPolicy(
+                &.{ invocation_record, body_record },
+                max_turns,
+                self.activation.frame.executionPolicy(),
+            )) catch |run_error| {
+            const callback_failed = if (environment) |*env|
+                env.callbackFailed()
+            else
+                false;
+            if (environment) |*env| env.deinit() catch {};
+            environment_live = false;
+            self.releaseAssets() catch {};
+            if (callback_failed) return error.CallbackFailed;
             return run_error;
         };
-        try self.releaseAssets();
+        if (environment) |*env| {
+            env.deinit() catch {
+                environment_live = false;
+                self.releaseAssets() catch {};
+                return error.AdmittedCleanupFailed;
+            };
+        }
+        environment_live = false;
+        self.releaseAssets() catch return error.AdmittedCleanupFailed;
         return .{ .completed = result };
     }
 
@@ -536,7 +658,9 @@ const MaterializedSkillRun = struct {
         }
 
         var executor_context = ForkExecutorContext{
+            .facade = self.facade,
             .session = self.admitted.session,
+            .materializations = self.materializations,
             .activation = &self.activation,
             .plan = plan,
             .max_turns = max_turns,
@@ -548,10 +672,10 @@ const MaterializedSkillRun = struct {
                 .executeFn = ForkExecutorContext.execute,
             },
         ) catch |run_error| {
-            try self.releaseAssets();
+            self.releaseAssets() catch {};
             return run_error;
         };
-        try self.releaseAssets();
+        self.releaseAssets() catch return error.AdmittedCleanupFailed;
         return .{ .completed = result };
     }
 
@@ -575,7 +699,9 @@ const MaterializedSkillRun = struct {
 };
 
 const ForkExecutorContext = struct {
+    facade: *AbiSession,
     session: *core.agent_session.AgentSession,
+    materializations: *skill_materialization.Manager,
     activation: *skill_activation.Activation,
     plan: *const skill_activation.ActivationPlan,
     max_turns: u32,
@@ -612,12 +738,47 @@ const ForkExecutorContext = struct {
                 .host_session_ctx = host_ctx,
             } else null;
         const child_depth = try childDepth(self.activation.parent_agent_depth);
+        const cell = self.facade.skill_catalog_cell orelse
+            return error.InvalidSessionState;
+        var environment: ?model_skill_tool.Environment =
+            if (model_skill_tool.Environment.hasModelInvocable(cell.snapshot))
+                try model_skill_tool.Environment.init(.{
+                    .allocator = output_allocator,
+                    .session = self.session,
+                    .materializations = self.materializations,
+                    .snapshot = cell.snapshot,
+                    .identity = identity,
+                    .base_frame = self.activation.frame,
+                    .abort = @constCast(abort),
+                    .event_sink = .{
+                        .ctx = self.facade,
+                        .emit = AbiSession.emit,
+                    },
+                    .max_turns = self.max_turns,
+                    .agent_depth = child_depth,
+                })
+            else
+                null;
+        var environment_live = environment != null;
+        defer if (environment_live) environment.?.deinit() catch {};
+        const definitions = if (environment) |*env|
+            env.definitions
+        else
+            self.session.tools.definitions;
+        const dispatcher = if (environment) |*env|
+            env.surface().dispatcher
+        else
+            self.session.tools.dispatcher();
+        const execution_policy = if (environment) |*env|
+            env.executionPolicy()
+        else
+            self.activation.frame.executionPolicy();
 
-        const child = try core.subagent.spawnAgentSink(
+        const child = core.subagent.spawnAgentSink(
             output_allocator,
             self.session.provider.provider(),
             self.session.provider.anthropicClient(),
-            self.session.tools.definitions,
+            definitions,
             &self.session.permission_ctx,
             abort,
             self.activation.rendered_body,
@@ -626,8 +787,8 @@ const ForkExecutorContext = struct {
                 .system_prompt = "You are a subagent. Complete the task and return a concise final answer.\n",
                 .session = identity.session_id,
                 .agent_depth = child_depth,
-                .tool_dispatcher = self.session.tools.dispatcher(),
-                .execution_policy = self.activation.frame.executionPolicy(),
+                .tool_dispatcher = dispatcher,
+                .execution_policy = execution_policy,
                 .host_run = host_run,
                 .ui_requester = self.session.permission_ctx.ui_requester,
                 .read_state = &self.session.read_state,
@@ -644,9 +805,20 @@ const ForkExecutorContext = struct {
                 .home_dir = self.session.workspace.home,
             },
             &child_backend,
-        );
+        ) catch |run_error| {
+            const callback_failed = if (environment) |*env|
+                env.callbackFailed()
+            else
+                false;
+            if (callback_failed) return error.CallbackFailed;
+            return run_error;
+        };
         defer child.deinit();
         try projector.appendFinalText(out_final_text);
+        if (environment) |*env| {
+            try env.deinit();
+            environment_live = false;
+        }
         return .{
             .stop_reason = child.stop_reason,
             .turns = child.turns,
@@ -1092,6 +1264,8 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
             return failError(inputErrorStatus(err), err, out_error);
         const name = text(descriptor.name) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
         if (!validToolName(name)) return fail(wire.STATUS_INVALID_ARGUMENT, "invalid Host tool name", out_error);
+        if (std.mem.eql(u8, name, model_skill_tool.TOOL_NAME))
+            return fail(wire.STATUS_INVALID_ARGUMENT, "Host tool name 'Skill' is reserved by AgentCore", out_error);
         const description = text(descriptor.description) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
         const schema_json = text(descriptor.input_schema_json) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
         const schema = parseSchema(a, schema_json) catch |err| return failError(inputErrorStatus(err), err, out_error);
@@ -1413,17 +1587,19 @@ fn sessionRunInput(
                 return fail(wire.STATUS_RESOURCE_LIMIT, "prompt exceeds AgentCore ABI v1 limit", out_error);
             const prompt = text(input.text) catch |err|
                 return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
-            const result = self.core_session.runText(
+            const text_execution = self.runTextWithBoundSkills(
+                &runtime.materializations,
                 run_id,
                 prompt,
                 options.max_turns,
-                .{ .ctx = self, .emit = AbiSession.emit },
             ) catch |err| {
                 const status = runErrorStatus(self, err);
-                if (self.core_session.isPoisoned()) self.facade_poisoned.store(true, .release);
+                if (err == error.AdmittedCleanupFailed or
+                    self.core_session.isPoisoned())
+                    self.facade_poisoned.store(true, .release);
                 return failError(status, err, out_error);
             };
-            break :text_run .{ .completed = result };
+            break :text_run text_execution;
         },
         wire.RUN_INPUT_SKILL => skill_run: {
             if (!canonicalEmpty(input.text))
@@ -1451,7 +1627,9 @@ fn sessionRunInput(
                 options.max_turns,
             ) catch |err| {
                 const status = skillRunErrorStatus(self, err);
-                if (self.core_session.isPoisoned()) self.facade_poisoned.store(true, .release);
+                if (err == error.AdmittedCleanupFailed or
+                    self.core_session.isPoisoned())
+                    self.facade_poisoned.store(true, .release);
                 return failError(status, err, out_error);
             };
         },
@@ -2188,6 +2366,14 @@ test "ABI Runtime applies tool-name grammar to built-ins and Host tools" {
     runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
     runtime_config.host_tools = @ptrCast(&host);
     runtime_config.host_tool_count = 1;
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        runtimeCreate(&runtime_config, &runtime, &diagnostic),
+    );
+    try std.testing.expect(runtime == null);
+    bufferRelease(&diagnostic);
+
+    host.name = view(model_skill_tool.TOOL_NAME);
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
         runtimeCreate(&runtime_config, &runtime, &diagnostic),

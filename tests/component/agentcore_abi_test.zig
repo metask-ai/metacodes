@@ -30,6 +30,69 @@ const HOST_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+const SKILL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_skill\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_skill\",\"name\":\"Skill\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"name\\\":\\\"review\\\",\\\"values\\\":[\\\"src/main.zig\\\"]}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const CHILD_SKILL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_child_skill\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_child_skill\",\"name\":\"Skill\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"name\\\":\\\"child\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const HIDDEN_SKILL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_hidden_skill\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_hidden_skill\",\"name\":\"Skill\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"name\\\":\\\"private-deploy\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const FORK_SKILL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_fork_skill\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_fork_skill\",\"name\":\"Skill\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"name\\\":\\\"forked\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const WRITE_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_write\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_write\",\"name\":\"Write\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\":\\\"blocked.txt\\\",\\\"content\\\":\\\"must-not-write\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const SKILL_THEN_GLOB_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_serial_skill\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_serial_skill\",\"name\":\"Skill\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"name\\\":\\\"root-policy\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_serial_glob\",\"name\":\"Glob\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pattern\\\":\\\"**/*\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const OPENAI_SKILL_SSE =
+    "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"call_skill\",\"type\":\"function\",\"function\":{\"name\":\"Skill\",\"arguments\":\"\"}}]}}]}\n\n" ++
+    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"name\\\":\\\"re\"}}]}}]}\n\n" ++
+    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"view\\\",\\\"values\\\":[\\\"README.md\\\"]}\"}}]}}]}\n\n" ++
+    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" ++
+    "data: [DONE]\n\n";
+
+const OPENAI_FINAL_SSE =
+    "data: {\"choices\":[{\"delta\":{\"content\":\"openai skill done\"}}]}\n\n" ++
+    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+    "data: [DONE]\n\n";
+
 const CONTINUATION_HEAD_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"cont_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
@@ -317,6 +380,29 @@ const FatalEventProbe = struct {
         const self: *FatalEventProbe = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
         self.calls += 1;
         return wire.EVENT_FATAL;
+    }
+};
+
+const NestedSkillFatalProbe = struct {
+    calls: usize = 0,
+    failed: bool = false,
+
+    fn event(
+        raw: ?*anyopaque,
+        _: ?*const wire.RunContextV1,
+        event_json: wire.BytesViewV1,
+    ) callconv(.c) u32 {
+        const self: *NestedSkillFatalProbe = @ptrCast(@alignCast(
+            raw orelse return wire.EVENT_FATAL,
+        ));
+        self.calls += 1;
+        const bytes = sdk.borrowedBytes(event_json) catch
+            return wire.EVENT_FATAL;
+        if (std.mem.indexOf(u8, bytes, "\"text_chunk\":\"done\"") != null) {
+            self.failed = true;
+            return wire.EVENT_FATAL;
+        }
+        return wire.EVENT_CONTINUE;
     }
 };
 
@@ -840,6 +926,501 @@ test "L2 Revision 4 catalog binds before Session and typed Skill failures remain
         ),
     );
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+}
+
+test "L2 bound catalog executes model Skill and preserves nested policy lineage" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+
+    const review_dir = try std.fs.path.join(
+        a,
+        &.{ root, ".metacodes", "skills", "review" },
+    );
+    defer a.free(review_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, review_dir);
+    const review_path = try std.fs.path.join(
+        a,
+        &.{ review_dir, "SKILL.md" },
+    );
+    defer a.free(review_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = review_path,
+        .data = "---\n" ++
+            "name: Review\n" ++
+            "description: Review a target selected by the model\n" ++
+            "arguments: [target]\n" ++
+            "---\n" ++
+            "Review $target using the bound snapshot.",
+    });
+
+    const hidden_dir = try std.fs.path.join(
+        a,
+        &.{ root, ".metacodes", "skills", "private-deploy" },
+    );
+    defer a.free(hidden_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, hidden_dir);
+    const hidden_path = try std.fs.path.join(
+        a,
+        &.{ hidden_dir, "SKILL.md" },
+    );
+    defer a.free(hidden_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = hidden_path,
+        .data = "---\n" ++
+            "name: Hidden Deploy\n" ++
+            "description: hidden-deploy-secret\n" ++
+            "disable-model-invocation: true\n" ++
+            "---\n" ++
+            "Never advertise this body.",
+    });
+
+    const root_skill_dir = try std.fs.path.join(
+        a,
+        &.{ root, ".metacodes", "skills", "root-policy" },
+    );
+    defer a.free(root_skill_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, root_skill_dir);
+    const root_skill_path = try std.fs.path.join(
+        a,
+        &.{ root_skill_dir, "SKILL.md" },
+    );
+    defer a.free(root_skill_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = root_skill_path,
+        .data = "---\n" ++
+            "name: Root Policy\n" ++
+            "description: Narrow the external invocation to Read\n" ++
+            "allowed-tools: Read\n" ++
+            "---\n" ++
+            "Invoke the child Skill, then continue.",
+    });
+
+    const child_dir = try std.fs.path.join(
+        a,
+        &.{ root, ".metacodes", "skills", "child" },
+    );
+    defer a.free(child_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, child_dir);
+    const child_path = try std.fs.path.join(
+        a,
+        &.{ child_dir, "SKILL.md" },
+    );
+    defer a.free(child_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = child_path,
+        .data = "---\n" ++
+            "name: Child\n" ++
+            "description: Nested child with no additional grant\n" ++
+            "---\n" ++
+            "Child activation body.",
+    });
+
+    const fork_dir = try std.fs.path.join(
+        a,
+        &.{ root, ".metacodes", "skills", "forked" },
+    );
+    defer a.free(fork_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, fork_dir);
+    const fork_path = try std.fs.path.join(
+        a,
+        &.{ fork_dir, "SKILL.md" },
+    );
+    defer a.free(fork_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = fork_path,
+        .data = "---\n" ++
+            "name: Forked\n" ++
+            "description: Run a fresh child that may invoke another Skill\n" ++
+            "context: fork\n" ++
+            "---\n" ++
+            "Invoke the child Skill and return its result.",
+    });
+
+    const bodies = [_][]const u8{
+        SKILL_SSE,
+        FINAL_SSE,
+        SKILL_THEN_GLOB_SSE,
+        FINAL_SSE,
+        CHILD_SKILL_SSE,
+        WRITE_SSE,
+        FINAL_SSE,
+        HIDDEN_SKILL_SSE,
+        FINAL_SSE,
+        FORK_SKILL_SSE,
+        CHILD_SKILL_SSE,
+        FINAL_SSE,
+        FINAL_SSE,
+    };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+
+    const builtins = [_]wire.BytesViewV1{
+        sdk.bytesView("Read"),
+        sdk.bytesView("Write"),
+        sdk.bytesView("Glob"),
+    };
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    runtime_config.builtin_tools = &builtins;
+    runtime_config.builtin_tool_count = builtins.len;
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+    );
+    defer if (runtime) |handle| {
+        _ = api.runtimeDestroy()(handle, &diagnostic);
+    };
+
+    var query = wire.SkillCatalogQueryV1{
+        .struct_size = @sizeOf(wire.SkillCatalogQueryV1),
+        .reserved0 = 0,
+        .workspace_root = sdk.bytesView(root),
+        .workspace_home = sdk.bytesView(root),
+        .workspace_epoch = sdk.bytesView("model-tool-epoch"),
+        .reserved = [_]u64{0} ** 3,
+    };
+    var catalog: ?*wire.SkillCatalogHandle = null;
+    defer if (catalog) |handle| {
+        _ = api.skillCatalogRelease()(handle, &diagnostic);
+    };
+    var descriptor = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&descriptor);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeQuerySkillCatalog()(
+            runtime,
+            &query,
+            &catalog,
+            &descriptor,
+            &diagnostic,
+        ),
+    );
+    const descriptor_bytes = try sdk.borrowedBytes(.{
+        .ptr = descriptor.ptr,
+        .len = descriptor.len,
+    });
+    const root_identity = try extractCatalogIdentities(
+        a,
+        descriptor_bytes,
+        "root-policy",
+    );
+    defer a.free(root_identity.revision);
+    defer a.free(root_identity.skill_id);
+
+    const allowed = [_]wire.BytesViewV1{
+        sdk.bytesView("Read"),
+        sdk.bytesView("Write"),
+        sdk.bytesView("Glob"),
+    };
+    var session_config = std.mem.zeroes(wire.SessionConfigV1);
+    session_config.struct_size = @sizeOf(wire.SessionConfigV1);
+    session_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    session_config.permission_mode_code = wire.PERMISSION_BYPASS;
+    session_config.shell_policy_code = wire.SHELL_DISABLED;
+    session_config.api_key = sdk.bytesView("test-key");
+    session_config.model = sdk.bytesView("test-model");
+    session_config.base_url = sdk.bytesView(url);
+    session_config.workspace_root = sdk.bytesView(root);
+    session_config.workspace_home = sdk.bytesView(root);
+    session_config.allowed_tools = &allowed;
+    session_config.allowed_tool_count = allowed.len;
+    session_config.skill_catalog = catalog;
+
+    var probe = Probe{};
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = Probe.event;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionCreate()(
+            runtime,
+            &session_config,
+            &callbacks,
+            &session,
+            &diagnostic,
+        ),
+    );
+    probe.expected_session = session;
+    defer if (session) |handle| {
+        _ = api.sessionDestroy()(handle, &diagnostic);
+    };
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 3;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRunText(
+            session,
+            1,
+            sdk.bytesView("Use the review Skill."),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
+    try std.testing.expect(probe.saw_tool_start and probe.saw_tool_result);
+
+    const body = (server.lastRequest() orelse
+        return error.NoRequestCaptured).body();
+    try std.testing.expect(
+        std.mem.indexOf(u8, body, "\"name\":\"Skill\"") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, body, "# Skill: Review") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, body, "Review src/main.zig using the bound snapshot.") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, body, "hidden-deploy-secret") == null,
+    );
+
+    probe.expected_run_id = 2;
+    options.max_turns = 3;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRunText(
+            session,
+            2,
+            sdk.bytesView("Activate root-policy, then Glob in the same response."),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(@as(u32, 2), result.tool_calls);
+    const serial_body = (server.lastRequest() orelse
+        return error.NoRequestCaptured).body();
+    const serial_result = std.mem.indexOf(u8, serial_body, "tu_serial_glob") orelse
+        return error.MissingSerializedToolResult;
+    try std.testing.expect(
+        std.mem.indexOfPos(
+            u8,
+            serial_body,
+            serial_result,
+            "outside the current execution policy",
+        ) != null,
+    );
+
+    probe.expected_run_id = 3;
+    options.max_turns = 5;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRunSkill(
+            session,
+            3,
+            sdk.bytesView(root_identity.skill_id),
+            sdk.bytesView(root_identity.revision),
+            sdk.bytesView(""),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(u32, 2), result.tool_calls);
+    const nested_body = (server.lastRequest() orelse
+        return error.NoRequestCaptured).body();
+    try std.testing.expect(
+        std.mem.indexOf(u8, nested_body, "# Skill: Child") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, nested_body, "outside the current execution policy") != null,
+    );
+    const blocked_path = try std.fs.path.join(a, &.{ root, "blocked.txt" });
+    defer a.free(blocked_path);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().access(std.testing.io, blocked_path, .{}),
+    );
+
+    probe.expected_run_id = 4;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRunText(
+            session,
+            4,
+            sdk.bytesView("Try the hidden Skill name."),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
+    const hidden_body = (server.lastRequest() orelse
+        return error.NoRequestCaptured).body();
+    try std.testing.expect(
+        std.mem.indexOf(u8, hidden_body, "Never advertise this body.") == null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, hidden_body, "PolicyViolation") != null or
+            std.mem.indexOf(u8, hidden_body, "policy_violation") != null,
+    );
+
+    probe.expected_run_id = 5;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRunText(
+            session,
+            5,
+            sdk.bytesView("Use the forked Skill."),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
+    const fork_body = (server.lastRequest() orelse
+        return error.NoRequestCaptured).body();
+    try std.testing.expect(
+        std.mem.indexOf(u8, fork_body, "# Skill: Forked (forked)") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, fork_body, "done") != null,
+    );
+
+    const openai_bodies = [_][]const u8{
+        OPENAI_SKILL_SSE,
+        OPENAI_FINAL_SSE,
+    };
+    var openai_server = try harness.MockServer.startCassette(
+        &openai_bodies,
+        0,
+    );
+    defer openai_server.stop();
+    const openai_url = try openai_server.urlOwned(a);
+    defer a.free(openai_url);
+
+    session_config.provider_kind_code = wire.PROVIDER_OPENAI;
+    session_config.base_url = sdk.bytesView(openai_url);
+    var openai_probe = Probe{};
+    callbacks.ctx = &openai_probe;
+    var openai_session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionCreate()(
+            runtime,
+            &session_config,
+            &callbacks,
+            &openai_session,
+            &diagnostic,
+        ),
+    );
+    openai_probe.expected_session = openai_session;
+    defer if (openai_session) |handle| {
+        _ = api.sessionDestroy()(handle, &diagnostic);
+    };
+
+    options.max_turns = 3;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRunText(
+            openai_session,
+            1,
+            sdk.bytesView("Use review through the OpenAI interface."),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
+    const openai_body = (openai_server.lastRequest() orelse
+        return error.NoRequestCaptured).body();
+    try std.testing.expect(
+        std.mem.indexOf(u8, openai_body, "\"name\":\"Skill\"") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, openai_body, "# Skill: Review") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            openai_body,
+            "Review README.md using the bound snapshot.",
+        ) != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, openai_body, "\"tool_call_id\":\"call_skill\"") != null,
+    );
+
+    const fatal_bodies = [_][]const u8{
+        FORK_SKILL_SSE,
+        FINAL_SSE,
+    };
+    var fatal_server = try harness.MockServer.startCassette(
+        &fatal_bodies,
+        0,
+    );
+    defer fatal_server.stop();
+    const fatal_url = try fatal_server.urlOwned(a);
+    defer a.free(fatal_url);
+
+    session_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    session_config.base_url = sdk.bytesView(fatal_url);
+    var fatal_probe = NestedSkillFatalProbe{};
+    var fatal_callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    fatal_callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    fatal_callbacks.ctx = &fatal_probe;
+    fatal_callbacks.on_event = NestedSkillFatalProbe.event;
+    var fatal_session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionCreate()(
+            runtime,
+            &session_config,
+            &fatal_callbacks,
+            &fatal_session,
+            &diagnostic,
+        ),
+    );
+    defer if (fatal_session) |handle| {
+        _ = api.sessionDestroy()(handle, &diagnostic);
+    };
+
+    try std.testing.expectEqual(
+        wire.STATUS_CALLBACK_FAILED,
+        api.sessionRunText(
+            fatal_session,
+            1,
+            sdk.bytesView("Run the forked Skill."),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expect(fatal_probe.failed);
+    api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_STATE,
+        api.sessionRunText(
+            fatal_session,
+            2,
+            sdk.bytesView("A callback-failed Session stays poisoned."),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
 }
 
 test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers" {

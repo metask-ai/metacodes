@@ -10,10 +10,9 @@
 //!   - **并行 tool_calls(P0.1 已实现)**:按 delta 的 `index` 分槽累积(ToolCallAcc),done 时
 //!     每槽 flush 一个 tool_use_start,executeSlots 真并发执行;请求侧每个 tool_result 独立
 //!     {role:"tool"} 回传。见 parseChunk tool_calls 分支 / buildFlush / serializeOpenAIMessage。
+//! `function.arguments` 的每个 SSE 字符串片段先解除外层 JSON 转义，再按 tool-call
+//! `index` 拼接；字符串字段、反斜杠和跨 chunk 片段因此以原始 JSON 字节进入工具层。
 //! **诚实登记——以下未做**:
-//!   - **跨 chunk arguments 转义**:arguments 提取按"单 chunk 内是完整字符串值"假设。OpenAI
-//!     流式可能把 arguments 切成多 chunk、单 chunk 内引号不配对——那种情况下转义层数会错。
-//!     本测试 cassette 用简单 arguments(""/"{}"),真实复杂参数(含路径/嵌套引号且跨 chunk)未覆盖。
 //!   - **建连重试 / 429 退避**:pSendStreamRetry 忽略 max_retries/reporter,直接发一次;doStream
 //!     遇非 200(含 429/500)直接 error.RequestFailed,无重试。Anthropic 路径有 withRetry,此处没有。
 //!   - **非流式 pSend**:返回 error.NotImplemented → auto-compact summary 在 OpenAI 路径退化成
@@ -313,12 +312,16 @@ const OpenAIStream = struct {
                     if (id.len > 0 and acc.id.items.len == 0) acc.id.appendSlice(self.allocator, id) catch {};
                 }
                 // name = function.name(元素内首个 "name");arguments = function.arguments 片段。
-                // 复用与旧单工具路径同一提取语义(raw slice,含转义),保证每个 tool_call 行为不变。
                 if (util_json.extractStringField(elem, "name")) |name| {
                     acc.name.appendSlice(self.allocator, name) catch {};
                 }
-                if (util_json.extractStringField(elem, "arguments")) |args| {
-                    acc.args.appendSlice(self.allocator, args) catch {};
+                if (try extractDecodedStringField(
+                    self.allocator,
+                    elem,
+                    "arguments",
+                )) |args| {
+                    defer self.allocator.free(args);
+                    try acc.args.appendSlice(self.allocator, args);
                 }
             }
         }
@@ -424,6 +427,52 @@ fn findToolCallsArray(data: []const u8) ?[]const u8 {
     return data[arr_open + 1 ..]; // 未闭合:返回剩余
 }
 
+/// 提取一个 JSON string 字段并只解除其外层 JSON 转义。
+///
+/// OpenAI 的 `function.arguments` 自身是装在 string 里的 JSON 文档。把
+/// raw escaped slice 交给工具层会让任何 string 参数变成非法 JSON。这个
+/// owned-fragment 契约属于 OpenAI 流累积器，故不下沉到通用 JSON helper。
+fn extractDecodedStringField(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    field: []const u8,
+) !?[]u8 {
+    var pattern_buf: [256]u8 = undefined;
+    if (field.len >= pattern_buf.len - 3) return null;
+    pattern_buf[0] = '"';
+    @memcpy(pattern_buf[1..][0..field.len], field);
+    pattern_buf[1 + field.len] = '"';
+    pattern_buf[2 + field.len] = ':';
+    const pattern = pattern_buf[0 .. field.len + 3];
+
+    const field_index = std.mem.indexOf(u8, data, pattern) orelse return null;
+    var cursor = field_index + pattern.len;
+    while (cursor < data.len and std.ascii.isWhitespace(data[cursor])) : (cursor += 1) {}
+    if (cursor >= data.len or data[cursor] != '"') return null;
+    cursor += 1;
+    const value_start = cursor;
+    var escaped = false;
+    while (cursor < data.len) : (cursor += 1) {
+        const byte = data[cursor];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (byte == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (byte == '"') {
+            return try util_json.unescapeString(
+                data[value_start..cursor],
+                allocator,
+            );
+        }
+        if (byte < 0x20) return null;
+    }
+    return null;
+}
+
 /// 迭代 JSON array slice 里的顶层 `{...}` 对象(深度感知,跳字符串)。
 const ElemIter = struct {
     s: []const u8,
@@ -465,6 +514,28 @@ fn mapFinish(fr: []const u8) StopReason {
     if (std.mem.eql(u8, fr, "tool_calls")) return .tool_use;
     if (std.mem.eql(u8, fr, "length")) return .max_tokens;
     return .unknown;
+}
+
+test "OpenAI arguments decoder removes one JSON layer and handles backslash parity" {
+    const a = std.testing.allocator;
+    const decoded = (try extractDecodedStringField(
+        a,
+        "{\"arguments\":\"{\\\"name\\\":\\\"review\\\",\\\"path\\\":\\\"C:\\\\\\\\tmp\\\"}\"}",
+        "arguments",
+    )) orelse return error.MissingArguments;
+    defer a.free(decoded);
+    try std.testing.expectEqualStrings(
+        "{\"name\":\"review\",\"path\":\"C:\\\\tmp\"}",
+        decoded,
+    );
+
+    const trailing = (try extractDecodedStringField(
+        a,
+        "{\"arguments\":\"fragment\\\\\"}",
+        "arguments",
+    )) orelse return error.MissingArguments;
+    defer a.free(trailing);
+    try std.testing.expectEqualStrings("fragment\\", trailing);
 }
 
 /// 提取 OpenAI delta.content(简易:找 `"content":"..."`,反转义)。null=本 chunk 无 content。

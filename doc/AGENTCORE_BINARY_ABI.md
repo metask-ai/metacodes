@@ -391,6 +391,25 @@ Materialization begins only after admission, is private to that activation,
 and is removed before terminal return. A Skill can only narrow the Session's
 tool, shell, and permission authority.
 
+When a bound snapshot contains at least one model-invocable Skill, AgentCore
+adds one Run-local provider tool named `Skill` to both Text Runs and explicit
+Skill Runs. It is an internal projection, not another ABI entry point. Its
+input is exactly `{"name":"<invocation_name>","values":["..."]}`; `values` is
+optional, `origin` and all other fields are invalid, and names resolve only in
+the snapshot pinned by that Session. The tool schema and description omit
+`disable-model-invocation` Skills. Guessing such a name still fails closed as
+an ordinary tool result and never falls back to prompt text.
+
+Inline and fork calls reuse the same typed activation, materialization, and
+immutable PolicyFrame lineage as explicit input. Nested activation starts
+from the current frame and therefore cannot restore authority removed by an
+outer Skill. `Skill` is a serialization boundary: no later tool call in the
+same provider response may be speculatively executed before its policy change.
+Inline materializations live until Run quiescence; fork execution is
+synchronous within the same Host Run and projects its public text and usage
+through the ordinary event stream. The provider tool name `Skill` is reserved:
+Runtime creation rejects a Host tool with that name.
+
 AgentCore exposes no slash parser, Command registry, route field, or
 product-specific command. A consumer resolves its own Commands first, maps a
 catalog hit to typed Skill input, and treats an unresolved slash as its own
