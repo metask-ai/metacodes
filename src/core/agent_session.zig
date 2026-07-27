@@ -241,6 +241,58 @@ pub const LifecycleError = error{
     CallbackFailed,
 };
 
+/// Exactly-once capability returned after Run admission but before any
+/// Conversation mutation. AgentCore uses this narrow seam to materialize a
+/// typed Skill without duplicating the Session lifecycle state machine.
+pub const AdmittedRun = struct {
+    session: *AgentSession,
+    identity_value: RunIdentity,
+    completed: bool = false,
+
+    pub fn identity(self: *const AdmittedRun) RunIdentity {
+        std.debug.assert(!self.completed);
+        return self.identity_value;
+    }
+
+    pub fn abortSignal(self: *const AdmittedRun) *const AbortSignal {
+        std.debug.assert(!self.completed);
+        return &self.session.abort_signal;
+    }
+
+    /// Complete an admitted Run without appending to Conversation or entering
+    /// the provider/tool loop. The Run ID remains consumed by admission.
+    pub fn finishWithoutConversation(
+        self: *AdmittedRun,
+    ) LifecycleError!AdmittedCompletion {
+        if (self.completed) return error.InvalidSessionState;
+        const completion = try self.session.finishAdmittedRun(self.identity_value);
+        self.completed = true;
+        return completion;
+    }
+
+    /// Append the already-prepared root prompt and reuse the ordinary Run
+    /// pipeline. Any failure after this call begins has normal admitted-Run
+    /// poison semantics.
+    pub fn runText(
+        self: *AdmittedRun,
+        prompt: []const u8,
+        max_turns: u32,
+    ) anyerror!agent_loop.RunResult {
+        if (self.completed) return error.InvalidSessionState;
+        try self.session.claimAdmittedRun(self.identity_value);
+        self.completed = true;
+        self.session.conversation.appendText(.user, prompt) catch |err| {
+            _ = self.session.poisonRun();
+            return err;
+        };
+        return self.session.runLoop(self.identity_value, max_turns);
+    }
+};
+
+pub const AdmittedCompletion = struct {
+    aborted: bool,
+};
+
 pub const AgentSession = struct {
     allocator: std.mem.Allocator,
     runtime: *AgentRuntime,
@@ -267,6 +319,9 @@ pub const AgentSession = struct {
     callback_mutex: sync.Mutex = .{},
     state: State = .idle,
     active_run_id: u64 = 0,
+    /// Shared exactly-once gate for copyable `AdmittedRun` values. False means
+    /// no Conversation mutation has begun; the first continuation claims it.
+    active_run_started: bool = false,
     /// Highest admitted Run ID. Zero is the no-Run sentinel; admission only
     /// replaces it with a strictly greater value, preventing ABA reuse.
     last_run_id: u64 = 0,
@@ -418,14 +473,19 @@ pub const AgentSession = struct {
 
     /// Run one text turn while preserving Conversation across successful Runs.
     pub fn runText(self: *AgentSession, run_id: u64, prompt: []const u8, max_turns: u32, sink: EventSink) anyerror!agent_loop.RunResult {
-        const identity = try self.beginRun(run_id, sink);
+        var admitted = try self.admitRun(run_id, sink);
+        return admitted.runText(prompt, max_turns);
+    }
 
-        self.conversation.appendText(.user, prompt) catch |err| {
-            _ = self.poisonRun();
-            return err;
+    pub fn admitRun(
+        self: *AgentSession,
+        run_id: u64,
+        sink: EventSink,
+    ) LifecycleError!AdmittedRun {
+        return .{
+            .session = self,
+            .identity_value = try self.beginRun(run_id, sink),
         };
-
-        return self.runLoop(identity, max_turns);
     }
 
     fn runLoop(self: *AgentSession, identity: RunIdentity, max_turns: u32) anyerror!agent_loop.RunResult {
@@ -499,6 +559,7 @@ pub const AgentSession = struct {
             self.state = .idle;
         }
         self.active_run_id = 0;
+        self.active_run_started = false;
         self.active_sink = null;
         self.mutex.unlock();
         self.callback_mutex.unlock();
@@ -554,12 +615,61 @@ pub const AgentSession = struct {
         self.abort_signal = AbortSignal.init();
         self.state = .running;
         self.active_run_id = run_id;
+        self.active_run_started = false;
         self.last_run_id = run_id;
         self.callback_failed = false;
         self.active_sink = sink;
         const identity = RunIdentity{ .session_id = self.session_id, .run_id = run_id };
         self.mutex.unlock();
         return identity;
+    }
+
+    fn claimAdmittedRun(
+        self: *AgentSession,
+        identity: RunIdentity,
+    ) LifecycleError!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!std.mem.eql(u8, identity.session_id.asSlice(), self.session_id.asSlice()) or
+            identity.run_id == 0 or
+            identity.run_id != self.active_run_id or
+            self.active_run_started)
+            return error.InvalidSessionState;
+        switch (self.state) {
+            .running, .abort_requested => {},
+            .idle, .poisoned, .destroying => return error.InvalidSessionState,
+        }
+        self.active_run_started = true;
+    }
+
+    fn finishAdmittedRun(
+        self: *AgentSession,
+        identity: RunIdentity,
+    ) LifecycleError!AdmittedCompletion {
+        self.callback_mutex.lock();
+        defer self.callback_mutex.unlock();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (!std.mem.eql(u8, identity.session_id.asSlice(), self.session_id.asSlice()) or
+            identity.run_id == 0 or
+            identity.run_id != self.active_run_id or
+            self.active_run_started)
+            return error.InvalidSessionState;
+        switch (self.state) {
+            .running, .abort_requested => {},
+            .idle, .poisoned, .destroying => return error.InvalidSessionState,
+        }
+        const aborted = self.state == .abort_requested;
+        if (self.callback_failed) {
+            self.state = .poisoned;
+        } else {
+            self.state = .idle;
+        }
+        self.active_run_id = 0;
+        self.active_run_started = false;
+        self.active_sink = null;
+        if (self.callback_failed) return error.CallbackFailed;
+        return .{ .aborted = aborted };
     }
 
     /// Poison a failed Run and return whether delivery failure was the cause.
@@ -572,6 +682,7 @@ pub const AgentSession = struct {
         const failed = self.callback_failed;
         self.state = .poisoned;
         self.active_run_id = 0;
+        self.active_run_started = false;
         self.active_sink = null;
         self.mutex.unlock();
         return failed;
@@ -861,6 +972,37 @@ test "AgentSession enforces one active Run and monotonic nonzero run ids" {
     try std.testing.expectError(error.StaleRun, self.beginRun(max_run_id, probe.sink()));
     try std.testing.expect(!self.isPoisoned());
     try self.destroy();
+}
+
+test "AdmittedRun consumes run id without mutating Conversation" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    var probe = SinkProbe{};
+    const initial_messages = self.conversation.messages.items.len;
+
+    var first = try self.admitRun(1, probe.sink());
+    var copied = first;
+    try std.testing.expectEqual(@as(u64, 1), first.identity().run_id);
+    try std.testing.expect(!first.abortSignal().isAborted());
+    const first_completion = try first.finishWithoutConversation();
+    try std.testing.expect(!first_completion.aborted);
+    try std.testing.expectEqual(initial_messages, self.conversation.messages.items.len);
+    try std.testing.expectError(error.InvalidSessionState, first.finishWithoutConversation());
+    try std.testing.expectError(error.InvalidSessionState, copied.finishWithoutConversation());
+    try std.testing.expectError(error.StaleRun, self.admitRun(1, probe.sink()));
+
+    var second = try self.admitRun(2, probe.sink());
+    try self.abort(2, .timeout);
+    const second_completion = try second.finishWithoutConversation();
+    try std.testing.expect(second_completion.aborted);
+    try std.testing.expectEqual(initial_messages, self.conversation.messages.items.len);
+
+    var third = try self.admitRun(3, probe.sink());
+    _ = try third.finishWithoutConversation();
 }
 
 test "AgentSession abort is run-scoped, idempotent and reports late requests" {

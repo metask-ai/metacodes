@@ -365,6 +365,68 @@ const AbiSession = struct {
         self.skill_catalog_cell = replacement;
         if (previous) |cell| runtime.catalogs.releaseSession(cell);
     }
+
+    /// Caller holds the facade Run gate and Runtime active-call guard. Pure
+    /// ActivationPlan validation has already completed before this admitted
+    /// boundary.
+    fn admitMaterializedSkill(
+        self: *AbiSession,
+        materializations: *skill_materialization.Manager,
+        run_id: u64,
+        record: *const skill_catalog.SkillRecord,
+    ) anyerror!SkillAdmission {
+        var admitted = try self.core_session.admitRun(
+            run_id,
+            .{ .ctx = self, .emit = AbiSession.emit },
+        );
+        var tree = materializations.materialize(
+            record,
+            admitted.abortSignal(),
+        ) catch |materialize_error| {
+            const completion = try admitted.finishWithoutConversation();
+            if (materialize_error != error.OutOfMemory and
+                (materialize_error == error.Aborted or completion.aborted))
+                return .aborted;
+            return materialize_error;
+        };
+        if (admitted.abortSignal().isAborted()) {
+            var cleanup_failed = false;
+            tree.deinit() catch {
+                cleanup_failed = true;
+            };
+            _ = try admitted.finishWithoutConversation();
+            if (cleanup_failed) return error.CoreError;
+            return .aborted;
+        }
+        return .{ .ready = .{
+            .admitted = admitted,
+            .tree = tree,
+        } };
+    }
+};
+
+const SkillAdmission = union(enum) {
+    aborted,
+    ready: MaterializedSkillRun,
+};
+
+const MaterializedSkillRun = struct {
+    admitted: core.agent_session.AdmittedRun,
+    tree: skill_materialization.WorkingTree,
+
+    /// Test/rollback path before prompt rendering. Always closes the core
+    /// lifecycle even if filesystem cleanup reports failure.
+    fn finishWithoutConversation(
+        self: *MaterializedSkillRun,
+    ) anyerror!core.agent_session.AdmittedCompletion {
+        var cleanup_failed = false;
+        self.tree.deinit() catch {
+            cleanup_failed = true;
+        };
+        const completion = try self.admitted.finishWithoutConversation();
+        if (cleanup_failed) return error.CoreError;
+        return completion;
+    }
 };
 
 pub const TestEpilogueHook = struct {
@@ -1714,4 +1776,112 @@ test "Session catalog refresh is idle-only atomic replacement with rollback" {
     call.deinit();
     try runtime.catalogs.tryBeginDestroy();
     runtime.catalogs.finishDestroy();
+}
+
+test "Skill materialization is post-admission and pre-Conversation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const cwd = root_buffer[0..root_len];
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{} },
+    );
+    defer native_runtime.destroy() catch unreachable;
+    const native_session = try native_runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
+    });
+    defer native_session.destroy() catch unreachable;
+    var session = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = native_session,
+    };
+    var materializations = try skill_materialization.Manager.init(std.testing.allocator);
+    defer materializations.deinit() catch unreachable;
+    const record = skill_catalog.SkillRecord{
+        .skill_id = [_]u8{'a'} ** 64,
+        .invocation_name = "review",
+        .definition = undefined,
+        .directories = &.{},
+        .files = &.{},
+    };
+    const initial_messages = native_session.conversation.messages.items.len;
+
+    materializations.max_active_bytes = 0;
+    try std.testing.expectError(
+        error.ResourceLimit,
+        session.admitMaterializedSkill(&materializations, 1, &record),
+    );
+    try std.testing.expectEqual(initial_messages, native_session.conversation.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), materializations.active_count);
+
+    materializations.max_active_bytes = skill_materialization.MAX_ACTIVE_BYTES;
+    try std.testing.expectError(
+        error.StaleRun,
+        session.admitMaterializedSkill(&materializations, 1, &record),
+    );
+    var next_run_id: u64 = 2;
+    const faults = [_]skill_materialization.TestFault{
+        .after_reserve,
+        .after_create,
+        .after_write,
+        .before_verify,
+        .corrupt_before_verify,
+    };
+    for (faults) |fault| {
+        materializations.setTestFault(fault);
+        try std.testing.expectError(
+            error.CoreError,
+            session.admitMaterializedSkill(&materializations, next_run_id, &record),
+        );
+        materializations.setTestFault(null);
+        try std.testing.expectEqual(
+            initial_messages,
+            native_session.conversation.messages.items.len,
+        );
+        try std.testing.expectEqual(@as(usize, 0), materializations.active_count);
+        try std.testing.expectError(
+            error.StaleRun,
+            session.admitMaterializedSkill(&materializations, next_run_id, &record),
+        );
+        next_run_id += 1;
+    }
+
+    materializations.setTestFault(.abort_after_create);
+    const aborted = try session.admitMaterializedSkill(
+        &materializations,
+        next_run_id,
+        &record,
+    );
+    materializations.setTestFault(null);
+    switch (aborted) {
+        .aborted => {},
+        .ready => return error.ExpectedAbort,
+    }
+    next_run_id += 1;
+    try std.testing.expectEqual(initial_messages, native_session.conversation.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), materializations.active_count);
+
+    var admission = try session.admitMaterializedSkill(
+        &materializations,
+        next_run_id,
+        &record,
+    );
+    switch (admission) {
+        .aborted => return error.UnexpectedAbort,
+        .ready => |*ready| {
+            try native_session.abort(next_run_id, .timeout);
+            const completion = try ready.finishWithoutConversation();
+            try std.testing.expect(completion.aborted);
+        },
+    }
+    try std.testing.expectEqual(initial_messages, native_session.conversation.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), materializations.active_count);
 }

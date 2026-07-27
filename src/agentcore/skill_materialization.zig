@@ -32,6 +32,15 @@ pub const Error = error{
     Unavailable,
 };
 
+pub const TestFault = enum {
+    after_reserve,
+    after_create,
+    after_write,
+    before_verify,
+    corrupt_before_verify,
+    abort_after_create,
+};
+
 const State = enum {
     available,
     poisoned,
@@ -64,6 +73,7 @@ pub const Manager = struct {
     active_count: usize = 0,
     active_bytes: usize = 0,
     max_active_bytes: usize = MAX_ACTIVE_BYTES,
+    test_fault: if (builtin.is_test) ?TestFault else void = if (builtin.is_test) null else {},
 
     pub fn init(allocator: std.mem.Allocator) Error!Manager {
         const io_runtime = allocator.create(std.Io.Threaded) catch
@@ -167,7 +177,17 @@ pub const Manager = struct {
         record: *const catalog.SkillRecord,
         abort: *const AbortSignal,
     ) Error!WorkingTree {
-        return self.materializeWithFaults(record, abort, .{});
+        const faults: Faults = if (comptime builtin.is_test)
+            testFaults(self.test_fault)
+        else
+            .{};
+        return self.materializeWithFaults(record, abort, faults);
+    }
+
+    pub fn setTestFault(self: *Manager, fault: ?TestFault) void {
+        if (comptime !builtin.is_test)
+            @compileError("materialization fault injection is test-only");
+        self.test_fault = fault;
     }
 
     fn materializeWithFaults(
@@ -295,6 +315,17 @@ const Faults = struct {
     corrupt_before_verify: bool = false,
 };
 
+fn testFaults(fault: ?TestFault) Faults {
+    return switch (fault orelse return .{}) {
+        .after_reserve => .{ .fail_at = .after_reserve },
+        .after_create => .{ .fail_at = .after_create },
+        .after_write => .{ .fail_at = .after_write },
+        .before_verify => .{ .fail_at = .before_verify },
+        .corrupt_before_verify => .{ .corrupt_before_verify = true },
+        .abort_after_create => .{ .abort_at = .after_create },
+    };
+}
+
 fn populateAndVerify(
     manager: *Manager,
     tree_dir: Dir,
@@ -334,6 +365,7 @@ fn populateAndVerify(
         error.Aborted => return error.Aborted,
         else => return error.CoreError,
     };
+    try abort.throwIfAborted();
 }
 
 fn checkpoint(
@@ -414,7 +446,7 @@ fn verifyTree(
     root: Dir,
     record: *const catalog.SkillRecord,
     abort: *const AbortSignal,
-) !void {
+) VerifyError!void {
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
     var counts = VerifyCounts{};
@@ -436,6 +468,19 @@ const VerifyCounts = struct {
     files: usize = 0,
 };
 
+const VerifyError = error{
+    OutOfMemory,
+    Aborted,
+    TreeMismatch,
+    Overflow,
+} || Dir.StatError ||
+    Dir.Iterator.Error ||
+    Dir.StatFileError ||
+    Dir.OpenError ||
+    File.OpenError ||
+    File.StatError ||
+    File.ReadPositionalError;
+
 fn verifyDirectory(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -444,7 +489,7 @@ fn verifyDirectory(
     record: *const catalog.SkillRecord,
     abort: *const AbortSignal,
     counts: *VerifyCounts,
-) !void {
+) VerifyError!void {
     try abort.throwIfAborted();
     const before = try dir.stat(io);
     if (before.kind != .directory) return error.TreeMismatch;
@@ -504,7 +549,7 @@ fn verifyChildDirectory(
     record: *const catalog.SkillRecord,
     abort: *const AbortSignal,
     counts: *VerifyCounts,
-) !void {
+) VerifyError!void {
     if (!containsString(record.directories, relative_path)) return error.TreeMismatch;
     counts.directories = try std.math.add(usize, counts.directories, 1);
     var child = try parent.openDir(io, name, .{
@@ -523,7 +568,7 @@ fn verifyFile(
     record: *const catalog.SkillRecord,
     abort: *const AbortSignal,
     counts: *VerifyCounts,
-) !void {
+) VerifyError!void {
     const expected = findFile(record.files, relative_path) orelse
         return error.TreeMismatch;
     counts.files = try std.math.add(usize, counts.files, 1);
@@ -781,6 +826,12 @@ test "final verification rejects extra state and abort is typed" {
         &abort,
         .{ .abort_at = .after_create },
     ));
+    try std.testing.expectEqual(@as(usize, 0), manager.active_count);
+    try expectRootEmpty(&manager);
+
+    abort = AbortSignal.init();
+    abort.abort(.timeout);
+    try std.testing.expectError(error.Aborted, manager.materialize(&record, &abort));
     try std.testing.expectEqual(@as(usize, 0), manager.active_count);
     try expectRootEmpty(&manager);
 }
