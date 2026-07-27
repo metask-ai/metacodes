@@ -8,6 +8,7 @@ const core = @import("metacodes-core");
 const ui_request = core.protocol.ui_request;
 pub const protocol_v1 = @import("protocol_v1.zig");
 pub const skill_catalog = @import("skill_catalog.zig");
+pub const skill_catalog_handles = @import("skill_catalog_handles.zig");
 const sandbox_admission = @import("sandbox_admission.zig");
 
 const allocator = std.heap.c_allocator;
@@ -143,6 +144,7 @@ const AbiHostTool = struct {
 const AbiRuntime = struct {
     core_runtime: *core.agent_session.AgentRuntime,
     host_tools: []AbiHostTool,
+    catalogs: skill_catalog_handles.RuntimeCatalogs,
 
     fn handle(self: *AbiRuntime) *wire.RuntimeHandle {
         return @ptrCast(self);
@@ -150,12 +152,15 @@ const AbiRuntime = struct {
 };
 
 const AbiSession = struct {
-    const CallState = enum { idle, running, destroying };
+    const CallState = enum { idle, running, refreshing, destroying };
 
     callbacks: wire.SessionCallbacksV1,
     callback_status: std.atomic.Value(u32),
     facade_poisoned: std.atomic.Value(bool),
     core_session: *core.agent_session.AgentSession,
+    runtime: ?*AbiRuntime = null,
+    workspace_scope_id: [64]u8 = [_]u8{0} ** 64,
+    skill_catalog_cell: ?*skill_catalog_handles.CatalogCell = null,
     host_permission_rules: HostPermissionRules = .{},
     call_mutex: sync.Mutex = .{},
     call_state: CallState = .idle,
@@ -310,6 +315,21 @@ const AbiSession = struct {
         self.call_state = .idle;
     }
 
+    fn tryBeginRefresh(self: *AbiSession) bool {
+        self.call_mutex.lock();
+        defer self.call_mutex.unlock();
+        if (self.call_state != .idle) return false;
+        self.call_state = .refreshing;
+        return true;
+    }
+
+    fn finishRefresh(self: *AbiSession) void {
+        self.call_mutex.lock();
+        defer self.call_mutex.unlock();
+        std.debug.assert(self.call_state == .refreshing);
+        self.call_state = .idle;
+    }
+
     fn tryBeginDestroy(self: *AbiSession) bool {
         self.call_mutex.lock();
         defer self.call_mutex.unlock();
@@ -323,6 +343,25 @@ const AbiSession = struct {
         defer self.call_mutex.unlock();
         std.debug.assert(self.call_state == .destroying);
         self.call_state = .idle;
+    }
+
+    fn refreshCatalog(
+        self: *AbiSession,
+        host: *const skill_catalog_handles.HostCatalog,
+    ) !void {
+        const runtime = self.runtime orelse return error.InvalidSessionState;
+        var runtime_call = try runtime.catalogs.enterCall();
+        defer runtime_call.deinit();
+        if (!self.tryBeginRefresh()) return error.SessionBusy;
+        defer self.finishRefresh();
+
+        const replacement = try runtime.catalogs.retainForSession(
+            host,
+            &self.workspace_scope_id,
+        );
+        const previous = self.skill_catalog_cell;
+        self.skill_catalog_cell = replacement;
+        if (previous) |cell| runtime.catalogs.releaseSession(cell);
     }
 };
 
@@ -450,6 +489,17 @@ fn runtimeErrorStatus(err: anyerror) u32 {
         wire.STATUS_INVALID_ARGUMENT
     else
         wire.STATUS_CORE_ERROR;
+}
+
+fn catalogLifecycleStatus(err: anyerror) u32 {
+    return switch (err) {
+        error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
+        error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
+        error.RuntimeBusy, error.SessionBusy => wire.STATUS_BUSY,
+        error.RuntimeUnavailable, error.InvalidSessionState => wire.STATUS_INVALID_STATE,
+        error.WrongRuntime, error.WrongWorkspace, error.InvalidWorkspace => wire.STATUS_INVALID_ARGUMENT,
+        else => wire.STATUS_CORE_ERROR,
+    };
 }
 
 fn sessionCreateErrorStatus(err: anyerror) u32 {
@@ -645,6 +695,13 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
     const self = allocator.create(AbiRuntime) catch return fail(wire.STATUS_OUT_OF_MEMORY, "allocating Runtime failed", out_error);
     var keep_self = false;
     defer if (!keep_self) allocator.destroy(self);
+    self.catalogs = skill_catalog_handles.RuntimeCatalogs.init(allocator) catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    var keep_catalogs = false;
+    defer if (!keep_catalogs) {
+        self.catalogs.tryBeginDestroy() catch unreachable;
+        self.catalogs.finishDestroy();
+    };
     self.host_tools = allocator.alloc(AbiHostTool, host_count) catch return fail(wire.STATUS_OUT_OF_MEMORY, "allocating Host tools failed", out_error);
     var keep_host_tools = false;
     defer if (!keep_host_tools) allocator.free(self.host_tools);
@@ -673,6 +730,7 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
     };
     out.* = self.handle();
     keep_host_tools = true;
+    keep_catalogs = true;
     keep_self = true;
     return wire.STATUS_OK;
 }
@@ -680,7 +738,14 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
 fn runtimeDestroy(handle: ?*wire.RuntimeHandle, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
     emptyError(out_error);
     const self = runtimeFrom(handle orelse return fail(wire.STATUS_INVALID_ARGUMENT, "runtime is required", out_error));
-    self.core_runtime.destroy() catch |err| return failError(if (err == error.RuntimeBusy) wire.STATUS_BUSY else wire.STATUS_INVALID_STATE, err, out_error);
+    self.catalogs.tryBeginDestroy() catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    var destroy_committed = false;
+    defer if (!destroy_committed) self.catalogs.cancelDestroy();
+    self.core_runtime.destroy() catch |err|
+        return failError(if (err == error.RuntimeBusy) wire.STATUS_BUSY else wire.STATUS_INVALID_STATE, err, out_error);
+    self.catalogs.finishDestroy();
+    destroy_committed = true;
     allocator.free(self.host_tools);
     allocator.destroy(self);
     return wire.STATUS_OK;
@@ -690,6 +755,9 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     if (out_session) |out| out.* = null;
     emptyError(out_error);
     const runtime = runtimeFrom(runtime_handle orelse return fail(wire.STATUS_INVALID_ARGUMENT, "runtime is required", out_error));
+    var runtime_call = runtime.catalogs.enterCall() catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    defer runtime_call.deinit();
     const config = config_ptr orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session config is required", out_error);
     const callbacks = callbacks_ptr orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session callbacks are required", out_error);
     const out = out_session orelse return fail(wire.STATUS_INVALID_ARGUMENT, "out_session is required", out_error);
@@ -718,6 +786,14 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     const root = text(config.workspace_root) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
     const home = text(config.workspace_home) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
     if (api_key.len == 0 or model.len == 0 or root.len == 0) return fail(wire.STATUS_INVALID_ARGUMENT, "api_key, model and workspace_root are required", out_error);
+    var workspace = skill_catalog_handles.CanonicalWorkspace.init(
+        allocator,
+        root,
+        home,
+    ) catch |err| return failError(catalogLifecycleStatus(err), err, out_error);
+    defer workspace.deinit();
+    const workspace_scope_id = runtime.catalogs.scopeId(&workspace) catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
     const allowed = borrowedViews(
@@ -740,6 +816,9 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     self.callbacks = callbacks.*;
     self.callback_status = .init(wire.STATUS_OK);
     self.facade_poisoned = .init(false);
+    self.runtime = runtime;
+    self.workspace_scope_id = workspace_scope_id;
+    self.skill_catalog_cell = null;
     self.host_permission_rules = .{};
     self.call_mutex = .{};
     self.call_state = .idle;
@@ -749,7 +828,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
         .model = model,
         .base_url = if (base_url.len == 0) null else base_url,
         .permission_mode = mode,
-        .workspace = .{ .root = root, .home = home, .shell = shell },
+        .workspace = .{ .root = workspace.root, .home = workspace.home, .shell = shell },
         .allowed_tools = allowed,
         .run_ui_requester = if (callbacks.on_ui_request != null) .{ .ctx = self, .requestFn = AbiSession.requestUi } else null,
         // Host tool 身份锚点 = 本 AbiSession;仅 AbiHostTool 适配层可解释此指针。
@@ -765,11 +844,20 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
 fn sessionDestroy(handle: ?*wire.SessionHandle, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
     emptyError(out_error);
     const self = sessionFrom(handle orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    const runtime = self.runtime orelse
+        return fail(wire.STATUS_INVALID_STATE, "Session has no owning Runtime", out_error);
+    var runtime_call = runtime.catalogs.enterCall() catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    defer runtime_call.deinit();
     if (!self.tryBeginDestroy()) return fail(wire.STATUS_BUSY, "Session has an active facade call", out_error);
     self.core_session.destroy() catch |err| {
         self.cancelDestroy();
         return failError(if (err == error.SessionBusy) wire.STATUS_BUSY else wire.STATUS_INVALID_STATE, err, out_error);
     };
+    if (self.skill_catalog_cell) |cell| {
+        runtime.catalogs.releaseSession(cell);
+        self.skill_catalog_cell = null;
+    }
     self.host_permission_rules.deinit();
     allocator.destroy(self);
     return wire.STATUS_OK;
@@ -780,6 +868,11 @@ fn sessionRun(handle: ?*wire.SessionHandle, run_id: u64, prompt_view: wire.Bytes
     if (out_result) |out| out.* = std.mem.zeroes(wire.RunResultV1);
     emptyError(out_error);
     const self = sessionFrom(handle orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    const runtime = self.runtime orelse
+        return fail(wire.STATUS_INVALID_STATE, "Session has no owning Runtime", out_error);
+    var runtime_call = runtime.catalogs.enterCall() catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    defer runtime_call.deinit();
     if (!self.tryBeginRun()) return fail(wire.STATUS_BUSY, "Session has an active facade call", out_error);
     // This defer is the facade completion linearization point. Everything that
     // reads AbiSession or publishes RunResult/diagnostics happens before it;
@@ -812,6 +905,11 @@ fn sessionRun(handle: ?*wire.SessionHandle, run_id: u64, prompt_view: wire.Bytes
 fn sessionAbort(handle: ?*wire.SessionHandle, run_id: u64, reason_code: u32, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
     emptyError(out_error);
     const self = sessionFrom(handle orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    const runtime = self.runtime orelse
+        return fail(wire.STATUS_INVALID_STATE, "Session has no owning Runtime", out_error);
+    var runtime_call = runtime.catalogs.enterCall() catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    defer runtime_call.deinit();
     if (self.facade_poisoned.load(.acquire))
         return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
     const reason: core.agent_session.AbortReason = switch (reason_code) {
@@ -1546,4 +1644,72 @@ test "ABI Runtime reports oversized Host schemas as resource limits" {
     defer bufferRelease(&diagnostic);
     try std.testing.expectEqual(wire.STATUS_RESOURCE_LIMIT, runtimeCreate(&config, &runtime, &diagnostic));
     try std.testing.expect(runtime == null);
+}
+
+test "Session catalog refresh is idle-only atomic replacement with rollback" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    var workspace = try skill_catalog_handles.CanonicalWorkspace.init(
+        std.testing.allocator,
+        root_buffer[0..root_len],
+        "",
+    );
+    defer workspace.deinit();
+
+    var runtime = AbiRuntime{
+        .core_runtime = undefined,
+        .host_tools = &.{},
+        .catalogs = skill_catalog_handles.RuntimeCatalogs.initWithSecret(
+            std.testing.allocator,
+            [_]u8{0x41} ** 32,
+        ),
+    };
+    var other_runtime = AbiRuntime{
+        .core_runtime = undefined,
+        .host_tools = &.{},
+        .catalogs = skill_catalog_handles.RuntimeCatalogs.initWithSecret(
+            std.testing.allocator,
+            [_]u8{0x42} ** 32,
+        ),
+    };
+    const scope_id = try runtime.catalogs.scopeId(&workspace);
+    const first_host = try runtime.catalogs.query(io, &workspace, "first", &.{}, .{});
+    const second_host = try runtime.catalogs.query(io, &workspace, "second", &.{}, .{});
+    const foreign_host = try other_runtime.catalogs.query(io, &workspace, "foreign", &.{}, .{});
+    defer foreign_host.release() catch unreachable;
+    const first_cell = try runtime.catalogs.retainForSession(first_host, &scope_id);
+    try first_host.release();
+
+    var session = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = undefined,
+        .runtime = &runtime,
+        .workspace_scope_id = scope_id,
+        .skill_catalog_cell = first_cell,
+    };
+
+    session.call_state = .running;
+    try std.testing.expectError(error.SessionBusy, session.refreshCatalog(second_host));
+    try std.testing.expect(session.skill_catalog_cell == first_cell);
+    session.call_state = .idle;
+    try std.testing.expectError(error.WrongRuntime, session.refreshCatalog(foreign_host));
+    try std.testing.expect(session.skill_catalog_cell == first_cell);
+
+    const second_cell = second_host.cell;
+    try session.refreshCatalog(second_host);
+    try std.testing.expect(session.skill_catalog_cell == second_cell);
+    try std.testing.expectEqual(@as(usize, 2), second_cell.references);
+    try second_host.release();
+
+    var call = try runtime.catalogs.enterCall();
+    runtime.catalogs.releaseSession(session.skill_catalog_cell.?);
+    session.skill_catalog_cell = null;
+    call.deinit();
+    try runtime.catalogs.tryBeginDestroy();
+    runtime.catalogs.finishDestroy();
 }

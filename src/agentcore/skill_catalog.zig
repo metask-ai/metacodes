@@ -6,6 +6,7 @@
 //! tombstones, revisions, and no-follow execution inputs.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const skill_mod = @import("metacodes-core").skills;
 
 const Dir = std.Io.Dir;
@@ -90,6 +91,7 @@ pub const Snapshot = struct {
     issues: []const Issue,
     descriptor_json: []const u8,
     snapshot_bytes: usize,
+    resident_bytes: usize,
 
     pub fn deinit(self: *Snapshot) void {
         const owner = self.owner_allocator;
@@ -162,6 +164,7 @@ pub fn build(
         .issues = &.{},
         .descriptor_json = "",
         .snapshot_bytes = 0,
+        .resident_bytes = 0,
     };
     errdefer {
         snapshot.arena.deinit();
@@ -169,13 +172,16 @@ pub fn build(
     }
     @memcpy(&snapshot.scope_id, scope_id);
     const arena = snapshot.arena.allocator();
+    var build_scratch = std.heap.ArenaAllocator.init(owner_allocator);
+    defer build_scratch.deinit();
+    const scratch = build_scratch.allocator();
 
     var candidates: std.ArrayList(Candidate) = .empty;
     var issues: std.ArrayList(Issue) = .empty;
     var counters = Counters{};
 
     for (sources) |source| {
-        try enumerateSource(arena, io, source, limits, &counters, &candidates, &issues);
+        try enumerateSource(scratch, io, source, limits, &counters, &candidates, &issues);
     }
     std.mem.sort(Candidate, candidates.items, {}, candidateLessThan);
     std.mem.sort(Issue, issues.items, {}, issueLessThan);
@@ -199,7 +205,7 @@ pub fn build(
         var top_count: usize = 1;
         while (top_count < group.len and group[top_count].priority == highest) : (top_count += 1) {}
         if (top_count != 1) {
-            try issues.append(arena, .{
+            try issues.append(scratch, .{
                 .code = .source_conflict,
                 .invocation_name = invocation_name,
                 .source_scope = group[0].scope,
@@ -210,7 +216,7 @@ pub fn build(
 
         const selected = group[0];
         if (selected.kind != .directory) {
-            try issues.append(arena, .{
+            try issues.append(scratch, .{
                 .code = .invalid_resource,
                 .invocation_name = invocation_name,
                 .source_scope = selected.scope,
@@ -230,7 +236,7 @@ pub fn build(
             error.ResourceLimit => return error.ResourceLimit,
             error.CatalogInvalid => return error.CatalogInvalid,
             error.InvalidDefinition => {
-                try issues.append(arena, .{
+                try issues.append(scratch, .{
                     .code = .invalid_definition,
                     .invocation_name = invocation_name,
                     .source_scope = selected.scope,
@@ -239,7 +245,7 @@ pub fn build(
                 continue;
             },
             error.InvalidResource => {
-                try issues.append(arena, .{
+                try issues.append(scratch, .{
                     .code = .invalid_resource,
                     .invocation_name = invocation_name,
                     .source_scope = selected.scope,
@@ -254,7 +260,7 @@ pub fn build(
     std.mem.sort(SkillRecord, records.items, {}, recordLessThan);
     std.mem.sort(Issue, issues.items, {}, issueLessThan);
     snapshot.skills = records.toOwnedSlice(arena) catch return error.OutOfMemory;
-    snapshot.issues = issues.toOwnedSlice(arena) catch return error.OutOfMemory;
+    snapshot.issues = cloneIssues(arena, issues.items) catch return error.OutOfMemory;
     snapshot.snapshot_bytes = counters.snapshot_bytes;
     snapshot.health = if (snapshot.issues.len == 0) .healthy else .degraded;
     snapshot.revision = computeRevision(snapshot, workspace_epoch);
@@ -263,6 +269,11 @@ pub fn build(
         error.ResourceLimit => return error.ResourceLimit,
         else => return error.CatalogInvalid,
     };
+    snapshot.resident_bytes = std.math.add(
+        usize,
+        @sizeOf(Snapshot),
+        snapshot.arena.queryCapacity(),
+    ) catch return error.ResourceLimit;
     return snapshot;
 }
 
@@ -433,6 +444,25 @@ fn cloneStringList(
     return result;
 }
 
+fn cloneIssues(
+    arena: std.mem.Allocator,
+    source: []const Issue,
+) error{OutOfMemory}![]const Issue {
+    const result = try arena.alloc(Issue, source.len);
+    for (source, result) |issue, *copy| {
+        copy.* = .{
+            .code = issue.code,
+            .invocation_name = if (issue.invocation_name) |name|
+                try arena.dupe(u8, name)
+            else
+                null,
+            .source_scope = issue.source_scope,
+            .revision_key = try arena.dupe(u8, issue.revision_key),
+        };
+    }
+    return result;
+}
+
 fn snapshotTree(
     arena: std.mem.Allocator,
     io: std.Io,
@@ -518,6 +548,11 @@ fn snapshotFile(
         .resolve_beneath = true,
     }) catch return error.InvalidResource;
     defer file.close(io);
+    // Zig 0.16's Windows Threaded backend opens no-follow files with
+    // `IO.ASYNCHRONOUS` but currently returns `nonblocking=false`. Correct the
+    // local value so positional reads wait for PENDING completion instead of
+    // treating it as an impossible synchronous result.
+    if (builtin.os.tag == .windows) file.flags.nonblocking = true;
     const before = file.stat(io) catch return error.InvalidResource;
     if (before.kind != .file) return error.InvalidResource;
     if (before.size > limits.max_single_file_bytes) return error.ResourceLimit;
@@ -529,7 +564,8 @@ fn snapshotFile(
         return error.ResourceLimit;
     if (counters.snapshot_bytes > limits.max_snapshot_bytes) return error.ResourceLimit;
 
-    var reader = file.reader(io, &.{});
+    var read_buffer: [8192]u8 = undefined;
+    var reader = file.reader(io, &read_buffer);
     const read_limit = std.math.add(usize, limits.max_single_file_bytes, 1) catch
         return error.ResourceLimit;
     const bytes = reader.interface.allocRemaining(arena, .limited(read_limit)) catch |err| switch (err) {
@@ -823,9 +859,7 @@ test "typed argument schema accepts only unique renderable names" {
 }
 
 test "catalog priority, tombstone, snapshot, parser parity, and revision are deterministic" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -887,9 +921,7 @@ test "catalog priority, tombstone, snapshot, parser parity, and revision are det
 }
 
 test "catalog limits fail the whole query before publishing a partial snapshot" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -914,9 +946,7 @@ test "catalog limits fail the whole query before publishing a partial snapshot" 
 }
 
 test "invalid policy metadata is a slot tombstone and does not fall back" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -951,9 +981,7 @@ test "invalid policy metadata is a slot tombstone and does not fall back" {
 }
 
 test "hidden invalid invocation identity still changes catalog revision" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -982,9 +1010,7 @@ test "hidden invalid invocation identity still changes catalog revision" {
 }
 
 test "selected skill tree never follows symbolic links" {
-    var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
