@@ -9,6 +9,7 @@ const ui_request = core.protocol.ui_request;
 pub const protocol_v1 = @import("protocol_v1.zig");
 pub const skill_catalog = @import("skill_catalog.zig");
 pub const skill_catalog_handles = @import("skill_catalog_handles.zig");
+pub const skill_activation = @import("skill_activation.zig");
 const sandbox_admission = @import("sandbox_admission.zig");
 
 const allocator = std.heap.c_allocator;

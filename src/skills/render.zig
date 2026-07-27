@@ -138,13 +138,24 @@ const Inject = struct { cmd: []u8 };
 const FileRef = struct { raw: []u8, literal: []u8 };
 const Segment = union(enum) { literal: Range, inject: Inject, file_ref: FileRef };
 
+/// Pure capability query over the same recognition predicates used by
+/// `scanInjections`. AgentCore uses this before Run admission; it must never
+/// execute, allocate, or resolve file references.
+pub fn hasShellInjection(body: []const u8) bool {
+    for (0..body.len) |i| {
+        if (isFencedInjectionStart(body, i) or inlineInjectionClose(body, i) != null)
+            return true;
+    }
+    return false;
+}
+
 fn scanInjections(allocator: std.mem.Allocator, body: []const u8, segs: *std.ArrayList(Segment)) !void {
     var lit_start: usize = 0;
     var i: usize = 0;
 
     while (i < body.len) {
         // 优先识别 fenced block: 行首 "```!" + (lang 可选) 直到下一个行首 ```
-        if (atLineStart(body, i) and i + 4 <= body.len and std.mem.startsWith(u8, body[i..], "```!")) {
+        if (isFencedInjectionStart(body, i)) {
             // close 段
             try segs.append(allocator, .{ .literal = .{ .start = lit_start, .end = i } });
             // 找开 fence 行的结尾(到第一个换行)
@@ -168,19 +179,13 @@ fn scanInjections(allocator: std.mem.Allocator, body: []const u8, segs: *std.Arr
         }
 
         // 内联 !`cmd`: 必须在行首或紧跟空白(\s 或 \t)
-        if (body[i] == '!' and i + 1 < body.len and body[i + 1] == '`') {
-            const prev_ok = (i == 0) or isInlineLeftDelim(body[i - 1]);
-            if (prev_ok) {
-                // 找闭合 `
-                if (std.mem.indexOfScalarPos(u8, body, i + 2, '`')) |close| {
-                    try segs.append(allocator, .{ .literal = .{ .start = lit_start, .end = i } });
-                    const cmd = try allocator.dupe(u8, body[i + 2 .. close]);
-                    try segs.append(allocator, .{ .inject = .{ .cmd = cmd } });
-                    i = close + 1;
-                    lit_start = i;
-                    continue;
-                }
-            }
+        if (inlineInjectionClose(body, i)) |close| {
+            try segs.append(allocator, .{ .literal = .{ .start = lit_start, .end = i } });
+            const cmd = try allocator.dupe(u8, body[i + 2 .. close]);
+            try segs.append(allocator, .{ .inject = .{ .cmd = cmd } });
+            i = close + 1;
+            lit_start = i;
+            continue;
         }
         // 文件注入 @path / @"quoted path":行首或紧跟空白。对齐 Claude Code 的 (^|\s)@。
         if (body[i] == '@') {
@@ -226,6 +231,16 @@ fn scanInjections(allocator: std.mem.Allocator, body: []const u8, segs: *std.Arr
 
 fn atLineStart(body: []const u8, i: usize) bool {
     return i == 0 or body[i - 1] == '\n';
+}
+
+fn isFencedInjectionStart(body: []const u8, i: usize) bool {
+    return atLineStart(body, i) and std.mem.startsWith(u8, body[i..], "```!");
+}
+
+fn inlineInjectionClose(body: []const u8, i: usize) ?usize {
+    if (body[i] != '!' or i + 1 >= body.len or body[i + 1] != '`') return null;
+    if (i != 0 and !isInlineLeftDelim(body[i - 1])) return null;
+    return std.mem.indexOfScalarPos(u8, body, i + 2, '`');
 }
 
 fn isInlineLeftDelim(c: u8) bool {

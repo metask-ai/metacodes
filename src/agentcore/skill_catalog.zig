@@ -799,7 +799,7 @@ pub fn validInvocationName(name: []const u8) bool {
     return true;
 }
 
-fn isLowerHex64(value: []const u8) bool {
+pub fn isLowerHex64(value: []const u8) bool {
     if (value.len != 64) return false;
     for (value) |byte| {
         if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f')) return false;

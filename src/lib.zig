@@ -72,6 +72,7 @@ pub const agents_def = @import("agents/def.zig");
 pub const agents_set = @import("agents/set.zig");
 pub const skills = @import("skills/skill.zig");
 pub const skills_tool = @import("skills/tool.zig");
+pub const skills_render = @import("skills/render.zig");
 pub const mcp_client = @import("mcp/client.zig");
 pub const mcp_protocol = @import("mcp/protocol.zig");
 pub const sandbox_config = @import("sandbox/config.zig");
