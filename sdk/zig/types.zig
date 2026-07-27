@@ -112,6 +112,7 @@ pub const MAX_SESSION_ID_BYTES_V1: u64 = 64;
 pub const MAX_METADATA_STRING_BYTES_V1: u64 = 1024 * 1024;
 pub const MAX_RUNTIME_METADATA_BYTES_V1: u64 = 16 * 1024 * 1024;
 pub const MAX_SESSION_METADATA_BYTES_V1: u64 = 4 * 1024 * 1024;
+pub const MAX_PROMPT_BYTES_V1: u64 = 16 * 1024 * 1024;
 pub const MAX_TURNS_V1: u32 = 1000;
 
 pub const EVENT_CONTINUE: u32 = 0;
@@ -119,6 +120,7 @@ pub const EVENT_FATAL: u32 = 1;
 pub const UI_ANSWERED: u32 = 0;
 pub const UI_UNAVAILABLE: u32 = 1;
 pub const UI_FATAL: u32 = 2;
+pub const UI_CANCELLED: u32 = 3;
 pub const HOST_OK: u32 = 0;
 pub const HOST_FAILED: u32 = 1;
 pub const HOST_REJECTED: u32 = 2;

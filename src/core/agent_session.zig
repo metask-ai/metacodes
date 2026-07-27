@@ -635,6 +635,10 @@ pub const AgentSession = struct {
         else
             return .unavailable;
         return result catch |err| {
+            // A user cancelling AskQuestion is a model-visible tool outcome,
+            // not a broken Host transport. AgentCore is the only current
+            // producer; every other callback error retains poison semantics.
+            if (err == error.UiCancelled and req.* == .ask_question) return err;
             // A Host UI transport/decoding error is infrastructure failure,
             // not a model-visible tool error. Abort the current Run and let
             // finishRunLifecycle poison the Session consistently with event

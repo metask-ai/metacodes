@@ -7,6 +7,8 @@ const wire = @import("metask_agentcore_types");
 const core = @import("metacodes-core");
 const ui_request = core.protocol.ui_request;
 pub const protocol_v1 = @import("protocol_v1.zig");
+pub const skill_catalog = @import("skill_catalog.zig");
+const sandbox_admission = @import("sandbox_admission.zig");
 
 const allocator = std.heap.c_allocator;
 
@@ -14,6 +16,48 @@ comptime {
     if (wire.MAX_TOOL_ERROR_PAYLOAD_BYTES_V1 != @as(u64, core.tool_exec.MAX_TOOL_ERROR_PAYLOAD_BYTES_V1))
         @compileError("AgentCore wire and core encoded Host-error limits must match");
 }
+
+/// AgentCore owns session-scoped permission memory. Public "session" choices
+/// must never reach the product-managed core persistence branch.
+const HostPermissionRules = struct {
+    const Decision = enum { allow, deny };
+
+    mutex: sync.Mutex = .{},
+    allowed: std.ArrayList([]u8) = .empty,
+    denied: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *HostPermissionRules) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.allowed.items) |name| allocator.free(name);
+        for (self.denied.items) |name| allocator.free(name);
+        self.allowed.deinit(allocator);
+        self.denied.deinit(allocator);
+    }
+
+    fn lookup(self: *HostPermissionRules, name: []const u8) ?Decision {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (contains(self.denied.items, name)) return .deny;
+        if (contains(self.allowed.items, name)) return .allow;
+        return null;
+    }
+
+    fn remember(self: *HostPermissionRules, decision: Decision, name: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const list = if (decision == .allow) &self.allowed else &self.denied;
+        if (contains(list.items, name)) return;
+        const owned = try allocator.dupe(u8, name);
+        errdefer allocator.free(owned);
+        try list.append(allocator, owned);
+    }
+
+    fn contains(names: []const []u8, needle: []const u8) bool {
+        for (names) |name| if (std.mem.eql(u8, name, needle)) return true;
+        return false;
+    }
+};
 
 const AbiHostTool = struct {
     ctx: ?*anyopaque,
@@ -112,6 +156,7 @@ const AbiSession = struct {
     callback_status: std.atomic.Value(u32),
     facade_poisoned: std.atomic.Value(bool),
     core_session: *core.agent_session.AgentSession,
+    host_permission_rules: HostPermissionRules = .{},
     call_mutex: sync.Mutex = .{},
     call_state: CallState = .idle,
 
@@ -141,7 +186,18 @@ const AbiSession = struct {
 
     fn requestUi(raw: *anyopaque, identity: core.agent_session.RunIdentity, response_allocator: std.mem.Allocator, req: *const ui_request.UiRequest, out: *ui_request.UiResponse) anyerror!ui_request.RequestOutcome {
         const self: *AbiSession = @ptrCast(@alignCast(raw));
-        const callback = self.callbacks.on_ui_request orelse return .unavailable;
+
+        if (rememberedPermission(self, req)) |choice| {
+            out.* = .{ .permission = choice };
+            return .answered;
+        }
+        const callback = self.callbacks.on_ui_request orelse return switch (req.*) {
+            .permission => blk: {
+                out.* = .{ .permission = .deny_once };
+                break :blk .answered;
+            },
+            else => .unavailable,
+        };
         const release_fn = self.callbacks.release_response orelse return error.HostUiFailed;
         const request_json = protocol_v1.encodeUiRequest(response_allocator, req) catch |err| {
             self.recordCallbackStatus(if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_INTERNAL_ERROR);
@@ -157,7 +213,21 @@ const AbiSession = struct {
             return error.HostUiFailed;
         }
         return switch (status) {
-            wire.UI_UNAVAILABLE => .unavailable,
+            wire.UI_UNAVAILABLE => switch (req.*) {
+                .permission => blk: {
+                    out.* = .{ .permission = .deny_once };
+                    break :blk .answered;
+                },
+                else => .unavailable,
+            },
+            wire.UI_CANCELLED => switch (req.*) {
+                .permission => blk: {
+                    out.* = .{ .permission = .deny_once };
+                    break :blk .answered;
+                },
+                .ask_question => return error.UiCancelled,
+                else => unreachable,
+            },
             wire.UI_ANSWERED => blk: {
                 if (response.len > wire.MAX_UI_RESPONSE_BYTES_V1) {
                     self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
@@ -171,6 +241,10 @@ const AbiSession = struct {
                     self.recordCallbackStatus(if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_CALLBACK_FAILED);
                     return err;
                 };
+                self.captureSessionPermission(req, out) catch |err| {
+                    self.recordCallbackStatus(wire.STATUS_OUT_OF_MEMORY);
+                    return err;
+                };
                 break :blk .answered;
             },
             else => {
@@ -178,6 +252,38 @@ const AbiSession = struct {
                 return error.HostUiFailed;
             },
         };
+    }
+
+    fn rememberedPermission(self: *AbiSession, req: *const ui_request.UiRequest) ?core.protocol.PermissionChoice {
+        const permission = switch (req.*) {
+            .permission => |value| value,
+            else => return null,
+        };
+        return switch (self.host_permission_rules.lookup(permission.tool) orelse return null) {
+            .allow => .allow_once,
+            .deny => .deny_once,
+        };
+    }
+
+    fn captureSessionPermission(self: *AbiSession, req: *const ui_request.UiRequest, out: *ui_request.UiResponse) !void {
+        const permission = switch (req.*) {
+            .permission => |value| value,
+            else => return,
+        };
+        switch (out.*) {
+            .permission => |choice| switch (choice) {
+                .allow_always => {
+                    try self.host_permission_rules.remember(.allow, permission.tool);
+                    out.* = .{ .permission = .allow_once };
+                },
+                .deny_tool_session => {
+                    try self.host_permission_rules.remember(.deny, permission.tool);
+                    out.* = .{ .permission = .deny_once };
+                },
+                .allow_once, .deny_once => {},
+            },
+            else => {},
+        }
     }
 
     fn recordCallbackStatus(self: *AbiSession, status: u32) void {
@@ -445,9 +551,18 @@ fn borrowedViews(
 
 fn parseSchema(arena: std.mem.Allocator, encoded: []const u8) !core.json.InputSchema {
     if (encoded.len > wire.MAX_TOOL_SCHEMA_BYTES_V1) return error.ResourceLimit;
-    const root = try std.json.parseFromSliceLeaky(std.json.Value, arena, encoded, .{});
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, arena, encoded, .{
+        .duplicate_field_behavior = .@"error",
+    });
     try validateSchemaDepth(root, 1);
     if (root != .object) return error.InvalidSchema;
+    var fields = root.object.iterator();
+    while (fields.next()) |field| {
+        if (!std.mem.eql(u8, field.key_ptr.*, "type") and
+            !std.mem.eql(u8, field.key_ptr.*, "properties") and
+            !std.mem.eql(u8, field.key_ptr.*, "required"))
+            return error.InvalidSchema;
+    }
     const type_value = root.object.get("type") orelse return error.InvalidSchema;
     if (type_value != .string or !std.mem.eql(u8, type_value.string, "object")) return error.InvalidSchema;
     var schema = core.json.InputSchema{ .type = type_value.string };
@@ -462,6 +577,11 @@ fn parseSchema(arena: std.mem.Allocator, encoded: []const u8) !core.json.InputSc
         const names = try arena.alloc([]const u8, required.array.items.len);
         for (required.array.items, 0..) |item, i| {
             if (item != .string) return error.InvalidSchema;
+            if (schema.properties == null or schema.properties.?.get(item.string) == null)
+                return error.InvalidSchema;
+            for (names[0..i]) |existing| {
+                if (std.mem.eql(u8, existing, item.string)) return error.InvalidSchema;
+            }
             names[i] = item.string;
         }
         schema.required = names;
@@ -479,6 +599,16 @@ fn validateSchemaDepth(value: std.json.Value, depth: u32) !void {
         },
         else => {},
     }
+}
+
+fn validToolName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 64) return false;
+    const first = name[0];
+    if (!std.ascii.isAlphabetic(first) and first != '_') return false;
+    for (name[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-') return false;
+    }
+    return true;
 }
 
 fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire.RuntimeHandle, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
@@ -501,6 +631,9 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
         wire.MAX_RUNTIME_METADATA_BYTES_V1,
     ) catch |err|
         return failError(inputErrorStatus(err), err, out_error);
+    for (builtin_names) |name| {
+        if (!validToolName(name)) return fail(wire.STATUS_INVALID_ARGUMENT, "invalid builtin tool name", out_error);
+    }
     if (config.host_tool_count > wire.MAX_TOOL_COUNT_V1 or
         config.builtin_tool_count > wire.MAX_TOOL_COUNT_V1 - config.host_tool_count)
         return fail(wire.STATUS_RESOURCE_LIMIT, "Runtime tool count exceeds AgentCore ABI v1 limit", out_error);
@@ -528,6 +661,7 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
         addMetadata(&runtime_metadata, descriptor.input_schema_json.len, wire.MAX_RUNTIME_METADATA_BYTES_V1) catch |err|
             return failError(inputErrorStatus(err), err, out_error);
         const name = text(descriptor.name) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+        if (!validToolName(name)) return fail(wire.STATUS_INVALID_ARGUMENT, "invalid Host tool name", out_error);
         const description = text(descriptor.description) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
         const schema_json = text(descriptor.input_schema_json) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
         const schema = parseSchema(a, schema_json) catch |err| return failError(inputErrorStatus(err), err, out_error);
@@ -559,7 +693,10 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     const config = config_ptr orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session config is required", out_error);
     const callbacks = callbacks_ptr orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session callbacks are required", out_error);
     const out = out_session orelse return fail(wire.STATUS_INVALID_ARGUMENT, "out_session is required", out_error);
-    if (config.struct_size != @sizeOf(wire.SessionConfigV1) or !allZero(config.reserved) or callbacks.struct_size != @sizeOf(wire.SessionCallbacksV1) or callbacks.reserved0 != 0 or !allZero(callbacks.reserved) or (callbacks.on_ui_request != null and callbacks.release_response == null))
+    if (config.struct_size != @sizeOf(wire.SessionConfigV1) or !allZero(config.reserved) or
+        callbacks.struct_size != @sizeOf(wire.SessionCallbacksV1) or callbacks.reserved0 != 0 or
+        !allZero(callbacks.reserved) or callbacks.on_event == null or
+        (callbacks.on_ui_request != null and callbacks.release_response == null))
         return fail(wire.STATUS_INVALID_ARGUMENT, "invalid SessionConfigV1 or SessionCallbacksV1", out_error);
     const kind = provider(config.provider_kind_code) orelse return fail(wire.STATUS_INVALID_ARGUMENT, "unknown provider", out_error);
     const mode = permissionMode(config.permission_mode_code) orelse return fail(wire.STATUS_INVALID_ARGUMENT, "unknown permission mode", out_error);
@@ -591,11 +728,19 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
         wire.MAX_SESSION_METADATA_BYTES_V1,
     ) catch |err|
         return failError(inputErrorStatus(err), err, out_error);
+    if (shell == .sandboxed) {
+        sandbox_admission.validate(allocator) catch |err| return failError(
+            if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_INVALID_ARGUMENT,
+            err,
+            out_error,
+        );
+    }
 
     const self = allocator.create(AbiSession) catch return fail(wire.STATUS_OUT_OF_MEMORY, "allocating Session failed", out_error);
     self.callbacks = callbacks.*;
     self.callback_status = .init(wire.STATUS_OK);
     self.facade_poisoned = .init(false);
+    self.host_permission_rules = .{};
     self.call_mutex = .{};
     self.call_state = .idle;
     self.core_session = runtime.core_runtime.createSession(.{
@@ -625,6 +770,7 @@ fn sessionDestroy(handle: ?*wire.SessionHandle, out_error: ?*wire.OwnedBytesV1) 
         self.cancelDestroy();
         return failError(if (err == error.SessionBusy) wire.STATUS_BUSY else wire.STATUS_INVALID_STATE, err, out_error);
     };
+    self.host_permission_rules.deinit();
     allocator.destroy(self);
     return wire.STATUS_OK;
 }
@@ -647,6 +793,8 @@ fn sessionRun(handle: ?*wire.SessionHandle, run_id: u64, prompt_view: wire.Bytes
         return fail(wire.STATUS_INVALID_ARGUMENT, "invalid run id or RunOptionsV1", out_error);
     if (options.max_turns > wire.MAX_TURNS_V1)
         return fail(wire.STATUS_RESOURCE_LIMIT, "max_turns exceeds AgentCore ABI v1 limit", out_error);
+    if (prompt_view.len > wire.MAX_PROMPT_BYTES_V1)
+        return fail(wire.STATUS_RESOURCE_LIMIT, "prompt exceeds AgentCore ABI v1 limit", out_error);
     const prompt = text(prompt_view) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
     const result = self.core_session.runText(run_id, prompt, options.max_turns, .{ .ctx = self, .emit = AbiSession.emit }) catch |err| {
         const status = runErrorStatus(self, err);
@@ -720,10 +868,10 @@ test "ABI discovery is versioned" {
 }
 
 test "UI response parser owns AskUserQuestion answers" {
-    const questions = [_]core.tool_context.AskQuestion{.{ .question = "continue?", .header = "choice", .multi = false, .options = &.{} }};
+    const questions = [_]core.tool_context.AskQuestion{.{ .question = "continue?", .header = "choice", .multi = false, .options = &.{.{ .label = "yes", .description = "continue" }} }};
     const req = ui_request.UiRequest{ .ask_question = &questions };
     var out: ui_request.UiResponse = undefined;
-    try protocol_v1.decodeUiResponse(std.testing.allocator, &req, "{\"answers\":[\"yes\"]}", &out);
+    try protocol_v1.decodeUiResponse(std.testing.allocator, &req, "{\"answers\":[{\"values\":[\"yes\"]}]}", &out);
     switch (out) {
         .answers => |answers| {
             defer std.testing.allocator.free(answers);
@@ -735,7 +883,7 @@ test "UI response parser owns AskUserQuestion answers" {
 }
 
 test "UI response parser rejects an answer count mismatch" {
-    const questions = [_]core.tool_context.AskQuestion{.{ .question = "continue?", .header = "choice", .multi = false, .options = &.{} }};
+    const questions = [_]core.tool_context.AskQuestion{.{ .question = "continue?", .header = "choice", .multi = false, .options = &.{.{ .label = "yes", .description = "continue" }} }};
     const req = ui_request.UiRequest{ .ask_question = &questions };
     var out: ui_request.UiResponse = undefined;
     try std.testing.expectError(error.InvalidUiResponse, protocol_v1.decodeUiResponse(std.testing.allocator, &req, "{\"answers\":[]}", &out));
@@ -900,7 +1048,7 @@ test "Host UI descriptor ownership is independent of callback status" {
         var status: u32 = wire.UI_ANSWERED;
         var with_buffer: bool = false;
         var releases: usize = 0;
-        const response_json = "{\"answers\":[\"yes\"]}";
+        const response_json = "{\"answers\":[{\"values\":[\"yes\"]}]}";
 
         fn request(_: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
             const result = out orelse return wire.UI_FATAL;
@@ -915,7 +1063,7 @@ test "Host UI descriptor ownership is independent of callback status" {
             releases += 1;
         }
     };
-    const questions = [_]core.tool_context.AskQuestion{.{ .question = "continue?", .header = "choice", .multi = false, .options = &.{} }};
+    const questions = [_]core.tool_context.AskQuestion{.{ .question = "continue?", .header = "choice", .multi = false, .options = &.{.{ .label = "yes", .description = "continue" }} }};
     const request = ui_request.UiRequest{ .ask_question = &questions };
     var response: ui_request.UiResponse = undefined;
     var fake = AbiSession{
@@ -951,6 +1099,17 @@ test "Host UI descriptor ownership is independent of callback status" {
     );
     try std.testing.expectEqual(@as(usize, 0), Probe.releases);
 
+    fake.callback_status.store(wire.STATUS_OK, .release);
+    Probe.status = wire.UI_CANCELLED;
+    Probe.with_buffer = true;
+    Probe.releases = 0;
+    try std.testing.expectError(
+        error.UiCancelled,
+        AbiSession.requestUi(&fake, .{ .session_id = .single, .run_id = 1 }, std.testing.allocator, &request, &response),
+    );
+    try std.testing.expectEqual(@as(usize, 1), Probe.releases);
+    try std.testing.expectEqual(wire.STATUS_OK, fake.callback_status.load(.acquire));
+
     Probe.status = wire.UI_ANSWERED;
     Probe.with_buffer = true;
     Probe.releases = 0;
@@ -984,6 +1143,110 @@ test "Host UI descriptor ownership is independent of callback status" {
         }
         try std.testing.expectEqual(@as(usize, 1), Probe.releases);
     }
+}
+
+test "AgentCore permission session choices stay in facade memory and unavailable denies once" {
+    const Probe = struct {
+        var status: u32 = wire.UI_ANSWERED;
+        var response_json: []const u8 = "{\"permission\":\"allow_session\"}";
+        var calls: usize = 0;
+        var releases: usize = 0;
+
+        fn request(_: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+            calls += 1;
+            const result = out orelse return wire.UI_FATAL;
+            result.* = if (response_json.len == 0)
+                .{ .ptr = null, .len = 0 }
+            else
+                .{ .ptr = @constCast(response_json.ptr), .len = response_json.len };
+            return status;
+        }
+
+        fn release(_: ?*anyopaque, _: ?*wire.OwnedBytesV1) callconv(.c) void {
+            releases += 1;
+        }
+    };
+    const request = ui_request.UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
+    var response: ui_request.UiResponse = undefined;
+    var fake = AbiSession{
+        .callbacks = .{
+            .struct_size = @sizeOf(wire.SessionCallbacksV1),
+            .reserved0 = 0,
+            .ctx = null,
+            .on_event = null,
+            .on_ui_request = Probe.request,
+            .release_response = Probe.release,
+            .reserved = [_]u64{0} ** 4,
+        },
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = undefined,
+    };
+    defer fake.host_permission_rules.deinit();
+
+    Probe.status = wire.UI_ANSWERED;
+    Probe.response_json = "{\"permission\":\"allow_session\"}";
+    Probe.calls = 0;
+    Probe.releases = 0;
+    try std.testing.expectEqual(
+        ui_request.RequestOutcome.answered,
+        try AbiSession.requestUi(&fake, .{ .session_id = .single, .run_id = 1 }, std.testing.allocator, &request, &response),
+    );
+    try std.testing.expect(response == .permission and response.permission == .allow_once);
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+    try std.testing.expectEqual(@as(usize, 1), Probe.releases);
+
+    // The second request is answered from AgentCore-owned memory. The product
+    // callback is not invoked and the core only sees an allow-once projection,
+    // so its disk-persistence branch is unreachable.
+    try std.testing.expectEqual(
+        ui_request.RequestOutcome.answered,
+        try AbiSession.requestUi(&fake, .{ .session_id = .single, .run_id = 2 }, std.testing.allocator, &request, &response),
+    );
+    try std.testing.expect(response == .permission and response.permission == .allow_once);
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+    try std.testing.expectEqual(@as(usize, 1), Probe.releases);
+
+    var denied = AbiSession{
+        .callbacks = fake.callbacks,
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = undefined,
+    };
+    defer denied.host_permission_rules.deinit();
+    const write_request = ui_request.UiRequest{ .permission = .{ .tool = "Write", .args = "{}" } };
+    Probe.status = wire.UI_ANSWERED;
+    Probe.response_json = "{\"permission\":\"deny_session\"}";
+    Probe.calls = 0;
+    Probe.releases = 0;
+    try std.testing.expectEqual(
+        ui_request.RequestOutcome.answered,
+        try AbiSession.requestUi(&denied, .{ .session_id = .single, .run_id = 1 }, std.testing.allocator, &write_request, &response),
+    );
+    try std.testing.expect(response == .permission and response.permission == .deny_once);
+    try std.testing.expectEqual(
+        ui_request.RequestOutcome.answered,
+        try AbiSession.requestUi(&denied, .{ .session_id = .single, .run_id = 2 }, std.testing.allocator, &write_request, &response),
+    );
+    try std.testing.expect(response == .permission and response.permission == .deny_once);
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+    try std.testing.expectEqual(@as(usize, 1), Probe.releases);
+
+    var unavailable = AbiSession{
+        .callbacks = fake.callbacks,
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = undefined,
+    };
+    defer unavailable.host_permission_rules.deinit();
+    Probe.status = wire.UI_UNAVAILABLE;
+    Probe.response_json = "";
+    try std.testing.expectEqual(
+        ui_request.RequestOutcome.answered,
+        try AbiSession.requestUi(&unavailable, .{ .session_id = .single, .run_id = 3 }, std.testing.allocator, &request, &response),
+    );
+    try std.testing.expect(response == .permission and response.permission == .deny_once);
+    try std.testing.expectEqual(wire.STATUS_OK, unavailable.callback_status.load(.acquire));
 }
 
 test "oversized Host tool results are released exactly once" {
@@ -1053,7 +1316,7 @@ test "oversized Host UI responses are released and classified as callback failur
         }
     };
     Probe.releases = 0;
-    const questions = [_]core.tool_context.AskQuestion{.{ .question = "continue?", .header = "choice", .multi = false, .options = &.{} }};
+    const questions = [_]core.tool_context.AskQuestion{.{ .question = "continue?", .header = "choice", .multi = false, .options = &.{.{ .label = "yes", .description = "continue" }} }};
     const request = ui_request.UiRequest{ .ask_question = &questions };
     var response: ui_request.UiResponse = undefined;
     var fake = AbiSession{
@@ -1094,6 +1357,43 @@ test "Host schema limits reject excessive size and nesting" {
     for (0..wire.MAX_TOOL_SCHEMA_DEPTH_V1 + 1) |_| try nested.append(std.testing.allocator, '}');
     try nested.appendSlice(std.testing.allocator, "}}");
     try std.testing.expectError(error.ResourceLimit, parseSchema(arena.allocator(), nested.items));
+}
+
+test "Host schema admission rejects ambiguous object contracts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    try std.testing.expectError(
+        error.InvalidSchema,
+        parseSchema(a, "{\"type\":\"object\",\"additionalProperties\":false}"),
+    );
+    try std.testing.expectError(
+        error.InvalidSchema,
+        parseSchema(a, "{\"type\":\"object\",\"required\":[\"missing\"]}"),
+    );
+    try std.testing.expectError(
+        error.InvalidSchema,
+        parseSchema(a, "{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"string\"}},\"required\":[\"x\",\"x\"]}"),
+    );
+    try std.testing.expectError(
+        error.DuplicateField,
+        parseSchema(a, "{\"type\":\"object\",\"type\":\"object\"}"),
+    );
+}
+
+test "provider-facing tool names use the Revision 4 intersection grammar" {
+    try std.testing.expect(validToolName("_"));
+    try std.testing.expect(validToolName("A_9-name"));
+    const max_name = "A" ++ ("x" ** 63);
+    try std.testing.expectEqual(@as(usize, 64), max_name.len);
+    try std.testing.expect(validToolName(max_name));
+
+    try std.testing.expect(!validToolName(""));
+    try std.testing.expect(!validToolName("1bad"));
+    try std.testing.expect(!validToolName("bad:name"));
+    try std.testing.expect(!validToolName("bad.name"));
+    try std.testing.expect(!validToolName("A" ++ ("x" ** 64)));
 }
 
 test "Run OutOfMemory maps to the public OOM status" {
@@ -1172,6 +1472,48 @@ test "ABI Runtime rejects process-only built-ins as invalid input" {
     var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
     defer bufferRelease(&diagnostic);
     try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, runtimeCreate(&config, &runtime, &diagnostic));
+    try std.testing.expect(runtime == null);
+}
+
+test "ABI Runtime applies tool-name grammar to built-ins and Host tools" {
+    const Probe = struct {
+        fn execute(_: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1, _: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+            return wire.HOST_FAILED;
+        }
+
+        fn release(_: ?*anyopaque, _: ?*wire.OwnedBytesV1) callconv(.c) void {}
+    };
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer bufferRelease(&diagnostic);
+    var runtime: ?*wire.RuntimeHandle = null;
+
+    const invalid_builtin_names = [_]wire.BytesViewV1{view("1bad")};
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    runtime_config.builtin_tools = &invalid_builtin_names;
+    runtime_config.builtin_tool_count = invalid_builtin_names.len;
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        runtimeCreate(&runtime_config, &runtime, &diagnostic),
+    );
+    try std.testing.expect(runtime == null);
+    bufferRelease(&diagnostic);
+
+    var host = std.mem.zeroes(wire.HostToolV1);
+    host.struct_size = @sizeOf(wire.HostToolV1);
+    host.name = view("bad:name");
+    host.description = view("test");
+    host.input_schema_json = view("{\"type\":\"object\"}");
+    host.execute = Probe.execute;
+    host.release_result = Probe.release;
+    runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    runtime_config.host_tools = @ptrCast(&host);
+    runtime_config.host_tool_count = 1;
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_ARGUMENT,
+        runtimeCreate(&runtime_config, &runtime, &diagnostic),
+    );
     try std.testing.expect(runtime == null);
 }
 

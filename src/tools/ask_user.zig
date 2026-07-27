@@ -119,7 +119,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         const ui_request = @import("../core/protocol/ui_request.zig");
         const req = ui_request.UiRequest{ .ask_question = qlist.items };
         var resp: ui_request.UiResponse = undefined;
-        const outcome = try ctx.requestUi(allocator, &req, &resp);
+        const outcome = ctx.requestUi(allocator, &req, &resp) catch |err| switch (err) {
+            error.UiCancelled => return error.InputAborted,
+            else => return err,
+        };
         // L3:异步前端返 .pending → error.UiPending(agent_loop 挂起,响应到达 resumeRun 续跑);
         // .unavailable(headless/无 backend/sync 永不到此)→ NotATty 兜底。sync TUI 恒 .answered。
         switch (outcome) {
@@ -287,6 +290,30 @@ test "AskUserQuestion: 恰好 9 问通过校验(放宽后边界,经应答队列)
     const out = try execute(&ctx, buf.items); // 不应 TooManyQuestions
     defer a.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"answers\"") != null);
+}
+
+test "AskUserQuestion maps an AgentCore Host cancellation to InputAborted" {
+    const ui_request = @import("../core/protocol/ui_request.zig");
+    const Probe = struct {
+        fn request(
+            _: *anyopaque,
+            _: ui_request.SessionId,
+            _: std.mem.Allocator,
+            _: *const ui_request.UiRequest,
+            _: *ui_request.UiResponse,
+        ) anyerror!ui_request.RequestOutcome {
+            return error.UiCancelled;
+        }
+    };
+    var state: u8 = 0;
+    const ctx = ToolContext{
+        .allocator = std.testing.allocator,
+        .ui_requester = .{ .ctx = &state, .requestFn = Probe.request },
+    };
+    const args =
+        \\{"questions":[{"question":"q","options":[{"label":"a"},{"label":"b"}]}]}
+    ;
+    try std.testing.expectError(error.InputAborted, execute(&ctx, args));
 }
 
 test "AskUserQuestion rejects non-tty" {

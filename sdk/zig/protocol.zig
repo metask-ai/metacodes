@@ -89,9 +89,15 @@ pub const AskQuestion = struct {
 
 pub const PermissionChoice = enum {
     allow_once,
-    allow_always,
+    allow_session,
     deny_once,
-    deny_tool_session,
+    deny_session,
+};
+
+pub const MAX_ANSWER_VALUES_PER_QUESTION_V1: usize = 64;
+
+pub const Answer = struct {
+    values: []const []const u8,
 };
 
 pub const UiRequest = union(enum) {
@@ -100,7 +106,7 @@ pub const UiRequest = union(enum) {
 };
 
 pub const UiResponse = union(enum) {
-    answers: []const []const u8,
+    answers: []const Answer,
     permission: PermissionChoice,
 };
 
@@ -184,7 +190,18 @@ pub fn decodeUiResponse(allocator: std.mem.Allocator, encoded: []const u8) Decod
 pub fn encodeUiResponse(allocator: std.mem.Allocator, request: UiRequest, response: UiResponse) EncodeError![]u8 {
     switch (request) {
         .ask_question => |questions| switch (response) {
-            .answers => |answers| if (answers.len != questions.len) return error.InvalidResponse,
+            .answers => |answers| {
+                if (answers.len != questions.len) return error.InvalidResponse;
+                for (questions, answers) |question, answer| {
+                    if (question.options.len == 0) return error.InvalidResponse;
+                    if (question.multi) {
+                        if (answer.values.len == 0 or answer.values.len > MAX_ANSWER_VALUES_PER_QUESTION_V1)
+                            return error.InvalidResponse;
+                    } else if (answer.values.len != 1) {
+                        return error.InvalidResponse;
+                    }
+                }
+            },
             else => return error.MismatchedResponse,
         },
         .permission => if (response != .permission) return error.MismatchedResponse,
@@ -302,21 +319,82 @@ test "UiRequest decoder covers every tag and response encoder enforces pairing" 
         parsed.deinit();
     }
 
-    const answers = [_][]const u8{ "Yes", "需要转义 \"quote\"" };
+    const first_values = [_][]const u8{"Yes"};
+    const second_values = [_][]const u8{"需要转义 \"quote\""};
+    const answers = [_]Answer{
+        .{ .values = &first_values },
+        .{ .values = &second_values },
+    };
     const ask_request = UiRequest{ .ask_question = &.{
-        .{ .question = "First?", .header = "One", .multi = false, .options = &.{} },
-        .{ .question = "Second?", .header = "Two", .multi = false, .options = &.{} },
+        .{ .question = "First?", .header = "One", .multi = false, .options = &.{.{ .label = "Yes", .description = "Proceed" }} },
+        .{ .question = "Second?", .header = "Two", .multi = false, .options = &.{.{ .label = "Custom", .description = "Free text is allowed" }} },
     } };
     const encoded = try encodeUiResponse(a, ask_request, .{ .answers = &answers });
     defer a.free(encoded);
-    try std.testing.expectEqualStrings("{\"answers\":[\"Yes\",\"需要转义 \\\"quote\\\"\"]}", encoded);
+    try std.testing.expectEqualStrings("{\"answers\":[{\"values\":[\"Yes\"]},{\"values\":[\"需要转义 \\\"quote\\\"\"]}]}", encoded);
 
     const permission_request = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
-    const permission = try encodeUiResponse(a, permission_request, .{ .permission = .allow_always });
+    const permission = try encodeUiResponse(a, permission_request, .{ .permission = .allow_session });
     defer a.free(permission);
-    try std.testing.expectEqualStrings("{\"permission\":\"allow_always\"}", permission);
+    try std.testing.expectEqualStrings("{\"permission\":\"allow_session\"}", permission);
     try std.testing.expectError(error.MismatchedResponse, encodeUiResponse(a, permission_request, .{ .answers = &answers }));
     try std.testing.expectError(error.InvalidResponse, encodeUiResponse(a, ask_request, .{ .answers = answers[0..1] }));
+}
+
+test "answer cardinality uses an independent wire cap and preserves free text values" {
+    const a = std.testing.allocator;
+    const option = [_]AskOption{.{ .label = "Known", .description = "Catalog option" }};
+    const multi_request = UiRequest{ .ask_question = &.{.{
+        .question = "Choose or explain",
+        .header = "Choice",
+        .multi = true,
+        .options = &option,
+    }} };
+    const free_text_values = [_][]const u8{ "Known", "free text outside options" };
+    const free_text_answers = [_]Answer{.{ .values = &free_text_values }};
+    const encoded = try encodeUiResponse(a, multi_request, .{ .answers = &free_text_answers });
+    defer a.free(encoded);
+    try std.testing.expectEqualStrings(
+        "{\"answers\":[{\"values\":[\"Known\",\"free text outside options\"]}]}",
+        encoded,
+    );
+
+    const empty_values = [_][]const u8{};
+    const empty_answers = [_]Answer{.{ .values = &empty_values }};
+    try std.testing.expectError(
+        error.InvalidResponse,
+        encodeUiResponse(a, multi_request, .{ .answers = &empty_answers }),
+    );
+
+    var too_many_values: [MAX_ANSWER_VALUES_PER_QUESTION_V1 + 1][]const u8 = undefined;
+    for (&too_many_values) |*value| value.* = "x";
+    const too_many_answers = [_]Answer{.{ .values = &too_many_values }};
+    try std.testing.expectError(
+        error.InvalidResponse,
+        encodeUiResponse(a, multi_request, .{ .answers = &too_many_answers }),
+    );
+
+    const single_request = UiRequest{ .ask_question = &.{.{
+        .question = "One answer",
+        .header = "One",
+        .multi = false,
+        .options = &option,
+    }} };
+    try std.testing.expectError(
+        error.InvalidResponse,
+        encodeUiResponse(a, single_request, .{ .answers = &free_text_answers }),
+    );
+
+    const no_options_request = UiRequest{ .ask_question = &.{.{
+        .question = "Impossible",
+        .header = "None",
+        .multi = true,
+        .options = &.{},
+    }} };
+    try std.testing.expectError(
+        error.InvalidResponse,
+        encodeUiResponse(a, no_options_request, .{ .answers = &free_text_answers }),
+    );
 }
 
 test "UiRequest decoder rejects unknown tags and invalid payloads" {
@@ -343,7 +421,8 @@ test "decoder and encoder normalize allocation failure" {
     var decode_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, decodeCoreEvent(decode_failing.allocator(), "{\"text_chunk\":\"x\"}"));
     var encode_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    const answers = [_][]const u8{"Yes"};
-    const request = UiRequest{ .ask_question = &.{.{ .question = "Continue?", .header = "Choice", .multi = false, .options = &.{} }} };
+    const values = [_][]const u8{"Yes"};
+    const answers = [_]Answer{.{ .values = &values }};
+    const request = UiRequest{ .ask_question = &.{.{ .question = "Continue?", .header = "Choice", .multi = false, .options = &.{.{ .label = "Yes", .description = "Proceed" }} }} };
     try std.testing.expectError(error.OutOfMemory, encodeUiResponse(encode_failing.allocator(), request, .{ .answers = &answers }));
 }

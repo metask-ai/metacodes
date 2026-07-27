@@ -134,7 +134,8 @@ const Probe = struct {
             questions[0].options.len != 2 or !std.mem.eql(u8, questions[0].options[0].label, "Yes"))
             return wire.UI_FATAL;
         self.ui_calls += 1;
-        const answers = [_][]const u8{"Yes"};
+        const values = [_][]const u8{"Yes"};
+        const answers = [_]sdk.protocol.Answer{.{ .values = &values }};
         const response = sdk.encodeUiResponse(std.heap.c_allocator, parsed.value, .{ .answers = &answers }) catch return wire.UI_FATAL;
         (out orelse {
             std.heap.c_allocator.free(response);

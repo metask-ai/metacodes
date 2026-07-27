@@ -30,6 +30,96 @@ const HOST_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+const CONTINUATION_HEAD_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"cont_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"head\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":2}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const CONTINUATION_TAIL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"cont_2\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":6,\"output_tokens\":0}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"tail\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+/// Independent Host-side oracle for the public A1 recipe. It deliberately
+/// knows nothing about Conversation internals.
+const ReconstructionProbe = struct {
+    current: [128]u8 = undefined,
+    current_len: usize = 0,
+    answer: [256]u8 = undefined,
+    answer_len: usize = 0,
+    stream_done_count: usize = 0,
+    usage: sdk.protocol.UsageDelta = .{},
+
+    fn checkedAdd(dst: *u64, value: u64) bool {
+        dst.* = std.math.add(u64, dst.*, value) catch return false;
+        return true;
+    }
+
+    fn event(raw: ?*anyopaque, _: ?*const wire.RunContextV1, event_json: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *ReconstructionProbe = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        const bytes = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, bytes) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        const event_value = switch (parsed.value) {
+            .known => |decoded| decoded,
+            .unknown => return wire.EVENT_CONTINUE,
+        };
+        switch (event_value) {
+            .text_chunk => |text| {
+                if (text.len > self.current.len - self.current_len) return wire.EVENT_FATAL;
+                @memcpy(self.current[self.current_len..][0..text.len], text);
+                self.current_len += text.len;
+            },
+            .stream_done => {
+                if (self.current_len > self.answer.len - self.answer_len) return wire.EVENT_FATAL;
+                @memcpy(self.answer[self.answer_len..][0..self.current_len], self.current[0..self.current_len]);
+                self.answer_len += self.current_len;
+                self.current_len = 0;
+                self.stream_done_count += 1;
+            },
+            .tool_start, .tool_result => {
+                self.answer_len = 0;
+                self.current_len = 0;
+            },
+            .usage => |usage| {
+                if (!checkedAdd(&self.usage.input_tokens, usage.input_tokens) or
+                    !checkedAdd(&self.usage.output_tokens, usage.output_tokens) or
+                    !checkedAdd(&self.usage.cache_read_input_tokens, usage.cache_read_input_tokens) or
+                    !checkedAdd(&self.usage.cache_creation_input_tokens, usage.cache_creation_input_tokens))
+                    return wire.EVENT_FATAL;
+            },
+            else => {},
+        }
+        return wire.EVENT_CONTINUE;
+    }
+};
+
+test "Host reconstruction oracle resets at public tool boundaries" {
+    var probe = ReconstructionProbe{};
+    const events = [_][]const u8{
+        "{\"text_chunk\":\"provisional\"}",
+        "{\"stream_done\":{}}",
+        "{\"text_chunk\":\"unclosed\"}",
+        "{\"tool_start\":{\"id\":\"t\",\"name\":\"Read\",\"input\":\"{}\"}}",
+        "{\"tool_result\":{\"id\":\"t\",\"name\":\"Read\",\"input\":\"{}\",\"content\":\"ok\",\"is_error\":false}}",
+        "{\"text_chunk\":\"final\"}",
+        "{\"stream_done\":{}}",
+    };
+    for (events) |encoded| {
+        try std.testing.expectEqual(
+            wire.EVENT_CONTINUE,
+            ReconstructionProbe.event(&probe, null, sdk.bytesView(encoded)),
+        );
+    }
+    try std.testing.expectEqualStrings("final", probe.answer[0..probe.answer_len]);
+}
+
 /// Test Host registry implementing the consumer-side §4 contract. The binding
 /// is keyed by opaque Session handle, deep-copies session_id, and performs the
 /// first bind and every comparison under the same per-registry mutex.
@@ -108,7 +198,8 @@ const Probe = struct {
         defer parsed.deinit();
         if (parsed.value != .ask_question) return wire.UI_FATAL;
         self.ui_calls += 1;
-        const answers = [_][]const u8{"Yes"};
+        const values = [_][]const u8{"Yes"};
+        const answers = [_]sdk.protocol.Answer{.{ .values = &values }};
         const response = sdk.encodeUiResponse(std.heap.c_allocator, parsed.value, .{ .answers = &answers }) catch return wire.UI_FATAL;
         (out orelse {
             std.heap.c_allocator.free(response);
@@ -147,9 +238,14 @@ const UiFailureMode = enum {
     fatal,
     oversized,
     unavailable,
+    cancelled_with_buffer,
     unknown,
     abort_twice,
 };
+
+fn acceptEvent(_: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1) callconv(.c) u32 {
+    return wire.EVENT_CONTINUE;
+}
 
 const UiFailureProbe = struct {
     mode: UiFailureMode,
@@ -175,6 +271,13 @@ const UiFailureProbe = struct {
                 break :blk wire.UI_ANSWERED;
             },
             .unavailable => wire.UI_UNAVAILABLE,
+            .cancelled_with_buffer => blk: {
+                (out orelse return wire.UI_FATAL).* = .{
+                    .ptr = @ptrCast(&self.byte),
+                    .len = 1,
+                };
+                break :blk wire.UI_CANCELLED;
+            },
             .unknown => std.math.maxInt(u32),
             .abort_twice => blk: {
                 const api = self.api orelse return wire.UI_FATAL;
@@ -330,6 +433,7 @@ test "L2 invalid Session configuration publishes no handle and diagnostics never
 
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.on_event = Probe.event;
     const read_only = [_]wire.BytesViewV1{sdk.bytesView("Read")};
     var config = std.mem.zeroes(wire.SessionConfigV1);
     config.struct_size = @sizeOf(wire.SessionConfigV1);
@@ -342,6 +446,10 @@ test "L2 invalid Session configuration publishes no handle and diagnostics never
     config.workspace_home = sdk.bytesView(root);
     config.allowed_tools = &read_only;
     config.allowed_tool_count = read_only.len;
+
+    var missing_event_callbacks = callbacks;
+    missing_event_callbacks.on_event = null;
+    try expectInvalidSessionConfig(api, runtime.?, &config, &missing_event_callbacks, &diagnostic);
 
     var metadata_byte: u8 = 'x';
     const valid_model = config.model;
@@ -390,6 +498,129 @@ test "L2 invalid Session configuration publishes no handle and diagnostics never
 
     try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
     runtime = null;
+}
+
+test "L2 sandbox admission is eager while unrestricted skips the probe" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    const builtins = [_]wire.BytesViewV1{sdk.bytesView("Read")};
+    runtime_config.builtin_tools = &builtins;
+    runtime_config.builtin_tool_count = builtins.len;
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreate()(&runtime_config, &runtime, &diagnostic));
+    defer if (runtime) |handle| {
+        _ = api.runtimeDestroy()(handle, &diagnostic);
+    };
+
+    const read_only = [_]wire.BytesViewV1{sdk.bytesView("Read")};
+    var config = std.mem.zeroes(wire.SessionConfigV1);
+    config.struct_size = @sizeOf(wire.SessionConfigV1);
+    config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    config.permission_mode_code = wire.PERMISSION_BYPASS;
+    config.api_key = sdk.bytesView("test-key");
+    config.model = sdk.bytesView("test-model");
+    config.workspace_root = sdk.bytesView(root);
+    config.workspace_home = sdk.bytesView(root);
+    config.allowed_tools = &read_only;
+    config.allowed_tool_count = read_only.len;
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.on_event = Probe.event;
+
+    config.shell_policy_code = wire.SHELL_UNRESTRICTED;
+    var unrestricted: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionCreate()(runtime, &config, &callbacks, &unrestricted, &diagnostic),
+    );
+    try std.testing.expect(unrestricted != null);
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(unrestricted, &diagnostic));
+
+    config.shell_policy_code = wire.SHELL_SANDBOXED;
+    var sandboxed: ?*wire.SessionHandle = null;
+    const status = api.sessionCreate()(runtime, &config, &callbacks, &sandboxed, &diagnostic);
+    if (@import("builtin").os.tag == .macos) {
+        try std.testing.expectEqual(wire.STATUS_OK, status);
+        try std.testing.expect(sandboxed != null);
+        try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(sandboxed, &diagnostic));
+    } else {
+        try std.testing.expectEqual(wire.STATUS_INVALID_ARGUMENT, status);
+        try std.testing.expect(sandboxed == null);
+    }
+}
+
+test "L2 public events reconstruct continuation output and observable run usage" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ CONTINUATION_HEAD_SSE, CONTINUATION_TAIL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeCreate()(&runtime_config, &runtime, &diagnostic));
+    defer if (runtime) |handle| {
+        _ = api.runtimeDestroy()(handle, &diagnostic);
+    };
+
+    var session_config = std.mem.zeroes(wire.SessionConfigV1);
+    session_config.struct_size = @sizeOf(wire.SessionConfigV1);
+    session_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    session_config.permission_mode_code = wire.PERMISSION_BYPASS;
+    session_config.shell_policy_code = wire.SHELL_DISABLED;
+    session_config.api_key = sdk.bytesView("test-key");
+    session_config.model = sdk.bytesView("test-model");
+    session_config.base_url = sdk.bytesView(url);
+    session_config.workspace_root = sdk.bytesView(root);
+    session_config.workspace_home = sdk.bytesView(root);
+
+    var probe = ReconstructionProbe{};
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = ReconstructionProbe.event;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionCreate()(runtime, &session_config, &callbacks, &session, &diagnostic),
+    );
+    defer if (session) |handle| {
+        _ = api.sessionDestroy()(handle, &diagnostic);
+    };
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 4;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRun()(session, 1, sdk.bytesView("continue fixture"), &options, &result, &diagnostic),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqualStrings("headtail", probe.answer[0..probe.answer_len]);
+    try std.testing.expectEqual(@as(usize, 2), probe.stream_done_count);
+    try std.testing.expectEqual(@as(u64, 11), probe.usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 5), probe.usage.output_tokens);
 }
 
 test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers" {
@@ -476,6 +707,19 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
     try std.testing.expectEqual(
         wire.STATUS_INVALID_ARGUMENT,
         api.sessionRun()(session, 0, sdk.bytesView("zero is not a Run identifier"), &options, &result, &diagnostic),
+    );
+    api.bufferRelease()(&diagnostic);
+    var invalid_utf8: u8 = 0xff;
+    try std.testing.expectEqual(
+        wire.STATUS_RESOURCE_LIMIT,
+        api.sessionRun()(
+            session,
+            1,
+            .{ .ptr = @ptrCast(&invalid_utf8), .len = wire.MAX_PROMPT_BYTES_V1 + 1 },
+            &options,
+            &result,
+            &diagnostic,
+        ),
     );
     api.bufferRelease()(&diagnostic);
     try std.testing.expectEqual(wire.STATUS_OK, api.sessionRun()(session, 1, sdk.bytesView("exercise ABI"), &options, &result, &diagnostic));
@@ -628,6 +872,7 @@ test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
     session_config.workspace_home = sdk.bytesView(root);
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.on_event = acceptEvent;
     var session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(wire.STATUS_OK, api.sessionCreate()(runtime, &session_config, &callbacks, &session, &diagnostic));
     defer if (session) |handle| {
@@ -791,6 +1036,7 @@ test "L2 invalid UTF-8 Host tool result is released and does not poison Session"
     session_config.allowed_tool_count = allowed.len;
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.on_event = acceptEvent;
     var session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(wire.STATUS_OK, api.sessionCreate()(runtime, &session_config, &callbacks, &session, &diagnostic));
     defer {
@@ -993,6 +1239,7 @@ fn expectUiOutcome(mode: UiFailureMode, expected_releases: usize, expected_statu
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
     callbacks.ctx = &probe;
+    callbacks.on_event = acceptEvent;
     callbacks.on_ui_request = UiFailureProbe.ui;
     callbacks.release_response = UiFailureProbe.release;
     var session: ?*wire.SessionHandle = null;
@@ -1041,6 +1288,10 @@ test "L2 unknown Host UI status poisons the ABI Session" {
 
 test "L2 unavailable Host UI is a reusable business outcome" {
     try expectUiOutcome(.unavailable, 0, wire.STATUS_OK, wire.STOP_END_TURN);
+}
+
+test "L2 cancelled AskQuestion releases Host bytes and leaves the Session reusable" {
+    try expectUiOutcome(.cancelled_with_buffer, 1, wire.STATUS_OK, wire.STOP_END_TURN);
 }
 
 test "L2 Host UI callback may repeat abort while nested run and destroy stay busy" {

@@ -95,6 +95,7 @@ pub fn encodeUiRequest(allocator: std.mem.Allocator, request: *const InternalUiR
         .ask_question => |questions| blk: {
             const out = try a.alloc(public.AskQuestion, questions.len);
             for (questions, out) |question, *dest| {
+                if (question.options.len == 0) return error.InvalidUiRequest;
                 const options = try a.alloc(public.AskOption, question.options.len);
                 for (question.options, options) |option, *option_dest| {
                     option_dest.* = .{
@@ -139,8 +140,15 @@ pub fn decodeUiResponse(
                     for (copied[0..copied_count]) |answer| allocator.free(@constCast(answer));
                     allocator.free(copied);
                 }
-                for (answers, copied) |answer, *dest| {
-                    dest.* = try allocator.dupe(u8, answer);
+                for (questions, answers, copied) |question, answer, *dest| {
+                    if (question.options.len == 0) return error.InvalidUiResponse;
+                    if (question.multi) {
+                        if (answer.values.len == 0 or answer.values.len > public.MAX_ANSWER_VALUES_PER_QUESTION_V1)
+                            return error.InvalidUiResponse;
+                    } else if (answer.values.len != 1) {
+                        return error.InvalidUiResponse;
+                    }
+                    dest.* = try std.mem.join(allocator, ", ", answer.values);
                     copied_count += 1;
                 }
                 out.* = .{ .answers = copied };
@@ -150,9 +158,9 @@ pub fn decodeUiResponse(
         .permission => switch (parsed.value) {
             .permission => |choice| out.* = .{ .permission = switch (choice) {
                 .allow_once => .allow_once,
-                .allow_always => .allow_always,
+                .allow_session => .allow_always,
                 .deny_once => .deny_once,
-                .deny_tool_session => .deny_tool_session,
+                .deny_session => .deny_tool_session,
             } },
             else => return error.InvalidUiResponse,
         },
@@ -196,5 +204,84 @@ test "plan and custom UI requests are not part of ABI v1" {
     try std.testing.expectError(
         error.UnsupportedUiRequest,
         decodeUiResponse(std.testing.allocator, &custom, "{\"answers\":[]}", &out),
+    );
+}
+
+test "AskQuestion response validation preserves value boundaries until core projection" {
+    const options = [_]core.tool_context.AskOption{.{
+        .label = "Known",
+        .description = "Catalog option",
+    }};
+    const multi_questions = [_]core.tool_context.AskQuestion{.{
+        .question = "Choose or explain",
+        .header = "Choice",
+        .multi = true,
+        .options = &options,
+    }};
+    const multi_request = InternalUiRequest{ .ask_question = &multi_questions };
+    var out: InternalUiResponse = undefined;
+    try decodeUiResponse(
+        std.testing.allocator,
+        &multi_request,
+        "{\"answers\":[{\"values\":[\"Known\",\"free text\"]}]}",
+        &out,
+    );
+    switch (out) {
+        .answers => |answers| {
+            defer {
+                for (answers) |answer| std.testing.allocator.free(@constCast(answer));
+                std.testing.allocator.free(@constCast(answers));
+            }
+            try std.testing.expectEqualStrings("Known, free text", answers[0]);
+        },
+        else => return error.UnexpectedUiResponse,
+    }
+
+    try std.testing.expectError(
+        error.InvalidUiResponse,
+        decodeUiResponse(
+            std.testing.allocator,
+            &multi_request,
+            "{\"answers\":[{\"values\":[]}]}",
+            &out,
+        ),
+    );
+
+    const single_questions = [_]core.tool_context.AskQuestion{.{
+        .question = "One",
+        .header = "One",
+        .multi = false,
+        .options = &options,
+    }};
+    const single_request = InternalUiRequest{ .ask_question = &single_questions };
+    try std.testing.expectError(
+        error.InvalidUiResponse,
+        decodeUiResponse(
+            std.testing.allocator,
+            &single_request,
+            "{\"answers\":[{\"values\":[\"one\",\"two\"]}]}",
+            &out,
+        ),
+    );
+
+    const no_options_questions = [_]core.tool_context.AskQuestion{.{
+        .question = "Impossible",
+        .header = "None",
+        .multi = true,
+        .options = &.{},
+    }};
+    const no_options_request = InternalUiRequest{ .ask_question = &no_options_questions };
+    try std.testing.expectError(
+        error.InvalidUiResponse,
+        decodeUiResponse(
+            std.testing.allocator,
+            &no_options_request,
+            "{\"answers\":[{\"values\":[\"free text\"]}]}",
+            &out,
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidUiRequest,
+        encodeUiRequest(std.testing.allocator, &no_options_request),
     );
 }
