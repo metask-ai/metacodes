@@ -124,6 +124,7 @@ const TestFixture = struct {
                 .shell = shell,
                 .source_path = "",
             },
+            .directories = &.{},
             .files = &.{},
         };
         fixture.snapshot = .{

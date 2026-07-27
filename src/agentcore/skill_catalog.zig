@@ -62,6 +62,7 @@ pub const SkillRecord = struct {
     skill_id: [64]u8,
     invocation_name: []const u8,
     definition: skill_mod.Skill,
+    directories: []const []const u8,
     files: []const FileRecord,
 };
 
@@ -372,8 +373,21 @@ fn snapshotCandidateTemporary(
     defer skill_dir.close(io);
 
     var files: std.ArrayList(FileRecord) = .empty;
-    try snapshotTree(arena, io, skill_dir, "", 0, limits, counters, &files);
+    var directories: std.ArrayList([]const u8) = .empty;
+    try snapshotTree(
+        arena,
+        io,
+        skill_dir,
+        "",
+        0,
+        limits,
+        counters,
+        &directories,
+        &files,
+    );
+    std.mem.sort([]const u8, directories.items, {}, stringLessThan);
     std.mem.sort(FileRecord, files.items, {}, fileLessThan);
+    const owned_directories = try directories.toOwnedSlice(arena);
     const owned_files = try files.toOwnedSlice(arena);
 
     var definition_bytes: ?[]const u8 = null;
@@ -401,11 +415,13 @@ fn snapshotCandidateTemporary(
         .skill_id = hashHex(candidate.invocation_name),
         .invocation_name = candidate.invocation_name,
         .definition = definition,
+        .directories = owned_directories,
         .files = owned_files,
     };
 }
 
 fn cloneSkillRecord(arena: std.mem.Allocator, source: SkillRecord) error{OutOfMemory}!SkillRecord {
+    const directories = try cloneStringList(arena, source.directories);
     const files = try arena.alloc(FileRecord, source.files.len);
     for (source.files, files) |file, *copy| {
         copy.* = .{
@@ -431,6 +447,7 @@ fn cloneSkillRecord(arena: std.mem.Allocator, source: SkillRecord) error{OutOfMe
             .shell = try arena.dupe(u8, source.definition.shell),
             .source_path = "",
         },
+        .directories = directories,
         .files = files,
     };
 }
@@ -471,6 +488,7 @@ fn snapshotTree(
     depth: usize,
     limits: Limits,
     counters: *Counters,
+    directories: *std.ArrayList([]const u8),
     files: *std.ArrayList(FileRecord),
 ) LocalError!void {
     if (depth > limits.max_depth) return error.ResourceLimit;
@@ -500,12 +518,23 @@ fn snapshotTree(
 
         switch (entry.kind) {
             .directory => {
+                try directories.append(arena, relative_path);
                 var child = dir.openDir(io, entry.name, .{
                     .iterate = true,
                     .follow_symlinks = false,
                 }) catch return error.InvalidResource;
                 defer child.close(io);
-                try snapshotTree(arena, io, child, relative_path, depth + 1, limits, counters, files);
+                try snapshotTree(
+                    arena,
+                    io,
+                    child,
+                    relative_path,
+                    depth + 1,
+                    limits,
+                    counters,
+                    directories,
+                    files,
+                );
             },
             .file => try snapshotFile(arena, io, dir, entry.name, relative_path, limits, counters, files),
             .sym_link => return error.InvalidResource,
@@ -514,12 +543,23 @@ fn snapshotTree(
                     return error.InvalidResource;
                 switch (stat.kind) {
                     .directory => {
+                        try directories.append(arena, relative_path);
                         var child = dir.openDir(io, entry.name, .{
                             .iterate = true,
                             .follow_symlinks = false,
                         }) catch return error.InvalidResource;
                         defer child.close(io);
-                        try snapshotTree(arena, io, child, relative_path, depth + 1, limits, counters, files);
+                        try snapshotTree(
+                            arena,
+                            io,
+                            child,
+                            relative_path,
+                            depth + 1,
+                            limits,
+                            counters,
+                            directories,
+                            files,
+                        );
                     },
                     .file => try snapshotFile(arena, io, dir, entry.name, relative_path, limits, counters, files),
                     else => return error.InvalidResource,
@@ -685,6 +725,10 @@ fn computeRevision(snapshot: *const Snapshot, workspace_epoch: []const u8) [64]u
         for (record.definition.arguments) |value| hashField(&hash, value);
         for (record.definition.allowed_tools) |value| hashField(&hash, value);
         for (record.definition.disallowed_tools) |value| hashField(&hash, value);
+        for (record.directories) |directory| {
+            hashField(&hash, "directory");
+            hashField(&hash, directory);
+        }
         for (record.files) |file| {
             hashField(&hash, file.relative_path);
             hashU64(&hash, @intFromBool(file.executable));
@@ -842,6 +886,10 @@ fn fileLessThan(_: void, lhs: FileRecord, rhs: FileRecord) bool {
     return std.mem.lessThan(u8, lhs.relative_path, rhs.relative_path);
 }
 
+fn stringLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+    return std.mem.lessThan(u8, lhs, rhs);
+}
+
 test "invocation grammar is intentionally wider than provider tool names" {
     try std.testing.expect(validInvocationName("review"));
     try std.testing.expect(validInvocationName("plugin:review-2"));
@@ -899,6 +947,8 @@ test "catalog priority, tombstone, snapshot, parser parity, and revision are det
     try std.testing.expectEqual(Health.healthy, first.health);
     try std.testing.expectEqual(@as(usize, 1), first.skills.len);
     try std.testing.expectEqualStrings("High", first.skills[0].definition.name);
+    try std.testing.expectEqual(@as(usize, 1), first.skills[0].directories.len);
+    try std.testing.expectEqualStrings("resources", first.skills[0].directories[0]);
     try std.testing.expect(first.skills[0].files.len == 2);
     try std.testing.expectEqualSlices(u8, &first.revision, &second.revision);
     try std.testing.expectEqualStrings(first.descriptor_json, second.descriptor_json);
