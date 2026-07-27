@@ -63,6 +63,7 @@ pub const tools_dynamic = @import("tools/dynamic.zig"); // Skill/MCP DynRegistry
 // ── 权限 ─────────────────────────────────────────────────────────────────
 pub const permission = @import("permission.zig"); // PermissionContext
 pub const permission_decision = @import("permission/decision.zig");
+pub const permission_rule_spec = @import("permission/rule_spec.zig");
 pub const permission_settings = @import("permission/settings.zig");
 pub const permission_prompt = @import("permission/prompt.zig"); // 断 UI 后纯协议路径
 pub const permission_session_rules = @import("permission/session_rules.zig"); // per-session 权限记忆

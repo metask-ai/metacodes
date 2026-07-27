@@ -11,6 +11,7 @@ pub const skill_catalog = @import("skill_catalog.zig");
 pub const skill_catalog_handles = @import("skill_catalog_handles.zig");
 pub const skill_activation = @import("skill_activation.zig");
 pub const skill_materialization = @import("skill_materialization.zig");
+pub const policy_frame = @import("policy_frame.zig");
 const sandbox_admission = @import("sandbox_admission.zig");
 
 const allocator = std.heap.c_allocator;
