@@ -23,6 +23,9 @@ const Client = @import("../client.zig").Client;
 const ToolDefinition = @import("../json.zig").ToolDefinition;
 const DynRegistry = @import("dynamic.zig").DynRegistry;
 
+/// Shared recursion ceiling for every child-agent/fork mechanism.
+pub const MAX_AGENT_DEPTH: u8 = 3;
+
 /// AskUserQuestion 的结构化输入(解析+校验在 ask_user.zig 做,渲染在 dialog/ask_question.zig)。
 /// 放在中性的 context 层:所有工具已 import 它,避免 ask_user.zig ↔ tui dialog 的循环依赖。
 pub const AskOption = struct {

@@ -23,6 +23,49 @@ const MINIMAL_END_TURN_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+const READ_TOOL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_tool\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_read\",\"name\":\"Read\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const ProjectionProbe = struct {
+    text: usize = 0,
+    stream_done: usize = 0,
+    tool_start: usize = 0,
+    tool_result: usize = 0,
+    usage: usize = 0,
+
+    fn backend(self: *ProjectionProbe) cc.ui_backend.UiBackend {
+        return .{ .ctx = self, .emit = emit, .poll = poll };
+    }
+
+    fn emit(
+        raw: *anyopaque,
+        _: cc.session_id.SessionId,
+        event: cc.ui_event.CoreEvent,
+    ) void {
+        const self: *ProjectionProbe = @ptrCast(@alignCast(raw));
+        switch (event) {
+            .text_chunk => self.text += 1,
+            .stream_done => self.stream_done += 1,
+            .tool_start => self.tool_start += 1,
+            .tool_result => self.tool_result += 1,
+            .usage => self.usage += 1,
+            else => {},
+        }
+    }
+
+    fn poll(
+        _: *anyopaque,
+        _: cc.session_id.SessionId,
+    ) ?cc.ui_event.UiEvent {
+        return null;
+    }
+};
+
 // 1) fork 触发 spawn:context: fork 的 skill 激活后,MockServer 收到请求,
 //    请求体含 rendered body 当 user message。**核心端到端断言**。
 test "L2: skill context:fork → spawn subagent (请求体含 body)" {
@@ -236,4 +279,88 @@ test "L2: skill fork 无 api_client → 降级 inline" {
     try std.testing.expect(std.mem.indexOf(u8, out, "# Skill: degradefork") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "DEGRADE_BODY") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "(forked)") == null);
+}
+
+test "L2: AgentCore fork capture preserves raw boundaries at true child depth" {
+    const a = std.testing.allocator;
+    const bodies = [_][]const u8{
+        READ_TOOL_SSE,
+        MINIMAL_END_TURN_SSE,
+        READ_TOOL_SSE,
+        MINIMAL_END_TURN_SSE,
+    };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(
+        a,
+        io_runtime.io(),
+        "test-key",
+        "test-model",
+        url,
+    );
+    defer client.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const tool_defs = try cc.tools.toToolDefinitions(arena.allocator());
+    var permission = cc.permission.PermissionContext{
+        .mode = .init(.bypass_permissions),
+        .allocator = a,
+    };
+
+    var root_probe = ProjectionProbe{};
+    const root_backend = root_probe.backend();
+    const root_result = try cc.core_subagent.spawnAgentSink(
+        a,
+        client.provider(),
+        &client,
+        tool_defs,
+        &permission,
+        null,
+        "exercise run-root projection",
+        .{
+            .max_turns = 3,
+            .agent_depth = 2,
+            .event_projection = .run_root,
+        },
+        &root_backend,
+    );
+    defer root_result.deinit();
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, root_result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 1), root_probe.tool_start);
+    try std.testing.expectEqual(@as(usize, 1), root_probe.tool_result);
+    try std.testing.expect(root_probe.text > 0);
+    try std.testing.expectEqual(@as(usize, 2), root_probe.stream_done);
+    try std.testing.expect(root_probe.usage > 0);
+
+    var model_probe = ProjectionProbe{};
+    const model_backend = model_probe.backend();
+    const model_result = try cc.core_subagent.spawnAgentSink(
+        a,
+        client.provider(),
+        &client,
+        tool_defs,
+        &permission,
+        null,
+        "exercise model-tool projection",
+        .{
+            .max_turns = 3,
+            .agent_depth = 2,
+            .event_projection = .model_tool,
+        },
+        &model_backend,
+    );
+    defer model_result.deinit();
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, model_result.stop_reason);
+    // The private AgentCore projector needs these raw boundaries for A1 final
+    // reconstruction, then filters them from the model-tool public surface.
+    try std.testing.expectEqual(@as(usize, 1), model_probe.tool_start);
+    try std.testing.expectEqual(@as(usize, 1), model_probe.tool_result);
+    try std.testing.expect(model_probe.text > 0);
+    try std.testing.expectEqual(@as(usize, 2), model_probe.stream_done);
+    try std.testing.expect(model_probe.usage > 0);
 }

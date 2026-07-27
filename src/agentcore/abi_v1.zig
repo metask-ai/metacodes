@@ -12,6 +12,7 @@ pub const skill_catalog_handles = @import("skill_catalog_handles.zig");
 pub const skill_activation = @import("skill_activation.zig");
 pub const skill_materialization = @import("skill_materialization.zig");
 pub const policy_frame = @import("policy_frame.zig");
+pub const event_projection = @import("event_projection.zig");
 const sandbox_admission = @import("sandbox_admission.zig");
 
 const allocator = std.heap.c_allocator;
@@ -372,7 +373,7 @@ const AbiSession = struct {
 
     /// Internal typed-Skill entry used by the Revision 4 public input union.
     /// All validation before `admitMaterializedSkill` is side-effect free.
-    fn runInlineSkill(
+    fn runSkill(
         self: *AbiSession,
         materializations: *skill_materialization.Manager,
         run_id: u64,
@@ -380,7 +381,7 @@ const AbiSession = struct {
         skill_id: []const u8,
         arguments_json: []const u8,
         max_turns: u32,
-    ) anyerror!InlineSkillExecution {
+    ) anyerror!SkillExecution {
         const cell = self.skill_catalog_cell orelse
             return error.SkillCatalogNotBound;
         const root_frame = self.policy_root orelse
@@ -405,7 +406,10 @@ const AbiSession = struct {
             .aborted => .aborted,
             .ready => |ready_value| blk: {
                 var ready = ready_value;
-                break :blk try ready.executeInline(&plan, max_turns);
+                break :blk switch (plan.skill.definition.context) {
+                    .inline_ctx => try ready.executeInline(&plan, max_turns),
+                    .fork => try ready.executeFork(&plan, max_turns),
+                };
             },
         };
     }
@@ -461,7 +465,7 @@ const SkillAdmission = union(enum) {
     ready: MaterializedSkillRun,
 };
 
-const InlineSkillExecution = union(enum) {
+const SkillExecution = union(enum) {
     aborted,
     completed: core.agent_loop.RunResult,
 };
@@ -474,7 +478,7 @@ const MaterializedSkillRun = struct {
         self: *MaterializedSkillRun,
         plan: *const skill_activation.ActivationPlan,
         max_turns: u32,
-    ) anyerror!InlineSkillExecution {
+    ) anyerror!SkillExecution {
         const invocation_record = canonicalInvocationRecord(
             allocator,
             plan,
@@ -511,6 +515,45 @@ const MaterializedSkillRun = struct {
         return .{ .completed = result };
     }
 
+    fn executeFork(
+        self: *MaterializedSkillRun,
+        plan: *const skill_activation.ActivationPlan,
+        max_turns: u32,
+    ) anyerror!SkillExecution {
+        const invocation_record = canonicalInvocationRecord(
+            allocator,
+            plan,
+        ) catch |record_error| {
+            _ = try self.finishWithoutConversation();
+            return record_error;
+        };
+        defer allocator.free(invocation_record);
+
+        if (self.admitted.abortSignal().isAborted()) {
+            _ = try self.finishWithoutConversation();
+            return .aborted;
+        }
+
+        var executor_context = ForkExecutorContext{
+            .session = self.admitted.session,
+            .activation = &self.activation,
+            .plan = plan,
+            .max_turns = max_turns,
+        };
+        const result = self.admitted.runIsolated(
+            &.{invocation_record},
+            .{
+                .ctx = &executor_context,
+                .executeFn = ForkExecutorContext.execute,
+            },
+        ) catch |run_error| {
+            try self.releaseAssets();
+            return run_error;
+        };
+        try self.releaseAssets();
+        return .{ .completed = result };
+    }
+
     fn releaseAssets(self: *MaterializedSkillRun) !void {
         self.activation.deinit() catch return error.CoreError;
     }
@@ -527,6 +570,93 @@ const MaterializedSkillRun = struct {
         const completion = try self.admitted.finishWithoutConversation();
         if (cleanup_failed) return error.CoreError;
         return completion;
+    }
+};
+
+const ForkExecutorContext = struct {
+    session: *core.agent_session.AgentSession,
+    activation: *skill_activation.Activation,
+    plan: *const skill_activation.ActivationPlan,
+    max_turns: u32,
+
+    fn execute(
+        raw: *anyopaque,
+        output_allocator: std.mem.Allocator,
+        identity: core.agent_session.RunIdentity,
+        downstream: *const core.protocol.ui_backend.UiBackend,
+        abort: *const core.util_abort.AbortSignal,
+        out_final_text: *std.ArrayList(u8),
+    ) anyerror!core.agent_loop.RunResult {
+        const self: *ForkExecutorContext = @ptrCast(@alignCast(raw));
+        const mode: event_projection.Mode = switch (self.plan.context) {
+            .external_run_root => .external_run_root,
+            .model_tool => .model_tool,
+        };
+        var projector = event_projection.Projector.init(
+            output_allocator,
+            mode,
+            downstream,
+        );
+        defer projector.deinit();
+        const child_backend = projector.backend();
+        const model_override: ?[]const u8 =
+            if (self.plan.skill.definition.model.len == 0 or
+            std.mem.eql(u8, self.plan.skill.definition.model, "inherit"))
+                null
+            else
+                self.plan.skill.definition.model;
+        const host_run: ?core.agent_session.HostRunIdentity =
+            if (self.session.host_identity_ctx) |host_ctx| .{
+                .identity = identity,
+                .host_session_ctx = host_ctx,
+            } else null;
+        const child_depth = try childDepth(self.activation.parent_agent_depth);
+
+        const child = try core.subagent.spawnAgentSink(
+            output_allocator,
+            self.session.provider.provider(),
+            self.session.provider.anthropicClient(),
+            self.session.tools.definitions,
+            &self.session.permission_ctx,
+            abort,
+            self.activation.rendered_body,
+            .{
+                .max_turns = self.max_turns,
+                .system_prompt = "You are a subagent. Complete the task and return a concise final answer.\n",
+                .session = identity.session_id,
+                .agent_depth = child_depth,
+                .tool_dispatcher = self.session.tools.dispatcher(),
+                .execution_policy = self.activation.frame.executionPolicy(),
+                .host_run = host_run,
+                .ui_requester = self.session.permission_ctx.ui_requester,
+                .read_state = &self.session.read_state,
+                .jobs = if (self.session.jobs) |*jobs| jobs else null,
+                .event_projection = switch (mode) {
+                    .external_run_root => .run_root,
+                    .model_tool => .model_tool,
+                },
+                .model_override = model_override,
+                .project_dir = self.session.workspace.root,
+                .sandbox = self.session.workspace.sandbox(),
+                .cwd_abs = self.session.workspace.root,
+                .resolve_relative_paths = true,
+                .home_dir = self.session.workspace.home,
+            },
+            &child_backend,
+        );
+        defer child.deinit();
+        try projector.appendFinalText(out_final_text);
+        return .{
+            .stop_reason = child.stop_reason,
+            .turns = child.turns,
+            .tool_calls = child.tool_calls,
+        };
+    }
+
+    fn childDepth(parent: u8) error{AgentDepthExceeded}!u8 {
+        if (parent >= core.tool_context.MAX_AGENT_DEPTH)
+            return error.AgentDepthExceeded;
+        return parent + 1;
     }
 };
 
@@ -2159,5 +2289,17 @@ test "typed Skill invocation record is deterministic and JSON-safe" {
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" ++
             "\",\"invocation_name\":\"review:deep\",\"arguments\":{\"values\":[\"src/\\\"quoted\\\"\\nfile.zig\"]}}",
         encoded,
+    );
+}
+
+test "fork depth uses the shared child-agent recursion ceiling" {
+    try std.testing.expectEqual(@as(u8, 1), try ForkExecutorContext.childDepth(0));
+    try std.testing.expectEqual(
+        core.tool_context.MAX_AGENT_DEPTH,
+        try ForkExecutorContext.childDepth(core.tool_context.MAX_AGENT_DEPTH - 1),
+    );
+    try std.testing.expectError(
+        error.AgentDepthExceeded,
+        ForkExecutorContext.childDepth(core.tool_context.MAX_AGENT_DEPTH),
     );
 }

@@ -242,6 +242,42 @@ pub const LifecycleError = error{
     CallbackFailed,
 };
 
+/// Synchronous isolated execution hook used by a facade that needs a fresh
+/// child Conversation while retaining this Session's admitted Run lifecycle.
+///
+/// `out_final_text` is owned by AgentSession and starts empty. The executor
+/// appends only the final assistant text that is safe to commit to the parent
+/// Conversation. It must return only after every event producer is quiescent.
+pub const IsolatedRunExecutor = struct {
+    ctx: *anyopaque,
+    executeFn: *const fn (
+        ctx: *anyopaque,
+        allocator: std.mem.Allocator,
+        identity: RunIdentity,
+        backend: *const ui_backend.UiBackend,
+        abort: *const AbortSignal,
+        out_final_text: *std.ArrayList(u8),
+    ) anyerror!agent_loop.RunResult,
+
+    fn execute(
+        self: IsolatedRunExecutor,
+        allocator: std.mem.Allocator,
+        identity: RunIdentity,
+        backend: *const ui_backend.UiBackend,
+        abort: *const AbortSignal,
+        out_final_text: *std.ArrayList(u8),
+    ) anyerror!agent_loop.RunResult {
+        return self.executeFn(
+            self.ctx,
+            allocator,
+            identity,
+            backend,
+            abort,
+            out_final_text,
+        );
+    }
+};
+
 /// Exactly-once capability returned after Run admission but before any
 /// Conversation mutation. AgentCore uses this narrow seam to materialize a
 /// typed Skill without duplicating the Session lifecycle state machine.
@@ -309,6 +345,67 @@ pub const AdmittedRun = struct {
             max_turns,
             execution_policy,
         );
+    }
+
+    /// Run a synchronous child executor under this already-admitted Run. The
+    /// parent Conversation receives the supplied root records and, only after
+    /// successful quiescence, the executor's non-empty final assistant text.
+    /// Errors poison through the same lifecycle as the ordinary agent loop.
+    pub fn runIsolated(
+        self: *AdmittedRun,
+        root_records: []const []const u8,
+        executor: IsolatedRunExecutor,
+    ) anyerror!agent_loop.RunResult {
+        if (self.completed) return error.InvalidSessionState;
+        if (root_records.len == 0) {
+            _ = try self.finishWithoutConversation();
+            return error.InvalidSessionState;
+        }
+        try self.session.claimAdmittedRun(self.identity_value);
+        self.completed = true;
+        for (root_records) |record| {
+            self.session.conversation.appendText(.user, record) catch |err| {
+                _ = self.session.poisonRun();
+                return err;
+            };
+        }
+
+        var final_text = std.ArrayList(u8).empty;
+        defer final_text.deinit(self.session.allocator);
+        var backend = ui_backend.UiBackend{
+            .ctx = @ptrCast(self.session),
+            .emit = AgentSession.backendEmit,
+            .poll = AgentSession.backendPoll,
+        };
+        var native_result = executor.execute(
+            self.session.allocator,
+            self.identity_value,
+            &backend,
+            &self.session.abort_signal,
+            &final_text,
+        ) catch |err| {
+            const callback_failed = self.session.poisonRun();
+            if (callback_failed) return error.CallbackFailed;
+            return err;
+        };
+
+        // The executor contract guarantees event-producer quiescence here, so
+        // callback_failed cannot change between this observation and terminal.
+        if (!self.session.callbackFailed() and final_text.items.len != 0) {
+            self.session.conversation.appendText(.assistant, final_text.items) catch |err| {
+                if (native_result.suspend_info) |suspend_info| suspend_info.deinit();
+                _ = self.session.poisonRun();
+                return err;
+            };
+        }
+
+        const completion = self.session.finishRunLifecycle();
+        if (completion.callback_failed) {
+            if (native_result.suspend_info) |suspend_info| suspend_info.deinit();
+            return error.CallbackFailed;
+        }
+        if (completion.abort_requested) native_result.stop_reason = .aborted;
+        return native_result;
     }
 };
 
@@ -492,6 +589,12 @@ pub const AgentSession = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.state == .poisoned;
+    }
+
+    fn callbackFailed(self: *AgentSession) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.callback_failed;
     }
 
     /// Run one text turn while preserving Conversation across successful Runs.
@@ -1040,6 +1143,150 @@ test "AdmittedRun consumes run id without mutating Conversation" {
     );
     try std.testing.expectEqual(initial_messages, self.conversation.messages.items.len);
     try std.testing.expectError(error.StaleRun, self.admitRun(4, probe.sink()));
+}
+
+test "AdmittedRun isolated executor shares identity and commits only final assistant text" {
+    const Executor = struct {
+        seen_run_id: u64 = 0,
+        seen_session: ?SessionId = null,
+
+        fn run(
+            raw: *anyopaque,
+            allocator: std.mem.Allocator,
+            identity: RunIdentity,
+            backend: *const ui_backend.UiBackend,
+            _: *const AbortSignal,
+            out_final_text: *std.ArrayList(u8),
+        ) anyerror!agent_loop.RunResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.seen_run_id = identity.run_id;
+            self.seen_session = identity.session_id;
+            backend.emitEvent(identity.session_id, .{ .text_chunk = "provisional" });
+            backend.emitEvent(identity.session_id, .stream_done);
+            try out_final_text.appendSlice(allocator, "final");
+            return .{ .stop_reason = .end_turn, .turns = 2, .tool_calls = 1 };
+        }
+    };
+
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    var probe = SinkProbe{};
+    var executor = Executor{};
+    var admitted = try self.admitRun(7, probe.sink());
+    const result = try admitted.runIsolated(
+        &.{"invocation"},
+        .{ .ctx = &executor, .executeFn = Executor.run },
+    );
+
+    try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 2), result.turns);
+    try std.testing.expectEqual(@as(u64, 7), executor.seen_run_id);
+    try std.testing.expectEqualSlices(
+        u8,
+        self.session_id.asSlice(),
+        executor.seen_session.?.asSlice(),
+    );
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
+    try std.testing.expectEqual(@as(u64, 7), probe.run_id);
+    try std.testing.expectEqual(@as(usize, 2), self.conversation.messages.items.len);
+    try std.testing.expectEqualStrings(
+        "invocation",
+        self.conversation.messages.items[0].blocks[0].text,
+    );
+    try std.testing.expectEqualStrings(
+        "final",
+        self.conversation.messages.items[1].blocks[0].text,
+    );
+    try std.testing.expectEqual(State.idle, self.state);
+}
+
+test "AdmittedRun isolated callback failure poisons and does not commit final text" {
+    const Executor = struct {
+        fn run(
+            _: *anyopaque,
+            allocator: std.mem.Allocator,
+            identity: RunIdentity,
+            backend: *const ui_backend.UiBackend,
+            _: *const AbortSignal,
+            out_final_text: *std.ArrayList(u8),
+        ) anyerror!agent_loop.RunResult {
+            backend.emitEvent(identity.session_id, .{ .text_chunk = "rejected" });
+            try out_final_text.appendSlice(allocator, "must-not-commit");
+            return .{ .stop_reason = .aborted, .turns = 1, .tool_calls = 0 };
+        }
+    };
+
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    var probe = SinkProbe{ .accept = false };
+    var executor: u8 = 0;
+    var admitted = try self.admitRun(9, probe.sink());
+    try std.testing.expectError(
+        error.CallbackFailed,
+        admitted.runIsolated(
+            &.{"invocation"},
+            .{ .ctx = &executor, .executeFn = Executor.run },
+        ),
+    );
+
+    try std.testing.expect(self.isPoisoned());
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(@as(usize, 1), self.conversation.messages.items.len);
+    try std.testing.expectEqualStrings(
+        "invocation",
+        self.conversation.messages.items[0].blocks[0].text,
+    );
+}
+
+test "AdmittedRun isolated executor shares outer abort and closes cleanly" {
+    const Executor = struct {
+        session: *AgentSession,
+
+        fn run(
+            raw: *anyopaque,
+            allocator: std.mem.Allocator,
+            identity: RunIdentity,
+            _: *const ui_backend.UiBackend,
+            abort: *const AbortSignal,
+            out_final_text: *std.ArrayList(u8),
+        ) anyerror!agent_loop.RunResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.session.abort(identity.run_id, .timeout);
+            try std.testing.expect(abort.isAborted());
+            try out_final_text.appendSlice(allocator, "closed-before-abort");
+            return .{ .stop_reason = .end_turn, .turns = 1, .tool_calls = 0 };
+        }
+    };
+
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    var probe = SinkProbe{};
+    var executor = Executor{ .session = self };
+    var admitted = try self.admitRun(11, probe.sink());
+    const result = try admitted.runIsolated(
+        &.{"invocation"},
+        .{ .ctx = &executor, .executeFn = Executor.run },
+    );
+
+    try std.testing.expectEqual(agent_loop.StopReason.aborted, result.stop_reason);
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expectEqual(@as(usize, 2), self.conversation.messages.items.len);
+    try std.testing.expectEqualStrings(
+        "closed-before-abort",
+        self.conversation.messages.items[1].blocks[0].text,
+    );
 }
 
 test "AgentSession abort is run-scoped, idempotent and reports late requests" {

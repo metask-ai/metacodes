@@ -25,8 +25,8 @@ const filter_mod = @import("../agents/filter.zig");
 
 /// 最深嵌套层数。parent=0,孙=2;>= 这个值就拒绝 spawn。
 /// 嵌套 subagent 是允许的(子 agent 也能调 Task),但深度有限保护栈。
-/// pub:skills/tool.zig 的 context:fork 分支复用同一深度上限。
-pub const MAX_AGENT_DEPTH: u8 = 3;
+/// pub:skills/tool.zig 和 AgentCore fork 复用同一中立上限。
+pub const MAX_AGENT_DEPTH = @import("context.zig").MAX_AGENT_DEPTH;
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     // Precondition: depth guard

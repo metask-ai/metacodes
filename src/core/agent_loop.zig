@@ -33,6 +33,62 @@ const CoreEvent = ui_event.CoreEvent;
 
 pub const StopReason = enum { end_turn, max_turns, aborted, tool_error, api_error, tool_loop, suspended, backgrounded, budget };
 
+/// Event capture is independent of execution depth. The default preserves the
+/// existing CLI/UI card behavior. Both AgentCore modes emit the complete raw
+/// semantic stream into the facade's private projector without pretending that
+/// a real child is depth zero; that projector alone decides which events become
+/// public. In particular, model-tool boundaries must remain observable there
+/// for final-text reconstruction even though they are hidden from the Host.
+pub const EventProjection = enum {
+    legacy,
+    run_root,
+    model_tool,
+
+    fn emitToolStart(self: EventProjection, emit_tool_cards: bool, agent_depth: u8) bool {
+        return switch (self) {
+            .legacy => emit_tool_cards and agent_depth == 0,
+            .run_root, .model_tool => true,
+        };
+    }
+
+    fn emitToolResult(self: EventProjection, emit_tool_cards: bool) bool {
+        return switch (self) {
+            .legacy => emit_tool_cards,
+            .run_root, .model_tool => true,
+        };
+    }
+
+    fn emitToolProgress(self: EventProjection, agent_depth: u8) bool {
+        return switch (self) {
+            .legacy => agent_depth == 0,
+            .run_root, .model_tool => true,
+        };
+    }
+
+    fn allowUiRequests(self: EventProjection, agent_depth: u8) bool {
+        return switch (self) {
+            .legacy => agent_depth == 0,
+            .run_root, .model_tool => true,
+        };
+    }
+};
+
+test "EventProjection is orthogonal to true agent depth and preserves legacy defaults" {
+    try std.testing.expect(EventProjection.legacy.emitToolStart(true, 0));
+    try std.testing.expect(!EventProjection.legacy.emitToolStart(true, 1));
+    try std.testing.expect(EventProjection.legacy.emitToolResult(true));
+    try std.testing.expect(!EventProjection.legacy.emitToolResult(false));
+
+    try std.testing.expect(EventProjection.run_root.emitToolStart(false, 7));
+    try std.testing.expect(EventProjection.run_root.emitToolResult(false));
+    try std.testing.expect(EventProjection.run_root.emitToolProgress(7));
+    try std.testing.expect(EventProjection.run_root.allowUiRequests(7));
+    try std.testing.expect(EventProjection.model_tool.emitToolStart(false, 7));
+    try std.testing.expect(EventProjection.model_tool.emitToolResult(false));
+    try std.testing.expect(EventProjection.model_tool.emitToolProgress(7));
+    try std.testing.expect(EventProjection.model_tool.allowUiRequests(7));
+}
+
 /// 工具进度 trampoline:把工具的 progress 回调(WebSearch query/results)转成 CoreEvent,
 /// 经 backend 路由到归属 session 的 UI。per-run 实例(backend + session),progress_state 指它。
 ///
@@ -327,6 +383,10 @@ pub const Options = struct {
     /// false(headless/单测)→ 不 emit 工具卡事件,保持纯净输出。
     /// (原 tool_render_theme: ?*const Theme,只当存在标志用;为解 core→UI 类型依赖降为 bool。)
     emit_tool_cards: bool = false,
+    /// Raw semantic-event capture for forked executions. `.legacy` keeps all
+    /// existing callers byte-for-byte compatible; AgentCore's private adapter
+    /// performs the actual public projection.
+    event_projection: EventProjection = .legacy,
     /// 子进程长命令"仍在运行"心跳回调(per-session,传给 ToolContext.spawn_tick_fn → spawn 层)。
     /// 重构前是 tools/common.zig 进程全局 g_progress_cb。REPL tty 下 loop.zig 设;headless=null。
     spawn_tick_fn: ?*const fn (elapsed_ms: u64, argv0: []const u8) void = null,
@@ -1161,13 +1221,15 @@ pub fn run(
 
         // 工具执行期 progress 通路(对齐 cc onProgress):把 WebSearch 子请求的
         // query_update/results_received 格式化成第二行文本,经 backend.emit(.tool_progress) 喂 UI。
-        // depth==0 才接(子 agent 不驱动顶层 TUI)。WriterBackend 的 tool_progress no-op → 无害,
-        // 故去掉旧 @hasDecl 探测。
-        if (opts.agent_depth == 0) {
+        // Legacy UI only wires depth zero. AgentCore captures progress from
+        // real children too; its private projector suppresses model-tool
+        // internals before they reach the Host.
+        if (opts.event_projection.emitToolProgress(opts.agent_depth)) {
             progress_tramp = .{ .be = backend, .session = sess };
             base_ctx.progress_reporter = .{ .ctx = @ptrCast(&progress_tramp), .reportFn = &ProgressTramp.cb };
-            // U6 A2:同 depth==0 注入 agent_lifecycle/tasks_changed 通知通路。子 agent 不驱动顶层
-            // UI(WebBackend/TuiBackend 对这俩事件 journal/no-op,子 agent 发也无害但语义上父级才广播)。
+        }
+        if (opts.agent_depth == 0) {
+            // U6 A2:only the real root injects agent_lifecycle/tasks_changed.
             event_tramp = .{ .be = backend, .session = sess };
             base_ctx.event_reporter = .{
                 .ctx = @ptrCast(&event_tramp),
@@ -1176,9 +1238,11 @@ pub fn run(
             };
         }
 
-        // 统一 UI 请求回调(AskUserQuestion/权限/plan 审批共用):仅顶层 TUI(depth==0)接——
-        // 子 agent 无 tty,工具按语义兜底(ask→NotATty;plan→answer_queue/reject)。
-        if (opts.ui_requester != null and opts.agent_depth == 0) {
+        // Legacy subagents have no terminal UI. AgentCore explicit projections
+        // reuse the outer Run's UI bridge and identity without faking depth.
+        if (opts.ui_requester != null and
+            opts.event_projection.allowUiRequests(opts.agent_depth))
+        {
             base_ctx.ui_requester = opts.ui_requester;
         }
         // 子进程心跳(Bash 长命令"仍在运行")per-session 通路:从 opts 透传到 ctx → spawn 层。
@@ -1190,7 +1254,7 @@ pub fn run(
         // **渲染决策(showStartCard/hasProgressCard/喂 spinner)全在 backend**——agent_loop
         // 不再 import tool_card UI widget(层泄漏修复)。headless/subagent(depth>0)/无 theme
         // 时 tool_render_theme=null → 不 emit(那些场景 WriterBackend 也 no-op)。
-        if (opts.emit_tool_cards and opts.agent_depth == 0) {
+        if (opts.event_projection.emitToolStart(opts.emit_tool_cards, opts.agent_depth)) {
             for (slots.items) |*s| {
                 if (s.decision != .run) continue;
                 backend.emitEvent(sess, .{ .tool_start = .{ .id = s.id, .name = s.name, .input = s.input } });
@@ -1217,7 +1281,7 @@ pub fn run(
         // Host 工具 fatal → 直接上抛:不组装 tool_result(errdefer 释放 result_blocks,
         // slot payload 由上方 defer 回收),AgentSession.runLoop 捕获后 poisonRun。
         try tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
-        if (opts.emit_tool_cards and opts.agent_depth == 0) {
+        if (opts.event_projection.emitToolStart(opts.emit_tool_cards, opts.agent_depth)) {
             // P2.1:只发 clear_current_tool 清运行态动态卡。**不再**为每个 slot 补发一条空 content
             // 的 tool_result——那是历史"双发",逼每个 backend 靠 content.len>0 去重(tui gate / web JS dedup /
             // WebSearch 靠真 emit 也会 clearToolCard)。真结果由下方每 slot 的单条 tool_result(真 content)
@@ -1356,7 +1420,7 @@ pub fn run(
             // 实时工具卡渲染(REPL):把结果经 backend 渲染到屏幕——Edit/Write diff 着色、
             // Grep/Glob 摘要、Read 摘要。headless/单测 tool_render_theme=null → 跳过(emit 仍发,
             // 但那些场景用 WriterBackend,tool_result no-op)。渲染移入 backend(renderResult)。
-            if (opts.emit_tool_cards) {
+            if (opts.event_projection.emitToolResult(opts.emit_tool_cards)) {
                 backend.emitEvent(sess, .{ .tool_result = .{
                     .id = s.id,
                     .name = s.name,

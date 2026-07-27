@@ -21,6 +21,7 @@ const Conversation = @import("conversation.zig").Conversation;
 const msg = @import("message.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const TaskStore = @import("task_store.zig").TaskStore;
+const SessionId = @import("session_id.zig").SessionId;
 
 pub const SubagentResult = struct {
     allocator: std.mem.Allocator,
@@ -41,6 +42,9 @@ pub const SubagentResult = struct {
 pub const SpawnOptions = struct {
     max_turns: u32 = 20,
     system_prompt: ?[]const u8 = null,
+    /// UI/event routing identity. It is deliberately separate from
+    /// `agent_ident`, which remains the child's coordination identity.
+    session: @import("session_id.zig").SessionId = .single,
     /// 嵌套深度。Agent 工具 spawn 时传 parent_depth+1。
     agent_depth: u8 = 1,
     /// 父 agent 的 dyn_registry，子 agent 共享同一套 Skill/MCP 工具。
@@ -56,6 +60,17 @@ pub const SpawnOptions = struct {
     /// 父 dispatch 传过来的宿主能力(L5)。subagent 通常只用 skill 激活(调用方传 skillOnly 投影);
     /// 见 HostServices.skillOnly。
     host_services: ?@import("../tools/context.zig").HostServices = null,
+    /// Optional Session-owned dispatch and immutable execution bound.
+    tool_dispatcher: ?@import("../tools/context.zig").ToolDispatcher = null,
+    execution_policy: ?@import("../tools/context.zig").ToolExecutionPolicy = null,
+    host_run: ?@import("../tools/context.zig").HostRunIdentity = null,
+    ui_requester: ?@import("protocol/ui_request.zig").UiRequester = null,
+    read_state: ?*@import("read_state.zig").ReadState = null,
+    jobs: ?*@import("job_registry.zig").JobRegistry = null,
+    /// Explicit raw-event capture for AgentCore fork children. The facade's
+    /// private projector performs public filtering. The default retains the
+    /// existing CLI/headless behavior.
+    event_projection: agent_loop.EventProjection = .legacy,
     project_dir: []const u8 = "",
     /// 后台 subagent registry(允许嵌套后台:子 agent 也能 Task(run_in_background)注册进同一 root)。
     /// null = 子 agent 不能再开后台(同步路径恒 null)。
@@ -78,6 +93,7 @@ pub const SpawnOptions = struct {
     /// 默认 null/空 = 无 sandbox(与 agent_loop.Options 默认一致)。
     sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
     cwd_abs: []const u8 = "",
+    resolve_relative_paths: bool = false,
     home_dir: []const u8 = "",
     additional_dirs: []const []const u8 = &.{},
 };
@@ -144,14 +160,22 @@ pub fn spawnAgentSink(
         .{
             .max_turns = opts.max_turns,
             .system_prompt = opts.system_prompt,
+            .session = opts.session,
             .abort = abort,
             .api_client = anthropic_client,
             .tool_defs = effective_tool_defs,
             .agent_depth = opts.agent_depth,
             .dyn_registry = opts.dyn_registry,
+            .tool_dispatcher = opts.tool_dispatcher,
+            .execution_policy = opts.execution_policy,
             .host_services = opts.host_services,
+            .host_run = opts.host_run,
+            .ui_requester = opts.ui_requester,
+            .read_state = opts.read_state,
+            .jobs = opts.jobs,
             .agent_jobs = opts.agent_jobs,
             .project_dir = opts.project_dir,
+            .session_id = opts.session.asSlice(),
             .model_override = opts.model_override,
             .tasks = &sub_tasks,
             .kg = opts.kg,
@@ -161,9 +185,11 @@ pub fn spawnAgentSink(
             // 后台 subagent 不应往父 stdout 喷 ANSI 着色(final_text/output 会混入 \x1b[32m)。
             // sink 是 NullWriter(同步)或 SinkWriter(后台)时都非交互终端 → 关着色。
             .colorize = false,
+            .event_projection = opts.event_projection,
             // task#12:sandbox 透传——subagent Bash 继承父 sandbox(否则绕过用户配置的后门)。
             .sandbox = opts.sandbox,
             .cwd_abs = opts.cwd_abs,
+            .resolve_relative_paths = opts.resolve_relative_paths,
             .home_dir = opts.home_dir,
             .additional_dirs = opts.additional_dirs,
         },
@@ -215,4 +241,8 @@ test "SpawnOptions defaults" {
     const o = SpawnOptions{};
     try testing.expect(o.max_turns == 20);
     try testing.expect(o.system_prompt == null);
+    try testing.expectEqualSlices(u8, SessionId.single.asSlice(), o.session.asSlice());
+    try testing.expect(o.event_projection == .legacy);
+    try testing.expect(o.execution_policy == null);
+    try testing.expect(o.tool_dispatcher == null);
 }

@@ -55,6 +55,7 @@ pub const ExecuteOptions = struct {
     cwd_abs: []const u8,
     home_dir: []const u8,
     additional_dirs: []const []const u8 = &.{},
+    parent_agent_depth: u8 = 0,
 };
 
 /// Owned result of the one canonical activation kernel. External typed input
@@ -65,6 +66,7 @@ pub const Activation = struct {
     tree: materialization.WorkingTree,
     frame: *policy_frame.PolicyFrame,
     rendered_body: []u8,
+    parent_agent_depth: u8,
 
     pub fn deinit(self: *Activation) materialization.Error!void {
         const owner_allocator = self.owner_allocator;
@@ -97,6 +99,10 @@ pub fn prepare(
     const skill = snapshot.findById(skill_id) orelse return error.SkillNotFound;
     if (context == .model_tool and skill.definition.disable_model_invocation)
         return error.PolicyViolation;
+    // Revision 4 has no AgentDef catalog or profile-binding contract. Accepting
+    // this metadata and silently using the generic fork prompt would claim a
+    // capability the formal ABI cannot provide.
+    if (skill.definition.agent.len != 0) return error.SkillUnavailable;
     policy_frame.validateRules(
         skill.definition.allowed_tools,
         skill.definition.disallowed_tools,
@@ -170,6 +176,7 @@ pub fn activate(
         .tree = tree,
         .frame = frame,
         .rendered_body = rendered,
+        .parent_agent_depth = options.parent_agent_depth,
     };
 }
 
@@ -535,6 +542,26 @@ test "model-only admission guard does not block explicit external invocation" {
         .external_run_root,
     );
     defer external.deinit();
+}
+
+test "agent profile metadata fails closed when AgentCore has no AgentDef catalog" {
+    var fixture = TestFixture.init("Review.", "bash");
+    defer fixture.deinit();
+    fixture.records[0].definition.agent = "reviewer";
+    fixture.bind();
+
+    try std.testing.expectError(
+        error.SkillUnavailable,
+        prepare(
+            std.testing.allocator,
+            &fixture.snapshot,
+            &fixture.snapshot.revision,
+            &fixture.records[0].skill_id,
+            "{\"values\":[]}",
+            .sandboxed,
+            .external_run_root,
+        ),
+    );
 }
 
 test "model-tool and external callers share activation kernel and parent lineage" {
