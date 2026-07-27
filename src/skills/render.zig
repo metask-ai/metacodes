@@ -466,7 +466,7 @@ fn runInjection(allocator: std.mem.Allocator, cmd: []const u8, opts: RenderOptio
     }
     // 沙箱包裹（task#25:防 Write→SKILL.md→activate 自造 skill 经注入 shell 逃逸沙箱）。
     // 复用 Bash/Monitor 同款 wrapAsShellString 范式:enabled → sandbox-exec 包;
-    // SandboxUnavailable → **拒跑**（绝不降级裸跑）;其它 error（profile 写失败）→ passthrough。
+    // 任一 sandbox 包裹失败都必须拒跑，绝不降级为原始命令。
     var sandbox_wrap: ?@import("../sandbox/exec.zig").ShellWrap = null;
     defer if (sandbox_wrap) |*sw| sw.deinit();
     const eff_cmd: []const u8 = blk: {
@@ -480,10 +480,9 @@ fn runInjection(allocator: std.mem.Allocator, cmd: []const u8, opts: RenderOptio
             .sandbox = sb,
             .additional_dirs = opts.additional_dirs,
             .disable_for_this_command = false, // skill 注入无 readonly 豁免:enabled 恒包
-        }) catch |e| {
-            if (e == error.SandboxUnavailable)
-                return try allocator.dupe(u8, "[skill shell blocked: sandbox unavailable]");
-            break :blk cmd; // profile 写失败等 → passthrough
+        }) catch |err| {
+            log.warn("skill.inject", "sandbox setup failed: {s}", .{@errorName(err)});
+            return try allocator.dupe(u8, "[skill shell blocked: sandbox setup failed]");
         };
         if (maybe) |sw| {
             sandbox_wrap = sw;
@@ -659,6 +658,28 @@ test "inject: sandbox 开 → cwd 外写被拦(task#25:Write→SKILL.md→activa
     // sandbox 开 → touch 被 sandbox-exec 拦 → 文件不存在。
     // **toggle-verify**:去掉 runInjection 的 wrap(直投 raw cmd)→ touch 不受限 → 文件被创建 → 测试红。
     try testing.expect(!pfs.exists(escape_z));
+}
+
+test "inject: unavailable sandbox never falls back to the raw command" {
+    if (@import("builtin").os.tag == .macos) return error.SkipZigTest;
+    const SandboxSettings = @import("../sandbox/config.zig").SandboxSettings;
+    const sandbox = SandboxSettings{
+        .enabled = true,
+        .fail_if_unavailable = true,
+    };
+    const rendered = try renderBody(
+        testing.allocator,
+        "!`printf RAW_COMMAND_MUST_NOT_RUN`",
+        .{
+            .sandbox = &sandbox,
+            .cwd_abs = ".",
+        },
+    );
+    defer testing.allocator.free(rendered);
+    try testing.expectEqualStrings(
+        "[skill shell blocked: sandbox setup failed]",
+        rendered,
+    );
 }
 
 test "inject: mid-line after letter is NOT recognized (KEY=!`cmd`)" {

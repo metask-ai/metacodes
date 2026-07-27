@@ -33,6 +33,7 @@ const find_symbol_tool = @import("tools/find_symbol.zig");
 pub const ToolContext = @import("tools/context.zig").ToolContext;
 pub const ToolDispatcher = @import("tools/context.zig").ToolDispatcher;
 pub const ToolDispatchOutcome = @import("tools/context.zig").ToolDispatchOutcome;
+pub const ToolExecutionPolicy = @import("tools/context.zig").ToolExecutionPolicy;
 pub const RunIdentity = @import("tools/context.zig").RunIdentity;
 pub const HostRunIdentity = @import("tools/context.zig").HostRunIdentity;
 pub const HostServices = @import("tools/context.zig").HostServices;

@@ -6,6 +6,8 @@
 
 const std = @import("std");
 const catalog = @import("skill_catalog.zig");
+const materialization = @import("skill_materialization.zig");
+const policy_frame = @import("policy_frame.zig");
 const core = @import("metacodes-core");
 const workspace = core.workspace_policy;
 
@@ -24,15 +26,54 @@ pub const PrepareError = error{
     SkillUnavailable,
 };
 
+pub const Context = enum {
+    external_run_root,
+    model_tool,
+};
+
 pub const ActivationPlan = struct {
     arena: std.heap.ArenaAllocator,
     snapshot: *const catalog.Snapshot,
     skill: *const catalog.SkillRecord,
     arguments: []const []const u8,
     requires_shell: bool,
+    context: Context,
 
     pub fn deinit(self: *ActivationPlan) void {
         self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const ExecuteOptions = struct {
+    materializations: *materialization.Manager,
+    parent_frame: *policy_frame.PolicyFrame,
+    abort: *const core.util_abort.AbortSignal,
+    project_dir: []const u8,
+    session_id: []const u8,
+    sandbox: ?*const core.sandbox_config.SandboxSettings,
+    cwd_abs: []const u8,
+    home_dir: []const u8,
+    additional_dirs: []const []const u8 = &.{},
+};
+
+/// Owned result of the one canonical activation kernel. External typed input
+/// and model-tool invocation both prepare the same immutable plan and enter
+/// here after their respective admission boundary.
+pub const Activation = struct {
+    owner_allocator: std.mem.Allocator,
+    tree: materialization.WorkingTree,
+    frame: *policy_frame.PolicyFrame,
+    rendered_body: []u8,
+
+    pub fn deinit(self: *Activation) materialization.Error!void {
+        const owner_allocator = self.owner_allocator;
+        owner_allocator.free(self.rendered_body);
+        self.frame.release();
+        self.tree.deinit() catch |err| {
+            self.* = undefined;
+            return err;
+        };
         self.* = undefined;
     }
 };
@@ -44,6 +85,7 @@ pub fn prepare(
     skill_id: []const u8,
     arguments_json: []const u8,
     shell_policy: workspace.ShellPolicy,
+    context: Context,
 ) PrepareError!ActivationPlan {
     var arena = std.heap.ArenaAllocator.init(owner_allocator);
     errdefer arena.deinit();
@@ -53,6 +95,12 @@ pub fn prepare(
     if (!std.mem.eql(u8, &snapshot.revision, catalog_revision)) return error.StaleCatalog;
     if (!catalog.isLowerHex64(skill_id)) return error.InvalidSkillId;
     const skill = snapshot.findById(skill_id) orelse return error.SkillNotFound;
+    if (context == .model_tool and skill.definition.disable_model_invocation)
+        return error.PolicyViolation;
+    policy_frame.validateRules(
+        skill.definition.allowed_tools,
+        skill.definition.disallowed_tools,
+    ) catch return error.PolicyViolation;
 
     const requires_shell = core.skills_render.hasShellInjection(skill.definition.body);
 
@@ -66,6 +114,62 @@ pub fn prepare(
         .skill = skill,
         .arguments = arguments,
         .requires_shell = requires_shell,
+        .context = context,
+    };
+}
+
+pub fn activate(
+    owner_allocator: std.mem.Allocator,
+    plan: *const ActivationPlan,
+    options: ExecuteOptions,
+) anyerror!Activation {
+    var tree = try options.materializations.materialize(
+        plan.skill,
+        options.abort,
+    );
+    const frame = policy_frame.PolicyFrame.derive(
+        options.parent_frame,
+        plan.skill.definition.allowed_tools,
+        plan.skill.definition.disallowed_tools,
+    ) catch |frame_error| {
+        tree.deinit() catch return error.CoreError;
+        return frame_error;
+    };
+
+    const rendered = core.skills_render.renderBody(
+        owner_allocator,
+        plan.skill.definition.body,
+        .{
+            .arguments = plan.arguments,
+            .arg_names = plan.skill.definition.arguments,
+            .skill_dir = tree.path,
+            .project_dir = options.project_dir,
+            .session_id = options.session_id,
+            .shell = plan.skill.definition.shell,
+            .disable_shell_execution = frame.shellPolicy() == .disabled,
+            .abort = options.abort,
+            .sandbox = options.sandbox,
+            .cwd_abs = options.cwd_abs,
+            .home_dir = options.home_dir,
+            .additional_dirs = options.additional_dirs,
+        },
+    ) catch |render_error| {
+        frame.release();
+        tree.deinit() catch return error.CoreError;
+        return render_error;
+    };
+    options.abort.throwIfAborted() catch |abort_error| {
+        owner_allocator.free(rendered);
+        frame.release();
+        tree.deinit() catch return error.CoreError;
+        return abort_error;
+    };
+
+    return .{
+        .owner_allocator = owner_allocator,
+        .tree = tree,
+        .frame = frame,
+        .rendered_body = rendered,
     };
 }
 
@@ -164,6 +268,7 @@ test "ActivationPlan owns canonical typed arguments and retains immutable identi
         &fixture.records[0].skill_id,
         "{\"values\":[\"src/main.zig\",\"deep\"]}",
         .disabled,
+        .external_run_root,
     );
     defer plan.deinit();
 
@@ -187,6 +292,7 @@ test "ActivationPlan rejects identity and revision failures before argument allo
         &fixture.records[0].skill_id,
         "",
         .disabled,
+        .external_run_root,
     ));
     try std.testing.expectError(error.StaleCatalog, prepare(
         std.testing.allocator,
@@ -195,6 +301,7 @@ test "ActivationPlan rejects identity and revision failures before argument allo
         &fixture.records[0].skill_id,
         "",
         .disabled,
+        .external_run_root,
     ));
     try std.testing.expectError(error.InvalidSkillId, prepare(
         std.testing.allocator,
@@ -203,6 +310,7 @@ test "ActivationPlan rejects identity and revision failures before argument allo
         "not-an-id",
         "",
         .disabled,
+        .external_run_root,
     ));
     try std.testing.expectError(error.SkillNotFound, prepare(
         std.testing.allocator,
@@ -211,6 +319,7 @@ test "ActivationPlan rejects identity and revision failures before argument allo
         &([_]u8{'d'} ** 64),
         "",
         .disabled,
+        .external_run_root,
     ));
 }
 
@@ -229,6 +338,7 @@ test "argument bounds and decoding precede catalog identity checks" {
         "not-an-id",
         too_large,
         .disabled,
+        .external_run_root,
     ));
     try std.testing.expectError(error.InvalidArguments, prepare(
         std.testing.allocator,
@@ -237,6 +347,7 @@ test "argument bounds and decoding precede catalog identity checks" {
         "not-an-id",
         &[_]u8{0xff},
         .disabled,
+        .external_run_root,
     ));
 }
 
@@ -261,6 +372,7 @@ test "Skill arguments enforce the exact bounded wire schema" {
             &fixture.records[0].skill_id,
             encoded,
             .disabled,
+            .external_run_root,
         ));
     }
 
@@ -274,6 +386,7 @@ test "Skill arguments enforce the exact bounded wire schema" {
         &fixture.records[0].skill_id,
         too_large,
         .disabled,
+        .external_run_root,
     ));
 
     var writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
@@ -291,6 +404,7 @@ test "Skill arguments enforce the exact bounded wire schema" {
         &fixture.records[0].skill_id,
         writer.written(),
         .disabled,
+        .external_run_root,
     ));
 }
 
@@ -320,6 +434,7 @@ test "shell injection admission exactly follows renderer recognition" {
                 &fixture.records[0].skill_id,
                 "",
                 .disabled,
+                .external_run_root,
             ));
             var allowed = try prepare(
                 std.testing.allocator,
@@ -328,6 +443,7 @@ test "shell injection admission exactly follows renderer recognition" {
                 &fixture.records[0].skill_id,
                 "",
                 .sandboxed,
+                .external_run_root,
             );
             defer allowed.deinit();
             try std.testing.expect(allowed.requires_shell);
@@ -339,6 +455,7 @@ test "shell injection admission exactly follows renderer recognition" {
                 &fixture.records[0].skill_id,
                 "",
                 .disabled,
+                .external_run_root,
             );
             defer plan.deinit();
             try std.testing.expect(!plan.requires_shell);
@@ -357,6 +474,7 @@ test "powershell is unavailable only when the Skill requires shell execution" {
         &executable.records[0].skill_id,
         "",
         .unrestricted,
+        .external_run_root,
     ));
 
     var inert = TestFixture.init("Explain PowerShell.", "powershell");
@@ -369,7 +487,117 @@ test "powershell is unavailable only when the Skill requires shell execution" {
         &inert.records[0].skill_id,
         "",
         .disabled,
+        .external_run_root,
     );
     defer plan.deinit();
     try std.testing.expect(!plan.requires_shell);
+}
+
+test "malformed tool policy is rejected before Run admission" {
+    var fixture = TestFixture.init("Review.", "bash");
+    defer fixture.deinit();
+    fixture.records[0].definition.allowed_tools = &.{"Bash("};
+    fixture.bind();
+
+    try std.testing.expectError(error.PolicyViolation, prepare(
+        std.testing.allocator,
+        &fixture.snapshot,
+        &fixture.snapshot.revision,
+        &fixture.records[0].skill_id,
+        "",
+        .unrestricted,
+        .external_run_root,
+    ));
+}
+
+test "model-only admission guard does not block explicit external invocation" {
+    var fixture = TestFixture.init("Review.", "bash");
+    defer fixture.deinit();
+    fixture.records[0].definition.disable_model_invocation = true;
+    fixture.bind();
+
+    try std.testing.expectError(error.PolicyViolation, prepare(
+        std.testing.allocator,
+        &fixture.snapshot,
+        &fixture.snapshot.revision,
+        &fixture.records[0].skill_id,
+        "",
+        .disabled,
+        .model_tool,
+    ));
+    var external = try prepare(
+        std.testing.allocator,
+        &fixture.snapshot,
+        &fixture.snapshot.revision,
+        &fixture.records[0].skill_id,
+        "",
+        .disabled,
+        .external_run_root,
+    );
+    defer external.deinit();
+}
+
+test "model-tool and external callers share activation kernel and parent lineage" {
+    var fixture = TestFixture.init("Review $target.", "bash");
+    defer fixture.deinit();
+    fixture.records[0].definition.arguments = &.{"target"};
+    fixture.records[0].definition.allowed_tools = &.{ "Read", "Write" };
+    fixture.bind();
+
+    var plan = try prepare(
+        std.testing.allocator,
+        &fixture.snapshot,
+        &fixture.snapshot.revision,
+        &fixture.records[0].skill_id,
+        "{\"values\":[\"src/main.zig\"]}",
+        .disabled,
+        .model_tool,
+    );
+    defer plan.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const root_path = root_buffer[0..root_len];
+
+    var manager = try materialization.Manager.init(std.testing.allocator);
+    defer manager.deinit() catch unreachable;
+    const root_frame = try policy_frame.PolicyFrame.createRoot(
+        std.testing.allocator,
+        &.{ "Read", "Write" },
+        .disabled,
+        .default,
+        .{ .cwd = root_path, .project_root = root_path, .home = root_path },
+    );
+    defer root_frame.release();
+    const parent_frame = try policy_frame.PolicyFrame.derive(
+        root_frame,
+        &.{"Read"},
+        &.{},
+    );
+    defer parent_frame.release();
+    var abort = core.util_abort.AbortSignal.init();
+
+    {
+        var activated = try activate(std.testing.allocator, &plan, .{
+            .materializations = &manager,
+            .parent_frame = parent_frame,
+            .abort = &abort,
+            .project_dir = root_path,
+            .session_id = "session",
+            .sandbox = null,
+            .cwd_abs = root_path,
+            .home_dir = root_path,
+        });
+        defer activated.deinit() catch unreachable;
+        try std.testing.expect(activated.frame.parent() == parent_frame);
+        try std.testing.expect(activated.frame.allowsInvocation("Read", "{}"));
+        try std.testing.expect(!activated.frame.allowsInvocation("Write", "{}"));
+        try std.testing.expectEqualStrings(
+            "Review src/main.zig.\nARGUMENTS: src/main.zig\n",
+            activated.rendered_body,
+        );
+    }
+    try std.testing.expectEqual(@as(usize, 0), manager.active_count);
 }

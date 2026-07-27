@@ -164,6 +164,9 @@ const AbiSession = struct {
     runtime: ?*AbiRuntime = null,
     workspace_scope_id: [64]u8 = [_]u8{0} ** 64,
     skill_catalog_cell: ?*skill_catalog_handles.CatalogCell = null,
+    /// Null only in narrow unit-test fakes. Every live Session created through
+    /// the ABI owns exactly one immutable baseline frame.
+    policy_root: ?*policy_frame.PolicyFrame = null,
     host_permission_rules: HostPermissionRules = .{},
     call_mutex: sync.Mutex = .{},
     call_state: CallState = .idle,
@@ -367,6 +370,46 @@ const AbiSession = struct {
         if (previous) |cell| runtime.catalogs.releaseSession(cell);
     }
 
+    /// Internal typed-Skill entry used by the Revision 4 public input union.
+    /// All validation before `admitMaterializedSkill` is side-effect free.
+    fn runInlineSkill(
+        self: *AbiSession,
+        materializations: *skill_materialization.Manager,
+        run_id: u64,
+        catalog_revision: []const u8,
+        skill_id: []const u8,
+        arguments_json: []const u8,
+        max_turns: u32,
+    ) anyerror!InlineSkillExecution {
+        const cell = self.skill_catalog_cell orelse
+            return error.SkillCatalogNotBound;
+        const root_frame = self.policy_root orelse
+            return error.InvalidSessionState;
+        var plan = try skill_activation.prepare(
+            allocator,
+            cell.snapshot,
+            catalog_revision,
+            skill_id,
+            arguments_json,
+            root_frame.shellPolicy(),
+            .external_run_root,
+        );
+        defer plan.deinit();
+
+        return switch (try self.admitMaterializedSkill(
+            materializations,
+            run_id,
+            &plan,
+            root_frame,
+        )) {
+            .aborted => .aborted,
+            .ready => |ready_value| blk: {
+                var ready = ready_value;
+                break :blk try ready.executeInline(&plan, max_turns);
+            },
+        };
+    }
+
     /// Caller holds the facade Run gate and Runtime active-call guard. Pure
     /// ActivationPlan validation has already completed before this admitted
     /// boundary.
@@ -374,25 +417,32 @@ const AbiSession = struct {
         self: *AbiSession,
         materializations: *skill_materialization.Manager,
         run_id: u64,
-        record: *const skill_catalog.SkillRecord,
+        plan: *const skill_activation.ActivationPlan,
+        parent_frame: *policy_frame.PolicyFrame,
     ) anyerror!SkillAdmission {
         var admitted = try self.core_session.admitRun(
             run_id,
             .{ .ctx = self, .emit = AbiSession.emit },
         );
-        var tree = materializations.materialize(
-            record,
-            admitted.abortSignal(),
-        ) catch |materialize_error| {
+        var activation = skill_activation.activate(allocator, plan, .{
+            .materializations = materializations,
+            .parent_frame = parent_frame,
+            .abort = admitted.abortSignal(),
+            .project_dir = self.core_session.workspace.root,
+            .session_id = admitted.identity().session_id.asSlice(),
+            .sandbox = self.core_session.workspace.sandbox(),
+            .cwd_abs = self.core_session.workspace.root,
+            .home_dir = self.core_session.workspace.home,
+        }) catch |activation_error| {
             const completion = try admitted.finishWithoutConversation();
-            if (materialize_error != error.OutOfMemory and
-                (materialize_error == error.Aborted or completion.aborted))
+            if (activation_error != error.OutOfMemory and
+                (activation_error == error.Aborted or completion.aborted))
                 return .aborted;
-            return materialize_error;
+            return activation_error;
         };
         if (admitted.abortSignal().isAborted()) {
             var cleanup_failed = false;
-            tree.deinit() catch {
+            activation.deinit() catch {
                 cleanup_failed = true;
             };
             _ = try admitted.finishWithoutConversation();
@@ -401,7 +451,7 @@ const AbiSession = struct {
         }
         return .{ .ready = .{
             .admitted = admitted,
-            .tree = tree,
+            .activation = activation,
         } };
     }
 };
@@ -411,9 +461,59 @@ const SkillAdmission = union(enum) {
     ready: MaterializedSkillRun,
 };
 
+const InlineSkillExecution = union(enum) {
+    aborted,
+    completed: core.agent_loop.RunResult,
+};
+
 const MaterializedSkillRun = struct {
     admitted: core.agent_session.AdmittedRun,
-    tree: skill_materialization.WorkingTree,
+    activation: skill_activation.Activation,
+
+    fn executeInline(
+        self: *MaterializedSkillRun,
+        plan: *const skill_activation.ActivationPlan,
+        max_turns: u32,
+    ) anyerror!InlineSkillExecution {
+        const invocation_record = canonicalInvocationRecord(
+            allocator,
+            plan,
+        ) catch |record_error| {
+            _ = try self.finishWithoutConversation();
+            return record_error;
+        };
+        defer allocator.free(invocation_record);
+
+        const body_record = std.fmt.allocPrint(
+            allocator,
+            "# Skill: {s}\n\n{s}",
+            .{ plan.skill.definition.name, self.activation.rendered_body },
+        ) catch |body_error| {
+            _ = try self.finishWithoutConversation();
+            return body_error;
+        };
+        defer allocator.free(body_record);
+
+        if (self.admitted.abortSignal().isAborted()) {
+            _ = try self.finishWithoutConversation();
+            return .aborted;
+        }
+
+        const result = self.admitted.runUserMessagesWithPolicy(
+            &.{ invocation_record, body_record },
+            max_turns,
+            self.activation.frame.executionPolicy(),
+        ) catch |run_error| {
+            try self.releaseAssets();
+            return run_error;
+        };
+        try self.releaseAssets();
+        return .{ .completed = result };
+    }
+
+    fn releaseAssets(self: *MaterializedSkillRun) !void {
+        self.activation.deinit() catch return error.CoreError;
+    }
 
     /// Test/rollback path before prompt rendering. Always closes the core
     /// lifecycle even if filesystem cleanup reports failure.
@@ -421,7 +521,7 @@ const MaterializedSkillRun = struct {
         self: *MaterializedSkillRun,
     ) anyerror!core.agent_session.AdmittedCompletion {
         var cleanup_failed = false;
-        self.tree.deinit() catch {
+        self.releaseAssets() catch {
             cleanup_failed = true;
         };
         const completion = try self.admitted.finishWithoutConversation();
@@ -429,6 +529,37 @@ const MaterializedSkillRun = struct {
         return completion;
     }
 };
+
+fn canonicalInvocationRecord(
+    output_allocator: std.mem.Allocator,
+    plan: *const skill_activation.ActivationPlan,
+) error{OutOfMemory}![]u8 {
+    var output: std.Io.Writer.Allocating = .init(output_allocator);
+    defer output.deinit();
+    output.writer.writeAll(
+        "{\"type\":\"metask.skill-invocation/v1\",\"catalog_revision\":\"",
+    ) catch return error.OutOfMemory;
+    output.writer.writeAll(&plan.snapshot.revision) catch return error.OutOfMemory;
+    output.writer.writeAll("\",\"skill_id\":\"") catch return error.OutOfMemory;
+    output.writer.writeAll(&plan.skill.skill_id) catch return error.OutOfMemory;
+    output.writer.writeAll("\",\"invocation_name\":") catch return error.OutOfMemory;
+    std.json.Stringify.encodeJsonString(
+        plan.skill.invocation_name,
+        .{},
+        &output.writer,
+    ) catch return error.OutOfMemory;
+    output.writer.writeAll(",\"arguments\":{\"values\":[") catch return error.OutOfMemory;
+    for (plan.arguments, 0..) |argument, index| {
+        if (index != 0) output.writer.writeByte(',') catch return error.OutOfMemory;
+        std.json.Stringify.encodeJsonString(
+            argument,
+            .{},
+            &output.writer,
+        ) catch return error.OutOfMemory;
+    }
+    output.writer.writeAll("]}}") catch return error.OutOfMemory;
+    return output.toOwnedSlice() catch error.OutOfMemory;
+}
 
 pub const TestEpilogueHook = struct {
     ctx: *anyopaque,
@@ -884,6 +1015,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     self.runtime = runtime;
     self.workspace_scope_id = workspace_scope_id;
     self.skill_catalog_cell = null;
+    self.policy_root = null;
     self.host_permission_rules = .{};
     self.call_mutex = .{};
     self.call_state = .idle;
@@ -902,6 +1034,28 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
         allocator.destroy(self);
         return failError(sessionCreateErrorStatus(err), err, out_error);
     };
+    self.policy_root = policy_frame.PolicyFrame.createRoot(
+        allocator,
+        allowed,
+        shell,
+        mode,
+        .{
+            .cwd = workspace.root,
+            .project_root = workspace.root,
+            .home = workspace.home,
+        },
+    ) catch |err| {
+        // The Session has not escaped and no Run can exist yet. A destroy
+        // failure here would be an internal lifecycle invariant violation,
+        // not a recoverable construction error.
+        self.core_session.destroy() catch unreachable;
+        allocator.destroy(self);
+        return failError(
+            if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_INVALID_ARGUMENT,
+            err,
+            out_error,
+        );
+    };
     out.* = self.handle();
     return wire.STATUS_OK;
 }
@@ -919,6 +1073,10 @@ fn sessionDestroy(handle: ?*wire.SessionHandle, out_error: ?*wire.OwnedBytesV1) 
         self.cancelDestroy();
         return failError(if (err == error.SessionBusy) wire.STATUS_BUSY else wire.STATUS_INVALID_STATE, err, out_error);
     };
+    if (self.policy_root) |root_frame| {
+        root_frame.release();
+        self.policy_root = null;
+    }
     if (self.skill_catalog_cell) |cell| {
         runtime.catalogs.releaseSession(cell);
         self.skill_catalog_cell = null;
@@ -1804,21 +1962,67 @@ test "Skill materialization is post-admission and pre-Conversation" {
         .facade_poisoned = .init(false),
         .core_session = native_session,
     };
+    const root_frame = try policy_frame.PolicyFrame.createRoot(
+        std.testing.allocator,
+        &.{},
+        .disabled,
+        .default,
+        .{ .cwd = cwd, .project_root = cwd, .home = cwd },
+    );
+    defer root_frame.release();
     var materializations = try skill_materialization.Manager.init(std.testing.allocator);
     defer materializations.deinit() catch unreachable;
     const record = skill_catalog.SkillRecord{
         .skill_id = [_]u8{'a'} ** 64,
         .invocation_name = "review",
-        .definition = undefined,
+        .definition = .{
+            .name = "Review",
+            .description = "Review",
+            .body = "Review the target.",
+            .allowed_tools = &.{},
+            .disallowed_tools = &.{},
+            .arguments = &.{},
+            .disable_model_invocation = false,
+            .context = .inline_ctx,
+            .agent = "",
+            .model = "",
+            .shell = "bash",
+            .source_path = "",
+        },
         .directories = &.{},
         .files = &.{},
+    };
+    var snapshot_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer snapshot_arena.deinit();
+    var snapshot = skill_catalog.Snapshot{
+        .owner_allocator = std.testing.allocator,
+        .arena = snapshot_arena,
+        .scope_id = [_]u8{'c'} ** 64,
+        .revision = [_]u8{'b'} ** 64,
+        .health = .healthy,
+        .skills = &.{record},
+        .issues = &.{},
+        .descriptor_json = "",
+        .snapshot_bytes = 0,
+        .resident_bytes = 0,
+    };
+    _ = &snapshot;
+    var plan_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer plan_arena.deinit();
+    const plan = skill_activation.ActivationPlan{
+        .arena = plan_arena,
+        .snapshot = &snapshot,
+        .skill = &snapshot.skills[0],
+        .arguments = &.{},
+        .requires_shell = false,
+        .context = .external_run_root,
     };
     const initial_messages = native_session.conversation.messages.items.len;
 
     materializations.max_active_bytes = 0;
     try std.testing.expectError(
         error.ResourceLimit,
-        session.admitMaterializedSkill(&materializations, 1, &record),
+        session.admitMaterializedSkill(&materializations, 1, &plan, root_frame),
     );
     try std.testing.expectEqual(initial_messages, native_session.conversation.messages.items.len);
     try std.testing.expectEqual(@as(usize, 0), materializations.active_count);
@@ -1826,7 +2030,7 @@ test "Skill materialization is post-admission and pre-Conversation" {
     materializations.max_active_bytes = skill_materialization.MAX_ACTIVE_BYTES;
     try std.testing.expectError(
         error.StaleRun,
-        session.admitMaterializedSkill(&materializations, 1, &record),
+        session.admitMaterializedSkill(&materializations, 1, &plan, root_frame),
     );
     var next_run_id: u64 = 2;
     const faults = [_]skill_materialization.TestFault{
@@ -1840,7 +2044,12 @@ test "Skill materialization is post-admission and pre-Conversation" {
         materializations.setTestFault(fault);
         try std.testing.expectError(
             error.CoreError,
-            session.admitMaterializedSkill(&materializations, next_run_id, &record),
+            session.admitMaterializedSkill(
+                &materializations,
+                next_run_id,
+                &plan,
+                root_frame,
+            ),
         );
         materializations.setTestFault(null);
         try std.testing.expectEqual(
@@ -1850,7 +2059,12 @@ test "Skill materialization is post-admission and pre-Conversation" {
         try std.testing.expectEqual(@as(usize, 0), materializations.active_count);
         try std.testing.expectError(
             error.StaleRun,
-            session.admitMaterializedSkill(&materializations, next_run_id, &record),
+            session.admitMaterializedSkill(
+                &materializations,
+                next_run_id,
+                &plan,
+                root_frame,
+            ),
         );
         next_run_id += 1;
     }
@@ -1859,7 +2073,8 @@ test "Skill materialization is post-admission and pre-Conversation" {
     const aborted = try session.admitMaterializedSkill(
         &materializations,
         next_run_id,
-        &record,
+        &plan,
+        root_frame,
     );
     materializations.setTestFault(null);
     switch (aborted) {
@@ -1873,7 +2088,8 @@ test "Skill materialization is post-admission and pre-Conversation" {
     var admission = try session.admitMaterializedSkill(
         &materializations,
         next_run_id,
-        &record,
+        &plan,
+        root_frame,
     );
     switch (admission) {
         .aborted => return error.UnexpectedAbort,
@@ -1885,4 +2101,63 @@ test "Skill materialization is post-admission and pre-Conversation" {
     }
     try std.testing.expectEqual(initial_messages, native_session.conversation.messages.items.len);
     try std.testing.expectEqual(@as(usize, 0), materializations.active_count);
+}
+
+test "typed Skill invocation record is deterministic and JSON-safe" {
+    var snapshot_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer snapshot_arena.deinit();
+    var plan_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer plan_arena.deinit();
+    const record = skill_catalog.SkillRecord{
+        .skill_id = [_]u8{'b'} ** 64,
+        .invocation_name = "review:deep",
+        .definition = .{
+            .name = "Review",
+            .description = "Review",
+            .body = "Review $ARGUMENTS",
+            .allowed_tools = &.{},
+            .disallowed_tools = &.{},
+            .arguments = &.{"target"},
+            .disable_model_invocation = false,
+            .context = .inline_ctx,
+            .agent = "",
+            .model = "",
+            .shell = "bash",
+            .source_path = "",
+        },
+        .directories = &.{},
+        .files = &.{},
+    };
+    var snapshot = skill_catalog.Snapshot{
+        .owner_allocator = std.testing.allocator,
+        .arena = snapshot_arena,
+        .scope_id = [_]u8{'c'} ** 64,
+        .revision = [_]u8{'a'} ** 64,
+        .health = .healthy,
+        .skills = &.{record},
+        .issues = &.{},
+        .descriptor_json = "",
+        .snapshot_bytes = 0,
+        .resident_bytes = 0,
+    };
+    _ = &snapshot;
+    const arguments = [_][]const u8{"src/\"quoted\"\nfile.zig"};
+    const plan = skill_activation.ActivationPlan{
+        .arena = plan_arena,
+        .snapshot = &snapshot,
+        .skill = &snapshot.skills[0],
+        .arguments = &arguments,
+        .requires_shell = false,
+        .context = .external_run_root,
+    };
+    const encoded = try canonicalInvocationRecord(std.testing.allocator, &plan);
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expectEqualStrings(
+        "{\"type\":\"metask.skill-invocation/v1\",\"catalog_revision\":\"" ++
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ++
+            "\",\"skill_id\":\"" ++
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" ++
+            "\",\"invocation_name\":\"review:deep\",\"arguments\":{\"values\":[\"src/\\\"quoted\\\"\\nfile.zig\"]}}",
+        encoded,
+    );
 }

@@ -112,6 +112,28 @@ pub fn executeOne(
     job_ctx.pending_request = &pending_req;
 
     log.infoId("agent", rid, "tool.exec start(par) name={s} id={s}", .{ name, id });
+    if (job_ctx.execution_policy) |policy| {
+        if (!policy.allowsInvocation(name, input)) {
+            const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
+            const denied = @import("tool_error.zig").errorToJson(
+                "ToolPolicyDenied",
+                "Tool '{s}' is outside the current execution policy",
+                .{name},
+                parent_allocator,
+            ) catch return error.OutOfMemory;
+            log.warnId(
+                "agent",
+                rid,
+                "tool.exec POLICY-DENIED name={s} duration_ms={d}",
+                .{ name, elapsed },
+            );
+            return .{ .done = .{
+                .content = denied,
+                .is_error = true,
+                .elapsed_ms = elapsed,
+            } };
+        }
+    }
     const r = tools_mod.dispatch(&job_ctx, name, input) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
@@ -494,6 +516,104 @@ const StubDispatcher = struct {
     }
     var sentinel: u8 = 0;
 };
+
+test "execution policy denies before the single dispatch choke point" {
+    const Probe = struct {
+        calls: usize = 0,
+
+        fn dispatch(
+            raw: *const anyopaque,
+            tool_ctx: *const tools_mod.ToolContext,
+            _: []const u8,
+            args: []const u8,
+        ) anyerror!tools_mod.ToolDispatchOutcome {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            return .{ .ok = try tool_ctx.allocator.dupe(u8, args) };
+        }
+        fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+        fn nameAt(_: *const anyopaque, _: usize) ?[]const u8 {
+            return null;
+        }
+        fn hostSync(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+        fn dispatcher(self: *@This()) tools_mod.ToolDispatcher {
+            return .{
+                .ctx = @ptrCast(self),
+                .dispatchFn = dispatch,
+                .prefetchSafeFn = prefetchSafe,
+                .nameAtFn = nameAt,
+                .hostSyncFn = hostSync,
+            };
+        }
+        fn allowsTool(_: *const anyopaque, _: []const u8) bool {
+            return true;
+        }
+        fn allowsInvocation(
+            _: *const anyopaque,
+            _: []const u8,
+            args: []const u8,
+        ) bool {
+            return std.mem.indexOf(u8, args, "denied") == null;
+        }
+        fn policy(self: *const @This()) tools_mod.ToolExecutionPolicy {
+            return .{
+                .ctx = @ptrCast(self),
+                .allowsToolFn = allowsTool,
+                .allowsInvocationFn = allowsInvocation,
+            };
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var probe = Probe{};
+    var ctx = tools_mod.ToolContext{
+        .allocator = allocator,
+        .tool_dispatcher = probe.dispatcher(),
+        .execution_policy = probe.policy(),
+    };
+    const denied = try executeOne(
+        &ctx,
+        "Write",
+        "{\"value\":\"denied\"}",
+        "policy-denied",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (denied) {
+        .done => |result| {
+            defer if (result.content) |content| allocator.free(content);
+            try std.testing.expect(result.is_error);
+            try std.testing.expect(std.mem.indexOf(
+                u8,
+                result.content orelse "",
+                "\"code\":\"permission_denied\"",
+            ) != null);
+        },
+        else => return error.UnexpectedToolOutcome,
+    }
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+
+    const allowed = try executeOne(
+        &ctx,
+        "Write",
+        "{\"value\":\"allowed\"}",
+        "policy-allowed",
+        allocator,
+        .{ .bytes = [_]u8{'0'} ** 12 },
+    );
+    switch (allowed) {
+        .done => |result| {
+            defer if (result.content) |content| allocator.free(content);
+            try std.testing.expect(!result.is_error);
+        },
+        else => return error.UnexpectedToolOutcome,
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+}
 
 test "矩阵24:host fatal 后无泄漏——已完成 slot 的 owned payload 由 Slot.deinit 全部回收" {
     const a = std.testing.allocator; // testing.allocator 自带泄漏检测:测试结束未释放即 fail

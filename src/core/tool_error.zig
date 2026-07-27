@@ -120,6 +120,7 @@ const ERROR_MAP = [_]ErrorSpec{
     .{ .name = "PathTraversal", .code = .path_traversal, .category = .safety, .recoverable = false },
     .{ .name = "DangerousCommand", .code = .dangerous_command, .category = .safety, .recoverable = false },
     .{ .name = "PermissionDenied", .code = .permission_denied, .category = .safety, .recoverable = false },
+    .{ .name = "ToolPolicyDenied", .code = .permission_denied, .category = .safety, .recoverable = false },
     .{ .name = "UnknownTool", .code = .unknown_tool, .category = .user_error, .recoverable = true },
     .{ .name = "FileNotFound", .code = .file_not_found, .category = .user_error, .recoverable = true },
     .{ .name = "MultipleMatches", .code = .multiple_matches, .category = .user_error, .recoverable = true },

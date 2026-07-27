@@ -24,6 +24,7 @@ const workspace_mod = @import("workspace_policy.zig");
 const ReadState = @import("read_state.zig").ReadState;
 const JobRegistry = @import("job_registry.zig").JobRegistry;
 const SessionRules = @import("../permission/session_rules.zig").SessionRules;
+const ToolExecutionPolicy = @import("../tools.zig").ToolExecutionPolicy;
 
 pub const DEFAULT_BUILTIN_TOOLS = [_][]const u8{ "Read", "Write", "Edit", "Glob", "Grep", "Bash", "BashOutput", "KillShell" };
 /// Built-ins whose complete execution dependencies are owned by AgentSession.
@@ -278,14 +279,36 @@ pub const AdmittedRun = struct {
         prompt: []const u8,
         max_turns: u32,
     ) anyerror!agent_loop.RunResult {
+        return self.runUserMessagesWithPolicy(&.{prompt}, max_turns, null);
+    }
+
+    /// Continue an admitted Run with a caller-defined sequence of user
+    /// records and an immutable execution upper bound. Appends and provider
+    /// execution retain the ordinary poison semantics.
+    pub fn runUserMessagesWithPolicy(
+        self: *AdmittedRun,
+        prompts: []const []const u8,
+        max_turns: u32,
+        execution_policy: ?ToolExecutionPolicy,
+    ) anyerror!agent_loop.RunResult {
         if (self.completed) return error.InvalidSessionState;
+        if (prompts.len == 0) {
+            _ = try self.finishWithoutConversation();
+            return error.InvalidSessionState;
+        }
         try self.session.claimAdmittedRun(self.identity_value);
         self.completed = true;
-        self.session.conversation.appendText(.user, prompt) catch |err| {
-            _ = self.session.poisonRun();
-            return err;
-        };
-        return self.session.runLoop(self.identity_value, max_turns);
+        for (prompts) |prompt| {
+            self.session.conversation.appendText(.user, prompt) catch |err| {
+                _ = self.session.poisonRun();
+                return err;
+            };
+        }
+        return self.session.runLoop(
+            self.identity_value,
+            max_turns,
+            execution_policy,
+        );
     }
 };
 
@@ -488,7 +511,12 @@ pub const AgentSession = struct {
         };
     }
 
-    fn runLoop(self: *AgentSession, identity: RunIdentity, max_turns: u32) anyerror!agent_loop.RunResult {
+    fn runLoop(
+        self: *AgentSession,
+        identity: RunIdentity,
+        max_turns: u32,
+        execution_policy: ?ToolExecutionPolicy,
+    ) anyerror!agent_loop.RunResult {
         var backend = ui_backend.UiBackend{ .ctx = @ptrCast(self), .emit = backendEmit, .poll = backendPoll };
         var native_result = agent_loop.run(
             &self.conversation,
@@ -504,6 +532,7 @@ pub const AgentSession = struct {
                 .jobs = if (self.jobs) |*registry| registry else null,
                 .tool_defs = self.tools.definitions,
                 .tool_dispatcher = self.tools.dispatcher(),
+                .execution_policy = execution_policy,
                 // admission 处固定的 Run 身份,显式传值贯穿至 Host tool 执行点。
                 .host_run = if (self.host_identity_ctx) |hctx| .{
                     .identity = identity,
@@ -1003,6 +1032,14 @@ test "AdmittedRun consumes run id without mutating Conversation" {
 
     var third = try self.admitRun(3, probe.sink());
     _ = try third.finishWithoutConversation();
+
+    var fourth = try self.admitRun(4, probe.sink());
+    try std.testing.expectError(
+        error.InvalidSessionState,
+        fourth.runUserMessagesWithPolicy(&.{}, 1, null),
+    );
+    try std.testing.expectEqual(initial_messages, self.conversation.messages.items.len);
+    try std.testing.expectError(error.StaleRun, self.admitRun(4, probe.sink()));
 }
 
 test "AgentSession abort is run-scoped, idempotent and reports late requests" {

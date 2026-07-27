@@ -146,6 +146,14 @@ pub const PolicyFrame = struct {
         return self.permission;
     }
 
+    pub fn executionPolicy(self: *const PolicyFrame) core.tools.ToolExecutionPolicy {
+        return .{
+            .ctx = @ptrCast(self),
+            .allowsToolFn = allowsToolAdapter,
+            .allowsInvocationFn = allowsInvocationAdapter,
+        };
+    }
+
     /// This is an upper-bound check only. A true result still goes through the
     /// Session's ordinary permission decision; Skill metadata never grants.
     pub fn allowsInvocation(
@@ -182,7 +190,29 @@ pub const PolicyFrame = struct {
             @compileError("PolicyFrame reference count is test-only");
         return self.references.load(.acquire);
     }
+
+    fn allowsToolAdapter(raw: *const anyopaque, name: []const u8) bool {
+        const self: *const PolicyFrame = @ptrCast(@alignCast(raw));
+        return containsTool(self.effective_tools, name);
+    }
+
+    fn allowsInvocationAdapter(
+        raw: *const anyopaque,
+        name: []const u8,
+        arguments_json: []const u8,
+    ) bool {
+        const self: *const PolicyFrame = @ptrCast(@alignCast(raw));
+        return self.allowsInvocation(name, arguments_json);
+    }
 };
+
+pub fn validateRules(
+    allowed: []const []const u8,
+    disallowed: []const []const u8,
+) Error!void {
+    if (!validRules(allowed) or !validRules(disallowed))
+        return error.InvalidPolicy;
+}
 
 fn cloneMatchContext(
     arena: std.mem.Allocator,
@@ -314,6 +344,17 @@ test "parent narrowing cannot be recovered by a broad child" {
     try std.testing.expect(!child.allowsInvocation("Write", "{\"file_path\":\"/work/a\"}"));
     try std.testing.expect(child.allowsInvocation("Bash", "{\"command\":\"git status\"}"));
     try std.testing.expect(!child.allowsInvocation("Bash", "{\"command\":\"rm -rf /\"}"));
+    const execution_policy = child.executionPolicy();
+    try std.testing.expect(execution_policy.allowsTool("Read"));
+    try std.testing.expect(!execution_policy.allowsTool("Write"));
+    try std.testing.expect(execution_policy.allowsInvocation(
+        "Bash",
+        "{\"command\":\"git status\"}",
+    ));
+    try std.testing.expect(!execution_policy.allowsInvocation(
+        "Bash",
+        "{\"command\":\"rm -rf /\"}",
+    ));
 }
 
 test "three-level intersections and denials leave every ancestor immutable" {

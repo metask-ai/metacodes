@@ -203,6 +203,34 @@ pub const ToolDispatcher = struct {
     }
 };
 
+/// Borrowed, immutable upper bound for one execution context. The owner must
+/// keep `ctx` alive until every synchronous tool execution has quiesced.
+///
+/// This interface deliberately does not grant permission. `true` only means
+/// that the ordinary Session permission pipeline may continue; `false` is a
+/// fail-closed denial before dispatch.
+pub const ToolExecutionPolicy = struct {
+    ctx: *const anyopaque,
+    allowsToolFn: *const fn (ctx: *const anyopaque, name: []const u8) bool,
+    allowsInvocationFn: *const fn (
+        ctx: *const anyopaque,
+        name: []const u8,
+        arguments_json: []const u8,
+    ) bool,
+
+    pub fn allowsTool(self: ToolExecutionPolicy, name: []const u8) bool {
+        return self.allowsToolFn(self.ctx, name);
+    }
+
+    pub fn allowsInvocation(
+        self: ToolExecutionPolicy,
+        name: []const u8,
+        arguments_json: []const u8,
+    ) bool {
+        return self.allowsInvocationFn(self.ctx, name, arguments_json);
+    }
+};
+
 pub const ToolContext = struct {
     allocator: std.mem.Allocator,
     abort: ?*const AbortSignal = null,
@@ -263,6 +291,10 @@ pub const ToolContext = struct {
     /// dispatch authority; tools not selected into it remain unexecutable even
     /// though they exist in the process-wide built-in registry.
     tool_dispatcher: ?ToolDispatcher = null,
+    /// Optional execution-context upper bound (for example a nested Skill
+    /// PolicyFrame). It is checked independently of Session dispatch and
+    /// permission so no child context can re-authorize a parent denial.
+    execution_policy: ?ToolExecutionPolicy = null,
     /// L5:宿主能力聚合(Skill 激活 / ToolSearch 激活 / Worktree push-pop)——三类"工具改宿主
     /// 状态"的请求-响应回调收成一个接口。null = 无宿主(纯单测)。各能力可空,见 HostServices。
     host_services: ?HostServices = null,

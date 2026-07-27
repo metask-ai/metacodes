@@ -312,6 +312,9 @@ pub const Options = struct {
     /// ToolSearch 激活的 deferred 工具名集。非 null 时:deferred 且不在此集的工具
     /// 不进 API tools 数组(降低弱后端工具菜单稀释)。null = 不过滤 deferred(全暴露)。
     activated_tools: ?*const std.StringHashMap(void) = null,
+    /// Borrowed immutable upper bound for this execution context. The owner
+    /// keeps it alive until this synchronous Run and all tool workers quiesce.
+    execution_policy: ?tools_mod.ToolExecutionPolicy = null,
     /// 统一 UI 请求回调(替代旧 ask_question/exit_plan 三套;ctx 指 *TuiBackend)。
     /// 仅顶层 TUI 接(agent_depth==0)——子 agent 无 tty。见 UiRequester。
     ui_requester: ?@import("protocol/ui_request.zig").UiRequester = null,
@@ -348,12 +351,14 @@ fn emitProgress(backend: *const UiBackend, sess: @import("session_id.zig").Sessi
 }
 
 const EffectiveToolSet = struct {
+    policy_filtered: ?[]json_mod.ToolDefinition = null,
     filtered_pool: ?[]json_mod.ToolDefinition = null,
     deferred_filtered: ?[]json_mod.ToolDefinition = null,
     cap_filtered: ?[]json_mod.ToolDefinition = null,
     defs: []const json_mod.ToolDefinition = &.{},
 
     fn deinit(self: *EffectiveToolSet, allocator: std.mem.Allocator) void {
+        if (self.policy_filtered) |pf| allocator.free(pf);
         if (self.filtered_pool) |fp| allocator.free(fp);
         if (self.deferred_filtered) |df| allocator.free(df);
         if (self.cap_filtered) |cf| allocator.free(cf);
@@ -366,13 +371,27 @@ fn buildEffectiveToolSet(
     tool_defs: []const json_mod.ToolDefinition,
     permission_ctx: *const permission_mod.PermissionContext,
     activated_tools: ?*const std.StringHashMap(void),
+    execution_policy: ?tools_mod.ToolExecutionPolicy,
     provider: provider_mod.Provider,
-) EffectiveToolSet {
+) error{OutOfMemory}!EffectiveToolSet {
     var out = EffectiveToolSet{ .defs = tool_defs };
 
+    const policy_filtered = blk: {
+        const policy = execution_policy orelse break :blk tool_defs;
+        var keep: std.ArrayList(json_mod.ToolDefinition) = .empty;
+        errdefer keep.deinit(allocator);
+        for (tool_defs) |definition| {
+            if (!policy.allowsTool(definition.name)) continue;
+            try keep.append(allocator, definition);
+        }
+        out.policy_filtered = try keep.toOwnedSlice(allocator);
+        break :blk out.policy_filtered.?;
+    };
+    out.defs = policy_filtered;
+
     const pool_filter = @import("../skills/tool_pool_filter.zig");
-    out.filtered_pool = pool_filter.filterToolDefs(allocator, tool_defs, permission_ctx.active_skill) catch null;
-    const skill_filtered = if (out.filtered_pool) |fp| fp else tool_defs;
+    out.filtered_pool = pool_filter.filterToolDefs(allocator, policy_filtered, permission_ctx.active_skill) catch null;
+    const skill_filtered = if (out.filtered_pool) |fp| fp else policy_filtered;
     out.defs = skill_filtered;
 
     const effective_tool_defs = blk: {
@@ -547,7 +566,14 @@ pub fn run(
 
         // 工具池过滤必须在 compact 判断之前完成。auto-compact 以"实际下一次请求"
         // 为准，而不是未经过 skill/deferred/capability 门控的全量工具表。
-        var effective_tools = buildEffectiveToolSet(allocator, tool_defs, permission_ctx, opts.activated_tools, provider);
+        var effective_tools = try buildEffectiveToolSet(
+            allocator,
+            tool_defs,
+            permission_ctx,
+            opts.activated_tools,
+            opts.execution_policy,
+            provider,
+        );
         defer effective_tools.deinit(allocator);
         const gated_tool_defs = effective_tools.defs;
 
@@ -682,6 +708,7 @@ pub fn run(
             .agent_depth = opts.agent_depth,
             .dyn_registry = opts.dyn_registry,
             .tool_dispatcher = opts.tool_dispatcher,
+            .execution_policy = opts.execution_policy,
             .host_services = opts.host_services,
             .host_run = opts.host_run,
             .explicit_invocation = opts.explicit_invocation,
@@ -1111,6 +1138,7 @@ pub fn run(
             .agent_depth = opts.agent_depth,
             .dyn_registry = opts.dyn_registry,
             .tool_dispatcher = opts.tool_dispatcher,
+            .execution_policy = opts.execution_policy,
             .host_services = opts.host_services,
             .host_run = opts.host_run,
             .explicit_invocation = opts.explicit_invocation,
@@ -2945,8 +2973,54 @@ test "buildEffectiveToolSet hides unactivated deferred tools for compact estimat
     defer activated.deinit();
     var permission_ctx = permission_mod.PermissionContext{ .allocator = a };
     var state = TestProviderState{};
-    var effective = buildEffectiveToolSet(a, &tool_defs, &permission_ctx, &activated, testProvider(&state));
+    var effective = try buildEffectiveToolSet(
+        a,
+        &tool_defs,
+        &permission_ctx,
+        &activated,
+        null,
+        testProvider(&state),
+    );
     defer effective.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), effective.defs.len);
+    try std.testing.expectEqualStrings("Read", effective.defs[0].name);
+}
+
+test "buildEffectiveToolSet applies an execution policy before provider exposure" {
+    const Policy = struct {
+        fn allowsTool(_: *const anyopaque, name: []const u8) bool {
+            return std.mem.eql(u8, name, "Read");
+        }
+        fn allowsInvocation(
+            _: *const anyopaque,
+            name: []const u8,
+            _: []const u8,
+        ) bool {
+            return std.mem.eql(u8, name, "Read");
+        }
+        var sentinel: u8 = 0;
+    };
+    const tool_defs = [_]json_mod.ToolDefinition{
+        .{ .name = "Read", .description = "read", .input_schema = .{} },
+        .{ .name = "Write", .description = "write", .input_schema = .{} },
+    };
+    var permission_ctx = permission_mod.PermissionContext{
+        .allocator = std.testing.allocator,
+    };
+    var provider_state = TestProviderState{};
+    var effective = try buildEffectiveToolSet(
+        std.testing.allocator,
+        &tool_defs,
+        &permission_ctx,
+        null,
+        .{
+            .ctx = @ptrCast(&Policy.sentinel),
+            .allowsToolFn = Policy.allowsTool,
+            .allowsInvocationFn = Policy.allowsInvocation,
+        },
+        testProvider(&provider_state),
+    );
+    defer effective.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), effective.defs.len);
     try std.testing.expectEqualStrings("Read", effective.defs[0].name);
 }
