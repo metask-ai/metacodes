@@ -588,13 +588,24 @@ fn capturePosix(argv: []const ?[*:0]const u8, allocator: std.mem.Allocator, opts
             return error.ReadError;
         }
         if (rc == 0) continue;
-        if (!out_done and (pfds[0].revents & std.c.POLL.IN) != 0) {
+        const terminal_events = std.c.POLL.HUP | std.c.POLL.ERR | std.c.POLL.NVAL;
+        if (!out_done and (pfds[0].revents & (std.c.POLL.IN | terminal_events)) != 0) {
             const n = std.c.read(out_pipe[0], &buf, buf.len);
-            if (n <= 0) out_done = true else try out.appendSlice(allocator, buf[0..@intCast(n)]);
+            if (n < 0) {
+                _ = std.c.close(out_pipe[0]);
+                if (opts.want_stderr) _ = std.c.close(err_pipe[0]);
+                return error.ReadError;
+            }
+            if (n == 0) out_done = true else try out.appendSlice(allocator, buf[0..@intCast(n)]);
         }
-        if (!err_done and (pfds[1].revents & std.c.POLL.IN) != 0) {
+        if (!err_done and (pfds[1].revents & (std.c.POLL.IN | terminal_events)) != 0) {
             const n = std.c.read(err_pipe[0], &buf, buf.len);
-            if (n <= 0) err_done = true else try err.appendSlice(allocator, buf[0..@intCast(n)]);
+            if (n < 0) {
+                _ = std.c.close(out_pipe[0]);
+                _ = std.c.close(err_pipe[0]);
+                return error.ReadError;
+            }
+            if (n == 0) err_done = true else try err.appendSlice(allocator, buf[0..@intCast(n)]);
         }
         if (out.items.len + err.items.len >= opts.max_bytes) {
             killGroupPosix(pid); // cap 命中：止血，返已读部分（Ok，非错误，对齐 common.zig）
@@ -966,6 +977,18 @@ test "captureStdout 便捷+非零 exit" {
     try std.testing.expect(std.mem.indexOf(u8, r.stdout, "hi") != null);
     try std.testing.expectEqual(@as(i32, 3), r.exit_code);
     try std.testing.expectEqual(@as(usize, 0), r.stderr.len); // want_stderr=false
+}
+
+test "capturePosix drains short-lived stdout after pipe hangup" {
+    if (is_windows or !procSpawnTestsEnabled()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const argv: []const ?[*:0]const u8 =
+        &.{ "/bin/sh", "-c", "printf hup-drained", null };
+    const result = try captureStdout(argv, allocator, 1_000, 1 << 20);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    try std.testing.expectEqualStrings("hup-drained", result.stdout);
+    try std.testing.expectEqual(@as(i32, 0), result.exit_code);
 }
 
 test "capture stdin_data 喂入子进程 stdin" {
