@@ -225,8 +225,13 @@ typedef struct {
 } metask_agentcore_session_callbacks_v1;
 
 /* Query is Session-independent so a consumer can render a Skill menu before
- * creating its first Task/Session. workspace_epoch is Host identity input,
- * not a globally ordered version. */
+ * creating its first Task/Session. workspace_epoch is an opaque Host-supplied
+ * byte token: canonical empty means no external generation; otherwise it is
+ * interpreted only by byte equality within one canonical Workspace scope.
+ * It need not be parseable, monotonic, or comparable across Hosts. Change it
+ * when the Host's external Workspace binding generation changes. It enters
+ * catalog_revision, so changing it can make input prepared for another bound
+ * revision return METASK_AGENTCORE_STATUS_STALE_CATALOG. */
 typedef struct {
     uint32_t struct_size;
     uint32_t reserved0;
@@ -302,6 +307,10 @@ typedef uint32_t (*metask_agentcore_runtime_query_skill_catalog_fn_v1)(
     metask_agentcore_skill_catalog **,
     metask_agentcore_owned_bytes_v1 *,
     metask_agentcore_owned_bytes_v1 *);
+/* On success, the descriptor uses metask.skill-catalog/v1. Each valid Skill
+ * has argument_schema {schema:"metask.skill-arguments/v1", max_values:64,
+ * names:[...]}. names are ordered positional UI labels, not required arity;
+ * arguments_json.values[i] corresponds to names[i]. */
 typedef uint32_t (*metask_agentcore_skill_catalog_release_fn_v1)(
     metask_agentcore_skill_catalog *,
     metask_agentcore_owned_bytes_v1 *);
@@ -311,6 +320,9 @@ typedef uint32_t (*metask_agentcore_session_refresh_skill_catalog_fn_v1)(
     metask_agentcore_session *,
     metask_agentcore_skill_catalog *,
     metask_agentcore_owned_bytes_v1 *);
+/* STALE_CATALOG is pre-admission: query a new catalog, re-resolve the Skill,
+ * wait for Session idle, refresh, release the Host catalog handle, and retry
+ * with the same run_id and new catalog_revision. */
 
 /* run_id is Host-assigned, non-zero, and scoped to one Session. Each admitted
  * Run must use a value strictly greater than that Session's previously

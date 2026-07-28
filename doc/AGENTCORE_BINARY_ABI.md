@@ -367,6 +367,31 @@ paths, policy internals, or execution mode. Isolated invalid slots produce
 `OK + degraded`; failure to prove the whole snapshot returns
 `SKILL_CATALOG_INVALID` and no partial handle or descriptor.
 
+Each valid `skills[]` entry contains this fixed argument-schema shape:
+
+```json
+{
+  "argument_schema": {
+    "schema": "metask.skill-arguments/v1",
+    "max_values": 64,
+    "names": ["target", "scope"]
+  }
+}
+```
+
+`names[]` supplies ordered positional labels for consumer UI:
+`arguments_json.values[i]` corresponds to `names[i]`. Names do not declare
+required arity. A caller may submit zero through `max_values` strings, including
+values beyond `names.len`; `max_values` is the wire upper bound.
+
+`workspace_epoch` is an opaque byte token supplied by the Host. It is compared
+only for byte equality inside one canonical Workspace scope and need not be
+parseable, monotonic, or comparable across Hosts. Canonical empty `{NULL,0}`
+means that the Host has no external Workspace generation. The Host changes the
+token when its external Workspace binding generation changes. The token enters
+the catalog-revision hash, so changing it produces a new revision and may make
+an input prepared for a differently bound Session return `STALE_CATALOG`.
+
 The Host releases its catalog handle exactly once with
 `skill_catalog_release`. Session create and idle-only refresh retain their own
 reference, so the Host may release its handle immediately after either call
@@ -391,6 +416,22 @@ Materialization begins only after admission, is private to that activation,
 and is removed before terminal return. A Skill can only narrow the Session's
 tool, shell, and permission authority.
 
+A consumer normally uses the Skill ABI in this order:
+
+1. During draft creation, query a catalog and render its descriptor.
+2. Create a Session bound to that catalog.
+3. Release the Host's catalog handle; the Session retains its own reference.
+4. Submit `RUN_INPUT_SKILL` with an identity and revision from that descriptor.
+5. On `STALE_CATALOG`, query again, re-resolve the identity from the new
+   descriptor, wait until the Session is idle, refresh it, release the new Host
+   handle, and retry with the same `run_id` because the rejected Run was never
+   admitted.
+
+Changing source files alone does not mutate a Session's immutable snapshot.
+`STALE_CATALOG` means that the input revision differs from the revision
+currently bound to the Session. If the new descriptor removes the Skill or
+reports it as an issue, the consumer must not blindly retry.
+
 When a bound snapshot contains at least one model-invocable Skill, AgentCore
 adds one Run-local provider tool named `Skill` to both Text Runs and explicit
 Skill Runs. It is an internal projection, not another ABI entry point. Its
@@ -409,6 +450,11 @@ Inline materializations live until Run quiescence; fork execution is
 synchronous within the same Host Run and projects its public text and usage
 through the ordinary event stream. The provider tool name `Skill` is reserved:
 Runtime creation rejects a Host tool with that name.
+
+Fork children cannot suspend for Host UI interaction in Revision 4. Their UI
+requester is unavailable, so a child question or permission request fails
+closed as an ordinary fork/tool failure attributed to the outer Run. Inline
+execution may use the outer Run's synchronous UI callback.
 
 AgentCore exposes no slash parser, Command registry, route field, or
 product-specific command. A consumer resolves its own Commands first, maps a

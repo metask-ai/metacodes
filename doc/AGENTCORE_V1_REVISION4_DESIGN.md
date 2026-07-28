@@ -1,9 +1,9 @@
 # AgentCore ABI v1 Revision 4 设计
 
-> 状态：方案草案（待评审）
-> 日期：2026-07-27
+> 状态：Revision 4 公共 ABI 与内部 Skill Runtime 收敛均已实施
+> 日期：2026-07-28
 > 前置：`AGENTCORE_V1_EXPERIMENTAL_LEDGER.md` A1/A3/A4、B1–B4、C9
-> 本文描述目标态；实施完成前以 `AGENTCORE_BINARY_ABI.md` 为准。
+> 本文记录已实施设计；公共契约以 `AGENTCORE_BINARY_ABI.md` 为准。
 
 ## 0. 版本语义
 
@@ -43,6 +43,8 @@ Session persistence/restore、异步 Run、Conversation 导出、托管语言绑
     候选集合或 snapshot 完整性时才使 catalog query 失败。
 11. **嵌套权限单调收窄**：child activation 的工具、shell 和 permission bounds
     不得超出 parent；并发 sibling 互不污染。
+12. **单一 Skill 语义**：CLI 与 AgentCore 必须共用同一套 catalog、invocation、
+    policy、materialization 与 activation 实现；产品入口和 ABI 入口只能保留适配逻辑。
 
 ## 2. Cut 范围
 
@@ -207,13 +209,52 @@ MetaWork slash/Command UI → Workbench tasks.run
 - **Workbench**：扩展既有 `tasks.run` input union 为 `text | skill`，校验
   Task/Run ownership、Workspace binding 和 catalog ownership；取消仍走
   `metawork.tasks.cancel`。
-- **AgentCore**：Skill discovery、优先级、snapshot、参数终验、policy、资源以及
-  inline/fork 的唯一语义权威。
+- **共享 Skill Runtime**：Skill discovery、优先级、snapshot、参数终验、policy、
+  资源以及 inline/fork 的唯一语义权威。
+- **AgentCore adapter**：拥有 ABI handle/status、Session/Run admission、Host callback、
+  event/diagnostic 映射，不拥有第二套 Skill 语义。
 
 AgentCore 不提供 `list_commands`、`invoke_command` 或 slash parser。`/new`、
 `/status`、`/stop` 等产品命令不进入 AgentCore。MetaWork 对未命中的 Command 再查
 Skill catalog；命中 valid Skill 才提交 typed invocation，命中 typed issue 显示
 unavailable，均未命中才是 unknown slash。不得回退成 text prompt。
+
+#### 4.1.1 单一 Skill Runtime 与适配边界
+
+共享实现位于 `src/skills/runtime/`，依赖方向固定为：
+
+```text
+CLI Skill adapter ─┐
+                   ├─> skills/runtime ─> 既有通用执行接口
+AgentCore adapter ─┘
+```
+
+Runtime 负责 canonical definition、catalog resolver/snapshot、typed invocation、
+argument validation、PolicyFrame、materialization、activation plan 与模型面 Skill
+语义。它不得 import `agentcore`、`app`、`repl`，也不得依赖具体的
+`agent_loop`、`agent_session`、Conversation 或 permission 产品层；只能使用
+adapter-neutral 的既有通用接口。
+
+AgentCore 保留 scope HMAC、catalog handle/refcount、wire descriptor/status、
+Session/run_id/admission、Host callback 与 event projection。CLI 保留 source 配置、
+slash/UI、DynRegistry 与错误呈现。两侧 adapter 只做类型、所有权和错误映射，不得重新
+解析 frontmatter、计算优先级/policy、读取活 Skill tree 或实现第二条 inline/fork 路径。
+
+本次收敛不新增 `agent_loop`、provider、Conversation、permission engine、REPL
+基础设施或 subagent scheduler 改动，只复用已经存在的通用执行钩子。CLI Skill
+适配语义集中在 `src/skills/cli_adapter.zig`；`app.zig` 只负责 Runtime/adapter
+初始化与接线，`repl/loop.zig` 只负责 import、slash 委托和删除旧 handler。现有
+`SkillSet`、`ActiveSkillState` 或 pool-filter 形状若因底层调用签名暂时保留，必须
+降为 Runtime projection/adapter，不得继续拥有独立语义；它们不是兼容栈。
+
+CLI 随此次收敛明确采用与 AgentCore 相同的 snapshot 和 activation 语义：调用不再
+读取活 source tree；`${CLAUDE_SKILL_DIR}` 指向本次 activation 的 working tree，
+其中写入在 terminal 后销毁；materialization 能力不足时该 Skill typed unavailable。
+这些是批准的 Revision 4 CLI 迁移，不得通过回退旧 loader/直读路径规避。
+
+CLI adapter 以程序赋值的 `agent_ident` 隔离 execution context；Runtime 管理的 fork
+会预注册 child context 并在 terminal 注销。缺少 terminal hook 的其它 child context
+不得创建持久 activation，必须 fail-closed，不能退回进程全局 Skill 状态。
 
 ### 4.2 Catalog 查询与身份
 
@@ -240,7 +281,7 @@ reserved0@4
 workspace_root@8
 workspace_home@24
 workspace_epoch@40
-reserved[4]@48
+reserved[3]@56
 ```
 
 身份规则：
@@ -253,6 +294,10 @@ reserved[4]@48
 - revision 是对 scope、workspace epoch 及 canonical effective records 的
   SHA-256。valid Skill 的 body、frontmatter、policy、资源及可执行位进入 hash；
   tombstone 的稳定字段进入 hash；diagnostic 文案不进入 hash。
+- `workspace_epoch` 是调用方声明的 opaque byte token，只在同一 canonical Workspace
+  scope 内按 byte equality 解释；不要求可解析、单调或跨 Host 可比。canonical empty
+  表示没有外部世代。Host 在 Workspace binding 的外部世代变化时更换它；由于它进入
+  revision hash，更换后旧 Session 与新 descriptor 组合会产生 `STALE_CATALOG`。
 - revision 只允许在同一 Runtime/scope 内做 byte equality，不表示全局顺序。
 - 普通 source 的 `invocation_name` 来自 discovery root 的直接子目录名；plugin
   使用稳定 namespace + `:` + 子目录名。frontmatter `name` 只作为
@@ -300,6 +345,20 @@ issues[]
   `execution_mode`；diagnostic 仅供人阅读。
 - 数组按稳定键排序，重复 query 的 descriptor bytes 必须确定性相等。
 
+每个 valid Skill 的 `argument_schema` 固定为：
+
+```json
+{
+  "schema": "metask.skill-arguments/v1",
+  "max_values": 64,
+  "names": ["target", "scope"]
+}
+```
+
+`names[]` 是有序的位置参数提示名，`values[i]` 对应 `names[i]`；它不声明 required
+arity。提交允许 `0..max_values` 个值，超出 `names.len` 的值仍是合法位置参数。
+消费方按顺序生成参数 UI，但不得把 `names.len` 当成必填数量。
+
 `OK + degraded` 表示 snapshot 完整，但存在隔离的 issue；Session 可以绑定，只暴露
 `skills[]`。非 `OK` 才表示没有 snapshot。
 
@@ -328,6 +387,12 @@ tree：
 - 完整写入并复核后才交给执行器；
 - 创建、执行和清理受当前 Run abort/quiescence 管理；
 - terminal return 前销毁并释放预算。
+
+Runtime 从有界、确定的候选根中选择 materialization 根：先尝试平台首选临时目录，
+再尝试不同的 OS-native fallback。每个候选都必须先创建独占私有目录，再探测权限位
+语义；失败候选完整删除后才能继续。OOM 与 CSPRNG 失败立即返回，不得伪装成候选不可用；
+只有路径或文件系统能力不满足才能尝试下一候选。全部候选失败时，Skill capability
+为 typed `SKILL_UNAVAILABLE`，不得因单个错误的 `TMPDIR` 放弃可用的 native temp。
 
 公共上限：
 
@@ -376,6 +441,11 @@ uint32_t session_refresh_skill_catalog(
 refresh 仅在 idle Session 上允许，并与 run/destroy 使用同一 facade gate。它原子
 替换 snapshot、tool exposure、prompt 和 policy lookup；失败保留旧状态。refresh
 不修改 Conversation、不产生 events、不影响 run_id，也不自动发生。
+
+`STALE_CATALOG` 是 pre-admission failure，因此不推进 run_id。Host 必须重新 query，
+按新 descriptor 重新解析 Skill identity，等待 Session idle 后 refresh，释放自己的
+新 catalog handle，再以相同 run_id 和新 revision 重试。只修改 source 文件不会改变
+已绑定 snapshot；stale 只表示 RunInput revision 与 Session 当前绑定 revision 不同。
 
 ### 4.6 Typed RunInput
 
@@ -443,7 +513,7 @@ tool/Run 语义返回，不伪装成 external pre-admission status。
 external 与 model-tool 调用必须共用唯一内部入口：
 
 ```text
-skill_activation.activate(snapshot, skill_id, arguments, context)
+skills.runtime.activate(snapshot, skill_id, arguments, context)
 context = external_run_root | model_tool
 ```
 
@@ -477,6 +547,8 @@ child_effective ⊆ parent_effective ⊆ session_effective_tools
 - child 任意 terminal 只释放自己的 frame；Run terminal 等待全部 lineage
   quiescent，下一 Run 从 Session baseline 开始。
 - frame 同时持有不可扩大的 shell/permission bounds。
+- policy rule 在 frame 构造时完成校验或解析；运行期再次解析失败必须 fail-closed，
+  不得使用 `catch unreachable` 把跨函数约定升级成 ReleaseFast UB。
 
 Shell policy：
 
@@ -486,8 +558,9 @@ Shell policy：
   强制 fail-closed。
 - `unrestricted`：才允许无 sandbox 执行。
 
-现有 flat `effective_tools` 不足以表达嵌套；`AgentLoopOptions`、`ToolContext` 和
-fork child 必须显式传递 current `PolicyFrame`。
+`PolicyFrame` 由 Skill Runtime 持有并通过既有 type-erased
+`ToolExecutionPolicy` 投影给执行 adapter。通用 agent loop 不拥有或解释
+`PolicyFrame`，也不得为 Skill 新增状态字段。
 
 ### 4.9 Fork、事件与 Conversation 投影
 
@@ -503,6 +576,8 @@ result、poison 或 catalog binding。它继承 parent frame、abort 和串行 e
   Skill 的 public `tool_start/tool_result` 包围；
 - callback failure、abort、core failure 和 usage 均归属外层 Run；
 - Run terminal 后不得出现迟到事件或 usage。
+- fork child 不支持可恢复 UI suspend；其执行 adapter 不提供 UI requester。
+  child 内的提问或权限请求 fail-closed，并作为普通 fork/tool 失败归属外层 Run。
 
 不得通过伪造 `agent_depth=0` 实现投影。ABI semantic events 必须与 UI card
 显示开关解耦。
@@ -583,14 +658,20 @@ SKILL_UNAVAILABLE       = 16u
 
 ### 6.1 原子 cut
 
-默认一次完成 Revision 3 → 4：
+Revision 4 公共 ABI 已完成原子 cut；内部纠偏不得改变已发布的 layout、status、
+ownership 或 failure boundary。收敛顺序固定为：
 
-1. 提取 CLI/AgentCore 共用的 Skill discovery/activation kernel；
-2. 实现 snapshot、tombstone、bounded traversal、handle 和 Session binding；
-3. 实现 typed Run、working tree、PolicyFrame、fork/event projection；
-4. 原子更新 header、SDK、facade、protocol、manifest、canonical ABI 文档、ledger
-   和双平台 baseline；
-5. 迁移 CLI 与 source-free MetaWork fixture。
+1. 在 `src/skills/runtime/` 定义 adapter-neutral 类型与边界测试；
+2. 将现有 AgentCore catalog、materialization、policy、activation 的通用语义迁入
+   Runtime，不改变行为；
+3. AgentCore 改为 ABI adapter，保留 handle/admission/event 等 ABI 所有权；
+4. 在 `src/skills/cli_adapter.zig` 收敛 CLI discovery、slash 与 model-tool
+   适配，产品调用点只委托给该 adapter；
+5. 删除两侧重复实现；迁移期间可以短暂共存，但任何可交付状态不得保留两套语义；
+6. 逐条用 Runtime 测试和 CLI/AgentCore adapter 测试替换旧测试。
+
+本节所有“新增 diff”均以
+`d3cf66634982c0ac780112fb8732602349d4fb89` 为固定收敛基线，不随分支 HEAD 漂移。
 
 公共表面只切换一次。任何中间提交不得发布可被消费的 Revision 4 header 或 bundle。
 
@@ -612,12 +693,17 @@ A/B 关闭的设计缺陷，可经 MetaWork 确认拆分为：
 | A1 | 普通结束、ABORTED、continuation、工具后 continuation、自动压缩、top-level fork、两类 event projection；流式/非流式 usage 恰好计量 |
 | A3/A4 | Host-owned 零权限配置写入、无跨 Session 泄漏、不读 fd 0、CLI 行为保持；sandbox 全部 admission/运行期漂移分支 |
 | B1–B4 | single/multi/free-text、取消及 release；schema/name 边界；prompt cap-before-UTF-8 |
-| Catalog | Session 前查询、priority、identity/revision、healthy/degraded、slot tombstone、无同名回退、全局/局部失败域、遍历与资源 caps |
-| Lifecycle | immutable snapshot、per-activation working tree、Runtime aggregate caps；强制覆盖 final release 与 destroy 的两种竞争顺序，结果只能符合规定的成功或 `BUSY`，且无 UAF |
-| Run/policy | pre-admission 不改 Conversation/不推进 run_id；在 working-tree reserve、create/write、final verification 三处逐点注入失败，均推进 run_id、完整清理且不污染 parent frame；三层 policy 收窄、并发 sibling 隔离、所有 terminal 精确恢复 |
-| Fork | inline/fork 共用 events、usage、abort、RunResult；run-root/model-tool 投影正确且无迟到事件 |
-| 单一路径 | TextInput 行为不变；external/model-tool 只经过一套 activation kernel；CLI 与 AgentCore 只剩一套 discovery/activation 内核 |
-| 消费闭环 | `/skill → MetaWork route → tasks.run → session_run_input(SKILL)`；TextInput 的 `/xxx` 仍是普通文本；valid/tombstone/unknown 三种结果互不退化 |
+| Catalog | Session 前查询、priority、identity/revision、argument schema、workspace epoch、healthy/degraded、slot tombstone、无同名回退、全局/局部失败域、遍历与资源 caps |
+| Lifecycle | immutable snapshot、per-activation working tree、Runtime aggregate caps、首选 temp 不适用时选择 native fallback；强制覆盖 final release 与 destroy 的两种竞争顺序，结果只能符合规定的成功或 `BUSY`，且无 UAF |
+| Run/policy | pre-admission 不改 Conversation/不推进 run_id；在 working-tree reserve、create/write、final verification 三处逐点注入失败，均推进 run_id、完整清理且不污染 parent frame；三层 policy 收窄、并发 sibling 隔离、非法 rule fail-closed、所有 terminal 精确恢复 |
+| Fork | inline/fork 共用 events、usage、abort、RunResult；run-root/model-tool 投影正确，无迟到事件，fork UI 请求 fail-closed |
+| 单一路径 | TextInput 行为不变；external/model-tool 只经过一套 activation kernel；同一 roots/scope/epoch fixture 在 CLI 与 AgentCore 产生相同 records、issues、revision、activation plan、policy 与 materialized tree |
+| 模块边界 | `skills/runtime` 不 import AgentCore 或产品层；AgentCore 目录不保留第二份 catalog/materialization/policy/activation 语义；相对固定基线，全部 changed paths 命中 allowlist，受限文件仅含批准的 adapter/注册改动 |
+| 消费闭环 | `/skill → MetaWork route → tasks.run → session_run_input(SKILL)`；TextInput 的 `/xxx` 仍是普通文本；valid/tombstone/unknown 三种结果互不退化；`STALE_CATALOG` query/refresh/同 run_id 重试 |
+
+定向门禁为 `zig build test:skill-runtime` 与 `zig build agentcore:test`。旧测试替代关系：
+loader/catalog → Runtime catalog + CLI projection；model tool/slash → shared model semantics
++ adapter L2；active policy/pool filter → `PolicyFrame` + projection tests。
 
 ### 6.3 实施护栏
 
@@ -627,8 +713,25 @@ A/B 关闭的设计缺陷，可经 MetaWork 确认拆分为：
    API、route 字段或具体 Skill 名称特判；MetaWork/CLI 产品路由不在该禁区。
 3. 批准前必须关闭影响 public contract 的事实调查；实施不得自行决定或改变
    layout、映射、ownership、failure boundary 与 event projection。
-4. 除本文明确批准的 invocation identity 与 degraded catalog 迁移外，CLI 行为
-   不得改变；未被替换的存量测试必须全绿，旧断言只能由对应的新语义测试替代。
+4. CLI 明确批准 invocation identity、degraded catalog、snapshot-bound source、
+   per-activation working tree 与 typed unavailable 迁移；除此之外行为不得改变。
+   未被替换的存量测试必须全绿，每条删除的旧测试必须指名对应的新语义测试。
+5. 不得以清理旧字段、统一 App/Session 或消除所有 Skill 名称为由修改通用底层。
+   底层遗留适配点的物理删除另立任务，不阻塞 Revision 4 的单一语义 Runtime。
+6. 修改范围采用 allowlist，未列出的路径相对固定基线一律零 diff：
+   - 允许：`src/skills/**`、`src/agentcore/**`、`tests/**`、`doc/**`；
+   - 受限：`src/app.zig` 仅允许 Runtime/adapter 初始化与接线；
+     `src/repl/loop.zig` 仅允许 import `skills/cli_adapter.zig`、委托 slash 调用并删除
+     旧 `handleSkillInvocation`；`src/main.zig`、`src/lib.zig` 与 `build.zig` 仅允许
+     Runtime/测试模块注册；`sdk/metask/agentcore.h` 仅允许消费合同注释；
+   - 因而 `src/core/agent_loop.zig`、`src/core/agent_session.zig`、
+     `src/core/conversation.zig`、`src/core/tool_exec.zig`、
+     `src/core/subagent.zig`、`src/tools/context.zig`、`src/tools/ask_user.zig`、
+     `src/api/**`、`src/permission.zig`、`src/permission/**` 及其余
+     `src/repl/**` 均禁止修改。
+   任何新解析、catalog、policy、materialization 或执行语义必须位于共享 Runtime
+   或 CLI adapter。若实现证据表明必须修改 allowlist 外路径，应停止实施，先更新
+   本文、说明缺失的通用接口和最小操作范围并重新评审，不得现场扩权。
 
 完成条件：矩阵全绿，双平台 baseline 更新，canonical ABI 文档、header、SDK、
 manifest、ledger 与实现一致；MetaWork 无需读取 Skill body、复制 loader 或解析
