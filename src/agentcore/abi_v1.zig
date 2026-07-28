@@ -7,11 +7,12 @@ const wire = @import("metask_agentcore_types");
 const core = @import("metacodes-core");
 const ui_request = core.protocol.ui_request;
 pub const protocol_v1 = @import("protocol_v1.zig");
-pub const skill_catalog = @import("skill_catalog.zig");
+const skill_runtime = core.skills_runtime;
+pub const skill_catalog = skill_runtime.catalog;
 pub const skill_catalog_handles = @import("skill_catalog_handles.zig");
-pub const skill_activation = @import("skill_activation.zig");
-pub const skill_materialization = @import("skill_materialization.zig");
-pub const policy_frame = @import("policy_frame.zig");
+pub const skill_activation = skill_runtime.activation;
+pub const skill_materialization = skill_runtime.materialization;
+pub const policy_frame = skill_runtime.policy_frame;
 pub const event_projection = @import("event_projection.zig");
 pub const model_skill_tool = @import("model_skill_tool.zig");
 const sandbox_admission = @import("sandbox_admission.zig");
@@ -474,7 +475,10 @@ const AbiSession = struct {
             environment.surface(),
         ) catch |run_error| {
             const callback_failed = environment.callbackFailed();
-            environment.deinit() catch {};
+            environment.deinit() catch {
+                environment_live = false;
+                return error.AdmittedCleanupFailed;
+            };
             environment_live = false;
             if (callback_failed) return error.CallbackFailed;
             return run_error;
@@ -565,10 +569,11 @@ const MaterializedSkillRun = struct {
         };
         defer allocator.free(invocation_record);
 
-        const body_record = std.fmt.allocPrint(
+        const body_record = core.skills_runtime.model_tool.formatResult(
             allocator,
-            "# Skill: {s}\n\n{s}",
-            .{ plan.skill.definition.name, self.activation.rendered_body },
+            plan.skill.definition.name,
+            self.activation.rendered_body,
+            false,
         ) catch |body_error| {
             _ = try self.finishWithoutConversation();
             return body_error;
@@ -624,21 +629,27 @@ const MaterializedSkillRun = struct {
                 env.callbackFailed()
             else
                 false;
-            if (environment) |*env| env.deinit() catch {};
+            var cleanup_failed = false;
+            if (environment) |*env| env.deinit() catch {
+                cleanup_failed = true;
+            };
             environment_live = false;
-            self.releaseAssets() catch {};
+            self.releaseAssets() catch {
+                cleanup_failed = true;
+            };
+            if (cleanup_failed) return error.AdmittedCleanupFailed;
             if (callback_failed) return error.CallbackFailed;
             return run_error;
         };
-        if (environment) |*env| {
-            env.deinit() catch {
-                environment_live = false;
-                self.releaseAssets() catch {};
-                return error.AdmittedCleanupFailed;
-            };
-        }
+        var cleanup_failed = false;
+        if (environment) |*env| env.deinit() catch {
+            cleanup_failed = true;
+        };
         environment_live = false;
-        self.releaseAssets() catch return error.AdmittedCleanupFailed;
+        self.releaseAssets() catch {
+            cleanup_failed = true;
+        };
+        if (cleanup_failed) return error.AdmittedCleanupFailed;
         return .{ .completed = result };
     }
 
@@ -676,7 +687,8 @@ const MaterializedSkillRun = struct {
                 .executeFn = ForkExecutorContext.execute,
             },
         ) catch |run_error| {
-            self.releaseAssets() catch {};
+            self.releaseAssets() catch
+                return error.AdmittedCleanupFailed;
             return run_error;
         };
         self.releaseAssets() catch return error.AdmittedCleanupFailed;
@@ -794,7 +806,10 @@ const ForkExecutorContext = struct {
                 .tool_dispatcher = dispatcher,
                 .execution_policy = execution_policy,
                 .host_run = host_run,
-                .ui_requester = self.session.permission_ctx.ui_requester,
+                // SubagentResult has no resumable suspend payload. Allowing a
+                // child UI request here would lose that payload at this
+                // adapter boundary, so fork children fail closed instead.
+                .ui_requester = null,
                 .read_state = &self.session.read_state,
                 .jobs = if (self.session.jobs) |*jobs| jobs else null,
                 .event_projection = switch (mode) {
@@ -807,6 +822,7 @@ const ForkExecutorContext = struct {
                 .cwd_abs = self.session.workspace.root,
                 .resolve_relative_paths = true,
                 .home_dir = self.session.workspace.home,
+                .additional_dirs = self.session.permission_ctx.match_ctx.additional_dirs,
             },
             &child_backend,
         ) catch |run_error| {
@@ -1016,6 +1032,7 @@ fn catalogLifecycleStatus(err: anyerror) u32 {
         error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
         error.RuntimeBusy, error.SessionBusy => wire.STATUS_BUSY,
         error.RuntimeUnavailable, error.InvalidSessionState => wire.STATUS_INVALID_STATE,
+        error.UnsupportedFilesystem => wire.STATUS_SKILL_UNAVAILABLE,
         error.WrongRuntime, error.WrongWorkspace, error.InvalidWorkspace => wire.STATUS_INVALID_ARGUMENT,
         else => wire.STATUS_CORE_ERROR,
     };
@@ -2277,6 +2294,10 @@ test "unsupported Skill materialization filesystem maps to Skill unavailable" {
     try std.testing.expectEqual(
         wire.STATUS_SKILL_UNAVAILABLE,
         skillRunErrorStatus(&fake, error.UnsupportedFilesystem),
+    );
+    try std.testing.expectEqual(
+        wire.STATUS_SKILL_UNAVAILABLE,
+        catalogLifecycleStatus(error.UnsupportedFilesystem),
     );
 }
 

@@ -5,11 +5,13 @@
 //! may safely cross the `beginRun` admission point.
 
 const std = @import("std");
-const catalog = @import("skill_catalog.zig");
-const materialization = @import("skill_materialization.zig");
+const catalog = @import("catalog.zig");
+const materialization = @import("materialization.zig");
 const policy_frame = @import("policy_frame.zig");
-const core = @import("metacodes-core");
-const workspace = core.workspace_policy;
+const workspace = @import("../../core/workspace_policy.zig");
+const AbortSignal = @import("../../util/abort.zig").AbortSignal;
+const sandbox_config = @import("../../sandbox/config.zig");
+const render = @import("../render.zig");
 
 pub const MAX_ARGUMENT_VALUES: usize = 64;
 pub const MAX_ARGUMENT_JSON_BYTES: usize = 1024 * 1024;
@@ -48,10 +50,10 @@ pub const ActivationPlan = struct {
 pub const ExecuteOptions = struct {
     materializations: *materialization.Manager,
     parent_frame: *policy_frame.PolicyFrame,
-    abort: *const core.util_abort.AbortSignal,
+    abort: *const AbortSignal,
     project_dir: []const u8,
     session_id: []const u8,
-    sandbox: ?*const core.sandbox_config.SandboxSettings,
+    sandbox: ?*const sandbox_config.SandboxSettings,
     cwd_abs: []const u8,
     home_dir: []const u8,
     additional_dirs: []const []const u8 = &.{},
@@ -92,7 +94,63 @@ pub fn prepare(
     var arena = std.heap.ArenaAllocator.init(owner_allocator);
     errdefer arena.deinit();
     const arguments = try parseArguments(arena.allocator(), arguments_json);
+    return finishPrepare(
+        arena,
+        snapshot,
+        catalog_revision,
+        skill_id,
+        arguments,
+        shell_policy,
+        context,
+    );
+}
 
+/// Adapter-neutral typed entry. JSON decoding belongs only at a wire boundary;
+/// CLI and in-process callers pass already-tokenized values here.
+pub fn prepareValues(
+    owner_allocator: std.mem.Allocator,
+    snapshot: *const catalog.Snapshot,
+    catalog_revision: []const u8,
+    skill_id: []const u8,
+    argument_values: []const []const u8,
+    shell_policy: workspace.ShellPolicy,
+    context: Context,
+) PrepareError!ActivationPlan {
+    if (argument_values.len > MAX_ARGUMENT_VALUES) return error.InvalidArguments;
+    var total_bytes: usize = 0;
+    for (argument_values) |value| {
+        if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidArguments;
+        total_bytes = std.math.add(usize, total_bytes, value.len) catch
+            return error.ResourceLimit;
+        if (total_bytes > MAX_ARGUMENT_JSON_BYTES) return error.ResourceLimit;
+    }
+
+    var arena = std.heap.ArenaAllocator.init(owner_allocator);
+    errdefer arena.deinit();
+    const arguments = try arena.allocator().alloc([]const u8, argument_values.len);
+    for (argument_values, arguments) |value, *owned| {
+        owned.* = try arena.allocator().dupe(u8, value);
+    }
+    return finishPrepare(
+        arena,
+        snapshot,
+        catalog_revision,
+        skill_id,
+        arguments,
+        shell_policy,
+        context,
+    );
+}
+
+fn finishPrepare(
+    arena: std.heap.ArenaAllocator,
+    snapshot: *const catalog.Snapshot,
+    catalog_revision: []const u8,
+    skill_id: []const u8,
+    arguments: []const []const u8,
+    shell_policy: workspace.ShellPolicy,
+    context: Context,
+) PrepareError!ActivationPlan {
     if (!catalog.isLowerHex64(catalog_revision)) return error.InvalidCatalogRevision;
     if (!std.mem.eql(u8, &snapshot.revision, catalog_revision)) return error.StaleCatalog;
     if (!catalog.isLowerHex64(skill_id)) return error.InvalidSkillId;
@@ -108,7 +166,7 @@ pub fn prepare(
         skill.definition.disallowed_tools,
     ) catch return error.PolicyViolation;
 
-    const requires_shell = core.skills_render.hasShellInjection(skill.definition.body);
+    const requires_shell = render.hasShellInjection(skill.definition.body);
 
     if (requires_shell and shell_policy == .disabled) return error.PolicyViolation;
     if (requires_shell and std.mem.eql(u8, skill.definition.shell, "powershell"))
@@ -142,7 +200,7 @@ pub fn activate(
         return frame_error;
     };
 
-    const rendered = core.skills_render.renderBody(
+    const rendered = render.renderBody(
         owner_allocator,
         plan.skill.definition.body,
         .{
@@ -604,7 +662,7 @@ test "model-tool and external callers share activation kernel and parent lineage
         &.{},
     );
     defer parent_frame.release();
-    var abort = core.util_abort.AbortSignal.init();
+    var abort = AbortSignal.init();
 
     {
         var activated = try activate(std.testing.allocator, &plan, .{

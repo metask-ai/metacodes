@@ -41,6 +41,7 @@ const usage_mod = @import("../core/usage.zig");
 const types_mod = @import("../types.zig");
 const util_time = @import("../util/time.zig");
 const model_command = @import("model_command.zig");
+const skill_cli_adapter = @import("../skills/cli_adapter.zig");
 
 /// 把 CoreEvent 的字节写到 std.debug.print(stderr)——非 TTY 交互 / cron / skill 等场景。
 /// 对齐旧 DebugWriter.print 行为。
@@ -470,11 +471,6 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             continue;
         }
 
-        // 用户显式 /<skill-name> [args] 触发 — 在内建命令之后兜底。
-        // 必须以 / 开头且看起来像 skill 名(无 / 之外的特殊字符)。
-        if (trimmed.len > 1 and trimmed[0] == '/' and try handleSkillInvocation(app, allocator, trimmed[1..])) {
-            continue;
-        }
         // ! shell mode:直接执行 shell 命令,输出加入对话上下文(不走模型)
         if (trimmed.len > 1 and trimmed[0] == '!') {
             try handleShellMode(app, allocator, std.mem.trim(u8, trimmed[1..], " \t"));
@@ -491,6 +487,18 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
             try app.conversation.appendText(.user, REVIEW_PROMPT);
             try runInjectedAgent(app, allocator, &aux_be);
             continue;
+        }
+        // 用户显式 /<skill-name> [args] 触发。所有内建 Command 已先消费，
+        // 因而同名 Skill 不会劫持 /review、/commit 等产品路由。
+        if (trimmed.len > 0 and trimmed[0] == '/') {
+            switch (try skill_cli_adapter.handleSlash(app, allocator, trimmed[1..])) {
+                .handled => continue,
+                .unknown_command => {
+                    std.debug.print("Unknown command or unavailable Skill: {s}\n", .{trimmed});
+                    continue;
+                },
+                .not_a_command => {},
+            }
         }
 
         // tty 模式：LineEditor 已经在 buffer 里保存换行（Shift+Enter / Ctrl+Enter），一次提交
@@ -3187,110 +3195,6 @@ fn shellQuoteSingle(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     }
     try out.append(allocator, '\'');
     return out.toOwnedSlice(allocator);
-}
-
-/// 用户显式 /<skill-name> [args] 调用。
-/// 返回 true 表示已处理(skill 命中或不存在但语法看起来像 skill 名);
-/// false 表示不是 skill 调用,继续走普通用户消息。
-///
-/// 处理流程:
-/// 1. 拆 head [args...](shell-style 引号)
-/// 2. head 在 skillset 找;没找到 → 友好提示后返 true(避免被当成普通消息发给模型)
-/// 3. 找到 → 构造 user message 写入 transcript "/name [args]"
-///    然后**直接调用 Skill 工具**(explicit_invocation=true),把结果作为 user-side
-///    tool_result 形态注入 conversation(模拟 Skill 工具被用户那边触发了一次)。
-/// 4. 让 agent_loop 跑一轮 — 模型基于激活的 skill 内容回应。
-fn handleSkillInvocation(app: *app_mod.App, allocator: std.mem.Allocator, rest: []const u8) !bool {
-    // 拆 head + args(空格分;不深入引号支持,使用 skills/tool.zig 内的 parseShellQuoted 通过 Skill tool args 处理)
-    var head_end: usize = 0;
-    while (head_end < rest.len and rest[head_end] != ' ' and rest[head_end] != '\t') : (head_end += 1) {}
-    const head = rest[0..head_end];
-    if (head.len == 0) return false;
-
-    // 不允许嵌套斜杠/其它特殊字符 — 那不像 skill 名
-    for (head) |c| {
-        if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != ':') return false;
-    }
-
-    // 是否真有这个 skill
-    if (app.skills.find(head) == null) return false;
-
-    const args_tail = std.mem.trim(u8, rest[head_end..], " \t");
-
-    // 构造 Skill 工具 args:用 args 字符串透传(parseShellQuoted 在 tool.zig 内拆)
-    var skill_args_buf: std.Io.Writer.Allocating = .init(allocator);
-    defer skill_args_buf.deinit();
-    try skill_args_buf.writer.writeAll("{\"name\":");
-    try std.json.Stringify.encodeJsonString(head, .{}, &skill_args_buf.writer);
-    if (args_tail.len > 0) {
-        try skill_args_buf.writer.writeAll(",\"args\":");
-        try std.json.Stringify.encodeJsonString(args_tail, .{}, &skill_args_buf.writer);
-    }
-    try skill_args_buf.writer.writeByte('}');
-    const skill_args_json = try skill_args_buf.toOwnedSlice();
-    defer allocator.free(skill_args_json);
-
-    // 直接调 Skill 工具(绕过模型) — 通过 dyn_registry
-    const skill_entry = app.dyn_registry.find("Skill") orelse {
-        std.debug.print("\x1b[31m/{s}: Skill tool not registered\x1b[0m\n", .{head});
-        return true;
-    };
-    // 上一个 user message 是新的 → 清掉之前的激活态
-    app.clearActiveSkill();
-    var tool_ctx = @import("../tools.zig").ToolContext{
-        .allocator = allocator,
-        .abort = &app.abort,
-        .read_state = &app.read_state,
-        .permission_ctx = &app.permission_ctx,
-        .dyn_registry = &app.dyn_registry,
-        .host_services = app.hostServices(),
-        .explicit_invocation = true, // 关键:用户显式触发,disable-model-invocation 跳过
-        .project_dir = app.project_dir_or_empty(),
-        .session_id = "",
-    };
-    const skill_result = skill_entry.execute(&tool_ctx, skill_args_json, skill_entry.ctx_ptr) catch |err| {
-        std.debug.print("\x1b[31m/{s}: skill activation failed: {s}\x1b[0m\n", .{ head, @errorName(err) });
-        return true;
-    };
-    defer allocator.free(skill_result);
-
-    // 把命令和激活结果作为用户消息注入 conversation
-    const user_msg = if (args_tail.len > 0)
-        try std.fmt.allocPrint(allocator, "/{s} {s}", .{ head, args_tail })
-    else
-        try std.fmt.allocPrint(allocator, "/{s}", .{head});
-    defer allocator.free(user_msg);
-    try app.conversation.appendText(.user, user_msg);
-
-    // 把渲染好的 skill 内容紧接其后,作为一段额外 user 上下文(skill 激活的标准做法)
-    try app.conversation.appendText(.user, skill_result);
-
-    // 显示给用户看
-    std.debug.print("\x1b[36m{s}\x1b[0m\n", .{skill_result});
-
-    // 让模型基于激活态回应。WriterBackend/std.debug.print:tool_render_theme 虽传,但
-    // print-only backend 的工具卡事件 no-op(对齐旧 DebugWriter 经 @hasDecl 编译期消失)。
-    var wb = debugBackend(app.config.verbose, true, &app.usage);
-    const be = wb.backend();
-    const jobs_ptr: ?*@import("../core/job_registry.zig").JobRegistry = if (app.jobs) |*jr| jr else null;
-    // 辅助路径(skill 调用 / cron 注入),非用户盯着的主交互循环 → 不接 spawn_tick_fn(默认 null,Bash 长命令静默,故意不传非遗漏)。
-    const result = agent_loop.run(
-        &app.conversation,
-        app.provider(),
-        app.tool_defs,
-        &app.permission_ctx,
-        .{ .session = app.session_id, .verbose = app.config.verbose, .abort = &app.abort, .read_state = &app.read_state, .edit_hl_cache = &app.edit_hl_cache, .lsp = app.lsp_service, .jobs = jobs_ptr, .agent_jobs = if (app.agent_jobs) |*aj| aj else null, .plan_prev_mode = &app.plan_prev_mode, .tasks = &app.tasks, .kg = if (app.kg) |*k| k else null, .kg_projects_dir = app.kg_projects_dir, .memdir_abs = app.memdir_abs, .api_client = app.anthropicClientOrNull(), .tool_defs = app.tool_defs, .system_prompt = app.system_prompt, .inject_user_context = app.user_context, .model_switch_compact = app.pendingModelSwitchCompact(), .dyn_registry = &app.dyn_registry, .host_services = app.hostServices(), .project_dir = app.project_dir_or_empty(), .sandbox = app.sandboxPtr(), .cwd_abs = app.cwdAbs(), .additional_dirs = app.additionalDirs(), .home_dir = app.homeDir(), .plan_file_path = app.plan_file_path, .emit_tool_cards = true },
-        &be,
-        allocator,
-    ) catch |err| {
-        std.debug.print("\x1b[31mError after /{s}: {s}\x1b[0m\n", .{ head, @errorName(err) });
-        app.clearPendingModelSwitchCompact();
-        return true;
-    };
-    app.clearPendingModelSwitchCompact();
-    app.persistTranscript();
-    if (result.stop_reason == .aborted) app.abort.resetForTesting();
-    return true;
 }
 
 /// 启动 banner:圆角 box(对齐 cc 2.1.x)。版本 + 模型 + cwd 三行。

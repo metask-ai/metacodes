@@ -9,12 +9,11 @@ const builtin = @import("builtin");
 const sync = @import("platform").sync;
 const rng = @import("platform").rng;
 const paths = @import("platform").paths;
-const core = @import("metacodes-core");
-const catalog = @import("skill_catalog.zig");
+const catalog = @import("catalog.zig");
+const AbortSignal = @import("../../util/abort.zig").AbortSignal;
 
 const Dir = std.Io.Dir;
 const File = std.Io.File;
-const AbortSignal = core.util_abort.AbortSignal;
 const windows = std.os.windows;
 
 pub const MAX_ACTIVE_BYTES: usize = 256 * 1024 * 1024;
@@ -26,6 +25,7 @@ const ENTRY_ACCOUNT_BYTES: usize = 4096;
 pub const Error = error{
     OutOfMemory,
     RandomUnavailable,
+    CandidateUnavailable,
     ResourceLimit,
     Aborted,
     CoreError,
@@ -84,14 +84,97 @@ pub const Manager = struct {
         errdefer allocator.destroy(io_runtime);
         io_runtime.* = std.Io.Threaded.init(allocator, .{});
         errdefer io_runtime.deinit();
-        return initWithIo(
+        var manager = try initWithPreferredRoot(
             allocator,
             io_runtime.io(),
-            io_runtime,
             paths.tempDir(),
             .{},
             MAX_ACTIVE_BYTES,
         );
+        manager.owned_io_runtime = io_runtime;
+        return manager;
+    }
+
+    pub fn initWithBorrowedIo(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        base_path: []const u8,
+    ) Error!Manager {
+        return initWithPreferredRoot(
+            allocator,
+            io,
+            base_path,
+            .{},
+            MAX_ACTIVE_BYTES,
+        );
+    }
+
+    fn initWithPreferredRoot(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        preferred_root: []const u8,
+        name_source: NameSource,
+        max_active_bytes: usize,
+    ) Error!Manager {
+        var scratch = std.heap.ArenaAllocator.init(allocator);
+        defer scratch.deinit();
+        var candidates: std.ArrayList([]const u8) = .empty;
+        try appendCandidate(scratch.allocator(), &candidates, preferred_root);
+        if (builtin.os.tag == .windows) {
+            if (paths.homeDir()) |home| {
+                const local_temp = std.fs.path.join(
+                    scratch.allocator(),
+                    &.{ home, "AppData", "Local", "Temp" },
+                ) catch return error.OutOfMemory;
+                try appendCandidate(scratch.allocator(), &candidates, local_temp);
+            }
+            try appendCandidate(
+                scratch.allocator(),
+                &candidates,
+                "C:\\Windows\\Temp",
+            );
+        } else {
+            try appendCandidate(scratch.allocator(), &candidates, "/tmp");
+            if (builtin.os.tag == .macos)
+                try appendCandidate(
+                    scratch.allocator(),
+                    &candidates,
+                    "/private/tmp",
+                );
+        }
+        return initFromCandidates(
+            allocator,
+            io,
+            candidates.items,
+            name_source,
+            max_active_bytes,
+        );
+    }
+
+    fn initFromCandidates(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        candidates: []const []const u8,
+        name_source: NameSource,
+        max_active_bytes: usize,
+    ) Error!Manager {
+        for (candidates) |candidate| {
+            var manager = initWithIo(
+                allocator,
+                io,
+                null,
+                candidate,
+                name_source,
+                max_active_bytes,
+            ) catch |err| switch (err) {
+                error.CandidateUnavailable, error.UnsupportedFilesystem => continue,
+                error.OutOfMemory, error.RandomUnavailable => return err,
+                else => return err,
+            };
+            if (manager.exact_file_modes) return manager;
+            manager.deinit() catch return error.CoreError;
+        }
+        return error.UnsupportedFilesystem;
     }
 
     fn initBorrowed(
@@ -102,15 +185,8 @@ pub const Manager = struct {
         max_active_bytes: usize,
     ) Error!Manager {
         if (comptime !builtin.is_test)
-            @compileError("borrowed materializer I/O is test-only");
-        return initWithIo(
-            allocator,
-            io,
-            null,
-            base_path,
-            name_source,
-            max_active_bytes,
-        );
+            @compileError("custom borrowed materializer configuration is test-only");
+        return initWithIo(allocator, io, null, base_path, name_source, max_active_bytes);
     }
 
     fn initWithIo(
@@ -424,6 +500,18 @@ const CreatedRoot = struct {
     dir: Dir,
 };
 
+fn appendCandidate(
+    arena: std.mem.Allocator,
+    candidates: *std.ArrayList([]const u8),
+    path: []const u8,
+) error{OutOfMemory}!void {
+    if (path.len == 0) return;
+    for (candidates.items) |existing| {
+        if (std.mem.eql(u8, existing, path)) return;
+    }
+    try candidates.append(arena, try arena.dupe(u8, path));
+}
+
 fn createPrivateRoot(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -443,7 +531,10 @@ fn createPrivateRoot(
     const root_dir = Dir.openDirAbsolute(io, root_path, .{
         .iterate = true,
         .follow_symlinks = false,
-    }) catch return error.CoreError;
+    }) catch {
+        Dir.cwd().deleteTree(io, root_path) catch return error.CoreError;
+        return error.CandidateUnavailable;
+    };
     return .{ .path = root_path, .dir = root_dir };
 }
 
@@ -451,7 +542,7 @@ fn createPrivateDirectory(io: std.Io, path: []const u8) Error!bool {
     if (comptime builtin.os.tag != .windows) {
         Dir.createDirAbsolute(io, path, privateDirPermissions()) catch |err| switch (err) {
             error.PathAlreadyExists => return false,
-            else => return error.CoreError,
+            else => return error.CandidateUnavailable,
         };
         return true;
     }
@@ -482,7 +573,7 @@ fn createPrivateDirectory(io: std.Io, path: []const u8) Error!bool {
     if (!CreateDirectoryW(path_w.span(), &security_attributes).toBool()) {
         return switch (windows.GetLastError()) {
             .ALREADY_EXISTS, .FILE_EXISTS => false,
-            else => error.CoreError,
+            else => error.CandidateUnavailable,
         };
     }
     if (!windowsPrivateDaclIsProtected(path_w.span())) {
@@ -1016,6 +1107,56 @@ test "entropy failure does not create a Runtime private root" {
     try std.testing.expectError(
         error.RandomUnavailable,
         testManager(&tmp, &names, MAX_ACTIVE_BYTES),
+    );
+}
+
+test "candidate root selection skips an unusable path and chooses a valid fallback" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const valid_root = root_buffer[0..root_len];
+    const invalid_root = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ valid_root, "missing", "child" },
+    );
+    defer std.testing.allocator.free(invalid_root);
+    const candidates = [_][]const u8{ invalid_root, valid_root };
+    var names = DeterministicNames{};
+    var manager = try Manager.initFromCandidates(
+        std.testing.allocator,
+        std.testing.io,
+        &candidates,
+        names.source(),
+        MAX_ACTIVE_BYTES,
+    );
+    defer manager.deinit() catch unreachable;
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        manager.root_path,
+        valid_root,
+    ));
+}
+
+test "candidate root selection never hides entropy failure behind fallback" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const candidates = [_][]const u8{
+        root_buffer[0..root_len],
+        root_buffer[0..root_len],
+    };
+    var names = DeterministicNames{ .fail = true };
+    try std.testing.expectError(
+        error.RandomUnavailable,
+        Manager.initFromCandidates(
+            std.testing.allocator,
+            std.testing.io,
+            &candidates,
+            names.source(),
+            MAX_ACTIVE_BYTES,
+        ),
     );
 }
 

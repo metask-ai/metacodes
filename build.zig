@@ -870,6 +870,60 @@ pub fn build(b: *std.Build) void {
         spike_step.dependOn(&run_t.step);
     }
 
+    // Focused Revision 4 gate. Keep Skill Runtime/adapter work independently
+    // runnable instead of forcing every unrelated spike/component artifact
+    // through the broad `test` graph.
+    const skill_runtime_step = b.step(
+        "test:skill-runtime",
+        "Run the shared Skill Runtime and CLI adapter integration tests",
+    );
+    const skill_runtime_files = [_][]const u8{
+        "tests/integration/skills_e2e_test.zig",
+        "tests/component/skill_fork_test.zig",
+    };
+    for (skill_runtime_files) |f| {
+        const m = b.createModule(.{
+            .root_source_file = b.path(f),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        m.addImport("harness", test_harness_mod);
+        m.addImport("cc", test_cc_mod);
+        addPlatform(b, m);
+        const t = b.addTest(.{
+            .name = "skill-runtime",
+            .root_module = m,
+            .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+        });
+        const run_t = addTestRunArtifact(b, t, windows_test_prelude);
+        skill_runtime_step.dependOn(&run_t.step);
+    }
+    const skill_runtime_unit_mod = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    addHl(b, skill_runtime_unit_mod);
+    const skill_runtime_unit = b.addTest(.{
+        .name = "skill-runtime-unit",
+        .root_module = skill_runtime_unit_mod,
+        .filters = &.{
+            "skills.runtime",
+            "skills.active",
+            "skills.skill",
+            "skills.tool_pool_filter",
+        },
+    });
+    skill_runtime_step.dependOn(
+        &addTestRunArtifact(
+            b,
+            skill_runtime_unit,
+            windows_test_prelude,
+        ).step,
+    );
+
     test_step.dependOn(spike_step);
 
     // test:new —— 只跑本次 e2e 框架新增的 L2 component 测试(隔离运行,绕开主套件已知

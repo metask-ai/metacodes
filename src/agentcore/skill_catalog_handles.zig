@@ -9,7 +9,7 @@ const builtin = @import("builtin");
 const sync = @import("platform").sync;
 const rng = @import("platform").rng;
 const core = @import("metacodes-core");
-const catalog = @import("skill_catalog.zig");
+const catalog = core.skills_runtime.catalog;
 
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
@@ -256,7 +256,11 @@ pub const RuntimeCatalogs = struct {
         defer call.deinit();
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
-        const sources = try defaultSources(scratch.allocator(), workspace);
+        const sources = try catalog.defaultSources(
+            scratch.allocator(),
+            workspace.root,
+            workspace.home,
+        );
         return self.queryUnderGuard(
             io,
             workspace,
@@ -366,72 +370,6 @@ fn updateField(hmac: *HmacSha256, bytes: []const u8) void {
     std.mem.writeInt(u64, &encoded, bytes.len, .big);
     hmac.update(&encoded);
     hmac.update(bytes);
-}
-
-fn defaultSources(
-    arena: std.mem.Allocator,
-    workspace: *const CanonicalWorkspace,
-) error{OutOfMemory}![]const catalog.Source {
-    var sources: std.ArrayList(catalog.Source) = .empty;
-    const enterprise = "/etc/metacodes/skills";
-    if (std.fs.path.isAbsolute(enterprise)) {
-        try sources.append(arena, .{
-            .root = enterprise,
-            .scope = .enterprise,
-            .priority = 100,
-        });
-    }
-    try appendSource(
-        arena,
-        &sources,
-        workspace.home,
-        &.{ ".claude", "skills" },
-        .personal,
-        200,
-    );
-    try appendSource(
-        arena,
-        &sources,
-        workspace.home,
-        &.{ ".metacodes", "skills" },
-        .personal,
-        201,
-    );
-    try appendSource(
-        arena,
-        &sources,
-        workspace.root,
-        &.{ ".claude", "skills" },
-        .project,
-        300,
-    );
-    try appendSource(
-        arena,
-        &sources,
-        workspace.root,
-        &.{ ".metacodes", "skills" },
-        .project,
-        301,
-    );
-    return sources.toOwnedSlice(arena);
-}
-
-fn appendSource(
-    arena: std.mem.Allocator,
-    sources: *std.ArrayList(catalog.Source),
-    base: []const u8,
-    suffix: []const []const u8,
-    scope: catalog.SourceScope,
-    priority: u32,
-) error{OutOfMemory}!void {
-    const parts = try arena.alloc([]const u8, suffix.len + 1);
-    parts[0] = base;
-    @memcpy(parts[1..], suffix);
-    try sources.append(arena, .{
-        .root = try std.fs.path.join(arena, parts),
-        .scope = scope,
-        .priority = priority,
-    });
 }
 
 test "scope identity is Runtime-secret and canonical-workspace bound" {

@@ -1,13 +1,8 @@
-//! Immutable Skill catalog snapshot used by the AgentCore ABI.
-//!
-//! The existing CLI `SkillSet` remains a tolerant product projection. This
-//! resolver reuses its canonical frontmatter parser, but retains structural
-//! candidates and snapshots selected trees so the ABI can expose deterministic
-//! tombstones, revisions, and no-follow execution inputs.
+//! Canonical immutable Skill catalog snapshot shared by product adapters.
 
 const std = @import("std");
 const builtin = @import("builtin");
-const skill_mod = @import("metacodes-core").skills;
+const definition_mod = @import("definition.zig");
 
 const Dir = std.Io.Dir;
 const File = std.Io.File;
@@ -40,6 +35,47 @@ pub const Source = struct {
     namespace: []const u8 = "",
 };
 
+/// Canonical built-in source order shared by CLI and AgentCore adapters.
+pub fn defaultSources(
+    arena: std.mem.Allocator,
+    workspace_root: []const u8,
+    workspace_home: []const u8,
+) error{OutOfMemory}![]const Source {
+    var sources: std.ArrayList(Source) = .empty;
+    const enterprise = "/etc/metacodes/skills";
+    if (std.fs.path.isAbsolute(enterprise)) {
+        try sources.append(arena, .{
+            .root = enterprise,
+            .scope = .enterprise,
+            .priority = 100,
+        });
+    }
+    try appendDefaultSource(arena, &sources, workspace_home, &.{ ".claude", "skills" }, .personal, 200);
+    try appendDefaultSource(arena, &sources, workspace_home, &.{ ".metacodes", "skills" }, .personal, 201);
+    try appendDefaultSource(arena, &sources, workspace_root, &.{ ".claude", "skills" }, .project, 300);
+    try appendDefaultSource(arena, &sources, workspace_root, &.{ ".metacodes", "skills" }, .project, 301);
+    return sources.toOwnedSlice(arena);
+}
+
+fn appendDefaultSource(
+    arena: std.mem.Allocator,
+    sources: *std.ArrayList(Source),
+    base: []const u8,
+    suffix: []const []const u8,
+    scope: SourceScope,
+    priority: u32,
+) error{OutOfMemory}!void {
+    if (base.len == 0) return;
+    const parts = try arena.alloc([]const u8, suffix.len + 1);
+    parts[0] = base;
+    @memcpy(parts[1..], suffix);
+    try sources.append(arena, .{
+        .root = try std.fs.path.join(arena, parts),
+        .scope = scope,
+        .priority = priority,
+    });
+}
+
 pub const IssueCode = enum {
     invalid_definition,
     source_conflict,
@@ -61,7 +97,7 @@ pub const FileRecord = struct {
 pub const SkillRecord = struct {
     skill_id: [64]u8,
     invocation_name: []const u8,
-    definition: skill_mod.Skill,
+    definition: definition_mod.Skill,
     directories: []const []const u8,
     files: []const FileRecord,
 };
@@ -427,7 +463,7 @@ fn snapshotCandidateTemporary(
     const md = definition_bytes orelse return error.InvalidDefinition;
     if (!std.unicode.utf8ValidateSlice(md)) return error.InvalidDefinition;
     validateSkillMetadata(md) catch return error.InvalidDefinition;
-    const definition = skill_mod.parseSkillMdWithFallback(
+    const definition = definition_mod.parseSkillMdWithFallback(
         arena,
         md,
         "",
@@ -982,7 +1018,7 @@ test "catalog priority, tombstone, snapshot, parser parity, and revision are det
     try std.testing.expect(std.mem.indexOf(u8, first.descriptor_json, "source_path") == null);
     try std.testing.expect(std.mem.indexOf(u8, first.descriptor_json, "\"body\"") == null);
 
-    var parsed = try skill_mod.parseSkillMdWithFallback(std.testing.allocator, high_md, "", "review");
+    var parsed = try definition_mod.parseSkillMdWithFallback(std.testing.allocator, high_md, "", "review");
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(parsed.name, first.skills[0].definition.name);
     try std.testing.expectEqualStrings(parsed.description, first.skills[0].definition.description);

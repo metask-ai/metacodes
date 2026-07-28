@@ -117,6 +117,7 @@ const TaskStore = @import("core/task_store.zig").TaskStore;
 const system_prompt_mod = @import("core/system_prompt.zig");
 const DynRegistry = @import("tools/dynamic.zig").DynRegistry;
 const skill_tool_mod = @import("skills/tool.zig");
+const skill_cli_adapter = @import("skills/cli_adapter.zig");
 const McpClient = @import("mcp/client.zig").McpClient;
 const McpSession = @import("mcp/registry_bridge.zig").McpSession;
 const ActiveSkillState = @import("skills/active.zig").ActiveSkillState;
@@ -202,6 +203,9 @@ pub const App = struct {
     /// 与 abort 分开:abort=用户中断(对话留前台),background=主对话转后台续跑。
     background_request: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     skills: SkillSet,
+    /// Canonical Skill Runtime; `skills` above is only its legacy-shaped
+    /// presentation/preload projection.
+    skill_runtime: skill_cli_adapter.Runtime,
     read_state: ReadState,
     /// Edit/Write 旁路高亮缓存(tool_id → 新旧全文)。供 diff 工具卡 hl-zig 着色;
     /// 不进对话历史。session 退出 deinit。
@@ -329,6 +333,7 @@ pub const App = struct {
             .permission_ctx = permission_mod.createContext(config.permission_mode, allocator),
             .abort = AbortSignal.init(),
             .skills = SkillSet.init(allocator),
+            .skill_runtime = skill_cli_adapter.Runtime.init(allocator, io),
             .activated_tools = std.StringHashMap(void).init(allocator),
             .read_state = ReadState.init(allocator),
             .edit_hl_cache = @import("core/edit_hl_cache.zig").EditHlCache.init(allocator),
@@ -354,11 +359,23 @@ pub const App = struct {
             app.gemini_client = gemini_mod.GeminiClient.init(allocator, io, api_key, config.model, config.base_url);
         }
 
-        // 启动时加载 skills:enterprise / ~/.metacodes / ~/.claude / project chain。
-        // 沿 cwd 向上找 .git 定位 project root,沿途每级 .metacodes/skills 都加载。
+        // 启动时由 canonical Runtime 解析 enterprise / personal / project
+        // sources；cwd 仅用于确定稳定的 Workspace root。
         const cwd_for_skills = @import("util/fs.zig").getCwd(allocator) catch null;
         defer if (cwd_for_skills) |c| allocator.free(c);
-        app.skills.loadFromStandardPaths(cwd_for_skills orelse "") catch {};
+        if (cwd_for_skills) |cwd| {
+            app.skill_runtime.loadDefault(
+                cwd,
+                @import("platform").paths.homeDir() orelse "",
+                &app.skills,
+            ) catch |err| {
+                @import("util/log.zig").warn(
+                    "skill",
+                    "canonical catalog load failed: {s}",
+                    .{@errorName(err)},
+                );
+            };
+        }
         // 加载 subagent 定义(builtin 三个 + personal + project)
         app.agents.loadFromStandardPaths(cwd_for_skills orelse "") catch {};
         // 缓存 project root(供 ${CLAUDE_PROJECT_DIR} 替换)
@@ -397,11 +414,13 @@ pub const App = struct {
         app.permission_ctx.session_rules = &app.session_rules;
         app.permission_ctx.session = app.session_id; // 权限对话框路由到本会话视图(M5/M6)
 
-        // 注册 Skill 工具到 dyn_registry（ctx_ptr 指向 SkillSet）。
-        // 失败仅 log——skills 仍可通过 /skills 列表，只是模型激活不了。
-        skill_tool_mod.registerSkillTool(&app.dyn_registry, &app.skills) catch |err| {
-            @import("util/log.zig").warn("skill", "register Skill tool failed: {s}", .{@errorName(err)});
-        };
+        // Model-facing Skill is present only when the canonical snapshot has
+        // at least one model-invocable record.
+        if (app.skill_runtime.hasModelInvocable()) {
+            skill_tool_mod.registerSkillTool(&app.dyn_registry, &app.skill_runtime) catch |err| {
+                @import("util/log.zig").warn("skill", "register Skill tool failed: {s}", .{@errorName(err)});
+            };
+        }
 
         // 启动时尝试连接 config.json 里声明的 MCP servers。失败逐个 log，不影响启动。
         app.connectMcpServers() catch |err| {
@@ -428,6 +447,7 @@ pub const App = struct {
             .agent_teams = config.agent_teams, // F5:门控 swarm 工具进 tool_defs
         };
         app.tool_defs = try tools_mod.toToolDefinitionsFull(allocator, &app.dyn_registry, &prompt_ctx);
+        _ = skill_cli_adapter.applyModelToolSchema(app.tool_defs);
         errdefer allocator.free(app.tool_defs);
 
         // 加载模型上下文窗口表(~/.metacode/models.toml)并挂到 client。
@@ -620,6 +640,12 @@ pub const App = struct {
         if (app.kg_projects_dir.len > 0) app.allocator.free(app.kg_projects_dir);
         if (app.kg_summary.len > 0) app.allocator.free(app.kg_summary);
         app.allocator.free(app.tool_defs);
+        if (app.active_skill) |*active| {
+            active.deinit();
+            app.active_skill = null;
+            app.permission_ctx.active_skill = null;
+        }
+        app.skill_runtime.deinit();
         app.skills.deinit();
         app.read_state.deinit();
         app.edit_hl_cache.deinit();
@@ -635,7 +661,6 @@ pub const App = struct {
         }
         app.mcp_sessions.deinit(app.allocator);
         app.dyn_registry.deinit();
-        if (app.active_skill) |*as| as.deinit();
         {
             var it = app.activated_tools.keyIterator();
             while (it.next()) |k| app.allocator.free(k.*);
@@ -1109,9 +1134,16 @@ pub const App = struct {
         allowed_tools: []const []const u8,
         disallowed_tools: []const []const u8,
     ) !void {
-        if (app.active_skill) |*as| as.deinit();
-        app.active_skill = try ActiveSkillState.init(app.allocator, skill_name, allowed_tools, disallowed_tools);
-        app.permission_ctx.active_skill = &app.active_skill.?;
+        _ = skill_name;
+        _ = allowed_tools;
+        _ = disallowed_tools;
+        // The CLI adapter owns the context-local projection. Keeping it there
+        // lets fork siblings use distinct PermissionContext values without
+        // turning App into a second mutable Skill runtime.
+        try app.skill_runtime.projectCurrent(
+            app.session_id,
+            &app.permission_ctx,
+        );
     }
 
     /// 清除激活态(loop.zig 在每条新 user message 进来时调用)。
@@ -1121,6 +1153,7 @@ pub const App = struct {
             app.active_skill = null;
         }
         app.permission_ctx.active_skill = null;
+        app.skill_runtime.clearContext(app.session_id);
     }
 
     /// Trampoline: ToolContext.activate_skill_fn 签名 — Skill 工具调用它把激活态通知到 App。

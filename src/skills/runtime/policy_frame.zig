@@ -1,13 +1,14 @@
-//! Immutable execution-context policy lineage for typed Skill activations.
+//! Shared immutable execution-context policy lineage for typed Skill activations.
 //!
 //! Frames are refcounted because fork siblings may outlive their caller's
 //! stack. A child can only add intersections and denials; it never mutates or
 //! re-authorizes its parent.
 
 const std = @import("std");
-const core = @import("metacodes-core");
-
-const rule_spec = core.permission_rule_spec;
+const rule_spec = @import("../../permission/rule_spec.zig");
+const workspace = @import("../../core/workspace_policy.zig");
+const types = @import("../../types.zig");
+const tool_types = @import("../../tools.zig");
 
 pub const Error = error{
     OutOfMemory,
@@ -23,15 +24,17 @@ pub const PolicyFrame = struct {
     effective_tools: []const []const u8,
     local_allowed: []const []const u8,
     local_disallowed: []const []const u8,
-    shell: core.workspace_policy.ShellPolicy,
-    permission: core.types.PermissionMode,
+    local_allowed_rules: []const rule_spec.RuleSpec,
+    local_disallowed_rules: []const rule_spec.RuleSpec,
+    shell: workspace.ShellPolicy,
+    permission: types.PermissionMode,
     match_context: rule_spec.MatchContext,
 
     pub fn createRoot(
         owner_allocator: std.mem.Allocator,
         session_tools: []const []const u8,
-        shell: core.workspace_policy.ShellPolicy,
-        permission: core.types.PermissionMode,
+        shell: workspace.ShellPolicy,
+        permission: types.PermissionMode,
         match_context: rule_spec.MatchContext,
     ) Error!*PolicyFrame {
         if (hasDuplicate(session_tools)) return error.InvalidPolicy;
@@ -44,6 +47,8 @@ pub const PolicyFrame = struct {
             .effective_tools = &.{},
             .local_allowed = &.{},
             .local_disallowed = &.{},
+            .local_allowed_rules = &.{},
+            .local_disallowed_rules = &.{},
             .shell = shell,
             .permission = permission,
             .match_context = undefined,
@@ -75,6 +80,8 @@ pub const PolicyFrame = struct {
             .effective_tools = &.{},
             .local_allowed = &.{},
             .local_disallowed = &.{},
+            .local_allowed_rules = &.{},
+            .local_disallowed_rules = &.{},
             .shell = base_frame.shell,
             .permission = base_frame.permission,
             // The child retains base_frame before returning, so these borrowed
@@ -90,13 +97,23 @@ pub const PolicyFrame = struct {
         const arena = self.arena.allocator();
         self.local_allowed = try cloneStrings(arena, allowed);
         self.local_disallowed = try cloneStrings(arena, disallowed);
+        self.local_allowed_rules = try parseRules(arena, self.local_allowed);
+        self.local_disallowed_rules = try parseRules(arena, self.local_disallowed);
 
         var effective: std.ArrayList([]const u8) = .empty;
         for (base_frame.effective_tools) |tool_name| {
             if (allowed.len != 0 and
-                !anyRuleTargetsTool(allowed, &base_frame.match_context, tool_name))
+                !anyRuleTargetsTool(
+                    self.local_allowed_rules,
+                    &base_frame.match_context,
+                    tool_name,
+                ))
                 continue;
-            if (anyRuleFullyDeniesTool(disallowed, &base_frame.match_context, tool_name))
+            if (anyRuleFullyDeniesTool(
+                self.local_disallowed_rules,
+                &base_frame.match_context,
+                tool_name,
+            ))
                 continue;
             effective.append(arena, tool_name) catch return error.OutOfMemory;
         }
@@ -142,15 +159,15 @@ pub const PolicyFrame = struct {
         return self.effective_tools;
     }
 
-    pub fn shellPolicy(self: *const PolicyFrame) core.workspace_policy.ShellPolicy {
+    pub fn shellPolicy(self: *const PolicyFrame) workspace.ShellPolicy {
         return self.shell;
     }
 
-    pub fn permissionMode(self: *const PolicyFrame) core.types.PermissionMode {
+    pub fn permissionMode(self: *const PolicyFrame) types.PermissionMode {
         return self.permission;
     }
 
-    pub fn executionPolicy(self: *const PolicyFrame) core.tools.ToolExecutionPolicy {
+    pub fn executionPolicy(self: *const PolicyFrame) tool_types.ToolExecutionPolicy {
         return .{
             .ctx = @ptrCast(self),
             .allowsToolFn = allowsToolAdapter,
@@ -168,9 +185,9 @@ pub const PolicyFrame = struct {
         if (!containsTool(self.effective_tools, tool_name)) return false;
         var cursor: ?*const PolicyFrame = self;
         while (cursor) |frame| : (cursor = frame.parent_frame) {
-            if (frame.local_allowed.len != 0 and
+            if (frame.local_allowed_rules.len != 0 and
                 !anyRuleMatches(
-                    frame.local_allowed,
+                    frame.local_allowed_rules,
                     &frame.match_context,
                     tool_name,
                     arguments_json,
@@ -178,13 +195,60 @@ pub const PolicyFrame = struct {
                 ))
                 return false;
             if (anyRuleMatches(
-                frame.local_disallowed,
+                frame.local_disallowed_rules,
                 &frame.match_context,
                 tool_name,
                 arguments_json,
                 .deny,
             ))
                 return false;
+        }
+        return true;
+    }
+
+    /// The internal Skill tool is an activation boundary, not a Session tool,
+    /// so ordinary allowed-tool intersections do not implicitly hide it.
+    /// Explicit `Skill(...)` rules still constrain nested composition.
+    pub fn allowsSkillTool(self: *const PolicyFrame) bool {
+        var cursor: ?*const PolicyFrame = self;
+        while (cursor) |frame| : (cursor = frame.parent_frame) {
+            if (anyRuleFullyDeniesTool(
+                frame.local_disallowed_rules,
+                &frame.match_context,
+                "Skill",
+            )) return false;
+        }
+        return true;
+    }
+
+    pub fn allowsSkillInvocation(
+        self: *const PolicyFrame,
+        arguments_json: []const u8,
+    ) bool {
+        var cursor: ?*const PolicyFrame = self;
+        while (cursor) |frame| : (cursor = frame.parent_frame) {
+            var constrained = false;
+            var matched = false;
+            for (frame.local_allowed_rules) |*rule| {
+                if (!ruleTargetsTool(rule, &frame.match_context, "Skill"))
+                    continue;
+                constrained = true;
+                if (rule_spec.matchesMode(
+                    rule,
+                    &frame.match_context,
+                    "Skill",
+                    arguments_json,
+                    .allow,
+                )) matched = true;
+            }
+            if (constrained and !matched) return false;
+            if (anyRuleMatches(
+                frame.local_disallowed_rules,
+                &frame.match_context,
+                "Skill",
+                arguments_json,
+                .deny,
+            )) return false;
         }
         return true;
     }
@@ -249,6 +313,19 @@ fn validRules(rules: []const []const u8) bool {
     return true;
 }
 
+fn parseRules(
+    arena: std.mem.Allocator,
+    rules: []const []const u8,
+) Error![]const rule_spec.RuleSpec {
+    const parsed = arena.alloc(rule_spec.RuleSpec, rules.len) catch
+        return error.OutOfMemory;
+    for (rules, parsed) |raw, *rule| {
+        rule.* = rule_spec.parseRule(raw) catch return error.InvalidPolicy;
+        if (rule.tool.len == 0) return error.InvalidPolicy;
+    }
+    return parsed;
+}
+
 fn hasDuplicate(values: []const []const u8) bool {
     for (values, 0..) |value, index| {
         if (value.len == 0) return true;
@@ -260,25 +337,23 @@ fn hasDuplicate(values: []const []const u8) bool {
 }
 
 fn anyRuleTargetsTool(
-    rules: []const []const u8,
+    rules: []const rule_spec.RuleSpec,
     context: *const rule_spec.MatchContext,
     tool_name: []const u8,
 ) bool {
-    for (rules) |raw| {
-        const parsed = rule_spec.parseRule(raw) catch unreachable;
-        if (ruleTargetsTool(&parsed, context, tool_name)) return true;
+    for (rules) |*parsed| {
+        if (ruleTargetsTool(parsed, context, tool_name)) return true;
     }
     return false;
 }
 
 fn anyRuleFullyDeniesTool(
-    rules: []const []const u8,
+    rules: []const rule_spec.RuleSpec,
     context: *const rule_spec.MatchContext,
     tool_name: []const u8,
 ) bool {
-    for (rules) |raw| {
-        const parsed = rule_spec.parseRule(raw) catch unreachable;
-        if (!ruleTargetsTool(&parsed, context, tool_name)) continue;
+    for (rules) |*parsed| {
+        if (!ruleTargetsTool(parsed, context, tool_name)) continue;
         switch (parsed.spec) {
             .all, .mcp_match => return true,
             else => {},
@@ -301,16 +376,15 @@ fn ruleTargetsTool(
 }
 
 fn anyRuleMatches(
-    rules: []const []const u8,
+    rules: []const rule_spec.RuleSpec,
     context: *const rule_spec.MatchContext,
     tool_name: []const u8,
     arguments_json: []const u8,
     mode: rule_spec.RuleMode,
 ) bool {
-    for (rules) |raw| {
-        const parsed = rule_spec.parseRule(raw) catch unreachable;
+    for (rules) |*parsed| {
         if (rule_spec.matchesMode(
-            &parsed,
+            parsed,
             context,
             tool_name,
             arguments_json,
@@ -342,8 +416,8 @@ test "parent narrowing cannot be recovered by a broad child" {
     defer child.release();
 
     try std.testing.expect(child.parent() == parent);
-    try std.testing.expectEqual(core.workspace_policy.ShellPolicy.sandboxed, child.shellPolicy());
-    try std.testing.expectEqual(core.types.PermissionMode.default, child.permissionMode());
+    try std.testing.expectEqual(workspace.ShellPolicy.sandboxed, child.shellPolicy());
+    try std.testing.expectEqual(types.PermissionMode.default, child.permissionMode());
     try std.testing.expect(child.allowsInvocation("Read", "{\"file_path\":\"/work/a\"}"));
     try std.testing.expect(!child.allowsInvocation("Write", "{\"file_path\":\"/work/a\"}"));
     try std.testing.expect(child.allowsInvocation("Bash", "{\"command\":\"git status\"}"));
@@ -358,6 +432,47 @@ test "parent narrowing cannot be recovered by a broad child" {
     try std.testing.expect(!execution_policy.allowsInvocation(
         "Bash",
         "{\"command\":\"rm -rf /\"}",
+    ));
+}
+
+test "nested Skill remains composable but explicit Skill rules are enforced" {
+    const root = try PolicyFrame.createRoot(
+        std.testing.allocator,
+        &.{ "Read", "Write" },
+        .sandboxed,
+        .default,
+        .{ .cwd = "/work", .project_root = "/work", .home = "/home/test" },
+    );
+    defer root.release();
+    const ordinary_narrow = try PolicyFrame.derive(root, &.{"Read"}, &.{});
+    defer ordinary_narrow.release();
+    try std.testing.expect(ordinary_narrow.allowsSkillTool());
+    try std.testing.expect(ordinary_narrow.allowsSkillInvocation(
+        "{\"name\":\"review\"}",
+    ));
+
+    const named = try PolicyFrame.derive(
+        ordinary_narrow,
+        &.{ "Read", "Skill(review)" },
+        &.{},
+    );
+    defer named.release();
+    try std.testing.expect(named.allowsSkillInvocation(
+        "{\"name\":\"review\"}",
+    ));
+    try std.testing.expect(!named.allowsSkillInvocation(
+        "{\"name\":\"deploy\"}",
+    ));
+
+    const denied = try PolicyFrame.derive(
+        ordinary_narrow,
+        &.{},
+        &.{"Skill"},
+    );
+    defer denied.release();
+    try std.testing.expect(!denied.allowsSkillTool());
+    try std.testing.expect(!denied.allowsSkillInvocation(
+        "{\"name\":\"review\"}",
     ));
 }
 

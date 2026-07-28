@@ -7,13 +7,15 @@
 
 const std = @import("std");
 const core = @import("metacodes-core");
-const catalog = @import("skill_catalog.zig");
-const activation_mod = @import("skill_activation.zig");
-const materialization = @import("skill_materialization.zig");
-const policy_frame = @import("policy_frame.zig");
+const skill_runtime = core.skills_runtime;
+const catalog = skill_runtime.catalog;
+const activation_mod = skill_runtime.activation;
+const materialization = skill_runtime.materialization;
+const policy_frame = skill_runtime.policy_frame;
+const model_semantics = skill_runtime.model_tool;
 const event_projection = @import("event_projection.zig");
 
-pub const TOOL_NAME = "Skill";
+pub const TOOL_NAME = model_semantics.TOOL_NAME;
 
 pub const InitError = error{
     OutOfMemory,
@@ -56,10 +58,7 @@ pub const Environment = struct {
     callback_failed: std.atomic.Value(bool) = .init(false),
 
     pub fn hasModelInvocable(snapshot: *const catalog.Snapshot) bool {
-        for (snapshot.skills) |skill| {
-            if (!skill.definition.disable_model_invocation) return true;
-        }
-        return false;
+        return model_semantics.hasModelInvocable(snapshot);
     }
 
     pub fn init(options: Options) InitError!Environment {
@@ -80,7 +79,7 @@ pub const Environment = struct {
         ) catch return error.OutOfMemory;
         errdefer options.allocator.free(owned_names);
 
-        const description = buildDescription(
+        const description = model_semantics.buildDescription(
             options.allocator,
             options.snapshot,
         ) catch return error.OutOfMemory;
@@ -88,21 +87,11 @@ pub const Environment = struct {
 
         const properties = options.allocator.alloc(
             core.json.PropSpec,
-            2,
+            model_semantics.INPUT_PROPERTIES.len,
         ) catch return error.OutOfMemory;
         errdefer options.allocator.free(properties);
-        properties[0] = .{
-            .name = "name",
-            .type = "string",
-            .description = "Canonical invocation_name from the bound Skill catalog",
-            .enum_values = owned_names,
-        };
-        properties[1] = .{
-            .name = "values",
-            .type = "array",
-            .description = "Optional positional argument values in declared order",
-            .items_type = "string",
-        };
+        @memcpy(properties, &model_semantics.INPUT_PROPERTIES);
+        properties[0].enum_values = owned_names;
 
         const base_definitions = options.session.tools.definitions;
         const definitions = options.allocator.alloc(
@@ -117,7 +106,7 @@ pub const Environment = struct {
             .input_schema = .{
                 .type = "object",
                 .prop_specs = properties,
-                .required = &.{"name"},
+                .required = model_semantics.REQUIRED_FIELDS,
             },
         };
 
@@ -234,7 +223,8 @@ pub const Environment = struct {
 
     fn allowsTool(raw: *const anyopaque, name: []const u8) bool {
         const self: *const Environment = @ptrCast(@alignCast(raw));
-        if (std.mem.eql(u8, name, TOOL_NAME)) return true;
+        if (std.mem.eql(u8, name, TOOL_NAME))
+            return self.current_frame.allowsSkillTool();
         return self.current_frame.executionPolicy().allowsTool(name);
     }
 
@@ -244,7 +234,8 @@ pub const Environment = struct {
         arguments_json: []const u8,
     ) bool {
         const self: *const Environment = @ptrCast(@alignCast(raw));
-        if (std.mem.eql(u8, name, TOOL_NAME)) return true;
+        if (std.mem.eql(u8, name, TOOL_NAME))
+            return self.current_frame.allowsSkillInvocation(arguments_json);
         return self.current_frame.executionPolicy().allowsInvocation(
             name,
             arguments_json,
@@ -256,30 +247,21 @@ pub const Environment = struct {
         tool_ctx: *const core.tool_context.ToolContext,
         arguments_json: []const u8,
     ) anyerror!core.tools.ToolDispatchOutcome {
-        if (arguments_json.len > activation_mod.MAX_ARGUMENT_JSON_BYTES)
-            return error.ResourceLimit;
-        if (!std.unicode.utf8ValidateSlice(arguments_json))
-            return error.InvalidArguments;
-
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
-        const parsed = try parseInvocation(
+        const parsed = try model_semantics.parseInvocation(
             scratch.allocator(),
             arguments_json,
         );
         const skill = self.snapshot.findByInvocation(parsed.name) orelse
             return error.SkillNotFound;
-        const canonical_arguments = try encodeArguments(
-            scratch.allocator(),
-            parsed.values,
-        );
 
-        var plan = try activation_mod.prepare(
+        var plan = try activation_mod.prepareValues(
             self.allocator,
             self.snapshot,
             &self.snapshot.revision,
             &skill.skill_id,
-            canonical_arguments,
+            parsed.values,
             self.current_frame.shellPolicy(),
             .model_tool,
         );
@@ -323,10 +305,11 @@ pub const Environment = struct {
         activation: activation_mod.Activation,
     ) anyerror!core.tools.ToolDispatchOutcome {
         var owned_activation = activation;
-        const output = std.fmt.allocPrint(
+        const output = model_semantics.formatResult(
             output_allocator,
-            "# Skill: {s}\n\n{s}",
-            .{ skill.definition.name, owned_activation.rendered_body },
+            skill.definition.name,
+            owned_activation.rendered_body,
+            false,
         ) catch |err| {
             owned_activation.deinit() catch return error.CoreError;
             return err;
@@ -402,7 +385,10 @@ pub const Environment = struct {
                 .tool_dispatcher = child_environment.dispatcher(),
                 .execution_policy = child_environment.executionPolicy(),
                 .host_run = host_run,
-                .ui_requester = self.session.permission_ctx.ui_requester,
+                // SubagentResult has no resumable suspend payload. Allowing a
+                // child UI request here would lose that payload at this
+                // adapter boundary, so model-tool children fail closed.
+                .ui_requester = null,
                 .read_state = &self.session.read_state,
                 .jobs = if (self.session.jobs) |*jobs| jobs else null,
                 .event_projection = .model_tool,
@@ -443,10 +429,11 @@ pub const Environment = struct {
             if (cleanup_failed) return error.CoreError;
             return projection_error;
         };
-        const output = std.fmt.allocPrint(
+        const output = model_semantics.formatResult(
             output_allocator,
-            "# Skill: {s} (forked)\n\n{s}",
-            .{ plan.skill.definition.name, final_text.items },
+            plan.skill.definition.name,
+            final_text.items,
+            true,
         ) catch |output_error| {
             var cleanup_failed = false;
             child_environment.deinit() catch {
@@ -512,117 +499,8 @@ pub const Environment = struct {
     }
 };
 
-const ParsedInvocation = struct {
-    name: []const u8,
-    values: []const []const u8,
-};
-
-fn parseInvocation(
-    arena: std.mem.Allocator,
-    encoded: []const u8,
-) !ParsedInvocation {
-    const root = std.json.parseFromSliceLeaky(
-        std.json.Value,
-        arena,
-        encoded,
-        .{ .duplicate_field_behavior = .@"error" },
-    ) catch |err| {
-        if (err == error.OutOfMemory) return error.OutOfMemory;
-        return error.InvalidArguments;
-    };
-    if (root != .object or root.object.count() < 1 or root.object.count() > 2)
-        return error.InvalidArguments;
-    const name_node = root.object.get("name") orelse
-        return error.InvalidArguments;
-    if (name_node != .string or name_node.string.len == 0)
-        return error.InvalidArguments;
-
-    const values_node = root.object.get("values");
-    if (root.object.count() == 2 and values_node == null)
-        return error.InvalidArguments;
-    const values = if (values_node) |node| blk: {
-        if (node != .array or
-            node.array.items.len > activation_mod.MAX_ARGUMENT_VALUES)
-            return error.InvalidArguments;
-        const result = try arena.alloc([]const u8, node.array.items.len);
-        for (node.array.items, result) |item, *value| {
-            if (item != .string) return error.InvalidArguments;
-            value.* = item.string;
-        }
-        break :blk result;
-    } else &.{};
-    return .{ .name = name_node.string, .values = values };
-}
-
-fn encodeArguments(
-    arena: std.mem.Allocator,
-    values: []const []const u8,
-) ![]const u8 {
-    var output: std.Io.Writer.Allocating = .init(arena);
-    defer output.deinit();
-    try output.writer.writeAll("{\"values\":[");
-    for (values, 0..) |value, index| {
-        if (index != 0) try output.writer.writeByte(',');
-        try std.json.Stringify.encodeJsonString(value, .{}, &output.writer);
-    }
-    try output.writer.writeAll("]}");
-    return try output.toOwnedSlice();
-}
-
-fn buildDescription(
-    allocator: std.mem.Allocator,
-    snapshot: *const catalog.Snapshot,
-) ![]u8 {
-    var output: std.Io.Writer.Allocating = .init(allocator);
-    defer output.deinit();
-    try output.writer.writeAll(
-        "Activate one Skill from the Session-bound immutable catalog. " ++
-            "Use the exact canonical name; values are positional. Skill is a " ++
-            "serialization boundary, so later calls use its narrowed policy. Available:\n",
-    );
-    for (snapshot.skills) |skill| {
-        if (skill.definition.disable_model_invocation) continue;
-        try output.writer.print(
-            "- {s}: {s}\n",
-            .{ skill.invocation_name, skill.definition.description },
-        );
-    }
-    return try output.toOwnedSlice();
-}
-
 fn childDepth(parent: u8) error{AgentDepthExceeded}!u8 {
     if (parent >= core.tool_context.MAX_AGENT_DEPTH)
         return error.AgentDepthExceeded;
     return parent + 1;
-}
-
-test "model invocation parser accepts exact name plus optional string values" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const parsed = try parseInvocation(
-        arena.allocator(),
-        "{\"name\":\"review\",\"values\":[\"a\",\"b\"]}",
-    );
-    try std.testing.expectEqualStrings("review", parsed.name);
-    try std.testing.expectEqual(@as(usize, 2), parsed.values.len);
-    try std.testing.expectEqualStrings("a", parsed.values[0]);
-}
-
-test "model invocation parser rejects unknown fields and non-string values" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    try std.testing.expectError(
-        error.InvalidArguments,
-        parseInvocation(
-            arena.allocator(),
-            "{\"name\":\"review\",\"origin\":\"MODEL\"}",
-        ),
-    );
-    try std.testing.expectError(
-        error.InvalidArguments,
-        parseInvocation(
-            arena.allocator(),
-            "{\"name\":\"review\",\"values\":[1]}",
-        ),
-    );
 }

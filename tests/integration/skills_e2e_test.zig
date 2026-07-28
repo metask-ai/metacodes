@@ -1,10 +1,21 @@
-//! Skill E2E：造临时 skill 目录 → SkillSet 加载 → Skill tool 激活。
+//! Shared Skill Runtime integration tests.
+//!
+//! These replace the retired CLI-only loader/tool tests. Each fixture enters
+//! through the canonical catalog, projects the snapshot for CLI presentation,
+//! and invokes the same typed activation used by AgentCore.
 
 const std = @import("std");
 const cc = @import("cc");
-const pfs = @import("platform").fs; // 可移植文件 IO(std.c.open 的 O 在 Windows 是 void)
+const pfs = @import("platform").fs;
 
-fn dispatchOk(ctx: *const cc.tools.ToolContext, name: []const u8, args: []const u8) ![]u8 {
+const Runtime = cc.skills_cli_adapter.Runtime;
+const Source = cc.skills_runtime.catalog.Source;
+
+fn dispatchOk(
+    ctx: *const cc.tools.ToolContext,
+    name: []const u8,
+    args: []const u8,
+) ![]u8 {
     var outcome = try cc.tools.dispatch(ctx, name, args);
     return switch (outcome) {
         .ok => |bytes| bytes,
@@ -16,294 +27,461 @@ fn dispatchOk(ctx: *const cc.tools.ToolContext, name: []const u8, args: []const 
 }
 
 fn makeSkill(parent: []const u8, name: []const u8, md: []const u8) !void {
-    const a = std.testing.allocator;
-    const parent_z = try a.dupeZ(u8, parent);
-    defer a.free(parent_z);
+    const allocator = std.testing.allocator;
+    const parent_z = try allocator.dupeZ(u8, parent);
+    defer allocator.free(parent_z);
     _ = std.c.mkdir(parent_z, 0o755);
-    const sd = try std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ parent, name }, 0);
-    defer a.free(sd);
-    _ = std.c.mkdir(sd, 0o755);
-    const md_path = try std.fmt.allocPrintSentinel(a, "{s}/{s}/SKILL.md", .{ parent, name }, 0);
-    defer a.free(md_path);
-    const fd = pfs.open(md_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    const skill_dir = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/{s}",
+        .{ parent, name },
+        0,
+    );
+    defer allocator.free(skill_dir);
+    _ = std.c.mkdir(skill_dir, 0o755);
+    const definition_path = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/{s}/SKILL.md",
+        .{ parent, name },
+        0,
+    );
+    defer allocator.free(definition_path);
+    const fd = pfs.open(
+        definition_path,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true },
+        0o644,
+    );
     _ = pfs.write(fd, md);
     pfs.close(fd);
 }
 
-fn rmSkill(parent: []const u8, name: []const u8) void {
-    const a = std.testing.allocator;
-    const md_path = std.fmt.allocPrintSentinel(a, "{s}/{s}/SKILL.md", .{ parent, name }, 0) catch return;
-    defer a.free(md_path);
-    _ = std.c.unlink(md_path);
-    const sd = std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ parent, name }, 0) catch return;
-    defer a.free(sd);
-    _ = std.c.rmdir(sd);
+fn removeSkill(parent: []const u8, name: []const u8) void {
+    const allocator = std.testing.allocator;
+    const definition_path = std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/{s}/SKILL.md",
+        .{ parent, name },
+        0,
+    ) catch return;
+    defer allocator.free(definition_path);
+    _ = std.c.unlink(definition_path);
+    const skill_dir = std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/{s}",
+        .{ parent, name },
+        0,
+    ) catch return;
+    defer allocator.free(skill_dir);
+    _ = std.c.rmdir(skill_dir);
 }
 
-test "Skills E2E: loadFromDir + Skill tool activation" {
-    const a = std.testing.allocator;
-    const dir = "/tmp/cc-zig-skills-e2e";
-    defer {
-        rmSkill(dir, "refactor");
-        rmSkill(dir, "review");
-        if (a.dupeZ(u8, dir)) |dir_z| {
-            defer a.free(dir_z);
-            _ = std.c.rmdir(dir_z);
-        } else |_| {}
+fn removeRoot(path: []const u8) void {
+    const allocator = std.testing.allocator;
+    const path_z = allocator.dupeZ(u8, path) catch return;
+    defer allocator.free(path_z);
+    _ = std.c.rmdir(path_z);
+}
+
+const HostCapture = struct {
+    calls: usize = 0,
+    effective_count: usize = 0,
+
+    fn activate(
+        raw: *anyopaque,
+        _: []const u8,
+        effective: []const []const u8,
+        _: []const []const u8,
+    ) anyerror!void {
+        const self: *HostCapture = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        self.effective_count = effective.len;
     }
 
-    try makeSkill(dir, "refactor", "---\nname: refactor\ndescription: Refactor safely\n---\nSteps: 1. read 2. plan 3. edit\n");
-    try makeSkill(dir, "review", "---\nname: review\ndescription: Review PR\n---\nChecklist: security, perf, clarity.\n");
-
-    var set = cc.skills.SkillSet.init(a);
-    defer set.deinit();
-    try set.loadFromDir(dir);
-    try std.testing.expect(set.len() == 2);
-    try std.testing.expect(set.find("refactor") != null);
-    try std.testing.expect(set.find("review") != null);
-
-    // 激活 refactor skill
-    var reg = cc.tools_dynamic.DynRegistry.init(a);
-    defer reg.deinit();
-    try cc.skills_tool.registerSkillTool(&reg, &set);
-
-    const entry = reg.find("Skill").?;
-    const ctx = cc.tools.ToolContext.simple(a);
-    const out = try entry.execute(&ctx, "{\"name\":\"refactor\"}", entry.ctx_ptr);
-    defer a.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "# Skill: refactor") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Steps:") != null);
-
-    // renderSystemAddendum 包含两个 skill
-    const sys = try cc.skills_discovery.renderSystemAddendum(&set, a);
-    defer a.free(sys);
-    try std.testing.expect(std.mem.indexOf(u8, sys, "refactor") != null);
-    try std.testing.expect(std.mem.indexOf(u8, sys, "review") != null);
-}
-
-test "Skills E2E: tools.dispatch routes Skill tool through dyn_registry" {
-    const a = std.testing.allocator;
-    const dir = "/tmp/cc-zig-skills-dispatch";
-    defer {
-        rmSkill(dir, "demo");
-        if (a.dupeZ(u8, dir)) |dz| {
-            defer a.free(dz);
-            _ = std.c.rmdir(dz);
-        } else |_| {}
+    fn services(self: *HostCapture) cc.tool_context.HostServices {
+        return .{
+            .ctx = @ptrCast(self),
+            .activateSkillFn = &activate,
+        };
     }
-    try makeSkill(dir, "demo", "---\nname: demo\ndescription: Demo skill\nallowed_tools: Read, Grep\n---\nDemo body.\n");
+};
 
-    var set = cc.skills.SkillSet.init(a);
-    defer set.deinit();
-    try set.loadFromDir(dir);
+const Fixture = struct {
+    runtime: Runtime,
+    projection: cc.skills.SkillSet,
+    registry: cc.tools_dynamic.DynRegistry,
+    abort: cc.util_abort.AbortSignal,
+    permission: cc.permission.PermissionContext,
+    host: HostCapture = .{},
+    tool_defs: []cc.json_mod.ToolDefinition,
 
-    var reg = cc.tools_dynamic.DynRegistry.init(a);
-    defer reg.deinit();
-    try cc.skills_tool.registerSkillTool(&reg, &set);
+    fn init(
+        self: *Fixture,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        root: []const u8,
+    ) !void {
+        self.* = .{
+            .runtime = Runtime.init(allocator, io),
+            .projection = cc.skills.SkillSet.init(allocator),
+            .registry = cc.tools_dynamic.DynRegistry.init(allocator),
+            .abort = cc.util_abort.AbortSignal.init(),
+            .permission = .{
+                .mode = .init(.bypass_permissions),
+                .allocator = allocator,
+            },
+            .tool_defs = try cc.tools.toToolDefinitions(allocator),
+        };
+        errdefer allocator.free(self.tool_defs);
+        errdefer self.registry.deinit();
+        errdefer self.projection.deinit();
+        errdefer self.runtime.deinit();
 
-    // 这才是真正的生产路径：模型通过 tools.dispatch 调用,而不是绕过 dispatch 直接 find
-    var ctx = cc.tools.ToolContext.simple(a);
-    ctx.dyn_registry = &reg;
-    const out = try dispatchOk(&ctx, "Skill", "{\"name\":\"demo\"}");
-    defer a.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "# Skill: demo") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Demo body") != null);
-    // allowed_tools 软约束被注入
-    try std.testing.expect(std.mem.indexOf(u8, out, "Active tool grants: Read, Grep") != null);
-}
-
-test "Skills E2E: buildWithSkills injects skill list into system prompt" {
-    const a = std.testing.allocator;
-    const dir = "/tmp/cc-zig-skills-sysprompt";
-    defer {
-        rmSkill(dir, "inject-me");
-        if (a.dupeZ(u8, dir)) |dz| {
-            defer a.free(dz);
-            _ = std.c.rmdir(dz);
-        } else |_| {}
+        const sources = [_]Source{.{
+            .root = root,
+            .scope = .project,
+            .priority = 300,
+        }};
+        try self.runtime.loadSources(
+            root,
+            "",
+            "",
+            &sources,
+            &self.projection,
+        );
+        try cc.skills_tool.registerSkillTool(
+            &self.registry,
+            &self.runtime,
+        );
+        const model_defs = try cc.tools.toToolDefinitionsWithDyn(
+            allocator,
+            &self.registry,
+        );
+        allocator.free(self.tool_defs);
+        self.tool_defs = model_defs;
+        if (!cc.skills_cli_adapter.applyModelToolSchema(self.tool_defs))
+            return error.SkillSchemaMissing;
     }
-    try makeSkill(dir, "inject-me", "---\nname: inject-me\ndescription: Should appear in sysprompt\n---\nbody\n");
 
-    var set = cc.skills.SkillSet.init(a);
-    defer set.deinit();
-    try set.loadFromDir(dir);
-
-    const sp = @import("cc").system_prompt;
-    const prompt = try sp.buildWithSkills(a, "claude-opus-4-7", &set);
-    defer a.free(prompt);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "# Available skills") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "**inject-me**") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Should appear in sysprompt") != null);
-}
-
-// =====================================================================
-// Stage B/C/D 综合集成测试
-// =====================================================================
-
-test "Skills E2E: bash injection runs at activation time and emits stdout" {
-    const a = std.testing.allocator;
-    const dir = "/tmp/cc-zig-skills-bash-inject";
-    defer {
-        rmSkill(dir, "echoer");
-        if (a.dupeZ(u8, dir)) |dz| {
-            defer a.free(dz);
-            _ = std.c.rmdir(dz);
-        } else |_| {}
+    fn deinit(self: *Fixture, allocator: std.mem.Allocator) void {
+        self.registry.deinit();
+        self.runtime.deinit();
+        self.projection.deinit();
+        allocator.free(self.tool_defs);
+        self.* = undefined;
     }
-    try makeSkill(dir, "echoer",
-        "---\nname: echoer\ndescription: bash inject test\n---\n" ++
-        "Output: !`echo hello-from-bash`\n");
 
-    var set = cc.skills.SkillSet.init(a);
-    defer set.deinit();
-    try set.loadFromDir(dir);
-
-    var reg = cc.tools_dynamic.DynRegistry.init(a);
-    defer reg.deinit();
-    try cc.skills_tool.registerSkillTool(&reg, &set);
-
-    var ctx = cc.tools.ToolContext.simple(a);
-    ctx.dyn_registry = &reg;
-    const out = try dispatchOk(&ctx, "Skill", "{\"name\":\"echoer\"}");
-    defer a.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Output: hello-from-bash") != null);
-}
-
-test "Skills E2E: disable-model-invocation blocks auto, allows explicit" {
-    const a = std.testing.allocator;
-    const dir = "/tmp/cc-zig-skills-dmi";
-    defer {
-        rmSkill(dir, "deploy");
-        if (a.dupeZ(u8, dir)) |dz| {
-            defer a.free(dz);
-            _ = std.c.rmdir(dz);
-        } else |_| {}
+    fn context(self: *Fixture, allocator: std.mem.Allocator, root: []const u8) cc.tools.ToolContext {
+        var ctx = cc.tools.ToolContext.withAbort(allocator, &self.abort);
+        ctx.permission_ctx = &self.permission;
+        ctx.dyn_registry = &self.registry;
+        ctx.host_services = self.host.services();
+        ctx.tool_defs = self.tool_defs;
+        ctx.project_dir = root;
+        ctx.cwd_abs = root;
+        return ctx;
     }
-    try makeSkill(dir, "deploy",
-        "---\nname: deploy\ndescription: deploys\ndisable-model-invocation: true\n---\nDeploy steps.\n");
+};
 
-    var set = cc.skills.SkillSet.init(a);
-    defer set.deinit();
-    try set.loadFromDir(dir);
-
-    var reg = cc.tools_dynamic.DynRegistry.init(a);
-    defer reg.deinit();
-    try cc.skills_tool.registerSkillTool(&reg, &set);
-
-    // 模型路径(explicit_invocation=false 默认):应被拒
-    var ctx_auto = cc.tools.ToolContext.simple(a);
-    ctx_auto.dyn_registry = &reg;
-    const out_auto = try dispatchOk(&ctx_auto, "Skill", "{\"name\":\"deploy\"}");
-    defer a.free(out_auto);
-    try std.testing.expect(std.mem.indexOf(u8, out_auto, "SkillRequiresExplicitInvocation") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out_auto, "Deploy steps") == null);
-
-    // 用户显式路径(explicit_invocation=true):放行
-    var ctx_explicit = cc.tools.ToolContext.simple(a);
-    ctx_explicit.dyn_registry = &reg;
-    ctx_explicit.explicit_invocation = true;
-    const out_explicit = try dispatchOk(&ctx_explicit, "Skill", "{\"name\":\"deploy\"}");
-    defer a.free(out_explicit);
-    try std.testing.expect(std.mem.indexOf(u8, out_explicit, "Deploy steps") != null);
-}
-
-test "Skills E2E: allowed-tools active skill overrides prompt-mode ask" {
-    const a = std.testing.allocator;
-    const active_mod = @import("cc").active_skill;
-
-    // 模拟在 prompt mode 下(Bash 默认会 ask),激活 skill 后 Bash(git *) 应直接 allow
-    const allowed = [_][]const u8{"Bash(git *)"};
-    var st = try active_mod.ActiveSkillState.init(a, "test", &allowed, &.{});
-    defer st.deinit();
-
-    // 构造 PermissionContext with active_skill
-    var ctx = cc.permission.createContext(.prompt, a);
-    ctx.active_skill = &st;
-
-    // git 命令应被 allow(active skill 覆盖 mode 的 ask)
-    const d1 = cc.permission.checkPermission(&ctx, "Bash", "{\"command\":\"git status\"}");
-    try std.testing.expect(d1 == .allow);
-
-    // 不在白名单的 Bash 命令仍 ask(prompt mode 默认)
-    const d2 = cc.permission.checkPermission(&ctx, "Bash", "{\"command\":\"rm -rf /\"}");
-    try std.testing.expect(d2 == .ask);
-}
-
-test "Skills E2E: disallowed-tools active skill turns allow into deny" {
-    const a = std.testing.allocator;
-    const active_mod = @import("cc").active_skill;
-    const disallowed = [_][]const u8{"AskUserQuestion"};
-    var st = try active_mod.ActiveSkillState.init(a, "test", &.{}, &disallowed);
-    defer st.deinit();
-
-    // 在 bypass 模式下,默认本应 allow;但 disallowed 应胜出 deny
-    var ctx = cc.permission.createContext(.bypass, a);
-    ctx.active_skill = &st;
-    const d = cc.permission.checkPermission(&ctx, "AskUserQuestion", "{}");
-    try std.testing.expect(d == .deny);
-}
-
-test "Skills E2E: $ARGUMENTS rendering through dispatch" {
-    const a = std.testing.allocator;
-    const dir = "/tmp/cc-zig-skills-args";
+test "Skills E2E: canonical catalog projects into CLI and system prompt" {
+    const allocator = std.testing.allocator;
+    const root = "/tmp/metacodes-shared-skill-catalog";
     defer {
-        rmSkill(dir, "greet");
-        if (a.dupeZ(u8, dir)) |dz| {
-            defer a.free(dz);
-            _ = std.c.rmdir(dz);
-        } else |_| {}
+        removeSkill(root, "refactor");
+        removeSkill(root, "review");
+        removeRoot(root);
     }
-    try makeSkill(dir, "greet",
-        "---\nname: greet\ndescription: hello\n---\nHello $ARGUMENTS!\n");
+    try makeSkill(
+        root,
+        "refactor",
+        "---\nname: Display Refactor\ndescription: Refactor safely\n---\nSteps: read, plan, edit.\n",
+    );
+    try makeSkill(
+        root,
+        "review",
+        "---\nname: Display Review\ndescription: Review PR\n---\nChecklist: security and clarity.\n",
+    );
 
-    var set = cc.skills.SkillSet.init(a);
-    defer set.deinit();
-    try set.loadFromDir(dir);
+    var fixture: Fixture = undefined;
+    try fixture.init(allocator, std.testing.io, root);
+    defer fixture.deinit(allocator);
 
-    var reg = cc.tools_dynamic.DynRegistry.init(a);
-    defer reg.deinit();
-    try cc.skills_tool.registerSkillTool(&reg, &set);
+    try std.testing.expectEqual(@as(usize, 2), fixture.projection.len());
+    try std.testing.expect(fixture.projection.find("refactor") != null);
+    try std.testing.expect(fixture.projection.find("review") != null);
+    try std.testing.expectEqualSlices(
+        u8,
+        &fixture.runtime.snapshot.?.revision,
+        &fixture.projection.catalog_revision,
+    );
+    const skill_definition = blk: {
+        for (fixture.tool_defs) |definition| {
+            if (std.mem.eql(u8, definition.name, "Skill"))
+                break :blk definition;
+        }
+        return error.SkillSchemaMissing;
+    };
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        skill_definition.input_schema.prop_specs.?.len,
+    );
+    try std.testing.expectEqualStrings(
+        "values",
+        skill_definition.input_schema.prop_specs.?[1].name,
+    );
 
-    var ctx = cc.tools.ToolContext.simple(a);
-    ctx.dyn_registry = &reg;
-    const out = try dispatchOk(&ctx, "Skill", "{\"name\":\"greet\",\"args\":[\"world\"]}");
-    defer a.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Hello world!") != null);
+    const prompt = try cc.system_prompt.buildWithSkills(
+        allocator,
+        "claude-opus-4-7",
+        &fixture.projection,
+    );
+    defer allocator.free(prompt);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "**refactor**") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Refactor safely") != null);
 }
 
-test "Skills E2E: ${CLAUDE_SKILL_DIR} resolves to skill source path" {
-    const a = std.testing.allocator;
-    const dir = "/tmp/cc-zig-skills-dir";
+test "Skills E2E: model dispatch uses typed activation and working tree" {
+    const allocator = std.testing.allocator;
+    const root = "/tmp/metacodes-shared-skill-dispatch";
     defer {
-        rmSkill(dir, "pathy");
-        if (a.dupeZ(u8, dir)) |dz| {
-            defer a.free(dz);
-            _ = std.c.rmdir(dz);
-        } else |_| {}
+        removeSkill(root, "greet");
+        removeRoot(root);
     }
-    try makeSkill(dir, "pathy",
-        "---\nname: pathy\ndescription: path test\n---\nMy dir: ${CLAUDE_SKILL_DIR}/scripts\n");
+    try makeSkill(
+        root,
+        "greet",
+        "---\nname: greet\ndescription: hello\narguments: [target]\nallowed-tools: Read\n---\nHello $target from ${CLAUDE_SKILL_DIR}.\n",
+    );
 
-    var set = cc.skills.SkillSet.init(a);
-    defer set.deinit();
-    try set.loadFromDir(dir);
+    var fixture: Fixture = undefined;
+    try fixture.init(allocator, std.testing.io, root);
+    defer fixture.deinit(allocator);
+    var ctx = fixture.context(allocator, root);
 
-    var reg = cc.tools_dynamic.DynRegistry.init(a);
-    defer reg.deinit();
-    try cc.skills_tool.registerSkillTool(&reg, &set);
+    const output = try dispatchOk(
+        &ctx,
+        "Skill",
+        "{\"name\":\"greet\",\"values\":[\"world\"]}",
+    );
+    defer allocator.free(output);
 
-    var ctx = cc.tools.ToolContext.simple(a);
-    ctx.dyn_registry = &reg;
-    const out = try dispatchOk(&ctx, "Skill", "{\"name\":\"pathy\"}");
-    defer a.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "My dir: /tmp/cc-zig-skills-dir/pathy/scripts") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "# Skill: greet") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Hello world from ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, root) == null);
+    try std.testing.expect(fixture.permission.active_skill != null);
+    try std.testing.expect(fixture.runtime.currentPolicyFrame() != null);
 }
 
-test "Skills E2E: project root cwd-walking loads .metacodes/skills in repo root" {
-    const a = std.testing.allocator;
-    const cwd = try cc.util_fs.getCwd(a);
-    defer a.free(cwd);
-    const root = try cc.skills.findRepoRoot(a, cwd);
-    defer a.free(root);
+test "Skills E2E: shell rendering and model-only admission share Runtime" {
+    const allocator = std.testing.allocator;
+    const root = "/tmp/metacodes-shared-skill-policy";
+    defer {
+        removeSkill(root, "echoer");
+        removeSkill(root, "explicit");
+        removeRoot(root);
+    }
+    try makeSkill(
+        root,
+        "echoer",
+        "---\nname: echoer\ndescription: shell\n---\nOutput: !`echo hello-from-runtime`\n",
+    );
+    try makeSkill(
+        root,
+        "explicit",
+        "---\nname: explicit\ndescription: explicit only\ndisable-model-invocation: true\n---\nMust be explicit.\n",
+    );
+
+    var fixture: Fixture = undefined;
+    try fixture.init(allocator, std.testing.io, root);
+    defer fixture.deinit(allocator);
+    var ctx = fixture.context(allocator, root);
+
+    const rendered = try dispatchOk(&ctx, "Skill", "{\"name\":\"echoer\"}");
+    defer allocator.free(rendered);
+    try std.testing.expect(
+        std.mem.indexOf(u8, rendered, "Output: hello-from-runtime") != null,
+    );
+
+    var outcome = cc.tools.dispatch(&ctx, "Skill", "{\"name\":\"explicit\"}") catch |err| {
+        try std.testing.expectEqual(error.PolicyViolation, err);
+        return;
+    };
+    defer outcome.deinit(allocator);
+    return error.ExpectedPolicyViolation;
+}
+
+test "Skills E2E: execution contexts keep sibling policy projections isolated" {
+    const allocator = std.testing.allocator;
+    const root = "/tmp/metacodes-shared-skill-contexts";
+    defer {
+        removeSkill(root, "reader");
+        removeSkill(root, "writer");
+        removeRoot(root);
+    }
+    try makeSkill(
+        root,
+        "reader",
+        "---\nname: reader\ndescription: read only\nallowed-tools: Read\n---\nread\n",
+    );
+    try makeSkill(
+        root,
+        "writer",
+        "---\nname: writer\ndescription: write only\nallowed-tools: Write\n---\nwrite\n",
+    );
+
+    var fixture: Fixture = undefined;
+    try fixture.init(allocator, std.testing.io, root);
+    defer fixture.deinit(allocator);
+
+    var reader_permission = cc.permission.PermissionContext{
+        .mode = .init(.bypass_permissions),
+        .allocator = allocator,
+    };
+    var writer_permission = cc.permission.PermissionContext{
+        .mode = .init(.bypass_permissions),
+        .allocator = allocator,
+    };
+    var reader_ctx = fixture.context(allocator, root);
+    reader_ctx.permission_ctx = &reader_permission;
+    reader_ctx.agent_ident = cc.session_id.gen();
+    var writer_ctx = fixture.context(allocator, root);
+    writer_ctx.permission_ctx = &writer_permission;
+    writer_ctx.agent_ident = cc.session_id.gen();
+
+    _ = try fixture.runtime.activate(
+        &reader_ctx,
+        "reader",
+        &.{},
+        .model_tool,
+    );
+    try fixture.runtime.projectCurrent(
+        reader_ctx.agent_ident,
+        &reader_permission,
+    );
+    _ = try fixture.runtime.activate(
+        &writer_ctx,
+        "writer",
+        &.{},
+        .model_tool,
+    );
+    try fixture.runtime.projectCurrent(
+        writer_ctx.agent_ident,
+        &writer_permission,
+    );
+
+    try std.testing.expect(
+        !reader_permission.active_skill.?.isDisallowed("Read", "{}"),
+    );
+    try std.testing.expect(
+        reader_permission.active_skill.?.isDisallowed("Write", "{}"),
+    );
+    try std.testing.expect(
+        !writer_permission.active_skill.?.isDisallowed("Write", "{}"),
+    );
+    try std.testing.expect(
+        writer_permission.active_skill.?.isDisallowed("Read", "{}"),
+    );
+
+    fixture.runtime.clearContext(reader_ctx.agent_ident);
+    try std.testing.expect(reader_permission.active_skill == null);
+    try std.testing.expect(writer_permission.active_skill != null);
+    fixture.runtime.clearContext(writer_ctx.agent_ident);
+    try std.testing.expect(writer_permission.active_skill == null);
+}
+
+test "Skills E2E: unmanaged child activation fails closed without leaking lineage" {
+    const allocator = std.testing.allocator;
+    const root = "/tmp/metacodes-shared-skill-unmanaged-child";
+    defer {
+        removeSkill(root, "reader");
+        removeRoot(root);
+    }
+    try makeSkill(
+        root,
+        "reader",
+        "---\nname: reader\ndescription: read only\nallowed-tools: Read\n---\nread\n",
+    );
+
+    var fixture: Fixture = undefined;
+    try fixture.init(allocator, std.testing.io, root);
+    defer fixture.deinit(allocator);
+    var child_permission = cc.permission.PermissionContext{
+        .mode = .init(.bypass_permissions),
+        .allocator = allocator,
+    };
+    var child_ctx = fixture.context(allocator, root);
+    child_ctx.permission_ctx = &child_permission;
+    child_ctx.agent_ident = cc.session_id.gen();
+    child_ctx.agent_depth = 1;
+
+    try std.testing.expectError(
+        error.SkillUnavailable,
+        fixture.runtime.activate(
+            &child_ctx,
+            "reader",
+            &.{},
+            .model_tool,
+        ),
+    );
+    try std.testing.expect(child_permission.active_skill == null);
+    try std.testing.expect(fixture.runtime.currentPolicyFrame() == null);
+}
+
+test "Skills E2E: project root lookup remains presentation-only utility" {
+    const allocator = std.testing.allocator;
+    const cwd = try cc.util_fs.getCwd(allocator);
+    defer allocator.free(cwd);
+    const root = try cc.skills.findRepoRoot(allocator, cwd);
+    defer allocator.free(root);
     try std.testing.expect(std.mem.endsWith(u8, root, "cc-t2z"));
+}
+
+test "Skills E2E: slash adapter tokenization is bounded and rejects partial quotes" {
+    const allocator = std.testing.allocator;
+    const values = try cc.skills_cli_adapter.parseSlashValues(
+        allocator,
+        "alpha \"two words\"",
+    );
+    defer {
+        for (values) |value| allocator.free(value);
+        allocator.free(values);
+    }
+    try std.testing.expectEqual(@as(usize, 2), values.len);
+    try std.testing.expectEqualStrings("two words", values[1]);
+    try std.testing.expectError(
+        error.InvalidArguments,
+        cc.skills_cli_adapter.parseSlashValues(
+            allocator,
+            "\"unterminated",
+        ),
+    );
+
+    var too_many: std.Io.Writer.Allocating = .init(allocator);
+    defer too_many.deinit();
+    for (0..65) |index| {
+        if (index != 0) try too_many.writer.writeByte(' ');
+        try too_many.writer.writeByte('x');
+    }
+    try std.testing.expectError(
+        error.InvalidArguments,
+        cc.skills_cli_adapter.parseSlashValues(
+            allocator,
+            too_many.written(),
+        ),
+    );
+}
+
+test "Skills E2E: slash syntax preserves path-first ordinary messages" {
+    const adapter = cc.skills_cli_adapter;
+    switch (adapter.parseSlashSyntax("tmp/foo.zig help me")) {
+        .not_a_command => {},
+        .command => return error.TestExpectedOrdinaryMessage,
+    }
+    switch (adapter.parseSlashSyntax("")) {
+        .not_a_command => {},
+        .command => return error.TestExpectedOrdinaryMessage,
+    }
+    switch (adapter.parseSlashSyntax("unknown argument")) {
+        .command => |head| try std.testing.expectEqualStrings("unknown", head),
+        .not_a_command => return error.TestExpectedCommand,
+    }
 }
