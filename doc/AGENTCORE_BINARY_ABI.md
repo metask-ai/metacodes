@@ -175,9 +175,10 @@ not in the consumer bundle.
 The shipped Zig SDK remains source-free. `bindings/zig/src/types.zig`
 contains the raw ABI declarations plus validated `Status` and `StopReason`
 enums. `bindings/zig/src/protocol.zig` owns the ABI v1 `CoreEvent`,
-`UiRequest`, and `UiResponse` wire types, decoders, and the request-aware
-response encoder. `bindings/zig/src/root.zig` re-exports both layers beside raw
-API-table access.
+`UiRequest`, `UiResponse`, and Skill-catalog wire types, their typed decoders,
+the request-aware UI response encoder, and the bounded Skill-arguments
+encoder. `bindings/zig/src/root.zig` re-exports both layers beside raw API-table
+access.
 
 `decodeCoreEvent` returns an owned `ParsedCoreEvent` whose value is either
 `known: CoreEvent` or `unknown: { tag, payload_json }`. This lets an older Host
@@ -189,6 +190,15 @@ control message cannot be answered safely. All decoded strings and arrays
 remain valid until `deinit`; consumers must not copy an owner and deinitialize
 both copies.
 
+`decodeSkillCatalog` returns an owned `ParsedSkillCatalog` for
+`metask.skill-catalog/v1`. It validates the schema, identity forms, health and
+issue consistency, and each Skill argument schema. Because decoded strings and
+arrays are allocator-owned, the consumer may release the AgentCore descriptor
+buffer immediately after decoding. `encodeSkillArguments` accepts positional
+UTF-8 values, enforces the 64-value and encoded 1 MiB limits, and returns the
+allocator-owned canonical `{"values":[...]}` representation accepted by
+`sessionRunSkill`.
+
 ```zig
 var parsed = try sdk.decodeCoreEvent(allocator, event_json);
 defer parsed.deinit();
@@ -196,6 +206,15 @@ switch (parsed.value) {
     .known => |event| consume(event),
     .unknown => |event| retainOrIgnore(event.tag, event.payload_json),
 }
+
+var catalog = try sdk.decodeSkillCatalog(allocator, descriptor_json);
+defer catalog.deinit();
+
+const arguments_json = try sdk.encodeSkillArguments(
+    allocator,
+    &.{ "src/main.zig", "deep" },
+);
+defer allocator.free(arguments_json);
 ```
 
 Known payloads accept additive fields. Multiple tags, duplicate tags, malformed
@@ -508,7 +527,7 @@ callback or release-callback boundary.
 ABI v1 UI response JSON is one of:
 
 ```json
-{"answers":["choice per question"]}
+{"answers":[{"values":["choice per question"]}]}
 {"permission":"allow_once"}
 ```
 

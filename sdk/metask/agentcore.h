@@ -198,7 +198,7 @@ typedef uint32_t (*metask_agentcore_on_event_fn_v1)(
     const metask_agentcore_run_context_v1 *run,
     metask_agentcore_bytes_view_v1 event_json);
 /* UI requests are synchronous in ABI v1. The Host returns one JSON response:
- * {"answers":[...]} or {"permission":"allow_once"}.
+ * {"answers":[{"values":[...]}]} or {"permission":"allow_once"}.
  * Only METASK_AGENTCORE_UI_ANSWERED consumes the response. METASK_AGENTCORE_UI_UNAVAILABLE is an ordinary
  * reusable outcome; fatal/unknown status poisons the Session.
  * Responses over METASK_AGENTCORE_MAX_UI_RESPONSE_BYTES_V1 are callback failures and poison

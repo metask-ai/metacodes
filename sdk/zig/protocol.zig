@@ -110,9 +110,64 @@ pub const UiResponse = union(enum) {
     permission: PermissionChoice,
 };
 
+pub const SkillCatalogHealth = enum {
+    healthy,
+    degraded,
+};
+
+pub const SkillCatalogIssueCode = enum {
+    invalid_definition,
+    source_conflict,
+    invalid_resource,
+    invalid_invocation_name,
+};
+
+pub const SkillSourceScope = enum {
+    enterprise,
+    personal,
+    project,
+    plugin,
+};
+
+pub const SkillArgumentSchema = struct {
+    schema: []const u8,
+    max_values: u32,
+    names: []const []const u8,
+};
+
+pub const SkillDescriptor = struct {
+    skill_id: []const u8,
+    invocation_name: []const u8,
+    display_name: []const u8,
+    description: []const u8,
+    argument_schema: SkillArgumentSchema,
+};
+
+pub const SkillCatalogIssue = struct {
+    code: SkillCatalogIssueCode,
+    invocation_name: ?[]const u8,
+    source_scope: SkillSourceScope,
+};
+
+/// Source-free projection of the `metask.skill-catalog/v1` descriptor.
+/// It deliberately excludes Skill bodies, physical paths, and policy state.
+pub const SkillCatalog = struct {
+    schema: []const u8,
+    catalog_scope_id: []const u8,
+    catalog_revision: []const u8,
+    health: SkillCatalogHealth,
+    skills: []const SkillDescriptor,
+    issues: []const SkillCatalogIssue,
+};
+
 pub const ParsedCoreEvent = std.json.Parsed(DecodedCoreEvent);
 pub const ParsedUiRequest = std.json.Parsed(UiRequest);
 pub const ParsedUiResponse = std.json.Parsed(UiResponse);
+pub const ParsedSkillCatalog = std.json.Parsed(SkillCatalog);
+
+pub const MAX_SKILL_CATALOG_DESCRIPTOR_BYTES_V1: usize = 4 * 1024 * 1024;
+pub const MAX_SKILL_ARGUMENT_VALUES_V1: usize = 64;
+pub const MAX_SKILL_ARGUMENT_JSON_BYTES_V1: usize = 1024 * 1024;
 
 pub const DecodeError = error{
     OutOfMemory,
@@ -125,6 +180,14 @@ pub const EncodeError = error{
     OutOfMemory,
     MismatchedResponse,
     InvalidResponse,
+};
+
+pub const SkillCatalogDecodeError = DecodeError || error{ResourceLimit};
+
+pub const SkillArgumentsEncodeError = error{
+    OutOfMemory,
+    InvalidArguments,
+    ResourceLimit,
 };
 
 pub fn decodeCoreEvent(allocator: std.mem.Allocator, encoded: []const u8) DecodeError!ParsedCoreEvent {
@@ -187,6 +250,21 @@ pub fn decodeUiResponse(allocator: std.mem.Allocator, encoded: []const u8) Decod
     return decode(UiResponse, allocator, encoded);
 }
 
+/// Decodes and owns a `metask.skill-catalog/v1` descriptor. The returned value
+/// is independent of the AgentCore-owned ABI output buffer, so that buffer may
+/// be released immediately after this call succeeds.
+pub fn decodeSkillCatalog(
+    allocator: std.mem.Allocator,
+    encoded: []const u8,
+) SkillCatalogDecodeError!ParsedSkillCatalog {
+    if (encoded.len > MAX_SKILL_CATALOG_DESCRIPTOR_BYTES_V1)
+        return error.ResourceLimit;
+    var parsed = try decode(SkillCatalog, allocator, encoded);
+    errdefer parsed.deinit();
+    try validateSkillCatalog(parsed.value);
+    return parsed;
+}
+
 pub fn encodeUiResponse(allocator: std.mem.Allocator, request: UiRequest, response: UiResponse) EncodeError![]u8 {
     switch (request) {
         .ask_question => |questions| switch (response) {
@@ -209,6 +287,51 @@ pub fn encodeUiResponse(allocator: std.mem.Allocator, request: UiRequest, respon
     return std.json.Stringify.valueAlloc(allocator, response, .{}) catch error.OutOfMemory;
 }
 
+/// Encodes the only valid non-empty Skill argument wire shape. The returned
+/// bytes are allocator-owned and remain borrowed by `sessionRunSkill` only for
+/// that synchronous call.
+pub fn encodeSkillArguments(
+    allocator: std.mem.Allocator,
+    values: []const []const u8,
+) SkillArgumentsEncodeError![]u8 {
+    if (values.len > MAX_SKILL_ARGUMENT_VALUES_V1)
+        return error.InvalidArguments;
+    var raw_values_bytes: usize = 0;
+    for (values) |value| {
+        raw_values_bytes = std.math.add(
+            usize,
+            raw_values_bytes,
+            value.len,
+        ) catch return error.ResourceLimit;
+        if (raw_values_bytes > MAX_SKILL_ARGUMENT_JSON_BYTES_V1)
+            return error.ResourceLimit;
+        if (!std.unicode.utf8ValidateSlice(value))
+            return error.InvalidArguments;
+    }
+
+    const payload = struct { values: []const []const u8 }{ .values = values };
+    var count_buffer: [256]u8 = undefined;
+    var discarding: std.Io.Writer.Discarding = .init(&count_buffer);
+    std.json.Stringify.value(payload, .{}, &discarding.writer) catch
+        return error.OutOfMemory;
+    const encoded_len_u64 = discarding.fullCount();
+    if (encoded_len_u64 > MAX_SKILL_ARGUMENT_JSON_BYTES_V1 or
+        encoded_len_u64 > std.math.maxInt(usize))
+        return error.ResourceLimit;
+    const encoded_len: usize = @intCast(encoded_len_u64);
+
+    var allocating = std.Io.Writer.Allocating.initCapacity(
+        allocator,
+        encoded_len,
+    ) catch return error.OutOfMemory;
+    defer allocating.deinit();
+    std.json.Stringify.value(payload, .{}, &allocating.writer) catch
+        return error.OutOfMemory;
+    const encoded = allocating.toOwnedSlice() catch return error.OutOfMemory;
+    std.debug.assert(encoded.len == encoded_len);
+    return encoded;
+}
+
 fn decode(comptime T: type, allocator: std.mem.Allocator, encoded: []const u8) DecodeError!std.json.Parsed(T) {
     return std.json.parseFromSlice(T, allocator, encoded, .{
         .allocate = .alloc_always,
@@ -224,6 +347,69 @@ fn normalizeDecodeError(err: anyerror) DecodeError {
         error.UnknownField => error.UnknownTag,
         else => error.InvalidPayload,
     };
+}
+
+fn validateSkillCatalog(catalog: SkillCatalog) error{InvalidPayload}!void {
+    if (!std.mem.eql(u8, catalog.schema, "metask.skill-catalog/v1") or
+        !lowerHex64(catalog.catalog_scope_id) or
+        !lowerHex64(catalog.catalog_revision))
+        return error.InvalidPayload;
+
+    switch (catalog.health) {
+        .healthy => if (catalog.issues.len != 0) return error.InvalidPayload,
+        .degraded => if (catalog.issues.len == 0) return error.InvalidPayload,
+    }
+
+    for (catalog.skills) |skill| {
+        if (!lowerHex64(skill.skill_id) or
+            !validInvocationName(skill.invocation_name) or
+            !std.mem.eql(u8, skill.argument_schema.schema, "metask.skill-arguments/v1") or
+            skill.argument_schema.max_values != MAX_SKILL_ARGUMENT_VALUES_V1 or
+            !validArgumentNames(skill.argument_schema.names))
+            return error.InvalidPayload;
+    }
+    for (catalog.issues) |issue| {
+        if (issue.invocation_name) |name| {
+            if (!validInvocationName(name)) return error.InvalidPayload;
+        }
+    }
+}
+
+fn lowerHex64(value: []const u8) bool {
+    if (value.len != 64) return false;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f'))
+            return false;
+    }
+    return true;
+}
+
+fn validInvocationName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 128) return false;
+    if (!std.ascii.isAlphanumeric(name[0]) and name[0] != '_') return false;
+    for (name[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and
+            byte != '_' and byte != ':' and byte != '-')
+            return false;
+    }
+    return true;
+}
+
+fn validArgumentNames(names: []const []const u8) bool {
+    if (names.len > MAX_SKILL_ARGUMENT_VALUES_V1) return false;
+    for (names, 0..) |name, index| {
+        if (name.len == 0 or name.len > 64 or
+            (!std.ascii.isAlphabetic(name[0]) and name[0] != '_'))
+            return false;
+        for (name[1..]) |byte| {
+            if (!std.ascii.isAlphanumeric(byte) and byte != '_')
+                return false;
+        }
+        for (names[0..index]) |earlier| {
+            if (std.mem.eql(u8, earlier, name)) return false;
+        }
+    }
+    return true;
 }
 
 test "CoreEvent decoder covers every ABI v1 tag" {
@@ -417,6 +603,139 @@ test "UiResponse decoder rejects unknown tags and invalid payloads" {
     try std.testing.expectError(error.InvalidPayload, decodeUiResponse(a, "{\"permission\":\"allow_once\",\"answers\":[]}"));
 }
 
+test "Skill catalog decoder owns and validates the public descriptor" {
+    const a = std.testing.allocator;
+    const scope_id = "0" ** 64;
+    const revision = "1" ** 64;
+    const skill_id = "2" ** 64;
+    const encoded = try std.fmt.allocPrint(
+        a,
+        "{{\"schema\":\"metask.skill-catalog/v1\",\"catalog_scope_id\":\"{s}\",\"catalog_revision\":\"{s}\",\"health\":\"healthy\",\"skills\":[{{\"skill_id\":\"{s}\",\"invocation_name\":\"review\",\"display_name\":\"Review\",\"description\":\"Review a target\",\"argument_schema\":{{\"schema\":\"metask.skill-arguments/v1\",\"max_values\":64,\"names\":[\"target\"]}}}}],\"issues\":[]}}",
+        .{ scope_id, revision, skill_id },
+    );
+    var parsed = try decodeSkillCatalog(a, encoded);
+    @memset(encoded, 'x');
+    a.free(encoded);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(SkillCatalogHealth.healthy, parsed.value.health);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.skills.len);
+    try std.testing.expectEqualStrings("review", parsed.value.skills[0].invocation_name);
+    try std.testing.expectEqualStrings(
+        "target",
+        parsed.value.skills[0].argument_schema.names[0],
+    );
+}
+
+test "Skill catalog decoder rejects schema and semantic contradictions" {
+    const a = std.testing.allocator;
+    const hash = "0" ** 64;
+    const wrong_schema = try std.fmt.allocPrint(
+        a,
+        "{{\"schema\":\"future\",\"catalog_scope_id\":\"{s}\",\"catalog_revision\":\"{s}\",\"health\":\"healthy\",\"skills\":[],\"issues\":[]}}",
+        .{ hash, hash },
+    );
+    defer a.free(wrong_schema);
+    try std.testing.expectError(
+        error.InvalidPayload,
+        decodeSkillCatalog(a, wrong_schema),
+    );
+
+    const contradictory_health = try std.fmt.allocPrint(
+        a,
+        "{{\"schema\":\"metask.skill-catalog/v1\",\"catalog_scope_id\":\"{s}\",\"catalog_revision\":\"{s}\",\"health\":\"degraded\",\"skills\":[],\"issues\":[]}}",
+        .{ hash, hash },
+    );
+    defer a.free(contradictory_health);
+    try std.testing.expectError(
+        error.InvalidPayload,
+        decodeSkillCatalog(a, contradictory_health),
+    );
+}
+
+test "Skill catalog decoder exposes typed degraded issues" {
+    const a = std.testing.allocator;
+    const hash = "0" ** 64;
+    const encoded = try std.fmt.allocPrint(
+        a,
+        "{{\"schema\":\"metask.skill-catalog/v1\",\"catalog_scope_id\":\"{s}\",\"catalog_revision\":\"{s}\",\"health\":\"degraded\",\"skills\":[],\"issues\":[{{\"code\":\"invalid_definition\",\"invocation_name\":\"review\",\"source_scope\":\"project\"}},{{\"code\":\"invalid_invocation_name\",\"invocation_name\":null,\"source_scope\":\"personal\"}}]}}",
+        .{ hash, hash },
+    );
+    defer a.free(encoded);
+    var parsed = try decodeSkillCatalog(a, encoded);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(SkillCatalogHealth.degraded, parsed.value.health);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.issues.len);
+    try std.testing.expectEqual(
+        SkillCatalogIssueCode.invalid_definition,
+        parsed.value.issues[0].code,
+    );
+    try std.testing.expectEqualStrings(
+        "review",
+        parsed.value.issues[0].invocation_name.?,
+    );
+    try std.testing.expectEqual(
+        SkillSourceScope.project,
+        parsed.value.issues[0].source_scope,
+    );
+    try std.testing.expectEqual(
+        SkillCatalogIssueCode.invalid_invocation_name,
+        parsed.value.issues[1].code,
+    );
+    try std.testing.expect(parsed.value.issues[1].invocation_name == null);
+    try std.testing.expectEqual(
+        SkillSourceScope.personal,
+        parsed.value.issues[1].source_scope,
+    );
+}
+
+test "Skill arguments encoder emits the exact bounded wire shape" {
+    const a = std.testing.allocator;
+    const values = [_][]const u8{
+        "C:\\work\\main.zig",
+        "quoted \"target\"\nnext",
+    };
+    const encoded = try encodeSkillArguments(a, &values);
+    defer a.free(encoded);
+    try std.testing.expectEqualStrings(
+        "{\"values\":[\"C:\\\\work\\\\main.zig\",\"quoted \\\"target\\\"\\nnext\"]}",
+        encoded,
+    );
+
+    var too_many: [MAX_SKILL_ARGUMENT_VALUES_V1 + 1][]const u8 = undefined;
+    for (&too_many) |*value| value.* = "x";
+    try std.testing.expectError(
+        error.InvalidArguments,
+        encodeSkillArguments(a, &too_many),
+    );
+    const invalid_utf8 = [_]u8{0xff};
+    const invalid_values = [_][]const u8{&invalid_utf8};
+    try std.testing.expectError(
+        error.InvalidArguments,
+        encodeSkillArguments(a, &invalid_values),
+    );
+
+    const oversized_invalid = try a.alloc(
+        u8,
+        MAX_SKILL_ARGUMENT_JSON_BYTES_V1 + 1,
+    );
+    defer a.free(oversized_invalid);
+    @memset(oversized_invalid, 0xff);
+    try std.testing.expectError(
+        error.ResourceLimit,
+        encodeSkillArguments(a, &.{oversized_invalid}),
+    );
+
+    const escaped = try a.alloc(u8, 200_000);
+    defer a.free(escaped);
+    @memset(escaped, 0);
+    try std.testing.expectError(
+        error.ResourceLimit,
+        encodeSkillArguments(a, &.{escaped}),
+    );
+}
+
 test "decoder and encoder normalize allocation failure" {
     var decode_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, decodeCoreEvent(decode_failing.allocator(), "{\"text_chunk\":\"x\"}"));
@@ -425,4 +744,18 @@ test "decoder and encoder normalize allocation failure" {
     const answers = [_]Answer{.{ .values = &values }};
     const request = UiRequest{ .ask_question = &.{.{ .question = "Continue?", .header = "Choice", .multi = false, .options = &.{.{ .label = "Yes", .description = "Proceed" }} }} };
     try std.testing.expectError(error.OutOfMemory, encodeUiResponse(encode_failing.allocator(), request, .{ .answers = &answers }));
+
+    var catalog_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        decodeSkillCatalog(
+            catalog_failing.allocator(),
+            "{\"schema\":\"metask.skill-catalog/v1\"}",
+        ),
+    );
+    var arguments_failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(
+        error.OutOfMemory,
+        encodeSkillArguments(arguments_failing.allocator(), &.{"x"}),
+    );
 }

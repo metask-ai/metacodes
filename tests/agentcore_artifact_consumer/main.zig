@@ -196,7 +196,7 @@ pub fn main(init: std.process.Init) !void {
     const skill_path = try std.fs.path.join(a, &.{ skill_dir, "SKILL.md" });
     try std.Io.Dir.cwd().writeFile(init.io, .{
         .sub_path = skill_path,
-        .data = "---\nname: Review\ndescription: Source-free typed invocation fixture\n---\nexercise bundle",
+        .data = "---\nname: Review\ndescription: Source-free typed invocation fixture\narguments: [target]\n---\nexercise $target",
     });
     // Source-free proof: the model supplies a relative file path and the
     // binary facade resolves it against workspace_root, not process cwd.
@@ -301,13 +301,17 @@ pub fn main(init: std.process.Init) !void {
     };
     var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 6, .reserved = [_]u64{0} ** 4 };
     var result: wire.RunResultV1 = undefined;
+    const encoded_arguments = try sdk.encodeSkillArguments(
+        a,
+        &.{"artifact-target"},
+    );
     try probe.beginRun(1);
     try expectStatus(.ok, api.sessionRunSkill(
         session,
         1,
         sdk.bytesView(identities.skill_id),
         sdk.bytesView(identities.revision),
-        sdk.bytesView(""),
+        sdk.bytesView(encoded_arguments),
         &options,
         &result,
         &diagnostic,
@@ -333,27 +337,16 @@ fn catalogIdentities(
     descriptor_json: []const u8,
     invocation_name: []const u8,
 ) !CatalogIdentities {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, descriptor_json, .{});
+    const parsed = try sdk.decodeSkillCatalog(allocator, descriptor_json);
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidCatalogDescriptor;
-    const revision_value = parsed.value.object.get("catalog_revision") orelse
-        return error.InvalidCatalogDescriptor;
-    if (revision_value != .string or revision_value.string.len != 64)
-        return error.InvalidCatalogDescriptor;
-    const skills_value = parsed.value.object.get("skills") orelse
-        return error.InvalidCatalogDescriptor;
-    if (skills_value != .array) return error.InvalidCatalogDescriptor;
-    for (skills_value.array.items) |skill_value| {
-        if (skill_value != .object) return error.InvalidCatalogDescriptor;
-        const name_value = skill_value.object.get("invocation_name") orelse
-            return error.InvalidCatalogDescriptor;
-        const id_value = skill_value.object.get("skill_id") orelse
-            return error.InvalidCatalogDescriptor;
-        if (name_value != .string or id_value != .string) return error.InvalidCatalogDescriptor;
-        if (std.mem.eql(u8, name_value.string, invocation_name)) {
+    for (parsed.value.skills) |skill| {
+        if (std.mem.eql(u8, skill.invocation_name, invocation_name)) {
+            if (skill.argument_schema.names.len != 1 or
+                !std.mem.eql(u8, skill.argument_schema.names[0], "target"))
+                return error.InvalidCatalogDescriptor;
             return .{
-                .revision = try allocator.dupe(u8, revision_value.string),
-                .skill_id = try allocator.dupe(u8, id_value.string),
+                .revision = try allocator.dupe(u8, parsed.value.catalog_revision),
+                .skill_id = try allocator.dupe(u8, skill.skill_id),
             };
         }
     }

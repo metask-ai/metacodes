@@ -443,29 +443,15 @@ fn extractCatalogIdentities(
     descriptor_json: []const u8,
     invocation_name: []const u8,
 ) !CatalogIdentities {
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, descriptor_json, .{});
+    const parsed = try sdk.decodeSkillCatalog(allocator, descriptor_json);
     defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidCatalogDescriptor;
-    const revision_value = parsed.value.object.get("catalog_revision") orelse
-        return error.InvalidCatalogDescriptor;
-    const skills_value = parsed.value.object.get("skills") orelse
-        return error.InvalidCatalogDescriptor;
-    if (revision_value != .string or skills_value != .array)
-        return error.InvalidCatalogDescriptor;
-    for (skills_value.array.items) |skill_value| {
-        if (skill_value != .object) return error.InvalidCatalogDescriptor;
-        const name_value = skill_value.object.get("invocation_name") orelse
-            return error.InvalidCatalogDescriptor;
-        const id_value = skill_value.object.get("skill_id") orelse
-            return error.InvalidCatalogDescriptor;
-        if (name_value != .string or id_value != .string)
-            return error.InvalidCatalogDescriptor;
-        if (std.mem.eql(u8, name_value.string, invocation_name)) {
-            const revision = try allocator.dupe(u8, revision_value.string);
+    for (parsed.value.skills) |skill| {
+        if (std.mem.eql(u8, skill.invocation_name, invocation_name)) {
+            const revision = try allocator.dupe(u8, parsed.value.catalog_revision);
             errdefer allocator.free(revision);
             return .{
                 .revision = revision,
-                .skill_id = try allocator.dupe(u8, id_value.string),
+                .skill_id = try allocator.dupe(u8, skill.skill_id),
             };
         }
     }
@@ -761,7 +747,7 @@ test "L2 Revision 4 catalog binds before Session and typed Skill failures remain
     defer a.free(skill_path);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{
         .sub_path = skill_path,
-        .data = "---\nname: Review\ndescription: Public typed invocation fixture\n---\nreview the target",
+        .data = "---\nname: Review\ndescription: Public typed invocation fixture\narguments: [target]\n---\nreview $target",
     });
 
     const bodies = [_][]const u8{FINAL_SSE};
@@ -912,6 +898,11 @@ test "L2 Revision 4 catalog binds before Session and typed Skill failures remain
         ),
     );
     api.bufferRelease()(&diagnostic);
+    const encoded_arguments = try sdk.encodeSkillArguments(
+        a,
+        &.{"src/main.zig"},
+    );
+    defer a.free(encoded_arguments);
     try std.testing.expectEqual(
         wire.STATUS_OK,
         api.sessionRunSkill(
@@ -919,7 +910,7 @@ test "L2 Revision 4 catalog binds before Session and typed Skill failures remain
             1,
             sdk.bytesView(ids.skill_id),
             sdk.bytesView(ids.revision),
-            sdk.bytesView(""),
+            sdk.bytesView(encoded_arguments),
             &options,
             &result,
             &diagnostic,

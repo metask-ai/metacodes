@@ -11,13 +11,31 @@ pub const DecodedCoreEvent = protocol.DecodedCoreEvent;
 pub const UnknownCoreEvent = protocol.UnknownCoreEvent;
 pub const UiRequest = protocol.UiRequest;
 pub const UiResponse = protocol.UiResponse;
+pub const SkillCatalog = protocol.SkillCatalog;
+pub const SkillDescriptor = protocol.SkillDescriptor;
+pub const SkillArgumentSchema = protocol.SkillArgumentSchema;
+pub const SkillCatalogIssue = protocol.SkillCatalogIssue;
+pub const SkillCatalogHealth = protocol.SkillCatalogHealth;
+pub const SkillCatalogIssueCode = protocol.SkillCatalogIssueCode;
+pub const SkillSourceScope = protocol.SkillSourceScope;
 pub const ParsedCoreEvent = protocol.ParsedCoreEvent;
 pub const ParsedUiRequest = protocol.ParsedUiRequest;
+pub const ParsedSkillCatalog = protocol.ParsedSkillCatalog;
 pub const DecodeError = protocol.DecodeError;
 pub const EncodeError = protocol.EncodeError;
+pub const SkillCatalogDecodeError = protocol.SkillCatalogDecodeError;
+pub const SkillArgumentsEncodeError = protocol.SkillArgumentsEncodeError;
 pub const decodeCoreEvent = protocol.decodeCoreEvent;
 pub const decodeUiRequest = protocol.decodeUiRequest;
+pub const decodeSkillCatalog = protocol.decodeSkillCatalog;
 pub const encodeUiResponse = protocol.encodeUiResponse;
+pub const encodeSkillArguments = protocol.encodeSkillArguments;
+
+comptime {
+    if (protocol.MAX_SKILL_ARGUMENT_VALUES_V1 != types.MAX_SKILL_ARGUMENT_VALUES_V1 or
+        protocol.MAX_SKILL_ARGUMENT_JSON_BYTES_V1 != types.MAX_SKILL_ARGUMENT_JSON_BYTES_V1)
+        @compileError("Skill JSON codec limits must match the raw ABI contract");
+}
 
 pub extern fn metask_agentcore_get_api(requested_abi: u32) callconv(.c) ?*const anyopaque;
 
