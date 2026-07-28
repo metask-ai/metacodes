@@ -55,31 +55,12 @@ fn makeSkill(parent: []const u8, name: []const u8, md: []const u8) !void {
     pfs.close(fd);
 }
 
-fn removeSkill(parent: []const u8, name: []const u8) void {
-    const allocator = std.testing.allocator;
-    const definition_path = std.fmt.allocPrintSentinel(
-        allocator,
-        "{s}/{s}/SKILL.md",
-        .{ parent, name },
-        0,
-    ) catch return;
-    defer allocator.free(definition_path);
-    _ = std.c.unlink(definition_path);
-    const skill_dir = std.fmt.allocPrintSentinel(
-        allocator,
-        "{s}/{s}",
-        .{ parent, name },
-        0,
-    ) catch return;
-    defer allocator.free(skill_dir);
-    _ = std.c.rmdir(skill_dir);
-}
-
-fn removeRoot(path: []const u8) void {
-    const allocator = std.testing.allocator;
-    const path_z = allocator.dupeZ(u8, path) catch return;
-    defer allocator.free(path_z);
-    _ = std.c.rmdir(path_z);
+fn tmpRoot(
+    tmp: *std.testing.TmpDir,
+    buffer: *[std.fs.max_path_bytes]u8,
+) ![]const u8 {
+    const length = try tmp.dir.realPath(std.testing.io, buffer);
+    return buffer[0..length];
 }
 
 const HostCapture = struct {
@@ -184,12 +165,10 @@ const Fixture = struct {
 
 test "Skills E2E: canonical catalog projects into CLI and system prompt" {
     const allocator = std.testing.allocator;
-    const root = "/tmp/metacodes-shared-skill-catalog";
-    defer {
-        removeSkill(root, "refactor");
-        removeSkill(root, "review");
-        removeRoot(root);
-    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(&tmp, &root_buffer);
     try makeSkill(
         root,
         "refactor",
@@ -241,11 +220,10 @@ test "Skills E2E: canonical catalog projects into CLI and system prompt" {
 
 test "Skills E2E: model dispatch uses typed activation and working tree" {
     const allocator = std.testing.allocator;
-    const root = "/tmp/metacodes-shared-skill-dispatch";
-    defer {
-        removeSkill(root, "greet");
-        removeRoot(root);
-    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(&tmp, &root_buffer);
     try makeSkill(
         root,
         "greet",
@@ -273,12 +251,10 @@ test "Skills E2E: model dispatch uses typed activation and working tree" {
 
 test "Skills E2E: shell rendering and model-only admission share Runtime" {
     const allocator = std.testing.allocator;
-    const root = "/tmp/metacodes-shared-skill-policy";
-    defer {
-        removeSkill(root, "echoer");
-        removeSkill(root, "explicit");
-        removeRoot(root);
-    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(&tmp, &root_buffer);
     try makeSkill(
         root,
         "echoer",
@@ -311,12 +287,10 @@ test "Skills E2E: shell rendering and model-only admission share Runtime" {
 
 test "Skills E2E: execution contexts keep sibling policy projections isolated" {
     const allocator = std.testing.allocator;
-    const root = "/tmp/metacodes-shared-skill-contexts";
-    defer {
-        removeSkill(root, "reader");
-        removeSkill(root, "writer");
-        removeRoot(root);
-    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(&tmp, &root_buffer);
     try makeSkill(
         root,
         "reader",
@@ -390,11 +364,10 @@ test "Skills E2E: execution contexts keep sibling policy projections isolated" {
 
 test "Skills E2E: unmanaged child activation fails closed without leaking lineage" {
     const allocator = std.testing.allocator;
-    const root = "/tmp/metacodes-shared-skill-unmanaged-child";
-    defer {
-        removeSkill(root, "reader");
-        removeRoot(root);
-    }
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(&tmp, &root_buffer);
     try makeSkill(
         root,
         "reader",
