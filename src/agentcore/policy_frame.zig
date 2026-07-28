@@ -77,6 +77,10 @@ pub const PolicyFrame = struct {
             .local_disallowed = &.{},
             .shell = base_frame.shell,
             .permission = base_frame.permission,
+            // The child retains base_frame before returning, so these borrowed
+            // slices remain alive for the whole child lifetime. Copying the
+            // context into every sibling would add allocations without adding
+            // ownership safety.
             .match_context = base_frame.match_context,
         };
         errdefer {

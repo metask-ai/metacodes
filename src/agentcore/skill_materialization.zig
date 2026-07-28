@@ -15,6 +15,7 @@ const catalog = @import("skill_catalog.zig");
 const Dir = std.Io.Dir;
 const File = std.Io.File;
 const AbortSignal = core.util_abort.AbortSignal;
+const windows = std.os.windows;
 
 pub const MAX_ACTIVE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_NAME_ATTEMPTS: usize = 8;
@@ -30,6 +31,7 @@ pub const Error = error{
     CoreError,
     Busy,
     Unavailable,
+    UnsupportedFilesystem,
 };
 
 pub const TestFault = enum {
@@ -73,6 +75,7 @@ pub const Manager = struct {
     active_count: usize = 0,
     active_bytes: usize = 0,
     max_active_bytes: usize = MAX_ACTIVE_BYTES,
+    exact_file_modes: bool,
     test_fault: if (builtin.is_test) ?TestFault else void = if (builtin.is_test) null else {},
 
     pub fn init(allocator: std.mem.Allocator) Error!Manager {
@@ -126,6 +129,12 @@ pub const Manager = struct {
                 base_path,
                 name_source,
             ) orelse continue;
+            const exact_file_modes = probeExactFileModes(io, created.dir) catch |err| {
+                created.dir.close(io);
+                Dir.cwd().deleteTree(io, created.path) catch {};
+                allocator.free(created.path);
+                return err;
+            };
             return .{
                 .allocator = allocator,
                 .io = io,
@@ -134,6 +143,7 @@ pub const Manager = struct {
                 .root_dir = created.dir,
                 .name_source = name_source,
                 .max_active_bytes = max_active_bytes,
+                .exact_file_modes = exact_file_modes,
             };
         }
         return error.CoreError;
@@ -203,11 +213,16 @@ pub const Manager = struct {
         record: *const catalog.SkillRecord,
         abort: *const AbortSignal,
     ) Error!WorkingTree {
+        if (!self.exact_file_modes) return error.UnsupportedFilesystem;
         const faults: Faults = if (comptime builtin.is_test)
             testFaults(self.test_fault)
         else
             .{};
         return self.materializeWithFaults(record, abort, faults);
+    }
+
+    pub fn supportsExactFileModes(self: *const Manager) bool {
+        return self.exact_file_modes;
     }
 
     pub fn setTestFault(self: *Manager, fault: ?TestFault) void {
@@ -420,19 +435,119 @@ fn createPrivateRoot(
     const root_path = std.fs.path.join(allocator, &.{ base_path, name }) catch
         return error.OutOfMemory;
     errdefer allocator.free(root_path);
-    Dir.createDirAbsolute(io, root_path, privateDirPermissions()) catch |err| switch (err) {
-        error.PathAlreadyExists => {
-            allocator.free(root_path);
-            return null;
-        },
-        else => return error.CoreError,
-    };
+    if (!try createPrivateDirectory(io, root_path)) {
+        allocator.free(root_path);
+        return null;
+    }
     errdefer Dir.cwd().deleteTree(io, root_path) catch {};
     const root_dir = Dir.openDirAbsolute(io, root_path, .{
         .iterate = true,
         .follow_symlinks = false,
     }) catch return error.CoreError;
     return .{ .path = root_path, .dir = root_dir };
+}
+
+fn createPrivateDirectory(io: std.Io, path: []const u8) Error!bool {
+    if (comptime builtin.os.tag != .windows) {
+        Dir.createDirAbsolute(io, path, privateDirPermissions()) catch |err| switch (err) {
+            error.PathAlreadyExists => return false,
+            else => return error.CoreError,
+        };
+        return true;
+    }
+
+    // Protect the root from inheriting permissive entries from %TEMP%.
+    // OW is the effective object owner; SYSTEM and Administrators retain the
+    // ordinary recovery access expected on Windows. OI/CI propagates the same
+    // ceiling to activation directories and files.
+    const sddl = std.unicode.utf8ToUtf16LeStringLiteral(
+        "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+    );
+    var descriptor: ?*anyopaque = null;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl,
+        SDDL_REVISION_1,
+        &descriptor,
+        null,
+    ).toBool()) return error.CoreError;
+    defer _ = LocalFree(descriptor);
+
+    var security_attributes = windows.SECURITY_ATTRIBUTES{
+        .nLength = @sizeOf(windows.SECURITY_ATTRIBUTES),
+        .lpSecurityDescriptor = descriptor,
+        .bInheritHandle = .FALSE,
+    };
+    const path_w = std.Io.Threaded.sliceToPrefixedFileW(null, path, .{}) catch
+        return error.CoreError;
+    if (!CreateDirectoryW(path_w.span(), &security_attributes).toBool()) {
+        return switch (windows.GetLastError()) {
+            .ALREADY_EXISTS, .FILE_EXISTS => false,
+            else => error.CoreError,
+        };
+    }
+    if (!windowsPrivateDaclIsProtected(path_w.span())) {
+        Dir.cwd().deleteTree(io, path) catch {};
+        return error.CoreError;
+    }
+    return true;
+}
+
+fn windowsPrivateDaclIsProtected(path_w: [*:0]const u16) bool {
+    if (comptime builtin.os.tag != .windows) return false;
+    var descriptor: ?*anyopaque = null;
+    if (GetNamedSecurityInfoW(
+        path_w,
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        null,
+        null,
+        null,
+        null,
+        &descriptor,
+    ) != ERROR_SUCCESS) return false;
+    defer _ = LocalFree(descriptor);
+
+    var control: u16 = 0;
+    var revision: windows.DWORD = 0;
+    if (!GetSecurityDescriptorControl(
+        descriptor,
+        &control,
+        &revision,
+    ).toBool()) return false;
+    return control & SE_DACL_PROTECTED != 0;
+}
+
+/// POSIX materialization promises to preserve the executable bit exactly.
+/// Some mounted filesystems accept chmod but report every file as executable;
+/// silently skipping the final check there would widen authority. Probe once
+/// per Runtime root and let Skill admission fail explicitly instead.
+fn probeExactFileModes(io: std.Io, root: Dir) Error!bool {
+    if (!File.Permissions.has_executable_bit) return true;
+
+    const probe_name = ".mode-probe";
+    var file = root.createFile(io, probe_name, .{
+        .exclusive = true,
+        .permissions = filePermissions(false),
+        .resolve_beneath = true,
+    }) catch return error.CoreError;
+    var file_open = true;
+    defer if (file_open) file.close(io);
+
+    const non_executable = blk: {
+        file.setPermissions(io, filePermissions(false)) catch break :blk false;
+        const state = file.stat(io) catch return error.CoreError;
+        break :blk !executableBit(state.permissions);
+    };
+    const executable = if (non_executable) blk: {
+        file.setPermissions(io, filePermissions(true)) catch break :blk false;
+        const state = file.stat(io) catch return error.CoreError;
+        break :blk executableBit(state.permissions);
+    } else false;
+
+    file.close(io);
+    file_open = false;
+    root.deleteFile(io, probe_name) catch return error.CoreError;
+    return non_executable and executable;
 }
 
 fn materializationCost(record: *const catalog.SkillRecord) error{ResourceLimit}!usize {
@@ -725,13 +840,18 @@ fn testManager(
 ) !Manager {
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
-    return Manager.initBorrowed(
+    var manager = try Manager.initBorrowed(
         std.testing.allocator,
         std.testing.io,
         root_buffer[0..root_len],
         names.source(),
         cap,
     );
+    if (!manager.supportsExactFileModes()) {
+        try manager.deinit();
+        return error.SkipZigTest;
+    }
+    return manager;
 }
 
 fn expectRootEmpty(manager: *Manager) !void {
@@ -765,6 +885,33 @@ test "materialization preserves exact tree and isolates mutable scratch" {
     try tree.deinit();
     try std.testing.expectEqual(@as(usize, 0), manager.active_count);
     try std.testing.expectEqual(@as(usize, 0), manager.active_bytes);
+}
+
+test "unsupported mode semantics fail before reserving or creating an activation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var names = DeterministicNames{};
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    var manager = try Manager.initBorrowed(
+        std.testing.allocator,
+        std.testing.io,
+        root_buffer[0..root_len],
+        names.source(),
+        MAX_ACTIVE_BYTES,
+    );
+    defer manager.deinit() catch unreachable;
+    manager.exact_file_modes = false;
+    const record = testRecord();
+    var abort = AbortSignal.init();
+
+    try std.testing.expectError(
+        error.UnsupportedFilesystem,
+        manager.materialize(&record, &abort),
+    );
+    try std.testing.expectEqual(@as(usize, 0), manager.active_count);
+    try std.testing.expectEqual(@as(usize, 0), manager.active_bytes);
+    try expectRootEmpty(&manager);
 }
 
 test "aggregate reservation is concurrent-live and released exactly once" {
@@ -876,12 +1023,53 @@ test "production Manager owns a concurrent I/O runtime and removes its private r
     var manager = try Manager.init(std.testing.allocator);
     const root = try std.testing.allocator.dupe(u8, manager.root_path);
     defer std.testing.allocator.free(root);
+    if (builtin.os.tag == .windows) {
+        const root_w = try std.Io.Threaded.sliceToPrefixedFileW(null, root, .{});
+        try std.testing.expect(windowsPrivateDaclIsProtected(root_w.span()));
+    }
     try manager.deinit();
     try std.testing.expectError(
         error.FileNotFound,
         Dir.openDirAbsolute(std.testing.io, root, .{}),
     );
 }
+
+const SDDL_REVISION_1: windows.DWORD = 1;
+const SE_FILE_OBJECT: windows.DWORD = 1;
+const DACL_SECURITY_INFORMATION: windows.DWORD = 0x00000004;
+const SE_DACL_PROTECTED: u16 = 0x1000;
+const ERROR_SUCCESS: windows.DWORD = 0;
+
+extern "advapi32" fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+    string_security_descriptor: [*:0]const u16,
+    string_sd_revision: windows.DWORD,
+    security_descriptor: *?*anyopaque,
+    security_descriptor_size: ?*windows.DWORD,
+) callconv(.winapi) windows.BOOL;
+
+extern "advapi32" fn GetNamedSecurityInfoW(
+    object_name: [*:0]const u16,
+    object_type: windows.DWORD,
+    security_info: windows.DWORD,
+    owner: ?*?*anyopaque,
+    group: ?*?*anyopaque,
+    dacl: ?*?*anyopaque,
+    sacl: ?*?*anyopaque,
+    security_descriptor: *?*anyopaque,
+) callconv(.winapi) windows.DWORD;
+
+extern "advapi32" fn GetSecurityDescriptorControl(
+    security_descriptor: ?*anyopaque,
+    control: *u16,
+    revision: *windows.DWORD,
+) callconv(.winapi) windows.BOOL;
+
+extern "kernel32" fn CreateDirectoryW(
+    path_name: [*:0]const u16,
+    security_attributes: ?*windows.SECURITY_ATTRIBUTES,
+) callconv(.winapi) windows.BOOL;
+
+extern "kernel32" fn LocalFree(memory: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 
 test "Runtime private root retries a random-name collision without leaking allocations" {
     var tmp = std.testing.tmpDir(.{});

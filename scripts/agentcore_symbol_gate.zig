@@ -49,7 +49,9 @@ fn validateArchiveSymbols(archive: []const u8) !void {
         data = data[name_size..];
     }
     if (std.mem.eql(u8, logical_name, "/")) {
-        try validateGnuLinkerMember(data);
+        try validateGnuLinkerMember(u32, data);
+    } else if (std.mem.eql(u8, logical_name, "/SYM64/")) {
+        try validateGnuLinkerMember(u64, data);
     } else if (std.mem.startsWith(u8, logical_name, "__.SYMDEF")) {
         try validateBsdLinkerMember(data);
     } else {
@@ -57,16 +59,25 @@ fn validateArchiveSymbols(archive: []const u8) !void {
     }
 }
 
-fn validateGnuLinkerMember(data: []const u8) !void {
-    if (data.len < 4) return error.InvalidArchive;
-    const symbol_count = std.mem.readInt(u32, data[0..4], .big);
-    const offsets_size = std.math.mul(usize, symbol_count, 4) catch return error.InvalidArchive;
-    const names_start = std.math.add(usize, 4, offsets_size) catch return error.InvalidArchive;
+fn validateGnuLinkerMember(comptime Offset: type, data: []const u8) !void {
+    comptime {
+        if (Offset != u32 and Offset != u64)
+            @compileError("GNU archive offsets must be u32 or u64");
+    }
+    const word_size = @sizeOf(Offset);
+    if (data.len < word_size) return error.InvalidArchive;
+    const raw_symbol_count = std.mem.readInt(Offset, data[0..word_size], .big);
+    const symbol_count = std.math.cast(usize, raw_symbol_count) orelse
+        return error.InvalidArchive;
+    const offsets_size = std.math.mul(usize, symbol_count, word_size) catch
+        return error.InvalidArchive;
+    const names_start = std.math.add(usize, word_size, offsets_size) catch
+        return error.InvalidArchive;
     if (names_start > data.len) return error.InvalidArchive;
 
     var names = data[names_start..];
     var found_discovery = false;
-    var index: u32 = 0;
+    var index: usize = 0;
     while (index < symbol_count) : (index += 1) {
         const end = std.mem.indexOfScalar(u8, names, 0) orelse return error.InvalidArchive;
         try checkSymbol(names[0..end], &found_discovery);
@@ -116,7 +127,7 @@ test "archive symbol gate accepts only the new discovery namespace" {
     std.mem.writeInt(u32, data[0..4], 2, .big);
     @memset(data[4..12], 0);
     @memcpy(data[12..], symbols);
-    try validateGnuLinkerMember(&data);
+    try validateGnuLinkerMember(u32, &data);
 }
 
 test "archive symbol gate rejects old and duplicate namespaces" {
@@ -125,14 +136,14 @@ test "archive symbol gate rejects old and duplicate namespaces" {
     std.mem.writeInt(u32, legacy_data[0..4], 1, .big);
     @memset(legacy_data[4..8], 0);
     @memcpy(legacy_data[8..], legacy);
-    try std.testing.expectError(error.ForbiddenLegacySymbol, validateGnuLinkerMember(&legacy_data));
+    try std.testing.expectError(error.ForbiddenLegacySymbol, validateGnuLinkerMember(u32, &legacy_data));
 
     const duplicate = "metask_agentcore_agentcore_get_api\x00";
     var duplicate_data: [4 + 4 + duplicate.len]u8 = undefined;
     std.mem.writeInt(u32, duplicate_data[0..4], 1, .big);
     @memset(duplicate_data[4..8], 0);
     @memcpy(duplicate_data[8..], duplicate);
-    try std.testing.expectError(error.ForbiddenLegacySymbol, validateGnuLinkerMember(&duplicate_data));
+    try std.testing.expectError(error.ForbiddenLegacySymbol, validateGnuLinkerMember(u32, &duplicate_data));
 }
 
 test "archive symbol gate rejects missing discovery symbol" {
@@ -141,7 +152,7 @@ test "archive symbol gate rejects missing discovery symbol" {
     std.mem.writeInt(u32, data[0..4], 1, .big);
     @memset(data[4..8], 0);
     @memcpy(data[8..], symbols);
-    try std.testing.expectError(error.MissingDiscoverySymbol, validateGnuLinkerMember(&data));
+    try std.testing.expectError(error.MissingDiscoverySymbol, validateGnuLinkerMember(u32, &data));
 }
 
 test "archive symbol gate rejects COFF import-library symbols" {
@@ -150,7 +161,33 @@ test "archive symbol gate rejects COFF import-library symbols" {
     std.mem.writeInt(u32, data[0..4], 2, .big);
     @memset(data[4..12], 0);
     @memcpy(data[12..], symbols);
-    try std.testing.expectError(error.ImportLibrarySymbol, validateGnuLinkerMember(&data));
+    try std.testing.expectError(error.ImportLibrarySymbol, validateGnuLinkerMember(u32, &data));
+}
+
+test "GNU64 archive dispatch accepts discovery and rejects truncated offsets" {
+    const symbols = "metask_agentcore_get_api\x00another_global\x00";
+    var data: [8 + 2 * 8 + symbols.len]u8 = undefined;
+    std.mem.writeInt(u64, data[0..8], 2, .big);
+    @memset(data[8..24], 0);
+    @memcpy(data[24..], symbols);
+
+    var archive: [archive_magic.len + header_size + data.len]u8 = undefined;
+    @memcpy(archive[0..archive_magic.len], archive_magic);
+    const header = archive[archive_magic.len..][0..header_size];
+    @memset(header, ' ');
+    @memcpy(header[0.."/SYM64/".len], "/SYM64/");
+    const size_text = try std.fmt.bufPrint(header[48..58], "{d}", .{data.len});
+    @memset(header[48 + size_text.len .. 58], ' ');
+    @memcpy(header[58..60], "`\n");
+    @memcpy(archive[archive_magic.len + header_size ..], &data);
+    try validateArchiveSymbols(&archive);
+
+    var truncated: [8]u8 = undefined;
+    std.mem.writeInt(u64, &truncated, std.math.maxInt(u64), .big);
+    try std.testing.expectError(
+        error.InvalidArchive,
+        validateGnuLinkerMember(u64, &truncated),
+    );
 }
 
 test "BSD archive symbol gate accepts Mach-O leading underscore" {

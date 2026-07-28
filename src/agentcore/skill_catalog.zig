@@ -307,6 +307,38 @@ fn enumerateSource(
             return error.ResourceLimit;
         if (counters.visited_entries > limits.max_visited_entries) return error.ResourceLimit;
 
+        const kind = if (entry.kind == .unknown)
+            (root.statFile(io, entry.name, .{ .follow_symlinks = false }) catch
+                return error.CatalogInvalid).kind
+        else
+            entry.kind;
+        if (kind != .directory) continue;
+
+        // A discovery-root entry is a Skill candidate only when its directory
+        // contains a no-follow SKILL.md entry. Ordinary files and directories
+        // must not degrade catalog health or perturb the revision.
+        var candidate_dir = root.openDir(io, entry.name, .{
+            .follow_symlinks = false,
+        }) catch return error.CatalogInvalid;
+        defer candidate_dir.close(io);
+        const candidate_before = candidate_dir.stat(io) catch
+            return error.CatalogInvalid;
+        const has_definition = blk: {
+            const definition = candidate_dir.statFile(io, "SKILL.md", .{
+                .follow_symlinks = false,
+            }) catch |err| switch (err) {
+                error.FileNotFound => break :blk false,
+                else => return error.CatalogInvalid,
+            };
+            _ = definition;
+            break :blk true;
+        };
+        const candidate_after = candidate_dir.stat(io) catch
+            return error.CatalogInvalid;
+        if (!sameDirectoryState(candidate_before, candidate_after))
+            return error.CatalogInvalid;
+        if (!has_definition) continue;
+
         const invocation = makeInvocationName(arena, source.namespace, entry.name) catch
             return error.OutOfMemory;
         if (!validInvocationName(invocation)) {
@@ -319,11 +351,6 @@ fn enumerateSource(
             });
             continue;
         }
-        const kind = if (entry.kind == .unknown)
-            (root.statFile(io, entry.name, .{ .follow_symlinks = false }) catch
-                return error.CatalogInvalid).kind
-        else
-            entry.kind;
         try candidates.append(arena, .{
             // Sources are borrowed for the synchronous duration of `build`.
             .root = source.root,
@@ -1047,6 +1074,12 @@ test "hidden invalid invocation identity still changes catalog revision" {
     defer std.testing.allocator.free(second_bad);
     try Dir.cwd().createDirPath(io, first_bad);
     try Dir.cwd().createDirPath(io, second_bad);
+    const first_md = try std.fmt.allocPrint(std.testing.allocator, "{s}/SKILL.md", .{first_bad});
+    defer std.testing.allocator.free(first_md);
+    const second_md = try std.fmt.allocPrint(std.testing.allocator, "{s}/SKILL.md", .{second_bad});
+    defer std.testing.allocator.free(second_md);
+    try Dir.cwd().writeFile(io, .{ .sub_path = first_md, .data = "first" });
+    try Dir.cwd().writeFile(io, .{ .sub_path = second_md, .data = "second" });
     const scope_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const first_sources = [_]Source{.{ .root = first_root, .scope = .project, .priority = 1 }};
     const second_sources = [_]Source{.{ .root = second_root, .scope = .project, .priority = 1 }};
@@ -1057,6 +1090,59 @@ test "hidden invalid invocation identity still changes catalog revision" {
     try std.testing.expectEqual(@as(usize, 1), first.issues.len);
     try std.testing.expect(first.issues[0].invocation_name == null);
     try std.testing.expect(!std.mem.eql(u8, &first.revision, &second.revision));
+}
+
+test "unrelated root entries do not degrade or perturb catalog revision" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const skill_dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/review", .{root});
+    defer std.testing.allocator.free(skill_dir);
+    try Dir.cwd().createDirPath(io, skill_dir);
+    const md_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/SKILL.md", .{skill_dir});
+    defer std.testing.allocator.free(md_path);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = md_path,
+        .data = "---\nname: Review\n---\nbody",
+    });
+    const sources = [_]Source{.{ .root = root, .scope = .project, .priority = 1 }};
+    const scope_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const baseline = try build(std.testing.allocator, io, scope_id, "epoch", &sources, .{});
+    defer baseline.deinit();
+
+    const readme = try std.fmt.allocPrint(std.testing.allocator, "{s}/README", .{root});
+    defer std.testing.allocator.free(readme);
+    const dotted = try std.fmt.allocPrint(std.testing.allocator, "{s}/README.md", .{root});
+    defer std.testing.allocator.free(dotted);
+    const hidden = try std.fmt.allocPrint(std.testing.allocator, "{s}/.DS_Store", .{root});
+    defer std.testing.allocator.free(hidden);
+    const notes = try std.fmt.allocPrint(std.testing.allocator, "{s}/notes", .{root});
+    defer std.testing.allocator.free(notes);
+    try Dir.cwd().writeFile(io, .{ .sub_path = readme, .data = "ordinary" });
+    try Dir.cwd().writeFile(io, .{ .sub_path = dotted, .data = "ordinary" });
+    try Dir.cwd().writeFile(io, .{ .sub_path = hidden, .data = "ordinary" });
+    try Dir.cwd().createDirPath(io, notes);
+
+    const with_unrelated = try build(
+        std.testing.allocator,
+        io,
+        scope_id,
+        "epoch",
+        &sources,
+        .{},
+    );
+    defer with_unrelated.deinit();
+    try std.testing.expectEqual(Health.healthy, with_unrelated.health);
+    try std.testing.expectEqual(@as(usize, 0), with_unrelated.issues.len);
+    try std.testing.expectEqual(@as(usize, 1), with_unrelated.skills.len);
+    try std.testing.expectEqualSlices(
+        u8,
+        &baseline.revision,
+        &with_unrelated.revision,
+    );
 }
 
 test "selected skill tree never follows symbolic links" {

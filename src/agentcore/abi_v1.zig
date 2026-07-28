@@ -398,6 +398,8 @@ const AbiSession = struct {
             .external_run_root,
         );
         defer plan.deinit();
+        if (!materializations.supportsExactFileModes())
+            return error.SkillUnavailable;
 
         return switch (try self.admitMaterializedSkill(
             materializations,
@@ -431,7 +433,9 @@ const AbiSession = struct {
                 .{ .ctx = self, .emit = AbiSession.emit },
             ) };
         };
-        if (!model_skill_tool.Environment.hasModelInvocable(cell.snapshot)) {
+        if (!materializations.supportsExactFileModes() or
+            !model_skill_tool.Environment.hasModelInvocable(cell.snapshot))
+        {
             return .{ .completed = try self.core_session.runText(
                 run_id,
                 prompt,
@@ -1038,6 +1042,7 @@ fn skillRunErrorStatus(self: *const AbiSession, err: anyerror) u32 {
         error.InvalidArguments => wire.STATUS_INVALID_SKILL_ARGUMENTS,
         error.PolicyViolation => wire.STATUS_SKILL_POLICY_VIOLATION,
         error.SkillUnavailable => wire.STATUS_SKILL_UNAVAILABLE,
+        error.UnsupportedFilesystem => wire.STATUS_SKILL_UNAVAILABLE,
         error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
         else => runErrorStatus(self, err),
     };
@@ -2260,6 +2265,19 @@ test "Run OutOfMemory maps to the public OOM status" {
         .core_session = undefined,
     };
     try std.testing.expectEqual(wire.STATUS_OUT_OF_MEMORY, runErrorStatus(&fake, error.OutOfMemory));
+}
+
+test "unsupported Skill materialization filesystem maps to Skill unavailable" {
+    var fake = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = undefined,
+    };
+    try std.testing.expectEqual(
+        wire.STATUS_SKILL_UNAVAILABLE,
+        skillRunErrorStatus(&fake, error.UnsupportedFilesystem),
+    );
 }
 
 test "diagnostic allocation failure leaves canonical empty output" {
