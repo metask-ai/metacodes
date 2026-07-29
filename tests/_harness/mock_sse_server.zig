@@ -15,6 +15,8 @@ const net = @import("platform").net;
 const psync = @import("platform").sync;
 
 pub const MockServer = struct {
+    pub const MAX_CAPTURED_REQUESTS: usize = 32;
+
     listen_sock: net.Socket,
     port: u16,
     thread: std.Thread,
@@ -24,12 +26,13 @@ pub const MockServer = struct {
     /// HTTP 状态行。默认 200 OK(走 chunked SSE)。非 200 时 sendResponse 发纯 body
     /// (application/json,非 chunked)——用于 Stage 6 HTTP 错误现场 L2(401/429/5xx)。
     status_line: []const u8 = "HTTP/1.1 200 OK",
-    /// 捕获的请求 raw bytes(headers + body,完整 HTTP 请求)。serveOne 写入,lastRequest 读取。
-    /// page_allocator 分配,stop 释放。
-    captured_buf: ?[]u8 = null,
-    captured_len: usize = 0,
-    /// captured_buf 是否已写完(serveOne 写完后置 1)。读端用 .acquire 确保看到完整 buf。
-    captured_ready: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    /// 有序、不可变的请求账本。每条仅保留实际读取长度；borrowed accessor slice
+    /// 在 stop() 前稳定。写入和读取均由 capture_mutex 建立可见性。
+    captured_requests: [MAX_CAPTURED_REQUESTS]?[]u8 =
+        .{null} ** MAX_CAPTURED_REQUESTS,
+    captured_count: usize = 0,
+    captured_overflowed: bool = false,
+    capture_mutex: psync.Mutex = .{},
     /// cassette 模式:多轮 SSE bodies(每个连接回一条,按序)。null = 单 body 模式。
     cassette: ?[]const []const u8 = null,
     /// cassette 当前轮游标(serveLoop 递增)。
@@ -122,17 +125,41 @@ pub const MockServer = struct {
         }
         net.closeSocket(self.listen_sock);
         self.thread.join();
-        if (self.captured_buf) |buf| std.heap.page_allocator.free(buf);
+        for (self.captured_requests[0..self.captured_count]) |maybe_raw| {
+            if (maybe_raw) |raw| std.heap.page_allocator.free(raw);
+        }
         std.heap.page_allocator.destroy(self);
     }
 
     /// 取最近一次收到的请求(raw HTTP)。返回的 slice 借用 self,server 存活期间有效。
     /// 调用前应确保 serveOne 已完成(即客户端已读完响应)。返回 null = 还没收到请求。
     pub fn lastRequest(self: *MockServer) ?CapturedRequest {
-        if (self.captured_ready.load(.acquire) == 0) return null;
-        const buf = self.captured_buf orelse return null;
-        const raw = buf[0..self.captured_len];
-        return CapturedRequest{ .raw = raw };
+        self.capture_mutex.lock();
+        defer self.capture_mutex.unlock();
+        if (self.captured_count == 0) return null;
+        const raw = self.captured_requests[self.captured_count - 1] orelse
+            return null;
+        return .{ .raw = raw };
+    }
+
+    pub fn requestCount(self: *MockServer) usize {
+        self.capture_mutex.lock();
+        defer self.capture_mutex.unlock();
+        return self.captured_count;
+    }
+
+    pub fn requestAt(self: *MockServer, index: usize) ?CapturedRequest {
+        self.capture_mutex.lock();
+        defer self.capture_mutex.unlock();
+        if (index >= self.captured_count) return null;
+        const raw = self.captured_requests[index] orelse return null;
+        return .{ .raw = raw };
+    }
+
+    pub fn captureOverflowed(self: *MockServer) bool {
+        self.capture_mutex.lock();
+        defer self.capture_mutex.unlock();
+        return self.captured_overflowed;
     }
 
     /// 返回形如 "http://127.0.0.1:<port>/v1/messages" 的 URL（allocator-owned）
@@ -145,7 +172,7 @@ pub const MockServer = struct {
         defer net.closeSocket(conn);
         if (self.closing.load(.acquire)) return; // stop() 的自连唤醒,不是真请求
 
-        // 读完整请求(headers + body)到 captured_buf。
+        // 读完整请求(headers + body)到临时缓冲，再按实际长度写入账本。
         // 算法:recv 直到看见 \r\n\r\n,然后根据 Content-Length 读余下 body。
         const cap: usize = 64 * 1024;
         const buf = std.heap.page_allocator.alloc(u8, cap) catch {
@@ -154,10 +181,8 @@ pub const MockServer = struct {
         };
 
         const total = readRequest(conn, buf);
-
-        self.captured_buf = buf;
-        self.captured_len = total;
-        self.captured_ready.store(1, .release);
+        self.captureRequest(buf[0..total]);
+        std.heap.page_allocator.free(buf);
 
         sendResponse(conn, self);
     }
@@ -185,12 +210,8 @@ pub const MockServer = struct {
                 continue;
             };
             const total = readRequest(conn, buf);
-
-            // 记录最近一次请求(覆盖式;cassette 模式主要关心回放,捕获取最后一轮)
-            if (self.captured_buf) |old| std.heap.page_allocator.free(old);
-            self.captured_buf = buf;
-            self.captured_len = total;
-            self.captured_ready.store(1, .release);
+            self.captureRequest(buf[0..total]);
+            std.heap.page_allocator.free(buf);
 
             // flaky:前 N 个连接读完请求后直接断开(不写响应)→ 客户端 receiveHead 失败。
             if (self.flaky_close_remaining > 0) {
@@ -202,6 +223,24 @@ pub const MockServer = struct {
             sendResponse(conn, self);
             net.closeSocket(conn);
         }
+    }
+
+    fn captureRequest(self: *MockServer, raw: []const u8) void {
+        const owned = std.heap.page_allocator.dupe(u8, raw) catch {
+            self.capture_mutex.lock();
+            defer self.capture_mutex.unlock();
+            self.captured_overflowed = true;
+            return;
+        };
+        self.capture_mutex.lock();
+        defer self.capture_mutex.unlock();
+        if (self.captured_count == MAX_CAPTURED_REQUESTS) {
+            self.captured_overflowed = true;
+            std.heap.page_allocator.free(owned);
+            return;
+        }
+        self.captured_requests[self.captured_count] = owned;
+        self.captured_count += 1;
     }
 
     /// 读一个完整 HTTP 请求(headers + Content-Length body)进 buf,返回读到的总字节数。
@@ -452,4 +491,109 @@ test "MockServer: captures request body + jsonField extracts fields" {
     try std.testing.expectEqualStrings("true", cap.jsonField("stream").?);
     try std.testing.expectEqualStrings("[]", cap.jsonField("messages").?);
     try std.testing.expect(cap.jsonField("nonexistent") == null);
+}
+
+test "MockServer: request ledger preserves order and lastRequest compatibility" {
+    const response = "data: {\"type\":\"message_stop\"}\n\n";
+    const bodies = [_][]const u8{ response, response };
+    var srv = try MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+
+    const request_bodies = [_][]const u8{
+        "{\"model\":\"first\"}",
+        "{\"model\":\"second\"}",
+    };
+    for (request_bodies) |request_body| {
+        var request_buf: [256]u8 = undefined;
+        const request = try std.fmt.bufPrint(
+            &request_buf,
+            "POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\n\r\n{s}",
+            .{ request_body.len, request_body },
+        );
+        const reply = try clientRoundtrip(
+            std.testing.allocator,
+            srv.port,
+            request,
+            null,
+        );
+        std.testing.allocator.free(reply);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+    try std.testing.expectEqualStrings(
+        request_bodies[0],
+        srv.requestAt(0).?.body(),
+    );
+    try std.testing.expectEqualStrings(
+        request_bodies[1],
+        srv.requestAt(1).?.body(),
+    );
+    try std.testing.expectEqualStrings(
+        request_bodies[1],
+        srv.lastRequest().?.body(),
+    );
+    try std.testing.expect(!srv.captureOverflowed());
+}
+
+test "MockServer: request ledger reports overflow without overwriting entries" {
+    const response = "data: {\"type\":\"message_stop\"}\n\n";
+    var srv = try MockServer.startCassette(&.{response}, 0);
+    defer srv.stop();
+
+    for (0..MockServer.MAX_CAPTURED_REQUESTS + 1) |index| {
+        var body_buf: [64]u8 = undefined;
+        const request_body = try std.fmt.bufPrint(
+            &body_buf,
+            "{{\"index\":{d}}}",
+            .{index},
+        );
+        var request_buf: [256]u8 = undefined;
+        const request = try std.fmt.bufPrint(
+            &request_buf,
+            "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {d}\r\n\r\n{s}",
+            .{ request_body.len, request_body },
+        );
+        const reply = try clientRoundtrip(
+            std.testing.allocator,
+            srv.port,
+            request,
+            null,
+        );
+        std.testing.allocator.free(reply);
+    }
+
+    try std.testing.expectEqual(
+        MockServer.MAX_CAPTURED_REQUESTS,
+        srv.requestCount(),
+    );
+    try std.testing.expect(srv.captureOverflowed());
+    try std.testing.expectEqualStrings(
+        "{\"index\":0}",
+        srv.requestAt(0).?.body(),
+    );
+}
+
+test "MockServer: flaky closed requests remain in the ledger" {
+    const response = "data: {\"type\":\"message_stop\"}\n\n";
+    var srv = try MockServer.startFlaky(response, 1);
+    defer srv.stop();
+
+    const request = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+    const closed_reply = try clientRoundtrip(
+        std.testing.allocator,
+        srv.port,
+        request,
+        null,
+    );
+    std.testing.allocator.free(closed_reply);
+    const served_reply = try clientRoundtrip(
+        std.testing.allocator,
+        srv.port,
+        request,
+        null,
+    );
+    std.testing.allocator.free(served_reply);
+
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+    try std.testing.expect(!srv.captureOverflowed());
 }
