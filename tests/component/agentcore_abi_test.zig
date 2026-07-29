@@ -62,6 +62,14 @@ const FORK_SKILL_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+const BLOCKED_MODEL_SKILL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_blocked_skill\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_blocked_skill\",\"name\":\"Skill\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"name\\\":\\\"blocked\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
 const WRITE_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_write\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_write\",\"name\":\"Write\",\"input\":{}}}\n\n" ++
@@ -431,6 +439,29 @@ const AbortEventProbe = struct {
 fn rootPath(tmp: *std.testing.TmpDir, buffer: []u8) ![]const u8 {
     const len = try tmp.dir.realPath(std.testing.io, buffer);
     return buffer[0..len];
+}
+
+fn writeSkillFixture(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    invocation_name: []const u8,
+    contents: []const u8,
+) !void {
+    const skill_dir = try std.fs.path.join(
+        allocator,
+        &.{ root, ".metacodes", "skills", invocation_name },
+    );
+    defer allocator.free(skill_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, skill_dir);
+    const skill_path = try std.fs.path.join(
+        allocator,
+        &.{ skill_dir, "SKILL.md" },
+    );
+    defer allocator.free(skill_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = skill_path,
+        .data = contents,
+    });
 }
 
 const CatalogIdentities = struct {
@@ -919,6 +950,205 @@ test "L2 Revision 4 catalog binds before Session and typed Skill failures remain
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
 }
 
+test "L2 AgentCore Skill forks cannot override the Session model" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    try writeSkillFixture(
+        a,
+        root,
+        "blocked",
+        "---\n" ++
+            "name: Blocked\n" ++
+            "description: Attempt a forbidden model override\n" ++
+            "context: fork\n" ++
+            "model: arbitrary-model-id\n" ++
+            "---\n" ++
+            "BLOCKED_CHILD_MODEL_SENTINEL",
+    );
+
+    const bodies = [_][]const u8{
+        BLOCKED_MODEL_SKILL_SSE,
+        FINAL_SSE,
+        FINAL_SSE,
+    };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+    );
+    defer if (runtime) |handle| {
+        _ = api.runtimeDestroy()(handle, &diagnostic);
+    };
+
+    var query = wire.SkillCatalogQueryV1{
+        .struct_size = @sizeOf(wire.SkillCatalogQueryV1),
+        .reserved0 = 0,
+        .workspace_root = sdk.bytesView(root),
+        .workspace_home = sdk.bytesView(root),
+        .workspace_epoch = sdk.bytesView("model-binding-epoch"),
+        .reserved = [_]u64{0} ** 3,
+    };
+    var catalog: ?*wire.SkillCatalogHandle = null;
+    defer if (catalog) |handle| {
+        _ = api.skillCatalogRelease()(handle, &diagnostic);
+    };
+    var descriptor = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&descriptor);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeQuerySkillCatalog()(
+            runtime,
+            &query,
+            &catalog,
+            &descriptor,
+            &diagnostic,
+        ),
+    );
+    const descriptor_bytes = try sdk.borrowedBytes(.{
+        .ptr = descriptor.ptr,
+        .len = descriptor.len,
+    });
+    const blocked = try extractCatalogIdentities(
+        a,
+        descriptor_bytes,
+        "blocked",
+    );
+    defer a.free(blocked.revision);
+    defer a.free(blocked.skill_id);
+
+    var session_config = std.mem.zeroes(wire.SessionConfigV1);
+    session_config.struct_size = @sizeOf(wire.SessionConfigV1);
+    session_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    session_config.permission_mode_code = wire.PERMISSION_BYPASS;
+    session_config.shell_policy_code = wire.SHELL_DISABLED;
+    session_config.api_key = sdk.bytesView("test-key");
+    session_config.model = sdk.bytesView("session-locked-model");
+    session_config.base_url = sdk.bytesView(url);
+    session_config.workspace_root = sdk.bytesView(root);
+    session_config.workspace_home = sdk.bytesView(root);
+    session_config.skill_catalog = catalog;
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.on_event = acceptEvent;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionCreate()(
+            runtime,
+            &session_config,
+            &callbacks,
+            &session,
+            &diagnostic,
+        ),
+    );
+    defer if (session) |handle| {
+        _ = api.sessionDestroy()(handle, &diagnostic);
+    };
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 3;
+    var result = std.mem.zeroes(wire.RunResultV1);
+
+    const blocked_status = api.sessionRunSkill(
+        session,
+        1,
+        sdk.bytesView(blocked.skill_id),
+        sdk.bytesView(blocked.revision),
+        sdk.bytesView(""),
+        &options,
+        &result,
+        &diagnostic,
+    );
+    try std.testing.expectEqual(wire.STATUS_SKILL_UNAVAILABLE, blocked_status);
+    const rejected_diagnostic = try sdk.borrowedBytes(.{
+        .ptr = diagnostic.ptr,
+        .len = diagnostic.len,
+    });
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            rejected_diagnostic,
+            "ModelOverrideUnavailable",
+        ) != null,
+    );
+    api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(@as(usize, 0), server.requestCount());
+
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRunText(
+            session,
+            1,
+            sdk.bytesView("Invoke the blocked Skill."),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    for (0..server.requestCount()) |index| {
+        const request = server.requestAt(index) orelse
+            return error.NoRequestCaptured;
+        try std.testing.expect(
+            std.mem.indexOf(
+                u8,
+                request.body(),
+                "BLOCKED_CHILD_MODEL_SENTINEL",
+            ) == null,
+        );
+        try std.testing.expect(
+            std.mem.indexOf(
+                u8,
+                request.body(),
+                "arbitrary-model-id",
+            ) == null,
+        );
+        try std.testing.expectEqualStrings(
+            "\"session-locked-model\"",
+            request.jsonField("model").?,
+        );
+    }
+    try std.testing.expect(
+        std.mem.indexOf(
+            u8,
+            server.requestAt(1).?.body(),
+            "ModelOverrideUnavailable",
+        ) != null,
+    );
+
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRunText(
+            session,
+            2,
+            sdk.bytesView("Continue after the rejected Skill."),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 3), server.requestCount());
+    try std.testing.expect(!server.captureOverflowed());
+}
+
 test "L2 bound catalog executes model Skill and preserves nested policy lineage" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1027,7 +1257,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
             "description: Run a fresh child that may invoke another Skill\n" ++
             "context: fork\n" ++
             "---\n" ++
-            "Invoke the child Skill and return its result.",
+            "AGENTCORE_FORK_CHILD_SENTINEL Invoke the child Skill and return its result.",
     });
 
     const bodies = [_][]const u8{
@@ -1288,6 +1518,22 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     try std.testing.expect(
         std.mem.indexOf(u8, fork_body, "done") != null,
     );
+    var found_fork_child = false;
+    for (0..server.requestCount()) |index| {
+        const request = server.requestAt(index) orelse continue;
+        if (std.mem.indexOf(
+            u8,
+            request.body(),
+            "AGENTCORE_FORK_CHILD_SENTINEL",
+        ) == null) continue;
+        found_fork_child = true;
+        try std.testing.expectEqualStrings(
+            "\"test-model\"",
+            request.jsonField("model").?,
+        );
+    }
+    try std.testing.expect(found_fork_child);
+    try std.testing.expect(!server.captureOverflowed());
 
     const openai_bodies = [_][]const u8{
         OPENAI_SKILL_SSE,
