@@ -258,6 +258,9 @@ typedef struct {
      * METASK_AGENTCORE_MAX_SESSION_METADATA_BYTES_V1; each is at most
      * METASK_AGENTCORE_MAX_METADATA_STRING_BYTES_V1. */
     metask_agentcore_bytes_view_v1 api_key;
+    /* This is the fixed provider model for the Session and all AgentCore Skill
+     * fork children. A Skill model other than empty/"inherit" is unavailable
+     * and cannot override this binding. */
     metask_agentcore_bytes_view_v1 model;
     metask_agentcore_bytes_view_v1 base_url;
     metask_agentcore_bytes_view_v1 workspace_root;
@@ -353,8 +356,9 @@ typedef uint32_t (*metask_agentcore_session_abort_fn_v1)(
     metask_agentcore_owned_bytes_v1 *out_diagnostic);
 
 /* session_run_input failures before admission (invalid input, resource limit,
- * busy, or stale run id) do not consume run_id. Skill materialization failures
- * after admission consume run_id but leave the Session reusable after cleanup.
+ * busy, stale run id, or an unavailable Skill model override) do not consume
+ * run_id. Skill materialization failures after admission consume run_id but
+ * leave the Session reusable after cleanup.
  * Once Conversation/provider/tool execution begins, OUT_OF_MEMORY, CORE_ERROR,
  * CALLBACK_FAILED, or INTERNAL_ERROR poisons the Session; subsequent run/abort
  * calls return INVALID_STATE and destroy remains valid. STATUS_OK, including

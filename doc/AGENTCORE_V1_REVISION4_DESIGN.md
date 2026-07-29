@@ -1,9 +1,11 @@
 # AgentCore ABI v1 Revision 4 设计
 
-> 状态：Revision 4 公共 ABI 与内部 Skill Runtime 收敛均已实施
-> 日期：2026-07-28
+> 状态：Revision 4 公共 ABI、内部 Skill Runtime 与 §7 Session model binding
+> 纠偏均已实施
+> 日期：2026-07-29
 > 前置：`AGENTCORE_V1_EXPERIMENTAL_LEDGER.md` A1/A3/A4、B1–B4、C9
-> 本文记录已实施设计；公共契约以 `AGENTCORE_BINARY_ABI.md` 为准。
+> 本文记录已实施设计；当前公共契约以
+> `AGENTCORE_BINARY_ABI.md` 为准。
 
 ## 0. 版本语义
 
@@ -733,6 +735,159 @@ loader/catalog → Runtime catalog + CLI projection；model tool/slash → share
    或 CLI adapter。若实现证据表明必须修改 allowlist 外路径，应停止实施，先更新
    本文、说明缺失的通用接口和最小操作范围并重新评审，不得现场扩权。
 
-完成条件：矩阵全绿，双平台 baseline 更新，canonical ABI 文档、header、SDK、
-manifest、ledger 与实现一致；MetaWork 无需读取 Skill body、复制 loader 或解析
-diagnostic，即可完成 Command + Skill slash 路由。
+Revision 4 主体完成条件：矩阵全绿，双平台 baseline 更新，canonical ABI 文档、
+header、SDK、manifest、ledger 与实现一致；MetaWork 无需读取 Skill body、复制
+loader 或解析 diagnostic，即可完成 Command + Skill slash 路由。
+
+## 7. Session model binding 纠偏（已实施）
+
+### 7.1 判断与边界
+
+AgentCore 的 external fork 与 model-tool fork 当前都会解释 `SKILL.md` 的
+`model`，使 Personal/Project Skill 能绕过 Session model。根因是同一语义在
+external、model-tool、CLI 三处重复解释。
+
+本次只修正 model-selection 的所有权和数据流：
+
+1. 共享 Skill Runtime 唯一解释 `definition.model`；
+2. 宿主显式声明是否允许 override：AgentCore `.forbidden`，CLI `.allowed`；
+3. executor 只执行 typed decision，不再读取原始 `definition.model`。
+
+公开 `DescriptorSkill` 不含 `model`，因此这是实现泄漏纠偏，不改 ABI layout、
+status 数值、capability、revision 或 SDK codec。代码与测试落地后再更新
+`AGENTCORE_BINARY_ABI.md`、`sdk/metask/agentcore.h` 与 changelog；在此之前，
+当前公共契约不变。
+
+### 7.2 共享 Runtime 语义
+
+在 `src/skills/runtime/activation.zig` 增加：
+
+```zig
+pub const ModelOverrideCapability = enum {
+    forbidden,
+    allowed,
+};
+
+pub const ModelSelection = union(enum) {
+    inherit_parent,
+    override: []const u8,
+};
+
+pub const ModelSelectionError = error {
+    ModelOverrideUnavailable,
+};
+
+pub const PrepareOptions = struct {
+    context: Context,
+    shell_policy: workspace.ShellPolicy,
+    model_override_capability: ModelOverrideCapability,
+};
+```
+
+`model_override_capability` 不提供默认值，所有 production prepare callsite
+必须显式填写。该名称与 spawn option 的
+`.model_override: ?[]const u8` 有意区分：前者是能力，后者是执行参数。
+
+唯一解释函数为：
+
+```zig
+resolveModelSelection(
+    exec_context: definition.ExecContext,
+    declared_model: []const u8,
+    capability: ModelOverrideCapability,
+) ModelSelectionError!ModelSelection
+```
+
+决策表固定如下：
+
+| Skill context | `declared_model` | capability | 结果 |
+|---|---|---|---|
+| inline | 任意值 | 任意值 | `.inherit_parent` |
+| fork | 空串或 `inherit` | 任意值 | `.inherit_parent` |
+| fork | 其他字符串 | `.allowed` | `.override(declared_model)` |
+| fork | 其他字符串 | `.forbidden` | `error.ModelOverrideUnavailable` |
+
+`ActivationPlan` 与 `Activation` 携带 `model_selection`。
+Plan 可以借用 catalog snapshot；`activate()` 将 override 复制给 Activation，
+保持“Activation 完全自持有、零 catalog 借用”的既有不变量。自有字符串必须在
+可能返回错误的 `tree.deinit()` 之前释放。
+
+### 7.3 Adapter 接线与失败语义
+
+CLI prepare 传 `.allowed`，并根据 `activation.model_selection` 使用 parent model
+或 CLI alias 解析后的 override。CLI fork executor 删除对
+`record.definition.model` 的读取；现有 override L2 保持全绿。
+
+AgentCore 的 external 与 model-tool prepare 都传 `.forbidden`。二者共用一个小型
+binding helper：
+
+```zig
+fn requireSessionModel(
+    selection: ModelSelection,
+) error{AgentCoreModelBindingViolation}!void
+```
+
+helper 只接受 `.inherit_parent`；若收到 `.override`，返回
+`error.AgentCoreModelBindingViolation`。这样 impossible-state 防御只有一处，
+两个 executor 都固定 `.model_override = null`，不再各自实现 model 规则。
+external 在 `runSkill` 的 `prepare` 之后立即调用 helper，且必须早于
+`supportsExactFileModes()` 与 `admitMaterializedSkill()`；model-tool 在
+`prepareValues` 之后立即调用，且必须早于 `activate()`。
+
+正常拒绝与内部违约的边界为：
+
+| 场景 | external | model-tool |
+|---|---|---|
+| 任意 model + `.forbidden` | admission 前返回 `STATUS_SKILL_UNAVAILABLE`，诊断 `ModelOverrideUnavailable` | activate 前返回 ordinary structured tool error `ModelOverrideUnavailable` |
+| helper 发现 `.override` | `STATUS_INTERNAL_ERROR` | structured tool error `AgentCoreModelBindingViolation` + error log |
+
+external 的两类失败都不得消耗 `run_id`、materialize、创建 Conversation 或发起
+provider 请求。model-tool 的两类失败都不得创建 child Run 或 poison outer
+Run/Session。内部违约不得走 `.host_fatal`，因为该通道表示 Host callback failure
+并会错误地 poison Session。model-tool 的内部违约通过
+`core.util_log.err("agentcore", ...)` 写入现有内部日志，不发送 event sink 事件。
+本任务不新增 fatal channel。
+
+### 7.4 最小测试设施与证明
+
+现有 MockServer 的单个覆盖式 `captured_buf` 无法做多请求负向断言。只增加本次
+需要的固定上限、有序、mutex 保护的请求账本：
+
+```zig
+requestCount()
+requestAt(index)
+lastRequest()
+captureOverflowed()
+```
+
+每条请求只复制实际长度，写入后不可变，borrowed slice 在 `server.stop()` 前有效；
+overflow 显式置 flag。`readRequest()` 完成即计入账本，包括随后断连的请求。
+只补顺序、`lastRequest()` 兼容和 overflow self-test，不把它扩展成通用网络审计。
+多请求测试通过唯一 Skill body sentinel 定位 child，不依赖固定索引。
+
+必须提供的证明只有：
+
+1. Runtime L1 覆盖完整决策表；用 failing allocator 覆盖 override 复制失败、
+   Plan → Activation 失败清理，以及 `tree.deinit()` 报错前自有 override 已释放；
+2. CLI L2 证明 `.allowed` 仍能覆盖 parent model；
+3. external L2 证明 arbitrary model 被拒绝、无 child 请求，并可用同一 `run_id`
+   启动后续合法 Run，证明失败未消耗 `run_id`；另用合法 fork 断言 child model
+   等于 Session model；
+4. model-tool L2 证明 arbitrary model 只产生 tool error、无 child 请求，后续 Run
+   仍可成功；合法 child 的 model 等于 Session model；
+5. `requireSessionModel` 及两条错误映射用单元测试覆盖，不为 impossible state
+   复制两套端到端场景。
+
+### 7.5 范围与完成条件
+
+按 Runtime 类型与 L1 → MockServer ledger → CLI → 两个 AgentCore adapter →
+全量测试的顺序实施，最后删除三处重复字符串解释并更新 canonical ABI 文档、
+C header、changelog 与 ledger。
+
+本任务不增加公开 catalog 字段，不升级 ABI，不做仅针对 model 的 provider schema
+过滤，不改变 Session model ownership，不把 CLI alias 解析下沉到 Runtime，也不
+新增 fatal channel。
+
+完成状态：`definition.model` 只有 `resolveModelSelection` 一个解释点；AgentCore
+两个入口都不能改变 Session model；CLI override 保持；失败不越过 admission/
+activation 边界；请求账本已证明没有隐藏 child 请求。实现、测试与公共合同已同步。

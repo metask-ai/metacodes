@@ -435,6 +435,16 @@ Materialization begins only after admission, is private to that activation,
 and is removed before terminal return. A Skill can only narrow the Session's
 tool, shell, and permission authority.
 
+The Session configuration owns the provider model binding. Skill metadata
+cannot replace it: inline Skills ignore `model`, fork Skills with an empty
+model or `inherit` use the Session model, and any other fork model is
+unavailable in AgentCore. An explicit typed invocation returns
+`SKILL_UNAVAILABLE` before admission, so it does not consume `run_id`,
+materialize, mutate Conversation, or send a provider request. The Run-local
+`Skill` tool reports the same condition as an ordinary structured tool error
+with code `ModelOverrideUnavailable`; it does not create a child Run or poison
+the outer Run. Every admitted fork child therefore sends the Session model.
+
 A consumer normally uses the Skill ABI in this order:
 
 1. During draft creation, query a catalog and render its descriptor.
