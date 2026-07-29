@@ -1122,6 +1122,23 @@ test "candidate root selection skips an unusable path and chooses a valid fallba
     );
     defer std.testing.allocator.free(invalid_root);
     const candidates = [_][]const u8{ invalid_root, valid_root };
+    // The temporary root inherits the test runner's filesystem. Measure that
+    // filesystem separately instead of skipping on any initFromCandidates
+    // error: only a proven lack of exact permission bits leaves fallback
+    // selection with nothing to assert. A real selection regression must still
+    // fail here rather than disappear into a skip.
+    var probe_names = DeterministicNames{};
+    var probe = try Manager.initBorrowed(
+        std.testing.allocator,
+        std.testing.io,
+        valid_root,
+        probe_names.source(),
+        MAX_ACTIVE_BYTES,
+    );
+    const exact_file_modes = probe.supportsExactFileModes();
+    try probe.deinit();
+    if (!exact_file_modes) return error.SkipZigTest;
+
     var names = DeterministicNames{};
     var manager = try Manager.initFromCandidates(
         std.testing.allocator,

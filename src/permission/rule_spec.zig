@@ -1032,7 +1032,11 @@ test "matchesMode: symlink deny triggers if target matches (任一)" {
     var pat_buf: [96]u8 = undefined;
     const pat = try std.fmt.bufPrint(&pat_buf, "Read({s})", .{secret_name}); // cwd anchor 裸文件名
     const r = try parseRule(pat);
-    var mctx = MatchContext{ .cwd = "/private/tmp" };
+    // cwd 必须是 /tmp 的**解析后**路径:macOS 上 /tmp 是 /private/tmp 的符号链接,
+    // Linux 上就是 /tmp。硬编码任一侧都会让另一侧的 realpath 落在 cwd 之外。
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_z = pfs.realpath("/tmp", &cwd_buf) orelse return error.SkipZigTest;
+    var mctx = MatchContext{ .cwd = std.mem.span(cwd_z) };
 
     var args_buf: [256]u8 = undefined;
     const args = try std.fmt.bufPrint(&args_buf, "{{\"file_path\":\"{s}\"}}", .{link_path});
