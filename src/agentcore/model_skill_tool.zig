@@ -14,6 +14,7 @@ const materialization = skill_runtime.materialization;
 const policy_frame = skill_runtime.policy_frame;
 const model_semantics = skill_runtime.model_tool;
 const event_projection = @import("event_projection.zig");
+const model_binding = @import("model_binding.zig");
 
 pub const TOOL_NAME = model_semantics.TOOL_NAME;
 
@@ -262,10 +263,21 @@ pub const Environment = struct {
             &self.snapshot.revision,
             &skill.skill_id,
             parsed.values,
-            self.current_frame.shellPolicy(),
-            .model_tool,
+            .{
+                .context = .model_tool,
+                .shell_policy = self.current_frame.shellPolicy(),
+                .model_override_capability = .forbidden,
+            },
         );
         defer plan.deinit();
+        model_binding.requireSessionModel(plan.model_selection) catch |err| {
+            core.util_log.err(
+                "agentcore",
+                "Skill model binding invariant violated: {s}",
+                .{@errorName(err)},
+            );
+            return err;
+        };
 
         var activation = try activation_mod.activate(
             self.allocator,
@@ -357,12 +369,6 @@ pub const Environment = struct {
         );
         defer projector.deinit();
         const child_backend = projector.backend();
-        const model_override: ?[]const u8 =
-            if (plan.skill.definition.model.len == 0 or
-            std.mem.eql(u8, plan.skill.definition.model, "inherit"))
-                null
-            else
-                plan.skill.definition.model;
         const host_run: ?core.agent_session.HostRunIdentity =
             if (self.session.host_identity_ctx) |host_ctx| .{
                 .identity = self.identity,
@@ -392,7 +398,7 @@ pub const Environment = struct {
                 .read_state = &self.session.read_state,
                 .jobs = if (self.session.jobs) |*jobs| jobs else null,
                 .event_projection = .model_tool,
-                .model_override = model_override,
+                .model_override = null,
                 .project_dir = self.session.workspace.root,
                 .sandbox = self.session.workspace.sandbox(),
                 .cwd_abs = self.session.workspace.root,

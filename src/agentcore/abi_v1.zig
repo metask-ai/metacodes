@@ -15,6 +15,7 @@ pub const skill_materialization = skill_runtime.materialization;
 pub const policy_frame = skill_runtime.policy_frame;
 pub const event_projection = @import("event_projection.zig");
 pub const model_skill_tool = @import("model_skill_tool.zig");
+const model_binding = @import("model_binding.zig");
 const sandbox_admission = @import("sandbox_admission.zig");
 
 const allocator = std.heap.c_allocator;
@@ -395,10 +396,14 @@ const AbiSession = struct {
             catalog_revision,
             skill_id,
             arguments_json,
-            root_frame.shellPolicy(),
-            .external_run_root,
+            .{
+                .context = .external_run_root,
+                .shell_policy = root_frame.shellPolicy(),
+                .model_override_capability = .forbidden,
+            },
         );
         defer plan.deinit();
+        try model_binding.requireSessionModel(plan.model_selection);
         if (!materializations.supportsExactFileModes())
             return error.SkillUnavailable;
 
@@ -742,12 +747,6 @@ const ForkExecutorContext = struct {
         );
         defer projector.deinit();
         const child_backend = projector.backend();
-        const model_override: ?[]const u8 =
-            if (self.plan.skill.definition.model.len == 0 or
-            std.mem.eql(u8, self.plan.skill.definition.model, "inherit"))
-                null
-            else
-                self.plan.skill.definition.model;
         const host_run: ?core.agent_session.HostRunIdentity =
             if (self.session.host_identity_ctx) |host_ctx| .{
                 .identity = identity,
@@ -816,7 +815,7 @@ const ForkExecutorContext = struct {
                     .external_run_root => .run_root,
                     .model_tool => .model_tool,
                 },
-                .model_override = model_override,
+                .model_override = null,
                 .project_dir = self.session.workspace.root,
                 .sandbox = self.session.workspace.sandbox(),
                 .cwd_abs = self.session.workspace.root,
@@ -1058,7 +1057,8 @@ fn skillRunErrorStatus(self: *const AbiSession, err: anyerror) u32 {
         error.SkillNotFound => wire.STATUS_SKILL_NOT_FOUND,
         error.InvalidArguments => wire.STATUS_INVALID_SKILL_ARGUMENTS,
         error.PolicyViolation => wire.STATUS_SKILL_POLICY_VIOLATION,
-        error.SkillUnavailable => wire.STATUS_SKILL_UNAVAILABLE,
+        error.SkillUnavailable, error.ModelOverrideUnavailable => wire.STATUS_SKILL_UNAVAILABLE,
+        error.AgentCoreModelBindingViolation => wire.STATUS_INTERNAL_ERROR,
         error.UnsupportedFilesystem => wire.STATUS_SKILL_UNAVAILABLE,
         error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
         else => runErrorStatus(self, err),
@@ -2301,6 +2301,23 @@ test "unsupported Skill materialization filesystem maps to Skill unavailable" {
     );
 }
 
+test "AgentCore Skill model binding errors have explicit public mappings" {
+    var fake = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = undefined,
+    };
+    try std.testing.expectEqual(
+        wire.STATUS_SKILL_UNAVAILABLE,
+        skillRunErrorStatus(&fake, error.ModelOverrideUnavailable),
+    );
+    try std.testing.expectEqual(
+        wire.STATUS_INTERNAL_ERROR,
+        skillRunErrorStatus(&fake, error.AgentCoreModelBindingViolation),
+    );
+}
+
 test "diagnostic allocation failure leaves canonical empty output" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var sentinel: u8 = 0;
@@ -2600,6 +2617,7 @@ test "Skill materialization is post-admission and pre-Conversation" {
         .arguments = &.{},
         .requires_shell = false,
         .context = .external_run_root,
+        .model_selection = .inherit_parent,
     };
     const initial_messages = native_session.conversation.messages.items.len;
 
@@ -2733,6 +2751,7 @@ test "typed Skill invocation record is deterministic and JSON-safe" {
         .arguments = &arguments,
         .requires_shell = false,
         .context = .external_run_root,
+        .model_selection = .inherit_parent,
     };
     const encoded = try canonicalInvocationRecord(std.testing.allocator, &plan);
     defer std.testing.allocator.free(encoded);

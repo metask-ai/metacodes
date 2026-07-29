@@ -176,8 +176,11 @@ pub const Runtime = struct {
             &snapshot.revision,
             &record.skill_id,
             values,
-            shell_policy,
-            activation_context,
+            .{
+                .context = activation_context,
+                .shell_policy = shell_policy,
+                .model_override_capability = .allowed,
+            },
         );
         defer plan.deinit();
 
@@ -569,7 +572,6 @@ pub fn handleSlash(
         const final_text = executeFork(
             &app.skill_runtime,
             &tool_context,
-            record,
             activation,
         ) catch |err| {
             std.debug.print(
@@ -708,7 +710,7 @@ fn executeModelTool(
         return error.SkillNotFound;
 
     if (record.definition.context == .fork) {
-        const final_text = try executeFork(self, ctx, record, activation);
+        const final_text = try executeFork(self, ctx, activation);
         defer ctx.allocator.free(final_text);
         try self.finishActivation(ctx.agent_ident, activation);
         activation_live = false;
@@ -735,7 +737,6 @@ fn executeModelTool(
 fn executeFork(
     self: *Runtime,
     ctx: *const ToolContext,
-    record: *const runtime.catalog.SkillRecord,
     activation: *const runtime.activation.Activation,
 ) ![]u8 {
     const api_client = ctx.api_client orelse return error.ForkUnavailable;
@@ -764,11 +765,10 @@ fn executeFork(
         }
     }
 
-    const model_override = if (record.definition.model.len > 0 and
-        !std.mem.eql(u8, record.definition.model, "inherit"))
-        agent_tool.resolveModelAlias(record.definition.model)
-    else
-        null;
+    const model_override = switch (activation.model_selection) {
+        .inherit_parent => null,
+        .override => |model| agent_tool.resolveModelAlias(model),
+    };
     var child_permission = permission.scopedDerive(null);
     child_permission.active_skill = null;
     const child_ident = session_id.gen();
