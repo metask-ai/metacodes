@@ -166,6 +166,7 @@ pub const ParsedUiResponse = std.json.Parsed(UiResponse);
 pub const ParsedSkillCatalog = std.json.Parsed(SkillCatalog);
 
 pub const MAX_SKILL_CATALOG_DESCRIPTOR_BYTES_V1: usize = 4 * 1024 * 1024;
+pub const MAX_SKILL_CATALOG_SKILLS_V1: usize = 1024;
 pub const MAX_SKILL_ARGUMENT_VALUES_V1: usize = 64;
 pub const MAX_SKILL_ARGUMENT_JSON_BYTES_V1: usize = 1024 * 1024;
 
@@ -349,11 +350,13 @@ fn normalizeDecodeError(err: anyerror) DecodeError {
     };
 }
 
-fn validateSkillCatalog(catalog: SkillCatalog) error{InvalidPayload}!void {
+fn validateSkillCatalog(catalog: SkillCatalog) SkillCatalogDecodeError!void {
     if (!std.mem.eql(u8, catalog.schema, "metask.skill-catalog/v1") or
         !lowerHex64(catalog.catalog_scope_id) or
         !lowerHex64(catalog.catalog_revision))
         return error.InvalidPayload;
+    if (catalog.skills.len > MAX_SKILL_CATALOG_SKILLS_V1)
+        return error.ResourceLimit;
 
     switch (catalog.health) {
         .healthy => if (catalog.issues.len != 0) return error.InvalidPayload,
@@ -607,7 +610,7 @@ test "Skill catalog decoder owns and validates the public descriptor" {
     const a = std.testing.allocator;
     const scope_id = "0" ** 64;
     const revision = "1" ** 64;
-    const skill_id = "2" ** 64;
+    const skill_id = "c97ace4c8fef2cee8fa0f3c9f52aab18dbd4f42438afe362ffb8f75ce4c04b84";
     const encoded = try std.fmt.allocPrint(
         a,
         "{{\"schema\":\"metask.skill-catalog/v1\",\"catalog_scope_id\":\"{s}\",\"catalog_revision\":\"{s}\",\"health\":\"healthy\",\"skills\":[{{\"skill_id\":\"{s}\",\"invocation_name\":\"review\",\"display_name\":\"Review\",\"description\":\"Review a target\",\"argument_schema\":{{\"schema\":\"metask.skill-arguments/v1\",\"max_values\":64,\"names\":[\"target\"]}}}}],\"issues\":[]}}",
@@ -653,6 +656,83 @@ test "Skill catalog decoder rejects schema and semantic contradictions" {
     );
 }
 
+test "Skill catalog decoder preserves identity semantics for the consumer" {
+    const a = std.testing.allocator;
+    const hash = "0" ** 64;
+    const review_id = "c97ace4c8fef2cee8fa0f3c9f52aab18dbd4f42438afe362ffb8f75ce4c04b84";
+    const mismatched = try std.fmt.allocPrint(
+        a,
+        "{{\"schema\":\"metask.skill-catalog/v1\",\"catalog_scope_id\":\"{s}\",\"catalog_revision\":\"{s}\",\"health\":\"healthy\",\"skills\":[{{\"skill_id\":\"{s}\",\"invocation_name\":\"workctl\",\"display_name\":\"Workctl\",\"description\":\"Operate Work Agent\",\"argument_schema\":{{\"schema\":\"metask.skill-arguments/v1\",\"max_values\":64,\"names\":[]}}}}],\"issues\":[]}}",
+        .{ hash, hash, review_id },
+    );
+    defer a.free(mismatched);
+    var mismatched_parsed = try decodeSkillCatalog(a, mismatched);
+    defer mismatched_parsed.deinit();
+    try std.testing.expectEqualStrings(
+        review_id,
+        mismatched_parsed.value.skills[0].skill_id,
+    );
+
+    const skill = SkillDescriptor{
+        .skill_id = review_id,
+        .invocation_name = "review",
+        .display_name = "Review",
+        .description = "Review code",
+        .argument_schema = .{
+            .schema = "metask.skill-arguments/v1",
+            .max_values = MAX_SKILL_ARGUMENT_VALUES_V1,
+            .names = &.{},
+        },
+    };
+    const duplicate_catalog = SkillCatalog{
+        .schema = "metask.skill-catalog/v1",
+        .catalog_scope_id = hash,
+        .catalog_revision = hash,
+        .health = .healthy,
+        .skills = &.{ skill, skill },
+        .issues = &.{},
+    };
+    const duplicate = try std.json.Stringify.valueAlloc(a, duplicate_catalog, .{});
+    defer a.free(duplicate);
+    var duplicate_parsed = try decodeSkillCatalog(a, duplicate);
+    defer duplicate_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), duplicate_parsed.value.skills.len);
+    try std.testing.expectEqualStrings(
+        duplicate_parsed.value.skills[0].skill_id,
+        duplicate_parsed.value.skills[1].skill_id,
+    );
+}
+
+test "Skill catalog decoder enforces the public Skill slot limit" {
+    const a = std.testing.allocator;
+    const hash = "0" ** 64;
+    const skill = SkillDescriptor{
+        .skill_id = "c97ace4c8fef2cee8fa0f3c9f52aab18dbd4f42438afe362ffb8f75ce4c04b84",
+        .invocation_name = "review",
+        .display_name = "Review",
+        .description = "Review code",
+        .argument_schema = .{
+            .schema = "metask.skill-arguments/v1",
+            .max_values = MAX_SKILL_ARGUMENT_VALUES_V1,
+            .names = &.{},
+        },
+    };
+    const skills = try a.alloc(SkillDescriptor, MAX_SKILL_CATALOG_SKILLS_V1 + 1);
+    defer a.free(skills);
+    @memset(skills, skill);
+    const oversized_catalog = SkillCatalog{
+        .schema = "metask.skill-catalog/v1",
+        .catalog_scope_id = hash,
+        .catalog_revision = hash,
+        .health = .healthy,
+        .skills = skills,
+        .issues = &.{},
+    };
+    const oversized = try std.json.Stringify.valueAlloc(a, oversized_catalog, .{});
+    defer a.free(oversized);
+    try expectSkillCatalogDecodeError(error.ResourceLimit, a, oversized);
+}
+
 test "Skill catalog decoder exposes typed degraded issues" {
     const a = std.testing.allocator;
     const hash = "0" ** 64;
@@ -688,6 +768,19 @@ test "Skill catalog decoder exposes typed degraded issues" {
         SkillSourceScope.personal,
         parsed.value.issues[1].source_scope,
     );
+}
+
+fn expectSkillCatalogDecodeError(
+    expected: SkillCatalogDecodeError,
+    allocator: std.mem.Allocator,
+    encoded: []const u8,
+) !void {
+    var parsed = decodeSkillCatalog(allocator, encoded) catch |err| {
+        try std.testing.expectEqual(expected, err);
+        return;
+    };
+    defer parsed.deinit();
+    return error.TestExpectedError;
 }
 
 test "Skill arguments encoder emits the exact bounded wire shape" {

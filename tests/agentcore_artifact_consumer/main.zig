@@ -196,12 +196,19 @@ pub fn main(init: std.process.Init) !void {
     const skill_path = try std.fs.path.join(a, &.{ skill_dir, "SKILL.md" });
     try std.Io.Dir.cwd().writeFile(init.io, .{
         .sub_path = skill_path,
-        .data = "---\nname: Review\ndescription: Source-free typed invocation fixture\narguments: [target]\n---\nexercise $target",
+        .data = "---\nname: Review\ndescription: Source-free typed invocation fixture\narguments: [target]\n---\nREVIEW_SKILL_SENTINEL $target",
+    });
+    const workctl_dir = try std.fs.path.join(a, &.{ workspace, ".metacodes", "skills", "workctl" });
+    try std.Io.Dir.cwd().createDirPath(init.io, workctl_dir);
+    const workctl_path = try std.fs.path.join(a, &.{ workctl_dir, "SKILL.md" });
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = workctl_path,
+        .data = "---\nname: Workctl\ndescription: Second source-free typed invocation fixture\narguments: [target]\n---\nWORKCTL_SKILL_SENTINEL $target",
     });
     // Source-free proof: the model supplies a relative file path and the
     // binary facade resolves it against workspace_root, not process cwd.
     const read_sse = try readToolSse(a, file_name);
-    const bodies = [_][]const u8{ ASK_SSE, read_sse, HOST_SSE, FINAL_SSE };
+    const bodies = [_][]const u8{ ASK_SSE, read_sse, HOST_SSE, FINAL_SSE, FINAL_SSE };
     const server = try Server.start(init.io, &bodies);
     defer server.stop();
     const url = try server.url(a);
@@ -264,6 +271,10 @@ pub fn main(init: std.process.Init) !void {
         .len = descriptor.len,
     });
     const identities = try catalogIdentities(a, descriptor_bytes, "review");
+    const workctl_identities = try catalogIdentities(a, descriptor_bytes, "workctl");
+    if (!std.mem.eql(u8, identities.revision, workctl_identities.revision) or
+        std.mem.eql(u8, identities.skill_id, workctl_identities.skill_id))
+        return error.InvalidCatalogDescriptor;
     api.bufferRelease()(&descriptor);
 
     const allowed = [_]wire.BytesViewV1{ sdk.bytesView("AskUserQuestion"), sdk.bytesView("Read"), sdk.bytesView("HostEcho") };
@@ -320,6 +331,21 @@ pub fn main(init: std.process.Init) !void {
     if (try sdk.StopReason.fromCode(result.stop_reason_code) != .end_turn or result.tool_calls != 3) return error.UnexpectedRunResult;
     if (probe.ui_calls != 1 or probe.ui_releases != 1 or probe.host_calls != 1 or probe.host_releases != 1) return error.CallbackContractFailed;
     if (!probe.saw_read_result or !probe.saw_host_result or !probe.saw_final_text) return error.MissingCoreEvent;
+    try probe.beginRun(2);
+    try expectStatus(.ok, api.sessionRunSkill(
+        session,
+        2,
+        sdk.bytesView(workctl_identities.skill_id),
+        sdk.bytesView(workctl_identities.revision),
+        sdk.bytesView(encoded_arguments),
+        &options,
+        &result,
+        &diagnostic,
+    ), diagnostic);
+    try probe.endRun(2);
+    if (try sdk.StopReason.fromCode(result.stop_reason_code) != .end_turn or
+        result.tool_calls != 0)
+        return error.UnexpectedRunResult;
     try expectStatus(.ok, api.sessionDestroy()(session, &diagnostic), diagnostic);
     session = null;
     try expectStatus(.ok, api.runtimeDestroy()(runtime, &diagnostic), diagnostic);

@@ -771,17 +771,26 @@ test "L2 Revision 4 catalog binds before Session and typed Skill failures remain
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = try rootPath(&tmp, &root_buf);
-    const skill_dir = try std.fs.path.join(a, &.{ root, ".metacodes", "skills", "review" });
-    defer a.free(skill_dir);
-    try std.Io.Dir.cwd().createDirPath(std.testing.io, skill_dir);
-    const skill_path = try std.fs.path.join(a, &.{ skill_dir, "SKILL.md" });
-    defer a.free(skill_path);
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
-        .sub_path = skill_path,
-        .data = "---\nname: Review\ndescription: Public typed invocation fixture\narguments: [target]\n---\nreview $target",
-    });
+    try writeSkillFixture(
+        a,
+        root,
+        "review",
+        "---\nname: Review \"quoted\"\ndescription: Public \\ typed invocation fixture\narguments: [target]\n---\nREVIEW_SKILL_SENTINEL $target",
+    );
+    try writeSkillFixture(
+        a,
+        root,
+        "workctl",
+        "---\nname: Workctl\ndescription: Second public typed invocation fixture\narguments: [target]\n---\nWORKCTL_SKILL_SENTINEL $target",
+    );
+    try writeSkillFixture(
+        a,
+        root,
+        "broken",
+        "---\nname: Broken\ncontext: surprise\n---\nBROKEN_SKILL_SENTINEL",
+    );
 
-    const bodies = [_][]const u8{FINAL_SSE};
+    const bodies = [_][]const u8{ FINAL_SSE, FINAL_SSE };
     var server = try harness.MockServer.startCassette(&bodies, 0);
     defer server.stop();
     const url = try server.urlOwned(a);
@@ -819,11 +828,40 @@ test "L2 Revision 4 catalog binds before Session and typed Skill failures remain
     );
     const descriptor_bytes = try sdk.borrowedBytes(.{ .ptr = descriptor.ptr, .len = descriptor.len });
     try std.testing.expect(std.mem.indexOf(u8, descriptor_bytes, "\"invocation_name\":\"review\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, descriptor_bytes, "\"invocation_name\":\"workctl\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, descriptor_bytes, "\"body\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, descriptor_bytes, "source_path") == null);
+    var decoded = try sdk.decodeSkillCatalog(a, descriptor_bytes);
+    defer decoded.deinit();
+    try std.testing.expectEqual(sdk.SkillCatalogHealth.degraded, decoded.value.health);
+    try std.testing.expectEqual(@as(usize, 1), decoded.value.issues.len);
+    try std.testing.expectEqual(
+        sdk.SkillCatalogIssueCode.invalid_definition,
+        decoded.value.issues[0].code,
+    );
+    try std.testing.expectEqualStrings(
+        "broken",
+        decoded.value.issues[0].invocation_name.?,
+    );
+    var found_escaped_review = false;
+    for (decoded.value.skills) |skill| {
+        if (!std.mem.eql(u8, skill.invocation_name, "review")) continue;
+        found_escaped_review = true;
+        try std.testing.expectEqualStrings("Review \"quoted\"", skill.display_name);
+        try std.testing.expectEqualStrings(
+            "Public \\ typed invocation fixture",
+            skill.description,
+        );
+    }
+    try std.testing.expect(found_escaped_review);
     const ids = try extractCatalogIdentities(a, descriptor_bytes, "review");
     defer a.free(ids.revision);
     defer a.free(ids.skill_id);
+    const workctl_ids = try extractCatalogIdentities(a, descriptor_bytes, "workctl");
+    defer a.free(workctl_ids.revision);
+    defer a.free(workctl_ids.skill_id);
+    try std.testing.expectEqualStrings(ids.revision, workctl_ids.revision);
+    try std.testing.expect(!std.mem.eql(u8, ids.skill_id, workctl_ids.skill_id));
     api.bufferRelease()(&descriptor);
 
     var session_config = std.mem.zeroes(wire.SessionConfigV1);
@@ -948,6 +986,33 @@ test "L2 Revision 4 catalog binds before Session and typed Skill failures remain
         ),
     );
     try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRunSkill(
+            session,
+            2,
+            sdk.bytesView(workctl_ids.skill_id),
+            sdk.bytesView(workctl_ids.revision),
+            sdk.bytesView(encoded_arguments),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    const review_request = server.requestAt(0) orelse return error.NoRequestCaptured;
+    const workctl_request = server.requestAt(1) orelse return error.NoRequestCaptured;
+    try std.testing.expect(
+        std.mem.indexOf(u8, review_request.body(), "REVIEW_SKILL_SENTINEL") != null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, review_request.body(), "WORKCTL_SKILL_SENTINEL") == null,
+    );
+    try std.testing.expect(
+        std.mem.indexOf(u8, workctl_request.body(), "WORKCTL_SKILL_SENTINEL") != null,
+    );
+    try std.testing.expect(!server.captureOverflowed());
 }
 
 test "L2 AgentCore Skill forks cannot override the Session model" {

@@ -191,13 +191,17 @@ remain valid until `deinit`; consumers must not copy an owner and deinitialize
 both copies.
 
 `decodeSkillCatalog` returns an owned `ParsedSkillCatalog` for
-`metask.skill-catalog/v1`. It validates the schema, identity forms, health and
-issue consistency, and each Skill argument schema. Because decoded strings and
+`metask.skill-catalog/v1`. It validates the schema, the 1024-Skill limit,
+identity forms, health and issue consistency, and each Skill argument schema.
+Cross-record identity semantics deliberately remain outside the wire decoder:
+AgentCore validates canonical IDs and uniqueness before publishing, while a
+Host projection must independently reject duplicate IDs or invocation names
+so it can preserve domain-specific diagnostics. Because decoded strings and
 arrays are allocator-owned, the consumer may release the AgentCore descriptor
-buffer immediately after decoding. `encodeSkillArguments` accepts positional
-UTF-8 values, enforces the 64-value and encoded 1 MiB limits, and returns the
-allocator-owned canonical `{"values":[...]}` representation accepted by
-`sessionRunSkill`.
+buffer immediately after decoding.
+`encodeSkillArguments` accepts positional UTF-8 values, enforces the 64-value
+and encoded 1 MiB limits, and returns the allocator-owned canonical
+`{"values":[...]}` representation accepted by `sessionRunSkill`.
 
 ```zig
 var parsed = try sdk.decodeCoreEvent(allocator, event_json);
@@ -578,6 +582,7 @@ allocations or unbounded work:
 | total Runtime metadata | 16 MiB |
 | total Session metadata | 4 MiB |
 | one TextInput prompt | 16 MiB |
+| valid Skills per catalog | 1024 |
 | one Skill argument array / JSON | 64 values / 1 MiB |
 | one catalog descriptor | 4 MiB |
 | one catalog snapshot / Runtime live snapshots | 64 MiB / 256 MiB |

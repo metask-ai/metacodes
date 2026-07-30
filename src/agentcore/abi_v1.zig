@@ -23,6 +23,8 @@ const allocator = std.heap.c_allocator;
 comptime {
     if (wire.MAX_TOOL_ERROR_PAYLOAD_BYTES_V1 != @as(u64, core.tool_exec.MAX_TOOL_ERROR_PAYLOAD_BYTES_V1))
         @compileError("AgentCore wire and core encoded Host-error limits must match");
+    if ((skill_catalog.Limits{}).max_slots != @as(usize, @intCast(wire.MAX_SKILL_CATALOG_SKILLS_V1)))
+        @compileError("AgentCore wire and Skill catalog slot limits must match");
 }
 
 /// AgentCore owns session-scoped permission memory. Public "session" choices

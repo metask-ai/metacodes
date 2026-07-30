@@ -296,6 +296,7 @@ pub fn build(
 
     std.mem.sort(SkillRecord, records.items, {}, recordLessThan);
     std.mem.sort(Issue, issues.items, {}, issueLessThan);
+    try validateUniqueSkillIds(scratch, records.items);
     snapshot.skills = records.toOwnedSlice(arena) catch return error.OutOfMemory;
     snapshot.issues = cloneIssues(arena, issues.items) catch return error.OutOfMemory;
     snapshot.snapshot_bytes = counters.snapshot_bytes;
@@ -699,64 +700,12 @@ fn buildDescriptor(
     snapshot: *const Snapshot,
     max_bytes: usize,
 ) ![]u8 {
-    const ArgumentSchema = struct {
-        schema: []const u8 = "metask.skill-arguments/v1",
-        max_values: u32 = 64,
-        names: []const []const u8,
-    };
-    const DescriptorSkill = struct {
-        skill_id: []const u8,
-        invocation_name: []const u8,
-        display_name: []const u8,
-        description: []const u8,
-        argument_schema: ArgumentSchema,
-    };
-    const DescriptorIssue = struct {
-        code: IssueCode,
-        invocation_name: ?[]const u8,
-        source_scope: SourceScope,
-    };
-    const Descriptor = struct {
-        schema: []const u8 = "metask.skill-catalog/v1",
-        catalog_scope_id: []const u8,
-        catalog_revision: []const u8,
-        health: Health,
-        skills: []const DescriptorSkill,
-        issues: []const DescriptorIssue,
-    };
-
-    const skills = try arena.alloc(DescriptorSkill, snapshot.skills.len);
-    for (snapshot.skills, skills) |record, *descriptor| {
-        descriptor.* = .{
-            .skill_id = &record.skill_id,
-            .invocation_name = record.invocation_name,
-            .display_name = record.definition.name,
-            .description = record.definition.description,
-            .argument_schema = .{ .names = record.definition.arguments },
-        };
-    }
-    const issues = try arena.alloc(DescriptorIssue, snapshot.issues.len);
-    for (snapshot.issues, issues) |issue, *descriptor| {
-        descriptor.* = .{
-            .code = issue.code,
-            .invocation_name = issue.invocation_name,
-            .source_scope = issue.source_scope,
-        };
-    }
-    const descriptor = Descriptor{
-        .catalog_scope_id = &snapshot.scope_id,
-        .catalog_revision = &snapshot.revision,
-        .health = snapshot.health,
-        .skills = skills,
-        .issues = issues,
-    };
-
     // Count the exact escaped JSON size before allocating the public buffer.
     // Descriptor caps therefore apply before output allocation, not after a
     // potentially unbounded `valueAlloc`.
     var count_buffer: [256]u8 = undefined;
     var discarding: std.Io.Writer.Discarding = .init(&count_buffer);
-    try std.json.Stringify.value(descriptor, .{}, &discarding.writer);
+    try writeDescriptor(&discarding.writer, snapshot);
     const encoded_len_u64 = discarding.fullCount();
     if (encoded_len_u64 > max_bytes or encoded_len_u64 > std.math.maxInt(usize))
         return error.ResourceLimit;
@@ -764,10 +713,66 @@ fn buildDescriptor(
 
     var allocating = try std.Io.Writer.Allocating.initCapacity(arena, encoded_len);
     defer allocating.deinit();
-    try std.json.Stringify.value(descriptor, .{}, &allocating.writer);
+    try writeDescriptor(&allocating.writer, snapshot);
     const encoded = try allocating.toOwnedSlice();
     std.debug.assert(encoded.len == encoded_len);
     return encoded;
+}
+
+fn writeDescriptor(writer: *std.Io.Writer, snapshot: *const Snapshot) !void {
+    try writer.writeAll("{\"schema\":\"metask.skill-catalog/v1\",\"catalog_scope_id\":");
+    try std.json.Stringify.encodeJsonString(&snapshot.scope_id, .{}, writer);
+    try writer.writeAll(",\"catalog_revision\":");
+    try std.json.Stringify.encodeJsonString(&snapshot.revision, .{}, writer);
+    try writer.writeAll(",\"health\":");
+    try std.json.Stringify.encodeJsonString(@tagName(snapshot.health), .{}, writer);
+    try writer.writeAll(",\"skills\":[");
+    for (snapshot.skills, 0..) |*record, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.writeAll("{\"skill_id\":");
+        try std.json.Stringify.encodeJsonString(&record.skill_id, .{}, writer);
+        try writer.writeAll(",\"invocation_name\":");
+        try std.json.Stringify.encodeJsonString(record.invocation_name, .{}, writer);
+        try writer.writeAll(",\"display_name\":");
+        try std.json.Stringify.encodeJsonString(record.definition.name, .{}, writer);
+        try writer.writeAll(",\"description\":");
+        try std.json.Stringify.encodeJsonString(record.definition.description, .{}, writer);
+        try writer.writeAll(
+            ",\"argument_schema\":{\"schema\":\"metask.skill-arguments/v1\",\"max_values\":64,\"names\":[",
+        );
+        for (record.definition.arguments, 0..) |name, name_index| {
+            if (name_index != 0) try writer.writeByte(',');
+            try std.json.Stringify.encodeJsonString(name, .{}, writer);
+        }
+        try writer.writeAll("]}}");
+    }
+    try writer.writeAll("],\"issues\":[");
+    for (snapshot.issues, 0..) |*issue, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.writeAll("{\"code\":");
+        try std.json.Stringify.encodeJsonString(@tagName(issue.code), .{}, writer);
+        try writer.writeAll(",\"invocation_name\":");
+        if (issue.invocation_name) |name|
+            try std.json.Stringify.encodeJsonString(name, .{}, writer)
+        else
+            try writer.writeAll("null");
+        try writer.writeAll(",\"source_scope\":");
+        try std.json.Stringify.encodeJsonString(@tagName(issue.source_scope), .{}, writer);
+        try writer.writeByte('}');
+    }
+    try writer.writeAll("]}");
+}
+
+fn validateUniqueSkillIds(
+    allocator: std.mem.Allocator,
+    records: []const SkillRecord,
+) BuildError!void {
+    var seen = std.AutoHashMap([64]u8, void).init(allocator);
+    defer seen.deinit();
+    for (records) |record| {
+        const entry = seen.getOrPut(record.skill_id) catch return error.OutOfMemory;
+        if (entry.found_existing) return error.CatalogInvalid;
+    }
 }
 
 fn computeRevision(snapshot: *const Snapshot, workspace_epoch: []const u8) [64]u8 {
@@ -1031,6 +1036,116 @@ test "catalog priority, tombstone, snapshot, parser parity, and revision are det
     try std.testing.expectEqual(@as(usize, 1), degraded.issues.len);
     try std.testing.expectEqual(IssueCode.invalid_definition, degraded.issues[0].code);
     try std.testing.expectEqualStrings("review", degraded.issues[0].invocation_name.?);
+}
+
+test "catalog descriptor preserves each Skill identity across multiple records" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    const review_dir = try std.fs.path.join(allocator, &.{ root, "review" });
+    defer allocator.free(review_dir);
+    const workctl_dir = try std.fs.path.join(allocator, &.{ root, "workctl" });
+    defer allocator.free(workctl_dir);
+    try Dir.cwd().createDirPath(io, review_dir);
+    try Dir.cwd().createDirPath(io, workctl_dir);
+
+    const review_path = try std.fs.path.join(allocator, &.{ review_dir, "SKILL.md" });
+    defer allocator.free(review_path);
+    const workctl_path = try std.fs.path.join(allocator, &.{ workctl_dir, "SKILL.md" });
+    defer allocator.free(workctl_path);
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = review_path,
+        .data = "---\nname: Review\ndescription: Review code\n---\nReview the target.",
+    });
+    try Dir.cwd().writeFile(io, .{
+        .sub_path = workctl_path,
+        .data = "---\nname: Workctl\ndescription: Operate Work Agent\n---\nOperate the requested resource.",
+    });
+
+    const sources = [_]Source{
+        .{ .root = root, .scope = .project, .priority = 1 },
+    };
+    const scope_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const snapshot = try build(allocator, io, scope_id, "epoch-1", &sources, .{});
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, 2), snapshot.skills.len);
+
+    const PublicSkill = struct {
+        skill_id: []const u8,
+        invocation_name: []const u8,
+    };
+    const PublicCatalog = struct {
+        skills: []const PublicSkill,
+    };
+    var parsed = try std.json.parseFromSlice(
+        PublicCatalog,
+        allocator,
+        snapshot.descriptor_json,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(snapshot.skills.len, parsed.value.skills.len);
+
+    for (parsed.value.skills) |skill| {
+        const expected = hashHex(skill.invocation_name);
+        try std.testing.expectEqualStrings(&expected, skill.skill_id);
+    }
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        parsed.value.skills[0].skill_id,
+        parsed.value.skills[1].skill_id,
+    ));
+}
+
+test "catalog identity validation rejects duplicates and preserves allocation failure" {
+    const definition = definition_mod.Skill{
+        .name = "",
+        .description = "",
+        .body = "",
+        .allowed_tools = &.{},
+        .disallowed_tools = &.{},
+        .arguments = &.{},
+        .disable_model_invocation = false,
+        .context = .inline_ctx,
+        .agent = "",
+        .model = "",
+        .shell = "",
+        .source_path = "",
+    };
+    const records = [_]SkillRecord{
+        .{
+            .skill_id = [_]u8{'a'} ** 64,
+            .invocation_name = "review",
+            .definition = definition,
+            .directories = &.{},
+            .files = &.{},
+        },
+        .{
+            .skill_id = [_]u8{'a'} ** 64,
+            .invocation_name = "workctl",
+            .definition = definition,
+            .directories = &.{},
+            .files = &.{},
+        },
+    };
+    try std.testing.expectError(
+        error.CatalogInvalid,
+        validateUniqueSkillIds(std.testing.allocator, &records),
+    );
+
+    var failing = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    try std.testing.expectError(
+        error.OutOfMemory,
+        validateUniqueSkillIds(failing.allocator(), records[0..1]),
+    );
 }
 
 test "catalog limits fail the whole query before publishing a partial snapshot" {

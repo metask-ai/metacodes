@@ -32,7 +32,8 @@ pub const encodeUiResponse = protocol.encodeUiResponse;
 pub const encodeSkillArguments = protocol.encodeSkillArguments;
 
 comptime {
-    if (protocol.MAX_SKILL_ARGUMENT_VALUES_V1 != types.MAX_SKILL_ARGUMENT_VALUES_V1 or
+    if (protocol.MAX_SKILL_CATALOG_SKILLS_V1 != types.MAX_SKILL_CATALOG_SKILLS_V1 or
+        protocol.MAX_SKILL_ARGUMENT_VALUES_V1 != types.MAX_SKILL_ARGUMENT_VALUES_V1 or
         protocol.MAX_SKILL_ARGUMENT_JSON_BYTES_V1 != types.MAX_SKILL_ARGUMENT_JSON_BYTES_V1)
         @compileError("Skill JSON codec limits must match the raw ABI contract");
 }
