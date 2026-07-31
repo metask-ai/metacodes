@@ -336,7 +336,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         }
         if (std.mem.eql(u8, trimmed, "/skills")) {
             if (app.skills.len() == 0) {
-                std.debug.print("No skills installed. Put SKILL.md files under ~/.metacodes/skills/<name>/ or <project>/.metacodes/skills/<name>/\n", .{});
+                std.debug.print("No skills installed. Put SKILL.md files under ~/.agents/skills/<name>/ or <project>/.agents/skills/<name>/\n", .{});
             } else {
                 std.debug.print("Available skills ({d}):\n", .{app.skills.len()});
                 for (app.skills.skills.items) |s| {

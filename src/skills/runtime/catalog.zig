@@ -52,8 +52,10 @@ pub fn defaultSources(
     }
     try appendDefaultSource(arena, &sources, workspace_home, &.{ ".claude", "skills" }, .personal, 200);
     try appendDefaultSource(arena, &sources, workspace_home, &.{ ".metacodes", "skills" }, .personal, 201);
+    try appendDefaultSource(arena, &sources, workspace_home, &.{ ".agents", "skills" }, .personal, 202);
     try appendDefaultSource(arena, &sources, workspace_root, &.{ ".claude", "skills" }, .project, 300);
     try appendDefaultSource(arena, &sources, workspace_root, &.{ ".metacodes", "skills" }, .project, 301);
+    try appendDefaultSource(arena, &sources, workspace_root, &.{ ".agents", "skills" }, .project, 302);
     return sources.toOwnedSlice(arena);
 }
 

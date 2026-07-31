@@ -508,6 +508,116 @@ test "default query applies stable project precedence" {
     );
 }
 
+test "default query discovers personal and project .agents skills with compatible precedence" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const workspace_root = try std.fs.path.join(allocator, &.{ root, "workspace" });
+    defer allocator.free(workspace_root);
+    const workspace_home = try std.fs.path.join(allocator, &.{ root, "home" });
+    defer allocator.free(workspace_home);
+    try std.Io.Dir.cwd().createDirPath(io, workspace_root);
+    try std.Io.Dir.cwd().createDirPath(io, workspace_home);
+
+    const Fixture = struct {
+        fn write(
+            fixture_io: std.Io,
+            fixture_allocator: std.mem.Allocator,
+            body: []const u8,
+            relative_dir: []const []const u8,
+            name: []const u8,
+        ) !void {
+            const skill_dir = try std.fs.path.join(fixture_allocator, relative_dir);
+            defer fixture_allocator.free(skill_dir);
+            try std.Io.Dir.cwd().createDirPath(fixture_io, skill_dir);
+            const skill_md = try std.fs.path.join(fixture_allocator, &.{ skill_dir, "SKILL.md" });
+            defer fixture_allocator.free(skill_md);
+            const skill_md_contents = try std.fmt.allocPrint(
+                fixture_allocator,
+                "---\nname: {s}\n---\n{s}",
+                .{ name, body },
+            );
+            defer fixture_allocator.free(skill_md_contents);
+            try std.Io.Dir.cwd().writeFile(fixture_io, .{
+                .sub_path = skill_md,
+                .data = skill_md_contents,
+            });
+        }
+    };
+
+    try Fixture.write(
+        io,
+        allocator,
+        "personal",
+        &.{ workspace_home, ".agents", "skills", "personal-only" },
+        "Personal Agents",
+    );
+    try Fixture.write(
+        io,
+        allocator,
+        "project",
+        &.{ workspace_root, ".agents", "skills", "project-only" },
+        "Project Agents",
+    );
+    try Fixture.write(
+        io,
+        allocator,
+        "legacy",
+        &.{ workspace_root, ".metacodes", "skills", "review" },
+        "Project Legacy",
+    );
+    try Fixture.write(
+        io,
+        allocator,
+        "neutral",
+        &.{ workspace_root, ".agents", "skills", "review" },
+        "Project Neutral",
+    );
+    try Fixture.write(
+        io,
+        allocator,
+        "personal neutral",
+        &.{ workspace_home, ".agents", "skills", "scope-order" },
+        "Personal Neutral",
+    );
+    try Fixture.write(
+        io,
+        allocator,
+        "project legacy",
+        &.{ workspace_root, ".metacodes", "skills", "scope-order" },
+        "Project Legacy Scope",
+    );
+
+    var runtime = RuntimeCatalogs.initWithSecret(allocator, [_]u8{10} ** 32);
+    var workspace = try CanonicalWorkspace.init(allocator, workspace_root, workspace_home);
+    defer workspace.deinit();
+    const host = try runtime.queryDefault(io, &workspace, "epoch", .{});
+    defer host.release() catch unreachable;
+    const snapshot = host.snapshot();
+
+    try std.testing.expectEqual(@as(usize, 4), snapshot.skills.len);
+    try std.testing.expectEqualStrings(
+        "Personal Agents",
+        snapshot.findByInvocation("personal-only").?.definition.name,
+    );
+    try std.testing.expectEqualStrings(
+        "Project Agents",
+        snapshot.findByInvocation("project-only").?.definition.name,
+    );
+    try std.testing.expectEqualStrings(
+        "Project Neutral",
+        snapshot.findByInvocation("review").?.definition.name,
+    );
+    try std.testing.expectEqualStrings(
+        "Project Legacy Scope",
+        snapshot.findByInvocation("scope-order").?.definition.name,
+    );
+}
+
 test "live snapshot budget rejects publication without leaking a reference" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
