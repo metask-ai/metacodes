@@ -85,13 +85,15 @@ pub const Api = struct {
         if (raw.struct_size != @sizeOf(types.ApiV1) or raw.abi_version != types.ABI_VERSION_V1)
             return error.UnsupportedAbi;
         if (raw.abi_revision != types.ABI_REVISION or raw.reserved0 != 0 or
-            raw.capabilities & types.REQUIRED_CAPABILITIES_V1 != types.REQUIRED_CAPABILITIES_V1 or
+            raw.capabilities != types.REQUIRED_CAPABILITIES_V1 or
             !allZero(raw.reserved) or
             raw.runtime_create == null or raw.runtime_destroy == null or
             raw.runtime_query_skill_catalog == null or raw.skill_catalog_release == null or
             raw.session_create == null or raw.session_destroy == null or
-            raw.session_refresh_skill_catalog == null or raw.session_run_input == null or
-            raw.session_abort == null or raw.buffer_release == null)
+            raw.session_set_model == null or raw.session_update_skills == null or
+            raw.session_update_permission_rules == null or raw.session_run_input == null or
+            raw.session_abort == null or raw.session_compact == null or
+            raw.session_abort_compact == null or raw.buffer_release == null)
             return error.UnsupportedAbi;
         return .{ .raw = raw };
     }
@@ -114,8 +116,14 @@ pub const Api = struct {
     pub fn sessionDestroy(self: Api) types.SessionDestroyFnV1 {
         return self.raw.session_destroy.?;
     }
-    pub fn sessionRefreshSkillCatalog(self: Api) types.SessionRefreshSkillCatalogFnV1 {
-        return self.raw.session_refresh_skill_catalog.?;
+    pub fn sessionSetModel(self: Api) types.SessionSetModelFnV1 {
+        return self.raw.session_set_model.?;
+    }
+    pub fn sessionUpdateSkills(self: Api) types.SessionUpdateSkillsFnV1 {
+        return self.raw.session_update_skills.?;
+    }
+    pub fn sessionUpdatePermissionRules(self: Api) types.SessionUpdatePermissionRulesFnV1 {
+        return self.raw.session_update_permission_rules.?;
     }
     pub fn sessionRunInput(self: Api) types.SessionRunInputFnV1 {
         return self.raw.session_run_input.?;
@@ -179,6 +187,12 @@ pub const Api = struct {
     pub fn sessionAbort(self: Api) types.SessionAbortFnV1 {
         return self.raw.session_abort.?;
     }
+    pub fn sessionCompact(self: Api) types.SessionCompactFnV1 {
+        return self.raw.session_compact.?;
+    }
+    pub fn sessionAbortCompact(self: Api) types.SessionAbortCompactFnV1 {
+        return self.raw.session_abort_compact.?;
+    }
     pub fn bufferRelease(self: Api) types.BufferReleaseFnV1 {
         return self.raw.buffer_release.?;
     }
@@ -213,16 +227,20 @@ test "RunContext validator bounds length before pointer slicing" {
     try std.testing.expectEqualStrings(id, valid.session_id);
 }
 
-test "SDK rejects a different revision API size from the stable prefix" {
-    const LegacyApi = extern struct {
+test "Revision 5 SDK rejects the Revision 4 table from the stable prefix" {
+    const Revision4Api = extern struct {
         struct_size: u32,
         abi_version: u32,
+        abi_revision: u32,
+        reserved0: u32,
         capabilities: u64,
-        tail: [88]u8,
+        tail: [112]u8,
     };
-    var legacy = std.mem.zeroes(LegacyApi);
-    legacy.struct_size = 104;
+    var legacy: Revision4Api align(@alignOf(types.ApiV1)) =
+        std.mem.zeroes(Revision4Api);
+    legacy.struct_size = @sizeOf(Revision4Api);
     legacy.abi_version = types.ABI_VERSION_V1;
+    legacy.abi_revision = 4;
     const raw: *const types.ApiV1 = @ptrCast(&legacy);
     try std.testing.expectError(error.UnsupportedAbi, Api.validate(raw));
 }

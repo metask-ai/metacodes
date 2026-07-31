@@ -8,8 +8,10 @@ int main() {
         return 1;
     }
     if (api->abi_revision != METASK_AGENTCORE_ABI_REVISION || api->reserved0 != 0 ||
-        (api->capabilities & METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1) !=
-            METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1) {
+        api->capabilities != METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1 ||
+        api->session_set_model == nullptr || api->session_update_skills == nullptr ||
+        api->session_update_permission_rules == nullptr ||
+        api->session_compact == nullptr || api->session_abort_compact == nullptr) {
         return 1;
     }
     return 0;

@@ -1,6 +1,6 @@
 # AgentCore ABI v1 Revision 5 范围设计
 
-> 状态：Scope accepted；公共语义已确定；wire layout 须通过 Core/L2 门槛后冻结
+> 状态：Implemented；公共语义与 Revision 5 wire layout 已冻结
 > 日期：2026-07-31
 > 前置：`AGENTCORE_V1_REVISION4_DESIGN.md`、`AGENTCORE_BINARY_ABI.md`
 
@@ -487,8 +487,56 @@ Revision 5 仍是一张精确的 `ApiV1` table。函数集合确定为：
 | `session_abort_compact` | 新增 |
 | `buffer_release` | 保留 |
 
-不通过扩展表或字符串 ID 发现这些函数。exact table 顺序、大小、DTO layout 和 limits 在
-Core/L2 门槛完成后统一冻结。
+不通过扩展表或字符串 ID 发现这些函数。
+
+### 7.1 冻结的 wire contract
+
+Revision 5 是 hard cut，不包含 Revision 4 table、layout、capability set、旧函数入口或兼容分派。
+精确发现元组为：
+
+```text
+abi_version   = 1
+abi_revision  = 5
+ApiV1 size    = 168
+capabilities  = 0x0fff
+```
+
+消费者必须同时精确匹配四项；capabilities 不是“至少包含”关系。`ApiV1` 在 24-byte
+发现前缀之后按下列顺序包含函数指针：
+
+```text
+runtime_create
+runtime_destroy
+runtime_query_skill_catalog
+skill_catalog_release
+session_create
+session_destroy
+session_set_model
+session_update_skills
+session_update_permission_rules
+session_run_input
+session_abort
+session_compact
+session_abort_compact
+buffer_release
+```
+
+Revision 4 的 `session_refresh_skill_catalog` 不存在于 Revision 5 table。
+
+新增或变更 DTO 冻结为：
+
+| DTO | size | 字段 |
+|---|---:|---|
+| `SessionConfigV1` | 168 | 既有字段 + optional `skill_catalog`、optional `skill_selection`、optional `permission_rules` |
+| `SkillSelectionV1` | 56 | `default_state_code` + `exception_skill_ids[]`；例外 ID 使用默认状态的反向状态 |
+| `PermissionRuleSetV1` | 88 | borrowed `allow[]`、`ask[]`、`deny[]` |
+| `CompactResultV1` | 88 | outcome、compact 前后 token 规模、四项 provider usage delta |
+
+`session_compact` 不接收 options。compact outcome 固定为 `compacted/no_change/degraded/aborted`；
+新增独立状态 `STATUS_STALE_COMPACT = 17`。Skill exception 数量上限为 1024；permission
+rules 总数上限为 1024，单条 64 KiB，总字节数 1 MiB。所有 `struct_size` 必须精确相等，
+reserved 字段必须为零，输入在解引用前先限长。C、Zig、Rust binding 与 manifest 使用同一组
+精确值；manifest 同时记录 revision、table size 与 capability set。
 
 ## 8. 明确非目标
 

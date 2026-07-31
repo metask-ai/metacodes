@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 4;
+pub const ABI_REVISION: u32 = 5;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 4 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 5 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -29,6 +29,7 @@ pub const Status = enum(u32) {
     invalid_skill_arguments = 14,
     skill_policy_violation = 15,
     skill_unavailable = 16,
+    stale_compact = 17,
 
     pub fn fromCode(code: u32) error{UnknownStatus}!Status {
         return switch (code) {
@@ -49,6 +50,7 @@ pub const Status = enum(u32) {
             @intFromEnum(Status.invalid_skill_arguments) => .invalid_skill_arguments,
             @intFromEnum(Status.skill_policy_violation) => .skill_policy_violation,
             @intFromEnum(Status.skill_unavailable) => .skill_unavailable,
+            @intFromEnum(Status.stale_compact) => .stale_compact,
             else => error.UnknownStatus,
         };
     }
@@ -71,6 +73,7 @@ pub const STATUS_SKILL_NOT_FOUND: u32 = @intFromEnum(Status.skill_not_found);
 pub const STATUS_INVALID_SKILL_ARGUMENTS: u32 = @intFromEnum(Status.invalid_skill_arguments);
 pub const STATUS_SKILL_POLICY_VIOLATION: u32 = @intFromEnum(Status.skill_policy_violation);
 pub const STATUS_SKILL_UNAVAILABLE: u32 = @intFromEnum(Status.skill_unavailable);
+pub const STATUS_STALE_COMPACT: u32 = @intFromEnum(Status.stale_compact);
 
 pub const PROVIDER_ANTHROPIC: u32 = 1;
 pub const PROVIDER_OPENAI: u32 = 2;
@@ -134,10 +137,21 @@ pub const MAX_PROMPT_BYTES_V1: u64 = 16 * 1024 * 1024;
 pub const MAX_SKILL_CATALOG_SKILLS_V1: u64 = 1024;
 pub const MAX_SKILL_ARGUMENT_VALUES_V1: u64 = 64;
 pub const MAX_SKILL_ARGUMENT_JSON_BYTES_V1: u64 = 1024 * 1024;
+pub const MAX_PERMISSION_RULES_V1: u64 = 1024;
+pub const MAX_PERMISSION_RULE_BYTES_V1: u64 = 64 * 1024;
+pub const MAX_PERMISSION_RULE_TOTAL_BYTES_V1: u64 = 1024 * 1024;
 pub const MAX_TURNS_V1: u32 = 1000;
 
 pub const RUN_INPUT_TEXT: u32 = 1;
 pub const RUN_INPUT_SKILL: u32 = 2;
+
+pub const SKILL_SELECTION_DISABLED: u32 = 1;
+pub const SKILL_SELECTION_ENABLED: u32 = 2;
+
+pub const COMPACT_COMPACTED: u32 = 1;
+pub const COMPACT_NO_CHANGE: u32 = 2;
+pub const COMPACT_DEGRADED: u32 = 3;
+pub const COMPACT_ABORTED: u32 = 4;
 
 pub const EVENT_CONTINUE: u32 = 0;
 pub const EVENT_FATAL: u32 = 1;
@@ -158,7 +172,11 @@ pub const CAP_CORE_EVENTS_JSON: u64 = 1 << 4;
 pub const CAP_ABORT: u64 = 1 << 5;
 pub const CAP_SKILL_CATALOG: u64 = 1 << 6;
 pub const CAP_TYPED_RUN_INPUT: u64 = 1 << 7;
-pub const REQUIRED_CAPABILITIES_V1: u64 = CAP_RUNTIME | CAP_BUILTIN_TOOLS | CAP_HOST_SYNC_TOOLS | CAP_HOST_UI | CAP_CORE_EVENTS_JSON | CAP_ABORT | CAP_SKILL_CATALOG | CAP_TYPED_RUN_INPUT;
+pub const CAP_SESSION_MODEL_MUTATION: u64 = 1 << 8;
+pub const CAP_MANUAL_COMPACT: u64 = 1 << 9;
+pub const CAP_SKILL_SELECTION: u64 = 1 << 10;
+pub const CAP_HOST_PERMISSION_RULES: u64 = 1 << 11;
+pub const REQUIRED_CAPABILITIES_V1: u64 = CAP_RUNTIME | CAP_BUILTIN_TOOLS | CAP_HOST_SYNC_TOOLS | CAP_HOST_UI | CAP_CORE_EVENTS_JSON | CAP_ABORT | CAP_SKILL_CATALOG | CAP_TYPED_RUN_INPUT | CAP_SESSION_MODEL_MUTATION | CAP_MANUAL_COMPACT | CAP_SKILL_SELECTION | CAP_HOST_PERMISSION_RULES;
 
 /// Each published v1 revision is rigid: every struct_size is exact and every
 /// reserved field is zero. A Host pins version, revision, table size, and
@@ -262,6 +280,31 @@ pub const SessionCallbacksV1 = extern struct {
     reserved: [4]u64,
 };
 
+/// New Skills use `default_state_code`. Every listed catalog Skill ID uses the
+/// opposite state. The list is borrowed for the call and must not contain
+/// duplicate or foreign IDs.
+pub const SkillSelectionV1 = extern struct {
+    struct_size: u32,
+    default_state_code: u32,
+    exception_skill_ids: ?[*]const BytesViewV1,
+    exception_skill_id_count: u64,
+    reserved: [4]u64,
+};
+
+/// Borrowed canonical Tool(specifier) rules. AgentCore validates, copies, and
+/// compiles the complete replacement before publishing it.
+pub const PermissionRuleSetV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    allow: ?[*]const BytesViewV1,
+    allow_count: u64,
+    ask: ?[*]const BytesViewV1,
+    ask_count: u64,
+    deny: ?[*]const BytesViewV1,
+    deny_count: u64,
+    reserved: [4]u64,
+};
+
 pub const SessionConfigV1 = extern struct {
     struct_size: u32,
     provider_kind_code: u32,
@@ -275,6 +318,8 @@ pub const SessionConfigV1 = extern struct {
     allowed_tools: ?[*]const BytesViewV1,
     allowed_tool_count: u64,
     skill_catalog: ?*SkillCatalogHandle,
+    skill_selection: ?*const SkillSelectionV1,
+    permission_rules: ?*const PermissionRuleSetV1,
     reserved: [4]u64,
 };
 
@@ -313,6 +358,20 @@ pub const RunResultV1 = extern struct {
     reserved: [4]u64,
 };
 
+/// Terminal manual-compact summary. Fields are defined only when
+/// `session_compact` returns STATUS_OK.
+pub const CompactResultV1 = extern struct {
+    struct_size: u32,
+    outcome_code: u32,
+    before_context_tokens: u64,
+    after_context_tokens: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    reserved: [4]u64,
+};
+
 /// The final OwnedBytesV1 pointer on each AgentCore operation is an optional,
 /// write-only diagnostic output. Release a prior diagnostic before reusing
 /// its variable. Diagnostic allocation is best-effort and never changes the
@@ -329,7 +388,18 @@ pub const RuntimeQuerySkillCatalogFnV1 = *const fn (
 pub const SkillCatalogReleaseFnV1 = *const fn (?*SkillCatalogHandle, ?*OwnedBytesV1) callconv(.c) u32;
 pub const SessionCreateFnV1 = *const fn (?*RuntimeHandle, ?*const SessionConfigV1, ?*const SessionCallbacksV1, ?*?*SessionHandle, ?*OwnedBytesV1) callconv(.c) u32;
 pub const SessionDestroyFnV1 = *const fn (?*SessionHandle, ?*OwnedBytesV1) callconv(.c) u32;
-pub const SessionRefreshSkillCatalogFnV1 = *const fn (?*SessionHandle, ?*SkillCatalogHandle, ?*OwnedBytesV1) callconv(.c) u32;
+pub const SessionSetModelFnV1 = *const fn (?*SessionHandle, BytesViewV1, ?*OwnedBytesV1) callconv(.c) u32;
+pub const SessionUpdateSkillsFnV1 = *const fn (
+    session: ?*SessionHandle,
+    optional_catalog: ?*SkillCatalogHandle,
+    selection: ?*const SkillSelectionV1,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
+pub const SessionUpdatePermissionRulesFnV1 = *const fn (
+    session: ?*SessionHandle,
+    rules: ?*const PermissionRuleSetV1,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
 /// Pre-admission validation, resource-limit, busy, and stale-run failures do
 /// not consume `run_id`. Post-admission Skill materialization failure consumes
 /// it but leaves the Session reusable after cleanup. Once Conversation or
@@ -361,6 +431,17 @@ pub const SessionAbortFnV1 = *const fn (
     reason_code: u32,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
+pub const SessionCompactFnV1 = *const fn (
+    session: ?*SessionHandle,
+    operation_id: u64,
+    out_result: ?*CompactResultV1,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
+pub const SessionAbortCompactFnV1 = *const fn (
+    session: ?*SessionHandle,
+    operation_id: u64,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
 /// Releases only library-owned diagnostics, never Host-owned tool or UI
 /// callback buffers.
 pub const BufferReleaseFnV1 = *const fn (?*OwnedBytesV1) callconv(.c) void;
@@ -377,9 +458,13 @@ pub const ApiV1 = extern struct {
     skill_catalog_release: ?SkillCatalogReleaseFnV1,
     session_create: ?SessionCreateFnV1,
     session_destroy: ?SessionDestroyFnV1,
-    session_refresh_skill_catalog: ?SessionRefreshSkillCatalogFnV1,
+    session_set_model: ?SessionSetModelFnV1,
+    session_update_skills: ?SessionUpdateSkillsFnV1,
+    session_update_permission_rules: ?SessionUpdatePermissionRulesFnV1,
     session_run_input: ?SessionRunInputFnV1,
     session_abort: ?SessionAbortFnV1,
+    session_compact: ?SessionCompactFnV1,
+    session_abort_compact: ?SessionAbortCompactFnV1,
     buffer_release: ?BufferReleaseFnV1,
     reserved: [4]u64,
 };
@@ -392,12 +477,15 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 96), @sizeOf(HostToolV1));
     try std.testing.expectEqual(@as(usize, 72), @sizeOf(RuntimeConfigV1));
     try std.testing.expectEqual(@as(usize, 72), @sizeOf(SessionCallbacksV1));
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(SkillSelectionV1));
+    try std.testing.expectEqual(@as(usize, 88), @sizeOf(PermissionRuleSetV1));
     try std.testing.expectEqual(@as(usize, 80), @sizeOf(SkillCatalogQueryV1));
     try std.testing.expectEqual(@as(usize, 104), @sizeOf(RunInputV1));
-    try std.testing.expectEqual(@as(usize, 152), @sizeOf(SessionConfigV1));
+    try std.testing.expectEqual(@as(usize, 168), @sizeOf(SessionConfigV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(RunOptionsV1));
     try std.testing.expectEqual(@as(usize, 48), @sizeOf(RunResultV1));
-    try std.testing.expectEqual(@as(usize, 136), @sizeOf(ApiV1));
+    try std.testing.expectEqual(@as(usize, 88), @sizeOf(CompactResultV1));
+    try std.testing.expectEqual(@as(usize, 168), @sizeOf(ApiV1));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(RunContextV1, "session"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(RunContextV1, "run_id"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(RunContextV1, "session_id"));
@@ -405,14 +493,28 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(SessionConfigV1, "api_key"));
     try std.testing.expectEqual(@as(usize, 96), @offsetOf(SessionConfigV1, "allowed_tools"));
     try std.testing.expectEqual(@as(usize, 112), @offsetOf(SessionConfigV1, "skill_catalog"));
+    try std.testing.expectEqual(@as(usize, 120), @offsetOf(SessionConfigV1, "skill_selection"));
+    try std.testing.expectEqual(@as(usize, 128), @offsetOf(SessionConfigV1, "permission_rules"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(SkillSelectionV1, "exception_skill_ids"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(PermissionRuleSetV1, "allow"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(PermissionRuleSetV1, "ask"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(PermissionRuleSetV1, "deny"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(CompactResultV1, "before_context_tokens"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(CompactResultV1, "input_tokens"));
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(SkillCatalogQueryV1, "workspace_epoch"));
     try std.testing.expectEqual(@as(usize, 56), @offsetOf(RunInputV1, "arguments_json"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(ApiV1, "abi_revision"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(ApiV1, "capabilities"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(ApiV1, "runtime_create"));
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(ApiV1, "runtime_query_skill_catalog"));
-    try std.testing.expectEqual(@as(usize, 72), @offsetOf(ApiV1, "session_refresh_skill_catalog"));
-    try std.testing.expectEqual(@as(usize, 80), @offsetOf(ApiV1, "session_run_input"));
+    try std.testing.expectEqual(@as(usize, 72), @offsetOf(ApiV1, "session_set_model"));
+    try std.testing.expectEqual(@as(usize, 80), @offsetOf(ApiV1, "session_update_skills"));
+    try std.testing.expectEqual(@as(usize, 88), @offsetOf(ApiV1, "session_update_permission_rules"));
+    try std.testing.expectEqual(@as(usize, 96), @offsetOf(ApiV1, "session_run_input"));
+    try std.testing.expectEqual(@as(usize, 112), @offsetOf(ApiV1, "session_compact"));
+    try std.testing.expectEqual(@as(usize, 120), @offsetOf(ApiV1, "session_abort_compact"));
+    try std.testing.expectEqual(@as(usize, 128), @offsetOf(ApiV1, "buffer_release"));
+    try std.testing.expectEqual(@as(usize, 136), @offsetOf(ApiV1, "reserved"));
 }
 
 test "typed status and stop reason validate every public code" {
@@ -427,7 +529,8 @@ test "typed status and stop reason validate every public code" {
     }
     try std.testing.expectEqual(Status.skill_catalog_invalid, try Status.fromCode(11));
     try std.testing.expectEqual(Status.skill_unavailable, try Status.fromCode(16));
-    try std.testing.expectError(error.UnknownStatus, Status.fromCode(17));
+    try std.testing.expectEqual(Status.stale_compact, try Status.fromCode(17));
+    try std.testing.expectError(error.UnknownStatus, Status.fromCode(18));
     try std.testing.expectError(error.UnknownStatus, Status.fromCode(std.math.maxInt(u32)));
     try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(0));
     try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(7));

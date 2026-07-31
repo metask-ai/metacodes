@@ -26,6 +26,11 @@ comptime {
         @compileError("AgentCore wire and core encoded Host-error limits must match");
     if ((skill_catalog.Limits{}).max_slots != @as(usize, @intCast(wire.MAX_SKILL_CATALOG_SKILLS_V1)))
         @compileError("AgentCore wire and Skill catalog slot limits must match");
+    const permission_limits = core.permission_settings.RuleSetLimits{};
+    if (permission_limits.max_rules != @as(usize, @intCast(wire.MAX_PERMISSION_RULES_V1)) or
+        permission_limits.max_rule_bytes != @as(usize, @intCast(wire.MAX_PERMISSION_RULE_BYTES_V1)) or
+        permission_limits.max_total_bytes != @as(usize, @intCast(wire.MAX_PERMISSION_RULE_TOTAL_BYTES_V1)))
+        @compileError("AgentCore wire and canonical permission rule limits must match");
 }
 
 const AbiHostTool = struct {
@@ -170,7 +175,7 @@ fn createInitialSkillBinding(
 }
 
 const AbiSession = struct {
-    const CallState = enum { idle, running, mutating, destroying };
+    const CallState = enum { idle, running, compacting, mutating, destroying };
 
     callbacks: wire.SessionCallbacksV1,
     callback_status: std.atomic.Value(u32),
@@ -335,6 +340,21 @@ const AbiSession = struct {
         self.call_state = .idle;
     }
 
+    fn tryBeginCompact(self: *AbiSession) bool {
+        self.call_mutex.lock();
+        defer self.call_mutex.unlock();
+        if (self.call_state != .idle) return false;
+        self.call_state = .compacting;
+        return true;
+    }
+
+    fn finishCompact(self: *AbiSession) void {
+        self.call_mutex.lock();
+        defer self.call_mutex.unlock();
+        std.debug.assert(self.call_state == .compacting);
+        self.call_state = .idle;
+    }
+
     fn tryBeginMutation(self: *AbiSession) bool {
         self.call_mutex.lock();
         defer self.call_mutex.unlock();
@@ -377,7 +397,15 @@ const AbiSession = struct {
         defer runtime_call.deinit();
         if (!self.tryBeginMutation()) return error.SessionBusy;
         defer self.finishMutation();
+        try self.updateSkillsAdmitted(runtime, optional_host, spec);
+    }
 
+    fn updateSkillsAdmitted(
+        self: *AbiSession,
+        runtime: *AbiRuntime,
+        optional_host: ?*const skill_catalog_handles.HostCatalog,
+        spec: skill_availability.Spec,
+    ) !void {
         if (optional_host) |host| {
             const replacement_cell = try runtime.catalogs.retainForSession(
                 host,
@@ -452,8 +480,7 @@ const AbiSession = struct {
         arguments_json: []const u8,
         max_turns: u32,
     ) anyerror!SkillExecution {
-        const binding = if (self.skill_binding) |*value| value else
-            return error.SkillCatalogNotBound;
+        const binding = if (self.skill_binding) |*value| value else return error.SkillCatalogNotBound;
         const root_frame = self.policy_root orelse
             return error.InvalidSessionState;
         var plan = try skill_activation.prepare(
@@ -828,8 +855,7 @@ const ForkExecutorContext = struct {
                 .host_session_ctx = host_ctx,
             } else null;
         const child_depth = try childDepth(self.activation.parent_agent_depth);
-        const binding = if (self.facade.skill_binding) |*value| value else
-            return error.InvalidSessionState;
+        const binding = if (self.facade.skill_binding) |*value| value else return error.InvalidSessionState;
         var environment: ?model_skill_tool.Environment =
             if (model_skill_tool.Environment.hasModelInvocable(
                 binding.snapshot(),
@@ -1081,6 +1107,7 @@ fn statusText(status: u32) []const u8 {
         wire.STATUS_INVALID_SKILL_ARGUMENTS => "invalid Skill arguments",
         wire.STATUS_SKILL_POLICY_VIOLATION => "Skill policy violation",
         wire.STATUS_SKILL_UNAVAILABLE => "Skill unavailable",
+        wire.STATUS_STALE_COMPACT => "stale compact operation",
         else => "AgentCore error",
     };
 }
@@ -1125,6 +1152,38 @@ fn catalogQueryStatus(err: anyerror) u32 {
         error.RuntimeUnavailable => wire.STATUS_INVALID_STATE,
         error.InvalidWorkspace => wire.STATUS_INVALID_ARGUMENT,
         else => wire.STATUS_CORE_ERROR,
+    };
+}
+
+fn sessionMutationStatus(err: anyerror) u32 {
+    return switch (err) {
+        error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
+        error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
+        error.SessionBusy, error.RuntimeBusy => wire.STATUS_BUSY,
+        error.InvalidSessionState, error.SkillCatalogNotBound, error.RuntimeUnavailable => wire.STATUS_INVALID_STATE,
+        error.InvalidModel,
+        error.InvalidRule,
+        error.InvalidSkillId,
+        error.DuplicateSkillId,
+        error.ForeignSkillId,
+        error.WrongRuntime,
+        error.WrongWorkspace,
+        error.InvalidWorkspace,
+        => wire.STATUS_INVALID_ARGUMENT,
+        else => wire.STATUS_CORE_ERROR,
+    };
+}
+
+fn compactStatus(err: anyerror) u32 {
+    return switch (err) {
+        error.InvalidOperationId => wire.STATUS_INVALID_ARGUMENT,
+        error.StaleCompact => wire.STATUS_STALE_COMPACT,
+        error.AbortTooLate => wire.STATUS_TOO_LATE,
+        error.SessionBusy => wire.STATUS_BUSY,
+        error.InvalidSessionState => wire.STATUS_INVALID_STATE,
+        error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
+        error.ConcurrentMutation => wire.STATUS_CORE_ERROR,
+        else => wire.STATUS_INTERNAL_ERROR,
     };
 }
 
@@ -1239,6 +1298,104 @@ fn borrowedViews(
         out[i] = try text(value);
     }
     return out;
+}
+
+fn parseSkillSelection(
+    scratch: std.mem.Allocator,
+    raw: *const wire.SkillSelectionV1,
+) !skill_availability.Spec {
+    if (raw.struct_size != @sizeOf(wire.SkillSelectionV1) or
+        !allZero(raw.reserved))
+        return error.InvalidArgument;
+    const default_state: skill_availability.State = switch (raw.default_state_code) {
+        wire.SKILL_SELECTION_DISABLED => .disabled,
+        wire.SKILL_SELECTION_ENABLED => .enabled,
+        else => return error.InvalidArgument,
+    };
+    if (raw.exception_skill_id_count > wire.MAX_SKILL_CATALOG_SKILLS_V1)
+        return error.ResourceLimit;
+    const count = std.math.cast(usize, raw.exception_skill_id_count) orelse
+        return error.Overflow;
+    if (count == 0) {
+        return .{ .default_state = default_state, .exceptions = &.{} };
+    }
+    const ids = (raw.exception_skill_ids orelse return error.InvalidArgument)[0..count];
+    const exceptions = try scratch.alloc(skill_availability.Exception, count);
+    const exception_state: skill_availability.State =
+        if (default_state == .enabled) .disabled else .enabled;
+    for (ids, 0..) |id, index| {
+        if (id.len > 64) return error.InvalidArgument;
+        const skill_id = try text(id);
+        if (skill_id.len == 0) return error.InvalidArgument;
+        exceptions[index] = .{
+            .skill_id = skill_id,
+            .state = exception_state,
+        };
+    }
+    return .{
+        .default_state = default_state,
+        .exceptions = exceptions,
+    };
+}
+
+fn parsePermissionRuleViews(
+    scratch: std.mem.Allocator,
+    ptr: ?[*]const wire.BytesViewV1,
+    count64: u64,
+    total_count: *u64,
+    total_bytes: *u64,
+) ![]const []const u8 {
+    total_count.* = std.math.add(u64, total_count.*, count64) catch
+        return error.ResourceLimit;
+    if (total_count.* > wire.MAX_PERMISSION_RULES_V1)
+        return error.ResourceLimit;
+    const count = std.math.cast(usize, count64) orelse return error.Overflow;
+    if (count == 0) return &.{};
+    const values = (ptr orelse return error.InvalidArgument)[0..count];
+    const rules = try scratch.alloc([]const u8, count);
+    for (values, 0..) |value, index| {
+        if (value.len == 0 or value.len > wire.MAX_PERMISSION_RULE_BYTES_V1)
+            return error.InvalidRule;
+        total_bytes.* = std.math.add(u64, total_bytes.*, value.len) catch
+            return error.ResourceLimit;
+        if (total_bytes.* > wire.MAX_PERMISSION_RULE_TOTAL_BYTES_V1)
+            return error.ResourceLimit;
+        rules[index] = try text(value);
+    }
+    return rules;
+}
+
+fn parsePermissionRuleSet(
+    scratch: std.mem.Allocator,
+    raw: *const wire.PermissionRuleSetV1,
+) !core.permission_settings.RuleSetInput {
+    if (raw.struct_size != @sizeOf(wire.PermissionRuleSetV1) or
+        raw.reserved0 != 0 or !allZero(raw.reserved))
+        return error.InvalidArgument;
+    var total_count: u64 = 0;
+    var total_bytes: u64 = 0;
+    const allow = try parsePermissionRuleViews(
+        scratch,
+        raw.allow,
+        raw.allow_count,
+        &total_count,
+        &total_bytes,
+    );
+    const ask = try parsePermissionRuleViews(
+        scratch,
+        raw.ask,
+        raw.ask_count,
+        &total_count,
+        &total_bytes,
+    );
+    const deny = try parsePermissionRuleViews(
+        scratch,
+        raw.deny,
+        raw.deny_count,
+        &total_count,
+        &total_bytes,
+    );
+    return .{ .allow = allow, .ask = ask, .deny = deny };
 }
 
 fn parseSchema(arena: std.mem.Allocator, encoded: []const u8) !core.json.InputSchema {
@@ -1520,6 +1677,18 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
         home,
     ) catch |err| return failError(catalogLifecycleStatus(err), err, out_error);
     defer workspace.deinit();
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const initial_selection = if (config.skill_selection) |selection|
+        parseSkillSelection(scratch.allocator(), selection) catch |err|
+            return failError(inputErrorStatus(err), err, out_error)
+    else
+        null;
+    const initial_permission_rules = if (config.permission_rules) |rules|
+        parsePermissionRuleSet(scratch.allocator(), rules) catch |err|
+            return failError(inputErrorStatus(err), err, out_error)
+    else
+        null;
     const workspace_scope_id = runtime.catalogs.scopeId(&workspace) catch |err|
         return failError(catalogLifecycleStatus(err), err, out_error);
     var initial_binding = createInitialSkillBinding(
@@ -1529,7 +1698,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
             catalogFrom(catalog_handle)
         else
             null,
-        null,
+        if (initial_selection) |*selection| selection else null,
     ) catch |err| return failError(
         if (err == error.InvalidSkillBinding)
             wire.STATUS_INVALID_ARGUMENT
@@ -1541,8 +1710,6 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     var keep_binding = false;
     defer if (!keep_binding) if (initial_binding) |*binding|
         binding.deinit(&runtime.catalogs);
-    var scratch = std.heap.ArenaAllocator.init(allocator);
-    defer scratch.deinit();
     const allowed = borrowedViews(
         scratch.allocator(),
         config.allowed_tools,
@@ -1575,6 +1742,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
         .model = model,
         .base_url = if (base_url.len == 0) null else base_url,
         .permission_mode = mode,
+        .permission_rules = initial_permission_rules,
         .workspace = .{ .root = workspace.root, .home = workspace.home, .shell = shell },
         .allowed_tools = allowed,
         .run_ui_requester = if (callbacks.on_ui_request != null) .{ .ctx = self, .requestFn = AbiSession.requestUi } else null,
@@ -1636,21 +1804,88 @@ fn sessionDestroy(handle: ?*wire.SessionHandle, out_error: ?*wire.OwnedBytesV1) 
     return wire.STATUS_OK;
 }
 
-fn sessionRefreshSkillCatalog(
+fn sessionSetModel(
     handle: ?*wire.SessionHandle,
-    catalog_handle: ?*wire.SkillCatalogHandle,
+    model_view: wire.BytesViewV1,
     out_error: ?*wire.OwnedBytesV1,
 ) callconv(.c) u32 {
     emptyError(out_error);
-    _ = sessionFrom(handle orelse
+    const self = sessionFrom(handle orelse
         return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
-    _ = catalogFrom(catalog_handle orelse
-        return fail(wire.STATUS_INVALID_ARGUMENT, "Skill catalog is required", out_error));
-    return fail(
-        wire.STATUS_INVALID_ARGUMENT,
-        "Revision 5 requires session_update_skills with an explicit selection",
-        out_error,
-    );
+    if (!self.tryBeginMutation())
+        return fail(wire.STATUS_BUSY, "Session has an active facade call", out_error);
+    defer self.finishMutation();
+    if (self.facade_poisoned.load(.acquire))
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
+    if (model_view.len == 0)
+        return fail(wire.STATUS_INVALID_ARGUMENT, "model is required", out_error);
+    if (model_view.len > wire.MAX_METADATA_STRING_BYTES_V1)
+        return fail(wire.STATUS_RESOURCE_LIMIT, "model exceeds AgentCore ABI v1 limit", out_error);
+    const model = text(model_view) catch |err|
+        return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+    self.core_session.setModel(model) catch |err|
+        return failError(sessionMutationStatus(err), err, out_error);
+    return wire.STATUS_OK;
+}
+
+fn sessionUpdateSkills(
+    handle: ?*wire.SessionHandle,
+    optional_catalog_handle: ?*wire.SkillCatalogHandle,
+    selection_ptr: ?*const wire.SkillSelectionV1,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    const runtime = self.runtime orelse
+        return fail(wire.STATUS_INVALID_STATE, "Session has no owning Runtime", out_error);
+    var runtime_call = runtime.catalogs.enterCall() catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    defer runtime_call.deinit();
+    if (!self.tryBeginMutation())
+        return fail(wire.STATUS_BUSY, "Session has an active facade call", out_error);
+    defer self.finishMutation();
+    if (self.facade_poisoned.load(.acquire))
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
+    const selection = selection_ptr orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "Skill selection is required", out_error);
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const spec = parseSkillSelection(scratch.allocator(), selection) catch |err|
+        return failError(inputErrorStatus(err), err, out_error);
+    self.updateSkillsAdmitted(
+        runtime,
+        if (optional_catalog_handle) |catalog_handle|
+            catalogFrom(catalog_handle)
+        else
+            null,
+        spec,
+    ) catch |err| return failError(sessionMutationStatus(err), err, out_error);
+    return wire.STATUS_OK;
+}
+
+fn sessionUpdatePermissionRules(
+    handle: ?*wire.SessionHandle,
+    rules_ptr: ?*const wire.PermissionRuleSetV1,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    if (!self.tryBeginMutation())
+        return fail(wire.STATUS_BUSY, "Session has an active facade call", out_error);
+    defer self.finishMutation();
+    if (self.facade_poisoned.load(.acquire))
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
+    const rules = rules_ptr orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "permission rules are required", out_error);
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const input = parsePermissionRuleSet(scratch.allocator(), rules) catch |err|
+        return failError(inputErrorStatus(err), err, out_error);
+    self.core_session.updatePermissionRules(input) catch |err|
+        return failError(sessionMutationStatus(err), err, out_error);
+    return wire.STATUS_OK;
 }
 
 fn sessionRunInput(
@@ -1790,6 +2025,71 @@ fn sessionAbort(handle: ?*wire.SessionHandle, run_id: u64, reason_code: u32, out
     return wire.STATUS_OK;
 }
 
+fn sessionCompact(
+    handle: ?*wire.SessionHandle,
+    operation_id: u64,
+    out_result: ?*wire.CompactResultV1,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    if (out_result) |out| out.* = std.mem.zeroes(wire.CompactResultV1);
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    const runtime = self.runtime orelse
+        return fail(wire.STATUS_INVALID_STATE, "Session has no owning Runtime", out_error);
+    var runtime_call = runtime.catalogs.enterCall() catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    defer runtime_call.deinit();
+    if (!self.tryBeginCompact())
+        return fail(wire.STATUS_BUSY, "Session has an active facade call", out_error);
+    defer self.finishCompact();
+    if (self.facade_poisoned.load(.acquire))
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
+    const out = out_result orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "out_result is required", out_error);
+    const report = self.core_session.compact(operation_id, .{}) catch |err|
+        return failError(compactStatus(err), err, out_error);
+    out.* = .{
+        .struct_size = @sizeOf(wire.CompactResultV1),
+        .outcome_code = switch (report.outcome) {
+            .compacted => wire.COMPACT_COMPACTED,
+            .no_change => wire.COMPACT_NO_CHANGE,
+            .degraded => wire.COMPACT_DEGRADED,
+            .aborted => wire.COMPACT_ABORTED,
+        },
+        .before_context_tokens = @intCast(report.before_tokens),
+        .after_context_tokens = @intCast(report.after_tokens),
+        .input_tokens = report.usage.input_tokens,
+        .output_tokens = report.usage.output_tokens,
+        .cache_read_input_tokens = report.usage.cache_read_input_tokens,
+        .cache_creation_input_tokens = report.usage.cache_creation_input_tokens,
+        .reserved = [_]u64{0} ** 4,
+    };
+    return wire.STATUS_OK;
+}
+
+fn sessionAbortCompact(
+    handle: ?*wire.SessionHandle,
+    operation_id: u64,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    if (operation_id == 0)
+        return fail(wire.STATUS_INVALID_ARGUMENT, "operation_id must be nonzero", out_error);
+    const runtime = self.runtime orelse
+        return fail(wire.STATUS_INVALID_STATE, "Session has no owning Runtime", out_error);
+    var runtime_call = runtime.catalogs.enterCall() catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    defer runtime_call.deinit();
+    if (self.facade_poisoned.load(.acquire))
+        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
+    self.core_session.abortCompact(operation_id) catch |err|
+        return failError(compactStatus(err), err, out_error);
+    return wire.STATUS_OK;
+}
+
 fn bufferRelease(buffer: ?*wire.OwnedBytesV1) callconv(.c) void {
     const out = buffer orelse return;
     const len = std.math.cast(usize, out.len) orelse {
@@ -1812,9 +2112,13 @@ const api_v1 = wire.ApiV1{
     .skill_catalog_release = skillCatalogRelease,
     .session_create = sessionCreate,
     .session_destroy = sessionDestroy,
-    .session_refresh_skill_catalog = sessionRefreshSkillCatalog,
+    .session_set_model = sessionSetModel,
+    .session_update_skills = sessionUpdateSkills,
+    .session_update_permission_rules = sessionUpdatePermissionRules,
     .session_run_input = sessionRunInput,
     .session_abort = sessionAbort,
+    .session_compact = sessionCompact,
+    .session_abort_compact = sessionAbortCompact,
     .buffer_release = bufferRelease,
     .reserved = [_]u64{0} ** 4,
 };
@@ -2362,7 +2666,7 @@ test "Host schema admission rejects ambiguous object contracts" {
     );
 }
 
-test "provider-facing tool names use the Revision 4 intersection grammar" {
+test "provider-facing tool names use the public intersection grammar" {
     try std.testing.expect(validToolName("_"));
     try std.testing.expect(validToolName("A_9-name"));
     const max_name = "A" ++ ("x" ** 63);

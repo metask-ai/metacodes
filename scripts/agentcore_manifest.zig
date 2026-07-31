@@ -40,6 +40,8 @@ const Manifest = struct {
         binary_abi_status: []const u8 = "experimental",
         binary_abi_version: u32 = abi_types.ABI_VERSION_V1,
         binary_abi_revision: u32 = abi_types.ABI_REVISION,
+        binary_abi_table_size: u32 = @sizeOf(abi_types.ApiV1),
+        capabilities: u64 = abi_types.REQUIRED_CAPABILITIES_V1,
     },
     files: []const FileEntry,
 };

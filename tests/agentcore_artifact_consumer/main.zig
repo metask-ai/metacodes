@@ -4,8 +4,9 @@ const wire = sdk.types;
 const Server = @import("mock_server.zig").Server;
 
 comptime {
-    if (@hasDecl(wire, "CALLBACK_CONTINUE") or @hasDecl(wire, "CALLBACK_FATAL"))
-        @compileError("revision 4 must not retain pre-revision callback aliases");
+    if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
+        @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
+        @compileError("revision 5 must not expose revision 4 catalog refresh");
 }
 
 const ASK_SSE =
@@ -278,6 +279,11 @@ pub fn main(init: std.process.Init) !void {
     api.bufferRelease()(&descriptor);
 
     const allowed = [_]wire.BytesViewV1{ sdk.bytesView("AskUserQuestion"), sdk.bytesView("Read"), sdk.bytesView("HostEcho") };
+    var skill_selection = std.mem.zeroes(wire.SkillSelectionV1);
+    skill_selection.struct_size = @sizeOf(wire.SkillSelectionV1);
+    skill_selection.default_state_code = wire.SKILL_SELECTION_ENABLED;
+    var initial_rules = std.mem.zeroes(wire.PermissionRuleSetV1);
+    initial_rules.struct_size = @sizeOf(wire.PermissionRuleSetV1);
     var config = wire.SessionConfigV1{
         .struct_size = @sizeOf(wire.SessionConfigV1),
         .provider_kind_code = wire.PROVIDER_ANTHROPIC,
@@ -291,6 +297,8 @@ pub fn main(init: std.process.Init) !void {
         .allowed_tools = &allowed,
         .allowed_tool_count = allowed.len,
         .skill_catalog = catalog,
+        .skill_selection = &skill_selection,
+        .permission_rules = &initial_rules,
         .reserved = [_]u64{0} ** 4,
     };
     var callbacks = wire.SessionCallbacksV1{
@@ -310,6 +318,36 @@ pub fn main(init: std.process.Init) !void {
     defer if (session) |handle| {
         _ = api.sessionDestroy()(handle, &diagnostic);
     };
+    try expectStatus(
+        .ok,
+        api.sessionSetModel()(session, sdk.bytesView("artifact-model-v2"), &diagnostic),
+        diagnostic,
+    );
+    try expectStatus(
+        .ok,
+        api.sessionUpdateSkills()(session, null, &skill_selection, &diagnostic),
+        diagnostic,
+    );
+    try expectStatus(
+        .ok,
+        api.sessionUpdatePermissionRules()(session, &initial_rules, &diagnostic),
+        diagnostic,
+    );
+    var compact_result = std.mem.zeroes(wire.CompactResultV1);
+    try expectStatus(
+        .ok,
+        api.sessionCompact()(session, 1, &compact_result, &diagnostic),
+        diagnostic,
+    );
+    if (compact_result.struct_size != @sizeOf(wire.CompactResultV1) or
+        compact_result.outcome_code != wire.COMPACT_NO_CHANGE)
+        return error.InvalidCompactResult;
+    try expectStatus(
+        .too_late,
+        api.sessionAbortCompact()(session, 1, &diagnostic),
+        diagnostic,
+    );
+    api.bufferRelease()(&diagnostic);
     var options = wire.RunOptionsV1{ .struct_size = @sizeOf(wire.RunOptionsV1), .max_turns = 6, .reserved = [_]u64{0} ** 4 };
     var result: wire.RunResultV1 = undefined;
     const encoded_arguments = try sdk.encodeSkillArguments(
@@ -350,7 +388,7 @@ pub fn main(init: std.process.Init) !void {
     session = null;
     try expectStatus(.ok, api.runtimeDestroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
-    std.debug.print("AgentCore source-free consumer: catalog, typed Skill, tools, Host UI and events OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 5 mutations, compact, catalog, typed Skill, tools, Host UI and events OK\n", .{});
 }
 
 const CatalogIdentities = struct {
@@ -380,23 +418,35 @@ fn catalogIdentities(
 }
 
 fn verifyRevisionMismatchRejection(api: sdk.Api) !void {
-    const LegacyApi104 = extern struct {
+    const Revision4Api = extern struct {
         struct_size: u32,
         abi_version: u32,
-        tail: [96]u8,
+        abi_revision: u32,
+        reserved0: u32,
+        capabilities: u64,
+        tail: [112]u8,
     };
-    var legacy: LegacyApi104 align(@alignOf(wire.ApiV1)) = std.mem.zeroes(LegacyApi104);
-    legacy.struct_size = @sizeOf(LegacyApi104);
+    var legacy: Revision4Api align(@alignOf(wire.ApiV1)) = std.mem.zeroes(Revision4Api);
+    legacy.struct_size = @sizeOf(Revision4Api);
     legacy.abi_version = wire.ABI_VERSION_V1;
+    legacy.abi_revision = 4;
     if (sdk.Api.validate(@ptrCast(&legacy))) |_| return error.LegacyTableAccepted else |err| {
         if (err != error.UnsupportedAbi) return err;
     }
+    if (revision4Accepts(api.raw))
+        return error.Revision4ConsumerAcceptedRevision5;
 
     var wrong_revision = api.raw.*;
     wrong_revision.abi_revision = wire.ABI_REVISION - 1;
     if (sdk.Api.validate(&wrong_revision)) |_| return error.WrongRevisionAccepted else |err| {
         if (err != error.UnsupportedAbi) return err;
     }
+}
+
+fn revision4Accepts(raw: *const wire.ApiV1) bool {
+    return raw.struct_size == 136 and
+        raw.abi_version == wire.ABI_VERSION_V1 and
+        raw.abi_revision == 4;
 }
 
 fn readToolSse(a: std.mem.Allocator, path: []const u8) ![]u8 {

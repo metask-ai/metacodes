@@ -36,6 +36,8 @@ pub const Manifest = struct {
         binary_abi_status: []const u8,
         binary_abi_version: u32,
         binary_abi_revision: u32,
+        binary_abi_table_size: u32,
+        capabilities: u64,
     },
     files: []const FileEntry,
 };
@@ -110,7 +112,10 @@ pub fn validateManifest(manifest: Manifest, expected: Expected) Error!void {
     if (!std.mem.eql(u8, manifest.target.abi, expected.abi)) return error.TargetAbiMismatch;
     if (!std.mem.eql(u8, manifest.build.optimize, expected.optimize)) return error.OptimizeMismatch;
     if (manifest.build.strip != expected.strip) return error.StripMismatch;
-    if (manifest.contract.binary_abi_version != 1 or manifest.contract.binary_abi_revision != 4)
+    if (manifest.contract.binary_abi_version != 1 or
+        manifest.contract.binary_abi_revision != 5 or
+        manifest.contract.binary_abi_table_size != 168 or
+        manifest.contract.capabilities != 0xfff)
         return error.AbiMismatch;
     if (!std.mem.eql(u8, manifest.contract.binary_abi_status, "experimental")) return error.AbiStatusMismatch;
     const expected_link_inputs: []const []const u8 = if (std.mem.eql(u8, expected.os, "windows"))
@@ -213,7 +218,9 @@ fn validManifest() Manifest {
         .contract = .{
             .binary_abi_status = "experimental",
             .binary_abi_version = 1,
-            .binary_abi_revision = 4,
+            .binary_abi_revision = 5,
+            .binary_abi_table_size = 168,
+            .capabilities = 0xfff,
         },
         .files = &valid_files,
     };
@@ -323,6 +330,12 @@ test "manifest contract rejects toolchain target optimize and ABI drift" {
     try std.testing.expectError(error.AbiMismatch, validateManifest(manifest, valid_expected));
     manifest = validManifest();
     manifest.contract.binary_abi_revision = 1;
+    try std.testing.expectError(error.AbiMismatch, validateManifest(manifest, valid_expected));
+    manifest = validManifest();
+    manifest.contract.binary_abi_table_size = 136;
+    try std.testing.expectError(error.AbiMismatch, validateManifest(manifest, valid_expected));
+    manifest = validManifest();
+    manifest.contract.capabilities &= ~@as(u64, 1) << 11;
     try std.testing.expectError(error.AbiMismatch, validateManifest(manifest, valid_expected));
     manifest = validManifest();
     manifest.contract.binary_abi_status = "stable";

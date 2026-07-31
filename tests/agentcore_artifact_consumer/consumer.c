@@ -6,7 +6,7 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 4 must not retain pre-revision callback aliases"
+#error "revision 5 must not retain pre-revision callback aliases"
 #endif
 
 #ifdef _WIN32
@@ -301,14 +301,15 @@ int main(void) {
         return 10;
     }
     if (api->abi_revision != METASK_AGENTCORE_ABI_REVISION || api->reserved0 != 0 ||
-        (api->capabilities & METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1) !=
-            METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1 ||
+        api->capabilities != METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1 ||
         api->runtime_create == NULL || api->runtime_destroy == NULL ||
         api->runtime_query_skill_catalog == NULL ||
         api->skill_catalog_release == NULL ||
         api->session_create == NULL || api->session_destroy == NULL ||
-        api->session_refresh_skill_catalog == NULL ||
+        api->session_set_model == NULL || api->session_update_skills == NULL ||
+        api->session_update_permission_rules == NULL ||
         api->session_run_input == NULL || api->session_abort == NULL ||
+        api->session_compact == NULL || api->session_abort_compact == NULL ||
         api->buffer_release == NULL) {
         return 10;
     }
@@ -368,6 +369,37 @@ int main(void) {
         return release_error(api, &diagnostic, 15);
     }
     registered_session = session;
+
+    if (api->session_set_model(session, view("c-consumer-model-v2"),
+                               &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
+        stop_server(&server);
+        api->session_destroy(session, &diagnostic);
+        api->runtime_destroy(runtime, &diagnostic);
+        return release_error(api, &diagnostic, 16);
+    }
+    metask_agentcore_permission_rule_set_v1 empty_rules = {0};
+    empty_rules.struct_size = sizeof(empty_rules);
+    if (api->session_update_permission_rules(session, &empty_rules,
+                                             &diagnostic) != METASK_AGENTCORE_STATUS_OK) {
+        stop_server(&server);
+        api->session_destroy(session, &diagnostic);
+        api->runtime_destroy(runtime, &diagnostic);
+        return release_error(api, &diagnostic, 17);
+    }
+    metask_agentcore_compact_result_v1 compact_result = {0};
+    if (api->session_compact(session, 1, &compact_result,
+                             &diagnostic) != METASK_AGENTCORE_STATUS_OK ||
+        compact_result.struct_size != sizeof(compact_result) ||
+        compact_result.outcome_code != METASK_AGENTCORE_COMPACT_NO_CHANGE ||
+        api->session_abort_compact(session, 1, &diagnostic) !=
+            METASK_AGENTCORE_STATUS_TOO_LATE) {
+        stop_server(&server);
+        api->buffer_release(&diagnostic);
+        api->session_destroy(session, &diagnostic);
+        api->runtime_destroy(runtime, &diagnostic);
+        return release_error(api, &diagnostic, 18);
+    }
+    api->buffer_release(&diagnostic);
 
     uint32_t busy_status = api->runtime_destroy(runtime, &diagnostic);
     if (busy_status != METASK_AGENTCORE_STATUS_BUSY ||

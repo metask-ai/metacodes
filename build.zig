@@ -870,7 +870,7 @@ pub fn build(b: *std.Build) void {
         spike_step.dependOn(&run_t.step);
     }
 
-    // Focused Revision 4 gate. Keep Skill Runtime/adapter work independently
+    // Focused Revision 5 gate. Keep Skill Runtime/adapter work independently
     // runnable instead of forcing every unrelated spike/component artifact
     // through the broad `test` graph.
     const skill_runtime_step = b.step(

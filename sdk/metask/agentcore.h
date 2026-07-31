@@ -5,7 +5,7 @@
 #include <stddef.h>
 
 #if !defined(UINTPTR_MAX) || !defined(UINT64_MAX) || UINTPTR_MAX != UINT64_MAX
-#error "AgentCore ABI v1 revision 4 requires a 64-bit pointer ABI"
+#error "AgentCore ABI v1 revision 5 requires a 64-bit pointer ABI"
 #endif
 
 #ifdef __cplusplus
@@ -19,7 +19,7 @@ extern "C" {
  * change incompatibly between commits. Pin an exact bundle; its manifest
  * records the commit. */
 #define METASK_AGENTCORE_ABI_V1 1u
-#define METASK_AGENTCORE_ABI_REVISION 4u
+#define METASK_AGENTCORE_ABI_REVISION 5u
 
 #define METASK_AGENTCORE_STATUS_OK 0u
 #define METASK_AGENTCORE_STATUS_INVALID_ARGUMENT 1u
@@ -38,6 +38,7 @@ extern "C" {
 #define METASK_AGENTCORE_STATUS_INVALID_SKILL_ARGUMENTS 14u
 #define METASK_AGENTCORE_STATUS_SKILL_POLICY_VIOLATION 15u
 #define METASK_AGENTCORE_STATUS_SKILL_UNAVAILABLE 16u
+#define METASK_AGENTCORE_STATUS_STALE_COMPACT 17u
 
 #define METASK_AGENTCORE_PROVIDER_ANTHROPIC 1u
 #define METASK_AGENTCORE_PROVIDER_OPENAI 2u
@@ -75,10 +76,19 @@ extern "C" {
 #define METASK_AGENTCORE_MAX_SKILL_CATALOG_SKILLS_V1 1024ULL
 #define METASK_AGENTCORE_MAX_SKILL_ARGUMENT_VALUES_V1 64ULL
 #define METASK_AGENTCORE_MAX_SKILL_ARGUMENT_JSON_BYTES_V1 1048576ULL
+#define METASK_AGENTCORE_MAX_PERMISSION_RULES_V1 1024ULL
+#define METASK_AGENTCORE_MAX_PERMISSION_RULE_BYTES_V1 65536ULL
+#define METASK_AGENTCORE_MAX_PERMISSION_RULE_TOTAL_BYTES_V1 1048576ULL
 #define METASK_AGENTCORE_MAX_TURNS_V1 1000u
 
 #define METASK_AGENTCORE_RUN_INPUT_TEXT 1u
 #define METASK_AGENTCORE_RUN_INPUT_SKILL 2u
+#define METASK_AGENTCORE_SKILL_SELECTION_DISABLED 1u
+#define METASK_AGENTCORE_SKILL_SELECTION_ENABLED 2u
+#define METASK_AGENTCORE_COMPACT_COMPACTED 1u
+#define METASK_AGENTCORE_COMPACT_NO_CHANGE 2u
+#define METASK_AGENTCORE_COMPACT_DEGRADED 3u
+#define METASK_AGENTCORE_COMPACT_ABORTED 4u
 
 #define METASK_AGENTCORE_EVENT_CONTINUE 0u
 #define METASK_AGENTCORE_EVENT_FATAL 1u
@@ -99,12 +109,18 @@ extern "C" {
 #define METASK_AGENTCORE_CAP_ABORT (1ULL << 5)
 #define METASK_AGENTCORE_CAP_SKILL_CATALOG (1ULL << 6)
 #define METASK_AGENTCORE_CAP_TYPED_RUN_INPUT (1ULL << 7)
+#define METASK_AGENTCORE_CAP_SESSION_MODEL_MUTATION (1ULL << 8)
+#define METASK_AGENTCORE_CAP_MANUAL_COMPACT (1ULL << 9)
+#define METASK_AGENTCORE_CAP_SKILL_SELECTION (1ULL << 10)
+#define METASK_AGENTCORE_CAP_HOST_PERMISSION_RULES (1ULL << 11)
 #define METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1 \
     (METASK_AGENTCORE_CAP_RUNTIME | METASK_AGENTCORE_CAP_BUILTIN_TOOLS | METASK_AGENTCORE_CAP_HOST_SYNC_TOOLS | \
      METASK_AGENTCORE_CAP_HOST_UI | METASK_AGENTCORE_CAP_CORE_EVENTS_JSON | METASK_AGENTCORE_CAP_ABORT | \
-     METASK_AGENTCORE_CAP_SKILL_CATALOG | METASK_AGENTCORE_CAP_TYPED_RUN_INPUT)
+     METASK_AGENTCORE_CAP_SKILL_CATALOG | METASK_AGENTCORE_CAP_TYPED_RUN_INPUT | \
+     METASK_AGENTCORE_CAP_SESSION_MODEL_MUTATION | METASK_AGENTCORE_CAP_MANUAL_COMPACT | \
+     METASK_AGENTCORE_CAP_SKILL_SELECTION | METASK_AGENTCORE_CAP_HOST_PERMISSION_RULES)
 
-/* Every revision-4 struct_size must equal sizeof(the exact type), and all
+/* Every revision-5 struct_size must equal sizeof(the exact type), and all
  * reserved fields must be zero. Consumers pin ABI version, revision, table
  * size, and capabilities together. V1 remains experimental and later
  * revisions may intentionally be breaking. */
@@ -242,6 +258,31 @@ typedef struct {
     uint64_t reserved[3];
 } metask_agentcore_skill_catalog_query_v1;
 
+/* New Skills use default_state_code. Each listed catalog Skill ID uses the
+ * opposite state. The borrowed list must not contain duplicate or foreign
+ * IDs and is copied before session_create/session_update_skills returns. */
+typedef struct {
+    uint32_t struct_size;
+    uint32_t default_state_code;
+    const metask_agentcore_bytes_view_v1 *exception_skill_ids;
+    uint64_t exception_skill_id_count;
+    uint64_t reserved[4];
+} metask_agentcore_skill_selection_v1;
+
+/* Canonical Tool(specifier) rules are borrowed for one call. AgentCore
+ * validates, copies, and compiles the complete replacement atomically. */
+typedef struct {
+    uint32_t struct_size;
+    uint32_t reserved0;
+    const metask_agentcore_bytes_view_v1 *allow;
+    uint64_t allow_count;
+    const metask_agentcore_bytes_view_v1 *ask;
+    uint64_t ask_count;
+    const metask_agentcore_bytes_view_v1 *deny;
+    uint64_t deny_count;
+    uint64_t reserved[4];
+} metask_agentcore_permission_rule_set_v1;
+
 /* workspace_root is the execution base for relative paths used by the
  * supported built-in file tools and shell commands. It is not a filesystem
  * containment boundary: absolute paths remain valid unless the Host applies
@@ -268,10 +309,14 @@ typedef struct {
     metask_agentcore_bytes_view_v1 workspace_home;
     const metask_agentcore_bytes_view_v1 *allowed_tools;
     uint64_t allowed_tool_count;
-    /* NULL creates a text-only Session. A non-NULL catalog must belong to this
-     * Runtime and canonical Workspace binding. Model-invocable entries are
-     * projected through AgentCore's internal Skill tool on every Run. */
+    /* skill_catalog and skill_selection must both be NULL or both non-NULL.
+     * A catalog must belong to this Runtime and canonical Workspace binding.
+     * The selection is validated against that exact catalog. */
     metask_agentcore_skill_catalog *skill_catalog;
+    const metask_agentcore_skill_selection_v1 *skill_selection;
+    /* NULL means no imported rules. A non-NULL empty set has the same effective
+     * meaning and is useful for sharing construction code with updates. */
+    const metask_agentcore_permission_rule_set_v1 *permission_rules;
     uint64_t reserved[4];
 } metask_agentcore_session_config_v1;
 
@@ -303,6 +348,21 @@ typedef struct {
  * METASK_AGENTCORE_STATUS_OK. stop_reason_code is then one of METASK_AGENTCORE_STOP_END_TURN through
  * METASK_AGENTCORE_STOP_TOOL_LOOP. */
 
+typedef struct {
+    uint32_t struct_size;
+    uint32_t outcome_code;
+    uint64_t before_context_tokens;
+    uint64_t after_context_tokens;
+    uint64_t input_tokens;
+    uint64_t output_tokens;
+    uint64_t cache_read_input_tokens;
+    uint64_t cache_creation_input_tokens;
+    uint64_t reserved[4];
+} metask_agentcore_compact_result_v1;
+/* Fields are defined only when session_compact returns
+ * METASK_AGENTCORE_STATUS_OK. An accepted cancellation returns OK with
+ * METASK_AGENTCORE_COMPACT_ABORTED and does not commit Conversation changes. */
+
 typedef uint32_t (*metask_agentcore_runtime_create_fn_v1)(const metask_agentcore_runtime_config_v1 *, metask_agentcore_runtime **, metask_agentcore_owned_bytes_v1 *);
 typedef uint32_t (*metask_agentcore_runtime_destroy_fn_v1)(metask_agentcore_runtime *, metask_agentcore_owned_bytes_v1 *);
 typedef uint32_t (*metask_agentcore_runtime_query_skill_catalog_fn_v1)(
@@ -320,13 +380,25 @@ typedef uint32_t (*metask_agentcore_skill_catalog_release_fn_v1)(
     metask_agentcore_owned_bytes_v1 *);
 typedef uint32_t (*metask_agentcore_session_create_fn_v1)(metask_agentcore_runtime *, const metask_agentcore_session_config_v1 *, const metask_agentcore_session_callbacks_v1 *, metask_agentcore_session **, metask_agentcore_owned_bytes_v1 *);
 typedef uint32_t (*metask_agentcore_session_destroy_fn_v1)(metask_agentcore_session *, metask_agentcore_owned_bytes_v1 *);
-typedef uint32_t (*metask_agentcore_session_refresh_skill_catalog_fn_v1)(
+typedef uint32_t (*metask_agentcore_session_set_model_fn_v1)(
     metask_agentcore_session *,
-    metask_agentcore_skill_catalog *,
+    metask_agentcore_bytes_view_v1,
     metask_agentcore_owned_bytes_v1 *);
-/* STALE_CATALOG is pre-admission: query a new catalog, re-resolve the Skill,
- * wait for Session idle, refresh, release the Host catalog handle, and retry
- * with the same run_id and new catalog_revision. */
+typedef uint32_t (*metask_agentcore_session_update_skills_fn_v1)(
+    metask_agentcore_session *,
+    metask_agentcore_skill_catalog *optional_catalog,
+    const metask_agentcore_skill_selection_v1 *,
+    metask_agentcore_owned_bytes_v1 *);
+typedef uint32_t (*metask_agentcore_session_update_permission_rules_fn_v1)(
+    metask_agentcore_session *,
+    const metask_agentcore_permission_rule_set_v1 *,
+    metask_agentcore_owned_bytes_v1 *);
+/* session_set_model performs no remote probe. STATUS_OK means only that the
+ * owned local model/provider state was replaced; the next Run reports an
+ * unavailable model as METASK_AGENTCORE_STOP_API_ERROR without poisoning the
+ * Session. update_skills requires a selection. A NULL optional_catalog keeps
+ * the current catalog without discovery; it is INVALID_STATE if none is bound.
+ * All three mutations require an idle, usable Session and commit atomically. */
 
 /* run_id is Host-assigned, non-zero, and scoped to one Session. Each admitted
  * Run must use a value strictly greater than that Session's previously
@@ -354,6 +426,24 @@ typedef uint32_t (*metask_agentcore_session_abort_fn_v1)(
     metask_agentcore_session *session,
     uint64_t run_id,
     uint32_t reason_code,
+    metask_agentcore_owned_bytes_v1 *out_diagnostic);
+
+/* operation_id is Host-assigned, non-zero, and strictly increasing in the
+ * Session compact ID space. Zero is INVALID_ARGUMENT and an ID not greater
+ * than the last admitted compact is STALE_COMPACT. Pre-admission rejection
+ * does not consume the ID; every admitted terminal path does. */
+typedef uint32_t (*metask_agentcore_session_compact_fn_v1)(
+    metask_agentcore_session *session,
+    uint64_t operation_id,
+    metask_agentcore_compact_result_v1 *out_result,
+    metask_agentcore_owned_bytes_v1 *out_diagnostic);
+/* For an active compact: equal requests cancellation, lower is STALE_COMPACT,
+ * higher is INVALID_ARGUMENT. When idle: the last terminal ID is TOO_LATE,
+ * lower is STALE_COMPACT, and every other ID is INVALID_ARGUMENT. Cancellation
+ * is propagated to in-flight provider I/O and does not wait for its response. */
+typedef uint32_t (*metask_agentcore_session_abort_compact_fn_v1)(
+    metask_agentcore_session *session,
+    uint64_t operation_id,
     metask_agentcore_owned_bytes_v1 *out_diagnostic);
 
 /* session_run_input failures before admission (invalid input, resource limit,
@@ -391,15 +481,20 @@ typedef struct {
     metask_agentcore_skill_catalog_release_fn_v1 skill_catalog_release;
     metask_agentcore_session_create_fn_v1 session_create;
     metask_agentcore_session_destroy_fn_v1 session_destroy;
-    metask_agentcore_session_refresh_skill_catalog_fn_v1 session_refresh_skill_catalog;
+    metask_agentcore_session_set_model_fn_v1 session_set_model;
+    metask_agentcore_session_update_skills_fn_v1 session_update_skills;
+    metask_agentcore_session_update_permission_rules_fn_v1 session_update_permission_rules;
     metask_agentcore_session_run_input_fn_v1 session_run_input;
     metask_agentcore_session_abort_fn_v1 session_abort;
+    metask_agentcore_session_compact_fn_v1 session_compact;
+    metask_agentcore_session_abort_compact_fn_v1 session_abort_compact;
     metask_agentcore_buffer_release_fn_v1 buffer_release;
     uint64_t reserved[4];
 } metask_agentcore_api_v1;
 
-/* Runtime outlives its Sessions. Runs are synchronous and one-at-a-time per
- * Session. Different Sessions may run and invoke shared callbacks concurrently.
+/* Runtime outlives its Sessions. Run, compact, model mutation, Skill mutation,
+ * permission-rule mutation, and destroy are mutually exclusive per Session.
+ * Different Sessions may run and invoke shared callbacks concurrently.
  * A Host tool may also be invoked concurrently within one Session. Callbacks
  * may request abort; re-entered run or destroy returns BUSY. A callback must
  * not wait or spin for that operation. C++ exceptions, longjmp, and all other
@@ -426,11 +521,14 @@ METASK_AGENTCORE_STATIC_ASSERT(sizeof(metask_agentcore_host_tool_v1) == 96, "met
 METASK_AGENTCORE_STATIC_ASSERT(sizeof(metask_agentcore_runtime_config_v1) == 72, "metask_agentcore_runtime_config_v1 layout");
 METASK_AGENTCORE_STATIC_ASSERT(sizeof(metask_agentcore_session_callbacks_v1) == 72, "metask_agentcore_session_callbacks_v1 layout");
 METASK_AGENTCORE_STATIC_ASSERT(sizeof(metask_agentcore_skill_catalog_query_v1) == 80, "metask_agentcore_skill_catalog_query_v1 layout");
+METASK_AGENTCORE_STATIC_ASSERT(sizeof(metask_agentcore_skill_selection_v1) == 56, "metask_agentcore_skill_selection_v1 layout");
+METASK_AGENTCORE_STATIC_ASSERT(sizeof(metask_agentcore_permission_rule_set_v1) == 88, "metask_agentcore_permission_rule_set_v1 layout");
 METASK_AGENTCORE_STATIC_ASSERT(sizeof(metask_agentcore_run_input_v1) == 104, "metask_agentcore_run_input_v1 layout");
-METASK_AGENTCORE_STATIC_ASSERT(sizeof(metask_agentcore_session_config_v1) == 152, "metask_agentcore_session_config_v1 layout");
+METASK_AGENTCORE_STATIC_ASSERT(sizeof(metask_agentcore_session_config_v1) == 168, "metask_agentcore_session_config_v1 layout");
 METASK_AGENTCORE_STATIC_ASSERT(sizeof(metask_agentcore_run_options_v1) == 40, "metask_agentcore_run_options_v1 layout");
 METASK_AGENTCORE_STATIC_ASSERT(sizeof(metask_agentcore_run_result_v1) == 48, "metask_agentcore_run_result_v1 layout");
-METASK_AGENTCORE_STATIC_ASSERT(sizeof(metask_agentcore_api_v1) == 136, "metask_agentcore_api_v1 layout");
+METASK_AGENTCORE_STATIC_ASSERT(sizeof(metask_agentcore_compact_result_v1) == 88, "metask_agentcore_compact_result_v1 layout");
+METASK_AGENTCORE_STATIC_ASSERT(sizeof(metask_agentcore_api_v1) == 168, "metask_agentcore_api_v1 layout");
 METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_run_context_v1, session) == 8, "metask_agentcore_run_context_v1.session offset");
 METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_run_context_v1, run_id) == 16, "metask_agentcore_run_context_v1.run_id offset");
 METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_run_context_v1, session_id) == 24, "metask_agentcore_run_context_v1.session_id offset");
@@ -438,14 +536,28 @@ METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_host_tool_v1, ctx) == 8
 METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_session_config_v1, api_key) == 16, "metask_agentcore_session_config_v1.api_key offset");
 METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_session_config_v1, allowed_tools) == 96, "metask_agentcore_session_config_v1.allowed_tools offset");
 METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_session_config_v1, skill_catalog) == 112, "metask_agentcore_session_config_v1.skill_catalog offset");
+METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_session_config_v1, skill_selection) == 120, "metask_agentcore_session_config_v1.skill_selection offset");
+METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_session_config_v1, permission_rules) == 128, "metask_agentcore_session_config_v1.permission_rules offset");
+METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_skill_selection_v1, exception_skill_ids) == 8, "metask_agentcore_skill_selection_v1.exception_skill_ids offset");
+METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_permission_rule_set_v1, allow) == 8, "metask_agentcore_permission_rule_set_v1.allow offset");
+METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_permission_rule_set_v1, ask) == 24, "metask_agentcore_permission_rule_set_v1.ask offset");
+METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_permission_rule_set_v1, deny) == 40, "metask_agentcore_permission_rule_set_v1.deny offset");
+METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_compact_result_v1, before_context_tokens) == 8, "metask_agentcore_compact_result_v1.before_context_tokens offset");
+METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_compact_result_v1, input_tokens) == 24, "metask_agentcore_compact_result_v1.input_tokens offset");
 METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_skill_catalog_query_v1, workspace_epoch) == 40, "metask_agentcore_skill_catalog_query_v1.workspace_epoch offset");
 METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_run_input_v1, arguments_json) == 56, "metask_agentcore_run_input_v1.arguments_json offset");
 METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_api_v1, abi_revision) == 8, "metask_agentcore_api_v1.abi_revision offset");
 METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_api_v1, capabilities) == 16, "metask_agentcore_api_v1.capabilities offset");
 METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_api_v1, runtime_create) == 24, "metask_agentcore_api_v1.runtime_create offset");
 METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_api_v1, runtime_query_skill_catalog) == 40, "metask_agentcore_api_v1.runtime_query_skill_catalog offset");
-METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_api_v1, session_refresh_skill_catalog) == 72, "metask_agentcore_api_v1.session_refresh_skill_catalog offset");
-METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_api_v1, session_run_input) == 80, "metask_agentcore_api_v1.session_run_input offset");
+METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_api_v1, session_set_model) == 72, "metask_agentcore_api_v1.session_set_model offset");
+METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_api_v1, session_update_skills) == 80, "metask_agentcore_api_v1.session_update_skills offset");
+METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_api_v1, session_update_permission_rules) == 88, "metask_agentcore_api_v1.session_update_permission_rules offset");
+METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_api_v1, session_run_input) == 96, "metask_agentcore_api_v1.session_run_input offset");
+METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_api_v1, session_compact) == 112, "metask_agentcore_api_v1.session_compact offset");
+METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_api_v1, session_abort_compact) == 120, "metask_agentcore_api_v1.session_abort_compact offset");
+METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_api_v1, buffer_release) == 128, "metask_agentcore_api_v1.buffer_release offset");
+METASK_AGENTCORE_STATIC_ASSERT(offsetof(metask_agentcore_api_v1, reserved) == 136, "metask_agentcore_api_v1.reserved offset");
 
 #undef METASK_AGENTCORE_STATIC_ASSERT
 

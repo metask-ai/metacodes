@@ -9,35 +9,35 @@ ABI v1 is an experimental in-process embedding contract for synchronous,
 stateful AgentSession execution. It does not expose or define a host product
 model.
 
-**Status: experimental — freeze retracted on 2026-07-17.** V1 was frozen on
-2026-07-17 and unfrozen the same week: consumer feedback exposed a design gap
-in the callback identity surface (Host tools receive a `session_id`
-correlation key that no v1 API lets the Host obtain, and callbacks do not
-carry a unified admitted-Run context). Freezing a surface with a dangling
-reference was premature; retracting the label now, while exposure is minimal,
-was judged cheaper than carrying the flaw forever.
+**Status: experimental.** The premature 2026-07-17 freeze was retracted after
+consumer feedback exposed a dangling callback-identity contract. Revision 5
+now freezes one exact hard-cut wire shape after the missing Session seams were
+implemented and tested; this is not a general v1 stability promise.
 
-While experimental, v1 makes no stability promise: layouts, numeric values,
-function-table order, and semantics may change incompatibly between commits.
 Consumers must pin an exact bundle (the manifest records the source commit)
-and treat every update as potentially breaking. No near-term re-freeze is
-planned.
+and treat a different revision as incompatible. Layouts, numeric values,
+function-table order, and semantics may change only through another explicit
+revision cut while v1 remains experimental.
 
-The current experimental bundle is **ABI v1 revision 4**. Revision 4 is an
-in-place breaking cut that adds a Session-independent immutable Skill catalog
-and a typed `TextInput | SkillInvocation` Run entry while closing the A1/A3/A4
-and B1–B4 contract gaps:
+The current experimental bundle is **ABI v1 revision 5**. Revision 5 is a
+hard-cut replacement for Revision 4. It adds controlled long-lived Session
+model mutation, manual Conversation compact, Skill availability updates, and
+Host-owned permission-rule import:
 
-- `metask_agentcore_api_v1` is 136 bytes and requires `abi_revision == 4`;
-- `SkillCatalogQueryV1`, `RunInputV1`, and `SessionConfigV1` are respectively
-  80, 104, and 152 bytes;
-- `runtime_query_skill_catalog`, `skill_catalog_release`,
-  `session_refresh_skill_catalog`, and `session_run_input` are mandatory;
-- `CAP_SKILL_CATALOG` and `CAP_TYPED_RUN_INPUT` are required;
-- `manifest.json` records `binary_abi_revision: 4`.
+- `metask_agentcore_api_v1` is 168 bytes and requires `abi_revision == 5`;
+- `SessionConfigV1`, `SkillSelectionV1`, `PermissionRuleSetV1`, and
+  `CompactResultV1` are respectively 168, 56, 88, and 88 bytes;
+- `session_set_model`, `session_update_skills`,
+  `session_update_permission_rules`, `session_compact`, and
+  `session_abort_compact` are mandatory;
+- the Revision 4 `session_refresh_skill_catalog` entry does not exist;
+- the exact required capability set is `0x0fff`;
+- `manifest.json` records revision 5, table size 168, and capability set
+  `0x0fff`.
 
-Revision 4 provides no Revision 3 compatibility. Consumers update the header,
-SDK, manifest, and library atomically, validate the stable
+Revision 5 provides no Revision 4 compatibility, shim, dual dispatch, or old
+table layout. Consumers update the header, SDK, manifest, and library
+atomically, validate the stable
 `struct_size`/`abi_version` prefix before reading later fields, then require
 exact revision, table size, capability, reserved-field, and function-identity
 matches. Every per-Run callback validates and copies any retained `RunContext`
@@ -259,7 +259,7 @@ Events describe observations, not commands. A Host may render, aggregate,
 persist, or ignore them; consuming an event never drives the core execution
 loop.
 
-`on_event` is mandatory in Revision 4. To reconstruct final visible assistant
+`on_event` is mandatory in Revision 5. To reconstruct final visible assistant
 output, a Host accumulates only closed segments: `text_chunk` appends to the
 current segment and `stream_done` closes it. `tool_start` and `tool_result` are
 semantic boundaries that discard any unclosed segment and all previously
@@ -484,7 +484,7 @@ synchronous within the same Host Run and projects its public text and usage
 through the ordinary event stream. The provider tool name `Skill` is reserved:
 Runtime creation rejects a Host tool with that name.
 
-Fork children cannot suspend for Host UI interaction in Revision 4. Their UI
+Fork children cannot suspend for Host UI interaction in Revision 5. Their UI
 requester is unavailable, so a child question or permission request fails
 closed as an ordinary fork/tool failure attributed to the outer Run. Inline
 execution may use the outer Run's synchronous UI callback.
@@ -637,19 +637,21 @@ reliable automatic classification.
 ### ABI evolution
 
 All v1 POD descriptors and the API table require their exact documented
-`struct_size`; every reserved field must be zero. During the current unfrozen
-experimental period, a breaking v1 bundle increments `abi_revision` and
-consumers accept only the exact revision they were built against. Reserved
-storage is not permission to infer compatibility. After v1 is genuinely
-re-frozen, later layout, function-table, or control-message extensions require
-`metask_agentcore_get_api(2)` and v2 types.
+`struct_size`; every reserved field must be zero. Revision 5 freezes one exact
+experimental cut. A later breaking v1 bundle must increment `abi_revision`,
+and consumers accept only the exact revision they were built against.
+Reserved storage is not permission to infer compatibility. After v1 is
+genuinely stabilized, later layout, function-table, or control-message
+extensions require `metask_agentcore_get_api(2)` and v2 types.
 
-Revision 4's published POD offsets and sizes require a 64-bit pointer ABI.
+Revision 5's published POD offsets and sizes require a 64-bit pointer ABI.
 The header rejects 32-bit consumers at compile time; a future 32-bit contract
 would need separately specified layouts and consumer gates.
 
 `capabilities` reports the API surface implemented by the returned library
-table. It is not per-Runtime or per-Session negotiation; concrete Runtime and
+table. Revision 5 consumers require exact equality with
+`METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1`; it is not an extensible superset
+check. It is not per-Runtime or per-Session negotiation; concrete Runtime and
 Session configuration still determines which tools and callbacks are active.
 
 ABI v1 deliberately does not add a slash/Command ABI, session
