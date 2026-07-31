@@ -9,6 +9,7 @@ const ui_request = core.protocol.ui_request;
 pub const protocol_v1 = @import("protocol_v1.zig");
 const skill_runtime = core.skills_runtime;
 pub const skill_catalog = skill_runtime.catalog;
+pub const skill_availability = skill_runtime.availability;
 pub const skill_catalog_handles = @import("skill_catalog_handles.zig");
 pub const skill_activation = skill_runtime.activation;
 pub const skill_materialization = skill_runtime.materialization;
@@ -161,6 +162,55 @@ const AbiRuntime = struct {
     }
 };
 
+const SkillBinding = struct {
+    cell: *skill_catalog_handles.CatalogCell,
+    selection: skill_availability.Selection,
+
+    fn snapshot(self: *const SkillBinding) *const skill_catalog.Snapshot {
+        return self.cell.snapshot;
+    }
+
+    fn view(self: *const SkillBinding) skill_availability.View {
+        return .{ .selected = &self.selection };
+    }
+
+    fn deinit(
+        self: *SkillBinding,
+        catalogs: *skill_catalog_handles.RuntimeCatalogs,
+    ) void {
+        self.selection.deinit();
+        catalogs.releaseSession(self.cell);
+        self.* = undefined;
+    }
+};
+
+fn createInitialSkillBinding(
+    runtime: *AbiRuntime,
+    workspace_scope_id: *const [64]u8,
+    optional_host: ?*const skill_catalog_handles.HostCatalog,
+    optional_spec: ?*const skill_availability.Spec,
+) !?SkillBinding {
+    var runtime_call = try runtime.catalogs.enterCall();
+    defer runtime_call.deinit();
+    if ((optional_host == null) != (optional_spec == null))
+        return error.InvalidSkillBinding;
+    const host = optional_host orelse return null;
+    const spec = optional_spec.?;
+    const cell = try runtime.catalogs.retainForSession(
+        host,
+        workspace_scope_id,
+    );
+    errdefer runtime.catalogs.releaseSession(cell);
+    return .{
+        .cell = cell,
+        .selection = try skill_availability.Selection.init(
+            allocator,
+            cell.snapshot,
+            spec.*,
+        ),
+    };
+}
+
 const AbiSession = struct {
     const CallState = enum { idle, running, mutating, destroying };
 
@@ -170,7 +220,7 @@ const AbiSession = struct {
     core_session: *core.agent_session.AgentSession,
     runtime: ?*AbiRuntime = null,
     workspace_scope_id: [64]u8 = [_]u8{0} ** 64,
-    skill_catalog_cell: ?*skill_catalog_handles.CatalogCell = null,
+    skill_binding: ?SkillBinding = null,
     /// Null only in narrow unit-test fakes. Every live Session created through
     /// the ABI owns exactly one immutable baseline frame.
     policy_root: ?*policy_frame.PolicyFrame = null,
@@ -358,23 +408,57 @@ const AbiSession = struct {
         self.call_state = .idle;
     }
 
-    fn refreshCatalog(
+    fn updateSkills(
         self: *AbiSession,
-        host: *const skill_catalog_handles.HostCatalog,
+        optional_host: ?*const skill_catalog_handles.HostCatalog,
+        spec: skill_availability.Spec,
     ) !void {
+        if (self.facade_poisoned.load(.acquire))
+            return error.InvalidSessionState;
         const runtime = self.runtime orelse return error.InvalidSessionState;
         var runtime_call = try runtime.catalogs.enterCall();
         defer runtime_call.deinit();
         if (!self.tryBeginMutation()) return error.SessionBusy;
         defer self.finishMutation();
 
-        const replacement = try runtime.catalogs.retainForSession(
-            host,
-            &self.workspace_scope_id,
+        if (optional_host) |host| {
+            const replacement_cell = try runtime.catalogs.retainForSession(
+                host,
+                &self.workspace_scope_id,
+            );
+            errdefer runtime.catalogs.releaseSession(replacement_cell);
+            var replacement_selection = try skill_availability.Selection.init(
+                allocator,
+                replacement_cell.snapshot,
+                spec,
+            );
+            errdefer replacement_selection.deinit();
+
+            const previous = self.skill_binding;
+            self.skill_binding = .{
+                .cell = replacement_cell,
+                .selection = replacement_selection,
+            };
+            if (previous) |binding_value| {
+                var binding = binding_value;
+                binding.deinit(&runtime.catalogs);
+            }
+            return;
+        }
+
+        const snapshot = if (self.skill_binding) |*binding|
+            binding.snapshot()
+        else
+            return error.SkillCatalogNotBound;
+        const replacement_selection = try skill_availability.Selection.init(
+            allocator,
+            snapshot,
+            spec,
         );
-        const previous = self.skill_catalog_cell;
-        self.skill_catalog_cell = replacement;
-        if (previous) |cell| runtime.catalogs.releaseSession(cell);
+        const previous_selection = self.skill_binding.?.selection;
+        self.skill_binding.?.selection = replacement_selection;
+        var previous = previous_selection;
+        previous.deinit();
     }
 
     /// Internal Revision 5 adapter. The public wire entry point is frozen only
@@ -387,7 +471,7 @@ const AbiSession = struct {
         try self.core_session.setModel(model);
     }
 
-    /// Internal typed-Skill entry used by the Revision 4 public input union.
+    /// Internal typed-Skill entry used by the Revision 5 public input union.
     /// All validation before `admitMaterializedSkill` is side-effect free.
     fn runSkill(
         self: *AbiSession,
@@ -398,13 +482,13 @@ const AbiSession = struct {
         arguments_json: []const u8,
         max_turns: u32,
     ) anyerror!SkillExecution {
-        const cell = self.skill_catalog_cell orelse
+        const binding = if (self.skill_binding) |*value| value else
             return error.SkillCatalogNotBound;
         const root_frame = self.policy_root orelse
             return error.InvalidSessionState;
         var plan = try skill_activation.prepare(
             allocator,
-            cell.snapshot,
+            binding.snapshot(),
             catalog_revision,
             skill_id,
             arguments_json,
@@ -412,6 +496,7 @@ const AbiSession = struct {
                 .context = .external_run_root,
                 .shell_policy = root_frame.shellPolicy(),
                 .model_override_capability = .forbidden,
+                .availability = binding.view(),
             },
         );
         defer plan.deinit();
@@ -443,7 +528,7 @@ const AbiSession = struct {
         prompt: []const u8,
         max_turns: u32,
     ) anyerror!SkillExecution {
-        const cell = self.skill_catalog_cell orelse {
+        const binding = if (self.skill_binding) |*value| value else {
             return .{ .completed = try self.core_session.runText(
                 run_id,
                 prompt,
@@ -452,7 +537,10 @@ const AbiSession = struct {
             ) };
         };
         if (!materializations.supportsExactFileModes() or
-            !model_skill_tool.Environment.hasModelInvocable(cell.snapshot))
+            !model_skill_tool.Environment.hasModelInvocable(
+                binding.snapshot(),
+                binding.view(),
+            ))
         {
             return .{ .completed = try self.core_session.runText(
                 run_id,
@@ -471,7 +559,8 @@ const AbiSession = struct {
             .allocator = allocator,
             .session = self.core_session,
             .materializations = materializations,
-            .snapshot = cell.snapshot,
+            .snapshot = binding.snapshot(),
+            .availability = binding.view(),
             .identity = identity,
             .base_frame = root_frame,
             .abort = &self.core_session.abort_signal,
@@ -602,17 +691,21 @@ const MaterializedSkillRun = struct {
             return .aborted;
         }
 
-        const cell = self.facade.skill_catalog_cell orelse {
+        const binding = if (self.facade.skill_binding) |*value| value else {
             _ = try self.finishWithoutConversation();
             return error.InvalidSessionState;
         };
         var environment: ?model_skill_tool.Environment =
-            if (model_skill_tool.Environment.hasModelInvocable(cell.snapshot))
+            if (model_skill_tool.Environment.hasModelInvocable(
+                binding.snapshot(),
+                binding.view(),
+            ))
                 model_skill_tool.Environment.init(.{
                     .allocator = allocator,
                     .session = self.admitted.session,
                     .materializations = self.materializations,
-                    .snapshot = cell.snapshot,
+                    .snapshot = binding.snapshot(),
+                    .availability = binding.view(),
                     .identity = self.admitted.identity(),
                     .base_frame = self.activation.frame,
                     .abort = @constCast(self.admitted.abortSignal()),
@@ -765,15 +858,19 @@ const ForkExecutorContext = struct {
                 .host_session_ctx = host_ctx,
             } else null;
         const child_depth = try childDepth(self.activation.parent_agent_depth);
-        const cell = self.facade.skill_catalog_cell orelse
+        const binding = if (self.facade.skill_binding) |*value| value else
             return error.InvalidSessionState;
         var environment: ?model_skill_tool.Environment =
-            if (model_skill_tool.Environment.hasModelInvocable(cell.snapshot))
+            if (model_skill_tool.Environment.hasModelInvocable(
+                binding.snapshot(),
+                binding.view(),
+            ))
                 try model_skill_tool.Environment.init(.{
                     .allocator = output_allocator,
                     .session = self.session,
                     .materializations = self.materializations,
-                    .snapshot = cell.snapshot,
+                    .snapshot = binding.snapshot(),
+                    .availability = binding.view(),
                     .identity = identity,
                     .base_frame = self.activation.frame,
                     .abort = @constCast(abort),
@@ -1068,7 +1165,7 @@ fn skillRunErrorStatus(self: *const AbiSession, err: anyerror) u32 {
         error.StaleCatalog => wire.STATUS_STALE_CATALOG,
         error.SkillNotFound => wire.STATUS_SKILL_NOT_FOUND,
         error.InvalidArguments => wire.STATUS_INVALID_SKILL_ARGUMENTS,
-        error.PolicyViolation => wire.STATUS_SKILL_POLICY_VIOLATION,
+        error.PolicyViolation, error.SkillDisabled => wire.STATUS_SKILL_POLICY_VIOLATION,
         error.SkillUnavailable, error.ModelOverrideUnavailable => wire.STATUS_SKILL_UNAVAILABLE,
         error.AgentCoreModelBindingViolation => wire.STATUS_INTERNAL_ERROR,
         error.UnsupportedFilesystem => wire.STATUS_SKILL_UNAVAILABLE,
@@ -1455,16 +1552,25 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     defer workspace.deinit();
     const workspace_scope_id = runtime.catalogs.scopeId(&workspace) catch |err|
         return failError(catalogLifecycleStatus(err), err, out_error);
-    const retained_catalog = if (config.skill_catalog) |catalog_handle|
-        runtime.catalogs.retainForSession(
-            catalogFrom(catalog_handle),
-            &workspace_scope_id,
-        ) catch |err| return failError(catalogLifecycleStatus(err), err, out_error)
-    else
-        null;
-    var keep_catalog = false;
-    defer if (!keep_catalog) if (retained_catalog) |cell|
-        runtime.catalogs.releaseSession(cell);
+    var initial_binding = createInitialSkillBinding(
+        runtime,
+        &workspace_scope_id,
+        if (config.skill_catalog) |catalog_handle|
+            catalogFrom(catalog_handle)
+        else
+            null,
+        null,
+    ) catch |err| return failError(
+        if (err == error.InvalidSkillBinding)
+            wire.STATUS_INVALID_ARGUMENT
+        else
+            catalogLifecycleStatus(err),
+        err,
+        out_error,
+    );
+    var keep_binding = false;
+    defer if (!keep_binding) if (initial_binding) |*binding|
+        binding.deinit(&runtime.catalogs);
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
     const allowed = borrowedViews(
@@ -1489,7 +1595,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     self.facade_poisoned = .init(false);
     self.runtime = runtime;
     self.workspace_scope_id = workspace_scope_id;
-    self.skill_catalog_cell = retained_catalog;
+    self.skill_binding = initial_binding;
     self.policy_root = null;
     self.host_permission_rules = .{};
     self.call_mutex = .{};
@@ -1532,7 +1638,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
         );
     };
     out.* = self.handle();
-    keep_catalog = true;
+    keep_binding = true;
     return wire.STATUS_OK;
 }
 
@@ -1553,9 +1659,9 @@ fn sessionDestroy(handle: ?*wire.SessionHandle, out_error: ?*wire.OwnedBytesV1) 
         root_frame.release();
         self.policy_root = null;
     }
-    if (self.skill_catalog_cell) |cell| {
-        runtime.catalogs.releaseSession(cell);
-        self.skill_catalog_cell = null;
+    if (self.skill_binding) |*binding| {
+        binding.deinit(&runtime.catalogs);
+        self.skill_binding = null;
     }
     self.host_permission_rules.deinit();
     allocator.destroy(self);
@@ -1568,15 +1674,15 @@ fn sessionRefreshSkillCatalog(
     out_error: ?*wire.OwnedBytesV1,
 ) callconv(.c) u32 {
     emptyError(out_error);
-    const self = sessionFrom(handle orelse
+    _ = sessionFrom(handle orelse
         return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
-    const catalog = catalogFrom(catalog_handle orelse
+    _ = catalogFrom(catalog_handle orelse
         return fail(wire.STATUS_INVALID_ARGUMENT, "Skill catalog is required", out_error));
-    if (self.facade_poisoned.load(.acquire))
-        return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
-    self.refreshCatalog(catalog) catch |err|
-        return failError(catalogLifecycleStatus(err), err, out_error);
-    return wire.STATUS_OK;
+    return fail(
+        wire.STATUS_INVALID_ARGUMENT,
+        "Revision 5 requires session_update_skills with an explicit selection",
+        out_error,
+    );
 }
 
 fn sessionRunInput(
@@ -2521,7 +2627,7 @@ test "AbiSession model mutation delegates atomically through the shared gate" {
         HostPermissionRules.Decision.allow,
         session.host_permission_rules.lookup("Read").?,
     );
-    try std.testing.expect(session.skill_catalog_cell == null);
+    try std.testing.expect(session.skill_binding == null);
     try std.testing.expectEqual(AbiSession.CallState.idle, session.call_state);
 
     session.call_state = .running;
@@ -2534,7 +2640,7 @@ test "AbiSession model mutation delegates atomically through the shared gate" {
     try std.testing.expectEqualStrings("missing-model-is-locally-valid", native_session.model);
 }
 
-test "Session catalog refresh is idle-only atomic replacement with rollback" {
+test "Session Skill selection update is explicit atomic and selection-only" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2570,7 +2676,35 @@ test "Session catalog refresh is idle-only atomic replacement with rollback" {
     const second_host = try runtime.catalogs.query(io, &workspace, "second", &.{}, .{});
     const foreign_host = try other_runtime.catalogs.query(io, &workspace, "foreign", &.{}, .{});
     defer foreign_host.release() catch unreachable;
-    const first_cell = try runtime.catalogs.retainForSession(first_host, &scope_id);
+    const all_enabled = skill_availability.Spec{
+        .default_state = .enabled,
+        .exceptions = &.{},
+    };
+    try std.testing.expect((try createInitialSkillBinding(
+        &runtime,
+        &scope_id,
+        null,
+        null,
+    )) == null);
+    try std.testing.expectError(error.InvalidSkillBinding, createInitialSkillBinding(
+        &runtime,
+        &scope_id,
+        first_host,
+        null,
+    ));
+    try std.testing.expectError(error.InvalidSkillBinding, createInitialSkillBinding(
+        &runtime,
+        &scope_id,
+        null,
+        &all_enabled,
+    ));
+    const initial_binding = (try createInitialSkillBinding(
+        &runtime,
+        &scope_id,
+        first_host,
+        &all_enabled,
+    )).?;
+    const first_cell = initial_binding.cell;
     try first_host.release();
 
     var session = AbiSession{
@@ -2580,28 +2714,170 @@ test "Session catalog refresh is idle-only atomic replacement with rollback" {
         .core_session = undefined,
         .runtime = &runtime,
         .workspace_scope_id = scope_id,
-        .skill_catalog_cell = first_cell,
+        .skill_binding = initial_binding,
     };
 
     session.call_state = .running;
-    try std.testing.expectError(error.SessionBusy, session.refreshCatalog(second_host));
-    try std.testing.expect(session.skill_catalog_cell == first_cell);
+    try std.testing.expectError(error.SessionBusy, session.updateSkills(second_host, all_enabled));
+    try std.testing.expect(session.skill_binding.?.cell == first_cell);
     session.call_state = .idle;
-    try std.testing.expectError(error.WrongRuntime, session.refreshCatalog(foreign_host));
-    try std.testing.expect(session.skill_catalog_cell == first_cell);
+    session.facade_poisoned.store(true, .release);
+    try std.testing.expectError(
+        error.InvalidSessionState,
+        session.updateSkills(null, all_enabled),
+    );
+    session.facade_poisoned.store(false, .release);
+    try std.testing.expectError(error.WrongRuntime, session.updateSkills(foreign_host, all_enabled));
+    try std.testing.expect(session.skill_binding.?.cell == first_cell);
+
+    const foreign_id = [_]u8{'f'} ** 64;
+    const invalid_exceptions = [_]skill_availability.Exception{
+        .{ .skill_id = &foreign_id, .state = .disabled },
+    };
+    try std.testing.expectError(error.ResourceLimit, session.updateSkills(null, .{
+        .default_state = .enabled,
+        .exceptions = &invalid_exceptions,
+    }));
+    try std.testing.expect(session.skill_binding.?.cell == first_cell);
+    try std.testing.expectError(error.ResourceLimit, session.updateSkills(second_host, .{
+        .default_state = .enabled,
+        .exceptions = &invalid_exceptions,
+    }));
+    try std.testing.expect(session.skill_binding.?.cell == first_cell);
+    try std.testing.expectEqual(@as(usize, 1), second_host.cell.references);
+
+    try session.updateSkills(null, .{
+        .default_state = .disabled,
+        .exceptions = &.{},
+    });
+    try std.testing.expect(session.skill_binding.?.cell == first_cell);
+    try std.testing.expectEqual(@as(usize, 1), first_cell.references);
 
     const second_cell = second_host.cell;
-    try session.refreshCatalog(second_host);
-    try std.testing.expect(session.skill_catalog_cell == second_cell);
+    try session.updateSkills(second_host, all_enabled);
+    try std.testing.expect(session.skill_binding.?.cell == second_cell);
     try std.testing.expectEqual(@as(usize, 2), second_cell.references);
     try second_host.release();
 
     var call = try runtime.catalogs.enterCall();
-    runtime.catalogs.releaseSession(session.skill_catalog_cell.?);
-    session.skill_catalog_cell = null;
+    session.skill_binding.?.deinit(&runtime.catalogs);
+    session.skill_binding = null;
     call.deinit();
+    try std.testing.expectError(
+        error.SkillCatalogNotBound,
+        session.updateSkills(null, all_enabled),
+    );
     try runtime.catalogs.tryBeginDestroy();
     runtime.catalogs.finishDestroy();
+}
+
+test "disabled AgentCore Skill fails before admission and materialization" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const cwd = root_buffer[0..root_len];
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{} },
+    );
+    defer native_runtime.destroy() catch unreachable;
+    const native_session = try native_runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
+    });
+    defer native_session.destroy() catch unreachable;
+    const root_frame = try policy_frame.PolicyFrame.createRoot(
+        std.testing.allocator,
+        &.{},
+        .disabled,
+        .default,
+        .{ .cwd = cwd, .project_root = cwd, .home = cwd },
+    );
+    defer root_frame.release();
+    var materializations = try skill_materialization.Manager.init(std.testing.allocator);
+    defer materializations.deinit() catch unreachable;
+    const record = skill_catalog.SkillRecord{
+        .skill_id = [_]u8{'a'} ** 64,
+        .invocation_name = "review",
+        .definition = .{
+            .name = "Review",
+            .description = "Review",
+            .body = "Review the target.",
+            .allowed_tools = &.{},
+            .disallowed_tools = &.{},
+            .arguments = &.{},
+            .disable_model_invocation = false,
+            .context = .inline_ctx,
+            .agent = "",
+            .model = "",
+            .shell = "bash",
+            .source_path = "",
+        },
+        .directories = &.{},
+        .files = &.{},
+    };
+    var snapshot_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer snapshot_arena.deinit();
+    var snapshot = skill_catalog.Snapshot{
+        .owner_allocator = std.testing.allocator,
+        .arena = snapshot_arena,
+        .scope_id = [_]u8{'c'} ** 64,
+        .revision = [_]u8{'b'} ** 64,
+        .health = .healthy,
+        .skills = &.{record},
+        .issues = &.{},
+        .descriptor_json = "",
+        .snapshot_bytes = 0,
+        .resident_bytes = 0,
+    };
+    var cell = skill_catalog_handles.CatalogCell{
+        .runtime = undefined,
+        .snapshot = &snapshot,
+        .references = 1,
+        .accounted_bytes = 0,
+    };
+    const selection = try skill_availability.Selection.init(
+        std.testing.allocator,
+        &snapshot,
+        .{ .default_state = .disabled, .exceptions = &.{} },
+    );
+    var session = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = native_session,
+        .skill_binding = .{ .cell = &cell, .selection = selection },
+        .policy_root = root_frame,
+    };
+    defer {
+        session.skill_binding.?.selection.deinit();
+        session.skill_binding = null;
+    }
+    const initial_messages = native_session.conversation.messages.items.len;
+
+    try std.testing.expect(!model_skill_tool.Environment.hasModelInvocable(
+        &snapshot,
+        session.skill_binding.?.view(),
+    ));
+    try std.testing.expectError(error.SkillDisabled, session.runSkill(
+        &materializations,
+        1,
+        &snapshot.revision,
+        &record.skill_id,
+        "{\"values\":[]}",
+        1,
+    ));
+    try std.testing.expectEqual(
+        wire.STATUS_SKILL_POLICY_VIOLATION,
+        skillRunErrorStatus(&session, error.SkillDisabled),
+    );
+    try std.testing.expectEqual(@as(u64, 0), native_session.last_run_id);
+    try std.testing.expectEqual(initial_messages, native_session.conversation.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), materializations.active_count);
 }
 
 test "Skill materialization is post-admission and pre-Conversation" {

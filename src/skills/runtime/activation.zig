@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const catalog = @import("catalog.zig");
+const availability = @import("availability.zig");
 const definition = @import("definition.zig");
 const materialization = @import("materialization.zig");
 const policy_frame = @import("policy_frame.zig");
@@ -26,6 +27,7 @@ pub const PrepareError = error{
     SkillNotFound,
     InvalidArguments,
     PolicyViolation,
+    SkillDisabled,
     SkillUnavailable,
     ModelOverrideUnavailable,
 };
@@ -53,6 +55,7 @@ pub const PrepareOptions = struct {
     context: Context,
     shell_policy: workspace.ShellPolicy,
     model_override_capability: ModelOverrideCapability,
+    availability: availability.View = .all,
 };
 
 pub const ActivationPlan = struct {
@@ -175,6 +178,8 @@ fn finishPrepare(
     if (!std.mem.eql(u8, &snapshot.revision, catalog_revision)) return error.StaleCatalog;
     if (!catalog.isLowerHex64(skill_id)) return error.InvalidSkillId;
     const skill = snapshot.findById(skill_id) orelse return error.SkillNotFound;
+    if (!options.availability.isEnabled(snapshot, skill))
+        return error.SkillDisabled;
     const model_selection = try resolveModelSelection(
         skill.definition.context,
         skill.definition.model,
@@ -182,7 +187,7 @@ fn finishPrepare(
     );
     if (options.context == .model_tool and skill.definition.disable_model_invocation)
         return error.PolicyViolation;
-    // Revision 4 has no AgentDef catalog or profile-binding contract. Accepting
+    // AgentCore has no AgentDef catalog or profile-binding contract. Accepting
     // this metadata and silently using the generic fork prompt would claim a
     // capability the formal ABI cannot provide.
     if (skill.definition.agent.len != 0) return error.SkillUnavailable;
@@ -721,6 +726,38 @@ test "model-only admission guard does not block explicit external invocation" {
         .external_run_root,
     );
     defer external.deinit();
+}
+
+test "disabled Skill fails before activation or materialization" {
+    var fixture = TestFixture.init("Review.", "bash");
+    defer fixture.deinit();
+    fixture.bind();
+    const exceptions = [_]availability.Exception{
+        .{
+            .skill_id = &fixture.records[0].skill_id,
+            .state = .disabled,
+        },
+    };
+    var selection = try availability.Selection.init(
+        std.testing.allocator,
+        &fixture.snapshot,
+        .{ .default_state = .enabled, .exceptions = &exceptions },
+    );
+    defer selection.deinit();
+
+    try std.testing.expectError(error.SkillDisabled, prepare(
+        std.testing.allocator,
+        &fixture.snapshot,
+        &fixture.snapshot.revision,
+        &fixture.records[0].skill_id,
+        "{\"values\":[]}",
+        .{
+            .context = .external_run_root,
+            .shell_policy = .unrestricted,
+            .model_override_capability = .allowed,
+            .availability = .{ .selected = &selection },
+        },
+    ));
 }
 
 test "agent profile metadata fails closed when AgentCore has no AgentDef catalog" {

@@ -1,4 +1,4 @@
-//! Run-local model-facing `Skill` tool for a bound Revision 4 catalog.
+//! Run-local model-facing `Skill` tool for a bound Revision 5 Skill binding.
 //!
 //! This adapter deliberately lives in AgentCore. It projects one internal
 //! provider tool into the existing agent loop, resolves only against the
@@ -9,6 +9,7 @@ const std = @import("std");
 const core = @import("metacodes-core");
 const skill_runtime = core.skills_runtime;
 const catalog = skill_runtime.catalog;
+const availability = skill_runtime.availability;
 const activation_mod = skill_runtime.activation;
 const materialization = skill_runtime.materialization;
 const policy_frame = skill_runtime.policy_frame;
@@ -28,6 +29,7 @@ pub const Options = struct {
     session: *core.agent_session.AgentSession,
     materializations: *materialization.Manager,
     snapshot: *const catalog.Snapshot,
+    availability: availability.View,
     identity: core.agent_session.RunIdentity,
     base_frame: *policy_frame.PolicyFrame,
     abort: *core.util_abort.AbortSignal,
@@ -44,6 +46,7 @@ pub const Environment = struct {
     session: *core.agent_session.AgentSession,
     materializations: *materialization.Manager,
     snapshot: *const catalog.Snapshot,
+    availability: availability.View,
     identity: core.agent_session.RunIdentity,
     current_frame: *policy_frame.PolicyFrame,
     abort: *core.util_abort.AbortSignal,
@@ -58,15 +61,23 @@ pub const Environment = struct {
     inline_activations: std.ArrayList(activation_mod.Activation) = .empty,
     callback_failed: std.atomic.Value(bool) = .init(false),
 
-    pub fn hasModelInvocable(snapshot: *const catalog.Snapshot) bool {
-        return model_semantics.hasModelInvocable(snapshot);
+    pub fn hasModelInvocable(
+        snapshot: *const catalog.Snapshot,
+        available: availability.View,
+    ) bool {
+        return model_semantics.hasModelInvocableWithAvailability(
+            snapshot,
+            available,
+        );
     }
 
     pub fn init(options: Options) InitError!Environment {
         var invocation_names: std.ArrayList([]const u8) = .empty;
         defer invocation_names.deinit(options.allocator);
-        for (options.snapshot.skills) |skill| {
-            if (skill.definition.disable_model_invocation) continue;
+        for (options.snapshot.skills, 0..) |skill, index| {
+            if (!options.availability.isEnabledAt(options.snapshot, index) or
+                skill.definition.disable_model_invocation)
+                continue;
             invocation_names.append(
                 options.allocator,
                 skill.invocation_name,
@@ -80,9 +91,10 @@ pub const Environment = struct {
         ) catch return error.OutOfMemory;
         errdefer options.allocator.free(owned_names);
 
-        const description = model_semantics.buildDescription(
+        const description = model_semantics.buildDescriptionWithAvailability(
             options.allocator,
             options.snapshot,
+            options.availability,
         ) catch return error.OutOfMemory;
         errdefer options.allocator.free(description);
 
@@ -116,6 +128,7 @@ pub const Environment = struct {
             .session = options.session,
             .materializations = options.materializations,
             .snapshot = options.snapshot,
+            .availability = options.availability,
             .identity = options.identity,
             .current_frame = options.base_frame,
             .abort = options.abort,
@@ -267,6 +280,7 @@ pub const Environment = struct {
                 .context = .model_tool,
                 .shell_policy = self.current_frame.shellPolicy(),
                 .model_override_capability = .forbidden,
+                .availability = self.availability,
             },
         );
         defer plan.deinit();
@@ -350,6 +364,7 @@ pub const Environment = struct {
             .session = self.session,
             .materializations = self.materializations,
             .snapshot = self.snapshot,
+            .availability = self.availability,
             .identity = self.identity,
             .base_frame = activation.frame,
             .abort = self.abort,

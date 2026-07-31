@@ -14,7 +14,7 @@ const catalog = core.skills_runtime.catalog;
 const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
 
 pub const MAX_LIVE_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
-pub const BUNDLE_IDENTITY = "metask-agentcore/abi-v1/revision-4";
+pub const BUNDLE_IDENTITY = "metask-agentcore/abi-v1/revision-5";
 const SCOPE_DOMAIN = "metask.agentcore.skill-catalog.scope/v1";
 
 pub const Error = error{
@@ -270,7 +270,7 @@ pub const RuntimeCatalogs = struct {
         );
     }
 
-    /// Retains the immutable cell for a Session create/refresh transaction.
+    /// Retains the immutable cell for a Session create/update transaction.
     /// The Host handle itself remains independently releasable after success.
     pub fn retainForSession(
         self: *RuntimeCatalogs,

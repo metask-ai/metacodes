@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const catalog = @import("catalog.zig");
+const availability = @import("availability.zig");
 const activation = @import("activation.zig");
 const json = @import("../../json.zig");
 
@@ -30,8 +31,17 @@ pub const Invocation = struct {
 };
 
 pub fn hasModelInvocable(snapshot: *const catalog.Snapshot) bool {
-    for (snapshot.skills) |skill| {
-        if (!skill.definition.disable_model_invocation) return true;
+    return hasModelInvocableWithAvailability(snapshot, .all);
+}
+
+pub fn hasModelInvocableWithAvailability(
+    snapshot: *const catalog.Snapshot,
+    available: availability.View,
+) bool {
+    for (snapshot.skills, 0..) |skill, index| {
+        if (available.isEnabledAt(snapshot, index) and
+            !skill.definition.disable_model_invocation)
+            return true;
     }
     return false;
 }
@@ -81,6 +91,14 @@ pub fn buildDescription(
     allocator: std.mem.Allocator,
     snapshot: *const catalog.Snapshot,
 ) ![]u8 {
+    return buildDescriptionWithAvailability(allocator, snapshot, .all);
+}
+
+pub fn buildDescriptionWithAvailability(
+    allocator: std.mem.Allocator,
+    snapshot: *const catalog.Snapshot,
+    available: availability.View,
+) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(allocator);
     defer output.deinit();
     try output.writer.writeAll(
@@ -88,8 +106,10 @@ pub fn buildDescription(
             "Use the exact canonical name; values are positional. Skill is a " ++
             "serialization boundary, so later calls use its narrowed policy. Available:\n",
     );
-    for (snapshot.skills) |skill| {
-        if (skill.definition.disable_model_invocation) continue;
+    for (snapshot.skills, 0..) |skill, index| {
+        if (!available.isEnabledAt(snapshot, index) or
+            skill.definition.disable_model_invocation)
+            continue;
         try output.writer.print(
             "- {s}: {s}\n",
             .{ skill.invocation_name, skill.definition.description },
@@ -154,4 +174,83 @@ test "model invocation rejects aliases unknown fields and non-string values" {
             "{\"name\":\"review\",\"values\":[1]}",
         ),
     );
+}
+
+test "model Skill surface omits disabled records while catalog stays intact" {
+    const records = [_]catalog.SkillRecord{
+        .{
+            .skill_id = [_]u8{'1'} ** 64,
+            .invocation_name = "enabled",
+            .definition = .{
+                .name = "Enabled",
+                .description = "visible",
+                .body = "body",
+                .allowed_tools = &.{},
+                .disallowed_tools = &.{},
+                .arguments = &.{},
+                .disable_model_invocation = false,
+                .context = .inline_ctx,
+                .agent = "",
+                .model = "",
+                .shell = "bash",
+                .source_path = "",
+            },
+            .directories = &.{},
+            .files = &.{},
+        },
+        .{
+            .skill_id = [_]u8{'2'} ** 64,
+            .invocation_name = "disabled",
+            .definition = .{
+                .name = "Disabled",
+                .description = "hidden",
+                .body = "body",
+                .allowed_tools = &.{},
+                .disallowed_tools = &.{},
+                .arguments = &.{},
+                .disable_model_invocation = false,
+                .context = .inline_ctx,
+                .agent = "",
+                .model = "",
+                .shell = "bash",
+                .source_path = "",
+            },
+            .directories = &.{},
+            .files = &.{},
+        },
+    };
+    var snapshot = catalog.Snapshot{
+        .owner_allocator = std.testing.allocator,
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+        .scope_id = [_]u8{'a'} ** 64,
+        .revision = [_]u8{'b'} ** 64,
+        .health = .healthy,
+        .skills = &records,
+        .issues = &.{},
+        .descriptor_json = "",
+        .snapshot_bytes = 0,
+        .resident_bytes = 0,
+    };
+    defer snapshot.arena.deinit();
+    const exceptions = [_]availability.Exception{
+        .{ .skill_id = &records[1].skill_id, .state = .disabled },
+    };
+    var selection = try availability.Selection.init(
+        std.testing.allocator,
+        &snapshot,
+        .{ .default_state = .enabled, .exceptions = &exceptions },
+    );
+    defer selection.deinit();
+    const view = availability.View{ .selected = &selection };
+
+    try std.testing.expect(hasModelInvocableWithAvailability(&snapshot, view));
+    const description = try buildDescriptionWithAvailability(
+        std.testing.allocator,
+        &snapshot,
+        view,
+    );
+    defer std.testing.allocator.free(description);
+    try std.testing.expect(std.mem.indexOf(u8, description, "enabled: visible") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "disabled") == null);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.skills.len);
 }
