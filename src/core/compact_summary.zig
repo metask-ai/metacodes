@@ -13,6 +13,8 @@ const msg = @import("message.zig");
 const log = @import("../util/log.zig");
 const json_mod = @import("../json.zig");
 const provider_mod = @import("../api/provider.zig");
+const AbortSignal = @import("../util/abort.zig").AbortSignal;
+const UsageDelta = @import("../api/stream.zig").UsageDelta;
 
 const DEFAULT_COMPACT_SYSTEM = @embedFile("templates/compact/prompt.md");
 const DEFAULT_SUMMARY_PREFIX = @embedFile("templates/compact/summary_prefix.md");
@@ -87,6 +89,116 @@ pub fn summarizeWithModel(
     defer if (resp.content.len > 0) allocator.free(resp.content);
     if (resp.content.len == 0) return null;
     return applySummaryPrefix(allocator, resp.content) catch null;
+}
+
+/// Abortable summary transport used by CompactKernel. It uses the neutral
+/// streaming provider path because that path exposes both AbortSignal and
+/// provider usage; callers aggregate the returned delta exactly once.
+pub fn summarizeAbortable(
+    allocator: std.mem.Allocator,
+    provider: provider_mod.Provider,
+    drop_msgs: []const msg.Message,
+    model_override: ?[]const u8,
+    abort: *const AbortSignal,
+    usage_out: *UsageDelta,
+) error{Aborted}!?[]u8 {
+    usage_out.* = .{};
+    if (drop_msgs.len == 0) return null;
+    if (abort.isAborted()) return error.Aborted;
+
+    var transcript_buf: std.ArrayList(u8) = .empty;
+    defer transcript_buf.deinit(allocator);
+    for (drop_msgs) |m| {
+        const role = if (m.role == .user) "User" else "Assistant";
+        transcript_buf.appendSlice(allocator, role) catch return null;
+        transcript_buf.appendSlice(allocator, ": ") catch return null;
+        for (m.blocks) |b| switch (b) {
+            .text => |t| transcript_buf.appendSlice(allocator, t) catch return null,
+            .tool_use => |tu| {
+                transcript_buf.appendSlice(allocator, "[tool ") catch return null;
+                transcript_buf.appendSlice(allocator, tu.name) catch return null;
+                transcript_buf.appendSlice(allocator, "]") catch return null;
+            },
+            .tool_result => |tr| {
+                const cap = tr.content[0..@min(tr.content.len, 500)];
+                transcript_buf.appendSlice(allocator, "[result: ") catch return null;
+                transcript_buf.appendSlice(allocator, cap) catch return null;
+                transcript_buf.appendSlice(allocator, "]") catch return null;
+            },
+            .thinking => {},
+        };
+        transcript_buf.append(allocator, '\n') catch return null;
+    }
+
+    const user_text = std.fmt.allocPrint(
+        allocator,
+        "Summarize this conversation for compaction:\n\n{s}",
+        .{transcript_buf.items},
+    ) catch return null;
+    defer allocator.free(user_text);
+    const system_prompt = loadTemplateOrDefault(
+        allocator,
+        COMPACT_PROMPT_FILE_ENV,
+        DEFAULT_COMPACT_SYSTEM,
+    ) catch return null;
+    defer allocator.free(system_prompt);
+    const api_msgs = [_]types.ApiMessage{.{
+        .role = .user,
+        .content = &[_]types.ApiContent{.{ .text = user_text }},
+    }};
+    var stream = provider.sendStream(
+        &api_msgs,
+        system_prompt,
+        null,
+        abort,
+        model_override,
+        null,
+        "",
+    ) catch |err| {
+        if (abort.isAborted() or err == error.Aborted) return error.Aborted;
+        log.warn("compact", "summary stream failed: {s} (falling back to keep-recent)", .{@errorName(err)});
+        return null;
+    };
+    defer stream.deinit();
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(allocator);
+    while (true) {
+        if (abort.isAborted()) return error.Aborted;
+        const event = stream.next() catch |err| {
+            if (abort.isAborted() or err == error.Aborted) return error.Aborted;
+            log.warn("compact", "summary stream read failed: {s} (falling back to keep-recent)", .{@errorName(err)});
+            return null;
+        } orelse break;
+        switch (event) {
+            .text => |bytes| {
+                defer allocator.free(bytes);
+                text.appendSlice(allocator, bytes) catch return null;
+            },
+            .usage => |delta| accumulateUsage(usage_out, delta),
+            .tool_use_start => |tool| {
+                allocator.free(tool.id);
+                allocator.free(tool.name);
+                allocator.free(tool.input_json);
+            },
+            .web_search_result => |result| {
+                allocator.free(result.ui_text);
+                allocator.free(result.content_json);
+            },
+            .web_search_query => |query| allocator.free(query),
+            .done => {},
+        }
+    }
+    if (abort.isAborted()) return error.Aborted;
+    if (text.items.len == 0) return null;
+    return applySummaryPrefix(allocator, text.items) catch return null;
+}
+
+fn accumulateUsage(total: *UsageDelta, delta: UsageDelta) void {
+    total.input_tokens +|= delta.input_tokens;
+    total.output_tokens +|= delta.output_tokens;
+    total.cache_read_input_tokens +|= delta.cache_read_input_tokens;
+    total.cache_creation_input_tokens +|= delta.cache_creation_input_tokens;
 }
 
 pub fn applySummaryPrefix(allocator: std.mem.Allocator, summary_suffix: []const u8) ![]u8 {

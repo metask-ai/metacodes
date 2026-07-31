@@ -23,6 +23,7 @@ pub const tool_catalog = @import("core/tool_catalog.zig");
 pub const workspace_policy = @import("core/workspace_policy.zig");
 pub const conversation = @import("core/conversation.zig");
 pub const compact_summary = @import("core/compact_summary.zig");
+pub const compact_kernel = @import("core/compact_kernel.zig");
 pub const message = @import("core/message.zig");
 pub const subagent = @import("core/subagent.zig");
 pub const tool_exec = @import("core/tool_exec.zig");

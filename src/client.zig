@@ -40,6 +40,7 @@ pub const StreamResult = struct {
     response: http.Client.Response,
     transfer_buf: [8192]u8,
     id: log.RequestId,
+    abort_registry: ?*provider_mod.RequestAbortRegistry = null,
 };
 
 /// 网络瞬态错误判定:服务端关连接(keep-alive 回收/LB 断连)、连接重置、读到 EOF 等。
@@ -146,6 +147,7 @@ pub const Client = struct {
     /// 用户 CLI `--max-tokens N` 覆盖；null = 自动（catalog → fallback table → default）。
     max_tokens_override: ?u32 = null,
     reasoning_effort: ?types.ReasoningEffort = null,
+    abort_registry: provider_mod.RequestAbortRegistry = .{},
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, model: []const u8) Client {
         return initWithBaseUrl(allocator, io, api_key, model, null);
@@ -170,6 +172,7 @@ pub const Client = struct {
     }
 
     pub fn deinit(client: *Client) void {
+        client.abort_registry.deinit(client.allocator);
         client.http_client.deinit();
         client.catalog.deinit();
     }
@@ -184,6 +187,7 @@ pub const Client = struct {
             .sendStreamFn = &pSendStream,
             .sendStreamRetryFn = &pSendStreamRetry,
             .sendFn = &pSend,
+            .cancelFn = &pCancel,
             .maxTokensFn = &pMaxTokens,
             .maxInputTokensFn = &pMaxInputTokens,
             .reasoningEffortFn = &pReasoningEffort,
@@ -216,6 +220,9 @@ pub const Client = struct {
     }
     fn pSend(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, model_override: ?[]const u8) anyerror!ApiResponse {
         return asClient(ctx).sendMessageWithModel(messages, system, tools, model_override);
+    }
+    fn pCancel(ctx: *anyopaque, signal: *const AbortSignal) void {
+        asClient(ctx).abort_registry.cancel(signal);
     }
     fn pMaxTokens(ctx: *anyopaque) u32 {
         return asClient(ctx).resolveMaxTokens();
@@ -347,7 +354,7 @@ pub const Client = struct {
         }, client.allocator);
         defer client.allocator.free(req_body);
 
-        const result = try client.doRequest(req_body, false);
+        const result = try client.doRequest(req_body, false, null);
         switch (result) {
             .full_body => |fb| {
                 defer client.allocator.free(fb.body);
@@ -407,7 +414,7 @@ pub const Client = struct {
         // doRequest 内部 sendBodyComplete 是同步全发,返回后 body 即可释放(stream/error 都)。
         defer client.allocator.free(req_body);
 
-        const result = try client.doRequest(req_body, true);
+        const result = try client.doRequest(req_body, true, abort);
         switch (result) {
             .streaming_response => |r| {
                 return StreamResponse.init(client.allocator, r, abort);
@@ -463,7 +470,12 @@ pub const Client = struct {
         }
     }
 
-    fn doRequest(client: *Client, body: []const u8, streaming: bool) !RequestResult {
+    fn doRequest(
+        client: *Client,
+        body: []const u8,
+        streaming: bool,
+        abort: ?*const AbortSignal,
+    ) !RequestResult {
         const rid = log.genRequestId();
         const t_start = timestampMs();
 
@@ -519,6 +531,14 @@ pub const Client = struct {
         };
         // errdefer 销毁顺序：先 req.deinit()（释放连接/缓冲），再 destroy 槽位。
         errdefer req_ptr.deinit();
+        if (abort) |signal|
+            try client.abort_registry.register(
+                client.allocator,
+                signal,
+                req_ptr,
+                shutdownRequest,
+            );
+        errdefer if (abort != null) client.abort_registry.unregister(req_ptr);
 
         // 发送 body
         req_ptr.sendBodyComplete(@constCast(body)) catch |err| {
@@ -591,6 +611,7 @@ pub const Client = struct {
                     .response = http_response,
                     .transfer_buf = undefined,
                     .id = rid,
+                    .abort_registry = if (abort != null) &client.abort_registry else null,
                 },
             };
         }
@@ -610,6 +631,11 @@ pub const Client = struct {
         return RequestResult{ .full_body = .{ .body = response_body, .id = rid } };
     }
 };
+
+fn shutdownRequest(raw: *anyopaque) void {
+    const request: *http.Client.Request = @ptrCast(@alignCast(raw));
+    provider_mod.abortHttpRequest(request);
+}
 
 fn secureFree(allocator: std.mem.Allocator, buf: []u8) void {
     @memset(buf, 0);
@@ -701,6 +727,8 @@ pub const StreamResponse = struct {
     pub fn deinit(self: *StreamResponse) void {
         // EventIterator 可能持有未 emit 的 pending_tool(流中途断开时残留),释放它。
         if (self.iter_initialized) self.event_iter.deinit(self.allocator);
+        if (self.stream_result.abort_registry) |registry|
+            registry.unregister(self.stream_result.request);
         self.stream_result.request.deinit();
         self.allocator.destroy(self.stream_result.request);
     }

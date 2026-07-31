@@ -67,6 +67,7 @@ pub const GeminiClient = struct {
     base_url: []const u8, // 基址(可指向 MockServer);doStream 拼 model + :streamGenerateContent
     model: []const u8,
     http_client: http.Client,
+    abort_registry: provider_mod.RequestAbortRegistry = .{},
     max_tokens: u32 = 8192,
     context_window: u32 = 1_048_576, // Gemini 1.5/2.x 默认 1M(保守;未按 model 区分)
 
@@ -84,6 +85,7 @@ pub const GeminiClient = struct {
         };
     }
     pub fn deinit(self: *GeminiClient) void {
+        self.abort_registry.deinit(self.allocator);
         for (self.cache_table.items) |e| self.allocator.free(e.cache_name);
         self.cache_table.deinit(self.allocator);
         self.http_client.deinit();
@@ -130,6 +132,7 @@ pub const GeminiClient = struct {
             .sendStreamFn = &pSendStream,
             .sendStreamRetryFn = &pSendStreamRetry,
             .sendFn = &pSend,
+            .cancelFn = &pCancel,
             .maxTokensFn = &pMaxTokens,
             .maxInputTokensFn = &pMaxInputTokens,
             .reasoningEffortFn = &pReasoningEffort,
@@ -161,6 +164,9 @@ pub const GeminiClient = struct {
         _ = tools;
         _ = model_override;
         return error.NotImplemented; // 非流式未实现(compact 退 keep-recent)
+    }
+    fn pCancel(ctx: *anyopaque, signal: *const AbortSignal) void {
+        cast(ctx).abort_registry.cancel(signal);
     }
     fn pSendStreamRetry(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, max_retries: u32, retry_base_ms: u64, reporter: ?provider_mod.RetryReporter, user_query: []const u8) anyerror!StreamHandle {
         _ = max_retries;
@@ -205,30 +211,47 @@ pub const GeminiClient = struct {
             log.errId("gemini", rid, "request init failed: {s}", .{@errorName(err)});
             return error.RequestFailed; // errdefer destroy(req_ptr);req_ptr.* 未初始化, 无需 deinit
         };
+        var registered = false;
+        errdefer {
+            if (registered) self.abort_registry.unregister(req_ptr);
+            req_ptr.deinit();
+        }
+        if (abort) |signal| {
+            try self.abort_registry.register(
+                self.allocator,
+                signal,
+                req_ptr,
+                shutdownRequest,
+            );
+            registered = true;
+        }
         req_ptr.transfer_encoding = .{ .content_length = body.len };
         req_ptr.sendBodyComplete(@constCast(body)) catch |err| {
             log.errId("gemini", rid, "send body failed: {s}", .{@errorName(err)});
-            req_ptr.deinit(); // 释放 Request 内部;heap box 由 errdefer destroy
             return error.RequestFailed;
         };
         const response = req_ptr.receiveHead(&.{}) catch |err| {
             log.errId("gemini", rid, "receiveHead failed: {s}", .{@errorName(err)});
-            req_ptr.deinit();
             return err;
         };
         if (response.head.status != .ok) {
             log.errId("gemini", rid, "HTTP {d}", .{@intFromEnum(response.head.status)});
-            req_ptr.deinit();
             return error.RequestFailed;
         }
         // receiveHead 成功后,req_ptr.* 是个开着连接的完整 Request。到 heap 转移所有权之前若出错
         // (create(GeminiStream) OOM),必须 deinit 它(否则泄漏 socket fd + 连接状态,非纯字节)。
         // errdefer LIFO:此 deinit 先跑、顶部 destroy 后跑 = 正确的 deinit()→destroy() 顺序。
-        errdefer req_ptr.deinit();
         const heap = try self.allocator.create(GeminiStream);
         // create 成功 → 所有权转移给 GeminiStream(其 deinit 负责 req_ptr.deinit()+destroy);
         // 正常返回,两个 errdefer 都不触发。
-        heap.* = .{ .allocator = self.allocator, .request = req_ptr, .response = response, .abort = abort, .id = rid };
+        heap.* = .{
+            .allocator = self.allocator,
+            .request = req_ptr,
+            .response = response,
+            .abort = abort,
+            .abort_registry = if (abort != null) &self.abort_registry else null,
+            .id = rid,
+        };
         return heap.handle();
     }
 };
@@ -241,6 +264,7 @@ const GeminiStream = struct {
     transfer_buf: [8192]u8 = undefined,
     reader: ?*std.Io.Reader = null,
     abort: ?*const AbortSignal = null,
+    abort_registry: ?*provider_mod.RequestAbortRegistry = null,
     id: log.RequestId,
     done: bool = false,
     last_stop: StopReason = .unknown,
@@ -276,6 +300,7 @@ const GeminiStream = struct {
         // 未 drain 的并行 functionCall 事件持 owned id/name/input_json → 释放防泄漏。
         for (self.fc_queue.items[self.fc_pos..]) |ev| freeToolUseStart(self.allocator, ev);
         self.fc_queue.deinit(self.allocator);
+        if (self.abort_registry) |registry| registry.unregister(self.request);
         self.request.deinit();
         self.allocator.destroy(self.request);
     }
@@ -386,6 +411,11 @@ const GeminiStream = struct {
         return null;
     }
 };
+
+fn shutdownRequest(raw: *anyopaque) void {
+    const request: *http.Client.Request = @ptrCast(@alignCast(raw));
+    provider_mod.abortHttpRequest(request);
+}
 
 fn mapGeminiFinish(fr: []const u8) StopReason {
     if (std.mem.eql(u8, fr, "STOP")) return .end_turn;

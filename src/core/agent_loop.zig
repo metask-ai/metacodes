@@ -24,6 +24,7 @@ const ReadState = @import("read_state.zig").ReadState;
 const api_stream = @import("../api/stream.zig");
 const tool_error = @import("tool_error.zig");
 const context_pressure_mod = @import("context_pressure.zig");
+const compact_kernel = @import("compact_kernel.zig");
 const util_time = @import("../util/time.zig");
 const log = @import("../util/log.zig");
 const ui_backend = @import("protocol/ui_backend.zig");
@@ -665,9 +666,13 @@ pub fn run(
                     allocator,
                     opts.tasks,
                     permission_ctx.hooks,
+                    opts.abort,
                 );
                 if (previous_model_compact_outcome == .api_error) {
                     return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
+                }
+                if (previous_model_compact_outcome == .aborted) {
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .aborted, .turns = turns, .tool_calls = total_tool_calls });
                 }
             }
         }
@@ -690,9 +695,13 @@ pub fn run(
                 allocator,
                 opts.tasks,
                 permission_ctx.hooks,
+                opts.abort,
             );
             if (pre_sampling_compact == .api_error) {
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
+            }
+            if (pre_sampling_compact == .aborted) {
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .aborted, .turns = turns, .tool_calls = total_tool_calls });
             }
         }
 
@@ -1498,9 +1507,13 @@ pub fn run(
             allocator,
             opts.tasks,
             permission_ctx.hooks,
+            opts.abort,
         );
         if (post_tool_compact == .api_error) {
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
+        }
+        if (post_tool_compact == .aborted) {
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .aborted, .turns = turns + 1, .tool_calls = total_tool_calls });
         }
 
         // L4 诊断:turn span 终点(本轮有 tool_use、将进入下一轮的正常路径;无工具的
@@ -1729,7 +1742,7 @@ fn estimateNextRequestTokensOrFallback(
     };
 }
 
-const AutoCompactOutcome = enum { not_needed, compacted, skipped_no_savings, api_error };
+const AutoCompactOutcome = enum { not_needed, compacted, skipped_no_savings, aborted, api_error };
 
 fn recoverContextWindowExceeded(
     conversation: *Conversation,
@@ -1845,6 +1858,7 @@ fn runAutoCompactIfNeeded(
     allocator: std.mem.Allocator,
     tasks: ?*@import("task_store.zig").TaskStore,
     hookset: ?*const hooks_mod.HookSet,
+    abort: ?*const AbortSignal,
 ) !AutoCompactOutcome {
     var outcome: AutoCompactOutcome = .not_needed;
     const tool_result_limit = conversation_mod.toolResultContextBytes(provider.maxInputTokens());
@@ -1884,44 +1898,76 @@ fn runAutoCompactIfNeeded(
             }
         };
         const compact_summary = @import("compact_summary.zig");
-        const SummCtx = struct { provider: provider_mod.Provider, alloc: std.mem.Allocator, model_override: ?[]const u8, task_anchor: ?[]const u8 };
         const summary_model = compact_model_override orelse model_override;
         const eff_keep_recent = forcedAutoCompactKeep() orelse keep_recent;
+        if (conversation.compactBoundary(eff_keep_recent) <= conversation.compact_boundary)
+            return outcome;
         // 任务锚:进行中的任务确定性追加到摘要尾(压缩有损,闭环纪律硬保底)。
         const task_anchor: ?[]u8 = if (tasks) |ts| compact_summary.buildTaskAnchor(allocator, ts) else null;
         defer if (task_anchor) |a| allocator.free(a);
-        var preview = try conversation.cloneForCompactPreview(allocator, eff_keep_recent);
-        defer preview.deinit();
-        const before_len = preview.conversation.len();
-        const report = preview.conversation.compactWithSummaryReport(eff_keep_recent, SummCtx{ .provider = provider, .alloc = allocator, .model_override = summary_model, .task_anchor = task_anchor }, struct {
-            fn f(c: SummCtx, drop_msgs: []const msg.Message) ?[]u8 {
-                const summary = compact_summary.summarizeWithModel(c.alloc, c.provider, drop_msgs, c.model_override) orelse return null;
-                return compact_summary.appendTaskAnchor(c.alloc, summary, c.task_anchor);
+        const EstimateContext = struct {
+            allocator: std.mem.Allocator,
+            provider: provider_mod.Provider,
+            system_prompt: ?[]const u8,
+            inject_user_context: ?[]const u8,
+            synthetic_user_input: ?[]const u8,
+            tool_defs: []const json_mod.ToolDefinition,
+            model_override: ?[]const u8,
+
+            fn estimate(raw: *anyopaque, value: *const Conversation) usize {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                return estimateNextRequestTokensOrFallback(
+                    self.allocator,
+                    self.provider,
+                    value,
+                    self.system_prompt,
+                    self.inject_user_context,
+                    self.synthetic_user_input,
+                    self.tool_defs,
+                    self.model_override,
+                );
             }
-        }.f) catch Conversation.CompactReport{
-            .dropped = preview.conversation.compactKeepRecent(eff_keep_recent),
-            .summary_used = false,
         };
-        if (report.dropped > 0) {
-            var cause: []const u8 = if (report.summary_used) trigger_cause else "summary_fallback";
-            var request_tokens_after = estimateNextRequestTokensOrFallback(allocator, provider, &preview.conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
-            var saved_percent = compactSavedPercent(request_tokens_before, request_tokens_after);
-            if (report.summary_used and !compactHasMinSavings(request_tokens_before, request_tokens_after)) {
+        var estimate_ctx = EstimateContext{
+            .allocator = allocator,
+            .provider = provider,
+            .system_prompt = system_prompt,
+            .inject_user_context = inject_user_context,
+            .synthetic_user_input = synthetic_user_input,
+            .tool_defs = tool_defs,
+            .model_override = model_override,
+        };
+        var local_abort = AbortSignal.init();
+        const signal = abort orelse &local_abort;
+        const report = compact_kernel.run(
+            allocator,
+            conversation,
+            provider,
+            signal,
+            .{
+                .keep_recent = eff_keep_recent,
+                .model_override = summary_model,
+                .task_anchor = task_anchor,
+                .estimator = .{
+                    .ctx = &estimate_ctx,
+                    .estimate_fn = EstimateContext.estimate,
+                },
+                .minimum_saved_percent = COMPACT_MIN_SAVED_PERCENT,
+                .target_tokens = auto_threshold,
+            },
+        ) catch |err| {
+            log.warn("agent", "auto-compact kernel failed: {s}", .{@errorName(err)});
+            return .api_error;
+        };
+        if (usageChanged(report.usage))
+            backend.emitEvent(sess, .{ .usage = report.usage });
+        switch (report.outcome) {
+            .aborted => return .aborted,
+            .no_change => {
+                log.warn("agent", "auto-compact skipped: summary savings below {d}% before_tokens={d} after_tokens={d} cause={s}", .{ COMPACT_MIN_SAVED_PERCENT, report.before_tokens, report.after_tokens, trigger_cause });
                 outcome = .skipped_no_savings;
-                log.warn("agent", "auto-compact skipped: summary savings below {d}% before_tokens={d} after_tokens={d} saved_percent={d} dropped={d} cause={s}", .{ COMPACT_MIN_SAVED_PERCENT, request_tokens_before, request_tokens_after, saved_percent, report.dropped, trigger_cause });
-            } else {
-                if (request_tokens_after > auto_threshold) {
-                    const emergency = preview.conversation.microcompactToolResultsByRecentResults(0);
-                    if (emergency.changed()) {
-                        cause = "tool_result_pressure";
-                        request_tokens_after = estimateNextRequestTokensOrFallback(allocator, provider, &preview.conversation, system_prompt, inject_user_context, synthetic_user_input, tool_defs, model_override);
-                        saved_percent = compactSavedPercent(request_tokens_before, request_tokens_after);
-                    }
-                }
-                if (!conversation.replaceWithOwnedIfSuffixUnchanged(&preview.suffix, &preview.conversation)) {
-                    log.warn("agent", "auto-compact aborted: conversation suffix changed during summary generation cause={s}", .{trigger_cause});
-                    return .api_error;
-                }
+            },
+            .compacted, .degraded => {
                 // PostCompact hook(压缩后):喂 {trigger, summary},其 additionalContext 拼进投影摘要
                 // → 模型下轮读得到(条目 I 的挂载点:重注入 active skill/plan/MCP)。非阻塞。
                 if (hookset) |hs| if (hs.hasPostCompact()) {
@@ -1935,19 +1981,24 @@ fn runAutoCompactIfNeeded(
                     }
                 };
                 // 投影:len() 不变(原始不删),真正收缩的是活跃窗口——日志/事件的"after/kept"用活跃计数。
-                const kept_active = conversation.activeMessages().len;
-                log.info("agent", "auto-compact: dropped {d} old messages (active {d} -> {d}) threshold={d} before_tokens={d} after_tokens={d} saved_percent={d} cause={s}", .{ report.dropped, before_len, kept_active, auto_threshold, request_tokens_before, request_tokens_after, saved_percent, cause });
+                const cause: []const u8 = if (report.emergency_reduced)
+                    "tool_result_pressure"
+                else if (report.outcome == .degraded)
+                    "summary_fallback"
+                else
+                    trigger_cause;
+                log.info("agent", "auto-compact: dropped {d} old messages kept={d} threshold={d} before_tokens={d} after_tokens={d} cause={s}", .{ report.dropped, report.kept, auto_threshold, report.before_tokens, report.after_tokens, cause });
                 backend.emitEvent(sess, .{ .auto_compact = .{
                     .dropped = @as(u32, @intCast(report.dropped)),
-                    .kept = @as(u32, @intCast(kept_active)),
-                    .before_tokens = @intCast(request_tokens_before),
-                    .after_tokens = @intCast(request_tokens_after),
+                    .kept = @as(u32, @intCast(report.kept)),
+                    .before_tokens = @intCast(report.before_tokens),
+                    .after_tokens = @intCast(report.after_tokens),
                     .cause = cause,
                 } });
                 outcome = .compacted;
-                request_tokens_before = request_tokens_after;
+                request_tokens_before = report.after_tokens;
                 pressure = context_pressure_mod.ContextPressure.fromModel(provider.maxInputTokens(), provider.maxTokens(), configured_threshold, request_tokens_before);
-            }
+            },
         }
     }
 
@@ -1989,18 +2040,11 @@ fn emitContextWarningIfNeeded(
     } });
 }
 
-fn compactHasMinSavings(before_tokens: usize, after_tokens: usize) bool {
-    if (before_tokens == 0) return false;
-    if (after_tokens >= before_tokens) return false;
-    const saved = before_tokens - after_tokens;
-    const divisor = 100 / COMPACT_MIN_SAVED_PERCENT;
-    const required = before_tokens / divisor + @intFromBool(before_tokens % divisor != 0);
-    return saved >= required;
-}
-
-fn compactSavedPercent(before_tokens: usize, after_tokens: usize) usize {
-    if (before_tokens == 0 or after_tokens >= before_tokens) return 0;
-    return (before_tokens - after_tokens) * 100 / before_tokens;
+fn usageChanged(usage: api_stream.UsageDelta) bool {
+    return usage.input_tokens != 0 or
+        usage.output_tokens != 0 or
+        usage.cache_read_input_tokens != 0 or
+        usage.cache_creation_input_tokens != 0;
 }
 
 fn estimateNextRequestTokensFallback(
@@ -2207,6 +2251,7 @@ const TestProviderState = struct {
     allocator: ?std.mem.Allocator = null,
     compact_summary_response: ?[]const u8 = null,
     last_send_model_override: ?[]const u8 = null,
+    compact_stream_stage: u8 = 0,
 };
 
 fn testProvider(state: *TestProviderState) provider_mod.Provider {
@@ -2217,8 +2262,36 @@ fn testProvider(state: *TestProviderState) provider_mod.Provider {
         fn model(ctx: *anyopaque) []const u8 {
             return asState(ctx).model;
         }
-        fn sendStream(_: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition, _: ?*const AbortSignal, _: ?[]const u8, _: ?json_mod.ToolChoice, _: []const u8) anyerror!provider_mod.StreamHandle {
-            return error.UnexpectedTestCall;
+        fn sendStream(ctx: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition, _: ?*const AbortSignal, model_override: ?[]const u8, _: ?json_mod.ToolChoice, _: []const u8) anyerror!provider_mod.StreamHandle {
+            const st = asState(ctx);
+            if (st.compact_summary_response == null or st.allocator == null)
+                return error.UnexpectedTestCall;
+            st.last_send_model_override = model_override;
+            st.compact_stream_stage = 0;
+            return .{
+                .ctx = ctx,
+                .nextFn = streamNext,
+                .deinitFn = streamDeinit,
+                .stopReasonFn = streamStop,
+                .requestIdFn = streamRequestId,
+            };
+        }
+        fn streamNext(ctx: *anyopaque) anyerror!?api_stream.StreamEvent {
+            const st = asState(ctx);
+            defer st.compact_stream_stage += 1;
+            return switch (st.compact_stream_stage) {
+                0 => .{ .text = try st.allocator.?.dupe(u8, st.compact_summary_response.?) },
+                1 => .{ .usage = .{ .input_tokens = 11, .output_tokens = 7 } },
+                2 => .{ .done = {} },
+                else => null,
+            };
+        }
+        fn streamDeinit(_: *anyopaque) void {}
+        fn streamStop(_: *anyopaque) api_stream.StopReason {
+            return .end_turn;
+        }
+        fn streamRequestId(_: *anyopaque) log.RequestId {
+            return log.RequestId{ .bytes = [_]u8{1} ** 12 };
         }
         fn sendStreamRetry(_: *anyopaque, _: []const types.ApiMessage, _: ?[]const u8, _: ?[]const json_mod.ToolDefinition, _: ?*const AbortSignal, _: ?[]const u8, _: ?json_mod.ToolChoice, _: u32, _: u64, _: ?provider_mod.RetryReporter, _: []const u8) anyerror!provider_mod.StreamHandle {
             return error.UnexpectedTestCall;
@@ -2394,6 +2467,7 @@ test "usage anchor suppresses false blocking-limit nuke (glm-5.2 并发工具风
         a,
         null,
         null,
+        null,
     );
 
     // est = 13522 + 20×(32768/4) + 信封 ≈ 178K < 229144 → 不触发;结果全部保留。
@@ -2532,6 +2606,7 @@ test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool s
         a,
         null,
         null,
+        null,
     );
 
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
@@ -2598,6 +2673,7 @@ test "auto-compact summary carries in_progress task anchor through compaction" {
         a,
         &store,
         null,
+        null,
     );
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
 
@@ -2642,7 +2718,7 @@ test "auto-compact 触发 PreCompact + PostCompact hook(G-rest 接线,端到端)
     const post_entries = [_]hooks_mod.HookEntry{.{ .matcher = "*", .commands = &post_cmds }};
     const hs = hooks_mod.HookSet{ .pre_tool_use = &.{}, .pre_compact = &pre_entries, .post_compact = &post_entries, .allocator = a };
 
-    const outcome = try runAutoCompactIfNeeded(&c, provider, null, null, null, &.{}, null, null, 32_000, 2, "post_tool_follow_up_threshold", &backend, .single, null, a, null, &hs);
+    const outcome = try runAutoCompactIfNeeded(&c, provider, null, null, null, &.{}, null, null, 32_000, 2, "post_tool_follow_up_threshold", &backend, .single, null, a, null, &hs, null);
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
 
     // PreCompact 真触发:marker 文件存在。
@@ -2748,6 +2824,7 @@ test "previous-model compact uses old model override before smaller-window sampl
         .single,
         null,
         a,
+        null,
         null,
         null,
     );
@@ -2957,16 +3034,6 @@ test "context warning emits once only at medium pressure" {
     emitContextWarningIfNeeded(&backend, .single, context_pressure_mod.ContextPressure.fromModel(200_000, 32_000, null, 155_000), &emitted);
     try std.testing.expectEqual(@as(u32, 1), cap.warnings);
     try std.testing.expect(!emitted);
-}
-
-test "compactHasMinSavings requires at least five percent reduction" {
-    try std.testing.expect(compactHasMinSavings(1000, 949)); // 5.1%
-    try std.testing.expect(compactHasMinSavings(1000, 950)); // exactly 5%
-    try std.testing.expect(!compactHasMinSavings(1000, 951));
-    try std.testing.expect(!compactHasMinSavings(1000, 1000));
-    try std.testing.expect(!compactHasMinSavings(0, 0));
-    try std.testing.expectEqual(@as(usize, 5), compactSavedPercent(1000, 950));
-    try std.testing.expectEqual(@as(usize, 0), compactSavedPercent(1000, 1000));
 }
 
 test "auto-compact preflight keeps serialized request valid UTF-8 after multibyte truncation" {

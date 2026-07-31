@@ -8,9 +8,11 @@ const std = @import("std");
 const sync = @import("platform").sync;
 const types = @import("../types.zig");
 const provider_factory = @import("../api/provider_factory.zig");
+const provider_mod = @import("../api/provider.zig");
 const Conversation = @import("conversation.zig").Conversation;
 const permission = @import("../permission.zig");
 const permission_settings = @import("../permission/settings.zig");
+const compact_kernel = @import("compact_kernel.zig");
 const abort_mod = @import("../util/abort.zig");
 const AbortSignal = abort_mod.AbortSignal;
 const ui_backend = @import("protocol/ui_backend.zig");
@@ -229,6 +231,8 @@ const State = enum {
     idle,
     running,
     abort_requested,
+    compacting,
+    compact_finishing,
     mutating,
     poisoned,
     destroying,
@@ -269,6 +273,26 @@ pub const PermissionRuleMutationError = error{
     OutOfMemory,
     ResourceLimit,
     InvalidRule,
+};
+
+pub const CompactError = error{
+    InvalidOperationId,
+    StaleCompact,
+    SessionBusy,
+    InvalidSessionState,
+    OutOfMemory,
+    ConcurrentMutation,
+};
+
+pub const AbortCompactError = error{
+    InvalidOperationId,
+    StaleCompact,
+    AbortTooLate,
+    InvalidSessionState,
+};
+
+pub const CompactOptions = struct {
+    keep_recent: usize = 10,
 };
 
 /// Synchronous isolated execution hook used by a facade that needs a fresh
@@ -482,6 +506,7 @@ pub const AgentSession = struct {
     /// Host tool 身份锚点(SessionConfig.host_identity_ctx,core 只透传)。
     host_identity_ctx: ?*anyopaque = null,
     abort_signal: AbortSignal,
+    compact_abort_signal: AbortSignal,
     active_sink: ?EventSink = null,
 
     mutex: sync.Mutex = .{},
@@ -494,6 +519,10 @@ pub const AgentSession = struct {
     /// Highest admitted Run ID. Zero is the no-Run sentinel; admission only
     /// replaces it with a strictly greater value, preventing ABA reuse.
     last_run_id: u64 = 0,
+    active_compact_id: u64 = 0,
+    active_compact_provider: ?provider_mod.Provider = null,
+    last_admitted_compact_id: u64 = 0,
+    last_terminal_compact_id: u64 = 0,
     callback_failed: bool = false,
 
     /// Allocate directly at the final address. This avoids the invalid
@@ -586,6 +615,7 @@ pub const AgentSession = struct {
             .host_run_ui_requester = config.run_ui_requester,
             .host_identity_ctx = config.host_identity_ctx,
             .abort_signal = AbortSignal.init(),
+            .compact_abort_signal = AbortSignal.init(),
         };
         self.permission_ctx.session_rules = &self.session_rules;
         self.permission_ctx.settings = if (self.imported_permission_rules) |*rules|
@@ -616,7 +646,7 @@ pub const AgentSession = struct {
         self.mutex.lock();
         switch (self.state) {
             .idle, .poisoned => self.state = .destroying,
-            .running, .abort_requested, .mutating => {
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating => {
                 self.mutex.unlock();
                 return error.SessionBusy;
             },
@@ -668,7 +698,7 @@ pub const AgentSession = struct {
         self.mutex.lock();
         switch (self.state) {
             .idle => {},
-            .running, .abort_requested, .mutating => {
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating => {
                 self.mutex.unlock();
                 return error.SessionBusy;
             },
@@ -732,7 +762,7 @@ pub const AgentSession = struct {
         self.mutex.lock();
         switch (self.state) {
             .idle => self.state = .mutating,
-            .running, .abort_requested, .mutating => {
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating => {
                 self.mutex.unlock();
                 return error.SessionBusy;
             },
@@ -775,6 +805,148 @@ pub const AgentSession = struct {
         std.debug.assert(self.state == .mutating);
         self.state = .idle;
         self.mutex.unlock();
+    }
+
+    pub fn compact(
+        self: *AgentSession,
+        operation_id: u64,
+        options: CompactOptions,
+    ) CompactError!compact_kernel.Report {
+        return self.compactUsingProvider(
+            operation_id,
+            options,
+            self.provider.provider(),
+        );
+    }
+
+    fn compactUsingProvider(
+        self: *AgentSession,
+        operation_id: u64,
+        options: CompactOptions,
+        provider: provider_mod.Provider,
+    ) CompactError!compact_kernel.Report {
+        if (operation_id == 0) return error.InvalidOperationId;
+        self.mutex.lock();
+        if (operation_id <= self.last_admitted_compact_id) {
+            self.mutex.unlock();
+            return error.StaleCompact;
+        }
+        switch (self.state) {
+            .idle => {},
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating => {
+                self.mutex.unlock();
+                return error.SessionBusy;
+            },
+            .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+        self.state = .compacting;
+        self.active_compact_id = operation_id;
+        self.active_compact_provider = provider;
+        self.last_admitted_compact_id = operation_id;
+        self.compact_abort_signal = AbortSignal.init();
+        self.mutex.unlock();
+        defer self.finishCompact(operation_id);
+
+        return compact_kernel.run(
+            self.allocator,
+            &self.conversation,
+            provider,
+            &self.compact_abort_signal,
+            .{
+                .keep_recent = options.keep_recent,
+                .committer = .{
+                    .ctx = self,
+                    .commit_fn = commitCompact,
+                },
+            },
+        );
+    }
+
+    fn commitCompact(
+        raw: *anyopaque,
+        live: *Conversation,
+        suffix: *const Conversation.SuffixSnapshot,
+        replacement: *Conversation,
+        signal: *const AbortSignal,
+    ) compact_kernel.CommitResult {
+        const self: *AgentSession = @ptrCast(@alignCast(raw));
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.state == .compacting);
+        if (signal.isAborted()) return .aborted;
+        if (!live.replaceWithOwnedIfSuffixUnchanged(suffix, replacement))
+            return .concurrent_mutation;
+        self.last_terminal_compact_id = self.active_compact_id;
+        self.active_compact_id = 0;
+        self.active_compact_provider = null;
+        self.state = .compact_finishing;
+        return .committed;
+    }
+
+    pub fn abortCompact(
+        self: *AgentSession,
+        operation_id: u64,
+    ) AbortCompactError!void {
+        if (operation_id == 0) return error.InvalidOperationId;
+        self.mutex.lock();
+        switch (self.state) {
+            .compacting => {
+                if (operation_id < self.active_compact_id) {
+                    self.mutex.unlock();
+                    return error.StaleCompact;
+                }
+                if (operation_id > self.active_compact_id) {
+                    self.mutex.unlock();
+                    return error.InvalidOperationId;
+                }
+                self.compact_abort_signal.abort(.user_interrupt);
+                const provider = self.active_compact_provider.?;
+                self.mutex.unlock();
+                provider.cancel(&self.compact_abort_signal);
+            },
+            .compact_finishing => {
+                const terminal = self.last_terminal_compact_id;
+                self.mutex.unlock();
+                if (operation_id == terminal) return error.AbortTooLate;
+                if (operation_id < terminal) return error.StaleCompact;
+                return error.InvalidOperationId;
+            },
+            .idle => {
+                const terminal = self.last_terminal_compact_id;
+                self.mutex.unlock();
+                if (terminal != 0 and operation_id == terminal)
+                    return error.AbortTooLate;
+                if (terminal != 0 and operation_id < terminal)
+                    return error.StaleCompact;
+                return error.InvalidOperationId;
+            },
+            .running, .abort_requested, .mutating, .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+    }
+
+    fn finishCompact(self: *AgentSession, operation_id: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        switch (self.state) {
+            .compacting => {
+                std.debug.assert(self.active_compact_id == operation_id);
+                self.active_compact_id = 0;
+                self.active_compact_provider = null;
+                self.last_terminal_compact_id = operation_id;
+            },
+            .compact_finishing => {
+                std.debug.assert(self.active_compact_id == 0);
+                std.debug.assert(self.last_terminal_compact_id == operation_id);
+            },
+            else => unreachable,
+        }
+        self.state = .idle;
     }
 
     fn cancelMutation(self: *AgentSession) void {
@@ -913,6 +1085,7 @@ pub const AgentSession = struct {
                 // state transition. The signal itself is atomic and nonblocking.
                 self.abort_signal.abort(reason.internal());
                 self.mutex.unlock();
+                self.provider.provider().cancel(&self.abort_signal);
             },
             .abort_requested => self.mutex.unlock(),
             .idle => {
@@ -920,7 +1093,7 @@ pub const AgentSession = struct {
                 self.mutex.unlock();
                 return if (too_late) error.AbortTooLate else error.StaleRun;
             },
-            .mutating, .poisoned, .destroying => {
+            .compacting, .compact_finishing, .mutating, .poisoned, .destroying => {
                 self.mutex.unlock();
                 return error.InvalidSessionState;
             },
@@ -933,7 +1106,7 @@ pub const AgentSession = struct {
         self.mutex.lock();
         switch (self.state) {
             .idle => {},
-            .running, .abort_requested, .mutating => {
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating => {
                 self.mutex.unlock();
                 return error.SessionBusy;
             },
@@ -971,7 +1144,7 @@ pub const AgentSession = struct {
             return error.InvalidSessionState;
         switch (self.state) {
             .running, .abort_requested => {},
-            .idle, .mutating, .poisoned, .destroying => return error.InvalidSessionState,
+            .idle, .compacting, .compact_finishing, .mutating, .poisoned, .destroying => return error.InvalidSessionState,
         }
         self.active_run_started = true;
     }
@@ -991,7 +1164,7 @@ pub const AgentSession = struct {
             return error.InvalidSessionState;
         switch (self.state) {
             .running, .abort_requested => {},
-            .idle, .mutating, .poisoned, .destroying => return error.InvalidSessionState,
+            .idle, .compacting, .compact_finishing, .mutating, .poisoned, .destroying => return error.InvalidSessionState,
         }
         const aborted = self.state == .abort_requested;
         if (self.callback_failed) {
@@ -1062,7 +1235,7 @@ pub const AgentSession = struct {
                 RunIdentity{ .session_id = self.session_id, .run_id = self.active_run_id }
             else
                 null,
-            .idle, .mutating, .poisoned, .destroying => null,
+            .idle, .compacting, .compact_finishing, .mutating, .poisoned, .destroying => null,
         };
         if (identity == null and (self.state == .running or self.state == .abort_requested)) {
             if (!self.callback_failed) {
@@ -1505,6 +1678,212 @@ test "AgentSession permission rule update is idle-only atomic and preserves memo
     try std.testing.expect(self.permission_ctx.settings == null);
     try std.testing.expect(self.session_rules.isAllowed("Bash"));
     try std.testing.expect(self.session_rules.isDenied("Write"));
+}
+
+const CompactTestProvider = struct {
+    block: bool = false,
+    started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    stream_stage: u8 = 0,
+
+    fn provider(self: *@This()) provider_mod.Provider {
+        return .{
+            .ctx = self,
+            .modelFn = model,
+            .sendStreamFn = sendStream,
+            .sendStreamRetryFn = sendStreamRetry,
+            .sendFn = send,
+            .cancelFn = cancel,
+            .maxTokensFn = maxTokens,
+            .maxInputTokensFn = maxInputTokens,
+            .reasoningEffortFn = reasoningEffort,
+            .supportsFn = supports,
+        };
+    }
+
+    fn cast(raw: *anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw));
+    }
+    fn model(_: *anyopaque) []const u8 {
+        return "compact-test";
+    }
+    fn sendStream(
+        raw: *anyopaque,
+        _: []const types.ApiMessage,
+        _: ?[]const u8,
+        _: ?[]const @import("../json.zig").ToolDefinition,
+        _: ?*const AbortSignal,
+        _: ?[]const u8,
+        _: ?@import("../json.zig").ToolChoice,
+        _: []const u8,
+    ) anyerror!provider_mod.StreamHandle {
+        const self = cast(raw);
+        if (!self.block) return error.ProviderFailed;
+        self.stream_stage = 0;
+        return .{
+            .ctx = raw,
+            .nextFn = next,
+            .deinitFn = deinitStream,
+            .stopReasonFn = stopReason,
+            .requestIdFn = requestId,
+        };
+    }
+    fn sendStreamRetry(
+        raw: *anyopaque,
+        messages: []const types.ApiMessage,
+        system: ?[]const u8,
+        tools: ?[]const @import("../json.zig").ToolDefinition,
+        abort: ?*const AbortSignal,
+        model_override: ?[]const u8,
+        tool_choice: ?@import("../json.zig").ToolChoice,
+        _: u32,
+        _: u64,
+        _: ?provider_mod.RetryReporter,
+        user_query: []const u8,
+    ) anyerror!provider_mod.StreamHandle {
+        return sendStream(raw, messages, system, tools, abort, model_override, tool_choice, user_query);
+    }
+    fn next(raw: *anyopaque) anyerror!?@import("../api/stream.zig").StreamEvent {
+        const self = cast(raw);
+        if (self.stream_stage == 0) {
+            self.stream_stage = 1;
+            return .{ .usage = .{ .input_tokens = 5, .output_tokens = 2 } };
+        }
+        self.started.store(true, .release);
+        while (!self.cancelled.load(.acquire)) std.Thread.yield() catch {};
+        return error.Aborted;
+    }
+    fn deinitStream(_: *anyopaque) void {}
+    fn stopReason(_: *anyopaque) @import("../api/stream.zig").StopReason {
+        return .unknown;
+    }
+    fn requestId(_: *anyopaque) @import("../util/log.zig").RequestId {
+        return .{ .bytes = [_]u8{'c'} ** 12 };
+    }
+    fn send(
+        _: *anyopaque,
+        _: []const types.ApiMessage,
+        _: ?[]const u8,
+        _: ?[]const @import("../json.zig").ToolDefinition,
+        _: ?[]const u8,
+    ) anyerror!provider_mod.ApiResponse {
+        return error.Unused;
+    }
+    fn cancel(raw: *anyopaque, _: *const AbortSignal) void {
+        cast(raw).cancelled.store(true, .release);
+    }
+    fn maxTokens(_: *anyopaque) u32 {
+        return 32_000;
+    }
+    fn maxInputTokens(_: *anyopaque) u32 {
+        return 200_000;
+    }
+    fn reasoningEffort(_: *anyopaque) ?types.ReasoningEffort {
+        return null;
+    }
+    fn supports(_: *anyopaque, _: provider_mod.Capability) bool {
+        return false;
+    }
+};
+
+test "AgentSession compact admission consumes only admitted operation ids" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    try self.conversation.appendText(.user, "old user context");
+    try self.conversation.appendText(.assistant, "old assistant context");
+    try self.conversation.appendText(.user, "recent user context");
+
+    var fake = CompactTestProvider{};
+    try std.testing.expectError(
+        error.InvalidOperationId,
+        self.compactUsingProvider(0, .{ .keep_recent = 1 }, fake.provider()),
+    );
+    const first = try self.compactUsingProvider(
+        1,
+        .{ .keep_recent = 1 },
+        fake.provider(),
+    );
+    try std.testing.expectEqual(compact_kernel.Outcome.degraded, first.outcome);
+    try std.testing.expect(first.dropped > 0);
+    try std.testing.expectEqual(@as(u64, 1), self.last_admitted_compact_id);
+    try std.testing.expectEqual(@as(u64, 1), self.last_terminal_compact_id);
+    try std.testing.expectEqual(@as(u64, 0), self.last_run_id);
+    try std.testing.expectError(
+        error.StaleCompact,
+        self.compactUsingProvider(1, .{}, fake.provider()),
+    );
+    try std.testing.expectError(error.AbortTooLate, self.abortCompact(1));
+    try std.testing.expectError(error.InvalidOperationId, self.abortCompact(2));
+
+    var sink_probe = SinkProbe{};
+    _ = try self.beginRun(7, sink_probe.sink());
+    try std.testing.expectError(
+        error.SessionBusy,
+        self.compactUsingProvider(2, .{}, fake.provider()),
+    );
+    _ = self.finishRunLifecycle();
+    const second = try self.compactUsingProvider(2, .{}, fake.provider());
+    try std.testing.expectEqual(compact_kernel.Outcome.no_change, second.outcome);
+    try std.testing.expectError(error.StaleCompact, self.abortCompact(1));
+    try std.testing.expectError(error.AbortTooLate, self.abortCompact(2));
+}
+
+test "AgentSession compact abort is bounded terminal and leaves Conversation unchanged" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    try self.conversation.appendText(.user, "old user context");
+    try self.conversation.appendText(.assistant, "old assistant context");
+    try self.conversation.appendText(.user, "recent user context");
+    const boundary_before = self.conversation.compact_boundary;
+    var fake = CompactTestProvider{ .block = true };
+    const Worker = struct {
+        session: *AgentSession,
+        provider: provider_mod.Provider,
+        report: ?compact_kernel.Report = null,
+        failure: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            ctx.report = ctx.session.compactUsingProvider(
+                3,
+                .{ .keep_recent = 1 },
+                ctx.provider,
+            ) catch |err| {
+                ctx.failure = err;
+                return;
+            };
+        }
+    };
+    var worker = Worker{ .session = self, .provider = fake.provider() };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    while (!fake.started.load(.acquire)) std.Thread.yield() catch {};
+
+    try std.testing.expectError(error.InvalidOperationId, self.abortCompact(0));
+    try std.testing.expectError(error.StaleCompact, self.abortCompact(2));
+    try std.testing.expectError(error.InvalidOperationId, self.abortCompact(4));
+    try std.testing.expectError(
+        error.SessionBusy,
+        self.compactUsingProvider(4, .{}, fake.provider()),
+    );
+    try std.testing.expectError(error.SessionBusy, self.destroy());
+    try self.abortCompact(3);
+    thread.join();
+
+    try std.testing.expect(worker.failure == null);
+    try std.testing.expectEqual(compact_kernel.Outcome.aborted, worker.report.?.outcome);
+    try std.testing.expectEqual(@as(u64, 5), worker.report.?.usage.input_tokens);
+    try std.testing.expectEqual(@as(u64, 2), worker.report.?.usage.output_tokens);
+    try std.testing.expectEqual(boundary_before, self.conversation.compact_boundary);
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expectEqual(@as(u64, 3), self.last_terminal_compact_id);
+    try std.testing.expectError(error.AbortTooLate, self.abortCompact(3));
 }
 
 test "AgentSession enforces one active Run and monotonic nonzero run ids" {

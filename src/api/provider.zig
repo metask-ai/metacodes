@@ -20,12 +20,113 @@ const types = @import("../types.zig");
 const json_mod = @import("../json.zig");
 const api_stream = @import("stream.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
+const sync = @import("platform").sync;
 
 pub const StreamHandle = api_stream.StreamHandle;
 pub const ApiResponse = api_stream.ApiResponse;
 pub const RetryReporter = api_stream.RetryReporter;
 
+/// Registry for in-flight HTTP requests that borrow an AbortSignal.
+/// Concrete transports register only after the request is initialized and
+/// unregister before destroying it. `cancel` runs the transport's shutdown
+/// hook under the same lock, closing the lifetime race without knowing HTTP
+/// details in this neutral module.
+pub const RequestAbortRegistry = struct {
+    const ShutdownFn = *const fn (ctx: *anyopaque) void;
+    const Slot = struct {
+        signal: *const AbortSignal,
+        ctx: *anyopaque,
+        shutdown_fn: ShutdownFn,
+    };
+
+    mutex: sync.Mutex = .{},
+    slots: std.ArrayList(Slot) = .empty,
+
+    pub fn register(
+        self: *RequestAbortRegistry,
+        allocator: std.mem.Allocator,
+        signal: *const AbortSignal,
+        ctx: *anyopaque,
+        shutdown_fn: ShutdownFn,
+    ) error{OutOfMemory}!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.slots.append(allocator, .{
+            .signal = signal,
+            .ctx = ctx,
+            .shutdown_fn = shutdown_fn,
+        });
+        // Close the race where abort was accepted just before the transport
+        // published its request in this registry.
+        if (signal.isAborted()) shutdown_fn(ctx);
+    }
+
+    pub fn unregister(self: *RequestAbortRegistry, ctx: *anyopaque) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.slots.items, 0..) |active, index| {
+            if (active.ctx == ctx) {
+                _ = self.slots.swapRemove(index);
+                return;
+            }
+        }
+    }
+
+    pub fn cancel(self: *RequestAbortRegistry, signal: *const AbortSignal) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.slots.items) |active| {
+            if (active.signal == signal) active.shutdown_fn(active.ctx);
+        }
+    }
+
+    pub fn deinit(
+        self: *RequestAbortRegistry,
+        allocator: std.mem.Allocator,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.slots.items.len == 0);
+        self.slots.deinit(allocator);
+    }
+};
+
 /// provider+model 的能力查询(P2 落 capability 表;P0 先留枚举 + 占位)。
+/// Interrupt a std.http request without taking ownership of its connection.
+/// Windows needs an abortive AFD disconnect: ordinary `Stream.shutdown` does
+/// not wake an already-pending asynchronous receive. POSIX shutdown does.
+/// Request.deinit remains the sole close/destroy owner.
+pub fn abortHttpRequest(request: *std.http.Client.Request) void {
+    const connection = request.connection orelse return;
+    connection.closing = true;
+    if (@import("builtin").os.tag == .windows) {
+        const win = std.os.windows;
+        var iosb: win.IO_STATUS_BLOCK = undefined;
+        var disconnect = win.AFD.PARTIAL_DISCONNECT_INFO{
+            .DisconnectMode = .{
+                .SEND = true,
+                .RECEIVE = true,
+                .ABORTIVE = true,
+            },
+            .Timeout = -1,
+        };
+        _ = win.ntdll.NtDeviceIoControlFile(
+            connection.stream_reader.stream.socket.handle,
+            null,
+            null,
+            null,
+            &iosb,
+            win.IOCTL.AFD.PARTIAL_DISCONNECT,
+            &disconnect,
+            @sizeOf(@TypeOf(disconnect)),
+            null,
+            0,
+        );
+        return;
+    }
+    connection.stream_reader.stream.shutdown(request.client.io, .both) catch {};
+}
+
 pub const Capability = enum {
     web_search,
     extended_thinking,
@@ -84,6 +185,11 @@ pub const Provider = struct {
         model_override: ?[]const u8,
     ) anyerror!ApiResponse,
 
+    /// Actively interrupt transport I/O registered against this exact signal.
+    /// The default is a no-op for synthetic Providers that already observe the
+    /// signal without a blocking transport.
+    cancelFn: *const fn (ctx: *anyopaque, signal: *const AbortSignal) void = noopCancel,
+
     /// 模型规格:output 上限 / input context window(auto-compact 阈值用)。
     maxTokensFn: *const fn (ctx: *anyopaque) u32,
     maxInputTokensFn: *const fn (ctx: *anyopaque) u32,
@@ -108,6 +214,9 @@ pub const Provider = struct {
     pub inline fn sendWithModel(self: Provider, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, model_override: ?[]const u8) anyerror!ApiResponse {
         return self.sendFn(self.ctx, messages, system, tools, model_override);
     }
+    pub inline fn cancel(self: Provider, signal: *const AbortSignal) void {
+        self.cancelFn(self.ctx, signal);
+    }
     pub inline fn maxTokens(self: Provider) u32 {
         return self.maxTokensFn(self.ctx);
     }
@@ -122,7 +231,31 @@ pub const Provider = struct {
     }
 };
 
+fn noopCancel(_: *anyopaque, _: *const AbortSignal) void {}
+
 test "Capability enum + StreamHandle 可表达" {
     try std.testing.expect(Capability.web_search != Capability.prompt_cache);
     try std.testing.expect(@sizeOf(Provider) > 0);
+}
+
+test "RequestAbortRegistry closes pre-registration abort race" {
+    var registry = RequestAbortRegistry{};
+    defer registry.deinit(std.testing.allocator);
+    var signal = AbortSignal.init();
+    signal.abort(.user_interrupt);
+    var interrupted = false;
+    const Probe = struct {
+        fn shutdown(raw: *anyopaque) void {
+            const value: *bool = @ptrCast(@alignCast(raw));
+            value.* = true;
+        }
+    };
+    try registry.register(
+        std.testing.allocator,
+        &signal,
+        &interrupted,
+        Probe.shutdown,
+    );
+    defer registry.unregister(&interrupted);
+    try std.testing.expect(interrupted);
 }

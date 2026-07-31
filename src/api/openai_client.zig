@@ -52,6 +52,7 @@ pub const OpenAIClient = struct {
     base_url: []const u8, // 完整 chat/completions URL(可指向 MockServer / 自建中转站)
     model: []const u8,
     http_client: http.Client,
+    abort_registry: provider_mod.RequestAbortRegistry = .{},
     max_tokens: u32 = 4096,
     context_window: u32 = 128_000,
 
@@ -65,6 +66,7 @@ pub const OpenAIClient = struct {
         };
     }
     pub fn deinit(self: *OpenAIClient) void {
+        self.abort_registry.deinit(self.allocator);
         self.http_client.deinit();
     }
 
@@ -76,6 +78,7 @@ pub const OpenAIClient = struct {
             .sendStreamFn = &pSendStream,
             .sendStreamRetryFn = &pSendStreamRetry,
             .sendFn = &pSend,
+            .cancelFn = &pCancel,
             .maxTokensFn = &pMaxTokens,
             .maxInputTokensFn = &pMaxInputTokens,
             .reasoningEffortFn = &pReasoningEffort,
@@ -108,6 +111,9 @@ pub const OpenAIClient = struct {
         _ = tools;
         _ = model_override;
         return error.NotImplemented;
+    }
+    fn pCancel(ctx: *anyopaque, signal: *const AbortSignal) void {
+        cast(ctx).abort_registry.cancel(signal);
     }
     fn pSendStreamRetry(ctx: *anyopaque, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, abort: ?*const AbortSignal, model_override: ?[]const u8, tool_choice: ?json_mod.ToolChoice, max_retries: u32, retry_base_ms: u64, reporter: ?provider_mod.RetryReporter, user_query: []const u8) anyerror!StreamHandle {
         // P3 MVP:不做建连重试(直接发一次)。retry/reporter 忽略——证明架构不需要它先齐全。
@@ -146,28 +152,43 @@ pub const OpenAIClient = struct {
             log.errId("openai", rid, "request init failed: {s}", .{@errorName(err)});
             return error.RequestFailed; // req_ptr.* 未初始化, errdefer destroy 即可
         };
+        var registered = false;
+        errdefer {
+            if (registered) self.abort_registry.unregister(req_ptr);
+            req_ptr.deinit();
+        }
+        if (abort) |signal| {
+            try self.abort_registry.register(
+                self.allocator,
+                signal,
+                req_ptr,
+                shutdownRequest,
+            );
+            registered = true;
+        }
         req_ptr.transfer_encoding = .{ .content_length = body.len };
         req_ptr.sendBodyComplete(@constCast(body)) catch |err| {
             log.errId("openai", rid, "send body failed: {s}", .{@errorName(err)});
-            req_ptr.deinit(); // 释放 Request 内部;heap box 由 errdefer destroy
             return error.RequestFailed;
         };
         const response = req_ptr.receiveHead(&.{}) catch |err| {
             log.errId("openai", rid, "receiveHead failed: {s}", .{@errorName(err)});
-            req_ptr.deinit();
             return err;
         };
         if (response.head.status != .ok) {
             log.errId("openai", rid, "HTTP {d}", .{@intFromEnum(response.head.status)});
-            req_ptr.deinit();
             return error.RequestFailed;
         }
 
-        // receiveHead 成功后到 heap 转移所有权前若出错(create OOM),deinit 开着连接的 Request
-        // (否则泄漏 socket fd)。errdefer LIFO:此 deinit 先跑、顶部 destroy 后跑 = deinit()→destroy()。
-        errdefer req_ptr.deinit();
         const heap = try self.allocator.create(OpenAIStream);
-        heap.* = .{ .allocator = self.allocator, .request = req_ptr, .response = response, .abort = abort, .id = rid };
+        heap.* = .{
+            .allocator = self.allocator,
+            .request = req_ptr,
+            .response = response,
+            .abort = abort,
+            .abort_registry = if (abort != null) &self.abort_registry else null,
+            .id = rid,
+        };
         return heap.handle();
     }
 };
@@ -185,6 +206,7 @@ const OpenAIStream = struct {
     transfer_buf: [8192]u8 = undefined,
     reader: ?*std.Io.Reader = null,
     abort: ?*const AbortSignal = null,
+    abort_registry: ?*provider_mod.RequestAbortRegistry = null,
     id: log.RequestId,
     done: bool = false,
     last_stop: StopReason = .unknown,
@@ -229,6 +251,7 @@ const OpenAIStream = struct {
             else => {},
         };
         self.flush_q.deinit(self.allocator);
+        if (self.abort_registry) |registry| registry.unregister(self.request);
         self.request.deinit();
         self.allocator.destroy(self.request);
     }
@@ -382,6 +405,11 @@ const OpenAIStream = struct {
         return null;
     }
 };
+
+fn shutdownRequest(raw: *anyopaque) void {
+    const request: *http.Client.Request = @ptrCast(@alignCast(raw));
+    provider_mod.abortHttpRequest(request);
+}
 
 /// 单个并行 tool_call 的按-index 累积槽。
 const ToolCallAcc = struct {
