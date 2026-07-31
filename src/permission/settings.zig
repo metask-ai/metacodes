@@ -34,7 +34,29 @@ pub const Rule = struct {
     source: Source,
 };
 
-pub const Source = enum { managed, cli, local_project, shared_project, user, builtin };
+pub const Source = enum { managed, cli, local_project, shared_project, user, builtin, host };
+
+pub const RuleSetInput = struct {
+    allow: []const []const u8 = &.{},
+    ask: []const []const u8 = &.{},
+    deny: []const []const u8 = &.{},
+
+    pub fn isEmpty(self: RuleSetInput) bool {
+        return self.allow.len == 0 and self.ask.len == 0 and self.deny.len == 0;
+    }
+};
+
+pub const RuleSetLimits = struct {
+    max_rules: usize = 1024,
+    max_rule_bytes: usize = 64 * 1024,
+    max_total_bytes: usize = 1024 * 1024,
+};
+
+pub const RuleSetError = error{
+    OutOfMemory,
+    ResourceLimit,
+    InvalidRule,
+};
 
 /// 单层 permissions 段(从一个 JSON 文件里解析)。
 pub const Layer = struct {
@@ -89,6 +111,74 @@ pub const MergedSettings = struct {
         return try out.toOwnedSlice(alloc);
     }
 };
+
+/// Strict owned builder for Host-imported Session rules. Product settings
+/// loading remains tolerant of malformed local files; an ABI transaction must
+/// instead reject the entire borrowed input before publication.
+pub fn buildRuleSet(
+    allocator: std.mem.Allocator,
+    input: RuleSetInput,
+    limits: RuleSetLimits,
+) RuleSetError!MergedSettings {
+    var rule_count: usize = 0;
+    var total_bytes: usize = 0;
+    for ([_][]const []const u8{ input.allow, input.ask, input.deny }) |rules| {
+        rule_count = std.math.add(usize, rule_count, rules.len) catch
+            return error.ResourceLimit;
+        if (rule_count > limits.max_rules) return error.ResourceLimit;
+        for (rules) |raw| {
+            if (raw.len == 0 or raw.len > limits.max_rule_bytes or
+                !std.unicode.utf8ValidateSlice(raw))
+                return error.InvalidRule;
+            total_bytes = std.math.add(usize, total_bytes, raw.len) catch
+                return error.ResourceLimit;
+            if (total_bytes > limits.max_total_bytes)
+                return error.ResourceLimit;
+        }
+    }
+
+    const allow = try buildStrictRules(allocator, input.allow);
+    errdefer freeRules(allocator, allow);
+    const ask = try buildStrictRules(allocator, input.ask);
+    errdefer freeRules(allocator, ask);
+    const deny = try buildStrictRules(allocator, input.deny);
+    errdefer freeRules(allocator, deny);
+    const layers = allocator.alloc(Layer, 1) catch return error.OutOfMemory;
+    layers[0] = .{
+        .source = .host,
+        .allow = allow,
+        .ask = ask,
+        .deny = deny,
+    };
+    return .{ .layers = layers, .allocator = allocator };
+}
+
+fn buildStrictRules(
+    allocator: std.mem.Allocator,
+    borrowed: []const []const u8,
+) RuleSetError![]const Rule {
+    var rules: std.ArrayList(Rule) = .empty;
+    errdefer {
+        for (rules.items) |rule| allocator.free(rule.raw);
+        rules.deinit(allocator);
+    }
+    for (borrowed) |raw| {
+        const owned = allocator.dupe(u8, raw) catch return error.OutOfMemory;
+        errdefer allocator.free(owned);
+        const spec = rule_spec.parseRule(owned) catch return error.InvalidRule;
+        rules.append(allocator, .{
+            .raw = owned,
+            .spec = spec,
+            .source = .host,
+        }) catch return error.OutOfMemory;
+    }
+    return rules.toOwnedSlice(allocator) catch return error.OutOfMemory;
+}
+
+fn freeRules(allocator: std.mem.Allocator, rules: []const Rule) void {
+    for (rules) |rule| allocator.free(rule.raw);
+    allocator.free(rules);
+}
 
 /// 把 raw additionalDirectories 解析为绝对路径 owned 列表(元素与外层 slice 都由
 /// alloc 分配,caller 逐项 free)。规则:绝对原样 / `~` `~/x` 按 home / 相对按 cwd
@@ -358,6 +448,50 @@ fn collectCsv(
         };
         try out.append(alloc, .{ .raw = raw, .spec = spec, .source = source });
     }
+}
+
+test "Host rule set builder is strict owned and canonical" {
+    var allow_rule = [_]u8{ 'B', 'a', 's', 'h' };
+    const deny_rule = "Write(.env)";
+    var rules = try buildRuleSet(std.testing.allocator, .{
+        .allow = &.{&allow_rule},
+        .deny = &.{deny_rule},
+    }, .{});
+    defer rules.deinit();
+    allow_rule[0] = 'X';
+
+    const mctx = rule_spec.MatchContext{
+        .cwd = "/project",
+        .project_root = "/project",
+        .home = "/home/test",
+        .alloc = std.testing.allocator,
+    };
+    try std.testing.expectEqual(
+        Decision.allow,
+        evaluate(&rules, &mctx, "Bash", "{\"command\":\"echo ok\"}"),
+    );
+    try std.testing.expectEqual(
+        Decision.deny,
+        evaluate(&rules, &mctx, "Write", "{\"file_path\":\"/project/.env\"}"),
+    );
+}
+
+test "Host rule set builder rejects malformed UTF-8 syntax and limits" {
+    try std.testing.expectError(error.InvalidRule, buildRuleSet(
+        std.testing.allocator,
+        .{ .allow = &.{"Bash("} },
+        .{},
+    ));
+    try std.testing.expectError(error.InvalidRule, buildRuleSet(
+        std.testing.allocator,
+        .{ .allow = &.{&[_]u8{0xff}} },
+        .{},
+    ));
+    try std.testing.expectError(error.ResourceLimit, buildRuleSet(
+        std.testing.allocator,
+        .{ .allow = &.{ "Read", "Write" } },
+        .{ .max_rules = 1 },
+    ));
 }
 
 // ============================================================================

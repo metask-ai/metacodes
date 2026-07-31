@@ -10,6 +10,7 @@ const types = @import("../types.zig");
 const provider_factory = @import("../api/provider_factory.zig");
 const Conversation = @import("conversation.zig").Conversation;
 const permission = @import("../permission.zig");
+const permission_settings = @import("../permission/settings.zig");
 const abort_mod = @import("../util/abort.zig");
 const AbortSignal = abort_mod.AbortSignal;
 const ui_backend = @import("protocol/ui_backend.zig");
@@ -191,6 +192,7 @@ pub const SessionConfig = struct {
     model: []const u8,
     base_url: ?[]const u8 = null,
     permission_mode: types.PermissionMode = .default,
+    permission_rules: ?permission_settings.RuleSetInput = null,
     workspace: WorkspaceConfig,
     /// Explicit authority ceiling. It can only select names present in the
     /// Runtime catalog; an empty list creates a text-only Session deliberately.
@@ -259,6 +261,14 @@ pub const ModelMutationError = error{
     InvalidSessionState,
     InvalidModel,
     OutOfMemory,
+};
+
+pub const PermissionRuleMutationError = error{
+    SessionBusy,
+    InvalidSessionState,
+    OutOfMemory,
+    ResourceLimit,
+    InvalidRule,
 };
 
 /// Synchronous isolated execution hook used by a facade that needs a fresh
@@ -465,6 +475,7 @@ pub const AgentSession = struct {
     read_state: ReadState,
     jobs: ?JobRegistry,
     session_rules: SessionRules,
+    imported_permission_rules: ?permission_settings.MergedSettings,
     permission_ctx: permission.PermissionContext,
     host_ui_requester: ?UiRequester,
     host_run_ui_requester: ?AgentSessionUiRequester,
@@ -514,6 +525,15 @@ pub const AgentSession = struct {
             jobs = try JobRegistry.init(allocator);
         }
         errdefer if (jobs) |*registry| registry.deinit();
+        var imported_permission_rules: ?permission_settings.MergedSettings =
+            if (config.permission_rules) |rules|
+                if (rules.isEmpty())
+                    null
+                else
+                    try permission_settings.buildRuleSet(allocator, rules, .{})
+            else
+                null;
+        errdefer if (imported_permission_rules) |*rules| rules.deinit();
 
         const api_key = try allocator.dupe(u8, config.api_key);
         errdefer secureFree(allocator, api_key);
@@ -560,6 +580,7 @@ pub const AgentSession = struct {
             .read_state = ReadState.init(allocator),
             .jobs = jobs,
             .session_rules = .{},
+            .imported_permission_rules = imported_permission_rules,
             .permission_ctx = permission_ctx,
             .host_ui_requester = config.ui_requester,
             .host_run_ui_requester = config.run_ui_requester,
@@ -567,6 +588,10 @@ pub const AgentSession = struct {
             .abort_signal = AbortSignal.init(),
         };
         self.permission_ctx.session_rules = &self.session_rules;
+        self.permission_ctx.settings = if (self.imported_permission_rules) |*rules|
+            rules
+        else
+            null;
         self.permission_ctx.ui_requester = if (config.ui_requester != null or config.run_ui_requester != null)
             .{ .ctx = self, .requestFn = requestHostUi }
         else
@@ -608,6 +633,7 @@ pub const AgentSession = struct {
         self.provider.deinit();
         self.conversation.deinit();
         if (self.jobs) |*registry| registry.deinit();
+        if (self.imported_permission_rules) |*rules| rules.deinit();
         self.read_state.deinit();
         self.tools.deinit();
         self.workspace.deinit();
@@ -690,6 +716,60 @@ pub const AgentSession = struct {
         // reclaim `self` while this call still reads its allocator.
         previous_provider.deinit();
         self.allocator.free(previous_model);
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        self.state = .idle;
+        self.mutex.unlock();
+    }
+
+    /// Atomically replace the Host-imported canonical permission rule layer.
+    /// Session-local allow/deny memory is a distinct field and is preserved.
+    pub fn updatePermissionRules(
+        self: *AgentSession,
+        input: permission_settings.RuleSetInput,
+    ) PermissionRuleMutationError!void {
+        self.mutex.lock();
+        switch (self.state) {
+            .idle => self.state = .mutating,
+            .running, .abort_requested, .mutating => {
+                self.mutex.unlock();
+                return error.SessionBusy;
+            },
+            .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+        self.mutex.unlock();
+
+        const replacement: ?permission_settings.MergedSettings =
+            if (input.isEmpty())
+                null
+            else
+                permission_settings.buildRuleSet(
+                    self.allocator,
+                    input,
+                    .{},
+                ) catch |err| {
+                    self.cancelMutation();
+                    return err;
+                };
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        const previous = self.imported_permission_rules;
+        self.imported_permission_rules = replacement;
+        self.permission_ctx.settings = if (self.imported_permission_rules) |*rules|
+            rules
+        else
+            null;
+        self.mutex.unlock();
+
+        if (previous) |rules_value| {
+            var rules = rules_value;
+            rules.deinit();
+        }
 
         self.mutex.lock();
         std.debug.assert(self.state == .mutating);
@@ -1326,6 +1406,105 @@ test "AgentSession model mutation rolls back allocation failures" {
     try std.testing.expect(self.conversation.messages.items.ptr == original_message_ptr);
     try std.testing.expectEqualStrings("test-model", self.model);
     try std.testing.expect(!self.isPoisoned());
+}
+
+test "AgentSession owns initial imported permission rules" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    var borrowed_rule = [_]u8{ 'W', 'r', 'i', 't', 'e' };
+    const self = try runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"Read"},
+        .permission_rules = .{ .allow = &.{&borrowed_rule} },
+    });
+    defer self.destroy() catch unreachable;
+    borrowed_rule[0] = 'X';
+
+    try std.testing.expectEqual(
+        permission.PermissionResult.allow,
+        permission.checkPermission(
+            &self.permission_ctx,
+            "Write",
+            "{\"file_path\":\"ordinary.txt\"}",
+        ),
+    );
+}
+
+test "AgentSession permission rule update is idle-only atomic and preserves memory" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    self.session_rules.rememberAllow("Bash");
+    self.session_rules.rememberDeny("Write");
+
+    try self.updatePermissionRules(.{
+        .allow = &.{"Write"},
+        .ask = &.{"Edit"},
+        .deny = &.{"Bash"},
+    });
+    try std.testing.expectEqual(
+        permission.PermissionResult.deny,
+        permission.checkPermission(
+            &self.permission_ctx,
+            "Bash",
+            "{\"command\":\"echo ok\"}",
+        ),
+    );
+    try std.testing.expectEqual(
+        permission.PermissionResult.deny,
+        permission.checkPermission(
+            &self.permission_ctx,
+            "Write",
+            "{\"file_path\":\"ordinary.txt\"}",
+        ),
+    );
+    try std.testing.expectEqual(
+        permission.PermissionResult.ask,
+        permission.checkPermission(
+            &self.permission_ctx,
+            "Edit",
+            "{\"file_path\":\"ordinary.txt\"}",
+        ),
+    );
+    const previous_settings = self.permission_ctx.settings;
+    try std.testing.expectError(
+        error.InvalidRule,
+        self.updatePermissionRules(.{ .allow = &.{"Bash("} }),
+    );
+    try std.testing.expect(self.permission_ctx.settings == previous_settings);
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expect(!self.isPoisoned());
+
+    var probe = SinkProbe{};
+    _ = try self.beginRun(31, probe.sink());
+    try std.testing.expectError(
+        error.SessionBusy,
+        self.updatePermissionRules(.{}),
+    );
+    try std.testing.expect(self.permission_ctx.settings == previous_settings);
+    _ = self.finishRunLifecycle();
+
+    try self.updatePermissionRules(.{ .ask = &.{"Bash"} });
+    try std.testing.expectEqual(
+        permission.PermissionResult.allow,
+        permission.checkPermission(
+            &self.permission_ctx,
+            "Bash",
+            "{\"command\":\"echo ok\"}",
+        ),
+    );
+    try self.updatePermissionRules(.{});
+    try std.testing.expect(self.permission_ctx.settings == null);
+    try std.testing.expect(self.session_rules.isAllowed("Bash"));
+    try std.testing.expect(self.session_rules.isDenied("Write"));
 }
 
 test "AgentSession enforces one active Run and monotonic nonzero run ids" {

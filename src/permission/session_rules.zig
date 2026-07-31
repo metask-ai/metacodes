@@ -21,6 +21,8 @@ pub const MAX_REMEMBERED = 64;
 const MAX_NAME = 64;
 
 pub const SessionRules = struct {
+    pub const Decision = enum { allow, deny };
+
     always_allow: [MAX_REMEMBERED][]const u8 = undefined,
     always_allow_count: usize = 0,
     session_deny: [MAX_REMEMBERED][]const u8 = undefined,
@@ -64,6 +66,17 @@ pub const SessionRules = struct {
         defer _ = self.mutex.unlock();
         return contains(self.session_deny[0..self.session_deny_count], name);
     }
+
+    /// One locked deny-first snapshot for the canonical decision chain.
+    pub fn decisionFor(self: *SessionRules, name: []const u8) ?Decision {
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
+        if (contains(self.session_deny[0..self.session_deny_count], name))
+            return .deny;
+        if (contains(self.always_allow[0..self.always_allow_count], name))
+            return .allow;
+        return null;
+    }
 };
 
 fn contains(list: []const []const u8, name: []const u8) bool {
@@ -86,6 +99,14 @@ test "rememberAllow/isAllowed + 与 deny 隔离" {
     r.rememberDeny("Write");
     try testing.expect(r.isDenied("Write"));
     try testing.expect(!r.isAllowed("Write"));
+    try testing.expectEqual(SessionRules.Decision.deny, r.decisionFor("Write").?);
+}
+
+test "deny wins when both Session memories contain the same tool" {
+    var r = SessionRules{};
+    r.rememberAllow("Bash");
+    r.rememberDeny("Bash");
+    try testing.expectEqual(SessionRules.Decision.deny, r.decisionFor("Bash").?);
 }
 
 test "remember 上限/超长名安全(不越界)" {

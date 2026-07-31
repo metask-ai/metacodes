@@ -28,48 +28,6 @@ comptime {
         @compileError("AgentCore wire and Skill catalog slot limits must match");
 }
 
-/// AgentCore owns session-scoped permission memory. Public "session" choices
-/// must never reach the product-managed core persistence branch.
-const HostPermissionRules = struct {
-    const Decision = enum { allow, deny };
-
-    mutex: sync.Mutex = .{},
-    allowed: std.ArrayList([]u8) = .empty,
-    denied: std.ArrayList([]u8) = .empty,
-
-    fn deinit(self: *HostPermissionRules) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        for (self.allowed.items) |name| allocator.free(name);
-        for (self.denied.items) |name| allocator.free(name);
-        self.allowed.deinit(allocator);
-        self.denied.deinit(allocator);
-    }
-
-    fn lookup(self: *HostPermissionRules, name: []const u8) ?Decision {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        if (contains(self.denied.items, name)) return .deny;
-        if (contains(self.allowed.items, name)) return .allow;
-        return null;
-    }
-
-    fn remember(self: *HostPermissionRules, decision: Decision, name: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        const list = if (decision == .allow) &self.allowed else &self.denied;
-        if (contains(list.items, name)) return;
-        const owned = try allocator.dupe(u8, name);
-        errdefer allocator.free(owned);
-        try list.append(allocator, owned);
-    }
-
-    fn contains(names: []const []u8, needle: []const u8) bool {
-        for (names) |name| if (std.mem.eql(u8, name, needle)) return true;
-        return false;
-    }
-};
-
 const AbiHostTool = struct {
     ctx: ?*anyopaque,
     execute_fn: wire.HostExecuteFnV1,
@@ -224,7 +182,6 @@ const AbiSession = struct {
     /// Null only in narrow unit-test fakes. Every live Session created through
     /// the ABI owns exactly one immutable baseline frame.
     policy_root: ?*policy_frame.PolicyFrame = null,
-    host_permission_rules: HostPermissionRules = .{},
     call_mutex: sync.Mutex = .{},
     call_state: CallState = .idle,
 
@@ -309,10 +266,7 @@ const AbiSession = struct {
                     self.recordCallbackStatus(if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_CALLBACK_FAILED);
                     return err;
                 };
-                self.captureSessionPermission(req, out) catch |err| {
-                    self.recordCallbackStatus(wire.STATUS_OUT_OF_MEMORY);
-                    return err;
-                };
+                self.captureSessionPermission(req, out);
                 break :blk .answered;
             },
             else => {
@@ -327,25 +281,28 @@ const AbiSession = struct {
             .permission => |value| value,
             else => return null,
         };
-        return switch (self.host_permission_rules.lookup(permission.tool) orelse return null) {
+        return switch (self.core_session.session_rules.decisionFor(permission.tool) orelse return null) {
             .allow => .allow_once,
             .deny => .deny_once,
         };
     }
 
-    fn captureSessionPermission(self: *AbiSession, req: *const ui_request.UiRequest, out: *ui_request.UiResponse) !void {
+    fn captureSessionPermission(self: *AbiSession, req: *const ui_request.UiRequest, out: *ui_request.UiResponse) void {
         const permission = switch (req.*) {
             .permission => |value| value,
             else => return,
         };
+        // The Host already observes and may persist its own response. Core gets
+        // only a one-shot projection so product settings persistence remains
+        // unreachable from the AgentCore path.
         switch (out.*) {
             .permission => |choice| switch (choice) {
                 .allow_always => {
-                    try self.host_permission_rules.remember(.allow, permission.tool);
+                    self.core_session.session_rules.rememberAllow(permission.tool);
                     out.* = .{ .permission = .allow_once };
                 },
                 .deny_tool_session => {
-                    try self.host_permission_rules.remember(.deny, permission.tool);
+                    self.core_session.session_rules.rememberDeny(permission.tool);
                     out.* = .{ .permission = .deny_once };
                 },
                 .allow_once, .deny_once => {},
@@ -469,6 +426,19 @@ const AbiSession = struct {
         if (!self.tryBeginMutation()) return error.SessionBusy;
         defer self.finishMutation();
         try self.core_session.setModel(model);
+    }
+
+    /// Internal Revision 5 adapter. Host rules are compiled by the canonical
+    /// Core parser/matcher; the facade contributes only lifecycle admission.
+    fn updatePermissionRules(
+        self: *AbiSession,
+        input: core.permission_settings.RuleSetInput,
+    ) !void {
+        if (self.facade_poisoned.load(.acquire))
+            return error.InvalidSessionState;
+        if (!self.tryBeginMutation()) return error.SessionBusy;
+        defer self.finishMutation();
+        try self.core_session.updatePermissionRules(input);
     }
 
     /// Internal typed-Skill entry used by the Revision 5 public input union.
@@ -1597,7 +1567,6 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     self.workspace_scope_id = workspace_scope_id;
     self.skill_binding = initial_binding;
     self.policy_root = null;
-    self.host_permission_rules = .{};
     self.call_mutex = .{};
     self.call_state = .idle;
     self.core_session = runtime.core_runtime.createSession(.{
@@ -1663,7 +1632,6 @@ fn sessionDestroy(handle: ?*wire.SessionHandle, out_error: ?*wire.OwnedBytesV1) 
         binding.deinit(&runtime.catalogs);
         self.skill_binding = null;
     }
-    self.host_permission_rules.deinit();
     allocator.destroy(self);
     return wire.STATUS_OK;
 }
@@ -2141,7 +2109,7 @@ test "Host UI descriptor ownership is independent of callback status" {
     }
 }
 
-test "AgentCore permission session choices stay in facade memory and unavailable denies once" {
+test "AgentCore permission session choices use Core memory and unavailable denies once" {
     const Probe = struct {
         var status: u32 = wire.UI_ANSWERED;
         var response_json: []const u8 = "{\"permission\":\"allow_session\"}";
@@ -2162,6 +2130,24 @@ test "AgentCore permission session choices stay in facade memory and unavailable
             releases += 1;
         }
     };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{} },
+    );
+    defer native_runtime.destroy() catch unreachable;
+    const native_session = try native_runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = root_buffer[0..root_len] },
+        .allowed_tools = &.{},
+    });
+    defer native_session.destroy() catch unreachable;
+
     const request = ui_request.UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
     var response: ui_request.UiResponse = undefined;
     var fake = AbiSession{
@@ -2176,9 +2162,8 @@ test "AgentCore permission session choices stay in facade memory and unavailable
         },
         .callback_status = .init(wire.STATUS_OK),
         .facade_poisoned = .init(false),
-        .core_session = undefined,
+        .core_session = native_session,
     };
-    defer fake.host_permission_rules.deinit();
 
     Probe.status = wire.UI_ANSWERED;
     Probe.response_json = "{\"permission\":\"allow_session\"}";
@@ -2192,7 +2177,7 @@ test "AgentCore permission session choices stay in facade memory and unavailable
     try std.testing.expectEqual(@as(usize, 1), Probe.calls);
     try std.testing.expectEqual(@as(usize, 1), Probe.releases);
 
-    // The second request is answered from AgentCore-owned memory. The product
+    // The second request is answered from Core-owned memory. The product
     // callback is not invoked and the core only sees an allow-once projection,
     // so its disk-persistence branch is unreachable.
     try std.testing.expectEqual(
@@ -2207,9 +2192,8 @@ test "AgentCore permission session choices stay in facade memory and unavailable
         .callbacks = fake.callbacks,
         .callback_status = .init(wire.STATUS_OK),
         .facade_poisoned = .init(false),
-        .core_session = undefined,
+        .core_session = native_session,
     };
-    defer denied.host_permission_rules.deinit();
     const write_request = ui_request.UiRequest{ .permission = .{ .tool = "Write", .args = "{}" } };
     Probe.status = wire.UI_ANSWERED;
     Probe.response_json = "{\"permission\":\"deny_session\"}";
@@ -2232,14 +2216,14 @@ test "AgentCore permission session choices stay in facade memory and unavailable
         .callbacks = fake.callbacks,
         .callback_status = .init(wire.STATUS_OK),
         .facade_poisoned = .init(false),
-        .core_session = undefined,
+        .core_session = native_session,
     };
-    defer unavailable.host_permission_rules.deinit();
+    const edit_request = ui_request.UiRequest{ .permission = .{ .tool = "Edit", .args = "{}" } };
     Probe.status = wire.UI_UNAVAILABLE;
     Probe.response_json = "";
     try std.testing.expectEqual(
         ui_request.RequestOutcome.answered,
-        try AbiSession.requestUi(&unavailable, .{ .session_id = .single, .run_id = 3 }, std.testing.allocator, &request, &response),
+        try AbiSession.requestUi(&unavailable, .{ .session_id = .single, .run_id = 3 }, std.testing.allocator, &edit_request, &response),
     );
     try std.testing.expect(response == .permission and response.permission == .deny_once);
     try std.testing.expectEqual(wire.STATUS_OK, unavailable.callback_status.load(.acquire));
@@ -2613,8 +2597,7 @@ test "AbiSession model mutation delegates atomically through the shared gate" {
         .facade_poisoned = .init(false),
         .core_session = native_session,
     };
-    defer session.host_permission_rules.deinit();
-    try session.host_permission_rules.remember(.allow, "Read");
+    native_session.session_rules.rememberAllow("Read");
     const conversation_ptr = native_session.conversation.messages.items.ptr;
 
     try session.setModel("missing-model-is-locally-valid");
@@ -2624,8 +2607,8 @@ test "AbiSession model mutation delegates atomically through the shared gate" {
     );
     try std.testing.expect(native_session.conversation.messages.items.ptr == conversation_ptr);
     try std.testing.expectEqual(
-        HostPermissionRules.Decision.allow,
-        session.host_permission_rules.lookup("Read").?,
+        core.permission_session_rules.SessionRules.Decision.allow,
+        native_session.session_rules.decisionFor("Read").?,
     );
     try std.testing.expect(session.skill_binding == null);
     try std.testing.expectEqual(AbiSession.CallState.idle, session.call_state);
@@ -2638,6 +2621,78 @@ test "AbiSession model mutation delegates atomically through the shared gate" {
     session.facade_poisoned.store(true, .release);
     try std.testing.expectError(error.InvalidSessionState, session.setModel("poisoned-model"));
     try std.testing.expectEqualStrings("missing-model-is-locally-valid", native_session.model);
+}
+
+test "AbiSession permission rule mutation delegates through the shared gate" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{} },
+    );
+    defer native_runtime.destroy() catch unreachable;
+    const native_session = try native_runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = root_buffer[0..root_len] },
+        .allowed_tools = &.{},
+    });
+    defer native_session.destroy() catch unreachable;
+    native_session.session_rules.rememberAllow("Bash");
+
+    var session = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = native_session,
+    };
+    try session.updatePermissionRules(.{
+        .allow = &.{"Write"},
+        .deny = &.{"Bash"},
+    });
+    try std.testing.expectEqual(
+        core.permission.PermissionResult.deny,
+        core.permission.checkPermission(
+            &native_session.permission_ctx,
+            "Bash",
+            "{\"command\":\"echo ok\"}",
+        ),
+    );
+    try std.testing.expectEqual(
+        core.permission.PermissionResult.allow,
+        core.permission.checkPermission(
+            &native_session.permission_ctx,
+            "Write",
+            "{\"file_path\":\"ordinary.txt\"}",
+        ),
+    );
+    try std.testing.expect(native_session.session_rules.isAllowed("Bash"));
+    const published = native_session.permission_ctx.settings;
+
+    try std.testing.expectError(
+        error.InvalidRule,
+        session.updatePermissionRules(.{ .allow = &.{"Bash("} }),
+    );
+    try std.testing.expect(native_session.permission_ctx.settings == published);
+    try std.testing.expectEqual(AbiSession.CallState.idle, session.call_state);
+
+    session.call_state = .running;
+    try std.testing.expectError(
+        error.SessionBusy,
+        session.updatePermissionRules(.{}),
+    );
+    session.call_state = .idle;
+    try std.testing.expect(native_session.permission_ctx.settings == published);
+
+    session.facade_poisoned.store(true, .release);
+    try std.testing.expectError(
+        error.InvalidSessionState,
+        session.updatePermissionRules(.{}),
+    );
+    try std.testing.expect(native_session.permission_ctx.settings == published);
 }
 
 test "Session Skill selection update is explicit atomic and selection-only" {

@@ -115,6 +115,7 @@ pub fn checkPermission(ctx: *const PermissionContext, tool_name: []const u8, arg
         .rules = ctx.rules,
         .active_skill = ctx.active_skill,
         .settings = ctx.settings,
+        .session_rules = ctx.session_rules,
         .match_ctx = mctx,
         .sandbox_enabled = ctx.sandbox_enabled,
         .auto_allow_bash_if_sandboxed = ctx.auto_allow_bash_if_sandboxed,

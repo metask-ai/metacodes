@@ -11,6 +11,7 @@ const Mode = @import("mode.zig").Mode;
 const category = @import("category.zig");
 const rule_matcher = @import("rule_matcher.zig");
 const settings_mod = @import("settings.zig");
+const SessionRules = @import("session_rules.zig").SessionRules;
 const rule_spec = @import("rule_spec.zig");
 const hooks_mod = @import("hooks.zig");
 const log = @import("../util/log.zig");
@@ -25,6 +26,9 @@ pub const Context = struct {
     active_skill: ?*const @import("../skills/active.zig").ActiveSkillState = null,
     /// 5 层 settings 聚合(管理 + cli + project local/shared + user)。
     settings: ?*const settings_mod.MergedSettings = null,
+    /// Session-local allow/deny memory. It participates in the same deny-first
+    /// matrix as imported settings instead of being deferred to the UI layer.
+    session_rules: ?*SessionRules = null,
     /// rule_spec 匹配上下文(cwd / project_root / home),用于 path / bash compound 等。
     match_ctx: rule_spec.MatchContext = .{},
     /// 沙箱启用?(用于 autoAllowBashIfSandboxed)。
@@ -96,35 +100,43 @@ pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decis
         }
     }
 
-    // 1. settings(deny → allow → ask;deny 永远优先)
-    if (ctx.settings) |s| {
-        const d = settings_mod.evaluate(s, &ctx.match_ctx, tool_name, args);
-        switch (d) {
-            .deny => {
-                log.debug("permission", "settings deny tool={s}", .{tool_name});
-                return .deny;
-            },
-            .allow => {
-                // 但 protected paths 始终需要 ask(即便 allow 规则命中也不豁免)
-                if (isProtectedTarget(ctx, tool_name, args)) {
-                    log.debug("permission", "settings allow OVERRIDDEN by protected path tool={s}", .{tool_name});
-                    return .ask;
-                }
-                log.debug("permission", "settings allow tool={s}", .{tool_name});
-                return .allow;
-            },
-            .ask => {
-                log.debug("permission", "settings ask tool={s}", .{tool_name});
-                return .ask;
-            },
-            .undecided => {}, // 落到下层
-        }
+    // 1. Imported settings and Session memory form one deny-first matrix.
+    const imported = if (ctx.settings) |settings|
+        settings_mod.evaluate(settings, &ctx.match_ctx, tool_name, args)
+    else
+        settings_mod.Decision.undecided;
+    const remembered = if (ctx.session_rules) |rules|
+        rules.decisionFor(tool_name)
+    else
+        null;
+    if (imported == .deny or
+        (remembered != null and remembered.? == .deny))
+    {
+        log.debug("permission", "imported/session deny tool={s}", .{tool_name});
+        return .deny;
     }
 
-    // 2. Protected paths:Edit/Write/NotebookEdit 到 .git/.env/.ssh/* 永远 ask
+    // 2. Protected paths are a Core ceiling over imported and temporary allow.
     if (isProtectedTarget(ctx, tool_name, args)) {
         log.debug("permission", "protected path tool={s} -> ask", .{tool_name});
         return .ask;
+    }
+
+    if (remembered != null and remembered.? == .allow) {
+        log.debug("permission", "session allow tool={s}", .{tool_name});
+        return .allow;
+    }
+    switch (imported) {
+        .allow => {
+            log.debug("permission", "settings allow tool={s}", .{tool_name});
+            return .allow;
+        },
+        .ask => {
+            log.debug("permission", "settings ask tool={s}", .{tool_name});
+            return .ask;
+        },
+        .deny => unreachable,
+        .undecided => {},
     }
 
     // 2.5 memdir 写豁免(通道 B):模型用 Write/Edit 自管自动记忆目录。目标落在 memdir
@@ -393,6 +405,89 @@ test "settings allow grants Bash in default mode" {
     try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"git status\"}") == .allow);
     // npm test:未命中 settings、非 readonly → 落到 mode → ask
     try std.testing.expect(check(&ctx, "Bash", "{\"command\":\"npm test\"}") == .ask);
+}
+
+test "imported rules and Session memory use the complete deny-first matrix" {
+    var imported_allow = try settings_mod.buildRuleSet(
+        std.testing.allocator,
+        .{ .allow = &.{"Bash"} },
+        .{},
+    );
+    defer imported_allow.deinit();
+    var imported_ask = try settings_mod.buildRuleSet(
+        std.testing.allocator,
+        .{ .ask = &.{"Bash"} },
+        .{},
+    );
+    defer imported_ask.deinit();
+    var imported_deny = try settings_mod.buildRuleSet(
+        std.testing.allocator,
+        .{ .deny = &.{"Bash"} },
+        .{},
+    );
+    defer imported_deny.deinit();
+    var allow_memory = SessionRules{};
+    allow_memory.rememberAllow("Bash");
+    var deny_memory = SessionRules{};
+    deny_memory.rememberDeny("Bash");
+    const args = "{\"command\":\"echo ok\"}";
+
+    try std.testing.expectEqual(Decision.allow, check(&.{
+        .mode = .default,
+        .settings = &imported_allow,
+        .session_rules = &allow_memory,
+    }, "Bash", args));
+    try std.testing.expectEqual(Decision.deny, check(&.{
+        .mode = .default,
+        .settings = &imported_deny,
+        .session_rules = &allow_memory,
+    }, "Bash", args));
+    try std.testing.expectEqual(Decision.deny, check(&.{
+        .mode = .default,
+        .settings = &imported_allow,
+        .session_rules = &deny_memory,
+    }, "Bash", args));
+    try std.testing.expectEqual(Decision.deny, check(&.{
+        .mode = .default,
+        .settings = &imported_deny,
+        .session_rules = &deny_memory,
+    }, "Bash", args));
+
+    try std.testing.expectEqual(Decision.allow, check(&.{
+        .mode = .default,
+        .settings = &imported_ask,
+        .session_rules = &allow_memory,
+    }, "Bash", args));
+    try std.testing.expectEqual(Decision.deny, check(&.{
+        .mode = .default,
+        .settings = &imported_ask,
+        .session_rules = &deny_memory,
+    }, "Bash", args));
+    try std.testing.expectEqual(Decision.ask, check(&.{
+        .mode = .default,
+        .settings = &imported_ask,
+    }, "Bash", args));
+}
+
+test "protected paths override imported and Session allow" {
+    var imported_allow = try settings_mod.buildRuleSet(
+        std.testing.allocator,
+        .{ .allow = &.{"Write"} },
+        .{},
+    );
+    defer imported_allow.deinit();
+    var allow_memory = SessionRules{};
+    allow_memory.rememberAllow("Write");
+    const ctx = Context{
+        .mode = .bypass_permissions,
+        .settings = &imported_allow,
+        .session_rules = &allow_memory,
+        .path_check_allocator = std.testing.allocator,
+    };
+    try std.testing.expectEqual(
+        Decision.ask,
+        check(&ctx, "Write", "{\"file_path\":\"/project/.env\"}"),
+    );
 }
 
 test "B1 绕过修复(第4镜像点·规则匹配器): allow 规则 Write(/**) 圈 /proj 不放行 .. 逃逸" {
