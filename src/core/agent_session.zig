@@ -227,6 +227,7 @@ const State = enum {
     idle,
     running,
     abort_requested,
+    mutating,
     poisoned,
     destroying,
 };
@@ -251,6 +252,13 @@ pub const LifecycleError = error{
     AbortTooLate,
     InvalidSessionState,
     CallbackFailed,
+};
+
+pub const ModelMutationError = error{
+    SessionBusy,
+    InvalidSessionState,
+    InvalidModel,
+    OutOfMemory,
 };
 
 /// Synchronous isolated execution hook used by a facade that needs a fresh
@@ -583,7 +591,7 @@ pub const AgentSession = struct {
         self.mutex.lock();
         switch (self.state) {
             .idle, .poisoned => self.state = .destroying,
-            .running, .abort_requested => {
+            .running, .abort_requested, .mutating => {
                 self.mutex.unlock();
                 return error.SessionBusy;
             },
@@ -619,6 +627,81 @@ pub const AgentSession = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.state == .poisoned;
+    }
+
+    /// Atomically replace the Session's effective model/provider pair.
+    ///
+    /// Provider construction happens after the mutation gate is acquired but
+    /// before publication. A construction failure restores `.idle` and leaves
+    /// every existing Session-owned object untouched.
+    pub fn setModel(self: *AgentSession, requested_model: []const u8) ModelMutationError!void {
+        if (requested_model.len == 0 or
+            !std.unicode.utf8ValidateSlice(requested_model))
+            return error.InvalidModel;
+
+        self.mutex.lock();
+        switch (self.state) {
+            .idle => {},
+            .running, .abort_requested, .mutating => {
+                self.mutex.unlock();
+                return error.SessionBusy;
+            },
+            .poisoned, .destroying => {
+                self.mutex.unlock();
+                return error.InvalidSessionState;
+            },
+        }
+        if (std.mem.eql(u8, self.model, requested_model)) {
+            self.mutex.unlock();
+            return;
+        }
+        self.state = .mutating;
+        const provider_kind = self.provider.kind();
+        self.mutex.unlock();
+
+        const replacement_model = self.allocator.dupe(u8, requested_model) catch {
+            self.cancelMutation();
+            return error.OutOfMemory;
+        };
+        errdefer self.allocator.free(replacement_model);
+        var replacement_provider = provider_factory.makeProvider(
+            self.allocator,
+            provider_kind,
+            self.api_key,
+            replacement_model,
+            self.base_url,
+        ) catch |err| {
+            self.cancelMutation();
+            return err;
+        };
+        errdefer replacement_provider.deinit();
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        const previous_model = self.model;
+        const previous_provider = self.provider;
+        self.model = replacement_model;
+        self.provider = replacement_provider;
+        self.mutex.unlock();
+
+        // Concrete clients borrow their model bytes, so destroy the previous
+        // provider before releasing its backing model slice. Keep the mutation
+        // gate held until cleanup finishes so a direct Core destroy cannot
+        // reclaim `self` while this call still reads its allocator.
+        previous_provider.deinit();
+        self.allocator.free(previous_model);
+
+        self.mutex.lock();
+        std.debug.assert(self.state == .mutating);
+        self.state = .idle;
+        self.mutex.unlock();
+    }
+
+    fn cancelMutation(self: *AgentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.state == .mutating);
+        self.state = .idle;
     }
 
     fn callbackFailed(self: *AgentSession) bool {
@@ -757,7 +840,7 @@ pub const AgentSession = struct {
                 self.mutex.unlock();
                 return if (too_late) error.AbortTooLate else error.StaleRun;
             },
-            .poisoned, .destroying => {
+            .mutating, .poisoned, .destroying => {
                 self.mutex.unlock();
                 return error.InvalidSessionState;
             },
@@ -770,7 +853,7 @@ pub const AgentSession = struct {
         self.mutex.lock();
         switch (self.state) {
             .idle => {},
-            .running, .abort_requested => {
+            .running, .abort_requested, .mutating => {
                 self.mutex.unlock();
                 return error.SessionBusy;
             },
@@ -808,7 +891,7 @@ pub const AgentSession = struct {
             return error.InvalidSessionState;
         switch (self.state) {
             .running, .abort_requested => {},
-            .idle, .poisoned, .destroying => return error.InvalidSessionState,
+            .idle, .mutating, .poisoned, .destroying => return error.InvalidSessionState,
         }
         self.active_run_started = true;
     }
@@ -828,7 +911,7 @@ pub const AgentSession = struct {
             return error.InvalidSessionState;
         switch (self.state) {
             .running, .abort_requested => {},
-            .idle, .poisoned, .destroying => return error.InvalidSessionState,
+            .idle, .mutating, .poisoned, .destroying => return error.InvalidSessionState,
         }
         const aborted = self.state == .abort_requested;
         if (self.callback_failed) {
@@ -899,7 +982,7 @@ pub const AgentSession = struct {
                 RunIdentity{ .session_id = self.session_id, .run_id = self.active_run_id }
             else
                 null,
-            .idle, .poisoned, .destroying => null,
+            .idle, .mutating, .poisoned, .destroying => null,
         };
         if (identity == null and (self.state == .running or self.state == .abort_requested)) {
             if (!self.callback_failed) {
@@ -1107,6 +1190,142 @@ test "AgentSession initializes per-session permission state" {
     defer self.destroy() catch unreachable;
     try std.testing.expectEqual(types.PermissionMode.plan, self.permission_ctx.modeValue());
     try std.testing.expectEqualSlices(u8, self.session_id.asSlice(), self.permission_ctx.session.asSlice());
+}
+
+test "AgentSession model mutation is idle-only and preserves Session state" {
+    const ApiErrorExecutor = struct {
+        fn run(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: RunIdentity,
+            _: *const ui_backend.UiBackend,
+            _: *const AbortSignal,
+            _: *std.ArrayList(u8),
+        ) anyerror!agent_loop.RunResult {
+            return .{ .stop_reason = .api_error, .turns = 1, .tool_calls = 0 };
+        }
+    };
+
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    try self.conversation.appendText(.user, "preserve me");
+    self.session_rules.rememberAllow("Read");
+    self.session_rules.rememberDeny("Bash");
+
+    var probe = SinkProbe{};
+    _ = try self.beginRun(17, probe.sink());
+    _ = self.finishRunLifecycle();
+
+    const session_id = self.session_id;
+    const messages_ptr = self.conversation.messages.items.ptr;
+    const tools_ptr = self.tools.entries.ptr;
+    const workspace_root_ptr = self.workspace.root.ptr;
+    const previous_provider_ctx = self.provider.provider().ctx;
+    try self.setModel("replacement-model");
+
+    try std.testing.expectEqualStrings("replacement-model", self.model);
+    try std.testing.expectEqualStrings("replacement-model", self.provider.provider().model());
+    try std.testing.expect(self.provider.provider().ctx != previous_provider_ctx);
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expectEqualSlices(u8, session_id.asSlice(), self.session_id.asSlice());
+    try std.testing.expectEqual(@as(u64, 17), self.last_run_id);
+    try std.testing.expectEqual(@as(usize, 1), self.conversation.messages.items.len);
+    try std.testing.expect(self.conversation.messages.items.ptr == messages_ptr);
+    try std.testing.expect(self.tools.entries.ptr == tools_ptr);
+    try std.testing.expect(self.workspace.root.ptr == workspace_root_ptr);
+    try std.testing.expect(self.session_rules.isAllowed("Read"));
+    try std.testing.expect(self.session_rules.isDenied("Bash"));
+    try std.testing.expect(!self.isPoisoned());
+
+    const model_ptr = self.model.ptr;
+    const provider_ctx = self.provider.provider().ctx;
+    try self.setModel("replacement-model");
+    try std.testing.expect(self.model.ptr == model_ptr);
+    try std.testing.expect(self.provider.provider().ctx == provider_ctx);
+
+    _ = try self.beginRun(18, probe.sink());
+    try std.testing.expectError(error.SessionBusy, self.setModel("busy-model"));
+    try std.testing.expectEqualStrings("replacement-model", self.model);
+    _ = self.finishRunLifecycle();
+
+    // Model existence is intentionally provider-validated by the next Run.
+    // Its ordinary API-error outcome remains non-poisoning and the Host can
+    // switch the same Session back to another model.
+    try self.setModel("missing-model-is-locally-valid");
+    var executor: u8 = 0;
+    var admitted = try self.admitRun(19, probe.sink());
+    const result = try admitted.runIsolated(
+        &.{"provider validates the model"},
+        .{ .ctx = &executor, .executeFn = ApiErrorExecutor.run },
+    );
+    try std.testing.expectEqual(agent_loop.StopReason.api_error, result.stop_reason);
+    try std.testing.expect(!self.isPoisoned());
+    try self.setModel("recovered-model");
+    try std.testing.expectEqualStrings("recovered-model", self.model);
+}
+
+test "AgentSession model mutation rejects invalid input and poisoned state" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer {
+        self.state = .idle;
+        self.destroy() catch unreachable;
+    }
+
+    try std.testing.expectError(error.InvalidModel, self.setModel(""));
+    try std.testing.expectError(error.InvalidModel, self.setModel(&.{0xff}));
+    try std.testing.expectEqualStrings("test-model", self.model);
+
+    self.state = .poisoned;
+    try std.testing.expectError(error.InvalidSessionState, self.setModel("other-model"));
+    try std.testing.expectEqualStrings("test-model", self.model);
+}
+
+test "AgentSession model mutation rolls back allocation failures" {
+    var observer = EraseObservingAllocator{
+        .backing = std.testing.allocator,
+        .target_len = std.math.maxInt(usize),
+    };
+    const runtime = try createTestRuntime(observer.allocator());
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    try self.conversation.appendText(.user, "stable");
+
+    const original_model_ptr = self.model.ptr;
+    const original_provider_ctx = self.provider.provider().ctx;
+    const original_message_ptr = self.conversation.messages.items.ptr;
+
+    // The copied model is the first allocation after admission.
+    observer.fail_index = observer.allocations;
+    try std.testing.expectError(error.OutOfMemory, self.setModel("copy-fails"));
+    observer.fail_index = null;
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expect(self.model.ptr == original_model_ptr);
+    try std.testing.expect(self.provider.provider().ctx == original_provider_ctx);
+    try std.testing.expect(self.conversation.messages.items.ptr == original_message_ptr);
+    try std.testing.expectEqualStrings("test-model", self.model);
+
+    // The next allocation constructs the replacement provider after the model
+    // copy, proving that partial replacement state is also discarded.
+    observer.fail_index = observer.allocations + 1;
+    try std.testing.expectError(error.OutOfMemory, self.setModel("provider-fails"));
+    observer.fail_index = null;
+    try std.testing.expectEqual(State.idle, self.state);
+    try std.testing.expect(self.model.ptr == original_model_ptr);
+    try std.testing.expect(self.provider.provider().ctx == original_provider_ctx);
+    try std.testing.expect(self.conversation.messages.items.ptr == original_message_ptr);
+    try std.testing.expectEqualStrings("test-model", self.model);
+    try std.testing.expect(!self.isPoisoned());
 }
 
 test "AgentSession enforces one active Run and monotonic nonzero run ids" {

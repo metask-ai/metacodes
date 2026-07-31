@@ -162,7 +162,7 @@ const AbiRuntime = struct {
 };
 
 const AbiSession = struct {
-    const CallState = enum { idle, running, refreshing, destroying };
+    const CallState = enum { idle, running, mutating, destroying };
 
     callbacks: wire.SessionCallbacksV1,
     callback_status: std.atomic.Value(u32),
@@ -328,18 +328,18 @@ const AbiSession = struct {
         self.call_state = .idle;
     }
 
-    fn tryBeginRefresh(self: *AbiSession) bool {
+    fn tryBeginMutation(self: *AbiSession) bool {
         self.call_mutex.lock();
         defer self.call_mutex.unlock();
         if (self.call_state != .idle) return false;
-        self.call_state = .refreshing;
+        self.call_state = .mutating;
         return true;
     }
 
-    fn finishRefresh(self: *AbiSession) void {
+    fn finishMutation(self: *AbiSession) void {
         self.call_mutex.lock();
         defer self.call_mutex.unlock();
-        std.debug.assert(self.call_state == .refreshing);
+        std.debug.assert(self.call_state == .mutating);
         self.call_state = .idle;
     }
 
@@ -365,8 +365,8 @@ const AbiSession = struct {
         const runtime = self.runtime orelse return error.InvalidSessionState;
         var runtime_call = try runtime.catalogs.enterCall();
         defer runtime_call.deinit();
-        if (!self.tryBeginRefresh()) return error.SessionBusy;
-        defer self.finishRefresh();
+        if (!self.tryBeginMutation()) return error.SessionBusy;
+        defer self.finishMutation();
 
         const replacement = try runtime.catalogs.retainForSession(
             host,
@@ -375,6 +375,16 @@ const AbiSession = struct {
         const previous = self.skill_catalog_cell;
         self.skill_catalog_cell = replacement;
         if (previous) |cell| runtime.catalogs.releaseSession(cell);
+    }
+
+    /// Internal Revision 5 adapter. The public wire entry point is frozen only
+    /// after the Core contract and the ABI lifecycle gate pass their tests.
+    fn setModel(self: *AbiSession, model: []const u8) !void {
+        if (self.facade_poisoned.load(.acquire))
+            return error.InvalidSessionState;
+        if (!self.tryBeginMutation()) return error.SessionBusy;
+        defer self.finishMutation();
+        try self.core_session.setModel(model);
     }
 
     /// Internal typed-Skill entry used by the Revision 4 public input union.
@@ -2468,6 +2478,60 @@ test "ABI Runtime reports oversized Host schemas as resource limits" {
     defer bufferRelease(&diagnostic);
     try std.testing.expectEqual(wire.STATUS_RESOURCE_LIMIT, runtimeCreate(&config, &runtime, &diagnostic));
     try std.testing.expect(runtime == null);
+}
+
+test "AbiSession model mutation delegates atomically through the shared gate" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const cwd = root_buffer[0..root_len];
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{} },
+    );
+    defer native_runtime.destroy() catch unreachable;
+    const native_session = try native_runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
+    });
+    defer native_session.destroy() catch unreachable;
+    try native_session.conversation.appendText(.user, "preserved");
+
+    var session = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = native_session,
+    };
+    defer session.host_permission_rules.deinit();
+    try session.host_permission_rules.remember(.allow, "Read");
+    const conversation_ptr = native_session.conversation.messages.items.ptr;
+
+    try session.setModel("missing-model-is-locally-valid");
+    try std.testing.expectEqualStrings(
+        "missing-model-is-locally-valid",
+        native_session.provider.provider().model(),
+    );
+    try std.testing.expect(native_session.conversation.messages.items.ptr == conversation_ptr);
+    try std.testing.expectEqual(
+        HostPermissionRules.Decision.allow,
+        session.host_permission_rules.lookup("Read").?,
+    );
+    try std.testing.expect(session.skill_catalog_cell == null);
+    try std.testing.expectEqual(AbiSession.CallState.idle, session.call_state);
+
+    session.call_state = .running;
+    try std.testing.expectError(error.SessionBusy, session.setModel("busy-model"));
+    try std.testing.expectEqualStrings("missing-model-is-locally-valid", native_session.model);
+    session.call_state = .idle;
+
+    session.facade_poisoned.store(true, .release);
+    try std.testing.expectError(error.InvalidSessionState, session.setModel("poisoned-model"));
+    try std.testing.expectEqualStrings("missing-model-is-locally-valid", native_session.model);
 }
 
 test "Session catalog refresh is idle-only atomic replacement with rollback" {
