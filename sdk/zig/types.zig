@@ -323,6 +323,8 @@ pub const SessionConfigV1 = extern struct {
     reserved: [4]u64,
 };
 
+/// Default discovery is limited to `workspace_home/.agents/skills` and
+/// `workspace_root/.agents/skills`; product-specific roots are not scanned.
 pub const SkillCatalogQueryV1 = extern struct {
     struct_size: u32,
     reserved0: u32,

@@ -256,11 +256,7 @@ pub const RuntimeCatalogs = struct {
         defer call.deinit();
         var scratch = std.heap.ArenaAllocator.init(self.allocator);
         defer scratch.deinit();
-        const sources = try catalog.defaultSources(
-            scratch.allocator(),
-            workspace.root,
-            workspace.home,
-        );
+        const sources = try agentCoreDefaultSources(scratch.allocator(), workspace);
         return self.queryUnderGuard(
             io,
             workspace,
@@ -322,6 +318,35 @@ pub const RuntimeCatalogs = struct {
         self.active_calls -= 1;
     }
 };
+
+const PERSONAL_AGENTS_PRIORITY: u32 = 1;
+const PROJECT_AGENTS_PRIORITY: u32 = 2;
+
+/// AgentCore owns only the cross-Agent neutral discovery convention. Product
+/// adapters may opt into additional roots through the shared catalog engine,
+/// but those roots must never become implicit AgentCore filesystem authority.
+fn agentCoreDefaultSources(
+    arena: std.mem.Allocator,
+    workspace: *const CanonicalWorkspace,
+) error{OutOfMemory}![]const catalog.Source {
+    const shared_root = std.mem.eql(u8, workspace.home, workspace.root);
+    const sources = try arena.alloc(catalog.Source, if (shared_root) 1 else 2);
+    var next: usize = 0;
+    if (!shared_root) {
+        sources[next] = .{
+            .root = try std.fs.path.join(arena, &.{ workspace.home, ".agents", "skills" }),
+            .scope = .personal,
+            .priority = PERSONAL_AGENTS_PRIORITY,
+        };
+        next += 1;
+    }
+    sources[next] = .{
+        .root = try std.fs.path.join(arena, &.{ workspace.root, ".agents", "skills" }),
+        .scope = .project,
+        .priority = PROJECT_AGENTS_PRIORITY,
+    };
+    return sources;
+}
 
 pub const CallGuard = struct {
     runtime: *RuntimeCatalogs,
@@ -454,7 +479,33 @@ test "catalog binding rejects cross-Runtime and cross-Workspace handles without 
     try std.testing.expectEqual(@as(usize, 1), runtime.reference_count);
 }
 
-test "default query applies stable project precedence" {
+test "AgentCore default sources collapse identical canonical home and root" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    var workspace = try CanonicalWorkspace.init(
+        allocator,
+        root_buffer[0..root_len],
+        "",
+    );
+    defer workspace.deinit();
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+
+    const sources = try agentCoreDefaultSources(scratch.allocator(), &workspace);
+    try std.testing.expectEqual(@as(usize, 1), sources.len);
+    try std.testing.expectEqual(catalog.SourceScope.project, sources[0].scope);
+    try std.testing.expectEqual(PROJECT_AGENTS_PRIORITY, sources[0].priority);
+    const expected = try std.fs.path.join(
+        scratch.allocator(),
+        &.{ workspace.root, ".agents", "skills" },
+    );
+    try std.testing.expectEqualStrings(expected, sources[0].root);
+}
+
+test "AgentCore default query ignores product-specific Skill roots" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -501,14 +552,10 @@ test "default query applies stable project precedence" {
     defer workspace.deinit();
     const host = try runtime.queryDefault(io, &workspace, "epoch", .{});
     defer host.release() catch unreachable;
-    try std.testing.expectEqual(@as(usize, 1), host.snapshot().skills.len);
-    try std.testing.expectEqualStrings(
-        "MetaCodes",
-        host.snapshot().skills[0].definition.name,
-    );
+    try std.testing.expectEqual(@as(usize, 0), host.snapshot().skills.len);
 }
 
-test "default query discovers personal and project .agents skills with compatible precedence" {
+test "AgentCore default query discovers only personal and project .agents Skills" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -587,9 +634,9 @@ test "default query discovers personal and project .agents skills with compatibl
     try Fixture.write(
         io,
         allocator,
-        "project legacy",
-        &.{ workspace_root, ".metacodes", "skills", "scope-order" },
-        "Project Legacy Scope",
+        "project neutral",
+        &.{ workspace_root, ".agents", "skills", "scope-order" },
+        "Project Agents Scope",
     );
 
     var runtime = RuntimeCatalogs.initWithSecret(allocator, [_]u8{10} ** 32);
@@ -613,7 +660,7 @@ test "default query discovers personal and project .agents skills with compatibl
         snapshot.findByInvocation("review").?.definition.name,
     );
     try std.testing.expectEqualStrings(
-        "Project Legacy Scope",
+        "Project Agents Scope",
         snapshot.findByInvocation("scope-order").?.definition.name,
     );
 }

@@ -35,7 +35,8 @@ pub const Source = struct {
     namespace: []const u8 = "",
 };
 
-/// Canonical built-in source order shared by CLI and AgentCore adapters.
+/// Built-in product source order. AgentCore deliberately supplies its own
+/// neutral-only `.agents/skills` policy to the shared engine.
 pub fn defaultSources(
     arena: std.mem.Allocator,
     workspace_root: []const u8,
@@ -974,6 +975,44 @@ test "typed argument schema accepts only unique renderable names" {
     try std.testing.expect(!validArgumentNames(&.{ "issue", "issue" }));
     try std.testing.expect(!validArgumentNames(&.{"bad-name"}));
     try std.testing.expect(!validArgumentNames(&.{"9bad"}));
+}
+
+test "product default sources preserve product-owned directory policy" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const workspace_root = try std.fs.path.join(a, &.{ root_buffer[0..root_len], "workspace" });
+    const workspace_home = try std.fs.path.join(a, &.{ root_buffer[0..root_len], "home" });
+
+    const sources = try defaultSources(a, workspace_root, workspace_home);
+    const has_enterprise: usize = @intFromBool(std.fs.path.isAbsolute("/etc/metacodes/skills"));
+    try std.testing.expectEqual(6 + has_enterprise, sources.len);
+    if (has_enterprise == 1) {
+        try std.testing.expectEqualStrings("/etc/metacodes/skills", sources[0].root);
+        try std.testing.expectEqual(SourceScope.enterprise, sources[0].scope);
+        try std.testing.expectEqual(@as(u32, 100), sources[0].priority);
+    }
+
+    const expected = [_]Source{
+        .{ .root = try std.fs.path.join(a, &.{ workspace_home, ".claude", "skills" }), .scope = .personal, .priority = 200 },
+        .{ .root = try std.fs.path.join(a, &.{ workspace_home, ".metacodes", "skills" }), .scope = .personal, .priority = 201 },
+        .{ .root = try std.fs.path.join(a, &.{ workspace_home, ".agents", "skills" }), .scope = .personal, .priority = 202 },
+        .{ .root = try std.fs.path.join(a, &.{ workspace_root, ".claude", "skills" }), .scope = .project, .priority = 300 },
+        .{ .root = try std.fs.path.join(a, &.{ workspace_root, ".metacodes", "skills" }), .scope = .project, .priority = 301 },
+        .{ .root = try std.fs.path.join(a, &.{ workspace_root, ".agents", "skills" }), .scope = .project, .priority = 302 },
+    };
+    for (expected, 0..) |want, index| {
+        const got = sources[has_enterprise + index];
+        try std.testing.expectEqualStrings(want.root, got.root);
+        try std.testing.expectEqual(want.scope, got.scope);
+        try std.testing.expectEqual(want.priority, got.priority);
+        try std.testing.expectEqualStrings("", got.namespace);
+    }
 }
 
 test "catalog priority, tombstone, snapshot, parser parity, and revision are deterministic" {

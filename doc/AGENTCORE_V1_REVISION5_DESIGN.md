@@ -88,7 +88,10 @@ AgentCore：
 | permission persistence | AgentCore facade 为 Host-owned | 继续由 Host 负责 |
 | Full access | 无统一安全语义 | 不进入 Revision 5 |
 
-`.agents/skills` discovery root 已在 Revision 4 完成，不属于 Revision 5。
+Revision 4 引入了跨 Agent 中立的 `.agents/skills` discovery root。Revision 5 将
+AgentCore 默认 discovery policy 收紧为只读取 personal/project `.agents/skills`；
+`.claude/skills`、`.metacodes/skills` 与 enterprise roots 属于产品 adapter policy，
+不是 AgentCore 默认文件系统权限。该修正不增加 wire 能力。
 
 ## 2. 统一 Session 语义
 

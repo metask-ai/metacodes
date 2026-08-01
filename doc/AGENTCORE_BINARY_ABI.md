@@ -406,6 +406,13 @@ paths, policy internals, or execution mode. Isolated invalid slots produce
 `OK + degraded`; failure to prove the whole snapshot returns
 `SKILL_CATALOG_INVALID` and no partial handle or descriptor.
 
+Default AgentCore discovery reads exactly
+`<workspace_home>/.agents/skills` and `<workspace_root>/.agents/skills`, with
+the project root winning an invocation-name collision. It does not implicitly
+read `/etc/metacodes/skills`, `.claude/skills`, or `.metacodes/skills`.
+Product adapters may apply their own source policy through the shared Skill
+Runtime; those product defaults are not AgentCore filesystem authority.
+
 Each valid `skills[]` entry contains this fixed argument-schema shape:
 
 ```json

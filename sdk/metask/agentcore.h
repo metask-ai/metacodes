@@ -248,7 +248,9 @@ typedef struct {
  * It need not be parseable, monotonic, or comparable across Hosts. Change it
  * when the Host's external Workspace binding generation changes. It enters
  * catalog_revision, so changing it can make input prepared for another bound
- * revision return METASK_AGENTCORE_STATUS_STALE_CATALOG. */
+ * revision return METASK_AGENTCORE_STATUS_STALE_CATALOG. Default discovery is
+ * limited to workspace_home/.agents/skills and
+ * workspace_root/.agents/skills; product-specific roots are not scanned. */
 typedef struct {
     uint32_t struct_size;
     uint32_t reserved0;

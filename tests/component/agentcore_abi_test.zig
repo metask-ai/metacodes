@@ -552,9 +552,25 @@ fn writeSkillFixture(
     invocation_name: []const u8,
     contents: []const u8,
 ) !void {
+    try writeSkillFixtureInSource(
+        allocator,
+        root,
+        ".agents",
+        invocation_name,
+        contents,
+    );
+}
+
+fn writeSkillFixtureInSource(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    source_dir: []const u8,
+    invocation_name: []const u8,
+    contents: []const u8,
+) !void {
     const skill_dir = try std.fs.path.join(
         allocator,
-        &.{ root, ".metacodes", "skills", invocation_name },
+        &.{ root, source_dir, "skills", invocation_name },
     );
     defer allocator.free(skill_dir);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, skill_dir);
@@ -1418,6 +1434,20 @@ test "L2 Revision 5 catalog and explicit selection bind before Session" {
         "broken",
         "---\nname: Broken\ncontext: surprise\n---\nBROKEN_SKILL_SENTINEL",
     );
+    try writeSkillFixtureInSource(
+        a,
+        root,
+        ".metacodes",
+        "metacodes-only",
+        "---\nname: Product Legacy\n---\nMUST_NOT_ENTER_AGENTCORE_CATALOG",
+    );
+    try writeSkillFixtureInSource(
+        a,
+        root,
+        ".claude",
+        "claude-only",
+        "---\nname: Claude Legacy\n---\nMUST_NOT_ENTER_AGENTCORE_CATALOG",
+    );
 
     const bodies = [_][]const u8{ FINAL_SSE, FINAL_SSE };
     var server = try harness.MockServer.startCassette(&bodies, 0);
@@ -1458,6 +1488,8 @@ test "L2 Revision 5 catalog and explicit selection bind before Session" {
     const descriptor_bytes = try sdk.borrowedBytes(.{ .ptr = descriptor.ptr, .len = descriptor.len });
     try std.testing.expect(std.mem.indexOf(u8, descriptor_bytes, "\"invocation_name\":\"review\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, descriptor_bytes, "\"invocation_name\":\"workctl\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, descriptor_bytes, "metacodes-only") == null);
+    try std.testing.expect(std.mem.indexOf(u8, descriptor_bytes, "claude-only") == null);
     try std.testing.expect(std.mem.indexOf(u8, descriptor_bytes, "\"body\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, descriptor_bytes, "source_path") == null);
     var decoded = try sdk.decodeSkillCatalog(a, descriptor_bytes);
@@ -1882,7 +1914,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
 
     const review_dir = try std.fs.path.join(
         a,
-        &.{ root, ".metacodes", "skills", "review" },
+        &.{ root, ".agents", "skills", "review" },
     );
     defer a.free(review_dir);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, review_dir);
@@ -1903,7 +1935,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
 
     const hidden_dir = try std.fs.path.join(
         a,
-        &.{ root, ".metacodes", "skills", "private-deploy" },
+        &.{ root, ".agents", "skills", "private-deploy" },
     );
     defer a.free(hidden_dir);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, hidden_dir);
@@ -1924,7 +1956,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
 
     const root_skill_dir = try std.fs.path.join(
         a,
-        &.{ root, ".metacodes", "skills", "root-policy" },
+        &.{ root, ".agents", "skills", "root-policy" },
     );
     defer a.free(root_skill_dir);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, root_skill_dir);
@@ -1945,7 +1977,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
 
     const child_dir = try std.fs.path.join(
         a,
-        &.{ root, ".metacodes", "skills", "child" },
+        &.{ root, ".agents", "skills", "child" },
     );
     defer a.free(child_dir);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, child_dir);
@@ -1965,7 +1997,7 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
 
     const fork_dir = try std.fs.path.join(
         a,
-        &.{ root, ".metacodes", "skills", "forked" },
+        &.{ root, ".agents", "skills", "forked" },
     );
     defer a.free(fork_dir);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, fork_dir);
