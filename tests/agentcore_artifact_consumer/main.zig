@@ -192,14 +192,14 @@ pub fn main(init: std.process.Init) !void {
     const file_name = "artifact-read.txt";
     const file_path = try std.fs.path.join(a, &.{ workspace, file_name });
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = file_path, .data = "artifact-read-ok" });
-    const skill_dir = try std.fs.path.join(a, &.{ workspace, ".metacodes", "skills", "review" });
+    const skill_dir = try std.fs.path.join(a, &.{ workspace, ".agents", "skills", "review" });
     try std.Io.Dir.cwd().createDirPath(init.io, skill_dir);
     const skill_path = try std.fs.path.join(a, &.{ skill_dir, "SKILL.md" });
     try std.Io.Dir.cwd().writeFile(init.io, .{
         .sub_path = skill_path,
         .data = "---\nname: Review\ndescription: Source-free typed invocation fixture\narguments: [target]\n---\nREVIEW_SKILL_SENTINEL $target",
     });
-    const workctl_dir = try std.fs.path.join(a, &.{ workspace, ".metacodes", "skills", "workctl" });
+    const workctl_dir = try std.fs.path.join(a, &.{ workspace, ".agents", "skills", "workctl" });
     try std.Io.Dir.cwd().createDirPath(init.io, workctl_dir);
     const workctl_path = try std.fs.path.join(a, &.{ workctl_dir, "SKILL.md" });
     try std.Io.Dir.cwd().writeFile(init.io, .{
