@@ -40,6 +40,11 @@ pub const MockServer = struct {
     /// flaky 模式:前 N 个连接读完请求后直接 close 不写响应(模拟服务端建连阶段断连,
     /// 客户端 receiveHead 拿到 ConnectionClosing/EOF)。serveLoop 每断一次递减,归 0 后正常服务。
     flaky_close_remaining: usize = 0,
+    /// Deterministic concurrency gate for tests that must hold a provider
+    /// request in-flight without relying on wall-clock sleeps.
+    gate_next_response: std.atomic.Value(bool) = .init(false),
+    response_gate_entered: std.atomic.Value(bool) = .init(false),
+    release_response_gate: std.atomic.Value(bool) = .init(false),
     /// 停机标志:stop() 先置位、再自连唤醒 accept。Windows 上 closesocket **不可靠唤醒**
     /// 已阻塞的 accept(实测 join 永挂,竞态:线程先进 accept 则挂);POSIX close 同样无保证。
     /// 自连是跨平台确定性唤醒;accept 线程醒来见标志立即退出。
@@ -154,6 +159,24 @@ pub const MockServer = struct {
         if (index >= self.captured_count) return null;
         const raw = self.captured_requests[index] orelse return null;
         return .{ .raw = raw };
+    }
+
+    pub fn gateNextResponse(self: *MockServer) void {
+        self.release_response_gate.store(false, .release);
+        self.response_gate_entered.store(false, .release);
+        self.gate_next_response.store(true, .release);
+    }
+
+    pub fn waitUntilResponseGated(self: *MockServer) !void {
+        for (0..1_000_000) |_| {
+            if (self.response_gate_entered.load(.acquire)) return;
+            std.Thread.yield() catch {};
+        }
+        return error.ResponseGateTimeout;
+    }
+
+    pub fn releaseGatedResponse(self: *MockServer) void {
+        self.release_response_gate.store(true, .release);
     }
 
     pub fn captureOverflowed(self: *MockServer) bool {
@@ -290,6 +313,16 @@ pub const MockServer = struct {
             "transfer-encoding: chunked\r\n" ++
             "connection: close\r\n\r\n";
         sendAll(conn, header);
+
+        if (self.gate_next_response.swap(false, .acq_rel)) {
+            self.response_gate_entered.store(true, .release);
+            while (!self.release_response_gate.load(.acquire) and
+                !self.closing.load(.acquire))
+            {
+                std.Thread.yield() catch {};
+            }
+            self.response_gate_entered.store(false, .release);
+        }
 
         var cursor: usize = 0;
         while (cursor < self.body.len) {

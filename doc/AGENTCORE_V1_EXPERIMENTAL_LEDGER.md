@@ -80,3 +80,10 @@ revision 4 准入引用的真实消费者证据：
 4. **E4 — stability horizon**：外部消费方出现后，连续 hard cut 的协调成本会改变。达到何种
    外部消费数量、支持期限、consumer matrix 与弃用周期时进入兼容窗口，留待真实交付数据
    决定；当前不预设 revision 编号、shim 或双分派。
+
+## F 组：SDK 生成卫生
+
+- [ ] **Rust bindgen capability 常量位宽**：`bindgen 0.72.1` 当前把 C header 中的
+  `1ULL << n` capability macros 生成为 `u32` 常量，而 wire field 是 `u64`。数值和布局
+  不受影响，现有 Rust consumer 显式转换；下次重新生成 SDK 时应从 header 或 bindgen
+  配置统一为 `u64`，并保持 drift gate。不得手改自动生成的 `raw.rs`。

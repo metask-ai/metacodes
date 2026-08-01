@@ -335,7 +335,7 @@ test "manifest contract rejects toolchain target optimize and ABI drift" {
     manifest.contract.binary_abi_table_size = 136;
     try std.testing.expectError(error.AbiMismatch, validateManifest(manifest, valid_expected));
     manifest = validManifest();
-    manifest.contract.capabilities &= ~@as(u64, 1) << 11;
+    manifest.contract.capabilities &= ~(@as(u64, 1) << 11);
     try std.testing.expectError(error.AbiMismatch, validateManifest(manifest, valid_expected));
     manifest = validManifest();
     manifest.contract.binary_abi_status = "stable";

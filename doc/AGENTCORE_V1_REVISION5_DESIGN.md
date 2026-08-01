@@ -379,7 +379,9 @@ disabled Skill：
 - 保留在 catalog descriptor；
 - 不进入模型可见 Skill surface；
 - typed invocation 返回 `SKILL_POLICY_VIOLATION`；
-- explicit invocation、nested activation 和 preload 不得绕过；
+- explicit invocation 和 nested activation 不得绕过；
+- Revision 5 AgentCore 不公开或隐式执行 preload；Session create/update 只绑定
+  catalog/selection，不 materialize Skill；
 - model 猜测名称不得触发 materialization；
 - 不创建 activation working tree；
 - 不执行 Skill script、tool 或 provider 行为。
@@ -395,7 +397,9 @@ disabled。
 
 - snapshot 保留全部 valid records；
 - selection 在 Session/Run admission 时固定；
-- model surface、typed invocation、nested activation 和 preload 共用同一判断；
+- model surface、typed invocation 和 nested activation 共用同一判断；
+- Revision 5 AgentCore 不存在 preload 入口；未来若引入，必须先进入同一 canonical
+  availability enforcement；
 - CLI 和 AgentCore 只做类型、所有权与错误映射。
 
 ## 6. Host-owned permission rules
@@ -621,7 +625,7 @@ bypass、unrestricted shell 或 allowed tools 拼成公共承诺。
 | compact accounting | manual/auto 共用 kernel；provider usage 恰好计入一次；不消费 `run_id` |
 | Skill selection-only | 不要求 catalog handle；不 discovery；对当前 target catalog 校验 |
 | Skill joint update | invalid/duplicate/foreign ID fail-fast；失败保留旧组合 |
-| Skill enforcement | model、typed、nested、preload 共用判断；disabled 不 materialize |
+| Skill enforcement | model、typed、nested 共用判断；Session create/update 不 materialize；Revision 5 无 preload 入口 |
 | permission rules | owned parse/compile；create/update 共用 seam；失败保留旧 rules |
 | permission precedence | deny-wins 四格矩阵；imported ask 三种结果；protected paths 不被绕过 |
 | Run fixed view | active Run 不观察 model、Skill 或 permission rules 中途变化 |

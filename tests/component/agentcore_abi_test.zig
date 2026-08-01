@@ -14,6 +14,9 @@ const FINAL_SSE =
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
+const API_ERROR_SSE =
+    "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"model not found\"}}\n\n";
+
 const ASK_SSE =
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_ask\",\"name\":\"AskUserQuestion\",\"input\":{}}}\n\n" ++
@@ -446,6 +449,101 @@ fn allSkillsEnabledSelection() wire.SkillSelectionV1 {
     selection.struct_size = @sizeOf(wire.SkillSelectionV1);
     selection.default_state_code = wire.SKILL_SELECTION_ENABLED;
     return selection;
+}
+
+const PublicSessionFixture = struct {
+    api: sdk.Api,
+    runtime: ?*wire.RuntimeHandle = null,
+    session: ?*wire.SessionHandle = null,
+    diagnostic: wire.OwnedBytesV1 = .{ .ptr = null, .len = 0 },
+
+    fn init(root: []const u8, base_url: []const u8, model: []const u8) !PublicSessionFixture {
+        const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+            return error.MissingApi;
+        var self = PublicSessionFixture{
+            .api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api))),
+        };
+        errdefer self.deinit();
+
+        var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+        runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            self.api.runtimeCreate()(&runtime_config, &self.runtime, &self.diagnostic),
+        );
+
+        var session_config = std.mem.zeroes(wire.SessionConfigV1);
+        session_config.struct_size = @sizeOf(wire.SessionConfigV1);
+        session_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+        session_config.permission_mode_code = wire.PERMISSION_BYPASS;
+        session_config.shell_policy_code = wire.SHELL_DISABLED;
+        session_config.api_key = sdk.bytesView("test-key");
+        session_config.model = sdk.bytesView(model);
+        session_config.base_url = sdk.bytesView(base_url);
+        session_config.workspace_root = sdk.bytesView(root);
+        session_config.workspace_home = sdk.bytesView(root);
+        var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+        callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+        callbacks.on_event = acceptEvent;
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            self.api.sessionCreate()(
+                self.runtime,
+                &session_config,
+                &callbacks,
+                &self.session,
+                &self.diagnostic,
+            ),
+        );
+        return self;
+    }
+
+    fn deinit(self: *PublicSessionFixture) void {
+        if (self.session) |handle| {
+            _ = self.api.sessionDestroy()(handle, &self.diagnostic);
+            self.session = null;
+            self.releaseDiagnostic();
+        }
+        if (self.runtime) |handle| {
+            _ = self.api.runtimeDestroy()(handle, &self.diagnostic);
+            self.runtime = null;
+            self.releaseDiagnostic();
+        }
+        self.releaseDiagnostic();
+    }
+
+    fn releaseDiagnostic(self: *PublicSessionFixture) void {
+        self.api.bufferRelease()(&self.diagnostic);
+    }
+
+    fn runText(self: *PublicSessionFixture, run_id: u64, prompt: []const u8) !wire.RunResultV1 {
+        var options = std.mem.zeroes(wire.RunOptionsV1);
+        options.struct_size = @sizeOf(wire.RunOptionsV1);
+        options.max_turns = 1;
+        var result = std.mem.zeroes(wire.RunResultV1);
+        try std.testing.expectEqual(
+            wire.STATUS_OK,
+            self.api.sessionRunText(
+                self.session,
+                run_id,
+                sdk.bytesView(prompt),
+                &options,
+                &result,
+                &self.diagnostic,
+            ),
+        );
+        return result;
+    }
+};
+
+fn appendCompactablePublicHistory(fixture: *PublicSessionFixture) !void {
+    const old_context = [_]u8{'A'} ** 8192;
+    var result = try fixture.runText(1, &old_context);
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    for (2..7) |run_id| {
+        result = try fixture.runText(run_id, "recent context");
+        try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    }
 }
 
 fn writeSkillFixture(
@@ -1108,6 +1206,192 @@ test "L2 session_set_model preserves Conversation and changes the next Run reque
     try std.testing.expect(std.mem.indexOf(u8, second.body(), "\"model\":\"new-model\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, second.body(), "first prompt") != null);
     try std.testing.expect(std.mem.indexOf(u8, second.body(), "\"text\":\"done\"") != null);
+}
+
+test "L2 invalid model is a recoverable provider outcome through the public facade" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{ API_ERROR_SSE, FINAL_SSE };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var fixture = try PublicSessionFixture.init(root, url, "old-model");
+    defer fixture.deinit();
+
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        fixture.api.sessionSetModel()(
+            fixture.session,
+            sdk.bytesView("invalid-model"),
+            &fixture.diagnostic,
+        ),
+    );
+    var result = try fixture.runText(1, "provider validates this model");
+    try std.testing.expectEqual(wire.STOP_API_ERROR, result.stop_reason_code);
+
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        fixture.api.sessionSetModel()(
+            fixture.session,
+            sdk.bytesView("recovered-model"),
+            &fixture.diagnostic,
+        ),
+    );
+    result = try fixture.runText(2, "continue after recovery");
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 2), server.requestCount());
+    const failed = server.requestAt(0) orelse return error.NoRequestCaptured;
+    const recovered = server.requestAt(1) orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, failed.body(), "\"model\":\"invalid-model\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recovered.body(), "\"model\":\"recovered-model\"") != null);
+}
+
+test "L2 public compact commits a summary and reports COMPACT_COMPACTED" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{
+        FINAL_SSE,
+        FINAL_SSE,
+        FINAL_SSE,
+        FINAL_SSE,
+        FINAL_SSE,
+        FINAL_SSE,
+        FINAL_SSE,
+        FINAL_SSE,
+    };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var fixture = try PublicSessionFixture.init(root, url, "compact-model");
+    defer fixture.deinit();
+    try appendCompactablePublicHistory(&fixture);
+
+    var compact_result = std.mem.zeroes(wire.CompactResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        fixture.api.sessionCompact()(
+            fixture.session,
+            1,
+            &compact_result,
+            &fixture.diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(wire.COMPACT_COMPACTED, compact_result.outcome_code);
+    try std.testing.expect(compact_result.after_context_tokens < compact_result.before_context_tokens);
+    try std.testing.expect(compact_result.input_tokens > 0);
+    try std.testing.expect(compact_result.output_tokens > 0);
+
+    const result = try fixture.runText(7, "continue after compact");
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 8), server.requestCount());
+    const summary_request = server.requestAt(6) orelse return error.NoRequestCaptured;
+    const post_compact = server.requestAt(7) orelse return error.NoRequestCaptured;
+    const old_context_needle = [_]u8{'A'} ** 128;
+    try std.testing.expect(std.mem.indexOf(u8, summary_request.body(), &old_context_needle) != null);
+    try std.testing.expect(std.mem.indexOf(u8, post_compact.body(), &old_context_needle) == null);
+    try std.testing.expect(std.mem.indexOf(u8, post_compact.body(), "Another language model started") != null);
+    try std.testing.expect(std.mem.indexOf(u8, post_compact.body(), "done") != null);
+}
+
+test "L2 public compact abort is concurrent bounded and leaves the facade reusable" {
+    const CompactWorker = struct {
+        api: sdk.Api,
+        session: *wire.SessionHandle,
+        status: u32 = std.math.maxInt(u32),
+        result: wire.CompactResultV1 = std.mem.zeroes(wire.CompactResultV1),
+        diagnostic: wire.OwnedBytesV1 = .{ .ptr = null, .len = 0 },
+
+        fn run(self: *@This()) void {
+            self.status = self.api.sessionCompact()(
+                self.session,
+                2,
+                &self.result,
+                &self.diagnostic,
+            );
+        }
+    };
+
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buf);
+    const bodies = [_][]const u8{
+        FINAL_SSE,
+        FINAL_SSE,
+        FINAL_SSE,
+        FINAL_SSE,
+        FINAL_SSE,
+        FINAL_SSE,
+        FINAL_SSE,
+    };
+    var server = try harness.MockServer.startCassette(&bodies, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+    var fixture = try PublicSessionFixture.init(root, url, "compact-model");
+    defer fixture.deinit();
+    try appendCompactablePublicHistory(&fixture);
+
+    server.gateNextResponse();
+    var worker = CompactWorker{ .api = fixture.api, .session = fixture.session.? };
+    const compact_thread = try std.Thread.spawn(.{}, CompactWorker.run, .{&worker});
+    var joined = false;
+    defer if (!joined) {
+        server.releaseGatedResponse();
+        compact_thread.join();
+    };
+    try server.waitUntilResponseGated();
+
+    try std.testing.expectEqual(
+        wire.STATUS_BUSY,
+        fixture.api.sessionSetModel()(
+            fixture.session,
+            sdk.bytesView("must-not-race-compact"),
+            &fixture.diagnostic,
+        ),
+    );
+    fixture.releaseDiagnostic();
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        fixture.api.sessionAbortCompact()(
+            fixture.session,
+            2,
+            &fixture.diagnostic,
+        ),
+    );
+    server.releaseGatedResponse();
+    compact_thread.join();
+    joined = true;
+    defer fixture.api.bufferRelease()(&worker.diagnostic);
+
+    try std.testing.expectEqual(wire.STATUS_OK, worker.status);
+    try std.testing.expectEqual(wire.COMPACT_ABORTED, worker.result.outcome_code);
+    try std.testing.expectEqual(
+        wire.STATUS_TOO_LATE,
+        fixture.api.sessionAbortCompact()(
+            fixture.session,
+            2,
+            &fixture.diagnostic,
+        ),
+    );
+    fixture.releaseDiagnostic();
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        fixture.api.sessionSetModel()(
+            fixture.session,
+            sdk.bytesView("model-after-abort"),
+            &fixture.diagnostic,
+        ),
+    );
 }
 
 test "L2 Revision 5 catalog and explicit selection bind before Session" {
