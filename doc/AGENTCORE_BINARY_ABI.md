@@ -303,6 +303,8 @@ an overlapping Run or destroy returns `METASK_AGENTCORE_STATUS_BUSY`. Releasing 
 the completion linearization point, after which the completed call no longer
 reads Session storage and destroy may free it. Matching `session_abort` bypasses
 this gate so it can remain useful while the synchronous Run is active.
+That exception permits overlap only with the matching Run. It does not permit
+any later Session call to overlap an in-flight abort call.
 
 `run_id` is a non-zero `uint64_t` Run identifier assigned by the Host and
 scoped to one Session. Each admitted Run must have a `run_id` strictly greater
@@ -361,6 +363,20 @@ requests cooperative abort and any other value returns
 `run_id` returns `METASK_AGENTCORE_STATUS_TOO_LATE` and any other value returns
 `METASK_AGENTCORE_STATUS_STALE_RUN`. A poisoned Session returns
 `METASK_AGENTCORE_STATUS_INVALID_STATE` regardless of the supplied ID.
+
+### Manual compact
+
+`session_compact` runs the canonical default compact policy as a best-effort
+Conversation maintenance operation. Revision 5 has no Host-supplied target
+token budget and does not guarantee that the result fits the context window of
+the current or a future model. `session_set_model` and `session_compact` are
+independent primitives, not a compound model-migration transaction.
+
+On `METASK_AGENTCORE_STATUS_OK`, `CompactResultV1.before_context_tokens` and
+`after_context_tokens` are context-size estimates for UI and policy decisions;
+they are not provider billing values. The four provider usage-delta fields are
+semantically separate. `METASK_AGENTCORE_COMPACT_DEGRADED` exposes no structured
+reason in Revision 5, and a Host must not infer one by parsing diagnostics.
 
 Assistant text and other execution output are delivered through `on_event`.
 `RunResultV1` is a terminal summary containing stop reason, turns, and tool
@@ -514,8 +530,9 @@ write-only diagnostic output. AgentCore never reads or releases its previous
 value; a Host must call `buffer_release` before reusing a variable that still
 contains a diagnostic from an earlier call. Successful calls return canonical
 empty. Diagnostic allocation is best-effort and never changes the primary
-operation status. Host-owned callback output must never be passed to
-`buffer_release`.
+operation status. Diagnostic text is human-readable, non-normative, and
+unstable; consumers must not parse it or branch on its wording. Host-owned
+callback output must never be passed to `buffer_release`.
 
 Host tool `execute` receives a borrowed `RunContext` and the provider-produced
 tool arguments JSON. The context, its `session_id` view, and arguments view do
@@ -530,11 +547,16 @@ not remain valid after the callback returns.
 | `on_ui_request` | Synchronous in the Run path | `METASK_AGENTCORE_UI_UNAVAILABLE` is an ordinary reusable outcome; fatal/unknown status or invalid, mismatched, or oversized response aborts and poisons |
 | release callbacks | Exactly once for every accepted Host-owned buffer; no thread affinity | Must not re-enter Run or destroy |
 | `session_abort` | May run concurrently with the matching synchronous Run, including from a callback | Cooperative; callback or provider code that blocks can delay completion |
+| `session_abort_compact` | May run concurrently only with the matching synchronous compact | Cancellation propagates to in-flight provider I/O |
 
 Callbacks may request abort. A callback attempt to re-enter Run or destroy on
 the same handle returns `METASK_AGENTCORE_STATUS_BUSY`; callers must not spin or wait for that
-operation from inside the callback. The Host must serialize create/destroy and
-all operations other than matching abort on the same handle. C++ exceptions,
+operation from inside the callback. Matching abort is the only concurrency
+exception to ordinary Session operations. The Host must wait for every
+`session_abort` and `session_abort_compact` call to return before issuing any
+subsequent call on the same handle, including a new Run, compact, mutation, or
+destroy. A successful destroy invalidates the handle; calling any API with that
+pointer afterward is invalid Host behavior. C++ exceptions,
 `longjmp`, and other non-local control transfers must never cross an AgentCore
 callback or release-callback boundary.
 
@@ -643,6 +665,8 @@ and consumers accept only the exact revision they were built against.
 Reserved storage is not permission to infer compatibility. After v1 is
 genuinely stabilized, later layout, function-table, or control-message
 extensions require `metask_agentcore_get_api(2)` and v2 types.
+In particular, assigning a meaning or non-zero value to a Revision 5 reserved
+field is a new wire contract and requires another explicit revision cut.
 
 Revision 5's published POD offsets and sizes require a 64-bit pointer ABI.
 The header rejects 32-bit consumers at compile time; a future 32-bit contract

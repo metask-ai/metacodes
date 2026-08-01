@@ -521,6 +521,12 @@ pub const AgentSession = struct {
     last_run_id: u64 = 0,
     active_compact_id: u64 = 0,
     active_compact_provider: ?provider_mod.Provider = null,
+    /// Number of matching abort calls that borrowed a provider under `mutex`
+    /// and have not yet returned from `Provider.cancel`. A terminal Run or
+    /// compact may publish `.idle` first; all later activity admission remains
+    /// BUSY until these borrows drain, so model replacement/destroy cannot free
+    /// a provider still used by a cross-thread abort.
+    in_flight_provider_cancels: usize = 0,
     last_admitted_compact_id: u64 = 0,
     last_terminal_compact_id: u64 = 0,
     callback_failed: bool = false,
@@ -640,10 +646,14 @@ pub const AgentSession = struct {
     }
 
     /// Destroy requires unique ownership of `self` and is valid only after the
-    /// synchronous Run has returned. As with allocator.destroy, using the
-    /// pointer again after success is invalid.
+    /// synchronous activity and every matching abort call have returned. As
+    /// with allocator.destroy, using the pointer again after success is invalid.
     pub fn destroy(self: *AgentSession) LifecycleError!void {
         self.mutex.lock();
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
         switch (self.state) {
             .idle, .poisoned => self.state = .destroying,
             .running, .abort_requested, .compacting, .compact_finishing, .mutating => {
@@ -696,6 +706,10 @@ pub const AgentSession = struct {
             return error.InvalidModel;
 
         self.mutex.lock();
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
         switch (self.state) {
             .idle => {},
             .running, .abort_requested, .compacting, .compact_finishing, .mutating => {
@@ -760,6 +774,10 @@ pub const AgentSession = struct {
         input: permission_settings.RuleSetInput,
     ) PermissionRuleMutationError!void {
         self.mutex.lock();
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
         switch (self.state) {
             .idle => self.state = .mutating,
             .running, .abort_requested, .compacting, .compact_finishing, .mutating => {
@@ -812,10 +830,13 @@ pub const AgentSession = struct {
         operation_id: u64,
         options: CompactOptions,
     ) CompactError!compact_kernel.Report {
+        // The production provider snapshot is intentionally selected by
+        // compactUsingProvider under the same mutex that admits `.compacting`.
+        // Tests may pass an explicit provider through that private seam.
         return self.compactUsingProvider(
             operation_id,
             options,
-            self.provider.provider(),
+            null,
         );
     }
 
@@ -823,10 +844,17 @@ pub const AgentSession = struct {
         self: *AgentSession,
         operation_id: u64,
         options: CompactOptions,
-        provider: provider_mod.Provider,
+        provider_override: ?provider_mod.Provider,
     ) CompactError!compact_kernel.Report {
         if (operation_id == 0) return error.InvalidOperationId;
         self.mutex.lock();
+        // A provider cancel borrow is a lifetime gate, not another operation-ID
+        // state. Do not classify or admit a new compact until that borrow drains;
+        // BUSY therefore intentionally takes precedence over stale-ID reporting.
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
         if (operation_id <= self.last_admitted_compact_id) {
             self.mutex.unlock();
             return error.StaleCompact;
@@ -842,6 +870,7 @@ pub const AgentSession = struct {
                 return error.InvalidSessionState;
             },
         }
+        const provider = provider_override orelse self.provider.provider();
         self.state = .compacting;
         self.active_compact_id = operation_id;
         self.active_compact_provider = provider;
@@ -904,7 +933,10 @@ pub const AgentSession = struct {
                 }
                 self.compact_abort_signal.abort(.user_interrupt);
                 const provider = self.active_compact_provider.?;
+                std.debug.assert(self.in_flight_provider_cancels < std.math.maxInt(usize));
+                self.in_flight_provider_cancels += 1;
                 self.mutex.unlock();
+                defer self.finishProviderCancel();
                 provider.cancel(&self.compact_abort_signal);
             },
             .compact_finishing => {
@@ -947,6 +979,13 @@ pub const AgentSession = struct {
             else => unreachable,
         }
         self.state = .idle;
+    }
+
+    fn finishProviderCancel(self: *AgentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.in_flight_provider_cancels > 0);
+        self.in_flight_provider_cancels -= 1;
     }
 
     fn cancelMutation(self: *AgentSession) void {
@@ -1073,6 +1112,15 @@ pub const AgentSession = struct {
     }
 
     pub fn abort(self: *AgentSession, run_id: u64, reason: AbortReason) LifecycleError!void {
+        return self.abortUsingProvider(run_id, reason, null);
+    }
+
+    fn abortUsingProvider(
+        self: *AgentSession,
+        run_id: u64,
+        reason: AbortReason,
+        provider_override: ?provider_mod.Provider,
+    ) LifecycleError!void {
         self.mutex.lock();
         if (self.active_run_id != 0 and self.active_run_id != run_id) {
             self.mutex.unlock();
@@ -1084,8 +1132,12 @@ pub const AgentSession = struct {
                 // Store the abort flag under the same lock that linearizes the
                 // state transition. The signal itself is atomic and nonblocking.
                 self.abort_signal.abort(reason.internal());
+                const provider = provider_override orelse self.provider.provider();
+                std.debug.assert(self.in_flight_provider_cancels < std.math.maxInt(usize));
+                self.in_flight_provider_cancels += 1;
                 self.mutex.unlock();
-                self.provider.provider().cancel(&self.abort_signal);
+                defer self.finishProviderCancel();
+                provider.cancel(&self.abort_signal);
             },
             .abort_requested => self.mutex.unlock(),
             .idle => {
@@ -1104,6 +1156,10 @@ pub const AgentSession = struct {
     /// increasing, Session-scoped Run ID contract.
     fn beginRun(self: *AgentSession, run_id: u64, sink: EventSink) LifecycleError!RunIdentity {
         self.mutex.lock();
+        if (self.in_flight_provider_cancels != 0) {
+            self.mutex.unlock();
+            return error.SessionBusy;
+        }
         switch (self.state) {
             .idle => {},
             .running, .abort_requested, .compacting, .compact_finishing, .mutating => {
@@ -1682,8 +1738,11 @@ test "AgentSession permission rule update is idle-only atomic and preserves memo
 
 const CompactTestProvider = struct {
     block: bool = false,
+    block_cancel: bool = false,
     started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    cancel_started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    release_cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     stream_stage: u8 = 0,
 
     fn provider(self: *@This()) provider_mod.Provider {
@@ -1770,7 +1829,11 @@ const CompactTestProvider = struct {
         return error.Unused;
     }
     fn cancel(raw: *anyopaque, _: *const AbortSignal) void {
-        cast(raw).cancelled.store(true, .release);
+        const self = cast(raw);
+        self.cancelled.store(true, .release);
+        self.cancel_started.store(true, .release);
+        while (self.block_cancel and !self.release_cancel.load(.acquire))
+            std.Thread.yield() catch {};
     }
     fn maxTokens(_: *anyopaque) u32 {
         return 32_000;
@@ -1884,6 +1947,122 @@ test "AgentSession compact abort is bounded terminal and leaves Conversation unc
     try std.testing.expectEqual(State.idle, self.state);
     try std.testing.expectEqual(@as(u64, 3), self.last_terminal_compact_id);
     try std.testing.expectError(error.AbortTooLate, self.abortCompact(3));
+}
+
+test "AgentSession keeps every activity busy until compact provider cancel returns" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    try self.conversation.appendText(.user, "old user context");
+    try self.conversation.appendText(.assistant, "old assistant context");
+    try self.conversation.appendText(.user, "recent user context");
+
+    var fake = CompactTestProvider{ .block = true, .block_cancel = true };
+    const CompactWorker = struct {
+        session: *AgentSession,
+        provider: provider_mod.Provider,
+        report: ?compact_kernel.Report = null,
+        failure: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            ctx.report = ctx.session.compactUsingProvider(
+                3,
+                .{ .keep_recent = 1 },
+                ctx.provider,
+            ) catch |err| {
+                ctx.failure = err;
+                return;
+            };
+        }
+    };
+    const AbortWorker = struct {
+        session: *AgentSession,
+        failure: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            ctx.session.abortCompact(3) catch |err| {
+                ctx.failure = err;
+            };
+        }
+    };
+    var compact_worker = CompactWorker{ .session = self, .provider = fake.provider() };
+    var abort_worker = AbortWorker{ .session = self };
+    const compact_thread = try std.Thread.spawn(.{}, CompactWorker.run, .{&compact_worker});
+    while (!fake.started.load(.acquire)) std.Thread.yield() catch {};
+    const abort_thread = try std.Thread.spawn(.{}, AbortWorker.run, .{&abort_worker});
+    while (!fake.cancel_started.load(.acquire)) std.Thread.yield() catch {};
+    compact_thread.join();
+
+    try std.testing.expect(compact_worker.failure == null);
+    try std.testing.expectEqual(compact_kernel.Outcome.aborted, compact_worker.report.?.outcome);
+    try std.testing.expectError(error.SessionBusy, self.setModel("model-while-cancel-borrowed"));
+    try std.testing.expectError(error.SessionBusy, self.updatePermissionRules(.{}));
+    var sink_probe = SinkProbe{};
+    try std.testing.expectError(error.SessionBusy, self.beginRun(1, sink_probe.sink()));
+    try std.testing.expectError(
+        error.SessionBusy,
+        self.compactUsingProvider(4, .{}, fake.provider()),
+    );
+    try std.testing.expectEqual(@as(u64, 3), self.last_admitted_compact_id);
+    try std.testing.expectError(error.SessionBusy, self.destroy());
+
+    fake.release_cancel.store(true, .release);
+    abort_thread.join();
+    try std.testing.expect(abort_worker.failure == null);
+    try std.testing.expectEqual(@as(usize, 0), self.in_flight_provider_cancels);
+    try self.setModel("model-after-cancel-returned");
+}
+
+test "AgentSession keeps every activity busy until Run provider cancel returns" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    var sink_probe = SinkProbe{};
+    _ = try self.beginRun(1, sink_probe.sink());
+
+    var fake = CompactTestProvider{ .block_cancel = true };
+    const AbortWorker = struct {
+        session: *AgentSession,
+        provider: provider_mod.Provider,
+        failure: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            ctx.session.abortUsingProvider(
+                1,
+                .user_interrupt,
+                ctx.provider,
+            ) catch |err| {
+                ctx.failure = err;
+            };
+        }
+    };
+    var abort_worker = AbortWorker{ .session = self, .provider = fake.provider() };
+    const abort_thread = try std.Thread.spawn(.{}, AbortWorker.run, .{&abort_worker});
+    while (!fake.cancel_started.load(.acquire)) std.Thread.yield() catch {};
+    const completion = self.finishRunLifecycle();
+    try std.testing.expect(completion.abort_requested);
+
+    try std.testing.expectError(error.SessionBusy, self.setModel("model-while-cancel-borrowed"));
+    try std.testing.expectError(error.SessionBusy, self.updatePermissionRules(.{}));
+    try std.testing.expectError(error.SessionBusy, self.beginRun(2, sink_probe.sink()));
+    try std.testing.expectError(
+        error.SessionBusy,
+        self.compactUsingProvider(1, .{}, fake.provider()),
+    );
+    try std.testing.expectError(error.SessionBusy, self.destroy());
+
+    fake.release_cancel.store(true, .release);
+    abort_thread.join();
+    try std.testing.expect(abort_worker.failure == null);
+    try std.testing.expectEqual(@as(usize, 0), self.in_flight_provider_cancels);
+    _ = try self.beginRun(2, sink_probe.sink());
+    _ = self.finishRunLifecycle();
 }
 
 test "AgentSession enforces one active Run and monotonic nonzero run ids" {

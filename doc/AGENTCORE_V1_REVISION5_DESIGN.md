@@ -112,6 +112,13 @@ Session idle
 
 内部可以复用 Session mutation gate，但不把该抽象暴露成公共 Activity 框架。
 
+matching abort 是唯一的并发例外：`session_abort` 只可与其标识的 active Run 并发，
+`session_abort_compact` 只可与其标识的 active compact 并发。它们不获得与
+其它 Session 调用并发的额外权利。Host 必须等待所有 abort 调用返回后，才能在同一
+handle 上发起任何后续调用，包括新的 Run、compact、mutation 或 destroy；destroy 返回
+`OK` 后 handle 立即失效，后续任何调用均属于 Host 错误。Revision 5 只保证有效 handle
+上符合上述时序的调用安全，不承诺已销毁或可能在调用返回前被销毁的裸指针仍可使用。
+
 ### 2.2 Run 固定读取视图
 
 Run admission 成功时固定读取：
@@ -211,6 +218,13 @@ session_abort_compact(session, operation_id, diagnostic)
 
 Host 可以通过 slash、按钮或自己的策略调用 compact；AgentCore 不感知触发来源。
 
+Revision 5 的 manual compact 执行 canonical 默认策略，是 best-effort Conversation
+维护操作。它不接收 Host 指定的目标 token budget，也不保证结果能够装入某个当前或未来
+模型的上下文窗口。`session_set_model` 与 `session_compact` 是两个独立 primitive；Host
+可以自行安排顺序，但 Revision 5 不定义复合事务或目标模型适配承诺。只有真实消费证据
+证明 Host 必须控制某个稳定策略输入，且 Core 已形成 canonical 语义后，才讨论新的 wire
+输入。
+
 ### 4.2 结果与 usage
 
 `CompactResult` 的 exact wire shape 后续冻结，但必须表达：
@@ -220,6 +234,13 @@ Host 可以通过 slash、按钮或自己的策略调用 compact；AgentCore 不
 - 本次 provider usage delta。
 
 `degraded` 表示 Core 使用了有损但合法的 fallback，不冻结具体摘要或裁剪算法。
+Revision 5 不提供结构化 degrade reason；不得从 diagnostic 文案反推原因。未来若 Core
+形成稳定的 reason taxonomy，必须通过新的 ABI revision 显式投影，不能在 Revision 5
+中把 reserved storage 重新解释成新字段。
+
+compact 前后的 token 规模是用于上下文状态展示和策略判断的估算值，不是 provider
+账单或计费凭据。四项 provider usage delta 与这两个估算值语义独立；消费方不得用
+`before_context_tokens` 或 `after_context_tokens` 对账计费。
 
 manual compact 不伪造 `RunContext`，也不借用 `run_id` 发事件。它产生的 provider usage
 通过 `CompactResult` 返回。
@@ -466,7 +487,12 @@ Revision 5 不增加：
 - rule revision 或 policy generation；
 - workspace/global/organization scope 对象；
 - suggested-rule 生成系统；
+- matched-rule identity、decision trace 或通用 permission provenance；
 - 审计数据库。
+
+规则命中来源若进入后续 ABI，必须先由 Core decision chain 形成覆盖 imported rules、
+Session 临时记忆、protected paths、permission mode 与 Skill policy 的统一结构化结果；
+AgentCore adapter 不得依据当前三数组索引临时拼出第二套来源语义。
 
 ## 7. Revision 5 API surface
 
@@ -538,6 +564,9 @@ rules 总数上限为 1024，单条 64 KiB，总字节数 1 MiB。所有 `struct
 reserved 字段必须为零，输入在解引用前先限长。C、Zig、Rust binding 与 manifest 使用同一组
 精确值；manifest 同时记录 revision、table size 与 capability set。
 
+reserved storage 只保留布局空间，不是 Revision 5 内的扩展协议。任何 reserved 字段的
+新解释、非零值或新增可观察语义都必须切换 ABI revision。
+
 ## 8. 明确非目标
 
 ### 8.1 已由 Revision 4 处理
@@ -573,6 +602,8 @@ bypass、unrestricted shell 或 allowed tools 拼成公共承诺。
 - Skill 管理中心 UI；
 - 通用 extension/versioning framework；
 - 通用异步 Operation API。
+- Host 指定目标 token budget 的 compact，以及“适配目标模型窗口”的结果保证；
+- 结构化 permission decision provenance 与 compact degrade reason。
 
 ## 9. 冻结门槛
 
@@ -586,6 +617,7 @@ bypass、unrestricted shell 或 allowed tools 拼成公共承诺。
 | compact admission | zero/future/stale/too-late 及 active/idle 互斥矩阵；pre-admission 不消费；admitted terminal 均消费 |
 | compact atomicity | tool pair 合法；非 `OK` 零提交；degraded/no-change/aborted 结果明确 |
 | compact liveness | provider 永不响应时 abort 主动中断；测试上限 5 秒；之后 destroy 成功 |
+| abort lifecycle | matching abort 只与对应 Run/compact 并发；任何后续调用等待 abort 返回；Core provider snapshot 与 cancel borrow 在同一 admission gate 下；destroy 成功后 handle 失效 |
 | compact accounting | manual/auto 共用 kernel；provider usage 恰好计入一次；不消费 `run_id` |
 | Skill selection-only | 不要求 catalog handle；不 discovery；对当前 target catalog 校验 |
 | Skill joint update | invalid/duplicate/foreign ID fail-fast；失败保留旧组合 |
@@ -610,6 +642,7 @@ ABI 冻结还必须满足：
 |---|---|---|
 | 对话后执行 `/model` | Session model 创建后不可变 | Conversation 保留，后续 Run 使用新 model |
 | Host `/compact` 或按钮 | 无 UI-neutral manual compact | Host 直接调用 compact primitive |
+| 切换到更小上下文窗口的模型 | 是否需要 Host 指定目标预算尚未形成 canonical 公共语义 | R5 仅提供独立 model/default compact primitive，不承诺适配；由真实消费证据决定后续演进 |
 | Skill 管理中心拨开关 | catalog 与 availability 未分离 | selection-only 更新且全入口一致生效 |
 | 跨 Session `Allow always` | Host rules 无正式导入通道 | Host 持久化，AgentCore 校验和执行 |
 | Full access | 无统一 capability 语义 | 不以单个布尔字段进入 ABI |

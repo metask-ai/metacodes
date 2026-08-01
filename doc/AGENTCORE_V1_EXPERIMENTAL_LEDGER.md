@@ -59,3 +59,24 @@ revision 4 准入引用的真实消费者证据：
 - [x] 改为“不暴露 ABI 级异步 operation”，并明确 Bash 后台作业/BashOutput/KillShell 仍是工具级能力；
 - [x] 明确 revision 2 依赖 64 位指针布局，header 对 32 位消费端编译期拒绝；
 - [x] 明确禁止 C++ exception / longjmp 等非局部跳转跨越回调与 release 边界。
+
+## E 组：Revision 5 后续架构观测（不自动扩入当前 revision）
+
+以下项目来自 2026-08-01 的外部 Host 视角评审。它们是后续证据收集项，不因为消费场景
+本身成为 ABI 演进依据，也不得绕过“Core 先于 ABI”或借 reserved storage 在 Revision 5
+内增加语义：
+
+1. **E1 — goal-directed compact**：用真实 Host 验证切换到更小上下文模型的完整流程。
+   当前 R5 manual compact 是无 target budget 的 canonical default best-effort 操作，不承诺
+   适配目标模型。只有证明 Host 必须控制稳定输入、且 Core 能定义达到/未达到目标的
+   canonical 结果后，才评估新 revision；不得直接投影全部 `CompactKernel.Options`。
+2. **E2 — permission decision provenance**：评估 Host 是否需要结构化回答“哪条规则或哪层
+   安全边界导致该决定”。若需要，Core 先统一 imported rules、Session 临时记忆、protected
+   paths、permission mode 与 Skill policy 的来源模型；不得由 AgentCore adapter 返回脆弱的
+   三数组索引或可解析英文文本。
+3. **E3 — compact degraded reason**：当前 Core 在 ABI 投影前已折叠具体失败原因。若真实运维
+   证据要求区分原因，先定义稳定的小型 Core taxonomy，再通过新 revision 显式投影；不得
+   复用 R5 reserved 字段规避 revision cut。
+4. **E4 — stability horizon**：外部消费方出现后，连续 hard cut 的协调成本会改变。达到何种
+   外部消费数量、支持期限、consumer matrix 与弃用周期时进入兼容窗口，留待真实交付数据
+   决定；当前不预设 revision 编号、shim 或双分派。

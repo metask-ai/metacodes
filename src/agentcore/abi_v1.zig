@@ -1842,6 +1842,11 @@ fn sessionUpdateSkills(
     var runtime_call = runtime.catalogs.enterCall() catch |err|
         return failError(catalogLifecycleStatus(err), err, out_error);
     defer runtime_call.deinit();
+    // Deliberately facade-only: Skill binding neither borrows nor mutates the
+    // Core provider, and the terminal Run/compact has no remaining Skill
+    // consumer while its abort call drains. The Host contract still forbids
+    // this overlap; the Core cancel counter is a provider-lifetime backstop,
+    // not a general-purpose concurrency oracle for unrelated facade state.
     if (!self.tryBeginMutation())
         return fail(wire.STATUS_BUSY, "Session has an active facade call", out_error);
     defer self.finishMutation();

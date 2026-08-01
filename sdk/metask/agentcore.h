@@ -361,7 +361,10 @@ typedef struct {
 } metask_agentcore_compact_result_v1;
 /* Fields are defined only when session_compact returns
  * METASK_AGENTCORE_STATUS_OK. An accepted cancellation returns OK with
- * METASK_AGENTCORE_COMPACT_ABORTED and does not commit Conversation changes. */
+ * METASK_AGENTCORE_COMPACT_ABORTED and does not commit Conversation changes.
+ * before_context_tokens and after_context_tokens are context-size estimates,
+ * not provider billing values. The four usage fields are separate provider
+ * usage deltas. Revision 5 exposes no structured degraded reason. */
 
 typedef uint32_t (*metask_agentcore_runtime_create_fn_v1)(const metask_agentcore_runtime_config_v1 *, metask_agentcore_runtime **, metask_agentcore_owned_bytes_v1 *);
 typedef uint32_t (*metask_agentcore_runtime_destroy_fn_v1)(metask_agentcore_runtime *, metask_agentcore_owned_bytes_v1 *);
@@ -379,6 +382,10 @@ typedef uint32_t (*metask_agentcore_skill_catalog_release_fn_v1)(
     metask_agentcore_skill_catalog *,
     metask_agentcore_owned_bytes_v1 *);
 typedef uint32_t (*metask_agentcore_session_create_fn_v1)(metask_agentcore_runtime *, const metask_agentcore_session_config_v1 *, const metask_agentcore_session_callbacks_v1 *, metask_agentcore_session **, metask_agentcore_owned_bytes_v1 *);
+/* The Host must wait for every session_abort/session_abort_compact call to
+ * return before issuing any subsequent call on the same handle, including
+ * destroy. STATUS_OK invalidates the handle; any later call with that pointer
+ * is invalid Host behavior. */
 typedef uint32_t (*metask_agentcore_session_destroy_fn_v1)(metask_agentcore_session *, metask_agentcore_owned_bytes_v1 *);
 typedef uint32_t (*metask_agentcore_session_set_model_fn_v1)(
     metask_agentcore_session *,
@@ -431,7 +438,9 @@ typedef uint32_t (*metask_agentcore_session_abort_fn_v1)(
 /* operation_id is Host-assigned, non-zero, and strictly increasing in the
  * Session compact ID space. Zero is INVALID_ARGUMENT and an ID not greater
  * than the last admitted compact is STALE_COMPACT. Pre-admission rejection
- * does not consume the ID; every admitted terminal path does. */
+ * does not consume the ID; every admitted terminal path does. Revision 5 runs
+ * a canonical default best-effort policy: it accepts no target token budget
+ * and does not guarantee that the result fits any model context window. */
 typedef uint32_t (*metask_agentcore_session_compact_fn_v1)(
     metask_agentcore_session *session,
     uint64_t operation_id,
@@ -466,7 +475,9 @@ typedef uint32_t (*metask_agentcore_session_abort_compact_fn_v1)(
  * success; non-empty diagnostics are library-owned and must be released with
  * buffer_release. buffer_release must not be used for Host-owned tool or UI
  * callback buffers, which use their paired Host release callback. Diagnostic
- * allocation is best-effort and never changes the operation's primary status. */
+ * allocation is best-effort and never changes the operation's primary status.
+ * Diagnostic text is human-readable, non-normative, and unstable; consumers
+ * must not parse it or branch on its wording. */
 typedef void (*metask_agentcore_buffer_release_fn_v1)(metask_agentcore_owned_bytes_v1 *);
 
 typedef struct {
@@ -496,8 +507,11 @@ typedef struct {
  * permission-rule mutation, and destroy are mutually exclusive per Session.
  * Different Sessions may run and invoke shared callbacks concurrently.
  * A Host tool may also be invoked concurrently within one Session. Callbacks
- * may request abort; re-entered run or destroy returns BUSY. A callback must
- * not wait or spin for that operation. C++ exceptions, longjmp, and all other
+ * may request matching abort; matching abort may overlap only its corresponding
+ * active Run or compact. The Host must wait for abort to return before any
+ * subsequent call on the same handle. Re-entered run or destroy returns BUSY.
+ * A callback must not wait or spin for that operation.
+ * C++ exceptions, longjmp, and all other
  * non-local control transfers must not cross callback or release-callback
  * boundaries. No callback or release callback has thread affinity. */
 /* requested_abi selects the major table shape. Consumers must additionally

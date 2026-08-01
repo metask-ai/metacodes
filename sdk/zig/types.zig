@@ -359,7 +359,9 @@ pub const RunResultV1 = extern struct {
 };
 
 /// Terminal manual-compact summary. Fields are defined only when
-/// `session_compact` returns STATUS_OK.
+/// `session_compact` returns STATUS_OK. The before/after values are context-size
+/// estimates, not provider billing values; the four usage fields are separate
+/// provider usage deltas. Revision 5 exposes no structured degraded reason.
 pub const CompactResultV1 = extern struct {
     struct_size: u32,
     outcome_code: u32,
@@ -375,7 +377,8 @@ pub const CompactResultV1 = extern struct {
 /// The final OwnedBytesV1 pointer on each AgentCore operation is an optional,
 /// write-only diagnostic output. Release a prior diagnostic before reusing
 /// its variable. Diagnostic allocation is best-effort and never changes the
-/// operation's primary status.
+/// operation's primary status. Text is human-readable, non-normative, and
+/// unstable; consumers must not parse it or branch on its wording.
 pub const RuntimeCreateFnV1 = *const fn (?*const RuntimeConfigV1, ?*?*RuntimeHandle, ?*OwnedBytesV1) callconv(.c) u32;
 pub const RuntimeDestroyFnV1 = *const fn (?*RuntimeHandle, ?*OwnedBytesV1) callconv(.c) u32;
 pub const RuntimeQuerySkillCatalogFnV1 = *const fn (
@@ -387,6 +390,9 @@ pub const RuntimeQuerySkillCatalogFnV1 = *const fn (
 ) callconv(.c) u32;
 pub const SkillCatalogReleaseFnV1 = *const fn (?*SkillCatalogHandle, ?*OwnedBytesV1) callconv(.c) u32;
 pub const SessionCreateFnV1 = *const fn (?*RuntimeHandle, ?*const SessionConfigV1, ?*const SessionCallbacksV1, ?*?*SessionHandle, ?*OwnedBytesV1) callconv(.c) u32;
+/// Wait for every Session abort call to return before any subsequent call on
+/// the same handle, including destroy. STATUS_OK invalidates the handle; any
+/// later call with that pointer is invalid.
 pub const SessionDestroyFnV1 = *const fn (?*SessionHandle, ?*OwnedBytesV1) callconv(.c) u32;
 pub const SessionSetModelFnV1 = *const fn (?*SessionHandle, BytesViewV1, ?*OwnedBytesV1) callconv(.c) u32;
 pub const SessionUpdateSkillsFnV1 = *const fn (
@@ -431,6 +437,8 @@ pub const SessionAbortFnV1 = *const fn (
     reason_code: u32,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
+/// Runs the canonical default best-effort compact policy. Revision 5 accepts
+/// no target token budget and does not guarantee fit for a model context.
 pub const SessionCompactFnV1 = *const fn (
     session: ?*SessionHandle,
     operation_id: u64,
