@@ -94,7 +94,7 @@ pub const WebServer = struct {
     /// 活跃连接线程数(detached)。stop() 等它归零再释放 self——否则连接线程
     /// 还在摸 self.deps 时资源已被 deinit(UAF)。
     live_conns: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
-    /// stop() 已发起:acceptLoop 唯一的退出依据。stop 先置它再 close(listen_fd),
+    /// stop() 已发起:acceptLoop 唯一的退出依据。stop 先置它再 shutdown+close(listen_fd),
     /// accept 返 -1 时据它区分"主动关闭(退出)"vs"瞬时错误 EINTR/ECONNABORTED/
     /// EMFILE(continue 重试)"——否则一次瞬时错误就让 server 永久哑掉。
     closing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -118,10 +118,11 @@ pub const WebServer = struct {
         return self;
     }
 
-    /// 关 listen fd(accept 返负退出)+ join + 等连接线程归零。SSE 连接线程靠
+    /// shutdown+关 listen fd(accept 返负退出)+ join + 等连接线程归零。SSE 连接线程靠
     /// journal.close() 醒来收尾——调用方(session driver)须**先 close journal 再 stop**。
     pub fn stop(self: *WebServer) void {
         self.closing.store(true, .release); // 先标记再 close:accept 醒来据它判定主动退出
+        net.shutdownSocket(self.listen_fd); // Linux:跨线程 close 不保证唤醒已阻塞的 accept
         net.closeSocket(self.listen_fd);
         self.accept_thread.join();
         // 等 detached 连接线程退净。**上限须 > socket 超时(SO_RCVTIMEO/SNDTIMEO=10s)**:

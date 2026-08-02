@@ -198,8 +198,10 @@ test "generate: basic profile structure" {
     try testing.expect(std.mem.indexOf(u8, p, "(allow default)") != null);
     try testing.expect(std.mem.indexOf(u8, p, "(deny file-write*)") != null);
     try testing.expect(std.mem.indexOf(u8, p, "(allow file-write*") != null);
-    // /tmp 应 realpath 成 /private/tmp
-    try testing.expect(std.mem.indexOf(u8, p, "/private/tmp") != null);
+    // macOS 的 /tmp realpath 到 /private/tmp；Linux 保持 /tmp。测试 profile
+    // 生成语义，而不是把 Darwin 文件系统布局误当成 POSIX 通则。
+    const expected_tmp = if (@import("builtin").os.tag == .macos) "/private/tmp" else "/tmp";
+    try testing.expect(std.mem.indexOf(u8, p, expected_tmp) != null);
 }
 
 test "generate: allowWrite + denyWrite + denyRead" {

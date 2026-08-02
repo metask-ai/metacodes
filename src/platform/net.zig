@@ -12,6 +12,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const pfs = @import("fs.zig"); // 可移植 stat（isSocket 等）——避免 std.c.Stat（linux 下 void）
 const pproc = @import("process.zig"); // currentPid（跨平台;测试唯一 path 用，std.time.nanoTimestamp 在此 Zig 0.16 缺失）
+const psync = @import("sync.zig");
 const is_windows = builtin.os.tag == .windows;
 const win = std.os.windows;
 const ws2 = win.ws2_32; // 只用它的常量/struct(AF/SOCK/SOL/SO/IPPROTO/sockaddr);zig 0.16 未导出函数
@@ -35,6 +36,7 @@ const sys = struct {
     extern "ws2_32" fn connect(s: SOCKET, addr: *const anyopaque, namelen: i32) callconv(.winapi) i32;
     extern "ws2_32" fn recv(s: SOCKET, buf: [*]u8, len: i32, flags: i32) callconv(.winapi) i32;
     extern "ws2_32" fn send(s: SOCKET, buf: [*]const u8, len: i32, flags: i32) callconv(.winapi) i32;
+    extern "ws2_32" fn shutdown(s: SOCKET, how: i32) callconv(.winapi) i32;
     extern "ws2_32" fn closesocket(s: SOCKET) callconv(.winapi) i32;
     extern "ws2_32" fn setsockopt(s: SOCKET, level: i32, optname: i32, optval: [*]const u8, optlen: i32) callconv(.winapi) i32;
     extern "ws2_32" fn getsockname(s: SOCKET, addr: *anyopaque, addrlen: *i32) callconv(.winapi) i32;
@@ -269,6 +271,18 @@ pub fn closeSocket(s: Socket) void {
     }
 }
 
+/// Interrupt blocking I/O without releasing the socket handle. Listener owners
+/// must call this before close+join: on Linux, closing a descriptor in one
+/// thread does not reliably wake another thread already blocked in accept(2).
+/// `shutdown(SHUT_RDWR)` does, on POSIX and Winsock alike.
+pub fn shutdownSocket(s: Socket) void {
+    if (is_windows) {
+        _ = sys.shutdown(s, 2); // SD_BOTH
+    } else {
+        _ = std.c.shutdown(s, std.c.SHUT.RDWR);
+    }
+}
+
 /// 收超时。POSIX=timeval;Windows=DWORD 毫秒(关键差异:同 optname 不同参数类型)。
 pub fn setRecvTimeoutMs(s: Socket, ms: u32) void {
     setTimeoutMs(s, .recv, ms);
@@ -329,6 +343,28 @@ test "loopback listen/connect/send/recv roundtrip" {
     const n = recv(conn, &buf);
     try testing.expectEqual(@as(isize, 4), n);
     try testing.expectEqualSlices(u8, msg, buf[0..@intCast(n)]);
+}
+
+test "shutdownSocket wakes a blocked accept before close" {
+    const listener = try listenLoopback(0, 4);
+    errdefer closeSocket(listener.sock);
+
+    var entered = std.atomic.Value(bool).init(false);
+    const Probe = struct {
+        fn run(sock: Socket, started: *std.atomic.Value(bool)) void {
+            started.store(true, .release);
+            if (acceptConn(sock)) |conn| closeSocket(conn);
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Probe.run, .{ listener.sock, &entered });
+    while (!entered.load(.acquire)) std.atomic.spinLoopHint();
+    // `entered` is set immediately before accept; give the new thread time to
+    // cross into the blocking syscall so this specifically covers the Linux
+    // close-vs-accept shutdown bug instead of merely shutting down first.
+    psync.sleepMs(20);
+    shutdownSocket(listener.sock);
+    closeSocket(listener.sock);
+    thread.join();
 }
 
 test "UDS listen/connect/send/recv roundtrip(POSIX)" {
