@@ -5,6 +5,11 @@ const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
 const error_class = @import("error_class.zig");
 
+/// Maximum accepted SSE line size. Tool input deltas can legitimately be much
+/// larger than the transport reader buffer, but a peer-controlled line must
+/// still have a hard bound so a missing newline cannot grow memory forever.
+pub const MAX_SSE_LINE_BYTES: usize = 16 * 1024 * 1024;
+
 /// SSE 行解析：提取 `data: ` 之后的 JSON payload；非 data 行返回 null。
 pub const SseParser = struct {
     pub fn parseLine(_: *SseParser, line: []const u8) ?[]const u8 {
@@ -49,6 +54,28 @@ pub fn parseEventType(data: []const u8) SseEventType {
     return .unknown;
 }
 
+/// Return the closing quote for a JSON string whose content starts at
+/// `content_start`. A quote closes the string only when preceded by an even
+/// run of backslashes; the escaped-state machine implements that parity
+/// without repeatedly scanning backwards.
+fn jsonStringEnd(data: []const u8, content_start: usize) ?usize {
+    var i = content_start;
+    var escaped = false;
+    while (i < data.len) : (i += 1) {
+        const c = data[i];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (c == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (c == '"') return i;
+    }
+    return null;
+}
+
 /// 在 top-level object 中查找指定字段的 string 值。跳过嵌套 object/array 和字符串内部。
 /// data 应以 `{` 开头；本函数只查 depth==1 的 key:value。
 fn findTopLevelStringField(data: []const u8, field: []const u8) ?[]const u8 {
@@ -67,8 +94,7 @@ fn findTopLevelStringField(data: []const u8, field: []const u8) ?[]const u8 {
         if (data[i] != '"') return null;
         i += 1;
         const key_start = i;
-        while (i < data.len and !(data[i] == '"' and data[i - 1] != '\\')) : (i += 1) {}
-        if (i >= data.len) return null;
+        i = jsonStringEnd(data, i) orelse return null;
         const key = data[key_start..i];
         i += 1; // 跳 closing "
 
@@ -83,8 +109,7 @@ fn findTopLevelStringField(data: []const u8, field: []const u8) ?[]const u8 {
             '"' => {
                 i += 1;
                 const v_start = i;
-                while (i < data.len and !(data[i] == '"' and data[i - 1] != '\\')) : (i += 1) {}
-                if (i >= data.len) return null;
+                i = jsonStringEnd(data, i) orelse return null;
                 if (is_target) return data[v_start..i];
                 i += 1;
             },
@@ -141,25 +166,16 @@ pub const ToolUseResult = struct {
 
 /// 从 content_block_delta 中提取文本增量（反转义后的 owned bytes，caller free）。
 pub fn extractTextDelta(data: []const u8, allocator: std.mem.Allocator) !?[]u8 {
-    if (std.mem.indexOf(u8, data, "\"type\":\"content_block_delta\"") == null) return null;
-    const delta_start = std.mem.indexOf(u8, data, "\"delta\":{") orelse return null;
-
-    var depth: i32 = 1;
-    var i = delta_start + 8;
-    while (i < data.len and depth > 0) : (i += 1) {
-        if (data[i] == '{') depth += 1;
-        if (data[i] == '}') depth -= 1;
+    if (parseEventType(data) != .content_block_delta) return null;
+    const delta_obj = findTopLevelObjectField(data, "delta") orelse return null;
+    // Some older compatible providers omit delta.type. Preserve that accepted
+    // shape when a top-level text field exists, while explicitly rejecting
+    // typed thinking/input deltas.
+    if (findTopLevelStringField(delta_obj, "type")) |delta_type| {
+        if (!std.mem.eql(u8, delta_type, "text_delta")) return null;
     }
-    const delta_obj = data[delta_start + 8 .. i];
-
-    const text_start = std.mem.indexOf(u8, delta_obj, "\"text\":\"") orelse return null;
-    const value_start = text_start + 8;
-    var end = value_start;
-    while (end < delta_obj.len and delta_obj[end] != '"') {
-        if (delta_obj[end] == '\\') end += 1;
-        end += 1;
-    }
-    return try util_json.unescapeString(delta_obj[value_start..end], allocator);
+    const raw_text = findTopLevelStringField(delta_obj, "text") orelse return null;
+    return try util_json.unescapeString(raw_text, allocator);
 }
 
 /// 从 content_block_delta 中提取 tool_use 的 input_json_delta.partial_json 片段。
@@ -298,10 +314,7 @@ fn findTopLevelArrayFieldRaw(data: []const u8, field: []const u8) ?[]const u8 {
         if (data[i] != '"') return null;
         i += 1;
         const k_start = i;
-        while (i < data.len and data[i] != '"') : (i += 1) {
-            if (data[i] == '\\') i += 1;
-        }
-        if (i >= data.len) return null;
+        i = jsonStringEnd(data, i) orelse return null;
         const k = data[k_start..i];
         i += 1;
         while (i < data.len and (data[i] == ' ' or data[i] == '\t' or data[i] == ':' or data[i] == '\n')) : (i += 1) {}
@@ -348,10 +361,8 @@ fn skipJsonValue(data: []const u8, start: usize) usize {
     const c = data[i];
     if (c == '"') {
         i += 1;
-        while (i < data.len and data[i] != '"') : (i += 1) {
-            if (data[i] == '\\') i += 1;
-        }
-        return if (i < data.len) i + 1 else i;
+        const end = jsonStringEnd(data, i) orelse return data.len;
+        return end + 1;
     }
     if (c == '{' or c == '[') {
         const open = c;
@@ -403,8 +414,7 @@ fn findTopLevelObjectFieldRaw(data: []const u8, field: []const u8) ?[]const u8 {
         if (data[i] != '"') return null;
         i += 1;
         const key_start = i;
-        while (i < data.len and !(data[i] == '"' and data[i - 1] != '\\')) : (i += 1) {}
-        if (i >= data.len) return null;
+        i = jsonStringEnd(data, i) orelse return null;
         const key = data[key_start..i];
         i += 1;
 
@@ -450,8 +460,7 @@ fn findTopLevelObjectFieldRaw(data: []const u8, field: []const u8) ?[]const u8 {
             '"' => {
                 // 不匹配（本函数只返回 object/array 值）——跳过这个 string
                 i += 1;
-                while (i < data.len and !(data[i] == '"' and data[i - 1] != '\\')) : (i += 1) {}
-                if (i < data.len) i += 1;
+                i = (jsonStringEnd(data, i) orelse return null) + 1;
             },
             else => {
                 // scalar — 跳
@@ -503,10 +512,63 @@ test "extractTextDelta basic" {
 }
 
 test "extractTextDelta with escape" {
-    const data = "{\"type\":\"content_block_delta\",\"delta\":{\"text\":\"a\\nb\"}}";
+    const data = "{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"a\\nb\"}}";
     const r = (try extractTextDelta(data, std.testing.allocator)).?;
     defer std.testing.allocator.free(r);
     try std.testing.expectEqualStrings("a\nb", r);
+}
+
+test "JSON string scanner handles backslash parity and escaped quotes" {
+    const cases = [_]struct { encoded: []const u8, expected: []const u8 }{
+        .{
+            .encoded =
+            \\{"type":"content_block_delta","delta":{"type":"text_delta","text":"tail\\"}}
+            ,
+            .expected = "tail\\",
+        },
+        .{
+            .encoded =
+            \\{"type":"content_block_delta","delta":{"type":"text_delta","text":"tail\\\\"}}
+            ,
+            .expected = "tail\\\\",
+        },
+        .{
+            .encoded =
+            \\{"type":"content_block_delta","delta":{"type":"text_delta","text":"C:\\temp\\"}}
+            ,
+            .expected = "C:\\temp\\",
+        },
+        .{
+            .encoded =
+            \\{"type":"content_block_delta","delta":{"type":"text_delta","text":"say \"hi\""}}
+            ,
+            .expected = "say \"hi\"",
+        },
+    };
+    for (cases) |case| {
+        const actual = (try extractTextDelta(case.encoded, std.testing.allocator)).?;
+        defer std.testing.allocator.free(actual);
+        try std.testing.expectEqualStrings(case.expected, actual);
+    }
+}
+
+test "input_json_delta chunk may end with a backslash" {
+    const data =
+        \\{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"tail\\"}}
+    ;
+    try std.testing.expectEqualStrings("tail\\\\", extractInputJsonDelta(data).?);
+}
+
+test "extractTextDelta accepts proxy whitespace and reordered fields" {
+    const data = "{\"delta\": {\"text\": \"proxy text\", \"type\": \"text_delta\"}, \"index\": 2, \"type\": \"content_block_delta\"}";
+    const r = (try extractTextDelta(data, std.testing.allocator)).?;
+    defer std.testing.allocator.free(r);
+    try std.testing.expectEqualStrings("proxy text", r);
+}
+
+test "extractTextDelta rejects thinking_delta" {
+    const data = "{\"type\": \"content_block_delta\", \"delta\": {\"type\": \"thinking_delta\", \"thinking\": \"secret\"}}";
+    try std.testing.expect(try extractTextDelta(data, std.testing.allocator) == null);
 }
 
 test "extractTextDelta no delta returns null" {
@@ -563,7 +625,7 @@ test "parseEventType on malformed JSON returns unknown" {
 }
 
 test "extractTextDelta on empty text" {
-    const data = "{\"type\":\"content_block_delta\",\"delta\":{\"text\":\"\"}}";
+    const data = "{\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"\"}}";
     const r = (try extractTextDelta(data, std.testing.allocator)).?;
     defer std.testing.allocator.free(r);
     try std.testing.expectEqualStrings("", r);
@@ -844,26 +906,42 @@ pub const EventIterator = struct {
     /// 读一行(到 '\n',不含)。
     /// 快路径:reader.takeDelimiter 直接借 reader buffer 里的 slice(短行,无分配)。
     /// 慢路径:行超出 reader buffer(8KB)→ takeDelimiter 报 StreamTooLong,改用
-    ///   streamDelimiterEnding 把整行累积到 line_overflow(可增长),再吞掉分隔符。
+    ///   streamDelimiterLimit 把整行累积到 line_overflow,并在读取过程中执行硬上限。
     /// 返回借用 slice(指向 reader buffer 或 self.line_overflow);null = EOF。
     /// 修复:大 input_json_delta(写大文件)曾因 8KB 上限直接 StreamTooLong→RequestFailed。
     fn takeLine(self: *EventIterator, allocator: std.mem.Allocator) !?[]const u8 {
         if (self.reader.takeDelimiter('\n')) |line_opt| {
+            if (line_opt) |line| {
+                if (line.len > MAX_SSE_LINE_BYTES) return error.StreamTooLong;
+            }
             return line_opt; // 含 EOF→null 的快路径
         } else |err| switch (err) {
             error.StreamTooLong => {
-                // 慢路径:行比 reader buffer 长。用 Allocating writer 累积整行(可增长)。
+                // 慢路径:行比 reader buffer 长。limit 取 max+1，允许恰好 max
+                // 字节后紧跟分隔符，同时保证无分隔符的恶意流最多只累积 max+1。
                 self.line_overflow.clearRetainingCapacity();
                 var alloc_w: std.Io.Writer.Allocating = .fromArrayList(allocator, &self.line_overflow);
-                _ = self.reader.streamDelimiterEnding(&alloc_w.writer, '\n') catch |e| {
+                const line_len = self.reader.streamDelimiterLimit(
+                    &alloc_w.writer,
+                    '\n',
+                    .limited(MAX_SSE_LINE_BYTES + 1),
+                ) catch |e| {
                     self.line_overflow = alloc_w.toArrayList();
-                    self.logWarn("streamDelimiterEnding failed: {s}", .{@errorName(e)});
-                    return error.ReadFailed;
+                    self.logWarn("streamDelimiterLimit failed: {s}", .{@errorName(e)});
+                    return switch (e) {
+                        error.StreamTooLong => error.StreamTooLong,
+                        error.ReadFailed => error.ReadFailed,
+                        // Allocating.writer reports allocation failure through
+                        // Writer.Error; restore the ArrayList above, then expose
+                        // the actionable allocator error to the caller.
+                        error.WriteFailed => error.OutOfMemory,
+                    };
                 };
                 // streamDelimiterEnding 停在分隔符处(buffer 首字节是 '\n')或 EOF(buffer 空)。
                 // 若还有分隔符,吞掉它,让下次从下一行开始。
                 if (self.reader.bufferedLen() > 0) self.reader.toss(1);
                 self.line_overflow = alloc_w.toArrayList(); // 取回所有权
+                if (line_len > MAX_SSE_LINE_BYTES) return error.StreamTooLong;
                 return self.line_overflow.items;
             },
             else => return err,
@@ -881,6 +959,10 @@ pub const EventIterator = struct {
             if (self.abort) |a| try a.throwIfAborted();
 
             const line_opt = self.takeLine(allocator) catch |err| {
+                // A read/limit failure can leave the transport positioned in
+                // the middle of a line. Make the iterator terminal so callers
+                // cannot accidentally parse the suffix as a fresh SSE frame.
+                self.done_flag = true;
                 self.logWarn("takeLine failed: {s}", .{@errorName(err)});
                 return err;
             };
@@ -1137,6 +1219,28 @@ test "EventIterator: 超长 SSE 行(> reader buffer)不再 StreamTooLong" {
     // text_delta 应完整拿到 5000 个 'x'
     try std.testing.expectEqual(@as(usize, 5000), ev.text_delta.len);
     try std.testing.expect(std.mem.indexOfNone(u8, ev.text_delta, "x") == null);
+}
+
+test "EventIterator: SSE line hard limit prevents unbounded allocation" {
+    const a = std.testing.allocator;
+    const oversized = try a.alloc(u8, MAX_SSE_LINE_BYTES + 2);
+    defer a.free(oversized);
+    @memset(oversized, 'x');
+    oversized[oversized.len - 1] = '\n';
+
+    // Force the overflow path used by network readers rather than letting the
+    // fixed source expose the complete line as one enormous reader buffer.
+    var src = std.Io.Reader.fixed(oversized);
+    var small_buf: [64]u8 = undefined;
+    var limited = std.Io.Reader.limited(&src, .unlimited, &small_buf);
+
+    var it = EventIterator.init(&limited.interface);
+    defer it.deinit(a);
+    try std.testing.expectError(error.StreamTooLong, it.next(a));
+    try std.testing.expect(it.line_overflow.items.len <= MAX_SSE_LINE_BYTES + 1);
+    // The failed line was only partially consumed; continuing would treat its
+    // suffix as a new frame, so the iterator must remain terminal.
+    try std.testing.expect((try it.next(a)) == null);
 }
 
 test "EventIterator: tool_use_start emitted on content_block_stop" {

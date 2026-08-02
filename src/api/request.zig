@@ -51,6 +51,9 @@ pub const ToolDefinition = struct {
     /// 运行期内部标记(不序列化进 API):deferred 工具(MCP 等)默认不进 tools 数组,
     /// 经 ToolSearch 激活后才发。agent_loop 据此过滤。
     deferred: bool = false,
+    /// 运行期内部来源标记(不序列化)。非 null 只用于 MCP 注册桥接，
+    /// AgentDef.mcpServers 必须按此字段过滤，不能从 `name` 猜来源。
+    mcp_server: ?[]const u8 = null,
 };
 
 /// 单个参数的 JSON Schema 描述。comptime 友好（纯字面量），用于内置工具表里

@@ -202,6 +202,7 @@ pub const SpawnTeammateParams = struct {
     agent_type: []const u8 = "",
     max_turns_per_run: u32 = 0, // 0=默认 20
     model_override: ?[]const u8 = null,
+    reasoning_effort_override: ?types_mod.ReasoningEffort = null,
     perm_override: ?types_mod.PermissionMode = null,
     project_dir: []const u8 = "",
     cwd: []const u8 = "",
@@ -211,6 +212,9 @@ pub const SpawnTeammateParams = struct {
     sandbox: ?*const @import("../sandbox/config.zig").SandboxSettings = null,
     home_dir: []const u8 = "",
     additional_dirs: []const []const u8 = &.{},
+    mcp_sessions: []const @import("../core/mcp_session.zig").McpSessionEntry = &.{},
+    /// AgentDef.isolation=worktree 所有权；spawnTeammate consume-on-call。
+    worktree: ?@import("../agents/isolation.zig").Worktree = null,
     // 借用(App 生命周期):
     dyn_registry: ?*const @import("../tools/dynamic.zig").DynRegistry = null,
     host_services: ?@import("../tools/context.zig").HostServices = null,
@@ -229,6 +233,7 @@ const TeammateInput = struct {
     project_dir: []u8,
     home: []u8, // teammate SwarmContext 路径根(SendMessage 用)
     model_override: ?[]u8,
+    reasoning_effort_override: ?types_mod.ReasoningEffort,
     permission_ctx: permission_mod.PermissionContext,
     perm_override: ?types_mod.PermissionMode,
     max_turns_per_run: u32,
@@ -241,6 +246,9 @@ const TeammateInput = struct {
     cwd_abs: []u8,
     home_dir: []u8,
     additional_dirs: [][]u8,
+    memdir_owned: []u8,
+    mcp_sessions_owned: []@import("../core/mcp_session.zig").McpSessionEntry,
+    worktree: ?@import("../agents/isolation.zig").Worktree,
     owned: pf.OwnedProvider,
 
     fn cleanup(self: *TeammateInput) void {
@@ -256,6 +264,12 @@ const TeammateInput = struct {
         a.free(self.home_dir);
         for (self.additional_dirs) |d| a.free(d);
         a.free(self.additional_dirs);
+        a.free(self.memdir_owned);
+        a.free(self.mcp_sessions_owned);
+        if (self.worktree) |*wt| {
+            _ = wt.finalize(null);
+            wt.deinit();
+        }
         if (self.model_override) |m| a.free(m);
         self.owned.deinit();
         a.destroy(self);
@@ -447,6 +461,11 @@ pub const TeammateRegistry = struct {
         // 内存全部统一 c_allocator;registry 自身的 entries 列表仍用 registry allocator。
         const a = std.heap.c_allocator;
         var committed = false;
+        var worktree = p.worktree;
+        errdefer if (!committed) if (worktree) |*wt| {
+            _ = wt.finalize(null);
+            wt.deinit();
+        };
 
         // 身份与路径预计算。
         var name_buf: [64]u8 = undefined;
@@ -577,6 +596,19 @@ pub const TeammateRegistry = struct {
             adirs_sb_owned[di] = try a.dupe(u8, d);
             nad_sb = di + 1;
         }
+        const memdir_owned = try a.dupe(u8, p.permission_ctx.memdir_abs);
+        errdefer if (!committed) a.free(memdir_owned);
+        const mcp_sessions_owned = try a.dupe(@import("../core/mcp_session.zig").McpSessionEntry, p.mcp_sessions);
+        errdefer if (!committed) a.free(mcp_sessions_owned);
+
+        var permission_owned = p.permission_ctx.scopedDerive(null);
+        permission_owned.allocator = a;
+        permission_owned.memdir_abs = memdir_owned;
+        permission_owned.match_ctx.cwd = cwd_sb_owned;
+        permission_owned.match_ctx.project_root = pdir_owned;
+        permission_owned.match_ctx.home = home_sb_owned;
+        permission_owned.match_ctx.additional_dirs = adirs_sb_owned;
+        permission_owned.match_ctx.alloc = a;
 
         input.* = .{
             .allocator = a,
@@ -588,7 +620,8 @@ pub const TeammateRegistry = struct {
             .project_dir = pdir_owned,
             .home = home_owned,
             .model_override = mover_owned,
-            .permission_ctx = p.permission_ctx,
+            .reasoning_effort_override = p.reasoning_effort_override,
+            .permission_ctx = permission_owned,
             .perm_override = p.perm_override,
             .max_turns_per_run = p.max_turns_per_run,
             .dyn_registry = p.dyn_registry,
@@ -599,6 +632,9 @@ pub const TeammateRegistry = struct {
             .cwd_abs = cwd_sb_owned,
             .home_dir = home_sb_owned,
             .additional_dirs = adirs_sb_owned,
+            .memdir_owned = memdir_owned,
+            .mcp_sessions_owned = mcp_sessions_owned,
+            .worktree = worktree,
             .owned = owned,
         };
 
@@ -901,11 +937,20 @@ fn teammateThreadMain(input: *TeammateInput) void {
     const a = input.allocator;
     const e = input.entry;
 
-    var ctx_override = input.permission_ctx;
-    if (input.perm_override) |m| ctx_override.setMode(m);
+    var ctx_override = input.permission_ctx.scopedDerive(input.perm_override);
     // teammate 线程绝不读 fd 0(与 lead REPL 争抢/卡死):`.ask` 无 ui_requester → fail-closed deny
     // (PM SW4 3c)。SW7 权限代理会给 teammate 一个转发到 lead 的 ui_requester。
     ctx_override.no_interactive_prompt = true;
+
+    if (input.reasoning_effort_override) |effort| {
+        input.owned.provider().setReasoningEffort(effort) catch {
+            e.setStatus(.failed);
+            sendIdleNotification(a, e, "failed", null, "AgentEffortUnsupportedProvider");
+            setMemberActiveBestEffort(a, e.config_path, e.name, false);
+            input.cleanup();
+            return;
+        };
+    }
 
     // 持久状态(跨 turn):conversation + teammate 自己的 TaskStore。
     var conv = Conversation.init(a);
@@ -951,6 +996,12 @@ fn teammateThreadMain(input: *TeammateInput) void {
 
     const be = e.backend();
 
+    // The teammate shares DynRegistry but may only execute tools selected into
+    // its AgentDef-derived definition snapshot.
+    var child_tool_policy = @import("../tools/context.zig").ToolSetExecutionPolicy{
+        .definitions = input.tool_defs_owned,
+    };
+
     while (true) {
         e.setStatus(.working);
         // 首轮此写与 spawn 的 addMember(is_active=true)重复,曾试图"只在值变化时写"去重——
@@ -973,6 +1024,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
                 .tool_defs = input.tool_defs_owned,
                 .agent_depth = 1, // teammate 不得再 spawn teammate(扁平 roster);Task 深度守卫沿用
                 .dyn_registry = input.dyn_registry,
+                .execution_policy = child_tool_policy.executionPolicy(),
                 .host_services = input.host_services,
                 .agent_jobs = null, // SW1 登记:teammate 无嵌套后台 job
                 .project_dir = input.project_dir,
@@ -988,6 +1040,7 @@ fn teammateThreadMain(input: *TeammateInput) void {
                 .cwd_abs = input.cwd_abs,
                 .home_dir = input.home_dir,
                 .additional_dirs = input.additional_dirs,
+                .mcp_sessions = &input.mcp_sessions_owned,
             },
             &be,
             a,

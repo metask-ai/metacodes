@@ -4,7 +4,7 @@
 //! validateRequired + validateTypes 前置校验链;而 agent_loop 实际走的是 dispatch。
 //! 本测试用 cc.tools.dispatch(&ctx, name, args) 跑完整链路,确保:
 //!   ① 正常入参 → 工具执行成功、输出含预期;
-//!   ② 缺 required 字段 → MissingRequiredField(校验链拦在 execute 前);
+//!   ② 缺 required 字段 → 字段具名 Missing* error(校验链拦在 execute 前);
 //!   ③ 类型错 → InvalidFieldType。
 //! 每工具 2-3 例(正常 + 错误/边界)。
 //!
@@ -40,12 +40,12 @@ fn dispatchOk(ctx: *const ToolContext, name: []const u8, args: []const u8) ![]u8
 // dispatch 校验链(所有工具共享的前置层)
 // ============================================================================
 
-test "L2 smoke/dispatch: 缺 required → MissingRequiredField(链路拦在 execute 前)" {
+test "L2 smoke/dispatch: 缺 required → 字段具名错误(链路拦在 execute 前)" {
     const a = std.testing.allocator;
     var ctx = simpleCtx(a);
-    try std.testing.expectError(error.MissingRequiredField, tools.dispatch(&ctx, "Write", "{\"file_path\":\"/tmp/x\"}"));
-    try std.testing.expectError(error.MissingRequiredField, tools.dispatch(&ctx, "Bash", "{}"));
-    try std.testing.expectError(error.MissingRequiredField, tools.dispatch(&ctx, "TaskCreate", "{\"subject\":\"S\"}"));
+    try std.testing.expectError(error.MissingContent, tools.dispatch(&ctx, "Write", "{\"file_path\":\"/tmp/x\"}"));
+    try std.testing.expectError(error.MissingCommand, tools.dispatch(&ctx, "Bash", "{}"));
+    try std.testing.expectError(error.MissingDescription, tools.dispatch(&ctx, "TaskCreate", "{\"subject\":\"S\"}"));
 }
 
 test "L2 smoke/dispatch: 类型错 → InvalidFieldType" {

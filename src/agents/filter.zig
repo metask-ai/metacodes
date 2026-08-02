@@ -43,12 +43,43 @@ pub fn filterToolDefs(
         if (isPermanentlyDisabled(d.name, def.permission_mode)) continue;
         // 2. disallowed_tools 黑名单
         if (matchesAny(def.disallowed_tools, d.name)) continue;
-        // 3. tools 白名单(非空时取交集)
-        if (def.tools.len > 0 and !matchesAny(def.tools, d.name)) continue;
+        // 3. mcpServers 非空时是 server allowlist。来源由注册桥显式标记；
+        // 不能把合法含 `__` 的普通动态工具误判成 MCP。
+        if (def.mcp_servers.len > 0) if (d.mcp_server) |server| {
+            if (!matchesAny(def.mcp_servers, server)) continue;
+        };
+        // 4. tools 白名单(非空时取交集)
+        // memory 开启时 Read/Write/Edit 是该能力的必要通道，和 cc 一样补入白名单；
+        // disallowed_tools 仍在上一步优先，可显式禁用。
+        if (def.tools.len > 0 and !matchesAny(def.tools, d.name) and
+            !(def.memory_scope != .none and isMemoryTool(d.name))) continue;
         try out.append(allocator, d);
     }
 
     return try out.toOwnedSlice(allocator);
+}
+
+pub fn filterMcpSessions(
+    allocator: std.mem.Allocator,
+    sessions: []const @import("../core/mcp_session.zig").McpSessionEntry,
+    allow: []const []const u8,
+) ![]@import("../core/mcp_session.zig").McpSessionEntry {
+    if (allow.len == 0) return allocator.dupe(@import("../core/mcp_session.zig").McpSessionEntry, sessions);
+    var out = std.ArrayList(@import("../core/mcp_session.zig").McpSessionEntry).empty;
+    errdefer out.deinit(allocator);
+    for (sessions) |s| {
+        for (allow) |name| {
+            if (std.mem.eql(u8, name, s.name)) {
+                try out.append(allocator, s);
+                break;
+            }
+        }
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+fn isMemoryTool(name: []const u8) bool {
+    return std.mem.eql(u8, name, "Read") or std.mem.eql(u8, name, "Write") or std.mem.eql(u8, name, "Edit");
 }
 
 fn isPermanentlyDisabled(name: []const u8, mode: ?PermissionMode) bool {
@@ -79,7 +110,8 @@ const parseAgentMd = @import("def.zig").parseAgentMd;
 
 fn makeFakeDef(allocator: std.mem.Allocator, tools_raw: []const u8, disallowed_raw: []const u8, perm: ?PermissionMode) !AgentDef {
     var md_buf: [512]u8 = undefined;
-    const md = try std.fmt.bufPrint(&md_buf,
+    const md = try std.fmt.bufPrint(
+        &md_buf,
         "---\nname: t\ndescription: d\ntools: {s}\ndisallowedTools: {s}\n---\nbody",
         .{ tools_raw, disallowed_raw },
     );
@@ -216,4 +248,26 @@ test "filterToolDefs: tools and disallowedTools both — disallowed wins" {
     defer a.free(filtered);
     try testing.expectEqual(@as(usize, 1), filtered.len);
     try testing.expectEqualStrings("Read", filtered[0].name);
+}
+
+test "filterToolDefs: MCP allowlist uses provenance, not double-underscore names" {
+    const a = testing.allocator;
+    var def = try parseAgentMd(
+        a,
+        "---\nname: t\ntools: allowed__probe, blocked__probe, local__helper\nmcpServers: allowed\n---\nbody",
+        "/x",
+        .personal,
+    );
+    defer def.deinit(a);
+    const parent = [_]json.ToolDefinition{
+        .{ .name = "allowed__probe", .description = "", .input_schema = .{}, .mcp_server = "allowed" },
+        .{ .name = "blocked__probe", .description = "", .input_schema = .{}, .mcp_server = "blocked" },
+        .{ .name = "local__helper", .description = "", .input_schema = .{} },
+    };
+
+    const filtered = try filterToolDefs(a, &parent, &def);
+    defer a.free(filtered);
+    try testing.expectEqual(@as(usize, 2), filtered.len);
+    try testing.expectEqualStrings("allowed__probe", filtered[0].name);
+    try testing.expectEqualStrings("local__helper", filtered[1].name);
 }

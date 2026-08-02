@@ -26,11 +26,17 @@ pub const McpSession = struct {
     }
 
     pub fn deinit(self: *McpSession) void {
-        for (self.bindings.items) |b| {
+        self.rollbackBindingsTo(0);
+        self.bindings.deinit(self.allocator);
+    }
+
+    fn rollbackBindingsTo(self: *McpSession, checkpoint: usize) void {
+        std.debug.assert(checkpoint <= self.bindings.items.len);
+        for (self.bindings.items[checkpoint..]) |b| {
             self.allocator.free(b.mcp_tool_name);
             self.allocator.destroy(b);
         }
-        self.bindings.deinit(self.allocator);
+        self.bindings.shrinkRetainingCapacity(checkpoint);
     }
 
     /// 从 MCP server listTools → 注入到 DynRegistry。
@@ -42,6 +48,12 @@ pub const McpSession = struct {
     ) !void {
         const tools_json = try self.client.listTools();
         defer self.allocator.free(tools_json);
+        const registry_checkpoint = registry.entries.items.len;
+        const bindings_checkpoint = self.bindings.items.len;
+        errdefer {
+            registry.rollbackTo(registry_checkpoint);
+            self.rollbackBindingsTo(bindings_checkpoint);
+        }
 
         // MCP tools/list result 结构：`{"tools":[{"name":"x","description":"...","inputSchema":{...}}, ...]}`
         const tools_arr = protocol.findObjectField(tools_json, "tools") orelse return error.MalformedMcpResponse;
@@ -70,8 +82,12 @@ pub const McpSession = struct {
             const full_name = try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ server_prefix, name });
             defer self.allocator.free(full_name);
 
-            try registry.register(full_name, desc, &.{}, executeMcpTool, binding, true);
-            try self.bindings.append(self.allocator, binding);
+            // Reserve the owner slot before publishing ctx_ptr into registry.
+            // Once registerMcp succeeds, appendAssumeCapacity cannot strand a
+            // registry entry pointing at a freed binding.
+            try self.bindings.ensureUnusedCapacity(self.allocator, 1);
+            try registry.registerMcp(full_name, desc, &.{}, executeMcpTool, binding, server_prefix);
+            self.bindings.appendAssumeCapacity(binding);
         }
     }
 
@@ -82,6 +98,13 @@ pub const McpSession = struct {
         registry: *DynRegistry,
         server_prefix: []const u8,
     ) !void {
+        const registry_checkpoint = registry.entries.items.len;
+        const bindings_checkpoint = self.bindings.items.len;
+        errdefer {
+            registry.rollbackTo(registry_checkpoint);
+            self.rollbackBindingsTo(bindings_checkpoint);
+        }
+        try self.bindings.ensureUnusedCapacity(self.allocator, 2);
         // list_resources
         {
             const binding = try self.allocator.create(McpToolBinding);
@@ -90,8 +113,8 @@ pub const McpSession = struct {
             errdefer self.allocator.free(binding.mcp_tool_name);
             const name = try std.fmt.allocPrint(self.allocator, "{s}__list_resources", .{server_prefix});
             defer self.allocator.free(name);
-            try registry.register(name, "List resources exposed by this MCP server.", &.{}, executeListResources, binding, true);
-            try self.bindings.append(self.allocator, binding);
+            try registry.registerMcp(name, "List resources exposed by this MCP server.", &.{}, executeListResources, binding, server_prefix);
+            self.bindings.appendAssumeCapacity(binding);
         }
         // read_resource
         {
@@ -102,8 +125,8 @@ pub const McpSession = struct {
             const name = try std.fmt.allocPrint(self.allocator, "{s}__read_resource", .{server_prefix});
             defer self.allocator.free(name);
             const required = [_][]const u8{"uri"};
-            try registry.register(name, "Read a resource from this MCP server by uri.", &required, executeReadResource, binding, true);
-            try self.bindings.append(self.allocator, binding);
+            try registry.registerMcp(name, "Read a resource from this MCP server by uri.", &required, executeReadResource, binding, server_prefix);
+            self.bindings.appendAssumeCapacity(binding);
         }
     }
 };
@@ -115,25 +138,19 @@ pub const McpToolBinding = struct {
 
 fn executeMcpTool(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anyerror![]u8 {
     const binding: *McpToolBinding = @ptrCast(@alignCast(ctx_ptr orelse return error.MissingMcpBinding));
-    // 透传中断信号:挂死的 MCP server 可被 Ctrl+C 打断(transport poll 查 abort)。callTool 后清,
-    // 避免悬垂指向本次 turn 的 abort。
-    binding.client.abort = ctx.abort;
-    defer binding.client.abort = null;
-    return try binding.client.callTool(binding.mcp_tool_name, args);
+    return try binding.client.callToolAbortable(binding.mcp_tool_name, args, ctx.abort);
 }
 
 fn executeListResources(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anyerror![]u8 {
     const binding: *McpToolBinding = @ptrCast(@alignCast(ctx_ptr orelse return error.MissingMcpBinding));
-    _ = ctx;
     _ = args;
-    return try binding.client.listResources();
+    return try binding.client.listResourcesAbortable(ctx.abort);
 }
 
 fn executeReadResource(ctx: *const ToolContext, args: []const u8, ctx_ptr: ?*anyopaque) anyerror![]u8 {
     const binding: *McpToolBinding = @ptrCast(@alignCast(ctx_ptr orelse return error.MissingMcpBinding));
-    _ = ctx;
     const uri = extractStringField(args, "uri") orelse return error.MissingUri;
-    return try binding.client.readResource(uri);
+    return try binding.client.readResourceAbortable(uri, ctx.abort);
 }
 
 // 私有 helpers——和 protocol.zig 同逻辑但只处理 object
@@ -216,4 +233,32 @@ test "registerResourceTools registers list + read tools" {
 
     try testing.expect(reg.find("myserver__list_resources") != null);
     try testing.expect(reg.find("myserver__read_resource") != null);
+}
+
+test "registerResourceTools rolls back registry and bindings on partial failure" {
+    var fake_client: McpClient = undefined;
+    var session = McpSession.init(testing.allocator, &fake_client);
+    defer session.deinit();
+
+    var reg = DynRegistry.init(testing.allocator);
+    defer reg.deinit();
+    // Force the second resource registration to fail after the first one has
+    // already been published. The batch must leave neither its first tool nor
+    // any binding behind.
+    try reg.registerMcp(
+        "myserver__read_resource",
+        "preexisting",
+        &.{},
+        executeReadResource,
+        null,
+        "myserver",
+    );
+    try testing.expectError(
+        error.ToolAlreadyRegistered,
+        session.registerResourceTools(&reg, "myserver"),
+    );
+    try testing.expect(reg.find("myserver__list_resources") == null);
+    try testing.expect(reg.find("myserver__read_resource") != null);
+    try testing.expectEqual(@as(usize, 1), reg.entries.items.len);
+    try testing.expectEqual(@as(usize, 0), session.bindings.items.len);
 }

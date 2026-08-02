@@ -353,6 +353,7 @@ pub const App = struct {
         // base_url 复用 config.base_url(record/replay 指 MockServer);null → OpenAI 官方端点。
         if (config.provider_kind == .openai) {
             app.openai_client = openai_mod.OpenAIClient.init(allocator, io, api_key, config.model, config.base_url);
+            app.openai_client.?.reasoning_effort = config.reasoning_effort;
         }
         // Gemini 后端:仅当 provider_kind==.gemini 才建(讲 generateContent 协议 + 有状态缓存)。
         if (config.provider_kind == .gemini) {
@@ -510,7 +511,10 @@ pub const App = struct {
 
         // 初始化后台 subagent registry（Task run_in_background）。每个 job 内部自建
         // 专属 Client（指向同 endpoint），故这里只需 api_key/base_url/model。
-        app.agent_jobs = @import("core/agent_job_registry.zig").AgentJobRegistry.init(allocator, app.api_key, config.base_url, app.config.model, app.config.provider_kind) catch |err| blk: {
+        // Background jobs allocate and free from worker threads.  The session
+        // arena is not thread-safe; keep the registry and all job-owned state
+        // on c_allocator (the provider/agent_loop allocator must match too).
+        app.agent_jobs = @import("core/agent_job_registry.zig").AgentJobRegistry.init(std.heap.c_allocator, app.api_key, config.base_url, app.config.model, app.config.provider_kind) catch |err| blk: {
             @import("util/log.zig").warn("agent", "agent_jobs registry init failed: {s}", .{@errorName(err)});
             break :blk null;
         };
@@ -827,9 +831,9 @@ pub const App = struct {
         app.pending_current_model_context_window = null;
     }
 
-    pub fn setReasoningEffort(app: *App, effort: types.ReasoningEffort) void {
+    pub fn setReasoningEffort(app: *App, effort: types.ReasoningEffort) !void {
+        try app.provider().setReasoningEffort(effort);
         app.config.reasoning_effort = effort;
-        app.api_client.reasoning_effort = effort;
         app.emitConfig(.{ .reasoning = effort }); // U4:reasoning 单写侧 emit
     }
 
@@ -1600,12 +1604,25 @@ pub const App = struct {
 
             // spawn + connect
             const client_heap = try app.allocator.create(McpClient);
-            errdefer app.allocator.destroy(client_heap);
             client_heap.* = McpClient.connect(app.allocator, argv_storage.items) catch |err| {
                 log.warn("mcp", "server '{s}' connect failed: {s}", .{ name_v.string, @errorName(err) });
                 app.allocator.destroy(client_heap);
                 continue;
             };
+            var client_committed = false;
+            defer if (!client_committed) {
+                client_heap.close();
+                app.allocator.destroy(client_heap);
+            };
+
+            // Reserve every App-owned resource before publishing any tool
+            // definition into dyn_registry. After registration succeeds the
+            // final session append is infallible, so registry ctx_ptr values
+            // cannot outlive an unowned/freed McpSession.
+            const name_owned = try app.allocator.dupe(u8, name_v.string);
+            var name_committed = false;
+            defer if (!name_committed) app.allocator.free(name_owned);
+            try app.mcp_sessions.ensureUnusedCapacity(app.allocator, 1);
 
             // **诚实登记(elicitation UI 未接线)**:client.elicit 回调机制已实现+测试(见 mcp/client.zig),
             // 但此处**不设** handler → 生产中 MCP server 发 elicitation/create 一律安全 decline(协议正确闭合,
@@ -1616,8 +1633,6 @@ pub const App = struct {
             session.registerTools(&app.dyn_registry, name_v.string) catch |err| {
                 log.warn("mcp", "server '{s}' registerTools failed: {s}", .{ name_v.string, @errorName(err) });
                 session.deinit();
-                client_heap.close();
-                app.allocator.destroy(client_heap);
                 continue;
             };
             session.registerResourceTools(&app.dyn_registry, name_v.string) catch |err| {
@@ -1625,12 +1640,13 @@ pub const App = struct {
                 // tools 已注册无法回滚；只能略过 resources
             };
 
-            const name_owned = try app.allocator.dupe(u8, name_v.string);
-            try app.mcp_sessions.append(app.allocator, .{
+            app.mcp_sessions.appendAssumeCapacity(.{
                 .name = name_owned,
                 .client = client_heap,
                 .session = session,
             });
+            name_committed = true;
+            client_committed = true;
             log.info("mcp", "connected '{s}'", .{name_v.string});
         }
     }
@@ -1748,7 +1764,7 @@ test "U4 A3: reasoning/dirs 单写侧 emit config_changed;setConfigEventSink 同
     try std.testing.expect(app.permission_ctx.event_sink != null); // mode sink 同步设了
 
     // reasoning 单写侧 → emit .reasoning
-    app.setReasoningEffort(.high);
+    try app.setReasoningEffort(.high);
     try std.testing.expectEqual(types.ReasoningEffort.high, rec.last.?.reasoning.?);
     try std.testing.expectEqual(@as(usize, 1), rec.count);
 
@@ -1759,7 +1775,7 @@ test "U4 A3: reasoning/dirs 单写侧 emit config_changed;setConfigEventSink 同
 
     // 清 sink:不再 emit
     app.setConfigEventSink(null);
-    app.setReasoningEffort(.low);
+    try app.setReasoningEffort(.low);
     try std.testing.expectEqual(@as(usize, 2), rec.count); // 无变化
 
     // setConfigEventSink 已 seed cache(dup model/dirs);undefined-App 无 deinit,手动释。

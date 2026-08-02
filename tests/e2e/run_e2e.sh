@@ -4,6 +4,7 @@
 # 用法:
 #   tests/e2e/run_e2e.sh              # 跑 scenarios/ 下全部
 #   tests/e2e/run_e2e.sh '01*'        # 只跑匹配 glob 的场景
+#   tests/e2e/run_e2e.sh '00_smoke,12_deny_rule' # 逗号分隔多个精确/glob 选择器
 #   E2E_TIMEOUT=900 tests/e2e/run_e2e.sh 00_smoke   # 单场景 + 自定义超时
 #   E2E_BIN=release tests/e2e/run_e2e.sh            # 用 ReleaseSmall(默认 debug)
 #   E2E_KEEP=all  tests/e2e/run_e2e.sh              # 保留所有 runs/(默认留最近 5)
@@ -17,7 +18,7 @@ set -u
 E2E_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$E2E_DIR/lib.sh"
 
-GLOB="${1:-*}"
+SELECTOR="${1:-*}"
 
 # 1) 确认二进制在(默认 debug)
 if [[ ! -x "$BIN" ]]; then
@@ -27,7 +28,7 @@ fi
 [[ -x "$BIN" ]] || { echo "编译后仍无 $BIN" >&2; exit 1; }
 
 # 2) 时间戳 run 目录
-TS="$(date +%Y%m%d-%H%M%S)"
+TS="$(date +%Y%m%d-%H%M%S)-${E2E_RUN_LABEL:-run}-${E2E_TRIAL:-0}-$$-${RANDOM:-0}"
 RUN_DIR="$E2E_DIR/runs/$TS"
 mkdir -p "$RUN_DIR"
 REPORT="$RUN_DIR/REPORT.md"
@@ -54,9 +55,14 @@ shopt -s nullglob
 SCENARIOS=()
 while IFS= read -r f; do
   [[ -n "$f" ]] && SCENARIOS+=("$f")
-done < <(cd "$E2E_DIR/scenarios" && ls -1 ${GLOB}.txt 2>/dev/null | sort)
+done < <(
+  IFS=',' read -ra patterns <<< "$SELECTOR"
+  for pattern in "${patterns[@]}"; do
+    (cd "$E2E_DIR/scenarios" && ls -1 ${pattern}.txt 2>/dev/null)
+  done | sort -u
+)
 if [[ ${#SCENARIOS[@]} -eq 0 ]]; then
-  echo "没有匹配 '$GLOB' 的场景(scenarios/${GLOB}.txt)" >&2
+  echo "没有匹配 '$SELECTOR' 的场景" >&2
   exit 1
 fi
 
@@ -89,7 +95,7 @@ for sfile in "${SCENARIOS[@]}"; do
   HARD_FAILS=$(( HARD_FAILS + ${hard:-0} ))
 
   nfiles=$(cd "$workdir" 2>/dev/null && find . -type f -not -path './.*' | wc -l | tr -d ' ')
-  ntools=$(grep -cE 'tool\.exec start name=' "$debug_logfile" 2>/dev/null | tr -d ' \n')
+  ntools=$(grep -cE 'tool\.exec start(\(par\))? name=' "$debug_logfile" 2>/dev/null | tr -d ' \n')
   SUMMARY+=("$name|$rc|$nfiles|$ntools|$nerr")
   echo "    退出码=$rc 文件=$nfiles 工具调用=$ntools 错误=$nerr$( [[ "${hard:-0}" != "0" ]] && echo " 硬失败=$hard" )"
 done

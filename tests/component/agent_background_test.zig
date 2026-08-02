@@ -140,20 +140,14 @@ test "L2 后台B: TaskOutput running→done 拿到 final_text + stop_reason" {
     const query = try std.fmt.allocPrint(a, "{{\"agent_job_id\":\"{s}\"}}", .{job_id});
     defer a.free(query);
 
-    var done = false;
-    var i: usize = 0;
-    while (i < 300) : (i += 1) { // 最多 ~3s
-        const r = try cc.task_output_tool.execute(&ctx, query);
-        defer a.free(r);
-        if (std.mem.indexOf(u8, r, "\"status\":\"done\"") != null) {
-            try std.testing.expect(std.mem.indexOf(u8, r, "BG DONE") != null);
-            try std.testing.expect(std.mem.indexOf(u8, r, "\"stop_reason\":\"end_turn\"") != null);
-            done = true;
-            break;
-        }
-        sleepMs(10);
-    }
-    try std.testing.expect(done);
+    // One call must long-poll through the cassette delay and observe terminal
+    // state. The old zero-wait snapshot required a caller-side busy loop and
+    // let real models trip the identical-result zero-gain breaker.
+    const r = try cc.task_output_tool.execute(&ctx, query);
+    defer a.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "\"status\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "BG DONE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "\"stop_reason\":\"end_turn\"") != null);
 }
 
 test "L2 后台E: TaskStop 对普通 todo taskId 仍标 completed(分流不回归)" {

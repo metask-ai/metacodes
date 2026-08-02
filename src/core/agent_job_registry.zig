@@ -47,6 +47,10 @@ pub const JobEntry = struct {
     id_len: u8 = 0,
     /// 保护下列 status/output_buf/final_text/stop_reason/turns/tool_calls/err_name。
     mutex: sync.Mutex = .{},
+    /// TaskOutput long-poll wakeup. Signaled when observable output grows or
+    /// the job publishes a terminal status, so callers do not busy-poll the
+    /// same `running` snapshot into the zero-gain breaker.
+    condition: sync.Condition = .{},
     status: JobStatus = .running,
     /// **task#18**:done lifecycle 事件是否已发。job 线程只置 status(不能安全用父栈 trampoline
     /// reporter);主/driver 线程 drainNewlyDone reap 时据此一次性发 done,避免重复。锁内读写。
@@ -85,6 +89,12 @@ pub const JobEntry = struct {
     tokens: u64 = 0,
     /// 该 agent 收到的 prompt 预览(spawn 时 dup,截断)。区域2 查看 transcript 顶部显示。owned。
     prompt_preview: []u8 = &.{},
+    /// AgentDef.isolation=worktree 的稳定路径副本；后台线程释放 Worktree 自有路径后仍可查询。
+    worktree_path: []u8 = &.{},
+    /// null=仍在运行/无 worktree；终态 true=有变化保留，false=干净已移除。
+    worktree_kept: ?bool = null,
+    /// null=running/no worktree; false=cleanup failed or only partially completed.
+    worktree_cleanup_complete: ?bool = null,
     /// 该 agent 的可读 transcript(progress trampoline 持锁 append `⎿ Tool: arg` 行)。
     /// 区域2 Enter 查看 agent 上下文用。owned ArrayList。
     transcript: std.ArrayList(u8) = .empty,
@@ -112,6 +122,17 @@ pub const JobEntry = struct {
         self.lock();
         defer self.unlock();
         self.output_buf.appendSlice(self.allocator, bytes) catch {};
+        self.condition.broadcast();
+    }
+
+    /// Wait for TaskOutput-observable state to change. The caller supplies a
+    /// bounded slice so it can re-check AbortSignal between waits.
+    pub fn waitForOutputOrTerminal(self: *JobEntry, since: ?usize, timeout_ns: u64) bool {
+        self.lock();
+        defer self.unlock();
+        if (self.status != .running or (since != null and self.output_buf.items.len > since.?)) return true;
+        _ = self.condition.timedWait(&self.mutex, timeout_ns);
+        return self.status != .running or (since != null and self.output_buf.items.len > since.?);
     }
 
     /// L1:JobEntry 是一个 UiBackend——subagent 的 agent_loop 经 backend.emit 把流式 text /
@@ -193,6 +214,7 @@ pub const SpawnParams = struct {
     agent_depth: u8 = 1,
     max_turns: u32 = 0, // 0 = 用 SpawnOptions 默认
     model_override: ?[]const u8 = null,
+    reasoning_effort_override: ?@import("../types.zig").ReasoningEffort = null,
     perm_override: ?@import("../types.zig").PermissionMode = null,
     project_dir: []const u8 = "",
     parent_model: []const u8 = "",
@@ -213,6 +235,10 @@ pub const SpawnParams = struct {
     cwd_abs: []const u8 = "",
     home_dir: []const u8 = "",
     additional_dirs: []const []const u8 = &.{},
+    /// AgentDef.mcpServers 过滤后的 session 视图；registry 复制外层 slice，entry 本体借 App。
+    mcp_sessions: []const @import("mcp_session.zig").McpSessionEntry = &.{},
+    /// AgentDef.isolation=worktree 所有权；spawnBackground consume-on-call。
+    worktree: ?@import("../agents/isolation.zig").Worktree = null,
     /// Ctrl+B 主对话转后台:预建对话副本(深拷贝,所有权转移给 registry → JobInput → spawnAgentSink)。
     /// null=普通 subagent(从 prompt 起新对话)。
     prebuilt_conversation: ?Conversation = null,
@@ -232,6 +258,7 @@ const JobInput = struct {
     project_dir: []u8,
     parent_model: []u8,
     model_override: ?[]u8,
+    reasoning_effort_override: ?@import("../types.zig").ReasoningEffort,
     // 值拷贝:
     permission_ctx: permission_mod.PermissionContext,
     perm_override: ?@import("../types.zig").PermissionMode,
@@ -250,6 +277,9 @@ const JobInput = struct {
     cwd_abs: []u8,
     home_dir: []u8,
     additional_dirs: [][]u8,
+    memdir_owned: []u8,
+    mcp_sessions_owned: []@import("mcp_session.zig").McpSessionEntry,
+    worktree: ?@import("../agents/isolation.zig").Worktree,
     // 专属资源:P0.5 换成 OwnedProvider(据 provider_kind 造对应具体 client + io,统一 deinit)。
     owned: pf.OwnedProvider,
     /// Ctrl+B 主对话转后台:预建对话(深拷贝副本,所有权在此)。jobThreadMain move 进 SpawnOptions
@@ -257,6 +287,18 @@ const JobInput = struct {
     prebuilt_conversation: ?Conversation = null,
     // 嵌套后台:子 agent 也能 Task(run_in_background) 注册进同一 root registry。
     registry: *AgentJobRegistry,
+
+    /// 在发布 terminal status 前固定 worktree 结局；否则 TaskOutput 可能先看到 done，
+    /// 下一次轮询才看到 worktree_kept，形成非原子的终态快照。
+    fn finalizeWorktree(self: *JobInput) void {
+        if (self.worktree) |*wt| {
+            const kept = wt.finalize(null);
+            self.entry.lock();
+            self.entry.worktree_kept = kept;
+            self.entry.worktree_cleanup_complete = wt.cleanup_complete;
+            self.entry.unlock();
+        }
+    }
 
     fn cleanup(self: *JobInput) void {
         const a = self.allocator;
@@ -271,6 +313,12 @@ const JobInput = struct {
         a.free(self.home_dir);
         for (self.additional_dirs) |d| a.free(d);
         a.free(self.additional_dirs);
+        a.free(self.memdir_owned);
+        a.free(self.mcp_sessions_owned);
+        if (self.worktree) |*wt| {
+            self.finalizeWorktree();
+            wt.deinit();
+        }
         if (self.model_override) |m| a.free(m);
         if (self.prebuilt_conversation) |*c| c.deinit(); // 仅 spawn 失败回滚命中(jobThreadMain 成功路径已 move 置 null)
         self.owned.deinit();
@@ -390,6 +438,10 @@ pub const AgentJobRegistry = struct {
         // prebuilt_conversation 的释放(失败路径):consume-on-call,errdefer 接管。
         errdefer if (!committed) {
             if (p.prebuilt_conversation) |*c| c.deinit();
+            if (p.worktree) |*wt| {
+                _ = wt.finalize(null);
+                wt.deinit();
+            }
         };
         if (self.runningCount() >= MAX_BG_JOBS) return error.TooManyBackgroundJobs;
 
@@ -413,6 +465,8 @@ pub const AgentJobRegistry = struct {
         errdefer if (!committed) a.free(entry.desc_preview);
         entry.agent_type = a.dupe(u8, p.agent_type[0..@min(p.agent_type.len, 32)]) catch &.{};
         errdefer if (!committed and entry.agent_type.len > 0) a.free(entry.agent_type);
+        entry.worktree_path = if (p.worktree) |wt| try a.dupe(u8, wt.path) else &.{};
+        errdefer if (!committed and entry.worktree_path.len > 0) a.free(entry.worktree_path);
 
         // 2) 专属 OwnedProvider(据 provider_kind 造对应具体 client + io,所有权给 JobInput)。
         //    **必须用 self.allocator**(与 jobThreadMain 传给 spawnAgentSink 的 input.allocator 一致):
@@ -463,6 +517,19 @@ pub const AgentJobRegistry = struct {
             adirs_owned[di] = try a.dupe(u8, d);
             nad = di + 1;
         }
+        const memdir_owned = try a.dupe(u8, p.permission_ctx.memdir_abs);
+        errdefer if (!committed) a.free(memdir_owned);
+        const mcp_sessions_owned = try a.dupe(@import("mcp_session.zig").McpSessionEntry, p.mcp_sessions);
+        errdefer if (!committed) a.free(mcp_sessions_owned);
+
+        var permission_owned = p.permission_ctx.scopedDerive(null);
+        permission_owned.allocator = a;
+        permission_owned.memdir_abs = memdir_owned;
+        permission_owned.match_ctx.cwd = cwd_owned;
+        permission_owned.match_ctx.project_root = pdir_owned;
+        permission_owned.match_ctx.home = home_owned;
+        permission_owned.match_ctx.additional_dirs = adirs_owned;
+        permission_owned.match_ctx.alloc = a;
 
         input.* = .{
             .allocator = a,
@@ -474,7 +541,8 @@ pub const AgentJobRegistry = struct {
             .project_dir = pdir_owned,
             .parent_model = pmodel_owned,
             .model_override = mover_owned,
-            .permission_ctx = p.permission_ctx,
+            .reasoning_effort_override = p.reasoning_effort_override,
+            .permission_ctx = permission_owned,
             .perm_override = p.perm_override,
             .agent_depth = p.agent_depth,
             .max_turns = p.max_turns,
@@ -488,6 +556,9 @@ pub const AgentJobRegistry = struct {
             .cwd_abs = cwd_owned,
             .home_dir = home_owned,
             .additional_dirs = adirs_owned,
+            .memdir_owned = memdir_owned,
+            .mcp_sessions_owned = mcp_sessions_owned,
+            .worktree = p.worktree,
             .owned = owned,
             .prebuilt_conversation = p.prebuilt_conversation, // move(Ctrl+B 转后台);普通 subagent=null
             .registry = self,
@@ -609,6 +680,21 @@ pub const AgentJobRegistry = struct {
         self.listLock();
         defer self.listUnlock();
         return self.index.get(key);
+    }
+
+    /// TaskOutput may long-poll, so it must never borrow a transient foreground
+    /// entry that another parallel Task can remove. Background entries remain
+    /// allocated until registry deinit (which joins workers before freeing).
+    pub fn getBackground(self: *AgentJobRegistry, id: []const u8) ?*JobEntry {
+        if (id.len > 16) return null;
+        var key: [16]u8 = undefined;
+        @memcpy(key[0..id.len], id);
+        for (key[id.len..]) |*b| b.* = 0;
+        self.listLock();
+        defer self.listUnlock();
+        const entry = self.index.get(key) orelse return null;
+        if (entry.foreground) return null;
+        return entry;
     }
 
     /// 后台 subagent job 的值语义快照(供 TUI Ctrl+T 列表用,不持锁/不持指针)。
@@ -784,6 +870,7 @@ pub const AgentJobRegistry = struct {
         e.tool_calls = tool_calls;
         e.stop_reason = stop_reason;
         e.status = if (e.abort.isAborted()) .killed else .done;
+        e.condition.broadcast();
         e.unlock();
     }
 
@@ -879,6 +966,7 @@ fn freeEntry(e: *JobEntry) void {
     e.allocator.free(e.desc_preview);
     if (e.agent_type.len > 0) e.allocator.free(e.agent_type);
     if (e.prompt_preview.len > 0) e.allocator.free(e.prompt_preview);
+    if (e.worktree_path.len > 0) e.allocator.free(e.worktree_path);
     e.transcript.deinit(e.allocator);
     e.allocator.destroy(e);
 }
@@ -887,12 +975,17 @@ fn freeEntry(e: *JobEntry) void {
 fn jobThreadMain(input: *JobInput) void {
     const e = input.entry;
 
-    var ctx_override = input.permission_ctx;
-    if (input.perm_override) |m| ctx_override.setMode(m);
+    var ctx_override = input.permission_ctx.scopedDerive(input.perm_override);
 
     // L1:JobEntry 自身就是 backend——流式 text 进 output_buf、进度/token 更新树字段,
     // 单通道(取代旧 WriterBackend+jobSink / progress / usage 三通道)。
     const be = e.backend();
+
+    // JobInput owns this definition snapshot for the whole thread lifetime.
+    // Use it as the execution ceiling as well as the advertised tool list.
+    var child_tool_policy = @import("../tools/context.zig").ToolSetExecutionPolicy{
+        .definitions = input.tool_defs_owned,
+    };
 
     const opts = subagent.SpawnOptions{
         .max_turns = if (input.max_turns > 0) input.max_turns else 20,
@@ -900,8 +993,10 @@ fn jobThreadMain(input: *JobInput) void {
         .agent_depth = input.agent_depth,
         .dyn_registry = input.dyn_registry,
         .tool_defs_override = input.tool_defs_owned,
+        .execution_policy = child_tool_policy.executionPolicy(),
         .permission_mode_override = input.perm_override,
         .model_override = input.model_override,
+        .reasoning_effort_override = input.reasoning_effort_override,
         .host_services = input.host_services,
         .project_dir = input.project_dir,
         .agent_jobs = input.registry, // 允许嵌套后台
@@ -912,6 +1007,7 @@ fn jobThreadMain(input: *JobInput) void {
         .cwd_abs = input.cwd_abs,
         .home_dir = input.home_dir,
         .additional_dirs = input.additional_dirs,
+        .mcp_sessions = &input.mcp_sessions_owned,
         // Ctrl+B 转后台:move 预建对话给 spawnAgentSink(它 defer deinit)。**move 后立即置 null**:
         // 单一所有者不变式——此后只有 opts/spawnAgentSink 持有,input.cleanup 不再 deinit(防 double-free)。
         .prebuilt_conversation = input.prebuilt_conversation,
@@ -929,20 +1025,24 @@ fn jobThreadMain(input: *JobInput) void {
         opts,
         &be,
     ) catch |err| {
+        input.finalizeWorktree();
         e.lock();
         e.status = .failed;
         e.err_name = @errorName(err);
+        e.condition.broadcast();
         e.unlock();
         input.cleanup();
         return;
     };
 
+    input.finalizeWorktree();
     e.lock();
     e.final_text = result.final_text; // 偷走所有权;不调 result.deinit()
     e.stop_reason = result.stop_reason;
     e.turns = result.turns;
     e.tool_calls = result.tool_calls;
     e.status = if (e.abort.isAborted()) .killed else .done;
+    e.condition.broadcast();
     e.unlock();
 
     input.cleanup();

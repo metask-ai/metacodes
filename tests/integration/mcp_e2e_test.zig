@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const cc = @import("cc");
+const sync = @import("platform").sync;
 
 fn dispatchOk(ctx: *const cc.tools.ToolContext, name: []const u8, args: []const u8) ![]u8 {
     var outcome = try cc.tools.dispatch(ctx, name, args);
@@ -35,6 +36,64 @@ test "MCP: full cycle initialize + listTools + callTool echo" {
     const result = try client.callTool("echo", "{\"message\":\"hello mcp\"}");
     defer a.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "hello mcp") != null);
+}
+
+const ConcurrentStart = struct {
+    mutex: sync.Mutex = .{},
+    cond: sync.Condition = .{},
+    ready: usize = 0,
+    go: bool = false,
+
+    fn wait(self: *ConcurrentStart) void {
+        self.mutex.lock();
+        self.ready += 1;
+        self.cond.broadcast();
+        while (!self.go) self.cond.wait(&self.mutex);
+        self.mutex.unlock();
+    }
+};
+
+const ConcurrentCall = struct {
+    client: *cc.mcp_client.McpClient,
+    start: *ConcurrentStart,
+    message: []const u8,
+    output: ?[]u8 = null,
+
+    fn run(self: *ConcurrentCall) void {
+        self.start.wait();
+        const args = std.fmt.allocPrint(std.heap.c_allocator, "{{\"message\":\"{s}\"}}", .{self.message}) catch return;
+        defer std.heap.c_allocator.free(args);
+        self.output = self.client.callTool("slow_echo", args) catch null;
+    }
+};
+
+test "MCP: parallel tool calls serialize one stdio JSON-RPC stream" {
+    const a = std.heap.c_allocator;
+    const mock_path: [*:0]const u8 = "zig-out/bin/mock_mcp_server";
+    const argv = [_]?[*:0]const u8{ mock_path, null };
+    var client = try cc.mcp_client.McpClient.connect(a, argv[0..]);
+    defer client.close();
+
+    var start = ConcurrentStart{};
+    var first = ConcurrentCall{ .client = &client, .start = &start, .message = "first" };
+    var second = ConcurrentCall{ .client = &client, .start = &start, .message = "second" };
+    const t1 = try std.Thread.spawn(.{}, ConcurrentCall.run, .{&first});
+    const t2 = try std.Thread.spawn(.{}, ConcurrentCall.run, .{&second});
+
+    start.mutex.lock();
+    while (start.ready != 2) start.cond.wait(&start.mutex);
+    start.go = true;
+    start.cond.broadcast();
+    start.mutex.unlock();
+
+    t1.join();
+    t2.join();
+    const first_out = first.output orelse return error.FirstConcurrentMcpCallFailed;
+    defer a.free(first_out);
+    const second_out = second.output orelse return error.SecondConcurrentMcpCallFailed;
+    defer a.free(second_out);
+    try std.testing.expect(std.mem.indexOf(u8, first_out, "first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_out, "second") != null);
 }
 
 fn elicitAcceptHandler(ctx: *anyopaque, _: []const u8, alloc: std.mem.Allocator) ?[]u8 {

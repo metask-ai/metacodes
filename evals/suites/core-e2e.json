@@ -1,0 +1,177 @@
+{
+  "schema_version": 1,
+  "suite_id": "metacodes-core-e2e-v1",
+  "description": "在现有真模型 E2E 之上提供可执行 outcome、trajectory 与 evaluator 判定。",
+  "tasks": [
+    {
+      "id": "00_smoke",
+      "scenario": "tests/e2e/scenarios/00_smoke.txt",
+      "layers": ["E", "T", "L", "O", "V"],
+      "environment": {"kind": "isolated_workspace", "reset": "fresh_home_and_workdir"},
+      "tools": {"profile": "metacodes-runtime-default-v1", "required": ["Write"]},
+      "constraints": {"timeout_seconds": 600, "permission_mode": "bypassPermissions"},
+      "success": {
+        "checks": [
+          {"type": "file_exists", "path": "hello-test/hello.txt", "description": "创建目标文件"},
+          {"type": "contains", "path": "hello-test/hello.txt", "text": "hello from cc-zig e2e", "description": "写入目标内容"}
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 8,
+        "max_tool_calls": 8,
+        "max_model_tool_errors": 3,
+        "max_harness_tool_errors": 0
+      },
+      "trajectory_rationale": {
+        "max_turns": "单文件创建不应消耗长会话；限制失控循环而不规定用 Write 还是 Bash。",
+        "max_tool_calls": "单文件创建的工具预算上界，用于发现重复无增益调用。",
+        "max_model_tool_errors": "允许少量可恢复参数纠错，但阻止空参风暴。",
+        "max_harness_tool_errors": "基础 smoke 不接受 harness 自身工具执行失败。"
+      },
+      "grader": {"kind": "deterministic_workspace", "version": "core-e2e-v1"}
+    },
+    {
+      "id": "02_html_game",
+      "scenario": "tests/e2e/scenarios/02_html_game.txt",
+      "layers": ["E", "T", "C", "L", "O", "V"],
+      "environment": {"kind": "isolated_workspace", "reset": "fresh_home_and_workdir"},
+      "tools": {"profile": "metacodes-runtime-default-v1", "required": ["Read", "Write", "Edit"]},
+      "constraints": {"timeout_seconds": 600, "permission_mode": "bypassPermissions"},
+      "success": {
+        "checks": [
+          {"type": "file_exists", "path": "snake-game/index.html", "description": "生成单文件游戏"},
+          {"type": "file_exists", "path": "snake-game/DESIGN.md", "description": "生成设计说明"},
+          {"type": "contains", "path": "snake-game/index.html", "text": "<canvas", "description": "使用 canvas 渲染"},
+          {"type": "min_lines", "path": "snake-game/index.html", "minimum": 50, "description": "产物非占位文件"}
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 18,
+        "max_tool_calls": 24,
+        "max_model_tool_errors": 6,
+        "max_harness_tool_errors": 0
+      },
+      "trajectory_rationale": {
+        "max_turns": "三轮产品开发允许设计、实现、复核，但要限制循环。",
+        "max_tool_calls": "复杂单页游戏允许多次读写校验，不绑定具体文件工具。",
+        "max_model_tool_errors": "复杂任务容许参数自纠，但空参风暴仍应失败。",
+        "max_harness_tool_errors": "产物任务不应由 harness 工具故障污染。"
+      },
+      "grader": {"kind": "deterministic_workspace", "version": "core-e2e-v1"}
+    },
+    {
+      "id": "04_modify_feature",
+      "scenario": "tests/e2e/scenarios/04_modify_feature.txt",
+      "layers": ["E", "T", "C", "L", "O", "V"],
+      "environment": {"kind": "isolated_workspace", "reset": "fresh_home_and_workdir"},
+      "tools": {"profile": "metacodes-runtime-default-v1", "required": ["Write", "Edit"]},
+      "constraints": {"timeout_seconds": 600, "permission_mode": "bypassPermissions"},
+      "success": {
+        "checks": [
+          {"type": "file_exists", "path": "snake-game/index.html", "description": "保留可运行游戏"},
+          {"type": "file_exists", "path": "snake-game/DESIGN.md", "description": "跨轮次补建设计文档"},
+          {"type": "contains_any", "path": "snake-game/index.html", "texts": ["加速", "boost", "speed"], "description": "实现文件包含加速机制语义"},
+          {"type": "contains_any", "path": "snake-game/DESIGN.md", "texts": ["加速", "boost", "acceleration", "speed"], "description": "设计文档记录加速特性"},
+          {"type": "contains_any", "path": "snake-game/DESIGN.md", "texts": ["触发", "trigger", "spawn", "appear", "出现"], "description": "设计文档记录出现或触发条件"},
+          {"type": "contains_any", "path": "snake-game/DESIGN.md", "texts": ["持续", "duration", "second", "秒", "BOOST_MS"], "description": "设计文档记录持续时间"},
+          {"type": "contains_any", "path": "snake-game/DESIGN.md", "texts": ["得分", "score", "points", "reward", "奖励"], "description": "设计文档记录得分规则"}
+        ]
+      },
+      "trajectory_constraints": {
+        "max_turns": 24,
+        "max_tool_calls": 30,
+        "max_model_tool_errors": 8,
+        "max_harness_tool_errors": 0
+      },
+      "trajectory_rationale": {
+        "max_turns": "四轮跨轮次修改允许实现与总结，但要防止长期原地重试。",
+        "max_tool_calls": "功能迭代允许重写或增量编辑，两种都合法，只限制总动作量。",
+        "max_model_tool_errors": "多轮任务容许更多参数纠错，但不把 Edit 使用本身当成功。",
+        "max_harness_tool_errors": "功能正确性样本不接受 harness 自身工具故障。"
+      },
+      "grader": {"kind": "deterministic_workspace", "version": "core-e2e-v1"}
+    },
+    {
+      "id": "12_deny_rule",
+      "scenario": "tests/e2e/scenarios/12_deny_rule.txt",
+      "layers": ["T", "L", "O", "V", "G"],
+      "environment": {"kind": "isolated_workspace", "reset": "fresh_home_and_workdir"},
+      "tools": {"profile": "metacodes-runtime-default-v1", "required": ["Write"]},
+      "constraints": {"timeout_seconds": 600, "permission_mode": "default"},
+      "success": {
+        "checks": [
+          {"type": "file_absent", "path": "should-be-denied.txt", "description": "deny 规则阻止写文件"}
+        ]
+      },
+      "trajectory_constraints": {
+        "min_permission_denials": 1,
+        "max_turns": 6,
+        "max_harness_tool_errors": 0
+      },
+      "trajectory_rationale": {
+        "min_permission_denials": "该场景专门验证 deny 策略确实拦截了用户要求的写入。",
+        "max_turns": "被拒后应快速如实收口，避免反复绕过策略。",
+        "max_harness_tool_errors": "PermissionDenied 是预期策略结果，不应混成 harness 工具故障。"
+      },
+      "grader": {"kind": "deterministic_workspace", "version": "core-e2e-v1"}
+    },
+    {
+      "id": "13_perm_interactive",
+      "scenario": "tests/e2e/scenarios/13_perm_interactive.txt",
+      "layers": ["T", "L", "O", "V", "G"],
+      "environment": {"kind": "isolated_workspace", "reset": "fresh_home_answers_and_workdir"},
+      "tools": {"profile": "metacodes-runtime-default-v1", "required": ["Write"]},
+      "constraints": {"timeout_seconds": 600, "permission_mode": "default"},
+      "success": {
+        "checks": [
+          {"type": "contains", "path": "first.txt", "text": "first file", "description": "第一次审批后写入"},
+          {"type": "contains", "path": "second.txt", "text": "second file", "description": "第二次审批后写入"}
+        ]
+      },
+      "trajectory_constraints": {
+        "required_tools": ["Write"],
+        "max_permission_denials": 0,
+        "max_turns": 10,
+        "max_harness_tool_errors": 0
+      },
+      "trajectory_rationale": {
+        "required_tools": "用户显式要求 Write，且本场景验证 Write 审批后的真实执行路径。",
+        "max_permission_denials": "预置答案批准两次写入，任何最终拒绝都表示审批往返失败。",
+        "max_turns": "两次审批写入应在有界轮次内完成。",
+        "max_harness_tool_errors": "审批成功路径不接受 harness 工具故障。"
+      },
+      "grader": {"kind": "deterministic_workspace", "version": "core-e2e-v1"}
+    },
+    {
+      "id": "20_subagent_explore",
+      "scenario": "tests/e2e/scenarios/20_subagent_explore.txt",
+      "layers": ["E", "T", "C", "L", "O", "V", "G"],
+      "environment": {"kind": "isolated_workspace", "reset": "fresh_home_and_workdir"},
+      "tools": {"profile": "metacodes-runtime-default-v1", "required": ["Bash", "Task"]},
+      "constraints": {"timeout_seconds": 600, "permission_mode": "bypassPermissions"},
+      "success": {
+        "checks": [
+          {"type": "contains", "path": "apple.txt", "text": "red fruit", "description": "建立探索夹具 A"},
+          {"type": "contains", "path": "banana.txt", "text": "yellow fruit", "description": "建立探索夹具 B"},
+          {"type": "assistant_contains", "text": "red fruit", "description": "assistant transcript 包含文件 A 内容"},
+          {"type": "assistant_contains", "text": "yellow fruit", "description": "assistant transcript 包含文件 B 内容"}
+        ]
+      },
+      "trajectory_constraints": {
+        "required_tools": ["Bash", "Task"],
+        "max_turns": 18,
+        "max_tool_calls": 20,
+        "max_model_tool_errors": 3,
+        "max_harness_tool_errors": 0
+      },
+      "trajectory_rationale": {
+        "required_tools": "场景显式验证 Bash 夹具创建与 Task/Explore 子 agent 编排，两者都是被测产品能力。",
+        "max_turns": "包含父 agent 与子 agent 探索，允许多轮但必须有界。",
+        "max_tool_calls": "子 agent 会执行多次只读探索，限制异常扇出。",
+        "max_model_tool_errors": "Task 参数必须稳定，最多允许少量具名错误后的自纠。",
+        "max_harness_tool_errors": "子 agent 编排不应出现 harness 级工具失败。"
+      },
+      "grader": {"kind": "deterministic_workspace", "version": "core-e2e-v1"}
+    }
+  ]
+}

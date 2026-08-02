@@ -63,7 +63,7 @@ fn handleLine(alloc: std.mem.Allocator, line: []const u8) !void {
         );
     } else if (std.mem.eql(u8, method, "tools/list")) {
         try writeResponse(alloc, id,
-            \\{"tools":[{"name":"echo","description":"echo back input","inputSchema":{"type":"object"}},{"name":"elicit","description":"asks user via elicitation","inputSchema":{"type":"object"}}]}
+            \\{"tools":[{"name":"echo","description":"echo back input","inputSchema":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}},{"name":"slow_echo","description":"delayed echo for concurrency tests","inputSchema":{"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}},{"name":"elicit","description":"asks user via elicitation","inputSchema":{"type":"object"}}]}
         );
     } else if (std.mem.eql(u8, method, "tools/call")) {
         const tool = extractStringField(line, "name") orelse "";
@@ -79,6 +79,9 @@ fn handleLine(alloc: std.mem.Allocator, line: []const u8) !void {
             defer alloc.free(wbuf);
             _ = pfs.write(1, wbuf);
             return;
+        }
+        if (std.mem.eql(u8, tool, "slow_echo")) {
+            @import("platform").sync.sleepMs(100);
         }
         const msg = extractNestedStringField(line, "message") orelse "<nothing>";
         const payload = try std.fmt.allocPrint(alloc,
@@ -151,11 +154,15 @@ fn extractStringFieldFrom(data: []const u8, from: usize, field: []const u8) ?Fou
     buf[0] = '"';
     @memcpy(buf[1..][0..field.len], field);
     buf[1 + field.len] = '"';
-    buf[2 + field.len] = ':';
-    buf[3 + field.len] = '"';
-    const pat = buf[0 .. 4 + field.len];
+    const pat = buf[0 .. 2 + field.len];
     const idx = std.mem.indexOfPos(u8, data, from, pat) orelse return null;
-    const s = idx + pat.len;
+    var s = idx + pat.len;
+    while (s < data.len and (data[s] == ' ' or data[s] == '\t')) : (s += 1) {}
+    if (s >= data.len or data[s] != ':') return null;
+    s += 1;
+    while (s < data.len and (data[s] == ' ' or data[s] == '\t')) : (s += 1) {}
+    if (s >= data.len or data[s] != '"') return null;
+    s += 1;
     var e = s;
     while (e < data.len) : (e += 1) {
         if (data[e] == '"' and data[e - 1] != '\\') break;

@@ -11,6 +11,8 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const StdioTransport = @import("transport_stdio.zig").StdioTransport;
+const sync = @import("platform").sync;
+const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
 /// elicitation 回调:server 在 tool 执行中发 `elicitation/create` 请求用户输入时被调。
 /// 入参 = elicitation params JSON(含 message/requestedSchema);返回 = 用户回复的 content 对象 JSON
@@ -25,10 +27,12 @@ pub const McpClient = struct {
     transport: StdioTransport,
     next_id: u64 = 1,
     initialized: bool = false,
+    /// stdio transport is one ordered JSON-RPC stream. Parallel agent tools
+    /// may call the same server concurrently, but only one request may own the
+    /// send/recv loop at a time or responses can be consumed by the wrong call.
+    request_mutex: sync.Mutex = .{},
     /// server→client elicitation 回调(可选)。未设 → 一律 decline(协议仍正确闭合,server 不卡)。
     elicit: ?ElicitHandler = null,
-    /// 中断信号(callTool 期由调用方设):挂死的 MCP server 可被 Ctrl+C 打断(经 transport poll)。
-    abort: ?*const @import("../util/abort.zig").AbortSignal = null,
 
     pub fn connect(
         allocator: std.mem.Allocator,
@@ -53,7 +57,10 @@ pub const McpClient = struct {
         const params = try protocol.initializeParams(self.allocator);
         defer self.allocator.free(params);
 
-        const resp = try self.request("initialize", params);
+        // request_mutex has not been used yet: McpClient is still a local value
+        // that will be moved into caller storage on return. Never lock a pthread
+        // mutex before that move.
+        const resp = try self.requestUnlocked("initialize", params, null);
         defer self.allocator.free(resp);
         // 发 notifications/initialized 完成握手
         const notif = try protocol.serializeNotification(self.allocator, "notifications/initialized", "{}");
@@ -67,13 +74,20 @@ pub const McpClient = struct {
     /// **JSON-RPC 循环**:读到 server→client 请求(有 method+id,如 elicitation/create)就地处理并回复,
     /// 通知(有 method 无 id)忽略,继续读直到拿到本请求 id 的响应。否则 server 发 elicitation 会把
     /// 单次 recvLine 的响应假设打破(旧版直接解析失败)。
-    fn request(self: *McpClient, method: []const u8, params_json: []const u8) ![]u8 {
+    fn request(self: *McpClient, method: []const u8, params_json: []const u8, abort: ?*const AbortSignal) ![]u8 {
+        self.request_mutex.lock();
+        defer self.request_mutex.unlock();
+        return self.requestUnlocked(method, params_json, abort);
+    }
+
+    fn requestUnlocked(self: *McpClient, method: []const u8, params_json: []const u8, abort: ?*const AbortSignal) ![]u8 {
         const id = self.next_id;
         self.next_id += 1;
 
         const req = try protocol.serializeRequest(self.allocator, id, method, params_json);
         defer self.allocator.free(req);
-        self.transport.abort = self.abort; // 透传中断信号给阻塞读
+        self.transport.abort = abort;
+        defer self.transport.abort = null;
         self.transport.send(req) catch return error.McpServerCrashed;
 
         while (true) {
@@ -149,26 +163,38 @@ pub const McpClient = struct {
 
     /// 返回 tools 列表（owned JSON string，caller free）。
     pub fn listTools(self: *McpClient) ![]u8 {
-        return try self.request("tools/list", protocol.EMPTY_PARAMS);
+        return try self.request("tools/list", protocol.EMPTY_PARAMS, null);
     }
 
     /// 调用某个 tool。arguments_json 必须是合法 JSON object。
     pub fn callTool(self: *McpClient, name: []const u8, arguments_json: []const u8) ![]u8 {
+        return self.callToolAbortable(name, arguments_json, null);
+    }
+
+    pub fn callToolAbortable(self: *McpClient, name: []const u8, arguments_json: []const u8, abort: ?*const AbortSignal) ![]u8 {
         const params = try protocol.callToolParams(self.allocator, name, arguments_json);
         defer self.allocator.free(params);
-        return try self.request("tools/call", params);
+        return try self.request("tools/call", params, abort);
     }
 
     /// 列出 server 暴露的 resources（resources/list）。返回原始 JSON-RPC result。
     pub fn listResources(self: *McpClient) ![]u8 {
-        return try self.request("resources/list", protocol.EMPTY_PARAMS);
+        return self.listResourcesAbortable(null);
+    }
+
+    pub fn listResourcesAbortable(self: *McpClient, abort: ?*const AbortSignal) ![]u8 {
+        return try self.request("resources/list", protocol.EMPTY_PARAMS, abort);
     }
 
     /// 读取一个 resource（resources/read）。uri 为 resource 标识。
     pub fn readResource(self: *McpClient, uri: []const u8) ![]u8 {
+        return self.readResourceAbortable(uri, null);
+    }
+
+    pub fn readResourceAbortable(self: *McpClient, uri: []const u8, abort: ?*const AbortSignal) ![]u8 {
         const params = try protocol.readResourceParams(self.allocator, uri);
         defer self.allocator.free(params);
-        return try self.request("resources/read", params);
+        return try self.request("resources/read", params, abort);
     }
 };
 

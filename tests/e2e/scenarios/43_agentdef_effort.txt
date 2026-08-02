@@ -1,0 +1,1 @@
+使用 Task 工具调用 release-effort agent，让它只返回固定文本 EFFORT_HIGH_ACCEPTED。收到结果后用 Write 创建 effort-proof.txt，内容写 EFFORT_HIGH_ACCEPTED。必须使用指定 agent，不要改用 general-purpose。

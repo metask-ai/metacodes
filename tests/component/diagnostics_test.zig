@@ -9,6 +9,7 @@ const agent_loop = cc.agent_loop;
 const ui_backend = cc.ui_backend;
 const tee_backend = cc.tee_backend;
 const diagnostics_backend = cc.diagnostics_backend;
+const evaluation_backend = cc.evaluation_backend;
 const writer_backend = cc.writer_backend;
 
 // 一轮纯文本 → end_turn。
@@ -18,6 +19,14 @@ const TEXT_SSE =
     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n" ++
     "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":4}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const DENIED_WRITE_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":7,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu-denied\",\"name\":\"Write\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\":\\\"/tmp/metacodes-eval-must-not-write\\\",\\\"content\\\":\\\"x\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":4}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
 test "L4: DiagnosticsBackend 经 TeeBackend 收集真 agent_loop 的 trace" {
@@ -101,4 +110,110 @@ test "L4: DiagnosticsBackend 经 TeeBackend 收集真 agent_loop 的 trace" {
     try std.testing.expect(std.mem.indexOf(u8, jsonl, "turn_begin") != null);
     try std.testing.expect(std.mem.indexOf(u8, jsonl, "run_end") != null);
     try std.testing.expect(std.mem.indexOf(u8, jsonl, "end_turn") != null);
+}
+
+test "L2: EvaluationBackend projects a real agent_loop into stable events" {
+    const a = std.testing.allocator;
+    const bodies = [_][]const u8{TEXT_SSE};
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    const io = io_runtime.io();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io, "test-key", "model-a", url);
+    defer client.deinit();
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "hi");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+
+    var eval = evaluation_backend.EvaluationBackend.init(a, .{
+        .run_id = "component-run",
+        .suite_id = "component-suite",
+        .task_id = "diagnostics",
+        .task_fingerprint = "recorded-fingerprint",
+        .task_fingerprint_provenance = "recorded_at_execution",
+        .model_provider = "mock",
+        .model_id = "model-a",
+        .harness_config_id = "component",
+        .harness_revision = "test",
+        .grader_fingerprint = "grader-v1",
+    });
+    defer eval.deinit();
+    const eval_be = eval.backend();
+    const result = try agent_loop.run(
+        &conv,
+        client.provider(),
+        &.{},
+        &perm,
+        .{ .max_turns = 3 },
+        &eval_be,
+        a,
+    );
+    try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+    const jsonl = eval.jsonl();
+    try std.testing.expect(std.mem.indexOf(u8, jsonl, "recorded_at_execution") != null);
+    try std.testing.expect(std.mem.indexOf(u8, jsonl, "turn_started") != null);
+    try std.testing.expect(std.mem.indexOf(u8, jsonl, "usage") != null);
+    try std.testing.expect(std.mem.indexOf(u8, jsonl, "run_finished") != null);
+}
+
+test "L2: denied tool attempt has paired lifecycle and exact policy id" {
+    const a = std.testing.allocator;
+    const bodies = [_][]const u8{ DENIED_WRITE_SSE, TEXT_SSE };
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "model-a", url);
+    defer client.deinit();
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "write outside the plan file");
+    const perm = cc.permission.createContext(.plan, a);
+    const tool_defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(tool_defs);
+
+    var eval = evaluation_backend.EvaluationBackend.init(a, .{
+        .run_id = "denied-run",
+        .suite_id = "component-suite",
+        .task_id = "policy-denial",
+        .task_fingerprint = "recorded-fingerprint",
+        .task_fingerprint_provenance = "recorded_at_execution",
+        .model_provider = "mock",
+        .model_id = "model-a",
+        .harness_config_id = "component",
+        .harness_revision = "test",
+        .grader_fingerprint = "grader-v1",
+    });
+    defer eval.deinit();
+    const eval_be = eval.backend();
+    const result = try agent_loop.run(
+        &conv,
+        client.provider(),
+        tool_defs,
+        &perm,
+        .{ .max_turns = 3, .emit_tool_cards = true },
+        &eval_be,
+        a,
+    );
+    try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+
+    const jsonl = eval.jsonl();
+    const started = std.mem.indexOf(u8, jsonl, "\"tool_started\":{\"trace_id\":");
+    const policy = std.mem.indexOf(u8, jsonl, "\"policy_decision\":{\"trace_id\":");
+    const finished = std.mem.indexOf(u8, jsonl, "\"tool_finished\":{\"trace_id\":");
+    try std.testing.expect(started != null);
+    try std.testing.expect(policy != null);
+    try std.testing.expect(finished != null);
+    try std.testing.expect(started.? < finished.?);
+    try std.testing.expect(std.mem.indexOf(u8, jsonl, "\"id\":\"tu-denied\",\"tool\":\"Write\",\"decision\":\"deny\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, jsonl, "\"id\":\"tu-denied\",\"name\":\"Write\",\"is_error\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, jsonl, "\"error_code\":\"permission_denied\"") != null);
 }

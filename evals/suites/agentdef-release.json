@@ -1,0 +1,179 @@
+{
+  "schema_version": 1,
+  "suite_id": "metacodes-agentdef-release-v1",
+  "description": "AgentDef background、memory、worktree isolation、provider effort 与 MCP allowlist 的真实模型发布门禁。",
+  "tasks": [
+    {
+      "id": "40_agentdef_background",
+      "scenario": "tests/e2e/scenarios/40_agentdef_background.txt",
+      "layers": ["E", "T", "L", "O", "V"],
+      "environment": {
+        "kind": "isolated_workspace",
+        "reset": "fresh_home_and_workdir",
+        "fixtures": ["tests/e2e/fixtures/agents/release-background.md"]
+      },
+      "tools": {"profile": "metacodes-agentdef-release-v1", "required": ["Task", "TaskOutput", "Write"]},
+      "constraints": {"timeout_seconds": 600, "permission_mode": "bypassPermissions"},
+      "success": {
+        "checks": [
+          {"type": "contains", "path": "background-child.txt", "text": "BACKGROUND_CHILD_DONE", "description": "后台子 agent 完成真实文件副作用"},
+          {"type": "contains", "path": "background-proof.txt", "text": "BACKGROUND_TERMINAL_COMPLETED", "description": "父 agent 在观察终态后写入证明"}
+        ]
+      },
+      "trajectory_constraints": {
+        "required_tools": ["Task", "TaskOutput", "Write"],
+        "max_turns": 14,
+        "max_tool_calls": 18,
+        "max_model_tool_errors": 4,
+        "max_harness_tool_errors": 0
+      },
+      "trajectory_rationale": {
+        "required_tools": "AgentDef.background 必须让未显式传后台参数的 Task 返回 job id，并由父 agent 通过 TaskOutput 观察终态；Write 产生可执行副作用证据。",
+        "max_turns": "一次后台任务及终态轮询应在有界父会话内完成。",
+        "max_tool_calls": "允许短暂轮询但阻止无界 TaskOutput 风暴。",
+        "max_model_tool_errors": "允许少量 job id 参数自纠，不接受反复错误。",
+        "max_harness_tool_errors": "后台 registry、线程与终态合并不允许 harness 故障。"
+      },
+      "grader": {"kind": "deterministic_workspace", "version": "agentdef-release-v1"}
+    },
+    {
+      "id": "41_agentdef_memory",
+      "scenario": "tests/e2e/scenarios/41_agentdef_memory.txt",
+      "layers": ["E", "T", "C", "L", "O", "V"],
+      "environment": {
+        "kind": "isolated_git_workspace",
+        "reset": "fresh_home_workdir_and_git",
+        "fixtures": ["tests/e2e/fixtures/agents/release-memory.md"]
+      },
+      "tools": {"profile": "metacodes-agentdef-release-v1", "required": ["Task", "Read", "Write"]},
+      "constraints": {"timeout_seconds": 600, "permission_mode": "bypassPermissions"},
+      "success": {
+        "checks": [
+          {"type": "contains", "path": ".metacodes/agent-memory/release-memory-0a9ec8a380a77ab2af4ed59785bb80ad/MEMORY.md", "text": "MEMORY_RELEASE_7F3A", "description": "秘密写入无碰撞的 project-scope memory 路径"},
+          {"type": "contains", "path": "memory-proof.txt", "text": "MEMORY_RELEASE_7F3A", "description": "第二个新子 agent 能恢复秘密"}
+        ]
+      },
+      "trajectory_constraints": {
+        "required_tools": ["Task"],
+        "max_turns": 18,
+        "max_tool_calls": 24,
+        "max_model_tool_errors": 5,
+        "max_harness_tool_errors": 0
+      },
+      "trajectory_rationale": {
+        "required_tools": "两次 Task 形成跨子 agent 恢复；第二个新子 agent 亲自 Read memory 并 Write proof，两个精确文件 outcome 同时验证写入与召回。",
+        "max_turns": "保存、重新启动、恢复三阶段允许多轮但必须有界。",
+        "max_tool_calls": "允许两个子 agent 各自读写记忆和父验收，不允许异常扇出。",
+        "max_model_tool_errors": "路径和 must-read-first 可少量自纠，但不应持续失败。",
+        "max_harness_tool_errors": "memory 目录、权限和 sandbox 接线不允许 harness 故障。"
+      },
+      "grader": {"kind": "deterministic_workspace", "version": "agentdef-release-v2"}
+    },
+    {
+      "id": "42_agentdef_isolation",
+      "scenario": "tests/e2e/scenarios/42_agentdef_isolation.txt",
+      "layers": ["E", "T", "L", "O", "V", "G"],
+      "environment": {
+        "kind": "isolated_git_workspace",
+        "reset": "fresh_home_workdir_and_git",
+        "fixtures": ["tests/e2e/fixtures/agents/release-isolation.md"]
+      },
+      "tools": {"profile": "metacodes-agentdef-release-v1", "required": ["Task", "Write"]},
+      "constraints": {"timeout_seconds": 600, "permission_mode": "bypassPermissions"},
+      "success": {
+        "checks": [
+          {"type": "file_absent", "path": "isolation-child.txt", "description": "子 agent 修改没有泄漏到父 workspace"},
+          {"type": "contains", "path": "isolation-proof.txt", "text": "worktree_path", "description": "Task 返回可审计 worktree 路径"},
+          {"type": "contains", "path": "isolation-proof.txt", "text": "worktree_kept=true", "description": "有修改的 worktree 被保留"}
+        ]
+      },
+      "trajectory_constraints": {
+        "required_tools": ["Task", "Write"],
+        "max_turns": 12,
+        "max_tool_calls": 16,
+        "max_model_tool_errors": 4,
+        "max_harness_tool_errors": 0
+      },
+      "trajectory_rationale": {
+        "required_tools": "Task 必须建立 AgentDef worktree，父 Write 仅记录结构化返回；根目录 absent 防止把普通子 agent 误判为隔离成功。",
+        "max_turns": "单次隔离写入和验收无需长会话。",
+        "max_tool_calls": "允许 git/worktree 内部动作与父验收，限制重复创建。",
+        "max_model_tool_errors": "允许少量文件参数自纠但不接受 worktree 循环。",
+        "max_harness_tool_errors": "worktree 创建、finalize 与结果序列化不允许 harness 故障。"
+      },
+      "grader": {"kind": "deterministic_workspace", "version": "agentdef-release-v1"}
+    },
+    {
+      "id": "43_agentdef_effort",
+      "scenario": "tests/e2e/scenarios/43_agentdef_effort.txt",
+      "layers": ["T", "C", "L", "O", "V"],
+      "environment": {
+        "kind": "isolated_workspace",
+        "reset": "fresh_home_and_workdir",
+        "fixtures": ["tests/e2e/fixtures/agents/release-effort.md"]
+      },
+      "tools": {"profile": "metacodes-agentdef-release-v1", "required": ["Task", "Write"]},
+      "constraints": {"timeout_seconds": 600, "permission_mode": "bypassPermissions"},
+      "success": {
+        "checks": [
+          {"type": "contains", "path": "effort-proof.txt", "text": "EFFORT_HIGH_ACCEPTED", "description": "真实 provider 接受 effort 子请求并完成"},
+          {"type": "debug_log_contains", "text": "reasoning_effort=high", "description": "请求边界记录 AgentDef high effort 已进入 OpenAI-compatible wire path"}
+        ]
+      },
+      "trajectory_constraints": {
+        "required_tools": ["Task", "Write"],
+        "max_turns": 10,
+        "max_tool_calls": 12,
+        "max_model_tool_errors": 3,
+        "max_harness_tool_errors": 0
+      },
+      "trajectory_rationale": {
+        "required_tools": "Task 触发独立 provider 请求，Write 固化返回；debug request-boundary 证据排除仅解析字段未接线。",
+        "max_turns": "固定文本子任务应快速完成。",
+        "max_tool_calls": "该场景不需要探索，限制无关工具。",
+        "max_model_tool_errors": "允许少量 Task 参数自纠。",
+        "max_harness_tool_errors": "provider setter、请求序列化与 scoped restore 不允许 harness 故障。"
+      },
+      "grader": {"kind": "deterministic_workspace_and_debug_trace", "version": "agentdef-release-v1"}
+    },
+    {
+      "id": "44_agentdef_mcp",
+      "scenario": "tests/e2e/scenarios/44_agentdef_mcp.txt",
+      "layers": ["E", "T", "C", "L", "O", "V", "G"],
+      "environment": {
+        "kind": "isolated_workspace_with_two_mcp_servers",
+        "reset": "fresh_home_workdir_and_mcp_processes",
+        "fixtures": [
+          "tests/e2e/fixtures/agents/release-mcp.md",
+          "tests/_harness/mock_mcp_server.zig"
+        ]
+      },
+      "tools": {"profile": "metacodes-agentdef-release-v1", "required": ["Task", "ToolSearch", "allowed__echo", "Write"]},
+      "constraints": {"timeout_seconds": 600, "permission_mode": "bypassPermissions"},
+      "success": {
+        "checks": [
+          {"type": "contains", "path": "mcp-proof.txt", "text": "MCP_ALLOWLIST_SENTINEL", "description": "允许的 MCP server 完成真实 roundtrip"},
+          {"type": "contains", "path": "mcp-proof.txt", "text": "allowed__echo", "description": "父 agent 固化实际允许工具名"},
+          {"type": "debug_log_contains", "text": "tool.exec done(par) name=allowed__echo", "description": "子 agent 实际完成 allowed MCP roundtrip"},
+          {"type": "debug_log_contains", "text": "tool.exec FAILED(par) name=ToolSearch err=NoToolMatch", "description": "ToolSearch 不会从全局 registry 泄露 blocked server 工具"},
+          {"type": "debug_log_not_contains", "text": "tool.exec done(par) name=blocked__echo", "description": "blocked server 工具未完成动态执行"}
+        ]
+      },
+      "trajectory_constraints": {
+        "required_tools": ["Task", "Write"],
+        "max_turns": 14,
+        "max_tool_calls": 18,
+        "max_model_tool_errors": 4,
+        "max_harness_tool_errors": 0
+      },
+      "trajectory_rationale": {
+        "required_tools": "父 Task 触发带 allowlist 的子 agent，父 Write 固化 MCP 返回；子层调用由 debug trace 精确判定。",
+        "max_turns": "一次 MCP roundtrip 和父验收应在有界轮次完成。",
+        "max_tool_calls": "允许 MCP 初始化之外的模型工具调用，但限制重复 echo。",
+        "max_model_tool_errors": "允许少量 MCP 参数自纠。",
+        "max_harness_tool_errors": "MCP session 裁剪、transport 与动态 dispatch 不允许 harness 故障。"
+      },
+      "grader": {"kind": "deterministic_workspace_and_debug_trace", "version": "agentdef-release-v1"}
+    }
+  ]
+}
