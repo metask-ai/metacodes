@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "suite_id": "metacodes-websearch-concurrency-v2",
+  "description": "隔离 WebSearch 串行化变量；ToolSearch 激活是合法可选轨迹，不作为成功前提。比较单搜索无回归与同轮三搜索的质量、可靠性、成本、延迟和实际并行度。",
+  "tasks": [
+    {
+      "id": "60_websearch_single",
+      "scenario": "tests/e2e/scenarios/60_websearch_single.txt",
+      "layers": ["E", "T", "L", "O", "V"],
+      "environment": {"kind": "isolated_workspace", "reset": "fresh_home_and_workdir"},
+      "tools": {"profile": "metacodes-websearch-concurrency-v2", "required": ["WebSearch"]},
+      "constraints": {"timeout_seconds": 600, "permission_mode": "bypassPermissions"},
+      "success": {
+        "checks": [
+          {"type": "assistant_contains", "text": "SINGLE_SEARCH_DONE", "description": "单搜索完成后正常收口"}
+        ]
+      },
+      "trajectory_constraints": {
+        "required_tools": ["WebSearch"],
+        "min_tool_counts": {"WebSearch": 1},
+        "max_tool_calls": 2,
+        "max_turns": 3,
+        "max_model_tool_errors": 0,
+        "max_harness_tool_errors": 0
+      },
+      "trajectory_rationale": {
+        "required_tools": "必须实际执行 WebSearch，不能用模型记忆冒充搜索；ToolSearch 激活是可选轨迹。",
+        "min_tool_counts": "单搜索基线要求至少一次真实 WebSearch。",
+        "max_tool_calls": "允许至多一次可选 ToolSearch 激活和一次搜索，其他调用会污染控制组。",
+        "max_turns": "一次工具调用和一次最终回答应在三轮内完成。",
+        "max_model_tool_errors": "固定 query 不需要参数自纠。",
+        "max_harness_tool_errors": "网络工具的 harness 执行不应失败。"
+      },
+      "grader": {"kind": "deterministic_transcript_and_native_trace", "version": "websearch-concurrency-v2"}
+    },
+    {
+      "id": "61_websearch_batch3",
+      "scenario": "tests/e2e/scenarios/61_websearch_batch3.txt",
+      "layers": ["E", "T", "C", "L", "O", "V"],
+      "environment": {"kind": "isolated_workspace", "reset": "fresh_home_and_workdir"},
+      "tools": {"profile": "metacodes-websearch-concurrency-v2", "required": ["WebSearch"]},
+      "constraints": {"timeout_seconds": 600, "permission_mode": "bypassPermissions"},
+      "success": {
+        "checks": [
+          {"type": "assistant_contains", "text": "BATCH3_SEARCH_DONE", "description": "三搜索完成后正常收口"}
+        ]
+      },
+      "trajectory_constraints": {
+        "required_tools": ["WebSearch"],
+        "min_tool_counts": {"WebSearch": 3},
+        "max_tool_calls": 4,
+        "max_turns": 3,
+        "max_model_tool_errors": 0,
+        "max_harness_tool_errors": 0
+      },
+      "trajectory_rationale": {
+        "required_tools": "必须实际执行 WebSearch，不能用模型记忆冒充搜索；ToolSearch 激活是可选轨迹。",
+        "min_tool_counts": "三次 WebSearch 才真正触发本次并行与串行调度变量。",
+        "max_tool_calls": "允许至多一次可选 ToolSearch 激活和三次搜索，其他调用会污染实验。",
+        "max_turns": "同轮发出三调用后一次总结应在三轮内完成；逐轮搜索会超出产品轨迹预算。",
+        "max_model_tool_errors": "固定三个 query 不需要参数自纠。",
+        "max_harness_tool_errors": "并发或串行执行都不允许 harness 工具故障。"
+      },
+      "grader": {"kind": "deterministic_transcript_and_native_trace", "version": "websearch-concurrency-v2"}
+    }
+  ]
+}

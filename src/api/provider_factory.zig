@@ -72,6 +72,18 @@ pub const OwnedProvider = struct {
     }
 };
 
+/// Opaque capability for creating a per-call provider. ToolContext carries this
+/// instead of API keys/base URLs, so concurrent tools can ask their owner for an
+/// isolated client without leaking provider configuration across the tool API.
+pub const Factory = struct {
+    ctx: *anyopaque,
+    makeFn: *const fn (ctx: *anyopaque) anyerror!OwnedProvider,
+
+    pub fn make(self: Factory) anyerror!OwnedProvider {
+        return self.makeFn(self.ctx);
+    }
+};
+
 /// 据 provider_kind 造 OwnedProvider(独立 io_runtime + 对应具体 client,堆分配)。
 pub fn makeProvider(
     a: std.mem.Allocator,

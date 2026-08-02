@@ -323,6 +323,10 @@ pub const ToolContext = struct {
     /// 用于 Agent 工具 spawn 子 agent：共享 API client + tool defs + permission ctx
     /// api_client 仅 Anthropic 具体 client(web_search server tool 用);非 Anthropic → null。
     api_client: ?*Client = null,
+    /// Per-call provider construction capability. WebSearch requires this to
+    /// enter a parallel batch; null preserves the legacy shared-client serial
+    /// path for embedders that have not supplied isolated request resources.
+    provider_factory: ?@import("../api/provider_factory.zig").Factory = null,
     /// P0.5:父 loop 的中立 Provider。skill/agent 同步 spawn 的子 loop 据此继承父 provider
     /// (跨 provider 也正确);null = 无(纯单测)→ spawn 降级用 api_client.provider() 兜底。
     provider: ?@import("../api/provider.zig").Provider = null,

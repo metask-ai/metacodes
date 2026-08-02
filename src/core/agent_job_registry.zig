@@ -824,6 +824,18 @@ pub const AgentJobRegistry = struct {
         return pf.makeProvider(std.heap.c_allocator, self.provider_kind, self.api_key, self.model, self.base_url);
     }
 
+    fn makeProviderForTool(raw: *anyopaque) anyerror!pf.OwnedProvider {
+        const self: *AgentJobRegistry = @ptrCast(@alignCast(raw));
+        return self.makeProvider();
+    }
+
+    /// Capability view used by tools that need a private HTTP client. Keeping
+    /// construction here reuses the registry's owned provider configuration and
+    /// its thread-safe c_allocator policy without exposing credentials.
+    pub fn providerFactory(self: *AgentJobRegistry) pf.Factory {
+        return .{ .ctx = @ptrCast(self), .makeFn = &makeProviderForTool };
+    }
+
     /// 前台(同步)job 注册:堆分配一个无线程的 running entry,返回稳定 *JobEntry
     /// 供 agent.zig 同步路径传 progress_state/usage_state。spawn 在主线程/并发批 worker
     /// 上同步驱动,进度经 trampoline 写入,被 watcher tickSpinner 拾取渲染。

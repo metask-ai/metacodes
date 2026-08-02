@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[3]
 SUITES = (
     ROOT / "evals" / "suites" / "core-e2e.json",
     ROOT / "evals" / "suites" / "agentdef-release.json",
+    ROOT / "evals" / "suites" / "websearch-concurrency.json",
 )
 
 
@@ -44,6 +45,16 @@ class SuiteValidationTest(unittest.TestCase):
         broken["tasks"][0]["trajectory_rationale"].pop("max_turns")
         with self.assertRaisesRegex(ValidationError, "missing product rationale"):
             validate_suite(broken, ROOT)
+
+    def test_min_tool_counts_requires_positive_named_counts(self):
+        suite = load_json(SUITES[0])
+        for invalid in ({}, {"": 1}, {"WebSearch": 0}, {"WebSearch": True}):
+            with self.subTest(invalid=invalid):
+                broken = copy.deepcopy(suite)
+                broken["tasks"][0]["trajectory_constraints"]["min_tool_counts"] = invalid
+                broken["tasks"][0]["trajectory_rationale"]["min_tool_counts"] = "test"
+                with self.assertRaisesRegex(ValidationError, "positive integer object"):
+                    validate_suite(broken, ROOT)
 
     def test_workspace_check_cannot_escape(self):
         suite = load_json(SUITES[0])

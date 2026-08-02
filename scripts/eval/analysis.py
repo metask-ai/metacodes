@@ -24,6 +24,13 @@ LATENCY_COMPONENTS = (
     "harness_time_ms",
 )
 
+DIAGNOSTIC_METRICS = (
+    "tool_time_ms",
+    "tool_parallelism_factor",
+    "network_errors",
+    "retries",
+)
+
 
 def _rate(successes: int, total: int) -> Optional[float]:
     return successes / total if total else None
@@ -71,6 +78,8 @@ def summarize(rollouts: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "wall_time_ms": [],
         "model_request_time_ms": [],
         "tool_stage_time_ms": [],
+        "tool_time_ms": [],
+        "tool_parallelism_factor": [],
         "harness_time_ms": [],
         "tool_calls": [],
         "turns": [],
@@ -84,6 +93,8 @@ def summarize(rollouts: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             "cost_usd",
             "wall_time_ms",
             *LATENCY_COMPONENTS,
+            "tool_time_ms",
+            "tool_parallelism_factor",
             "tool_calls",
             "turns",
             "retries",
@@ -479,6 +490,9 @@ def compare(
     latency_component_deltas: Dict[str, List[float]] = {
         key: [] for key in LATENCY_COMPONENTS
     }
+    diagnostic_deltas: Dict[str, List[float]] = {
+        key: [] for key in DIAGNOSTIC_METRICS
+    }
     task_trial_contributions = []
     for pair_key, before, after in eligible:
         base_success = bool(before["judgement"]["trustworthy_success"])
@@ -519,6 +533,18 @@ def compare(
             component_row[metric] = delta
             if delta is not None:
                 latency_component_deltas[metric].append(delta)
+        diagnostic_row: Dict[str, Optional[float]] = {}
+        for metric in DIAGNOSTIC_METRICS:
+            before_value = before["metrics"].get(metric)
+            after_value = after["metrics"].get(metric)
+            delta = (
+                float(after_value) - float(before_value)
+                if before_value is not None and after_value is not None
+                else None
+            )
+            diagnostic_row[metric] = delta
+            if delta is not None:
+                diagnostic_deltas[metric].append(delta)
         task_trial_contributions.append(
             {
                 "task_id": pair_key[0],
@@ -531,6 +557,7 @@ def compare(
                 "cost_usd": cost_delta_value,
                 "wall_time_ms": latency_delta_value,
                 **component_row,
+                **diagnostic_row,
             }
         )
 
@@ -542,6 +569,7 @@ def compare(
         "cost_usd": cost_deltas,
         "wall_time_ms": latency_deltas,
         **latency_component_deltas,
+        **diagnostic_deltas,
     }
     paired_delta = {
         key: {
@@ -605,6 +633,7 @@ def compare(
                         "cost_usd",
                         "wall_time_ms",
                         *LATENCY_COMPONENTS,
+                        *DIAGNOSTIC_METRICS,
                     )
                 },
             }

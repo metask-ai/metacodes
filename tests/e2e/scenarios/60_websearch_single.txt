@@ -1,0 +1,1 @@
+只做一次联网搜索。如果 WebSearch 尚未激活，先用 ToolSearch 激活它；然后调用一次 WebSearch，query 必须是 "Zig language official documentation"。除这一次激活和一次搜索外不要调用其他工具，也不要重复搜索。搜索完成后用一行总结，并在最终回答末尾原样输出 SINGLE_SEARCH_DONE。

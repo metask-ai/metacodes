@@ -531,6 +531,21 @@ pub const AgentSession = struct {
     last_terminal_compact_id: u64 = 0,
     callback_failed: bool = false,
 
+    fn makeToolProvider(raw: *anyopaque) anyerror!provider_factory.OwnedProvider {
+        const self: *AgentSession = @ptrCast(@alignCast(raw));
+        return provider_factory.makeProvider(
+            std.heap.c_allocator,
+            self.provider.kind(),
+            self.api_key,
+            self.model,
+            self.base_url,
+        );
+    }
+
+    fn toolProviderFactory(self: *AgentSession) provider_factory.Factory {
+        return .{ .ctx = @ptrCast(self), .makeFn = &makeToolProvider };
+    }
+
     /// Allocate directly at the final address. This avoids the invalid
     /// init-by-value + bind(self) pattern where a later move leaves backend ctx
     /// pointing at stale storage.
@@ -1046,6 +1061,7 @@ pub const AgentSession = struct {
                 .abort = &self.abort_signal,
                 .read_state = &self.read_state,
                 .jobs = if (self.jobs) |*registry| registry else null,
+                .provider_factory = self.toolProviderFactory(),
                 .tool_defs = tool_definitions,
                 .tool_dispatcher = tool_dispatcher,
                 .execution_policy = execution_policy,

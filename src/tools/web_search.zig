@@ -20,6 +20,7 @@ const common = @import("common.zig");
 const types = @import("../types.zig");
 const json_mod = @import("../json.zig");
 const api_stream = @import("../api/stream.zig");
+const admission = @import("../api/web_search_admission.zig");
 const ToolContext = @import("context.zig").ToolContext;
 
 /// 子请求建连重试上限(< 主对话 defaultMaxRetries=10:工具内快速失败优于长时间钉死)。
@@ -29,7 +30,24 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
     const query = common.extractJsonArg(args, "query") orelse return error.MissingQuery;
     if (query.len == 0) return error.EmptyQuery;
-    const client = ctx.api_client orelse return error.WebSearchUnavailable;
+    var lease = admission.acquire(ctx.abort) catch return error.Aborted;
+    defer lease.release();
+
+    // Parallel-safe path: every invocation owns its HTTP client, IO runtime,
+    // and allocator. Legacy embedders without a factory retain the shared
+    // client path, but tool_exec keeps that path serial.
+    var owned_provider = if (ctx.provider_factory) |factory| factory.make() catch |err| {
+        setDetail(ctx, allocator, "web search provider creation failed: {s}", .{@errorName(err)});
+        return error.WebSearchUnavailable;
+    } else null;
+    defer if (owned_provider) |owned| owned.deinit();
+    const client = if (owned_provider) |*owned|
+        owned.anthropicClient() orelse {
+            setDetail(ctx, allocator, "web search requires an Anthropic-compatible provider", .{});
+            return error.WebSearchUnavailable;
+        }
+    else
+        ctx.api_client orelse return error.WebSearchUnavailable;
 
     // 隔离子请求:只带 web_search server tool(异形形态只在此处出现,不进主工具集)。
     const tools_one = [_]json_mod.ToolDefinition{.{
@@ -57,6 +75,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         return error.WebSearchFailed;
     };
     defer stream.deinit();
+    // Stream events are owned by the client's allocator. With a per-call
+    // provider that is c_allocator, while the final tool result belongs to the
+    // job allocator; freeing event payloads through ctx.allocator is invalid.
+    const stream_allocator = stream.allocator;
     stream.user_query = query; // 让 UI 装饰显示真实 query
 
     // 收集:模型续写摘要(model_text)+ 结构化结果链接(links)。
@@ -73,17 +95,17 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         const e = ev orelse break;
         switch (e) {
             .text => |t| {
-                defer allocator.free(t);
+                defer stream_allocator.free(t);
                 try model_text.appendSlice(allocator, t);
             },
             .web_search_query => |q| {
-                defer allocator.free(q);
+                defer stream_allocator.free(q);
                 // 对齐 cc query_update:刷新 TUI 第二行 `Searching: <query>`。
                 ctx.reportProgress(.query_update, q, 0);
             },
             .web_search_result => |w| {
-                defer allocator.free(w.ui_text); // 子请求不显示 UI 装饰
-                defer allocator.free(w.content_json);
+                defer stream_allocator.free(w.ui_text); // 子请求不显示 UI 装饰
+                defer stream_allocator.free(w.content_json);
                 // content_json 是原始结果数组(metask 常 "[]")。渲染成 `- title — url` 行。
                 const rendered = try api_stream.renderWebSearchResults(allocator, w.content_json);
                 defer allocator.free(rendered);

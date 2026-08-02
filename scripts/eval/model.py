@@ -209,6 +209,7 @@ def validate_suite(data: Dict[str, Any], root: Path) -> List[str]:
                 "min_permission_denials",
                 "required_tools",
                 "forbidden_tools",
+                "min_tool_counts",
             }:
                 raise ValidationError(f"{where}.trajectory_constraints: unknown field {key!r}")
             if key in {"required_tools", "forbidden_tools"}:
@@ -217,6 +218,19 @@ def validate_suite(data: Dict[str, Any], root: Path) -> List[str]:
                 ):
                     raise ValidationError(
                         f"{where}.trajectory_constraints.{key}: expected tool-name list"
+                    )
+            elif key == "min_tool_counts":
+                if not isinstance(value, dict) or not value or not all(
+                    isinstance(tool_name, str)
+                    and tool_name
+                    and isinstance(count, int)
+                    and not isinstance(count, bool)
+                    and count > 0
+                    for tool_name, count in value.items()
+                ):
+                    raise ValidationError(
+                        f"{where}.trajectory_constraints.{key}: expected non-empty "
+                        "tool-name to positive integer object"
                     )
             elif not isinstance(value, int) or value < 0:
                 raise ValidationError(f"{where}.trajectory_constraints.{key}: expected integer >= 0")
@@ -329,6 +343,7 @@ def validate_rollout(data: Dict[str, Any], where: str = "rollout") -> None:
         "model_request_time_ms",
         "tool_time_ms",
         "tool_stage_time_ms",
+        "tool_parallelism_factor",
         "harness_time_ms",
     ):
         _validate_metric(metrics, key)

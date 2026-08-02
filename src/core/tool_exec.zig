@@ -298,6 +298,10 @@ fn slotSafe(ctx: *const ToolContext, s: Slot) bool {
         // (它只注册后台 job 即返回)。统一按 safe 处理。
         return true;
     }
+    // WebSearch is safe only when each worker can construct an isolated
+    // provider. The process-wide WebSearch gate separately caps active searches
+    // at two; without this capability it continues down the legacy serial path.
+    if (std.mem.eql(u8, s.name, "WebSearch") and ctx.provider_factory != null) return true;
     return tools_mod.isConcurrencySafeInput(s.name, s.input);
 }
 

@@ -48,6 +48,7 @@ pub const client = @import("client.zig");
 pub const api_stream = @import("api/stream.zig");
 pub const api_error_class = @import("api/error_class.zig");
 pub const api_provider = @import("api/provider.zig"); // 多 provider vtable
+pub const api_provider_factory = @import("api/provider_factory.zig");
 pub const api_capability = @import("api/capability.zig");
 pub const api_cache = @import("api/cache.zig"); // 多 provider 缓存扩展点契约
 pub const api_openai = @import("api/openai_client.zig");

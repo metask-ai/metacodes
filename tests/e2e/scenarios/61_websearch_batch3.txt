@@ -1,0 +1,1 @@
+这是工具调度评估。如果 WebSearch 尚未激活，先用 ToolSearch 激活它。激活后的下一次助手工具调用批次中，必须一次性并列发出恰好 3 个 WebSearch 调用；不要等待第一个结果后再发第二个，也不要调用任何其他工具。三个 query 分别且原样为："Zig language official documentation"、"Rust language official documentation"、"Python language official documentation"。等三个搜索全部返回后，用三行各写一个语言的官方网站链接，并在最终回答末尾原样输出 BATCH3_SEARCH_DONE。

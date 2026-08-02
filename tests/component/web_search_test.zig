@@ -61,12 +61,18 @@ test "L2: WebSearch 子请求带 forced tool_choice + server tool" {
     const url = try srv.urlOwned(a);
     defer a.free(url);
 
-    var io_runtime = std.Io.Threaded.init(a, .{});
-    defer io_runtime.deinit();
-    var client = makeClient(a, io_runtime.io(), url);
-    defer client.deinit();
+    var registry = try cc.agent_job_registry.AgentJobRegistry.init(
+        std.heap.c_allocator,
+        "test-key",
+        url,
+        "claude-3-5-haiku-20241022",
+        .anthropic,
+    );
+    defer registry.deinit();
 
-    var ctx = cc.tools.ToolContext{ .allocator = a, .api_client = &client };
+    // api_client intentionally null: success proves dispatch used the per-call
+    // provider factory rather than borrowing the session client.
+    var ctx = cc.tools.ToolContext{ .allocator = a, .provider_factory = registry.providerFactory() };
     const out = dispatchOk(&ctx, "WebSearch", "{\"query\":\"zig language\"}") catch |e| {
         std.debug.print("WebSearch dispatch failed: {s}\n", .{@errorName(e)});
         return error.SkipZigTest;
@@ -86,6 +92,47 @@ test "L2: WebSearch 子请求带 forced tool_choice + server tool" {
     try std.testing.expect(std.mem.indexOf(u8, out, "https://ziglang.org") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Zig is a systems language.") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "REMINDER") != null);
+}
+
+test "L2: provider factory returns distinct WebSearch clients" {
+    var registry = try cc.agent_job_registry.AgentJobRegistry.init(
+        std.heap.c_allocator,
+        "test-key",
+        null,
+        "claude-3-5-haiku-20241022",
+        .anthropic,
+    );
+    defer registry.deinit();
+    const factory = registry.providerFactory();
+    var first = try factory.make();
+    defer first.deinit();
+    var second = try factory.make();
+    defer second.deinit();
+    try std.testing.expect(first.anthropicClient().? != second.anthropicClient().?);
+}
+
+test "L2: provider factory failure becomes structured WebSearch error" {
+    const Failing = struct {
+        fn make(_: *anyopaque) anyerror!cc.api_provider_factory.OwnedProvider {
+            return error.FactoryOffline;
+        }
+    };
+    var dummy: u8 = 0;
+    var slots = [_]cc.tool_exec.Slot{.{
+        .decision = .run,
+        .name = "WebSearch",
+        .id = "ws-fail",
+        .input = "{\"query\":\"zig\"}",
+    }};
+    defer slots[0].deinit(std.testing.allocator);
+    const ctx = cc.tools.ToolContext{
+        .allocator = std.testing.allocator,
+        .provider_factory = .{ .ctx = @ptrCast(&dummy), .makeFn = &Failing.make },
+    };
+    try cc.tool_exec.executeSlots(&slots, &ctx, std.testing.allocator, .{ .bytes = [_]u8{0} ** 12 });
+    try std.testing.expect(slots[0].is_error);
+    try std.testing.expect(std.mem.indexOf(u8, slots[0].content.?, "provider creation failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, slots[0].content.?, "FactoryOffline") != null);
 }
 
 test "L2: WebSearch content:[] 时靠模型摘要作答(非 no-results)" {

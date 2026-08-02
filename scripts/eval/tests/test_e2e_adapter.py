@@ -16,6 +16,7 @@ from scripts.eval.e2e_adapter import (
     finalize_evaluation_fd,
     import_run,
     prepare_runtime_metadata,
+    _trajectory_judgement,
 )
 
 
@@ -48,6 +49,20 @@ def suite():
 
 
 class E2EAdapterTest(unittest.TestCase):
+    def test_min_tool_counts_requires_the_requested_multiplicity(self):
+        constraints = {"required_tools": ["WebSearch"], "min_tool_counts": {"WebSearch": 3}}
+        passed = _trajectory_judgement(
+            constraints,
+            {"tool_distribution": {"WebSearch": 3}},
+        )
+        failed = _trajectory_judgement(
+            constraints,
+            {"tool_distribution": {"WebSearch": 2, "Read": 1}},
+        )
+        self.assertEqual(passed["status"], "pass")
+        self.assertEqual(failed["status"], "fail")
+        self.assertIn("WebSearch", failed["checks"][1]["detail"])
+
     def _native_terminal_rollout(
         self,
         *,

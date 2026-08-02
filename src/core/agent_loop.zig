@@ -320,6 +320,9 @@ pub const Options = struct {
     /// (provider-neutral),此字段只剩 web_search 这个 Anthropic 专有 server tool 的入口——它必须
     /// 是 Anthropic 具体 client 才能发 server-tool 请求,故保持 *Client 而非 Provider。
     api_client: ?*@import("../client.zig").Client = null,
+    /// Optional explicit per-call provider factory. Normal App runs derive this
+    /// from agent_jobs; embedders such as AgentSession provide their own.
+    provider_factory: ?@import("../api/provider_factory.zig").Factory = null,
     tool_defs: ?[]const @import("../json.zig").ToolDefinition = null,
     /// 本次 run 对应的 agent 嵌套深度（父=0，子=1…）
     agent_depth: u8 = 0,
@@ -1270,6 +1273,15 @@ pub fn run(
             .kg_projects_dir = opts.kg_projects_dir,
             .memdir_abs = opts.memdir_abs,
             .api_client = opts.api_client,
+            // Root App runs may reuse agent_jobs' owned provider config. Nested
+            // agents can carry a model override while agent_jobs still stores
+            // the parent model, so deriving there would silently search with
+            // the wrong model; they stay on their private serial client unless
+            // their caller supplies an explicit matching factory.
+            .provider_factory = opts.provider_factory orelse if (opts.agent_depth == 0)
+                if (opts.agent_jobs) |registry| registry.providerFactory() else null
+            else
+                null,
             .provider = provider, // P0.5:子 spawn 继承父 provider(跨 provider 正确)
             .tool_defs = opts.tool_defs,
             .agent_depth = opts.agent_depth,

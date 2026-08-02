@@ -706,6 +706,26 @@ def _trajectory_judgement(
                 }
             )
             continue
+        if constraint == "min_tool_counts":
+            observed = metrics.get("tool_distribution") or {}
+            missing = {
+                tool_name: {"minimum": minimum, "observed": int(observed.get(tool_name, 0))}
+                for tool_name, minimum in limit.items()
+                if int(observed.get(tool_name, 0)) < minimum
+            }
+            checks.append(
+                {
+                    "constraint": constraint,
+                    "expected": dict(sorted(limit.items())),
+                    "observed": {
+                        tool_name: int(observed.get(tool_name, 0))
+                        for tool_name in sorted(limit)
+                    },
+                    "detail": f"below_minimum={missing}",
+                    "passed": not missing,
+                }
+            )
+            continue
         metric = metric_names[constraint]
         actual = metrics.get(metric)
         if constraint.startswith("min_"):
@@ -1154,6 +1174,14 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
                 f"model+tool={attributed_ms} wall={wall_time_ms}"
             )
         harness_time_ms = wall_time_ms - attributed_ms
+    tool_time_ms = sum(int(item.get("elapsed_ms", 0)) for item in tool_finishes)
+    tool_parallelism_factor = (
+        tool_time_ms / tool_stage_time_ms
+        if tool_stage_time_ms is not None and tool_stage_time_ms > 0
+        else 0.0
+        if total_tool_calls == 0
+        else None
+    )
     metrics: Dict[str, Any] = {
         "input_tokens": sum(int(item.get("input_tokens", 0)) for item in usage),
         "output_tokens": sum(int(item.get("output_tokens", 0)) for item in usage),
@@ -1165,8 +1193,9 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
         "model_request_time_ms": model_request_time_ms,
         "model_request_count": len(model_requests) if model_requests else None,
         "model_request_outcomes": model_request_outcomes if model_requests else None,
-        "tool_time_ms": sum(int(item.get("elapsed_ms", 0)) for item in tool_finishes),
+        "tool_time_ms": tool_time_ms,
         "tool_stage_time_ms": tool_stage_time_ms,
+        "tool_parallelism_factor": tool_parallelism_factor,
         "harness_time_ms": harness_time_ms,
         "turns": sum(
             1

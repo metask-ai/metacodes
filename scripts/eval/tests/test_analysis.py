@@ -44,10 +44,13 @@ def rollout(task_id, success, harness="h1", policy_violations=0):
             "wall_time_ms": 100,
             "model_request_time_ms": 80,
             "tool_stage_time_ms": 10,
+            "tool_time_ms": 10,
+            "tool_parallelism_factor": 1.0,
             "harness_time_ms": 10,
             "tool_calls": 1,
             "turns": 1,
             "retries": 0,
+            "network_errors": 0,
             "policy_violations": policy_violations,
             "model_tool_errors": 0,
         },
@@ -97,6 +100,7 @@ class AnalysisTest(unittest.TestCase):
         self.assertIsNotNone(result["paired_delta"]["cost_usd"]["variance"])
         self.assertIsNotNone(result["paired_delta"]["cost_usd"]["ci95"][0])
         self.assertEqual(result["latency_attribution_pairs"], 3)
+        self.assertEqual(result["paired_delta"]["tool_parallelism_factor"]["mean"], 0.0)
         self.assertEqual(len(result["task_trial_contributions"]), 3)
         self.assertEqual(result["task_contributions"][0]["task_id"], "task")
 

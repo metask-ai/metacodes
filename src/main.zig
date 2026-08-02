@@ -16,6 +16,7 @@ pub const VERSION = "0.1.0";
 // Public re-exports for tests and future consumers.
 pub const api_stream = @import("api/stream.zig");
 pub const api_provider = @import("api/provider.zig");
+pub const api_provider_factory = @import("api/provider_factory.zig");
 pub const api_capability = @import("api/capability.zig");
 pub const api_cache = @import("api/cache.zig");
 pub const api_openai = @import("api/openai_client.zig");

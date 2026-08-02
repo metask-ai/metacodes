@@ -16,7 +16,7 @@ test "L2 并发: isConcurrencySafe 分类" {
     try std.testing.expect(tools.isConcurrencySafe("Glob"));
     try std.testing.expect(tools.isConcurrencySafe("Grep"));
     try std.testing.expect(tools.isConcurrencySafe("WebFetch"));
-    // WebSearch 复用 session api_client + session arena，必须留在串行批。
+    // 静态 API 保守为 false；tool_exec 只在有 provider factory 时动态升级。
     try std.testing.expect(!tools.isConcurrencySafe("WebSearch"));
     try std.testing.expect(!tools.isConcurrencySafe("Write"));
     try std.testing.expect(!tools.isConcurrencySafe("Edit"));
@@ -24,7 +24,7 @@ test "L2 并发: isConcurrencySafe 分类" {
     try std.testing.expect(!tools.isConcurrencySafe("Task"));
 }
 
-test "L2 #5: 两个 WebSearch slot 不重叠使用 session client" {
+test "L2 #5: 没有 provider factory 时两个 WebSearch 不重叠使用 session client" {
     const Probe = struct {
         active: std.atomic.Value(usize) = .init(0),
         max_active: std.atomic.Value(usize) = .init(0),
@@ -78,6 +78,87 @@ test "L2 #5: 两个 WebSearch slot 不重叠使用 session client" {
     try std.testing.expectEqual(@as(usize, 1), probe.max_active.load(.acquire));
     try std.testing.expectEqualStrings("ok", slots[0].content.?);
     try std.testing.expectEqualStrings("ok", slots[1].content.?);
+}
+
+test "L2 WebSearch 独立 provider 让混合批并发且 Read 不被隔离" {
+    const Probe = struct {
+        active: std.atomic.Value(usize) = .init(0),
+        max_active: std.atomic.Value(usize) = .init(0),
+        web_active: std.atomic.Value(bool) = .init(false),
+        web_overlap: std.atomic.Value(bool) = .init(false),
+
+        fn dispatch(raw: *const anyopaque, tool_ctx: *const tools.ToolContext, name: []const u8, _: []const u8) anyerror!tools.ToolDispatchOutcome {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            const now = self.active.fetchAdd(1, .acq_rel) + 1;
+            var seen = self.max_active.load(.acquire);
+            while (now > seen) {
+                seen = self.max_active.cmpxchgWeak(seen, now, .acq_rel, .acquire) orelse break;
+            }
+            const is_web = std.mem.eql(u8, name, "WebSearch");
+            if (is_web) {
+                if (now > 1) self.web_overlap.store(true, .release);
+                self.web_active.store(true, .release);
+            } else if (self.web_active.load(.acquire)) {
+                self.web_overlap.store(true, .release);
+            }
+            // A provider factory makes all four slots one safe batch. Wait for
+            // the whole batch so the assertion is scheduler-deterministic.
+            for (0..100_000) |_| {
+                if (self.active.load(.acquire) == 4) break;
+                std.Thread.yield() catch {};
+            }
+            if (is_web) self.web_active.store(false, .release);
+            _ = self.active.fetchSub(1, .acq_rel);
+            return .{ .ok = try tool_ctx.allocator.dupe(u8, "ok") };
+        }
+        fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+        fn nameAt(_: *const anyopaque, index: usize) ?[]const u8 {
+            return switch (index) {
+                0 => "WebSearch",
+                1 => "Read",
+                else => null,
+            };
+        }
+        fn hostSync(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+        fn dispatcher(self: *@This()) tools.ToolDispatcher {
+            return .{
+                .ctx = @ptrCast(self),
+                .dispatchFn = dispatch,
+                .prefetchSafeFn = prefetchSafe,
+                .nameAtFn = nameAt,
+                .hostSyncFn = hostSync,
+            };
+        }
+    };
+
+    const a = std.testing.allocator;
+    var probe = Probe{};
+    const DummyFactory = struct {
+        fn make(_: *anyopaque) anyerror!cc.api_provider_factory.OwnedProvider {
+            return error.TestFactoryMustNotRun;
+        }
+    };
+    var dummy: u8 = 0;
+    var slots = [_]tool_exec.Slot{
+        .{ .decision = .run, .name = "WebSearch", .id = "ws1", .input = "{}" },
+        .{ .decision = .run, .name = "Read", .id = "r1", .input = "{}" },
+        .{ .decision = .run, .name = "Read", .id = "r2", .input = "{}" },
+        .{ .decision = .run, .name = "WebSearch", .id = "ws2", .input = "{}" },
+    };
+    defer for (&slots) |*slot| slot.deinit(a);
+    const ctx = tools.ToolContext{
+        .allocator = a,
+        .tool_dispatcher = probe.dispatcher(),
+        .provider_factory = .{ .ctx = @ptrCast(&dummy), .makeFn = &DummyFactory.make },
+    };
+
+    try tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
+    try std.testing.expectEqual(@as(usize, 4), probe.max_active.load(.acquire));
+    try std.testing.expect(probe.web_overlap.load(.acquire));
 }
 
 fn mkdir(p: [*:0]const u8) void {
