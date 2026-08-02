@@ -194,6 +194,11 @@ pub const Provider = struct {
     maxTokensFn: *const fn (ctx: *anyopaque) u32,
     maxInputTokensFn: *const fn (ctx: *anyopaque) u32,
     reasoningEffortFn: *const fn (ctx: *anyopaque) ?types.ReasoningEffort,
+    /// Scoped subagent/teammate effort override. Optional because some wire
+    /// protocols do not expose an equivalent control. A missing setter must
+    /// fail explicitly instead of silently accepting an AgentDef field that
+    /// cannot affect the request.
+    setReasoningEffortFn: ?*const fn (ctx: *anyopaque, effort: ?types.ReasoningEffort) void = null,
 
     /// 能力查询(P2 真接表;P0 实现可恒按 Anthropic 能力答)。
     supportsFn: *const fn (ctx: *anyopaque, cap: Capability) bool,
@@ -225,6 +230,10 @@ pub const Provider = struct {
     }
     pub inline fn reasoningEffort(self: Provider) ?types.ReasoningEffort {
         return self.reasoningEffortFn(self.ctx);
+    }
+    pub inline fn setReasoningEffort(self: Provider, effort: ?types.ReasoningEffort) !void {
+        const setter = self.setReasoningEffortFn orelse return error.AgentEffortUnsupportedProvider;
+        setter(self.ctx, effort);
     }
     pub inline fn supports(self: Provider, cap: Capability) bool {
         return self.supportsFn(self.ctx, cap);

@@ -34,6 +34,7 @@ const ui_backend_mod = @import("../core/protocol/ui_backend.zig");
 const writer_backend_mod = @import("../core/writer_backend.zig");
 const tee_backend_mod = @import("../core/tee_backend.zig");
 const diagnostics_backend_mod = @import("../core/diagnostics_backend.zig");
+const evaluation_backend_mod = @import("../core/evaluation_backend.zig");
 const tui_backend_mod = @import("tui/tui_backend.zig");
 const terminal_title = @import("tui/terminal_title.zig");
 const goal_mod = @import("../core/goal.zig");
@@ -55,6 +56,12 @@ fn debugBackend(verbose: bool, show_retry: bool, usage_acc: ?*@import("../core/u
 }
 
 pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
+    // Evaluation is opt-in and fail-closed: without METACODES_EVAL_METADATA no
+    // object is created; when set, malformed/incomplete grounding aborts before
+    // any rollout can be mistaken for comparable evidence.
+    var eval_runtime = try evaluation_backend_mod.RuntimeConfig.fromEnvironment(allocator);
+    defer if (eval_runtime) |*runtime| runtime.deinit();
+
     printStartupBanner(app);
 
     // 启动 prompt 建议:基于 git 最近改动的文件给一条灰色提示(对齐 Claude Code)
@@ -578,7 +585,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         var diag_ui = diag_be.backend();
         var tee = tee_backend_mod.TeeBackend{ .primary = &ui_be, .secondary = &diag_ui };
         const tee_ui = tee.backend();
-        const effective_be: *const ui_backend_mod.UiBackend = if (trace_on) &tee_ui else &ui_be;
+        const traced_be: *const ui_backend_mod.UiBackend = if (trace_on) &tee_ui else &ui_be;
         defer if (trace_on) {
             const jsonl = diag_be.toJsonl(allocator) catch null;
             if (jsonl) |j| {
@@ -586,6 +593,30 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
                 std.debug.print("{s}", .{j});
             }
         };
+
+        // Native evaluation events are a second decorator over the normal UI
+        // (and optional diagnostics decorator). Each user submission is one
+        // invocation inside the execution-grounded scenario rollout.
+        var eval_be: ?evaluation_backend_mod.EvaluationBackend = if (eval_runtime) |*runtime|
+            evaluation_backend_mod.EvaluationBackend.init(allocator, runtime.nextMetadata(
+                @tagName(app.config.provider_kind),
+                app.activeModel(),
+                @tagName(app.permission_ctx.modeValue()),
+            ))
+        else
+            null;
+        defer if (eval_be) |*evaluation| {
+            if (eval_runtime) |*runtime| {
+                runtime.appendEvaluation(evaluation) catch |err| {
+                    std.debug.print("evaluation artifact write failed: {s}\n", .{@errorName(err)});
+                };
+            }
+            evaluation.deinit();
+        };
+        var eval_ui: ui_backend_mod.UiBackend = if (eval_be) |*evaluation| evaluation.backend() else ui_be;
+        var eval_tee = tee_backend_mod.TeeBackend{ .primary = traced_be, .secondary = &eval_ui };
+        const eval_tee_ui = eval_tee.backend();
+        const effective_be: *const ui_backend_mod.UiBackend = if (eval_be != null) &eval_tee_ui else traced_be;
 
         // 生成期键盘监听:仅 tty + 有 TuiBackend 时启动(回车入队 / Esc 中断 / 超时 tickSpinner)。
         if (tty) {
@@ -1238,7 +1269,7 @@ fn readLineRaw(fd: c_int, allocator: std.mem.Allocator, history: *history_mod.Hi
                     var efforts_buf: [5]types_mod.ReasoningEffort = undefined;
                     const efforts = reasoningOptionsForMask(entries[model_idx].reasoning_mask, &efforts_buf);
                     const effort_idx = @min(region.ui.slash_sel, efforts.len - 1);
-                    app.setReasoningEffort(efforts[effort_idx]);
+                    try app.setReasoningEffort(efforts[effort_idx]);
                     const line = try std.fmt.allocPrint(allocator, "/model use {s}", .{entries[model_idx].model_id});
                     defer allocator.free(line);
                     try editor.setLine(line);

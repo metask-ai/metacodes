@@ -15,15 +15,22 @@
 # 仓库根 = 本文件上两级
 E2E_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ZIG_ROOT="$(cd "$E2E_DIR/../.." && pwd)"
+# 保存进入场景 fake HOME 前的宿主 HOME，仅用于只读解析 auth 文件。
+# 凭据只进子进程环境，不复制到 run artifact，也不打印。
+E2E_HOST_HOME="${HOME:-}"
 
 # 二进制:默认 debug(带 error-return-trace + 堆栈,利于排错);
 # E2E_BIN=release 可切回 ReleaseSmall(更快更小,某些慢场景用)。
-case "${E2E_BIN:-debug}" in
-  release) BIN="$ZIG_ROOT/zig-out/bin/metacodes" ;;
-  *)       BIN="$ZIG_ROOT/zig-out/bin/metacodes-debug" ;;
-esac
+if [[ -n "${E2E_BIN_PATH:-}" ]]; then
+  BIN="$E2E_BIN_PATH"
+else
+  case "${E2E_BIN:-debug}" in
+    release) BIN="$ZIG_ROOT/zig-out/bin/metacodes" ;;
+    *)       BIN="$ZIG_ROOT/zig-out/bin/metacodes-debug" ;;
+  esac
+fi
 # debug 不存在则回退 release + 提示(不静默)。
-if [[ ! -x "$BIN" && "$BIN" == *metacodes-debug ]]; then
+if [[ -z "${E2E_BIN_PATH:-}" && ! -x "$BIN" && "$BIN" == *metacodes-debug ]]; then
   if [[ -x "$ZIG_ROOT/zig-out/bin/metacodes" ]]; then
     echo "⚠️  metacodes-debug 不存在,回退到 release 二进制(无 trace)。先 'zig build' 产出 debug。" >&2
     BIN="$ZIG_ROOT/zig-out/bin/metacodes"
@@ -43,7 +50,7 @@ E2E_LOG_SPEC="agent:debug,client:debug,stream:debug,tool:debug,permission:debug,
 # ============================================================================
 # 设置的变量(调用方读):
 #   CONF_PERMISSION CONF_SETTINGS CONF_ALLOWED_TOOLS CONF_DISALLOWED_TOOLS
-#   CONF_ADD_DIR(换行分隔多条) CONF_ANSWERS CONF_GIT_INIT CONF_TIMEOUT
+#   CONF_ADD_DIR(换行分隔多条) CONF_ANSWERS CONF_GIT_INIT CONF_MCP_MOCK_SERVERS CONF_TIMEOUT
 #   CONF_EXPECT(换行分隔多条 EXPECT_* 原始行) CONF_EXPECT_HARD
 load_conf() {
   local conf_file="$1"
@@ -54,6 +61,7 @@ load_conf() {
   CONF_ADD_DIR=""
   CONF_ANSWERS=""
   CONF_GIT_INIT=""
+  CONF_MCP_MOCK_SERVERS=""
   CONF_TIMEOUT=""
   CONF_EXPECT=""
   CONF_EXPECT_HARD="0"
@@ -78,6 +86,7 @@ load_conf() {
       ADD_DIR)           CONF_ADD_DIR="${CONF_ADD_DIR}${val}"$'\n' ;;
       ANSWERS)           CONF_ANSWERS="$val" ;;
       GIT_INIT)          CONF_GIT_INIT="$val" ;;
+      MCP_MOCK_SERVERS)  CONF_MCP_MOCK_SERVERS="$val" ;;
       TIMEOUT)           CONF_TIMEOUT="$val" ;;
       EXPECT_FILE|EXPECT_CONTAINS|EXPECT_MIN_LINES|EXPECT_ABSENT)
                          CONF_EXPECT="${CONF_EXPECT}${key}=${val}"$'\n' ;;
@@ -121,6 +130,30 @@ run_session() {
     cp -f "$E2E_DIR/fixtures/agents/"*.md "$fake_home/.claude/agents/" 2>/dev/null || true
   fi
 
+  # --- 真 MCP allowlist 夹具:同一个确定性 mock 以多个 server name 启动。---
+  # AgentDef.mcpServers 的发布场景需要同时存在 allowed/blocked server，才能证明
+  # 请求 tools 与运行时 session 都被裁剪。缺 binary 直接使 rollout invalid，绝不降级。
+  if [[ -n "$CONF_MCP_MOCK_SERVERS" ]]; then
+    local mock_mcp="$ZIG_ROOT/zig-out/bin/mock_mcp_server"
+    if [[ ! -x "$mock_mcp" ]]; then
+      echo "MCP fixture missing: $mock_mcp (run zig build first)" >&2
+      echo 96
+      return 0
+    fi
+    python3 - "$fake_home/.metacodes/config.json" "$mock_mcp" "$CONF_MCP_MOCK_SERVERS" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+output, command, raw_names = sys.argv[1:]
+names = [item.strip() for item in raw_names.split(",") if item.strip()]
+if not names:
+    raise SystemExit("MCP_MOCK_SERVERS must contain at least one server name")
+payload = {"mcp_servers": [{"name": name, "command": [command]} for name in names]}
+Path(output).write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+PY
+  fi
+
   # --- git 夹具:GIT_INIT=1 时框架预先 init + 初始 commit(省一轮模型调用,更稳)---
   if [[ "$CONF_GIT_INIT" == "1" ]]; then
     (
@@ -138,6 +171,13 @@ run_session() {
   # --- 拼 CLI 参数(从 .conf)---
   local -a cli_args=()
   cli_args+=(--permission "$CONF_PERMISSION")
+  local eval_model="${E2E_MODEL:-claude-sonnet-4-20250514}"
+  local eval_provider="${E2E_MODEL_PROVIDER:-anthropic}"
+  case "$eval_provider" in
+    anthropic|openai|gemini) ;;
+    *) echo "invalid E2E_MODEL_PROVIDER: $eval_provider" >&2; echo 95; return 0 ;;
+  esac
+  cli_args+=(--model "$eval_model")
   [[ -n "$CONF_SETTINGS" ]] && cli_args+=(--settings "$E2E_DIR/$CONF_SETTINGS")
   [[ -n "$CONF_ALLOWED_TOOLS" ]] && cli_args+=(--allowedTools "$CONF_ALLOWED_TOOLS")
   [[ -n "$CONF_DISALLOWED_TOOLS" ]] && cli_args+=(--disallowedTools "$CONF_DISALLOWED_TOOLS")
@@ -148,12 +188,61 @@ run_session() {
   fi
   [[ -n "$CONF_ANSWERS" ]] && cli_args+=(--answers-file "$E2E_DIR/$CONF_ANSWERS")
 
+  # --- 真实模型认证:fake HOME 不复制用户 auth.json。---
+  # 优先继承显式 METASK_API_KEY；否则从 E2E_AUTH_FILE（默认宿主 auth.json）只读 api_key。
+  local eval_api_key="${METASK_API_KEY:-}"
+  local auth_source="${E2E_AUTH_FILE:-${E2E_HOST_HOME:+$E2E_HOST_HOME/.metacodes/auth.json}}"
+  if [[ -z "$eval_api_key" && -n "$auth_source" && -f "$auth_source" ]]; then
+    eval_api_key="$(python3 - "$auth_source" <<'PY'
+import json
+import sys
+
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8")).get("api_key") or ""
+except (OSError, ValueError, TypeError):
+    value = ""
+sys.stdout.write(value if isinstance(value, str) else "")
+PY
+)"
+  fi
+  local -a auth_env=()
+  [[ -n "$eval_api_key" ]] && auth_env+=("METASK_API_KEY=$eval_api_key")
+
   # --- record 模式(Stage 7):E2E_RECORD=1 时录 cassette 到 <workdir>/cassette/ ---
   if [[ "${E2E_RECORD:-0}" == "1" ]]; then
     cli_args+=(--record "$workdir/cassette")
   fi
   # --- replay 模式(Stage 7):E2E_BASE_URL 设置时指向 mock(由 replay 驱动起)---
   [[ -n "${E2E_BASE_URL:-}" ]] && cli_args+=(--base-url "$E2E_BASE_URL")
+
+  # --- 原生 evaluation events(M2):在子进程启动前冻结所有可比性身份。---
+  # suite 外的探索场景不强行计分；prepare-e2e 会跳过且不创建 metadata。
+  local eval_metadata="$workdir/.eval-metadata.tmp"
+  local eval_events="$workdir/events.jsonl"
+  local eval_events_stage="$workdir/.eval-events.tmp"
+  local eval_task eval_run_name eval_revision
+  eval_task="$(basename "$workdir")"
+  eval_run_name="$(basename "$(dirname "$workdir")"):${eval_task}:${E2E_TRIAL:-0}"
+  if [[ -n "${E2E_HARNESS_REVISION:-}" ]]; then
+    eval_revision="$E2E_HARNESS_REVISION"
+  else
+    eval_revision="$(git -C "$ZIG_ROOT" rev-parse HEAD 2>/dev/null || printf 'unknown')"
+  fi
+  python3 "$ZIG_ROOT/scripts/eval/cli.py" prepare-e2e \
+    --suite "${E2E_EVAL_SUITE:-$ZIG_ROOT/evals/suites/core-e2e.json}" \
+    --task "$eval_task" \
+    --output "$eval_metadata" \
+    --events "$eval_events" \
+    --run-id "$eval_run_name" \
+    --trial "${E2E_TRIAL:-0}" \
+    --model-provider "$eval_provider" \
+    --model-id "$eval_model" \
+    --harness-config-id "${E2E_HARNESS_CONFIG_ID:-metacodes-e2e-native-v1}" \
+    --harness-revision "$eval_revision" \
+    --permission-mode "$CONF_PERMISSION" \
+    --binary "$BIN" >/dev/null || return 98
+  local eval_enabled=0
+  [[ -f "$eval_metadata" ]] && eval_enabled=1
 
   # 组装喂给 REPL 的输入:每段(--- 分隔)→ 一行(= 一轮 agent turn)。
   # 段内换行压成空格;末尾追加 /exit。
@@ -172,10 +261,23 @@ run_session() {
   # 关键:cd 到隔离 workdir;HOME 指 fake HOME;分级日志双写(debug 落单独文件)。
   (
     cd "$workdir" || exit 97
+    local -a eval_env=()
+    if [[ "$eval_enabled" == "1" ]]; then
+      exec 8<"$eval_metadata" || exit 98
+      rm -f "$eval_metadata" || exit 98
+      : > "$eval_events_stage" || exit 98
+      exec 9<>"$eval_events_stage" || exit 98
+      rm -f "$eval_events_stage" || exit 98
+      eval_env+=("METACODES_EVAL_METADATA_FD=8" "METACODES_EVAL_FD=9")
+    fi
     printf '%s\n' "$feed" | \
-      HOME="$fake_home" \
-      METACODES_LOG="$E2E_LOG_SPEC" \
-      METACODES_LOG_FILE="$debug_logfile" \
+      env \
+      "HOME=$fake_home" \
+      "METACODES_LOG=$E2E_LOG_SPEC" \
+      "METACODES_LOG_FILE=$debug_logfile" \
+      "METACODES_PROVIDER=$eval_provider" \
+      "${auth_env[@]}" \
+      "${eval_env[@]}" \
       perl -e '
         my $to=shift; my @cmd=@ARGV;
         my $pid=fork();
@@ -184,6 +286,12 @@ run_session() {
         alarm $to; waitpid($pid,0); exit($? >> 8);
       ' "$timeout" \
       "$BIN" "${cli_args[@]}"
+    child_rc=$?
+    if [[ "$eval_enabled" == "1" ]]; then
+      python3 "$ZIG_ROOT/scripts/eval/cli.py" finalize-e2e \
+        --fd 9 --output "$eval_events" || exit 98
+    fi
+    exit "$child_rc"
   ) > "$logfile" 2>&1
   local rc=$?
 
@@ -270,10 +378,11 @@ collect_artifacts() {
   nfail=$(grep -c 'tool.exec FAILED' "$debug_logfile" 2>/dev/null)
   nfail="${nfail//[^0-9]/}"; nfail="${nfail:-0}"
 
-  # 工具失败分类(e2e triage):区分**模型给错参**(Missing*/Invalid* 字段错,可恢复,
-  # cc-zig 行为正确)vs **cc-zig/工具真错**(其它)。前者不该让人误以为 cc-zig 有 bug。
+  # 工具失败分类(e2e triage):区分**模型可纠正的 user_error**(字段/路径/patch context
+  # 错,cc-zig 正确拒绝)vs **cc-zig/工具真错**。与 core/tool_error.zig 的 user_error
+  # 映射保持一致；原生日志只有 Zig error name，故在这里保留兼容表。
   local nfail_model nfail_real
-  nfail_model=$(grep -E 'tool.exec FAILED' "$debug_logfile" 2>/dev/null | grep -cE 'err=(Missing|Invalid|Empty)' )
+  nfail_model=$(grep -E 'tool.exec FAILED' "$debug_logfile" 2>/dev/null | grep -cE 'err=(Missing|Invalid|Empty|NotRead|StaleFile|UnknownTool|FileNotFound|MultipleMatches|StringNotFound|ContextNotFound|OldLinesNotFound|NoOpEdit)' )
   nfail_model="${nfail_model//[^0-9]/}"; nfail_model="${nfail_model:-0}"
   nfail_real=$(( 10#${nfail:-0} - 10#${nfail_model:-0} ))
 
@@ -293,8 +402,8 @@ collect_artifacts() {
 
     # --- 工具调用统计(主对话 vs subagent 分桶,Stage 4)---
     echo "- 工具调用统计:"
-    if grep -q 'tool.exec start name=' "$debug_logfile" 2>/dev/null; then
-      grep -oE 'tool\.exec start name=[A-Za-z_]+' "$debug_logfile" | sed 's/.*name=//' \
+    if grep -qE 'tool\.exec start(\(par\))? name=' "$debug_logfile" 2>/dev/null; then
+      grep -oE 'tool\.exec start(\(par\))? name=[A-Za-z_]+' "$debug_logfile" | sed 's/.*name=//' \
         | sort | uniq -c | sort -rn | sed 's/^/    - /'
       echo "    - (其中失败: $nfail 次 = 模型给错参 $nfail_model + cc-zig 真错 $nfail_real)"
     else
@@ -311,10 +420,10 @@ collect_artifacts() {
 
     # --- worktree Enter/Exit 配对校验(Stage 5)---
     # 精确数 tool.exec 调用(不数提示词/工具定义/流式 delta 里的工具名提及)。
-    if [[ "$CONF_GIT_INIT" == "1" ]] || grep -q 'tool.exec start name=EnterWorktree' "$debug_logfile" 2>/dev/null; then
+    if [[ "$CONF_GIT_INIT" == "1" ]] || grep -qE 'tool\.exec start(\(par\))? name=EnterWorktree' "$debug_logfile" 2>/dev/null; then
       local n_enter n_exit
-      n_enter=$(grep -c 'tool.exec start name=EnterWorktree' "$debug_logfile" 2>/dev/null); n_enter="${n_enter//[^0-9]/}"; n_enter="${n_enter:-0}"
-      n_exit=$(grep -c 'tool.exec start name=ExitWorktree' "$debug_logfile" 2>/dev/null); n_exit="${n_exit//[^0-9]/}"; n_exit="${n_exit:-0}"
+      n_enter=$(grep -cE 'tool\.exec start(\(par\))? name=EnterWorktree' "$debug_logfile" 2>/dev/null); n_enter="${n_enter//[^0-9]/}"; n_enter="${n_enter:-0}"
+      n_exit=$(grep -cE 'tool\.exec start(\(par\))? name=ExitWorktree' "$debug_logfile" 2>/dev/null); n_exit="${n_exit//[^0-9]/}"; n_exit="${n_exit:-0}"
       if [[ "$n_enter" == "$n_exit" ]]; then
         echo "- worktree: Enter=$n_enter Exit=$n_exit ✓ 配对"
       else

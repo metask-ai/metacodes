@@ -1,0 +1,3 @@
+使用 Task 工具调用 release-isolation agent，让它用 Write 创建 isolation-child.txt，内容必须包含 ISOLATED_WORKTREE_ONLY。不要让父 agent 创建这个文件。
+---
+读取 Task 返回的结构化结果，确认其中有 worktree_path 且 worktree_kept=true。不要在根 workspace 创建 isolation-child.txt。用 Write 创建 isolation-proof.txt，逐字记录 worktree_path 和 worktree_kept=true。

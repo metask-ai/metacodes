@@ -113,7 +113,7 @@ fn buildOptions(app: *app_mod.App, scoped_recall: ?[]const u8) agent_loop.Option
         .kg = if (app.kg) |*k| k else null,
         .kg_projects_dir = app.kg_projects_dir,
         .memdir_abs = app.memdir_abs,
-        .api_client = &app.api_client,
+        .api_client = app.anthropicClientOrNull(),
         .tool_defs = app.tool_defs,
         .system_prompt = app.system_prompt,
         .inject_user_context = app.user_context,

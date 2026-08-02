@@ -34,13 +34,14 @@ pub const invalid_fd: Fd = -1;
 pub const O = if (is_windows) WindowsO else std.c.O;
 
 /// Windows 端 O：字段名与 std.c.O 对齐，使调用点 `.{ .ACCMODE = .WRONLY, .CREAT = true }`
-/// 在两平台同构（迁移=纯前缀 swap）。仅含本仓用到的 flag（ACCMODE/CREAT/TRUNC/APPEND/EXCL）。
+/// 在两平台同构（迁移=纯前缀 swap）。仅含本仓用到的 flag。
 const WindowsO = struct {
     ACCMODE: AccessMode = .RDONLY,
     CREAT: bool = false,
     TRUNC: bool = false,
     APPEND: bool = false,
     EXCL: bool = false,
+    NOFOLLOW: bool = false,
 
     pub const AccessMode = enum(u2) { RDONLY = 0, WRONLY = 1, RDWR = 2 };
 };
@@ -88,12 +89,85 @@ pub fn open(path: [*:0]const u8, flags: O, mode: c_uint) c_int {
     // 而 std.c.open 的 `oflag: O` 在 windows 是 void(std.c.O=void)→ winapi void-param 报错。
     // else 块保证该分支 comptime 死、不被分析(nowMs 同款,已验证)。
     if (is_windows) {
+        // MSVCRT 没有 O_NOFOLLOW。先拒绝 reparse point；真正需要抵抗路径竞态的
+        // 安全边界应传已打开 fd（evaluation harness 正是如此），不要依赖此检查。
+        if (flags.NOFOLLOW and isSymlink(path)) return -1;
         // MSVCRT _open：第三变参是 pmode（_S_IREAD/_S_IWRITE），仅 CREAT 时生效。
         return _open(path, windowsOflag(flags), @as(c_int, @intCast(mode & 0o777)));
     } else {
         return std.c.open(path, flags, mode);
     }
 }
+
+const S_IFREG: u32 = 0o100000;
+
+pub const FileInfo = struct {
+    size: u64,
+    is_regular: bool,
+};
+
+/// 对已打开 fd 做类型与大小检查。安全敏感读取必须先 open(O_NOFOLLOW)，再 fstat fd，
+/// 不能只 lstat path 后 open（两步之间可被换成 symlink/FIFO）。
+pub fn fileInfo(fd: Fd) error{StatFailed}!FileInfo {
+    if (is_windows) {
+        var st: Stat64 = undefined;
+        if (_fstat64(fd, &st) != 0 or st.st_size < 0) return error.StatFailed;
+        return .{
+            .size = @intCast(st.st_size),
+            .is_regular = (@as(u32, st.st_mode) & S_IFMT) == S_IFREG,
+        };
+    }
+    if (builtin.os.tag == .linux) {
+        var stx: std.os.linux.Statx = undefined;
+        const empty_path: [*:0]const u8 = "";
+        const AT_EMPTY_PATH: u32 = 0x1000;
+        const rc = std.os.linux.statx(fd, empty_path, AT_EMPTY_PATH, std.os.linux.STATX.BASIC_STATS, &stx);
+        if (@as(isize, @bitCast(rc)) < 0) return error.StatFailed;
+        return .{
+            .size = stx.size,
+            .is_regular = (@as(u32, stx.mode) & S_IFMT) == S_IFREG,
+        };
+    }
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &st) != 0 or st.size < 0) return error.StatFailed;
+    return .{
+        .size = @intCast(st.size),
+        .is_regular = (@as(u32, @intCast(st.mode)) & S_IFMT) == S_IFREG,
+    };
+}
+
+/// 禁止 fd 穿过后续 exec 边界。POSIX 用 FD_CLOEXEC；Windows 清底层 HANDLE 的
+/// HANDLE_FLAG_INHERIT，避免 bInheritHandles=TRUE 的工具子进程拿到可信 artifact fd。
+pub fn makeCloseOnExec(fd: Fd) error{CloseOnExecFailed}!void {
+    if (is_windows) {
+        const raw = _get_osfhandle(fd);
+        if (raw == -1) return error.CloseOnExecFailed;
+        if (SetHandleInformation(@ptrFromInt(@as(usize, @bitCast(raw))), HANDLE_FLAG_INHERIT, 0) == 0)
+            return error.CloseOnExecFailed;
+        return;
+    }
+    const current = std.c.fcntl(fd, std.c.F.GETFD);
+    if (current < 0 or std.c.fcntl(fd, std.c.F.SETFD, current | std.c.FD_CLOEXEC) < 0)
+        return error.CloseOnExecFailed;
+}
+
+const Stat64 = extern struct {
+    st_dev: u32,
+    st_ino: u16,
+    st_mode: u16,
+    st_nlink: i16,
+    st_uid: i16,
+    st_gid: i16,
+    st_rdev: u32,
+    st_size: i64,
+    st_atime: i64,
+    st_mtime: i64,
+    st_ctime: i64,
+};
+extern "c" fn _fstat64(fd: c_int, buf: *Stat64) c_int;
+extern "c" fn _get_osfhandle(fd: c_int) isize;
+const HANDLE_FLAG_INHERIT: u32 = 0x1;
+extern "kernel32" fn SetHandleInformation(handle: *anyopaque, mask: u32, flags: u32) callconv(.winapi) c_int;
 
 /// `open` 的 error-union 包装:收编全仓 `std.posix.openat(AT.FDCWD, …) catch/try` 样板
 /// (std.posix.openat 在 Windows 无 AT.FDCWD、返回 HANDLE 而非 c_int fd)。语义等价:失败

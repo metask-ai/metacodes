@@ -96,6 +96,7 @@ pub const headless_backend = @import("core/headless_backend.zig"); // CoreEvent 
 pub const suspend_state = @import("core/suspend_state.zig");
 pub const tee_backend = @import("core/tee_backend.zig"); // L4:多路转发 decorator
 pub const diagnostics_backend = @import("core/diagnostics_backend.zig"); // L4:诊断 trace 后端
+pub const evaluation_backend = @import("core/evaluation_backend.zig"); // V1:稳定评估事件投影
 
 // ── 工具库 ───────────────────────────────────────────────────────────────
 pub const util_abort = @import("util/abort.zig"); // AbortSignal

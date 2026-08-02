@@ -147,7 +147,9 @@ pub const SessionService = struct {
     }
 
     pub fn setReasoningEffort(self: *SessionService, effort: types.ReasoningEffort) CommandOutcome {
-        self.app.setReasoningEffort(effort);
+        self.app.setReasoningEffort(effort) catch |e| {
+            return .{ .kind = .err, .ok = false, .data = .{ .err_name = @errorName(e) } };
+        };
         return .{ .kind = .reasoning_changed, .ok = true, .data = .{ .text = effort.name() } };
     }
 

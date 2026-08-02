@@ -234,6 +234,47 @@ pub const ToolExecutionPolicy = struct {
     }
 };
 
+/// Name-level execution ceiling backed by the exact tool definitions selected
+/// for a child agent.  AgentDef filtering must constrain execution as well as
+/// provider-visible schemas: the child still shares the process DynRegistry,
+/// so schema filtering alone would let a guessed MCP tool name escape the
+/// allowlist.
+///
+/// `parent` is optional and is useful for synchronous nesting.  The selected
+/// definition set is always checked first, so no child can re-authorize a tool
+/// that AgentDef removed.
+pub const ToolSetExecutionPolicy = struct {
+    definitions: []const ToolDefinition,
+    parent: ?ToolExecutionPolicy = null,
+
+    pub fn executionPolicy(self: *const ToolSetExecutionPolicy) ToolExecutionPolicy {
+        return .{
+            .ctx = @ptrCast(self),
+            .allowsToolFn = allowsToolAdapter,
+            .allowsInvocationFn = allowsInvocationAdapter,
+        };
+    }
+
+    fn contains(self: *const ToolSetExecutionPolicy, name: []const u8) bool {
+        for (self.definitions) |definition| {
+            if (std.mem.eql(u8, definition.name, name)) return true;
+        }
+        return false;
+    }
+
+    fn allowsToolAdapter(raw: *const anyopaque, name: []const u8) bool {
+        const self: *const ToolSetExecutionPolicy = @ptrCast(@alignCast(raw));
+        if (!self.contains(name)) return false;
+        return if (self.parent) |parent| parent.allowsTool(name) else true;
+    }
+
+    fn allowsInvocationAdapter(raw: *const anyopaque, name: []const u8, arguments_json: []const u8) bool {
+        const self: *const ToolSetExecutionPolicy = @ptrCast(@alignCast(raw));
+        if (!self.contains(name)) return false;
+        return if (self.parent) |parent| parent.allowsInvocation(name, arguments_json) else true;
+    }
+};
+
 pub const ToolContext = struct {
     allocator: std.mem.Allocator,
     abort: ?*const AbortSignal = null,

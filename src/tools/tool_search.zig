@@ -35,6 +35,9 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         while (it.next()) |raw| {
             const name = std.mem.trim(u8, raw, " \t");
             if (name.len == 0) continue;
+            if (ctx.execution_policy) |policy| {
+                if (!policy.allowsTool(name)) continue;
+            }
             if (tools.getTool(name) != null) {
                 try matched.append(allocator, name);
             } else if (ctx.dyn_registry) |dr| {
@@ -45,12 +48,18 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         // 关键字匹配:扫 deferred 工具(静态 deferred + dyn/MCP deferred)的 name/description。
         for (tools.registry) |*t| {
             if (!t.deferred) continue;
+            if (ctx.execution_policy) |policy| {
+                if (!policy.allowsTool(t.name)) continue;
+            }
             if (matched.items.len >= max_results) break;
             if (matchesKeywords(query, t.name, t.description)) try matched.append(allocator, t.name);
         }
         if (ctx.dyn_registry) |dr| {
             for (dr.entries.items) |*e| {
                 if (!e.deferred) continue;
+                if (ctx.execution_policy) |policy| {
+                    if (!policy.allowsTool(e.name)) continue;
+                }
                 if (matched.items.len >= max_results) break;
                 if (matchesKeywords(query, e.name, e.description)) try matched.append(allocator, e.name);
             }

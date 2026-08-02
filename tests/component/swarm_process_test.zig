@@ -135,8 +135,16 @@ test "L2 SW6 B: worktree 隔离 create + remove(真 git)" {
     var rb: [256:0]u8 = undefined;
     const rp = try std.fmt.bufPrintZ(&rb, "{s}/README", .{wt});
     try std.testing.expect(cc.platform_fs.exists(rp.ptr));
-    // removeWorktree → 目录清。
-    tp.removeWorktree(a, wt, root, null);
+    // 锁定 worktree 会让单 --force 删除失败。严格 API 必须传播失败且
+    // 保留磁盘事实，不能像旧 best-effort wrapper 一样虚报已清理。
+    try std.testing.expect(runGit(a, root, &.{ "worktree", "lock", wt }));
+    try std.testing.expectError(
+        error.WorktreeRemoveFailed,
+        tp.removeWorktreeStrict(a, wt, root, null),
+    );
+    try std.testing.expect(cc.platform_fs.exists(rp.ptr));
+    try std.testing.expect(runGit(a, root, &.{ "worktree", "unlock", wt }));
+    try tp.removeWorktreeStrict(a, wt, root, null);
     try std.testing.expect(!cc.platform_fs.exists(rp.ptr));
 }
 

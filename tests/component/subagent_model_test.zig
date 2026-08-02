@@ -99,7 +99,7 @@ test "L2 GAP: subagent 期望用 haiku 但当前用父 model" {
     if (std.mem.indexOf(u8, model_field, "haiku") == null) {
         std.debug.print(
             "[KNOWN GAP] subagent 应用 haiku,但请求 body.model 是 {s}\n" ++
-            "→ Phase 2 修接线后,把本测试的 SkipZigTest 改为 try testing.expect。\n",
+                "→ Phase 2 修接线后,把本测试的 SkipZigTest 改为 try testing.expect。\n",
             .{model_field},
         );
         return error.SkipZigTest;
@@ -191,7 +191,13 @@ test "L2: spawnAgent(tool_defs_override) → 请求体 tools 收窄" {
     };
 
     var result = cc.core_subagent.spawnAgent(
-        a, client.provider(), &client, empty, &perm_ctx, null, "hi",
+        a,
+        client.provider(),
+        &client,
+        empty,
+        &perm_ctx,
+        null,
+        "hi",
         .{ .max_turns = 2, .tool_defs_override = &override },
     ) catch return error.SkipZigTest;
     defer result.deinit();
@@ -223,7 +229,13 @@ test "L2: spawnAgent(permission_mode_override=plan) 生效" {
     const perm_ctx = cc.permission.PermissionContext{ .mode = .init(.bypass_permissions), .allocator = a };
     const empty: []const cc.json_mod.ToolDefinition = &.{};
     var result = cc.core_subagent.spawnAgent(
-        a, client.provider(), &client, empty, &perm_ctx, null, "hi",
+        a,
+        client.provider(),
+        &client,
+        empty,
+        &perm_ctx,
+        null,
+        "hi",
         .{ .max_turns = 2, .permission_mode_override = .plan },
     ) catch return error.SkipZigTest;
     defer result.deinit();
@@ -269,6 +281,8 @@ test "L2 #12: 父 sandbox 透传到 subagent(ctx.sandbox 到达子 agent 工具)
     var probe_reg = cc.tools_dynamic.DynRegistry.init(a);
     defer probe_reg.deinit();
     try probe_reg.register("SbxProbe", "records ctx.sandbox", &.{}, sbxProbe, null, false);
+    const probe_defs = try cc.tools.toToolDefinitionsFull(a, &probe_reg, null);
+    defer a.free(probe_defs);
 
     var sbx = cc.sandbox_config.SandboxSettings{ .enabled = true, .allocator = a };
     defer sbx.deinit();
@@ -276,7 +290,7 @@ test "L2 #12: 父 sandbox 透传到 subagent(ctx.sandbox 到达子 agent 工具)
     const ctx = cc.tool_context.ToolContext{
         .allocator = a,
         .api_client = &client,
-        .tool_defs = &.{},
+        .tool_defs = probe_defs,
         .permission_ctx = @constCast(&perm),
         .agents = &agents,
         .dyn_registry = &probe_reg,
@@ -319,6 +333,8 @@ test "L2 #12(Linus review): 后台 subagent 也继承父 sandbox(run_in_backgrou
     var probe_reg = cc.tools_dynamic.DynRegistry.init(a);
     defer probe_reg.deinit();
     try probe_reg.register("SbxProbe", "records ctx.sandbox", &.{}, sbxProbe, null, false);
+    const probe_defs = try cc.tools.toToolDefinitionsFull(a, &probe_reg, null);
+    defer a.free(probe_defs);
 
     var sbx = cc.sandbox_config.SandboxSettings{ .enabled = true, .allocator = a };
     defer sbx.deinit();
@@ -330,7 +346,7 @@ test "L2 #12(Linus review): 后台 subagent 也继承父 sandbox(run_in_backgrou
     const ctx = cc.tool_context.ToolContext{
         .allocator = a,
         .api_client = &client,
-        .tool_defs = &.{},
+        .tool_defs = probe_defs,
         .permission_ctx = @constCast(&perm),
         .agents = &agents,
         .dyn_registry = &probe_reg,

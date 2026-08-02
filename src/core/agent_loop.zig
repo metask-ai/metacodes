@@ -799,6 +799,7 @@ pub fn run(
         };
 
         request_recovery: while (true) {
+            const model_request_started_ns = util_time.nowNs();
             var stream: api_stream.StreamHandle = undefined;
             var api_messages = try buildApiMessages(conversation, allocator, opts.inject_user_context, synthetic_user_input);
             defer freeApiMessages(&api_messages, allocator);
@@ -824,31 +825,41 @@ pub fn run(
                 0, // base_ms=0 → 用默认 RETRY_BASE_MS(500)
                 reporter,
                 latestUserText(conversation), // web_search 显示用:用户原话(P1:作请求参数传, 不再 post-set)
-            ) catch |err| switch (err) {
-                error.ContextWindowExceeded => {
-                    if (!recoverContextWindowExceeded(
-                        conversation,
-                        provider,
-                        effective_system_prompt,
-                        opts.inject_user_context,
-                        synthetic_user_input,
-                        gated_tool_defs,
-                        opts.model_override,
-                        backend,
-                        sess,
-                        &context_recovery_attempts,
-                        context_recovery_cap,
-                        turns + 1,
-                        allocator,
-                    )) {
+            ) catch |err| {
+                backend.emitEvent(sess, .{ .diag_model_request = .{
+                    .trace_id = trace_id,
+                    .depth = depth,
+                    .turn = turns + 1,
+                    .attempt = @intCast(@min(context_recovery_attempts, std.math.maxInt(u32))),
+                    .elapsed_ms = elapsedSinceNs(model_request_started_ns),
+                    .outcome = if (err == error.ContextWindowExceeded) "context_window_exceeded" else "api_error",
+                } });
+                switch (err) {
+                    error.ContextWindowExceeded => {
+                        if (!recoverContextWindowExceeded(
+                            conversation,
+                            provider,
+                            effective_system_prompt,
+                            opts.inject_user_context,
+                            synthetic_user_input,
+                            gated_tool_defs,
+                            opts.model_override,
+                            backend,
+                            sess,
+                            &context_recovery_attempts,
+                            context_recovery_cap,
+                            turns + 1,
+                            allocator,
+                        )) {
+                            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
+                        }
+                        continue :request_recovery;
+                    },
+                    else => |e| {
+                        log.err("agent", "sendMessageStream failed turn={d}: {s}", .{ turns + 1, @errorName(e) });
                         return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
-                    }
-                    continue :request_recovery;
-                },
-                else => |e| {
-                    log.err("agent", "sendMessageStream failed turn={d}: {s}", .{ turns + 1, @errorName(e) });
-                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
-                },
+                    },
+                }
             };
             defer stream.deinit();
 
@@ -958,6 +969,21 @@ pub fn run(
                     .done => {},
                 }
             }
+            backend.emitEvent(sess, .{ .diag_model_request = .{
+                .trace_id = trace_id,
+                .depth = depth,
+                .turn = turns + 1,
+                .attempt = @intCast(@min(context_recovery_attempts, std.math.maxInt(u32))),
+                .elapsed_ms = elapsedSinceNs(model_request_started_ns),
+                .outcome = if (aborted_during_stream)
+                    "aborted"
+                else if (stream_context_window_exceeded)
+                    "context_window_exceeded"
+                else if (stream_error)
+                    "stream_error"
+                else
+                    "success",
+            } });
             // 闭颜色括号 + 尾换行由 backend 决定(colorize ? "\x1b[0m\n" : "\n")。
             backend.emitEvent(sess, .stream_done);
 
@@ -1094,6 +1120,7 @@ pub fn run(
 
         // 6. 执行所有 tool_use，把结果作为 user-role 的 tool_result block 追加。
         //    批1:权限检查主线程串行,执行按 isConcurrencySafe 分批并发(tool_exec.zig)。
+        const tool_stage_started_ns = util_time.nowNs();
         var result_blocks = std.ArrayList(msg.Block).empty;
         errdefer {
             for (result_blocks.items) |b| b.deinit(allocator);
@@ -1140,6 +1167,15 @@ pub fn run(
                 }
                 if (pre.decision == .block) {
                     log.warnId("permission", rid, "PreToolUse hook blocked tool={s}", .{tu.name});
+                    backend.emitEvent(sess, .{ .policy_decision = .{
+                        .trace_id = trace_id,
+                        .depth = depth,
+                        .id = tu.id,
+                        .tool = tu.name,
+                        .decision = "deny",
+                        .source = "pre_tool_use_hook",
+                        .allowed = false,
+                    } });
                     var dslot = tool_exec.Slot{ .decision = .denied, .name = tu.name, .id = tu.id, .input = eff_input };
                     dslot.content = try tool_error.errorToJson("PreToolUseBlocked", "tool '{s}' blocked by PreToolUse hook", .{tu.name}, allocator);
                     dslot.is_error = true;
@@ -1150,6 +1186,7 @@ pub fn run(
             const perm_result = permission_mod.checkPermission(&pc_nohooks, tu.name, eff_input);
             log.infoId("permission", rid, "tool={s} decision={s}", .{ tu.name, @tagName(perm_result) });
             var slot = tool_exec.Slot{ .decision = .run, .name = tu.name, .id = tu.id, .input = eff_input };
+            var policy_allowed = perm_result == .allow;
             switch (perm_result) {
                 .deny => {
                     log.warnId("permission", rid, "DENY tool={s} input={s}", .{ tu.name, tu.input });
@@ -1161,6 +1198,7 @@ pub fn run(
                     // ctx constCast:promptUser 写 session 记忆(有副作用)。同 plan_mode 分支
                     // 的 @constCast 先例——agent_loop 持 *const 但权限交互本就改 per-session 状态。
                     const allowed = permission_mod.promptUser(@constCast(permission_ctx), tu.name, eff_input) catch false;
+                    policy_allowed = allowed;
                     log.infoId("permission", rid, "prompt tool={s} user_allowed={}", .{ tu.name, allowed });
                     if (!allowed) {
                         slot.decision = .denied;
@@ -1170,7 +1208,37 @@ pub fn run(
                 },
                 .allow => {},
             }
+            backend.emitEvent(sess, .{ .policy_decision = .{
+                .trace_id = trace_id,
+                .depth = depth,
+                .id = tu.id,
+                .tool = tu.name,
+                .decision = @tagName(perm_result),
+                .source = if (perm_result == .ask) "user_prompt" else "permission_chain",
+                .allowed = policy_allowed,
+            } });
             try slots.append(allocator, slot);
+        }
+
+        // AgentDef/skill execution ceilings are a distinct, final policy
+        // layer.  executeOne remains the enforcing seam (and returns a paired
+        // tool_result), while this event makes a denial visible to native eval
+        // telemetry instead of looking like an unexplained tool failure.
+        if (opts.execution_policy) |execution_policy| {
+            for (slots.items) |*slot| {
+                if (slot.decision != .run or
+                    execution_policy.allowsInvocation(slot.name, slot.input)) continue;
+                log.warnId("permission", rid, "execution policy DENY tool={s}", .{slot.name});
+                backend.emitEvent(sess, .{ .policy_decision = .{
+                    .trace_id = trace_id,
+                    .depth = depth,
+                    .id = slot.id,
+                    .tool = slot.name,
+                    .decision = "deny",
+                    .source = "execution_policy",
+                    .allowed = false,
+                } });
+            }
         }
 
         // 6b. 构造一次 ToolContext(所有 tool 共用;并发 job 各自换独立 arena allocator)。
@@ -1265,7 +1333,9 @@ pub fn run(
         // 时 tool_render_theme=null → 不 emit(那些场景 WriterBackend 也 no-op)。
         if (opts.event_projection.emitToolStart(opts.emit_tool_cards, opts.agent_depth)) {
             for (slots.items) |*s| {
-                if (s.decision != .run) continue;
+                // Lifecycle represents the model's tool attempt, not proof of
+                // dispatch. Denied attempts still receive a paired result and
+                // must therefore receive a start event as well.
                 backend.emitEvent(sess, .{ .tool_start = .{ .id = s.id, .name = s.name, .input = s.input } });
             }
         }
@@ -1290,6 +1360,13 @@ pub fn run(
         // Host 工具 fatal → 直接上抛:不组装 tool_result(errdefer 释放 result_blocks,
         // slot payload 由上方 defer 回收),AgentSession.runLoop 捕获后 poisonRun。
         try tool_exec.executeSlots(slots.items, &base_ctx, allocator, rid);
+        backend.emitEvent(sess, .{ .diag_tool_stage = .{
+            .trace_id = trace_id,
+            .depth = depth,
+            .turn = turns + 1,
+            .tool_calls = @intCast(slots.items.len),
+            .elapsed_ms = elapsedSinceNs(tool_stage_started_ns),
+        } });
         if (opts.event_projection.emitToolStart(opts.emit_tool_cards, opts.agent_depth)) {
             // P2.1:只发 clear_current_tool 清运行态动态卡。**不再**为每个 slot 补发一条空 content
             // 的 tool_result——那是历史"双发",逼每个 backend 靠 content.len>0 去重(tui gate / web JS dedup /
@@ -1523,6 +1600,12 @@ pub fn run(
 
     // 循环正常退出 = turns >= max_turns
     return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .max_turns, .turns = turns, .tool_calls = total_tool_calls });
+}
+
+fn elapsedSinceNs(started_ns: util_time.Nanos) u64 {
+    const now = util_time.nowNs();
+    if (now <= started_ns) return 0;
+    return @intCast(@divTrunc(now - started_ns, std.time.ns_per_ms));
 }
 
 /// L3 恢复:把异步 UI 响应 + 同轮已完成工具的结果**一起**注入为单条 user 消息(满足 API 的

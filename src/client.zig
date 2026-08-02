@@ -191,6 +191,7 @@ pub const Client = struct {
             .maxTokensFn = &pMaxTokens,
             .maxInputTokensFn = &pMaxInputTokens,
             .reasoningEffortFn = &pReasoningEffort,
+            .setReasoningEffortFn = &pSetReasoningEffort,
             .supportsFn = &pSupports,
         };
     }
@@ -232,6 +233,9 @@ pub const Client = struct {
     }
     fn pReasoningEffort(ctx: *anyopaque) ?types.ReasoningEffort {
         return asClient(ctx).reasoning_effort;
+    }
+    fn pSetReasoningEffort(ctx: *anyopaque, effort: ?types.ReasoningEffort) void {
+        asClient(ctx).reasoning_effort = effort;
     }
     fn pSupports(ctx: *anyopaque, cap: provider_mod.Capability) bool {
         // P2:走 capability 表(单一真相源),按当前 model 真判, 不再恒 true stub。
@@ -479,15 +483,13 @@ pub const Client = struct {
         const rid = log.genRequestId();
         const t_start = timestampMs();
 
-        // token preview：前 6 + 后 4 字符，中间打码。日志不能全量打 token。
-        var tok_prev_buf: [24]u8 = undefined;
-        const tok_preview = tokenPreview(client.api_key, &tok_prev_buf);
-        log.infoId("client", rid, "POST {s} model={s} streaming={} token={s} body_bytes={d}", .{
+        // 凭据及其任何片段都不得进入日志/eval artifact。
+        log.infoId("client", rid, "POST {s} model={s} streaming={} body_bytes={d} reasoning_effort={s}", .{
             client.base_url,
             client.model,
             streaming,
-            tok_preview,
             body.len,
+            if (client.reasoning_effort) |effort| effort.name() else "default",
         });
         log.debugId("client", rid, "request body:\n{s}", .{body});
 
@@ -675,23 +677,6 @@ fn logErrorBody(
 const ErrorBodyInfo = struct {
     context_window_exceeded: bool = false,
 };
-
-/// Token 打码：只露前 6 + 后 4 字符（常见格式 `sk-xxxxxxxx...yyyy`）。
-/// 过短的 token 直接打 "<short:N>"。out buf 至少 24 字节。
-fn tokenPreview(token: []const u8, out: []u8) []const u8 {
-    if (token.len < 12) {
-        return std.fmt.bufPrint(out, "<short:{d}>", .{token.len}) catch "<?>";
-    }
-    const head = token[0..6];
-    const tail = token[token.len - 4 ..];
-    return std.fmt.bufPrint(out, "{s}...{s}", .{ head, tail }) catch "<?>";
-}
-
-test "tokenPreview masks middle" {
-    var buf: [24]u8 = undefined;
-    try std.testing.expectEqualStrings("sk-6cd...3711", tokenPreview("sk-test-redacted", &buf));
-    try std.testing.expectEqualStrings("<short:4>", tokenPreview("abcd", &buf));
-}
 
 /// API 响应（非流式）
 // ApiResponse/ToolCallResult 下沉到中立层 api/stream.zig(多 Provider 重构);此处 re-export 保持兼容。

@@ -57,6 +57,8 @@ pub const SpawnOptions = struct {
     /// per-spawn model 覆盖(用 AgentDef.model 解析后的具体 model 名;"inherit" 父端
     /// 自己已经解析过,这里只接受具体 model 名或 null)。
     model_override: ?[]const u8 = null,
+    /// AgentDef.effort override。Anthropic client 在本 isolated run 期间临时覆盖，结束恢复。
+    reasoning_effort_override: ?@import("../types.zig").ReasoningEffort = null,
     /// 父 dispatch 传过来的宿主能力(L5)。subagent 通常只用 skill 激活(调用方传 skillOnly 投影);
     /// 见 HostServices.skillOnly。
     host_services: ?@import("../tools/context.zig").HostServices = null,
@@ -96,6 +98,8 @@ pub const SpawnOptions = struct {
     resolve_relative_paths: bool = false,
     home_dir: []const u8 = "",
     additional_dirs: []const []const u8 = &.{},
+    /// AgentDef.mcpServers 过滤后的 session 视图。
+    mcp_sessions: ?*const []@import("mcp_session.zig").McpSessionEntry = null,
 };
 
 pub fn spawnAgent(
@@ -126,6 +130,16 @@ pub fn spawnAgentSink(
     opts: SpawnOptions,
     backend: *const ui_backend.UiBackend,
 ) !SubagentResult {
+    // Effort is a Provider capability, not an Anthropic implementation detail. Restore the
+    // previous value so a scoped AgentDef override never leaks into its parent session.
+    const saved_effort = prov.reasoningEffort();
+    if (opts.reasoning_effort_override) |effort| {
+        try prov.setReasoningEffort(effort);
+    }
+    defer if (opts.reasoning_effort_override != null) {
+        prov.setReasoningEffort(saved_effort) catch unreachable;
+    };
+
     // 预建对话(Ctrl+B 转后台续跑)→ 用它(所有权转移,本函数 defer deinit);否则从 prompt 起新对话。
     var conv = if (opts.prebuilt_conversation) |pc| pc else blk: {
         var c = Conversation.init(allocator);
@@ -192,6 +206,7 @@ pub fn spawnAgentSink(
             .resolve_relative_paths = opts.resolve_relative_paths,
             .home_dir = opts.home_dir,
             .additional_dirs = opts.additional_dirs,
+            .mcp_sessions = opts.mcp_sessions,
         },
         backend,
         allocator,

@@ -15,13 +15,17 @@
 //!     "stop_reason":"..."?,"turns":N?,"tool_calls":N?,
 //!     "error":"<err_name>"? }
 //!
-//! 增量轮询:模型下次传 since_byte = 上次 output_total_bytes。truncated=true 表示还有。
+//! 增量轮询:模型下次传 since_byte = 上次 output_total_bytes。无新输出时最长等待 30s；
+//! terminal/output change 会立即唤醒。truncated=true 表示还有。
 
 const std = @import("std");
 const common = @import("common.zig");
 const ToolContext = @import("context.zig").ToolContext;
+const util_time = @import("../util/time.zig");
 
 const DEFAULT_MAX_BYTES: usize = 64 * 1024;
+const LONG_POLL_MS: i64 = 30_000;
+const ABORT_SLICE_MS: i64 = 250;
 
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
@@ -33,10 +37,23 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
 
     const reg = ctx.agent_jobs orelse return error.AgentJobsUnavailable;
-    const e = reg.get(id) orelse return error.JobNotFound;
+    const e = reg.getBackground(id) orelse return error.JobNotFound;
 
-    const since = parseUsizeArg(args, "since_byte") orelse 0;
+    const since_arg = parseUsizeArg(args, "since_byte");
+    const since = since_arg orelse 0;
     const max_bytes = parseUsizeArg(args, "max_bytes") orelse DEFAULT_MAX_BYTES;
+
+    // A status read with no unseen output is a long-poll, not a zero-wait
+    // snapshot. Otherwise a fast model can issue three identical TaskOutput
+    // calls before the background thread gets scheduled and trip the generic
+    // zero-gain breaker even though the job is making progress.
+    const deadline = util_time.nowMs() + LONG_POLL_MS;
+    while (util_time.nowMs() < deadline) {
+        try ctx.throwIfAborted();
+        const remaining = deadline - util_time.nowMs();
+        const wait_ms: u64 = @intCast(@min(remaining, ABORT_SLICE_MS));
+        if (e.waitForOutputOrTerminal(since_arg, wait_ms * std.time.ns_per_ms)) break;
+    }
 
     // 持 entry 锁:把要序列化的内容拷到本地,unlock 后再拼 JSON(锁内不做大分配)。
     var snap = Snapshot{};
@@ -61,6 +78,9 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         snap.tool_calls = e.tool_calls;
         snap.err_name = e.err_name;
         if (e.final_text) |ft| snap.final_text = try allocator.dupe(u8, ft);
+        if (e.worktree_path.len > 0) snap.worktree_path = try allocator.dupe(u8, e.worktree_path);
+        snap.worktree_kept = e.worktree_kept;
+        snap.worktree_cleanup_complete = e.worktree_cleanup_complete;
     }
 
     var aw: std.Io.Writer.Allocating = .init(allocator);
@@ -85,6 +105,16 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         try aw.writer.writeAll(",\"error\":");
         try std.json.Stringify.encodeJsonString(en, .{}, &aw.writer);
     }
+    if (snap.worktree_path) |path| {
+        try aw.writer.writeAll(",\"worktree_path\":");
+        try std.json.Stringify.encodeJsonString(path, .{}, &aw.writer);
+        if (snap.worktree_kept) |kept| {
+            try aw.writer.print(",\"worktree_kept\":{s}", .{if (kept) "true" else "false"});
+        }
+        if (snap.worktree_cleanup_complete) |complete| {
+            try aw.writer.print(",\"worktree_cleanup_complete\":{s}", .{if (complete) "true" else "false"});
+        }
+    }
     try aw.writer.writeAll("}");
     return try aw.toOwnedSlice();
 }
@@ -99,10 +129,14 @@ const Snapshot = struct {
     turns: u32 = 0,
     tool_calls: u32 = 0,
     err_name: ?[]const u8 = null,
+    worktree_path: ?[]const u8 = null,
+    worktree_kept: ?bool = null,
+    worktree_cleanup_complete: ?bool = null,
 
     fn deinit(self: *Snapshot, allocator: std.mem.Allocator) void {
         if (self.output.len > 0) allocator.free(@constCast(self.output));
         if (self.final_text) |ft| allocator.free(@constCast(ft));
+        if (self.worktree_path) |path| allocator.free(@constCast(path));
     }
 };
 

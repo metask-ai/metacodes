@@ -28,6 +28,8 @@ pub const DynToolEntry = struct {
     /// deferred(对齐 cc isMcp→defer):MCP 工具 true → 不进默认 tools 数组,经 ToolSearch
     /// 激活才发。Skill 工具 false(它是单个常驻工具)。
     deferred: bool = false,
+    /// owned when non-null; explicit provenance for AgentDef MCP filtering.
+    mcp_server: ?[]const u8 = null,
 };
 
 pub const DynRegistry = struct {
@@ -39,13 +41,26 @@ pub const DynRegistry = struct {
     }
 
     pub fn deinit(self: *DynRegistry) void {
-        for (self.entries.items) |e| {
-            self.allocator.free(e.name);
-            self.allocator.free(e.description);
-            for (e.required_fields) |f| self.allocator.free(f);
-            self.allocator.free(e.required_fields);
-        }
+        for (self.entries.items) |e| self.freeEntry(e);
         self.entries.deinit(self.allocator);
+    }
+
+    fn freeEntry(self: *DynRegistry, e: DynToolEntry) void {
+        self.allocator.free(e.name);
+        self.allocator.free(e.description);
+        if (e.mcp_server) |server| self.allocator.free(server);
+        for (e.required_fields) |f| self.allocator.free(f);
+        self.allocator.free(e.required_fields);
+    }
+
+    /// Transaction checkpoint support for multi-tool registrars such as MCP.
+    /// Entries at and after `checkpoint` are owned by this registry and are
+    /// fully destroyed. This prevents a failed registration batch from
+    /// leaving callable definitions whose ctx_ptr ownership was rolled back.
+    pub fn rollbackTo(self: *DynRegistry, checkpoint: usize) void {
+        std.debug.assert(checkpoint <= self.entries.items.len);
+        for (self.entries.items[checkpoint..]) |e| self.freeEntry(e);
+        self.entries.shrinkRetainingCapacity(checkpoint);
     }
 
     /// 注册（转移字符串所有权）。name 不能与已有冲突。
@@ -59,6 +74,32 @@ pub const DynRegistry = struct {
         ctx_ptr: ?*anyopaque,
         deferred: bool,
     ) !void {
+        return self.registerImpl(name, description, required_fields, execute, ctx_ptr, deferred, null);
+    }
+
+    pub fn registerMcp(
+        self: *DynRegistry,
+        name: []const u8,
+        description: []const u8,
+        required_fields: []const []const u8,
+        execute: DynExecuteFn,
+        ctx_ptr: ?*anyopaque,
+        server_name: []const u8,
+    ) !void {
+        if (server_name.len == 0) return error.InvalidMcpServerName;
+        return self.registerImpl(name, description, required_fields, execute, ctx_ptr, true, server_name);
+    }
+
+    fn registerImpl(
+        self: *DynRegistry,
+        name: []const u8,
+        description: []const u8,
+        required_fields: []const []const u8,
+        execute: DynExecuteFn,
+        ctx_ptr: ?*anyopaque,
+        deferred: bool,
+        mcp_server: ?[]const u8,
+    ) !void {
         for (self.entries.items) |e| {
             if (std.mem.eql(u8, e.name, name)) return error.ToolAlreadyRegistered;
         }
@@ -66,6 +107,8 @@ pub const DynRegistry = struct {
         errdefer self.allocator.free(name_owned);
         const desc_owned = try self.allocator.dupe(u8, description);
         errdefer self.allocator.free(desc_owned);
+        const server_owned = if (mcp_server) |server| try self.allocator.dupe(u8, server) else null;
+        errdefer if (server_owned) |server| self.allocator.free(server);
 
         var req_owned = try self.allocator.alloc([]const u8, required_fields.len);
         errdefer self.allocator.free(req_owned);
@@ -82,6 +125,7 @@ pub const DynRegistry = struct {
             .execute = execute,
             .ctx_ptr = ctx_ptr,
             .deferred = deferred,
+            .mcp_server = server_owned,
         });
     }
 
@@ -109,6 +153,7 @@ pub const DynRegistry = struct {
                     .required = e.required_fields,
                 },
                 .deferred = e.deferred,
+                .mcp_server = e.mcp_server,
             });
         }
     }
@@ -158,6 +203,24 @@ test "DynRegistry: appendDefinitions appends" {
     try r.appendDefinitions(&defs, testing.allocator);
     try testing.expect(defs.items.len == 2);
     try testing.expectEqualStrings("t1", defs.items[0].name);
+}
+
+test "DynRegistry: MCP provenance is owned and propagated" {
+    var r = DynRegistry.init(testing.allocator);
+    defer r.deinit();
+    var server_buf = [_]u8{ 'a', 'l', 'l', 'o', 'w', 'e', 'd' };
+    try r.registerMcp("allowed__probe", "probe", &.{}, dummyExec, null, &server_buf);
+    server_buf[0] = 'X';
+
+    const entry = r.find("allowed__probe").?;
+    try testing.expectEqualStrings("allowed", entry.mcp_server.?);
+    try testing.expect(entry.deferred);
+
+    var defs = std.ArrayList(json.ToolDefinition).empty;
+    defer defs.deinit(testing.allocator);
+    try r.appendDefinitions(&defs, testing.allocator);
+    try testing.expectEqual(@as(usize, 1), defs.items.len);
+    try testing.expectEqualStrings("allowed", defs.items[0].mcp_server.?);
 }
 
 test "DynRegistry: execute dispatches to fn" {

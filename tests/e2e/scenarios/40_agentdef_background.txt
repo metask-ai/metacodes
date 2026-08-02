@@ -1,0 +1,3 @@
+使用 Task 工具调用 release-background agent，不要传 run_in_background。让子 agent 用 Write 创建 background-child.txt，内容必须包含 BACKGROUND_CHILD_DONE。记录 Task 返回的 agent_job_id。如果 Task 没有返回 agent_job_id，说明 background 配置未生效：立即如实结束，不要用 Bash、Grep、Read、ToolSearch 或源码探索补救，也不要伪造 proof 文件。
+---
+使用 TaskOutput 等待该 agent_job_id 到达 completed 终态（如果尚未完成就继续阻塞等待）。确认子任务完成后，用 Write 创建 background-proof.txt，写入 BACKGROUND_TERMINAL_COMPLETED 和最终 status。不要省略 TaskOutput。

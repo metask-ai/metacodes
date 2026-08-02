@@ -5,6 +5,7 @@
 //! 关键:**身份只看 frontmatter `name` 字段**,文件名/子目录路径仅控制位置发现,不影响调用名。
 
 const std = @import("std");
+const types = @import("../types.zig");
 
 pub const PermissionMode = enum {
     /// 与官方 default 对齐:细粒度 ask
@@ -24,6 +25,8 @@ pub const PermissionMode = enum {
 pub const Color = enum { default, red, blue, green, yellow, purple, orange, pink, cyan };
 
 pub const MemoryScope = enum { none, user, project, local };
+
+pub const Isolation = enum { none, worktree };
 
 pub const Origin = enum {
     builtin, // Explore/Plan/general-purpose
@@ -58,10 +61,10 @@ pub const AgentDef = struct {
     memory_scope: MemoryScope,
     /// 总在后台跑
     background: bool,
-    /// effort 等级("low"/"medium"/"high"/"xhigh"/"max",空 = inherit)
-    effort: []const u8,
-    /// isolation: 空 / "worktree"
-    isolation: []const u8,
+    /// effort 等级。null = inherit；非法字符串在解析期拒绝，不能静默存入 struct。
+    effort: ?types.ReasoningEffort,
+    /// isolation。用 enum 让未知模式不可表示。
+    isolation: Isolation,
     /// 颜色
     color: Color,
     /// 启动时自动作为第一条 user 消息(--agent 启动主线时用)
@@ -84,8 +87,6 @@ pub const AgentDef = struct {
         allocator.free(self.preload_skills);
         for (self.mcp_servers) |s| allocator.free(s);
         allocator.free(self.mcp_servers);
-        allocator.free(self.effort);
-        allocator.free(self.isolation);
         allocator.free(self.initial_prompt);
         allocator.free(self.source_path);
     }
@@ -104,8 +105,8 @@ pub fn parseAgentMd(allocator: std.mem.Allocator, md: []const u8, source_path: [
     var mcp_raw: []const u8 = "";
     var memory_str: []const u8 = "";
     var background = false;
-    var effort_str: []const u8 = "";
-    var isolation_str: []const u8 = "";
+    var effort: ?types.ReasoningEffort = null;
+    var isolation: Isolation = .none;
     var color_str: []const u8 = "";
     var initial_prompt_str: []const u8 = "";
     var body: []const u8 = md;
@@ -137,7 +138,8 @@ pub fn parseAgentMd(allocator: std.mem.Allocator, md: []const u8, source_path: [
                 } else if (std.mem.eql(u8, key, "permissionMode") or std.mem.eql(u8, key, "permission_mode")) {
                     permission_mode_str = value;
                 } else if (std.mem.eql(u8, key, "maxTurns") or std.mem.eql(u8, key, "max_turns")) {
-                    max_turns = std.fmt.parseInt(u32, value, 10) catch 20;
+                    max_turns = std.fmt.parseInt(u32, value, 10) catch return error.InvalidAgentMaxTurns;
+                    if (max_turns == 0) return error.InvalidAgentMaxTurns;
                 } else if (std.mem.eql(u8, key, "skills")) {
                     skills_raw = value;
                 } else if (std.mem.eql(u8, key, "mcpServers") or std.mem.eql(u8, key, "mcp_servers")) {
@@ -145,11 +147,14 @@ pub fn parseAgentMd(allocator: std.mem.Allocator, md: []const u8, source_path: [
                 } else if (std.mem.eql(u8, key, "memory")) {
                     memory_str = value;
                 } else if (std.mem.eql(u8, key, "background")) {
-                    background = parseBool(value);
+                    background = parseBool(value) orelse return error.InvalidAgentBackground;
                 } else if (std.mem.eql(u8, key, "effort")) {
-                    effort_str = value;
+                    effort = types.ReasoningEffort.parse(value) orelse return error.InvalidAgentEffort;
                 } else if (std.mem.eql(u8, key, "isolation")) {
-                    isolation_str = value;
+                    isolation = if (std.mem.eql(u8, value, "worktree"))
+                        .worktree
+                    else
+                        return error.InvalidAgentIsolation;
                 } else if (std.mem.eql(u8, key, "color")) {
                     color_str = value;
                 } else if (std.mem.eql(u8, key, "initialPrompt") or std.mem.eql(u8, key, "initial_prompt")) {
@@ -163,6 +168,12 @@ pub fn parseAgentMd(allocator: std.mem.Allocator, md: []const u8, source_path: [
     }
 
     if (name.len == 0) return error.MissingAgentName;
+    // Validate all scalar enum-like fields before taking ownership of any
+    // slices. A malformed frontmatter entry must not leave a half-built
+    // AgentDef behind, and allocation failures below must unwind explicitly.
+    const permission_mode = try parsePermissionMode(permission_mode_str);
+    const memory_scope = try parseMemoryScope(memory_str);
+    const color = try parseColor(color_str);
 
     const tools = try parseStringList(allocator, tools_raw);
     errdefer freeStringList(allocator, tools);
@@ -173,35 +184,50 @@ pub fn parseAgentMd(allocator: std.mem.Allocator, md: []const u8, source_path: [
     const mcp_servers = try parseStringList(allocator, mcp_raw);
     errdefer freeStringList(allocator, mcp_servers);
 
+    const name_owned = try allocator.dupe(u8, name);
+    errdefer allocator.free(name_owned);
+    const description_owned = try allocator.dupe(u8, description);
+    errdefer allocator.free(description_owned);
+    const prompt_owned = try allocator.dupe(u8, body);
+    errdefer allocator.free(prompt_owned);
+    const model_owned = try allocator.dupe(u8, model_str);
+    errdefer allocator.free(model_owned);
+    const initial_prompt_owned = try allocator.dupe(u8, initial_prompt_str);
+    errdefer allocator.free(initial_prompt_owned);
+    const source_path_owned = try allocator.dupe(u8, source_path);
+    errdefer allocator.free(source_path_owned);
+
     return .{
-        .name = try allocator.dupe(u8, name),
-        .description = try allocator.dupe(u8, description),
-        .prompt = try allocator.dupe(u8, body),
+        .name = name_owned,
+        .description = description_owned,
+        .prompt = prompt_owned,
         .tools = tools,
         .disallowed_tools = disallowed_tools,
-        .model = try allocator.dupe(u8, model_str),
-        .permission_mode = parsePermissionMode(permission_mode_str),
+        .model = model_owned,
+        .permission_mode = permission_mode,
         .max_turns = max_turns,
         .preload_skills = skills,
         .mcp_servers = mcp_servers,
-        .memory_scope = parseMemoryScope(memory_str),
+        .memory_scope = memory_scope,
         .background = background,
-        .effort = try allocator.dupe(u8, effort_str),
-        .isolation = try allocator.dupe(u8, isolation_str),
-        .color = parseColor(color_str),
-        .initial_prompt = try allocator.dupe(u8, initial_prompt_str),
+        .effort = effort,
+        .isolation = isolation,
+        .color = color,
+        .initial_prompt = initial_prompt_owned,
         .origin = origin,
-        .source_path = try allocator.dupe(u8, source_path),
+        .source_path = source_path_owned,
     };
 }
 
 // ---- helpers ----
 
-fn parseBool(s: []const u8) bool {
-    return std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "yes") or std.mem.eql(u8, s, "1");
+fn parseBool(s: []const u8) ?bool {
+    if (std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "yes") or std.mem.eql(u8, s, "1")) return true;
+    if (std.mem.eql(u8, s, "false") or std.mem.eql(u8, s, "no") or std.mem.eql(u8, s, "0")) return false;
+    return null;
 }
 
-fn parsePermissionMode(s: []const u8) ?PermissionMode {
+fn parsePermissionMode(s: []const u8) !?PermissionMode {
     if (s.len == 0) return null;
     if (std.mem.eql(u8, s, "default")) return .default;
     if (std.mem.eql(u8, s, "acceptEdits")) return .acceptEdits;
@@ -209,17 +235,19 @@ fn parsePermissionMode(s: []const u8) ?PermissionMode {
     if (std.mem.eql(u8, s, "dontAsk")) return .dontAsk;
     if (std.mem.eql(u8, s, "bypassPermissions")) return .bypassPermissions;
     if (std.mem.eql(u8, s, "plan")) return .plan;
-    return null;
+    return error.InvalidAgentPermissionMode;
 }
 
-fn parseMemoryScope(s: []const u8) MemoryScope {
+fn parseMemoryScope(s: []const u8) !MemoryScope {
+    if (s.len == 0 or std.mem.eql(u8, s, "none")) return .none;
     if (std.mem.eql(u8, s, "user")) return .user;
     if (std.mem.eql(u8, s, "project")) return .project;
     if (std.mem.eql(u8, s, "local")) return .local;
-    return .none;
+    return error.InvalidAgentMemoryScope;
 }
 
-fn parseColor(s: []const u8) Color {
+fn parseColor(s: []const u8) !Color {
+    if (s.len == 0 or std.mem.eql(u8, s, "default")) return .default;
     if (std.mem.eql(u8, s, "red")) return .red;
     if (std.mem.eql(u8, s, "blue")) return .blue;
     if (std.mem.eql(u8, s, "green")) return .green;
@@ -228,7 +256,7 @@ fn parseColor(s: []const u8) Color {
     if (std.mem.eql(u8, s, "orange")) return .orange;
     if (std.mem.eql(u8, s, "pink")) return .pink;
     if (std.mem.eql(u8, s, "cyan")) return .cyan;
-    return .default;
+    return error.InvalidAgentColor;
 }
 
 /// 解析 `Read, Grep, Glob` / `Read Grep Glob` / `[Read, Grep]` 列表(同 skill 端实现)
@@ -254,10 +282,16 @@ pub fn parseStringList(allocator: std.mem.Allocator, raw: []const u8) ![]const [
                     var sp_it = std.mem.tokenizeAny(u8, seg, " \t");
                     while (sp_it.next()) |tok| {
                         const t = std.mem.trim(u8, tok, " \t");
-                        if (t.len > 0) try out.append(allocator, try allocator.dupe(u8, t));
+                        if (t.len > 0) {
+                            const owned = try allocator.dupe(u8, t);
+                            errdefer allocator.free(owned);
+                            try out.append(allocator, owned);
+                        }
                     }
                 } else {
-                    try out.append(allocator, try allocator.dupe(u8, seg));
+                    const owned = try allocator.dupe(u8, seg);
+                    errdefer allocator.free(owned);
+                    try out.append(allocator, owned);
                 }
             }
             start = i + 1;
@@ -352,8 +386,39 @@ test "parseAgentMd: model + permissionMode + maxTurns + background + color" {
     try testing.expectEqual(@as(u32, 5), d.max_turns);
     try testing.expect(d.background == true);
     try testing.expect(d.color == .cyan);
-    try testing.expectEqualStrings("high", d.effort);
-    try testing.expectEqualStrings("worktree", d.isolation);
+    try testing.expectEqual(types.ReasoningEffort.high, d.effort.?);
+    try testing.expectEqual(Isolation.worktree, d.isolation);
+}
+
+test "parseAgentMd: invalid effort and isolation are rejected" {
+    try testing.expectError(
+        error.InvalidAgentEffort,
+        parseAgentMd(testing.allocator, "---\nname: x\neffort: turbo\n---\nbody", "/x", .personal),
+    );
+    try testing.expectError(
+        error.InvalidAgentIsolation,
+        parseAgentMd(testing.allocator, "---\nname: x\nisolation: process\n---\nbody", "/x", .personal),
+    );
+    try testing.expectError(
+        error.InvalidAgentMemoryScope,
+        parseAgentMd(testing.allocator, "---\nname: x\nmemory: shared-ish\n---\nbody", "/x", .personal),
+    );
+    try testing.expectError(
+        error.InvalidAgentPermissionMode,
+        parseAgentMd(testing.allocator, "---\nname: x\npermissionMode: permissive\n---\nbody", "/x", .personal),
+    );
+    try testing.expectError(
+        error.InvalidAgentMaxTurns,
+        parseAgentMd(testing.allocator, "---\nname: x\nmaxTurns: zero\n---\nbody", "/x", .personal),
+    );
+    try testing.expectError(
+        error.InvalidAgentBackground,
+        parseAgentMd(testing.allocator, "---\nname: x\nbackground: sometimes\n---\nbody", "/x", .personal),
+    );
+    try testing.expectError(
+        error.InvalidAgentColor,
+        parseAgentMd(testing.allocator, "---\nname: x\ncolor: ultraviolet\n---\nbody", "/x", .personal),
+    );
 }
 
 test "parseAgentMd: skills + mcpServers + memory + initialPrompt" {

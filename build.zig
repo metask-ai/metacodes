@@ -751,6 +751,23 @@ pub fn build(b: *std.Build) void {
     if (tinykg_install_step) |s| test_run.step.dependOn(s);
     test_step.dependOn(&test_run.step);
 
+    // test:eval —— harness 评估控制面（suite/readiness/rollout/judgement/
+    // compare/gate）。纯 stdlib Python，确定性且不打模型；默认 test 也执行，避免
+    // 评估器自身漂移后继续给出看似可信的分数。
+    const eval_test_step = b.step("test:eval", "Test the harness evaluation framework");
+    const eval_python_exe = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    const eval_test_cmd = b.addSystemCommand(&.{
+        eval_python_exe,
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "scripts/eval/tests",
+        "-v",
+    });
+    eval_test_step.dependOn(&eval_test_cmd.step);
+    test_step.dependOn(&eval_test_cmd.step);
+
     // ------------------------------------------------------------------
     // Extra test step: spike / standalone harness files under tests/
     // Each file is compiled as an independent test artifact so main src
@@ -791,6 +808,7 @@ pub fn build(b: *std.Build) void {
         "tests/integration/skills_e2e_test.zig",
         "tests/integration/agents_e2e_test.zig",
         "tests/component/subagent_model_test.zig",
+        "tests/component/subagent_agentdef_fields_test.zig",
         "tests/component/web_search_test.zig",
         "tests/component/allowed_tools_test.zig",
         "tests/component/agent_session_tools_test.zig",
@@ -931,6 +949,7 @@ pub fn build(b: *std.Build) void {
     const new_step = b.step("test:new", "Run only the new e2e-framework L2 component tests");
     const new_files = [_][]const u8{
         "tests/component/user_context_inject_test.zig",
+        "tests/component/subagent_agentdef_fields_test.zig",
         "tests/component/agent_session_tools_test.zig",
         "tests/component/agent_session_host_tools_test.zig",
         "tests/component/agent_session_ui_test.zig",
@@ -998,6 +1017,26 @@ pub fn build(b: *std.Build) void {
             .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
         });
         new_step.dependOn(&addTestRunArtifact(b, t, windows_test_prelude).step);
+    }
+
+    // 五个 AgentDef 运行字段的聚焦门；开发时无需编译整套 component artifacts。
+    const agentdef_fields_step = b.step("test:agentdef-fields", "Run AgentDef runtime field L2/L3 tests");
+    {
+        const m = b.createModule(.{
+            .root_source_file = b.path("tests/component/subagent_agentdef_fields_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        m.addImport("harness", test_harness_mod);
+        m.addImport("cc", test_cc_mod);
+        addPlatform(b, m);
+        const t = b.addTest(.{
+            .name = "agentdef-fields",
+            .root_module = m,
+            .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+        });
+        agentdef_fields_step.dependOn(&addTestRunArtifact(b, t, windows_test_prelude).step);
     }
 
     // test:mem —— 记忆系统 L2 组件测试(隔离 artifact,绕开主套件 integration 挂起)。

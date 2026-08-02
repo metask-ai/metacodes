@@ -80,6 +80,7 @@ pub const edit_tool = @import("tools/edit.zig");
 pub const mcp_client = @import("mcp/client.zig");
 pub const mcp_protocol = @import("mcp/protocol.zig");
 pub const mcp_registry_bridge = @import("mcp/registry_bridge.zig");
+pub const mcp_session = @import("core/mcp_session.zig");
 pub const skills = @import("skills/skill.zig");
 pub const skills_runtime = @import("skills/runtime/root.zig");
 pub const skills_cli_adapter = @import("skills/cli_adapter.zig");
@@ -115,6 +116,7 @@ pub const headless_backend = @import("core/headless_backend.zig");
 pub const suspend_state = @import("core/suspend_state.zig");
 pub const tee_backend = @import("core/tee_backend.zig");
 pub const diagnostics_backend = @import("core/diagnostics_backend.zig");
+pub const evaluation_backend = @import("core/evaluation_backend.zig");
 pub const repl_msg_queue = @import("repl/msg_queue.zig");
 pub const web_journal = @import("web/journal.zig");
 pub const web_backend = @import("web/backend.zig");
@@ -401,7 +403,7 @@ pub fn main(init: std.process.Init) !void {
 fn dumpWrite(bytes: []const u8) void {
     var pos: usize = 0;
     while (pos < bytes.len) {
-        const n = pfs.write(1, bytes[pos..][0..bytes.len - pos]);
+        const n = pfs.write(1, bytes[pos..][0 .. bytes.len - pos]);
         if (n <= 0) break;
         pos += @as(usize, @intCast(n));
     }

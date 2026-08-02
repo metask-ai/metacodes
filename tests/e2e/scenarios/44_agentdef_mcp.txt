@@ -1,0 +1,3 @@
+使用 Task 工具调用 release-mcp agent，要求它先且只用一次 ToolSearch，参数必须是 query=`select:blocked__echo`。若 ToolSearch 返回完整工具定义，则用消息 MCP_ALLOWLIST_SENTINEL 调用该 blocked 工具一次；若返回 NoToolMatch，则记为被策略拒绝并且不重试。随后用同一消息调用 allowed__echo 一次。子 agent 必须把成功与被拒绝分开报告，不得把被拒绝的工具记为成功。父 agent 不要直接调用 MCP 工具。
+---
+根据子 agent 的真实返回：只有返回文本明确同时包含 MCP_ALLOWLIST_SENTINEL 和 allowed__echo 成功时，才用 Write 创建 mcp-proof.txt，只记录 sentinel 和执行成功的 MCP 工具名；如果返回为空、缺少任一项或状态不明确，立即如实结束，不要重试 Task、不要探索源码、不要创建 proof 文件。不要写入被拒绝的工具名，不要编造未执行的工具。

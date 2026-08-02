@@ -116,7 +116,8 @@ pub const AgentSet = struct {
     fn loadAgentFile(self: *AgentSet, path: []const u8, origin: Origin) !void {
         const md = try readAllFile(self.allocator, path);
         defer self.allocator.free(md);
-        const a = try def_mod.parseAgentMd(self.allocator, md, path, origin);
+        var a = try def_mod.parseAgentMd(self.allocator, md, path, origin);
+        errdefer a.deinit(self.allocator);
         try self.upsert(a);
     }
 
@@ -203,70 +204,85 @@ const GENERAL_PROMPT =
 ;
 
 fn injectBuiltins(set: *AgentSet) !void {
-    const a = set.allocator;
+    try addBuiltin(set, "Explore", EXPLORE_DESC, EXPLORE_PROMPT, &.{ "Read", "Grep", "Glob", "Bash" }, &.{ "Write", "Edit" }, "haiku", .plan, 30, .blue);
+    try addBuiltin(set, "Plan", PLAN_DESC, PLAN_PROMPT, &.{ "Read", "Grep", "Glob" }, &.{ "Write", "Edit", "Bash" }, "inherit", .plan, 30, .purple);
+    try addBuiltin(set, "general-purpose", GENERAL_DESC, GENERAL_PROMPT, &.{}, &.{}, "inherit", null, 50, .green);
+}
 
-    try set.upsert(.{
-        .name = try a.dupe(u8, "Explore"),
-        .description = try a.dupe(u8, EXPLORE_DESC),
-        .prompt = try a.dupe(u8, EXPLORE_PROMPT),
-        .tools = try dupeList(a, &.{ "Read", "Grep", "Glob", "Bash" }),
-        .disallowed_tools = try dupeList(a, &.{ "Write", "Edit" }),
-        .model = try a.dupe(u8, "haiku"),
-        .permission_mode = .plan, // 等价于"读 allow,其它 deny" — 一定不写
-        .max_turns = 30,
-        .preload_skills = try dupeList(a, &.{}),
-        .mcp_servers = try dupeList(a, &.{}),
+fn addBuiltin(
+    set: *AgentSet,
+    name: []const u8,
+    description: []const u8,
+    prompt: []const u8,
+    tools: []const []const u8,
+    disallowed_tools: []const []const u8,
+    model: []const u8,
+    permission_mode: ?def_mod.PermissionMode,
+    max_turns: u32,
+    color: def_mod.Color,
+) !void {
+    var builtin = try makeBuiltin(set.allocator, name, description, prompt, tools, disallowed_tools, model, permission_mode, max_turns, color);
+    errdefer builtin.deinit(set.allocator);
+    try set.upsert(builtin);
+}
+
+fn makeBuiltin(
+    a: std.mem.Allocator,
+    name: []const u8,
+    description: []const u8,
+    prompt: []const u8,
+    tools: []const []const u8,
+    disallowed_tools: []const []const u8,
+    model: []const u8,
+    permission_mode: ?def_mod.PermissionMode,
+    max_turns: u32,
+    color: def_mod.Color,
+) !AgentDef {
+    const name_owned = try a.dupe(u8, name);
+    errdefer a.free(name_owned);
+    const description_owned = try a.dupe(u8, description);
+    errdefer a.free(description_owned);
+    const prompt_owned = try a.dupe(u8, prompt);
+    errdefer a.free(prompt_owned);
+    const tools_owned = try dupeList(a, tools);
+    errdefer freeList(a, tools_owned);
+    const disallowed_owned = try dupeList(a, disallowed_tools);
+    errdefer freeList(a, disallowed_owned);
+    const model_owned = try a.dupe(u8, model);
+    errdefer a.free(model_owned);
+    const preload_owned = try dupeList(a, &.{});
+    errdefer freeList(a, preload_owned);
+    const mcp_owned = try dupeList(a, &.{});
+    errdefer freeList(a, mcp_owned);
+    const initial_prompt_owned = try a.dupe(u8, "");
+    errdefer a.free(initial_prompt_owned);
+    const source_path_owned = try a.dupe(u8, "");
+    errdefer a.free(source_path_owned);
+    return .{
+        .name = name_owned,
+        .description = description_owned,
+        .prompt = prompt_owned,
+        .tools = tools_owned,
+        .disallowed_tools = disallowed_owned,
+        .model = model_owned,
+        .permission_mode = permission_mode,
+        .max_turns = max_turns,
+        .preload_skills = preload_owned,
+        .mcp_servers = mcp_owned,
         .memory_scope = .none,
         .background = false,
-        .effort = try a.dupe(u8, ""),
-        .isolation = try a.dupe(u8, ""),
-        .color = .blue,
-        .initial_prompt = try a.dupe(u8, ""),
+        .effort = null,
+        .isolation = .none,
+        .color = color,
+        .initial_prompt = initial_prompt_owned,
         .origin = .builtin,
-        .source_path = try a.dupe(u8, ""),
-    });
+        .source_path = source_path_owned,
+    };
+}
 
-    try set.upsert(.{
-        .name = try a.dupe(u8, "Plan"),
-        .description = try a.dupe(u8, PLAN_DESC),
-        .prompt = try a.dupe(u8, PLAN_PROMPT),
-        .tools = try dupeList(a, &.{ "Read", "Grep", "Glob" }),
-        .disallowed_tools = try dupeList(a, &.{ "Write", "Edit", "Bash" }),
-        .model = try a.dupe(u8, "inherit"),
-        .permission_mode = .plan,
-        .max_turns = 30,
-        .preload_skills = try dupeList(a, &.{}),
-        .mcp_servers = try dupeList(a, &.{}),
-        .memory_scope = .none,
-        .background = false,
-        .effort = try a.dupe(u8, ""),
-        .isolation = try a.dupe(u8, ""),
-        .color = .purple,
-        .initial_prompt = try a.dupe(u8, ""),
-        .origin = .builtin,
-        .source_path = try a.dupe(u8, ""),
-    });
-
-    try set.upsert(.{
-        .name = try a.dupe(u8, "general-purpose"),
-        .description = try a.dupe(u8, GENERAL_DESC),
-        .prompt = try a.dupe(u8, GENERAL_PROMPT),
-        .tools = try dupeList(a, &.{}), // 空 = inherit all
-        .disallowed_tools = try dupeList(a, &.{}),
-        .model = try a.dupe(u8, "inherit"),
-        .permission_mode = null,
-        .max_turns = 50,
-        .preload_skills = try dupeList(a, &.{}),
-        .mcp_servers = try dupeList(a, &.{}),
-        .memory_scope = .none,
-        .background = false,
-        .effort = try a.dupe(u8, ""),
-        .isolation = try a.dupe(u8, ""),
-        .color = .green,
-        .initial_prompt = try a.dupe(u8, ""),
-        .origin = .builtin,
-        .source_path = try a.dupe(u8, ""),
-    });
+fn freeList(a: std.mem.Allocator, list: []const []const u8) void {
+    for (list) |item| a.free(item);
+    a.free(list);
 }
 
 fn dupeList(a: std.mem.Allocator, src: []const []const u8) ![]const []const u8 {
@@ -309,8 +325,7 @@ test "AgentSet: load custom from dir" {
     const a = testing.allocator;
     const dir = "/tmp/cc-zig-agents-test";
     defer cleanupDir(dir);
-    try makeAgent(dir, "code-reviewer.md",
-        "---\nname: code-reviewer\ndescription: review\n---\nYou review code.\n");
+    try makeAgent(dir, "code-reviewer.md", "---\nname: code-reviewer\ndescription: review\n---\nYou review code.\n");
 
     var set = AgentSet.init(a);
     defer set.deinit();
@@ -325,8 +340,7 @@ test "AgentSet: name from frontmatter wins over filename" {
     const a = testing.allocator;
     const dir = "/tmp/cc-zig-agents-name";
     defer cleanupDir(dir);
-    try makeAgent(dir, "wrong-filename.md",
-        "---\nname: my-real-name\ndescription: x\n---\nbody\n");
+    try makeAgent(dir, "wrong-filename.md", "---\nname: my-real-name\ndescription: x\n---\nbody\n");
 
     var set = AgentSet.init(a);
     defer set.deinit();
@@ -344,8 +358,7 @@ test "AgentSet: recursive subfolder discovery (path doesn't affect name)" {
     defer a.free(sub_z);
     _ = std.c.mkdir(dir, 0o755);
     _ = std.c.mkdir(sub_z, 0o755);
-    try makeAgentInDir(sub_dir, "security.md",
-        "---\nname: security\ndescription: sec review\n---\nbody\n");
+    try makeAgentInDir(sub_dir, "security.md", "---\nname: security\ndescription: sec review\n---\nbody\n");
 
     var set = AgentSet.init(a);
     defer set.deinit();

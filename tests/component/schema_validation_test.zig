@@ -1,6 +1,6 @@
 //! L2 组件测试:schema 层 required 字段校验(对齐 cc zod safeParse 层)。
 //!
-//! dispatch 前统一校验 input 含所有 required 字段;缺则 error.MissingRequiredField
+//! dispatch 前统一校验 input 含所有 required 字段;缺则返回字段具名 Missing* error
 //! (→ invalid_args 给模型现场)。这是工具自身 MissingX 之外的统一前置层。
 
 const std = @import("std");
@@ -8,9 +8,9 @@ const cc = @import("cc");
 
 const tools = cc.tools;
 
-test "L2 schema: Write 缺 content → MissingRequiredField" {
+test "L2 schema: Write 缺 content → MissingContent" {
     // Write required = file_path + content
-    try std.testing.expectError(error.MissingRequiredField, tools.validateRequired("Write", "{\"file_path\":\"/x\"}"));
+    try std.testing.expectError(error.MissingContent, tools.validateRequired("Write", "{\"file_path\":\"/x\"}"));
 }
 
 test "L2 schema: Write 齐全 → 通过" {
@@ -18,13 +18,13 @@ test "L2 schema: Write 齐全 → 通过" {
 }
 
 test "L2 schema: Edit 缺 old_string → 拦" {
-    try std.testing.expectError(error.MissingRequiredField, tools.validateRequired("Edit", "{\"file_path\":\"/x\",\"new_string\":\"y\"}"));
+    try std.testing.expectError(error.MissingOldString, tools.validateRequired("Edit", "{\"file_path\":\"/x\",\"new_string\":\"y\"}"));
     // 齐全通过
     try tools.validateRequired("Edit", "{\"file_path\":\"/x\",\"old_string\":\"a\",\"new_string\":\"b\"}");
 }
 
 test "L2 schema: Grep 缺 pattern → 拦" {
-    try std.testing.expectError(error.MissingRequiredField, tools.validateRequired("Grep", "{\"path\":\".\"}"));
+    try std.testing.expectError(error.MissingPattern, tools.validateRequired("Grep", "{\"path\":\".\"}"));
     try tools.validateRequired("Grep", "{\"pattern\":\"foo\"}");
 }
 
@@ -32,7 +32,7 @@ test "L2 schema: Task 只需 prompt(subagent_type/description 有默认不必需
     // 只给 prompt → 通过(subagent_type 缺省 general-purpose,不应被拦)
     try tools.validateRequired("Task", "{\"prompt\":\"do it\"}");
     // 缺 prompt → 拦
-    try std.testing.expectError(error.MissingRequiredField, tools.validateRequired("Task", "{\"subagent_type\":\"Explore\"}"));
+    try std.testing.expectError(error.MissingPrompt, tools.validateRequired("Task", "{\"subagent_type\":\"Explore\"}"));
 }
 
 test "L2 schema: 未知工具 → 不拦(交给 dyn/UnknownTool)" {

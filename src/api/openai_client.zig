@@ -55,6 +55,7 @@ pub const OpenAIClient = struct {
     abort_registry: provider_mod.RequestAbortRegistry = .{},
     max_tokens: u32 = 4096,
     context_window: u32 = 128_000,
+    reasoning_effort: ?types.ReasoningEffort = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, model: []const u8, base_url: ?[]const u8) OpenAIClient {
         return .{
@@ -82,6 +83,7 @@ pub const OpenAIClient = struct {
             .maxTokensFn = &pMaxTokens,
             .maxInputTokensFn = &pMaxInputTokens,
             .reasoningEffortFn = &pReasoningEffort,
+            .setReasoningEffortFn = &pSetReasoningEffort,
             .supportsFn = &pSupports,
         };
     }
@@ -97,8 +99,11 @@ pub const OpenAIClient = struct {
     fn pMaxInputTokens(ctx: *anyopaque) u32 {
         return cast(ctx).context_window;
     }
-    fn pReasoningEffort(_: *anyopaque) ?types.ReasoningEffort {
-        return null;
+    fn pReasoningEffort(ctx: *anyopaque) ?types.ReasoningEffort {
+        return cast(ctx).reasoning_effort;
+    }
+    fn pSetReasoningEffort(ctx: *anyopaque, effort: ?types.ReasoningEffort) void {
+        cast(ctx).reasoning_effort = effort;
     }
     fn pSupports(ctx: *anyopaque, cap: provider_mod.Capability) bool {
         return capability.supports(.openai, cast(ctx).model, cap);
@@ -127,7 +132,7 @@ pub const OpenAIClient = struct {
         _ = user_query; // OpenAI 无 server-tool web_search → 无需 query 透传
         const self = cast(ctx);
         const model = model_override orelse self.model;
-        const body = try serializeOpenAIRequest(self.allocator, model, messages, system, tools);
+        const body = try serializeOpenAIRequest(self.allocator, model, messages, system, tools, self.reasoning_effort);
         defer self.allocator.free(body);
         return self.doStream(body, abort);
     }
@@ -135,7 +140,12 @@ pub const OpenAIClient = struct {
     /// 发 HTTP POST + 包成中立 StreamHandle(堆框 OpenAIStream,地址稳定)。
     fn doStream(self: *OpenAIClient, body: []const u8, abort: ?*const AbortSignal) !StreamHandle {
         const rid = log.genRequestId();
-        log.infoId("openai", rid, "POST {s} model={s} body_bytes={d} cache_mode={s}", .{ self.base_url, self.model, body.len, cache.modeFor(.openai).label() });
+        log.infoId(
+            "openai",
+            rid,
+            "POST {s} model={s} body_bytes={d} cache_mode={s} reasoning_effort={s}",
+            .{ self.base_url, self.model, body.len, cache.modeFor(.openai).label(), if (self.reasoning_effort) |effort| effort.name() else "default" },
+        );
         const uri = std.Uri.parse(self.base_url) catch return error.InvalidUrl;
         const auth = std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.api_key}) catch return error.RequestFailed;
         defer secureFree(self.allocator, auth);
@@ -573,11 +583,17 @@ fn extractDeltaContent(data: []const u8) ?[]const u8 {
 }
 
 /// 中立 Conversation/tools → OpenAI chat/completions 请求 body。caller free。
-pub fn serializeOpenAIRequest(allocator: std.mem.Allocator, model: []const u8, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition) ![]u8 {
+pub fn serializeOpenAIRequest(allocator: std.mem.Allocator, model: []const u8, messages: []const types.ApiMessage, system: ?[]const u8, tools: ?[]const json_mod.ToolDefinition, reasoning_effort: ?types.ReasoningEffort) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "{\"model\":");
     try util_json.serializeString(model, &out, allocator);
+    if (reasoning_effort) |effort| {
+        if (effort.active()) {
+            try out.appendSlice(allocator, ",\"reasoning_effort\":");
+            try util_json.serializeString(effort.name(), &out, allocator);
+        }
+    }
     // stream_options.include_usage=true:OpenAI 默认流式不发 usage,显式要求才在末尾发一个
     // {choices:[],usage:{...}} chunk。缓存命中(cached_tokens)就在这个 usage 里。
     try out.appendSlice(allocator, ",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[");
@@ -694,11 +710,12 @@ test "OpenAI 请求翻译:中立 Conversation → chat/completions body" {
     const msgs = [_]types.ApiMessage{
         .{ .role = .user, .content = &[_]types.ApiContent{.{ .text = "hello" }} },
     };
-    const body = try serializeOpenAIRequest(a, "gpt-4o", &msgs, "you are helpful", null);
+    const body = try serializeOpenAIRequest(a, "gpt-4o", &msgs, "you are helpful", null, .high);
     defer a.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"gpt-4o\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"system\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"user\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "hello") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
 }

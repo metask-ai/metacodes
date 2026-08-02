@@ -32,6 +32,8 @@ pub const ContextOptions = struct {
     cwd_abs: []const u8 = "",
     home_dir: []const u8 = "",
     additional_dirs: []const []const u8 = &.{},
+    /// AgentDef.memory 解析后的专属目录。为空表示 memory 未启用。
+    memory_dir: []const u8 = "",
 };
 
 pub fn buildSubagentContext(
@@ -72,13 +74,22 @@ pub fn buildSubagentContext(
         try out.writer.writeByte('\n');
     }
 
-    // 3. CLAUDE.md 链(Explore/Plan 跳过)
+    // 3. agent 专属持久记忆。路径在 tools/agent.zig 中由可信 home/project root 解析并
+    // mkdir；这里仅把能力与精确边界写进 system prompt。
+    if (def.memory_scope != .none) {
+        if (opts.memory_dir.len == 0) return error.AgentMemoryBaseUnavailable;
+        const memory_prompt = try @import("memory.zig").buildPrompt(allocator, def.memory_scope, opts.memory_dir);
+        defer allocator.free(memory_prompt);
+        try out.writer.writeAll(memory_prompt);
+    }
+
+    // 4. CLAUDE.md 链(Explore/Plan 跳过)
     if (!opts.skip_codebase_context) {
         try injectClaudeMd(allocator, &out, opts);
         try injectGitStatus(allocator, &out, opts);
     }
 
-    // 4. preload skills 全文(builtin agents 通常 def.preload_skills 为空,custom 才有)
+    // 5. preload skills 全文(builtin agents 通常 def.preload_skills 为空,custom 才有)
     if (opts.skills) |skset| {
         for (def.preload_skills) |skill_name| {
             const skill = skset.find(skill_name) orelse {
@@ -196,9 +207,11 @@ const parseAgentMd = @import("def.zig").parseAgentMd;
 
 test "buildSubagentContext: base prompt + environment" {
     const a = testing.allocator;
-    var d = try parseAgentMd(a,
+    var d = try parseAgentMd(
+        a,
         "---\nname: code-reviewer\ndescription: r\n---\nYou review code.\n",
-        "/x", .personal,
+        "/x",
+        .personal,
     );
     defer d.deinit(a);
 
@@ -219,9 +232,11 @@ test "buildSubagentContext: base prompt + environment" {
 
 test "buildSubagentContext: tools listed" {
     const a = testing.allocator;
-    var d = try parseAgentMd(a,
+    var d = try parseAgentMd(
+        a,
         "---\nname: t\ndescription: x\ntools: Read, Grep\ndisallowedTools: Write\n---\nbody\n",
-        "/x", .personal,
+        "/x",
+        .personal,
     );
     defer d.deinit(a);
 
@@ -259,9 +274,11 @@ test "shouldSkipCodebaseContext: Explore and Plan only" {
 
 test "buildSubagentContext: preload skill body" {
     const a = testing.allocator;
-    var d = try parseAgentMd(a,
+    var d = try parseAgentMd(
+        a,
         "---\nname: api-dev\ndescription: x\nskills: [api-conv]\n---\nbody\n",
-        "/x", .personal,
+        "/x",
+        .personal,
     );
     defer d.deinit(a);
 

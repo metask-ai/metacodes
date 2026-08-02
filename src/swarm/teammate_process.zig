@@ -378,20 +378,34 @@ fn freeGitArgv(a: std.mem.Allocator, argv: *std.ArrayList(?[*:0]const u8)) void 
 
 /// git worktree remove --force <path>(teammate 关闭后 lead 清理)。repo 同款 -C。best-effort。
 pub fn removeWorktree(a: std.mem.Allocator, wt_path: []const u8, repo: []const u8, abort: anytype) void {
+    removeWorktreeStrict(a, wt_path, repo, abort) catch |err| {
+        log.warn("swarm", "removeWorktree({s}) failed: {s}", .{ wt_path, @errorName(err) });
+    };
+}
+
+/// Strict variant for callers that publish cleanup state. Returning success
+/// means both git accepted the removal and the worktree path is confirmed
+/// absent. Swarm teardown intentionally keeps the best-effort wrapper above;
+/// AgentDef isolation uses this result to avoid reporting a false cleanup.
+pub fn removeWorktreeStrict(a: std.mem.Allocator, wt_path: []const u8, repo: []const u8, abort: anytype) !void {
     const common = @import("../tools/common.zig");
     var argv: std.ArrayList(?[*:0]const u8) = .empty;
     defer freeGitArgv(a, &argv);
-    appendZ(a, &argv, "/usr/bin/env") catch return;
-    appendZ(a, &argv, "git") catch return;
+    try appendZ(a, &argv, "/usr/bin/env");
+    try appendZ(a, &argv, "git");
     if (repo.len > 0) {
-        appendZ(a, &argv, "-C") catch return;
-        appendZ(a, &argv, repo) catch return;
+        try appendZ(a, &argv, "-C");
+        try appendZ(a, &argv, repo);
     }
-    for ([_][]const u8{ "worktree", "remove", "--force", wt_path }) |w| appendZ(a, &argv, w) catch return;
-    argv.append(a, null) catch return;
-    const out = common.spawnCaptureWithStderrTimed(argv.items, a, abort, 30_000, null, common.MAX_SPAWN_CAPTURE_BYTES) catch return;
-    a.free(out.stdout);
-    a.free(out.stderr);
+    for ([_][]const u8{ "worktree", "remove", "--force", wt_path }) |w| try appendZ(a, &argv, w);
+    try argv.append(a, null);
+    const out = try common.spawnCaptureWithStderrTimed(argv.items, a, abort, 30_000, null, common.MAX_SPAWN_CAPTURE_BYTES);
+    defer a.free(out.stdout);
+    defer a.free(out.stderr);
+    if (out.exit_code != 0) return error.WorktreeRemoveFailed;
+    const path_z = try a.dupeZ(u8, wt_path);
+    defer a.free(path_z);
+    if (pfs.exists(path_z.ptr)) return error.WorktreeStillExists;
 }
 
 /// spawn 函数签名(DI):生产 = forkExecTeammate;测试注入 mock(不真 fork)验证接线。

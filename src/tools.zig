@@ -308,31 +308,35 @@ pub const registry: []const ToolEntry = &.{
     .{
         .name = "AskUserQuestion",
         .description = "Ask the user a multiple-choice question interactively. Only works in TTY. Use when you need user decision to proceed (architecture choices, ambiguous requests).",
-        .input_schema = .{ .type = "object", .prop_specs = &.{
-            .{
-                .name = "questions",
-                .type = "array",
-                .description = "List of questions to ask the user (1-9). Prefer multiSelect when the user can pick several options for one question, rather than splitting into many single-select questions.",
-                // 嵌套 schema:每个 question 是对象,options 又是 {label,description} 对象数组。
-                .items_props = &.{
-                    .{ .name = "question", .type = "string", .description = "The complete question to ask. Clear, specific, ends with '?'." },
-                    .{ .name = "header", .type = "string", .description = "Very short label/chip for the question (max 12 chars)." },
-                    .{
-                        .name = "options",
-                        .type = "array",
-                        .description = "The available choices (2-4). Each a distinct option object.",
-                        .items_props = &.{
-                            .{ .name = "label", .type = "string", .description = "Display text the user selects. Concise (1-5 words)." },
-                            .{ .name = "description", .type = "string", .description = "Explanation of what this option means / its trade-offs." },
-                            .{ .name = "preview", .type = "string", .description = "Optional ASCII/markdown mockup shown side-by-side when this option is focused (single-select only). Use for layouts/code/diagram comparisons." },
+        .input_schema = .{
+            .type = "object",
+            .prop_specs = &.{
+                .{
+                    .name = "questions",
+                    .type = "array",
+                    .description = "List of questions to ask the user (1-9). Prefer multiSelect when the user can pick several options for one question, rather than splitting into many single-select questions.",
+                    // 嵌套 schema:每个 question 是对象,options 又是 {label,description} 对象数组。
+                    .items_props = &.{
+                        .{ .name = "question", .type = "string", .description = "The complete question to ask. Clear, specific, ends with '?'." },
+                        .{ .name = "header", .type = "string", .description = "Very short label/chip for the question (max 12 chars)." },
+                        .{
+                            .name = "options",
+                            .type = "array",
+                            .description = "The available choices (2-4). Each a distinct option object.",
+                            .items_props = &.{
+                                .{ .name = "label", .type = "string", .description = "Display text the user selects. Concise (1-5 words)." },
+                                .{ .name = "description", .type = "string", .description = "Explanation of what this option means / its trade-offs." },
+                                .{ .name = "preview", .type = "string", .description = "Optional ASCII/markdown mockup shown side-by-side when this option is focused (single-select only). Use for layouts/code/diagram comparisons." },
+                            },
+                            .items_required = &.{ "label", "description" },
                         },
-                        .items_required = &.{ "label", "description" },
+                        .{ .name = "multiSelect", .type = "boolean", .description = "Allow selecting multiple options instead of one. Default false." },
                     },
-                    .{ .name = "multiSelect", .type = "boolean", .description = "Allow selecting multiple options instead of one. Default false." },
+                    .items_required = &.{ "question", "header", "options" },
                 },
-                .items_required = &.{ "question", "header", "options" },
             },
-        }, .required = &.{"questions"} },
+            .required = &.{"questions"},
+        },
         .execute = ask_user_tool.execute,
     },
     .{
@@ -422,7 +426,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskOutput",
-        .description = "Read status and incremental output of a backgrounded Task subagent by agent_job_id. While running, returns incremental output (poll with since_byte = previous output_total_bytes); when done, returns final_text + stop_reason. Args: agent_job_id (required), since_byte, max_bytes (optional).",
+        .description = "Wait for a backgrounded Task subagent by agent_job_id. Omit since_byte to wait up to 30 seconds for terminal status; pass since_byte = previous output_total_bytes to wait for incremental output instead. When done, returns final_text + stop_reason. Args: agent_job_id (required), since_byte, max_bytes (optional).",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "agent_job_id", .type = "string", .description = "The backgrounded agent job id to read" },
             .{ .name = "since_byte", .type = "integer", .description = "Byte offset to poll from (previous output_total_bytes)" },
@@ -676,10 +680,10 @@ pub fn executeTool(tool: *const ToolEntry, ctx: *const ToolContext, args: []cons
 }
 
 /// Schema 层校验(对齐 cc 的 zod safeParse 层):执行前检查 input JSON 含所有 required
-/// 字段。缺则返 error.MissingRequiredField(agent_loop 转 invalid_args 现场给模型)。
+/// 字段。缺则返回字段具名错误(agent_loop 转 invalid_args 现场给模型)。
 /// 这是工具自身 MissingX 检查之外的统一前置层——uniform + 在 dispatch 前拦,且对没写
 /// 自检的工具也兜底。检查用顶层 "field": 子串(与 extractJsonArg 同口径,够分辨缺失)。
-pub fn validateRequired(name: []const u8, args: []const u8) error{MissingRequiredField}!void {
+pub fn validateRequired(name: []const u8, args: []const u8) anyerror!void {
     const t = getTool(name) orelse return; // 动态工具(MCP/Skill)走自己的校验
     const required = t.input_schema.required orelse return;
     for (required) |field| {
@@ -687,8 +691,30 @@ pub fn validateRequired(name: []const u8, args: []const u8) error{MissingRequire
         if (field.len + 3 > pat_buf.len) continue;
         // 匹配 "field": (顶层键)。简化:子串匹配(args 是工具入参 JSON,误报概率极低)。
         const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\"", .{field}) catch continue;
-        if (std.mem.indexOf(u8, args, pat) == null) return error.MissingRequiredField;
+        if (std.mem.indexOf(u8, args, pat) == null) return missingRequiredFieldError(field);
     }
+}
+
+/// 把高频 schema 字段映射成稳定、可行动的错误码。无法枚举的动态字段仍用
+/// MissingRequiredField 兜底；不要为了“更具体”拼运行时 error 名（Zig error set 是静态的）。
+fn missingRequiredFieldError(field: []const u8) anyerror {
+    if (std.mem.eql(u8, field, "file_path")) return error.MissingFilePath;
+    if (std.mem.eql(u8, field, "path")) return error.MissingPath;
+    if (std.mem.eql(u8, field, "command")) return error.MissingCommand;
+    if (std.mem.eql(u8, field, "pattern")) return error.MissingPattern;
+    if (std.mem.eql(u8, field, "content")) return error.MissingContent;
+    if (std.mem.eql(u8, field, "old_string")) return error.MissingOldString;
+    if (std.mem.eql(u8, field, "new_string")) return error.MissingNewString;
+    if (std.mem.eql(u8, field, "prompt")) return error.MissingPrompt;
+    if (std.mem.eql(u8, field, "prompt_template")) return error.MissingPromptTemplate;
+    if (std.mem.eql(u8, field, "subject")) return error.MissingSubject;
+    if (std.mem.eql(u8, field, "description")) return error.MissingDescription;
+    if (std.mem.eql(u8, field, "taskId")) return error.MissingTaskId;
+    if (std.mem.eql(u8, field, "agent_job_id")) return error.MissingAgentJobId;
+    if (std.mem.eql(u8, field, "query")) return error.MissingQuery;
+    if (std.mem.eql(u8, field, "url")) return error.MissingUrl;
+    if (std.mem.eql(u8, field, "items")) return error.MissingItems;
+    return error.MissingRequiredField;
 }
 
 /// schema 类型层(对齐 cc zod 的类型校验维度):对 input JSON 中**已出现**的高风险字段,
@@ -774,6 +800,12 @@ fn jsonValueKind(args: []const u8, key: []const u8) ?JsonKind {
 /// 找不到时先做 P0.6 弱模型工具名修复(归一化 + 模糊匹配),命中则改派到真工具;仍找不到
 /// 返 error.UnknownTool —— 由 agent_loop 转 tool_error 给模型。
 pub fn dispatch(ctx: *const ToolContext, name: []const u8, args: []const u8) anyerror!ToolDispatchOutcome {
+    // Defense in depth: agent_loop/tool_exec normally checks this first, but
+    // dispatch is also a public L2 seam and dynamic tools can be called through
+    // it directly.  Never let a guessed name bypass a child execution ceiling.
+    if (ctx.execution_policy) |policy| {
+        if (!policy.allowsInvocation(name, args)) return error.ToolPolicyDenied;
+    }
     // An embedding Session's immutable directory is an authority boundary, not
     // a lookup hint. Do not fall through to the process-wide registry on miss.
     if (ctx.tool_dispatcher) |dispatcher| return dispatcher.dispatch(ctx, name, args);
@@ -913,19 +945,30 @@ const ToolNameIter = struct {
     }
     fn next(self: *ToolNameIter) ?[]const u8 {
         if (self.ctx.tool_dispatcher) |dispatcher| {
-            const name = dispatcher.nameAt(self.static_idx) orelse return null;
-            self.static_idx += 1;
-            return name;
+            while (dispatcher.nameAt(self.static_idx)) |name| {
+                self.static_idx += 1;
+                if (self.ctx.execution_policy) |policy| {
+                    if (!policy.allowsTool(name)) continue;
+                }
+                return name;
+            }
+            return null;
         }
-        if (self.static_idx < registry.len) {
+        while (self.static_idx < registry.len) {
             const nm = registry[self.static_idx].name;
             self.static_idx += 1;
+            if (self.ctx.execution_policy) |policy| {
+                if (!policy.allowsTool(nm)) continue;
+            }
             return nm;
         }
         if (self.ctx.dyn_registry) |dr| {
-            if (self.dyn_idx < dr.entries.items.len) {
+            while (self.dyn_idx < dr.entries.items.len) {
                 const nm = dr.entries.items[self.dyn_idx].name;
                 self.dyn_idx += 1;
+                if (self.ctx.execution_policy) |policy| {
+                    if (!policy.allowsTool(nm)) continue;
+                }
                 return nm;
             }
         }
@@ -1155,11 +1198,21 @@ test "toToolDefinitionsWithDyn appends dynamic tools after static (no server-too
 
 test "dispatch finds static tool" {
     const ctx = ToolContext.simple(std.testing.allocator);
-    // schema 层(validateRequired)先于工具自身校验:Read 缺 required file_path
-    // → MissingRequiredField(对齐 cc zod safeParse 在 validateInput 之前)。
-    try std.testing.expectError(error.MissingRequiredField, dispatch(&ctx, "Read", "{}"));
+    // schema 层(validateRequired)先于工具自身校验，但错误仍指出具体缺失字段。
+    try std.testing.expectError(error.MissingFilePath, dispatch(&ctx, "Read", "{}"));
     // 带 file_path 但工具内部其它校验:走到工具自身(此处文件不存在 → 工具错误,非 schema 层)。
     try std.testing.expectError(error.FileNotFound, dispatch(&ctx, "Read", "{\"file_path\":\"/no/such/file/xyz123\"}"));
+}
+
+test "schema validation returns actionable field-specific errors" {
+    const ctx = ToolContext.simple(std.testing.allocator);
+    try std.testing.expectError(error.MissingPrompt, dispatch(&ctx, "Task", "{}"));
+    try std.testing.expectError(error.MissingSubject, dispatch(&ctx, "TaskCreate", "{}"));
+    try std.testing.expectError(
+        error.MissingDescription,
+        dispatch(&ctx, "TaskCreate", "{\"subject\":\"inspect\"}"),
+    );
+    try std.testing.expectError(error.MissingTaskId, dispatch(&ctx, "TaskUpdate", "{}"));
 }
 
 test "dispatch falls back to dyn_registry" {

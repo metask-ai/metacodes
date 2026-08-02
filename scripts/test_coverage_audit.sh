@@ -27,7 +27,9 @@ fi
 
 covered() {
   # 字段名是否在 L2 测试文本中出现(测试名、注释、断言任意位置)
-  echo "$L2_TEXT" | grep -q "$1" && return 0 || return 1
+  # 不用 `echo | grep -q`：在 pipefail 下 grep 提前命中退出会令 echo 收到 SIGPIPE，
+  # 整条 pipeline 反而被判失败，导致所有已覆盖字段都误报「缺」。
+  grep -q "$1" <<<"$L2_TEXT" && return 0 || return 1
 }
 
 # ---- 2. 提取 AgentDef 字段(src/agents/def.zig 顶层 struct 字段)----
@@ -81,7 +83,7 @@ echo
 echo "每条「缺」要么:(a) 补一条 L2 测试,要么 (b) 在 doc/E2E_TESTING.md §3.1"
 echo "差距矩阵登记「未实现 + 原因」。不允许沉默。"
 echo
-echo "已知登记(见 §3.1):background/effort/memory_scope/mcp_servers/isolation"
-echo "  = AgentDef 解析了但下游未消费(P2/P3 未实现)。"
+echo "AgentDef background/effort/memory_scope/mcp_servers/isolation 已由"
+echo "tests/component/subagent_agentdef_fields_test.zig 覆盖生产接线。"
 
 exit 0

@@ -259,12 +259,28 @@ pub const CoreEvent = union(enum) {
     diag_turn_begin: struct { trace_id: [12]u8, depth: u8, turn: u32 },
     /// 诊断:一轮结束(本轮累计 tool_calls)。turn span 终点。
     diag_turn_end: struct { trace_id: [12]u8, depth: u8, turn: u32, tool_calls: u32 },
+    /// 评估:一次 provider 请求（含建连重试与完整 stream 消费）的阻塞墙钟。
+    diag_model_request: struct { trace_id: [12]u8, depth: u8, turn: u32, attempt: u32, elapsed_ms: u64, outcome: []const u8 },
+    /// 评估:模型 stream 完成后，本轮权限/Hook/工具执行关键路径的墙钟。
+    /// 与 model request 串行，因此两者可从 run wall time 中相减得到 harness residual。
+    diag_tool_stage: struct { trace_id: [12]u8, depth: u8, turn: u32, tool_calls: u32, elapsed_ms: u64 },
     /// 诊断:工具熔断器触发(同错连续 N 轮)。
     diag_breaker_tripped: struct { trace_id: [12]u8, depth: u8, same_err_count: u32 },
     /// 诊断:prompt cache 击穿(cache_read 跌幅触发)。
     diag_cache_break: struct { trace_id: [12]u8, depth: u8, cache_read: u64, cache_creation: u64 },
     /// 诊断:max_tokens 截断 → 续写(第 n/max 次)。
     diag_continuation: struct { trace_id: [12]u8, depth: u8, n: u32, max: u32 },
+    /// 评估/审计:工具执行前的最终权限结果。input 不进入事件，避免评估 artifact
+    /// 复制命令、路径或密钥；tool_started 与 allowed=false 的配对可检测策略绕过。
+    policy_decision: struct {
+        trace_id: [12]u8,
+        depth: u8,
+        id: []const u8,
+        tool: []const u8,
+        decision: []const u8,
+        source: []const u8,
+        allowed: bool,
+    },
     /// 诊断:run 结束(stop_reason + 总计)。run span 终点;借用 slice(同步消费)。
     diag_run_end: struct { trace_id: [12]u8, depth: u8, turns: u32, tool_calls: u32, stop_reason_name: []const u8 },
 };
