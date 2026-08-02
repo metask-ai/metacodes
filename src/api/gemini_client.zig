@@ -31,6 +31,7 @@
 
 const std = @import("std");
 const http = std.http;
+const connection_gate = @import("connection_gate.zig");
 const log = @import("../util/log.zig");
 const types = @import("../types.zig");
 const json_mod = @import("../json.zig");
@@ -200,9 +201,12 @@ pub const GeminiClient = struct {
 
         const req_ptr = try self.allocator.create(http.Client.Request);
         errdefer self.allocator.destroy(req_ptr); // 唯一 destroy:所有错误路径都靠它(不手动 destroy,否则 double-free)
+        var connection_lease = try connection_gate.acquire(abort);
+        defer connection_lease.release();
         req_ptr.* = self.http_client.request(.POST, uri, .{
-            .keep_alive = false, // 每请求独立连接:不复用 pooled 连接(MockServer 每连接一回放;
-            // 真 Gemini 流式也无 pooling 收益)。避免"干净 EOF→连接入池→复用已弃连接→HttpConnectionClosing"。
+            // 每请求独立连接:不复用 pooled 连接，避免"干净 EOF→连接入池→复用已弃连接
+            // →HttpConnectionClosing"；process-wide connection_gate 负责限制握手洪峰。
+            .keep_alive = false,
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json" },
                 .{ .name = "x-goog-api-key", .value = self.api_key },
@@ -234,6 +238,7 @@ pub const GeminiClient = struct {
             log.errId("gemini", rid, "receiveHead failed: {s}", .{@errorName(err)});
             return err;
         };
+        connection_lease.release();
         if (response.head.status != .ok) {
             log.errId("gemini", rid, "HTTP {d}", .{@intFromEnum(response.head.status)});
             return error.RequestFailed;

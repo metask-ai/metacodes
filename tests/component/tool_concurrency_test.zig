@@ -16,10 +16,68 @@ test "L2 并发: isConcurrencySafe 分类" {
     try std.testing.expect(tools.isConcurrencySafe("Glob"));
     try std.testing.expect(tools.isConcurrencySafe("Grep"));
     try std.testing.expect(tools.isConcurrencySafe("WebFetch"));
+    // WebSearch 复用 session api_client + session arena，必须留在串行批。
+    try std.testing.expect(!tools.isConcurrencySafe("WebSearch"));
     try std.testing.expect(!tools.isConcurrencySafe("Write"));
     try std.testing.expect(!tools.isConcurrencySafe("Edit"));
     try std.testing.expect(!tools.isConcurrencySafe("Bash"));
     try std.testing.expect(!tools.isConcurrencySafe("Task"));
+}
+
+test "L2 #5: 两个 WebSearch slot 不重叠使用 session client" {
+    const Probe = struct {
+        active: std.atomic.Value(usize) = .init(0),
+        max_active: std.atomic.Value(usize) = .init(0),
+
+        fn dispatch(raw: *const anyopaque, tool_ctx: *const tools.ToolContext, _: []const u8, _: []const u8) anyerror!tools.ToolDispatchOutcome {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            const now = self.active.fetchAdd(1, .acq_rel) + 1;
+            if (now > self.max_active.load(.acquire)) self.max_active.store(now, .release);
+            defer _ = self.active.fetchSub(1, .acq_rel);
+
+            // 若 executeSlots 错把 WebSearch 放进并发批，第一项会等到第二项进入，
+            // max_active 必然变成 2；串行路径则有限等待后返回，再执行第二项。
+            if (now == 1) {
+                for (0..100_000) |_| {
+                    if (self.active.load(.acquire) > 1) break;
+                    std.Thread.yield() catch {};
+                }
+            }
+            return .{ .ok = try tool_ctx.allocator.dupe(u8, "ok") };
+        }
+        fn prefetchSafe(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+        fn nameAt(_: *const anyopaque, index: usize) ?[]const u8 {
+            return if (index == 0) "WebSearch" else null;
+        }
+        fn hostSync(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+        fn dispatcher(self: *@This()) tools.ToolDispatcher {
+            return .{
+                .ctx = @ptrCast(self),
+                .dispatchFn = dispatch,
+                .prefetchSafeFn = prefetchSafe,
+                .nameAtFn = nameAt,
+                .hostSyncFn = hostSync,
+            };
+        }
+    };
+
+    const a = std.testing.allocator;
+    var probe = Probe{};
+    var slots = [_]tool_exec.Slot{
+        .{ .decision = .run, .name = "WebSearch", .id = "ws1", .input = "{\"query\":\"one\"}" },
+        .{ .decision = .run, .name = "WebSearch", .id = "ws2", .input = "{\"query\":\"two\"}" },
+    };
+    defer for (&slots) |*slot| slot.deinit(a);
+    const ctx = tools.ToolContext{ .allocator = a, .tool_dispatcher = probe.dispatcher() };
+
+    try tool_exec.executeSlots(&slots, &ctx, a, cc.util_log.RequestId{ .bytes = [_]u8{0} ** 12 });
+    try std.testing.expectEqual(@as(usize, 1), probe.max_active.load(.acquire));
+    try std.testing.expectEqualStrings("ok", slots[0].content.?);
+    try std.testing.expectEqualStrings("ok", slots[1].content.?);
 }
 
 fn mkdir(p: [*:0]const u8) void {

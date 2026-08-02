@@ -8,7 +8,8 @@
 //!
 //! 权限检查(走 fd0 prompt)必须在调用方主线程串行做好——本模块只执行已决定的。
 //! 共享态:read_state 已加锁(Read 安全);其余 safe 工具(Glob/Grep/WebFetch/BashOutput)
-//! 不写共享态。每个并发 job 用独立 ArenaAllocator 规避 GPA 非线程安全;结果 dupe 回父。
+//! 不写共享态。每个并发 job 用独立 ArenaAllocator；这些 arena 的后备分配和逃逸结果
+//! 都经 LockedAllocator 串行访问父 allocator（生产父 allocator 是 session arena，本身不线程安全）。
 
 const std = @import("std");
 const platform = @import("platform");
@@ -16,6 +17,53 @@ const tools_mod = @import("../tools.zig");
 const ToolContext = tools_mod.ToolContext;
 const log = @import("../util/log.zig");
 const util_time = @import("../util/time.zig");
+
+/// 给任意 allocator 加互斥视图。ArenaAllocator 只隔离自己的链表元数据，它增长时仍会
+/// 调后备 allocator；多个 worker 直接以同一个 session arena 为后备会破坏 arena 状态。
+/// 该包装只活在一次并发 batch 内，所有 worker join 后才销毁，因此 ptr 生命周期稳定。
+const LockedAllocator = struct {
+    child: std.mem.Allocator,
+    mutex: platform.sync.Mutex = .{},
+
+    fn allocator(self: *LockedAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn cast(ctx: *anyopaque) *LockedAllocator {
+        return @ptrCast(@alignCast(ctx));
+    }
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self = cast(ctx);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self = cast(ctx);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self = cast(ctx);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self = cast(ctx);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
 
 pub const MAX_TOOL_CONCURRENCY: usize = 8;
 pub const MAX_TOOL_ERROR_PAYLOAD_BYTES_V1: usize = 1024 * 1024;
@@ -436,6 +484,8 @@ fn runConcurrentBatchWithSpawner(
     rid: log.RequestId,
     spawn_job: SpawnJobFn,
 ) error{ HostToolFatal, OutOfMemory }!void {
+    var locked_parent = LockedAllocator{ .child = parent_allocator };
+    const worker_allocator = locked_parent.allocator();
     var jobs = parent_allocator.alloc(Job, batch.len) catch {
         // 分配失败 → 退化串行
         for (batch) |*s| {
@@ -447,7 +497,7 @@ fn runConcurrentBatchWithSpawner(
         return;
     };
     defer parent_allocator.free(jobs);
-    for (batch, 0..) |*s, k| jobs[k] = .{ .slot = s, .ctx = base_ctx, .parent_allocator = parent_allocator, .rid = rid };
+    for (batch, 0..) |*s, k| jobs[k] = .{ .slot = s, .ctx = base_ctx, .parent_allocator = worker_allocator, .rid = rid };
 
     var threads = parent_allocator.alloc(?std.Thread, batch.len) catch {
         for (jobs) |*job| {

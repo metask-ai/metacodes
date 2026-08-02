@@ -1012,10 +1012,12 @@ fn similarity(a: []const u8, b: []const u8) f32 {
 /// 工具是否可与同批工具并发执行(对齐 cc isConcurrencySafe)。
 /// 安全 = 只读 + 不写任何共享态(或写的共享态已线程安全)。
 ///   Read(read_state 已加锁)/Glob/Grep/WebFetch/BashOutput → safe。
+///   WebSearch 会通过 ctx.api_client 使用 session-owned http.Client/arena，必须串行；
+///   std.http.Client 的连接池可并发，不代表它被配置的 allocator 也可并发。
 ///   Write/Edit/Bash/Task*/NotebookEdit/MCP/Skill 等有副作用或写共享态 → unsafe。
 /// 一期按工具名判定(cc 是 per-input;cc-zig 工具名足够,Bash 即便 readonly 也保守串行)。
 pub fn isConcurrencySafe(name: []const u8) bool {
-    const safe = [_][]const u8{ "Read", "Glob", "Grep", "WebFetch", "WebSearch", "BashOutput" };
+    const safe = [_][]const u8{ "Read", "Glob", "Grep", "WebFetch", "BashOutput" };
     for (safe) |s| if (std.mem.eql(u8, name, s)) return true;
     return false;
 }
@@ -1082,8 +1084,8 @@ fn hasOutputRedirect(cmd: []const u8) bool {
 }
 
 test "isConcurrencySafeInput: Bash readonly per-input" {
-    // WebSearch/WebFetch 只读 → safe(同轮多个可并发,对齐 cc)。
-    try std.testing.expect(isConcurrencySafe("WebSearch"));
+    // WebSearch 虽只读，但复用 session api_client + session arena，不能进并发批。
+    try std.testing.expect(!isConcurrencySafe("WebSearch"));
     try std.testing.expect(isConcurrencySafe("WebFetch"));
     try std.testing.expect(isConcurrencySafe("Read"));
     try std.testing.expect(!isConcurrencySafe("Write"));

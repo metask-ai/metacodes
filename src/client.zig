@@ -11,6 +11,8 @@ const Catalog = @import("api/catalog.zig").Catalog;
 const AbortSignal = @import("util/abort.zig").AbortSignal;
 const provider_mod = @import("api/provider.zig");
 const sync = @import("platform").sync;
+const rng = @import("platform").rng;
+const connection_gate = @import("api/connection_gate.zig");
 
 pub const VERSION = "0.1.0";
 
@@ -58,6 +60,11 @@ pub fn isTransientNetworkError(err: anyerror) bool {
         error.NetworkUnreachable,
         error.ConnectionRefused,
         error.TemporaryNameServerFailure,
+        // std.http folds TLS certificate loading/handshake setup resource failures into this
+        // concrete error. At request-setup time no response body has been consumed, so a bounded
+        // retry is safe; permanent failures still terminate at max_retries with the original
+        // concrete error retained in last_error diagnostics.
+        error.TlsInitializationFailed,
         // std.Io.Writer/Reader 把底层 broken-pipe/reset **包装成通用 WriteFailed/ReadFailed**,
         // 丢了具体 errno。写 HTTP 请求体 / 读响应头时它必是连接问题(尤其长驻 daemon 撞到
         // 服务端已关的 pooled keep-alive 连接)→ 该重试(重连拿新连接)。非连接场景的
@@ -86,15 +93,123 @@ pub fn isRetriableError(err: anyerror) bool {
     };
 }
 
-/// 重试退避(对齐 CC getRetryDelay):min(base * 2^(attempt-1), 32000) + jitter(0~25%)。
-/// attempt 从 1 起。base_ms 可注入(测试用小值避免真 sleep)。jitter 用 attempt 派生(确定性,
-/// 不引入全局 rng;测试可预测)。
-pub fn retryDelayMs(attempt: u32, base_ms: u64) u64 {
+/// 纯函数版本：sample 由调用方注入，便于测试边界；生产入口 retryDelayMs 使用系统熵。
+pub fn retryDelayMsWithSample(attempt: u32, base_ms: u64, sample: u64) u64 {
     const shift: u6 = @min(@as(u6, @intCast(@min(attempt -| 1, 16))), 6);
-    const base = @min(base_ms << shift, 32_000);
-    // jitter:0~25% of base,由 attempt 派生(确定性)。
-    const jitter = (base / 4) * (@as(u64, attempt) % 5) / 5;
+    const base = if (base_ms >= 32_000 or base_ms > (@as(u64, 32_000) >> shift))
+        32_000
+    else
+        base_ms << shift;
+    const jitter_max = base / 4;
+    const jitter = if (jitter_max == 0) 0 else sample % (jitter_max + 1);
     return base + jitter;
+}
+
+/// 重试退避(对齐 CC getRetryDelay):min(base * 2^(attempt-1), 32000) + 真随机 jitter(0~25%)。
+/// attempt 从 1 起。若系统熵源罕见失败，以单调时间 + 栈地址混合作为降级，避免退回所有
+/// session 按 attempt 同步重试的确定性羊群行为。
+pub fn retryDelayMs(attempt: u32, base_ms: u64) u64 {
+    var bytes: [8]u8 = undefined;
+    var sample: u64 = 0;
+    if (rng.randomBytes(&bytes)) {
+        for (bytes, 0..) |b, i| sample |= @as(u64, b) << @intCast(i * 8);
+    } else {
+        sample = @as(u64, @intCast(@max(time.nowMs(), 0))) ^ @as(u64, @intCast(@intFromPtr(&bytes))) ^ attempt;
+    }
+    return retryDelayMsWithSample(attempt, base_ms, sample);
+}
+
+pub const MAX_RETRY_AFTER_MS: u64 = 60_000;
+pub const TLS_SETUP_MAX_ATTEMPTS: u32 = 3;
+
+/// RFC 9110 Retry-After: delta-seconds or IMF-fixdate. Values are capped so a hostile/mistyped
+/// header cannot pin an agent indefinitely. `now_unix` is injectable for deterministic tests.
+pub fn parseRetryAfterMsAt(value_raw: []const u8, now_unix: i64) ?u64 {
+    const value = std.mem.trim(u8, value_raw, " \t");
+    if (value.len == 0) return null;
+    var all_digits = true;
+    var seconds: u64 = 0;
+    for (value) |c| {
+        if (c < '0' or c > '9') {
+            all_digits = false;
+            break;
+        }
+        seconds = @min(MAX_RETRY_AFTER_MS / 1000, seconds *| 10 +| (c - '0'));
+    }
+    if (all_digits) return @min(MAX_RETRY_AFTER_MS, seconds * 1000);
+
+    const target = parseHttpDateUnix(value) orelse return null;
+    if (target <= now_unix) return 0;
+    const delta: u64 = @intCast(target - now_unix);
+    return @min(MAX_RETRY_AFTER_MS, delta *| 1000);
+}
+
+fn parseHttpDateUnix(value: []const u8) ?i64 {
+    // IMF-fixdate: "Sun, 06 Nov 1994 08:49:37 GMT"
+    if (value.len != 29 or !std.mem.eql(u8, value[26..29], "GMT")) return null;
+    if (!std.mem.eql(u8, value[3..5], ", ") or value[7] != ' ' or value[11] != ' ' or
+        value[16] != ' ' or value[19] != ':' or value[22] != ':' or value[25] != ' ')
+        return null;
+    const day = parseFixed2(value[5..7]) orelse return null;
+    const month = monthNumber(value[8..11]) orelse return null;
+    const year = std.fmt.parseInt(i64, value[12..16], 10) catch return null;
+    const hour = parseFixed2(value[17..19]) orelse return null;
+    const minute = parseFixed2(value[20..22]) orelse return null;
+    const second = parseFixed2(value[23..25]) orelse return null;
+    if (hour > 23 or minute > 59 or second > 60) return null;
+    const days = daysFromCivil(year, month, day) orelse return null;
+    return days * 86_400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + second;
+}
+
+fn parseFixed2(s: *const [2]u8) ?u8 {
+    if (s[0] < '0' or s[0] > '9' or s[1] < '0' or s[1] > '9') return null;
+    return (s[0] - '0') * 10 + (s[1] - '0');
+}
+
+fn monthNumber(s: *const [3]u8) ?u8 {
+    const names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    for (names, 1..) |name, n| if (std.mem.eql(u8, s, name)) return @intCast(n);
+    return null;
+}
+
+fn daysFromCivil(year_raw: i64, month: u8, day: u8) ?i64 {
+    if (month < 1 or month > 12 or day < 1) return null;
+    const leap = @mod(year_raw, 4) == 0 and (@mod(year_raw, 100) != 0 or @mod(year_raw, 400) == 0);
+    const month_days = [_]u8{ 31, if (leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if (day > month_days[month - 1]) return null;
+    var year = year_raw;
+    if (month <= 2) year -= 1;
+    const era = @divFloor(year, 400);
+    const yoe = year - era * 400;
+    const adjusted_month: i64 = @as(i64, month) + (if (month > 2) @as(i64, -3) else @as(i64, 9));
+    const doy = @divFloor(153 * adjusted_month + 2, 5) + day - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    return era * 146_097 + doe - 719_468;
+}
+
+const RetryHint = struct { delay_ms: ?u64 = null };
+
+/// Deterministic L2 seam: fail the next N request-setup attempts with a concrete Zig error,
+/// then allow the real HTTP request. This proves the public retry wrapper is wired to setup
+/// classification; classifier-only unit tests cannot catch an earlier error-collapse bug.
+pub const RequestSetupFailureInjector = struct {
+    remaining: u32,
+    failure: anyerror,
+
+    fn take(self: *RequestSetupFailureInjector) ?anyerror {
+        if (self.remaining == 0) return null;
+        self.remaining -= 1;
+        return self.failure;
+    }
+};
+
+fn retryAfterFromHead(head: http.Client.Response.Head) ?u64 {
+    var it = head.iterateHeaders();
+    while (it.next()) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "retry-after"))
+            return parseRetryAfterMsAt(header.value, time.nowUnix());
+    }
+    return null;
 }
 
 /// 默认重试次数(对齐 CC DEFAULT_MAX_RETRIES=10;env CLAUDE_CODE_MAX_RETRIES 覆盖)。
@@ -148,6 +263,7 @@ pub const Client = struct {
     max_tokens_override: ?u32 = null,
     reasoning_effort: ?types.ReasoningEffort = null,
     abort_registry: provider_mod.RequestAbortRegistry = .{},
+    request_setup_failure_injector: ?*RequestSetupFailureInjector = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, api_key: []const u8, model: []const u8) Client {
         return initWithBaseUrl(allocator, io, api_key, model, null);
@@ -310,6 +426,8 @@ pub const Client = struct {
         const auth_header = std.fmt.allocPrint(client.allocator, "Bearer {s}", .{client.api_key}) catch return error.RequestFailed;
         defer secureFree(client.allocator, auth_header);
 
+        var connection_lease = connection_gate.acquire(null) catch return error.RequestFailed;
+        defer connection_lease.release();
         var req = client.http_client.request(.GET, uri, .{
             .keep_alive = false, // 同 POST:不复用陈旧连接
             .extra_headers = &.{
@@ -322,6 +440,7 @@ pub const Client = struct {
         req.sendBodiless() catch return error.RequestFailed;
         var redirect_buf: [4096]u8 = undefined;
         const http_response = req.receiveHead(&redirect_buf) catch return error.RequestFailed;
+        connection_lease.release();
         if (http_response.head.status != .ok) return error.HttpError;
 
         var transfer_buf: [8192]u8 = undefined;
@@ -358,7 +477,7 @@ pub const Client = struct {
         }, client.allocator);
         defer client.allocator.free(req_body);
 
-        const result = try client.doRequest(req_body, false, null);
+        const result = try client.doRequest(req_body, false, null, null);
         switch (result) {
             .full_body => |fb| {
                 defer client.allocator.free(fb.body);
@@ -404,6 +523,19 @@ pub const Client = struct {
         model_override: ?[]const u8,
         tool_choice: ?json_mod.ToolChoice,
     ) !StreamResponse {
+        return client.sendMessageStreamFullAttempt(messages, system, tools, abort, model_override, tool_choice, null);
+    }
+
+    fn sendMessageStreamFullAttempt(
+        client: *Client,
+        messages: []const types.ApiMessage,
+        system: ?[]const u8,
+        tools: ?[]const json_mod.ToolDefinition,
+        abort: ?*const AbortSignal,
+        model_override: ?[]const u8,
+        tool_choice: ?json_mod.ToolChoice,
+        retry_hint: ?*RetryHint,
+    ) !StreamResponse {
         const effective_model = model_override orelse client.modelSnapshot();
         const req_body = try json_mod.serializeMessagesRequest(.{
             .model = effective_model,
@@ -418,7 +550,7 @@ pub const Client = struct {
         // doRequest 内部 sendBodyComplete 是同步全发,返回后 body 即可释放(stream/error 都)。
         defer client.allocator.free(req_body);
 
-        const result = try client.doRequest(req_body, true, abort);
+        const result = try client.doRequest(req_body, true, abort, retry_hint);
         switch (result) {
             .streaming_response => |r| {
                 return StreamResponse.init(client.allocator, r, abort);
@@ -446,12 +578,20 @@ pub const Client = struct {
         const base_ms = if (retry_base_ms > 0) retry_base_ms else RETRY_BASE_MS;
         var attempt: u32 = 0;
         while (true) {
-            const r = client.sendMessageStreamFull(messages, system, tools, abort, model_override, tool_choice);
+            var retry_hint = RetryHint{};
+            const r = client.sendMessageStreamFullAttempt(messages, system, tools, abort, model_override, tool_choice, &retry_hint);
             if (r) |stream| {
                 return stream;
             } else |err| {
                 attempt += 1;
-                if (!isRetriableError(err) or attempt >= max_retries) {
+                // TlsInitializationFailed can hide both transient resource pressure and permanent
+                // certificate/protocol failures. Retrying is safe before body send, but cap it
+                // tighter than generic network/HTTP retries to avoid minutes of deterministic pain.
+                const effective_max_attempts = if (err == error.TlsInitializationFailed)
+                    @min(max_retries, TLS_SETUP_MAX_ATTEMPTS)
+                else
+                    max_retries;
+                if (!isRetriableError(err) or attempt >= effective_max_attempts) {
                     log.err("client", "stream connect failed after {d} attempt(s): {s}", .{ attempt, @errorName(err) });
                     // (Aborted 不在 sendMessageStreamFull 的 error set 里,编译器背书,无需分支。)
                     switch (err) {
@@ -459,15 +599,18 @@ pub const Client = struct {
                         error.Unauthorized, error.RateLimited, error.ServerError, error.BadGateway, error.ServiceUnavailable, error.HttpError, error.ContextWindowExceeded => last_error.noteAttempts(attempt),
                         // 连接类:无 HTTP 响应没走 logErrorBody,现场在这里补记。
                         else => {
-                            last_error.recordNamed("连接失败", @errorName(err));
+                            // doRequest 已记录具体底层错误（例如 TlsInitializationFailed）；
+                            // TransientNetwork 是对 send/receive 错误的分类壳，不能在这里覆盖现场。
+                            if (err != error.TransientNetwork)
+                                last_error.recordNamed("连接初始化失败", @errorName(err));
                             last_error.noteAttempts(attempt);
                         },
                     }
                     return err;
                 }
-                const delay = retryDelayMs(attempt, base_ms);
-                if (reporter) |rep| rep.report(rep.state, attempt, max_retries, delay);
-                log.warn("client", "stream connect retry {d}/{d} after {s}; sleeping {d}ms", .{ attempt, max_retries, @errorName(err), delay });
+                const delay = retry_hint.delay_ms orelse retryDelayMs(attempt, base_ms);
+                if (reporter) |rep| rep.report(rep.state, attempt, effective_max_attempts, delay);
+                log.warn("client", "stream connect retry {d}/{d} after {s}; sleeping {d}ms", .{ attempt, effective_max_attempts, @errorName(err), delay });
                 // 可中断 sleep:每 50ms 查一次 abort。
                 if (!interruptibleSleepMs(delay, abort)) return error.Aborted;
             }
@@ -479,6 +622,7 @@ pub const Client = struct {
         body: []const u8,
         streaming: bool,
         abort: ?*const AbortSignal,
+        retry_hint: ?*RetryHint,
     ) !RequestResult {
         const rid = log.genRequestId();
         const t_start = timestampMs();
@@ -518,8 +662,23 @@ pub const Client = struct {
         };
         errdefer client.allocator.destroy(req_ptr);
 
+        var connection_lease = try connection_gate.acquire(abort);
+        defer connection_lease.release();
+
+        if (client.request_setup_failure_injector) |injector| {
+            if (injector.take()) |err| {
+                log.errId("client", rid, "request setup injected failure: {s}", .{@errorName(err)});
+                if (isTransientNetworkError(err)) {
+                    last_error.recordNamed("连接初始化失败", @errorName(err));
+                    return err;
+                }
+                return error.RequestFailed;
+            }
+        }
+
         // keep_alive=false:长驻(serve/--web)复用连接池,空闲后服务端关连接,首个 sendBody 撞
-        // WriteFailed → 重试风暴(isTransientNetworkError 注释的病根)。对齐 openai/gemini client 根除。
+        // WriteFailed → 重试风暴(isTransientNetworkError 注释的病根)。新连接的握手洪峰由
+        // process-wide connection_gate(MAX_CONNECTING_REQUESTS) 限制，不重新引入陈旧池连接。
         req_ptr.* = client.http_client.request(.POST, uri, .{
             .keep_alive = false,
             .extra_headers = &.{
@@ -529,6 +688,10 @@ pub const Client = struct {
             },
         }) catch |err| {
             log.errId("client", rid, "request setup failed: {s}", .{@errorName(err)});
+            if (isTransientNetworkError(err)) {
+                last_error.recordNamed("连接初始化失败", @errorName(err));
+                return err;
+            }
             return error.RequestFailed;
         };
         // errdefer 销毁顺序：先 req.deinit()（释放连接/缓冲），再 destroy 槽位。
@@ -545,7 +708,11 @@ pub const Client = struct {
         // 发送 body
         req_ptr.sendBodyComplete(@constCast(body)) catch |err| {
             log.errId("client", rid, "sendBody failed: {s}", .{@errorName(err)});
-            if (isTransientNetworkError(err)) return error.TransientNetwork;
+            if (isTransientNetworkError(err)) {
+                last_error.recordNamed("连接失败", @errorName(err));
+                if (err == error.TlsInitializationFailed) return err;
+                return error.TransientNetwork;
+            }
             return error.RequestFailed;
         };
 
@@ -554,9 +721,17 @@ pub const Client = struct {
         const http_response = req_ptr.receiveHead(&redirect_buf) catch |err| {
             log.errId("client", rid, "receiveHead failed: {s}", .{@errorName(err)});
             // 网络瞬态错误(服务端关连接等)上抛区分性 error,让重试层识别;非瞬态塌缩 RequestFailed。
-            if (isTransientNetworkError(err)) return error.TransientNetwork;
+            if (isTransientNetworkError(err)) {
+                last_error.recordNamed("连接失败", @errorName(err));
+                if (err == error.TlsInitializationFailed) return err;
+                return error.TransientNetwork;
+            }
             return error.RequestFailed;
         };
+        // DNS/TCP/TLS + request-head phase is complete; active streaming must not consume a slot.
+        connection_lease.release();
+
+        if (retry_hint) |hint| hint.delay_ms = retryAfterFromHead(http_response.head);
 
         const status = http_response.head.status;
         const header_ms = timestampMs() - t_start;

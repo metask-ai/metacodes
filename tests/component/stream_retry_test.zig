@@ -6,6 +6,8 @@
 //!   ③ 退避公式:retryDelayMs(n) = min(base*2^(n-1),32000)+jitter
 //!   ④ 不可重试不重试:401 → Unauthorized 立即返回(0 重试)
 //!   ⑤ 重试耗尽:永远断 → max_retries 次后返 TransientNetwork,不无限循环
+//!   ⑥ Retry-After 响应头覆盖本地退避
+//!   ⑦ TLS request-setup 具体错误穿透分类并被真实 retry wrapper 重试
 //!
 //! 测试策略:MockServer.startFlaky(断连模拟) + Client.initWithBaseUrl + 短退避(base_ms=1)。
 
@@ -107,6 +109,109 @@ test "L2: retryDelayMs 指数退避 + cap + jitter 范围" {
     // 大 attempt: cap 32000(+jitter ≤ 8000)。
     const dbig = cc.client_mod.retryDelayMs(20, base);
     try std.testing.expect(dbig >= 32000 and dbig <= 40000);
+}
+
+test "L2 #6: jitter sample 可注入且不同 sample 不再同步" {
+    try std.testing.expectEqual(@as(u64, 500), cc.client_mod.retryDelayMsWithSample(1, 500, 0));
+    try std.testing.expectEqual(@as(u64, 625), cc.client_mod.retryDelayMsWithSample(1, 500, 125));
+    // 超大 base/attempt 必须饱和，不能 shift overflow。
+    const capped = cc.client_mod.retryDelayMsWithSample(99, std.math.maxInt(u64), 8_000);
+    try std.testing.expect(capped >= 32_000 and capped <= 40_000);
+}
+
+test "L2 #6: Retry-After delta/date 解析且恶意大值有上限" {
+    try std.testing.expectEqual(@as(?u64, 2_000), cc.client_mod.parseRetryAfterMsAt(" 2 ", 0));
+    try std.testing.expectEqual(@as(?u64, cc.client_mod.MAX_RETRY_AFTER_MS), cc.client_mod.parseRetryAfterMsAt("999999999999999999999", 0));
+    try std.testing.expectEqual(@as(?u64, 1_000), cc.client_mod.parseRetryAfterMsAt("Sun, 06 Nov 1994 08:49:37 GMT", 784_111_776));
+    try std.testing.expectEqual(@as(?u64, 0), cc.client_mod.parseRetryAfterMsAt("Sun, 06 Nov 1994 08:49:37 GMT", 784_111_777));
+    try std.testing.expect(cc.client_mod.parseRetryAfterMsAt("not-a-delay", 0) == null);
+}
+
+test "L2 #6: 429 Retry-After header 覆盖本地退避并进入第二次请求" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.startRepeatingStatus(
+        "{\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}",
+        "HTTP/1.1 429 Too Many Requests",
+        "Retry-After: 0\r\n",
+    );
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = mkClient(a, io_runtime.io(), url);
+    defer client.deinit();
+
+    const Report = struct {
+        calls: u32 = 0,
+        delay_ms: u64 = std.math.maxInt(u64),
+        fn report(raw: *anyopaque, _: u32, _: u32, delay_ms: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.delay_ms = delay_ms;
+        }
+    };
+    var report = Report{};
+    const reporter = cc.client_mod.RetryReporter{ .state = @ptrCast(&report), .report = Report.report };
+    const empty: []const cc.types_mod.ApiMessage = &.{};
+    const result = client.sendMessageStreamFullRetry(empty, null, null, null, null, null, 2, 500, reporter);
+    try std.testing.expectError(error.RateLimited, result);
+    try std.testing.expectEqual(@as(u32, 1), report.calls);
+    try std.testing.expectEqual(@as(u64, 0), report.delay_ms);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+}
+
+test "L2 #7: injected TLS setup failure is retried before a successful real request" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.start(OK_SSE, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = mkClient(a, io_runtime.io(), url);
+    defer client.deinit();
+    var injector = cc.client_mod.RequestSetupFailureInjector{
+        .remaining = 1,
+        .failure = error.TlsInitializationFailed,
+    };
+    client.request_setup_failure_injector = &injector;
+
+    try std.testing.expect(cc.client_mod.isTransientNetworkError(error.TlsInitializationFailed));
+    const empty: []const cc.types_mod.ApiMessage = &.{};
+    var resp = try client.sendMessageStreamFullRetry(empty, null, null, null, null, null, 3, 1, null);
+    defer resp.deinit();
+    try drainStream(&resp);
+    try std.testing.expect(resp.done);
+    try std.testing.expectEqual(@as(u32, 0), injector.remaining);
+    try std.testing.expectEqual(@as(usize, 1), srv.requestCount());
+}
+
+test "L2 #7: persistent TLS setup failure preserves concrete error and stops at bound" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.start(OK_SSE, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = mkClient(a, io_runtime.io(), url);
+    defer client.deinit();
+    var injector = cc.client_mod.RequestSetupFailureInjector{
+        .remaining = 99,
+        .failure = error.TlsInitializationFailed,
+    };
+    client.request_setup_failure_injector = &injector;
+
+    const empty: []const cc.types_mod.ApiMessage = &.{};
+    // Generic policy allows 10, but TLS setup has a dedicated safety cap of 3 attempts.
+    const result = client.sendMessageStreamFullRetry(empty, null, null, null, null, null, 10, 1, null);
+    try std.testing.expectError(error.TlsInitializationFailed, result);
+    try std.testing.expectEqual(@as(u32, 96), injector.remaining); // exactly three attempts
+    try std.testing.expectEqual(@as(usize, 0), srv.requestCount()); // failed before network I/O
 }
 
 // ④ 不可重试不重试:401 → Unauthorized 立即返回(retry 包装不重试 4xx)。

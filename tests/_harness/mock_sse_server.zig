@@ -26,6 +26,8 @@ pub const MockServer = struct {
     /// HTTP 状态行。默认 200 OK(走 chunked SSE)。非 200 时 sendResponse 发纯 body
     /// (application/json,非 chunked)——用于 Stage 6 HTTP 错误现场 L2(401/429/5xx)。
     status_line: []const u8 = "HTTP/1.1 200 OK",
+    /// Raw header lines, each ending in CRLF. Tests use this for Retry-After wiring.
+    extra_response_headers: []const u8 = "",
     /// 有序、不可变的请求账本。每条仅保留实际读取长度；borrowed accessor slice
     /// 在 stop() 前稳定。写入和读取均由 capture_mutex 建立可见性。
     captured_requests: [MAX_CAPTURED_REQUESTS]?[]u8 =
@@ -71,6 +73,25 @@ pub const MockServer = struct {
             .status_line = status_line,
         };
         self.thread = try std.Thread.spawn(.{}, serveOne, .{self});
+        return self;
+    }
+
+    /// Repeating non-200 response with caller-supplied headers. Unlike startWithStatus (one
+    /// connection), this accepts the retry wrapper's subsequent attempts.
+    pub fn startRepeatingStatus(body: []const u8, status_line: []const u8, extra_headers: []const u8) !*MockServer {
+        const listener = try net.listenLoopback(0, 16);
+        errdefer net.closeSocket(listener.sock);
+
+        const self = try std.heap.page_allocator.create(MockServer);
+        self.* = .{
+            .listen_sock = listener.sock,
+            .port = listener.port,
+            .thread = undefined,
+            .body = body,
+            .status_line = status_line,
+            .extra_response_headers = extra_headers,
+        };
+        self.thread = try std.Thread.spawn(.{}, serveLoop, .{self});
         return self;
     }
 
@@ -300,8 +321,10 @@ pub const MockServer = struct {
         // 让客户端的 HTTP 错误分支(logErrorBody)能读到 body。
         if (std.mem.indexOf(u8, self.status_line, "200") == null) {
             var hdr_buf: [256]u8 = undefined;
-            const hdr = std.fmt.bufPrint(&hdr_buf, "{s}\r\ncontent-type: application/json\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n", .{ self.status_line, self.body.len }) catch return;
+            const hdr = std.fmt.bufPrint(&hdr_buf, "{s}\r\ncontent-type: application/json\r\ncontent-length: {d}\r\nconnection: close\r\n", .{ self.status_line, self.body.len }) catch return;
             sendAll(conn, hdr);
+            sendAll(conn, self.extra_response_headers);
+            sendAll(conn, "\r\n");
             sendAll(conn, self.body);
             return;
         }
@@ -311,8 +334,10 @@ pub const MockServer = struct {
             "content-type: text/event-stream\r\n" ++
             "cache-control: no-cache\r\n" ++
             "transfer-encoding: chunked\r\n" ++
-            "connection: close\r\n\r\n";
+            "connection: close\r\n";
         sendAll(conn, header);
+        sendAll(conn, self.extra_response_headers);
+        sendAll(conn, "\r\n");
 
         if (self.gate_next_response.swap(false, .acq_rel)) {
             self.response_gate_entered.store(true, .release);

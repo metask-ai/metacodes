@@ -29,6 +29,7 @@
 
 const std = @import("std");
 const http = std.http;
+const connection_gate = @import("connection_gate.zig");
 const log = @import("../util/log.zig");
 const types = @import("../types.zig");
 const json_mod = @import("../json.zig");
@@ -152,8 +153,11 @@ pub const OpenAIClient = struct {
 
         const req_ptr = try self.allocator.create(http.Client.Request);
         errdefer self.allocator.destroy(req_ptr); // 唯一 destroy:所有错误路径靠它(不手动 destroy,否则 double-free)
+        var connection_lease = try connection_gate.acquire(abort);
+        defer connection_lease.release();
         req_ptr.* = self.http_client.request(.POST, uri, .{
-            .keep_alive = false, // 每请求独立连接(同 gemini_client:避免复用 pooled 连接致 HttpConnectionClosing)
+            // 保持禁用陈旧池连接；跨 provider 的 process-wide connection_gate 限制并发握手。
+            .keep_alive = false,
             .extra_headers = &.{
                 .{ .name = "content-type", .value = "application/json" },
                 .{ .name = "authorization", .value = auth },
@@ -185,6 +189,7 @@ pub const OpenAIClient = struct {
             log.errId("openai", rid, "receiveHead failed: {s}", .{@errorName(err)});
             return err;
         };
+        connection_lease.release();
         if (response.head.status != .ok) {
             log.errId("openai", rid, "HTTP {d}", .{@intFromEnum(response.head.status)});
             return error.RequestFailed;
