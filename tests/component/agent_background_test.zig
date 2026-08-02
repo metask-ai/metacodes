@@ -200,7 +200,10 @@ test "L2 后台并发: 多 job 各得不同 id 且都可查;MAX_BG_JOBS 上限�
     const a = std.testing.allocator;
 
     const bodies = [_][]const u8{BG_DONE_SSE};
-    var srv = try harness.MockServer.startCassette(&bodies, 3000); // 慢,保证并发期都 running
+    // 每个 BG_DONE 响应有 6 个 SSE chunk；500ms/chunk 让首个 job 至少保持
+    // running 3s，足以完成 8 个非阻塞 spawn，同时避免单线程 cassette server
+    // 把最坏清理时间放大成 8 * 6 * 3s = 144s。
+    var srv = try harness.MockServer.startCassette(&bodies, 500);
     defer srv.stop();
     const url = try srv.urlOwned(a);
     defer a.free(url);

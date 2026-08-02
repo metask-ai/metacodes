@@ -12,7 +12,7 @@
 //! **鉴权**:UDS 文件权限 0600(listenUnix chmod)——仅属主可连,无 CSRF/Origin 顾虑(非浏览器可达)。
 //!
 //! **生命周期(mirror WebServer)**:accept 线程 + per-conn detached 线程 + live_conns 计数;stop 先置
-//! closing 再 close(listen_fd)唤 accept,join,drain live_conns(≤12s),unlink socket 文件。attach 流靠
+//! closing 后 shutdown+close(listen_fd) 唤 accept，再 join、drain live_conns(≤12s)、unlink socket 文件。attach 流靠
 //! journal.close(关停时 serve 先调)唤醒 waitSince → session_closed → 退出(与 SSE 同机制)。
 
 const std = @import("std");
@@ -62,7 +62,8 @@ pub const UdsServer = struct {
 
     pub fn stop(self: *UdsServer) void {
         self.closing.store(true, .release);
-        net.closeSocket(self.listen_fd); // 唤 accept 阻塞
+        net.shutdownSocket(self.listen_fd); // Linux:跨线程 close 不保证唤醒已阻塞的 accept
+        net.closeSocket(self.listen_fd);
         self.accept_thread.join();
         // drain 连接线程(≤12s):journal 已 close 会唤醒 attach,普通请求线程靠 recv 超时查 closing。
         var waited: usize = 0;
