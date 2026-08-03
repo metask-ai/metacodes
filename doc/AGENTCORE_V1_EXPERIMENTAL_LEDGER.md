@@ -80,6 +80,17 @@ revision 4 准入引用的真实消费者证据：
 4. **E4 — stability horizon**：外部消费方出现后，连续 hard cut 的协调成本会改变。达到何种
    外部消费数量、支持期限、consumer matrix 与弃用周期时进入兼容窗口，留待真实交付数据
    决定；当前不预设 revision 编号、shim 或双分派。
+5. **E5 — CLI/App 与 AgentCore 并行语义路径**：Revision 6 为控制变更范围，明确不迁移
+   现有 CLI/App，因此仓内将暂时并存两条 Permission 路径和两套 MCP 协议栈：CLI/App
+   保留现有 SessionRules、settings persistence 与 `2025-06-18` MCP client；AgentCore
+   使用 Revision 6 的 specifier-scoped Session rules、policy generation、零写盘和双 era
+   MCP Runtime。这是已接受但必须显式维护的架构债务，不得被描述成已共享 canonical
+   semantics。**Owner**：AgentCore/Runtime 架构负责人；CLI/App 负责人参加联合影响评审。
+   **触发条件**：任一路径发生 Permission/MCP 的安全、authority、identity 或协议语义修复；
+   MCP compatibility window 滚动或 legacy adapter 退场；AgentCore 进入稳定支持候选。
+   任一条件触发时必须对两条路径执行影响审计与对应回归，避免单边安全修复。长期收敛路径
+   在“CLI 迁移到 AgentCore Runtime”与“共同下沉到窄 canonical seam”之间待定；本条目
+   不扩大 Revision 6 范围，也不授权修改 `src/core/agent_loop.zig`。
 
 ## F 组：SDK 生成卫生
 
