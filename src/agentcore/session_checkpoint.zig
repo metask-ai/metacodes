@@ -477,10 +477,14 @@ fn parseHeader(header: *const [HEADER_BYTES]u8, limits: Limits) Error!ParsedHead
     if (expected_total != total_bytes) return error.Corrupt;
     const session_id = SessionId.fromSlice(header[136..160]) orelse
         return error.Corrupt;
-    const terminal_kind = std.meta.intToEnum(
-        TerminalKind,
-        getInt(header, 160, u32),
-    ) catch return error.Corrupt;
+    const terminal_kind: TerminalKind = switch (getInt(header, 160, u32)) {
+        0 => .none,
+        1 => .run,
+        2 => .compact,
+        3 => .budget_exhausted,
+        4 => .resource_limit,
+        else => return error.Corrupt,
+    };
     const descriptor = Descriptor{
         .session_id = session_id,
         .checkpoint_generation = getInt(header, 32, u64),
@@ -551,7 +555,7 @@ const Writer = struct {
                 @as(usize, @intCast(self.limits.chunk_bytes)),
             );
             const part = bytes[offset..][0..count];
-            const next = try checkedAdd(self.written, @intCast(part.len));
+            const next = try checkedAdd(self.written, part.len);
             if (next > self.expected_total or next > self.limits.hard_bytes)
                 return error.ResourceLimit;
             if (hash) self.hasher.update(part);
@@ -588,7 +592,7 @@ const Reader = struct {
     }
 
     fn read(self: *Reader, out: []u8, hash: bool) Error!void {
-        const next = try checkedAdd(self.position, @intCast(out.len));
+        const next = try checkedAdd(self.position, out.len);
         if (next > self.expected_total or next > self.limits.hard_bytes)
             return error.ResourceLimit;
         var offset: usize = 0;
@@ -877,6 +881,120 @@ test "Revision 6 checkpoint streams and round-trips canonical Conversation" {
     try std.testing.expectEqual(@as(usize, 4), decoded.conversation.messages.items[0].blocks.len);
     try std.testing.expectEqualStrings("Read", decoded.conversation.messages.items[0].blocks[2].tool_use.name);
     try std.testing.expectEqualStrings("permission-state", decoded.permission_state);
+}
+
+test "Revision 6 checkpoint long Conversation honors exact byte and chunk budgets" {
+    const allocator = std.testing.allocator;
+    var conversation = Conversation.init(allocator);
+    defer conversation.deinit();
+
+    const message_count = 4096;
+    var index: usize = 0;
+    while (index < message_count) : (index += 1) {
+        var buffer: [128]u8 = undefined;
+        const text = try std.fmt.bufPrint(
+            &buffer,
+            "message-{d}-payload-for-streaming-checkpoint-conformance",
+            .{index},
+        );
+        try conversation.appendText(
+            if (index % 2 == 0) .user else .assistant,
+            text,
+        );
+    }
+    try conversation.restoreCompactState(message_count / 2, "long-summary");
+
+    const snapshot = Snapshot{
+        .session_id = core.session_id.gen(),
+        .checkpoint_generation = 11,
+        .last_run_id = 37,
+        .last_compact_id = 4,
+        .terminal_kind = .run,
+        .terminal_id = 37,
+        .model = "long-session-model",
+        .conversation = &conversation,
+    };
+    const roomy_limits = Limits{
+        .hard_bytes = 16 * 1024 * 1024,
+        .chunk_bytes = 31,
+    };
+    var measured_sink = TestSink{ .allocator = allocator };
+    defer measured_sink.deinit();
+    const measured = try exportToSink(
+        snapshot,
+        roomy_limits,
+        .{ .ctx = &measured_sink, .write_fn = TestSink.write },
+    );
+    try std.testing.expect(measured.total_bytes > 256 * 1024);
+    try std.testing.expect(measured.chunk_count > 1000);
+    try std.testing.expect(measured_sink.max_chunk <= roomy_limits.chunk_bytes);
+
+    var exact_sink = TestSink{ .allocator = allocator };
+    defer exact_sink.deinit();
+    const exact_limits = Limits{
+        .hard_bytes = measured.total_bytes,
+        .chunk_bytes = roomy_limits.chunk_bytes,
+    };
+    const exact = try exportToSink(
+        snapshot,
+        exact_limits,
+        .{ .ctx = &exact_sink, .write_fn = TestSink.write },
+    );
+    try std.testing.expectEqual(measured.total_bytes, exact.total_bytes);
+
+    var undersized_sink = TestSink{ .allocator = allocator };
+    defer undersized_sink.deinit();
+    var undersized_limits = exact_limits;
+    undersized_limits.hard_bytes -= 1;
+    try std.testing.expectError(error.ResourceLimit, exportToSink(
+        snapshot,
+        undersized_limits,
+        .{ .ctx = &undersized_sink, .write_fn = TestSink.write },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), undersized_sink.calls);
+
+    var source = TestSource{ .bytes = exact_sink.bytes.items, .step = 13 };
+    var decoded = try decodeFromSource(
+        allocator,
+        .{ .ctx = &source, .read_fn = TestSource.read },
+        exact_limits,
+    );
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(usize, message_count), decoded.conversation.len());
+    try std.testing.expectEqual(@as(usize, message_count / 2), decoded.conversation.compact_boundary);
+    try std.testing.expectEqualStrings("long-summary", decoded.conversation.compact_summary.?);
+    try std.testing.expectEqualStrings(
+        "message-4095-payload-for-streaming-checkpoint-conformance",
+        decoded.conversation.messages.items[message_count - 1].blocks[0].text,
+    );
+
+    var oversized_source = TestSource{ .bytes = exact_sink.bytes.items, .step = 17 };
+    try std.testing.expectError(error.ResourceLimit, decodeFromSource(
+        allocator,
+        .{ .ctx = &oversized_source, .read_fn = TestSource.read },
+        undersized_limits,
+    ));
+}
+
+test "Revision 6 checkpoint snapshot surface excludes runtime capabilities" {
+    const expected_fields = [_][]const u8{
+        "session_id",
+        "checkpoint_generation",
+        "last_run_id",
+        "last_compact_id",
+        "terminal_kind",
+        "terminal_id",
+        "model",
+        "conversation",
+        "policy_generation",
+        "catalog_generation",
+        "authority",
+    };
+    const fields = @typeInfo(Snapshot).@"struct".fields;
+    try std.testing.expectEqual(expected_fields.len, fields.len);
+    inline for (fields, 0..) |field, field_index| {
+        try std.testing.expectEqualStrings(expected_fields[field_index], field.name);
+    }
 }
 
 test "Revision 6 checkpoint rejects budget before first sink write" {

@@ -2,6 +2,7 @@
 
 const std = @import("std");
 pub const session_checkpoint = @import("session_checkpoint.zig");
+pub const session_authority = @import("session_authority.zig");
 const builtin = @import("builtin");
 const sync = @import("platform").sync;
 const wire = @import("metask_agentcore_types");
@@ -176,7 +177,7 @@ fn createInitialSkillBinding(
 }
 
 const AbiSession = struct {
-    const CallState = enum { idle, running, compacting, mutating, destroying };
+    const CallState = enum { idle, running, compacting, mutating, checkpointing, destroying };
 
     callbacks: wire.SessionCallbacksV1,
     callback_status: std.atomic.Value(u32),
@@ -190,6 +191,19 @@ const AbiSession = struct {
     policy_root: ?*policy_frame.PolicyFrame = null,
     call_mutex: sync.Mutex = .{},
     call_state: CallState = .idle,
+    checkpoint_generation: u64 = 0,
+    policy_generation: u64 = 0,
+    catalog_generation: u64 = 0,
+    logical_origin: session_authority.LogicalOrigin = .fresh,
+    restore_health: session_authority.RestoreHealth = .complete,
+    invalidated_skill_authority: u32 = 0,
+    invalidated_permission_rules: u32 = 0,
+    invalidated_mcp_bindings: u32 = 0,
+    last_terminal_kind: session_checkpoint.TerminalKind = .none,
+    last_terminal_id: u64 = 0,
+    /// Revision 6 Permission will replace this fail-closed bridge with the
+    /// canonical bounded Permission authority section.
+    has_uncheckpointable_permission_memory: std.atomic.Value(bool) = .init(false),
 
     fn handle(self: *AbiSession) *wire.SessionHandle {
         return @ptrCast(self);
@@ -305,10 +319,12 @@ const AbiSession = struct {
             .permission => |choice| switch (choice) {
                 .allow_always => {
                     self.core_session.session_rules.rememberAllow(permission.tool);
+                    self.has_uncheckpointable_permission_memory.store(true, .release);
                     out.* = .{ .permission = .allow_once };
                 },
                 .deny_tool_session => {
                     self.core_session.session_rules.rememberDeny(permission.tool);
+                    self.has_uncheckpointable_permission_memory.store(true, .release);
                     out.* = .{ .permission = .deny_once };
                 },
                 .allow_once, .deny_once => {},
@@ -369,6 +385,164 @@ const AbiSession = struct {
         defer self.call_mutex.unlock();
         std.debug.assert(self.call_state == .mutating);
         self.call_state = .idle;
+    }
+
+    fn tryBeginCheckpoint(self: *AbiSession) bool {
+        self.call_mutex.lock();
+        defer self.call_mutex.unlock();
+        if (self.call_state != .idle) return false;
+        self.call_state = .checkpointing;
+        return true;
+    }
+
+    fn finishCheckpoint(self: *AbiSession) void {
+        self.call_mutex.lock();
+        defer self.call_mutex.unlock();
+        std.debug.assert(self.call_state == .checkpointing);
+        self.call_state = .idle;
+    }
+
+    fn commitCheckpointGeneration(self: *AbiSession, generation: u64) void {
+        self.call_mutex.lock();
+        defer self.call_mutex.unlock();
+        std.debug.assert(self.call_state == .checkpointing);
+        std.debug.assert(generation > self.checkpoint_generation);
+        self.checkpoint_generation = generation;
+    }
+
+    fn recordTerminal(
+        self: *AbiSession,
+        kind: session_checkpoint.TerminalKind,
+        operation_id: u64,
+    ) void {
+        std.debug.assert(kind == .run or kind == .compact);
+        std.debug.assert(operation_id != 0);
+        self.call_mutex.lock();
+        defer self.call_mutex.unlock();
+        self.last_terminal_kind = kind;
+        self.last_terminal_id = operation_id;
+    }
+
+    fn terminalForCheckpoint(
+        self: *const AbiSession,
+        lease: *const core.agent_session.CheckpointLease,
+    ) struct { kind: session_checkpoint.TerminalKind, id: u64 } {
+        switch (self.last_terminal_kind) {
+            .run => if (self.last_terminal_id == lease.last_run_id)
+                return .{ .kind = .run, .id = self.last_terminal_id },
+            .compact => if (self.last_terminal_id == lease.last_compact_id)
+                return .{ .kind = .compact, .id = self.last_terminal_id },
+            .none, .budget_exhausted, .resource_limit => {},
+        }
+        // Direct Core tests may have advanced a Session without traversing the
+        // facade. Prefer the Run anchor because it preserves strict Run-ID
+        // continuation; compact identity remains independently encoded.
+        if (lease.last_run_id != 0)
+            return .{ .kind = .run, .id = lease.last_run_id };
+        if (lease.last_compact_id != 0)
+            return .{ .kind = .compact, .id = lease.last_compact_id };
+        return .{ .kind = .none, .id = 0 };
+    }
+
+    fn exportCheckpoint(
+        self: *AbiSession,
+        limits: session_checkpoint.Limits,
+        sink: session_checkpoint.Sink,
+    ) !session_checkpoint.ExportReport {
+        if (self.facade_poisoned.load(.acquire))
+            return error.InvalidSessionState;
+        const runtime = self.runtime orelse return error.InvalidSessionState;
+        var runtime_call = try runtime.catalogs.enterCall();
+        defer runtime_call.deinit();
+        if (!self.tryBeginCheckpoint()) return error.SessionBusy;
+        defer self.finishCheckpoint();
+        if (self.has_uncheckpointable_permission_memory.load(.acquire))
+            return error.PermissionStateUnavailable;
+
+        var lease = try self.core_session.snapshotCommitted();
+        defer lease.deinit();
+        const binding_snapshot = if (self.skill_binding) |*binding|
+            binding.snapshot()
+        else
+            null;
+        const binding_selection = if (self.skill_binding) |*binding|
+            &binding.selection
+        else
+            null;
+        const skill_state = try session_authority.encodeSkillState(
+            allocator,
+            binding_snapshot,
+            binding_selection,
+        );
+        defer allocator.free(skill_state);
+        const permission_state = try session_authority.encodePermissionState(
+            allocator,
+            self.core_session.permission_ctx.modeValue(),
+        );
+        defer allocator.free(permission_state);
+        const next_generation = std.math.add(
+            u64,
+            self.checkpoint_generation,
+            1,
+        ) catch return error.ResourceLimit;
+        const terminal = self.terminalForCheckpoint(&lease);
+        const report = try session_checkpoint.exportToSink(.{
+            .session_id = lease.session_id,
+            .checkpoint_generation = next_generation,
+            .last_run_id = lease.last_run_id,
+            .last_compact_id = lease.last_compact_id,
+            .terminal_kind = terminal.kind,
+            .terminal_id = terminal.id,
+            .model = lease.model,
+            .conversation = lease.conversation,
+            .policy_generation = self.policy_generation,
+            .catalog_generation = self.catalog_generation,
+            .authority = .{
+                .skill = skill_state,
+                .permission = permission_state,
+            },
+        }, limits, sink);
+        self.commitCheckpointGeneration(next_generation);
+        return report;
+    }
+
+    fn describe(
+        self: *AbiSession,
+        description_allocator: std.mem.Allocator,
+    ) !session_authority.SessionDescription {
+        const runtime = self.runtime orelse return error.InvalidSessionState;
+        var runtime_call = try runtime.catalogs.enterCall();
+        defer runtime_call.deinit();
+        if (!self.tryBeginCheckpoint()) return error.SessionBusy;
+        defer self.finishCheckpoint();
+        var lease = try self.core_session.snapshotCommitted();
+        defer lease.deinit();
+        const model = description_allocator.dupe(u8, lease.model) catch
+            return error.OutOfMemory;
+        errdefer description_allocator.free(model);
+        return .{
+            .allocator = description_allocator,
+            .session_id = lease.session_id,
+            .origin = self.logical_origin,
+            .lifecycle = .idle,
+            .registered = true,
+            .last_run_id = lease.last_run_id,
+            .last_compact_id = lease.last_compact_id,
+            .checkpoint_generation = self.checkpoint_generation,
+            .policy_generation = self.policy_generation,
+            .catalog_generation = self.catalog_generation,
+            .model = model,
+            .conversation_messages = @intCast(lease.conversation.messages.items.len),
+            .compact_boundary = @intCast(lease.conversation.compact_boundary),
+            .skill_revision = if (self.skill_binding) |*binding|
+                binding.snapshot().revision
+            else
+                null,
+            .restore_health = self.restore_health,
+            .invalidated_skill_authority = self.invalidated_skill_authority,
+            .invalidated_permission_rules = self.invalidated_permission_rules,
+            .invalidated_mcp_bindings = self.invalidated_mcp_bindings,
+        };
     }
 
     fn tryBeginDestroy(self: *AbiSession) bool {
@@ -1637,6 +1811,211 @@ fn skillCatalogRelease(
     return wire.STATUS_OK;
 }
 
+const SessionBuildConfig = struct {
+    callbacks: wire.SessionCallbacksV1,
+    provider_kind: core.types.ProviderKind,
+    api_key: []const u8,
+    model: []const u8,
+    base_url: ?[]const u8,
+    permission_mode: core.types.PermissionMode,
+    permission_rules: ?core.permission_settings.RuleSetInput,
+    workspace: core.agent_session.WorkspaceConfig,
+    allowed_tools: []const []const u8,
+    workspace_scope_id: [64]u8,
+    skill_binding: ?SkillBinding,
+    restored: ?*const session_checkpoint.Decoded = null,
+    skill_summary: session_authority.AuthoritySummary = .{},
+};
+
+const RestoreHostConfig = struct {
+    callbacks: wire.SessionCallbacksV1,
+    provider_kind: core.types.ProviderKind,
+    api_key: []const u8,
+    base_url: ?[]const u8,
+    permission_mode: core.types.PermissionMode,
+    permission_rules: ?core.permission_settings.RuleSetInput,
+    workspace: core.agent_session.WorkspaceConfig,
+    allowed_tools: []const []const u8,
+    workspace_scope_id: [64]u8,
+};
+
+const InternalRestoreResult = struct {
+    session: *AbiSession,
+    report: session_authority.RestoreReport,
+};
+
+/// Construct a facade only from canonical, already-bounded inputs. The caller
+/// retains `skill_binding` on failure and transfers it on success.
+fn buildAbiSession(
+    runtime: *AbiRuntime,
+    config: SessionBuildConfig,
+) !*AbiSession {
+    const self = try allocator.create(AbiSession);
+    self.* = .{
+        .callbacks = config.callbacks,
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = undefined,
+        .runtime = runtime,
+        .workspace_scope_id = config.workspace_scope_id,
+        .skill_binding = config.skill_binding,
+        .checkpoint_generation = if (config.restored) |decoded|
+            decoded.descriptor.checkpoint_generation
+        else
+            0,
+        .policy_generation = if (config.restored) |decoded|
+            decoded.descriptor.policy_generation
+        else
+            0,
+        .catalog_generation = if (config.restored) |decoded|
+            decoded.descriptor.catalog_generation
+        else
+            0,
+        .logical_origin = if (config.restored == null) .fresh else .restored,
+        .restore_health = switch (config.skill_summary.disposition) {
+            .not_bound, .restored => .complete,
+            .narrowed, .unavailable, .changed => .degraded,
+        },
+        .invalidated_skill_authority = config.skill_summary.invalidated,
+        .invalidated_permission_rules = 0,
+        .invalidated_mcp_bindings = 0,
+        .last_terminal_kind = if (config.restored) |decoded|
+            decoded.descriptor.terminal_kind
+        else
+            .none,
+        .last_terminal_id = if (config.restored) |decoded|
+            decoded.descriptor.terminal_id
+        else
+            0,
+    };
+    errdefer allocator.destroy(self);
+
+    const core_config = core.agent_session.SessionConfig{
+        .provider_kind = config.provider_kind,
+        .api_key = config.api_key,
+        .model = config.model,
+        .base_url = config.base_url,
+        .permission_mode = config.permission_mode,
+        .permission_rules = config.permission_rules,
+        .workspace = config.workspace,
+        .allowed_tools = config.allowed_tools,
+        .run_ui_requester = if (config.callbacks.on_ui_request != null)
+            .{ .ctx = self, .requestFn = AbiSession.requestUi }
+        else
+            null,
+        .host_identity_ctx = self,
+    };
+    self.core_session = if (config.restored) |decoded|
+        try runtime.core_runtime.createRestoredSession(core_config, .{
+            .session_id = decoded.descriptor.session_id,
+            .last_run_id = decoded.descriptor.last_run_id,
+            .last_compact_id = decoded.descriptor.last_compact_id,
+            .conversation = @constCast(&decoded.conversation),
+        })
+    else
+        try runtime.core_runtime.createSession(core_config);
+    errdefer self.core_session.destroy() catch unreachable;
+
+    self.policy_root = try policy_frame.PolicyFrame.createRoot(
+        allocator,
+        config.allowed_tools,
+        config.workspace.shell,
+        config.permission_mode,
+        .{
+            .cwd = config.workspace.root,
+            .project_root = config.workspace.root,
+            .home = config.workspace.home,
+        },
+    );
+    return self;
+}
+
+/// Internal Revision 6 restore seam. `current_skill_binding` is consumed on
+/// every path after decoding succeeds. It represents current Host authority,
+/// while the checkpoint selection is intersected as the historical ceiling.
+fn restoreCheckpoint(
+    runtime: *AbiRuntime,
+    config: RestoreHostConfig,
+    current_skill_binding: *?SkillBinding,
+    source: session_checkpoint.Source,
+    limits: session_checkpoint.Limits,
+) !InternalRestoreResult {
+    var runtime_call = try runtime.catalogs.enterCall();
+    defer runtime_call.deinit();
+    var decoded = try session_checkpoint.decodeFromSource(
+        allocator,
+        source,
+        limits,
+    );
+    defer decoded.deinit();
+    const restored_permission = try session_authority.decodePermissionState(
+        decoded.permission_state,
+    );
+    if (restored_permission.mode != config.permission_mode)
+        return error.PermissionModeMismatch;
+    if (decoded.descriptor.policy_generation != 0)
+        return error.PermissionStateUnsupported;
+    if (decoded.mcp_state.len != 0 or
+        decoded.descriptor.catalog_generation != 0)
+        return error.McpStateUnsupported;
+    var restored_skill = try session_authority.decodeSkillState(
+        allocator,
+        decoded.skill_state,
+    );
+    defer if (restored_skill) |*state| state.deinit();
+
+    var binding = current_skill_binding.*;
+    current_skill_binding.* = null;
+    var keep_binding = false;
+    defer if (!keep_binding) if (binding) |*value|
+        value.deinit(&runtime.catalogs);
+    var reconciliation = try session_authority.reconcileSkillState(
+        allocator,
+        if (restored_skill) |*state| state else null,
+        if (binding) |*value| value.snapshot() else null,
+        if (binding) |*value| &value.selection else null,
+    );
+    defer reconciliation.deinit();
+    if (reconciliation.takeSelection()) |replacement| {
+        const value = if (binding) |*existing| existing else return error.InvalidState;
+        var previous = value.selection;
+        value.selection = replacement;
+        previous.deinit();
+    } else if (binding) |*value| {
+        value.deinit(&runtime.catalogs);
+        binding = null;
+    }
+
+    const skill_summary = reconciliation.summary();
+    const self = try buildAbiSession(runtime, .{
+        .callbacks = config.callbacks,
+        .provider_kind = config.provider_kind,
+        .api_key = config.api_key,
+        .model = decoded.model,
+        .base_url = config.base_url,
+        .permission_mode = config.permission_mode,
+        .permission_rules = config.permission_rules,
+        .workspace = config.workspace,
+        .allowed_tools = config.allowed_tools,
+        .workspace_scope_id = config.workspace_scope_id,
+        .skill_binding = binding,
+        .restored = &decoded,
+        .skill_summary = skill_summary,
+    });
+    keep_binding = true;
+    return .{
+        .session = self,
+        .report = .{
+            .health = self.restore_health,
+            .session_id = self.core_session.session_id,
+            .checkpoint_generation = self.checkpoint_generation,
+            .policy_generation = self.policy_generation,
+            .catalog_generation = self.catalog_generation,
+            .skill = skill_summary,
+        },
+    };
+}
+
 fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.SessionConfigV1, callbacks_ptr: ?*const wire.SessionCallbacksV1, out_session: ?*?*wire.SessionHandle, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
     if (out_session) |out| out.* = null;
     emptyError(out_error);
@@ -1727,17 +2106,8 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
         );
     }
 
-    const self = allocator.create(AbiSession) catch return fail(wire.STATUS_OUT_OF_MEMORY, "allocating Session failed", out_error);
-    self.callbacks = callbacks.*;
-    self.callback_status = .init(wire.STATUS_OK);
-    self.facade_poisoned = .init(false);
-    self.runtime = runtime;
-    self.workspace_scope_id = workspace_scope_id;
-    self.skill_binding = initial_binding;
-    self.policy_root = null;
-    self.call_mutex = .{};
-    self.call_state = .idle;
-    self.core_session = runtime.core_runtime.createSession(.{
+    const self = buildAbiSession(runtime, .{
+        .callbacks = callbacks.*,
         .provider_kind = kind,
         .api_key = api_key,
         .model = model,
@@ -1746,31 +2116,18 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
         .permission_rules = initial_permission_rules,
         .workspace = .{ .root = workspace.root, .home = workspace.home, .shell = shell },
         .allowed_tools = allowed,
-        .run_ui_requester = if (callbacks.on_ui_request != null) .{ .ctx = self, .requestFn = AbiSession.requestUi } else null,
-        // Host tool 身份锚点 = 本 AbiSession;仅 AbiHostTool 适配层可解释此指针。
-        .host_identity_ctx = self,
+        .workspace_scope_id = workspace_scope_id,
+        .skill_binding = initial_binding,
     }) catch |err| {
-        allocator.destroy(self);
-        return failError(sessionCreateErrorStatus(err), err, out_error);
-    };
-    self.policy_root = policy_frame.PolicyFrame.createRoot(
-        allocator,
-        allowed,
-        shell,
-        mode,
-        .{
-            .cwd = workspace.root,
-            .project_root = workspace.root,
-            .home = workspace.home,
-        },
-    ) catch |err| {
-        // The Session has not escaped and no Run can exist yet. A destroy
-        // failure here would be an internal lifecycle invariant violation,
-        // not a recoverable construction error.
-        self.core_session.destroy() catch unreachable;
-        allocator.destroy(self);
         return failError(
-            if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_INVALID_ARGUMENT,
+            if (err == error.OutOfMemory)
+                wire.STATUS_OUT_OF_MEMORY
+            else if (err == error.ResourceLimit)
+                wire.STATUS_RESOURCE_LIMIT
+            else if (err == error.InvalidPolicy)
+                wire.STATUS_INVALID_ARGUMENT
+            else
+                sessionCreateErrorStatus(err),
             err,
             out_error,
         );
@@ -1984,6 +2341,7 @@ fn sessionRunInput(
         },
         else => return fail(wire.STATUS_INVALID_ARGUMENT, "unknown RunInputV1 kind", out_error),
     };
+    self.recordTerminal(.run, run_id);
     const result = switch (execution) {
         .aborted => {
             out.* = .{
@@ -2055,6 +2413,7 @@ fn sessionCompact(
         return fail(wire.STATUS_INVALID_ARGUMENT, "out_result is required", out_error);
     const report = self.core_session.compact(operation_id, .{}) catch |err|
         return failError(compactStatus(err), err, out_error);
+    self.recordTerminal(.compact, operation_id);
     out.* = .{
         .struct_size = @sizeOf(wire.CompactResultV1),
         .outcome_code = switch (report.outcome) {
@@ -2133,6 +2492,62 @@ pub export fn metask_agentcore_get_api(requested_abi: u32) callconv(.c) ?*const 
     if (requested_abi != wire.ABI_VERSION_V1) return null;
     return @ptrCast(&api_v1);
 }
+
+const TestCheckpointBuffer = struct {
+    allocator: std.mem.Allocator,
+    bytes: std.ArrayList(u8) = .empty,
+    read_offset: usize = 0,
+
+    fn write(raw: *anyopaque, part: []const u8) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try self.bytes.appendSlice(self.allocator, part);
+    }
+
+    fn read(raw: *anyopaque, out: []u8) anyerror!usize {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.read_offset == self.bytes.items.len) return 0;
+        const count = @min(out.len, self.bytes.items.len - self.read_offset);
+        @memcpy(
+            out[0..count],
+            self.bytes.items[self.read_offset..][0..count],
+        );
+        self.read_offset += count;
+        return count;
+    }
+
+    fn sink(self: *@This()) session_checkpoint.Sink {
+        return .{ .ctx = self, .write_fn = write };
+    }
+
+    fn source(self: *@This()) session_checkpoint.Source {
+        self.read_offset = 0;
+        return .{ .ctx = self, .read_fn = read };
+    }
+
+    fn clear(self: *@This()) void {
+        self.bytes.clearRetainingCapacity();
+        self.read_offset = 0;
+    }
+
+    fn deinit(self: *@This()) void {
+        self.bytes.deinit(self.allocator);
+    }
+};
+
+const TestEventSink = struct {
+    fn emit(
+        _: *anyopaque,
+        _: core.session_id.SessionId,
+        _: u64,
+        _: core.protocol.ui_event.CoreEvent,
+    ) bool {
+        return true;
+    }
+
+    fn sink(ctx: *u8) core.agent_session.EventSink {
+        return .{ .ctx = ctx, .emit = emit };
+    }
+};
 
 test "ABI discovery is versioned" {
     try std.testing.expect(metask_agentcore_get_api(0) == null);
@@ -2784,6 +3199,526 @@ test "Session create maps caller configuration errors to invalid argument" {
     try std.testing.expectEqual(wire.STATUS_OUT_OF_MEMORY, sessionCreateErrorStatus(error.OutOfMemory));
     try std.testing.expectEqual(wire.STATUS_INVALID_STATE, sessionCreateErrorStatus(error.RuntimeUnavailable));
     try std.testing.expectEqual(wire.STATUS_CORE_ERROR, sessionCreateErrorStatus(error.Unexpected));
+}
+
+test "Revision 6 AgentCore checkpoint export commits generation only after sink success" {
+    const CaptureSink = struct {
+        allocator: std.mem.Allocator,
+        bytes: std.ArrayList(u8) = .empty,
+        fail: bool = false,
+        read_offset: usize = 0,
+
+        fn write(raw: *anyopaque, part: []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fail) return error.HostSinkFailed;
+            try self.bytes.appendSlice(self.allocator, part);
+        }
+
+        fn sink(self: *@This()) session_checkpoint.Sink {
+            return .{ .ctx = self, .write_fn = write };
+        }
+
+        fn read(raw: *anyopaque, out: []u8) anyerror!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.read_offset == self.bytes.items.len) return 0;
+            const count = @min(
+                out.len,
+                self.bytes.items.len - self.read_offset,
+            );
+            @memcpy(
+                out[0..count],
+                self.bytes.items[self.read_offset..][0..count],
+            );
+            self.read_offset += count;
+            return count;
+        }
+
+        fn clear(self: *@This()) void {
+            self.bytes.clearRetainingCapacity();
+            self.read_offset = 0;
+        }
+
+        fn deinit(self: *@This()) void {
+            self.bytes.deinit(self.allocator);
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const cwd = root_buffer[0..root_len];
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{} },
+    );
+    const native_session = try native_runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
+    });
+    try native_session.conversation.appendText(.user, "persist me");
+    var runtime = AbiRuntime{
+        .core_runtime = native_runtime,
+        .host_tools = &.{},
+        .catalogs = skill_catalog_handles.RuntimeCatalogs.initWithSecret(
+            std.testing.allocator,
+            [_]u8{0x61} ** 32,
+        ),
+        .materializations = undefined,
+    };
+    var session = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = native_session,
+        .runtime = &runtime,
+    };
+    var capture = CaptureSink{ .allocator = std.testing.allocator };
+    defer capture.deinit();
+    const limits = session_checkpoint.Limits{
+        .hard_bytes = 1024 * 1024,
+        .chunk_bytes = 17,
+    };
+
+    const first = try session.exportCheckpoint(limits, capture.sink());
+    try std.testing.expectEqual(@as(u64, 1), session.checkpoint_generation);
+    try std.testing.expectEqual(first.total_bytes, capture.bytes.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, capture.bytes.items, "test-key") == null);
+    try std.testing.expectEqual(AbiSession.CallState.idle, session.call_state);
+    var description = try session.describe(std.testing.allocator);
+    defer description.deinit();
+    try std.testing.expectEqual(@as(u64, 1), description.checkpoint_generation);
+    try std.testing.expectEqualStrings("test-model", description.model);
+    try std.testing.expectEqual(@as(u64, 1), description.conversation_messages);
+    try std.testing.expectEqualSlices(
+        u8,
+        native_session.session_id.asSlice(),
+        description.session_id.asSlice(),
+    );
+
+    capture.clear();
+    capture.fail = true;
+    try std.testing.expectError(
+        error.SinkFailed,
+        session.exportCheckpoint(limits, capture.sink()),
+    );
+    try std.testing.expectEqual(@as(u64, 1), session.checkpoint_generation);
+    try std.testing.expectEqual(AbiSession.CallState.idle, session.call_state);
+    var lease = try native_session.snapshotCommitted();
+    lease.deinit();
+
+    capture.fail = false;
+    const second = try session.exportCheckpoint(limits, capture.sink());
+    try std.testing.expectEqual(@as(u64, 2), session.checkpoint_generation);
+    try std.testing.expectEqual(second.total_bytes, capture.bytes.items.len);
+    const source = session_checkpoint.Source{
+        .ctx = &capture,
+        .read_fn = CaptureSink.read,
+    };
+    var decoded = try session_checkpoint.decodeFromSource(
+        std.testing.allocator,
+        source,
+        limits,
+    );
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u64, 2), decoded.descriptor.checkpoint_generation);
+    try std.testing.expectEqualStrings("test-model", decoded.model);
+    try std.testing.expectEqual(@as(usize, 0), decoded.skill_state.len);
+
+    var event_ctx: u8 = 0;
+    var active_run = try native_session.admitRun(1, TestEventSink.sink(&event_ctx));
+    capture.clear();
+    try std.testing.expectError(
+        error.SessionBusy,
+        session.exportCheckpoint(limits, capture.sink()),
+    );
+    try std.testing.expectEqual(@as(u64, 2), session.checkpoint_generation);
+    try std.testing.expectEqual(AbiSession.CallState.idle, session.call_state);
+    try std.testing.expectEqual(@as(usize, 0), capture.bytes.items.len);
+    _ = try active_run.finishWithoutConversation();
+    var after_busy = try session.describe(std.testing.allocator);
+    after_busy.deinit();
+
+    session.call_state = .running;
+    try std.testing.expectError(
+        error.SessionBusy,
+        session.exportCheckpoint(limits, capture.sink()),
+    );
+    try std.testing.expectError(
+        error.SessionBusy,
+        session.describe(std.testing.allocator),
+    );
+    session.call_state = .idle;
+    session.has_uncheckpointable_permission_memory.store(true, .release);
+    try std.testing.expectError(
+        error.PermissionStateUnavailable,
+        session.exportCheckpoint(limits, capture.sink()),
+    );
+    try std.testing.expectEqual(@as(u64, 2), session.checkpoint_generation);
+
+    try native_session.destroy();
+    try native_runtime.destroy();
+    try runtime.catalogs.tryBeginDestroy();
+    runtime.catalogs.finishDestroy();
+}
+
+test "Revision 6 AgentCore restore is atomic and continues logical operation IDs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const cwd = root_buffer[0..root_len];
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{} },
+    );
+    const original = try native_runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "old-key",
+        .model = "checkpoint-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
+    });
+    try original.conversation.appendText(.user, "survives restore");
+    var event_ctx: u8 = 0;
+    var admitted = try original.admitRun(7, TestEventSink.sink(&event_ctx));
+    _ = try admitted.finishWithoutConversation();
+
+    var runtime = AbiRuntime{
+        .core_runtime = native_runtime,
+        .host_tools = &.{},
+        .catalogs = skill_catalog_handles.RuntimeCatalogs.initWithSecret(
+            std.testing.allocator,
+            [_]u8{0x62} ** 32,
+        ),
+        .materializations = undefined,
+    };
+    var original_facade = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = original,
+        .runtime = &runtime,
+    };
+    original_facade.recordTerminal(.run, 7);
+    var checkpoint = TestCheckpointBuffer{ .allocator = std.testing.allocator };
+    defer checkpoint.deinit();
+    const limits = session_checkpoint.Limits{
+        .hard_bytes = 1024 * 1024,
+        .chunk_bytes = 23,
+    };
+    _ = try original_facade.exportCheckpoint(limits, checkpoint.sink());
+    try std.testing.expect(std.mem.indexOf(u8, checkpoint.bytes.items, "old-key") == null);
+
+    var canonical_workspace = try skill_catalog_handles.CanonicalWorkspace.init(
+        std.testing.allocator,
+        cwd,
+        cwd,
+    );
+    defer canonical_workspace.deinit();
+    const scope_id = try runtime.catalogs.scopeId(&canonical_workspace);
+    const restore_config = RestoreHostConfig{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .provider_kind = .anthropic,
+        .api_key = "new-key",
+        .base_url = null,
+        .permission_mode = .default,
+        .permission_rules = null,
+        .workspace = .{ .root = cwd, .home = cwd },
+        .allowed_tools = &.{},
+        .workspace_scope_id = scope_id,
+    };
+    var no_binding: ?SkillBinding = null;
+
+    try std.testing.expectError(
+        error.SessionAlreadyOpen,
+        restoreCheckpoint(
+            &runtime,
+            restore_config,
+            &no_binding,
+            checkpoint.source(),
+            limits,
+        ),
+    );
+    try std.testing.expect(no_binding == null);
+
+    const first_byte = checkpoint.bytes.items[0];
+    checkpoint.bytes.items[0] = 'X';
+    try std.testing.expectError(
+        error.Corrupt,
+        restoreCheckpoint(
+            &runtime,
+            restore_config,
+            &no_binding,
+            checkpoint.source(),
+            limits,
+        ),
+    );
+    checkpoint.bytes.items[0] = first_byte;
+
+    try original.destroy();
+    const restored = try restoreCheckpoint(
+        &runtime,
+        restore_config,
+        &no_binding,
+        checkpoint.source(),
+        limits,
+    );
+    try std.testing.expectEqual(
+        session_authority.RestoreHealth.complete,
+        restored.report.health,
+    );
+    try std.testing.expectEqual(@as(u64, 1), restored.report.checkpoint_generation);
+    try std.testing.expectEqual(
+        session_authority.LogicalOrigin.restored,
+        restored.session.logical_origin,
+    );
+    try std.testing.expectEqual(@as(usize, 1), restored.session.core_session.conversation.len());
+    try std.testing.expectEqualStrings("checkpoint-model", restored.session.core_session.model);
+    try std.testing.expectEqualStrings("new-key", restored.session.core_session.api_key);
+    try std.testing.expectError(
+        error.StaleRun,
+        restored.session.core_session.admitRun(7, TestEventSink.sink(&event_ctx)),
+    );
+    var continued = try restored.session.core_session.admitRun(
+        8,
+        TestEventSink.sink(&event_ctx),
+    );
+    _ = try continued.finishWithoutConversation();
+
+    var description = try restored.session.describe(std.testing.allocator);
+    defer description.deinit();
+    try std.testing.expectEqual(@as(u64, 8), description.last_run_id);
+    try std.testing.expectEqual(@as(u64, 1), description.checkpoint_generation);
+    try std.testing.expectEqual(session_authority.LogicalOrigin.restored, description.origin);
+
+    var continued_checkpoint = TestCheckpointBuffer{ .allocator = std.testing.allocator };
+    defer continued_checkpoint.deinit();
+    _ = try restored.session.exportCheckpoint(limits, continued_checkpoint.sink());
+    var decoded = try session_checkpoint.decodeFromSource(
+        std.testing.allocator,
+        continued_checkpoint.source(),
+        limits,
+    );
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u64, 2), decoded.descriptor.checkpoint_generation);
+    try std.testing.expectEqual(@as(u64, 8), decoded.descriptor.last_run_id);
+    try std.testing.expectEqual(session_checkpoint.TerminalKind.run, decoded.descriptor.terminal_kind);
+    try std.testing.expectEqual(@as(u64, 8), decoded.descriptor.terminal_id);
+
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer bufferRelease(&diagnostic);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        sessionDestroy(restored.session.handle(), &diagnostic),
+    );
+    try native_runtime.destroy();
+    try runtime.catalogs.tryBeginDestroy();
+    runtime.catalogs.finishDestroy();
+}
+
+test "Revision 6 AgentCore restore degrades unavailable and changed Skill authority" {
+    const record = skill_catalog.SkillRecord{
+        .skill_id = [_]u8{'1'} ** 64,
+        .invocation_name = "checkpoint-skill",
+        .definition = .{
+            .name = "checkpoint-skill",
+            .description = "checkpoint-skill",
+            .body = "checkpoint-skill",
+            .allowed_tools = &.{},
+            .disallowed_tools = &.{},
+            .arguments = &.{},
+            .disable_model_invocation = false,
+            .context = .inline_ctx,
+            .agent = "",
+            .model = "",
+            .shell = "bash",
+            .source_path = "",
+        },
+        .directories = &.{},
+        .files = &.{},
+    };
+    var snapshot_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer snapshot_arena.deinit();
+    var snapshot = skill_catalog.Snapshot{
+        .owner_allocator = std.testing.allocator,
+        .arena = snapshot_arena,
+        .scope_id = [_]u8{'2'} ** 64,
+        .revision = [_]u8{'3'} ** 64,
+        .health = .healthy,
+        .skills = &.{record},
+        .issues = &.{},
+        .descriptor_json = "",
+        .snapshot_bytes = 0,
+        .resident_bytes = 0,
+    };
+    var selection = try skill_availability.Selection.init(
+        std.testing.allocator,
+        &snapshot,
+        .{ .default_state = .enabled, .exceptions = &.{} },
+    );
+    defer selection.deinit();
+    const skill_state = try session_authority.encodeSkillState(
+        std.testing.allocator,
+        &snapshot,
+        &selection,
+    );
+    defer std.testing.allocator.free(skill_state);
+    const permission_state = try session_authority.encodePermissionState(
+        std.testing.allocator,
+        .default,
+    );
+    defer std.testing.allocator.free(permission_state);
+    var conversation = core.conversation.Conversation.init(std.testing.allocator);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "restore even when Skill is unavailable");
+    const logical_id = core.session_id.SessionId.fromSlice(
+        "0000000000000000000000bb",
+    ).?;
+    const limits = session_checkpoint.Limits{
+        .hard_bytes = 1024 * 1024,
+        .chunk_bytes = 31,
+    };
+    var checkpoint = TestCheckpointBuffer{ .allocator = std.testing.allocator };
+    defer checkpoint.deinit();
+    _ = try session_checkpoint.exportToSink(.{
+        .session_id = logical_id,
+        .checkpoint_generation = 1,
+        .last_run_id = 0,
+        .last_compact_id = 0,
+        .terminal_kind = .none,
+        .terminal_id = 0,
+        .model = "checkpoint-model",
+        .conversation = &conversation,
+        .authority = .{
+            .skill = skill_state,
+            .permission = permission_state,
+        },
+    }, limits, checkpoint.sink());
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const cwd = root_buffer[0..root_len];
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{} },
+    );
+    var runtime = AbiRuntime{
+        .core_runtime = native_runtime,
+        .host_tools = &.{},
+        .catalogs = skill_catalog_handles.RuntimeCatalogs.initWithSecret(
+            std.testing.allocator,
+            [_]u8{0x63} ** 32,
+        ),
+        .materializations = undefined,
+    };
+    var workspace = try skill_catalog_handles.CanonicalWorkspace.init(
+        std.testing.allocator,
+        cwd,
+        cwd,
+    );
+    defer workspace.deinit();
+    const scope_id = try runtime.catalogs.scopeId(&workspace);
+    const base_config = RestoreHostConfig{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .provider_kind = .anthropic,
+        .api_key = "new-key",
+        .base_url = null,
+        .permission_mode = .default,
+        .permission_rules = null,
+        .workspace = .{ .root = cwd, .home = cwd },
+        .allowed_tools = &.{},
+        .workspace_scope_id = scope_id,
+    };
+
+    var no_binding: ?SkillBinding = null;
+    var mismatched_mode = base_config;
+    mismatched_mode.permission_mode = .auto;
+    try std.testing.expectError(
+        error.PermissionModeMismatch,
+        restoreCheckpoint(
+            &runtime,
+            mismatched_mode,
+            &no_binding,
+            checkpoint.source(),
+            limits,
+        ),
+    );
+
+    const unavailable = try restoreCheckpoint(
+        &runtime,
+        base_config,
+        &no_binding,
+        checkpoint.source(),
+        limits,
+    );
+    try std.testing.expectEqual(
+        session_authority.RestoreHealth.degraded,
+        unavailable.report.health,
+    );
+    try std.testing.expectEqual(
+        session_authority.SkillDisposition.unavailable,
+        unavailable.report.skill.disposition,
+    );
+    try std.testing.expectEqual(@as(u32, 1), unavailable.report.skill.invalidated);
+    try std.testing.expect(unavailable.session.skill_binding == null);
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        sessionDestroy(unavailable.session.handle(), &diagnostic),
+    );
+    bufferRelease(&diagnostic);
+
+    const changed_host = try runtime.catalogs.query(
+        std.testing.io,
+        &workspace,
+        "changed-epoch",
+        &.{},
+        .{},
+    );
+    const all_enabled = skill_availability.Spec{
+        .default_state = .enabled,
+        .exceptions = &.{},
+    };
+    var changed_binding = try createInitialSkillBinding(
+        &runtime,
+        &scope_id,
+        changed_host,
+        &all_enabled,
+    );
+    try changed_host.release();
+    const changed = try restoreCheckpoint(
+        &runtime,
+        base_config,
+        &changed_binding,
+        checkpoint.source(),
+        limits,
+    );
+    try std.testing.expect(changed_binding == null);
+    try std.testing.expectEqual(
+        session_authority.RestoreHealth.degraded,
+        changed.report.health,
+    );
+    try std.testing.expectEqual(
+        session_authority.SkillDisposition.changed,
+        changed.report.skill.disposition,
+    );
+    try std.testing.expectEqual(@as(u32, 1), changed.report.skill.invalidated);
+    try std.testing.expect(changed.session.skill_binding == null);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        sessionDestroy(changed.session.handle(), &diagnostic),
+    );
+    bufferRelease(&diagnostic);
+
+    try native_runtime.destroy();
+    try runtime.catalogs.tryBeginDestroy();
+    runtime.catalogs.finishDestroy();
 }
 
 test "ABI Runtime rejects process-only built-ins as invalid input" {
