@@ -4,6 +4,7 @@ const std = @import("std");
 pub const session_checkpoint = @import("session_checkpoint.zig");
 pub const session_authority = @import("session_authority.zig");
 pub const session_permission = @import("session_permission.zig");
+pub const mcp_protocol = @import("mcp_protocol.zig");
 const builtin = @import("builtin");
 const sync = @import("platform").sync;
 const wire = @import("metask_agentcore_types");
