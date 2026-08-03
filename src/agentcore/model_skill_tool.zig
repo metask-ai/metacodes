@@ -1,4 +1,4 @@
-//! Run-local model-facing `Skill` tool for a bound Revision 5 Skill binding.
+//! Run-local model-facing `Skill` tool for a bound Revision 6 Skill binding.
 //!
 //! This adapter deliberately lives in AgentCore. It projects one internal
 //! provider tool into the existing agent loop, resolves only against the
@@ -36,6 +36,10 @@ pub const Options = struct {
     event_sink: core.agent_session.EventSink,
     max_turns: u32,
     agent_depth: u8 = 0,
+    /// Optional AgentCore-owned lower overlay (currently the Session MCP
+    /// view). Skill remains the outer policy boundary and may only narrow it.
+    base_surface: ?core.agent_session.RunToolSurface = null,
+    base_policy: ?core.tools.ToolExecutionPolicy = null,
 };
 
 /// A synchronous Run owns this value at a stable address. Definitions,
@@ -53,6 +57,9 @@ pub const Environment = struct {
     event_sink: core.agent_session.EventSink,
     max_turns: u32,
     agent_depth: u8,
+    base_definitions: []const core.json.ToolDefinition,
+    base_dispatcher: core.tools.ToolDispatcher,
+    base_policy: ?core.tools.ToolExecutionPolicy,
 
     definitions: []core.json.ToolDefinition,
     properties: []core.json.PropSpec,
@@ -106,7 +113,14 @@ pub const Environment = struct {
         @memcpy(properties, &model_semantics.INPUT_PROPERTIES);
         properties[0].enum_values = owned_names;
 
-        const base_definitions = options.session.tools.definitions;
+        const base_definitions = if (options.base_surface) |base|
+            base.definitions
+        else
+            options.session.tools.definitions;
+        const base_dispatcher = if (options.base_surface) |base|
+            base.dispatcher
+        else
+            options.session.tools.dispatcher();
         const definitions = options.allocator.alloc(
             core.json.ToolDefinition,
             base_definitions.len + 1,
@@ -135,6 +149,9 @@ pub const Environment = struct {
             .event_sink = options.event_sink,
             .max_turns = options.max_turns,
             .agent_depth = options.agent_depth,
+            .base_definitions = base_definitions,
+            .base_dispatcher = base_dispatcher,
+            .base_policy = options.base_policy,
             .definitions = definitions,
             .properties = properties,
             .invocation_names = owned_names,
@@ -202,7 +219,7 @@ pub const Environment = struct {
     ) anyerror!core.tools.ToolDispatchOutcome {
         const self: *Environment = @ptrCast(@alignCast(@constCast(raw)));
         if (!std.mem.eql(u8, name, TOOL_NAME)) {
-            return self.session.tools.dispatcher().dispatch(
+            return self.base_dispatcher.dispatch(
                 tool_ctx,
                 name,
                 arguments_json,
@@ -223,23 +240,24 @@ pub const Environment = struct {
 
     fn nameAt(raw: *const anyopaque, index: usize) ?[]const u8 {
         const self: *const Environment = @ptrCast(@alignCast(raw));
-        if (index < self.session.tools.definitions.len)
-            return self.session.tools.dispatcher().nameAt(index);
-        if (index == self.session.tools.definitions.len) return TOOL_NAME;
+        if (index < self.base_definitions.len)
+            return self.base_dispatcher.nameAt(index);
+        if (index == self.base_definitions.len) return TOOL_NAME;
         return null;
     }
 
     fn hostSync(raw: *const anyopaque, name: []const u8) bool {
         const self: *const Environment = @ptrCast(@alignCast(raw));
         if (std.mem.eql(u8, name, TOOL_NAME)) return false;
-        return self.session.tools.dispatcher().isHostSync(name);
+        return self.base_dispatcher.isHostSync(name);
     }
 
     fn allowsTool(raw: *const anyopaque, name: []const u8) bool {
         const self: *const Environment = @ptrCast(@alignCast(raw));
         if (std.mem.eql(u8, name, TOOL_NAME))
             return self.current_frame.allowsSkillTool();
-        return self.current_frame.executionPolicy().allowsTool(name);
+        if (!self.current_frame.executionPolicy().allowsTool(name)) return false;
+        return if (self.base_policy) |policy| policy.allowsTool(name) else true;
     }
 
     fn allowsInvocation(
@@ -250,10 +268,12 @@ pub const Environment = struct {
         const self: *const Environment = @ptrCast(@alignCast(raw));
         if (std.mem.eql(u8, name, TOOL_NAME))
             return self.current_frame.allowsSkillInvocation(arguments_json);
-        return self.current_frame.executionPolicy().allowsInvocation(
-            name,
-            arguments_json,
-        );
+        if (!self.current_frame.executionPolicy().allowsInvocation(name, arguments_json))
+            return false;
+        return if (self.base_policy) |policy|
+            policy.allowsInvocation(name, arguments_json)
+        else
+            true;
     }
 
     fn invokeSkill(
@@ -371,6 +391,11 @@ pub const Environment = struct {
             .event_sink = self.event_sink,
             .max_turns = self.max_turns,
             .agent_depth = child_depth,
+            .base_surface = .{
+                .definitions = self.base_definitions,
+                .dispatcher = self.base_dispatcher,
+            },
+            .base_policy = self.base_policy,
         }) catch |err| {
             activation.deinit() catch return error.CoreError;
             return err;
@@ -524,4 +549,72 @@ fn childDepth(parent: u8) error{AgentDepthExceeded}!u8 {
     if (parent >= core.tool_context.MAX_AGENT_DEPTH)
         return error.AgentDepthExceeded;
     return parent + 1;
+}
+
+test "Skill execution policy cannot re-authorize a denied MCP base tool" {
+    const Deny = struct {
+        fn tool(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+        fn invocation(_: *const anyopaque, _: []const u8, _: []const u8) bool {
+            return false;
+        }
+        fn policy() core.tools.ToolExecutionPolicy {
+            return .{
+                .ctx = &unit,
+                .allowsToolFn = tool,
+                .allowsInvocationFn = invocation,
+            };
+        }
+        const unit: u8 = 0;
+    };
+    const model_name = "mcp__weather__0123456789abcdef0123456789abcdef";
+    const root = try policy_frame.PolicyFrame.createRoot(
+        std.testing.allocator,
+        &.{model_name},
+        .sandboxed,
+        .default,
+        .{ .cwd = "/work", .project_root = "/work", .home = "/home/test" },
+    );
+    defer root.release();
+    var environment: Environment = undefined;
+    environment.current_frame = root;
+    environment.base_policy = Deny.policy();
+    try std.testing.expect(!environment.executionPolicy().allowsTool(model_name));
+    try std.testing.expect(!environment.executionPolicy().allowsInvocation(
+        model_name,
+        "{\"city\":\"Paris\"}",
+    ));
+    const definition = core.json.ToolDefinition{
+        .name = model_name,
+        .description = "MCP inheritance fixture",
+        .input_schema = .{},
+    };
+    var child = core.tool_context.ToolSetExecutionPolicy{
+        .definitions = &.{definition},
+        .parent = environment.executionPolicy(),
+    };
+    try std.testing.expect(!child.executionPolicy().allowsInvocation(
+        model_name,
+        "{\"city\":\"Paris\"}",
+    ));
+
+    // Both layers must agree. Removing the lower denial exposes the current
+    // Skill frame's own decision. A child agent still intersects its selected
+    // definitions with that parent and can never widen either layer.
+    environment.base_policy = null;
+    child.parent = environment.executionPolicy();
+    try std.testing.expect(environment.executionPolicy().allowsInvocation(
+        model_name,
+        "{\"city\":\"Paris\"}",
+    ));
+    try std.testing.expect(child.executionPolicy().allowsInvocation(
+        model_name,
+        "{\"city\":\"Paris\"}",
+    ));
+    var narrowed_child = core.tool_context.ToolSetExecutionPolicy{
+        .definitions = &.{},
+        .parent = environment.executionPolicy(),
+    };
+    try std.testing.expect(!narrowed_child.executionPolicy().allowsTool(model_name));
 }

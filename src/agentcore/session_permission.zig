@@ -429,6 +429,36 @@ pub const State = struct {
         };
     }
 
+    /// Remove stale grants for one external authority namespace without
+    /// changing policy generation or disturbing unrelated Session decisions.
+    /// The facade calls this only behind its idle mutation gate.
+    pub fn invalidateUnresolvable(
+        self: *State,
+        namespace: ToolNamespace,
+        resolver: ExternalIdentityResolver,
+    ) u32 {
+        std.debug.assert(namespace != .builtin);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var invalidated: u32 = 0;
+        var index: usize = 0;
+        while (index < self.rules.items.len) {
+            const rule = &self.rules.items[index];
+            if (rule.namespace != namespace or resolver.isResolvable(.{
+                .namespace = rule.namespace,
+                .name = rule.tool_name,
+                .binding = rule.binding,
+            })) {
+                index += 1;
+                continue;
+            }
+            var removed = self.rules.orderedRemove(index);
+            removed.deinit(self.allocator);
+            invalidated += 1;
+        }
+        return invalidated;
+    }
+
     fn matchingRule(
         self: *State,
         action: SessionRuleAction,
@@ -488,6 +518,15 @@ pub const Reconciliation = struct {
     pub fn deinit(self: *Reconciliation) void {
         if (self.state) |*state| state.deinit();
         self.* = undefined;
+    }
+};
+
+pub const ExternalIdentityResolver = struct {
+    ctx: *const anyopaque,
+    is_resolvable_fn: *const fn (ctx: *const anyopaque, tool: ToolIdentity) bool,
+
+    pub fn isResolvable(self: ExternalIdentityResolver, tool: ToolIdentity) bool {
+        return self.is_resolvable_fn(self.ctx, tool);
     }
 };
 
@@ -591,13 +630,32 @@ pub fn decodeCheckpoint(
 /// Revalidate checkpoint grants against current authority. A policy mismatch
 /// restores the Conversation under a fresh generation with no grants. Rules
 /// whose external Tool binding is not currently resolvable are invalidated
-/// individually; MCP adds its resolver in the later integration phase.
+/// individually. The resolver-aware entry point below covers Host and MCP
+/// identities without teaching this canonical state machine either registry.
 pub fn reconcileCheckpoint(
     allocator: std.mem.Allocator,
     decoded: *const DecodedCheckpoint,
     current_mode: core.types.PermissionMode,
     current_fingerprint: PolicyFingerprint,
     current_allowed_tools: []const []const u8,
+) Error!Reconciliation {
+    return reconcileCheckpointWithResolver(
+        allocator,
+        decoded,
+        current_mode,
+        current_fingerprint,
+        current_allowed_tools,
+        null,
+    );
+}
+
+pub fn reconcileCheckpointWithResolver(
+    allocator: std.mem.Allocator,
+    decoded: *const DecodedCheckpoint,
+    current_mode: core.types.PermissionMode,
+    current_fingerprint: PolicyFingerprint,
+    current_allowed_tools: []const []const u8,
+    external_resolver: ?ExternalIdentityResolver,
 ) Error!Reconciliation {
     const compatible = decoded.mode == current_mode and std.mem.eql(
         u8,
@@ -624,9 +682,13 @@ pub fn reconcileCheckpoint(
     var restored: u32 = 0;
     var invalidated: u32 = 0;
     for (decoded.rules) |rule| {
-        const resolvable = rule.tool.namespace == .builtin and
+        const resolvable = if (rule.tool.namespace == .builtin)
             isKnownBuiltin(rule.tool.name) and
-            containsString(current_allowed_tools, rule.tool.name);
+                containsString(current_allowed_tools, rule.tool.name)
+        else if (external_resolver) |resolver|
+            resolver.isResolvable(rule.tool)
+        else
+            false;
         if (!resolvable) {
             invalidated += 1;
             continue;
