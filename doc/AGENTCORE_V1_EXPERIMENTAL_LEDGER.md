@@ -8,6 +8,10 @@
 > ① A 组四项关闭；② B 组**逐项形成明确 disposition**，其中 **B1、B3 必须修复或给出
 > 不修的正式论证**（歧义 wire format 与 schema 静默吞字段冻结后再修就是 breaking，
 > "修复队列"的名字不降低其严重性）；③ 引用闭包审查；④ 真实消费者门禁。
+>
+> **Revision 6 disposition（2026-08-03）**：A3、B2、C8、E2 已由 Revision 6
+> canonical seam、public wire 与 conformance tests 关闭；E4 已形成明确的 hard-cut/
+> 单代 MCP compatibility window 处置但继续作为发布治理项；E5 继续作为显式双路径债务跟踪。
 
 ## A 组：复冻前必须正面解决（评审方点名四项）
 
@@ -15,7 +19,7 @@
 |---|------|----------|----------|
 | A1 | 成功 Run 可能无任何可取得的最终输出（on_event 可空且事件被丢弃，RunResult 无文本/usage） | `.h` on_event optional 条款；`abi_v1.zig` emit 丢弃路径 | 三选一进消费端观测（强制 on_event / RunResult 带 final snapshot / 明文纯事件流 API）。实现方倾向：明文纯事件流 + on_event 必填（RunResult 带 owned 文本会把 POD 摘要变成带释放义务的资源，代价大） |
 | A2 | Host 工具 FAILED/REJECTED 丢失错误详情，模型无法自纠 | revision 2 前的 `AbiHostTool.execute` 释放并忽略非 OK 内容 | **已关闭（revision 2）**：FAILED/REJECTED 可携带 16 MiB 内原始 UTF-8 detail；统一 serializer 在转义后按 1 MiB 完整 payload 限额，超限降级为有界通用业务错误；错误 payload 绕过通用结果落盘与 aggregate budget；原文、控制字符、近界、release、真实回调链路与大错误详情保真均有测试 |
-| A3 | allow_always 隐藏持久化副作用（写 `<ws>/.claude/settings.local.json` 或 `~/.claude/settings.json`），且 core Session 创建**只建 SessionRules 不读盘**——只写不读 = 制造垃圾文件，不是 persistence | `permission/prompt.zig:63`、`settings_writer.zig`、`agent_session.zig` SessionRules 创建路径 | **推荐方案一（Host 全责）**：ABI 模式下 core 不写盘，作用域仅限当前 Session；Host 本就通过 UI 回调产出每个 permission 决定，长期持久化 = Host 自存并对后续同类 prompt 自动作答，零新增 wire token。**wire 词汇同步改名以免撒谎**：core 只记 Session 的语义下 `allow_always` 名不副实，实验期改为 `allow_once / allow_session / deny_once / deny_session`；若保留 `allow_always` 则必须写明 Host 返回它之前已承担持久化义务、持久化失败不得返回该值。测试：ABI 模式零写盘 + 新 Session 重新 prompt。若改选方案二（AgentCore 全责）则须定义完整 load/write 格式/优先级/错误语义 + round-trip L2。**无零写盘或 round-trip 测试，A3 不关闭** |
+| A3 | allow_always 隐藏持久化副作用（写 `<ws>/.claude/settings.local.json` 或 `~/.claude/settings.json`），且 core Session 创建**只建 SessionRules 不读盘**——只写不读 = 制造垃圾文件，不是 persistence | `permission/prompt.zig:63`、`settings_writer.zig`、`agent_session.zig` SessionRules 创建路径 | **已关闭（Revision 6，Host 全责）**：公开 response 只有 `allow_once / allow_session / deny_once / deny_session`，不存在 `allow_always`；AgentCore grant 只属于 logical Session，可经 Host checkpoint 恢复但不写产品 settings。`Revision 6 AgentCore Permission callback binds grants and preserves typed unavailable` 在真实临时 Workspace 中断言 `.claude`/`.metacodes` 均未创建，并创建同 Runtime/Workspace 的 fresh Session 断言零 grant、重新进入 ask；rules replacement/restore 另有 generation 与 authority 测试。CLI/App 的 settings writer 不在 AgentCore 调用图中，长期授权仍由 Host 自存并在后续 Session 导入明确规则 |
 | A4 | MC_SHELL_SANDBOXED 跨平台承诺不真实（仅 macOS，非 macOS 到首次 Bash 才暴露） | `sandbox/exec.zig:69` 平台分支与运行期探测 | **双层且 Session 校验不可省**：bundle capability 只声明"编译了该实现"；`session_create(SANDBOXED)` **必须运行期探测**当前机器实际可用（macOS bundle ≠ sandbox-exec 存在），不可用即创建失败——绝不拖到首次 Bash。"target OS 猜可用性"是同一个错误换衣服 |
 
 ## B 组：解冻期修复队列（协议/硬化）
@@ -23,7 +27,7 @@
 | # | 问题 | 处置方向 |
 |---|------|----------|
 | B1 | AskQuestion 多选用 ", " 拼接（label 含逗号即歧义） | 改为 per-question 字符串数组 `{"answers":[{"values":[...]}]}`；实验期 breaking 许可 |
-| B2 | UI 缺"用户主动取消"与 UNAVAILABLE 的区分 | 与 B1 同批设计（用户决定 ≠ 基础设施不可用） |
+| B2 | UI 缺"用户主动取消"与 UNAVAILABLE 的区分 | **已关闭（Revision 6）**：Permission canonical outcome 固定为 `answered / user_cancelled / unavailable / contract_failure`，并进入 `permission_provenance`；`UI_CANCELLED` 与 `UI_UNAVAILABLE` 保持独立 ABI status。Permission callback 测试逐一断言四态及 release，AskQuestion L2 另断言 cancelled 与 unavailable 都不 poison Session |
 | B3 | Host 工具 schema 非严格子集（未知顶层字段静默忽略） | 拒绝未知顶层关键字；required 引用必须存在且不重复；定义工具名长度与 provider-safe 字符集；Runtime 创建时失败，不留到 provider 请求 |
 | B4 | prompt 无硬上限（RESOURCE_LIMIT 防御模型不完整） | 加宽松硬上限，阈值待消费端负载数据 |
 
@@ -40,7 +44,7 @@ revision 4 准入引用的真实消费者证据：
 5. **C5（开放）**：prompt/event 合理硬上限（联动 B4）；
 6. **C6（开放）**：Runtime/Session config 的后续扩展机制；
 7. **C7（开放）**：异步/流式 Run；
-8. **C8（开放）**：Conversation 导出；
+8. **C8（已关闭，Revision 6）**：通过 Host-owned bounded checkpoint sink/source 导出并恢复 canonical Conversation；不增加无 authority envelope 的裸 transcript 导出。长 Conversation/chunk/budget、Runtime 重建、degraded restore 与 continued Run 均有测试；
 9. **C9（已验证，2026-07-27）— MetaWork pre-session Skill discovery 与 typed invocation**：
    - 消费方证据固定在 MetaWork commit
      `4e0f30dfe44fea29288f35d334f2532ecf8df071`；
@@ -60,27 +64,36 @@ revision 4 准入引用的真实消费者证据：
 - [x] 明确 revision 2 依赖 64 位指针布局，header 对 32 位消费端编译期拒绝；
 - [x] 明确禁止 C++ exception / longjmp 等非局部跳转跨越回调与 release 边界。
 
-## E 组：Revision 5 后续架构观测（不自动扩入当前 revision）
+## E 组：Revision 5 后续架构观测与 Revision 6 disposition
 
 以下项目来自 2026-08-01 的外部 Host 视角评审。它们是后续证据收集项，不因为消费场景
-本身成为 ABI 演进依据，也不得绕过“Core 先于 ABI”或借 reserved storage 在 Revision 5
-内增加语义：
+本身成为 ABI 演进依据，也不得绕过“Core 先于 ABI”或借 reserved storage 在任一已发布
+revision 内增加语义：
 
 1. **E1 — goal-directed compact**：用真实 Host 验证切换到更小上下文模型的完整流程。
    当前 R5 manual compact 是无 target budget 的 canonical default best-effort 操作，不承诺
    适配目标模型。只有证明 Host 必须控制稳定输入、且 Core 能定义达到/未达到目标的
    canonical 结果后，才评估新 revision；不得直接投影全部 `CompactKernel.Options`。
-2. **E2 — permission decision provenance**：评估 Host 是否需要结构化回答“哪条规则或哪层
-   安全边界导致该决定”。若需要，Core 先统一 imported rules、Session 临时记忆、protected
-   paths、permission mode 与 Skill policy 的来源模型；不得由 AgentCore adapter 返回脆弱的
-   三数组索引或可解析英文文本。
+2. **E2 — permission decision provenance（已关闭，Revision 6）**：公开
+   `permission_provenance` CoreEvent 使用稳定的 decision/source、matched `rule_id`、logical
+   Session/Run/tool-call/request identity、Tool binding、argument digest、policy generation、
+   Session-rule 标记和 typed callback outcome；不暴露三数组索引、可解析英文文本、raw
+   arguments 或凭证。callback response 与 final authorization 分离：owned audit receipt 在
+   Session grant 前准备，在 authoritative `policy_decision` 到达后以实际执行结果无分配提交；
+   durable budget/grant 失败保留 response 事实但 final decision 为 deny，不允许 audit/public
+   provenance 分叉。public Host Tool callback/provenance L2 与内部四态矩阵均已通过。
 3. **E3 — compact degraded reason**：当前 Core 在 ABI 投影前已折叠具体失败原因。若真实运维
    证据要求区分原因，先定义稳定的小型 Core taxonomy，再通过新 revision 显式投影；不得
    复用 R5 reserved 字段规避 revision cut。
-4. **E4 — stability horizon**：外部消费方出现后，连续 hard cut 的协调成本会改变。达到何种
-   外部消费数量、支持期限、consumer matrix 与弃用周期时进入兼容窗口，留待真实交付数据
-   决定；当前不预设 revision 编号、shim 或双分派。
-5. **E5 — CLI/App 与 AgentCore 并行语义路径**：Revision 6 为控制变更范围，明确不迁移
+4. **E4 — stability horizon（Revision 6 disposition 已完成，治理项继续开放）**：AgentCore
+   ABI 在 experimental 阶段对 R6 执行一次完全 hard cut，不保留旧 table、shim、alias 或双分派；
+   真实 C/Zig/Rust source-free consumer matrix 与 archive gate 是当前交付基线。MCP 外部协议只
+   维护 `2026-07-28` primary + `2025-11-25` 单代 compatibility window。下一稳定 MCP revision
+   进入时，以新 revision 为 primary、`2026-07-28` 为唯一 compatibility candidate，并默认移除
+   `2025-11-25`；退场必须走新的显式 AgentCore ABI revision、old -> new 说明、adapter conformance
+   和 consumer/server matrix，不得静默滚动。何时从 experimental hard cut 转为长期 ABI
+   compatibility window，仍由真实外部消费者数量、支持期限和弃用承诺决定，不预埋 shim。
+5. **E5 — CLI/App 与 AgentCore 并行语义路径（Revision 6 已登记，开放债务）**：Revision 6 为控制变更范围，明确不迁移
    现有 CLI/App，因此仓内将暂时并存两条 Permission 路径和两套 MCP 协议栈：CLI/App
    保留现有 SessionRules、settings persistence 与 `2025-06-18` MCP client；AgentCore
    使用 Revision 6 的 specifier-scoped Session rules、policy generation、零写盘和双 era
@@ -91,6 +104,43 @@ revision 4 准入引用的真实消费者证据：
    任一条件触发时必须对两条路径执行影响审计与对应回归，避免单边安全修复。长期收敛路径
    在“CLI 迁移到 AgentCore Runtime”与“共同下沉到窄 canonical seam”之间待定；本条目
    不扩大 Revision 6 范围，也不授权修改 `src/core/agent_loop.zig`。
+6. **E6 — MCP freshness 与 schema capability honesty（已关闭，Revision 6）**：Runtime
+   snapshot 现在携带 clocked expiry/cache scope；modern TTL 受 5 分钟 cap 约束，legacy
+   使用 30 秒保守 TTL。fresh Session view 拒绝过期 server，restore 降级失效相关
+   authority，已 admitted Run 的 immutable Environment 不漂移。MCP schema 明确是有节点、
+   容器项和 work-unit 预算的本地 profile；schema/instance 在动态树分配前经过 O(depth) 流式
+   结构准入，instance number 保留 exact lexeme 并按数学整数语义验证。`uniqueItems: true`、
+   数值约束/数值 enum、引用和 header projection typed unavailable，不再以浮点近似或
+   “完整 2020-12 validator”宣传掩盖本地 profile 边界。
+7. **E7 — Text/Skill root-input budget symmetry（已关闭，Revision 6）**：两类输入都按
+   admission 前可确定的 canonical root record 精确预留。typed Skill 预留 canonical
+   invocation record，不再预留整块 `input_cap_bytes`；effectful body rendering 仍严格位于
+   admitted Run 内，并在 Conversation mutation 前原子对账精确 delta。这样既保留
+   materialization/shell 执行的 Run lifecycle 归属，也消除长 Session 的伪保守拒绝。
+8. **E8 — Permission outcome 的模型可见投影（开放，shared seam）**：Revision 6 public
+   request/provenance 已严格区分 `answered`、`user_cancelled`、`unavailable` 与
+   `contract_failure`，final authorization 也全部 fail closed；但 shared
+   `PermissionContext.ui_requester` 到 `agent_loop` 仍是 bool seam，non-answered 路径在普通
+   Tool result 中使用同一 legacy deny 文案。该缺口不允许通过 AgentCore event 重写或字符串
+   patch 掩盖。**Owner**：shared Core/Permission 架构负责人。**触发条件**：修改
+   `agent_loop`、引入 typed prompt outcome，或真实消费方要求模型按 cancelled/unavailable
+   采取不同恢复策略。处置必须同时覆盖 CLI/TUI/Web/child 与 AgentCore，未经独立设计批准
+   不得借 Revision 6 修改 `src/core/agent_loop.zig`。
+9. **E9 — budgeted Provider stream 的 bounded spool 时序（开放，行为债务）**：为保证超限
+   provider tail 不把 partial response 提交进 Conversation，Revision 6 在 AgentCore facade
+   内有界缓存完整 stream 后再向 shared loop 释放事件。这保持 durable-state invariant，
+   但 AgentCore 消费方观察到的 chunk 时序不同于直接 provider streaming。**Owner**：
+   AgentCore Runtime。**触发条件**：公开异步 Run/低延迟 streaming SLA，或引入能够回滚
+   partial projection 的 transaction seam。当前不得为追求早到 chunk 放松 checkpointability。
+10. **E10 — durable reservation 可用性标定（开放，参数治理）**：operation reservation 以
+    实际 request bytes 加该 operation 的配置 result cap 计算，安全但 cap 过松会提前拒绝长
+    Session。默认 cap/soft threshold 需要持续用真实 provider、Host Tool 与 MCP workload
+    校准；任何调整必须保持 payload 超限的有界 outcome、pre-side-effect reservation 和
+    source-free durable-budget 回归，不得用协议理论最大值替代运行配置。
+11. **E11 — `InvalidBudget` status 映射（已关闭，Revision 6）**：该内部错误只表示
+    checkpoint limits 或 durable profile 在结构上无效，统一映射 public
+    `STATUS_INVALID_ARGUMENT`，不新增同义 status token；合法配置下的运行容量不足必须使用
+    `STATUS_CHECKPOINT_BUDGET_REQUIRED`，不得重新折回 `InvalidBudget`。
 
 ## F 组：SDK 生成卫生
 

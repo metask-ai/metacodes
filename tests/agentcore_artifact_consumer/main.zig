@@ -67,6 +67,14 @@ const Probe = struct {
         self.session = session;
     }
 
+    fn unregisterSession(self: *Probe, session: *wire.SessionHandle) !void {
+        self.identity_mutex.lock();
+        defer self.identity_mutex.unlock();
+        if (self.session != session or self.active_run_id != 0)
+            return error.InvalidHostLifecycle;
+        self.session = null;
+    }
+
     fn beginRun(self: *Probe, run_id: u64) !void {
         self.identity_mutex.lock();
         defer self.identity_mutex.unlock();
@@ -176,6 +184,77 @@ const Probe = struct {
     }
 };
 
+const CheckpointBuffer = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    read_offset: usize = 0,
+
+    fn deinit(self: *@This()) void {
+        self.bytes.deinit(std.heap.c_allocator);
+    }
+
+    fn sink(self: *@This()) wire.CheckpointSinkV1 {
+        var result = std.mem.zeroes(wire.CheckpointSinkV1);
+        result.struct_size = @sizeOf(wire.CheckpointSinkV1);
+        result.ctx = self;
+        result.write = write;
+        return result;
+    }
+
+    fn source(self: *@This()) wire.CheckpointSourceV1 {
+        self.read_offset = 0;
+        var result = std.mem.zeroes(wire.CheckpointSourceV1);
+        result.struct_size = @sizeOf(wire.CheckpointSourceV1);
+        result.ctx = self;
+        result.read = read;
+        return result;
+    }
+
+    fn write(raw: ?*anyopaque, chunk: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse
+            return wire.CHECKPOINT_IO_FATAL));
+        const part = sdk.borrowedBytes(chunk) catch
+            return wire.CHECKPOINT_IO_FATAL;
+        self.bytes.appendSlice(std.heap.c_allocator, part) catch
+            return wire.CHECKPOINT_IO_FATAL;
+        return wire.CHECKPOINT_IO_OK;
+    }
+
+    fn read(
+        raw: ?*anyopaque,
+        destination: ?[*]u8,
+        capacity_raw: u64,
+        out_len: ?*u64,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse
+            return wire.CHECKPOINT_IO_FATAL));
+        const written = out_len orelse return wire.CHECKPOINT_IO_FATAL;
+        written.* = 0;
+        if (self.read_offset == self.bytes.items.len)
+            return wire.CHECKPOINT_IO_OK;
+        const capacity = std.math.cast(usize, capacity_raw) orelse
+            return wire.CHECKPOINT_IO_FATAL;
+        if (capacity == 0) return wire.CHECKPOINT_IO_FATAL;
+        const output = destination orelse return wire.CHECKPOINT_IO_FATAL;
+        const count = @min(capacity, self.bytes.items.len - self.read_offset);
+        @memcpy(output[0..count], self.bytes.items[self.read_offset..][0..count]);
+        self.read_offset += count;
+        written.* = count;
+        return wire.CHECKPOINT_IO_OK;
+    }
+};
+
+fn checkpointLimits() wire.CheckpointLimitsV1 {
+    var limits = std.mem.zeroes(wire.CheckpointLimitsV1);
+    limits.struct_size = @sizeOf(wire.CheckpointLimitsV1);
+    limits.hard_bytes = 16 * 1024 * 1024;
+    limits.max_section_bytes = 8 * 1024 * 1024;
+    limits.max_string_bytes = 1024 * 1024;
+    limits.max_messages = 1024;
+    limits.max_blocks_per_message = 64;
+    limits.chunk_bytes = 4096;
+    return limits;
+}
+
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
     const api = try sdk.Api.discover();
@@ -209,7 +288,14 @@ pub fn main(init: std.process.Init) !void {
     // Source-free proof: the model supplies a relative file path and the
     // binary facade resolves it against workspace_root, not process cwd.
     const read_sse = try readToolSse(a, file_name);
-    const bodies = [_][]const u8{ ASK_SSE, read_sse, HOST_SSE, FINAL_SSE, FINAL_SSE };
+    const bodies = [_][]const u8{
+        ASK_SSE,
+        read_sse,
+        HOST_SSE,
+        FINAL_SSE,
+        FINAL_SSE,
+        FINAL_SSE,
+    };
     const server = try Server.start(init.io, &bodies);
     defer server.stop();
     const url = try server.url(a);
@@ -389,11 +475,106 @@ pub fn main(init: std.process.Init) !void {
     if (try sdk.StopReason.fromCode(result.stop_reason_code) != .end_turn or
         result.tool_calls != 0)
         return error.UnexpectedRunResult;
+
+    var checkpoint = CheckpointBuffer{};
+    defer checkpoint.deinit();
+    var checkpoint_limits = checkpointLimits();
+    var checkpoint_sink = checkpoint.sink();
+    var export_config = std.mem.zeroes(wire.CheckpointExportConfigV1);
+    export_config.struct_size = @sizeOf(wire.CheckpointExportConfigV1);
+    export_config.limits = &checkpoint_limits;
+    export_config.sink = &checkpoint_sink;
+    var export_result = std.mem.zeroes(wire.CheckpointExportResultV1);
+    try expectStatus(
+        .ok,
+        api.sessionExportCheckpoint()(
+            session,
+            &export_config,
+            &export_result,
+            &diagnostic,
+        ),
+        diagnostic,
+    );
+    if (checkpoint.bytes.items.len == 0 or export_result.checkpoint_generation != 1 or
+        export_result.total_bytes != @as(u64, @intCast(checkpoint.bytes.items.len)))
+        return error.InvalidCheckpoint;
+
+    try probe.unregisterSession(session.?);
     try expectStatus(.ok, api.sessionDestroy()(session, &diagnostic), diagnostic);
     session = null;
     try expectStatus(.ok, api.runtimeDestroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
-    std.debug.print("AgentCore source-free consumer: Revision 6 mutations, compact, catalog, typed Skill, tools, Host UI and events OK\n", .{});
+
+    try expectStatus(.ok, api.runtimeCreate()(&runtime_config, &runtime, &diagnostic), diagnostic);
+    var restored_catalog: ?*wire.SkillCatalogHandle = null;
+    defer if (restored_catalog) |handle| {
+        _ = api.skillCatalogRelease()(handle, &diagnostic);
+    };
+    try expectStatus(.ok, api.runtimeQuerySkillCatalog()(
+        runtime,
+        &query,
+        &restored_catalog,
+        &descriptor,
+        &diagnostic,
+    ), diagnostic);
+    api.bufferRelease()(&descriptor);
+    session_host.skill_catalog = restored_catalog;
+    var checkpoint_source = checkpoint.source();
+    var restore_config = std.mem.zeroes(wire.SessionRestoreConfigV1);
+    restore_config.struct_size = @sizeOf(wire.SessionRestoreConfigV1);
+    restore_config.host = &session_host;
+    restore_config.source = &checkpoint_source;
+    restore_config.limits = &checkpoint_limits;
+    var restore_report = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&restore_report);
+    try expectStatus(.ok, api.sessionRestore()(
+        runtime,
+        &restore_config,
+        &callbacks,
+        &session,
+        &restore_report,
+        &diagnostic,
+    ), diagnostic);
+    try expectStatus(
+        .ok,
+        api.skillCatalogRelease()(restored_catalog, &diagnostic),
+        diagnostic,
+    );
+    restored_catalog = null;
+    session_host.skill_catalog = null;
+    try probe.registerSession(session.?);
+    {
+        const encoded_report = try sdk.borrowedBytes(.{
+            .ptr = restore_report.ptr,
+            .len = restore_report.len,
+        });
+        const parsed_report = try sdk.decodeRestoreReport(a, encoded_report);
+        defer parsed_report.deinit();
+        if (parsed_report.value.checkpoint_generation != 1 or
+            parsed_report.value.session_id.len == 0)
+            return error.InvalidRestoreReport;
+    }
+    api.bufferRelease()(&restore_report);
+
+    try probe.beginRun(3);
+    try expectStatus(.ok, api.sessionRunText(
+        session,
+        3,
+        sdk.bytesView("continue after source-free restore"),
+        &options,
+        &result,
+        &diagnostic,
+    ), diagnostic);
+    try probe.endRun(3);
+    if (try sdk.StopReason.fromCode(result.stop_reason_code) != .end_turn)
+        return error.UnexpectedRunResult;
+
+    try probe.unregisterSession(session.?);
+    try expectStatus(.ok, api.sessionDestroy()(session, &diagnostic), diagnostic);
+    session = null;
+    try expectStatus(.ok, api.runtimeDestroy()(runtime, &diagnostic), diagnostic);
+    runtime = null;
+    std.debug.print("AgentCore source-free consumer: Revision 6 tools, checkpoint, Runtime rebuild, restore and continued Run OK\n", .{});
 }
 
 const CatalogIdentities = struct {

@@ -458,6 +458,15 @@ const PublicSessionFixture = struct {
     diagnostic: wire.OwnedBytesV1 = .{ .ptr = null, .len = 0 },
 
     fn init(root: []const u8, base_url: []const u8, model: []const u8) !PublicSessionFixture {
+        return initWithBudget(root, base_url, model, null);
+    }
+
+    fn initWithBudget(
+        root: []const u8,
+        base_url: []const u8,
+        model: []const u8,
+        budget: ?*const wire.DurableBudgetProfileV1,
+    ) !PublicSessionFixture {
         const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
             return error.MissingApi;
         var self = PublicSessionFixture{
@@ -481,6 +490,7 @@ const PublicSessionFixture = struct {
         host_config.base_url = sdk.bytesView(base_url);
         host_config.workspace_root = sdk.bytesView(root);
         host_config.workspace_home = sdk.bytesView(root);
+        host_config.durable_budget = budget;
         var session_config = sessionCreateConfig(&host_config, model);
         var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
         callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
@@ -535,6 +545,89 @@ const PublicSessionFixture = struct {
         return result;
     }
 };
+
+test "L2 durable budget profile crosses the public wire and rejects before Run admission" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    var server = try harness.MockServer.startCassette(&.{FINAL_SSE}, 0);
+    defer server.stop();
+    const url = try server.urlOwned(a);
+    defer a.free(url);
+
+    const budget = wire.DurableBudgetProfileV1{
+        .struct_size = @sizeOf(wire.DurableBudgetProfileV1),
+        .reserved0 = 0,
+        .hard_bytes = 4 * 1024 * 1024,
+        .soft_bytes = 3 * 1024 * 1024,
+        .input_cap_bytes = 512,
+        .provider_request_cap_bytes = 512 * 1024,
+        .provider_result_cap_bytes = 64 * 1024,
+        .tool_result_cap_bytes = 64 * 1024,
+        .mcp_result_cap_bytes = 64 * 1024,
+        .audit_reserve_bytes = 64 * 1024,
+        .terminal_reserve_bytes = 64 * 1024,
+        .reserved = [_]u64{0} ** 4,
+    };
+    var fixture = try PublicSessionFixture.initWithBudget(
+        root,
+        url,
+        "test-model",
+        &budget,
+    );
+    defer fixture.deinit();
+
+    var description = std.mem.zeroes(wire.OwnedBytesV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        fixture.api.sessionDescribe()(
+            fixture.session,
+            &description,
+            &fixture.diagnostic,
+        ),
+    );
+    {
+        defer fixture.api.bufferRelease()(&description);
+        const encoded = try sdk.borrowedBytes(.{
+            .ptr = description.ptr,
+            .len = description.len,
+        });
+        const decoded = try sdk.decodeSessionDescription(a, encoded);
+        defer decoded.deinit();
+        try std.testing.expectEqual(
+            budget.hard_bytes,
+            decoded.value.budget.hard_bytes,
+        );
+        try std.testing.expectEqual(
+            budget.soft_bytes,
+            decoded.value.budget.soft_bytes,
+        );
+    }
+
+    var oversized: [513]u8 = undefined;
+    @memset(&oversized, 'x');
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 1;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_CHECKPOINT_BUDGET_REQUIRED,
+        fixture.api.sessionRunText(
+            fixture.session,
+            1,
+            sdk.bytesView(&oversized),
+            &options,
+            &result,
+            &fixture.diagnostic,
+        ),
+    );
+    fixture.releaseDiagnostic();
+    result = try fixture.runText(1, "short input reuses the unconsumed run id");
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(usize, 1), server.requestCount());
+}
 
 fn appendCompactablePublicHistory(fixture: *PublicSessionFixture) !void {
     const old_context = [_]u8{'A'} ** 8192;
@@ -831,6 +924,8 @@ const PublicCheckpointBuffer = struct {
 
 const PublicPermissionProbe = struct {
     expected_session: ?*wire.SessionHandle = null,
+    expected_run_id: u64 = 1,
+    fatal_on_permission: bool = false,
     ui_calls: u32 = 0,
     ui_releases: u32 = 0,
     host_calls: u32 = 0,
@@ -840,7 +935,9 @@ const PublicPermissionProbe = struct {
 
     fn validRun(self: *@This(), run_ptr: ?*const wire.RunContextV1) bool {
         const run = sdk.validateRunContext(run_ptr) catch return false;
-        return run.session == self.expected_session and run.run_id == 1 and run.session_id.len == 24;
+        return run.session == self.expected_session and
+            run.run_id == self.expected_run_id and
+            run.session_id.len == 24;
     }
 
     fn event(
@@ -859,6 +956,7 @@ const PublicPermissionProbe = struct {
         };
         switch (event_value) {
             .permission_provenance => |provenance| {
+                if (self.fatal_on_permission) return wire.EVENT_FATAL;
                 if (std.mem.indexOf(u8, encoded, "hello") != null) {
                     self.raw_arguments_leaked = true;
                     return wire.EVENT_FATAL;
@@ -1224,6 +1322,8 @@ test "L2 Revision 6 public MCP checkpoint restore facade preserves Conversation 
         wire.STATUS_OK,
         api.runtimeDescribeMcp()(runtime, &mcp_description, &diagnostic),
     );
+    var catalog_binding: [64]u8 = undefined;
+    var catalog_binding_len: usize = 0;
     {
         const encoded = try sdk.borrowedBytes(.{
             .ptr = mcp_description.ptr,
@@ -1235,10 +1335,19 @@ test "L2 Revision 6 public MCP checkpoint restore facade preserves Conversation 
         try std.testing.expectEqual(@as(usize, 1), decoded.value.servers.len);
         try std.testing.expectEqual(@as(usize, 1), decoded.value.tools.len);
         try std.testing.expectEqualStrings("2026-07-28", decoded.value.servers[0].negotiated_protocol);
+        try std.testing.expectEqualStrings("private", decoded.value.servers[0].cache_scope);
+        try std.testing.expect(decoded.value.servers[0].fresh);
+        try std.testing.expect(decoded.value.servers[0].ttl_remaining_ms <= 1000);
         try std.testing.expectEqualStrings("weather", decoded.value.tools[0].canonical_name);
         try std.testing.expectEqualStrings(
             decoded.value.servers[0].server_binding_identity,
             decoded.value.tools[0].server_binding_identity,
+        );
+        catalog_binding_len = decoded.value.servers[0].server_binding_identity.len;
+        try std.testing.expect(catalog_binding_len <= catalog_binding.len);
+        @memcpy(
+            catalog_binding[0..catalog_binding_len],
+            decoded.value.servers[0].server_binding_identity,
         );
     }
     api.bufferRelease()(&mcp_description);
@@ -1383,6 +1492,86 @@ test "L2 Revision 6 public MCP checkpoint restore facade preserves Conversation 
     restore_config.source = &source;
     restore_config.limits = &limits;
     var restore_report = std.mem.zeroes(wire.OwnedBytesV1);
+
+    const original_magic = checkpoint.bytes.items[0];
+    checkpoint.bytes.items[0] = 'X';
+    source = checkpoint.source();
+    restore_config.source = &source;
+    try std.testing.expectEqual(
+        wire.STATUS_CHECKPOINT_CORRUPT,
+        api.sessionRestore()(
+            runtime,
+            &restore_config,
+            &callbacks,
+            &session,
+            &restore_report,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expect(session == null);
+    api.bufferRelease()(&diagnostic);
+    checkpoint.bytes.items[0] = original_magic;
+
+    var schema_revision_bytes: [4]u8 = undefined;
+    @memcpy(&schema_revision_bytes, checkpoint.bytes.items[16..20]);
+    std.mem.writeInt(u32, checkpoint.bytes.items[16..20], 2, .little);
+    source = checkpoint.source();
+    restore_config.source = &source;
+    try std.testing.expectEqual(
+        wire.STATUS_CHECKPOINT_UNSUPPORTED,
+        api.sessionRestore()(
+            runtime,
+            &restore_config,
+            &callbacks,
+            &session,
+            &restore_report,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expect(session == null);
+    api.bufferRelease()(&diagnostic);
+    @memcpy(checkpoint.bytes.items[16..20], &schema_revision_bytes);
+
+    var abi_revision_bytes: [4]u8 = undefined;
+    @memcpy(&abi_revision_bytes, checkpoint.bytes.items[20..24]);
+    std.mem.writeInt(u32, checkpoint.bytes.items[20..24], 7, .little);
+    source = checkpoint.source();
+    restore_config.source = &source;
+    try std.testing.expectEqual(
+        wire.STATUS_CHECKPOINT_INCOMPATIBLE,
+        api.sessionRestore()(
+            runtime,
+            &restore_config,
+            &callbacks,
+            &session,
+            &restore_report,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expect(session == null);
+    api.bufferRelease()(&diagnostic);
+    @memcpy(checkpoint.bytes.items[20..24], &abi_revision_bytes);
+
+    var undersized_limits = limits;
+    undersized_limits.hard_bytes = checkpoint.bytes.items.len - 1;
+    restore_config.limits = &undersized_limits;
+    source = checkpoint.source();
+    restore_config.source = &source;
+    try std.testing.expectEqual(
+        wire.STATUS_RESOURCE_LIMIT,
+        api.sessionRestore()(
+            runtime,
+            &restore_config,
+            &callbacks,
+            &session,
+            &restore_report,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expect(session == null);
+    api.bufferRelease()(&diagnostic);
+    restore_config.limits = &limits;
+
     checkpoint.fail_read = true;
     try std.testing.expectEqual(
         wire.STATUS_CHECKPOINT_IO,
@@ -1414,6 +1603,10 @@ test "L2 Revision 6 public MCP checkpoint restore facade preserves Conversation 
         ),
     );
     try std.testing.expect(checkpoint.reads != 0);
+    var restored_policy_generation: u64 = 0;
+    var restored_catalog_generation: u64 = 0;
+    var restored_issue_id: [64]u8 = undefined;
+    var restored_issue_id_len: usize = 0;
     {
         const encoded = try sdk.borrowedBytes(.{
             .ptr = restore_report.ptr,
@@ -1423,9 +1616,25 @@ test "L2 Revision 6 public MCP checkpoint restore facade preserves Conversation 
         defer decoded.deinit();
         try std.testing.expectEqual(sdk.protocol.RestoreHealth.degraded, decoded.value.health);
         try std.testing.expectEqualStrings(session_id[0..session_id_len], decoded.value.session_id);
+        try std.testing.expectEqual(
+            export_result.checkpoint_generation,
+            decoded.value.checkpoint_generation,
+        );
+        restored_policy_generation = decoded.value.policy_generation;
+        restored_catalog_generation = decoded.value.catalog_generation;
+        try std.testing.expectEqual(catalog_generation, restored_catalog_generation);
         try std.testing.expectEqual(@as(u32, 0), decoded.value.mcp.restored_bindings);
         try std.testing.expectEqual(@as(u32, 1), decoded.value.mcp.invalidated_bindings);
         try std.testing.expect(decoded.value.issues.len != 0);
+        const issue = decoded.value.issues[0];
+        try std.testing.expectEqual(sdk.protocol.AuthoritySubsystem.mcp, issue.subsystem);
+        try std.testing.expectEqualStrings(
+            catalog_binding[0..catalog_binding_len],
+            issue.server_binding_identity.?,
+        );
+        restored_issue_id_len = issue.issue_id.len;
+        try std.testing.expect(restored_issue_id_len <= restored_issue_id.len);
+        @memcpy(restored_issue_id[0..restored_issue_id_len], issue.issue_id);
     }
     api.bufferRelease()(&restore_report);
 
@@ -1443,9 +1652,24 @@ test "L2 Revision 6 public MCP checkpoint restore facade preserves Conversation 
         try std.testing.expectEqual(sdk.protocol.LogicalSessionOrigin.restored, decoded.value.origin);
         try std.testing.expectEqualStrings(session_id[0..session_id_len], decoded.value.session_id);
         try std.testing.expectEqual(@as(u64, 1), decoded.value.last_run_id);
+        try std.testing.expectEqual(
+            export_result.checkpoint_generation,
+            decoded.value.checkpoint_generation,
+        );
+        try std.testing.expectEqual(restored_policy_generation, decoded.value.policy_generation);
+        try std.testing.expectEqual(restored_catalog_generation, decoded.value.catalog_generation);
         try std.testing.expect(decoded.value.conversation.message_count != 0);
         try std.testing.expectEqual(@as(usize, 0), decoded.value.mcp.tools.len);
         try std.testing.expectEqual(@as(u32, 1), decoded.value.restore.invalidated_mcp_bindings);
+        try std.testing.expectEqual(@as(usize, 1), decoded.value.restore.issues.len);
+        try std.testing.expectEqualStrings(
+            restored_issue_id[0..restored_issue_id_len],
+            decoded.value.restore.issues[0].issue_id,
+        );
+        try std.testing.expectEqualStrings(
+            catalog_binding[0..catalog_binding_len],
+            decoded.value.restore.issues[0].server_binding_identity.?,
+        );
     }
     api.bufferRelease()(&session_description);
 
@@ -1480,7 +1704,7 @@ test "L2 Revision 6 public Permission callback and provenance bind the exact Hos
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const root = try rootPath(&tmp, &root_buffer);
-    const bodies = [_][]const u8{ HOST_SSE, FINAL_SSE };
+    const bodies = [_][]const u8{ HOST_SSE, FINAL_SSE, HOST_SSE };
     var provider = try harness.MockServer.startCassette(&bodies, 0);
     defer provider.stop();
     const base_url = try provider.urlOwned(a);
@@ -1567,6 +1791,26 @@ test "L2 Revision 6 public Permission callback and provenance bind the exact Hos
     try std.testing.expectEqual(@as(u32, 1), probe.host_releases);
     try std.testing.expectEqual(@as(u32, 1), probe.callback_provenance);
     try std.testing.expect(!probe.raw_arguments_leaked);
+
+    // Permission provenance uses the same fatal-aware Run event lifecycle as
+    // every other public event. A Host rejection aborts before dispatch and
+    // cannot be converted into an ordinary model-visible deny.
+    probe.expected_run_id = 2;
+    probe.fatal_on_permission = true;
+    api.bufferRelease()(&diagnostic);
+    try std.testing.expectEqual(
+        wire.STATUS_CALLBACK_FAILED,
+        api.sessionRunText(
+            session,
+            2,
+            sdk.bytesView("invoke the Host echo again"),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(@as(u32, 1), probe.host_calls);
+    try std.testing.expectEqual(@as(u32, 1), probe.host_releases);
 }
 
 test "L2 Revision 6 imported permission rules control the next Run" {

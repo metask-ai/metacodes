@@ -1,6 +1,6 @@
-# AgentCore ABI v1 Revision 6 设计草案
+# AgentCore ABI v1 Revision 6 设计与冻结记录
 
-> 状态：Accepted for implementation；canonical 语义按本文实施，wire contract 尚未冻结
+> 状态：Implemented；canonical 语义、Revision 6 wire 与交付门已闭合
 > 日期：2026-08-03
 > 前置：`AGENTCORE_BINARY_ABI.md`、`AGENTCORE_V1_REVISION5_DESIGN.md`
 > 当前目标：① Permission 体系完善；② Session checkpoint/restore；③ MCP `2026-07-28` 主协议与 `2025-11-25` 单代兼容
@@ -75,6 +75,35 @@ Revision 6 的实现范围默认限制在 AgentCore-owned 层：
 6. 不允许为了减少局部代码量，把 AgentCore 专属 lifecycle、wire compatibility 或 persistence policy 下沉成全局产品行为。
 
 该边界会使现有 CLI/App 与 AgentCore 暂时保留不同的 Permission 决策路径和 MCP 协议栈。这是为控制 Revision 6 范围而接受的并行语义路径债务，不等于两边已经共享 canonical semantics；Ledger E5 记录 owner、双路径安全修复义务、触发条件和待定收敛方向。该债务本身不构成在 Revision 6 中迁移 CLI/App 或修改 `agent_loop` 的理由。
+
+### 0.4 Shared Core necessity records
+
+最终 scope audit 确认 Revision 6 除 AgentCore-owned、SDK、测试、构建和文档外，只修改了以下四个 shared Core 文件。它们是实现 canonical Session/Permission 语义所需的窄 seam，不包含 AgentCore wire、MCP adapter 或 Host persistence policy：
+
+| Shared Core 文件 | 现有 seam 缺口 | 最小改动与必要性 | 受影响 caller | 验证与默认行为 |
+|---|---|---|---|---|
+| `src/core/agent_session.zig` | 现有 Session 无法在同一 activity gate 下取得已提交 Conversation 快照、以 checkpoint logical ID 原子恢复，或在不改 `agent_loop` 的前提下为一次 admitted Run 注入 budget/MCP 包装 Provider | 增加 `CheckpointLease`/`checkpointing` activity、`RestoredSessionState`、exact ID registration、borrowed Provider Run seam 和 candidate-aware compact commit guard。guard 只把 owned preview Conversation 借给 facade 的同步 predicate，使 AgentCore 能在 replacement linearization point 验算候选 checkpoint；Conversation 仍由 shared Session 持有，若在 AgentCore 层复制这些状态机会形成第二个 Session 真理源 | AgentCore 使用新 seam；CLI/App 继续走原 `createSession`、Run、compact 路径且不设置 guard | shared unit 覆盖 busy/restore collision/lease/guard/provider；AgentCore checkpoint、near-hard compact、budget、restore L2 覆盖端到端。所有新增参数默认 null/旧入口不变 |
+| `src/permission/decision.zig` | shared matcher 能算 imported deny/ask/allow，但没有把该 canonical 结果交给 AgentCore logical-Session grants；在 AgentCore 重写 matcher 会复制 1200+ 行 specifier 语义 | 增加可空 `DecisionOverride`，只传 Tool identity、arguments 与 imported action；null 时原决策链不变。显式 settings deny、Core safety、active Skill narrowing 和 shared Session deny 被标记为 fixed authority，seam 只观察而不能替换；只有普通 settings ask/allow/undecided 路径可由 AgentCore 完成。AgentCore 的 generation、grant 和 provenance 仍留在 `src/agentcore/**` | 只有 AgentCore Session 与受限 child lease 设置非空 override；CLI/App 保持 null | unit 证明 null inert、imported action 完整传递；恶意 override 返回 allow 仍不能改写 explicit deny/shared ceiling；Permission matrix、fresh Session、rules update 和 child authority 测试覆盖非空路径 |
+| `src/permission.zig` | public shared `PermissionContext` 无法装配上述窄 seam | 只重导出 override 类型并把可空字段传给 decision 层，不新增产品 mode、规则或持久化行为 | 同上 | 原产品 caller 无需修改；CLI/App 行为基线由 null 默认和既有测试保持 |
+| `src/permission/prompt.zig` | `no_interactive_prompt` 只在没有 requester 时阻止交互；requester 返回 unavailable/cancelled/异常后仍可能落到进程 answer queue 或 stdin，破坏嵌入库的输入所有权 | 把 `no_interactive_prompt` 定义为绝对边界：requester 没有产生 answered response 时直接 fail closed，且 process queue/`askText` 均不可达。不改变默认 `false` 的产品交互路径 | AgentCore Session、无交互 child/teammate 使用该边界；CLI/TUI/Web 默认路径保持原值 | 确定性测试预装 `y` answer queue 并让 requester 返回 unavailable，断言 deny 且输入未被消费；既有交互测试继续覆盖默认路径 |
+
+`git diff e043575 -- src/core/agent_loop.zig` 为空；Provider turn loop、通用 Tool execution、CLI/TUI/Web 产品层也没有 Revision 6 diff。上述 necessity records 不授权未来继续扩张 shared Core；任何新增 seam 仍需重新审计。
+
+### 0.5 实现评审后的架构处置
+
+本轮实现评审按不变量和所有权边界处置，不以局部条件补丁替代设计：
+
+| 发现 | 架构处置 |
+|---|---|
+| Permission 在 callback 非 answered 后回落 stdin | `no_interactive_prompt` 升格为输入所有权边界；AgentCore/child 永不读取宿主进程输入 |
+| 合法 durable profile 可产生 checkpoint codec 无法编码的字符串 | profile 构造时要求所有 durable 单 payload cap 不超过 checkpoint `max_string_bytes`；transient provider request 不受该约束 |
+| restore 把下一次 Run reserve 当作快照有效性条件 | restore 只验证已持久化状态和 profile；下一次 Run 在自己的 admission 阶段检查 reserve，使近满 Session 仍可恢复、describe，并通过 replacement-aware compact 降低 durable 使用量 |
+| Run 可恢复错误绕过 budget 终结 | admitted Run 的 error path 统一 reconciliation；只对已经提交的同一 `run_id` 对账，不把 pre-admission 失败伪装成已运行 |
+| 单个 MCP server 的协议资源超限中止整个 refresh | server-controlled failure 形成该 server issue 并跳过；只有 Runtime 本地 OOM 等全局失败中止 refresh |
+| MCP 成功/错误、schema 和 wire 细节漂移 | `isError=true` 不强制 success `structuredContent`；参数 number lexeme 原样重编码；`format` 作为 annotation 接纳；schema OOM/resource-limit 保持 typed |
+| negotiation 假分支和 allocator 漂移 | 删除生产路径不可达的“明确 legacy response”观察；只以格式正确的 `MethodNotFound`/stdio timeout/child exit 进入 legacy 候选；probe 使用 Runtime allocator，OOM 不伪装 transport failure |
+
+评审同时暴露一个仍需单独设计的 shared seam：public Permission provenance 已区分 `user_cancelled` 与 `unavailable`，但通用 `agent_loop` 仍通过 bool prompt 结果生成同一普通拒绝 Tool result。Revision 6 不为修文案越过第 0.3 节修改 `agent_loop`；Ledger E8 记录该模型可见差异和后续 typed prompt-outcome seam 的触发条件。
 
 ## 1. 整体架构边界
 
@@ -267,7 +296,7 @@ deny > ask > allow
 
 ### 2.6 Permission mode
 
-Revision 6 保留五类 Session mode 语义；exact wire name 在 freeze 前确定：
+Revision 6 的 public wire 已采用五个固定 code：`PERMISSION_DEFAULT`、`PERMISSION_ACCEPT_EDITS`、`PERMISSION_AUTO`、`PERMISSION_DONT_ASK` 和 `PERMISSION_FULL_ACCESS`；下表描述其 Session 语义：
 
 | Mode | 未命中显式规则时 | 显式 `ask` | 显式 `deny` |
 |---|---|---|---|
@@ -279,7 +308,7 @@ Revision 6 保留五类 Session mode 语义；exact wire name 在 freeze 前确�
 
 补充约束：
 
-- `full_access` 对应现有 `bypass_permissions` 所表达的 Session mode 方向，但公共命名尚待 freeze；
+- `PERMISSION_FULL_ACCESS` 在 AgentCore public wire 中对应 shared Core 的 `bypass_permissions` mode；该映射不把 shared Core 的旧命名暴露给消费方；
 - Host 可以完全禁用 `full_access`；
 - `full_access` 不关闭不可绕过 safety constraints；
 - `full_access` 不等于关闭 Sandbox；
@@ -308,9 +337,11 @@ policy_generation
 - callback response 必须与 pending request 中固定的 policy generation 一致；
 - Run 结束、abort 或 Session 销毁后，所有 pending request 失效；
 - callback outcome 必须区分 `answered`、`user_cancelled`、`unavailable` 与 `contract_failure`；
-- `deny_once/deny_session` 形成 permission-denied 结果，`user_cancelled` 形成 cancelled 结果，`unavailable` 形成 UI-unavailable 结果；三者都不执行 Tool，也不互相伪装；
+- `deny_once/deny_session`、`user_cancelled` 与 `unavailable` 都不执行 Tool；public request/provenance 必须保持三者的 typed 区分，不得把 callback unavailable 记录成用户主动拒绝；
 - 用户取消或 callback unavailable 不创建 Session grant，Session 保持可用；
 - callback 返回非法 response、错误 request identity 或无效 rule candidate 属于 callback contract failure。
+
+AgentCore 设置 `no_interactive_prompt=true` 后，该值是绝对的输入所有权边界：即使 requester 已安装但返回 unavailable、cancelled 或异常，也不得读取 process answer queue 或 stdin。当前通用 `agent_loop` 的 bool prompt seam 仍把 non-answered 路径投影为同一普通拒绝 Tool result；这是模型可见文案/类型的已知缺口，不影响 final authorization 与 public provenance 的四态区分，处置见 Ledger E8。
 
 ### 2.8 Rules 更新
 
@@ -333,16 +364,15 @@ Host permission rules 仍只能在 Session idle 时原子替换：
 - fork Skill/Subagent 不建立独立持久授权域；
 - fork child 若没有 Host UI 能力，`ask` 必须 fail closed；
 - MCP Tool 使用与内置/Host Tool 相同的决策、请求绑定和审计模型；
-- nested activation 的有效权限是父 PolicyFrame 与当前 Skill 限制的交集。
-
-精确继承矩阵仍需在 wire freeze 前逐项冻结。
+- nested activation 的有效权限是父 PolicyFrame 与当前 Skill 限制的交集；
+- explicit settings deny、shared Core safety、active Skill narrowing 与 shared Session denial 是不可由 AgentCore consumer seam 放宽的 fixed authority；seam 仍观察其 canonical source，以形成同一 provenance record。
 
 ### 2.10 可观测性
 
 每次 Permission 判定应形成稳定、结构化、可审计的数据：
 
 - final decision；
-- decision source；
+- decision source：`core_safety`、`active_skill`、`explicit_deny`、`session_deny`、`explicit_ask`、`explicit_allow`、`session_allow`、`builtin_classification`、`mode_fallback` 或 `callback`；
 - matched rule identity；
 - tool identity 与 canonical specifier；
 - request/tool-call/run/session identity；
@@ -352,6 +382,8 @@ Host permission rules 仍只能在 Session idle 时原子替换：
 - callback outcome 与用户响应作用域。
 
 审计记录如何持久化由 Host 决定；AgentCore 只提供规范化事件，不内置审计数据库。
+
+Host callback response 与 final authorization decision 是两个不同事实。AgentCore 对需要新增 Session grant 的回答采用两阶段 receipt：先为审计 receipt 准备 owned storage，再尝试预留 durable budget 和修改 Session authority，最后以既有 `policy_decision` 事件中的实际 `allowed` 结果提交同一 receipt 并发布 provenance。准备失败时不得新增 grant；grant/budget 失败时 receipt 仍保留 Host 的 `response=allow_session|deny_session`，但 final decision 必须记录实际 deny，不能先写一条 allow 审计再对外发布 deny。receipt commit 不得再分配内存，避免“authority 已生效但审计无法落地”的反向裂缝。
 
 ### 2.11 持久化边界与 Ledger A3 disposition
 
@@ -428,13 +460,19 @@ AgentCore 不选择 SQLite、Redis、数据库、对象存储或产品目录。
 compact 继续是第 1.2 节定义的独立 idle activity，不允许作为 Run commit 的隐藏副作用。预算状态机固定为：
 
 1. Session create/restore 校验 checkpoint budget 至少可以容纳 canonical 最小 terminal/error record；无效配置直接失败；
-2. idle Session 接近 soft threshold 时，通过 describe/result 暴露 `compaction_recommended`（语义占位名，非 wire token），由 Host 决定是否调用独立 `session_compact`；
+2. idle Session 接近 soft threshold 时，通过 describe/result 暴露 `compaction_recommended`，由 Host 决定是否调用独立 `session_compact`；compact 是 replacement transaction：Provider 请求/结果仍受 cap 约束，提交时按候选 Conversation checkpoint 精确验算，而不是把摘要当作追加到旧 Conversation；
 3. `session_run_input` 在 admission 前校验输入、当前 durable usage 与最小 Run reserve；不足时返回 `checkpoint_budget_required`（语义占位名），不分配 `run_id`、不修改 Conversation，输入仍由 Host 持有；
 4. Run admission 后维护 Run-local durable reservation；每次 Provider、Tool 或 MCP 外部操作前，按当前 reservation profile 为 canonical request、结果上限、审计记录和 terminal marker 预留预算。profile 由 Runtime hard cap、Provider/Tool/MCP 已声明或 AgentCore 配置的 per-operation cap，以及 Host 协商的 checkpoint budget 共同约束；不得把协议理论最大 payload 直接作为默认 reservation；
 5. 无法建立 reservation 时，不发起下一次外部操作，以 `checkpoint_budget_exhausted`（语义占位名）结束已接纳 Run；已在安全边界内接纳的 Conversation 前缀和有界 terminal marker 一并提交，Session 返回 idle 且继续可 checkpoint；
 6. 用户输入等已知超大 payload 在 admission 前拒绝；Provider/Tool/MCP 返回超过已声明上限时，不提交原始 payload，而是形成有界 resource-limit terminal/tool outcome。若外部调用可能已有副作用，仍按对应的 indeterminate/failed 语义记录，不能伪装为未执行。
 
-这三种预算语义的 exact Status/StopReason、数值和 DTO 映射待 wire freeze，但必须保持“pre-admission 不消费状态”“admitted Run 只在已预留的安全边界提交”“compact 不隐藏在 commit 内”三条可观察语义。
+Profile 在构造时还必须保证 `input_cap_bytes`、`provider_result_cap_bytes`、`tool_result_cap_bytes` 与 `mcp_result_cap_bytes` 不超过 checkpoint codec 的 `max_string_bytes`；`provider_request_cap_bytes` 是 transient wire budget，不受 durable-string 约束。这样“可接纳的单段 durable payload 必然可编码”由配置构造保证，而不是依赖 Run 结束后的 poison 兜底。
+
+checkpoint 保存可继续执行的 canonical Conversation 投影，而不是原始 transcript 归档：未 compact 时保存全部 messages；compact 后保存 summary 与 active messages，不再重复保存已经被 summary 替代的隐藏前缀。restore 将 summary 物化为首条 assistant context，使后续再次 compact 仍会把既有摘要纳入新摘要；因此 codec 的 `max_messages` 同时计入该物化 summary，不能在恢复时凭空多出一条越过上限的消息。Host 若需要逐字审计历史，应从 event/transcript 存储独立归档。该边界让 compact 同时降低模型上下文和 durable checkpoint 使用量。
+
+Text 与 typed Skill 共用 `preflightRootRecords` 不变量，但不能伪装二者的输入生成时机相同：Text prompt 和 Skill canonical invocation record 都是无副作用、可在 admission 前精确编码的 root record，因此只按精确 checkpoint delta 预留；Skill body 的文件引用、materialization 路径和 shell 注入只有在 admitted Run 内才能安全求值。后者在 Conversation mutation 前原子对账其精确 root-record delta，超出 input cap 形成 `resource_limit`，durable budget 不足形成 `budget_exhausted`。不得为方便计算而把 materialization 或 shell 执行偷移到 Run admission 之前，也不得再用整块 `input_cap_bytes` 冒充 Skill 的已知输入大小。
+
+公开 wire 已将上述路径映射为 `STATUS_CHECKPOINT_BUDGET_REQUIRED`、`STOP_CHECKPOINT_BUDGET_EXHAUSTED`、`STOP_CHECKPOINT_RESOURCE_LIMIT` 与 `RunResultV1.checkpoint_outcome_code`。实现必须保持“pre-admission 不消费状态”“admitted Run 只在已预留的安全边界提交”“compact 不隐藏在 commit 内”三条可观察语义。
 
 reservation profile 必须同时满足安全性与可用性：结果超过已预留的 per-operation cap 时仍按第 6 条形成有界 outcome，但常规有界结果不得仅因为协议存在极大的理论上限而提前耗尽长 Session。默认 cap 和 soft threshold 必须由真实长会话与 consumer workload gate 决定，不能只做最坏值推导。
 
@@ -464,7 +502,7 @@ reservation profile 必须同时满足安全性与可用性：结果超过已预
 - logical `session_id`；
 - 最后接纳的 `run_id`；
 - canonical Conversation，包括合法的 Tool use/result 结构；
-- Compact 后的 Conversation 投影；
+- Compact 后的 resumable 投影（summary + active messages）；被 summary 替代的 raw prefix 属于 Host transcript 归档，不重复进入 checkpoint；
 - 当前有效模型标识；
 - Skill Catalog revision 与 selection；
 - MCP server/tool selection、catalog generation 与 binding/schema fingerprints；
@@ -575,7 +613,7 @@ Revision 6 需要一个只读、规范化的最小描述能力，供 Host 对账
 - restore health、degraded bindings 与 invalidated-grant summary；
 - logical ID 的来源（fresh create 或 restored checkpoint）及当前 Runtime registration state。
 
-它不是通用内部状态 dump，不承诺暴露完整 Conversation，也不允许 Host 修改任意内部字段。exact function 和 DTO 待 freeze。
+它不是通用内部状态 dump，不承诺暴露完整 Conversation，也不允许 Host 修改任意内部字段。public 入口已经固定为 `session_describe`，返回受 `sdk/zig/protocol.zig` 校验的 `SessionDescription` JSON；新增字段必须通过新的 ABI revision，而不是复用 reserved 字段暗改语义。
 
 ### 3.12 状态格式、容量与信任边界
 
@@ -589,7 +627,7 @@ checkpoint 必须具备：
 - 配置与 authority fingerprints；
 - 明确区分 corrupt、unsupported、incompatible、stale-policy 和 resource-limit。
 
-checkpoint export 的 Core seam 必须支持 sink/chunk 形式，不得要求整个长 Session 先形成单个连续 owned buffer。Host 在 Session create/restore 时提供可接受的 checkpoint budget；Core 暴露预算使用量，并通过第 3.3.1 节的 admission/reservation 状态机持续维持 durable-state invariant。exact C ABI buffer/stream 形式仍待 freeze，但“长 Conversation 不能在最需要持久化时才变成不可导出”是已确定语义。
+checkpoint export/restore 的 C ABI 已采用 Host-owned `checkpoint_sink_v1`/`checkpoint_source_v1` 回调与显式 `checkpoint_limits_v1`，不得要求整个长 Session 先形成单个连续 owned buffer。Host 在 Session create/restore 时提供可接受的 checkpoint budget；Core 暴露预算使用量，并通过第 3.3.1 节的 admission/reservation 状态机持续维持 durable-state invariant。
 
 checkpoint 包含对话、工具结果和可能的用户数据，属于敏感数据。AgentCore 负责结构、版本、资源边界和内容一致性校验；Host 负责加密、MAC/签名、访问控制和来源真实性。checksum 只能检测意外损坏，不能冒充可信来源。AgentCore 不假设传入 checkpoint 天然可信。
 
@@ -635,7 +673,7 @@ auto | modern_only | legacy_only
 | Probe 结果 | stdio | Streamable HTTP |
 |---|---|---|
 | 合法且 mutually supported 的 `server/discover` | modern | modern |
-| 格式正确的 `MethodNotFound`/明确 legacy-era 响应 | legacy probe | legacy probe |
+| 格式正确的 `MethodNotFound` | legacy probe | legacy probe |
 | 有界 probe timeout | legacy probe；默认不 retry | typed timeout failure，不 fallback |
 | probe child 在 modern 响应前退出 | legacy probe | 不适用 |
 | 401/403、5xx、损坏响应、现代协议错误、显式取消 | typed failure，不 fallback | typed failure，不 fallback |
@@ -669,7 +707,7 @@ policy auto
 - `2025-11-25` 的 initialize state、连接级 session ID 和 legacy notification 只存在于 Runtime adapter；它们不等于 logical AgentCore `session_id`，也不得进入 checkpoint；
 - `2026-07-28` operation result 必须携带 `resultType`；`2025-11-25` 结果缺失该字段时在 canonical seam 规范化为 `complete`；
 - `2026-07-28` 通过 MRTR 表达额外输入需求；Revision 6 不为兼容旧版而把 server-initiated request 重新引入 canonical Core；
-- `2026-07-28` list cache 使用 `ttlMs/cacheScope`；旧版缺失这些字段时采用保守的 Runtime refresh policy，并仍产生 catalog generation；
+- `2026-07-28` `tools/list` cache 使用 required `ttlMs/cacheScope`；`server/discover` 未返回两者时表示没有该结果级 cache hint，不能误判为损坏；旧版缺失这些字段时采用保守的 Runtime refresh policy，并仍产生 catalog generation；
 - `subscriptions/listen`、legacy notifications 或 transport resumability 都只能触发 Runtime refresh，不能直接修改 active Run。
 
 因此，AgentCore 的逻辑 Session、MCP transport、server process 和 catalog cache 必须解耦设计。
@@ -725,11 +763,15 @@ MCP server
 要求：
 
 - Runtime catalog 更新产生新的 catalog generation；
+- 单个 server 的 transport/protocol/resource-limit 失败只形成该 server issue 并跳过，不得中止其它 server 的 catalog 构建；只有 Runtime 本地 OOM 等全局失败可以中止整个 refresh；
 - active Run 继续使用 admission 时固定的 Tool view；
 - 新 generation 只影响后续 Run，不在模型生成中途替换 schema；
 - 已从 Session view 移除的 Tool 不得通过手工构造调用绕过可见性检查；
 - cache 过期不等于自动扩大或缩小正在执行的 Run authority；
-- catalog refresh 失败时不得用无限期陈旧结果伪装为成功；允许的 stale-read 窗口和错误策略仍待冻结；
+- Runtime snapshot 为每个 server 固定 `expires_at` 与 `cache_scope`：TTL 从该 server 的 discovery/list 完成时刻计算，不能从整轮 refresh 开始时刻计算；modern TTL 受 Runtime 上限约束，legacy 缺失 TTL 时使用 30 秒保守默认；
+- fresh Session view 遇到过期 server 返回 `mcp_not_refreshed`，restore 则降级并失效相关 view/grant；同一过期 snapshot 不得为新 Run 投影 MCP Tool；
+- 已 admitted Run 使用 admission 时形成的 immutable Environment，TTL 在执行中到期不会改变该 Run 的 Tool 集合；
+- catalog refresh 失败时不得用无限期陈旧结果伪装为成功；Host 可通过 Runtime catalog description 观察 `fresh`、`cache_scope` 与 `ttl_remaining_ms` 后显式刷新；
 - list/change notification 或 subscription 只能触发重新发现，不能直接修改 active Run。
 
 ### 4.6 Identity、Schema 与结果
@@ -747,7 +789,7 @@ tool_name
 tool_schema_fingerprint
 ```
 
-exact 编码尚待 wire freeze，但必须满足：
+Revision 6 不把这些字段拼成需要转义的单一 identity 字符串：C ABI 使用定长 digest/identity 字段，JSON description 使用规范化小写十六进制，Permission matcher 使用结构化 MCP identity。三种投影必须满足：
 
 - 同名 Tool 来自不同 server 时不冲突；
 - server 配置、认证隔离域或 Tool schema 变化可被识别；
@@ -773,7 +815,14 @@ Schema 处理要求：
 - 不受支持、无法安全验证或超限的 schema 必须使该 Tool 不可用并产生 catalog issue，不能静默放宽为任意参数；
 - Provider projection 可以是有损的，但必须有版本化 projection profile 和 diagnostics；不能宣称完整 JSON Schema 无损进入 Provider API；
 - 若 projection 丢失的关键约束会使模型产生 AgentCore 无法安全验证或授权的调用，该 Tool 不进入该 Provider 的 Run view；
-- 选择或实现完整 JSON Schema validator 是显式依赖、二进制体积和安全边界决策，必须在 Core seam 实现前完成，不得以 ad-hoc keyword parser 冒充 2020-12 支持。
+- Revision 6 固定使用版本化、资源受限的本地 profile，而不是完整 JSON Schema 2020-12 validator：支持 object/property、required、type、字符串/数组/对象边界、additionalProperties、dependentRequired、prefix/items，以及 string/bool/null 的 `enum/const`；
+- `uniqueItems: true`、所有数值边界/`multipleOf`、数值或结构化 `enum/const`、`$ref/$dynamicRef` 与 `x-mcp-header` 在 Revision 6 都是 typed unavailable。这样避免二次复杂度、IEEE-754 精度漂移和未定义 resolver authority；
+- schema 容器项数、遍历节点和 admission/validation work units 分别有硬预算；达到任一预算即产生 `schema_resource_limit`，不进入 Run view；
+- schema 和 invocation JSON 在构造动态树之前先经过 O(depth) 流式结构准入；深度、节点、单容器项数或 work budget 超限时不得进入高分配 parser；
+- `format` 在本地 profile 中作为 JSON Schema annotation 接纳，不声称执行 `date-time`、URI 等格式断言；
+- invocation 数字在校验和 `tools/call` 重编码时都保留原始 JSON number lexeme；批准参数、digest 与发送到 server 的参数不得因 f64 转换而改变。`type: integer` 按 JSON Schema 的数学整数语义判断，因此 `1.0`、`1e3` 与超出 i64/IEEE-754 精确范围的整数不会因本地机器表示被误拒，非整数仍 fail closed；
+- `outputSchema` 只约束成功结果的 `structuredContent`；`isError=true` 是 Tool 业务错误，允许只有 typed content，不能因为缺少 success payload 而改判协议错误并吞掉原错误；
+- 完整 validator 若未来有真实需求，必须作为新的依赖、二进制体积和安全边界决策进入后续 ABI revision；不得把当前 bounded profile 描述成完整 2020-12 支持。
 
 若首版包含 Streamable HTTP，还必须按规范处理 `x-mcp-header`：先验证 header name、类型和静态可达性，再从已验证参数生成 header；不得把敏感字段或任意 schema 值未经约束地投影为 HTTP header。
 
@@ -846,19 +895,17 @@ MCP `2026-07-28` Streamable HTTP 对 broken response stream 要求 client 以新
 - 让 AgentCore 在 Revision 6 中成为 MCP server；
 - 通过 MCP 恢复 active Run 或 exactly-once 外部副作用。
 
-### 4.12 MCP 暂不冻结的事项
+### 4.12 MCP 后续能力边界
 
 - Revision 6 首版 transport 是只支持 stdio，还是同时支持最新规范的网络 transport；
 - Resources、Prompts、Elicitation 的 AgentCore 公共投影与优先级；
 - 是否在首版开放 `subscriptions/listen`，以及 reconnect/backpressure 边界；
 - 完整 MRTR 中需要由 AgentCore 暴露的 client operation、用户输入和 retry state 范围；
-- modern/legacy era detection、fallback diagnostics 与 negotiated-version DTO 的 exact wire 表示；
 - Host OAuth callback、token refresh 与多租户 isolation 的具体接口；
-- catalog stale-read、刷新失败和 server 不可用时的精确状态机；
-- JSON Schema validator 依赖选择与每个 Provider projection profile；
-- server/tool display naming 与 canonical identity 的 exact wire 表示；
-- MCP-specific error 到 AgentCore status/event 的映射；
-- capability bits、API table 入口和资源上限。
+- 完整 JSON Schema validator、远程 resolver 与更宽 keyword profile 是否值得引入；
+- 每个新增 Provider projection profile 的 exact keyword 投影；
+- server/tool display naming 的产品策略；
+- 尚未纳入 Revision 6 的 MCP-specific error 扩展与新 capability。
 
 ## 5. 三个目标的交叉约束
 
@@ -906,7 +953,7 @@ Revision 6 的 public wire 已按以下内容冻结。规范性机器声明位�
 - transport code 固定为 `stdio=1`、`streamable_http=2`；negotiation code 固定为 `auto=1`、`modern_only=2`、`legacy_only=3`；era code 只允许 `2026-07-28=1` 与 `2025-11-25=2`。
 - Host-owned `McpConnectorV1` 提供 open/request/notify/close/release-response；AgentCore-owned Runtime 管理协商、连接生命周期、catalog generations 和 Session view。凭证及 transport handle 不进入 Session 或 checkpoint。
 - `auto` 只允许规范定义的 modern-first probe；stdio 可使用 disposable probe 后单次 fallback，HTTP timeout 不降级。actual connection 必须重新验证 era，probe/actual 不一致产生 typed failure，不静默重协商。
-- `runtime_describe_mcp` 输出 `agentcore.mcp-catalog/v1`，公开 server binding identity、negotiated protocol、server/catalog/schema/permission fingerprints、canonical Tool identity 与 typed issue reference。Session selector只引用 `server_binding_identity + tool_name`。
+- `runtime_describe_mcp` 输出 `agentcore.mcp-catalog/v1`，公开 server binding identity、negotiated protocol、server/catalog/schema/permission fingerprints、canonical Tool identity、`cache_scope`、`fresh`、`ttl_remaining_ms` 与 typed issue reference。Session selector只引用 `server_binding_identity + tool_name`。
 - connector open/exchange/notify outcome code、cancellation descriptor、frame/schema/catalog limits均为固定 DTO/code；未知 outcome fail closed。
 
 ### 6.5 仍明确不属于 Revision 6 wire 的内容
@@ -945,6 +992,8 @@ Revision 6 进入实现前，按以下顺序推进：
 - idle rules update 原子递增 policy generation 并清除两类 Session rule；测试不得构造不存在的 active pending response 路径；
 - AgentCore 路径在真实临时 Workspace 中零 settings 写盘，产品 `settings_writer` 不可达；
 - `answered deny`、`user_cancelled`、`unavailable` 与 `contract_failure` 产生不同 typed outcome/provenance；
+- 每次 final Permission decision 都先形成完整 provenance，再经所属 Run 的统一 EventSink 发布；`on_event` fatal 必须按普通 callback failure 中止并 poison，不能被吞并成 deny 或只留内部日志；
+- callback response、Session grant mutation 与 final decision 使用两阶段 receipt：审计 storage 在 grant 前准备，receipt 只在 authoritative `policy_decision` 到达后以实际 allowed/denied 结果提交；budget/grant 失败不得留下“audit allow / execution deny”分叉；
 - 批准参数与执行参数 digest 不一致时拒绝执行；
 - MCP、Host Tool、内置 Tool 使用同一 identity/matcher 路径；
 - Skill/Subagent 不得扩大父 authority；
@@ -966,7 +1015,9 @@ Revision 6 进入实现前，按以下顺序推进：
 - Tool/Skill/policy binding 变化不会恢复旧 authority；
 - checkpoint 中的 Session grant 不得绕过当前 explicit deny/ask；
 - 长 Conversation 在协商预算内可经 sink/chunk 导出；budget 小于最小 terminal/error record 时 Session create/restore 失败；
+- restore 不要求为“下一次 Run”预留空间；近满但合法的 checkpoint 可恢复/describe，并可通过 replacement-aware compact 把 summary + active messages 收敛为更小 checkpoint；
 - pre-admission budget 不足不消费 `run_id`、不修改 Conversation，Host 可在独立 compact 后重试原输入；
+- Text prompt 与 Skill canonical invocation record 使用同一精确 pre-admission 预算路径；Skill 动态 body expansion 在 admitted Run 内、Conversation mutation 前原子对账，禁止整块预留 `input_cap_bytes`，也禁止把 materialization/shell 注入提前到 admission 前；
 - admitted Run 在每次 Provider/Tool/MCP 调用前完成 durable reservation；不足时不发起该外部调用，以有界 terminal marker 结束并保持 Session 可 checkpoint；
 - reservation profile 在 hard cap、per-operation cap 和 Host budget 边界上有确定性测试；常规有界结果与代表性长会话不得因为协议理论最大 payload 被提前判定 budget exhausted；
 - 超限 Provider/Tool/MCP payload 不进入 Conversation 原文，而形成有界 resource-limit outcome；
@@ -978,17 +1029,19 @@ Revision 6 进入实现前，按以下顺序推进：
 ### 8.3 MCP
 
 - `modern_only` 只接受 `2026-07-28`；`legacy_only` 直接 initialize 且只接受 `2025-11-25`；`auto` 优先 modern probe；
-- stdio `auto` 使用 disposable process；格式正确的 legacy 响应、probe child 退出和有界 timeout 触发且仅触发 `2025-11-25` fallback，probe process 被回收；
+- stdio `auto` 使用 disposable process；格式正确的 `MethodNotFound`、probe child 退出和有界 timeout 触发且仅触发 `2025-11-25` fallback，probe process 被回收；
 - probe 与真正 transport 的 era 一致时才能完成 binding；server 两次启动间更新、identity/era 不一致或行为不确定时返回 typed negotiation failure，不重新 probe、不静默切换或降级；
 - HTTP timeout/network error、401/403、5xx、损坏响应和现代协议错误不触发 fallback；negotiated version 与 fallback reason 对 Host 可见；
 - 任一 policy 最终遇到 `2025-06-18` 或更早 revision 都明确失败；
 - modern 请求携带规范要求的 `_meta` 且 `server/discover` 结果经过校验；legacy initialize/session state 只存在于 Runtime adapter；
 - 两个 era 的 `tools/list/tools/call` 投影到相同 canonical Tool identity、catalog 和 result；
 - `tools/list` 的完整 input/output schema 无损进入 canonical catalog；Provider projection 的有损字段、拒绝原因与 profile 可观测；
-- JSON Schema 2020-12 默认 dialect、显式 dialect、非法、超深、超大和外部引用场景均有边界测试；
+- JSON Schema 2020-12 默认 dialect、显式 dialect、非法、超深、超大和外部引用场景均有边界测试；动态树分配前的流式 depth/node/container/work admission 有确定性边界测试；bounded profile 对 `uniqueItems`、数值约束/枚举和 validation work budget 有确定性 fail-closed 测试；
+- `type: integer` 以 exact number lexeme 验证 `1`、`1.0`、`1e3`、大整数和负例，不以 Zig `integer/float` tag 或 i64 范围冒充 JSON Schema 数学语义；
 - `2026-07-28` 缺失 required `resultType` 失败，`2025-11-25` 缺失时规范化为 `complete`；typed/structured content 与协议错误均有测试；
+- `isError=true` 的业务错误不要求 success `structuredContent`；text/image/audio/resource link/embedded resource 保持 canonical 无损；
 - 未声明 MRTR 时收到 `input_required` 返回 `input_required_unsupported` 语义结果，不重试、不提交 partial result，且 Session 可复用；
-- modern `ttlMs/cacheScope`、legacy 保守 refresh、catalog generation、过期和刷新失败语义有确定性测试；
+- modern `ttlMs/cacheScope`、legacy 30 秒保守 TTL、Runtime TTL cap、catalog generation、过期和刷新失败语义有注入时钟的确定性测试；新 Run 不接纳过期 Tool，已 admitted Run view 不漂移；
 - MCP Tool 使用与内置/Host Tool 相同的 Permission identity、argument digest 和审计路径；
 - 不同 Session 的 server/tool selection 与 grants 完全隔离；
 - active Run 的 Tool view 不因并发 catalog refresh 变化；
@@ -1010,6 +1063,37 @@ Revision 6 进入实现前，按以下顺序推进：
 - Ledger E5 明确登记 CLI/App 与 AgentCore 的 Permission/MCP 并行语义路径、owner、双路径安全修复义务、触发条件和待定收敛方向；该登记不扩大 Revision 6 实现范围；
 - MCP `2025-11-25` adapter 只提供外部协议互操作，不暴露或恢复任何旧 AgentCore ABI。
 
+### 8.5 最终 conformance、reference closure 与交付证据
+
+2026-08-03 的初始矩阵与 2026-08-04 的增量架构收口结果如下。专项行使用 `PASS` 或当前精确计数；全量 gate 必须覆盖全部专项矩阵：
+
+| 门禁 | 结果 | 覆盖重点 |
+|---|---:|---|
+| `agentcore:test -Dtfilter="Revision 6 Permission"` | PASS | deny/ask/allow action priority、五种 mode、once/Session grant、fresh Session 隔离、generation、restore、规则替换、child authority、typed callback outcome、零 settings 写盘 |
+| shared Permission provenance/ceiling tests | PASS | null seam inert；settings、Session memory、Core safety 与 active Skill 来源完整；consumer override 不能放宽 explicit deny 或 shared authority ceiling；callback receipt 在 grant 前准备并以 final policy result 提交 |
+| `agentcore:test -Dtfilter="MCP"` | PASS | modern/legacy canonical projection、auto/modern_only/legacy_only、stdio disposable probe、HTTP 禁止降级、actual-era revalidation、两页 `tools/list` 无损合并及保守 cache policy、schema/Permission/Session/checkpoint 绑定 |
+| MCP freshness/schema budget tests | PASS | 注入时钟验证 TTL/default/cap；过期 view 的新 Run 排除、active Run 不漂移；schema 在动态树分配前执行 container/node/depth/work admission；数学 integer lexeme 与 unsupported semantics fail closed |
+| `agentcore:test -Dtfilter="checkpoint"` | 16/16 | 长 Conversation、compact 投影、summary 恢复消息数上限、chunk/byte 边界、budget admission/reservation、corrupt/unsupported、authority revalidation、degraded restore |
+| Text/Skill unified root admission tests | PASS | 精确 canonical invocation preflight；admitted effectful expansion 原子对账；拒绝不消费 `run_id`、不改 Conversation、不预留整块 input cap |
+| `agentcore:test -Dtfilter="public MCP checkpoint restore"` | 1/1 | public ABI 下 MCP catalog -> Session selection -> Run -> checkpoint -> narrower restore -> continued Run，并执行 identifier reference closure 断言 |
+| `agentcore:consumer -Dtarget=x86_64-windows-msvc` | 18/18 | 无源码 C consumer；无源码 Zig consumer 完成 tools -> checkpoint -> Runtime 重建 -> restore -> continued Run |
+| `agentcore:gate -Dtarget=x86_64-windows-msvc` | 42/42 steps；217/217 tests（2026-08-04） | C/C++/Zig/Rust exact R6 discovery、symbol/manifest、原生 consumer 与全量 ABI 回归 |
+| `agentcore:archive -Dtarget=x86_64-windows-msvc` | PASS（2026-08-04，6/6 self-tests） | immutable archive、coordinate root、hash、identity、拒绝覆盖和错误 payload |
+
+Host-visible identifier 的 reference-closure audit 结论：
+
+| Identifier | 产生位置 | 规范化解析/对账位置 | conformance 断言 |
+|---|---|---|---|
+| logical `session_id` | callback `RunContextV1`、Session create/restore | `session_describe`、`RestoreReport` | checkpoint 前后 ID 相同，恢复后新物理 Handle 的 callback 仍解析为同一 logical ID |
+| `run_id` | Host 调用、callback context、Run result | `session_describe.last_run_id` | restore 后 last ID 可见，下一 Run 严格递增 |
+| `policy_generation` | Permission request/provenance、checkpoint | `session_describe`、`RestoreReport` | request/response 回显绑定；report 与 describe 相等 |
+| `catalog_generation` | `runtime_refresh_mcp` result | `runtime_describe_mcp`、`session_describe`、`RestoreReport` | Runtime catalog、restore report 与 Session description 相等 |
+| `checkpoint_generation` | export result | `session_describe`、`RestoreReport` | export、report 与 describe 三方相等，只在 sink 成功后递增 |
+| `server_binding_identity` | Runtime MCP catalog | catalog Tool、Session MCP view、RestoreReport/Session issue | server/tool identity 相等；degraded issue 回指原 catalog binding |
+| authority/catalog `issue_id` | Runtime refresh 或 restore reconciliation | Runtime catalog、`RestoreReport`、`session_describe.restore.issues` | RestoreReport 与 Session description 暴露同一稳定 issue identity 和 binding |
+
+scope audit 以 `e043575` 为 Revision 6 基线：允许范围外只有第 0.4 节登记的四个 shared Core seam；`src/core/agent_loop.zig`、产品层和旧 `src/mcp` 均为零 diff。hard-cut symbol gate 与 source-free consumers 证明 Revision 5 table、DTO、alias、shim 和 multi-revision dispatch 不存在。
+
 ## 9. 当前结论
 
 Revision 6 当前确认三个目标：
@@ -1024,7 +1108,7 @@ Permission 不负责 Sandbox，Session restore 不负责存储系统，MCP trans
 
 Revision 6 对 AgentCore ABI 是完全 hard cut，不提供任何旧 revision 兼容；实现默认收敛在 AgentCore-owned 层，`agent_loop` 等通用执行层不属于本方案修改范围。MCP `2025-11-25` 的单代 adapter 是外部协议互操作，不改变这两个约束。
 
-架构方案至此可以收口：剩余工作是第 6 节列出的 exact wire、默认值和 DTO freeze，不再增加新的目标。CLI/App 与 AgentCore 的并行语义路径作为 Ledger E5 的显式债务继续管理，不能以“消债”为由扩大 Revision 6 范围。
+Revision 6 的三个目标、exact wire、默认值、DTO、跨语言 SDK、source-free consumer 和 conformance/governance 门均已闭合。后续能力必须进入新的显式 ABI revision，不得继续修改 Revision 6 reserved 字段或 JSON wire。CLI/App 与 AgentCore 的并行语义路径作为 Ledger E5 的显式债务继续管理，不能以“消债”为由回改本 revision 或扩大其实现范围。
 
 ## 10. 参考依据（非规范性）
 
