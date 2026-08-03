@@ -18,7 +18,7 @@ trap 'rm -f "$TMP_FILE" "$TMP_NORMALIZED" "$CHECKED_IN_NORMALIZED"' EXIT HUP INT
 
 "$BINDGEN" "$REPO_ROOT/sdk/metask/agentcore.h" \
     --output "$TMP_FILE" \
-    --allowlist-function '^metask_agentcore_.*' \
+    --allowlist-function '^metask_agentcore_get_api$' \
     --allowlist-type '^metask_agentcore_.*' \
     --allowlist-var '^METASK_AGENTCORE_.*' \
     --formatter rustfmt \

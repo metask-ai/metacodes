@@ -6,7 +6,7 @@ const Server = @import("mock_server.zig").Server;
 comptime {
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
-        @compileError("revision 5 must not expose revision 4 catalog refresh");
+        @compileError("revision 6 must not expose the removed catalog refresh entry");
 }
 
 const ASK_SSE =
@@ -227,15 +227,12 @@ pub fn main(init: std.process.Init) !void {
         .release_result = Probe.hostRelease,
         .reserved = [_]u64{0} ** 2,
     };
-    var runtime_config = wire.RuntimeConfigV1{
-        .struct_size = @sizeOf(wire.RuntimeConfigV1),
-        .reserved0 = 0,
-        .builtin_tools = &builtins,
-        .builtin_tool_count = builtins.len,
-        .host_tools = @ptrCast(&host),
-        .host_tool_count = 1,
-        .reserved = [_]u64{0} ** 4,
-    };
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    runtime_config.builtin_tools = &builtins;
+    runtime_config.builtin_tool_count = builtins.len;
+    runtime_config.host_tools = @ptrCast(&host);
+    runtime_config.host_tool_count = 1;
     var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
     defer api.bufferRelease()(&diagnostic);
     var runtime: ?*wire.RuntimeHandle = null;
@@ -284,13 +281,12 @@ pub fn main(init: std.process.Init) !void {
     skill_selection.default_state_code = wire.SKILL_SELECTION_ENABLED;
     var initial_rules = std.mem.zeroes(wire.PermissionRuleSetV1);
     initial_rules.struct_size = @sizeOf(wire.PermissionRuleSetV1);
-    var config = wire.SessionConfigV1{
-        .struct_size = @sizeOf(wire.SessionConfigV1),
+    var session_host = wire.SessionHostConfigV1{
+        .struct_size = @sizeOf(wire.SessionHostConfigV1),
         .provider_kind_code = wire.PROVIDER_ANTHROPIC,
-        .permission_mode_code = wire.PERMISSION_BYPASS,
+        .permission_mode_code = wire.PERMISSION_FULL_ACCESS,
         .shell_policy_code = wire.SHELL_DISABLED,
         .api_key = sdk.bytesView("artifact-key"),
-        .model = sdk.bytesView("artifact-model"),
         .base_url = sdk.bytesView(url),
         .workspace_root = sdk.bytesView(workspace),
         .workspace_home = sdk.bytesView(workspace),
@@ -299,6 +295,15 @@ pub fn main(init: std.process.Init) !void {
         .skill_catalog = catalog,
         .skill_selection = &skill_selection,
         .permission_rules = &initial_rules,
+        .mcp_selection = null,
+        .durable_budget = null,
+        .reserved = [_]u64{0} ** 4,
+    };
+    var config = wire.SessionCreateConfigV1{
+        .struct_size = @sizeOf(wire.SessionCreateConfigV1),
+        .reserved0 = 0,
+        .host = &session_host,
+        .model = sdk.bytesView("artifact-model"),
         .reserved = [_]u64{0} ** 4,
     };
     var callbacks = wire.SessionCallbacksV1{
@@ -388,7 +393,7 @@ pub fn main(init: std.process.Init) !void {
     session = null;
     try expectStatus(.ok, api.runtimeDestroy()(runtime, &diagnostic), diagnostic);
     runtime = null;
-    std.debug.print("AgentCore source-free consumer: Revision 5 mutations, compact, catalog, typed Skill, tools, Host UI and events OK\n", .{});
+    std.debug.print("AgentCore source-free consumer: Revision 6 mutations, compact, catalog, typed Skill, tools, Host UI and events OK\n", .{});
 }
 
 const CatalogIdentities = struct {
@@ -418,35 +423,11 @@ fn catalogIdentities(
 }
 
 fn verifyRevisionMismatchRejection(api: sdk.Api) !void {
-    const Revision4Api = extern struct {
-        struct_size: u32,
-        abi_version: u32,
-        abi_revision: u32,
-        reserved0: u32,
-        capabilities: u64,
-        tail: [112]u8,
-    };
-    var legacy: Revision4Api align(@alignOf(wire.ApiV1)) = std.mem.zeroes(Revision4Api);
-    legacy.struct_size = @sizeOf(Revision4Api);
-    legacy.abi_version = wire.ABI_VERSION_V1;
-    legacy.abi_revision = 4;
-    if (sdk.Api.validate(@ptrCast(&legacy))) |_| return error.LegacyTableAccepted else |err| {
-        if (err != error.UnsupportedAbi) return err;
-    }
-    if (revision4Accepts(api.raw))
-        return error.Revision4ConsumerAcceptedRevision5;
-
     var wrong_revision = api.raw.*;
-    wrong_revision.abi_revision = wire.ABI_REVISION - 1;
+    wrong_revision.abi_revision = 5;
     if (sdk.Api.validate(&wrong_revision)) |_| return error.WrongRevisionAccepted else |err| {
         if (err != error.UnsupportedAbi) return err;
     }
-}
-
-fn revision4Accepts(raw: *const wire.ApiV1) bool {
-    return raw.struct_size == 136 and
-        raw.abi_version == wire.ABI_VERSION_V1 and
-        raw.abi_revision == 4;
 }
 
 fn readToolSse(a: std.mem.Allocator, path: []const u8) ![]u8 {

@@ -6,7 +6,7 @@
 #include <string.h>
 
 #if defined(METASK_AGENTCORE_CALLBACK_CONTINUE) || defined(METASK_AGENTCORE_CALLBACK_FATAL)
-#error "revision 5 must not retain pre-revision callback aliases"
+#error "revision 6 must not retain historical callback aliases"
 #endif
 
 #ifdef _WIN32
@@ -294,31 +294,17 @@ static int release_error(const metask_agentcore_api_v1 *api,
 }
 
 int main(void) {
-    const metask_agentcore_api_v1 *api =
-        (const metask_agentcore_api_v1 *)metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1);
-    if (api == NULL || api->struct_size != sizeof(*api) ||
-        api->abi_version != METASK_AGENTCORE_ABI_V1) {
+    const metask_agentcore_api_v1 *api = metask_agentcore_api_v1_discover();
+    if (api == NULL) {
         return 10;
     }
-    if (api->abi_revision != METASK_AGENTCORE_ABI_REVISION || api->reserved0 != 0 ||
-        api->capabilities != METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1 ||
-        api->runtime_create == NULL || api->runtime_destroy == NULL ||
-        api->runtime_query_skill_catalog == NULL ||
-        api->skill_catalog_release == NULL ||
-        api->session_create == NULL || api->session_destroy == NULL ||
-        api->session_set_model == NULL || api->session_update_skills == NULL ||
-        api->session_update_permission_rules == NULL ||
-        api->session_run_input == NULL || api->session_abort == NULL ||
-        api->session_compact == NULL || api->session_abort_compact == NULL ||
-        api->buffer_release == NULL) {
+    metask_agentcore_api_v1 revision_5 = *api;
+    revision_5.abi_revision = 5;
+    if (metask_agentcore_api_v1_is_compatible(&revision_5)) {
         return 10;
     }
-    for (size_t i = 0; i < sizeof(api->reserved) / sizeof(api->reserved[0]); ++i) {
-        if (api->reserved[i] != 0) {
-            return 10;
-        }
-    }
-    if (metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1 + 1) != NULL) {
+    if (metask_agentcore_get_api(0) != NULL ||
+        metask_agentcore_get_api(METASK_AGENTCORE_ABI_V1 + 1) != NULL) {
         return 11;
     }
 
@@ -348,16 +334,19 @@ int main(void) {
     metask_agentcore_session_callbacks_v1 callbacks = {0};
     callbacks.struct_size = sizeof(callbacks);
     callbacks.on_event = on_event;
-    metask_agentcore_session_config_v1 session_config = {0};
+    metask_agentcore_session_host_config_v1 session_host = {0};
+    session_host.struct_size = sizeof(session_host);
+    session_host.provider_kind_code = METASK_AGENTCORE_PROVIDER_ANTHROPIC;
+    session_host.permission_mode_code = METASK_AGENTCORE_PERMISSION_FULL_ACCESS;
+    session_host.shell_policy_code = METASK_AGENTCORE_SHELL_DISABLED;
+    session_host.api_key = view("c-consumer-key");
+    session_host.base_url = view(base_url);
+    session_host.workspace_root = view(cwd);
+    session_host.workspace_home = view(cwd);
+    metask_agentcore_session_create_config_v1 session_config = {0};
     session_config.struct_size = sizeof(session_config);
-    session_config.provider_kind_code = METASK_AGENTCORE_PROVIDER_ANTHROPIC;
-    session_config.permission_mode_code = METASK_AGENTCORE_PERMISSION_BYPASS;
-    session_config.shell_policy_code = METASK_AGENTCORE_SHELL_DISABLED;
-    session_config.api_key = view("c-consumer-key");
+    session_config.host = &session_host;
     session_config.model = view("c-consumer-model");
-    session_config.base_url = view(base_url);
-    session_config.workspace_root = view(cwd);
-    session_config.workspace_home = view(cwd);
 
     metask_agentcore_session *session = NULL;
     if (api->session_create(runtime, &session_config, &callbacks, &session,

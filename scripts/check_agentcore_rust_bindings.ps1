@@ -17,7 +17,7 @@ $temporary = [System.IO.Path]::GetTempFileName()
 try {
     & $Bindgen $header `
         --output $temporary `
-        --allowlist-function '^metask_agentcore_.*' `
+        --allowlist-function '^metask_agentcore_get_api$' `
         --allowlist-type '^metask_agentcore_.*' `
         --allowlist-var '^METASK_AGENTCORE_.*' `
         --formatter rustfmt `
