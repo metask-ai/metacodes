@@ -7,6 +7,9 @@ pub const wire = @import("mcp_wire.zig");
 pub const modern = @import("mcp_modern.zig");
 pub const legacy = @import("mcp_legacy.zig");
 pub const negotiation = @import("mcp_negotiation.zig");
+pub const schema = @import("mcp_schema.zig");
+pub const runtime = @import("mcp_runtime.zig");
+pub const catalog = @import("mcp_catalog.zig");
 
 test "dual era tool catalogs project the same executable identity" {
     const modern_response =
