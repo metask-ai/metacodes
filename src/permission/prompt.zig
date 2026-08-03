@@ -24,14 +24,17 @@ pub fn ask(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bo
         if (sr.isDenied(tool_name)) return false;
     }
 
-    // Swarm teammate:非交互强制拒(PM SW4 3c)——无 ui_requester 时**绝不读 fd 0**(teammate
-    // 线程与 lead REPL 共享 fd 0,isatty(0) 为真会争抢/卡死)。有 ui_requester(SW7 权限代理)则
-    // 正常走下面的 runner 路径。fail-closed:模型据工具错经 SendMessage 请 lead 代办。
+    // `no_interactive_prompt` is an absolute ownership boundary: a requester
+    // may answer, but every non-answer must fail closed instead of consulting
+    // process-global answer queues or fd 0. This covers embedded libraries as
+    // well as swarm teammates whose Host owns the surrounding process input.
     if (ctx.no_interactive_prompt and ctx.ui_requester == null) return false;
 
     // 预置应答队列曾加载(Stage 3 e2e)→ 强制走文字路径(askText 从队列弹/耗尽则
     // 安全默认 deny,**绝不**退回读 fd 0——它被 REPL 行流独占,会死等)。
-    if (@import("../core/answer_queue.zig").wasLoaded()) {
+    if (!ctx.no_interactive_prompt and
+        @import("../core/answer_queue.zig").wasLoaded())
+    {
         return askText(tool_name, args);
     }
 
@@ -87,13 +90,19 @@ pub fn ask(ctx: *PermissionContext, tool_name: []const u8, args: []const u8) !bo
                 },
             }
         }
-        // requester 存在但未给出答案(异常/pending/取消)且无 tty 可回落 → 安全 deny。
+        // requester 存在但未给出答案(异常/pending/取消)时，库消费者绝不
+        // 回落到进程 stdin。交互产品仍保留既有文字 prompt 兜底。
+        if (ctx.no_interactive_prompt) return false;
+        // requester 存在但未给出答案且无 tty 可回落 → 安全 deny。
         // 绝不读 fd 0:web/GUI daemon 的 fd 0 不属于权限系统(读它 = 死等或吞别人的输入)。
         // tty 场景保留 askText 回落(TUI dialog Esc 的存量语义不动)。
         if (!platform_term.isatty(0)) return false;
         // dialog 返回 null(意外非 TTY)→ 落到文字
     }
 
+    // Keep the invariant local to the only textual input edge as defense in
+    // depth if the control flow above changes later.
+    if (ctx.no_interactive_prompt) return false;
     // 非 TTY 退回文字 prompt
     return askText(tool_name, args);
 }
@@ -141,4 +150,38 @@ test "no_interactive_prompt: 无 ui_requester 时 .ask 直接 deny(绝不读 fd 
     ctx.setMode(.default);
     const allowed = try ask(&ctx, "Write", "{\"file_path\":\"/x\"}");
     try testing.expect(!allowed); // fail-closed deny
+}
+
+test "no_interactive_prompt: requester non-answer never falls back to process answer queue" {
+    const testing = std.testing;
+    const answer_queue = @import("../core/answer_queue.zig");
+    const Unavailable = struct {
+        calls: usize = 0,
+
+        fn request(
+            raw: *anyopaque,
+            _: ui_request.SessionId,
+            _: std.mem.Allocator,
+            _: *const ui_request.UiRequest,
+            _: *ui_request.UiResponse,
+        ) anyerror!ui_request.RequestOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return .unavailable;
+        }
+    };
+
+    answer_queue.load("y\n");
+    defer answer_queue.resetForTest();
+    var unavailable = Unavailable{};
+    var ctx = PermissionContext{
+        .allocator = testing.allocator,
+        .no_interactive_prompt = true,
+        .ui_requester = .{ .ctx = &unavailable, .requestFn = Unavailable.request },
+    };
+    ctx.setMode(.default);
+    try testing.expect(!try ask(&ctx, "Write", "{\"file_path\":\"/x\"}"));
+    try testing.expectEqual(@as(usize, 1), unavailable.calls);
+    // The process-global answer was not consumed by the embedded Session.
+    try testing.expectEqualStrings("y", answer_queue.pop().?);
 }

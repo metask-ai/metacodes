@@ -3,6 +3,7 @@
 const std = @import("std");
 pub const session_checkpoint = @import("session_checkpoint.zig");
 pub const session_authority = @import("session_authority.zig");
+pub const session_permission = @import("session_permission.zig");
 const builtin = @import("builtin");
 const sync = @import("platform").sync;
 const wire = @import("metask_agentcore_types");
@@ -39,6 +40,7 @@ const AbiHostTool = struct {
     ctx: ?*anyopaque,
     execute_fn: wire.HostExecuteFnV1,
     release_fn: wire.HostReleaseFnV1,
+    binding: [32]u8 = [_]u8{1} ** 32,
 
     /// HOST_FATAL and unknown statuses are infrastructure-fatal. FAILED and
     /// REJECTED may carry bounded UTF-8 detail; malformed detail degrades to a
@@ -192,18 +194,198 @@ const AbiSession = struct {
     call_mutex: sync.Mutex = .{},
     call_state: CallState = .idle,
     checkpoint_generation: u64 = 0,
-    policy_generation: u64 = 0,
+    policy_generation: u64 = 1,
+    policy_fingerprint: session_permission.PolicyFingerprint = [_]u8{0} ** 32,
     catalog_generation: u64 = 0,
     logical_origin: session_authority.LogicalOrigin = .fresh,
     restore_health: session_authority.RestoreHealth = .complete,
     invalidated_skill_authority: u32 = 0,
     invalidated_permission_rules: u32 = 0,
     invalidated_mcp_bindings: u32 = 0,
+    permission_state: session_permission.State = .{
+        .allocator = allocator,
+        .policy_generation = 1,
+    },
+    permission_audit: ?session_permission.AuditTrail = null,
+    permission_request_sequence: u64 = 0,
+    pending_permission: ?PendingPermission = null,
     last_terminal_kind: session_checkpoint.TerminalKind = .none,
     last_terminal_id: u64 = 0,
-    /// Revision 6 Permission will replace this fail-closed bridge with the
-    /// canonical bounded Permission authority section.
-    has_uncheckpointable_permission_memory: std.atomic.Value(bool) = .init(false),
+
+    const PendingPermission = struct {
+        tool_namespace: session_permission.ToolNamespace,
+        tool_name: []const u8,
+        binding: [32]u8,
+        arguments_digest: session_permission.ArgumentsDigest,
+        source: session_permission.DecisionSource,
+
+        fn matches(
+            self: PendingPermission,
+            tool: session_permission.ToolIdentity,
+            digest: session_permission.ArgumentsDigest,
+        ) bool {
+            return self.tool_namespace == tool.namespace and
+                std.mem.eql(u8, self.tool_name, tool.name) and
+                std.mem.eql(u8, &self.binding, &tool.binding) and
+                std.mem.eql(u8, &self.arguments_digest, &digest);
+        }
+    };
+
+    fn permissionDecisionOverride(
+        raw: *anyopaque,
+        tool_name: []const u8,
+        arguments_json: []const u8,
+        imported: core.permission.ImportedPermissionDecision,
+    ) ?core.permission.PermissionResult {
+        const self: *AbiSession = @ptrCast(@alignCast(raw));
+        self.pending_permission = null;
+        const tool = self.permissionToolIdentity(tool_name) catch return .deny;
+        const digest = session_permission.digestCanonicalArguments(
+            allocator,
+            arguments_json,
+            .{},
+        ) catch return .deny;
+        var match_context = self.core_session.permission_ctx.match_ctx;
+        if (match_context.alloc == null)
+            match_context.alloc = self.core_session.permission_ctx.allocator;
+        const explicit: session_permission.ExplicitAction = if (self.core_session.permission_ctx.settings != null)
+            session_permission.evaluateExplicit(
+                self.core_session.permission_ctx.settings,
+                &match_context,
+                tool_name,
+                arguments_json,
+            )
+        else switch (imported) {
+            .undecided => .undecided,
+            .deny => .deny,
+            .ask => .ask,
+            .allow => .allow,
+        };
+        var result = self.permission_state.decide(
+            tool,
+            digest,
+            explicit,
+            .{ .decision = .ask, .source = .mode_fallback },
+        ) catch return .deny;
+        const suppress_prompt = self.core_session.permission_ctx.modeValue() == .dont_ask and
+            result.decision == .ask;
+        if (suppress_prompt) result.decision = .deny;
+        if (result.decision == .ask) self.pending_permission = .{
+            .tool_namespace = tool.namespace,
+            .tool_name = tool.name,
+            .binding = tool.binding,
+            .arguments_digest = digest,
+            .source = result.source,
+        };
+        if (result.used_session_rule or
+            result.source == .explicit_allow or
+            result.source == .explicit_deny or
+            suppress_prompt)
+        {
+            self.recordPermissionDecision(
+                tool,
+                arguments_json,
+                digest,
+                result,
+            ) catch
+                return .deny;
+        }
+        if (suppress_prompt) return .deny;
+        if (result.source == .mode_fallback) return null;
+        return switch (result.decision) {
+            .deny => .deny,
+            .ask => .ask,
+            .allow => .allow,
+        };
+    }
+
+    fn permissionToolIdentity(
+        self: *AbiSession,
+        tool_name: []const u8,
+    ) session_permission.Error!session_permission.ToolIdentity {
+        // The model-facing Skill tool is AgentCore-owned but materialized
+        // outside Core's immutable Runtime catalog. It remains once-only until
+        // its selected catalog revision is incorporated into a Session rule
+        // candidate during the Permission checkpoint child.
+        if (std.mem.eql(u8, tool_name, model_skill_tool.TOOL_NAME))
+            return .{ .namespace = .builtin, .name = model_skill_tool.TOOL_NAME };
+        const entry = self.core_session.tools.find(tool_name) orelse
+            return error.InvalidIdentity;
+        return switch (entry.executor) {
+            .builtin => if (session_permission.isKnownBuiltin(tool_name))
+                .{ .namespace = .builtin, .name = entry.definition.name }
+            else
+                error.InvalidIdentity,
+            .host_sync => |host| blk: {
+                const abi_tool: *AbiHostTool = @ptrCast(@alignCast(host.ctx));
+                break :blk .{
+                    .namespace = .host,
+                    .name = entry.definition.name,
+                    .binding = abi_tool.binding,
+                };
+            },
+        };
+    }
+
+    fn copyPermissionToolCallId(
+        self: *AbiSession,
+        output_allocator: std.mem.Allocator,
+        tool_name: []const u8,
+        arguments_json: []const u8,
+    ) session_permission.Error![]u8 {
+        self.core_session.conversation.lockSnapshot();
+        defer self.core_session.conversation.unlockSnapshot();
+        const messages = self.core_session.conversation.messages.items;
+        if (messages.len == 0) return error.InvalidIdentity;
+        const latest = messages[messages.len - 1];
+        var match: ?[]const u8 = null;
+        for (latest.blocks) |block| switch (block) {
+            .tool_use => |tool_use| {
+                if (!std.mem.eql(u8, tool_use.name, tool_name) or
+                    !std.mem.eql(u8, tool_use.input, arguments_json)) continue;
+                // The old UiRequest omits tool_call_id. Ambiguous identical
+                // calls must fail closed; guessing would bind approval to the
+                // wrong operation. The R6 public DTO removes this scan.
+                if (match != null) return error.InvalidIdentity;
+                match = tool_use.id;
+            },
+            else => {},
+        };
+        const found = match orelse return error.InvalidIdentity;
+        if (found.len == 0 or found.len > session_permission.MAX_TOOL_CALL_ID_BYTES)
+            return error.InvalidIdentity;
+        return output_allocator.dupe(u8, found) catch error.OutOfMemory;
+    }
+
+    fn recordPermissionDecision(
+        self: *AbiSession,
+        tool: session_permission.ToolIdentity,
+        arguments_json: []const u8,
+        digest: session_permission.ArgumentsDigest,
+        result: session_permission.DecisionResult,
+    ) session_permission.Error!void {
+        const audit = if (self.permission_audit) |*value| value else return;
+        const run_id = self.core_session.active_run_id;
+        if (run_id == 0) return error.InvalidIdentity;
+        const tool_call_id = try self.copyPermissionToolCallId(
+            allocator,
+            tool.name,
+            arguments_json,
+        );
+        defer allocator.free(tool_call_id);
+        try audit.append(.{
+            .decision = result.decision,
+            .source = result.source,
+            .matched_rule_id = result.matched_rule_id,
+            .session_id = self.core_session.session_id,
+            .run_id = run_id,
+            .tool_call_id = tool_call_id,
+            .tool = tool,
+            .arguments_digest = digest,
+            .policy_generation = self.policy_generation,
+            .used_session_rule = result.used_session_rule,
+        });
+    }
 
     fn handle(self: *AbiSession) *wire.SessionHandle {
         return @ptrCast(self);
@@ -231,21 +413,133 @@ const AbiSession = struct {
 
     fn requestUi(raw: *anyopaque, identity: core.agent_session.RunIdentity, response_allocator: std.mem.Allocator, req: *const ui_request.UiRequest, out: *ui_request.UiResponse) anyerror!ui_request.RequestOutcome {
         const self: *AbiSession = @ptrCast(@alignCast(raw));
+        return switch (req.*) {
+            .permission => |permission| self.requestPermissionUi(
+                identity,
+                response_allocator,
+                permission.tool,
+                permission.args,
+                out,
+            ),
+            else => self.requestOtherUi(
+                identity,
+                response_allocator,
+                req,
+                out,
+            ),
+        };
+    }
 
-        if (rememberedPermission(self, req)) |choice| {
-            out.* = .{ .permission = choice };
+    fn requestPermissionUi(
+        self: *AbiSession,
+        identity: core.agent_session.RunIdentity,
+        response_allocator: std.mem.Allocator,
+        tool_name: []const u8,
+        arguments_json: []const u8,
+        out: *ui_request.UiResponse,
+    ) anyerror!ui_request.RequestOutcome {
+        const tool = self.permissionToolIdentity(tool_name) catch |err| {
+            self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
+            return err;
+        };
+        const digest = session_permission.digestCanonicalArguments(
+            response_allocator,
+            arguments_json,
+            .{},
+        ) catch |err| {
+            self.recordCallbackStatus(if (err == error.OutOfMemory)
+                wire.STATUS_OUT_OF_MEMORY
+            else
+                wire.STATUS_CALLBACK_FAILED);
+            return err;
+        };
+        if (self.pending_permission) |pending| {
+            if (!pending.matches(tool, digest)) {
+                self.pending_permission = null;
+                self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
+                return error.HostUiFailed;
+            }
+        }
+        const tool_call_id = self.copyPermissionToolCallId(
+            response_allocator,
+            tool_name,
+            arguments_json,
+        ) catch |err| {
+            self.recordCallbackStatus(if (err == error.OutOfMemory)
+                wire.STATUS_OUT_OF_MEMORY
+            else
+                wire.STATUS_CALLBACK_FAILED);
+            return err;
+        };
+        defer response_allocator.free(tool_call_id);
+
+        if (self.permission_request_sequence == std.math.maxInt(u64)) {
+            self.recordCallbackStatus(wire.STATUS_RESOURCE_LIMIT);
+            return error.ResourceLimit;
+        }
+        self.permission_request_sequence += 1;
+        const candidate = try session_permission.deriveRuleCandidate(
+            tool,
+            digest,
+        );
+        const request_id = try session_permission.deriveRequestId(
+            identity.session_id,
+            identity.run_id,
+            tool_call_id,
+            tool,
+            digest,
+            self.policy_generation,
+            self.permission_request_sequence,
+        );
+        const request = session_permission.PermissionRequest{
+            .session_id = identity.session_id,
+            .run_id = identity.run_id,
+            .tool_call_id = tool_call_id,
+            .request_id = request_id,
+            .tool = tool,
+            .arguments_digest = digest,
+            .policy_generation = self.policy_generation,
+            .candidate = candidate,
+        };
+        const prompt_source: session_permission.DecisionSource = if (self.pending_permission != null and
+            self.pending_permission.?.matches(tool, digest))
+            self.pending_permission.?.source
+        else
+            .core_safety;
+        self.pending_permission = null;
+        const encoding_options = session_permission.CallbackEncodingOptions{
+            .allow_session_response = prompt_source != .explicit_ask and
+                prompt_source != .core_safety,
+        };
+
+        // `dont_ask` is a Session mode contract, not a UI preference. Core
+        // safety prompts are produced before the AgentCore override seam, so
+        // close that path here without calling the Host.
+        if (self.core_session.permission_ctx.modeValue() == .dont_ask) {
+            try self.recordPermissionCallback(request, .answered, .deny_once);
+            out.* = .{ .permission = .deny_once };
             return .answered;
         }
-        const callback = self.callbacks.on_ui_request orelse return switch (req.*) {
-            .permission => blk: {
-                out.* = .{ .permission = .deny_once };
-                break :blk .answered;
-            },
-            else => .unavailable,
+
+        const callback = self.callbacks.on_ui_request orelse {
+            try self.recordPermissionCallback(
+                request,
+                .unavailable,
+                null,
+            );
+            return .unavailable;
         };
         const release_fn = self.callbacks.release_response orelse return error.HostUiFailed;
-        const request_json = protocol_v1.encodeUiRequest(response_allocator, req) catch |err| {
-            self.recordCallbackStatus(if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_INTERNAL_ERROR);
+        const request_json = session_permission.encodeCallbackRequest(
+            response_allocator,
+            request,
+            arguments_json,
+            encoding_options,
+        ) catch |err| {
+            self.recordCallbackStatus(if (err == error.OutOfMemory)
+                wire.STATUS_OUT_OF_MEMORY
+            else
+                wire.STATUS_INTERNAL_ERROR);
             return err;
         };
         defer response_allocator.free(request_json);
@@ -255,24 +549,172 @@ const AbiSession = struct {
         defer if (hasReleaseToken(response)) release_fn(self.callbacks.ctx, &response);
         if (!canonicalOwned(response)) {
             self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
+            try self.recordPermissionCallback(
+                request,
+                .contract_failure,
+                null,
+            );
             return error.HostUiFailed;
         }
         return switch (status) {
-            wire.UI_UNAVAILABLE => switch (req.*) {
-                .permission => blk: {
-                    out.* = .{ .permission = .deny_once };
-                    break :blk .answered;
-                },
-                else => .unavailable,
+            wire.UI_UNAVAILABLE => blk: {
+                if (response.len != 0) {
+                    self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
+                    try self.recordPermissionCallback(
+                        request,
+                        .contract_failure,
+                        null,
+                    );
+                    return error.HostUiFailed;
+                }
+                try self.recordPermissionCallback(
+                    request,
+                    .unavailable,
+                    null,
+                );
+                break :blk .unavailable;
             },
-            wire.UI_CANCELLED => switch (req.*) {
-                .permission => blk: {
-                    out.* = .{ .permission = .deny_once };
-                    break :blk .answered;
-                },
-                .ask_question => return error.UiCancelled,
-                else => unreachable,
+            wire.UI_CANCELLED => {
+                if (response.len != 0) {
+                    self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
+                    try self.recordPermissionCallback(
+                        request,
+                        .contract_failure,
+                        null,
+                    );
+                    return error.HostUiFailed;
+                }
+                try self.recordPermissionCallback(
+                    request,
+                    .user_cancelled,
+                    null,
+                );
+                return error.UiCancelled;
             },
+            wire.UI_ANSWERED => blk: {
+                if (response.len > wire.MAX_UI_RESPONSE_BYTES_V1) {
+                    self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
+                    try self.recordPermissionCallback(
+                        request,
+                        .contract_failure,
+                        null,
+                    );
+                    return error.HostUiFailed;
+                }
+                const bytes = ownedSlice(response) catch |err| {
+                    self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
+                    try self.recordPermissionCallback(
+                        request,
+                        .contract_failure,
+                        null,
+                    );
+                    return err;
+                };
+                const permission_response = session_permission.decodeCallbackResponse(
+                    response_allocator,
+                    bytes,
+                    request,
+                    encoding_options,
+                ) catch |err| {
+                    self.recordCallbackStatus(if (err == error.OutOfMemory)
+                        wire.STATUS_OUT_OF_MEMORY
+                    else
+                        wire.STATUS_CALLBACK_FAILED);
+                    try self.recordPermissionCallback(
+                        request,
+                        .contract_failure,
+                        null,
+                    );
+                    return err;
+                };
+                switch (permission_response) {
+                    .allow_session, .deny_session => {
+                        const rule_candidate = candidate orelse {
+                            self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
+                            try self.recordPermissionCallback(
+                                request,
+                                .contract_failure,
+                                null,
+                            );
+                            return error.HostUiFailed;
+                        };
+                        _ = self.permission_state.remember(
+                            permission_response,
+                            rule_candidate,
+                            self.policy_generation,
+                        ) catch |err| {
+                            self.recordCallbackStatus(if (err == error.OutOfMemory)
+                                wire.STATUS_OUT_OF_MEMORY
+                            else if (err == error.ResourceLimit)
+                                wire.STATUS_RESOURCE_LIMIT
+                            else
+                                wire.STATUS_CALLBACK_FAILED);
+                            return err;
+                        };
+                    },
+                    .allow_once, .deny_once => {},
+                }
+                out.* = .{ .permission = switch (permission_response) {
+                    .allow_once, .allow_session => .allow_once,
+                    .deny_once, .deny_session => .deny_once,
+                } };
+                try self.recordPermissionCallback(
+                    request,
+                    .answered,
+                    permission_response,
+                );
+                break :blk .answered;
+            },
+            else => {
+                self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
+                try self.recordPermissionCallback(
+                    request,
+                    .contract_failure,
+                    null,
+                );
+                return error.HostUiFailed;
+            },
+        };
+    }
+
+    fn requestOtherUi(
+        self: *AbiSession,
+        identity: core.agent_session.RunIdentity,
+        response_allocator: std.mem.Allocator,
+        req: *const ui_request.UiRequest,
+        out: *ui_request.UiResponse,
+    ) anyerror!ui_request.RequestOutcome {
+        const callback = self.callbacks.on_ui_request orelse return .unavailable;
+        const release_fn = self.callbacks.release_response orelse
+            return error.HostUiFailed;
+        const request_json = protocol_v1.encodeUiRequest(
+            response_allocator,
+            req,
+        ) catch |err| {
+            self.recordCallbackStatus(if (err == error.OutOfMemory)
+                wire.STATUS_OUT_OF_MEMORY
+            else
+                wire.STATUS_INTERNAL_ERROR);
+            return err;
+        };
+        defer response_allocator.free(request_json);
+        var response = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+        const run = self.runContext(&identity);
+        const status = callback(
+            self.callbacks.ctx,
+            &run,
+            view(request_json),
+            &response,
+        );
+        defer if (hasReleaseToken(response))
+            release_fn(self.callbacks.ctx, &response);
+        if (!canonicalOwned(response)) {
+            self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
+            return error.HostUiFailed;
+        }
+        return switch (status) {
+            wire.UI_UNAVAILABLE => .unavailable,
+            wire.UI_CANCELLED => error.UiCancelled,
             wire.UI_ANSWERED => blk: {
                 if (response.len > wire.MAX_UI_RESPONSE_BYTES_V1) {
                     self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
@@ -282,11 +724,18 @@ const AbiSession = struct {
                     self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
                     return err;
                 };
-                protocol_v1.decodeUiResponse(response_allocator, req, bytes, out) catch |err| {
-                    self.recordCallbackStatus(if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_CALLBACK_FAILED);
+                protocol_v1.decodeUiResponse(
+                    response_allocator,
+                    req,
+                    bytes,
+                    out,
+                ) catch |err| {
+                    self.recordCallbackStatus(if (err == error.OutOfMemory)
+                        wire.STATUS_OUT_OF_MEMORY
+                    else
+                        wire.STATUS_CALLBACK_FAILED);
                     return err;
                 };
-                self.captureSessionPermission(req, out);
                 break :blk .answered;
             },
             else => {
@@ -296,41 +745,31 @@ const AbiSession = struct {
         };
     }
 
-    fn rememberedPermission(self: *AbiSession, req: *const ui_request.UiRequest) ?core.protocol.PermissionChoice {
-        const permission = switch (req.*) {
-            .permission => |value| value,
-            else => return null,
+    fn recordPermissionCallback(
+        self: *AbiSession,
+        request: session_permission.PermissionRequest,
+        callback_outcome: session_permission.CallbackOutcome,
+        response: ?session_permission.Response,
+    ) session_permission.Error!void {
+        const audit = if (self.permission_audit) |*value| value else return;
+        const decision: session_permission.Decision = switch (response orelse
+            .deny_once) {
+            .allow_once, .allow_session => .allow,
+            .deny_once, .deny_session => .deny,
         };
-        return switch (self.core_session.session_rules.decisionFor(permission.tool) orelse return null) {
-            .allow => .allow_once,
-            .deny => .deny_once,
-        };
-    }
-
-    fn captureSessionPermission(self: *AbiSession, req: *const ui_request.UiRequest, out: *ui_request.UiResponse) void {
-        const permission = switch (req.*) {
-            .permission => |value| value,
-            else => return,
-        };
-        // The Host already observes and may persist its own response. Core gets
-        // only a one-shot projection so product settings persistence remains
-        // unreachable from the AgentCore path.
-        switch (out.*) {
-            .permission => |choice| switch (choice) {
-                .allow_always => {
-                    self.core_session.session_rules.rememberAllow(permission.tool);
-                    self.has_uncheckpointable_permission_memory.store(true, .release);
-                    out.* = .{ .permission = .allow_once };
-                },
-                .deny_tool_session => {
-                    self.core_session.session_rules.rememberDeny(permission.tool);
-                    self.has_uncheckpointable_permission_memory.store(true, .release);
-                    out.* = .{ .permission = .deny_once };
-                },
-                .allow_once, .deny_once => {},
-            },
-            else => {},
-        }
+        try audit.append(.{
+            .decision = decision,
+            .source = .callback,
+            .session_id = request.session_id,
+            .run_id = request.run_id,
+            .tool_call_id = request.tool_call_id,
+            .request_id = request.request_id,
+            .tool = request.tool,
+            .arguments_digest = request.arguments_digest,
+            .policy_generation = request.policy_generation,
+            .callback_outcome = callback_outcome,
+            .response = response,
+        });
     }
 
     fn recordCallbackStatus(self: *AbiSession, status: u32) void {
@@ -456,8 +895,6 @@ const AbiSession = struct {
         defer runtime_call.deinit();
         if (!self.tryBeginCheckpoint()) return error.SessionBusy;
         defer self.finishCheckpoint();
-        if (self.has_uncheckpointable_permission_memory.load(.acquire))
-            return error.PermissionStateUnavailable;
 
         var lease = try self.core_session.snapshotCommitted();
         defer lease.deinit();
@@ -478,6 +915,8 @@ const AbiSession = struct {
         const permission_state = try session_authority.encodePermissionState(
             allocator,
             self.core_session.permission_ctx.modeValue(),
+            &self.permission_state,
+            self.policy_fingerprint,
         );
         defer allocator.free(permission_state);
         const next_generation = std.math.add(
@@ -621,8 +1060,7 @@ const AbiSession = struct {
         previous.deinit();
     }
 
-    /// Internal Revision 5 adapter. The public wire entry point is frozen only
-    /// after the Core contract and the ABI lifecycle gate pass their tests.
+    /// AgentCore Session mutation admitted through the common idle gate.
     fn setModel(self: *AbiSession, model: []const u8) !void {
         if (self.facade_poisoned.load(.acquire))
             return error.InvalidSessionState;
@@ -631,8 +1069,8 @@ const AbiSession = struct {
         try self.core_session.setModel(model);
     }
 
-    /// Internal Revision 5 adapter. Host rules are compiled by the canonical
-    /// Core parser/matcher; the facade contributes only lifecycle admission.
+    /// Host rules are compiled by the canonical Core parser/matcher; the
+    /// AgentCore facade adds lifecycle admission and authority invalidation.
     fn updatePermissionRules(
         self: *AbiSession,
         input: core.permission_settings.RuleSetInput,
@@ -641,11 +1079,44 @@ const AbiSession = struct {
             return error.InvalidSessionState;
         if (!self.tryBeginMutation()) return error.SessionBusy;
         defer self.finishMutation();
-        try self.core_session.updatePermissionRules(input);
+        try self.updatePermissionRulesAdmitted(input);
     }
 
-    /// Internal typed-Skill entry used by the Revision 5 public input union.
-    /// All validation before `admitMaterializedSkill` is side-effect free.
+    fn updatePermissionRulesAdmitted(
+        self: *AbiSession,
+        input: core.permission_settings.RuleSetInput,
+    ) !void {
+        const next_generation = std.math.add(
+            u64,
+            self.policy_generation,
+            1,
+        ) catch return error.ResourceLimit;
+        const definitions = self.core_session.tools.definitions;
+        const tool_names = try allocator.alloc([]const u8, definitions.len);
+        defer allocator.free(tool_names);
+        for (definitions, tool_names) |definition, *name|
+            name.* = definition.name;
+        const next_fingerprint = try session_permission.computePolicyFingerprint(
+            allocator,
+            self.core_session.permission_ctx.modeValue(),
+            input,
+            .{
+                .root = self.core_session.workspace.root,
+                .home = self.core_session.workspace.home,
+                .shell = self.core_session.workspace.shell,
+            },
+            tool_names,
+        );
+        try self.core_session.updatePermissionRules(input);
+        self.permission_state.replaceGeneration(next_generation) catch
+            unreachable;
+        self.policy_generation = next_generation;
+        self.policy_fingerprint = next_fingerprint;
+        self.pending_permission = null;
+    }
+
+    /// Internal typed-Skill entry. All validation before
+    /// `admitMaterializedSkill` is side-effect free.
     fn runSkill(
         self: *AbiSession,
         materializations: *skill_materialization.Manager,
@@ -1702,7 +2173,17 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
         const description = text(descriptor.description) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
         const schema_json = text(descriptor.input_schema_json) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
         const schema = parseSchema(a, schema_json) catch |err| return failError(inputErrorStatus(err), err, out_error);
-        self.host_tools[i] = .{ .ctx = descriptor.ctx, .execute_fn = descriptor.execute.?, .release_fn = descriptor.release_result.? };
+        const binding = session_permission.deriveHostBinding(
+            a,
+            name,
+            schema_json,
+        ) catch |err| return failError(inputErrorStatus(err), err, out_error);
+        self.host_tools[i] = .{
+            .ctx = descriptor.ctx,
+            .execute_fn = descriptor.execute.?,
+            .release_fn = descriptor.release_result.?,
+            .binding = binding,
+        };
         native_tools[i] = .{ .definition = .{ .name = name, .description = description, .input_schema = schema }, .ctx = &self.host_tools[i], .execute = AbiHostTool.execute };
     }
     self.core_runtime = core.agent_session.AgentRuntime.create(allocator, .{ .builtin_tools = builtin_names, .host_sync_tools = native_tools }) catch |err| {
@@ -1825,6 +2306,7 @@ const SessionBuildConfig = struct {
     skill_binding: ?SkillBinding,
     restored: ?*const session_checkpoint.Decoded = null,
     skill_summary: session_authority.AuthoritySummary = .{},
+    permission_reconciliation: ?*session_permission.Reconciliation = null,
 };
 
 const RestoreHostConfig = struct {
@@ -1850,7 +2332,29 @@ fn buildAbiSession(
     runtime: *AbiRuntime,
     config: SessionBuildConfig,
 ) !*AbiSession {
+    const policy_fingerprint = try session_permission.computePolicyFingerprint(
+        allocator,
+        config.permission_mode,
+        config.permission_rules,
+        config.workspace,
+        config.allowed_tools,
+    );
+    const policy_generation: u64 = if (config.permission_reconciliation) |value|
+        value.policy_generation
+    else
+        1;
+    if (policy_generation == 0) return error.PermissionStateUnsupported;
+    var permission_state = if (config.permission_reconciliation) |value|
+        value.takeState()
+    else
+        try session_permission.State.init(allocator, policy_generation);
+    var keep_permission_state = false;
+    defer if (!keep_permission_state) permission_state.deinit();
+    var permission_audit = try session_permission.AuditTrail.init(allocator);
+    var keep_permission_audit = false;
+    defer if (!keep_permission_audit) permission_audit.deinit();
     const self = try allocator.create(AbiSession);
+    errdefer allocator.destroy(self);
     self.* = .{
         .callbacks = config.callbacks,
         .callback_status = .init(wire.STATUS_OK),
@@ -1863,22 +2367,30 @@ fn buildAbiSession(
             decoded.descriptor.checkpoint_generation
         else
             0,
-        .policy_generation = if (config.restored) |decoded|
-            decoded.descriptor.policy_generation
-        else
-            0,
+        .policy_generation = policy_generation,
+        .policy_fingerprint = policy_fingerprint,
         .catalog_generation = if (config.restored) |decoded|
             decoded.descriptor.catalog_generation
         else
             0,
         .logical_origin = if (config.restored == null) .fresh else .restored,
-        .restore_health = switch (config.skill_summary.disposition) {
-            .not_bound, .restored => .complete,
-            .narrowed, .unavailable, .changed => .degraded,
-        },
+        .restore_health = if ((switch (config.skill_summary.disposition) {
+            .not_bound, .restored => false,
+            .narrowed, .unavailable, .changed => true,
+        }) or (config.permission_reconciliation != null and
+            (config.permission_reconciliation.?.invalidated != 0 or
+                !config.permission_reconciliation.?.fingerprint_compatible)))
+            .degraded
+        else
+            .complete,
         .invalidated_skill_authority = config.skill_summary.invalidated,
-        .invalidated_permission_rules = 0,
+        .invalidated_permission_rules = if (config.permission_reconciliation) |value|
+            value.invalidated
+        else
+            0,
         .invalidated_mcp_bindings = 0,
+        .permission_state = permission_state,
+        .permission_audit = permission_audit,
         .last_terminal_kind = if (config.restored) |decoded|
             decoded.descriptor.terminal_kind
         else
@@ -1888,7 +2400,12 @@ fn buildAbiSession(
         else
             0,
     };
-    errdefer allocator.destroy(self);
+    keep_permission_state = true;
+    keep_permission_audit = true;
+    errdefer {
+        if (self.permission_audit) |*audit| audit.deinit();
+        self.permission_state.deinit();
+    }
 
     const core_config = core.agent_session.SessionConfig{
         .provider_kind = config.provider_kind,
@@ -1899,10 +2416,10 @@ fn buildAbiSession(
         .permission_rules = config.permission_rules,
         .workspace = config.workspace,
         .allowed_tools = config.allowed_tools,
-        .run_ui_requester = if (config.callbacks.on_ui_request != null)
-            .{ .ctx = self, .requestFn = AbiSession.requestUi }
-        else
-            null,
+        // Always attach the AgentCore requester. A missing Host callback is a
+        // typed `unavailable` outcome with provenance, never an implicit
+        // process-stdin fallback or an answered deny.
+        .run_ui_requester = .{ .ctx = self, .requestFn = AbiSession.requestUi },
         .host_identity_ctx = self,
     };
     self.core_session = if (config.restored) |decoded|
@@ -1915,6 +2432,13 @@ fn buildAbiSession(
     else
         try runtime.core_runtime.createSession(core_config);
     errdefer self.core_session.destroy() catch unreachable;
+    // AgentCore owns its Session rules. Disconnect the product-level
+    // name-only memory and install the optional, otherwise inert shared seam.
+    self.core_session.permission_ctx.session_rules = null;
+    self.core_session.permission_ctx.decision_override = .{
+        .ctx = self,
+        .decideFn = AbiSession.permissionDecisionOverride,
+    };
 
     self.policy_root = try policy_frame.PolicyFrame.createRoot(
         allocator,
@@ -1948,13 +2472,29 @@ fn restoreCheckpoint(
         limits,
     );
     defer decoded.deinit();
-    const restored_permission = try session_authority.decodePermissionState(
+    var restored_permission = try session_authority.decodePermissionState(
+        allocator,
         decoded.permission_state,
     );
-    if (restored_permission.mode != config.permission_mode)
-        return error.PermissionModeMismatch;
-    if (decoded.descriptor.policy_generation != 0)
+    defer restored_permission.deinit();
+    if (restored_permission.policy_generation !=
+        decoded.descriptor.policy_generation)
         return error.PermissionStateUnsupported;
+    const current_fingerprint = try session_permission.computePolicyFingerprint(
+        allocator,
+        config.permission_mode,
+        config.permission_rules,
+        config.workspace,
+        config.allowed_tools,
+    );
+    var permission_reconciliation = try session_permission.reconcileCheckpoint(
+        allocator,
+        &restored_permission,
+        config.permission_mode,
+        current_fingerprint,
+        config.allowed_tools,
+    );
+    defer permission_reconciliation.deinit();
     if (decoded.mcp_state.len != 0 or
         decoded.descriptor.catalog_generation != 0)
         return error.McpStateUnsupported;
@@ -2001,6 +2541,7 @@ fn restoreCheckpoint(
         .skill_binding = binding,
         .restored = &decoded,
         .skill_summary = skill_summary,
+        .permission_reconciliation = &permission_reconciliation,
     });
     keep_binding = true;
     return .{
@@ -2012,6 +2553,8 @@ fn restoreCheckpoint(
             .policy_generation = self.policy_generation,
             .catalog_generation = self.catalog_generation,
             .skill = skill_summary,
+            .permission_rules_restored = permission_reconciliation.restored,
+            .permission_rules_invalidated = permission_reconciliation.invalidated,
         },
     };
 }
@@ -2158,6 +2701,8 @@ fn sessionDestroy(handle: ?*wire.SessionHandle, out_error: ?*wire.OwnedBytesV1) 
         binding.deinit(&runtime.catalogs);
         self.skill_binding = null;
     }
+    if (self.permission_audit) |*audit| audit.deinit();
+    self.permission_state.deinit();
     allocator.destroy(self);
     return wire.STATUS_OK;
 }
@@ -2246,7 +2791,7 @@ fn sessionUpdatePermissionRules(
     defer scratch.deinit();
     const input = parsePermissionRuleSet(scratch.allocator(), rules) catch |err|
         return failError(inputErrorStatus(err), err, out_error);
-    self.core_session.updatePermissionRules(input) catch |err|
+    self.updatePermissionRulesAdmitted(input) catch |err|
         return failError(sessionMutationStatus(err), err, out_error);
     return wire.STATUS_OK;
 }
@@ -2834,25 +3379,108 @@ test "Host UI descriptor ownership is independent of callback status" {
     }
 }
 
-test "AgentCore permission session choices use Core memory and unavailable denies once" {
+test "Revision 6 AgentCore Permission callback binds grants and preserves typed unavailable" {
     const Probe = struct {
         var status: u32 = wire.UI_ANSWERED;
-        var response_json: []const u8 = "{\"permission\":\"allow_session\"}";
+        var permission: []const u8 = "allow_session";
         var calls: usize = 0;
         var releases: usize = 0;
+        var response_buffer: [1024]u8 = undefined;
+        var last_request: [4096]u8 = undefined;
+        var last_request_len: usize = 0;
 
-        fn request(_: ?*anyopaque, _: ?*const wire.RunContextV1, _: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+        fn request(_: ?*anyopaque, _: ?*const wire.RunContextV1, request_view: wire.BytesViewV1, out: ?*wire.OwnedBytesV1) callconv(.c) u32 {
             calls += 1;
             const result = out orelse return wire.UI_FATAL;
-            result.* = if (response_json.len == 0)
-                .{ .ptr = null, .len = 0 }
+            if (status != wire.UI_ANSWERED) {
+                result.* = .{ .ptr = null, .len = 0 };
+                return status;
+            }
+            const request_len = std.math.cast(usize, request_view.len) orelse
+                return wire.UI_FATAL;
+            const request_bytes = if (request_len == 0)
+                ""
             else
-                .{ .ptr = @constCast(response_json.ptr), .len = response_json.len };
+                (request_view.ptr orelse return wire.UI_FATAL)[0..request_len];
+            if (request_bytes.len > last_request.len) return wire.UI_FATAL;
+            @memcpy(last_request[0..request_bytes.len], request_bytes);
+            last_request_len = request_bytes.len;
+            var parsed = std.json.parseFromSlice(
+                std.json.Value,
+                std.heap.c_allocator,
+                request_bytes,
+                .{},
+            ) catch return wire.UI_FATAL;
+            defer parsed.deinit();
+            const root = switch (parsed.value) {
+                .object => |object| object,
+                else => return wire.UI_FATAL,
+            };
+            const request_id = switch (root.get("request_id") orelse
+                return wire.UI_FATAL) {
+                .string => |value| value,
+                else => return wire.UI_FATAL,
+            };
+            const generation = switch (root.get("policy_generation") orelse
+                return wire.UI_FATAL) {
+                .integer => |value| value,
+                else => return wire.UI_FATAL,
+            };
+            const encoded = if (std.mem.endsWith(u8, permission, "_session")) blk: {
+                const candidate_value = root.get("candidate") orelse
+                    return wire.UI_FATAL;
+                const candidate = switch (candidate_value) {
+                    .object => |object| object,
+                    else => return wire.UI_FATAL,
+                };
+                const rule_id = switch (candidate.get("rule_id") orelse
+                    return wire.UI_FATAL) {
+                    .string => |value| value,
+                    else => return wire.UI_FATAL,
+                };
+                break :blk std.fmt.bufPrint(
+                    &response_buffer,
+                    "{{\"permission\":\"{s}\",\"request_id\":\"{s}\",\"policy_generation\":{d},\"rule_id\":\"{s}\"}}",
+                    .{ permission, request_id, generation, rule_id },
+                ) catch return wire.UI_FATAL;
+            } else std.fmt.bufPrint(
+                &response_buffer,
+                "{{\"permission\":\"{s}\",\"request_id\":\"{s}\",\"policy_generation\":{d}}}",
+                .{ permission, request_id, generation },
+            ) catch return wire.UI_FATAL;
+            result.* = .{ .ptr = encoded.ptr, .len = encoded.len };
             return status;
         }
 
         fn release(_: ?*anyopaque, _: ?*wire.OwnedBytesV1) callconv(.c) void {
             releases += 1;
+        }
+    };
+    const ToolCall = struct {
+        fn append(
+            session: *core.agent_session.AgentSession,
+            id: []const u8,
+            name: []const u8,
+            input: []const u8,
+        ) !void {
+            const a = session.allocator;
+            const id_owned = try a.dupe(u8, id);
+            errdefer a.free(id_owned);
+            const name_owned = try a.dupe(u8, name);
+            errdefer a.free(name_owned);
+            const input_owned = try a.dupe(u8, input);
+            errdefer a.free(input_owned);
+            const blocks = try a.alloc(core.message.Block, 1);
+            errdefer a.free(blocks);
+            blocks[0] = .{ .tool_use = .{
+                .id = id_owned,
+                .name = name_owned,
+                .input = input_owned,
+            } };
+            try session.conversation.append(.{
+                .role = .assistant,
+                .blocks = blocks,
+            });
         }
     };
     var tmp = std.testing.tmpDir(.{});
@@ -2861,15 +3489,18 @@ test "AgentCore permission session choices use Core memory and unavailable denie
     const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
     const native_runtime = try core.agent_session.AgentRuntime.create(
         std.testing.allocator,
-        .{ .builtin_tools = &.{} },
+        .{ .builtin_tools = &.{ "Bash", "Write", "Edit" } },
     );
     defer native_runtime.destroy() catch unreachable;
     const native_session = try native_runtime.createSession(.{
         .provider_kind = .anthropic,
         .api_key = "test-key",
         .model = "test-model",
-        .workspace = .{ .root = root_buffer[0..root_len] },
-        .allowed_tools = &.{},
+        .workspace = .{
+            .root = root_buffer[0..root_len],
+            .shell = .unrestricted,
+        },
+        .allowed_tools = &.{ "Bash", "Write", "Edit" },
     });
     defer native_session.destroy() catch unreachable;
 
@@ -2889,69 +3520,371 @@ test "AgentCore permission session choices use Core memory and unavailable denie
         .facade_poisoned = .init(false),
         .core_session = native_session,
     };
+    defer fake.permission_state.deinit();
 
     Probe.status = wire.UI_ANSWERED;
-    Probe.response_json = "{\"permission\":\"allow_session\"}";
+    Probe.permission = "allow_session";
     Probe.calls = 0;
     Probe.releases = 0;
+    try ToolCall.append(native_session, "call-allow", "Bash", "{}");
+    try std.testing.expect(
+        AbiSession.permissionDecisionOverride(
+            &fake,
+            "Bash",
+            "{}",
+            .undecided,
+        ) == null,
+    );
     try std.testing.expectEqual(
         ui_request.RequestOutcome.answered,
-        try AbiSession.requestUi(&fake, .{ .session_id = .single, .run_id = 1 }, std.testing.allocator, &request, &response),
+        try AbiSession.requestUi(&fake, .{
+            .session_id = native_session.session_id,
+            .run_id = 1,
+        }, std.testing.allocator, &request, &response),
     );
     try std.testing.expect(response == .permission and response.permission == .allow_once);
     try std.testing.expectEqual(@as(usize, 1), Probe.calls);
     try std.testing.expectEqual(@as(usize, 1), Probe.releases);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        Probe.last_request[0..Probe.last_request_len],
+        "\"tool_call_id\":\"call-allow\"",
+    ) != null);
 
-    // The second request is answered from Core-owned memory. The product
-    // callback is not invoked and the core only sees an allow-once projection,
-    // so its disk-persistence branch is unreachable.
+    // The next invocation is decided before the callback. Product-level
+    // name-only SessionRules and the settings writer never participate.
     try std.testing.expectEqual(
-        ui_request.RequestOutcome.answered,
-        try AbiSession.requestUi(&fake, .{ .session_id = .single, .run_id = 2 }, std.testing.allocator, &request, &response),
+        core.permission.PermissionResult.allow,
+        AbiSession.permissionDecisionOverride(
+            &fake,
+            "Bash",
+            "{}",
+            .undecided,
+        ).?,
     );
-    try std.testing.expect(response == .permission and response.permission == .allow_once);
     try std.testing.expectEqual(@as(usize, 1), Probe.calls);
     try std.testing.expectEqual(@as(usize, 1), Probe.releases);
-
-    var denied = AbiSession{
-        .callbacks = fake.callbacks,
-        .callback_status = .init(wire.STATUS_OK),
-        .facade_poisoned = .init(false),
-        .core_session = native_session,
+    // Explicit ask remains stronger than a Session allow.
+    try std.testing.expectEqual(
+        core.permission.PermissionResult.ask,
+        AbiSession.permissionDecisionOverride(
+            &fake,
+            "Bash",
+            "{}",
+            .ask,
+        ).?,
+    );
+    const ModeCase = struct {
+        mode: core.types.PermissionMode,
+        explicit_ask: core.permission.PermissionResult,
     };
+    for ([_]ModeCase{
+        .{ .mode = .default, .explicit_ask = .ask },
+        .{ .mode = .accept_edits, .explicit_ask = .ask },
+        .{ .mode = .auto, .explicit_ask = .ask },
+        .{ .mode = .dont_ask, .explicit_ask = .deny },
+        .{ .mode = .bypass_permissions, .explicit_ask = .ask },
+    }) |case| {
+        native_session.permission_ctx.setMode(case.mode);
+        try std.testing.expectEqual(
+            case.explicit_ask,
+            AbiSession.permissionDecisionOverride(
+                &fake,
+                "Bash",
+                "{}",
+                .ask,
+            ).?,
+        );
+        try std.testing.expectEqual(
+            core.permission.PermissionResult.deny,
+            AbiSession.permissionDecisionOverride(
+                &fake,
+                "Bash",
+                "{}",
+                .deny,
+            ).?,
+        );
+        try std.testing.expectEqual(
+            core.permission.PermissionResult.allow,
+            AbiSession.permissionDecisionOverride(
+                &fake,
+                "Bash",
+                "{}",
+                .allow,
+            ).?,
+        );
+    }
+    native_session.permission_ctx.setMode(.default);
+
+    const mismatch_approved_args = "{\"file_path\":\"approved.txt\"}";
+    const mismatch_execution_args = "{\"file_path\":\"changed.txt\"}";
+    try ToolCall.append(
+        native_session,
+        "call-mismatch-approved",
+        "Edit",
+        mismatch_approved_args,
+    );
+    try std.testing.expect(
+        AbiSession.permissionDecisionOverride(
+            &fake,
+            "Edit",
+            mismatch_approved_args,
+            .undecided,
+        ) == null,
+    );
+    try ToolCall.append(
+        native_session,
+        "call-mismatch-execution",
+        "Edit",
+        mismatch_execution_args,
+    );
+    const mismatch_request = ui_request.UiRequest{ .permission = .{
+        .tool = "Edit",
+        .args = mismatch_execution_args,
+    } };
+    const calls_before_mismatch = Probe.calls;
+    try std.testing.expectError(
+        error.HostUiFailed,
+        AbiSession.requestUi(&fake, .{
+            .session_id = native_session.session_id,
+            .run_id = 2,
+        }, std.testing.allocator, &mismatch_request, &response),
+    );
+    try std.testing.expectEqual(calls_before_mismatch, Probe.calls);
+    fake.callback_status.store(wire.STATUS_OK, .release);
+
     const write_request = ui_request.UiRequest{ .permission = .{ .tool = "Write", .args = "{}" } };
-    Probe.status = wire.UI_ANSWERED;
-    Probe.response_json = "{\"permission\":\"deny_session\"}";
+    fake.permission_audit = try session_permission.AuditTrail.init(
+        std.testing.allocator,
+    );
+    defer if (fake.permission_audit) |*audit| audit.deinit();
+    Probe.permission = "deny_session";
     Probe.calls = 0;
     Probe.releases = 0;
+    try ToolCall.append(native_session, "call-deny", "Write", "{}");
+    try std.testing.expect(
+        AbiSession.permissionDecisionOverride(
+            &fake,
+            "Write",
+            "{}",
+            .undecided,
+        ) == null,
+    );
     try std.testing.expectEqual(
         ui_request.RequestOutcome.answered,
-        try AbiSession.requestUi(&denied, .{ .session_id = .single, .run_id = 1 }, std.testing.allocator, &write_request, &response),
+        try AbiSession.requestUi(&fake, .{
+            .session_id = native_session.session_id,
+            .run_id = 2,
+        }, std.testing.allocator, &write_request, &response),
     );
     try std.testing.expect(response == .permission and response.permission == .deny_once);
     try std.testing.expectEqual(
-        ui_request.RequestOutcome.answered,
-        try AbiSession.requestUi(&denied, .{ .session_id = .single, .run_id = 2 }, std.testing.allocator, &write_request, &response),
+        core.permission.PermissionResult.deny,
+        AbiSession.permissionDecisionOverride(
+            &fake,
+            "Write",
+            "{}",
+            .allow,
+        ).?,
     );
-    try std.testing.expect(response == .permission and response.permission == .deny_once);
     try std.testing.expectEqual(@as(usize, 1), Probe.calls);
     try std.testing.expectEqual(@as(usize, 1), Probe.releases);
+    var last_audit = (try fake.permission_audit.?.cloneLast(
+        std.testing.allocator,
+    )).?;
+    defer last_audit.deinit(std.testing.allocator);
+    try std.testing.expectEqual(
+        session_permission.CallbackOutcome.answered,
+        last_audit.callback_outcome.?,
+    );
+    try std.testing.expectEqual(
+        session_permission.Response.deny_session,
+        last_audit.response.?,
+    );
 
-    var unavailable = AbiSession{
-        .callbacks = fake.callbacks,
-        .callback_status = .init(wire.STATUS_OK),
-        .facade_poisoned = .init(false),
-        .core_session = native_session,
-    };
     const edit_request = ui_request.UiRequest{ .permission = .{ .tool = "Edit", .args = "{}" } };
-    Probe.status = wire.UI_UNAVAILABLE;
-    Probe.response_json = "";
+    Probe.permission = "allow_once";
+    Probe.calls = 0;
+    Probe.releases = 0;
+    try ToolCall.append(native_session, "call-once", "Edit", "{}");
+    try std.testing.expect(
+        AbiSession.permissionDecisionOverride(
+            &fake,
+            "Edit",
+            "{}",
+            .undecided,
+        ) == null,
+    );
     try std.testing.expectEqual(
         ui_request.RequestOutcome.answered,
-        try AbiSession.requestUi(&unavailable, .{ .session_id = .single, .run_id = 3 }, std.testing.allocator, &edit_request, &response),
+        try AbiSession.requestUi(&fake, .{
+            .session_id = native_session.session_id,
+            .run_id = 3,
+        }, std.testing.allocator, &edit_request, &response),
+    );
+    try std.testing.expect(response == .permission and response.permission == .allow_once);
+    try std.testing.expectEqual(@as(usize, 2), fake.permission_state.ruleCount());
+    try std.testing.expect(
+        AbiSession.permissionDecisionOverride(
+            &fake,
+            "Edit",
+            "{}",
+            .undecided,
+        ) == null,
+    );
+
+    // dont_ask rejects both an explicit ask and a Core-safety prompt without
+    // invoking the Host callback.
+    native_session.permission_ctx.setMode(.dont_ask);
+    const calls_before_dont_ask = Probe.calls;
+    try ToolCall.append(native_session, "call-dont-ask-explicit", "Bash", "{}");
+    try std.testing.expectEqual(
+        core.permission.PermissionResult.deny,
+        AbiSession.permissionDecisionOverride(
+            &fake,
+            "Bash",
+            "{}",
+            .ask,
+        ).?,
+    );
+    fake.pending_permission = null;
+    try ToolCall.append(native_session, "call-dont-ask-safety", "Edit", "{}");
+    try std.testing.expectEqual(
+        ui_request.RequestOutcome.answered,
+        try AbiSession.requestUi(&fake, .{
+            .session_id = native_session.session_id,
+            .run_id = 4,
+        }, std.testing.allocator, &edit_request, &response),
     );
     try std.testing.expect(response == .permission and response.permission == .deny_once);
-    try std.testing.expectEqual(wire.STATUS_OK, unavailable.callback_status.load(.acquire));
+    try std.testing.expectEqual(calls_before_dont_ask, Probe.calls);
+    native_session.permission_ctx.setMode(.default);
+
+    Probe.status = wire.UI_UNAVAILABLE;
+    try ToolCall.append(native_session, "call-unavailable", "Edit", "{}");
+    try std.testing.expect(
+        AbiSession.permissionDecisionOverride(
+            &fake,
+            "Edit",
+            "{}",
+            .undecided,
+        ) == null,
+    );
+    try std.testing.expectEqual(
+        ui_request.RequestOutcome.unavailable,
+        try AbiSession.requestUi(&fake, .{
+            .session_id = native_session.session_id,
+            .run_id = 5,
+        }, std.testing.allocator, &edit_request, &response),
+    );
+    try std.testing.expectEqual(wire.STATUS_OK, fake.callback_status.load(.acquire));
+    last_audit.deinit(std.testing.allocator);
+    last_audit = (try fake.permission_audit.?.cloneLast(
+        std.testing.allocator,
+    )).?;
+    try std.testing.expectEqual(
+        session_permission.CallbackOutcome.unavailable,
+        last_audit.callback_outcome.?,
+    );
+    try std.testing.expectEqualStrings(
+        "call-unavailable",
+        last_audit.tool_call_id,
+    );
+
+    Probe.status = wire.UI_CANCELLED;
+    try ToolCall.append(native_session, "call-cancelled", "Edit", "{}");
+    try std.testing.expect(
+        AbiSession.permissionDecisionOverride(
+            &fake,
+            "Edit",
+            "{}",
+            .undecided,
+        ) == null,
+    );
+    try std.testing.expectError(
+        error.UiCancelled,
+        AbiSession.requestUi(&fake, .{
+            .session_id = native_session.session_id,
+            .run_id = 6,
+        }, std.testing.allocator, &edit_request, &response),
+    );
+    last_audit.deinit(std.testing.allocator);
+    last_audit = (try fake.permission_audit.?.cloneLast(
+        std.testing.allocator,
+    )).?;
+    try std.testing.expectEqual(
+        session_permission.CallbackOutcome.user_cancelled,
+        last_audit.callback_outcome.?,
+    );
+
+    // An explicit ask does not offer allow_session. Returning it anyway is a
+    // callback contract failure, not an answered allow or a user denial.
+    Probe.status = wire.UI_ANSWERED;
+    Probe.permission = "allow_session";
+    try ToolCall.append(native_session, "call-contract", "Bash", "{}");
+    try std.testing.expectEqual(
+        core.permission.PermissionResult.ask,
+        AbiSession.permissionDecisionOverride(
+            &fake,
+            "Bash",
+            "{}",
+            .ask,
+        ).?,
+    );
+    try std.testing.expectError(
+        error.InvalidResponse,
+        AbiSession.requestUi(&fake, .{
+            .session_id = native_session.session_id,
+            .run_id = 7,
+        }, std.testing.allocator, &request, &response),
+    );
+    last_audit.deinit(std.testing.allocator);
+    last_audit = (try fake.permission_audit.?.cloneLast(
+        std.testing.allocator,
+    )).?;
+    try std.testing.expectEqual(
+        session_permission.CallbackOutcome.contract_failure,
+        last_audit.callback_outcome.?,
+    );
+    try std.testing.expectEqual(
+        wire.STATUS_CALLBACK_FAILED,
+        fake.callback_status.load(.acquire),
+    );
+    try native_session.updatePermissionRules(.{
+        .allow = &.{"Bash(git *)"},
+        .ask = &.{"Bash(*)"},
+    });
+    native_session.permission_ctx.session_rules = null;
+    native_session.permission_ctx.decision_override = .{
+        .ctx = &fake,
+        .decideFn = AbiSession.permissionDecisionOverride,
+    };
+    try std.testing.expectEqual(
+        core.permission.PermissionResult.ask,
+        core.permission.checkPermission(
+            &native_session.permission_ctx,
+            "Bash",
+            "{\"command\":\"git status\"}",
+        ),
+    );
+    const metacodes_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root_buffer[0..root_len], ".metacodes" },
+    );
+    defer std.testing.allocator.free(metacodes_path);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().access(std.testing.io, metacodes_path, .{}),
+    );
+    const claude_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ root_buffer[0..root_len], ".claude" },
+    );
+    defer std.testing.allocator.free(claude_path);
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().access(std.testing.io, claude_path, .{}),
+    );
 }
 
 test "oversized Host tool results are released exactly once" {
@@ -3250,14 +4183,14 @@ test "Revision 6 AgentCore checkpoint export commits generation only after sink 
     const cwd = root_buffer[0..root_len];
     const native_runtime = try core.agent_session.AgentRuntime.create(
         std.testing.allocator,
-        .{ .builtin_tools = &.{} },
+        .{ .builtin_tools = &.{"Read"} },
     );
     const native_session = try native_runtime.createSession(.{
         .provider_kind = .anthropic,
         .api_key = "test-key",
         .model = "test-model",
         .workspace = .{ .root = cwd },
-        .allowed_tools = &.{},
+        .allowed_tools = &.{"Read"},
     });
     try native_session.conversation.appendText(.user, "persist me");
     var runtime = AbiRuntime{
@@ -3276,6 +4209,27 @@ test "Revision 6 AgentCore checkpoint export commits generation only after sink 
         .core_session = native_session,
         .runtime = &runtime,
     };
+    defer session.permission_state.deinit();
+    session.policy_fingerprint = try session_permission.computePolicyFingerprint(
+        std.testing.allocator,
+        .default,
+        null,
+        .{ .root = cwd, .home = cwd },
+        &.{"Read"},
+    );
+    const read_digest = try session_permission.digestCanonicalArguments(
+        std.testing.allocator,
+        "{\"file_path\":\"README.md\"}",
+        .{},
+    );
+    _ = try session.permission_state.remember(
+        .allow_session,
+        (try session_permission.deriveRuleCandidate(.{
+            .namespace = .builtin,
+            .name = "Read",
+        }, read_digest)).?,
+        1,
+    );
     var capture = CaptureSink{ .allocator = std.testing.allocator };
     defer capture.deinit();
     const limits = session_checkpoint.Limits{
@@ -3327,6 +4281,12 @@ test "Revision 6 AgentCore checkpoint export commits generation only after sink 
     try std.testing.expectEqual(@as(u64, 2), decoded.descriptor.checkpoint_generation);
     try std.testing.expectEqualStrings("test-model", decoded.model);
     try std.testing.expectEqual(@as(usize, 0), decoded.skill_state.len);
+    var decoded_permission = try session_authority.decodePermissionState(
+        std.testing.allocator,
+        decoded.permission_state,
+    );
+    defer decoded_permission.deinit();
+    try std.testing.expectEqual(@as(usize, 1), decoded_permission.rules.len);
 
     var event_ctx: u8 = 0;
     var active_run = try native_session.admitRun(1, TestEventSink.sink(&event_ctx));
@@ -3352,12 +4312,9 @@ test "Revision 6 AgentCore checkpoint export commits generation only after sink 
         session.describe(std.testing.allocator),
     );
     session.call_state = .idle;
-    session.has_uncheckpointable_permission_memory.store(true, .release);
-    try std.testing.expectError(
-        error.PermissionStateUnavailable,
-        session.exportCheckpoint(limits, capture.sink()),
-    );
-    try std.testing.expectEqual(@as(u64, 2), session.checkpoint_generation);
+    capture.clear();
+    _ = try session.exportCheckpoint(limits, capture.sink());
+    try std.testing.expectEqual(@as(u64, 3), session.checkpoint_generation);
 
     try native_session.destroy();
     try native_runtime.destroy();
@@ -3373,14 +4330,14 @@ test "Revision 6 AgentCore restore is atomic and continues logical operation IDs
     const cwd = root_buffer[0..root_len];
     const native_runtime = try core.agent_session.AgentRuntime.create(
         std.testing.allocator,
-        .{ .builtin_tools = &.{} },
+        .{ .builtin_tools = &.{"Read"} },
     );
     const original = try native_runtime.createSession(.{
         .provider_kind = .anthropic,
         .api_key = "old-key",
         .model = "checkpoint-model",
         .workspace = .{ .root = cwd },
-        .allowed_tools = &.{},
+        .allowed_tools = &.{"Read"},
     });
     try original.conversation.appendText(.user, "survives restore");
     var event_ctx: u8 = 0;
@@ -3402,7 +4359,30 @@ test "Revision 6 AgentCore restore is atomic and continues logical operation IDs
         .facade_poisoned = .init(false),
         .core_session = original,
         .runtime = &runtime,
+        .permission_state = try session_permission.State.init(std.testing.allocator, 1),
     };
+    defer original_facade.permission_state.deinit();
+    original_facade.policy_fingerprint = try session_permission.computePolicyFingerprint(
+        std.testing.allocator,
+        .default,
+        null,
+        .{ .root = cwd, .home = cwd },
+        &.{"Read"},
+    );
+    const read_digest = try session_permission.digestCanonicalArguments(
+        std.testing.allocator,
+        "{\"file_path\":\"README.md\"}",
+        .{},
+    );
+    const read_candidate = (try session_permission.deriveRuleCandidate(.{
+        .namespace = .builtin,
+        .name = "Read",
+    }, read_digest)).?;
+    _ = try original_facade.permission_state.remember(
+        .allow_session,
+        read_candidate,
+        1,
+    );
     original_facade.recordTerminal(.run, 7);
     var checkpoint = TestCheckpointBuffer{ .allocator = std.testing.allocator };
     defer checkpoint.deinit();
@@ -3428,7 +4408,7 @@ test "Revision 6 AgentCore restore is atomic and continues logical operation IDs
         .permission_mode = .default,
         .permission_rules = null,
         .workspace = .{ .root = cwd, .home = cwd },
-        .allowed_tools = &.{},
+        .allowed_tools = &.{"Read"},
         .workspace_scope_id = scope_id,
     };
     var no_binding: ?SkillBinding = null;
@@ -3470,6 +4450,18 @@ test "Revision 6 AgentCore restore is atomic and continues logical operation IDs
     try std.testing.expectEqual(
         session_authority.RestoreHealth.complete,
         restored.report.health,
+    );
+    try std.testing.expectEqual(@as(u32, 1), restored.report.permission_rules_restored);
+    try std.testing.expectEqual(@as(u32, 0), restored.report.permission_rules_invalidated);
+    try std.testing.expectEqual(@as(usize, 1), restored.session.permission_state.ruleCount());
+    try std.testing.expectEqual(
+        session_permission.Decision.allow,
+        (try restored.session.permission_state.decide(
+            .{ .namespace = .builtin, .name = "Read" },
+            read_digest,
+            .undecided,
+            .{ .decision = .ask, .source = .mode_fallback },
+        )).decision,
     );
     try std.testing.expectEqual(@as(u64, 1), restored.report.checkpoint_generation);
     try std.testing.expectEqual(
@@ -3567,9 +4559,28 @@ test "Revision 6 AgentCore restore degrades unavailable and changed Skill author
         &selection,
     );
     defer std.testing.allocator.free(skill_state);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const cwd = root_buffer[0..root_len];
+    var permission_owner = try session_permission.State.init(
+        std.testing.allocator,
+        1,
+    );
+    defer permission_owner.deinit();
+    const policy_fingerprint = try session_permission.computePolicyFingerprint(
+        std.testing.allocator,
+        .default,
+        null,
+        .{ .root = cwd, .home = cwd },
+        &.{},
+    );
     const permission_state = try session_authority.encodePermissionState(
         std.testing.allocator,
         .default,
+        &permission_owner,
+        policy_fingerprint,
     );
     defer std.testing.allocator.free(permission_state);
     var conversation = core.conversation.Conversation.init(std.testing.allocator);
@@ -3593,17 +4604,13 @@ test "Revision 6 AgentCore restore degrades unavailable and changed Skill author
         .terminal_id = 0,
         .model = "checkpoint-model",
         .conversation = &conversation,
+        .policy_generation = 1,
         .authority = .{
             .skill = skill_state,
             .permission = permission_state,
         },
     }, limits, checkpoint.sink());
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
-    const cwd = root_buffer[0..root_len];
     const native_runtime = try core.agent_session.AgentRuntime.create(
         std.testing.allocator,
         .{ .builtin_tools = &.{} },
@@ -3639,16 +4646,27 @@ test "Revision 6 AgentCore restore degrades unavailable and changed Skill author
     var no_binding: ?SkillBinding = null;
     var mismatched_mode = base_config;
     mismatched_mode.permission_mode = .auto;
-    try std.testing.expectError(
-        error.PermissionModeMismatch,
-        restoreCheckpoint(
-            &runtime,
-            mismatched_mode,
-            &no_binding,
-            checkpoint.source(),
-            limits,
-        ),
+    const narrowed_permission = try restoreCheckpoint(
+        &runtime,
+        mismatched_mode,
+        &no_binding,
+        checkpoint.source(),
+        limits,
     );
+    try std.testing.expectEqual(
+        session_authority.RestoreHealth.degraded,
+        narrowed_permission.report.health,
+    );
+    try std.testing.expectEqual(
+        @as(u64, 2),
+        narrowed_permission.report.policy_generation,
+    );
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        sessionDestroy(narrowed_permission.session.handle(), &diagnostic),
+    );
+    bufferRelease(&diagnostic);
 
     const unavailable = try restoreCheckpoint(
         &runtime,
@@ -3667,7 +4685,6 @@ test "Revision 6 AgentCore restore degrades unavailable and changed Skill author
     );
     try std.testing.expectEqual(@as(u32, 1), unavailable.report.skill.invalidated);
     try std.testing.expect(unavailable.session.skill_binding == null);
-    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
     try std.testing.expectEqual(
         wire.STATUS_OK,
         sessionDestroy(unavailable.session.handle(), &diagnostic),
@@ -3868,7 +4885,7 @@ test "AbiSession model mutation delegates atomically through the shared gate" {
     try std.testing.expectEqualStrings("missing-model-is-locally-valid", native_session.model);
 }
 
-test "AbiSession permission rule mutation delegates through the shared gate" {
+test "Revision 6 AgentCore permission rule mutation is atomic and invalidates Session grants" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
@@ -3893,11 +4910,44 @@ test "AbiSession permission rule mutation delegates through the shared gate" {
         .callback_status = .init(wire.STATUS_OK),
         .facade_poisoned = .init(false),
         .core_session = native_session,
+        .permission_state = try session_permission.State.init(std.testing.allocator, 1),
     };
+    defer session.permission_state.deinit();
+    session.policy_fingerprint = try session_permission.computePolicyFingerprint(
+        std.testing.allocator,
+        .default,
+        null,
+        .{
+            .root = native_session.workspace.root,
+            .home = native_session.workspace.home,
+            .shell = native_session.workspace.shell,
+        },
+        &.{},
+    );
+    const arguments_digest = try session_permission.digestCanonicalArguments(
+        std.testing.allocator,
+        "{\"command\":\"echo ok\"}",
+        .{},
+    );
+    const candidate = (try session_permission.deriveRuleCandidate(.{
+        .namespace = .builtin,
+        .name = "Bash",
+    }, arguments_digest)).?;
+    _ = try session.permission_state.remember(.allow_session, candidate, 1);
+    const initial_fingerprint = session.policy_fingerprint;
+
     try session.updatePermissionRules(.{
         .allow = &.{"Write"},
         .deny = &.{"Bash"},
     });
+    try std.testing.expectEqual(@as(u64, 2), session.policy_generation);
+    try std.testing.expectEqual(@as(u64, 2), session.permission_state.generation());
+    try std.testing.expectEqual(@as(usize, 0), session.permission_state.ruleCount());
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        &initial_fingerprint,
+        &session.policy_fingerprint,
+    ));
     try std.testing.expectEqual(
         core.permission.PermissionResult.deny,
         core.permission.checkPermission(
@@ -3916,12 +4966,32 @@ test "AbiSession permission rule mutation delegates through the shared gate" {
     );
     try std.testing.expect(native_session.session_rules.isAllowed("Bash"));
     const published = native_session.permission_ctx.settings;
+    _ = try session.permission_state.remember(.deny_session, candidate, 2);
+    const published_generation = session.policy_generation;
+    const published_fingerprint = session.policy_fingerprint;
 
     try std.testing.expectError(
         error.InvalidRule,
         session.updatePermissionRules(.{ .allow = &.{"Bash("} }),
     );
     try std.testing.expect(native_session.permission_ctx.settings == published);
+    try std.testing.expectEqual(published_generation, session.policy_generation);
+    try std.testing.expectEqual(published_generation, session.permission_state.generation());
+    try std.testing.expectEqual(@as(usize, 1), session.permission_state.ruleCount());
+    try std.testing.expect(std.mem.eql(
+        u8,
+        &published_fingerprint,
+        &session.policy_fingerprint,
+    ));
+    try std.testing.expectEqual(
+        session_permission.Decision.deny,
+        (try session.permission_state.decide(
+            .{ .namespace = .builtin, .name = "Bash" },
+            arguments_digest,
+            .undecided,
+            .{ .decision = .ask, .source = .mode_fallback },
+        )).decision,
+    );
     try std.testing.expectEqual(AbiSession.CallState.idle, session.call_state);
 
     session.call_state = .running;

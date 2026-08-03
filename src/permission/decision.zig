@@ -18,6 +18,89 @@ const log = @import("../util/log.zig");
 
 pub const Decision = enum { allow, deny, ask };
 
+/// Optional consumer-owned decision seam. It exists so AgentCore can apply
+/// its Revision 6 logical-Session grants without changing CLI/App semantics or
+/// moving product policy into the shared loop. Null preserves the existing
+/// decision chain byte-for-byte.
+pub const ImportedSource = enum {
+    none,
+    core_safety,
+    active_skill,
+    settings,
+    session_memory,
+};
+
+/// The shared Permission layer passes its already-established decision into a
+/// consumer without discarding why that decision exists.  AgentCore uses this
+/// as the base of its Session policy; product callers without an override keep
+/// the exact existing decision chain.
+pub const ImportedDecision = enum {
+    undecided,
+    deny,
+    ask,
+    allow,
+    core_safety_deny,
+    core_safety_ask,
+    active_skill_deny,
+    active_skill_allow,
+    session_deny,
+
+    pub fn resolved(self: ImportedDecision) ?Decision {
+        return switch (self) {
+            .undecided => null,
+            .deny, .core_safety_deny, .active_skill_deny, .session_deny => .deny,
+            .ask, .core_safety_ask => .ask,
+            .allow, .active_skill_allow => .allow,
+        };
+    }
+
+    pub fn source(self: ImportedDecision) ImportedSource {
+        return switch (self) {
+            .undecided => .none,
+            .deny, .ask, .allow => .settings,
+            .core_safety_deny, .core_safety_ask => .core_safety,
+            .active_skill_deny, .active_skill_allow => .active_skill,
+            .session_deny => .session_memory,
+        };
+    }
+
+    /// A fixed decision is authority already owned by shared Permission.  A
+    /// consumer may observe it for provenance, but cannot replace it.  Only
+    /// the ordinary settings ask/allow/undecided path remains open for a
+    /// Session-scoped consumer to complete.
+    pub fn isFixed(self: ImportedDecision) bool {
+        return switch (self) {
+            .deny,
+            .core_safety_deny,
+            .core_safety_ask,
+            .active_skill_deny,
+            .active_skill_allow,
+            .session_deny,
+            => true,
+            .undecided, .ask, .allow => false,
+        };
+    }
+};
+
+pub const DecisionOverride = struct {
+    ctx: *anyopaque,
+    decideFn: *const fn (
+        ctx: *anyopaque,
+        tool_name: []const u8,
+        arguments_json: []const u8,
+        imported: ImportedDecision,
+    ) ?Decision,
+
+    pub fn decide(
+        self: DecisionOverride,
+        tool_name: []const u8,
+        arguments_json: []const u8,
+        imported: ImportedDecision,
+    ) ?Decision {
+        return self.decideFn(self.ctx, tool_name, arguments_json, imported);
+    }
+};
+
 pub const Context = struct {
     mode: Mode,
     /// 旧 schema rule_set(保留兼容,新代码用 settings)。
@@ -29,6 +112,8 @@ pub const Context = struct {
     /// Session-local allow/deny memory. It participates in the same deny-first
     /// matrix as imported settings instead of being deferred to the UI layer.
     session_rules: ?*SessionRules = null,
+    /// AgentCore-only optional seam; product callers leave it null.
+    decision_override: ?DecisionOverride = null,
     /// rule_spec 匹配上下文(cwd / project_root / home),用于 path / bash compound 等。
     match_ctx: rule_spec.MatchContext = .{},
     /// 沙箱启用?(用于 autoAllowBashIfSandboxed)。
@@ -55,6 +140,23 @@ pub const Context = struct {
     /// 见 extractCheckedPath 注释与 B1 绕过。shim 填 ctx.allocator。
     path_check_allocator: ?std.mem.Allocator = null,
 };
+
+fn resolveImported(
+    ctx: *const Context,
+    tool_name: []const u8,
+    arguments_json: []const u8,
+    imported: ImportedDecision,
+) Decision {
+    std.debug.assert(imported.resolved() != null);
+    std.debug.assert(imported.isFixed());
+    if (ctx.decision_override) |override| {
+        // Fixed decisions are reported through the same seam so AgentCore can
+        // retain canonical provenance.  Its return value is deliberately
+        // ignored: the shared layer remains the sole authority for ceilings.
+        _ = override.decide(tool_name, arguments_json, imported);
+    }
+    return imported.resolved().?;
+}
 
 /// 提取路径参数(file_path/notebook_path/path)并 **unescape**——与工具层落盘前的
 /// `util_json.unescapeString` 逐字节等价。owned,caller free;alloc=null / 无路径 / unescape
@@ -83,7 +185,7 @@ pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decis
             const dec = hooks_mod.runPreToolUse(h, ha, tool_name, args);
             if (dec == .block) {
                 log.warn("permission", "PreToolUse hook blocked tool={s}", .{tool_name});
-                return .deny;
+                return resolveImported(ctx, tool_name, args, .core_safety_deny);
             }
         }
     }
@@ -92,11 +194,11 @@ pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decis
     if (ctx.active_skill) |as| {
         if (as.isDisallowed(tool_name, args)) {
             log.debug("permission", "active skill '{s}' disallowed tool={s}", .{ as.skill_name, tool_name });
-            return .deny;
+            return resolveImported(ctx, tool_name, args, .active_skill_deny);
         }
         if (as.isAllowed(tool_name, args)) {
             log.debug("permission", "active skill '{s}' allowed tool={s}", .{ as.skill_name, tool_name });
-            return .allow;
+            return resolveImported(ctx, tool_name, args, .active_skill_allow);
         }
     }
 
@@ -113,13 +215,34 @@ pub fn check(ctx: *const Context, tool_name: []const u8, args: []const u8) Decis
         (remembered != null and remembered.? == .deny))
     {
         log.debug("permission", "imported/session deny tool={s}", .{tool_name});
-        return .deny;
+        return resolveImported(
+            ctx,
+            tool_name,
+            args,
+            if (imported == .deny) .deny else .session_deny,
+        );
     }
 
     // 2. Protected paths are a Core ceiling over imported and temporary allow.
     if (isProtectedTarget(ctx, tool_name, args)) {
         log.debug("permission", "protected path tool={s} -> ask", .{tool_name});
-        return .ask;
+        return resolveImported(ctx, tool_name, args, .core_safety_ask);
+    }
+
+    if (ctx.decision_override) |override| {
+        const imported_view: ImportedDecision = switch (imported) {
+            .undecided => .undecided,
+            .deny => .deny,
+            .ask => .ask,
+            .allow => .allow,
+        };
+        if (override.decide(tool_name, args, imported_view)) |overridden| {
+            log.debug("permission", "consumer override tool={s} -> {s}", .{
+                tool_name,
+                @tagName(overridden),
+            });
+            return overridden;
+        }
     }
 
     if (remembered != null and remembered.? == .allow) {
@@ -488,6 +611,106 @@ test "protected paths override imported and Session allow" {
         Decision.ask,
         check(&ctx, "Write", "{\"file_path\":\"/project/.env\"}"),
     );
+}
+
+test "consumer override observes complete provenance without weakening Core ceilings" {
+    const Probe = struct {
+        seen: ?ImportedDecision = null,
+        replacement: ?Decision = .allow,
+
+        fn decide(
+            raw: *anyopaque,
+            _: []const u8,
+            _: []const u8,
+            imported: ImportedDecision,
+        ) ?Decision {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.seen = imported;
+            return self.replacement;
+        }
+
+        fn seam(self: *@This()) DecisionOverride {
+            return .{ .ctx = self, .decideFn = decide };
+        }
+    };
+
+    var probe = Probe{};
+    var imported_deny = try settings_mod.buildRuleSet(
+        std.testing.allocator,
+        .{ .deny = &.{"Bash"} },
+        .{},
+    );
+    defer imported_deny.deinit();
+    try std.testing.expectEqual(Decision.deny, check(&.{
+        .mode = .bypass_permissions,
+        .settings = &imported_deny,
+        .decision_override = probe.seam(),
+    }, "Bash", "{\"command\":\"echo ok\"}"));
+    try std.testing.expectEqual(ImportedDecision.deny, probe.seen.?);
+    try std.testing.expectEqual(ImportedSource.settings, probe.seen.?.source());
+
+    probe.seen = null;
+    var deny_memory = SessionRules{};
+    deny_memory.rememberDeny("Bash");
+    try std.testing.expectEqual(Decision.deny, check(&.{
+        .mode = .bypass_permissions,
+        .session_rules = &deny_memory,
+        .decision_override = probe.seam(),
+    }, "Bash", "{\"command\":\"echo ok\"}"));
+    try std.testing.expectEqual(ImportedDecision.session_deny, probe.seen.?);
+    try std.testing.expectEqual(ImportedSource.session_memory, probe.seen.?.source());
+
+    probe.seen = null;
+    try std.testing.expectEqual(Decision.ask, check(&.{
+        .mode = .bypass_permissions,
+        .decision_override = probe.seam(),
+        .path_check_allocator = std.testing.allocator,
+    }, "Write", "{\"file_path\":\"/project/.env\"}"));
+    try std.testing.expectEqual(ImportedDecision.core_safety_ask, probe.seen.?);
+    try std.testing.expectEqual(ImportedSource.core_safety, probe.seen.?.source());
+
+    const PolicyFrame = @import("../skills/runtime/policy_frame.zig").PolicyFrame;
+    const tools = [_][]const u8{ "Read", "Bash" };
+    const root = try PolicyFrame.createRoot(
+        std.testing.allocator,
+        &tools,
+        .unrestricted,
+        .default,
+        .{ .alloc = std.testing.allocator },
+    );
+    defer root.release();
+    const child = try PolicyFrame.derive(root, &.{"Read"}, &.{});
+    defer child.release();
+    const active = @import("../skills/active.zig").ActiveSkillState.borrowFromPolicyFrame(
+        "read-only",
+        child,
+    );
+    probe.seen = null;
+    try std.testing.expectEqual(Decision.deny, check(&.{
+        .mode = .bypass_permissions,
+        .active_skill = &active,
+        .decision_override = probe.seam(),
+    }, "Bash", "{\"command\":\"echo ok\"}"));
+    try std.testing.expectEqual(ImportedDecision.active_skill_deny, probe.seen.?);
+    try std.testing.expectEqual(ImportedSource.active_skill, probe.seen.?.source());
+}
+
+test "null consumer override leaves the shared decision chain inert" {
+    var imported_ask = try settings_mod.buildRuleSet(
+        std.testing.allocator,
+        .{ .ask = &.{"Bash"} },
+        .{},
+    );
+    defer imported_ask.deinit();
+    const baseline = Context{ .mode = .bypass_permissions, .settings = &imported_ask };
+    const explicit_null = Context{
+        .mode = .bypass_permissions,
+        .settings = &imported_ask,
+        .decision_override = null,
+    };
+    const args = "{\"command\":\"echo ok\"}";
+    try std.testing.expectEqual(check(&baseline, "Bash", args), check(&explicit_null, "Bash", args));
+    try std.testing.expectEqual(Decision.ask, check(&explicit_null, "Bash", args));
 }
 
 test "B1 绕过修复(第4镜像点·规则匹配器): allow 规则 Write(/**) 圈 /proj 不放行 .. 逃逸" {

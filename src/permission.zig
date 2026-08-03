@@ -17,6 +17,9 @@ const rule_spec_mod = @import("permission/rule_spec.zig");
 // --- 旧 API 重导出 ---
 
 pub const PermissionResult = decision_mod.Decision;
+pub const ImportedPermissionDecision = decision_mod.ImportedDecision;
+pub const ImportedPermissionSource = decision_mod.ImportedSource;
+pub const PermissionDecisionOverride = decision_mod.DecisionOverride;
 pub const ToolCategory = category_mod.ToolCategory;
 pub const RiskLevel = category_mod.RiskLevel;
 pub const getToolCategory = category_mod.getToolCategory;
@@ -53,14 +56,16 @@ pub const PermissionContext = struct {
     /// Session 级权限记忆(always-allow / session-deny)。指针:*const ctx 仍可经它 remember。
     /// null = 无记忆(单测/库消费者不接)→ 每次都问。每 session 一个实例(多 Session 不串台)。
     session_rules: ?*@import("permission/session_rules.zig").SessionRules = null,
+    /// Optional consumer-owned decision seam. AgentCore uses it; CLI/App leave
+    /// it null so their existing Permission behavior is unchanged.
+    decision_override: ?PermissionDecisionOverride = null,
     /// UI 请求 runner(权限框经它让前端渲染)。重构前是 prompt.zig 的 g_ui_runner 全局
     /// (多 Session 会串台 + 指向已失效 TuiBackend 的 UAF)。现挂 per-session ctx。
     /// null = 无 runner → ask 退回文字 prompt。见 UiRequester。
     ui_requester: ?@import("core/protocol/ui_request.zig").UiRequester = null,
-    /// **非交互强制拒**(swarm teammate 用):true 时 ask() 命中 `.ask` 且无 ui_requester →
-    /// 直接 deny,**绝不读 fd 0**。teammate 线程与 lead REPL 共享进程 fd 0,isatty(0) 为真会
-    /// 让 ask() 落到 askText 读 stdin,和 lead 行读争抢/卡死(PM SW4 3c)。fail-closed:
-    /// teammate 拿不到权限就报工具错,由模型经 SendMessage 请 lead 代办(SW7 权限代理)。
+    /// **非交互强制拒**:true 时 requester 可以明确回答，但 unavailable、pending、取消或
+    /// callback error 都直接 deny，**绝不**回落到 process answer queue / fd 0。用于
+    /// UI-neutral library Session 和共享进程 stdin 的 swarm teammate。
     no_interactive_prompt: bool = false,
     /// 本 ctx 归属的会话(权限对话框路由到对应 session 视图)。默认 .single(N=1)。
     /// **M6 待办**:这与 ToolContext.session 是同一概念的两份拷贝(权限路径走 PermissionContext,
@@ -116,6 +121,7 @@ pub fn checkPermission(ctx: *const PermissionContext, tool_name: []const u8, arg
         .active_skill = ctx.active_skill,
         .settings = ctx.settings,
         .session_rules = ctx.session_rules,
+        .decision_override = ctx.decision_override,
         .match_ctx = mctx,
         .sandbox_enabled = ctx.sandbox_enabled,
         .auto_allow_bash_if_sandboxed = ctx.auto_allow_bash_if_sandboxed,
@@ -151,6 +157,35 @@ test "shim createContext + check plan" {
     const ctx = createContext(.plan, std.testing.allocator);
     try std.testing.expect(checkPermission(&ctx, "Read", "") == .allow);
     try std.testing.expect(checkPermission(&ctx, "Write", "") == .deny);
+}
+
+test "optional decision override is inert by default and receives imported action" {
+    const Probe = struct {
+        var calls: usize = 0;
+        var last_imported: ImportedPermissionDecision = .deny;
+
+        fn decide(
+            _: *anyopaque,
+            _: []const u8,
+            _: []const u8,
+            imported: ImportedPermissionDecision,
+        ) ?PermissionResult {
+            calls += 1;
+            last_imported = imported;
+            return .deny;
+        }
+    };
+    var marker: u8 = 0;
+    var ctx = createContext(.default, std.testing.allocator);
+    try std.testing.expectEqual(PermissionResult.allow, checkPermission(&ctx, "Read", "{}"));
+    Probe.calls = 0;
+    ctx.decision_override = .{
+        .ctx = &marker,
+        .decideFn = Probe.decide,
+    };
+    try std.testing.expectEqual(PermissionResult.deny, checkPermission(&ctx, "Read", "{}"));
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+    try std.testing.expectEqual(ImportedPermissionDecision.undecided, Probe.last_imported);
 }
 
 test "PermissionContext.mode 原子跨线程 write-read(无撕裂,release-acquire 可见)" {

@@ -6,19 +6,18 @@
 
 const std = @import("std");
 const core = @import("metacodes-core");
+const session_permission = @import("session_permission.zig");
 
 const skill_catalog = core.skills_runtime.catalog;
 const skill_availability = core.skills_runtime.availability;
 
 pub const SKILL_STATE_REVISION: u16 = 1;
-pub const PERMISSION_STATE_REVISION: u16 = 1;
+pub const PERMISSION_STATE_REVISION: u16 = session_permission.CHECKPOINT_STATE_REVISION;
 pub const MAX_SKILLS: usize = (skill_catalog.Limits{}).max_slots;
 
 const skill_magic = "R6SKILL\x00";
 const skill_header_bytes: usize = 80;
 const skill_entry_bytes: usize = 72;
-const permission_magic = "R6PERM\x00\x00";
-const permission_bytes: usize = 16;
 
 pub const Error = error{
     OutOfMemory,
@@ -106,9 +105,7 @@ pub const SkillEntry = struct {
     state: skill_availability.State,
 };
 
-pub const PermissionState = struct {
-    mode: core.types.PermissionMode,
-};
+pub const PermissionState = session_permission.DecodedCheckpoint;
 
 pub const DecodedSkillState = struct {
     allocator: std.mem.Allocator,
@@ -261,27 +258,29 @@ pub fn decodeSkillState(
 pub fn encodePermissionState(
     allocator: std.mem.Allocator,
     mode: core.types.PermissionMode,
+    state: *session_permission.State,
+    fingerprint: session_permission.PolicyFingerprint,
 ) Error![]u8 {
-    _ = canonicalPermissionMode(@intFromEnum(mode)) orelse
-        return error.InvalidState;
-    const encoded = allocator.alloc(u8, permission_bytes) catch
-        return error.OutOfMemory;
-    @memset(encoded, 0);
-    @memcpy(encoded[0..permission_magic.len], permission_magic);
-    std.mem.writeInt(u16, encoded[8..10], PERMISSION_STATE_REVISION, .little);
-    encoded[10] = @intFromEnum(mode);
-    return encoded;
+    return state.encodeCheckpoint(allocator, mode, fingerprint) catch |err|
+        return mapPermissionError(err);
 }
 
-pub fn decodePermissionState(encoded: []const u8) Error!PermissionState {
-    if (encoded.len != permission_bytes or
-        !std.mem.eql(u8, encoded[0..permission_magic.len], permission_magic) or
-        std.mem.readInt(u16, encoded[8..10], .little) != PERMISSION_STATE_REVISION or
-        !allZero(encoded[11..permission_bytes]))
-        return error.Corrupt;
-    return .{
-        .mode = canonicalPermissionMode(encoded[10]) orelse
-            return error.Corrupt,
+pub fn decodePermissionState(
+    allocator: std.mem.Allocator,
+    encoded: []const u8,
+) Error!PermissionState {
+    return session_permission.decodeCheckpoint(allocator, encoded) catch |err|
+        return mapPermissionError(err);
+}
+
+fn mapPermissionError(err: session_permission.Error) Error {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ResourceLimit => error.ResourceLimit,
+        error.InvalidArguments,
+        error.InvalidIdentity,
+        error.InvalidResponse,
+        => error.Corrupt,
     };
 }
 
@@ -360,18 +359,6 @@ pub fn reconcileSkillState(
 fn allZero(bytes: []const u8) bool {
     for (bytes) |byte| if (byte != 0) return false;
     return true;
-}
-
-fn canonicalPermissionMode(raw: u8) ?core.types.PermissionMode {
-    return switch (raw) {
-        0 => .default,
-        1 => .accept_edits,
-        2 => .plan,
-        3 => .auto,
-        4 => .dont_ask,
-        5 => .bypass_permissions,
-        else => null,
-    };
 }
 
 fn testRecord(id: u8, name: []const u8) skill_catalog.SkillRecord {
@@ -518,20 +505,38 @@ test "Revision 6 Skill authority rejects corrupt and oversized state" {
 }
 
 test "Revision 6 Permission authority preserves canonical mode" {
+    var state = try session_permission.State.init(std.testing.allocator, 7);
+    defer state.deinit();
+    const fingerprint = [_]u8{0x41} ** 32;
     const encoded = try encodePermissionState(
         std.testing.allocator,
         .dont_ask,
+        &state,
+        fingerprint,
     );
     defer std.testing.allocator.free(encoded);
-    const decoded = try decodePermissionState(encoded);
+    var decoded = try decodePermissionState(std.testing.allocator, encoded);
+    defer decoded.deinit();
     try std.testing.expectEqual(core.types.PermissionMode.dont_ask, decoded.mode);
+    try std.testing.expectEqual(@as(u64, 7), decoded.policy_generation);
+    try std.testing.expectEqualSlices(
+        u8,
+        &fingerprint,
+        &decoded.policy_fingerprint,
+    );
 
     const corrupt = try std.testing.allocator.dupe(u8, encoded);
     defer std.testing.allocator.free(corrupt);
     corrupt[10] = @intFromEnum(core.types.PermissionMode.prompt);
-    try std.testing.expectError(error.Corrupt, decodePermissionState(corrupt));
     try std.testing.expectError(
         error.Corrupt,
-        decodePermissionState(encoded[0 .. encoded.len - 1]),
+        decodePermissionState(std.testing.allocator, corrupt),
+    );
+    try std.testing.expectError(
+        error.Corrupt,
+        decodePermissionState(
+            std.testing.allocator,
+            encoded[0 .. encoded.len - 1],
+        ),
     );
 }
