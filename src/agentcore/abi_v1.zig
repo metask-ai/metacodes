@@ -1,6 +1,7 @@
 //! Thin C ABI v1 facade over AgentRuntime and AgentSession.
 
 const std = @import("std");
+pub const session_checkpoint = @import("session_checkpoint.zig");
 const builtin = @import("builtin");
 const sync = @import("platform").sync;
 const wire = @import("metask_agentcore_types");

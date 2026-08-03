@@ -96,6 +96,7 @@ const SessionIdSource = struct {
 /// without exposing test controls through the public Runtime/Session config.
 const SessionCreateHooks = struct {
     session_id_source: SessionIdSource = .{},
+    restored: ?RestoredSessionState = null,
     ctx: ?*anyopaque = null,
     after_id_registered_fn: ?*const fn (ctx: ?*anyopaque) anyerror!void = null,
 
@@ -170,6 +171,17 @@ pub const AgentRuntime = struct {
         return AgentSession.create(self, config);
     }
 
+    /// Narrow Core seam for an already validated AgentCore checkpoint. The
+    /// exact logical ID is registered atomically; no Handle is published on
+    /// collision or reconstruction failure.
+    pub fn createRestoredSession(
+        self: *AgentRuntime,
+        config: SessionConfig,
+        restored: RestoredSessionState,
+    ) !*AgentSession {
+        return AgentSession.createRestored(self, config, restored);
+    }
+
     fn retainSession(self: *AgentRuntime) RuntimeError!void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -234,6 +246,7 @@ const State = enum {
     compacting,
     compact_finishing,
     mutating,
+    checkpointing,
     poisoned,
     destroying,
 };
@@ -282,6 +295,39 @@ pub const CompactError = error{
     InvalidSessionState,
     OutOfMemory,
     ConcurrentMutation,
+};
+
+pub const CheckpointError = error{
+    SessionBusy,
+    InvalidSessionState,
+};
+
+/// Canonical state already reconstructed and validated by the AgentCore
+/// checkpoint layer. Conversation remains caller-owned and is deep-cloned into
+/// the Runtime allocator before the new Session can escape.
+pub const RestoredSessionState = struct {
+    session_id: SessionId,
+    last_run_id: u64,
+    last_compact_id: u64,
+    conversation: *Conversation,
+};
+
+/// Borrowed committed state protected by the Session's checkpointing activity.
+/// This value is linear: callers must not copy it and must call deinit exactly
+/// once on every success path, including Host sink failure.
+pub const CheckpointLease = struct {
+    session: ?*AgentSession,
+    session_id: SessionId,
+    last_run_id: u64,
+    last_compact_id: u64,
+    model: []const u8,
+    conversation: *const Conversation,
+
+    pub fn deinit(self: *CheckpointLease) void {
+        const session = self.session orelse return;
+        self.session = null;
+        session.finishCheckpoint();
+    }
 };
 
 pub const AbortCompactError = error{
@@ -553,6 +599,21 @@ pub const AgentSession = struct {
         return createWithHooks(runtime, config, .{});
     }
 
+    pub fn createRestored(
+        runtime: *AgentRuntime,
+        config: SessionConfig,
+        restored: RestoredSessionState,
+    ) !*AgentSession {
+        if (std.mem.eql(
+            u8,
+            restored.session_id.asSlice(),
+            SessionId.single.asSlice(),
+        ) or restored.conversation.compact_boundary >
+            restored.conversation.messages.items.len)
+            return error.InvalidRestoredState;
+        return createWithHooks(runtime, config, .{ .restored = restored });
+    }
+
     fn createWithHooks(runtime: *AgentRuntime, config: SessionConfig, hooks: SessionCreateHooks) !*AgentSession {
         try runtime.retainSession();
         errdefer runtime.releaseSession();
@@ -592,6 +653,12 @@ pub const AgentSession = struct {
         const base_url = if (config.base_url) |url| try allocator.dupe(u8, url) else null;
         errdefer if (base_url) |url| allocator.free(url);
 
+        var conversation = if (hooks.restored) |restored|
+            try restored.conversation.cloneInto(allocator)
+        else
+            Conversation.init(allocator);
+        errdefer conversation.deinit();
+
         const owned_provider = try provider_factory.makeProvider(
             allocator,
             config.provider_kind,
@@ -603,7 +670,11 @@ pub const AgentSession = struct {
 
         // collision detection:锁下原子注册,冲突则重新生成;重试超限 = 生成器故障,
         // 报不可达级错误而非无限循环。创建失败由 errdefer 回滚注册。
-        const session_id = blk: {
+        const session_id = if (hooks.restored) |restored| restored_id: {
+            if (!(try runtime.registerSessionId(restored.session_id)))
+                return error.SessionAlreadyOpen;
+            break :restored_id restored.session_id;
+        } else blk: {
             var attempts: usize = 0;
             while (attempts < AgentRuntime.MAX_SESSION_ID_RETRIES) : (attempts += 1) {
                 const candidate = hooks.session_id_source.next();
@@ -624,7 +695,7 @@ pub const AgentSession = struct {
             .model = model,
             .base_url = base_url,
             .provider = owned_provider,
-            .conversation = Conversation.init(allocator),
+            .conversation = conversation,
             .workspace = workspace,
             .tools = selected_tools,
             .read_state = ReadState.init(allocator),
@@ -637,6 +708,18 @@ pub const AgentSession = struct {
             .host_identity_ctx = config.host_identity_ctx,
             .abort_signal = AbortSignal.init(),
             .compact_abort_signal = AbortSignal.init(),
+            .last_run_id = if (hooks.restored) |restored|
+                restored.last_run_id
+            else
+                0,
+            .last_admitted_compact_id = if (hooks.restored) |restored|
+                restored.last_compact_id
+            else
+                0,
+            .last_terminal_compact_id = if (hooks.restored) |restored|
+                restored.last_compact_id
+            else
+                0,
         };
         self.permission_ctx.session_rules = &self.session_rules;
         self.permission_ctx.settings = if (self.imported_permission_rules) |*rules|
@@ -671,7 +754,7 @@ pub const AgentSession = struct {
         }
         switch (self.state) {
             .idle, .poisoned => self.state = .destroying,
-            .running, .abort_requested, .compacting, .compact_finishing, .mutating => {
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
                 self.mutex.unlock();
                 return error.SessionBusy;
             },
@@ -710,6 +793,46 @@ pub const AgentSession = struct {
         return self.state == .poisoned;
     }
 
+    /// Admit an immutable committed-state view without copying the long
+    /// Conversation. The dedicated lifecycle state prevents every mutation
+    /// until the caller releases the returned lease.
+    pub fn snapshotCommitted(self: *AgentSession) CheckpointError!CheckpointLease {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.in_flight_provider_cancels != 0)
+            return error.SessionBusy;
+        switch (self.state) {
+            .idle => {},
+            .running,
+            .abort_requested,
+            .compacting,
+            .compact_finishing,
+            .mutating,
+            .checkpointing,
+            => return error.SessionBusy,
+            .poisoned, .destroying => return error.InvalidSessionState,
+        }
+        if (self.jobs) |*registry| {
+            if (registry.activeCount() != 0) return error.SessionBusy;
+        }
+        self.state = .checkpointing;
+        return .{
+            .session = self,
+            .session_id = self.session_id,
+            .last_run_id = self.last_run_id,
+            .last_compact_id = self.last_terminal_compact_id,
+            .model = self.model,
+            .conversation = &self.conversation,
+        };
+    }
+
+    fn finishCheckpoint(self: *AgentSession) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.debug.assert(self.state == .checkpointing);
+        self.state = .idle;
+    }
+
     /// Atomically replace the Session's effective model/provider pair.
     ///
     /// Provider construction happens after the mutation gate is acquired but
@@ -727,7 +850,7 @@ pub const AgentSession = struct {
         }
         switch (self.state) {
             .idle => {},
-            .running, .abort_requested, .compacting, .compact_finishing, .mutating => {
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
                 self.mutex.unlock();
                 return error.SessionBusy;
             },
@@ -795,7 +918,7 @@ pub const AgentSession = struct {
         }
         switch (self.state) {
             .idle => self.state = .mutating,
-            .running, .abort_requested, .compacting, .compact_finishing, .mutating => {
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
                 self.mutex.unlock();
                 return error.SessionBusy;
             },
@@ -876,7 +999,7 @@ pub const AgentSession = struct {
         }
         switch (self.state) {
             .idle => {},
-            .running, .abort_requested, .compacting, .compact_finishing, .mutating => {
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
                 self.mutex.unlock();
                 return error.SessionBusy;
             },
@@ -970,7 +1093,7 @@ pub const AgentSession = struct {
                     return error.StaleCompact;
                 return error.InvalidOperationId;
             },
-            .running, .abort_requested, .mutating, .poisoned, .destroying => {
+            .running, .abort_requested, .mutating, .checkpointing, .poisoned, .destroying => {
                 self.mutex.unlock();
                 return error.InvalidSessionState;
             },
@@ -1161,7 +1284,7 @@ pub const AgentSession = struct {
                 self.mutex.unlock();
                 return if (too_late) error.AbortTooLate else error.StaleRun;
             },
-            .compacting, .compact_finishing, .mutating, .poisoned, .destroying => {
+            .compacting, .compact_finishing, .mutating, .checkpointing, .poisoned, .destroying => {
                 self.mutex.unlock();
                 return error.InvalidSessionState;
             },
@@ -1178,7 +1301,7 @@ pub const AgentSession = struct {
         }
         switch (self.state) {
             .idle => {},
-            .running, .abort_requested, .compacting, .compact_finishing, .mutating => {
+            .running, .abort_requested, .compacting, .compact_finishing, .mutating, .checkpointing => {
                 self.mutex.unlock();
                 return error.SessionBusy;
             },
@@ -1216,7 +1339,7 @@ pub const AgentSession = struct {
             return error.InvalidSessionState;
         switch (self.state) {
             .running, .abort_requested => {},
-            .idle, .compacting, .compact_finishing, .mutating, .poisoned, .destroying => return error.InvalidSessionState,
+            .idle, .compacting, .compact_finishing, .mutating, .checkpointing, .poisoned, .destroying => return error.InvalidSessionState,
         }
         self.active_run_started = true;
     }
@@ -1236,7 +1359,7 @@ pub const AgentSession = struct {
             return error.InvalidSessionState;
         switch (self.state) {
             .running, .abort_requested => {},
-            .idle, .compacting, .compact_finishing, .mutating, .poisoned, .destroying => return error.InvalidSessionState,
+            .idle, .compacting, .compact_finishing, .mutating, .checkpointing, .poisoned, .destroying => return error.InvalidSessionState,
         }
         const aborted = self.state == .abort_requested;
         if (self.callback_failed) {
@@ -1307,7 +1430,7 @@ pub const AgentSession = struct {
                 RunIdentity{ .session_id = self.session_id, .run_id = self.active_run_id }
             else
                 null,
-            .idle, .compacting, .compact_finishing, .mutating, .poisoned, .destroying => null,
+            .idle, .compacting, .compact_finishing, .mutating, .checkpointing, .poisoned, .destroying => null,
         };
         if (identity == null and (self.state == .running or self.state == .abort_requested)) {
             if (!self.callback_failed) {
@@ -2400,6 +2523,100 @@ test "AgentRuntime refuses destruction while Sessions are live" {
     try std.testing.expectError(error.RuntimeBusy, runtime.destroy());
     try second.destroy();
     try runtime.destroy();
+}
+
+test "AgentSession checkpoint lease gates lifecycle and releases to idle" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+
+    try self.conversation.appendText(.user, "committed before checkpoint");
+    var sink_probe = SinkProbe{};
+    var first = try self.admitRun(7, sink_probe.sink());
+    _ = try first.finishWithoutConversation();
+
+    var lease = try self.snapshotCommitted();
+    try std.testing.expectEqualSlices(u8, self.session_id.asSlice(), lease.session_id.asSlice());
+    try std.testing.expectEqual(@as(u64, 7), lease.last_run_id);
+    try std.testing.expectEqualStrings("test-model", lease.model);
+    try std.testing.expectEqual(@as(usize, 1), lease.conversation.messages.items.len);
+    try std.testing.expectError(error.SessionBusy, self.admitRun(8, sink_probe.sink()));
+    try std.testing.expectError(error.SessionBusy, self.compact(1, .{}));
+    try std.testing.expectError(error.SessionBusy, self.destroy());
+
+    lease.deinit();
+    var second = try self.admitRun(8, sink_probe.sink());
+    _ = try second.finishWithoutConversation();
+}
+
+test "restored AgentSession preserves logical identity and operation continuity" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const config = SessionConfig{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "restored-model",
+        .permission_mode = .default,
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{"Read"},
+    };
+
+    var source = Conversation.init(std.testing.allocator);
+    defer source.deinit();
+    try source.appendText(.user, "before compact");
+    try source.appendText(.assistant, "after compact");
+    try source.restoreCompactState(1, "restored summary");
+
+    try std.testing.expectError(error.InvalidRestoredState, runtime.createRestoredSession(config, .{
+        .session_id = SessionId.single,
+        .last_run_id = 11,
+        .last_compact_id = 4,
+        .conversation = &source,
+    }));
+
+    const logical_id = SessionId.fromSlice("0000000000000000000000aa").?;
+    const restored = try runtime.createRestoredSession(config, .{
+        .session_id = logical_id,
+        .last_run_id = 11,
+        .last_compact_id = 4,
+        .conversation = &source,
+    });
+    try source.appendText(.user, "source mutates independently");
+    try std.testing.expectEqual(@as(usize, 2), restored.conversation.messages.items.len);
+
+    try std.testing.expectError(error.SessionAlreadyOpen, runtime.createRestoredSession(config, .{
+        .session_id = logical_id,
+        .last_run_id = 11,
+        .last_compact_id = 4,
+        .conversation = &source,
+    }));
+    var sink_probe = SinkProbe{};
+    try std.testing.expectError(error.StaleRun, restored.admitRun(11, sink_probe.sink()));
+
+    var lease = try restored.snapshotCommitted();
+    try std.testing.expectEqualSlices(u8, logical_id.asSlice(), lease.session_id.asSlice());
+    try std.testing.expectEqual(@as(u64, 11), lease.last_run_id);
+    try std.testing.expectEqual(@as(u64, 4), lease.last_compact_id);
+    try std.testing.expectEqual(@as(usize, 1), lease.conversation.compact_boundary);
+    try std.testing.expectEqualStrings("restored summary", lease.conversation.compact_summary.?);
+    lease.deinit();
+
+    var admitted = try restored.admitRun(12, sink_probe.sink());
+    _ = try admitted.finishWithoutConversation();
+    try restored.destroy();
+
+    const reopened = try runtime.createRestoredSession(config, .{
+        .session_id = logical_id,
+        .last_run_id = 12,
+        .last_compact_id = 4,
+        .conversation = &source,
+    });
+    try reopened.destroy();
 }
 
 test "AgentRuntime rejects process-only built-ins that AgentSession cannot wire" {
