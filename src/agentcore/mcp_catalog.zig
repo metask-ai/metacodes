@@ -9,11 +9,27 @@ const sync = @import("platform").sync;
 const canonical = @import("mcp_canonical.zig");
 const runtime = @import("mcp_runtime.zig");
 const schema = @import("mcp_schema.zig");
+const util_time = @import("metacodes-core").util_time;
+
+pub const Clock = struct {
+    ctx: ?*const anyopaque = null,
+    now_fn: *const fn (?*const anyopaque) util_time.Nanos = systemNow,
+
+    pub fn now(self: Clock) util_time.Nanos {
+        return self.now_fn(self.ctx);
+    }
+
+    fn systemNow(_: ?*const anyopaque) util_time.Nanos {
+        return util_time.nowNs();
+    }
+};
 
 pub const Limits = struct {
     max_servers: usize = 64,
     max_namespace_bytes: usize = 24,
     max_issues: usize = 4096,
+    legacy_ttl_ms: u64 = 30_000,
+    max_ttl_ms: u64 = 300_000,
 };
 
 pub const ServerSpec = struct {
@@ -49,6 +65,56 @@ pub const ServerRecord = struct {
     namespace: []const u8,
     client: *runtime.Client,
     fingerprint: [32]u8,
+    expires_at_ns: util_time.Nanos,
+    cache_scope: canonical.CacheScope,
+
+    pub fn isFreshAt(self: ServerRecord, now_ns: util_time.Nanos) bool {
+        return now_ns < self.expires_at_ns;
+    }
+};
+
+pub const ServerDescription = struct {
+    server_binding_identity: [32]u8,
+    namespace: []const u8,
+    era: canonical.Era,
+    server_fingerprint: [32]u8,
+    cache_scope: canonical.CacheScope,
+    fresh: bool,
+    ttl_remaining_ms: u64,
+    tool_offset: u32,
+    tool_count: u32,
+};
+
+pub const ToolDescription = struct {
+    server_binding_identity: [32]u8,
+    canonical_name: []const u8,
+    schema_fingerprint: [32]u8,
+    permission_binding: [32]u8,
+};
+
+pub const IssueDescription = struct {
+    issue_id: [32]u8,
+    server_binding_identity: [32]u8,
+    tool_name: ?[]const u8,
+    kind: []const u8,
+    detail: []const u8,
+};
+
+/// Value-only Runtime query result. It gives every Host-visible catalog and
+/// binding identifier a canonical resolution path without leaking Snapshot,
+/// Client or transport pointers.
+pub const Description = struct {
+    arena: std.heap.ArenaAllocator,
+    generation: u64,
+    fingerprint: [32]u8,
+    servers: []ServerDescription,
+    tools: []ToolDescription,
+    issues: []IssueDescription,
+
+    pub fn deinit(self: *Description) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
 };
 
 pub const Snapshot = struct {
@@ -57,6 +123,8 @@ pub const Snapshot = struct {
     ref_count: std.atomic.Value(u32) = .init(1),
     generation: u64,
     fingerprint: [32]u8,
+    refreshed_at_ns: util_time.Nanos,
+    clock: Clock,
     servers: []ServerRecord,
     issues: []CatalogIssue,
 
@@ -85,6 +153,10 @@ pub const Snapshot = struct {
         return null;
     }
 
+    pub fn now(self: *const Snapshot) util_time.Nanos {
+        return self.clock.now();
+    }
+
     pub fn findTool(
         self: *const Snapshot,
         binding: *const [32]u8,
@@ -95,6 +167,92 @@ pub const Snapshot = struct {
             if (std.mem.eql(u8, tool.identity.name, name))
                 return .{ .server = server, .tool = tool };
         return null;
+    }
+
+    pub fn describe(
+        self: *const Snapshot,
+        backing: std.mem.Allocator,
+    ) Error!Description {
+        var arena = std.heap.ArenaAllocator.init(backing);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        var tool_count: usize = 0;
+        for (self.servers) |server| tool_count = std.math.add(
+            usize,
+            tool_count,
+            server.client.catalog.tools.len,
+        ) catch return error.ResourceLimit;
+        const servers = a.alloc(ServerDescription, self.servers.len) catch
+            return error.OutOfMemory;
+        const tools = a.alloc(ToolDescription, tool_count) catch
+            return error.OutOfMemory;
+        const issues = a.alloc(IssueDescription, self.issues.len) catch
+            return error.OutOfMemory;
+        var tool_offset: usize = 0;
+        const now_ns = self.now();
+        for (self.servers, servers) |server, *description| {
+            const remaining_ns = @max(@as(util_time.Nanos, 0), server.expires_at_ns - now_ns);
+            description.* = .{
+                .server_binding_identity = server.client.binding,
+                .namespace = a.dupe(u8, server.namespace) catch
+                    return error.OutOfMemory,
+                .era = server.client.era,
+                .server_fingerprint = server.fingerprint,
+                .cache_scope = server.cache_scope,
+                .fresh = server.isFreshAt(now_ns),
+                .ttl_remaining_ms = @intCast(@divTrunc(remaining_ns, std.time.ns_per_ms)),
+                .tool_offset = @intCast(tool_offset),
+                .tool_count = @intCast(server.client.catalog.tools.len),
+            };
+            for (server.client.catalog.tools, tools[tool_offset..]) |tool, *target| {
+                target.* = .{
+                    .server_binding_identity = tool.identity.server_binding_identity,
+                    .canonical_name = a.dupe(u8, tool.identity.name) catch
+                        return error.OutOfMemory,
+                    .schema_fingerprint = tool.identity.schema_fingerprint,
+                    .permission_binding = tool.identity.permissionBinding(),
+                };
+                tool_offset += 1;
+            }
+        }
+        for (self.issues, issues) |issue, *description| {
+            const parts = switch (issue.kind) {
+                .connection => |failure| .{ @tagName(failure), "" },
+                .schema => |schema_issue| .{
+                    @tagName(schema_issue.code),
+                    schema_issue.keyword orelse "",
+                },
+            };
+            const kind: []const u8 = parts[0];
+            const detail: []const u8 = parts[1];
+            const owned_tool = if (issue.tool_name) |name|
+                a.dupe(u8, name) catch return error.OutOfMemory
+            else
+                null;
+            const owned_kind = a.dupe(u8, kind) catch return error.OutOfMemory;
+            const owned_detail = a.dupe(u8, detail) catch return error.OutOfMemory;
+            description.* = .{
+                .issue_id = deriveIssueId(
+                    &issue.server_binding_identity,
+                    issue.tool_name,
+                    kind,
+                    detail,
+                ),
+                .server_binding_identity = issue.server_binding_identity,
+                .tool_name = owned_tool,
+                .kind = owned_kind,
+                .detail = owned_detail,
+            };
+        }
+        std.debug.assert(tool_offset == tools.len);
+        return .{
+            .arena = arena,
+            .generation = self.generation,
+            .fingerprint = self.fingerprint,
+            .servers = servers,
+            .tools = tools,
+            .issues = issues,
+        };
     }
 };
 
@@ -125,6 +283,7 @@ pub const Manager = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     limits: Limits,
+    clock: Clock,
     specs: []OwnedSpec,
     refresh_mutex: sync.Mutex = .{},
     current_mutex: sync.Mutex = .{},
@@ -135,8 +294,19 @@ pub const Manager = struct {
         specs: []const ServerSpec,
         limits: Limits,
     ) Error!Manager {
+        return initWithClock(allocator, specs, limits, .{});
+    }
+
+    pub fn initWithClock(
+        allocator: std.mem.Allocator,
+        specs: []const ServerSpec,
+        limits: Limits,
+        clock: Clock,
+    ) Error!Manager {
         if (limits.max_servers == 0 or limits.max_namespace_bytes == 0 or
-            limits.max_issues == 0 or specs.len > limits.max_servers)
+            limits.max_issues == 0 or limits.legacy_ttl_ms == 0 or
+            limits.max_ttl_ms == 0 or limits.legacy_ttl_ms > limits.max_ttl_ms or
+            specs.len > limits.max_servers)
             return error.InvalidConfig;
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
@@ -175,6 +345,7 @@ pub const Manager = struct {
             .allocator = allocator,
             .arena = arena,
             .limits = limits,
+            .clock = clock,
             .specs = owned,
         };
     }
@@ -187,8 +358,8 @@ pub const Manager = struct {
 
     /// Publish a fresh immutable snapshot. Individual server failures are
     /// catalog issues and do not prevent other servers (or Conversation) from
-    /// being usable. Allocation/resource failures abort publication, leaving
-    /// the old generation untouched.
+    /// being usable. Only Runtime-local allocation/global catalog failures
+    /// abort publication, leaving the old generation untouched.
     pub fn refresh(self: *Manager) Error!u64 {
         self.refresh_mutex.lock();
         defer self.refresh_mutex.unlock();
@@ -218,6 +389,15 @@ pub const Manager = struct {
         return snapshot.retain();
     }
 
+    pub fn describeCurrent(
+        self: *Manager,
+        backing: std.mem.Allocator,
+    ) Error!Description {
+        const snapshot = try self.retainCurrent();
+        defer snapshot.release();
+        return snapshot.describe(backing);
+    }
+
     fn buildSnapshot(self: *Manager, generation: u64) Error!*Snapshot {
         const snapshot = self.allocator.create(Snapshot) catch return error.OutOfMemory;
         errdefer self.allocator.destroy(snapshot);
@@ -229,7 +409,6 @@ pub const Manager = struct {
         var issues: std.ArrayList(CatalogIssue) = .empty;
         defer issues.deinit(a);
         errdefer for (servers.items) |server| server.client.deinit();
-
         for (self.specs) |spec| {
             const connected = runtime.connectServer(self.allocator, spec.runtimeConfig());
             const client = switch (connected) {
@@ -237,8 +416,7 @@ pub const Manager = struct {
                 .failed => |failure| {
                     switch (failure) {
                         .out_of_memory => return error.OutOfMemory,
-                        .resource_limit => return error.ResourceLimit,
-                        .diagnostic => {},
+                        .resource_limit, .diagnostic => {},
                     }
                     try appendIssue(&issues, a, self.limits, .{
                         .server_binding_identity = spec.binding,
@@ -264,7 +442,17 @@ pub const Manager = struct {
             servers.append(a, .{
                 .namespace = namespace,
                 .client = client,
-                .fingerprint = serverFingerprint(client),
+                .fingerprint = serverFingerprint(self.allocator, client) catch
+                    return error.OutOfMemory,
+                .expires_at_ns = try expiresAt(
+                    // Protocol TTL starts when this server's complete
+                    // discovery/list result has been received, not when the
+                    // multi-server refresh began.
+                    self.clock.now(),
+                    client.catalog.cache.ttl_ms,
+                    self.limits,
+                ),
+                .cache_scope = client.catalog.cache.scope,
             }) catch return error.OutOfMemory;
         }
         sortServers(servers.items);
@@ -275,12 +463,30 @@ pub const Manager = struct {
             .arena = arena,
             .generation = generation,
             .fingerprint = snapshotFingerprint(owned_servers),
+            .refreshed_at_ns = self.clock.now(),
+            .clock = self.clock,
             .servers = owned_servers,
             .issues = owned_issues,
         };
         return snapshot;
     }
 };
+
+fn expiresAt(
+    refreshed_at_ns: util_time.Nanos,
+    protocol_ttl_ms: ?f64,
+    limits: Limits,
+) Error!util_time.Nanos {
+    const requested_ms = protocol_ttl_ms orelse @as(f64, @floatFromInt(limits.legacy_ttl_ms));
+    if (!std.math.isFinite(requested_ms) or requested_ms < 0)
+        return error.InvalidConfig;
+    const bounded_ms = @min(requested_ms, @as(f64, @floatFromInt(limits.max_ttl_ms)));
+    const duration_ns: util_time.Nanos = @intFromFloat(@ceil(
+        bounded_ms * @as(f64, @floatFromInt(std.time.ns_per_ms)),
+    ));
+    return std.math.add(util_time.Nanos, refreshed_at_ns, duration_ns) catch
+        error.ResourceLimit;
+}
 
 fn appendIssue(
     issues: *std.ArrayList(CatalogIssue),
@@ -292,6 +498,24 @@ fn appendIssue(
     issues.append(allocator, issue) catch return error.OutOfMemory;
 }
 
+fn deriveIssueId(
+    binding: *const [32]u8,
+    tool_name: ?[]const u8,
+    kind: []const u8,
+    detail: []const u8,
+) [32]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("agentcore-r6-mcp-catalog-issue\x00");
+    hasher.update(binding);
+    hashBytes(&hasher, tool_name orelse "");
+    hashBytes(&hasher, kind);
+    hashBytes(&hasher, detail);
+    var result: [32]u8 = undefined;
+    hasher.final(&result);
+    if (std.mem.allEqual(u8, &result, 0)) result[0] = 1;
+    return result;
+}
+
 fn validNamespace(value: []const u8, max_bytes: usize) bool {
     if (value.len == 0 or value.len > max_bytes or
         !std.ascii.isAlphabetic(value[0])) return false;
@@ -299,21 +523,25 @@ fn validNamespace(value: []const u8, max_bytes: usize) bool {
     return true;
 }
 
-fn serverFingerprint(client: *const runtime.Client) [32]u8 {
+fn serverFingerprint(
+    allocator: std.mem.Allocator,
+    client: *const runtime.Client,
+) error{OutOfMemory}![32]u8 {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("agentcore-r6-mcp-server-catalog\x00");
     hasher.update(&client.binding);
     hasher.update(client.era.version());
-    var digests: [1024][32]u8 = undefined;
-    std.debug.assert(client.catalog.tools.len <= digests.len);
-    for (client.catalog.tools, digests[0..client.catalog.tools.len]) |tool, *digest| {
+    const digests = allocator.alloc([32]u8, client.catalog.tools.len) catch
+        return error.OutOfMemory;
+    defer allocator.free(digests);
+    for (client.catalog.tools, digests) |tool, *digest| {
         var tool_hasher = std.crypto.hash.sha2.Sha256.init(.{});
         hashBytes(&tool_hasher, tool.identity.name);
         tool_hasher.update(&tool.identity.schema_fingerprint);
         tool_hasher.final(digest);
     }
-    std.mem.sort([32]u8, digests[0..client.catalog.tools.len], {}, digestLessThan);
-    for (digests[0..client.catalog.tools.len]) |digest| hasher.update(&digest);
+    std.mem.sort([32]u8, digests, {}, digestLessThan);
+    for (digests) |digest| hasher.update(&digest);
     var result: [32]u8 = undefined;
     hasher.final(&result);
     return result;
@@ -358,6 +586,9 @@ fn allZero(value: []const u8) bool {
 const Fake = struct {
     opens: u8 = 0,
     closes: u8 = 0,
+    ttl_ms: u64 = 1000,
+    tool_count: u8 = 1,
+    paginate: bool = false,
 
     const Conn = struct { owner: *Fake };
 
@@ -385,20 +616,33 @@ const Fake = struct {
         _: u32,
         _: runtime.Cancellation,
     ) anyerror!runtime.ExchangeOutcome {
-        _ = raw;
+        const connection: *Conn = @ptrCast(@alignCast(raw));
         const id = requestId(encoded) orelse return .server_error;
         const response = if (std.mem.indexOf(u8, encoded, "server/discover") != null)
             try std.fmt.allocPrint(
                 allocator,
-                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{{}},\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}",
-                .{id},
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{{}},\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
+                .{ id, connection.owner.ttl_ms },
             )
         else if (std.mem.indexOf(u8, encoded, "tools/list") != null)
-            try std.fmt.allocPrint(
-                allocator,
-                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"weather\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"city\":{{\"type\":\"string\"}}}}}}}}],\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}",
-                .{id},
-            )
+            if (connection.owner.paginate)
+                try std.fmt.allocPrint(
+                    allocator,
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"weather\",\"inputSchema\":{{\"type\":\"object\"}}}}],\"nextCursor\":\"again\",\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
+                    .{ id, connection.owner.ttl_ms },
+                )
+            else if (connection.owner.tool_count == 1)
+                try std.fmt.allocPrint(
+                    allocator,
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"weather\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"city\":{{\"type\":\"string\"}}}}}}}}],\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
+                    .{ id, connection.owner.ttl_ms },
+                )
+            else
+                try std.fmt.allocPrint(
+                    allocator,
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"weather\",\"inputSchema\":{{\"type\":\"object\"}}}},{{\"name\":\"alerts\",\"inputSchema\":{{\"type\":\"object\"}}}}],\"ttlMs\":{d},\"cacheScope\":\"private\"}}}}",
+                    .{ id, connection.owner.ttl_ms },
+                )
         else
             return .server_error;
         return .{ .response = response };
@@ -418,6 +662,19 @@ const Fake = struct {
         var end = start;
         while (end < encoded.len and std.ascii.isDigit(encoded[end])) : (end += 1) {}
         return std.fmt.parseInt(u64, encoded[start..end], 10) catch null;
+    }
+};
+
+const TestClock = struct {
+    now_ns: util_time.Nanos,
+
+    fn read(raw: ?*const anyopaque) util_time.Nanos {
+        const self: *const TestClock = @ptrCast(@alignCast(raw.?));
+        return self.now_ns;
+    }
+
+    fn clock(self: *const TestClock) Clock {
+        return .{ .ctx = self, .now_fn = read };
     }
 };
 
@@ -442,10 +699,150 @@ test "catalog refresh publishes generations while retained Run snapshot remains 
     try std.testing.expectEqual(@as(u64, 1), first.generation);
     try std.testing.expectEqual(@as(u64, 2), second.generation);
     try std.testing.expect(first.findTool(&specs[0].binding, "weather") != null);
+    var description = try manager.describeCurrent(std.testing.allocator);
+    defer description.deinit();
+    try std.testing.expectEqual(@as(u64, 2), description.generation);
+    try std.testing.expectEqual(@as(usize, 1), description.servers.len);
+    try std.testing.expectEqual(@as(usize, 1), description.tools.len);
+    try std.testing.expectEqualStrings("weather", description.servers[0].namespace);
+    try std.testing.expectEqualStrings("weather", description.tools[0].canonical_name);
+    try std.testing.expectEqualSlices(
+        u8,
+        &specs[0].binding,
+        &description.tools[0].server_binding_identity,
+    );
+    try std.testing.expect(!std.mem.allEqual(
+        u8,
+        &description.tools[0].permission_binding,
+        0,
+    ));
     try std.testing.expectEqual(@as(u8, 4), fake.opens);
     // Each disposable probe and the Manager's released generation-1 owner are
     // closed; the explicit `first` retain keeps its actual connection alive.
     try std.testing.expectEqual(@as(u8, 2), fake.closes);
+}
+
+test "catalog freshness is clocked bounded and visible through description" {
+    var fake = Fake{ .ttl_ms = 1000 };
+    var clock = TestClock{ .now_ns = 10 * std.time.ns_per_s };
+    const specs = [_]ServerSpec{.{
+        .binding = [_]u8{0x37} ** 32,
+        .namespace = "weather",
+        .connector = fake.connector(),
+        .transport = .stdio,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    }};
+    var manager = try Manager.initWithClock(
+        std.testing.allocator,
+        &specs,
+        .{},
+        clock.clock(),
+    );
+    defer manager.deinit();
+    _ = try manager.refresh();
+
+    var fresh = try manager.describeCurrent(std.testing.allocator);
+    defer fresh.deinit();
+    try std.testing.expect(fresh.servers[0].fresh);
+    try std.testing.expectEqual(canonical.CacheScope.private, fresh.servers[0].cache_scope);
+    try std.testing.expectEqual(@as(u64, 1000), fresh.servers[0].ttl_remaining_ms);
+
+    clock.now_ns += 1001 * std.time.ns_per_ms;
+    var expired = try manager.describeCurrent(std.testing.allocator);
+    defer expired.deinit();
+    try std.testing.expect(!expired.servers[0].fresh);
+    try std.testing.expectEqual(@as(u64, 0), expired.servers[0].ttl_remaining_ms);
+}
+
+test "one server resource limit does not suppress unrelated catalog entries" {
+    var over_limit = Fake{ .paginate = true };
+    var healthy = Fake{};
+    const specs = [_]ServerSpec{
+        .{
+            .binding = [_]u8{0x41} ** 32,
+            .namespace = "oversized",
+            .connector = over_limit.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+            .protocol_limits = .{ .max_tools = 1 },
+        },
+        .{
+            .binding = [_]u8{0x42} ** 32,
+            .namespace = "healthy",
+            .connector = healthy.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+        },
+    };
+    var manager = try Manager.init(std.testing.allocator, &specs, .{});
+    defer manager.deinit();
+    try std.testing.expectEqual(@as(u64, 1), try manager.refresh());
+    var description = try manager.describeCurrent(std.testing.allocator);
+    defer description.deinit();
+    try std.testing.expectEqual(@as(usize, 1), description.servers.len);
+    try std.testing.expectEqualStrings("healthy", description.servers[0].namespace);
+    try std.testing.expectEqual(@as(usize, 1), description.tools.len);
+    try std.testing.expectEqual(@as(usize, 1), description.issues.len);
+    try std.testing.expectEqualStrings("resource_limit", description.issues[0].kind);
+}
+
+test "catalog TTL policy supplies legacy default and caps modern duration" {
+    const limits = Limits{ .legacy_ttl_ms = 30_000, .max_ttl_ms = 300_000 };
+    try std.testing.expectEqual(
+        @as(util_time.Nanos, 30_000 * std.time.ns_per_ms),
+        try expiresAt(0, null, limits),
+    );
+    try std.testing.expectEqual(
+        @as(util_time.Nanos, 300_000 * std.time.ns_per_ms),
+        try expiresAt(0, 900_000, limits),
+    );
+    try std.testing.expectEqual(
+        @as(util_time.Nanos, 0),
+        try expiresAt(0, 0, limits),
+    );
+}
+
+test "catalog description resolves stable issue identity without live handles" {
+    const Failing = struct {
+        fn open(
+            _: *anyopaque,
+            _: runtime.ConnectionPurpose,
+            _: canonical.Era,
+        ) anyerror!runtime.OpenOutcome {
+            return .auth_error;
+        }
+    };
+    var marker: u8 = 0;
+    const binding = [_]u8{9} ** 32;
+    const specs = [_]ServerSpec{.{
+        .binding = binding,
+        .namespace = "private",
+        .connector = .{ .ctx = &marker, .open_fn = Failing.open },
+        .transport = .streamable_http,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    }};
+    var manager = try Manager.init(std.testing.allocator, &specs, .{});
+    defer manager.deinit();
+    try std.testing.expectEqual(@as(u64, 1), try manager.refresh());
+
+    var first = try manager.describeCurrent(std.testing.allocator);
+    defer first.deinit();
+    var second = try manager.describeCurrent(std.testing.allocator);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 0), first.servers.len);
+    try std.testing.expectEqual(@as(usize, 1), first.issues.len);
+    try std.testing.expectEqualSlices(
+        u8,
+        &binding,
+        &first.issues[0].server_binding_identity,
+    );
+    try std.testing.expect(first.issues[0].kind.len != 0);
+    try std.testing.expect(!std.mem.allEqual(u8, &first.issues[0].issue_id, 0));
+    try std.testing.expectEqualSlices(
+        u8,
+        &first.issues[0].issue_id,
+        &second.issues[0].issue_id,
+    );
 }
 
 test "catalog configuration rejects duplicate identity and unsafe namespace" {

@@ -7,6 +7,7 @@
 const std = @import("std");
 const core = @import("metacodes-core");
 const session_permission = @import("session_permission.zig");
+const session_budget = @import("session_budget.zig");
 
 const skill_catalog = core.skills_runtime.catalog;
 const skill_availability = core.skills_runtime.availability;
@@ -14,6 +15,7 @@ const skill_availability = core.skills_runtime.availability;
 pub const SKILL_STATE_REVISION: u16 = 1;
 pub const PERMISSION_STATE_REVISION: u16 = session_permission.CHECKPOINT_STATE_REVISION;
 pub const MAX_SKILLS: usize = (skill_catalog.Limits{}).max_slots;
+pub const MAX_AUTHORITY_ISSUES: usize = 4096;
 
 const skill_magic = "R6SKILL\x00";
 const skill_header_bytes: usize = 80;
@@ -57,6 +59,113 @@ pub const AuthoritySummary = struct {
     invalidated: u32 = 0,
 };
 
+pub const AuthoritySubsystem = enum(u8) {
+    skill,
+    permission,
+    mcp,
+};
+
+pub const AuthorityIssueReason = enum(u8) {
+    unavailable,
+    identity_changed,
+    schema_changed,
+    policy_changed,
+    authority_narrowed,
+};
+
+/// Uniform value model used by restore reports and Session descriptions. Only
+/// fields meaningful to the selected subsystem are nonzero/nonempty.
+pub const AuthorityIssue = struct {
+    issue_id: [32]u8,
+    subsystem: AuthoritySubsystem,
+    reason: AuthorityIssueReason,
+    skill_id: [64]u8 = [_]u8{0} ** 64,
+    permission_rule_id: session_permission.RuleId = [_]u8{0} ** session_permission.RULE_ID_BYTES,
+    server_binding_identity: [32]u8 = [_]u8{0} ** 32,
+    authority_binding: [32]u8 = [_]u8{0} ** 32,
+    canonical_name: []const u8 = "",
+};
+
+pub const AuthorityIssueSeed = struct {
+    subsystem: AuthoritySubsystem,
+    reason: AuthorityIssueReason,
+    skill_id: [64]u8 = [_]u8{0} ** 64,
+    permission_rule_id: session_permission.RuleId = [_]u8{0} ** session_permission.RULE_ID_BYTES,
+    server_binding_identity: [32]u8 = [_]u8{0} ** 32,
+    authority_binding: [32]u8 = [_]u8{0} ** 32,
+    canonical_name: []const u8 = "",
+};
+
+pub const IssueLedger = struct {
+    arena: std.heap.ArenaAllocator,
+    items: []AuthorityIssue,
+
+    pub fn init(
+        backing: std.mem.Allocator,
+        seeds: []const AuthorityIssueSeed,
+    ) Error!IssueLedger {
+        if (seeds.len > MAX_AUTHORITY_ISSUES) return error.ResourceLimit;
+        var arena = std.heap.ArenaAllocator.init(backing);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const items = a.alloc(AuthorityIssue, seeds.len) catch
+            return error.OutOfMemory;
+        for (seeds, items) |seed, *item| {
+            try validateAuthorityIssueSeed(seed);
+            const canonical_name = a.dupe(u8, seed.canonical_name) catch
+                return error.OutOfMemory;
+            item.* = .{
+                .issue_id = deriveAuthorityIssueId(seed),
+                .subsystem = seed.subsystem,
+                .reason = seed.reason,
+                .skill_id = seed.skill_id,
+                .permission_rule_id = seed.permission_rule_id,
+                .server_binding_identity = seed.server_binding_identity,
+                .authority_binding = seed.authority_binding,
+                .canonical_name = canonical_name,
+            };
+        }
+        return .{ .arena = arena, .items = items };
+    }
+
+    pub fn deinit(self: *IssueLedger) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn cloneIssues(
+    allocator: std.mem.Allocator,
+    source: []const AuthorityIssue,
+) Error![]AuthorityIssue {
+    if (source.len > MAX_AUTHORITY_ISSUES) return error.ResourceLimit;
+    const result = allocator.alloc(AuthorityIssue, source.len) catch
+        return error.OutOfMemory;
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |issue|
+            allocator.free(issue.canonical_name);
+        allocator.free(result);
+    }
+    for (source, result) |issue, *copy| {
+        copy.* = issue;
+        copy.canonical_name = allocator.dupe(u8, issue.canonical_name) catch
+            return error.OutOfMemory;
+        initialized += 1;
+    }
+    return result;
+}
+
+pub const McpToolDescription = struct {
+    model_name: []const u8,
+    namespace: []const u8,
+    canonical_name: []const u8,
+    server_binding_identity: [32]u8,
+    schema_fingerprint: [32]u8,
+    permission_binding: [32]u8,
+    era: @import("mcp_canonical.zig").Era,
+};
+
 /// Internal canonical restore result. Exact C/Rust/Zig DTOs are deliberately
 /// deferred until the Session, Permission and MCP seams all close.
 pub const RestoreReport = struct {
@@ -70,12 +179,15 @@ pub const RestoreReport = struct {
     permission_rules_invalidated: u32 = 0,
     mcp_bindings_restored: u32 = 0,
     mcp_bindings_invalidated: u32 = 0,
+    /// Borrowed from the returned Session and valid until that Session is
+    /// destroyed. The public ABI projection copies these value records.
+    issues: []const AuthorityIssue = &.{},
 };
 
 /// Owned/value-only description used to close internal identifier references
 /// before a public ABI representation is selected.
 pub const SessionDescription = struct {
-    allocator: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
     session_id: core.session_id.SessionId,
     origin: LogicalOrigin,
     lifecycle: Lifecycle,
@@ -89,13 +201,17 @@ pub const SessionDescription = struct {
     conversation_messages: u64,
     compact_boundary: u64,
     skill_revision: ?[64]u8,
+    mcp_selection_fingerprint: [32]u8,
+    mcp_tools: []McpToolDescription,
+    budget: session_budget.Description,
+    authority_issues: []AuthorityIssue,
     restore_health: RestoreHealth,
     invalidated_skill_authority: u32,
     invalidated_permission_rules: u32,
     invalidated_mcp_bindings: u32,
 
     pub fn deinit(self: *SessionDescription) void {
-        self.allocator.free(self.model);
+        self.arena.deinit();
         self.* = undefined;
     }
 };
@@ -356,6 +472,37 @@ pub fn reconcileSkillState(
     };
 }
 
+fn validateAuthorityIssueSeed(seed: AuthorityIssueSeed) Error!void {
+    switch (seed.subsystem) {
+        .skill => if (allZero(&seed.skill_id) or seed.canonical_name.len != 0)
+            return error.InvalidState,
+        .permission => if (allZero(&seed.permission_rule_id) or
+            seed.canonical_name.len == 0)
+            return error.InvalidState,
+        .mcp => if (allZero(&seed.server_binding_identity) or
+            seed.canonical_name.len == 0)
+            return error.InvalidState,
+    }
+}
+
+fn deriveAuthorityIssueId(seed: AuthorityIssueSeed) [32]u8 {
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update("agentcore-r6-authority-issue\x00");
+    hasher.update(&.{ @intFromEnum(seed.subsystem), @intFromEnum(seed.reason) });
+    hasher.update(&seed.skill_id);
+    hasher.update(&seed.permission_rule_id);
+    hasher.update(&seed.server_binding_identity);
+    hasher.update(&seed.authority_binding);
+    var length: [8]u8 = undefined;
+    std.mem.writeInt(u64, &length, @intCast(seed.canonical_name.len), .little);
+    hasher.update(&length);
+    hasher.update(seed.canonical_name);
+    var result: [32]u8 = undefined;
+    hasher.final(&result);
+    if (allZero(&result)) result[0] = 1;
+    return result;
+}
+
 fn allZero(bytes: []const u8) bool {
     for (bytes) |byte| if (byte != 0) return false;
     return true;
@@ -539,4 +686,37 @@ test "Revision 6 Permission authority preserves canonical mode" {
             encoded[0 .. encoded.len - 1],
         ),
     );
+}
+
+test "authority issue identities are stable value-only references" {
+    const seeds = [_]AuthorityIssueSeed{
+        .{
+            .subsystem = .skill,
+            .reason = .authority_narrowed,
+            .skill_id = [_]u8{'a'} ** 64,
+        },
+        .{
+            .subsystem = .permission,
+            .reason = .policy_changed,
+            .permission_rule_id = [_]u8{2} ** session_permission.RULE_ID_BYTES,
+            .authority_binding = [_]u8{3} ** 32,
+            .canonical_name = "Write",
+        },
+        .{
+            .subsystem = .mcp,
+            .reason = .schema_changed,
+            .server_binding_identity = [_]u8{4} ** 32,
+            .authority_binding = [_]u8{5} ** 32,
+            .canonical_name = "weather",
+        },
+    };
+    var first = try IssueLedger.init(std.testing.allocator, &seeds);
+    defer first.deinit();
+    var second = try IssueLedger.init(std.testing.allocator, &seeds);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, seeds.len), first.items.len);
+    for (first.items, second.items) |left, right| {
+        try std.testing.expectEqualSlices(u8, &left.issue_id, &right.issue_id);
+        try std.testing.expect(!allZero(&left.issue_id));
+    }
 }

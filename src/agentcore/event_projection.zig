@@ -19,12 +19,25 @@ pub const Mode = enum {
 };
 
 pub const Projector = struct {
+    const ToolAttempt = struct {
+        id: []u8,
+        name: []u8,
+        input: []u8,
+
+        fn deinit(self: ToolAttempt, allocator: std.mem.Allocator) void {
+            allocator.free(self.id);
+            allocator.free(self.name);
+            allocator.free(self.input);
+        }
+    };
+
     allocator: std.mem.Allocator,
     mode: Mode,
     downstream: *const UiBackend,
     mutex: sync.Mutex = .{},
     current_segment: std.ArrayList(u8) = .empty,
     closed_segments: std.ArrayList(u8) = .empty,
+    tool_attempts: std.ArrayList(ToolAttempt) = .empty,
     reconstruction_error: ?anyerror = null,
 
     pub fn init(
@@ -43,6 +56,8 @@ pub const Projector = struct {
         self.mutex.lock();
         self.current_segment.deinit(self.allocator);
         self.closed_segments.deinit(self.allocator);
+        for (self.tool_attempts.items) |attempt| attempt.deinit(self.allocator);
+        self.tool_attempts.deinit(self.allocator);
         self.mutex.unlock();
         self.* = undefined;
     }
@@ -65,6 +80,28 @@ pub const Projector = struct {
         defer self.mutex.unlock();
         if (self.reconstruction_error != null) return error.OutOfMemory;
         try out.appendSlice(self.allocator, self.closed_segments.items);
+    }
+
+    /// Resolve the exact child model tool-call identity observed immediately
+    /// before Permission evaluation. Duplicate name+input attempts are
+    /// intentionally ambiguous and therefore fail closed.
+    pub fn copyToolCallId(
+        self: *Projector,
+        allocator: std.mem.Allocator,
+        tool_name: []const u8,
+        input: []const u8,
+    ) error{ OutOfMemory, InvalidIdentity }![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.reconstruction_error != null) return error.OutOfMemory;
+        var found: ?[]const u8 = null;
+        for (self.tool_attempts.items) |attempt| {
+            if (!std.mem.eql(u8, attempt.name, tool_name) or
+                !std.mem.eql(u8, attempt.input, input)) continue;
+            if (found != null) return error.InvalidIdentity;
+            found = attempt.id;
+        }
+        return allocator.dupe(u8, found orelse return error.InvalidIdentity);
     }
 
     fn emit(raw: *anyopaque, session: SessionId, event: CoreEvent) void {
@@ -101,13 +138,65 @@ pub const Projector = struct {
                 };
                 self.current_segment.clearRetainingCapacity();
             },
-            .tool_start, .tool_result => {
+            .tool_start => |tool| {
                 // A boundary invalidates both earlier closed responses and any
                 // currently open segment. Consecutive boundaries are idempotent.
                 self.closed_segments.clearRetainingCapacity();
                 self.current_segment.clearRetainingCapacity();
+                self.rememberToolAttempt(tool.id, tool.name, tool.input);
+            },
+            .tool_result => |tool| {
+                self.closed_segments.clearRetainingCapacity();
+                self.current_segment.clearRetainingCapacity();
+                self.forgetToolAttempt(tool.id);
             },
             else => {},
+        }
+    }
+
+    fn rememberToolAttempt(
+        self: *Projector,
+        id: []const u8,
+        name: []const u8,
+        input: []const u8,
+    ) void {
+        if (self.reconstruction_error != null) return;
+        const owned_id = self.allocator.dupe(u8, id) catch {
+            self.reconstruction_error = error.OutOfMemory;
+            return;
+        };
+        const owned_name = self.allocator.dupe(u8, name) catch {
+            self.allocator.free(owned_id);
+            self.reconstruction_error = error.OutOfMemory;
+            return;
+        };
+        const owned_input = self.allocator.dupe(u8, input) catch {
+            self.allocator.free(owned_name);
+            self.allocator.free(owned_id);
+            self.reconstruction_error = error.OutOfMemory;
+            return;
+        };
+        self.tool_attempts.append(self.allocator, .{
+            .id = owned_id,
+            .name = owned_name,
+            .input = owned_input,
+        }) catch {
+            self.allocator.free(owned_input);
+            self.allocator.free(owned_name);
+            self.allocator.free(owned_id);
+            self.reconstruction_error = error.OutOfMemory;
+        };
+    }
+
+    fn forgetToolAttempt(self: *Projector, id: []const u8) void {
+        var i: usize = 0;
+        while (i < self.tool_attempts.items.len) {
+            if (!std.mem.eql(u8, self.tool_attempts.items[i].id, id)) {
+                i += 1;
+                continue;
+            }
+            const removed = self.tool_attempts.swapRemove(i);
+            removed.deinit(self.allocator);
         }
     }
 
@@ -241,6 +330,74 @@ test "A1 tool boundaries discard closed and unclosed segments" {
     defer final.deinit(std.testing.allocator);
     try projector.appendFinalText(&final);
     try std.testing.expectEqualStrings("final-1final-2", final.items);
+}
+
+test "fork projector resolves one live tool-call identity and forgets it at result" {
+    var probe = EventProbe{};
+    const downstream = probe.backend();
+    var projector = Projector.init(
+        std.testing.allocator,
+        .model_tool,
+        &downstream,
+    );
+    defer projector.deinit();
+    const backend = projector.backend();
+
+    backend.emitEvent(.single, .{ .tool_start = .{
+        .id = "child-call-1",
+        .name = "Bash",
+        .input = "{\"command\":\"git status\"}",
+    } });
+    const id = try projector.copyToolCallId(
+        std.testing.allocator,
+        "Bash",
+        "{\"command\":\"git status\"}",
+    );
+    defer std.testing.allocator.free(id);
+    try std.testing.expectEqualStrings("child-call-1", id);
+
+    backend.emitEvent(.single, .{ .tool_start = .{
+        .id = "child-call-2",
+        .name = "Bash",
+        .input = "{\"command\":\"git status\"}",
+    } });
+    try std.testing.expectError(
+        error.InvalidIdentity,
+        projector.copyToolCallId(
+            std.testing.allocator,
+            "Bash",
+            "{\"command\":\"git status\"}",
+        ),
+    );
+    backend.emitEvent(.single, .{ .tool_result = .{
+        .id = "child-call-2",
+        .name = "Bash",
+        .input = "{\"command\":\"git status\"}",
+        .content = "denied",
+        .is_error = true,
+    } });
+    const remaining = try projector.copyToolCallId(
+        std.testing.allocator,
+        "Bash",
+        "{\"command\":\"git status\"}",
+    );
+    defer std.testing.allocator.free(remaining);
+    try std.testing.expectEqualStrings("child-call-1", remaining);
+    backend.emitEvent(.single, .{ .tool_result = .{
+        .id = "child-call-1",
+        .name = "Bash",
+        .input = "{\"command\":\"git status\"}",
+        .content = "ok",
+        .is_error = false,
+    } });
+    try std.testing.expectError(
+        error.InvalidIdentity,
+        projector.copyToolCallId(
+            std.testing.allocator,
+            "Bash",
+            "{\"command\":\"git status\"}",
+        ),
+    );
 }
 
 test "run-root and model-tool projections expose different public surfaces" {

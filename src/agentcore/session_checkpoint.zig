@@ -91,6 +91,7 @@ pub const Snapshot = struct {
 pub const Descriptor = struct {
     session_id: SessionId,
     checkpoint_generation: u64,
+    total_bytes: u64,
     last_run_id: u64,
     last_compact_id: u64,
     terminal_kind: TerminalKind,
@@ -134,6 +135,12 @@ pub const ExportReport = struct {
     digest: [DIGEST_BYTES]u8,
 };
 
+pub const Usage = struct {
+    total_bytes: u64,
+    message_bytes: u64,
+    message_count: u64,
+};
+
 const Measurement = struct {
     total_bytes: u64,
     message_bytes: u64,
@@ -159,7 +166,7 @@ pub fn exportToSink(snapshot: Snapshot, limits: Limits, sink: Sink) Error!Export
     try writer.writeHashed(snapshot.authority.skill);
     try writer.writeHashed(snapshot.authority.permission);
     try writer.writeHashed(snapshot.authority.mcp);
-    for (snapshot.conversation.messages.items) |item|
+    for (snapshot.conversation.activeMessages()) |item|
         try writeMessage(&writer, item);
     var digest: [DIGEST_BYTES]u8 = undefined;
     writer.hasher.final(&digest);
@@ -170,6 +177,25 @@ pub fn exportToSink(snapshot: Snapshot, limits: Limits, sink: Sink) Error!Export
         .chunk_count = writer.chunk_count,
         .digest = digest,
     };
+}
+
+/// Measure the exact canonical checkpoint representation without touching a
+/// Host sink. Admission code uses this to preserve the durable-state invariant
+/// before accepting another state change.
+pub fn measureSnapshot(snapshot: Snapshot, limits: Limits) Error!Usage {
+    const measured = try measure(snapshot, limits);
+    return .{
+        .total_bytes = measured.total_bytes,
+        .message_bytes = measured.message_bytes,
+        .message_count = measured.message_count,
+    };
+}
+
+/// Exact encoded delta for one Message containing one text block. This is the
+/// only pre-admission input shape currently accepted by AgentCore Runs.
+pub fn encodedTextMessageBytes(bytes: []const u8) Error!u64 {
+    if (!std.unicode.utf8ValidateSlice(bytes)) return error.Corrupt;
+    return checkedAdd(14, bytes.len);
 }
 
 pub fn decodeFromSource(
@@ -225,6 +251,10 @@ pub fn decodeFromSource(
 
     var conversation = Conversation.init(allocator);
     errdefer conversation.deinit();
+    // A checkpoint is resumable canonical state, not a transcript archive.
+    // Materialize the compact summary as the first assistant message so a
+    // later compact includes it even though the hidden raw prefix was omitted.
+    if (summary) |bytes| try conversation.appendText(.assistant, bytes);
     var message_index: u64 = 0;
     while (message_index < parsed.measurement.message_count) : (message_index += 1) {
         const item = try readMessage(
@@ -241,12 +271,8 @@ pub fn decodeFromSource(
         };
     }
     if (reader.position != parsed.messages_end or
-        parsed.measurement.compact_boundary > parsed.measurement.message_count)
+        parsed.measurement.compact_boundary != 0)
         return error.Corrupt;
-    try conversation.restoreCompactState(
-        @intCast(parsed.measurement.compact_boundary),
-        if (summary) |bytes| bytes else null,
-    );
 
     var expected_digest: [DIGEST_BYTES]u8 = undefined;
     reader.hasher.final(&expected_digest);
@@ -285,12 +311,19 @@ fn measure(snapshot: Snapshot, limits: Limits) Error!Measurement {
     const skill_bytes = try boundedSection(snapshot.authority.skill, limits);
     const permission_bytes = try boundedSection(snapshot.authority.permission, limits);
     const mcp_bytes = try boundedSection(snapshot.authority.mcp, limits);
-    const message_count: u64 = @intCast(snapshot.conversation.messages.items.len);
-    if (message_count > limits.max_messages) return error.ResourceLimit;
-    const compact_boundary: u64 = @intCast(snapshot.conversation.compact_boundary);
-    if (compact_boundary > message_count) return error.Corrupt;
+    const active_messages = snapshot.conversation.activeMessages();
+    const message_count: u64 = @intCast(active_messages.len);
+    const restored_message_count = try checkedAdd(
+        message_count,
+        @intFromBool(snapshot.conversation.compact_summary != null),
+    );
+    if (restored_message_count > limits.max_messages) return error.ResourceLimit;
+    // Hidden pre-compact messages are transcript history, not resumable model
+    // state. The summary section plus active messages is the exact projection
+    // seen by the next provider call.
+    const compact_boundary: u64 = 0;
     var message_bytes: u64 = 0;
-    for (snapshot.conversation.messages.items) |item|
+    for (active_messages) |item|
         message_bytes = try checkedAdd(message_bytes, try measureMessage(item, limits));
     if (message_bytes > limits.max_section_bytes) return error.ResourceLimit;
     var payload_bytes = try checkedAdd(model_bytes, summary_bytes);
@@ -451,14 +484,18 @@ fn parseHeader(header: *const [HEADER_BYTES]u8, limits: Limits) Error!ParsedHead
     const skill_bytes = getInt(header, 112, u64);
     const permission_bytes = getInt(header, 120, u64);
     const mcp_bytes = getInt(header, 128, u64);
+    const restored_message_count = try checkedAdd(
+        message_count,
+        @intFromBool((flags & flag_has_compact_summary) != 0),
+    );
     if (total_bytes < HEADER_BYTES + DIGEST_BYTES or
-        compact_boundary > message_count or model_bytes == 0 or
+        compact_boundary != 0 or model_bytes == 0 or
         ((flags & flag_has_compact_summary) == 0 and summary_bytes != 0))
         return error.Corrupt;
     if (total_bytes > limits.hard_bytes or
         total_bytes > ABSOLUTE_MAX_CHECKPOINT_BYTES or
         message_bytes > limits.max_section_bytes or
-        message_count > limits.max_messages or
+        restored_message_count > limits.max_messages or
         model_bytes > limits.max_string_bytes or
         summary_bytes > limits.max_string_bytes or
         skill_bytes > limits.max_section_bytes or
@@ -488,6 +525,7 @@ fn parseHeader(header: *const [HEADER_BYTES]u8, limits: Limits) Error!ParsedHead
     const descriptor = Descriptor{
         .session_id = session_id,
         .checkpoint_generation = getInt(header, 32, u64),
+        .total_bytes = total_bytes,
         .last_run_id = getInt(header, 40, u64),
         .last_compact_id = getInt(header, 48, u64),
         .terminal_id = getInt(header, 56, u64),
@@ -876,11 +914,41 @@ test "Revision 6 checkpoint streams and round-trips canonical Conversation" {
     try std.testing.expectEqual(@as(u64, 4), decoded.descriptor.checkpoint_generation);
     try std.testing.expectEqual(@as(u64, 9), decoded.descriptor.last_run_id);
     try std.testing.expectEqualStrings("test-model", decoded.model);
-    try std.testing.expectEqualStrings("summary", decoded.conversation.compact_summary.?);
     try std.testing.expectEqual(@as(usize, 1), decoded.conversation.messages.items.len);
-    try std.testing.expectEqual(@as(usize, 4), decoded.conversation.messages.items[0].blocks.len);
-    try std.testing.expectEqualStrings("Read", decoded.conversation.messages.items[0].blocks[2].tool_use.name);
+    try std.testing.expectEqualStrings(
+        "summary",
+        decoded.conversation.messages.items[0].blocks[0].text,
+    );
+    try std.testing.expect(decoded.conversation.compact_summary == null);
+    try std.testing.expectEqual(@as(usize, 0), decoded.conversation.compact_boundary);
     try std.testing.expectEqualStrings("permission-state", decoded.permission_state);
+}
+
+test "Revision 6 checkpoint counts compact summary in restored message limit" {
+    const allocator = std.testing.allocator;
+    var conversation = Conversation.init(allocator);
+    defer conversation.deinit();
+    try conversation.appendText(.user, "hidden-prefix");
+    try conversation.restoreCompactState(1, "summary");
+    try conversation.appendText(.user, "active");
+
+    var sink = TestSink{ .allocator = allocator };
+    defer sink.deinit();
+    const limits = Limits{
+        .hard_bytes = 1024 * 1024,
+        .max_messages = 1,
+    };
+    try std.testing.expectError(error.ResourceLimit, exportToSink(.{
+        .session_id = core.session_id.gen(),
+        .checkpoint_generation = 1,
+        .last_run_id = 0,
+        .last_compact_id = 0,
+        .terminal_kind = .none,
+        .terminal_id = 0,
+        .model = "test-model",
+        .conversation = &conversation,
+    }, limits, .{ .ctx = &sink, .write_fn = TestSink.write }));
+    try std.testing.expectEqual(@as(usize, 0), sink.calls);
 }
 
 test "Revision 6 checkpoint long Conversation honors exact byte and chunk budgets" {
@@ -925,7 +993,7 @@ test "Revision 6 checkpoint long Conversation honors exact byte and chunk budget
         roomy_limits,
         .{ .ctx = &measured_sink, .write_fn = TestSink.write },
     );
-    try std.testing.expect(measured.total_bytes > 256 * 1024);
+    try std.testing.expect(measured.total_bytes > 100 * 1024);
     try std.testing.expect(measured.chunk_count > 1000);
     try std.testing.expect(measured_sink.max_chunk <= roomy_limits.chunk_bytes);
 
@@ -960,12 +1028,16 @@ test "Revision 6 checkpoint long Conversation honors exact byte and chunk budget
         exact_limits,
     );
     defer decoded.deinit();
-    try std.testing.expectEqual(@as(usize, message_count), decoded.conversation.len());
-    try std.testing.expectEqual(@as(usize, message_count / 2), decoded.conversation.compact_boundary);
-    try std.testing.expectEqualStrings("long-summary", decoded.conversation.compact_summary.?);
+    try std.testing.expectEqual(@as(usize, message_count / 2 + 1), decoded.conversation.len());
+    try std.testing.expectEqual(@as(usize, 0), decoded.conversation.compact_boundary);
+    try std.testing.expect(decoded.conversation.compact_summary == null);
+    try std.testing.expectEqualStrings(
+        "long-summary",
+        decoded.conversation.messages.items[0].blocks[0].text,
+    );
     try std.testing.expectEqualStrings(
         "message-4095-payload-for-streaming-checkpoint-conformance",
-        decoded.conversation.messages.items[message_count - 1].blocks[0].text,
+        decoded.conversation.messages.items[decoded.conversation.len() - 1].blocks[0].text,
     );
 
     var oversized_source = TestSource{ .bytes = exact_sink.bytes.items, .step = 17 };

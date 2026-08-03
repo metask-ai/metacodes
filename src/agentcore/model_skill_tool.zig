@@ -16,6 +16,9 @@ const policy_frame = skill_runtime.policy_frame;
 const model_semantics = skill_runtime.model_tool;
 const event_projection = @import("event_projection.zig");
 const model_binding = @import("model_binding.zig");
+const mcp_session = @import("mcp_session.zig");
+const session_budget = @import("session_budget.zig");
+const child_permission = @import("child_permission.zig");
 
 pub const TOOL_NAME = model_semantics.TOOL_NAME;
 
@@ -40,6 +43,14 @@ pub const Options = struct {
     /// view). Skill remains the outer policy boundary and may only narrow it.
     base_surface: ?core.agent_session.RunToolSurface = null,
     base_policy: ?core.tools.ToolExecutionPolicy = null,
+    mcp_view: ?*const mcp_session.View = null,
+    initial_mcp_restrictions: []const mcp_session.SkillRestriction = &.{},
+    /// Borrowed from the synchronous AgentCore Run. Nested fork Skills share
+    /// the same atomic durable-state reservation controller.
+    budget_controller: ?*session_budget.Controller = null,
+    /// Same logical-Session authority, plus AgentCore-owned provenance hooks
+    /// used to derive a non-interactive fork scope.
+    permission_owner: child_permission.Owner,
 };
 
 /// A synchronous Run owns this value at a stable address. Definitions,
@@ -60,6 +71,10 @@ pub const Environment = struct {
     base_definitions: []const core.json.ToolDefinition,
     base_dispatcher: core.tools.ToolDispatcher,
     base_policy: ?core.tools.ToolExecutionPolicy,
+    mcp_view: ?*const mcp_session.View,
+    budget_controller: ?*session_budget.Controller,
+    permission_owner: child_permission.Owner,
+    mcp_restrictions: std.ArrayList(mcp_session.SkillRestriction) = .empty,
 
     definitions: []core.json.ToolDefinition,
     properties: []core.json.PropSpec,
@@ -137,6 +152,13 @@ pub const Environment = struct {
             },
         };
 
+        var mcp_restrictions: std.ArrayList(mcp_session.SkillRestriction) = .empty;
+        errdefer mcp_restrictions.deinit(options.allocator);
+        mcp_restrictions.appendSlice(
+            options.allocator,
+            options.initial_mcp_restrictions,
+        ) catch return error.OutOfMemory;
+
         return .{
             .allocator = options.allocator,
             .session = options.session,
@@ -152,6 +174,10 @@ pub const Environment = struct {
             .base_definitions = base_definitions,
             .base_dispatcher = base_dispatcher,
             .base_policy = options.base_policy,
+            .mcp_view = options.mcp_view,
+            .budget_controller = options.budget_controller,
+            .permission_owner = options.permission_owner,
+            .mcp_restrictions = mcp_restrictions,
             .definitions = definitions,
             .properties = properties,
             .invocation_names = owned_names,
@@ -172,6 +198,7 @@ pub const Environment = struct {
             };
         }
         self.inline_activations.deinit(self.allocator);
+        self.mcp_restrictions.deinit(self.allocator);
         self.allocator.free(self.definitions);
         self.allocator.free(self.properties);
         self.allocator.free(self.invocation_names);
@@ -256,6 +283,11 @@ pub const Environment = struct {
         const self: *const Environment = @ptrCast(@alignCast(raw));
         if (std.mem.eql(u8, name, TOOL_NAME))
             return self.current_frame.allowsSkillTool();
+        if (self.mcp_view) |view| if (view.findModelTool(name) != null) {
+            if (!view.allowsSkillRestrictions(name, self.mcp_restrictions.items))
+                return false;
+            return if (self.base_policy) |policy| policy.allowsTool(name) else true;
+        };
         if (!self.current_frame.executionPolicy().allowsTool(name)) return false;
         return if (self.base_policy) |policy| policy.allowsTool(name) else true;
     }
@@ -268,6 +300,14 @@ pub const Environment = struct {
         const self: *const Environment = @ptrCast(@alignCast(raw));
         if (std.mem.eql(u8, name, TOOL_NAME))
             return self.current_frame.allowsSkillInvocation(arguments_json);
+        if (self.mcp_view) |view| if (view.findModelTool(name) != null) {
+            if (!view.allowsSkillRestrictions(name, self.mcp_restrictions.items))
+                return false;
+            return if (self.base_policy) |policy|
+                policy.allowsInvocation(name, arguments_json)
+            else
+                true;
+        };
         if (!self.current_frame.executionPolicy().allowsInvocation(name, arguments_json))
             return false;
         return if (self.base_policy) |policy|
@@ -289,6 +329,11 @@ pub const Environment = struct {
         );
         const skill = self.snapshot.findByInvocation(parsed.name) orelse
             return error.SkillNotFound;
+        if (self.mcp_view != null and skill.definition.context == .inline_ctx)
+            self.mcp_restrictions.ensureUnusedCapacity(
+                self.allocator,
+                1,
+            ) catch return error.OutOfMemory;
 
         var plan = try activation_mod.prepareValues(
             self.allocator,
@@ -369,6 +414,10 @@ pub const Environment = struct {
             return err;
         };
         self.current_frame = owned_activation.frame;
+        if (self.mcp_view != null) self.mcp_restrictions.appendAssumeCapacity(.{
+            .allowed = skill.definition.allowed_tools,
+            .disallowed = skill.definition.disallowed_tools,
+        });
         return .{ .ok = output };
     }
 
@@ -396,7 +445,22 @@ pub const Environment = struct {
                 .dispatcher = self.base_dispatcher,
             },
             .base_policy = self.base_policy,
+            .mcp_view = self.mcp_view,
+            .initial_mcp_restrictions = self.mcp_restrictions.items,
+            .budget_controller = self.budget_controller,
+            .permission_owner = self.permission_owner,
         }) catch |err| {
+            activation.deinit() catch return error.CoreError;
+            return err;
+        };
+        if (self.mcp_view != null) child_environment.mcp_restrictions.append(
+            self.allocator,
+            .{
+                .allowed = plan.skill.definition.allowed_tools,
+                .disallowed = plan.skill.definition.disallowed_tools,
+            },
+        ) catch |err| {
+            child_environment.deinit() catch return error.CoreError;
             activation.deinit() catch return error.CoreError;
             return err;
         };
@@ -409,18 +473,38 @@ pub const Environment = struct {
         );
         defer projector.deinit();
         const child_backend = projector.backend();
+        var permission_lease = child_permission.Lease{};
+        permission_lease.init(self.permission_owner, &projector);
+        defer permission_lease.deinit();
         const host_run: ?core.agent_session.HostRunIdentity =
             if (self.session.host_identity_ctx) |host_ctx| .{
                 .identity = self.identity,
                 .host_session_ctx = host_ctx,
             } else null;
 
+        var budget_provider: ?session_budget.BudgetedProvider = if (self.budget_controller) |controller| .{
+            .allocator = self.allocator,
+            .controller = controller,
+            .base = self.session.provider.provider(),
+        } else null;
+        var budget_tools: ?session_budget.ToolEnvironment = if (self.budget_controller) |controller| .{
+            .controller = controller,
+            .base = child_environment.surface(),
+            .mcp_view = self.mcp_view,
+        } else null;
+        const child_surface = if (budget_tools) |*tools|
+            tools.surface()
+        else
+            child_environment.surface();
         const child = core.subagent.spawnAgentSink(
             self.allocator,
-            self.session.provider.provider(),
+            if (budget_provider) |*provider|
+                provider.provider()
+            else
+                self.session.provider.provider(),
             self.session.provider.anthropicClient(),
-            child_environment.definitions,
-            &self.session.permission_ctx,
+            child_surface.definitions,
+            permission_lease.permissionContext(),
             self.abort,
             activation.rendered_body,
             .{
@@ -428,7 +512,7 @@ pub const Environment = struct {
                 .system_prompt = "You are a subagent. Complete the task and return a concise final answer.\n",
                 .session = self.identity.session_id,
                 .agent_depth = child_depth,
-                .tool_dispatcher = child_environment.dispatcher(),
+                .tool_dispatcher = child_surface.dispatcher,
                 .execution_policy = child_environment.executionPolicy(),
                 .host_run = host_run,
                 // SubagentResult has no resumable suspend payload. Allowing a
@@ -580,6 +664,8 @@ test "Skill execution policy cannot re-authorize a denied MCP base tool" {
     var environment: Environment = undefined;
     environment.current_frame = root;
     environment.base_policy = Deny.policy();
+    environment.mcp_view = null;
+    environment.mcp_restrictions = .empty;
     try std.testing.expect(!environment.executionPolicy().allowsTool(model_name));
     try std.testing.expect(!environment.executionPolicy().allowsInvocation(
         model_name,
@@ -617,4 +703,60 @@ test "Skill execution policy cannot re-authorize a denied MCP base tool" {
         .parent = environment.executionPolicy(),
     };
     try std.testing.expect(!narrowed_child.executionPolicy().allowsTool(model_name));
+}
+
+test "Skill execution policy matches MCP metadata against canonical tool identity" {
+    const fixture = @import("mcp_test_support.zig");
+    const mcp_catalog = @import("mcp_catalog.zig");
+    var server = fixture.Server{};
+    const binding = [_]u8{0x65} ** 32;
+    const specs = [_]mcp_catalog.ServerSpec{.{
+        .binding = binding,
+        .namespace = "weather",
+        .connector = server.connector(),
+        .transport = .stdio,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    }};
+    var manager = try mcp_catalog.Manager.init(std.testing.allocator, &specs, .{});
+    defer manager.deinit();
+    _ = try manager.refresh();
+    const snapshot = try manager.retainCurrent();
+    defer snapshot.release();
+    var view = try mcp_session.View.init(std.testing.allocator, snapshot, &.{.{
+        .server_binding_identity = binding,
+        .tool_name = "weather",
+    }}, .fresh);
+    defer view.deinit();
+    const alias = view.entries[0].model_name;
+    const root = try policy_frame.PolicyFrame.createRoot(
+        std.testing.allocator,
+        &.{alias},
+        .sandboxed,
+        .default,
+        .{ .cwd = "/work", .project_root = "/work", .home = "/home/test" },
+    );
+    defer root.release();
+    var environment: Environment = undefined;
+    environment.current_frame = root;
+    environment.base_policy = null;
+    environment.mcp_view = &view;
+    environment.mcp_restrictions = .empty;
+    defer environment.mcp_restrictions.deinit(std.testing.allocator);
+    try environment.mcp_restrictions.append(std.testing.allocator, .{
+        .allowed = &.{"mcp__weather__weather"},
+        .disallowed = &.{},
+    });
+    try std.testing.expect(environment.executionPolicy().allowsInvocation(
+        alias,
+        "{\"city\":\"Paris\"}",
+    ));
+    environment.mcp_restrictions.clearRetainingCapacity();
+    try environment.mcp_restrictions.append(std.testing.allocator, .{
+        .allowed = &.{"mcp__weather"},
+        .disallowed = &.{"mcp__weather__weather"},
+    });
+    try std.testing.expect(!environment.executionPolicy().allowsInvocation(
+        alias,
+        "{\"city\":\"Paris\"}",
+    ));
 }

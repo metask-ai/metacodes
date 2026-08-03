@@ -2,12 +2,14 @@
 
 const std = @import("std");
 pub const session_checkpoint = @import("session_checkpoint.zig");
+pub const session_budget = @import("session_budget.zig");
 pub const session_authority = @import("session_authority.zig");
 pub const session_permission = @import("session_permission.zig");
 pub const mcp_protocol = @import("mcp_protocol.zig");
 pub const mcp_catalog = @import("mcp_catalog.zig");
 pub const mcp_session = @import("mcp_session.zig");
 pub const mcp_checkpoint = @import("mcp_checkpoint.zig");
+pub const mcp_canonical = @import("mcp_canonical.zig");
 const builtin = @import("builtin");
 const sync = @import("platform").sync;
 const wire = @import("metask_agentcore_types");
@@ -23,6 +25,7 @@ pub const skill_materialization = skill_runtime.materialization;
 pub const policy_frame = skill_runtime.policy_frame;
 pub const event_projection = @import("event_projection.zig");
 pub const model_skill_tool = @import("model_skill_tool.zig");
+pub const child_permission = @import("child_permission.zig");
 const model_binding = @import("model_binding.zig");
 const sandbox_admission = @import("sandbox_admission.zig");
 
@@ -214,6 +217,15 @@ const AbiSession = struct {
     /// Borrowed only while one synchronous Run is admitted. Permission uses
     /// it to resolve the model-facing alias back to canonical MCP identity.
     active_mcp_view: ?*const mcp_session.View = null,
+    /// The innermost synchronous fork projector supplies exact child
+    /// tool-call identity to Permission provenance. Nested forks restore the
+    /// outer projector when their own scope quiesces.
+    active_permission_trace: ?*event_projection.Projector = null,
+    /// Borrowed from the synchronous Run. Permission callbacks reserve a
+    /// durable Session-rule delta through the same controller used by the
+    /// Provider/Tool/MCP decorators before publishing allow_session or
+    /// deny_session memory.
+    active_budget_controller: ?*session_budget.Controller = null,
     /// Null only in narrow unit-test fakes. Every live Session created through
     /// the ABI owns exactly one immutable baseline frame.
     policy_root: ?*policy_frame.PolicyFrame = null,
@@ -228,6 +240,7 @@ const AbiSession = struct {
     invalidated_skill_authority: u32 = 0,
     invalidated_permission_rules: u32 = 0,
     invalidated_mcp_bindings: u32 = 0,
+    authority_issues: ?session_authority.IssueLedger = null,
     permission_state: session_permission.State = .{
         .allocator = allocator,
         .policy_generation = 1,
@@ -235,6 +248,9 @@ const AbiSession = struct {
     permission_audit: ?session_permission.AuditTrail = null,
     permission_request_sequence: u64 = 0,
     pending_permission: ?PendingPermission = null,
+    budget_state: session_budget.SessionState = .{
+        .profile = .{},
+    },
     last_terminal_kind: session_checkpoint.TerminalKind = .none,
     last_terminal_id: u64 = 0,
 
@@ -265,11 +281,21 @@ const AbiSession = struct {
     ) ?core.permission.PermissionResult {
         const self: *AbiSession = @ptrCast(@alignCast(raw));
         self.pending_permission = null;
+        const mcp_entry = if (self.active_mcp_view) |mcp_bound|
+            mcp_bound.findModelTool(tool_name)
+        else
+            null;
         if (self.active_mcp_view) |mcp_bound| {
-            if (mcp_bound.findModelTool(tool_name) != null and
+            if (mcp_entry != null and
                 !mcp_bound.validatesInvocation(tool_name, arguments_json))
                 return .deny;
         }
+        const explicit_name_owned = if (mcp_entry) |entry|
+            entry.permissionRuleName(allocator) catch return .deny
+        else
+            null;
+        defer if (explicit_name_owned) |name| allocator.free(name);
+        const explicit_name = explicit_name_owned orelse tool_name;
         const tool = self.permissionToolIdentity(tool_name) catch return .deny;
         const digest = session_permission.digestCanonicalArguments(
             allocator,
@@ -283,7 +309,7 @@ const AbiSession = struct {
             session_permission.evaluateExplicit(
                 self.core_session.permission_ctx.settings,
                 &match_context,
-                tool_name,
+                explicit_name,
                 arguments_json,
             )
         else switch (imported) {
@@ -381,6 +407,15 @@ const AbiSession = struct {
         tool_name: []const u8,
         arguments_json: []const u8,
     ) session_permission.Error![]u8 {
+        if (self.active_permission_trace) |trace|
+            return trace.copyToolCallId(
+                output_allocator,
+                tool_name,
+                arguments_json,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.InvalidIdentity => error.InvalidIdentity,
+            };
         self.core_session.conversation.lockSnapshot();
         defer self.core_session.conversation.unlockSnapshot();
         const messages = self.core_session.conversation.messages.items;
@@ -403,6 +438,30 @@ const AbiSession = struct {
         if (found.len == 0 or found.len > session_permission.MAX_TOOL_CALL_ID_BYTES)
             return error.InvalidIdentity;
         return output_allocator.dupe(u8, found) catch error.OutOfMemory;
+    }
+
+    fn permissionForkOwner(self: *AbiSession) child_permission.Owner {
+        return .{
+            .parent = &self.core_session.permission_ctx,
+            .ctx = self,
+            .swap_trace_fn = swapPermissionTrace,
+            .clear_pending_fn = clearPendingPermission,
+        };
+    }
+
+    fn swapPermissionTrace(
+        raw: *anyopaque,
+        replacement: ?*event_projection.Projector,
+    ) ?*event_projection.Projector {
+        const self: *AbiSession = @ptrCast(@alignCast(raw));
+        const previous = self.active_permission_trace;
+        self.active_permission_trace = replacement;
+        return previous;
+    }
+
+    fn clearPendingPermission(raw: *anyopaque) void {
+        const self: *AbiSession = @ptrCast(@alignCast(raw));
+        self.pending_permission = null;
     }
 
     fn recordPermissionDecision(
@@ -676,6 +735,7 @@ const AbiSession = struct {
                     );
                     return err;
                 };
+                var answered_audit_recorded = false;
                 switch (permission_response) {
                     .allow_session, .deny_session => {
                         const rule_candidate = candidate orelse {
@@ -687,11 +747,22 @@ const AbiSession = struct {
                             );
                             return error.HostUiFailed;
                         };
-                        _ = self.permission_state.remember(
+                        // Provenance is the first publication. If its owned
+                        // record cannot be prepared, no Session authority is
+                        // added. Once recorded, remembering the grant is the
+                        // final fallible authority step and failures remain an
+                        // honest answered-but-not-remembered outcome.
+                        try self.recordPermissionCallback(
+                            request,
+                            .answered,
+                            permission_response,
+                        );
+                        answered_audit_recorded = true;
+                        _ = self.rememberPermissionResponseBudgeted(
                             permission_response,
                             rule_candidate,
-                            self.policy_generation,
                         ) catch |err| {
+                            if (err == error.BudgetExhausted) return err;
                             self.recordCallbackStatus(if (err == error.OutOfMemory)
                                 wire.STATUS_OUT_OF_MEMORY
                             else if (err == error.ResourceLimit)
@@ -707,11 +778,12 @@ const AbiSession = struct {
                     .allow_once, .allow_session => .allow_once,
                     .deny_once, .deny_session => .deny_once,
                 } };
-                try self.recordPermissionCallback(
-                    request,
-                    .answered,
-                    permission_response,
-                );
+                if (!answered_audit_recorded)
+                    try self.recordPermissionCallback(
+                        request,
+                        .answered,
+                        permission_response,
+                    );
                 break :blk .answered;
             },
             else => {
@@ -724,6 +796,31 @@ const AbiSession = struct {
                 return error.HostUiFailed;
             },
         };
+    }
+
+    fn rememberPermissionResponseBudgeted(
+        self: *AbiSession,
+        response: session_permission.Response,
+        candidate: session_permission.RuleCandidate,
+    ) !session_permission.RememberResult {
+        var durable_reservation: ?session_budget.DurableReservation = null;
+        defer if (durable_reservation) |*reservation| reservation.release();
+        if (self.active_budget_controller) |controller| {
+            const durable_delta = try session_permission.checkpointRuleDeltaBytes(
+                candidate.tool,
+            );
+            durable_reservation = try controller.beginDurableDelta(durable_delta);
+        }
+        const remembered = try self.permission_state.remember(
+            response,
+            candidate,
+            self.policy_generation,
+        );
+        if (durable_reservation) |*reservation| switch (remembered) {
+            .added => reservation.commit(),
+            .already_present => reservation.release(),
+        };
+        return remembered;
     }
 
     fn requestOtherUi(
@@ -903,7 +1000,7 @@ const AbiSession = struct {
         kind: session_checkpoint.TerminalKind,
         operation_id: u64,
     ) void {
-        std.debug.assert(kind == .run or kind == .compact);
+        std.debug.assert(kind != .none);
         std.debug.assert(operation_id != 0);
         self.call_mutex.lock();
         defer self.call_mutex.unlock();
@@ -920,7 +1017,11 @@ const AbiSession = struct {
                 return .{ .kind = .run, .id = self.last_terminal_id },
             .compact => if (self.last_terminal_id == lease.last_compact_id)
                 return .{ .kind = .compact, .id = self.last_terminal_id },
-            .none, .budget_exhausted, .resource_limit => {},
+            .budget_exhausted, .resource_limit => if (self.last_terminal_id == lease.last_run_id) return .{
+                .kind = self.last_terminal_kind,
+                .id = self.last_terminal_id,
+            },
+            .none => {},
         }
         // Direct Core tests may have advanced a Session without traversing the
         // facade. Prefer the Run anchor because it preserves strict Run-ID
@@ -930,6 +1031,236 @@ const AbiSession = struct {
         if (lease.last_compact_id != 0)
             return .{ .kind = .compact, .id = lease.last_compact_id };
         return .{ .kind = .none, .id = 0 };
+    }
+
+    /// Measure the exact checkpoint that would be emitted for the current
+    /// committed Session. This is usable while the facade Run gate is held as
+    /// long as no Core Run is active; no sink, generation commit or hidden
+    /// compaction occurs.
+    fn measureDurableUsage(self: *AbiSession) !session_checkpoint.Usage {
+        var lease = try self.core_session.snapshotCommitted();
+        defer lease.deinit();
+        const binding_snapshot = if (self.skill_binding) |*binding|
+            binding.snapshot()
+        else
+            null;
+        const binding_selection = if (self.skill_binding) |*binding|
+            &binding.selection
+        else
+            null;
+        const skill_state = try session_authority.encodeSkillState(
+            allocator,
+            binding_snapshot,
+            binding_selection,
+        );
+        defer allocator.free(skill_state);
+        const permission_state = try session_authority.encodePermissionState(
+            allocator,
+            self.core_session.permission_ctx.modeValue(),
+            &self.permission_state,
+            self.policy_fingerprint,
+        );
+        defer allocator.free(permission_state);
+        const mcp_state = try mcp_checkpoint.encodeView(
+            allocator,
+            if (self.mcp_view) |*mcp_bound| mcp_bound else null,
+        );
+        defer allocator.free(mcp_state);
+        const terminal = self.terminalForCheckpoint(&lease);
+        return session_checkpoint.measureSnapshot(.{
+            .session_id = lease.session_id,
+            .checkpoint_generation = self.checkpoint_generation +| 1,
+            .last_run_id = lease.last_run_id,
+            .last_compact_id = lease.last_compact_id,
+            .terminal_kind = terminal.kind,
+            .terminal_id = terminal.id,
+            .model = lease.model,
+            .conversation = lease.conversation,
+            .policy_generation = self.policy_generation,
+            .catalog_generation = self.catalog_generation,
+            .authority = .{
+                .skill = skill_state,
+                .permission = permission_state,
+                .mcp = mcp_state,
+            },
+        }, self.budget_state.profile.checkpointLimits());
+    }
+
+    fn preflightRun(
+        self: *AbiSession,
+        prompts: []const []const u8,
+    ) !session_budget.Preflight {
+        const usage = try self.measureDurableUsage();
+        try self.budget_state.updateUsage(usage.total_bytes);
+        return session_budget.preflight(
+            self.budget_state.profile,
+            usage.total_bytes,
+            prompts,
+        ) catch |err| switch (err) {
+            error.BudgetRequired => {
+                self.budget_state.recordRequired(
+                    self.budget_state.profile.hard_bytes +| 1,
+                );
+                return error.CheckpointBudgetRequired;
+            },
+            else => return err,
+        };
+    }
+
+    fn preflightSkillRun(
+        self: *AbiSession,
+        arguments_json: []const u8,
+    ) !session_budget.Preflight {
+        const usage = try self.measureDurableUsage();
+        try self.budget_state.updateUsage(usage.total_bytes);
+        return session_budget.preflightProjected(
+            self.budget_state.profile,
+            usage.total_bytes,
+            arguments_json.len,
+            self.budget_state.profile.input_cap_bytes,
+        ) catch |err| switch (err) {
+            error.BudgetRequired => {
+                self.budget_state.recordRequired(
+                    self.budget_state.profile.hard_bytes +| 1,
+                );
+                return error.CheckpointBudgetRequired;
+            },
+            else => return err,
+        };
+    }
+
+    fn finishBudgetedRun(
+        self: *AbiSession,
+        run_id: u64,
+        controller: *session_budget.Controller,
+    ) !session_budget.Outcome {
+        const outcome = controller.outcome();
+        const required = controller.requiredBytes();
+        const terminal = switch (outcome) {
+            .budget_exhausted => session_checkpoint.TerminalKind.budget_exhausted,
+            .resource_limit => session_checkpoint.TerminalKind.resource_limit,
+            .none, .budget_required => session_checkpoint.TerminalKind.run,
+        };
+        if (outcome == .budget_exhausted or outcome == .resource_limit) {
+            const marker = if (outcome == .budget_exhausted)
+                session_budget.BUDGET_EXHAUSTED_MARKER
+            else
+                session_budget.RESOURCE_LIMIT_MARKER;
+            self.core_session.conversation.appendText(.assistant, marker) catch |err| {
+                // The admitted Run has already committed its safe prefix. If
+                // the bounded terminal cannot be published, retry semantics
+                // are ambiguous; fail closed instead of returning idle.
+                self.facade_poisoned.store(true, .release);
+                return err;
+            };
+        }
+        self.recordTerminal(terminal, run_id);
+        const usage = self.measureDurableUsage() catch |err| {
+            self.facade_poisoned.store(true, .release);
+            return err;
+        };
+        self.budget_state.recordRun(outcome, required, usage.total_bytes) catch |err| {
+            self.facade_poisoned.store(true, .release);
+            return err;
+        };
+        return outcome;
+    }
+
+    /// Explicit compact remains a separate idle activity. It borrows a
+    /// budgeted Provider so an oversized summary cannot be published and does
+    /// not hide compaction inside Run commit.
+    fn compactBudgeted(
+        self: *AbiSession,
+        operation_id: u64,
+    ) !core.compact_kernel.Report {
+        return self.compactBudgetedUsingProvider(
+            operation_id,
+            self.core_session.provider.provider(),
+        );
+    }
+
+    fn compactBudgetedUsingProvider(
+        self: *AbiSession,
+        operation_id: u64,
+        base_provider: core.api_provider.Provider,
+    ) !core.compact_kernel.Report {
+        const preflight = try self.preflightRun(&.{});
+        var controller = session_budget.Controller.init(
+            allocator,
+            self.budget_state.profile,
+            preflight,
+        );
+        var budget_provider = session_budget.BudgetedProvider{
+            .allocator = allocator,
+            .controller = &controller,
+            .base = base_provider,
+        };
+        const report = try self.core_session.compactUsingBorrowedProvider(
+            operation_id,
+            .{ .commit_guard = .{
+                .ctx = &controller,
+                .allowFn = compactBudgetAllowsCommit,
+            } },
+            budget_provider.provider(),
+        );
+        self.recordTerminal(.compact, operation_id);
+        const usage = self.measureDurableUsage() catch |err| {
+            self.facade_poisoned.store(true, .release);
+            return err;
+        };
+        self.budget_state.recordRun(
+            controller.outcome(),
+            controller.requiredBytes(),
+            usage.total_bytes,
+        ) catch |err| {
+            self.facade_poisoned.store(true, .release);
+            return err;
+        };
+        return report;
+    }
+
+    fn compactBudgetAllowsCommit(raw: *anyopaque) bool {
+        const controller: *session_budget.Controller = @ptrCast(@alignCast(raw));
+        return controller.outcome() == .none;
+    }
+
+    /// Admission for an idle mutation that replaces one canonical checkpoint
+    /// section (or the model string) without changing any other durable byte.
+    /// The caller publishes only after this returns and then commits the exact
+    /// projected usage with no fallible post-publication work.
+    fn admitDurableReplacement(
+        self: *AbiSession,
+        current_bytes: u64,
+        replacement_bytes: u64,
+    ) !u64 {
+        const usage = try self.measureDurableUsage();
+        if (current_bytes > usage.total_bytes) return error.InvalidSessionState;
+        const without_current = usage.total_bytes - current_bytes;
+        const projected = std.math.add(
+            u64,
+            without_current,
+            replacement_bytes,
+        ) catch return error.ResourceLimit;
+        _ = session_budget.preflightProjected(
+            self.budget_state.profile,
+            projected,
+            0,
+            0,
+        ) catch |err| switch (err) {
+            error.BudgetRequired => {
+                self.budget_state.recordRequired(projected);
+                return error.CheckpointBudgetRequired;
+            },
+            else => return err,
+        };
+        return projected;
+    }
+
+    fn commitDurableReplacement(self: *AbiSession, projected: u64) void {
+        std.debug.assert(projected <= self.budget_state.profile.hard_bytes);
+        self.budget_state.durable_usage_bytes = projected;
+        self.budget_state.last_outcome = .none;
+        self.budget_state.required_bytes = 0;
     }
 
     fn exportCheckpoint(
@@ -944,6 +1275,9 @@ const AbiSession = struct {
         defer runtime_call.deinit();
         if (!self.tryBeginCheckpoint()) return error.SessionBusy;
         defer self.finishCheckpoint();
+        const bounded_limits = try self.budget_state.profile.boundCheckpointLimits(
+            limits,
+        );
 
         var lease = try self.core_session.snapshotCommitted();
         defer lease.deinit();
@@ -995,8 +1329,9 @@ const AbiSession = struct {
                 .permission = permission_state,
                 .mcp = mcp_state,
             },
-        }, limits, sink);
+        }, bounded_limits, sink);
         self.commitCheckpointGeneration(next_generation);
+        self.budget_state.commitVerifiedUsage(report.total_bytes);
         return report;
     }
 
@@ -1011,11 +1346,43 @@ const AbiSession = struct {
         defer self.finishCheckpoint();
         var lease = try self.core_session.snapshotCommitted();
         defer lease.deinit();
-        const model = description_allocator.dupe(u8, lease.model) catch
+        var description_arena = std.heap.ArenaAllocator.init(description_allocator);
+        errdefer description_arena.deinit();
+        const a = description_arena.allocator();
+        const model = a.dupe(u8, lease.model) catch
             return error.OutOfMemory;
-        errdefer description_allocator.free(model);
+        const mcp_count = if (self.mcp_view) |*mcp_bound|
+            mcp_bound.entries.len
+        else
+            0;
+        const mcp_tools = a.alloc(
+            session_authority.McpToolDescription,
+            mcp_count,
+        ) catch return error.OutOfMemory;
+        if (self.mcp_view) |*mcp_bound| {
+            for (mcp_bound.entries, mcp_tools) |entry, *description| {
+                description.* = .{
+                    .model_name = a.dupe(u8, entry.model_name) catch
+                        return error.OutOfMemory,
+                    .namespace = a.dupe(u8, entry.server.namespace) catch
+                        return error.OutOfMemory,
+                    .canonical_name = a.dupe(
+                        u8,
+                        entry.tool.identity.name,
+                    ) catch return error.OutOfMemory,
+                    .server_binding_identity = entry.tool.identity.server_binding_identity,
+                    .schema_fingerprint = entry.tool.identity.schema_fingerprint,
+                    .permission_binding = entry.tool.identity.permissionBinding(),
+                    .era = entry.server.client.era,
+                };
+            }
+        }
+        const authority_issues = try session_authority.cloneIssues(
+            a,
+            if (self.authority_issues) |*issues| issues.items else &.{},
+        );
         return .{
-            .allocator = description_allocator,
+            .arena = description_arena,
             .session_id = lease.session_id,
             .origin = self.logical_origin,
             .lifecycle = .idle,
@@ -1032,6 +1399,13 @@ const AbiSession = struct {
                 binding.snapshot().revision
             else
                 null,
+            .mcp_selection_fingerprint = if (self.mcp_view) |*mcp_bound|
+                mcp_bound.selection_fingerprint
+            else
+                [_]u8{0} ** 32,
+            .mcp_tools = mcp_tools,
+            .budget = self.budget_state.describe(),
+            .authority_issues = authority_issues,
             .restore_health = self.restore_health,
             .invalidated_skill_authority = self.invalidated_skill_authority,
             .invalidated_permission_rules = self.invalidated_permission_rules,
@@ -1088,6 +1462,23 @@ const AbiSession = struct {
             );
             errdefer replacement_selection.deinit();
 
+            const current_state = try session_authority.encodeSkillState(
+                allocator,
+                if (self.skill_binding) |*binding| binding.snapshot() else null,
+                if (self.skill_binding) |*binding| &binding.selection else null,
+            );
+            defer allocator.free(current_state);
+            const replacement_state = try session_authority.encodeSkillState(
+                allocator,
+                replacement_cell.snapshot,
+                &replacement_selection,
+            );
+            defer allocator.free(replacement_state);
+            const projected = try self.admitDurableReplacement(
+                current_state.len,
+                replacement_state.len,
+            );
+
             const previous = self.skill_binding;
             self.skill_binding = .{
                 .cell = replacement_cell,
@@ -1097,6 +1488,7 @@ const AbiSession = struct {
                 var binding = binding_value;
                 binding.deinit(&runtime.catalogs);
             }
+            self.commitDurableReplacement(projected);
             return;
         }
 
@@ -1104,15 +1496,33 @@ const AbiSession = struct {
             binding.snapshot()
         else
             return error.SkillCatalogNotBound;
-        const replacement_selection = try skill_availability.Selection.init(
+        var replacement_selection = try skill_availability.Selection.init(
             allocator,
             snapshot,
             spec,
+        );
+        errdefer replacement_selection.deinit();
+        const current_state = try session_authority.encodeSkillState(
+            allocator,
+            snapshot,
+            &self.skill_binding.?.selection,
+        );
+        defer allocator.free(current_state);
+        const replacement_state = try session_authority.encodeSkillState(
+            allocator,
+            snapshot,
+            &replacement_selection,
+        );
+        defer allocator.free(replacement_state);
+        const projected = try self.admitDurableReplacement(
+            current_state.len,
+            replacement_state.len,
         );
         const previous_selection = self.skill_binding.?.selection;
         self.skill_binding.?.selection = replacement_selection;
         var previous = previous_selection;
         previous.deinit();
+        self.commitDurableReplacement(projected);
     }
 
     /// AgentCore Session mutation admitted through the common idle gate.
@@ -1121,7 +1531,16 @@ const AbiSession = struct {
             return error.InvalidSessionState;
         if (!self.tryBeginMutation()) return error.SessionBusy;
         defer self.finishMutation();
+        try self.setModelAdmitted(model);
+    }
+
+    fn setModelAdmitted(self: *AbiSession, model: []const u8) !void {
+        const projected = try self.admitDurableReplacement(
+            self.core_session.model.len,
+            model.len,
+        );
         try self.core_session.setModel(model);
+        self.commitDurableReplacement(projected);
     }
 
     /// Host rules are compiled by the canonical Core parser/matcher; the
@@ -1162,12 +1581,36 @@ const AbiSession = struct {
             },
             tool_names,
         );
+        const current_state = try session_authority.encodePermissionState(
+            allocator,
+            self.core_session.permission_ctx.modeValue(),
+            &self.permission_state,
+            self.policy_fingerprint,
+        );
+        defer allocator.free(current_state);
+        var replacement_permission = try session_permission.State.init(
+            allocator,
+            next_generation,
+        );
+        defer replacement_permission.deinit();
+        const replacement_state = try session_authority.encodePermissionState(
+            allocator,
+            self.core_session.permission_ctx.modeValue(),
+            &replacement_permission,
+            next_fingerprint,
+        );
+        defer allocator.free(replacement_state);
+        const projected = try self.admitDurableReplacement(
+            current_state.len,
+            replacement_state.len,
+        );
         try self.core_session.updatePermissionRules(input);
         self.permission_state.replaceGeneration(next_generation) catch
             unreachable;
         self.policy_generation = next_generation;
         self.policy_fingerprint = next_fingerprint;
         self.pending_permission = null;
+        self.commitDurableReplacement(projected);
     }
 
     /// Replace the Session's filtered MCP catalog only at the common idle
@@ -1215,6 +1658,56 @@ const AbiSession = struct {
         var next_root_live = true;
         defer if (next_root_live) next_root.release();
 
+        const resolver_context = RestorePermissionResolver{
+            .runtime = runtime_owner,
+            .allowed_tools = names[0..base_definitions.len],
+            .mcp_view = &replacement,
+        };
+        var prepared_permission = try self.permission_state.prepareInvalidation(
+            .mcp,
+            resolver_context.interface(),
+        );
+        defer prepared_permission.deinit();
+
+        const current_mcp_state = try mcp_checkpoint.encodeView(
+            allocator,
+            if (self.mcp_view) |*mcp_bound| mcp_bound else null,
+        );
+        defer allocator.free(current_mcp_state);
+        const replacement_mcp_state = try mcp_checkpoint.encodeView(
+            allocator,
+            &replacement,
+        );
+        defer allocator.free(replacement_mcp_state);
+        const current_permission_state = try session_authority.encodePermissionState(
+            allocator,
+            self.core_session.permission_ctx.modeValue(),
+            &self.permission_state,
+            self.policy_fingerprint,
+        );
+        defer allocator.free(current_permission_state);
+        const replacement_permission_state = try session_authority.encodePermissionState(
+            allocator,
+            self.core_session.permission_ctx.modeValue(),
+            &prepared_permission.state,
+            self.policy_fingerprint,
+        );
+        defer allocator.free(replacement_permission_state);
+        const current_bytes = std.math.add(
+            u64,
+            current_mcp_state.len,
+            current_permission_state.len,
+        ) catch return error.ResourceLimit;
+        const replacement_bytes = std.math.add(
+            u64,
+            replacement_mcp_state.len,
+            replacement_permission_state.len,
+        ) catch return error.ResourceLimit;
+        const projected = try self.admitDurableReplacement(
+            current_bytes,
+            replacement_bytes,
+        );
+
         var previous_view = self.mcp_view;
         const previous_root = self.policy_root;
         self.mcp_view = replacement;
@@ -1223,21 +1716,15 @@ const AbiSession = struct {
         next_root_live = false;
         self.catalog_generation = self.mcp_view.?.catalog_generation;
         self.pending_permission = null;
+        self.permission_state.commitPrepared(&prepared_permission.state);
 
-        const resolver_context = RestorePermissionResolver{
-            .runtime = runtime_owner,
-            .allowed_tools = names[0..base_definitions.len],
-            .mcp_view = &self.mcp_view.?,
-        };
-        const stale_grants = self.permission_state.invalidateUnresolvable(
-            .mcp,
-            resolver_context.interface(),
-        );
+        const stale_grants = prepared_permission.invalidated;
         self.invalidated_mcp_bindings +|= stale_grants +| self.mcp_view.?.invalidated;
         if (stale_grants != 0 or self.mcp_view.?.invalidated != 0)
             self.restore_health = .degraded;
         if (previous_root) |root| root.release();
         if (previous_view) |*old| old.deinit();
+        self.commitDurableReplacement(projected);
     }
 
     /// Internal typed-Skill entry. All validation before
@@ -1272,11 +1759,32 @@ const AbiSession = struct {
         if (!materializations.supportsExactFileModes())
             return error.SkillUnavailable;
 
-        return switch (try self.admitMaterializedSkill(
+        // External Skill input is checked before Core admission. The same
+        // controller then follows the materialized root and every nested
+        // Provider/Tool/MCP operation until quiescence.
+        const preflight = try self.preflightSkillRun(arguments_json);
+        var budget_controller = session_budget.Controller.init(
+            allocator,
+            self.budget_state.profile,
+            preflight,
+        );
+        var budget_provider = session_budget.BudgetedProvider{
+            .allocator = allocator,
+            .controller = &budget_controller,
+            .base = self.core_session.provider.provider(),
+        };
+        if (self.active_budget_controller != null)
+            return error.InvalidSessionState;
+        self.active_budget_controller = &budget_controller;
+        defer self.active_budget_controller = null;
+
+        const execution = switch (try self.admitMaterializedSkillBudgeted(
             materializations,
             run_id,
             &plan,
             root_frame,
+            &budget_controller,
+            &budget_provider,
         )) {
             .aborted => .aborted,
             .ready => |ready_value| blk: {
@@ -1287,6 +1795,8 @@ const AbiSession = struct {
                 };
             },
         };
+        _ = try self.finishBudgetedRun(run_id, &budget_controller);
+        return execution;
     }
 
     fn runTextWithBoundSkills(
@@ -1296,6 +1806,21 @@ const AbiSession = struct {
         prompt: []const u8,
         max_turns: u32,
     ) anyerror!SkillExecution {
+        const preflight = try self.preflightRun(&.{prompt});
+        var budget_controller = session_budget.Controller.init(
+            allocator,
+            self.budget_state.profile,
+            preflight,
+        );
+        var budget_provider = session_budget.BudgetedProvider{
+            .allocator = allocator,
+            .controller = &budget_controller,
+            .base = self.core_session.provider.provider(),
+        };
+        if (self.active_budget_controller != null)
+            return error.InvalidSessionState;
+        self.active_budget_controller = &budget_controller;
+        defer self.active_budget_controller = null;
         const binding: ?*SkillBinding = if (self.skill_binding) |*value| value else null;
         const has_model_skill = if (binding) |value|
             materializations.supportsExactFileModes() and
@@ -1306,14 +1831,6 @@ const AbiSession = struct {
         else
             false;
         const has_mcp = if (self.mcp_view) |*mcp_bound| mcp_bound.entries.len != 0 else false;
-        if (!has_model_skill and !has_mcp) {
-            return .{ .completed = try self.core_session.runText(
-                run_id,
-                prompt,
-                max_turns,
-                .{ .ctx = self, .emit = AbiSession.emit },
-            ) };
-        }
         const identity = core.agent_session.RunIdentity{
             .session_id = self.core_session.session_id,
             .run_id = run_id,
@@ -1353,6 +1870,9 @@ const AbiSession = struct {
                     environment.executionPolicy()
                 else
                     null,
+                .mcp_view = if (has_mcp) &self.mcp_view.? else null,
+                .budget_controller = &budget_controller,
+                .permission_owner = self.permissionForkOwner(),
             });
         } else null;
         var skill_environment_live = skill_environment != null;
@@ -1364,22 +1884,33 @@ const AbiSession = struct {
         );
         self.active_mcp_view = if (has_mcp) &self.mcp_view.? else null;
         defer self.active_mcp_view = null;
-        const result = (if (skill_environment) |*environment|
-            admitted.runUserMessagesWithToolSurface(
-                &.{prompt},
-                max_turns,
-                environment.executionPolicy(),
-                environment.surface(),
-            )
+        const inner_surface = if (skill_environment) |*environment|
+            environment.surface()
         else if (mcp_environment) |*environment|
-            admitted.runUserMessagesWithToolSurface(
-                &.{prompt},
-                max_turns,
-                environment.executionPolicy(),
-                environment.surface(),
-            )
+            environment.surface()
         else
-            unreachable) catch |run_error| {
+            core.agent_session.RunToolSurface{
+                .definitions = self.core_session.tools.definitions,
+                .dispatcher = self.core_session.tools.dispatcher(),
+            };
+        const execution_policy = if (skill_environment) |*environment|
+            environment.executionPolicy()
+        else if (mcp_environment) |*environment|
+            environment.executionPolicy()
+        else
+            null;
+        var budget_tools = session_budget.ToolEnvironment{
+            .controller = &budget_controller,
+            .base = inner_surface,
+            .mcp_view = if (has_mcp) &self.mcp_view.? else null,
+        };
+        const result = admitted.runUserMessagesWithToolSurfaceUsingProvider(
+            &.{prompt},
+            max_turns,
+            execution_policy,
+            budget_tools.surface(),
+            budget_provider.provider(),
+        ) catch |run_error| {
             const callback_failed = if (skill_environment) |*environment|
                 environment.callbackFailed()
             else
@@ -1402,6 +1933,7 @@ const AbiSession = struct {
         skill_environment_live = false;
         if (mcp_environment) |*environment| environment.deinit();
         mcp_environment_live = false;
+        _ = try self.finishBudgetedRun(run_id, &budget_controller);
         return .{ .completed = result };
     }
 
@@ -1414,6 +1946,44 @@ const AbiSession = struct {
         run_id: u64,
         plan: *const skill_activation.ActivationPlan,
         parent_frame: *policy_frame.PolicyFrame,
+    ) anyerror!SkillAdmission {
+        return self.admitMaterializedSkillImpl(
+            materializations,
+            run_id,
+            plan,
+            parent_frame,
+            null,
+            null,
+        );
+    }
+
+    fn admitMaterializedSkillBudgeted(
+        self: *AbiSession,
+        materializations: *skill_materialization.Manager,
+        run_id: u64,
+        plan: *const skill_activation.ActivationPlan,
+        parent_frame: *policy_frame.PolicyFrame,
+        budget_controller: *session_budget.Controller,
+        budget_provider: *session_budget.BudgetedProvider,
+    ) anyerror!SkillAdmission {
+        return self.admitMaterializedSkillImpl(
+            materializations,
+            run_id,
+            plan,
+            parent_frame,
+            budget_controller,
+            budget_provider,
+        );
+    }
+
+    fn admitMaterializedSkillImpl(
+        self: *AbiSession,
+        materializations: *skill_materialization.Manager,
+        run_id: u64,
+        plan: *const skill_activation.ActivationPlan,
+        parent_frame: *policy_frame.PolicyFrame,
+        budget_controller: ?*session_budget.Controller,
+        budget_provider: ?*session_budget.BudgetedProvider,
     ) anyerror!SkillAdmission {
         var admitted = try self.core_session.admitRun(
             run_id,
@@ -1449,6 +2019,8 @@ const AbiSession = struct {
             .materializations = materializations,
             .admitted = admitted,
             .activation = activation,
+            .budget_controller = budget_controller,
+            .budget_provider = budget_provider,
         } };
     }
 };
@@ -1468,6 +2040,8 @@ const MaterializedSkillRun = struct {
     materializations: *skill_materialization.Manager,
     admitted: core.agent_session.AdmittedRun,
     activation: skill_activation.Activation,
+    budget_controller: ?*session_budget.Controller,
+    budget_provider: ?*session_budget.BudgetedProvider,
 
     fn executeInline(
         self: *MaterializedSkillRun,
@@ -1499,18 +2073,43 @@ const MaterializedSkillRun = struct {
             return .aborted;
         }
 
+        const budget_controller = self.budget_controller orelse {
+            _ = try self.finishWithoutConversation();
+            return error.InvalidSessionState;
+        };
+        const budget_provider = self.budget_provider orelse {
+            _ = try self.finishWithoutConversation();
+            return error.InvalidSessionState;
+        };
+        budget_controller.reconcileRootPrompts(
+            self.facade.budget_state.profile.input_cap_bytes,
+            &.{ invocation_record, body_record },
+        ) catch {
+            _ = try self.finishWithoutConversation();
+            return .{ .completed = .{
+                .stop_reason = .api_error,
+                .turns = 0,
+                .tool_calls = 0,
+            } };
+        };
+
         const binding = if (self.facade.skill_binding) |*value| value else {
             _ = try self.finishWithoutConversation();
             return error.InvalidSessionState;
         };
         const has_mcp = if (self.facade.mcp_view) |*mcp_bound| mcp_bound.entries.len != 0 else false;
+        const root_mcp_restrictions = [_]mcp_session.SkillRestriction{.{
+            .allowed = plan.skill.definition.allowed_tools,
+            .disallowed = plan.skill.definition.disallowed_tools,
+        }};
         var mcp_environment: ?mcp_session.Environment = if (has_mcp)
-            mcp_session.Environment.init(
+            mcp_session.Environment.initRestricted(
                 allocator,
                 &self.facade.mcp_view.?,
                 self.admitted.session.tools.definitions,
                 self.admitted.session.tools.dispatcher(),
-                self.activation.frame.executionPolicy(),
+                null,
+                &root_mcp_restrictions,
             ) catch |environment_error| {
                 _ = try self.finishWithoutConversation();
                 return environment_error;
@@ -1546,6 +2145,9 @@ const MaterializedSkillRun = struct {
                         mcp_env.executionPolicy()
                     else
                         null,
+                    .mcp_view = if (has_mcp) &self.facade.mcp_view.? else null,
+                    .budget_controller = budget_controller,
+                    .permission_owner = self.facade.permissionForkOwner(),
                 }) catch |environment_error| {
                     _ = try self.finishWithoutConversation();
                     return environment_error;
@@ -1556,26 +2158,33 @@ const MaterializedSkillRun = struct {
         defer if (environment_live) environment.?.deinit() catch {};
         self.facade.active_mcp_view = if (has_mcp) &self.facade.mcp_view.? else null;
         defer self.facade.active_mcp_view = null;
-        const result = (if (environment) |*env|
-            self.admitted.runUserMessagesWithToolSurface(
-                &.{ invocation_record, body_record },
-                max_turns,
-                env.executionPolicy(),
-                env.surface(),
-            )
+        const inner_surface = if (environment) |*env|
+            env.surface()
         else if (mcp_environment) |*mcp_env|
-            self.admitted.runUserMessagesWithToolSurface(
-                &.{ invocation_record, body_record },
-                max_turns,
-                mcp_env.executionPolicy(),
-                mcp_env.surface(),
-            )
+            mcp_env.surface()
         else
-            self.admitted.runUserMessagesWithPolicy(
-                &.{ invocation_record, body_record },
-                max_turns,
-                self.activation.frame.executionPolicy(),
-            )) catch |run_error| {
+            core.agent_session.RunToolSurface{
+                .definitions = self.admitted.session.tools.definitions,
+                .dispatcher = self.admitted.session.tools.dispatcher(),
+            };
+        const execution_policy = if (environment) |*env|
+            env.executionPolicy()
+        else if (mcp_environment) |*mcp_env|
+            mcp_env.executionPolicy()
+        else
+            self.activation.frame.executionPolicy();
+        var budget_tools = session_budget.ToolEnvironment{
+            .controller = budget_controller,
+            .base = inner_surface,
+            .mcp_view = if (has_mcp) &self.facade.mcp_view.? else null,
+        };
+        const result = self.admitted.runUserMessagesWithToolSurfaceUsingProvider(
+            &.{ invocation_record, body_record },
+            max_turns,
+            execution_policy,
+            budget_tools.surface(),
+            budget_provider.provider(),
+        ) catch |run_error| {
             const callback_failed = if (environment) |*env|
                 env.callbackFailed()
             else
@@ -1627,6 +2236,26 @@ const MaterializedSkillRun = struct {
             return .aborted;
         }
 
+        const budget_controller = self.budget_controller orelse {
+            _ = try self.finishWithoutConversation();
+            return error.InvalidSessionState;
+        };
+        const budget_provider = self.budget_provider orelse {
+            _ = try self.finishWithoutConversation();
+            return error.InvalidSessionState;
+        };
+        budget_controller.reconcileRootPrompts(
+            self.facade.budget_state.profile.input_cap_bytes,
+            &.{invocation_record},
+        ) catch {
+            _ = try self.finishWithoutConversation();
+            return .{ .completed = .{
+                .stop_reason = .api_error,
+                .turns = 0,
+                .tool_calls = 0,
+            } };
+        };
+
         var executor_context = ForkExecutorContext{
             .facade = self.facade,
             .session = self.admitted.session,
@@ -1634,6 +2263,8 @@ const MaterializedSkillRun = struct {
             .activation = &self.activation,
             .plan = plan,
             .max_turns = max_turns,
+            .budget_controller = budget_controller,
+            .budget_provider = budget_provider,
         };
         const result = self.admitted.runIsolated(
             &.{invocation_record},
@@ -1676,6 +2307,8 @@ const ForkExecutorContext = struct {
     activation: *skill_activation.Activation,
     plan: *const skill_activation.ActivationPlan,
     max_turns: u32,
+    budget_controller: *session_budget.Controller,
+    budget_provider: *session_budget.BudgetedProvider,
 
     fn execute(
         raw: *anyopaque,
@@ -1697,6 +2330,9 @@ const ForkExecutorContext = struct {
         );
         defer projector.deinit();
         const child_backend = projector.backend();
+        var permission_lease = child_permission.Lease{};
+        permission_lease.init(self.facade.permissionForkOwner(), &projector);
+        defer permission_lease.deinit();
         const host_run: ?core.agent_session.HostRunIdentity =
             if (self.session.host_identity_ctx) |host_ctx| .{
                 .identity = identity,
@@ -1705,13 +2341,18 @@ const ForkExecutorContext = struct {
         const child_depth = try childDepth(self.activation.parent_agent_depth);
         const binding = if (self.facade.skill_binding) |*value| value else return error.InvalidSessionState;
         const has_mcp = if (self.facade.mcp_view) |*mcp_bound| mcp_bound.entries.len != 0 else false;
+        const root_mcp_restrictions = [_]mcp_session.SkillRestriction{.{
+            .allowed = self.plan.skill.definition.allowed_tools,
+            .disallowed = self.plan.skill.definition.disallowed_tools,
+        }};
         var mcp_environment: ?mcp_session.Environment = if (has_mcp)
-            try mcp_session.Environment.init(
+            try mcp_session.Environment.initRestricted(
                 output_allocator,
                 &self.facade.mcp_view.?,
                 self.session.tools.definitions,
                 self.session.tools.dispatcher(),
-                self.activation.frame.executionPolicy(),
+                null,
+                &root_mcp_restrictions,
             )
         else
             null;
@@ -1745,23 +2386,29 @@ const ForkExecutorContext = struct {
                         mcp_env.executionPolicy()
                     else
                         null,
+                    .mcp_view = if (has_mcp) &self.facade.mcp_view.? else null,
+                    .budget_controller = self.budget_controller,
+                    .permission_owner = self.facade.permissionForkOwner(),
                 })
             else
                 null;
         var environment_live = environment != null;
         defer if (environment_live) environment.?.deinit() catch {};
-        const definitions = if (environment) |*env|
-            env.definitions
+        const inner_surface = if (environment) |*env|
+            env.surface()
         else if (mcp_environment) |*mcp_env|
-            mcp_env.definitions
+            mcp_env.surface()
         else
-            self.session.tools.definitions;
-        const dispatcher = if (environment) |*env|
-            env.surface().dispatcher
-        else if (mcp_environment) |*mcp_env|
-            mcp_env.surface().dispatcher
-        else
-            self.session.tools.dispatcher();
+            core.agent_session.RunToolSurface{
+                .definitions = self.session.tools.definitions,
+                .dispatcher = self.session.tools.dispatcher(),
+            };
+        var budget_tools = session_budget.ToolEnvironment{
+            .controller = self.budget_controller,
+            .base = inner_surface,
+            .mcp_view = if (has_mcp) &self.facade.mcp_view.? else null,
+        };
+        const child_surface = budget_tools.surface();
         const execution_policy = if (environment) |*env|
             env.executionPolicy()
         else if (mcp_environment) |*mcp_env|
@@ -1773,10 +2420,10 @@ const ForkExecutorContext = struct {
         defer self.facade.active_mcp_view = null;
         const child = core.subagent.spawnAgentSink(
             output_allocator,
-            self.session.provider.provider(),
+            self.budget_provider.provider(),
             self.session.provider.anthropicClient(),
-            definitions,
-            &self.session.permission_ctx,
+            child_surface.definitions,
+            permission_lease.permissionContext(),
             abort,
             self.activation.rendered_body,
             .{
@@ -1784,7 +2431,7 @@ const ForkExecutorContext = struct {
                 .system_prompt = "You are a subagent. Complete the task and return a concise final answer.\n",
                 .session = identity.session_id,
                 .agent_depth = child_depth,
-                .tool_dispatcher = dispatcher,
+                .tool_dispatcher = child_surface.dispatcher,
                 .execution_policy = execution_policy,
                 .host_run = host_run,
                 // SubagentResult has no resumable suspend payload. Allowing a
@@ -2039,7 +2686,7 @@ fn catalogQueryStatus(err: anyerror) u32 {
 fn sessionMutationStatus(err: anyerror) u32 {
     return switch (err) {
         error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
-        error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
+        error.ResourceLimit, error.CheckpointBudgetRequired => wire.STATUS_RESOURCE_LIMIT,
         error.SessionBusy, error.RuntimeBusy => wire.STATUS_BUSY,
         error.InvalidSessionState, error.SkillCatalogNotBound, error.RuntimeUnavailable => wire.STATUS_INVALID_STATE,
         error.InvalidModel,
@@ -2063,6 +2710,7 @@ fn compactStatus(err: anyerror) u32 {
         error.SessionBusy => wire.STATUS_BUSY,
         error.InvalidSessionState => wire.STATUS_INVALID_STATE,
         error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
+        error.CheckpointBudgetRequired, error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
         error.ConcurrentMutation => wire.STATUS_CORE_ERROR,
         else => wire.STATUS_INTERNAL_ERROR,
     };
@@ -2105,6 +2753,10 @@ fn runErrorStatus(self: *const AbiSession, err: anyerror) u32 {
         error.StaleRun => wire.STATUS_STALE_RUN,
         error.InvalidSessionState => wire.STATUS_INVALID_STATE,
         error.CallbackFailed => self.callbackFailureStatus(),
+        // Exact Revision 6 wire token is frozen with the final DTO pass. The
+        // internal semantic is already distinct and, critically, occurs
+        // before Core admission.
+        error.CheckpointBudgetRequired => wire.STATUS_RESOURCE_LIMIT,
         else => wire.STATUS_CORE_ERROR,
     };
 }
@@ -2551,6 +3203,8 @@ const SessionBuildConfig = struct {
     /// when the current Runtime has a catalog.
     mcp_view_transfer: ?*?mcp_session.View = null,
     mcp_invalidated_without_view: u32 = 0,
+    authority_issue_seeds: []const session_authority.AuthorityIssueSeed = &.{},
+    budget_profile: session_budget.Profile = .{},
 };
 
 const RestoreHostConfig = struct {
@@ -2563,6 +3217,7 @@ const RestoreHostConfig = struct {
     workspace: core.agent_session.WorkspaceConfig,
     allowed_tools: []const []const u8,
     workspace_scope_id: [64]u8,
+    budget_profile: session_budget.Profile = .{},
 };
 
 const InternalRestoreResult = struct {
@@ -2616,6 +3271,11 @@ fn buildAbiSession(
     runtime: *AbiRuntime,
     config: SessionBuildConfig,
 ) !*AbiSession {
+    var budget_state = try session_budget.SessionState.init(
+        config.budget_profile,
+    );
+    if (config.restored) |decoded|
+        try budget_state.updateUsage(decoded.descriptor.total_bytes);
     var initial_mcp_view = if (config.mcp_view_transfer) |source| blk: {
         const transferred = source.*;
         source.* = null;
@@ -2664,6 +3324,12 @@ fn buildAbiSession(
     var permission_audit = try session_permission.AuditTrail.init(allocator);
     var keep_permission_audit = false;
     defer if (!keep_permission_audit) permission_audit.deinit();
+    var authority_issues = try session_authority.IssueLedger.init(
+        allocator,
+        config.authority_issue_seeds,
+    );
+    var keep_authority_issues = false;
+    defer if (!keep_authority_issues) authority_issues.deinit();
     const self = try allocator.create(AbiSession);
     errdefer allocator.destroy(self);
     self.* = .{
@@ -2702,8 +3368,10 @@ fn buildAbiSession(
         else
             0,
         .invalidated_mcp_bindings = mcp_invalidated,
+        .authority_issues = authority_issues,
         .permission_state = permission_state,
         .permission_audit = permission_audit,
+        .budget_state = budget_state,
         .last_terminal_kind = if (config.restored) |decoded|
             decoded.descriptor.terminal_kind
         else
@@ -2715,10 +3383,12 @@ fn buildAbiSession(
     };
     keep_permission_state = true;
     keep_permission_audit = true;
+    keep_authority_issues = true;
     keep_mcp_view = true;
     errdefer {
         if (self.mcp_view) |*mcp_bound| mcp_bound.deinit();
         if (self.permission_audit) |*audit| audit.deinit();
+        if (self.authority_issues) |*issues| issues.deinit();
         self.permission_state.deinit();
     }
 
@@ -2766,6 +3436,17 @@ fn buildAbiSession(
             .home = config.workspace.home,
         },
     );
+    errdefer if (self.policy_root) |root| root.release();
+    const initial_usage = try self.measureDurableUsage();
+    try self.budget_state.updateUsage(initial_usage.total_bytes);
+    _ = session_budget.preflight(
+        self.budget_state.profile,
+        initial_usage.total_bytes,
+        &.{},
+    ) catch |err| switch (err) {
+        error.BudgetRequired => return error.InvalidBudget,
+        else => return err,
+    };
     return self;
 }
 
@@ -2884,6 +3565,88 @@ fn restoreCheckpoint(
     }
 
     const skill_summary = reconciliation.summary();
+    var authority_issue_seeds: std.ArrayList(
+        session_authority.AuthorityIssueSeed,
+    ) = .empty;
+    defer authority_issue_seeds.deinit(allocator);
+    if (restored_skill) |*skill_state| {
+        for (skill_state.entries) |entry| {
+            if (entry.state != .enabled) continue;
+            var still_enabled = false;
+            if (binding) |*current| {
+                for (current.snapshot().skills, 0..) |record, index| {
+                    if (std.mem.eql(u8, &record.skill_id, &entry.skill_id)) {
+                        still_enabled = current.selection.states[index] == .enabled;
+                        break;
+                    }
+                }
+            }
+            if (still_enabled) continue;
+            try authority_issue_seeds.append(allocator, .{
+                .subsystem = .skill,
+                .reason = switch (skill_summary.disposition) {
+                    .changed => .identity_changed,
+                    .narrowed => .authority_narrowed,
+                    .unavailable, .not_bound, .restored => .unavailable,
+                },
+                .skill_id = entry.skill_id,
+            });
+        }
+    }
+    for (restored_permission.rules) |rule| {
+        const resolvable = if (!permission_reconciliation.fingerprint_compatible)
+            false
+        else if (rule.tool.namespace == .builtin)
+            session_permission.isKnownBuiltin(rule.tool.name) and
+                containsName(config.allowed_tools, rule.tool.name)
+        else
+            resolver.interface().isResolvable(rule.tool);
+        if (resolvable) continue;
+        try authority_issue_seeds.append(allocator, .{
+            .subsystem = .permission,
+            .reason = if (permission_reconciliation.fingerprint_compatible)
+                .unavailable
+            else
+                .policy_changed,
+            .permission_rule_id = rule.rule_id,
+            .authority_binding = rule.tool.binding,
+            .canonical_name = rule.tool.name,
+        });
+    }
+    if (restored_mcp_state) |*mcp_state| {
+        for (mcp_state.entries) |entry| {
+            const restored_entry = if (restored_mcp_view) |*mcp_bound|
+                mcp_bound.findCanonicalTool(
+                    &entry.server_binding_identity,
+                    entry.tool_name,
+                )
+            else
+                null;
+            if (restored_entry != null) continue;
+            const current_tool = if (restored_mcp_view) |*mcp_bound|
+                mcp_bound.snapshot.findTool(
+                    &entry.server_binding_identity,
+                    entry.tool_name,
+                )
+            else
+                null;
+            const identity = mcp_canonical.ToolIdentity{
+                .server_binding_identity = entry.server_binding_identity,
+                .name = entry.tool_name,
+                .schema_fingerprint = entry.schema_fingerprint,
+            };
+            try authority_issue_seeds.append(allocator, .{
+                .subsystem = .mcp,
+                .reason = if (current_tool != null)
+                    .schema_changed
+                else
+                    .unavailable,
+                .server_binding_identity = entry.server_binding_identity,
+                .authority_binding = identity.permissionBinding(),
+                .canonical_name = entry.tool_name,
+            });
+        }
+    }
     const self = try buildAbiSession(runtime, .{
         .callbacks = config.callbacks,
         .provider_kind = config.provider_kind,
@@ -2901,6 +3664,8 @@ fn restoreCheckpoint(
         .permission_reconciliation = &permission_reconciliation,
         .mcp_view_transfer = &restored_mcp_view,
         .mcp_invalidated_without_view = mcp_invalidated_without_view,
+        .authority_issue_seeds = authority_issue_seeds.items,
+        .budget_profile = config.budget_profile,
     });
     keep_binding = true;
     return .{
@@ -2916,6 +3681,7 @@ fn restoreCheckpoint(
             .permission_rules_invalidated = permission_reconciliation.invalidated,
             .mcp_bindings_restored = restored_mcp_count,
             .mcp_bindings_invalidated = self.invalidated_mcp_bindings,
+            .issues = if (self.authority_issues) |*issues| issues.items else &.{},
         },
     };
 }
@@ -3067,6 +3833,7 @@ fn sessionDestroy(handle: ?*wire.SessionHandle, out_error: ?*wire.OwnedBytesV1) 
         self.mcp_view = null;
     }
     if (self.permission_audit) |*audit| audit.deinit();
+    if (self.authority_issues) |*issues| issues.deinit();
     self.permission_state.deinit();
     allocator.destroy(self);
     return wire.STATUS_OK;
@@ -3091,7 +3858,7 @@ fn sessionSetModel(
         return fail(wire.STATUS_RESOURCE_LIMIT, "model exceeds AgentCore ABI v1 limit", out_error);
     const model = text(model_view) catch |err|
         return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
-    self.core_session.setModel(model) catch |err|
+    self.setModelAdmitted(model) catch |err|
         return failError(sessionMutationStatus(err), err, out_error);
     return wire.STATUS_OK;
 }
@@ -3251,7 +4018,10 @@ fn sessionRunInput(
         },
         else => return fail(wire.STATUS_INVALID_ARGUMENT, "unknown RunInputV1 kind", out_error),
     };
-    self.recordTerminal(.run, run_id);
+    // Budget-aware paths already recorded their stronger terminal kind. Keep
+    // this fallback for any pre-budget internal fixture path.
+    if (self.last_terminal_id != run_id)
+        self.recordTerminal(.run, run_id);
     const result = switch (execution) {
         .aborted => {
             out.* = .{
@@ -3321,9 +4091,8 @@ fn sessionCompact(
         return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
     const out = out_result orelse
         return fail(wire.STATUS_INVALID_ARGUMENT, "out_result is required", out_error);
-    const report = self.core_session.compact(operation_id, .{}) catch |err|
+    const report = self.compactBudgeted(operation_id) catch |err|
         return failError(compactStatus(err), err, out_error);
-    self.recordTerminal(.compact, operation_id);
     out.* = .{
         .struct_size = @sizeOf(wire.CompactResultV1),
         .outcome_code = switch (report.outcome) {
@@ -3457,6 +4226,139 @@ const TestEventSink = struct {
     fn sink(ctx: *u8) core.agent_session.EventSink {
         return .{ .ctx = ctx, .emit = emit };
     }
+};
+
+const CompactBudgetTestProvider = struct {
+    allocator: std.mem.Allocator,
+    payload_bytes: usize,
+    calls: u32 = 0,
+    stream: Stream = undefined,
+
+    fn provider(self: *@This()) core.api_provider.Provider {
+        return .{
+            .ctx = self,
+            .modelFn = model,
+            .sendStreamFn = sendStream,
+            .sendStreamRetryFn = sendStreamRetry,
+            .sendFn = send,
+            .maxTokensFn = maxTokens,
+            .maxInputTokensFn = maxInputTokens,
+            .reasoningEffortFn = reasoningEffort,
+            .supportsFn = supports,
+        };
+    }
+
+    fn model(_: *anyopaque) []const u8 {
+        return "compact-budget-test";
+    }
+
+    fn sendStream(
+        raw: *anyopaque,
+        _: []const core.types.ApiMessage,
+        _: ?[]const u8,
+        _: ?[]const core.json.ToolDefinition,
+        _: ?*const core.util_abort.AbortSignal,
+        _: ?[]const u8,
+        _: ?core.json.ToolChoice,
+        _: []const u8,
+    ) anyerror!core.api_provider.StreamHandle {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+        self.stream = .{
+            .allocator = self.allocator,
+            .payload_bytes = self.payload_bytes,
+            .request_id = core.util_log.genRequestId(),
+        };
+        return self.stream.handle();
+    }
+
+    fn sendStreamRetry(
+        raw: *anyopaque,
+        messages: []const core.types.ApiMessage,
+        system: ?[]const u8,
+        tools: ?[]const core.json.ToolDefinition,
+        abort: ?*const core.util_abort.AbortSignal,
+        model_override: ?[]const u8,
+        tool_choice: ?core.json.ToolChoice,
+        _: u32,
+        _: u64,
+        _: ?core.api_provider.RetryReporter,
+        user_query: []const u8,
+    ) anyerror!core.api_provider.StreamHandle {
+        return sendStream(
+            raw,
+            messages,
+            system,
+            tools,
+            abort,
+            model_override,
+            tool_choice,
+            user_query,
+        );
+    }
+
+    fn send(
+        _: *anyopaque,
+        _: []const core.types.ApiMessage,
+        _: ?[]const u8,
+        _: ?[]const core.json.ToolDefinition,
+        _: ?[]const u8,
+    ) anyerror!core.api_provider.ApiResponse {
+        return error.Unused;
+    }
+
+    fn maxTokens(_: *anyopaque) u32 {
+        return 1024;
+    }
+
+    fn maxInputTokens(_: *anyopaque) u32 {
+        return 200_000;
+    }
+
+    fn reasoningEffort(_: *anyopaque) ?core.types.ReasoningEffort {
+        return null;
+    }
+
+    fn supports(_: *anyopaque, _: core.api_provider.Capability) bool {
+        return false;
+    }
+
+    const Stream = struct {
+        allocator: std.mem.Allocator,
+        payload_bytes: usize,
+        request_id: core.util_log.RequestId,
+        emitted: bool = false,
+
+        fn handle(self: *@This()) core.api_provider.StreamHandle {
+            return .{
+                .ctx = self,
+                .nextFn = next,
+                .deinitFn = deinit,
+                .stopReasonFn = Stream.stopReason,
+                .requestIdFn = requestId,
+            };
+        }
+
+        fn next(raw: *anyopaque) anyerror!?core.api_stream.StreamEvent {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.emitted) return null;
+            self.emitted = true;
+            const bytes = try self.allocator.alloc(u8, self.payload_bytes);
+            @memset(bytes, 's');
+            return .{ .text = bytes };
+        }
+
+        fn deinit(_: *anyopaque) void {}
+
+        fn stopReason(_: *anyopaque) core.api_stream.StopReason {
+            return .end_turn;
+        }
+
+        fn requestId(raw: *anyopaque) core.util_log.RequestId {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.request_id;
+        }
+    };
 };
 
 test "ABI discovery is versioned" {
@@ -3868,7 +4770,6 @@ test "Revision 6 AgentCore Permission callback binds grants and preserves typed 
         .allowed_tools = &.{ "Bash", "Write", "Edit" },
     });
     defer native_session.destroy() catch unreachable;
-
     const request = ui_request.UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
     var response: ui_request.UiResponse = undefined;
     var fake = AbiSession{
@@ -3915,6 +4816,118 @@ test "Revision 6 AgentCore Permission callback binds grants and preserves typed 
         Probe.last_request[0..Probe.last_request_len],
         "\"tool_call_id\":\"call-allow\"",
     ) != null);
+
+    // Fork children inherit the exact Session grant but not the parent's Host
+    // UI capability. An unresolved Core safety prompt is denied locally and
+    // cannot leave a pending request behind or invoke the callback.
+    const ChildSink = struct {
+        fn emit(
+            _: *anyopaque,
+            _: core.session_id.SessionId,
+            _: core.protocol.ui_event.CoreEvent,
+        ) void {}
+        fn poll(
+            _: *anyopaque,
+            _: core.session_id.SessionId,
+        ) ?core.protocol.ui_event.UiEvent {
+            return null;
+        }
+    };
+    var child_sink_marker: u8 = 0;
+    const child_downstream = core.protocol.ui_backend.UiBackend{
+        .ctx = &child_sink_marker,
+        .emit = ChildSink.emit,
+        .poll = ChildSink.poll,
+    };
+    var child_projector = event_projection.Projector.init(
+        std.testing.allocator,
+        .model_tool,
+        &child_downstream,
+    );
+    defer child_projector.deinit();
+    {
+        const saved_override = native_session.permission_ctx.decision_override;
+        native_session.permission_ctx.decision_override = .{
+            .ctx = &fake,
+            .decideFn = AbiSession.permissionDecisionOverride,
+        };
+        defer native_session.permission_ctx.decision_override = saved_override;
+        var child_lease = child_permission.Lease{};
+        child_lease.init(fake.permissionForkOwner(), &child_projector);
+        defer child_lease.deinit();
+        const child_ctx = child_lease.permissionContext();
+        const child_backend = child_projector.backend();
+        child_backend.emitEvent(native_session.session_id, .{ .tool_start = .{
+            .id = "child-call-allow",
+            .name = "Bash",
+            .input = "{}",
+        } });
+        const child_call_id = try fake.copyPermissionToolCallId(
+            std.testing.allocator,
+            "Bash",
+            "{}",
+        );
+        defer std.testing.allocator.free(child_call_id);
+        try std.testing.expectEqualStrings("child-call-allow", child_call_id);
+        try std.testing.expectEqual(
+            core.permission.PermissionResult.allow,
+            core.permission.checkPermission(child_ctx, "Bash", "{}"),
+        );
+        try std.testing.expectEqual(
+            core.permission.PermissionResult.deny,
+            child_ctx.decision_override.?.decide(
+                "Bash",
+                "{}",
+                .ask,
+            ).?,
+        );
+        try std.testing.expectEqual(
+            core.permission.PermissionResult.ask,
+            core.permission.checkPermission(child_ctx, "Edit", "{}"),
+        );
+        const calls_before_child_prompt = Probe.calls;
+        try std.testing.expect(!try core.permission.promptUser(
+            child_ctx,
+            "Edit",
+            "{}",
+        ));
+        try std.testing.expectEqual(calls_before_child_prompt, Probe.calls);
+        try std.testing.expect(fake.pending_permission == null);
+        try std.testing.expect(fake.active_permission_trace == &child_projector);
+    }
+    try std.testing.expect(fake.active_permission_trace == null);
+    try std.testing.expect(fake.pending_permission == null);
+
+    // Session memory belongs only to the logical Session that received the
+    // answer. A fresh Session over the same Runtime and Workspace must ask
+    // again; no process-wide or product-settings authority is inherited.
+    const fresh_native_session = try native_runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{
+            .root = root_buffer[0..root_len],
+            .shell = .unrestricted,
+        },
+        .allowed_tools = &.{ "Bash", "Write", "Edit" },
+    });
+    defer fresh_native_session.destroy() catch unreachable;
+    var fresh = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = fresh_native_session,
+    };
+    defer fresh.permission_state.deinit();
+    try std.testing.expectEqual(@as(usize, 0), fresh.permission_state.ruleCount());
+    try std.testing.expect(
+        AbiSession.permissionDecisionOverride(
+            &fresh,
+            "Bash",
+            "{}",
+            .undecided,
+        ) == null,
+    );
 
     // The next invocation is decided before the callback. Product-level
     // name-only SessionRules and the settings writer never participate.
@@ -4023,6 +5036,41 @@ test "Revision 6 AgentCore Permission callback binds grants and preserves typed 
         std.testing.allocator,
     );
     defer if (fake.permission_audit) |*audit| audit.deinit();
+
+    // Audit ownership is prepared before Session authority publication. An
+    // allocation failure therefore leaves the existing grant set untouched.
+    var failing_audit = std.testing.FailingAllocator.init(
+        std.testing.allocator,
+        .{ .fail_index = 0 },
+    );
+    {
+        fake.permission_audit.?.allocator = failing_audit.allocator();
+        defer fake.permission_audit.?.allocator = std.testing.allocator;
+        Probe.permission = "deny_session";
+        try ToolCall.append(native_session, "call-audit-failure", "Write", "{}");
+        try std.testing.expect(
+            AbiSession.permissionDecisionOverride(
+                &fake,
+                "Write",
+                "{}",
+                .undecided,
+            ) == null,
+        );
+        const grants_before_audit_failure = fake.permission_state.ruleCount();
+        try std.testing.expectError(
+            error.OutOfMemory,
+            AbiSession.requestUi(&fake, .{
+                .session_id = native_session.session_id,
+                .run_id = 2,
+            }, std.testing.allocator, &write_request, &response),
+        );
+        try std.testing.expectEqual(
+            grants_before_audit_failure,
+            fake.permission_state.ruleCount(),
+        );
+        try std.testing.expectEqual(@as(usize, 0), fake.permission_audit.?.count());
+    }
+
     Probe.permission = "deny_session";
     Probe.calls = 0;
     Probe.releases = 0;
@@ -4341,6 +5389,46 @@ test "Revision 6 MCP schema denial precedes Permission callback eligibility" {
         &session.mcp_view.?.entries[0].permissionIdentity().binding,
         &pending.binding,
     );
+    // This focused rule projection check runs outside a real admitted tool
+    // call, so temporarily disable provenance recording; production explicit
+    // decisions still require the real tool_call identity and fail closed.
+    const saved_audit = session.permission_audit;
+    session.permission_audit = null;
+    defer session.permission_audit = saved_audit;
+    try session.updatePermissionRules(.{
+        .allow = &.{"mcp__weather__weather"},
+    });
+    try std.testing.expectEqual(
+        core.permission.PermissionResult.allow,
+        core.permission.checkPermission(
+            &session.core_session.permission_ctx,
+            model_name,
+            "{\"city\":\"Paris\"}",
+        ),
+    );
+    try session.updatePermissionRules(.{
+        .ask = &.{"mcp__weather"},
+    });
+    try std.testing.expectEqual(
+        core.permission.PermissionResult.ask,
+        core.permission.checkPermission(
+            &session.core_session.permission_ctx,
+            model_name,
+            "{\"city\":\"Paris\"}",
+        ),
+    );
+    try session.updatePermissionRules(.{
+        .deny = &.{"mcp__weather__*"},
+    });
+    try std.testing.expectEqual(
+        core.permission.PermissionResult.deny,
+        core.permission.checkPermission(
+            &session.core_session.permission_ctx,
+            model_name,
+            "{\"city\":\"Paris\"}",
+        ),
+    );
+    try session.updatePermissionRules(.{});
     const ModeCase = struct {
         mode: core.types.PermissionMode,
         expected: core.permission.PermissionResult,
@@ -4456,6 +5544,16 @@ test "Revision 6 MCP view update is idle atomic and invalidates schema-bound gra
     session.call_state = .idle;
     try std.testing.expectEqual(@as(u64, 1), session.catalog_generation);
     try std.testing.expectEqual(@as(usize, 1), session.permission_state.ruleCount());
+    const missing_selectors = [_]mcp_session.Selector{.{
+        .server_binding_identity = binding,
+        .tool_name = "missing",
+    }};
+    try std.testing.expectError(
+        error.InvalidSelection,
+        session.updateMcpView(&missing_selectors, .fresh),
+    );
+    try std.testing.expectEqual(@as(u64, 1), session.catalog_generation);
+    try std.testing.expectEqual(@as(usize, 1), session.permission_state.ruleCount());
 
     server.input_schema_json =
         "{\"type\":\"object\",\"properties\":{\"country\":{\"type\":\"string\"}},\"required\":[\"country\"],\"additionalProperties\":false}";
@@ -4479,6 +5577,47 @@ test "Revision 6 MCP view update is idle atomic and invalidates schema-bound gra
         old_model_name,
         "{\"city\":\"Paris\"}",
     ));
+
+    // A newer Runtime generation is built off-side. If its durable MCP +
+    // Permission replacement cannot fit, the Session keeps generation 2,
+    // its old immutable view/root, and its exact usage.
+    const before_root = session.policy_root;
+    const before_usage = try session.measureDurableUsage();
+    const minimum_reserve: u64 = 64 + 64 + 128;
+    const tight_profile = session_budget.Profile{
+        .hard_bytes = before_usage.total_bytes + minimum_reserve,
+        .soft_bytes = before_usage.total_bytes + minimum_reserve - 1,
+        .input_cap_bytes = 64,
+        .provider_request_cap_bytes = 64,
+        .provider_result_cap_bytes = 64,
+        .tool_result_cap_bytes = 32,
+        .mcp_result_cap_bytes = 32,
+        .audit_reserve_bytes = 64,
+        .terminal_reserve_bytes = 128,
+    };
+    session.budget_state = try session_budget.SessionState.init(tight_profile);
+    try session.budget_state.updateUsage(before_usage.total_bytes);
+    server.tool_name = "weather_forecast_extended";
+    try std.testing.expectEqual(@as(u64, 3), try runtime.mcp_manager.?.refresh());
+    const larger_selectors = [_]mcp_session.Selector{.{
+        .server_binding_identity = binding,
+        .tool_name = "weather_forecast_extended",
+    }};
+    try std.testing.expectError(
+        error.CheckpointBudgetRequired,
+        session.updateMcpView(&larger_selectors, .fresh),
+    );
+    try std.testing.expectEqual(@as(u64, 2), session.catalog_generation);
+    try std.testing.expect(session.policy_root == before_root);
+    try std.testing.expectEqual(@as(usize, 0), session.permission_state.ruleCount());
+    try std.testing.expectEqual(
+        before_usage.total_bytes,
+        session.budget_state.durable_usage_bytes,
+    );
+    try std.testing.expectEqual(
+        session_budget.Outcome.budget_required,
+        session.budget_state.last_outcome,
+    );
 }
 
 test "Revision 6 checkpoint restores compatible MCP view and exact Session grant" {
@@ -4502,14 +5641,25 @@ test "Revision 6 checkpoint restores compatible MCP view and exact Session grant
     );
     defer native_runtime.destroy() catch unreachable;
     var server = fixture.Server{};
+    var calendar_server = fixture.Server{ .tool_name = "events" };
     const binding = [_]u8{0x76} ** 32;
-    const specs = [_]mcp_catalog.ServerSpec{.{
-        .binding = binding,
-        .namespace = "weather",
-        .connector = server.connector(),
-        .transport = .stdio,
-        .client = .{ .name = "agentcore-test", .version = "1" },
-    }};
+    const calendar_binding = [_]u8{0x78} ** 32;
+    const specs = [_]mcp_catalog.ServerSpec{
+        .{
+            .binding = binding,
+            .namespace = "weather",
+            .connector = server.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+        },
+        .{
+            .binding = calendar_binding,
+            .namespace = "calendar",
+            .connector = calendar_server.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+        },
+    };
     var runtime = AbiRuntime{
         .core_runtime = native_runtime,
         .host_tools = &.{},
@@ -4572,6 +5722,7 @@ test "Revision 6 checkpoint restores compatible MCP view and exact Session grant
     );
     const expected_model_name = try std.testing.allocator.dupe(u8, original_entry.model_name);
     defer std.testing.allocator.free(expected_model_name);
+    const expected_permission_binding = original_entry.permissionIdentity().binding;
     var checkpoint = TestCheckpointBuffer{ .allocator = std.testing.allocator };
     defer checkpoint.deinit();
     const limits = session_checkpoint.Limits{
@@ -4623,6 +5774,15 @@ test "Revision 6 checkpoint restores compatible MCP view and exact Session grant
     try std.testing.expectEqual(@as(u32, 1), restored.report.permission_rules_restored);
     try std.testing.expectEqual(@as(u32, 0), restored.report.permission_rules_invalidated);
     try std.testing.expectEqual(@as(u64, 1), restored.report.catalog_generation);
+    // The current Runtime exposes additional MCP authority, but restore
+    // reconstructs only the checkpoint selection and never auto-enables it.
+    try std.testing.expectEqual(@as(usize, 1), restored.session.mcp_view.?.entries.len);
+    try std.testing.expect(
+        restored.session.mcp_view.?.findCanonicalTool(
+            &calendar_binding,
+            "events",
+        ) == null,
+    );
     try std.testing.expectEqualStrings(
         expected_model_name,
         restored.session.mcp_view.?.entries[0].model_name,
@@ -4660,6 +5820,48 @@ test "Revision 6 checkpoint restores compatible MCP view and exact Session grant
     try std.testing.expectEqual(@as(u64, 2), changed.report.catalog_generation);
     try std.testing.expectEqual(@as(usize, 0), changed.session.mcp_view.?.entries.len);
     try std.testing.expectEqual(@as(usize, 1), changed.session.core_session.conversation.len());
+    try std.testing.expectEqual(@as(usize, 2), changed.report.issues.len);
+    var saw_permission_issue = false;
+    var saw_mcp_issue = false;
+    for (changed.report.issues) |issue| switch (issue.subsystem) {
+        .permission => {
+            saw_permission_issue = true;
+            try std.testing.expectEqual(
+                session_authority.AuthorityIssueReason.unavailable,
+                issue.reason,
+            );
+            try std.testing.expectEqualStrings("weather", issue.canonical_name);
+            try std.testing.expectEqualSlices(
+                u8,
+                &expected_permission_binding,
+                &issue.authority_binding,
+            );
+        },
+        .mcp => {
+            saw_mcp_issue = true;
+            try std.testing.expectEqual(
+                session_authority.AuthorityIssueReason.schema_changed,
+                issue.reason,
+            );
+            try std.testing.expectEqualStrings("weather", issue.canonical_name);
+            try std.testing.expectEqualSlices(
+                u8,
+                &binding,
+                &issue.server_binding_identity,
+            );
+        },
+        .skill => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(saw_permission_issue and saw_mcp_issue);
+    var changed_description = try changed.session.describe(std.testing.allocator);
+    defer changed_description.deinit();
+    try std.testing.expectEqual(@as(usize, 2), changed_description.authority_issues.len);
+    try std.testing.expectEqualSlices(
+        u8,
+        &changed.report.issues[0].issue_id,
+        &changed_description.authority_issues[0].issue_id,
+    );
+    try std.testing.expectEqual(@as(usize, 0), changed_description.mcp_tools.len);
 }
 
 test "oversized Host tool results are released exactly once" {
@@ -5005,6 +6207,21 @@ test "Revision 6 AgentCore checkpoint export commits generation only after sink 
         }, read_digest)).?,
         1,
     );
+    const initial_usage = try session.measureDurableUsage();
+    const checkpoint_hard = @max(initial_usage.total_bytes + 1024, 8192);
+    const checkpoint_profile = session_budget.Profile{
+        .hard_bytes = checkpoint_hard,
+        .soft_bytes = checkpoint_hard - 1,
+        .input_cap_bytes = 1024,
+        .provider_request_cap_bytes = 1024,
+        .provider_result_cap_bytes = 512,
+        .tool_result_cap_bytes = 256,
+        .mcp_result_cap_bytes = 256,
+        .audit_reserve_bytes = 64,
+        .terminal_reserve_bytes = 128,
+    };
+    session.budget_state = try session_budget.SessionState.init(checkpoint_profile);
+    try session.budget_state.updateUsage(initial_usage.total_bytes);
     var capture = CaptureSink{ .allocator = std.testing.allocator };
     defer capture.deinit();
     const limits = session_checkpoint.Limits{
@@ -5015,6 +6232,11 @@ test "Revision 6 AgentCore checkpoint export commits generation only after sink 
     const first = try session.exportCheckpoint(limits, capture.sink());
     try std.testing.expectEqual(@as(u64, 1), session.checkpoint_generation);
     try std.testing.expectEqual(first.total_bytes, capture.bytes.items.len);
+    try std.testing.expect(first.total_bytes <= checkpoint_profile.hard_bytes);
+    try std.testing.expectEqual(
+        first.total_bytes,
+        session.budget_state.durable_usage_bytes,
+    );
     try std.testing.expect(std.mem.indexOf(u8, capture.bytes.items, "test-key") == null);
     try std.testing.expectEqual(AbiSession.CallState.idle, session.call_state);
     var description = try session.describe(std.testing.allocator);
@@ -5030,11 +6252,16 @@ test "Revision 6 AgentCore checkpoint export commits generation only after sink 
 
     capture.clear();
     capture.fail = true;
+    const usage_before_sink_failure = session.budget_state.durable_usage_bytes;
     try std.testing.expectError(
         error.SinkFailed,
         session.exportCheckpoint(limits, capture.sink()),
     );
     try std.testing.expectEqual(@as(u64, 1), session.checkpoint_generation);
+    try std.testing.expectEqual(
+        usage_before_sink_failure,
+        session.budget_state.durable_usage_bytes,
+    );
     try std.testing.expectEqual(AbiSession.CallState.idle, session.call_state);
     var lease = try native_session.snapshotCommitted();
     lease.deinit();
@@ -5165,7 +6392,10 @@ test "Revision 6 AgentCore restore is atomic and continues logical operation IDs
         .hard_bytes = 1024 * 1024,
         .chunk_bytes = 23,
     };
-    _ = try original_facade.exportCheckpoint(limits, checkpoint.sink());
+    const exported = try original_facade.exportCheckpoint(
+        limits,
+        checkpoint.sink(),
+    );
     try std.testing.expect(std.mem.indexOf(u8, checkpoint.bytes.items, "old-key") == null);
 
     var canonical_workspace = try skill_catalog_handles.CanonicalWorkspace.init(
@@ -5240,6 +6470,10 @@ test "Revision 6 AgentCore restore is atomic and continues logical operation IDs
     );
     try std.testing.expectEqual(@as(u64, 1), restored.report.checkpoint_generation);
     try std.testing.expectEqual(
+        exported.total_bytes,
+        restored.session.budget_state.durable_usage_bytes,
+    );
+    try std.testing.expectEqual(
         session_authority.LogicalOrigin.restored,
         restored.session.logical_origin,
     );
@@ -5261,6 +6495,10 @@ test "Revision 6 AgentCore restore is atomic and continues logical operation IDs
     try std.testing.expectEqual(@as(u64, 8), description.last_run_id);
     try std.testing.expectEqual(@as(u64, 1), description.checkpoint_generation);
     try std.testing.expectEqual(session_authority.LogicalOrigin.restored, description.origin);
+    try std.testing.expectEqual(
+        exported.total_bytes,
+        description.budget.durable_usage_bytes,
+    );
 
     var continued_checkpoint = TestCheckpointBuffer{ .allocator = std.testing.allocator };
     defer continued_checkpoint.deinit();
@@ -5460,6 +6698,20 @@ test "Revision 6 AgentCore restore degrades unavailable and changed Skill author
     );
     try std.testing.expectEqual(@as(u32, 1), unavailable.report.skill.invalidated);
     try std.testing.expect(unavailable.session.skill_binding == null);
+    try std.testing.expectEqual(@as(usize, 1), unavailable.report.issues.len);
+    try std.testing.expectEqual(
+        session_authority.AuthoritySubsystem.skill,
+        unavailable.report.issues[0].subsystem,
+    );
+    try std.testing.expectEqual(
+        session_authority.AuthorityIssueReason.unavailable,
+        unavailable.report.issues[0].reason,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &record.skill_id,
+        &unavailable.report.issues[0].skill_id,
+    );
     try std.testing.expectEqual(
         wire.STATUS_OK,
         sessionDestroy(unavailable.session.handle(), &diagnostic),
@@ -5502,6 +6754,16 @@ test "Revision 6 AgentCore restore degrades unavailable and changed Skill author
     );
     try std.testing.expectEqual(@as(u32, 1), changed.report.skill.invalidated);
     try std.testing.expect(changed.session.skill_binding == null);
+    try std.testing.expectEqual(@as(usize, 1), changed.report.issues.len);
+    try std.testing.expectEqual(
+        session_authority.AuthorityIssueReason.identity_changed,
+        changed.report.issues[0].reason,
+    );
+    try std.testing.expect(!std.mem.allEqual(
+        u8,
+        &changed.report.issues[0].issue_id,
+        0,
+    ));
     try std.testing.expectEqual(
         wire.STATUS_OK,
         sessionDestroy(changed.session.handle(), &diagnostic),
@@ -5655,6 +6917,32 @@ test "Revision 6 restore preserves Conversation and invalidates unavailable MCP 
     try std.testing.expectEqualStrings(
         "survives unavailable MCP server",
         first.session.core_session.conversation.messages.items[0].blocks[0].text,
+    );
+    try std.testing.expectEqual(@as(usize, 2), first.report.issues.len);
+    try std.testing.expectEqual(
+        session_authority.AuthoritySubsystem.permission,
+        first.report.issues[0].subsystem,
+    );
+    try std.testing.expectEqual(
+        session_authority.AuthoritySubsystem.mcp,
+        first.report.issues[1].subsystem,
+    );
+    try std.testing.expectEqual(
+        session_authority.AuthorityIssueReason.unavailable,
+        first.report.issues[1].reason,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &persisted_entries[0].server_binding_identity,
+        &first.report.issues[1].server_binding_identity,
+    );
+    var first_description = try first.session.describe(std.testing.allocator);
+    defer first_description.deinit();
+    try std.testing.expectEqual(@as(usize, 2), first_description.authority_issues.len);
+    try std.testing.expectEqualSlices(
+        u8,
+        &first.report.issues[1].issue_id,
+        &first_description.authority_issues[1].issue_id,
     );
 
     // Once the stale authority is invalidated, the degraded Session remains
@@ -5942,6 +7230,44 @@ test "Revision 6 AgentCore permission rule mutation is atomic and invalidates Se
     );
     try std.testing.expectEqual(AbiSession.CallState.idle, session.call_state);
 
+    // A valid replacement must also remain fully off-side when the durable
+    // Session budget cannot reserve the post-mutation checkpoint plus the
+    // minimum next-Run terminal space.
+    const before_budget_rejection = try session.measureDurableUsage();
+    const permission_profile = session_budget.Profile{
+        .hard_bytes = before_budget_rejection.total_bytes,
+        .soft_bytes = before_budget_rejection.total_bytes - 1,
+        .input_cap_bytes = 64,
+        .provider_request_cap_bytes = 64,
+        .provider_result_cap_bytes = 64,
+        .tool_result_cap_bytes = 32,
+        .mcp_result_cap_bytes = 32,
+        .audit_reserve_bytes = 64,
+        .terminal_reserve_bytes = 128,
+    };
+    session.budget_state = try session_budget.SessionState.init(permission_profile);
+    try session.budget_state.updateUsage(before_budget_rejection.total_bytes);
+    try std.testing.expectError(
+        error.CheckpointBudgetRequired,
+        session.updatePermissionRules(.{ .allow = &.{"Read"} }),
+    );
+    try std.testing.expect(native_session.permission_ctx.settings == published);
+    try std.testing.expectEqual(published_generation, session.policy_generation);
+    try std.testing.expectEqual(@as(usize, 1), session.permission_state.ruleCount());
+    try std.testing.expect(std.mem.eql(
+        u8,
+        &published_fingerprint,
+        &session.policy_fingerprint,
+    ));
+    try std.testing.expectEqual(
+        before_budget_rejection.total_bytes,
+        session.budget_state.durable_usage_bytes,
+    );
+    try std.testing.expectEqual(
+        session_budget.Outcome.budget_required,
+        session.budget_state.last_outcome,
+    );
+
     session.call_state = .running;
     try std.testing.expectError(
         error.SessionBusy,
@@ -5971,8 +7297,26 @@ test "Session Skill selection update is explicit atomic and selection-only" {
     );
     defer workspace.deinit();
 
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{} },
+    );
+    defer native_runtime.destroy() catch unreachable;
+    const native_session = try native_runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{
+            .root = workspace.root,
+            .home = workspace.home,
+            .shell = .disabled,
+        },
+        .allowed_tools = &.{},
+    });
+    defer native_session.destroy() catch unreachable;
+
     var runtime = AbiRuntime{
-        .core_runtime = undefined,
+        .core_runtime = native_runtime,
         .host_tools = &.{},
         .catalogs = skill_catalog_handles.RuntimeCatalogs.initWithSecret(
             std.testing.allocator,
@@ -6029,7 +7373,7 @@ test "Session Skill selection update is explicit atomic and selection-only" {
         .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
         .callback_status = .init(wire.STATUS_OK),
         .facade_poisoned = .init(false),
-        .core_session = undefined,
+        .core_session = native_session,
         .runtime = &runtime,
         .workspace_scope_id = scope_id,
         .skill_binding = initial_binding,
@@ -6063,6 +7407,54 @@ test "Session Skill selection update is explicit atomic and selection-only" {
     }));
     try std.testing.expect(session.skill_binding.?.cell == first_cell);
     try std.testing.expectEqual(@as(usize, 1), second_host.cell.references);
+
+    const skill_state_before = try session_authority.encodeSkillState(
+        std.testing.allocator,
+        session.skill_binding.?.snapshot(),
+        &session.skill_binding.?.selection,
+    );
+    defer std.testing.allocator.free(skill_state_before);
+    const before_skill_budget_rejection = try session.measureDurableUsage();
+    const skill_profile = session_budget.Profile{
+        .hard_bytes = before_skill_budget_rejection.total_bytes + 255,
+        .soft_bytes = before_skill_budget_rejection.total_bytes + 254,
+        .input_cap_bytes = 64,
+        .provider_request_cap_bytes = 64,
+        .provider_result_cap_bytes = 64,
+        .tool_result_cap_bytes = 32,
+        .mcp_result_cap_bytes = 32,
+        .audit_reserve_bytes = 64,
+        .terminal_reserve_bytes = 128,
+    };
+    session.budget_state = try session_budget.SessionState.init(skill_profile);
+    try session.budget_state.updateUsage(before_skill_budget_rejection.total_bytes);
+    try std.testing.expectError(
+        error.CheckpointBudgetRequired,
+        session.updateSkills(null, .{
+            .default_state = .disabled,
+            .exceptions = &.{},
+        }),
+    );
+    const skill_state_after = try session_authority.encodeSkillState(
+        std.testing.allocator,
+        session.skill_binding.?.snapshot(),
+        &session.skill_binding.?.selection,
+    );
+    defer std.testing.allocator.free(skill_state_after);
+    try std.testing.expectEqualSlices(u8, skill_state_before, skill_state_after);
+    try std.testing.expect(session.skill_binding.?.cell == first_cell);
+    try std.testing.expectEqual(@as(usize, 1), first_cell.references);
+    try std.testing.expectEqual(
+        before_skill_budget_rejection.total_bytes,
+        session.budget_state.durable_usage_bytes,
+    );
+    try std.testing.expectEqual(
+        session_budget.Outcome.budget_required,
+        session.budget_state.last_outcome,
+    );
+
+    session.budget_state = try session_budget.SessionState.init(.{});
+    try session.budget_state.updateUsage(before_skill_budget_rejection.total_bytes);
 
     try session.updateSkills(null, .{
         .default_state = .disabled,
@@ -6196,6 +7588,436 @@ test "disabled AgentCore Skill fails before admission and materialization" {
     try std.testing.expectEqual(@as(u64, 0), native_session.last_run_id);
     try std.testing.expectEqual(initial_messages, native_session.conversation.messages.items.len);
     try std.testing.expectEqual(@as(usize, 0), materializations.active_count);
+}
+
+test "checkpoint budget rejects text before consuming run identity" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const cwd = root_buffer[0..root_len];
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{} },
+    );
+    defer native_runtime.destroy() catch unreachable;
+    const native_session = try native_runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
+    });
+    defer native_session.destroy() catch unreachable;
+    const profile = session_budget.Profile{
+        .hard_bytes = 4096,
+        .soft_bytes = 3072,
+        .input_cap_bytes = 1024,
+        .provider_request_cap_bytes = 1024,
+        .provider_result_cap_bytes = 512,
+        .tool_result_cap_bytes = 256,
+        .mcp_result_cap_bytes = 256,
+        .audit_reserve_bytes = 64,
+        .terminal_reserve_bytes = 128,
+    };
+    var facade = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = native_session,
+        .budget_state = try session_budget.SessionState.init(profile),
+    };
+    var materializations = try skill_materialization.Manager.init(
+        std.testing.allocator,
+    );
+    defer materializations.deinit() catch unreachable;
+    var oversized: [1025]u8 = undefined;
+    @memset(&oversized, 'x');
+    const before_messages = native_session.conversation.messages.items.len;
+    var before = try native_session.snapshotCommitted();
+    const before_run_id = before.last_run_id;
+    before.deinit();
+
+    try std.testing.expectError(
+        error.CheckpointBudgetRequired,
+        facade.runTextWithBoundSkills(
+            &materializations,
+            1,
+            &oversized,
+            1,
+        ),
+    );
+
+    var after = try native_session.snapshotCommitted();
+    defer after.deinit();
+    try std.testing.expectEqual(before_run_id, after.last_run_id);
+    try std.testing.expectEqual(
+        before_messages,
+        native_session.conversation.messages.items.len,
+    );
+    try std.testing.expectEqual(
+        session_budget.Outcome.budget_required,
+        facade.budget_state.last_outcome,
+    );
+}
+
+test "Permission Session grant reserves durable bytes before publication" {
+    const profile = session_budget.Profile{
+        .hard_bytes = 4096,
+        .soft_bytes = 3072,
+        .input_cap_bytes = 1024,
+        .provider_request_cap_bytes = 1024,
+        .provider_result_cap_bytes = 512,
+        .tool_result_cap_bytes = 256,
+        .mcp_result_cap_bytes = 256,
+        .audit_reserve_bytes = 128,
+        .terminal_reserve_bytes = 128,
+    };
+    try profile.validate();
+    const digest = try session_permission.digestCanonicalArguments(
+        std.testing.allocator,
+        "{\"command\":\"echo ok\"}",
+        .{},
+    );
+    const candidate = (try session_permission.deriveRuleCandidate(.{
+        .namespace = .builtin,
+        .name = "Bash",
+    }, digest)).?;
+    var facade = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = undefined,
+        .permission_state = try session_permission.State.init(
+            std.testing.allocator,
+            1,
+        ),
+    };
+    defer facade.permission_state.deinit();
+
+    var denied = session_budget.Controller.init(std.testing.allocator, profile, .{
+        .input_delta_bytes = 0,
+        .projected_usage_bytes = 3900,
+        .minimum_required_bytes = 3900,
+    });
+    facade.active_budget_controller = &denied;
+    try std.testing.expectError(
+        error.BudgetExhausted,
+        facade.rememberPermissionResponseBudgeted(.allow_session, candidate),
+    );
+    try std.testing.expectEqual(@as(usize, 0), facade.permission_state.ruleCount());
+    try std.testing.expectEqual(session_budget.Outcome.budget_exhausted, denied.outcome());
+    try std.testing.expectEqual(@as(u64, 0), denied.reserved_bytes);
+
+    var admitted = session_budget.Controller.init(std.testing.allocator, profile, .{
+        .input_delta_bytes = 0,
+        .projected_usage_bytes = 1000,
+        .minimum_required_bytes = 1000,
+    });
+    facade.active_budget_controller = &admitted;
+    try std.testing.expectEqual(
+        session_permission.RememberResult.added,
+        try facade.rememberPermissionResponseBudgeted(.allow_session, candidate),
+    );
+    try std.testing.expectEqual(@as(usize, 1), facade.permission_state.ruleCount());
+    try std.testing.expectEqual(@as(u64, 0), admitted.reserved_bytes);
+    try std.testing.expectEqual(
+        session_permission.RememberResult.already_present,
+        try facade.rememberPermissionResponseBudgeted(.allow_session, candidate),
+    );
+    try std.testing.expectEqual(@as(u64, 0), admitted.reserved_bytes);
+    facade.active_budget_controller = null;
+}
+
+test "durable mutation is rejected before model publication" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const cwd = root_buffer[0..root_len];
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{} },
+    );
+    defer native_runtime.destroy() catch unreachable;
+    const native_session = try native_runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
+    });
+    defer native_session.destroy() catch unreachable;
+    var facade = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = native_session,
+    };
+    const initial = try facade.measureDurableUsage();
+    const profile = session_budget.Profile{
+        .hard_bytes = initial.total_bytes + 216,
+        .soft_bytes = initial.total_bytes + 215,
+        .input_cap_bytes = 64,
+        .provider_request_cap_bytes = 64,
+        .provider_result_cap_bytes = 64,
+        .tool_result_cap_bytes = 32,
+        .mcp_result_cap_bytes = 32,
+        .audit_reserve_bytes = 16,
+        .terminal_reserve_bytes = 128,
+    };
+    facade.budget_state = try session_budget.SessionState.init(profile);
+    try facade.budget_state.updateUsage(initial.total_bytes);
+    var larger_model: [64]u8 = undefined;
+    @memset(&larger_model, 'm');
+
+    try std.testing.expectError(
+        error.CheckpointBudgetRequired,
+        facade.setModel(&larger_model),
+    );
+    try std.testing.expectEqualStrings("test-model", native_session.model);
+    try std.testing.expectEqual(AbiSession.CallState.idle, facade.call_state);
+    try std.testing.expectEqual(
+        session_budget.Outcome.budget_required,
+        facade.budget_state.last_outcome,
+    );
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer bufferRelease(&diagnostic);
+    try std.testing.expectEqual(
+        wire.STATUS_RESOURCE_LIMIT,
+        sessionSetModel(facade.handle(), view(&larger_model), &diagnostic),
+    );
+    try std.testing.expectEqualStrings("test-model", native_session.model);
+    try std.testing.expectEqual(AbiSession.CallState.idle, facade.call_state);
+}
+
+test "compact bounds Provider payload and preserves checkpointability" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const cwd = root_buffer[0..root_len];
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{} },
+    );
+    defer native_runtime.destroy() catch unreachable;
+    const native_session = try native_runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
+    });
+    defer native_session.destroy() catch unreachable;
+    try native_session.conversation.appendText(.user, "old context one");
+    try native_session.conversation.appendText(.assistant, "old context two");
+    try native_session.conversation.appendText(.user, "recent context");
+    // Default compact keeps the newest ten messages. Seed enough durable
+    // history to force the summarization Provider path instead of exercising
+    // the legitimate no-change fast path.
+    for (0..8) |index| {
+        const message = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "compact budget source message {d}",
+            .{index},
+        );
+        defer std.testing.allocator.free(message);
+        try native_session.conversation.appendText(
+            if (index % 2 == 0) .assistant else .user,
+            message,
+        );
+    }
+    var runtime = AbiRuntime{
+        .core_runtime = native_runtime,
+        .host_tools = &.{},
+        .catalogs = skill_catalog_handles.RuntimeCatalogs.initWithSecret(
+            std.testing.allocator,
+            [_]u8{0x95} ** 32,
+        ),
+        .materializations = undefined,
+    };
+    defer {
+        runtime.catalogs.tryBeginDestroy() catch unreachable;
+        runtime.catalogs.finishDestroy();
+    }
+    var facade = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = native_session,
+        .runtime = &runtime,
+    };
+    const initial = try facade.measureDurableUsage();
+    const hard = @max(initial.total_bytes + 4096, 8192);
+    const profile = session_budget.Profile{
+        .hard_bytes = hard,
+        .soft_bytes = hard - 1,
+        .input_cap_bytes = 1024,
+        .provider_request_cap_bytes = 4096,
+        .provider_result_cap_bytes = 64,
+        .tool_result_cap_bytes = 32,
+        .mcp_result_cap_bytes = 32,
+        .audit_reserve_bytes = 64,
+        .terminal_reserve_bytes = 128,
+    };
+    facade.budget_state = try session_budget.SessionState.init(profile);
+    try facade.budget_state.updateUsage(initial.total_bytes);
+    var test_provider = CompactBudgetTestProvider{
+        // Provider-owned stream events follow the AgentCore Session allocator
+        // contract because the consumer releases them after projection.
+        .allocator = allocator,
+        .payload_bytes = 512,
+    };
+
+    const before_compact_messages = native_session.conversation.len();
+    const report = try facade.compactBudgetedUsingProvider(
+        1,
+        test_provider.provider(),
+    );
+    try std.testing.expectEqual(@as(u32, 1), test_provider.calls);
+    try std.testing.expectEqual(
+        core.compact_kernel.Outcome.aborted,
+        report.outcome,
+    );
+    try std.testing.expectEqual(
+        session_budget.Outcome.resource_limit,
+        facade.budget_state.last_outcome,
+    );
+    try std.testing.expect(!facade.facade_poisoned.load(.acquire));
+    try std.testing.expect(facade.budget_state.durable_usage_bytes <= hard);
+    try std.testing.expectEqual(
+        before_compact_messages,
+        native_session.conversation.len(),
+    );
+    try std.testing.expectEqualStrings(
+        "old context one",
+        native_session.conversation.messages.items[0].blocks[0].text,
+    );
+    for (native_session.conversation.messages.items) |message| {
+        for (message.blocks) |block| switch (block) {
+            .text => |text_block| try std.testing.expect(
+                std.mem.indexOf(u8, text_block, "ssssssss") == null,
+            ),
+            else => {},
+        };
+    }
+    var checkpoint = TestCheckpointBuffer{
+        .allocator = std.testing.allocator,
+    };
+    defer checkpoint.deinit();
+    _ = try facade.exportCheckpoint(profile.checkpointLimits(), checkpoint.sink());
+    var decoded = try session_checkpoint.decodeFromSource(
+        std.testing.allocator,
+        checkpoint.source(),
+        profile.checkpointLimits(),
+    );
+    decoded.deinit();
+}
+
+test "admitted resource limit remains bounded and checkpointable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const cwd = root_buffer[0..root_len];
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{} },
+    );
+    defer native_runtime.destroy() catch unreachable;
+    var runtime = AbiRuntime{
+        .core_runtime = native_runtime,
+        .host_tools = &.{},
+        .catalogs = skill_catalog_handles.RuntimeCatalogs.initWithSecret(
+            std.testing.allocator,
+            [_]u8{0x91} ** 32,
+        ),
+        .materializations = undefined,
+    };
+    defer {
+        runtime.catalogs.tryBeginDestroy() catch unreachable;
+        runtime.catalogs.finishDestroy();
+    }
+    const profile = session_budget.Profile{
+        .hard_bytes = 8192,
+        .soft_bytes = 6144,
+        .input_cap_bytes = 1024,
+        .provider_request_cap_bytes = 1024,
+        .provider_result_cap_bytes = 512,
+        .tool_result_cap_bytes = 256,
+        .mcp_result_cap_bytes = 256,
+        .audit_reserve_bytes = 64,
+        .terminal_reserve_bytes = 128,
+    };
+    const session = try buildAbiSession(&runtime, .{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .base_url = null,
+        .permission_mode = .default,
+        .permission_rules = null,
+        .workspace = .{ .root = cwd, .home = cwd },
+        .allowed_tools = &.{},
+        .workspace_scope_id = [_]u8{0} ** 64,
+        .skill_binding = null,
+        .budget_profile = profile,
+    });
+    defer {
+        var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+        const status = sessionDestroy(session.handle(), &diagnostic);
+        bufferRelease(&diagnostic);
+        std.debug.assert(status == wire.STATUS_OK);
+    }
+
+    const preflight = try session.preflightRun(&.{"accepted"});
+    var controller = session_budget.Controller.init(
+        std.testing.allocator,
+        profile,
+        preflight,
+    );
+    var reservation = try controller.beginOperation(.provider, 1);
+    reservation.failResourceLimit(513);
+    var sink_ctx: u8 = 0;
+    var admitted = try session.core_session.admitRun(
+        1,
+        TestEventSink.sink(&sink_ctx),
+    );
+    _ = try admitted.finishWithoutConversation();
+    try std.testing.expectEqual(
+        session_budget.Outcome.resource_limit,
+        try session.finishBudgetedRun(1, &controller),
+    );
+
+    var checkpoint = TestCheckpointBuffer{
+        .allocator = std.testing.allocator,
+    };
+    defer checkpoint.deinit();
+    const report = try session.exportCheckpoint(
+        profile.checkpointLimits(),
+        checkpoint.sink(),
+    );
+    try std.testing.expect(report.total_bytes <= profile.hard_bytes);
+    var decoded = try session_checkpoint.decodeFromSource(
+        std.testing.allocator,
+        checkpoint.source(),
+        profile.checkpointLimits(),
+    );
+    defer decoded.deinit();
+    try std.testing.expectEqual(
+        session_checkpoint.TerminalKind.resource_limit,
+        decoded.descriptor.terminal_kind,
+    );
+    try std.testing.expectEqual(@as(u64, 1), decoded.descriptor.terminal_id);
+    const last = decoded.conversation.messages.items[
+        decoded.conversation.messages.items.len - 1
+    ];
+    try std.testing.expectEqual(core.message.Role.assistant, last.role);
+    try std.testing.expectEqualStrings(
+        session_budget.RESOURCE_LIMIT_MARKER,
+        last.blocks[0].text,
+    );
 }
 
 test "Skill materialization is post-admission and pre-Conversation" {

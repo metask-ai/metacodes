@@ -337,8 +337,27 @@ pub const AbortCompactError = error{
     InvalidSessionState,
 };
 
+pub const CompactCommitGuard = struct {
+    ctx: *anyopaque,
+    allowFn: *const fn (
+        ctx: *anyopaque,
+        replacement: *const Conversation,
+    ) bool,
+
+    fn allows(
+        self: CompactCommitGuard,
+        replacement: *const Conversation,
+    ) bool {
+        return self.allowFn(self.ctx, replacement);
+    }
+};
+
 pub const CompactOptions = struct {
     keep_recent: usize = 10,
+    /// Optional facade-owned, non-allocating commit predicate evaluated at
+    /// the existing Conversation replacement linearization point. Default
+    /// callers retain the canonical degraded-compaction behavior.
+    commit_guard: ?CompactCommitGuard = null,
 };
 
 /// Synchronous isolated execution hook used by a facade that needs a fresh
@@ -444,6 +463,45 @@ pub const AdmittedRun = struct {
         execution_policy: ?ToolExecutionPolicy,
         tool_surface: ?RunToolSurface,
     ) anyerror!agent_loop.RunResult {
+        return self.runUserMessagesWithToolSurfaceImpl(
+            prompts,
+            max_turns,
+            execution_policy,
+            tool_surface,
+            null,
+        );
+    }
+
+    /// Borrow a facade-owned Provider for this admitted synchronous Run. This
+    /// narrow override exists so embedding layers can enforce per-operation
+    /// admission without mutating the Session-owned Provider or duplicating
+    /// the shared agent loop. The caller keeps the Provider context alive until
+    /// the Run and all of its workers have quiesced.
+    pub fn runUserMessagesWithToolSurfaceUsingProvider(
+        self: *AdmittedRun,
+        prompts: []const []const u8,
+        max_turns: u32,
+        execution_policy: ?ToolExecutionPolicy,
+        tool_surface: ?RunToolSurface,
+        provider_override: provider_mod.Provider,
+    ) anyerror!agent_loop.RunResult {
+        return self.runUserMessagesWithToolSurfaceImpl(
+            prompts,
+            max_turns,
+            execution_policy,
+            tool_surface,
+            provider_override,
+        );
+    }
+
+    fn runUserMessagesWithToolSurfaceImpl(
+        self: *AdmittedRun,
+        prompts: []const []const u8,
+        max_turns: u32,
+        execution_policy: ?ToolExecutionPolicy,
+        tool_surface: ?RunToolSurface,
+        provider_override: ?provider_mod.Provider,
+    ) anyerror!agent_loop.RunResult {
         if (self.completed) return error.InvalidSessionState;
         if (prompts.len == 0) {
             _ = try self.finishWithoutConversation();
@@ -462,6 +520,7 @@ pub const AdmittedRun = struct {
             max_turns,
             execution_policy,
             tool_surface,
+            provider_override,
         );
     }
 
@@ -978,6 +1037,23 @@ pub const AgentSession = struct {
         );
     }
 
+    /// Borrow a facade-owned Provider for one synchronous compact operation.
+    /// This keeps the canonical compact preview/commit state machine in Core
+    /// while allowing embedding layers to enforce request/result budgets. The
+    /// caller owns the Provider context and keeps it alive through quiescence.
+    pub fn compactUsingBorrowedProvider(
+        self: *AgentSession,
+        operation_id: u64,
+        options: CompactOptions,
+        provider_override: provider_mod.Provider,
+    ) CompactError!compact_kernel.Report {
+        return self.compactUsingProvider(
+            operation_id,
+            options,
+            provider_override,
+        );
+    }
+
     fn compactUsingProvider(
         self: *AgentSession,
         operation_id: u64,
@@ -1017,6 +1093,11 @@ pub const AgentSession = struct {
         self.mutex.unlock();
         defer self.finishCompact(operation_id);
 
+        var commit_context = CompactCommitContext{
+            .session = self,
+            .guard = options.commit_guard,
+        };
+
         return compact_kernel.run(
             self.allocator,
             &self.conversation,
@@ -1025,7 +1106,7 @@ pub const AgentSession = struct {
             .{
                 .keep_recent = options.keep_recent,
                 .committer = .{
-                    .ctx = self,
+                    .ctx = &commit_context,
                     .commit_fn = commitCompact,
                 },
             },
@@ -1039,11 +1120,15 @@ pub const AgentSession = struct {
         replacement: *Conversation,
         signal: *const AbortSignal,
     ) compact_kernel.CommitResult {
-        const self: *AgentSession = @ptrCast(@alignCast(raw));
+        const context: *CompactCommitContext = @ptrCast(@alignCast(raw));
+        const self = context.session;
         self.mutex.lock();
         defer self.mutex.unlock();
         std.debug.assert(self.state == .compacting);
         if (signal.isAborted()) return .aborted;
+        if (context.guard) |guard| {
+            if (!guard.allows(replacement)) return .aborted;
+        }
         if (!live.replaceWithOwnedIfSuffixUnchanged(suffix, replacement))
             return .concurrent_mutation;
         self.last_terminal_compact_id = self.active_compact_id;
@@ -1052,6 +1137,11 @@ pub const AgentSession = struct {
         self.state = .compact_finishing;
         return .committed;
     }
+
+    const CompactCommitContext = struct {
+        session: *AgentSession,
+        guard: ?CompactCommitGuard,
+    };
 
     pub fn abortCompact(
         self: *AgentSession,
@@ -1162,6 +1252,7 @@ pub const AgentSession = struct {
         max_turns: u32,
         execution_policy: ?ToolExecutionPolicy,
         tool_surface: ?RunToolSurface,
+        provider_override: ?provider_mod.Provider,
     ) anyerror!agent_loop.RunResult {
         var backend = ui_backend.UiBackend{ .ctx = @ptrCast(self), .emit = backendEmit, .poll = backendPoll };
         const tool_definitions = if (tool_surface) |surface|
@@ -1174,7 +1265,7 @@ pub const AgentSession = struct {
             self.tools.dispatcher();
         var native_result = agent_loop.run(
             &self.conversation,
-            self.provider.provider(),
+            provider_override orelse self.provider.provider(),
             tool_definitions,
             &self.permission_ctx,
             .{
@@ -1988,6 +2079,158 @@ const CompactTestProvider = struct {
     }
 };
 
+const RunOverrideTestProvider = struct {
+    allocator: std.mem.Allocator,
+    calls: u32 = 0,
+    stage: u8 = 0,
+
+    fn provider(self: *@This()) provider_mod.Provider {
+        return .{
+            .ctx = self,
+            .modelFn = model,
+            .sendStreamFn = sendStream,
+            .sendStreamRetryFn = sendStreamRetry,
+            .sendFn = send,
+            .maxTokensFn = maxTokens,
+            .maxInputTokensFn = maxInputTokens,
+            .reasoningEffortFn = reasoningEffort,
+            .supportsFn = supports,
+        };
+    }
+
+    fn cast(raw: *anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw));
+    }
+
+    fn model(_: *anyopaque) []const u8 {
+        return "run-override-test";
+    }
+
+    fn sendStream(
+        raw: *anyopaque,
+        _: []const types.ApiMessage,
+        _: ?[]const u8,
+        _: ?[]const @import("../json.zig").ToolDefinition,
+        _: ?*const AbortSignal,
+        _: ?[]const u8,
+        _: ?@import("../json.zig").ToolChoice,
+        _: []const u8,
+    ) anyerror!provider_mod.StreamHandle {
+        const self = cast(raw);
+        self.calls += 1;
+        self.stage = 0;
+        return .{
+            .ctx = raw,
+            .nextFn = next,
+            .deinitFn = deinitStream,
+            .stopReasonFn = stopReason,
+            .requestIdFn = requestId,
+        };
+    }
+
+    fn sendStreamRetry(
+        raw: *anyopaque,
+        messages: []const types.ApiMessage,
+        system: ?[]const u8,
+        tools: ?[]const @import("../json.zig").ToolDefinition,
+        abort: ?*const AbortSignal,
+        model_override: ?[]const u8,
+        tool_choice: ?@import("../json.zig").ToolChoice,
+        _: u32,
+        _: u64,
+        _: ?provider_mod.RetryReporter,
+        user_query: []const u8,
+    ) anyerror!provider_mod.StreamHandle {
+        return sendStream(
+            raw,
+            messages,
+            system,
+            tools,
+            abort,
+            model_override,
+            tool_choice,
+            user_query,
+        );
+    }
+
+    fn next(raw: *anyopaque) anyerror!?@import("../api/stream.zig").StreamEvent {
+        const self = cast(raw);
+        if (self.stage == 0) {
+            self.stage = 1;
+            return .{ .text = try self.allocator.dupe(u8, "override reply") };
+        }
+        if (self.stage == 1) {
+            self.stage = 2;
+            return .done;
+        }
+        return null;
+    }
+
+    fn deinitStream(_: *anyopaque) void {}
+
+    fn stopReason(_: *anyopaque) @import("../api/stream.zig").StopReason {
+        return .end_turn;
+    }
+
+    fn requestId(_: *anyopaque) @import("../util/log.zig").RequestId {
+        return .{ .bytes = [_]u8{'r'} ** 12 };
+    }
+
+    fn send(
+        _: *anyopaque,
+        _: []const types.ApiMessage,
+        _: ?[]const u8,
+        _: ?[]const @import("../json.zig").ToolDefinition,
+        _: ?[]const u8,
+    ) anyerror!provider_mod.ApiResponse {
+        return error.Unused;
+    }
+
+    fn maxTokens(_: *anyopaque) u32 {
+        return 1024;
+    }
+
+    fn maxInputTokens(_: *anyopaque) u32 {
+        return 200_000;
+    }
+
+    fn reasoningEffort(_: *anyopaque) ?types.ReasoningEffort {
+        return null;
+    }
+
+    fn supports(_: *anyopaque, _: provider_mod.Capability) bool {
+        return false;
+    }
+};
+
+test "AdmittedRun uses a borrowed Provider override without mutating Session ownership" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    var sink = SinkProbe{};
+    var override = RunOverrideTestProvider{
+        .allocator = std.testing.allocator,
+    };
+    var admitted = try self.admitRun(1, sink.sink());
+    const result = try admitted.runUserMessagesWithToolSurfaceUsingProvider(
+        &.{"hello"},
+        1,
+        null,
+        null,
+        override.provider(),
+    );
+    try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 1), override.calls);
+    try std.testing.expectEqualStrings("test-model", self.provider.provider().model());
+    const last = self.conversation.messages.items[
+        self.conversation.messages.items.len - 1
+    ];
+    try std.testing.expectEqualStrings("override reply", last.blocks[0].text);
+}
+
 test "AgentSession compact admission consumes only admitted operation ids" {
     const runtime = try createTestRuntime(std.testing.allocator);
     defer runtime.destroy() catch unreachable;
@@ -2002,9 +2245,9 @@ test "AgentSession compact admission consumes only admitted operation ids" {
     var fake = CompactTestProvider{};
     try std.testing.expectError(
         error.InvalidOperationId,
-        self.compactUsingProvider(0, .{ .keep_recent = 1 }, fake.provider()),
+        self.compactUsingBorrowedProvider(0, .{ .keep_recent = 1 }, fake.provider()),
     );
-    const first = try self.compactUsingProvider(
+    const first = try self.compactUsingBorrowedProvider(
         1,
         .{ .keep_recent = 1 },
         fake.provider(),
@@ -2014,6 +2257,7 @@ test "AgentSession compact admission consumes only admitted operation ids" {
     try std.testing.expectEqual(@as(u64, 1), self.last_admitted_compact_id);
     try std.testing.expectEqual(@as(u64, 1), self.last_terminal_compact_id);
     try std.testing.expectEqual(@as(u64, 0), self.last_run_id);
+    try std.testing.expectEqualStrings("test-model", self.provider.provider().model());
     try std.testing.expectError(
         error.StaleCompact,
         self.compactUsingProvider(1, .{}, fake.provider()),
@@ -2032,6 +2276,46 @@ test "AgentSession compact admission consumes only admitted operation ids" {
     try std.testing.expectEqual(compact_kernel.Outcome.no_change, second.outcome);
     try std.testing.expectError(error.StaleCompact, self.abortCompact(1));
     try std.testing.expectError(error.AbortTooLate, self.abortCompact(2));
+}
+
+test "AgentSession borrowed compact commit guard preserves Conversation on rejection" {
+    const runtime = try createTestRuntime(std.testing.allocator);
+    defer runtime.destroy() catch unreachable;
+    const cwd = try testCwd();
+    defer std.testing.allocator.free(cwd);
+    const self = try createTestSession(runtime, .default, cwd);
+    defer self.destroy() catch unreachable;
+    try self.conversation.appendText(.user, "old user context");
+    try self.conversation.appendText(.assistant, "old assistant context");
+    try self.conversation.appendText(.user, "recent user context");
+
+    const Guard = struct {
+        fn reject(_: *anyopaque, _: *const Conversation) bool {
+            return false;
+        }
+    };
+    var guard_anchor: u8 = 0;
+    var fake = CompactTestProvider{};
+    const before_len = self.conversation.len();
+    const report = try self.compactUsingBorrowedProvider(
+        1,
+        .{
+            .keep_recent = 1,
+            .commit_guard = .{
+                .ctx = &guard_anchor,
+                .allowFn = Guard.reject,
+            },
+        },
+        fake.provider(),
+    );
+    try std.testing.expectEqual(compact_kernel.Outcome.aborted, report.outcome);
+    try std.testing.expectEqual(before_len, self.conversation.len());
+    try std.testing.expectEqualStrings(
+        "old user context",
+        self.conversation.messages.items[0].blocks[0].text,
+    );
+    try std.testing.expectEqual(@as(u64, 1), self.last_admitted_compact_id);
+    try std.testing.expectEqual(@as(u64, 1), self.last_terminal_compact_id);
 }
 
 test "AgentSession compact abort is bounded terminal and leaves Conversation unchanged" {

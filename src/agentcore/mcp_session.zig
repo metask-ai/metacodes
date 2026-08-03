@@ -23,6 +23,7 @@ pub const BuildMode = enum { fresh, restore_degraded };
 pub const Error = error{
     OutOfMemory,
     InvalidSelection,
+    NotRefreshed,
     ResourceLimit,
 };
 
@@ -39,6 +40,28 @@ pub const Entry = struct {
             .binding = self.tool.identity.permissionBinding(),
         };
     }
+
+    /// Shared product rules historically match MCP names as
+    /// `<server>__<tool>`. The model-facing alias is deliberately opaque, so
+    /// AgentCore must project the canonical Session binding back into that
+    /// matcher vocabulary instead of authorizing the alias itself.
+    pub fn permissionRuleName(
+        self: *const Entry,
+        allocator: std.mem.Allocator,
+    ) error{OutOfMemory}![]u8 {
+        return std.fmt.allocPrint(
+            allocator,
+            "{s}__{s}",
+            .{ self.server.namespace, self.tool.identity.name },
+        ) catch error.OutOfMemory;
+    }
+};
+
+/// One Skill metadata layer. Slices borrow the immutable Skill catalog
+/// snapshot retained by the admitted Run.
+pub const SkillRestriction = struct {
+    allowed: []const []const u8,
+    disallowed: []const []const u8,
 };
 
 pub const View = struct {
@@ -83,6 +106,11 @@ pub const View = struct {
                 invalidated += 1;
                 continue;
             };
+            if (!resolved.server.isFreshAt(retained.now())) {
+                if (mode == .fresh) return error.NotRefreshed;
+                invalidated += 1;
+                continue;
+            }
             if (selector.expected_schema_fingerprint) |expected| {
                 if (!std.mem.eql(u8, &expected, &resolved.tool.identity.schema_fingerprint)) {
                     if (mode == .fresh) return error.InvalidSelection;
@@ -123,6 +151,10 @@ pub const View = struct {
                 return error.OutOfMemory;
             };
         }
+        // Compute every fallible derived value while `entries` still owns the
+        // prepared schemas, so errdefer can release them on allocation failure.
+        const selection_fingerprint = selectionFingerprint(backing, entries.items) catch
+            return error.OutOfMemory;
         const owned_entries = entries.toOwnedSlice(a) catch return error.OutOfMemory;
         return .{
             .allocator = backing,
@@ -131,7 +163,7 @@ pub const View = struct {
             .entries = owned_entries,
             .catalog_generation = retained.generation,
             .catalog_fingerprint = retained.fingerprint,
-            .selection_fingerprint = selectionFingerprint(owned_entries),
+            .selection_fingerprint = selection_fingerprint,
             .invalidated = invalidated,
         };
     }
@@ -165,15 +197,50 @@ pub const View = struct {
         model_name: []const u8,
         arguments_json: []const u8,
     ) bool {
-        const entry = self.findModelTool(model_name) orelse return false;
+        return self.validateInvocation(model_name, arguments_json) == .valid;
+    }
+
+    pub fn validateInvocation(
+        self: *const View,
+        model_name: []const u8,
+        arguments_json: []const u8,
+    ) schema.Validation {
+        const entry = self.findModelTool(model_name) orelse
+            return .{ .invalid = .schema_violation };
         return schema.validateArguments(
             self.allocator,
             entry.tool.input_schema_json,
             arguments_json,
             .{},
-        ) == .valid;
+        );
+    }
+
+    /// Evaluate Skill MCP rules against canonical server/tool identity. The
+    /// provider alias is never a policy identity. Every layer intersects its
+    /// parent: a non-empty allow list must explicitly select this MCP tool,
+    /// while any matching deny removes it.
+    pub fn allowsSkillRestrictions(
+        self: *const View,
+        model_name: []const u8,
+        restrictions: []const SkillRestriction,
+    ) bool {
+        const entry = self.findModelTool(model_name) orelse return false;
+        return allowsEntrySkillRestrictions(entry, restrictions);
     }
 };
+
+fn allowsEntrySkillRestrictions(
+    entry: *const Entry,
+    restrictions: []const SkillRestriction,
+) bool {
+    for (restrictions) |restriction| {
+        if (restriction.allowed.len != 0 and
+            !anyMcpRuleMatches(restriction.allowed, entry))
+            return false;
+        if (anyMcpRuleMatches(restriction.disallowed, entry)) return false;
+    }
+    return true;
+}
 
 pub const Environment = struct {
     allocator: std.mem.Allocator,
@@ -181,6 +248,8 @@ pub const Environment = struct {
     base_definitions: []const core.json.ToolDefinition,
     base_dispatcher: core.tools.ToolDispatcher,
     base_policy: ?core.tools.ToolExecutionPolicy,
+    skill_restrictions: []const SkillRestriction,
+    entries: []const *const Entry,
     definitions: []core.json.ToolDefinition,
 
     pub fn init(
@@ -190,12 +259,39 @@ pub const Environment = struct {
         base_dispatcher: core.tools.ToolDispatcher,
         base_policy: ?core.tools.ToolExecutionPolicy,
     ) Error!Environment {
+        return initRestricted(
+            allocator,
+            view,
+            base_definitions,
+            base_dispatcher,
+            base_policy,
+            &.{},
+        );
+    }
+
+    pub fn initRestricted(
+        allocator: std.mem.Allocator,
+        view: *const View,
+        base_definitions: []const core.json.ToolDefinition,
+        base_dispatcher: core.tools.ToolDispatcher,
+        base_policy: ?core.tools.ToolExecutionPolicy,
+        skill_restrictions: []const SkillRestriction,
+    ) Error!Environment {
+        const admitted_at_ns = view.snapshot.now();
+        var admitted: std.ArrayList(*const Entry) = .empty;
+        defer admitted.deinit(allocator);
+        for (view.entries) |*entry| {
+            if (!entry.server.isFreshAt(admitted_at_ns)) continue;
+            admitted.append(allocator, entry) catch return error.OutOfMemory;
+        }
+        const entries = admitted.toOwnedSlice(allocator) catch return error.OutOfMemory;
+        errdefer allocator.free(entries);
         const definitions = allocator.alloc(
             core.json.ToolDefinition,
-            base_definitions.len + view.entries.len,
+            base_definitions.len + entries.len,
         ) catch return error.OutOfMemory;
         @memcpy(definitions[0..base_definitions.len], base_definitions);
-        for (view.entries, definitions[base_definitions.len..]) |entry, *definition|
+        for (entries, definitions[base_definitions.len..]) |entry, *definition|
             definition.* = entry.prepared.definition;
         return .{
             .allocator = allocator,
@@ -203,13 +299,45 @@ pub const Environment = struct {
             .base_definitions = base_definitions,
             .base_dispatcher = base_dispatcher,
             .base_policy = base_policy,
+            .skill_restrictions = skill_restrictions,
+            .entries = entries,
             .definitions = definitions,
         };
     }
 
     pub fn deinit(self: *Environment) void {
+        self.allocator.free(self.entries);
         self.allocator.free(self.definitions);
         self.* = undefined;
+    }
+
+    pub fn findModelTool(self: *const Environment, name: []const u8) ?*const Entry {
+        for (self.entries) |entry|
+            if (std.mem.eql(u8, entry.model_name, name)) return entry;
+        return null;
+    }
+
+    pub fn validatesInvocation(
+        self: *const Environment,
+        name: []const u8,
+        arguments_json: []const u8,
+    ) bool {
+        return self.validateInvocation(name, arguments_json) == .valid;
+    }
+
+    pub fn validateInvocation(
+        self: *const Environment,
+        name: []const u8,
+        arguments_json: []const u8,
+    ) schema.Validation {
+        const entry = self.findModelTool(name) orelse
+            return .{ .invalid = .schema_violation };
+        return schema.validateArguments(
+            self.allocator,
+            entry.tool.input_schema_json,
+            arguments_json,
+            .{},
+        );
     }
 
     pub fn surface(self: *const Environment) core.agent_session.RunToolSurface {
@@ -241,10 +369,16 @@ pub const Environment = struct {
         arguments_json: []const u8,
     ) anyerror!core.tools.ToolDispatchOutcome {
         const self: *const Environment = @ptrCast(@alignCast(raw));
-        const entry = self.view.findModelTool(name) orelse
+        const entry = self.findModelTool(name) orelse
             return self.base_dispatcher.dispatch(tool_ctx, name, arguments_json);
-        if (!self.view.validatesInvocation(name, arguments_json))
-            return .{ .host_rejected = try tool_ctx.allocator.dupe(u8, "MCP arguments violate the admitted schema") };
+        switch (self.validateInvocation(name, arguments_json)) {
+            .valid => {},
+            .invalid => |issue| switch (issue) {
+                .resource_limit => return error.ResourceLimit,
+                .invalid_json, .schema_violation => return .{ .host_rejected = try tool_ctx.allocator.dupe(u8, "MCP arguments violate the admitted schema") },
+            },
+            .out_of_memory => return error.OutOfMemory,
+        }
         const cancellation = runtime.Cancellation{
             .ctx = if (tool_ctx.abort) |abort| abort else null,
             .is_cancelled_fn = abortAdapter,
@@ -274,7 +408,7 @@ pub const Environment = struct {
 
     fn prefetchSafe(raw: *const anyopaque, name: []const u8) bool {
         const self: *const Environment = @ptrCast(@alignCast(raw));
-        if (self.view.findModelTool(name) != null) return false;
+        if (self.findModelTool(name) != null) return false;
         return self.base_dispatcher.prefetchSafe(name);
     }
 
@@ -282,29 +416,40 @@ pub const Environment = struct {
         const self: *const Environment = @ptrCast(@alignCast(raw));
         if (index < self.base_definitions.len) return self.base_dispatcher.nameAt(index);
         const mcp_index = index - self.base_definitions.len;
-        if (mcp_index >= self.view.entries.len) return null;
-        return self.view.entries[mcp_index].model_name;
+        if (mcp_index >= self.entries.len) return null;
+        return self.entries[mcp_index].model_name;
     }
 
     fn hostSync(raw: *const anyopaque, name: []const u8) bool {
         const self: *const Environment = @ptrCast(@alignCast(raw));
-        if (self.view.findModelTool(name) != null) return false;
+        if (self.findModelTool(name) != null) return false;
         return self.base_dispatcher.isHostSync(name);
     }
 
     fn allowsTool(raw: *const anyopaque, name: []const u8) bool {
         const self: *const Environment = @ptrCast(@alignCast(raw));
-        if (self.view.findModelTool(name) != null)
-            return if (self.base_policy) |policy| policy.allowsTool(name) else true;
+        if (self.findModelTool(name)) |entry|
+            return allowsEntrySkillRestrictions(entry, self.skill_restrictions) and
+                if (self.base_policy) |policy| policy.allowsTool(name) else true;
         return if (self.base_policy) |policy| policy.allowsTool(name) else true;
     }
 
     fn allowsInvocation(raw: *const anyopaque, name: []const u8, arguments_json: []const u8) bool {
         const self: *const Environment = @ptrCast(@alignCast(raw));
-        if (self.view.findModelTool(name) != null) {
+        if (self.findModelTool(name)) |entry| {
+            if (!allowsEntrySkillRestrictions(entry, self.skill_restrictions))
+                return false;
             if (self.base_policy) |policy|
                 if (!policy.allowsInvocation(name, arguments_json)) return false;
-            return self.view.validatesInvocation(name, arguments_json);
+            // Preserve the ordinary schema-deny fast path, but let typed
+            // resource/OOM failures reach dispatch. Collapsing those failures
+            // into this bool would misreport infrastructure failure as user
+            // denial.
+            return switch (self.validateInvocation(name, arguments_json)) {
+                .valid => true,
+                .invalid => |issue| issue == .resource_limit,
+                .out_of_memory => true,
+            };
         }
         return if (self.base_policy) |policy|
             policy.allowsInvocation(name, arguments_json)
@@ -343,24 +488,28 @@ pub fn deriveModelName(
     return result;
 }
 
-fn selectionFingerprint(entries: []const Entry) [32]u8 {
-    var digests: [1024][32]u8 = undefined;
-    std.debug.assert(entries.len <= digests.len);
-    for (entries, digests[0..entries.len]) |entry, *digest| {
+fn selectionFingerprint(
+    allocator: std.mem.Allocator,
+    entries: []const Entry,
+) error{OutOfMemory}![32]u8 {
+    const digests = allocator.alloc([32]u8, entries.len) catch
+        return error.OutOfMemory;
+    defer allocator.free(digests);
+    for (entries, digests) |entry, *digest| {
         var hasher = std.crypto.hash.sha2.Sha256.init(.{});
         hasher.update(&entry.tool.identity.server_binding_identity);
         hasher.update(entry.tool.identity.name);
         hasher.update(&entry.tool.identity.schema_fingerprint);
         hasher.final(digest);
     }
-    std.mem.sort([32]u8, digests[0..entries.len], {}, struct {
+    std.mem.sort([32]u8, digests, {}, struct {
         fn lessThan(_: void, left: [32]u8, right: [32]u8) bool {
             return std.mem.order(u8, &left, &right) == .lt;
         }
     }.lessThan);
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("agentcore-r6-mcp-session-selection\x00");
-    for (digests[0..entries.len]) |digest| hasher.update(&digest);
+    for (digests) |digest| hasher.update(&digest);
     var result: [32]u8 = undefined;
     hasher.final(&result);
     return result;
@@ -395,6 +544,30 @@ fn encodeFailure(
     return std.json.Stringify.valueAlloc(allocator, dto, .{}) catch error.OutOfMemory;
 }
 
+fn anyMcpRuleMatches(rules: []const []const u8, entry: *const Entry) bool {
+    for (rules) |rule| if (mcpRuleMatches(rule, entry)) return true;
+    return false;
+}
+
+/// Canonical interpretation of the existing Skill/Permission authoring
+/// vocabulary. Namespace uniqueness is enforced by the Runtime catalog;
+/// binding identity remains attached to `entry` and is never inferred from
+/// the author-facing namespace.
+fn mcpRuleMatches(rule: []const u8, entry: *const Entry) bool {
+    const prefix = "mcp__";
+    if (!std.mem.startsWith(u8, rule, prefix)) return false;
+    const remainder = rule[prefix.len..];
+    if (remainder.len == 0) return false;
+    const separator = std.mem.indexOf(u8, remainder, "__") orelse
+        return std.mem.eql(u8, remainder, entry.server.namespace);
+    const namespace = remainder[0..separator];
+    const tool = remainder[separator + 2 ..];
+    if (!std.mem.eql(u8, namespace, entry.server.namespace) or tool.len == 0)
+        return false;
+    return std.mem.eql(u8, tool, "*") or
+        std.mem.eql(u8, tool, entry.tool.identity.name);
+}
+
 test "model-facing MCP name is stable bounded and does not expose raw tool name" {
     const binding = [_]u8{4} ** 32;
     const first = try deriveModelName(std.testing.allocator, "weather", &binding, "get forecast/unsafe");
@@ -405,6 +578,89 @@ test "model-facing MCP name is stable bounded and does not expose raw tool name"
     try std.testing.expect(first.len <= MAX_MODEL_TOOL_NAME_BYTES);
     try std.testing.expect(std.mem.startsWith(u8, first, "mcp__weather__"));
     try std.testing.expect(std.mem.indexOf(u8, first, "forecast") == null);
+}
+
+test "Skill MCP rules resolve opaque aliases through canonical identity" {
+    const fixture = @import("mcp_test_support.zig");
+    var server = fixture.Server{};
+    const binding = [_]u8{0x64} ** 32;
+    const specs = [_]catalog.ServerSpec{.{
+        .binding = binding,
+        .namespace = "weather",
+        .connector = server.connector(),
+        .transport = .stdio,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    }};
+    var manager = try catalog.Manager.init(std.testing.allocator, &specs, .{});
+    defer manager.deinit();
+    _ = try manager.refresh();
+    const snapshot = try manager.retainCurrent();
+    defer snapshot.release();
+    var view = try View.init(std.testing.allocator, snapshot, &.{.{
+        .server_binding_identity = binding,
+        .tool_name = "weather",
+    }}, .fresh);
+    defer view.deinit();
+    const alias = view.entries[0].model_name;
+    try std.testing.expect(std.mem.startsWith(u8, alias, "mcp__weather__"));
+    try std.testing.expect(view.allowsSkillRestrictions(alias, &.{.{
+        .allowed = &.{"mcp__weather__weather"},
+        .disallowed = &.{},
+    }}));
+    try std.testing.expect(view.allowsSkillRestrictions(alias, &.{.{
+        .allowed = &.{"mcp__weather__*"},
+        .disallowed = &.{},
+    }}));
+    try std.testing.expect(!view.allowsSkillRestrictions(alias, &.{.{
+        .allowed = &.{"Read"},
+        .disallowed = &.{},
+    }}));
+    try std.testing.expect(!view.allowsSkillRestrictions(alias, &.{.{
+        .allowed = &.{"mcp__weather"},
+        .disallowed = &.{"mcp__weather__weather"},
+    }}));
+    const rule_name = try view.entries[0].permissionRuleName(std.testing.allocator);
+    defer std.testing.allocator.free(rule_name);
+    try std.testing.expectEqualStrings("weather__weather", rule_name);
+}
+
+test "Session MCP view never auto-selects wider Runtime authority" {
+    const fixture = @import("mcp_test_support.zig");
+    var weather = fixture.Server{ .tool_name = "weather" };
+    var calendar = fixture.Server{ .tool_name = "events" };
+    const weather_binding = [_]u8{0x65} ** 32;
+    const calendar_binding = [_]u8{0x66} ** 32;
+    const specs = [_]catalog.ServerSpec{
+        .{
+            .binding = weather_binding,
+            .namespace = "weather",
+            .connector = weather.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+        },
+        .{
+            .binding = calendar_binding,
+            .namespace = "calendar",
+            .connector = calendar.connector(),
+            .transport = .stdio,
+            .client = .{ .name = "agentcore-test", .version = "1" },
+        },
+    };
+    var manager = try catalog.Manager.init(std.testing.allocator, &specs, .{});
+    defer manager.deinit();
+    _ = try manager.refresh();
+    const snapshot = try manager.retainCurrent();
+    defer snapshot.release();
+
+    var view = try View.init(std.testing.allocator, snapshot, &.{.{
+        .server_binding_identity = weather_binding,
+        .tool_name = "weather",
+    }}, .fresh);
+    defer view.deinit();
+    try std.testing.expectEqual(@as(usize, 1), view.entries.len);
+    try std.testing.expect(view.findCanonicalTool(&weather_binding, "weather") != null);
+    try std.testing.expect(view.findCanonicalTool(&calendar_binding, "events") == null);
+    try std.testing.expectEqual(@as(u32, 0), view.invalidated);
 }
 
 test "Session MCP view binds canonical identity validates before dispatch and retains its generation" {
@@ -540,6 +796,110 @@ test "Session MCP view binds canonical identity validates before dispatch and re
     try std.testing.expectEqualStrings(model_name, second.entries[0].model_name);
     try std.testing.expectEqual(@as(u64, 1), first.catalog_generation);
     try std.testing.expectEqual(@as(u64, 2), second.catalog_generation);
+}
+
+test "MCP expiry excludes new Runs without mutating an admitted Run environment" {
+    const fixture = @import("mcp_test_support.zig");
+    const FakeClock = struct {
+        now_ns: core.util_time.Nanos,
+
+        fn read(raw: ?*const anyopaque) core.util_time.Nanos {
+            const self: *const @This() = @ptrCast(@alignCast(raw.?));
+            return self.now_ns;
+        }
+
+        fn value(self: *const @This()) catalog.Clock {
+            return .{ .ctx = self, .now_fn = read };
+        }
+    };
+    const Base = struct {
+        fn dispatch(
+            _: *const anyopaque,
+            _: *const core.tool_context.ToolContext,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror!core.tools.ToolDispatchOutcome {
+            return .host_fatal;
+        }
+        fn no(_: *const anyopaque, _: []const u8) bool {
+            return false;
+        }
+        fn name(_: *const anyopaque, _: usize) ?[]const u8 {
+            return null;
+        }
+        fn dispatcher() core.tools.ToolDispatcher {
+            return .{
+                .ctx = &unit,
+                .dispatchFn = dispatch,
+                .prefetchSafeFn = no,
+                .nameAtFn = name,
+                .hostSyncFn = no,
+            };
+        }
+        const unit: u8 = 0;
+    };
+
+    var clock = FakeClock{ .now_ns = 100 * std.time.ns_per_s };
+    var server = fixture.Server{};
+    const binding = [_]u8{0x72} ** 32;
+    const specs = [_]catalog.ServerSpec{.{
+        .binding = binding,
+        .namespace = "weather",
+        .connector = server.connector(),
+        .transport = .stdio,
+        .client = .{ .name = "agentcore-test", .version = "1" },
+    }};
+    var manager = try catalog.Manager.initWithClock(
+        std.testing.allocator,
+        &specs,
+        .{},
+        clock.value(),
+    );
+    defer manager.deinit();
+    _ = try manager.refresh();
+    const snapshot = try manager.retainCurrent();
+    defer snapshot.release();
+    const selectors = [_]Selector{.{
+        .server_binding_identity = binding,
+        .tool_name = "weather",
+    }};
+    var view = try View.init(std.testing.allocator, snapshot, &selectors, .fresh);
+    defer view.deinit();
+    const model_name = view.entries[0].model_name;
+    var admitted = try Environment.init(
+        std.testing.allocator,
+        &view,
+        &.{},
+        Base.dispatcher(),
+        null,
+    );
+    defer admitted.deinit();
+    try std.testing.expect(admitted.findModelTool(model_name) != null);
+
+    clock.now_ns += 1001 * std.time.ns_per_ms;
+    try std.testing.expect(admitted.findModelTool(model_name) != null);
+    var after_expiry = try Environment.init(
+        std.testing.allocator,
+        &view,
+        &.{},
+        Base.dispatcher(),
+        null,
+    );
+    defer after_expiry.deinit();
+    try std.testing.expect(after_expiry.findModelTool(model_name) == null);
+    try std.testing.expectError(
+        error.NotRefreshed,
+        View.init(std.testing.allocator, snapshot, &selectors, .fresh),
+    );
+    var degraded = try View.init(
+        std.testing.allocator,
+        snapshot,
+        &selectors,
+        .restore_degraded,
+    );
+    defer degraded.deinit();
+    try std.testing.expectEqual(@as(usize, 0), degraded.entries.len);
+    try std.testing.expectEqual(@as(u32, 1), degraded.invalidated);
 }
 
 test "modern and legacy peers enter the same Session identity and dispatch seam" {

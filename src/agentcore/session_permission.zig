@@ -459,6 +459,58 @@ pub const State = struct {
         return invalidated;
     }
 
+    /// Build the post-invalidation rule set without mutating the live Session.
+    /// The AgentCore facade publishes this prepared value only after every
+    /// other authority replacement and durable-budget check has succeeded.
+    pub fn prepareInvalidation(
+        self: *State,
+        namespace: ToolNamespace,
+        resolver: ExternalIdentityResolver,
+    ) Error!PreparedInvalidation {
+        std.debug.assert(namespace != .builtin);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var replacement = try State.init(self.allocator, self.policy_generation);
+        errdefer replacement.deinit();
+        var invalidated: u32 = 0;
+        for (self.rules.items) |rule| {
+            const tool = ToolIdentity{
+                .namespace = rule.namespace,
+                .name = rule.tool_name,
+                .binding = rule.binding,
+            };
+            if (rule.namespace == namespace and !resolver.isResolvable(tool)) {
+                invalidated += 1;
+                continue;
+            }
+            _ = try replacement.remember(
+                if (rule.action == .allow) .allow_session else .deny_session,
+                .{
+                    .rule_id = rule.rule_id,
+                    .tool = tool,
+                    .arguments_digest = rule.arguments_digest,
+                },
+                self.policy_generation,
+            );
+        }
+        return .{
+            .state = replacement,
+            .invalidated = invalidated,
+        };
+    }
+
+    /// Infallible publication of a fully prepared rule set. Keep the live
+    /// mutex and allocator in place so readers never observe a moved lock.
+    /// `replacement` receives the old rules and can be deinitialized after
+    /// the surrounding facade transaction has published its other fields.
+    pub fn commitPrepared(self: *State, replacement: *State) void {
+        std.debug.assert(self.policy_generation == replacement.policy_generation);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        std.mem.swap(std.ArrayList(SessionRule), &self.rules, &replacement.rules);
+    }
+
     fn matchingRule(
         self: *State,
         action: SessionRuleAction,
@@ -475,6 +527,27 @@ pub const State = struct {
         return null;
     }
 };
+
+pub const PreparedInvalidation = struct {
+    state: State,
+    invalidated: u32,
+
+    pub fn deinit(self: *PreparedInvalidation) void {
+        self.state.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Exact canonical checkpoint growth of one newly remembered Session rule.
+/// Callers use it to reserve durable bytes before publishing the rule.
+pub fn checkpointRuleDeltaBytes(tool: ToolIdentity) Error!u64 {
+    try tool.validate();
+    return std.math.add(
+        u64,
+        checkpoint_rule_bytes,
+        tool.name.len,
+    ) catch error.ResourceLimit;
+}
 
 pub const DurableRule = struct {
     action: SessionRuleAction,
@@ -1896,7 +1969,10 @@ test "Revision 6 Permission checkpoint restores compatible rules or starts a new
         &decoded,
         .default,
         fingerprint,
-        &.{ "Bash", "Write" },
+        // Current authority is deliberately wider than the checkpoint. Only
+        // persisted Session rules may be reconstructed; newly available Edit
+        // authority remains governed by the current fallback/rules.
+        &.{ "Bash", "Write", "Edit" },
     );
     defer compatible.deinit();
     try std.testing.expect(compatible.fingerprint_compatible);
@@ -1916,6 +1992,15 @@ test "Revision 6 Permission checkpoint restores compatible rules or starts a new
         .{ .decision = .allow, .source = .mode_fallback },
     );
     try std.testing.expectEqual(Decision.deny, decision.decision);
+    decision = try compatible.state.?.decide(
+        .{ .namespace = .builtin, .name = "Edit" },
+        [_]u8{0x73} ** ARGUMENT_DIGEST_BYTES,
+        .undecided,
+        .{ .decision = .ask, .source = .mode_fallback },
+    );
+    try std.testing.expectEqual(Decision.ask, decision.decision);
+    try std.testing.expect(!decision.used_session_rule);
+    try std.testing.expect(decision.matched_rule_id == null);
 
     var incompatible = try reconcileCheckpoint(
         allocator,
