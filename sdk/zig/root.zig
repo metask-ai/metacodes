@@ -11,6 +11,9 @@ pub const DecodedCoreEvent = protocol.DecodedCoreEvent;
 pub const UnknownCoreEvent = protocol.UnknownCoreEvent;
 pub const UiRequest = protocol.UiRequest;
 pub const UiResponse = protocol.UiResponse;
+pub const PermissionRequest = protocol.PermissionRequest;
+pub const PermissionResponse = protocol.PermissionResponse;
+pub const PermissionProvenance = protocol.PermissionProvenance;
 pub const SkillCatalog = protocol.SkillCatalog;
 pub const SkillDescriptor = protocol.SkillDescriptor;
 pub const SkillArgumentSchema = protocol.SkillArgumentSchema;
@@ -18,9 +21,15 @@ pub const SkillCatalogIssue = protocol.SkillCatalogIssue;
 pub const SkillCatalogHealth = protocol.SkillCatalogHealth;
 pub const SkillCatalogIssueCode = protocol.SkillCatalogIssueCode;
 pub const SkillSourceScope = protocol.SkillSourceScope;
+pub const McpCatalog = protocol.McpCatalog;
+pub const SessionDescription = protocol.SessionDescription;
+pub const RestoreReport = protocol.RestoreReport;
 pub const ParsedCoreEvent = protocol.ParsedCoreEvent;
 pub const ParsedUiRequest = protocol.ParsedUiRequest;
 pub const ParsedSkillCatalog = protocol.ParsedSkillCatalog;
+pub const ParsedMcpCatalog = protocol.ParsedMcpCatalog;
+pub const ParsedSessionDescription = protocol.ParsedSessionDescription;
+pub const ParsedRestoreReport = protocol.ParsedRestoreReport;
 pub const DecodeError = protocol.DecodeError;
 pub const EncodeError = protocol.EncodeError;
 pub const SkillCatalogDecodeError = protocol.SkillCatalogDecodeError;
@@ -28,14 +37,22 @@ pub const SkillArgumentsEncodeError = protocol.SkillArgumentsEncodeError;
 pub const decodeCoreEvent = protocol.decodeCoreEvent;
 pub const decodeUiRequest = protocol.decodeUiRequest;
 pub const decodeSkillCatalog = protocol.decodeSkillCatalog;
+pub const decodeMcpCatalog = protocol.decodeMcpCatalog;
+pub const decodeSessionDescription = protocol.decodeSessionDescription;
+pub const decodeRestoreReport = protocol.decodeRestoreReport;
 pub const encodeUiResponse = protocol.encodeUiResponse;
 pub const encodeSkillArguments = protocol.encodeSkillArguments;
 
 comptime {
     if (protocol.MAX_SKILL_CATALOG_SKILLS_V1 != types.MAX_SKILL_CATALOG_SKILLS_V1 or
         protocol.MAX_SKILL_ARGUMENT_VALUES_V1 != types.MAX_SKILL_ARGUMENT_VALUES_V1 or
-        protocol.MAX_SKILL_ARGUMENT_JSON_BYTES_V1 != types.MAX_SKILL_ARGUMENT_JSON_BYTES_V1)
-        @compileError("Skill JSON codec limits must match the raw ABI contract");
+        protocol.MAX_SKILL_ARGUMENT_JSON_BYTES_V1 != types.MAX_SKILL_ARGUMENT_JSON_BYTES_V1 or
+        protocol.MAX_DESCRIPTION_JSON_BYTES_V1 != types.MAX_DESCRIPTION_JSON_BYTES_V1 or
+        protocol.MAX_MCP_SERVERS_V1 != types.MAX_MCP_SERVERS_V1 or
+        protocol.MAX_MCP_TOOLS_V1 != types.MAX_MCP_TOOLS_V1 or
+        protocol.MAX_AUTHORITY_ISSUES_V1 != types.MAX_MCP_CATALOG_ISSUES_V1 or
+        protocol.MAX_PERMISSION_ARGUMENT_JSON_BYTES_V1 != types.MAX_PERMISSION_ARGUMENT_JSON_BYTES_V1)
+        @compileError("JSON codec limits must match the raw ABI contract");
 }
 
 pub extern fn metask_agentcore_get_api(requested_abi: u32) callconv(.c) ?*const anyopaque;
@@ -89,11 +106,15 @@ pub const Api = struct {
             !allZero(raw.reserved) or
             raw.runtime_create == null or raw.runtime_destroy == null or
             raw.runtime_query_skill_catalog == null or raw.skill_catalog_release == null or
+            raw.runtime_refresh_mcp == null or raw.runtime_describe_mcp == null or
+            raw.session_restore == null or raw.session_describe == null or
             raw.session_create == null or raw.session_destroy == null or
             raw.session_set_model == null or raw.session_update_skills == null or
-            raw.session_update_permission_rules == null or raw.session_run_input == null or
+            raw.session_update_permission_rules == null or raw.session_update_mcp == null or
+            raw.session_run_input == null or
             raw.session_abort == null or raw.session_compact == null or
-            raw.session_abort_compact == null or raw.buffer_release == null)
+            raw.session_abort_compact == null or raw.session_export_checkpoint == null or
+            raw.buffer_release == null)
             return error.UnsupportedAbi;
         return .{ .raw = raw };
     }
@@ -110,11 +131,23 @@ pub const Api = struct {
     pub fn skillCatalogRelease(self: Api) types.SkillCatalogReleaseFnV1 {
         return self.raw.skill_catalog_release.?;
     }
+    pub fn runtimeRefreshMcp(self: Api) types.RuntimeRefreshMcpFnV1 {
+        return self.raw.runtime_refresh_mcp.?;
+    }
+    pub fn runtimeDescribeMcp(self: Api) types.RuntimeDescribeMcpFnV1 {
+        return self.raw.runtime_describe_mcp.?;
+    }
     pub fn sessionCreate(self: Api) types.SessionCreateFnV1 {
         return self.raw.session_create.?;
     }
+    pub fn sessionRestore(self: Api) types.SessionRestoreFnV1 {
+        return self.raw.session_restore.?;
+    }
     pub fn sessionDestroy(self: Api) types.SessionDestroyFnV1 {
         return self.raw.session_destroy.?;
+    }
+    pub fn sessionDescribe(self: Api) types.SessionDescribeFnV1 {
+        return self.raw.session_describe.?;
     }
     pub fn sessionSetModel(self: Api) types.SessionSetModelFnV1 {
         return self.raw.session_set_model.?;
@@ -124,6 +157,9 @@ pub const Api = struct {
     }
     pub fn sessionUpdatePermissionRules(self: Api) types.SessionUpdatePermissionRulesFnV1 {
         return self.raw.session_update_permission_rules.?;
+    }
+    pub fn sessionUpdateMcp(self: Api) types.SessionUpdateMcpFnV1 {
+        return self.raw.session_update_mcp.?;
     }
     pub fn sessionRunInput(self: Api) types.SessionRunInputFnV1 {
         return self.raw.session_run_input.?;
@@ -193,6 +229,9 @@ pub const Api = struct {
     pub fn sessionAbortCompact(self: Api) types.SessionAbortCompactFnV1 {
         return self.raw.session_abort_compact.?;
     }
+    pub fn sessionExportCheckpoint(self: Api) types.SessionExportCheckpointFnV1 {
+        return self.raw.session_export_checkpoint.?;
+    }
     pub fn bufferRelease(self: Api) types.BufferReleaseFnV1 {
         return self.raw.buffer_release.?;
     }
@@ -227,20 +266,20 @@ test "RunContext validator bounds length before pointer slicing" {
     try std.testing.expectEqualStrings(id, valid.session_id);
 }
 
-test "Revision 5 SDK rejects the Revision 4 table from the stable prefix" {
-    const Revision4Api = extern struct {
+test "Revision 6 SDK rejects the Revision 5 table from the stable prefix" {
+    const Revision5Api = extern struct {
         struct_size: u32,
         abi_version: u32,
         abi_revision: u32,
         reserved0: u32,
         capabilities: u64,
-        tail: [112]u8,
+        tail: [144]u8,
     };
-    var legacy: Revision4Api align(@alignOf(types.ApiV1)) =
-        std.mem.zeroes(Revision4Api);
-    legacy.struct_size = @sizeOf(Revision4Api);
+    var legacy: Revision5Api align(@alignOf(types.ApiV1)) =
+        std.mem.zeroes(Revision5Api);
+    legacy.struct_size = @sizeOf(Revision5Api);
     legacy.abi_version = types.ABI_VERSION_V1;
-    legacy.abi_revision = 4;
+    legacy.abi_revision = 5;
     const raw: *const types.ApiV1 = @ptrCast(&legacy);
     try std.testing.expectError(error.UnsupportedAbi, Api.validate(raw));
 }

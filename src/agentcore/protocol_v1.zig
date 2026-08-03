@@ -116,8 +116,10 @@ pub fn encodeUiRequest(allocator: std.mem.Allocator, request: *const InternalUiR
             }
             break :blk .{ .ask_question = out };
         },
-        .permission => |v| .{ .permission = .{ .tool = v.tool, .args = v.args } },
-        .plan_approval, .custom => return error.UnsupportedUiRequest,
+        // Revision 6 Permission is encoded by session_permission.zig because
+        // it requires Session/Run/request/generation identities unavailable
+        // in this presentation-only Core request.
+        .permission, .plan_approval, .custom => return error.UnsupportedUiRequest,
     };
     return std.json.Stringify.valueAlloc(allocator, mapped, .{});
 }
@@ -158,16 +160,7 @@ pub fn decodeUiResponse(
             },
             else => return error.InvalidUiResponse,
         },
-        .permission => switch (parsed.value) {
-            .permission => |choice| out.* = .{ .permission = switch (choice) {
-                .allow_once => .allow_once,
-                .allow_session => .allow_always,
-                .deny_once => .deny_once,
-                .deny_session => .deny_tool_session,
-            } },
-            else => return error.InvalidUiResponse,
-        },
-        .plan_approval, .custom => return error.UnsupportedUiRequest,
+        .permission, .plan_approval, .custom => return error.UnsupportedUiRequest,
     }
 }
 

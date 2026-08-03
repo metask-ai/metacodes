@@ -7,12 +7,15 @@ pub const session_authority = @import("session_authority.zig");
 pub const session_permission = @import("session_permission.zig");
 pub const mcp_protocol = @import("mcp_protocol.zig");
 pub const mcp_catalog = @import("mcp_catalog.zig");
+pub const mcp_runtime = @import("mcp_runtime.zig");
+pub const mcp_negotiation = @import("mcp_negotiation.zig");
 pub const mcp_session = @import("mcp_session.zig");
 pub const mcp_checkpoint = @import("mcp_checkpoint.zig");
 pub const mcp_canonical = @import("mcp_canonical.zig");
 const builtin = @import("builtin");
 const sync = @import("platform").sync;
 const wire = @import("metask_agentcore_types");
+const public_protocol = @import("metask_agentcore_protocol");
 const core = @import("metacodes-core");
 const ui_request = core.protocol.ui_request;
 pub const protocol_v1 = @import("protocol_v1.zig");
@@ -125,9 +128,175 @@ const AbiHostTool = struct {
     }
 };
 
+const AbiMcpConnector = struct {
+    descriptor: wire.McpConnectorV1,
+    max_frame_bytes: u64,
+    timeout_ms: u32,
+
+    fn connector(self: *AbiMcpConnector) mcp_runtime.Connector {
+        return .{ .ctx = self, .open_fn = open };
+    }
+
+    fn open(
+        raw: *anyopaque,
+        purpose: mcp_runtime.ConnectionPurpose,
+        era: mcp_canonical.Era,
+    ) anyerror!mcp_runtime.OpenOutcome {
+        const self: *AbiMcpConnector = @ptrCast(@alignCast(raw));
+        const callback = self.descriptor.open orelse return error.InvalidConnector;
+        var connection_ctx: ?*anyopaque = null;
+        const status = callback(
+            self.descriptor.ctx,
+            switch (purpose) {
+                .disposable_probe => wire.MCP_CONNECTION_DISPOSABLE_PROBE,
+                .actual => wire.MCP_CONNECTION_ACTUAL,
+            },
+            switch (era) {
+                .modern_2026_07_28 => wire.MCP_ERA_2026_07_28,
+                .legacy_2025_11_25 => wire.MCP_ERA_2025_11_25,
+            },
+            self.timeout_ms,
+            &connection_ctx,
+        );
+        if (status == wire.MCP_OPEN_OK) {
+            const host_connection = connection_ctx orelse
+                return error.InvalidConnectorResponse;
+            const connection = allocator.create(AbiMcpConnection) catch {
+                self.descriptor.close.?(self.descriptor.ctx, host_connection);
+                return error.OutOfMemory;
+            };
+            connection.* = .{
+                .connector = self,
+                .host_connection = host_connection,
+            };
+            return .{ .connection = connection.interface() };
+        }
+        if (connection_ctx) |unexpected| {
+            self.descriptor.close.?(self.descriptor.ctx, unexpected);
+            return error.InvalidConnectorResponse;
+        }
+        return switch (status) {
+            wire.MCP_OPEN_TIMEOUT => .timeout,
+            wire.MCP_OPEN_NETWORK_ERROR => .network_error,
+            wire.MCP_OPEN_AUTH_ERROR => .auth_error,
+            wire.MCP_OPEN_SERVER_ERROR => .server_error,
+            wire.MCP_OPEN_CHILD_EXIT => .child_exit,
+            else => error.HostConnectorFatal,
+        };
+    }
+};
+
+const AbiMcpConnection = struct {
+    connector: *AbiMcpConnector,
+    host_connection: *anyopaque,
+
+    fn interface(self: *AbiMcpConnection) mcp_runtime.Connection {
+        return .{
+            .ctx = self,
+            .request_fn = request,
+            .notify_fn = notify,
+            .close_fn = close,
+        };
+    }
+
+    fn request(
+        raw: *anyopaque,
+        response_allocator: std.mem.Allocator,
+        request_json: []const u8,
+        timeout_ms: u32,
+        cancellation: mcp_runtime.Cancellation,
+    ) anyerror!mcp_runtime.ExchangeOutcome {
+        const self: *AbiMcpConnection = @ptrCast(@alignCast(raw));
+        var cancellation_copy = cancellation;
+        const public_cancellation = wire.McpCancellationV1{
+            .struct_size = @sizeOf(wire.McpCancellationV1),
+            .reserved0 = 0,
+            .ctx = &cancellation_copy,
+            .is_cancelled = cancellationPoll,
+            .reserved = [_]u64{0} ** 2,
+        };
+        var response = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
+        const status = self.connector.descriptor.request.?(
+            self.connector.descriptor.ctx,
+            self.host_connection,
+            view(request_json),
+            timeout_ms,
+            &public_cancellation,
+            &response,
+        );
+        defer if (hasReleaseToken(response))
+            self.connector.descriptor.release_response.?(
+                self.connector.descriptor.ctx,
+                self.host_connection,
+                &response,
+            );
+        if (!canonicalOwned(response)) return error.InvalidConnectorResponse;
+        if (status == wire.MCP_EXCHANGE_RESPONSE) {
+            if (response.len == 0 or response.len > self.connector.max_frame_bytes)
+                return error.InvalidConnectorResponse;
+            const source = try ownedSlice(response);
+            const copied = response_allocator.dupe(u8, source) catch
+                return error.OutOfMemory;
+            return .{ .response = copied };
+        }
+        if (response.len != 0) return error.InvalidConnectorResponse;
+        return switch (status) {
+            wire.MCP_EXCHANGE_TIMEOUT => .timeout,
+            wire.MCP_EXCHANGE_NETWORK_ERROR => .network_error,
+            wire.MCP_EXCHANGE_AUTH_ERROR => .auth_error,
+            wire.MCP_EXCHANGE_SERVER_ERROR => .server_error,
+            wire.MCP_EXCHANGE_CHILD_EXIT => .child_exit,
+            wire.MCP_EXCHANGE_CANCELLED => .cancelled,
+            wire.MCP_EXCHANGE_INDETERMINATE => .indeterminate,
+            else => error.HostConnectorFatal,
+        };
+    }
+
+    fn notify(
+        raw: *anyopaque,
+        notification_json: []const u8,
+        timeout_ms: u32,
+        cancellation: mcp_runtime.Cancellation,
+    ) anyerror!void {
+        const self: *AbiMcpConnection = @ptrCast(@alignCast(raw));
+        var cancellation_copy = cancellation;
+        const public_cancellation = wire.McpCancellationV1{
+            .struct_size = @sizeOf(wire.McpCancellationV1),
+            .reserved0 = 0,
+            .ctx = &cancellation_copy,
+            .is_cancelled = cancellationPoll,
+            .reserved = [_]u64{0} ** 2,
+        };
+        const status = self.connector.descriptor.notify.?(
+            self.connector.descriptor.ctx,
+            self.host_connection,
+            view(notification_json),
+            timeout_ms,
+            &public_cancellation,
+        );
+        if (status != wire.MCP_NOTIFY_OK) return error.HostNotifyFailed;
+    }
+
+    fn close(raw: *anyopaque) void {
+        const self: *AbiMcpConnection = @ptrCast(@alignCast(raw));
+        self.connector.descriptor.close.?(
+            self.connector.descriptor.ctx,
+            self.host_connection,
+        );
+        allocator.destroy(self);
+    }
+
+    fn cancellationPoll(raw: ?*const anyopaque) callconv(.c) u32 {
+        const cancellation: *const mcp_runtime.Cancellation =
+            @ptrCast(@alignCast(raw orelse return 1));
+        return @intFromBool(cancellation.isCancelled());
+    }
+};
+
 const AbiRuntime = struct {
     core_runtime: *core.agent_session.AgentRuntime,
     host_tools: []AbiHostTool,
+    mcp_connectors: ?[]AbiMcpConnector = null,
     catalogs: skill_catalog_handles.RuntimeCatalogs,
     materializations: skill_materialization.Manager,
     /// Populated by the Revision 6 Runtime configuration seam. Null keeps the
@@ -194,9 +363,9 @@ fn createInitialMcpView(
     selectors: []const mcp_session.Selector,
     mode: mcp_session.BuildMode,
 ) !?mcp_session.View {
+    if (selectors.len == 0) return null;
     const manager = if (runtime.mcp_manager) |*value| value else {
-        if (selectors.len != 0) return error.InvalidMcpBinding;
-        return null;
+        return error.InvalidMcpBinding;
     };
     const snapshot = try manager.retainCurrent();
     defer snapshot.release();
@@ -216,7 +385,7 @@ const AbiSession = struct {
     mcp_view: ?mcp_session.View = null,
     /// Borrowed only while one synchronous Run is admitted. Permission uses
     /// it to resolve the model-facing alias back to canonical MCP identity.
-    active_mcp_view: ?*const mcp_session.View = null,
+    active_mcp_environment: ?*const mcp_session.Environment = null,
     /// The innermost synchronous fork projector supplies exact child
     /// tool-call identity to Permission provenance. Nested forks restore the
     /// outer projector when their own scope quiesces.
@@ -248,6 +417,8 @@ const AbiSession = struct {
     permission_audit: ?session_permission.AuditTrail = null,
     permission_request_sequence: u64 = 0,
     pending_permission: ?PendingPermission = null,
+    staged_permission_provenance: ?StagedPermissionProvenance = null,
+    staged_permission_failure: u32 = wire.STATUS_OK,
     budget_state: session_budget.SessionState = .{
         .profile = .{},
     },
@@ -273,6 +444,49 @@ const AbiSession = struct {
         }
     };
 
+    /// One synchronous Permission check is followed by exactly one internal
+    /// `policy_decision` event before the loop examines the next tool.  Keep
+    /// the canonical receipt here until that existing event boundary delivers
+    /// it through AgentSession's fatal-aware EventSink.
+    const StagedPermissionProvenance = struct {
+        model_tool_name: []const u8,
+        source: session_permission.DecisionSource,
+        matched_rule_id: ?session_permission.RuleId = null,
+        session_id: core.session_id.SessionId,
+        run_id: u64,
+        /// Owned by the staged receipt. Callback requests are allocated from a
+        /// short-lived response arena, so the exact identity must be retained
+        /// until the corresponding policy event arrives.
+        tool_call_id: ?[]u8 = null,
+        request_id: ?session_permission.PermissionRequestId = null,
+        tool: session_permission.ToolIdentity,
+        arguments_digest: session_permission.ArgumentsDigest,
+        policy_generation: u64,
+        used_session_rule: bool = false,
+        callback_outcome: ?session_permission.CallbackOutcome = null,
+        response: ?session_permission.Response = null,
+        prepared_audit: ?session_permission.OwnedProvenance = null,
+    };
+
+    fn clearStagedPermission(self: *AbiSession) void {
+        if (self.staged_permission_provenance) |*staged| {
+            if (staged.tool_call_id) |owned| allocator.free(owned);
+            if (staged.prepared_audit) |*prepared| {
+                if (self.permission_audit) |*audit|
+                    audit.discard(prepared)
+                else {
+                    // The prepared receipt owns its strings independently of
+                    // the trail. Recover safely even if a future lifecycle
+                    // change violates the expected audit/staging coupling.
+                    prepared.deinit(allocator);
+                    self.recordCallbackStatus(wire.STATUS_INTERNAL_ERROR);
+                }
+            }
+        }
+        self.staged_permission_provenance = null;
+        self.staged_permission_failure = wire.STATUS_OK;
+    }
+
     fn permissionDecisionOverride(
         raw: *anyopaque,
         tool_name: []const u8,
@@ -281,15 +495,10 @@ const AbiSession = struct {
     ) ?core.permission.PermissionResult {
         const self: *AbiSession = @ptrCast(@alignCast(raw));
         self.pending_permission = null;
-        const mcp_entry = if (self.active_mcp_view) |mcp_bound|
+        const mcp_entry = if (self.active_mcp_environment) |mcp_bound|
             mcp_bound.findModelTool(tool_name)
         else
             null;
-        if (self.active_mcp_view) |mcp_bound| {
-            if (mcp_entry != null and
-                !mcp_bound.validatesInvocation(tool_name, arguments_json))
-                return .deny;
-        }
         const explicit_name_owned = if (mcp_entry) |entry|
             entry.permissionRuleName(allocator) catch return .deny
         else
@@ -302,22 +511,65 @@ const AbiSession = struct {
             arguments_json,
             .{},
         ) catch return .deny;
+        if (mcp_entry != null) {
+            const validation = self.active_mcp_environment.?.validateInvocation(
+                tool_name,
+                arguments_json,
+            );
+            switch (validation) {
+                .valid => {},
+                .invalid => |issue| {
+                    self.stagePermissionDecision(tool_name, tool, digest, .{
+                        .decision = .deny,
+                        .source = .core_safety,
+                    });
+                    if (issue == .resource_limit) {
+                        self.recordCallbackStatus(wire.STATUS_RESOURCE_LIMIT);
+                        self.staged_permission_failure = wire.STATUS_RESOURCE_LIMIT;
+                    }
+                    return .deny;
+                },
+                .out_of_memory => {
+                    self.stagePermissionDecision(tool_name, tool, digest, .{
+                        .decision = .deny,
+                        .source = .core_safety,
+                    });
+                    self.recordCallbackStatus(wire.STATUS_OUT_OF_MEMORY);
+                    self.staged_permission_failure = wire.STATUS_OUT_OF_MEMORY;
+                    return .deny;
+                },
+            }
+        }
         var match_context = self.core_session.permission_ctx.match_ctx;
         if (match_context.alloc == null)
             match_context.alloc = self.core_session.permission_ctx.allocator;
-        const explicit: session_permission.ExplicitAction = if (self.core_session.permission_ctx.settings != null)
+        const imported_decision = imported.resolved();
+        const imported_source = imported.source();
+        const shared_source: ?session_permission.DecisionSource = switch (imported_source) {
+            .core_safety => .core_safety,
+            .active_skill => .active_skill,
+            .session_memory => .session_deny,
+            .none, .settings => null,
+        };
+        const is_shared_ceiling = shared_source != null;
+        const explicit: session_permission.ExplicitAction = if (is_shared_ceiling)
+            switch (imported_decision.?) {
+                .deny => .deny,
+                .ask => .ask,
+                .allow => .allow,
+            }
+        else if (self.core_session.permission_ctx.settings != null)
             session_permission.evaluateExplicit(
                 self.core_session.permission_ctx.settings,
                 &match_context,
                 explicit_name,
                 arguments_json,
             )
-        else switch (imported) {
-            .undecided => .undecided,
+        else if (imported_decision) |decision| switch (decision) {
             .deny => .deny,
             .ask => .ask,
             .allow => .allow,
-        };
+        } else .undecided;
         const permission_mode = self.core_session.permission_ctx.modeValue();
         const external_fallback: session_permission.Decision = if (tool.namespace == .builtin)
             .ask
@@ -326,12 +578,22 @@ const AbiSession = struct {
             .bypass_permissions, .bypass => .allow,
             .default, .accept_edits, .auto, .prompt => .ask,
         };
-        var result = self.permission_state.decide(
-            tool,
-            digest,
-            explicit,
-            .{ .decision = external_fallback, .source = .mode_fallback },
-        ) catch return .deny;
+        var result = if (is_shared_ceiling)
+            session_permission.DecisionResult{
+                .decision = switch (imported_decision.?) {
+                    .deny => .deny,
+                    .ask => .ask,
+                    .allow => .allow,
+                },
+                .source = shared_source.?,
+            }
+        else
+            self.permission_state.decide(
+                tool,
+                digest,
+                explicit,
+                .{ .decision = external_fallback, .source = .mode_fallback },
+            ) catch return .deny;
         const suppress_prompt = permission_mode == .dont_ask and
             result.decision == .ask;
         if (suppress_prompt) result.decision = .deny;
@@ -342,26 +604,24 @@ const AbiSession = struct {
             .arguments_digest = digest,
             .source = result.source,
         };
-        if (result.used_session_rule or
-            result.source == .explicit_allow or
-            result.source == .explicit_deny or
-            suppress_prompt)
-        {
-            self.recordPermissionDecision(
-                tool_name,
-                tool,
-                arguments_json,
-                digest,
-                result,
-            ) catch
-                return .deny;
-        }
+        const delegates_builtin_classification = !suppress_prompt and
+            result.source == .mode_fallback and
+            tool.namespace == .builtin;
+        self.stagePermissionDecision(
+            tool_name,
+            tool,
+            digest,
+            if (delegates_builtin_classification) .{
+                .decision = result.decision,
+                .source = .builtin_classification,
+            } else result,
+        );
         if (suppress_prompt) return .deny;
         // Built-ins retain the Core's read/edit/risk classification. Host and
         // MCP identities are intentionally unknown to that product-level
         // classifier, so AgentCore must finish their conservative mode
         // fallback here instead of letting an unknown alias become read-only.
-        if (result.source == .mode_fallback and tool.namespace == .builtin)
+        if (delegates_builtin_classification)
             return null;
         return switch (result.decision) {
             .deny => .deny,
@@ -374,7 +634,7 @@ const AbiSession = struct {
         self: *AbiSession,
         tool_name: []const u8,
     ) session_permission.Error!session_permission.ToolIdentity {
-        if (self.active_mcp_view) |mcp_bound|
+        if (self.active_mcp_environment) |mcp_bound|
             if (mcp_bound.findModelTool(tool_name)) |entry|
                 return entry.permissionIdentity();
         // The model-facing Skill tool is AgentCore-owned but materialized
@@ -464,35 +724,178 @@ const AbiSession = struct {
         self.pending_permission = null;
     }
 
-    fn recordPermissionDecision(
+    fn stagePermissionDecision(
         self: *AbiSession,
         model_tool_name: []const u8,
         tool: session_permission.ToolIdentity,
-        arguments_json: []const u8,
         digest: session_permission.ArgumentsDigest,
         result: session_permission.DecisionResult,
-    ) session_permission.Error!void {
-        const audit = if (self.permission_audit) |*value| value else return;
+    ) void {
+        self.clearStagedPermission();
+        if (self.permission_audit == null and self.callbacks.on_event == null) {
+            return;
+        }
         const run_id = self.core_session.active_run_id;
-        if (run_id == 0) return error.InvalidIdentity;
-        const tool_call_id = try self.copyPermissionToolCallId(
-            allocator,
-            model_tool_name,
-            arguments_json,
-        );
-        defer allocator.free(tool_call_id);
-        try audit.append(.{
-            .decision = result.decision,
+        if (run_id == 0) {
+            return;
+        }
+        self.staged_permission_provenance = .{
+            .model_tool_name = model_tool_name,
             .source = result.source,
             .matched_rule_id = result.matched_rule_id,
             .session_id = self.core_session.session_id,
             .run_id = run_id,
-            .tool_call_id = tool_call_id,
             .tool = tool,
             .arguments_digest = digest,
             .policy_generation = self.policy_generation,
             .used_session_rule = result.used_session_rule,
-        });
+        };
+    }
+
+    fn publishStagedPermission(
+        self: *AbiSession,
+        session_id: core.session_id.SessionId,
+        run_id: u64,
+        event: core.protocol.ui_event.CoreEvent,
+    ) bool {
+        const policy = switch (event) {
+            .policy_decision => |value| value,
+            else => return true,
+        };
+        if (self.staged_permission_failure != wire.STATUS_OK) {
+            self.staged_permission_failure = wire.STATUS_OK;
+            return false;
+        }
+        var staged = self.staged_permission_provenance orelse return true;
+        self.staged_permission_provenance = null;
+        defer if (staged.tool_call_id) |owned| allocator.free(owned);
+        defer if (staged.prepared_audit) |*prepared| {
+            if (self.permission_audit) |*audit| audit.discard(prepared);
+        };
+        if (!std.mem.eql(u8, staged.session_id.asSlice(), session_id.asSlice()) or
+            staged.run_id != run_id or
+            !std.mem.eql(u8, staged.model_tool_name, policy.tool) or
+            (staged.tool_call_id != null and
+                !std.mem.eql(u8, staged.tool_call_id.?, policy.id)))
+        {
+            self.recordCallbackStatus(wire.STATUS_INTERNAL_ERROR);
+            return false;
+        }
+        const provenance = session_permission.Provenance{
+            .decision = if (policy.allowed) .allow else .deny,
+            .source = staged.source,
+            .matched_rule_id = staged.matched_rule_id,
+            .session_id = session_id,
+            .run_id = run_id,
+            .tool_call_id = policy.id,
+            .request_id = staged.request_id,
+            .tool = staged.tool,
+            .arguments_digest = staged.arguments_digest,
+            .policy_generation = staged.policy_generation,
+            .used_session_rule = staged.used_session_rule,
+            .callback_outcome = staged.callback_outcome,
+            .response = staged.response,
+        };
+        if (self.permission_audit) |*audit| {
+            if (staged.prepared_audit) |*prepared| {
+                prepared.decision = provenance.decision;
+                audit.commit(prepared);
+                staged.prepared_audit = null;
+            } else audit.append(provenance) catch |err| {
+                self.recordCallbackStatus(if (err == error.OutOfMemory)
+                    wire.STATUS_OUT_OF_MEMORY
+                else
+                    wire.STATUS_INTERNAL_ERROR);
+                return false;
+            };
+        }
+        self.emitPermissionProvenance(provenance) catch return false;
+        return true;
+    }
+
+    fn emitPermissionProvenance(
+        self: *AbiSession,
+        provenance: session_permission.Provenance,
+    ) session_permission.Error!void {
+        const callback = self.callbacks.on_event orelse return;
+        const binding_hex = std.fmt.bytesToHex(provenance.tool.binding, .lower);
+        const digest_hex = std.fmt.bytesToHex(provenance.arguments_digest, .lower);
+        var matched_rule_hex: [session_permission.RULE_ID_BYTES * 2]u8 = undefined;
+        const matched_rule_id: ?[]const u8 = if (provenance.matched_rule_id) |value| blk: {
+            matched_rule_hex = std.fmt.bytesToHex(value, .lower);
+            break :blk &matched_rule_hex;
+        } else null;
+        var request_hex: [session_permission.REQUEST_ID_BYTES * 2]u8 = undefined;
+        const request_id: ?[]const u8 = if (provenance.request_id) |value| blk: {
+            request_hex = std.fmt.bytesToHex(value, .lower);
+            break :blk &request_hex;
+        } else null;
+        const dto = public_protocol.PermissionProvenance{
+            .decision = switch (provenance.decision) {
+                .deny => .deny,
+                .ask => .ask,
+                .allow => .allow,
+            },
+            .source = switch (provenance.source) {
+                .core_safety => .core_safety,
+                .active_skill => .active_skill,
+                .explicit_deny => .explicit_deny,
+                .session_deny => .session_deny,
+                .explicit_ask => .explicit_ask,
+                .explicit_allow => .explicit_allow,
+                .session_allow => .session_allow,
+                .builtin_classification => .builtin_classification,
+                .mode_fallback => .mode_fallback,
+                .callback => .callback,
+            },
+            .matched_rule_id = matched_rule_id,
+            .session_id = provenance.session_id.asSlice(),
+            .run_id = provenance.run_id,
+            .tool_call_id = provenance.tool_call_id,
+            .request_id = request_id,
+            .tool = .{
+                .namespace = switch (provenance.tool.namespace) {
+                    .builtin => .builtin,
+                    .host => .host,
+                    .mcp => .mcp,
+                },
+                .name = provenance.tool.name,
+                .binding = &binding_hex,
+            },
+            .canonical_arguments_digest = &digest_hex,
+            .policy_generation = provenance.policy_generation,
+            .used_session_rule = provenance.used_session_rule,
+            .callback_outcome = if (provenance.callback_outcome) |value| switch (value) {
+                .answered => .answered,
+                .user_cancelled => .user_cancelled,
+                .unavailable => .unavailable,
+                .contract_failure => .contract_failure,
+            } else null,
+            .response = if (provenance.response) |value| switch (value) {
+                .deny_once => .deny_once,
+                .deny_session => .deny_session,
+                .allow_once => .allow_once,
+                .allow_session => .allow_session,
+            } else null,
+        };
+        const json = std.json.Stringify.valueAlloc(
+            allocator,
+            public_protocol.CoreEvent{ .permission_provenance = dto },
+            .{},
+        ) catch {
+            self.recordCallbackStatus(wire.STATUS_OUT_OF_MEMORY);
+            return error.OutOfMemory;
+        };
+        defer allocator.free(json);
+        const identity = core.agent_session.RunIdentity{
+            .session_id = provenance.session_id,
+            .run_id = provenance.run_id,
+        };
+        const run = self.runContext(&identity);
+        if (callback(self.callbacks.ctx, &run, view(json)) != wire.EVENT_CONTINUE) {
+            self.recordCallbackStatus(wire.STATUS_CALLBACK_FAILED);
+            return error.InvalidResponse;
+        }
     }
 
     fn handle(self: *AbiSession) *wire.SessionHandle {
@@ -505,6 +908,8 @@ const AbiSession = struct {
 
     fn emit(raw: *anyopaque, session_id: core.session_id.SessionId, run_id: u64, event: core.protocol.ui_event.CoreEvent) bool {
         const self: *AbiSession = @ptrCast(@alignCast(raw));
+        if (!self.publishStagedPermission(session_id, run_id, event))
+            return false;
         const callback = self.callbacks.on_event orelse return true;
         const public_event = protocol_v1.event(event) orelse return true;
         const json = std.json.Stringify.valueAlloc(allocator, public_event, .{}) catch {
@@ -603,6 +1008,7 @@ const AbiSession = struct {
             .session_id = identity.session_id,
             .run_id = identity.run_id,
             .tool_call_id = tool_call_id,
+            .model_tool_name = tool_name,
             .request_id = request_id,
             .tool = tool,
             .arguments_digest = digest,
@@ -735,7 +1141,6 @@ const AbiSession = struct {
                     );
                     return err;
                 };
-                var answered_audit_recorded = false;
                 switch (permission_response) {
                     .allow_session, .deny_session => {
                         const rule_candidate = candidate orelse {
@@ -747,17 +1152,14 @@ const AbiSession = struct {
                             );
                             return error.HostUiFailed;
                         };
-                        // Provenance is the first publication. If its owned
-                        // record cannot be prepared, no Session authority is
-                        // added. Once recorded, remembering the grant is the
-                        // final fallible authority step and failures remain an
-                        // honest answered-but-not-remembered outcome.
+                        // Prepare the receipt before mutating authority.  The
+                        // following policy event supplies the final execution
+                        // decision and atomically commits the receipt.
                         try self.recordPermissionCallback(
                             request,
                             .answered,
                             permission_response,
                         );
-                        answered_audit_recorded = true;
                         _ = self.rememberPermissionResponseBudgeted(
                             permission_response,
                             rule_candidate,
@@ -778,7 +1180,8 @@ const AbiSession = struct {
                     .allow_once, .allow_session => .allow_once,
                     .deny_once, .deny_session => .deny_once,
                 } };
-                if (!answered_audit_recorded)
+                if (permission_response == .allow_once or
+                    permission_response == .deny_once)
                     try self.recordPermissionCallback(
                         request,
                         .answered,
@@ -897,13 +1300,12 @@ const AbiSession = struct {
         callback_outcome: session_permission.CallbackOutcome,
         response: ?session_permission.Response,
     ) session_permission.Error!void {
-        const audit = if (self.permission_audit) |*value| value else return;
         const decision: session_permission.Decision = switch (response orelse
             .deny_once) {
             .allow_once, .allow_session => .allow,
             .deny_once, .deny_session => .deny,
         };
-        try audit.append(.{
+        const provenance = session_permission.Provenance{
             .decision = decision,
             .source = .callback,
             .session_id = request.session_id,
@@ -915,7 +1317,40 @@ const AbiSession = struct {
             .policy_generation = request.policy_generation,
             .callback_outcome = callback_outcome,
             .response = response,
-        });
+        };
+        self.clearStagedPermission();
+        const staged_tool_call_id = allocator.dupe(u8, request.tool_call_id) catch {
+            self.recordCallbackStatus(wire.STATUS_OUT_OF_MEMORY);
+            self.staged_permission_failure = wire.STATUS_OUT_OF_MEMORY;
+            return error.OutOfMemory;
+        };
+        errdefer allocator.free(staged_tool_call_id);
+        var prepared_audit: ?session_permission.OwnedProvenance = null;
+        if (self.permission_audit) |*audit| {
+            prepared_audit = audit.prepare(provenance) catch |err| {
+                const status = if (err == error.OutOfMemory)
+                    wire.STATUS_OUT_OF_MEMORY
+                else
+                    wire.STATUS_INTERNAL_ERROR;
+                self.recordCallbackStatus(status);
+                self.staged_permission_failure = status;
+                return err;
+            };
+        }
+        self.staged_permission_provenance = .{
+            .model_tool_name = request.model_tool_name,
+            .source = .callback,
+            .session_id = request.session_id,
+            .run_id = request.run_id,
+            .tool_call_id = staged_tool_call_id,
+            .request_id = request.request_id,
+            .tool = request.tool,
+            .arguments_digest = request.arguments_digest,
+            .policy_generation = request.policy_generation,
+            .callback_outcome = callback_outcome,
+            .response = response,
+            .prepared_audit = prepared_audit,
+        };
     }
 
     fn recordCallbackStatus(self: *AbiSession, status: u32) void {
@@ -1086,38 +1521,16 @@ const AbiSession = struct {
         }, self.budget_state.profile.checkpointLimits());
     }
 
-    fn preflightRun(
+    fn preflightRootRecords(
         self: *AbiSession,
-        prompts: []const []const u8,
+        records: []const []const u8,
     ) !session_budget.Preflight {
         const usage = try self.measureDurableUsage();
         try self.budget_state.updateUsage(usage.total_bytes);
         return session_budget.preflight(
             self.budget_state.profile,
             usage.total_bytes,
-            prompts,
-        ) catch |err| switch (err) {
-            error.BudgetRequired => {
-                self.budget_state.recordRequired(
-                    self.budget_state.profile.hard_bytes +| 1,
-                );
-                return error.CheckpointBudgetRequired;
-            },
-            else => return err,
-        };
-    }
-
-    fn preflightSkillRun(
-        self: *AbiSession,
-        arguments_json: []const u8,
-    ) !session_budget.Preflight {
-        const usage = try self.measureDurableUsage();
-        try self.budget_state.updateUsage(usage.total_bytes);
-        return session_budget.preflightProjected(
-            self.budget_state.profile,
-            usage.total_bytes,
-            arguments_json.len,
-            self.budget_state.profile.input_cap_bytes,
+            records,
         ) catch |err| switch (err) {
             error.BudgetRequired => {
                 self.budget_state.recordRequired(
@@ -1166,6 +1579,25 @@ const AbiSession = struct {
         return outcome;
     }
 
+    /// Reconcile an error path only when Core has already consumed this Run
+    /// and returned to an inspectable idle state. Pre-admission errors have no
+    /// Run state to record; poisoned Runs remain terminal and cannot expose a
+    /// misleading partial budget snapshot.
+    fn reconcileBudgetedRunError(
+        self: *AbiSession,
+        run_id: u64,
+        controller: *session_budget.Controller,
+    ) void {
+        if (self.core_session.isPoisoned()) return;
+        var lease = self.core_session.snapshotCommitted() catch return;
+        const run_was_consumed = lease.last_run_id == run_id;
+        lease.deinit();
+        if (!run_was_consumed) return;
+        _ = self.finishBudgetedRun(run_id, controller) catch {
+            self.facade_poisoned.store(true, .release);
+        };
+    }
+
     /// Explicit compact remains a separate idle activity. It borrows a
     /// budgeted Provider so an oversized summary cannot be published and does
     /// not hide compaction inside Run commit.
@@ -1184,22 +1616,126 @@ const AbiSession = struct {
         operation_id: u64,
         base_provider: core.api_provider.Provider,
     ) !core.compact_kernel.Report {
-        const preflight = try self.preflightRun(&.{});
+        const initial_usage = try self.measureDurableUsage();
+        try self.budget_state.updateUsage(initial_usage.total_bytes);
+        // Compact is a replacement transaction, not a Run append. Provider
+        // request/result caps still apply, but the live Conversation's current
+        // bytes must not be counted again as if the summary were appended.
         var controller = session_budget.Controller.init(
             allocator,
             self.budget_state.profile,
-            preflight,
+            .{
+                .input_delta_bytes = 0,
+                .projected_usage_bytes = 0,
+                .minimum_required_bytes = 0,
+            },
         );
         var budget_provider = session_budget.BudgetedProvider{
             .allocator = allocator,
             .controller = &controller,
             .base = base_provider,
         };
+
+        var lease = try self.core_session.snapshotCommitted();
+        const checkpoint_session_id = lease.session_id;
+        const checkpoint_last_run_id = lease.last_run_id;
+        const checkpoint_model = lease.model;
+        lease.deinit();
+        const binding_snapshot = if (self.skill_binding) |*binding|
+            binding.snapshot()
+        else
+            null;
+        const binding_selection = if (self.skill_binding) |*binding|
+            &binding.selection
+        else
+            null;
+        const skill_state = try session_authority.encodeSkillState(
+            allocator,
+            binding_snapshot,
+            binding_selection,
+        );
+        defer allocator.free(skill_state);
+        const permission_state = try session_authority.encodePermissionState(
+            allocator,
+            self.core_session.permission_ctx.modeValue(),
+            &self.permission_state,
+            self.policy_fingerprint,
+        );
+        defer allocator.free(permission_state);
+        const mcp_state = try mcp_checkpoint.encodeView(
+            allocator,
+            if (self.mcp_view) |*mcp_bound| mcp_bound else null,
+        );
+        defer allocator.free(mcp_state);
+
+        const CompactGuard = struct {
+            controller: *session_budget.Controller,
+            profile: session_budget.Profile,
+            session_id: core.session_id.SessionId,
+            checkpoint_generation: u64,
+            last_run_id: u64,
+            compact_id: u64,
+            model: []const u8,
+            policy_generation: u64,
+            catalog_generation: u64,
+            skill_state: []const u8,
+            permission_state: []const u8,
+            mcp_state: []const u8,
+
+            fn allows(
+                raw: *anyopaque,
+                replacement: *const core.conversation.Conversation,
+            ) bool {
+                const guard: *@This() = @ptrCast(@alignCast(raw));
+                if (guard.controller.outcome() != .none) return false;
+                const usage = session_checkpoint.measureSnapshot(.{
+                    .session_id = guard.session_id,
+                    .checkpoint_generation = guard.checkpoint_generation,
+                    .last_run_id = guard.last_run_id,
+                    .last_compact_id = guard.compact_id,
+                    .terminal_kind = .compact,
+                    .terminal_id = guard.compact_id,
+                    .model = guard.model,
+                    .conversation = replacement,
+                    .policy_generation = guard.policy_generation,
+                    .catalog_generation = guard.catalog_generation,
+                    .authority = .{
+                        .skill = guard.skill_state,
+                        .permission = guard.permission_state,
+                        .mcp = guard.mcp_state,
+                    },
+                }, guard.profile.checkpointLimits()) catch {
+                    guard.controller.failReplacementBudget(
+                        guard.profile.hard_bytes +| 1,
+                    );
+                    return false;
+                };
+                if (usage.total_bytes > guard.profile.hard_bytes) {
+                    guard.controller.failReplacementBudget(usage.total_bytes);
+                    return false;
+                }
+                return true;
+            }
+        };
+        var compact_guard = CompactGuard{
+            .controller = &controller,
+            .profile = self.budget_state.profile,
+            .session_id = checkpoint_session_id,
+            .checkpoint_generation = self.checkpoint_generation +| 1,
+            .last_run_id = checkpoint_last_run_id,
+            .compact_id = operation_id,
+            .model = checkpoint_model,
+            .policy_generation = self.policy_generation,
+            .catalog_generation = self.catalog_generation,
+            .skill_state = skill_state,
+            .permission_state = permission_state,
+            .mcp_state = mcp_state,
+        };
         const report = try self.core_session.compactUsingBorrowedProvider(
             operation_id,
             .{ .commit_guard = .{
-                .ctx = &controller,
-                .allowFn = compactBudgetAllowsCommit,
+                .ctx = &compact_guard,
+                .allowFn = CompactGuard.allows,
             } },
             budget_provider.provider(),
         );
@@ -1217,11 +1753,6 @@ const AbiSession = struct {
             return err;
         };
         return report;
-    }
-
-    fn compactBudgetAllowsCommit(raw: *anyopaque) bool {
-        const controller: *session_budget.Controller = @ptrCast(@alignCast(raw));
-        return controller.outcome() == .none;
     }
 
     /// Admission for an idle mutation that replaces one canonical checkpoint
@@ -1625,6 +2156,7 @@ const AbiSession = struct {
         if (self.facade_poisoned.load(.acquire)) return error.InvalidSessionState;
         if (!self.tryBeginMutation()) return error.SessionBusy;
         defer self.finishMutation();
+        if (selectors.len == 0 and self.mcp_view == null) return;
         const runtime_owner = self.runtime orelse return error.InvalidSessionState;
         const manager = if (runtime_owner.mcp_manager) |*value| value else return error.InvalidMcpBinding;
         const snapshot = try manager.retainCurrent();
@@ -1759,15 +2291,22 @@ const AbiSession = struct {
         if (!materializations.supportsExactFileModes())
             return error.SkillUnavailable;
 
-        // External Skill input is checked before Core admission. The same
-        // controller then follows the materialized root and every nested
-        // Provider/Tool/MCP operation until quiescence.
-        const preflight = try self.preflightSkillRun(arguments_json);
+        // The canonical invocation record is the exact, deterministic part of
+        // a typed Skill root input. Reserve it through the same pre-admission
+        // path as Text. Effectful body rendering remains after Core admission
+        // and is atomically reconciled before Conversation mutation.
+        const invocation_record = try canonicalInvocationRecord(
+            allocator,
+            &plan,
+        );
+        defer allocator.free(invocation_record);
+        const preflight = try self.preflightRootRecords(&.{invocation_record});
         var budget_controller = session_budget.Controller.init(
             allocator,
             self.budget_state.profile,
             preflight,
         );
+        errdefer self.reconcileBudgetedRunError(run_id, &budget_controller);
         var budget_provider = session_budget.BudgetedProvider{
             .allocator = allocator,
             .controller = &budget_controller,
@@ -1785,6 +2324,7 @@ const AbiSession = struct {
             root_frame,
             &budget_controller,
             &budget_provider,
+            invocation_record,
         )) {
             .aborted => .aborted,
             .ready => |ready_value| blk: {
@@ -1806,12 +2346,13 @@ const AbiSession = struct {
         prompt: []const u8,
         max_turns: u32,
     ) anyerror!SkillExecution {
-        const preflight = try self.preflightRun(&.{prompt});
+        const preflight = try self.preflightRootRecords(&.{prompt});
         var budget_controller = session_budget.Controller.init(
             allocator,
             self.budget_state.profile,
             preflight,
         );
+        errdefer self.reconcileBudgetedRunError(run_id, &budget_controller);
         var budget_provider = session_budget.BudgetedProvider{
             .allocator = allocator,
             .controller = &budget_controller,
@@ -1882,8 +2423,8 @@ const AbiSession = struct {
             run_id,
             .{ .ctx = self, .emit = AbiSession.emit },
         );
-        self.active_mcp_view = if (has_mcp) &self.mcp_view.? else null;
-        defer self.active_mcp_view = null;
+        self.active_mcp_environment = if (mcp_environment) |*environment| environment else null;
+        defer self.active_mcp_environment = null;
         const inner_surface = if (skill_environment) |*environment|
             environment.surface()
         else if (mcp_environment) |*environment|
@@ -1954,6 +2495,7 @@ const AbiSession = struct {
             parent_frame,
             null,
             null,
+            null,
         );
     }
 
@@ -1965,6 +2507,7 @@ const AbiSession = struct {
         parent_frame: *policy_frame.PolicyFrame,
         budget_controller: *session_budget.Controller,
         budget_provider: *session_budget.BudgetedProvider,
+        invocation_record: []const u8,
     ) anyerror!SkillAdmission {
         return self.admitMaterializedSkillImpl(
             materializations,
@@ -1973,6 +2516,7 @@ const AbiSession = struct {
             parent_frame,
             budget_controller,
             budget_provider,
+            invocation_record,
         );
     }
 
@@ -1984,6 +2528,7 @@ const AbiSession = struct {
         parent_frame: *policy_frame.PolicyFrame,
         budget_controller: ?*session_budget.Controller,
         budget_provider: ?*session_budget.BudgetedProvider,
+        invocation_record: ?[]const u8,
     ) anyerror!SkillAdmission {
         var admitted = try self.core_session.admitRun(
             run_id,
@@ -2021,6 +2566,7 @@ const AbiSession = struct {
             .activation = activation,
             .budget_controller = budget_controller,
             .budget_provider = budget_provider,
+            .invocation_record = invocation_record,
         } };
     }
 };
@@ -2042,20 +2588,27 @@ const MaterializedSkillRun = struct {
     activation: skill_activation.Activation,
     budget_controller: ?*session_budget.Controller,
     budget_provider: ?*session_budget.BudgetedProvider,
+    /// Borrowed from the synchronous external run when budgeted. Test-only
+    /// direct admission may omit it and falls back to local construction.
+    invocation_record: ?[]const u8,
 
     fn executeInline(
         self: *MaterializedSkillRun,
         plan: *const skill_activation.ActivationPlan,
         max_turns: u32,
     ) anyerror!SkillExecution {
-        const invocation_record = canonicalInvocationRecord(
-            allocator,
-            plan,
-        ) catch |record_error| {
-            _ = try self.finishWithoutConversation();
-            return record_error;
+        var owned_invocation: ?[]u8 = null;
+        defer if (owned_invocation) |record| allocator.free(record);
+        const invocation_record = self.invocation_record orelse blk: {
+            owned_invocation = canonicalInvocationRecord(
+                allocator,
+                plan,
+            ) catch |record_error| {
+                _ = try self.finishWithoutConversation();
+                return record_error;
+            };
+            break :blk owned_invocation.?;
         };
-        defer allocator.free(invocation_record);
 
         const body_record = core.skills_runtime.model_tool.formatResult(
             allocator,
@@ -2081,8 +2634,7 @@ const MaterializedSkillRun = struct {
             _ = try self.finishWithoutConversation();
             return error.InvalidSessionState;
         };
-        budget_controller.reconcileRootPrompts(
-            self.facade.budget_state.profile.input_cap_bytes,
+        budget_controller.reconcileGeneratedRootPrompts(
             &.{ invocation_record, body_record },
         ) catch {
             _ = try self.finishWithoutConversation();
@@ -2156,8 +2708,8 @@ const MaterializedSkillRun = struct {
                 null;
         var environment_live = environment != null;
         defer if (environment_live) environment.?.deinit() catch {};
-        self.facade.active_mcp_view = if (has_mcp) &self.facade.mcp_view.? else null;
-        defer self.facade.active_mcp_view = null;
+        self.facade.active_mcp_environment = if (mcp_environment) |*mcp_env| mcp_env else null;
+        defer self.facade.active_mcp_environment = null;
         const inner_surface = if (environment) |*env|
             env.surface()
         else if (mcp_environment) |*mcp_env|
@@ -2222,14 +2774,18 @@ const MaterializedSkillRun = struct {
         plan: *const skill_activation.ActivationPlan,
         max_turns: u32,
     ) anyerror!SkillExecution {
-        const invocation_record = canonicalInvocationRecord(
-            allocator,
-            plan,
-        ) catch |record_error| {
-            _ = try self.finishWithoutConversation();
-            return record_error;
+        var owned_invocation: ?[]u8 = null;
+        defer if (owned_invocation) |record| allocator.free(record);
+        const invocation_record = self.invocation_record orelse blk: {
+            owned_invocation = canonicalInvocationRecord(
+                allocator,
+                plan,
+            ) catch |record_error| {
+                _ = try self.finishWithoutConversation();
+                return record_error;
+            };
+            break :blk owned_invocation.?;
         };
-        defer allocator.free(invocation_record);
 
         if (self.admitted.abortSignal().isAborted()) {
             _ = try self.finishWithoutConversation();
@@ -2244,8 +2800,7 @@ const MaterializedSkillRun = struct {
             _ = try self.finishWithoutConversation();
             return error.InvalidSessionState;
         };
-        budget_controller.reconcileRootPrompts(
-            self.facade.budget_state.profile.input_cap_bytes,
+        budget_controller.reconcileGeneratedRootPrompts(
             &.{invocation_record},
         ) catch {
             _ = try self.finishWithoutConversation();
@@ -2416,8 +2971,8 @@ const ForkExecutorContext = struct {
         else
             self.activation.frame.executionPolicy();
 
-        self.facade.active_mcp_view = if (has_mcp) &self.facade.mcp_view.? else null;
-        defer self.facade.active_mcp_view = null;
+        self.facade.active_mcp_environment = if (mcp_environment) |*mcp_env| mcp_env else null;
+        defer self.facade.active_mcp_environment = null;
         const child = core.subagent.spawnAgentSink(
             output_allocator,
             self.budget_provider.provider(),
@@ -2636,6 +3191,14 @@ fn statusText(status: u32) []const u8 {
         wire.STATUS_SKILL_POLICY_VIOLATION => "Skill policy violation",
         wire.STATUS_SKILL_UNAVAILABLE => "Skill unavailable",
         wire.STATUS_STALE_COMPACT => "stale compact operation",
+        wire.STATUS_CHECKPOINT_BUDGET_REQUIRED => "checkpoint budget required",
+        wire.STATUS_CHECKPOINT_CORRUPT => "checkpoint corrupt",
+        wire.STATUS_CHECKPOINT_UNSUPPORTED => "checkpoint unsupported",
+        wire.STATUS_CHECKPOINT_INCOMPATIBLE => "checkpoint incompatible",
+        wire.STATUS_CHECKPOINT_IO => "checkpoint I/O failed",
+        wire.STATUS_LOGICAL_SESSION_CONFLICT => "logical Session conflict",
+        wire.STATUS_MCP_NOT_REFRESHED => "MCP catalog not refreshed",
+        wire.STATUS_INVALID_MCP_SELECTION => "invalid MCP selection",
         else => "AgentCore error",
     };
 }
@@ -2686,7 +3249,8 @@ fn catalogQueryStatus(err: anyerror) u32 {
 fn sessionMutationStatus(err: anyerror) u32 {
     return switch (err) {
         error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
-        error.ResourceLimit, error.CheckpointBudgetRequired => wire.STATUS_RESOURCE_LIMIT,
+        error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
+        error.CheckpointBudgetRequired => wire.STATUS_CHECKPOINT_BUDGET_REQUIRED,
         error.SessionBusy, error.RuntimeBusy => wire.STATUS_BUSY,
         error.InvalidSessionState, error.SkillCatalogNotBound, error.RuntimeUnavailable => wire.STATUS_INVALID_STATE,
         error.InvalidModel,
@@ -2710,7 +3274,8 @@ fn compactStatus(err: anyerror) u32 {
         error.SessionBusy => wire.STATUS_BUSY,
         error.InvalidSessionState => wire.STATUS_INVALID_STATE,
         error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
-        error.CheckpointBudgetRequired, error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
+        error.CheckpointBudgetRequired => wire.STATUS_CHECKPOINT_BUDGET_REQUIRED,
+        error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
         error.ConcurrentMutation => wire.STATUS_CORE_ERROR,
         else => wire.STATUS_INTERNAL_ERROR,
     };
@@ -2735,8 +3300,12 @@ fn skillRunErrorStatus(self: *const AbiSession, err: anyerror) u32 {
 fn sessionCreateErrorStatus(err: anyerror) u32 {
     return switch (err) {
         error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
+        error.NotRefreshed => wire.STATUS_MCP_NOT_REFRESHED,
+        error.InvalidMcpBinding, error.InvalidSelection => wire.STATUS_INVALID_MCP_SELECTION,
         error.InvalidWorkspaceRoot,
         error.InvalidWorkspaceHome,
+        error.InvalidBudget,
+        error.InvalidProfile,
         error.ToolNotInRuntime,
         error.DuplicateToolName,
         error.ShellToolDisabled,
@@ -2753,10 +3322,7 @@ fn runErrorStatus(self: *const AbiSession, err: anyerror) u32 {
         error.StaleRun => wire.STATUS_STALE_RUN,
         error.InvalidSessionState => wire.STATUS_INVALID_STATE,
         error.CallbackFailed => self.callbackFailureStatus(),
-        // Exact Revision 6 wire token is frozen with the final DTO pass. The
-        // internal semantic is already distinct and, critically, occurs
-        // before Core admission.
-        error.CheckpointBudgetRequired => wire.STATUS_RESOURCE_LIMIT,
+        error.CheckpointBudgetRequired => wire.STATUS_CHECKPOINT_BUDGET_REQUIRED,
         else => wire.STATUS_CORE_ERROR,
     };
 }
@@ -2776,7 +3342,7 @@ fn permissionMode(code: u32) ?core.types.PermissionMode {
         wire.PERMISSION_ACCEPT_EDITS => .accept_edits,
         wire.PERMISSION_AUTO => .auto,
         wire.PERMISSION_DONT_ASK => .dont_ask,
-        wire.PERMISSION_BYPASS => .bypass_permissions,
+        wire.PERMISSION_FULL_ACCESS => .bypass_permissions,
         else => null,
     };
 }
@@ -2931,6 +3497,88 @@ fn parsePermissionRuleSet(
     return .{ .allow = allow, .ask = ask, .deny = deny };
 }
 
+fn parseMcpSelection(
+    scratch: std.mem.Allocator,
+    optional: ?*const wire.McpSelectionV1,
+    metadata_total: *u64,
+) ![]const mcp_session.Selector {
+    const raw = optional orelse return &.{};
+    if (raw.struct_size != @sizeOf(wire.McpSelectionV1) or
+        raw.reserved0 != 0 or !allZero(raw.reserved))
+        return error.InvalidArgument;
+    if (raw.selector_count > wire.MAX_MCP_TOOLS_V1)
+        return error.ResourceLimit;
+    const count = std.math.cast(usize, raw.selector_count) orelse
+        return error.Overflow;
+    if (count == 0) return &.{};
+    const descriptors = (raw.selectors orelse
+        return error.InvalidArgument)[0..count];
+    const selectors = try scratch.alloc(mcp_session.Selector, count);
+    for (descriptors, selectors) |descriptor, *selector| {
+        if (descriptor.struct_size != @sizeOf(wire.McpSelectorV1) or
+            descriptor.reserved0 != 0 or !allZero(descriptor.reserved) or
+            allZero(descriptor.server_binding_identity[0..]))
+            return error.InvalidArgument;
+        if (descriptor.tool_name.len == 0 or
+            descriptor.tool_name.len > wire.MAX_MCP_TOOL_NAME_BYTES_V1)
+            return error.ResourceLimit;
+        try addMetadata(
+            metadata_total,
+            descriptor.tool_name.len,
+            wire.MAX_SESSION_METADATA_BYTES_V1,
+        );
+        selector.* = .{
+            .server_binding_identity = descriptor.server_binding_identity,
+            .tool_name = try text(descriptor.tool_name),
+        };
+    }
+    return selectors;
+}
+
+fn parseDurableBudget(
+    optional: ?*const wire.DurableBudgetProfileV1,
+) !session_budget.Profile {
+    const raw = optional orelse return .{};
+    if (raw.struct_size != @sizeOf(wire.DurableBudgetProfileV1) or
+        raw.reserved0 != 0 or !allZero(raw.reserved))
+        return error.InvalidArgument;
+    const profile = session_budget.Profile{
+        .hard_bytes = raw.hard_bytes,
+        .soft_bytes = raw.soft_bytes,
+        .input_cap_bytes = raw.input_cap_bytes,
+        .provider_request_cap_bytes = raw.provider_request_cap_bytes,
+        .provider_result_cap_bytes = raw.provider_result_cap_bytes,
+        .tool_result_cap_bytes = raw.tool_result_cap_bytes,
+        .mcp_result_cap_bytes = raw.mcp_result_cap_bytes,
+        .audit_reserve_bytes = raw.audit_reserve_bytes,
+        .terminal_reserve_bytes = raw.terminal_reserve_bytes,
+    };
+    try profile.validate();
+    return profile;
+}
+
+fn parseCheckpointLimits(
+    raw: *const wire.CheckpointLimitsV1,
+) !session_checkpoint.Limits {
+    if (raw.struct_size != @sizeOf(wire.CheckpointLimitsV1) or
+        raw.reserved0 != 0 or raw.reserved1 != 0 or
+        !allZero(raw.reserved))
+        return error.InvalidArgument;
+    if (raw.hard_bytes > wire.MAX_CHECKPOINT_BYTES_V1 or
+        raw.chunk_bytes > wire.MAX_CHECKPOINT_CHUNK_BYTES_V1)
+        return error.ResourceLimit;
+    const limits = session_checkpoint.Limits{
+        .hard_bytes = raw.hard_bytes,
+        .chunk_bytes = raw.chunk_bytes,
+        .max_section_bytes = raw.max_section_bytes,
+        .max_string_bytes = raw.max_string_bytes,
+        .max_messages = raw.max_messages,
+        .max_blocks_per_message = raw.max_blocks_per_message,
+    };
+    try limits.validate();
+    return limits;
+}
+
 fn parseSchema(arena: std.mem.Allocator, encoded: []const u8) !core.json.InputSchema {
     if (encoded.len > wire.MAX_TOOL_SCHEMA_BYTES_V1) return error.ResourceLimit;
     const root = try std.json.parseFromSliceLeaky(std.json.Value, arena, encoded, .{
@@ -2993,6 +3641,84 @@ fn validToolName(name: []const u8) bool {
     return true;
 }
 
+fn mcpTransport(code: u32) ?mcp_negotiation.Transport {
+    return switch (code) {
+        wire.MCP_TRANSPORT_STDIO => .stdio,
+        wire.MCP_TRANSPORT_STREAMABLE_HTTP => .streamable_http,
+        else => null,
+    };
+}
+
+fn mcpNegotiationPolicy(code: u32) ?mcp_negotiation.Policy {
+    return switch (code) {
+        wire.MCP_NEGOTIATION_AUTO => .auto,
+        wire.MCP_NEGOTIATION_MODERN_ONLY => .modern_only,
+        wire.MCP_NEGOTIATION_LEGACY_ONLY => .legacy_only,
+        else => null,
+    };
+}
+
+fn parseMcpProtocolLimits(
+    optional: ?*const wire.McpProtocolLimitsV1,
+) !mcp_canonical.Limits {
+    const raw = optional orelse return .{};
+    if (raw.struct_size != @sizeOf(wire.McpProtocolLimitsV1) or
+        raw.reserved0 != 0 or !allZero(raw.reserved))
+        return error.InvalidArgument;
+    const result = mcp_canonical.Limits{
+        .max_frame_bytes = std.math.cast(usize, raw.max_frame_bytes) orelse
+            return error.Overflow,
+        .max_tools = std.math.cast(usize, raw.max_tools) orelse
+            return error.Overflow,
+        .max_tool_name_bytes = std.math.cast(usize, raw.max_tool_name_bytes) orelse
+            return error.Overflow,
+        .max_text_bytes = std.math.cast(usize, raw.max_text_bytes) orelse
+            return error.Overflow,
+        .max_schema_bytes = std.math.cast(usize, raw.max_schema_bytes) orelse
+            return error.Overflow,
+        .max_json_depth = std.math.cast(u16, raw.max_json_depth) orelse
+            return error.Overflow,
+        .max_json_nodes = std.math.cast(u32, raw.max_json_nodes) orelse
+            return error.Overflow,
+        .max_cursor_bytes = std.math.cast(usize, raw.max_cursor_bytes) orelse
+            return error.Overflow,
+        .max_versions = std.math.cast(usize, raw.max_versions) orelse
+            return error.Overflow,
+    };
+    try result.validate();
+    if (raw.max_frame_bytes > wire.MAX_MCP_FRAME_BYTES_V1 or
+        raw.max_tools > wire.MAX_MCP_TOOLS_V1 or
+        raw.max_tool_name_bytes > wire.MAX_MCP_TOOL_NAME_BYTES_V1 or
+        raw.max_text_bytes > wire.MAX_MCP_TEXT_BYTES_V1 or
+        raw.max_schema_bytes > wire.MAX_MCP_SCHEMA_BYTES_V1 or
+        raw.max_cursor_bytes > wire.MAX_MCP_CURSOR_BYTES_V1 or
+        raw.max_versions > wire.MAX_MCP_PROTOCOL_VERSIONS_V1)
+        return error.ResourceLimit;
+    return result;
+}
+
+fn parseMcpCatalogLimits(
+    optional: ?*const wire.McpCatalogLimitsV1,
+) !mcp_catalog.Limits {
+    const raw = optional orelse return .{};
+    if (raw.struct_size != @sizeOf(wire.McpCatalogLimitsV1) or
+        raw.reserved0 != 0 or !allZero(raw.reserved))
+        return error.InvalidArgument;
+    if (raw.max_servers == 0 or raw.max_servers > wire.MAX_MCP_SERVERS_V1 or
+        raw.max_namespace_bytes == 0 or
+        raw.max_namespace_bytes > wire.MAX_MCP_NAMESPACE_BYTES_V1 or
+        raw.max_issues == 0 or raw.max_issues > wire.MAX_MCP_CATALOG_ISSUES_V1)
+        return error.ResourceLimit;
+    return .{
+        .max_servers = std.math.cast(usize, raw.max_servers) orelse
+            return error.Overflow,
+        .max_namespace_bytes = std.math.cast(usize, raw.max_namespace_bytes) orelse
+            return error.Overflow,
+        .max_issues = std.math.cast(usize, raw.max_issues) orelse
+            return error.Overflow,
+    };
+}
+
 fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire.RuntimeHandle, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
     if (out_runtime) |out| out.* = null;
     emptyError(out_error);
@@ -3023,9 +3749,19 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
         return fail(wire.STATUS_INVALID_ARGUMENT, "host tool count overflow", out_error);
     const host_descriptors = if (host_count == 0) &.{} else (config.host_tools orelse
         return fail(wire.STATUS_INVALID_ARGUMENT, "host_tools is required", out_error))[0..host_count];
+    const mcp_limits = parseMcpCatalogLimits(config.mcp_catalog_limits) catch |err|
+        return failError(inputErrorStatus(err), err, out_error);
+    if (config.mcp_server_count > wire.MAX_MCP_SERVERS_V1 or
+        config.mcp_server_count > mcp_limits.max_servers)
+        return fail(wire.STATUS_RESOURCE_LIMIT, "MCP server count exceeds AgentCore ABI v1 limits", out_error);
+    const mcp_count = std.math.cast(usize, config.mcp_server_count) orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "MCP server count overflow", out_error);
+    const mcp_descriptors = if (mcp_count == 0) &.{} else (config.mcp_servers orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "mcp_servers is required", out_error))[0..mcp_count];
 
     const self = allocator.create(AbiRuntime) catch return fail(wire.STATUS_OUT_OF_MEMORY, "allocating Runtime failed", out_error);
     self.mcp_manager = null;
+    self.mcp_connectors = null;
     var keep_self = false;
     defer if (!keep_self) allocator.destroy(self);
     self.catalogs = skill_catalog_handles.RuntimeCatalogs.init(allocator) catch |err|
@@ -3074,11 +3810,87 @@ fn runtimeCreate(config_ptr: ?*const wire.RuntimeConfigV1, out_runtime: ?*?*wire
         };
         native_tools[i] = .{ .definition = .{ .name = name, .description = description, .input_schema = schema }, .ctx = &self.host_tools[i], .execute = AbiHostTool.execute };
     }
+    const connectors = allocator.alloc(AbiMcpConnector, mcp_count) catch
+        return fail(wire.STATUS_OUT_OF_MEMORY, "allocating MCP connectors failed", out_error);
+    self.mcp_connectors = connectors;
+    var keep_connectors = false;
+    defer if (!keep_connectors) {
+        allocator.free(connectors);
+        self.mcp_connectors = null;
+    };
+    const mcp_specs = a.alloc(mcp_catalog.ServerSpec, mcp_count) catch
+        return fail(wire.STATUS_OUT_OF_MEMORY, "allocating MCP server specifications failed", out_error);
+    for (mcp_descriptors, connectors, mcp_specs) |descriptor, *connector, *spec| {
+        if (descriptor.struct_size != @sizeOf(wire.McpServerV1) or
+            descriptor.reserved0 != 0 or descriptor.reserved1 != 0 or
+            !allZero(descriptor.reserved) or
+            descriptor.connector.struct_size != @sizeOf(wire.McpConnectorV1) or
+            descriptor.connector.reserved0 != 0 or
+            !allZero(descriptor.connector.reserved) or
+            descriptor.connector.open == null or
+            descriptor.connector.request == null or
+            descriptor.connector.notify == null or
+            descriptor.connector.close == null or
+            descriptor.connector.release_response == null)
+            return fail(wire.STATUS_INVALID_ARGUMENT, "invalid MCP server or connector descriptor", out_error);
+        const transport = mcpTransport(descriptor.transport_code) orelse
+            return fail(wire.STATUS_INVALID_ARGUMENT, "unknown MCP transport", out_error);
+        const policy = mcpNegotiationPolicy(descriptor.negotiation_policy_code) orelse
+            return fail(wire.STATUS_INVALID_ARGUMENT, "unknown MCP negotiation policy", out_error);
+        if (descriptor.timeout_ms == 0)
+            return fail(wire.STATUS_INVALID_ARGUMENT, "MCP timeout must be nonzero", out_error);
+        for ([_]wire.BytesViewV1{
+            descriptor.namespace,
+            descriptor.client_name,
+            descriptor.client_version,
+        }) |value| addMetadata(
+            &runtime_metadata,
+            value.len,
+            wire.MAX_RUNTIME_METADATA_BYTES_V1,
+        ) catch |err| return failError(inputErrorStatus(err), err, out_error);
+        const namespace = text(descriptor.namespace) catch |err|
+            return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+        const client_name = text(descriptor.client_name) catch |err|
+            return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+        const client_version = text(descriptor.client_version) catch |err|
+            return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+        if (client_name.len == 0 or client_version.len == 0)
+            return fail(wire.STATUS_INVALID_ARGUMENT, "MCP client name and version are required", out_error);
+        const protocol_limits = parseMcpProtocolLimits(descriptor.protocol_limits) catch |err|
+            return failError(inputErrorStatus(err), err, out_error);
+        connector.* = .{
+            .descriptor = descriptor.connector,
+            .max_frame_bytes = protocol_limits.max_frame_bytes,
+            .timeout_ms = descriptor.timeout_ms,
+        };
+        spec.* = .{
+            .binding = descriptor.server_binding_identity,
+            .namespace = namespace,
+            .connector = connector.connector(),
+            .transport = transport,
+            .policy = policy,
+            .client = .{ .name = client_name, .version = client_version },
+            .timeout_ms = descriptor.timeout_ms,
+            .protocol_limits = protocol_limits,
+        };
+    }
+    self.mcp_manager = mcp_catalog.Manager.init(
+        allocator,
+        mcp_specs,
+        mcp_limits,
+    ) catch |err| return failError(inputErrorStatus(err), err, out_error);
+    var keep_mcp_manager = false;
+    defer if (!keep_mcp_manager) {
+        self.mcp_manager.?.deinit();
+        self.mcp_manager = null;
+    };
     self.core_runtime = core.agent_session.AgentRuntime.create(allocator, .{ .builtin_tools = builtin_names, .host_sync_tools = native_tools }) catch |err| {
         return failError(runtimeErrorStatus(err), err, out_error);
     };
     out.* = self.handle();
     keep_host_tools = true;
+    keep_mcp_manager = true;
+    keep_connectors = true;
     keep_materializations = true;
     keep_catalogs = true;
     keep_self = true;
@@ -3099,6 +3911,7 @@ fn runtimeDestroy(handle: ?*wire.RuntimeHandle, out_error: ?*wire.OwnedBytesV1) 
     self.catalogs.finishDestroy();
     destroy_committed = true;
     allocator.free(self.host_tools);
+    if (self.mcp_connectors) |connectors| allocator.free(connectors);
     allocator.destroy(self);
     return wire.STATUS_OK;
 }
@@ -3181,6 +3994,159 @@ fn skillCatalogRelease(
     return wire.STATUS_OK;
 }
 
+const McpCatalogServerJson = struct {
+    server_binding_identity: []const u8,
+    namespace: []const u8,
+    negotiated_protocol: []const u8,
+    server_fingerprint: []const u8,
+    cache_scope: []const u8,
+    fresh: bool,
+    ttl_remaining_ms: u64,
+    tool_offset: u32,
+    tool_count: u32,
+};
+
+const McpCatalogToolJson = struct {
+    server_binding_identity: []const u8,
+    canonical_name: []const u8,
+    schema_fingerprint: []const u8,
+    permission_binding: []const u8,
+};
+
+const McpCatalogIssueJson = struct {
+    issue_id: []const u8,
+    server_binding_identity: []const u8,
+    tool_name: ?[]const u8,
+    kind: []const u8,
+    detail: []const u8,
+};
+
+const McpCatalogDescriptionJson = struct {
+    schema: []const u8 = "agentcore.mcp-catalog/v1",
+    catalog_generation: u64,
+    catalog_fingerprint: []const u8,
+    servers: []const McpCatalogServerJson,
+    tools: []const McpCatalogToolJson,
+    issues: []const McpCatalogIssueJson,
+};
+
+fn lowerHexAlloc(
+    output_allocator: std.mem.Allocator,
+    bytes: []const u8,
+) error{OutOfMemory}![]u8 {
+    const result = output_allocator.alloc(u8, bytes.len * 2) catch
+        return error.OutOfMemory;
+    const alphabet = "0123456789abcdef";
+    for (bytes, 0..) |byte, index| {
+        result[index * 2] = alphabet[byte >> 4];
+        result[index * 2 + 1] = alphabet[byte & 0x0f];
+    }
+    return result;
+}
+
+fn encodeMcpCatalogDescription(
+    output_allocator: std.mem.Allocator,
+    description: *const mcp_catalog.Description,
+) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(output_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const servers = try a.alloc(McpCatalogServerJson, description.servers.len);
+    for (description.servers, servers) |server, *dto| dto.* = .{
+        .server_binding_identity = try lowerHexAlloc(a, &server.server_binding_identity),
+        .namespace = server.namespace,
+        .negotiated_protocol = server.era.version(),
+        .server_fingerprint = try lowerHexAlloc(a, &server.server_fingerprint),
+        .cache_scope = @tagName(server.cache_scope),
+        .fresh = server.fresh,
+        .ttl_remaining_ms = server.ttl_remaining_ms,
+        .tool_offset = server.tool_offset,
+        .tool_count = server.tool_count,
+    };
+    const tools = try a.alloc(McpCatalogToolJson, description.tools.len);
+    for (description.tools, tools) |tool, *dto| dto.* = .{
+        .server_binding_identity = try lowerHexAlloc(a, &tool.server_binding_identity),
+        .canonical_name = tool.canonical_name,
+        .schema_fingerprint = try lowerHexAlloc(a, &tool.schema_fingerprint),
+        .permission_binding = try lowerHexAlloc(a, &tool.permission_binding),
+    };
+    const issues = try a.alloc(McpCatalogIssueJson, description.issues.len);
+    for (description.issues, issues) |issue, *dto| dto.* = .{
+        .issue_id = try lowerHexAlloc(a, &issue.issue_id),
+        .server_binding_identity = try lowerHexAlloc(a, &issue.server_binding_identity),
+        .tool_name = issue.tool_name,
+        .kind = issue.kind,
+        .detail = issue.detail,
+    };
+    const dto = McpCatalogDescriptionJson{
+        .catalog_generation = description.generation,
+        .catalog_fingerprint = try lowerHexAlloc(a, &description.fingerprint),
+        .servers = servers,
+        .tools = tools,
+        .issues = issues,
+    };
+    const encoded = std.json.Stringify.valueAlloc(output_allocator, dto, .{}) catch
+        return error.OutOfMemory;
+    if (encoded.len > wire.MAX_DESCRIPTION_JSON_BYTES_V1) {
+        output_allocator.free(encoded);
+        return error.ResourceLimit;
+    }
+    return encoded;
+}
+
+fn runtimeRefreshMcp(
+    runtime_handle: ?*wire.RuntimeHandle,
+    out_generation: ?*u64,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    if (out_generation) |out| out.* = 0;
+    emptyError(out_error);
+    const runtime = runtimeFrom(runtime_handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "runtime is required", out_error));
+    const out = out_generation orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "out_catalog_generation is required", out_error);
+    var runtime_call = runtime.catalogs.enterCall() catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    defer runtime_call.deinit();
+    const manager = if (runtime.mcp_manager) |*value| value else return fail(wire.STATUS_INVALID_STATE, "Runtime has no MCP manager", out_error);
+    out.* = manager.refresh() catch |err| return failError(switch (err) {
+        error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
+        error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
+        error.InvalidConfig => wire.STATUS_INVALID_ARGUMENT,
+        else => wire.STATUS_CORE_ERROR,
+    }, err, out_error);
+    return wire.STATUS_OK;
+}
+
+fn runtimeDescribeMcp(
+    runtime_handle: ?*wire.RuntimeHandle,
+    out_description: ?*wire.OwnedBytesV1,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    if (out_description) |out| out.* = .{ .ptr = null, .len = 0 };
+    emptyError(out_error);
+    const runtime = runtimeFrom(runtime_handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "runtime is required", out_error));
+    const out = out_description orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "out_description_json is required", out_error);
+    var runtime_call = runtime.catalogs.enterCall() catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    defer runtime_call.deinit();
+    const manager = if (runtime.mcp_manager) |*value| value else return fail(wire.STATUS_INVALID_STATE, "Runtime has no MCP manager", out_error);
+    var description = manager.describeCurrent(allocator) catch |err|
+        return failError(switch (err) {
+            error.NotRefreshed => wire.STATUS_MCP_NOT_REFRESHED,
+            error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
+            error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
+            else => wire.STATUS_CORE_ERROR,
+        }, err, out_error);
+    defer description.deinit();
+    const encoded = encodeMcpCatalogDescription(allocator, &description) catch |err|
+        return failError(inputErrorStatus(err), err, out_error);
+    out.* = .{ .ptr = encoded.ptr, .len = encoded.len };
+    return wire.STATUS_OK;
+}
+
 const SessionBuildConfig = struct {
     callbacks: wire.SessionCallbacksV1,
     provider_kind: core.types.ProviderKind,
@@ -3216,6 +4182,7 @@ const RestoreHostConfig = struct {
     permission_rules: ?core.permission_settings.RuleSetInput,
     workspace: core.agent_session.WorkspaceConfig,
     allowed_tools: []const []const u8,
+    mcp_selectors: []const mcp_session.Selector = &.{},
     workspace_scope_id: [64]u8,
     budget_profile: session_budget.Profile = .{},
 };
@@ -3223,6 +4190,42 @@ const RestoreHostConfig = struct {
 const InternalRestoreResult = struct {
     session: *AbiSession,
     report: session_authority.RestoreReport,
+};
+
+const AbiCheckpointSink = struct {
+    descriptor: wire.CheckpointSinkV1,
+
+    fn interface(self: *AbiCheckpointSink) session_checkpoint.Sink {
+        return .{ .ctx = self, .write_fn = write };
+    }
+
+    fn write(raw: *anyopaque, bytes: []const u8) anyerror!void {
+        const self: *AbiCheckpointSink = @ptrCast(@alignCast(raw));
+        const status = self.descriptor.write.?(self.descriptor.ctx, view(bytes));
+        if (status != wire.CHECKPOINT_IO_OK) return error.HostSinkFailed;
+    }
+};
+
+const AbiCheckpointSource = struct {
+    descriptor: wire.CheckpointSourceV1,
+
+    fn interface(self: *AbiCheckpointSource) session_checkpoint.Source {
+        return .{ .ctx = self, .read_fn = read };
+    }
+
+    fn read(raw: *anyopaque, destination: []u8) anyerror!usize {
+        const self: *AbiCheckpointSource = @ptrCast(@alignCast(raw));
+        var read_len: u64 = 0;
+        const status = self.descriptor.read.?(
+            self.descriptor.ctx,
+            if (destination.len == 0) null else destination.ptr,
+            destination.len,
+            &read_len,
+        );
+        if (status != wire.CHECKPOINT_IO_OK or read_len > destination.len)
+            return error.HostSourceFailed;
+        return @intCast(read_len);
+    }
 };
 
 const RestorePermissionResolver = struct {
@@ -3439,14 +4442,10 @@ fn buildAbiSession(
     errdefer if (self.policy_root) |root| root.release();
     const initial_usage = try self.measureDurableUsage();
     try self.budget_state.updateUsage(initial_usage.total_bytes);
-    _ = session_budget.preflight(
-        self.budget_state.profile,
-        initial_usage.total_bytes,
-        &.{},
-    ) catch |err| switch (err) {
-        error.BudgetRequired => return error.InvalidBudget,
-        else => return err,
-    };
+    // Session materialization proves that the restored state is encodable.
+    // Capacity for a future Run is a separate admission question; requiring a
+    // full Run reserve here would make a valid near-full checkpoint impossible
+    // to restore and therefore impossible to compact or inspect.
     return self;
 }
 
@@ -3488,8 +4487,28 @@ fn restoreCheckpoint(
     defer if (restored_mcp_view) |*mcp_bound| mcp_bound.deinit();
     var mcp_invalidated_without_view: u32 = 0;
     if (restored_mcp_state) |*state| {
-        const selectors = try state.selectors(allocator);
-        defer allocator.free(selectors);
+        const historical_selectors = try state.selectors(allocator);
+        defer allocator.free(historical_selectors);
+        var bounded_selectors: std.ArrayList(mcp_session.Selector) = .empty;
+        defer bounded_selectors.deinit(allocator);
+        for (historical_selectors) |historical| {
+            var allowed = false;
+            for (config.mcp_selectors) |current| {
+                if (std.mem.eql(
+                    u8,
+                    &historical.server_binding_identity,
+                    &current.server_binding_identity,
+                ) and std.mem.eql(u8, historical.tool_name, current.tool_name)) {
+                    allowed = true;
+                    break;
+                }
+            }
+            if (allowed) {
+                try bounded_selectors.append(allocator, historical);
+            } else {
+                mcp_invalidated_without_view +|= 1;
+            }
+        }
         if (runtime.mcp_manager) |*manager| {
             const current_snapshot = manager.retainCurrent() catch |err| switch (err) {
                 error.NotRefreshed => null,
@@ -3501,7 +4520,7 @@ fn restoreCheckpoint(
                 restored_mcp_view = try mcp_session.View.init(
                     allocator,
                     snapshot,
-                    selectors,
+                    bounded_selectors.items,
                     .restore_degraded,
                 );
             } else {
@@ -3630,6 +4649,17 @@ fn restoreCheckpoint(
                 )
             else
                 null;
+            var allowed_by_current = false;
+            for (config.mcp_selectors) |current| {
+                if (std.mem.eql(
+                    u8,
+                    &entry.server_binding_identity,
+                    &current.server_binding_identity,
+                ) and std.mem.eql(u8, entry.tool_name, current.tool_name)) {
+                    allowed_by_current = true;
+                    break;
+                }
+            }
             const identity = mcp_canonical.ToolIdentity{
                 .server_binding_identity = entry.server_binding_identity,
                 .name = entry.tool_name,
@@ -3637,7 +4667,9 @@ fn restoreCheckpoint(
             };
             try authority_issue_seeds.append(allocator, .{
                 .subsystem = .mcp,
-                .reason = if (current_tool != null)
+                .reason = if (!allowed_by_current)
+                    .authority_narrowed
+                else if (current_tool != null)
                     .schema_changed
                 else
                     .unavailable,
@@ -3686,7 +4718,232 @@ fn restoreCheckpoint(
     };
 }
 
-fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.SessionConfigV1, callbacks_ptr: ?*const wire.SessionCallbacksV1, out_session: ?*?*wire.SessionHandle, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
+const AuthorityIssueJson = struct {
+    issue_id: []const u8,
+    subsystem: []const u8,
+    reason: []const u8,
+    skill_id: ?[]const u8,
+    permission_rule_id: ?[]const u8,
+    server_binding_identity: ?[]const u8,
+    authority_binding: ?[]const u8,
+    canonical_name: ?[]const u8,
+};
+
+const SessionMcpToolJson = struct {
+    model_name: []const u8,
+    namespace: []const u8,
+    canonical_name: []const u8,
+    server_binding_identity: []const u8,
+    schema_fingerprint: []const u8,
+    permission_binding: []const u8,
+    negotiated_protocol: []const u8,
+};
+
+const SessionDescriptionJson = struct {
+    schema: []const u8 = "agentcore.session-description/v1",
+    session_id: []const u8,
+    origin: []const u8,
+    lifecycle: []const u8,
+    registered: bool,
+    last_run_id: u64,
+    last_compact_id: u64,
+    checkpoint_generation: u64,
+    policy_generation: u64,
+    catalog_generation: u64,
+    model: []const u8,
+    conversation: struct {
+        message_count: u64,
+        compact_boundary: u64,
+    },
+    skill: struct {
+        catalog_revision: ?[]const u8,
+    },
+    mcp: struct {
+        selection_fingerprint: []const u8,
+        tools: []const SessionMcpToolJson,
+    },
+    budget: struct {
+        hard_bytes: u64,
+        soft_bytes: u64,
+        durable_usage_bytes: u64,
+        available_bytes: u64,
+        compaction_recommended: bool,
+        last_outcome: []const u8,
+        required_bytes: u64,
+    },
+    restore: struct {
+        health: []const u8,
+        invalidated_skill_authority: u32,
+        invalidated_permission_rules: u32,
+        invalidated_mcp_bindings: u32,
+        issues: []const AuthorityIssueJson,
+    },
+};
+
+const RestoreReportJson = struct {
+    schema: []const u8 = "agentcore.restore-report/v1",
+    health: []const u8,
+    session_id: []const u8,
+    checkpoint_generation: u64,
+    policy_generation: u64,
+    catalog_generation: u64,
+    skill: struct {
+        disposition: []const u8,
+        checkpoint_enabled: u32,
+        restored_enabled: u32,
+        invalidated: u32,
+    },
+    permission: struct {
+        restored_rules: u32,
+        invalidated_rules: u32,
+    },
+    mcp: struct {
+        restored_bindings: u32,
+        invalidated_bindings: u32,
+    },
+    issues: []const AuthorityIssueJson,
+};
+
+fn encodeAuthorityIssues(
+    output_allocator: std.mem.Allocator,
+    issues: []const session_authority.AuthorityIssue,
+) ![]AuthorityIssueJson {
+    const result = try output_allocator.alloc(AuthorityIssueJson, issues.len);
+    for (issues, result) |issue, *dto| dto.* = .{
+        .issue_id = try lowerHexAlloc(output_allocator, &issue.issue_id),
+        .subsystem = @tagName(issue.subsystem),
+        .reason = @tagName(issue.reason),
+        .skill_id = if (allZero(issue.skill_id[0..]))
+            null
+        else
+            try output_allocator.dupe(u8, &issue.skill_id),
+        .permission_rule_id = if (allZero(issue.permission_rule_id[0..]))
+            null
+        else
+            try lowerHexAlloc(output_allocator, &issue.permission_rule_id),
+        .server_binding_identity = if (allZero(issue.server_binding_identity[0..]))
+            null
+        else
+            try lowerHexAlloc(output_allocator, &issue.server_binding_identity),
+        .authority_binding = if (allZero(issue.authority_binding[0..]))
+            null
+        else
+            try lowerHexAlloc(output_allocator, &issue.authority_binding),
+        .canonical_name = if (issue.canonical_name.len == 0)
+            null
+        else
+            issue.canonical_name,
+    };
+    return result;
+}
+
+fn encodeSessionDescription(
+    output_allocator: std.mem.Allocator,
+    description: *const session_authority.SessionDescription,
+) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(output_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = try a.alloc(SessionMcpToolJson, description.mcp_tools.len);
+    for (description.mcp_tools, tools) |tool, *dto| dto.* = .{
+        .model_name = tool.model_name,
+        .namespace = tool.namespace,
+        .canonical_name = tool.canonical_name,
+        .server_binding_identity = try lowerHexAlloc(a, &tool.server_binding_identity),
+        .schema_fingerprint = try lowerHexAlloc(a, &tool.schema_fingerprint),
+        .permission_binding = try lowerHexAlloc(a, &tool.permission_binding),
+        .negotiated_protocol = tool.era.version(),
+    };
+    const dto = SessionDescriptionJson{
+        .session_id = description.session_id.asSlice(),
+        .origin = @tagName(description.origin),
+        .lifecycle = @tagName(description.lifecycle),
+        .registered = description.registered,
+        .last_run_id = description.last_run_id,
+        .last_compact_id = description.last_compact_id,
+        .checkpoint_generation = description.checkpoint_generation,
+        .policy_generation = description.policy_generation,
+        .catalog_generation = description.catalog_generation,
+        .model = description.model,
+        .conversation = .{
+            .message_count = description.conversation_messages,
+            .compact_boundary = description.compact_boundary,
+        },
+        .skill = .{
+            .catalog_revision = if (description.skill_revision) |*revision|
+                revision
+            else
+                null,
+        },
+        .mcp = .{
+            .selection_fingerprint = try lowerHexAlloc(a, &description.mcp_selection_fingerprint),
+            .tools = tools,
+        },
+        .budget = .{
+            .hard_bytes = description.budget.hard_bytes,
+            .soft_bytes = description.budget.soft_bytes,
+            .durable_usage_bytes = description.budget.durable_usage_bytes,
+            .available_bytes = description.budget.available_bytes,
+            .compaction_recommended = description.budget.compaction_recommended,
+            .last_outcome = @tagName(description.budget.last_outcome),
+            .required_bytes = description.budget.required_bytes,
+        },
+        .restore = .{
+            .health = @tagName(description.restore_health),
+            .invalidated_skill_authority = description.invalidated_skill_authority,
+            .invalidated_permission_rules = description.invalidated_permission_rules,
+            .invalidated_mcp_bindings = description.invalidated_mcp_bindings,
+            .issues = try encodeAuthorityIssues(a, description.authority_issues),
+        },
+    };
+    const encoded = std.json.Stringify.valueAlloc(output_allocator, dto, .{}) catch
+        return error.OutOfMemory;
+    if (encoded.len > wire.MAX_DESCRIPTION_JSON_BYTES_V1) {
+        output_allocator.free(encoded);
+        return error.ResourceLimit;
+    }
+    return encoded;
+}
+
+fn encodeRestoreReport(
+    output_allocator: std.mem.Allocator,
+    report: *const session_authority.RestoreReport,
+) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(output_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const dto = RestoreReportJson{
+        .health = @tagName(report.health),
+        .session_id = report.session_id.asSlice(),
+        .checkpoint_generation = report.checkpoint_generation,
+        .policy_generation = report.policy_generation,
+        .catalog_generation = report.catalog_generation,
+        .skill = .{
+            .disposition = @tagName(report.skill.disposition),
+            .checkpoint_enabled = report.skill.checkpoint_enabled,
+            .restored_enabled = report.skill.restored_enabled,
+            .invalidated = report.skill.invalidated,
+        },
+        .permission = .{
+            .restored_rules = report.permission_rules_restored,
+            .invalidated_rules = report.permission_rules_invalidated,
+        },
+        .mcp = .{
+            .restored_bindings = report.mcp_bindings_restored,
+            .invalidated_bindings = report.mcp_bindings_invalidated,
+        },
+        .issues = try encodeAuthorityIssues(a, report.issues),
+    };
+    const encoded = std.json.Stringify.valueAlloc(output_allocator, dto, .{}) catch
+        return error.OutOfMemory;
+    if (encoded.len > wire.MAX_DESCRIPTION_JSON_BYTES_V1) {
+        output_allocator.free(encoded);
+        return error.ResourceLimit;
+    }
+    return encoded;
+}
+
+fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.SessionCreateConfigV1, callbacks_ptr: ?*const wire.SessionCallbacksV1, out_session: ?*?*wire.SessionHandle, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
     if (out_session) |out| out.* = null;
     emptyError(out_error);
     const runtime = runtimeFrom(runtime_handle orelse return fail(wire.STATUS_INVALID_ARGUMENT, "runtime is required", out_error));
@@ -3694,32 +4951,34 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
         return failError(catalogLifecycleStatus(err), err, out_error);
     defer runtime_call.deinit();
     const config = config_ptr orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session config is required", out_error);
+    const host = config.host orelse return fail(wire.STATUS_INVALID_ARGUMENT, "Session Host config is required", out_error);
     const callbacks = callbacks_ptr orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session callbacks are required", out_error);
     const out = out_session orelse return fail(wire.STATUS_INVALID_ARGUMENT, "out_session is required", out_error);
-    if (config.struct_size != @sizeOf(wire.SessionConfigV1) or !allZero(config.reserved) or
+    if (config.struct_size != @sizeOf(wire.SessionCreateConfigV1) or config.reserved0 != 0 or !allZero(config.reserved) or
+        host.struct_size != @sizeOf(wire.SessionHostConfigV1) or !allZero(host.reserved) or
         callbacks.struct_size != @sizeOf(wire.SessionCallbacksV1) or callbacks.reserved0 != 0 or
         !allZero(callbacks.reserved) or callbacks.on_event == null or
         (callbacks.on_ui_request != null and callbacks.release_response == null))
-        return fail(wire.STATUS_INVALID_ARGUMENT, "invalid SessionConfigV1 or SessionCallbacksV1", out_error);
-    const kind = provider(config.provider_kind_code) orelse return fail(wire.STATUS_INVALID_ARGUMENT, "unknown provider", out_error);
-    const mode = permissionMode(config.permission_mode_code) orelse return fail(wire.STATUS_INVALID_ARGUMENT, "unknown permission mode", out_error);
-    const shell = shellPolicy(config.shell_policy_code) orelse return fail(wire.STATUS_INVALID_ARGUMENT, "unknown shell policy", out_error);
+        return fail(wire.STATUS_INVALID_ARGUMENT, "invalid Session create, Host, or callback config", out_error);
+    const kind = provider(host.provider_kind_code) orelse return fail(wire.STATUS_INVALID_ARGUMENT, "unknown provider", out_error);
+    const mode = permissionMode(host.permission_mode_code) orelse return fail(wire.STATUS_INVALID_ARGUMENT, "unknown permission mode", out_error);
+    const shell = shellPolicy(host.shell_policy_code) orelse return fail(wire.STATUS_INVALID_ARGUMENT, "unknown shell policy", out_error);
     var session_metadata: u64 = 0;
     for ([_]wire.BytesViewV1{
-        config.api_key,
+        host.api_key,
         config.model,
-        config.base_url,
-        config.workspace_root,
-        config.workspace_home,
+        host.base_url,
+        host.workspace_root,
+        host.workspace_home,
     }) |value| {
         addMetadata(&session_metadata, value.len, wire.MAX_SESSION_METADATA_BYTES_V1) catch |err|
             return failError(inputErrorStatus(err), err, out_error);
     }
-    const api_key = text(config.api_key) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+    const api_key = text(host.api_key) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
     const model = text(config.model) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
-    const base_url = text(config.base_url) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
-    const root = text(config.workspace_root) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
-    const home = text(config.workspace_home) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+    const base_url = text(host.base_url) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+    const root = text(host.workspace_root) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+    const home = text(host.workspace_home) catch |err| return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
     if (api_key.len == 0 or model.len == 0 or root.len == 0) return fail(wire.STATUS_INVALID_ARGUMENT, "api_key, model and workspace_root are required", out_error);
     var workspace = skill_catalog_handles.CanonicalWorkspace.init(
         allocator,
@@ -3729,12 +4988,12 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     defer workspace.deinit();
     var scratch = std.heap.ArenaAllocator.init(allocator);
     defer scratch.deinit();
-    const initial_selection = if (config.skill_selection) |selection|
+    const initial_selection = if (host.skill_selection) |selection|
         parseSkillSelection(scratch.allocator(), selection) catch |err|
             return failError(inputErrorStatus(err), err, out_error)
     else
         null;
-    const initial_permission_rules = if (config.permission_rules) |rules|
+    const initial_permission_rules = if (host.permission_rules) |rules|
         parsePermissionRuleSet(scratch.allocator(), rules) catch |err|
             return failError(inputErrorStatus(err), err, out_error)
     else
@@ -3744,7 +5003,7 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     var initial_binding = createInitialSkillBinding(
         runtime,
         &workspace_scope_id,
-        if (config.skill_catalog) |catalog_handle|
+        if (host.skill_catalog) |catalog_handle|
             catalogFrom(catalog_handle)
         else
             null,
@@ -3762,11 +5021,18 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
         binding.deinit(&runtime.catalogs);
     const allowed = borrowedViews(
         scratch.allocator(),
-        config.allowed_tools,
-        config.allowed_tool_count,
+        host.allowed_tools,
+        host.allowed_tool_count,
         &session_metadata,
         wire.MAX_SESSION_METADATA_BYTES_V1,
     ) catch |err|
+        return failError(inputErrorStatus(err), err, out_error);
+    const initial_mcp_selection = parseMcpSelection(
+        scratch.allocator(),
+        host.mcp_selection,
+        &session_metadata,
+    ) catch |err| return failError(inputErrorStatus(err), err, out_error);
+    const budget_profile = parseDurableBudget(host.durable_budget) catch |err|
         return failError(inputErrorStatus(err), err, out_error);
     if (shell == .sandboxed) {
         sandbox_admission.validate(allocator) catch |err| return failError(
@@ -3788,6 +5054,8 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
         .allowed_tools = allowed,
         .workspace_scope_id = workspace_scope_id,
         .skill_binding = initial_binding,
+        .mcp_selectors = initial_mcp_selection,
+        .budget_profile = budget_profile,
     }) catch |err| {
         return failError(
             if (err == error.OutOfMemory)
@@ -3807,6 +5075,177 @@ fn sessionCreate(runtime_handle: ?*wire.RuntimeHandle, config_ptr: ?*const wire.
     return wire.STATUS_OK;
 }
 
+fn sessionRestore(
+    runtime_handle: ?*wire.RuntimeHandle,
+    config_ptr: ?*const wire.SessionRestoreConfigV1,
+    callbacks_ptr: ?*const wire.SessionCallbacksV1,
+    out_session: ?*?*wire.SessionHandle,
+    out_report: ?*wire.OwnedBytesV1,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    if (out_session) |out| out.* = null;
+    if (out_report) |out| out.* = .{ .ptr = null, .len = 0 };
+    emptyError(out_error);
+    const runtime = runtimeFrom(runtime_handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "runtime is required", out_error));
+    const config = config_ptr orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "restore config is required", out_error);
+    const host = config.host orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "Session Host config is required", out_error);
+    const callbacks = callbacks_ptr orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "Session callbacks are required", out_error);
+    const source_raw = config.source orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "checkpoint source is required", out_error);
+    const limits_raw = config.limits orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "checkpoint limits are required", out_error);
+    const session_out = out_session orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "out_session is required", out_error);
+    const report_out = out_report orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "out_restore_report_json is required", out_error);
+    if (config.struct_size != @sizeOf(wire.SessionRestoreConfigV1) or
+        config.reserved0 != 0 or !allZero(config.reserved) or
+        host.struct_size != @sizeOf(wire.SessionHostConfigV1) or
+        !allZero(host.reserved) or
+        callbacks.struct_size != @sizeOf(wire.SessionCallbacksV1) or
+        callbacks.reserved0 != 0 or !allZero(callbacks.reserved) or
+        callbacks.on_event == null or
+        (callbacks.on_ui_request != null and callbacks.release_response == null) or
+        source_raw.struct_size != @sizeOf(wire.CheckpointSourceV1) or
+        source_raw.reserved0 != 0 or !allZero(source_raw.reserved) or
+        source_raw.read == null)
+        return fail(wire.STATUS_INVALID_ARGUMENT, "invalid restore, Host, callback, or source config", out_error);
+    var runtime_call = runtime.catalogs.enterCall() catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    defer runtime_call.deinit();
+    const kind = provider(host.provider_kind_code) orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "unknown provider", out_error);
+    const mode = permissionMode(host.permission_mode_code) orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "unknown permission mode", out_error);
+    const shell = shellPolicy(host.shell_policy_code) orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "unknown shell policy", out_error);
+    var session_metadata: u64 = 0;
+    for ([_]wire.BytesViewV1{
+        host.api_key,
+        host.base_url,
+        host.workspace_root,
+        host.workspace_home,
+    }) |value| addMetadata(
+        &session_metadata,
+        value.len,
+        wire.MAX_SESSION_METADATA_BYTES_V1,
+    ) catch |err| return failError(inputErrorStatus(err), err, out_error);
+    const api_key = text(host.api_key) catch |err|
+        return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+    const base_url = text(host.base_url) catch |err|
+        return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+    const root = text(host.workspace_root) catch |err|
+        return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+    const home = text(host.workspace_home) catch |err|
+        return failError(wire.STATUS_INVALID_ARGUMENT, err, out_error);
+    if (api_key.len == 0 or root.len == 0)
+        return fail(wire.STATUS_INVALID_ARGUMENT, "api_key and workspace_root are required", out_error);
+    var workspace = skill_catalog_handles.CanonicalWorkspace.init(
+        allocator,
+        root,
+        home,
+    ) catch |err| return failError(catalogLifecycleStatus(err), err, out_error);
+    defer workspace.deinit();
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    const skill_selection = if (host.skill_selection) |selection|
+        parseSkillSelection(scratch.allocator(), selection) catch |err|
+            return failError(inputErrorStatus(err), err, out_error)
+    else
+        null;
+    const permission_rules = if (host.permission_rules) |rules|
+        parsePermissionRuleSet(scratch.allocator(), rules) catch |err|
+            return failError(inputErrorStatus(err), err, out_error)
+    else
+        null;
+    const allowed = borrowedViews(
+        scratch.allocator(),
+        host.allowed_tools,
+        host.allowed_tool_count,
+        &session_metadata,
+        wire.MAX_SESSION_METADATA_BYTES_V1,
+    ) catch |err| return failError(inputErrorStatus(err), err, out_error);
+    const mcp_selectors = parseMcpSelection(
+        scratch.allocator(),
+        host.mcp_selection,
+        &session_metadata,
+    ) catch |err| return failError(inputErrorStatus(err), err, out_error);
+    const budget_profile = parseDurableBudget(host.durable_budget) catch |err|
+        return failError(inputErrorStatus(err), err, out_error);
+    const limits = parseCheckpointLimits(limits_raw) catch |err|
+        return failError(inputErrorStatus(err), err, out_error);
+    if (shell == .sandboxed) sandbox_admission.validate(allocator) catch |err|
+        return failError(
+            if (err == error.OutOfMemory) wire.STATUS_OUT_OF_MEMORY else wire.STATUS_INVALID_ARGUMENT,
+            err,
+            out_error,
+        );
+    const workspace_scope_id = runtime.catalogs.scopeId(&workspace) catch |err|
+        return failError(catalogLifecycleStatus(err), err, out_error);
+    var current_skill_binding = createInitialSkillBinding(
+        runtime,
+        &workspace_scope_id,
+        if (host.skill_catalog) |catalog_handle| catalogFrom(catalog_handle) else null,
+        if (skill_selection) |*selection| selection else null,
+    ) catch |err| return failError(
+        if (err == error.InvalidSkillBinding)
+            wire.STATUS_INVALID_ARGUMENT
+        else
+            catalogLifecycleStatus(err),
+        err,
+        out_error,
+    );
+    defer if (current_skill_binding) |*binding|
+        binding.deinit(&runtime.catalogs);
+    var source = AbiCheckpointSource{ .descriptor = source_raw.* };
+    const restored = restoreCheckpoint(
+        runtime,
+        .{
+            .callbacks = callbacks.*,
+            .provider_kind = kind,
+            .api_key = api_key,
+            .base_url = if (base_url.len == 0) null else base_url,
+            .permission_mode = mode,
+            .permission_rules = permission_rules,
+            .workspace = .{ .root = workspace.root, .home = workspace.home, .shell = shell },
+            .allowed_tools = allowed,
+            .mcp_selectors = mcp_selectors,
+            .workspace_scope_id = workspace_scope_id,
+            .budget_profile = budget_profile,
+        },
+        &current_skill_binding,
+        source.interface(),
+        limits,
+    ) catch |err| return failError(switch (err) {
+        error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
+        error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
+        error.InvalidBudget, error.InvalidProfile, error.InvalidSkillBinding => wire.STATUS_INVALID_ARGUMENT,
+        error.Corrupt, error.InvalidState => wire.STATUS_CHECKPOINT_CORRUPT,
+        error.UnsupportedSchema,
+        error.PermissionStateUnsupported,
+        error.McpStateUnsupported,
+        => wire.STATUS_CHECKPOINT_UNSUPPORTED,
+        error.IncompatibleAbi => wire.STATUS_CHECKPOINT_INCOMPATIBLE,
+        error.SourceFailed => wire.STATUS_CHECKPOINT_IO,
+        error.SessionAlreadyOpen => wire.STATUS_LOGICAL_SESSION_CONFLICT,
+        error.RuntimeUnavailable => wire.STATUS_INVALID_STATE,
+        else => wire.STATUS_CORE_ERROR,
+    }, err, out_error);
+    const encoded_report = encodeRestoreReport(allocator, &restored.report) catch |err| {
+        std.debug.assert(restored.session.tryBeginDestroy());
+        restored.session.core_session.destroy() catch unreachable;
+        deinitAbiSession(restored.session, runtime);
+        return failError(inputErrorStatus(err), err, out_error);
+    };
+    report_out.* = .{ .ptr = encoded_report.ptr, .len = encoded_report.len };
+    session_out.* = restored.session.handle();
+    return wire.STATUS_OK;
+}
+
 fn sessionDestroy(handle: ?*wire.SessionHandle, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
     emptyError(out_error);
     const self = sessionFrom(handle orelse return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
@@ -3820,6 +5259,12 @@ fn sessionDestroy(handle: ?*wire.SessionHandle, out_error: ?*wire.OwnedBytesV1) 
         self.cancelDestroy();
         return failError(if (err == error.SessionBusy) wire.STATUS_BUSY else wire.STATUS_INVALID_STATE, err, out_error);
     };
+    deinitAbiSession(self, runtime);
+    return wire.STATUS_OK;
+}
+
+fn deinitAbiSession(self: *AbiSession, runtime: *AbiRuntime) void {
+    self.clearStagedPermission();
     if (self.policy_root) |root_frame| {
         root_frame.release();
         self.policy_root = null;
@@ -3836,6 +5281,31 @@ fn sessionDestroy(handle: ?*wire.SessionHandle, out_error: ?*wire.OwnedBytesV1) 
     if (self.authority_issues) |*issues| issues.deinit();
     self.permission_state.deinit();
     allocator.destroy(self);
+}
+
+fn sessionDescribe(
+    handle: ?*wire.SessionHandle,
+    out_description: ?*wire.OwnedBytesV1,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    if (out_description) |out| out.* = .{ .ptr = null, .len = 0 };
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    const out = out_description orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "out_description_json is required", out_error);
+    var description = self.describe(allocator) catch |err|
+        return failError(switch (err) {
+            error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
+            error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
+            error.SessionBusy => wire.STATUS_BUSY,
+            error.InvalidSessionState => wire.STATUS_INVALID_STATE,
+            else => wire.STATUS_CORE_ERROR,
+        }, err, out_error);
+    defer description.deinit();
+    const encoded = encodeSessionDescription(allocator, &description) catch |err|
+        return failError(inputErrorStatus(err), err, out_error);
+    out.* = .{ .ptr = encoded.ptr, .len = encoded.len };
     return wire.STATUS_OK;
 }
 
@@ -3928,6 +5398,38 @@ fn sessionUpdatePermissionRules(
     return wire.STATUS_OK;
 }
 
+fn sessionUpdateMcp(
+    handle: ?*wire.SessionHandle,
+    selection_ptr: ?*const wire.McpSelectionV1,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    const selection = selection_ptr orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "MCP selection is required", out_error);
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+    var metadata: u64 = 0;
+    const selectors = parseMcpSelection(
+        scratch.allocator(),
+        selection,
+        &metadata,
+    ) catch |err| return failError(inputErrorStatus(err), err, out_error);
+    self.updateMcpView(selectors, .fresh) catch |err|
+        return failError(switch (err) {
+            error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
+            error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
+            error.CheckpointBudgetRequired => wire.STATUS_CHECKPOINT_BUDGET_REQUIRED,
+            error.NotRefreshed => wire.STATUS_MCP_NOT_REFRESHED,
+            error.InvalidSelection, error.InvalidMcpBinding => wire.STATUS_INVALID_MCP_SELECTION,
+            error.SessionBusy => wire.STATUS_BUSY,
+            error.InvalidSessionState => wire.STATUS_INVALID_STATE,
+            else => wire.STATUS_CORE_ERROR,
+        }, err, out_error);
+    return wire.STATUS_OK;
+}
+
 fn sessionRunInput(
     handle: ?*wire.SessionHandle,
     run_id: u64,
@@ -3946,10 +5448,16 @@ fn sessionRunInput(
         return failError(catalogLifecycleStatus(err), err, out_error);
     defer runtime_call.deinit();
     if (!self.tryBeginRun()) return fail(wire.STATUS_BUSY, "Session has an active facade call", out_error);
+    self.pending_permission = null;
+    self.clearStagedPermission();
     // This defer is the facade completion linearization point. Everything that
     // reads AbiSession or publishes RunResult/diagnostics happens before it;
     // after it releases the gate, sessionDestroy may immediately free `self`.
-    defer self.finishRun();
+    defer {
+        self.pending_permission = null;
+        self.clearStagedPermission();
+        self.finishRun();
+    }
     if (self.facade_poisoned.load(.acquire))
         return fail(wire.STATUS_INVALID_STATE, "Session is poisoned by a previous admitted Run failure", out_error);
     const input = input_ptr orelse return fail(wire.STATUS_INVALID_ARGUMENT, "RunInputV1 is required", out_error);
@@ -3977,6 +5485,8 @@ fn sessionRunInput(
                 options.max_turns,
             ) catch |err| {
                 const status = runErrorStatus(self, err);
+                if (err == error.CheckpointBudgetRequired)
+                    writeRunBudgetFields(self, out);
                 if (err == error.AdmittedCleanupFailed or
                     self.core_session.isPoisoned())
                     self.facade_poisoned.store(true, .release);
@@ -4010,6 +5520,8 @@ fn sessionRunInput(
                 options.max_turns,
             ) catch |err| {
                 const status = skillRunErrorStatus(self, err);
+                if (err == error.CheckpointBudgetRequired)
+                    writeRunBudgetFields(self, out);
                 if (err == error.AdmittedCleanupFailed or
                     self.core_session.isPoisoned())
                     self.facade_poisoned.store(true, .release);
@@ -4029,8 +5541,13 @@ fn sessionRunInput(
                 .stop_reason_code = wire.STOP_ABORTED,
                 .turns = 0,
                 .tool_calls = 0,
+                .checkpoint_outcome_code = 0,
+                .result_flags = 0,
+                .durable_usage_bytes = 0,
+                .required_checkpoint_bytes = 0,
                 .reserved = [_]u64{0} ** 4,
             };
+            writeRunBudgetFields(self, out);
             invokeTestEpilogueHook(run_id);
             return wire.STATUS_OK;
         },
@@ -4038,10 +5555,42 @@ fn sessionRunInput(
     };
     defer if (result.suspend_info) |suspend_info| suspend_info.deinit();
     invokeTestEpilogueHook(run_id);
-    const stop_code = stopReason(self, result.stop_reason) catch
-        return fail(wire.STATUS_INTERNAL_ERROR, "core returned a stop reason unsupported by AgentCore ABI v1", out_error);
-    out.* = .{ .struct_size = @sizeOf(wire.RunResultV1), .stop_reason_code = stop_code, .turns = result.turns, .tool_calls = result.tool_calls, .reserved = [_]u64{0} ** 4 };
+    const stop_code = switch (self.budget_state.last_outcome) {
+        .budget_exhausted => wire.STOP_CHECKPOINT_BUDGET_EXHAUSTED,
+        .resource_limit => wire.STOP_CHECKPOINT_RESOURCE_LIMIT,
+        .none, .budget_required => stopReason(self, result.stop_reason) catch
+            return fail(wire.STATUS_INTERNAL_ERROR, "core returned a stop reason unsupported by AgentCore ABI v1", out_error),
+    };
+    out.* = .{
+        .struct_size = @sizeOf(wire.RunResultV1),
+        .stop_reason_code = stop_code,
+        .turns = result.turns,
+        .tool_calls = result.tool_calls,
+        .checkpoint_outcome_code = 0,
+        .result_flags = 0,
+        .durable_usage_bytes = 0,
+        .required_checkpoint_bytes = 0,
+        .reserved = [_]u64{0} ** 4,
+    };
+    writeRunBudgetFields(self, out);
     return wire.STATUS_OK;
+}
+
+fn writeRunBudgetFields(self: *const AbiSession, out: *wire.RunResultV1) void {
+    const budget = self.budget_state.describe();
+    out.struct_size = @sizeOf(wire.RunResultV1);
+    out.checkpoint_outcome_code = switch (budget.last_outcome) {
+        .none => wire.RUN_CHECKPOINT_NONE,
+        .budget_required => wire.RUN_CHECKPOINT_BUDGET_REQUIRED,
+        .budget_exhausted => wire.RUN_CHECKPOINT_BUDGET_EXHAUSTED,
+        .resource_limit => wire.RUN_CHECKPOINT_RESOURCE_LIMIT,
+    };
+    out.result_flags = if (budget.compaction_recommended)
+        wire.RUN_RESULT_COMPACTION_RECOMMENDED
+    else
+        0;
+    out.durable_usage_bytes = budget.durable_usage_bytes;
+    out.required_checkpoint_bytes = budget.required_bytes;
 }
 
 fn sessionAbort(handle: ?*wire.SessionHandle, run_id: u64, reason_code: u32, out_error: ?*wire.OwnedBytesV1) callconv(.c) u32 {
@@ -4134,6 +5683,55 @@ fn sessionAbortCompact(
     return wire.STATUS_OK;
 }
 
+fn sessionExportCheckpoint(
+    handle: ?*wire.SessionHandle,
+    config_ptr: ?*const wire.CheckpointExportConfigV1,
+    out_result: ?*wire.CheckpointExportResultV1,
+    out_error: ?*wire.OwnedBytesV1,
+) callconv(.c) u32 {
+    if (out_result) |out| out.* = std.mem.zeroes(wire.CheckpointExportResultV1);
+    emptyError(out_error);
+    const self = sessionFrom(handle orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "session is required", out_error));
+    const config = config_ptr orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "checkpoint export config is required", out_error);
+    const out = out_result orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "checkpoint export result is required", out_error);
+    const limits_raw = config.limits orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "checkpoint limits are required", out_error);
+    const sink_raw = config.sink orelse
+        return fail(wire.STATUS_INVALID_ARGUMENT, "checkpoint sink is required", out_error);
+    if (config.struct_size != @sizeOf(wire.CheckpointExportConfigV1) or
+        config.reserved0 != 0 or !allZero(config.reserved) or
+        sink_raw.struct_size != @sizeOf(wire.CheckpointSinkV1) or
+        sink_raw.reserved0 != 0 or !allZero(sink_raw.reserved) or
+        sink_raw.write == null)
+        return fail(wire.STATUS_INVALID_ARGUMENT, "invalid checkpoint export or sink config", out_error);
+    const limits = parseCheckpointLimits(limits_raw) catch |err|
+        return failError(inputErrorStatus(err), err, out_error);
+    var sink = AbiCheckpointSink{ .descriptor = sink_raw.* };
+    const report = self.exportCheckpoint(limits, sink.interface()) catch |err|
+        return failError(switch (err) {
+            error.OutOfMemory => wire.STATUS_OUT_OF_MEMORY,
+            error.InvalidBudget => wire.STATUS_INVALID_ARGUMENT,
+            error.ResourceLimit => wire.STATUS_RESOURCE_LIMIT,
+            error.SinkFailed => wire.STATUS_CHECKPOINT_IO,
+            error.SessionBusy, error.RuntimeBusy => wire.STATUS_BUSY,
+            error.InvalidSessionState, error.RuntimeUnavailable => wire.STATUS_INVALID_STATE,
+            else => wire.STATUS_CORE_ERROR,
+        }, err, out_error);
+    out.* = .{
+        .struct_size = @sizeOf(wire.CheckpointExportResultV1),
+        .reserved0 = 0,
+        .checkpoint_generation = self.checkpoint_generation,
+        .total_bytes = report.total_bytes,
+        .chunk_count = report.chunk_count,
+        .digest = report.digest,
+        .reserved = [_]u64{0} ** 4,
+    };
+    return wire.STATUS_OK;
+}
+
 fn bufferRelease(buffer: ?*wire.OwnedBytesV1) callconv(.c) void {
     const out = buffer orelse return;
     const len = std.math.cast(usize, out.len) orelse {
@@ -4154,15 +5752,21 @@ const api_v1 = wire.ApiV1{
     .runtime_destroy = runtimeDestroy,
     .runtime_query_skill_catalog = runtimeQuerySkillCatalog,
     .skill_catalog_release = skillCatalogRelease,
+    .runtime_refresh_mcp = runtimeRefreshMcp,
+    .runtime_describe_mcp = runtimeDescribeMcp,
     .session_create = sessionCreate,
+    .session_restore = sessionRestore,
     .session_destroy = sessionDestroy,
+    .session_describe = sessionDescribe,
     .session_set_model = sessionSetModel,
     .session_update_skills = sessionUpdateSkills,
     .session_update_permission_rules = sessionUpdatePermissionRules,
+    .session_update_mcp = sessionUpdateMcp,
     .session_run_input = sessionRunInput,
     .session_abort = sessionAbort,
     .session_compact = sessionCompact,
     .session_abort_compact = sessionAbortCompact,
+    .session_export_checkpoint = sessionExportCheckpoint,
     .buffer_release = bufferRelease,
     .reserved = [_]u64{0} ** 4,
 };
@@ -4787,6 +6391,29 @@ test "Revision 6 AgentCore Permission callback binds grants and preserves typed 
         .core_session = native_session,
     };
     defer fake.permission_state.deinit();
+    const PublishPermission = struct {
+        fn call(
+            session: *AbiSession,
+            run_id: u64,
+            tool_call_id: []const u8,
+            tool_name: []const u8,
+            allowed: bool,
+        ) bool {
+            return session.publishStagedPermission(
+                session.core_session.session_id,
+                run_id,
+                .{ .policy_decision = .{
+                    .trace_id = [_]u8{0} ** 12,
+                    .depth = 0,
+                    .id = tool_call_id,
+                    .tool = tool_name,
+                    .decision = if (allowed) "allow" else "deny",
+                    .source = "test",
+                    .allowed = allowed,
+                } },
+            );
+        }
+    };
 
     Probe.status = wire.UI_ANSWERED;
     Probe.permission = "allow_session";
@@ -5069,7 +6696,72 @@ test "Revision 6 AgentCore Permission callback binds grants and preserves typed 
             fake.permission_state.ruleCount(),
         );
         try std.testing.expectEqual(@as(usize, 0), fake.permission_audit.?.count());
+        try std.testing.expect(!PublishPermission.call(
+            &fake,
+            2,
+            "call-audit-failure",
+            "Write",
+            false,
+        ));
+        fake.callback_status.store(wire.STATUS_OK, .release);
     }
+
+    // A Host answer is not the authorization decision. If durable Session
+    // authority cannot be reserved, the final policy event denies execution
+    // and commits one receipt containing both facts.
+    const budget_profile = session_budget.Profile{
+        .hard_bytes = 4096,
+        .soft_bytes = 3072,
+        .input_cap_bytes = 1024,
+        .provider_request_cap_bytes = 1024,
+        .provider_result_cap_bytes = 512,
+        .tool_result_cap_bytes = 256,
+        .mcp_result_cap_bytes = 256,
+        .audit_reserve_bytes = 128,
+        .terminal_reserve_bytes = 128,
+    };
+    var denied_budget = session_budget.Controller.init(
+        std.testing.allocator,
+        budget_profile,
+        .{
+            .input_delta_bytes = 0,
+            .projected_usage_bytes = 3900,
+            .minimum_required_bytes = 3900,
+        },
+    );
+    fake.active_budget_controller = &denied_budget;
+    Probe.permission = "allow_session";
+    try ToolCall.append(native_session, "call-budget-deny", "Write", "{}");
+    try std.testing.expect(
+        AbiSession.permissionDecisionOverride(
+            &fake,
+            "Write",
+            "{}",
+            .undecided,
+        ) == null,
+    );
+    try std.testing.expectError(
+        error.BudgetExhausted,
+        AbiSession.requestUi(&fake, .{
+            .session_id = native_session.session_id,
+            .run_id = 2,
+        }, std.testing.allocator, &write_request, &response),
+    );
+    fake.active_budget_controller = null;
+    try std.testing.expect(PublishPermission.call(
+        &fake,
+        2,
+        "call-budget-deny",
+        "Write",
+        false,
+    ));
+    var budget_audit = (try fake.permission_audit.?.cloneLast(
+        std.testing.allocator,
+    )).?;
+    defer budget_audit.deinit(std.testing.allocator);
+    try std.testing.expectEqual(session_permission.Decision.deny, budget_audit.decision);
+    try std.testing.expectEqual(session_permission.Response.allow_session, budget_audit.response.?);
+    try std.testing.expectEqual(session_permission.CallbackOutcome.answered, budget_audit.callback_outcome.?);
 
     Probe.permission = "deny_session";
     Probe.calls = 0;
@@ -5091,6 +6783,13 @@ test "Revision 6 AgentCore Permission callback binds grants and preserves typed 
         }, std.testing.allocator, &write_request, &response),
     );
     try std.testing.expect(response == .permission and response.permission == .deny_once);
+    try std.testing.expect(PublishPermission.call(
+        &fake,
+        2,
+        "call-deny",
+        "Write",
+        false,
+    ));
     try std.testing.expectEqual(
         core.permission.PermissionResult.deny,
         AbiSession.permissionDecisionOverride(
@@ -5136,6 +6835,13 @@ test "Revision 6 AgentCore Permission callback binds grants and preserves typed 
         }, std.testing.allocator, &edit_request, &response),
     );
     try std.testing.expect(response == .permission and response.permission == .allow_once);
+    try std.testing.expect(PublishPermission.call(
+        &fake,
+        3,
+        "call-once",
+        "Edit",
+        true,
+    ));
     try std.testing.expectEqual(@as(usize, 2), fake.permission_state.ruleCount());
     try std.testing.expect(
         AbiSession.permissionDecisionOverride(
@@ -5170,8 +6876,49 @@ test "Revision 6 AgentCore Permission callback binds grants and preserves typed 
         }, std.testing.allocator, &edit_request, &response),
     );
     try std.testing.expect(response == .permission and response.permission == .deny_once);
+    try std.testing.expect(PublishPermission.call(
+        &fake,
+        4,
+        "call-dont-ask-safety",
+        "Edit",
+        false,
+    ));
     try std.testing.expectEqual(calls_before_dont_ask, Probe.calls);
     native_session.permission_ctx.setMode(.default);
+
+    // A callback answer is bound to the exact tool call that was shown to the
+    // Host. A later policy event cannot substitute another call id even when
+    // the model-facing tool name and arguments are identical.
+    Probe.status = wire.UI_ANSWERED;
+    Probe.permission = "allow_once";
+    try ToolCall.append(native_session, "call-id-bound", "Edit", "{}");
+    try std.testing.expect(
+        AbiSession.permissionDecisionOverride(
+            &fake,
+            "Edit",
+            "{}",
+            .undecided,
+        ) == null,
+    );
+    try std.testing.expectEqual(
+        ui_request.RequestOutcome.answered,
+        try AbiSession.requestUi(&fake, .{
+            .session_id = native_session.session_id,
+            .run_id = 5,
+        }, std.testing.allocator, &edit_request, &response),
+    );
+    try std.testing.expect(!PublishPermission.call(
+        &fake,
+        5,
+        "call-id-substituted",
+        "Edit",
+        true,
+    ));
+    try std.testing.expectEqual(
+        wire.STATUS_INTERNAL_ERROR,
+        fake.callback_status.load(.acquire),
+    );
+    fake.callback_status.store(wire.STATUS_OK, .release);
 
     Probe.status = wire.UI_UNAVAILABLE;
     try ToolCall.append(native_session, "call-unavailable", "Edit", "{}");
@@ -5191,6 +6938,13 @@ test "Revision 6 AgentCore Permission callback binds grants and preserves typed 
         }, std.testing.allocator, &edit_request, &response),
     );
     try std.testing.expectEqual(wire.STATUS_OK, fake.callback_status.load(.acquire));
+    try std.testing.expect(PublishPermission.call(
+        &fake,
+        5,
+        "call-unavailable",
+        "Edit",
+        false,
+    ));
     last_audit.deinit(std.testing.allocator);
     last_audit = (try fake.permission_audit.?.cloneLast(
         std.testing.allocator,
@@ -5221,6 +6975,13 @@ test "Revision 6 AgentCore Permission callback binds grants and preserves typed 
             .run_id = 6,
         }, std.testing.allocator, &edit_request, &response),
     );
+    try std.testing.expect(PublishPermission.call(
+        &fake,
+        6,
+        "call-cancelled",
+        "Edit",
+        false,
+    ));
     last_audit.deinit(std.testing.allocator);
     last_audit = (try fake.permission_audit.?.cloneLast(
         std.testing.allocator,
@@ -5251,6 +7012,13 @@ test "Revision 6 AgentCore Permission callback binds grants and preserves typed 
             .run_id = 7,
         }, std.testing.allocator, &request, &response),
     );
+    try std.testing.expect(PublishPermission.call(
+        &fake,
+        7,
+        "call-contract",
+        "Bash",
+        false,
+    ));
     last_audit.deinit(std.testing.allocator);
     last_audit = (try fake.permission_audit.?.cloneLast(
         std.testing.allocator,
@@ -5356,13 +7124,21 @@ test "Revision 6 MCP schema denial precedes Permission callback eligibility" {
         }},
     });
     defer {
-        session.active_mcp_view = null;
+        session.active_mcp_environment = null;
         var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
         const status = sessionDestroy(session.handle(), &diagnostic);
         bufferRelease(&diagnostic);
         std.debug.assert(status == wire.STATUS_OK);
     }
-    session.active_mcp_view = &session.mcp_view.?;
+    var active_mcp_environment = try mcp_session.Environment.init(
+        std.testing.allocator,
+        &session.mcp_view.?,
+        session.core_session.tools.definitions,
+        session.core_session.tools.dispatcher(),
+        null,
+    );
+    defer active_mcp_environment.deinit();
+    session.active_mcp_environment = &active_mcp_environment;
     const model_name = session.mcp_view.?.entries[0].model_name;
     try std.testing.expectEqual(
         core.permission.PermissionResult.deny,
@@ -5756,6 +7532,7 @@ test "Revision 6 checkpoint restores compatible MCP view and exact Session grant
         .permission_rules = null,
         .workspace = .{ .root = cwd, .home = cwd },
         .allowed_tools = &.{},
+        .mcp_selectors = &selectors,
         .workspace_scope_id = scope_id,
     };
     var no_binding: ?SkillBinding = null;
@@ -6884,6 +8661,10 @@ test "Revision 6 restore preserves Conversation and invalidates unavailable MCP 
     );
     defer workspace.deinit();
     const scope_id = try runtime.catalogs.scopeId(&workspace);
+    const current_mcp_selection = [_]mcp_session.Selector{.{
+        .server_binding_identity = persisted_entries[0].server_binding_identity,
+        .tool_name = persisted_entries[0].tool_name,
+    }};
     const restore_config = RestoreHostConfig{
         .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
         .provider_kind = .anthropic,
@@ -6893,6 +8674,7 @@ test "Revision 6 restore preserves Conversation and invalidates unavailable MCP 
         .permission_rules = null,
         .workspace = .{ .root = cwd, .home = cwd },
         .allowed_tools = &.{},
+        .mcp_selectors = &current_mcp_selection,
         .workspace_scope_id = scope_id,
     };
     var no_binding: ?SkillBinding = null;
@@ -7588,6 +9370,27 @@ test "disabled AgentCore Skill fails before admission and materialization" {
     try std.testing.expectEqual(@as(u64, 0), native_session.last_run_id);
     try std.testing.expectEqual(initial_messages, native_session.conversation.messages.items.len);
     try std.testing.expectEqual(@as(usize, 0), materializations.active_count);
+
+    session.skill_binding.?.selection.deinit();
+    session.skill_binding.?.selection = try skill_availability.Selection.init(
+        std.testing.allocator,
+        &snapshot,
+        .{ .default_state = .enabled, .exceptions = &.{} },
+    );
+    session.budget_state = try session_budget.SessionState.init(.{
+        .input_cap_bytes = 128,
+    });
+    try std.testing.expectError(error.CheckpointBudgetRequired, session.runSkill(
+        &materializations,
+        1,
+        &snapshot.revision,
+        &record.skill_id,
+        "{\"values\":[]}",
+        1,
+    ));
+    try std.testing.expectEqual(@as(u64, 0), native_session.last_run_id);
+    try std.testing.expectEqual(initial_messages, native_session.conversation.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), materializations.active_count);
 }
 
 test "checkpoint budget rejects text before consuming run identity" {
@@ -7784,7 +9587,7 @@ test "durable mutation is rejected before model publication" {
     var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
     defer bufferRelease(&diagnostic);
     try std.testing.expectEqual(
-        wire.STATUS_RESOURCE_LIMIT,
+        wire.STATUS_CHECKPOINT_BUDGET_REQUIRED,
         sessionSetModel(facade.handle(), view(&larger_model), &diagnostic),
     );
     try std.testing.expectEqualStrings("test-model", native_session.model);
@@ -7915,6 +9718,99 @@ test "compact bounds Provider payload and preserves checkpointability" {
     decoded.deinit();
 }
 
+test "near-hard durable state can compact as a replacement transaction" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    const cwd = root_buffer[0..root_len];
+    const native_runtime = try core.agent_session.AgentRuntime.create(
+        std.testing.allocator,
+        .{ .builtin_tools = &.{} },
+    );
+    defer native_runtime.destroy() catch unreachable;
+    const native_session = try native_runtime.createSession(.{
+        .provider_kind = .anthropic,
+        .api_key = "test-key",
+        .model = "test-model",
+        .workspace = .{ .root = cwd },
+        .allowed_tools = &.{},
+    });
+    defer native_session.destroy() catch unreachable;
+    var runtime = AbiRuntime{
+        .core_runtime = native_runtime,
+        .host_tools = &.{},
+        .catalogs = skill_catalog_handles.RuntimeCatalogs.initWithSecret(
+            std.testing.allocator,
+            [_]u8{0x99} ** 32,
+        ),
+        .materializations = undefined,
+    };
+    defer {
+        runtime.catalogs.tryBeginDestroy() catch unreachable;
+        runtime.catalogs.finishDestroy();
+    }
+    var message_bytes: [512]u8 = undefined;
+    for (0..20) |index| {
+        @memset(&message_bytes, @as(u8, 'a') + @as(u8, @intCast(index % 20)));
+        try native_session.conversation.appendText(
+            if (index % 2 == 0) .user else .assistant,
+            &message_bytes,
+        );
+    }
+    var facade = AbiSession{
+        .callbacks = std.mem.zeroes(wire.SessionCallbacksV1),
+        .callback_status = .init(wire.STATUS_OK),
+        .facade_poisoned = .init(false),
+        .core_session = native_session,
+        .runtime = &runtime,
+    };
+    const initial = try facade.measureDurableUsage();
+    const hard = initial.total_bytes + 255;
+    const profile = session_budget.Profile{
+        .hard_bytes = hard,
+        .soft_bytes = hard - 1,
+        .input_cap_bytes = 1024,
+        .provider_request_cap_bytes = initial.total_bytes - 1,
+        .provider_result_cap_bytes = 64,
+        .tool_result_cap_bytes = 256,
+        .mcp_result_cap_bytes = 256,
+        .audit_reserve_bytes = 64,
+        .terminal_reserve_bytes = 128,
+    };
+    try profile.validate();
+    try std.testing.expect(
+        initial.total_bytes + try profile.minimumRunReserve() > hard,
+    );
+    facade.budget_state = try session_budget.SessionState.init(profile);
+    try facade.budget_state.updateUsage(initial.total_bytes);
+    var test_provider = CompactBudgetTestProvider{
+        .allocator = std.testing.allocator,
+        .payload_bytes = 64,
+    };
+
+    const report = try facade.compactBudgetedUsingProvider(
+        1,
+        test_provider.provider(),
+    );
+    try std.testing.expectEqual(
+        session_budget.Outcome.none,
+        facade.budget_state.last_outcome,
+    );
+    try std.testing.expectEqual(core.compact_kernel.Outcome.compacted, report.outcome);
+    try std.testing.expectEqual(@as(u32, 1), test_provider.calls);
+    try std.testing.expect(!facade.facade_poisoned.load(.acquire));
+    try std.testing.expect(facade.budget_state.durable_usage_bytes < initial.total_bytes);
+
+    var checkpoint = TestCheckpointBuffer{ .allocator = std.testing.allocator };
+    defer checkpoint.deinit();
+    const exported = try facade.exportCheckpoint(
+        profile.checkpointLimits(),
+        checkpoint.sink(),
+    );
+    try std.testing.expect(exported.total_bytes <= hard);
+}
+
 test "admitted resource limit remains bounded and checkpointable" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -7971,7 +9867,7 @@ test "admitted resource limit remains bounded and checkpointable" {
         std.debug.assert(status == wire.STATUS_OK);
     }
 
-    const preflight = try session.preflightRun(&.{"accepted"});
+    const preflight = try session.preflightRootRecords(&.{"accepted"});
     var controller = session_budget.Controller.init(
         std.testing.allocator,
         profile,

@@ -4,11 +4,11 @@
 /// doc/AGENTCORE_BINARY_ABI.md, Status). No stability promise: layouts and
 /// semantics may change incompatibly between commits. Pin an exact bundle.
 pub const ABI_VERSION_V1: u32 = 1;
-pub const ABI_REVISION: u32 = 5;
+pub const ABI_REVISION: u32 = 6;
 
 comptime {
     if (@sizeOf(usize) != 8)
-        @compileError("AgentCore ABI v1 revision 5 requires a 64-bit pointer ABI");
+        @compileError("AgentCore ABI v1 revision 6 requires a 64-bit pointer ABI");
 }
 
 pub const Status = enum(u32) {
@@ -30,6 +30,14 @@ pub const Status = enum(u32) {
     skill_policy_violation = 15,
     skill_unavailable = 16,
     stale_compact = 17,
+    checkpoint_budget_required = 18,
+    checkpoint_corrupt = 19,
+    checkpoint_unsupported = 20,
+    checkpoint_incompatible = 21,
+    checkpoint_io = 22,
+    logical_session_conflict = 23,
+    mcp_not_refreshed = 24,
+    invalid_mcp_selection = 25,
 
     pub fn fromCode(code: u32) error{UnknownStatus}!Status {
         return switch (code) {
@@ -51,6 +59,14 @@ pub const Status = enum(u32) {
             @intFromEnum(Status.skill_policy_violation) => .skill_policy_violation,
             @intFromEnum(Status.skill_unavailable) => .skill_unavailable,
             @intFromEnum(Status.stale_compact) => .stale_compact,
+            @intFromEnum(Status.checkpoint_budget_required) => .checkpoint_budget_required,
+            @intFromEnum(Status.checkpoint_corrupt) => .checkpoint_corrupt,
+            @intFromEnum(Status.checkpoint_unsupported) => .checkpoint_unsupported,
+            @intFromEnum(Status.checkpoint_incompatible) => .checkpoint_incompatible,
+            @intFromEnum(Status.checkpoint_io) => .checkpoint_io,
+            @intFromEnum(Status.logical_session_conflict) => .logical_session_conflict,
+            @intFromEnum(Status.mcp_not_refreshed) => .mcp_not_refreshed,
+            @intFromEnum(Status.invalid_mcp_selection) => .invalid_mcp_selection,
             else => error.UnknownStatus,
         };
     }
@@ -74,6 +90,14 @@ pub const STATUS_INVALID_SKILL_ARGUMENTS: u32 = @intFromEnum(Status.invalid_skil
 pub const STATUS_SKILL_POLICY_VIOLATION: u32 = @intFromEnum(Status.skill_policy_violation);
 pub const STATUS_SKILL_UNAVAILABLE: u32 = @intFromEnum(Status.skill_unavailable);
 pub const STATUS_STALE_COMPACT: u32 = @intFromEnum(Status.stale_compact);
+pub const STATUS_CHECKPOINT_BUDGET_REQUIRED: u32 = @intFromEnum(Status.checkpoint_budget_required);
+pub const STATUS_CHECKPOINT_CORRUPT: u32 = @intFromEnum(Status.checkpoint_corrupt);
+pub const STATUS_CHECKPOINT_UNSUPPORTED: u32 = @intFromEnum(Status.checkpoint_unsupported);
+pub const STATUS_CHECKPOINT_INCOMPATIBLE: u32 = @intFromEnum(Status.checkpoint_incompatible);
+pub const STATUS_CHECKPOINT_IO: u32 = @intFromEnum(Status.checkpoint_io);
+pub const STATUS_LOGICAL_SESSION_CONFLICT: u32 = @intFromEnum(Status.logical_session_conflict);
+pub const STATUS_MCP_NOT_REFRESHED: u32 = @intFromEnum(Status.mcp_not_refreshed);
+pub const STATUS_INVALID_MCP_SELECTION: u32 = @intFromEnum(Status.invalid_mcp_selection);
 
 pub const PROVIDER_ANTHROPIC: u32 = 1;
 pub const PROVIDER_OPENAI: u32 = 2;
@@ -83,7 +107,7 @@ pub const PERMISSION_DEFAULT: u32 = 1;
 pub const PERMISSION_ACCEPT_EDITS: u32 = 2;
 pub const PERMISSION_AUTO: u32 = 3;
 pub const PERMISSION_DONT_ASK: u32 = 4;
-pub const PERMISSION_BYPASS: u32 = 5;
+pub const PERMISSION_FULL_ACCESS: u32 = 5;
 
 pub const SHELL_DISABLED: u32 = 1;
 pub const SHELL_SANDBOXED: u32 = 2;
@@ -99,6 +123,8 @@ pub const StopReason = enum(u32) {
     tool_error = 4,
     api_error = 5,
     tool_loop = 6,
+    checkpoint_budget_exhausted = 7,
+    checkpoint_resource_limit = 8,
 
     pub fn fromCode(code: u32) error{UnknownStopReason}!StopReason {
         return switch (code) {
@@ -108,6 +134,8 @@ pub const StopReason = enum(u32) {
             @intFromEnum(StopReason.tool_error) => .tool_error,
             @intFromEnum(StopReason.api_error) => .api_error,
             @intFromEnum(StopReason.tool_loop) => .tool_loop,
+            @intFromEnum(StopReason.checkpoint_budget_exhausted) => .checkpoint_budget_exhausted,
+            @intFromEnum(StopReason.checkpoint_resource_limit) => .checkpoint_resource_limit,
             else => error.UnknownStopReason,
         };
     }
@@ -119,6 +147,8 @@ pub const STOP_ABORTED: u32 = @intFromEnum(StopReason.aborted);
 pub const STOP_TOOL_ERROR: u32 = @intFromEnum(StopReason.tool_error);
 pub const STOP_API_ERROR: u32 = @intFromEnum(StopReason.api_error);
 pub const STOP_TOOL_LOOP: u32 = @intFromEnum(StopReason.tool_loop);
+pub const STOP_CHECKPOINT_BUDGET_EXHAUSTED: u32 = @intFromEnum(StopReason.checkpoint_budget_exhausted);
+pub const STOP_CHECKPOINT_RESOURCE_LIMIT: u32 = @intFromEnum(StopReason.checkpoint_resource_limit);
 
 /// V1 resource limits guard allocation-amplifying Host inputs. They are part
 /// of the public contract, not a claim that the same-process Host is untrusted.
@@ -140,6 +170,20 @@ pub const MAX_SKILL_ARGUMENT_JSON_BYTES_V1: u64 = 1024 * 1024;
 pub const MAX_PERMISSION_RULES_V1: u64 = 1024;
 pub const MAX_PERMISSION_RULE_BYTES_V1: u64 = 64 * 1024;
 pub const MAX_PERMISSION_RULE_TOTAL_BYTES_V1: u64 = 1024 * 1024;
+pub const MAX_PERMISSION_ARGUMENT_JSON_BYTES_V1: u64 = 1024 * 1024;
+pub const MAX_MCP_SERVERS_V1: u64 = 64;
+pub const MAX_MCP_NAMESPACE_BYTES_V1: u64 = 24;
+pub const MAX_MCP_CATALOG_ISSUES_V1: u64 = 4096;
+pub const MAX_MCP_FRAME_BYTES_V1: u64 = 8 * 1024 * 1024;
+pub const MAX_MCP_TOOLS_V1: u64 = 1024;
+pub const MAX_MCP_TOOL_NAME_BYTES_V1: u64 = 256;
+pub const MAX_MCP_TEXT_BYTES_V1: u64 = 64 * 1024;
+pub const MAX_MCP_SCHEMA_BYTES_V1: u64 = 1024 * 1024;
+pub const MAX_MCP_CURSOR_BYTES_V1: u64 = 16 * 1024;
+pub const MAX_MCP_PROTOCOL_VERSIONS_V1: u64 = 16;
+pub const MAX_CHECKPOINT_BYTES_V1: u64 = 1024 * 1024 * 1024;
+pub const MAX_CHECKPOINT_CHUNK_BYTES_V1: u32 = 1024 * 1024;
+pub const MAX_DESCRIPTION_JSON_BYTES_V1: u64 = 16 * 1024 * 1024;
 pub const MAX_TURNS_V1: u32 = 1000;
 
 pub const RUN_INPUT_TEXT: u32 = 1;
@@ -152,6 +196,50 @@ pub const COMPACT_COMPACTED: u32 = 1;
 pub const COMPACT_NO_CHANGE: u32 = 2;
 pub const COMPACT_DEGRADED: u32 = 3;
 pub const COMPACT_ABORTED: u32 = 4;
+
+pub const RUN_CHECKPOINT_NONE: u32 = 0;
+pub const RUN_CHECKPOINT_BUDGET_REQUIRED: u32 = 1;
+pub const RUN_CHECKPOINT_BUDGET_EXHAUSTED: u32 = 2;
+pub const RUN_CHECKPOINT_RESOURCE_LIMIT: u32 = 3;
+pub const RUN_RESULT_COMPACTION_RECOMMENDED: u32 = 1 << 0;
+
+pub const MCP_TRANSPORT_STDIO: u32 = 1;
+pub const MCP_TRANSPORT_STREAMABLE_HTTP: u32 = 2;
+pub const MCP_NEGOTIATION_AUTO: u32 = 1;
+pub const MCP_NEGOTIATION_MODERN_ONLY: u32 = 2;
+pub const MCP_NEGOTIATION_LEGACY_ONLY: u32 = 3;
+pub const MCP_ERA_2026_07_28: u32 = 1;
+pub const MCP_ERA_2025_11_25: u32 = 2;
+pub const MCP_CONNECTION_DISPOSABLE_PROBE: u32 = 1;
+pub const MCP_CONNECTION_ACTUAL: u32 = 2;
+pub const MCP_OPEN_OK: u32 = 0;
+pub const MCP_OPEN_TIMEOUT: u32 = 1;
+pub const MCP_OPEN_NETWORK_ERROR: u32 = 2;
+pub const MCP_OPEN_AUTH_ERROR: u32 = 3;
+pub const MCP_OPEN_SERVER_ERROR: u32 = 4;
+pub const MCP_OPEN_CHILD_EXIT: u32 = 5;
+pub const MCP_OPEN_FATAL: u32 = 6;
+pub const MCP_EXCHANGE_RESPONSE: u32 = 0;
+pub const MCP_EXCHANGE_TIMEOUT: u32 = 1;
+pub const MCP_EXCHANGE_NETWORK_ERROR: u32 = 2;
+pub const MCP_EXCHANGE_AUTH_ERROR: u32 = 3;
+pub const MCP_EXCHANGE_SERVER_ERROR: u32 = 4;
+pub const MCP_EXCHANGE_CHILD_EXIT: u32 = 5;
+pub const MCP_EXCHANGE_CANCELLED: u32 = 6;
+pub const MCP_EXCHANGE_INDETERMINATE: u32 = 7;
+pub const MCP_EXCHANGE_FATAL: u32 = 8;
+pub const MCP_NOTIFY_OK: u32 = 0;
+pub const MCP_NOTIFY_TIMEOUT: u32 = 1;
+pub const MCP_NOTIFY_NETWORK_ERROR: u32 = 2;
+pub const MCP_NOTIFY_AUTH_ERROR: u32 = 3;
+pub const MCP_NOTIFY_SERVER_ERROR: u32 = 4;
+pub const MCP_NOTIFY_CHILD_EXIT: u32 = 5;
+pub const MCP_NOTIFY_CANCELLED: u32 = 6;
+pub const MCP_NOTIFY_FATAL: u32 = 7;
+
+pub const CHECKPOINT_IO_OK: u32 = 0;
+pub const CHECKPOINT_IO_FAILED: u32 = 1;
+pub const CHECKPOINT_IO_FATAL: u32 = 2;
 
 pub const EVENT_CONTINUE: u32 = 0;
 pub const EVENT_FATAL: u32 = 1;
@@ -176,7 +264,14 @@ pub const CAP_SESSION_MODEL_MUTATION: u64 = 1 << 8;
 pub const CAP_MANUAL_COMPACT: u64 = 1 << 9;
 pub const CAP_SKILL_SELECTION: u64 = 1 << 10;
 pub const CAP_HOST_PERMISSION_RULES: u64 = 1 << 11;
-pub const REQUIRED_CAPABILITIES_V1: u64 = CAP_RUNTIME | CAP_BUILTIN_TOOLS | CAP_HOST_SYNC_TOOLS | CAP_HOST_UI | CAP_CORE_EVENTS_JSON | CAP_ABORT | CAP_SKILL_CATALOG | CAP_TYPED_RUN_INPUT | CAP_SESSION_MODEL_MUTATION | CAP_MANUAL_COMPACT | CAP_SKILL_SELECTION | CAP_HOST_PERMISSION_RULES;
+pub const CAP_SESSION_CHECKPOINT: u64 = 1 << 12;
+pub const CAP_SESSION_RESTORE: u64 = 1 << 13;
+pub const CAP_SESSION_DESCRIBE: u64 = 1 << 14;
+pub const CAP_MCP_RUNTIME_CATALOG: u64 = 1 << 15;
+pub const CAP_MCP_SESSION_SELECTION: u64 = 1 << 16;
+pub const CAP_DURABLE_BUDGET: u64 = 1 << 17;
+pub const CAP_SESSION_PERMISSION_AUTHORITY: u64 = 1 << 18;
+pub const REQUIRED_CAPABILITIES_V1: u64 = CAP_RUNTIME | CAP_BUILTIN_TOOLS | CAP_HOST_SYNC_TOOLS | CAP_HOST_UI | CAP_CORE_EVENTS_JSON | CAP_ABORT | CAP_SKILL_CATALOG | CAP_TYPED_RUN_INPUT | CAP_SESSION_MODEL_MUTATION | CAP_MANUAL_COMPACT | CAP_SKILL_SELECTION | CAP_HOST_PERMISSION_RULES | CAP_SESSION_CHECKPOINT | CAP_SESSION_RESTORE | CAP_SESSION_DESCRIBE | CAP_MCP_RUNTIME_CATALOG | CAP_MCP_SESSION_SELECTION | CAP_DURABLE_BUDGET | CAP_SESSION_PERMISSION_AUTHORITY;
 
 /// Each published v1 revision is rigid: every struct_size is exact and every
 /// reserved field is zero. A Host pins version, revision, table size, and
@@ -238,6 +333,107 @@ pub const HostToolV1 = extern struct {
     reserved: [2]u64,
 };
 
+/// MCP transport callbacks are Host-owned. AgentCore passes only borrowed
+/// request bytes and copies every successful response before the callback
+/// returns. A successful open produces one opaque connection context; its
+/// close callback is invoked exactly once. Credentials and transport handles
+/// never enter AgentCore checkpoints.
+pub const McpIsCancelledFnV1 = *const fn (
+    cancellation_ctx: ?*const anyopaque,
+) callconv(.c) u32;
+
+pub const McpCancellationV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    ctx: ?*const anyopaque,
+    is_cancelled: ?McpIsCancelledFnV1,
+    reserved: [2]u64,
+};
+
+pub const McpOpenFnV1 = *const fn (
+    connector_ctx: ?*anyopaque,
+    purpose_code: u32,
+    requested_era_code: u32,
+    timeout_ms: u32,
+    out_connection_ctx: ?*?*anyopaque,
+) callconv(.c) u32;
+pub const McpRequestFnV1 = *const fn (
+    connector_ctx: ?*anyopaque,
+    connection_ctx: ?*anyopaque,
+    request_json: BytesViewV1,
+    timeout_ms: u32,
+    cancellation: ?*const McpCancellationV1,
+    out_response_json: ?*OwnedBytesV1,
+) callconv(.c) u32;
+pub const McpNotifyFnV1 = *const fn (
+    connector_ctx: ?*anyopaque,
+    connection_ctx: ?*anyopaque,
+    notification_json: BytesViewV1,
+    timeout_ms: u32,
+    cancellation: ?*const McpCancellationV1,
+) callconv(.c) u32;
+pub const McpCloseFnV1 = *const fn (
+    connector_ctx: ?*anyopaque,
+    connection_ctx: ?*anyopaque,
+) callconv(.c) void;
+pub const McpReleaseResponseFnV1 = *const fn (
+    connector_ctx: ?*anyopaque,
+    connection_ctx: ?*anyopaque,
+    response_json: ?*OwnedBytesV1,
+) callconv(.c) void;
+
+pub const McpConnectorV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    ctx: ?*anyopaque,
+    open: ?McpOpenFnV1,
+    request: ?McpRequestFnV1,
+    notify: ?McpNotifyFnV1,
+    close: ?McpCloseFnV1,
+    release_response: ?McpReleaseResponseFnV1,
+    reserved: [3]u64,
+};
+
+pub const McpProtocolLimitsV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    max_frame_bytes: u64,
+    max_tools: u64,
+    max_tool_name_bytes: u64,
+    max_text_bytes: u64,
+    max_schema_bytes: u64,
+    max_json_depth: u64,
+    max_json_nodes: u64,
+    max_cursor_bytes: u64,
+    max_versions: u64,
+    reserved: [2]u64,
+};
+
+pub const McpServerV1 = extern struct {
+    struct_size: u32,
+    transport_code: u32,
+    negotiation_policy_code: u32,
+    reserved0: u32,
+    server_binding_identity: [32]u8,
+    namespace: BytesViewV1,
+    client_name: BytesViewV1,
+    client_version: BytesViewV1,
+    timeout_ms: u32,
+    reserved1: u32,
+    connector: McpConnectorV1,
+    protocol_limits: ?*const McpProtocolLimitsV1,
+    reserved: [4]u64,
+};
+
+pub const McpCatalogLimitsV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    max_servers: u64,
+    max_namespace_bytes: u64,
+    max_issues: u64,
+    reserved: [4]u64,
+};
+
 pub const RuntimeConfigV1 = extern struct {
     struct_size: u32,
     reserved0: u32,
@@ -245,6 +441,9 @@ pub const RuntimeConfigV1 = extern struct {
     builtin_tool_count: u64,
     host_tools: ?[*]const HostToolV1,
     host_tool_count: u64,
+    mcp_servers: ?[*]const McpServerV1,
+    mcp_server_count: u64,
+    mcp_catalog_limits: ?*const McpCatalogLimitsV1,
     reserved: [4]u64,
 };
 
@@ -305,13 +504,50 @@ pub const PermissionRuleSetV1 = extern struct {
     reserved: [4]u64,
 };
 
-pub const SessionConfigV1 = extern struct {
+pub const McpSelectorV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    server_binding_identity: [32]u8,
+    tool_name: BytesViewV1,
+    reserved: [3]u64,
+};
+
+/// A complete replacement for one Session's MCP authority view. Null in a
+/// create config means an empty view. During restore this is the current Host
+/// ceiling and is intersected with the historical checkpoint selection; a
+/// wider current list can never add authority absent from the checkpoint.
+pub const McpSelectionV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    selectors: ?[*]const McpSelectorV1,
+    selector_count: u64,
+    reserved: [4]u64,
+};
+
+pub const DurableBudgetProfileV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    hard_bytes: u64,
+    soft_bytes: u64,
+    input_cap_bytes: u64,
+    provider_request_cap_bytes: u64,
+    provider_result_cap_bytes: u64,
+    tool_result_cap_bytes: u64,
+    mcp_result_cap_bytes: u64,
+    audit_reserve_bytes: u64,
+    terminal_reserve_bytes: u64,
+    reserved: [4]u64,
+};
+
+/// Current Host-owned authority and ephemeral execution configuration shared
+/// by fresh creation and restore. No logical Session identity is accepted from
+/// the Host. All borrowed data is copied during the synchronous call.
+pub const SessionHostConfigV1 = extern struct {
     struct_size: u32,
     provider_kind_code: u32,
     permission_mode_code: u32,
     shell_policy_code: u32,
     api_key: BytesViewV1,
-    model: BytesViewV1,
     base_url: BytesViewV1,
     workspace_root: BytesViewV1,
     workspace_home: BytesViewV1,
@@ -320,6 +556,16 @@ pub const SessionConfigV1 = extern struct {
     skill_catalog: ?*SkillCatalogHandle,
     skill_selection: ?*const SkillSelectionV1,
     permission_rules: ?*const PermissionRuleSetV1,
+    mcp_selection: ?*const McpSelectionV1,
+    durable_budget: ?*const DurableBudgetProfileV1,
+    reserved: [4]u64,
+};
+
+pub const SessionCreateConfigV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    host: ?*const SessionHostConfigV1,
+    model: BytesViewV1,
     reserved: [4]u64,
 };
 
@@ -350,20 +596,27 @@ pub const RunOptionsV1 = extern struct {
     reserved: [4]u64,
 };
 
-/// Terminal Run summary. Fields are defined only when `session_run_input` returns
-/// `STATUS_OK`; on any other status they are unspecified and must not be read.
+/// Terminal Run summary. All fields are defined on STATUS_OK. On
+/// STATUS_CHECKPOINT_BUDGET_REQUIRED, only struct_size,
+/// checkpoint_outcome_code, result_flags, durable_usage_bytes and
+/// required_checkpoint_bytes are defined; the Run was not admitted and its ID
+/// remains reusable. Fields are unspecified on every other status.
 pub const RunResultV1 = extern struct {
     struct_size: u32,
     stop_reason_code: u32,
     turns: u32,
     tool_calls: u32,
+    checkpoint_outcome_code: u32,
+    result_flags: u32,
+    durable_usage_bytes: u64,
+    required_checkpoint_bytes: u64,
     reserved: [4]u64,
 };
 
 /// Terminal manual-compact summary. Fields are defined only when
 /// `session_compact` returns STATUS_OK. The before/after values are context-size
 /// estimates, not provider billing values; the four usage fields are separate
-/// provider usage deltas. Revision 5 exposes no structured degraded reason.
+/// provider usage deltas.
 pub const CompactResultV1 = extern struct {
     struct_size: u32,
     outcome_code: u32,
@@ -373,6 +626,72 @@ pub const CompactResultV1 = extern struct {
     output_tokens: u64,
     cache_read_input_tokens: u64,
     cache_creation_input_tokens: u64,
+    reserved: [4]u64,
+};
+
+pub const CheckpointLimitsV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    hard_bytes: u64,
+    max_section_bytes: u64,
+    max_string_bytes: u64,
+    max_messages: u64,
+    max_blocks_per_message: u64,
+    chunk_bytes: u32,
+    reserved1: u32,
+    reserved: [4]u64,
+};
+
+pub const CheckpointWriteFnV1 = *const fn (
+    sink_ctx: ?*anyopaque,
+    chunk: BytesViewV1,
+) callconv(.c) u32;
+pub const CheckpointSinkV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    ctx: ?*anyopaque,
+    write: ?CheckpointWriteFnV1,
+    reserved: [4]u64,
+};
+
+pub const CheckpointReadFnV1 = *const fn (
+    source_ctx: ?*anyopaque,
+    destination: ?[*]u8,
+    capacity: u64,
+    out_len: ?*u64,
+) callconv(.c) u32;
+pub const CheckpointSourceV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    ctx: ?*anyopaque,
+    read: ?CheckpointReadFnV1,
+    reserved: [4]u64,
+};
+
+pub const CheckpointExportConfigV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    limits: ?*const CheckpointLimitsV1,
+    sink: ?*const CheckpointSinkV1,
+    reserved: [4]u64,
+};
+
+pub const CheckpointExportResultV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    checkpoint_generation: u64,
+    total_bytes: u64,
+    chunk_count: u64,
+    digest: [32]u8,
+    reserved: [4]u64,
+};
+
+pub const SessionRestoreConfigV1 = extern struct {
+    struct_size: u32,
+    reserved0: u32,
+    host: ?*const SessionHostConfigV1,
+    source: ?*const CheckpointSourceV1,
+    limits: ?*const CheckpointLimitsV1,
     reserved: [4]u64,
 };
 
@@ -391,11 +710,34 @@ pub const RuntimeQuerySkillCatalogFnV1 = *const fn (
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
 pub const SkillCatalogReleaseFnV1 = *const fn (?*SkillCatalogHandle, ?*OwnedBytesV1) callconv(.c) u32;
-pub const SessionCreateFnV1 = *const fn (?*RuntimeHandle, ?*const SessionConfigV1, ?*const SessionCallbacksV1, ?*?*SessionHandle, ?*OwnedBytesV1) callconv(.c) u32;
+pub const RuntimeRefreshMcpFnV1 = *const fn (
+    runtime: ?*RuntimeHandle,
+    out_catalog_generation: ?*u64,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
+pub const RuntimeDescribeMcpFnV1 = *const fn (
+    runtime: ?*RuntimeHandle,
+    out_description_json: ?*OwnedBytesV1,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
+pub const SessionCreateFnV1 = *const fn (?*RuntimeHandle, ?*const SessionCreateConfigV1, ?*const SessionCallbacksV1, ?*?*SessionHandle, ?*OwnedBytesV1) callconv(.c) u32;
+pub const SessionRestoreFnV1 = *const fn (
+    runtime: ?*RuntimeHandle,
+    config: ?*const SessionRestoreConfigV1,
+    callbacks: ?*const SessionCallbacksV1,
+    out_session: ?*?*SessionHandle,
+    out_restore_report_json: ?*OwnedBytesV1,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
 /// Wait for every Session abort call to return before any subsequent call on
 /// the same handle, including destroy. STATUS_OK invalidates the handle; any
 /// later call with that pointer is invalid.
 pub const SessionDestroyFnV1 = *const fn (?*SessionHandle, ?*OwnedBytesV1) callconv(.c) u32;
+pub const SessionDescribeFnV1 = *const fn (
+    session: ?*SessionHandle,
+    out_description_json: ?*OwnedBytesV1,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
 pub const SessionSetModelFnV1 = *const fn (?*SessionHandle, BytesViewV1, ?*OwnedBytesV1) callconv(.c) u32;
 pub const SessionUpdateSkillsFnV1 = *const fn (
     session: ?*SessionHandle,
@@ -406,6 +748,11 @@ pub const SessionUpdateSkillsFnV1 = *const fn (
 pub const SessionUpdatePermissionRulesFnV1 = *const fn (
     session: ?*SessionHandle,
     rules: ?*const PermissionRuleSetV1,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
+pub const SessionUpdateMcpFnV1 = *const fn (
+    session: ?*SessionHandle,
+    selection: ?*const McpSelectionV1,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
 /// Pre-admission validation, resource-limit, busy, and stale-run failures do
@@ -439,7 +786,7 @@ pub const SessionAbortFnV1 = *const fn (
     reason_code: u32,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
-/// Runs the canonical default best-effort compact policy. Revision 5 accepts
+/// Runs the canonical default best-effort compact policy. Revision 6 accepts
 /// no target token budget and does not guarantee fit for a model context.
 pub const SessionCompactFnV1 = *const fn (
     session: ?*SessionHandle,
@@ -450,6 +797,12 @@ pub const SessionCompactFnV1 = *const fn (
 pub const SessionAbortCompactFnV1 = *const fn (
     session: ?*SessionHandle,
     operation_id: u64,
+    out_diagnostic: ?*OwnedBytesV1,
+) callconv(.c) u32;
+pub const SessionExportCheckpointFnV1 = *const fn (
+    session: ?*SessionHandle,
+    config: ?*const CheckpointExportConfigV1,
+    out_result: ?*CheckpointExportResultV1,
     out_diagnostic: ?*OwnedBytesV1,
 ) callconv(.c) u32;
 /// Releases only library-owned diagnostics, never Host-owned tool or UI
@@ -466,15 +819,21 @@ pub const ApiV1 = extern struct {
     runtime_destroy: ?RuntimeDestroyFnV1,
     runtime_query_skill_catalog: ?RuntimeQuerySkillCatalogFnV1,
     skill_catalog_release: ?SkillCatalogReleaseFnV1,
+    runtime_refresh_mcp: ?RuntimeRefreshMcpFnV1,
+    runtime_describe_mcp: ?RuntimeDescribeMcpFnV1,
     session_create: ?SessionCreateFnV1,
+    session_restore: ?SessionRestoreFnV1,
     session_destroy: ?SessionDestroyFnV1,
+    session_describe: ?SessionDescribeFnV1,
     session_set_model: ?SessionSetModelFnV1,
     session_update_skills: ?SessionUpdateSkillsFnV1,
     session_update_permission_rules: ?SessionUpdatePermissionRulesFnV1,
+    session_update_mcp: ?SessionUpdateMcpFnV1,
     session_run_input: ?SessionRunInputFnV1,
     session_abort: ?SessionAbortFnV1,
     session_compact: ?SessionCompactFnV1,
     session_abort_compact: ?SessionAbortCompactFnV1,
+    session_export_checkpoint: ?SessionExportCheckpointFnV1,
     buffer_release: ?BufferReleaseFnV1,
     reserved: [4]u64,
 };
@@ -485,46 +844,79 @@ test "ABI v1 public layouts are fixed on supported 64-bit targets" {
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(OwnedBytesV1));
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(RunContextV1));
     try std.testing.expectEqual(@as(usize, 96), @sizeOf(HostToolV1));
-    try std.testing.expectEqual(@as(usize, 72), @sizeOf(RuntimeConfigV1));
+    try std.testing.expectEqual(@as(usize, 40), @sizeOf(McpCancellationV1));
+    try std.testing.expectEqual(@as(usize, 80), @sizeOf(McpConnectorV1));
+    try std.testing.expectEqual(@as(usize, 96), @sizeOf(McpProtocolLimitsV1));
+    try std.testing.expectEqual(@as(usize, 224), @sizeOf(McpServerV1));
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(McpCatalogLimitsV1));
+    try std.testing.expectEqual(@as(usize, 96), @sizeOf(RuntimeConfigV1));
     try std.testing.expectEqual(@as(usize, 72), @sizeOf(SessionCallbacksV1));
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(SkillSelectionV1));
     try std.testing.expectEqual(@as(usize, 88), @sizeOf(PermissionRuleSetV1));
+    try std.testing.expectEqual(@as(usize, 80), @sizeOf(McpSelectorV1));
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(McpSelectionV1));
+    try std.testing.expectEqual(@as(usize, 112), @sizeOf(DurableBudgetProfileV1));
+    try std.testing.expectEqual(@as(usize, 168), @sizeOf(SessionHostConfigV1));
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(SessionCreateConfigV1));
     try std.testing.expectEqual(@as(usize, 80), @sizeOf(SkillCatalogQueryV1));
     try std.testing.expectEqual(@as(usize, 104), @sizeOf(RunInputV1));
-    try std.testing.expectEqual(@as(usize, 168), @sizeOf(SessionConfigV1));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(RunOptionsV1));
-    try std.testing.expectEqual(@as(usize, 48), @sizeOf(RunResultV1));
+    try std.testing.expectEqual(@as(usize, 72), @sizeOf(RunResultV1));
     try std.testing.expectEqual(@as(usize, 88), @sizeOf(CompactResultV1));
-    try std.testing.expectEqual(@as(usize, 168), @sizeOf(ApiV1));
+    try std.testing.expectEqual(@as(usize, 88), @sizeOf(CheckpointLimitsV1));
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(CheckpointSinkV1));
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(CheckpointSourceV1));
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(CheckpointExportConfigV1));
+    try std.testing.expectEqual(@as(usize, 96), @sizeOf(CheckpointExportResultV1));
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(SessionRestoreConfigV1));
+    try std.testing.expectEqual(@as(usize, 216), @sizeOf(ApiV1));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(RunContextV1, "session"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(RunContextV1, "run_id"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(RunContextV1, "session_id"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(HostToolV1, "ctx"));
-    try std.testing.expectEqual(@as(usize, 16), @offsetOf(SessionConfigV1, "api_key"));
-    try std.testing.expectEqual(@as(usize, 96), @offsetOf(SessionConfigV1, "allowed_tools"));
-    try std.testing.expectEqual(@as(usize, 112), @offsetOf(SessionConfigV1, "skill_catalog"));
-    try std.testing.expectEqual(@as(usize, 120), @offsetOf(SessionConfigV1, "skill_selection"));
-    try std.testing.expectEqual(@as(usize, 128), @offsetOf(SessionConfigV1, "permission_rules"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(McpConnectorV1, "ctx"));
+    try std.testing.expectEqual(@as(usize, 104), @offsetOf(McpServerV1, "connector"));
+    try std.testing.expectEqual(@as(usize, 184), @offsetOf(McpServerV1, "protocol_limits"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(RuntimeConfigV1, "mcp_servers"));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(RuntimeConfigV1, "mcp_catalog_limits"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(SessionHostConfigV1, "api_key"));
+    try std.testing.expectEqual(@as(usize, 80), @offsetOf(SessionHostConfigV1, "allowed_tools"));
+    try std.testing.expectEqual(@as(usize, 96), @offsetOf(SessionHostConfigV1, "skill_catalog"));
+    try std.testing.expectEqual(@as(usize, 104), @offsetOf(SessionHostConfigV1, "skill_selection"));
+    try std.testing.expectEqual(@as(usize, 112), @offsetOf(SessionHostConfigV1, "permission_rules"));
+    try std.testing.expectEqual(@as(usize, 120), @offsetOf(SessionHostConfigV1, "mcp_selection"));
+    try std.testing.expectEqual(@as(usize, 128), @offsetOf(SessionHostConfigV1, "durable_budget"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(SessionCreateConfigV1, "host"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(SessionCreateConfigV1, "model"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(SkillSelectionV1, "exception_skill_ids"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(PermissionRuleSetV1, "allow"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(PermissionRuleSetV1, "ask"));
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(PermissionRuleSetV1, "deny"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(McpSelectorV1, "tool_name"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(CompactResultV1, "before_context_tokens"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(CompactResultV1, "input_tokens"));
+    try std.testing.expectEqual(@as(usize, 24), @offsetOf(RunResultV1, "durable_usage_bytes"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(RunResultV1, "required_checkpoint_bytes"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(CheckpointExportResultV1, "digest"));
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(SkillCatalogQueryV1, "workspace_epoch"));
     try std.testing.expectEqual(@as(usize, 56), @offsetOf(RunInputV1, "arguments_json"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(ApiV1, "abi_revision"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(ApiV1, "capabilities"));
     try std.testing.expectEqual(@as(usize, 24), @offsetOf(ApiV1, "runtime_create"));
     try std.testing.expectEqual(@as(usize, 40), @offsetOf(ApiV1, "runtime_query_skill_catalog"));
-    try std.testing.expectEqual(@as(usize, 72), @offsetOf(ApiV1, "session_set_model"));
-    try std.testing.expectEqual(@as(usize, 80), @offsetOf(ApiV1, "session_update_skills"));
-    try std.testing.expectEqual(@as(usize, 88), @offsetOf(ApiV1, "session_update_permission_rules"));
-    try std.testing.expectEqual(@as(usize, 96), @offsetOf(ApiV1, "session_run_input"));
-    try std.testing.expectEqual(@as(usize, 112), @offsetOf(ApiV1, "session_compact"));
-    try std.testing.expectEqual(@as(usize, 120), @offsetOf(ApiV1, "session_abort_compact"));
-    try std.testing.expectEqual(@as(usize, 128), @offsetOf(ApiV1, "buffer_release"));
-    try std.testing.expectEqual(@as(usize, 136), @offsetOf(ApiV1, "reserved"));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(ApiV1, "runtime_refresh_mcp"));
+    try std.testing.expectEqual(@as(usize, 72), @offsetOf(ApiV1, "session_create"));
+    try std.testing.expectEqual(@as(usize, 80), @offsetOf(ApiV1, "session_restore"));
+    try std.testing.expectEqual(@as(usize, 104), @offsetOf(ApiV1, "session_set_model"));
+    try std.testing.expectEqual(@as(usize, 112), @offsetOf(ApiV1, "session_update_skills"));
+    try std.testing.expectEqual(@as(usize, 120), @offsetOf(ApiV1, "session_update_permission_rules"));
+    try std.testing.expectEqual(@as(usize, 128), @offsetOf(ApiV1, "session_update_mcp"));
+    try std.testing.expectEqual(@as(usize, 136), @offsetOf(ApiV1, "session_run_input"));
+    try std.testing.expectEqual(@as(usize, 152), @offsetOf(ApiV1, "session_compact"));
+    try std.testing.expectEqual(@as(usize, 160), @offsetOf(ApiV1, "session_abort_compact"));
+    try std.testing.expectEqual(@as(usize, 168), @offsetOf(ApiV1, "session_export_checkpoint"));
+    try std.testing.expectEqual(@as(usize, 176), @offsetOf(ApiV1, "buffer_release"));
+    try std.testing.expectEqual(@as(usize, 184), @offsetOf(ApiV1, "reserved"));
 }
 
 test "typed status and stop reason validate every public code" {
@@ -540,9 +932,11 @@ test "typed status and stop reason validate every public code" {
     try std.testing.expectEqual(Status.skill_catalog_invalid, try Status.fromCode(11));
     try std.testing.expectEqual(Status.skill_unavailable, try Status.fromCode(16));
     try std.testing.expectEqual(Status.stale_compact, try Status.fromCode(17));
-    try std.testing.expectError(error.UnknownStatus, Status.fromCode(18));
+    try std.testing.expectEqual(Status.invalid_mcp_selection, try Status.fromCode(25));
+    try std.testing.expectError(error.UnknownStatus, Status.fromCode(26));
     try std.testing.expectError(error.UnknownStatus, Status.fromCode(std.math.maxInt(u32)));
     try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(0));
-    try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(7));
+    try std.testing.expectEqual(StopReason.checkpoint_resource_limit, try StopReason.fromCode(8));
+    try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(9));
     try std.testing.expectError(error.UnknownStopReason, StopReason.fromCode(std.math.maxInt(u32)));
 }

@@ -472,16 +472,16 @@ const PublicSessionFixture = struct {
             self.api.runtimeCreate()(&runtime_config, &self.runtime, &self.diagnostic),
         );
 
-        var session_config = std.mem.zeroes(wire.SessionConfigV1);
-        session_config.struct_size = @sizeOf(wire.SessionConfigV1);
-        session_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
-        session_config.permission_mode_code = wire.PERMISSION_BYPASS;
-        session_config.shell_policy_code = wire.SHELL_DISABLED;
-        session_config.api_key = sdk.bytesView("test-key");
-        session_config.model = sdk.bytesView(model);
-        session_config.base_url = sdk.bytesView(base_url);
-        session_config.workspace_root = sdk.bytesView(root);
-        session_config.workspace_home = sdk.bytesView(root);
+        var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+        host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+        host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+        host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+        host_config.shell_policy_code = wire.SHELL_DISABLED;
+        host_config.api_key = sdk.bytesView("test-key");
+        host_config.base_url = sdk.bytesView(base_url);
+        host_config.workspace_root = sdk.bytesView(root);
+        host_config.workspace_home = sdk.bytesView(root);
+        var session_config = sessionCreateConfig(&host_config, model);
         var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
         callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
         callbacks.on_event = acceptEvent;
@@ -613,7 +613,7 @@ fn extractCatalogIdentities(
 fn expectInvalidSessionConfig(
     api: sdk.Api,
     runtime: *wire.RuntimeHandle,
-    config: *const wire.SessionConfigV1,
+    config: *const wire.SessionCreateConfigV1,
     callbacks: *const wire.SessionCallbacksV1,
     diagnostic: *wire.OwnedBytesV1,
 ) !void {
@@ -625,10 +625,359 @@ fn expectInvalidSessionConfig(
     try std.testing.expect(session == null);
     try std.testing.expect(diagnostic.ptr != null and diagnostic.len != 0);
     const diagnostic_bytes = try sdk.borrowedBytes(.{ .ptr = diagnostic.ptr, .len = diagnostic.len });
-    const api_key = try sdk.borrowedBytes(config.api_key);
+    const api_key = try sdk.borrowedBytes(config.host.?.api_key);
     if (api_key.len != 0) try std.testing.expect(std.mem.indexOf(u8, diagnostic_bytes, api_key) == null);
     api.bufferRelease()(diagnostic);
     try std.testing.expect(diagnostic.ptr == null and diagnostic.len == 0);
+}
+
+fn sessionCreateConfig(
+    host: *const wire.SessionHostConfigV1,
+    model: []const u8,
+) wire.SessionCreateConfigV1 {
+    var config = std.mem.zeroes(wire.SessionCreateConfigV1);
+    config.struct_size = @sizeOf(wire.SessionCreateConfigV1);
+    config.host = host;
+    config.model = sdk.bytesView(model);
+    return config;
+}
+
+const PublicMcpProbe = struct {
+    opens: u32 = 0,
+    probe_opens: u32 = 0,
+    actual_opens: u32 = 0,
+    requests: u32 = 0,
+    notifications: u32 = 0,
+    closes: u32 = 0,
+    releases: u32 = 0,
+
+    fn connector(self: *@This()) wire.McpConnectorV1 {
+        var result = std.mem.zeroes(wire.McpConnectorV1);
+        result.struct_size = @sizeOf(wire.McpConnectorV1);
+        result.ctx = self;
+        result.open = open;
+        result.request = request;
+        result.notify = notify;
+        result.close = close;
+        result.release_response = releaseResponse;
+        return result;
+    }
+
+    fn open(
+        raw: ?*anyopaque,
+        purpose_code: u32,
+        requested_era_code: u32,
+        _: u32,
+        out_connection_ctx: ?*?*anyopaque,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.MCP_OPEN_FATAL));
+        const out = out_connection_ctx orelse return wire.MCP_OPEN_FATAL;
+        out.* = null;
+        if (requested_era_code != wire.MCP_ERA_2026_07_28)
+            return wire.MCP_OPEN_NETWORK_ERROR;
+        switch (purpose_code) {
+            wire.MCP_CONNECTION_DISPOSABLE_PROBE => self.probe_opens += 1,
+            wire.MCP_CONNECTION_ACTUAL => self.actual_opens += 1,
+            else => return wire.MCP_OPEN_FATAL,
+        }
+        self.opens += 1;
+        out.* = self;
+        return wire.MCP_OPEN_OK;
+    }
+
+    fn request(
+        raw: ?*anyopaque,
+        connection_ctx: ?*anyopaque,
+        request_json: wire.BytesViewV1,
+        _: u32,
+        _: ?*const wire.McpCancellationV1,
+        out_response: ?*wire.OwnedBytesV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.MCP_EXCHANGE_FATAL));
+        if (connection_ctx != raw) return wire.MCP_EXCHANGE_FATAL;
+        const out = out_response orelse return wire.MCP_EXCHANGE_FATAL;
+        out.* = .{ .ptr = null, .len = 0 };
+        const encoded = sdk.borrowedBytes(request_json) catch return wire.MCP_EXCHANGE_FATAL;
+        const id = requestId(encoded) orelse return wire.MCP_EXCHANGE_FATAL;
+        const response = if (std.mem.indexOf(u8, encoded, "server/discover") != null)
+            std.fmt.allocPrint(
+                std.heap.c_allocator,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{{}},\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}",
+                .{id},
+            )
+        else if (std.mem.indexOf(u8, encoded, "tools/list") != null)
+            std.fmt.allocPrint(
+                std.heap.c_allocator,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"result\":{{\"resultType\":\"complete\",\"tools\":[{{\"name\":\"weather\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{\"city\":{{\"type\":\"string\"}}}},\"required\":[\"city\"],\"additionalProperties\":false}},\"outputSchema\":{{\"type\":\"object\",\"properties\":{{\"ok\":{{\"type\":\"boolean\"}}}},\"required\":[\"ok\"]}}}}],\"ttlMs\":1000,\"cacheScope\":\"private\"}}}}",
+                .{id},
+            )
+        else
+            return wire.MCP_EXCHANGE_FATAL;
+        const owned = response catch return wire.MCP_EXCHANGE_FATAL;
+        self.requests += 1;
+        out.* = .{ .ptr = owned.ptr, .len = owned.len };
+        return wire.MCP_EXCHANGE_RESPONSE;
+    }
+
+    fn notify(
+        raw: ?*anyopaque,
+        connection_ctx: ?*anyopaque,
+        _: wire.BytesViewV1,
+        _: u32,
+        _: ?*const wire.McpCancellationV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.MCP_NOTIFY_FATAL));
+        if (connection_ctx != raw) return wire.MCP_NOTIFY_FATAL;
+        self.notifications += 1;
+        return wire.MCP_NOTIFY_OK;
+    }
+
+    fn close(raw: ?*anyopaque, connection_ctx: ?*anyopaque) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return));
+        if (connection_ctx != raw) return;
+        self.closes += 1;
+    }
+
+    fn releaseResponse(
+        raw: ?*anyopaque,
+        connection_ctx: ?*anyopaque,
+        response: ?*wire.OwnedBytesV1,
+    ) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return));
+        if (connection_ctx != raw) return;
+        const out = response orelse return;
+        if (out.ptr) |ptr| {
+            const len = std.math.cast(usize, out.len) orelse return;
+            std.heap.c_allocator.free(ptr[0..len]);
+            self.releases += 1;
+        }
+        out.* = .{ .ptr = null, .len = 0 };
+    }
+
+    fn requestId(encoded: []const u8) ?u64 {
+        const marker = "\"id\":";
+        const start = (std.mem.indexOf(u8, encoded, marker) orelse return null) + marker.len;
+        var end = start;
+        while (end < encoded.len and std.ascii.isDigit(encoded[end])) : (end += 1) {}
+        return std.fmt.parseInt(u64, encoded[start..end], 10) catch null;
+    }
+};
+
+const PublicCheckpointBuffer = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    read_offset: usize = 0,
+    writes: u32 = 0,
+    reads: u32 = 0,
+    fail_write: bool = false,
+    fail_read: bool = false,
+
+    fn deinit(self: *@This()) void {
+        self.bytes.deinit(std.heap.c_allocator);
+    }
+
+    fn resetRead(self: *@This()) void {
+        self.read_offset = 0;
+        self.reads = 0;
+    }
+
+    fn sink(self: *@This()) wire.CheckpointSinkV1 {
+        var result = std.mem.zeroes(wire.CheckpointSinkV1);
+        result.struct_size = @sizeOf(wire.CheckpointSinkV1);
+        result.ctx = self;
+        result.write = write;
+        return result;
+    }
+
+    fn source(self: *@This()) wire.CheckpointSourceV1 {
+        self.resetRead();
+        var result = std.mem.zeroes(wire.CheckpointSourceV1);
+        result.struct_size = @sizeOf(wire.CheckpointSourceV1);
+        result.ctx = self;
+        result.read = read;
+        return result;
+    }
+
+    fn write(raw: ?*anyopaque, chunk: wire.BytesViewV1) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.CHECKPOINT_IO_FATAL));
+        if (self.fail_write) return wire.CHECKPOINT_IO_FAILED;
+        const part = sdk.borrowedBytes(chunk) catch return wire.CHECKPOINT_IO_FATAL;
+        self.bytes.appendSlice(std.heap.c_allocator, part) catch return wire.CHECKPOINT_IO_FATAL;
+        self.writes += 1;
+        return wire.CHECKPOINT_IO_OK;
+    }
+
+    fn read(
+        raw: ?*anyopaque,
+        destination: ?[*]u8,
+        capacity_raw: u64,
+        out_len: ?*u64,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.CHECKPOINT_IO_FATAL));
+        const written = out_len orelse return wire.CHECKPOINT_IO_FATAL;
+        written.* = 0;
+        if (self.fail_read) return wire.CHECKPOINT_IO_FAILED;
+        const capacity = std.math.cast(usize, capacity_raw) orelse return wire.CHECKPOINT_IO_FATAL;
+        if (self.read_offset == self.bytes.items.len) return wire.CHECKPOINT_IO_OK;
+        if (capacity == 0) return wire.CHECKPOINT_IO_FATAL;
+        const out = destination orelse return wire.CHECKPOINT_IO_FATAL;
+        const count = @min(capacity, self.bytes.items.len - self.read_offset);
+        @memcpy(out[0..count], self.bytes.items[self.read_offset..][0..count]);
+        self.read_offset += count;
+        self.reads += 1;
+        written.* = count;
+        return wire.CHECKPOINT_IO_OK;
+    }
+};
+
+const PublicPermissionProbe = struct {
+    expected_session: ?*wire.SessionHandle = null,
+    ui_calls: u32 = 0,
+    ui_releases: u32 = 0,
+    host_calls: u32 = 0,
+    host_releases: u32 = 0,
+    callback_provenance: u32 = 0,
+    raw_arguments_leaked: bool = false,
+
+    fn validRun(self: *@This(), run_ptr: ?*const wire.RunContextV1) bool {
+        const run = sdk.validateRunContext(run_ptr) catch return false;
+        return run.session == self.expected_session and run.run_id == 1 and run.session_id.len == 24;
+    }
+
+    fn event(
+        raw: ?*anyopaque,
+        run_ptr: ?*const wire.RunContextV1,
+        event_json: wire.BytesViewV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.EVENT_FATAL));
+        if (!self.validRun(run_ptr)) return wire.EVENT_FATAL;
+        const encoded = sdk.borrowedBytes(event_json) catch return wire.EVENT_FATAL;
+        const parsed = sdk.decodeCoreEvent(std.heap.c_allocator, encoded) catch return wire.EVENT_FATAL;
+        defer parsed.deinit();
+        const event_value = switch (parsed.value) {
+            .known => |value| value,
+            .unknown => return wire.EVENT_CONTINUE,
+        };
+        switch (event_value) {
+            .permission_provenance => |provenance| {
+                if (std.mem.indexOf(u8, encoded, "hello") != null) {
+                    self.raw_arguments_leaked = true;
+                    return wire.EVENT_FATAL;
+                }
+                if (provenance.source == .callback) {
+                    if (provenance.decision != .allow or
+                        provenance.callback_outcome != .answered or
+                        provenance.response != .allow_once or
+                        provenance.request_id == null or
+                        provenance.tool.namespace != .host or
+                        !std.mem.eql(u8, provenance.tool.name, "HostEcho") or
+                        provenance.used_session_rule)
+                        return wire.EVENT_FATAL;
+                    self.callback_provenance += 1;
+                }
+            },
+            else => {},
+        }
+        return wire.EVENT_CONTINUE;
+    }
+
+    fn ui(
+        raw: ?*anyopaque,
+        run_ptr: ?*const wire.RunContextV1,
+        request_json: wire.BytesViewV1,
+        out_response: ?*wire.OwnedBytesV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.UI_FATAL));
+        if (!self.validRun(run_ptr)) return wire.UI_FATAL;
+        const encoded = sdk.borrowedBytes(request_json) catch return wire.UI_FATAL;
+        const parsed = sdk.decodeUiRequest(std.heap.c_allocator, encoded) catch return wire.UI_FATAL;
+        defer parsed.deinit();
+        const request = switch (parsed.value) {
+            .permission => |value| value,
+            else => return wire.UI_FATAL,
+        };
+        if (!std.mem.eql(u8, request.type, "permission") or
+            request.run_id != 1 or
+            request.policy_generation != 1 or
+            request.tool.namespace != .host or
+            !std.mem.eql(u8, request.tool.name, "HostEcho") or
+            std.mem.indexOf(u8, request.arguments_json, "hello") == null or
+            request.candidate != null)
+            return wire.UI_FATAL;
+        var permits_once = false;
+        for (request.responses) |choice| {
+            if (choice == .allow_once) permits_once = true;
+            if (choice == .allow_session or choice == .deny_session)
+                return wire.UI_FATAL;
+        }
+        if (!permits_once) return wire.UI_FATAL;
+        const response = sdk.protocol.PermissionResponse{
+            .permission = .allow_once,
+            .request_id = request.request_id,
+            .policy_generation = request.policy_generation,
+        };
+        const response_json = sdk.encodeUiResponse(
+            std.heap.c_allocator,
+            parsed.value,
+            .{ .permission = response },
+        ) catch return wire.UI_FATAL;
+        const out = out_response orelse {
+            std.heap.c_allocator.free(response_json);
+            return wire.UI_FATAL;
+        };
+        out.* = .{ .ptr = response_json.ptr, .len = response_json.len };
+        self.ui_calls += 1;
+        return wire.UI_ANSWERED;
+    }
+
+    fn releaseUi(raw: ?*anyopaque, response: ?*wire.OwnedBytesV1) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return));
+        const out = response orelse return;
+        if (out.ptr) |ptr| {
+            const len = std.math.cast(usize, out.len) orelse return;
+            std.heap.c_allocator.free(ptr[0..len]);
+            self.ui_releases += 1;
+        }
+        out.* = .{ .ptr = null, .len = 0 };
+    }
+
+    fn host(
+        raw: ?*anyopaque,
+        run_ptr: ?*const wire.RunContextV1,
+        arguments_json: wire.BytesViewV1,
+        out_result: ?*wire.OwnedBytesV1,
+    ) callconv(.c) u32 {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return wire.HOST_FATAL));
+        if (!self.validRun(run_ptr)) return wire.HOST_FATAL;
+        const arguments = sdk.borrowedBytes(arguments_json) catch return wire.HOST_FATAL;
+        if (std.mem.indexOf(u8, arguments, "hello") == null) return wire.HOST_FAILED;
+        const result = "host-ok";
+        (out_result orelse return wire.HOST_FATAL).* = .{
+            .ptr = @constCast(result.ptr),
+            .len = result.len,
+        };
+        self.host_calls += 1;
+        return wire.HOST_OK;
+    }
+
+    fn releaseHost(raw: ?*anyopaque, result: ?*wire.OwnedBytesV1) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw orelse return));
+        if (result) |out| {
+            if (out.ptr != null) self.host_releases += 1;
+            out.* = .{ .ptr = null, .len = 0 };
+        }
+    }
+};
+
+fn publicCheckpointLimits() wire.CheckpointLimitsV1 {
+    var limits = std.mem.zeroes(wire.CheckpointLimitsV1);
+    limits.struct_size = @sizeOf(wire.CheckpointLimitsV1);
+    limits.hard_bytes = 16 * 1024 * 1024;
+    limits.max_section_bytes = 8 * 1024 * 1024;
+    limits.max_string_bytes = 1024 * 1024;
+    limits.max_messages = 1024;
+    limits.max_blocks_per_message = 64;
+    limits.chunk_bytes = 4096;
+    return limits;
 }
 
 test "L2 SDK rejects API tables that violate rigid v1 discovery" {
@@ -672,7 +1021,7 @@ test "L2 SDK rejects API tables that violate rigid v1 discovery" {
     try std.testing.expectError(error.UnsupportedAbi, sdk.Api.validate(&extra_capability));
 }
 
-test "L2 Revision 5 public mutations and compact use the exact hard-cut table" {
+test "L2 Revision 6 public mutations and compact use the exact hard-cut table" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -701,17 +1050,17 @@ test "L2 Revision 5 public mutations and compact use the exact hard-cut table" {
     initial_rules.allow = &initial_allow;
     initial_rules.allow_count = initial_allow.len;
     var selection = allSkillsEnabledSelection();
-    var config = std.mem.zeroes(wire.SessionConfigV1);
-    config.struct_size = @sizeOf(wire.SessionConfigV1);
-    config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
-    config.permission_mode_code = wire.PERMISSION_BYPASS;
-    config.shell_policy_code = wire.SHELL_DISABLED;
-    config.api_key = sdk.bytesView("test-key");
-    config.model = sdk.bytesView("old-model");
-    config.workspace_root = sdk.bytesView(root);
-    config.workspace_home = sdk.bytesView(root);
-    config.skill_selection = &selection;
-    config.permission_rules = &initial_rules;
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("test-key");
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    host_config.skill_selection = &selection;
+    host_config.permission_rules = &initial_rules;
+    var config = sessionCreateConfig(&host_config, "old-model");
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
     callbacks.on_event = acceptEvent;
@@ -723,7 +1072,7 @@ test "L2 Revision 5 public mutations and compact use the exact hard-cut table" {
     try std.testing.expect(session == null);
     api.bufferRelease()(&diagnostic);
 
-    config.skill_selection = null;
+    host_config.skill_selection = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
         api.sessionCreate()(runtime, &config, &callbacks, &session, &diagnostic),
@@ -804,7 +1153,423 @@ test "L2 Revision 5 public mutations and compact use the exact hard-cut table" {
     );
 }
 
-test "L2 Revision 5 imported permission rules control the next Run" {
+test "L2 Revision 6 public MCP checkpoint restore facade preserves Conversation under narrower current authority" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    const provider_bodies = [_][]const u8{ FINAL_SSE, FINAL_SSE };
+    var provider = try harness.MockServer.startCassette(&provider_bodies, 0);
+    defer provider.stop();
+    const base_url = try provider.urlOwned(a);
+    defer a.free(base_url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+
+    var mcp_probe = PublicMcpProbe{};
+    var mcp_server = std.mem.zeroes(wire.McpServerV1);
+    mcp_server.struct_size = @sizeOf(wire.McpServerV1);
+    mcp_server.transport_code = wire.MCP_TRANSPORT_STDIO;
+    mcp_server.negotiation_policy_code = wire.MCP_NEGOTIATION_AUTO;
+    mcp_server.server_binding_identity = [_]u8{0x42} ** 32;
+    mcp_server.namespace = sdk.bytesView("weather");
+    mcp_server.client_name = sdk.bytesView("agentcore-component-test");
+    mcp_server.client_version = sdk.bytesView("6");
+    mcp_server.timeout_ms = 1000;
+    mcp_server.connector = mcp_probe.connector();
+    const mcp_servers = [_]wire.McpServerV1{mcp_server};
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    runtime_config.mcp_servers = &mcp_servers;
+    runtime_config.mcp_server_count = mcp_servers.len;
+    var runtime: ?*wire.RuntimeHandle = null;
+    var session: ?*wire.SessionHandle = null;
+    defer {
+        if (session) |handle| {
+            _ = api.sessionDestroy()(handle, &diagnostic);
+            session = null;
+            api.bufferRelease()(&diagnostic);
+        }
+        if (runtime) |handle| {
+            _ = api.runtimeDestroy()(handle, &diagnostic);
+            runtime = null;
+            api.bufferRelease()(&diagnostic);
+        }
+    }
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+    );
+
+    var mcp_description = std.mem.zeroes(wire.OwnedBytesV1);
+    try std.testing.expectEqual(
+        wire.STATUS_MCP_NOT_REFRESHED,
+        api.runtimeDescribeMcp()(runtime, &mcp_description, &diagnostic),
+    );
+    try std.testing.expect(mcp_description.ptr == null and mcp_description.len == 0);
+    api.bufferRelease()(&diagnostic);
+
+    var catalog_generation: u64 = 0;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeRefreshMcp()(runtime, &catalog_generation, &diagnostic),
+    );
+    try std.testing.expectEqual(@as(u64, 1), catalog_generation);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeDescribeMcp()(runtime, &mcp_description, &diagnostic),
+    );
+    {
+        const encoded = try sdk.borrowedBytes(.{
+            .ptr = mcp_description.ptr,
+            .len = mcp_description.len,
+        });
+        const decoded = try sdk.decodeMcpCatalog(a, encoded);
+        defer decoded.deinit();
+        try std.testing.expectEqual(@as(u64, 1), decoded.value.catalog_generation);
+        try std.testing.expectEqual(@as(usize, 1), decoded.value.servers.len);
+        try std.testing.expectEqual(@as(usize, 1), decoded.value.tools.len);
+        try std.testing.expectEqualStrings("2026-07-28", decoded.value.servers[0].negotiated_protocol);
+        try std.testing.expectEqualStrings("weather", decoded.value.tools[0].canonical_name);
+        try std.testing.expectEqualStrings(
+            decoded.value.servers[0].server_binding_identity,
+            decoded.value.tools[0].server_binding_identity,
+        );
+    }
+    api.bufferRelease()(&mcp_description);
+
+    var selector = std.mem.zeroes(wire.McpSelectorV1);
+    selector.struct_size = @sizeOf(wire.McpSelectorV1);
+    selector.server_binding_identity = [_]u8{0x42} ** 32;
+    selector.tool_name = sdk.bytesView("weather");
+    const selectors = [_]wire.McpSelectorV1{selector};
+    var selected_mcp = std.mem.zeroes(wire.McpSelectionV1);
+    selected_mcp.struct_size = @sizeOf(wire.McpSelectionV1);
+    selected_mcp.selectors = &selectors;
+    selected_mcp.selector_count = selectors.len;
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView(base_url);
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    host.mcp_selection = &selected_mcp;
+    var create_config = sessionCreateConfig(&host, "test-model");
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.on_event = acceptEvent;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionCreate()(runtime, &create_config, &callbacks, &session, &diagnostic),
+    );
+
+    var session_id: [wire.MAX_SESSION_ID_BYTES_V1]u8 = undefined;
+    var session_id_len: usize = 0;
+    var session_description = std.mem.zeroes(wire.OwnedBytesV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionDescribe()(session, &session_description, &diagnostic),
+    );
+    {
+        const encoded = try sdk.borrowedBytes(.{
+            .ptr = session_description.ptr,
+            .len = session_description.len,
+        });
+        const decoded = try sdk.decodeSessionDescription(a, encoded);
+        defer decoded.deinit();
+        try std.testing.expectEqual(sdk.protocol.LogicalSessionOrigin.fresh, decoded.value.origin);
+        try std.testing.expectEqual(@as(usize, 1), decoded.value.mcp.tools.len);
+        try std.testing.expectEqualStrings("weather", decoded.value.mcp.tools[0].canonical_name);
+        session_id_len = decoded.value.session_id.len;
+        @memcpy(session_id[0..session_id_len], decoded.value.session_id);
+    }
+    api.bufferRelease()(&session_description);
+
+    var bad_selector = selector;
+    bad_selector.tool_name = sdk.bytesView("missing");
+    const bad_selectors = [_]wire.McpSelectorV1{bad_selector};
+    var bad_selection = selected_mcp;
+    bad_selection.selectors = &bad_selectors;
+    try std.testing.expectEqual(
+        wire.STATUS_INVALID_MCP_SELECTION,
+        api.sessionUpdateMcp()(session, &bad_selection, &diagnostic),
+    );
+    api.bufferRelease()(&diagnostic);
+
+    var empty_selection = std.mem.zeroes(wire.McpSelectionV1);
+    empty_selection.struct_size = @sizeOf(wire.McpSelectionV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionUpdateMcp()(session, &empty_selection, &diagnostic),
+    );
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionDescribe()(session, &session_description, &diagnostic),
+    );
+    {
+        const encoded = try sdk.borrowedBytes(.{
+            .ptr = session_description.ptr,
+            .len = session_description.len,
+        });
+        const decoded = try sdk.decodeSessionDescription(a, encoded);
+        defer decoded.deinit();
+        try std.testing.expectEqual(@as(usize, 0), decoded.value.mcp.tools.len);
+    }
+    api.bufferRelease()(&session_description);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionUpdateMcp()(session, &selected_mcp, &diagnostic),
+    );
+
+    var run_options = std.mem.zeroes(wire.RunOptionsV1);
+    run_options.struct_size = @sizeOf(wire.RunOptionsV1);
+    run_options.max_turns = 1;
+    var run_result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRunText(
+            session,
+            1,
+            sdk.bytesView("remember this before restore"),
+            &run_options,
+            &run_result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, run_result.stop_reason_code);
+
+    var checkpoint = PublicCheckpointBuffer{};
+    defer checkpoint.deinit();
+    var limits = publicCheckpointLimits();
+    var sink = checkpoint.sink();
+    var export_config = std.mem.zeroes(wire.CheckpointExportConfigV1);
+    export_config.struct_size = @sizeOf(wire.CheckpointExportConfigV1);
+    export_config.limits = &limits;
+    export_config.sink = &sink;
+    var export_result = std.mem.zeroes(wire.CheckpointExportResultV1);
+    checkpoint.fail_write = true;
+    try std.testing.expectEqual(
+        wire.STATUS_CHECKPOINT_IO,
+        api.sessionExportCheckpoint()(session, &export_config, &export_result, &diagnostic),
+    );
+    try std.testing.expectEqual(@as(usize, 0), checkpoint.bytes.items.len);
+    api.bufferRelease()(&diagnostic);
+    checkpoint.fail_write = false;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionExportCheckpoint()(session, &export_config, &export_result, &diagnostic),
+    );
+    try std.testing.expectEqual(@as(u64, 1), export_result.checkpoint_generation);
+    try std.testing.expectEqual(@as(u64, checkpoint.bytes.items.len), export_result.total_bytes);
+    try std.testing.expect(export_result.chunk_count != 0 and checkpoint.writes != 0);
+
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
+    session = null;
+
+    var restore_host = host;
+    restore_host.mcp_selection = null;
+    var source = checkpoint.source();
+    var restore_config = std.mem.zeroes(wire.SessionRestoreConfigV1);
+    restore_config.struct_size = @sizeOf(wire.SessionRestoreConfigV1);
+    restore_config.host = &restore_host;
+    restore_config.source = &source;
+    restore_config.limits = &limits;
+    var restore_report = std.mem.zeroes(wire.OwnedBytesV1);
+    checkpoint.fail_read = true;
+    try std.testing.expectEqual(
+        wire.STATUS_CHECKPOINT_IO,
+        api.sessionRestore()(
+            runtime,
+            &restore_config,
+            &callbacks,
+            &session,
+            &restore_report,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expect(session == null);
+    try std.testing.expect(restore_report.ptr == null and restore_report.len == 0);
+    api.bufferRelease()(&diagnostic);
+
+    checkpoint.fail_read = false;
+    source = checkpoint.source();
+    restore_config.source = &source;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRestore()(
+            runtime,
+            &restore_config,
+            &callbacks,
+            &session,
+            &restore_report,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expect(checkpoint.reads != 0);
+    {
+        const encoded = try sdk.borrowedBytes(.{
+            .ptr = restore_report.ptr,
+            .len = restore_report.len,
+        });
+        const decoded = try sdk.decodeRestoreReport(a, encoded);
+        defer decoded.deinit();
+        try std.testing.expectEqual(sdk.protocol.RestoreHealth.degraded, decoded.value.health);
+        try std.testing.expectEqualStrings(session_id[0..session_id_len], decoded.value.session_id);
+        try std.testing.expectEqual(@as(u32, 0), decoded.value.mcp.restored_bindings);
+        try std.testing.expectEqual(@as(u32, 1), decoded.value.mcp.invalidated_bindings);
+        try std.testing.expect(decoded.value.issues.len != 0);
+    }
+    api.bufferRelease()(&restore_report);
+
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionDescribe()(session, &session_description, &diagnostic),
+    );
+    {
+        const encoded = try sdk.borrowedBytes(.{
+            .ptr = session_description.ptr,
+            .len = session_description.len,
+        });
+        const decoded = try sdk.decodeSessionDescription(a, encoded);
+        defer decoded.deinit();
+        try std.testing.expectEqual(sdk.protocol.LogicalSessionOrigin.restored, decoded.value.origin);
+        try std.testing.expectEqualStrings(session_id[0..session_id_len], decoded.value.session_id);
+        try std.testing.expectEqual(@as(u64, 1), decoded.value.last_run_id);
+        try std.testing.expect(decoded.value.conversation.message_count != 0);
+        try std.testing.expectEqual(@as(usize, 0), decoded.value.mcp.tools.len);
+        try std.testing.expectEqual(@as(u32, 1), decoded.value.restore.invalidated_mcp_bindings);
+    }
+    api.bufferRelease()(&session_description);
+
+    run_result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRunText(
+            session,
+            2,
+            sdk.bytesView("continue after restore"),
+            &run_options,
+            &run_result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, run_result.stop_reason_code);
+
+    try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(session, &diagnostic));
+    session = null;
+    try std.testing.expectEqual(wire.STATUS_OK, api.runtimeDestroy()(runtime, &diagnostic));
+    runtime = null;
+    try std.testing.expectEqual(@as(u32, 2), mcp_probe.opens);
+    try std.testing.expectEqual(@as(u32, 1), mcp_probe.probe_opens);
+    try std.testing.expectEqual(@as(u32, 1), mcp_probe.actual_opens);
+    try std.testing.expectEqual(mcp_probe.opens, mcp_probe.closes);
+    try std.testing.expectEqual(mcp_probe.requests, mcp_probe.releases);
+}
+
+test "L2 Revision 6 public Permission callback and provenance bind the exact Host invocation" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try rootPath(&tmp, &root_buffer);
+    const bodies = [_][]const u8{ HOST_SSE, FINAL_SSE };
+    var provider = try harness.MockServer.startCassette(&bodies, 0);
+    defer provider.stop();
+    const base_url = try provider.urlOwned(a);
+    defer a.free(base_url);
+
+    const raw_api = abi.metask_agentcore_get_api(wire.ABI_VERSION_V1) orelse
+        return error.MissingApi;
+    const api = try sdk.Api.validate(@ptrCast(@alignCast(raw_api)));
+    var diagnostic = std.mem.zeroes(wire.OwnedBytesV1);
+    defer api.bufferRelease()(&diagnostic);
+    var probe = PublicPermissionProbe{};
+    var host_tool = std.mem.zeroes(wire.HostToolV1);
+    host_tool.struct_size = @sizeOf(wire.HostToolV1);
+    host_tool.ctx = &probe;
+    host_tool.name = sdk.bytesView("HostEcho");
+    host_tool.description = sdk.bytesView("Echo a value through the Host");
+    host_tool.input_schema_json = sdk.bytesView(
+        "{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"]}",
+    );
+    host_tool.execute = PublicPermissionProbe.host;
+    host_tool.release_result = PublicPermissionProbe.releaseHost;
+    const host_tools = [_]wire.HostToolV1{host_tool};
+    var runtime_config = std.mem.zeroes(wire.RuntimeConfigV1);
+    runtime_config.struct_size = @sizeOf(wire.RuntimeConfigV1);
+    runtime_config.host_tools = &host_tools;
+    runtime_config.host_tool_count = host_tools.len;
+    var runtime: ?*wire.RuntimeHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.runtimeCreate()(&runtime_config, &runtime, &diagnostic),
+    );
+    defer if (runtime) |handle| {
+        _ = api.runtimeDestroy()(handle, &diagnostic);
+    };
+
+    const allowed_tools = [_]wire.BytesViewV1{sdk.bytesView("HostEcho")};
+    var host = std.mem.zeroes(wire.SessionHostConfigV1);
+    host.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host.permission_mode_code = wire.PERMISSION_DEFAULT;
+    host.shell_policy_code = wire.SHELL_DISABLED;
+    host.api_key = sdk.bytesView("test-key");
+    host.base_url = sdk.bytesView(base_url);
+    host.workspace_root = sdk.bytesView(root);
+    host.workspace_home = sdk.bytesView(root);
+    host.allowed_tools = &allowed_tools;
+    host.allowed_tool_count = allowed_tools.len;
+    var create_config = sessionCreateConfig(&host, "test-model");
+    var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
+    callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
+    callbacks.ctx = &probe;
+    callbacks.on_event = PublicPermissionProbe.event;
+    callbacks.on_ui_request = PublicPermissionProbe.ui;
+    callbacks.release_response = PublicPermissionProbe.releaseUi;
+    var session: ?*wire.SessionHandle = null;
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionCreate()(runtime, &create_config, &callbacks, &session, &diagnostic),
+    );
+    probe.expected_session = session;
+    defer if (session) |handle| {
+        _ = api.sessionDestroy()(handle, &diagnostic);
+    };
+
+    var options = std.mem.zeroes(wire.RunOptionsV1);
+    options.struct_size = @sizeOf(wire.RunOptionsV1);
+    options.max_turns = 3;
+    var result = std.mem.zeroes(wire.RunResultV1);
+    try std.testing.expectEqual(
+        wire.STATUS_OK,
+        api.sessionRunText(
+            session,
+            1,
+            sdk.bytesView("invoke the Host echo"),
+            &options,
+            &result,
+            &diagnostic,
+        ),
+    );
+    try std.testing.expectEqual(wire.STOP_END_TURN, result.stop_reason_code);
+    try std.testing.expectEqual(@as(u32, 1), probe.ui_calls);
+    try std.testing.expectEqual(@as(u32, 1), probe.ui_releases);
+    try std.testing.expectEqual(@as(u32, 1), probe.host_calls);
+    try std.testing.expectEqual(@as(u32, 1), probe.host_releases);
+    try std.testing.expectEqual(@as(u32, 1), probe.callback_provenance);
+    try std.testing.expect(!probe.raw_arguments_leaked);
+}
+
+test "L2 Revision 6 imported permission rules control the next Run" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -841,19 +1606,19 @@ test "L2 Revision 5 imported permission rules control the next Run" {
     initial_rules.struct_size = @sizeOf(wire.PermissionRuleSetV1);
     initial_rules.deny = &deny_write;
     initial_rules.deny_count = deny_write.len;
-    var config = std.mem.zeroes(wire.SessionConfigV1);
-    config.struct_size = @sizeOf(wire.SessionConfigV1);
-    config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
-    config.permission_mode_code = wire.PERMISSION_DEFAULT;
-    config.shell_policy_code = wire.SHELL_DISABLED;
-    config.api_key = sdk.bytesView("test-key");
-    config.model = sdk.bytesView("test-model");
-    config.base_url = sdk.bytesView(url);
-    config.workspace_root = sdk.bytesView(root);
-    config.workspace_home = sdk.bytesView(root);
-    config.allowed_tools = &builtins;
-    config.allowed_tool_count = builtins.len;
-    config.permission_rules = &initial_rules;
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_DEFAULT;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("test-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    host_config.allowed_tools = &builtins;
+    host_config.allowed_tool_count = builtins.len;
+    host_config.permission_rules = &initial_rules;
+    var config = sessionCreateConfig(&host_config, "test-model");
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
     callbacks.on_event = acceptEvent;
@@ -947,17 +1712,17 @@ test "L2 invalid Session configuration publishes no handle and diagnostics never
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
     callbacks.on_event = Probe.event;
     const read_only = [_]wire.BytesViewV1{sdk.bytesView("Read")};
-    var config = std.mem.zeroes(wire.SessionConfigV1);
-    config.struct_size = @sizeOf(wire.SessionConfigV1);
-    config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
-    config.permission_mode_code = wire.PERMISSION_BYPASS;
-    config.shell_policy_code = wire.SHELL_DISABLED;
-    config.api_key = sdk.bytesView("test-key");
-    config.model = sdk.bytesView("test-model");
-    config.workspace_root = sdk.bytesView(root);
-    config.workspace_home = sdk.bytesView(root);
-    config.allowed_tools = &read_only;
-    config.allowed_tool_count = read_only.len;
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("test-key");
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    host_config.allowed_tools = &read_only;
+    host_config.allowed_tool_count = read_only.len;
+    var config = sessionCreateConfig(&host_config, "test-model");
 
     var missing_event_callbacks = callbacks;
     missing_event_callbacks.on_event = null;
@@ -975,31 +1740,31 @@ test "L2 invalid Session configuration publishes no handle and diagnostics never
     api.bufferRelease()(&diagnostic);
     config.model = valid_model;
 
-    config.workspace_root = sdk.bytesView(".");
+    host_config.workspace_root = sdk.bytesView(".");
     try expectInvalidSessionConfig(api, runtime.?, &config, &callbacks, &diagnostic);
-    config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_root = sdk.bytesView(root);
 
-    config.workspace_home = sdk.bytesView(".");
+    host_config.workspace_home = sdk.bytesView(".");
     try expectInvalidSessionConfig(api, runtime.?, &config, &callbacks, &diagnostic);
-    config.workspace_home = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
 
     const missing = [_]wire.BytesViewV1{sdk.bytesView("Grep")};
-    config.allowed_tools = &missing;
-    config.allowed_tool_count = missing.len;
+    host_config.allowed_tools = &missing;
+    host_config.allowed_tool_count = missing.len;
     try expectInvalidSessionConfig(api, runtime.?, &config, &callbacks, &diagnostic);
 
     const duplicate = [_]wire.BytesViewV1{ sdk.bytesView("Read"), sdk.bytesView("Read") };
-    config.allowed_tools = &duplicate;
-    config.allowed_tool_count = duplicate.len;
+    host_config.allowed_tools = &duplicate;
+    host_config.allowed_tool_count = duplicate.len;
     try expectInvalidSessionConfig(api, runtime.?, &config, &callbacks, &diagnostic);
 
     const disabled_shell = [_]wire.BytesViewV1{sdk.bytesView("Bash")};
-    config.allowed_tools = &disabled_shell;
-    config.allowed_tool_count = disabled_shell.len;
+    host_config.allowed_tools = &disabled_shell;
+    host_config.allowed_tool_count = disabled_shell.len;
     try expectInvalidSessionConfig(api, runtime.?, &config, &callbacks, &diagnostic);
 
-    config.allowed_tools = null;
-    config.allowed_tool_count = wire.MAX_TOOL_COUNT_V1 + 1;
+    host_config.allowed_tools = null;
+    host_config.allowed_tool_count = wire.MAX_TOOL_COUNT_V1 + 1;
     var limited_session: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_RESOURCE_LIMIT,
@@ -1034,21 +1799,21 @@ test "L2 sandbox admission is eager while unrestricted skips the probe" {
     };
 
     const read_only = [_]wire.BytesViewV1{sdk.bytesView("Read")};
-    var config = std.mem.zeroes(wire.SessionConfigV1);
-    config.struct_size = @sizeOf(wire.SessionConfigV1);
-    config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
-    config.permission_mode_code = wire.PERMISSION_BYPASS;
-    config.api_key = sdk.bytesView("test-key");
-    config.model = sdk.bytesView("test-model");
-    config.workspace_root = sdk.bytesView(root);
-    config.workspace_home = sdk.bytesView(root);
-    config.allowed_tools = &read_only;
-    config.allowed_tool_count = read_only.len;
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.api_key = sdk.bytesView("test-key");
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    host_config.allowed_tools = &read_only;
+    host_config.allowed_tool_count = read_only.len;
+    var config = sessionCreateConfig(&host_config, "test-model");
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
     callbacks.on_event = Probe.event;
 
-    config.shell_policy_code = wire.SHELL_UNRESTRICTED;
+    host_config.shell_policy_code = wire.SHELL_UNRESTRICTED;
     var unrestricted: ?*wire.SessionHandle = null;
     try std.testing.expectEqual(
         wire.STATUS_OK,
@@ -1057,7 +1822,7 @@ test "L2 sandbox admission is eager while unrestricted skips the probe" {
     try std.testing.expect(unrestricted != null);
     try std.testing.expectEqual(wire.STATUS_OK, api.sessionDestroy()(unrestricted, &diagnostic));
 
-    config.shell_policy_code = wire.SHELL_SANDBOXED;
+    host_config.shell_policy_code = wire.SHELL_SANDBOXED;
     var sandboxed: ?*wire.SessionHandle = null;
     const status = api.sessionCreate()(runtime, &config, &callbacks, &sandboxed, &diagnostic);
     if (@import("builtin").os.tag == .macos) {
@@ -1095,16 +1860,16 @@ test "L2 public events reconstruct continuation output and observable run usage"
         _ = api.runtimeDestroy()(handle, &diagnostic);
     };
 
-    var session_config = std.mem.zeroes(wire.SessionConfigV1);
-    session_config.struct_size = @sizeOf(wire.SessionConfigV1);
-    session_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
-    session_config.permission_mode_code = wire.PERMISSION_BYPASS;
-    session_config.shell_policy_code = wire.SHELL_DISABLED;
-    session_config.api_key = sdk.bytesView("test-key");
-    session_config.model = sdk.bytesView("test-model");
-    session_config.base_url = sdk.bytesView(url);
-    session_config.workspace_root = sdk.bytesView(root);
-    session_config.workspace_home = sdk.bytesView(root);
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("test-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    var session_config = sessionCreateConfig(&host_config, "test-model");
 
     var probe = ReconstructionProbe{};
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
@@ -1163,16 +1928,16 @@ test "L2 session_set_model preserves Conversation and changes the next Run reque
         _ = api.runtimeDestroy()(handle, &diagnostic);
     };
 
-    var config = std.mem.zeroes(wire.SessionConfigV1);
-    config.struct_size = @sizeOf(wire.SessionConfigV1);
-    config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
-    config.permission_mode_code = wire.PERMISSION_BYPASS;
-    config.shell_policy_code = wire.SHELL_DISABLED;
-    config.api_key = sdk.bytesView("test-key");
-    config.model = sdk.bytesView("old-model");
-    config.base_url = sdk.bytesView(url);
-    config.workspace_root = sdk.bytesView(root);
-    config.workspace_home = sdk.bytesView(root);
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("test-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    var config = sessionCreateConfig(&host_config, "old-model");
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
     callbacks.on_event = acceptEvent;
@@ -1410,7 +2175,7 @@ test "L2 public compact abort is concurrent bounded and leaves the facade reusab
     );
 }
 
-test "L2 Revision 5 catalog and explicit selection bind before Session" {
+test "L2 Revision 6 catalog and explicit selection bind before Session" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1525,19 +2290,19 @@ test "L2 Revision 5 catalog and explicit selection bind before Session" {
     try std.testing.expect(!std.mem.eql(u8, ids.skill_id, workctl_ids.skill_id));
     api.bufferRelease()(&descriptor);
 
-    var session_config = std.mem.zeroes(wire.SessionConfigV1);
-    session_config.struct_size = @sizeOf(wire.SessionConfigV1);
-    session_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
-    session_config.permission_mode_code = wire.PERMISSION_BYPASS;
-    session_config.shell_policy_code = wire.SHELL_DISABLED;
-    session_config.api_key = sdk.bytesView("test-key");
-    session_config.model = sdk.bytesView("test-model");
-    session_config.base_url = sdk.bytesView(url);
-    session_config.workspace_root = sdk.bytesView(root);
-    session_config.workspace_home = sdk.bytesView(root);
-    session_config.skill_catalog = catalog;
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("test-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    host_config.skill_catalog = catalog;
     var skill_selection = allSkillsEnabledSelection();
-    session_config.skill_selection = &skill_selection;
+    host_config.skill_selection = &skill_selection;
+    var session_config = sessionCreateConfig(&host_config, "test-model");
     var probe = ReconstructionProbe{};
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
@@ -1785,19 +2550,19 @@ test "L2 AgentCore Skill forks cannot override the Session model" {
     defer a.free(blocked.revision);
     defer a.free(blocked.skill_id);
 
-    var session_config = std.mem.zeroes(wire.SessionConfigV1);
-    session_config.struct_size = @sizeOf(wire.SessionConfigV1);
-    session_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
-    session_config.permission_mode_code = wire.PERMISSION_BYPASS;
-    session_config.shell_policy_code = wire.SHELL_DISABLED;
-    session_config.api_key = sdk.bytesView("test-key");
-    session_config.model = sdk.bytesView("session-locked-model");
-    session_config.base_url = sdk.bytesView(url);
-    session_config.workspace_root = sdk.bytesView(root);
-    session_config.workspace_home = sdk.bytesView(root);
-    session_config.skill_catalog = catalog;
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("test-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    host_config.skill_catalog = catalog;
     var skill_selection = allSkillsEnabledSelection();
-    session_config.skill_selection = &skill_selection;
+    host_config.skill_selection = &skill_selection;
+    var session_config = sessionCreateConfig(&host_config, "session-locked-model");
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
     callbacks.on_event = acceptEvent;
@@ -2101,21 +2866,21 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
         sdk.bytesView("Write"),
         sdk.bytesView("Glob"),
     };
-    var session_config = std.mem.zeroes(wire.SessionConfigV1);
-    session_config.struct_size = @sizeOf(wire.SessionConfigV1);
-    session_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
-    session_config.permission_mode_code = wire.PERMISSION_BYPASS;
-    session_config.shell_policy_code = wire.SHELL_DISABLED;
-    session_config.api_key = sdk.bytesView("test-key");
-    session_config.model = sdk.bytesView("test-model");
-    session_config.base_url = sdk.bytesView(url);
-    session_config.workspace_root = sdk.bytesView(root);
-    session_config.workspace_home = sdk.bytesView(root);
-    session_config.allowed_tools = &allowed;
-    session_config.allowed_tool_count = allowed.len;
-    session_config.skill_catalog = catalog;
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("test-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    host_config.allowed_tools = &allowed;
+    host_config.allowed_tool_count = allowed.len;
+    host_config.skill_catalog = catalog;
     var skill_selection = allSkillsEnabledSelection();
-    session_config.skill_selection = &skill_selection;
+    host_config.skill_selection = &skill_selection;
+    var session_config = sessionCreateConfig(&host_config, "test-model");
 
     var probe = Probe{};
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
@@ -2305,8 +3070,8 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     const openai_url = try openai_server.urlOwned(a);
     defer a.free(openai_url);
 
-    session_config.provider_kind_code = wire.PROVIDER_OPENAI;
-    session_config.base_url = sdk.bytesView(openai_url);
+    host_config.provider_kind_code = wire.PROVIDER_OPENAI;
+    host_config.base_url = sdk.bytesView(openai_url);
     var openai_probe = Probe{};
     callbacks.ctx = &openai_probe;
     var openai_session: ?*wire.SessionHandle = null;
@@ -2370,8 +3135,8 @@ test "L2 bound catalog executes model Skill and preserves nested policy lineage"
     const fatal_url = try fatal_server.urlOwned(a);
     defer a.free(fatal_url);
 
-    session_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
-    session_config.base_url = sdk.bytesView(fatal_url);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.base_url = sdk.bytesView(fatal_url);
     var fatal_probe = NestedSkillFatalProbe{};
     var fatal_callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
     fatal_callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
@@ -2452,6 +3217,9 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
         .builtin_tool_count = builtins.len,
         .host_tools = @ptrCast(&host),
         .host_tool_count = 1,
+        .mcp_servers = null,
+        .mcp_server_count = 0,
+        .mcp_catalog_limits = null,
         .reserved = [_]u64{0} ** 4,
     };
     var diagnostic = wire.OwnedBytesV1{ .ptr = null, .len = 0 };
@@ -2463,13 +3231,12 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
     }
 
     const allowed = [_]wire.BytesViewV1{ sdk.bytesView("AskUserQuestion"), sdk.bytesView("HostEcho") };
-    var session_config = wire.SessionConfigV1{
-        .struct_size = @sizeOf(wire.SessionConfigV1),
+    var host_config = wire.SessionHostConfigV1{
+        .struct_size = @sizeOf(wire.SessionHostConfigV1),
         .provider_kind_code = wire.PROVIDER_ANTHROPIC,
-        .permission_mode_code = wire.PERMISSION_BYPASS,
+        .permission_mode_code = wire.PERMISSION_FULL_ACCESS,
         .shell_policy_code = wire.SHELL_DISABLED,
         .api_key = sdk.bytesView("test-key"),
-        .model = sdk.bytesView("test-model"),
         .base_url = sdk.bytesView(url),
         .workspace_root = sdk.bytesView(root),
         .workspace_home = sdk.bytesView(root),
@@ -2478,8 +3245,11 @@ test "L2 opaque ABI routes Host callbacks and enforces Run admission identifiers
         .skill_catalog = null,
         .skill_selection = null,
         .permission_rules = null,
+        .mcp_selection = null,
+        .durable_budget = null,
         .reserved = [_]u64{0} ** 4,
     };
+    var session_config = sessionCreateConfig(&host_config, "test-model");
     var callbacks = wire.SessionCallbacksV1{
         .struct_size = @sizeOf(wire.SessionCallbacksV1),
         .reserved0 = 0,
@@ -2658,16 +3428,16 @@ test "L2 facade gate covers the core-idle epilogue until sessionRun returns" {
         _ = api.runtimeDestroy()(handle, &diagnostic);
     };
 
-    var session_config = std.mem.zeroes(wire.SessionConfigV1);
-    session_config.struct_size = @sizeOf(wire.SessionConfigV1);
-    session_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
-    session_config.permission_mode_code = wire.PERMISSION_BYPASS;
-    session_config.shell_policy_code = wire.SHELL_DISABLED;
-    session_config.api_key = sdk.bytesView("test-key");
-    session_config.model = sdk.bytesView("test-model");
-    session_config.base_url = sdk.bytesView(url);
-    session_config.workspace_root = sdk.bytesView(root);
-    session_config.workspace_home = sdk.bytesView(root);
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("test-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    var session_config = sessionCreateConfig(&host_config, "test-model");
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
     callbacks.on_event = acceptEvent;
@@ -2841,18 +3611,18 @@ test "L2 invalid UTF-8 Host tool result is released and does not poison Session"
     }
 
     const allowed = [_]wire.BytesViewV1{sdk.bytesView("HostEcho")};
-    var session_config = std.mem.zeroes(wire.SessionConfigV1);
-    session_config.struct_size = @sizeOf(wire.SessionConfigV1);
-    session_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
-    session_config.permission_mode_code = wire.PERMISSION_BYPASS;
-    session_config.shell_policy_code = wire.SHELL_DISABLED;
-    session_config.api_key = sdk.bytesView("failure-test-key");
-    session_config.model = sdk.bytesView("failure-test-model");
-    session_config.base_url = sdk.bytesView(url);
-    session_config.workspace_root = sdk.bytesView(root);
-    session_config.workspace_home = sdk.bytesView(root);
-    session_config.allowed_tools = &allowed;
-    session_config.allowed_tool_count = allowed.len;
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("failure-test-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    host_config.allowed_tools = &allowed;
+    host_config.allowed_tool_count = allowed.len;
+    var session_config = sessionCreateConfig(&host_config, "failure-test-model");
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
     callbacks.on_event = acceptEvent;
@@ -2901,16 +3671,16 @@ test "L2 Event callback fatal aborts the Run and poisons the ABI Session" {
         if (runtime) |handle| _ = api.runtimeDestroy()(handle, &diagnostic);
     }
 
-    var session_config = std.mem.zeroes(wire.SessionConfigV1);
-    session_config.struct_size = @sizeOf(wire.SessionConfigV1);
-    session_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
-    session_config.permission_mode_code = wire.PERMISSION_BYPASS;
-    session_config.shell_policy_code = wire.SHELL_DISABLED;
-    session_config.api_key = sdk.bytesView("event-fatal-key");
-    session_config.model = sdk.bytesView("event-fatal-model");
-    session_config.base_url = sdk.bytesView(url);
-    session_config.workspace_root = sdk.bytesView(root);
-    session_config.workspace_home = sdk.bytesView(root);
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("event-fatal-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    var session_config = sessionCreateConfig(&host_config, "event-fatal-model");
     var probe = FatalEventProbe{};
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
@@ -2967,16 +3737,16 @@ test "L2 Event callback may cooperatively abort without poisoning the ABI Sessio
         if (runtime) |handle| _ = api.runtimeDestroy()(handle, &diagnostic);
     }
 
-    var session_config = std.mem.zeroes(wire.SessionConfigV1);
-    session_config.struct_size = @sizeOf(wire.SessionConfigV1);
-    session_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
-    session_config.permission_mode_code = wire.PERMISSION_BYPASS;
-    session_config.shell_policy_code = wire.SHELL_DISABLED;
-    session_config.api_key = sdk.bytesView("event-abort-key");
-    session_config.model = sdk.bytesView("event-abort-model");
-    session_config.base_url = sdk.bytesView(url);
-    session_config.workspace_root = sdk.bytesView(root);
-    session_config.workspace_home = sdk.bytesView(root);
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("event-abort-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    var session_config = sessionCreateConfig(&host_config, "event-abort-model");
     var probe = AbortEventProbe{ .api = api };
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
@@ -3042,18 +3812,18 @@ fn expectUiOutcome(mode: UiFailureMode, expected_releases: usize, expected_statu
     }
 
     const allowed = [_]wire.BytesViewV1{sdk.bytesView("AskUserQuestion")};
-    var session_config = std.mem.zeroes(wire.SessionConfigV1);
-    session_config.struct_size = @sizeOf(wire.SessionConfigV1);
-    session_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
-    session_config.permission_mode_code = wire.PERMISSION_BYPASS;
-    session_config.shell_policy_code = wire.SHELL_DISABLED;
-    session_config.api_key = sdk.bytesView("test-key");
-    session_config.model = sdk.bytesView("test-model");
-    session_config.base_url = sdk.bytesView(url);
-    session_config.workspace_root = sdk.bytesView(root);
-    session_config.workspace_home = sdk.bytesView(root);
-    session_config.allowed_tools = &allowed;
-    session_config.allowed_tool_count = allowed.len;
+    var host_config = std.mem.zeroes(wire.SessionHostConfigV1);
+    host_config.struct_size = @sizeOf(wire.SessionHostConfigV1);
+    host_config.provider_kind_code = wire.PROVIDER_ANTHROPIC;
+    host_config.permission_mode_code = wire.PERMISSION_FULL_ACCESS;
+    host_config.shell_policy_code = wire.SHELL_DISABLED;
+    host_config.api_key = sdk.bytesView("test-key");
+    host_config.base_url = sdk.bytesView(url);
+    host_config.workspace_root = sdk.bytesView(root);
+    host_config.workspace_home = sdk.bytesView(root);
+    host_config.allowed_tools = &allowed;
+    host_config.allowed_tool_count = allowed.len;
+    var session_config = sessionCreateConfig(&host_config, "test-model");
     var probe = UiFailureProbe{ .mode = mode, .api = api };
     var callbacks = std.mem.zeroes(wire.SessionCallbacksV1);
     callbacks.struct_size = @sizeOf(wire.SessionCallbacksV1);
@@ -3223,7 +3993,7 @@ fn expectMappedUiRequestEquals(request: *const core.protocol.ui_request.UiReques
     try std.testing.expectEqualDeep(expected, parsed.value);
 }
 
-test "L2 every UiRequestV1 mapping preserves its complete payload" {
+test "L2 AskUserQuestion mapping is complete and canonical Permission bypasses presentation wire" {
     const options = [_]core.tool_context.AskOption{
         .{ .label = "Yes", .description = "Proceed", .preview = "preview" },
         .{ .label = "No", .description = "Stop" },
@@ -3249,7 +4019,10 @@ test "L2 every UiRequestV1 mapping preserves its complete payload" {
         .options = &public_options,
     }};
     try expectMappedUiRequestEquals(&ask, .{ .ask_question = &public_questions });
-    try expectMappedUiRequestEquals(&permission, .{ .permission = .{ .tool = "Bash", .args = "{}" } });
+    try std.testing.expectError(
+        error.UnsupportedUiRequest,
+        abi.protocol_v1.encodeUiRequest(std.testing.allocator, &permission),
+    );
     try std.testing.expectError(
         error.UnsupportedUiRequest,
         abi.protocol_v1.encodeUiRequest(std.testing.allocator, &plan),

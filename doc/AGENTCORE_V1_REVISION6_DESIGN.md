@@ -874,48 +874,44 @@ MCP `2026-07-28` Streamable HTTP 对 broken response stream 要求 client 以新
 | MCP 版本协商 | 不改变 Permission 语义 | checkpoint 不固定 live protocol state | 首选 `2026-07-28`，只回退 `2025-11-25`，更早版本拒绝 |
 | full access Session | 仍受 safety/sandbox 约束 | checkpoint 不得绕过 Host 当前禁用策略 | 仍受 server selection、schema validation 与 Runtime authority ceiling 约束 |
 
-## 6. Revision 6 暂不冻结的事项
+## 6. Revision 6 public wire freeze
 
-以下问题必须继续讨论，不在本草案中假装已经决定：
+Revision 6 的 public wire 已按以下内容冻结。规范性机器声明位于 `sdk/zig/types.zig`、C header 与 Rust sys binding；三者必须由 layout/conformance gate 证明一致，不允许任何 Revision 5 alias、shim 或多 revision dispatch。
 
-### Permission
+### 6.1 Discovery、能力位与函数表
 
-- `full_access` 与现有 `bypass_permissions` 的最终 public wire name；
-- Permission request/response 的 exact DTO；
-- suggested `allow_session/deny_session` rule 的 wire 表示；
-- matched-rule identity 和 decision provenance 的 event shape；
-- Skill/fork/Subagent/MCP 的完整继承矩阵；
-- policy generation 的宽度、分配者和 exact wire 表示。
+- `abi_version = 1`、`abi_revision = 6`、64-bit `ApiV1.struct_size = 216`；发现只接受 version、revision、table size、capability mask 全部精确匹配。
+- `REQUIRED_CAPABILITIES_V1 = 0x7ffff`。Revision 6 新增 bit 12..18：`session_checkpoint`、`session_restore`、`session_describe`、`mcp_runtime_catalog`、`mcp_session_selection`、`durable_budget`、`session_permission_authority`。
+- 函数表固定顺序：`runtime_create`、`runtime_destroy`、`runtime_query_skill_catalog`、`skill_catalog_release`、`runtime_refresh_mcp`、`runtime_describe_mcp`、`session_create`、`session_restore`、`session_destroy`、`session_describe`、`session_set_model`、`session_update_skills`、`session_update_permission_rules`、`session_update_mcp`、`session_run_input`、`session_abort`、`session_compact`、`session_abort_compact`、`session_export_checkpoint`、`buffer_release`。
+- `SessionHostConfigV1` 只表达当前 Host authority；fresh create 通过 `SessionCreateConfigV1` 另带 model，restore 通过 `SessionRestoreConfigV1` 另带 bounded source。Host 没有写入 logical `session_id` 的入口。
 
-### Session
+### 6.2 Permission wire
 
-- checkpoint envelope、section 与 sink/chunk 的 exact wire 表示；
-- checkpoint full snapshot 与增量表示；
-- export/restore 的 exact function signatures；
-- checkpoint buffer 的 ownership/release；
-- restore config 与普通 SessionConfig 的关系；
-- state schema revision 与 ABI revision 的兼容矩阵；
-- RestoreReport 与 Session describe 的 exact DTO；
-- durable-state/checkpoint budget 的默认值、协商字段、compact 触发阈值与 consumer workload 基线；
-- `compaction_recommended/checkpoint_budget_required/checkpoint_budget_exhausted` 三种语义占位结果的 exact Status/StopReason、RunResult 与 event 映射；
-- Run admission/minimum reserve、reservation profile、Provider/Tool/MCP per-operation cap 来源与最大 durable delta 的计算规则；默认值必须验证不会因协议理论最大 payload 过度保守地拒绝常规长会话；
-- checkpoint generation 和 operation identity 的 exact 语义；
-- 新增 status code、capability bits 和 API table 顺序。
+- Session mode code 固定为 `default=1`、`accept_edits=2`、`auto=3`、`dont_ask=4`、`full_access=5`；不再公开 `bypass`/`bypass_permissions` token。
+- callback response 固定为 `deny_once`、`deny_session`、`allow_once`、`allow_session`。`allow_always` 不存在。
+- Permission request 是 flat JSON object，`type="permission"`，并携带 `request_id`、logical `session_id`、`run_id`、`tool_call_id`、`tool{namespace,name,binding}`、`canonical_arguments_digest`、`policy_generation`、原始 `arguments_json`、有序 `responses` 与可空 exact-arguments `candidate{rule_id,scope}`。
+- response 是 flat JSON object：`permission`、回显 `request_id`、回显 `policy_generation`；Session-scoped response 还必须回显 candidate `rule_id`，once response 禁止携带该字段。
+- `permission_provenance` 是公开 CoreEvent tag，字段固定为 decision/source/matched rule、Session/Run/tool-call/request identity、Tool identity、argument digest、policy generation、Session-rule 标记及 typed callback outcome/response。事件不包含 raw arguments 或凭证。
 
-### MCP
+### 6.3 Session/checkpoint wire
 
-- 首版 transport 范围；
-- Resources、Prompts、Elicitation 和 `subscriptions/listen` 的公开范围；
-- 完整 MRTR client operation 的公开范围；
-- `auto/modern_only/legacy_only` negotiation policy 的最终 public wire name、probe timeout 默认值和 diagnostics DTO；
-- negotiation policy 是 Host 必填还是默认 `auto`；
-- stdio disposable probe process 的 spawn/reap/abort/启动失败与 stderr policy；
-- OAuth/认证 callback 与 Runtime transport manager 的 exact seam；
-- catalog cache、stale-read、refresh 和 server unavailable 的状态机；
-- JSON Schema validator 依赖与 Provider projection profiles；
-- canonical MCP Tool identity 与 schema fingerprint 的 wire 表示；
-- MCP result/error/event 的 exact DTO；
-- 新增 status code、capability bits 和 API table 顺序。
+- checkpoint 只通过 Host-owned `CheckpointSinkV1`/`CheckpointSourceV1` 流式传输；AgentCore 不拥有路径、数据库、加密密钥或 checkpoint buffer。export 成功才提交 `checkpoint_generation`。
+- `CheckpointLimitsV1` 同时约束总字节、chunk 和各 durable section；公开硬上限为 1 GiB，总 chunk 上限为 1 MiB。超限不会截断或提交半成品。
+- pre-admission budget 不足返回 `STATUS_CHECKPOINT_BUDGET_REQUIRED=18`，不消费 `run_id`；admitted Run 中途耗尽分别用 `STOP_CHECKPOINT_BUDGET_EXHAUSTED=7` 或 `STOP_CHECKPOINT_RESOURCE_LIMIT=8` 结束，并通过 `RunResultV1.checkpoint_outcome_code` 和 `result_flags` 报告。
+- 新增 status 18..25 固定为 `checkpoint_budget_required`、`checkpoint_corrupt`、`checkpoint_unsupported`、`checkpoint_incompatible`、`checkpoint_io`、`logical_session_conflict`、`mcp_not_refreshed`、`invalid_mcp_selection`。
+- `session_describe` 输出 `agentcore.session-description/v1`；`session_restore` 输出 `agentcore.restore-report/v1`。typed source-free DTO、枚举、hash/id 校验与 16 MiB JSON 上限位于 `sdk/zig/protocol.zig`。
+
+### 6.4 MCP wire
+
+- transport code 固定为 `stdio=1`、`streamable_http=2`；negotiation code 固定为 `auto=1`、`modern_only=2`、`legacy_only=3`；era code 只允许 `2026-07-28=1` 与 `2025-11-25=2`。
+- Host-owned `McpConnectorV1` 提供 open/request/notify/close/release-response；AgentCore-owned Runtime 管理协商、连接生命周期、catalog generations 和 Session view。凭证及 transport handle 不进入 Session 或 checkpoint。
+- `auto` 只允许规范定义的 modern-first probe；stdio 可使用 disposable probe 后单次 fallback，HTTP timeout 不降级。actual connection 必须重新验证 era，probe/actual 不一致产生 typed failure，不静默重协商。
+- `runtime_describe_mcp` 输出 `agentcore.mcp-catalog/v1`，公开 server binding identity、negotiated protocol、server/catalog/schema/permission fingerprints、canonical Tool identity 与 typed issue reference。Session selector只引用 `server_binding_identity + tool_name`。
+- connector open/exchange/notify outcome code、cancellation descriptor、frame/schema/catalog limits均为固定 DTO/code；未知 outcome fail closed。
+
+### 6.5 仍明确不属于 Revision 6 wire 的内容
+
+Resources、Prompts、Elicitation、subscription、完整 MRTR client operation、AgentCore server 模式、OAuth 产品流程、exactly-once Tool replay、增量 checkpoint、完整 JSON Schema 2020-12 validator 与跨 Provider 无损 schema projection均不是 Revision 6 公共能力。后续引入必须走新的 ABI revision，不得在 Revision 6 reserved 字段或 JSON 可选字段中偷渡新的 authority。
 
 ## 7. 实施顺序
 

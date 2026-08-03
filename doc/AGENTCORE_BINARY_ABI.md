@@ -10,8 +10,9 @@ stateful AgentSession execution. It does not expose or define a host product
 model.
 
 **Status: experimental.** The premature 2026-07-17 freeze was retracted after
-consumer feedback exposed a dangling callback-identity contract. Revision 5
-now freezes one exact hard-cut wire shape after the missing Session seams were
+consumer feedback exposed a dangling callback-identity contract. Revision 6
+now defines one exact hard-cut wire shape after Permission authority,
+checkpoint/restore, durable budget, and MCP Runtime/Session seams were
 implemented and tested; this is not a general v1 stability promise.
 
 Consumers must pin an exact bundle (the manifest records the source commit)
@@ -19,23 +20,22 @@ and treat a different revision as incompatible. Layouts, numeric values,
 function-table order, and semantics may change only through another explicit
 revision cut while v1 remains experimental.
 
-The current experimental bundle is **ABI v1 revision 5**. Revision 5 is a
-hard-cut replacement for Revision 4. It adds controlled long-lived Session
-model mutation, manual Conversation compact, Skill availability updates, and
-Host-owned permission-rule import:
+The current experimental bundle is **ABI v1 revision 6**. Revision 6 is a
+hard-cut replacement for every earlier revision. In addition to the Revision
+5 Session surface, it adds Session checkpoint/restore/describe, durable
+admission budgets, Session Permission authority, and Runtime/Session MCP:
 
-- `metask_agentcore_api_v1` is 168 bytes and requires `abi_revision == 5`;
-- `SessionConfigV1`, `SkillSelectionV1`, `PermissionRuleSetV1`, and
-  `CompactResultV1` are respectively 168, 56, 88, and 88 bytes;
-- `session_set_model`, `session_update_skills`,
-  `session_update_permission_rules`, `session_compact`, and
-  `session_abort_compact` are mandatory;
-- the Revision 4 `session_refresh_skill_catalog` entry does not exist;
-- the exact required capability set is `0x0fff`;
-- `manifest.json` records revision 5, table size 168, and capability set
-  `0x0fff`.
+- `metask_agentcore_api_v1` is 216 bytes and requires `abi_revision == 6`;
+- `RuntimeConfigV1`, `SessionHostConfigV1`, `SessionCreateConfigV1`,
+  `SessionRestoreConfigV1`, `RunInputV1`, and `RunResultV1` are respectively
+  96, 168, 64, 64, 104, and 72 bytes on the required 64-bit ABI;
+- checkpoint, restore, describe, MCP refresh/describe/selection, Permission
+  rule update, compact, and abort entries are mandatory;
+- the exact required capability set is `0x7ffff`;
+- `manifest.json` records revision 6, table size 216, and that exact capability
+  set.
 
-Revision 5 provides no Revision 4 compatibility, shim, dual dispatch, or old
+Revision 6 provides no earlier-revision compatibility, shim, dual dispatch, or old
 table layout. Consumers update the header, SDK, manifest, and library
 atomically, validate the stable
 `struct_size`/`abi_version` prefix before reading later fields, then require
@@ -259,7 +259,7 @@ Events describe observations, not commands. A Host may render, aggregate,
 persist, or ignore them; consuming an event never drives the core execution
 loop.
 
-`on_event` is mandatory in Revision 5. To reconstruct final visible assistant
+`on_event` is mandatory in Revision 6. To reconstruct final visible assistant
 output, a Host accumulates only closed segments: `text_chunk` appends to the
 current segment and `stream_done` closes it. `tool_start` and `tool_result` are
 semantic boundaries that discard any unclosed segment and all previously
@@ -346,15 +346,36 @@ destroy remains valid. `METASK_AGENTCORE_STATUS_OK`, including a terminal
 `METASK_AGENTCORE_STOP_ABORTED`, returns the Session to idle. A too-late abort
 also leaves the already-idle Session reusable.
 
+Durable pre-admission uses exact canonical records that are available without
+effects: a Text prompt or a typed Skill invocation record. Skill body
+rendering can read files or execute admitted shell injection, so it remains
+after Run admission. Its exact durable delta is reconciled atomically before
+Conversation mutation; input-cap excess becomes a resource-limit terminal and
+insufficient durable capacity becomes budget-exhausted. AgentCore never moves
+materialization or shell execution before admission merely to estimate bytes,
+and it does not reserve the entire configured input cap for every Skill.
+
 Given a valid Session handle, the poisoned-state check takes precedence over
 remaining `session_run_input` and `session_abort` argument validation. ABI v1 does
 not define status precedence when multiple other input or admission errors are
 present in the same call.
 
-ABI v1 provides no in-place recovery, Conversation export/import, or history
-hydration for a poisoned Session. The Host must destroy it and create a new
-Session; previously committed Conversation state cannot be restored through
-ABI v1.
+ABI v1 provides no in-place recovery or mutation of a poisoned Session. The
+Host must destroy that physical handle. Revision 6 checkpoint/restore creates
+a new handle from a previously exported committed checkpoint; it does not
+reconstruct state that was never successfully exported or resume an active
+Run.
+
+A checkpoint is resumable model state, not a raw transcript archive. Before
+compact it contains the complete Conversation. After compact it contains the
+summary plus active messages and omits the hidden raw prefix already replaced
+by that summary. Restore materializes the summary as leading assistant context,
+so continued Runs and later compaction preserve the same model-visible state.
+The checkpoint `max_messages` limit counts that materialized summary as one
+message in addition to the encoded active-message count.
+Hosts that require verbatim historical audit must persist the event/transcript
+stream separately. This projection is what allows compact to reduce durable
+usage for a near-hard Session.
 
 On a usable Session, `session_abort` requires a non-zero `run_id`; zero returns
 `METASK_AGENTCORE_STATUS_INVALID_ARGUMENT`. While a Run is active, its exact `run_id`
@@ -367,7 +388,7 @@ requests cooperative abort and any other value returns
 ### Manual compact
 
 `session_compact` runs the canonical default compact policy as a best-effort
-Conversation maintenance operation. Revision 5 has no Host-supplied target
+Conversation maintenance operation. Revision 6 has no Host-supplied target
 token budget and does not guarantee that the result fits the context window of
 the current or a future model. `session_set_model` and `session_compact` are
 independent primitives, not a compound model-migration transaction.
@@ -376,7 +397,7 @@ On `METASK_AGENTCORE_STATUS_OK`, `CompactResultV1.before_context_tokens` and
 `after_context_tokens` are context-size estimates for UI and policy decisions;
 they are not provider billing values. The four provider usage-delta fields are
 semantically separate. `METASK_AGENTCORE_COMPACT_DEGRADED` exposes no structured
-reason in Revision 5, and a Host must not infer one by parsing diagnostics.
+reason in Revision 6, and a Host must not infer one by parsing diagnostics.
 
 Assistant text and other execution output are delivered through `on_event`.
 `RunResultV1` is a terminal summary containing stop reason, turns, and tool
@@ -462,6 +483,16 @@ Materialization begins only after admission, is private to that activation,
 and is removed before terminal return. A Skill can only narrow the Session's
 tool, shell, and permission authority.
 
+Text input and typed Skill input share one root-record admission invariant.
+Text reserves its exact prompt record; Skill reserves its exact canonical
+invocation record before admission. Skill body rendering may read referenced
+files or run declared shell injection, so it remains inside the admitted Run.
+Before Conversation mutation, AgentCore atomically replaces the invocation-only
+estimate with the exact generated root records. Input-cap failure becomes a
+bounded resource-limit outcome and durable-budget shortage becomes a
+budget-exhausted outcome. AgentCore neither reserves the entire input cap as a
+fictional Skill payload nor moves effectful materialization before admission.
+
 The Session configuration owns the provider model binding. Skill metadata
 cannot replace it: inline Skills ignore `model`, fork Skills with an empty
 model or `inherit` use the Session model, and any other fork model is
@@ -507,7 +538,7 @@ synchronous within the same Host Run and projects its public text and usage
 through the ordinary event stream. The provider tool name `Skill` is reserved:
 Runtime creation rejects a Host tool with that name.
 
-Fork children cannot suspend for Host UI interaction in Revision 5. Their UI
+Fork children cannot suspend for Host UI interaction in Revision 6. Their UI
 requester is unavailable, so a child question or permission request fails
 closed as an ordinary fork/tool failure attributed to the outer Run. Inline
 execution may use the outer Run's synchronous UI callback.
@@ -516,6 +547,74 @@ AgentCore exposes no slash parser, Command registry, route field, or
 product-specific command. A consumer resolves its own Commands first, maps a
 catalog hit to typed Skill input, and treats an unresolved slash as its own
 product decision.
+
+### MCP Runtime catalog and Session view
+
+Revision 6 accepts only MCP `2026-07-28` as the primary era and
+`2025-11-25` as the single compatibility era. Runtime owns negotiation,
+transport, canonical catalogs, cache expiry, and immutable generations;
+Session owns only a filtered selection, while each Run pins an admitted Tool
+environment. Credentials, live connections, and request state never enter a
+Session checkpoint.
+
+`runtime_describe_mcp` returns `agentcore.mcp-catalog/v1`. Every server entry
+contains `server_binding_identity`, namespace, negotiated protocol,
+fingerprint, `cache_scope`, `fresh`, `ttl_remaining_ms`, and its Tool range.
+Modern TTL is capped by Runtime policy; the legacy adapter receives a
+conservative default TTL. A fresh Session selection fails when its server is
+expired, restore degrades and invalidates that authority, and a newly admitted
+Run never receives stale MCP Tools. An already admitted Run keeps its immutable
+environment until terminal completion.
+
+One server's transport, protocol, or catalog resource-limit failure produces a
+server-scoped issue and does not suppress healthy servers in the same refresh.
+Only Runtime-local failures such as allocation exhaustion abort the refresh.
+Modern `tools/list` cache metadata is required; `server/discover` may omit both
+cache fields. Each server TTL starts when that server's discovery completes,
+not when the multi-server refresh began.
+
+Canonical MCP schemas are retained losslessly, but Revision 6 advertises only
+a bounded local validation profile. References, header projection,
+`uniqueItems: true`, numeric constraints, and numeric or structural
+`enum`/`const` are unavailable rather than approximately validated. Container,
+node, and work-unit budgets fail closed. This is not a claim of complete JSON
+Schema 2020-12 support.
+`format` is admitted as an annotation, exact JSON number lexemes survive
+validation and `tools/call` encoding, and `outputSchema` is applied only to a
+successful result. An `isError=true` Tool business error may omit
+`structuredContent` without losing its typed content.
+
+### Permission authority and provenance
+
+Permission response tokens are `deny_once`, `deny_session`, `allow_once`, and
+`allow_session`; Session grants never mean cross-Session persistence. Every
+final decision carries its canonical source, matching rule when present,
+logical Session/Run/tool identity, canonical argument digest, policy
+generation, and typed callback outcome in a `permission_provenance` event.
+The exact source vocabulary is `core_safety`, `active_skill`, `explicit_deny`,
+`session_deny`, `explicit_ask`, `explicit_allow`, `session_allow`,
+`builtin_classification`, `mode_fallback`, and `callback`. Explicit settings
+deny, shared Core safety, active Skill narrowing, and existing shared Session denial are authority
+ceilings: the AgentCore Session seam observes them for provenance but cannot
+replace their result.
+Host callback response and final authorization are separate facts. Audit
+storage is prepared before a Session grant can be added, then the same receipt
+is committed only when the authoritative `policy_decision` event supplies the
+actual execution result. If durable grant reservation fails, provenance keeps
+the Host response but records the final deny; an audit allow/public deny split
+is forbidden. Receipt commit performs no allocation.
+Publication uses the same Run EventSink as all other public events. If the Host
+returns an event-fatal result, the Run terminates with callback failure and the
+Session is poisoned; AgentCore must not silently convert that failure into a
+permission deny.
+
+AgentCore sets `no_interactive_prompt` as an absolute input-ownership boundary.
+After an unavailable, cancelled, or failed UI callback it never reads a process
+answer queue or stdin. Public provenance preserves the typed callback outcome.
+The current shared bool prompt seam still renders non-answered permission
+outcomes to the model as the same ordinary deny Tool result; consumers that
+need the distinction must use `permission_provenance` until a shared typed
+prompt-outcome contract replaces that seam.
 
 ABI v1 has three ownership classes:
 
@@ -618,7 +717,15 @@ allocations or unbounded work:
 | one Skill file / files per snapshot | 4 MiB / 16384 |
 | catalog traversal entries / depth | 65536 / 64 |
 | active materializations per Runtime | 256 MiB |
+| MCP Runtime servers / canonical tools | 64 / 1024 |
+| MCP local-schema container entries / validation work units | 256 / 65536 |
+| MCP legacy default TTL / maximum accepted TTL | 30 s / 300 s |
 | one Run | 1000 turns |
+
+MCP schema and invocation JSON cross the depth/node/container/work admission
+gate before a dynamic JSON tree is allocated. Invocation number lexemes are
+retained exactly; JSON Schema `integer` means a mathematical integer (`1.0`
+and `1e3` included), not merely a value that fit Zig's i64 parser.
 
 Configuration and pre-admission Run limits return
 `METASK_AGENTCORE_STATUS_RESOURCE_LIMIT`. An oversized UI response is released exactly once,
@@ -666,29 +773,28 @@ reliable automatic classification.
 ### ABI evolution
 
 All v1 POD descriptors and the API table require their exact documented
-`struct_size`; every reserved field must be zero. Revision 5 freezes one exact
+`struct_size`; every reserved field must be zero. Revision 6 freezes one exact
 experimental cut. A later breaking v1 bundle must increment `abi_revision`,
 and consumers accept only the exact revision they were built against.
 Reserved storage is not permission to infer compatibility. After v1 is
 genuinely stabilized, later layout, function-table, or control-message
 extensions require `metask_agentcore_get_api(2)` and v2 types.
-In particular, assigning a meaning or non-zero value to a Revision 5 reserved
+In particular, assigning a meaning or non-zero value to a Revision 6 reserved
 field is a new wire contract and requires another explicit revision cut.
 
-Revision 5's published POD offsets and sizes require a 64-bit pointer ABI.
+Revision 6's published POD offsets and sizes require a 64-bit pointer ABI.
 The header rejects 32-bit consumers at compile time; a future 32-bit contract
 would need separately specified layouts and consumer gates.
 
 `capabilities` reports the API surface implemented by the returned library
-table. Revision 5 consumers require exact equality with
+table. Revision 6 consumers require exact equality with
 `METASK_AGENTCORE_REQUIRED_CAPABILITIES_V1`; it is not an extensible superset
 check. It is not per-Runtime or per-Session negotiation; concrete Runtime and
 Session configuration still determines which tools and callbacks are active.
 
-ABI v1 deliberately does not add a slash/Command ABI, session
-persistence/restore, asynchronous UI
-continuations, ABI-level asynchronous operations, resume/checkpoint, strict Workspace
-security, Workbench `Output`/`FileChange`/plan-progress models, or a
+ABI v1 deliberately does not add a slash/Command ABI, in-place active-Run
+resume, asynchronous UI continuations, ABI-level asynchronous operations,
+strict Workspace security, Workbench `Output`/`FileChange`/plan-progress models, or a
 multi-platform universal bundle. Those are separate contracts, not hidden
 behavior in the library facade. This does not remove Bash's existing
 tool-managed background jobs, which remain reachable synchronously through

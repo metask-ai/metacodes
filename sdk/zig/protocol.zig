@@ -7,6 +7,104 @@
 
 const std = @import("std");
 
+pub const PermissionChoice = enum {
+    deny_once,
+    deny_session,
+    allow_once,
+    allow_session,
+};
+
+pub const PermissionDecision = enum {
+    deny,
+    ask,
+    allow,
+};
+
+pub const PermissionDecisionSource = enum {
+    core_safety,
+    active_skill,
+    explicit_deny,
+    session_deny,
+    explicit_ask,
+    explicit_allow,
+    session_allow,
+    builtin_classification,
+    mode_fallback,
+    callback,
+};
+
+pub const PermissionCallbackOutcome = enum {
+    answered,
+    user_cancelled,
+    unavailable,
+    contract_failure,
+};
+
+pub const PermissionToolNamespace = enum {
+    builtin,
+    host,
+    mcp,
+};
+
+pub const PermissionTool = struct {
+    namespace: PermissionToolNamespace,
+    name: []const u8,
+    binding: []const u8,
+};
+
+pub const PermissionCandidateScope = enum {
+    exact_arguments,
+};
+
+pub const PermissionCandidate = struct {
+    rule_id: []const u8,
+    scope: PermissionCandidateScope,
+};
+
+/// Exact Revision 6 Permission callback request. Unlike AskUserQuestion this
+/// is a flat typed object, identified by `type == "permission"`.
+pub const PermissionRequest = struct {
+    type: []const u8,
+    request_id: []const u8,
+    session_id: []const u8,
+    run_id: u64,
+    tool_call_id: []const u8,
+    tool: PermissionTool,
+    canonical_arguments_digest: []const u8,
+    policy_generation: u64,
+    arguments_json: []const u8,
+    responses: []const PermissionChoice,
+    candidate: ?PermissionCandidate,
+};
+
+/// The response echoes the request and policy generation. Session-scoped
+/// choices additionally echo the exact candidate rule id.
+pub const PermissionResponse = struct {
+    permission: PermissionChoice,
+    request_id: []const u8,
+    policy_generation: u64,
+    rule_id: ?[]const u8 = null,
+};
+
+/// Normalized observation emitted for every canonical Permission decision or
+/// callback outcome. It contains identities and digests, never credentials or
+/// raw Tool arguments.
+pub const PermissionProvenance = struct {
+    decision: PermissionDecision,
+    source: PermissionDecisionSource,
+    matched_rule_id: ?[]const u8,
+    session_id: []const u8,
+    run_id: u64,
+    tool_call_id: []const u8,
+    request_id: ?[]const u8,
+    tool: PermissionTool,
+    canonical_arguments_digest: []const u8,
+    policy_generation: u64,
+    used_session_rule: bool,
+    callback_outcome: ?PermissionCallbackOutcome,
+    response: ?PermissionChoice,
+};
+
 pub const UsageDelta = struct {
     input_tokens: u64 = 0,
     output_tokens: u64 = 0,
@@ -59,6 +157,7 @@ pub const CoreEvent = union(enum) {
         max: u32,
         delay_ms: u64,
     },
+    permission_provenance: PermissionProvenance,
     stream_done,
 };
 
@@ -87,13 +186,6 @@ pub const AskQuestion = struct {
     options: []const AskOption,
 };
 
-pub const PermissionChoice = enum {
-    allow_once,
-    allow_session,
-    deny_once,
-    deny_session,
-};
-
 pub const MAX_ANSWER_VALUES_PER_QUESTION_V1: usize = 64;
 
 pub const Answer = struct {
@@ -102,12 +194,12 @@ pub const Answer = struct {
 
 pub const UiRequest = union(enum) {
     ask_question: []const AskQuestion,
-    permission: struct { tool: []const u8, args: []const u8 },
+    permission: PermissionRequest,
 };
 
 pub const UiResponse = union(enum) {
     answers: []const Answer,
-    permission: PermissionChoice,
+    permission: PermissionResponse,
 };
 
 pub const SkillCatalogHealth = enum {
@@ -160,15 +252,190 @@ pub const SkillCatalog = struct {
     issues: []const SkillCatalogIssue,
 };
 
+pub const McpCatalogServer = struct {
+    server_binding_identity: []const u8,
+    namespace: []const u8,
+    negotiated_protocol: []const u8,
+    server_fingerprint: []const u8,
+    cache_scope: []const u8,
+    fresh: bool,
+    ttl_remaining_ms: u64,
+    tool_offset: u32,
+    tool_count: u32,
+};
+
+pub const McpCatalogTool = struct {
+    server_binding_identity: []const u8,
+    canonical_name: []const u8,
+    schema_fingerprint: []const u8,
+    permission_binding: []const u8,
+};
+
+pub const McpCatalogIssue = struct {
+    issue_id: []const u8,
+    server_binding_identity: []const u8,
+    tool_name: ?[]const u8,
+    kind: []const u8,
+    detail: []const u8,
+};
+
+pub const McpCatalog = struct {
+    schema: []const u8,
+    catalog_generation: u64,
+    catalog_fingerprint: []const u8,
+    servers: []const McpCatalogServer,
+    tools: []const McpCatalogTool,
+    issues: []const McpCatalogIssue,
+};
+
+pub const AuthoritySubsystem = enum {
+    skill,
+    permission,
+    mcp,
+};
+
+pub const AuthorityIssueReason = enum {
+    unavailable,
+    identity_changed,
+    schema_changed,
+    policy_changed,
+    authority_narrowed,
+};
+
+pub const AuthorityIssue = struct {
+    issue_id: []const u8,
+    subsystem: AuthoritySubsystem,
+    reason: AuthorityIssueReason,
+    skill_id: ?[]const u8,
+    permission_rule_id: ?[]const u8,
+    server_binding_identity: ?[]const u8,
+    authority_binding: ?[]const u8,
+    canonical_name: ?[]const u8,
+};
+
+pub const SessionMcpTool = struct {
+    model_name: []const u8,
+    namespace: []const u8,
+    canonical_name: []const u8,
+    server_binding_identity: []const u8,
+    schema_fingerprint: []const u8,
+    permission_binding: []const u8,
+    negotiated_protocol: []const u8,
+};
+
+pub const LogicalSessionOrigin = enum {
+    fresh,
+    restored,
+};
+
+pub const SessionLifecycle = enum {
+    idle,
+    busy,
+    poisoned,
+};
+
+pub const RestoreHealth = enum {
+    complete,
+    degraded,
+};
+
+pub const DurableBudgetOutcome = enum {
+    none,
+    budget_required,
+    budget_exhausted,
+    resource_limit,
+};
+
+pub const SessionDescription = struct {
+    schema: []const u8,
+    session_id: []const u8,
+    origin: LogicalSessionOrigin,
+    lifecycle: SessionLifecycle,
+    registered: bool,
+    last_run_id: u64,
+    last_compact_id: u64,
+    checkpoint_generation: u64,
+    policy_generation: u64,
+    catalog_generation: u64,
+    model: []const u8,
+    conversation: struct {
+        message_count: u64,
+        compact_boundary: u64,
+    },
+    skill: struct {
+        catalog_revision: ?[]const u8,
+    },
+    mcp: struct {
+        selection_fingerprint: []const u8,
+        tools: []const SessionMcpTool,
+    },
+    budget: struct {
+        hard_bytes: u64,
+        soft_bytes: u64,
+        durable_usage_bytes: u64,
+        available_bytes: u64,
+        compaction_recommended: bool,
+        last_outcome: DurableBudgetOutcome,
+        required_bytes: u64,
+    },
+    restore: struct {
+        health: RestoreHealth,
+        invalidated_skill_authority: u32,
+        invalidated_permission_rules: u32,
+        invalidated_mcp_bindings: u32,
+        issues: []const AuthorityIssue,
+    },
+};
+
+pub const SkillRestoreDisposition = enum {
+    not_bound,
+    restored,
+    narrowed,
+    unavailable,
+    changed,
+};
+
+pub const RestoreReport = struct {
+    schema: []const u8,
+    health: RestoreHealth,
+    session_id: []const u8,
+    checkpoint_generation: u64,
+    policy_generation: u64,
+    catalog_generation: u64,
+    skill: struct {
+        disposition: SkillRestoreDisposition,
+        checkpoint_enabled: u32,
+        restored_enabled: u32,
+        invalidated: u32,
+    },
+    permission: struct {
+        restored_rules: u32,
+        invalidated_rules: u32,
+    },
+    mcp: struct {
+        restored_bindings: u32,
+        invalidated_bindings: u32,
+    },
+    issues: []const AuthorityIssue,
+};
+
 pub const ParsedCoreEvent = std.json.Parsed(DecodedCoreEvent);
 pub const ParsedUiRequest = std.json.Parsed(UiRequest);
 pub const ParsedUiResponse = std.json.Parsed(UiResponse);
 pub const ParsedSkillCatalog = std.json.Parsed(SkillCatalog);
+pub const ParsedMcpCatalog = std.json.Parsed(McpCatalog);
+pub const ParsedSessionDescription = std.json.Parsed(SessionDescription);
+pub const ParsedRestoreReport = std.json.Parsed(RestoreReport);
 
 pub const MAX_SKILL_CATALOG_DESCRIPTOR_BYTES_V1: usize = 4 * 1024 * 1024;
 pub const MAX_SKILL_CATALOG_SKILLS_V1: usize = 1024;
 pub const MAX_SKILL_ARGUMENT_VALUES_V1: usize = 64;
 pub const MAX_SKILL_ARGUMENT_JSON_BYTES_V1: usize = 1024 * 1024;
+pub const MAX_DESCRIPTION_JSON_BYTES_V1: usize = 16 * 1024 * 1024;
+pub const MAX_MCP_SERVERS_V1: usize = 64;
+pub const MAX_MCP_TOOLS_V1: usize = 1024;
+pub const MAX_AUTHORITY_ISSUES_V1: usize = 4096;
+pub const MAX_PERMISSION_ARGUMENT_JSON_BYTES_V1: usize = 1024 * 1024;
 
 pub const DecodeError = error{
     OutOfMemory,
@@ -219,6 +486,10 @@ pub fn decodeCoreEvent(allocator: std.mem.Allocator, encoded: []const u8) Decode
             .ignore_unknown_fields = true,
             .duplicate_field_behavior = .@"error",
         }) catch |err| return normalizeDecodeError(err);
+        switch (known) {
+            .permission_provenance => |value| try validatePermissionProvenance(value),
+            else => {},
+        }
         return .{ .arena = arena, .value = .{ .known = known } };
     }
 
@@ -242,13 +513,71 @@ pub fn decodeCoreEvent(allocator: std.mem.Allocator, encoded: []const u8) Decode
 }
 
 pub fn decodeUiRequest(allocator: std.mem.Allocator, encoded: []const u8) DecodeError!ParsedUiRequest {
-    return decode(UiRequest, allocator, encoded);
+    const arena = allocator.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
+    errdefer allocator.destroy(arena);
+    arena.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const root = std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    }) catch |err| return normalizeDecodeError(err);
+    if (root != .object) return error.InvalidPayload;
+    if (root.object.get("type")) |kind| {
+        if (kind != .string or !std.mem.eql(u8, kind.string, "permission"))
+            return error.UnknownTag;
+        const request = std.json.parseFromSliceLeaky(PermissionRequest, a, encoded, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+            .duplicate_field_behavior = .@"error",
+        }) catch |err| return normalizeDecodeError(err);
+        try validatePermissionRequest(a, request);
+        return .{ .arena = arena, .value = .{ .permission = request } };
+    }
+    if (root.object.get("ask_question") != null) {
+        if (root.object.count() != 1) return error.InvalidPayload;
+        const request = std.json.parseFromSliceLeaky(UiRequest, a, encoded, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+            .duplicate_field_behavior = .@"error",
+        }) catch |err| return normalizeDecodeError(err);
+        return .{ .arena = arena, .value = request };
+    }
+    return error.UnknownTag;
 }
 
 /// Primarily used by the binary facade to validate Host-owned response bytes
 /// against the same source-free schema shipped to consumers.
 pub fn decodeUiResponse(allocator: std.mem.Allocator, encoded: []const u8) DecodeError!ParsedUiResponse {
-    return decode(UiResponse, allocator, encoded);
+    const arena = allocator.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
+    errdefer allocator.destroy(arena);
+    arena.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const root = std.json.parseFromSliceLeaky(std.json.Value, a, encoded, .{
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    }) catch |err| return normalizeDecodeError(err);
+    if (root != .object) return error.InvalidPayload;
+    if (root.object.get("answers") != null) {
+        if (root.object.count() != 1) return error.InvalidPayload;
+        const response = std.json.parseFromSliceLeaky(UiResponse, a, encoded, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+            .duplicate_field_behavior = .@"error",
+        }) catch |err| return normalizeDecodeError(err);
+        return .{ .arena = arena, .value = response };
+    }
+    if (root.object.get("permission") != null) {
+        const response = std.json.parseFromSliceLeaky(PermissionResponse, a, encoded, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+            .duplicate_field_behavior = .@"error",
+        }) catch |err| return normalizeDecodeError(err);
+        try validatePermissionResponse(response);
+        return .{ .arena = arena, .value = .{ .permission = response } };
+    }
+    return error.UnknownTag;
 }
 
 /// Decodes and owns a `metask.skill-catalog/v1` descriptor. The returned value
@@ -266,8 +595,41 @@ pub fn decodeSkillCatalog(
     return parsed;
 }
 
+pub fn decodeMcpCatalog(
+    allocator: std.mem.Allocator,
+    encoded: []const u8,
+) SkillCatalogDecodeError!ParsedMcpCatalog {
+    if (encoded.len > MAX_DESCRIPTION_JSON_BYTES_V1) return error.ResourceLimit;
+    var parsed = try decode(McpCatalog, allocator, encoded);
+    errdefer parsed.deinit();
+    try validateMcpCatalog(parsed.value);
+    return parsed;
+}
+
+pub fn decodeSessionDescription(
+    allocator: std.mem.Allocator,
+    encoded: []const u8,
+) SkillCatalogDecodeError!ParsedSessionDescription {
+    if (encoded.len > MAX_DESCRIPTION_JSON_BYTES_V1) return error.ResourceLimit;
+    var parsed = try decode(SessionDescription, allocator, encoded);
+    errdefer parsed.deinit();
+    try validateSessionDescription(parsed.value);
+    return parsed;
+}
+
+pub fn decodeRestoreReport(
+    allocator: std.mem.Allocator,
+    encoded: []const u8,
+) SkillCatalogDecodeError!ParsedRestoreReport {
+    if (encoded.len > MAX_DESCRIPTION_JSON_BYTES_V1) return error.ResourceLimit;
+    var parsed = try decode(RestoreReport, allocator, encoded);
+    errdefer parsed.deinit();
+    try validateRestoreReport(parsed.value);
+    return parsed;
+}
+
 pub fn encodeUiResponse(allocator: std.mem.Allocator, request: UiRequest, response: UiResponse) EncodeError![]u8 {
-    switch (request) {
+    return switch (request) {
         .ask_question => |questions| switch (response) {
             .answers => |answers| {
                 if (answers.len != questions.len) return error.InvalidResponse;
@@ -280,12 +642,19 @@ pub fn encodeUiResponse(allocator: std.mem.Allocator, request: UiRequest, respon
                         return error.InvalidResponse;
                     }
                 }
+                const dto = struct { answers: []const Answer }{ .answers = answers };
+                return std.json.Stringify.valueAlloc(allocator, dto, .{}) catch error.OutOfMemory;
             },
-            else => return error.MismatchedResponse,
+            else => error.MismatchedResponse,
         },
-        .permission => if (response != .permission) return error.MismatchedResponse,
-    }
-    return std.json.Stringify.valueAlloc(allocator, response, .{}) catch error.OutOfMemory;
+        .permission => |permission_request| switch (response) {
+            .permission => |permission_response| {
+                try validatePermissionResponseForRequest(permission_request, permission_response);
+                return std.json.Stringify.valueAlloc(allocator, permission_response, .{}) catch error.OutOfMemory;
+            },
+            else => error.MismatchedResponse,
+        },
+    };
 }
 
 /// Encodes the only valid non-empty Skill argument wire shape. The returned
@@ -378,13 +747,273 @@ fn validateSkillCatalog(catalog: SkillCatalog) SkillCatalogDecodeError!void {
     }
 }
 
-fn lowerHex64(value: []const u8) bool {
-    if (value.len != 64) return false;
+fn validatePermissionRequest(
+    allocator: std.mem.Allocator,
+    request: PermissionRequest,
+) DecodeError!void {
+    if (!std.mem.eql(u8, request.type, "permission") or
+        !lowerHex64(request.request_id) or
+        !validSessionId(request.session_id) or
+        request.run_id == 0 or
+        request.policy_generation == 0 or
+        !validBoundedText(request.tool_call_id, 4096) or
+        !validPermissionTool(request.tool) or
+        !lowerHex64(request.canonical_arguments_digest) or
+        request.arguments_json.len == 0 or
+        request.arguments_json.len > MAX_PERMISSION_ARGUMENT_JSON_BYTES_V1 or
+        !std.unicode.utf8ValidateSlice(request.arguments_json))
+        return error.InvalidPayload;
+    const arguments = std.json.parseFromSliceLeaky(std.json.Value, allocator, request.arguments_json, .{
+        .duplicate_field_behavior = .@"error",
+    }) catch |err| return normalizeDecodeError(err);
+    if (arguments != .object) return error.InvalidPayload;
+
+    if (request.candidate) |candidate| {
+        if (!lowerHex64(candidate.rule_id) or candidate.scope != .exact_arguments)
+            return error.InvalidPayload;
+        if (request.responses.len != 3 and request.responses.len != 4)
+            return error.InvalidPayload;
+        if (request.responses[0] != .deny_once or
+            request.responses[1] != .deny_session or
+            request.responses[2] != .allow_once or
+            (request.responses.len == 4 and request.responses[3] != .allow_session))
+            return error.InvalidPayload;
+    } else {
+        if (request.responses.len != 2 or
+            request.responses[0] != .deny_once or
+            request.responses[1] != .allow_once)
+            return error.InvalidPayload;
+    }
+}
+
+fn validatePermissionResponse(response: PermissionResponse) DecodeError!void {
+    if (!lowerHex64(response.request_id) or response.policy_generation == 0)
+        return error.InvalidPayload;
+    switch (response.permission) {
+        .deny_once, .allow_once => if (response.rule_id != null)
+            return error.InvalidPayload,
+        .deny_session, .allow_session => if (response.rule_id == null or
+            !lowerHex64(response.rule_id.?)) return error.InvalidPayload,
+    }
+}
+
+fn validatePermissionResponseForRequest(
+    request: PermissionRequest,
+    response: PermissionResponse,
+) EncodeError!void {
+    if (!std.mem.eql(u8, request.request_id, response.request_id) or
+        request.policy_generation != response.policy_generation or
+        !containsPermissionChoice(request.responses, response.permission))
+        return error.InvalidResponse;
+    switch (response.permission) {
+        .deny_once, .allow_once => if (response.rule_id != null)
+            return error.InvalidResponse,
+        .deny_session, .allow_session => {
+            const candidate = request.candidate orelse return error.InvalidResponse;
+            const rule_id = response.rule_id orelse return error.InvalidResponse;
+            if (!std.mem.eql(u8, candidate.rule_id, rule_id))
+                return error.InvalidResponse;
+        },
+    }
+}
+
+fn validatePermissionProvenance(value: PermissionProvenance) DecodeError!void {
+    if (!validSessionId(value.session_id) or value.run_id == 0 or
+        value.policy_generation == 0 or
+        !validBoundedText(value.tool_call_id, 4096) or
+        !validPermissionTool(value.tool) or
+        !lowerHex64(value.canonical_arguments_digest))
+        return error.InvalidPayload;
+    if (value.matched_rule_id) |rule_id| if (!lowerHex64(rule_id))
+        return error.InvalidPayload;
+    if (value.request_id) |request_id| if (!lowerHex64(request_id))
+        return error.InvalidPayload;
+    if (value.source == .callback) {
+        const outcome = value.callback_outcome orelse return error.InvalidPayload;
+        if (value.request_id == null) return error.InvalidPayload;
+        if (outcome == .answered) {
+            const response = value.response orelse return error.InvalidPayload;
+            if ((value.decision == .allow) !=
+                (response == .allow_once or response == .allow_session))
+                return error.InvalidPayload;
+        } else if (value.response != null) {
+            return error.InvalidPayload;
+        }
+    } else if (value.request_id != null or value.callback_outcome != null or value.response != null) {
+        return error.InvalidPayload;
+    }
+}
+
+fn validateMcpCatalog(catalog: McpCatalog) SkillCatalogDecodeError!void {
+    if (!std.mem.eql(u8, catalog.schema, "agentcore.mcp-catalog/v1") or
+        !lowerHex64(catalog.catalog_fingerprint))
+        return error.InvalidPayload;
+    if (catalog.servers.len > MAX_MCP_SERVERS_V1 or
+        catalog.tools.len > MAX_MCP_TOOLS_V1 or
+        catalog.issues.len > MAX_AUTHORITY_ISSUES_V1)
+        return error.ResourceLimit;
+    for (catalog.servers) |server| {
+        if (!lowerHex64(server.server_binding_identity) or
+            !lowerHex64(server.server_fingerprint) or
+            !validBoundedText(server.namespace, 128) or
+            !validMcpProtocol(server.negotiated_protocol) or
+            (!std.mem.eql(u8, server.cache_scope, "private") and
+                !std.mem.eql(u8, server.cache_scope, "public")))
+            return error.InvalidPayload;
+        const end = std.math.add(u32, server.tool_offset, server.tool_count) catch
+            return error.InvalidPayload;
+        if (end > catalog.tools.len) return error.InvalidPayload;
+        for (catalog.tools[server.tool_offset..end]) |tool| {
+            if (!std.mem.eql(u8, tool.server_binding_identity, server.server_binding_identity))
+                return error.InvalidPayload;
+        }
+    }
+    for (catalog.tools) |tool| try validateMcpIdentity(
+        tool.server_binding_identity,
+        tool.canonical_name,
+        tool.schema_fingerprint,
+        tool.permission_binding,
+        null,
+    );
+    for (catalog.issues) |issue| {
+        if (!lowerHex64(issue.issue_id) or
+            !lowerHex64(issue.server_binding_identity) or
+            !validBoundedText(issue.kind, 128) or
+            !std.unicode.utf8ValidateSlice(issue.detail))
+            return error.InvalidPayload;
+        if (issue.tool_name) |name| if (!validBoundedText(name, 128))
+            return error.InvalidPayload;
+    }
+}
+
+fn validateSessionDescription(description: SessionDescription) SkillCatalogDecodeError!void {
+    if (!std.mem.eql(u8, description.schema, "agentcore.session-description/v1") or
+        !validSessionId(description.session_id) or
+        description.policy_generation == 0 or
+        !validBoundedText(description.model, 4096) or
+        description.conversation.compact_boundary > description.conversation.message_count or
+        !lowerHex64(description.mcp.selection_fingerprint))
+        return error.InvalidPayload;
+    if (description.skill.catalog_revision) |revision| if (!lowerHex64(revision))
+        return error.InvalidPayload;
+    if (description.mcp.tools.len > MAX_MCP_TOOLS_V1 or
+        description.restore.issues.len > MAX_AUTHORITY_ISSUES_V1)
+        return error.ResourceLimit;
+    for (description.mcp.tools) |tool| try validateMcpIdentity(
+        tool.server_binding_identity,
+        tool.canonical_name,
+        tool.schema_fingerprint,
+        tool.permission_binding,
+        tool.negotiated_protocol,
+    );
+    if (description.budget.soft_bytes > description.budget.hard_bytes or
+        description.budget.durable_usage_bytes > description.budget.hard_bytes or
+        description.budget.available_bytes !=
+            description.budget.hard_bytes - description.budget.durable_usage_bytes)
+        return error.InvalidPayload;
+    try validateRestoreSummary(
+        description.restore.health,
+        description.restore.invalidated_skill_authority,
+        description.restore.invalidated_permission_rules,
+        description.restore.invalidated_mcp_bindings,
+        description.restore.issues,
+    );
+}
+
+fn validateRestoreReport(report: RestoreReport) SkillCatalogDecodeError!void {
+    if (!std.mem.eql(u8, report.schema, "agentcore.restore-report/v1") or
+        !validSessionId(report.session_id) or
+        report.checkpoint_generation == 0 or
+        report.policy_generation == 0)
+        return error.InvalidPayload;
+    if (report.issues.len > MAX_AUTHORITY_ISSUES_V1) return error.ResourceLimit;
+    try validateRestoreSummary(
+        report.health,
+        report.skill.invalidated,
+        report.permission.invalidated_rules,
+        report.mcp.invalidated_bindings,
+        report.issues,
+    );
+}
+
+fn validateRestoreSummary(
+    health: RestoreHealth,
+    invalidated_skill: u32,
+    invalidated_permission: u32,
+    invalidated_mcp: u32,
+    issues: []const AuthorityIssue,
+) SkillCatalogDecodeError!void {
+    const invalidated = invalidated_skill != 0 or invalidated_permission != 0 or invalidated_mcp != 0;
+    if ((health == .complete and (invalidated or issues.len != 0)) or
+        (health == .degraded and !invalidated and issues.len == 0))
+        return error.InvalidPayload;
+    for (issues) |issue| try validateAuthorityIssue(issue);
+}
+
+fn validateAuthorityIssue(issue: AuthorityIssue) SkillCatalogDecodeError!void {
+    if (!lowerHex64(issue.issue_id)) return error.InvalidPayload;
+    if (issue.skill_id) |value| if (!lowerHex64(value)) return error.InvalidPayload;
+    if (issue.permission_rule_id) |value| if (!lowerHex64(value)) return error.InvalidPayload;
+    if (issue.server_binding_identity) |value| if (!lowerHex64(value)) return error.InvalidPayload;
+    if (issue.authority_binding) |value| if (!lowerHex64(value)) return error.InvalidPayload;
+    if (issue.canonical_name) |value| if (!validBoundedText(value, 128))
+        return error.InvalidPayload;
+}
+
+fn validateMcpIdentity(
+    server_binding_identity: []const u8,
+    canonical_name: []const u8,
+    schema_fingerprint: []const u8,
+    permission_binding: []const u8,
+    negotiated_protocol: ?[]const u8,
+) SkillCatalogDecodeError!void {
+    if (!lowerHex64(server_binding_identity) or
+        !validBoundedText(canonical_name, 128) or
+        !lowerHex64(schema_fingerprint) or
+        !lowerHex64(permission_binding))
+        return error.InvalidPayload;
+    if (negotiated_protocol) |protocol| if (!validMcpProtocol(protocol))
+        return error.InvalidPayload;
+}
+
+fn validPermissionTool(tool: PermissionTool) bool {
+    if (!validBoundedText(tool.name, 128) or !lowerHex64(tool.binding)) return false;
+    const all_zero = allAsciiZero(tool.binding);
+    return if (tool.namespace == .builtin) all_zero else !all_zero;
+}
+
+fn containsPermissionChoice(values: []const PermissionChoice, choice: PermissionChoice) bool {
+    for (values) |value| if (value == choice) return true;
+    return false;
+}
+
+fn validSessionId(value: []const u8) bool {
+    return value.len == 24 and lowerHex(value);
+}
+
+fn validMcpProtocol(value: []const u8) bool {
+    return std.mem.eql(u8, value, "2026-07-28") or
+        std.mem.eql(u8, value, "2025-11-25");
+}
+
+fn validBoundedText(value: []const u8, max: usize) bool {
+    return value.len != 0 and value.len <= max and std.unicode.utf8ValidateSlice(value);
+}
+
+fn allAsciiZero(value: []const u8) bool {
+    for (value) |byte| if (byte != '0') return false;
+    return true;
+}
+
+fn lowerHex(value: []const u8) bool {
     for (value) |byte| {
-        if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f'))
-            return false;
+        if (!std.ascii.isDigit(byte) and (byte < 'a' or byte > 'f')) return false;
     }
     return true;
+}
+
+fn lowerHex64(value: []const u8) bool {
+    return value.len == 64 and lowerHex(value);
 }
 
 fn validInvocationName(name: []const u8) bool {
@@ -415,6 +1044,29 @@ fn validArgumentNames(names: []const []const u8) bool {
     return true;
 }
 
+fn testPermissionRequest() PermissionRequest {
+    return .{
+        .type = "permission",
+        .request_id = "1111111111111111111111111111111111111111111111111111111111111111",
+        .session_id = "000000000000000000000001",
+        .run_id = 9,
+        .tool_call_id = "tool-9",
+        .tool = .{
+            .namespace = .builtin,
+            .name = "Bash",
+            .binding = "0000000000000000000000000000000000000000000000000000000000000000",
+        },
+        .canonical_arguments_digest = "3333333333333333333333333333333333333333333333333333333333333333",
+        .policy_generation = 7,
+        .arguments_json = "{\"command\":\"git status\"}",
+        .responses = &.{ .deny_once, .deny_session, .allow_once, .allow_session },
+        .candidate = .{
+            .rule_id = "2222222222222222222222222222222222222222222222222222222222222222",
+            .scope = .exact_arguments,
+        },
+    };
+}
+
 test "CoreEvent decoder covers every ABI v1 tag" {
     const cases = [_][]const u8{
         "{\"text_chunk\":\"hello\"}",
@@ -426,6 +1078,7 @@ test "CoreEvent decoder covers every ABI v1 tag" {
         "{\"context_warning\":{\"current_tokens\":1,\"warning_threshold\":2,\"auto_compact_threshold\":3,\"blocking_limit\":4,\"level\":\"medium\"}}",
         "{\"auto_compact\":{\"dropped\":1,\"kept\":2,\"before_tokens\":3,\"after_tokens\":4,\"cause\":\"trigger\"}}",
         "{\"retry_notice\":{\"attempt\":1,\"max\":2,\"delay_ms\":3}}",
+        "{\"permission_provenance\":{\"decision\":\"allow\",\"source\":\"explicit_allow\",\"matched_rule_id\":null,\"session_id\":\"000000000000000000000001\",\"run_id\":1,\"tool_call_id\":\"tool-1\",\"request_id\":null,\"tool\":{\"namespace\":\"builtin\",\"name\":\"Read\",\"binding\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"canonical_arguments_digest\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"policy_generation\":1,\"used_session_rule\":false,\"callback_outcome\":null,\"response\":null}}",
         "{\"stream_done\":{}}",
     };
     try std.testing.expectEqual(std.meta.fields(std.meta.Tag(CoreEvent)).len, cases.len);
@@ -456,9 +1109,9 @@ test "known payloads accept additive fields" {
         .unknown => return error.UnexpectedUnknownEvent,
     }
 
-    var ui = try decodeUiRequest(std.testing.allocator, "{\"permission\":{\"tool\":\"Bash\",\"args\":\"{}\",\"future_hint\":true}}");
+    var ui = try decodeUiRequest(std.testing.allocator, "{\"type\":\"permission\",\"request_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"session_id\":\"000000000000000000000001\",\"run_id\":9,\"tool_call_id\":\"tool-9\",\"tool\":{\"namespace\":\"builtin\",\"name\":\"Bash\",\"binding\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"canonical_arguments_digest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"policy_generation\":7,\"arguments_json\":\"{\\\"command\\\":\\\"git status\\\"}\",\"responses\":[\"deny_once\",\"deny_session\",\"allow_once\",\"allow_session\"],\"candidate\":{\"rule_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"scope\":\"exact_arguments\"},\"future_hint\":true}");
     defer ui.deinit();
-    try std.testing.expectEqualStrings("Bash", ui.value.permission.tool);
+    try std.testing.expectEqualStrings("Bash", ui.value.permission.tool.name);
 }
 
 test "wire integers accept full u32 and u64 ranges" {
@@ -499,7 +1152,7 @@ test "UiRequest decoder covers every tag and response encoder enforces pairing" 
     const a = std.testing.allocator;
     const requests = [_][]const u8{
         "{\"ask_question\":[{\"question\":\"Continue?\",\"header\":\"Choice\",\"multi\":false,\"options\":[{\"label\":\"Yes\",\"description\":\"Proceed\",\"preview\":\"\"}]}]}",
-        "{\"permission\":{\"tool\":\"Bash\",\"args\":\"{}\"}}",
+        "{\"type\":\"permission\",\"request_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"session_id\":\"000000000000000000000001\",\"run_id\":9,\"tool_call_id\":\"tool-9\",\"tool\":{\"namespace\":\"builtin\",\"name\":\"Bash\",\"binding\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"canonical_arguments_digest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"policy_generation\":7,\"arguments_json\":\"{\\\"command\\\":\\\"git status\\\"}\",\"responses\":[\"deny_once\",\"deny_session\",\"allow_once\",\"allow_session\"],\"candidate\":{\"rule_id\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"scope\":\"exact_arguments\"}}",
     };
     try std.testing.expectEqual(std.meta.fields(std.meta.Tag(UiRequest)).len, requests.len);
     try std.testing.expectEqual(@as(usize, 2), std.meta.fields(std.meta.Tag(UiResponse)).len);
@@ -522,10 +1175,16 @@ test "UiRequest decoder covers every tag and response encoder enforces pairing" 
     defer a.free(encoded);
     try std.testing.expectEqualStrings("{\"answers\":[{\"values\":[\"Yes\"]},{\"values\":[\"需要转义 \\\"quote\\\"\"]}]}", encoded);
 
-    const permission_request = UiRequest{ .permission = .{ .tool = "Bash", .args = "{}" } };
-    const permission = try encodeUiResponse(a, permission_request, .{ .permission = .allow_session });
+    const permission_request = UiRequest{ .permission = testPermissionRequest() };
+    const permission_response = PermissionResponse{
+        .permission = .allow_session,
+        .request_id = permission_request.permission.request_id,
+        .policy_generation = permission_request.permission.policy_generation,
+        .rule_id = permission_request.permission.candidate.?.rule_id,
+    };
+    const permission = try encodeUiResponse(a, permission_request, .{ .permission = permission_response });
     defer a.free(permission);
-    try std.testing.expectEqualStrings("{\"permission\":\"allow_session\"}", permission);
+    try std.testing.expectEqualStrings("{\"permission\":\"allow_session\",\"request_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"policy_generation\":7,\"rule_id\":\"2222222222222222222222222222222222222222222222222222222222222222\"}", permission);
     try std.testing.expectError(error.MismatchedResponse, encodeUiResponse(a, permission_request, .{ .answers = &answers }));
     try std.testing.expectError(error.InvalidResponse, encodeUiResponse(a, ask_request, .{ .answers = answers[0..1] }));
 }
@@ -590,20 +1249,20 @@ test "UiRequest decoder rejects unknown tags and invalid payloads" {
     const a = std.testing.allocator;
     try std.testing.expectError(error.MalformedJson, decodeUiRequest(a, "{"));
     try std.testing.expectError(error.UnknownTag, decodeUiRequest(a, "{\"future\":{}}"));
-    try std.testing.expectError(error.InvalidPayload, decodeUiRequest(a, "{\"permission\":{\"tool\":\"Bash\"}}"));
-    try std.testing.expectError(error.InvalidPayload, decodeUiRequest(a, "{\"permission\":{\"tool\":\"Bash\",\"args\":\"{}\"},\"future\":{}}"));
-    try std.testing.expectError(error.InvalidPayload, decodeUiRequest(a, "{\"permission\":{\"tool\":\"Bash\",\"args\":\"{}\"},\"permission\":{\"tool\":\"Bash\",\"args\":\"{}\"}}"));
+    try std.testing.expectError(error.InvalidPayload, decodeUiRequest(a, "{\"type\":\"permission\"}"));
+    try std.testing.expectError(error.UnknownTag, decodeUiRequest(a, "{\"type\":\"future\"}"));
+    try std.testing.expectError(error.InvalidPayload, decodeUiRequest(a, "{\"type\":\"permission\",\"type\":\"permission\"}"));
     try std.testing.expectError(error.InvalidPayload, decodeUiRequest(a, "{\"ask_question\":{}}"));
 }
 
 test "UiResponse decoder rejects unknown tags and invalid payloads" {
     const a = std.testing.allocator;
-    var permission = try decodeUiResponse(a, "{\"permission\":\"allow_once\"}");
+    var permission = try decodeUiResponse(a, "{\"permission\":\"allow_once\",\"request_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"policy_generation\":7}");
     defer permission.deinit();
-    try std.testing.expectEqual(PermissionChoice.allow_once, permission.value.permission);
+    try std.testing.expectEqual(PermissionChoice.allow_once, permission.value.permission.permission);
     try std.testing.expectError(error.UnknownTag, decodeUiResponse(a, "{\"future\":{}}"));
     try std.testing.expectError(error.InvalidPayload, decodeUiResponse(a, "{\"permission\":\"future\"}"));
-    try std.testing.expectError(error.InvalidPayload, decodeUiResponse(a, "{\"permission\":\"allow_once\",\"answers\":[]}"));
+    try std.testing.expectError(error.InvalidPayload, decodeUiResponse(a, "{\"permission\":\"allow_once\",\"request_id\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"policy_generation\":7,\"answers\":[]}"));
 }
 
 test "Skill catalog decoder owns and validates the public descriptor" {

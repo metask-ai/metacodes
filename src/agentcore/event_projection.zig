@@ -204,7 +204,10 @@ pub const Projector = struct {
         return switch (self.mode) {
             .external_run_root => true,
             .model_tool => switch (event) {
-                .text_chunk, .stream_done, .usage => true,
+                // Permission provenance is finalized by the outer AgentCore
+                // facade from this internal boundary.  It remains hidden from
+                // the public protocol after the facade has consumed it.
+                .text_chunk, .stream_done, .usage, .policy_decision => true,
                 else => false,
             },
         };
