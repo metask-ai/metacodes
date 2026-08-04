@@ -434,7 +434,10 @@ pub const App = struct {
         // arena allocator：第一次的临时 defs 随 session 释放，不单独 free。
         // probe pass 用 teams-aware bootstrap ctx,让 enabled_names 与最终 tool_defs 的
         // swarm 门控一致(否则 --agent-teams 开时 "Using your tools" 段漏列 swarm 工具)。
-        const probe_ctx = tools_mod.PromptContext{ .agent_teams = config.agent_teams };
+        const probe_ctx = tools_mod.PromptContext{
+            .agent_teams = config.agent_teams,
+            .tinykg_enabled = config.long_horizon_arm.usesTinyKg(),
+        };
         const probe_defs = try tools_mod.toToolDefinitionsFull(allocator, &app.dyn_registry, &probe_ctx);
         const enabled_names = try allocator.alloc([]const u8, probe_defs.len);
         for (probe_defs, 0..) |d, i| enabled_names[i] = d.name;
@@ -446,6 +449,7 @@ pub const App = struct {
             .agent_type = "", // 主对话
             .include_git = true,
             .agent_teams = config.agent_teams, // F5:门控 swarm 工具进 tool_defs
+            .tinykg_enabled = config.long_horizon_arm.usesTinyKg(),
         };
         app.tool_defs = try tools_mod.toToolDefinitionsFull(allocator, &app.dyn_registry, &prompt_ctx);
         _ = skill_cli_adapter.applyModelToolSchema(app.tool_defs);
@@ -490,7 +494,7 @@ pub const App = struct {
         app.initMemdir();
 
         // 初始化 TinyKG(记忆/计划/DAG 真相源)。best-effort:失败 → kg=null/degraded,
-        // KG 工具不注册、注入段不出现——KG 是增强非依赖(设计 §6)。
+        // 注入段不出现；允许 TinyKG 的 treatment 仍广告工具并显式返回 kg_unavailable。
         app.initKg();
 
         // 从 config.json 加载 permission_rules（旧 schema，向后兼容）
@@ -933,7 +937,7 @@ pub const App = struct {
     /// memdir 禁用(env)或无 home/cwd → 留空串(降级:不豁免、不注入 AutoMem)。
     fn initMemdir(app: *App) void {
         const memdir = @import("core/memory/memdir.zig");
-        if (!memdir.isEnabled()) return;
+        if (!app.config.long_horizon_arm.usesAutoMemory(memdir.isEnabled())) return;
         const home = app.homeDir();
         const cwd = app.cwdAbs();
         if (home.len == 0 or cwd.len == 0) return;
@@ -946,8 +950,8 @@ pub const App = struct {
         app.permission_ctx.memdir_abs = app.memdir_abs;
     }
 
-    /// KG 就绪判定(kg 非 null 且 ready)。**仅 system prompt 门控用**(tool_defs 在
-    /// initKg 之前构建,不做注册过滤——工具恒注册,degraded 时返回 kg_unavailable)。
+    /// KG 就绪判定(kg 非 null 且 ready)。system prompt 用它决定是否声明图谱与
+    /// Markdown→KG 投影；工具广告则由 long_horizon_arm 的 typed treatment 门控。
     pub fn kgReady(app: *const App) bool {
         if (app.kg) |*k| return k.ready;
         return false;
@@ -957,6 +961,7 @@ pub const App = struct {
     /// P1:同步 ensureReady + 同步注入摘要(本地未竞争 store 为毫秒级)。
     /// **P2 待办**:移到后台线程(锁竞争最坏 35s;设计 §5 要求启动零阻塞)——已记账。
     fn initKg(app: *App) void {
+        if (!app.config.long_horizon_arm.usesTinyKg()) return;
         const home = app.homeDir();
         const cwd = app.cwdAbs();
         if (home.len == 0 or cwd.len == 0) return;

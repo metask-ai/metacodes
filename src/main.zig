@@ -258,6 +258,13 @@ pub fn main(init: std.process.Init) !void {
     if (config.record_dir == null) {
         if (std.c.getenv("METACODES_RECORD_DIR")) |c| config.record_dir = std.mem.span(c);
     }
+    if (std.c.getenv("METACODES_LONG_HORIZON_ARM")) |c| {
+        const value = std.mem.span(c);
+        config.long_horizon_arm = types.LongHorizonArm.parse(value) orelse {
+            std.debug.print("error: invalid METACODES_LONG_HORIZON_ARM '{s}'\n", .{value});
+            std.process.exit(2);
+        };
+    }
 
     // --- provider 选择:env METACODES_PROVIDER 显式优先,否则据 model 前缀推断 ---
     // (gpt*/o1*/o3* → openai,gemini* → gemini)。只在此组装层据此选 Client;core/UI 零感知。

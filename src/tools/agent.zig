@@ -172,6 +172,10 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .enabled_tool_names = names,
             .agent_type = d.name,
             .include_git = true,
+            // AgentDef may intentionally hide KgRecall while retaining the
+            // persistent Task tools. Runtime capability, not a filtered tool
+            // name, decides which Task contract the child sees.
+            .tinykg_enabled = ctx.kg != null,
         };
         const originals = try ctx.allocator.alloc([]const u8, filtered.len);
         for (filtered, 0..) |fd, i| originals[i] = fd.description;

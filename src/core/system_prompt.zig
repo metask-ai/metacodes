@@ -318,7 +318,11 @@ pub fn buildFull(
 
     // # Memory 段(通道 B):仅 memdir 启用(memdir_abs 非空)时拼。教模型管理自动记忆。
     const memory_section = if (memdir_abs.len > 0)
-        try @import("memory/memory_section.zig").build(allocator, memdir_abs)
+        try @import("memory/memory_section.zig").build(
+            allocator,
+            memdir_abs,
+            if (kg_ready) .tinykg_linked else .markdown_only,
+        )
     else
         try allocator.dupe(u8, "");
     defer allocator.free(memory_section);

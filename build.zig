@@ -144,6 +144,7 @@ pub fn build(b: *std.Build) void {
     // install step 提到外层:kg/swarm 集成测试需要真 tinykg 二进制,故 test step 也依赖它
     // (让 `zig build test` 自包含地把 tinykg 建到 zig-out/vendor/tinykg/tinykg,测试候选路径命中)。
     var tinykg_install_step: ?*std.Build.Step = null;
+    var tinykg_artifact: ?*std.Build.Step.Compile = null;
     if (build_tinykg) {
         const tinykg_exe = b.addExecutable(.{
             .name = "tinykg",
@@ -159,6 +160,7 @@ pub fn build(b: *std.Build) void {
         });
         b.getInstallStep().dependOn(&install_tinykg.step);
         tinykg_install_step = &install_tinykg.step;
+        tinykg_artifact = tinykg_exe;
     }
 
     const debug_mod = b.createModule(.{
@@ -767,6 +769,23 @@ pub fn build(b: *std.Build) void {
     });
     eval_test_step.dependOn(&eval_test_cmd.step);
     test_step.dependOn(&eval_test_cmd.step);
+    const runtime_tests_can_execute_target =
+        target.result.os.tag == @import("builtin").os.tag and
+        target.result.cpu.arch == @import("builtin").cpu.arch;
+    if (runtime_tests_can_execute_target) {
+        if (tinykg_artifact) |tinykg_exe| {
+            const arm_smoke = b.addSystemCommand(&.{
+                eval_python_exe,
+                "scripts/eval/runtime_arm_smoke.py",
+                "--binary",
+            });
+            arm_smoke.addArtifactArg(exe);
+            arm_smoke.addArg("--tinykg-binary");
+            arm_smoke.addArtifactArg(tinykg_exe);
+            eval_test_step.dependOn(&arm_smoke.step);
+            test_step.dependOn(&arm_smoke.step);
+        }
+    }
 
     // ------------------------------------------------------------------
     // Extra test step: spike / standalone harness files under tests/

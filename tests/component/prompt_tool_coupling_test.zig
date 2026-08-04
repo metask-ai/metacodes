@@ -135,6 +135,79 @@ test "L2: ToolSearch enters the API tool set only when a deferred tool exists" {
     try std.testing.expect(deferred.deferred);
 }
 
+test "L2: long-horizon arm gates TinyKG tools as one typed treatment" {
+    const a = std.testing.allocator;
+
+    const codex = cc.types_mod.LongHorizonArm.codex_style;
+    try std.testing.expect(!codex.usesAutoMemory(true));
+    try std.testing.expect(!codex.usesTinyKg());
+    const claude = cc.types_mod.LongHorizonArm.claude_style;
+    try std.testing.expect(claude.usesAutoMemory(false));
+    try std.testing.expect(!claude.usesTinyKg());
+    const tinykg = cc.types_mod.LongHorizonArm.tinykg;
+    try std.testing.expect(tinykg.usesAutoMemory(false));
+    try std.testing.expect(tinykg.usesTinyKg());
+
+    var without_kg = cc.tools.PromptContext{ .tinykg_enabled = false };
+    const baseline_defs = try cc.tools.toToolDefinitionsFull(a, null, &without_kg);
+    defer {
+        for (baseline_defs) |def| {
+            if (cc.tools.getTool(def.name)) |tool| {
+                if (tool.describe_fn != null) a.free(@constCast(def.description));
+            }
+        }
+        a.free(baseline_defs);
+    }
+    try std.testing.expect(findDef(baseline_defs, "KgRemember") == null);
+    try std.testing.expect(findDef(baseline_defs, "KgRecall") == null);
+    const baseline_create = findDef(baseline_defs, "TaskCreate") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, baseline_create.description, "in-session task list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, baseline_create.description, "TinyKG") == null);
+    try std.testing.expect(findDef(baseline_defs, "TaskList") != null);
+    const baseline_get = findDef(baseline_defs, "TaskGet") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, baseline_get.description, "TinyKG") == null);
+    try std.testing.expect(std.mem.indexOf(u8, baseline_get.description, "kg-*") == null);
+    try std.testing.expect(std.mem.indexOf(u8, baseline_get.description, "do not persist after this session") != null);
+    const baseline_update = findDef(baseline_defs, "TaskUpdate") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, baseline_update.description, "persistent") == null);
+    const baseline_props = baseline_update.input_schema.prop_specs orelse return error.TestUnexpectedResult;
+    var saw_status = false;
+    for (baseline_props) |prop| {
+        try std.testing.expect(!std.mem.eql(u8, prop.name, "conclusion"));
+        try std.testing.expect(!std.mem.eql(u8, prop.name, "acts_on"));
+        try std.testing.expect(!std.mem.eql(u8, prop.name, "uses"));
+        try std.testing.expect(!std.mem.eql(u8, prop.name, "produces"));
+        if (std.mem.eql(u8, prop.name, "status")) {
+            saw_status = true;
+            const values = prop.enum_values orelse return error.TestUnexpectedResult;
+            for (values) |value| try std.testing.expect(!std.mem.eql(u8, value, "failed"));
+        }
+    }
+    try std.testing.expect(saw_status);
+
+    var with_kg = cc.tools.PromptContext{ .tinykg_enabled = true };
+    const tinykg_defs = try cc.tools.toToolDefinitionsFull(a, null, &with_kg);
+    defer {
+        for (tinykg_defs) |def| {
+            if (cc.tools.getTool(def.name)) |tool| {
+                if (tool.describe_fn != null) a.free(@constCast(def.description));
+            }
+        }
+        a.free(tinykg_defs);
+    }
+    try std.testing.expect(findDef(tinykg_defs, "KgRemember") != null);
+    try std.testing.expect(findDef(tinykg_defs, "KgRecall") != null);
+    const tinykg_create = findDef(tinykg_defs, "TaskCreate") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, tinykg_create.description, "persistent task in TinyKG") != null);
+    const tinykg_get = findDef(tinykg_defs, "TaskGet") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, tinykg_get.description, "TinyKG") != null);
+    const tinykg_update = findDef(tinykg_defs, "TaskUpdate") orelse return error.TestUnexpectedResult;
+    const tinykg_props = tinykg_update.input_schema.prop_specs orelse return error.TestUnexpectedResult;
+    try std.testing.expect(for (tinykg_props) |prop| {
+        if (std.mem.eql(u8, prop.name, "conclusion")) break true;
+    } else false);
+}
+
 // ② 动态耦合:USING_TOOLS 段按工具集裁剪。
 test "L2: buildUsingTools 段按工具集裁剪" {
     const a = std.testing.allocator;

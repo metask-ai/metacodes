@@ -72,6 +72,20 @@ pub const ToolEntry = struct {
     /// Swarm 门控工具(TeamCreate/TeamDelete/SendMessage):仅 --agent-teams 时进 advertised
     /// tool_defs(F5)。默认 false=常规工具不受门控。
     swarm_gated: bool = false,
+    /// Only advertised when the active long-horizon treatment includes TinyKG.
+    tinykg_gated: bool = false,
+};
+
+const SESSION_TASK_STATUS_VALUES: []const []const u8 = &.{ "pending", "in_progress", "completed", "deleted" };
+const SESSION_TASK_UPDATE_PROPS: []const json.PropSpec = &.{
+    json.PropSpec{ .name = "taskId", .type = "string", .description = "The id of the in-session task to update" },
+    json.PropSpec{ .name = "status", .type = "string", .description = "New in-session status", .enum_values = SESSION_TASK_STATUS_VALUES },
+    json.PropSpec{ .name = "subject", .type = "string", .description = "New subject (title)" },
+    json.PropSpec{ .name = "description", .type = "string", .description = "New description" },
+    json.PropSpec{ .name = "activeForm", .type = "string", .description = "New present-continuous form" },
+    json.PropSpec{ .name = "owner", .type = "string", .description = "New owner (agent name)" },
+    json.PropSpec{ .name = "addBlocks", .type = "array", .description = "Task ids that this task blocks", .items_type = "string" },
+    json.PropSpec{ .name = "addBlockedBy", .type = "array", .description = "Task ids that block this task", .items_type = "string" },
 };
 
 pub const registry: []const ToolEntry = &.{
@@ -363,6 +377,7 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "scope", .type = "string", .description = "project (default) | global — global only for cross-project user preferences" },
         }, .required = &.{"text"} },
         .execute = kg_tools.executeRemember,
+        .tinykg_gated = true,
     },
     .{
         .name = "KgRecall",
@@ -372,10 +387,12 @@ pub const registry: []const ToolEntry = &.{
             .{ .name = "type", .type = "string", .description = kg_retrieval.TYPE_DESCRIPTION },
         }, .required = &.{"query"} },
         .execute = kg_tools.executeRecall,
+        .tinykg_gated = true,
     },
     .{
         .name = "TaskCreate",
         .description = "Create a task in the in-session task list. Returns the new task id. Use for multi-step work you want to track across turns.",
+        .describe_fn = descriptions.describeTaskCreate,
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "subject", .type = "string", .description = "A brief title for the task" },
             .{ .name = "description", .type = "string", .description = "What needs to be done" },
@@ -386,6 +403,7 @@ pub const registry: []const ToolEntry = &.{
     .{
         .name = "TaskGet",
         .description = "Fetch a task by id. For persistent kg-* tasks this also returns a bounded TinyKG task_packet with parent objective, dependencies, evidence, truncation diagnostics and continuations. Call it after restart/compaction or whenever claim could not return a packet; do not work from the title alone.",
+        .describe_fn = descriptions.describeTaskGet,
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "taskId", .type = "string", .description = "The id of the task to fetch" },
         }, .required = &.{"taskId"} },
@@ -394,12 +412,14 @@ pub const registry: []const ToolEntry = &.{
     .{
         .name = "TaskList",
         .description = "List the live task frontier. For kg-* tasks select only an open, ready, unclaimed leaf; then claim it with TaskUpdate status=in_progress before work. This is a summary/projection, so use TaskGet/task_packet for full recovery context.",
+        .describe_fn = descriptions.describeTaskList,
         .input_schema = .{ .type = "object", .prop_specs = &.{}, .required = &.{} },
         .execute = task_tools.executeList,
     },
     .{
         .name = "TaskUpdate",
         .description = "Update a task's status (pending/in_progress/completed/failed/deleted) and/or fields. For persistent kg-* tasks: claim with in_progress before work (the successful response contains the bounded task_packet); completed/failed are terminal while preserving the stable id; deleted is only a compatibility alias for failed. Close every claimed task with a verified conclusion and actual acts_on/uses/produces when known, then inspect the returned frontier.",
+        .describe_fn = descriptions.describeTaskUpdate,
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "taskId", .type = "string", .description = "The id of the task to update" },
             .{ .name = "status", .type = "string", .description = "New status; failed is for persistent KG tasks", .enum_values = &.{ "pending", "in_progress", "completed", "failed", "deleted" } },
@@ -609,6 +629,7 @@ pub fn toToolDefinitionsFull(
 
     // Swarm 工具门控(F5):未开 --agent-teams 时不广告 TeamCreate/TeamDelete/SendMessage。
     const teams_on = if (prompt_ctx) |pc| pc.agent_teams else false;
+    const tinykg_on = if (prompt_ctx) |pc| pc.tinykg_enabled else true;
     // ToolSearch 是 deferred 工具的发现/激活入口。没有任何 deferred 工具时仍广告它，
     // 会诱导模型对已经带完整 schema 的常驻工具做 select:Write/KgRecall，徒增一轮。
     // 静态内置当前全常驻；MCP 动态工具 deferred=true。未来若静态工具重新 deferred，
@@ -633,6 +654,7 @@ pub fn toToolDefinitionsFull(
 
     for (registry) |*tool| {
         if (tool.swarm_gated and !teams_on) continue;
+        if (tool.tinykg_gated and !tinykg_on) continue;
         if (std.mem.eql(u8, tool.name, "ToolSearch") and !has_deferred) continue;
         const desc: []const u8 = blk: {
             // env override(slot "TOOL_DESC_<UPPER_NAME>")优先于 describe_fn / 静态描述。
@@ -643,6 +665,10 @@ pub fn toToolDefinitionsFull(
             }
             break :blk tool.description;
         };
+        const prop_specs = if (!tinykg_on and std.mem.eql(u8, tool.name, "TaskUpdate"))
+            SESSION_TASK_UPDATE_PROPS
+        else
+            tool.input_schema.prop_specs;
         try defs.append(allocator, .{
             .name = tool.name,
             .description = desc,
@@ -651,7 +677,7 @@ pub fn toToolDefinitionsFull(
                 // 透传 comptime prop_specs（内置工具字段定义）。早先这里硬编码 null，
                 // 把 registry 声明的 schema 全抹掉 → 模型只收到空 properties，触发
                 // 空参/漏参风暴（TaskCreate MissingRequiredField 即此根因）。
-                .prop_specs = tool.input_schema.prop_specs,
+                .prop_specs = prop_specs,
                 .properties = null,
                 .required = tool.input_schema.required,
             },
@@ -691,6 +717,12 @@ pub fn redescribeForContext(
 ) !void {
     for (defs) |*d| {
         if (getTool(d.name)) |t| {
+            if (std.mem.eql(u8, d.name, "TaskUpdate")) {
+                d.input_schema.prop_specs = if (prompt_ctx.tinykg_enabled)
+                    t.input_schema.prop_specs
+                else
+                    SESSION_TASK_UPDATE_PROPS;
+            }
             if (t.describe_fn) |df| {
                 d.description = try df(allocator, prompt_ctx);
             }

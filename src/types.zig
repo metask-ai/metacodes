@@ -17,6 +17,10 @@ pub const Config = struct {
     /// Swarm(teams/teammates):`--agent-teams` 开启。opt-in——默认关,不污染单 agent 会话
     /// 的工具菜单(对齐 cc agentSwarmsEnabled 门)。
     agent_teams: bool = false,
+    /// Long-horizon evaluation ablation. `native` preserves the product's normal
+    /// behavior; the three explicit arms are injected only by the evaluation
+    /// runner so one binary can be compared without revision drift.
+    long_horizon_arm: LongHorizonArm = .native,
     /// SW6 进程外 teammate 身份(lead fork+exec 时经 CLI 注入;非 null → 进 teammate 进程模式,
     /// 不进 REPL)。teammate_name 非空即触发。cwd 非空则启动时 chdir(worktree 隔离)。
     teammate_name: []const u8 = "",
@@ -89,6 +93,38 @@ pub const Config = struct {
     /// gpt*/o1*/o3* → openai(讲 chat/completions 协议)。**只在 App 组装层据此选 Client,
     /// core/UI 零感知**(多 Provider 重构 P3)。
     provider_kind: ProviderKind = .anthropic,
+};
+
+/// A single tagged treatment prevents invalid combinations such as "TinyKG on
+/// but graph tools hidden".  Swarm is intentionally outside this first-stage
+/// single-agent experiment and remains controlled by `agent_teams`.
+pub const LongHorizonArm = enum {
+    native,
+    codex_style,
+    claude_style,
+    tinykg,
+
+    pub fn parse(value: []const u8) ?LongHorizonArm {
+        inline for (std.meta.fields(LongHorizonArm)) |field| {
+            if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+        }
+        return null;
+    }
+
+    pub fn usesAutoMemory(self: LongHorizonArm, native_enabled: bool) bool {
+        return switch (self) {
+            .native => native_enabled,
+            .codex_style => false,
+            .claude_style, .tinykg => true,
+        };
+    }
+
+    pub fn usesTinyKg(self: LongHorizonArm) bool {
+        return switch (self) {
+            .native, .tinykg => true,
+            .codex_style, .claude_style => false,
+        };
+    }
 };
 
 /// LLM 后端协议种类(App 组装层据此选具体 Client;core 只见中立 Provider)。
