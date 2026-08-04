@@ -88,6 +88,8 @@ Revision 6 的实现范围默认限制在 AgentCore-owned 层：
 | `src/permission/prompt.zig` | `no_interactive_prompt` 只在没有 requester 时阻止交互；requester 返回 unavailable/cancelled/异常后仍可能落到进程 answer queue 或 stdin，破坏嵌入库的输入所有权 | 把 `no_interactive_prompt` 定义为绝对边界：requester 没有产生 answered response 时直接 fail closed，且 process queue/`askText` 均不可达。不改变默认 `false` 的产品交互路径 | AgentCore Session、无交互 child/teammate 使用该边界；CLI/TUI/Web 默认路径保持原值 | 确定性测试预装 `y` answer queue 并让 requester 返回 unavailable，断言 deny 且输入未被消费；既有交互测试继续覆盖默认路径 |
 | `src/skills/runtime/catalog.zig` | 共享 scanner 已有 per-candidate temporary arena，但单文件、文件数和内容计数仍混入 catalog-global counters，使一个超限 Skill 中止整轮 query；AgentCore 侧复制 scanner 会制造第二真理源 | 在 shared canonical catalog 中分离 `WorkBudget`、`CandidateUsage` 与 `CatalogUsage`；已选 Skill 的资源失败形成 typed reason 并继续，只有 catalog-global admission 失败整轮终止。共享 source policy、precedence、parser、snapshot 和 activation 语义不变 | AgentCore 与 CLI adapter 都使用相同 canonical 隔离语义；不修改 CLI/TUI/Web 产品层代码 | shared scanner 的 A/B/C 同目录隔离与 global no-partial 测试，加 AgentCore public ABI reason 解码测试 |
 
+Skill catalog 的 `snapshot_bytes` -> `content_bytes` 测试 fixture 改名还机械波及 `src/skills/runtime/activation.zig`、`availability.zig`、`model_tool.zig` 与 `src/skills/skill.zig` 四个 shared 文件中的测试字面量；这些位置没有生产逻辑变化，也不构成第六个 shared canonical seam。
+
 `git diff e043575 -- src/core/agent_loop.zig` 为空；Provider turn loop、通用 Tool execution、CLI/TUI/Web 产品层也没有 Revision 6 diff。上述 necessity records 不授权未来继续扩张 shared Core；任何新增 seam 仍需重新审计。
 
 ### 0.5 实现评审后的架构处置
@@ -472,12 +474,14 @@ compact 继续是第 1.2 节定义的独立 idle activity，不允许作为 Run 
 
 1. Session create/restore 校验 checkpoint budget 至少可以容纳 canonical 最小 terminal/error record；无效配置直接失败；
 2. idle Session 接近 soft threshold 时，通过 describe/result 暴露 `compaction_recommended`，由 Host 决定是否调用独立 `session_compact`；compact 是 replacement transaction：Provider 请求/结果仍受 cap 约束，提交时按候选 Conversation checkpoint 精确验算，而不是把摘要当作追加到旧 Conversation；
-3. `session_run_input` 在 admission 前校验输入、当前 durable usage 与最小 Run reserve；不足时返回 `checkpoint_budget_required`（语义占位名），不分配 `run_id`、不修改 Conversation，输入仍由 Host 持有；
+3. `session_run_input` 在 admission 前校验输入、当前 durable usage 与最小 Run reserve；不足时返回正式公开语义 `checkpoint_budget_required`，不分配 `run_id`、不修改 Conversation，输入仍由 Host 持有；
 4. Run admission 后维护 Run-local durable reservation；每次 Provider、Tool 或 MCP 外部操作前，按当前 reservation profile 为 canonical request、结果上限、审计记录和 terminal marker 预留预算。profile 由 Runtime hard cap、Provider/Tool/MCP 已声明或 AgentCore 配置的 per-operation cap，以及 Host 协商的 checkpoint budget 共同约束；不得把协议理论最大 payload 直接作为默认 reservation；
-5. 无法建立 reservation 时，不发起下一次外部操作，以 `checkpoint_budget_exhausted`（语义占位名）结束已接纳 Run；已在安全边界内接纳的 Conversation 前缀和有界 terminal marker 一并提交，Session 返回 idle 且继续可 checkpoint；
+5. 无法建立 reservation 时，不发起下一次外部操作，以正式公开语义 `checkpoint_budget_exhausted` 结束已接纳 Run；已在安全边界内接纳的 Conversation 前缀和有界 terminal marker 一并提交，Session 返回 idle 且继续可 checkpoint；
 6. 用户输入等已知超大 payload 在 admission 前拒绝；Provider/Tool/MCP 返回超过已声明上限时，不提交原始 payload，而是形成有界 resource-limit terminal/tool outcome。若外部调用可能已有副作用，仍按对应的 indeterminate/failed 语义记录，不能伪装为未执行。
 
 Profile 在构造时还必须保证 `input_cap_bytes`、`provider_result_cap_bytes`、`tool_result_cap_bytes` 与 `mcp_result_cap_bytes` 不超过 checkpoint codec 的 `max_string_bytes`；`provider_request_cap_bytes` 是 transient wire budget，不受 durable-string 约束。这样“可接纳的单段 durable payload 必然可编码”由配置构造保证，而不是依赖 Run 结束后的 poison 兜底。
+
+为防止超限 Provider tail 在错误发生前以 partial response 进入 shared loop 和 Conversation，Revision 6 的 AgentCore budget facade 会先在配置上限内缓存完整 Provider stream，再向 shared loop 发布事件。该实现保持 durable-state invariant，但会改变消费方观察到的 chunk 到达时序；这是 Ledger E9 管理的明确行为债务，不得把它描述成与直连 Provider streaming 等价，也不得为降低延迟而放松 checkpointability。
 
 checkpoint 保存可继续执行的 canonical Conversation 投影，而不是原始 transcript 归档：未 compact 时保存全部 messages；compact 后保存 summary 与 active messages，不再重复保存已经被 summary 替代的隐藏前缀。restore 将 summary 物化为首条 assistant context，使后续再次 compact 仍会把既有摘要纳入新摘要；因此 codec 的 `max_messages` 同时计入该物化 summary，不能在恢复时凭空多出一条越过上限的消息。Host 若需要逐字审计历史，应从 event/transcript 存储独立归档。该边界让 compact 同时降低模型上下文和 durable checkpoint 使用量。
 
@@ -669,7 +673,7 @@ Revision 6 的主协议固定为 **MCP 2026-07-28**，同时只为紧邻的 **MC
 - 不把当前 `src/mcp` 的旧协议行为直接暴露为 AgentCore 公共契约；
 - Revision 6 后续若升级 MCP，必须重新进行协议、权限、缓存和恢复兼容性审计。
 
-每个 server binding 必须选择一种 negotiation policy。以下是语义名，不是已冻结 public wire token：
+每个 server binding 必须选择一种 negotiation policy。`auto`、`modern_only`、`legacy_only` 是 Revision 6 的稳定语义名称，分别映射到第 6.4 节固定的 public numeric code；它们不是 transport JSON 中传输的字符串 token：
 
 ```text
 auto | modern_only | legacy_only
@@ -751,7 +755,7 @@ Revision 6 第一阶段必须具备以下 MCP 消费能力：
 9. Session 级 server/tool 选择与 Run 级固定 Tool view；
 10. restore 时重新协商版本并对 MCP binding、catalog fingerprint 和 Session grants 重新验证。
 
-Revision 6 第一阶段不声明 MRTR/Elicitation client capability。若 `2026-07-28` server 在未协商支持的情况下返回 `resultType: "input_required"`，AgentCore 必须完整解析并校验该结果，然后以结构化 `input_required_unsupported`（语义占位名，非 wire token）结束当前 Tool call：不自动 retry、不把 interim result 当作 complete、不提交部分 Tool result，Session 保持可用。完整 MRTR 支持需要单独冻结 request/response、用户输入和重试状态机。
+Revision 6 第一阶段不声明 MRTR/Elicitation client capability。若 `2026-07-28` server 在未协商支持的情况下返回 `resultType: "input_required"`，AgentCore 必须完整解析并校验该结果，然后以结构化 `input_required_unsupported` 结束当前 Tool call：不自动 retry、不把 interim result 当作 complete、不提交部分 Tool result，Session 保持可用。该名称是当前模型可见诊断，不是 C ABI status 或稳定控制词汇。完整 MRTR 支持需要新的 request/response、用户输入和重试状态机设计。
 
 这里只确认 MCP Tool 作为 Revision 6 的基础能力。Resources、Prompts、Elicitation 和 subscription 的公共投影范围仍待单独讨论，不能因为底层协议能够收发就宣称 AgentCore 已经支持。
 
@@ -835,6 +839,8 @@ Schema 处理要求：
 - `outputSchema` 只约束成功结果的 `structuredContent`；`isError=true` 是 Tool 业务错误，允许只有 typed content，不能因为缺少 success payload 而改判协议错误并吞掉原错误；
 - 完整 validator 若未来有真实需求，必须作为新的依赖、二进制体积和安全边界决策进入后续 ABI revision；不得把当前 bounded profile 描述成完整 2020-12 支持。
 
+MCP Tool 失败进入模型时使用 `{code, phase, rpc_code}` 结构；这些字段目前只是模型可见诊断，不属于 Revision 6 稳定 wire 词汇，也不允许 Host 通过字符串扩大 authority。当前 uncertain-delivery code 为 `indeterminate`；若未来要供 Host 或模型稳定分支，必须另行定义小型 canonical taxonomy，不能直接冻结实现 enum 名。
+
 若首版包含 Streamable HTTP，还必须按规范处理 `x-mcp-header`：先验证 header name、类型和静态可达性，再从已验证参数生成 header；不得把敏感字段或任意 schema 值未经约束地投影为 HTTP header。
 
 MCP annotations、description 和 server instructions 是不可信元数据，只能作为展示或风险判断提示，不能单独赋予 authority，也不能覆盖 Core safety policy。
@@ -875,8 +881,8 @@ restore 后由 Host 重新提供 server 配置和认证，Runtime 重新执行�
 
 - `server/discover`、legacy initialize probe 和 list/read 类只读操作可以在有界预算内重试；
 - `tools/call` 在能够证明请求尚未交付前可以安全重试；
-- 请求已可能到达 server、但响应流在 terminal result 前断开时，外部副作用是否发生不可证明，必须返回 `outcome_indeterminate`（语义占位名，非 wire token）；
-- `outcome_indeterminate` 不产生成功 Tool result、不恢复 Session grant、也不 poison 无关 Session；
+- 请求已可能到达 server、但响应流在 terminal result 前断开时，外部副作用是否发生不可证明，必须返回模型可见诊断 `indeterminate`；
+- `indeterminate` 不产生成功 Tool result、不恢复 Session grant、也不 poison 无关 Session；
 - 后续重试必须是新的、经过当前 Permission 与 Host/用户确认的调用，不能由 restore 或 transport manager 盲目重放。
 
 MCP `2026-07-28` Streamable HTTP 对 broken response stream 要求 client 以新 request ID 重发。对具有未知副作用的 `tools/call`，上述安全策略是有意的更严格限制。若 Revision 6 首版包含 Streamable HTTP，必须在 conformance 声明中明确该差异，或只在 server 提供可验证幂等机制时自动重发；在此问题关闭前不得宣称 broken-stream 路径完全 conformant。stdio 不引入该 HTTP 重发义务，但仍遵守不自动重放未完成调用的 Session 语义。
@@ -987,7 +993,7 @@ Revision 6 进入实现前，按以下顺序推进：
 10. 完成 reference-closure、安全、所有权、并发、失败原子性、资源上限和变更范围审计；
 11. 运行两个 MCP era 的 conformance tests、checkpoint 长会话测试与真实 artifact consumer gate；
 12. 再设计 C ABI DTO、status、capability 和 API table；
-13. 最后执行 hard-cut revision freeze，并更新 experimental ledger 的 A3、B2、C8、E2、E4、E5 disposition；E4 必须记录 legacy adapter 的单代窗口与退场条件，E5 必须保留 owner、双路径安全修复义务、触发条件和待定收敛方向。
+13. 最后执行 hard-cut revision 收口，并同步 experimental ledger 中所有 Revision 6 已关闭项与 E4..E11 disposition；E4 必须记录 legacy adapter 的单代窗口与退场条件，E5/E8/E9/E10 必须保留 owner、触发条件和待定处置方向。
 
 实现顺序必须是 AgentCore-owned canonical 类型与 seam 在前、binary ABI 投影在后。这条规则不授权修改通用 agent loop：每个实施变更集都必须声明触及层级；没有 necessity record 的 shared Core 改动不得进入实现，未经单独方案和明确批准的 `src/core/agent_loop.zig` 改动直接视为范围验收失败。
 
@@ -1034,7 +1040,8 @@ Revision 6 进入实现前，按以下顺序推进：
 - 超限 Provider/Tool/MCP payload 不进入 Conversation 原文，而形成有界 resource-limit outcome；
 - MCP server 下线、认证暂不可用或 Skill 缺失时，Conversation 恢复成功并返回 degraded RestoreReport；
 - `session_describe`/Runtime query 对所有 Host-visible identifiers 完成 reference closure；
-- checksum 与 Host authenticity/MAC 职责有独立测试，不把结构完整性冒充可信来源；
+- checksum 损坏路径已有确定性测试；Host authenticity/MAC 仍是明确的 Host 职责，
+  “checksum 不代表可信来源”的独立 conformance 证据登记在 Ledger H5，不由现有损坏测试冒充；
 - artifact consumer 能完成 export -> 持久化 -> 进程重建 -> restore -> 后续 Run 的完整链路。
 
 ### 8.3 MCP
@@ -1057,7 +1064,7 @@ Revision 6 进入实现前，按以下顺序推进：
 - 不同 Session 的 server/tool selection 与 grants 完全隔离；
 - active Run 的 Tool view 不因并发 catalog refresh 变化；
 - abort、timeout、transport failure 和 server process exit 不 poison 无关 Session；
-- 已交付但丢失 terminal response 的 `tools/call` 返回 `outcome_indeterminate` 语义结果，不盲目重放；
+- 已交付但丢失 terminal response 的 `tools/call` 返回 `indeterminate` 诊断结果，不盲目重放；
 - checkpoint 不包含 token、transport、process 或 in-flight request；
 - restore 后重新协商/discover，binding/schema 漂移或 server unavailable 使相关 view/grant 失效并报告 degraded，不阻断核心 Session；
 - artifact consumer 能完成 server binding -> discovery -> Session selection -> Run tool call -> checkpoint -> Runtime 重建 -> restore -> 后续调用的完整链路。
@@ -1076,6 +1083,11 @@ Revision 6 进入实现前，按以下顺序推进：
 
 ### 8.5 最终 conformance、reference closure 与交付证据
 
+发布 gate 只按已经存在且可重复运行的证据计数。sandbox/Permission 正交性、background
+job 导出 `BUSY`、HTTP negotiation 的 401/403/5xx 分场景、跨 Session poison 隔离以及
+checksum/authenticity 边界仍是非阻塞的 PARTIAL 项，统一登记在 Ledger H 组；它们不改变
+Revision 6 的 public contract，也不得在补齐测试前写成已覆盖。
+
 2026-08-03 的初始矩阵与 2026-08-04 的增量架构收口结果如下。专项行使用 `PASS` 或当前精确计数；全量 gate 必须覆盖全部专项矩阵：
 
 | 门禁 | 结果 | 覆盖重点 |
@@ -1086,8 +1098,8 @@ Revision 6 进入实现前，按以下顺序推进：
 | MCP freshness/schema budget tests | PASS | 注入时钟验证 TTL/default/cap；过期 view 的新 Run 排除、active Run 不漂移；schema 在动态树分配前执行 container/node/depth/work admission；数学 integer lexeme 与 unsupported semantics fail closed |
 | `agentcore:test -Dtfilter="checkpoint"` | 16/16 | 长 Conversation、compact 投影、summary 恢复消息数上限、chunk/byte 边界、budget admission/reservation、corrupt/unsupported、authority revalidation、degraded restore |
 | Text/Skill unified root admission tests | PASS | 精确 canonical invocation preflight；admitted effectful expansion 原子对账；拒绝不消费 `run_id`、不改 Conversation、不预留整块 input cap |
-| `agentcore:test -Dtfilter="public MCP checkpoint restore"` | 1/1 | public ABI 下 MCP catalog -> Session selection -> Run -> checkpoint -> narrower restore -> continued Run，并执行 identifier reference closure 断言 |
-| `agentcore:consumer -Dtarget=x86_64-windows-msvc` | 18/18 | 无源码 C consumer；无源码 Zig consumer 完成 tools -> checkpoint -> Runtime 重建 -> restore -> continued Run |
+| `agentcore:test -Dtfilter="public MCP checkpoint restore"` | 1/1 | public ABI 下 MCP catalog -> Session selection -> checkpoint -> narrower degraded restore -> continued Run，并执行 identifier reference closure 断言 |
+| `agentcore:consumer -Dtarget=x86_64-windows-msvc` | PASS | 无源码 C consumer；无源码 Zig consumer 完成 tools -> checkpoint -> Runtime 重建 -> restore -> continued Run；完整 MCP 调用链仍按本节 PARTIAL 口径处理 |
 | `agentcore:gate -Dtarget=x86_64-windows-msvc` | 42/42 steps；217/217 tests（2026-08-04） | C/C++/Zig/Rust exact R6 discovery、symbol/manifest、原生 consumer 与全量 ABI 回归 |
 | `agentcore:archive -Dtarget=x86_64-windows-msvc` | PASS（2026-08-04，6/6 self-tests） | immutable archive、coordinate root、hash、identity、拒绝覆盖和错误 payload |
 

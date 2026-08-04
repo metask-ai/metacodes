@@ -1936,7 +1936,7 @@ const AbiSession = struct {
             .arena = description_arena,
             .session_id = lease.session_id,
             .origin = self.logical_origin,
-            .lifecycle = .idle,
+            .lifecycle = if (self.facade_poisoned.load(.acquire)) .poisoned else .idle,
             .registered = true,
             .last_run_id = lease.last_run_id,
             .last_compact_id = lease.last_compact_id,
@@ -8046,6 +8046,19 @@ test "Revision 6 AgentCore checkpoint export commits generation only after sink 
         native_session.session_id.asSlice(),
         description.session_id.asSlice(),
     );
+
+    // The facade may become poisoned after Core has returned to an otherwise
+    // inspectable idle state. describe() is the Host's health surface, so it
+    // must expose that terminal facade state instead of reporting a healthy
+    // idle Session.
+    session.facade_poisoned.store(true, .release);
+    var poisoned_description = try session.describe(std.testing.allocator);
+    defer poisoned_description.deinit();
+    try std.testing.expectEqual(
+        session_authority.Lifecycle.poisoned,
+        poisoned_description.lifecycle,
+    );
+    session.facade_poisoned.store(false, .release);
 
     capture.clear();
     capture.fail = true;

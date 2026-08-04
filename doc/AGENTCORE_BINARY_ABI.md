@@ -254,6 +254,7 @@ The v1 observation set is:
 | `context_warning` | Context-pressure thresholds and level |
 | `auto_compact` | Conversation compaction summary |
 | `retry_notice` | Provider retry attempt and delay |
+| `permission_provenance` | Final Permission decision, canonical source, request binding, generation, and typed callback outcome |
 
 Events describe observations, not commands. A Host may render, aggregate,
 persist, or ignore them; consuming an event never drives the core execution
@@ -287,12 +288,18 @@ One Session accepts one active Run at a time. A successful Run returns to idle
 and the Host may start another Run on the same stateful Conversation. `Status`
 describes whether the ABI call itself succeeded. `StopReason` is meaningful
 only when `session_run_input` returns `METASK_AGENTCORE_STATUS_OK` and is one of `end_turn`,
-`max_turns`, `aborted`, `tool_error`, `api_error`, or `tool_loop`. Internal
-`suspended`, `backgrounded`, and `budget` states are not representable in v1;
-if one becomes reachable through the facade it is an internal contract failure,
-not a new public stop code. Because the stateful Run may already have committed
-Conversation changes, that failure poisons the ABI facade and subsequent Run or
-abort calls return `METASK_AGENTCORE_STATUS_INVALID_STATE`; destroy remains valid.
+`max_turns`, `aborted`, `tool_error`, `api_error`, `tool_loop`,
+`checkpoint_budget_exhausted`, or `checkpoint_resource_limit`. The last two are
+the public durable-budget terminals
+`METASK_AGENTCORE_STOP_CHECKPOINT_BUDGET_EXHAUSTED` and
+`METASK_AGENTCORE_STOP_CHECKPOINT_RESOURCE_LIMIT`; their detailed outcome is
+also reported through `RunResultV1.checkpoint_outcome_code` and result flags.
+Internal `suspended`, `backgrounded`, and a raw unprojected Core `budget` stop
+remain unrepresentable in v1. If one of those internal states reaches the
+facade it is a contract failure, not an additional public stop code. Because
+the stateful Run may already have committed Conversation changes, that failure
+poisons the ABI facade and subsequent Run or abort calls return
+`METASK_AGENTCORE_STATUS_INVALID_STATE`; destroy remains valid.
 
 The synchronous `session_run_input` return is a quiescence boundary: every callback
 started for that Run, and every paired release callback for its Host-owned
@@ -365,6 +372,12 @@ Host must destroy that physical handle. Revision 6 checkpoint/restore creates
 a new handle from a previously exported committed checkpoint; it does not
 reconstruct state that was never successfully exported or resume an active
 Run.
+
+When facade poison occurs after Core has returned to an inspectable idle state,
+`session_describe` succeeds and reports lifecycle `poisoned`; it must not report
+`idle`. An active ordinary Session activity makes `session_describe` return
+`METASK_AGENTCORE_STATUS_BUSY`, so a successful Revision 6 description does not
+emit lifecycle `busy`.
 
 A checkpoint is resumable model state, not a raw transcript archive. Before
 compact it contains the complete Conversation. After compact it contains the
@@ -610,6 +623,15 @@ validation and `tools/call` encoding, and `outputSchema` is applied only to a
 successful result. An `isError=true` Tool business error may omit
 `structuredContent` without losing its typed content.
 
+### Model-visible MCP diagnostics
+
+MCP Tool failures currently reach the model as compact JSON with `code`,
+`phase`, and nullable `rpc_code`. These strings are diagnostic output, not C ABI
+`Status` values or a stable Revision 6 control vocabulary; Hosts must not branch
+on their spelling or use them to broaden Tool authority. The current uncertain
+delivery code is `indeterminate`. Stabilizing this vocabulary requires a later
+explicit contract decision rather than treating leaked enum names as wire API.
+
 ### Permission authority and provenance
 
 Permission response tokens are `deny_once`, `deny_session`, `allow_once`, and
@@ -708,7 +730,7 @@ input schemas use the AgentCore object-schema subset: `type`, `properties`,
 and `required`.
 
 Session permission modes are `default`, `accept_edits`, `auto`, `dont_ask`,
-and `bypass_permissions`, represented by the corresponding public constants.
+and `full_access`, represented by the corresponding public constants.
 
 ABI v1 supports these built-in tools: `Read`, `Write`, `Edit`, `Glob`, `Grep`,
 `Bash`, `BashOutput`, `KillShell`, and `AskUserQuestion`. Runtime creation

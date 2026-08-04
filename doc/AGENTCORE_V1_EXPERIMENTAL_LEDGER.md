@@ -9,26 +9,27 @@
 > 不修的正式论证**（歧义 wire format 与 schema 静默吞字段冻结后再修就是 breaking，
 > "修复队列"的名字不降低其严重性）；③ 引用闭包审查；④ 真实消费者门禁。
 >
-> **Revision 6 disposition（2026-08-03）**：A3、B2、C8、E2 已由 Revision 6
-> canonical seam、public wire 与 conformance tests 关闭；E4 已形成明确的 hard-cut/
-> 单代 MCP compatibility window 处置但继续作为发布治理项；E5 继续作为显式双路径债务跟踪。
+> **Revision 6 disposition（2026-08-04）**：A1、A3、A4、B1、B2、B3、C8、E2、
+> E6、E7、E11 已由 Revision 6 canonical seam、public wire 与 conformance tests
+> 关闭；E4 已形成明确的 hard-cut/单代 MCP compatibility window 处置但继续作为
+> 发布治理项；E5、E8、E9、E10 继续作为显式开放债务跟踪。
 
 ## A 组：复冻前必须正面解决（评审方点名四项）
 
 | # | 问题 | 事实锚点 | 处置方向 |
 |---|------|----------|----------|
-| A1 | 成功 Run 可能无任何可取得的最终输出（on_event 可空且事件被丢弃，RunResult 无文本/usage） | `.h` on_event optional 条款；`abi_v1.zig` emit 丢弃路径 | 三选一进消费端观测（强制 on_event / RunResult 带 final snapshot / 明文纯事件流 API）。实现方倾向：明文纯事件流 + on_event 必填（RunResult 带 owned 文本会把 POD 摘要变成带释放义务的资源，代价大） |
+| A1 | 成功 Run 可能无任何可取得的最终输出（on_event 可空且事件被丢弃，RunResult 无文本/usage） | `.h` on_event optional 条款；`abi_v1.zig` emit 丢弃路径 | **已关闭（Revision 6，纯事件流）**：`on_event` 成为 Session create/restore 必填 callback；ABI 文档固定 closed-segment 最终文本重建算法与 usage checked-add 规则，不给 POD `RunResult` 增加 owned buffer。L2 拒绝缺失 callback，并用独立 Host reconstruction oracle 覆盖 tool boundary、stream completion 与 usage；source-free consumer 通过必填事件面取得最终文本 |
 | A2 | Host 工具 FAILED/REJECTED 丢失错误详情，模型无法自纠 | revision 2 前的 `AbiHostTool.execute` 释放并忽略非 OK 内容 | **已关闭（revision 2）**：FAILED/REJECTED 可携带 16 MiB 内原始 UTF-8 detail；统一 serializer 在转义后按 1 MiB 完整 payload 限额，超限降级为有界通用业务错误；错误 payload 绕过通用结果落盘与 aggregate budget；原文、控制字符、近界、release、真实回调链路与大错误详情保真均有测试 |
 | A3 | allow_always 隐藏持久化副作用（写 `<ws>/.claude/settings.local.json` 或 `~/.claude/settings.json`），且 core Session 创建**只建 SessionRules 不读盘**——只写不读 = 制造垃圾文件，不是 persistence | `permission/prompt.zig:63`、`settings_writer.zig`、`agent_session.zig` SessionRules 创建路径 | **已关闭（Revision 6，Host 全责）**：公开 response 只有 `allow_once / allow_session / deny_once / deny_session`，不存在 `allow_always`；AgentCore grant 只属于 logical Session，可经 Host checkpoint 恢复但不写产品 settings。`Revision 6 AgentCore Permission callback binds grants and preserves typed unavailable` 在真实临时 Workspace 中断言 `.claude`/`.metacodes` 均未创建，并创建同 Runtime/Workspace 的 fresh Session 断言零 grant、重新进入 ask；rules replacement/restore 另有 generation 与 authority 测试。CLI/App 的 settings writer 不在 AgentCore 调用图中，长期授权仍由 Host 自存并在后续 Session 导入明确规则 |
-| A4 | MC_SHELL_SANDBOXED 跨平台承诺不真实（仅 macOS，非 macOS 到首次 Bash 才暴露） | `sandbox/exec.zig:69` 平台分支与运行期探测 | **双层且 Session 校验不可省**：bundle capability 只声明"编译了该实现"；`session_create(SANDBOXED)` **必须运行期探测**当前机器实际可用（macOS bundle ≠ sandbox-exec 存在），不可用即创建失败——绝不拖到首次 Bash。"target OS 猜可用性"是同一个错误换衣服 |
+| A4 | MC_SHELL_SANDBOXED 跨平台承诺不真实（仅 macOS，非 macOS 到首次 Bash 才暴露） | `sandbox/exec.zig:69` 平台分支与运行期探测 | **已关闭（Revision 6，双层准入）**：bundle capability 只声明“编译了该实现”；`session_create(SANDBOXED)` 运行期探测当前机器实际可用性，不可用立即失败，绝不拖到首次 Bash。`L2 sandbox admission is eager while unrestricted skips the probe` 同时证明 sandboxed eager admission 与 unrestricted 不触发探测 |
 
 ## B 组：解冻期修复队列（协议/硬化）
 
 | # | 问题 | 处置方向 |
 |---|------|----------|
-| B1 | AskQuestion 多选用 ", " 拼接（label 含逗号即歧义） | 改为 per-question 字符串数组 `{"answers":[{"values":[...]}]}`；实验期 breaking 许可 |
+| B1 | AskQuestion 多选用 ", " 拼接（label 含逗号即歧义） | **已关闭（Revision 6）**：response 固定为 per-question 字符串数组 `{"answers":[{"values":[...]}]}`；SDK encoder/decoder 校验问题数、单选/多选 cardinality、自由文本与资源上限，逗号只作为普通 label 内容，不再参与 framing |
 | B2 | UI 缺"用户主动取消"与 UNAVAILABLE 的区分 | **已关闭（Revision 6）**：Permission canonical outcome 固定为 `answered / user_cancelled / unavailable / contract_failure`，并进入 `permission_provenance`；`UI_CANCELLED` 与 `UI_UNAVAILABLE` 保持独立 ABI status。Permission callback 测试逐一断言四态及 release，AskQuestion L2 另断言 cancelled 与 unavailable 都不 poison Session |
-| B3 | Host 工具 schema 非严格子集（未知顶层字段静默忽略） | 拒绝未知顶层关键字；required 引用必须存在且不重复；定义工具名长度与 provider-safe 字符集；Runtime 创建时失败，不留到 provider 请求 |
+| B3 | Host 工具 schema 非严格子集（未知顶层字段静默忽略） | **已关闭（Revision 6）**：Runtime admission 只接受 `type/properties/required` 顶层集合，拒绝未知或重复字段；`required` 必须引用现有 property 且不得重复；Tool 名固定为 1..64 bytes 的 provider-safe 交集语法。size/depth、ambiguous object contract 与 tool-name grammar 测试均在 Runtime 创建前闭合 |
 | B4 | prompt 无硬上限（RESOURCE_LIMIT 防御模型不完整） | 加宽松硬上限，阈值待消费端负载数据 |
 
 ## C 组：消费端观测清单（consumer gate 收集，不拍脑袋）
@@ -136,7 +137,8 @@ revision 内增加语义：
     实际 request bytes 加该 operation 的配置 result cap 计算，安全但 cap 过松会提前拒绝长
     Session。默认 cap/soft threshold 需要持续用真实 provider、Host Tool 与 MCP workload
     校准；任何调整必须保持 payload 超限的有界 outcome、pre-side-effect reservation 和
-    source-free durable-budget 回归，不得用协议理论最大值替代运行配置。
+    source-free durable-budget 回归，不得用协议理论最大值替代运行配置。**Owner**：
+    AgentCore Runtime/容量治理负责人；Provider、Host Tool 与 MCP owner 提供 workload 样本。
 11. **E11 — `InvalidBudget` status 映射（已关闭，Revision 6）**：该内部错误只表示
     checkpoint limits 或 durable profile 在结构上无效，统一映射 public
     `STATUS_INVALID_ARGUMENT`，不新增同义 status token；合法配置下的运行容量不足必须使用
@@ -148,3 +150,18 @@ revision 内增加语义：
   `1ULL << n` capability macros 生成为 `u32` 常量，而 wire field 是 `u64`。数值和布局
   不受影响，现有 Rust consumer 显式转换；下次重新生成 SDK 时应从 header 或 bindgen
   配置统一为 `u64`，并保持 drift gate。不得手改自动生成的 `raw.rs`。
+
+## G 组：发布合同治理
+
+1. **G1 — Header/参考文档镜像审查（持续规则）**：任何修改 public function table、DTO、
+   enum/status/stop code、capability bit、CoreEvent tag 或资源限制的提交，必须在同一主题批次
+   同步审查 `sdk/metask/agentcore.h`、跨语言 SDK、`AGENTCORE_BINARY_ABI.md` 与 artifact
+   consumer。Header 是机器合同，ABI 参考文档是消费方语义合同，二者不得分批收口。若未来
+   增加自动 drift gate，它只能补充人工语义审查，不能把“文本存在”冒充“语义一致”。
+
+## H 组：Revision 6 非阻塞 conformance 债务
+
+1. **H1 — 收口审计的 PARTIAL 测试项**：sandbox/Permission 正交性、background activity
+   导出 `BUSY`、HTTP negotiation 的 401/403/5xx 分场景、跨 Session poison 隔离，以及
+   checksum 不代表来源真实性。**Owner**：AgentCore conformance。相关 seam 变更时补最窄
+   的故障注入测试；本条不重新打开 Revision 6 架构，也不授权扩大实现范围。
