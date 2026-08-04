@@ -78,6 +78,12 @@ pub const RuntimeCatalogs = struct {
 
     allocator: std.mem.Allocator,
     mutex: sync.Mutex = .{},
+    /// Filesystem discovery is synchronous and may transiently hold both the
+    /// candidate arena and the immutable clone. Serialize only that work per
+    /// Runtime so concurrent Host queries cannot multiply the bounded build
+    /// peak. Lifecycle/refcount operations continue to use `mutex` and never
+    /// hold it across filesystem I/O.
+    build_mutex: sync.Mutex = .{},
     state: State = .live,
     active_calls: usize = 0,
     reference_count: usize = 0,
@@ -200,6 +206,9 @@ pub const RuntimeCatalogs = struct {
         sources: []const catalog.Source,
         limits: catalog.Limits,
     ) (Error || catalog.BuildError)!*HostCatalog {
+        self.build_mutex.lock();
+        defer self.build_mutex.unlock();
+
         const scope_id = self.scopeIdUnderGuard(workspace);
         const snapshot = try catalog.build(
             self.allocator,
@@ -458,6 +467,82 @@ test "Host and Session catalog references gate Runtime destruction" {
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 32), &runtime.secret);
 }
 
+test "Runtime serializes catalog builds without holding the lifecycle lock" {
+    const Worker = struct {
+        runtime: *RuntimeCatalogs,
+        workspace: *const CanonicalWorkspace,
+        completed: *std.atomic.Value(bool),
+        failed: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            const host = self.runtime.query(
+                std.testing.io,
+                self.workspace,
+                "epoch",
+                &.{},
+                .{},
+            ) catch {
+                self.failed.store(true, .release);
+                self.completed.store(true, .release);
+                return;
+            };
+            host.release() catch self.failed.store(true, .release);
+            self.completed.store(true, .release);
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buffer);
+    var workspace = try CanonicalWorkspace.init(
+        std.testing.allocator,
+        root_buffer[0..root_len],
+        "",
+    );
+    defer workspace.deinit();
+    var runtime = RuntimeCatalogs.initWithSecret(std.testing.allocator, [_]u8{8} ** 32);
+    var completed = std.atomic.Value(bool).init(false);
+    var failed = std.atomic.Value(bool).init(false);
+    var worker = Worker{
+        .runtime = &runtime,
+        .workspace = &workspace,
+        .completed = &completed,
+        .failed = &failed,
+    };
+
+    runtime.build_mutex.lock();
+    var gate_locked = true;
+    defer if (gate_locked) runtime.build_mutex.unlock();
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
+    var joined = false;
+    defer if (!joined) thread.join();
+
+    var observed_waiting_call = false;
+    for (0..5_000) |_| {
+        runtime.mutex.lock();
+        const active_calls = runtime.active_calls;
+        runtime.mutex.unlock();
+        if (active_calls == 1) {
+            observed_waiting_call = true;
+            break;
+        }
+        sync.sleepMs(1);
+    }
+    try std.testing.expect(observed_waiting_call);
+    try std.testing.expect(!completed.load(.acquire));
+    try std.testing.expectError(error.RuntimeBusy, runtime.tryBeginDestroy());
+
+    runtime.build_mutex.unlock();
+    gate_locked = false;
+    thread.join();
+    joined = true;
+    try std.testing.expect(completed.load(.acquire));
+    try std.testing.expect(!failed.load(.acquire));
+    try runtime.tryBeginDestroy();
+    runtime.finishDestroy();
+}
+
 test "catalog binding rejects cross-Runtime and cross-Workspace handles without mutation" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -685,4 +770,53 @@ test "live snapshot budget rejects publication without leaking a reference" {
     );
     try std.testing.expectEqual(@as(usize, 0), runtime.reference_count);
     try std.testing.expectEqual(@as(usize, 0), runtime.live_snapshot_bytes);
+}
+
+test "failed catalog build preserves an existing Host snapshot" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    const skill_dir = try std.fs.path.join(allocator, &.{ root, "review" });
+    defer allocator.free(skill_dir);
+    try std.Io.Dir.cwd().createDirPath(io, skill_dir);
+    const skill_md = try std.fs.path.join(allocator, &.{ skill_dir, "SKILL.md" });
+    defer allocator.free(skill_md);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = skill_md,
+        .data = "---\nname: Review\n---\nbody",
+    });
+
+    var runtime = RuntimeCatalogs.initWithSecret(allocator, [_]u8{6} ** 32);
+    var workspace = try CanonicalWorkspace.init(allocator, root, "");
+    defer workspace.deinit();
+    const sources = [_]catalog.Source{.{
+        .root = root,
+        .scope = .project,
+        .priority = 1,
+    }};
+    var host: ?*HostCatalog = try runtime.query(io, &workspace, "epoch", &sources, .{});
+    defer if (host) |value| value.release() catch unreachable;
+    const resident_before = runtime.live_snapshot_bytes;
+
+    try std.testing.expectError(
+        error.ResourceLimit,
+        runtime.query(io, &workspace, "epoch", &sources, .{
+            .max_catalog_content_bytes = 1,
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), runtime.reference_count);
+    try std.testing.expectEqual(resident_before, runtime.live_snapshot_bytes);
+    try std.testing.expectEqualStrings(
+        "Review",
+        host.?.snapshot().findByInvocation("review").?.definition.name,
+    );
+
+    try host.?.release();
+    host = null;
+    try runtime.tryBeginDestroy();
+    runtime.finishDestroy();
 }

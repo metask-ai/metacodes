@@ -541,7 +541,7 @@ fn testSnapshot(records: []const skill_catalog.SkillRecord) skill_catalog.Snapsh
         .skills = records,
         .issues = &.{},
         .descriptor_json = "",
-        .snapshot_bytes = 0,
+        .content_bytes = 0,
         .resident_bytes = 0,
     };
 }

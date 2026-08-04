@@ -155,7 +155,7 @@ fn testSnapshot(records: []const catalog.SkillRecord) catalog.Snapshot {
         .skills = records,
         .issues = &.{},
         .descriptor_json = "",
-        .snapshot_bytes = 0,
+        .content_bytes = 0,
         .resident_bytes = 0,
     };
 }

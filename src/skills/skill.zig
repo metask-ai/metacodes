@@ -176,7 +176,7 @@ test "SkillSet projection uses invocation identity and no live source path" {
         .skills = (&[_]catalog.SkillRecord{record})[0..],
         .issues = &.{},
         .descriptor_json = "",
-        .snapshot_bytes = 0,
+        .content_bytes = 0,
         .resident_bytes = 0,
     };
     _ = &snapshot;

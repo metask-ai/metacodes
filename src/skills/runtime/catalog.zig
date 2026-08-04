@@ -14,9 +14,12 @@ pub const Limits = struct {
     max_visited_entries: usize = 65536,
     max_depth: usize = 64,
     max_relative_path_bytes: usize = 4096,
-    max_files: usize = 16384,
-    max_single_file_bytes: usize = 4 * 1024 * 1024,
-    max_snapshot_bytes: usize = 64 * 1024 * 1024,
+    max_skill_entries: usize = 4096,
+    max_skill_files: usize = 1024,
+    max_skill_content_bytes: usize = 32 * 1024 * 1024,
+    max_file_content_bytes: usize = 16 * 1024 * 1024,
+    max_catalog_files: usize = 16384,
+    max_catalog_content_bytes: usize = 64 * 1024 * 1024,
 };
 
 pub const SourceScope = enum {
@@ -86,6 +89,18 @@ pub const IssueCode = enum {
     invalid_invocation_name,
 };
 
+pub const ResourceReason = enum {
+    file_too_large,
+    skill_too_large,
+    too_many_files,
+    too_many_entries,
+    directory_too_deep,
+    path_too_long,
+    unsupported_entry,
+    resource_unavailable,
+    resource_changed,
+};
+
 pub const Health = enum {
     healthy,
     degraded,
@@ -107,6 +122,8 @@ pub const SkillRecord = struct {
 
 pub const Issue = struct {
     code: IssueCode,
+    /// Present exactly when `code == .invalid_resource`.
+    reason: ?ResourceReason,
     invocation_name: ?[]const u8,
     source_scope: SourceScope,
     /// Internal-only stable identity for revision hashing and ordering. This
@@ -130,7 +147,7 @@ pub const Snapshot = struct {
     skills: []const SkillRecord,
     issues: []const Issue,
     descriptor_json: []const u8,
-    snapshot_bytes: usize,
+    content_bytes: usize,
     resident_bytes: usize,
 
     pub fn deinit(self: *Snapshot) void {
@@ -161,18 +178,33 @@ const Candidate = struct {
     invocation_name: []const u8,
     scope: SourceScope,
     priority: u32,
-    kind: File.Kind,
+    state: State,
+
+    const State = union(enum) {
+        ready,
+        invalid_resource: ResourceReason,
+    };
 };
 
 const EntryCopy = struct {
     name: []const u8,
     kind: File.Kind,
+    relative_path_len: usize,
 };
 
-const Counters = struct {
+const WorkBudget = struct {
     visited_entries: usize = 0,
+};
+
+const CandidateUsage = struct {
+    entries: usize = 0,
     file_count: usize = 0,
-    snapshot_bytes: usize = 0,
+    content_bytes: usize = 0,
+};
+
+const CatalogUsage = struct {
+    file_count: usize = 0,
+    content_bytes: usize = 0,
 };
 
 const LocalError = error{
@@ -180,7 +212,15 @@ const LocalError = error{
     ResourceLimit,
     CatalogInvalid,
     InvalidDefinition,
-    InvalidResource,
+    FileTooLarge,
+    SkillTooLarge,
+    TooManyFiles,
+    TooManyEntries,
+    DirectoryTooDeep,
+    PathTooLong,
+    UnsupportedEntry,
+    ResourceUnavailable,
+    ResourceChanged,
 };
 
 pub fn build(
@@ -203,7 +243,7 @@ pub fn build(
         .skills = &.{},
         .issues = &.{},
         .descriptor_json = "",
-        .snapshot_bytes = 0,
+        .content_bytes = 0,
         .resident_bytes = 0,
     };
     errdefer {
@@ -218,10 +258,11 @@ pub fn build(
 
     var candidates: std.ArrayList(Candidate) = .empty;
     var issues: std.ArrayList(Issue) = .empty;
-    var counters = Counters{};
+    var work_budget = WorkBudget{};
+    var catalog_usage = CatalogUsage{};
 
     for (sources) |source| {
-        try enumerateSource(scratch, io, source, limits, &counters, &candidates, &issues);
+        try enumerateSource(scratch, io, source, limits, &work_budget, &candidates, &issues);
     }
     std.mem.sort(Candidate, candidates.items, {}, candidateLessThan);
     std.mem.sort(Issue, issues.items, {}, issueLessThan);
@@ -247,6 +288,7 @@ pub fn build(
         if (top_count != 1) {
             try issues.append(scratch, .{
                 .code = .source_conflict,
+                .reason = null,
                 .invocation_name = invocation_name,
                 .source_scope = group[0].scope,
                 .revision_key = invocation_name,
@@ -255,14 +297,18 @@ pub fn build(
         }
 
         const selected = group[0];
-        if (selected.kind != .directory) {
-            try issues.append(scratch, .{
-                .code = .invalid_resource,
-                .invocation_name = invocation_name,
-                .source_scope = selected.scope,
-                .revision_key = invocation_name,
-            });
-            continue;
+        switch (selected.state) {
+            .ready => {},
+            .invalid_resource => |reason| {
+                try issues.append(scratch, .{
+                    .code = .invalid_resource,
+                    .reason = reason,
+                    .invocation_name = invocation_name,
+                    .source_scope = selected.scope,
+                    .revision_key = invocation_name,
+                });
+                continue;
+            },
         }
         const record = snapshotCandidate(
             arena,
@@ -270,29 +316,35 @@ pub fn build(
             io,
             selected,
             limits,
-            &counters,
-        ) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.ResourceLimit => return error.ResourceLimit,
-            error.CatalogInvalid => return error.CatalogInvalid,
-            error.InvalidDefinition => {
-                try issues.append(scratch, .{
-                    .code = .invalid_definition,
-                    .invocation_name = invocation_name,
-                    .source_scope = selected.scope,
-                    .revision_key = invocation_name,
-                });
-                continue;
-            },
-            error.InvalidResource => {
+            &work_budget,
+            &catalog_usage,
+        ) catch |err| {
+            if (resourceReasonFromError(err)) |reason| {
                 try issues.append(scratch, .{
                     .code = .invalid_resource,
+                    .reason = reason,
                     .invocation_name = invocation_name,
                     .source_scope = selected.scope,
                     .revision_key = invocation_name,
                 });
                 continue;
-            },
+            }
+            switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ResourceLimit => return error.ResourceLimit,
+                error.CatalogInvalid => return error.CatalogInvalid,
+                error.InvalidDefinition => {
+                    try issues.append(scratch, .{
+                        .code = .invalid_definition,
+                        .reason = null,
+                        .invocation_name = invocation_name,
+                        .source_scope = selected.scope,
+                        .revision_key = invocation_name,
+                    });
+                    continue;
+                },
+                else => unreachable,
+            }
         };
         try records.append(arena, record);
     }
@@ -302,7 +354,7 @@ pub fn build(
     try validateUniqueSkillIds(scratch, records.items);
     snapshot.skills = records.toOwnedSlice(arena) catch return error.OutOfMemory;
     snapshot.issues = cloneIssues(arena, issues.items) catch return error.OutOfMemory;
-    snapshot.snapshot_bytes = counters.snapshot_bytes;
+    snapshot.content_bytes = catalog_usage.content_bytes;
     snapshot.health = if (snapshot.issues.len == 0) .healthy else .degraded;
     snapshot.revision = computeRevision(snapshot, workspace_epoch);
     snapshot.descriptor_json = buildDescriptor(arena, snapshot, limits.max_descriptor_bytes) catch |err| switch (err) {
@@ -323,7 +375,7 @@ fn enumerateSource(
     io: std.Io,
     source: Source,
     limits: Limits,
-    counters: *Counters,
+    work_budget: *WorkBudget,
     candidates: *std.ArrayList(Candidate),
     issues: *std.ArrayList(Issue),
 ) BuildError!void {
@@ -343,66 +395,170 @@ fn enumerateSource(
     var iterator = root.iterate();
     while (iterator.next(io) catch return error.CatalogInvalid) |entry| {
         if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
-        counters.visited_entries = std.math.add(usize, counters.visited_entries, 1) catch
-            return error.ResourceLimit;
-        if (counters.visited_entries > limits.max_visited_entries) return error.ResourceLimit;
+        try chargeWork(work_budget, limits);
 
         const kind = if (entry.kind == .unknown)
-            (root.statFile(io, entry.name, .{ .follow_symlinks = false }) catch
-                return error.CatalogInvalid).kind
+            (root.statFile(io, entry.name, .{ .follow_symlinks = false }) catch |err| {
+                try appendCandidate(
+                    arena,
+                    source,
+                    entry.name,
+                    .{ .invalid_resource = discoveryFailureReason(err) },
+                    candidates,
+                    issues,
+                );
+                continue;
+            }).kind
         else
             entry.kind;
         if (kind != .directory) continue;
 
         // A discovery-root entry is a Skill candidate only when its directory
-        // contains a no-follow SKILL.md entry. Ordinary files and directories
-        // must not degrade catalog health or perturb the revision.
-        var candidate_dir = root.openDir(io, entry.name, .{
-            .follow_symlinks = false,
-        }) catch return error.CatalogInvalid;
-        defer candidate_dir.close(io);
-        const candidate_before = candidate_dir.stat(io) catch
-            return error.CatalogInvalid;
-        const has_definition = blk: {
-            const definition = candidate_dir.statFile(io, "SKILL.md", .{
-                .follow_symlinks = false,
-            }) catch |err| switch (err) {
-                error.FileNotFound => break :blk false,
-                else => return error.CatalogInvalid,
-            };
-            _ = definition;
-            break :blk true;
-        };
-        const candidate_after = candidate_dir.stat(io) catch
-            return error.CatalogInvalid;
-        if (!sameDirectoryState(candidate_before, candidate_after))
-            return error.CatalogInvalid;
-        if (!has_definition) continue;
-
-        const invocation = makeInvocationName(arena, source.namespace, entry.name) catch
-            return error.OutOfMemory;
-        if (!validInvocationName(invocation)) {
-            const raw_name_hash = hashHex(invocation);
-            try issues.append(arena, .{
-                .code = .invalid_invocation_name,
-                .invocation_name = null,
-                .source_scope = source.scope,
-                .revision_key = try arena.dupe(u8, &raw_name_hash),
-            });
-            continue;
-        }
-        try candidates.append(arena, .{
-            // Sources are borrowed for the synchronous duration of `build`.
-            .root = source.root,
-            .dir_name = try arena.dupe(u8, entry.name),
-            .invocation_name = invocation,
-            .scope = source.scope,
-            .priority = source.priority,
-            .kind = kind,
-        });
+        // contains a stable no-follow SKILL.md file. A stable ordinary
+        // directory is ignored; an entry that cannot be proven ordinary is a
+        // failed candidate so it remains in priority/no-fallback selection.
+        const state = probeCandidateDirectory(io, root, entry.name) orelse continue;
+        try appendCandidate(arena, source, entry.name, state, candidates, issues);
     }
     const after = root.stat(io) catch return error.CatalogInvalid;
     if (!sameDirectoryState(before, after)) return error.CatalogInvalid;
+}
+
+fn appendCandidate(
+    arena: std.mem.Allocator,
+    source: Source,
+    dir_name: []const u8,
+    state: Candidate.State,
+    candidates: *std.ArrayList(Candidate),
+    issues: *std.ArrayList(Issue),
+) BuildError!void {
+    const invocation = makeInvocationName(arena, source.namespace, dir_name) catch
+        return error.OutOfMemory;
+    if (!validInvocationName(invocation)) {
+        const raw_name_hash = hashHex(invocation);
+        try issues.append(arena, .{
+            .code = .invalid_invocation_name,
+            .reason = null,
+            .invocation_name = null,
+            .source_scope = source.scope,
+            .revision_key = try arena.dupe(u8, &raw_name_hash),
+        });
+        return;
+    }
+    try candidates.append(arena, .{
+        // Sources are borrowed for the synchronous duration of `build`.
+        .root = source.root,
+        .dir_name = try arena.dupe(u8, dir_name),
+        .invocation_name = invocation,
+        .scope = source.scope,
+        .priority = source.priority,
+        .state = state,
+    });
+}
+
+fn probeCandidateDirectory(
+    io: std.Io,
+    root: Dir,
+    dir_name: []const u8,
+) ?Candidate.State {
+    var candidate_dir = root.openDir(io, dir_name, .{
+        .follow_symlinks = false,
+    }) catch |err| return .{ .invalid_resource = discoveryFailureReason(err) };
+    defer candidate_dir.close(io);
+    const candidate_before = candidate_dir.stat(io) catch |err|
+        return .{ .invalid_resource = discoveryFailureReason(err) };
+    if (candidate_before.kind != .directory)
+        return .{ .invalid_resource = .resource_changed };
+
+    const definition = candidate_dir.statFile(io, "SKILL.md", .{
+        .follow_symlinks = false,
+    }) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return .{ .invalid_resource = discoveryFailureReason(err) },
+    };
+    const candidate_after = candidate_dir.stat(io) catch |err|
+        return .{ .invalid_resource = discoveryFailureReason(err) };
+    if (!sameDirectoryState(candidate_before, candidate_after))
+        return .{ .invalid_resource = .resource_changed };
+    const definition_stat = definition orelse return null;
+    if (definition_stat.kind != .file)
+        return .{ .invalid_resource = .unsupported_entry };
+    return .ready;
+}
+
+fn discoveryFailureReason(err: anyerror) ResourceReason {
+    return if (err == error.FileNotFound)
+        .resource_changed
+    else
+        .resource_unavailable;
+}
+
+fn chargeWork(
+    budget: *WorkBudget,
+    limits: Limits,
+) error{ResourceLimit}!void {
+    budget.visited_entries = std.math.add(usize, budget.visited_entries, 1) catch
+        return error.ResourceLimit;
+    if (budget.visited_entries > limits.max_visited_entries)
+        return error.ResourceLimit;
+}
+
+fn checkedRelativePathLength(
+    prefix: []const u8,
+    name: []const u8,
+    limits: Limits,
+) error{ PathTooLong, UnsupportedEntry }!usize {
+    if (name.len == 0 or
+        std.mem.eql(u8, name, ".") or
+        std.mem.eql(u8, name, "..") or
+        !std.unicode.utf8ValidateSlice(name))
+        return error.UnsupportedEntry;
+    const length = if (prefix.len == 0)
+        name.len
+    else blk: {
+        const with_separator = std.math.add(usize, prefix.len, 1) catch
+            return error.PathTooLong;
+        break :blk std.math.add(usize, with_separator, name.len) catch
+            return error.PathTooLong;
+    };
+    if (length > limits.max_relative_path_bytes) return error.PathTooLong;
+    return length;
+}
+
+fn projectCatalogUsage(
+    current: CatalogUsage,
+    candidate: CandidateUsage,
+    limits: Limits,
+) error{ResourceLimit}!CatalogUsage {
+    const file_count = std.math.add(usize, current.file_count, candidate.file_count) catch
+        return error.ResourceLimit;
+    if (file_count > limits.max_catalog_files) return error.ResourceLimit;
+    const content_bytes = std.math.add(usize, current.content_bytes, candidate.content_bytes) catch
+        return error.ResourceLimit;
+    if (content_bytes > limits.max_catalog_content_bytes) return error.ResourceLimit;
+    return .{
+        .file_count = file_count,
+        .content_bytes = content_bytes,
+    };
+}
+
+fn resourceReasonFromError(err: LocalError) ?ResourceReason {
+    return switch (err) {
+        error.FileTooLarge => .file_too_large,
+        error.SkillTooLarge => .skill_too_large,
+        error.TooManyFiles => .too_many_files,
+        error.TooManyEntries => .too_many_entries,
+        error.DirectoryTooDeep => .directory_too_deep,
+        error.PathTooLong => .path_too_long,
+        error.UnsupportedEntry => .unsupported_entry,
+        error.ResourceUnavailable => .resource_unavailable,
+        error.ResourceChanged => .resource_changed,
+        error.OutOfMemory,
+        error.ResourceLimit,
+        error.CatalogInvalid,
+        error.InvalidDefinition,
+        => null,
+    };
 }
 
 fn snapshotCandidate(
@@ -411,14 +567,26 @@ fn snapshotCandidate(
     io: std.Io,
     candidate: Candidate,
     limits: Limits,
-    counters: *Counters,
+    work_budget: *WorkBudget,
+    catalog_usage: *CatalogUsage,
 ) LocalError!SkillRecord {
     var temporary = std.heap.ArenaAllocator.init(temporary_allocator);
     defer temporary.deinit();
     const scratch = temporary.allocator();
+    var candidate_usage = CandidateUsage{};
 
-    const record = try snapshotCandidateTemporary(scratch, io, candidate, limits, counters);
-    return cloneSkillRecord(destination, record);
+    const record = try snapshotCandidateTemporary(
+        scratch,
+        io,
+        candidate,
+        limits,
+        work_budget,
+        &candidate_usage,
+    );
+    const admitted_usage = try projectCatalogUsage(catalog_usage.*, candidate_usage, limits);
+    const cloned = try cloneSkillRecord(destination, record);
+    catalog_usage.* = admitted_usage;
+    return cloned;
 }
 
 fn snapshotCandidateTemporary(
@@ -426,17 +594,18 @@ fn snapshotCandidateTemporary(
     io: std.Io,
     candidate: Candidate,
     limits: Limits,
-    counters: *Counters,
+    work_budget: *WorkBudget,
+    candidate_usage: *CandidateUsage,
 ) LocalError!SkillRecord {
     var root = Dir.openDirAbsolute(io, candidate.root, .{
         .iterate = true,
         .follow_symlinks = false,
-    }) catch return error.CatalogInvalid;
+    }) catch return error.ResourceUnavailable;
     defer root.close(io);
     var skill_dir = root.openDir(io, candidate.dir_name, .{
         .iterate = true,
         .follow_symlinks = false,
-    }) catch return error.InvalidResource;
+    }) catch return error.ResourceUnavailable;
     defer skill_dir.close(io);
 
     var files: std.ArrayList(FileRecord) = .empty;
@@ -448,7 +617,8 @@ fn snapshotCandidateTemporary(
         "",
         0,
         limits,
-        counters,
+        work_budget,
+        candidate_usage,
         &directories,
         &files,
     );
@@ -464,7 +634,7 @@ fn snapshotCandidateTemporary(
             break;
         }
     }
-    const md = definition_bytes orelse return error.InvalidDefinition;
+    const md = definition_bytes orelse return error.ResourceChanged;
     if (!std.unicode.utf8ValidateSlice(md)) return error.InvalidDefinition;
     validateSkillMetadata(md) catch return error.InvalidDefinition;
     const definition = definition_mod.parseSkillMdWithFallback(
@@ -536,6 +706,7 @@ fn cloneIssues(
     for (source, result) |issue, *copy| {
         copy.* = .{
             .code = issue.code,
+            .reason = issue.reason,
             .invocation_name = if (issue.invocation_name) |name|
                 try arena.dupe(u8, name)
             else
@@ -554,23 +725,28 @@ fn snapshotTree(
     prefix: []const u8,
     depth: usize,
     limits: Limits,
-    counters: *Counters,
+    work_budget: *WorkBudget,
+    candidate_usage: *CandidateUsage,
     directories: *std.ArrayList([]const u8),
     files: *std.ArrayList(FileRecord),
 ) LocalError!void {
-    if (depth > limits.max_depth) return error.ResourceLimit;
-    const before = dir.stat(io) catch return error.InvalidResource;
-    if (before.kind != .directory) return error.InvalidResource;
+    if (depth > limits.max_depth) return error.DirectoryTooDeep;
+    const before = dir.stat(io) catch return error.ResourceUnavailable;
+    if (before.kind != .directory) return error.UnsupportedEntry;
     var entries: std.ArrayList(EntryCopy) = .empty;
     var iterator = dir.iterate();
-    while (iterator.next(io) catch return error.InvalidResource) |entry| {
+    while (iterator.next(io) catch return error.ResourceUnavailable) |entry| {
         if (std.mem.eql(u8, entry.name, ".") or std.mem.eql(u8, entry.name, "..")) continue;
-        counters.visited_entries = std.math.add(usize, counters.visited_entries, 1) catch
-            return error.ResourceLimit;
-        if (counters.visited_entries > limits.max_visited_entries) return error.ResourceLimit;
+        try chargeWork(work_budget, limits);
+        candidate_usage.entries = std.math.add(usize, candidate_usage.entries, 1) catch
+            return error.TooManyEntries;
+        if (candidate_usage.entries > limits.max_skill_entries)
+            return error.TooManyEntries;
+        const relative_path_len = try checkedRelativePathLength(prefix, entry.name, limits);
         try entries.append(arena, .{
             .name = try arena.dupe(u8, entry.name),
             .kind = entry.kind,
+            .relative_path_len = relative_path_len,
         });
     }
     std.mem.sort(EntryCopy, entries.items, {}, entryLessThan);
@@ -580,16 +756,16 @@ fn snapshotTree(
             try arena.dupe(u8, entry.name)
         else
             try std.fmt.allocPrint(arena, "{s}/{s}", .{ prefix, entry.name });
-        if (relative_path.len == 0 or relative_path.len > limits.max_relative_path_bytes)
-            return error.ResourceLimit;
+        std.debug.assert(relative_path.len == entry.relative_path_len);
 
         switch (entry.kind) {
             .directory => {
+                if (depth == limits.max_depth) return error.DirectoryTooDeep;
                 try directories.append(arena, relative_path);
                 var child = dir.openDir(io, entry.name, .{
                     .iterate = true,
                     .follow_symlinks = false,
-                }) catch return error.InvalidResource;
+                }) catch return error.ResourceUnavailable;
                 defer child.close(io);
                 try snapshotTree(
                     arena,
@@ -598,23 +774,25 @@ fn snapshotTree(
                     relative_path,
                     depth + 1,
                     limits,
-                    counters,
+                    work_budget,
+                    candidate_usage,
                     directories,
                     files,
                 );
             },
-            .file => try snapshotFile(arena, io, dir, entry.name, relative_path, limits, counters, files),
-            .sym_link => return error.InvalidResource,
+            .file => try snapshotFile(arena, io, dir, entry.name, relative_path, limits, candidate_usage, files),
+            .sym_link => return error.UnsupportedEntry,
             .unknown => {
                 const stat = dir.statFile(io, entry.name, .{ .follow_symlinks = false }) catch
-                    return error.InvalidResource;
+                    return error.ResourceUnavailable;
                 switch (stat.kind) {
                     .directory => {
+                        if (depth == limits.max_depth) return error.DirectoryTooDeep;
                         try directories.append(arena, relative_path);
                         var child = dir.openDir(io, entry.name, .{
                             .iterate = true,
                             .follow_symlinks = false,
-                        }) catch return error.InvalidResource;
+                        }) catch return error.ResourceUnavailable;
                         defer child.close(io);
                         try snapshotTree(
                             arena,
@@ -623,20 +801,21 @@ fn snapshotTree(
                             relative_path,
                             depth + 1,
                             limits,
-                            counters,
+                            work_budget,
+                            candidate_usage,
                             directories,
                             files,
                         );
                     },
-                    .file => try snapshotFile(arena, io, dir, entry.name, relative_path, limits, counters, files),
-                    else => return error.InvalidResource,
+                    .file => try snapshotFile(arena, io, dir, entry.name, relative_path, limits, candidate_usage, files),
+                    else => return error.UnsupportedEntry,
                 }
             },
-            else => return error.InvalidResource,
+            else => return error.UnsupportedEntry,
         }
     }
-    const after = dir.stat(io) catch return error.InvalidResource;
-    if (!sameDirectoryState(before, after)) return error.InvalidResource;
+    const after = dir.stat(io) catch return error.ResourceUnavailable;
+    if (!sameDirectoryState(before, after)) return error.ResourceChanged;
 }
 
 fn snapshotFile(
@@ -646,46 +825,47 @@ fn snapshotFile(
     name: []const u8,
     relative_path: []const u8,
     limits: Limits,
-    counters: *Counters,
+    candidate_usage: *CandidateUsage,
     files: *std.ArrayList(FileRecord),
 ) LocalError!void {
     var file = dir.openFile(io, name, .{
         .allow_directory = false,
         .follow_symlinks = false,
         .resolve_beneath = true,
-    }) catch return error.InvalidResource;
+    }) catch return error.ResourceUnavailable;
     defer file.close(io);
     // Zig 0.16's Windows Threaded backend opens no-follow files with
     // `IO.ASYNCHRONOUS` but currently returns `nonblocking=false`. Correct the
     // local value so positional reads wait for PENDING completion instead of
     // treating it as an impossible synchronous result.
     if (builtin.os.tag == .windows) file.flags.nonblocking = true;
-    const before = file.stat(io) catch return error.InvalidResource;
-    if (before.kind != .file) return error.InvalidResource;
-    if (before.size > limits.max_single_file_bytes) return error.ResourceLimit;
-    const size = std.math.cast(usize, before.size) orelse return error.ResourceLimit;
-    counters.file_count = std.math.add(usize, counters.file_count, 1) catch
-        return error.ResourceLimit;
-    if (counters.file_count > limits.max_files) return error.ResourceLimit;
-    counters.snapshot_bytes = std.math.add(usize, counters.snapshot_bytes, size) catch
-        return error.ResourceLimit;
-    if (counters.snapshot_bytes > limits.max_snapshot_bytes) return error.ResourceLimit;
+    const before = file.stat(io) catch return error.ResourceUnavailable;
+    if (before.kind != .file) return error.UnsupportedEntry;
+    if (before.size > limits.max_file_content_bytes) return error.FileTooLarge;
+    const size = std.math.cast(usize, before.size) orelse return error.FileTooLarge;
+    candidate_usage.file_count = std.math.add(usize, candidate_usage.file_count, 1) catch
+        return error.TooManyFiles;
+    if (candidate_usage.file_count > limits.max_skill_files) return error.TooManyFiles;
+    candidate_usage.content_bytes = std.math.add(usize, candidate_usage.content_bytes, size) catch
+        return error.SkillTooLarge;
+    if (candidate_usage.content_bytes > limits.max_skill_content_bytes)
+        return error.SkillTooLarge;
 
     var read_buffer: [8192]u8 = undefined;
     var reader = file.reader(io, &read_buffer);
-    const read_limit = std.math.add(usize, limits.max_single_file_bytes, 1) catch
+    const read_limit = std.math.add(usize, limits.max_file_content_bytes, 1) catch
         return error.ResourceLimit;
     const bytes = reader.interface.allocRemaining(arena, .limited(read_limit)) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.StreamTooLong => return error.ResourceLimit,
-        else => return error.InvalidResource,
+        error.StreamTooLong => return error.ResourceChanged,
+        else => return error.ResourceUnavailable,
     };
-    if (bytes.len != size) return error.InvalidResource;
-    const after = file.stat(io) catch return error.InvalidResource;
+    if (bytes.len != size) return error.ResourceChanged;
+    const after = file.stat(io) catch return error.ResourceUnavailable;
     if (after.size != before.size or
         after.mtime.nanoseconds != before.mtime.nanoseconds or
         after.ctime.nanoseconds != before.ctime.nanoseconds)
-        return error.InvalidResource;
+        return error.ResourceChanged;
 
     const executable = if (File.Permissions.has_executable_bit)
         (@intFromEnum(before.permissions) & 0o111) != 0
@@ -759,6 +939,11 @@ fn writeDescriptor(writer: *std.Io.Writer, snapshot: *const Snapshot) !void {
             try std.json.Stringify.encodeJsonString(name, .{}, writer)
         else
             try writer.writeAll("null");
+        try writer.writeAll(",\"reason\":");
+        if (issue.reason) |reason|
+            try std.json.Stringify.encodeJsonString(@tagName(reason), .{}, writer)
+        else
+            try writer.writeAll("null");
         try writer.writeAll(",\"source_scope\":");
         try std.json.Stringify.encodeJsonString(@tagName(issue.source_scope), .{}, writer);
         try writer.writeByte('}');
@@ -809,6 +994,7 @@ fn computeRevision(snapshot: *const Snapshot, workspace_epoch: []const u8) [64]u
     for (snapshot.issues) |issue| {
         hashField(&hash, "issue");
         hashField(&hash, @tagName(issue.code));
+        hashField(&hash, if (issue.reason) |reason| @tagName(reason) else "");
         hashField(&hash, issue.revision_key);
         hashField(&hash, @tagName(issue.source_scope));
     }
@@ -942,6 +1128,10 @@ fn issueLessThan(_: void, lhs: Issue, rhs: Issue) bool {
     if (by_revision_key != .eq) return by_revision_key == .lt;
     const by_code = std.mem.order(u8, @tagName(lhs.code), @tagName(rhs.code));
     if (by_code != .eq) return by_code == .lt;
+    const lhs_reason = if (lhs.reason) |reason| @tagName(reason) else "";
+    const rhs_reason = if (rhs.reason) |reason| @tagName(reason) else "";
+    const by_reason = std.mem.order(u8, lhs_reason, rhs_reason);
+    if (by_reason != .eq) return by_reason == .lt;
     return std.mem.lessThan(u8, @tagName(lhs.source_scope), @tagName(rhs.source_scope));
 }
 
@@ -959,6 +1149,25 @@ fn fileLessThan(_: void, lhs: FileRecord, rhs: FileRecord) bool {
 
 fn stringLessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
     return std.mem.lessThan(u8, lhs, rhs);
+}
+
+fn createTestDir(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    parts: []const []const u8,
+) !void {
+    try Dir.cwd().createDirPath(io, try std.fs.path.join(arena, parts));
+}
+
+fn writeTestFile(
+    arena: std.mem.Allocator,
+    io: std.Io,
+    parts: []const []const u8,
+    data: []const u8,
+) !void {
+    const path = try std.fs.path.join(arena, parts);
+    if (std.fs.path.dirname(path)) |parent| try Dir.cwd().createDirPath(io, parent);
+    try Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data });
 }
 
 test "invocation grammar is intentionally wider than provider tool names" {
@@ -1189,7 +1398,7 @@ test "catalog identity validation rejects duplicates and preserves allocation fa
     );
 }
 
-test "catalog limits fail the whole query before publishing a partial snapshot" {
+test "candidate resource limits degrade while catalog limits fail the whole query" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1204,13 +1413,228 @@ test "catalog limits fail the whole query before publishing a partial snapshot" 
     try Dir.cwd().writeFile(io, .{ .sub_path = md_path, .data = "---\nname: One\n---\nbody" });
     const sources = [_]Source{.{ .root = root, .scope = .project, .priority = 1 }};
     const scope_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const degraded = try build(
+        std.testing.allocator,
+        io,
+        scope_id,
+        "epoch",
+        &sources,
+        .{ .max_file_content_bytes = 1 },
+    );
+    defer degraded.deinit();
+    try std.testing.expectEqual(Health.degraded, degraded.health);
+    try std.testing.expectEqual(@as(usize, 0), degraded.skills.len);
+    try std.testing.expectEqual(@as(usize, 1), degraded.issues.len);
+    try std.testing.expectEqual(IssueCode.invalid_resource, degraded.issues[0].code);
+    try std.testing.expectEqual(ResourceReason.file_too_large, degraded.issues[0].reason.?);
     try std.testing.expectError(
         error.ResourceLimit,
-        build(std.testing.allocator, io, scope_id, "epoch", &sources, .{ .max_single_file_bytes = 1 }),
+        build(std.testing.allocator, io, scope_id, "epoch", &sources, .{ .max_catalog_content_bytes = 1 }),
     );
     try std.testing.expectError(
         error.ResourceLimit,
         build(std.testing.allocator, io, scope_id, "epoch", &sources, .{ .max_descriptor_bytes = 1 }),
+    );
+}
+
+test "one oversized Skill does not poison siblings in the same source" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    const a_md = "---\nname: A\n---\na";
+    const b_md = "---\nname: B\n---\nb";
+    const c_md = "---\nname: C\n---\nc";
+    inline for (.{ .{ "a", a_md }, .{ "b", b_md }, .{ "c", c_md } }) |fixture| {
+        const skill_dir = try std.fs.path.join(allocator, &.{ root, fixture[0] });
+        defer allocator.free(skill_dir);
+        try Dir.cwd().createDirPath(io, skill_dir);
+        const md_path = try std.fs.path.join(allocator, &.{ skill_dir, "SKILL.md" });
+        defer allocator.free(md_path);
+        try Dir.cwd().writeFile(io, .{ .sub_path = md_path, .data = fixture[1] });
+    }
+    const oversized_path = try std.fs.path.join(allocator, &.{ root, "b", "oversized.bin" });
+    defer allocator.free(oversized_path);
+    try Dir.cwd().writeFile(io, .{ .sub_path = oversized_path, .data = "x" ** 65 });
+
+    const sources = [_]Source{.{ .root = root, .scope = .project, .priority = 1 }};
+    const scope_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const snapshot = try build(allocator, io, scope_id, "epoch", &sources, .{
+        .max_file_content_bytes = 64,
+        .max_skill_content_bytes = 128,
+        .max_catalog_content_bytes = a_md.len + c_md.len,
+    });
+    defer snapshot.deinit();
+
+    try std.testing.expectEqual(Health.degraded, snapshot.health);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.skills.len);
+    try std.testing.expectEqualStrings("a", snapshot.skills[0].invocation_name);
+    try std.testing.expectEqualStrings("c", snapshot.skills[1].invocation_name);
+    try std.testing.expectEqual(a_md.len + c_md.len, snapshot.content_bytes);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.issues.len);
+    try std.testing.expectEqualStrings("b", snapshot.issues[0].invocation_name.?);
+    try std.testing.expectEqual(IssueCode.invalid_resource, snapshot.issues[0].code);
+    try std.testing.expectEqual(ResourceReason.file_too_large, snapshot.issues[0].reason.?);
+    try std.testing.expect(std.mem.indexOf(u8, snapshot.descriptor_json, "\"reason\":\"file_too_large\"") != null);
+}
+
+test "per-Skill entry limit is local and checked before sibling admission" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_len];
+
+    inline for (.{ "a", "b", "c" }) |name| {
+        const skill_dir = try std.fs.path.join(allocator, &.{ root, name });
+        defer allocator.free(skill_dir);
+        try Dir.cwd().createDirPath(io, skill_dir);
+        const md_path = try std.fs.path.join(allocator, &.{ skill_dir, "SKILL.md" });
+        defer allocator.free(md_path);
+        try Dir.cwd().writeFile(io, .{ .sub_path = md_path, .data = "---\nname: Skill\n---\nbody" });
+    }
+    const extra_path = try std.fs.path.join(allocator, &.{ root, "b", "extra.txt" });
+    defer allocator.free(extra_path);
+    try Dir.cwd().writeFile(io, .{ .sub_path = extra_path, .data = "extra" });
+
+    const sources = [_]Source{.{ .root = root, .scope = .project, .priority = 1 }};
+    const scope_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const snapshot = try build(allocator, io, scope_id, "epoch", &sources, .{
+        .max_skill_entries = 1,
+    });
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, 2), snapshot.skills.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.issues.len);
+    try std.testing.expectEqual(ResourceReason.too_many_entries, snapshot.issues[0].reason.?);
+}
+
+test "candidate discovery failure is local and does not fall back" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    var paths = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer paths.deinit();
+    const a = paths.allocator();
+    const low = try std.fs.path.join(a, &.{ root, "low" });
+    const high = try std.fs.path.join(a, &.{ root, "high" });
+    try writeTestFile(a, io, &.{ low, "review", "SKILL.md" }, "---\nname: Low Review\n---\nlow");
+    try createTestDir(a, io, &.{ high, "review", "SKILL.md" });
+    try writeTestFile(a, io, &.{ high, "good", "SKILL.md" }, "---\nname: Good\n---\ngood");
+
+    const sources = [_]Source{
+        .{ .root = low, .scope = .personal, .priority = 1 },
+        .{ .root = high, .scope = .project, .priority = 2 },
+    };
+    const scope_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const snapshot = try build(std.testing.allocator, io, scope_id, "epoch", &sources, .{});
+    defer snapshot.deinit();
+
+    try std.testing.expectEqual(Health.degraded, snapshot.health);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.skills.len);
+    try std.testing.expectEqualStrings("good", snapshot.skills[0].invocation_name);
+    try std.testing.expect(snapshot.findByInvocation("review") == null);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.issues.len);
+    try std.testing.expectEqualStrings("review", snapshot.issues[0].invocation_name.?);
+    try std.testing.expectEqual(ResourceReason.unsupported_entry, snapshot.issues[0].reason.?);
+    try std.testing.expectEqual(ResourceReason.resource_changed, discoveryFailureReason(error.FileNotFound));
+    try std.testing.expectEqual(ResourceReason.resource_unavailable, discoveryFailureReason(error.AccessDenied));
+}
+
+test "candidate resource reasons are isolated from a valid sibling" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    var paths = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer paths.deinit();
+    const a = paths.allocator();
+    const skill_md = "---\nname: X\n---\nx";
+
+    inline for (.{ "good", "file-large", "skill-large", "files-many", "deep", "path-long" }) |name| {
+        try writeTestFile(a, io, &.{ root, name, "SKILL.md" }, skill_md);
+    }
+    try writeTestFile(a, io, &.{ root, "file-large", "asset.bin" }, "x" ** 65);
+    try writeTestFile(a, io, &.{ root, "skill-large", "asset.bin" }, "x" ** 32);
+    inline for (.{ "a", "b" }) |name| {
+        try writeTestFile(a, io, &.{ root, "files-many", name }, "");
+    }
+    try createTestDir(a, io, &.{ root, "deep", "one", "two" });
+    try writeTestFile(a, io, &.{ root, "path-long", "123456789012345678901" }, "");
+
+    const sources = [_]Source{.{ .root = root, .scope = .project, .priority = 1 }};
+    const scope_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const snapshot = try build(std.testing.allocator, io, scope_id, "epoch", &sources, .{
+        .max_file_content_bytes = 64,
+        .max_skill_content_bytes = 48,
+        .max_skill_files = 2,
+        .max_depth = 1,
+        .max_relative_path_bytes = 20,
+    });
+    defer snapshot.deinit();
+
+    try std.testing.expectEqual(Health.degraded, snapshot.health);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.skills.len);
+    try std.testing.expectEqualStrings("good", snapshot.skills[0].invocation_name);
+    const expected = [_]struct { name: []const u8, reason: ResourceReason }{
+        .{ .name = "file-large", .reason = .file_too_large },
+        .{ .name = "files-many", .reason = .too_many_files },
+        .{ .name = "deep", .reason = .directory_too_deep },
+        .{ .name = "path-long", .reason = .path_too_long },
+        .{ .name = "skill-large", .reason = .skill_too_large },
+    };
+    try std.testing.expectEqual(expected.len, snapshot.issues.len);
+    for (expected) |want| {
+        var found = false;
+        for (snapshot.issues) |issue| {
+            if (!std.mem.eql(u8, issue.invocation_name orelse continue, want.name)) continue;
+            found = true;
+            try std.testing.expectEqual(want.reason, issue.reason.?);
+            break;
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "definition loss after discovery is resource_changed" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buffer);
+    const root = root_buffer[0..root_len];
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try createTestDir(arena.allocator(), io, &.{ root, "review" });
+    var work_budget = WorkBudget{};
+    var usage = CandidateUsage{};
+    try std.testing.expectError(
+        error.ResourceChanged,
+        snapshotCandidateTemporary(
+            arena.allocator(),
+            io,
+            .{
+                .root = root,
+                .dir_name = "review",
+                .invocation_name = "review",
+                .scope = .project,
+                .priority = 1,
+                .state = .ready,
+            },
+            .{},
+            &work_budget,
+            &usage,
+        ),
     );
 }
 
@@ -1367,4 +1791,5 @@ test "selected skill tree never follows symbolic links" {
     try std.testing.expectEqual(Health.degraded, catalog.health);
     try std.testing.expectEqual(@as(usize, 0), catalog.skills.len);
     try std.testing.expectEqual(IssueCode.invalid_resource, catalog.issues[0].code);
+    try std.testing.expectEqual(ResourceReason.unsupported_entry, catalog.issues[0].reason.?);
 }

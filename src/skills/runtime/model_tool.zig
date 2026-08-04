@@ -228,7 +228,7 @@ test "model Skill surface omits disabled records while catalog stays intact" {
         .skills = &records,
         .issues = &.{},
         .descriptor_json = "",
-        .snapshot_bytes = 0,
+        .content_bytes = 0,
         .resident_bytes = 0,
     };
     defer snapshot.arena.deinit();
