@@ -427,6 +427,32 @@ paths, policy internals, or execution mode. Isolated invalid slots produce
 `OK + degraded`; failure to prove the whole snapshot returns
 `SKILL_CATALOG_INVALID` and no partial handle or descriptor.
 
+An `invalid_resource` issue always carries a typed `reason`; every other issue
+code carries `reason: null`. The resource reasons are `file_too_large`,
+`skill_too_large`, `too_many_files`, `too_many_entries`,
+`directory_too_deep`, `path_too_long`, `unsupported_entry`,
+`resource_unavailable`, and `resource_changed`. A failing selected Skill never
+falls back to a lower-priority candidate with the same invocation name.
+
+An absent source root contributes no candidates. Any other failure to open,
+enumerate, or prove the stability of a source root is a catalog-global
+discovery failure. Failure to open or stably inspect one entry below that root
+is a failed candidate: it remains subject to normal
+invocation-name precedence and, if selected, produces a local resource issue.
+An uncertain higher-priority candidate therefore never silently exposes a
+lower-priority Skill with the same invocation name.
+
+Resource accounting includes every regular file below the selected Skill root,
+including `SKILL.md` and hidden files; no ignore file is applied. Every regular
+file counts toward entry, traversal, file, and content limits. Directories and
+special entries count only toward the per-Skill entry and catalog traversal
+limits. Symlinks and other special entries produce `unsupported_entry`.
+Relative paths use UTF-8 bytes, `/` separators, no Unicode normalization, and
+no case folding. MiB means `1024 * 1024` bytes. The initial source enumeration
+defines the candidates for one query; later additions are observed by a
+subsequent query. Atomicity means that the completed immutable snapshot is
+published once, not that the Host filesystem is transactional.
+
 Default AgentCore discovery reads exactly
 `<workspace_home>/.agents/skills` and `<workspace_root>/.agents/skills`, with
 the project root winning an invocation-name collision. It does not implicitly
@@ -710,12 +736,15 @@ allocations or unbounded work:
 | total Runtime metadata | 16 MiB |
 | total Session metadata | 4 MiB |
 | one TextInput prompt | 16 MiB |
-| valid Skills per catalog | 1024 |
+| Skill invocation slots per catalog | 1024 |
 | one Skill argument array / JSON | 64 values / 1 MiB |
 | one catalog descriptor | 4 MiB |
-| one catalog snapshot / Runtime live snapshots | 64 MiB / 256 MiB |
-| one Skill file / files per snapshot | 4 MiB / 16384 |
-| catalog traversal entries / depth | 65536 / 64 |
+| one Skill file / total content per Skill | 16 MiB / 32 MiB |
+| files / entries per Skill | 1024 / 4096 |
+| total catalog content / files | 64 MiB / 16384 |
+| catalog traversal entries | 65536 |
+| Skill directory depth / relative path | 64 / 4096 UTF-8 bytes |
+| retained Skill catalog snapshots per Runtime | 256 MiB resident bytes |
 | active materializations per Runtime | 256 MiB |
 | MCP Runtime servers / canonical tools | 64 / 1024 |
 | MCP local-schema container entries / validation work units | 256 / 65536 |

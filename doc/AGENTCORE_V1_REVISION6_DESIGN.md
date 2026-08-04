@@ -78,7 +78,7 @@ Revision 6 的实现范围默认限制在 AgentCore-owned 层：
 
 ### 0.4 Shared Core necessity records
 
-最终 scope audit 确认 Revision 6 除 AgentCore-owned、SDK、测试、构建和文档外，只修改了以下四个 shared Core 文件。它们是实现 canonical Session/Permission 语义所需的窄 seam，不包含 AgentCore wire、MCP adapter 或 Host persistence policy：
+最终 scope audit 确认 Revision 6 除 AgentCore-owned、SDK、测试、构建和文档外，只修改了以下五个 shared Core 文件。它们是实现 canonical Session/Permission 与 Skill catalog 语义所需的窄 seam，不包含 AgentCore wire、MCP adapter 或 Host persistence policy：
 
 | Shared Core 文件 | 现有 seam 缺口 | 最小改动与必要性 | 受影响 caller | 验证与默认行为 |
 |---|---|---|---|---|
@@ -86,6 +86,7 @@ Revision 6 的实现范围默认限制在 AgentCore-owned 层：
 | `src/permission/decision.zig` | shared matcher 能算 imported deny/ask/allow，但没有把该 canonical 结果交给 AgentCore logical-Session grants；在 AgentCore 重写 matcher 会复制 1200+ 行 specifier 语义 | 增加可空 `DecisionOverride`，只传 Tool identity、arguments 与 imported action；null 时原决策链不变。显式 settings deny、Core safety、active Skill narrowing 和 shared Session deny 被标记为 fixed authority，seam 只观察而不能替换；只有普通 settings ask/allow/undecided 路径可由 AgentCore 完成。AgentCore 的 generation、grant 和 provenance 仍留在 `src/agentcore/**` | 只有 AgentCore Session 与受限 child lease 设置非空 override；CLI/App 保持 null | unit 证明 null inert、imported action 完整传递；恶意 override 返回 allow 仍不能改写 explicit deny/shared ceiling；Permission matrix、fresh Session、rules update 和 child authority 测试覆盖非空路径 |
 | `src/permission.zig` | public shared `PermissionContext` 无法装配上述窄 seam | 只重导出 override 类型并把可空字段传给 decision 层，不新增产品 mode、规则或持久化行为 | 同上 | 原产品 caller 无需修改；CLI/App 行为基线由 null 默认和既有测试保持 |
 | `src/permission/prompt.zig` | `no_interactive_prompt` 只在没有 requester 时阻止交互；requester 返回 unavailable/cancelled/异常后仍可能落到进程 answer queue 或 stdin，破坏嵌入库的输入所有权 | 把 `no_interactive_prompt` 定义为绝对边界：requester 没有产生 answered response 时直接 fail closed，且 process queue/`askText` 均不可达。不改变默认 `false` 的产品交互路径 | AgentCore Session、无交互 child/teammate 使用该边界；CLI/TUI/Web 默认路径保持原值 | 确定性测试预装 `y` answer queue 并让 requester 返回 unavailable，断言 deny 且输入未被消费；既有交互测试继续覆盖默认路径 |
+| `src/skills/runtime/catalog.zig` | 共享 scanner 已有 per-candidate temporary arena，但单文件、文件数和内容计数仍混入 catalog-global counters，使一个超限 Skill 中止整轮 query；AgentCore 侧复制 scanner 会制造第二真理源 | 在 shared canonical catalog 中分离 `WorkBudget`、`CandidateUsage` 与 `CatalogUsage`；已选 Skill 的资源失败形成 typed reason 并继续，只有 catalog-global admission 失败整轮终止。共享 source policy、precedence、parser、snapshot 和 activation 语义不变 | AgentCore 与 CLI adapter 都使用相同 canonical 隔离语义；不修改 CLI/TUI/Web 产品层代码 | shared scanner 的 A/B/C 同目录隔离与 global no-partial 测试，加 AgentCore public ABI reason 解码测试 |
 
 `git diff e043575 -- src/core/agent_loop.zig` 为空；Provider turn loop、通用 Tool execution、CLI/TUI/Web 产品层也没有 Revision 6 diff。上述 necessity records 不授权未来继续扩张 shared Core；任何新增 seam 仍需重新审计。
 
@@ -104,6 +105,16 @@ Revision 6 的实现范围默认限制在 AgentCore-owned 层：
 | negotiation 假分支和 allocator 漂移 | 删除生产路径不可达的“明确 legacy response”观察；只以格式正确的 `MethodNotFound`/stdio timeout/child exit 进入 legacy 候选；probe 使用 Runtime allocator，OOM 不伪装 transport failure |
 
 评审同时暴露一个仍需单独设计的 shared seam：public Permission provenance 已区分 `user_cancelled` 与 `unavailable`，但通用 `agent_loop` 仍通过 bool prompt 结果生成同一普通拒绝 Tool result。Revision 6 不为修文案越过第 0.3 节修改 `agent_loop`；Ledger E8 记录该模型可见差异和后续 typed prompt-outcome seam 的触发条件。
+
+### 0.6 Skill catalog 资源失败隔离补充
+
+Revision 6 对既有 Skill catalog 能力补齐公开资源合同，不引入新的 Skill 子系统。每个经过现有 source precedence 选中的最高优先级 invocation slot 独立审核；失败候选仍参与 precedence，且不回退同名低优先级候选。局部资源失败形成 `invalid_resource + reason`、`OK + degraded`，同一 source 中的合法兄弟继续发布。尚不存在的 source root 按空 source 处理；已存在 root 的打开、完整遍历或枚举期稳定性无法证明属于全局 discovery 失败。root 下单个候选目录无法打开、探测或稳定确认则形成 failed candidate，由选中阶段投影为局部 issue。只有 catalog content/files/slots/traversal/descriptor 全局预算、source root discovery 完整性、OOM 等 Runtime 级错误终止整轮，并且不发布 partial snapshot。
+
+公开限制为：单文件 16 MiB；单 Skill 32 MiB content、1024 files、4096 entries；目录深度 64；相对路径 4096 UTF-8 bytes；catalog 64 MiB content、16384 files、1024 slots、65536 traversal entries；descriptor 4 MiB；每 Runtime retained snapshots 256 MiB。`content_bytes`、`descriptor_bytes` 与 `resident_bytes` 是不同预算。所有 regular files（包括 `SKILL.md` 和隐藏文件）同时计入 entries、traversal、files 与 content；目录和特殊 entry 只计入 entries/traversal；symlink 和特殊 entry 产生 `unsupported_entry`。不应用隐式 ignore、Unicode normalization 或大小写折叠。
+
+资源 reason 固定为 `file_too_large`、`skill_too_large`、`too_many_files`、`too_many_entries`、`directory_too_deep`、`path_too_long`、`unsupported_entry`、`resource_unavailable` 与 `resource_changed`，且只允许出现在 `invalid_resource` issue；reason 参与 catalog revision。首次 source 枚举定义本轮候选集合，构建完成后不再为制造虚假的 filesystem transaction 而二次枚举；原子性只保证 immutable snapshot 一次发布。AgentCore Runtime 使用独立 build gate 串行同一 Runtime 的 filesystem build，不持有生命周期主锁执行 I/O，也不新增公共 reservation 状态机。
+
+相对实现基线的可见修正明确记录为：单文件上限由 4 MiB 调整为公开的 16 MiB；非 UTF-8 相对路径不再静默接纳，而是形成 `unsupported_entry`；已发现资源在读取期间消失、变型或增长不再升级为全局失败，而是形成候选局部 `resource_changed`。这些是 Revision 6 发布前的合同修正，不引入旧行为兼容或迁移分支。
 
 ## 1. 整体架构边界
 
@@ -1092,7 +1103,7 @@ Host-visible identifier 的 reference-closure audit 结论：
 | `server_binding_identity` | Runtime MCP catalog | catalog Tool、Session MCP view、RestoreReport/Session issue | server/tool identity 相等；degraded issue 回指原 catalog binding |
 | authority/catalog `issue_id` | Runtime refresh 或 restore reconciliation | Runtime catalog、`RestoreReport`、`session_describe.restore.issues` | RestoreReport 与 Session description 暴露同一稳定 issue identity 和 binding |
 
-scope audit 以 `e043575` 为 Revision 6 基线：允许范围外只有第 0.4 节登记的四个 shared Core seam；`src/core/agent_loop.zig`、产品层和旧 `src/mcp` 均为零 diff。hard-cut symbol gate 与 source-free consumers 证明 Revision 5 table、DTO、alias、shim 和 multi-revision dispatch 不存在。
+scope audit 以 `e043575` 为 Revision 6 基线：允许范围外只有第 0.4 节登记的五个 shared Core seam；`src/core/agent_loop.zig`、产品层和旧 `src/mcp` 均为零 diff。hard-cut symbol gate 与 source-free consumers 证明 Revision 5 table、DTO、alias、shim 和 multi-revision dispatch 不存在。
 
 ## 9. 当前结论
 
@@ -1108,7 +1119,7 @@ Permission 不负责 Sandbox，Session restore 不负责存储系统，MCP trans
 
 Revision 6 对 AgentCore ABI 是完全 hard cut，不提供任何旧 revision 兼容；实现默认收敛在 AgentCore-owned 层，`agent_loop` 等通用执行层不属于本方案修改范围。MCP `2025-11-25` 的单代 adapter 是外部协议互操作，不改变这两个约束。
 
-Revision 6 的三个目标、exact wire、默认值、DTO、跨语言 SDK、source-free consumer 和 conformance/governance 门均已闭合。后续能力必须进入新的显式 ABI revision，不得继续修改 Revision 6 reserved 字段或 JSON wire。CLI/App 与 AgentCore 的并行语义路径作为 Ledger E5 的显式债务继续管理，不能以“消债”为由回改本 revision 或扩大其实现范围。
+Revision 6 的三个主目标已经闭合；第 0.6 节是在发布前修正既有 Skill catalog 的失败隔离与资源合同，不新增能力类别、不提供旧形状兼容，也不改变 ABI revision。该补充通过跨语言 SDK、source-free consumer 和 conformance/governance 门后，后续新能力仍必须进入新的显式 ABI revision。CLI/App 与 AgentCore 的 Permission/MCP 并行语义路径作为 Ledger E5 的显式债务继续管理，不能以“消债”为由扩大本次 Skill 修正范围。
 
 ## 10. 参考依据（非规范性）
 
