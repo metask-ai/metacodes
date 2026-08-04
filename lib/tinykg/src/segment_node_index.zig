@@ -1,8 +1,10 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const core = @import("core.zig");
 const segment_catalog_summary = @import("segment_catalog_summary.zig");
 const segment_manifest = @import("segment_manifest.zig");
 const segment_executor = @import("ql/segment_executor.zig");
+const read_only_memory_map = @import("read_only_memory_map.zig");
 
 pub const exact_texts_leaf = "segment_node_texts.idx";
 pub const nodes_by_id_leaf = "segment_nodes_by_id.idx";
@@ -320,11 +322,7 @@ const MappedFileView = struct {
         if (stat.kind != .file) return error.InvalidRecord;
         if (stat.size > max_size) return error.RecordTooLarge;
         const len = std.math.cast(usize, stat.size) orelse return error.RecordTooLarge;
-        const map = if (len == 0) null else try std.Io.File.MemoryMap.create(io, file, .{
-            .len = len,
-            .protection = .{ .read = true, .write = false },
-            .populate = false,
-        });
+        const map = if (len == 0) null else try read_only_memory_map.create(io, file, len);
         return .{
             .io = io,
             .file = file,
@@ -2003,6 +2001,13 @@ test "segment node index writes durable catalog and drives one-hop segment execu
 
     var mapped_catalog = try MappedCatalog.open(std.testing.io, dir_path);
     defer mapped_catalog.deinit();
+    if (builtin.os.tag == .windows) {
+        // Do not silently regress to Threaded's heap-backed fallback: the
+        // catalog must exercise a real Windows section mapping.
+        try std.testing.expect(mapped_catalog.texts.map.?.section != null);
+        try std.testing.expect(mapped_catalog.nodes_by_id.map.?.section != null);
+        try std.testing.expect(mapped_catalog.exact_texts.map.?.section != null);
+    }
     const summary = mapped_catalog.summary();
     var mapped_ids = try mapped_catalog.lookupExact(std.testing.allocator, .file, "src/main.zig", 8);
     defer mapped_ids.deinit(std.testing.allocator);

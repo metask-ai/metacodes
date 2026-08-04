@@ -514,7 +514,11 @@ fn collectDeltaSegmentEdgeRefs(
         .out = &out,
         .max_records = max_records,
     };
-    _ = try store.forEachOpenedPublishedEdgeSegmentNeighbor(edge_segments, direction, node_id, rel_filter, max_records, &collect_context, struct {
+    // Tombstones are filtered inside the storage callback adapter. Keep the
+    // visible-result cap in this collector, but allow the bounded default scan
+    // budget to skip deleted physical records before a live delta edge.
+    const scan_limit = @max(max_records, (core.QueryBudget{}).max_visited_edges);
+    _ = try store.forEachOpenedPublishedEdgeSegmentNeighbor(edge_segments, direction, node_id, rel_filter, scan_limit, &collect_context, struct {
         fn visit(collect_ctx: *SegmentCollectContext, edge: segment_mod.EdgeRecord) !bool {
             if (collect_ctx.out.items.len >= collect_ctx.max_records) return core.Error.BudgetExceeded;
             try collect_ctx.out.append(collect_ctx.allocator, segmentEdgeToRef(edge));
@@ -1996,6 +2000,49 @@ test "persistent neighbors hide tombstoned edges from opened published segment" 
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(std.testing.io, store.edge_by_src_path, .{}));
 }
 
+test "persistent delta lookup counts visible edges after tombstone filtering" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+    const segment_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "edge-base" });
+    defer std.testing.allocator.free(segment_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+
+    const base_src = core.NodeId.fromInt(1);
+    const base_dst = core.NodeId.fromInt(2);
+    const delta_src = core.NodeId.fromInt(3);
+    const deleted_dst = core.NodeId.fromInt(4);
+    const live_dst = core.NodeId.fromInt(5);
+    try store.appendNodesBatch(&.{
+        .{ .id = base_src, .kind = .file, .text = "base source" },
+        .{ .id = base_dst, .kind = .function, .text = "base target" },
+        .{ .id = delta_src, .kind = .file, .text = "delta source" },
+        .{ .id = deleted_dst, .kind = .function, .text = "deleted target" },
+        .{ .id = live_dst, .kind = .function, .text = "live target" },
+    });
+    try store.appendEdge(.{ .id = .fromInt(1), .src = base_src, .dst = base_dst, .rel = .defines });
+    try std.testing.expectEqual(@as(u64, 1), try store.publishEdgeAdjacencySegment(segment_path));
+    try store.appendEdgesBatch(&.{
+        .{ .id = .fromInt(2), .src = delta_src, .dst = deleted_dst, .rel = .defines },
+        .{ .id = .fromInt(3), .src = delta_src, .dst = live_dst, .rel = .defines },
+    });
+    try store.deleteEdge(.fromInt(2));
+
+    var refs = try readPersistentStoreEdgeRefsLimited(std.testing.allocator, std.testing.allocator, store, .src, delta_src, 1);
+    defer refs.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), refs.items.len);
+    try std.testing.expectEqual(@as(u64, 3), refs.items[0].edge_id.toInt());
+    try std.testing.expectEqual(live_dst, refs.items[0].dst);
+}
+
 test "persistent neighbors use visible full compacted segment after tombstone" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2765,8 +2812,10 @@ test "path persistent store repairs corrupt node catalog" {
     const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
     defer std.testing.allocator.free(store_path);
 
-    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
-    store.options.validate_indexes_on_read = true;
+    var store = try storage.Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .primary_text_write_mode = .bulk_ingest,
+        .validate_indexes_on_read = true,
+    });
     defer store.deinit();
     try store.createEmpty();
 

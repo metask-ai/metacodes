@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("core.zig");
 const schema = @import("schema.zig");
+const read_only_memory_map = @import("read_only_memory_map.zig");
 
 const dense_edge_id_validation_factor: u64 = 2;
 const dense_edge_id_validation_min: u64 = 4096;
@@ -903,11 +904,7 @@ const CsrFileView = struct {
         if (stat.kind != .file) return error.InvalidRecord;
         const len = std.math.cast(usize, stat.size) orelse return error.RecordTooLarge;
 
-        const map = if (len == 0) null else std.Io.File.MemoryMap.create(io, file, .{
-            .len = len,
-            .protection = .{ .read = true, .write = false },
-            .populate = false,
-        }) catch null;
+        const map = if (len == 0) null else read_only_memory_map.create(io, file, len) catch null;
 
         return .{
             .io = io,

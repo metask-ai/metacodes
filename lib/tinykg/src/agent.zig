@@ -19,6 +19,7 @@ pub const IdleMaintenancePolicy = struct {
     node_text_delta_max_records: u64 = 0,
     node_text_run_every_ops: usize = 0,
     node_text_run_max_records: u64 = 0,
+    primary_text_finalize_every_ops: usize = 0,
 
     pub const disabled = IdleMaintenancePolicy{};
     pub const edge_l0_maint10s16e64 = IdleMaintenancePolicy{
@@ -50,6 +51,12 @@ pub const IdleMaintenancePolicy = struct {
             completed_append_ops != 0 and
             completed_append_ops % self.node_text_run_every_ops == 0;
     }
+
+    pub fn shouldFinalizePrimaryText(self: IdleMaintenancePolicy, completed_append_ops: usize) bool {
+        return self.primary_text_finalize_every_ops != 0 and
+            completed_append_ops != 0 and
+            completed_append_ops % self.primary_text_finalize_every_ops == 0;
+    }
 };
 
 pub const IdleMaintenanceResult = struct {
@@ -61,6 +68,8 @@ pub const IdleMaintenanceResult = struct {
     node_text_delta: storage.NodeTextDeltaMaintenanceResult = .{ .compacted = false },
     node_text_runs_ran: bool = false,
     node_text_runs: storage.NodeTextRunMaintenanceResult = .{ .compacted = false },
+    primary_text_finalize_ran: bool = false,
+    primary_text_finalize: storage.NodeTextsCompressionResult = .{},
 };
 
 pub const IdleMaintenanceStats = struct {
@@ -84,13 +93,16 @@ pub const IdleMaintenanceStats = struct {
     node_text_run_records_before_last: u64 = 0,
     node_text_run_records_after_last: u64 = 0,
     node_text_run_gc_deleted_runs: u64 = 0,
+    primary_text_finalizations: usize = 0,
+    primary_text_bytes_before_last: u64 = 0,
+    primary_text_bytes_after_last: u64 = 0,
 
     fn recordAppend(self: *IdleMaintenanceStats) !void {
         self.append_ops = std.math.add(usize, self.append_ops, 1) catch return error.RecordTooLarge;
     }
 
     fn recordMaintenance(self: *IdleMaintenanceStats, result: IdleMaintenanceResult) !void {
-        if (!result.edge_l0_ran and !result.edge_gc_ran and !result.node_text_delta_ran and !result.node_text_runs_ran) return;
+        if (!result.edge_l0_ran and !result.edge_gc_ran and !result.node_text_delta_ran and !result.node_text_runs_ran and !result.primary_text_finalize_ran) return;
         self.maintenance_ops = std.math.add(usize, self.maintenance_ops, 1) catch return error.RecordTooLarge;
         if (result.edge_l0_ran) {
             self.maintenance_entries_before_last = result.edge_l0.manifest_entries_before;
@@ -124,6 +136,13 @@ pub const IdleMaintenanceStats = struct {
                 self.node_text_run_compactions = std.math.add(usize, self.node_text_run_compactions, 1) catch return error.RecordTooLarge;
                 self.node_text_run_records_compacted = std.math.add(u64, self.node_text_run_records_compacted, result.node_text_runs.compacted_run_records) catch return error.RecordTooLarge;
                 self.node_text_run_gc_deleted_runs = std.math.add(u64, self.node_text_run_gc_deleted_runs, result.node_text_runs.gc_deleted_runs) catch return error.RecordTooLarge;
+            }
+        }
+        if (result.primary_text_finalize_ran) {
+            self.primary_text_bytes_before_last = result.primary_text_finalize.before_bytes;
+            self.primary_text_bytes_after_last = result.primary_text_finalize.after_bytes;
+            if (result.primary_text_finalize.compressed) {
+                self.primary_text_finalizations = std.math.add(usize, self.primary_text_finalizations, 1) catch return error.RecordTooLarge;
             }
         }
     }
@@ -208,6 +227,10 @@ pub fn runIdleMaintenanceWithPinnedManifests(
     if (policy.shouldMaintainNodeTextRuns(completed_append_ops)) {
         result.node_text_runs_ran = true;
         result.node_text_runs = try store.compactNodeTextRunsBudgetedExceptAndProcessLeases(policy.node_text_run_max_records, pinned_node_text_run_manifest_paths);
+    }
+    if (policy.shouldFinalizePrimaryText(completed_append_ops)) {
+        result.primary_text_finalize_ran = true;
+        result.primary_text_finalize = try store.finalizePrimaryTextStorageWithResult();
     }
     return result;
 }
@@ -650,6 +673,7 @@ test "idle maintenance policy gates budgeted edge L0 compaction" {
 
     try std.testing.expect(!IdleMaintenancePolicy.disabled.shouldMaintainEdgeL0(2));
     try std.testing.expect(!IdleMaintenancePolicy.disabled.shouldMaintainEdgeGc(2));
+    try std.testing.expect(!IdleMaintenancePolicy.disabled.shouldFinalizePrimaryText(2));
     try std.testing.expect(!IdleMaintenancePolicy.edge_l0_maint10s16e64.shouldMaintainEdgeL0(9));
     try std.testing.expect(IdleMaintenancePolicy.edge_l0_maint10s16e64.shouldMaintainEdgeL0(10));
     try std.testing.expectEqual(@as(usize, 16), IdleMaintenancePolicy.edge_l0_maint10s16e64.edge_l0_max_segments);
@@ -688,6 +712,38 @@ test "idle maintenance policy gates budgeted edge L0 compaction" {
     try std.testing.expectEqual(@as(u64, 0), session.stats.maintenance_gc_deleted_manifests);
     try std.testing.expectEqual(@as(usize, 3), session.stats.maintenance_entries_before_last);
     try std.testing.expectEqual(@as(usize, 2), session.stats.maintenance_entries_after_last);
+}
+
+test "idle maintenance explicitly finalizes legacy raw primary text" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .durability = .fast,
+        .primary_text_write_mode = .bulk_ingest,
+    });
+    defer store.deinit();
+    try store.createEmpty();
+    const text = [_]u8{'a'} ** 4096;
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .document, .text = &text });
+
+    const skipped = try runIdleMaintenance(store, .{ .primary_text_finalize_every_ops = 2 }, 1);
+    try std.testing.expect(!skipped.primary_text_finalize_ran);
+    const finalized = try runIdleMaintenance(store, .{ .primary_text_finalize_every_ops = 2 }, 2);
+    try std.testing.expect(finalized.primary_text_finalize_ran);
+    try std.testing.expect(finalized.primary_text_finalize.compressed);
+
+    var session = AgentWriteSession.init(store, .{ .primary_text_finalize_every_ops = 1 });
+    const no_op = try session.recordAppendAndMaintain();
+    try std.testing.expect(no_op.primary_text_finalize_ran);
+    try std.testing.expect(!no_op.primary_text_finalize.compressed);
+    try std.testing.expectEqual(@as(usize, 1), session.stats.maintenance_ops);
+    try std.testing.expectEqual(@as(usize, 0), session.stats.primary_text_finalizations);
 }
 
 test "idle maintenance edge gc preserves pinned epoch manifests" {

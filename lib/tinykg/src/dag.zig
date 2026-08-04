@@ -1319,8 +1319,10 @@ test "checked persistent edge append repairs corrupt node catalog before direct 
     const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
     defer std.testing.allocator.free(store_path);
 
-    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
-    store.options.validate_indexes_on_read = true;
+    var store = try storage.Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .primary_text_write_mode = .bulk_ingest,
+        .validate_indexes_on_read = true,
+    });
     defer store.deinit();
     try store.createEmpty();
 

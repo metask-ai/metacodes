@@ -5,6 +5,7 @@ const index = @import("../index.zig");
 const query_mod = @import("../query.zig");
 const schema = @import("../schema.zig");
 const storage = @import("../storage.zig");
+const task_mod = @import("../task.zig");
 const text_mod = @import("../text.zig");
 const ast = @import("ast.zig");
 const optimizer = @import("optimizer.zig");
@@ -300,6 +301,9 @@ pub const Row = struct {
 pub const ResultTable = struct {
     rows: std.ArrayList(Row),
     stats: index.QueryStats = .{},
+    /// Persistent task leases are evaluated against one wall-clock snapshot
+    /// for the whole query, including CLI projection after execution.
+    read_timestamp_ns: ?u64 = null,
 
     pub fn init() ResultTable {
         return .{ .rows = .empty };
@@ -452,6 +456,7 @@ fn nodeUintPropertySupported(key: []const u8) bool {
     return std.mem.eql(u8, key, "task_recorded_ns") or
         std.mem.eql(u8, key, "task_created_ns") or
         std.mem.eql(u8, key, "task_completed_ns") or
+        std.mem.eql(u8, key, "claim_expires_ns") or
         std.mem.eql(u8, key, "task_event_ns") or
         std.mem.eql(u8, key, "task_root_id") or
         std.mem.eql(u8, key, "task_id");
@@ -535,6 +540,15 @@ fn nodeMatchesProperty(allocator: std.mem.Allocator, text: []const u8, property_
     return try nodeMatchesStringProperty(allocator, text, property_eq);
 }
 
+fn memoryNodeMatchesEffectiveStatus(kind: core.NodeKind, property_eq: planner.PropertyPredicate) bool {
+    if (property_eq.op != .eq or kind != .task) return false;
+    const expected = task_mod.Status.parse(property_eq.value) orelse return false;
+    // The in-memory Graph has no property sidecar or lease clock. Tasks in
+    // this compatibility executor therefore have the only representable
+    // lifecycle state: open.
+    return expected == .open;
+}
+
 fn edgeCursorMatchesStringProperty(edge_cursor: query_mod.EdgeCursor, allocator: std.mem.Allocator, edge_id: core.EdgeId, property_eq: planner.PropertyPredicate) !bool {
     if (property_eq.op != .eq) return false;
     const value = switch (edge_cursor) {
@@ -596,6 +610,257 @@ fn lookupStoreNodeIdsByProperty(store: storage.Store, allocator: std.mem.Allocat
         return try lookupStoreNodeIdsByMissingStringProperty(store, allocator, property_eq.key, kind_filter, max_ids);
     }
     return try store.lookupNodeIdsByStringProperty(allocator, property_eq.key, property_eq.value, kind_filter, max_ids);
+}
+
+const task_status_manifest_max_bytes: usize = 64 * 1024;
+const task_status_schema_version: u32 = 3;
+
+const TaskStatusStoreManifest = struct {
+    store_manifest_version: ?u32 = null,
+    storage_format_version: ?u32 = null,
+    schema: ?struct {
+        schema_version: ?u32 = null,
+    } = null,
+};
+
+fn storeHasMaterializedTaskStatus(allocator: std.mem.Allocator, store: storage.Store) !bool {
+    const path = try std.fs.path.join(allocator, &.{ store.dir_path, ".tinykg", "store-manifest.json" });
+    defer allocator.free(path);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(store.io, path, allocator, .limited(task_status_manifest_max_bytes)) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => |e| return e,
+    };
+    defer allocator.free(bytes);
+    var parsed = std.json.parseFromSlice(TaskStatusStoreManifest, allocator, bytes, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.InvalidStoreManifest;
+    defer parsed.deinit();
+    if (parsed.value.store_manifest_version != 1) return false;
+    if ((parsed.value.storage_format_version orelse 0) < 2) return false;
+    return if (parsed.value.schema) |manifest_schema| (manifest_schema.schema_version orelse 0) >= task_status_schema_version else false;
+}
+
+fn currentStoreReadTimestampNs(store: storage.Store) u64 {
+    const timestamp = std.Io.Clock.real.now(store.io).nanoseconds;
+    return if (timestamp < 0) 0 else @intCast(timestamp);
+}
+
+fn appendNodeIdCandidates(allocator: std.mem.Allocator, out: *std.ArrayList(core.NodeId), candidates: *std.ArrayList(core.NodeId)) !void {
+    defer candidates.deinit(allocator);
+    try out.appendSlice(allocator, candidates.items);
+}
+
+fn appendRawTaskStatusCandidates(
+    store: storage.Store,
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(core.NodeId),
+    raw_status: task_mod.Status,
+    candidate_limit: usize,
+    candidates_saturated: *bool,
+) !void {
+    const probe_limit = try currentGenerationCandidateProbeLimit(candidate_limit);
+    var candidates = try store.lookupNodeIdsByStringProperty(
+        allocator,
+        task_mod.status_property,
+        @tagName(raw_status),
+        .task,
+        probe_limit,
+    );
+    if (candidates.items.len > candidate_limit) candidates_saturated.* = true;
+    try appendNodeIdCandidates(allocator, out, &candidates);
+}
+
+fn deduplicateSortedNodeIds(ids: *std.ArrayList(core.NodeId)) void {
+    if (ids.items.len < 2) return;
+    sortNodeIds(ids.items);
+    var write_index: usize = 1;
+    for (ids.items[1..]) |id| {
+        if (id == ids.items[write_index - 1]) continue;
+        ids.items[write_index] = id;
+        write_index += 1;
+    }
+    ids.shrinkRetainingCapacity(write_index);
+}
+
+/// `status` is virtual/effective even though its durable commit marker is
+/// indexed. Build a bounded candidate union from the raw status and lease
+/// indexes, then validate each row at the query's single read timestamp.
+/// Pre-v3 stores can have tasks without a status marker, so only those stores
+/// receive a bounded compatibility scan; migrated stores never fall back to
+/// an O(task-count) read path.
+fn lookupStoreTaskIdsByEffectiveStatus(
+    store: storage.Store,
+    allocator: std.mem.Allocator,
+    edge_retention_registry: ?*storage.EdgeSegmentRetentionRegistry,
+    type_filter: schema.NodeTypeFilter,
+    property_eq: planner.PropertyPredicate,
+    max_ids: usize,
+    now_ns: u64,
+) !std.ArrayList(core.NodeId) {
+    var out = std.ArrayList(core.NodeId).empty;
+    errdefer out.deinit(allocator);
+    if (max_ids == 0 or property_eq.op != .eq or !type_filter.matches(.task)) return out;
+    const expected = task_mod.Status.parse(property_eq.value) orelse return out;
+
+    const candidate_limit = currentGenerationCandidateLimit(max_ids);
+    var ids = std.ArrayList(core.NodeId).empty;
+    defer ids.deinit(allocator);
+    var candidates_saturated = false;
+    switch (expected) {
+        .completed, .failed => {
+            try appendRawTaskStatusCandidates(store, allocator, &ids, expected, candidate_limit, &candidates_saturated);
+        },
+        .claimed => {
+            if (now_ns == std.math.maxInt(u64)) return out;
+            try appendRawTaskStatusCandidates(store, allocator, &ids, .claimed, candidate_limit, &candidates_saturated);
+        },
+        .open => {
+            // Effective open is the union of raw open and expired raw claimed.
+            // Selecting by lease alone also admits terminal tasks with stale
+            // lease fields; enough of those could hide every valid result
+            // before the bounded candidate limit.
+            try appendRawTaskStatusCandidates(store, allocator, &ids, .open, candidate_limit, &candidates_saturated);
+            try appendRawTaskStatusCandidates(store, allocator, &ids, .claimed, candidate_limit, &candidates_saturated);
+        },
+    }
+
+    const materialized_task_status = try storeHasMaterializedTaskStatus(allocator, store);
+    if (expected == .open and materialized_task_status) {
+        // A schema-v3 manifest proves that a completed migration published all
+        // existing status markers, but it cannot make a later node append and
+        // property-delta append atomic. Include a bounded task scan so a crash
+        // in that gap cannot silently hide an implicit-open task. Saturation
+        // fails closed below unless the requested LIMIT is already satisfied.
+        const probe_limit = try currentGenerationCandidateProbeLimit(candidate_limit);
+        var implicit_open_candidates = try store.scanNodeIds(allocator, .task, probe_limit);
+        if (implicit_open_candidates.items.len > candidate_limit) candidates_saturated = true;
+        try appendNodeIdCandidates(allocator, &ids, &implicit_open_candidates);
+    }
+
+    if ((expected == .open or expected == .claimed) and !materialized_task_status) {
+        // Small legacy stores preserve the pre-status behavior exactly. The
+        // cap prevents one predicate from allocating/scanning an unbounded
+        // task population; large legacy stores must use migrate-store-v2
+        // --task-status-v1 before effective-status queries.
+        const legacy_sentinel_limit = std.math.add(usize, candidate_limit, 1) catch return core.Error.BudgetExceeded;
+        var legacy = try store.scanNodeIds(allocator, .task, legacy_sentinel_limit);
+        if (legacy.items.len > candidate_limit) {
+            legacy.deinit(allocator);
+            return error.TaskStatusMigrationRequired;
+        }
+        try appendNodeIdCandidates(allocator, &ids, &legacy);
+    }
+    deduplicateSortedNodeIds(&ids);
+
+    // Do not validate each candidate through three independent property point
+    // lookups: every point lookup must validate the append-only delta, turning
+    // a status query into O(candidates * delta).  One owner-bounded lifecycle
+    // snapshot preserves the single read timestamp and amortizes that work.
+    var status_snapshot = try task_mod.StatusSnapshot.initForNodeIds(allocator, store, ids.items);
+    defer status_snapshot.deinit();
+    var node_view = try store.openNodeRecordView();
+    defer node_view.deinit();
+    for (ids.items) |id| {
+        if (out.items.len >= max_ids) break;
+        if (!try nodeCursorStoreNodeIsCurrentGeneration(store, edge_retention_registry, id)) continue;
+        var node = (try node_view.readNodeById(allocator, id)) orelse return error.InvalidRecord;
+        defer node.deinit(allocator);
+        if ((try status_snapshot.statusForStoredNode(node, now_ns)) != expected) continue;
+        try out.append(allocator, id);
+    }
+    // A bounded lookup must never turn candidate pressure into a successful
+    // but incomplete result.  Callers can raise the query budget/limit or
+    // compact stale generations; silently returning fewer rows is incorrect.
+    if (out.items.len < max_ids and candidates_saturated) return core.Error.BudgetExceeded;
+    return out;
+}
+
+/// `status` is a task lifecycle virtual property only for physical task
+/// nodes.  Other catalog types are allowed to define an unrelated property
+/// with the same name (for example `ticket.status = published`).  Preserve
+/// those ordinary indexed values while merging effective task candidates for
+/// filters that can match both domains.
+fn lookupStoreNodeIdsByStatusProperty(
+    store: storage.Store,
+    allocator: std.mem.Allocator,
+    edge_retention_registry: ?*storage.EdgeSegmentRetentionRegistry,
+    type_filter: schema.NodeTypeFilter,
+    property_eq: planner.PropertyPredicate,
+    max_ids: usize,
+    now_ns: u64,
+) !std.ArrayList(core.NodeId) {
+    var merged = std.ArrayList(core.NodeId).empty;
+    errdefer merged.deinit(allocator);
+    if (max_ids == 0 or property_eq.op != .eq) return merged;
+
+    var task_candidates_saturated = false;
+    var task_status_migration_required = false;
+    if (type_filter.matches(.task)) {
+        // A mixed-domain query may use `status` both as the virtual task
+        // lifecycle and as an ordinary catalog property.  Candidate pressure
+        // in the task subdomain must not fail the whole unordered LIMIT before
+        // the non-task subdomain gets a chance to satisfy it completely.
+        var tasks = lookupStoreTaskIdsByEffectiveStatus(store, allocator, edge_retention_registry, type_filter, property_eq, max_ids, now_ns) catch |err| switch (err) {
+            core.Error.BudgetExceeded => blk: {
+                task_candidates_saturated = true;
+                break :blk std.ArrayList(core.NodeId).empty;
+            },
+            error.TaskStatusMigrationRequired => blk: {
+                task_candidates_saturated = true;
+                task_status_migration_required = true;
+                break :blk std.ArrayList(core.NodeId).empty;
+            },
+            else => |e| return e,
+        };
+        defer tasks.deinit(allocator);
+        try merged.appendSlice(allocator, tasks.items);
+    }
+
+    const candidate_limit = currentGenerationCandidateLimit(max_ids);
+    const probe_limit = try currentGenerationCandidateProbeLimit(candidate_limit);
+    var raw_candidates_saturated = false;
+    if (typeFilterIsAny(type_filter)) {
+        var ids = try lookupStoreNodeIdsByProperty(store, allocator, property_eq, null, probe_limit);
+        defer ids.deinit(allocator);
+        if (ids.items.len > candidate_limit) raw_candidates_saturated = true;
+        var node_view = try store.openNodeRecordView();
+        defer node_view.deinit();
+        for (ids.items) |id| {
+            var node = (try node_view.readNodeById(allocator, id)) orelse return error.InvalidRecord;
+            defer node.deinit(allocator);
+            if (node.kind == .task or !type_filter.matches(node.kind)) continue;
+            try merged.append(allocator, id);
+        }
+    } else if (type_filter.asSingle()) |kind| {
+        if (kind != .task) {
+            var ids = try lookupStoreNodeIdsByProperty(store, allocator, property_eq, kind, probe_limit);
+            defer ids.deinit(allocator);
+            if (ids.items.len > candidate_limit) raw_candidates_saturated = true;
+            try merged.appendSlice(allocator, ids.items);
+        }
+    } else {
+        for (0..schema.max_node_types) |raw_id| {
+            const kind: core.NodeKind = @enumFromInt(@as(u16, @intCast(raw_id)));
+            if (kind == .task or !type_filter.matches(kind)) continue;
+            var ids = try lookupStoreNodeIdsByProperty(store, allocator, property_eq, kind, probe_limit);
+            defer ids.deinit(allocator);
+            if (ids.items.len > candidate_limit) raw_candidates_saturated = true;
+            try merged.appendSlice(allocator, ids.items);
+        }
+    }
+
+    deduplicateSortedNodeIds(&merged);
+    var write_index: usize = 0;
+    for (merged.items) |id| {
+        if (write_index >= max_ids) break;
+        if (!try nodeCursorStoreNodeIsCurrentGeneration(store, edge_retention_registry, id)) continue;
+        merged.items[write_index] = id;
+        write_index += 1;
+    }
+    merged.shrinkRetainingCapacity(write_index);
+    if (merged.items.len < max_ids and task_status_migration_required) return error.TaskStatusMigrationRequired;
+    if (merged.items.len < max_ids and (raw_candidates_saturated or task_candidates_saturated)) return core.Error.BudgetExceeded;
+    return merged;
 }
 
 fn lookupStoreNodeIdsByMissingStringProperty(store: storage.Store, allocator: std.mem.Allocator, key: []const u8, kind_filter: ?core.NodeKind, max_ids: usize) !std.ArrayList(core.NodeId) {
@@ -681,7 +946,7 @@ const NodeCursor = union(enum) {
                 }
                 var node = (try cursor.store.readNodeById(allocator, id)) orelse break :blk null;
                 defer node.deinit(allocator);
-                if (!try nodeCursorStoreNodeIsCurrentGeneration(cursor.store, id)) break :blk false;
+                if (!try nodeCursorStoreNodeIsCurrentGeneration(cursor.store, null, id)) break :blk false;
                 if (!type_filter.matches(node.kind)) break :blk false;
                 if (text_eq) |text| {
                     if (!visibleNodeTextEquals(node.text, text)) break :blk false;
@@ -700,6 +965,7 @@ const NodeCursor = union(enum) {
         errdefer out.deinit(allocator);
         if (max_ids == 0) return out;
         const candidate_limit = currentGenerationCandidateLimit(max_ids);
+        const probe_limit = try currentGenerationCandidateProbeLimit(candidate_limit);
         if (type_filter.asSingle()) |kind| {
             switch (self) {
                 .memory => |cursor| {
@@ -711,11 +977,11 @@ const NodeCursor = union(enum) {
                 },
                 .store => |cursor| {
                     var ids = if (cursor.state) |state|
-                        try state.lookupByText(allocator, kind, text, candidate_limit)
+                        try state.lookupByText(allocator, kind, text, probe_limit)
                     else
-                        try cursor.store.lookupNodeIdsByTextLimited(allocator, kind, text, candidate_limit);
+                        try cursor.store.lookupNodeIdsByTextLimited(allocator, kind, text, probe_limit);
                     defer ids.deinit(allocator);
-                    try nodeCursorRetainStoreCurrentGeneration(cursor.store, &ids, max_ids);
+                    try nodeCursorRetainStoreCurrentGeneration(cursor.store, if (cursor.state) |state| state.edge_retention_registry else null, &ids, candidate_limit, max_ids);
                     for (ids.items) |id| try appendUniqueNodeId(allocator, &out, id);
                 },
             }
@@ -734,33 +1000,36 @@ const NodeCursor = union(enum) {
             .store => |cursor| {
                 if (typeFilterIsAny(type_filter)) {
                     var ids = if (cursor.state) |state|
-                        try state.lookupByText(allocator, null, text, candidate_limit)
+                        try state.lookupByText(allocator, null, text, probe_limit)
                     else
-                        try cursor.store.lookupNodeIdsByTextLimited(allocator, null, text, candidate_limit);
+                        try cursor.store.lookupNodeIdsByTextLimited(allocator, null, text, probe_limit);
                     defer ids.deinit(allocator);
-                    try nodeCursorRetainStoreCurrentGeneration(cursor.store, &ids, max_ids);
+                    try nodeCursorRetainStoreCurrentGeneration(cursor.store, if (cursor.state) |state| state.edge_retention_registry else null, &ids, candidate_limit, max_ids);
                     for (ids.items) |id| try appendUniqueNodeId(allocator, &out, id);
                     return out;
                 }
                 var merged = std.ArrayList(core.NodeId).empty;
                 errdefer merged.deinit(allocator);
                 defer merged.deinit(allocator);
+                var candidates_saturated = false;
                 for (0..schema.max_node_types) |raw_id| {
                     const kind: core.NodeKind = @enumFromInt(@as(u16, @intCast(raw_id)));
                     if (!type_filter.matches(kind)) continue;
                     var ids = if (cursor.state) |state|
-                        try state.lookupByText(allocator, kind, text, candidate_limit)
+                        try state.lookupByText(allocator, kind, text, probe_limit)
                     else
-                        try cursor.store.lookupNodeIdsByTextLimited(allocator, kind, text, candidate_limit);
+                        try cursor.store.lookupNodeIdsByTextLimited(allocator, kind, text, probe_limit);
                     defer ids.deinit(allocator);
+                    if (ids.items.len > candidate_limit) candidates_saturated = true;
                     try merged.appendSlice(allocator, ids.items);
                 }
                 sortNodeIds(merged.items);
                 for (merged.items) |id| {
                     if (out.items.len >= max_ids) break;
-                    if (!try nodeCursorStoreNodeIsCurrentGeneration(cursor.store, id)) continue;
+                    if (!try nodeCursorStoreNodeIsCurrentGeneration(cursor.store, if (cursor.state) |state| state.edge_retention_registry else null, id)) continue;
                     try appendUniqueNodeId(allocator, &out, id);
                 }
+                if (out.items.len < max_ids and candidates_saturated) return core.Error.BudgetExceeded;
             },
         }
         return out;
@@ -771,6 +1040,7 @@ const NodeCursor = union(enum) {
         errdefer out.deinit(allocator);
         if (max_ids == 0) return out;
         const candidate_limit = currentGenerationCandidateLimit(max_ids);
+        const probe_limit = try currentGenerationCandidateProbeLimit(candidate_limit);
         switch (self) {
             .memory => |cursor| {
                 const needs_uint_order = nodeUintPropertySupported(property_eq.key);
@@ -779,7 +1049,11 @@ const NodeCursor = union(enum) {
                     if (node.status != .active) continue;
                     if (!nodeCursorMemoryNodeIsCurrentGeneration(cursor.graph, node.id)) continue;
                     if (!type_filter.matches(node.kind)) continue;
-                    if (!try nodeMatchesProperty(allocator, node.text, property_eq)) continue;
+                    const matches = if (node.kind == .task and std.mem.eql(u8, property_eq.key, task_mod.status_property))
+                        memoryNodeMatchesEffectiveStatus(node.kind, property_eq)
+                    else
+                        try nodeMatchesProperty(allocator, node.text, property_eq);
+                    if (!matches) continue;
                     try out.append(allocator, node.id);
                 }
                 if (needs_uint_order) {
@@ -788,34 +1062,41 @@ const NodeCursor = union(enum) {
                 }
             },
             .store => |cursor| {
+                if (std.mem.eql(u8, property_eq.key, task_mod.status_property)) {
+                    const now_ns = if (cursor.state) |state| state.read_timestamp_ns else currentStoreReadTimestampNs(cursor.store);
+                    return try lookupStoreNodeIdsByStatusProperty(cursor.store, allocator, if (cursor.state) |state| state.edge_retention_registry else null, type_filter, property_eq, max_ids, now_ns);
+                }
                 if (type_filter.asSingle()) |kind| {
-                    var ids = try lookupStoreNodeIdsByProperty(cursor.store, allocator, property_eq, kind, candidate_limit);
+                    var ids = try lookupStoreNodeIdsByProperty(cursor.store, allocator, property_eq, kind, probe_limit);
                     errdefer ids.deinit(allocator);
-                    try nodeCursorRetainStoreCurrentGeneration(cursor.store, &ids, max_ids);
+                    try nodeCursorRetainStoreCurrentGeneration(cursor.store, if (cursor.state) |state| state.edge_retention_registry else null, &ids, candidate_limit, max_ids);
                     return ids;
                 }
                 if (typeFilterIsAny(type_filter)) {
-                    var ids = try lookupStoreNodeIdsByProperty(cursor.store, allocator, property_eq, null, candidate_limit);
+                    var ids = try lookupStoreNodeIdsByProperty(cursor.store, allocator, property_eq, null, probe_limit);
                     errdefer ids.deinit(allocator);
-                    try nodeCursorRetainStoreCurrentGeneration(cursor.store, &ids, max_ids);
+                    try nodeCursorRetainStoreCurrentGeneration(cursor.store, if (cursor.state) |state| state.edge_retention_registry else null, &ids, candidate_limit, max_ids);
                     return ids;
                 }
                 var merged = std.ArrayList(core.NodeId).empty;
                 errdefer merged.deinit(allocator);
                 defer merged.deinit(allocator);
+                var candidates_saturated = false;
                 for (0..schema.max_node_types) |raw_id| {
                     const kind: core.NodeKind = @enumFromInt(@as(u16, @intCast(raw_id)));
                     if (!type_filter.matches(kind)) continue;
-                    var ids = try lookupStoreNodeIdsByProperty(cursor.store, allocator, property_eq, kind, candidate_limit);
+                    var ids = try lookupStoreNodeIdsByProperty(cursor.store, allocator, property_eq, kind, probe_limit);
                     defer ids.deinit(allocator);
+                    if (ids.items.len > candidate_limit) candidates_saturated = true;
                     try merged.appendSlice(allocator, ids.items);
                 }
                 sortNodeIds(merged.items);
                 for (merged.items) |id| {
                     if (out.items.len >= max_ids) break;
-                    if (!try nodeCursorStoreNodeIsCurrentGeneration(cursor.store, id)) continue;
+                    if (!try nodeCursorStoreNodeIsCurrentGeneration(cursor.store, if (cursor.state) |state| state.edge_retention_registry else null, id)) continue;
                     try out.append(allocator, id);
                 }
+                if (out.items.len < max_ids and candidates_saturated) return core.Error.BudgetExceeded;
             },
         }
         return out;
@@ -840,8 +1121,16 @@ const NodeCursor = union(enum) {
         }
         if (property_eq.op != .eq) return false;
         return switch (self) {
-            .memory => try nodeMatchesStringProperty(allocator, node.text, property_eq),
+            .memory => if (node.kind == .task and std.mem.eql(u8, property_eq.key, task_mod.status_property))
+                memoryNodeMatchesEffectiveStatus(node.kind, property_eq)
+            else
+                try nodeMatchesStringProperty(allocator, node.text, property_eq),
             .store => |cursor| blk: {
+                if (std.mem.eql(u8, property_eq.key, task_mod.status_property) and node.kind == .task) {
+                    const now_ns = if (cursor.state) |state| state.read_timestamp_ns else currentStoreReadTimestampNs(cursor.store);
+                    const lifecycle = try task_mod.statusWithPersistentStoreAt(allocator, cursor.store, id, now_ns);
+                    break :blk std.mem.eql(u8, @tagName(lifecycle), property_eq.value);
+                }
                 const value = cursor.store.getNodeStringProperty(allocator, id, property_eq.key) catch |err| switch (err) {
                     core.Error.InvalidId, core.Error.NotFound => break :blk null,
                     else => |e| return e,
@@ -887,36 +1176,40 @@ const NodeCursor = union(enum) {
             },
             .store => |cursor| blk: {
                 const candidate_limit = currentGenerationCandidateLimit(max_ids);
+                const probe_limit = try currentGenerationCandidateProbeLimit(candidate_limit);
                 if (type_filter.asSingle()) |kind| {
-                    var ids = try cursor.store.scanNodeIds(allocator, kind, candidate_limit);
+                    var ids = try cursor.store.scanNodeIds(allocator, kind, probe_limit);
                     errdefer ids.deinit(allocator);
-                    try nodeCursorRetainStoreCurrentGeneration(cursor.store, &ids, max_ids);
+                    try nodeCursorRetainStoreCurrentGeneration(cursor.store, if (cursor.state) |state| state.edge_retention_registry else null, &ids, candidate_limit, max_ids);
                     break :blk ids;
                 }
                 if (typeFilterIsAny(type_filter)) {
-                    var ids = try cursor.store.scanNodeIds(allocator, null, candidate_limit);
+                    var ids = try cursor.store.scanNodeIds(allocator, null, probe_limit);
                     errdefer ids.deinit(allocator);
-                    try nodeCursorRetainStoreCurrentGeneration(cursor.store, &ids, max_ids);
+                    try nodeCursorRetainStoreCurrentGeneration(cursor.store, if (cursor.state) |state| state.edge_retention_registry else null, &ids, candidate_limit, max_ids);
                     break :blk ids;
                 }
                 var merged = std.ArrayList(core.NodeId).empty;
                 errdefer merged.deinit(allocator);
+                var candidates_saturated = false;
                 for (0..schema.max_node_types) |raw_id| {
                     const kind: core.NodeKind = @enumFromInt(@as(u16, @intCast(raw_id)));
                     if (!type_filter.matches(kind)) continue;
-                    var ids = try cursor.store.scanNodeIds(allocator, kind, candidate_limit);
+                    var ids = try cursor.store.scanNodeIds(allocator, kind, probe_limit);
                     defer ids.deinit(allocator);
+                    if (ids.items.len > candidate_limit) candidates_saturated = true;
                     try merged.appendSlice(allocator, ids.items);
                 }
                 sortNodeIds(merged.items);
                 var write_index: usize = 0;
                 for (merged.items) |id| {
                     if (write_index >= max_ids) break;
-                    if (!try nodeCursorStoreNodeIsCurrentGeneration(cursor.store, id)) continue;
+                    if (!try nodeCursorStoreNodeIsCurrentGeneration(cursor.store, if (cursor.state) |state| state.edge_retention_registry else null, id)) continue;
                     merged.items[write_index] = id;
                     write_index += 1;
                 }
                 merged.shrinkRetainingCapacity(write_index);
+                if (merged.items.len < max_ids and candidates_saturated) return core.Error.BudgetExceeded;
                 break :blk merged;
             },
         };
@@ -926,31 +1219,43 @@ const NodeCursor = union(enum) {
         self: NodeCursor,
         allocator: std.mem.Allocator,
         query: []const u8,
-        kind_filter: ?core.NodeKind,
+        type_filter: schema.NodeTypeFilter,
         max_ids: usize,
         max_postings_scanned: usize,
         deadline: core.QueryDeadline,
     ) !std.ArrayList(text_mod.TextSearchHit) {
+        const kind_filter = type_filter.asSingle();
+        var kind_set_storage: schema.NodeTypeSet = undefined;
+        const kind_set_filter: ?*const schema.NodeTypeSet = switch (type_filter) {
+            .set => |set| blk: {
+                kind_set_storage = set;
+                break :blk &kind_set_storage;
+            },
+            else => null,
+        };
         return switch (self) {
             .memory => |cursor| blk: {
                 var text_index = try text_mod.TextIndex.buildFromGraphDeadline(allocator, cursor.graph, deadline);
                 defer text_index.deinit();
                 break :blk try text_index.search(query, .{
                     .kind_filter = kind_filter,
+                    .kind_set_filter = kind_set_filter,
                     .limit = max_ids,
                     .max_postings_scanned = max_postings_scanned,
                     .deadline = deadline,
                 });
             },
             .store => |cursor| blk: {
+                const candidate_limit = textSearchCandidateLimitForLatest(max_ids);
                 var hits = try text_mod.searchText(allocator, cursor.store, query, .{
                     .kind_filter = kind_filter,
-                    .limit = textSearchCandidateLimitForLatest(max_ids),
+                    .kind_set_filter = kind_set_filter,
+                    .limit = try currentGenerationCandidateProbeLimit(candidate_limit),
                     .max_postings_scanned = max_postings_scanned,
                     .deadline = deadline,
                 });
                 errdefer hits.deinit(allocator);
-                try retainCurrentGenerationTextHits(cursor.store, &hits, max_ids);
+                try retainCurrentGenerationTextHits(cursor.store, if (cursor.state) |state| state.edge_retention_registry else null, &hits, candidate_limit, max_ids);
                 break :blk hits;
             },
         };
@@ -961,42 +1266,60 @@ fn textSearchCandidateLimitForLatest(max_ids: usize) usize {
     if (max_ids == 0) return 0;
     const max_candidate_limit: usize = 4096;
     const expanded = std.math.add(usize, std.math.mul(usize, max_ids, 4) catch max_candidate_limit, 32) catch max_candidate_limit;
-    return @min(max_candidate_limit, @max(max_ids, expanded));
+    return @max(max_ids, @min(max_candidate_limit, expanded));
 }
 
-fn retainCurrentGenerationTextHits(store: storage.Store, hits: *std.ArrayList(text_mod.TextSearchHit), max_ids: usize) !void {
+fn retainCurrentGenerationTextHits(store: storage.Store, edge_retention_registry: ?*storage.EdgeSegmentRetentionRegistry, hits: *std.ArrayList(text_mod.TextSearchHit), candidate_limit: usize, max_ids: usize) !void {
+    const candidate_count = hits.items.len;
     var write_index: usize = 0;
     for (hits.items) |hit| {
         if (write_index >= max_ids) break;
-        if (!try nodeCursorStoreNodeIsCurrentGeneration(store, hit.node_id)) continue;
+        if (!try nodeCursorStoreNodeIsCurrentGeneration(store, edge_retention_registry, hit.node_id)) continue;
         hits.items[write_index] = hit;
         write_index += 1;
     }
     hits.shrinkRetainingCapacity(write_index);
+    if (hits.items.len < max_ids and candidate_count > candidate_limit) return core.Error.BudgetExceeded;
 }
 
 fn currentGenerationCandidateLimit(max_ids: usize) usize {
     if (max_ids == 0) return 0;
     const max_candidate_limit: usize = 4096;
     const expanded = std.math.add(usize, std.math.mul(usize, max_ids, 4) catch max_candidate_limit, 32) catch max_candidate_limit;
-    return @min(max_candidate_limit, @max(max_ids, expanded));
+    // Cap only speculative overfetch. An explicit result request larger than
+    // the cap must still be allowed to return the requested number of rows.
+    return @max(max_ids, @min(max_candidate_limit, expanded));
 }
 
-fn nodeCursorRetainStoreCurrentGeneration(store: storage.Store, ids: *std.ArrayList(core.NodeId), max_ids: usize) !void {
+fn currentGenerationCandidateProbeLimit(candidate_limit: usize) !usize {
+    return std.math.add(usize, candidate_limit, 1) catch core.Error.BudgetExceeded;
+}
+
+fn nodeCursorRetainStoreCurrentGeneration(store: storage.Store, edge_retention_registry: ?*storage.EdgeSegmentRetentionRegistry, ids: *std.ArrayList(core.NodeId), candidate_limit: usize, max_ids: usize) !void {
+    const candidate_count = ids.items.len;
     var write_index: usize = 0;
     for (ids.items) |id| {
         if (write_index >= max_ids) break;
-        if (!try nodeCursorStoreNodeIsCurrentGeneration(store, id)) continue;
+        if (!try nodeCursorStoreNodeIsCurrentGeneration(store, edge_retention_registry, id)) continue;
         ids.items[write_index] = id;
         write_index += 1;
     }
     ids.shrinkRetainingCapacity(write_index);
+    if (ids.items.len < max_ids and candidate_count > candidate_limit) return core.Error.BudgetExceeded;
 }
 
-fn nodeCursorStoreNodeIsCurrentGeneration(store: storage.Store, node_id: core.NodeId) !bool {
-    var iter = try store.edgeIndexRecordsByNodeAndRelationIterator(.src, node_id, .deprecated_by);
-    defer iter.deinit();
-    return (try iter.next()) == null;
+fn nodeCursorStoreNodeIsCurrentGeneration(store: storage.Store, edge_retention_registry: ?*storage.EdgeSegmentRetentionRegistry, node_id: core.NodeId) !bool {
+    const Visitor = struct {
+        fn visit(_: void, record: storage.EdgeIndexRecord) !bool {
+            _ = record;
+            return true;
+        }
+    };
+    const found = if (edge_retention_registry) |registry|
+        try store.forEachVisibleEdgeIndexRecordByNodeRetained(store.allocator, registry, .src, node_id, .deprecated_by, 1, {}, Visitor.visit)
+    else
+        try store.forEachVisibleEdgeIndexRecordByNode(store.allocator, .src, node_id, .deprecated_by, 1, {}, Visitor.visit);
+    return !found;
 }
 
 fn nodeCursorMemoryNodeIsCurrentGeneration(graph: *const graph_mod.Graph, node_id: core.NodeId) bool {
@@ -1012,11 +1335,13 @@ const PersistentNodeCursorState = struct {
     const direct_reads_before_view: usize = 8;
 
     store: storage.Store,
+    edge_retention_registry: ?*storage.EdgeSegmentRetentionRegistry = null,
     node_text_retention_registry: ?*storage.NodeTextRunRetentionRegistry = null,
     node_view: ?storage.Store.NodeRecordView = null,
     node_id_view: ?storage.Store.NodeByIdIndexView = null,
     node_text_lookup_view: ?storage.Store.NodeTextLookupView = null,
     direct_reads: usize = 0,
+    read_timestamp_ns: u64 = 0,
 
     fn deinit(self: *PersistentNodeCursorState) void {
         if (self.node_text_lookup_view) |*view| view.deinit();
@@ -1038,7 +1363,7 @@ const PersistentNodeCursorState = struct {
     }
 
     fn matchNodeFilter(self: *PersistentNodeCursorState, id: core.NodeId, type_filter: schema.NodeTypeFilter, text_eq: ?[]const u8) !?bool {
-        if (!try nodeCursorStoreNodeIsCurrentGeneration(self.store, id)) return false;
+        if (!try nodeCursorStoreNodeIsCurrentGeneration(self.store, self.edge_retention_registry, id)) return false;
         if (text_eq == null) {
             if (self.node_id_view == null) self.node_id_view = try self.store.openNodeByIdIndexView();
             const kind = (try self.node_id_view.?.nodeKind(id)) orelse return null;
@@ -1069,6 +1394,7 @@ pub const PersistentStoreQuerySession = struct {
     edge_retention_registry: storage.EdgeSegmentRetentionRegistry,
     node_text_retention_registry: storage.NodeTextRunRetentionRegistry,
     node_state: PersistentNodeCursorState,
+    read_timestamp_ns: u64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, store: storage.Store) PersistentStoreQuerySession {
         return .{
@@ -1092,6 +1418,7 @@ pub const PersistentStoreQuerySession = struct {
         plan: optimizer.PhysicalPlan,
         budget: core.QueryBudget,
     ) !ResultTable {
+        self.read_timestamp_ns = currentStoreReadTimestampNs(self.store);
         var repaired = false;
         while (true) {
             self.bindNodeState();
@@ -1123,13 +1450,17 @@ pub const PersistentStoreQuerySession = struct {
 
     fn bindNodeState(self: *PersistentStoreQuerySession) void {
         self.node_state.store = self.store;
+        self.node_state.edge_retention_registry = &self.edge_retention_registry;
         self.node_state.node_text_retention_registry = &self.node_text_retention_registry;
+        self.node_state.read_timestamp_ns = self.read_timestamp_ns;
     }
 
     fn resetNodeState(self: *PersistentStoreQuerySession) void {
         self.node_state = .{
             .store = self.store,
+            .edge_retention_registry = &self.edge_retention_registry,
             .node_text_retention_registry = &self.node_text_retention_registry,
+            .read_timestamp_ns = self.read_timestamp_ns,
         };
     }
 };
@@ -1265,10 +1596,16 @@ fn executeWithPersistentStoreAndIoMaybeRetainedIndexesTimed(
     timings: ?*OperatorTimingRecorder,
 ) !ResultTable {
     if (timings) |recorder| try recorder.ensureCapacityForPlan(plan);
+    const read_timestamp_ns = currentStoreReadTimestampNs(store);
     var repaired = false;
     while (true) {
         if (timings) |recorder| recorder.clearRetainingCapacity();
-        var node_state = PersistentNodeCursorState{ .store = store, .node_text_retention_registry = node_text_retention_registry };
+        var node_state = PersistentNodeCursorState{
+            .store = store,
+            .edge_retention_registry = edge_retention_registry,
+            .node_text_retention_registry = node_text_retention_registry,
+            .read_timestamp_ns = read_timestamp_ns,
+        };
         defer node_state.deinit();
         return executeWithCursorDeadline(
             allocator,
@@ -1319,6 +1656,10 @@ fn executeWithCursorDeadline(
     timings: ?*OperatorTimingRecorder,
 ) !ResultTable {
     var table = ResultTable.init();
+    table.read_timestamp_ns = switch (node_cursor) {
+        .memory => null,
+        .store => |cursor| if (cursor.state) |state| state.read_timestamp_ns else currentStoreReadTimestampNs(cursor.store),
+    };
     errdefer table.deinit(allocator);
     const limit: ?usize = effectiveLimit(plan, budget);
     if (limit != null and limit.? == 0) return table;
@@ -1353,7 +1694,7 @@ fn executeWithCursorDeadline(
                 const can_cap_text_candidates = can_apply_result_limit and text_search.text_eq == null;
                 const text_limit = if (can_cap_text_candidates) (limit orelse text_search.limit) else null;
                 const text_type_filter = effectiveNodeTypeFilter(text_search.kind, text_search.type_filter);
-                const maybe_hits: ?std.ArrayList(text_mod.TextSearchHit) = node_cursor.searchText(allocator, text_search.query, text_search.kind, seedCap(can_cap_text_candidates, text_limit, budget), budget.max_text_postings_scanned, deadline) catch |err| switch (err) {
+                const maybe_hits: ?std.ArrayList(text_mod.TextSearchHit) = node_cursor.searchText(allocator, text_search.query, text_type_filter, seedCap(can_cap_text_candidates, text_limit, budget), budget.max_text_postings_scanned, deadline) catch |err| switch (err) {
                     core.Error.BudgetExceeded => blk: {
                         table.stats.budget_exceeded = true;
                         break :blk null;
@@ -1500,6 +1841,7 @@ fn executeWithCursorDeadline(
             .expand => |expand| {
                 var next = ResultTable.init();
                 next.stats = table.stats;
+                next.read_timestamp_ns = table.read_timestamp_ns;
                 errdefer next.deinit(allocator);
                 try reserveExpandRows(allocator, &next, can_apply_result_limit, limit);
                 var edge_property_candidate_ids = if (expand.edge_property_eq) |property_eq|
@@ -2249,6 +2591,7 @@ test "persistent executor expand uses relation-bounded edge budget" {
 
     var table = try executeWithPersistentStoreAndIo(std.testing.allocator, std.testing.io, store, .{ .ops = ops }, .{ .max_visited_edges = 1 });
     defer table.deinit(std.testing.allocator);
+    try std.testing.expect(table.read_timestamp_ns != null);
     try std.testing.expectEqual(@as(usize, 1), table.rows.items.len);
     try std.testing.expectEqual(func.toInt(), table.rows.items[0].get("s").?.toInt());
     try std.testing.expect(!table.stats.budget_exceeded);
@@ -2373,6 +2716,54 @@ test "persistent executor lazily opens published edge segments by node range" {
     try std.testing.expectEqual(@as(usize, 1), table.rows.items.len);
     try std.testing.expectEqual(func.toInt(), table.rows.items[0].get("s").?.toInt());
     try std.testing.expect(!table.stats.budget_exceeded);
+}
+
+test "persistent node filtering sees deprecated_by in published edge overlay" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+    const base_segment_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "base-segment" });
+    defer std.testing.allocator.free(base_segment_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNodesBatch(&.{
+        .{ .id = .fromInt(1), .kind = .file, .text = "overlay stale candidate" },
+        .{ .id = .fromInt(2), .kind = .file, .text = "overlay current candidate" },
+        .{ .id = .fromInt(3), .kind = .file, .text = "base source" },
+        .{ .id = .fromInt(4), .kind = .file, .text = "base target" },
+    });
+    try store.appendEdge(.{ .id = .fromInt(1), .src = .fromInt(3), .rel = .references, .dst = .fromInt(4) });
+    try std.testing.expectEqual(@as(u64, 1), try store.publishEdgeAdjacencySegment(base_segment_path));
+    try store.appendEdge(.{ .id = .fromInt(2), .src = .fromInt(1), .rel = .deprecated_by, .dst = .fromInt(2) });
+
+    const cursor = NodeCursor{ .store = .{ .allocator = std.testing.allocator, .store = store } };
+    try std.testing.expectEqual(false, (try cursor.matchNode(std.testing.allocator, .fromInt(1), .file, null)).?);
+    var stale = try cursor.lookupByText(std.testing.allocator, .file, "overlay stale candidate", 1);
+    defer stale.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), stale.items.len);
+    var current = try cursor.lookupByText(std.testing.allocator, .file, "overlay current candidate", 1);
+    defer current.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), current.items.len);
+    try std.testing.expectEqual(@as(u64, 2), current.items[0].toInt());
+
+    var ops = std.ArrayList(optimizer.PhysicalOp).empty;
+    defer ops.deinit(std.testing.allocator);
+    try ops.append(std.testing.allocator, .{ .node_lookup_by_text = .{
+        .var_name = "n",
+        .kind = .file,
+        .text = "overlay stale candidate",
+    } });
+    var edge_retention_registry = storage.EdgeSegmentRetentionRegistry.init(std.testing.allocator);
+    defer edge_retention_registry.deinit();
+    var result = try executeWithPersistentStoreAndIoRetained(std.testing.allocator, std.testing.io, store, &edge_retention_registry, .{ .ops = ops }, .{});
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), result.rows.items.len);
 }
 
 test "persistent executor expand kind filter avoids node text materialization" {
@@ -2635,6 +3026,35 @@ test "executor keeps text score binding when projection needs it across expand" 
     try std.testing.expect(table.rows.items[0].getScore("o") != null);
 }
 
+test "executor text search applies schema descendant filter before result limit" {
+    var graph = graph_mod.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    const task_id = try graph.addNode(.task, "shared search term");
+    const decision_id = try graph.addNode(.decision, "shared search term");
+    _ = try graph.addNode(.file, "shared search term shared search term shared search term");
+
+    var descendants = schema.NodeTypeSet.empty();
+    try descendants.insert(@intFromEnum(core.NodeKind.task));
+    try descendants.insert(@intFromEnum(core.NodeKind.decision));
+    var ops = std.ArrayList(optimizer.PhysicalOp).empty;
+    defer ops.deinit(std.testing.allocator);
+    try ops.append(std.testing.allocator, .{ .text_search = .{
+        .var_name = "n",
+        .query = "shared search term",
+        .kind = null,
+        .type_filter = .{ .set = descendants },
+        .limit = 2,
+    } });
+
+    var table = try execute(std.testing.allocator, &graph, .{ .ops = ops });
+    defer table.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), table.rows.items.len);
+    const first = table.rows.items[0].get("n").?;
+    const second = table.rows.items[1].get("n").?;
+    try std.testing.expect((first == task_id and second == decision_id) or
+        (first == decision_id and second == task_id));
+}
+
 test "executor does not push limit before expand scan candidates" {
     var graph = graph_mod.Graph.init(std.testing.allocator);
     defer graph.deinit();
@@ -2759,6 +3179,447 @@ test "executor node scan hides non-active graph nodes" {
     defer table.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), table.rows.items.len);
     try std.testing.expectEqual(active.toInt(), table.rows.items[0].get("f").?.toInt());
+}
+
+test "executor memory status predicate exposes only representable open tasks" {
+    var graph = graph_mod.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    const task_id = try graph.addNode(.task, "open task");
+    _ = try graph.addNode(.document, "not a task");
+
+    var open_ops = std.ArrayList(optimizer.PhysicalOp).empty;
+    defer open_ops.deinit(std.testing.allocator);
+    try open_ops.append(std.testing.allocator, .{ .node_lookup_by_property = .{
+        .var_name = "t",
+        .kind = .task,
+        .type_filter = .{ .single = .task },
+        .property_eq = .{ .key = task_mod.status_property, .value = "open" },
+    } });
+    var open_table = try execute(std.testing.allocator, &graph, .{ .ops = open_ops });
+    defer open_table.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), open_table.rows.items.len);
+    try std.testing.expectEqual(task_id.toInt(), open_table.rows.items[0].get("t").?.toInt());
+
+    inline for (&.{ "claimed", "completed", "failed" }) |status| {
+        var terminal_ops = std.ArrayList(optimizer.PhysicalOp).empty;
+        defer terminal_ops.deinit(std.testing.allocator);
+        try terminal_ops.append(std.testing.allocator, .{ .node_lookup_by_property = .{
+            .var_name = "t",
+            .kind = .task,
+            .type_filter = .{ .single = .task },
+            .property_eq = .{ .key = task_mod.status_property, .value = status },
+        } });
+        var terminal_table = try execute(std.testing.allocator, &graph, .{ .ops = terminal_ops });
+        defer terminal_table.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 0), terminal_table.rows.items.len);
+    }
+}
+
+test "persistent effective task status uses bounded indexed candidates" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNodesBatch(&.{
+        .{ .id = .fromInt(1), .kind = .task, .text = "open" },
+        .{ .id = .fromInt(2), .kind = .task, .text = "live claim" },
+        .{ .id = .fromInt(3), .kind = .task, .text = "expired claim" },
+        .{ .id = .fromInt(4), .kind = .task, .text = "completed crash window" },
+    });
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(1), task_mod.status_property, "open");
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(2), task_mod.status_property, "claimed");
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(2), task_mod.claimed_by_property, "agent-a");
+    try store.setUintProperty(std.testing.allocator, .{ .node = .fromInt(2) }, task_mod.claim_expires_ns_property, 101);
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(3), task_mod.status_property, "claimed");
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(3), task_mod.claimed_by_property, "agent-b");
+    try store.setUintProperty(std.testing.allocator, .{ .node = .fromInt(3) }, task_mod.claim_expires_ns_property, 100);
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(4), task_mod.status_property, "completed");
+    try store.setUintProperty(std.testing.allocator, .{ .node = .fromInt(4) }, "task_completed_ns", 1);
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(4), task_mod.claimed_by_property, "agent-c");
+    try store.setUintProperty(std.testing.allocator, .{ .node = .fromInt(4) }, task_mod.claim_expires_ns_property, 999);
+
+    const expected = [_]struct { status: []const u8, ids: []const u64 }{
+        .{ .status = "open", .ids = &.{ 1, 3 } },
+        .{ .status = "claimed", .ids = &.{2} },
+        .{ .status = "completed", .ids = &.{4} },
+        .{ .status = "failed", .ids = &.{} },
+    };
+    for (expected) |case| {
+        var ids = try lookupStoreTaskIdsByEffectiveStatus(store, std.testing.allocator, null, .{ .single = .task }, .{
+            .key = task_mod.status_property,
+            .value = case.status,
+        }, 8, 100);
+        defer ids.deinit(std.testing.allocator);
+        try std.testing.expectEqual(case.ids.len, ids.items.len);
+        for (case.ids, ids.items) |want, got| try std.testing.expectEqual(want, got.toInt());
+    }
+}
+
+test "schema v3 effective open status includes a task missing its crash-window marker" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNodesBatch(&.{
+        .{ .id = .fromInt(1), .kind = .task, .text = "completed" },
+        .{ .id = .fromInt(2), .kind = .task, .text = "implicit open after crash" },
+    });
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(1), task_mod.status_property, "completed");
+    try store.setUintProperty(std.testing.allocator, .{ .node = .fromInt(1) }, "task_completed_ns", 1);
+
+    const manifest_dir = try std.fs.path.join(std.testing.allocator, &.{ store_path, ".tinykg" });
+    defer std.testing.allocator.free(manifest_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, manifest_dir);
+    const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ manifest_dir, "store-manifest.json" });
+    defer std.testing.allocator.free(manifest_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = manifest_path,
+        .data = "{\"store_manifest_version\":1,\"storage_format_version\":2,\"schema\":{\"schema_version\":3}}",
+        .flags = .{ .truncate = true },
+    });
+
+    var ids = try lookupStoreTaskIdsByEffectiveStatus(store, std.testing.allocator, null, .{ .single = .task }, .{
+        .key = task_mod.status_property,
+        .value = "open",
+    }, 8, 100);
+    defer ids.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), ids.items.len);
+    try std.testing.expectEqual(@as(u64, 2), ids.items[0].toInt());
+}
+
+test "persistent effective task status ignores terminal leases and fails closed on saturated claims" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+
+    const node_count: usize = 74;
+    const nodes = try std.testing.allocator.alloc(graph_mod.Node, node_count);
+    defer std.testing.allocator.free(nodes);
+    for (nodes, 0..) |*node, index_pos| node.* = .{
+        .id = .fromInt(index_pos + 1),
+        .kind = .task,
+        .text = "status candidate",
+    };
+    try store.appendNodesBatch(nodes);
+
+    const manifest_dir = try std.fs.path.join(std.testing.allocator, &.{ store_path, ".tinykg" });
+    defer std.testing.allocator.free(manifest_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, manifest_dir);
+    const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ manifest_dir, "store-manifest.json" });
+    defer std.testing.allocator.free(manifest_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = manifest_path,
+        .data = "{\"store_manifest_version\":1,\"storage_format_version\":2,\"schema\":{\"schema_version\":3}}",
+        .flags = .{ .truncate = true },
+    });
+
+    var initial_writes = try std.testing.allocator.alloc(storage.PropertyPayloadWrite, 36 * 3 + 3);
+    defer std.testing.allocator.free(initial_writes);
+    for (0..36) |index_pos| {
+        const id: core.NodeId = .fromInt(index_pos + 1);
+        initial_writes[index_pos * 3] = .{ .owner = .{ .node = id }, .key = task_mod.status_property, .value = .{ .string = "completed" } };
+        initial_writes[index_pos * 3 + 1] = .{ .owner = .{ .node = id }, .key = "task_completed_ns", .value = .{ .uint = 1 } };
+        initial_writes[index_pos * 3 + 2] = .{ .owner = .{ .node = id }, .key = task_mod.claim_expires_ns_property, .value = .{ .uint = 101 } };
+    }
+    initial_writes[108] = .{ .owner = .{ .node = .fromInt(37) }, .key = task_mod.status_property, .value = .{ .string = "claimed" } };
+    initial_writes[109] = .{ .owner = .{ .node = .fromInt(37) }, .key = task_mod.claimed_by_property, .value = .{ .string = "agent-a" } };
+    initial_writes[110] = .{ .owner = .{ .node = .fromInt(37) }, .key = task_mod.claim_expires_ns_property, .value = .{ .uint = 101 } };
+    _ = try store.upsertPropertiesBatch(std.testing.allocator, initial_writes);
+
+    // Terminal tasks retain stale lease fields after a crash window. They
+    // must not consume the claimed-status candidate budget.
+    var claimed = try lookupStoreTaskIdsByEffectiveStatus(store, std.testing.allocator, null, .{ .single = .task }, .{
+        .key = task_mod.status_property,
+        .value = "claimed",
+    }, 1, 100);
+    defer claimed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), claimed.items.len);
+    try std.testing.expectEqual(@as(u64, 37), claimed.items[0].toInt());
+
+    // Fill the bounded raw-claimed window with expired leases and place a
+    // live claim after it. Returning an empty success would be a false answer;
+    // the executor must surface budget pressure instead.
+    var pressure_writes = try std.testing.allocator.alloc(storage.PropertyPayloadWrite, (74 - 37 + 1) * 3);
+    defer std.testing.allocator.free(pressure_writes);
+    var write_index: usize = 0;
+    for (37..75) |raw_id| {
+        const id: core.NodeId = .fromInt(raw_id);
+        pressure_writes[write_index] = .{ .owner = .{ .node = id }, .key = task_mod.status_property, .value = .{ .string = "claimed" } };
+        pressure_writes[write_index + 1] = .{ .owner = .{ .node = id }, .key = task_mod.claimed_by_property, .value = .{ .string = "agent-a" } };
+        pressure_writes[write_index + 2] = .{
+            .owner = .{ .node = id },
+            .key = task_mod.claim_expires_ns_property,
+            .value = .{ .uint = if (raw_id == 74) 101 else 100 },
+        };
+        write_index += 3;
+    }
+    _ = try store.upsertPropertiesBatch(std.testing.allocator, pressure_writes);
+    try std.testing.expectError(core.Error.BudgetExceeded, lookupStoreTaskIdsByEffectiveStatus(store, std.testing.allocator, null, .{ .single = .task }, .{
+        .key = task_mod.status_property,
+        .value = "claimed",
+    }, 1, 100));
+
+    try std.testing.expectEqual(@as(usize, 5000), currentGenerationCandidateLimit(5000));
+    try std.testing.expectEqual(@as(usize, 5000), textSearchCandidateLimitForLatest(5000));
+}
+
+test "mixed status domain can satisfy limit despite saturated task candidates" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+
+    const candidate_limit = currentGenerationCandidateLimit(1);
+    const task_count = candidate_limit + 1;
+    const nodes = try std.testing.allocator.alloc(graph_mod.Node, task_count + 1);
+    defer std.testing.allocator.free(nodes);
+    nodes[0] = .{ .id = .fromInt(1), .kind = .concept, .text = "ordinary claimed status" };
+    for (nodes[1..], 0..) |*node, index_pos| node.* = .{
+        .id = .fromInt(index_pos + 2),
+        .kind = .task,
+        .text = "expired task claim",
+    };
+    try store.appendNodesBatch(nodes);
+
+    const writes = try std.testing.allocator.alloc(storage.PropertyPayloadWrite, 1 + task_count * 3);
+    defer std.testing.allocator.free(writes);
+    writes[0] = .{ .owner = .{ .node = .fromInt(1) }, .key = task_mod.status_property, .value = .{ .string = "claimed" } };
+    var write_index: usize = 1;
+    for (0..task_count) |index_pos| {
+        const id: core.NodeId = .fromInt(index_pos + 2);
+        writes[write_index] = .{ .owner = .{ .node = id }, .key = task_mod.status_property, .value = .{ .string = "claimed" } };
+        writes[write_index + 1] = .{ .owner = .{ .node = id }, .key = task_mod.claimed_by_property, .value = .{ .string = "expired-agent" } };
+        writes[write_index + 2] = .{ .owner = .{ .node = id }, .key = task_mod.claim_expires_ns_property, .value = .{ .uint = 100 } };
+        write_index += 3;
+    }
+    try store.appendPropertiesBatch(std.testing.allocator, writes);
+
+    const manifest_dir = try std.fs.path.join(std.testing.allocator, &.{ store_path, ".tinykg" });
+    defer std.testing.allocator.free(manifest_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, manifest_dir);
+    const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ manifest_dir, "store-manifest.json" });
+    defer std.testing.allocator.free(manifest_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = manifest_path,
+        .data = "{\"store_manifest_version\":1,\"storage_format_version\":2,\"schema\":{\"schema_version\":3}}",
+        .flags = .{ .truncate = true },
+    });
+
+    var ids = try lookupStoreNodeIdsByStatusProperty(store, std.testing.allocator, null, .any, .{
+        .key = task_mod.status_property,
+        .value = "claimed",
+    }, 1, 100);
+    defer ids.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), ids.items.len);
+    try std.testing.expectEqual(@as(u64, 1), ids.items[0].toInt());
+}
+
+test "mixed status domain can satisfy limit while legacy tasks require migration" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    // Size the legacy population against the larger request below.  Basing
+    // this on LIMIT 1 only exercises the "ordinary property satisfies the
+    // query" branch: LIMIT 2 has a larger overfetch budget and can otherwise
+    // enumerate every legacy task without requiring migration.
+    const legacy_task_count = currentGenerationCandidateLimit(2) + 1;
+    const nodes = try std.testing.allocator.alloc(graph_mod.Node, legacy_task_count + 1);
+    defer std.testing.allocator.free(nodes);
+    nodes[0] = .{ .id = .fromInt(1), .kind = .concept, .text = "ordinary open status" };
+    for (nodes[1..], 0..) |*node, index_pos| node.* = .{
+        .id = .fromInt(index_pos + 2),
+        .kind = .task,
+        .text = "legacy implicit-open task",
+    };
+    try store.appendNodesBatch(nodes);
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(1), task_mod.status_property, "open");
+
+    var satisfied = try lookupStoreNodeIdsByStatusProperty(store, std.testing.allocator, null, .any, .{
+        .key = task_mod.status_property,
+        .value = "open",
+    }, 1, 100);
+    defer satisfied.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), satisfied.items.len);
+    try std.testing.expectEqual(@as(u64, 1), satisfied.items[0].toInt());
+
+    try std.testing.expectError(error.TaskStatusMigrationRequired, lookupStoreNodeIdsByStatusProperty(store, std.testing.allocator, null, .any, .{
+        .key = task_mod.status_property,
+        .value = "open",
+    }, 2, 100));
+}
+
+test "malformed task status manifest is not reported as index corruption" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .task, .text = "open task" });
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(1), task_mod.status_property, "open");
+    const manifest_dir = try std.fs.path.join(std.testing.allocator, &.{ store_path, ".tinykg" });
+    defer std.testing.allocator.free(manifest_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, manifest_dir);
+    const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ manifest_dir, "store-manifest.json" });
+    defer std.testing.allocator.free(manifest_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = manifest_path,
+        .data = "{not-json",
+        .flags = .{ .truncate = true },
+    });
+
+    try std.testing.expectError(error.InvalidStoreManifest, lookupStoreTaskIdsByEffectiveStatus(store, std.testing.allocator, null, .{ .single = .task }, .{
+        .key = task_mod.status_property,
+        .value = "open",
+    }, 1, 100));
+}
+
+test "large pre-status store requires explicit task status migration" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    const legacy_count = currentGenerationCandidateLimit(1) + 1;
+    const nodes = try std.testing.allocator.alloc(graph_mod.Node, legacy_count);
+    defer std.testing.allocator.free(nodes);
+    for (nodes, 0..) |*node, index_pos| node.* = .{
+        .id = .fromInt(index_pos + 1),
+        .kind = .task,
+        .text = "legacy task",
+    };
+    try store.appendNodesBatch(nodes);
+
+    try std.testing.expectError(
+        error.TaskStatusMigrationRequired,
+        lookupStoreTaskIdsByEffectiveStatus(store, std.testing.allocator, null, .{ .single = .task }, .{
+            .key = task_mod.status_property,
+            .value = "open",
+        }, 1, 0),
+    );
+}
+
+test "persistent node candidate overfetch never hides current generations" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+
+    const candidate_limit = currentGenerationCandidateLimit(1);
+    const node_count = candidate_limit + 2;
+    const nodes = try std.testing.allocator.alloc(graph_mod.Node, node_count);
+    defer std.testing.allocator.free(nodes);
+    for (nodes, 0..) |*node, index_pos| node.* = .{
+        .id = .fromInt(index_pos + 1),
+        .kind = .file,
+        .text = "generation pressure sentinel",
+    };
+    try store.appendNodesBatch(nodes);
+
+    const edges = try std.testing.allocator.alloc(graph_mod.Edge, candidate_limit + 1);
+    defer std.testing.allocator.free(edges);
+    for (edges, 0..) |*edge, index_pos| edge.* = .{
+        .id = .fromInt(index_pos + 1),
+        .src = .fromInt(index_pos + 1),
+        .dst = .fromInt(node_count),
+        .rel = .deprecated_by,
+    };
+    // The first candidate_limit rows are stale. The +1 probe row is current,
+    // so bounded lookup must still recover it instead of reporting pressure.
+    try store.appendEdgesBatch(edges[0..candidate_limit]);
+
+    const property_writes = try std.testing.allocator.alloc(storage.PropertyPayloadWrite, node_count);
+    defer std.testing.allocator.free(property_writes);
+    for (property_writes, 0..) |*write, index_pos| write.* = .{
+        .owner = .{ .node = .fromInt(index_pos + 1) },
+        .key = "schema_type",
+        .value = .{ .string = "generation-pressure" },
+    };
+    try store.appendPropertiesBatch(std.testing.allocator, property_writes);
+
+    const cursor = NodeCursor{ .store = .{ .allocator = std.testing.allocator, .store = store } };
+    var recovered = try cursor.lookupByText(std.testing.allocator, .file, "generation pressure sentinel", 1);
+    defer recovered.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), recovered.items.len);
+    try std.testing.expectEqual(@as(u64, candidate_limit + 1), recovered.items[0].toInt());
+
+    // Once the probe row is stale too, a matching current row exists beyond
+    // the bounded window. Exact text, property and scan paths must all fail
+    // closed instead of returning an empty successful result.
+    try store.appendEdgesBatch(edges[candidate_limit .. candidate_limit + 1]);
+    try std.testing.expectError(
+        core.Error.BudgetExceeded,
+        cursor.lookupByText(std.testing.allocator, .file, "generation pressure sentinel", 1),
+    );
+    try std.testing.expectError(
+        core.Error.BudgetExceeded,
+        cursor.lookupByPropertyFilter(std.testing.allocator, .{ .single = .file }, .{
+            .key = "schema_type",
+            .value = "generation-pressure",
+        }, 1),
+    );
+    try std.testing.expectError(
+        core.Error.BudgetExceeded,
+        cursor.scan(std.testing.allocator, .file, 1),
+    );
+    try std.testing.expectError(
+        core.Error.BudgetExceeded,
+        cursor.searchText(
+            std.testing.allocator,
+            "generation pressure sentinel",
+            .{ .single = .file },
+            1,
+            10_000,
+            .none,
+        ),
+    );
 }
 
 test "executor applies node scan text predicate before result limit" {

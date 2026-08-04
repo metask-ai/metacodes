@@ -2,9 +2,19 @@ const std = @import("std");
 const builtin = @import("builtin");
 const core = @import("core.zig");
 const graph_mod = @import("graph.zig");
+const schema = @import("schema.zig");
 const storage_mod = @import("storage.zig");
+const read_only_memory_map = @import("read_only_memory_map.zig");
 
 const default_max_token_bytes: usize = 128;
+/// A stale persistent catalog may be searched through an ephemeral, read-only
+/// index only while the whole-store scan remains predictably bounded. Larger
+/// stores must run explicit maintenance; silently materializing GBs of BM25
+/// state on every query is worse than reporting the stale index.
+pub const stale_store_scan_max_nodes: u64 = 100_000;
+pub const stale_store_scan_max_text_bytes: u64 = 128 * 1024 * 1024;
+pub const stale_store_scan_max_event_bytes: u64 = 64 * 1024 * 1024;
+pub const stale_store_scan_max_property_delta_bytes: u64 = 64 * 1024 * 1024;
 var text_temp_nonce: std.atomic.Value(u64) = .init(0);
 
 fn currentProcessIdForTempPath() u64 {
@@ -193,25 +203,62 @@ pub fn searchText(
     defer query_tokens.deinit();
     if (query_tokens.items.items.len == 0) return std.ArrayList(TextSearchHit).empty;
 
-    var graph_index_repaired = false;
     const stale = try persistentTextCatalogQuickStaleDeadline(allocator, store, options.deadline);
-    if (stale) {
-        _ = try rebuildPersistentTextCatalogIfStaleWithGraphRepair(allocator, store, &graph_index_repaired, options.deadline);
-    }
+    if (stale) return try searchTextStoreScan(allocator, store, query, options);
     return searchTextPersistentTokens(allocator, store, query_tokens.items.items, options) catch |err| switch (err) {
-        error.FileNotFound, error.InvalidRecord => {
-            _ = try rebuildPersistentTextCatalogWithGraphRepair(allocator, store, &graph_index_repaired, options.deadline);
-            return try searchTextPersistentTokens(allocator, store, query_tokens.items.items, options);
-        },
-        core.Error.BudgetExceeded => {
-            if (try persistentTextCatalogStaleDeadline(allocator, store, options.deadline)) {
-                _ = try rebuildPersistentTextCatalogWithGraphRepair(allocator, store, &graph_index_repaired, options.deadline);
-                return try searchTextPersistentTokens(allocator, store, query_tokens.items.items, options);
-            }
-            return core.Error.BudgetExceeded;
-        },
+        error.FileNotFound, error.InvalidRecord => try searchTextStoreScan(allocator, store, query, options),
         else => |e| return e,
     };
+}
+
+fn searchTextStoreScan(
+    allocator: std.mem.Allocator,
+    store: storage_mod.Store,
+    query: []const u8,
+    options: TextSearchOptions,
+) !std.ArrayList(TextSearchHit) {
+    const max_metadata_bytes = try admitStaleStoreScan(store, options.deadline);
+    var index = TextIndex.buildFromStoreReadOnlyDeadline(allocator, store, max_metadata_bytes, stale_store_scan_max_property_delta_bytes, options.deadline) catch |err| switch (err) {
+        error.SearchableMetadataBudgetExceeded => return error.TextIndexMaintenanceRequired,
+        else => |e| return e,
+    };
+    defer index.deinit();
+    return try index.search(query, options);
+}
+
+fn staleStoreScanAllowed(node_count: u64, logical_text_bytes: u64, event_bytes: u64, property_delta_bytes: u64) bool {
+    return node_count <= stale_store_scan_max_nodes and
+        logical_text_bytes <= stale_store_scan_max_text_bytes and
+        event_bytes <= stale_store_scan_max_event_bytes and
+        property_delta_bytes <= stale_store_scan_max_property_delta_bytes;
+}
+
+test "stale store scan admission rejects unbounded node and text volumes" {
+    try std.testing.expect(staleStoreScanAllowed(stale_store_scan_max_nodes, stale_store_scan_max_text_bytes, stale_store_scan_max_event_bytes, stale_store_scan_max_property_delta_bytes));
+    try std.testing.expect(!staleStoreScanAllowed(stale_store_scan_max_nodes + 1, 0, 0, 0));
+    try std.testing.expect(!staleStoreScanAllowed(0, stale_store_scan_max_text_bytes + 1, 0, 0));
+    try std.testing.expect(!staleStoreScanAllowed(0, 0, stale_store_scan_max_event_bytes + 1, 0));
+    try std.testing.expect(!staleStoreScanAllowed(0, 0, 0, stale_store_scan_max_property_delta_bytes + 1));
+}
+
+fn admitStaleStoreScan(store: storage_mod.Store, deadline: core.QueryDeadline) !u64 {
+    if (deadline.expired()) return core.Error.BudgetExceeded;
+    // IndexMeta is allowed to lag the canonical event log after a crash, so
+    // its node count is not a safe admission bound. Stat the event log first:
+    // large stores fail without replay, while a bounded log can be counted
+    // exactly before the read-only fallback materializes graph/index state.
+    // events.bin and node_texts.dat are canonical data, not rebuildable text
+    // artifacts. Corruption or disappearance must retain its real error;
+    // reporting "maintenance required" would send operators toward an index
+    // rebuild that cannot repair lost primary records.
+    const event_bytes = try store.eventByteCount();
+    if (event_bytes > stale_store_scan_max_event_bytes) return error.TextIndexMaintenanceRequired;
+    const node_count = try store.nodeEventCountUpTo(stale_store_scan_max_nodes);
+    if (node_count > stale_store_scan_max_nodes) return error.TextIndexMaintenanceRequired;
+    const logical_text_bytes = try store.primaryNodeTextLogicalBytes();
+    const property_delta_bytes = try store.propertyPayloadDeltaByteCount();
+    if (!staleStoreScanAllowed(node_count, logical_text_bytes, event_bytes, property_delta_bytes)) return error.TextIndexMaintenanceRequired;
+    return stale_store_scan_max_text_bytes - logical_text_bytes;
 }
 
 pub const TextQueryPlanStats = struct {
@@ -234,18 +281,27 @@ pub fn textQueryPlanStats(
     defer query_tokens.deinit();
     if (query_tokens.items.items.len == 0) return .{};
 
-    var graph_index_repaired = false;
     const stale = try persistentTextCatalogQuickStaleDeadline(allocator, store, options.deadline);
-    if (stale) {
-        _ = try rebuildPersistentTextCatalogWithGraphRepair(allocator, store, &graph_index_repaired, options.deadline);
-    }
+    if (stale) return try textQueryPlanStatsStoreScan(allocator, store, query, options);
     return textQueryPlanStatsPersistentTokens(allocator, store, query_tokens.items.items) catch |err| switch (err) {
-        error.FileNotFound, error.InvalidRecord => {
-            _ = try rebuildPersistentTextCatalogWithGraphRepair(allocator, store, &graph_index_repaired, options.deadline);
-            return try textQueryPlanStatsPersistentTokens(allocator, store, query_tokens.items.items);
-        },
+        error.FileNotFound, error.InvalidRecord => try textQueryPlanStatsStoreScan(allocator, store, query, options),
         else => |e| return e,
     };
+}
+
+fn textQueryPlanStatsStoreScan(
+    allocator: std.mem.Allocator,
+    store: storage_mod.Store,
+    query: []const u8,
+    options: TextSearchOptions,
+) !TextQueryPlanStats {
+    const max_metadata_bytes = try admitStaleStoreScan(store, options.deadline);
+    var index = TextIndex.buildFromStoreReadOnlyDeadline(allocator, store, max_metadata_bytes, stale_store_scan_max_property_delta_bytes, options.deadline) catch |err| switch (err) {
+        error.SearchableMetadataBudgetExceeded => return error.TextIndexMaintenanceRequired,
+        else => |e| return e,
+    };
+    defer index.deinit();
+    return try index.queryPlanStats(query, options);
 }
 
 fn textQueryPlanStatsPersistentTokens(
@@ -286,21 +342,6 @@ fn rebuildPersistentTextCatalogWithGraphRepair(
     var rebuild_lock = try acquirePersistentTextRebuildLockDeadline(allocator, store, deadline);
     defer rebuild_lock.deinit();
 
-    return try rebuildPersistentTextCatalogLockedWithGraphRepair(allocator, store, graph_index_repaired, deadline);
-}
-
-fn rebuildPersistentTextCatalogIfStaleWithGraphRepair(
-    allocator: std.mem.Allocator,
-    store: storage_mod.Store,
-    graph_index_repaired: *bool,
-    deadline: core.QueryDeadline,
-) !PersistentTextMeta {
-    var rebuild_lock = try acquirePersistentTextRebuildLockDeadline(allocator, store, deadline);
-    defer rebuild_lock.deinit();
-
-    if (!try persistentTextCatalogQuickStaleDeadline(allocator, store, deadline)) {
-        return try readPersistentTextMeta(allocator, store);
-    }
     return try rebuildPersistentTextCatalogLockedWithGraphRepair(allocator, store, graph_index_repaired, deadline);
 }
 
@@ -1519,11 +1560,7 @@ const TextDocsFileView = struct {
         if (header_n != header_bytes.len) return error.InvalidRecord;
         const header = try TextDocsHeader.decode(&header_bytes);
         const len = std.math.cast(usize, stat.size) orelse return error.RecordTooLarge;
-        const map = if (len == 0) null else std.Io.File.MemoryMap.create(store.io, file, .{
-            .len = len,
-            .protection = .{ .read = true, .write = false },
-            .populate = false,
-        }) catch null;
+        const map = if (len == 0) null else read_only_memory_map.create(store.io, file, len) catch null;
 
         return .{
             .io = store.io,
@@ -1652,11 +1689,7 @@ const TextTermsFileView = struct {
         const stat = try file.stat(store.io);
         if (stat.kind != .file) return error.IsDir;
         const len = std.math.cast(usize, stat.size) orelse return error.RecordTooLarge;
-        const map = if (len == 0) null else std.Io.File.MemoryMap.create(store.io, file, .{
-            .len = len,
-            .protection = .{ .read = true, .write = false },
-            .populate = false,
-        }) catch null;
+        const map = if (len == 0) null else read_only_memory_map.create(store.io, file, len) catch null;
 
         return .{
             .io = store.io,
@@ -1960,11 +1993,7 @@ const TextPostingsFileView = struct {
         const stat = try file.stat(store.io);
         if (stat.kind != .file) return error.IsDir;
         const len = std.math.cast(usize, stat.size) orelse return error.RecordTooLarge;
-        const map = if (len == 0) null else std.Io.File.MemoryMap.create(store.io, file, .{
-            .len = len,
-            .protection = .{ .read = true, .write = false },
-            .populate = false,
-        }) catch null;
+        const map = if (len == 0) null else read_only_memory_map.create(store.io, file, len) catch null;
 
         return .{
             .io = store.io,
@@ -2032,11 +2061,7 @@ const TextPostingBlocksFileView = struct {
         const stat = try file.stat(store.io);
         if (stat.kind != .file) return error.IsDir;
         const len = std.math.cast(usize, stat.size) orelse return error.RecordTooLarge;
-        const map = if (len == 0) null else std.Io.File.MemoryMap.create(store.io, file, .{
-            .len = len,
-            .protection = .{ .read = true, .write = false },
-            .populate = false,
-        }) catch null;
+        const map = if (len == 0) null else read_only_memory_map.create(store.io, file, len) catch null;
 
         return .{
             .io = store.io,
@@ -2117,11 +2142,7 @@ const TextPostingBlockImpactsFileView = struct {
         const stat = try file.stat(store.io);
         if (stat.kind != .file) return error.IsDir;
         const len = std.math.cast(usize, stat.size) orelse return error.RecordTooLarge;
-        const map = if (len == 0) null else std.Io.File.MemoryMap.create(store.io, file, .{
-            .len = len,
-            .protection = .{ .read = true, .write = false },
-            .populate = false,
-        }) catch null;
+        const map = if (len == 0) null else read_only_memory_map.create(store.io, file, len) catch null;
 
         return .{
             .io = store.io,
@@ -2758,9 +2779,13 @@ fn currentPersistentTextMetaAnchorDigest(allocator: std.mem.Allocator, store: st
 }
 
 fn persistentTextMetaAnchorStale(text_meta: PersistentTextMeta, index_meta: storage_mod.IndexMeta, searchable_metadata_digest: u64) bool {
-    return text_meta.node_digest != index_meta.node_digest or
-        text_meta.node_by_text_order_digest != index_meta.node_by_text_order_digest or
+    return persistentTextGraphAnchorStale(text_meta, index_meta) or
         text_meta.searchable_metadata_digest != searchable_metadata_digest;
+}
+
+fn persistentTextGraphAnchorStale(text_meta: PersistentTextMeta, index_meta: storage_mod.IndexMeta) bool {
+    return text_meta.node_digest != index_meta.node_digest or
+        text_meta.node_by_text_order_digest != index_meta.node_by_text_order_digest;
 }
 
 const deleted_node_tombstone_prefix = "__tinykg_deleted_node__ ";
@@ -3071,6 +3096,13 @@ pub fn persistentTextCatalogStale(allocator: std.mem.Allocator, store: storage_m
     return persistentTextCatalogStaleDeadline(allocator, store, .none);
 }
 
+/// Cheap enough for status/reporting paths: validates the publication anchors
+/// and file headers without scanning every document/posting.  A true result
+/// means callers must not treat the on-disk BM25 files as current.
+pub fn persistentTextCatalogQuickStale(allocator: std.mem.Allocator, store: storage_mod.Store) !bool {
+    return persistentTextCatalogQuickStaleDeadline(allocator, store, .none);
+}
+
 fn persistentTextCatalogStaleDeadline(allocator: std.mem.Allocator, store: storage_mod.Store, deadline: core.QueryDeadline) !bool {
     if (deadline.expired()) return core.Error.BudgetExceeded;
     const text_meta = readPersistentTextMeta(allocator, store) catch |err| switch (err) {
@@ -3082,7 +3114,11 @@ fn persistentTextCatalogStaleDeadline(allocator: std.mem.Allocator, store: stora
         error.FileNotFound, error.InvalidRecord => return true,
         else => |e| return e,
     };
-    const searchable_metadata_digest = try store.searchableNodeMetadataDigest(allocator);
+    if (persistentTextGraphAnchorStale(text_meta, index_meta)) return true;
+    const searchable_metadata_digest = store.searchableNodeMetadataDigest(allocator) catch |err| switch (err) {
+        error.FileNotFound, error.InvalidRecord => return true,
+        else => |e| return e,
+    };
     if (persistentTextMetaAnchorStale(text_meta, index_meta, searchable_metadata_digest)) return true;
 
     const docs_path = try textDocsPath(allocator, store);
@@ -3124,7 +3160,12 @@ fn persistentTextCatalogQuickStaleDeadline(allocator: std.mem.Allocator, store: 
         error.FileNotFound, error.InvalidRecord => return true,
         else => |e| return e,
     };
-    const searchable_metadata_digest = try store.searchableNodeMetadataDigest(allocator);
+    if (persistentTextGraphAnchorStale(text_meta, index_meta)) return true;
+    const searchable_metadata_digest = store.searchableNodeMetadataDigestLimitedDeadline(allocator, stale_store_scan_max_property_delta_bytes, deadline) catch |err| switch (err) {
+        error.SearchableMetadataBudgetExceeded => return error.TextIndexMaintenanceRequired,
+        error.FileNotFound, error.InvalidRecord => return true,
+        else => |e| return e,
+    };
     if (persistentTextMetaAnchorStale(text_meta, index_meta, searchable_metadata_digest)) return true;
     if (try persistentTextDocsHeaderStale(allocator, store, text_meta)) return true;
     if (persistentTermsOrPostingsHeaderStale(allocator, store, text_meta)) |stale| {
@@ -4883,12 +4924,11 @@ fn searchPersistentMultiTermTopHitCandidates(
     mode: PersistentMultiTermCandidateMode,
 ) !?std.ArrayList(TextSearchHit) {
     if (query_term_plans.len == 0 or query_term_plans.len > persistent_query_term_freq_cache_max_terms) return null;
-    // member_filter 下推纪律(Linus 严重1):本装配的候选来自全库序 bounded top-64
+    // node/member filter 下推纪律(Linus 严重1):本装配的候选来自全库序 bounded top-64
     // (磁盘 per-term 缓存 + medium/cjk anchor 收集回调),**过滤前截断**——成员在全库 top-64
     // 之外就永远进不了候选,--project/--schema-type 在大库上静默漏召回。统一退 full-scan
     // 主路径(那里截断前过滤已就位),与单 term canUsePersistentTermTopHitCache gate 同款。
-    // kind_filter 不在此禁(既有行为:装配内打分循环有 kind 兜底,测试依赖该路径的预算特性)。
-    if (options.member_filter != null) return null;
+    if (textSearchHasNodeFilter(options) or options.member_filter != null) return null;
     if (textBenchTraceEnabled()) {
         std.debug.print(
             "text_trace=multi_top_hit_start terms={} max_postings={} limit={} mode={s}\n",
@@ -5086,9 +5126,7 @@ fn searchPersistentMultiTermTopHitCandidates(
         if (candidate_doc_id == 0) return error.InvalidRecord;
         const doc = try docs_view.readDocAt(candidate_doc_id - 1);
         if (doc.doc_id != candidate_doc_id) return error.InvalidRecord;
-        if (options.kind_filter) |kind| {
-            if ((try doc.nodeKind()) != kind) continue;
-        }
+        if (!textSearchMatchesNodeKind(options, try doc.nodeKind())) continue;
         if (options.member_filter) |m| {
             if (!m.contains(doc.node_id)) continue;
         }
@@ -5202,9 +5240,7 @@ fn collectPersistentSearchCandidatePosting(ctx: *PersistentSearchCandidateContex
     if (posting.doc_id == 0) return error.InvalidRecord;
     const doc = try ctx.docs_view.readDocAt(posting.doc_id - 1);
     if (doc.doc_id != posting.doc_id) return error.InvalidRecord;
-    if (ctx.options.kind_filter) |kind| {
-        if ((try doc.nodeKind()) != kind) return;
-    }
+    if (!textSearchMatchesNodeKind(ctx.options, try doc.nodeKind())) return;
     if (ctx.options.member_filter) |m| {
         if (!m.contains(doc.node_id)) return;
     }
@@ -5766,7 +5802,7 @@ test "posting block seen set keeps small terms on stack" {
 }
 
 fn canUsePersistentTermTopHitCache(options: TextSearchOptions, entry: TextTermEntry) bool {
-    if (options.kind_filter != null) return false;
+    if (textSearchHasNodeFilter(options)) return false;
     if (options.member_filter != null) return false; // top-hit 缓存是全库序,过滤前截断会漏
     if (options.limit == 0 or options.limit > persistent_term_top_hit_capacity) return false;
     if (entry.postings_count < persistent_term_top_hit_min_postings) return false;
@@ -5882,9 +5918,7 @@ fn appendSingleTermSearchPosting(ctx: *SingleTermSearchContext, posting: TextPos
         (try getCachedTextDocFromView(ctx.allocator, ctx.store, ctx.docs_view, ctx.node_view, ctx.docs, posting.doc_id)).doc
     else
         try getCachedTextDocRecordFromView(ctx.docs_view, ctx.doc_records, posting.doc_id);
-    if (ctx.options.kind_filter) |kind| {
-        if ((try doc.nodeKind()) != kind) return;
-    }
+    if (!textSearchMatchesNodeKind(ctx.options, try doc.nodeKind())) return;
     if (ctx.options.member_filter) |m| {
         if (!m.contains(doc.node_id)) return;
     }
@@ -5939,9 +5973,7 @@ fn scorePersistentSearchPosting(ctx: *PersistentSearchTermContext, posting: Text
         (try getCachedTextDocFromView(ctx.allocator, ctx.store, ctx.docs_view, ctx.node_view, ctx.docs, posting.doc_id)).doc
     else
         try getCachedTextDocRecordFromView(ctx.docs_view, ctx.doc_records, posting.doc_id);
-    if (ctx.options.kind_filter) |kind| {
-        if ((try doc.nodeKind()) != kind) return;
-    }
+    if (!textSearchMatchesNodeKind(ctx.options, try doc.nodeKind())) return;
     if (ctx.options.member_filter) |m| {
         if (!m.contains(doc.node_id)) return;
     }
@@ -6000,6 +6032,10 @@ pub const TextFieldWeights = struct {
 
 pub const TextSearchOptions = struct {
     kind_filter: ?core.NodeKind = null,
+    /// Multi-kind schema descendants. The pointed set only needs to live for
+    /// the synchronous search call; keeping it by reference avoids copying a
+    /// 4096-bit set through every posting callback context.
+    kind_set_filter: ?*const schema.NodeTypeSet = null,
     /// server-side 成员过滤(截断前生效,kind_filter 同款插入点):非 null 时只有集合内
     /// node_id 进入打分/top-K。search --project(contain 子树)与 --schema-type(property
     /// 成员集)都归一到此。**必须在截断前过滤**——后置过滤 + 放大候选窗口是创可贴
@@ -6018,6 +6054,20 @@ pub const TextSearchOptions = struct {
     /// **只作用于覆盖门,不影响重复频率门**(叠字 raw_tf 要求)。
     cjk_coverage_ratio: f32 = 0,
 };
+
+fn textSearchHasNodeFilter(options: TextSearchOptions) bool {
+    return options.kind_filter != null or options.kind_set_filter != null;
+}
+
+fn textSearchMatchesNodeKind(options: TextSearchOptions, kind: core.NodeKind) bool {
+    if (options.kind_filter) |expected| {
+        if (kind != expected) return false;
+    }
+    if (options.kind_set_filter) |set| {
+        if (!set.containsNodeKind(kind)) return false;
+    }
+    return true;
+}
 
 /// CJK bigram 覆盖门 floor:文档至少要命中这么多个 query bigram 才进结果。
 /// required=0(query 无 CJK bigram)→ 0(门失效,纯 ASCII/单字路径不变)。
@@ -6131,24 +6181,97 @@ pub const TextDocument = struct {
     summary: ?[]const u8 = null,
 };
 
+fn textIndexKindLabel(kind: core.NodeKind, fallback_buffer: *[16]u8) []const u8 {
+    inline for (@typeInfo(core.NodeKind).@"enum".fields) |field| {
+        if (@intFromEnum(kind) == field.value) return field.name;
+    }
+    return std.fmt.bufPrint(fallback_buffer, "type#{}", .{@intFromEnum(kind)}) catch unreachable;
+}
+
 const SearchableNodeMetadata = struct {
     name: ?[]const u8 = null,
     summary: ?[]const u8 = null,
+    owned: bool = false,
 
     fn deinit(self: *SearchableNodeMetadata, allocator: std.mem.Allocator) void {
-        if (self.name) |name| allocator.free(name);
-        if (self.summary) |summary| allocator.free(summary);
+        if (self.owned) {
+            if (self.name) |name| allocator.free(name);
+            if (self.summary) |summary| allocator.free(summary);
+        }
         self.* = .{};
     }
 };
 
 fn readSearchableNodeMetadata(allocator: std.mem.Allocator, store: storage_mod.Store, node_id: core.NodeId) !SearchableNodeMetadata {
-    var out = SearchableNodeMetadata{};
+    var out = SearchableNodeMetadata{ .owned = true };
     errdefer out.deinit(allocator);
     out.name = try store.getNodeStringProperty(allocator, node_id, "name");
     out.summary = try store.getNodeStringProperty(allocator, node_id, "summary");
     return out;
 }
+
+const SearchableNodeMetadataSnapshot = struct {
+    allocator: std.mem.Allocator,
+    snapshot: storage_mod.PropertySnapshot,
+    by_node: std.AutoHashMap(u64, SearchableNodeMetadata),
+
+    fn init(allocator: std.mem.Allocator, store: storage_mod.Store) !SearchableNodeMetadataSnapshot {
+        const snapshot = try store.loadSearchableNodeMetadataSnapshot(allocator);
+        return try initFromSnapshotDeadline(allocator, snapshot, .none);
+    }
+
+    fn initLimited(
+        allocator: std.mem.Allocator,
+        store: storage_mod.Store,
+        max_string_bytes: u64,
+        max_delta_scan_bytes: u64,
+        deadline: core.QueryDeadline,
+    ) !SearchableNodeMetadataSnapshot {
+        const snapshot = try store.loadSearchableNodeMetadataSnapshotWithLimitsDeadline(allocator, max_string_bytes, max_delta_scan_bytes, deadline);
+        return try initFromSnapshotDeadline(allocator, snapshot, deadline);
+    }
+
+    fn initFromSnapshotDeadline(
+        allocator: std.mem.Allocator,
+        snapshot_input: storage_mod.PropertySnapshot,
+        deadline: core.QueryDeadline,
+    ) !SearchableNodeMetadataSnapshot {
+        var snapshot = snapshot_input;
+        errdefer snapshot.deinit(allocator);
+        var by_node = std.AutoHashMap(u64, SearchableNodeMetadata).init(allocator);
+        errdefer by_node.deinit();
+
+        const name_hash = storage_mod.propertyKeyHashForLookup("name");
+        const summary_hash = storage_mod.propertyKeyHashForLookup("summary");
+        for (snapshot.entries) |entry| {
+            if (deadline.expired()) return core.Error.BudgetExceeded;
+            if (entry.value_kind != .string) continue;
+            const node_id = switch (entry.owner) {
+                .node => |id| id.toInt(),
+                .edge => continue,
+            };
+            if (entry.key_hash != name_hash and entry.key_hash != summary_hash) continue;
+            const slot = try by_node.getOrPut(node_id);
+            if (!slot.found_existing) slot.value_ptr.* = .{};
+            if (entry.key_hash == name_hash) {
+                slot.value_ptr.name = entry.string_value;
+            } else {
+                slot.value_ptr.summary = entry.string_value;
+            }
+        }
+        return .{ .allocator = allocator, .snapshot = snapshot, .by_node = by_node };
+    }
+
+    fn deinit(self: *SearchableNodeMetadataSnapshot) void {
+        self.by_node.deinit();
+        self.snapshot.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    fn get(self: *const SearchableNodeMetadataSnapshot, node_id: core.NodeId) SearchableNodeMetadata {
+        return self.by_node.get(node_id.toInt()) orelse .{};
+    }
+};
 
 const IndexedDocument = struct {
     node_id: core.NodeId,
@@ -6416,46 +6539,131 @@ pub const TextIndex = struct {
     }
 
     pub fn buildFromGraphDeadline(allocator: std.mem.Allocator, graph: *const graph_mod.Graph, deadline: core.QueryDeadline) !TextIndex {
+        return buildFromGraphWithMetadataDeadline(allocator, graph, null, deadline);
+    }
+
+    fn buildFromGraphWithMetadataDeadline(
+        allocator: std.mem.Allocator,
+        graph: *const graph_mod.Graph,
+        metadata: ?*const SearchableNodeMetadataSnapshot,
+        deadline: core.QueryDeadline,
+    ) !TextIndex {
         var index = TextIndex.init(allocator);
         errdefer index.deinit();
         for (graph.nodes.items) |node| {
             if (deadline.expired()) return core.Error.BudgetExceeded;
             if (node.status != .active) continue;
-            try index.addDocument(.{ .node_id = node.id, .kind = node.kind, .text = node.text });
+            if (isDeletedNodeTombstoneNode(node.kind, node.text)) continue;
+            const node_metadata = if (metadata) |snapshot| snapshot.get(node.id) else SearchableNodeMetadata{};
+            try index.addDocument(.{
+                .node_id = node.id,
+                .kind = node.kind,
+                .text = node.text,
+                .name = node_metadata.name,
+                .summary = node_metadata.summary,
+            });
         }
         return index;
     }
 
     pub fn buildFromStore(allocator: std.mem.Allocator, store: storage_mod.Store) !TextIndex {
-        return buildFromStoreOnce(allocator, store) catch |err| switch (err) {
+        return buildFromStoreOnce(allocator, store, .none) catch |err| switch (err) {
             error.FileNotFound, error.InvalidRecord => retry: {
                 try store.repairPersistentIndexesFromLog();
-                break :retry try buildFromStoreOnce(allocator, store);
+                break :retry try buildFromStoreOnce(allocator, store, .none);
             },
             else => |e| return e,
         };
     }
 
-    fn buildFromStoreOnce(allocator: std.mem.Allocator, store: storage_mod.Store) !TextIndex {
+    /// Build an ephemeral index without repairing or publishing any store
+    /// files.  Search uses this when the persistent catalog is stale so a
+    /// read cannot unexpectedly become an O(N) write transaction.
+    pub fn buildFromStoreReadOnlyDeadline(
+        allocator: std.mem.Allocator,
+        store: storage_mod.Store,
+        max_searchable_metadata_bytes: u64,
+        max_searchable_property_scan_bytes: u64,
+        deadline: core.QueryDeadline,
+    ) !TextIndex {
+        // Property corruption is not a graph-index repair signal. Materialize
+        // and validate metadata before entering the graph fallback so a bad
+        // property delta cannot silently erase name/summary search terms.
+        var metadata = try SearchableNodeMetadataSnapshot.initLimited(allocator, store, max_searchable_metadata_bytes, max_searchable_property_scan_bytes, deadline);
+        defer metadata.deinit();
+        return buildFromStoreOnceWithMetadata(allocator, store, &metadata, deadline) catch |err| switch (err) {
+            // A read-only fallback may replay the canonical event log in
+            // memory, but it must never publish repaired graph indexes.
+            error.FileNotFound, error.InvalidRecord => {
+                var graph = try store.loadGraphDeadline(deadline);
+                defer graph.deinit();
+                return try buildFromGraphWithMetadataDeadline(allocator, &graph, &metadata, deadline);
+            },
+            else => |e| return e,
+        };
+    }
+
+    fn buildFromStoreOnce(allocator: std.mem.Allocator, store: storage_mod.Store, deadline: core.QueryDeadline) !TextIndex {
+        var metadata = try SearchableNodeMetadataSnapshot.init(allocator, store);
+        defer metadata.deinit();
+        return buildFromStoreOnceWithMetadata(allocator, store, &metadata, deadline);
+    }
+
+    fn buildFromStoreOnceWithMetadata(
+        allocator: std.mem.Allocator,
+        store: storage_mod.Store,
+        metadata: *const SearchableNodeMetadataSnapshot,
+        deadline: core.QueryDeadline,
+    ) !TextIndex {
         var index = TextIndex.init(allocator);
         errdefer index.deinit();
 
-        var ids = try store.nodeIdsIterator(null);
-        defer ids.deinit();
-        while (try ids.next()) |node_id| {
-            var node = (try store.readNodeById(allocator, node_id)) orelse return error.InvalidRecord;
-            defer node.deinit(allocator);
-            var metadata = try readSearchableNodeMetadata(allocator, store, node.id);
-            defer metadata.deinit(allocator);
-            try index.addDocument(.{
-                .node_id = node.id,
-                .kind = node.kind,
-                .text = node.text,
-                .name = metadata.name,
-                .summary = metadata.summary,
-            });
+        var nodes = try store.nodeRecordsIterator(null);
+        defer nodes.deinit();
+        while (try nodes.nextRef()) |node| {
+            if (deadline.expired()) return core.Error.BudgetExceeded;
+            const node_metadata = metadata.get(node.id);
+            if (node.text_bytes) |text| {
+                if (isDeletedNodeTombstoneNode(node.kind, text)) continue;
+                try index.addDocument(.{ .node_id = node.id, .kind = node.kind, .text = text, .name = node_metadata.name, .summary = node_metadata.summary });
+            } else if (try nodes.readRefTextBorrowed(node)) |text| {
+                if (isDeletedNodeTombstoneNode(node.kind, text)) continue;
+                try index.addDocument(.{ .node_id = node.id, .kind = node.kind, .text = text, .name = node_metadata.name, .summary = node_metadata.summary });
+            } else {
+                const text = try nodes.readRefTextAlloc(allocator, node);
+                defer allocator.free(text);
+                if (isDeletedNodeTombstoneNode(node.kind, text)) continue;
+                try index.addDocument(.{ .node_id = node.id, .kind = node.kind, .text = text, .name = node_metadata.name, .summary = node_metadata.summary });
+            }
         }
         return index;
+    }
+
+    pub fn queryPlanStats(self: TextIndex, query: []const u8, options: TextSearchOptions) !TextQueryPlanStats {
+        try validateTextSearchOptions(options);
+        if (!tokenizerOptionsEqual(options.tokenizer, self.tokenizer_options)) return core.Error.Unsupported;
+        if (options.deadline.expired()) return core.Error.BudgetExceeded;
+
+        var query_tokens = try tokenize(self.allocator, query, options.tokenizer);
+        defer query_tokens.deinit();
+        var unique_query_terms = std.StringHashMap(void).init(self.allocator);
+        defer unique_query_terms.deinit();
+        try unique_query_terms.ensureTotalCapacity(@intCast(query_tokens.items.items.len));
+
+        var stats = TextQueryPlanStats{ .query_terms = query_tokens.items.items.len };
+        for (query_tokens.items.items) |term| {
+            if (options.deadline.expired()) return core.Error.BudgetExceeded;
+            const entry = try unique_query_terms.getOrPut(term);
+            if (entry.found_existing) continue;
+            entry.value_ptr.* = {};
+            stats.unique_query_terms += 1;
+            if (self.postings_by_term.get(term)) |postings| {
+                stats.matched_terms += 1;
+                stats.postings_count_total = std.math.add(u64, stats.postings_count_total, postings.items.len) catch return error.RecordTooLarge;
+                stats.max_postings_count = @max(stats.max_postings_count, postings.items.len);
+            }
+        }
+        return stats;
     }
 
     pub fn addDocument(self: *TextIndex, doc: TextDocument) !void {
@@ -6474,7 +6682,10 @@ pub const TextIndex = struct {
         try self.collectFieldTerms(&term_weights, &owned_term_weights, doc.text, self.field_weights.text, &doc_len);
         if (doc.name) |name| try self.collectFieldTerms(&term_weights, &owned_term_weights, name, self.field_weights.text, &doc_len);
         if (doc.summary) |summary| try self.collectFieldTerms(&term_weights, &owned_term_weights, summary, self.field_weights.text, &doc_len);
-        try self.collectFieldTerms(&term_weights, &owned_term_weights, @tagName(doc.kind), self.field_weights.kind, &doc_len);
+        if (self.field_weights.kind != 0) {
+            var kind_label_buffer: [16]u8 = undefined;
+            try self.collectFieldTerms(&term_weights, &owned_term_weights, textIndexKindLabel(doc.kind, &kind_label_buffer), self.field_weights.kind, &doc_len);
+        }
         if (doc_len <= 0) return core.Error.Unsupported;
         const next_total_doc_len = self.total_doc_len + doc_len;
         if (!std.math.isFinite(next_total_doc_len)) return core.Error.Unsupported;
@@ -6593,9 +6804,7 @@ pub const TextIndex = struct {
                 if (options.deadline.expired()) return core.Error.BudgetExceeded;
                 try chargeTextPostingScan(&postings_scanned, options);
                 const doc = self.docs.items[posting.doc_index];
-                if (options.kind_filter) |kind| {
-                    if (doc.kind != kind) continue;
-                }
+                if (!textSearchMatchesNodeKind(options, doc.kind)) continue;
                 if (options.member_filter) |m| {
                     if (!m.contains(doc.node_id.toInt())) continue;
                 }
@@ -12407,18 +12616,12 @@ fn appendRunTextDocFromNode(
     run_builder: *TextPostingRunBuilder,
     text_meta: *PersistentTextMeta,
     timings: ?*PersistentTextRebuildTimings,
-    store: storage_mod.Store,
     node_id: core.NodeId,
     kind: core.NodeKind,
     text: []const u8,
-    include_metadata: bool,
+    metadata: SearchableNodeMetadata,
 ) !void {
     clearReusableArenaTermFreqs(freqs, term_arena);
-    var metadata = if (include_metadata)
-        try readSearchableNodeMetadata(scratch_allocator, store, node_id)
-    else
-        SearchableNodeMetadata{};
-    defer metadata.deinit(scratch_allocator);
 
     if (timings) |t| {
         t.docs_node_count = std.math.add(u64, t.docs_node_count, 1) catch return error.RecordTooLarge;
@@ -12484,18 +12687,12 @@ fn appendBuilderTextDocFromNode(
     text_meta: *PersistentTextMeta,
     timings: ?*PersistentTextRebuildTimings,
     io: std.Io,
-    store: storage_mod.Store,
     node_id: core.NodeId,
     kind: core.NodeKind,
     text: []const u8,
-    include_metadata: bool,
+    metadata: SearchableNodeMetadata,
 ) !void {
     clearReusableTermFreqs(allocator, freqs, owned);
-    var metadata = if (include_metadata)
-        try readSearchableNodeMetadata(allocator, store, node_id)
-    else
-        SearchableNodeMetadata{};
-    defer metadata.deinit(allocator);
 
     if (timings) |t| {
         t.docs_node_count = std.math.add(u64, t.docs_node_count, 1) catch return error.RecordTooLarge;
@@ -12631,6 +12828,11 @@ fn writeTextDocsFileFromStore(
 
     {
         const include_metadata = text_meta.searchable_metadata_digest != 0;
+        var metadata_snapshot: ?SearchableNodeMetadataSnapshot = if (include_metadata)
+            try SearchableNodeMetadataSnapshot.init(allocator, store)
+        else
+            null;
+        defer if (metadata_snapshot) |*snapshot| snapshot.deinit();
         var file = try std.Io.Dir.cwd().createFile(store.io, tmp_path, .{ .read = true, .truncate = true });
         defer file.close(store.io);
         var writer = try TextBufferedWriter.init(allocator, store.io, file, text_write_buffer_bytes);
@@ -12663,7 +12865,8 @@ fn writeTextDocsFileFromStore(
             if (node.text_bytes) |text| {
                 recordTextDocsTextSource(timings, .inline_or_mapped, text.len);
                 if (isDeletedNodeTombstoneNode(node.kind, text)) continue;
-                try appendRunTextDocFromNode(term_allocator, allocator, &writer, &record_bytes, layout_header, &overflow_records, &freqs, &term_arena, &tokenizer_scratch, &text_freq_cache, run_builder, text_meta, timings, store, node.id, node.kind, text, include_metadata);
+                const metadata = if (metadata_snapshot) |*snapshot| snapshot.get(node.id) else SearchableNodeMetadata{};
+                try appendRunTextDocFromNode(term_allocator, allocator, &writer, &record_bytes, layout_header, &overflow_records, &freqs, &term_arena, &tokenizer_scratch, &text_freq_cache, run_builder, text_meta, timings, node.id, node.kind, text, metadata);
             } else {
                 const text_read_start = if (timings != null) textMonotonicNs(store.io) else 0;
                 const borrowed_text = try nodes.readRefTextBorrowed(node);
@@ -12671,14 +12874,16 @@ fn writeTextDocsFileFromStore(
                     if (timings) |t| t.docs_text_read_ns += textElapsedNs(store.io, text_read_start);
                     recordTextDocsTextSource(timings, .borrowed, text.len);
                     if (isDeletedNodeTombstoneNode(node.kind, text)) continue;
-                    try appendRunTextDocFromNode(term_allocator, allocator, &writer, &record_bytes, layout_header, &overflow_records, &freqs, &term_arena, &tokenizer_scratch, &text_freq_cache, run_builder, text_meta, timings, store, node.id, node.kind, text, include_metadata);
+                    const metadata = if (metadata_snapshot) |*snapshot| snapshot.get(node.id) else SearchableNodeMetadata{};
+                    try appendRunTextDocFromNode(term_allocator, allocator, &writer, &record_bytes, layout_header, &overflow_records, &freqs, &term_arena, &tokenizer_scratch, &text_freq_cache, run_builder, text_meta, timings, node.id, node.kind, text, metadata);
                 } else {
                     const text = try nodes.readRefTextAlloc(allocator, node);
                     defer allocator.free(text);
                     if (timings) |t| t.docs_text_read_ns += textElapsedNs(store.io, text_read_start);
                     recordTextDocsTextSource(timings, .allocated, text.len);
                     if (isDeletedNodeTombstoneNode(node.kind, text)) continue;
-                    try appendRunTextDocFromNode(term_allocator, allocator, &writer, &record_bytes, layout_header, &overflow_records, &freqs, &term_arena, &tokenizer_scratch, &text_freq_cache, run_builder, text_meta, timings, store, node.id, node.kind, text, include_metadata);
+                    const metadata = if (metadata_snapshot) |*snapshot| snapshot.get(node.id) else SearchableNodeMetadata{};
+                    try appendRunTextDocFromNode(term_allocator, allocator, &writer, &record_bytes, layout_header, &overflow_records, &freqs, &term_arena, &tokenizer_scratch, &text_freq_cache, run_builder, text_meta, timings, node.id, node.kind, text, metadata);
                 }
             }
             if (observer) |obs| {
@@ -12732,6 +12937,11 @@ fn writeTextDocsFileFromStoreWithTermBuilder(
 
     {
         const include_metadata = text_meta.searchable_metadata_digest != 0;
+        var metadata_snapshot: ?SearchableNodeMetadataSnapshot = if (include_metadata)
+            try SearchableNodeMetadataSnapshot.init(allocator, store)
+        else
+            null;
+        defer if (metadata_snapshot) |*snapshot| snapshot.deinit();
         var file = try std.Io.Dir.cwd().createFile(store.io, tmp_path, .{ .read = true, .truncate = true });
         defer file.close(store.io);
         var writer = try TextBufferedWriter.init(allocator, store.io, file, text_write_buffer_bytes);
@@ -12762,7 +12972,8 @@ fn writeTextDocsFileFromStoreWithTermBuilder(
             if (node.text_bytes) |text| {
                 recordTextDocsTextSource(timings, .inline_or_mapped, text.len);
                 if (isDeletedNodeTombstoneNode(node.kind, text)) continue;
-                try appendBuilderTextDocFromNode(allocator, &writer, &record_bytes, layout_header, &overflow_records, &freqs, &owned, term_builder, text_meta, timings, store.io, store, node.id, node.kind, text, include_metadata);
+                const metadata = if (metadata_snapshot) |*snapshot| snapshot.get(node.id) else SearchableNodeMetadata{};
+                try appendBuilderTextDocFromNode(allocator, &writer, &record_bytes, layout_header, &overflow_records, &freqs, &owned, term_builder, text_meta, timings, store.io, node.id, node.kind, text, metadata);
             } else {
                 const text_read_start = if (timings != null) textMonotonicNs(store.io) else 0;
                 const borrowed_text = try nodes.readRefTextBorrowed(node);
@@ -12770,14 +12981,16 @@ fn writeTextDocsFileFromStoreWithTermBuilder(
                     if (timings) |t| t.docs_text_read_ns += textElapsedNs(store.io, text_read_start);
                     recordTextDocsTextSource(timings, .borrowed, text.len);
                     if (isDeletedNodeTombstoneNode(node.kind, text)) continue;
-                    try appendBuilderTextDocFromNode(allocator, &writer, &record_bytes, layout_header, &overflow_records, &freqs, &owned, term_builder, text_meta, timings, store.io, store, node.id, node.kind, text, include_metadata);
+                    const metadata = if (metadata_snapshot) |*snapshot| snapshot.get(node.id) else SearchableNodeMetadata{};
+                    try appendBuilderTextDocFromNode(allocator, &writer, &record_bytes, layout_header, &overflow_records, &freqs, &owned, term_builder, text_meta, timings, store.io, node.id, node.kind, text, metadata);
                 } else {
                     const text = try nodes.readRefTextAlloc(allocator, node);
                     defer allocator.free(text);
                     if (timings) |t| t.docs_text_read_ns += textElapsedNs(store.io, text_read_start);
                     recordTextDocsTextSource(timings, .allocated, text.len);
                     if (isDeletedNodeTombstoneNode(node.kind, text)) continue;
-                    try appendBuilderTextDocFromNode(allocator, &writer, &record_bytes, layout_header, &overflow_records, &freqs, &owned, term_builder, text_meta, timings, store.io, store, node.id, node.kind, text, include_metadata);
+                    const metadata = if (metadata_snapshot) |*snapshot| snapshot.get(node.id) else SearchableNodeMetadata{};
+                    try appendBuilderTextDocFromNode(allocator, &writer, &record_bytes, layout_header, &overflow_records, &freqs, &owned, term_builder, text_meta, timings, store.io, node.id, node.kind, text, metadata);
                 }
             }
         }
@@ -18982,6 +19195,34 @@ test "text index add document rolls back allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, textIndexAddDocumentAllocationFailure, .{});
 }
 
+test "text index accepts schema-defined node kinds without enum tag panic" {
+    var index = TextIndex.init(std.testing.allocator);
+    defer index.deinit();
+
+    const custom_kind: core.NodeKind = @enumFromInt(100);
+    try index.addDocument(.{
+        .node_id = .fromInt(1),
+        .kind = custom_kind,
+        .text = "custom schema node",
+    });
+
+    var hits = try index.search("custom schema", .{ .limit = 10 });
+    defer hits.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), hits.items.len);
+    try std.testing.expectEqual(custom_kind, hits.items[0].kind);
+
+    index.field_weights.kind = 1;
+    try index.addDocument(.{
+        .node_id = .fromInt(2),
+        .kind = @enumFromInt(101),
+        .text = "fallback label",
+    });
+    var kind_hits = try index.search("type 101", .{ .limit = 10 });
+    defer kind_hits.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), kind_hits.items.len);
+    try std.testing.expectEqual(@as(u16, 101), @intFromEnum(kind_hits.items[0].kind));
+}
+
 test "text index rejects reserved and duplicate document node ids" {
     var index = TextIndex.init(std.testing.allocator);
     defer index.deinit();
@@ -20310,6 +20551,31 @@ test "text index applies kind filter and limit" {
     try std.testing.expectEqual(file_id, hits.items[0].node_id);
 }
 
+test "text index applies schema descendant kind set before top-k" {
+    var graph = graph_mod.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+
+    const task_id = try graph.addNode(.task, "shared search term");
+    const decision_id = try graph.addNode(.decision, "shared search term");
+    _ = try graph.addNode(.file, "shared search term shared search term shared search term");
+
+    var allowed = schema.NodeTypeSet.empty();
+    try allowed.insert(@intFromEnum(core.NodeKind.task));
+    try allowed.insert(@intFromEnum(core.NodeKind.decision));
+    var index = try TextIndex.buildFromGraph(std.testing.allocator, &graph);
+    defer index.deinit();
+
+    var hits = try index.search("shared search term", .{
+        .kind_set_filter = &allowed,
+        .limit = 2,
+    });
+    defer hits.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), hits.items.len);
+    try std.testing.expect(hitsContainNode(hits.items, task_id));
+    try std.testing.expect(hitsContainNode(hits.items, decision_id));
+}
+
 test "text index enforces postings scan budget" {
     var graph = graph_mod.Graph.init(std.testing.allocator);
     defer graph.deinit();
@@ -21079,6 +21345,43 @@ test "persistent text search indexes node name and summary metadata" {
     try std.testing.expectEqual(@as(usize, 0), old_hits.items.len);
 }
 
+test "persistent text catalog detects searchable metadata values swapped between owners" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage_mod.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .observation, .text = "first physical body" });
+    try store.appendNode(.{ .id = .fromInt(2), .kind = .observation, .text = "second physical body" });
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(1), "name", "alphaswapowner");
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(2), "name", "betaswapowner");
+    _ = try rebuildPersistentTextCatalog(std.testing.allocator, store);
+    try std.testing.expect(!try persistentTextCatalogQuickStale(std.testing.allocator, store));
+
+    // The multiset of owners, keys, and values is unchanged.  A metadata
+    // anchor that combines those fields independently cannot see this swap
+    // and would keep serving postings for the old owner.
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(1), "name", "betaswapowner");
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(2), "name", "alphaswapowner");
+    try std.testing.expect(try persistentTextCatalogQuickStale(std.testing.allocator, store));
+
+    var alpha_hits = try searchText(std.testing.allocator, store, "alphaswapowner", .{ .limit = 5 });
+    defer alpha_hits.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), alpha_hits.items.len);
+    try std.testing.expectEqual(core.NodeId.fromInt(2), alpha_hits.items[0].node_id);
+
+    var beta_hits = try searchText(std.testing.allocator, store, "betaswapowner", .{ .limit = 5 });
+    defer beta_hits.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), beta_hits.items.len);
+    try std.testing.expectEqual(core.NodeId.fromInt(1), beta_hits.items[0].node_id);
+}
+
 test "searchText persistent search rolls back allocation failures" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -21518,7 +21821,6 @@ test "searchText persistent mixed-frequency multi term combines exact and top hi
     _ = try rebuildPersistentTextCatalog(std.testing.allocator, store);
 
     var hits = try searchText(std.testing.allocator, store, "common uniquetarget4096", .{
-        .kind_filter = .task,
         .limit = 8,
         .max_postings_scanned = 8,
     });
@@ -21531,7 +21833,6 @@ test "searchText persistent mixed-frequency multi term combines exact and top hi
     try std.testing.expect(found_target);
 
     var uncached = searchText(std.testing.allocator, store, "common uniquetarget4096", .{
-        .kind_filter = .task,
         .limit = 8,
         .params = .{ .k1 = 1.21 },
         .max_postings_scanned = 8,
@@ -21541,6 +21842,48 @@ test "searchText persistent mixed-frequency multi term combines exact and top hi
     };
     uncached.deinit(std.testing.allocator);
     return error.TestExpectedError;
+}
+
+test "persistent multi term kind filter fails closed before global top-hit truncation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage_mod.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+
+    var node_id: u64 = 1;
+    while (node_id <= persistent_term_top_hit_min_postings) : (node_id += 1) {
+        try store.appendNode(.{ .id = .fromInt(node_id), .kind = .file, .text = "common shared" });
+    }
+    const task_id = node_id;
+    try store.appendNode(.{ .id = .fromInt(task_id), .kind = .task, .text = "common shared" });
+    _ = try rebuildPersistentTextCatalog(std.testing.allocator, store);
+
+    // The global top-hit side stream contains only the lower-id file rows.
+    // A filtered query must not turn that truncated global candidate set into
+    // a successful empty answer; with an insufficient exact-scan budget it
+    // fails closed instead.
+    try std.testing.expectError(core.Error.BudgetExceeded, searchText(std.testing.allocator, store, "common shared", .{
+        .kind_filter = .task,
+        .limit = 1,
+        .max_postings_scanned = 1,
+    }));
+
+    const exact_budget: usize = @intCast((persistent_term_top_hit_min_postings + 1) * 2);
+    var hits = try searchText(std.testing.allocator, store, "common shared", .{
+        .kind_filter = .task,
+        .limit = 1,
+        .max_postings_scanned = exact_budget,
+    });
+    defer hits.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), hits.items.len);
+    try std.testing.expectEqual(core.NodeId.fromInt(task_id), hits.items[0].node_id);
 }
 
 test "searchText persistent single term skips low impact posting blocks" {
@@ -22522,7 +22865,7 @@ test "readPersistentTermPostingsLimited rejects oversized postings list before m
     try std.testing.expectEqual(@as(u64, 2), postings.items[1].doc_id);
 }
 
-test "searchText rebuilds persistent catalog when tokenizer version changes" {
+test "searchText falls back read-only when tokenizer version changes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -22547,12 +22890,11 @@ test "searchText rebuilds persistent catalog when tokenizer version changes" {
     try std.testing.expectEqual(@as(usize, 1), hits.items.len);
     try std.testing.expectEqual(core.NodeId.fromInt(1), hits.items[0].node_id);
 
-    const repaired_meta = try readPersistentTextMeta(std.testing.allocator, store);
-    try std.testing.expectEqual(tokenizer_version, repaired_meta.tokenizer);
-    try std.testing.expect(!try persistentTextCatalogStale(std.testing.allocator, store));
+    try std.testing.expectError(error.InvalidRecord, readPersistentTextMeta(std.testing.allocator, store));
+    try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
 }
 
-test "searchText uses persistent postings and creates missing text index" {
+test "searchText scans read-only when persistent text index is missing" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -22571,9 +22913,33 @@ test "searchText uses persistent postings and creates missing text index" {
     var hits = try searchText(std.testing.allocator, store, "edge index node", .{ .limit = 5 });
     defer hits.deinit(std.testing.allocator);
 
-    try std.testing.expect(!try persistentTextCatalogStale(std.testing.allocator, store));
+    try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
     try std.testing.expect(hits.items.len >= 1);
     try std.testing.expectEqual(core.NodeId.fromInt(2), hits.items[0].node_id);
+}
+
+test "stale text admission preserves canonical event corruption errors" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage_mod.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .observation, .text = "canonical event corruption" });
+    var events = try std.Io.Dir.cwd().openFile(std.testing.io, store.events_bin_path, .{ .mode = .read_write });
+    const event_bytes = (try events.stat(std.testing.io)).size;
+    try events.writePositionalAll(std.testing.io, "broken", event_bytes);
+    events.close(std.testing.io);
+
+    try std.testing.expectError(
+        error.InvalidRecord,
+        searchText(std.testing.allocator, store, "canonical", .{ .limit = 5 }),
+    );
 }
 
 test "searchText rejects non-default tokenizer options for persistent index" {
@@ -22597,7 +22963,7 @@ test "searchText rejects non-default tokenizer options for persistent index" {
     try std.testing.expect(!try persistentTextCatalogStale(std.testing.allocator, store));
 }
 
-test "searchText rebuilds stale persistent postings after append" {
+test "searchText reads appended node without rebuilding stale persistent postings" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -22613,10 +22979,23 @@ test "searchText rebuilds stale persistent postings after append" {
     _ = try rebuildPersistentTextCatalog(std.testing.allocator, store);
     try store.appendNode(.{ .id = .fromInt(2), .kind = .task, .text = "repair stale text postings" });
 
+    const docs_path = try textDocsPath(std.testing.allocator, store);
+    defer std.testing.allocator.free(docs_path);
+    const terms_path = try textTermsPath(std.testing.allocator, store);
+    defer std.testing.allocator.free(terms_path);
+    const postings_path = try textPostingsPath(std.testing.allocator, store);
+    defer std.testing.allocator.free(postings_path);
+    const docs_bytes_before = try textPathFileSize(std.testing.io, docs_path);
+    const terms_bytes_before = try textPathFileSize(std.testing.io, terms_path);
+    const postings_bytes_before = try textPathFileSize(std.testing.io, postings_path);
+
     var hits = try searchText(std.testing.allocator, store, "stale postings", .{ .kind_filter = .task, .limit = 5 });
     defer hits.deinit(std.testing.allocator);
 
-    try std.testing.expect(!try persistentTextCatalogStale(std.testing.allocator, store));
+    try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
+    try std.testing.expectEqual(docs_bytes_before, try textPathFileSize(std.testing.io, docs_path));
+    try std.testing.expectEqual(terms_bytes_before, try textPathFileSize(std.testing.io, terms_path));
+    try std.testing.expectEqual(postings_bytes_before, try textPathFileSize(std.testing.io, postings_path));
     try std.testing.expectEqual(@as(usize, 1), hits.items.len);
     try std.testing.expectEqual(core.NodeId.fromInt(2), hits.items[0].node_id);
 }
@@ -22630,7 +23009,9 @@ test "searchText detects committed append even when graph index meta is stale" {
     const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
     defer std.testing.allocator.free(store_path);
 
-    var store = try storage_mod.Store.init(std.testing.allocator, std.testing.io, store_path);
+    var store = try storage_mod.Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .primary_text_write_mode = .bulk_ingest,
+    });
     defer store.deinit();
     try store.createEmpty();
     try store.appendNode(.{ .id = .fromInt(1), .kind = .file, .text = "storage index" });
@@ -22649,7 +23030,7 @@ test "searchText detects committed append even when graph index meta is stale" {
     defer hits.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), hits.items.len);
     try std.testing.expectEqual(core.NodeId.fromInt(2), hits.items[0].node_id);
-    try std.testing.expect(!try persistentTextCatalogStale(std.testing.allocator, store));
+    try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
 }
 
 fn appendTestNodeEvent(store: storage_mod.Store, out: *std.ArrayList(u8), allocator: std.mem.Allocator, id: u64, kind: core.NodeKind, text: []const u8) !void {
@@ -22712,6 +23093,97 @@ test "persistent text catalog detects stale node text anchor after node append" 
 
     try store.appendNode(.{ .id = .fromInt(2), .kind = .task, .text = "repair text index" });
     try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
+}
+
+test "persistent text stale graph anchor short circuits property metadata scan" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage_mod.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .task, .text = "indexed task" });
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(1), "summary", "indexed metadata");
+    _ = try rebuildPersistentTextCatalog(std.testing.allocator, store);
+
+    try store.appendNode(.{ .id = .fromInt(2), .kind = .task, .text = "new stale task" });
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, store.property_payload_delta_path);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, store.property_payload_delta_path);
+
+    // The graph anchor already proves staleness. Touching the deliberately
+    // invalid property path here would surface IsDir instead of returning.
+    try std.testing.expect(try persistentTextCatalogQuickStale(std.testing.allocator, store));
+    try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
+}
+
+test "stale text fallback never hides corrupt searchable property delta" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage_mod.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .task, .text = "indexed task" });
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(1), "summary", "searchable metadata");
+    _ = try rebuildPersistentTextCatalog(std.testing.allocator, store);
+    try store.appendNode(.{ .id = .fromInt(2), .kind = .task, .text = "make catalog stale" });
+
+    var delta = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_delta_path, .{ .mode = .read_write });
+    const delta_len = (try delta.stat(std.testing.io)).size;
+    try delta.writePositionalAll(std.testing.io, "broken", delta_len);
+    delta.close(std.testing.io);
+
+    try std.testing.expectError(error.InvalidRecord, searchText(std.testing.allocator, store, "searchable metadata", .{ .limit = 8 }));
+}
+
+test "searchText rejects oversized property delta before quick and fallback scans" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try storage_mod.Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .task, .text = "indexed task" });
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(1), "summary", "indexed searchable metadata");
+    _ = try rebuildPersistentTextCatalog(std.testing.allocator, store);
+
+    var delta = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_delta_path, .{ .mode = .read_write });
+    try delta.setLength(std.testing.io, stale_store_scan_max_property_delta_bytes + 1);
+    delta.close(std.testing.io);
+
+    // With current graph anchors the quick-stale metadata digest is the first
+    // possible delta reader. It must reject from the fixed file-size snapshot.
+    try std.testing.expectError(
+        error.TextIndexMaintenanceRequired,
+        searchText(std.testing.allocator, store, "searchable metadata", .{ .limit = 8 }),
+    );
+    try std.testing.expectError(
+        error.TextIndexMaintenanceRequired,
+        textQueryPlanStats(std.testing.allocator, store, "searchable metadata", .{ .limit = 8 }),
+    );
+
+    // A graph append short-circuits the quick digest. The read-only fallback
+    // admission must independently reject the same oversized canonical delta.
+    try store.appendNode(.{ .id = .fromInt(2), .kind = .task, .text = "new stale task" });
+    try std.testing.expectError(
+        error.TextIndexMaintenanceRequired,
+        searchText(std.testing.allocator, store, "new stale task", .{ .limit = 8 }),
+    );
 }
 
 test "persistent text catalog stays current after edge-only events" {
@@ -22829,7 +23301,7 @@ test "persistent text catalog detects doc records that disagree with graph nodes
     defer hits.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), hits.items.len);
     try std.testing.expectEqual(core.NodeId.fromInt(1), hits.items[0].node_id);
-    try std.testing.expect(!try persistentTextCatalogStale(std.testing.allocator, store));
+    try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
 }
 
 test "persistent text catalog detects corrupt terms file" {
@@ -22902,7 +23374,7 @@ test "persistent text catalog rejects self-consistent incomplete term and postin
     defer hits.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), hits.items.len);
     try std.testing.expectEqual(core.NodeId.fromInt(1), hits.items[0].node_id);
-    try std.testing.expect(!try persistentTextCatalogStale(std.testing.allocator, store));
+    try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
 }
 
 test "persistent text catalog detects unsorted persistent term dictionary" {
@@ -22935,7 +23407,7 @@ test "persistent text catalog detects unsorted persistent term dictionary" {
     defer hits.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), hits.items.len);
     try std.testing.expectEqual(core.NodeId.fromInt(1), hits.items[0].node_id);
-    try std.testing.expect(!try persistentTextCatalogStale(std.testing.allocator, store));
+    try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
 }
 
 test "persistent text catalog treats old postings version as stale" {
@@ -23002,7 +23474,7 @@ test "searchText repairs text terms header whose declared size overflows" {
     defer hits.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), hits.items.len);
     try std.testing.expectEqual(core.NodeId.fromInt(1), hits.items[0].node_id);
-    try std.testing.expect(!try persistentTextCatalogStale(std.testing.allocator, store));
+    try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
 }
 
 test "searchText repairs text postings header whose declared size overflows" {
@@ -23040,7 +23512,7 @@ test "searchText repairs text postings header whose declared size overflows" {
     defer hits.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), hits.items.len);
     try std.testing.expectEqual(core.NodeId.fromInt(1), hits.items[0].node_id);
-    try std.testing.expect(!try persistentTextCatalogStale(std.testing.allocator, store));
+    try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
 }
 
 test "persistent text doc readers reject overflowing declared doc count" {
@@ -23219,7 +23691,7 @@ test "persistent text catalog rejects corrupt posting block impact order" {
     defer hits.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), hits.items.len);
     try std.testing.expectEqual(core.NodeId.fromInt(65), hits.items[0].node_id);
-    try std.testing.expect(!try persistentTextCatalogStale(std.testing.allocator, store));
+    try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
 }
 
 test "persistent text catalog rejects invalid term entry length" {
@@ -23265,10 +23737,10 @@ test "persistent text catalog rejects invalid term entry length" {
     defer hits.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), hits.items.len);
     try std.testing.expectEqual(core.NodeId.fromInt(1), hits.items[0].node_id);
-    try std.testing.expect(!try persistentTextCatalogStale(std.testing.allocator, store));
+    try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
 }
 
-test "searchText repairs term exception sidecar with membership count mismatch" {
+test "searchText falls back without repairing term exception sidecar membership mismatch" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -23314,7 +23786,7 @@ test "searchText repairs term exception sidecar with membership count mismatch" 
     defer hits.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), hits.items.len);
     try std.testing.expectEqual(core.NodeId.fromInt(1), hits.items[0].node_id);
-    try std.testing.expect(!try persistentTextCatalogStale(std.testing.allocator, store));
+    try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
 }
 
 test "searchText repairs corrupt term posting offset encountered during query" {
@@ -23367,7 +23839,7 @@ test "searchText repairs corrupt term posting offset encountered during query" {
     try std.testing.expect(!try persistentTextCatalogStale(std.testing.allocator, store));
 }
 
-test "searchText repairs corrupt posting frequencies detected by block metadata" {
+test "searchText falls back without repairing corrupt posting frequencies" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -23422,12 +23894,8 @@ test "searchText repairs corrupt posting frequencies detected by block metadata"
     var hits = try searchText(std.testing.allocator, store, corrupted_term, .{ .limit = 5 });
     defer hits.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), hits.items.len);
-    try std.testing.expect(!try persistentTextCatalogStale(std.testing.allocator, store));
-
-    var repaired_postings = try readPersistentTermPostings(std.testing.allocator, store, corrupted_term);
-    defer repaired_postings.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 2), repaired_postings.items.len);
-    try std.testing.expect(repaired_postings.items[0].text_freq < 99);
+    try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
+    try std.testing.expectError(error.InvalidRecord, readPersistentTermPostings(std.testing.allocator, store, corrupted_term));
 }
 
 test "readPersistentTermPostings rejects duplicate or unsorted doc ids" {
@@ -23523,7 +23991,7 @@ test "persistent text stale detection rejects postings outside doc catalog" {
     try std.testing.expectError(error.InvalidRecord, readPersistentTermPostings(std.testing.allocator, store, "edge"));
 }
 
-test "searchText repairs text docs that reference missing graph nodes" {
+test "searchText falls back without repairing text docs that reference missing graph nodes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -23552,7 +24020,7 @@ test "searchText repairs text docs that reference missing graph nodes" {
     defer hits.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), hits.items.len);
     try std.testing.expectEqual(core.NodeId.fromInt(1), hits.items[0].node_id);
-    try std.testing.expect(!try persistentTextCatalogStale(std.testing.allocator, store));
+    try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
 }
 
 test "persistent text docs reject corrupt dense node id header" {
@@ -23630,7 +24098,7 @@ test "persistent text postings reject reserved max doc id" {
     try std.testing.expectError(error.InvalidRecord, readPersistentTermPostings(std.testing.allocator, store, "edge"));
 }
 
-test "searchText repairs text docs with corrupt token counts" {
+test "searchText falls back without repairing text docs with corrupt token counts" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -23658,16 +24126,17 @@ test "searchText repairs text docs with corrupt token counts" {
         try docs_file.sync(std.testing.io);
     }
 
+    const docs_size_before = try textPathFileSize(std.testing.io, docs_path);
+
     var hits = try searchText(std.testing.allocator, store, "storage", .{ .limit = 5 });
     defer hits.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), hits.items.len);
     try std.testing.expectEqual(core.NodeId.fromInt(1), hits.items[0].node_id);
-    try std.testing.expect(!try persistentTextCatalogStale(std.testing.allocator, store));
+    try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
 
     var docs_file = try std.Io.Dir.cwd().openFile(std.testing.io, docs_path, .{});
     defer docs_file.close(std.testing.io);
-    const repaired = try readTextDocRecordAt(store, docs_file, 0);
-    try std.testing.expect(repaired.text_tokens < std.math.maxInt(u16));
+    try std.testing.expectEqual(docs_size_before, (try docs_file.stat(std.testing.io)).size);
 }
 
 test "rebuildPersistentTextCatalog repairs corrupt graph node indexes" {
@@ -23679,8 +24148,10 @@ test "rebuildPersistentTextCatalog repairs corrupt graph node indexes" {
     const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
     defer std.testing.allocator.free(store_path);
 
-    var store = try storage_mod.Store.init(std.testing.allocator, std.testing.io, store_path);
-    store.options.validate_indexes_on_read = true;
+    var store = try storage_mod.Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .primary_text_write_mode = .bulk_ingest,
+        .validate_indexes_on_read = true,
+    });
     defer store.deinit();
     try store.createEmpty();
     try store.appendNode(.{ .id = .fromInt(1), .kind = .file, .text = "storage index" });
@@ -23710,8 +24181,10 @@ test "TextIndex buildFromStore repairs corrupt graph node indexes" {
     const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
     defer std.testing.allocator.free(store_path);
 
-    var store = try storage_mod.Store.init(std.testing.allocator, std.testing.io, store_path);
-    store.options.validate_indexes_on_read = true;
+    var store = try storage_mod.Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .primary_text_write_mode = .bulk_ingest,
+        .validate_indexes_on_read = true,
+    });
     defer store.deinit();
     try store.createEmpty();
     try store.appendNode(.{ .id = .fromInt(1), .kind = .file, .text = "storage index" });
@@ -23733,7 +24206,7 @@ test "TextIndex buildFromStore repairs corrupt graph node indexes" {
     try std.testing.expectEqual(core.NodeId.fromInt(1), hits.items[0].node_id);
 }
 
-test "searchText repairs corrupt graph node indexes before rebuilding text catalog" {
+test "searchText falls back to event log without repairing corrupt graph node indexes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -23742,8 +24215,10 @@ test "searchText repairs corrupt graph node indexes before rebuilding text catal
     const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
     defer std.testing.allocator.free(store_path);
 
-    var store = try storage_mod.Store.init(std.testing.allocator, std.testing.io, store_path);
-    store.options.validate_indexes_on_read = true;
+    var store = try storage_mod.Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .primary_text_write_mode = .bulk_ingest,
+        .validate_indexes_on_read = true,
+    });
     defer store.deinit();
     try store.createEmpty();
     try store.appendNode(.{ .id = .fromInt(1), .kind = .file, .text = "storage index" });
@@ -23761,9 +24236,6 @@ test "searchText repairs corrupt graph node indexes before rebuilding text catal
     defer hits.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), hits.items.len);
     try std.testing.expectEqual(core.NodeId.fromInt(1), hits.items[0].node_id);
-    try std.testing.expect(!try persistentTextCatalogStale(std.testing.allocator, store));
-
-    var repaired = (try store.readNodeById(std.testing.allocator, .fromInt(1))).?;
-    defer repaired.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("storage index", repaired.text);
+    try std.testing.expect(try persistentTextCatalogStale(std.testing.allocator, store));
+    try std.testing.expectError(error.InvalidRecord, store.readNodeById(std.testing.allocator, .fromInt(1)));
 }

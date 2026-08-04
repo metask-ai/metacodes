@@ -10,6 +10,8 @@ const segment_bundle = @import("segment_bundle.zig");
 const segment_manifest = @import("segment_manifest.zig");
 const segment_node_index = @import("segment_node_index.zig");
 const snapshot_mod = @import("snapshot.zig");
+const process_liveness = @import("process_liveness.zig");
+const read_only_memory_map = @import("read_only_memory_map.zig");
 
 pub const DurabilityMode = enum {
     /// Buffered writes. The OS may flush later, so a crash can lose recent
@@ -22,10 +24,21 @@ pub const DurabilityMode = enum {
     safe,
 };
 
-const ProcessId = if (builtin.os.tag == .windows) u64 else std.posix.pid_t;
+pub const PrimaryTextWriteMode = enum {
+    /// Normal stores enter the append-friendly block-deflate representation on
+    /// the first non-empty write. Existing non-empty raw stores are never
+    /// compressed by a foreground append; maintenance/finalize owns migration.
+    normal,
+    /// Bulk loaders may keep node_texts.dat raw while ingesting, but must call
+    /// finalizePrimaryTextStorage before publishing the finished store.
+    bulk_ingest,
+};
+
+const ProcessId = u64;
 
 pub const StorageOptions = struct {
     durability: DurabilityMode = .safe,
+    primary_text_write_mode: PrimaryTextWriteMode = .normal,
     max_node_by_id_index_bytes: u64 = 2 * 1024 * 1024 * 1024,
     validate_indexes_on_read: bool = false,
     auto_compact_edge_segment_entries: u32 = 128,
@@ -66,11 +79,7 @@ pub const EdgeExternalKeyLookupCache = struct {
 };
 
 fn currentProcessIdForTempPath() ProcessId {
-    return switch (builtin.os.tag) {
-        .windows => 1,
-        .linux => std.os.linux.getpid(),
-        else => if (builtin.link_libc) std.c.getpid() else 1,
-    };
+    return process_liveness.currentId();
 }
 
 pub const EdgeSegmentMaintenanceBudget = struct {
@@ -150,6 +159,7 @@ const ManifestProcessLeaseKind = enum {
 
 var manifest_process_lease_nonce: std.atomic.Value(u64) = .init(0);
 var store_temp_nonce: std.atomic.Value(u64) = .init(0);
+const manifest_process_lease_acquire_max_attempts: usize = 16;
 
 pub const ManifestProcessLease = struct {
     allocator: std.mem.Allocator,
@@ -160,6 +170,33 @@ pub const ManifestProcessLease = struct {
         std.Io.Dir.cwd().deleteFile(self.io, self.path) catch {};
         self.allocator.free(self.path);
         self.path = &.{};
+    }
+};
+
+const AcquiredManifestProcessLease = struct {
+    path_allocator: std.mem.Allocator,
+    manifest_path: []u8,
+    process_lease: ManifestProcessLease,
+    path_owned: bool = true,
+    lease_owned: bool = true,
+
+    fn deinit(self: *AcquiredManifestProcessLease) void {
+        if (self.lease_owned) self.process_lease.deinit();
+        if (self.path_owned) self.path_allocator.free(self.manifest_path);
+        self.path_owned = false;
+        self.lease_owned = false;
+    }
+
+    fn takeManifestPath(self: *AcquiredManifestProcessLease) []u8 {
+        std.debug.assert(self.path_owned);
+        self.path_owned = false;
+        return self.manifest_path;
+    }
+
+    fn takeProcessLease(self: *AcquiredManifestProcessLease) ManifestProcessLease {
+        std.debug.assert(self.lease_owned);
+        self.lease_owned = false;
+        return self.process_lease;
     }
 };
 
@@ -1727,6 +1764,8 @@ pub const EdgeOrderRecord = struct {
     }
 };
 
+pub const EdgeOrderRecordVisitor = *const fn (context: *anyopaque, record: EdgeOrderRecord) anyerror!void;
+
 const EdgeOrderHeader = struct {
     count: u64 = 0,
     digest: u64 = 0,
@@ -2572,6 +2611,47 @@ const PropertyPayloadIndexHeader = struct {
     }
 };
 
+const PropertyPayloadRedoJournalHeader = struct {
+    index_len: u64,
+    values_len: u64,
+    index_digest: u64,
+    values_digest: u64,
+
+    const magic = [_]u8{ 'T', 'K', 'P', 'J' };
+    const version: u16 = 1;
+    const encoded_len: usize = 48;
+
+    fn encode(self: PropertyPayloadRedoJournalHeader, out: *[encoded_len]u8) void {
+        @memset(out, 0);
+        @memcpy(out[0..4], &magic);
+        std.mem.writeInt(u16, out[4..6], version, .little);
+        std.mem.writeInt(u16, out[6..8], encoded_len, .little);
+        std.mem.writeInt(u64, out[8..16], self.index_len, .little);
+        std.mem.writeInt(u64, out[16..24], self.values_len, .little);
+        std.mem.writeInt(u64, out[24..32], self.index_digest, .little);
+        std.mem.writeInt(u64, out[32..40], self.values_digest, .little);
+    }
+
+    fn decode(bytes: *const [encoded_len]u8) !PropertyPayloadRedoJournalHeader {
+        if (!std.mem.eql(u8, bytes[0..4], &magic)) return error.InvalidRecord;
+        if (std.mem.readInt(u16, bytes[4..6], .little) != version) return error.InvalidRecord;
+        if (std.mem.readInt(u16, bytes[6..8], .little) != encoded_len) return error.InvalidRecord;
+        if (!std.mem.allEqual(u8, bytes[40..48], 0)) return error.InvalidRecord;
+        const header = PropertyPayloadRedoJournalHeader{
+            .index_len = std.mem.readInt(u64, bytes[8..16], .little),
+            .values_len = std.mem.readInt(u64, bytes[16..24], .little),
+            .index_digest = std.mem.readInt(u64, bytes[24..32], .little),
+            .values_digest = std.mem.readInt(u64, bytes[32..40], .little),
+        };
+        if (header.index_len < PropertyPayloadIndexHeader.encoded_len or
+            header.values_len < NodePropertyValueBlockHeader.encoded_len)
+        {
+            return error.InvalidRecord;
+        }
+        return header;
+    }
+};
+
 const PropertyPayloadIndexRecord = struct {
     key_hash: u64,
     value_hash: u64,
@@ -2625,6 +2705,59 @@ const PropertyPayloadIndexEntry = struct {
         if (self.value) |value| allocator.free(value);
         self.value = null;
     }
+};
+
+const property_payload_delta_magic = [_]u8{ 'T', 'K', 'P', 'D' };
+const property_payload_delta_version: u16 = 1;
+const property_payload_delta_header_len: usize = 32;
+const property_payload_delta_entry_len: usize = 40;
+const property_payload_delta_digest_seed: u64 = 0x544B_5044;
+const property_payload_delta_max_frame_bytes: u32 = 16 * 1024 * 1024;
+const property_snapshot_legacy_version: u64 = 0;
+const property_snapshot_base_version: u64 = 1 << 62;
+const property_snapshot_delta_version_base: u64 = 2 << 62;
+
+const PropertyPayloadDeltaHeader = struct {
+    sequence: u64,
+    write_count: u32,
+    payload_len: u32,
+    payload_digest: u64,
+
+    fn encode(self: PropertyPayloadDeltaHeader, out: *[property_payload_delta_header_len]u8) !void {
+        if (self.sequence == 0 or self.write_count == 0 or self.payload_len == 0 or self.payload_len > property_payload_delta_max_frame_bytes) return error.InvalidRecord;
+        @memcpy(out[0..4], &property_payload_delta_magic);
+        writeU16(out[4..6], property_payload_delta_version);
+        writeU16(out[6..8], property_payload_delta_header_len);
+        writeU64(out[8..16], self.sequence);
+        writeU32(out[16..20], self.write_count);
+        writeU32(out[20..24], self.payload_len);
+        writeU64(out[24..32], self.payload_digest);
+    }
+
+    fn decode(bytes: *const [property_payload_delta_header_len]u8) !PropertyPayloadDeltaHeader {
+        if (!std.mem.eql(u8, bytes[0..4], &property_payload_delta_magic)) return error.InvalidRecord;
+        if (readU16(bytes[4..6]) != property_payload_delta_version or readU16(bytes[6..8]) != property_payload_delta_header_len) return error.InvalidRecord;
+        const header = PropertyPayloadDeltaHeader{
+            .sequence = readU64(bytes[8..16]),
+            .write_count = readU32(bytes[16..20]),
+            .payload_len = readU32(bytes[20..24]),
+            .payload_digest = readU64(bytes[24..32]),
+        };
+        if (header.sequence == 0 or header.write_count == 0 or header.payload_len == 0 or header.payload_len > property_payload_delta_max_frame_bytes) return error.InvalidRecord;
+        return header;
+    }
+};
+
+const PropertyPayloadDeltaScan = struct {
+    valid_bytes: u64 = 0,
+    last_sequence: u64 = 0,
+    last_digest: u64 = 0,
+    trailing_partial: bool = false,
+};
+
+const PropertyPayloadDeltaRecovery = enum {
+    no_journal,
+    committed,
 };
 
 fn deinitPropertyPayloadIndexEntries(entries: []PropertyPayloadIndexEntry, allocator: std.mem.Allocator) void {
@@ -2692,6 +2825,8 @@ const NodePropertyValueRecord = struct {
 
 const NodePropertyPropsJson = struct {
     name: ?[]const u8 = null,
+    status: ?[]const u8 = null,
+    claimed_by: ?[]const u8 = null,
     schema_type: ?[]const u8 = null,
     external_key: ?[]const u8 = null,
     content_hash: ?[]const u8 = null,
@@ -2702,6 +2837,7 @@ const NodePropertyPropsJson = struct {
     task_recorded_ns: ?u64 = null,
     task_created_ns: ?u64 = null,
     task_completed_ns: ?u64 = null,
+    claim_expires_ns: ?u64 = null,
     task_event_ns: ?u64 = null,
     task_root_id: ?u64 = null,
     task_id: ?u64 = null,
@@ -2793,6 +2929,10 @@ pub fn propertyKeyHashForLookup(key: []const u8) u64 {
 
 fn nodePropertyValueHash(value: []const u8) u64 {
     return std.hash.Wyhash.hash(0x544B_5056, value);
+}
+
+pub fn propertyValueHashForStorage(value: []const u8) u64 {
+    return nodePropertyValueHash(value);
 }
 
 fn edgeExternalKeyHash(external_key: []const u8) u64 {
@@ -2917,6 +3057,14 @@ fn propertyPayloadOwnerId(owner: PropertyOwner) u64 {
     };
 }
 
+fn propertyPayloadOwnerFromParts(owner_kind: u8, owner_id: u64) !PropertyOwner {
+    return switch (owner_kind) {
+        PropertyPayloadIndexRecord.owner_kind_node => .{ .node = core.NodeId.fromInt(owner_id) },
+        PropertyPayloadIndexRecord.owner_kind_edge => .{ .edge = core.EdgeId.fromInt(owner_id) },
+        else => error.InvalidRecord,
+    };
+}
+
 fn propertyPayloadRecordLessThan(_: void, a: PropertyPayloadIndexRecord, b: PropertyPayloadIndexRecord) bool {
     if (a.key_hash != b.key_hash) return a.key_hash < b.key_hash;
     if (a.value_type != b.value_type) return a.value_type < b.value_type;
@@ -2939,6 +3087,90 @@ const PropertyPayloadOwnerKey = struct {
     owner_kind: u8,
     owner_id: u64,
     key_hash: u64,
+};
+
+const PropertyPayloadOwnerKeySet = std.AutoHashMap(PropertyPayloadOwnerKey, void);
+const PropertyPayloadNodeIdSet = std.AutoHashMap(u64, void);
+
+const PropertyPayloadOwnerFilter = struct {
+    owner_kind: u8,
+    owner_ids: ?*const PropertyPayloadNodeIdSet = null,
+
+    fn matches(self: PropertyPayloadOwnerFilter, owner_kind: u8, owner_id: u64) bool {
+        if (owner_kind != self.owner_kind) return false;
+        return if (self.owner_ids) |ids| ids.contains(owner_id) else true;
+    }
+};
+
+const PropertyPayloadExistingKeyTarget = struct {
+    wanted: *const PropertyPayloadOwnerKeySet,
+    found: *PropertyPayloadOwnerKeySet,
+};
+
+const PropertyPayloadLookupTarget = struct {
+    owner_key: PropertyPayloadOwnerKey,
+    key_name: []const u8,
+    value: ?PropertyPayloadIndexEntry = null,
+
+    fn deinit(self: *PropertyPayloadLookupTarget, allocator: std.mem.Allocator) void {
+        if (self.value) |*value| value.deinit(allocator);
+        self.value = null;
+    }
+};
+
+const PropertyPayloadKeyTarget = struct {
+    key_hash: u64,
+    key_name: []const u8,
+    entries: *std.ArrayList(PropertyPayloadIndexEntry),
+    positions: *std.AutoHashMap(PropertyPayloadOwnerKey, usize),
+    owner_filter: ?PropertyPayloadOwnerFilter = null,
+};
+
+const SearchablePropertyByteBudget = struct {
+    max_bytes: u64,
+    used_bytes: u64 = 0,
+
+    fn afterReplace(self: SearchablePropertyByteBudget, old_len: usize, new_len: usize) !u64 {
+        const old_bytes: u64 = @intCast(old_len);
+        const new_bytes: u64 = @intCast(new_len);
+        if (old_bytes > self.used_bytes) return error.InvalidRecord;
+        const without_old = self.used_bytes - old_bytes;
+        const next = std.math.add(u64, without_old, new_bytes) catch return error.SearchableMetadataBudgetExceeded;
+        if (next > self.max_bytes) return error.SearchableMetadataBudgetExceeded;
+        return next;
+    }
+};
+
+const PropertyPayloadIndexedTarget = struct {
+    entries: *std.ArrayList(PropertyPayloadIndexEntry),
+    positions: *std.AutoHashMap(PropertyPayloadOwnerKey, usize),
+    searchable_byte_budget: ?*SearchablePropertyByteBudget = null,
+};
+
+const PropertyPayloadKeyNameMap = std.AutoHashMap(u64, []const u8);
+
+const PropertyPayloadSnapshotTarget = struct {
+    key_names: *const PropertyPayloadKeyNameMap,
+    entries: *std.ArrayList(PropertySnapshotEntry),
+    positions: *std.AutoHashMap(PropertyPayloadOwnerKey, usize),
+    owner_filter: PropertyPayloadOwnerFilter,
+};
+
+const PropertyPayloadLayerScanTarget = struct {
+    context: *anyopaque,
+    visit: PropertySnapshotLayerVisitor,
+    next_version: *u64,
+};
+
+const PropertyPayloadDeltaTarget = union(enum) {
+    none,
+    all: PropertyPayloadIndexedTarget,
+    searchable: PropertyPayloadIndexedTarget,
+    key: PropertyPayloadKeyTarget,
+    snapshot: PropertyPayloadSnapshotTarget,
+    existing_keys: PropertyPayloadExistingKeyTarget,
+    lookup: *PropertyPayloadLookupTarget,
+    layer_scan: PropertyPayloadLayerScanTarget,
 };
 
 fn propertyPayloadOwnerKey(owner: PropertyOwner, key: []const u8) PropertyPayloadOwnerKey {
@@ -3287,6 +3519,34 @@ pub const PropertyPayloadWrite = struct {
     value: PropertyPayloadValue,
 };
 
+/// One entry in the exact on-disk canonical property order. The producer must
+/// yield a globally unique owner/key pair stream sorted by the same ordering
+/// as PropertyPayloadIndexRecord. `string` is borrowed until the next callback.
+pub const SortedPropertyPayloadEntry = struct {
+    owner: PropertyOwner,
+    key_hash: u64,
+    value: PropertyPayloadValue,
+};
+
+pub const SortedPropertyPayloadNext = *const fn (context: *anyopaque) anyerror!?SortedPropertyPayloadEntry;
+
+pub const PropertyPayloadUpsertResult = struct {
+    writes_applied: usize = 0,
+    entries_replaced: usize = 0,
+    /// One batch is committed as one delta frame. Exposing this keeps callers
+    /// and regression tests honest about lifecycle atomicity without adding
+    /// test-only state to Store.
+    payload_publish_count: usize = 0,
+};
+
+pub const PropertyPayloadCompactionResult = struct {
+    compacted: bool = false,
+    cleanup_pending: bool = false,
+    delta_bytes: u64 = 0,
+    delta_frames: u64 = 0,
+    live_entries: u64 = 0,
+};
+
 pub const PropertySnapshotValueKind = enum {
     string,
     uint,
@@ -3312,6 +3572,22 @@ pub const PropertySnapshot = struct {
         self.entries = &.{};
     }
 };
+
+/// One physical contribution to the effective property view. Callers that
+/// need a bounded all-store snapshot can external-sort by
+/// `(owner, key_hash, version)` and retain the greatest version. String
+/// slices are borrowed only for the duration of the visitor call.
+pub const PropertySnapshotLayerEntry = struct {
+    owner: PropertyOwner,
+    key_hash: u64,
+    version: u64,
+    value_kind: PropertySnapshotValueKind,
+    string_value: []const u8 = &.{},
+    uint_value: u64 = 0,
+};
+
+pub const PropertySnapshotLayerVisitor = *const fn (context: *anyopaque, entry: PropertySnapshotLayerEntry) anyerror!void;
+pub const EdgeIndexRecordVisitor = *const fn (context: *anyopaque, record: EdgeIndexRecord) anyerror!void;
 
 pub const NodeIndexLayoutHint = struct {
     node_count: u64,
@@ -3344,6 +3620,7 @@ pub const Store = struct {
     edge_props_overlay_values_path: []const u8,
     property_payload_index_path: []const u8,
     property_payload_values_path: []const u8,
+    property_payload_delta_path: []const u8,
     edge_external_key_index_path: []const u8,
     node_text_run_manifest_path: []const u8,
     node_text_run_current_path: []const u8,
@@ -3422,6 +3699,8 @@ pub const Store = struct {
         errdefer allocator.free(property_payload_index_path);
         const property_payload_values_path = try std.fs.path.join(allocator, &.{ owned_dir_path, "property_payload.values" });
         errdefer allocator.free(property_payload_values_path);
+        const property_payload_delta_path = try std.fs.path.join(allocator, &.{ owned_dir_path, "property_payload.delta" });
+        errdefer allocator.free(property_payload_delta_path);
         const edge_external_key_index_path = try std.fs.path.join(allocator, &.{ owned_dir_path, "edge_external_keys.idx" });
         errdefer allocator.free(edge_external_key_index_path);
         const node_text_run_manifest_path = try std.fs.path.join(allocator, &.{ owned_dir_path, "node_text_runs.manifest" });
@@ -3479,6 +3758,7 @@ pub const Store = struct {
             .edge_props_overlay_values_path = edge_props_overlay_values_path,
             .property_payload_index_path = property_payload_index_path,
             .property_payload_values_path = property_payload_values_path,
+            .property_payload_delta_path = property_payload_delta_path,
             .edge_external_key_index_path = edge_external_key_index_path,
             .node_text_run_manifest_path = node_text_run_manifest_path,
             .node_text_run_current_path = node_text_run_current_path,
@@ -3497,7 +3777,31 @@ pub const Store = struct {
             .node_text_base_filter_cache = node_text_base_filter_cache,
             .options = options,
         };
-        if (!create) try store.ensureStoreMarkerExists();
+        // The allocation-local errdefers above retain ownership until this
+        // function returns successfully.  Do not also errdefer store.deinit()
+        // here: an open/recovery failure would free every path and cache twice.
+        const store_marker_exists = try store.fileExists(store.events_bin_path);
+        if (!create) {
+            try store.ensureStoreMarkerExists();
+        }
+        if (!create or store_marker_exists) {
+            const node_text_recovery = try store.recoverNodeTextsAppendJournal();
+            // The append journal only makes the node_texts.dat mutation
+            // durable. It is committed before the canonical event record and
+            // derived indexes are published, so a crash can leave a durable
+            // text tail that no event references. Reconcile against the event
+            // log on this crash-only path; the repair reuse check preserves a
+            // fully published append and rewrites node_texts.dat when the
+            // committed tail is orphaned.
+            if (node_text_recovery == .committed) {
+                try store.repairPersistentIndexesFromLog();
+            }
+        }
+        // init is create-or-open at the storage API boundary.  Recover for both
+        // entry points so an interrupted property publication cannot be
+        // bypassed by a writer that re-enters through initWithOptions().
+        try store.recoverPropertyPayloadRedoJournal();
+        _ = try store.recoverPropertyPayloadDeltaJournal();
         return store;
     }
 
@@ -3532,6 +3836,7 @@ pub const Store = struct {
         self.allocator.free(self.edge_props_overlay_values_path);
         self.allocator.free(self.property_payload_index_path);
         self.allocator.free(self.property_payload_values_path);
+        self.allocator.free(self.property_payload_delta_path);
         self.allocator.free(self.edge_external_key_index_path);
         self.allocator.free(self.node_by_text_base_filter_path);
         self.allocator.free(self.node_by_text_path);
@@ -3654,6 +3959,46 @@ pub const Store = struct {
             error.FileNotFound => {},
             else => |e| return e,
         };
+        const property_payload_redo_journal_path = try self.propertyPayloadRedoJournalPath();
+        defer self.allocator.free(property_payload_redo_journal_path);
+        std.Io.Dir.cwd().deleteFile(self.io, property_payload_redo_journal_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => |e| return e,
+        };
+        std.Io.Dir.cwd().deleteFile(self.io, self.property_payload_delta_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => |e| return e,
+        };
+        const property_payload_delta_journal_path = try self.propertyPayloadDeltaJournalPath();
+        defer self.allocator.free(property_payload_delta_journal_path);
+        std.Io.Dir.cwd().deleteFile(self.io, property_payload_delta_journal_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => |e| return e,
+        };
+        var node_text_journal_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const node_text_journal_path = try self.nodeTextsAppendJournalPath(&node_text_journal_buffer);
+        std.Io.Dir.cwd().deleteFile(self.io, node_text_journal_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => |e| return e,
+        };
+        const node_text_journal_tmp_path = try self.tmpPathFor(node_text_journal_path);
+        defer self.allocator.free(node_text_journal_tmp_path);
+        std.Io.Dir.cwd().deleteFile(self.io, node_text_journal_tmp_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => |e| return e,
+        };
+        const primary_text_tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.deflate.tmp", .{self.node_texts_path});
+        defer self.allocator.free(primary_text_tmp_path);
+        std.Io.Dir.cwd().deleteFile(self.io, primary_text_tmp_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => |e| return e,
+        };
+        const primary_text_table_tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.deflate.table.tmp", .{self.node_texts_path});
+        defer self.allocator.free(primary_text_table_tmp_path);
+        std.Io.Dir.cwd().deleteFile(self.io, primary_text_table_tmp_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => |e| return e,
+        };
         try self.writeEdgeIndex(self.edge_by_id_path, &.{});
         try self.writeEdgeIndex(self.edge_by_src_path, &.{});
         try self.writeEdgeIndex(self.edge_by_dst_path, &.{});
@@ -3682,6 +4027,7 @@ pub const Store = struct {
         if (node.status != .active) return core.Error.Unsupported;
         if (node.text.len > maxBinaryNodeTextLen()) return error.RecordTooLarge;
         try graph_mod.validateNodeText(node.text);
+        try self.reconcileNodeTextsBeforeAppend();
         const validate_start = if (self.node_append_timings != null) storageMonotonicNs(self.io) else 0;
         try self.validateNodeIndexAppendWithRepair(node);
         if (self.node_append_timings) |timings| timings.validate_ns += storageElapsedNs(self.io, validate_start);
@@ -3689,21 +4035,31 @@ pub const Store = struct {
         const rollback_event_bytes = try self.eventBytes();
         if (self.node_append_timings) |timings| timings.event_bytes_ns += storageElapsedNs(self.io, event_start);
         var published = false;
-        errdefer if (!published) self.rollbackBatchAppend(rollback_event_bytes) catch {};
+        var text_appended = false;
+        errdefer if (!published) self.rollbackNodeAppendFailure(rollback_event_bytes, text_appended);
 
         const append_texts_start = if (self.node_append_timings != null) storageMonotonicNs(self.io) else 0;
         const text_span = try self.appendNodeTextBytes(node.text);
+        text_appended = true;
         if (self.node_append_timings) |timings| timings.append_texts_ns += storageElapsedNs(self.io, append_texts_start);
         const append_record_start = if (self.node_append_timings != null) storageMonotonicNs(self.io) else 0;
         try self.appendNodeRecord(node, text_span);
         if (self.node_append_timings) |timings| timings.append_record_ns += storageElapsedNs(self.io, append_record_start);
-        try self.refreshIndexesAfterCommittedAppend(.node, node, null, text_span);
+        const indexes_current = self.refreshIndexesAfterCommittedAppend(.node, node, null, text_span);
         if (self.node_append_timings) |timings| timings.nodes += 1;
         published = true;
+        // Keep the committed text journal until the whole append transaction,
+        // including derived-index publication, has succeeded. If index work
+        // fails, rollbackNodeAppendFailure may itself be unable to repair under
+        // the same filesystem/allocation fault; the journal must survive as
+        // the durable anchor that lets reopen or the next append remove the
+        // now-unreferenced text tail.
+        if (indexes_current) self.cleanupCommittedNodeTextsAppendJournal();
     }
 
     pub fn appendNodesBatch(self: Store, nodes: []const graph_mod.Node) !void {
         if (nodes.len == 0) return;
+        try self.reconcileNodeTextsBeforeAppend();
         self.appendNodesBatchOnce(nodes) catch |err| switch (err) {
             error.FileNotFound, error.InvalidRecord => {
                 const repair_start = if (self.node_batch_append_timings != null) storageMonotonicNs(self.io) else 0;
@@ -3736,10 +4092,12 @@ pub const Store = struct {
         const rollback_event_bytes = try self.eventBytes();
         const event_bytes_ns = if (self.node_batch_append_timings != null) storageElapsedNs(self.io, event_start) else 0;
         var published = false;
-        errdefer if (!published) self.rollbackBatchAppend(rollback_event_bytes) catch {};
+        var texts_appended = false;
+        errdefer if (!published) self.rollbackNodeAppendFailure(rollback_event_bytes, texts_appended);
 
         const append_texts_start = if (self.node_batch_append_timings != null) storageMonotonicNs(self.io) else 0;
         const text_spans = try self.appendNodeTextsBatch(nodes);
+        texts_appended = true;
         if (self.node_batch_append_timings) |timings| timings.append_texts_ns += storageElapsedNs(self.io, append_texts_start);
         defer self.allocator.free(text_spans);
 
@@ -3791,6 +4149,19 @@ pub const Store = struct {
         try self.writeIndexMeta(next_meta);
         if (self.node_batch_append_timings) |timings| timings.meta_write_ns += storageElapsedNs(self.io, meta_write_start);
         published = true;
+        self.cleanupCommittedNodeTextsAppendJournal();
+    }
+
+    fn rollbackNodeAppendFailure(self: Store, rollback_event_bytes: u64, texts_appended: bool) void {
+        self.rollbackBatchAppend(rollback_event_bytes) catch {};
+        if (!texts_appended) return;
+
+        // Node text is published before its canonical event. Both single and
+        // batch append retain the committed journal through derived-index
+        // publication, so if this best-effort repair fails the durable anchor
+        // remains for reopen or the next append instead of stranding an
+        // unreachable text suffix.
+        self.repairPersistentIndexesFromLog() catch {};
     }
 
     fn appendNodeRecord(self: Store, node: graph_mod.Node, text_span: TextSpan) !void {
@@ -3925,6 +4296,8 @@ pub const Store = struct {
             var rewrite_edges = std.ArrayList(graph_mod.Edge).empty;
             defer rewrite_edges.deinit(self.allocator);
             try rewrite_edges.ensureTotalCapacity(self.allocator, graph.edges.items.len);
+            var removed_edge_ids = std.AutoHashMap(u64, void).init(self.allocator);
+            defer removed_edge_ids.deinit();
             for (graph.edges.items) |edge| {
                 if (edge.status != .active) continue;
                 const incident_to_deleted = switch (action) {
@@ -3932,6 +4305,7 @@ pub const Store = struct {
                     .delete => edge.src.toInt() == target_id.toInt() or edge.dst.toInt() == target_id.toInt(),
                 };
                 if (incident_to_deleted) {
+                    try removed_edge_ids.put(edge.id.toInt(), {});
                     result.edges_removed += 1;
                     continue;
                 }
@@ -3948,9 +4322,43 @@ pub const Store = struct {
             if (payload_entries.items.len != 0) {
                 switch (action) {
                     .update => try rewritten.writePropertyPayload(payload_entries.items),
-                    .delete => {},
+                    .delete => {
+                        // The deleted node and incident edges lose their
+                        // properties, but unrelated owners remain canonical.
+                        // Dropping the whole payload here used to erase every
+                        // task lifecycle/property in the store after deleting
+                        // one node. Compact in place, transferring ownership
+                        // of retained string values into the surviving prefix.
+                        var retained: usize = 0;
+                        for (payload_entries.items) |entry| {
+                            const remove = (entry.record.owner_kind == PropertyPayloadIndexRecord.owner_kind_node and
+                                entry.record.owner_id == target_id.toInt()) or
+                                (entry.record.owner_kind == PropertyPayloadIndexRecord.owner_kind_edge and
+                                    removed_edge_ids.contains(entry.record.owner_id));
+                            if (remove) {
+                                var owned = entry;
+                                owned.deinit(self.allocator);
+                                continue;
+                            }
+                            payload_entries.items[retained] = entry;
+                            retained += 1;
+                        }
+                        payload_entries.items.len = retained;
+                        if (retained != 0) try rewritten.writePropertyPayload(payload_entries.items);
+                    },
                 }
             }
+
+            // A node-text rewrite replaces the whole directory, but the
+            // embedded schema catalog and store-format manifest are canonical
+            // control-plane state, not derived indexes. Recreating the target
+            // with createEmpty() installs a kernel-only catalog and no
+            // manifest; publishing that directory used to silently downgrade
+            // a migrated v2/v3 store to "legacy" after any task text update.
+            // Preserve both files inside the same COW transaction. Full-text
+            // indexes are intentionally omitted because changed node text
+            // makes them stale; callers may warm them explicitly.
+            try self.copyRewriteControlPlane(&rewritten);
         }
 
         try std.Io.Dir.rename(.cwd(), self.dir_path, .cwd(), backup_path, self.io);
@@ -3969,6 +4377,38 @@ pub const Store = struct {
         return result;
     }
 
+    fn copyRewriteControlPlane(self: Store, rewritten: *const Store) !void {
+        _ = try self.copyRegularFileForRewrite(self.catalog_path, rewritten.catalog_path);
+
+        const source_manifest = try std.fs.path.join(self.allocator, &.{ self.dir_path, ".tinykg", "store-manifest.json" });
+        defer self.allocator.free(source_manifest);
+        const target_manifest = try std.fs.path.join(self.allocator, &.{ rewritten.dir_path, ".tinykg", "store-manifest.json" });
+        defer self.allocator.free(target_manifest);
+        if (try self.copyRegularFileForRewrite(source_manifest, target_manifest)) {
+            const target_manifest_dir = std.fs.path.dirname(target_manifest) orelse return error.InvalidRecord;
+            try rewritten.syncParentDirForPath(target_manifest_dir);
+        }
+    }
+
+    fn copyRegularFileForRewrite(self: Store, source_path: []const u8, target_path: []const u8) !bool {
+        const stat = std.Io.Dir.cwd().statFile(self.io, source_path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return false,
+            else => |e| return e,
+        };
+        if (stat.kind != .file) return error.InvalidRecord;
+        try std.Io.Dir.copyFile(std.Io.Dir.cwd(), source_path, std.Io.Dir.cwd(), target_path, self.io, .{
+            .replace = true,
+            .make_path = true,
+        });
+        if (selfOptionsNeedSync(self)) {
+            var target_file = try std.Io.Dir.cwd().openFile(self.io, target_path, .{ .mode = .read_write });
+            defer target_file.close(self.io);
+            try target_file.sync(self.io);
+        }
+        try self.syncParentDirForPath(target_path);
+        return true;
+    }
+
     pub fn appendEdge(self: Store, edge: graph_mod.Edge) !void {
         if (edge.status != .active) return core.Error.Unsupported;
         if (try self.appendEdgeSegmentDeltaOnce(edge)) return;
@@ -3980,7 +4420,7 @@ pub const Store = struct {
         const keep_segment_current = try self.edgeSegmentCurrentManifestReadable();
         try self.validateEdgeAppendWithRepair(edge);
         try self.appendEdgeRecord(edge);
-        try self.refreshIndexesAfterCommittedAppend(.edge, null, edge, null);
+        _ = self.refreshIndexesAfterCommittedAppend(.edge, null, edge, null);
         if (!keep_segment_current) try self.invalidateEdgeSegmentCurrent();
     }
 
@@ -4090,9 +4530,8 @@ pub const Store = struct {
     fn deleteEdgeOnce(self: Store, edge_id: core.EdgeId) !void {
         if (edge_id == .none or edge_id.toInt() == std.math.maxInt(u64)) return core.Error.InvalidId;
         const old_meta = try self.readCurrentIndexMetaForAppend();
-        if (!try self.edgeIndexHeadersMatchMeta(old_meta)) return error.InvalidRecord;
-        if (self.options.validate_indexes_on_read and !try self.edgeIndexesMatchMeta(old_meta)) return error.InvalidRecord;
-        const record = try self.readEdgeIndexRecordById(edge_id);
+        if (!try self.edgeStorageMatchesMeta(old_meta, self.options.validate_indexes_on_read)) return error.InvalidRecord;
+        const record = try self.readVisibleEdgeIndexRecordById(edge_id);
 
         const rollback_event_bytes = try self.eventBytes();
         var published = false;
@@ -4113,8 +4552,7 @@ pub const Store = struct {
 
     fn deleteEdgesBatchOnce(self: Store, edge_ids: []const core.EdgeId) !void {
         const old_meta = try self.readCurrentIndexMetaForAppend();
-        if (!try self.edgeIndexHeadersMatchMeta(old_meta)) return error.InvalidRecord;
-        if (self.options.validate_indexes_on_read and !try self.edgeIndexesMatchMeta(old_meta)) return error.InvalidRecord;
+        if (!try self.edgeStorageMatchesMeta(old_meta, self.options.validate_indexes_on_read)) return error.InvalidRecord;
         if (@as(u64, @intCast(edge_ids.len)) > old_meta.edges) return core.Error.InvalidId;
 
         var existing_tombstones = try self.readAllEdgeTombstones(self.allocator);
@@ -4128,7 +4566,7 @@ pub const Store = struct {
         for (edge_ids) |edge_id| {
             if (edge_id == .none or edge_id.toInt() == std.math.maxInt(u64)) return core.Error.InvalidId;
             if (edgeTombstoneSliceContains(existing_tombstones.items, edge_id.toInt())) return core.Error.InvalidId;
-            const record = try self.readEdgeIndexRecordById(edge_id);
+            const record = try self.readVisibleEdgeIndexRecordById(edge_id);
             const edge_digest = edgeRecordDigest(record);
             batch_tombstones.appendAssumeCapacity(.{
                 .edge_id = record.edge_id,
@@ -4300,16 +4738,50 @@ pub const Store = struct {
     }
 
     pub fn compressNodeTextsFileIfSmaller(self: Store) !void {
-        _ = try self.compressNodeTextsFileIfSmallerWithResult();
+        _ = try self.finalizePrimaryTextStorageWithPolicy(.only_if_smaller);
     }
 
     pub fn compressNodeTextsFileIfSmallerWithResult(self: Store) !NodeTextsCompressionResult {
+        return try self.finalizePrimaryTextStorageWithPolicy(.only_if_smaller);
+    }
+
+    pub fn finalizePrimaryTextStorage(self: Store) !void {
+        _ = try self.finalizePrimaryTextStorageWithResult();
+    }
+
+    pub fn finalizePrimaryTextStorageWithResult(self: Store) !NodeTextsCompressionResult {
+        return try self.finalizePrimaryTextStorageWithPolicy(.always);
+    }
+
+    /// Logical uncompressed byte length of the canonical node-text stream.
+    /// Status and search admission paths use this without inflating the file.
+    pub fn primaryNodeTextLogicalBytes(self: Store) !u64 {
+        var view = try NodeTextsView.open(self);
+        defer view.deinit();
+        return view.size;
+    }
+
+    const PrimaryTextFinalizePolicy = enum {
+        always,
+        only_if_smaller,
+    };
+
+    fn finalizePrimaryTextStorageWithPolicy(self: Store, policy: PrimaryTextFinalizePolicy) !NodeTextsCompressionResult {
         const raw_size = try self.fileSizeOrZero(self.node_texts_path);
         if (raw_size == 0) return .{};
+
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.deflate.tmp", .{self.node_texts_path});
+        defer self.allocator.free(tmp_path);
+        const table_tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.deflate.table.tmp", .{self.node_texts_path});
+        defer self.allocator.free(table_tmp_path);
+
         var existing = try NodeTextsView.open(self);
         if (existing.format != .raw) {
             const logical_size = existing.size;
             existing.deinit();
+            // The primary file is already committed. Stale checkpoint cleanup
+            // must not turn an idempotent finalize into a false failure.
+            self.removePrimaryTextFinalizeCheckpoints(tmp_path, table_tmp_path);
             return .{
                 .before_bytes = raw_size,
                 .after_bytes = raw_size,
@@ -4318,29 +4790,26 @@ pub const Store = struct {
         }
         existing.deinit();
 
-        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.deflate.tmp", .{self.node_texts_path});
-        defer self.allocator.free(tmp_path);
-        errdefer std.Io.Dir.cwd().deleteFile(self.io, tmp_path) catch {};
-
         var input_file = try std.Io.Dir.cwd().openFile(self.io, self.node_texts_path, .{});
         var input_file_open = true;
         defer if (input_file_open) input_file.close(self.io);
         var output_file = try std.Io.Dir.cwd().createFile(self.io, tmp_path, .{
             .read = true,
-            .truncate = true,
+            .truncate = false,
         });
         var output_file_open = true;
         defer if (output_file_open) output_file.close(self.io);
+        var table_file = try std.Io.Dir.cwd().createFile(self.io, table_tmp_path, .{
+            .read = true,
+            .truncate = false,
+        });
+        var table_file_open = true;
+        defer if (table_file_open) table_file.close(self.io);
 
-        const block_count_u64 = (raw_size + node_texts_block_deflate_block_bytes - 1) / node_texts_block_deflate_block_bytes;
-        const block_count = std.math.cast(u32, block_count_u64) orelse return error.RecordTooLarge;
+        const pending_header = NodeTextsBlockDeflateHeader{ .logical_size = raw_size };
+        const block_count = try pending_header.blockCount();
         const table_bytes = std.math.mul(u64, block_count, node_texts_block_deflate_entry_len) catch return error.RecordTooLarge;
         const payload_offset: u64 = node_texts_block_deflate_header_len;
-        try output_file.setLength(self.io, payload_offset);
-
-        const table_len = std.math.cast(usize, table_bytes) orelse return error.RecordTooLarge;
-        const block_table = try self.allocator.alloc(u8, table_len);
-        defer self.allocator.free(block_table);
         var input = try self.allocator.alloc(u8, node_texts_block_deflate_block_bytes);
         defer self.allocator.free(input);
         const compressed = try self.allocator.alloc(u8, @as(usize, node_texts_block_deflate_block_bytes) * 2 + 1024);
@@ -4348,50 +4817,154 @@ pub const Store = struct {
         const flate_buffer = try self.allocator.alloc(u8, std.compress.flate.max_window_len);
         defer self.allocator.free(flate_buffer);
 
+        // The sidecar contains stored length + raw block hash for each committed
+        // full logical block. Payload is synced before its entry, so an
+        // interrupted finalize resumes by validating the source prefix and
+        // truncating any uncommitted payload suffix.
+        var table_size = try self.regularFileSize(table_file);
+        if (table_size % node_texts_deflate_progress_entry_len != 0) {
+            table_size -= table_size % node_texts_deflate_progress_entry_len;
+            try table_file.setLength(self.io, table_size);
+        }
+        const full_block_count = raw_size / node_texts_block_deflate_block_bytes;
+        var completed_blocks = table_size / node_texts_deflate_progress_entry_len;
+        if (completed_blocks > full_block_count) {
+            completed_blocks = 0;
+            table_size = 0;
+            try table_file.setLength(self.io, 0);
+            try output_file.setLength(self.io, payload_offset);
+        }
+
         var payload_cursor = payload_offset;
-        var logical_offset: u64 = 0;
-        var block_index: u32 = 0;
-        while (logical_offset < raw_size) : (block_index += 1) {
-            const remaining = raw_size - logical_offset;
-            const raw_len: usize = @intCast(@min(remaining, node_texts_block_deflate_block_bytes));
+        const progress_scan_entries: usize = 4096;
+        var table_scan: [progress_scan_entries * node_texts_deflate_progress_entry_len]u8 = undefined;
+        var table_scan_offset: u64 = 0;
+        var resume_block_index: u64 = 0;
+        var resume_valid = true;
+        while (table_scan_offset < table_size) {
+            const want: usize = @intCast(@min(@as(u64, table_scan.len), table_size - table_scan_offset));
+            const n = try table_file.readPositionalAll(self.io, table_scan[0..want], table_scan_offset);
+            if (n != want) return error.InvalidRecord;
+            var pos: usize = 0;
+            while (pos < want) : (pos += node_texts_deflate_progress_entry_len) {
+                const stored_len = readU32(table_scan[pos..][0..node_texts_block_deflate_entry_len]);
+                if (stored_len == 0 or stored_len > node_texts_block_deflate_block_bytes) {
+                    resume_valid = false;
+                    break;
+                }
+                const raw_hash = readU64(table_scan[pos + node_texts_block_deflate_entry_len ..][0..8]);
+                const stored_hash = readU64(table_scan[pos + node_texts_block_deflate_entry_len + 8 ..][0..8]);
+                const raw_offset = std.math.mul(u64, resume_block_index, node_texts_block_deflate_block_bytes) catch return error.RecordTooLarge;
+                const raw_n = try input_file.readPositionalAll(self.io, input, raw_offset);
+                if (raw_n != input.len or std.hash.Wyhash.hash(node_texts_deflate_progress_hash_seed, input) != raw_hash) {
+                    resume_valid = false;
+                    break;
+                }
+                const stored_n = try output_file.readPositionalAll(self.io, compressed[0..stored_len], payload_cursor);
+                if (stored_n != stored_len or std.hash.Wyhash.hash(node_texts_deflate_progress_hash_seed, compressed[0..stored_len]) != stored_hash) {
+                    resume_valid = false;
+                    break;
+                }
+                payload_cursor = std.math.add(u64, payload_cursor, stored_len) catch return error.RecordTooLarge;
+                resume_block_index += 1;
+            }
+            if (!resume_valid) break;
+            table_scan_offset += want;
+        }
+        const output_size = try self.regularFileSize(output_file);
+        if (!resume_valid or output_size < payload_cursor) {
+            completed_blocks = 0;
+            table_size = 0;
+            payload_cursor = payload_offset;
+            try table_file.setLength(self.io, 0);
+            try output_file.setLength(self.io, payload_offset);
+        } else if (output_size != payload_cursor) {
+            try output_file.setLength(self.io, payload_cursor);
+        }
+
+        var logical_offset = std.math.mul(u64, completed_blocks, node_texts_block_deflate_block_bytes) catch return error.RecordTooLarge;
+        const full_logical_end = std.math.mul(u64, full_block_count, node_texts_block_deflate_block_bytes) catch return error.RecordTooLarge;
+        const checkpoint_blocks: usize = 256;
+        var checkpoint_entries: [checkpoint_blocks * node_texts_deflate_progress_entry_len]u8 = undefined;
+        var checkpoint_len: usize = 0;
+        while (logical_offset < full_logical_end) {
+            const n = try input_file.readPositionalAll(self.io, input, logical_offset);
+            if (n != input.len) return error.InvalidRecord;
+            const compressed_len = deflateNodeTextsBlock(input, compressed, flate_buffer);
+            const stored = if (compressed_len < input.len) compressed[0..compressed_len] else input;
+            try output_file.writePositionalAll(self.io, stored, payload_cursor);
+            writeU32(checkpoint_entries[checkpoint_len..][0..node_texts_block_deflate_entry_len], @intCast(stored.len));
+            writeU64(checkpoint_entries[checkpoint_len + node_texts_block_deflate_entry_len ..][0..8], std.hash.Wyhash.hash(node_texts_deflate_progress_hash_seed, input));
+            writeU64(checkpoint_entries[checkpoint_len + node_texts_block_deflate_entry_len + 8 ..][0..8], std.hash.Wyhash.hash(node_texts_deflate_progress_hash_seed, stored));
+            checkpoint_len += node_texts_deflate_progress_entry_len;
+            payload_cursor = std.math.add(u64, payload_cursor, stored.len) catch return error.RecordTooLarge;
+            logical_offset = std.math.add(u64, logical_offset, input.len) catch return error.RecordTooLarge;
+
+            if (checkpoint_len == checkpoint_entries.len or logical_offset == full_logical_end) {
+                if (selfOptionsNeedSync(self)) try output_file.sync(self.io);
+                try table_file.writePositionalAll(self.io, checkpoint_entries[0..checkpoint_len], table_size);
+                table_size = std.math.add(u64, table_size, checkpoint_len) catch return error.RecordTooLarge;
+                if (selfOptionsNeedSync(self)) try table_file.sync(self.io);
+                checkpoint_len = 0;
+            }
+        }
+        if (table_size != std.math.mul(u64, full_block_count, node_texts_deflate_progress_entry_len) catch return error.RecordTooLarge) return error.InvalidRecord;
+
+        var partial_entry: [node_texts_block_deflate_entry_len]u8 = undefined;
+        var partial_entry_len: usize = 0;
+        if (logical_offset < raw_size) {
+            const raw_len: usize = @intCast(raw_size - logical_offset);
             const n = try input_file.readPositionalAll(self.io, input[0..raw_len], logical_offset);
             if (n != raw_len) return error.InvalidRecord;
-
             const compressed_len = deflateNodeTextsBlock(input[0..raw_len], compressed, flate_buffer);
-            const use_compressed = compressed_len < raw_len;
-            const stored = if (use_compressed) compressed[0..compressed_len] else input[0..raw_len];
+            const stored = if (compressed_len < raw_len) compressed[0..compressed_len] else input[0..raw_len];
             try output_file.writePositionalAll(self.io, stored, payload_cursor);
-
-            const entry = NodeTextsBlockDeflateEntry{
-                .physical_offset = payload_cursor,
-                .stored_len = @intCast(stored.len),
-                .raw_len = @intCast(raw_len),
-                .flags = if (use_compressed) node_texts_block_deflate_flag_compressed else 0,
-            };
-            var entry_bytes: [node_texts_block_deflate_entry_len]u8 = undefined;
-            try entry.encode(&entry_bytes);
-            const entry_offset: usize = @as(usize, block_index) * node_texts_block_deflate_entry_len;
-            @memcpy(block_table[entry_offset..][0..node_texts_block_deflate_entry_len], &entry_bytes);
-
+            writeU32(&partial_entry, @intCast(stored.len));
+            partial_entry_len = partial_entry.len;
             payload_cursor = std.math.add(u64, payload_cursor, stored.len) catch return error.RecordTooLarge;
-            logical_offset = std.math.add(u64, logical_offset, raw_len) catch return error.RecordTooLarge;
+            logical_offset = raw_size;
         }
-        if (block_index != block_count) return error.InvalidRecord;
+        if (logical_offset != raw_size or try self.regularFileSize(input_file) != raw_size) return error.InvalidRecord;
+        if (selfOptionsNeedSync(self)) try output_file.sync(self.io);
+
         const table_offset = payload_cursor;
         const final_size = std.math.add(u64, table_offset, table_bytes) catch return error.RecordTooLarge;
+        table_scan_offset = 0;
+        var table_write_offset = table_offset;
+        var block_table_chunk: [progress_scan_entries * node_texts_block_deflate_entry_len]u8 = undefined;
+        while (table_scan_offset < table_size) {
+            const want: usize = @intCast(@min(@as(u64, table_scan.len), table_size - table_scan_offset));
+            const n = try table_file.readPositionalAll(self.io, table_scan[0..want], table_scan_offset);
+            if (n != want) return error.InvalidRecord;
+            var progress_pos: usize = 0;
+            var block_table_len: usize = 0;
+            while (progress_pos < want) : (progress_pos += node_texts_deflate_progress_entry_len) {
+                @memcpy(block_table_chunk[block_table_len..][0..node_texts_block_deflate_entry_len], table_scan[progress_pos..][0..node_texts_block_deflate_entry_len]);
+                block_table_len += node_texts_block_deflate_entry_len;
+            }
+            try output_file.writePositionalAll(self.io, block_table_chunk[0..block_table_len], table_write_offset);
+            table_scan_offset += want;
+            table_write_offset += block_table_len;
+        }
+        if (partial_entry_len != 0) {
+            try output_file.writePositionalAll(self.io, partial_entry[0..partial_entry_len], table_write_offset);
+            table_write_offset += partial_entry_len;
+        }
+        if (table_write_offset != final_size) return error.InvalidRecord;
         try output_file.setLength(self.io, final_size);
         const header = NodeTextsBlockDeflateHeader{ .logical_size = raw_size };
         var header_bytes: [node_texts_block_deflate_header_len]u8 = undefined;
         try header.encode(&header_bytes);
         try output_file.writePositionalAll(self.io, &header_bytes, 0);
-        try output_file.writePositionalAll(self.io, block_table, table_offset);
         if (selfOptionsNeedSync(self)) try output_file.sync(self.io);
         output_file.close(self.io);
         output_file_open = false;
+        table_file.close(self.io);
+        table_file_open = false;
         input_file.close(self.io);
         input_file_open = false;
-        if (final_size >= raw_size) {
-            std.Io.Dir.cwd().deleteFile(self.io, tmp_path) catch {};
+        if (policy == .only_if_smaller and final_size >= raw_size) {
+            self.removePrimaryTextFinalizeCheckpoints(tmp_path, table_tmp_path);
             return .{
                 .before_bytes = raw_size,
                 .after_bytes = raw_size,
@@ -4399,12 +4972,30 @@ pub const Store = struct {
             };
         }
         try self.renameReplace(tmp_path, self.node_texts_path);
+        // renameReplace is the commit point. A stale resume sidecar is harmless
+        // (future runs validate every checkpoint hash), so cleanup after the
+        // commit cannot be allowed to report the committed operation as failed.
+        self.removePrimaryTextFinalizeCheckpoints(tmp_path, table_tmp_path);
         return .{
             .compressed = true,
             .before_bytes = raw_size,
             .after_bytes = final_size,
             .logical_bytes = raw_size,
         };
+    }
+
+    fn removePrimaryTextFinalizeCheckpoints(self: Store, tmp_path: []const u8, table_tmp_path: []const u8) void {
+        var removed = false;
+        std.Io.Dir.cwd().deleteFile(self.io, tmp_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return,
+        };
+        removed = true;
+        std.Io.Dir.cwd().deleteFile(self.io, table_tmp_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return,
+        };
+        if (removed) self.syncParentDirForPath(table_tmp_path) catch {};
     }
 
     fn deflateNodeTextsBlock(input: []const u8, output: []u8, flate_buffer: []u8) usize {
@@ -4421,6 +5012,70 @@ pub const Store = struct {
         return texts.size;
     }
 
+    fn mutateRawNodeTextSlicesInPlace(
+        self: Store,
+        file: std.Io.File,
+        start: u64,
+        slices: []const []const u8,
+        spans: []TextSpan,
+    ) !u64 {
+        if (slices.len != spans.len) return error.InvalidRecord;
+        var writer = try StorageBufferedWriter.initAtOffset(self.allocator, self.io, file, storage_write_buffer_bytes, start);
+        defer writer.deinit();
+        for (slices, spans) |text, *span| {
+            if (text.len > std.math.maxInt(u32)) return error.RecordTooLarge;
+            const text_offset = try writer.position();
+            if (text.len != 0) try writer.append(text);
+            span.* = .{ .offset = text_offset, .len = @intCast(text.len) };
+        }
+        try writer.flush();
+        const end = try writer.position();
+        if (try self.regularFileSize(file) != end) return error.InvalidRecord;
+        if (selfOptionsNeedSync(self)) try file.sync(self.io);
+        return end;
+    }
+
+    fn appendRawNodeTextSlices(self: Store, slices: []const []const u8) ![]TextSpan {
+        const spans = try self.allocator.alloc(TextSpan, slices.len);
+        errdefer self.allocator.free(spans);
+        try self.ensureRawNodeTextsFile();
+        var texts_file = try std.Io.Dir.cwd().createFile(self.io, self.node_texts_path, .{
+            .read = true,
+            .truncate = false,
+        });
+        var texts_file_open = true;
+        defer if (texts_file_open) texts_file.close(self.io);
+        const texts_start = try self.regularFileSize(texts_file);
+        var append_bytes: u64 = 0;
+        for (slices) |text| {
+            if (text.len > std.math.maxInt(u32)) return error.RecordTooLarge;
+            append_bytes = std.math.add(u64, append_bytes, text.len) catch return error.RecordTooLarge;
+        }
+
+        var append_journal_active = false;
+        if (append_bytes != 0 and selfOptionsNeedSync(self)) {
+            try self.writeRawNodeTextsAppendJournal(texts_start);
+            append_journal_active = true;
+        }
+        const texts_end = self.mutateRawNodeTextSlicesInPlace(texts_file, texts_start, slices, spans) catch |operation_err| {
+            if (append_journal_active) {
+                _ = self.recoverNodeTextsAppendJournal() catch |recovery_err| return recovery_err;
+                append_journal_active = false;
+            }
+            return operation_err;
+        };
+        if (append_journal_active) {
+            try self.commitNodeTextsAppendJournalAfterMutation();
+            append_journal_active = false;
+        }
+        if (texts_start == 0 and texts_end != 0 and self.options.primary_text_write_mode == .normal) {
+            texts_file.close(self.io);
+            texts_file_open = false;
+            try self.finalizePrimaryTextStorage();
+        }
+        return spans;
+    }
+
     fn appendNodeTextBytes(self: Store, text: []const u8) !TextSpan {
         if (text.len > std.math.maxInt(u32)) return error.RecordTooLarge;
         {
@@ -4433,17 +5088,10 @@ pub const Store = struct {
                 return spans[0];
             }
         }
-        try self.ensureRawNodeTextsFile();
-        var texts_file = try std.Io.Dir.cwd().createFile(self.io, self.node_texts_path, .{
-            .read = true,
-            .truncate = false,
-        });
-        defer texts_file.close(self.io);
-        const text_offset = try self.regularFileSize(texts_file);
-        if (text.len == 0) return .{ .offset = text_offset, .len = 0 };
-        try texts_file.writePositionalAll(self.io, text, text_offset);
-        if (selfOptionsNeedSync(self)) try texts_file.sync(self.io);
-        return .{ .offset = text_offset, .len = @intCast(text.len) };
+        var one = [_][]const u8{text};
+        const spans = try self.appendRawNodeTextSlices(&one);
+        defer self.allocator.free(spans);
+        return spans[0];
     }
 
     fn appendNodeTextsBatch(self: Store, nodes: []const graph_mod.Node) ![]TextSpan {
@@ -4479,34 +5127,232 @@ pub const Store = struct {
             }
         }
 
-        const spans = try self.allocator.alloc(TextSpan, nodes.len);
-        errdefer self.allocator.free(spans);
+        const slices = try self.allocator.alloc([]const u8, nodes.len);
+        defer self.allocator.free(slices);
+        for (nodes, 0..) |node, index| slices[index] = node.text;
+        return self.appendRawNodeTextSlices(slices);
+    }
 
-        try self.ensureRawNodeTextsFile();
-        var texts_file = try std.Io.Dir.cwd().createFile(self.io, self.node_texts_path, .{
-            .read = true,
-            .truncate = false,
-        });
-        defer texts_file.close(self.io);
-        const texts_start = try self.regularFileSize(texts_file);
-        var writer = try StorageBufferedWriter.initAtOffset(self.allocator, self.io, texts_file, storage_write_buffer_bytes, texts_start);
-        defer writer.deinit();
+    fn reconcileNodeTextsBeforeAppend(self: Store) !void {
+        const recovery = try self.recoverNodeTextsAppendJournal();
+        if (recovery == .committed) try self.repairPersistentIndexesFromLog();
+    }
 
-        for (nodes, 0..) |node, index| {
-            if (node.text.len > std.math.maxInt(u32)) return error.RecordTooLarge;
-            const text_offset = try writer.position();
-            if (node.text.len != 0) try writer.append(node.text);
-            spans[index] = .{ .offset = text_offset, .len = @intCast(node.text.len) };
+    fn nodeTextsAppendJournalPath(self: Store, buffer: []u8) ![]const u8 {
+        return try std.fmt.bufPrint(buffer, "{s}.append-journal", .{self.node_texts_path});
+    }
+
+    fn writeNodeTextsAppendJournal(self: Store, texts: *const NodeTextsView, suffix_offset: u64) !void {
+        if (texts.format != .block_deflate or !selfOptionsNeedSync(self)) return error.InvalidRecord;
+        const original_size = try self.regularFileSize(texts.file);
+        if (suffix_offset < node_texts_block_deflate_header_len or suffix_offset > original_size) return error.InvalidRecord;
+        const suffix_len_u64 = original_size - suffix_offset;
+        const suffix_len = std.math.cast(usize, suffix_len_u64) orelse return error.RecordTooLarge;
+        const suffix = try self.allocator.alloc(u8, suffix_len);
+        defer self.allocator.free(suffix);
+        const suffix_n = try texts.file.readPositionalAll(self.io, suffix, suffix_offset);
+        if (suffix_n != suffix.len) return error.InvalidRecord;
+
+        var original_header: [node_texts_block_deflate_header_len]u8 = undefined;
+        const header_n = try texts.file.readPositionalAll(self.io, &original_header, 0);
+        if (header_n != original_header.len) return error.InvalidRecord;
+        _ = try NodeTextsBlockDeflateHeader.decode(&original_header);
+
+        const journal_header = NodeTextsAppendJournalHeader{
+            .original_size = original_size,
+            .suffix_offset = suffix_offset,
+            .suffix_len = suffix_len_u64,
+            .suffix_hash = std.hash.Wyhash.hash(node_texts_append_journal_hash_seed, suffix),
+            .original_header = original_header,
+        };
+        var journal_header_bytes: [node_texts_append_journal_header_len]u8 = undefined;
+        try journal_header.encode(&journal_header_bytes);
+
+        var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const journal_path = try self.nodeTextsAppendJournalPath(&journal_path_buffer);
+        const tmp_path = try self.tmpPathFor(journal_path);
+        defer self.allocator.free(tmp_path);
+        errdefer std.Io.Dir.cwd().deleteFile(self.io, tmp_path) catch {};
+        {
+            var journal_file = try std.Io.Dir.cwd().createFile(self.io, tmp_path, .{
+                .read = true,
+                .truncate = true,
+            });
+            defer journal_file.close(self.io);
+            try journal_file.writePositionalAll(self.io, &journal_header_bytes, 0);
+            if (suffix.len != 0) try journal_file.writePositionalAll(self.io, suffix, node_texts_append_journal_header_len);
+            if (selfOptionsNeedSync(self)) try journal_file.sync(self.io);
         }
-        try writer.flush();
-        if (try self.regularFileSize(texts_file) != try writer.position()) return error.InvalidRecord;
+        try self.renameReplace(tmp_path, journal_path);
+    }
+
+    fn writeRawNodeTextsAppendJournal(self: Store, original_size: u64) !void {
+        if (!selfOptionsNeedSync(self)) return error.InvalidRecord;
+        const journal_header = NodeTextsAppendJournalHeader{
+            .original_size = original_size,
+            .suffix_offset = original_size,
+            .suffix_len = 0,
+            .suffix_hash = std.hash.Wyhash.hash(node_texts_append_journal_hash_seed, &.{}),
+            .original_header = @splat(0),
+            .original_format = .raw,
+        };
+        var journal_header_bytes: [node_texts_append_journal_header_len]u8 = undefined;
+        try journal_header.encode(&journal_header_bytes);
+
+        var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const journal_path = try self.nodeTextsAppendJournalPath(&journal_path_buffer);
+        const tmp_path = try self.tmpPathFor(journal_path);
+        defer self.allocator.free(tmp_path);
+        errdefer std.Io.Dir.cwd().deleteFile(self.io, tmp_path) catch {};
+        {
+            var journal_file = try std.Io.Dir.cwd().createFile(self.io, tmp_path, .{
+                .read = true,
+                .truncate = true,
+            });
+            defer journal_file.close(self.io);
+            try journal_file.writePositionalAll(self.io, &journal_header_bytes, 0);
+            if (selfOptionsNeedSync(self)) try journal_file.sync(self.io);
+        }
+        try self.renameReplace(tmp_path, journal_path);
+    }
+
+    fn cleanupNodeTextsAppendJournalAfterRecovery(self: Store, journal_path: []const u8) void {
+        std.Io.Dir.cwd().deleteFile(self.io, journal_path) catch return;
+        self.syncParentDirForPath(journal_path) catch {};
+    }
+
+    fn cleanupCommittedNodeTextsAppendJournal(self: Store) void {
+        var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const journal_path = self.nodeTextsAppendJournalPath(&journal_path_buffer) catch return;
+        self.cleanupNodeTextsAppendJournalAfterRecovery(journal_path);
+    }
+
+    const NodeTextsAppendRecovery = enum {
+        none,
+        rolled_back,
+        committed,
+    };
+
+    fn markNodeTextsAppendJournalCommitted(self: Store) !void {
+        var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const journal_path = try self.nodeTextsAppendJournalPath(&journal_path_buffer);
+        var journal_file = try std.Io.Dir.cwd().openFile(self.io, journal_path, .{ .allow_directory = false });
+        var journal_file_open = true;
+        defer if (journal_file_open) journal_file.close(self.io);
+        const journal_size = try self.regularFileSize(journal_file);
+        const journal_len = std.math.cast(usize, journal_size) orelse return error.RecordTooLarge;
+        if (journal_len < node_texts_append_journal_header_len) return error.InvalidRecord;
+        const journal_bytes = try self.allocator.alloc(u8, journal_len);
+        defer self.allocator.free(journal_bytes);
+        const journal_n = try journal_file.readPositionalAll(self.io, journal_bytes, 0);
+        if (journal_n != journal_bytes.len) return error.InvalidRecord;
+        var header_bytes: [node_texts_append_journal_header_len]u8 = undefined;
+        @memcpy(&header_bytes, journal_bytes[0..node_texts_append_journal_header_len]);
+        var header = try NodeTextsAppendJournalHeader.decode(&header_bytes);
+        if (journal_size != std.math.add(u64, node_texts_append_journal_header_len, header.suffix_len) catch return error.InvalidRecord) return error.InvalidRecord;
+        if (header.committed) return;
+        header.committed = true;
+        try header.encode(&header_bytes);
+        @memcpy(journal_bytes[0..node_texts_append_journal_header_len], &header_bytes);
+        journal_file.close(self.io);
+        journal_file_open = false;
+
+        // Never overwrite the only durable undo header in place. A torn
+        // committed-marker write would make both rollback and roll-forward
+        // impossible. Publish a fully synced current-version (v3) journal
+        // with atomic rename; if directory sync fails, recovery can still make
+        // the visible rename durable by deleting the committed journal and
+        // syncing the directory.
+        const tmp_path = try self.tmpPathFor(journal_path);
+        defer self.allocator.free(tmp_path);
+        errdefer std.Io.Dir.cwd().deleteFile(self.io, tmp_path) catch {};
+        {
+            var committed_file = try std.Io.Dir.cwd().createFile(self.io, tmp_path, .{ .read = true, .truncate = true });
+            defer committed_file.close(self.io);
+            try committed_file.writePositionalAll(self.io, journal_bytes, 0);
+            if (selfOptionsNeedSync(self)) try committed_file.sync(self.io);
+        }
+        try self.renameReplace(tmp_path, journal_path);
+    }
+
+    fn commitNodeTextsAppendJournalAfterMutation(self: Store) !void {
+        self.markNodeTextsAppendJournalCommitted() catch |commit_err| {
+            const recovery = self.recoverNodeTextsAppendJournal() catch |recovery_err| return recovery_err;
+            // The data mutation is the durable outcome once the committed
+            // marker is visible. Keep that marker until the canonical event
+            // is published; recovery will reconcile it if the caller fails.
+            if (recovery != .committed) return commit_err;
+        };
+    }
+
+    fn recoverNodeTextsAppendJournal(self: Store) !NodeTextsAppendRecovery {
+        var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const journal_path = try self.nodeTextsAppendJournalPath(&journal_path_buffer);
+        if (!try self.fileExists(journal_path)) return .none;
+
+        var journal_file = try std.Io.Dir.cwd().openFile(self.io, journal_path, .{});
+        var journal_file_open = true;
+        defer if (journal_file_open) journal_file.close(self.io);
+        const journal_size = try self.regularFileSize(journal_file);
+        if (journal_size < node_texts_append_journal_header_len) return error.InvalidRecord;
+        var header_bytes: [node_texts_append_journal_header_len]u8 = undefined;
+        const header_n = try journal_file.readPositionalAll(self.io, &header_bytes, 0);
+        if (header_n != header_bytes.len) return error.InvalidRecord;
+        const header = try NodeTextsAppendJournalHeader.decode(&header_bytes);
+        if (journal_size != std.math.add(u64, node_texts_append_journal_header_len, header.suffix_len) catch return error.InvalidRecord) return error.InvalidRecord;
+
+        switch (header.original_format) {
+            .raw => {
+                if (!allZero(&header.original_header)) return error.InvalidRecord;
+                if (header.suffix_offset != header.original_size or header.suffix_len != 0) return error.InvalidRecord;
+            },
+            .block_deflate => {
+                const original_header = try NodeTextsBlockDeflateHeader.decode(&header.original_header);
+                const table_bytes = try original_header.tableBytes();
+                if (header.suffix_offset < node_texts_block_deflate_header_len or header.suffix_offset > header.original_size) return error.InvalidRecord;
+                if (header.suffix_len != header.original_size - header.suffix_offset) return error.InvalidRecord;
+                if (header.suffix_len < table_bytes or header.suffix_len > table_bytes + node_texts_block_deflate_block_bytes) return error.InvalidRecord;
+            },
+        }
+
+        const suffix_len = std.math.cast(usize, header.suffix_len) orelse return error.RecordTooLarge;
+        const suffix = try self.allocator.alloc(u8, suffix_len);
+        defer self.allocator.free(suffix);
+        const suffix_n = try journal_file.readPositionalAll(self.io, suffix, node_texts_append_journal_header_len);
+        if (suffix_n != suffix.len) return error.InvalidRecord;
+        if (std.hash.Wyhash.hash(node_texts_append_journal_hash_seed, suffix) != header.suffix_hash) return error.InvalidRecord;
+        journal_file.close(self.io);
+        journal_file_open = false;
+
+        // The data file was synced before this checksummed marker. Keep the
+        // committed journal until the canonical event is durable. Store-open
+        // recovery or an explicit index repair reconciles against events.bin
+        // before deleting it, so a text-only append cannot become an orphan.
+        if (header.committed) {
+            try self.syncParentDirForPath(journal_path);
+            return .committed;
+        }
+
+        var texts_file = try std.Io.Dir.cwd().openFile(self.io, self.node_texts_path, .{ .mode = .read_write, .allow_directory = false });
+        defer texts_file.close(self.io);
+        switch (header.original_format) {
+            .raw => try texts_file.setLength(self.io, header.original_size),
+            .block_deflate => {
+                try texts_file.setLength(self.io, header.suffix_offset);
+                if (suffix.len != 0) try texts_file.writePositionalAll(self.io, suffix, header.suffix_offset);
+                try texts_file.writePositionalAll(self.io, &header.original_header, 0);
+                try texts_file.setLength(self.io, header.original_size);
+            },
+        }
         if (selfOptionsNeedSync(self)) try texts_file.sync(self.io);
-        return spans;
+        // The rollback is durable now. A leftover undo journal is harmless and
+        // idempotent, so cleanup failure must not block store open forever.
+        self.cleanupNodeTextsAppendJournalAfterRecovery(journal_path);
+        return .rolled_back;
     }
 
     fn appendCompressedNodeTextSlices(self: Store, texts: *const NodeTextsView, slices: []const []const u8) ![]TextSpan {
         if (texts.format != .block_deflate) return error.InvalidRecord;
-        if (selfOptionsNeedSync(self)) return try self.appendCompressedNodeTextSlicesCow(texts, slices);
         const spans = try self.allocator.alloc(TextSpan, slices.len);
         errdefer self.allocator.free(spans);
 
@@ -4519,6 +5365,32 @@ pub const Store = struct {
         }
         if (append_bytes == 0) return spans;
 
+        const old_block_count = texts.blocks.len;
+        if (old_block_count == 0) return error.InvalidRecord;
+        const old_last = texts.blocks[old_block_count - 1];
+        const old_payload_end = std.math.add(u64, old_last.physical_offset, old_last.stored_len) catch return error.InvalidRecord;
+        const last_has_room = old_last.raw_len < node_texts_block_deflate_block_bytes;
+        const truncate_offset = if (last_has_room) old_last.physical_offset else old_payload_end;
+        var append_journal_active = false;
+        if (selfOptionsNeedSync(self)) {
+            try self.writeNodeTextsAppendJournal(texts, truncate_offset);
+            append_journal_active = true;
+        }
+        self.mutateCompressedNodeTextSlicesInPlace(texts, slices, append_bytes) catch |operation_err| {
+            if (append_journal_active) {
+                _ = self.recoverNodeTextsAppendJournal() catch |recovery_err| return recovery_err;
+                append_journal_active = false;
+            }
+            return operation_err;
+        };
+        if (append_journal_active) {
+            try self.commitNodeTextsAppendJournalAfterMutation();
+            append_journal_active = false;
+        }
+        return spans;
+    }
+
+    fn mutateCompressedNodeTextSlicesInPlace(self: Store, texts: *const NodeTextsView, slices: []const []const u8, append_bytes: u64) !void {
         const old_block_count = texts.blocks.len;
         if (old_block_count == 0) return error.InvalidRecord;
         const old_last = texts.blocks[old_block_count - 1];
@@ -4589,96 +5461,6 @@ pub const Store = struct {
         try new_header.encode(&header_bytes);
         try file.writePositionalAll(self.io, &header_bytes, 0);
         if (selfOptionsNeedSync(self)) try file.sync(self.io);
-        return spans;
-    }
-
-    fn appendCompressedNodeTextSlicesCow(self: Store, texts: *const NodeTextsView, slices: []const []const u8) ![]TextSpan {
-        const spans = try self.allocator.alloc(TextSpan, slices.len);
-        errdefer self.allocator.free(spans);
-
-        var append_bytes: u64 = 0;
-        for (slices, 0..) |text, index| {
-            if (text.len > std.math.maxInt(u32)) return error.RecordTooLarge;
-            const offset = std.math.add(u64, texts.size, append_bytes) catch return error.RecordTooLarge;
-            spans[index] = .{ .offset = offset, .len = @intCast(text.len) };
-            append_bytes = std.math.add(u64, append_bytes, text.len) catch return error.RecordTooLarge;
-        }
-        if (append_bytes == 0) return spans;
-
-        const new_logical_size = std.math.add(u64, texts.size, append_bytes) catch return error.RecordTooLarge;
-        const new_header = NodeTextsBlockDeflateHeader{ .logical_size = new_logical_size };
-        const new_block_count = try new_header.blockCount();
-        const table_bytes = std.math.mul(u64, new_block_count, node_texts_block_deflate_entry_len) catch return error.RecordTooLarge;
-        const table_len = std.math.cast(usize, table_bytes) orelse return error.RecordTooLarge;
-        const block_table = try self.allocator.alloc(u8, table_len);
-        defer self.allocator.free(block_table);
-
-        const tmp_path = try self.tmpPathFor(self.node_texts_path);
-        defer self.allocator.free(tmp_path);
-        errdefer std.Io.Dir.cwd().deleteFile(self.io, tmp_path) catch {};
-
-        var file = try std.Io.Dir.cwd().createFile(self.io, tmp_path, .{
-            .read = true,
-            .truncate = true,
-        });
-        var file_open = true;
-        defer if (file_open) file.close(self.io);
-        try file.setLength(self.io, node_texts_block_deflate_header_len);
-
-        var pending = try self.allocator.alloc(u8, node_texts_block_deflate_block_bytes);
-        defer self.allocator.free(pending);
-        const compressed = try self.allocator.alloc(u8, @as(usize, node_texts_block_deflate_block_bytes) * 2 + 1024);
-        defer self.allocator.free(compressed);
-        const flate_buffer = try self.allocator.alloc(u8, std.compress.flate.max_window_len);
-        defer self.allocator.free(flate_buffer);
-
-        var pending_len: usize = 0;
-        var payload_cursor: u64 = node_texts_block_deflate_header_len;
-        var output_block_index: usize = 0;
-        var logical_offset: u64 = 0;
-        while (logical_offset < texts.size) {
-            const want = @min(@as(u64, node_texts_block_deflate_block_bytes - @as(u32, @intCast(pending_len))), texts.size - logical_offset);
-            const take = std.math.cast(usize, want) orelse return error.RecordTooLarge;
-            try texts.readInto(logical_offset, pending[pending_len..][0..take]);
-            pending_len += take;
-            logical_offset = std.math.add(u64, logical_offset, take) catch return error.RecordTooLarge;
-            if (pending_len == node_texts_block_deflate_block_bytes) {
-                payload_cursor = try self.writeNodeTextsCompressedBlock(&file, pending[0..pending_len], payload_cursor, output_block_index, block_table, compressed, flate_buffer);
-                output_block_index += 1;
-                pending_len = 0;
-            }
-        }
-        for (slices) |text| {
-            var pos: usize = 0;
-            while (pos < text.len) {
-                const available = @as(usize, node_texts_block_deflate_block_bytes) - pending_len;
-                const take = @min(available, text.len - pos);
-                @memcpy(pending[pending_len..][0..take], text[pos..][0..take]);
-                pending_len += take;
-                pos += take;
-                if (pending_len == node_texts_block_deflate_block_bytes) {
-                    payload_cursor = try self.writeNodeTextsCompressedBlock(&file, pending[0..pending_len], payload_cursor, output_block_index, block_table, compressed, flate_buffer);
-                    output_block_index += 1;
-                    pending_len = 0;
-                }
-            }
-        }
-        if (pending_len != 0) {
-            payload_cursor = try self.writeNodeTextsCompressedBlock(&file, pending[0..pending_len], payload_cursor, output_block_index, block_table, compressed, flate_buffer);
-            output_block_index += 1;
-        }
-        if (output_block_index != new_block_count) return error.InvalidRecord;
-        try file.writePositionalAll(self.io, block_table, payload_cursor);
-        const final_size = std.math.add(u64, payload_cursor, table_bytes) catch return error.RecordTooLarge;
-        try file.setLength(self.io, final_size);
-        var header_bytes: [node_texts_block_deflate_header_len]u8 = undefined;
-        try new_header.encode(&header_bytes);
-        try file.writePositionalAll(self.io, &header_bytes, 0);
-        try file.sync(self.io);
-        file.close(self.io);
-        file_open = false;
-        try self.renameReplace(tmp_path, self.node_texts_path);
-        return spans;
     }
 
     fn writeNodeTextsCompressedBlock(
@@ -4888,12 +5670,20 @@ pub const Store = struct {
     }
 
     pub fn loadGraph(self: Store) !graph_mod.Graph {
+        return self.loadGraphDeadline(.none);
+    }
+
+    /// Replay the canonical event log without publishing derived indexes,
+    /// while honoring a caller-owned query deadline. Read-only recovery paths
+    /// must not silently shed their time budget when a derived index is bad.
+    pub fn loadGraphDeadline(self: Store, deadline: core.QueryDeadline) !graph_mod.Graph {
+        if (deadline.expired()) return core.Error.BudgetExceeded;
         var graph = graph_mod.Graph.init(self.allocator);
         errdefer graph.deinit();
 
         var file = try std.Io.Dir.cwd().openFile(self.io, self.events_bin_path, .{});
         defer file.close(self.io);
-        try self.replayBinaryEvents(&graph, file);
+        try self.replayBinaryEvents(&graph, file, deadline);
         return graph;
     }
 
@@ -4923,6 +5713,7 @@ pub const Store = struct {
 
     pub fn repairPersistentIndexesFromLogWithTimings(self: Store, timings: *PersistentRepairTimings) !void {
         timings.* = .{};
+        const node_text_recovery = try self.recoverNodeTextsAppendJournal();
         const truncate_start = storageMonotonicNs(self.io);
         _ = try self.truncateIncompleteBatchTail();
         timings.truncate_ns = storageElapsedNs(self.io, truncate_start);
@@ -4934,6 +5725,9 @@ pub const Store = struct {
         const drop_start = storageMonotonicNs(self.io);
         _ = self.dropRedundantEdgeSegmentOverlayAfterBaseIndexCatchup() catch {};
         timings.drop_overlay_ns = storageElapsedNs(self.io, drop_start);
+        if (node_text_recovery == .committed) {
+            self.cleanupCommittedNodeTextsAppendJournal();
+        }
     }
 
     pub fn validatePersistentIndexes(self: Store) !void {
@@ -4953,12 +5747,15 @@ pub const Store = struct {
         if (!try self.fastPersistentIndexesCurrent()) return error.InvalidRecord;
     }
 
-    fn refreshIndexesAfterCommittedAppend(self: Store, kind: BinaryRecordKind, node: ?graph_mod.Node, edge: ?graph_mod.Edge, node_text_span: ?TextSpan) !void {
+    fn refreshIndexesAfterCommittedAppend(self: Store, kind: BinaryRecordKind, node: ?graph_mod.Node, edge: ?graph_mod.Edge, node_text_span: ?TextSpan) bool {
         self.tryRefreshIndexesAfterCommittedAppend(kind, node, edge, node_text_span) catch {
             // The append log write already committed the event; surfacing
             // derived-index repair failure here would invite unsafe retries.
-            self.repairPersistentIndexesFromLog() catch {};
+            // Report whether repair completed so node append can retain its
+            // committed text journal when the indexes are still unusable.
+            self.repairPersistentIndexesFromLog() catch return false;
         };
+        return true;
     }
 
     fn tryRefreshIndexesAfterCommittedAppend(self: Store, kind: BinaryRecordKind, node: ?graph_mod.Node, edge: ?graph_mod.Edge, node_text_span: ?TextSpan) !void {
@@ -4991,6 +5788,14 @@ pub const Store = struct {
             else => |e| return e,
         };
         try self.syncParentDirForPath(self.edge_segment_current_path);
+    }
+
+    fn invalidateNodeTextRunCurrent(self: Store) !void {
+        std.Io.Dir.cwd().deleteFile(self.io, self.node_text_run_current_path) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => |e| return e,
+        };
+        try self.syncParentDirForPath(self.node_text_run_current_path);
     }
 
     pub fn hasCatalog(self: Store) !bool {
@@ -5047,6 +5852,52 @@ pub const Store = struct {
         return state.stats;
     }
 
+    /// Count canonical node records without materializing ids, edges, or
+    /// node text. Returning `max_nodes + 1` is a deliberate saturation signal
+    /// so admission paths can reject a large log immediately.
+    pub fn nodeEventCountUpTo(self: Store, max_nodes: u64) !u64 {
+        var file = try std.Io.Dir.cwd().openFile(self.io, self.events_bin_path, .{});
+        defer file.close(self.io);
+        const file_size = try self.regularFileSize(file);
+        var offset: u64 = 0;
+        var count: u64 = 0;
+        var in_batch = false;
+        while (true) {
+            const parsed = try self.readBinaryRecordHeader(file, &offset) orelse break;
+            try ensureBinaryPayloadFits(file_size, offset, parsed.payload_len);
+            var prefix: [max_binary_count_payload_prefix_len]u8 = undefined;
+            var prefix_len: usize = 0;
+            try self.readBinaryPayloadPrefixAndValidateChecksum(file, offset, parsed, &prefix, &prefix_len);
+            try advanceBinaryOffset(&offset, parsed.payload_len);
+            const added: u64 = switch (parsed.kind) {
+                .batch_begin => blk: {
+                    if (in_batch or parsed.payload_len != 0) return error.InvalidRecord;
+                    in_batch = true;
+                    break :blk 0;
+                },
+                .batch_commit => blk: {
+                    if (!in_batch or parsed.payload_len != 0) return error.InvalidRecord;
+                    in_batch = false;
+                    break :blk 0;
+                },
+                .node => blk: {
+                    _ = try validateBinaryNodePayloadForCount(prefix[0..prefix_len], parsed.payload_len);
+                    break :blk 1;
+                },
+                .node_batch => blk: {
+                    if (!in_batch) return error.InvalidRecord;
+                    break :blk try binaryNodeBatchCountFromPrefix(prefix[0..prefix_len], parsed.payload_len);
+                },
+                .edge, .edge_batch, .edge_delete => 0,
+            };
+            count = std.math.add(u64, count, added) catch return error.RecordTooLarge;
+            if (count > max_nodes) return std.math.add(u64, max_nodes, 1) catch return error.RecordTooLarge;
+            if (offset == file_size and in_batch) return error.InvalidRecord;
+        }
+        if (in_batch) return error.InvalidRecord;
+        return count;
+    }
+
     fn fileExists(self: Store, path: []const u8) !bool {
         var file = std.Io.Dir.cwd().openFile(self.io, path, .{}) catch |err| switch (err) {
             error.FileNotFound => return false,
@@ -5085,6 +5936,7 @@ pub const Store = struct {
             self.edge_props_overlay_values_path,
             self.property_payload_index_path,
             self.property_payload_values_path,
+            self.property_payload_delta_path,
             self.edge_external_key_index_path,
             self.node_text_run_manifest_path,
             self.node_text_run_current_path,
@@ -5092,9 +5944,22 @@ pub const Store = struct {
             self.edge_by_src_path,
             self.edge_by_dst_path,
             self.edge_tombstones_path,
+            self.catalog_path,
         }) |path| {
             if (try self.pathExists(path)) return true;
         }
+        var node_text_journal_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const node_text_journal_path = try self.nodeTextsAppendJournalPath(&node_text_journal_buffer);
+        if (try self.pathExists(node_text_journal_path)) return true;
+        const node_text_journal_tmp_path = try self.tmpPathFor(node_text_journal_path);
+        defer self.allocator.free(node_text_journal_tmp_path);
+        if (try self.pathExists(node_text_journal_tmp_path)) return true;
+        const primary_text_tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.deflate.tmp", .{self.node_texts_path});
+        defer self.allocator.free(primary_text_tmp_path);
+        if (try self.pathExists(primary_text_tmp_path)) return true;
+        const primary_text_table_tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.deflate.table.tmp", .{self.node_texts_path});
+        defer self.allocator.free(primary_text_table_tmp_path);
+        if (try self.pathExists(primary_text_table_tmp_path)) return true;
         return false;
     }
 
@@ -5103,13 +5968,14 @@ pub const Store = struct {
         return error.FileNotFound;
     }
 
-    fn replayBinaryEvents(self: Store, graph: *graph_mod.Graph, file: std.Io.File) !void {
+    fn replayBinaryEvents(self: Store, graph: *graph_mod.Graph, file: std.Io.File, deadline: core.QueryDeadline) !void {
         var offset: u64 = 0;
         const file_size = try self.regularFileSize(file);
         var texts: ?NodeTextsView = null;
         defer if (texts) |*view| view.deinit();
         var in_batch = false;
         while (true) {
+            if (deadline.expired()) return core.Error.BudgetExceeded;
             const parsed = try self.readBinaryRecordHeader(file, &offset) orelse break;
             try ensureBinaryPayloadFits(file_size, offset, parsed.payload_len);
             const payload = try self.allocator.alloc(u8, parsed.payload_len);
@@ -5143,6 +6009,7 @@ pub const Store = struct {
                     if (!in_batch) return error.InvalidRecord;
                     var batch_reader = try BinaryNodeBatchReader.init(payload);
                     while (try batch_reader.next()) |parsed_node| {
+                        if (deadline.expired()) return core.Error.BudgetExceeded;
                         {
                             if (texts == null) texts = try NodeTextsView.open(self);
                             const text = try texts.?.readTextAlloc(self.allocator, parsed_node.text_offset, parsed_node.text_len);
@@ -5154,14 +6021,16 @@ pub const Store = struct {
                         }
                     }
                 },
-                .edge, .edge_delete => try replayBinaryRecord(graph, parsed.kind, payload),
+                .edge, .edge_delete => try replayBinaryRecord(graph, parsed.kind, payload, deadline),
                 .edge_batch => {
                     if (!in_batch) return error.InvalidRecord;
-                    try replayBinaryRecord(graph, parsed.kind, payload);
+                    try replayBinaryRecord(graph, parsed.kind, payload, deadline);
                 },
             }
+            if (deadline.expired()) return core.Error.BudgetExceeded;
         }
         if (in_batch) return error.InvalidRecord;
+        if (deadline.expired()) return core.Error.BudgetExceeded;
     }
 
     fn countBinaryEvents(self: Store, file: std.Io.File, state: *EventCountState) !void {
@@ -5949,7 +6818,7 @@ pub const Store = struct {
         if (timings) |t| t.primary_rename_ns += storageElapsedNs(self.io, primary_rename_start);
 
         const compress_start = if (timings != null) storageMonotonicNs(self.io) else 0;
-        try self.compressNodeTextsFileIfSmaller();
+        try self.finalizePrimaryTextStorage();
         if (timings) |t| t.node_texts_compress_ns += storageElapsedNs(self.io, compress_start);
 
         const node_text_index_start = if (timings != null) storageMonotonicNs(self.io) else 0;
@@ -6021,6 +6890,15 @@ pub const Store = struct {
 
     pub fn eventByteCount(self: Store) !u64 {
         return self.eventBytes();
+    }
+
+    pub fn propertyPayloadDeltaByteCount(self: Store) !u64 {
+        var file = std.Io.Dir.cwd().openFile(self.io, self.property_payload_delta_path, .{ .allow_directory = false }) catch |err| switch (err) {
+            error.FileNotFound => return 0,
+            else => |e| return e,
+        };
+        defer file.close(self.io);
+        return self.regularFileSize(file);
     }
 
     fn writeIndexMeta(self: Store, meta: IndexMeta) !void {
@@ -6457,6 +7335,8 @@ pub const Store = struct {
         tombstones: ?EdgeTombstoneIndexView = null,
         pos: u64,
         end: u64,
+        physical_records_scanned: u64 = 0,
+        max_physical_records: ?u64 = null,
         done: bool = false,
 
         pub fn deinit(self: *EdgeIndexRecordIterator) void {
@@ -6467,8 +7347,12 @@ pub const Store = struct {
 
         pub fn next(self: *EdgeIndexRecordIterator) !?EdgeIndexRecord {
             while (!self.done and self.pos < self.end) {
+                if (self.max_physical_records) |limit| {
+                    if (self.physical_records_scanned >= limit) return core.Error.BudgetExceeded;
+                }
                 const record = try self.readRecordAt(self.pos);
                 self.pos += 1;
+                self.physical_records_scanned += 1;
                 if (edgeIndexRecordKey(record, self.order) != self.key) {
                     self.done = true;
                     return null;
@@ -6536,6 +7420,96 @@ pub const Store = struct {
             .reader = reader,
             .tombstones = tombstones,
         };
+    }
+
+    /// Stream the complete visible edge set, including a published segment
+    /// overlay that has not yet been consolidated into the three base edge
+    /// indexes. Memory is bounded by the manifest fan-in; callers that need a
+    /// different global order can external-sort the fixed-size records.
+    pub fn scanVisibleEdgeIndexRecords(
+        self: Store,
+        allocator: std.mem.Allocator,
+        context: *anyopaque,
+        visit: EdgeIndexRecordVisitor,
+    ) !u64 {
+        const meta = try self.readCurrentIndexMeta();
+        var count: u64 = 0;
+        var digest: u64 = 0;
+        var opened = try self.openPublishedEdgeSegmentsForQuery(allocator);
+        defer if (opened) |*segments| segments.deinit();
+        if (opened) |*segments| {
+            const tombstone_header = try self.readEdgeTombstoneIndexHeader();
+            var tombstones: ?EdgeTombstoneIndexView = null;
+            defer if (tombstones) |*view| view.deinit();
+            if (tombstone_header.count != 0 and segments.coverage != .visible_full) {
+                tombstones = try EdgeTombstoneIndexView.open(self);
+            }
+
+            if (segments.coverage == .delta) {
+                var base = try self.openEdgeIndexRecordReader(self.edge_by_src_path, .src, meta);
+                defer base.deinit();
+                var stream = BaseAndSegmentMergeStream.initWithVirtualFiltered(
+                    allocator,
+                    &base,
+                    &segments.segments.segments,
+                    &segments.segments.virtual_edges,
+                    .forward,
+                    if (tombstones) |*view| view else null,
+                );
+                defer stream.deinit();
+                try stream.reset();
+                while (try stream.next()) |edge| {
+                    const record = EdgeIndexRecord{
+                        .src = edge.src.toInt(),
+                        .dst = edge.dst.toInt(),
+                        .edge_id = edge.edge_id.toInt(),
+                        .rel = @intFromEnum(edge.rel),
+                    };
+                    try visit(context, record);
+                    count = std.math.add(u64, count, 1) catch return error.RecordTooLarge;
+                    digest ^= edgeRecordDigest(record);
+                }
+            } else {
+                var stream = if (tombstones) |*view|
+                    EdgeSegmentMergeStream.initWithVirtualFiltered(
+                        allocator,
+                        &segments.segments.segments,
+                        &segments.segments.virtual_edges,
+                        .forward,
+                        view,
+                    )
+                else
+                    EdgeSegmentMergeStream.initWithVirtual(
+                        allocator,
+                        &segments.segments.segments,
+                        &segments.segments.virtual_edges,
+                        .forward,
+                    );
+                defer stream.deinit();
+                try stream.reset();
+                while (try stream.next()) |edge| {
+                    const record = EdgeIndexRecord{
+                        .src = edge.src.toInt(),
+                        .dst = edge.dst.toInt(),
+                        .edge_id = edge.edge_id.toInt(),
+                        .rel = @intFromEnum(edge.rel),
+                    };
+                    try visit(context, record);
+                    count = std.math.add(u64, count, 1) catch return error.RecordTooLarge;
+                    digest ^= edgeRecordDigest(record);
+                }
+            }
+        } else {
+            var records = try self.visibleEdgeIndexRecordsIterator(.src);
+            defer records.deinit();
+            while (try records.next()) |record| {
+                try visit(context, record);
+                count = std.math.add(u64, count, 1) catch return error.RecordTooLarge;
+                digest ^= edgeRecordDigest(record);
+            }
+        }
+        if (count != meta.edges or digest != meta.edge_digest) return error.InvalidRecord;
+        return count;
     }
 
     pub fn edgeIndexRecordsByNodeIterator(self: Store, order: EdgeIndexOrder, node_id: core.NodeId) !EdgeIndexRecordIterator {
@@ -6642,71 +7616,186 @@ pub const Store = struct {
         return records;
     }
 
-    /// segment-aware 前向边读取:committed 索引 + published delta segment 合并。
-    /// pub 原因(project containment 修复):contain 树遍历必须看见 delta 边——>1024 边 store
-    /// 上新边走 delta segment,只读 committed 索引的 edgeIndexRecordsByNodeAndRelationIterator 会漏。
-    pub fn readVisibleEdgeIndexRecordsByNodeForOrderedTraversal(self: Store, allocator: std.mem.Allocator, node_id: core.NodeId) !std.ArrayList(EdgeIndexRecord) {
-        var segments_for_query = try self.openPublishedEdgeSegmentsForQueryForNode(allocator, .forward, node_id);
-        defer if (segments_for_query) |*opened| opened.deinit();
-
-        if (segments_for_query) |*opened| {
-            switch (opened.coverage) {
-                .full, .visible_full => return self.readPublishedEdgeSegmentRecordsByNode(allocator, &opened.segments, node_id),
-                .delta => {
-                    var records = try self.readEdgeIndexRecordsByNode(allocator, .src, node_id);
-                    errdefer records.deinit(allocator);
-                    try self.appendPublishedEdgeSegmentRecordsByNode(allocator, &opened.segments, node_id, &records);
-                    return records;
-                },
-            }
-        }
-
-        return self.readEdgeIndexRecordsByNode(allocator, .src, node_id);
-    }
-
-    fn readPublishedEdgeSegmentRecordsByNode(
+    /// Read the physical visible adjacency for one endpoint. This is the
+    /// storage-level source of truth for base indexes plus published segment
+    /// overlays; query-only virtual edges (for example deferred `based_on`)
+    /// are intentionally outside this API.
+    pub fn readVisibleEdgeIndexRecordsByNode(
         self: Store,
         allocator: std.mem.Allocator,
-        segments: *PublishedEdgeSegments,
+        order: EdgeIndexOrder,
         node_id: core.NodeId,
+        rel_filter: ?core.RelKind,
     ) !std.ArrayList(EdgeIndexRecord) {
-        var records = std.ArrayList(EdgeIndexRecord).empty;
-        errdefer records.deinit(allocator);
-        try self.appendPublishedEdgeSegmentRecordsByNode(allocator, segments, node_id, &records);
-        return records;
+        return self.readVisibleEdgeIndexRecordsByNodeLimited(
+            allocator,
+            order,
+            node_id,
+            rel_filter,
+            (core.QueryBudget{}).max_visited_edges,
+        );
     }
 
-    fn appendPublishedEdgeSegmentRecordsByNode(
+    pub fn readVisibleEdgeIndexRecordsByNodeLimited(
         self: Store,
         allocator: std.mem.Allocator,
-        segments: *PublishedEdgeSegments,
+        order: EdgeIndexOrder,
         node_id: core.NodeId,
-        records: *std.ArrayList(EdgeIndexRecord),
-    ) !void {
+        rel_filter: ?core.RelKind,
+        max_records: usize,
+    ) !std.ArrayList(EdgeIndexRecord) {
         const CollectContext = struct {
             allocator: std.mem.Allocator,
-            out: *std.ArrayList(EdgeIndexRecord),
+            records: *std.ArrayList(EdgeIndexRecord),
 
-            fn visit(ctx: *@This(), edge: segment_mod.EdgeRecord) !bool {
-                try ctx.out.append(ctx.allocator, .{
-                    .src = edge.src.toInt(),
-                    .dst = edge.dst.toInt(),
-                    .edge_id = edge.edge_id.toInt(),
-                    .rel = @intFromEnum(edge.rel),
-                });
+            fn visit(context: *@This(), record: EdgeIndexRecord) !bool {
+                try context.records.append(context.allocator, record);
                 return false;
             }
         };
-        var context = CollectContext{ .allocator = allocator, .out = records };
-        _ = try self.forEachOpenedPublishedEdgeSegmentNeighbor(
-            segments,
-            .forward,
+        var records = std.ArrayList(EdgeIndexRecord).empty;
+        errdefer records.deinit(allocator);
+        var context = CollectContext{ .allocator = allocator, .records = &records };
+        _ = try self.forEachVisibleEdgeIndexRecordByNode(
+            allocator,
+            order,
             node_id,
-            null,
-            (core.QueryBudget{}).max_visited_edges,
+            rel_filter,
+            max_records,
             &context,
             CollectContext.visit,
         );
+        return records;
+    }
+
+    pub fn forEachVisibleEdgeIndexRecordByNode(
+        self: Store,
+        allocator: std.mem.Allocator,
+        order: EdgeIndexOrder,
+        node_id: core.NodeId,
+        rel_filter: ?core.RelKind,
+        max_records: usize,
+        context: anytype,
+        comptime callback: fn (@TypeOf(context), EdgeIndexRecord) anyerror!bool,
+    ) !bool {
+        return self.forEachVisibleEdgeIndexRecordByNodeMaybeRetained(
+            allocator,
+            null,
+            order,
+            node_id,
+            rel_filter,
+            max_records,
+            context,
+            callback,
+        );
+    }
+
+    pub fn forEachVisibleEdgeIndexRecordByNodeRetained(
+        self: Store,
+        allocator: std.mem.Allocator,
+        registry: *EdgeSegmentRetentionRegistry,
+        order: EdgeIndexOrder,
+        node_id: core.NodeId,
+        rel_filter: ?core.RelKind,
+        max_records: usize,
+        context: anytype,
+        comptime callback: fn (@TypeOf(context), EdgeIndexRecord) anyerror!bool,
+    ) !bool {
+        return self.forEachVisibleEdgeIndexRecordByNodeMaybeRetained(
+            allocator,
+            registry,
+            order,
+            node_id,
+            rel_filter,
+            max_records,
+            context,
+            callback,
+        );
+    }
+
+    fn forEachVisibleEdgeIndexRecordByNodeMaybeRetained(
+        self: Store,
+        allocator: std.mem.Allocator,
+        registry: ?*EdgeSegmentRetentionRegistry,
+        order: EdgeIndexOrder,
+        node_id: core.NodeId,
+        rel_filter: ?core.RelKind,
+        max_records: usize,
+        context: anytype,
+        comptime callback: fn (@TypeOf(context), EdgeIndexRecord) anyerror!bool,
+    ) !bool {
+        const direction: segment_mod.Direction = switch (order) {
+            .src => .forward,
+            .dst => .reverse,
+            .id => return core.Error.Unsupported,
+        };
+        var segments_for_query = if (registry) |retention_registry|
+            try self.openPublishedEdgeSegmentsForQueryForNodeRetained(allocator, retention_registry, direction, node_id)
+        else
+            try self.openPublishedEdgeSegmentsForQueryForNode(allocator, direction, node_id);
+        defer if (segments_for_query) |*opened| opened.deinit();
+
+        var emitted: usize = 0;
+        const scan_limit = @max(max_records, (core.QueryBudget{}).max_visited_edges);
+        const base_scan_limit = std.math.cast(u64, scan_limit) orelse std.math.maxInt(u64);
+        if (segments_for_query) |*opened| {
+            if (opened.coverage == .delta) {
+                var base = try self.edgeIndexRecordsByNodeAndRelationIterator(order, node_id, rel_filter);
+                defer base.deinit();
+                base.max_physical_records = base_scan_limit;
+                while (try base.next()) |record| {
+                    if (emitted >= max_records) return core.Error.BudgetExceeded;
+                    emitted += 1;
+                    if (try callback(context, record)) return true;
+                }
+            }
+            const SegmentContext = struct {
+                inner: @TypeOf(context),
+                emitted: *usize,
+                max_records: usize,
+
+                fn visit(segment_context: *@This(), edge: segment_mod.EdgeRecord) !bool {
+                    if (segment_context.emitted.* >= segment_context.max_records) return core.Error.BudgetExceeded;
+                    segment_context.emitted.* += 1;
+                    return callback(segment_context.inner, .{
+                        .src = edge.src.toInt(),
+                        .dst = edge.dst.toInt(),
+                        .edge_id = edge.edge_id.toInt(),
+                        .rel = @intFromEnum(edge.rel),
+                    });
+                }
+            };
+            var segment_context = SegmentContext{
+                .inner = context,
+                .emitted = &emitted,
+                .max_records = max_records,
+            };
+            // Segment tombstone filtering happens inside the storage wrapper,
+            // so its physical-edge budget cannot represent this API's visible
+            // record budget. Keep the two limits independent: callbacks count
+            // visible records above, while the scan cap still bounds work on a
+            // tombstone-heavy adjacency.
+            return if (opened.coverage == .visible_full)
+                try opened.segments.forEachNeighbor(direction, node_id, rel_filter, scan_limit, &segment_context, SegmentContext.visit)
+            else
+                try self.forEachOpenedPublishedEdgeSegmentNeighbor(&opened.segments, direction, node_id, rel_filter, scan_limit, &segment_context, SegmentContext.visit);
+        }
+
+        var base = try self.edgeIndexRecordsByNodeAndRelationIterator(order, node_id, rel_filter);
+        defer base.deinit();
+        base.max_physical_records = base_scan_limit;
+        while (try base.next()) |record| {
+            if (emitted >= max_records) return core.Error.BudgetExceeded;
+            emitted += 1;
+            if (try callback(context, record)) return true;
+        }
+        return false;
+    }
+
+    /// Ordered traversal sorts this physical adjacency with the edge-order
+    /// sidecar after loading; keep the compatibility name for those callers.
+    pub fn readVisibleEdgeIndexRecordsByNodeForOrderedTraversal(self: Store, allocator: std.mem.Allocator, node_id: core.NodeId) !std.ArrayList(EdgeIndexRecord) {
+        return self.readVisibleEdgeIndexRecordsByNode(allocator, .src, node_id, null);
     }
 
     pub fn readEdgeIndexRecordsByNodeLimited(self: Store, allocator: std.mem.Allocator, order: EdgeIndexOrder, node_id: core.NodeId, max_records: usize) !std.ArrayList(EdgeIndexRecord) {
@@ -6748,6 +7837,148 @@ pub const Store = struct {
         try order_map.ensureTotalCapacity(@intCast(records.items.len));
         for (records.items) |record| order_map.putAssumeCapacity(record.edge_id, record.order_key);
         return order_map;
+    }
+
+    /// Validate and stream the ordered-edge sidecar without materializing an
+    /// O(ordered edges) map. Migration uses this both to publish the target
+    /// sidecar once and to feed authoritative order_key values into its
+    /// external property sort.
+    pub fn scanEdgeOrderRecords(self: Store, context: *anyopaque, visit: EdgeOrderRecordVisitor) !u64 {
+        var file = std.Io.Dir.cwd().openFile(self.io, self.edge_order_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return 0,
+            else => |e| return e,
+        };
+        defer file.close(self.io);
+        const file_size = try self.regularFileSize(file);
+        if (file_size < EdgeOrderHeader.encoded_len) return error.InvalidRecord;
+        var header_bytes: [EdgeOrderHeader.encoded_len]u8 = undefined;
+        if (try file.readPositionalAll(self.io, &header_bytes, 0) != header_bytes.len) return error.InvalidRecord;
+        const header = EdgeOrderHeader.decode(&header_bytes);
+        const payload_bytes = std.math.mul(u64, header.count, EdgeOrderRecord.encoded_len) catch return error.InvalidRecord;
+        if (file_size != std.math.add(u64, EdgeOrderHeader.encoded_len, payload_bytes) catch return error.InvalidRecord) return error.InvalidRecord;
+
+        var digest: u64 = 0;
+        var pos: u64 = EdgeOrderHeader.encoded_len;
+        var previous: ?EdgeOrderRecord = null;
+        var index: u64 = 0;
+        while (index < header.count) : (index += 1) {
+            var record_bytes: [EdgeOrderRecord.encoded_len]u8 = undefined;
+            if (try file.readPositionalAll(self.io, &record_bytes, pos) != record_bytes.len) return error.InvalidRecord;
+            pos = std.math.add(u64, pos, EdgeOrderRecord.encoded_len) catch return error.InvalidRecord;
+            const record = try EdgeOrderRecord.decode(&record_bytes);
+            if (previous) |prior| {
+                if (!edgeOrderRecordLessThan({}, prior, record)) return error.InvalidRecord;
+                if (prior.edge_id == record.edge_id) return error.InvalidRecord;
+            }
+            digest ^= edgeOrderRecordDigest(record);
+            try visit(context, record);
+            previous = record;
+        }
+        if (digest != header.digest) return error.InvalidRecord;
+        return header.count;
+    }
+
+    /// Replace this store's order sidecar by streaming a source sidecar and
+    /// remapping relation ids. The target file is published atomically after
+    /// the complete source digest and target ordering have been validated.
+    pub fn replaceEdgeOrderIndexRemappedFrom(
+        self: Store,
+        source: Store,
+        rel_remap: []const u16,
+        invalid_rel: u16,
+    ) !u64 {
+        return self.replaceEdgeOrderIndexFrom(source, rel_remap, invalid_rel, false);
+    }
+
+    /// Copy the authoritative order sidecar for edges that survived a COW
+    /// rewrite.  Deleted edges may still have stale sidecar records; they are
+    /// omitted, while every surviving record must exactly match the target
+    /// edge identity and endpoints.
+    pub fn replaceEdgeOrderIndexFromPresentEdges(self: Store, source: Store) !u64 {
+        return self.replaceEdgeOrderIndexFrom(source, null, std.math.maxInt(u16), true);
+    }
+
+    fn replaceEdgeOrderIndexFrom(
+        self: Store,
+        source: Store,
+        rel_remap: ?[]const u16,
+        invalid_rel: u16,
+        present_only: bool,
+    ) !u64 {
+        const tmp_path = try self.tmpPathFor(self.edge_order_path);
+        defer self.allocator.free(tmp_path);
+        errdefer std.Io.Dir.cwd().deleteFile(self.io, tmp_path) catch {};
+        var count: u64 = 0;
+        {
+            var file = try std.Io.Dir.cwd().createFile(self.io, tmp_path, .{ .read = true, .truncate = true });
+            defer file.close(self.io);
+            var writer = try StorageBufferedWriter.initAtOffset(
+                self.allocator,
+                self.io,
+                file,
+                storage_write_buffer_bytes,
+                EdgeOrderHeader.encoded_len,
+            );
+            defer writer.deinit();
+            const CopyContext = struct {
+                writer: *StorageBufferedWriter,
+                target: Store,
+                rel_remap: ?[]const u16,
+                invalid_rel: u16,
+                present_only: bool,
+                previous: ?EdgeOrderRecord = null,
+                count: u64 = 0,
+                digest: u64 = 0,
+
+                fn visit(raw_context: *anyopaque, source_record: EdgeOrderRecord) anyerror!void {
+                    const context: *@This() = @ptrCast(@alignCast(raw_context));
+                    const target_rel = if (context.rel_remap) |remap| blk: {
+                        if (source_record.rel >= remap.len) return error.InvalidRecord;
+                        const remapped = remap[source_record.rel];
+                        if (remapped == context.invalid_rel or relKindFromInt(remapped) == null) return error.InvalidRecord;
+                        break :blk remapped;
+                    } else source_record.rel;
+                    var target_record = source_record;
+                    target_record.rel = target_rel;
+                    try validateEdgeOrderRecord(target_record);
+                    if (context.present_only) {
+                        const target_edge = context.target.readVisibleEdgeIndexRecordById(.fromInt(target_record.edge_id)) catch |err| switch (err) {
+                            core.Error.NotFound, core.Error.InvalidId => return,
+                            else => |e| return e,
+                        };
+                        if (target_edge.src != target_record.src or
+                            target_edge.rel != target_record.rel) return error.InvalidRecord;
+                    }
+                    if (context.previous) |prior| {
+                        if (!edgeOrderRecordLessThan({}, prior, target_record)) return error.InvalidRecord;
+                        if (prior.edge_id == target_record.edge_id) return error.InvalidRecord;
+                    }
+                    var bytes: [EdgeOrderRecord.encoded_len]u8 = undefined;
+                    target_record.encode(&bytes);
+                    try context.writer.append(&bytes);
+                    context.count = std.math.add(u64, context.count, 1) catch return error.RecordTooLarge;
+                    context.digest ^= edgeOrderRecordDigest(target_record);
+                    context.previous = target_record;
+                }
+            };
+            var context = CopyContext{
+                .writer = &writer,
+                .target = self,
+                .rel_remap = rel_remap,
+                .invalid_rel = invalid_rel,
+                .present_only = present_only,
+            };
+            const source_count = try source.scanEdgeOrderRecords(&context, CopyContext.visit);
+            if (context.count > source_count or (!present_only and source_count != context.count)) return error.InvalidRecord;
+            try writer.flush();
+            var header_bytes: [EdgeOrderHeader.encoded_len]u8 = undefined;
+            (EdgeOrderHeader{ .count = context.count, .digest = context.digest }).encode(&header_bytes);
+            try file.writePositionalAll(self.io, &header_bytes, 0);
+            if (selfOptionsNeedSync(self)) try file.sync(self.io);
+            count = context.count;
+        }
+        try self.renameReplace(tmp_path, self.edge_order_path);
+        return count;
     }
 
     /// 批量 upsert order 记录(按 edge_id 替换旧值;一次读全表+写回)。
@@ -7067,12 +8298,17 @@ pub const Store = struct {
             };
         };
         defer derived.deinit(allocator);
-        var overlay = try self.readNodePropertyOverlayEntriesOrEmpty(allocator);
+        var overlay = try self.readNodePropertyOverlayEntriesForKeyOrEmpty(
+            allocator,
+            self.node_props_overlay_index_path,
+            self.node_props_overlay_values_path,
+            key,
+        );
         defer {
             deinitNodePropertyIndexEntries(overlay.items, allocator);
             overlay.deinit(allocator);
         }
-        var payload_overlay = try self.readPropertyPayloadEntriesOrEmpty(allocator);
+        var payload_overlay = try self.readPropertyPayloadEntriesForKeyOrEmpty(allocator, key);
         defer {
             deinitPropertyPayloadIndexEntries(payload_overlay.items, allocator);
             payload_overlay.deinit(allocator);
@@ -7173,7 +8409,7 @@ pub const Store = struct {
         errdefer out.deinit(allocator);
         if (max_edges == 0 or value.len == 0 or !edgePropertyOverlayStringKeySupported(key)) return out;
 
-        var payload_entries = try self.readPropertyPayloadEntriesOrEmpty(allocator);
+        var payload_entries = try self.readPropertyPayloadEntriesForKeyOrEmpty(allocator, key);
         defer {
             deinitPropertyPayloadIndexEntries(payload_entries.items, allocator);
             payload_entries.deinit(allocator);
@@ -7188,14 +8424,16 @@ pub const Store = struct {
             const concrete = entry.value orelse return error.InvalidRecord;
             if (!std.mem.eql(u8, concrete, value)) continue;
             const edge_id: core.EdgeId = .fromInt(entry.record.owner_id);
-            _ = self.readEdgeIndexRecordById(edge_id) catch |err| switch (err) {
-                core.Error.InvalidId, core.Error.NotFound => continue,
-                else => |e| return e,
-            };
+            if (!try self.visibleEdgeIdExists(edge_id)) continue;
             try appendUniqueEdgeId(allocator, &out, edge_id);
         }
 
-        var legacy_entries = try self.readEdgePropertyOverlayEntriesOrEmpty(allocator);
+        var legacy_entries = try self.readNodePropertyOverlayEntriesForKeyOrEmpty(
+            allocator,
+            self.edge_props_overlay_index_path,
+            self.edge_props_overlay_values_path,
+            key,
+        );
         defer {
             deinitNodePropertyIndexEntries(legacy_entries.items, allocator);
             legacy_entries.deinit(allocator);
@@ -7207,10 +8445,7 @@ pub const Store = struct {
             if (!std.mem.eql(u8, concrete, value)) continue;
             const edge_id: core.EdgeId = .fromInt(entry.record.node_id);
             if (propertyPayloadStringValue(payload_entries.items, .{ .edge = edge_id }, key) != null) continue;
-            _ = self.readEdgeIndexRecordById(edge_id) catch |err| switch (err) {
-                core.Error.InvalidId, core.Error.NotFound => continue,
-                else => |e| return e,
-            };
+            if (!try self.visibleEdgeIdExists(edge_id)) continue;
             try appendUniqueEdgeId(allocator, &out, edge_id);
         }
         std.mem.sort(core.EdgeId, out.items, {}, edgeIdLessThan);
@@ -7265,7 +8500,7 @@ pub const Store = struct {
         };
         defer derived.deinit(allocator);
 
-        var payload_overlay = try self.readPropertyPayloadEntriesOrEmpty(allocator);
+        var payload_overlay = try self.readPropertyPayloadEntriesForKeyOrEmpty(allocator, key);
         defer {
             deinitPropertyPayloadIndexEntries(payload_overlay.items, allocator);
             payload_overlay.deinit(allocator);
@@ -7347,7 +8582,7 @@ pub const Store = struct {
         };
         defer derived.deinit(allocator);
 
-        var payload_overlay = try self.readPropertyPayloadEntriesOrEmpty(allocator);
+        var payload_overlay = try self.readPropertyPayloadEntriesForKeyOrEmpty(allocator, key);
         defer {
             deinitPropertyPayloadIndexEntries(payload_overlay.items, allocator);
             payload_overlay.deinit(allocator);
@@ -7510,6 +8745,44 @@ pub const Store = struct {
         return PropertyPayloadIndexRecord.decode(&bytes);
     }
 
+    fn propertyPayloadKeyHashLowerBound(self: Store, file: std.Io.File, record_count: u64, key_hash: u64) !u64 {
+        var lo: u64 = 0;
+        var hi = record_count;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const record = try self.readPropertyPayloadIndexRecordAt(file, mid);
+            if (record.key_hash < key_hash) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return lo;
+    }
+
+    fn validatePropertyPayloadIndexOrderIfStrict(self: Store, file: std.Io.File, header: PropertyPayloadIndexHeader) !void {
+        return self.validatePropertyPayloadIndexOrderIfStrictDeadline(file, header, .none);
+    }
+
+    fn validatePropertyPayloadIndexOrderIfStrictDeadline(
+        self: Store,
+        file: std.Io.File,
+        header: PropertyPayloadIndexHeader,
+        deadline: core.QueryDeadline,
+    ) !void {
+        if (!self.options.validate_indexes_on_read) return;
+        var previous: ?PropertyPayloadIndexRecord = null;
+        var index: u64 = 0;
+        while (index < header.record_count) : (index += 1) {
+            if (deadline.expired()) return core.Error.BudgetExceeded;
+            const record = try self.readPropertyPayloadIndexRecordAt(file, index);
+            if (previous) |prev| {
+                if (!propertyPayloadRecordLessThan({}, prev, record)) return error.InvalidRecord;
+            }
+            previous = record;
+        }
+    }
+
     fn readPropertyPayloadValuePayloadAt(self: Store, allocator: std.mem.Allocator, file: std.Io.File, header: NodePropertyValueBlockHeader, index: u64, record: PropertyPayloadIndexRecord) !?[]u8 {
         const value_record = try self.readNodePropertyValueRecordAt(file, index);
         if (record.value_type == PropertyPayloadIndexRecord.value_type_uint) {
@@ -7656,50 +8929,710 @@ pub const Store = struct {
         try self.renameReplace(tmp_path, values_path);
     }
 
-    fn writePropertyPayloadIndexFiles(self: Store, index_path: []const u8, values_path: []const u8, entries: []PropertyPayloadIndexEntry) !void {
-        std.mem.sort(PropertyPayloadIndexEntry, entries, {}, propertyPayloadEntryLessThan);
-        const tmp_path = try self.tmpPathFor(index_path);
+    fn encodePropertyPayloadDeltaFrame(self: Store, allocator: std.mem.Allocator, sequence: u64, writes: []const PropertyPayloadWrite) ![]u8 {
+        _ = self;
+        if (writes.len == 0) return error.InvalidRecord;
+        var payload = std.ArrayList(u8).empty;
+        defer payload.deinit(allocator);
+        var frame_keys = PropertyPayloadOwnerKeySet.init(allocator);
+        defer frame_keys.deinit();
+        try frame_keys.ensureTotalCapacity(std.math.cast(u32, writes.len) orelse return error.RecordTooLarge);
+        for (writes) |write| {
+            const key_len = std.math.cast(u16, write.key.len) orelse return error.RecordTooLarge;
+            if (!propertyKeyNameValid(write.key)) return error.InvalidRecord;
+            const frame_key = try frame_keys.getOrPut(propertyPayloadOwnerKey(write.owner, write.key));
+            if (frame_key.found_existing) return error.InvalidRecord;
+            const value_len: u32 = switch (write.value) {
+                .string => |value| std.math.cast(u32, value.len) orelse return error.RecordTooLarge,
+                .uint => 0,
+            };
+            const value_hash: u64 = switch (write.value) {
+                .string => |value| blk: {
+                    if (value.len == 0) return error.InvalidRecord;
+                    break :blk nodePropertyValueHash(value);
+                },
+                .uint => |value| value,
+            };
+            var entry_bytes: [property_payload_delta_entry_len]u8 = [_]u8{0} ** property_payload_delta_entry_len;
+            entry_bytes[0] = propertyPayloadOwnerKind(write.owner);
+            entry_bytes[1] = switch (write.value) {
+                .string => PropertyPayloadIndexRecord.value_type_string,
+                .uint => PropertyPayloadIndexRecord.value_type_uint,
+            };
+            writeU16(entry_bytes[2..4], key_len);
+            writeU32(entry_bytes[4..8], value_len);
+            writeU64(entry_bytes[8..16], propertyPayloadOwnerId(write.owner));
+            writeU64(entry_bytes[16..24], nodePropertyKeyHash(write.key));
+            writeU64(entry_bytes[24..32], value_hash);
+            try payload.appendSlice(allocator, &entry_bytes);
+            try payload.appendSlice(allocator, write.key);
+            switch (write.value) {
+                .string => |value| try payload.appendSlice(allocator, value),
+                .uint => {},
+            }
+        }
+        const payload_len = std.math.cast(u32, payload.items.len) orelse return error.RecordTooLarge;
+        if (payload_len > property_payload_delta_max_frame_bytes) return error.RecordTooLarge;
+        const frame_len = std.math.add(usize, property_payload_delta_header_len, payload.items.len) catch return error.RecordTooLarge;
+        const frame = try allocator.alloc(u8, frame_len);
+        errdefer allocator.free(frame);
+        const header = PropertyPayloadDeltaHeader{
+            .sequence = sequence,
+            .write_count = std.math.cast(u32, writes.len) orelse return error.RecordTooLarge,
+            .payload_len = payload_len,
+            .payload_digest = std.hash.Wyhash.hash(property_payload_delta_digest_seed, payload.items),
+        };
+        var header_bytes: [property_payload_delta_header_len]u8 = undefined;
+        try header.encode(&header_bytes);
+        @memcpy(frame[0..property_payload_delta_header_len], &header_bytes);
+        @memcpy(frame[property_payload_delta_header_len..], payload.items);
+        return frame;
+    }
+
+    fn applyPropertyPayloadDeltaEntryIndexed(
+        allocator: std.mem.Allocator,
+        target: PropertyPayloadIndexedTarget,
+        record: PropertyPayloadIndexRecord,
+        string_value: ?[]const u8,
+    ) !void {
+        const owner_key = PropertyPayloadOwnerKey{
+            .owner_kind = record.owner_kind,
+            .owner_id = record.owner_id,
+            .key_hash = record.key_hash,
+        };
+        const existing_index = target.positions.get(owner_key);
+        const old_len = if (existing_index) |index| blk: {
+            if (index >= target.entries.items.len) return error.InvalidRecord;
+            break :blk if (target.entries.items[index].value) |value| value.len else 0;
+        } else 0;
+        const next_budget_bytes = if (target.searchable_byte_budget) |budget|
+            try budget.afterReplace(old_len, if (string_value) |value| value.len else 0)
+        else
+            0;
+        const owned = if (string_value) |value| try allocator.dupe(u8, value) else null;
+        errdefer if (owned) |value| allocator.free(value);
+        if (existing_index) |index| {
+            target.entries.items[index].deinit(allocator);
+            target.entries.items[index] = .{ .record = record, .value = owned };
+            if (target.searchable_byte_budget) |budget| budget.used_bytes = next_budget_bytes;
+            return;
+        }
+
+        try target.entries.ensureUnusedCapacity(allocator, 1);
+        const position = try target.positions.getOrPut(owner_key);
+        if (position.found_existing) return error.InvalidRecord;
+        position.value_ptr.* = target.entries.items.len;
+        target.entries.appendAssumeCapacity(.{ .record = record, .value = owned });
+        if (target.searchable_byte_budget) |budget| budget.used_bytes = next_budget_bytes;
+    }
+
+    fn applyPropertyPayloadDeltaEntryToSnapshot(
+        allocator: std.mem.Allocator,
+        target: PropertyPayloadSnapshotTarget,
+        record: PropertyPayloadIndexRecord,
+        string_value: ?[]const u8,
+    ) !void {
+        if (!target.owner_filter.matches(record.owner_kind, record.owner_id)) return;
+        const value_kind: PropertySnapshotValueKind = switch (record.value_type) {
+            PropertyPayloadIndexRecord.value_type_string => .string,
+            PropertyPayloadIndexRecord.value_type_uint => .uint,
+            else => return error.InvalidRecord,
+        };
+        const owned = if (value_kind == .string)
+            try allocator.dupe(u8, string_value orelse return error.InvalidRecord)
+        else
+            &.{};
+        errdefer if (value_kind == .string) allocator.free(owned);
+        const replacement = PropertySnapshotEntry{
+            .owner = try propertyPayloadOwnerFromParts(record.owner_kind, record.owner_id),
+            .key_hash = record.key_hash,
+            .value_kind = value_kind,
+            .string_len = if (value_kind == .string) @intCast(owned.len) else 0,
+            .string_value = owned,
+            .uint_value = if (value_kind == .uint) record.value_hash else 0,
+        };
+        const owner_key = PropertyPayloadOwnerKey{
+            .owner_kind = record.owner_kind,
+            .owner_id = record.owner_id,
+            .key_hash = record.key_hash,
+        };
+        if (target.positions.get(owner_key)) |position| {
+            if (position >= target.entries.items.len) return error.InvalidRecord;
+            if (target.entries.items[position].value_kind == .string) allocator.free(target.entries.items[position].string_value);
+            target.entries.items[position] = replacement;
+            return;
+        }
+        try target.entries.ensureUnusedCapacity(allocator, 1);
+        const position = try target.positions.getOrPut(owner_key);
+        if (position.found_existing) return error.InvalidRecord;
+        position.value_ptr.* = target.entries.items.len;
+        target.entries.appendAssumeCapacity(replacement);
+    }
+
+    fn parsePropertyPayloadDeltaPayload(
+        allocator: std.mem.Allocator,
+        header: PropertyPayloadDeltaHeader,
+        payload: []const u8,
+        target: PropertyPayloadDeltaTarget,
+    ) !void {
+        if (payload.len != header.payload_len or std.hash.Wyhash.hash(property_payload_delta_digest_seed, payload) != header.payload_digest) return error.InvalidRecord;
+        const min_entry_bytes = property_payload_delta_entry_len + 1;
+        if (header.write_count > payload.len / min_entry_bytes) return error.InvalidRecord;
+        var frame_keys = PropertyPayloadOwnerKeySet.init(allocator);
+        defer frame_keys.deinit();
+        try frame_keys.ensureTotalCapacity(header.write_count);
+        var offset: usize = 0;
+        var write_index: u32 = 0;
+        while (write_index < header.write_count) : (write_index += 1) {
+            if (payload.len - offset < property_payload_delta_entry_len) return error.InvalidRecord;
+            const raw = payload[offset..][0..property_payload_delta_entry_len];
+            offset += property_payload_delta_entry_len;
+            if (!allZero(raw[32..40])) return error.InvalidRecord;
+            const owner_kind = raw[0];
+            const value_type = raw[1];
+            const key_len = readU16(raw[2..4]);
+            const value_len = readU32(raw[4..8]);
+            const owner_id = readU64(raw[8..16]);
+            const key_hash = readU64(raw[16..24]);
+            const value_hash = readU64(raw[24..32]);
+            if ((owner_kind != PropertyPayloadIndexRecord.owner_kind_node and owner_kind != PropertyPayloadIndexRecord.owner_kind_edge) or
+                (value_type != PropertyPayloadIndexRecord.value_type_string and value_type != PropertyPayloadIndexRecord.value_type_uint) or
+                owner_id == 0 or owner_id == std.math.maxInt(u64) or key_len == 0)
+            {
+                return error.InvalidRecord;
+            }
+            const body_len = std.math.add(usize, key_len, value_len) catch return error.InvalidRecord;
+            if (payload.len - offset < body_len) return error.InvalidRecord;
+            const key = payload[offset..][0..key_len];
+            const string_value = payload[offset + key_len .. offset + body_len];
+            offset += body_len;
+            if (!propertyKeyNameValid(key) or nodePropertyKeyHash(key) != key_hash) return error.InvalidRecord;
+            const owner: PropertyOwner = if (owner_kind == PropertyPayloadIndexRecord.owner_kind_node)
+                .{ .node = .fromInt(owner_id) }
+            else
+                .{ .edge = .fromInt(owner_id) };
+            const frame_key = try frame_keys.getOrPut(.{
+                .owner_kind = owner_kind,
+                .owner_id = owner_id,
+                .key_hash = key_hash,
+            });
+            if (frame_key.found_existing) return error.InvalidRecord;
+            if (value_type == PropertyPayloadIndexRecord.value_type_string) {
+                if (value_len == 0 or nodePropertyValueHash(string_value) != value_hash or !stringPropertyKeySupportedForOwner(owner, key)) return error.InvalidRecord;
+            } else if (value_len != 0 or !uintPropertyKeySupportedForOwner(owner, key)) {
+                return error.InvalidRecord;
+            }
+            const record = PropertyPayloadIndexRecord{
+                .key_hash = key_hash,
+                .value_hash = value_hash,
+                .owner_id = owner_id,
+                .owner_kind = owner_kind,
+                .value_type = value_type,
+            };
+            switch (target) {
+                .none => {},
+                .all => |out| try applyPropertyPayloadDeltaEntryIndexed(
+                    allocator,
+                    out,
+                    record,
+                    if (value_type == PropertyPayloadIndexRecord.value_type_string) string_value else null,
+                ),
+                .searchable => |out| {
+                    if (owner_kind == PropertyPayloadIndexRecord.owner_kind_node and
+                        value_type == PropertyPayloadIndexRecord.value_type_string and
+                        (std.mem.eql(u8, key, "name") or std.mem.eql(u8, key, "summary")))
+                    {
+                        try applyPropertyPayloadDeltaEntryIndexed(allocator, out, record, string_value);
+                    }
+                },
+                .key => |lookup| {
+                    if (lookup.key_hash == key_hash and std.mem.eql(u8, lookup.key_name, key)) {
+                        if (lookup.owner_filter) |filter| {
+                            if (!filter.matches(owner_kind, owner_id)) continue;
+                        }
+                        try applyPropertyPayloadDeltaEntryIndexed(
+                            allocator,
+                            .{ .entries = lookup.entries, .positions = lookup.positions },
+                            record,
+                            if (value_type == PropertyPayloadIndexRecord.value_type_string) string_value else null,
+                        );
+                    }
+                },
+                .snapshot => |lookup| {
+                    const expected_name = lookup.key_names.get(key_hash) orelse continue;
+                    if (!std.mem.eql(u8, expected_name, key)) continue;
+                    try applyPropertyPayloadDeltaEntryToSnapshot(allocator, lookup, record, if (value_type == PropertyPayloadIndexRecord.value_type_string) string_value else null);
+                },
+                .existing_keys => |lookup| {
+                    const owner_key = PropertyPayloadOwnerKey{
+                        .owner_kind = owner_kind,
+                        .owner_id = owner_id,
+                        .key_hash = key_hash,
+                    };
+                    if (lookup.wanted.contains(owner_key)) try lookup.found.put(owner_key, {});
+                },
+                .lookup => |lookup| {
+                    if (lookup.owner_key.owner_kind == owner_kind and
+                        lookup.owner_key.owner_id == owner_id and
+                        lookup.owner_key.key_hash == key_hash and
+                        std.mem.eql(u8, lookup.key_name, key))
+                    {
+                        if (lookup.value) |*previous| previous.deinit(allocator);
+                        const owned = if (value_type == PropertyPayloadIndexRecord.value_type_string)
+                            try allocator.dupe(u8, string_value)
+                        else
+                            null;
+                        lookup.value = .{ .record = record, .value = owned };
+                    }
+                },
+                .layer_scan => |scan| {
+                    if (scan.next_version.* == std.math.maxInt(u64)) return error.RecordTooLarge;
+                    const version = scan.next_version.*;
+                    scan.next_version.* += 1;
+                    try scan.visit(scan.context, .{
+                        .owner = owner,
+                        .key_hash = key_hash,
+                        .version = version,
+                        .value_kind = if (value_type == PropertyPayloadIndexRecord.value_type_string) .string else .uint,
+                        .string_value = if (value_type == PropertyPayloadIndexRecord.value_type_string) string_value else &.{},
+                        .uint_value = if (value_type == PropertyPayloadIndexRecord.value_type_uint) value_hash else 0,
+                    });
+                },
+            }
+        }
+        if (offset != payload.len) return error.InvalidRecord;
+    }
+
+    fn scanPropertyPayloadDelta(
+        self: Store,
+        allocator: std.mem.Allocator,
+        target: PropertyPayloadDeltaTarget,
+        allow_partial_tail: bool,
+    ) !PropertyPayloadDeltaScan {
+        return self.scanPropertyPayloadDeltaLimited(allocator, target, allow_partial_tail, null, .none);
+    }
+
+    fn scanPropertyPayloadDeltaLimited(
+        self: Store,
+        allocator: std.mem.Allocator,
+        target: PropertyPayloadDeltaTarget,
+        allow_partial_tail: bool,
+        max_scan_bytes: ?u64,
+        deadline: core.QueryDeadline,
+    ) !PropertyPayloadDeltaScan {
+        if (deadline.expired()) return core.Error.BudgetExceeded;
+        var file = std.Io.Dir.cwd().openFile(self.io, self.property_payload_delta_path, .{ .allow_directory = false }) catch |err| switch (err) {
+            error.FileNotFound => return .{},
+            else => |e| return e,
+        };
+        defer file.close(self.io);
+        const file_size = try self.regularFileSize(file);
+        // Capture and admit the complete scan range before reading the first
+        // frame. A caller that promises bounded fallback I/O must never walk
+        // a giant append-only delta and reject only after doing the work.
+        // Later concurrent appends are outside this fixed snapshot range.
+        if (max_scan_bytes) |limit| {
+            if (file_size > limit) return error.SearchableMetadataBudgetExceeded;
+        }
+        var scan = PropertyPayloadDeltaScan{};
+        while (scan.valid_bytes < file_size) {
+            if (deadline.expired()) return core.Error.BudgetExceeded;
+            const remaining = file_size - scan.valid_bytes;
+            if (remaining < property_payload_delta_header_len) {
+                if (!allow_partial_tail) return error.InvalidRecord;
+                scan.trailing_partial = true;
+                return scan;
+            }
+            var header_bytes: [property_payload_delta_header_len]u8 = undefined;
+            const header_n = try file.readPositionalAll(self.io, &header_bytes, scan.valid_bytes);
+            if (header_n != header_bytes.len) return error.InvalidRecord;
+            const header = PropertyPayloadDeltaHeader.decode(&header_bytes) catch |err| {
+                if (!allow_partial_tail) return err;
+                scan.trailing_partial = true;
+                return scan;
+            };
+            const frame_len = std.math.add(u64, property_payload_delta_header_len, header.payload_len) catch return error.InvalidRecord;
+            if (remaining < frame_len) {
+                if (!allow_partial_tail) return error.InvalidRecord;
+                scan.trailing_partial = true;
+                return scan;
+            }
+            if (header.sequence != std.math.add(u64, scan.last_sequence, 1) catch return error.InvalidRecord) {
+                if (!allow_partial_tail) return error.InvalidRecord;
+                scan.trailing_partial = true;
+                return scan;
+            }
+            const payload = try allocator.alloc(u8, header.payload_len);
+            defer allocator.free(payload);
+            const payload_offset = std.math.add(u64, scan.valid_bytes, property_payload_delta_header_len) catch return error.InvalidRecord;
+            const payload_n = try file.readPositionalAll(self.io, payload, payload_offset);
+            if (payload_n != payload.len) return error.InvalidRecord;
+            parsePropertyPayloadDeltaPayload(allocator, header, payload, target) catch |err| {
+                if (!allow_partial_tail) return err;
+                scan.trailing_partial = true;
+                return scan;
+            };
+            scan.valid_bytes = std.math.add(u64, scan.valid_bytes, frame_len) catch return error.InvalidRecord;
+            scan.last_sequence = header.sequence;
+            scan.last_digest = header.payload_digest;
+        }
+        return scan;
+    }
+
+    fn propertyPayloadDeltaJournalPath(self: Store) ![]u8 {
+        return try std.fmt.allocPrint(self.allocator, "{s}.redo", .{self.property_payload_delta_path});
+    }
+
+    fn writePropertyPayloadDeltaJournal(self: Store, frame: []const u8) !void {
+        const journal_path = try self.propertyPayloadDeltaJournalPath();
+        defer self.allocator.free(journal_path);
+        const tmp_path = try self.tmpPathFor(journal_path);
         defer self.allocator.free(tmp_path);
         errdefer std.Io.Dir.cwd().deleteFile(self.io, tmp_path) catch {};
         {
-            var file = try std.Io.Dir.cwd().createFile(self.io, tmp_path, .{
-                .read = true,
-                .truncate = true,
-            });
+            var file = try std.Io.Dir.cwd().createFile(self.io, tmp_path, .{ .read = true, .truncate = true });
             defer file.close(self.io);
-            var writer = try StorageBufferedWriter.init(self.allocator, self.io, file, try storageWriteBufferCapacity(try propertyPayloadIndexFileSize(@intCast(entries.len))));
-            defer writer.deinit();
-            const header = PropertyPayloadIndexHeader{
-                .record_count = @intCast(entries.len),
-                .owner_count = 0,
-                .owner_digest = 0,
-            };
-            var header_bytes: [PropertyPayloadIndexHeader.encoded_len]u8 = undefined;
-            header.encode(&header_bytes);
-            try writer.append(&header_bytes);
-            var previous: ?PropertyPayloadIndexRecord = null;
-            for (entries) |entry| {
-                const record = entry.record;
-                if (previous) |prev| {
-                    if (!propertyPayloadRecordLessThan({}, prev, record)) return error.InvalidRecord;
-                }
-                var record_bytes: [PropertyPayloadIndexRecord.encoded_len]u8 = undefined;
-                try record.encode(&record_bytes);
-                try writer.append(&record_bytes);
-                previous = record;
-            }
-            try writer.flush();
-            if (try self.regularFileSize(file) != try propertyPayloadIndexFileSize(@intCast(entries.len))) return error.InvalidRecord;
+            try file.writePositionalAll(self.io, frame, 0);
             if (selfOptionsNeedSync(self)) try file.sync(self.io);
         }
-        try self.writePropertyPayloadValueBlock(values_path, entries);
-        try self.renameReplace(tmp_path, index_path);
+        try self.renameReplace(tmp_path, journal_path);
     }
 
-    fn writePropertyPayloadValueBlock(self: Store, values_path: []const u8, entries: []const PropertyPayloadIndexEntry) !void {
-        const tmp_path = try self.tmpPathFor(values_path);
+    fn deletePropertyPayloadDeltaJournal(self: Store) !void {
+        const journal_path = try self.propertyPayloadDeltaJournalPath();
+        defer self.allocator.free(journal_path);
+        try std.Io.Dir.cwd().deleteFile(self.io, journal_path);
+        try self.syncParentDirForPath(journal_path);
+    }
+
+    fn appendPropertyPayloadDeltaFrame(self: Store, frame: []const u8, expected_offset: u64) !void {
+        const existed = try self.fileExists(self.property_payload_delta_path);
+        {
+            var file = try std.Io.Dir.cwd().createFile(self.io, self.property_payload_delta_path, .{ .read = true, .truncate = false });
+            defer file.close(self.io);
+            if (try self.regularFileSize(file) != expected_offset) return error.InvalidRecord;
+            try file.writePositionalAll(self.io, frame, expected_offset);
+            if (selfOptionsNeedSync(self)) try file.sync(self.io);
+        }
+        if (!existed) try self.syncParentDirForPath(self.property_payload_delta_path);
+    }
+
+    fn recoverPropertyPayloadDeltaJournal(self: Store) !PropertyPayloadDeltaRecovery {
+        const journal_path = try self.propertyPayloadDeltaJournalPath();
+        defer self.allocator.free(journal_path);
+        const frame = std.Io.Dir.cwd().readFileAlloc(self.io, journal_path, self.allocator, .limited(property_payload_delta_header_len + property_payload_delta_max_frame_bytes)) catch |err| switch (err) {
+            // With no redo there is no interrupted append to recover. Do not
+            // eagerly walk the complete append-only delta on every Store.open:
+            // every property read, write and compaction path validates the
+            // full frame sequence before returning data or mutating it. This
+            // keeps corruption fail-closed at first use without making an
+            // unrelated node/edge-only CLI command pay O(delta) startup I/O.
+            error.FileNotFound => return .no_journal,
+            else => |e| return e,
+        };
+        defer self.allocator.free(frame);
+        if (frame.len < property_payload_delta_header_len) return error.InvalidRecord;
+        var header_bytes: [property_payload_delta_header_len]u8 = undefined;
+        @memcpy(&header_bytes, frame[0..property_payload_delta_header_len]);
+        const header = try PropertyPayloadDeltaHeader.decode(&header_bytes);
+        if (frame.len != property_payload_delta_header_len + header.payload_len) return error.InvalidRecord;
+        try parsePropertyPayloadDeltaPayload(self.allocator, header, frame[property_payload_delta_header_len..], .none);
+
+        var scan = try self.scanPropertyPayloadDelta(self.allocator, .none, true);
+        if (scan.trailing_partial) {
+            if (header.sequence != std.math.add(u64, scan.last_sequence, 1) catch return error.InvalidRecord) return error.InvalidRecord;
+            {
+                var delta = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_delta_path, .{ .mode = .read_write, .allow_directory = false });
+                defer delta.close(self.io);
+                const delta_len = try self.regularFileSize(delta);
+                if (delta_len < scan.valid_bytes) return error.InvalidRecord;
+                const tail_len_u64 = delta_len - scan.valid_bytes;
+                if (tail_len_u64 > frame.len) return error.InvalidRecord;
+                const tail_len: usize = @intCast(tail_len_u64);
+                const tail = try self.allocator.alloc(u8, tail_len);
+                defer self.allocator.free(tail);
+                const tail_n = try delta.readPositionalAll(self.io, tail, scan.valid_bytes);
+                if (tail_n != tail.len or !std.mem.eql(u8, tail, frame[0..tail.len])) return error.InvalidRecord;
+                try delta.setLength(self.io, scan.valid_bytes);
+                if (selfOptionsNeedSync(self)) try delta.sync(self.io);
+            }
+            scan.trailing_partial = false;
+        }
+        if (scan.last_sequence == header.sequence) {
+            if (scan.last_digest != header.payload_digest or scan.valid_bytes < frame.len) return error.InvalidRecord;
+            var delta = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_delta_path, .{ .mode = .read_write, .allow_directory = false });
+            defer delta.close(self.io);
+            const frame_offset = scan.valid_bytes - frame.len;
+            const published = try self.allocator.alloc(u8, frame.len);
+            defer self.allocator.free(published);
+            const published_n = try delta.readPositionalAll(self.io, published, frame_offset);
+            if (published_n != published.len or !std.mem.eql(u8, published, frame)) return error.InvalidRecord;
+            // A prior append may have returned from fsync with an error after
+            // all bytes reached the page cache.  Exact byte equality proves
+            // identity, not durability: retry fsync before deleting the only
+            // durable redo copy.
+            if (selfOptionsNeedSync(self)) try delta.sync(self.io);
+        } else {
+            if (header.sequence != std.math.add(u64, scan.last_sequence, 1) catch return error.InvalidRecord) return error.InvalidRecord;
+            try self.appendPropertyPayloadDeltaFrame(frame, scan.valid_bytes);
+        }
+        // Recovery is not complete until the redo name is durably removed.
+        // Leaving it behind is normally harmless while the matching delta is
+        // still present, but compaction may subsequently publish the merged
+        // base and unlink that delta.  A stale redo would then be replayed
+        // against an empty delta (or reject the store when its sequence is
+        // greater than one).  Propagate cleanup failure so maintenance cannot
+        // cross that unsafe boundary.
+        try self.deletePropertyPayloadDeltaJournal();
+        return .committed;
+    }
+
+    fn publishPropertyPayloadDelta(
+        self: Store,
+        allocator: std.mem.Allocator,
+        writes: []const PropertyPayloadWrite,
+        scan: PropertyPayloadDeltaScan,
+    ) !void {
+        if (scan.trailing_partial) return error.InvalidRecord;
+        const sequence = std.math.add(u64, scan.last_sequence, 1) catch return error.RecordTooLarge;
+        const frame = try self.encodePropertyPayloadDeltaFrame(allocator, sequence, writes);
+        defer allocator.free(frame);
+        try self.writePropertyPayloadDeltaJournal(frame);
+        self.appendPropertyPayloadDeltaFrame(frame, scan.valid_bytes) catch |err| {
+            const recovery = self.recoverPropertyPayloadDeltaJournal() catch |recovery_err| return recovery_err;
+            if (recovery == .committed) return;
+            return err;
+        };
+        // A deletion whose parent-directory sync fails is not safely
+        // ignorable: the redo name can reappear after a crash.  If a caller
+        // then compacts and removes the matching delta, that resurrected redo
+        // is no longer idempotent against the empty sequence.  Surface the
+        // post-commit cleanup error so one-shot CLI writers stop before
+        // entering maintenance; Store.open recovery remains retryable.
+        try self.deletePropertyPayloadDeltaJournal();
+    }
+
+    fn propertyPayloadRedoJournalPath(self: Store) ![]u8 {
+        return try std.fmt.allocPrint(self.allocator, "{s}.redo", .{self.property_payload_index_path});
+    }
+
+    fn appendFileToJournal(
+        self: Store,
+        source: std.Io.File,
+        source_len: u64,
+        writer: *StorageBufferedWriter,
+        hasher: *std.hash.Wyhash,
+    ) !void {
+        var offset: u64 = 0;
+        var buffer: [storage_write_buffer_bytes]u8 = undefined;
+        while (offset < source_len) {
+            const remaining = source_len - offset;
+            const chunk_len: usize = @intCast(@min(remaining, buffer.len));
+            const chunk = buffer[0..chunk_len];
+            const n = try source.readPositionalAll(self.io, chunk, offset);
+            if (n != chunk.len) return error.InvalidRecord;
+            hasher.update(chunk);
+            try writer.append(chunk);
+            offset = std.math.add(u64, offset, chunk.len) catch return error.RecordTooLarge;
+        }
+    }
+
+    fn writePropertyPayloadRedoJournal(self: Store, index_stage_path: []const u8, values_stage_path: []const u8) !void {
+        var index_file = try std.Io.Dir.cwd().openFile(self.io, index_stage_path, .{ .allow_directory = false });
+        defer index_file.close(self.io);
+        const index_len = try self.regularFileSize(index_file);
+        var values_file = try std.Io.Dir.cwd().openFile(self.io, values_stage_path, .{ .allow_directory = false });
+        defer values_file.close(self.io);
+        const values_len = try self.regularFileSize(values_file);
+        const body_len = std.math.add(u64, index_len, values_len) catch return error.RecordTooLarge;
+        const journal_len = std.math.add(u64, PropertyPayloadRedoJournalHeader.encoded_len, body_len) catch return error.RecordTooLarge;
+
+        const journal_path = try self.propertyPayloadRedoJournalPath();
+        defer self.allocator.free(journal_path);
+        const tmp_path = try self.tmpPathFor(journal_path);
         defer self.allocator.free(tmp_path);
         errdefer std.Io.Dir.cwd().deleteFile(self.io, tmp_path) catch {};
+        {
+            var journal_file = try std.Io.Dir.cwd().createFile(self.io, tmp_path, .{ .read = true, .truncate = true });
+            defer journal_file.close(self.io);
+            var writer = try StorageBufferedWriter.init(self.allocator, self.io, journal_file, try storageWriteBufferCapacity(journal_len));
+            defer writer.deinit();
+            var placeholder: [PropertyPayloadRedoJournalHeader.encoded_len]u8 = [_]u8{0} ** PropertyPayloadRedoJournalHeader.encoded_len;
+            try writer.append(&placeholder);
+            var index_hasher = std.hash.Wyhash.init(0x544B_504A);
+            var values_hasher = std.hash.Wyhash.init(0x544B_504A);
+            try self.appendFileToJournal(index_file, index_len, &writer, &index_hasher);
+            try self.appendFileToJournal(values_file, values_len, &writer, &values_hasher);
+            try writer.flush();
+
+            const header = PropertyPayloadRedoJournalHeader{
+                .index_len = index_len,
+                .values_len = values_len,
+                .index_digest = index_hasher.final(),
+                .values_digest = values_hasher.final(),
+            };
+            var header_bytes: [PropertyPayloadRedoJournalHeader.encoded_len]u8 = undefined;
+            header.encode(&header_bytes);
+            try journal_file.writePositionalAll(self.io, &header_bytes, 0);
+            if (try self.regularFileSize(journal_file) != journal_len) return error.InvalidRecord;
+            if (selfOptionsNeedSync(self)) try journal_file.sync(self.io);
+        }
+        try self.renameReplace(tmp_path, journal_path);
+    }
+
+    fn restorePropertyPayloadJournalRange(
+        self: Store,
+        journal_file: std.Io.File,
+        journal_offset: u64,
+        byte_len: u64,
+        expected_digest: u64,
+        stage_path: []const u8,
+    ) !void {
+        var stage_file = try std.Io.Dir.cwd().createFile(self.io, stage_path, .{ .read = true, .truncate = true });
+        defer stage_file.close(self.io);
+        var writer = try StorageBufferedWriter.init(self.allocator, self.io, stage_file, try storageWriteBufferCapacity(byte_len));
+        defer writer.deinit();
+        var hasher = std.hash.Wyhash.init(0x544B_504A);
+        var copied: u64 = 0;
+        var buffer: [storage_write_buffer_bytes]u8 = undefined;
+        while (copied < byte_len) {
+            const remaining = byte_len - copied;
+            const chunk_len: usize = @intCast(@min(remaining, buffer.len));
+            const chunk = buffer[0..chunk_len];
+            const offset = std.math.add(u64, journal_offset, copied) catch return error.InvalidRecord;
+            const n = try journal_file.readPositionalAll(self.io, chunk, offset);
+            if (n != chunk.len) return error.InvalidRecord;
+            hasher.update(chunk);
+            try writer.append(chunk);
+            copied = std.math.add(u64, copied, chunk.len) catch return error.RecordTooLarge;
+        }
+        try writer.flush();
+        if (hasher.final() != expected_digest) return error.InvalidRecord;
+        if (try self.regularFileSize(stage_file) != byte_len) return error.InvalidRecord;
+        if (selfOptionsNeedSync(self)) try stage_file.sync(self.io);
+    }
+
+    fn recoverPropertyPayloadRedoJournal(self: Store) !void {
+        const journal_path = try self.propertyPayloadRedoJournalPath();
+        defer self.allocator.free(journal_path);
+        var journal_file = std.Io.Dir.cwd().openFile(self.io, journal_path, .{ .allow_directory = false }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => |e| return e,
+        };
+        var journal_file_open = true;
+        defer if (journal_file_open) journal_file.close(self.io);
+        const journal_size = try self.regularFileSize(journal_file);
+        var header_bytes: [PropertyPayloadRedoJournalHeader.encoded_len]u8 = undefined;
+        const header_n = try journal_file.readPositionalAll(self.io, &header_bytes, 0);
+        if (header_n != header_bytes.len) return error.InvalidRecord;
+        const header = try PropertyPayloadRedoJournalHeader.decode(&header_bytes);
+        const body_len = std.math.add(u64, header.index_len, header.values_len) catch return error.InvalidRecord;
+        const expected_size = std.math.add(u64, PropertyPayloadRedoJournalHeader.encoded_len, body_len) catch return error.InvalidRecord;
+        if (journal_size != expected_size) return error.InvalidRecord;
+
+        const index_tmp_path = try self.tmpPathFor(self.property_payload_index_path);
+        defer self.allocator.free(index_tmp_path);
+        errdefer std.Io.Dir.cwd().deleteFile(self.io, index_tmp_path) catch {};
+        const values_tmp_path = try self.tmpPathFor(self.property_payload_values_path);
+        defer self.allocator.free(values_tmp_path);
+        errdefer std.Io.Dir.cwd().deleteFile(self.io, values_tmp_path) catch {};
+        try self.restorePropertyPayloadJournalRange(
+            journal_file,
+            PropertyPayloadRedoJournalHeader.encoded_len,
+            header.index_len,
+            header.index_digest,
+            index_tmp_path,
+        );
+        const values_offset = std.math.add(u64, PropertyPayloadRedoJournalHeader.encoded_len, header.index_len) catch return error.InvalidRecord;
+        try self.restorePropertyPayloadJournalRange(
+            journal_file,
+            values_offset,
+            header.values_len,
+            header.values_digest,
+            values_tmp_path,
+        );
+        journal_file.close(self.io);
+        journal_file_open = false;
+        var validated = try self.readPropertyPayloadEntriesFromFiles(self.allocator, index_tmp_path, values_tmp_path);
+        defer {
+            deinitPropertyPayloadIndexEntries(validated.items, self.allocator);
+            validated.deinit(self.allocator);
+        }
+        try self.renameReplace(values_tmp_path, self.property_payload_values_path);
+        try self.renameReplace(index_tmp_path, self.property_payload_index_path);
+        try std.Io.Dir.cwd().deleteFile(self.io, journal_path);
+        try self.syncParentDirForPath(journal_path);
+    }
+
+    fn deletePropertyPayloadRedoJournal(self: Store) !void {
+        const journal_path = try self.propertyPayloadRedoJournalPath();
+        defer self.allocator.free(journal_path);
+        try std.Io.Dir.cwd().deleteFile(self.io, journal_path);
+        try self.syncParentDirForPath(journal_path);
+    }
+
+    fn writePropertyPayloadIndexFiles(self: Store, index_path: []const u8, values_path: []const u8, entries: []PropertyPayloadIndexEntry) !void {
+        std.mem.sort(PropertyPayloadIndexEntry, entries, {}, propertyPayloadEntryLessThan);
+        const index_tmp_path = try self.tmpPathFor(index_path);
+        defer self.allocator.free(index_tmp_path);
+        errdefer std.Io.Dir.cwd().deleteFile(self.io, index_tmp_path) catch {};
+        const values_tmp_path = try self.tmpPathFor(values_path);
+        defer self.allocator.free(values_tmp_path);
+        errdefer std.Io.Dir.cwd().deleteFile(self.io, values_tmp_path) catch {};
+
+        try self.writePropertyPayloadIndexStage(index_tmp_path, entries);
+        try self.writePropertyPayloadValueStage(values_tmp_path, entries);
+        try self.writePropertyPayloadRedoJournal(index_tmp_path, values_tmp_path);
+
+        // Once the redo journal is durable, either this writer or Store.open
+        // can finish the pair.  The journal is deleted only after both names
+        // refer to the same generation.
+        try self.renameReplace(values_tmp_path, values_path);
+        try self.renameReplace(index_tmp_path, index_path);
+        // Do not let this Store instance continue after a cleanup failure.
+        // Although replaying this redo is idempotent against the base that was
+        // just published, a later compaction or delta append in the same
+        // process could advance the store.  A resurrected stale redo would
+        // then roll that newer base back on the next open.  Propagating the
+        // post-commit error keeps the old delta intact and makes recovery
+        // retryable without acknowledged-data loss.
+        try self.deletePropertyPayloadRedoJournal();
+    }
+
+    fn writePropertyPayloadIndexStage(self: Store, path: []const u8, entries: []const PropertyPayloadIndexEntry) !void {
+        var file = try std.Io.Dir.cwd().createFile(self.io, path, .{
+            .read = true,
+            .truncate = true,
+        });
+        defer file.close(self.io);
+        const file_size = try propertyPayloadIndexFileSize(@intCast(entries.len));
+        var writer = try StorageBufferedWriter.init(self.allocator, self.io, file, try storageWriteBufferCapacity(file_size));
+        defer writer.deinit();
+        const header = PropertyPayloadIndexHeader{
+            .record_count = @intCast(entries.len),
+            .owner_count = 0,
+            .owner_digest = 0,
+        };
+        var header_bytes: [PropertyPayloadIndexHeader.encoded_len]u8 = undefined;
+        header.encode(&header_bytes);
+        try writer.append(&header_bytes);
+        var previous: ?PropertyPayloadIndexRecord = null;
+        for (entries) |entry| {
+            const record = entry.record;
+            if (previous) |prev| {
+                if (!propertyPayloadRecordLessThan({}, prev, record)) return error.InvalidRecord;
+            }
+            var record_bytes: [PropertyPayloadIndexRecord.encoded_len]u8 = undefined;
+            try record.encode(&record_bytes);
+            try writer.append(&record_bytes);
+            previous = record;
+        }
+        try writer.flush();
+        if (try self.regularFileSize(file) != file_size) return error.InvalidRecord;
+        if (selfOptionsNeedSync(self)) try file.sync(self.io);
+    }
+
+    fn writePropertyPayloadValueStage(self: Store, path: []const u8, entries: []const PropertyPayloadIndexEntry) !void {
         const value_records = try self.allocator.alloc(NodePropertyValueRecord, entries.len);
         defer self.allocator.free(value_records);
         var payload_bytes: u64 = 0;
@@ -7724,40 +9657,37 @@ pub const Store = struct {
                 return error.InvalidRecord;
             }
         }
-        {
-            var file = try std.Io.Dir.cwd().createFile(self.io, tmp_path, .{
-                .read = true,
-                .truncate = true,
-            });
-            defer file.close(self.io);
-            const file_size = try nodePropertyValueBlockFileSize(@intCast(entries.len), payload_bytes);
-            var writer = try StorageBufferedWriter.init(self.allocator, self.io, file, try storageWriteBufferCapacity(file_size));
-            defer writer.deinit();
-            const header = NodePropertyValueBlockHeader{
-                .record_count = @intCast(entries.len),
-                .node_count = 0,
-                .node_digest = 0,
-                .payload_bytes = payload_bytes,
-                .payload_digest = payload_digest,
-            };
-            var header_bytes: [NodePropertyValueBlockHeader.encoded_len]u8 = undefined;
-            header.encode(&header_bytes);
-            try writer.append(&header_bytes);
-            var value_record_bytes: [NodePropertyValueRecord.encoded_len]u8 = undefined;
-            for (value_records) |record| {
-                record.encode(&value_record_bytes);
-                try writer.append(&value_record_bytes);
-            }
-            for (entries) |entry| {
-                if (entry.record.value_type == PropertyPayloadIndexRecord.value_type_string) {
-                    try writer.append(entry.value.?);
-                }
-            }
-            try writer.flush();
-            if (try self.regularFileSize(file) != file_size) return error.InvalidRecord;
-            if (selfOptionsNeedSync(self)) try file.sync(self.io);
+        var file = try std.Io.Dir.cwd().createFile(self.io, path, .{
+            .read = true,
+            .truncate = true,
+        });
+        defer file.close(self.io);
+        const file_size = try nodePropertyValueBlockFileSize(@intCast(entries.len), payload_bytes);
+        var writer = try StorageBufferedWriter.init(self.allocator, self.io, file, try storageWriteBufferCapacity(file_size));
+        defer writer.deinit();
+        const header = NodePropertyValueBlockHeader{
+            .record_count = @intCast(entries.len),
+            .node_count = 0,
+            .node_digest = 0,
+            .payload_bytes = payload_bytes,
+            .payload_digest = payload_digest,
+        };
+        var header_bytes: [NodePropertyValueBlockHeader.encoded_len]u8 = undefined;
+        header.encode(&header_bytes);
+        try writer.append(&header_bytes);
+        var value_record_bytes: [NodePropertyValueRecord.encoded_len]u8 = undefined;
+        for (value_records) |record| {
+            record.encode(&value_record_bytes);
+            try writer.append(&value_record_bytes);
         }
-        try self.renameReplace(tmp_path, values_path);
+        for (entries) |entry| {
+            if (entry.record.value_type == PropertyPayloadIndexRecord.value_type_string) {
+                try writer.append(entry.value.?);
+            }
+        }
+        try writer.flush();
+        if (try self.regularFileSize(file) != file_size) return error.InvalidRecord;
+        if (selfOptionsNeedSync(self)) try file.sync(self.io);
     }
 
     fn readNodePropertyIndexEntriesForMeta(self: Store, allocator: std.mem.Allocator, meta: IndexMeta) !std.ArrayList(NodePropertyIndexEntry) {
@@ -7838,6 +9768,61 @@ pub const Store = struct {
         return try self.readNodePropertyIndexEntriesFromFiles(allocator, self.node_props_overlay_index_path, self.node_props_overlay_values_path, nodePropertyOverlayMeta());
     }
 
+    fn readNodePropertyOverlayEntriesForKeyOrEmpty(
+        self: Store,
+        allocator: std.mem.Allocator,
+        index_path: []const u8,
+        values_path: []const u8,
+        key: []const u8,
+    ) !std.ArrayList(NodePropertyIndexEntry) {
+        return try self.readNodePropertyOverlayEntriesForKeyOwnersOrEmpty(allocator, index_path, values_path, key, null);
+    }
+
+    fn readNodePropertyOverlayEntriesForKeyOwnersOrEmpty(
+        self: Store,
+        allocator: std.mem.Allocator,
+        index_path: []const u8,
+        values_path: []const u8,
+        key: []const u8,
+        wanted_node_ids: ?*const PropertyPayloadNodeIdSet,
+    ) !std.ArrayList(NodePropertyIndexEntry) {
+        const has_index = try self.fileExists(index_path);
+        const has_values = try self.fileExists(values_path);
+        if (!has_index and !has_values) return std.ArrayList(NodePropertyIndexEntry).empty;
+        if (has_index != has_values) return error.InvalidRecord;
+
+        var index_file = try std.Io.Dir.cwd().openFile(self.io, index_path, .{ .allow_directory = false });
+        defer index_file.close(self.io);
+        const header = try self.readNodePropertyIndexHeaderFromFile(index_file);
+        if (header.node_count != 0 or header.node_digest != 0) return error.InvalidRecord;
+        if (try self.regularFileSize(index_file) != try nodePropertyIndexFileSize(header.record_count)) return error.InvalidRecord;
+
+        var values_file = try std.Io.Dir.cwd().openFile(self.io, values_path, .{ .allow_directory = false });
+        defer values_file.close(self.io);
+        const values_header = try self.readNodePropertyValueBlockHeaderFromFile(values_file);
+        if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
+        if (try self.regularFileSize(values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
+
+        var entries = std.ArrayList(NodePropertyIndexEntry).empty;
+        errdefer {
+            deinitNodePropertyIndexEntries(entries.items, allocator);
+            entries.deinit(allocator);
+        }
+        const key_hash = nodePropertyKeyHash(key);
+        var index = try self.nodePropertyIndexLowerBound(index_file, header, key_hash, 0, 0);
+        while (index < header.record_count) : (index += 1) {
+            const record = try self.readNodePropertyIndexRecordAt(index_file, index);
+            if (record.key_hash != key_hash) break;
+            if (wanted_node_ids) |wanted| {
+                if (!wanted.contains(record.node_id)) continue;
+            }
+            const value = try self.readNodePropertyValuePayloadAt(allocator, values_file, values_header, index, record);
+            errdefer if (value) |owned| allocator.free(owned);
+            try entries.append(allocator, .{ .record = record, .value = value });
+        }
+        return entries;
+    }
+
     fn writeNodePropertyOverlay(self: Store, entries: []NodePropertyIndexEntry) !void {
         try self.writeNodePropertyIndexFiles(self.node_props_overlay_index_path, self.node_props_overlay_values_path, entries, nodePropertyOverlayMeta());
     }
@@ -7857,34 +9842,496 @@ pub const Store = struct {
     fn readPropertyPayloadEntriesOrEmpty(self: Store, allocator: std.mem.Allocator) !std.ArrayList(PropertyPayloadIndexEntry) {
         const has_index = try self.fileExists(self.property_payload_index_path);
         const has_values = try self.fileExists(self.property_payload_values_path);
-        if (!has_index and !has_values) return std.ArrayList(PropertyPayloadIndexEntry).empty;
+        var entries = if (!has_index and !has_values)
+            std.ArrayList(PropertyPayloadIndexEntry).empty
+        else blk: {
+            if (has_index != has_values) return error.InvalidRecord;
+            break :blk try self.readPropertyPayloadEntriesFromFiles(allocator, self.property_payload_index_path, self.property_payload_values_path);
+        };
+        errdefer {
+            deinitPropertyPayloadIndexEntries(entries.items, allocator);
+            entries.deinit(allocator);
+        }
+        var positions = std.AutoHashMap(PropertyPayloadOwnerKey, usize).init(allocator);
+        defer positions.deinit();
+        try positions.ensureTotalCapacity(std.math.cast(u32, entries.items.len) orelse return error.RecordTooLarge);
+        for (entries.items, 0..) |entry, index| {
+            const position = try positions.getOrPut(.{
+                .owner_kind = entry.record.owner_kind,
+                .owner_id = entry.record.owner_id,
+                .key_hash = entry.record.key_hash,
+            });
+            if (position.found_existing) return error.InvalidRecord;
+            position.value_ptr.* = index;
+        }
+        _ = try self.scanPropertyPayloadDelta(allocator, .{ .all = .{
+            .entries = &entries,
+            .positions = &positions,
+        } }, false);
+        std.mem.sort(PropertyPayloadIndexEntry, entries.items, {}, propertyPayloadEntryLessThan);
+        return entries;
+    }
+
+    /// Read only one persisted property key. The immutable base is ordered by
+    /// key hash, so unrelated values (which may be very large blobs) are never
+    /// materialized. Delta frames still have to be validated sequentially,
+    /// but only exact persisted key names are retained and latest-wins updates
+    /// are applied in O(1) per matching owner instead of rescanning the list.
+    fn readPropertyPayloadEntriesForKeyOrEmpty(self: Store, allocator: std.mem.Allocator, key: []const u8) !std.ArrayList(PropertyPayloadIndexEntry) {
+        return try self.readPropertyPayloadEntriesForKeyOwnersOrEmpty(allocator, key, null, true);
+    }
+
+    fn readPropertyPayloadEntriesForKeyOwnersOrEmpty(
+        self: Store,
+        allocator: std.mem.Allocator,
+        key: []const u8,
+        owner_filter: ?PropertyPayloadOwnerFilter,
+        include_delta: bool,
+    ) !std.ArrayList(PropertyPayloadIndexEntry) {
+        var entries = std.ArrayList(PropertyPayloadIndexEntry).empty;
+        errdefer {
+            deinitPropertyPayloadIndexEntries(entries.items, allocator);
+            entries.deinit(allocator);
+        }
+        var positions = std.AutoHashMap(PropertyPayloadOwnerKey, usize).init(allocator);
+        defer positions.deinit();
+
+        const key_hash = nodePropertyKeyHash(key);
+        const has_index = try self.fileExists(self.property_payload_index_path);
+        const has_values = try self.fileExists(self.property_payload_values_path);
         if (has_index != has_values) return error.InvalidRecord;
-        return try self.readPropertyPayloadEntriesFromFiles(allocator, self.property_payload_index_path, self.property_payload_values_path);
+        if (has_index) {
+            var index_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_index_path, .{ .allow_directory = false });
+            defer index_file.close(self.io);
+            const header = try self.readPropertyPayloadIndexHeaderFromFile(index_file);
+            if (header.owner_count != 0 or header.owner_digest != 0) return error.InvalidRecord;
+            if (try self.regularFileSize(index_file) != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
+            try self.validatePropertyPayloadIndexOrderIfStrict(index_file, header);
+
+            var values_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_values_path, .{ .allow_directory = false });
+            defer values_file.close(self.io);
+            const values_header = try self.readNodePropertyValueBlockHeaderFromFile(values_file);
+            if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
+            if (try self.regularFileSize(values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
+
+            var index = try self.propertyPayloadKeyHashLowerBound(index_file, header.record_count, key_hash);
+            while (index < header.record_count) : (index += 1) {
+                const record = try self.readPropertyPayloadIndexRecordAt(index_file, index);
+                if (record.key_hash != key_hash) break;
+                if (owner_filter) |filter| {
+                    if (!filter.matches(record.owner_kind, record.owner_id)) continue;
+                }
+                const owner_key = PropertyPayloadOwnerKey{
+                    .owner_kind = record.owner_kind,
+                    .owner_id = record.owner_id,
+                    .key_hash = record.key_hash,
+                };
+                const position = try positions.getOrPut(owner_key);
+                if (position.found_existing) return error.InvalidRecord;
+                const value = try self.readPropertyPayloadValuePayloadAt(allocator, values_file, values_header, index, record);
+                errdefer if (value) |owned| allocator.free(owned);
+                try entries.append(allocator, .{ .record = record, .value = value });
+                position.value_ptr.* = entries.items.len - 1;
+            }
+        }
+
+        if (include_delta) {
+            _ = try self.scanPropertyPayloadDelta(allocator, .{ .key = .{
+                .key_hash = key_hash,
+                .key_name = key,
+                .entries = &entries,
+                .positions = &positions,
+                .owner_filter = owner_filter,
+            } }, false);
+        }
+        std.mem.sort(PropertyPayloadIndexEntry, entries.items, {}, propertyPayloadEntryLessThan);
+        return entries;
+    }
+
+    /// Materialize only node `name`/`summary` values.  Full-text stale-index
+    /// fallback must not allocate unrelated property blobs merely to compute
+    /// its metadata digest or snapshot.
+    fn readSearchablePropertyPayloadEntriesOrEmpty(
+        self: Store,
+        allocator: std.mem.Allocator,
+        byte_budget: ?*SearchablePropertyByteBudget,
+        delta_scan_byte_budget: ?u64,
+        deadline: core.QueryDeadline,
+    ) !std.ArrayList(PropertyPayloadIndexEntry) {
+        if (deadline.expired()) return core.Error.BudgetExceeded;
+        var entries = std.ArrayList(PropertyPayloadIndexEntry).empty;
+        errdefer {
+            deinitPropertyPayloadIndexEntries(entries.items, allocator);
+            entries.deinit(allocator);
+        }
+        var positions = std.AutoHashMap(PropertyPayloadOwnerKey, usize).init(allocator);
+        defer positions.deinit();
+        // The common steady state has an immutable base and no delta. Keep
+        // metadata digest/snapshot reads within their tiny allocation budget;
+        // the owner-key map is needed only when latest-wins delta records can
+        // actually replace base entries. `pathExists` intentionally preserves
+        // directories/other invalid path kinds so the scan below still fails
+        // closed instead of treating corruption as an absent delta.
+        const has_delta = try self.pathExists(self.property_payload_delta_path);
+
+        const has_index = try self.fileExists(self.property_payload_index_path);
+        const has_values = try self.fileExists(self.property_payload_values_path);
+        if (has_index != has_values) return error.InvalidRecord;
+        if (has_index) {
+            var index_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_index_path, .{ .allow_directory = false });
+            defer index_file.close(self.io);
+            const header = try self.readPropertyPayloadIndexHeaderFromFile(index_file);
+            if (header.owner_count != 0 or header.owner_digest != 0) return error.InvalidRecord;
+            if (try self.regularFileSize(index_file) != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
+            try self.validatePropertyPayloadIndexOrderIfStrictDeadline(index_file, header, deadline);
+
+            var values_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_values_path, .{ .allow_directory = false });
+            defer values_file.close(self.io);
+            const values_header = try self.readNodePropertyValueBlockHeaderFromFile(values_file);
+            if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
+            if (try self.regularFileSize(values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
+
+            // The immutable index is ordered by key hash.  Stale-text checks
+            // need only `name` and `summary`; walking every unrelated
+            // lifecycle/blob property made a quick search-open O(all
+            // properties).  Probe the two contiguous ranges directly while
+            // retaining the same record/value validation for every selected
+            // entry.  Full-file validation remains the responsibility of
+            // maintenance and readers that actually consume the other keys.
+            const searchable_hashes = [_]u64{
+                nodePropertyKeyHash("name"),
+                nodePropertyKeyHash("summary"),
+            };
+            if (searchable_hashes[0] == searchable_hashes[1]) return error.InvalidRecord;
+            for (searchable_hashes) |key_hash| {
+                var previous: ?PropertyPayloadIndexRecord = null;
+                var index = try self.propertyPayloadKeyHashLowerBound(index_file, header.record_count, key_hash);
+                while (index < header.record_count) : (index += 1) {
+                    if (deadline.expired()) return core.Error.BudgetExceeded;
+                    const record = try self.readPropertyPayloadIndexRecordAt(index_file, index);
+                    if (record.key_hash != key_hash) break;
+                    if (previous) |prev| {
+                        if (!propertyPayloadRecordLessThan({}, prev, record)) return error.InvalidRecord;
+                    }
+                    const value_record = try self.readNodePropertyValueRecordAt(values_file, index);
+                    if (record.value_type == PropertyPayloadIndexRecord.value_type_uint) {
+                        if (value_record.offset != 0 or value_record.len != 0) return error.InvalidRecord;
+                    } else if (record.value_type == PropertyPayloadIndexRecord.value_type_string) {
+                        if (value_record.len == 0) return error.InvalidRecord;
+                        const payload_end = std.math.add(u64, value_record.offset, value_record.len) catch return error.InvalidRecord;
+                        if (payload_end > values_header.payload_bytes) return error.InvalidRecord;
+                        if (record.owner_kind == PropertyPayloadIndexRecord.owner_kind_node) {
+                            const next_budget_bytes = if (byte_budget) |budget|
+                                try budget.afterReplace(0, @intCast(value_record.len))
+                            else
+                                0;
+                            const value = (try self.readPropertyPayloadValuePayloadAt(allocator, values_file, values_header, index, record)) orelse return error.InvalidRecord;
+                            errdefer allocator.free(value);
+                            const position = if (has_delta) try positions.getOrPut(.{
+                                .owner_kind = record.owner_kind,
+                                .owner_id = record.owner_id,
+                                .key_hash = record.key_hash,
+                            }) else null;
+                            if (position) |entry| {
+                                if (entry.found_existing) return error.InvalidRecord;
+                            }
+                            try entries.append(allocator, .{ .record = record, .value = value });
+                            if (position) |entry| entry.value_ptr.* = entries.items.len - 1;
+                            if (byte_budget) |budget| budget.used_bytes = next_budget_bytes;
+                        }
+                    } else {
+                        return error.InvalidRecord;
+                    }
+                    previous = record;
+                }
+            }
+        }
+
+        if (has_delta) {
+            _ = try self.scanPropertyPayloadDeltaLimited(allocator, .{ .searchable = .{
+                .entries = &entries,
+                .positions = &positions,
+                .searchable_byte_budget = byte_budget,
+            } }, false, delta_scan_byte_budget, deadline);
+        }
+        std.mem.sort(PropertyPayloadIndexEntry, entries.items, {}, propertyPayloadEntryLessThan);
+        return entries;
+    }
+
+    fn addSearchableNodeMetadataDigest(
+        digest: *u64,
+        seed: u64,
+        owner_id: u64,
+        key_hash: u64,
+        value_hash: u64,
+        value: []const u8,
+    ) void {
+        var entry_hasher = std.hash.Wyhash.init(seed);
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, owner_id, .little);
+        entry_hasher.update(&bytes);
+        std.mem.writeInt(u64, &bytes, key_hash, .little);
+        entry_hasher.update(&bytes);
+        std.mem.writeInt(u64, &bytes, value_hash, .little);
+        entry_hasher.update(&bytes);
+        entry_hasher.update(value);
+        // Records are stored in multiple ordered physical layers, but the
+        // stale anchor should not depend on traversal order. Hash each full
+        // association first, then combine record digests commutatively.
+        // Hashing tuple fields independently would make swapping two values
+        // between owners invisible because every component still appears in
+        // the same XOR multiset.
+        digest.* ^= entry_hasher.final();
+    }
+
+    fn addSearchableNodeMetadataDigestFromValueFile(
+        self: Store,
+        digest: *u64,
+        seed: u64,
+        owner_id: u64,
+        key_hash: u64,
+        value_hash: u64,
+        file: std.Io.File,
+        file_offset: u64,
+        value_len: u32,
+        deadline: core.QueryDeadline,
+    ) !void {
+        var entry_hasher = std.hash.Wyhash.init(seed);
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, owner_id, .little);
+        entry_hasher.update(&bytes);
+        std.mem.writeInt(u64, &bytes, key_hash, .little);
+        entry_hasher.update(&bytes);
+        std.mem.writeInt(u64, &bytes, value_hash, .little);
+        entry_hasher.update(&bytes);
+
+        var value_hasher = std.hash.Wyhash.init(0x544B_5056);
+        var scratch: [16 * 1024]u8 = undefined;
+        var consumed: u64 = 0;
+        while (consumed < value_len) {
+            if (deadline.expired()) return core.Error.BudgetExceeded;
+            const remaining = @as(u64, value_len) - consumed;
+            const take: usize = @intCast(@min(remaining, scratch.len));
+            const offset = std.math.add(u64, file_offset, consumed) catch return error.InvalidRecord;
+            const n = try file.readPositionalAll(self.io, scratch[0..take], offset);
+            if (n != take) return error.InvalidRecord;
+            value_hasher.update(scratch[0..take]);
+            entry_hasher.update(scratch[0..take]);
+            consumed += take;
+        }
+        if (value_hasher.final() != value_hash) return error.InvalidRecord;
+        digest.* ^= entry_hasher.final();
+    }
+
+    fn searchableNodeCanonicalBaseMetadataDigest(
+        self: Store,
+        overridden: ?*const std.AutoHashMap(PropertyPayloadOwnerKey, usize),
+        deadline: core.QueryDeadline,
+    ) !u64 {
+        if (deadline.expired()) return core.Error.BudgetExceeded;
+        const has_index = try self.fileExists(self.property_payload_index_path);
+        const has_values = try self.fileExists(self.property_payload_values_path);
+        if (!has_index and !has_values) return 0;
+        if (has_index != has_values) return error.InvalidRecord;
+
+        var index_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_index_path, .{ .allow_directory = false });
+        defer index_file.close(self.io);
+        const header = try self.readPropertyPayloadIndexHeaderFromFile(index_file);
+        if (header.owner_count != 0 or header.owner_digest != 0) return error.InvalidRecord;
+        if (try self.regularFileSize(index_file) != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
+        try self.validatePropertyPayloadIndexOrderIfStrictDeadline(index_file, header, deadline);
+
+        var values_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_values_path, .{ .allow_directory = false });
+        defer values_file.close(self.io);
+        const values_header = try self.readNodePropertyValueBlockHeaderFromFile(values_file);
+        if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
+        if (try self.regularFileSize(values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
+        const payload_start = try nodePropertyValueBlockHeaderAndRecordBytes(values_header.record_count);
+
+        const searchable_hashes = [_]u64{
+            nodePropertyKeyHash("name"),
+            nodePropertyKeyHash("summary"),
+        };
+        if (searchable_hashes[0] == searchable_hashes[1]) return error.InvalidRecord;
+        var digest: u64 = 0;
+        for (searchable_hashes) |key_hash| {
+            var previous: ?PropertyPayloadIndexRecord = null;
+            var index = try self.propertyPayloadKeyHashLowerBound(index_file, header.record_count, key_hash);
+            while (index < header.record_count) : (index += 1) {
+                if (deadline.expired()) return core.Error.BudgetExceeded;
+                const record = try self.readPropertyPayloadIndexRecordAt(index_file, index);
+                if (record.key_hash != key_hash) break;
+                if (previous) |prev| {
+                    if (!propertyPayloadRecordLessThan({}, prev, record)) return error.InvalidRecord;
+                }
+                const value_record = try self.readNodePropertyValueRecordAt(values_file, index);
+                if (record.value_type == PropertyPayloadIndexRecord.value_type_uint) {
+                    if (value_record.offset != 0 or value_record.len != 0) return error.InvalidRecord;
+                } else if (record.value_type == PropertyPayloadIndexRecord.value_type_string) {
+                    if (value_record.len == 0) return error.InvalidRecord;
+                    const payload_end = std.math.add(u64, value_record.offset, value_record.len) catch return error.InvalidRecord;
+                    if (payload_end > values_header.payload_bytes) return error.InvalidRecord;
+                    if (record.owner_kind == PropertyPayloadIndexRecord.owner_kind_node) {
+                        const file_offset = std.math.add(u64, payload_start, value_record.offset) catch return error.InvalidRecord;
+                        var ignored_digest: u64 = 0;
+                        const digest_target = if (overridden) |positions|
+                            if (positions.contains(.{
+                                .owner_kind = record.owner_kind,
+                                .owner_id = record.owner_id,
+                                .key_hash = record.key_hash,
+                            })) &ignored_digest else &digest
+                        else
+                            &digest;
+                        try self.addSearchableNodeMetadataDigestFromValueFile(
+                            digest_target,
+                            0x544B_534D,
+                            record.owner_id,
+                            record.key_hash,
+                            record.value_hash,
+                            values_file,
+                            file_offset,
+                            value_record.len,
+                            deadline,
+                        );
+                    }
+                } else {
+                    return error.InvalidRecord;
+                }
+                previous = record;
+            }
+        }
+        return digest;
+    }
+
+    fn searchableNodeLegacyMetadataDigest(self: Store, deadline: core.QueryDeadline) !u64 {
+        if (deadline.expired()) return core.Error.BudgetExceeded;
+        const has_index = try self.fileExists(self.node_props_overlay_index_path);
+        const has_values = try self.fileExists(self.node_props_overlay_values_path);
+        if (!has_index and !has_values) return 0;
+        if (has_index != has_values) return error.InvalidRecord;
+
+        var index_file = try std.Io.Dir.cwd().openFile(self.io, self.node_props_overlay_index_path, .{ .allow_directory = false });
+        defer index_file.close(self.io);
+        const header = try self.readNodePropertyIndexHeaderFromFile(index_file);
+        if (header.node_count != 0 or header.node_digest != 0) return error.InvalidRecord;
+        if (try self.regularFileSize(index_file) != try nodePropertyIndexFileSize(header.record_count)) return error.InvalidRecord;
+
+        var values_file = try std.Io.Dir.cwd().openFile(self.io, self.node_props_overlay_values_path, .{ .allow_directory = false });
+        defer values_file.close(self.io);
+        const values_header = try self.readNodePropertyValueBlockHeaderFromFile(values_file);
+        if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
+        if (try self.regularFileSize(values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
+        const payload_start = try nodePropertyValueBlockHeaderAndRecordBytes(values_header.record_count);
+
+        const searchable_hashes = [_]u64{
+            nodePropertyKeyHash("name"),
+            nodePropertyKeyHash("summary"),
+        };
+        if (searchable_hashes[0] == searchable_hashes[1]) return error.InvalidRecord;
+        var digest: u64 = 0;
+        for (searchable_hashes) |key_hash| {
+            var previous: ?NodePropertyIndexRecord = null;
+            var index = try self.nodePropertyIndexLowerBound(index_file, header, key_hash, 0, 0);
+            while (index < header.record_count) : (index += 1) {
+                if (deadline.expired()) return core.Error.BudgetExceeded;
+                const record = try self.readNodePropertyIndexRecordAt(index_file, index);
+                if (record.key_hash != key_hash) break;
+                if (previous) |prev| {
+                    if (!nodePropertyIndexRecordLessThan({}, prev, record)) return error.InvalidRecord;
+                }
+                if (record.value_type == NodePropertyIndexRecord.value_type_uint) {
+                    const value_record = try self.readNodePropertyValueRecordAt(values_file, index);
+                    if (value_record.offset != 0 or value_record.len != 0) return error.InvalidRecord;
+                } else if (record.value_type == NodePropertyIndexRecord.value_type_string) {
+                    const value_record = try self.readNodePropertyValueRecordAt(values_file, index);
+                    if (value_record.len == 0) return error.InvalidRecord;
+                    const payload_end = std.math.add(u64, value_record.offset, value_record.len) catch return error.InvalidRecord;
+                    if (payload_end > values_header.payload_bytes) return error.InvalidRecord;
+                    const file_offset = std.math.add(u64, payload_start, value_record.offset) catch return error.InvalidRecord;
+                    // Domain-separate the legacy layer so an identical value
+                    // present in both physical layers cannot XOR-cancel the
+                    // whole metadata anchor to zero.
+                    try self.addSearchableNodeMetadataDigestFromValueFile(
+                        &digest,
+                        0x544B_534C,
+                        record.node_id,
+                        record.key_hash,
+                        record.value_hash,
+                        values_file,
+                        file_offset,
+                        value_record.len,
+                        deadline,
+                    );
+                } else {
+                    return error.InvalidRecord;
+                }
+                previous = record;
+            }
+        }
+        return digest;
     }
 
     pub fn searchableNodeMetadataDigest(self: Store, allocator: std.mem.Allocator) !u64 {
-        var entries = try self.readPropertyPayloadEntriesOrEmpty(allocator);
+        return self.searchableNodeMetadataDigestInternal(allocator, null, .none);
+    }
+
+    /// Digest the searchable property view while bounding the append-only
+    /// delta scan and honoring the caller's query deadline. Explicit
+    /// maintenance and validation continue to use the unbounded variant.
+    pub fn searchableNodeMetadataDigestLimitedDeadline(
+        self: Store,
+        allocator: std.mem.Allocator,
+        max_delta_scan_bytes: u64,
+        deadline: core.QueryDeadline,
+    ) !u64 {
+        return self.searchableNodeMetadataDigestInternal(allocator, max_delta_scan_bytes, deadline);
+    }
+
+    fn searchableNodeMetadataDigestInternal(
+        self: Store,
+        allocator: std.mem.Allocator,
+        max_delta_scan_bytes: ?u64,
+        deadline: core.QueryDeadline,
+    ) !u64 {
+        // Hash immutable value ranges directly from disk instead of owning
+        // every base name/summary merely to prove that a large text index is
+        // current. An append-only delta still needs a latest-wins owner map,
+        // but its working set is proportional only to the bounded delta, not
+        // to the complete immutable base.
+        if (!try self.pathExists(self.property_payload_delta_path)) {
+            return (try self.searchableNodeCanonicalBaseMetadataDigest(null, deadline)) ^
+                (try self.searchableNodeLegacyMetadataDigest(deadline));
+        }
+
+        var entries = std.ArrayList(PropertyPayloadIndexEntry).empty;
         defer {
             deinitPropertyPayloadIndexEntries(entries.items, allocator);
             entries.deinit(allocator);
         }
-        const name_key_hash = nodePropertyKeyHash("name");
-        const summary_key_hash = nodePropertyKeyHash("summary");
-        var digest: u64 = 0;
-        var bytes: [8]u8 = undefined;
+        var positions = std.AutoHashMap(PropertyPayloadOwnerKey, usize).init(allocator);
+        defer positions.deinit();
+        _ = try self.scanPropertyPayloadDeltaLimited(
+            allocator,
+            .{ .searchable = .{
+                .entries = &entries,
+                .positions = &positions,
+            } },
+            false,
+            max_delta_scan_bytes,
+            deadline,
+        );
+
+        var digest = try self.searchableNodeCanonicalBaseMetadataDigest(&positions, deadline);
         for (entries.items) |entry| {
-            if (entry.record.owner_kind != PropertyPayloadIndexRecord.owner_kind_node) continue;
-            if (entry.record.value_type != PropertyPayloadIndexRecord.value_type_string) continue;
-            if (entry.record.key_hash != name_key_hash and entry.record.key_hash != summary_key_hash) continue;
+            if (deadline.expired()) return core.Error.BudgetExceeded;
+            const record = entry.record;
+            if (record.owner_kind != PropertyPayloadIndexRecord.owner_kind_node or
+                record.value_type != PropertyPayloadIndexRecord.value_type_string) return error.InvalidRecord;
             const value = entry.value orelse return error.InvalidRecord;
-            std.mem.writeInt(u64, &bytes, entry.record.owner_id, .little);
-            digest ^= std.hash.Wyhash.hash(0x544B_534D, &bytes);
-            std.mem.writeInt(u64, &bytes, entry.record.key_hash, .little);
-            digest ^= std.hash.Wyhash.hash(0x544B_534D, &bytes);
-            std.mem.writeInt(u64, &bytes, entry.record.value_hash, .little);
-            digest ^= std.hash.Wyhash.hash(0x544B_534D, &bytes);
-            digest ^= std.hash.Wyhash.hash(0x544B_534D, value);
+            addSearchableNodeMetadataDigest(&digest, 0x544B_534D, record.owner_id, record.key_hash, record.value_hash, value);
         }
+        // Layer-domain separation avoids duplicate-value XOR cancellation.
+        digest ^= try self.searchableNodeLegacyMetadataDigest(deadline);
         return digest;
     }
 
@@ -7892,9 +10339,521 @@ pub const Store = struct {
         try self.writePropertyPayloadIndexFiles(self.property_payload_index_path, self.property_payload_values_path, entries);
     }
 
+    fn deinitPropertySnapshotList(entries: *std.ArrayList(PropertySnapshotEntry), allocator: std.mem.Allocator) void {
+        for (entries.items) |entry| {
+            if (entry.value_kind == .string) allocator.free(entry.string_value);
+        }
+        entries.deinit(allocator);
+    }
+
+    fn appendSearchableNodeOverlaySnapshot(
+        self: Store,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayList(PropertySnapshotEntry),
+        effective_positions: *std.AutoHashMap(PropertyPayloadOwnerKey, usize),
+        byte_budget: ?*SearchablePropertyByteBudget,
+        deadline: core.QueryDeadline,
+    ) !void {
+        if (deadline.expired()) return core.Error.BudgetExceeded;
+        const has_index = try self.fileExists(self.node_props_overlay_index_path);
+        const has_values = try self.fileExists(self.node_props_overlay_values_path);
+        if (!has_index and !has_values) return;
+        if (has_index != has_values) return error.InvalidRecord;
+
+        var index_file = try std.Io.Dir.cwd().openFile(self.io, self.node_props_overlay_index_path, .{ .allow_directory = false });
+        defer index_file.close(self.io);
+        const header = try self.readNodePropertyIndexHeaderFromFile(index_file);
+        if (header.node_count != 0 or header.node_digest != 0) return error.InvalidRecord;
+        if (try self.regularFileSize(index_file) != try nodePropertyIndexFileSize(header.record_count)) return error.InvalidRecord;
+
+        var values_file = try std.Io.Dir.cwd().openFile(self.io, self.node_props_overlay_values_path, .{ .allow_directory = false });
+        defer values_file.close(self.io);
+        const values_header = try self.readNodePropertyValueBlockHeaderFromFile(values_file);
+        if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
+        if (try self.regularFileSize(values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
+
+        const searchable_hashes = [_]u64{
+            nodePropertyKeyHash("name"),
+            nodePropertyKeyHash("summary"),
+        };
+        if (searchable_hashes[0] == searchable_hashes[1]) return error.InvalidRecord;
+        for (searchable_hashes) |key_hash| {
+            var previous: ?NodePropertyIndexRecord = null;
+            var index = try self.nodePropertyIndexLowerBound(index_file, header, key_hash, 0, 0);
+            while (index < header.record_count) : (index += 1) {
+                if (deadline.expired()) return core.Error.BudgetExceeded;
+                const record = try self.readNodePropertyIndexRecordAt(index_file, index);
+                if (record.key_hash != key_hash) break;
+                if (previous) |prev| {
+                    if (!nodePropertyIndexRecordLessThan({}, prev, record)) return error.InvalidRecord;
+                }
+                const value_record = try self.readNodePropertyValueRecordAt(values_file, index);
+                if (record.value_type == NodePropertyIndexRecord.value_type_uint) {
+                    if (value_record.offset != 0 or value_record.len != 0) return error.InvalidRecord;
+                } else if (record.value_type == NodePropertyIndexRecord.value_type_string) {
+                    if (value_record.len == 0) return error.InvalidRecord;
+                    const payload_end = std.math.add(u64, value_record.offset, value_record.len) catch return error.InvalidRecord;
+                    if (payload_end > values_header.payload_bytes) return error.InvalidRecord;
+                    // The append-friendly property payload is the canonical
+                    // overlay.  Historical stores may still carry the same
+                    // owner/key in node_props_overlay; point reads prefer the
+                    // canonical value, so the full-text snapshot and its byte
+                    // budget must do the same instead of materializing both.
+                    const owner_key = PropertyPayloadOwnerKey{
+                        .owner_kind = PropertyPayloadIndexRecord.owner_kind_node,
+                        .owner_id = record.node_id,
+                        .key_hash = record.key_hash,
+                    };
+                    if (effective_positions.contains(owner_key)) {
+                        previous = record;
+                        continue;
+                    }
+                    const next_budget_bytes = if (byte_budget) |budget|
+                        try budget.afterReplace(0, @intCast(value_record.len))
+                    else
+                        0;
+                    const value = (try self.readNodePropertyValuePayloadAt(allocator, values_file, values_header, index, record)) orelse return error.InvalidRecord;
+                    errdefer allocator.free(value);
+                    try out.append(allocator, .{
+                        .owner = .{ .node = core.NodeId.fromInt(record.node_id) },
+                        .key_hash = record.key_hash,
+                        .value_kind = .string,
+                        .string_len = @intCast(value.len),
+                        .string_value = value,
+                    });
+                    try effective_positions.putNoClobber(owner_key, out.items.len - 1);
+                    if (byte_budget) |budget| budget.used_bytes = next_budget_bytes;
+                } else {
+                    return error.InvalidRecord;
+                }
+                previous = record;
+            }
+        }
+    }
+
+    fn appendSearchablePropertyPayloadSnapshot(
+        self: Store,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayList(PropertySnapshotEntry),
+        byte_budget: ?*SearchablePropertyByteBudget,
+        delta_scan_byte_budget: ?u64,
+        deadline: core.QueryDeadline,
+    ) !void {
+        var entries = try self.readSearchablePropertyPayloadEntriesOrEmpty(allocator, byte_budget, delta_scan_byte_budget, deadline);
+        defer {
+            deinitPropertyPayloadIndexEntries(entries.items, allocator);
+            entries.deinit(allocator);
+        }
+        try out.ensureUnusedCapacity(allocator, entries.items.len);
+        for (entries.items) |*entry| {
+            if (deadline.expired()) return core.Error.BudgetExceeded;
+            const value = entry.value orelse return error.InvalidRecord;
+            out.appendAssumeCapacity(.{
+                .owner = .{ .node = core.NodeId.fromInt(entry.record.owner_id) },
+                .key_hash = entry.record.key_hash,
+                .value_kind = .string,
+                .string_len = @intCast(value.len),
+                .string_value = value,
+            });
+            entry.value = null;
+        }
+    }
+
+    /// Snapshot only the node metadata consumed by full-text indexing.  The
+    /// general property snapshot includes edge fields and arbitrary payloads;
+    /// materializing those on a stale-search fallback can turn a bounded node
+    /// scan into an unrelated O(all property bytes) allocation.
+    pub fn loadSearchableNodeMetadataSnapshot(self: Store, allocator: std.mem.Allocator) !PropertySnapshot {
+        return try self.loadSearchableNodeMetadataSnapshotInternal(allocator, null, null, .none);
+    }
+
+    /// Same snapshot with a hard cap on owned string bytes.  Stale full-text
+    /// fallback uses this before building an ephemeral BM25 index so bounded
+    /// node text cannot be paired with unbounded `name`/`summary` allocation.
+    pub fn loadSearchableNodeMetadataSnapshotLimited(
+        self: Store,
+        allocator: std.mem.Allocator,
+        max_string_bytes: u64,
+    ) !PropertySnapshot {
+        var budget = SearchablePropertyByteBudget{ .max_bytes = max_string_bytes };
+        return try self.loadSearchableNodeMetadataSnapshotInternal(allocator, &budget, null, .none);
+    }
+
+    /// Bound both owned searchable strings and canonical property-delta scan
+    /// bytes while honoring the caller's query deadline.
+    pub fn loadSearchableNodeMetadataSnapshotWithLimitsDeadline(
+        self: Store,
+        allocator: std.mem.Allocator,
+        max_string_bytes: u64,
+        max_delta_scan_bytes: u64,
+        deadline: core.QueryDeadline,
+    ) !PropertySnapshot {
+        var budget = SearchablePropertyByteBudget{ .max_bytes = max_string_bytes };
+        return try self.loadSearchableNodeMetadataSnapshotInternal(allocator, &budget, max_delta_scan_bytes, deadline);
+    }
+
+    fn loadSearchableNodeMetadataSnapshotInternal(
+        self: Store,
+        allocator: std.mem.Allocator,
+        byte_budget: ?*SearchablePropertyByteBudget,
+        delta_scan_byte_budget: ?u64,
+        deadline: core.QueryDeadline,
+    ) !PropertySnapshot {
+        if (deadline.expired()) return core.Error.BudgetExceeded;
+        var out = std.ArrayList(PropertySnapshotEntry).empty;
+        errdefer deinitPropertySnapshotList(&out, allocator);
+        // Load the canonical payload first.  Legacy node_props_overlay is a
+        // fallback only; this ordering makes precedence explicit, avoids
+        // duplicate live values, and keeps the hard byte budget aligned with
+        // the effective metadata consumed by point reads and text indexing.
+        try self.appendSearchablePropertyPayloadSnapshot(allocator, &out, byte_budget, delta_scan_byte_budget, deadline);
+        const has_legacy_index = try self.fileExists(self.node_props_overlay_index_path);
+        const has_legacy_values = try self.fileExists(self.node_props_overlay_values_path);
+        if (has_legacy_index != has_legacy_values) return error.InvalidRecord;
+        if (!has_legacy_index) return .{ .entries = try out.toOwnedSlice(allocator) };
+        var canonical_positions = std.AutoHashMap(PropertyPayloadOwnerKey, usize).init(allocator);
+        defer canonical_positions.deinit();
+        try canonical_positions.ensureTotalCapacity(std.math.cast(u32, out.items.len) orelse return error.RecordTooLarge);
+        for (out.items, 0..) |entry, index| {
+            if (deadline.expired()) return core.Error.BudgetExceeded;
+            const node_id = switch (entry.owner) {
+                .node => |id| id,
+                .edge => return error.InvalidRecord,
+            };
+            const position = try canonical_positions.getOrPut(.{
+                .owner_kind = PropertyPayloadIndexRecord.owner_kind_node,
+                .owner_id = node_id.toInt(),
+                .key_hash = entry.key_hash,
+            });
+            if (position.found_existing) return error.InvalidRecord;
+            position.value_ptr.* = index;
+        }
+        try self.appendSearchableNodeOverlaySnapshot(allocator, &out, &canonical_positions, byte_budget, deadline);
+        return .{ .entries = try out.toOwnedSlice(allocator) };
+    }
+
+    /// Materialize only the requested node-sidecar keys. This is the bounded
+    /// read primitive for callers (notably task DAG walks) that need the same
+    /// small property family for many nodes: each key probes the immutable
+    /// base and validates the append-only delta once, rather than every node
+    /// independently rescanning all property history.
+    pub fn loadNodePropertySnapshotForKeys(self: Store, allocator: std.mem.Allocator, keys: []const []const u8) !PropertySnapshot {
+        return try self.loadPropertySnapshotForKeysFiltered(
+            allocator,
+            keys,
+            PropertyPayloadIndexRecord.owner_kind_node,
+            self.node_props_overlay_index_path,
+            self.node_props_overlay_values_path,
+            null,
+        );
+    }
+
+    pub fn loadNodePropertySnapshotForNodeIds(
+        self: Store,
+        allocator: std.mem.Allocator,
+        node_ids: []const core.NodeId,
+        keys: []const []const u8,
+    ) !PropertySnapshot {
+        var wanted_node_ids = PropertyPayloadNodeIdSet.init(allocator);
+        defer wanted_node_ids.deinit();
+        try wanted_node_ids.ensureTotalCapacity(std.math.cast(u32, node_ids.len) orelse return error.RecordTooLarge);
+        for (node_ids) |node_id| {
+            if (node_id == .none or node_id.toInt() == std.math.maxInt(u64)) return core.Error.InvalidId;
+            try wanted_node_ids.put(node_id.toInt(), {});
+        }
+        return try self.loadPropertySnapshotForKeysFiltered(
+            allocator,
+            keys,
+            PropertyPayloadIndexRecord.owner_kind_node,
+            self.node_props_overlay_index_path,
+            self.node_props_overlay_values_path,
+            &wanted_node_ids,
+        );
+    }
+
+    /// Bounded edge-property snapshot for migration and batch validation.  It
+    /// probes only requested key ranges and retains only requested owners while
+    /// still validating every append-only delta frame once.
+    pub fn loadEdgePropertySnapshotForEdgeIds(
+        self: Store,
+        allocator: std.mem.Allocator,
+        edge_ids: []const core.EdgeId,
+        keys: []const []const u8,
+    ) !PropertySnapshot {
+        var wanted_edge_ids = PropertyPayloadNodeIdSet.init(allocator);
+        defer wanted_edge_ids.deinit();
+        try wanted_edge_ids.ensureTotalCapacity(std.math.cast(u32, edge_ids.len) orelse return error.RecordTooLarge);
+        for (edge_ids) |edge_id| {
+            if (edge_id == .none or edge_id.toInt() == std.math.maxInt(u64)) return core.Error.InvalidId;
+            try wanted_edge_ids.put(edge_id.toInt(), {});
+        }
+        return try self.loadPropertySnapshotForKeysFiltered(
+            allocator,
+            keys,
+            PropertyPayloadIndexRecord.owner_kind_edge,
+            self.edge_props_overlay_index_path,
+            self.edge_props_overlay_values_path,
+            &wanted_edge_ids,
+        );
+    }
+
+    fn loadPropertySnapshotForKeysFiltered(
+        self: Store,
+        allocator: std.mem.Allocator,
+        keys: []const []const u8,
+        owner_kind: u8,
+        legacy_index_path: []const u8,
+        legacy_values_path: []const u8,
+        wanted_owner_ids: ?*const PropertyPayloadNodeIdSet,
+    ) !PropertySnapshot {
+        if (owner_kind != PropertyPayloadIndexRecord.owner_kind_node and
+            owner_kind != PropertyPayloadIndexRecord.owner_kind_edge) return error.InvalidRecord;
+        const owner_filter = PropertyPayloadOwnerFilter{
+            .owner_kind = owner_kind,
+            .owner_ids = wanted_owner_ids,
+        };
+        var out = std.ArrayList(PropertySnapshotEntry).empty;
+        errdefer deinitPropertySnapshotList(&out, allocator);
+        var positions = std.AutoHashMap(PropertyPayloadOwnerKey, usize).init(allocator);
+        defer positions.deinit();
+        var key_hashes = PropertyPayloadKeyNameMap.init(allocator);
+        defer key_hashes.deinit();
+
+        for (keys) |key| {
+            if (!propertyKeyNameValid(key) or
+                (owner_kind == PropertyPayloadIndexRecord.owner_kind_node and std.mem.eql(u8, key, "text"))) return error.InvalidRecord;
+            const key_hash = nodePropertyKeyHash(key);
+            const key_entry = try key_hashes.getOrPut(key_hash);
+            if (key_entry.found_existing) return error.InvalidRecord;
+            key_entry.value_ptr.* = key;
+
+            var legacy = try self.readNodePropertyOverlayEntriesForKeyOwnersOrEmpty(
+                allocator,
+                legacy_index_path,
+                legacy_values_path,
+                key,
+                wanted_owner_ids,
+            );
+            defer {
+                deinitNodePropertyIndexEntries(legacy.items, allocator);
+                legacy.deinit(allocator);
+            }
+            for (legacy.items) |*entry| {
+                const owner_key = PropertyPayloadOwnerKey{
+                    .owner_kind = owner_kind,
+                    .owner_id = entry.record.node_id,
+                    .key_hash = entry.record.key_hash,
+                };
+                const position = try positions.getOrPut(owner_key);
+                if (position.found_existing) return error.InvalidRecord;
+                const value_kind: PropertySnapshotValueKind = switch (entry.record.value_type) {
+                    NodePropertyIndexRecord.value_type_string => .string,
+                    NodePropertyIndexRecord.value_type_uint => .uint,
+                    else => return error.InvalidRecord,
+                };
+                try out.append(allocator, .{
+                    .owner = try propertyPayloadOwnerFromParts(owner_kind, entry.record.node_id),
+                    .key_hash = entry.record.key_hash,
+                    .value_kind = value_kind,
+                    .string_len = if (value_kind == .string) @intCast((entry.value orelse return error.InvalidRecord).len) else 0,
+                    .string_value = if (value_kind == .string) entry.value.? else &.{},
+                    .uint_value = if (value_kind == .uint) entry.record.value_hash else 0,
+                });
+                if (value_kind == .string) entry.value = null;
+                position.value_ptr.* = out.items.len - 1;
+            }
+
+            var payload = try self.readPropertyPayloadEntriesForKeyOwnersOrEmpty(allocator, key, owner_filter, false);
+            defer {
+                deinitPropertyPayloadIndexEntries(payload.items, allocator);
+                payload.deinit(allocator);
+            }
+            for (payload.items) |*entry| {
+                if (entry.record.owner_kind != owner_kind) return error.InvalidRecord;
+                const owner_key = PropertyPayloadOwnerKey{
+                    .owner_kind = entry.record.owner_kind,
+                    .owner_id = entry.record.owner_id,
+                    .key_hash = entry.record.key_hash,
+                };
+                const value_kind: PropertySnapshotValueKind = switch (entry.record.value_type) {
+                    PropertyPayloadIndexRecord.value_type_string => .string,
+                    PropertyPayloadIndexRecord.value_type_uint => .uint,
+                    else => return error.InvalidRecord,
+                };
+                const replacement = PropertySnapshotEntry{
+                    .owner = try propertyPayloadOwnerFromParts(owner_kind, entry.record.owner_id),
+                    .key_hash = entry.record.key_hash,
+                    .value_kind = value_kind,
+                    .string_len = if (value_kind == .string) @intCast((entry.value orelse return error.InvalidRecord).len) else 0,
+                    .string_value = if (value_kind == .string) entry.value.? else &.{},
+                    .uint_value = if (value_kind == .uint) entry.record.value_hash else 0,
+                };
+                if (positions.get(owner_key)) |position| {
+                    if (position >= out.items.len) return error.InvalidRecord;
+                    if (out.items[position].value_kind == .string) allocator.free(out.items[position].string_value);
+                    out.items[position] = replacement;
+                } else {
+                    try out.ensureUnusedCapacity(allocator, 1);
+                    const position = try positions.getOrPut(owner_key);
+                    if (position.found_existing) return error.InvalidRecord;
+                    position.value_ptr.* = out.items.len;
+                    out.appendAssumeCapacity(replacement);
+                }
+                if (value_kind == .string) entry.value = null;
+            }
+        }
+        // All requested lifecycle/metadata keys share one validated delta
+        // pass.  This is the hot path for task-frontier and effective-status
+        // queries; scanning once per key made latency grow as keys*history.
+        _ = try self.scanPropertyPayloadDelta(allocator, .{ .snapshot = .{
+            .key_names = &key_hashes,
+            .entries = &out,
+            .positions = &positions,
+            .owner_filter = owner_filter,
+        } }, false);
+        return .{ .entries = try out.toOwnedSlice(allocator) };
+    }
+
+    fn scanLegacyPropertySnapshotLayer(
+        self: Store,
+        allocator: std.mem.Allocator,
+        index_path: []const u8,
+        values_path: []const u8,
+        owner_kind: u8,
+        context: *anyopaque,
+        visit: PropertySnapshotLayerVisitor,
+    ) !void {
+        const has_index = try self.fileExists(index_path);
+        const has_values = try self.fileExists(values_path);
+        if (!has_index and !has_values) return;
+        if (has_index != has_values) return error.InvalidRecord;
+
+        var index_file = try std.Io.Dir.cwd().openFile(self.io, index_path, .{ .allow_directory = false });
+        defer index_file.close(self.io);
+        const header = try self.readNodePropertyIndexHeaderFromFile(index_file);
+        if (header.node_count != 0 or header.node_digest != 0) return error.InvalidRecord;
+        if (try self.regularFileSize(index_file) != try nodePropertyIndexFileSize(header.record_count)) return error.InvalidRecord;
+
+        var values_file = try std.Io.Dir.cwd().openFile(self.io, values_path, .{ .allow_directory = false });
+        defer values_file.close(self.io);
+        const values_header = try self.readNodePropertyValueBlockHeaderFromFile(values_file);
+        if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
+        if (try self.regularFileSize(values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
+
+        var previous: ?NodePropertyIndexRecord = null;
+        var index: u64 = 0;
+        while (index < header.record_count) : (index += 1) {
+            const record = try self.readNodePropertyIndexRecordAt(index_file, index);
+            if (previous) |prev| {
+                if (!nodePropertyIndexRecordLessThan({}, prev, record)) return error.InvalidRecord;
+            }
+            const value = try self.readNodePropertyValuePayloadAt(allocator, values_file, values_header, index, record);
+            defer if (value) |owned| allocator.free(owned);
+            const value_kind: PropertySnapshotValueKind = switch (record.value_type) {
+                NodePropertyIndexRecord.value_type_string => .string,
+                NodePropertyIndexRecord.value_type_uint => .uint,
+                else => return error.InvalidRecord,
+            };
+            try visit(context, .{
+                .owner = try propertyPayloadOwnerFromParts(owner_kind, record.node_id),
+                .key_hash = record.key_hash,
+                .version = property_snapshot_legacy_version,
+                .value_kind = value_kind,
+                .string_value = if (value_kind == .string) value orelse return error.InvalidRecord else &.{},
+                .uint_value = if (value_kind == .uint) record.value_hash else 0,
+            });
+            previous = record;
+        }
+    }
+
+    fn scanCanonicalPropertySnapshotLayer(
+        self: Store,
+        allocator: std.mem.Allocator,
+        context: *anyopaque,
+        visit: PropertySnapshotLayerVisitor,
+    ) !void {
+        const has_index = try self.fileExists(self.property_payload_index_path);
+        const has_values = try self.fileExists(self.property_payload_values_path);
+        if (!has_index and !has_values) return;
+        if (has_index != has_values) return error.InvalidRecord;
+
+        var index_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_index_path, .{ .allow_directory = false });
+        defer index_file.close(self.io);
+        const header = try self.readPropertyPayloadIndexHeaderFromFile(index_file);
+        if (header.owner_count != 0 or header.owner_digest != 0) return error.InvalidRecord;
+        if (try self.regularFileSize(index_file) != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
+
+        var values_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_values_path, .{ .allow_directory = false });
+        defer values_file.close(self.io);
+        const values_header = try self.readNodePropertyValueBlockHeaderFromFile(values_file);
+        if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
+        if (try self.regularFileSize(values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
+
+        var previous: ?PropertyPayloadIndexRecord = null;
+        var index: u64 = 0;
+        while (index < header.record_count) : (index += 1) {
+            const record = try self.readPropertyPayloadIndexRecordAt(index_file, index);
+            if (previous) |prev| {
+                if (!propertyPayloadRecordLessThan({}, prev, record)) return error.InvalidRecord;
+            }
+            const value = try self.readPropertyPayloadValuePayloadAt(allocator, values_file, values_header, index, record);
+            defer if (value) |owned| allocator.free(owned);
+            const value_kind: PropertySnapshotValueKind = switch (record.value_type) {
+                PropertyPayloadIndexRecord.value_type_string => .string,
+                PropertyPayloadIndexRecord.value_type_uint => .uint,
+                else => return error.InvalidRecord,
+            };
+            try visit(context, .{
+                .owner = try propertyPayloadOwnerFromParts(record.owner_kind, record.owner_id),
+                .key_hash = record.key_hash,
+                .version = property_snapshot_base_version,
+                .value_kind = value_kind,
+                .string_value = if (value_kind == .string) value orelse return error.InvalidRecord else &.{},
+                .uint_value = if (value_kind == .uint) record.value_hash else 0,
+            });
+            previous = record;
+        }
+    }
+
+    /// Stream every physical property layer once with explicit precedence.
+    /// This validates the legacy overlays, canonical base, and append-only
+    /// delta without retaining an all-store owner map. The visitor may spool
+    /// fixed-size metadata and values to disk, then external-sort to obtain a
+    /// bounded effective snapshot.
+    pub fn scanPropertySnapshotLayers(
+        self: Store,
+        allocator: std.mem.Allocator,
+        context: *anyopaque,
+        visit: PropertySnapshotLayerVisitor,
+    ) !void {
+        try self.scanLegacyPropertySnapshotLayer(
+            allocator,
+            self.node_props_overlay_index_path,
+            self.node_props_overlay_values_path,
+            PropertyPayloadIndexRecord.owner_kind_node,
+            context,
+            visit,
+        );
+        try self.scanLegacyPropertySnapshotLayer(
+            allocator,
+            self.edge_props_overlay_index_path,
+            self.edge_props_overlay_values_path,
+            PropertyPayloadIndexRecord.owner_kind_edge,
+            context,
+            visit,
+        );
+        try self.scanCanonicalPropertySnapshotLayer(allocator, context, visit);
+        var next_version = property_snapshot_delta_version_base;
+        _ = try self.scanPropertyPayloadDelta(allocator, .{ .layer_scan = .{
+            .context = context,
+            .visit = visit,
+            .next_version = &next_version,
+        } }, false);
+    }
+
     pub fn loadPropertySnapshot(self: Store, allocator: std.mem.Allocator) !PropertySnapshot {
         var out = std.ArrayList(PropertySnapshotEntry).empty;
-        errdefer out.deinit(allocator);
+        errdefer deinitPropertySnapshotList(&out, allocator);
 
         var node_overlay = try self.readNodePropertyOverlayEntriesOrEmpty(allocator);
         defer {
@@ -7989,7 +10948,8 @@ pub const Store = struct {
 
         var seen = std.AutoHashMap(PropertyPayloadOwnerKey, void).init(allocator);
         defer seen.deinit();
-        try seen.ensureTotalCapacity(@intCast(entries.items.len + writes.len));
+        const expected_count = std.math.add(usize, entries.items.len, writes.len) catch return error.RecordTooLarge;
+        try seen.ensureTotalCapacity(std.math.cast(u32, expected_count) orelse return error.RecordTooLarge);
         for (entries.items) |entry| {
             try seen.put(.{
                 .owner_kind = entry.record.owner_kind,
@@ -8017,6 +10977,357 @@ pub const Store = struct {
         try self.writePropertyPayload(entries.items);
     }
 
+    /// Publish a canonical property base from a bounded sorted stream. This is
+    /// intentionally restricted to an empty COW target: replacing a live base
+    /// would discard concurrent deltas and violate the Store writer contract.
+    /// The two-file base is still committed through the normal redo journal.
+    pub fn replaceEmptyPropertyPayloadFromSortedStream(
+        self: Store,
+        expected_count: u64,
+        context: *anyopaque,
+        next: SortedPropertyPayloadNext,
+    ) !void {
+        const has_index = try self.fileExists(self.property_payload_index_path);
+        const has_values = try self.fileExists(self.property_payload_values_path);
+        if (has_index != has_values) return error.InvalidRecord;
+        if (has_index) {
+            var index_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_index_path, .{ .allow_directory = false });
+            defer index_file.close(self.io);
+            const header = try self.readPropertyPayloadIndexHeaderFromFile(index_file);
+            if (header.record_count != 0 or header.owner_count != 0 or header.owner_digest != 0) return error.InvalidRecord;
+            if (try self.regularFileSize(index_file) != try propertyPayloadIndexFileSize(0)) return error.InvalidRecord;
+            var values_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_values_path, .{ .allow_directory = false });
+            defer values_file.close(self.io);
+            const values_header = try self.readNodePropertyValueBlockHeaderFromFile(values_file);
+            if (values_header.record_count != 0 or values_header.node_count != 0 or values_header.node_digest != 0 or
+                values_header.payload_bytes != 0 or values_header.payload_digest != 0) return error.InvalidRecord;
+            if (try self.regularFileSize(values_file) != try nodePropertyValueBlockFileSize(0, 0)) return error.InvalidRecord;
+        }
+        const delta_scan = try self.scanPropertyPayloadDelta(self.allocator, .none, false);
+        if (delta_scan.valid_bytes != 0 or delta_scan.last_sequence != 0) return error.InvalidRecord;
+        const RejectNonEmpty = struct {
+            fn visit(_: *anyopaque, _: PropertySnapshotLayerEntry) anyerror!void {
+                return error.InvalidRecord;
+            }
+        };
+        var empty_context: u8 = 0;
+        try self.scanPropertySnapshotLayers(self.allocator, &empty_context, RejectNonEmpty.visit);
+
+        const index_stage_path = try self.tmpPathFor(self.property_payload_index_path);
+        defer self.allocator.free(index_stage_path);
+        errdefer std.Io.Dir.cwd().deleteFile(self.io, index_stage_path) catch {};
+        const values_stage_path = try self.tmpPathFor(self.property_payload_values_path);
+        defer self.allocator.free(values_stage_path);
+        errdefer std.Io.Dir.cwd().deleteFile(self.io, values_stage_path) catch {};
+
+        var record_count: u64 = 0;
+        var payload_bytes: u64 = 0;
+        var payload_digest: u64 = 0;
+        {
+            var index_file = try std.Io.Dir.cwd().createFile(self.io, index_stage_path, .{ .read = true, .truncate = true });
+            defer index_file.close(self.io);
+            var values_file = try std.Io.Dir.cwd().createFile(self.io, values_stage_path, .{ .read = true, .truncate = true });
+            defer values_file.close(self.io);
+            var index_writer = try StorageBufferedWriter.initAtOffset(
+                self.allocator,
+                self.io,
+                index_file,
+                storage_write_buffer_bytes,
+                PropertyPayloadIndexHeader.encoded_len,
+            );
+            defer index_writer.deinit();
+            var value_record_writer = try StorageBufferedWriter.initAtOffset(
+                self.allocator,
+                self.io,
+                values_file,
+                storage_write_buffer_bytes,
+                NodePropertyValueBlockHeader.encoded_len,
+            );
+            defer value_record_writer.deinit();
+            const payload_offset = std.math.add(
+                u64,
+                NodePropertyValueBlockHeader.encoded_len,
+                std.math.mul(u64, expected_count, NodePropertyValueRecord.encoded_len) catch return error.RecordTooLarge,
+            ) catch return error.RecordTooLarge;
+            var value_writer = try StorageBufferedWriter.initAtOffset(
+                self.allocator,
+                self.io,
+                values_file,
+                storage_write_buffer_bytes,
+                payload_offset,
+            );
+            defer value_writer.deinit();
+
+            var previous: ?PropertyPayloadIndexRecord = null;
+            var digest_bytes: [8]u8 = undefined;
+            while (try next(context)) |entry| {
+                // payload_offset reserves exactly expected_count value-record
+                // slots. Reject an over-producing stream before either writer
+                // can enter the payload region reserved for string bytes.
+                if (record_count >= expected_count) return error.InvalidRecord;
+                const owner_id = propertyPayloadOwnerId(entry.owner);
+                const owner_kind = propertyPayloadOwnerKind(entry.owner);
+                const value_type: u8 = switch (entry.value) {
+                    .string => PropertyPayloadIndexRecord.value_type_string,
+                    .uint => PropertyPayloadIndexRecord.value_type_uint,
+                };
+                const value_hash: u64 = switch (entry.value) {
+                    .string => |value| blk: {
+                        if (value.len == 0) return error.InvalidRecord;
+                        break :blk nodePropertyValueHash(value);
+                    },
+                    .uint => |value| value,
+                };
+                const record = PropertyPayloadIndexRecord{
+                    .key_hash = entry.key_hash,
+                    .value_hash = value_hash,
+                    .owner_id = owner_id,
+                    .owner_kind = owner_kind,
+                    .value_type = value_type,
+                };
+                if (previous) |prior| {
+                    if (!propertyPayloadRecordLessThan({}, prior, record)) return error.InvalidRecord;
+                }
+                var record_bytes: [PropertyPayloadIndexRecord.encoded_len]u8 = undefined;
+                try record.encode(&record_bytes);
+                try index_writer.append(&record_bytes);
+
+                var value_record: NodePropertyValueRecord = .{ .offset = 0, .len = 0 };
+                switch (entry.value) {
+                    .string => |value| {
+                        value_record = .{
+                            .offset = payload_bytes,
+                            .len = std.math.cast(u32, value.len) orelse return error.RecordTooLarge,
+                        };
+                        std.mem.writeInt(u64, &digest_bytes, entry.key_hash, .little);
+                        payload_digest ^= std.hash.Wyhash.hash(0x544B_5056, &digest_bytes);
+                        std.mem.writeInt(u64, &digest_bytes, value_hash, .little);
+                        payload_digest ^= std.hash.Wyhash.hash(0x544B_5056, &digest_bytes);
+                        payload_digest ^= std.hash.Wyhash.hash(0x544B_5056, value);
+                        try value_writer.append(value);
+                        payload_bytes = std.math.add(u64, payload_bytes, value.len) catch return error.RecordTooLarge;
+                    },
+                    .uint => {},
+                }
+                var value_record_bytes: [NodePropertyValueRecord.encoded_len]u8 = undefined;
+                value_record.encode(&value_record_bytes);
+                try value_record_writer.append(&value_record_bytes);
+                record_count = std.math.add(u64, record_count, 1) catch return error.RecordTooLarge;
+                previous = record;
+            }
+            if (record_count != expected_count) return error.InvalidRecord;
+            try index_writer.flush();
+            try value_record_writer.flush();
+            try value_writer.flush();
+
+            var index_header_bytes: [PropertyPayloadIndexHeader.encoded_len]u8 = undefined;
+            (PropertyPayloadIndexHeader{
+                .record_count = record_count,
+                .owner_count = 0,
+                .owner_digest = 0,
+            }).encode(&index_header_bytes);
+            try index_file.writePositionalAll(self.io, &index_header_bytes, 0);
+            var values_header_bytes: [NodePropertyValueBlockHeader.encoded_len]u8 = undefined;
+            (NodePropertyValueBlockHeader{
+                .record_count = record_count,
+                .node_count = 0,
+                .node_digest = 0,
+                .payload_bytes = payload_bytes,
+                .payload_digest = payload_digest,
+            }).encode(&values_header_bytes);
+            try values_file.writePositionalAll(self.io, &values_header_bytes, 0);
+
+            if (try self.regularFileSize(index_file) != try propertyPayloadIndexFileSize(record_count)) return error.InvalidRecord;
+            if (try self.regularFileSize(values_file) != try nodePropertyValueBlockFileSize(record_count, payload_bytes)) return error.InvalidRecord;
+            if (selfOptionsNeedSync(self)) {
+                try index_file.sync(self.io);
+                try values_file.sync(self.io);
+            }
+        }
+
+        try self.writePropertyPayloadRedoJournal(index_stage_path, values_stage_path);
+        try self.renameReplace(values_stage_path, self.property_payload_values_path);
+        try self.renameReplace(index_stage_path, self.property_payload_index_path);
+        try self.deletePropertyPayloadRedoJournal();
+    }
+
+    fn validatePropertyPayloadWrite(self: Store, allocator: std.mem.Allocator, write: PropertyPayloadWrite) !void {
+        switch (write.value) {
+            .string => |value| {
+                if (!stringPropertyKeySupportedForOwner(write.owner, write.key) or value.len == 0) return error.InvalidRecord;
+            },
+            .uint => {
+                if (!uintPropertyKeySupportedForOwner(write.owner, write.key)) return error.InvalidRecord;
+            },
+        }
+        switch (write.owner) {
+            .node => |node_id| {
+                var node = (try self.readNodeById(allocator, node_id)) orelse return core.Error.NotFound;
+                node.deinit(allocator);
+            },
+            .edge => |edge_id| if (!try self.visibleEdgeIdExists(edge_id)) return core.Error.InvalidId,
+        }
+    }
+
+    fn countExistingPropertyPayloadKeys(
+        self: Store,
+        allocator: std.mem.Allocator,
+        wanted: *const PropertyPayloadOwnerKeySet,
+        delta_scan: *PropertyPayloadDeltaScan,
+    ) !usize {
+        var found = PropertyPayloadOwnerKeySet.init(allocator);
+        defer found.deinit();
+        try found.ensureTotalCapacity(@intCast(wanted.count()));
+
+        const has_index = try self.fileExists(self.property_payload_index_path);
+        const has_values = try self.fileExists(self.property_payload_values_path);
+        if (has_index != has_values) return error.InvalidRecord;
+        if (has_index) {
+            var index_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_index_path, .{ .allow_directory = false });
+            defer index_file.close(self.io);
+            const header = try self.readPropertyPayloadIndexHeaderFromFile(index_file);
+            if (header.owner_count != 0 or header.owner_digest != 0) return error.InvalidRecord;
+            if (try self.regularFileSize(index_file) != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
+            try self.validatePropertyPayloadIndexOrderIfStrict(index_file, header);
+
+            var values_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_values_path, .{ .allow_directory = false });
+            defer values_file.close(self.io);
+            const values_header = try self.readNodePropertyValueBlockHeaderFromFile(values_file);
+            if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
+            if (try self.regularFileSize(values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
+
+            var wanted_it = wanted.keyIterator();
+            while (wanted_it.next()) |wanted_key| {
+                var index = try self.propertyPayloadKeyHashLowerBound(index_file, header.record_count, wanted_key.key_hash);
+                while (index < header.record_count) : (index += 1) {
+                    const record = try self.readPropertyPayloadIndexRecordAt(index_file, index);
+                    if (record.key_hash != wanted_key.key_hash) break;
+                    if (record.owner_kind == wanted_key.owner_kind and record.owner_id == wanted_key.owner_id) {
+                        try found.put(wanted_key.*, {});
+                        break;
+                    }
+                }
+            }
+        }
+
+        delta_scan.* = try self.scanPropertyPayloadDelta(allocator, .{ .existing_keys = .{ .wanted = wanted, .found = &found } }, false);
+        return found.count();
+    }
+
+    /// Replace or insert several property values with one crash-safe delta
+    /// publication.  The immutable base pair is only probed by key and is not
+    /// rewritten; write amplification is therefore proportional to this batch.
+    /// Duplicate owner/key writes are rejected before any durable mutation.
+    pub fn upsertPropertiesBatch(self: Store, allocator: std.mem.Allocator, writes: []const PropertyPayloadWrite) !PropertyPayloadUpsertResult {
+        if (writes.len == 0) return .{};
+
+        var write_keys = PropertyPayloadOwnerKeySet.init(allocator);
+        defer write_keys.deinit();
+        try write_keys.ensureTotalCapacity(std.math.cast(u32, writes.len) orelse return error.RecordTooLarge);
+        for (writes) |write| {
+            try self.validatePropertyPayloadWrite(allocator, write);
+            const entry = try write_keys.getOrPut(propertyPayloadOwnerKey(write.owner, write.key));
+            if (entry.found_existing) return error.InvalidRecord;
+        }
+
+        // The existing-key pass already validates and walks the complete
+        // delta. Reuse its tail/sequence as the append precondition instead of
+        // immediately rescanning an ever-growing journal a second time.
+        // Raw Store callers still owe the documented external writer lock;
+        // CLI lifecycle commands hold it across this whole operation.
+        var delta_scan: PropertyPayloadDeltaScan = undefined;
+        const replaced = try self.countExistingPropertyPayloadKeys(allocator, &write_keys, &delta_scan);
+        try self.publishPropertyPayloadDelta(allocator, writes, delta_scan);
+        return .{
+            .writes_applied = writes.len,
+            .entries_replaced = replaced,
+            .payload_publish_count = 1,
+        };
+    }
+
+    /// Merge the append-only property delta into the immutable base pair.
+    /// Callers must provide the same external writer exclusion used by other
+    /// Store maintenance operations (the CLI holds CliStoreLock).  Publishing
+    /// the new base before unlinking the delta is deliberate: a crash in that
+    /// window merely replays identical latest-wins values, while deleting the
+    /// delta first could lose committed updates.
+    pub fn compactPropertyPayloadDelta(self: Store, allocator: std.mem.Allocator) !PropertyPayloadCompactionResult {
+        _ = try self.recoverPropertyPayloadDeltaJournal();
+        const scan = try self.scanPropertyPayloadDelta(allocator, .none, false);
+        if (scan.valid_bytes == 0) return .{};
+
+        var entries = try self.readPropertyPayloadEntriesOrEmpty(allocator);
+        defer {
+            deinitPropertyPayloadIndexEntries(entries.items, allocator);
+            entries.deinit(allocator);
+        }
+        try self.writePropertyPayload(entries.items);
+        const cleanup_pending = !self.cleanupPropertyPayloadDeltaAfterCompaction();
+        return .{
+            .compacted = true,
+            .cleanup_pending = cleanup_pending,
+            .delta_bytes = scan.valid_bytes,
+            .delta_frames = scan.last_sequence,
+            .live_entries = @intCast(entries.items.len),
+        };
+    }
+
+    /// The merged base pair is already the committed source of truth. A
+    /// retained delta only replays the same latest-wins values, so unlink or
+    /// parent-sync failure is retryable garbage collection rather than a
+    /// failed compaction.
+    fn cleanupPropertyPayloadDeltaAfterCompaction(self: Store) bool {
+        std.Io.Dir.cwd().deleteFile(self.io, self.property_payload_delta_path) catch return false;
+        self.syncParentDirForPath(self.property_payload_delta_path) catch return false;
+        return true;
+    }
+
+    fn readPropertyPayloadEntryForKey(
+        self: Store,
+        allocator: std.mem.Allocator,
+        owner: PropertyOwner,
+        key: []const u8,
+    ) !?PropertyPayloadIndexEntry {
+        var lookup = PropertyPayloadLookupTarget{
+            .owner_key = propertyPayloadOwnerKey(owner, key),
+            .key_name = key,
+        };
+        errdefer lookup.deinit(allocator);
+
+        const has_index = try self.fileExists(self.property_payload_index_path);
+        const has_values = try self.fileExists(self.property_payload_values_path);
+        if (has_index != has_values) return error.InvalidRecord;
+        if (has_index) {
+            var index_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_index_path, .{ .allow_directory = false });
+            defer index_file.close(self.io);
+            const header = try self.readPropertyPayloadIndexHeaderFromFile(index_file);
+            if (header.owner_count != 0 or header.owner_digest != 0) return error.InvalidRecord;
+            if (try self.regularFileSize(index_file) != try propertyPayloadIndexFileSize(header.record_count)) return error.InvalidRecord;
+            try self.validatePropertyPayloadIndexOrderIfStrict(index_file, header);
+
+            var values_file = try std.Io.Dir.cwd().openFile(self.io, self.property_payload_values_path, .{ .allow_directory = false });
+            defer values_file.close(self.io);
+            const values_header = try self.readNodePropertyValueBlockHeaderFromFile(values_file);
+            if (values_header.record_count != header.record_count or values_header.node_count != 0 or values_header.node_digest != 0) return error.InvalidRecord;
+            if (try self.regularFileSize(values_file) != try nodePropertyValueBlockFileSize(values_header.record_count, values_header.payload_bytes)) return error.InvalidRecord;
+
+            var index = try self.propertyPayloadKeyHashLowerBound(index_file, header.record_count, lookup.owner_key.key_hash);
+            while (index < header.record_count) : (index += 1) {
+                const record = try self.readPropertyPayloadIndexRecordAt(index_file, index);
+                if (record.key_hash != lookup.owner_key.key_hash) break;
+                if (record.owner_kind != lookup.owner_key.owner_kind or record.owner_id != lookup.owner_key.owner_id) continue;
+                if (lookup.value != null) return error.InvalidRecord;
+                const value = try self.readPropertyPayloadValuePayloadAt(allocator, values_file, values_header, index, record);
+                lookup.value = .{ .record = record, .value = value };
+            }
+        }
+
+        _ = try self.scanPropertyPayloadDelta(allocator, .{ .lookup = &lookup }, false);
+        const result = lookup.value;
+        lookup.value = null;
+        return result;
+    }
+
     fn propertyPayloadStringValue(entries: []const PropertyPayloadIndexEntry, owner: PropertyOwner, key: []const u8) ?[]const u8 {
         for (entries) |entry| {
             if (!propertyPayloadEntryMatchesOwnerKey(entry, owner, key)) continue;
@@ -8037,64 +11348,19 @@ pub const Store = struct {
     }
 
     fn setStringPropertyPayload(self: Store, allocator: std.mem.Allocator, owner: PropertyOwner, key: []const u8, value: []const u8) !void {
-        if (!stringPropertyKeySupportedForOwner(owner, key)) return error.InvalidRecord;
-        if (value.len == 0) return error.InvalidRecord;
-        switch (owner) {
-            .node => |node_id| {
-                var node = (try self.readNodeById(allocator, node_id)) orelse return core.Error.NotFound;
-                node.deinit(allocator);
-            },
-            .edge => |edge_id| _ = try self.readEdgeIndexRecordById(edge_id),
-        }
-
-        var entries = try self.readPropertyPayloadEntriesOrEmpty(allocator);
-        defer {
-            deinitPropertyPayloadIndexEntries(entries.items, allocator);
-            entries.deinit(allocator);
-        }
-
-        var index: usize = 0;
-        while (index < entries.items.len) {
-            if (propertyPayloadEntryMatchesOwnerKey(entries.items[index], owner, key)) {
-                var removed = entries.orderedRemove(index);
-                removed.deinit(allocator);
-            } else {
-                index += 1;
-            }
-        }
-
-        try appendStringPropertyPayloadRecord(&entries, allocator, owner, key, value);
-        try self.writePropertyPayload(entries.items);
+        _ = try self.upsertPropertiesBatch(allocator, &.{.{
+            .owner = owner,
+            .key = key,
+            .value = .{ .string = value },
+        }});
     }
 
     fn setUintPropertyPayload(self: Store, allocator: std.mem.Allocator, owner: PropertyOwner, key: []const u8, value: u64) !void {
-        if (!uintPropertyKeySupportedForOwner(owner, key)) return error.InvalidRecord;
-        switch (owner) {
-            .node => |node_id| {
-                var node = (try self.readNodeById(allocator, node_id)) orelse return core.Error.NotFound;
-                node.deinit(allocator);
-            },
-            .edge => |edge_id| _ = try self.readEdgeIndexRecordById(edge_id),
-        }
-
-        var entries = try self.readPropertyPayloadEntriesOrEmpty(allocator);
-        defer {
-            deinitPropertyPayloadIndexEntries(entries.items, allocator);
-            entries.deinit(allocator);
-        }
-
-        var index: usize = 0;
-        while (index < entries.items.len) {
-            if (propertyPayloadEntryMatchesOwnerKey(entries.items[index], owner, key)) {
-                var removed = entries.orderedRemove(index);
-                removed.deinit(allocator);
-            } else {
-                index += 1;
-            }
-        }
-
-        try appendUintPropertyPayloadRecord(&entries, allocator, owner, key, value);
-        try self.writePropertyPayload(entries.items);
+        _ = try self.upsertPropertiesBatch(allocator, &.{.{
+            .owner = owner,
+            .key = key,
+            .value = .{ .uint = value },
+        }});
     }
 
     pub fn setNodeStringProperty(self: Store, allocator: std.mem.Allocator, node_id: core.NodeId, key: []const u8, value: []const u8) !void {
@@ -8107,12 +11373,14 @@ pub const Store = struct {
         var node = (try self.readNodeById(allocator, node_id)) orelse return core.Error.NotFound;
         defer node.deinit(allocator);
         if (nodePropertyOverlayStringKeySupported(key)) {
-            var payload_entries = try self.readPropertyPayloadEntriesOrEmpty(allocator);
-            defer {
-                deinitPropertyPayloadIndexEntries(payload_entries.items, allocator);
-                payload_entries.deinit(allocator);
+            var payload_entry = try self.readPropertyPayloadEntryForKey(allocator, .{ .node = node_id }, key);
+            defer if (payload_entry) |*entry| entry.deinit(allocator);
+            if (payload_entry) |*entry| {
+                if (entry.record.value_type != PropertyPayloadIndexRecord.value_type_string) return error.InvalidRecord;
+                const value = entry.value orelse return error.InvalidRecord;
+                entry.value = null;
+                return value;
             }
-            if (propertyPayloadStringValue(payload_entries.items, .{ .node = node_id }, key)) |value| return try allocator.dupe(u8, value);
             var entries = try self.readNodePropertyOverlayEntriesOrEmpty(allocator);
             defer {
                 deinitNodePropertyIndexEntries(entries.items, allocator);
@@ -8136,13 +11404,15 @@ pub const Store = struct {
 
     pub fn getEdgeStringProperty(self: Store, allocator: std.mem.Allocator, edge_id: core.EdgeId, key: []const u8) !?[]u8 {
         if (!edgePropertyOverlayStringKeySupported(key)) return null;
-        _ = try self.readEdgeIndexRecordById(edge_id);
-        var payload_entries = try self.readPropertyPayloadEntriesOrEmpty(allocator);
-        defer {
-            deinitPropertyPayloadIndexEntries(payload_entries.items, allocator);
-            payload_entries.deinit(allocator);
+        _ = try self.readVisibleEdgeIndexRecordById(edge_id);
+        var payload_entry = try self.readPropertyPayloadEntryForKey(allocator, .{ .edge = edge_id }, key);
+        defer if (payload_entry) |*entry| entry.deinit(allocator);
+        if (payload_entry) |*entry| {
+            if (entry.record.value_type != PropertyPayloadIndexRecord.value_type_string) return error.InvalidRecord;
+            const value = entry.value orelse return error.InvalidRecord;
+            entry.value = null;
+            return value;
         }
-        if (propertyPayloadStringValue(payload_entries.items, .{ .edge = edge_id }, key)) |value| return try allocator.dupe(u8, value);
         var entries = try self.readEdgePropertyOverlayEntriesOrEmpty(allocator);
         defer {
             deinitNodePropertyIndexEntries(entries.items, allocator);
@@ -8167,14 +11437,12 @@ pub const Store = struct {
                 var node = (try self.readNodeById(allocator, node_id)) orelse return core.Error.NotFound;
                 node.deinit(allocator);
             },
-            .edge => |edge_id| _ = try self.readEdgeIndexRecordById(edge_id),
+            .edge => |edge_id| _ = try self.readVisibleEdgeIndexRecordById(edge_id),
         }
-        var entries = try self.readPropertyPayloadEntriesOrEmpty(allocator);
-        defer {
-            deinitPropertyPayloadIndexEntries(entries.items, allocator);
-            entries.deinit(allocator);
-        }
-        return propertyPayloadUintValue(entries.items, owner, key);
+        var entry = try self.readPropertyPayloadEntryForKey(allocator, owner, key) orelse return null;
+        defer entry.deinit(allocator);
+        if (entry.record.value_type != PropertyPayloadIndexRecord.value_type_uint or entry.value != null) return error.InvalidRecord;
+        return entry.record.value_hash;
     }
 
     pub fn setStringProperty(self: Store, allocator: std.mem.Allocator, owner: PropertyOwner, key: []const u8, value: []const u8) !void {
@@ -8368,12 +11636,35 @@ pub const Store = struct {
 
     fn scanEdgeRecordByExternalKeyCached(self: Store, allocator: std.mem.Allocator, external_key: []const u8, cache: *EdgeExternalKeyLookupCache) !?EdgeIndexRecord {
         if (external_key.len == 0) return null;
-        var edge_records = try self.readAllEdgeIndexRecords(allocator, self.edge_by_id_path, .id);
-        defer edge_records.deinit(allocator);
-        for (edge_records.items) |edge| {
-            if (try self.edgeRecordMatchesExternalKeyCached(allocator, edge.edge_id, external_key, cache)) |matched| return matched;
-        }
-        return null;
+        const ScanContext = struct {
+            store: Store,
+            allocator: std.mem.Allocator,
+            external_key: []const u8,
+            cache: *EdgeExternalKeyLookupCache,
+            found: ?EdgeIndexRecord = null,
+
+            fn visit(raw_context: *anyopaque, edge: EdgeIndexRecord) anyerror!void {
+                const context: *@This() = @ptrCast(@alignCast(raw_context));
+                // Keep consuming the stream after a match. The terminal
+                // count/digest check is part of the storage integrity
+                // contract, not an optional cost of an unsuccessful lookup.
+                if (context.found != null) return;
+                context.found = try context.store.edgeRecordMatchesExternalKeyCachedRecord(
+                    context.allocator,
+                    edge,
+                    context.external_key,
+                    context.cache,
+                );
+            }
+        };
+        var context = ScanContext{
+            .store = self,
+            .allocator = allocator,
+            .external_key = external_key,
+            .cache = cache,
+        };
+        _ = try self.scanVisibleEdgeIndexRecords(allocator, &context, ScanContext.visit);
+        return context.found;
     }
 
     fn factEdgeExternalKeyForNodesAlloc(self: Store, allocator: std.mem.Allocator, src: core.NodeId, rel: core.RelKind, dst: core.NodeId) !?[]u8 {
@@ -8390,7 +11681,7 @@ pub const Store = struct {
     }
 
     fn edgeMatchesExternalKey(self: Store, allocator: std.mem.Allocator, edge_id: u64, external_key: []const u8) !bool {
-        const edge = self.readEdgeIndexRecordById(.fromInt(edge_id)) catch |err| switch (err) {
+        const edge = self.readVisibleEdgeIndexRecordById(.fromInt(edge_id)) catch |err| switch (err) {
             core.Error.InvalidId => return false,
             else => |e| return e,
         };
@@ -8420,10 +11711,15 @@ pub const Store = struct {
     }
 
     fn edgeRecordMatchesExternalKeyCached(self: Store, allocator: std.mem.Allocator, edge_id: u64, external_key: []const u8, cache: *EdgeExternalKeyLookupCache) !?EdgeIndexRecord {
-        const edge = self.readEdgeIndexRecordById(.fromInt(edge_id)) catch |err| switch (err) {
+        const edge = self.readVisibleEdgeIndexRecordById(.fromInt(edge_id)) catch |err| switch (err) {
             core.Error.InvalidId => return null,
             else => |e| return e,
         };
+        return try self.edgeRecordMatchesExternalKeyCachedRecord(allocator, edge, external_key, cache);
+    }
+
+    fn edgeRecordMatchesExternalKeyCachedRecord(self: Store, allocator: std.mem.Allocator, edge: EdgeIndexRecord, external_key: []const u8, cache: *EdgeExternalKeyLookupCache) !?EdgeIndexRecord {
+        _ = self;
         const src_key = cache.node_keys.get(edge.src) orelse return null;
         const rel: core.RelKind = @enumFromInt(edge.rel);
         if (cache.order_map.get(edge.edge_id)) |order_key| {
@@ -8451,11 +11747,24 @@ pub const Store = struct {
         }
         var order_map = try self.edgeOrderMap(self.allocator);
         defer order_map.deinit();
-        var edge_records = try self.readAllEdgeIndexRecords(self.allocator, self.edge_by_id_path, .id);
-        defer edge_records.deinit(self.allocator);
-        for (edge_records.items) |edge| {
-            try self.appendEdgeExternalKeyRecordsForEdge(&records, node_keys, order_map, edge);
-        }
+        const RebuildContext = struct {
+            store: Store,
+            records: *std.ArrayList(EdgeExternalKeyIndexRecord),
+            node_keys: std.AutoHashMap(u64, []u8),
+            order_map: std.AutoHashMap(u64, u64),
+
+            fn visit(raw_context: *anyopaque, edge: EdgeIndexRecord) anyerror!void {
+                const context: *@This() = @ptrCast(@alignCast(raw_context));
+                try context.store.appendEdgeExternalKeyRecordsForEdge(context.records, context.node_keys, context.order_map, edge);
+            }
+        };
+        var context = RebuildContext{
+            .store = self,
+            .records = &records,
+            .node_keys = node_keys,
+            .order_map = order_map,
+        };
+        _ = try self.scanVisibleEdgeIndexRecords(self.allocator, &context, RebuildContext.visit);
         try self.writeEdgeExternalKeyIndex(records.items, meta);
     }
 
@@ -9900,11 +13209,89 @@ pub const Store = struct {
     pub const node_texts_block_deflate_block_bytes: u32 = 256 * 1024;
     pub const node_texts_raw_mmap_max_bytes: u64 = 64 * 1024 * 1024;
     const node_texts_block_deflate_flag_compressed: u16 = 1 << 0;
+    const node_texts_append_journal_magic = [_]u8{ 'T', 'K', 'N', 'A' };
+    const node_texts_append_journal_version: u16 = 3;
+    const node_texts_append_journal_checksummed_version: u16 = 2;
+    const node_texts_append_journal_legacy_version: u16 = 1;
+    const node_texts_append_journal_header_len: usize = 64;
+    const node_texts_append_journal_hash_seed: u64 = 0x544B_4E41;
+    const node_texts_append_journal_header_hash_seed: u64 = 0x544B_4E48;
+    const node_texts_deflate_progress_entry_len: usize = 20;
+    const node_texts_deflate_progress_hash_seed: u64 = 0x544B_4E50;
     // Keep synchronous ingestion at level 3. Level 6 saves only a few percent
     // of node_texts bytes on GB10 but makes the append path several times
     // slower; deeper compression belongs in an offline maintenance pass.
     pub const node_texts_block_deflate_level_number: u8 = 3;
     pub const node_texts_block_deflate_level = std.compress.flate.Compress.Options.level_3;
+
+    const NodeTextsAppendJournalHeader = struct {
+        original_size: u64,
+        suffix_offset: u64,
+        suffix_len: u64,
+        suffix_hash: u64,
+        original_header: [node_texts_block_deflate_header_len]u8,
+        original_format: NodeTextsStorageFormat = .block_deflate,
+        committed: bool = false,
+
+        fn decode(bytes: *const [node_texts_append_journal_header_len]u8) !NodeTextsAppendJournalHeader {
+            if (!std.mem.eql(u8, bytes[0..4], &node_texts_append_journal_magic)) return error.InvalidRecord;
+            const version = readU16(bytes[4..6]);
+            if (version != node_texts_append_journal_version and
+                version != node_texts_append_journal_checksummed_version and
+                version != node_texts_append_journal_legacy_version) return error.InvalidRecord;
+            if (readU16(bytes[6..8]) != node_texts_append_journal_header_len) return error.InvalidRecord;
+            if (bytes[56] > 1) return error.InvalidRecord;
+            if (version == node_texts_append_journal_legacy_version) {
+                if (!allZero(bytes[57..64])) return error.InvalidRecord;
+            } else {
+                var digest_bytes: [8]u8 = undefined;
+                writeU64(&digest_bytes, std.hash.Wyhash.hash(node_texts_append_journal_header_hash_seed, bytes[0..57]));
+                if (!std.mem.eql(u8, bytes[57..64], digest_bytes[0..7])) return error.InvalidRecord;
+            }
+            var original_header: [node_texts_block_deflate_header_len]u8 = undefined;
+            @memcpy(&original_header, bytes[40..56]);
+            const original_format: NodeTextsStorageFormat = if (version == node_texts_append_journal_version and allZero(&original_header))
+                .raw
+            else
+                .block_deflate;
+            return .{
+                .original_size = readU64(bytes[8..16]),
+                .suffix_offset = readU64(bytes[16..24]),
+                .suffix_len = readU64(bytes[24..32]),
+                .suffix_hash = readU64(bytes[32..40]),
+                .original_header = original_header,
+                .original_format = original_format,
+                .committed = bytes[56] == 1,
+            };
+        }
+
+        fn encode(self: NodeTextsAppendJournalHeader, out: *[node_texts_append_journal_header_len]u8) !void {
+            if (self.suffix_offset > self.original_size or self.suffix_len != self.original_size - self.suffix_offset) return error.InvalidRecord;
+            switch (self.original_format) {
+                .raw => {
+                    if (self.suffix_offset != self.original_size or self.suffix_len != 0) return error.InvalidRecord;
+                    if (self.suffix_hash != std.hash.Wyhash.hash(node_texts_append_journal_hash_seed, &.{})) return error.InvalidRecord;
+                    if (!allZero(&self.original_header)) return error.InvalidRecord;
+                },
+                .block_deflate => {
+                    if (self.original_size < node_texts_block_deflate_header_len) return error.InvalidRecord;
+                    _ = try NodeTextsBlockDeflateHeader.decode(&self.original_header);
+                },
+            }
+            @memcpy(out[0..4], &node_texts_append_journal_magic);
+            writeU16(out[4..6], node_texts_append_journal_version);
+            writeU16(out[6..8], node_texts_append_journal_header_len);
+            writeU64(out[8..16], self.original_size);
+            writeU64(out[16..24], self.suffix_offset);
+            writeU64(out[24..32], self.suffix_len);
+            writeU64(out[32..40], self.suffix_hash);
+            @memcpy(out[40..56], &self.original_header);
+            out[56] = @intFromBool(self.committed);
+            var digest_bytes: [8]u8 = undefined;
+            writeU64(&digest_bytes, std.hash.Wyhash.hash(node_texts_append_journal_header_hash_seed, out[0..57]));
+            @memcpy(out[57..64], digest_bytes[0..7]);
+        }
+    };
 
     const NodeTextsBlockDeflateHeader = struct {
         logical_size: u64,
@@ -10016,6 +13403,7 @@ pub const Store = struct {
         block_cache: ?*NodeTextsBlockCache = null,
 
         fn open(store: Store) !NodeTextsView {
+            _ = try store.recoverNodeTextsAppendJournal();
             var file = try std.Io.Dir.cwd().openFile(store.io, store.node_texts_path, .{});
             errdefer file.close(store.io);
             const physical_size = try store.regularFileSize(file);
@@ -11092,16 +14480,22 @@ pub const Store = struct {
         const epoch_digest = nodeTextRunManifestEpochDigest(entries);
         const epoch_path = try self.nodeTextRunManifestEpochPath(total_nodes, epoch_digest);
         defer self.allocator.free(epoch_path);
-        errdefer std.Io.Dir.cwd().deleteFile(self.io, epoch_path) catch {};
         const previous_epoch_path = try self.readNodeTextRunCurrentPath(self.allocator);
         defer if (previous_epoch_path) |path| self.allocator.free(path);
 
+        // Once CURRENT is renamed, `epoch_path` is live even if the following
+        // parent-directory sync reports an error. Never arm an errdefer that
+        // can remove a possibly published manifest. An unreferenced epoch from
+        // an earlier failure is harmless and the normal GC pass can reclaim it.
         try self.writeNodeTextRunManifestFile(epoch_path, entries);
         try self.writeNodeTextRunCurrent(epoch_path);
         self.warmNodeTextRunManifestCache(epoch_path);
         if (previous_epoch_path) |path| {
             if (!std.mem.eql(u8, path, epoch_path)) {
-                try self.deleteSupersededNodeTextRunManifestEpochExcept(path, pinned_manifest_paths);
+                // CURRENT already names the new epoch. Retiring its predecessor
+                // is post-commit GC and must not turn a successful publication
+                // into an error or unwind callers that own newly referenced runs.
+                self.deleteSupersededNodeTextRunManifestEpochExcept(path, pinned_manifest_paths) catch {};
             }
         }
     }
@@ -11235,8 +14629,38 @@ pub const Store = struct {
         return record;
     }
 
+    fn readVisibleEdgeIndexRecordById(self: Store, edge_id: core.EdgeId) !EdgeIndexRecord {
+        const base_record: ?EdgeIndexRecord = self.readEdgeIndexRecordById(edge_id) catch |err| switch (err) {
+            core.Error.InvalidId => null,
+            else => |e| return e,
+        };
+        if (base_record) |record| return record;
+        const raw_id = edge_id.toInt();
+        if (raw_id == 0 or raw_id == std.math.maxInt(u64) or try self.edgeTombstoneContains(raw_id)) return core.Error.InvalidId;
+        var opened = (try self.openPublishedEdgeSegmentsForQuery(self.allocator)) orelse return core.Error.InvalidId;
+        defer opened.deinit();
+        var stream = EdgeSegmentMergeStream.initWithVirtual(
+            self.allocator,
+            &opened.segments.segments,
+            &opened.segments.virtual_edges,
+            .forward,
+        );
+        defer stream.deinit();
+        try stream.reset();
+        while (try stream.next()) |edge| {
+            if (edge.edge_id.toInt() != raw_id) continue;
+            return .{
+                .src = edge.src.toInt(),
+                .dst = edge.dst.toInt(),
+                .edge_id = raw_id,
+                .rel = @intFromEnum(edge.rel),
+            };
+        }
+        return core.Error.InvalidId;
+    }
+
     pub fn readEdgeById(self: Store, edge_id: core.EdgeId) !graph_mod.Edge {
-        const record = try self.readEdgeIndexRecordById(edge_id);
+        const record = try self.readVisibleEdgeIndexRecordById(edge_id);
         return .{
             .id = .fromInt(record.edge_id),
             .src = .fromInt(record.src),
@@ -11246,20 +14670,26 @@ pub const Store = struct {
     }
 
     pub fn loadEdgeRefs(self: Store, allocator: std.mem.Allocator) ![]StoredEdgeRef {
-        var records = try self.readAllEdgeIndexRecords(allocator, self.edge_by_id_path, .id);
-        defer records.deinit(allocator);
         var out = std.ArrayList(StoredEdgeRef).empty;
         errdefer out.deinit(allocator);
-        try out.ensureTotalCapacity(allocator, records.items.len);
-        for (records.items) |record| {
-            if (try self.edgeTombstoneContains(record.edge_id)) continue;
-            out.appendAssumeCapacity(.{
-                .src = core.NodeId.fromInt(record.src),
-                .dst = core.NodeId.fromInt(record.dst),
-                .edge_id = core.EdgeId.fromInt(record.edge_id),
-                .rel = @enumFromInt(record.rel),
-            });
-        }
+        const meta = try self.readCurrentIndexMeta();
+        try out.ensureTotalCapacityPrecise(allocator, std.math.cast(usize, meta.edges) orelse return error.RecordTooLarge);
+        const Context = struct {
+            allocator: std.mem.Allocator,
+            refs: *std.ArrayList(StoredEdgeRef),
+
+            fn visit(raw: *anyopaque, record: EdgeIndexRecord) !void {
+                const context: *@This() = @ptrCast(@alignCast(raw));
+                try context.refs.append(context.allocator, .{
+                    .src = core.NodeId.fromInt(record.src),
+                    .dst = core.NodeId.fromInt(record.dst),
+                    .edge_id = core.EdgeId.fromInt(record.edge_id),
+                    .rel = try record.relKind(),
+                });
+            }
+        };
+        var context = Context{ .allocator = allocator, .refs = &out };
+        _ = try self.scanVisibleEdgeIndexRecords(allocator, &context, Context.visit);
         return try out.toOwnedSlice(allocator);
     }
 
@@ -11750,11 +15180,7 @@ pub const Store = struct {
 
     fn openReadOnlyMemoryMap(io: std.Io, file: std.Io.File, file_size: u64) !std.Io.File.MemoryMap {
         const len = std.math.cast(usize, file_size) orelse return error.RecordTooLarge;
-        return std.Io.File.MemoryMap.create(io, file, .{
-            .len = len,
-            .protection = .{ .read = true, .write = false },
-            .populate = false,
-        });
+        return read_only_memory_map.create(io, file, len);
     }
 
     fn readAllEdgeIndexRecords(self: Store, allocator: std.mem.Allocator, path: []const u8, order: EdgeIndexOrder) !std.ArrayList(EdgeIndexRecord) {
@@ -12546,7 +15972,8 @@ pub const Store = struct {
         const segment_path = try self.edgeBatchSegmentPath(old_meta, next_meta.*);
         defer self.allocator.free(segment_path);
         if (try self.pathExists(segment_path)) return error.AlreadyExists;
-        errdefer std.Io.Dir.cwd().deleteTree(self.io, segment_path) catch {};
+        var segment_unpublished = true;
+        errdefer if (segment_unpublished) std.Io.Dir.cwd().deleteTree(self.io, segment_path) catch {};
         const segment_write_start = if (self.edge_batch_segment_delta_stats != null) storageMonotonicNs(self.io) else 0;
         const batch_edge_id_index = try self.writeEdgeBatchSegment(segment_path, batch_records);
         if (self.edge_batch_segment_delta_stats) |delta_stats| {
@@ -12582,6 +16009,11 @@ pub const Store = struct {
             .path = segment_path,
         });
         const manifest_write_start = if (self.edge_batch_segment_delta_stats != null) storageMonotonicNs(self.io) else 0;
+        // The CURRENT rename is an irreversible commit point. From here on,
+        // preserve the segment on every error; an unreferenced segment can be
+        // collected later, while deleting a possibly referenced one corrupts
+        // the published manifest.
+        segment_unpublished = false;
         try self.writeEdgeSegmentManifestEntries(entries.items);
         setEdgeSegmentSummary(next_meta, try self.edgeSegmentManifestSummary(entries.items));
         if (self.edge_batch_segment_delta_stats) |delta_stats| {
@@ -12668,7 +16100,8 @@ pub const Store = struct {
 
         var segment = try segment_mod.ImmutableAdjacencySegment.initEmpty(self.allocator, self.io, segment_dir_path);
         errdefer segment.deinit();
-        errdefer std.Io.Dir.cwd().deleteTree(self.io, segment_dir_path) catch {};
+        var segment_unpublished = true;
+        errdefer if (segment_unpublished) std.Io.Dir.cwd().deleteTree(self.io, segment_dir_path) catch {};
 
         var forward_summary: segment_mod.ImmutableAdjacencySegment.WrittenEdgeStreamSummary = undefined;
         var reverse_summary: segment_mod.ImmutableAdjacencySegment.WrittenEdgeStreamSummary = undefined;
@@ -12705,6 +16138,7 @@ pub const Store = struct {
         const endpoint_summary = written_summary.endpoint_summary;
         try segment.openWrittenViewsWithSummaries(forward_summary, reverse_summary);
         const edge_id_index = try self.writeEdgeSegmentIdIndexFromSegment(segment_dir_path, &segment, edge_id_summary);
+        segment_unpublished = false;
         const manifest_summary = try self.writeEdgeSegmentManifest(segment_dir_path, written_summary.edge_digest, edge_id_summary, endpoint_summary, edge_id_index.edge_id_order_digest, edge_id_index.edge_id_runs);
         try self.updateIndexMetaEdgeSegmentSummary(manifest_summary);
         segment.deinit();
@@ -12729,13 +16163,15 @@ pub const Store = struct {
     }
 
     pub fn openRegisteredEdgeSegmentRetentionWindow(self: Store, registry: *EdgeSegmentRetentionRegistry) !EdgeSegmentRegisteredRetentionWindow {
-        if (try self.currentEdgeSegmentManifestPath(registry.allocator)) |path| {
-            var process_lease = try self.createManifestProcessLease(.edge_segment, path);
-            errdefer process_lease.deinit();
-            const retained_path = try registry.retainOwnedManifestPath(path);
-            return .{ .registry = registry, .manifest_path = retained_path, .process_lease = process_lease };
-        }
-        return .{ .registry = registry };
+        var acquired = (try self.acquireCurrentManifestProcessLease(registry.allocator, .edge_segment)) orelse
+            return .{ .registry = registry };
+        errdefer acquired.deinit();
+        const retained_path = try registry.retainOwnedManifestPath(acquired.takeManifestPath());
+        return .{
+            .registry = registry,
+            .manifest_path = retained_path,
+            .process_lease = acquired.takeProcessLease(),
+        };
     }
 
     pub fn gcUnreferencedEdgeSegmentsRetainingRegistry(self: Store, registry: *const EdgeSegmentRetentionRegistry) !EdgeSegmentGcResult {
@@ -12768,29 +16204,47 @@ pub const Store = struct {
             if (!try self.edgeSegmentPathIsImplicitL0(entry.path)) return false;
         }
 
-        const protected_paths = try self.pinnedManifestPathsWithProcessLeases(.edge_segment, self.allocator, &.{});
-        defer freeOwnedManifestPathList(self.allocator, protected_paths);
-        var current_protected = false;
-        for (protected_paths) |path| {
-            if (std.mem.eql(u8, path, current_path)) {
-                current_protected = true;
-                break;
-            }
-        }
-        if (current_protected) return false;
-
+        // Withdraw CURRENT before sampling leases. A reader publishes its
+        // lease between two CURRENT reads; after this durable unlink, every
+        // reader that accepted `current_path` must already have a visible
+        // lease, while a later reader will fail its second read and never use
+        // the old files. Sampling first would leave a race where a reader
+        // stabilizes the old CURRENT after the sample and loses its segment.
         std.Io.Dir.cwd().deleteFile(self.io, self.edge_segment_current_path) catch |err| switch (err) {
             error.FileNotFound => return false,
             else => |e| return e,
         };
         try self.syncParentDirForPath(self.edge_segment_current_path);
+
+        const protected_paths = try self.pinnedManifestPathsWithProcessLeases(.edge_segment, self.allocator, &.{});
+        defer freeOwnedManifestPathList(self.allocator, protected_paths);
+        for (protected_paths) |path| {
+            if (std.mem.eql(u8, path, current_path)) {
+                // Keep the old epoch discoverable for a later cleanup pass.
+                // The temporary withdrawal above closed the acquisition race;
+                // republishing now is safe because every accepted reader has
+                // a lease that the next pass will sample after withdrawing it
+                // again. A crash before this point only leaks redundant files.
+                try self.writeEdgeSegmentCurrent(current_path);
+                return false;
+            }
+        }
+
         for (manifest.entries.items) |entry| {
             if (try self.pathExists(entry.path)) {
-                try std.Io.Dir.cwd().deleteTree(self.io, entry.path);
+                std.Io.Dir.cwd().deleteTree(self.io, entry.path) catch |err| switch (err) {
+                    // CURRENT is already durably withdrawn and the base index
+                    // covers these edges. Windows can still deny unlink while
+                    // an mmap/AV handle drains; leaving unreferenced garbage
+                    // for the normal GC pass is safe, while failing here would
+                    // report an error after the logical commit point.
+                    error.AccessDenied => {},
+                    else => |e| return e,
+                };
             }
         }
         std.Io.Dir.cwd().deleteFile(self.io, current_path) catch |err| switch (err) {
-            error.FileNotFound => {},
+            error.FileNotFound, error.AccessDenied => {},
             else => |e| return e,
         };
         return true;
@@ -12814,13 +16268,15 @@ pub const Store = struct {
     }
 
     pub fn openRegisteredNodeTextRunRetentionWindow(self: Store, registry: *NodeTextRunRetentionRegistry) !NodeTextRunRegisteredRetentionWindow {
-        if (try self.currentNodeTextRunManifestPath(registry.allocator)) |path| {
-            var process_lease = try self.createManifestProcessLease(.node_text_run, path);
-            errdefer process_lease.deinit();
-            const retained_path = try registry.retainOwnedManifestPath(path);
-            return .{ .registry = registry, .manifest_path = retained_path, .process_lease = process_lease };
-        }
-        return .{ .registry = registry };
+        var acquired = (try self.acquireCurrentManifestProcessLease(registry.allocator, .node_text_run)) orelse
+            return .{ .registry = registry };
+        errdefer acquired.deinit();
+        const retained_path = try registry.retainOwnedManifestPath(acquired.takeManifestPath());
+        return .{
+            .registry = registry,
+            .manifest_path = retained_path,
+            .process_lease = acquired.takeProcessLease(),
+        };
     }
 
     pub fn gcUnreferencedNodeTextRunsRetainingRegistry(self: Store, registry: *const NodeTextRunRetentionRegistry) !NodeTextRunGcResult {
@@ -12841,6 +16297,63 @@ pub const Store = struct {
 
     fn manifestProcessLeaseDirPath(self: Store, allocator: std.mem.Allocator) ![]u8 {
         return try std.fs.path.join(allocator, &.{ self.dir_path, ".tinykg_leases" });
+    }
+
+    fn currentManifestPathForProcessLease(
+        self: Store,
+        allocator: std.mem.Allocator,
+        kind: ManifestProcessLeaseKind,
+    ) !?[]u8 {
+        return switch (kind) {
+            .edge_segment => try self.currentEdgeSegmentManifestPath(allocator),
+            .node_text_run => try self.currentNodeTextRunManifestPath(allocator),
+        };
+    }
+
+    fn acquireCurrentManifestProcessLease(
+        self: Store,
+        allocator: std.mem.Allocator,
+        kind: ManifestProcessLeaseKind,
+    ) !?AcquiredManifestProcessLease {
+        // Reading CURRENT and publishing the lease are not one atomic action.
+        // Re-read CURRENT after the lease is visible: if a publisher moved it
+        // in between, that publisher may already have reclaimed the old epoch.
+        // A stable match means every later reclaimer must observe this lease;
+        // a changing writer is bounded so a reader cannot spin forever.
+        for (0..manifest_process_lease_acquire_max_attempts) |_| {
+            const candidate = (try self.currentManifestPathForProcessLease(allocator, kind)) orelse return null;
+            if (try self.acquireManifestProcessLeaseCandidate(allocator, kind, candidate)) |acquired| return acquired;
+        }
+        return error.WouldBlock;
+    }
+
+    /// Consumes `candidate` on every path. Split out so the publication race
+    /// has a deterministic regression test: a stale pre-read candidate must
+    /// never escape merely because its lease file was published successfully.
+    fn acquireManifestProcessLeaseCandidate(
+        self: Store,
+        allocator: std.mem.Allocator,
+        kind: ManifestProcessLeaseKind,
+        candidate: []u8,
+    ) !?AcquiredManifestProcessLease {
+        var candidate_owned = true;
+        defer if (candidate_owned) allocator.free(candidate);
+
+        var process_lease = try self.createManifestProcessLease(kind, candidate);
+        var lease_owned = true;
+        defer if (lease_owned) process_lease.deinit();
+
+        const observed = try self.currentManifestPathForProcessLease(allocator, kind);
+        defer if (observed) |path| allocator.free(path);
+        if (observed == null or !std.mem.eql(u8, candidate, observed.?)) return null;
+
+        candidate_owned = false;
+        lease_owned = false;
+        return .{
+            .path_allocator = allocator,
+            .manifest_path = candidate,
+            .process_lease = process_lease,
+        };
     }
 
     fn createManifestProcessLease(self: Store, kind: ManifestProcessLeaseKind, manifest_path: []const u8) !ManifestProcessLease {
@@ -12948,7 +16461,6 @@ pub const Store = struct {
     pub fn gcUnreferencedEdgeSegmentsExcept(self: Store, pinned_manifest_paths: []const []const u8) !EdgeSegmentGcResult {
         const current_manifest_path = try self.readEdgeSegmentCurrentPath(self.allocator);
         defer if (current_manifest_path) |path| self.allocator.free(path);
-        if (current_manifest_path == null and pinned_manifest_paths.len == 0) return .{};
 
         var live_paths = std.StringHashMap(void).init(self.allocator);
         defer live_paths.deinit();
@@ -13268,7 +16780,8 @@ pub const Store = struct {
 
         var segment = try segment_mod.ImmutableAdjacencySegment.initEmpty(self.allocator, self.io, segment_dir_path);
         errdefer segment.deinit();
-        errdefer std.Io.Dir.cwd().deleteTree(self.io, segment_dir_path) catch {};
+        var segment_unpublished = true;
+        errdefer if (segment_unpublished) std.Io.Dir.cwd().deleteTree(self.io, segment_dir_path) catch {};
 
         const forward_summary = blk: {
             var stream = EdgeSegmentMergeStream.initWithVirtual(self.allocator, &segments.segments, &segments.virtual_edges, .forward);
@@ -13326,6 +16839,7 @@ pub const Store = struct {
                 .path = entry.path,
             });
         }
+        segment_unpublished = false;
         try self.writeEdgeSegmentManifestEntries(next_entries.items);
         try self.updateIndexMetaEdgeSegmentSummary(try self.edgeSegmentManifestSummary(next_entries.items));
         segment.deinit();
@@ -13344,7 +16858,8 @@ pub const Store = struct {
 
         var segment = try segment_mod.ImmutableAdjacencySegment.initEmpty(self.allocator, self.io, segment_dir_path);
         errdefer segment.deinit();
-        errdefer std.Io.Dir.cwd().deleteTree(self.io, segment_dir_path) catch {};
+        var segment_unpublished = true;
+        errdefer if (segment_unpublished) std.Io.Dir.cwd().deleteTree(self.io, segment_dir_path) catch {};
 
         const forward_summary = blk: {
             var stream = EdgeSegmentMergeStream.initWithVirtual(self.allocator, &segments.segments, &segments.virtual_edges, .forward);
@@ -13361,6 +16876,7 @@ pub const Store = struct {
         const edge_id_summary = written_summary.edge_id_summary;
         const endpoint_summary = written_summary.endpoint_summary;
         const edge_id_index = try self.writeEdgeSegmentIdIndexFromManifestEntries(segment_dir_path, entries, edge_id_summary);
+        segment_unpublished = false;
         const manifest_summary = try self.writeEdgeSegmentManifest(segment_dir_path, written_summary.edge_digest, edge_id_summary, endpoint_summary, edge_id_index.edge_id_order_digest, edge_id_index.edge_id_runs);
         try self.updateIndexMetaEdgeSegmentSummary(manifest_summary);
         segment.deinit();
@@ -13929,8 +17445,10 @@ pub const Store = struct {
         const epoch_digest = try self.edgeSegmentManifestDigest(entries);
         const epoch_path = try self.edgeSegmentManifestEpochPath(total_edges, epoch_digest);
         defer self.allocator.free(epoch_path);
-        errdefer std.Io.Dir.cwd().deleteFile(self.io, epoch_path) catch {};
 
+        // Keep an epoch whenever publication may have crossed the CURRENT
+        // rename commit point. A leaked unreferenced manifest is recoverable;
+        // CURRENT naming a deleted manifest is not.
         try self.writeEdgeSegmentManifestFile(epoch_path, entries);
         try self.writeEdgeSegmentCurrent(epoch_path);
     }
@@ -14046,7 +17564,7 @@ pub const Store = struct {
         defer self.allocator.free(root);
         if (!std.mem.startsWith(u8, segment_path, root)) return null;
         if (segment_path.len <= root.len + 1) return null;
-        if (segment_path[root.len] != '/') return null;
+        if (!std.fs.path.isSep(segment_path[root.len])) return null;
         const suffix = segment_path[root.len + 1 ..];
         if (!edgeSegmentManifestSafeRelativePath(suffix)) return null;
         return suffix;
@@ -15628,6 +19146,11 @@ pub const Store = struct {
     }
 
     fn edgeIndexesValidatedAndMatchMeta(self: Store, meta: IndexMeta) !bool {
+        if (!try self.edgeBaseIndexesValidatedAndMatchMeta(meta)) return false;
+        return try self.edgeIndexHeadersMatchMeta(meta);
+    }
+
+    fn edgeBaseIndexesValidatedAndMatchMeta(self: Store, meta: IndexMeta) !bool {
         const id_digest = self.edgeIndexValidatedDigest(self.edge_by_id_path, .id, meta.edge_indexed_edges) catch |err| switch (err) {
             error.FileNotFound, error.InvalidRecord => return false,
             else => |e| return e,
@@ -15641,7 +19164,10 @@ pub const Store = struct {
             else => |e| return e,
         };
         if (!id_digest.eql(src_digest) or !id_digest.eql(dst_digest)) return false;
-        return try self.validatedEdgeIndexDigestsMatchMeta(meta, id_digest, src_digest, dst_digest);
+        if (id_digest.count != meta.edge_indexed_edges or id_digest.digest != meta.edge_index_digest) return false;
+        if (id_digest.order_digest != meta.edge_by_id_order_digest) return false;
+        if (src_digest.order_digest != meta.edge_by_src_order_digest) return false;
+        return dst_digest.order_digest == meta.edge_by_dst_order_digest;
     }
 
     fn edgeIndexesMatchMeta(self: Store, meta: IndexMeta) !bool {
@@ -15693,6 +19219,25 @@ pub const Store = struct {
         if (meta.edge_indexed_edges - tombstone_header.count != meta.edges) return false;
         if ((meta.edge_index_digest ^ tombstone_header.digest) != meta.edge_digest) return false;
         return try self.edgeIndexBaseHeadersMatchMeta(meta);
+    }
+
+    fn edgeStorageMatchesMeta(self: Store, meta: IndexMeta, validate_base_records: bool) !bool {
+        const base_matches = if (validate_base_records)
+            try self.edgeBaseIndexesValidatedAndMatchMeta(meta)
+        else
+            try self.edgeIndexBaseHeadersMatchMeta(meta);
+        if (!base_matches) return false;
+        const tombstone_header = try self.readEdgeTombstoneIndexHeader();
+        const physical_edges = std.math.add(u64, meta.edges, tombstone_header.count) catch return false;
+        if (meta.edge_indexed_edges > physical_edges) return false;
+        if (meta.edge_indexed_edges == physical_edges) {
+            return (meta.edge_index_digest ^ tombstone_header.digest) == meta.edge_digest;
+        }
+        // The base indexes intentionally lag while an immutable segment
+        // overlay owns the physical suffix (or the complete visible set).
+        // Treat that publication as current only after validating its count
+        // and digest identity against the same IndexMeta snapshot.
+        return try self.edgeSegmentManifestMatchesMeta(meta);
     }
 
     fn edgeIndexBaseHeadersMatchMeta(self: Store, meta: IndexMeta) !bool {
@@ -16311,7 +19856,7 @@ pub const Store = struct {
 
         try self.renameReplace(texts_tmp_path, self.node_texts_path);
         try self.renameReplace(by_id_tmp_path, self.node_by_id_path);
-        try self.compressNodeTextsFileIfSmaller();
+        try self.finalizePrimaryTextStorage();
 
         const node_text_publish_shape = NodeTextRepairPublishShape{
             .uniform_kind = if (uniform_kind) |kind| @intFromEnum(kind) else null,
@@ -17281,7 +20826,8 @@ pub const Store = struct {
         const run_path = try self.nodeTextRunBatchPath(next_meta, next_meta, delta_header.node_count);
         defer self.allocator.free(run_path);
         if (try self.pathExists(run_path)) return error.AlreadyExists;
-        errdefer std.Io.Dir.cwd().deleteFile(self.io, run_path) catch {};
+        var run_unpublished = true;
+        errdefer if (run_unpublished) std.Io.Dir.cwd().deleteFile(self.io, run_path) catch {};
         try self.writeNodeTextRunFile(run_path, delta_records.items, delta_digest.digest, delta_digest.order_digest, .verify_by_id);
 
         var next_entries = std.ArrayList(NodeTextRunManifestEntry).empty;
@@ -17314,6 +20860,7 @@ pub const Store = struct {
             .hash_filter = hash_filter,
         });
 
+        run_unpublished = false;
         try self.writeNodeTextRunManifestEntries(next_entries.items);
         try self.writeEmptyNodeTextDelta();
         next_meta.node_by_text_order_digest = combinedNodeTextOrderDigestWithRunEntries(base_header, .{ .node_count = 0 }, next_entries.items);
@@ -17878,10 +21425,10 @@ pub const Store = struct {
             error.FileNotFound => {},
             else => |e| return e,
         };
-        std.Io.Dir.cwd().deleteFile(self.io, self.node_text_run_current_path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => |e| return e,
-        };
+        // The CURRENT unlink must be durable before GC removes the manifest
+        // and run files it named. Otherwise a crash can resurrect CURRENT and
+        // leave it pointing at files that were already reclaimed.
+        try self.invalidateNodeTextRunCurrent();
         return self.gcUnreferencedNodeTextRunsExceptAndProcessLeases(pinned_manifest_paths);
     }
 
@@ -18017,7 +21564,8 @@ pub const Store = struct {
         const compacted_path = try self.nodeTextRunWindowCompactionPath(meta, selected.start, selected.count, selected.records, compacted_digest.order_digest);
         defer self.allocator.free(compacted_path);
         if (try self.pathExists(compacted_path)) return error.AlreadyExists;
-        errdefer std.Io.Dir.cwd().deleteFile(self.io, compacted_path) catch {};
+        var compacted_run_unpublished = true;
+        errdefer if (compacted_run_unpublished) std.Io.Dir.cwd().deleteFile(self.io, compacted_path) catch {};
         try self.renameReplace(scratch_path, compacted_path);
 
         var next_entries = std.ArrayList(NodeTextRunManifestEntry).empty;
@@ -18066,6 +21614,7 @@ pub const Store = struct {
                 .hash_filter = entry.hash_filter,
             });
         }
+        compacted_run_unpublished = false;
         try self.writeNodeTextRunManifestEntriesExcept(next_entries.items, pinned_manifest_paths);
 
         var next_meta = try self.readIndexMeta();
@@ -18630,7 +22179,8 @@ pub const Store = struct {
         if (try self.pathExists(run_path)) {
             return error.AlreadyExists;
         }
-        errdefer std.Io.Dir.cwd().deleteFile(self.io, run_path) catch {};
+        var run_unpublished = true;
+        errdefer if (run_unpublished) std.Io.Dir.cwd().deleteFile(self.io, run_path) catch {};
         try self.writeNodeTextRunFile(run_path, batch_records, batch_digest, batch_order_digest, span_derive_mode);
 
         var entries = std.ArrayList(NodeTextRunManifestEntry).empty;
@@ -18664,6 +22214,7 @@ pub const Store = struct {
             .path = run_path,
             .hash_filter = batch_hash_filter,
         });
+        run_unpublished = false;
         try self.writeNodeTextRunManifestEntries(entries.items);
         return true;
     }
@@ -19894,6 +23445,15 @@ pub const Store = struct {
         const expected_size = try edgeIndexFileSizeForHeader(header);
         if (try self.regularFileSize(file) != expected_size) return error.InvalidRecord;
         return try self.edgeIdExistsInFile(file, header, edge_id.toInt());
+    }
+
+    fn visibleEdgeIdExists(self: Store, edge_id: core.EdgeId) !bool {
+        const raw_id = edge_id.toInt();
+        if (raw_id == 0 or raw_id == std.math.maxInt(u64)) return false;
+        if (try self.edgeTombstoneContains(raw_id)) return false;
+        if (try self.edgeIdExists(edge_id)) return true;
+        const meta = try self.readCurrentIndexMeta();
+        return try self.edgeIdExistsInSegmentOverlay(meta, raw_id);
     }
 
     fn edgeSegmentMetaSummaryCurrent(self: Store, meta: IndexMeta) !bool {
@@ -23994,25 +27554,30 @@ fn parseManifestProcessLease(content: []const u8) ?ParsedManifestProcessLease {
 }
 
 fn edgeSegmentManifestSafeRelativePath(path: []const u8) bool {
+    if (path.len == 0) return false;
     if (std.fs.path.isAbsolute(path)) return false;
     if (std.mem.indexOfScalar(u8, path, 0) != null) return false;
-    var it = std.mem.splitScalar(u8, path, '/');
-    while (it.next()) |part| {
+    // Validate both separator spellings independent of the current host.  A
+    // Windows-authored manifest may be inspected or restored on POSIX, where
+    // `std.fs.path.isAbsolute("C:\\...")` and split('/') alone are insufficient.
+    if (path[0] == '/' or path[0] == '\\') return false;
+    if (path.len >= 2 and std.ascii.isAlphabetic(path[0]) and path[1] == ':') return false;
+    var part_start: usize = 0;
+    for (path, 0..) |byte, index| {
+        if (byte != '/' and byte != '\\') continue;
+        const part = path[part_start..index];
         if (part.len == 0) return false;
         if (std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
+        part_start = index + 1;
     }
+    const final_part = path[part_start..];
+    if (final_part.len == 0) return false;
+    if (std.mem.eql(u8, final_part, ".") or std.mem.eql(u8, final_part, "..")) return false;
     return true;
 }
 
 fn processIdIsAlive(pid: ProcessId) bool {
-    if (builtin.os.tag == .windows) return false;
-    if (pid <= 0) return false;
-    std.posix.kill(pid, @enumFromInt(0)) catch |err| switch (err) {
-        error.ProcessNotFound => return false,
-        error.PermissionDenied => return true,
-        else => return false,
-    };
-    return true;
+    return process_liveness.isAlive(pid);
 }
 
 fn freeOwnedManifestPathList(allocator: std.mem.Allocator, paths: []const []const u8) void {
@@ -26807,7 +30372,8 @@ fn encodeBinaryEdgeDeleteRecord(out: *[binary_edge_delete_record_len]u8, edge_id
     @memcpy(out[0..BinaryRecordHeader.encoded_len], &header);
 }
 
-fn replayBinaryRecord(graph: *graph_mod.Graph, kind: BinaryRecordKind, payload: []const u8) !void {
+fn replayBinaryRecord(graph: *graph_mod.Graph, kind: BinaryRecordKind, payload: []const u8, deadline: core.QueryDeadline) !void {
+    if (deadline.expired()) return core.Error.BudgetExceeded;
     switch (kind) {
         .node, .node_batch => return error.InvalidRecord,
         .edge => {
@@ -26821,6 +30387,7 @@ fn replayBinaryRecord(graph: *graph_mod.Graph, kind: BinaryRecordKind, payload: 
             const batch = try validateBinaryEdgeBatchHeader(payload);
             var index: u32 = 0;
             while (index < batch.count) : (index += 1) {
+                if (deadline.expired()) return core.Error.BudgetExceeded;
                 const parsed = try validateBinaryEdgeBatchEdge(payload, batch, index);
                 graph.addEdgeWithIdUnchecked(core.EdgeId.fromInt(parsed.id), core.NodeId.fromInt(parsed.src), parsed.rel, core.NodeId.fromInt(parsed.dst)) catch |err| switch (err) {
                     core.Error.InvalidId, core.Error.NotFound => return error.InvalidRecord,
@@ -26987,6 +30554,36 @@ fn binaryNodeBatchPayloadLen(node_count: usize, compact_dense_uniform: bool, sho
     const payload_len = std.math.add(usize, header_len, body_len) catch return error.RecordTooLarge;
     if (payload_len > BinaryRecordHeader.max_payload_len) return error.RecordTooLarge;
     return @intCast(payload_len);
+}
+
+fn binaryNodeBatchCountFromPrefix(prefix: []const u8, payload_len: u32) !u32 {
+    if (prefix.len < binary_node_batch_base_header_len) return error.InvalidRecord;
+    const count = readU32(prefix[0..4]);
+    if (count == 0 or count > binary_node_batch_max_count) return error.InvalidRecord;
+    const flags = readU16(prefix[4..6]);
+    var header_len: usize = binary_node_batch_base_header_len;
+    var row_len: usize = binary_node_payload_len;
+    if (flags == 0) {
+        // Full rows carry id and kind per node.
+    } else if ((flags & ~binary_node_batch_known_flags) == 0 and (flags & binary_node_batch_compact_flags) == binary_node_batch_compact_flags) {
+        if (prefix.len < binary_node_batch_compact_header_len) return error.InvalidRecord;
+        _ = nodeKindFromInt(readU16(prefix[6..8])) orelse return error.InvalidRecord;
+        const base_id = readU64(prefix[8..16]);
+        if (base_id == 0 or base_id == std.math.maxInt(u64)) return error.InvalidRecord;
+        const last_id = std.math.add(u64, base_id, @as(u64, count) - 1) catch return error.InvalidRecord;
+        if (last_id == std.math.maxInt(u64)) return error.InvalidRecord;
+        const short_text_len = (flags & binary_node_batch_flag_short_text_len) != 0;
+        const derived_text_offset = (flags & binary_node_batch_flag_derived_text_offset) != 0;
+        header_len = binary_node_batch_compact_header_len + if (derived_text_offset) binary_node_batch_derived_text_offset_header_extra_len else 0;
+        if (prefix.len < header_len) return error.InvalidRecord;
+        row_len = binaryNodeBatchCompactRowLen(short_text_len, derived_text_offset);
+    } else {
+        return error.InvalidRecord;
+    }
+    const body_len = std.math.mul(usize, @intCast(count), row_len) catch return error.InvalidRecord;
+    const expected_len = std.math.add(usize, header_len, body_len) catch return error.InvalidRecord;
+    if (expected_len != payload_len) return error.InvalidRecord;
+    return count;
 }
 
 fn validateBinaryNodeBatchHeader(payload: []const u8) !ParsedBinaryNodeBatch {
@@ -27516,6 +31113,10 @@ test "safe durability is the default" {
     try std.testing.expectEqual(DurabilityMode.safe, manifest.options.durability);
 }
 
+test "manifest process leases recognize the current process" {
+    try std.testing.expect(processIdIsAlive(currentProcessIdForTempPath()));
+}
+
 test "durability mode controls fsync policy" {
     var index_meta_cache = IndexMetaCache{};
     var node_text_delta_header_cache = NodeTextDeltaHeaderCache{};
@@ -27542,6 +31143,7 @@ test "durability mode controls fsync policy" {
         .edge_props_overlay_values_path = "edge_props_overlay.values",
         .property_payload_index_path = "property_payload.idx",
         .property_payload_values_path = "property_payload.values",
+        .property_payload_delta_path = "property_payload.delta",
         .edge_external_key_index_path = "edge_external_keys.idx",
         .node_text_run_manifest_path = "node_text_runs.manifest",
         .node_text_run_current_path = "node_text_runs.current",
@@ -28534,6 +32136,7 @@ test "store appends and replays graph events" {
     defer loaded.deinit();
     try std.testing.expectEqual(@as(usize, 2), loaded.nodes.items.len);
     try std.testing.expectEqual(@as(usize, 1), loaded.edges.items.len);
+    try std.testing.expectError(core.Error.BudgetExceeded, store.loadGraphDeadline(.immediate));
 
     const stats_out = try store.stats();
     try std.testing.expectEqual(@as(usize, 2), stats_out.nodes);
@@ -29880,6 +33483,46 @@ test "store compacts non-prefix node text L0 run window within record budget" {
     try std.testing.expect(try store.nodeIndexValid(8));
 }
 
+test "store node text compaction preserves published run when meta update fails" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .durability = .fast,
+        .validate_indexes_on_read = true,
+    });
+    defer store.deinit();
+    try store.createEmpty();
+
+    try store.appendNode(.{ .id = .fromInt(100), .kind = .repo, .text = "base" });
+    try store.appendNodesBatch(&.{
+        .{ .id = .fromInt(10), .kind = .task, .text = "run-a-1" },
+        .{ .id = .fromInt(20), .kind = .file, .text = "run-a-2" },
+    });
+    try store.appendNodesBatch(&.{
+        .{ .id = .fromInt(30), .kind = .function, .text = "run-b-1" },
+        .{ .id = .fromInt(40), .kind = .document, .text = "run-b-2" },
+    });
+
+    const meta_tmp_path = try store.tmpPathFor(store.index_meta_path);
+    defer std.testing.allocator.free(meta_tmp_path);
+    try std.Io.Dir.cwd().createDir(std.testing.io, meta_tmp_path, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, meta_tmp_path) catch {};
+
+    try std.testing.expectError(error.IsDir, store.compactNodeTextRunsBudgeted(4));
+
+    var manifest = try store.readNodeTextRunManifest(std.testing.allocator);
+    defer manifest.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), manifest.entries.items.len);
+    try std.testing.expect(try store.pathExists(manifest.entries.items[0].path));
+}
+
 test "store garbage collects unreferenced node text runs and stale manifest epochs" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -30214,6 +33857,64 @@ test "store batch node append repairs unordered text index with valid digest" {
     try std.testing.expectEqual(@as(u64, 3), matches.items[0].id.toInt());
 }
 
+test "store node text manifest publication ignores superseded epoch cleanup failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .durability = .fast,
+        .validate_indexes_on_read = true,
+    });
+    defer store.deinit();
+    try store.createEmpty();
+
+    const first_entry = NodeTextRunManifestEntry{
+        .node_count = 1,
+        .node_digest = 11,
+        .order_digest = 12,
+        .min_node_id = 1,
+        .max_node_id = 1,
+        .min_hash = 21,
+        .max_hash = 21,
+        .path = "run-a",
+    };
+    try store.writeNodeTextRunManifestEntries(&.{first_entry});
+    const first_epoch_path = (try store.readNodeTextRunCurrentPath(std.testing.allocator)).?;
+    defer std.testing.allocator.free(first_epoch_path);
+
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, first_epoch_path);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, first_epoch_path);
+
+    const second_entry = NodeTextRunManifestEntry{
+        .node_count = 1,
+        .node_digest = 31,
+        .order_digest = 32,
+        .min_node_id = 2,
+        .max_node_id = 2,
+        .min_hash = 41,
+        .max_hash = 41,
+        .path = "run-b",
+    };
+    try store.writeNodeTextRunManifestEntries(&.{second_entry});
+
+    const current_epoch_path = (try store.readNodeTextRunCurrentPath(std.testing.allocator)).?;
+    defer std.testing.allocator.free(current_epoch_path);
+    try std.testing.expect(!std.mem.eql(u8, first_epoch_path, current_epoch_path));
+    try std.testing.expect(try store.pathExists(current_epoch_path));
+    try std.testing.expect(try store.pathExists(first_epoch_path));
+
+    var manifest = try store.readNodeTextRunManifest(std.testing.allocator);
+    defer manifest.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), manifest.entries.items.len);
+    try std.testing.expectEqualStrings("run-b", manifest.entries.items[0].path);
+}
+
 test "store batch node append validates whole batch before mutating event log" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -30483,8 +34184,10 @@ test "store createEmpty repairs trailing garbage in node texts file" {
     const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
     defer std.testing.allocator.free(store_path);
 
-    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
-    store.options.validate_indexes_on_read = true;
+    var store = try Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .primary_text_write_mode = .bulk_ingest,
+        .validate_indexes_on_read = true,
+    });
     defer store.deinit();
     try store.createEmpty();
     try store.appendNode(.{ .id = .fromInt(1), .kind = .file, .text = "src/main.zig" });
@@ -30508,7 +34211,7 @@ test "store createEmpty repairs trailing garbage in node texts file" {
         matches.deinit(std.testing.allocator);
     }
     try std.testing.expectEqual(@as(usize, 1), matches.items.len);
-    try std.testing.expectEqual(@as(u64, "src/main.zig".len), try store.fileSizeOrZero(store.node_texts_path));
+    try std.testing.expectEqual(@as(u64, "src/main.zig".len), try store.nodeTextsLogicalSize());
 }
 
 fn makeCompressibleNodeTextForTest(allocator: std.mem.Allocator, id: u64) ![]u8 {
@@ -30563,14 +34266,6 @@ test "store appends to compressed node texts without expanding primary text" {
     try store.appendNodesBatch(nodes.items);
     const raw_size = try store.nodeTextsLogicalSize();
     try std.testing.expect(raw_size > Store.node_texts_block_deflate_block_bytes);
-
-    {
-        var texts = try Store.NodeTextsView.open(store);
-        defer texts.deinit();
-        try std.testing.expectEqual(Store.NodeTextsStorageFormat.raw, texts.format);
-        try std.testing.expectEqual(raw_size, texts.size);
-    }
-    try store.compressNodeTextsFileIfSmaller();
 
     {
         var texts = try Store.NodeTextsView.open(store);
@@ -30660,6 +34355,645 @@ test "store appends to compressed node texts without expanding primary text" {
     }
     try std.testing.expectEqual(@as(usize, 1), batch_matches.items.len);
     try std.testing.expectEqual(@as(u64, 1002), batch_matches.items[0].id.toInt());
+}
+
+test "normal safe node text append rewrites only the mutable tail" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+
+    var generated = std.ArrayList([]u8).empty;
+    defer {
+        for (generated.items) |text| std.testing.allocator.free(text);
+        generated.deinit(std.testing.allocator);
+    }
+    var nodes = std.ArrayList(graph_mod.Node).empty;
+    defer nodes.deinit(std.testing.allocator);
+    var id: u64 = 1;
+    while (id <= 96) : (id += 1) {
+        const text = try makeCompressibleNodeTextForTest(std.testing.allocator, id);
+        try generated.append(std.testing.allocator, text);
+        try nodes.append(std.testing.allocator, .{ .id = .fromInt(id), .kind = .document, .text = text });
+    }
+    try store.appendNodesBatch(nodes.items);
+
+    var before = try Store.NodeTextsView.open(store);
+    const before_block_count = before.blocks.len;
+    const first_entry = before.blocks[0];
+    const first_payload = try std.testing.allocator.alloc(u8, first_entry.stored_len);
+    defer std.testing.allocator.free(first_payload);
+    const first_n = try before.file.readPositionalAll(std.testing.io, first_payload, first_entry.physical_offset);
+    try std.testing.expectEqual(first_payload.len, first_n);
+    before.deinit();
+
+    const appended = try makeCompressibleNodeTextForTest(std.testing.allocator, 1000);
+    defer std.testing.allocator.free(appended);
+    try store.appendNode(.{ .id = .fromInt(1000), .kind = .document, .text = appended });
+
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try store.nodeTextsAppendJournalPath(&journal_path_buffer);
+    try std.testing.expect(!try store.fileExists(journal_path));
+
+    var after = try Store.NodeTextsView.open(store);
+    defer after.deinit();
+    try std.testing.expect(after.blocks.len >= before_block_count);
+    try std.testing.expectEqual(first_entry.physical_offset, after.blocks[0].physical_offset);
+    try std.testing.expectEqual(first_entry.stored_len, after.blocks[0].stored_len);
+    const first_payload_after = try std.testing.allocator.alloc(u8, after.blocks[0].stored_len);
+    defer std.testing.allocator.free(first_payload_after);
+    const after_n = try after.file.readPositionalAll(std.testing.io, first_payload_after, after.blocks[0].physical_offset);
+    try std.testing.expectEqual(first_payload_after.len, after_n);
+    try std.testing.expectEqualSlices(u8, first_payload, first_payload_after);
+}
+
+test "bounded node event count handles single and compact batch records" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNodesBatch(&.{
+        .{ .id = .fromInt(1), .kind = .task, .text = "a" },
+        .{ .id = .fromInt(2), .kind = .task, .text = "b" },
+        .{ .id = .fromInt(3), .kind = .task, .text = "c" },
+    });
+    try store.appendEdge(.{ .id = .fromInt(1), .src = .fromInt(1), .rel = .contains, .dst = .fromInt(2) });
+    try store.appendNode(.{ .id = .fromInt(4), .kind = .task, .text = "d" });
+
+    try std.testing.expectEqual(@as(u64, 4), try store.nodeEventCountUpTo(10));
+    try std.testing.expectEqual(@as(u64, 3), try store.nodeEventCountUpTo(2));
+}
+
+test "safe node text append journal restores interrupted tail mutation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    const text = try makeCompressibleNodeTextForTest(std.testing.allocator, 1);
+    defer std.testing.allocator.free(text);
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .document, .text = text });
+
+    var view = try Store.NodeTextsView.open(store);
+    const last = view.blocks[view.blocks.len - 1];
+    const suffix_offset = if (last.raw_len < Store.node_texts_block_deflate_block_bytes)
+        last.physical_offset
+    else
+        last.physical_offset + last.stored_len;
+    try store.writeNodeTextsAppendJournal(&view, suffix_offset);
+    view.deinit();
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, store.node_texts_path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.setLength(std.testing.io, suffix_offset);
+        try file.writePositionalAll(std.testing.io, "interrupted-tail", suffix_offset);
+        try file.sync(std.testing.io);
+    }
+
+    var restored = (try store.readNodeById(std.testing.allocator, .fromInt(1))).?;
+    defer restored.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(text, restored.text);
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try store.nodeTextsAppendJournalPath(&journal_path_buffer);
+    try std.testing.expect(!try store.fileExists(journal_path));
+}
+
+test "committed node text append journal remains until canonical reconciliation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    const text = try makeCompressibleNodeTextForTest(std.testing.allocator, 1);
+    defer std.testing.allocator.free(text);
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .document, .text = text });
+
+    var view = try Store.NodeTextsView.open(store);
+    const original_logical_size = view.size;
+    const last = view.blocks[view.blocks.len - 1];
+    const suffix_offset = if (last.raw_len < Store.node_texts_block_deflate_block_bytes)
+        last.physical_offset
+    else
+        last.physical_offset + last.stored_len;
+    try store.writeNodeTextsAppendJournal(&view, suffix_offset);
+    const appended = "durable committed tail";
+    try store.mutateCompressedNodeTextSlicesInPlace(&view, &.{appended}, appended.len);
+    view.deinit();
+    try store.markNodeTextsAppendJournalCommitted();
+
+    try std.testing.expectEqual(Store.NodeTextsAppendRecovery.committed, try store.recoverNodeTextsAppendJournal());
+    var reopened = try Store.NodeTextsView.open(store);
+    defer reopened.deinit();
+    try std.testing.expectEqual(original_logical_size + appended.len, reopened.size);
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try store.nodeTextsAppendJournalPath(&journal_path_buffer);
+    try std.testing.expect(try store.fileExists(journal_path));
+    store.cleanupCommittedNodeTextsAppendJournal();
+    try std.testing.expect(!try store.fileExists(journal_path));
+}
+
+test "store reopen removes committed raw text tail absent from event log" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    {
+        var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+        defer store.deinit();
+        try store.createEmpty();
+        const span = try store.appendNodeTextBytes("raw text without a canonical node event");
+        try std.testing.expectEqual(@as(u64, 0), span.offset);
+        var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const journal_path = try store.nodeTextsAppendJournalPath(&journal_path_buffer);
+        try std.testing.expect(try store.fileExists(journal_path));
+    }
+
+    var reopened = try Store.open(std.testing.allocator, std.testing.io, store_path);
+    defer reopened.deinit();
+    try std.testing.expectEqual(@as(u64, 0), try reopened.nodeTextsLogicalSize());
+    const stats_out = try reopened.stats();
+    try std.testing.expectEqual(@as(usize, 0), stats_out.nodes);
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try reopened.nodeTextsAppendJournalPath(&journal_path_buffer);
+    try std.testing.expect(!try reopened.fileExists(journal_path));
+}
+
+test "same process node append reconciles committed orphan text before overwriting journal" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+
+    const orphan_text = "durable text without a canonical event";
+    _ = try store.appendNodeTextBytes(orphan_text);
+    try std.testing.expectEqual(@as(u64, orphan_text.len), try store.nodeTextsLogicalSize());
+
+    const canonical_text = "first canonical node";
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .document, .text = canonical_text });
+
+    try std.testing.expectEqual(@as(u64, canonical_text.len), try store.nodeTextsLogicalSize());
+    var node = (try store.readNodeById(std.testing.allocator, .fromInt(1))).?;
+    defer node.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(canonical_text, node.text);
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try store.nodeTextsAppendJournalPath(&journal_path_buffer);
+    try std.testing.expect(!try store.fileExists(journal_path));
+}
+
+test "node append failure rollback removes text after journal cleanup" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .document, .text = "existing" });
+
+    const rollback_event_bytes = try store.eventBytes();
+    const appended = [_]graph_mod.Node{.{ .id = .fromInt(2), .kind = .document, .text = "rolled back" }};
+    const spans = try store.appendNodeTextsBatch(&appended);
+    defer std.testing.allocator.free(spans);
+    try store.appendNodeBatchRecords(&appended, spans, rollback_event_bytes);
+    store.cleanupCommittedNodeTextsAppendJournal();
+
+    store.rollbackNodeAppendFailure(rollback_event_bytes, true);
+
+    try std.testing.expectEqual(rollback_event_bytes, try store.eventBytes());
+    try std.testing.expectEqual(@as(u64, "existing".len), try store.nodeTextsLogicalSize());
+    try std.testing.expect((try store.readNodeById(std.testing.allocator, .fromInt(2))) == null);
+}
+
+test "node append rollback retains text journal when immediate repair fails" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    const existing_text = "existing canonical text";
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .document, .text = existing_text });
+
+    const rollback_event_bytes = try store.eventBytes();
+    const retry_text = "retry after failed index publication";
+    const retry_node: graph_mod.Node = .{ .id = .fromInt(2), .kind = .document, .text = retry_text };
+    const retry_span = try store.appendNodeTextBytes(retry_text);
+    try store.appendNodeRecord(retry_node, retry_span);
+
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try store.nodeTextsAppendJournalPath(&journal_path_buffer);
+    try std.testing.expect(try store.fileExists(journal_path));
+
+    // Make the immediate best-effort index rebuild fail after events.bin has
+    // been rolled back. The committed journal must remain so the next append
+    // can reconcile the orphan text before reusing the fixed journal path.
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, store.node_by_id_path);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, store.node_by_id_path);
+    store.rollbackNodeAppendFailure(rollback_event_bytes, true);
+    try std.testing.expectEqual(rollback_event_bytes, try store.eventBytes());
+    try std.testing.expect(try store.fileExists(journal_path));
+
+    try std.Io.Dir.cwd().deleteTree(std.testing.io, store.node_by_id_path);
+    try store.appendNode(retry_node);
+
+    try std.testing.expect(!try store.fileExists(journal_path));
+    try std.testing.expectEqual(@as(u64, existing_text.len + retry_text.len), try store.nodeTextsLogicalSize());
+    var restored = (try store.readNodeById(std.testing.allocator, retry_node.id)).?;
+    defer restored.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(retry_text, restored.text);
+}
+
+test "node append clears raw and compressed text journals after event commit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try store.nodeTextsAppendJournalPath(&journal_path_buffer);
+
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .document, .text = "first raw append" });
+    try std.testing.expect(!try store.fileExists(journal_path));
+    try store.appendNode(.{ .id = .fromInt(2), .kind = .document, .text = "second compressed append" });
+    try std.testing.expect(!try store.fileExists(journal_path));
+}
+
+test "store reopen removes committed node text tail absent from event log" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    const original_text = try makeCompressibleNodeTextForTest(std.testing.allocator, 1);
+    defer std.testing.allocator.free(original_text);
+    const orphan_text = "durable text without a canonical node event";
+    var original_logical_size: u64 = 0;
+    {
+        var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+        defer store.deinit();
+        try store.createEmpty();
+        try store.appendNode(.{ .id = .fromInt(1), .kind = .document, .text = original_text });
+
+        original_logical_size = try store.nodeTextsLogicalSize();
+        const orphan_span = try store.appendNodeTextBytes(orphan_text);
+        try std.testing.expectEqual(original_logical_size, orphan_span.offset);
+
+        var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const journal_path = try store.nodeTextsAppendJournalPath(&journal_path_buffer);
+        try std.testing.expect(try store.fileExists(journal_path));
+    }
+
+    var reopened = try Store.open(std.testing.allocator, std.testing.io, store_path);
+    defer reopened.deinit();
+    try std.testing.expectEqual(original_logical_size, try reopened.nodeTextsLogicalSize());
+    var node = (try reopened.readNodeById(std.testing.allocator, .fromInt(1))).?;
+    defer node.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(original_text, node.text);
+    try std.testing.expect((try reopened.readNodeById(std.testing.allocator, .fromInt(2))) == null);
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try reopened.nodeTextsAppendJournalPath(&journal_path_buffer);
+    try std.testing.expect(!try reopened.fileExists(journal_path));
+}
+
+test "store reopen preserves committed node text tail referenced by event log" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    const original_text = try makeCompressibleNodeTextForTest(std.testing.allocator, 1);
+    defer std.testing.allocator.free(original_text);
+    const committed_text = "durable text with a canonical node event";
+    var expected_logical_size: u64 = 0;
+    {
+        var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+        defer store.deinit();
+        try store.createEmpty();
+        try store.appendNode(.{ .id = .fromInt(1), .kind = .document, .text = original_text });
+
+        const original_logical_size = try store.nodeTextsLogicalSize();
+        const committed_span = try store.appendNodeTextBytes(committed_text);
+        try std.testing.expectEqual(original_logical_size, committed_span.offset);
+        expected_logical_size = original_logical_size + committed_text.len;
+
+        const committed_node = graph_mod.Node{ .id = .fromInt(2), .kind = .document, .text = committed_text };
+        try store.appendNodeRecord(committed_node, committed_span);
+    }
+
+    var reopened = try Store.open(std.testing.allocator, std.testing.io, store_path);
+    defer reopened.deinit();
+    try std.testing.expectEqual(expected_logical_size, try reopened.nodeTextsLogicalSize());
+    var node = (try reopened.readNodeById(std.testing.allocator, .fromInt(2))).?;
+    defer node.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(committed_text, node.text);
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try reopened.nodeTextsAppendJournalPath(&journal_path_buffer);
+    try std.testing.expect(!try reopened.fileExists(journal_path));
+}
+
+test "safe node text append journal corruption fails closed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .document, .text = "compressed primary text" });
+
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try store.nodeTextsAppendJournalPath(&journal_path_buffer);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = journal_path, .data = "", .flags = .{ .truncate = true } });
+    try std.testing.expectError(error.InvalidRecord, Store.NodeTextsView.open(store));
+    try std.testing.expectError(error.InvalidRecord, store.readNodeById(std.testing.allocator, .fromInt(1)));
+    try std.testing.expectEqual(.file, (try std.Io.Dir.cwd().statFile(std.testing.io, journal_path, .{})).kind);
+}
+
+test "node text append journal commit marker is checksummed" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .document, .text = "checksummed append journal" });
+
+    var view = try Store.NodeTextsView.open(store);
+    const last = view.blocks[view.blocks.len - 1];
+    const suffix_offset = if (last.raw_len < Store.node_texts_block_deflate_block_bytes)
+        last.physical_offset
+    else
+        last.physical_offset + last.stored_len;
+    try store.writeNodeTextsAppendJournal(&view, suffix_offset);
+    view.deinit();
+
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try store.nodeTextsAppendJournalPath(&journal_path_buffer);
+    var journal = try std.Io.Dir.cwd().openFile(std.testing.io, journal_path, .{ .mode = .read_write });
+    try journal.writePositionalAll(std.testing.io, &.{1}, 56);
+    journal.close(std.testing.io);
+    try std.testing.expectError(error.InvalidRecord, store.recoverNodeTextsAppendJournal());
+    try std.testing.expect(try store.fileExists(journal_path));
+}
+
+test "node text recovery accepts checksummed v2 append journal" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    const text = try makeCompressibleNodeTextForTest(std.testing.allocator, 1);
+    defer std.testing.allocator.free(text);
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .document, .text = text });
+
+    var view = try Store.NodeTextsView.open(store);
+    const last = view.blocks[view.blocks.len - 1];
+    const suffix_offset = if (last.raw_len < Store.node_texts_block_deflate_block_bytes)
+        last.physical_offset
+    else
+        last.physical_offset + last.stored_len;
+    try store.writeNodeTextsAppendJournal(&view, suffix_offset);
+    view.deinit();
+
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try store.nodeTextsAppendJournalPath(&journal_path_buffer);
+    {
+        var journal = try std.Io.Dir.cwd().openFile(std.testing.io, journal_path, .{ .mode = .read_write });
+        defer journal.close(std.testing.io);
+        var header: [Store.node_texts_append_journal_header_len]u8 = undefined;
+        const n = try journal.readPositionalAll(std.testing.io, &header, 0);
+        try std.testing.expectEqual(header.len, n);
+        writeU16(header[4..6], Store.node_texts_append_journal_checksummed_version);
+        var digest_bytes: [8]u8 = undefined;
+        writeU64(&digest_bytes, std.hash.Wyhash.hash(Store.node_texts_append_journal_header_hash_seed, header[0..57]));
+        @memcpy(header[57..64], digest_bytes[0..7]);
+        try journal.writePositionalAll(std.testing.io, &header, 0);
+        try journal.sync(std.testing.io);
+    }
+    {
+        var texts_file = try std.Io.Dir.cwd().openFile(std.testing.io, store.node_texts_path, .{ .mode = .read_write });
+        defer texts_file.close(std.testing.io);
+        try texts_file.setLength(std.testing.io, suffix_offset);
+        try texts_file.writePositionalAll(std.testing.io, "interrupted-v2-tail", suffix_offset);
+        try texts_file.sync(std.testing.io);
+    }
+
+    try std.testing.expectEqual(Store.NodeTextsAppendRecovery.rolled_back, try store.recoverNodeTextsAppendJournal());
+    var restored = (try store.readNodeById(std.testing.allocator, .fromInt(1))).?;
+    defer restored.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings(text, restored.text);
+}
+
+test "primary text finalize resumes validated full block checkpoint" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .primary_text_write_mode = .bulk_ingest,
+    });
+    defer store.deinit();
+    try store.createEmpty();
+
+    var generated = std.ArrayList([]u8).empty;
+    defer {
+        for (generated.items) |text| std.testing.allocator.free(text);
+        generated.deinit(std.testing.allocator);
+    }
+    var nodes = std.ArrayList(graph_mod.Node).empty;
+    defer nodes.deinit(std.testing.allocator);
+    var id: u64 = 1;
+    while (id <= 96) : (id += 1) {
+        const text = try makeCompressibleNodeTextForTest(std.testing.allocator, id);
+        try generated.append(std.testing.allocator, text);
+        try nodes.append(std.testing.allocator, .{ .id = .fromInt(id), .kind = .document, .text = text });
+    }
+    try store.appendNodesBatch(nodes.items);
+    try std.testing.expect((try store.fileSizeOrZero(store.node_texts_path)) > Store.node_texts_block_deflate_block_bytes * 2);
+
+    const raw = try std.testing.allocator.alloc(u8, Store.node_texts_block_deflate_block_bytes);
+    defer std.testing.allocator.free(raw);
+    var raw_file = try std.Io.Dir.cwd().openFile(std.testing.io, store.node_texts_path, .{});
+    defer raw_file.close(std.testing.io);
+    const raw_n = try raw_file.readPositionalAll(std.testing.io, raw, 0);
+    try std.testing.expectEqual(raw.len, raw_n);
+    const compressed = try std.testing.allocator.alloc(u8, Store.node_texts_block_deflate_block_bytes * 2 + 1024);
+    defer std.testing.allocator.free(compressed);
+    const flate_buffer = try std.testing.allocator.alloc(u8, std.compress.flate.max_window_len);
+    defer std.testing.allocator.free(flate_buffer);
+    const compressed_len = Store.deflateNodeTextsBlock(raw, compressed, flate_buffer);
+    const stored = if (compressed_len < raw.len) compressed[0..compressed_len] else raw;
+
+    const tmp_path = try std.fmt.allocPrint(std.testing.allocator, "{s}.deflate.tmp", .{store.node_texts_path});
+    defer std.testing.allocator.free(tmp_path);
+    const table_path = try std.fmt.allocPrint(std.testing.allocator, "{s}.deflate.table.tmp", .{store.node_texts_path});
+    defer std.testing.allocator.free(table_path);
+    {
+        var output = try std.Io.Dir.cwd().createFile(std.testing.io, tmp_path, .{ .read = true, .truncate = true });
+        defer output.close(std.testing.io);
+        try output.setLength(std.testing.io, Store.node_texts_block_deflate_header_len);
+        try output.writePositionalAll(std.testing.io, stored, Store.node_texts_block_deflate_header_len);
+        try output.sync(std.testing.io);
+    }
+    {
+        var progress: [Store.node_texts_deflate_progress_entry_len]u8 = undefined;
+        writeU32(progress[0..4], @intCast(stored.len));
+        writeU64(progress[4..12], std.hash.Wyhash.hash(Store.node_texts_deflate_progress_hash_seed, raw));
+        writeU64(progress[12..20], std.hash.Wyhash.hash(Store.node_texts_deflate_progress_hash_seed, stored));
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = table_path, .data = &progress, .flags = .{ .truncate = true } });
+    }
+
+    try store.finalizePrimaryTextStorage();
+    try std.testing.expect(!try store.fileExists(tmp_path));
+    try std.testing.expect(!try store.fileExists(table_path));
+    var view = try Store.NodeTextsView.open(store);
+    defer view.deinit();
+    try std.testing.expectEqual(Store.NodeTextsStorageFormat.block_deflate, view.format);
+    const persisted_prefix = try std.testing.allocator.alloc(u8, stored.len);
+    defer std.testing.allocator.free(persisted_prefix);
+    const persisted_n = try view.file.readPositionalAll(std.testing.io, persisted_prefix, Store.node_texts_block_deflate_header_len);
+    try std.testing.expectEqual(persisted_prefix.len, persisted_n);
+    try std.testing.expectEqualSlices(u8, stored, persisted_prefix);
+}
+
+test "normal append leaves legacy raw primary text pending for maintenance" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .primary_text_write_mode = .bulk_ingest,
+    });
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .file, .text = "legacy raw" });
+    store.options.primary_text_write_mode = .normal;
+    try store.appendNode(.{ .id = .fromInt(2), .kind = .file, .text = "foreground append" });
+    {
+        var raw_view = try Store.NodeTextsView.open(store);
+        defer raw_view.deinit();
+        try std.testing.expectEqual(Store.NodeTextsStorageFormat.raw, raw_view.format);
+    }
+    try store.finalizePrimaryTextStorage();
+    var finalized = try Store.NodeTextsView.open(store);
+    defer finalized.deinit();
+    try std.testing.expectEqual(Store.NodeTextsStorageFormat.block_deflate, finalized.format);
+}
+
+test "compress if smaller preserves raw data while finalize always enters append friendly format" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .primary_text_write_mode = .bulk_ingest,
+    });
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .document, .text = "x" });
+
+    const compression = try store.compressNodeTextsFileIfSmallerWithResult();
+    try std.testing.expect(!compression.compressed);
+    try std.testing.expectEqual(@as(u64, 1), compression.before_bytes);
+    try std.testing.expectEqual(@as(u64, 1), compression.after_bytes);
+    {
+        var raw = try Store.NodeTextsView.open(store);
+        defer raw.deinit();
+        try std.testing.expectEqual(Store.NodeTextsStorageFormat.raw, raw.format);
+    }
+
+    const finalized = try store.finalizePrimaryTextStorageWithResult();
+    try std.testing.expect(finalized.compressed);
+    try std.testing.expect(finalized.after_bytes > finalized.before_bytes);
+    var append_friendly = try Store.NodeTextsView.open(store);
+    defer append_friendly.deinit();
+    try std.testing.expectEqual(Store.NodeTextsStorageFormat.block_deflate, append_friendly.format);
+    try std.testing.expectEqual(@as(u64, 1), append_friendly.size);
 }
 
 test "store node record iterator borrows compressed single-block texts" {
@@ -30771,6 +35105,7 @@ test "store treats raw node texts with compression magic prefix as raw" {
 
     var store = try Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
         .durability = .fast,
+        .primary_text_write_mode = .bulk_ingest,
         .validate_indexes_on_read = true,
     });
     defer store.deinit();
@@ -30800,8 +35135,10 @@ test "store fast read option skips full node index validation" {
     const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
     defer std.testing.allocator.free(store_path);
 
-    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
-    store.options.validate_indexes_on_read = false;
+    var store = try Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .primary_text_write_mode = .bulk_ingest,
+        .validate_indexes_on_read = false,
+    });
     defer store.deinit();
     try store.createEmpty();
     try store.appendNode(.{ .id = .fromInt(1), .kind = .file, .text = "src/main.zig" });
@@ -30978,7 +35315,9 @@ test "store node record iterator streams borrowed refs without materializing tex
     const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
     defer std.testing.allocator.free(store_path);
 
-    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    var store = try Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .primary_text_write_mode = .bulk_ingest,
+    });
     defer store.deinit();
     try store.createEmpty();
     try store.appendNode(.{ .id = .fromInt(1), .kind = .file, .text = "a.zig" });
@@ -31016,7 +35355,9 @@ test "store node record view matches name without materializing node" {
     const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
     defer std.testing.allocator.free(store_path);
 
-    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    var store = try Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .primary_text_write_mode = .bulk_ingest,
+    });
     defer store.deinit();
     try store.createEmpty();
     try store.appendNode(.{ .id = .fromInt(1), .kind = .file, .text = "src/main.zig" });
@@ -31423,7 +35764,7 @@ test "store repairs indexes after committed node append index maintenance failur
         .flags = .{ .truncate = true },
     });
 
-    try store.refreshIndexesAfterCommittedAppend(.node, committed_node, null, committed_span);
+    try std.testing.expect(store.refreshIndexesAfterCommittedAppend(.node, committed_node, null, committed_span));
     var loaded = (try store.readNodeById(std.testing.allocator, committed_node.id)).?;
     defer loaded.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(committed_node.text, loaded.text);
@@ -31457,7 +35798,7 @@ test "store repairs corrupt node by id index after committed node append" {
         .flags = .{ .truncate = true },
     });
 
-    try store.refreshIndexesAfterCommittedAppend(.node, committed_node, null, committed_span);
+    try std.testing.expect(store.refreshIndexesAfterCommittedAppend(.node, committed_node, null, committed_span));
     var first = (try store.readNodeById(std.testing.allocator, .fromInt(1))).?;
     defer first.deinit(std.testing.allocator);
     var second = (try store.readNodeById(std.testing.allocator, .fromInt(2))).?;
@@ -31490,9 +35831,14 @@ test "store does not report post-commit index repair OOM as append failure" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var failing_store = store;
     failing_store.allocator = failing.allocator();
-    try failing_store.refreshIndexesAfterCommittedAppend(.node, committed_node, null, committed_span);
+    try std.testing.expect(!failing_store.refreshIndexesAfterCommittedAppend(.node, committed_node, null, committed_span));
+
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try store.nodeTextsAppendJournalPath(&journal_path_buffer);
+    try std.testing.expect(try store.fileExists(journal_path));
 
     try store.repairPersistentIndexesFromLog();
+    try std.testing.expect(!try store.fileExists(journal_path));
     var loaded = (try store.readNodeById(std.testing.allocator, committed_node.id)).?;
     defer loaded.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(committed_node.text, loaded.text);
@@ -31521,11 +35867,16 @@ test "store does not report post-commit index repair filesystem error as append 
 
     try std.Io.Dir.cwd().deleteFile(std.testing.io, store.node_by_id_path);
     try std.Io.Dir.cwd().createDirPath(std.testing.io, store.node_by_id_path);
-    try store.refreshIndexesAfterCommittedAppend(.node, committed_node, null, committed_span);
+    try std.testing.expect(!store.refreshIndexesAfterCommittedAppend(.node, committed_node, null, committed_span));
     try std.testing.expectError(error.InvalidRecord, store.readNodeById(std.testing.allocator, committed_node.id));
+
+    var journal_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const journal_path = try store.nodeTextsAppendJournalPath(&journal_path_buffer);
+    try std.testing.expect(try store.fileExists(journal_path));
 
     try std.Io.Dir.cwd().deleteDir(std.testing.io, store.node_by_id_path);
     try store.repairPersistentIndexesFromLog();
+    try std.testing.expect(!try store.fileExists(journal_path));
     var loaded = (try store.readNodeById(std.testing.allocator, committed_node.id)).?;
     defer loaded.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(committed_node.text, loaded.text);
@@ -31566,7 +35917,7 @@ test "store repairs indexes after committed edge append index maintenance failur
         .flags = .{ .truncate = true },
     });
 
-    try store.refreshIndexesAfterCommittedAppend(.edge, null, committed_edge, null);
+    try std.testing.expect(store.refreshIndexesAfterCommittedAppend(.edge, null, committed_edge, null));
     var edges = try store.readEdgeIndexRecordsByNode(std.testing.allocator, .src, committed_edge.src);
     defer edges.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), edges.items.len);
@@ -35141,6 +39492,42 @@ test "store publishes immutable edge adjacency segment from persistent indexes" 
     try std.testing.expectEqual(@as(u64, 3), reverse.items[0].src.toInt());
 }
 
+test "store edge segment publication preserves published data when meta update fails" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+    const segment_path = try std.fs.path.join(std.testing.allocator, &.{ store_path, "edge_segments", "fault-published" });
+    defer std.testing.allocator.free(segment_path);
+
+    var store = try Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .durability = .fast,
+        .validate_indexes_on_read = false,
+    });
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .file, .text = "a.zig" });
+    try store.appendNode(.{ .id = .fromInt(2), .kind = .function, .text = "main" });
+    try store.appendEdge(.{ .id = .fromInt(1), .src = .fromInt(1), .rel = .defines, .dst = .fromInt(2) });
+
+    const meta_tmp_path = try store.tmpPathFor(store.index_meta_path);
+    defer std.testing.allocator.free(meta_tmp_path);
+    try std.Io.Dir.cwd().createDir(std.testing.io, meta_tmp_path, .default_dir);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, meta_tmp_path) catch {};
+
+    try std.testing.expectError(error.IsDir, store.publishEdgeAdjacencySegment(segment_path));
+
+    var manifest = try store.readEdgeSegmentManifest(std.testing.allocator);
+    defer manifest.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), manifest.entries.items.len);
+    try std.testing.expectEqualStrings(segment_path, manifest.entries.items[0].path);
+    try std.testing.expect(try store.pathExists(segment_path));
+}
+
 test "store routes published edge neighbors across multi-segment manifest" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -35727,6 +40114,60 @@ test "repair drops stale edge segment overlay after base index catchup" {
     try std.testing.expect(!try store.pathExists(segment_path));
 }
 
+test "manifest process lease acquisition rejects a stale CURRENT candidate" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{ .durability = .fast });
+    defer store.deinit();
+    try store.createEmpty();
+
+    const kinds = [_]ManifestProcessLeaseKind{ .edge_segment, .node_text_run };
+    inline for (kinds) |kind| {
+        const old_leaf = switch (kind) {
+            .edge_segment => "edge-manifest-old",
+            .node_text_run => "node-text-manifest-old",
+        };
+        const current_leaf = switch (kind) {
+            .edge_segment => "edge-manifest-current",
+            .node_text_run => "node-text-manifest-current",
+        };
+        const old_path = try std.fs.path.join(std.testing.allocator, &.{ store_path, old_leaf });
+        defer std.testing.allocator.free(old_path);
+        const current_path = try std.fs.path.join(std.testing.allocator, &.{ store_path, current_leaf });
+        defer std.testing.allocator.free(current_path);
+        switch (kind) {
+            .edge_segment => {
+                try store.writeEdgeSegmentCurrent(old_path);
+            },
+            .node_text_run => {
+                try store.writeNodeTextRunCurrent(old_path);
+            },
+        }
+
+        const stale_candidate = (try store.currentManifestPathForProcessLease(std.testing.allocator, kind)).?;
+        switch (kind) {
+            .edge_segment => try store.writeEdgeSegmentCurrent(current_path),
+            .node_text_run => try store.writeNodeTextRunCurrent(current_path),
+        }
+        try std.testing.expect((try store.acquireManifestProcessLeaseCandidate(std.testing.allocator, kind, stale_candidate)) == null);
+
+        const stable_candidate = (try store.currentManifestPathForProcessLease(std.testing.allocator, kind)).?;
+        var acquired = (try store.acquireManifestProcessLeaseCandidate(std.testing.allocator, kind, stable_candidate)).?;
+        try std.testing.expectEqualStrings(current_path, acquired.manifest_path);
+        const lease_path = try std.testing.allocator.dupe(u8, acquired.process_lease.path);
+        defer std.testing.allocator.free(lease_path);
+        try std.testing.expect(try store.pathExists(lease_path));
+        acquired.deinit();
+        try std.testing.expect(!try store.pathExists(lease_path));
+    }
+}
+
 test "stale edge segment overlay cleanup preserves active reader lease" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -35774,6 +40215,8 @@ test "stale edge segment overlay cleanup preserves active reader lease" {
     var retention_registry = EdgeSegmentRetentionRegistry.init(std.testing.allocator);
     defer retention_registry.deinit();
     var pinned_window = try store.openRegisteredEdgeSegmentRetentionWindow(&retention_registry);
+    var pinned_window_live = true;
+    defer if (pinned_window_live) pinned_window.deinit();
 
     try store.repairPersistentIndexesFromLog();
     const repaired_meta = try store.readCurrentIndexMeta();
@@ -35783,9 +40226,81 @@ test "stale edge segment overlay cleanup preserves active reader lease" {
     try std.testing.expect(try store.pathExists(current_path));
 
     pinned_window.deinit();
+    pinned_window_live = false;
     try std.testing.expect(try store.dropRedundantEdgeSegmentOverlayAfterBaseIndexCatchup());
     try std.testing.expect(!try store.pathExists(store.edge_segment_current_path));
     try std.testing.expect(!try store.pathExists(current_path));
+}
+
+test "stale edge segment overlay cleanup tolerates live maps and gc scans without current" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .durability = .fast,
+        .validate_indexes_on_read = false,
+    });
+    defer store.deinit();
+    try store.createEmpty();
+
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .file, .text = "a.zig" });
+    try store.appendNode(.{ .id = .fromInt(2), .kind = .file, .text = "b.zig" });
+
+    var base_edges = std.ArrayList(graph_mod.Edge).empty;
+    defer base_edges.deinit(std.testing.allocator);
+    try base_edges.ensureTotalCapacity(std.testing.allocator, 1024);
+    var edge_id: u64 = 1;
+    while (edge_id <= 1024) : (edge_id += 1) {
+        base_edges.appendAssumeCapacity(.{
+            .id = .fromInt(edge_id),
+            .src = .fromInt(1),
+            .rel = .mentions,
+            .dst = .fromInt(2),
+        });
+    }
+    try store.appendEdgesBatch(base_edges.items);
+    try store.appendEdgesBatch(&.{
+        .{ .id = .fromInt(1025), .src = .fromInt(1), .rel = .mentions, .dst = .fromInt(2) },
+        .{ .id = .fromInt(1026), .src = .fromInt(1), .rel = .mentions, .dst = .fromInt(2) },
+    });
+
+    var manifest = try store.readEdgeSegmentManifest(std.testing.allocator);
+    const manifest_path = (try store.readEdgeSegmentCurrentPath(std.testing.allocator)).?;
+    defer std.testing.allocator.free(manifest_path);
+    const segment_path = try std.testing.allocator.dupe(u8, manifest.entries.items[0].path);
+    defer std.testing.allocator.free(segment_path);
+    manifest.deinit(std.testing.allocator);
+    try std.testing.expect(segment_path.len != 0);
+
+    // Deliberately omit a retention lease. The publisher may withdraw CURRENT
+    // once the base index catches up; an already-open view must remain usable
+    // whether the host unlinks immediately or defers cleanup until handles drain.
+    var opened = (try store.openPublishedEdgeSegmentsForQuery(std.testing.allocator)).?;
+    var opened_live = true;
+    defer if (opened_live) opened.deinit();
+    try std.testing.expect(opened.segments.segments.items.len > 0);
+    try store.repairPersistentIndexesFromLog();
+    try std.testing.expect(!try store.pathExists(store.edge_segment_current_path));
+    try std.testing.expectEqual(@as(u64, 1026), (try store.readCurrentIndexMeta()).edge_indexed_edges);
+    var retained_neighbors = try opened.segments.segments.items[0].neighbors(std.testing.allocator, .forward, .fromInt(1), .mentions, 3);
+    defer retained_neighbors.deinit(std.testing.allocator);
+    try std.testing.expect(retained_neighbors.items.len > 0);
+
+    opened.deinit();
+    opened_live = false;
+    const orphan_path = try std.fs.path.join(std.testing.allocator, &.{ store_path, "edge_segments", "orphan-after-current-withdrawal" });
+    defer std.testing.allocator.free(orphan_path);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, orphan_path);
+    const gc_result = try store.gcUnreferencedEdgeSegments();
+    try std.testing.expect(!try store.pathExists(segment_path));
+    try std.testing.expect(!try store.pathExists(orphan_path));
+    try std.testing.expect(!try store.pathExists(manifest_path));
+    try std.testing.expect(gc_result.deleted_segments > 0);
 }
 
 test "store checks edge id overlay through compacted sidecar without opening csr segment" {
@@ -36298,6 +40813,9 @@ test "edge segment manifest rejects unsafe relative segment paths" {
     defer manifest_file.close(std.testing.io);
     try manifest_file.writePositionalAll(std.testing.io, "../escape", EdgeSegmentManifest.header_len + EdgeSegmentManifest.entry_header_len + 8);
 
+    try std.testing.expectError(error.InvalidRecord, store.readEdgeSegmentManifestFile(std.testing.allocator, current_path));
+
+    try manifest_file.writePositionalAll(std.testing.io, "..\\escape", EdgeSegmentManifest.header_len + EdgeSegmentManifest.entry_header_len + 8);
     try std.testing.expectError(error.InvalidRecord, store.readEdgeSegmentManifestFile(std.testing.allocator, current_path));
 }
 
@@ -39369,6 +43887,84 @@ test "store soft deletes edge through tombstone and keeps repair consistent" {
     try std.testing.expectEqual(core.RecordStatus.active, graph.edges.items[1].status);
 }
 
+test "visible edge scan merges base delta tombstones and visible-full segments" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+    const full_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "full" });
+    defer std.testing.allocator.free(full_path);
+    const compacted_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "visible-full" });
+    defer std.testing.allocator.free(compacted_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNode(.{ .id = .fromInt(1), .kind = .file, .text = "owner" });
+    try store.appendNode(.{ .id = .fromInt(2), .kind = .function, .text = "base" });
+    try store.appendNode(.{ .id = .fromInt(3), .kind = .function, .text = "delta" });
+    try store.appendNode(.{ .id = .fromInt(4), .kind = .function, .text = "delta-two" });
+
+    var base_edges = std.ArrayList(graph_mod.Edge).empty;
+    defer base_edges.deinit(std.testing.allocator);
+    try base_edges.ensureTotalCapacity(std.testing.allocator, 1024);
+    for (1..1025) |raw_id| {
+        base_edges.appendAssumeCapacity(.{
+            .id = .fromInt(raw_id),
+            .src = .fromInt(1),
+            .rel = .mentions,
+            .dst = .fromInt(2),
+        });
+    }
+    try store.appendEdgesBatch(base_edges.items);
+    try store.appendEdgesBatch(&.{
+        .{ .id = .fromInt(1025), .src = .fromInt(1), .rel = .defines, .dst = .fromInt(3) },
+        .{ .id = .fromInt(1026), .src = .fromInt(1), .rel = .defines, .dst = .fromInt(4) },
+    });
+
+    const Collect = struct {
+        ids: *std.ArrayList(u64),
+        allocator: std.mem.Allocator,
+
+        fn visit(raw_context: *anyopaque, record: EdgeIndexRecord) anyerror!void {
+            const context: *@This() = @ptrCast(@alignCast(raw_context));
+            try context.ids.append(context.allocator, record.edge_id);
+        }
+    };
+    var ids = std.ArrayList(u64).empty;
+    defer ids.deinit(std.testing.allocator);
+    var context = Collect{ .ids = &ids, .allocator = std.testing.allocator };
+
+    try std.testing.expectEqual(@as(u64, 1026), try store.scanVisibleEdgeIndexRecords(std.testing.allocator, &context, Collect.visit));
+    try std.testing.expectEqual(@as(usize, 1026), ids.items.len);
+    std.mem.sort(u64, ids.items, {}, u64LessThan);
+    try std.testing.expectEqual(@as(u64, 1026), ids.items[ids.items.len - 1]);
+
+    try std.testing.expectEqual(@as(u64, 1026), try store.compactPublishedEdgeSegments(full_path));
+
+    try store.deleteEdge(.fromInt(1));
+    ids.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u64, 1025), try store.scanVisibleEdgeIndexRecords(std.testing.allocator, &context, Collect.visit));
+    try std.testing.expectEqual(@as(usize, 1025), ids.items.len);
+    std.mem.sort(u64, ids.items, {}, u64LessThan);
+    try std.testing.expectEqual(@as(u64, 2), ids.items[0]);
+
+    try std.testing.expectEqual(@as(u64, 1025), try store.compactPublishedEdgeSegments(compacted_path));
+    var opened = (try store.openPublishedEdgeSegmentsForQuery(std.testing.allocator)).?;
+    defer opened.deinit();
+    try std.testing.expectEqual(PublishedEdgeSegmentsCoverage.visible_full, opened.coverage);
+    ids.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(u64, 1025), try store.scanVisibleEdgeIndexRecords(std.testing.allocator, &context, Collect.visit));
+    try std.testing.expectEqual(@as(usize, 1025), ids.items.len);
+    std.mem.sort(u64, ids.items, {}, u64LessThan);
+    try std.testing.expectEqual(@as(u64, 2), ids.items[0]);
+    try std.testing.expectEqual(@as(u64, 1026), ids.items[ids.items.len - 1]);
+}
+
 test "store inserts edge tombstones by streaming sorted overlay" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -41272,6 +45868,47 @@ test "store appends ordered edge batch and validates order keys before mutation"
     try std.testing.expectEqual(@as(u64, 1), ordered.items[1].edge_id);
 }
 
+test "edge order sidecar copy omits deleted source edges" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const source_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "source" });
+    defer std.testing.allocator.free(source_path);
+    const target_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "target" });
+    defer std.testing.allocator.free(target_path);
+
+    var source = try Store.init(std.testing.allocator, std.testing.io, source_path);
+    defer source.deinit();
+    try source.createEmpty();
+    var target = try Store.init(std.testing.allocator, std.testing.io, target_path);
+    defer target.deinit();
+    try target.createEmpty();
+    const nodes = [_]graph_mod.Node{
+        .{ .id = .fromInt(1), .kind = .document, .text = "doc" },
+        .{ .id = .fromInt(2), .kind = .observation, .text = "two" },
+        .{ .id = .fromInt(3), .kind = .observation, .text = "three" },
+    };
+    try source.appendNodesBatch(&nodes);
+    try target.appendNodesBatch(&nodes);
+    const edges = [_]graph_mod.Edge{
+        .{ .id = .fromInt(1), .src = .fromInt(1), .rel = .mentions, .dst = .fromInt(2) },
+        .{ .id = .fromInt(2), .src = .fromInt(1), .rel = .mentions, .dst = .fromInt(3) },
+    };
+    try source.appendEdgesOrderedBatch(&edges, &.{ 10, 20 });
+    try source.deleteEdge(.fromInt(2));
+    try target.appendEdgesBatch(edges[0..1]);
+
+    try std.testing.expectEqual(@as(u64, 1), try target.replaceEdgeOrderIndexFromPresentEdges(source));
+    var order_map = try target.readEdgeOrderMap(std.testing.allocator);
+    defer order_map.deinit();
+    try std.testing.expectEqual(@as(usize, 1), order_map.count());
+    try std.testing.expectEqual(@as(?u64, 10), order_map.get(1));
+    try std.testing.expectEqual(@as(?u64, null), order_map.get(2));
+}
+
 test "store ordered edge traversal falls back to append edge id without sidecar" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -43015,6 +47652,1110 @@ test "store external key index supports append lookup and repair rebuild" {
     try std.testing.expectEqual(second, (try store.lookupNodeByExternalKey(std.testing.allocator, "content:test", .observation)).?);
 }
 
+test "property payload batch upsert replaces lifecycle fields with one publication" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+
+    const task_id = try store.addNode(.task, "batch lifecycle task");
+    _ = try store.upsertPropertiesBatch(std.testing.allocator, &.{
+        .{ .owner = .{ .node = task_id }, .key = "status", .value = .{ .string = "open" } },
+        .{ .owner = .{ .node = task_id }, .key = "claim_expires_ns", .value = .{ .uint = 0 } },
+    });
+
+    const result = try store.upsertPropertiesBatch(std.testing.allocator, &.{
+        .{ .owner = .{ .node = task_id }, .key = "claimed_by", .value = .{ .string = "agent-one" } },
+        .{ .owner = .{ .node = task_id }, .key = "claim_expires_ns", .value = .{ .uint = 99 } },
+        .{ .owner = .{ .node = task_id }, .key = "status", .value = .{ .string = "claimed" } },
+    });
+    try std.testing.expectEqual(@as(usize, 3), result.writes_applied);
+    try std.testing.expectEqual(@as(usize, 2), result.entries_replaced);
+    try std.testing.expectEqual(@as(usize, 1), result.payload_publish_count);
+
+    const status = (try store.getNodeStringProperty(std.testing.allocator, task_id, "status")).?;
+    defer std.testing.allocator.free(status);
+    try std.testing.expectEqualStrings("claimed", status);
+    const holder = (try store.getNodeStringProperty(std.testing.allocator, task_id, "claimed_by")).?;
+    defer std.testing.allocator.free(holder);
+    try std.testing.expectEqualStrings("agent-one", holder);
+    try std.testing.expectEqual(@as(?u64, 99), try store.getUintProperty(std.testing.allocator, .{ .node = task_id }, "claim_expires_ns"));
+
+    try std.testing.expectError(error.InvalidRecord, store.upsertPropertiesBatch(std.testing.allocator, &.{
+        .{ .owner = .{ .node = task_id }, .key = "status", .value = .{ .string = "open" } },
+        .{ .owner = .{ .node = task_id }, .key = "status", .value = .{ .string = "failed" } },
+    }));
+    var delta_file = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_delta_path, .{});
+    const delta_size_after_rejected_batch = try store.regularFileSize(delta_file);
+    delta_file.close(std.testing.io);
+    const status_after_rejected_batch = (try store.getNodeStringProperty(std.testing.allocator, task_id, "status")).?;
+    defer std.testing.allocator.free(status_after_rejected_batch);
+    try std.testing.expectEqualStrings("claimed", status_after_rejected_batch);
+    var delta_file_again = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_delta_path, .{});
+    defer delta_file_again.close(std.testing.io);
+    try std.testing.expectEqual(delta_size_after_rejected_batch, try store.regularFileSize(delta_file_again));
+}
+
+test "empty property payload can be replaced from a bounded sorted stream once" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    const node_id = try store.addNode(.task, "sorted property target");
+    const Context = struct {
+        node_id: core.NodeId,
+        emitted: bool = false,
+
+        fn next(raw_context: *anyopaque) anyerror!?SortedPropertyPayloadEntry {
+            const context: *@This() = @ptrCast(@alignCast(raw_context));
+            if (context.emitted) return null;
+            context.emitted = true;
+            return .{
+                .owner = .{ .node = context.node_id },
+                .key_hash = propertyKeyHashForLookup("status"),
+                .value = .{ .string = "open" },
+            };
+        }
+    };
+    var context = Context{ .node_id = node_id };
+    try std.testing.expectError(
+        error.InvalidRecord,
+        store.replaceEmptyPropertyPayloadFromSortedStream(0, &context, Context.next),
+    );
+    context.emitted = false;
+    try store.replaceEmptyPropertyPayloadFromSortedStream(1, &context, Context.next);
+    const status = (try store.getNodeStringProperty(std.testing.allocator, node_id, "status")).?;
+    defer std.testing.allocator.free(status);
+    try std.testing.expectEqualStrings("open", status);
+
+    context.emitted = false;
+    try std.testing.expectError(
+        error.InvalidRecord,
+        store.replaceEmptyPropertyPayloadFromSortedStream(1, &context, Context.next),
+    );
+}
+
+test "streamed property payload redo recovers between pair renames" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const donor_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "donor" });
+    defer std.testing.allocator.free(donor_path);
+    const target_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "target" });
+    defer std.testing.allocator.free(target_path);
+
+    const Context = struct {
+        node_id: core.NodeId,
+        emitted: bool = false,
+
+        fn next(raw_context: *anyopaque) anyerror!?SortedPropertyPayloadEntry {
+            const context: *@This() = @ptrCast(@alignCast(raw_context));
+            if (context.emitted) return null;
+            context.emitted = true;
+            return .{
+                .owner = .{ .node = context.node_id },
+                .key_hash = propertyKeyHashForLookup("status"),
+                .value = .{ .string = "claimed" },
+            };
+        }
+    };
+
+    var donor = try Store.init(std.testing.allocator, std.testing.io, donor_path);
+    defer donor.deinit();
+    try donor.createEmpty();
+    const donor_node = try donor.addNode(.task, "streamed redo donor");
+    var context = Context{ .node_id = donor_node };
+    try donor.replaceEmptyPropertyPayloadFromSortedStream(1, &context, Context.next);
+
+    var target = try Store.init(std.testing.allocator, std.testing.io, target_path);
+    var target_open = true;
+    defer if (target_open) target.deinit();
+    try target.createEmpty();
+    const target_node = try target.addNode(.task, "streamed redo target");
+    try std.testing.expectEqual(donor_node, target_node);
+
+    const index_stage = try target.tmpPathFor(target.property_payload_index_path);
+    defer std.testing.allocator.free(index_stage);
+    const values_stage = try target.tmpPathFor(target.property_payload_values_path);
+    defer std.testing.allocator.free(values_stage);
+    try std.Io.Dir.copyFile(std.Io.Dir.cwd(), donor.property_payload_index_path, std.Io.Dir.cwd(), index_stage, std.testing.io, .{});
+    try std.Io.Dir.copyFile(std.Io.Dir.cwd(), donor.property_payload_values_path, std.Io.Dir.cwd(), values_stage, std.testing.io, .{});
+    try target.writePropertyPayloadRedoJournal(index_stage, values_stage);
+
+    // Simulate power loss after the streamed values file was published but
+    // before the matching index rename and redo cleanup.
+    try target.renameReplace(values_stage, target.property_payload_values_path);
+    target.deinit();
+    target_open = false;
+
+    var reopened = try Store.open(std.testing.allocator, std.testing.io, target_path);
+    defer reopened.deinit();
+    const status = (try reopened.getNodeStringProperty(std.testing.allocator, target_node, "status")).?;
+    defer std.testing.allocator.free(status);
+    try std.testing.expectEqualStrings("claimed", status);
+    const journal_path = try reopened.propertyPayloadRedoJournalPath();
+    defer std.testing.allocator.free(journal_path);
+    try std.testing.expect(!try reopened.pathExists(journal_path));
+}
+
+test "property payload delta is append only latest wins and survives reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    var store_open = true;
+    defer if (store_open) store.deinit();
+    try store.createEmpty();
+    const task_id = try store.addNode(.task, "delta task");
+    const other_id = try store.addNode(.observation, "delta other");
+    const edge_id = try store.nextEdgeId();
+    try store.appendEdgeIndexed(.{ .id = edge_id, .src = task_id, .rel = .references, .dst = other_id });
+    try store.appendPropertiesBatch(std.testing.allocator, &.{
+        .{ .owner = .{ .node = task_id }, .key = "status", .value = .{ .string = "open" } },
+        .{ .owner = .{ .node = task_id }, .key = "name", .value = .{ .string = "base name" } },
+    });
+
+    var base_index_file = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_index_path, .{});
+    const base_index_bytes = try store.regularFileSize(base_index_file);
+    base_index_file.close(std.testing.io);
+    var base_values_file = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_values_path, .{});
+    const base_values_bytes = try store.regularFileSize(base_values_file);
+    base_values_file.close(std.testing.io);
+
+    const first = try store.upsertPropertiesBatch(std.testing.allocator, &.{
+        .{ .owner = .{ .node = task_id }, .key = "status", .value = .{ .string = "claimed" } },
+        .{ .owner = .{ .node = task_id }, .key = "name", .value = .{ .string = "delta name" } },
+        .{ .owner = .{ .node = task_id }, .key = "claim_expires_ns", .value = .{ .uint = 99 } },
+        .{ .owner = .{ .edge = edge_id }, .key = "created_by", .value = .{ .string = "agent" } },
+    });
+    try std.testing.expectEqual(@as(usize, 2), first.entries_replaced);
+    var delta_file = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_delta_path, .{});
+    const first_delta_bytes = try store.regularFileSize(delta_file);
+    delta_file.close(std.testing.io);
+
+    const second = try store.upsertPropertiesBatch(std.testing.allocator, &.{.{
+        .owner = .{ .node = task_id },
+        .key = "name",
+        .value = .{ .string = "latest name" },
+    }});
+    try std.testing.expectEqual(@as(usize, 1), second.entries_replaced);
+    var delta_file_after = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_delta_path, .{});
+    const second_delta_bytes = try store.regularFileSize(delta_file_after);
+    delta_file_after.close(std.testing.io);
+    try std.testing.expect(second_delta_bytes > first_delta_bytes);
+    try std.testing.expect(second_delta_bytes - first_delta_bytes < 256);
+
+    var current_index_file = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_index_path, .{});
+    try std.testing.expectEqual(base_index_bytes, try store.regularFileSize(current_index_file));
+    var current_values_file = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_values_path, .{});
+    try std.testing.expectEqual(base_values_bytes, try store.regularFileSize(current_values_file));
+
+    const status = (try store.getNodeStringProperty(std.testing.allocator, task_id, "status")).?;
+    defer std.testing.allocator.free(status);
+    try std.testing.expectEqualStrings("claimed", status);
+    const name = (try store.getNodeStringProperty(std.testing.allocator, task_id, "name")).?;
+    defer std.testing.allocator.free(name);
+    try std.testing.expectEqualStrings("latest name", name);
+    try std.testing.expectEqual(@as(?u64, 99), try store.getUintProperty(std.testing.allocator, .{ .node = task_id }, "claim_expires_ns"));
+    const created_by = (try store.getEdgeStringProperty(std.testing.allocator, edge_id, "created_by")).?;
+    defer std.testing.allocator.free(created_by);
+    try std.testing.expectEqualStrings("agent", created_by);
+
+    var snapshot = try store.loadSearchableNodeMetadataSnapshot(std.testing.allocator);
+    defer snapshot.deinit(std.testing.allocator);
+    var name_matches: usize = 0;
+    for (snapshot.entries) |entry| {
+        const owner_matches = switch (entry.owner) {
+            .node => |node_id| node_id == task_id,
+            .edge => false,
+        };
+        if (!owner_matches or entry.key_hash != nodePropertyKeyHash("name")) continue;
+        name_matches += 1;
+        try std.testing.expectEqualStrings("latest name", entry.string_value);
+    }
+    try std.testing.expectEqual(@as(usize, 1), name_matches);
+
+    var bounded_snapshot = try store.loadSearchableNodeMetadataSnapshotLimited(std.testing.allocator, "latest name".len);
+    bounded_snapshot.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.SearchableMetadataBudgetExceeded,
+        store.loadSearchableNodeMetadataSnapshotLimited(std.testing.allocator, "latest name".len - 1),
+    );
+
+    var edge_snapshot = try store.loadEdgePropertySnapshotForEdgeIds(
+        std.testing.allocator,
+        &.{edge_id},
+        &.{"created_by"},
+    );
+    defer edge_snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), edge_snapshot.entries.len);
+    try std.testing.expectEqual(edge_id, edge_snapshot.entries[0].owner.edge);
+    try std.testing.expectEqualStrings("agent", edge_snapshot.entries[0].string_value);
+
+    current_values_file.close(std.testing.io);
+    current_index_file.close(std.testing.io);
+    store.deinit();
+    store_open = false;
+    var reopened = try Store.open(std.testing.allocator, std.testing.io, store_path);
+    defer reopened.deinit();
+    const reopened_name = (try reopened.getNodeStringProperty(std.testing.allocator, task_id, "name")).?;
+    defer std.testing.allocator.free(reopened_name);
+    try std.testing.expectEqualStrings("latest name", reopened_name);
+    try std.testing.expectEqual(@as(?u64, 99), try reopened.getUintProperty(std.testing.allocator, .{ .node = task_id }, "claim_expires_ns"));
+}
+
+test "property payload delta frames reject duplicate owner keys and impossible counts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    const task_id = try store.addNode(.task, "duplicate delta owner key");
+
+    try std.testing.expectError(error.InvalidRecord, store.encodePropertyPayloadDeltaFrame(std.testing.allocator, 1, &.{
+        .{ .owner = .{ .node = task_id }, .key = "created_at", .value = .{ .uint = 1 } },
+        .{ .owner = .{ .node = task_id }, .key = "created_at", .value = .{ .uint = 2 } },
+    }));
+
+    const frame = try store.encodePropertyPayloadDeltaFrame(std.testing.allocator, 1, &.{
+        .{ .owner = .{ .node = task_id }, .key = "created_at", .value = .{ .uint = 1 } },
+        .{ .owner = .{ .node = task_id }, .key = "updated_at", .value = .{ .uint = 2 } },
+    });
+    defer std.testing.allocator.free(frame);
+    const payload = frame[property_payload_delta_header_len..];
+    const first_key = "created_at";
+    const second_entry_offset = property_payload_delta_entry_len + first_key.len;
+    const second_raw = payload[second_entry_offset..][0..property_payload_delta_entry_len];
+    writeU64(second_raw[16..24], nodePropertyKeyHash(first_key));
+    @memcpy(payload[second_entry_offset + property_payload_delta_entry_len ..], first_key);
+    var header_bytes: [property_payload_delta_header_len]u8 = undefined;
+    @memcpy(&header_bytes, frame[0..property_payload_delta_header_len]);
+    var header = try PropertyPayloadDeltaHeader.decode(&header_bytes);
+    header.payload_digest = std.hash.Wyhash.hash(property_payload_delta_digest_seed, payload);
+    try header.encode(&header_bytes);
+    @memcpy(frame[0..property_payload_delta_header_len], &header_bytes);
+    try std.testing.expectError(
+        error.InvalidRecord,
+        Store.parsePropertyPayloadDeltaPayload(std.testing.allocator, header, payload, .none),
+    );
+
+    var impossible = header;
+    impossible.write_count = std.math.maxInt(u32);
+    var no_alloc_scratch: [1]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&no_alloc_scratch);
+    try std.testing.expectError(
+        error.InvalidRecord,
+        Store.parsePropertyPayloadDeltaPayload(fixed.allocator(), impossible, payload, .none),
+    );
+}
+
+test "property layer scan preserves legacy base and delta precedence" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    const task_id = try store.addNode(.task, "layered properties");
+
+    var legacy = std.ArrayList(NodePropertyIndexEntry).empty;
+    defer {
+        deinitNodePropertyIndexEntries(legacy.items, std.testing.allocator);
+        legacy.deinit(std.testing.allocator);
+    }
+    try appendNodePropertyRecordForValue(&legacy, std.testing.allocator, task_id, "summary", "legacy");
+    try store.writeNodePropertyOverlay(legacy.items);
+    try store.appendPropertiesBatch(std.testing.allocator, &.{.{
+        .owner = .{ .node = task_id },
+        .key = "summary",
+        .value = .{ .string = "base" },
+    }});
+    _ = try store.upsertPropertiesBatch(std.testing.allocator, &.{.{
+        .owner = .{ .node = task_id },
+        .key = "summary",
+        .value = .{ .string = "delta-one" },
+    }});
+    _ = try store.upsertPropertiesBatch(std.testing.allocator, &.{.{
+        .owner = .{ .node = task_id },
+        .key = "summary",
+        .value = .{ .string = "delta-two" },
+    }});
+
+    const Capture = struct {
+        const Seen = struct { version: u64, value: []u8 };
+        allocator: std.mem.Allocator,
+        owner: core.NodeId,
+        entries: std.ArrayList(Seen) = .empty,
+
+        fn deinit(self: *@This()) void {
+            for (self.entries.items) |entry| self.allocator.free(entry.value);
+            self.entries.deinit(self.allocator);
+        }
+
+        fn visit(context: *anyopaque, entry: PropertySnapshotLayerEntry) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            const node_id = switch (entry.owner) {
+                .node => |id| id,
+                .edge => return,
+            };
+            if (node_id != self.owner or entry.key_hash != nodePropertyKeyHash("summary")) return;
+            if (entry.value_kind != .string) return error.InvalidRecord;
+            try self.entries.append(self.allocator, .{
+                .version = entry.version,
+                .value = try self.allocator.dupe(u8, entry.string_value),
+            });
+        }
+    };
+    var capture = Capture{ .allocator = std.testing.allocator, .owner = task_id };
+    defer capture.deinit();
+    try store.scanPropertySnapshotLayers(std.testing.allocator, &capture, Capture.visit);
+
+    try std.testing.expectEqual(@as(usize, 4), capture.entries.items.len);
+    try std.testing.expectEqual(property_snapshot_legacy_version, capture.entries.items[0].version);
+    try std.testing.expectEqual(property_snapshot_base_version, capture.entries.items[1].version);
+    try std.testing.expectEqual(property_snapshot_delta_version_base, capture.entries.items[2].version);
+    try std.testing.expectEqual(property_snapshot_delta_version_base + 1, capture.entries.items[3].version);
+    try std.testing.expectEqualStrings("legacy", capture.entries.items[0].value);
+    try std.testing.expectEqualStrings("base", capture.entries.items[1].value);
+    try std.testing.expectEqualStrings("delta-one", capture.entries.items[2].value);
+    try std.testing.expectEqualStrings("delta-two", capture.entries.items[3].value);
+}
+
+test "property payload delta compaction is idempotent and crash-window replay safe" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    var store_open = true;
+    defer if (store_open) store.deinit();
+    try store.createEmpty();
+    const task_id = try store.addNode(.task, "compact task properties");
+    try store.appendPropertiesBatch(std.testing.allocator, &.{.{
+        .owner = .{ .node = task_id },
+        .key = "status",
+        .value = .{ .string = "open" },
+    }});
+    _ = try store.upsertPropertiesBatch(std.testing.allocator, &.{
+        .{ .owner = .{ .node = task_id }, .key = "status", .value = .{ .string = "claimed" } },
+        .{ .owner = .{ .node = task_id }, .key = "claimed_by", .value = .{ .string = "agent-a" } },
+        .{ .owner = .{ .node = task_id }, .key = "claim_expires_ns", .value = .{ .uint = 99 } },
+    });
+    _ = try store.upsertPropertiesBatch(std.testing.allocator, &.{.{
+        .owner = .{ .node = task_id },
+        .key = "status",
+        .value = .{ .string = "completed" },
+    }});
+
+    // Simulate the safe half of the compaction publication: the new base has
+    // landed, but the old delta was not yet unlinked when the process died.
+    var merged = try store.readPropertyPayloadEntriesOrEmpty(std.testing.allocator);
+    defer {
+        deinitPropertyPayloadIndexEntries(merged.items, std.testing.allocator);
+        merged.deinit(std.testing.allocator);
+    }
+    try store.writePropertyPayload(merged.items);
+    store.deinit();
+    store_open = false;
+
+    store = try Store.open(std.testing.allocator, std.testing.io, store_path);
+    store_open = true;
+    const replayed_status = (try store.getNodeStringProperty(std.testing.allocator, task_id, "status")).?;
+    defer std.testing.allocator.free(replayed_status);
+    try std.testing.expectEqualStrings("completed", replayed_status);
+    const compacted = try store.compactPropertyPayloadDelta(std.testing.allocator);
+    try std.testing.expect(compacted.compacted);
+    try std.testing.expectEqual(@as(u64, 2), compacted.delta_frames);
+    try std.testing.expect(compacted.delta_bytes > 0);
+    try std.testing.expectEqual(@as(u64, 3), compacted.live_entries);
+    try std.testing.expect(!try store.fileExists(store.property_payload_delta_path));
+
+    const no_op = try store.compactPropertyPayloadDelta(std.testing.allocator);
+    try std.testing.expect(!no_op.compacted);
+    const status_after = (try store.getNodeStringProperty(std.testing.allocator, task_id, "status")).?;
+    defer std.testing.allocator.free(status_after);
+    try std.testing.expectEqualStrings("completed", status_after);
+    const holder_after = (try store.getNodeStringProperty(std.testing.allocator, task_id, "claimed_by")).?;
+    defer std.testing.allocator.free(holder_after);
+    try std.testing.expectEqualStrings("agent-a", holder_after);
+    try std.testing.expectEqual(@as(?u64, 99), try store.getUintProperty(std.testing.allocator, .{ .node = task_id }, "claim_expires_ns"));
+}
+
+test "property payload compaction cleanup failure remains retryable state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+
+    // A same-name directory deterministically makes file unlink fail without
+    // relying on platform-specific permission behavior. Post-commit cleanup
+    // reports pending and preserves the foreign path for retry/inspection.
+    try std.Io.Dir.cwd().createDir(std.testing.io, store.property_payload_delta_path, .default_dir);
+    try std.testing.expect(!store.cleanupPropertyPayloadDeltaAfterCompaction());
+    const stat = try std.Io.Dir.cwd().statFile(std.testing.io, store.property_payload_delta_path, .{ .follow_symlinks = false });
+    try std.testing.expectEqual(.directory, stat.kind);
+}
+
+test "property payload delta redo recovers absent committed and partial appends" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    var store_open = true;
+    defer if (store_open) store.deinit();
+    try store.createEmpty();
+    const task_id = try store.addNode(.task, "delta redo task");
+
+    const frame_one = try store.encodePropertyPayloadDeltaFrame(std.testing.allocator, 1, &.{.{
+        .owner = .{ .node = task_id },
+        .key = "status",
+        .value = .{ .string = "open" },
+    }});
+    defer std.testing.allocator.free(frame_one);
+    try store.writePropertyPayloadDeltaJournal(frame_one);
+    store.deinit();
+    store_open = false;
+
+    store = try Store.open(std.testing.allocator, std.testing.io, store_path);
+    store_open = true;
+    const open_status = (try store.getNodeStringProperty(std.testing.allocator, task_id, "status")).?;
+    defer std.testing.allocator.free(open_status);
+    try std.testing.expectEqualStrings("open", open_status);
+
+    const scan_one = try store.scanPropertyPayloadDelta(std.testing.allocator, .none, false);
+    const frame_two = try store.encodePropertyPayloadDeltaFrame(std.testing.allocator, 2, &.{.{
+        .owner = .{ .node = task_id },
+        .key = "status",
+        .value = .{ .string = "claimed" },
+    }});
+    defer std.testing.allocator.free(frame_two);
+    try store.writePropertyPayloadDeltaJournal(frame_two);
+    try store.appendPropertyPayloadDeltaFrame(frame_two, scan_one.valid_bytes);
+    store.deinit();
+    store_open = false;
+
+    store = try Store.open(std.testing.allocator, std.testing.io, store_path);
+    store_open = true;
+    const claimed_status = (try store.getNodeStringProperty(std.testing.allocator, task_id, "status")).?;
+    defer std.testing.allocator.free(claimed_status);
+    try std.testing.expectEqualStrings("claimed", claimed_status);
+
+    const scan_two = try store.scanPropertyPayloadDelta(std.testing.allocator, .none, false);
+    const frame_three = try store.encodePropertyPayloadDeltaFrame(std.testing.allocator, 3, &.{.{
+        .owner = .{ .node = task_id },
+        .key = "status",
+        .value = .{ .string = "completed" },
+    }});
+    defer std.testing.allocator.free(frame_three);
+    try store.writePropertyPayloadDeltaJournal(frame_three);
+    {
+        var delta = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_delta_path, .{ .mode = .read_write });
+        defer delta.close(std.testing.io);
+        try delta.writePositionalAll(std.testing.io, frame_three[0 .. frame_three.len / 2], scan_two.valid_bytes);
+    }
+    store.deinit();
+    store_open = false;
+
+    store = try Store.open(std.testing.allocator, std.testing.io, store_path);
+    store_open = true;
+    const completed_status = (try store.getNodeStringProperty(std.testing.allocator, task_id, "status")).?;
+    defer std.testing.allocator.free(completed_status);
+    try std.testing.expectEqualStrings("completed", completed_status);
+    const journal_path = try store.propertyPayloadDeltaJournalPath();
+    defer std.testing.allocator.free(journal_path);
+    try std.testing.expect(!try store.pathExists(journal_path));
+}
+
+test "property payload delta corruption without matching redo fails closed on first property use" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    try store.createEmpty();
+    const task_id = try store.addNode(.task, "delta corrupt task");
+    try store.setNodeStringProperty(std.testing.allocator, task_id, "status", "open");
+    var delta = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_delta_path, .{ .mode = .read_write });
+    const delta_len = try store.regularFileSize(delta);
+    try delta.writePositionalAll(std.testing.io, "broken", delta_len);
+    delta.close(std.testing.io);
+    store.deinit();
+
+    var reopened = try Store.open(std.testing.allocator, std.testing.io, store_path);
+    defer reopened.deinit();
+    try std.testing.expectError(
+        error.InvalidRecord,
+        reopened.getNodeStringProperty(std.testing.allocator, task_id, "status"),
+    );
+}
+
+test "property payload delta redo refuses a nonmatching corrupt tail" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    try store.createEmpty();
+    const task_id = try store.addNode(.task, "delta mismatched redo task");
+    try store.setNodeStringProperty(std.testing.allocator, task_id, "status", "open");
+    const scan = try store.scanPropertyPayloadDelta(std.testing.allocator, .none, false);
+    const frame = try store.encodePropertyPayloadDeltaFrame(std.testing.allocator, 2, &.{.{
+        .owner = .{ .node = task_id },
+        .key = "status",
+        .value = .{ .string = "claimed" },
+    }});
+    defer std.testing.allocator.free(frame);
+    try store.writePropertyPayloadDeltaJournal(frame);
+    var delta = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_delta_path, .{ .mode = .read_write });
+    try delta.writePositionalAll(std.testing.io, "wrong-tail", scan.valid_bytes);
+    delta.close(std.testing.io);
+    store.deinit();
+
+    try std.testing.expectError(error.InvalidRecord, Store.open(std.testing.allocator, std.testing.io, store_path));
+}
+
+test "property payload redo journal recovers between pair renames" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    var store_open = true;
+    defer if (store_open) store.deinit();
+    try store.createEmpty();
+    const task_id = try store.addNode(.task, "redo lifecycle task");
+    try store.appendPropertiesBatch(std.testing.allocator, &.{.{
+        .owner = .{ .node = task_id },
+        .key = "status",
+        .value = .{ .string = "open" },
+    }});
+
+    var entries = try store.readPropertyPayloadEntriesOrEmpty(std.testing.allocator);
+    defer {
+        deinitPropertyPayloadIndexEntries(entries.items, std.testing.allocator);
+        entries.deinit(std.testing.allocator);
+    }
+    var index: usize = 0;
+    while (index < entries.items.len) {
+        if (propertyPayloadEntryMatchesOwnerKey(entries.items[index], .{ .node = task_id }, "status")) {
+            var removed = entries.orderedRemove(index);
+            removed.deinit(std.testing.allocator);
+        } else {
+            index += 1;
+        }
+    }
+    try appendStringPropertyPayloadRecord(&entries, std.testing.allocator, .{ .node = task_id }, "status", "claimed");
+    try appendUintPropertyPayloadRecord(&entries, std.testing.allocator, .{ .node = task_id }, "claim_expires_ns", 99);
+    std.mem.sort(PropertyPayloadIndexEntry, entries.items, {}, propertyPayloadEntryLessThan);
+
+    const index_stage = try store.tmpPathFor(store.property_payload_index_path);
+    defer std.testing.allocator.free(index_stage);
+    const values_stage = try store.tmpPathFor(store.property_payload_values_path);
+    defer std.testing.allocator.free(values_stage);
+    try store.writePropertyPayloadIndexStage(index_stage, entries.items);
+    try store.writePropertyPayloadValueStage(values_stage, entries.items);
+    try store.writePropertyPayloadRedoJournal(index_stage, values_stage);
+
+    // Simulate power loss after values became visible but before the matching
+    // index rename and journal deletion.
+    try store.renameReplace(values_stage, store.property_payload_values_path);
+    store.deinit();
+    store_open = false;
+
+    var reopened = try Store.open(std.testing.allocator, std.testing.io, store_path);
+    defer reopened.deinit();
+    const status = (try reopened.getNodeStringProperty(std.testing.allocator, task_id, "status")).?;
+    defer std.testing.allocator.free(status);
+    try std.testing.expectEqualStrings("claimed", status);
+    try std.testing.expectEqual(@as(?u64, 99), try reopened.getUintProperty(std.testing.allocator, .{ .node = task_id }, "claim_expires_ns"));
+    const journal_path = try reopened.propertyPayloadRedoJournalPath();
+    defer std.testing.allocator.free(journal_path);
+    try std.testing.expect(!try reopened.pathExists(journal_path));
+}
+
+test "property payload redo journal corruption fails closed on open and init" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    var store_open = true;
+    defer if (store_open) store.deinit();
+    try store.createEmpty();
+    const node_id = try store.addNode(.task, "fail-closed redo");
+    try store.setNodeStringProperty(std.testing.allocator, node_id, "status", "open");
+    const journal_path = try store.propertyPayloadRedoJournalPath();
+    defer std.testing.allocator.free(journal_path);
+    store.deinit();
+    store_open = false;
+
+    // A zero-length or garbage journal is not safe to discard: either may be
+    // the only durable copy of a pair publication interrupted mid-rename.
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = journal_path, .data = "", .flags = .{ .truncate = true } });
+    try std.testing.expectError(error.InvalidRecord, Store.open(std.testing.allocator, std.testing.io, store_path));
+    try std.testing.expectError(error.InvalidRecord, Store.init(std.testing.allocator, std.testing.io, store_path));
+
+    const garbage = [_]u8{0xa5} ** PropertyPayloadRedoJournalHeader.encoded_len;
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = journal_path, .data = &garbage, .flags = .{ .truncate = true } });
+    try std.testing.expectError(error.InvalidRecord, Store.open(std.testing.allocator, std.testing.io, store_path));
+    try std.testing.expectEqual(.file, (try std.Io.Dir.cwd().statFile(std.testing.io, journal_path, .{})).kind);
+}
+
+test "strict property payload key readers reject globally unsorted immutable base" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    const node_id = try store.addNode(.task, "strict property order");
+    try store.appendPropertiesBatch(std.testing.allocator, &.{
+        .{ .owner = .{ .node = node_id }, .key = "name", .value = .{ .string = "searchable name" } },
+        .{ .owner = .{ .node = node_id }, .key = "summary", .value = .{ .string = "searchable summary" } },
+        .{ .owner = .{ .node = node_id }, .key = "unrelated_a", .value = .{ .string = "alpha" } },
+        .{ .owner = .{ .node = node_id }, .key = "unrelated_b", .value = .{ .string = "beta" } },
+    });
+
+    var index_file = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_index_path, .{ .mode = .read_write });
+    const header = try store.readPropertyPayloadIndexHeaderFromFile(index_file);
+    var unrelated_indexes: [2]u64 = undefined;
+    var unrelated_count: usize = 0;
+    var index: u64 = 0;
+    while (index < header.record_count and unrelated_count < unrelated_indexes.len) : (index += 1) {
+        const record = try store.readPropertyPayloadIndexRecordAt(index_file, index);
+        if (record.key_hash == nodePropertyKeyHash("name") or record.key_hash == nodePropertyKeyHash("summary")) continue;
+        unrelated_indexes[unrelated_count] = index;
+        unrelated_count += 1;
+    }
+    try std.testing.expectEqual(unrelated_indexes.len, unrelated_count);
+    const first = try store.readPropertyPayloadIndexRecordAt(index_file, unrelated_indexes[0]);
+    const second = try store.readPropertyPayloadIndexRecordAt(index_file, unrelated_indexes[1]);
+    var first_bytes: [PropertyPayloadIndexRecord.encoded_len]u8 = undefined;
+    var second_bytes: [PropertyPayloadIndexRecord.encoded_len]u8 = undefined;
+    try first.encode(&first_bytes);
+    try second.encode(&second_bytes);
+    try index_file.writePositionalAll(std.testing.io, &second_bytes, try propertyPayloadIndexRecordOffset(unrelated_indexes[0]));
+    try index_file.writePositionalAll(std.testing.io, &first_bytes, try propertyPayloadIndexRecordOffset(unrelated_indexes[1]));
+    index_file.close(std.testing.io);
+
+    store.options.validate_indexes_on_read = true;
+    try std.testing.expectError(error.InvalidRecord, store.searchableNodeMetadataDigest(std.testing.allocator));
+    try std.testing.expectError(error.InvalidRecord, store.getNodeStringProperty(std.testing.allocator, node_id, "name"));
+}
+
+test "searchable metadata digest allocates only selected property values" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    const node_id = try store.addNode(.task, "metadata digest task");
+    const unrelated = [_]u8{'x'} ** (64 * 1024);
+    try store.appendPropertiesBatch(std.testing.allocator, &.{
+        .{ .owner = .{ .node = node_id }, .key = "name", .value = .{ .string = "short searchable name" } },
+        .{ .owner = .{ .node = node_id }, .key = "unrelated_blob", .value = .{ .string = &unrelated } },
+    });
+
+    var digest_scratch: [256]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&digest_scratch);
+    try std.testing.expect((try store.searchableNodeMetadataDigest(fixed.allocator())) != 0);
+
+    var snapshot_scratch: [512]u8 = undefined;
+    var snapshot_fixed = std.heap.FixedBufferAllocator.init(&snapshot_scratch);
+    var snapshot = try store.loadSearchableNodeMetadataSnapshot(snapshot_fixed.allocator());
+    defer snapshot.deinit(snapshot_fixed.allocator());
+    try std.testing.expectEqual(@as(usize, 1), snapshot.entries.len);
+    try std.testing.expectEqualStrings("short searchable name", snapshot.entries[0].string_value);
+}
+
+test "compacted searchable metadata digest streams immutable values with fixed memory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+
+    const long_name = [_]u8{'n'} ** (20 * 1024);
+    for (0..8) |index| {
+        const node_id = try store.addNode(.task, "streamed metadata");
+        try std.testing.expectEqual(@as(u64, index + 1), node_id.toInt());
+        try store.setNodeStringProperty(std.testing.allocator, node_id, "name", &long_name);
+    }
+    const expected = try store.searchableNodeMetadataDigest(std.testing.allocator);
+    const compacted = try store.compactPropertyPayloadDelta(std.testing.allocator);
+    try std.testing.expect(compacted.compacted);
+    try std.testing.expect(!try store.pathExists(store.property_payload_delta_path));
+
+    // The pre-streaming path owned every selected value at once and could not
+    // compute this 160 KiB digest with a one-byte caller allocator. Each
+    // individual value also crosses the streaming scratch-buffer boundary.
+    // The immutable steady-state path now reads values through a fixed stack
+    // buffer while retaining the exact same semantic digest.
+    var scratch: [1]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+    try std.testing.expectEqual(expected, try store.searchableNodeMetadataDigest(fixed.allocator()));
+    try std.testing.expectError(
+        core.Error.BudgetExceeded,
+        store.searchableNodeMetadataDigestLimitedDeadline(fixed.allocator(), 0, .immediate),
+    );
+
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(1), "name", "delta override");
+    const expected_with_delta = try store.searchableNodeMetadataDigest(std.testing.allocator);
+    var manually_overridden = expected;
+    Store.addSearchableNodeMetadataDigest(
+        &manually_overridden,
+        0x544B_534D,
+        1,
+        nodePropertyKeyHash("name"),
+        nodePropertyValueHash(&long_name),
+        &long_name,
+    );
+    Store.addSearchableNodeMetadataDigest(
+        &manually_overridden,
+        0x544B_534D,
+        1,
+        nodePropertyKeyHash("name"),
+        nodePropertyValueHash("delta override"),
+        "delta override",
+    );
+    try std.testing.expectEqual(manually_overridden, expected_with_delta);
+    var delta_scratch: [16 * 1024]u8 = undefined;
+    var delta_fixed = std.heap.FixedBufferAllocator.init(&delta_scratch);
+    try std.testing.expectEqual(
+        expected_with_delta,
+        try store.searchableNodeMetadataDigestLimitedDeadline(
+            delta_fixed.allocator(),
+            try store.propertyPayloadDeltaByteCount(),
+            .none,
+        ),
+    );
+
+    var index_file = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_index_path, .{});
+    const index_header = try store.readPropertyPayloadIndexHeaderFromFile(index_file);
+    const name_index = try store.propertyPayloadKeyHashLowerBound(index_file, index_header.record_count, nodePropertyKeyHash("name"));
+    index_file.close(std.testing.io);
+    var values_file = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_values_path, .{ .mode = .read_write });
+    const values_header = try store.readNodePropertyValueBlockHeaderFromFile(values_file);
+    const value_record = try store.readNodePropertyValueRecordAt(values_file, name_index);
+    const payload_start = try nodePropertyValueBlockHeaderAndRecordBytes(values_header.record_count);
+    const value_offset = try std.math.add(u64, payload_start, value_record.offset);
+    var corrupt_byte: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try values_file.readPositionalAll(std.testing.io, &corrupt_byte, value_offset));
+    corrupt_byte[0] ^= 0xff;
+    try values_file.writePositionalAll(std.testing.io, &corrupt_byte, value_offset);
+    values_file.close(std.testing.io);
+    try std.testing.expectError(error.InvalidRecord, store.searchableNodeMetadataDigest(std.testing.allocator));
+}
+
+test "searchable metadata limited readers reject property delta before scanning" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    const node_id = try store.addNode(.task, "bounded metadata delta");
+    try store.setNodeStringProperty(std.testing.allocator, node_id, "summary", "searchable summary");
+
+    const delta_bytes = try store.propertyPayloadDeltaByteCount();
+    try std.testing.expect(delta_bytes > 0);
+    try std.testing.expect((try store.searchableNodeMetadataDigestLimitedDeadline(std.testing.allocator, delta_bytes, .none)) != 0);
+    try std.testing.expectError(
+        error.SearchableMetadataBudgetExceeded,
+        store.searchableNodeMetadataDigestLimitedDeadline(std.testing.allocator, delta_bytes - 1, .none),
+    );
+    try std.testing.expectError(
+        error.SearchableMetadataBudgetExceeded,
+        store.loadSearchableNodeMetadataSnapshotWithLimitsDeadline(std.testing.allocator, "searchable summary".len, delta_bytes - 1, .none),
+    );
+    try std.testing.expectError(
+        core.Error.BudgetExceeded,
+        store.searchableNodeMetadataDigestLimitedDeadline(std.testing.allocator, delta_bytes, .immediate),
+    );
+    try std.testing.expectError(
+        core.Error.BudgetExceeded,
+        store.loadSearchableNodeMetadataSnapshotWithLimitsDeadline(std.testing.allocator, "searchable summary".len, delta_bytes, .immediate),
+    );
+}
+
+test "searchable metadata effective view includes legacy fallback without duplicate overrides" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    const node_id = try store.addNode(.task, "legacy searchable metadata");
+
+    var legacy = std.ArrayList(NodePropertyIndexEntry).empty;
+    defer {
+        deinitNodePropertyIndexEntries(legacy.items, std.testing.allocator);
+        legacy.deinit(std.testing.allocator);
+    }
+    try appendNodePropertyRecordForValue(&legacy, std.testing.allocator, node_id, "name", "legacy name");
+    try appendNodePropertyRecordForValue(&legacy, std.testing.allocator, node_id, "summary", "legacy summary");
+    try store.writeNodePropertyOverlay(legacy.items);
+
+    const legacy_digest = try store.searchableNodeMetadataDigest(std.testing.allocator);
+    try std.testing.expect(legacy_digest != 0);
+
+    try store.setNodeStringProperty(std.testing.allocator, node_id, "name", "canonical name");
+    const canonical_digest = try store.searchableNodeMetadataDigest(std.testing.allocator);
+    try std.testing.expect(canonical_digest != legacy_digest);
+
+    const live_bytes = "canonical name".len + "legacy summary".len;
+    var snapshot = try store.loadSearchableNodeMetadataSnapshotLimited(std.testing.allocator, live_bytes);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.entries.len);
+    var name_count: usize = 0;
+    var summary_count: usize = 0;
+    for (snapshot.entries) |entry| {
+        const owner_matches = switch (entry.owner) {
+            .node => |id| id == node_id,
+            .edge => false,
+        };
+        if (!owner_matches) continue;
+        if (entry.key_hash == nodePropertyKeyHash("name")) {
+            name_count += 1;
+            try std.testing.expectEqualStrings("canonical name", entry.string_value);
+        } else if (entry.key_hash == nodePropertyKeyHash("summary")) {
+            summary_count += 1;
+            try std.testing.expectEqualStrings("legacy summary", entry.string_value);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), name_count);
+    try std.testing.expectEqual(@as(usize, 1), summary_count);
+    try std.testing.expectError(
+        error.SearchableMetadataBudgetExceeded,
+        store.loadSearchableNodeMetadataSnapshotLimited(std.testing.allocator, live_bytes - 1),
+    );
+}
+
+test "searchable legacy metadata snapshot does not scan unrelated value records" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    const node_id = try store.addNode(.task, "legacy key-range metadata");
+
+    var legacy = std.ArrayList(NodePropertyIndexEntry).empty;
+    defer {
+        deinitNodePropertyIndexEntries(legacy.items, std.testing.allocator);
+        legacy.deinit(std.testing.allocator);
+    }
+    try appendNodePropertyRecordForValue(&legacy, std.testing.allocator, node_id, "name", "legacy searchable name");
+    try appendNodePropertyRecordForValue(&legacy, std.testing.allocator, node_id, "status", "open");
+    try store.writeNodePropertyOverlay(legacy.items);
+
+    var index_file = try std.Io.Dir.cwd().openFile(std.testing.io, store.node_props_overlay_index_path, .{});
+    const index_header = try store.readNodePropertyIndexHeaderFromFile(index_file);
+    var unrelated_index: ?u64 = null;
+    var index: u64 = 0;
+    while (index < index_header.record_count) : (index += 1) {
+        const record = try store.readNodePropertyIndexRecordAt(index_file, index);
+        if (record.key_hash == nodePropertyKeyHash("status")) {
+            unrelated_index = index;
+            break;
+        }
+    }
+    index_file.close(std.testing.io);
+    try std.testing.expect(unrelated_index != null);
+
+    // A stale-text snapshot consumes only name/summary. Corrupting an
+    // unrelated legacy value record must remain the responsibility of a
+    // status reader or explicit validation, not turn this bounded key read
+    // back into a full legacy-overlay scan.
+    var values_file = try std.Io.Dir.cwd().openFile(std.testing.io, store.node_props_overlay_values_path, .{ .mode = .read_write });
+    const length_offset = std.math.add(u64, try nodePropertyValueRecordOffset(unrelated_index.?), 8) catch return error.RecordTooLarge;
+    const zero_len = [_]u8{0} ** 4;
+    try values_file.writePositionalAll(std.testing.io, &zero_len, length_offset);
+    values_file.close(std.testing.io);
+
+    try std.testing.expect((try store.searchableNodeMetadataDigest(std.testing.allocator)) != 0);
+    var snapshot = try store.loadSearchableNodeMetadataSnapshotLimited(std.testing.allocator, "legacy searchable name".len);
+    defer snapshot.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.entries.len);
+    try std.testing.expectEqualStrings("legacy searchable name", snapshot.entries[0].string_value);
+    try std.testing.expectError(error.InvalidRecord, store.getNodeStringProperty(std.testing.allocator, node_id, "status"));
+}
+
+test "searchable metadata digest binds values to their owners" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNodesBatch(&.{
+        .{ .id = .fromInt(1), .kind = .task, .text = "first" },
+        .{ .id = .fromInt(2), .kind = .task, .text = "second" },
+    });
+    try store.appendPropertiesBatch(std.testing.allocator, &.{
+        .{ .owner = .{ .node = .fromInt(1) }, .key = "name", .value = .{ .string = "alpha" } },
+        .{ .owner = .{ .node = .fromInt(2) }, .key = "name", .value = .{ .string = "beta" } },
+    });
+    const before = try store.searchableNodeMetadataDigest(std.testing.allocator);
+
+    _ = try store.upsertPropertiesBatch(std.testing.allocator, &.{
+        .{ .owner = .{ .node = .fromInt(1) }, .key = "name", .value = .{ .string = "beta" } },
+        .{ .owner = .{ .node = .fromInt(2) }, .key = "name", .value = .{ .string = "alpha" } },
+    });
+    const after = try store.searchableNodeMetadataDigest(std.testing.allocator);
+    try std.testing.expect(after != before);
+}
+
+test "property point lookups do not materialize unrelated base blobs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    const task_id = try store.addNode(.task, "bounded property lookup");
+    const unrelated = [_]u8{'x'} ** (64 * 1024);
+    try store.appendPropertiesBatch(std.testing.allocator, &.{
+        .{ .owner = .{ .node = task_id }, .key = "status", .value = .{ .string = "open" } },
+        .{ .owner = .{ .node = task_id }, .key = "task_recorded_ns", .value = .{ .uint = 42 } },
+        .{ .owner = .{ .node = task_id }, .key = "unrelated_blob", .value = .{ .string = &unrelated } },
+    });
+    var legacy_overlay = std.ArrayList(NodePropertyIndexEntry).empty;
+    defer {
+        deinitNodePropertyIndexEntries(legacy_overlay.items, std.testing.allocator);
+        legacy_overlay.deinit(std.testing.allocator);
+    }
+    try appendNodePropertyRecordForValue(
+        &legacy_overlay,
+        std.testing.allocator,
+        task_id,
+        "unrelated_legacy_blob",
+        &unrelated,
+    );
+    try store.writeNodePropertyOverlay(legacy_overlay.items);
+
+    // The old lookup path allocated every primary and legacy-overlay property
+    // payload and therefore exhausted this buffer on either 64 KiB value.
+    var string_scratch: [8 * 1024]u8 = undefined;
+    var string_fixed = std.heap.FixedBufferAllocator.init(&string_scratch);
+    var status_hits = try store.lookupNodeIdsByStringProperty(string_fixed.allocator(), "status", "open", .task, 10);
+    defer status_hits.deinit(string_fixed.allocator());
+    try std.testing.expectEqualSlices(core.NodeId, &.{task_id}, status_hits.items);
+
+    var uint_scratch: [8 * 1024]u8 = undefined;
+    var uint_fixed = std.heap.FixedBufferAllocator.init(&uint_scratch);
+    var recorded_hits = try store.lookupNodeIdsByUintProperty(uint_fixed.allocator(), "task_recorded_ns", 42, .task, 10);
+    defer recorded_hits.deinit(uint_fixed.allocator());
+    try std.testing.expectEqualSlices(core.NodeId, &.{task_id}, recorded_hits.items);
+}
+
 test "store node property index supports governed typed exact lookup and repair rebuild" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -43120,8 +48861,13 @@ test "store node property index supports governed typed exact lookup and repair 
     try std.testing.expectEqual(timed, repaired_hits.items[0]);
     try std.testing.expect(try store.fileExists(store.node_props_index_path));
 
-    try std.testing.expect(try store.fileExists(store.property_payload_values_path));
-    try std.Io.Dir.cwd().deleteFile(std.testing.io, store.property_payload_values_path);
+    try std.testing.expect(try store.fileExists(store.property_payload_delta_path));
+    {
+        var delta = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_delta_path, .{ .mode = .read_write });
+        defer delta.close(std.testing.io);
+        const delta_size = try store.regularFileSize(delta);
+        try delta.setLength(std.testing.io, delta_size - 1);
+    }
     try std.testing.expectError(error.InvalidRecord, store.lookupNodeIdsByStringProperty(std.testing.allocator, "summary", "overlay summary", null, 10));
 }
 
@@ -43202,9 +48948,105 @@ test "store edge property overlay supports independently writable string payload
     try std.testing.expectEqualStrings("edge summary", edge_summary);
     try std.testing.expectError(core.Error.InvalidId, store.setEdgeStringProperty(std.testing.allocator, .fromInt(99), "source_span", "missing edge"));
 
-    try std.testing.expect(try store.fileExists(store.property_payload_values_path));
-    try std.Io.Dir.cwd().deleteFile(std.testing.io, store.property_payload_values_path);
+    try std.testing.expect(try store.fileExists(store.property_payload_delta_path));
+    {
+        var delta = try std.Io.Dir.cwd().openFile(std.testing.io, store.property_payload_delta_path, .{ .mode = .read_write });
+        defer delta.close(std.testing.io);
+        const delta_size = try store.regularFileSize(delta);
+        try delta.setLength(std.testing.io, delta_size - 1);
+    }
     try std.testing.expectError(error.InvalidRecord, store.getEdgeStringProperty(std.testing.allocator, edge_id, "source_span"));
+}
+
+test "published edge overlay supports point properties external keys and delete without repair" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "store" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .durability = .fast,
+        .validate_indexes_on_read = false,
+    });
+    defer store.deinit();
+    try store.createEmpty();
+
+    try store.appendNodesBatch(&.{
+        .{ .id = .fromInt(1), .kind = .document, .text = "root" },
+        .{ .id = .fromInt(2), .kind = .observation, .text = "base" },
+        .{ .id = .fromInt(3), .kind = .observation, .text = "overlay" },
+    });
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(1), "external_key", "doc:overlay");
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(2), "external_key", "content:base");
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(3), "external_key", "content:overlay");
+
+    var base_edges = std.ArrayList(graph_mod.Edge).empty;
+    defer base_edges.deinit(std.testing.allocator);
+    try base_edges.ensureTotalCapacityPrecise(std.testing.allocator, 1024);
+    for (1..1025) |raw_id| {
+        base_edges.appendAssumeCapacity(.{
+            .id = .fromInt(raw_id),
+            .src = .fromInt(1),
+            .rel = .mentions,
+            .dst = .fromInt(2),
+        });
+    }
+    try store.appendEdgesBatch(base_edges.items);
+    try store.rebuildEdgeExternalKeyIndex();
+
+    const overlay_id: core.EdgeId = .fromInt(1025);
+    try store.appendEdgesBatch(&.{.{
+        .id = overlay_id,
+        .src = .fromInt(1),
+        .rel = .mentions,
+        .dst = .fromInt(3),
+    }});
+    const overlay_meta = try store.readCurrentIndexMeta();
+    try std.testing.expectEqual(@as(u64, 1024), overlay_meta.edge_indexed_edges);
+    try std.testing.expectEqual(@as(u64, 1), overlay_meta.edge_segment_edges);
+    try std.testing.expect(try store.edgeStorageMatchesMeta(overlay_meta, true));
+
+    const edge = try store.readEdgeById(overlay_id);
+    try std.testing.expectEqual(@as(u64, 3), edge.dst.toInt());
+    try store.setEdgeStringProperty(std.testing.allocator, overlay_id, "created_by", "overlay-agent");
+    try store.setUintProperty(std.testing.allocator, .{ .edge = overlay_id }, "order_key", 4096);
+    const created_by = (try store.getEdgeStringProperty(std.testing.allocator, overlay_id, "created_by")).?;
+    defer std.testing.allocator.free(created_by);
+    try std.testing.expectEqualStrings("overlay-agent", created_by);
+    try std.testing.expectEqual(@as(?u64, 4096), try store.getUintProperty(std.testing.allocator, .{ .edge = overlay_id }, "order_key"));
+
+    var property_hits = try store.lookupEdgeIdsByStringProperty(std.testing.allocator, "created_by", "overlay-agent", 10);
+    defer property_hits.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(core.EdgeId, &.{overlay_id}, property_hits.items);
+
+    const external_key = try edgeFactExternalKeyAlloc(std.testing.allocator, "doc:overlay", .mentions, "content:overlay");
+    defer std.testing.allocator.free(external_key);
+    try std.testing.expectEqual(overlay_id, (try store.lookupEdgeByExternalKey(std.testing.allocator, external_key)).?);
+    try store.rebuildEdgeExternalKeyIndex();
+    try std.testing.expectEqual(overlay_id, (try store.lookupEdgeByExternalKey(std.testing.allocator, external_key)).?);
+
+    const visible_refs = try store.loadEdgeRefs(std.testing.allocator);
+    defer std.testing.allocator.free(visible_refs);
+    try std.testing.expectEqual(@as(usize, 1025), visible_refs.len);
+    try std.testing.expectEqual(overlay_id, visible_refs[visible_refs.len - 1].edge_id);
+    try std.testing.expectEqual(@as(u64, 3), visible_refs[visible_refs.len - 1].dst.toInt());
+
+    try store.deleteEdge(overlay_id);
+    const deleted_meta = try store.readCurrentIndexMeta();
+    try std.testing.expectEqual(@as(u64, 1024), deleted_meta.edge_indexed_edges);
+    try std.testing.expectEqual(@as(u64, 1), deleted_meta.edge_segment_edges);
+    try std.testing.expectError(core.Error.InvalidId, store.readEdgeById(overlay_id));
+    try std.testing.expectEqual(@as(?core.EdgeId, null), try store.lookupEdgeByExternalKey(std.testing.allocator, external_key));
+    var deleted_property_hits = try store.lookupEdgeIdsByStringProperty(std.testing.allocator, "created_by", "overlay-agent", 10);
+    defer deleted_property_hits.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), deleted_property_hits.items.len);
+    const refs_after_delete = try store.loadEdgeRefs(std.testing.allocator);
+    defer std.testing.allocator.free(refs_after_delete);
+    try std.testing.expectEqual(@as(usize, 1024), refs_after_delete.len);
 }
 
 test "store edge external key index supports fact and ordered projection lookup" {
@@ -43679,7 +49521,9 @@ test "store defaults to fast reads with explicit full index validation" {
     const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
     defer std.testing.allocator.free(store_path);
 
-    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    var store = try Store.initWithOptions(std.testing.allocator, std.testing.io, store_path, .{
+        .primary_text_write_mode = .bulk_ingest,
+    });
     defer store.deinit();
     try std.testing.expect(!store.options.validate_indexes_on_read);
     try store.createEmpty();
@@ -43989,6 +49833,120 @@ test "store repairs corrupt persistent text index during snapshot load" {
     try std.testing.expectEqual(@as(usize, 1), matches.items.len);
 }
 
+test "visible base edge iterator bounds tombstone scans" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ path_buf[0..root_len], "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNodesBatch(&.{
+        .{ .id = .fromInt(1), .kind = .concept, .text = "source" },
+        .{ .id = .fromInt(2), .kind = .concept, .text = "deleted target" },
+        .{ .id = .fromInt(3), .kind = .concept, .text = "visible target" },
+    });
+    try store.appendEdgesBatch(&.{
+        .{ .id = .fromInt(1), .src = .fromInt(1), .rel = .mentions, .dst = .fromInt(2) },
+        .{ .id = .fromInt(2), .src = .fromInt(1), .rel = .mentions, .dst = .fromInt(3) },
+    });
+    try store.deleteEdge(.fromInt(1));
+
+    var capped = try store.edgeIndexRecordsByNodeIterator(.src, .fromInt(1));
+    defer capped.deinit();
+    capped.max_physical_records = 1;
+    try std.testing.expectError(core.Error.BudgetExceeded, capped.next());
+
+    var visible = try store.readVisibleEdgeIndexRecordsByNodeLimited(
+        std.testing.allocator,
+        .src,
+        .fromInt(1),
+        .mentions,
+        1,
+    );
+    defer visible.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), visible.items.len);
+    try std.testing.expectEqual(@as(u64, 2), visible.items[0].edge_id);
+}
+
+test "visible edge by-node visitor merges reverse delta overlay and tombstones" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+    const base_segment_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "edge-base" });
+    defer std.testing.allocator.free(base_segment_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNodesBatch(&.{
+        .{ .id = .fromInt(1), .kind = .file, .text = "old source" },
+        .{ .id = .fromInt(2), .kind = .file, .text = "shared target" },
+        .{ .id = .fromInt(3), .kind = .file, .text = "delta source" },
+    });
+    try store.appendEdge(.{ .id = .fromInt(1), .src = .fromInt(1), .rel = .mentions, .dst = .fromInt(2) });
+    try std.testing.expectEqual(@as(u64, 1), try store.publishEdgeAdjacencySegment(base_segment_path));
+    try store.appendEdge(.{ .id = .fromInt(2), .src = .fromInt(3), .rel = .defines, .dst = .fromInt(2) });
+    try store.deleteEdge(.fromInt(1));
+    try store.appendEdge(.{ .id = .fromInt(3), .src = .fromInt(1), .rel = .mentions, .dst = .fromInt(3) });
+
+    var incoming = try store.readVisibleEdgeIndexRecordsByNode(std.testing.allocator, .dst, .fromInt(2), null);
+    defer incoming.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), incoming.items.len);
+    try std.testing.expectEqual(@as(u64, 2), incoming.items[0].edge_id);
+    try std.testing.expectEqual(@as(u64, 3), incoming.items[0].src);
+
+    var old_mentions = try store.readVisibleEdgeIndexRecordsByNode(std.testing.allocator, .src, .fromInt(1), .mentions);
+    defer old_mentions.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), old_mentions.items.len);
+    try std.testing.expectEqual(@as(u64, 3), old_mentions.items[0].edge_id);
+    var limited_mentions = try store.readVisibleEdgeIndexRecordsByNodeLimited(std.testing.allocator, .src, .fromInt(1), .mentions, 1);
+    defer limited_mentions.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), limited_mentions.items.len);
+    try std.testing.expectEqual(@as(u64, 3), limited_mentions.items[0].edge_id);
+
+    var retention_registry = EdgeSegmentRetentionRegistry.init(std.testing.allocator);
+    defer retention_registry.deinit();
+    const RetainedContext = struct {
+        registry: *EdgeSegmentRetentionRegistry,
+        observed_pin: bool = false,
+
+        fn visit(context: *@This(), record: EdgeIndexRecord) !bool {
+            try std.testing.expectEqual(@as(u64, 2), record.edge_id);
+            const active_paths = try context.registry.activeManifestPaths(std.testing.allocator);
+            defer std.testing.allocator.free(active_paths);
+            try std.testing.expectEqual(@as(usize, 1), active_paths.len);
+            context.observed_pin = true;
+            return true;
+        }
+    };
+    var retained_context = RetainedContext{ .registry = &retention_registry };
+    const stopped = try store.forEachVisibleEdgeIndexRecordByNodeRetained(
+        std.testing.allocator,
+        &retention_registry,
+        .src,
+        .fromInt(3),
+        .defines,
+        1,
+        &retained_context,
+        RetainedContext.visit,
+    );
+    try std.testing.expect(stopped);
+    try std.testing.expect(retained_context.observed_pin);
+    const active_paths = try retention_registry.activeManifestPaths(std.testing.allocator);
+    defer std.testing.allocator.free(active_paths);
+    try std.testing.expectEqual(@as(usize, 0), active_paths.len);
+}
+
 test "node rewrite preserves edge segment overlay edges" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -44084,4 +50042,112 @@ test "node rewrite preserves edge segment overlay edges" {
     }
     try std.testing.expectEqual(@as(usize, @intCast(base_edge_count + 1)), active_edges);
     try std.testing.expect(overlay_edge_found);
+}
+
+test "node rewrite preserves schema catalog and store format manifest" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    _ = try store.addNode(.task, "task before rewrite");
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(1), "status", "completed");
+    try store.setUintProperty(std.testing.allocator, .{ .node = .fromInt(1) }, "task_completed_ns", 123);
+
+    var registry = schema.Registry.init(std.testing.allocator);
+    errdefer registry.deinit();
+    try registry.addKernelTypes();
+    try registry.addBuiltinProfile(.agent_dag);
+    var cat = try catalog_mod.Catalog.fromRegistry(std.testing.allocator, registry);
+    registry = schema.Registry.init(std.testing.allocator);
+    defer cat.deinit();
+    try store.writeCatalog(cat);
+
+    const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ store_path, ".tinykg", "store-manifest.json" });
+    defer std.testing.allocator.free(manifest_path);
+    const manifest_dir = std.fs.path.dirname(manifest_path) orelse return error.TestUnexpectedResult;
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, manifest_dir);
+    const manifest =
+        \\{"store_manifest_version":1,"storage_format_version":2,"schema":{"schema_version":3,"enabled_profiles":["agent-dag"]}}
+    ;
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{
+        .sub_path = manifest_path,
+        .data = manifest,
+        .flags = .{ .truncate = true },
+    });
+
+    const catalog_before = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, store.catalog_path, std.testing.allocator, .limited(catalog_max_bytes));
+    defer std.testing.allocator.free(catalog_before);
+
+    _ = try store.updateNode(.fromInt(1), .task, "task after rewrite");
+
+    const catalog_after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, store.catalog_path, std.testing.allocator, .limited(catalog_max_bytes));
+    defer std.testing.allocator.free(catalog_after);
+    try std.testing.expectEqualSlices(u8, catalog_before, catalog_after);
+
+    const manifest_after = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, manifest_path, std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(manifest_after);
+    try std.testing.expectEqualStrings(manifest, manifest_after);
+
+    var decoded = (try store.readCatalog()) orelse return error.TestUnexpectedResult;
+    defer decoded.deinit();
+    try std.testing.expect(decoded.registry.hasNodeTypeId(@intFromEnum(core.NodeKind.task)));
+    const status_after = (try store.getNodeStringProperty(std.testing.allocator, .fromInt(1), "status")).?;
+    defer std.testing.allocator.free(status_after);
+    try std.testing.expectEqualStrings("completed", status_after);
+    try std.testing.expectEqual(@as(?u64, 123), try store.getUintProperty(std.testing.allocator, .{ .node = .fromInt(1) }, "task_completed_ns"));
+}
+
+test "node delete preserves unrelated latest property payload entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const root_path = path_buf[0..root_len];
+    const store_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "kg" });
+    defer std.testing.allocator.free(store_path);
+
+    var store = try Store.init(std.testing.allocator, std.testing.io, store_path);
+    defer store.deinit();
+    try store.createEmpty();
+    try store.appendNodesBatch(&.{
+        .{ .id = .fromInt(1), .kind = .concept, .text = "delete me" },
+        .{ .id = .fromInt(2), .kind = .concept, .text = "survivor" },
+        .{ .id = .fromInt(3), .kind = .concept, .text = "other" },
+    });
+    try store.appendEdgesBatch(&.{
+        .{ .id = .fromInt(1), .src = .fromInt(1), .rel = .mentions, .dst = .fromInt(2) },
+        .{ .id = .fromInt(2), .src = .fromInt(2), .rel = .mentions, .dst = .fromInt(3) },
+    });
+
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(1), "name", "deleted-owner");
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(2), "name", "survivor-base");
+    try store.setEdgeStringProperty(std.testing.allocator, .fromInt(1), "created_by", "deleted-edge");
+    try store.setEdgeStringProperty(std.testing.allocator, .fromInt(2), "created_by", "survivor-edge-base");
+    const compacted = try store.compactPropertyPayloadDelta(std.testing.allocator);
+    try std.testing.expect(compacted.compacted);
+    try store.setNodeStringProperty(std.testing.allocator, .fromInt(2), "name", "survivor-delta");
+    try store.setEdgeStringProperty(std.testing.allocator, .fromInt(2), "created_by", "survivor-edge-delta");
+
+    const deleted = try store.deleteNode(.fromInt(1));
+    try std.testing.expectEqual(@as(u64, 1), deleted.edges_removed);
+
+    const survivor_name = (try store.getNodeStringProperty(std.testing.allocator, .fromInt(2), "name")).?;
+    defer std.testing.allocator.free(survivor_name);
+    try std.testing.expectEqualStrings("survivor-delta", survivor_name);
+    const survivor_edge = (try store.getEdgeStringProperty(std.testing.allocator, .fromInt(2), "created_by")).?;
+    defer std.testing.allocator.free(survivor_edge);
+    try std.testing.expectEqualStrings("survivor-edge-delta", survivor_edge);
+    try std.testing.expect((try store.getNodeStringProperty(std.testing.allocator, .fromInt(1), "name")) == null);
+    var removed_edge_property = try store.readPropertyPayloadEntryForKey(std.testing.allocator, .{ .edge = .fromInt(1) }, "created_by");
+    defer if (removed_edge_property) |*entry| entry.deinit(std.testing.allocator);
+    try std.testing.expect(removed_edge_property == null);
 }

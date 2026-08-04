@@ -9,6 +9,15 @@ pub const node_descendant_fast_cap: u16 = 128;
 pub const relation_descendant_fast_cap: u16 = 64;
 pub const max_traits: u16 = 64;
 pub const max_traits_per_node: u8 = 8;
+pub const max_enum_values: u8 = 32;
+pub const max_enum_value_bytes: u8 = 63;
+
+pub const task_status_enum_values = [_][]const u8{
+    "open",
+    "claimed",
+    "completed",
+    "failed",
+};
 
 pub const md_rel_h1_id: u16 = 3000;
 pub const md_rel_h2_id: u16 = 3001;
@@ -35,11 +44,11 @@ pub const md_rel_text_chunk_id: u16 = 3023;
 /// 否则 comptime 单测(cli composition membership)红——防"新 md rel 静默漏出 search --project
 /// membership"(markdown 召回全灭 bug 的复刻)。精确集合而非区间:3006..3009 空隙不误染。
 pub const md_projection_rel_ids = [_]u16{
-    md_rel_h1_id,             md_rel_h2_id,        md_rel_h3_id,    md_rel_h4_id,
-    md_rel_h5_id,             md_rel_h6_id,        md_rel_paragraph_id, md_rel_code_block_id,
-    md_rel_image_id,          md_rel_list_id,      md_rel_blockquote_id, md_rel_html_block_id,
-    md_rel_footnote_def_id,   md_rel_link_reference_id, md_rel_thematic_break_id, md_rel_raw_block_id,
-    md_rel_table_id,          md_rel_table_row_id, md_rel_table_cell_id, md_rel_text_chunk_id,
+    md_rel_h1_id,           md_rel_h2_id,             md_rel_h3_id,             md_rel_h4_id,
+    md_rel_h5_id,           md_rel_h6_id,             md_rel_paragraph_id,      md_rel_code_block_id,
+    md_rel_image_id,        md_rel_list_id,           md_rel_blockquote_id,     md_rel_html_block_id,
+    md_rel_footnote_def_id, md_rel_link_reference_id, md_rel_thematic_break_id, md_rel_raw_block_id,
+    md_rel_table_id,        md_rel_table_row_id,      md_rel_table_cell_id,     md_rel_text_chunk_id,
 };
 
 /// rel 是否 md:* 投影关系(document→heading→paragraph 结构边)。
@@ -62,6 +71,7 @@ pub const Error = error{
     TooManyParents,
     InheritanceTooDeep,
     DescendantSetTooBroad,
+    InvalidEnumValues,
 };
 
 pub const BuiltinProfile = enum {
@@ -207,7 +217,7 @@ const TypeDef = struct {
 
     fn deinit(self: *TypeDef, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
-        for (self.properties.items) |property| allocator.free(property.name);
+        for (self.properties.items) |property| deinitPropertyMeta(allocator, property);
         self.properties.deinit(allocator);
     }
 
@@ -307,6 +317,9 @@ pub const PropertyType = enum(u8) {
 pub const PropertyMeta = struct {
     name: []const u8,
     value_type: PropertyType = .string,
+    /// Closed string domain for enum properties. Empty is accepted only for
+    /// catalogs written before enum domains were persisted.
+    enum_values: []const []const u8 = &.{},
     required: bool = false,
     nullable: bool = true,
     agent_fillable: bool = false,
@@ -314,6 +327,17 @@ pub const PropertyMeta = struct {
     indexed: bool = false,
     searchable: bool = false,
     returned_by_default: bool = false,
+
+    pub fn enumAllows(self: PropertyMeta, value: []const u8) bool {
+        if (self.value_type != .@"enum") return false;
+        // Legacy v2 catalogs had an enum tag but no persisted domain. Keep
+        // those readable; newly parsed schemas require a non-empty domain.
+        if (self.enum_values.len == 0) return true;
+        for (self.enum_values) |candidate| {
+            if (std.mem.eql(u8, candidate, value)) return true;
+        }
+        return false;
+    }
 };
 
 pub const CompositionCardinality = enum(u8) {
@@ -581,14 +605,69 @@ pub const Registry = struct {
     }
 
     pub fn addBuiltinProfile(self: *Registry, profile: BuiltinProfile) !void {
+        return try self.addBuiltinProfileForSchemaVersion(profile, 3);
+    }
+
+    /// Build the profile contract promised by a store manifest. Schema v2
+    /// predates durable task lifecycle properties; schema v3 makes `status`
+    /// required and adds lease/timestamp fields. Storage-only compatibility
+    /// migrations must not publish the v3 contract under a v2 manifest.
+    pub fn addBuiltinProfileForSchemaVersion(self: *Registry, profile: BuiltinProfile, schema_version: u32) !void {
+        if (schema_version < 1 or schema_version > 3) return error.InvalidSchemaVersion;
         return switch (profile) {
-            .agent_dag => self.addAgentDagProfile(),
+            .agent_dag => self.addAgentDagProfile(schema_version >= 3),
             .markdown_document => self.addMarkdownDocumentProfile(),
         };
     }
 
-    fn addAgentDagProfile(self: *Registry) !void {
+    /// Install the canonical task lifecycle properties on an already
+    /// registered task type.  Store migrations use this narrower operation
+    /// to upgrade an embedded catalog without re-adding every agent-dag type
+    /// and relation (which may include project-specific extensions).
+    pub fn setTaskLifecycleProperties(self: *Registry) !void {
+        const task_type = @intFromEnum(core.NodeKind.task);
+        if (!self.hasNodeTypeId(task_type)) return Error.UnknownParentType;
+        try self.setNodeProperty(task_type, .{
+            .name = "status",
+            .value_type = .@"enum",
+            .enum_values = &task_status_enum_values,
+            .required = true,
+            .nullable = false,
+            .indexed = true,
+            .returned_by_default = true,
+        });
+        try self.setNodeProperty(task_type, .{
+            .name = "claimed_by",
+            .value_type = .string,
+            .required = false,
+            .nullable = true,
+            .indexed = true,
+            .returned_by_default = true,
+        });
+        try self.setNodeProperty(task_type, .{
+            .name = "claim_expires_ns",
+            .value_type = .uint,
+            .required = false,
+            .nullable = true,
+            .indexed = false,
+        });
+        inline for (.{ "task_recorded_ns", "task_created_ns", "task_completed_ns" }) |property_name| {
+            try self.setNodeProperty(task_type, .{
+                .name = property_name,
+                .value_type = .uint,
+                .required = false,
+                .nullable = true,
+                .indexed = true,
+            });
+        }
+    }
+
+    fn addAgentDagProfile(self: *Registry, include_task_lifecycle: bool) !void {
         try self.addNodeType("task", @intFromEnum(core.NodeKind.task), &.{kernel_node_type_id});
+        // Lifecycle is a property, never a node-kind transition. The v3
+        // schema requires `status`; pre-v3 stores remain readable through the
+        // task compatibility path until an explicit migration materializes it.
+        if (include_task_lifecycle) try self.setTaskLifecycleProperties();
         try self.addNodeType("decision", @intFromEnum(core.NodeKind.decision), &.{kernel_node_type_id});
         try self.addNodeType("evidence", @intFromEnum(core.NodeKind.evidence), &.{kernel_node_type_id});
         try self.addNodeType("verification", @intFromEnum(core.NodeKind.verification), &.{kernel_node_type_id});
@@ -744,20 +823,30 @@ pub const Registry = struct {
 
     fn setTypeProperty(self: *Registry, types: *std.ArrayList(TypeDef), lookup: *std.StringHashMap(PropertyMeta), comptime prefix: []const u8, id: u16, property: PropertyMeta) !void {
         try validatePropertyName(property.name);
+        try validatePropertyEnumValues(property);
         const type_def = findTypePtrById(types.items, id) orelse return Error.UnknownParentType;
         for (type_def.properties.items) |*existing| {
             if (!std.ascii.eqlIgnoreCase(existing.name, property.name)) continue;
-            const old_name = existing.name;
-            existing.* = property;
-            existing.name = old_name;
-            try self.putCompiledProperty(lookup, prefix, id, existing.*);
+            var canonical_property = property;
+            canonical_property.name = existing.name;
+            const owned = try clonePropertyMeta(self.allocator, canonical_property);
+            errdefer deinitPropertyMeta(self.allocator, owned);
+            const old = existing.*;
+            existing.* = owned;
+            self.putCompiledProperty(lookup, prefix, id, existing.*) catch |err| {
+                existing.* = old;
+                return err;
+            };
+            deinitPropertyMeta(self.allocator, old);
             return;
         }
-        var owned = property;
-        owned.name = try self.allocator.dupe(u8, property.name);
-        errdefer self.allocator.free(owned.name);
+        const owned = try clonePropertyMeta(self.allocator, property);
+        errdefer deinitPropertyMeta(self.allocator, owned);
         try type_def.properties.append(self.allocator, owned);
-        try self.putCompiledProperty(lookup, prefix, id, owned);
+        self.putCompiledProperty(lookup, prefix, id, owned) catch |err| {
+            _ = type_def.properties.pop();
+            return err;
+        };
     }
 
     fn putCompiledProperty(self: *Registry, lookup: *std.StringHashMap(PropertyMeta), comptime prefix: []const u8, type_id: u16, property: PropertyMeta) !void {
@@ -782,6 +871,47 @@ const max_property_name_bytes = 128;
 
 fn validatePropertyName(name: []const u8) !void {
     if (name.len == 0 or name.len > max_property_name_bytes) return Error.InvalidPropertyName;
+}
+
+fn validatePropertyEnumValues(property: PropertyMeta) !void {
+    if (property.value_type != .@"enum") {
+        if (property.enum_values.len != 0) return Error.InvalidEnumValues;
+        return;
+    }
+    if (property.enum_values.len > max_enum_values) return Error.InvalidEnumValues;
+    for (property.enum_values, 0..) |value, index| {
+        if (value.len == 0 or value.len > max_enum_value_bytes) return Error.InvalidEnumValues;
+        for (property.enum_values[0..index]) |previous| {
+            if (std.mem.eql(u8, previous, value)) return Error.InvalidEnumValues;
+        }
+    }
+}
+
+fn clonePropertyMeta(allocator: std.mem.Allocator, property: PropertyMeta) !PropertyMeta {
+    var owned = property;
+    owned.name = try allocator.dupe(u8, property.name);
+    errdefer allocator.free(owned.name);
+    if (property.enum_values.len == 0) {
+        owned.enum_values = &.{};
+        return owned;
+    }
+    const values = try allocator.alloc([]const u8, property.enum_values.len);
+    errdefer allocator.free(values);
+    var cloned: usize = 0;
+    errdefer for (values[0..cloned]) |value| allocator.free(value);
+    for (property.enum_values, 0..) |value, index| {
+        values[index] = try allocator.dupe(u8, value);
+        cloned += 1;
+    }
+    owned.enum_values = values;
+    return owned;
+}
+
+fn deinitPropertyMeta(allocator: std.mem.Allocator, property: PropertyMeta) void {
+    allocator.free(property.name);
+    if (property.enum_values.len == 0) return;
+    for (property.enum_values) |value| allocator.free(value);
+    allocator.free(property.enum_values);
 }
 
 fn typeInfo(type_def: *const TypeDef) TypeInfo {
@@ -1092,6 +1222,82 @@ test "schema kernel is clean and builtin profiles are explicit" {
     const info = registry.relationTypeInfo(registry.relationTypeCount() - 1).?;
     try std.testing.expectEqual(@as(u16, 3500), info.id);
     try std.testing.expectEqual(RelationClass.md, info.class);
+}
+
+test "agent dag task schema exposes lifecycle properties without changing kind" {
+    var registry = Registry.init(std.testing.allocator);
+    defer registry.deinit();
+    try registry.addDefaultTypes();
+    try registry.addBuiltinProfile(.agent_dag);
+
+    const task_type = @intFromEnum(core.NodeKind.task);
+    const status = registry.nodePropertyByTypeId(task_type, "status").?;
+    try std.testing.expectEqual(PropertyType.@"enum", status.value_type);
+    try std.testing.expect(status.indexed);
+    try std.testing.expect(status.returned_by_default);
+    try std.testing.expect(status.required);
+    try std.testing.expectEqual(task_status_enum_values.len, status.enum_values.len);
+    for (&task_status_enum_values, status.enum_values) |expected, actual| {
+        try std.testing.expectEqualStrings(expected, actual);
+    }
+    try std.testing.expect(status.enumAllows("open"));
+    try std.testing.expect(status.enumAllows("failed"));
+    try std.testing.expect(!status.enumAllows("done-ish"));
+    try std.testing.expectEqual(PropertyType.string, registry.nodePropertyByTypeId(task_type, "claimed_by").?.value_type);
+    try std.testing.expectEqual(PropertyType.uint, registry.nodePropertyByTypeId(task_type, "claim_expires_ns").?.value_type);
+    try std.testing.expectEqual(PropertyType.uint, registry.nodePropertyByTypeId(task_type, "task_completed_ns").?.value_type);
+}
+
+test "schema enum domains are owned inherited and validated" {
+    var registry = Registry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try registry.addNodeType("Workflow", 100, &.{});
+    try registry.setNodeProperty(100, .{
+        .name = "state",
+        .value_type = .@"enum",
+        .enum_values = &.{ "draft", "published" },
+    });
+    try registry.addNodeType("Article", 101, &.{100});
+
+    const inherited = registry.nodePropertyByTypeId(101, "state").?;
+    try std.testing.expect(inherited.enumAllows("draft"));
+    try std.testing.expect(!inherited.enumAllows("deleted"));
+    try std.testing.expectError(Error.InvalidEnumValues, registry.setNodeProperty(100, .{
+        .name = "bad",
+        .value_type = .string,
+        .enum_values = &.{"unexpected"},
+    }));
+    try std.testing.expectError(Error.InvalidEnumValues, registry.setNodeProperty(100, .{
+        .name = "duplicate",
+        .value_type = .@"enum",
+        .enum_values = &.{ "same", "same" },
+    }));
+}
+
+test "case-insensitive property replacement preserves canonical lookup ownership" {
+    var registry = Registry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    try registry.addNodeType("Workflow", 100, &.{});
+    try registry.setNodeProperty(100, .{
+        .name = "State",
+        .value_type = .@"enum",
+        .enum_values = &.{"draft"},
+    });
+    const property_count = registry.nodePropertyCount(100);
+    try registry.setNodeProperty(100, .{
+        .name = "state",
+        .value_type = .@"enum",
+        .enum_values = &.{"published"},
+    });
+
+    try std.testing.expectEqual(property_count, registry.nodePropertyCount(100));
+    const state = registry.nodePropertyByTypeId(100, "State").?;
+    try std.testing.expectEqualStrings("State", state.name);
+    try std.testing.expect(state.enumAllows("published"));
+    try std.testing.expect(!state.enumAllows("draft"));
+    try std.testing.expect(registry.nodePropertyByTypeId(100, "state") == null);
 }
 
 test "schema filters preserve single-type fast path and support descendant sets" {
