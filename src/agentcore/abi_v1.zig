@@ -37,8 +37,28 @@ const allocator = std.heap.c_allocator;
 comptime {
     if (wire.MAX_TOOL_ERROR_PAYLOAD_BYTES_V1 != @as(u64, core.tool_exec.MAX_TOOL_ERROR_PAYLOAD_BYTES_V1))
         @compileError("AgentCore wire and core encoded Host-error limits must match");
-    if ((skill_catalog.Limits{}).max_slots != @as(usize, @intCast(wire.MAX_SKILL_CATALOG_SKILLS_V1)))
-        @compileError("AgentCore wire and Skill catalog slot limits must match");
+    const catalog_limits = skill_catalog.Limits{};
+    if (catalog_limits.max_slots != @as(usize, @intCast(wire.MAX_SKILL_CATALOG_SKILLS_V1)) or
+        catalog_limits.max_descriptor_bytes != @as(usize, @intCast(wire.MAX_SKILL_CATALOG_DESCRIPTOR_BYTES_V1)) or
+        catalog_limits.max_file_content_bytes != @as(usize, @intCast(wire.MAX_SKILL_FILE_CONTENT_BYTES_V1)) or
+        catalog_limits.max_skill_content_bytes != @as(usize, @intCast(wire.MAX_SKILL_CONTENT_BYTES_V1)) or
+        catalog_limits.max_skill_files != @as(usize, @intCast(wire.MAX_SKILL_FILES_V1)) or
+        catalog_limits.max_skill_entries != @as(usize, @intCast(wire.MAX_SKILL_ENTRIES_V1)) or
+        catalog_limits.max_depth != @as(usize, @intCast(wire.MAX_SKILL_DIRECTORY_DEPTH_V1)) or
+        catalog_limits.max_relative_path_bytes != @as(usize, @intCast(wire.MAX_SKILL_RELATIVE_PATH_BYTES_V1)) or
+        catalog_limits.max_catalog_content_bytes != @as(usize, @intCast(wire.MAX_SKILL_CATALOG_CONTENT_BYTES_V1)) or
+        catalog_limits.max_catalog_files != @as(usize, @intCast(wire.MAX_SKILL_CATALOG_FILES_V1)) or
+        catalog_limits.max_visited_entries != @as(usize, @intCast(wire.MAX_SKILL_CATALOG_TRAVERSAL_ENTRIES_V1)) or
+        skill_catalog_handles.MAX_LIVE_SNAPSHOT_BYTES != @as(usize, @intCast(wire.MAX_SKILL_RUNTIME_RETAINED_SNAPSHOT_BYTES_V1)))
+        @compileError("AgentCore wire and canonical Skill catalog limits must match");
+    const canonical_reasons = std.meta.fields(skill_catalog.ResourceReason);
+    const public_reasons = std.meta.fields(public_protocol.SkillCatalogResourceReason);
+    if (canonical_reasons.len != public_reasons.len)
+        @compileError("AgentCore public and canonical Skill resource reasons must match");
+    for (canonical_reasons, public_reasons) |canonical, public| {
+        if (!std.mem.eql(u8, canonical.name, public.name) or canonical.value != public.value)
+            @compileError("AgentCore public and canonical Skill resource reason tags must match");
+    }
     const permission_limits = core.permission_settings.RuleSetLimits{};
     if (permission_limits.max_rules != @as(usize, @intCast(wire.MAX_PERMISSION_RULES_V1)) or
         permission_limits.max_rule_bytes != @as(usize, @intCast(wire.MAX_PERMISSION_RULE_BYTES_V1)) or
@@ -8334,7 +8354,7 @@ test "Revision 6 AgentCore restore degrades unavailable and changed Skill author
         .skills = &.{record},
         .issues = &.{},
         .descriptor_json = "",
-        .snapshot_bytes = 0,
+        .content_bytes = 0,
         .resident_bytes = 0,
     };
     var selection = try skill_availability.Selection.init(
@@ -9323,7 +9343,7 @@ test "disabled AgentCore Skill fails before admission and materialization" {
         .skills = &.{record},
         .issues = &.{},
         .descriptor_json = "",
-        .snapshot_bytes = 0,
+        .content_bytes = 0,
         .resident_bytes = 0,
     };
     var cell = skill_catalog_handles.CatalogCell{
@@ -9982,7 +10002,7 @@ test "Skill materialization is post-admission and pre-Conversation" {
         .skills = &.{record},
         .issues = &.{},
         .descriptor_json = "",
-        .snapshot_bytes = 0,
+        .content_bytes = 0,
         .resident_bytes = 0,
     };
     _ = &snapshot;
@@ -10117,7 +10137,7 @@ test "typed Skill invocation record is deterministic and JSON-safe" {
         .skills = &.{record},
         .issues = &.{},
         .descriptor_json = "",
-        .snapshot_bytes = 0,
+        .content_bytes = 0,
         .resident_bytes = 0,
     };
     _ = &snapshot;

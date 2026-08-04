@@ -233,6 +233,11 @@ fn renderReadme(
         \\
         \\The ABI is experimental and requires an exact revision match. Ownership, lifetime, concurrency,
         \\and failure contracts are defined by `doc/AGENTCORE_BINARY_ABI.md` at the source commit above.
+        \\The public header and bindings expose the complete Skill catalog resource contract: 16 MiB per
+        \\file, 32 MiB/1024 files/4096 entries per Skill, 64 MiB/16384 files/1024 slots per catalog,
+        \\65536 traversal entries, depth 64, 4096-byte relative paths, a 4 MiB descriptor, and
+        \\256 MiB of retained catalog snapshots per Runtime. `invalid_resource` issues carry a typed
+        \\reason; a single invalid Skill degrades the catalog without removing valid siblings.
         \\
     , .{ version, target, zig_target, rust_target, commit });
 }

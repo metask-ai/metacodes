@@ -7,6 +7,17 @@ comptime {
     if (@hasDecl(wire, "SessionRefreshSkillCatalogFnV1") or
         @hasField(wire.ApiV1, "session_refresh_skill_catalog"))
         @compileError("revision 6 must not expose the removed catalog refresh entry");
+    if (wire.MAX_SKILL_FILE_CONTENT_BYTES_V1 != 16 * 1024 * 1024 or
+        wire.MAX_SKILL_CONTENT_BYTES_V1 != 32 * 1024 * 1024 or
+        wire.MAX_SKILL_FILES_V1 != 1024 or
+        wire.MAX_SKILL_ENTRIES_V1 != 4096 or
+        wire.MAX_SKILL_DIRECTORY_DEPTH_V1 != 64 or
+        wire.MAX_SKILL_RELATIVE_PATH_BYTES_V1 != 4096 or
+        wire.MAX_SKILL_CATALOG_CONTENT_BYTES_V1 != 64 * 1024 * 1024 or
+        wire.MAX_SKILL_CATALOG_FILES_V1 != 16384 or
+        wire.MAX_SKILL_CATALOG_TRAVERSAL_ENTRIES_V1 != 65536 or
+        wire.MAX_SKILL_RUNTIME_RETAINED_SNAPSHOT_BYTES_V1 != 256 * 1024 * 1024)
+        @compileError("source-free Skill catalog limits must match the public contract");
 }
 
 const ASK_SSE =
@@ -285,6 +296,23 @@ pub fn main(init: std.process.Init) !void {
         .sub_path = workctl_path,
         .data = "---\nname: Workctl\ndescription: Second source-free typed invocation fixture\narguments: [target]\n---\nWORKCTL_SKILL_SENTINEL $target",
     });
+    const oversized_dir = try std.fs.path.join(a, &.{ workspace, ".agents", "skills", "oversized" });
+    try std.Io.Dir.cwd().createDirPath(init.io, oversized_dir);
+    const oversized_skill_path = try std.fs.path.join(a, &.{ oversized_dir, "SKILL.md" });
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = oversized_skill_path,
+        .data = "---\nname: Oversized\n---\nOVERSIZED_SKILL_SENTINEL",
+    });
+    const oversized_asset = try a.alloc(
+        u8,
+        @as(usize, @intCast(wire.MAX_SKILL_FILE_CONTENT_BYTES_V1)) + 1,
+    );
+    @memset(oversized_asset, 'x');
+    const oversized_asset_path = try std.fs.path.join(a, &.{ oversized_dir, "asset.bin" });
+    try std.Io.Dir.cwd().writeFile(init.io, .{
+        .sub_path = oversized_asset_path,
+        .data = oversized_asset,
+    });
     // Source-free proof: the model supplies a relative file path and the
     // binary facade resolves it against workspace_root, not process cwd.
     const read_sse = try readToolSse(a, file_name);
@@ -354,6 +382,14 @@ pub fn main(init: std.process.Init) !void {
         .ptr = descriptor.ptr,
         .len = descriptor.len,
     });
+    const decoded_catalog = try sdk.decodeSkillCatalog(a, descriptor_bytes);
+    defer decoded_catalog.deinit();
+    if (decoded_catalog.value.health != .degraded or
+        decoded_catalog.value.issues.len != 1 or
+        decoded_catalog.value.issues[0].code != .invalid_resource or
+        decoded_catalog.value.issues[0].reason != .file_too_large or
+        !std.mem.eql(u8, decoded_catalog.value.issues[0].invocation_name orelse "", "oversized"))
+        return error.InvalidCatalogIsolation;
     const identities = try catalogIdentities(a, descriptor_bytes, "review");
     const workctl_identities = try catalogIdentities(a, descriptor_bytes, "workctl");
     if (!std.mem.eql(u8, identities.revision, workctl_identities.revision) or

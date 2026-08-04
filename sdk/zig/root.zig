@@ -20,6 +20,7 @@ pub const SkillArgumentSchema = protocol.SkillArgumentSchema;
 pub const SkillCatalogIssue = protocol.SkillCatalogIssue;
 pub const SkillCatalogHealth = protocol.SkillCatalogHealth;
 pub const SkillCatalogIssueCode = protocol.SkillCatalogIssueCode;
+pub const SkillCatalogResourceReason = protocol.SkillCatalogResourceReason;
 pub const SkillSourceScope = protocol.SkillSourceScope;
 pub const McpCatalog = protocol.McpCatalog;
 pub const SessionDescription = protocol.SessionDescription;
@@ -45,6 +46,17 @@ pub const encodeSkillArguments = protocol.encodeSkillArguments;
 
 comptime {
     if (protocol.MAX_SKILL_CATALOG_SKILLS_V1 != types.MAX_SKILL_CATALOG_SKILLS_V1 or
+        protocol.MAX_SKILL_CATALOG_DESCRIPTOR_BYTES_V1 != types.MAX_SKILL_CATALOG_DESCRIPTOR_BYTES_V1 or
+        protocol.MAX_SKILL_FILE_CONTENT_BYTES_V1 != types.MAX_SKILL_FILE_CONTENT_BYTES_V1 or
+        protocol.MAX_SKILL_CONTENT_BYTES_V1 != types.MAX_SKILL_CONTENT_BYTES_V1 or
+        protocol.MAX_SKILL_FILES_V1 != types.MAX_SKILL_FILES_V1 or
+        protocol.MAX_SKILL_ENTRIES_V1 != types.MAX_SKILL_ENTRIES_V1 or
+        protocol.MAX_SKILL_DIRECTORY_DEPTH_V1 != types.MAX_SKILL_DIRECTORY_DEPTH_V1 or
+        protocol.MAX_SKILL_RELATIVE_PATH_BYTES_V1 != types.MAX_SKILL_RELATIVE_PATH_BYTES_V1 or
+        protocol.MAX_SKILL_CATALOG_CONTENT_BYTES_V1 != types.MAX_SKILL_CATALOG_CONTENT_BYTES_V1 or
+        protocol.MAX_SKILL_CATALOG_FILES_V1 != types.MAX_SKILL_CATALOG_FILES_V1 or
+        protocol.MAX_SKILL_CATALOG_TRAVERSAL_ENTRIES_V1 != types.MAX_SKILL_CATALOG_TRAVERSAL_ENTRIES_V1 or
+        protocol.MAX_SKILL_RUNTIME_RETAINED_SNAPSHOT_BYTES_V1 != types.MAX_SKILL_RUNTIME_RETAINED_SNAPSHOT_BYTES_V1 or
         protocol.MAX_SKILL_ARGUMENT_VALUES_V1 != types.MAX_SKILL_ARGUMENT_VALUES_V1 or
         protocol.MAX_SKILL_ARGUMENT_JSON_BYTES_V1 != types.MAX_SKILL_ARGUMENT_JSON_BYTES_V1 or
         protocol.MAX_DESCRIPTION_JSON_BYTES_V1 != types.MAX_DESCRIPTION_JSON_BYTES_V1 or

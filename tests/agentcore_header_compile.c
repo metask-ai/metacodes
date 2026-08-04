@@ -1,5 +1,18 @@
 #include <metask/agentcore.h>
 
+_Static_assert(METASK_AGENTCORE_MAX_SKILL_FILE_CONTENT_BYTES_V1 == 16777216ULL,
+               "Skill file limit changed");
+_Static_assert(METASK_AGENTCORE_MAX_SKILL_CONTENT_BYTES_V1 == 33554432ULL,
+               "Skill content limit changed");
+_Static_assert(METASK_AGENTCORE_MAX_SKILL_FILES_V1 == 1024ULL,
+               "Skill file-count limit changed");
+_Static_assert(METASK_AGENTCORE_MAX_SKILL_ENTRIES_V1 == 4096ULL,
+               "Skill entry-count limit changed");
+_Static_assert(METASK_AGENTCORE_MAX_SKILL_CATALOG_CONTENT_BYTES_V1 == 67108864ULL,
+               "catalog content limit changed");
+_Static_assert(METASK_AGENTCORE_MAX_SKILL_RUNTIME_RETAINED_SNAPSHOT_BYTES_V1 == 268435456ULL,
+               "Runtime retained-snapshot limit changed");
+
 const metask_agentcore_api_v1 *agentcore_header_compile_probe(void) {
     return metask_agentcore_api_v1_discover();
 }

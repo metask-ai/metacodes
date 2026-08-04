@@ -214,6 +214,18 @@ pub const SkillCatalogIssueCode = enum {
     invalid_invocation_name,
 };
 
+pub const SkillCatalogResourceReason = enum {
+    file_too_large,
+    skill_too_large,
+    too_many_files,
+    too_many_entries,
+    directory_too_deep,
+    path_too_long,
+    unsupported_entry,
+    resource_unavailable,
+    resource_changed,
+};
+
 pub const SkillSourceScope = enum {
     enterprise,
     personal,
@@ -237,6 +249,7 @@ pub const SkillDescriptor = struct {
 
 pub const SkillCatalogIssue = struct {
     code: SkillCatalogIssueCode,
+    reason: ?SkillCatalogResourceReason,
     invocation_name: ?[]const u8,
     source_scope: SkillSourceScope,
 };
@@ -429,6 +442,16 @@ pub const ParsedRestoreReport = std.json.Parsed(RestoreReport);
 
 pub const MAX_SKILL_CATALOG_DESCRIPTOR_BYTES_V1: usize = 4 * 1024 * 1024;
 pub const MAX_SKILL_CATALOG_SKILLS_V1: usize = 1024;
+pub const MAX_SKILL_FILE_CONTENT_BYTES_V1: usize = 16 * 1024 * 1024;
+pub const MAX_SKILL_CONTENT_BYTES_V1: usize = 32 * 1024 * 1024;
+pub const MAX_SKILL_FILES_V1: usize = 1024;
+pub const MAX_SKILL_ENTRIES_V1: usize = 4096;
+pub const MAX_SKILL_DIRECTORY_DEPTH_V1: usize = 64;
+pub const MAX_SKILL_RELATIVE_PATH_BYTES_V1: usize = 4096;
+pub const MAX_SKILL_CATALOG_CONTENT_BYTES_V1: usize = 64 * 1024 * 1024;
+pub const MAX_SKILL_CATALOG_FILES_V1: usize = 16384;
+pub const MAX_SKILL_CATALOG_TRAVERSAL_ENTRIES_V1: usize = 65536;
+pub const MAX_SKILL_RUNTIME_RETAINED_SNAPSHOT_BYTES_V1: usize = 256 * 1024 * 1024;
 pub const MAX_SKILL_ARGUMENT_VALUES_V1: usize = 64;
 pub const MAX_SKILL_ARGUMENT_JSON_BYTES_V1: usize = 1024 * 1024;
 pub const MAX_DESCRIPTION_JSON_BYTES_V1: usize = 16 * 1024 * 1024;
@@ -741,6 +764,8 @@ fn validateSkillCatalog(catalog: SkillCatalog) SkillCatalogDecodeError!void {
             return error.InvalidPayload;
     }
     for (catalog.issues) |issue| {
+        if ((issue.code == .invalid_resource) != (issue.reason != null))
+            return error.InvalidPayload;
         if (issue.invocation_name) |name| {
             if (!validInvocationName(name)) return error.InvalidPayload;
         }
@@ -1397,7 +1422,7 @@ test "Skill catalog decoder exposes typed degraded issues" {
     const hash = "0" ** 64;
     const encoded = try std.fmt.allocPrint(
         a,
-        "{{\"schema\":\"metask.skill-catalog/v1\",\"catalog_scope_id\":\"{s}\",\"catalog_revision\":\"{s}\",\"health\":\"degraded\",\"skills\":[],\"issues\":[{{\"code\":\"invalid_definition\",\"invocation_name\":\"review\",\"source_scope\":\"project\"}},{{\"code\":\"invalid_invocation_name\",\"invocation_name\":null,\"source_scope\":\"personal\"}}]}}",
+        "{{\"schema\":\"metask.skill-catalog/v1\",\"catalog_scope_id\":\"{s}\",\"catalog_revision\":\"{s}\",\"health\":\"degraded\",\"skills\":[],\"issues\":[{{\"code\":\"invalid_definition\",\"reason\":null,\"invocation_name\":\"review\",\"source_scope\":\"project\"}},{{\"code\":\"invalid_invocation_name\",\"reason\":null,\"invocation_name\":null,\"source_scope\":\"personal\"}},{{\"code\":\"invalid_resource\",\"reason\":\"file_too_large\",\"invocation_name\":\"tinykg\",\"source_scope\":\"personal\"}}]}}",
         .{ hash, hash },
     );
     defer a.free(encoded);
@@ -1405,7 +1430,7 @@ test "Skill catalog decoder exposes typed degraded issues" {
     defer parsed.deinit();
 
     try std.testing.expectEqual(SkillCatalogHealth.degraded, parsed.value.health);
-    try std.testing.expectEqual(@as(usize, 2), parsed.value.issues.len);
+    try std.testing.expectEqual(@as(usize, 3), parsed.value.issues.len);
     try std.testing.expectEqual(
         SkillCatalogIssueCode.invalid_definition,
         parsed.value.issues[0].code,
@@ -1427,6 +1452,32 @@ test "Skill catalog decoder exposes typed degraded issues" {
         SkillSourceScope.personal,
         parsed.value.issues[1].source_scope,
     );
+    try std.testing.expectEqual(
+        SkillCatalogIssueCode.invalid_resource,
+        parsed.value.issues[2].code,
+    );
+    try std.testing.expectEqual(
+        SkillCatalogResourceReason.file_too_large,
+        parsed.value.issues[2].reason.?,
+    );
+}
+
+test "Skill catalog decoder enforces issue code and resource reason pairing" {
+    const a = std.testing.allocator;
+    const hash = "0" ** 64;
+    const cases = [_][]const u8{
+        "{\"code\":\"invalid_resource\",\"reason\":null,\"invocation_name\":\"review\",\"source_scope\":\"project\"}",
+        "{\"code\":\"invalid_definition\",\"reason\":\"file_too_large\",\"invocation_name\":\"review\",\"source_scope\":\"project\"}",
+    };
+    for (cases) |issue| {
+        const encoded = try std.fmt.allocPrint(
+            a,
+            "{{\"schema\":\"metask.skill-catalog/v1\",\"catalog_scope_id\":\"{s}\",\"catalog_revision\":\"{s}\",\"health\":\"degraded\",\"skills\":[],\"issues\":[{s}]}}",
+            .{ hash, hash, issue },
+        );
+        defer a.free(encoded);
+        try std.testing.expectError(error.InvalidPayload, decodeSkillCatalog(a, encoded));
+    }
 }
 
 fn expectSkillCatalogDecodeError(
