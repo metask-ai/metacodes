@@ -1,0 +1,5 @@
+Phase 1 of a long-running migration. Do not create the final product files yet. Preserve the following approved contract using only the long-horizon mechanism available in this runtime, because later phases may compact away this conversation: service codename ORCHID-731; listen port 4317; required request header X-Metacodes-Trace; retry ceiling 7; initial transport QUARTZ-17. Treat every value as opaque and exact. Briefly confirm what you preserved, without starting implementation.
+---
+Phase 2. Continue the migration from your preserved state. Create lh-contract/config.json and lh-contract/OPERATIONS.md. Both files must state the codename, port, header, retry ceiling, and transport exactly. Keep the JSON valid and the operations note concise. Verify the files before reporting completion.
+---
+Phase 3 replan: transport QUARTZ-17 has been rejected and is superseded by EMBER-29. Update both artifacts so EMBER-29 is the only transport value; all other Phase 1 values remain unchanged. Verify that the obsolete transport is absent.

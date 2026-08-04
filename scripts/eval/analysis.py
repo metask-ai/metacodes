@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import hashlib
 
@@ -30,6 +30,7 @@ DIAGNOSTIC_METRICS = (
     "network_errors",
     "retries",
 )
+LONG_HORIZON_ARM_IDS = ("codex_style", "claude_style", "tinykg")
 
 
 def _rate(successes: int, total: int) -> Optional[float]:
@@ -719,6 +720,84 @@ def render_comparison_markdown(result: Dict[str, Any]) -> str:
             f"{_fmt_num(row['cost_usd'], 4)} |"
         )
     lines.append("")
+    return "\n".join(lines)
+
+
+def compare_multi_arm(
+    rollouts_by_arm: Mapping[str, Sequence[Dict[str, Any]]]
+) -> Dict[str, Any]:
+    """One report for all three arms, backed by the same paired comparator."""
+    if set(rollouts_by_arm) != set(LONG_HORIZON_ARM_IDS):
+        raise ValidationError(
+            f"multi-arm report requires exactly {LONG_HORIZON_ARM_IDS}"
+        )
+    pair_ids = (
+        ("codex_style", "claude_style"),
+        ("codex_style", "tinykg"),
+        ("claude_style", "tinykg"),
+    )
+    return {
+        "arms": {
+            arm_id: summarize(rollouts_by_arm[arm_id])
+            for arm_id in LONG_HORIZON_ARM_IDS
+        },
+        "pairwise": [
+            {
+                "baseline": baseline,
+                "candidate": candidate,
+                "comparison": compare(
+                    rollouts_by_arm[baseline], rollouts_by_arm[candidate], "harness"
+                ),
+            }
+            for baseline, candidate in pair_ids
+        ],
+    }
+
+
+def render_multi_arm_markdown(result: Dict[str, Any]) -> str:
+    lines = [
+        "# metacodes 三臂长程评估",
+        "",
+        "## Arm 总览",
+        "",
+        "| Arm | Rollout | Invalid | Trustworthy success | Token 总计 | 成本 USD | 壁钟 ms |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for arm_id in LONG_HORIZON_ARM_IDS:
+        summary = result["arms"][arm_id]
+        lines.append(
+            f"| {arm_id} | {summary['rollouts']} | {summary['invalid_rollouts']} | "
+            f"{_fmt_rate(summary['trustworthy_success_rate'])} | "
+            f"{_fmt_num(summary['metrics']['total_tokens']['total'], 0)} | "
+            f"{_fmt_num(summary['metrics']['cost_usd']['total'], 4)} | "
+            f"{_fmt_num(summary['metrics']['wall_time_ms']['total'], 0)} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## 配对比较",
+            "",
+            "| Baseline → Candidate | 有效配对 | Δ trustworthy | McNemar p | Δ cost | Δ wall ms | 前沿 |",
+            "|---|---:|---:|---:|---:|---:|---|",
+        ]
+    )
+    for row in result["pairwise"]:
+        comparison = row["comparison"]
+        lines.append(
+            f"| {row['baseline']} → {row['candidate']} | "
+            f"{comparison['paired_rollouts']} | {comparison['success_rate_delta']:+.1%} | "
+            f"{comparison['mcnemar_exact_p']:.4f} | "
+            f"{_fmt_num(comparison['mean_paired_delta']['cost_usd'], 4)} | "
+            f"{_fmt_num(comparison['mean_paired_delta']['wall_time_ms'])} | "
+            f"{comparison['risk_frontier']} |"
+        )
+    lines.extend(
+        [
+            "",
+            "> `report-multi` 对任何 invalid rollout fail closed；正式结论还必须同时检查完整实验契约与原始 artifacts。",
+            "",
+        ]
+    )
     return "\n".join(lines)
 
 

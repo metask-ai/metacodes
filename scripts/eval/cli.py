@@ -15,8 +15,10 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from scripts.eval.analysis import (  # type: ignore
         compare,
+        compare_multi_arm,
         gate,
         render_comparison_markdown,
+        render_multi_arm_markdown,
         render_summary_markdown,
         summarize,
         validate_release_contract,
@@ -28,6 +30,11 @@ if __package__ in {None, ""}:
         import_run,
         prepare_runtime_metadata,
     )
+    from scripts.eval.experiment import (  # type: ignore
+        build_dry_run_plan,
+        experiment_fingerprint,
+        validate_experiment,
+    )
     from scripts.eval.model import (  # type: ignore
         ValidationError,
         load_json,
@@ -36,12 +43,14 @@ if __package__ in {None, ""}:
         validate_suite,
         write_rollouts,
     )
-    from scripts.eval.paired_runner import run_paired  # type: ignore
+    from scripts.eval.paired_runner import run_multi_arm, run_paired  # type: ignore
 else:
     from .analysis import (
         compare,
+        compare_multi_arm,
         gate,
         render_comparison_markdown,
+        render_multi_arm_markdown,
         render_summary_markdown,
         summarize,
         validate_release_contract,
@@ -53,6 +62,11 @@ else:
         import_run,
         prepare_runtime_metadata,
     )
+    from .experiment import (
+        build_dry_run_plan,
+        experiment_fingerprint,
+        validate_experiment,
+    )
     from .model import (
         ValidationError,
         load_json,
@@ -61,7 +75,7 @@ else:
         validate_suite,
         write_rollouts,
     )
-    from .paired_runner import run_paired
+    from .paired_runner import run_multi_arm, run_paired
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -93,6 +107,77 @@ def cmd_validate_suite(args: argparse.Namespace) -> int:
 def cmd_validate_rollouts(args: argparse.Namespace) -> int:
     rollouts = load_rollouts(Path(args.rollouts))
     print(f"rollouts: valid ({len(rollouts)} records)")
+    return 0
+
+
+def _load_experiment_and_suite(path: Path) -> tuple[Dict[str, Any], Dict[str, Any], Path]:
+    experiment = load_json(path)
+    suite_value = experiment.get("suite")
+    if not isinstance(suite_value, str) or not suite_value.strip():
+        raise ValidationError("experiment.suite: expected non-empty string")
+    suite_path = (REPO_ROOT / suite_value).resolve()
+    try:
+        suite_path.relative_to(REPO_ROOT.resolve())
+    except ValueError as exc:
+        raise ValidationError("experiment.suite escapes repository root") from exc
+    if not suite_path.is_file():
+        raise ValidationError(f"experiment.suite does not exist: {suite_value}")
+    suite = load_json(suite_path)
+    validate_experiment(experiment, REPO_ROOT, suite)
+    return experiment, suite, suite_path
+
+
+def cmd_validate_experiment(args: argparse.Namespace) -> int:
+    experiment, suite, _suite_path = _load_experiment_and_suite(Path(args.experiment))
+    plan = build_dry_run_plan(
+        experiment,
+        suite,
+        binary=Path(args.binary),
+        tinykg_binary=Path(args.tinykg_binary),
+        revision=args.revision,
+    )
+    print(
+        f"experiment {experiment['experiment_id']}: valid "
+        f"({len(suite['tasks'])} tasks, {plan['rollout_count']} planned rollouts, "
+        f"plan={plan['plan_fingerprint']})"
+    )
+    return 0
+
+
+def cmd_run_multi(args: argparse.Namespace) -> int:
+    experiment, suite, suite_path = _load_experiment_and_suite(Path(args.experiment))
+    if args.dry_run:
+        plan = build_dry_run_plan(
+            experiment,
+            suite,
+            binary=Path(args.binary),
+            tinykg_binary=Path(args.tinykg_binary),
+            revision=args.revision,
+        )
+        _write_json(args.plan_output, plan)
+        print(
+            f"multi-arm dry-run complete: rollouts={plan['rollout_count']} "
+            f"plan={plan['plan_fingerprint']} paid=0",
+            file=sys.stderr if args.plan_output is None else sys.stdout,
+        )
+        return 0
+    collected = run_multi_arm(
+        experiment,
+        suite,
+        REPO_ROOT,
+        Path(args.binary),
+        tinykg_binary=Path(args.tinykg_binary),
+        revision=args.revision,
+        output_dir=Path(args.output_dir),
+        suite_path=suite_path,
+        allow_paid_rollouts=args.allow_paid_rollouts,
+        budget_used_cost_usd=args.budget_used_cost_usd,
+        budget_used_tokens=args.budget_used_tokens,
+    )
+    print(
+        "multi-arm E2E complete: "
+        + " ".join(f"{arm}={len(rows)}" for arm, rows in collected.items())
+    )
     return 0
 
 
@@ -184,6 +269,87 @@ def cmd_compare(args: argparse.Namespace) -> int:
     result = compare(baseline, candidate, args.factor)
     markdown = render_comparison_markdown(result)
     _write(args.markdown, markdown)
+    if args.json:
+        _write_json(args.json, result)
+    return 0
+
+
+def cmd_report_multi(args: argparse.Namespace) -> int:
+    experiment, suite, _suite_path = _load_experiment_and_suite(Path(args.experiment))
+    paths = {
+        "codex_style": Path(args.codex_style),
+        "claude_style": Path(args.claude_style),
+        "tinykg": Path(args.tinykg),
+    }
+    rollouts_by_arm = {
+        arm_id: load_rollouts(path) for arm_id, path in paths.items()
+    }
+    invalid = {
+        arm_id: [
+            (rollout["task_id"], rollout["trial"])
+            for rollout in rollouts
+            if not rollout["judgement"]["valid_for_scoring"]
+        ]
+        for arm_id, rollouts in rollouts_by_arm.items()
+    }
+    invalid = {arm_id: rows for arm_id, rows in invalid.items() if rows}
+    if invalid:
+        raise ValidationError(
+            f"formal multi-arm report rejects invalid rollouts per abort policy: {invalid}"
+        )
+    grounding = {
+        task["id"]: grounding_fingerprints(task, REPO_ROOT)
+        for task in suite["tasks"]
+    }
+    task_ids = sorted(grounding)
+    contracts: Dict[str, Any] = {}
+    metacodes_sha256s = set()
+    tinykg_sha256s = set()
+    revisions = set()
+    fingerprint = experiment_fingerprint(experiment, suite)
+    for arm_id, rollouts in rollouts_by_arm.items():
+        contract = validate_release_contract(
+            rollouts,
+            label=arm_id,
+            suite_id=suite["suite_id"],
+            task_ids=task_ids,
+            trials=experiment["trials"],
+            model_provider=experiment["model"]["provider"],
+            model_id=experiment["model"]["id"],
+            grounding=grounding,
+        )
+        prefix = f"{experiment['experiment_id']}:{arm_id}:{fingerprint}:mc-"
+        config_id = contract["harness_config_id"]
+        suffix = config_id[len(prefix) :] if config_id.startswith(prefix) else ""
+        parts = suffix.split(":kg-", 1)
+        if (
+            len(parts) != 2
+            or len(parts[0]) != 64
+            or len(parts[1]) != 64
+            or any(char not in "0123456789abcdef" for char in parts[0] + parts[1])
+        ):
+            raise ValidationError(
+                f"{arm_id} harness config is not bound to this experiment/TinyKG identity"
+            )
+        metacodes_sha256s.add(parts[0])
+        tinykg_sha256s.add(parts[1])
+        revisions.add(contract["harness_revision"])
+        contracts[arm_id] = contract
+    if len(metacodes_sha256s) != 1:
+        raise ValidationError("multi-arm report mixes metacodes binary identities")
+    if len(tinykg_sha256s) != 1:
+        raise ValidationError("multi-arm report mixes TinyKG dependency identities")
+    if len(revisions) != 1:
+        raise ValidationError("multi-arm report mixes metacodes revisions")
+
+    result = compare_multi_arm(rollouts_by_arm)
+    result["experiment_id"] = experiment["experiment_id"]
+    result["experiment_fingerprint"] = fingerprint
+    result["metacodes_sha256"] = next(iter(metacodes_sha256s))
+    result["tinykg_sha256"] = next(iter(tinykg_sha256s))
+    result["harness_revision"] = next(iter(revisions))
+    result["contracts"] = contracts
+    _write(args.markdown, render_multi_arm_markdown(result))
     if args.json:
         _write_json(args.json, result)
     return 0
@@ -504,6 +670,16 @@ def parser() -> argparse.ArgumentParser:
     validate_rollouts_parser.add_argument("rollouts")
     validate_rollouts_parser.set_defaults(func=cmd_validate_rollouts)
 
+    validate_experiment_parser = commands.add_parser(
+        "validate-experiment",
+        help="validate the frozen three-arm long-horizon contract and dry-run identity",
+    )
+    validate_experiment_parser.add_argument("experiment")
+    validate_experiment_parser.add_argument("--binary", required=True)
+    validate_experiment_parser.add_argument("--tinykg-binary", required=True)
+    validate_experiment_parser.add_argument("--revision", required=True)
+    validate_experiment_parser.set_defaults(func=cmd_validate_experiment)
+
     import_parser = commands.add_parser(
         "import-e2e", help="normalize an existing tests/e2e run directory"
     )
@@ -564,6 +740,22 @@ def parser() -> argparse.ArgumentParser:
     paired_parser.add_argument("--max-cumulative-tokens", type=int)
     paired_parser.set_defaults(func=cmd_run_paired)
 
+    multi_parser = commands.add_parser(
+        "run-multi",
+        help="dry-run or execute the resumable three-arm long-horizon experiment",
+    )
+    multi_parser.add_argument("--experiment", required=True)
+    multi_parser.add_argument("--binary", required=True)
+    multi_parser.add_argument("--tinykg-binary", required=True)
+    multi_parser.add_argument("--revision", required=True)
+    multi_parser.add_argument("--output-dir", required=True)
+    multi_parser.add_argument("--dry-run", action="store_true")
+    multi_parser.add_argument("--plan-output")
+    multi_parser.add_argument("--allow-paid-rollouts", action="store_true")
+    multi_parser.add_argument("--budget-used-cost-usd", type=float, default=0.0)
+    multi_parser.add_argument("--budget-used-tokens", type=int, default=0)
+    multi_parser.set_defaults(func=cmd_run_multi)
+
     compare_parser = commands.add_parser(
         "compare", help="paired comparison with exact McNemar significance"
     )
@@ -575,6 +767,18 @@ def parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("--markdown")
     compare_parser.add_argument("--json")
     compare_parser.set_defaults(func=cmd_compare)
+
+    multi_report_parser = commands.add_parser(
+        "report-multi",
+        help="validate and render one unified report for the three long-horizon arms",
+    )
+    multi_report_parser.add_argument("--experiment", required=True)
+    multi_report_parser.add_argument("--codex-style", required=True)
+    multi_report_parser.add_argument("--claude-style", required=True)
+    multi_report_parser.add_argument("--tinykg", required=True)
+    multi_report_parser.add_argument("--markdown")
+    multi_report_parser.add_argument("--json")
+    multi_report_parser.set_defaults(func=cmd_report_multi)
 
     gate_parser = commands.add_parser("gate", help="enforce deployment/regression thresholds")
     gate_parser.add_argument("candidate")

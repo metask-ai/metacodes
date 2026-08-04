@@ -9,6 +9,7 @@ from pathlib import Path
 
 from scripts.eval.cli import main
 from scripts.eval.e2e_adapter import EVALUATION_CONTRACT_VERSION, grounding_fingerprints
+from scripts.eval.experiment import arm_config_ids
 from scripts.eval.model import load_json, stable_json, write_rollouts
 from scripts.eval.tests.test_analysis import rollout
 
@@ -17,6 +18,31 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 class CliTest(unittest.TestCase):
+    def test_experiment_rejects_escaped_suite_before_reading_it(self):
+        experiment = load_json(
+            ROOT / "evals/experiments/long-horizon-three-arm-v1.json"
+        )
+        experiment["suite"] = "../outside-repository-suite.json"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "experiment.json"
+            path.write_text(json.dumps(experiment) + "\n", encoding="utf-8")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = main(
+                    [
+                        "validate-experiment",
+                        str(path),
+                        "--binary",
+                        "/not-read/metacodes",
+                        "--tinykg-binary",
+                        "/not-read/tinykg",
+                        "--revision",
+                        "not-read",
+                    ]
+                )
+        self.assertEqual(code, 2)
+        self.assertIn("suite escapes repository root", stderr.getvalue())
+
     def _production_gate_config(self, directory: Path, *, all_suites: bool = False) -> Path:
         config = load_json(ROOT / "evals/gates/default.json")
         if not all_suites:
@@ -108,6 +134,69 @@ class CliTest(unittest.TestCase):
             self.assertEqual(code, 0, output.getvalue())
 
             self.assertIn("[PASS] policy_violations", output.getvalue())
+
+    def test_report_multi_validates_frozen_three_arm_identity_and_writes_one_report(self):
+        experiment_path = ROOT / "evals/experiments/long-horizon-three-arm-v1.json"
+        suite_path = ROOT / "evals/suites/long-horizon-control-plane.json"
+        experiment = load_json(experiment_path)
+        suite = load_json(suite_path)
+        config_ids = arm_config_ids(experiment, suite, "a" * 64, "b" * 64)
+        model = experiment["model"]
+        model_fingerprint = hashlib.sha256(stable_json(model).encode("utf-8")).hexdigest()[:16]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            arm_paths = {}
+            for arm_id in config_ids:
+                rows = []
+                for trial in range(experiment["trials"]):
+                    for task in suite["tasks"]:
+                        identity = grounding_fingerprints(task, ROOT)
+                        item = copy.deepcopy(rollout(task["id"], True, config_ids[arm_id]))
+                        item["run_id"] = f"{arm_id}:{task['id']}:{trial}"
+                        item["suite_id"] = suite["suite_id"]
+                        item["task_fingerprint"] = identity["task_fingerprint"]
+                        item["trial"] = trial
+                        item["layers"] = task["layers"]
+                        item["model"] = {**model, "fingerprint": model_fingerprint}
+                        item["harness"].update(
+                            {
+                                "config_id": config_ids[arm_id],
+                                "revision": "same-revision",
+                                "fingerprint": f"{arm_id}:{task['id']}",
+                                "environment_fingerprint": identity["environment_fingerprint"],
+                                "permission_mode": identity["permission_mode"],
+                            }
+                        )
+                        item["evaluator"]["fingerprint"] = identity["grader_fingerprint"]
+                        rows.append(item)
+                path = root / f"{arm_id}.jsonl"
+                write_rollouts(path, rows)
+                arm_paths[arm_id] = path
+            markdown = root / "report.md"
+            result_json = root / "report.json"
+            code = main(
+                [
+                    "report-multi",
+                    "--experiment",
+                    str(experiment_path),
+                    "--codex-style",
+                    str(arm_paths["codex_style"]),
+                    "--claude-style",
+                    str(arm_paths["claude_style"]),
+                    "--tinykg",
+                    str(arm_paths["tinykg"]),
+                    "--markdown",
+                    str(markdown),
+                    "--json",
+                    str(result_json),
+                ]
+            )
+            self.assertEqual(code, 0)
+            self.assertIn("三臂长程评估", markdown.read_text(encoding="utf-8"))
+            result = load_json(result_json)
+            self.assertEqual(result["metacodes_sha256"], "a" * 64)
+            self.assertEqual(result["tinykg_sha256"], "b" * 64)
+            self.assertEqual(len(result["pairwise"]), 3)
 
     def test_release_gate_rejects_incomplete_cherry_picked_rollouts(self):
         with tempfile.TemporaryDirectory() as directory:

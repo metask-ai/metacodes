@@ -275,7 +275,11 @@ def validate_rollout(data: Dict[str, Any], where: str = "rollout") -> None:
     if not task_fingerprint:
         raise ValidationError(f"{where}.task_fingerprint: must not be empty")
     provenance = _require(data, "task_fingerprint_provenance", str, where)
-    if provenance not in {"recorded_at_execution", "inferred_from_current_suite"}:
+    if provenance not in {
+        "recorded_at_execution",
+        "runner_frozen_before_execution",
+        "inferred_from_current_suite",
+    }:
         raise ValidationError(
             f"{where}.task_fingerprint_provenance: unsupported provenance {provenance!r}"
         )

@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "suite_id": "metacodes-long-horizon-control-plane-v1",
+  "description": "Three multi-phase tasks force context pressure, replan after early facts, and grade only final artifacts without exposing arm identity.",
+  "tasks": [
+    {
+      "id": "80_lh_contract_recovery",
+      "scenario": "tests/e2e/scenarios/80_lh_contract_recovery.txt",
+      "layers": ["E", "T", "C", "L", "O", "V"],
+      "environment": {"kind": "isolated_workspace", "reset": "fresh_home_and_workdir"},
+      "tools": {"profile": "metacodes-long-horizon-common-v1", "required": ["Write", "Read"]},
+      "constraints": {"timeout_seconds": 900, "permission_mode": "bypassPermissions"},
+      "success": {
+        "checks": [
+          {"type": "file_exists", "path": "lh-contract/config.json", "description": "final config exists"},
+          {"type": "file_exists", "path": "lh-contract/OPERATIONS.md", "description": "operations note exists"},
+          {"type": "contains", "path": "lh-contract/config.json", "text": "ORCHID-731", "description": "opaque codename survives"},
+          {"type": "contains", "path": "lh-contract/config.json", "text": "4317", "description": "port survives"},
+          {"type": "contains", "path": "lh-contract/config.json", "text": "X-Metacodes-Trace", "description": "header survives"},
+          {"type": "contains", "path": "lh-contract/config.json", "text": "EMBER-29", "description": "latest transport wins"},
+          {"type": "not_contains", "path": "lh-contract/config.json", "text": "QUARTZ-17", "description": "obsolete transport removed"},
+          {"type": "contains", "path": "lh-contract/OPERATIONS.md", "text": "retry", "description": "operations note retains retry rule"},
+          {"type": "contains", "path": "lh-contract/OPERATIONS.md", "text": "7", "description": "retry ceiling survives"}
+        ]
+      },
+      "trajectory_constraints": {"required_tools": ["Write", "Read"], "max_turns": 24, "max_tool_calls": 24, "max_model_tool_errors": 4, "max_harness_tool_errors": 0},
+      "trajectory_rationale": {
+        "required_tools": "The final artifacts must be written and then verified through product tools common to every arm.",
+        "max_turns": "Three phases plus persistence and verification must stay bounded.",
+        "max_tool_calls": "Allows memory work and artifact verification without unbounded retries.",
+        "max_model_tool_errors": "A few recoverable argument corrections are tolerated.",
+        "max_harness_tool_errors": "Infrastructure errors invalidate a long-horizon comparison."
+      },
+      "grader": {"kind": "deterministic_workspace", "version": "long-horizon-v1"}
+    },
+    {
+      "id": "81_lh_dependency_replan",
+      "scenario": "tests/e2e/scenarios/81_lh_dependency_replan.txt",
+      "layers": ["E", "T", "C", "L", "O", "V"],
+      "environment": {"kind": "isolated_workspace", "reset": "fresh_home_and_workdir"},
+      "tools": {"profile": "metacodes-long-horizon-common-v1", "required": ["Write", "Read"]},
+      "constraints": {"timeout_seconds": 900, "permission_mode": "bypassPermissions"},
+      "success": {
+        "checks": [
+          {"type": "file_exists", "path": "lh-replan/STATUS.md", "description": "final status exists"},
+          {"type": "contains", "path": "lh-replan/STATUS.md", "text": "ATLAS-6", "description": "owner survives"},
+          {"type": "contains", "path": "lh-replan/STATUS.md", "text": "NEBULA-204", "description": "schema survives"},
+          {"type": "contains", "path": "lh-replan/STATUS.md", "text": "45", "description": "rollback window survives"},
+          {"type": "contains", "path": "lh-replan/STATUS.md", "text": "BATCH-917", "description": "replacement batch is current"},
+          {"type": "not_contains", "path": "lh-replan/STATUS.md", "text": "BATCH-908", "description": "obsolete batch is absent"},
+          {"type": "contains_any", "path": "lh-replan/STATUS.md", "texts": ["A and D", "A + D", "A、D", "A与D"], "description": "final dependency pair is explicit"}
+        ]
+      },
+      "trajectory_constraints": {"required_tools": ["Write", "Read"], "max_turns": 24, "max_tool_calls": 24, "max_model_tool_errors": 4, "max_harness_tool_errors": 0},
+      "trajectory_rationale": {
+        "required_tools": "The common artifact path must be written and verified in every arm.",
+        "max_turns": "Planning, replan, and execution are bounded to three phases.",
+        "max_tool_calls": "Leaves room for DAG or markdown persistence while preserving a common ceiling.",
+        "max_model_tool_errors": "Minor argument recovery is allowed but loops are not.",
+        "max_harness_tool_errors": "Harness failures are invalid rather than task failures."
+      },
+      "grader": {"kind": "deterministic_workspace", "version": "long-horizon-v1"}
+    },
+    {
+      "id": "82_lh_lexical_evolution",
+      "scenario": "tests/e2e/scenarios/82_lh_lexical_evolution.txt",
+      "layers": ["E", "T", "C", "L", "O", "V"],
+      "environment": {"kind": "isolated_workspace", "reset": "fresh_home_and_workdir"},
+      "tools": {"profile": "metacodes-long-horizon-common-v1", "required": ["Write", "Read"]},
+      "constraints": {"timeout_seconds": 900, "permission_mode": "bypassPermissions"},
+      "success": {
+        "checks": [
+          {"type": "file_exists", "path": "lh-lexical/HANDOFF.md", "description": "handoff exists"},
+          {"type": "contains", "path": "lh-lexical/HANDOFF.md", "text": "RESUME-K9", "description": "canonical operation recovered"},
+          {"type": "contains", "path": "lh-lexical/HANDOFF.md", "text": "CLAIM-V4", "description": "canonical lease mode recovered"},
+          {"type": "contains", "path": "lh-lexical/HANDOFF.md", "text": "expiry_seconds=7200", "description": "exact expiry recovered"},
+          {"type": "contains", "path": "lh-lexical/HANDOFF.md", "text": "release_auth=SAME-HOLDER", "description": "exact release rule recovered"}
+        ]
+      },
+      "trajectory_constraints": {"required_tools": ["Write", "Read"], "max_turns": 24, "max_tool_calls": 24, "max_model_tool_errors": 4, "max_harness_tool_errors": 0},
+      "trajectory_rationale": {
+        "required_tools": "Every arm writes and verifies the same deterministic handoff artifact.",
+        "max_turns": "Capture, paraphrased recovery, and handoff should fit a bounded three-phase run.",
+        "max_tool_calls": "Allows bounded lexical retrieval without permitting search loops.",
+        "max_model_tool_errors": "Small self-corrections are acceptable.",
+        "max_harness_tool_errors": "Any harness failure invalidates the sample."
+      },
+      "grader": {"kind": "deterministic_workspace", "version": "long-horizon-v1"}
+    }
+  ]
+}

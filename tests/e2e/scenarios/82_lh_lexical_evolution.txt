@@ -1,0 +1,5 @@
+Phase 1 knowledge capture. Preserve this project glossary using the configured long-horizon mechanism; do not create answer files yet. "断点接续" and "continue after interruption" refer to canonical operation RESUME-K9. "任务抢占" and "atomic work ownership" refer to lease mode CLAIM-V4. The approved expiry is 7200 seconds and release authorization is SAME-HOLDER. These tokens are opaque; do not normalize or invent aliases.
+---
+Phase 2. A teammate asks how to "pick work safely after a crash" without using any canonical terms. Recover the relevant meanings from the preserved glossary and retain the exact canonical operation, lease mode, expiry, and release authorization for the final handoff.
+---
+Phase 3. Create lh-lexical/HANDOFF.md containing one unambiguous mapping from the teammate's wording to RESUME-K9 and CLAIM-V4, plus expiry_seconds=7200 and release_auth=SAME-HOLDER. Do not add speculative synonyms or alternate values.

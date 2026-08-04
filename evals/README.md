@@ -184,6 +184,58 @@ paired delta 的均值、样本方差、Student-t 95% CI、P50/P95、exact McNem
 quality–cost–latency frontier（dominates / dominated / tradeoff / equivalent）。cost 或 wall-clock
 任一侧缺失时比较 fail closed。
 
+### 5.1 三臂长程机制实验
+
+`evals/experiments/long-horizon-three-arm-v1.json` 冻结同一 `glm-5.2`、同一二进制、
+同一任务/工具预算下的三个运行时消融：`codex_style`（transcript + compact）、
+`claude_style`（再加 Markdown AutoMemory）和 `tinykg`（再加 TinyKG/DAG）。首阶段三臂均
+关闭 swarm，避免额外 agent 调用成为混杂因子。六个 trial 使用完整 Williams-style
+counterbalanced block，使每个 arm 在每个顺序位置出现两次，并平衡一阶 carryover。
+TinyKG 是共享的冻结 runtime dependency：runner 必须接收其显式路径，先在临时 store 上验证
+`storage_format_version=2/schema_version=3`，再把 SHA-256 纳入 plan 与每臂 config identity；
+只有 TinyKG 臂收到可执行路径，避免非 KG 臂通过 Bash 环境绕过 typed treatment。
+runner 还会清除宿主的 `METACODES_*`、`TINYKG_*`、`E2E_*`、`CLAUDE_CODE_*` 和
+`RG_BIN` 覆盖，并把 suite 的逐任务 timeout 显式接到 E2E 进程，防止本机环境静默改变 treatment
+或执行预算。
+
+先执行零成本 dry-run；它验证 manifest、3 个跨 compact/replan 场景、二进制/revision、
+arm treatment、盲评、invalid 语义、预算闸门，并输出可重放计划：
+
+```bash
+python3 scripts/eval/cli.py run-multi \
+  --experiment evals/experiments/long-horizon-three-arm-v1.json \
+  --binary zig-out/bin/metacodes \
+  --tinykg-binary zig-out/vendor/tinykg/tinykg \
+  --revision "$(git rev-parse HEAD)" \
+  --output-dir /tmp/metacodes-lh3 \
+  --dry-run --plan-output /tmp/metacodes-lh3-plan.json
+```
+
+checked-in manifest 的 `paid_rollouts_enabled=false`。确定性门全部通过并经人工确认前，即使
+传 `--allow-paid-rollouts` 也会 fail closed；真正执行需要同时显式开启 manifest 闸门和 CLI
+授权。每个 task/arm/trial 完成后独立原子 checkpoint，重启不会重复已付费 rollout；若 E2E
+基础设施在创建 run 目录后失败，runner 会先导入并原子 checkpoint 为 invalid，再终止实验。
+`zig build test:eval` 还会用真实 metacodes/TinyKG 二进制执行零网络 `--dump-prompt` smoke，防止
+Markdown-only 臂泄漏 KG 提示词或工具。
+
+完成全部 checkpoint 后生成一个统一三臂报告；该入口会先验证 54 个 task/trial pair、同一
+revision、同一 metacodes/TinyKG SHA-256 和当前 experiment fingerprint，再给出三组 arm summary 与三组
+paired comparison：
+
+```bash
+python3 scripts/eval/cli.py report-multi \
+  --experiment evals/experiments/long-horizon-three-arm-v1.json \
+  --codex-style /tmp/metacodes-lh3/codex_style.jsonl \
+  --claude-style /tmp/metacodes-lh3/claude_style.jsonl \
+  --tinykg /tmp/metacodes-lh3/tinykg.jsonl \
+  --markdown /tmp/metacodes-lh3/report.md \
+  --json /tmp/metacodes-lh3/report.json
+```
+
+当前 80–82 三个场景是机制校准任务，只验证 compact 后事实保持、依赖重规划和词汇演化召回；
+它们不等于、也不得被表述为最终真实仓库 PK。扩大付费样本前，仍需在同一契约下加入真实、
+多阶段、可从仓库快照复现的任务。
+
 ### 6. 自动门禁
 
 ```bash

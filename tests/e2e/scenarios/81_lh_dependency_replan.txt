@@ -1,0 +1,5 @@
+Phase 1 planning only. Preserve this workflow and its opaque acceptance data with the runtime's configured long-horizon mechanism; do not create the final report yet. Tasks: A discovers schema NEBULA-204, B prepares migration batch BATCH-908, C publishes only after both A and B complete. The owner is team ATLAS-6 and the rollback window is 45 minutes. Later phases may compact prior conversation, so retain both dependencies and every exact token.
+---
+Phase 2 update. Task B failed validation and is replaced by task D, which prepares migration batch BATCH-917. C must now depend on A and D, never B. Preserve this replan and mark the old batch obsolete. Do not publish yet.
+---
+Phase 3 execution. Create lh-replan/STATUS.md with a compact final workflow: owner, schema, rollback window, replacement batch, and C's current dependencies. The report must not contain the obsolete batch BATCH-908 and must make clear that A and D are both required before C.

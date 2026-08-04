@@ -12,6 +12,7 @@ SUITES = (
     ROOT / "evals" / "suites" / "agentdef-release.json",
     ROOT / "evals" / "suites" / "websearch-concurrency.json",
     ROOT / "evals" / "suites" / "kg-lexical-bridge.json",
+    ROOT / "evals" / "suites" / "long-horizon-control-plane.json",
 )
 
 
