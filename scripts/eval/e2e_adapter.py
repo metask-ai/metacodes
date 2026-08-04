@@ -585,6 +585,8 @@ def _evaluate_check(
         "log_not_contains",
         "debug_log_contains",
         "debug_log_not_contains",
+        "debug_tool_input_contains",
+        "debug_tool_input_not_contains",
         "assistant_contains",
     }:
         target, read_error = _workspace_target(workspace, check["path"])
@@ -656,6 +658,14 @@ def _evaluate_check(
         contains = check["text"] in debug_log_text
         passed = contains if kind == "debug_log_contains" else not contains
         detail = f"debug log {'contains' if contains else 'does not contain'} {check['text']!r}"
+    elif kind in {"debug_tool_input_contains", "debug_tool_input_not_contains"}:
+        inputs = _debug_tool_inputs(debug_log_text, check["tool"])
+        contains = any(check["text"] in item for item in inputs)
+        passed = contains if kind == "debug_tool_input_contains" else not contains
+        detail = (
+            f"{check['tool']} inputs {'contain' if contains else 'do not contain'} "
+            f"{check['text']!r} across {len(inputs)} call(s)"
+        )
     elif kind == "assistant_contains":
         contains = target_text is not None and check["text"] in target_text
         passed = contains
@@ -670,6 +680,56 @@ def _evaluate_check(
         "detail": detail,
         "evaluator_error": read_error,
     }
+
+
+def _debug_tool_inputs(debug_log: str, tool_name: str) -> List[str]:
+    """Extract complete model-supplied JSON inputs for one tool from debug logs.
+
+    The stream logger emits a `tool_use complete ... name=X` line followed by
+    `tool_use input_json=...`. Large JSON strings may continue on physical
+    lines, so collect until the next structured log prefix. This intentionally
+    ignores model thinking/text deltas: a retrieval contract concerns the
+    query actually sent to the tool, not vocabulary the model considered and
+    rejected in hidden reasoning.
+    """
+    clean = ANSI_RE.sub("", debug_log)
+    complete_re = re.compile(
+        r"tool_use complete id=\S+ name=([A-Za-z0-9_]+) input_bytes=\d+"
+    )
+    log_prefix_re = re.compile(r"^\[(?:DEBUG|INFO|WARN|ERROR)\b")
+    marker = "tool_use input_json="
+    pending_tool: Optional[str] = None
+    collecting_tool: Optional[str] = None
+    payload: List[str] = []
+    collected: List[Tuple[str, str]] = []
+
+    def flush() -> None:
+        nonlocal collecting_tool, payload
+        if collecting_tool is not None:
+            collected.append((collecting_tool, "\n".join(payload)))
+        collecting_tool = None
+        payload = []
+
+    for line in clean.splitlines():
+        match = complete_re.search(line)
+        if match:
+            flush()
+            pending_tool = match.group(1)
+            continue
+        marker_pos = line.find(marker)
+        if marker_pos >= 0 and pending_tool is not None:
+            flush()
+            collecting_tool = pending_tool
+            pending_tool = None
+            payload = [line[marker_pos + len(marker) :]]
+            continue
+        if collecting_tool is not None:
+            if log_prefix_re.match(line):
+                flush()
+            else:
+                payload.append(line)
+    flush()
+    return [value for name, value in collected if name == tool_name]
 
 
 def _trajectory_judgement(

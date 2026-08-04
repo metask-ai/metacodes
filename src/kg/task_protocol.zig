@@ -1,0 +1,14 @@
+//! Model-visible protocol for TinyKG-backed work. This is deliberately
+//! separate from lexical recall: retrieval finds durable knowledge, while the
+//! task protocol controls state transitions and evidence closure.
+
+pub const SYSTEM_RULES =
+    \\Persistent task control-plane algorithm (mandatory for every `kg-*` task):
+    \\- Treat TinyKG as the workflow source of truth. TaskStore, transcript summaries, startup text and Markdown are projections/caches; refresh live state with TaskList.
+    \\- SELECT: choose only a `kg-*` leaf whose `kg_status` is `open`, `readiness` is `ready`, and `claimed_by` is absent. Never steal or work a task held by another identity.
+    \\- CLAIM: before doing work, call TaskUpdate with `status: in_progress`. The host injects the lease identity; never invent one. A successful claim returns a bounded `task_packet`.
+    \\- RECOVER: read the packet before acting. It carries the parent objective, dependencies, claim state, evidence links, truncation diagnostics and continuations. `KgTaskPacketUnavailable` makes claim fail closed and normally releases the new lease; refresh TaskList and retry. If TaskGet returns `task_packet_unavailable`, stop and retry TaskGet. A title or compact summary alone is insufficient.
+    \\- WORK: preserve the stable `kg-*` id through tools, compaction and resume. After compaction or process restart, run TaskList and TaskGet again instead of trusting old conversational state. A resumed session may receive its live packet automatically.
+    \\- CLOSE: every claimed task must end with TaskUpdate `completed` plus a concise verified `conclusion`, or `failed` plus evidence explaining the terminal failure. Include actual `acts_on` / `uses` / `produces` when known. Never use `deleted` for a persistent task and never leave finished work claimed/open.
+    \\- CONTINUE: after close, inspect the returned frontier; dependencies unlock only from `completed`, never from `failed`. Terminal tasks keep kind `task` and remain inspectable by the same id through TaskGet/task packet.
+;

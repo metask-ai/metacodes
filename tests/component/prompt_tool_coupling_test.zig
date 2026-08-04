@@ -27,6 +27,10 @@ fn findDef(defs: []const cc.json_mod.ToolDefinition, name: []const u8) ?cc.json_
     return null;
 }
 
+fn deferredProbe(_: *const cc.tool_context.ToolContext, _: []const u8, _: ?*anyopaque) anyerror![]u8 {
+    return error.ProbeNotExecutable;
+}
+
 // ① 核心工具长描述进 defs(对比:无 context 时是短描述)。
 test "L2: toToolDefinitionsFull 给核心工具动态长描述" {
     const a = std.testing.allocator;
@@ -66,6 +70,69 @@ test "L2: 无 context 回退短描述 + Monitor 恒静态" {
 
     const monitor = findDef(defs, "Monitor").?;
     try std.testing.expect(std.mem.indexOf(u8, monitor.description, "background monitor") != null);
+}
+
+test "L2: KgRecall schema carries the bounded lexical-bridge contract" {
+    const kg_recall = cc.tools.getTool("KgRecall") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, kg_recall.description, "no embeddings and computes no vector distance") != null);
+
+    const props = kg_recall.input_schema.prop_specs orelse return error.TestUnexpectedResult;
+    var query_description: ?[]const u8 = null;
+    for (props) |prop| {
+        if (std.mem.eql(u8, prop.name, "query")) query_description = prop.description;
+    }
+    const description = query_description orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, description, "3-8 intent-preserving") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "FIRST inspect automatic recall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "MUST contain ONLY that exact term") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "label every term U") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "DELETE every unlabeled term") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "Topically related implementation guesses are not paraphrases") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "At most TWO explicit calls total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "Extra keywords are safe") == null);
+
+    var type_description: ?[]const u8 = null;
+    for (props) |prop| {
+        if (std.mem.eql(u8, prop.name, "type")) type_description = prop.description;
+    }
+    const type_desc = type_description orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, type_desc, "NEVER set this on the first explicit KgRecall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, type_desc, "observation or module") != null);
+}
+
+test "L2: ToolSearch tells the model to call visible KgRecall directly" {
+    const tool_search = cc.tools.getTool("ToolSearch") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, tool_search.description, "NEVER call ToolSearch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tool_search.description, "including KgRecall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tool_search.description, "call that tool directly") != null);
+}
+
+test "L2: ToolSearch enters the API tool set only when a deferred tool exists" {
+    const a = std.testing.allocator;
+
+    // 无动态工具：KgRecall/Write 常驻可调，ToolSearch 没有工作可做，必须不广告。
+    const core_only = try cc.tools.toToolDefinitionsFull(a, null, null);
+    defer a.free(core_only);
+    try std.testing.expect(findDef(core_only, "KgRecall") != null);
+    try std.testing.expect(findDef(core_only, "Write") != null);
+    try std.testing.expect(findDef(core_only, "ToolSearch") == null);
+
+    var dyn = cc.tools_dynamic.DynRegistry.init(a);
+    defer dyn.deinit();
+    // 常驻 Skill 类动态工具不需要激活，仍不应引入 ToolSearch。
+    try dyn.register("always_visible", "always visible helper", &.{}, deferredProbe, null, false);
+    const visible_dyn = try cc.tools.toToolDefinitionsFull(a, &dyn, null);
+    defer a.free(visible_dyn);
+    try std.testing.expect(findDef(visible_dyn, "always_visible") != null);
+    try std.testing.expect(findDef(visible_dyn, "ToolSearch") == null);
+
+    // MCP 工具 deferred=true：此时 ToolSearch 才是必要能力并随工具表进入请求。
+    try dyn.registerMcp("demo__lookup", "deferred MCP lookup", &.{}, deferredProbe, null, "demo");
+    const with_deferred = try cc.tools.toToolDefinitionsFull(a, &dyn, null);
+    defer a.free(with_deferred);
+    try std.testing.expect(findDef(with_deferred, "ToolSearch") != null);
+    const deferred = findDef(with_deferred, "demo__lookup") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(deferred.deferred);
 }
 
 // ② 动态耦合:USING_TOOLS 段按工具集裁剪。

@@ -10,6 +10,8 @@
 
 const std = @import("std");
 const util_fs = @import("../util/fs.zig");
+const kg_retrieval = @import("../kg/retrieval_protocol.zig");
+const kg_tasks = @import("../kg/task_protocol.zig");
 
 // ============================================================================
 // 静态 section（直译 TS prompts.ts 同名函数，仅把 "Claude Code" 改成 "MetaCode"）
@@ -281,12 +283,17 @@ pub fn buildWithSkillsAndAgents(
 /// 最完整版:额外接收 enabled_tool_names,让 # Using your tools 段按工具集动态裁剪
 /// (对应 cc getUsingYourToolsSection(enabledTools))。
 /// enabled_tool_names 为 null → 用全量静态 USING_TOOLS_SECTION(向后兼容)。
-/// KG 段(设计 KG_DESIGN v3-final §5):仅 kg ready 时拼。≤15 行——决策边界 + 写入纪律。
+/// KG 段(设计 KG_DESIGN v3-final §5):仅 kg ready 时拼——决策边界、lexical bridge、写入纪律。
 pub const KG_SECTION =
     \\# Knowledge Graph
     \\A persistent knowledge graph stores durable memory and the cross-session task graph. It outlives this session: decisions, user corrections, and plan progress recorded there will be visible to future sessions.
     \\
     \\When to KgRecall: the user refers to prior decisions or past work; you are continuing cross-session work; an ambiguous request likely depends on earlier project choices. Skip it for self-contained tasks.
+    \\
+++ kg_retrieval.SYSTEM_RULES ++
+    \\
+++ kg_tasks.SYSTEM_RULES ++
+    \\
     \\When to KgRemember: a decision was made and confirmed; the user corrected you (record the rule + why); you learned a non-obvious project fact. Write short, structured facts — never transient task chatter or raw logs.
     \\Division of labor: KgRemember is for short atomic facts. For long-form narrative (investigation writeups, multi-step lessons) write a memory markdown file instead (see # Memory) — those files are auto-imported into this same graph and recalled through the same path, so never store the same content both ways.
 ;
@@ -468,6 +475,26 @@ test "build produces non-empty prompt with MetaCode identity" {
     try testing.expect(std.mem.indexOf(u8, s, "# Executing actions with care") != null);
     try testing.expect(std.mem.indexOf(u8, s, "# Using your tools") != null);
     try testing.expect(std.mem.indexOf(u8, s, "# Environment") != null);
+}
+
+test "KG prompt enforces bounded lexical bridge only when KG is ready" {
+    const with_kg = try buildFull(testing.allocator, "claude-opus-4-7", null, null, null, "", true);
+    defer testing.allocator.free(with_kg);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "computes no embeddings or vector distance") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "3-8 high-confidence lexical equivalents") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "ALIAS BRANCH HAS PRIORITY") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "BROAD BRANCH ONLY IF NO ALIAS WAS EXPOSED") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "first explicit KgRecall always omits `type`") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "Total explicit KgRecall calls: at most two") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "Persistent task control-plane algorithm") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "A title or compact summary alone is insufficient") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "never leave finished work claimed/open") != null);
+
+    const without_kg = try buildFull(testing.allocator, "claude-opus-4-7", null, null, null, "", false);
+    defer testing.allocator.free(without_kg);
+    try testing.expect(std.mem.indexOf(u8, without_kg, "computes no embeddings or vector distance") == null);
+    try testing.expect(std.mem.indexOf(u8, without_kg, "ALIAS BRANCH HAS PRIORITY") == null);
+    try testing.expect(std.mem.indexOf(u8, without_kg, "Persistent task control-plane algorithm") == null);
 }
 
 test "knowledge cutoff maps opus-4-7" {

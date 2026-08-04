@@ -19,6 +19,29 @@ const common = @import("common.zig");
 const log = @import("../util/log.zig");
 const KgClient = @import("../kg/client.zig").KgClient;
 
+const TASK_PACKET_LIMIT: usize = 12;
+const TASK_PACKET_MAX_CHARS: usize = 8_000;
+
+fn kgAgentIdent(ctx: *const ToolContext) []const u8 {
+    return ctx.kg_agent_ident orelse ctx.agent_ident.asSlice();
+}
+
+/// Append a trusted same-version TinyKG JSON envelope as a nested value.
+/// Failure is represented by the caller; never pretend a title-only TaskGet
+/// is a complete recovery packet.
+fn appendTaskPacketField(
+    ctx: *const ToolContext,
+    kg: *KgClient,
+    task_node: u64,
+    out: *std.ArrayList(u8),
+) !bool {
+    const packet = kg.taskPacketMeta(task_node, TASK_PACKET_LIMIT, TASK_PACKET_MAX_CHARS) catch return false;
+    defer kg.allocator.free(packet);
+    try out.appendSlice(ctx.allocator, ",\"task_packet\":");
+    try out.appendSlice(ctx.allocator, packet);
+    return true;
+}
+
 /// U6 A2:任务 DAG frontier 变更 → 经 event_reporter 发 tasks_changed 信号(默认轻量
 /// invalidated,UI 重拉 frontier)。无 reporter(headless/子 agent/单测)→ no-op。在每个
 /// **成功 mutation** 出口调(create/update/status/delete/stop-todo)。best-effort 不阻塞工具。
@@ -273,15 +296,16 @@ fn ensureInboxRoot(ctx: *const ToolContext, kg: *@import("../kg/client.zig").KgC
 // ============================================================================
 
 pub fn executeGet(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
-    const store = try requireStore(ctx);
     const id = try extractIdOrError(args, "taskId");
 
-    // KG 任务(id="kg-<node>"):todo 已镜像进 store(命中即返,零 spawn);
-    // 计划步骤只在图里 → store 未命中时从图取(getKgTask)。
-    if (std.mem.startsWith(u8, id, "kg-") and store.get(id) == null) {
+    // KG 任务的本地 TaskStore 只是 UI 镜像，不能成为读取旁路。尤其 claim 后镜像
+    // 必然存在，若命中即返会在最需要恢复上下文时丢掉 parent/dependencies/evidence
+    // packet。所有 kg-* TaskGet 都回 TinyKG 真源。
+    if (std.mem.startsWith(u8, id, "kg-")) {
         return getKgTask(ctx, id["kg-".len..]);
     }
 
+    const store = try requireStore(ctx);
     const t = store.get(id) orelse return error.TaskNotFound;
 
     var out: std.ArrayList(u8) = .empty;
@@ -297,12 +321,17 @@ pub fn executeGet(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 pub fn executeList(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     _ = args;
     const store = try requireStore(ctx);
+    const kg_live = hasLiveKgFrontier(ctx);
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(ctx.allocator);
     try out.append(ctx.allocator, '[');
     var first = true;
     for (store.tasks.items) |t| {
+        // Graph is authoritative whenever a live frontier pointer exists.
+        // Local kg-* entries remain a UI/offline fallback only; emitting them
+        // here would hide live claimed_by/readiness/status behind stale cache.
+        if (kg_live and std.mem.startsWith(u8, t.id, "kg-")) continue;
         if (!first) try out.append(ctx.allocator, ',');
         first = false;
         try writeTaskJson(&out, ctx.allocator, t, false);
@@ -315,11 +344,31 @@ pub fn executeList(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const parallel_ready = appendKgFrontier(ctx, &out, &first) catch blk: {
         out.shrinkRetainingCapacity(kg_mark);
         first = kg_first_before;
+        // A pointer only says that a graph projection exists; it does not prove
+        // that the live frontier subprocess succeeded.  On a transient KG
+        // failure, keep the UI usable by falling back to the local kg-* cache.
+        // The cache is appended only after the authoritative read has failed,
+        // so it can never hide fresh claimed_by/readiness/status on success.
+        for (store.tasks.items) |t| {
+            if (!std.mem.startsWith(u8, t.id, "kg-")) continue;
+            if (!first) try out.append(ctx.allocator, ',');
+            first = false;
+            try writeTaskJson(&out, ctx.allocator, t, false);
+        }
         break :blk 0;
     };
     appendParallelHint(ctx, &out, &first, parallel_ready) catch {};
     try out.append(ctx.allocator, ']');
     return try out.toOwnedSlice(ctx.allocator);
+}
+
+fn hasLiveKgFrontier(ctx: *const ToolContext) bool {
+    const kg = ctx.kg orelse return false;
+    if (!kg.ready or ctx.kg_projects_dir.len == 0) return false;
+    const inject = @import("../kg/inject.zig");
+    return inject.readIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_task_anchor") != null or
+        inject.readIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_root") != null or
+        inject.readIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_inbox") != null;
 }
 
 /// 并行信号:frontier 的 ready 无主叶子集按定义相互无序(有未闭合排序边就不会 ready)
@@ -340,42 +389,65 @@ fn appendParallelHint(ctx: *const ToolContext, out: *std.ArrayList(u8), first: *
 /// 把 KG 任务面 frontier 作为任务项追加进 TaskList 输出。
 /// 12b 单入口:优先 kg_task_anchor(task 锚=总任务,深遍历一次看全多计划树+inbox);
 /// 无锚指针(存量店)退回 kg_root(单计划 legacy)。readiness 是图派生的,必须每次读活值。
-/// 双列防重:write-through 镜像过的 todo(store 里有 kg-<id>)跳过——由 store 遍历呈现;
-/// 空 inbox root 叶(全部 todo 闭合后的容器残影)按 kg_inbox 指针滤掉。
+/// Live graph rows are authoritative. TaskStore kg-* mirrors are suppressed by
+/// executeList and used only if this whole append fails. 空 inbox root 叶(全部
+/// todo 闭合后的容器残影)按 kg_inbox 指针滤掉。
 /// 返回 ready 且无主的叶子数(并行 fan-out 信号源)。
 fn appendKgFrontier(ctx: *const ToolContext, out: *std.ArrayList(u8), first: *bool) !usize {
     const kg = ctx.kg orelse return 0;
     if (!kg.ready or ctx.kg_projects_dir.len == 0) return 0;
     const inject = @import("../kg/inject.zig");
     if (inject.readIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_task_anchor") != null) {
-        return try appendRootFrontier(ctx, out, first, "kg_task_anchor", true);
+        const anchor_ready = try appendRootFrontier(ctx, out, first, "kg_task_anchor", true, null);
+        // appendRootFrontier clears an authoritative empty/stale pointer. Fall
+        // through to legacy roots immediately instead of requiring a restart.
+        // A transient error returns above and preserves the anchor, so older
+        // projections never masquerade as live truth.
+        if (inject.readIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_task_anchor") != null) return anchor_ready;
     }
-    return try appendRootFrontier(ctx, out, first, "kg_root", true);
+    // Legacy two-pointer stores:show both the plan and ad-hoc inbox instead of
+    // letting a stale local mirror stand in for one half of the graph. The two
+    // roots may overlap, so stable task ids are deduplicated across both reads.
+    var seen = std.AutoHashMap(u64, void).init(ctx.allocator);
+    defer seen.deinit();
+    const plan_ready = try appendRootFrontier(ctx, out, first, "kg_root", true, &seen);
+    const inbox_ready = try appendRootFrontier(ctx, out, first, "kg_inbox", false, &seen);
+    return plan_ready + inbox_ready;
 }
 
-/// 12b frontier 行过滤:镜像 todo 防双列 + 空 inbox root 容器残影。
-fn skipFrontierRow(ctx: *const ToolContext, r: @import("../kg/client.zig").FrontierRow, inbox_id: ?u64) bool {
+/// 12b frontier 行过滤:空 inbox root 容器残影。kg-* TaskStore mirrors are
+/// suppressed at the store iteration, never by discarding authoritative rows.
+fn skipFrontierRow(r: @import("../kg/client.zig").FrontierRow, inbox_id: ?u64) bool {
     if (inbox_id) |iid| {
         // inbox root 无开放子时以 leaf 现身——它是容器不是任务,永不该上看板。
         if (r.task_id == iid) return true;
-    }
-    if (ctx.tasks) |store| {
-        var idbuf: [24]u8 = undefined;
-        const kg_id = std.fmt.bufPrint(&idbuf, "kg-{d}", .{r.task_id}) catch return false;
-        if (store.get(kg_id) != null) return true; // write-through 镜像已呈现
     }
     return false;
 }
 
 /// 呈现单个 root 的 frontier。is_plan 标注 plan_step(true)vs inbox todo(false)。
 /// 返回 ready 且无主的叶子数(供并行 fan-out 提示)。
-fn appendRootFrontier(ctx: *const ToolContext, out: *std.ArrayList(u8), first: *bool, pointer_name: []const u8, is_plan: bool) !usize {
+fn appendRootFrontier(
+    ctx: *const ToolContext,
+    out: *std.ArrayList(u8),
+    first: *bool,
+    pointer_name: []const u8,
+    is_plan: bool,
+    seen: ?*std.AutoHashMap(u64, void),
+) !usize {
     const kg = ctx.kg.?;
     const inject = @import("../kg/inject.zig");
     const root = inject.readIdPointer(ctx.allocator, ctx.kg_projects_dir, pointer_name) orelse return 0;
-    // M2:省掉冗余 nodeIsTask spawn——task-frontier 对非 task/不存在的 root 本就空返;
-    // 空 frontier 时顺手清 stale 指针。热路径少一次子进程。
-    const rows = kg.frontier(root, 50) catch return 0;
+    // M2:省掉冗余 nodeIsTask spawn。frontier 的 data error 是权威结构失效
+    // (NotFound/非 task/坏图)，可清 stale pointer；transient 不是缺席证据，必须
+    // 保留 pointer 并上抛，避免旧投影冒充真源。
+    const rows = kg.frontier(root, 50) catch |e| {
+        if (e == error.Data) {
+            inject.clearIdPointer(ctx.allocator, ctx.kg_projects_dir, pointer_name);
+            return 0;
+        }
+        return e;
+    };
     if (rows.len == 0) {
         inject.clearIdPointer(ctx.allocator, ctx.kg_projects_dir, pointer_name);
         kg.allocator.free(rows);
@@ -386,23 +458,27 @@ fn appendRootFrontier(ctx: *const ToolContext, out: *std.ArrayList(u8), first: *
         for (rows) |*r| r.deinit(kg.allocator);
         kg.allocator.free(rows);
     }
-    // 12b 过滤器:发射侧 ① write-through 镜像过的 todo(store 有 kg-<id>)跳过防双列;
-    // ② 空 inbox root 叶(容器残影)按 kg_inbox 指针滤。
-    // **计数侧只滤容器**:镜像只是呈现渠道,任务本身仍 ready 无主——并行集不因镜像低估。
+    // 12b 过滤器:空 inbox root 叶(容器残影)按 kg_inbox 指针滤。
     const inbox_id: ?u64 = inject.readIdPointer(ctx.allocator, ctx.kg_projects_dir, "kg_inbox");
     var ready_unclaimed: usize = 0;
     for (rows) |r| {
-        if (inbox_id != null and r.task_id == inbox_id.?) continue;
-        if (r.role == .leaf and r.readiness == .ready and r.claimed_by == null) ready_unclaimed += 1;
-    }
-    for (rows) |r| {
-        if (skipFrontierRow(ctx, r, inbox_id)) continue;
+        if (skipFrontierRow(r, inbox_id)) continue;
         // branch = 开放复合节点(靠子树闭合),非可执行项;看板只列叶子/关联,
         // 结构上下文由叶子行的 path 面包屑承担。
         if (r.role == .branch) continue;
+        if (seen) |ids| {
+            const entry = try ids.getOrPut(r.task_id);
+            if (entry.found_existing) continue;
+        }
+        if (r.role == .leaf and r.status == .open and r.readiness == .ready and r.claimed_by == null) ready_unclaimed += 1;
         if (!first.*) try out.append(ctx.allocator, ',');
         first.* = false;
-        const status = if (r.readiness == .ready) "pending" else "blocked";
+        const status = switch (r.status) {
+            .open => if (r.readiness == .ready) "pending" else "blocked",
+            .claimed => "in_progress",
+            .completed => "completed", // canonical frontier 不返回 completed；保守兼容。
+            .failed => "blocked",
+        };
         try out.appendSlice(ctx.allocator, "{\"id\":\"kg-");
         const idbuf = try std.fmt.allocPrint(ctx.allocator, "{d}", .{r.task_id});
         defer ctx.allocator.free(idbuf);
@@ -415,6 +491,8 @@ fn appendRootFrontier(ctx: *const ToolContext, out: *std.ArrayList(u8), first: *
         try writeString(out, ctx.allocator, title);
         try out.appendSlice(ctx.allocator, ",\"status\":\"");
         try out.appendSlice(ctx.allocator, status);
+        try out.appendSlice(ctx.allocator, "\",\"kg_status\":\"");
+        try out.appendSlice(ctx.allocator, @tagName(r.status));
         try out.appendSlice(ctx.allocator, "\",\"");
         try out.appendSlice(ctx.allocator, if (is_plan) "plan_step" else "persisted");
         try out.appendSlice(ctx.allocator, "\":true,\"readiness\":\"");
@@ -438,6 +516,7 @@ fn getKgTask(ctx: *const ToolContext, node_id_str: []const u8) anyerror![]u8 {
     const kg = ctx.kg orelse return error.KgUnavailable;
     if (!kg.ready) return error.KgUnavailable;
     const node_id = std.fmt.parseInt(u64, node_id_str, 10) catch return error.TaskNotFound;
+    const lifecycle = kg.taskStatus(node_id) catch return error.TaskNotFound;
     const text = kg.fetchNodeText(node_id) catch return error.TaskNotFound;
     defer kg.allocator.free(text); // kg 内存契约(见 KgClient 顶注)
     if (text.len == 0) return error.TaskNotFound;
@@ -452,20 +531,58 @@ fn getKgTask(ctx: *const ToolContext, node_id_str: []const u8) anyerror![]u8 {
     try writeString(&out, ctx.allocator, subject);
     try out.appendSlice(ctx.allocator, ",\"description\":");
     try writeString(&out, ctx.allocator, text);
-    try out.appendSlice(ctx.allocator, ",\"persisted\":true}");
+    try out.appendSlice(ctx.allocator, ",\"status\":\"");
+    try out.appendSlice(ctx.allocator, switch (lifecycle) {
+        .open => "pending",
+        .claimed => "in_progress",
+        .completed => "completed",
+        .failed => "blocked",
+    });
+    try out.appendSlice(ctx.allocator, "\",\"kg_status\":\"");
+    try out.appendSlice(ctx.allocator, @tagName(lifecycle));
+    try out.appendSlice(ctx.allocator, "\",\"persisted\":true");
+    if (!(try appendTaskPacketField(ctx, kg, node_id, &out))) {
+        try out.appendSlice(ctx.allocator, ",\"task_packet_unavailable\":true");
+    }
+    try out.append(ctx.allocator, '}');
     return try out.toOwnedSlice(ctx.allocator);
 }
 
-/// KG 计划步骤更新(TaskUpdate 的 kg-<node> 路由)。completed→closeTask,deleted→deleteTask。
+fn failKgTask(
+    ctx: *const ToolContext,
+    kg: *@import("../kg/client.zig").KgClient,
+    node_id: u64,
+    args: []const u8,
+) anyerror![]u8 {
+    const evidence = (try extractUnescaped(ctx.allocator, args, "conclusion")) orelse
+        (try extractUnescaped(ctx.allocator, args, "evidence")) orelse
+        (try extractUnescaped(ctx.allocator, args, "description")) orelse
+        try ctx.allocator.dupe(u8, "failed/cancelled");
+    defer ctx.allocator.free(evidence);
+    kg.failTaskAs(node_id, evidence, kgAgentIdent(ctx)) catch |e| {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "标记任务失败({s}): {s}", .{ @errorName(e), kg.detail() });
+        return error.KgCloseFailed;
+    };
+    // Authorization precedes every derived write. Stable task kind means the
+    // terminal node remains a valid ref-edge source after task-close.
+    writeClosureProjection(ctx, kg, node_id, args);
+    removeKgMirror(ctx, node_id);
+    noteTasksChanged(ctx);
+    return try ctx.allocator.dupe(u8, "{\"ok\":true,\"failed\":true,\"kg_status\":\"failed\",\"preserved\":true}");
+}
+
+/// KG 计划步骤更新(TaskUpdate 的 kg-<node> 路由)。completed/failed 走 canonical
+/// task-close；deleted 是旧兼容别名，在 KG 中也转 failed，绝不物理删除稳定 task id。
 fn updateKgTask(ctx: *const ToolContext, node_id_str: []const u8, args: []const u8) anyerror![]u8 {
     const kg = ctx.kg orelse return error.KgUnavailable;
     if (!kg.ready) return error.KgUnavailable;
     const node_id = std.fmt.parseInt(u64, node_id_str, 10) catch return error.InvalidStatus;
 
     const status_str = (try extractString(args, "status")) orelse {
-        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KG 计划步骤只支持 status=completed|deleted", .{});
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KG 计划步骤只支持 status=pending|in_progress|completed|failed|deleted", .{});
         return error.InvalidStatus;
     };
+    if (std.mem.eql(u8, status_str, "failed")) return failKgTask(ctx, kg, node_id, args);
     const st = TaskStatus.fromString(status_str) orelse return error.InvalidStatus;
     switch (st) {
         .completed => {
@@ -476,12 +593,12 @@ fn updateKgTask(ctx: *const ToolContext, node_id_str: []const u8, args: []const 
                 (try extractUnescaped(ctx.allocator, args, "description")) orelse
                 try ctx.allocator.dupe(u8, "completed");
             defer ctx.allocator.free(evidence);
-            kg.closeTask(node_id, evidence) catch |e| {
+            kg.closeTaskAs(node_id, evidence, kgAgentIdent(ctx)) catch |e| {
                 common.setErrorDetail(ctx.error_detail, ctx.allocator, "闭合计划步骤失败({s}): {s}", .{ @errorName(e), kg.detail() });
                 return error.KgCloseFailed;
             };
-            // 结构化投影(acts_on/uses/produces → ref 边,tentative)。**degraded 非依赖**:
-            // 任务已闭合,投影失败只 log 不回滚(catch 全在 writeClosureProjection 内部)。
+            // Terminal lifecycle is orthogonal to kind:the stable task remains
+            // a valid projection source. Run only after authorization succeeds.
             writeClosureProjection(ctx, kg, node_id, args);
             removeKgMirror(ctx, node_id); // store 镜像同步消失(TaskTab/TaskList)
             // 搭车:返回更新后的 frontier(刷新看板——设计 §2.2 R2 幂等"看板"非"领任务")。
@@ -499,46 +616,81 @@ fn updateKgTask(ctx: *const ToolContext, node_id_str: []const u8, args: []const 
             return out.toOwnedSlice(ctx.allocator);
         },
         .deleted => {
-            kg.deleteTask(node_id) catch |e| {
-                common.setErrorDetail(ctx.error_detail, ctx.allocator, "删除计划步骤失败({s})", .{@errorName(e)});
-                return error.KgDeleteFailed;
-            };
-            removeKgMirror(ctx, node_id); // store 镜像同步消失
-            noteTasksChanged(ctx); // U6:删除 → frontier 变
-            return try ctx.allocator.dupe(u8, "{\"ok\":true,\"deleted\":true}");
+            // 兼容旧模型的 deleted 调用；持久任务的生命周期只有四态，删除不是状态。
+            return failKgTask(ctx, kg, node_id, args);
         },
         else => {
             // in_progress/pending:状态本身是易失 UI 态(不落图),但**租约落图**——
             // in_progress = 本 session 认领(多 agent 并行防撞车,TTL 读侧过期),
             // pending = 释放租约(放回任务池)。撞他人未过期租约 → 明确报错引导换任务。
+            var claimed_packet: ?[]u8 = null;
+            defer if (claimed_packet) |packet| kg.allocator.free(packet);
             if (st == .in_progress) {
-                kg.claimTask(node_id, ctx.agent_ident.asSlice()) catch {
+                kg.claimTask(node_id, kgAgentIdent(ctx)) catch {
                     common.setErrorDetail(ctx.error_detail, ctx.allocator, "任务 {d} 已被其他 session 认领(租约未过期): {s}。请用 TaskList 选择其他 ready 任务,或等租约过期。", .{ node_id, kg.detail() });
                     return error.KgClaimHeld;
                 };
+                // Claim without recovery context is not a usable state. Match
+                // swarm self-assignment semantics: packet failure rolls the
+                // just-acquired lease back instead of inviting title-only work.
+                claimed_packet = kg.taskPacketMeta(node_id, TASK_PACKET_LIMIT, TASK_PACKET_MAX_CHARS) catch {
+                    const packet_detail = try ctx.allocator.dupe(u8, kg.detail());
+                    defer ctx.allocator.free(packet_detail);
+                    kg.releaseTask(node_id, kgAgentIdent(ctx)) catch |release_err| {
+                        common.setErrorDetail(ctx.error_detail, ctx.allocator, "任务 {d} 已认领但 task packet 获取失败，且自动释放也失败({s})；租约可能仍由 {s} 持有。packet 错误: {s}；release 错误: {s}", .{ node_id, @errorName(release_err), kgAgentIdent(ctx), packet_detail, kg.detail() });
+                        return error.KgTaskPacketUnavailable;
+                    };
+                    common.setErrorDetail(ctx.error_detail, ctx.allocator, "任务 {d} 的 task packet 获取失败，刚取得的租约已自动释放；请稍后重试。{s}", .{ node_id, packet_detail });
+                    return error.KgTaskPacketUnavailable;
+                };
             } else if (st == .pending) {
-                kg.releaseTask(node_id, ctx.agent_ident.asSlice()) catch {}; // best-effort:释放失败不阻塞看板
+                kg.releaseTask(node_id, kgAgentIdent(ctx)) catch |e| {
+                    common.setErrorDetail(ctx.error_detail, ctx.allocator, "释放任务 {d} 租约失败({s}): {s}。任务仍保持原状态。", .{ node_id, @errorName(e), kg.detail() });
+                    return error.KgReleaseFailed;
+                };
+            }
+            if (st == .in_progress) {
+                var out: std.ArrayList(u8) = .empty;
+                errdefer out.deinit(ctx.allocator);
+                // Build the complete response before touching the local mirror.
+                // If construction fails, release the lease that the caller
+                // never learned it owns; no projection then needs rollback.
+                var response_committed = false;
+                errdefer if (!response_committed) {
+                    kg.releaseTask(node_id, kgAgentIdent(ctx)) catch {};
+                };
+                try out.appendSlice(ctx.allocator, "{\"ok\":true,\"claimed\":true,\"claimed_by\":");
+                try writeString(&out, ctx.allocator, kgAgentIdent(ctx));
+                try out.appendSlice(ctx.allocator, ",\"task_packet\":");
+                try out.appendSlice(ctx.allocator, claimed_packet.?);
+                try out.appendSlice(ctx.allocator, ",\"note\":\"已认领；先按 task_packet 恢复父目标、依赖和证据，再开始工作；完成后 status=completed 闭合\"}");
+                const response = try out.toOwnedSlice(ctx.allocator);
+                // 认领的计划步骤镜像上板:TaskTab 可见 + activeKgTaskId(溯源锚)
+                // 能找到。todo 早有镜像;镜像失败不能推翻已完整构造的真源响应。
+                if (ctx.tasks) |store| {
+                    var idbuf: [24]u8 = undefined;
+                    const kg_id = std.fmt.bufPrint(&idbuf, "kg-{d}", .{node_id}) catch unreachable;
+                    if (store.get(kg_id) == null) {
+                        if (kg.fetchNodeText(node_id)) |text| {
+                            defer kg.allocator.free(text); // kg 内存契约:subagent 线程 ctx.allocator 不同源
+                            const nl = std.mem.indexOfScalar(u8, text, '\n');
+                            const subject = if (nl) |i| text[0..i] else text;
+                            store.createWithId(kg_id, subject, text, .in_progress) catch {};
+                        } else |_| {}
+                    } else {
+                        store.updateStatus(kg_id, .in_progress) catch {};
+                    }
+                }
+                noteTasksChanged(ctx); // U6:claim → frontier 变
+                response_committed = true;
+                return response;
             }
             if (ctx.tasks) |store| {
                 var idbuf: [24]u8 = undefined;
-                const kg_id = std.fmt.bufPrint(&idbuf, "kg-{d}", .{node_id}) catch return error.OutOfMemory;
-                if (store.get(kg_id) == null and st == .in_progress) {
-                    // 认领的计划步骤镜像上板:TaskTab 可见 + activeKgTaskId(溯源锚——
-                    // 任务执行中沉淀的记忆 derived_from 它)能找到。todo 早有镜像,此处专治计划步骤。
-                    if (kg.fetchNodeText(node_id)) |text| {
-                        defer kg.allocator.free(text); // kg 内存契约:subagent 线程 ctx.allocator 不同源
-                        const nl = std.mem.indexOfScalar(u8, text, '\n');
-                        const subject = if (nl) |i| text[0..i] else text;
-                        store.createWithId(kg_id, subject, text, .in_progress) catch {};
-                    } else |_| {}
-                } else {
-                    store.updateStatus(kg_id, st) catch {};
-                }
+                const kg_id = std.fmt.bufPrint(&idbuf, "kg-{d}", .{node_id}) catch unreachable;
+                store.updateStatus(kg_id, .pending) catch {};
             }
-            noteTasksChanged(ctx); // U6:claim(in_progress)/release(pending) → frontier 变
-            if (st == .in_progress) {
-                return try ctx.allocator.dupe(u8, "{\"ok\":true,\"claimed\":true,\"note\":\"已认领(租约落图,其他 session 不会重复领取);完成后 status=completed 闭合\"}");
-            }
+            noteTasksChanged(ctx); // U6:release → frontier 变
             return try ctx.allocator.dupe(u8, "{\"ok\":true,\"note\":\"已放回任务池(租约已释放)\"}");
         },
     }
@@ -549,16 +701,17 @@ fn updateKgTask(ctx: *const ToolContext, node_id_str: []const u8, args: []const 
 // ============================================================================
 
 pub fn executeUpdate(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
-    const store = try requireStore(ctx);
     const id = try extractIdOrError(args, "taskId");
 
     // KG 计划步骤(id 形如 "kg-<node>",由 TaskList 从 frontier 呈现)→ 路由到 KG。
-    // completed → closeTask(revise→verification,自动解锁 depends_on 链);deleted → deleteTask。
+    // completed → task-close(保留 task kind/id/原文 + verified_by 独立证据,自动解锁 depends_on 链);
+    // failed/deleted → failed 终态并保留稳定 task id。
     // 这是"DAG 驱动执行"的闭环:模型领 ready 步骤、干活、TaskUpdate completed → 下一步解锁。
     if (std.mem.startsWith(u8, id, "kg-")) {
         return updateKgTask(ctx, id["kg-".len..], args);
     }
 
+    const store = try requireStore(ctx);
     if (try extractString(args, "status")) |status_str| {
         const st = TaskStatus.fromString(status_str) orelse return error.InvalidStatus;
         try store.updateStatus(id, st);
@@ -653,7 +806,6 @@ pub fn executeStop(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         return std.fmt.allocPrint(ctx.allocator, "{{\"agent_job_id\":\"{s}\",\"status\":\"killing\"}}", .{aid});
     }
 
-    const store = try requireStore(ctx);
     const id = try extractIdOrError(args, "taskId");
     // KG 任务(kg-<node>)→ 闭合(与 TaskUpdate completed 同路径)。
     if (std.mem.startsWith(u8, id, "kg-")) {
@@ -664,18 +816,17 @@ pub fn executeStop(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         const evidence = (try extractUnescaped(ctx.allocator, args, "conclusion")) orelse
             try ctx.allocator.dupe(u8, "completed");
         defer ctx.allocator.free(evidence);
-        kg.closeTask(node_id, evidence) catch |e| {
+        kg.closeTaskAs(node_id, evidence, kgAgentIdent(ctx)) catch |e| {
             common.setErrorDetail(ctx.error_detail, ctx.allocator, "闭合任务失败({s})", .{@errorName(e)});
             return error.KgCloseFailed;
         };
-        // TaskStop 自称"等价 TaskUpdate completed"——闭合投影必须同路径,否则模型走哪个
-        // 闭合动词决定分类结晶是否发生(静默分叉)。args 通常无 acts_on/uses/produces → 空投影
-        // (degraded 无害),但若模型确实传了就同样生效。
+        // TaskStop 自称"等价 TaskUpdate completed"——投影与闭合顺序也必须同路径。
         writeClosureProjection(ctx, kg, node_id, args);
         removeKgMirror(ctx, node_id); // store 镜像同步消失
         noteTasksChanged(ctx); // U6:TaskStop 闭合 → frontier 变
         return try ctx.allocator.dupe(u8, "{\"ok\":true,\"status\":\"completed\"}");
     }
+    const store = try requireStore(ctx);
     try store.updateStatus(id, .completed);
     noteTasksChanged(ctx); // U6:TaskStop 闭合 → frontier 变
     return try ctx.allocator.dupe(u8, "{\"ok\":true,\"status\":\"completed\"}");

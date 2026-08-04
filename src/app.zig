@@ -989,7 +989,7 @@ pub const App = struct {
         // 注入摘要(空态零输出)。
         if (client.ready) {
             const inject = @import("kg/inject.zig");
-            if (inject.buildSummary(app.allocator, &app.kg.?, app.kg_projects_dir)) |sum| {
+            if (inject.buildSummaryForAgent(app.allocator, &app.kg.?, app.kg_projects_dir, app.session_id.asSlice())) |sum| {
                 app.kg_summary = sum;
             }
             // 跨会话重建 TaskTab 显示缓存:把 inbox 里未完成的 todo 镜像进内存 store,
@@ -1012,11 +1012,12 @@ pub const App = struct {
         }
         for (rows) |r| {
             if (r.role == .branch) continue; // 复合节点非可执行项,镜像只收叶子
+            if (r.status.isTerminal()) continue; // failed 仍在 frontier 作阻塞上下文，不镜像成 pending。
             var idbuf: [24]u8 = undefined;
             const kg_id = std.fmt.bufPrint(&idbuf, "kg-{d}", .{r.task_id}) catch continue;
             const nl = std.mem.indexOfScalar(u8, r.text, '\n');
             const subject = if (nl) |i| r.text[0..i] else r.text;
-            const status: @import("core/task_store.zig").TaskStatus = if (r.readiness == .ready) .pending else .pending;
+            const status: @import("core/task_store.zig").TaskStatus = if (r.status == .claimed) .in_progress else .pending;
             app.tasks.createWithId(kg_id, subject, r.text, status) catch {};
         }
     }

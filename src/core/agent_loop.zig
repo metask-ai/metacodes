@@ -313,6 +313,10 @@ pub const Options = struct {
     /// App.session_id 跨进程唯一且跨 turn 稳定)。subagent spawn 时必须显式 gen——
     /// 每个独立 agent loop 一个全局唯一 id,进程内并发 subagent 才互相有防撞。
     agent_ident: ?@import("session_id.zig").SessionId = null,
+    /// Optional TinyKG-specific lease identity. Main sessions inherit
+    /// `agent_ident`; swarm injects `name@team` so claim/release/close use one
+    /// exact holder string throughout the task lifecycle.
+    kg_agent_ident: ?[]const u8 = null,
     /// AutoMem memdir 绝对路径(B/C 合并 markdown 自动入图)。
     memdir_abs: []const u8 = "",
     /// Anthropic 具体 *Client(仅 web_search server tool 用;非 Anthropic provider → null)。
@@ -1338,6 +1342,7 @@ pub fn run(
         base_ctx.spawn_tick_fn = opts.spawn_tick_fn;
         base_ctx.session = sess; // UiRequest 路由到本 session 视图(M5)
         base_ctx.agent_ident = opts.agent_ident orelse sess; // 对外身份(claim);主 loop=session,subagent=spawn 时 gen
+        base_ctx.kg_agent_ident = opts.kg_agent_ident;
 
         // 6c. 分批并发执行。过程态(TTY 顶层):无条件 emit tool_start(每个 run slot);
         // **渲染决策(showStartCard/hasProgressCard/喂 spinner)全在 backend**——agent_loop

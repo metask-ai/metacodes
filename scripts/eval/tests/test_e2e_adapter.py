@@ -8,6 +8,7 @@ from scripts.eval.e2e_adapter import (
     MAX_NATIVE_EVENT_BYTES,
     NATIVE_EVENT_SCHEMA_VERSION,
     _count_policy_violations,
+    _debug_tool_inputs,
     _evaluate_check,
     comparison_fingerprints,
     _is_model_tool_failure,
@@ -49,6 +50,39 @@ def suite():
 
 
 class E2EAdapterTest(unittest.TestCase):
+    def test_debug_tool_input_checks_ignore_thinking_and_target_actual_tool_json(self):
+        debug = "\n".join(
+            [
+                '[DEBUG stream] event: {"thinking_delta":"consider TTL then reject it"}',
+                "[INFO stream] tool_use complete id=call_1 name=KgRecall input_bytes=31",
+                '[DEBUG stream] tool_use input_json={"query":"orion-k9 mode"}',
+                "[INFO agent] tool.exec start(par) name=KgRecall id=call_1",
+                "[INFO stream] tool_use complete id=call_2 name=Write input_bytes=40",
+                '[DEBUG stream] tool_use input_json={"file_path":"answer.txt",',
+                '"content":"done"}',
+                "[INFO agent] tool.exec start(par) name=Write id=call_2",
+            ]
+        )
+        self.assertEqual(_debug_tool_inputs(debug, "KgRecall"), ['{"query":"orion-k9 mode"}'])
+        self.assertEqual(
+            _debug_tool_inputs(debug, "Write"),
+            ['{"file_path":"answer.txt",\n"content":"done"}'],
+        )
+        passed = _evaluate_check(
+            {"type": "debug_tool_input_not_contains", "tool": "KgRecall", "text": "TTL"},
+            Path("."),
+            "",
+            debug,
+        )
+        failed = _evaluate_check(
+            {"type": "debug_tool_input_not_contains", "tool": "KgRecall", "text": "orion-k9"},
+            Path("."),
+            "",
+            debug,
+        )
+        self.assertTrue(passed["passed"])
+        self.assertFalse(failed["passed"])
+
     def test_min_tool_counts_requires_the_requested_multiplicity(self):
         constraints = {"required_tools": ["WebSearch"], "min_tool_counts": {"WebSearch": 3}}
         passed = _trajectory_judgement(

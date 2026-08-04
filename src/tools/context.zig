@@ -360,6 +360,12 @@ pub const ToolContext = struct {
     /// gen(路由仍归父视图,身份必须独立,否则并发 subagent 共享 sentinel 互相无防撞)。
     /// **身份由程序赋予,绝不指望模型手填。**
     agent_ident: @import("../core/session_id.zig").SessionId = @import("../core/session_id.zig").SessionId.single,
+    /// TinyKG lease holder identity override. Null means `agent_ident`.
+    /// Swarm uses the stable human-readable `name@team` here for both claim and
+    /// close; keeping it separate from the fixed-width session id prevents the
+    /// old split-brain state where one identity claimed and another tried to
+    /// close the same task. Host-injected only; never exposed as a model field.
+    kg_agent_ident: ?[]const u8 = null,
     /// 当前 project root(${CLAUDE_PROJECT_DIR} 替换)。
     project_dir: []const u8 = "",
     /// 全局 disable-shell-execution 开关(settings.json `disableSkillShellExecution`)。

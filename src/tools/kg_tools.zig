@@ -12,6 +12,7 @@ const kg_mod = @import("../kg/client.zig");
 const util_json = @import("../util/json.zig");
 const common = @import("common.zig");
 const log = @import("../util/log.zig");
+const retrieval_protocol = @import("../kg/retrieval_protocol.zig");
 
 fn requireKg(ctx: *const ToolContext) ?*kg_mod.KgClient {
     return ctx.kg;
@@ -188,8 +189,15 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         defer ctx.allocator.free(kv);
         try facet.appendSlice(ctx.allocator, kv);
     }
-    const tail = try std.fmt.allocPrint(ctx.allocator, "],\"count\":{d},\"types_in_results\":{{{s}}}}}", .{ hits.len, facet.items });
-    defer ctx.allocator.free(tail);
+    try out.appendSlice(ctx.allocator, "],\"count\":");
+    const count = try std.fmt.allocPrint(ctx.allocator, "{d}", .{hits.len});
+    defer ctx.allocator.free(count);
+    try out.appendSlice(ctx.allocator, count);
+    try out.appendSlice(ctx.allocator, ",\"types_in_results\":{");
+    try out.appendSlice(ctx.allocator, facet.items);
+    try out.appendSlice(ctx.allocator, "},\"retrieval_mode\":\"lexical_bm25_no_embeddings\",\"lexical_guidance\":");
+    try appendJsonString(&out, ctx.allocator, retrieval_protocol.RESULT_GUIDANCE);
+    const tail = "}";
     try out.appendSlice(ctx.allocator, tail);
     return out.toOwnedSlice(ctx.allocator);
 }

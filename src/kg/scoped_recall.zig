@@ -18,9 +18,13 @@ const client_mod = @import("client.zig");
 const conv_mod = @import("../core/conversation.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const log = @import("../util/log.zig");
+const retrieval_protocol = @import("retrieval_protocol.zig");
 
 const MIN_QUERY_LEN = 16; // 琐碎接话轮门(下界)
 const MAX_QUERY_LEN = 400; // BM25 query 上界(避免粘贴长文变噪声 query)
+// 自动命中既是上下文，也是 lexical→semantic 的桥。100 bytes 会把中文记忆压到约 33 字，
+// canonical alias/代码符号常在句尾被截掉，迫使模型重新宽搜。3 条×320B 仍是有界小预算。
+const MAX_HIT_TEXT_BYTES = 320;
 const TOP_K = 3;
 const REL_RATIO: f64 = 0.5; // 相对门:只留 ≥ top×0.5 的命中
 // 绝对地板(BM25;启发式,可 METACODES_RECALL_FLOOR 校准)。实测数据定初值:相关 query top≈7,
@@ -67,6 +71,8 @@ pub fn build(
     // 无 errdefer(本函数返回 !?[]u8;分配失败走 error 路径,显式 deinit 防泄漏——Linus 抓的死 errdefer)。
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "<system-reminder>\n# 相关持久记忆(按你的请求自动召回,可能不全)\n");
+    try out.appendSlice(allocator, retrieval_protocol.AUTO_RECALL_NOTE);
+    try out.appendSlice(allocator, "\n");
     for (hits) |h| {
         if (h.score < keep_min) continue; // 相对门:丢明显弱于最佳的
         const type_str = if (h.schema_type.len > 0) h.schema_type else h.kind;
@@ -79,6 +85,8 @@ pub fn build(
         try out.appendSlice(allocator, line);
         injected += 1;
     }
+    try out.appendSlice(allocator, retrieval_protocol.AUTO_RECALL_NEXT_ACTION);
+    try out.appendSlice(allocator, "\n");
     try out.appendSlice(allocator, "</system-reminder>");
 
     log.info("kg", "scoped_recall injected={d} top_score={d:.2} query_len={d}", .{ injected, top, query.len });
@@ -118,9 +126,16 @@ fn lastUserText(conversation: *const conv_mod.Conversation) ?[]const u8 {
 
 fn firstLine(text: []const u8) []const u8 {
     const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
-    var n = @min(end, 100);
+    var n = @min(end, MAX_HIT_TEXT_BYTES);
     while (n > 0 and (text[n - 1] & 0xC0) == 0x80) n -= 1; // 不切半个 CJK 字
     return text[0..n];
+}
+
+test "firstLine keeps a canonical bridge placed after the old 100-byte cutoff" {
+    const text = "长期任务被中断以后重新接续时，先从历史记录恢复精确并发规则；该规则的 canonical alias 是 orion-k9，后续应使用它聚焦检索。";
+    try std.testing.expect(text.len > 100);
+    const visible = firstLine(text);
+    try std.testing.expect(std.mem.indexOf(u8, visible, "orion-k9") != null);
 }
 
 test "build:kg 未就绪 → null(不阻塞)" {

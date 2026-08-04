@@ -30,6 +30,8 @@ CHECK_TYPES = frozenset(
         "log_not_contains",
         "debug_log_contains",
         "debug_log_not_contains",
+        "debug_tool_input_contains",
+        "debug_tool_input_not_contains",
         "assistant_contains",
     }
 )
@@ -100,9 +102,15 @@ def _validate_check(check: Dict[str, Any], where: str) -> None:
         "log_not_contains",
         "debug_log_contains",
         "debug_log_not_contains",
+        "debug_tool_input_contains",
+        "debug_tool_input_not_contains",
         "assistant_contains",
     }:
         _require(check, "text", str, where)
+    if kind in {"debug_tool_input_contains", "debug_tool_input_not_contains"}:
+        tool = _require(check, "tool", str, where)
+        if not tool:
+            raise ValidationError(f"{where}.tool: must not be empty")
     if kind == "contains_any":
         texts = _require(check, "texts", list, where)
         if not texts or not all(isinstance(item, str) and item for item in texts):

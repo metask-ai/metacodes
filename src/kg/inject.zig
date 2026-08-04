@@ -45,6 +45,35 @@ pub fn clearIdPointer(allocator: std.mem.Allocator, projects_dir: []const u8, na
     _ = std.c.unlink(path.ptr);
 }
 
+const RootLoad = enum { loaded, invalid, unavailable };
+
+/// Load one pointer root into owned row storage. `invalid` is authoritative
+/// (the id is not a task) and clears the pointer; `unavailable` covers
+/// transient subprocess/allocation failures and deliberately preserves it.
+fn appendRootRows(
+    allocator: std.mem.Allocator,
+    kg: *client_mod.KgClient,
+    projects_dir: []const u8,
+    pointer_name: []const u8,
+    root_id: u64,
+    rows: *std.ArrayList(client_mod.FrontierRow),
+) RootLoad {
+    const is_task = kg.nodeIsTask(root_id) catch return .unavailable;
+    if (!is_task) {
+        clearIdPointer(allocator, projects_dir, pointer_name);
+        return .invalid;
+    }
+    const fetched = kg.frontier(root_id, 50) catch return .unavailable;
+    rows.appendSlice(kg.allocator, fetched) catch {
+        for (fetched) |*r| r.deinit(kg.allocator);
+        kg.allocator.free(fetched);
+        return .unavailable;
+    };
+    // Row-owned strings moved into rows; only release the old slice container.
+    kg.allocator.free(fetched);
+    return .loaded;
+}
+
 /// 构建注入段。返回 null = 空态(零输出);否则 owned 字符串。
 /// 在后台线程调用(内部 spawn tinykg;主线程绝不直接调)。
 /// 两部分:① 记忆数锚(count>0 时,提升 recall 采用率——PM#3);② plan frontier(有活跃图时)。
@@ -53,6 +82,18 @@ pub fn buildSummary(
     kg: *client_mod.KgClient,
     projects_dir: []const u8,
 ) ?[]u8 {
+    return buildSummaryForAgent(allocator, kg, projects_dir, "");
+}
+
+/// Startup/resume variant. If this exact host-injected identity still owns a
+/// live lease, include one bounded packet so a fresh process can recover the
+/// active objective without depending on transcript prose.
+pub fn buildSummaryForAgent(
+    allocator: std.mem.Allocator,
+    kg: *client_mod.KgClient,
+    projects_dir: []const u8,
+    agent_identity: []const u8,
+) ?[]u8 {
     if (!kg.ready) return null;
     // 类型 facet(domain 准确 + 按 schema_type 分布);替代旧 memoryCount(全库节点计数,含别项目+任务)。
     const facet = kg.memoryFacet(allocator);
@@ -60,28 +101,61 @@ pub fn buildSummary(
     const mem_count: usize = if (facet) |f| f.total else 0;
     const breakdown: []const u8 = if (facet) |f| f.breakdown else "";
 
-    // 任务面 frontier(可选)。12b 单入口:优先 task 锚(一次看全多计划+inbox),
-    // 存量店退回 kg_root。inbox root 是容器不是任务,滤掉其自身行(空时以 leaf 现身)。
-    var rows: []client_mod.FrontierRow = &.{};
+    // 任务面 frontier(可选)。12b 单入口:优先 task 锚(一次看全多计划+inbox)。
+    // 存量店可能只有 kg_root、只有 kg_inbox，或两者并存；两者都读，避免 fresh
+    // process 恰好漏掉 inbox 中仍由自己持有租约的任务。
+    var row_storage: std.ArrayList(client_mod.FrontierRow) = .empty;
+    defer {
+        for (row_storage.items) |*r| r.deinit(kg.allocator);
+        row_storage.deinit(kg.allocator);
+    }
     var root_id: u64 = 0;
     const anchor_ptr = readIdPointer(allocator, projects_dir, "kg_task_anchor");
-    if (anchor_ptr orelse readIdPointer(allocator, projects_dir, "kg_root")) |rid| {
-        const is_task = kg.nodeIsTask(rid) catch false;
-        if (!is_task) {
-            clearIdPointer(allocator, projects_dir, if (anchor_ptr != null) "kg_task_anchor" else "kg_root"); // stale 防御
-        } else {
-            rows = kg.frontier(rid, 50) catch &.{};
-            root_id = rid;
+    var load_legacy = anchor_ptr == null;
+    if (anchor_ptr) |anchor| {
+        switch (appendRootRows(allocator, kg, projects_dir, "kg_task_anchor", anchor, &row_storage)) {
+            .loaded => root_id = anchor,
+            .invalid => load_legacy = true, // stale anchor:fall back in this same startup.
+            .unavailable => {}, // transient failure:preserve pointer and do not trust older roots.
         }
     }
-    // 释放持原始整片(free 的 len 必须等于分配时的 len);过滤只产生视图。
-    // kg 内存契约:rows 是 kg.allocator 分的,用它释放(本函数主线程调用时两者同源,
-    // 但契约要处处成立——见 KgClient 顶注)。
-    const rows_alloc = rows;
-    defer {
-        for (rows_alloc) |*r| r.deinit(kg.allocator);
-        if (rows_alloc.len > 0) kg.allocator.free(rows_alloc);
+    if (load_legacy) {
+        const RootPointer = struct { name: []const u8, id: ?u64 };
+        const roots = [_]RootPointer{
+            .{ .name = "kg_root", .id = readIdPointer(allocator, projects_dir, "kg_root") },
+            .{ .name = "kg_inbox", .id = readIdPointer(allocator, projects_dir, "kg_inbox") },
+        };
+        for (roots) |root| {
+            const rid = root.id orelse continue;
+            if (appendRootRows(allocator, kg, projects_dir, root.name, rid, &row_storage) == .loaded and root_id == 0) {
+                root_id = rid;
+            }
+        }
     }
+    // Legacy pointers may overlap (including both pointing at the same root, or
+    // one subtree containing the other). Frontier rows are identified by their
+    // stable task id; collapse duplicates before counting, rendering, or
+    // choosing a resume packet. Compaction moves ownership into the retained
+    // prefix, deinitializing only the duplicate copies.
+    var unique_len: usize = 0;
+    var row_index: usize = 0;
+    while (row_index < row_storage.items.len) : (row_index += 1) {
+        var duplicate = false;
+        for (row_storage.items[0..unique_len]) |prior| {
+            if (prior.task_id == row_storage.items[row_index].task_id) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            row_storage.items[row_index].deinit(kg.allocator);
+            continue;
+        }
+        if (unique_len != row_index) row_storage.items[unique_len] = row_storage.items[row_index];
+        unique_len += 1;
+    }
+    row_storage.shrinkRetainingCapacity(unique_len);
+    const rows = row_storage.items;
     var view: []const client_mod.FrontierRow = rows;
     if (rows.len > 0) {
         if (readIdPointer(allocator, projects_dir, "kg_inbox")) |inbox_id| {
@@ -96,22 +170,54 @@ pub fn buildSummary(
         }
     }
 
+    var resume_packet: ?[]u8 = null;
+    defer if (resume_packet) |packet| kg.allocator.free(packet);
+    if (agent_identity.len > 0) {
+        for (view) |r| {
+            const holder = r.claimed_by orelse continue;
+            if (r.status != .claimed or !std.mem.eql(u8, holder, agent_identity)) continue;
+            resume_packet = kg.taskPacketMeta(r.task_id, 12, 8_000) catch null;
+            break; // startup budget:one current work packet;TaskList handles the rest.
+        }
+    }
+
     // 全空(无记忆 + 无 frontier)→ 空态零输出。
     if (mem_count == 0 and view.len == 0) return null;
-    return renderSummary(allocator, root_id, view, mem_count, breakdown) catch null;
+    return renderSummaryFull(allocator, root_id, view, mem_count, breakdown, resume_packet) catch null;
 }
 
 /// 纯渲染(可单测):记忆数锚(带类型 breakdown)+ frontier rows → 注入段文本。
 pub fn renderSummary(allocator: std.mem.Allocator, root_id: u64, rows: []const client_mod.FrontierRow, mem_count: usize, breakdown: []const u8) ![]u8 {
+    return renderSummaryFull(allocator, root_id, rows, mem_count, breakdown, null);
+}
+
+fn renderSummaryFull(
+    allocator: std.mem.Allocator,
+    root_id: u64,
+    rows: []const client_mod.FrontierRow,
+    mem_count: usize,
+    breakdown: []const u8,
+    resume_packet: ?[]const u8,
+) ![]u8 {
     // v2 深遍历:branch 行是结构上下文(开放复合节点),不算可执行任务;
     // 计数与"ready 前 3"只看叶子/关联(frontier 的可执行集语义)。
     var ready_count: usize = 0;
     var blocked_count: usize = 0;
+    var claimed_count: usize = 0;
+    var failed_count: usize = 0;
     for (rows) |r| {
         if (r.role == .branch) continue;
-        if (r.readiness == .ready) ready_count += 1 else blocked_count += 1;
+        if (r.status == .failed) {
+            failed_count += 1;
+        } else if (r.status == .claimed) {
+            claimed_count += 1;
+        } else if (r.readiness == .ready) {
+            ready_count += 1;
+        } else {
+            blocked_count += 1;
+        }
     }
-    const actionable_count = ready_count + blocked_count;
+    const visible_count = ready_count + blocked_count + claimed_count + failed_count;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -125,11 +231,16 @@ pub fn renderSummary(allocator: std.mem.Allocator, root_id: u64, rows: []const c
         }
     }
     // ② plan frontier(有活跃图时)。
-    if (actionable_count > 0) {
-        try appendPrint(&out, allocator, "持久任务图(root {d}):{d} ready / {d} blocked(共 {d})\n", .{ root_id, ready_count, blocked_count, actionable_count });
+    if (visible_count > 0) {
+        if (claimed_count > 0 or failed_count > 0) {
+            try appendPrint(&out, allocator, "持久任务图(root {d}):{d} ready / {d} blocked / {d} claimed / {d} failed(共 {d})\n", .{ root_id, ready_count, blocked_count, claimed_count, failed_count, visible_count });
+        } else {
+            try appendPrint(&out, allocator, "持久任务图(root {d}):{d} ready / {d} blocked(共 {d})\n", .{ root_id, ready_count, blocked_count, visible_count });
+        }
         var shown: usize = 0;
         for (rows) |r| {
             if (r.role == .branch) continue;
+            if (r.status != .open) continue;
             if (r.readiness != .ready) continue;
             if (shown >= MAX_READY_SHOWN) break;
             shown += 1;
@@ -144,7 +255,22 @@ pub fn renderSummary(allocator: std.mem.Allocator, root_id: u64, rows: []const c
             try out.appendSlice(allocator, "\n");
         }
         if (ready_count > MAX_READY_SHOWN) try appendPrint(&out, allocator, "- …还有 {d} 个 ready 任务\n", .{ready_count - MAX_READY_SHOWN});
+        for (rows) |r| {
+            if (r.status != .claimed) continue;
+            try appendPrint(&out, allocator, "- CLAIMED [{d}] {s}", .{ r.task_id, firstLineTrunc(r.text, 120) });
+            if (r.claimed_by) |c| try appendPrint(&out, allocator, " (by {s})", .{c});
+            try out.appendSlice(allocator, "\n");
+        }
+        for (rows) |r| {
+            if (r.status != .failed) continue;
+            try appendPrint(&out, allocator, "- FAILED [{d}] {s}\n", .{ r.task_id, firstLineTrunc(r.text, 120) });
+        }
         try out.appendSlice(allocator, "此为启动快照,以 TaskList 实时结果为准。\n");
+    }
+    if (resume_packet) |packet| {
+        try out.appendSlice(allocator, "## Active task recovery packet\n当前 session 仍持有下面任务的有效租约。先按 packet 恢复父目标、依赖、证据和 continuation，再继续工作；不要只凭摘要猜测。\n");
+        try out.appendSlice(allocator, packet);
+        try out.append(allocator, '\n');
     }
     return out.toOwnedSlice(allocator);
 }

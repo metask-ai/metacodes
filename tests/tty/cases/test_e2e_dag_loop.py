@@ -1,4 +1,4 @@
-"""真模型 e2e:任务 DAG 闭环全链 —— frontier(深遍历)→ claim(租约)→ fan-out(subagent)→ revise 闭合 → 波前前进。
+"""真模型 e2e:任务 DAG 闭环全链 —— frontier(深遍历)→ claim(租约)→ fan-out(subagent)→ task-close 闭合 → 波前前进。
 
 场景(预置进 kg store,不靠模型建图):
     root(1) ─contains→ A(2) / B(3) / C(4);C depends_on A、C depends_on B
@@ -9,7 +9,7 @@ TaskUpdate(in_progress) 认领(claim 租约,身份=subagent 自己的 agent_iden
 TaskUpdate(completed) 闭合。
 
 权威断言(店内,不依赖模型措辞):
-    - A、B 出 frontier(已闭合,kind→verification)
+    - A、B 出 frontier，但原 id 仍是 kind=task,status=completed，task-packet 可调用
     - C 变 ready(depends_on 链解锁 = 波前前进)
 transcript 断言:主 agent 真调了 ≥2 次 Task(fan-out 而非自己顺序做)。
 claim 证据(软):subagent 被要求把认领返回的 JSON 转述进 final_text → 父 transcript
@@ -153,6 +153,14 @@ def test_e2e_dag_closed_loop(bin_path):
         a_closed = "整理甲清单" not in fr
         b_closed = "整理乙清单" not in fr
         c_ready = "汇总收尾" in fr and "readiness=ready" in _frontier_row(fr, "汇总收尾") if "汇总收尾" in fr else False
+        a_packet = _tinykg(store, "task-packet", ids["A"], "--limit", "10")
+        b_packet = _tinykg(store, "task-packet", ids["B"], "--limit", "10")
+        a_stable = (f"task_packet\t{ids['A']}\tstatus=completed" in a_packet and
+                    f"task\t{ids['A']}\ttask\t整理甲清单" in a_packet and
+                    "verified_by_out" in a_packet)
+        b_stable = (f"task_packet\t{ids['B']}\tstatus=completed" in b_packet and
+                    f"task\t{ids['B']}\ttask\t整理乙清单" in b_packet and
+                    "verified_by_out" in b_packet)
 
         # ── transcript 层:fan-out + claim 转述 ──
         uses = read_tool_uses(home)
@@ -168,12 +176,13 @@ def test_e2e_dag_closed_loop(bin_path):
                         break
 
         diag = (f"attempt{attempt}: a_closed={a_closed} b_closed={b_closed} c_ready={c_ready} "
+                f"a_stable={a_stable} b_stable={b_stable} "
                 f"task_spawns={len(task_spawns)} claims_relayed={claims_relayed} "
                 f"tools={[u.get('name') for u in uses]} home={home}")
         diags.append(diag)
         print("    " + diag)
 
-        if a_closed and b_closed and c_ready and len(task_spawns) >= 2:
+        if a_closed and b_closed and c_ready and a_stable and b_stable and len(task_spawns) >= 2:
             return  # 闭环全链 PASS
         # A/B 闭合但没 fan-out(模型自己顺序做了)→ 漂移方向,重试。
         # 什么都没动 → 也重试。

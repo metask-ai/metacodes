@@ -24,6 +24,7 @@ const ask_user_tool = @import("tools/ask_user.zig");
 const plan_mode_tool = @import("tools/plan_mode.zig");
 const task_tools = @import("tools/task_tools.zig");
 const kg_tools = @import("tools/kg_tools.zig");
+const kg_retrieval = @import("kg/retrieval_protocol.zig");
 const agent_tool = @import("tools/agent.zig");
 const tool_search_tool = @import("tools/tool_search.zig");
 const web_search_tool = @import("tools/web_search.zig");
@@ -365,10 +366,10 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "KgRecall",
-        .description = "Search the knowledge graph for durable memories (decisions, preferences, project facts) from this and past sessions. Use when the user refers to prior decisions/context or when continuing cross-session work. Retrieval is LEXICAL (BM25, no embeddings) — you supply the semantics by expanding the query (see query field). Hits carrying a \"source\" field come from a memory markdown file — to change that memory, UPDATE that file (do not KgRemember a duplicate).",
+        .description = kg_retrieval.TOOL_DESCRIPTION,
         .input_schema = .{ .type = "object", .prop_specs = &.{
-            .{ .name = "query", .type = "string", .description = "Search keywords. Because retrieval is LEXICAL (exact word/character match, no vector/semantic search), EXPAND the topic into a set of related keywords in ONE query: add synonyms, closely-related terms, and BOTH Chinese and English forms — a memory may be stored in either language or as code identifiers (e.g. crash↔崩溃, threshold↔阈值, panic↔报错/unreachable, retrieval↔召回/recall). Example: to recall why a process crashed → 'panic crash unreachable 崩溃 报错'. Extra keywords are safe — the most relevant memories rank first (coverage-first)." },
-            .{ .name = "type", .type = "string", .description = "Optional. Filter results to ONE memory type: decision | user_preference | module | bug | observation. The result header lists which types are present, so you can refine. Best-effort: an empty typed result does NOT prove the type is absent (lexical ranking may push same-type memories out of the window) — retry without type if unsure." },
+            .{ .name = "query", .type = "string", .description = kg_retrieval.QUERY_DESCRIPTION },
+            .{ .name = "type", .type = "string", .description = kg_retrieval.TYPE_DESCRIPTION },
         }, .required = &.{"query"} },
         .execute = kg_tools.executeRecall,
     },
@@ -384,7 +385,7 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskGet",
-        .description = "Fetch the full Task record (description, status, owner, blocks, blockedBy) by id.",
+        .description = "Fetch a task by id. For persistent kg-* tasks this also returns a bounded TinyKG task_packet with parent objective, dependencies, evidence, truncation diagnostics and continuations. Call it after restart/compaction or whenever claim could not return a packet; do not work from the title alone.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "taskId", .type = "string", .description = "The id of the task to fetch" },
         }, .required = &.{"taskId"} },
@@ -392,16 +393,16 @@ pub const registry: []const ToolEntry = &.{
     },
     .{
         .name = "TaskList",
-        .description = "List all tasks with id, subject, status, owner and blockedBy (summary view).",
+        .description = "List the live task frontier. For kg-* tasks select only an open, ready, unclaimed leaf; then claim it with TaskUpdate status=in_progress before work. This is a summary/projection, so use TaskGet/task_packet for full recovery context.",
         .input_schema = .{ .type = "object", .prop_specs = &.{}, .required = &.{} },
         .execute = task_tools.executeList,
     },
     .{
         .name = "TaskUpdate",
-        .description = "Update a task's status (pending/in_progress/completed/deleted) and/or fields (subject, description, activeForm, owner) and/or addBlocks/addBlockedBy id lists. When closing a KG plan step (status=completed), also fill conclusion + acts_on/uses/produces so the graph records what the task ACTUALLY touched — you know this best at closure, not at start.",
+        .description = "Update a task's status (pending/in_progress/completed/failed/deleted) and/or fields. For persistent kg-* tasks: claim with in_progress before work (the successful response contains the bounded task_packet); completed/failed are terminal while preserving the stable id; deleted is only a compatibility alias for failed. Close every claimed task with a verified conclusion and actual acts_on/uses/produces when known, then inspect the returned frontier.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "taskId", .type = "string", .description = "The id of the task to update" },
-            .{ .name = "status", .type = "string", .description = "New status", .enum_values = &.{ "pending", "in_progress", "completed", "deleted" } },
+            .{ .name = "status", .type = "string", .description = "New status; failed is for persistent KG tasks", .enum_values = &.{ "pending", "in_progress", "completed", "failed", "deleted" } },
             .{ .name = "subject", .type = "string", .description = "New subject (title)" },
             .{ .name = "description", .type = "string", .description = "New description" },
             .{ .name = "activeForm", .type = "string", .description = "New present-continuous form" },
@@ -477,13 +478,13 @@ pub const registry: []const ToolEntry = &.{
         }, .required = &.{"prompt"} },
         .execute = agent_tool.execute,
     },
-    // ToolSearch:core 常驻。模型按 query 检索 deferred 工具的完整 schema 并激活,
-    // 激活后该工具进后续请求 tools 数组变可调(对齐 cc ToolSearch)。
+    // ToolSearch:静态 registry 常驻，但 toToolDefinitionsFull 仅在确有 deferred 工具时
+    // 广告。模型按 query 检索完整 schema 并激活，下一轮该 deferred 工具才进入 tools。
     .{
         .name = "ToolSearch",
-        .description = "Fetches full schema definitions for deferred tools so they can be called. Some tools are deferred — only their names are shown in the prompt, with no parameter schema, so they cannot be invoked until fetched. Pass a `query` of keywords to find matching deferred tools, or `select:<tool_name>` (comma-separated for multiple) to fetch specific ones by name. Returns the matched tools' full JSON schemas; once returned, each tool is callable exactly like a core tool.",
+        .description = "Fetches schemas only for deferred tools whose names appear under # Deferred tools. NEVER call ToolSearch for a tool whose full schema is already present in the current tools list (including KgRecall); call that tool directly. Pass keywords to find a deferred tool, or `select:<deferred_tool_name>` to fetch a listed deferred tool by exact name. Returns matched deferred schemas; once returned, each is callable like a core tool.",
         .input_schema = .{ .type = "object", .prop_specs = &.{
-            .{ .name = "query", .type = "string", .description = "Keywords to find deferred tools, or `select:<tool_name>` (comma-separated) to fetch by exact name." },
+            .{ .name = "query", .type = "string", .description = "Keywords to find deferred tools, or `select:<deferred_tool_name>` for an exact name listed under # Deferred tools. Do not select an already-visible core tool." },
             .{ .name = "max_results", .type = "integer", .description = "Maximum number of results to return (default 5)" },
         }, .required = &.{"query"} },
         .execute = tool_search_tool.execute,
@@ -608,9 +609,31 @@ pub fn toToolDefinitionsFull(
 
     // Swarm 工具门控(F5):未开 --agent-teams 时不广告 TeamCreate/TeamDelete/SendMessage。
     const teams_on = if (prompt_ctx) |pc| pc.agent_teams else false;
+    // ToolSearch 是 deferred 工具的发现/激活入口。没有任何 deferred 工具时仍广告它，
+    // 会诱导模型对已经带完整 schema 的常驻工具做 select:Write/KgRecall，徒增一轮。
+    // 静态内置当前全常驻；MCP 动态工具 deferred=true。未来若静态工具重新 deferred，
+    // 此门会自动把 ToolSearch 放回。
+    var has_deferred = false;
+    for (registry) |tool| {
+        if (tool.deferred) {
+            has_deferred = true;
+            break;
+        }
+    }
+    if (!has_deferred) {
+        if (dyn) |d| {
+            for (d.entries.items) |entry| {
+                if (entry.deferred) {
+                    has_deferred = true;
+                    break;
+                }
+            }
+        }
+    }
 
     for (registry) |*tool| {
         if (tool.swarm_gated and !teams_on) continue;
+        if (std.mem.eql(u8, tool.name, "ToolSearch") and !has_deferred) continue;
         const desc: []const u8 = blk: {
             // env override(slot "TOOL_DESC_<UPPER_NAME>")优先于 describe_fn / 静态描述。
             // 用于提示词 A/B 实验:同一二进制按 env 切换工具描述,无需重编译。
@@ -1147,15 +1170,14 @@ test "getTool by name" {
     try std.testing.expect(getTool("web_search") == null);
 }
 
-test "toToolDefinitions creates all registry tools (WebSearch is a normal function tool)" {
+test "toToolDefinitions creates applicable registry tools (WebSearch normal, ToolSearch demand-gated)" {
     const defs = try toToolDefinitions(std.testing.allocator);
     defer std.testing.allocator.free(defs);
-    // 不再追加 server-tool 形态的 web_search(异形毒化后端,已删)。defs == registry 中**非 swarm-gated**
-    // 部分:toToolDefinitions 走 prompt_ctx=null → teams_on=false → TeamCreate/TeamDelete/SendMessage
-    // 被门控排除(F5)。动态计非门控数,勿硬编码(加 swarm 工具不破测)。
+    // 不再追加 server-tool 形态的 web_search(异形毒化后端,已删)。无 dyn deferred 时
+    // ToolSearch 也不应进入模型菜单；另排除 swarm-gated 工具。
     var non_gated: usize = 0;
     for (registry) |t| {
-        if (!t.swarm_gated) non_gated += 1;
+        if (!t.swarm_gated and !std.mem.eql(u8, t.name, "ToolSearch")) non_gated += 1;
     }
     try std.testing.expect(defs.len == non_gated);
     // WebSearch 作为普通函数工具在 registry 里,带 input_schema、无 server_type。
@@ -1170,6 +1192,7 @@ test "toToolDefinitions creates all registry tools (WebSearch is a normal functi
         }
         // 绝不应再出现 server-tool 形态的 web_search。
         try std.testing.expect(!std.mem.eql(u8, d.name, "web_search"));
+        try std.testing.expect(!std.mem.eql(u8, d.name, "ToolSearch"));
     }
     try std.testing.expect(found_ws);
 }
@@ -1188,10 +1211,10 @@ test "toToolDefinitionsWithDyn appends dynamic tools after static (no server-too
     const defs = try toToolDefinitionsWithDyn(std.testing.allocator, &dyn);
     defer std.testing.allocator.free(defs);
 
-    // 非 swarm-gated 静态 + 1 dyn(无 web_search);prompt_ctx=null 门控排除 swarm 工具(F5)。
+    // 非 swarm-gated 静态(且无需求的 ToolSearch) + 1 dyn；prompt_ctx=null 门控 swarm。
     var non_gated: usize = 0;
     for (registry) |t| {
-        if (!t.swarm_gated) non_gated += 1;
+        if (!t.swarm_gated and !std.mem.eql(u8, t.name, "ToolSearch")) non_gated += 1;
     }
     try std.testing.expect(defs.len == non_gated + 1);
     // 动态工具在末尾。

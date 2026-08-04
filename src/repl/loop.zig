@@ -2530,7 +2530,11 @@ fn printPlanWithProgress(md: []const u8, rows: []const @import("../kg/client.zig
             var mark: []const u8 = "✓"; // 默认:不在 frontier = 已完成
             for (rows) |r| {
                 if (frontierMatches(r.text, content)) {
-                    mark = if (r.role == .branch) "▹" else switch (r.readiness) {
+                    mark = if (r.status == .failed)
+                        "✗"
+                    else if (r.role == .branch)
+                        "▹"
+                    else switch (r.readiness) {
                         .ready => "○",
                         .blocked => "⊘",
                         .missing_dependencies => "…",
@@ -2586,10 +2590,14 @@ fn printKgRootFrontier(allocator: std.mem.Allocator, kg: anytype, projects_dir: 
     for (rows) |r| {
         if (r.role != .branch) actionable += 1;
     }
-    std.debug.print("{s} root {d} — {d} 个开放:\n", .{ label, root, actionable });
+    std.debug.print("{s} root {d} — {d} 个未完成/失败任务:\n", .{ label, root, actionable });
     for (rows) |r| {
         // branch = 开放复合节点(等子树闭合)→ ▹;缩进按 depth 呈现树形。
-        const mark = if (r.role == .branch) "▹" else switch (r.readiness) {
+        const mark = if (r.status == .failed)
+            "✗"
+        else if (r.role == .branch)
+            "▹"
+        else switch (r.readiness) {
             .ready => "○",
             .blocked => "⊘",
             .missing_dependencies => "…",

@@ -50,7 +50,7 @@ E2E_LOG_SPEC="agent:debug,client:debug,stream:debug,tool:debug,permission:debug,
 # ============================================================================
 # 设置的变量(调用方读):
 #   CONF_PERMISSION CONF_SETTINGS CONF_ALLOWED_TOOLS CONF_DISALLOWED_TOOLS
-#   CONF_ADD_DIR(换行分隔多条) CONF_ANSWERS CONF_GIT_INIT CONF_MCP_MOCK_SERVERS CONF_TIMEOUT
+#   CONF_ADD_DIR(换行分隔多条) CONF_ANSWERS CONF_GIT_INIT CONF_MCP_MOCK_SERVERS CONF_KG_SEED CONF_TIMEOUT
 #   CONF_EXPECT(换行分隔多条 EXPECT_* 原始行) CONF_EXPECT_HARD
 load_conf() {
   local conf_file="$1"
@@ -62,6 +62,7 @@ load_conf() {
   CONF_ANSWERS=""
   CONF_GIT_INIT=""
   CONF_MCP_MOCK_SERVERS=""
+  CONF_KG_SEED=""
   CONF_TIMEOUT=""
   CONF_EXPECT=""
   CONF_EXPECT_HARD="0"
@@ -87,6 +88,7 @@ load_conf() {
       ANSWERS)           CONF_ANSWERS="$val" ;;
       GIT_INIT)          CONF_GIT_INIT="$val" ;;
       MCP_MOCK_SERVERS)  CONF_MCP_MOCK_SERVERS="$val" ;;
+      KG_SEED)           CONF_KG_SEED="$val" ;;
       TIMEOUT)           CONF_TIMEOUT="$val" ;;
       EXPECT_FILE|EXPECT_CONTAINS|EXPECT_MIN_LINES|EXPECT_ABSENT)
                          CONF_EXPECT="${CONF_EXPECT}${key}=${val}"$'\n' ;;
@@ -124,6 +126,23 @@ run_session() {
   # --- HOME 隔离:每场景独立 fake HOME,隔离一切 HOME 级副作用 ---
   local fake_home="$workdir/.home"
   setup_fake_home "$fake_home"
+
+  # --- TinyKG 夹具:只向本场景 fake HOME 的全新 store 写入,以 global project 供任意
+  # workdir domain 只读召回。fixture 路径同时在 eval suite environment.fixtures 中冻结。---
+  if [[ -n "$CONF_KG_SEED" ]]; then
+    local tinykg_bin="$ZIG_ROOT/zig-out/vendor/tinykg/tinykg"
+    local kg_fixture="$E2E_DIR/$CONF_KG_SEED"
+    if [[ ! -x "$tinykg_bin" || ! -f "$kg_fixture" ]]; then
+      echo "KG fixture dependency missing: $tinykg_bin or $kg_fixture" >&2
+      echo 94
+      return 0
+    fi
+    python3 "$E2E_DIR/seed_kg_fixture.py" \
+      "$tinykg_bin" "$fake_home/.metacodes/kg/store.kg" "$kg_fixture" || {
+        echo 94
+        return 0
+      }
+  fi
 
   # --- 场景级预置夹具:fixtures/agents → fake HOME(供 22_subagent_custom 等)---
   if [[ -d "$E2E_DIR/fixtures/agents" ]]; then

@@ -11,6 +11,7 @@ SUITES = (
     ROOT / "evals" / "suites" / "core-e2e.json",
     ROOT / "evals" / "suites" / "agentdef-release.json",
     ROOT / "evals" / "suites" / "websearch-concurrency.json",
+    ROOT / "evals" / "suites" / "kg-lexical-bridge.json",
 )
 
 
@@ -62,6 +63,22 @@ class SuiteValidationTest(unittest.TestCase):
         broken["tasks"][0]["success"]["checks"][0]["path"] = "../secret"
         with self.assertRaisesRegex(ValidationError, "safe workspace-relative"):
             validate_suite(broken, ROOT)
+
+    def test_debug_tool_input_check_requires_a_named_tool(self):
+        suite = load_json(SUITES[0])
+        for invalid in (None, ""):
+            with self.subTest(invalid=invalid):
+                broken = copy.deepcopy(suite)
+                check = {
+                    "type": "debug_tool_input_not_contains",
+                    "text": "TTL",
+                    "description": "query must stay lexical",
+                }
+                if invalid is not None:
+                    check["tool"] = invalid
+                broken["tasks"][0]["success"]["checks"].append(check)
+                with self.assertRaisesRegex(ValidationError, "tool"):
+                    validate_suite(broken, ROOT)
 
     def test_fixture_path_cannot_escape_or_be_missing(self):
         suite = load_json(SUITES[1])
