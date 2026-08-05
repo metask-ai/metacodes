@@ -454,6 +454,10 @@ test "L2 KG governance: freshness and contradiction contract enters the actual A
     defer defs_arena.deinit();
     var pc = cc.tools.PromptContext{ .enabled_tool_names = &names };
     const defs = try cc.tools.toToolDefinitionsFull(defs_arena.allocator(), null, &pc);
+    // Production always supplies the session activation set. Keep it empty here so the request
+    // proves the real deferred-tool boundary: ToolSearch is visible, FormalAuditTask is not yet.
+    var activated_tools = std.StringHashMap(void).init(a);
+    defer activated_tools.deinit();
 
     var conv = cc.conversation.Conversation.init(a);
     defer conv.deinit();
@@ -465,6 +469,7 @@ test "L2 KG governance: freshness and contradiction contract enters the actual A
     const result = cc.agent_loop.run(&conv, client.provider(), defs, &perm, .{
         .max_turns = 1,
         .system_prompt = system_prompt,
+        .activated_tools = &activated_tools,
     }, &be, a) catch |e| {
         std.debug.print("agent_loop.run failed: {s}\n", .{@errorName(e)});
         return error.SkipZigTest;
@@ -493,8 +498,8 @@ test "L2 KG governance: freshness and contradiction contract enters the actual A
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "A title or compact summary alone is insufficient") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "never leave finished work claimed/open") != null);
 
-    // Pilot 中 glm-5.2 曾错误 ToolSearch(select:KgRecall/Write)。本场景没有 deferred
-    // 工具，请求体必须证明 KgRecall 直接可见而 ToolSearch 根本不被广告。
+    // KgRecall/Write remain directly callable. FormalAuditTask is genuinely deferred, so
+    // ToolSearch is advertised as its activation gate while the full formal schema stays absent.
     const tools_field = cap.jsonField("tools") orelse return error.ToolsFieldMissing;
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"KgRecall\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"KgContext\"") != null);
@@ -503,7 +508,8 @@ test "L2 KG governance: freshness and contradiction contract enters the actual A
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "select only an open, ready, unclaimed leaf") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "successful response contains the bounded task_packet") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"Write\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"ToolSearch\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"ToolSearch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"FormalAuditTask\"") == null);
 }
 
 test "L2 KG: KgRecall result carries staged variants, dedup, and graph verification guidance" {

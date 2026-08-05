@@ -26,6 +26,19 @@ mkdir -p "$(dirname "$output")" "$(dirname "$manifest")"
   "$lake" build metacodes-formal-kernel
 )
 
+# Lean permits declarations containing `sorry` to compile by inserting
+# `sorryAx`.  Shipping a theorem-bearing checker therefore requires an axiom
+# audit, not merely a green `lake build`.  The current proof uses only Lean's
+# expected quotient/propositional extensionality axioms; any expansion of this
+# exact trust set is a release-blocking review event.
+axiom_audit=$(cd "$lean_dir" && "$lake" env lean FormalAxiomAudit.lean 2>&1)
+expected_axioms="'MetaCodesControl.FormalKernel.safeMigration_sound' depends on axioms: [propext, Quot.sound]"
+if [[ "$axiom_audit" != "$expected_axioms" ]]; then
+  echo "build-formal-kernel: unexpected soundness theorem axiom set" >&2
+  printf '%s\n' "$axiom_audit" >&2
+  exit 1
+fi
+
 host_os=$(uname -s)
 linker="lake-default"
 if [[ "$host_os" == "Darwin" ]]; then
@@ -92,10 +105,12 @@ if command -v shasum >/dev/null 2>&1; then
   binary_sha256=$(shasum -a 256 "$output" | awk '{print $1}')
   kernel_source_sha256=$(shasum -a 256 "$lean_dir/MetaCodesControl/FormalKernel.lean" | awk '{print $1}')
   main_source_sha256=$(shasum -a 256 "$lean_dir/FormalMain.lean" | awk '{print $1}')
+  axiom_audit_source_sha256=$(shasum -a 256 "$lean_dir/FormalAxiomAudit.lean" | awk '{print $1}')
 else
   binary_sha256=$(sha256sum "$output" | awk '{print $1}')
   kernel_source_sha256=$(sha256sum "$lean_dir/MetaCodesControl/FormalKernel.lean" | awk '{print $1}')
   main_source_sha256=$(sha256sum "$lean_dir/FormalMain.lean" | awk '{print $1}')
+  axiom_audit_source_sha256=$(sha256sum "$lean_dir/FormalAxiomAudit.lean" | awk '{print $1}')
 fi
 if [[ "$host_os" == "Darwin" ]]; then
   binary_bytes=$(stat -f '%z' "$output")
@@ -107,7 +122,7 @@ host_arch=$(uname -m)
 built_at_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
 printf '%s\n' \
-  "{\"schema_version\":\"metacodes-formal-artifact-v1\",\"checker_version\":\"metacodes-formal-kernel-v1\",\"request_schema\":\"metacodes-formal-request-v1\",\"verdict_schema\":\"metacodes-formal-verdict-v1\",\"binary_sha256\":\"$binary_sha256\",\"binary_bytes\":$binary_bytes,\"kernel_source_sha256\":\"$kernel_source_sha256\",\"main_source_sha256\":\"$main_source_sha256\",\"host_os\":\"$host_os\",\"host_arch\":\"$host_arch\",\"linker\":\"$linker\",\"lean_version\":\"$lean_version\",\"native_smoke\":\"passed\",\"built_at_utc\":\"$built_at_utc\"}" \
+  "{\"schema_version\":\"metacodes-formal-artifact-v1\",\"checker_version\":\"metacodes-formal-kernel-v1\",\"request_schema\":\"metacodes-formal-request-v1\",\"verdict_schema\":\"metacodes-formal-verdict-v1\",\"binary_sha256\":\"$binary_sha256\",\"binary_bytes\":$binary_bytes,\"kernel_source_sha256\":\"$kernel_source_sha256\",\"main_source_sha256\":\"$main_source_sha256\",\"axiom_audit_source_sha256\":\"$axiom_audit_source_sha256\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"host_os\":\"$host_os\",\"host_arch\":\"$host_arch\",\"linker\":\"$linker\",\"lean_version\":\"$lean_version\",\"native_smoke\":\"passed\",\"built_at_utc\":\"$built_at_utc\"}" \
   >"$manifest"
 
 echo "formal kernel: $output"

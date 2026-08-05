@@ -335,7 +335,7 @@ pub fn buildFull(
     };
     defer allocator.free(using_tools_section);
 
-    const deferred_section = try buildDeferredToolsSection(allocator);
+    const deferred_section = try buildDeferredToolsSection(allocator, enabled_tool_names, kg_ready);
     defer allocator.free(deferred_section);
 
     const kg_section: []const u8 = if (kg_ready) KG_SECTION else "";
@@ -359,16 +359,31 @@ pub fn buildFull(
 }
 
 /// 列出 deferred 工具(name + 短描述),说明调 ToolSearch 取 schema 才能用(对齐 cc
-/// <available-deferred-tools>)。registry 里 deferred=true 的进名单。
-/// 注:内置工具现已全常驻(deferred=false),对齐 cc"只 defer MCP"。MCP 动态工具在
-/// DynRegistry(此函数看不到),其 prompt 列名待 MCP 启动接线后补;当前无 MCP → 返空串。
-fn buildDeferredToolsSection(allocator: std.mem.Allocator) ![]u8 {
+/// <available-deferred-tools>)。只列当前 runtime treatment 实际启用的 deferred 工具；
+/// 否则 TinyKG-only schema 名会泄漏到 codex/claude 对照臂并破坏实验隔离。
+/// MCP 动态工具在 DynRegistry(此函数看不到),其 prompt 列名待 MCP 启动接线后补。
+fn buildDeferredToolsSection(
+    allocator: std.mem.Allocator,
+    enabled_tool_names: ?[]const []const u8,
+    kg_ready: bool,
+) ![]u8 {
     const tools = @import("../tools.zig");
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     var any = false;
     for (tools.registry) |*t| {
         if (!t.deferred) continue;
+        if (t.tinykg_gated and !kg_ready) continue;
+        if (enabled_tool_names) |names| {
+            var enabled = false;
+            for (names) |name| {
+                if (std.mem.eql(u8, name, t.name)) {
+                    enabled = true;
+                    break;
+                }
+            }
+            if (!enabled) continue;
+        }
         if (!any) {
             try buf.appendSlice(allocator,
                 \\# Deferred tools
@@ -497,6 +512,8 @@ test "KG prompt enforces staged semantic neighborhood only when KG is ready" {
     try testing.expect(std.mem.indexOf(u8, with_kg, "Persistent task control-plane algorithm") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "A title or compact summary alone is insufficient") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "never leave finished work claimed/open") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "# Deferred tools") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "FormalAuditTask") != null);
 
     const without_kg = try buildFull(testing.allocator, "claude-opus-4-7", null, null, null, "", false);
     defer testing.allocator.free(without_kg);
@@ -504,6 +521,8 @@ test "KG prompt enforces staged semantic neighborhood only when KG is ready" {
     try testing.expect(std.mem.indexOf(u8, without_kg, "ALIAS BRANCH HAS PRIORITY") == null);
     try testing.expect(std.mem.indexOf(u8, without_kg, "KgContext") == null);
     try testing.expect(std.mem.indexOf(u8, without_kg, "Persistent task control-plane algorithm") == null);
+    try testing.expect(std.mem.indexOf(u8, without_kg, "# Deferred tools") == null);
+    try testing.expect(std.mem.indexOf(u8, without_kg, "FormalAuditTask") == null);
 }
 
 test "knowledge cutoff maps opus-4-7" {

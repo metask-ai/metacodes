@@ -25,6 +25,7 @@ const plan_mode_tool = @import("tools/plan_mode.zig");
 const task_tools = @import("tools/task_tools.zig");
 const kg_tools = @import("tools/kg_tools.zig");
 const kg_retrieval = @import("kg/retrieval_protocol.zig");
+const formal_task_audit = @import("formal/task_audit.zig");
 const agent_tool = @import("tools/agent.zig");
 const tool_search_tool = @import("tools/tool_search.zig");
 const web_search_tool = @import("tools/web_search.zig");
@@ -402,6 +403,16 @@ pub const registry: []const ToolEntry = &.{
         .tinykg_gated = true,
     },
     .{
+        .name = "FormalAuditTask",
+        .description = "Run a read-only, machine-checked audit of one bounded TinyKG task subgraph. Zig validates and hashes the real snapshot, invokes the deployment-pinned precompiled Lean kernel, verifies every verdict binding, and persists an engineering receipt. This does not mutate the graph and does not claim that reobserve/CAS/rollback are implemented. The checker path and SHA-256 are host configuration, never model arguments.",
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "root_task_id", .type = "integer", .description = "TinyKG root task id whose bounded task subgraph will be audited" },
+        }, .required = &.{"root_task_id"} },
+        .execute = formal_task_audit.execute,
+        .deferred = true,
+        .tinykg_gated = true,
+    },
+    .{
         .name = "TaskCreate",
         .description = "Create a task in the in-session task list. Returns the new task id. Use for multi-step work you want to track across turns.",
         .describe_fn = descriptions.describeTaskCreate,
@@ -648,6 +659,8 @@ pub fn toToolDefinitionsFull(
     // 此门会自动把 ToolSearch 放回。
     var has_deferred = false;
     for (registry) |tool| {
+        if (tool.swarm_gated and !teams_on) continue;
+        if (tool.tinykg_gated and !tinykg_on) continue;
         if (tool.deferred) {
             has_deferred = true;
             break;
@@ -1214,14 +1227,14 @@ test "getTool by name" {
     try std.testing.expect(getTool("web_search") == null);
 }
 
-test "toToolDefinitions creates applicable registry tools (WebSearch normal, ToolSearch demand-gated)" {
+test "toToolDefinitions includes ToolSearch when native formal audit is deferred" {
     const defs = try toToolDefinitions(std.testing.allocator);
     defer std.testing.allocator.free(defs);
-    // 不再追加 server-tool 形态的 web_search(异形毒化后端,已删)。无 dyn deferred 时
-    // ToolSearch 也不应进入模型菜单；另排除 swarm-gated 工具。
+    // 不再追加 server-tool 形态的 web_search(异形毒化后端,已删)。FormalAuditTask
+    // 是 deferred 静态工具，因此 ToolSearch 必须出现；只排除 swarm-gated 工具。
     var non_gated: usize = 0;
     for (registry) |t| {
-        if (!t.swarm_gated and !std.mem.eql(u8, t.name, "ToolSearch")) non_gated += 1;
+        if (!t.swarm_gated) non_gated += 1;
     }
     try std.testing.expect(defs.len == non_gated);
     // WebSearch 作为普通函数工具在 registry 里,带 input_schema、无 server_type。
@@ -1229,6 +1242,7 @@ test "toToolDefinitions creates applicable registry tools (WebSearch normal, Too
     const ws = getTool("WebSearch").?;
     try std.testing.expect(!ws.deferred);
     var found_ws = false;
+    var found_tool_search = false;
     for (defs) |d| {
         if (std.mem.eql(u8, d.name, "WebSearch")) {
             found_ws = true;
@@ -1236,9 +1250,10 @@ test "toToolDefinitions creates applicable registry tools (WebSearch normal, Too
         }
         // 绝不应再出现 server-tool 形态的 web_search。
         try std.testing.expect(!std.mem.eql(u8, d.name, "web_search"));
-        try std.testing.expect(!std.mem.eql(u8, d.name, "ToolSearch"));
+        if (std.mem.eql(u8, d.name, "ToolSearch")) found_tool_search = true;
     }
     try std.testing.expect(found_ws);
+    try std.testing.expect(found_tool_search);
 }
 
 test "toToolDefinitionsWithDyn appends dynamic tools after static (no server-tool web_search)" {
@@ -1255,10 +1270,11 @@ test "toToolDefinitionsWithDyn appends dynamic tools after static (no server-too
     const defs = try toToolDefinitionsWithDyn(std.testing.allocator, &dyn);
     defer std.testing.allocator.free(defs);
 
-    // 非 swarm-gated 静态(且无需求的 ToolSearch) + 1 dyn；prompt_ctx=null 门控 swarm。
+    // 非 swarm-gated 静态(含 FormalAuditTask 激活的 ToolSearch) + 1 dyn；
+    // prompt_ctx=null 门控 swarm。
     var non_gated: usize = 0;
     for (registry) |t| {
-        if (!t.swarm_gated and !std.mem.eql(u8, t.name, "ToolSearch")) non_gated += 1;
+        if (!t.swarm_gated) non_gated += 1;
     }
     try std.testing.expect(defs.len == non_gated + 1);
     // 动态工具在末尾。

@@ -43,6 +43,10 @@ pub const answer_queue = @import("core/answer_queue.zig");
 pub const recorder = @import("core/recorder.zig");
 pub const context_pressure = @import("core/context_pressure.zig");
 pub const kg_task_projection = @import("kg/task_projection.zig"); // pure TinyKG snapshot/Markdown contract
+pub const formal_runtime = @import("formal/runtime.zig"); // precompiled Lean sidecar trust boundary
+pub const formal_artifact_store = @import("formal/artifact_store.zig"); // immutable research evidence bundles
+pub const formal_provenance = @import("formal/provenance.zig"); // strict sidecar build identity
+pub const formal_task_audit = @import("formal/task_audit.zig"); // TinyKG task-audit sensor/receipt
 
 // ── API / client / 配置 ─────────────────────────────────────────────────
 pub const client = @import("client.zig");

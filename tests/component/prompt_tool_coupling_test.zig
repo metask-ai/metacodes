@@ -127,11 +127,16 @@ test "L2: ToolSearch tells the model to call visible KgRecall directly" {
 
 test "L2: ToolSearch enters the API tool set only when a deferred tool exists" {
     const a = std.testing.allocator;
+    // Dynamic descriptions are owned independently of the outer definitions
+    // slice. Production keeps both in the session arena; mirror that here.
+    var definitions_arena = std.heap.ArenaAllocator.init(a);
+    defer definitions_arena.deinit();
+    const definitions_allocator = definitions_arena.allocator();
+    var no_tinykg = cc.tools.PromptContext{ .tinykg_enabled = false };
 
-    // 无动态工具：KgRecall/Write 常驻可调，ToolSearch 没有工作可做，必须不广告。
-    const core_only = try cc.tools.toToolDefinitionsFull(a, null, null);
-    defer a.free(core_only);
-    try std.testing.expect(findDef(core_only, "KgRecall") != null);
+    // TinyKG 治理核未启用、无动态工具：ToolSearch 没有工作可做，必须不广告。
+    const core_only = try cc.tools.toToolDefinitionsFull(definitions_allocator, null, &no_tinykg);
+    try std.testing.expect(findDef(core_only, "KgRecall") == null);
     try std.testing.expect(findDef(core_only, "Write") != null);
     try std.testing.expect(findDef(core_only, "ToolSearch") == null);
 
@@ -139,15 +144,13 @@ test "L2: ToolSearch enters the API tool set only when a deferred tool exists" {
     defer dyn.deinit();
     // 常驻 Skill 类动态工具不需要激活，仍不应引入 ToolSearch。
     try dyn.register("always_visible", "always visible helper", &.{}, deferredProbe, null, false);
-    const visible_dyn = try cc.tools.toToolDefinitionsFull(a, &dyn, null);
-    defer a.free(visible_dyn);
+    const visible_dyn = try cc.tools.toToolDefinitionsFull(definitions_allocator, &dyn, &no_tinykg);
     try std.testing.expect(findDef(visible_dyn, "always_visible") != null);
     try std.testing.expect(findDef(visible_dyn, "ToolSearch") == null);
 
     // MCP 工具 deferred=true：此时 ToolSearch 才是必要能力并随工具表进入请求。
     try dyn.registerMcp("demo__lookup", "deferred MCP lookup", &.{}, deferredProbe, null, "demo");
-    const with_deferred = try cc.tools.toToolDefinitionsFull(a, &dyn, null);
-    defer a.free(with_deferred);
+    const with_deferred = try cc.tools.toToolDefinitionsFull(definitions_allocator, &dyn, &no_tinykg);
     try std.testing.expect(findDef(with_deferred, "ToolSearch") != null);
     const deferred = findDef(with_deferred, "demo__lookup") orelse return error.TestUnexpectedResult;
     try std.testing.expect(deferred.deferred);
@@ -179,6 +182,8 @@ test "L2: long-horizon arm gates TinyKG tools as one typed treatment" {
     try std.testing.expect(findDef(baseline_defs, "KgRemember") == null);
     try std.testing.expect(findDef(baseline_defs, "KgRecall") == null);
     try std.testing.expect(findDef(baseline_defs, "KgContext") == null);
+    try std.testing.expect(findDef(baseline_defs, "FormalAuditTask") == null);
+    try std.testing.expect(findDef(baseline_defs, "ToolSearch") == null);
     const baseline_create = findDef(baseline_defs, "TaskCreate") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, baseline_create.description, "in-session task list") != null);
     try std.testing.expect(std.mem.indexOf(u8, baseline_create.description, "TinyKG") == null);
@@ -217,6 +222,9 @@ test "L2: long-horizon arm gates TinyKG tools as one typed treatment" {
     try std.testing.expect(findDef(tinykg_defs, "KgRemember") != null);
     try std.testing.expect(findDef(tinykg_defs, "KgRecall") != null);
     try std.testing.expect(findDef(tinykg_defs, "KgContext") != null);
+    const formal_audit = findDef(tinykg_defs, "FormalAuditTask") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(formal_audit.deferred);
+    try std.testing.expect(findDef(tinykg_defs, "ToolSearch") != null);
     const tinykg_create = findDef(tinykg_defs, "TaskCreate") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, tinykg_create.description, "persistent task in TinyKG") != null);
     const tinykg_get = findDef(tinykg_defs, "TaskGet") orelse return error.TestUnexpectedResult;

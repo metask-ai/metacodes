@@ -14,6 +14,7 @@ from typing import Dict
 ARMS = ("codex_style", "claude_style", "tinykg")
 KG_TOOL_MARKERS = ("\n----- KgRemember -----\n", "\n----- KgRecall -----\n")
 TASK_TOOL_MARKER = "\n----- TaskList -----\n"
+FORMAL_TOOL_MARKER = "\n----- FormalAuditTask -----\n"
 
 
 def _base_env() -> Dict[str, str]:
@@ -95,6 +96,7 @@ def main() -> int:
     _require("# Memory" not in codex, "codex_style: Markdown memory leaked into prompt")
     _require("# Knowledge Graph" not in codex, "codex_style: TinyKG prompt leaked")
     _require(not any(marker in codex for marker in KG_TOOL_MARKERS), "codex_style: TinyKG tools leaked")
+    _require(FORMAL_TOOL_MARKER not in codex, "codex_style: formal TinyKG audit tool leaked")
     _require(
         "TinyKG" not in codex and "kg-*" not in codex and "task_packet" not in codex,
         "codex_style: persistent task-DAG affordances leaked",
@@ -104,6 +106,7 @@ def main() -> int:
     _require("# Memory" in claude, "claude_style: Markdown memory prompt is missing")
     _require("# Knowledge Graph" not in claude, "claude_style: TinyKG prompt leaked")
     _require(not any(marker in claude for marker in KG_TOOL_MARKERS), "claude_style: TinyKG tools leaked")
+    _require(FORMAL_TOOL_MARKER not in claude, "claude_style: formal TinyKG audit tool leaked")
     _require(
         "automatically imported into the knowledge graph" not in claude
         and "KgRemember" not in claude
@@ -119,6 +122,7 @@ def main() -> int:
     _require("# Memory" in tinykg, "tinykg: Markdown memory prompt is missing")
     _require("# Knowledge Graph" in tinykg, "tinykg: knowledge-graph prompt is missing")
     _require(all(marker in tinykg for marker in KG_TOOL_MARKERS), "tinykg: KG tools are missing")
+    _require(FORMAL_TOOL_MARKER in tinykg, "tinykg: formal TinyKG audit tool is missing")
     _require(
         "automatically imported into the knowledge graph" in tinykg,
         "tinykg: Markdown-to-graph projection contract is missing",
