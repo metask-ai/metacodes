@@ -2038,3 +2038,88 @@ test "L2 KG: 分类纠正入图 — 覆盖不并存 + error_event/fix 留痕(改
     }
     try std.testing.expectEqual(@as(usize, 1), confirmed_count);
 }
+
+const CHILD_KG_RECALL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"kg1\",\"name\":\"KgRecall\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"quasar-needle-731 isolated child memory\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+test "L2 KG: general-purpose child gets read tools and an isolated KgClient" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/kg-child-read.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-child-read");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+    _ = try kg.remember(.decision, "quasar-needle-731: child agents must recover this durable decision", "decision", false);
+
+    const responses = [_][]const u8{ CHILD_KG_RECALL_SSE, KG_END_TURN_SSE };
+    var srv = try harness.MockServer.startCassette(&responses, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+
+    var agents = cc.agents_set.AgentSet.init(a);
+    defer agents.deinit();
+    try agents.loadFromStandardPaths("");
+    const general = agents.find("general-purpose").?;
+
+    const enabled = [_][]const u8{ "KgRemember", "KgRecall", "KgContext" };
+    var defs_arena = std.heap.ArenaAllocator.init(a);
+    defer defs_arena.deinit();
+    var prompt_ctx = cc.tools.PromptContext{ .enabled_tool_names = &enabled };
+    const parent_defs = try cc.tools.toToolDefinitionsFull(defs_arena.allocator(), null, &prompt_ctx);
+    const filtered = try cc.agents_filter.filterToolDefs(a, parent_defs, general);
+    defer a.free(filtered);
+    var child_policy = cc.tool_context.ToolSetExecutionPolicy{ .definitions = filtered };
+
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    var child_abort = cc.util_abort.AbortSignal.init();
+    var result = try cc.core_subagent.spawnAgent(
+        a,
+        client.provider(),
+        &client,
+        parent_defs,
+        &perm,
+        &child_abort,
+        "Recover the durable decision before answering.",
+        .{
+            .max_turns = 3,
+            .tool_defs_override = filtered,
+            .execution_policy = child_policy.executionPolicy(),
+            .kg = &kg,
+            .home_dir = "/tmp",
+        },
+    );
+    defer result.deinit();
+
+    const cap = srv.lastRequest() orelse return error.NoRequestCaptured;
+    const tools_field = cap.jsonField("tools") orelse return error.ToolsFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"KgRecall\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"KgContext\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"KgRemember\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "quasar-needle-731") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "child agents must recover this durable decision") != null);
+    try std.testing.expectEqual(@as(u32, 1), result.tool_calls);
+
+    // KgRecall sets abort on the client it executes against. The parent must stay untouched,
+    // otherwise a child cancellation pointer leaks into the parent session after return.
+    try std.testing.expect(kg.abort == null);
+}

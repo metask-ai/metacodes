@@ -23,12 +23,10 @@ pub const PERMANENTLY_DISABLED = [_][]const u8{
     "ExitPlanMode",
     "ScheduleWakeup",
     "WaitForMcpServers",
-    // KG 写工具**只归主 agent**(设计 v3-final §2.8.4 单写者原则):subagent 干活+返报告,
-    // 父 agent 验收后闭合/记忆。避免多线程 KgClient 数据竞争(last_detail/degraded_reason
-    // 裸写)+ 避免子 agent 拿到 kg=null 后收到"KG 未配置"假错(H3)。
+    // KG 长期记忆保持单写者：subagent 只读并返报告，父 agent 验收后才沉淀新记忆。
+    // KgRecall/KgContext 是只读工具；spawnAgentSink 为每个 child 克隆独立 KgClient，
+    // 因此它们无需因 allocator/abort/cache 共享风险而被禁用。
     "KgRemember",
-    "KgRecall",
-    "KgContext",
 };
 
 pub fn filterToolDefs(
@@ -130,7 +128,7 @@ fn fakeDefs(allocator: std.mem.Allocator) ![]json.ToolDefinition {
     return out;
 }
 
-test "filterToolDefs: KG client 工具从 subagent 移除(H3)" {
+test "filterToolDefs: subagent keeps read-only KG tools but never KgRemember" {
     const a = testing.allocator;
     var def = try makeFakeDef(a, "", "", null);
     defer def.deinit(a);
@@ -142,13 +140,11 @@ test "filterToolDefs: KG client 工具从 subagent 移除(H3)" {
     };
     const filtered = try filterToolDefs(a, &parent, &def);
     defer a.free(filtered);
-    for (filtered) |d| {
-        try testing.expect(!std.mem.eql(u8, d.name, "KgRemember"));
-        try testing.expect(!std.mem.eql(u8, d.name, "KgRecall"));
-        try testing.expect(!std.mem.eql(u8, d.name, "KgContext"));
-    }
-    try testing.expectEqual(@as(usize, 1), filtered.len); // 只剩 Read
+    for (filtered) |d| try testing.expect(!std.mem.eql(u8, d.name, "KgRemember"));
+    try testing.expectEqual(@as(usize, 3), filtered.len);
     try testing.expectEqualStrings("Read", filtered[0].name);
+    try testing.expectEqualStrings("KgRecall", filtered[1].name);
+    try testing.expectEqualStrings("KgContext", filtered[2].name);
 }
 
 test "filterToolDefs: permanently disabled removed" {

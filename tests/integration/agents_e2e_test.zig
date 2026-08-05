@@ -138,6 +138,29 @@ test "Subagents E2E: permanently-disabled removed (Agent/Task/AskUserQuestion)" 
     }
 }
 
+test "Subagents E2E: Plan sees TinyKG history read tools without memory write access" {
+    const a = std.testing.allocator;
+    var set = cc.agents_set.AgentSet.init(a);
+    defer set.deinit();
+    try set.loadFromStandardPaths("");
+
+    const plan = set.find("Plan").?;
+    const parent_defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(parent_defs);
+    const filtered = try cc.agents_filter.filterToolDefs(a, parent_defs, plan);
+    defer a.free(filtered);
+
+    var saw_recall = false;
+    var saw_context = false;
+    for (filtered) |d| {
+        if (std.mem.eql(u8, d.name, "KgRecall")) saw_recall = true;
+        if (std.mem.eql(u8, d.name, "KgContext")) saw_context = true;
+        try std.testing.expect(!std.mem.eql(u8, d.name, "KgRemember"));
+    }
+    try std.testing.expect(saw_recall);
+    try std.testing.expect(saw_context);
+}
+
 test "Subagents E2E: buildSubagentContext for Explore skips CLAUDE.md+git" {
     const a = std.testing.allocator;
     var set = cc.agents_set.AgentSet.init(a);

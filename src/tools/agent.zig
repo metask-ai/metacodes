@@ -155,6 +155,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         }
         ctx.allocator.free(originals);
     };
+    var effective_tool_names: ?[][]const u8 = null;
+    defer if (effective_tool_names) |names| ctx.allocator.free(names);
     if (def_opt) |d| {
         const filtered = try filter_mod.filterToolDefs(ctx.allocator, tool_defs, d);
         filtered_owned = filtered;
@@ -164,8 +166,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         // 只读 agent(Explore/Plan)的 Bash 会去掉 Git 段 + 加只读提醒(对齐 cc Explore)。
         // 描述里引用其它工具的判断基于过滤后的工具集。
         const tools_mod = @import("../tools.zig");
-        var names = try ctx.allocator.alloc([]const u8, filtered.len);
-        defer ctx.allocator.free(names);
+        const names = try ctx.allocator.alloc([]const u8, filtered.len);
+        effective_tool_names = names;
         for (filtered, 0..) |fd, i| names[i] = fd.name;
         const sub_prompt_ctx = tools_mod.PromptContext{
             .permission_mode = if (d.permission_mode) |m| mapPermissionMode(m) else .default,
@@ -236,6 +238,8 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             .home_dir = ctx.home_dir,
             .additional_dirs = effective_additional_dirs,
             .memory_dir = memory_dir,
+            // def.tools 是意图白名单；真正可用集合还受父 arm/capability 与永久禁用集约束。
+            .allowed_tool_names = if (d.tools.len > 0) effective_tool_names.? else null,
         });
         sys_prompt_owned = sp;
         sys_prompt = sp;

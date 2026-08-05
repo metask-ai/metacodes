@@ -201,6 +201,38 @@ test "L2 AgentDef.disallowed_tools: frontmatter 黑名单裁剪真实子请求 t
     try std.testing.expect(std.mem.indexOf(u8, tools, "\"name\":\"Write\"") == null);
 }
 
+test "L2 Plan runtime tool snapshot keeps TinyKG capability and system prompt aligned" {
+    const a = std.testing.allocator;
+    var srv = try harness.MockServer.start(END_TURN_SSE, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+    var io_rt = std.Io.Threaded.init(a, .{});
+    defer io_rt.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_rt.io(), "k", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    var agents = cc.agents_set.AgentSet.init(a);
+    defer agents.deinit();
+    try agents.loadFromStandardPaths("");
+
+    const prompt_ctx = cc.tools.PromptContext{ .tinykg_enabled = false };
+    var defs_arena = std.heap.ArenaAllocator.init(a);
+    defer defs_arena.deinit();
+    const defs = try cc.tools.toToolDefinitionsFull(defs_arena.allocator(), null, &prompt_ctx);
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    const ctx = baseContext(a, &client, &agents, &perm, defs);
+
+    const out = try cc.agent_tool.execute(&ctx, "{\"subagent_type\":\"Plan\",\"prompt\":\"inspect\"}");
+    defer a.free(out);
+    const cap = srv.lastRequest() orelse return error.NoRequestCaptured;
+    const tools = cap.jsonField("tools") orelse return error.ToolsFieldMissing;
+    const system = cap.jsonField("system") orelse return error.SystemFieldMissing;
+    try std.testing.expect(std.mem.indexOf(u8, tools, "\"name\":\"KgRecall\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, tools, "\"name\":\"KgContext\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, system, "- Allowed tools: Read, Glob, Grep\\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, system, "- Allowed tools: Read, Glob, Grep, KgRecall") == null);
+}
+
 test "L2 AgentDef.preload_skills: skill 正文进入真实子请求 system" {
     const a = std.testing.allocator;
     var srv = try harness.MockServer.start(END_TURN_SSE, 0);

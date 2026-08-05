@@ -2,7 +2,8 @@
 //!
 //! 设计：
 //! - 独立 Conversation（起点为空 + system prompt）
-//! - 共享：api_client、tool_defs、permission_ctx、abort
+//! - 共享：api provider、tool_defs、permission_ctx、abort
+//! - KG：从父客户端克隆 child-owned 实例，隔离 allocator/cache/detail/abort
 //! - 有自己的 max_turns 上限（默认 20，避免子 agent 失控）
 //! - 返回：final text（assistant 最后的文本）+ stop_reason + tool_calls 次数
 //!
@@ -77,8 +78,8 @@ pub const SpawnOptions = struct {
     /// 后台 subagent registry(允许嵌套后台:子 agent 也能 Task(run_in_background)注册进同一 root)。
     /// null = 子 agent 不能再开后台(同步路径恒 null)。
     agent_jobs: ?*@import("agent_job_registry.zig").AgentJobRegistry = null,
-    /// KG 客户端透传(subagent 参与任务 DAG:frontier/claim/闭合)。null = 子 agent 无图。
-    /// 并发安全:KgClient 内部有 mutex 串行化调用(后台 subagent 多线程共享同一实例)。
+    /// KG 能力来源。spawnAgentSink 会克隆 child-owned 客户端再传给 agent_loop；
+    /// 父子不共享 allocator/cache/detail/abort。null = 子 agent 无图。
     kg: ?*@import("../kg/client.zig").KgClient = null,
     kg_projects_dir: []const u8 = "",
     /// 本 subagent loop 的对外身份(KG claim 租约)。null = spawn 时自动 gen 一个
@@ -166,6 +167,18 @@ pub fn spawnAgentSink(
     var sub_tasks = TaskStore.init(allocator);
     defer sub_tasks.deinit();
 
+    // 每个独立 agent loop 必须 own 自己的 KgClient。KgClient 的 allocator、缓存与 abort
+    // 都是 session-local 状态；把父指针直接透传会让并发 child 互相覆盖取消信号，且可能在
+    // 不同 allocator 间 alloc/free。clone 失败是 spawn 失败，不能静默把已广告的 KG 工具
+    // 变成“未配置”；版本/环境不就绪则保留 degraded clone，让工具返回结构化原因。
+    var child_kg: ?@import("../kg/client.zig").KgClient = null;
+    if (opts.kg) |parent_kg| {
+        child_kg = try parent_kg.cloneForThread(allocator, opts.home_dir);
+        child_kg.?.ensureReady();
+    }
+    defer if (child_kg) |*kg| kg.deinit();
+    const child_kg_ptr: ?*@import("../kg/client.zig").KgClient = if (child_kg) |*kg| kg else null;
+
     const result = try agent_loop.run(
         &conv,
         prov,
@@ -192,7 +205,7 @@ pub fn spawnAgentSink(
             .session_id = opts.session.asSlice(),
             .model_override = opts.model_override,
             .tasks = &sub_tasks,
-            .kg = opts.kg,
+            .kg = child_kg_ptr,
             .kg_projects_dir = opts.kg_projects_dir,
             // 每个 subagent loop 一个程序生成的全局唯一对外身份(claim 租约)。
             .agent_ident = opts.agent_ident orelse @import("session_id.zig").gen(),
