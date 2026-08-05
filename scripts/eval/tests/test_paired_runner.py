@@ -11,6 +11,8 @@ from scripts.eval.paired_runner import (
     InfrastructureRunError,
     _require_budget,
     _require_multi_budget,
+    _require_runtime_budget_provenance,
+    _remaining_multi_budget,
     _run_once,
     alternating_schedule,
     run_paired,
@@ -19,6 +21,54 @@ from scripts.eval.paired_runner import (
 
 
 class PairedRunnerTest(unittest.TestCase):
+    def test_normalized_runtime_budget_must_match_sealed_allowance(self):
+        rollout = {
+            "harness": {
+                "runtime_budget": {
+                    "max_metered_tokens": 1000,
+                    "max_cost_usd": 5.0,
+                }
+            }
+        }
+        _require_runtime_budget_provenance(
+            rollout, max_metered_tokens=1000, max_cost_usd=5.0
+        )
+        with self.assertRaisesRegex(ValidationError, "does not match"):
+            _require_runtime_budget_provenance(
+                rollout, max_metered_tokens=999, max_cost_usd=5.0
+            )
+
+    def test_runtime_budget_is_the_smaller_remaining_stage_or_aggregate_allowance(self):
+        budget = {
+            "max_stage_cost_usd": 10.0,
+            "max_stage_tokens": 1000,
+            "max_aggregate_cost_usd": 11.0,
+            "max_aggregate_tokens": 1000,
+        }
+        collected = {
+            "arm": [
+                {
+                    "metrics": {
+                        "cost_usd": 1.25,
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "cache_read_tokens": 20,
+                        "cache_write_tokens": 2,
+                    }
+                }
+            ]
+        }
+        cost, tokens = _remaining_multi_budget(
+            collected,
+            budget,
+            stage_prior_cost_usd=2.0,
+            stage_prior_tokens=100,
+            aggregate_prior_cost_usd=4.0,
+            aggregate_prior_tokens=200,
+        )
+        self.assertAlmostEqual(cost, 5.75)
+        self.assertEqual(tokens, 763)
+
     def test_multi_arm_budget_offsets_count_against_stage_and_aggregate_caps(self):
         budget = {
             "max_stage_cost_usd": 1.0,

@@ -20,6 +20,7 @@ from scripts.eval.e2e_adapter import (
     prepare_runtime_metadata,
     _trajectory_judgement,
 )
+from scripts.eval.model import ValidationError
 
 
 def suite():
@@ -51,6 +52,50 @@ def suite():
 
 
 class E2EAdapterTest(unittest.TestCase):
+    def test_runtime_metadata_seals_rollout_budget_before_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scenario.txt").write_text("write answer", encoding="utf-8")
+            binary = root / "metacodes"
+            binary.write_bytes(b"candidate-binary")
+            metadata = prepare_runtime_metadata(
+                suite(),
+                root,
+                "smoke",
+                output=root / "eval-metadata.json",
+                events_path=str(root / "events.jsonl"),
+                run_id="native:budget:0",
+                trial=0,
+                model_provider="test",
+                model_id="model-a",
+                harness_config_id="candidate",
+                harness_revision="abc",
+                permission_mode="default",
+                binary_path=binary,
+                max_metered_tokens=1234,
+                max_cost_usd=5.5,
+            )
+            with self.assertRaisesRegex(ValidationError, "requires both"):
+                prepare_runtime_metadata(
+                    suite(),
+                    root,
+                    "smoke",
+                    output=root / "invalid-budget.json",
+                    events_path=str(root / "events.jsonl"),
+                    run_id="native:budget:invalid",
+                    trial=0,
+                    model_provider="test",
+                    model_id="model-a",
+                    harness_config_id="candidate",
+                    harness_revision="abc",
+                    permission_mode="default",
+                    binary_path=binary,
+                    max_metered_tokens=1234,
+                )
+        assert metadata is not None
+        self.assertEqual(metadata["max_metered_tokens"], 1234)
+        self.assertEqual(metadata["max_cost_usd"], 5.5)
+
     def test_validator_output_is_killed_and_rejected_above_limit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -984,6 +1029,8 @@ class E2EAdapterTest(unittest.TestCase):
                 harness_revision="abc",
                 permission_mode="default",
                 binary_path=binary,
+                max_metered_tokens=1234,
+                max_cost_usd=5.5,
             )
             self.assertIsNotNone(metadata)
             assert metadata is not None
@@ -1114,6 +1161,10 @@ class E2EAdapterTest(unittest.TestCase):
             )
             self.assertEqual(rollout["run_id"], "native:smoke:0")
             self.assertEqual(rollout["model"]["fingerprint"], metadata["model_fingerprint"])
+            self.assertEqual(
+                rollout["harness"]["runtime_budget"],
+                {"max_metered_tokens": 1234, "max_cost_usd": 5.5},
+            )
             self.assertEqual(rollout["metrics"]["cost_usd"], 0.001)
             self.assertEqual(rollout["metrics"]["wall_time_ms"], 50)
             self.assertEqual(rollout["metrics"]["model_request_time_ms"], 41)

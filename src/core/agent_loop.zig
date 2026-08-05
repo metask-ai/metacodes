@@ -11,6 +11,7 @@ const pfs = @import("platform").fs;
 const types = @import("../types.zig");
 const client_mod = @import("../client.zig");
 const provider_mod = @import("../api/provider.zig");
+const request_gate_mod = @import("request_gate.zig");
 const json_mod = @import("../json.zig");
 const tools_mod = @import("../tools.zig");
 const permission_mod = @import("../permission.zig");
@@ -266,6 +267,10 @@ pub const Options = struct {
     /// **成本次闸**(度量真实"烧钱"维度,与轮数正交)。本 run 累计成本(USD)达此值 → 停
     /// (.budget),交互层询问用户是否继续(不自动续)。null = 不设预算(默认)。
     cost_budget_usd: ?f64 = null,
+    /// Checked at every provider side-effect boundary, including compact
+    /// summaries and same-turn context-recovery retries. A denial happens
+    /// before network I/O and returns stop_reason=budget.
+    request_gate: ?request_gate_mod.Gate = null,
     /// 本次 run 归属的会话(emit/poll 路由用)。默认 .single(N=1/TUI);M6 多 Session 时
     /// 由 SessionContext 传各自的 id。所有 backend.emitEvent 用它路由到对应 UI 视图。
     session: @import("session_id.zig").SessionId = @import("session_id.zig").SessionId.single,
@@ -541,6 +546,13 @@ fn finishRun(backend: *const UiBackend, sess: @import("session_id.zig").SessionI
     return result;
 }
 
+fn stopReasonForAbort(abort: ?*const AbortSignal) StopReason {
+    return if (abort) |signal|
+        if (signal.reason() == .evaluation_budget) .budget else .aborted
+    else
+        .aborted;
+}
+
 /// 一次用户请求的完整 agent 运行：发送当前 conversation 到 API，
 /// 收集事件到 assistant message 里（text 和 tool_use blocks），
 /// 如果有 tool_use 则执行、追加 tool_result 到 conversation，继续下一轮。
@@ -585,12 +597,17 @@ pub fn run(
     // Prompt cache 击穿检测(批3):跨 turn 跟踪 cache_read 跌幅 + system/tools 指纹。
     var cache_detector = @import("cache_break.zig").CacheBreakDetector{};
     var context_warning_emitted = false;
+    // Paid no-savings summaries feed their measured overhead back into the
+    // next optimistic preview. This is run-scoped on purpose: it suppresses
+    // immediate retry storms without persisting model-specific estimates into
+    // the transcript or across process revisions.
+    var compact_summary_reserve_tokens: usize = 0;
 
     while (turns < opts.max_turns) : (turns += 1) {
         // 开头检查 abort
         if (opts.abort) |a| if (a.isAborted()) {
             log.warn("agent", "aborted before turn {d}", .{turns + 1});
-            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .aborted, .turns = turns, .tool_calls = total_tool_calls });
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
         };
         // 成本次闸:本 run 累计成本达预算 → 停,交互层询问是否继续(不自动续)。
         if (opts.cost_budget_usd) |budget| {
@@ -676,13 +693,15 @@ pub fn run(
                     allocator,
                     opts.tasks,
                     permission_ctx.hooks,
+                    &compact_summary_reserve_tokens,
+                    opts.request_gate,
                     opts.abort,
                 );
                 if (previous_model_compact_outcome == .api_error) {
                     return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
                 }
                 if (previous_model_compact_outcome == .aborted) {
-                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .aborted, .turns = turns, .tool_calls = total_tool_calls });
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
                 }
             }
         }
@@ -708,13 +727,15 @@ pub fn run(
                 allocator,
                 opts.tasks,
                 permission_ctx.hooks,
+                &compact_summary_reserve_tokens,
+                opts.request_gate,
                 opts.abort,
             );
             if (pre_sampling_compact == .api_error) {
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
             }
             if (pre_sampling_compact == .aborted) {
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .aborted, .turns = turns, .tool_calls = total_tool_calls });
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
             }
         }
 
@@ -812,6 +833,10 @@ pub fn run(
         };
 
         request_recovery: while (true) {
+            if (opts.request_gate) |gate| {
+                if (!gate.allows())
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .budget, .turns = turns, .tool_calls = total_tool_calls });
+            }
             const model_request_started_ns = util_time.nowNs();
             var stream: api_stream.StreamHandle = undefined;
             var api_messages = try buildApiMessages(conversation, allocator, opts.inject_user_context, synthetic_user_input);
@@ -1035,7 +1060,7 @@ pub fn run(
                 } else {
                     assistant_blocks.deinit(allocator);
                 }
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .aborted, .turns = turns + 1, .tool_calls = total_tool_calls });
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
             }
 
             // Stream error：不把残缺的 assistant_text / tool_uses commit 到 conversation
@@ -1610,13 +1635,15 @@ pub fn run(
             allocator,
             opts.tasks,
             permission_ctx.hooks,
+            &compact_summary_reserve_tokens,
+            opts.request_gate,
             opts.abort,
         );
         if (post_tool_compact == .api_error) {
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
         }
         if (post_tool_compact == .aborted) {
-            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .aborted, .turns = turns + 1, .tool_calls = total_tool_calls });
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns + 1, .tool_calls = total_tool_calls });
         }
 
         // L4 诊断:turn span 终点(本轮有 tool_use、将进入下一轮的正常路径;无工具的
@@ -1970,6 +1997,8 @@ fn runAutoCompactIfNeeded(
     allocator: std.mem.Allocator,
     tasks: ?*@import("task_store.zig").TaskStore,
     hookset: ?*const hooks_mod.HookSet,
+    summary_reserve_tokens: ?*usize,
+    request_gate: ?request_gate_mod.Gate,
     abort: ?*const AbortSignal,
 ) !AutoCompactOutcome {
     var outcome: AutoCompactOutcome = .not_needed;
@@ -2065,6 +2094,11 @@ fn runAutoCompactIfNeeded(
                     .estimate_fn = EstimateContext.estimate,
                 },
                 .minimum_saved_percent = COMPACT_MIN_SAVED_PERCENT,
+                .minimum_summary_reserve_tokens = if (compact_model_override == null)
+                    if (summary_reserve_tokens) |reserve| reserve.* else 0
+                else
+                    0,
+                .request_gate = request_gate,
                 .target_tokens = auto_threshold,
             },
         ) catch |err| {
@@ -2089,10 +2123,18 @@ fn runAutoCompactIfNeeded(
         switch (report.outcome) {
             .aborted => return .aborted,
             .no_change => {
-                log.warn("agent", "auto-compact skipped: summary savings below {d}% before_tokens={d} after_tokens={d} cause={s}", .{ COMPACT_MIN_SAVED_PERCENT, report.before_tokens, report.after_tokens, trigger_cause });
+                if (compact_model_override == null and report.summary_request != null) {
+                    if (summary_reserve_tokens) |reserve|
+                        reserve.* = @max(reserve.*, report.summary_overhead_tokens);
+                }
+                const active_reserve = if (summary_reserve_tokens) |reserve| reserve.* else 0;
+                log.warn("agent", "auto-compact skipped: summary savings below {d}% before_tokens={d} after_tokens={d} summary_reserve_tokens={d} paid_request={} cause={s}", .{ COMPACT_MIN_SAVED_PERCENT, report.before_tokens, report.after_tokens, active_reserve, report.summary_request != null, trigger_cause });
                 outcome = .skipped_no_savings;
             },
             .compacted, .degraded => {
+                if (compact_model_override == null) {
+                    if (summary_reserve_tokens) |reserve| reserve.* = 0;
+                }
                 // PostCompact hook(压缩后):喂 {trigger, summary},其 additionalContext 拼进投影摘要
                 // → 模型下轮读得到(条目 I 的挂载点:重注入 active skill/plan/MCP)。非阻塞。
                 if (hookset) |hs| if (hs.hasPostCompact()) {
@@ -2598,6 +2640,8 @@ test "usage anchor suppresses false blocking-limit nuke (glm-5.2 并发工具风
         null,
         null,
         null,
+        null,
+        null,
     );
 
     // est = 13522 + 20×(32768/4) + 信封 ≈ 178K < 229144 → 不触发;结果全部保留。
@@ -2748,6 +2792,8 @@ test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool s
         null,
         null,
         null,
+        null,
+        null,
     );
 
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
@@ -2814,10 +2860,173 @@ test "auto-compact does not buy a summary when fixed request overhead makes savi
         null,
         null,
         null,
+        null,
+        null,
     );
 
     try std.testing.expectEqual(AutoCompactOutcome.skipped_no_savings, outcome);
     try std.testing.expectEqual(@as(u32, 0), provider_state.compact_request_count);
+    try std.testing.expectEqual(@as(usize, 0), c.compact_boundary);
+}
+
+test "auto-compact checks runtime request gate before provider side effect" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    const chunk = try a.alloc(u8, 8192);
+    defer a.free(chunk);
+    @memset(chunk, 'x');
+    var i: usize = 0;
+    while (i < 30) : (i += 1) try c.appendText(.user, chunk);
+
+    var provider_state = TestProviderState{
+        .allocator = a,
+        .compact_summary_response = "small summary",
+        .max_input_tokens = 200_000,
+        .max_tokens = 32_000,
+    };
+    const provider = testProvider(&provider_state);
+    const Capture = struct {
+        fn emit(_: *anyopaque, _: @import("session_id.zig").SessionId, _: CoreEvent) void {}
+        fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = Capture.emit, .poll = Capture.poll };
+    const GateState = struct {
+        checks: usize = 0,
+        fn allows(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.checks += 1;
+            return false;
+        }
+    };
+    var gate_state = GateState{};
+
+    const outcome = try runAutoCompactIfNeeded(
+        &c,
+        provider,
+        null,
+        null,
+        null,
+        &.{},
+        null,
+        null,
+        32_000,
+        2,
+        "pre_sampling_pending_turn_threshold",
+        &backend,
+        .single,
+        [_]u8{0} ** 12,
+        0,
+        0,
+        null,
+        a,
+        null,
+        null,
+        null,
+        .{ .ctx = @ptrCast(&gate_state), .allows_fn = GateState.allows },
+        null,
+    );
+    try std.testing.expectEqual(AutoCompactOutcome.aborted, outcome);
+    try std.testing.expectEqual(@as(usize, 1), gate_state.checks);
+    try std.testing.expectEqual(@as(u32, 0), provider_state.compact_request_count);
+    try std.testing.expectEqual(@as(usize, 0), c.compact_boundary);
+}
+
+test "auto-compact feeds realized summary overhead back into retry preview" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+
+    const chunk = try a.alloc(u8, 8192);
+    defer a.free(chunk);
+    @memset(chunk, 'x');
+    var i: usize = 0;
+    while (i < 30) : (i += 1) try c.appendText(.user, chunk);
+
+    // Dropping the prefix without a summary easily clears the 5% gate, but
+    // this realized summary is large enough to erase those savings. The first
+    // attempt therefore supplies a measured overhead reserve; the unchanged
+    // second attempt must be rejected locally without another provider call.
+    const oversized_summary = try a.alloc(u8, 240 * 1024);
+    defer a.free(oversized_summary);
+    @memset(oversized_summary, 's');
+    var provider_state = TestProviderState{
+        .allocator = a,
+        .compact_summary_response = oversized_summary,
+        .max_input_tokens = 200_000,
+        .max_tokens = 32_000,
+    };
+    const provider = testProvider(&provider_state);
+    const Capture = struct {
+        fn emit(_: *anyopaque, _: @import("session_id.zig").SessionId, _: CoreEvent) void {}
+        fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = Capture.emit, .poll = Capture.poll };
+    var summary_reserve_tokens: usize = 0;
+
+    const first = try runAutoCompactIfNeeded(
+        &c,
+        provider,
+        null,
+        null,
+        null,
+        &.{},
+        null,
+        null,
+        32_000,
+        2,
+        "post_tool_follow_up_threshold",
+        &backend,
+        .single,
+        [_]u8{0} ** 12,
+        0,
+        0,
+        null,
+        a,
+        null,
+        null,
+        &summary_reserve_tokens,
+        null,
+        null,
+    );
+    try std.testing.expectEqual(AutoCompactOutcome.skipped_no_savings, first);
+    try std.testing.expectEqual(@as(u32, 1), provider_state.compact_request_count);
+    try std.testing.expect(summary_reserve_tokens > 0);
+
+    const second = try runAutoCompactIfNeeded(
+        &c,
+        provider,
+        null,
+        null,
+        null,
+        &.{},
+        null,
+        null,
+        32_000,
+        2,
+        "pre_sampling_pending_turn_threshold",
+        &backend,
+        .single,
+        [_]u8{0} ** 12,
+        0,
+        1,
+        null,
+        a,
+        null,
+        null,
+        &summary_reserve_tokens,
+        null,
+        null,
+    );
+    try std.testing.expectEqual(AutoCompactOutcome.skipped_no_savings, second);
+    try std.testing.expectEqual(@as(u32, 1), provider_state.compact_request_count);
     try std.testing.expectEqual(@as(usize, 0), c.compact_boundary);
 }
 
@@ -2878,6 +3087,8 @@ test "auto-compact summary carries in_progress task anchor through compaction" {
         &store,
         null,
         null,
+        null,
+        null,
     );
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
 
@@ -2922,7 +3133,7 @@ test "auto-compact 触发 PreCompact + PostCompact hook(G-rest 接线,端到端)
     const post_entries = [_]hooks_mod.HookEntry{.{ .matcher = "*", .commands = &post_cmds }};
     const hs = hooks_mod.HookSet{ .pre_tool_use = &.{}, .pre_compact = &pre_entries, .post_compact = &post_entries, .allocator = a };
 
-    const outcome = try runAutoCompactIfNeeded(&c, provider, null, null, null, &.{}, null, null, 32_000, 2, "post_tool_follow_up_threshold", &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, &hs, null);
+    const outcome = try runAutoCompactIfNeeded(&c, provider, null, null, null, &.{}, null, null, 32_000, 2, "post_tool_follow_up_threshold", &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, &hs, null, null, null);
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
 
     // PreCompact 真触发:marker 文件存在。
@@ -3031,6 +3242,8 @@ test "previous-model compact uses old model override before smaller-window sampl
         0,
         null,
         a,
+        null,
+        null,
         null,
         null,
         null,

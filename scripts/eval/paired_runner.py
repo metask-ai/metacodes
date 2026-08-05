@@ -150,6 +150,67 @@ def _require_multi_budget(
     )
 
 
+def _remaining_multi_budget(
+    collected: Mapping[str, Sequence[Dict[str, Any]]],
+    budget: Mapping[str, Any],
+    *,
+    stage_prior_cost_usd: float,
+    stage_prior_tokens: int,
+    aggregate_prior_cost_usd: float,
+    aggregate_prior_tokens: int,
+) -> tuple[float, int]:
+    """Return the smaller authenticated stage/aggregate allowance.
+
+    Call only after `_require_multi_budget`: missing telemetry and exhausted
+    caps must already have failed closed. The returned allowance is sealed into
+    native runtime metadata so every invocation and compact request in the
+    rollout shares one execution-time meter.
+    """
+    rollouts = [item for variant in collected.values() for item in variant]
+    observed_cost = sum(float(item["metrics"]["cost_usd"]) for item in rollouts)
+    observed_tokens = sum(
+        int(item["metrics"][key]) for item in rollouts for key in TOKEN_METRICS
+    )
+    remaining_cost = min(
+        float(budget["max_stage_cost_usd"])
+        - stage_prior_cost_usd
+        - observed_cost,
+        float(budget["max_aggregate_cost_usd"])
+        - aggregate_prior_cost_usd
+        - observed_cost,
+    )
+    remaining_tokens = min(
+        int(budget["max_stage_tokens"])
+        - stage_prior_tokens
+        - observed_tokens,
+        int(budget["max_aggregate_tokens"])
+        - aggregate_prior_tokens
+        - observed_tokens,
+    )
+    if not math.isfinite(remaining_cost) or remaining_cost <= 0 or remaining_tokens <= 0:
+        raise ValidationError("runtime rollout budget is exhausted; fail-closed")
+    return remaining_cost, remaining_tokens
+
+
+def _require_runtime_budget_provenance(
+    rollout: Mapping[str, Any],
+    *,
+    max_metered_tokens: int,
+    max_cost_usd: float,
+) -> None:
+    """Bind the normalized checkpoint to the cap sealed before execution."""
+    actual = rollout.get("harness", {}).get("runtime_budget")
+    expected = {
+        "max_metered_tokens": max_metered_tokens,
+        "max_cost_usd": float(max_cost_usd),
+    }
+    if actual != expected:
+        raise ValidationError(
+            "normalized rollout runtime budget does not match the sealed "
+            f"execution allowance: expected {expected!r}, observed {actual!r}"
+        )
+
+
 def _require_scoring_rollout(rollout: Dict[str, Any], *, variant: str) -> None:
     if not rollout.get("judgement", {}).get("valid_for_scoring", False):
         task_id = rollout.get("task_id", "unknown")
@@ -194,6 +255,7 @@ def _load_checkpoint(
     model_id: str,
     harness_revision: str,
     harness_config_id: str | None = None,
+    require_runtime_budget: bool = False,
 ) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
@@ -212,6 +274,13 @@ def _load_checkpoint(
             )
         task = expected_tasks[task_id]
         expected_config_id = harness_config_id or variant
+        if require_runtime_budget and not isinstance(
+            rollout.get("harness", {}).get("runtime_budget"), dict
+        ):
+            raise ValidationError(
+                f"{variant} checkpoint {(task_id, trial)!r} is missing "
+                "runtime budget provenance"
+            )
         identity = comparison_fingerprints(
             task,
             repo_root,
@@ -275,6 +344,8 @@ def _run_once(
     runtime_env: Mapping[str, str] | None = None,
     allow_invalid_run: bool = False,
     timeout_seconds: int | None = None,
+    max_metered_tokens: int | None = None,
+    max_cost_usd: float | None = None,
 ) -> Path:
     runs_dir = repo_root / "tests/e2e/runs"
     before = (
@@ -294,6 +365,21 @@ def _run_once(
         or timeout_seconds <= 0
     ):
         raise ValidationError("E2E timeout must be an integer > 0")
+    if (max_metered_tokens is None) != (max_cost_usd is None):
+        raise ValidationError("runtime budget requires both token and cost caps")
+    if max_metered_tokens is not None and (
+        not isinstance(max_metered_tokens, int)
+        or isinstance(max_metered_tokens, bool)
+        or max_metered_tokens <= 0
+    ):
+        raise ValidationError("runtime max metered tokens must be an integer > 0")
+    if max_cost_usd is not None and (
+        not isinstance(max_cost_usd, (int, float))
+        or isinstance(max_cost_usd, bool)
+        or not math.isfinite(float(max_cost_usd))
+        or float(max_cost_usd) <= 0
+    ):
+        raise ValidationError("runtime max cost must be finite and > 0")
     env = {
         **_runner_env(),
         "E2E_BIN_PATH": str(binary.resolve()),
@@ -312,6 +398,10 @@ def _run_once(
         env.update(runtime_env)
     if timeout_seconds is not None:
         env["E2E_TIMEOUT"] = str(timeout_seconds)
+    if max_metered_tokens is not None:
+        env["E2E_MAX_METERED_TOKENS"] = str(max_metered_tokens)
+    if max_cost_usd is not None:
+        env["E2E_MAX_COST_USD"] = format(float(max_cost_usd), ".17g")
     completed = subprocess.run(
         [str(repo_root / "tests/e2e/run_e2e.sh"), scenario_glob],
         cwd=repo_root,
@@ -369,6 +459,8 @@ def _mark_infrastructure_invalid(
     harness_config_id: str,
     harness_revision: str,
     suite_id: str,
+    max_metered_tokens: int,
+    max_cost_usd: float,
 ) -> None:
     """Normalize runner failure into an auditable, unscorable checkpoint."""
     identity = comparison_fingerprints(
@@ -398,6 +490,10 @@ def _mark_infrastructure_invalid(
         "fingerprint": identity["harness_fingerprint"],
         "permission_mode": identity["permission_mode"],
         "environment_fingerprint": identity["environment_fingerprint"],
+        "runtime_budget": {
+            "max_metered_tokens": max_metered_tokens,
+            "max_cost_usd": float(max_cost_usd),
+        },
     }
     rollout["evaluator"]["fingerprint"] = identity["grader_fingerprint"]
     rollout["readiness"]["status"] = "fail"
@@ -703,6 +799,7 @@ def run_multi_arm(
             model_id=experiment["model"]["id"],
             harness_revision=revision,
             harness_config_id=config_ids[arm_id],
+            require_runtime_budget=True,
         )
         for arm_id in ARM_IDS
     }
@@ -725,6 +822,14 @@ def run_multi_arm(
             if (task_id, trial) in completed_keys[arm_id]:
                 continue
             _require_multi_budget(
+                collected,
+                budget,
+                stage_prior_cost_usd=stage_prior_cost_usd,
+                stage_prior_tokens=stage_prior_tokens,
+                aggregate_prior_cost_usd=aggregate_prior_cost_usd,
+                aggregate_prior_tokens=aggregate_prior_tokens,
+            )
+            runtime_max_cost_usd, runtime_max_metered_tokens = _remaining_multi_budget(
                 collected,
                 budget,
                 stage_prior_cost_usd=stage_prior_cost_usd,
@@ -760,6 +865,8 @@ def run_multi_arm(
                     ),
                     allow_invalid_run=True,
                     timeout_seconds=expected_tasks[task_id]["constraints"]["timeout_seconds"],
+                    max_metered_tokens=runtime_max_metered_tokens,
+                    max_cost_usd=runtime_max_cost_usd,
                 )
             except InfrastructureRunError as exc:
                 infrastructure_error = exc
@@ -816,12 +923,19 @@ def run_multi_arm(
                     harness_config_id=config_ids[arm_id],
                     harness_revision=revision,
                     suite_id=suite["suite_id"],
+                    max_metered_tokens=runtime_max_metered_tokens,
+                    max_cost_usd=runtime_max_cost_usd,
                 )
             if len(selected) != 1:
                 raise ValidationError(
                     f"{arm_id} trial {trial} task {task_id}: expected one "
                     "execution-grounded rollout"
                 )
+            _require_runtime_budget_provenance(
+                selected[0],
+                max_metered_tokens=runtime_max_metered_tokens,
+                max_cost_usd=runtime_max_cost_usd,
+            )
             collected[arm_id].extend(selected)
             completed_keys[arm_id].add((task_id, trial))
             write_rollouts(outputs[arm_id], collected[arm_id])

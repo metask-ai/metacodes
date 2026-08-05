@@ -6,6 +6,7 @@ const std = @import("std");
 const Conversation = @import("conversation.zig").Conversation;
 const msg = @import("message.zig");
 const compact_summary = @import("compact_summary.zig");
+const request_gate = @import("request_gate.zig");
 const provider_mod = @import("../api/provider.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const UsageDelta = @import("../api/stream.zig").UsageDelta;
@@ -37,6 +38,11 @@ pub const Report = struct {
     kept: usize,
     usage: UsageDelta,
     emergency_reduced: bool = false,
+    /// Tokens added by the realized summary over the no-summary lower bound.
+    /// A caller can feed this back as the next optimistic reserve, preventing
+    /// another paid request until the newly droppable prefix can absorb the
+    /// last observed summary overhead and still meet the savings gate.
+    summary_overhead_tokens: usize = 0,
     /// Present iff the kernel actually crossed the paid/provider boundary.
     /// Optimistic preview skips leave this null and therefore cannot be
     /// mistaken for model traffic by evaluation telemetry.
@@ -91,6 +97,8 @@ pub const Options = struct {
     task_anchor: ?[]const u8 = null,
     estimator: ?Estimator = null,
     minimum_saved_percent: usize = 5,
+    minimum_summary_reserve_tokens: usize = 0,
+    request_gate: ?request_gate.Gate = null,
     target_tokens: ?usize = null,
     committer: ?Committer = null,
 };
@@ -116,6 +124,7 @@ pub fn run(
     // system/tool overhead dominates a small conversation: the old path paid
     // for a summary, rejected it as <5% savings, then retried after every new
     // message without advancing the compact boundary.
+    var optimistic_after_tokens = before_tokens;
     if (options.minimum_saved_percent > 0) {
         var optimistic = conversation.cloneForCompactPreview(
             allocator,
@@ -133,9 +142,15 @@ pub fn run(
             &no_summary,
             NoSummary.summarize,
         ) catch return error.OutOfMemory;
+        optimistic_after_tokens = estimate(
+            options.estimator,
+            &optimistic.conversation,
+        );
+        const reserved_after = optimistic_after_tokens +|
+            options.minimum_summary_reserve_tokens;
         if (optimistic_report.dropped == 0 or !hasMinimumSavings(
             before_tokens,
-            estimate(options.estimator, &optimistic.conversation),
+            reserved_after,
             options.minimum_saved_percent,
         )) {
             return terminal(
@@ -155,6 +170,17 @@ pub fn run(
     ) catch return error.OutOfMemory;
     defer preview.deinit();
     const before_active = preview.conversation.activeMessages().len;
+    if (options.request_gate) |gate| {
+        if (!gate.allows())
+            return terminal(
+                .aborted,
+                before_tokens,
+                before_tokens,
+                0,
+                before_active,
+                .{},
+            );
+    }
     const SummaryContext = struct {
         allocator: std.mem.Allocator,
         provider: provider_mod.Provider,
@@ -240,6 +266,10 @@ pub fn run(
     }
 
     var after_tokens = estimate(options.estimator, &preview.conversation);
+    const summary_overhead_tokens = if (after_tokens > optimistic_after_tokens)
+        after_tokens - optimistic_after_tokens
+    else
+        0;
     if (compact_report.summary_used and !hasMinimumSavings(
         before_tokens,
         after_tokens,
@@ -254,6 +284,7 @@ pub fn run(
             summary_ctx.usage,
         );
         report.summary_request = summary_ctx.summary_request;
+        report.summary_overhead_tokens = summary_overhead_tokens;
         return report;
     }
     if (abort.isAborted()) {
@@ -266,6 +297,7 @@ pub fn run(
             summary_ctx.usage,
         );
         report.summary_request = summary_ctx.summary_request;
+        report.summary_overhead_tokens = summary_overhead_tokens;
         return report;
     }
     var emergency_reduced = false;
@@ -303,6 +335,7 @@ pub fn run(
                 summary_ctx.usage,
             );
             report.summary_request = summary_ctx.summary_request;
+            report.summary_overhead_tokens = summary_overhead_tokens;
             return report;
         },
         .concurrent_mutation => return error.ConcurrentMutation,
@@ -318,6 +351,7 @@ pub fn run(
     );
     report.emergency_reduced = emergency_reduced;
     report.summary_request = summary_ctx.summary_request;
+    report.summary_overhead_tokens = summary_overhead_tokens;
     return report;
 }
 

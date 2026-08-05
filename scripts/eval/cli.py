@@ -258,6 +258,8 @@ def cmd_prepare_e2e(args: argparse.Namespace) -> int:
         harness_revision=args.harness_revision,
         permission_mode=args.permission_mode,
         binary_path=Path(args.binary),
+        max_metered_tokens=args.max_metered_tokens,
+        max_cost_usd=args.max_cost_usd,
     )
     if metadata is None:
         print(f"task {args.task}: not in scored suite; native evaluation disabled")
@@ -737,6 +739,8 @@ def parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--harness-revision", required=True)
     prepare_parser.add_argument("--permission-mode", required=True)
     prepare_parser.add_argument("--binary", required=True)
+    prepare_parser.add_argument("--max-metered-tokens", type=int)
+    prepare_parser.add_argument("--max-cost-usd", type=float)
     prepare_parser.set_defaults(func=cmd_prepare_e2e)
 
     finalize_parser = commands.add_parser(

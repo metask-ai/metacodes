@@ -26,6 +26,10 @@ pub const Reason = enum(u8) {
     /// Host-side infrastructure/callback failure. This must not be reported as
     /// a user cancellation by binary-library consumers.
     host_failure = 6,
+    /// Evaluation-only metered budget guard. The process must terminate the
+    /// scored rollout instead of resetting this signal and accepting another
+    /// user submission.
+    evaluation_budget = 7,
 };
 
 pub const AbortSignal = struct {
@@ -148,7 +152,7 @@ test "cross-thread: worker observes flag set by main" {
 }
 
 test "all reasons round-trip" {
-    inline for (.{ .user_ctrl_c, .timeout, .max_turns, .api_error, .user_interrupt, .host_failure }) |r| {
+    inline for (.{ .user_ctrl_c, .timeout, .max_turns, .api_error, .user_interrupt, .host_failure, .evaluation_budget }) |r| {
         var s = AbortSignal.init();
         s.abort(r);
         try std.testing.expect(s.reason() == r);

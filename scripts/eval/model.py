@@ -486,6 +486,39 @@ def validate_rollout(data: Dict[str, Any], where: str = "rollout") -> None:
     _require(model, "id", str, f"{where}.model")
     _require(harness, "config_id", str, f"{where}.harness")
     _require(harness, "revision", str, f"{where}.harness")
+    runtime_budget = harness.get("runtime_budget")
+    if runtime_budget is not None:
+        if not isinstance(runtime_budget, dict):
+            raise ValidationError(
+                f"{where}.harness.runtime_budget: expected object or null"
+            )
+        expected_budget_keys = {"max_metered_tokens", "max_cost_usd"}
+        if set(runtime_budget) != expected_budget_keys:
+            raise ValidationError(
+                f"{where}.harness.runtime_budget: expected exactly "
+                f"{sorted(expected_budget_keys)}"
+            )
+        max_metered_tokens = runtime_budget["max_metered_tokens"]
+        max_cost_usd = runtime_budget["max_cost_usd"]
+        if (
+            not isinstance(max_metered_tokens, int)
+            or isinstance(max_metered_tokens, bool)
+            or max_metered_tokens <= 0
+        ):
+            raise ValidationError(
+                f"{where}.harness.runtime_budget.max_metered_tokens: "
+                "expected integer > 0"
+            )
+        if (
+            not isinstance(max_cost_usd, (int, float))
+            or isinstance(max_cost_usd, bool)
+            or not math.isfinite(float(max_cost_usd))
+            or max_cost_usd <= 0
+        ):
+            raise ValidationError(
+                f"{where}.harness.runtime_budget.max_cost_usd: "
+                "expected finite number > 0"
+            )
     attribution = _require(data, "attribution", list, where)
     for index, item in enumerate(attribution):
         if not isinstance(item, dict):

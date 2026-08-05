@@ -338,6 +338,8 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 runtime_env=None,
                 allow_invalid_run=False,
                 timeout_seconds=None,
+                max_metered_tokens=None,
+                max_cost_usd=None,
             ):
                 if fail_after[0] is not None and len(invocations) >= fail_after[0]:
                     raise RuntimeError("simulated interruption")
@@ -355,6 +357,8 @@ class LongHorizonExperimentTest(unittest.TestCase):
                     runtime_env,
                     allow_invalid_run,
                     timeout_seconds,
+                    max_metered_tokens,
+                    max_cost_usd,
                 )
                 return token
 
@@ -371,6 +375,8 @@ class LongHorizonExperimentTest(unittest.TestCase):
                     runtime_env,
                     allow_invalid_run,
                     timeout_seconds,
+                    max_metered_tokens,
+                    max_cost_usd,
                 ) = run_state[run_dir]
                 self.assertEqual(runtime_env["METACODES_LONG_HORIZON_ARM"], arm_id)
                 if arm_id == "tinykg":
@@ -411,7 +417,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         "trial": trial,
                         "layers": task["layers"],
                         "model": {"provider": model_provider, "id": model_id, "fingerprint": identity["model_fingerprint"]},
-                        "harness": {"config_id": harness_config_id, "revision": revision, "fingerprint": identity["harness_fingerprint"], "permission_mode": identity["permission_mode"], "environment_fingerprint": identity["environment_fingerprint"]},
+                        "harness": {"config_id": harness_config_id, "revision": revision, "fingerprint": identity["harness_fingerprint"], "permission_mode": identity["permission_mode"], "environment_fingerprint": identity["environment_fingerprint"], "runtime_budget": {"max_metered_tokens": max_metered_tokens, "max_cost_usd": max_cost_usd}},
                         "readiness": {"status": "pass", "checks": []},
                         "execution": {"status": "completed", "exit_code": 0, "invalid_reasons": []},
                         "outcome": {"status": "pass", "checks": []},
@@ -459,6 +465,27 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         allow_paid_rollouts=True,
                     )
                 self.assertEqual(len(invocations), 2)
+                checkpoint_path = sorted(output_dir.glob("*.jsonl"))[0]
+                checkpoint_bytes = checkpoint_path.read_bytes()
+                tampered = load_rollouts(checkpoint_path)
+                tampered[0]["harness"].pop("runtime_budget")
+                write_rollouts(checkpoint_path, tampered)
+                with self.assertRaisesRegex(
+                    ValidationError, "missing runtime budget provenance"
+                ):
+                    run_multi_arm(
+                        experiment,
+                        self.suite,
+                        ROOT,
+                        binary,
+                        tinykg_binary=tinykg,
+                        formal_kernel=formal,
+                        revision="abc123",
+                        output_dir=output_dir,
+                        suite_path=SUITE_PATH,
+                        allow_paid_rollouts=True,
+                    )
+                checkpoint_path.write_bytes(checkpoint_bytes)
                 fail_after[0] = None
                 invocations.clear()
                 result = run_multi_arm(
@@ -475,6 +502,13 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 )
             self.assertEqual(len(invocations), 16)
             self.assertEqual(sum(len(rows) for rows in result.values()), 18)
+            self.assertTrue(
+                all(
+                    row["harness"].get("runtime_budget")
+                    for rows in result.values()
+                    for row in rows
+                )
+            )
 
     def test_multi_arm_rechecks_binary_after_each_rollout(self):
         experiment = copy.deepcopy(self.experiment)
@@ -614,6 +648,8 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 runtime_env=None,
                 allow_invalid_run=False,
                 timeout_seconds=None,
+                max_metered_tokens=None,
+                max_cost_usd=None,
             ):
                 _ = (
                     observed_binary,
@@ -626,6 +662,8 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 )
                 self.assertTrue(allow_invalid_run)
                 self.assertEqual(timeout_seconds, 900)
+                self.assertGreater(max_metered_tokens, 0)
+                self.assertGreater(max_cost_usd, 0)
                 raise InfrastructureRunError(arm_id, trial, 1, run_dir)
 
             def fake_import(_suite, _repo_root, _run_dir):
@@ -661,6 +699,12 @@ class LongHorizonExperimentTest(unittest.TestCase):
             self.assertIn("e2e_runner_exit:1", checkpoint[0]["execution"]["invalid_reasons"])
             self.assertIn(
                 "evidence_import_failed", checkpoint[0]["execution"]["invalid_reasons"]
+            )
+            self.assertGreater(
+                checkpoint[0]["harness"]["runtime_budget"]["max_metered_tokens"], 0
+            )
+            self.assertGreater(
+                checkpoint[0]["harness"]["runtime_budget"]["max_cost_usd"], 0
             )
             self.assertEqual(
                 checkpoint[0]["task_fingerprint_provenance"],

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -225,6 +226,8 @@ def prepare_runtime_metadata(
     harness_revision: str,
     permission_mode: str,
     binary_path: Path,
+    max_metered_tokens: Optional[int] = None,
+    max_cost_usd: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """Freeze comparison-critical identities before the child process starts.
 
@@ -245,6 +248,21 @@ def prepare_runtime_metadata(
         binary_path=binary_path,
     )
     permission_mode = identity["permission_mode"]
+    if (max_metered_tokens is None) != (max_cost_usd is None):
+        raise ValidationError("runtime budget requires both token and cost caps")
+    if max_metered_tokens is not None and (
+        not isinstance(max_metered_tokens, int)
+        or isinstance(max_metered_tokens, bool)
+        or max_metered_tokens <= 0
+    ):
+        raise ValidationError("runtime max_metered_tokens must be an integer > 0")
+    if max_cost_usd is not None and (
+        not isinstance(max_cost_usd, (int, float))
+        or isinstance(max_cost_usd, bool)
+        or not math.isfinite(float(max_cost_usd))
+        or float(max_cost_usd) <= 0
+    ):
+        raise ValidationError("runtime max_cost_usd must be finite and > 0")
     metadata = {
         "schema_version": NATIVE_EVENT_SCHEMA_VERSION,
         "events_path": events_path,
@@ -263,6 +281,10 @@ def prepare_runtime_metadata(
         "environment_fingerprint": identity["environment_fingerprint"],
         "grader_fingerprint": identity["grader_fingerprint"],
     }
+    if max_metered_tokens is not None:
+        metadata["max_metered_tokens"] = max_metered_tokens
+    if max_cost_usd is not None:
+        metadata["max_cost_usd"] = float(max_cost_usd)
     _write_new_private_file(
         output,
         (json.dumps(metadata, ensure_ascii=False, sort_keys=True) + "\n").encode(
@@ -1203,6 +1225,20 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
         or metadata["trial"] < 0
     ):
         return None, "run_started metadata has invalid trial"
+    max_metered_tokens = metadata.get("max_metered_tokens")
+    max_cost_usd = metadata.get("max_cost_usd")
+    if (max_metered_tokens is None) != (max_cost_usd is None):
+        return None, "run_started metadata has incomplete runtime budget"
+    if max_metered_tokens is not None and (
+        not isinstance(max_metered_tokens, int)
+        or isinstance(max_metered_tokens, bool)
+        or max_metered_tokens <= 0
+        or not isinstance(max_cost_usd, (int, float))
+        or isinstance(max_cost_usd, bool)
+        or not math.isfinite(float(max_cost_usd))
+        or float(max_cost_usd) <= 0
+    ):
+        return None, "run_started metadata has invalid runtime budget"
     identity_keys = {
         "run_id",
         "trial",
@@ -1221,6 +1257,8 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
         "runtime_permission_mode",
         "environment_fingerprint",
         "grader_fingerprint",
+        "max_metered_tokens",
+        "max_cost_usd",
     }
     for start in starts[1:]:
         other = start.get("metadata", {})
@@ -1705,6 +1743,11 @@ def import_run(
                 "permission_mode": native_meta["permission_mode"],
                 "environment_fingerprint": native_meta["environment_fingerprint"],
             }
+            if native_meta.get("max_metered_tokens") is not None:
+                harness["runtime_budget"] = {
+                    "max_metered_tokens": native_meta["max_metered_tokens"],
+                    "max_cost_usd": native_meta["max_cost_usd"],
+                }
             identity_matches = (
                 native_meta.get("suite_id") == suite["suite_id"]
                 and native_meta.get("task_id") == task_id
