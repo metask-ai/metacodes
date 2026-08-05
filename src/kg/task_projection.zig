@@ -169,11 +169,7 @@ pub const Projection = struct {
             self.evidence.len,
         });
 
-        // One compact line: JSON-escaped task text cannot synthesize a closing
-        // fence on its own line, so extraction remains unambiguous.
-        try print(writer, "```json {s}\n", .{MARKDOWN_SCHEMA});
-        try writeAll(writer, canonical);
-        try writeAll(writer, "\n```\n\n## Tasks\n\n");
+        try writeAll(writer, "## Tasks\n\n");
 
         for (self.tasks) |task| {
             const marker = switch (task.lifecycle) {
@@ -245,6 +241,13 @@ pub const Projection = struct {
                 });
             }
         }
+        try writeAll(writer, "\n## Machine envelope\n\n" ++
+            "> Canonical data for exact read-only round trips. Human readers can ignore this block.\n\n");
+        // One compact line: JSON-escaped task text cannot synthesize a closing
+        // fence on its own line, so extraction remains unambiguous.
+        try print(writer, "```json {s}\n", .{MARKDOWN_SCHEMA});
+        try writeAll(writer, canonical);
+        try writeAll(writer, "\n```\n");
         return out.toOwnedSlice() catch error.OutOfMemory;
     }
 
@@ -549,7 +552,7 @@ pub fn parseMarkdown(
     markdown: []const u8,
 ) Error!Projection {
     const start_marker = "```json " ++ MARKDOWN_SCHEMA ++ "\n";
-    const start = std.mem.indexOf(u8, markdown, start_marker) orelse return error.InvalidMarkdown;
+    const start = findAtLineStart(markdown, start_marker) orelse return error.InvalidMarkdown;
     const payload_start = start + start_marker.len;
     const end_marker = "\n```";
     const relative_end = std.mem.indexOf(u8, markdown[payload_start..], end_marker) orelse
@@ -571,6 +574,15 @@ pub fn parseMarkdown(
     defer allocator.free(canonical);
     if (!std.mem.eql(u8, canonical, payload)) return error.NonCanonicalMarkdown;
     return result;
+}
+
+fn findAtLineStart(haystack: []const u8, needle: []const u8) ?usize {
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, cursor, needle)) |position| {
+        if (position == 0 or haystack[position - 1] == '\n') return position;
+        cursor = position + 1;
+    }
+    return null;
 }
 
 fn validateSummary(raw: RawSnapshot) Error!void {

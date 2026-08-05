@@ -37,6 +37,8 @@ test "L2 task projection preserves stable identity, lifecycle, DAG and evidence 
     try std.testing.expect(std.mem.indexOf(u8, markdown, "task:3") != null);
     try std.testing.expect(std.mem.indexOf(u8, markdown, "depends_on") != null);
     try std.testing.expect(std.mem.indexOf(u8, markdown, "proof one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, markdown, "## Tasks").? <
+        std.mem.indexOf(u8, markdown, "## Machine envelope").?);
 
     var second = try projection.parseMarkdown(
         allocator,
