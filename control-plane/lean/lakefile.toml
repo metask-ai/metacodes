@@ -8,3 +8,7 @@ name = "MetaCodesControl"
 [[lean_exe]]
 name = "rule-decision"
 root = "Main"
+
+[[lean_exe]]
+name = "metacodes-formal-kernel"
+root = "FormalMain"
