@@ -228,9 +228,10 @@ python3 scripts/eval/cli.py run-multi \
 
 runner 会把 Lean checker 二进制、相邻 provenance 及其版本化协议验证为一个 artifact identity，
 将 identity 绑定到三臂 config/checkpoint，但只向 `tinykg` 臂注入 checker 路径与 SHA-256；
-基线臂既拿不到路径，也不能从宿主环境继承它。两个 checked-in manifest 都保持
-`paid_rollouts_enabled=false`。真正执行仍需同时修改对应
-manifest 并传 `--allow-paid-rollouts`。每个昂贵 rollout 后独立原子 checkpoint；invalid 或基础设施
+基线臂既拿不到路径，也不能从宿主环境继承它。用户在 2026-08-06 授权总预算不超过
+$1000 后，checked-in calibration manifest 只开启最多 $100 / 3M token 的基础设施校准；
+confirmatory manifest 仍保持 `paid_rollouts_enabled=false`。真正执行 calibration 还必须显式传
+`--allow-paid-rollouts`，形成合同与命令行双钥匙。每个昂贵 rollout 后独立原子 checkpoint；invalid 或基础设施
 失败先保留证据再中止。TinyKG binary 的 storage/schema/version/SHA 会在执行前冻结，只有 TinyKG
 臂收到其路径；runner 同时清除宿主 `METACODES_*`、`TINYKG_*`、`E2E_*`、
 `CLAUDE_CODE_*` 和 `RG_BIN` 污染。

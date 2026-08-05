@@ -100,7 +100,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
         validate_experiment(
             self.confirmatory_experiment, ROOT, self.confirmatory_suite
         )
-        self.assertFalse(self.experiment["budget"]["paid_rollouts_enabled"])
+        self.assertTrue(self.experiment["budget"]["paid_rollouts_enabled"])
         self.assertFalse(
             self.confirmatory_experiment["budget"]["paid_rollouts_enabled"]
         )
