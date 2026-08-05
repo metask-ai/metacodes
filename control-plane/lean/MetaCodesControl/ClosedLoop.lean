@@ -110,6 +110,14 @@ theorem orphan_cannot_be_compliant
     nextState topology observation = .blocked := by
   simp [nextState, signal, orphan]
 
+/-- A manifest cannot claim an actuator into existence: the repository sensor
+must observe the executable build/CI link before release can be admitted. -/
+theorem unobserved_actuator_blocks
+    (topology : Topology) (observation : Observation)
+    (missing : topology.actuator = false) :
+    nextState topology observation = .blocked := by
+  simp [nextState, signal, Topology.complete, missing]
+
 /-- Failed runtime feedback always drives the controller back to blocked. -/
 theorem failed_feedback_blocks
     (topology : Topology) (observation : Observation)

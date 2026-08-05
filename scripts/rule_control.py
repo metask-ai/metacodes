@@ -49,6 +49,23 @@ class Observation:
     fingerprint_sha256: str = ""
 
 
+@dataclass
+class ActuatorObservation:
+    schema_version: int = SCHEMA_VERSION
+    sensor: str = "release_gate_wiring"
+    sensor_ok: bool = False
+    build_step_wired: bool = False
+    controller_command_wired: bool = False
+    workflow_job_wired: bool = False
+    workflow_command_wired: bool = False
+    workflow_workdir_wired: bool = False
+    telemetry_upload_wired: bool = False
+    telemetry_missing_fails: bool = False
+    errors: list[str] = field(default_factory=list)
+    source_sha256: dict[str, str] = field(default_factory=dict)
+    fingerprint_sha256: str = ""
+
+
 def load_json(path: Path) -> Any:
     try:
         with path.open("r", encoding="utf-8") as handle:
@@ -147,6 +164,222 @@ def fingerprint(paths: Iterable[Path]) -> str:
             digest.update(b"<missing>")
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def discover_workspace_root(repo: Path) -> Path:
+    """Find the checkout root without trusting a shell command or git config."""
+    current = repo.resolve()
+    while True:
+        if (current / ".git").exists():
+            return current
+        if current.parent == current:
+            return repo.resolve()
+        current = current.parent
+
+
+def _job_slice(workflow: str, job_id: str) -> str | None:
+    lines = workflow.splitlines(keepends=True)
+    jobs_index: int | None = None
+    for index, line in enumerate(lines):
+        if re.fullmatch(r"jobs:[ \t]*(?:#.*)?\r?\n?", line):
+            jobs_index = index
+            break
+    if jobs_index is None:
+        return None
+    start: int | None = None
+    for index in range(jobs_index + 1, len(lines)):
+        line = lines[index]
+        if re.fullmatch(r"  " + re.escape(job_id) + r":[ \t]*(?:#.*)?\r?\n?", line):
+            start = index
+            break
+    if start is None:
+        return None
+    stop = len(lines)
+    for index in range(start + 1, len(lines)):
+        if re.fullmatch(r"  [A-Za-z0-9_-]+:[ \t]*(?:#.*)?\r?\n?", lines[index]):
+            stop = index
+            break
+    return "".join(lines[start:stop])
+
+
+def _upload_step_slice(job: str) -> str | None:
+    lines = job.splitlines(keepends=True)
+    upload_index: int | None = None
+    for index, line in enumerate(lines):
+        if re.match(r"^\s+uses:\s*actions/upload-artifact@", line):
+            upload_index = index
+            break
+    if upload_index is None:
+        return None
+    start = upload_index
+    while start > 0 and not re.match(r"^\s{6}-\s", lines[start]):
+        start -= 1
+    stop = len(lines)
+    for index in range(upload_index + 1, len(lines)):
+        if re.match(r"^\s{6}-\s", lines[index]):
+            stop = index
+            break
+    return "".join(lines[start:stop])
+
+
+def _strip_zig_comments(source: str) -> str:
+    source = re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
+    return re.sub(r"//.*$", "", source, flags=re.MULTILINE)
+
+
+def observe_release_gate(
+    repo: Path,
+    workspace: Path,
+    actuator: Any,
+) -> ActuatorObservation:
+    """Observe the executable release path; manifest prose is not evidence."""
+    errors: list[str] = []
+    touched: list[Path] = []
+    if not isinstance(actuator, dict):
+        return ActuatorObservation(errors=["actuator must be an object"])
+    observation = actuator.get("observation")
+    if not isinstance(observation, dict) or observation.get("schema_version") != SCHEMA_VERSION:
+        return ActuatorObservation(errors=["actuator.observation schema is missing or unsupported"])
+
+    expected_strings = {
+        "build_file": "control-plane/build.zig",
+        "build_step": "rule-check",
+        "workflow_file": ".github/workflows/cross-platform.yml",
+        "workflow_job": "rule-control",
+        "workflow_workdir": "metacodes",
+        "telemetry_path": "metacodes/zig-out/reports/rule-control.json",
+    }
+    for key, expected in expected_strings.items():
+        if observation.get(key) != expected:
+            errors.append(
+                f"actuator.observation.{key} must be canonical value {expected!r}"
+            )
+    if errors:
+        return ActuatorObservation(errors=errors)
+
+    try:
+        build_path = safe_repo_path(repo, observation["build_file"])
+        workflow_path = safe_repo_path(workspace, observation["workflow_file"])
+        touched.extend((build_path, workflow_path))
+        build_source = _strip_zig_comments(read_text(build_path))
+        workflow_source = read_text(workflow_path)
+    except ControlError as exc:
+        return ActuatorObservation(errors=[str(exc)], fingerprint_sha256=fingerprint(touched))
+
+    controller_command_wired = False
+    command_var = ""
+    command_pattern = re.compile(
+        r"const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*b\.addSystemCommand\(\s*&\.\{([^}]*)\}\s*\)",
+        re.DOTALL,
+    )
+    for command_match in command_pattern.finditer(build_source):
+        command_body = command_match.group(2)
+        if not all(
+            marker in command_body for marker in ('"scripts/rule_control.py"', '"check"')
+        ):
+            continue
+        command_var = command_match.group(1)
+        controller_command_wired = True
+        break
+    if not controller_command_wired:
+        errors.append("control-plane build does not execute scripts/rule_control.py check")
+
+    step_name = re.escape(observation["build_step"])
+    step_match = re.search(
+        r"const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*b\.step\(\s*\"" + step_name + r"\"",
+        build_source,
+    )
+    build_step_wired = False
+    if step_match is not None and command_var:
+        step_var = re.escape(step_match.group(1))
+        command_name = re.escape(command_var)
+        build_step_wired = re.search(
+            step_var + r"\s*\.\s*dependOn\(\s*&" + command_name + r"\s*\.\s*step\s*\)",
+            build_source,
+        ) is not None
+    if not build_step_wired:
+        errors.append(f"control-plane build step {observation['build_step']!r} is not wired to the controller command")
+
+    job = _job_slice(workflow_source, observation["workflow_job"])
+    workflow_job_wired = job is not None
+    if job is None:
+        errors.append(f"workflow job {observation['workflow_job']!r} is missing")
+        job = ""
+
+    expected_run = (
+        "zig build --build-file " + observation["build_file"] + " " + observation["build_step"]
+    )
+    workflow_command_wired = re.search(
+        r"^\s+run:\s*" + re.escape(expected_run) + r"\s*$",
+        job,
+        re.MULTILINE,
+    ) is not None
+    if not workflow_command_wired:
+        errors.append(f"workflow job does not run exact release gate: {expected_run}")
+    if re.search(r"^\s+continue-on-error:\s*true\s*$", job, re.MULTILINE):
+        workflow_command_wired = False
+        errors.append("workflow release gate must not use continue-on-error: true")
+    if re.search(r"^\s+if:\s*(?:false|\$\{\{\s*false\s*\}\})\s*$", job, re.MULTILINE):
+        workflow_command_wired = False
+        errors.append("workflow release gate must not be disabled by if: false")
+
+    jobs_match = re.search(r"^jobs:[ \t]*(?:#.*)?\r?$", workflow_source, re.MULTILINE)
+    workflow_preamble = workflow_source[: jobs_match.start()] if jobs_match is not None else ""
+    workdir_pattern = (
+        r"^\s+working-directory:\s*" + re.escape(observation["workflow_workdir"]) + r"\s*$"
+    )
+    workflow_workdir_wired = (
+        re.search(workdir_pattern, workflow_preamble, re.MULTILINE) is not None
+        or re.search(workdir_pattern, job, re.MULTILINE) is not None
+    )
+    if not workflow_workdir_wired:
+        errors.append(f"workflow does not run from {observation['workflow_workdir']!r}")
+
+    upload = _upload_step_slice(job)
+    telemetry_upload_wired = upload is not None and all(
+        re.search(pattern, upload, re.MULTILINE) is not None
+        for pattern in (
+            r"^\s+if:\s*always\(\)\s*$",
+            r"^\s+path:\s*" + re.escape(observation["telemetry_path"]) + r"\s*$",
+        )
+    )
+    if not telemetry_upload_wired:
+        errors.append("workflow must always upload the exact rule-control telemetry path")
+    telemetry_missing_fails = upload is not None and re.search(
+        r"^\s+if-no-files-found:\s*error\s*$",
+        upload,
+        re.MULTILINE,
+    ) is not None
+    if not telemetry_missing_fails:
+        errors.append("workflow telemetry upload must fail when the report is missing")
+
+    sensor_ok = not errors and all(
+        (
+            build_step_wired,
+            controller_command_wired,
+            workflow_job_wired,
+            workflow_command_wired,
+            workflow_workdir_wired,
+            telemetry_upload_wired,
+            telemetry_missing_fails,
+        )
+    )
+    return ActuatorObservation(
+        sensor_ok=sensor_ok,
+        build_step_wired=build_step_wired,
+        controller_command_wired=controller_command_wired,
+        workflow_job_wired=workflow_job_wired,
+        workflow_command_wired=workflow_command_wired,
+        workflow_workdir_wired=workflow_workdir_wired,
+        telemetry_upload_wired=telemetry_upload_wired,
+        telemetry_missing_fails=telemetry_missing_fails,
+        errors=errors,
+        source_sha256={
+            f"repo:{observation['build_file']}": sha256_file(build_path),
+            f"workspace:{observation['workflow_file']}": sha256_file(workflow_path),
+        },
+        fingerprint_sha256=fingerprint(touched),
+    )
 
 
 def observe_declaration_l2(repo: Path, registry_path: Path) -> Observation:
@@ -423,7 +656,11 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def link_topology(rule: dict[str, Any], counterexamples_ok: bool) -> tuple[dict[str, bool], list[str]]:
+def link_topology(
+    rule: dict[str, Any],
+    counterexamples_ok: bool,
+    actuator_observed: bool,
+) -> tuple[dict[str, bool], list[str]]:
     failures: list[str] = []
     target = rule.get("target")
     target_ok = isinstance(target, dict) and bool(target.get("goal")) and target.get("setpoint") == 0
@@ -444,12 +681,13 @@ def link_topology(rule: dict[str, Any], counterexamples_ok: bool) -> tuple[dict[
         and all(isinstance(name, str) and name for name in decision.get("theorems"))
     )
     actuator = rule.get("actuator")
-    actuator_ok = (
+    actuator_declared = (
         isinstance(actuator, dict)
         and actuator.get("kind") == "release_gate"
         and actuator.get("on_violation") == "block"
         and bool(actuator.get("remediation"))
     )
+    actuator_ok = actuator_declared and actuator_observed
     feedback = rule.get("feedback")
     feedback_commands = feedback.get("commands") if isinstance(feedback, dict) else None
     commands_are_arrays = (
@@ -730,6 +968,8 @@ def run_check(repo: Path, manifest_path: Path, report_path: Path) -> int:
         "rules": [],
         "violations": [],
     }
+    workspace = discover_workspace_root(repo)
+    report["workspace"] = str(workspace)
     controller_inputs = (
         "scripts/rule_control.py",
         "scripts/tests/test_rule_control.py",
@@ -772,14 +1012,21 @@ def run_check(repo: Path, manifest_path: Path, report_path: Path) -> int:
         rule_report: dict[str, Any] = {"id": rule_id, "status": "blocked", "violations": []}
         report["rules"].append(rule_report)
         try:
+            actuator_before = observe_release_gate(repo, workspace, raw_rule.get("actuator"))
+            rule_report["actuator_observation_before"] = asdict(actuator_before)
             counterexamples_ok, counterexample_results, counterexample_errors = verify_counterexamples(
                 repo, raw_rule, kernel
             )
-            topology, topology_errors = link_topology(raw_rule, counterexamples_ok)
+            topology, topology_errors = link_topology(
+                raw_rule,
+                counterexamples_ok,
+                actuator_before.sensor_ok,
+            )
             rule_report["topology"] = topology
             rule_report["counterexamples"] = counterexample_results
             rule_report["violations"].extend(counterexample_errors)
             rule_report["violations"].extend(topology_errors)
+            rule_report["violations"].extend(actuator_before.errors)
 
             sensor = raw_rule.get("sensor", {})
             registry_relative = sensor.get("evidence_registry") if isinstance(sensor, dict) else None
@@ -820,13 +1067,25 @@ def run_check(repo: Path, manifest_path: Path, report_path: Path) -> int:
 
             after = observe_declaration_l2(repo, registry_path)
             rule_report["observation_after"] = asdict(after)
-            stable_observation = before.fingerprint_sha256 == after.fingerprint_sha256
+            actuator_after = observe_release_gate(repo, workspace, raw_rule.get("actuator"))
+            rule_report["actuator_observation_after"] = asdict(actuator_after)
+            final_topology, final_topology_errors = link_topology(
+                raw_rule,
+                counterexamples_ok,
+                actuator_after.sensor_ok,
+            )
+            rule_report["topology_after_feedback"] = final_topology
+            rule_report["topology"] = final_topology
+            stable_observation = (
+                before.fingerprint_sha256 == after.fingerprint_sha256
+                and actuator_before.fingerprint_sha256 == actuator_after.fingerprint_sha256
+            )
             rule_report["reobserved_after_feedback"] = True
             rule_report["observation_stable_during_feedback"] = stable_observation
             final_feedback = "passed" if feedback_ok and stable_observation else "failed"
             final = kernel.evaluate(
                 rule_id,
-                topology,
+                final_topology,
                 after.sensor_ok,
                 after.declared,
                 after.covered,
@@ -838,6 +1097,8 @@ def run_check(repo: Path, manifest_path: Path, report_path: Path) -> int:
                 rule_report["status"] = "enforced"
             else:
                 rule_report["violations"].extend(after.errors)
+                rule_report["violations"].extend(actuator_after.errors)
+                rule_report["violations"].extend(final_topology_errors)
                 if not feedback_ok:
                     rule_report["violations"].append("Zig L2 feedback failed or skipped tests")
                 if not stable_observation:

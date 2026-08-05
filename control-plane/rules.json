@@ -24,13 +24,23 @@
           "missing_evidence_blocks",
           "orphan_cannot_be_compliant",
           "failed_feedback_blocks",
-          "sensor_failure_blocks"
+          "sensor_failure_blocks",
+          "unobserved_actuator_blocks"
         ]
       },
       "actuator": {
         "kind": "release_gate",
         "on_violation": "block",
-        "remediation": "Add or repair a real L2 test and its evidence binding; do not silence the declaration."
+        "remediation": "Add or repair a real L2 test and its evidence binding; do not silence the declaration.",
+        "observation": {
+          "schema_version": 1,
+          "build_file": "control-plane/build.zig",
+          "build_step": "rule-check",
+          "workflow_file": ".github/workflows/cross-platform.yml",
+          "workflow_job": "rule-control",
+          "workflow_workdir": "metacodes",
+          "telemetry_path": "metacodes/zig-out/reports/rule-control.json"
+        }
       },
       "feedback": {
         "kind": "zig_l2_then_reobserve",

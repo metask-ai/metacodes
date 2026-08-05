@@ -17,7 +17,7 @@ A rule is enforced only when all six links are valid:
 1. `target`: a measurable setpoint or invariant;
 2. `sensor`: versioned facts observed from real repository files;
 3. `decision`: the Lean kernel and named theorems governing its behavior;
-4. `actuator`: a fail-closed release gate with remediation;
+4. `actuator`: an observed fail-closed build/CI release gate with remediation;
 5. `feedback`: real Zig tests followed by re-observation;
 6. `counterexample`: executable pass/block fixtures, including a formalization orphan.
 
@@ -35,6 +35,10 @@ Missing any link makes `Topology.complete = false`. The same Lean function used 
 - every exclusion is explicit, classified, and justified.
 
 Static evidence is not enough. Lean first returns `run_feedback`; the controller runs its own fail-closed sensor tests and the focused Zig component tests, rejects non-zero exits and non-zero skipped-test summaries, observes the repository again, and only then asks Lean for the final decision. A changed sensor fingerprint during feedback blocks the run and requires a retry.
+
+The actuator is also sensed, not trusted from `rules.json`. The controller must observe the `rule-check` Zig build dependency, the live `rule-control` CI job, its exact gate command and working directory, and an `always()` upload of the exact telemetry path that fails when the report is missing. It re-observes those files after feedback. Removing or disabling any executable link sets `Topology.actuator = false`, so the Lean kernel blocks before tests can masquerade as a release gate.
+
+This repository-local sensor proves wiring through the CI check. Whether a hosting service's branch-protection policy marks that check as required is external state and must be audited separately; this control plane does not claim to formalize an unobserved server setting.
 
 The first slice intentionally does not claim that all repository rules are formalized. Existing exclusions are visible debt, not silent coverage. New rule families should be added incrementally after this loop is stable.
 
@@ -66,7 +70,7 @@ Add a versioned entry to `rules.json` with all six links, implement a determinis
 - its decision function is the one proved in Lean;
 - a representative repository violation reaches the sensor;
 - the Lean signal blocks that violation;
-- the actuator has an observable effect;
+- the actuator is observed in the real build and CI path and has an observable effect;
 - a successful correction is re-observed before release;
 - removing any loop link creates a blocked formalization orphan.
 

@@ -150,6 +150,55 @@ class DeclarationSensorTests(unittest.TestCase):
 
 
 class TopologyTests(unittest.TestCase):
+    def actuator_config(self) -> dict:
+        return {
+            "kind": "release_gate",
+            "on_violation": "block",
+            "remediation": "repair executable wiring",
+            "observation": {
+                "schema_version": 1,
+                "build_file": "control-plane/build.zig",
+                "build_step": "rule-check",
+                "workflow_file": ".github/workflows/cross-platform.yml",
+                "workflow_job": "rule-control",
+                "workflow_workdir": "metacodes",
+                "telemetry_path": "metacodes/zig-out/reports/rule-control.json",
+            },
+        }
+
+    def make_actuator_workspace(self) -> tuple[tempfile.TemporaryDirectory[str], Path, Path, dict]:
+        temporary = tempfile.TemporaryDirectory()
+        workspace = Path(temporary.name)
+        repo = workspace / "metacodes"
+        (workspace / ".git").mkdir()
+        (workspace / ".github/workflows").mkdir(parents=True)
+        (repo / "control-plane").mkdir(parents=True)
+        (repo / "control-plane/build.zig").write_text(
+            "const check = b.addSystemCommand(&.{ python, \"scripts/rule_control.py\", \"check\" });\n"
+            "const rule_step = b.step(\"rule-check\", \"closed loop\");\n"
+            "rule_step.dependOn(&check.step);\n",
+            encoding="utf-8",
+        )
+        (workspace / ".github/workflows/cross-platform.yml").write_text(
+            "defaults:\n"
+            "  run:\n"
+            "    working-directory: metacodes\n"
+            "jobs:\n"
+            "  rule-control:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - name: Run gate\n"
+            "        run: zig build --build-file control-plane/build.zig rule-check\n"
+            "      - name: Upload telemetry\n"
+            "        if: always()\n"
+            "        uses: actions/upload-artifact@v4\n"
+            "        with:\n"
+            "          path: metacodes/zig-out/reports/rule-control.json\n"
+            "          if-no-files-found: error\n",
+            encoding="utf-8",
+        )
+        return temporary, workspace, repo, self.actuator_config()
+
     def complete_rule(self) -> dict:
         return {
             "target": {"goal": "zero deviation", "setpoint": 0},
@@ -163,11 +212,7 @@ class TopologyTests(unittest.TestCase):
                 "kernel": "MetaCodesControl.ClosedLoop.signal",
                 "theorems": ["missing_evidence_blocks"],
             },
-            "actuator": {
-                "kind": "release_gate",
-                "on_violation": "block",
-                "remediation": "add evidence",
-            },
+            "actuator": self.actuator_config(),
             "feedback": {
                 "kind": "zig_l2_then_reobserve",
                 "reobserve": True,
@@ -179,12 +224,106 @@ class TopologyTests(unittest.TestCase):
     def test_missing_actuator_is_a_formalization_orphan(self) -> None:
         rule = self.complete_rule()
         del rule["actuator"]
-        topology, errors = rule_control.link_topology(rule, counterexamples_ok=True)
+        topology, errors = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=False,
+        )
         self.assertFalse(topology["actuator"])
         self.assertTrue(any("formalization orphan" in error for error in errors))
 
+    def test_release_gate_is_observed_from_build_ci_and_telemetry_wiring(self) -> None:
+        temporary, workspace, repo, actuator = self.make_actuator_workspace()
+        self.addCleanup(temporary.cleanup)
+        observation = rule_control.observe_release_gate(repo, workspace, actuator)
+        self.assertTrue(observation.sensor_ok, observation.errors)
+        self.assertTrue(observation.build_step_wired)
+        self.assertTrue(observation.workflow_command_wired)
+        self.assertTrue(observation.telemetry_upload_wired)
+        self.assertTrue(observation.telemetry_missing_fails)
+        self.assertEqual(2, len(observation.source_sha256))
+
+    def test_manifest_actuator_cannot_hide_a_disconnected_ci_gate(self) -> None:
+        temporary, workspace, repo, actuator = self.make_actuator_workspace()
+        self.addCleanup(temporary.cleanup)
+        workflow = workspace / ".github/workflows/cross-platform.yml"
+        workflow.write_text(
+            workflow.read_text(encoding="utf-8").replace(
+                "run: zig build --build-file control-plane/build.zig rule-check",
+                "run: zig build test",
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_release_gate(repo, workspace, actuator)
+        self.assertFalse(observation.sensor_ok)
+        self.assertFalse(observation.workflow_command_wired)
+        topology, errors = rule_control.link_topology(
+            self.complete_rule(),
+            counterexamples_ok=True,
+            actuator_observed=observation.sensor_ok,
+        )
+        self.assertFalse(topology["actuator"])
+        self.assertTrue(any("formalization orphan" in error for error in errors))
+
+    def test_release_gate_rejects_manifest_redirect_to_decoy_files(self) -> None:
+        temporary, workspace, repo, actuator = self.make_actuator_workspace()
+        self.addCleanup(temporary.cleanup)
+        actuator["observation"]["workflow_file"] = "decoy.yml"
+        observation = rule_control.observe_release_gate(repo, workspace, actuator)
+        self.assertFalse(observation.sensor_ok)
+        self.assertTrue(any("canonical value" in error for error in observation.errors))
+
+    def test_commented_build_wiring_is_not_an_observed_actuator(self) -> None:
+        temporary, workspace, repo, actuator = self.make_actuator_workspace()
+        self.addCleanup(temporary.cleanup)
+        build = repo / "control-plane/build.zig"
+        build.write_text(
+            "// const check = b.addSystemCommand(&.{ python, \"scripts/rule_control.py\", \"check\" });\n"
+            "// const rule_step = b.step(\"rule-check\", \"closed loop\");\n"
+            "// rule_step.dependOn(&check.step);\n",
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_release_gate(repo, workspace, actuator)
+        self.assertFalse(observation.sensor_ok)
+        self.assertFalse(observation.controller_command_wired)
+        self.assertFalse(observation.build_step_wired)
+
+    def test_missing_telemetry_must_fail_the_ci_job(self) -> None:
+        temporary, workspace, repo, actuator = self.make_actuator_workspace()
+        self.addCleanup(temporary.cleanup)
+        workflow = workspace / ".github/workflows/cross-platform.yml"
+        workflow.write_text(
+            workflow.read_text(encoding="utf-8").replace(
+                "if-no-files-found: error",
+                "if-no-files-found: ignore",
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_release_gate(repo, workspace, actuator)
+        self.assertFalse(observation.sensor_ok)
+        self.assertFalse(observation.telemetry_missing_fails)
+
+    def test_rule_control_label_outside_jobs_is_not_a_ci_actuator(self) -> None:
+        temporary, workspace, repo, actuator = self.make_actuator_workspace()
+        self.addCleanup(temporary.cleanup)
+        workflow = workspace / ".github/workflows/cross-platform.yml"
+        workflow.write_text(
+            workflow.read_text(encoding="utf-8").replace(
+                "jobs:\n  rule-control:",
+                "metadata:\n  rule-control:",
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_release_gate(repo, workspace, actuator)
+        self.assertFalse(observation.sensor_ok)
+        self.assertFalse(observation.workflow_job_wired)
+
     def test_counterexample_must_execute_successfully(self) -> None:
-        topology, errors = rule_control.link_topology(self.complete_rule(), counterexamples_ok=False)
+        topology, errors = rule_control.link_topology(
+            self.complete_rule(),
+            counterexamples_ok=False,
+            actuator_observed=True,
+        )
         self.assertFalse(topology["counterexample"])
         self.assertTrue(errors)
 
