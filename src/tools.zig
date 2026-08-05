@@ -390,6 +390,18 @@ pub const registry: []const ToolEntry = &.{
         .tinykg_gated = true,
     },
     .{
+        .name = "KgContext",
+        .description = kg_retrieval.CONTEXT_DESCRIPTION,
+        .input_schema = .{ .type = "object", .prop_specs = &.{
+            .{ .name = "node_id", .type = "integer", .description = "Candidate node_id returned by KgRecall or a prior KgContext graph." },
+            .{ .name = "limit", .type = "integer", .description = "Bounded neighboring-edge limit, 1-20 (default 12); the graph also includes the root node." },
+            .{ .name = "text_offset", .type = "integer", .description = "Byte offset for paging long authoritative node text (default 0; use next_text_offset)." },
+            .{ .name = "text_limit", .type = "integer", .description = "Maximum authoritative text bytes for this page, 4-12000 (default 6000; minimum fits one UTF-8 codepoint)." },
+        }, .required = &.{"node_id"} },
+        .execute = kg_tools.executeContext,
+        .tinykg_gated = true,
+    },
+    .{
         .name = "TaskCreate",
         .description = "Create a task in the in-session task list. Returns the new task id. Use for multi-step work you want to track across turns.",
         .describe_fn = descriptions.describeTaskCreate,

@@ -481,15 +481,19 @@ test "build produces non-empty prompt with MetaCode identity" {
     try testing.expect(std.mem.indexOf(u8, s, "# Environment") != null);
 }
 
-test "KG prompt enforces bounded lexical bridge only when KG is ready" {
+test "KG prompt enforces staged semantic neighborhood only when KG is ready" {
     const with_kg = try buildFull(testing.allocator, "claude-opus-4-7", null, null, null, "", true);
     defer testing.allocator.free(with_kg);
     try testing.expect(std.mem.indexOf(u8, with_kg, "computes no embeddings or vector distance") != null);
-    try testing.expect(std.mem.indexOf(u8, with_kg, "3-8 high-confidence lexical equivalents") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "2-4 separate compact semantic variants") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "make at most four semantic-variant calls") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "ALIAS BRANCH HAS PRIORITY") != null);
-    try testing.expect(std.mem.indexOf(u8, with_kg, "BROAD BRANCH ONLY IF NO ALIAS WAS EXPOSED") != null);
-    try testing.expect(std.mem.indexOf(u8, with_kg, "first explicit KgRecall always omits `type`") != null);
-    try testing.expect(std.mem.indexOf(u8, with_kg, "Total explicit KgRecall calls: at most two") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "EXACT/HIGH-PRECISION SEED") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "mechanism, symptom, desired outcome, or nearby implementation term") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "one plausible broader or narrower concept") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "Deduplicate candidates by node_id across every call") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "KgContext") != null);
+    try testing.expect(std.mem.indexOf(u8, with_kg, "Stop as soon as authoritative evidence is sufficient") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "Persistent task control-plane algorithm") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "A title or compact summary alone is insufficient") != null);
     try testing.expect(std.mem.indexOf(u8, with_kg, "never leave finished work claimed/open") != null);
@@ -498,6 +502,7 @@ test "KG prompt enforces bounded lexical bridge only when KG is ready" {
     defer testing.allocator.free(without_kg);
     try testing.expect(std.mem.indexOf(u8, without_kg, "computes no embeddings or vector distance") == null);
     try testing.expect(std.mem.indexOf(u8, without_kg, "ALIAS BRANCH HAS PRIORITY") == null);
+    try testing.expect(std.mem.indexOf(u8, without_kg, "KgContext") == null);
     try testing.expect(std.mem.indexOf(u8, without_kg, "Persistent task control-plane algorithm") == null);
 }
 

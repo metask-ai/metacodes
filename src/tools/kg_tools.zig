@@ -1,9 +1,10 @@
-//! KG 记忆工具:KgRemember / KgRecall(设计 v3-final §5)。
+//! KG 记忆工具:KgRemember / KgRecall / KgContext(设计 v3-final §5)。
 //!
 //! - KgRemember:写记忆节点(kind 白名单 + scope project/global + 近重复搭车提示
 //!   + provenance session_id)。免审但**必出可见工具卡**(注册处 resultRenderMode
 //!   禁 hidden——hidden 吞卡血泪)。
 //! - KgRecall:BM25 检索 + 客户端过滤(domain 当前项目+global;默认排除任务面)。
+//! - KgContext:候选节点权威正文分页 + 有界、版本化的本地图邻域，用于证据验证。
 //! - degraded:结构化说明返回(不 spawn、不硬错、不撞熔断器)。
 
 const std = @import("std");
@@ -202,6 +203,153 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     return out.toOwnedSlice(ctx.allocator);
 }
 
+const DEFAULT_CONTEXT_EDGES: usize = 12;
+const MAX_CONTEXT_EDGES: usize = 20;
+const DEFAULT_TEXT_BYTES: usize = 6000;
+const MAX_TEXT_BYTES: usize = 12000;
+const MAX_GRAPH_BYTES: usize = 64 * 1024;
+
+/// 读取一个候选节点的权威正文页 + 有界本地图邻域。检索与遍历分开：KgRecall 找种子，
+/// KgContext 验证种子和 evidence；不能让模型仅凭 BM25 摘要或边名下结论。
+pub fn executeContext(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
+    const kg = requireKg(ctx) orelse return degradedResult(ctx.allocator, null);
+    if (!kg.ready) return degradedResult(ctx.allocator, kg);
+    kg.setAbort(ctx.abort);
+
+    var parsed_args = std.json.parseFromSlice(std.json.Value, ctx.allocator, args, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext 参数必须是合法 JSON object", .{});
+            return error.InvalidArguments;
+        },
+    };
+    defer parsed_args.deinit();
+    if (parsed_args.value != .object) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext 参数必须是 JSON object", .{});
+        return error.InvalidArguments;
+    }
+    const obj = parsed_args.value.object;
+
+    const node_id = (try readU64Arg(ctx, obj, "node_id")) orelse {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext 缺少合法 node_id (>0)", .{});
+        return error.InvalidNodeId;
+    };
+    if (node_id == 0) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext node_id 必须大于 0", .{});
+        return error.InvalidNodeId;
+    }
+    const limit_u64 = (try readU64Arg(ctx, obj, "limit")) orelse DEFAULT_CONTEXT_EDGES;
+    if (limit_u64 < 1 or limit_u64 > MAX_CONTEXT_EDGES) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext limit 必须在 1..20", .{});
+        return error.InvalidLimit;
+    }
+    const limit = std.math.cast(usize, limit_u64) orelse return error.InvalidLimit;
+
+    const offset_raw = (try readU64Arg(ctx, obj, "text_offset")) orelse 0;
+    const requested_offset = std.math.cast(usize, offset_raw) orelse {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext text_offset 超出平台范围", .{});
+        return error.InvalidOffset;
+    };
+    const text_limit_u64 = (try readU64Arg(ctx, obj, "text_limit")) orelse DEFAULT_TEXT_BYTES;
+    if (text_limit_u64 < 4 or text_limit_u64 > MAX_TEXT_BYTES) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext text_limit 必须在 4..12000，确保 UTF-8 分页前进", .{});
+        return error.InvalidLimit;
+    }
+    const text_limit = std.math.cast(usize, text_limit_u64) orelse return error.InvalidLimit;
+
+    const text = kg.fetchNodeText(node_id) catch |e| return kgErrorResult(ctx, kg, e, "KgContext");
+    defer kg.allocator.free(text);
+    const graph_raw = kg.neighborsJson(node_id, limit) catch |e| return kgErrorResult(ctx, kg, e, "KgContext");
+    defer kg.allocator.free(graph_raw);
+    const graph = std.mem.trim(u8, graph_raw, " \t\r\n");
+    if (graph.len > MAX_GRAPH_BYTES) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext 图邻域超过 64KiB；请降低 limit 或选择更精确的节点", .{});
+        return error.ContextTooLarge;
+    }
+
+    // TinyKG 是外部版本化协议。不能把任意 stdout 嵌进工具 JSON；版本或 mode 漂移时
+    // fail closed，让 vendor pin 升级显式更新适配器与 L2。
+    var parsed = std.json.parseFromSlice(std.json.Value, ctx.allocator, graph, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext 收到无效 neighbors JSON", .{});
+            return error.InvalidGraphProtocol;
+        },
+    };
+    defer parsed.deinit();
+    const graph_node_count = validateNeighborGraph(parsed.value, node_id, limit) orelse {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext 不支持当前 neighbors 协议版本", .{});
+        return error.InvalidGraphProtocol;
+    };
+
+    const page = textPage(text, requested_offset, text_limit);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(ctx.allocator);
+    const head = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d},\"text\":", .{node_id});
+    defer ctx.allocator.free(head);
+    try out.appendSlice(ctx.allocator, head);
+    try appendJsonString(&out, ctx.allocator, text[page.start..page.end]);
+    const meta = try std.fmt.allocPrint(
+        ctx.allocator,
+        ",\"text_offset\":{d},\"text_returned_bytes\":{d},\"text_total_bytes\":{d},\"text_truncated\":{s},\"next_text_offset\":{d},\"graph_node_count\":{d},\"graph\":",
+        .{ page.start, page.end - page.start, text.len, if (page.end < text.len) "true" else "false", page.end, graph_node_count },
+    );
+    defer ctx.allocator.free(meta);
+    try out.appendSlice(ctx.allocator, meta);
+    try out.appendSlice(ctx.allocator, graph);
+    try out.appendSlice(ctx.allocator, ",\"verification_guidance\":");
+    try appendJsonString(&out, ctx.allocator, retrieval_protocol.CONTEXT_RESULT_GUIDANCE);
+    try out.appendSlice(ctx.allocator, "}");
+    return out.toOwnedSlice(ctx.allocator);
+}
+
+fn readU64Arg(ctx: *const ToolContext, obj: std.json.ObjectMap, name: []const u8) anyerror!?u64 {
+    const value = obj.get(name) orelse return null;
+    if (value != .integer or value.integer < 0) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext {s} 必须是非负整数", .{name});
+        return error.InvalidArguments;
+    }
+    return @intCast(value.integer);
+}
+
+const TextPage = struct { start: usize, end: usize };
+
+fn textPage(text: []const u8, requested_offset: usize, max_bytes: usize) TextPage {
+    var start = @min(requested_offset, text.len);
+    while (start > 0 and start < text.len and isUtf8Continuation(text[start])) start -= 1;
+    var end = @min(text.len, start +| max_bytes);
+    while (end > start and end < text.len and isUtf8Continuation(text[end])) end -= 1;
+    return .{ .start = start, .end = end };
+}
+
+fn isUtf8Continuation(byte: u8) bool {
+    return (byte & 0xC0) == 0x80;
+}
+
+fn jsonStringEquals(value: ?std.json.Value, expected: []const u8) bool {
+    const v = value orelse return false;
+    return v == .string and std.mem.eql(u8, v.string, expected);
+}
+
+fn validateNeighborGraph(value: std.json.Value, requested_node_id: u64, limit: usize) ?u64 {
+    if (value != .object or
+        !jsonStringEquals(value.object.get("schema_version"), "tinykg-agent-retrieval-v1") or
+        !jsonStringEquals(value.object.get("mode"), "neighbors")) return null;
+    const query = value.object.get("query") orelse return null;
+    if (query != .object) return null;
+    const root_id = query.object.get("root_id") orelse return null;
+    if (root_id != .integer or root_id.integer < 1 or @as(u64, @intCast(root_id.integer)) != requested_node_id) return null;
+    const summary = value.object.get("summary") orelse return null;
+    if (summary != .object) return null;
+    const count = summary.object.get("node_count") orelse return null;
+    if (count != .integer or count.integer < 1) return null;
+    const node_count: u64 = @intCast(count.integer);
+    // TinyKG `--limit N` bounds neighbor edges; the JSON node set may contain
+    // the root plus N adjacent nodes.
+    if (node_count > limit + 1) return null;
+    return node_count;
+}
+
 /// KgError → 工具层结果。data 错带 detail 引导模型改参;transient 报可重试。
 fn kgErrorResult(ctx: *const ToolContext, kg: *kg_mod.KgClient, e: kg_mod.KgError, tool: []const u8) anyerror![]u8 {
     switch (e) {
@@ -256,4 +404,25 @@ test "isNearDuplicate: 尺度无关文本重合判定(替代不可靠的 BM25 �
     // 空串 → 非 dup(不阻扰)。
     try testing.expect(!isNearDuplicate("", "x"));
     try testing.expect(!isNearDuplicate("x", ""));
+}
+
+test "textPage preserves UTF-8 boundaries and supports deterministic paging" {
+    const text = "ab中文cd";
+    const first = textPage(text, 0, 4); // would split 文 without boundary repair
+    try testing.expectEqualStrings("ab", text[first.start..first.end]);
+    const second = textPage(text, first.end, 6);
+    try testing.expectEqualStrings("中文", text[second.start..second.end]);
+    const inside_codepoint = textPage(text, 3, 6);
+    try testing.expectEqualStrings("中文", text[inside_codepoint.start..inside_codepoint.end]);
+}
+
+test "validateNeighborGraph binds version, root, and requested limit" {
+    const raw =
+        \\{"schema_version":"tinykg-agent-retrieval-v1","mode":"neighbors","query":{"root_id":42},"summary":{"node_count":6}}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, raw, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(?u64, 6), validateNeighborGraph(parsed.value, 42, 5));
+    try testing.expect(validateNeighborGraph(parsed.value, 41, 5) == null);
+    try testing.expect(validateNeighborGraph(parsed.value, 42, 4) == null);
 }

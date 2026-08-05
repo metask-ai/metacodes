@@ -163,10 +163,11 @@ test "L2 KG: scoped 自动召回 — 相关请求注入、无关请求不注入(
         try std.testing.expect(std.mem.indexOf(u8, inj.?, "子进程") != null);
         try std.testing.expect(std.mem.indexOf(u8, inj.?, "one untyped raw-message lexical BM25 probe") != null);
         try std.testing.expect(std.mem.indexOf(u8, inj.?, "exact canonical alias/symbol") != null);
-        try std.testing.expect(std.mem.indexOf(u8, inj.?, "U/H/P provenance check") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "exact/high-precision") != null);
         try std.testing.expect(std.mem.indexOf(u8, inj.?, "强制下一步 / MANDATORY NEXT ACTION") != null);
         try std.testing.expect(std.mem.indexOf(u8, inj.?, "只能包含该精确词和用户已要求的字段名") != null);
-        try std.testing.expect(std.mem.indexOf(u8, inj.?, "删除所有无法标记的词") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "2-4 个彼此分开的紧凑语义变体") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "机制、症状、期望结果、邻近实现") != null);
     }
     // 负向:零重合无关请求 → 不注入(相关性门挡答案缺席噪声;PM P0 逼可证伪的两侧测试)。
     {
@@ -424,7 +425,7 @@ test "L2 KG: lexical bridge and persistent task protocol enter the actual API re
     var client = cc.client_mod.Client.initWithBaseUrl(a, io, "test-key", "claude-sonnet-4-20250514", url);
     defer client.deinit();
 
-    const names = [_][]const u8{ "KgRemember", "KgRecall", "TaskList", "TaskGet", "TaskUpdate" };
+    const names = [_][]const u8{ "KgRemember", "KgRecall", "KgContext", "TaskList", "TaskGet", "TaskUpdate" };
     const system_prompt = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &names, "", true);
     defer a.free(system_prompt);
     // 生产 App 用 session arena 承载 defs + describe_fn 动态描述；测试保持同一生命周期，
@@ -454,11 +455,15 @@ test "L2 KG: lexical bridge and persistent task protocol enter the actual API re
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "computes no embeddings or vector distance") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "ALIAS BRANCH HAS PRIORITY") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "MUST contain only that exact term plus field names") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "BROAD BRANCH ONLY IF NO ALIAS WAS EXPOSED") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "first explicit KgRecall always omits `type`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Total explicit KgRecall calls: at most two") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "EXACT/HIGH-PRECISION SEED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "2-4 separate compact semantic variants") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "make at most four semantic-variant calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "mechanism, symptom, desired outcome, or nearby implementation term") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Deduplicate candidates by node_id across every call") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "KgContext") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Stop as soon as authoritative evidence is sufficient") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "FIRST inspect automatic recall") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "NEVER set this on the first explicit KgRecall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Omit on the exact/high-precision seed") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Persistent task control-plane algorithm") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "A successful claim returns a bounded") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "A title or compact summary alone is insufficient") != null);
@@ -468,6 +473,8 @@ test "L2 KG: lexical bridge and persistent task protocol enter the actual API re
     // 工具，请求体必须证明 KgRecall 直接可见而 ToolSearch 根本不被广告。
     const tools_field = cap.jsonField("tools") orelse return error.ToolsFieldMissing;
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"KgRecall\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"KgContext\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tools_field, "authoritative node text") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "bounded TinyKG task_packet") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "select only an open, ready, unclaimed leaf") != null);
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "successful response contains the bounded task_packet") != null);
@@ -475,7 +482,7 @@ test "L2 KG: lexical bridge and persistent task protocol enter the actual API re
     try std.testing.expect(std.mem.indexOf(u8, tools_field, "\"name\":\"ToolSearch\"") == null);
 }
 
-test "L2 KG: KgRecall result carries semantic filtering and one-follow-up guidance" {
+test "L2 KG: KgRecall result carries staged variants, dedup, and graph verification guidance" {
     const a = std.testing.allocator;
     const bin = findBin(a) orelse return error.SkipZigTest;
     defer a.free(bin);
@@ -501,10 +508,69 @@ test "L2 KG: KgRecall result carries semantic filtering and one-follow-up guidan
     try std.testing.expect(parsed.value == .object);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"retrieval_mode\":\"lexical_bm25_no_embeddings\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Semantically judge these lexical hits") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "at most one focused KgRecall") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "containing only the alias and user-requested fields") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "do not widen to related topics") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "type filter only if these untyped hits") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "deduplicate node_id values across calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "2-4 separate compact variants") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "KgContext") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "authoritative node text and connected evidence") != null);
+}
+
+test "L2 KG: KgContext pages authoritative text and returns a bounded versioned neighborhood" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const store = try std.fmt.allocPrint(a, "{s}/kg-context.kg", .{pbuf[0..dir_len]});
+    defer a.free(store);
+
+    var kg = try makeClient(a, bin, store, "proj-context");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const root_id = try kg.remember(.decision, "authoritative-policy=quartz-17; verify connected evidence", "decision", false);
+    const evidence_id = try kg.remember(.observation, "evidence: approved after concurrency replay", "observation", false);
+    try kg.addEdge(root_id, "derived_from", evidence_id);
+
+    const ctx = @import("cc").tool_context.ToolContext{ .allocator = a, .kg = &kg };
+    const args = try std.fmt.allocPrint(a, "{{\"node_id\":{d},\"limit\":5,\"text_offset\":0,\"text_limit\":16}}", .{root_id});
+    defer a.free(args);
+    const out = try @import("cc").kg_tools.executeContext(&ctx, args);
+    defer a.free(out);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, out, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, @intCast(root_id)), obj.get("node_id").?.integer);
+    try std.testing.expectEqualStrings("authoritative-po", obj.get("text").?.string);
+    try std.testing.expectEqual(@as(i64, 0), obj.get("text_offset").?.integer);
+    try std.testing.expectEqual(@as(i64, 16), obj.get("next_text_offset").?.integer);
+    try std.testing.expect(obj.get("text_truncated").?.bool);
+    const graph = obj.get("graph").?.object;
+    try std.testing.expectEqualStrings("tinykg-agent-retrieval-v1", graph.get("schema_version").?.string);
+    try std.testing.expectEqualStrings("neighbors", graph.get("mode").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"rel\":\"derived_from\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Inspect connected evidence nodes with KgContext") != null);
+
+    var detail: ?[]const u8 = null;
+    defer if (detail) |d| a.free(d);
+    const bad_ctx = @import("cc").tool_context.ToolContext{ .allocator = a, .kg = &kg, .error_detail = &detail };
+    try std.testing.expectError(error.InvalidLimit, @import("cc").kg_tools.executeContext(&bad_ctx, "{\"node_id\":1,\"limit\":21}"));
+    try std.testing.expect(detail != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.?, "1..20") != null);
+    a.free(detail.?);
+    detail = null;
+    try std.testing.expectError(error.InvalidLimit, @import("cc").kg_tools.executeContext(&bad_ctx, "{\"node_id\":1,\"limit\":0}"));
+    try std.testing.expect(detail != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.?, "1..20") != null);
+    a.free(detail.?);
+    detail = null;
+    try std.testing.expectError(error.InvalidLimit, @import("cc").kg_tools.executeContext(&bad_ctx, "{\"node_id\":1,\"text_limit\":1}"));
+    try std.testing.expect(detail != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.?, "4..12000") != null);
 }
 
 test "L2 KG: 版本门 — degraded 明示且不 spawn" {

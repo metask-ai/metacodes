@@ -72,7 +72,7 @@ test "L2: 无 context 回退短描述 + Monitor 恒静态" {
     try std.testing.expect(std.mem.indexOf(u8, monitor.description, "background monitor") != null);
 }
 
-test "L2: KgRecall schema carries the bounded lexical-bridge contract" {
+test "L2: KgRecall and KgContext schemas carry the staged semantic-neighborhood contract" {
     const kg_recall = cc.tools.getTool("KgRecall") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, kg_recall.description, "no embeddings and computes no vector distance") != null);
 
@@ -82,13 +82,15 @@ test "L2: KgRecall schema carries the bounded lexical-bridge contract" {
         if (std.mem.eql(u8, prop.name, "query")) query_description = prop.description;
     }
     const description = query_description orelse return error.TestUnexpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, description, "3-8 intent-preserving") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "exact/high-precision query") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "ONE compact semantic variant") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "2-4 separate variants") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "at most four variant calls") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "FIRST inspect automatic recall") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "MUST contain ONLY that exact term") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "label every term U") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "DELETE every unlabeled term") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "Topically related implementation guesses are not paraphrases") != null);
-    try std.testing.expect(std.mem.indexOf(u8, description, "At most TWO explicit calls total") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "mechanism/symptom/outcome/nearby implementation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "broader or narrower concept") != null);
+    try std.testing.expect(std.mem.indexOf(u8, description, "Do not combine all variants into one keyword bag") != null);
     try std.testing.expect(std.mem.indexOf(u8, description, "Extra keywords are safe") == null);
 
     var type_description: ?[]const u8 = null;
@@ -96,8 +98,24 @@ test "L2: KgRecall schema carries the bounded lexical-bridge contract" {
         if (std.mem.eql(u8, prop.name, "type")) type_description = prop.description;
     }
     const type_desc = type_description orelse return error.TestUnexpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, type_desc, "NEVER set this on the first explicit KgRecall") != null);
+    try std.testing.expect(std.mem.indexOf(u8, type_desc, "Omit on the exact/high-precision seed") != null);
     try std.testing.expect(std.mem.indexOf(u8, type_desc, "observation or module") != null);
+
+    const kg_context = cc.tools.getTool("KgContext") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, kg_context.description, "authoritative node text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, kg_context.description, "connected evidence") != null);
+    const context_props = kg_context.input_schema.prop_specs orelse return error.TestUnexpectedResult;
+    var saw_node_id = false;
+    var saw_limit = false;
+    var saw_offset = false;
+    var saw_text_limit = false;
+    for (context_props) |prop| {
+        if (std.mem.eql(u8, prop.name, "node_id")) saw_node_id = true;
+        if (std.mem.eql(u8, prop.name, "limit")) saw_limit = true;
+        if (std.mem.eql(u8, prop.name, "text_offset")) saw_offset = true;
+        if (std.mem.eql(u8, prop.name, "text_limit")) saw_text_limit = true;
+    }
+    try std.testing.expect(saw_node_id and saw_limit and saw_offset and saw_text_limit);
 }
 
 test "L2: ToolSearch tells the model to call visible KgRecall directly" {
@@ -160,6 +178,7 @@ test "L2: long-horizon arm gates TinyKG tools as one typed treatment" {
     }
     try std.testing.expect(findDef(baseline_defs, "KgRemember") == null);
     try std.testing.expect(findDef(baseline_defs, "KgRecall") == null);
+    try std.testing.expect(findDef(baseline_defs, "KgContext") == null);
     const baseline_create = findDef(baseline_defs, "TaskCreate") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, baseline_create.description, "in-session task list") != null);
     try std.testing.expect(std.mem.indexOf(u8, baseline_create.description, "TinyKG") == null);
@@ -197,6 +216,7 @@ test "L2: long-horizon arm gates TinyKG tools as one typed treatment" {
     }
     try std.testing.expect(findDef(tinykg_defs, "KgRemember") != null);
     try std.testing.expect(findDef(tinykg_defs, "KgRecall") != null);
+    try std.testing.expect(findDef(tinykg_defs, "KgContext") != null);
     const tinykg_create = findDef(tinykg_defs, "TaskCreate") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, tinykg_create.description, "persistent task in TinyKG") != null);
     const tinykg_get = findDef(tinykg_defs, "TaskGet") orelse return error.TestUnexpectedResult;

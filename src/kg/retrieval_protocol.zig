@@ -1,40 +1,46 @@
-//! TinyKG 无向量检索的模型侧 lexical bridge 协议。
+//! TinyKG 无向量检索的模型侧 semantic-neighborhood 协议。
 //!
-//! TinyKG 只负责确定性的 BM25/图检索；语义扩展与命中判读由 LLM 完成。把同一份
-//! 协议同时接到 system prompt、KgRecall schema、自动召回提醒和工具结果，避免某条
-//! agent 入口只看到一句弱提示后退化成裸 query。
+//! TinyKG 只负责确定性的 BM25/图检索；LLM 负责按意图生成少量分离的词法探针、
+//! 合并候选并验证节点/证据。协议同时接到 system prompt、工具 schema、自动召回提醒
+//! 和工具结果，避免不同 agent 入口退化成单条裸 query 或一个超大关键词袋。
 
-/// system prompt 中的强制协议。所谓“语义邻域”是模型判断，不暗示底层计算向量距离。
+/// system prompt 中的强制协议。“语义邻域”是模型主动推理，不暗示底层计算向量距离。
 pub const SYSTEM_RULES =
     \\Lexical retrieval algorithm (mandatory whenever KgRecall is warranted; follow in order):
-    \\- TinyKG uses lexical BM25 and computes no embeddings or vector distance. A lexical miss is not proof that the knowledge is absent.
-    \\- Step 1 — SCAN FIRST: inspect any automatically recalled memory lines before forming a query.
-    \\- Step 2A — ALIAS BRANCH HAS PRIORITY: if an automatic hit contains an exact canonical alias or code symbol, the first explicit query MUST contain only that exact term plus field names already requested by the user, and MUST omit `type`. Taking the broad branch instead, or adding terms not copied from the user or that hit, is a protocol violation.
-    \\- Step 2B — BROAD BRANCH ONLY IF NO ALIAS WAS EXPOSED: preserve the user's exact terms and add only 3-8 high-confidence lexical equivalents: synonyms, Chinese/English forms, aliases/acronyms, current/legacy names, or code identifiers. Every added term must be a direct substitute for a user term, not merely related to the topic.
-    \\- Step 2C — TOKEN PROVENANCE CHECK: before calling KgRecall, classify every query term as U (copied from the user), H (copied from a hit), or P (a direct paraphrase/translation of one U term). Delete every term that cannot receive exactly one of those labels. A term that proposes how the answer may work is related context, not a paraphrase, and must be deleted.
-    \\- Step 3 — JUDGE: assess hits semantically yourself; BM25 score is lexical evidence, not semantic correctness. A bridge may be an observation/module even when the final fact is a decision, so the first explicit KgRecall always omits `type`.
-    \\- Step 4 — ONE CALIBRATION MAX: after an untyped broad probe, make at most one focused follow-up using exact aliases/symbols learned from its hits; only then may `type` be used if a hit explicitly justifies the facet. Total explicit KgRecall calls: at most two. If Step 2A applied, make that one focused call and stop widening.
+    \\- TinyKG uses lexical BM25 and computes no embeddings or vector distance. A lexical miss is not proof that the knowledge is absent; BM25 hits are candidates, not facts.
+    \\- Step 1 — SCAN FIRST: inspect any automatically recalled memory lines before forming a query. Keep a set of seen node_id values for this retrieval episode.
+    \\- Step 2A — ALIAS BRANCH HAS PRIORITY: if an automatic hit contains an exact canonical alias or code symbol, the first explicit query MUST contain only that exact term plus field names already requested by the user, and MUST omit `type`. This focused alias lookup is the high-precision fast path; do not widen before reading it.
+    \\- Step 2B — EXACT/HIGH-PRECISION SEED: if no alias was exposed, first issue one compact, untyped KgRecall using the user's exact wording and discriminating field names. Do not mix speculative semantic variants into this seed.
+    \\- Step 3 — BOUNDED SEMANTIC NEIGHBORHOOD: only if the seed is insufficient, infer 2-4 separate compact semantic variants for this specific intent. Fix that list once; make at most four semantic-variant calls, and never regenerate another batch. Each KgRecall contains ONE variant, not a combined keyword bag. Choose useful dimensions rather than mechanically using all of them: (a) synonym/paraphrase; (b) Chinese/English form, abbreviation, old/new name, or code identifier; (c) mechanism, symptom, desired outcome, or nearby implementation term; (d) one plausible broader or narrower concept. Run variants in stages and reassess after each result.
+    \\- Step 4 — MERGE AND VERIFY: semantically judge hits. Deduplicate candidates by node_id across every call. Prefer exact aliases, authoritative nodes, and explicit evidence relations, but never treat score or wording overlap as correctness. Call KgContext on the best seed to read its authoritative node text and bounded graph neighborhood; inspect connected evidence nodes with KgContext when the conclusion depends on them.
+    \\- Step 5 — STOP OR REPORT UNCERTAINTY: Stop as soon as authoritative evidence is sufficient. If the bounded variants and graph inspection remain insufficient, say so; do not infer absence from lexical misses and do not invent a fact.
 ;
 
 pub const TOOL_DESCRIPTION =
     "Search the knowledge graph for durable memories (decisions, preferences, project facts) from this and past sessions. " ++
-    "Use when the user refers to prior decisions/context or when continuing cross-session work. Retrieval is LEXICAL BM25: TinyKG has no embeddings and computes no vector distance, so you must supply and judge the semantics using the mandatory bounded lexical-bridge protocol in the query field. " ++
-    "Hits carrying a \"source\" field come from a memory markdown file; update that file instead of KgRemembering a duplicate.";
+    "Use when the user refers to prior decisions/context or when continuing cross-session work. Retrieval is LEXICAL BM25: TinyKG has no embeddings and computes no vector distance. Start exact, then if needed issue 2-4 separate compact semantic variants and judge them yourself; never combine the whole neighborhood into one keyword bag. " ++
+    "Deduplicate node_id values across calls, then use KgContext to read authoritative node text and connected evidence. Hits carrying a \"source\" field come from a memory markdown file; update that file instead of KgRemembering a duplicate.";
 
 pub const QUERY_DESCRIPTION =
-    "Follow the lexical decision tree exactly. FIRST inspect automatic recall. If it exposed an exact canonical alias/code symbol, this query MUST contain ONLY that exact term plus user-requested field names; OMIT type and DO NOT add anything else. Use the broad branch only when automatic hits exposed no exact term: keep user terms and add only 3-8 intent-preserving equivalents (synonyms, Chinese/English forms, aliases/acronyms, current/legacy names, code identifiers). Before calling, label every term U (copied from user), H (copied from hit), or P (direct paraphrase/translation of one U term), and DELETE every unlabeled term. Topically related implementation guesses are not paraphrases. At most TWO explicit calls total; a second call must be focused on exact hit terms. A lexical miss does not prove absence.";
+    "FIRST inspect automatic recall. If it exposed an exact canonical alias/code symbol, this query MUST contain ONLY that exact term plus user-requested field names; OMIT type. Otherwise begin with one compact exact/high-precision query using user wording. If that is insufficient, fix a list of 2-4 separate variants once and put ONE compact semantic variant in each later call (at most four variant calls): a synonym/paraphrase; Chinese/English, abbreviation, old/new name, or code identifier; a mechanism/symptom/outcome/nearby implementation term; or one plausible broader or narrower concept. Choose only intent-relevant dimensions. Do not combine all variants into one keyword bag or regenerate another batch. Reassess after each call, deduplicate node_id values across calls, and stop when authoritative evidence is sufficient. A lexical miss does not prove absence.";
 
 pub const TYPE_DESCRIPTION =
-    "Optional facet filter: decision | user_preference | module | bug | observation. NEVER set this on the first explicit KgRecall. A bridge that names the final decision may itself be an observation or module, so filtering early can hide it. Use type only for the single allowed follow-up and only when an earlier untyped hit explicitly supports that facet; otherwise omit it.";
+    "Optional facet filter: decision | user_preference | module | bug | observation. Omit on the exact/high-precision seed because a bridge to the final decision may itself be an observation or module. Use only on a later focused call when an earlier untyped hit explicitly justifies the facet.";
 
-/// 自动召回用原始 user 文本，未经过 LLM 扩词；必须显式告诉模型它不是权威缺席判断。
+pub const CONTEXT_DESCRIPTION =
+    "Read one TinyKG candidate's authoritative node text and bounded local graph neighborhood. Use after KgRecall to verify the selected node and discover connected evidence/decision/context ids. Page long node text with text_offset/text_limit; call KgContext on important connected evidence nodes before relying on them. This is deterministic graph traversal, not semantic or vector search.";
+
+pub const CONTEXT_RESULT_GUIDANCE =
+    "Inspect connected evidence nodes with KgContext when they support the conclusion. Verify authoritative text, track node_id values already inspected, follow only relevant edges, and stop once evidence is sufficient; a graph edge alone does not prove the neighboring text is applicable.";
+
+/// 自动召回使用原始 user 文本，未经过 LLM 扩词；明确说明它不是权威缺席判断。
 pub const AUTO_RECALL_NOTE =
-    "This automatic recall was one untyped raw-message lexical BM25 probe (no LLM expansion, no embeddings). Treat absence or partial coverage as non-authoritative. If a hit exposes an exact canonical alias/symbol, use it directly in one focused untyped KgRecall with only user-requested field names. Otherwise the first explicit KgRecall must be an untyped bounded lexical bridge whose every term passes the U/H/P provenance check.";
+    "This automatic recall was one untyped raw-message lexical BM25 probe (no LLM expansion, no embeddings). Treat absence or partial coverage as non-authoritative. If a hit exposes an exact canonical alias/symbol, use it directly in one focused untyped KgRecall with only user-requested field names. Otherwise begin with one compact exact/high-precision query; only if it is insufficient should you try 2-4 separate compact semantic variants.";
 
-/// 放在自动命中之后：模型在决策点最后读到的必须是下一步，而不是让若干 hit 把前置规则冲淡。
+/// 放在自动命中之后：让模型在决策点最后读到下一步，而非被 hit 正文冲淡。
 pub const AUTO_RECALL_NEXT_ACTION =
-    "强制下一步 / MANDATORY NEXT ACTION: 先检查上面的命中。只要任一命中给出 canonical alias 或代码符号，下一次 KgRecall 就必须是无 type 的聚焦查询，且只能包含该精确词和用户已要求的字段名；不要添加任何其他词。仅当命中没有给出精确词时，才可做一次无 type 的受限扩词；逐词标记 U=用户原词、H=命中原词、P=某个 U 的直接同义改写/翻译，删除所有无法标记的词。";
+    "强制下一步 / MANDATORY NEXT ACTION: 先检查上面的命中。只要任一命中给出 canonical alias 或代码符号，下一次 KgRecall 就必须是无 type 的聚焦查询，且只能包含该精确词和用户已要求的字段名。否则先做一个精确/高精度查询；仅在不足时生成 2-4 个彼此分开的紧凑语义变体，按意图选近义改写、中英/缩写/旧名、机制、症状、期望结果、邻近实现或一个合理的上下位概念，每次只查一个变体。跨调用按 node_id 去重，随后用 KgContext 读取最佳节点及相连证据。";
 
-/// 每次 KgRecall 结果都携带的短提示：把“读命中后校准”放到决策时点，而非只靠远端 system prompt。
+/// 每次 KgRecall 结果都携带：把下一步决策放在使用时点，而非只依赖 system prompt。
 pub const RESULT_GUIDANCE =
-    "Semantically judge these lexical hits. Reuse exact aliases or symbols from them for at most one focused KgRecall containing only the alias and user-requested fields; do not widen to related topics. Use a type filter only if these untyped hits explicitly justify the facet.";
+    "Semantically judge these lexical hits and deduplicate node_id values across calls. If an exact alias was exposed, use one focused untyped KgRecall containing only that alias and requested fields. Otherwise, if evidence is still insufficient, issue 2-4 separate compact variants one at a time (paraphrase/alias, mechanism or symptom or outcome or nearby implementation, or one broader/narrower concept); never merge them into one keyword bag. Use KgContext on the best candidate to read authoritative node text and connected evidence. Stop when evidence is sufficient; lexical misses do not prove absence.";
