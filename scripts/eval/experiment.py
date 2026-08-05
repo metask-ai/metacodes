@@ -919,12 +919,28 @@ def build_dry_run_plan(
     tinykg_binary: Path,
     formal_kernel: Path,
     revision: str,
+    budget_used_cost_usd: float = 0.0,
+    budget_used_tokens: int = 0,
 ) -> Dict[str, Any]:
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise ValidationError(f"binary is not executable: {binary}")
     revision = revision.strip()
     if not revision:
         raise ValidationError("multi-arm revision must be non-empty")
+    if (
+        not math.isfinite(budget_used_cost_usd)
+        or budget_used_cost_usd < 0
+        or budget_used_tokens < 0
+    ):
+        raise ValidationError("budget usage offsets must be non-negative")
+    if (
+        budget_used_cost_usd >= float(experiment["budget"]["max_stage_cost_usd"])
+        or budget_used_tokens >= int(experiment["budget"]["max_stage_tokens"])
+        or budget_used_cost_usd
+        >= float(experiment["budget"]["max_aggregate_cost_usd"])
+        or budget_used_tokens >= int(experiment["budget"]["max_aggregate_tokens"])
+    ):
+        raise ValidationError("budget carryover reaches a frozen stage or aggregate cap")
     binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
     tinykg_identity = tinykg_binary_identity(tinykg_binary)
     formal_identity = formal_kernel_identity(formal_kernel)
@@ -980,6 +996,24 @@ def build_dry_run_plan(
         "arm_config_ids": config_ids,
         "rollout_count": len(rows),
         "paid_rollouts_enabled": experiment["budget"]["paid_rollouts_enabled"],
+        "budget_carryover": {
+            "stage_used_cost_usd": budget_used_cost_usd,
+            "stage_used_tokens": budget_used_tokens,
+            "stage_remaining_cost_usd": float(
+                experiment["budget"]["max_stage_cost_usd"]
+            )
+            - budget_used_cost_usd,
+            "stage_remaining_tokens": int(experiment["budget"]["max_stage_tokens"])
+            - budget_used_tokens,
+            "aggregate_remaining_cost_usd_before_promotion": float(
+                experiment["budget"]["max_aggregate_cost_usd"]
+            )
+            - budget_used_cost_usd,
+            "aggregate_remaining_tokens_before_promotion": int(
+                experiment["budget"]["max_aggregate_tokens"]
+            )
+            - budget_used_tokens,
+        },
         "promotion_receipt_required": experiment["promotion"]["requires_receipt"],
         "rows": rows,
     }

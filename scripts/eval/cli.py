@@ -188,6 +188,8 @@ def cmd_run_multi(args: argparse.Namespace) -> int:
             tinykg_binary=Path(args.tinykg_binary),
             formal_kernel=Path(args.formal_kernel),
             revision=args.revision,
+            budget_used_cost_usd=args.budget_used_cost_usd,
+            budget_used_tokens=args.budget_used_tokens,
         )
         _write_json(args.plan_output, plan)
         print(

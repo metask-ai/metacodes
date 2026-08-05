@@ -255,6 +255,8 @@ class LongHorizonExperimentTest(unittest.TestCase):
                     tinykg_binary=tinykg,
                     formal_kernel=formal,
                     revision="abc123",
+                    budget_used_cost_usd=1.25,
+                    budget_used_tokens=1234,
                 )
                 second = build_dry_run_plan(
                     self.experiment,
@@ -263,12 +265,18 @@ class LongHorizonExperimentTest(unittest.TestCase):
                     tinykg_binary=tinykg,
                     formal_kernel=formal,
                     revision="abc123",
+                    budget_used_cost_usd=1.25,
+                    budget_used_tokens=1234,
                 )
         self.assertEqual(first, second)
         self.assertEqual(first["rollout_count"], 18)
         self.assertEqual(first["execution_identity"]["revision"], "abc123")
         self.assertEqual(first["execution_identity"]["tinykg"], tinykg_identity)
         self.assertEqual(first["execution_identity"]["formal_kernel"], formal_identity)
+        self.assertEqual(first["budget_carryover"]["stage_used_cost_usd"], 1.25)
+        self.assertEqual(first["budget_carryover"]["stage_used_tokens"], 1234)
+        self.assertEqual(first["budget_carryover"]["stage_remaining_cost_usd"], 98.75)
+        self.assertEqual(first["budget_carryover"]["stage_remaining_tokens"], 2_998_766)
         self.assertEqual(len({row["harness_config_id"] for row in first["rows"]}), 3)
         for row in first["rows"]:
             self.assertEqual(
