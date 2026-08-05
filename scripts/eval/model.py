@@ -24,8 +24,10 @@ CHECK_TYPES = frozenset(
         "file_exists",
         "file_absent",
         "contains",
+        "contains_casefold",
         "contains_any",
         "not_contains",
+        "not_contains_casefold",
         "min_lines",
         "log_contains",
         "log_not_contains",
@@ -120,7 +122,14 @@ def _validate_check(check: Dict[str, Any], where: str) -> None:
     kind = _require(check, "type", str, where)
     if kind not in CHECK_TYPES:
         raise ValidationError(f"{where}.type: unsupported check {kind!r}")
-    if kind.startswith("file_") or kind in {"contains", "contains_any", "not_contains", "min_lines"}:
+    if kind.startswith("file_") or kind in {
+        "contains",
+        "contains_casefold",
+        "contains_any",
+        "not_contains",
+        "not_contains_casefold",
+        "min_lines",
+    }:
         path = _require(check, "path", str, where)
         try:
             safe_posix_relative_path(path, f"{where}.path")
@@ -128,7 +137,9 @@ def _validate_check(check: Dict[str, Any], where: str) -> None:
             raise ValidationError(f"{where}.path: must be a safe workspace-relative path")
     if kind in {
         "contains",
+        "contains_casefold",
         "not_contains",
+        "not_contains_casefold",
         "log_contains",
         "log_not_contains",
         "debug_log_contains",
@@ -443,6 +454,7 @@ def validate_rollout(data: Dict[str, Any], where: str = "rollout") -> None:
         "cache_read_tokens",
         "cache_write_tokens",
         "model_request_count",
+        "compact_request_count",
         "tool_calls",
         "tool_successes",
         "model_tool_errors",
@@ -461,6 +473,7 @@ def validate_rollout(data: Dict[str, Any], where: str = "rollout") -> None:
         "wall_time_ms",
         "model_header_latency_ms",
         "model_request_time_ms",
+        "compact_request_time_ms",
         "tool_time_ms",
         "tool_stage_time_ms",
         "tool_parallelism_factor",

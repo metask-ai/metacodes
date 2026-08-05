@@ -128,21 +128,23 @@ def _require_multi_budget(
     collected: Mapping[str, Sequence[Dict[str, Any]]],
     budget: Mapping[str, Any],
     *,
-    prior_cost_usd: float,
-    prior_tokens: int,
+    stage_prior_cost_usd: float,
+    stage_prior_tokens: int,
+    aggregate_prior_cost_usd: float,
+    aggregate_prior_tokens: int,
 ) -> None:
-    """Enforce both this stage's cap and the cross-stage aggregate cap."""
+    """Enforce stage and aggregate caps including earlier failed attempts."""
     _require_budget(
         collected,
-        used_cost_usd=0.0,
-        used_tokens=0,
+        used_cost_usd=stage_prior_cost_usd,
+        used_tokens=stage_prior_tokens,
         max_cumulative_cost_usd=float(budget["max_stage_cost_usd"]),
         max_cumulative_tokens=int(budget["max_stage_tokens"]),
     )
     _require_budget(
         collected,
-        used_cost_usd=prior_cost_usd,
-        used_tokens=prior_tokens,
+        used_cost_usd=aggregate_prior_cost_usd,
+        used_tokens=aggregate_prior_tokens,
         max_cumulative_cost_usd=float(budget["max_aggregate_cost_usd"]),
         max_cumulative_tokens=int(budget["max_aggregate_tokens"]),
     )
@@ -672,8 +674,13 @@ def run_multi_arm(
         raise ValidationError(
             "calibration execution must not receive promotion evidence"
         )
-    prior_cost_usd = budget_used_cost_usd + receipt_cost_usd
-    prior_tokens = budget_used_tokens + receipt_tokens
+    # CLI offsets represent paid work from earlier attempts of this same
+    # stage, even when a fresh output directory is used. They therefore count
+    # against both the stage cap and the experiment-wide aggregate cap.
+    stage_prior_cost_usd = budget_used_cost_usd
+    stage_prior_tokens = budget_used_tokens
+    aggregate_prior_cost_usd = budget_used_cost_usd + receipt_cost_usd
+    aggregate_prior_tokens = budget_used_tokens + receipt_tokens
     expected_tasks = {task["id"]: task for task in suite["tasks"]}
     config_ids = arm_config_ids(
         experiment,
@@ -707,8 +714,10 @@ def run_multi_arm(
     _require_multi_budget(
         collected,
         budget,
-        prior_cost_usd=prior_cost_usd,
-        prior_tokens=prior_tokens,
+        stage_prior_cost_usd=stage_prior_cost_usd,
+        stage_prior_tokens=stage_prior_tokens,
+        aggregate_prior_cost_usd=aggregate_prior_cost_usd,
+        aggregate_prior_tokens=aggregate_prior_tokens,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     for trial, arm_id in counterbalanced_schedule(ARM_IDS, experiment["trials"]):
@@ -718,8 +727,10 @@ def run_multi_arm(
             _require_multi_budget(
                 collected,
                 budget,
-                prior_cost_usd=prior_cost_usd,
-                prior_tokens=prior_tokens,
+                stage_prior_cost_usd=stage_prior_cost_usd,
+                stage_prior_tokens=stage_prior_tokens,
+                aggregate_prior_cost_usd=aggregate_prior_cost_usd,
+                aggregate_prior_tokens=aggregate_prior_tokens,
             )
             _require_sha256(binary, metacodes_sha256, "metacodes binary")
             _require_sha256(
@@ -820,7 +831,9 @@ def run_multi_arm(
             _require_multi_budget(
                 collected,
                 budget,
-                prior_cost_usd=prior_cost_usd,
-                prior_tokens=prior_tokens,
+                stage_prior_cost_usd=stage_prior_cost_usd,
+                stage_prior_tokens=stage_prior_tokens,
+                aggregate_prior_cost_usd=aggregate_prior_cost_usd,
+                aggregate_prior_tokens=aggregate_prior_tokens,
             )
     return collected

@@ -10,6 +10,7 @@ from scripts.eval.model import ValidationError
 from scripts.eval.paired_runner import (
     InfrastructureRunError,
     _require_budget,
+    _require_multi_budget,
     _run_once,
     alternating_schedule,
     run_paired,
@@ -18,6 +19,32 @@ from scripts.eval.paired_runner import (
 
 
 class PairedRunnerTest(unittest.TestCase):
+    def test_multi_arm_budget_offsets_count_against_stage_and_aggregate_caps(self):
+        budget = {
+            "max_stage_cost_usd": 1.0,
+            "max_stage_tokens": 100,
+            "max_aggregate_cost_usd": 10.0,
+            "max_aggregate_tokens": 1000,
+        }
+        with self.assertRaisesRegex(ValidationError, "cost budget reached"):
+            _require_multi_budget(
+                {"arm": []},
+                budget,
+                stage_prior_cost_usd=1.0,
+                stage_prior_tokens=0,
+                aggregate_prior_cost_usd=1.0,
+                aggregate_prior_tokens=0,
+            )
+        with self.assertRaisesRegex(ValidationError, "token budget reached"):
+            _require_multi_budget(
+                {"arm": []},
+                budget,
+                stage_prior_cost_usd=0.0,
+                stage_prior_tokens=100,
+                aggregate_prior_cost_usd=0.0,
+                aggregate_prior_tokens=100,
+            )
+
     def test_cumulative_budget_counts_offsets_and_all_token_classes(self):
         collected = {
             "baseline": [

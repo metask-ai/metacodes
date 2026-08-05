@@ -87,8 +87,10 @@ BLIND_WORKSPACE_CHECKS = frozenset(
         "file_exists",
         "file_absent",
         "contains",
+        "contains_casefold",
         "contains_any",
         "not_contains",
+        "not_contains_casefold",
         "min_lines",
         "validator",
     }

@@ -598,6 +598,9 @@ def _trace_metrics(debug_log: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]
         "model_request_time_ms": None,
         "model_request_count": None,
         "model_request_outcomes": None,
+        "compact_request_count": None,
+        "compact_request_time_ms": None,
+        "compact_request_outcomes": None,
         "tool_time_ms": sum(duration for _name, duration in tool_done)
         + sum(duration for _name, _error, duration in failures),
         "tool_stage_time_ms": None,
@@ -836,6 +839,21 @@ def _evaluate_check(
         contains = target_text is not None and needle in target_text
         passed = contains if kind == "contains" else target_text is not None and not contains
         detail = f"{check['path']} {'contains' if contains else 'does not contain'} {needle!r}"
+    elif kind in {"contains_casefold", "not_contains_casefold"}:
+        needle = check["text"]
+        contains = (
+            target_text is not None
+            and needle.casefold() in target_text.casefold()
+        )
+        passed = (
+            contains
+            if kind == "contains_casefold"
+            else target_text is not None and not contains
+        )
+        detail = (
+            f"{check['path']} "
+            f"{'contains' if contains else 'does not contain'} {needle!r} (casefold)"
+        )
     elif kind == "contains_any":
         haystack = target_text.lower() if target_text is not None else ""
         matched = [needle for needle in check["texts"] if needle.lower() in haystack]
@@ -1091,7 +1109,10 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
     text, artifact_error = _read_regular_text_capped(path, MAX_NATIVE_EVENT_BYTES)
     if artifact_error is not None or text is None:
         return None, artifact_error
+    if text and not text.endswith("\n"):
+        return None, "native event artifact ends with a partial line"
     events: List[Tuple[str, Dict[str, Any], int, str]] = []
+    event_elapsed_ns: List[int] = []
     try:
         for line_no, line in enumerate(text.splitlines(), 1):
             if not line.strip():
@@ -1108,6 +1129,7 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
                 "turn_started",
                 "turn_finished",
                 "model_request_finished",
+                "compact_request_finished",
                 "tool_stage_finished",
                 "tool_started",
                 "tool_finished",
@@ -1132,7 +1154,15 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
                 raise ValueError(f"line {line_no}: invalid sequence")
             if not isinstance(session_id, str) or not session_id:
                 raise ValueError(f"line {line_no}: invalid session_id")
+            monotonic_elapsed_ns = envelope.get("monotonic_elapsed_ns")
+            if (
+                not isinstance(monotonic_elapsed_ns, int)
+                or isinstance(monotonic_elapsed_ns, bool)
+                or monotonic_elapsed_ns < 0
+            ):
+                raise ValueError(f"line {line_no}: invalid monotonic_elapsed_ns")
             events.append((kind, payload, sequence, session_id))
+            event_elapsed_ns.append(monotonic_elapsed_ns)
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         return None, str(exc)
     if not events:
@@ -1208,6 +1238,7 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
             "turn_started": ("depth", "turn"),
             "turn_finished": ("depth", "turn", "tool_calls"),
             "model_request_finished": ("depth", "turn", "attempt", "elapsed_ms"),
+            "compact_request_finished": ("depth", "turn", "elapsed_ms"),
             "tool_stage_finished": ("depth", "turn", "tool_calls", "elapsed_ms"),
             "tool_started": ("input_bytes",),
             "tool_finished": ("elapsed_ms", "result_bytes"),
@@ -1244,10 +1275,14 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
                 return None, "policy_decision has invalid allowed"
             if not isinstance(payload.get("id"), str) or not payload.get("id"):
                 return None, "policy_decision has invalid id"
-        if kind == "model_request_finished" and not isinstance(
+        if kind in {"model_request_finished", "compact_request_finished"} and not isinstance(
             payload.get("outcome"), str
         ):
-            return None, "model_request_finished has invalid outcome"
+            return None, f"{kind} has invalid outcome"
+        if kind == "compact_request_finished" and (
+            not isinstance(payload.get("cause"), str) or not payload.get("cause")
+        ):
+            return None, "compact_request_finished has invalid cause"
         if kind == "run_finished" and (
             not isinstance(payload.get("stop_reason"), str)
             or not payload.get("stop_reason")
@@ -1268,6 +1303,8 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
     stop_reasons: List[str] = []
     dropped_events_total = 0
     dropped_events_max = 0
+    incomplete_trace_ids: set[str] = set()
+    last_trace_id = str(events[-1][1].get("trace_id", ""))
     for trace_id, trace in trace_events.items():
         sequences = [event[2] for event in trace]
         if sequences != list(range(len(sequences))):
@@ -1277,23 +1314,36 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
             structural_errors.append(f"trace {trace_id}: session_id changed")
         trace_starts = [payload for kind, payload, _seq, _session in trace if kind == "run_started"]
         trace_finishes = [payload for kind, payload, _seq, _session in trace if kind == "run_finished"]
-        if len(trace_starts) != 1 or len(trace_finishes) != 1:
+        if len(trace_starts) != 1:
             structural_errors.append(
-                f"trace {trace_id}: expected one run_started and one run_finished"
+                f"trace {trace_id}: expected one run_started"
             )
             continue
-        if trace[0][0] != "run_started" or trace[-1][0] != "run_finished":
+        incomplete = len(trace_finishes) == 0 and trace_id == last_trace_id
+        if incomplete:
+            incomplete_trace_ids.add(trace_id)
+        elif len(trace_finishes) != 1:
+            structural_errors.append(
+                f"trace {trace_id}: expected one run_finished"
+            )
+            continue
+        if trace[0][0] != "run_started" or (not incomplete and trace[-1][0] != "run_finished"):
             structural_errors.append(
                 f"trace {trace_id}: run lifecycle does not bound the trace"
             )
-        reason = str(trace_finishes[0].get("stop_reason", "unknown"))
+        reason = (
+            "incomplete"
+            if incomplete
+            else str(trace_finishes[0].get("stop_reason", "unknown"))
+        )
         stop_reasons.append(reason)
-        dropped = trace_finishes[0].get("dropped_events")
-        if not isinstance(dropped, int) or dropped < 0:
-            structural_errors.append(f"trace {trace_id}: invalid dropped_events")
-        else:
-            dropped_events_total += dropped
-            dropped_events_max = max(dropped_events_max, dropped)
+        if not incomplete:
+            dropped = trace_finishes[0].get("dropped_events")
+            if not isinstance(dropped, int) or dropped < 0:
+                structural_errors.append(f"trace {trace_id}: invalid dropped_events")
+            else:
+                dropped_events_total += dropped
+                dropped_events_max = max(dropped_events_max, dropped)
 
         started_tools: Dict[Tuple[str, str], Tuple[str, int]] = {}
         finished_tools: Dict[
@@ -1314,7 +1364,7 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
                 started_tools[key] = (name, sequence)
             else:
                 finished_tools[key] = (name, sequence, payload)
-        if set(started_tools) != set(finished_tools):
+        if not incomplete and set(started_tools) != set(finished_tools):
             structural_errors.append(f"trace {trace_id}: unpaired tool lifecycle")
         for key in set(started_tools) & set(finished_tools):
             started_name, started_sequence = started_tools[key]
@@ -1366,6 +1416,12 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
     model_requests = [
         payload for kind, payload, _seq, _session in events if kind == "model_request_finished"
     ]
+    compact_requests = [
+        payload
+        for kind, payload, _seq, _session in events
+        if kind == "compact_request_finished"
+    ]
+    all_model_requests = model_requests + compact_requests
     tool_stages = [
         payload for kind, payload, _seq, _session in events if kind == "tool_stage_finished"
     ]
@@ -1391,10 +1447,12 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
     policy_violations = _count_policy_violations(tool_starts, policies)
     model_request_outcomes = {
         outcome: sum(
-            1 for item in model_requests if str(item.get("outcome", "unknown")) == outcome
+            1
+            for item in all_model_requests
+            if str(item.get("outcome", "unknown")) == outcome
         )
         for outcome in sorted(
-            {str(item.get("outcome", "unknown")) for item in model_requests}
+            {str(item.get("outcome", "unknown")) for item in all_model_requests}
         )
     }
     failed_model_requests = sum(
@@ -1405,13 +1463,38 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
         for outcome, count in model_request_outcomes.items()
         if outcome in {"api_error", "stream_error"}
     )
-    complete = True
-    wall_time_ms = sum(int(item.get("wall_time_ms", 0)) for item in finishes)
+    complete = not incomplete_trace_ids
+    partial_wall_time_ms = sum(
+        max(
+            (
+                elapsed_ns
+                for event, elapsed_ns in zip(events, event_elapsed_ns)
+                if event[1].get("trace_id") == trace_id
+            ),
+            default=0,
+        )
+        // 1_000_000
+        for trace_id in incomplete_trace_ids
+    )
+    wall_time_ms = (
+        sum(int(item.get("wall_time_ms", 0)) for item in finishes)
+        + partial_wall_time_ms
+    )
     model_request_time_ms = (
-        sum(int(item.get("elapsed_ms", 0)) for item in model_requests)
-        if model_requests
+        sum(int(item.get("elapsed_ms", 0)) for item in all_model_requests)
+        if all_model_requests
         else None
     )
+    compact_request_outcomes = {
+        outcome: sum(
+            1
+            for item in compact_requests
+            if str(item.get("outcome", "unknown")) == outcome
+        )
+        for outcome in sorted(
+            {str(item.get("outcome", "unknown")) for item in compact_requests}
+        )
+    }
     total_tool_calls = sum(int(item.get("tool_calls", 0)) for item in finishes)
     tool_stage_time_ms = (
         sum(int(item.get("elapsed_ms", 0)) for item in tool_stages)
@@ -1446,8 +1529,13 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
         "wall_time_ms": wall_time_ms,
         "model_header_latency_ms": None,
         "model_request_time_ms": model_request_time_ms,
-        "model_request_count": len(model_requests) if model_requests else None,
-        "model_request_outcomes": model_request_outcomes if model_requests else None,
+        "model_request_count": len(all_model_requests) if all_model_requests else None,
+        "model_request_outcomes": model_request_outcomes if all_model_requests else None,
+        "compact_request_count": len(compact_requests),
+        "compact_request_time_ms": sum(
+            int(item.get("elapsed_ms", 0)) for item in compact_requests
+        ),
+        "compact_request_outcomes": compact_request_outcomes,
         "tool_time_ms": tool_time_ms,
         "tool_stage_time_ms": tool_stage_time_ms,
         "tool_parallelism_factor": tool_parallelism_factor,

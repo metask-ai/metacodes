@@ -792,8 +792,18 @@ def parser() -> argparse.ArgumentParser:
         "--calibration-dir",
         help="authoritative calibration directory containing the three JSONL checkpoints",
     )
-    multi_parser.add_argument("--budget-used-cost-usd", type=float, default=0.0)
-    multi_parser.add_argument("--budget-used-tokens", type=int, default=0)
+    multi_parser.add_argument(
+        "--budget-used-cost-usd",
+        type=float,
+        default=0.0,
+        help="paid cost from earlier attempts of this same stage; counts against stage and aggregate caps",
+    )
+    multi_parser.add_argument(
+        "--budget-used-tokens",
+        type=int,
+        default=0,
+        help="metered tokens from earlier attempts of this same stage; counts against stage and aggregate caps",
+    )
     multi_parser.set_defaults(func=cmd_run_multi)
 
     compare_parser = commands.add_parser(

@@ -261,6 +261,9 @@ pub const CoreEvent = union(enum) {
     diag_turn_end: struct { trace_id: [12]u8, depth: u8, turn: u32, tool_calls: u32 },
     /// 评估:一次 provider 请求（含建连重试与完整 stream 消费）的阻塞墙钟。
     diag_model_request: struct { trace_id: [12]u8, depth: u8, turn: u32, attempt: u32, elapsed_ms: u64, outcome: []const u8 },
+    /// 评估:一次真实 compact-summary provider 请求。仅在跨过 provider
+    /// 边界后发出；纯本地 optimistic preview 不产生该事件。
+    diag_compact_request: struct { trace_id: [12]u8, depth: u8, turn: u32, elapsed_ms: u64, outcome: []const u8, cause: []const u8 },
     /// 评估:模型 stream 完成后，本轮权限/Hook/工具执行关键路径的墙钟。
     /// 与 model request 串行，因此两者可从 run wall time 中相减得到 harness residual。
     diag_tool_stage: struct { trace_id: [12]u8, depth: u8, turn: u32, tool_calls: u32, elapsed_ms: u64 },

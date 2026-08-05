@@ -169,9 +169,18 @@ pub const RuntimeConfig = struct {
         return self.parsed.value.events_path;
     }
 
-    pub fn appendEvaluation(self: *const RuntimeConfig, evaluation: *const EvaluationBackend) !void {
+    pub fn appendEvaluation(self: *const RuntimeConfig, evaluation: *EvaluationBackend) !void {
         const fd = self.events_fd orelse return error.MissingEvaluationArtifactFd;
         try evaluation.appendToFd(fd);
+    }
+
+    pub fn initEvaluation(
+        self: *const RuntimeConfig,
+        allocator: std.mem.Allocator,
+        metadata: RunMetadata,
+    ) !EvaluationBackend {
+        const fd = self.events_fd orelse return error.MissingEvaluationArtifactFd;
+        return EvaluationBackend.initStreaming(allocator, metadata, fd);
     }
 };
 
@@ -182,6 +191,7 @@ pub const EvalEvent = union(enum) {
     turn_started: struct { trace_id: []const u8, depth: u8, turn: u32 },
     turn_finished: struct { trace_id: []const u8, depth: u8, turn: u32, tool_calls: u32 },
     model_request_finished: struct { trace_id: []const u8, depth: u8, turn: u32, attempt: u32, elapsed_ms: u64, outcome: []const u8 },
+    compact_request_finished: struct { trace_id: []const u8, depth: u8, turn: u32, elapsed_ms: u64, outcome: []const u8, cause: []const u8 },
     tool_stage_finished: struct { trace_id: []const u8, depth: u8, turn: u32, tool_calls: u32, elapsed_ms: u64 },
     tool_started: struct {
         trace_id: []const u8,
@@ -261,6 +271,8 @@ pub const EvaluationBackend = struct {
     has_trace_id: bool = false,
     run_started: bool = false,
     dropped_events: u64 = 0,
+    sink_fd: ?pfs.Fd = null,
+    flushed_len: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, metadata: RunMetadata) EvaluationBackend {
         return .{
@@ -268,6 +280,16 @@ pub const EvaluationBackend = struct {
             .metadata = metadata,
             .started_ns = util_time.nowNs(),
         };
+    }
+
+    pub fn initStreaming(
+        allocator: std.mem.Allocator,
+        metadata: RunMetadata,
+        sink_fd: pfs.Fd,
+    ) EvaluationBackend {
+        var out = init(allocator, metadata);
+        out.sink_fd = sink_fd;
+        return out;
     }
 
     pub fn deinit(self: *EvaluationBackend) void {
@@ -284,7 +306,7 @@ pub const EvaluationBackend = struct {
 
     /// Append this run to a caller-owned artifact. The parent directory must
     /// already exist; M2 owns E2E artifact layout and readiness checks.
-    pub fn appendToPath(self: *const EvaluationBackend, path: []const u8) !void {
+    pub fn appendToPath(self: *EvaluationBackend, path: []const u8) !void {
         var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
         if (path.len + 1 > path_buf.len) return error.PathTooLong;
         @memcpy(path_buf[0..path.len], path);
@@ -299,17 +321,25 @@ pub const EvaluationBackend = struct {
         try self.appendToFd(fd);
     }
 
-    pub fn appendToFd(self: *const EvaluationBackend, fd: pfs.Fd) !void {
+    pub fn appendToFd(self: *EvaluationBackend, fd: pfs.Fd) !void {
         const info = pfs.fileInfo(fd) catch return error.StatFailed;
         if (!info.is_regular) return error.NotRegularFile;
+        const same_sink = self.sink_fd != null and self.sink_fd.? == fd;
+        const start = if (same_sink) self.flushed_len else 0;
+        if (start > self.lines.items.len) return error.InvalidFlushOffset;
+        const pending = self.lines.items[start..];
         if (info.size > MAX_ARTIFACT_BYTES or
-            self.lines.items.len > MAX_ARTIFACT_BYTES - @as(usize, @intCast(info.size)))
+            pending.len > MAX_ARTIFACT_BYTES - @as(usize, @intCast(info.size)))
             return error.ArtifactTooLarge;
         var offset: usize = 0;
-        while (offset < self.lines.items.len) {
-            const n = pfs.write(fd, self.lines.items[offset..]);
+        while (offset < pending.len) {
+            const n = pfs.write(fd, pending[offset..]);
             if (n <= 0) return error.WriteFailed;
             offset += @intCast(n);
+            // A regular-file write may legally be short. Advance the durable
+            // prefix after every successful fragment so retry cannot append
+            // duplicate bytes and corrupt the NDJSON stream.
+            if (same_sink) self.flushed_len = start + offset;
         }
     }
 
@@ -349,6 +379,18 @@ pub const EvaluationBackend = struct {
                     .attempt = d.attempt,
                     .elapsed_ms = d.elapsed_ms,
                     .outcome = d.outcome,
+                } });
+            },
+            .diag_compact_request => |d| {
+                self.setTrace(d.trace_id);
+                self.ensureRunStarted(session);
+                self.append(session, .{ .compact_request_finished = .{
+                    .trace_id = self.traceSlice(),
+                    .depth = d.depth,
+                    .turn = d.turn,
+                    .elapsed_ms = d.elapsed_ms,
+                    .outcome = d.outcome,
+                    .cause = d.cause,
                 } });
             },
             .diag_tool_stage => |d| {
@@ -528,6 +570,15 @@ pub const EvaluationBackend = struct {
         self.lines.appendSliceAssumeCapacity(line);
         self.lines.appendAssumeCapacity('\n');
         self.sequence += 1;
+        if (self.sink_fd) |fd| {
+            self.appendToFd(fd) catch |err| {
+                // Keep the complete record buffered so the next event or the
+                // normal invocation teardown can retry. A hard-killed process
+                // may lose only the still-pending suffix; the reader rejects a
+                // partial final line fail-closed.
+                log.warn("eval", "incremental evaluation event flush failed: {s}", .{@errorName(err)});
+            };
+        }
     }
 };
 
@@ -590,6 +641,7 @@ test "EvaluationBackend projects versioned redacted events" {
     const tid: [12]u8 = "abcd00010000".*;
     be.emit(be.ctx, .single, .{ .diag_turn_begin = .{ .trace_id = tid, .depth = 0, .turn = 1 } });
     be.emit(be.ctx, .single, .{ .diag_model_request = .{ .trace_id = tid, .depth = 0, .turn = 1, .attempt = 0, .elapsed_ms = 23, .outcome = "success" } });
+    be.emit(be.ctx, .single, .{ .diag_compact_request = .{ .trace_id = tid, .depth = 0, .turn = 1, .elapsed_ms = 17, .outcome = "success", .cause = "threshold" } });
     be.emit(be.ctx, .single, .{ .tool_start = .{ .id = "tu-1", .name = "Write", .input = "{\"secret\":\"do-not-store\"}" } });
     be.emit(be.ctx, .single, .{ .tool_result = .{
         .id = "tu-1",
@@ -618,6 +670,7 @@ test "EvaluationBackend projects versioned redacted events" {
     try std.testing.expect(std.mem.indexOf(u8, out, "tool_started") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "tool_finished") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "model_request_finished") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "compact_request_finished") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "tool_stage_finished") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "invalid_args") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"error_category\":\"user_error\"") != null);
@@ -627,7 +680,7 @@ test "EvaluationBackend projects versioned redacted events" {
     try std.testing.expect(std.mem.indexOf(u8, out, "run_finished") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "do-not-store") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "private") == null);
-    try std.testing.expectEqual(@as(u64, 9), eval.sequence);
+    try std.testing.expectEqual(@as(u64, 10), eval.sequence);
 }
 
 test "RuntimeConfig loads frozen identities and records runtime identity" {
@@ -702,4 +755,50 @@ test "EvaluationBackend appends complete NDJSON runs to a private artifact" {
         line_count += 1;
     }
     try std.testing.expectEqual(eval.sequence * 2, line_count);
+}
+
+test "streaming EvaluationBackend flushes complete events before invocation teardown" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    const path = try std.fmt.allocPrint(a, "{s}/streaming.jsonl", .{root_buf[0..root_len]});
+    defer a.free(path);
+    const path_z = try a.dupeZ(u8, path);
+    defer a.free(path_z);
+    const fd = pfs.open(
+        path_z.ptr,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .NOFOLLOW = true },
+        @as(std.c.mode_t, 0o600),
+    );
+    if (fd < 0) return error.OpenFailed;
+    defer _ = pfs.close(fd);
+
+    var eval = EvaluationBackend.initStreaming(a, .{ .run_id = "streaming-run" }, fd);
+    defer eval.deinit();
+    const be = eval.backend();
+    const tid: [12]u8 = "stream000001".*;
+    be.emit(be.ctx, .single, .{ .diag_turn_begin = .{ .trace_id = tid, .depth = 0, .turn = 1 } });
+
+    const live_info = pfs.fileInfo(fd) catch return error.StatFailed;
+    try std.testing.expect(live_info.size > 0);
+    const read_fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, @as(std.c.mode_t, 0));
+    if (read_fd < 0) return error.OpenFailed;
+    defer _ = pfs.close(read_fd);
+    const live = try readFdAlloc(a, read_fd, 1024 * 1024);
+    defer a.free(live);
+    try std.testing.expect(std.mem.endsWith(u8, live, "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, live, "run_started") != null);
+    try std.testing.expect(std.mem.indexOf(u8, live, "turn_started") != null);
+
+    const before_final = live_info.size;
+    be.emit(be.ctx, .single, .{ .diag_run_end = .{ .trace_id = tid, .depth = 0, .turns = 1, .tool_calls = 0, .stop_reason_name = "end_turn" } });
+    const final_info = pfs.fileInfo(fd) catch return error.StatFailed;
+    try std.testing.expect(final_info.size > before_final);
+    try std.testing.expectEqual(eval.jsonl().len, eval.flushed_len);
+    try eval.appendToFd(fd);
+    const teardown_info = pfs.fileInfo(fd) catch return error.StatFailed;
+    try std.testing.expectEqual(final_info.size, teardown_info.size);
 }

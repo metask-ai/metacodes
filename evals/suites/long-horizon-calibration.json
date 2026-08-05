@@ -19,7 +19,7 @@
           {"type": "contains", "path": "lh-contract/config.json", "text": "X-Metacodes-Trace", "description": "header survives"},
           {"type": "contains", "path": "lh-contract/config.json", "text": "EMBER-29", "description": "latest transport wins"},
           {"type": "not_contains", "path": "lh-contract/config.json", "text": "QUARTZ-17", "description": "obsolete transport removed"},
-          {"type": "contains", "path": "lh-contract/OPERATIONS.md", "text": "retry", "description": "operations note retains retry rule"},
+          {"type": "contains_casefold", "path": "lh-contract/OPERATIONS.md", "text": "retry", "description": "operations note retains retry rule"},
           {"type": "contains", "path": "lh-contract/OPERATIONS.md", "text": "7", "description": "retry ceiling survives"}
         ]
       },

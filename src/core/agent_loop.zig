@@ -669,6 +669,9 @@ pub fn run(
                     "pre_sampling_previous_model_smaller_window",
                     backend,
                     sess,
+                    trace_id,
+                    depth,
+                    turns + 1,
                     &context_warning_emitted,
                     allocator,
                     opts.tasks,
@@ -698,6 +701,9 @@ pub fn run(
                 "pre_sampling_pending_turn_threshold",
                 backend,
                 sess,
+                trace_id,
+                depth,
+                turns + 1,
                 &context_warning_emitted,
                 allocator,
                 opts.tasks,
@@ -1597,6 +1603,9 @@ pub fn run(
             "post_tool_follow_up_threshold",
             backend,
             sess,
+            trace_id,
+            depth,
+            turns + 1,
             &context_warning_emitted,
             allocator,
             opts.tasks,
@@ -1954,6 +1963,9 @@ fn runAutoCompactIfNeeded(
     trigger_cause: []const u8,
     backend: *const UiBackend,
     sess: @import("session_id.zig").SessionId,
+    trace_id: [12]u8,
+    depth: u8,
+    turn: u32,
     context_warning_emitted: ?*bool,
     allocator: std.mem.Allocator,
     tasks: ?*@import("task_store.zig").TaskStore,
@@ -2059,8 +2071,21 @@ fn runAutoCompactIfNeeded(
             log.warn("agent", "auto-compact kernel failed: {s}", .{@errorName(err)});
             return .api_error;
         };
+        // Persist metered usage before the diagnostic event. If the process is
+        // hard-killed between the two complete NDJSON records, budget evidence
+        // survives even if request-count telemetry is conservatively partial.
         if (usageChanged(report.usage))
             backend.emitEvent(sess, .{ .usage = report.usage });
+        if (report.summary_request) |request| {
+            backend.emitEvent(sess, .{ .diag_compact_request = .{
+                .trace_id = trace_id,
+                .depth = depth,
+                .turn = turn,
+                .elapsed_ms = request.elapsed_ms,
+                .outcome = @tagName(request.outcome),
+                .cause = trigger_cause,
+            } });
+        }
         switch (report.outcome) {
             .aborted => return .aborted,
             .no_change => {
@@ -2352,6 +2377,7 @@ const TestProviderState = struct {
     compact_summary_response: ?[]const u8 = null,
     last_send_model_override: ?[]const u8 = null,
     compact_stream_stage: u8 = 0,
+    compact_request_count: u32 = 0,
 };
 
 fn testProvider(state: *TestProviderState) provider_mod.Provider {
@@ -2366,6 +2392,7 @@ fn testProvider(state: *TestProviderState) provider_mod.Provider {
             const st = asState(ctx);
             if (st.compact_summary_response == null or st.allocator == null)
                 return error.UnexpectedTestCall;
+            st.compact_request_count += 1;
             st.last_send_model_override = model_override;
             st.compact_stream_stage = 0;
             return .{
@@ -2563,6 +2590,9 @@ test "usage anchor suppresses false blocking-limit nuke (glm-5.2 并发工具风
         "post_tool_follow_up_threshold",
         &backend,
         .single,
+        [_]u8{0} ** 12,
+        0,
+        0,
         null,
         a,
         null,
@@ -2670,12 +2700,20 @@ test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool s
     const Capture = struct {
         cause: ?[]const u8 = null,
         dropped: u32 = 0,
+        compact_requests: u32 = 0,
+        compact_request_outcome: ?[]const u8 = null,
+        compact_request_cause: ?[]const u8 = null,
         fn emit(ctx: *anyopaque, _: @import("session_id.zig").SessionId, ev: CoreEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             switch (ev) {
                 .auto_compact => |ac| {
                     self.cause = ac.cause;
                     self.dropped = ac.dropped;
+                },
+                .diag_compact_request => |request| {
+                    self.compact_requests += 1;
+                    self.compact_request_outcome = request.outcome;
+                    self.compact_request_cause = request.cause;
                 },
                 else => {},
             }
@@ -2702,6 +2740,9 @@ test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool s
         "post_tool_follow_up_threshold",
         &backend,
         .single,
+        [_]u8{0} ** 12,
+        0,
+        0,
         null,
         a,
         null,
@@ -2711,6 +2752,9 @@ test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool s
 
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
     try std.testing.expect(cap.dropped > 0);
+    try std.testing.expectEqual(@as(u32, 1), cap.compact_requests);
+    try std.testing.expectEqualStrings("success", cap.compact_request_outcome.?);
+    try std.testing.expectEqualStrings("post_tool_follow_up_threshold", cap.compact_request_cause.?);
     // 投影:原始消息全量保留(len 不变),收缩的是活跃窗口。
     const active = c.activeMessages();
     try std.testing.expect(active.len < before_active);
@@ -2718,6 +2762,63 @@ test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool s
     // 保住工具后缀:活跃窗口末尾仍是配对的 tool_use / tool_result(不留孤儿)。
     try std.testing.expect(active[active.len - 2].blocks[0] == .tool_use);
     try std.testing.expect(active[active.len - 1].blocks[0] == .tool_result);
+}
+
+test "auto-compact does not buy a summary when fixed request overhead makes savings impossible" {
+    const a = std.testing.allocator;
+    var c = Conversation.init(a);
+    defer c.deinit();
+    try c.appendText(.user, "one");
+    try c.appendText(.assistant, "two");
+    try c.appendText(.user, "three");
+    try c.appendText(.assistant, "four");
+
+    const system_prompt = try a.alloc(u8, 160 * 1024);
+    defer a.free(system_prompt);
+    @memset(system_prompt, 's');
+    var provider_state = TestProviderState{
+        .allocator = a,
+        .compact_summary_response = "summary that must not be requested",
+        .max_input_tokens = 200_000,
+        .max_tokens = 32_000,
+    };
+    const provider = testProvider(&provider_state);
+    const Capture = struct {
+        fn emit(_: *anyopaque, _: @import("session_id.zig").SessionId, _: CoreEvent) void {}
+        fn poll(_: *anyopaque, _: @import("session_id.zig").SessionId) ?@import("protocol/ui_event.zig").UiEvent {
+            return null;
+        }
+    };
+    var dummy: u8 = 0;
+    const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = Capture.emit, .poll = Capture.poll };
+
+    const outcome = try runAutoCompactIfNeeded(
+        &c,
+        provider,
+        system_prompt,
+        null,
+        null,
+        &.{},
+        null,
+        null,
+        32_000,
+        2,
+        "pre_sampling_pending_turn_threshold",
+        &backend,
+        .single,
+        [_]u8{0} ** 12,
+        0,
+        0,
+        null,
+        a,
+        null,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqual(AutoCompactOutcome.skipped_no_savings, outcome);
+    try std.testing.expectEqual(@as(u32, 0), provider_state.compact_request_count);
+    try std.testing.expectEqual(@as(usize, 0), c.compact_boundary);
 }
 
 test "auto-compact summary carries in_progress task anchor through compaction" {
@@ -2769,6 +2870,9 @@ test "auto-compact summary carries in_progress task anchor through compaction" {
         "post_tool_follow_up_threshold",
         &backend,
         .single,
+        [_]u8{0} ** 12,
+        0,
+        0,
         null,
         a,
         &store,
@@ -2818,7 +2922,7 @@ test "auto-compact 触发 PreCompact + PostCompact hook(G-rest 接线,端到端)
     const post_entries = [_]hooks_mod.HookEntry{.{ .matcher = "*", .commands = &post_cmds }};
     const hs = hooks_mod.HookSet{ .pre_tool_use = &.{}, .pre_compact = &pre_entries, .post_compact = &post_entries, .allocator = a };
 
-    const outcome = try runAutoCompactIfNeeded(&c, provider, null, null, null, &.{}, null, null, 32_000, 2, "post_tool_follow_up_threshold", &backend, .single, null, a, null, &hs, null);
+    const outcome = try runAutoCompactIfNeeded(&c, provider, null, null, null, &.{}, null, null, 32_000, 2, "post_tool_follow_up_threshold", &backend, .single, [_]u8{0} ** 12, 0, 0, null, a, null, &hs, null);
     try std.testing.expectEqual(AutoCompactOutcome.compacted, outcome);
 
     // PreCompact 真触发:marker 文件存在。
@@ -2922,6 +3026,9 @@ test "previous-model compact uses old model override before smaller-window sampl
         "pre_sampling_previous_model_smaller_window",
         &backend,
         .single,
+        [_]u8{0} ** 12,
+        0,
+        0,
         null,
         a,
         null,

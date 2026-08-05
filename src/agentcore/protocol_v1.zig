@@ -72,6 +72,7 @@ pub fn event(value: InternalEvent) ?public.CoreEvent {
         .diag_turn_begin,
         .diag_turn_end,
         .diag_model_request,
+        .diag_compact_request,
         .diag_tool_stage,
         .diag_breaker_tripped,
         .diag_cache_break,
@@ -179,6 +180,7 @@ test "internal-only events are explicitly excluded from ABI v1" {
     try std.testing.expect(event(.{ .diag_turn_begin = .{ .trace_id = trace_id, .depth = 0, .turn = 1 } }) == null);
     try std.testing.expect(event(.{ .diag_turn_end = .{ .trace_id = trace_id, .depth = 0, .turn = 1, .tool_calls = 0 } }) == null);
     try std.testing.expect(event(.{ .diag_model_request = .{ .trace_id = trace_id, .depth = 0, .turn = 1, .attempt = 1, .elapsed_ms = 2, .outcome = "ok" } }) == null);
+    try std.testing.expect(event(.{ .diag_compact_request = .{ .trace_id = trace_id, .depth = 0, .turn = 1, .elapsed_ms = 2, .outcome = "success", .cause = "threshold" } }) == null);
     try std.testing.expect(event(.{ .diag_tool_stage = .{ .trace_id = trace_id, .depth = 0, .turn = 1, .tool_calls = 2, .elapsed_ms = 3 } }) == null);
     try std.testing.expect(event(.{ .diag_breaker_tripped = .{ .trace_id = trace_id, .depth = 0, .same_err_count = 1 } }) == null);
     try std.testing.expect(event(.{ .diag_cache_break = .{ .trace_id = trace_id, .depth = 0, .cache_read = 1, .cache_creation = 2 } }) == null);

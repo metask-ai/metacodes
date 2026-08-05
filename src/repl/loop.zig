@@ -598,7 +598,7 @@ pub fn run(app: *app_mod.App, allocator: std.mem.Allocator) !void {
         // (and optional diagnostics decorator). Each user submission is one
         // invocation inside the execution-grounded scenario rollout.
         var eval_be: ?evaluation_backend_mod.EvaluationBackend = if (eval_runtime) |*runtime|
-            evaluation_backend_mod.EvaluationBackend.init(allocator, runtime.nextMetadata(
+            try runtime.initEvaluation(allocator, runtime.nextMetadata(
                 @tagName(app.config.provider_kind),
                 app.activeModel(),
                 @tagName(app.permission_ctx.modeValue()),
