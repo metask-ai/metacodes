@@ -64,6 +64,33 @@ deviation. Lean sees the same obligation counts, returns `run_feedback` only at
 source fingerprint is re-observed unchanged. Thus the prose describes the
 loop, but cannot substitute for it.
 
+`ontology.execution-grounded-projection.l2` is the third slice. It closes the
+gap between model narration and repository reality with three independently
+observed obligations:
+
+- after permission and successful execution, the host resolves exactly one
+  claimed `kg-*` task and records only bounded relation/resource labels;
+  denied, pending, failed, ambiguous-task, raw command/query/body, and tool
+  output paths are excluded;
+- terminal `TaskUpdate`/`TaskStop` merges explicit fields with the host ledger,
+  writes tentative ref edges, acknowledges only successful projections, and
+  returns projected/failed/dropped/retained counts so partial writes can be
+  retried instead of disappearing in logs;
+- `test:kg-ontology-feedback` drives a real TinyKG process through claim,
+  `tool_exec.executeSlots`, and terminal `TaskUpdate` without model-supplied
+  ontology fields, while proving denial/failure exclusion, privacy, and task
+  isolation.
+
+The adapter reads the production call chain and focused build wiring after
+stripping comments. Its negative fixtures disconnect the tool-exec sensor,
+replace runtime markers with comments, bypass TaskUpdate consumption, and
+remove the build dependency. Feedback with a non-zero exit or any reported
+skip is also rejected. Lean fixes this slice at three obligations and proves
+that admission entails coverage of all three. The actual runtime kernel is
+`executionProjectionSignal`, which blocks a weakened 2/2 sensor before
+feedback; the controller rejects substituting the generic kernel for this
+rule. A manifest or prompt cannot manufacture an observed execution fact.
+
 ## Commands
 
 From `metacodes/`:

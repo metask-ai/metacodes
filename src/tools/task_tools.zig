@@ -18,9 +18,11 @@ const util_json = @import("../util/json.zig");
 const common = @import("common.zig");
 const log = @import("../util/log.zig");
 const KgClient = @import("../kg/client.zig").KgClient;
+const execution_knowledge = @import("../kg/execution_knowledge.zig");
 
 const TASK_PACKET_LIMIT: usize = 12;
 const TASK_PACKET_MAX_CHARS: usize = 8_000;
+const MAX_PROJECTION_CANDIDATES: usize = 128;
 
 fn kgAgentIdent(ctx: *const ToolContext) []const u8 {
     return ctx.kg_agent_ident orelse ctx.agent_ident.asSlice();
@@ -49,38 +51,148 @@ fn noteTasksChanged(ctx: *const ToolContext) void {
     if (ctx.event_reporter) |r| r.tasksChanged(.invalidated);
 }
 
-/// 任务闭合结构化投影(改动一 —— 分类的"结晶点"):把模型在闭合时提供的
-/// acts_on/uses/produces 写成 concept 节点 + ref 边(默认 tentative)。任务开始时的分类是猜的,
-/// 闭合时才知道真实用了什么——这是"伴随执行浮现、闭合时质量最高"原则的落点。
-/// **写入失败不得阻塞任务闭合**(degraded 非依赖):任一步失败 log+continue,任务已闭合。
-fn writeClosureProjection(ctx: *const ToolContext, kg: *KgClient, task_node: u64, args: []const u8) void {
-    const Field = struct { field: []const u8, rel: []const u8 };
+const ProjectionReport = struct {
+    explicit: usize = 0,
+    observed: usize = 0,
+    projected: usize = 0,
+    failed: usize = 0,
+    dropped: usize = 0,
+    retained: usize = 0,
+
+    fn partial(self: ProjectionReport) bool {
+        return self.failed != 0 or self.dropped != 0 or self.retained != 0;
+    }
+};
+
+const ProjectionCandidate = struct {
+    relation: execution_knowledge.Relation,
+    value: []const u8,
+    /// Explicit values come from extractStringArray and stay owned here.
+    /// Observed values borrow the ledger snapshot until this function returns.
+    owned: ?[]const u8 = null,
+};
+
+fn candidateExists(candidates: []const ProjectionCandidate, relation: execution_knowledge.Relation, value: []const u8) bool {
+    for (candidates) |candidate| {
+        if (candidate.relation == relation and std.mem.eql(u8, candidate.value, value)) return true;
+    }
+    return false;
+}
+
+fn validProjectionLabel(value: []const u8) bool {
+    if (value.len == 0 or value.len > execution_knowledge.MAX_LABEL_BYTES) return false;
+    for (value) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+    return std.unicode.utf8ValidateSlice(value);
+}
+
+/// Task closure is the ontology crystallization point. Explicit model facts
+/// and bounded host-observed execution facts are merged and deduplicated, then
+/// projected as tentative edges for later human confirm/correct. Closure stays
+/// authoritative even if this derived write is partial, but failures and
+/// retained facts are returned to the model instead of disappearing in logs.
+fn writeClosureProjection(ctx: *const ToolContext, kg: *KgClient, task_node: u64, args: []const u8) ProjectionReport {
+    const Field = struct { field: []const u8, relation: execution_knowledge.Relation };
     const fields = [_]Field{
-        .{ .field = "acts_on", .rel = "acts_on" },
-        .{ .field = "uses", .rel = "uses" },
-        .{ .field = "produces", .rel = "produces" },
+        .{ .field = "acts_on", .relation = .acts_on },
+        .{ .field = "uses", .relation = .uses },
+        .{ .field = "produces", .relation = .produces },
     };
-    var wrote_any = false;
-    for (fields) |f| {
-        const items = (extractStringArray(ctx.allocator, args, f.field) catch continue) orelse continue;
-        defer freeStringArray(ctx.allocator, items);
+    var report = ProjectionReport{};
+    var candidates: std.ArrayList(ProjectionCandidate) = .empty;
+    defer {
+        for (candidates.items) |candidate| if (candidate.owned) |owned| ctx.allocator.free(owned);
+        candidates.deinit(ctx.allocator);
+    }
+
+    // Explicit fields remain supported as useful model assertions, but they no
+    // longer constitute the only evidence source.
+    for (fields) |field| {
+        const maybe_items = extractStringArray(ctx.allocator, args, field.field) catch {
+            report.failed +|= 1;
+            continue;
+        };
+        const items = maybe_items orelse continue;
+        defer ctx.allocator.free(items);
         for (items) |raw| {
-            const name = std.mem.trim(u8, raw, " \t\r\n");
-            if (name.len == 0 or name.len > 200) continue;
-            const concept = kg.ensureConcept(name) catch |e| {
-                log.warn("kg", "closure projection ensureConcept({s}) failed: {s}", .{ name, @errorName(e) });
+            const value = std.mem.trim(u8, raw, " \t\r\n");
+            if (!validProjectionLabel(value) or candidateExists(candidates.items, field.relation, value)) {
+                ctx.allocator.free(raw);
+                if (!validProjectionLabel(value)) report.dropped +|= 1;
+                continue;
+            }
+            if (candidates.items.len >= MAX_PROJECTION_CANDIDATES) {
+                ctx.allocator.free(raw);
+                report.dropped +|= 1;
+                continue;
+            }
+            candidates.append(ctx.allocator, .{
+                .relation = field.relation,
+                .value = value,
+                .owned = raw,
+            }) catch {
+                ctx.allocator.free(raw);
+                report.failed +|= 1;
                 continue;
             };
-            // tentative(confirmed=false):agent 执行中打的,人类确认/纠正才落 confirmed。
-            kg.addRefEdge(task_node, f.rel, concept, false) catch |e| {
-                log.warn("kg", "closure projection {s}→{d} failed: {s}", .{ f.rel, concept, @errorName(e) });
-                continue;
-            };
-            wrote_any = true;
+            report.explicit +|= 1;
         }
     }
-    // 发现面:登记有待确认分类的任务,/kg 状态页提示人类去 /kg refs 审阅结晶。
-    if (wrote_any) kg.notePendingRefTask(task_node);
+
+    var snapshot = kg.executionKnowledgeSnapshot(ctx.allocator, task_node) catch {
+        report.observed = kg.pendingExecutionFacts(task_node);
+        report.failed +|= report.observed;
+        report.retained = report.observed;
+        return report;
+    };
+    defer snapshot.deinit(ctx.allocator);
+    report.observed = snapshot.facts.len;
+    report.dropped +|= snapshot.dropped;
+    for (snapshot.facts) |fact| {
+        if (candidateExists(candidates.items, fact.relation, fact.value)) continue;
+        if (candidates.items.len >= MAX_PROJECTION_CANDIDATES) {
+            // The canonical ledger fact remains retained for a terminal retry.
+            report.failed +|= 1;
+            continue;
+        }
+        candidates.append(ctx.allocator, .{
+            .relation = fact.relation,
+            .value = fact.value,
+        }) catch {
+            // The ledger still owns the canonical fact, so this is observable
+            // retryable work rather than silent loss.
+            report.failed +|= 1;
+        };
+    }
+
+    for (candidates.items) |candidate| {
+        const concept = kg.ensureConcept(candidate.value) catch |e| {
+            log.warn("kg", "closure projection ensureConcept({s}) failed: {s}", .{ candidate.value, @errorName(e) });
+            report.failed +|= 1;
+            continue;
+        };
+        kg.addRefEdge(task_node, candidate.relation.label(), concept, false) catch |e| {
+            log.warn("kg", "closure projection {s}→{d} failed: {s}", .{ candidate.relation.label(), concept, @errorName(e) });
+            report.failed +|= 1;
+            continue;
+        };
+        report.projected +|= 1;
+        // This also clears an observed fact that was duplicated by an explicit
+        // model field. Failed projections remain available for terminal retry.
+        _ = kg.acknowledgeExecutionFact(task_node, candidate.relation, candidate.value);
+    }
+    report.retained = kg.pendingExecutionFacts(task_node);
+    if (report.projected != 0) kg.notePendingRefTask(task_node);
+    return report;
+}
+
+fn appendProjectionReport(ctx: *const ToolContext, out: *std.ArrayList(u8), report: ProjectionReport) !void {
+    const encoded = try std.fmt.allocPrint(
+        ctx.allocator,
+        ",\"knowledge_projection\":{{\"explicit\":{d},\"observed\":{d},\"projected\":{d},\"failed\":{d},\"dropped\":{d},\"retained\":{d},\"partial\":{s},\"retryable\":{s}}}",
+        .{ report.explicit, report.observed, report.projected, report.failed, report.dropped, report.retained, if (report.partial()) "true" else "false", if (report.retained != 0) "true" else "false" },
+    );
+    defer ctx.allocator.free(encoded);
+    try out.appendSlice(ctx.allocator, encoded);
 }
 
 fn requireStore(ctx: *const ToolContext) !*task_store.TaskStore {
@@ -565,10 +677,15 @@ fn failKgTask(
     };
     // Authorization precedes every derived write. Stable task kind means the
     // terminal node remains a valid ref-edge source after task-close.
-    writeClosureProjection(ctx, kg, node_id, args);
+    const projection = writeClosureProjection(ctx, kg, node_id, args);
     removeKgMirror(ctx, node_id);
     noteTasksChanged(ctx);
-    return try ctx.allocator.dupe(u8, "{\"ok\":true,\"failed\":true,\"kg_status\":\"failed\",\"preserved\":true}");
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(ctx.allocator);
+    try out.appendSlice(ctx.allocator, "{\"ok\":true,\"failed\":true,\"kg_status\":\"failed\",\"preserved\":true");
+    try appendProjectionReport(ctx, &out, projection);
+    try out.append(ctx.allocator, '}');
+    return out.toOwnedSlice(ctx.allocator);
 }
 
 /// KG 计划步骤更新(TaskUpdate 的 kg-<node> 路由)。completed/failed 走 canonical
@@ -599,7 +716,7 @@ fn updateKgTask(ctx: *const ToolContext, node_id_str: []const u8, args: []const 
             };
             // Terminal lifecycle is orthogonal to kind:the stable task remains
             // a valid projection source. Run only after authorization succeeds.
-            writeClosureProjection(ctx, kg, node_id, args);
+            const projection = writeClosureProjection(ctx, kg, node_id, args);
             removeKgMirror(ctx, node_id); // store 镜像同步消失(TaskTab/TaskList)
             // 搭车:返回更新后的 frontier(刷新看板——设计 §2.2 R2 幂等"看板"非"领任务")。
             // 闭合正是选下一步的时刻:ready 无主叶子 ≥2 时同样给并行提示。
@@ -611,6 +728,7 @@ fn updateKgTask(ctx: *const ToolContext, node_id_str: []const u8, args: []const 
             const parallel_ready = appendKgFrontier(ctx, &out, &first) catch 0;
             appendParallelHint(ctx, &out, &first, parallel_ready) catch {};
             try out.append(ctx.allocator, ']');
+            try appendProjectionReport(ctx, &out, projection);
             try out.appendSlice(ctx.allocator, "}");
             noteTasksChanged(ctx); // U6:闭合 → frontier 变(解锁下游)
             return out.toOwnedSlice(ctx.allocator);
@@ -821,10 +939,15 @@ pub fn executeStop(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
             return error.KgCloseFailed;
         };
         // TaskStop 自称"等价 TaskUpdate completed"——投影与闭合顺序也必须同路径。
-        writeClosureProjection(ctx, kg, node_id, args);
+        const projection = writeClosureProjection(ctx, kg, node_id, args);
         removeKgMirror(ctx, node_id); // store 镜像同步消失
         noteTasksChanged(ctx); // U6:TaskStop 闭合 → frontier 变
-        return try ctx.allocator.dupe(u8, "{\"ok\":true,\"status\":\"completed\"}");
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(ctx.allocator);
+        try out.appendSlice(ctx.allocator, "{\"ok\":true,\"status\":\"completed\"");
+        try appendProjectionReport(ctx, &out, projection);
+        try out.append(ctx.allocator, '}');
+        return out.toOwnedSlice(ctx.allocator);
     }
     const store = try requireStore(ctx);
     try store.updateStatus(id, .completed);

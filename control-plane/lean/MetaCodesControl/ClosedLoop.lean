@@ -70,6 +70,24 @@ def nextState (topology : Topology) (observation : Observation) : RuleState :=
 def releaseAllowed (topology : Topology) (observation : Observation) : Bool :=
   signal topology observation == .admitRelease
 
+/-- Runtime decision for the execution-grounded ontology slice. Its three
+obligations are part of the decision function, so a weakened sensor reporting
+2/2 cannot redefine success by silently shrinking the controlled surface. -/
+def executionProjectionSignal
+    (topology : Topology) (observation : Observation) : Signal :=
+  if observation.declared == 3 then signal topology observation else .blockRelease
+
+def executionProjectionNextState
+    (topology : Topology) (observation : Observation) : RuleState :=
+  match executionProjectionSignal topology observation with
+  | .blockRelease => .blocked
+  | .runFeedback => .verifying
+  | .admitRelease => .compliant
+
+def executionProjectionReleaseAllowed
+    (topology : Topology) (observation : Observation) : Bool :=
+  executionProjectionSignal topology observation == .admitRelease
+
 /-- An admitted rule can never be a formalization orphan. -/
 theorem admitted_implies_closed_loop
     (topology : Topology) (observation : Observation)
@@ -102,6 +120,41 @@ theorem missing_evidence_blocks
     signal topology observation = .blockRelease := by
   simp [signal, Observation.exact]
   omega
+
+/-- The execution-grounded ontology loop has three independently observed
+links: successful execution sensing, terminal projection, and focused L2
+feedback. Admission proves that all three—not merely a prose declaration—were
+covered by the repository sensor. -/
+theorem execution_projection_admitted_implies_three_obligations
+    (topology : Topology) (observation : Observation)
+    (admitted : executionProjectionReleaseAllowed topology observation = true) :
+    observation.declared = 3 ∧ observation.covered = 3 := by
+  simp [executionProjectionReleaseAllowed, executionProjectionSignal] at admitted
+  split at admitted
+  · rename_i declaredThree
+    have genericAdmitted : releaseAllowed topology observation = true := by
+      simpa [releaseAllowed] using admitted
+    have exact := admitted_implies_zero_deviation topology observation genericAdmitted
+    omega
+  · simp at admitted
+
+/-- With the execution ontology sensor fixed at three obligations, losing any
+one executable link blocks before feedback can masquerade as compliance. -/
+theorem execution_projection_missing_obligation_blocks
+    (topology : Topology) (observation : Observation)
+    (declaresThree : observation.declared = 3)
+    (missing : observation.covered < 3) :
+    signal topology observation = .blockRelease := by
+  apply missing_evidence_blocks topology observation
+  omega
+
+/-- Shrinking the sensor's declaration count is itself a release-blocking
+fault, even when the weakened adapter reports full internal coverage. -/
+theorem execution_projection_wrong_cardinality_blocks
+    (topology : Topology) (observation : Observation)
+    (wrong : observation.declared ≠ 3) :
+    executionProjectionSignal topology observation = .blockRelease := by
+  simp [executionProjectionSignal, wrong]
 
 /-- A theorem with any missing loop link cannot reach the compliant state. -/
 theorem orphan_cannot_be_compliant

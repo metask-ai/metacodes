@@ -147,6 +147,77 @@
         "fixture": "control-plane/counterexamples.json",
         "required": true
       }
+    },
+    {
+      "id": "ontology.execution-grounded-projection.l2",
+      "title": "Successful host execution feeds tentative TinyKG ontology projection",
+      "target": {
+        "metric": "execution_projection_obligations_minus_observed",
+        "setpoint": 0,
+        "goal": "The successful-execution sensor, task-close projection actuator, and focused real-TinyKG feedback remain connected without trusting model self-report."
+      },
+      "sensor": {
+        "adapter": "execution_ontology_feedback",
+        "schema_version": 1
+      },
+      "decision": {
+        "engine": "lean",
+        "kernel": "MetaCodesControl.ClosedLoop.executionProjectionSignal",
+        "theorems": [
+          "admitted_implies_closed_loop",
+          "admitted_implies_zero_deviation",
+          "admitted_implies_feedback_passed",
+          "execution_projection_admitted_implies_three_obligations",
+          "execution_projection_missing_obligation_blocks",
+          "execution_projection_wrong_cardinality_blocks",
+          "orphan_cannot_be_compliant",
+          "failed_feedback_blocks",
+          "sensor_failure_blocks",
+          "unobserved_actuator_blocks"
+        ]
+      },
+      "actuator": {
+        "kind": "release_gate",
+        "on_violation": "block",
+        "remediation": "Restore the production success sensor, terminal projection/retention report, and focused real-TinyKG L2. Comments, prompt claims, skipped tests, and model-supplied acts_on/uses/produces are not execution evidence.",
+        "observation": {
+          "schema_version": 1,
+          "build_file": "control-plane/build.zig",
+          "build_step": "rule-check",
+          "workflow_file": ".github/workflows/cross-platform.yml",
+          "workflow_job": "rule-control",
+          "workflow_workdir": "metacodes",
+          "telemetry_path": "metacodes/zig-out/reports/rule-control.json"
+        }
+      },
+      "feedback": {
+        "kind": "zig_l2_then_reobserve",
+        "reobserve": true,
+        "timeout_seconds": 300,
+        "commands": [
+          [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.tests.test_rule_control.ExecutionOntologySensorTests",
+            "scripts.tests.test_rule_control.FeedbackExecutionTests",
+            "-v"
+          ],
+          [
+            "zig",
+            "build",
+            "test:kg-ontology-feedback",
+            "-Dtfilter=L2 KG ontology feedback:",
+            "-j2",
+            "--summary",
+            "all"
+          ]
+        ]
+      },
+      "counterexample": {
+        "fixture": "control-plane/counterexamples.json",
+        "required": true
+      }
     }
   ]
 }

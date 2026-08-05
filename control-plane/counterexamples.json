@@ -12,8 +12,8 @@
         "counterexample": true
       },
       "sensor_ok": true,
-      "declared": 4,
-      "covered": 4,
+      "declared": 3,
+      "covered": 3,
       "feedback_status": "passed",
       "expected_signal": "admit_release",
       "expected_state": "compliant"
@@ -29,8 +29,8 @@
         "counterexample": true
       },
       "sensor_ok": true,
-      "declared": 4,
-      "covered": 3,
+      "declared": 3,
+      "covered": 2,
       "feedback_status": "passed",
       "expected_signal": "block_release",
       "expected_state": "blocked"
@@ -46,8 +46,8 @@
         "counterexample": true
       },
       "sensor_ok": true,
-      "declared": 4,
-      "covered": 4,
+      "declared": 3,
+      "covered": 3,
       "feedback_status": "passed",
       "expected_signal": "block_release",
       "expected_state": "blocked"
@@ -63,8 +63,8 @@
         "counterexample": true
       },
       "sensor_ok": true,
-      "declared": 4,
-      "covered": 4,
+      "declared": 3,
+      "covered": 3,
       "feedback_status": "failed",
       "expected_signal": "block_release",
       "expected_state": "blocked"
@@ -80,8 +80,28 @@
         "counterexample": true
       },
       "sensor_ok": false,
-      "declared": 4,
-      "covered": 4,
+      "declared": 3,
+      "covered": 3,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "execution-projection-wrong-cardinality-blocks",
+      "rule_ids": [
+        "ontology.execution-grounded-projection.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 2,
+      "covered": 2,
       "feedback_status": "passed",
       "expected_signal": "block_release",
       "expected_state": "blocked"

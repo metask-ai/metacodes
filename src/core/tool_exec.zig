@@ -320,6 +320,11 @@ pub fn executeSlots(
     while (i < slots.len) {
         // denied(已填错误)或 prefetched(结果已由流式预取填好)→ 跳过,不执行。
         if (slots[i].decision == .denied or slots[i].prefetched) {
+            // Prefetch execution is only knowledge-bearing after the main
+            // permission path accepts the slot. Denied prefetched work is
+            // deliberately invisible to the ledger.
+            if (slots[i].decision == .run and slots[i].prefetched)
+                observeSuccessfulExecutions(slots[i .. i + 1], base_ctx);
             i += 1;
             continue;
         }
@@ -341,6 +346,10 @@ pub fn executeSlots(
                 if (job.out_of_memory) return error.OutOfMemory;
             }
         }
+        // Commit host-observed facts after this execution batch succeeds, not
+        // at turn end. A later fatal batch must not erase already established
+        // successful work, while errors in this batch remain excluded.
+        observeSuccessfulExecutions(slots[i..j], base_ctx);
         i = j;
     }
 
@@ -351,6 +360,20 @@ pub fn executeSlots(
     // 结果合计超 200k → 按大小降序把最大的落盘(替成 preview)直到达标。批1A 并发后
     // 多工具同时产大结果更易触发;单结果落盘由上方确认整批成功后统一做,这里管"合计"。
     enforceMessageBudget(slots, base_ctx, parent_allocator);
+}
+
+fn observeSuccessfulExecutions(slots: []const Slot, base_ctx: *const ToolContext) void {
+    const kg = base_ctx.kg orelse return;
+    if (!kg.ready) return;
+    const tasks = base_ctx.tasks orelse return;
+    const task_id = tasks.uniqueActiveKgTaskId() orelse return;
+    const project_dir = if (base_ctx.project_dir.len != 0) base_ctx.project_dir else base_ctx.cwd_abs;
+    if (project_dir.len == 0) return;
+
+    for (slots) |slot| {
+        if (slot.decision != .run or slot.pending or slot.is_error or slot.content == null) continue;
+        kg.observeSuccessfulExecution(task_id, slot.name, slot.input, project_dir);
+    }
 }
 
 fn persistCompletedResults(slots: []Slot, base_ctx: *const ToolContext, parent_allocator: std.mem.Allocator) void {

@@ -1110,6 +1110,30 @@ pub fn build(b: *std.Build) void {
         kg_governance_step.dependOn(&run_t.step);
     }
 
+    // Focused feedback actuator for the execution-grounded ontology loop. The
+    // rule controller observes this exact production L2 instead of accepting a
+    // manifest or prompt claim as proof of runtime wiring.
+    const kg_ontology_feedback_step = b.step("test:kg-ontology-feedback", "Run host-execution to TinyKG ontology feedback L2");
+    {
+        const m = b.createModule(.{
+            .root_source_file = b.path("tests/component/kg_integration_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        m.addImport("harness", test_harness_mod);
+        m.addImport("cc", test_cc_mod);
+        addPlatform(b, m);
+        const t = b.addTest(.{
+            .name = "kg-ontology-feedback-l2",
+            .root_module = m,
+            .filters = if (tfilter) |filter_text| &.{filter_text} else &.{"L2 KG ontology feedback:"},
+        });
+        const run_t = addTestRunArtifact(b, t, windows_test_prelude);
+        if (tinykg_install_step) |s| run_t.step.dependOn(s);
+        kg_ontology_feedback_step.dependOn(&run_t.step);
+    }
+
     // 注:TTY 渲染测试(tests/tty/)用独立 python runner 跑,**不接 zig build**——
     // PTY(pty.fork)在 zig build-runner 的进程/stdio 监管下时序不稳(直接跑 12/12 全过,
     // 经 build SystemCommand 跑会大面积假失败)。跑法:

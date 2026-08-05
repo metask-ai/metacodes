@@ -22,7 +22,9 @@ SCHEMA_VERSION = 1
 DEFAULT_MANIFEST = Path("control-plane/rules.json")
 DEFAULT_REPORT = Path("zig-out/reports/rule-control.json")
 LOOP_LINKS = ("target", "sensor", "decision", "actuator", "feedback", "counterexample")
-SUPPORTED_SENSOR_ADAPTERS = frozenset(("declaration_l2", "memory_evidence_governance"))
+SUPPORTED_SENSOR_ADAPTERS = frozenset(
+    ("declaration_l2", "memory_evidence_governance", "execution_ontology_feedback")
+)
 RULE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,127}$")
 FIELD_RE = re.compile(r"^    ([a-z][a-z0-9_]*):", re.MULTILINE)
 STRING_RE = re.compile(r'"([a-zA-Z_][a-zA-Z0-9_]*)"')
@@ -152,6 +154,52 @@ def build_step_slice(source: str, step_name: str) -> str | None:
     if next_step is None:
         return source[match.start() :]
     return source[match.start() : match.end() + next_step.start()]
+
+
+def zig_function_slice(source: str, function_name: str) -> str | None:
+    """Return one Zig function body while ignoring braces inside literals."""
+    match = re.search(
+        r"(?:pub\s+)?fn\s+" + re.escape(function_name) + r"\s*\(",
+        source,
+    )
+    if match is None:
+        return None
+    cursor = match.end()
+    while True:
+        start = source.find("{", cursor)
+        if start < 0:
+            return None
+        # Zig error sets appear between the parameter list and function body.
+        # They are type syntax, not an executable body.
+        if source[max(cursor, start - 8) : start].rstrip().endswith("error"):
+            end_error_set = source.find("}", start + 1)
+            if end_error_set < 0:
+                return None
+            cursor = end_error_set + 1
+            continue
+        break
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for index in range(start, len(source)):
+        char = source[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return source[match.start() : index + 1]
+    return None
 
 
 def fingerprint(paths: Iterable[Path]) -> str:
@@ -698,6 +746,193 @@ def observe_memory_evidence_governance(repo: Path) -> Observation:
     )
 
 
+def observe_execution_ontology_feedback(repo: Path) -> Observation:
+    """Observe execution sensor -> task-close actuator -> focused L2 feedback."""
+    source_relatives = {
+        "tool_exec": "src/core/tool_exec.zig",
+        "task_store": "src/core/task_store.zig",
+        "client": "src/kg/client.zig",
+        "ledger": "src/kg/execution_knowledge.zig",
+        "task_tools": "src/tools/task_tools.zig",
+        "test": "tests/component/kg_integration_test.zig",
+        "build": "build.zig",
+    }
+    paths: dict[str, Path] = {}
+    touched: list[Path] = []
+    errors: list[str] = []
+    for name, relative in source_relatives.items():
+        try:
+            path = safe_repo_path(repo, relative)
+            paths[name] = path
+            touched.append(path)
+        except ControlError as exc:
+            errors.append(str(exc))
+    if errors:
+        return Observation(
+            sensor="execution_ontology_feedback",
+            errors=errors,
+            fingerprint_sha256=fingerprint(touched),
+        )
+    try:
+        sources = {
+            name: _strip_zig_comments(read_text(path))
+            for name, path in paths.items()
+            if name != "test"
+        }
+        test_source = read_text(paths["test"])
+    except ControlError as exc:
+        return Observation(
+            sensor="execution_ontology_feedback",
+            errors=[str(exc)],
+            fingerprint_sha256=fingerprint(touched),
+        )
+
+    execute_slots = zig_function_slice(sources["tool_exec"], "executeSlots") or ""
+    observe_success = zig_function_slice(
+        sources["tool_exec"], "observeSuccessfulExecutions"
+    ) or ""
+    client_observer = zig_function_slice(
+        sources["client"], "observeSuccessfulExecution"
+    ) or ""
+    task_selector = zig_function_slice(
+        sources["task_store"], "uniqueActiveKgTaskId"
+    ) or ""
+    ledger_observer = zig_function_slice(
+        sources["ledger"], "observeSuccessfulTool"
+    ) or ""
+
+    execution_checks = {
+        "successful batches invoke the sensor": (
+            "observeSuccessfulExecutions(slots[i..j], base_ctx)" in execute_slots
+        ),
+        "accepted prefetch invokes the sensor": (
+            "slots[i].decision == .run" in execute_slots
+            and "observeSuccessfulExecutions(slots[i .. i + 1], base_ctx)" in execute_slots
+        ),
+        "denied, pending, errors, and empty results are excluded": all(
+            marker in observe_success
+            for marker in (
+                "slot.decision != .run",
+                "slot.pending",
+                "slot.is_error",
+                "slot.content == null",
+            )
+        ),
+        "sensor requires one active persistent task": (
+            "uniqueActiveKgTaskId()" in observe_success
+            and "active != null" in task_selector
+            and "parseInt(u64" in task_selector
+        ),
+        "tool executor calls the client ledger": (
+            "kg.observeSuccessfulExecution" in observe_success
+            and "execution_ledger.observeSuccessfulTool" in client_observer
+        ),
+        "ledger stores sanitized resources rather than raw bodies": all(
+            marker in ledger_observer
+            for marker in (
+                "resourceSpec(tool_name)",
+                "extractStringField(input_json, resource.field)",
+                "normalizeProjectPath",
+                "self.record(task_id, .acts_on",
+            )
+        ),
+    }
+
+    projection = zig_function_slice(sources["task_tools"], "writeClosureProjection") or ""
+    update_task = zig_function_slice(sources["task_tools"], "updateKgTask") or ""
+    fail_task = zig_function_slice(sources["task_tools"], "failKgTask") or ""
+    stop_task = zig_function_slice(sources["task_tools"], "executeStop") or ""
+    closure_checks = {
+        "closure snapshots observed facts": "executionKnowledgeSnapshot" in projection,
+        "closure writes tentative ref edges": (
+            "addRefEdge" in projection and "false" in projection
+        ),
+        "successful projection acknowledges ledger facts": (
+            "acknowledgeExecutionFact" in projection
+        ),
+        "partial facts remain observable": all(
+            marker in sources["task_tools"]
+            for marker in ("observed", "projected", "failed", "dropped", "retained")
+        ),
+        "TaskUpdate completion consumes projection": (
+            "const projection = writeClosureProjection" in update_task
+            and "appendProjectionReport" in update_task
+        ),
+        "failed and stop closures consume projection": (
+            "writeClosureProjection" in fail_task
+            and "appendProjectionReport" in fail_task
+            and "writeClosureProjection" in stop_task
+            and "appendProjectionReport" in stop_task
+        ),
+    }
+
+    test_name = (
+        "L2 KG ontology feedback: successful host execution projects without model self-report"
+    )
+    test_body_raw = test_slice(test_source, test_name)
+    test_body = _strip_zig_comments(test_body_raw) if test_body_raw is not None else ""
+    step = build_step_slice(sources["build"], "test:kg-ontology-feedback")
+    test_wired = (
+        step is not None
+        and '"tests/component/kg_integration_test.zig"' in step
+        and "kg_ontology_feedback_step.dependOn(&run_t.step)" in step
+    )
+    feedback_checks = {
+        "focused L2 exists": test_body_raw is not None,
+        "L2 executes through host tool slots and TaskUpdate": (
+            "tool_exec.executeSlots" in test_body and "task_tools.executeUpdate" in test_body
+        ),
+        "L2 proves self-report omission and observed projection": (
+            '"explicit\\\":0"' in test_body
+            and '"observed\\\":2"' in test_body
+        ),
+        "L2 proves denied, failed, privacy, and task isolation": all(
+            marker in test_body
+            for marker in (
+                "DENIED_SENTINEL",
+                "MISSING_SENTINEL",
+                "PRIVATE_BODY_SENTINEL",
+                "first.zig",
+                "second.zig",
+            )
+        ),
+        "L2 contains executable assertions": "std.testing.expect" in test_body,
+        "focused build step is wired": test_wired,
+    }
+
+    obligations = {
+        "successful_execution_sensor": execution_checks,
+        "task_close_projection_actuator": closure_checks,
+        "focused_l2_feedback": feedback_checks,
+    }
+    covered = sorted(
+        name for name, checks in obligations.items() if all(checks.values())
+    )
+    declarations = sorted(obligations)
+    missing = sorted(set(declarations) - set(covered))
+    for name in missing:
+        absent = [label for label, present in obligations[name].items() if not present]
+        errors.append(f"{name}: missing executable evidence: {', '.join(absent)}")
+    return Observation(
+        sensor="execution_ontology_feedback",
+        sensor_ok=not errors and len(covered) == len(declarations),
+        declared=len(declarations),
+        covered=len(covered),
+        deviation=max(len(declarations) - len(covered), 0),
+        declarations=declarations,
+        covered_declarations=covered,
+        missing_declarations=missing,
+        feedback_bindings=[
+            {
+                "step": "test:kg-ontology-feedback",
+                "filter": "L2 KG ontology feedback:",
+            }
+        ],
+        errors=errors,
+        fingerprint_sha256=fingerprint(touched),
+    )
+
+
 def observe_rule(repo: Path, rule: dict[str, Any]) -> Observation:
     sensor = rule.get("sensor")
     if not isinstance(sensor, dict):
@@ -714,6 +949,8 @@ def observe_rule(repo: Path, rule: dict[str, Any]) -> Observation:
         return observe_declaration_l2(repo, registry_path)
     if adapter == "memory_evidence_governance":
         return observe_memory_evidence_governance(repo)
+    if adapter == "execution_ontology_feedback":
+        return observe_execution_ontology_feedback(repo)
     return Observation(sensor=str(adapter), errors=[f"unsupported sensor adapter: {adapter!r}"])
 
 
@@ -846,10 +1083,15 @@ def link_topology(
         )
     )
     decision = rule.get("decision")
+    expected_kernel = (
+        "MetaCodesControl.ClosedLoop.executionProjectionSignal"
+        if rule.get("id") == "ontology.execution-grounded-projection.l2"
+        else "MetaCodesControl.ClosedLoop.signal"
+    )
     decision_ok = (
         isinstance(decision, dict)
         and decision.get("engine") == "lean"
-        and decision.get("kernel") == "MetaCodesControl.ClosedLoop.signal"
+        and decision.get("kernel") == expected_kernel
         and isinstance(decision.get("theorems"), list)
         and len(decision.get("theorems")) > 0
         and all(isinstance(name, str) and name for name in decision.get("theorems"))
@@ -930,6 +1172,9 @@ def verify_counterexamples(
     saw_feedback_failure = False
     saw_sensor_failure = False
     seen_case_ids: set[str] = set()
+    decision_rule_id = rule.get("id")
+    if not isinstance(decision_rule_id, str) or not RULE_ID_RE.match(decision_rule_id):
+        return False, results, ["counterexample rule id is invalid"]
     for index, case in enumerate(cases):
         if not isinstance(case, dict):
             errors.append(f"counterexample case {index} must be an object")
@@ -943,6 +1188,15 @@ def verify_counterexamples(
             errors.append(f"duplicate counterexample id: {case_id}")
             continue
         seen_case_ids.add(case_id)
+        rule_ids = case.get("rule_ids")
+        if rule_ids is not None:
+            if not isinstance(rule_ids, list) or not rule_ids or not all(
+                isinstance(value, str) and RULE_ID_RE.match(value) for value in rule_ids
+            ):
+                errors.append(f"counterexample {case_id}: rule_ids must be non-empty valid ids")
+                continue
+            if decision_rule_id not in rule_ids:
+                continue
         if not isinstance(topology, dict) or any(not isinstance(topology.get(name), bool) for name in LOOP_LINKS):
             errors.append(f"counterexample {case_id}: topology must contain six booleans")
             continue
@@ -972,7 +1226,7 @@ def verify_counterexamples(
             continue
         try:
             result = kernel.evaluate(
-                case_id,
+                decision_rule_id,
                 {name: topology[name] for name in LOOP_LINKS},
                 sensor_ok_value,
                 declared_value,

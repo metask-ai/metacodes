@@ -22,6 +22,7 @@ const sync = @import("platform").sync;
 const common = @import("../tools/common.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 const log = @import("../util/log.zig");
+const execution_knowledge = @import("execution_knowledge.zig");
 
 pub const EXPECTED_STORAGE_FORMAT_VERSION = "2";
 pub const EXPECTED_SCHEMA_VERSION = "3";
@@ -201,6 +202,10 @@ pub const KgClient = struct {
     /// 人类需知道"有料可结晶"才会去 /kg refs 审阅/确认,否则 tentative 边永远无人 crystallize）。
     /// cache_mu 保护;over-inclusive 无害(是"去看看"的提示,真相以 /kg refs 当场查为准)。
     pending_ref_tasks: std.AutoHashMap(u64, void) = undefined,
+    /// 宿主观测的成功执行事实。只保存 bounded task/relation/sanitized-label，
+    /// 不保存命令、query、工具正文或结果；与其它 session 缓存共用 cache_mu，
+    /// 因为主 loop 的 arena allocator 本身不保证多线程安全。
+    execution_ledger: execution_knowledge.Ledger = undefined,
     /// project 三锚 id 缓存(乙方案):[scope_global 0/1][AnchorKind]。写路径 lazy ensure;
     /// 失效纪律同 project 缓存:挂接失败清对应槽,下次写重新 ensure(stale 自愈)。
     anchor_ids: [2][3]?u64 = .{ .{ null, null, null }, .{ null, null, null } },
@@ -229,6 +234,7 @@ pub const KgClient = struct {
         while (kit.next()) |k| self.allocator.free(k.*);
         self.scoped_types.deinit();
         self.pending_ref_tasks.deinit();
+        self.execution_ledger.deinit();
     }
 
     // ── 路径解析(设计 §1 D2)─────────────────────────────────────────
@@ -263,6 +269,7 @@ pub const KgClient = struct {
             .domain = domain,
             .scoped_types = std.StringHashMap(void).init(allocator),
             .pending_ref_tasks = std.AutoHashMap(u64, void).init(allocator),
+            .execution_ledger = execution_knowledge.Ledger.init(allocator),
         };
     }
 
@@ -303,6 +310,48 @@ pub const KgClient = struct {
         var it = self.pending_ref_tasks.keyIterator();
         while (it.next()) |k| : (i += 1) out[i] = k.*;
         return out;
+    }
+
+    /// Record only a host-authorized, successful tool invocation against the
+    /// one active persistent task selected by the caller. This is best-effort:
+    /// bounded drops are counted in the ledger and surfaced at task closure.
+    pub fn observeSuccessfulExecution(
+        self: *KgClient,
+        task_id: u64,
+        tool_name: []const u8,
+        input_json: []const u8,
+        project_dir: []const u8,
+    ) void {
+        self.cacheLock();
+        defer self.cacheUnlock();
+        self.execution_ledger.observeSuccessfulTool(task_id, tool_name, input_json, project_dir);
+    }
+
+    pub fn executionKnowledgeSnapshot(
+        self: *KgClient,
+        allocator: std.mem.Allocator,
+        task_id: u64,
+    ) !execution_knowledge.Snapshot {
+        self.cacheLock();
+        defer self.cacheUnlock();
+        return self.execution_ledger.snapshot(allocator, task_id);
+    }
+
+    pub fn acknowledgeExecutionFact(
+        self: *KgClient,
+        task_id: u64,
+        relation: execution_knowledge.Relation,
+        value: []const u8,
+    ) bool {
+        self.cacheLock();
+        defer self.cacheUnlock();
+        return self.execution_ledger.acknowledge(task_id, relation, value);
+    }
+
+    pub fn pendingExecutionFacts(self: *KgClient, task_id: u64) usize {
+        self.cacheLock();
+        defer self.cacheUnlock();
+        return self.execution_ledger.pendingForTask(task_id);
     }
 
     fn resolveStorePath(allocator: std.mem.Allocator, opts: ResolveOptions) ![]u8 {

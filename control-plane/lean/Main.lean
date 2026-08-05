@@ -62,8 +62,19 @@ def main (args : List String) : IO UInt32 := do
           let observation : Observation := {
             sensorOk, declared, covered, feedback := feedbackStatus
           }
-          let controlSignal := signal topology observation
-          let state := nextState topology observation
+          let executionOntologyRule := ruleId == "ontology.execution-grounded-projection.l2"
+          let controlSignal := if executionOntologyRule then
+            executionProjectionSignal topology observation
+          else
+            signal topology observation
+          let state := if executionOntologyRule then
+            executionProjectionNextState topology observation
+          else
+            nextState topology observation
+          let allowed := if executionOntologyRule then
+            executionProjectionReleaseAllowed topology observation
+          else
+            releaseAllowed topology observation
           IO.println <|
             "{" ++
             "\"schema_version\":1," ++
@@ -76,7 +87,7 @@ def main (args : List String) : IO UInt32 := do
             "\"feedback\":\"" ++ feedbackName observation.feedback ++ "\"," ++
             "\"signal\":\"" ++ signalName controlSignal ++ "\"," ++
             "\"state\":\"" ++ stateName state ++ "\"," ++
-            "\"release_allowed\":" ++ boolJson (releaseAllowed topology observation) ++
+            "\"release_allowed\":" ++ boolJson allowed ++
             "}"
           pure 0
   | _ =>

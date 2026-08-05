@@ -58,6 +58,21 @@ fn makeClient(a: std.mem.Allocator, bin: []const u8, store: []const u8, domain: 
     });
 }
 
+fn neighborTargetContains(a: std.mem.Allocator, kg: *KgClient, node_id: u64, needle: []const u8) !bool {
+    const payload = try kg.neighborsJson(node_id, 100);
+    defer a.free(payload);
+    const Edge = struct { dst: u64 };
+    const Envelope = struct { edges: []const Edge };
+    const parsed = try std.json.parseFromSlice(Envelope, a, payload, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    for (parsed.value.edges) |edge| {
+        const text = kg.fetchNodeText(edge.dst) catch continue;
+        defer kg.allocator.free(text);
+        if (std.mem.indexOf(u8, text, needle) != null) return true;
+    }
+    return false;
+}
+
 test "L2 KG: ensureReady 建店 + 版本门通过 + remember/recall 往返" {
     const a = std.testing.allocator;
     const bin = findBin(a) orelse return error.SkipZigTest;
@@ -1965,6 +1980,125 @@ test "L2 KG: 目标导向投影 — 任务闭合经工具写 acts_on/uses/produc
     defer a.free(nb_b);
     try std.testing.expect(std.mem.indexOf(u8, nb_b, "\"rel\":\"acts_on\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, nb_b, "\"state\":\"tentative\"") != null);
+}
+
+test "L2 KG ontology feedback: successful host execution projects without model self-report" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const project_dir = pbuf[0..dir_len];
+    const store_path = try std.fmt.allocPrint(a, "{s}/kg-execution-feedback.kg", .{project_dir});
+    defer a.free(store_path);
+
+    var kg = try makeClient(a, bin, store_path, "proj-execution-feedback");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const root = try kg.createTask("execution-grounded ontology root", "plan_root");
+    const first = try kg.createChildTask(root, "first observed task", "plan_step");
+    const second = try kg.createChildTask(root, "second isolated task", "plan_step");
+
+    const first_path = try std.fmt.allocPrint(a, "{s}/first.zig", .{project_dir});
+    defer a.free(first_path);
+    const second_path = try std.fmt.allocPrint(a, "{s}/second.zig", .{project_dir});
+    defer a.free(second_path);
+    try overwriteFile(a, first_path, "const value = 1;\n");
+    try overwriteFile(a, second_path, "const sibling = 2;\n");
+
+    var tasks = cc.core_task_store.TaskStore.init(a);
+    defer tasks.deinit();
+    const ctx = cc.tool_context.ToolContext{
+        .allocator = a,
+        .tasks = &tasks,
+        .kg = &kg,
+        .project_dir = project_dir,
+        .cwd_abs = project_dir,
+    };
+    const rid = cc.util_log.RequestId{ .bytes = [_]u8{'k'} ** 12 };
+
+    // Claim is the provenance anchor. The host sensor refuses to guess if the
+    // TaskStore has zero or multiple in-progress kg-* mirrors.
+    const first_claim_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"in_progress\"}}", .{first});
+    defer a.free(first_claim_args);
+    const first_claim = try cc.task_tools.executeUpdate(&ctx, first_claim_args);
+    defer a.free(first_claim);
+
+    const read_first = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}\"}}", .{first_path});
+    defer a.free(read_first);
+    const edit_first = try std.fmt.allocPrint(
+        a,
+        "{{\"file_path\":\"{s}\",\"old_string\":\"const value = 1;\",\"new_string\":\"const value = 3; // PRIVATE_BODY_SENTINEL\"}}",
+        .{first_path},
+    );
+    defer a.free(edit_first);
+    var first_slots = [_]cc.tool_exec.Slot{
+        .{ .decision = .run, .name = "Read", .id = "read-first", .input = read_first },
+        .{ .decision = .run, .name = "Edit", .id = "edit-first", .input = edit_first },
+    };
+    defer for (&first_slots) |*slot| slot.deinit(a);
+    try cc.tool_exec.executeSlots(&first_slots, &ctx, a, rid);
+    try std.testing.expect(!first_slots[0].is_error);
+    try std.testing.expect(!first_slots[1].is_error);
+
+    // No acts_on/uses/produces fields: projection must be supplied entirely by
+    // the execution ledger, while raw Edit body never enters the graph.
+    const first_close_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"completed\",\"conclusion\":\"host execution verified\"}}", .{first});
+    defer a.free(first_close_args);
+    const first_close = try cc.task_tools.executeUpdate(&ctx, first_close_args);
+    defer a.free(first_close);
+    try std.testing.expect(std.mem.indexOf(u8, first_close, "\"explicit\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_close, "\"observed\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_close, "\"retained\":0") != null);
+    const first_neighbors = try kg.neighborsJson(first, 30);
+    defer a.free(first_neighbors);
+    try std.testing.expect(try neighborTargetContains(a, &kg, first, "first.zig"));
+    try std.testing.expect(std.mem.indexOf(u8, first_neighbors, "\"rel\":\"acts_on\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_neighbors, "\"rel\":\"produces\"") != null);
+    try std.testing.expect(!(try neighborTargetContains(a, &kg, first, "PRIVATE_BODY_SENTINEL")));
+
+    const second_claim_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"in_progress\"}}", .{second});
+    defer a.free(second_claim_args);
+    const second_claim = try cc.task_tools.executeUpdate(&ctx, second_claim_args);
+    defer a.free(second_claim);
+
+    const denied_input = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/DENIED_SENTINEL.zig\",\"content\":\"must not execute\"}}", .{project_dir});
+    defer a.free(denied_input);
+    const missing_input = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}/MISSING_SENTINEL.zig\"}}", .{project_dir});
+    defer a.free(missing_input);
+    const read_second = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}\"}}", .{second_path});
+    defer a.free(read_second);
+    var second_slots = [_]cc.tool_exec.Slot{
+        .{ .decision = .denied, .name = "Write", .id = "denied-write", .input = denied_input },
+        .{ .decision = .run, .name = "Read", .id = "failed-read", .input = missing_input },
+        .{ .decision = .run, .name = "Read", .id = "read-second", .input = read_second },
+    };
+    defer for (&second_slots) |*slot| slot.deinit(a);
+    try cc.tool_exec.executeSlots(&second_slots, &ctx, a, rid);
+    try std.testing.expect(second_slots[1].is_error);
+    try std.testing.expect(!second_slots[2].is_error);
+
+    // Explicit + observed copies of the same fact must collapse to one edge;
+    // task one above still proves the zero-self-report path independently.
+    const second_close_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"completed\",\"conclusion\":\"isolation verified\",\"acts_on\":[\"second.zig\"]}}", .{second});
+    defer a.free(second_close_args);
+    const second_close = try cc.task_tools.executeUpdate(&ctx, second_close_args);
+    defer a.free(second_close);
+    try std.testing.expect(std.mem.indexOf(u8, second_close, "\"observed\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_close, "\"explicit\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_close, "\"projected\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_close, "\"retained\":0") != null);
+    const second_neighbors = try kg.neighborsJson(second, 30);
+    defer a.free(second_neighbors);
+    try std.testing.expect(try neighborTargetContains(a, &kg, second, "second.zig"));
+    try std.testing.expect(!(try neighborTargetContains(a, &kg, second, "first.zig")));
+    try std.testing.expect(!(try neighborTargetContains(a, &kg, second, "DENIED_SENTINEL")));
+    try std.testing.expect(!(try neighborTargetContains(a, &kg, second, "MISSING_SENTINEL")));
+    try std.testing.expect(!(try neighborTargetContains(a, &kg, first, "second.zig")));
 }
 
 test "L2 KG: ref-edge 重试修复缺失 state 且不降级 confirmed" {

@@ -266,6 +266,183 @@ class MemoryGovernanceSensorTests(unittest.TestCase):
         self.assertTrue(any("not wired" in error for error in observation.errors))
 
 
+class ExecutionOntologySensorTests(unittest.TestCase):
+    def make_repo(self) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        for relative in (
+            "src/core",
+            "src/kg",
+            "src/tools",
+            "tests/component",
+        ):
+            (root / relative).mkdir(parents=True, exist_ok=True)
+        (root / "src/core/tool_exec.zig").write_text(
+            "pub fn executeSlots() void {\n"
+            "  if (slots[i].decision == .run and slots[i].prefetched)\n"
+            "    observeSuccessfulExecutions(slots[i .. i + 1], base_ctx);\n"
+            "  observeSuccessfulExecutions(slots[i..j], base_ctx);\n"
+            "}\n"
+            "fn observeSuccessfulExecutions() void {\n"
+            "  const task_id = tasks.uniqueActiveKgTaskId() orelse return;\n"
+            "  if (slot.decision != .run or slot.pending or slot.is_error or slot.content == null) continue;\n"
+            "  kg.observeSuccessfulExecution(task_id, slot.name, slot.input, project_dir);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (root / "src/core/task_store.zig").write_text(
+            "pub fn uniqueActiveKgTaskId() ?u64 {\n"
+            "  const node_id = std.fmt.parseInt(u64, task.id, 10) catch return null;\n"
+            "  if (active != null) return null;\n"
+            "  return node_id;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (root / "src/kg/client.zig").write_text(
+            "pub fn observeSuccessfulExecution() void {\n"
+            "  execution_ledger.observeSuccessfulTool(task_id, tool_name, input_json, project_dir);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (root / "src/kg/execution_knowledge.zig").write_text(
+            "pub fn observeSuccessfulTool() void {\n"
+            "  const resource = resourceSpec(tool_name) orelse return;\n"
+            "  const raw = extractStringField(input_json, resource.field);\n"
+            "  const normalized = normalizeProjectPath(raw, project_dir);\n"
+            "  _ = self.record(task_id, .acts_on, normalized);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (root / "src/tools/task_tools.zig").write_text(
+            "const ProjectionReport = struct { observed: usize, projected: usize, failed: usize, dropped: usize, retained: usize };\n"
+            "fn writeClosureProjection() void {\n"
+            "  const snapshot = executionKnowledgeSnapshot();\n"
+            "  addRefEdge(task, relation, concept, false);\n"
+            "  acknowledgeExecutionFact(task, relation, value);\n"
+            "}\n"
+            "fn updateKgTask() void {\n"
+            "  const projection = writeClosureProjection(ctx, kg, task, args);\n"
+            "  appendProjectionReport(ctx, out, projection);\n"
+            "}\n"
+            "fn failKgTask() void {\n"
+            "  const projection = writeClosureProjection(ctx, kg, task, args);\n"
+            "  appendProjectionReport(ctx, out, projection);\n"
+            "}\n"
+            "pub fn executeStop() void {\n"
+            "  const projection = writeClosureProjection(ctx, kg, task, args);\n"
+            "  appendProjectionReport(ctx, out, projection);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (root / "tests/component/kg_integration_test.zig").write_text(
+            'test "L2 KG ontology feedback: successful host execution projects without model self-report" {\n'
+            '  try cc.tool_exec.executeSlots();\n'
+            '  try cc.task_tools.executeUpdate();\n'
+            '  try std.testing.expect(has("\\"explicit\\":0"));\n'
+            '  try std.testing.expect(has("\\"observed\\":2"));\n'
+            '  try std.testing.expect(has("DENIED_SENTINEL"));\n'
+            '  try std.testing.expect(has("MISSING_SENTINEL"));\n'
+            '  try std.testing.expect(has("PRIVATE_BODY_SENTINEL"));\n'
+            '  try std.testing.expect(has("first.zig"));\n'
+            '  try std.testing.expect(has("second.zig"));\n'
+            '}\n',
+            encoding="utf-8",
+        )
+        (root / "build.zig").write_text(
+            'const kg_ontology_feedback_step = b.step("test:kg-ontology-feedback", "fixture");\n'
+            'const test_file = "tests/component/kg_integration_test.zig";\n'
+            'kg_ontology_feedback_step.dependOn(&run_t.step);\n'
+            'const later_step = b.step("test:later", "boundary");\n',
+            encoding="utf-8",
+        )
+        return temporary, root
+
+    def test_execution_sensor_projection_and_feedback_form_three_obligations(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        observation = rule_control.observe_execution_ontology_feedback(root)
+        self.assertTrue(observation.sensor_ok, observation.errors)
+        self.assertEqual(3, observation.declared)
+        self.assertEqual(3, observation.covered)
+        self.assertEqual(
+            [{"step": "test:kg-ontology-feedback", "filter": "L2 KG ontology feedback:"}],
+            observation.feedback_bindings,
+        )
+
+    def test_disconnected_tool_exec_sensor_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        source = root / "src/core/tool_exec.zig"
+        source.write_text(
+            source.read_text(encoding="utf-8").replace(
+                "kg.observeSuccessfulExecution(task_id, slot.name, slot.input, project_dir);",
+                "_ = task_id;",
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_execution_ontology_feedback(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn("successful_execution_sensor", observation.missing_declarations)
+
+    def test_comment_or_manifest_words_cannot_replace_execution_sensor(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        (root / "src/core/tool_exec.zig").write_text(
+            "// observeSuccessfulExecutions kg.observeSuccessfulExecution uniqueActiveKgTaskId slot.is_error\n",
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_execution_ontology_feedback(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn("successful_execution_sensor", observation.missing_declarations)
+
+    def test_taskupdate_must_consume_projection(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        source = root / "src/tools/task_tools.zig"
+        source.write_text(
+            source.read_text(encoding="utf-8").replace(
+                "const projection = writeClosureProjection(ctx, kg, task, args);",
+                "const projection = ProjectionReport{};",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_execution_ontology_feedback(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn("task_close_projection_actuator", observation.missing_declarations)
+
+    def test_unwired_focused_feedback_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        (root / "build.zig").write_text(
+            'const kg_ontology_feedback_step = b.step("test:kg-ontology-feedback", "fixture");\n'
+            '// tests/component/kg_integration_test.zig and dependOn are inert comments\n'
+            'const later_step = b.step("test:later", "boundary");\n',
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_execution_ontology_feedback(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn("focused_l2_feedback", observation.missing_declarations)
+
+
+class FeedbackExecutionTests(unittest.TestCase):
+    def test_zero_exit_with_skipped_feedback_fails_closed(self) -> None:
+        passed, results = rule_control.run_feedback(
+            Path.cwd(),
+            {"commands": [["python", "-c", "print('1 skipped')"]], "timeout_seconds": 30},
+        )
+        self.assertFalse(passed)
+        self.assertEqual(1, results[0]["skipped_tests"])
+
+    def test_nonzero_feedback_fails_closed(self) -> None:
+        passed, results = rule_control.run_feedback(
+            Path.cwd(),
+            {"commands": [["python", "-c", "raise SystemExit(7)"]], "timeout_seconds": 30},
+        )
+        self.assertFalse(passed)
+        self.assertEqual(7, results[0]["exit_code"])
+
+
 class TopologyTests(unittest.TestCase):
     def actuator_config(self) -> dict:
         return {
@@ -361,6 +538,28 @@ class TopologyTests(unittest.TestCase):
             actuator_observed=True,
         )
         self.assertTrue(topology["sensor"], errors)
+
+    def test_execution_ontology_rule_requires_its_runtime_lean_kernel(self) -> None:
+        rule = self.complete_rule()
+        rule["id"] = "ontology.execution-grounded-projection.l2"
+        rule["sensor"] = {
+            "adapter": "execution_ontology_feedback",
+            "schema_version": 1,
+        }
+        rule["decision"]["kernel"] = "MetaCodesControl.ClosedLoop.executionProjectionSignal"
+        topology, errors = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertTrue(topology["decision"], errors)
+        rule["decision"]["kernel"] = "MetaCodesControl.ClosedLoop.signal"
+        weakened, _ = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertFalse(weakened["decision"])
 
     def test_release_gate_is_observed_from_build_ci_and_telemetry_wiring(self) -> None:
         temporary, workspace, repo, actuator = self.make_actuator_workspace()

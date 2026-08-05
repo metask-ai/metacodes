@@ -173,6 +173,23 @@ pub const TaskStore = struct {
         return null;
     }
 
+    /// Return the one persistent KG task currently owned by this agent loop.
+    /// Zero, multiple, or malformed `kg-*` mirrors are deliberately
+    /// indistinguishable: execution-grounded knowledge must fail safe instead
+    /// of guessing which task should receive a fact.
+    pub fn uniqueActiveKgTaskId(self: *TaskStore) ?u64 {
+        _ = self.mutex.lock();
+        defer _ = self.mutex.unlock();
+        var active: ?u64 = null;
+        for (self.tasks.items) |task| {
+            if (task.status != .in_progress or !std.mem.startsWith(u8, task.id, "kg-")) continue;
+            const node_id = std.fmt.parseInt(u64, task.id["kg-".len..], 10) catch return null;
+            if (node_id == 0 or active != null) return null;
+            active = node_id;
+        }
+        return active;
+    }
+
     /// 更新 status。若 deleted 则实际从列表删除并释放。
     pub fn updateStatus(self: *TaskStore, id: []const u8, status: TaskStatus) !void {
         _ = self.mutex.lock(); // task#19
@@ -370,6 +387,26 @@ test "TaskStore: completed 记 completed_ms,转出 completed 清零" {
     // 转回 in_progress(返工)→ 时戳清零,TTL 重置。
     try store.updateStatus(t.id, .in_progress);
     try testing.expectEqual(@as(i64, 0), t.completed_ms);
+}
+
+test "TaskStore: unique active KG task fails safe on ambiguity and malformed ids" {
+    var store = TaskStore.init(testing.allocator);
+    defer store.deinit();
+    try testing.expect(store.uniqueActiveKgTaskId() == null);
+
+    try store.createWithId("kg-41", "one", "", .in_progress);
+    try testing.expectEqual(@as(?u64, 41), store.uniqueActiveKgTaskId());
+
+    try store.createWithId("session-only", "scratch", "", .in_progress);
+    try testing.expectEqual(@as(?u64, 41), store.uniqueActiveKgTaskId());
+
+    try store.createWithId("kg-42", "two", "", .in_progress);
+    try testing.expect(store.uniqueActiveKgTaskId() == null);
+    try store.updateStatus("kg-42", .pending);
+    try testing.expectEqual(@as(?u64, 41), store.uniqueActiveKgTaskId());
+
+    try store.createWithId("kg-not-a-number", "bad", "", .in_progress);
+    try testing.expect(store.uniqueActiveKgTaskId() == null);
 }
 
 test "task#19: snapshotTasks 正确性 + 并发 create/snapshot 不崩(mutex 串行)" {
