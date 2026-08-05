@@ -58,13 +58,27 @@ if [[ "$host_os" == "Darwin" ]]; then
       link_args+=("-L$library_dir")
     fi
   done
-  tmp_binary=$(mktemp "${TMPDIR:-/tmp}/metacodes-formal-kernel.XXXXXX")
-  trap 'rm -f "$tmp_binary"' EXIT
-  LEAN_CC=/usr/bin/clang "$leanc" -o "$tmp_binary" \
-    "$lean_dir/.lake/build/ir/FormalMain.c.o.export" \
-    "$lean_dir/.lake/build/ir/MetaCodesControl/FormalKernel.c.o.export" \
-    "$lean_dir/.lake/build/ir/MetaCodesControl/MemoryMigration.c.o.export" \
-    "${link_args[@]}"
+  # Apple's linker derives the ad-hoc code-sign identifier from the output
+  # basename.  Passing mktemp's random basename here made otherwise identical
+  # Lean IR produce a different LC_UUID and signature on every build.  Keep the
+  # parent private/random but the basename stable, then relink independently and
+  # require byte identity before publishing the artifact.
+  tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/metacodes-formal-kernel.XXXXXX")
+  mkdir "$tmp_dir/first" "$tmp_dir/second"
+  tmp_binary="$tmp_dir/first/metacodes-formal-kernel"
+  tmp_repro="$tmp_dir/second/metacodes-formal-kernel"
+  trap 'rm -f "$tmp_binary" "$tmp_repro"; rmdir "$tmp_dir/first" "$tmp_dir/second" "$tmp_dir" 2>/dev/null || true' EXIT
+  for candidate in "$tmp_binary" "$tmp_repro"; do
+    LEAN_CC=/usr/bin/clang "$leanc" -o "$candidate" \
+      "$lean_dir/.lake/build/ir/FormalMain.c.o.export" \
+      "$lean_dir/.lake/build/ir/MetaCodesControl/FormalKernel.c.o.export" \
+      "$lean_dir/.lake/build/ir/MetaCodesControl/MemoryMigration.c.o.export" \
+      "${link_args[@]}"
+  done
+  if ! cmp -s "$tmp_binary" "$tmp_repro"; then
+    echo "build-formal-kernel: Darwin relink is not reproducible" >&2
+    exit 1
+  fi
   data_const_flags=$(otool -l "$tmp_binary" | awk '
     $1 == "segname" && $2 == "__DATA_CONST" { in_segment = 1; next }
     in_segment && $1 == "flags" { print $2; exit }
