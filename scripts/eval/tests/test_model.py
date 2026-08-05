@@ -13,6 +13,8 @@ SUITES = (
     ROOT / "evals" / "suites" / "websearch-concurrency.json",
     ROOT / "evals" / "suites" / "kg-lexical-bridge.json",
     ROOT / "evals" / "suites" / "long-horizon-control-plane.json",
+    ROOT / "evals" / "suites" / "long-horizon-calibration.json",
+    ROOT / "evals" / "suites" / "long-horizon-repository-pk.json",
 )
 
 
@@ -91,6 +93,32 @@ class SuiteValidationTest(unittest.TestCase):
         missing["tasks"][0]["environment"]["fixtures"] = ["tests/no-such-fixture"]
         with self.assertRaisesRegex(ValidationError, "file does not exist"):
             validate_suite(missing, ROOT)
+
+    def test_repository_snapshot_and_validator_paths_fail_closed(self):
+        suite = load_json(SUITES[-1])
+        short_revision = copy.deepcopy(suite)
+        short_revision["tasks"][0]["environment"]["repository_snapshot"]["revision"] = "abc123"
+        with self.assertRaisesRegex(ValidationError, "full lowercase Git commit"):
+            validate_suite(short_revision, ROOT)
+
+        escaped_snapshot = copy.deepcopy(suite)
+        escaped_snapshot["tasks"][0]["environment"]["repository_snapshot"]["paths"] = ["../secret"]
+        with self.assertRaisesRegex(ValidationError, "safe paths"):
+            validate_suite(escaped_snapshot, ROOT)
+
+        for ambiguous in ("src/./main.zig", "src//main.zig", "src\\main.zig"):
+            with self.subTest(ambiguous=ambiguous):
+                noncanonical = copy.deepcopy(suite)
+                noncanonical["tasks"][0]["environment"]["repository_snapshot"][
+                    "paths"
+                ] = [ambiguous]
+                with self.assertRaisesRegex(ValidationError, "safe paths"):
+                    validate_suite(noncanonical, ROOT)
+
+        escaped_validator = copy.deepcopy(suite)
+        escaped_validator["tasks"][0]["success"]["checks"][0]["validator"] = "../validator.py"
+        with self.assertRaisesRegex(ValidationError, "below evals/validators"):
+            validate_suite(escaped_validator, ROOT)
 
     def test_rollout_rejects_inconsistent_trustworthy_success(self):
         from scripts.eval.tests.test_analysis import rollout

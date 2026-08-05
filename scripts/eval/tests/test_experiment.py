@@ -15,23 +15,41 @@ from scripts.eval.experiment import (
     tinykg_binary_identity,
     validate_experiment,
 )
-from scripts.eval.model import ValidationError, load_json, load_rollouts
+from scripts.eval.model import ValidationError, load_json, load_rollouts, write_rollouts
 from scripts.eval.paired_runner import InfrastructureRunError, run_multi_arm
+from scripts.eval.promotion import build_promotion_receipt
+from scripts.eval.tests.multi_arm_fixture import write_multi_arm_checkpoints
 
 
 ROOT = Path(__file__).resolve().parents[3]
-EXPERIMENT_PATH = ROOT / "evals/experiments/long-horizon-three-arm-v1.json"
-SUITE_PATH = ROOT / "evals/suites/long-horizon-control-plane.json"
+EXPERIMENT_PATH = ROOT / "evals/experiments/long-horizon-three-arm-calibration-v2.json"
+SUITE_PATH = ROOT / "evals/suites/long-horizon-calibration.json"
+CONFIRMATORY_EXPERIMENT_PATH = (
+    ROOT / "evals/experiments/long-horizon-three-arm-confirmatory-v2.json"
+)
+CONFIRMATORY_SUITE_PATH = ROOT / "evals/suites/long-horizon-repository-pk.json"
 
 
 class LongHorizonExperimentTest(unittest.TestCase):
     def setUp(self):
         self.experiment = load_json(EXPERIMENT_PATH)
         self.suite = load_json(SUITE_PATH)
+        self.confirmatory_experiment = load_json(CONFIRMATORY_EXPERIMENT_PATH)
+        self.confirmatory_suite = load_json(CONFIRMATORY_SUITE_PATH)
 
     def test_checked_in_contract_is_valid_and_zero_cost(self):
         validate_experiment(self.experiment, ROOT, self.suite)
+        validate_experiment(
+            self.confirmatory_experiment, ROOT, self.confirmatory_suite
+        )
         self.assertFalse(self.experiment["budget"]["paid_rollouts_enabled"])
+        self.assertFalse(
+            self.confirmatory_experiment["budget"]["paid_rollouts_enabled"]
+        )
+        self.assertEqual(self.experiment["stage"]["id"], "calibration")
+        self.assertEqual(
+            self.confirmatory_experiment["stage"]["id"], "confirmatory"
+        )
         self.assertEqual([arm["id"] for arm in self.experiment["arms"]], list(ARM_IDS))
 
     def test_schedule_balances_every_position_and_ordered_carryover(self):
@@ -67,6 +85,14 @@ class LongHorizonExperimentTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValidationError, "workspace artifacts only"):
             validate_experiment(self.experiment, ROOT, non_blind_suite)
+
+    def test_confirmatory_manifest_freezes_calibration_source_fingerprint(self):
+        replayed = copy.deepcopy(self.confirmatory_experiment)
+        replayed["promotion"]["source_experiment_fingerprint"] = "0" * 16
+        with self.assertRaisesRegex(
+            ValidationError, "source manifest identity or fingerprint mismatch"
+        ):
+            validate_experiment(replayed, ROOT, self.confirmatory_suite)
 
     def test_tinykg_dependency_probe_freezes_hash_and_store_schema(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -129,7 +155,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                     revision="abc123",
                 )
         self.assertEqual(first, second)
-        self.assertEqual(first["rollout_count"], 54)
+        self.assertEqual(first["rollout_count"], 18)
         self.assertEqual(first["execution_identity"]["revision"], "abc123")
         self.assertEqual(first["execution_identity"]["tinykg"], tinykg_identity)
         self.assertEqual(len({row["harness_config_id"] for row in first["rows"]}), 3)
@@ -301,8 +327,8 @@ class LongHorizonExperimentTest(unittest.TestCase):
                     suite_path=SUITE_PATH,
                     allow_paid_rollouts=True,
                 )
-            self.assertEqual(len(invocations), 52)
-            self.assertEqual(sum(len(rows) for rows in result.values()), 54)
+            self.assertEqual(len(invocations), 16)
+            self.assertEqual(sum(len(rows) for rows in result.values()), 18)
 
     def test_multi_arm_rechecks_binary_after_each_rollout(self):
         experiment = copy.deepcopy(self.experiment)
@@ -433,6 +459,144 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 checkpoint[0]["task_fingerprint_provenance"],
                 "runner_frozen_before_execution",
             )
+
+    def test_confirmatory_runner_requires_and_wires_calibration_receipt(self):
+        experiment = copy.deepcopy(self.confirmatory_experiment)
+        experiment["budget"]["paid_rollouts_enabled"] = True
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "metacodes"
+            binary.write_bytes(b"confirmatory-metacodes")
+            binary.chmod(0o755)
+            tinykg = root / "tinykg"
+            tinykg.write_bytes(b"confirmatory-tinykg")
+            tinykg.chmod(0o755)
+            metacodes_sha = hashlib.sha256(binary.read_bytes()).hexdigest()
+            tinykg_sha = hashlib.sha256(tinykg.read_bytes()).hexdigest()
+            tinykg_identity = {
+                "path": str(tinykg.resolve()),
+                "sha256": tinykg_sha,
+                "version": "tinykg test",
+            }
+            with mock.patch(
+                "scripts.eval.paired_runner.tinykg_binary_identity",
+                return_value=tinykg_identity,
+            ):
+                with self.assertRaisesRegex(
+                    ValidationError, "requires a calibration promotion receipt"
+                ):
+                    run_multi_arm(
+                        experiment,
+                        self.confirmatory_suite,
+                        ROOT,
+                        binary,
+                        tinykg_binary=tinykg,
+                        revision="confirmatory-revision",
+                        output_dir=root / "missing-receipt",
+                        suite_path=CONFIRMATORY_SUITE_PATH,
+                        allow_paid_rollouts=True,
+                    )
+
+            calibration_paths = write_multi_arm_checkpoints(
+                root / "calibration",
+                self.experiment,
+                self.suite,
+                ROOT,
+                metacodes_sha256=metacodes_sha,
+                tinykg_sha256=tinykg_sha,
+                revision="confirmatory-revision",
+            )
+            receipt = build_promotion_receipt(
+                self.experiment, self.suite, ROOT, calibration_paths
+            )
+            with mock.patch(
+                "scripts.eval.paired_runner.tinykg_binary_identity",
+                return_value=tinykg_identity,
+            ):
+                with self.assertRaisesRegex(
+                    ValidationError, "authoritative calibration checkpoints"
+                ):
+                    run_multi_arm(
+                        experiment,
+                        self.confirmatory_suite,
+                        ROOT,
+                        binary,
+                        tinykg_binary=tinykg,
+                        revision="confirmatory-revision",
+                        output_dir=root / "missing-checkpoints",
+                        suite_path=CONFIRMATORY_SUITE_PATH,
+                        allow_paid_rollouts=True,
+                        promotion_receipt=receipt,
+                    )
+            with mock.patch(
+                "scripts.eval.paired_runner.tinykg_binary_identity",
+                return_value=tinykg_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner._run_once",
+                side_effect=RuntimeError("receipt accepted before paid rollout seam"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "receipt accepted"):
+                    run_multi_arm(
+                        experiment,
+                        self.confirmatory_suite,
+                        ROOT,
+                        binary,
+                        tinykg_binary=tinykg,
+                        revision="confirmatory-revision",
+                        output_dir=root / "accepted-receipt",
+                        suite_path=CONFIRMATORY_SUITE_PATH,
+                        allow_paid_rollouts=True,
+                        promotion_receipt=receipt,
+                        calibration_checkpoints=calibration_paths,
+                    )
+
+            broken = copy.deepcopy(receipt)
+            broken["identity"]["harness_revision"] = "wrong"
+            with mock.patch(
+                "scripts.eval.paired_runner.tinykg_binary_identity",
+                return_value=tinykg_identity,
+            ):
+                with self.assertRaisesRegex(
+                    ValidationError, "does not match authoritative calibration"
+                ):
+                    run_multi_arm(
+                        experiment,
+                        self.confirmatory_suite,
+                        ROOT,
+                        binary,
+                        tinykg_binary=tinykg,
+                        revision="confirmatory-revision",
+                        output_dir=root / "bad-receipt",
+                        suite_path=CONFIRMATORY_SUITE_PATH,
+                        allow_paid_rollouts=True,
+                        promotion_receipt=broken,
+                        calibration_checkpoints=calibration_paths,
+                    )
+
+            tampered = load_rollouts(calibration_paths["tinykg"])
+            tampered[0]["metrics"]["cost_usd"] = 0.5
+            write_rollouts(calibration_paths["tinykg"], tampered)
+            with mock.patch(
+                "scripts.eval.paired_runner.tinykg_binary_identity",
+                return_value=tinykg_identity,
+            ), mock.patch("scripts.eval.paired_runner._run_once") as run_once:
+                with self.assertRaisesRegex(
+                    ValidationError, "does not match authoritative calibration"
+                ):
+                    run_multi_arm(
+                        experiment,
+                        self.confirmatory_suite,
+                        ROOT,
+                        binary,
+                        tinykg_binary=tinykg,
+                        revision="confirmatory-revision",
+                        output_dir=root / "tampered-checkpoint",
+                        suite_path=CONFIRMATORY_SUITE_PATH,
+                        allow_paid_rollouts=True,
+                        promotion_receipt=receipt,
+                        calibration_checkpoints=calibration_paths,
+                    )
+            run_once.assert_not_called()
 
 
 if __name__ == "__main__":

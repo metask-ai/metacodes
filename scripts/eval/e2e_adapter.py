@@ -8,6 +8,9 @@ import os
 import platform
 import re
 import stat
+import subprocess
+import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -21,6 +24,7 @@ EVALUATION_CONTRACT_VERSION = 3
 NATIVE_EVENT_SCHEMA_VERSION = EVALUATION_CONTRACT_VERSION
 MAX_NATIVE_EVENT_BYTES = 64 * 1024 * 1024
 MAX_METADATA_BYTES = 1024 * 1024
+MAX_VALIDATOR_OUTPUT_BYTES = 1024 * 1024
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -89,14 +93,33 @@ def _fingerprint(value: Any) -> str:
     return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()[:16]
 
 
-def _grader_fingerprint(task: Dict[str, Any]) -> str:
-    return _fingerprint(
-        {
-            "evaluation_contract_version": EVALUATION_CONTRACT_VERSION,
-            "grader": task["grader"],
-            "checks": task["success"]["checks"],
-        }
-    )
+def _validator_hashes(task: Dict[str, Any], repo_root: Path) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    for check in task["success"]["checks"]:
+        if check.get("type") != "validator":
+            continue
+        path = (repo_root / check["validator"]).resolve()
+        try:
+            relative = path.relative_to(repo_root.resolve()).as_posix()
+            if path.is_symlink() or not path.is_file():
+                raise OSError("validator is not a regular file")
+            payload = path.read_bytes()
+        except (OSError, ValueError) as exc:
+            raise ValidationError(f"cannot fingerprint validator {path}: {exc}") from exc
+        result[relative] = hashlib.sha256(payload).hexdigest()
+    return dict(sorted(result.items()))
+
+
+def _grader_fingerprint(task: Dict[str, Any], repo_root: Path) -> str:
+    payload = {
+        "evaluation_contract_version": EVALUATION_CONTRACT_VERSION,
+        "grader": task["grader"],
+        "checks": task["success"]["checks"],
+    }
+    validator_sha256 = _validator_hashes(task, repo_root)
+    if validator_sha256:
+        payload["validator_sha256"] = validator_sha256
+    return _fingerprint(payload)
 
 
 def _execution_input_hashes(task: Dict[str, Any], repo_root: Path) -> Dict[str, str]:
@@ -108,6 +131,9 @@ def _execution_input_hashes(task: Dict[str, Any], repo_root: Path) -> Dict[str, 
         paths.append(companion)
     for fixture in task.get("environment", {}).get("fixtures", []):
         paths.append(repo_root / fixture)
+    for check in task["success"]["checks"]:
+        if check.get("type") == "validator":
+            paths.append(repo_root / check["validator"])
     result: Dict[str, str] = {}
     for path in paths:
         try:
@@ -116,6 +142,60 @@ def _execution_input_hashes(task: Dict[str, Any], repo_root: Path) -> Dict[str, 
         except (OSError, ValueError) as exc:
             raise ValidationError(f"cannot fingerprint execution input {path}: {exc}") from exc
         result[relative] = hashlib.sha256(payload).hexdigest()
+    snapshot = task.get("environment", {}).get("repository_snapshot")
+    if snapshot is not None:
+        revision = snapshot["revision"]
+        prefix = snapshot["prefix"].strip("/")
+        archive_paths = [f"{prefix}/{item.strip('/')}" for item in snapshot["paths"]]
+        try:
+            git_root = subprocess.run(
+                ["git", "-C", str(repo_root), "rev-parse", "--show-toplevel"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            ).stdout.strip()
+            verified = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    git_root,
+                    "rev-parse",
+                    "--verify",
+                    f"{revision}^{{commit}}",
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            ).stdout.strip()
+            listing = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    git_root,
+                    "ls-tree",
+                    "-r",
+                    "--full-tree",
+                    revision,
+                    "--",
+                    *archive_paths,
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=20,
+            ).stdout
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ValidationError(f"cannot fingerprint repository snapshot: {exc}") from exc
+        if verified != revision or not listing:
+            raise ValidationError("repository snapshot revision or sparse paths are unavailable")
+        for line in listing.splitlines():
+            if line.startswith(b"120000 ") or b" commit " in line:
+                raise ValidationError("repository snapshot may contain regular files only")
+        result[f"git:{revision}:{prefix}"] = hashlib.sha256(listing).hexdigest()
     return dict(sorted(result.items()))
 
 
@@ -286,7 +366,7 @@ def comparison_fingerprints(
                 "execution_inputs": execution_inputs,
             }
         ),
-        "grader_fingerprint": _grader_fingerprint(task),
+        "grader_fingerprint": _grader_fingerprint(task, repo_root),
         "model_fingerprint": _fingerprint(
             {"provider": model_provider, "id": model_id}
         ),
@@ -322,7 +402,7 @@ def grounding_fingerprints(task: Dict[str, Any], repo_root: Path) -> Dict[str, s
         "task_fingerprint": _fingerprint(
             {"task": task, "execution_inputs": execution_inputs}
         ),
-        "grader_fingerprint": _grader_fingerprint(task),
+        "grader_fingerprint": _grader_fingerprint(task, repo_root),
         "environment_fingerprint": _fingerprint(
             {
                 "environment": task["environment"],
@@ -572,15 +652,130 @@ def _count_policy_violations(
     )
 
 
+def _run_validator_capped(
+    command: List[str],
+    *,
+    cwd: Path,
+    env: Dict[str, str],
+    timeout_seconds: int,
+) -> Tuple[int, int, str, bool, bool]:
+    """Drain validator output without allowing an unbounded pipe allocation."""
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    assert process.stdout is not None
+    tail = bytearray()
+    state: Dict[str, Any] = {"bytes": 0, "overflow": False, "error": None}
+
+    def drain() -> None:
+        try:
+            while True:
+                chunk = process.stdout.read(64 * 1024)
+                if not chunk:
+                    return
+                state["bytes"] += len(chunk)
+                tail.extend(chunk)
+                if len(tail) > 4000:
+                    del tail[:-4000]
+                if state["bytes"] > MAX_VALIDATOR_OUTPUT_BYTES:
+                    state["overflow"] = True
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                    return
+        except OSError as exc:
+            state["error"] = exc
+        finally:
+            process.stdout.close()
+
+    reader = threading.Thread(target=drain, name="eval-validator-output", daemon=True)
+    reader.start()
+    timed_out = False
+    try:
+        returncode = process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        process.kill()
+        returncode = process.wait()
+    reader.join(timeout=2)
+    if reader.is_alive():
+        process.stdout.close()
+        reader.join(timeout=1)
+    if reader.is_alive():
+        raise OSError("validator output pipe did not close after process exit")
+    if state["error"] is not None and not timed_out and not state["overflow"]:
+        raise OSError(f"cannot read validator output: {state['error']}")
+    combined = bytes(tail).decode("utf-8", "replace").strip()
+    return (
+        returncode,
+        int(state["bytes"]),
+        combined,
+        bool(state["overflow"]),
+        timed_out,
+    )
+
+
 def _evaluate_check(
-    check: Dict[str, Any], workspace: Path, log_text: str, debug_log_text: str = ""
+    check: Dict[str, Any],
+    workspace: Path,
+    log_text: str,
+    debug_log_text: str = "",
+    *,
+    repo_root: Optional[Path] = None,
 ) -> Dict[str, Any]:
     kind = check["type"]
     description = check.get("description") or kind
     target: Optional[Path] = None
     target_text: Optional[str] = None
     read_error: Optional[str] = None
-    if kind not in {
+    passed = False
+    detail = ""
+    if kind == "validator":
+        if repo_root is None:
+            read_error = "validator check requires an explicit repository root"
+        else:
+            validator = (repo_root / check["validator"]).resolve()
+            try:
+                validator.relative_to(repo_root.resolve())
+                if validator.is_symlink() or not validator.is_file():
+                    raise OSError("validator is not a regular file")
+                returncode, output_bytes, combined, overflow, timed_out = (
+                    _run_validator_capped(
+                        [
+                            sys.executable,
+                            "-I",
+                            str(validator),
+                            str(workspace.resolve()),
+                        ],
+                        cwd=workspace,
+                        env={
+                            "PATH": os.environ.get("PATH", ""),
+                            "LANG": "C.UTF-8",
+                            "LC_ALL": "C.UTF-8",
+                        },
+                        timeout_seconds=check.get("timeout_seconds", 30),
+                    )
+                )
+                if timed_out:
+                    read_error = f"validator exceeded {check.get('timeout_seconds', 30)}s"
+                elif overflow:
+                    read_error = (
+                        f"validator output exceeds {MAX_VALIDATOR_OUTPUT_BYTES} byte limit"
+                    )
+                else:
+                    passed = returncode == 0
+                detail = (
+                    f"{check['validator']} exited {returncode} "
+                    f"output_bytes={output_bytes}: {combined}"
+                )
+            except (OSError, ValueError) as exc:
+                read_error = f"cannot execute validator: {exc}"
+    elif kind not in {
         "log_contains",
         "log_not_contains",
         "debug_log_contains",
@@ -622,9 +817,9 @@ def _evaluate_check(
             except OSError as exc:
                 read_error = str(exc)
 
-    passed = False
-    detail = ""
-    if kind == "file_exists":
+    if kind == "validator":
+        pass
+    elif kind == "file_exists":
         passed = bool(target and read_error is None and target.is_file())
         detail = f"{check['path']} {'exists' if passed else 'is missing'}"
     elif kind == "file_absent":
@@ -1400,7 +1595,7 @@ def import_run(
         task_fingerprint_provenance = "inferred_from_current_suite"
         rollout_run_id = f"{run_dir.name}:{task_id}:0"
         rollout_trial = 0
-        grader_fingerprint = _grader_fingerprint(task)
+        grader_fingerprint = _grader_fingerprint(task, repo_root)
         if native is not None:
             native_meta = native["metadata"]
             metrics = native["metrics"]
@@ -1431,7 +1626,7 @@ def import_run(
                 and native_meta.get("runtime_permission_mode")
                 == native_meta.get("permission_mode")
                 and grader_fingerprint
-                == _grader_fingerprint(task)
+                == _grader_fingerprint(task, repo_root)
             )
             readiness_checks.append(
                 {
@@ -1442,7 +1637,13 @@ def import_run(
             )
 
         outcome_checks = [
-            _evaluate_check(check, workspace, log_text, debug_text)
+            _evaluate_check(
+                check,
+                workspace,
+                log_text,
+                debug_text,
+                repo_root=repo_root,
+            )
             for check in task["success"]["checks"]
         ]
         evaluator_errors = [

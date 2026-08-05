@@ -5,8 +5,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Optional
 
 
@@ -33,12 +34,40 @@ CHECK_TYPES = frozenset(
         "debug_tool_input_contains",
         "debug_tool_input_not_contains",
         "assistant_contains",
+        "validator",
     }
 )
 
 
 class ValidationError(ValueError):
     """The evaluation artifact is structurally invalid."""
+
+
+def safe_posix_relative_path(value: Any, where: str) -> PurePosixPath:
+    """Parse one canonical repository-relative POSIX path.
+
+    Evaluation manifests are portable data, so accepting a host-native path on
+    one machine and interpreting it differently on another is a contract bug.
+    Reject normalization-sensitive spellings up front instead of waiting for
+    the snapshot materializer to fail at execution time.
+    """
+    if not isinstance(value, str) or not value or "\\" in value:
+        raise ValidationError(f"{where}: expected a canonical relative POSIX path")
+    components = value.split("/")
+    if any(component in {"", ".", ".."} for component in components):
+        raise ValidationError(f"{where}: expected a canonical relative POSIX path")
+    path = PurePosixPath(value)
+    if path.is_absolute() or path.as_posix() != value:
+        raise ValidationError(f"{where}: expected a canonical relative POSIX path")
+    return path
+
+
+def _is_safe_posix_relative_path(value: Any, where: str) -> bool:
+    try:
+        safe_posix_relative_path(value, where)
+    except ValidationError:
+        return False
+    return True
 
 
 def _validate_finite_numbers(value: Any, where: str) -> None:
@@ -93,7 +122,9 @@ def _validate_check(check: Dict[str, Any], where: str) -> None:
         raise ValidationError(f"{where}.type: unsupported check {kind!r}")
     if kind.startswith("file_") or kind in {"contains", "contains_any", "not_contains", "min_lines"}:
         path = _require(check, "path", str, where)
-        if not path or Path(path).is_absolute() or ".." in Path(path).parts:
+        try:
+            safe_posix_relative_path(path, f"{where}.path")
+        except ValidationError:
             raise ValidationError(f"{where}.path: must be a safe workspace-relative path")
     if kind in {
         "contains",
@@ -119,6 +150,23 @@ def _validate_check(check: Dict[str, Any], where: str) -> None:
         minimum = _require(check, "minimum", int, where)
         if minimum < 0:
             raise ValidationError(f"{where}.minimum: must be >= 0")
+    if kind == "validator":
+        validator = _require(check, "validator", str, where)
+        try:
+            validator_path = safe_posix_relative_path(
+                validator, f"{where}.validator"
+            )
+        except ValidationError:
+            validator_path = PurePosixPath()
+        if validator_path.parts[:2] != ("evals", "validators"):
+            raise ValidationError(
+                f"{where}.validator: must be a safe path below evals/validators"
+            )
+        timeout = check.get("timeout_seconds", 30)
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= 120:
+            raise ValidationError(
+                f"{where}.timeout_seconds: expected integer in [1, 120]"
+            )
 
 
 def validate_suite(data: Dict[str, Any], root: Path) -> List[str]:
@@ -159,6 +207,52 @@ def validate_suite(data: Dict[str, Any], root: Path) -> List[str]:
 
         environment = _require(task, "environment", dict, where)
         _require(environment, "reset", str, f"{where}.environment")
+        snapshot = environment.get("repository_snapshot")
+        if snapshot is not None:
+            if not isinstance(snapshot, dict) or set(snapshot) != {
+                "revision",
+                "prefix",
+                "paths",
+            }:
+                raise ValidationError(
+                    f"{where}.environment.repository_snapshot: expected exactly "
+                    "revision, prefix, and paths"
+                )
+            revision = snapshot.get("revision")
+            if not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+                raise ValidationError(
+                    f"{where}.environment.repository_snapshot.revision: "
+                    "expected a full lowercase Git commit id"
+                )
+            prefix = snapshot.get("prefix")
+            try:
+                safe_posix_relative_path(
+                    prefix,
+                    f"{where}.environment.repository_snapshot.prefix",
+                )
+            except ValidationError:
+                raise ValidationError(
+                    f"{where}.environment.repository_snapshot.prefix: "
+                    "expected a safe repository-relative path"
+                )
+            paths = snapshot.get("paths")
+            if (
+                not isinstance(paths, list)
+                or not paths
+                or len(paths) > 64
+                or not all(
+                    _is_safe_posix_relative_path(
+                        item,
+                        f"{where}.environment.repository_snapshot.paths",
+                    )
+                    for item in paths
+                )
+                or len(set(paths)) != len(paths)
+            ):
+                raise ValidationError(
+                    f"{where}.environment.repository_snapshot.paths: expected "
+                    "1-64 distinct safe paths relative to prefix"
+                )
         fixtures = environment.get("fixtures", [])
         if not isinstance(fixtures, list) or not all(
             isinstance(item, str) and item for item in fixtures
@@ -196,6 +290,20 @@ def validate_suite(data: Dict[str, Any], root: Path) -> List[str]:
             if not isinstance(check, dict):
                 raise ValidationError(f"{where}.success.checks[{check_index}]: expected object")
             _validate_check(check, f"{where}.success.checks[{check_index}]")
+            if check.get("type") == "validator":
+                validator_path = (root / check["validator"]).resolve()
+                try:
+                    validator_path.relative_to(root.resolve())
+                except ValueError as exc:
+                    raise ValidationError(
+                        f"{where}.success.checks[{check_index}].validator: "
+                        "escapes repository root"
+                    ) from exc
+                if not validator_path.is_file() or validator_path.is_symlink():
+                    raise ValidationError(
+                        f"{where}.success.checks[{check_index}].validator: "
+                        f"regular file does not exist: {check['validator']}"
+                    )
         grader = _require(task, "grader", dict, where)
         _require(grader, "kind", str, f"{where}.grader")
         _require(grader, "version", str, f"{where}.grader")

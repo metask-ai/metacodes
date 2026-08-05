@@ -6,6 +6,7 @@ from pathlib import Path
 
 from scripts.eval.e2e_adapter import (
     MAX_NATIVE_EVENT_BYTES,
+    MAX_VALIDATOR_OUTPUT_BYTES,
     NATIVE_EVENT_SCHEMA_VERSION,
     _count_policy_violations,
     _debug_tool_inputs,
@@ -50,6 +51,30 @@ def suite():
 
 
 class E2EAdapterTest(unittest.TestCase):
+    def test_validator_output_is_killed_and_rejected_above_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            validator = root / "evals/validators/noisy.py"
+            validator.parent.mkdir(parents=True)
+            validator.write_text(
+                f"print('x' * {MAX_VALIDATOR_OUTPUT_BYTES + 1})\n",
+                encoding="utf-8",
+            )
+            result = _evaluate_check(
+                {
+                    "type": "validator",
+                    "validator": "evals/validators/noisy.py",
+                    "timeout_seconds": 10,
+                },
+                workspace,
+                "",
+                repo_root=root,
+            )
+        self.assertFalse(result["passed"])
+        self.assertIn("output exceeds", result["evaluator_error"])
+
     def test_debug_tool_input_checks_ignore_thinking_and_target_actual_tool_json(self):
         debug = "\n".join(
             [

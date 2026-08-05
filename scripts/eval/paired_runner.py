@@ -21,6 +21,7 @@ from .experiment import (
     validate_experiment,
 )
 from .model import ValidationError, load_rollouts, write_rollouts
+from .promotion import validate_calibration_bundle
 
 
 TOKEN_METRICS = (
@@ -118,6 +119,30 @@ def _require_budget(
             f"cumulative token budget reached: {cumulative_tokens} >= "
             f"{max_cumulative_tokens}; fail-closed"
         )
+
+
+def _require_multi_budget(
+    collected: Mapping[str, Sequence[Dict[str, Any]]],
+    budget: Mapping[str, Any],
+    *,
+    prior_cost_usd: float,
+    prior_tokens: int,
+) -> None:
+    """Enforce both this stage's cap and the cross-stage aggregate cap."""
+    _require_budget(
+        collected,
+        used_cost_usd=0.0,
+        used_tokens=0,
+        max_cumulative_cost_usd=float(budget["max_stage_cost_usd"]),
+        max_cumulative_tokens=int(budget["max_stage_tokens"]),
+    )
+    _require_budget(
+        collected,
+        used_cost_usd=prior_cost_usd,
+        used_tokens=prior_tokens,
+        max_cumulative_cost_usd=float(budget["max_aggregate_cost_usd"]),
+        max_cumulative_tokens=int(budget["max_aggregate_tokens"]),
+    )
 
 
 def _require_scoring_rollout(rollout: Dict[str, Any], *, variant: str) -> None:
@@ -576,6 +601,8 @@ def run_multi_arm(
     output_dir: Path,
     suite_path: Path,
     allow_paid_rollouts: bool,
+    promotion_receipt: Mapping[str, Any] | None = None,
+    calibration_checkpoints: Mapping[str, Path] | None = None,
     budget_used_cost_usd: float = 0.0,
     budget_used_tokens: int = 0,
 ) -> Dict[str, List[Dict[str, Any]]]:
@@ -609,6 +636,30 @@ def run_multi_arm(
 
     metacodes_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
     tinykg_identity = tinykg_binary_identity(tinykg_binary)
+    receipt_cost_usd = 0.0
+    receipt_tokens = 0
+    if experiment["stage"]["id"] == "confirmatory":
+        if promotion_receipt is None:
+            raise ValidationError("confirmatory execution requires a calibration promotion receipt")
+        if calibration_checkpoints is None:
+            raise ValidationError(
+                "confirmatory execution requires authoritative calibration checkpoints"
+            )
+        receipt_cost_usd, receipt_tokens = validate_calibration_bundle(
+            promotion_receipt,
+            experiment,
+            repo_root,
+            calibration_checkpoints,
+            metacodes_sha256=metacodes_sha256,
+            tinykg_sha256=tinykg_identity["sha256"],
+            revision=revision,
+        )
+    elif promotion_receipt is not None or calibration_checkpoints is not None:
+        raise ValidationError(
+            "calibration execution must not receive promotion evidence"
+        )
+    prior_cost_usd = budget_used_cost_usd + receipt_cost_usd
+    prior_tokens = budget_used_tokens + receipt_tokens
     expected_tasks = {task["id"]: task for task in suite["tasks"]}
     config_ids = arm_config_ids(
         experiment, suite, metacodes_sha256, tinykg_identity["sha256"]
@@ -635,24 +686,22 @@ def run_multi_arm(
         for arm_id in ARM_IDS
     }
     budget = experiment["budget"]
-    _require_budget(
+    _require_multi_budget(
         collected,
-        used_cost_usd=budget_used_cost_usd,
-        used_tokens=budget_used_tokens,
-        max_cumulative_cost_usd=float(budget["max_cumulative_cost_usd"]),
-        max_cumulative_tokens=int(budget["max_cumulative_tokens"]),
+        budget,
+        prior_cost_usd=prior_cost_usd,
+        prior_tokens=prior_tokens,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     for trial, arm_id in counterbalanced_schedule(ARM_IDS, experiment["trials"]):
         for task_id in sorted(expected_tasks):
             if (task_id, trial) in completed_keys[arm_id]:
                 continue
-            _require_budget(
+            _require_multi_budget(
                 collected,
-                used_cost_usd=budget_used_cost_usd,
-                used_tokens=budget_used_tokens,
-                max_cumulative_cost_usd=float(budget["max_cumulative_cost_usd"]),
-                max_cumulative_tokens=int(budget["max_cumulative_tokens"]),
+                budget,
+                prior_cost_usd=prior_cost_usd,
+                prior_tokens=prior_tokens,
             )
             _require_sha256(binary, metacodes_sha256, "metacodes binary")
             _require_sha256(
@@ -745,11 +794,10 @@ def run_multi_arm(
             if infrastructure_error is not None:
                 raise infrastructure_error
             _require_scoring_rollout(selected[0], variant=arm_id)
-            _require_budget(
+            _require_multi_budget(
                 collected,
-                used_cost_usd=budget_used_cost_usd,
-                used_tokens=budget_used_tokens,
-                max_cumulative_cost_usd=float(budget["max_cumulative_cost_usd"]),
-                max_cumulative_tokens=int(budget["max_cumulative_tokens"]),
+                budget,
+                prior_cost_usd=prior_cost_usd,
+                prior_tokens=prior_tokens,
             )
     return collected

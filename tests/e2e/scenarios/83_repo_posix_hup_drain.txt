@@ -1,0 +1,5 @@
+Audit this historical metacodes snapshot as a production bug investigation. A short-lived POSIX child can close stdout or stderr with POLLHUP while bytes are still buffered; the current capture loop waits only for POLLIN and can hang or lose output. Do not edit yet. Record a concise plan in PLAN.md that preserves these exact acceptance invariants: both pipes react to POLLIN plus POLLHUP, POLLERR, and POLLNVAL; a negative read is ReadError; only zero is EOF; buffered bytes are appended before EOF; Windows behavior is out of scope.
+---
+Implement the fix in src/platform/process.zig. Keep stdout and stderr behavior symmetric, keep cleanup/waitpid behavior intact, and add a regression test whose short-lived child prints the exact sentinel hup-drained without a trailing newline. Inspect the diff and avoid unrelated changes.
+---
+Before finishing, verify the implementation against the Phase 1 invariants and write HANDOFF.md for the maintainer. It must contain the literal tokens POLLHUP, buffered-bytes-before-EOF, and negative-read=ReadError, plus a short explanation of the regression test. Do not merely describe a possible patch: leave the source and test implemented.

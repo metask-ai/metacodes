@@ -123,6 +123,19 @@ run_session() {
 
   mkdir -p "$workdir"
 
+  # --- 真实仓库稀疏快照:由 scored suite 冻结完整 commit id + 路径清单。---
+  # materializer 只接受 Git regular files，限制文件数/总字节，并拒绝路径逃逸与链接。
+  # suite 外的普通探索场景不含 task 条目，helper 会直接 no-op。
+  python3 "$E2E_DIR/materialize_repo_snapshot.py" \
+    --suite "${E2E_EVAL_SUITE:-$ZIG_ROOT/evals/suites/core-e2e.json}" \
+    --task "$(basename "$workdir")" \
+    --repo-root "$ZIG_ROOT" \
+    --workspace "$workdir" || {
+      echo "repository snapshot materialization failed" >&2
+      echo 93
+      return 0
+    }
+
   # --- HOME 隔离:每场景独立 fake HOME,隔离一切 HOME 级副作用 ---
   local fake_home="$workdir/.home"
   setup_fake_home "$fake_home"
@@ -180,6 +193,7 @@ PY
       git init -q 2>/dev/null
       git config user.email e2e@cc-zig.local 2>/dev/null
       git config user.name "cc-zig e2e" 2>/dev/null
+      printf '.home/\n' > .git/info/exclude
       # 放个种子文件,保证有东西可 commit
       printf 'cc-zig e2e worktree fixture\n' > .gitseed
       git add -A 2>/dev/null

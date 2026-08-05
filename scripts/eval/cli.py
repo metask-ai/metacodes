@@ -7,7 +7,9 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
@@ -32,7 +34,6 @@ if __package__ in {None, ""}:
     )
     from scripts.eval.experiment import (  # type: ignore
         build_dry_run_plan,
-        experiment_fingerprint,
         validate_experiment,
     )
     from scripts.eval.model import (  # type: ignore
@@ -44,6 +45,12 @@ if __package__ in {None, ""}:
         write_rollouts,
     )
     from scripts.eval.paired_runner import run_multi_arm, run_paired  # type: ignore
+    from scripts.eval.promotion import (  # type: ignore
+        build_promotion_receipt,
+        calibration_checkpoint_paths,
+        validate_calibration_bundle,
+        validate_multi_arm_evidence,
+    )
 else:
     from .analysis import (
         compare,
@@ -64,7 +71,6 @@ else:
     )
     from .experiment import (
         build_dry_run_plan,
-        experiment_fingerprint,
         validate_experiment,
     )
     from .model import (
@@ -76,6 +82,12 @@ else:
         write_rollouts,
     )
     from .paired_runner import run_multi_arm, run_paired
+    from .promotion import (
+        build_promotion_receipt,
+        calibration_checkpoint_paths,
+        validate_calibration_bundle,
+        validate_multi_arm_evidence,
+    )
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -85,7 +97,28 @@ def _write(path: Optional[str], text: str) -> None:
     if path:
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding="utf-8")
+        temp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=target.parent,
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, target)
+            temp_path = None
+        finally:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink()
+                except FileNotFoundError:
+                    pass
     else:
         print(text, end="" if text.endswith("\n") else "\n")
 
@@ -171,6 +204,16 @@ def cmd_run_multi(args: argparse.Namespace) -> int:
         output_dir=Path(args.output_dir),
         suite_path=suite_path,
         allow_paid_rollouts=args.allow_paid_rollouts,
+        promotion_receipt=(
+            load_json(Path(args.promotion_receipt))
+            if args.promotion_receipt
+            else None
+        ),
+        calibration_checkpoints=(
+            calibration_checkpoint_paths(Path(args.calibration_dir))
+            if args.calibration_dir
+            else None
+        ),
         budget_used_cost_usd=args.budget_used_cost_usd,
         budget_used_tokens=args.budget_used_tokens,
     )
@@ -274,84 +317,67 @@ def cmd_compare(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validated_multi_arm_outputs(
+    experiment: Dict[str, Any],
+    suite: Dict[str, Any],
+    paths: Dict[str, Path],
+) -> tuple[Dict[str, Any], Dict[str, list[Dict[str, Any]]]]:
+    metadata, rollouts_by_arm, _checkpoint_sha256 = validate_multi_arm_evidence(
+        experiment, suite, REPO_ROOT, paths
+    )
+    result = compare_multi_arm(rollouts_by_arm)
+    result.update(metadata)
+    return result, rollouts_by_arm
+
+
 def cmd_report_multi(args: argparse.Namespace) -> int:
     experiment, suite, _suite_path = _load_experiment_and_suite(Path(args.experiment))
+    if experiment["stage"]["scoring"] != "confirmatory":
+        raise ValidationError(
+            "report-multi only accepts the held-out confirmatory stage; "
+            "use promote-multi for calibration"
+        )
     paths = {
         "codex_style": Path(args.codex_style),
         "claude_style": Path(args.claude_style),
         "tinykg": Path(args.tinykg),
     }
-    rollouts_by_arm = {
-        arm_id: load_rollouts(path) for arm_id, path in paths.items()
+    result, _rollouts_by_arm = _validated_multi_arm_outputs(
+        experiment, suite, paths
+    )
+    receipt = load_json(Path(args.promotion_receipt))
+    calibration_cost, calibration_tokens = validate_calibration_bundle(
+        receipt,
+        experiment,
+        REPO_ROOT,
+        calibration_checkpoint_paths(Path(args.calibration_dir)),
+        metacodes_sha256=result["metacodes_sha256"],
+        tinykg_sha256=result["tinykg_sha256"],
+        revision=result["harness_revision"],
+    )
+    result["promotion"] = {
+        "source_experiment_id": receipt["source_experiment_id"],
+        "source_experiment_fingerprint": receipt["source_experiment_fingerprint"],
+        "calibration_cost_usd": calibration_cost,
+        "calibration_tokens": calibration_tokens,
     }
-    invalid = {
-        arm_id: [
-            (rollout["task_id"], rollout["trial"])
-            for rollout in rollouts
-            if not rollout["judgement"]["valid_for_scoring"]
-        ]
-        for arm_id, rollouts in rollouts_by_arm.items()
-    }
-    invalid = {arm_id: rows for arm_id, rows in invalid.items() if rows}
-    if invalid:
-        raise ValidationError(
-            f"formal multi-arm report rejects invalid rollouts per abort policy: {invalid}"
-        )
-    grounding = {
-        task["id"]: grounding_fingerprints(task, REPO_ROOT)
-        for task in suite["tasks"]
-    }
-    task_ids = sorted(grounding)
-    contracts: Dict[str, Any] = {}
-    metacodes_sha256s = set()
-    tinykg_sha256s = set()
-    revisions = set()
-    fingerprint = experiment_fingerprint(experiment, suite)
-    for arm_id, rollouts in rollouts_by_arm.items():
-        contract = validate_release_contract(
-            rollouts,
-            label=arm_id,
-            suite_id=suite["suite_id"],
-            task_ids=task_ids,
-            trials=experiment["trials"],
-            model_provider=experiment["model"]["provider"],
-            model_id=experiment["model"]["id"],
-            grounding=grounding,
-        )
-        prefix = f"{experiment['experiment_id']}:{arm_id}:{fingerprint}:mc-"
-        config_id = contract["harness_config_id"]
-        suffix = config_id[len(prefix) :] if config_id.startswith(prefix) else ""
-        parts = suffix.split(":kg-", 1)
-        if (
-            len(parts) != 2
-            or len(parts[0]) != 64
-            or len(parts[1]) != 64
-            or any(char not in "0123456789abcdef" for char in parts[0] + parts[1])
-        ):
-            raise ValidationError(
-                f"{arm_id} harness config is not bound to this experiment/TinyKG identity"
-            )
-        metacodes_sha256s.add(parts[0])
-        tinykg_sha256s.add(parts[1])
-        revisions.add(contract["harness_revision"])
-        contracts[arm_id] = contract
-    if len(metacodes_sha256s) != 1:
-        raise ValidationError("multi-arm report mixes metacodes binary identities")
-    if len(tinykg_sha256s) != 1:
-        raise ValidationError("multi-arm report mixes TinyKG dependency identities")
-    if len(revisions) != 1:
-        raise ValidationError("multi-arm report mixes metacodes revisions")
-
-    result = compare_multi_arm(rollouts_by_arm)
-    result["experiment_id"] = experiment["experiment_id"]
-    result["experiment_fingerprint"] = fingerprint
-    result["metacodes_sha256"] = next(iter(metacodes_sha256s))
-    result["tinykg_sha256"] = next(iter(tinykg_sha256s))
-    result["harness_revision"] = next(iter(revisions))
-    result["contracts"] = contracts
     _write(args.markdown, render_multi_arm_markdown(result))
     if args.json:
         _write_json(args.json, result)
+    return 0
+
+
+def cmd_promote_multi(args: argparse.Namespace) -> int:
+    experiment, suite, _suite_path = _load_experiment_and_suite(Path(args.experiment))
+    if experiment["stage"]["id"] != "calibration":
+        raise ValidationError("promote-multi only accepts the calibration stage")
+    paths = {
+        "codex_style": Path(args.codex_style),
+        "claude_style": Path(args.claude_style),
+        "tinykg": Path(args.tinykg),
+    }
+    receipt = build_promotion_receipt(experiment, suite, REPO_ROOT, paths)
+    _write_json(args.output, receipt)
     return 0
 
 
@@ -752,6 +778,14 @@ def parser() -> argparse.ArgumentParser:
     multi_parser.add_argument("--dry-run", action="store_true")
     multi_parser.add_argument("--plan-output")
     multi_parser.add_argument("--allow-paid-rollouts", action="store_true")
+    multi_parser.add_argument(
+        "--promotion-receipt",
+        help="calibration receipt required by the confirmatory stage",
+    )
+    multi_parser.add_argument(
+        "--calibration-dir",
+        help="authoritative calibration directory containing the three JSONL checkpoints",
+    )
     multi_parser.add_argument("--budget-used-cost-usd", type=float, default=0.0)
     multi_parser.add_argument("--budget-used-tokens", type=int, default=0)
     multi_parser.set_defaults(func=cmd_run_multi)
@@ -776,9 +810,22 @@ def parser() -> argparse.ArgumentParser:
     multi_report_parser.add_argument("--codex-style", required=True)
     multi_report_parser.add_argument("--claude-style", required=True)
     multi_report_parser.add_argument("--tinykg", required=True)
+    multi_report_parser.add_argument("--promotion-receipt", required=True)
+    multi_report_parser.add_argument("--calibration-dir", required=True)
     multi_report_parser.add_argument("--markdown")
     multi_report_parser.add_argument("--json")
     multi_report_parser.set_defaults(func=cmd_report_multi)
+
+    promote_parser = commands.add_parser(
+        "promote-multi",
+        help="validate a complete non-scoring calibration stage and issue its receipt",
+    )
+    promote_parser.add_argument("--experiment", required=True)
+    promote_parser.add_argument("--codex-style", required=True)
+    promote_parser.add_argument("--claude-style", required=True)
+    promote_parser.add_argument("--tinykg", required=True)
+    promote_parser.add_argument("--output", required=True)
+    promote_parser.set_defaults(func=cmd_promote_multi)
 
     gate_parser = commands.add_parser("gate", help="enforce deployment/regression thresholds")
     gate_parser.add_argument("candidate")
