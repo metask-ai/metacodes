@@ -142,7 +142,7 @@ pub const CommitResult = struct {
     incomplete: bool, // 部分失败(第 k 步落图失败)
     structured: bool, // false = 解析无结构,落成单 root task
     truncated: bool, // 计划超 MAX_STEPS 被截断(M1:绝不静默)
-    doc_id: u64 = 0, // markdown 文档 node id(P3 D3:人类可见 /kg plan render);0=未导入
+    doc_id: u64 = 0, // legacy 批准计划文档;只作审计材料,不是真实进度源;0=未导入
 };
 
 /// 把计划落成任务 DAG。返回 root id(供指针文件持久化)。
@@ -184,8 +184,8 @@ pub fn commit(
         committed += 1;
     }
 
-    // P3 D3:把计划正文导入成 markdown 文档(人类可见 /kg plan render-md-doc)。
-    // 图与文档同源两视图;失败不阻塞(任务 DAG 已建好)。
+    // 兼容保留批准时的原始 Markdown 审计材料；当前状态由 task snapshot 重新投影，
+    // 不再把这份不可同步更新的 document 当作进度真源。失败不阻塞任务 DAG。
     const doc = kg.importMarkdownDoc(plan_text) catch 0;
     return .{ .root_id = root, .steps_committed = committed, .total_steps = parsed.steps.len, .incomplete = false, .structured = true, .truncated = parsed.truncated, .doc_id = doc };
 }

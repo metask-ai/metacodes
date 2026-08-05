@@ -190,8 +190,8 @@ fn commitPlanToGraph(ctx: *const ToolContext, plan_md: []const u8) !?[]u8 {
         return try std.fmt.allocPrint(ctx.allocator, ",\"kg\":{{\"committed\":false,\"error\":\"{s}\"}}", .{@errorName(e)});
     };
 
-    // 写指针:kg_task_anchor(12b 权威查询根,frontier 单入口)+ kg_root(legacy 缓存,
-    // 存量读路径兜底)+ kg_plan_doc(P3:/kg plan 渲染)。
+    // 写指针:kg_task_anchor(12b 权威查询根,frontier 单入口)+ kg_root(计划投影根)+
+    // kg_plan_doc(legacy 批准计划审计材料;不得用于进度推断)。
     if (ctx.kg_projects_dir.len > 0) {
         const inject = @import("../kg/inject.zig");
         if (kg.ensureTaskAnchorId()) |aid| {

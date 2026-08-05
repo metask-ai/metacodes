@@ -818,7 +818,7 @@ pub const KgClient = struct {
         return doc_id;
     }
 
-    /// 渲染文档回 markdown(/kg plan 人类可见)。owned。
+    /// 渲染 legacy markdown document artifact。任务进度投影不得走此入口。owned。
     pub fn renderMarkdownDoc(self: *KgClient, doc_id: u64) KgError![]u8 {
         var idbuf: [24]u8 = undefined;
         const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{doc_id}) catch unreachable;
@@ -1076,6 +1076,25 @@ pub const KgClient = struct {
         const out = try self.runChecked(&.{ "task-packet", self.store_path, id_str, "--limit", lim_str });
         defer self.freeOut(out);
         return self.allocator.dupe(u8, out.stdout) catch KgError.OutOfMemory;
+    }
+
+    /// Fetch one bounded, deterministic task-subgraph snapshot under TinyKG's
+    /// store lock. The JSON is intentionally left opaque here; the independent
+    /// task_projection module owns schema and referential-integrity validation.
+    pub fn taskSnapshot(self: *KgClient, root_id: u64) KgError![]u8 {
+        var idbuf: [24]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{root_id}) catch unreachable;
+        const out = try self.runChecked(&.{
+            "task-snapshot", self.store_path, id_str,
+            "--max-tasks", "256",
+            "--max-edges", "1024",
+            "--max-chars", "200000",
+        });
+        defer self.freeOut(out);
+        const snapshot = std.mem.trim(u8, out.stdout, " \r\n\t");
+        if (snapshot.len < 2 or snapshot[0] != '{' or snapshot[snapshot.len - 1] != '}')
+            return self.dataError("task-snapshot {d} 非 JSON object: {s}", .{ root_id, trimForLog(snapshot) });
+        return self.allocator.dupe(u8, snapshot) catch KgError.OutOfMemory;
     }
 
     /// Agent-facing bounded packet. Unlike the text packet used by taskStatus,

@@ -42,6 +42,7 @@ pub const system_prompt = @import("core/system_prompt.zig");
 pub const answer_queue = @import("core/answer_queue.zig");
 pub const recorder = @import("core/recorder.zig");
 pub const context_pressure = @import("core/context_pressure.zig");
+pub const kg_task_projection = @import("kg/task_projection.zig"); // pure TinyKG snapshot/Markdown contract
 
 // ── API / client / 配置 ─────────────────────────────────────────────────
 pub const client = @import("client.zig");
