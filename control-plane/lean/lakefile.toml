@@ -1,0 +1,10 @@
+name = "metacodes-control-plane"
+version = "0.1.0"
+defaultTargets = ["MetaCodesControl"]
+
+[[lean_lib]]
+name = "MetaCodesControl"
+
+[[lean_exe]]
+name = "rule-decision"
+root = "Main"

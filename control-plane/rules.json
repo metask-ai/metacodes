@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "rules": [
+    {
+      "id": "declaration.agentdef-task-required.l2",
+      "title": "AgentDef runtime declarations and Task required inputs have L2 evidence",
+      "target": {
+        "metric": "declared_minus_covered",
+        "setpoint": 0,
+        "goal": "Every governed declaration has an exact, runnable L2 evidence binding."
+      },
+      "sensor": {
+        "adapter": "declaration_l2",
+        "schema_version": 1,
+        "evidence_registry": "control-plane/declaration-l2-evidence.json"
+      },
+      "decision": {
+        "engine": "lean",
+        "kernel": "MetaCodesControl.ClosedLoop.signal",
+        "theorems": [
+          "admitted_implies_closed_loop",
+          "admitted_implies_zero_deviation",
+          "admitted_implies_feedback_passed",
+          "missing_evidence_blocks",
+          "orphan_cannot_be_compliant",
+          "failed_feedback_blocks",
+          "sensor_failure_blocks"
+        ]
+      },
+      "actuator": {
+        "kind": "release_gate",
+        "on_violation": "block",
+        "remediation": "Add or repair a real L2 test and its evidence binding; do not silence the declaration."
+      },
+      "feedback": {
+        "kind": "zig_l2_then_reobserve",
+        "reobserve": true,
+        "timeout_seconds": 300,
+        "commands": [
+          [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.tests.test_rule_control",
+            "-v"
+          ],
+          [
+            "zig",
+            "build",
+            "test:agentdef-fields",
+            "-Dtinykg=false",
+            "-j2",
+            "--summary",
+            "all"
+          ],
+          [
+            "zig",
+            "build",
+            "test:new",
+            "-Dtinykg=false",
+            "-Dtfilter=L2 schema: Task",
+            "-j2",
+            "--summary",
+            "all"
+          ]
+        ]
+      },
+      "counterexample": {
+        "fixture": "control-plane/counterexamples.json",
+        "required": true
+      }
+    }
+  ]
+}

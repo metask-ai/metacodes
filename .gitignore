@@ -1,4 +1,5 @@
 .zig/
+.lake/
 zig-out/
 *.zig.zon
 !build.zig.zon
