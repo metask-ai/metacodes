@@ -38,6 +38,8 @@ class CliTest(unittest.TestCase):
                         "/not-read/metacodes",
                         "--tinykg-binary",
                         "/not-read/tinykg",
+                        "--formal-kernel",
+                        "/not-read/formal-kernel",
                         "--revision",
                         "not-read",
                     ]
@@ -144,7 +146,9 @@ class CliTest(unittest.TestCase):
         suite_path = ROOT / "evals/suites/long-horizon-repository-pk.json"
         experiment = load_json(experiment_path)
         suite = load_json(suite_path)
-        config_ids = arm_config_ids(experiment, suite, "a" * 64, "b" * 64)
+        config_ids = arm_config_ids(
+            experiment, suite, "a" * 64, "b" * 64, "c" * 64
+        )
         model = experiment["model"]
         model_fingerprint = hashlib.sha256(stable_json(model).encode("utf-8")).hexdigest()[:16]
         with tempfile.TemporaryDirectory() as directory:
@@ -194,6 +198,7 @@ class CliTest(unittest.TestCase):
                 ROOT,
                 metacodes_sha256="a" * 64,
                 tinykg_sha256="b" * 64,
+                formal_kernel_fingerprint="c" * 64,
                 revision="same-revision",
             )
             receipt.write_text(
@@ -232,9 +237,14 @@ class CliTest(unittest.TestCase):
             )
             self.assertEqual(code, 0)
             self.assertIn("三臂长程评估", markdown.read_text(encoding="utf-8"))
+            self.assertIn(
+                "Lean artifact fingerprint: `" + "c" * 64 + "`",
+                markdown.read_text(encoding="utf-8"),
+            )
             result = load_json(result_json)
             self.assertEqual(result["metacodes_sha256"], "a" * 64)
             self.assertEqual(result["tinykg_sha256"], "b" * 64)
+            self.assertEqual(result["formal_kernel_fingerprint"], "c" * 64)
             self.assertEqual(len(result["pairwise"]), 3)
 
     def test_promote_multi_issues_identity_and_budget_bound_receipt(self):
@@ -244,7 +254,9 @@ class CliTest(unittest.TestCase):
         suite_path = ROOT / "evals/suites/long-horizon-calibration.json"
         experiment = load_json(experiment_path)
         suite = load_json(suite_path)
-        config_ids = arm_config_ids(experiment, suite, "e" * 64, "f" * 64)
+        config_ids = arm_config_ids(
+            experiment, suite, "e" * 64, "f" * 64, "d" * 64
+        )
         model = experiment["model"]
         model_fingerprint = hashlib.sha256(
             stable_json(model).encode("utf-8")
@@ -300,6 +312,9 @@ class CliTest(unittest.TestCase):
             self.assertEqual(receipt["gate"]["valid_rollouts"], 18)
             self.assertEqual(receipt["identity"]["metacodes_sha256"], "e" * 64)
             self.assertEqual(receipt["identity"]["tinykg_sha256"], "f" * 64)
+            self.assertEqual(
+                receipt["identity"]["formal_kernel_fingerprint"], "d" * 64
+            )
             self.assertEqual(set(receipt["checkpoint_sha256"]), set(config_ids))
 
     def test_release_gate_rejects_incomplete_cherry_picked_rollouts(self):

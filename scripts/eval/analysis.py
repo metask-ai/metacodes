@@ -755,14 +755,31 @@ def compare_multi_arm(
 
 
 def render_multi_arm_markdown(result: Dict[str, Any]) -> str:
-    lines = [
-        "# metacodes 三臂长程评估",
-        "",
+    lines = ["# metacodes 三臂长程评估", ""]
+    identity_keys = (
+        "harness_revision",
+        "metacodes_sha256",
+        "tinykg_sha256",
+        "formal_kernel_fingerprint",
+    )
+    if all(result.get(key) for key in identity_keys):
+        lines.extend(
+            [
+                "## 冻结执行身份",
+                "",
+                f"- metacodes revision: `{result['harness_revision']}`",
+                f"- metacodes SHA-256: `{result['metacodes_sha256']}`",
+                f"- TinyKG SHA-256: `{result['tinykg_sha256']}`",
+                f"- Lean artifact fingerprint: `{result['formal_kernel_fingerprint']}`",
+                "",
+            ]
+        )
+    lines.extend([
         "## Arm 总览",
         "",
         "| Arm | Rollout | Invalid | Trustworthy success | Token 总计 | 成本 USD | 壁钟 ms |",
         "|---|---:|---:|---:|---:|---:|---:|",
-    ]
+    ])
     for arm_id in LONG_HORIZON_ARM_IDS:
         summary = result["arms"][arm_id]
         lines.append(

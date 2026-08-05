@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -20,7 +22,7 @@ from .model import (
 
 
 EXPERIMENT_SCHEMA_VERSION = 2
-PROMOTION_RECEIPT_SCHEMA_VERSION = 1
+PROMOTION_RECEIPT_SCHEMA_VERSION = 2
 ARM_IDS = ("codex_style", "claude_style", "tinykg")
 TREATMENT_KEYS = (
     "transcript",
@@ -28,6 +30,7 @@ TREATMENT_KEYS = (
     "memory_markdown",
     "tinykg",
     "task_dag",
+    "formal_audit",
     "swarm",
 )
 EXPECTED_TREATMENTS = {
@@ -37,6 +40,7 @@ EXPECTED_TREATMENTS = {
         "memory_markdown": False,
         "tinykg": False,
         "task_dag": False,
+        "formal_audit": False,
         "swarm": False,
     },
     "claude_style": {
@@ -45,6 +49,7 @@ EXPECTED_TREATMENTS = {
         "memory_markdown": True,
         "tinykg": False,
         "task_dag": False,
+        "formal_audit": False,
         "swarm": False,
     },
     "tinykg": {
@@ -53,6 +58,7 @@ EXPECTED_TREATMENTS = {
         "memory_markdown": True,
         "tinykg": True,
         "task_dag": True,
+        "formal_audit": True,
         "swarm": False,
     },
 }
@@ -165,6 +171,227 @@ def tinykg_binary_identity(binary: Path) -> Dict[str, str]:
     if final_sha256 != sha256:
         raise ValidationError("TinyKG binary changed during its readiness probe")
     return {"path": str(resolved), "sha256": sha256, "version": version}
+
+
+FORMAL_PROVENANCE_KEYS = {
+    "schema_version",
+    "checker_version",
+    "request_schema",
+    "memory_request_schema",
+    "verdict_schema",
+    "binary_sha256",
+    "binary_bytes",
+    "kernel_source_sha256",
+    "memory_kernel_source_sha256",
+    "main_source_sha256",
+    "axiom_audit_source_sha256",
+    "axiom_policy",
+    "axiom_audit",
+    "host_os",
+    "host_arch",
+    "linker",
+    "lean_version",
+    "native_smoke",
+    "built_at_utc",
+}
+
+
+def _load_unique_json(path: Path, label: str) -> Dict[str, Any]:
+    def reject_duplicates(pairs: Sequence[Tuple[str, Any]]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValidationError(f"{label} contains duplicate field {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=reject_duplicates
+        )
+    except ValidationError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValidationError(f"cannot read {label}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValidationError(f"{label} must contain one JSON object")
+    return value
+
+
+def _formal_probe(binary: Path) -> None:
+    hex_a, hex_b, hex_c, hex_d = (character * 64 for character in "abcd")
+    request = {
+        "schema_version": "metacodes-formal-request-v1",
+        "request_id": hex_a,
+        "operation": "task_audit",
+        "proposal_sha256": hex_b,
+        "snapshot_sha256": hex_c,
+        "snapshot_revision": hex_d,
+        "expected_checker_version": "metacodes-formal-kernel-v2",
+        "facts": {
+            "schema_supported": True,
+            "snapshot_bounded": True,
+            "task_count": 1,
+            "open_count": 1,
+            "claimed_count": 0,
+            "completed_count": 0,
+            "failed_count": 0,
+            "claimed_with_owner_count": 0,
+            "reachable_task_count": 1,
+            "terminal_with_evidence_count": 0,
+            "invalid_reference_count": 0,
+            "truncated": False,
+            "proposal_bound": True,
+            "preserves_tasks": True,
+            "preserves_evidence": True,
+            "preserves_recovery": True,
+            "preserves_schema": True,
+            "contradiction_safe": True,
+            "reversible": True,
+        },
+    }
+    try:
+        completed = subprocess.run(
+            [str(binary)],
+            # The checker deliberately accepts one canonical field order and
+            # rejects generic key-sorted JSON. Keep this order aligned with
+            # the compiled protocol exercised by build-formal-kernel.sh.
+            input=json.dumps(request, ensure_ascii=False, separators=(",", ":")),
+            env=_dependency_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=DEPENDENCY_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValidationError(f"formal kernel readiness probe failed: {exc}") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()[-1000:]
+        raise ValidationError(
+            f"formal kernel readiness probe exited {completed.returncode}: {detail}"
+        )
+    if len(completed.stdout.encode("utf-8")) > 64 * 1024 or completed.stderr:
+        raise ValidationError("formal kernel readiness probe produced unsafe output")
+    try:
+        verdict = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValidationError("formal kernel readiness probe returned invalid JSON") from exc
+    expected_binding = {
+        "schema_version": "metacodes-formal-verdict-v2",
+        "checker_version": "metacodes-formal-kernel-v2",
+        "request_id": hex_a,
+        "operation": "task_audit",
+        "proposal_sha256": hex_b,
+        "snapshot_sha256": hex_c,
+        "snapshot_revision": hex_d,
+        "decision": "admit",
+        "admitted": True,
+        "reason_codes": [],
+    }
+    if not isinstance(verdict, dict) or any(
+        verdict.get(key) != value for key, value in expected_binding.items()
+    ):
+        raise ValidationError("formal kernel readiness probe did not admit the safe fixture")
+
+
+def formal_kernel_identity(binary: Path) -> Dict[str, Any]:
+    """Freeze the executable and mandatory adjacent provenance as one artifact."""
+    try:
+        binary_info = binary.lstat()
+    except OSError as exc:
+        raise ValidationError(f"cannot inspect formal kernel: {exc}") from exc
+    if (
+        binary.is_symlink()
+        or not stat.S_ISREG(binary_info.st_mode)
+        or not os.access(binary, os.X_OK)
+    ):
+        raise ValidationError(f"formal kernel is not a real executable file: {binary}")
+    if binary_info.st_size <= 0 or binary_info.st_size > 128 * 1024 * 1024:
+        raise ValidationError("formal kernel size is outside the 1..134217728 byte bound")
+    resolved = binary.resolve()
+    try:
+        resolved_info = resolved.lstat()
+    except OSError as exc:
+        raise ValidationError(f"cannot inspect resolved formal kernel: {exc}") from exc
+    if (
+        not stat.S_ISREG(resolved_info.st_mode)
+        or resolved_info.st_dev != binary_info.st_dev
+        or resolved_info.st_ino != binary_info.st_ino
+    ):
+        raise ValidationError("formal kernel path changed while it was being resolved")
+    provenance_path = Path(f"{resolved}.provenance.json")
+    try:
+        provenance_info = provenance_path.lstat()
+    except OSError as exc:
+        raise ValidationError(f"cannot inspect formal kernel provenance: {exc}") from exc
+    if provenance_path.is_symlink() or not stat.S_ISREG(provenance_info.st_mode):
+        raise ValidationError("formal kernel provenance must be a real regular file")
+    if provenance_info.st_size <= 0 or provenance_info.st_size > 64 * 1024:
+        raise ValidationError("formal kernel provenance size is outside the 1..65536 byte bound")
+
+    binary_sha256 = hashlib.sha256(resolved.read_bytes()).hexdigest()
+    provenance_bytes = provenance_path.read_bytes()
+    provenance_sha256 = hashlib.sha256(provenance_bytes).hexdigest()
+    provenance = _load_unique_json(provenance_path, "formal kernel provenance")
+    if set(provenance) != FORMAL_PROVENANCE_KEYS:
+        unknown = sorted(set(provenance) - FORMAL_PROVENANCE_KEYS)
+        missing = sorted(FORMAL_PROVENANCE_KEYS - set(provenance))
+        raise ValidationError(
+            f"formal kernel provenance fields mismatch: missing={missing} unknown={unknown}"
+        )
+    if (
+        provenance.get("schema_version") != "metacodes-formal-artifact-v2"
+        or provenance.get("checker_version") != "metacodes-formal-kernel-v2"
+        or provenance.get("request_schema") != "metacodes-formal-request-v1"
+        or provenance.get("memory_request_schema")
+        != "metacodes-memory-migration-request-v1"
+        or provenance.get("verdict_schema") != "metacodes-formal-verdict-v2"
+        or provenance.get("axiom_policy") != "propext,Quot.sound"
+        or provenance.get("axiom_audit") != "passed"
+        or provenance.get("native_smoke") != "passed"
+        or provenance.get("binary_sha256") != binary_sha256
+        or provenance.get("binary_bytes") != binary_info.st_size
+    ):
+        raise ValidationError("formal kernel provenance does not bind a deployable v2 artifact")
+    source_hash_fields = (
+        "kernel_source_sha256",
+        "memory_kernel_source_sha256",
+        "main_source_sha256",
+        "axiom_audit_source_sha256",
+    )
+    if any(
+        not isinstance(provenance.get(field), str)
+        or len(provenance[field]) != 64
+        or any(character not in "0123456789abcdef" for character in provenance[field])
+        for field in source_hash_fields
+    ):
+        raise ValidationError("formal kernel provenance contains an invalid source digest")
+
+    _formal_probe(resolved)
+    if hashlib.sha256(resolved.read_bytes()).hexdigest() != binary_sha256:
+        raise ValidationError("formal kernel changed during its readiness probe")
+    if hashlib.sha256(provenance_path.read_bytes()).hexdigest() != provenance_sha256:
+        raise ValidationError("formal kernel provenance changed during its readiness probe")
+    fingerprint_payload = {
+        "binary_sha256": binary_sha256,
+        "provenance_sha256": provenance_sha256,
+        "checker_version": provenance["checker_version"],
+        "request_schema": provenance["request_schema"],
+        "memory_request_schema": provenance["memory_request_schema"],
+        "verdict_schema": provenance["verdict_schema"],
+    }
+    return {
+        "path": str(resolved),
+        "sha256": binary_sha256,
+        "bytes": binary_info.st_size,
+        "provenance_path": str(provenance_path),
+        "provenance_sha256": provenance_sha256,
+        "checker_version": provenance["checker_version"],
+        "artifact_fingerprint": hashlib.sha256(
+            stable_json(fingerprint_payload).encode("utf-8")
+        ).hexdigest(),
+    }
 
 
 def counterbalanced_schedule(
@@ -510,6 +737,7 @@ def validate_promotion_receipt(
     *,
     metacodes_sha256: str,
     tinykg_sha256: str,
+    formal_kernel_fingerprint: str,
     revision: str,
     source_experiment_fingerprint: str,
 ) -> Tuple[float, int]:
@@ -548,6 +776,7 @@ def validate_promotion_receipt(
     if identity != {
         "metacodes_sha256": metacodes_sha256,
         "tinykg_sha256": tinykg_sha256,
+        "formal_kernel_fingerprint": formal_kernel_fingerprint,
         "harness_revision": revision,
     }:
         raise ValidationError("promotion receipt binary or revision identity mismatch")
@@ -634,10 +863,12 @@ def arm_config_ids(
     suite: Mapping[str, Any],
     metacodes_sha256: str,
     tinykg_sha256: str,
+    formal_kernel_fingerprint: str,
 ) -> Dict[str, str]:
     for label, sha256 in (
         ("metacodes", metacodes_sha256),
         ("TinyKG dependency", tinykg_sha256),
+        ("formal kernel artifact", formal_kernel_fingerprint),
     ):
         if len(sha256) != 64 or any(
             char not in "0123456789abcdef" for char in sha256
@@ -648,14 +879,17 @@ def arm_config_ids(
     return {
         arm_id: (
             f"{experiment_id}:{arm_id}:{fingerprint}:"
-            f"mc-{metacodes_sha256}:kg-{tinykg_sha256}"
+            f"mc-{metacodes_sha256}:kg-{tinykg_sha256}:fk-{formal_kernel_fingerprint}"
         )
         for arm_id in ARM_IDS
     }
 
 
 def arm_runtime_env(
-    experiment: Mapping[str, Any], arm_id: str, tinykg_binary: Path
+    experiment: Mapping[str, Any],
+    arm_id: str,
+    tinykg_binary: Path,
+    formal_kernel: Mapping[str, Any],
 ) -> Dict[str, str]:
     if arm_id not in ARM_IDS:
         raise ValidationError(f"unknown long-horizon arm: {arm_id!r}")
@@ -670,6 +904,8 @@ def arm_runtime_env(
     # a baseline would let Bash bypass the typed treatment.
     if arm_id == "tinykg":
         env["METACODES_KG_BIN"] = str(tinykg_binary.resolve())
+        env["METACODES_FORMAL_KERNEL_PATH"] = str(formal_kernel["path"])
+        env["METACODES_FORMAL_KERNEL_SHA256"] = str(formal_kernel["sha256"])
     return env
 
 
@@ -679,6 +915,7 @@ def build_dry_run_plan(
     *,
     binary: Path,
     tinykg_binary: Path,
+    formal_kernel: Path,
     revision: str,
 ) -> Dict[str, Any]:
     if not binary.is_file() or not os.access(binary, os.X_OK):
@@ -688,8 +925,13 @@ def build_dry_run_plan(
         raise ValidationError("multi-arm revision must be non-empty")
     binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
     tinykg_identity = tinykg_binary_identity(tinykg_binary)
+    formal_identity = formal_kernel_identity(formal_kernel)
     config_ids = arm_config_ids(
-        experiment, suite, binary_sha256, tinykg_identity["sha256"]
+        experiment,
+        suite,
+        binary_sha256,
+        tinykg_identity["sha256"],
+        formal_identity["artifact_fingerprint"],
     )
     tasks = {task["id"]: task for task in suite["tasks"]}
     task_ids = sorted(tasks)
@@ -708,7 +950,10 @@ def build_dry_run_plan(
                     "timeout_seconds": tasks[task_id]["constraints"]["timeout_seconds"],
                     "harness_config_id": config_ids[arm_id],
                     "runtime_env": arm_runtime_env(
-                        experiment, arm_id, Path(tinykg_identity["path"])
+                        experiment,
+                        arm_id,
+                        Path(tinykg_identity["path"]),
+                        formal_identity,
                     ),
                 }
             )
@@ -725,6 +970,7 @@ def build_dry_run_plan(
                 "sha256": binary_sha256,
             },
             "tinykg": tinykg_identity,
+            "formal_kernel": formal_identity,
             "revision": revision,
         },
         "trials": experiment["trials"],

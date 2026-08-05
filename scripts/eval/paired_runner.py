@@ -17,6 +17,7 @@ from .experiment import (
     arm_config_ids,
     arm_runtime_env,
     counterbalanced_schedule,
+    formal_kernel_identity,
     tinykg_binary_identity,
     validate_experiment,
 )
@@ -37,6 +38,8 @@ RUNTIME_ENV_ALLOWLIST = frozenset(
         "METACODES_FORCE_COMPACT_KEEP",
         "METACODES_MAX_TURNS",
         "METACODES_KG_BIN",
+        "METACODES_FORMAL_KERNEL_PATH",
+        "METACODES_FORMAL_KERNEL_SHA256",
     }
 )
 
@@ -342,6 +345,14 @@ def _require_sha256(path: Path, expected: str, label: str) -> None:
         )
 
 
+def _require_formal_identity(expected: Mapping[str, Any]) -> None:
+    observed = formal_kernel_identity(Path(str(expected["path"])))
+    if observed != dict(expected):
+        raise ValidationError(
+            "formal kernel artifact changed after experiment identity was frozen"
+        )
+
+
 def _mark_infrastructure_invalid(
     rollout: Dict[str, Any],
     *,
@@ -597,6 +608,7 @@ def run_multi_arm(
     binary: Path,
     *,
     tinykg_binary: Path,
+    formal_kernel: Path,
     revision: str,
     output_dir: Path,
     suite_path: Path,
@@ -636,6 +648,7 @@ def run_multi_arm(
 
     metacodes_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
     tinykg_identity = tinykg_binary_identity(tinykg_binary)
+    formal_identity = formal_kernel_identity(formal_kernel)
     receipt_cost_usd = 0.0
     receipt_tokens = 0
     if experiment["stage"]["id"] == "confirmatory":
@@ -652,6 +665,7 @@ def run_multi_arm(
             calibration_checkpoints,
             metacodes_sha256=metacodes_sha256,
             tinykg_sha256=tinykg_identity["sha256"],
+            formal_kernel_fingerprint=formal_identity["artifact_fingerprint"],
             revision=revision,
         )
     elif promotion_receipt is not None or calibration_checkpoints is not None:
@@ -662,7 +676,11 @@ def run_multi_arm(
     prior_tokens = budget_used_tokens + receipt_tokens
     expected_tasks = {task["id"]: task for task in suite["tasks"]}
     config_ids = arm_config_ids(
-        experiment, suite, metacodes_sha256, tinykg_identity["sha256"]
+        experiment,
+        suite,
+        metacodes_sha256,
+        tinykg_identity["sha256"],
+        formal_identity["artifact_fingerprint"],
     )
     outputs = {arm_id: output_dir / f"{arm_id}.jsonl" for arm_id in ARM_IDS}
     collected = {
@@ -709,6 +727,7 @@ def run_multi_arm(
                 tinykg_identity["sha256"],
                 "TinyKG binary",
             )
+            _require_formal_identity(formal_identity)
             infrastructure_error: InfrastructureRunError | None = None
             try:
                 run_dir = _run_once(
@@ -723,7 +742,10 @@ def run_multi_arm(
                     revision,
                     harness_config_id=config_ids[arm_id],
                     runtime_env=arm_runtime_env(
-                        experiment, arm_id, Path(tinykg_identity["path"])
+                        experiment,
+                        arm_id,
+                        Path(tinykg_identity["path"]),
+                        formal_identity,
                     ),
                     allow_invalid_run=True,
                     timeout_seconds=expected_tasks[task_id]["constraints"]["timeout_seconds"],
@@ -740,6 +762,7 @@ def run_multi_arm(
                     tinykg_identity["sha256"],
                     "TinyKG binary",
                 )
+                _require_formal_identity(formal_identity)
             import_error: ValidationError | None = None
             try:
                 imported = import_run(suite, repo_root, run_dir)

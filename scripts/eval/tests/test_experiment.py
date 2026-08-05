@@ -1,5 +1,6 @@
 import copy
 import hashlib
+import json
 import os
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ from scripts.eval.experiment import (
     ARM_IDS,
     build_dry_run_plan,
     counterbalanced_schedule,
+    formal_kernel_identity,
     tinykg_binary_identity,
     validate_experiment,
 )
@@ -28,6 +30,62 @@ CONFIRMATORY_EXPERIMENT_PATH = (
     ROOT / "evals/experiments/long-horizon-three-arm-confirmatory-v2.json"
 )
 CONFIRMATORY_SUITE_PATH = ROOT / "evals/suites/long-horizon-repository-pk.json"
+
+
+def fake_formal_artifact(root: Path) -> tuple[Path, dict]:
+    binary = root / "metacodes-formal-kernel"
+    binary.write_bytes(b"formal-kernel-test-artifact")
+    binary.chmod(0o755)
+    binary_sha = hashlib.sha256(binary.read_bytes()).hexdigest()
+    provenance_path = Path(f"{binary}.provenance.json")
+    provenance = {
+        "schema_version": "metacodes-formal-artifact-v2",
+        "checker_version": "metacodes-formal-kernel-v2",
+        "request_schema": "metacodes-formal-request-v1",
+        "memory_request_schema": "metacodes-memory-migration-request-v1",
+        "verdict_schema": "metacodes-formal-verdict-v2",
+        "binary_sha256": binary_sha,
+        "binary_bytes": binary.stat().st_size,
+        "kernel_source_sha256": "1" * 64,
+        "memory_kernel_source_sha256": "2" * 64,
+        "main_source_sha256": "3" * 64,
+        "axiom_audit_source_sha256": "4" * 64,
+        "axiom_policy": "propext,Quot.sound",
+        "axiom_audit": "passed",
+        "host_os": "test",
+        "host_arch": "test",
+        "linker": "test",
+        "lean_version": "Lean test",
+        "native_smoke": "passed",
+        "built_at_utc": "2026-08-06T00:00:00Z",
+    }
+    provenance_path.write_text(
+        json.dumps(provenance, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    provenance_sha = hashlib.sha256(provenance_path.read_bytes()).hexdigest()
+    fingerprint_payload = {
+        "binary_sha256": binary_sha,
+        "provenance_sha256": provenance_sha,
+        "checker_version": provenance["checker_version"],
+        "request_schema": provenance["request_schema"],
+        "memory_request_schema": provenance["memory_request_schema"],
+        "verdict_schema": provenance["verdict_schema"],
+    }
+    identity = {
+        "path": str(binary.resolve()),
+        "sha256": binary_sha,
+        "bytes": binary.stat().st_size,
+        "provenance_path": str(provenance_path.resolve()),
+        "provenance_sha256": provenance_sha,
+        "checker_version": "metacodes-formal-kernel-v2",
+        "artifact_fingerprint": hashlib.sha256(
+            json.dumps(
+                fingerprint_payload, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+    return binary, identity
 
 
 class LongHorizonExperimentTest(unittest.TestCase):
@@ -123,6 +181,52 @@ class LongHorizonExperimentTest(unittest.TestCase):
             self.assertNotIn("METACODES_KG_BIN", call.kwargs["env"])
             self.assertNotIn("TINYKG_STORE", call.kwargs["env"])
 
+    def test_formal_kernel_probe_binds_binary_provenance_and_native_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary, expected = fake_formal_artifact(Path(directory))
+            verdict = {
+                "schema_version": "metacodes-formal-verdict-v2",
+                "checker_version": "metacodes-formal-kernel-v2",
+                "request_id": "a" * 64,
+                "operation": "task_audit",
+                "proposal_sha256": "b" * 64,
+                "snapshot_sha256": "c" * 64,
+                "snapshot_revision": "d" * 64,
+                "decision": "admit",
+                "admitted": True,
+                "reason_codes": [],
+            }
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "METACODES_FORMAL_KERNEL_PATH": "/host/leak",
+                    "TINYKG_STORE": "/host/store",
+                },
+            ), mock.patch(
+                "scripts.eval.experiment.subprocess.run",
+                return_value=mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(verdict),
+                    stderr="",
+                ),
+            ) as run:
+                observed = formal_kernel_identity(binary)
+            self.assertEqual(observed, expected)
+            self.assertNotIn("METACODES_FORMAL_KERNEL_PATH", run.call_args.kwargs["env"])
+            self.assertNotIn("TINYKG_STORE", run.call_args.kwargs["env"])
+            self.assertTrue(
+                run.call_args.kwargs["input"].startswith(
+                    '{"schema_version":"metacodes-formal-request-v1","request_id":'
+                )
+            )
+
+            provenance_path = Path(expected["provenance_path"])
+            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+            provenance["binary_sha256"] = "0" * 64
+            provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+            with self.assertRaisesRegex(ValidationError, "does not bind"):
+                formal_kernel_identity(binary)
+
     def test_dry_run_freezes_binary_revision_arm_env_and_all_rollouts(self):
         with tempfile.TemporaryDirectory() as directory:
             binary = Path(directory) / "metacodes"
@@ -136,15 +240,20 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 "sha256": hashlib.sha256(tinykg.read_bytes()).hexdigest(),
                 "version": "tinykg test",
             }
+            formal, formal_identity = fake_formal_artifact(Path(directory))
             with mock.patch(
                 "scripts.eval.experiment.tinykg_binary_identity",
                 return_value=tinykg_identity,
+            ), mock.patch(
+                "scripts.eval.experiment.formal_kernel_identity",
+                return_value=formal_identity,
             ):
                 first = build_dry_run_plan(
                     self.experiment,
                     self.suite,
                     binary=binary,
                     tinykg_binary=tinykg,
+                    formal_kernel=formal,
                     revision="abc123",
                 )
                 second = build_dry_run_plan(
@@ -152,12 +261,14 @@ class LongHorizonExperimentTest(unittest.TestCase):
                     self.suite,
                     binary=binary,
                     tinykg_binary=tinykg,
+                    formal_kernel=formal,
                     revision="abc123",
                 )
         self.assertEqual(first, second)
         self.assertEqual(first["rollout_count"], 18)
         self.assertEqual(first["execution_identity"]["revision"], "abc123")
         self.assertEqual(first["execution_identity"]["tinykg"], tinykg_identity)
+        self.assertEqual(first["execution_identity"]["formal_kernel"], formal_identity)
         self.assertEqual(len({row["harness_config_id"] for row in first["rows"]}), 3)
         for row in first["rows"]:
             self.assertEqual(
@@ -168,8 +279,18 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 self.assertEqual(
                     row["runtime_env"]["METACODES_KG_BIN"], str(tinykg.resolve())
                 )
+                self.assertEqual(
+                    row["runtime_env"]["METACODES_FORMAL_KERNEL_PATH"],
+                    str(formal.resolve()),
+                )
+                self.assertEqual(
+                    row["runtime_env"]["METACODES_FORMAL_KERNEL_SHA256"],
+                    formal_identity["sha256"],
+                )
             else:
                 self.assertNotIn("METACODES_KG_BIN", row["runtime_env"])
+                self.assertNotIn("METACODES_FORMAL_KERNEL_PATH", row["runtime_env"])
+                self.assertNotIn("METACODES_FORMAL_KERNEL_SHA256", row["runtime_env"])
 
     def test_multi_arm_checkpoints_resume_without_repeating_rollouts(self):
         experiment = copy.deepcopy(self.experiment)
@@ -188,6 +309,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 "sha256": hashlib.sha256(tinykg.read_bytes()).hexdigest(),
                 "version": "tinykg test",
             }
+            formal, formal_identity = fake_formal_artifact(root)
             output_dir = root / "checkpoints"
             invocations = []
             run_state = {}
@@ -245,8 +367,18 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 self.assertEqual(runtime_env["METACODES_LONG_HORIZON_ARM"], arm_id)
                 if arm_id == "tinykg":
                     self.assertEqual(runtime_env["METACODES_KG_BIN"], str(tinykg.resolve()))
+                    self.assertEqual(
+                        runtime_env["METACODES_FORMAL_KERNEL_PATH"],
+                        str(formal.resolve()),
+                    )
+                    self.assertEqual(
+                        runtime_env["METACODES_FORMAL_KERNEL_SHA256"],
+                        formal_identity["sha256"],
+                    )
                 else:
                     self.assertNotIn("METACODES_KG_BIN", runtime_env)
+                    self.assertNotIn("METACODES_FORMAL_KERNEL_PATH", runtime_env)
+                    self.assertNotIn("METACODES_FORMAL_KERNEL_SHA256", runtime_env)
                 self.assertTrue(allow_invalid_run)
                 self.assertEqual(timeout_seconds, 900)
                 task = task_by_id[task_id]
@@ -299,8 +431,12 @@ class LongHorizonExperimentTest(unittest.TestCase):
                     "scripts.eval.paired_runner.tinykg_binary_identity",
                     return_value=tinykg_identity,
                 ),
+                mock.patch(
+                    "scripts.eval.paired_runner.formal_kernel_identity",
+                    return_value=formal_identity,
+                ),
             )
-            with patches[0], patches[1], patches[2]:
+            with patches[0], patches[1], patches[2], patches[3]:
                 with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
                     run_multi_arm(
                         experiment,
@@ -308,6 +444,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         ROOT,
                         binary,
                         tinykg_binary=tinykg,
+                        formal_kernel=formal,
                         revision="abc123",
                         output_dir=output_dir,
                         suite_path=SUITE_PATH,
@@ -322,6 +459,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                     ROOT,
                     binary,
                     tinykg_binary=tinykg,
+                    formal_kernel=formal,
                     revision="abc123",
                     output_dir=output_dir,
                     suite_path=SUITE_PATH,
@@ -346,6 +484,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 "sha256": hashlib.sha256(tinykg.read_bytes()).hexdigest(),
                 "version": "tinykg test",
             }
+            formal, formal_identity = fake_formal_artifact(root)
 
             def replace_binary(*_args, **_kwargs):
                 binary.write_bytes(b"replaced-during-rollout")
@@ -356,6 +495,9 @@ class LongHorizonExperimentTest(unittest.TestCase):
             with mock.patch(
                 "scripts.eval.paired_runner.tinykg_binary_identity",
                 return_value=tinykg_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner.formal_kernel_identity",
+                return_value=formal_identity,
             ), mock.patch(
                 "scripts.eval.paired_runner._run_once", side_effect=replace_binary
             ), mock.patch("scripts.eval.paired_runner.import_run") as imported:
@@ -368,6 +510,58 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         ROOT,
                         binary,
                         tinykg_binary=tinykg,
+                        formal_kernel=formal,
+                        revision="abc123",
+                        output_dir=root / "checkpoints",
+                        suite_path=SUITE_PATH,
+                        allow_paid_rollouts=True,
+                    )
+            imported.assert_not_called()
+
+    def test_multi_arm_rechecks_formal_artifact_after_each_rollout(self):
+        experiment = copy.deepcopy(self.experiment)
+        experiment["budget"]["paid_rollouts_enabled"] = True
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "metacodes"
+            binary.write_bytes(b"frozen")
+            binary.chmod(0o755)
+            tinykg = root / "tinykg"
+            tinykg.write_bytes(b"tinykg")
+            tinykg.chmod(0o755)
+            tinykg_identity = {
+                "path": str(tinykg.resolve()),
+                "sha256": hashlib.sha256(tinykg.read_bytes()).hexdigest(),
+                "version": "tinykg test",
+            }
+            formal, formal_identity = fake_formal_artifact(root)
+            replaced = dict(formal_identity)
+            replaced["provenance_sha256"] = "0" * 64
+
+            def finish_one_rollout(*_args, **_kwargs):
+                run_dir = root / "run"
+                run_dir.mkdir()
+                return run_dir
+
+            with mock.patch(
+                "scripts.eval.paired_runner.tinykg_binary_identity",
+                return_value=tinykg_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner.formal_kernel_identity",
+                side_effect=[formal_identity, formal_identity, replaced],
+            ), mock.patch(
+                "scripts.eval.paired_runner._run_once", side_effect=finish_one_rollout
+            ), mock.patch("scripts.eval.paired_runner.import_run") as imported:
+                with self.assertRaisesRegex(
+                    ValidationError, "formal kernel artifact changed"
+                ):
+                    run_multi_arm(
+                        experiment,
+                        self.suite,
+                        ROOT,
+                        binary,
+                        tinykg_binary=tinykg,
+                        formal_kernel=formal,
                         revision="abc123",
                         output_dir=root / "checkpoints",
                         suite_path=SUITE_PATH,
@@ -392,6 +586,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 "sha256": hashlib.sha256(tinykg.read_bytes()).hexdigest(),
                 "version": "tinykg test",
             }
+            formal, formal_identity = fake_formal_artifact(root)
             output_dir = root / "checkpoints"
             run_dir = root / "invalid-run"
             run_dir.mkdir()
@@ -435,6 +630,9 @@ class LongHorizonExperimentTest(unittest.TestCase):
             ), mock.patch(
                 "scripts.eval.paired_runner.tinykg_binary_identity",
                 return_value=tinykg_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner.formal_kernel_identity",
+                return_value=formal_identity,
             ):
                 with self.assertRaisesRegex(InfrastructureRunError, "invalid evidence retained"):
                     run_multi_arm(
@@ -443,6 +641,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         ROOT,
                         binary,
                         tinykg_binary=tinykg,
+                        formal_kernel=formal,
                         revision="abc123",
                         output_dir=output_dir,
                         suite_path=SUITE_PATH,
@@ -478,9 +677,13 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 "sha256": tinykg_sha,
                 "version": "tinykg test",
             }
+            formal, formal_identity = fake_formal_artifact(root)
             with mock.patch(
                 "scripts.eval.paired_runner.tinykg_binary_identity",
                 return_value=tinykg_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner.formal_kernel_identity",
+                return_value=formal_identity,
             ):
                 with self.assertRaisesRegex(
                     ValidationError, "requires a calibration promotion receipt"
@@ -491,6 +694,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         ROOT,
                         binary,
                         tinykg_binary=tinykg,
+                        formal_kernel=formal,
                         revision="confirmatory-revision",
                         output_dir=root / "missing-receipt",
                         suite_path=CONFIRMATORY_SUITE_PATH,
@@ -504,6 +708,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 ROOT,
                 metacodes_sha256=metacodes_sha,
                 tinykg_sha256=tinykg_sha,
+                formal_kernel_fingerprint=formal_identity["artifact_fingerprint"],
                 revision="confirmatory-revision",
             )
             receipt = build_promotion_receipt(
@@ -512,6 +717,9 @@ class LongHorizonExperimentTest(unittest.TestCase):
             with mock.patch(
                 "scripts.eval.paired_runner.tinykg_binary_identity",
                 return_value=tinykg_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner.formal_kernel_identity",
+                return_value=formal_identity,
             ):
                 with self.assertRaisesRegex(
                     ValidationError, "authoritative calibration checkpoints"
@@ -522,6 +730,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         ROOT,
                         binary,
                         tinykg_binary=tinykg,
+                        formal_kernel=formal,
                         revision="confirmatory-revision",
                         output_dir=root / "missing-checkpoints",
                         suite_path=CONFIRMATORY_SUITE_PATH,
@@ -531,6 +740,9 @@ class LongHorizonExperimentTest(unittest.TestCase):
             with mock.patch(
                 "scripts.eval.paired_runner.tinykg_binary_identity",
                 return_value=tinykg_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner.formal_kernel_identity",
+                return_value=formal_identity,
             ), mock.patch(
                 "scripts.eval.paired_runner._run_once",
                 side_effect=RuntimeError("receipt accepted before paid rollout seam"),
@@ -542,6 +754,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         ROOT,
                         binary,
                         tinykg_binary=tinykg,
+                        formal_kernel=formal,
                         revision="confirmatory-revision",
                         output_dir=root / "accepted-receipt",
                         suite_path=CONFIRMATORY_SUITE_PATH,
@@ -555,6 +768,9 @@ class LongHorizonExperimentTest(unittest.TestCase):
             with mock.patch(
                 "scripts.eval.paired_runner.tinykg_binary_identity",
                 return_value=tinykg_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner.formal_kernel_identity",
+                return_value=formal_identity,
             ):
                 with self.assertRaisesRegex(
                     ValidationError, "does not match authoritative calibration"
@@ -565,6 +781,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         ROOT,
                         binary,
                         tinykg_binary=tinykg,
+                        formal_kernel=formal,
                         revision="confirmatory-revision",
                         output_dir=root / "bad-receipt",
                         suite_path=CONFIRMATORY_SUITE_PATH,
@@ -579,6 +796,9 @@ class LongHorizonExperimentTest(unittest.TestCase):
             with mock.patch(
                 "scripts.eval.paired_runner.tinykg_binary_identity",
                 return_value=tinykg_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner.formal_kernel_identity",
+                return_value=formal_identity,
             ), mock.patch("scripts.eval.paired_runner._run_once") as run_once:
                 with self.assertRaisesRegex(
                     ValidationError, "does not match authoritative calibration"
@@ -589,6 +809,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         ROOT,
                         binary,
                         tinykg_binary=tinykg,
+                        formal_kernel=formal,
                         revision="confirmatory-revision",
                         output_dir=root / "tampered-checkpoint",
                         suite_path=CONFIRMATORY_SUITE_PATH,

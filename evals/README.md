@@ -188,7 +188,7 @@ quality–cost–latency frontier（dominates / dominated / tradeoff / equivalen
 
 两个 manifest 共享 `metacodes-long-horizon-pk-v2`、同一 `glm-5.2`、同一二进制和三种
 typed treatment：`codex_style`（transcript + compact）、`claude_style`（再加 Markdown
-AutoMemory）和 `tinykg`（再加 TinyKG/DAG）。两阶段都关闭 swarm，避免额外模型调用成为混杂因子；
+AutoMemory）和 `tinykg`（再加 TinyKG/DAG 与原生 Lean formal audit）。两阶段都关闭 swarm，避免额外模型调用成为混杂因子；
 每个阶段使用 6-row Williams-style block，平衡顺序位置和一阶 carryover。
 
 - `long-horizon-three-arm-calibration-v2.json`：1 个非结论性机制任务 × 3 臂 × 6 trial =
@@ -211,6 +211,7 @@ python3 scripts/eval/cli.py run-multi \
   --experiment evals/experiments/long-horizon-three-arm-calibration-v2.json \
   --binary zig-out/bin/metacodes \
   --tinykg-binary zig-out/vendor/tinykg/tinykg \
+  --formal-kernel zig-out/libexec/metacodes/metacodes-formal-kernel \
   --revision "$(git rev-parse HEAD)" \
   --output-dir /tmp/metacodes-lh3-calibration \
   --dry-run --plan-output /tmp/metacodes-lh3-calibration-plan.json
@@ -219,12 +220,16 @@ python3 scripts/eval/cli.py run-multi \
   --experiment evals/experiments/long-horizon-three-arm-confirmatory-v2.json \
   --binary zig-out/bin/metacodes \
   --tinykg-binary zig-out/vendor/tinykg/tinykg \
+  --formal-kernel zig-out/libexec/metacodes/metacodes-formal-kernel \
   --revision "$(git rev-parse HEAD)" \
   --output-dir /tmp/metacodes-lh3-confirmatory \
   --dry-run --plan-output /tmp/metacodes-lh3-confirmatory-plan.json
 ```
 
-两个 checked-in manifest 都保持 `paid_rollouts_enabled=false`。真正执行仍需同时修改对应
+runner 会把 Lean checker 二进制、相邻 provenance 及其版本化协议验证为一个 artifact identity，
+将 identity 绑定到三臂 config/checkpoint，但只向 `tinykg` 臂注入 checker 路径与 SHA-256；
+基线臂既拿不到路径，也不能从宿主环境继承它。两个 checked-in manifest 都保持
+`paid_rollouts_enabled=false`。真正执行仍需同时修改对应
 manifest 并传 `--allow-paid-rollouts`。每个昂贵 rollout 后独立原子 checkpoint；invalid 或基础设施
 失败先保留证据再中止。TinyKG binary 的 storage/schema/version/SHA 会在执行前冻结，只有 TinyKG
 臂收到其路径；runner 同时清除宿主 `METACODES_*`、`TINYKG_*`、`E2E_*`、

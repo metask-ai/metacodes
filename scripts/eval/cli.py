@@ -167,6 +167,7 @@ def cmd_validate_experiment(args: argparse.Namespace) -> int:
         suite,
         binary=Path(args.binary),
         tinykg_binary=Path(args.tinykg_binary),
+        formal_kernel=Path(args.formal_kernel),
         revision=args.revision,
     )
     print(
@@ -185,6 +186,7 @@ def cmd_run_multi(args: argparse.Namespace) -> int:
             suite,
             binary=Path(args.binary),
             tinykg_binary=Path(args.tinykg_binary),
+            formal_kernel=Path(args.formal_kernel),
             revision=args.revision,
         )
         _write_json(args.plan_output, plan)
@@ -200,6 +202,7 @@ def cmd_run_multi(args: argparse.Namespace) -> int:
         REPO_ROOT,
         Path(args.binary),
         tinykg_binary=Path(args.tinykg_binary),
+        formal_kernel=Path(args.formal_kernel),
         revision=args.revision,
         output_dir=Path(args.output_dir),
         suite_path=suite_path,
@@ -353,6 +356,7 @@ def cmd_report_multi(args: argparse.Namespace) -> int:
         calibration_checkpoint_paths(Path(args.calibration_dir)),
         metacodes_sha256=result["metacodes_sha256"],
         tinykg_sha256=result["tinykg_sha256"],
+        formal_kernel_fingerprint=result["formal_kernel_fingerprint"],
         revision=result["harness_revision"],
     )
     result["promotion"] = {
@@ -703,6 +707,7 @@ def parser() -> argparse.ArgumentParser:
     validate_experiment_parser.add_argument("experiment")
     validate_experiment_parser.add_argument("--binary", required=True)
     validate_experiment_parser.add_argument("--tinykg-binary", required=True)
+    validate_experiment_parser.add_argument("--formal-kernel", required=True)
     validate_experiment_parser.add_argument("--revision", required=True)
     validate_experiment_parser.set_defaults(func=cmd_validate_experiment)
 
@@ -773,6 +778,7 @@ def parser() -> argparse.ArgumentParser:
     multi_parser.add_argument("--experiment", required=True)
     multi_parser.add_argument("--binary", required=True)
     multi_parser.add_argument("--tinykg-binary", required=True)
+    multi_parser.add_argument("--formal-kernel", required=True)
     multi_parser.add_argument("--revision", required=True)
     multi_parser.add_argument("--output-dir", required=True)
     multi_parser.add_argument("--dry-run", action="store_true")

@@ -108,6 +108,7 @@ def validate_multi_arm_evidence(
     contracts: Dict[str, Any] = {}
     metacodes_sha256s = set()
     tinykg_sha256s = set()
+    formal_kernel_fingerprints = set()
     revisions = set()
     fingerprint = experiment_fingerprint(experiment, suite)
     for arm_id, rollouts in rollouts_by_arm.items():
@@ -121,27 +122,39 @@ def validate_multi_arm_evidence(
             model_id=experiment["model"]["id"],
             grounding=grounding,
         )
-        prefix = f"{experiment['experiment_id']}:{arm_id}:{fingerprint}:mc-"
+        prefix = f"{experiment['experiment_id']}:{arm_id}:{fingerprint}:"
         config_id = contract["harness_config_id"]
         suffix = config_id[len(prefix) :] if config_id.startswith(prefix) else ""
-        parts = suffix.split(":kg-", 1)
+        parts = suffix.split(":")
         if (
-            len(parts) != 2
-            or len(parts[0]) != 64
-            or len(parts[1]) != 64
-            or any(char not in "0123456789abcdef" for char in parts[0] + parts[1])
+            len(parts) != 3
+            or not parts[0].startswith("mc-")
+            or not parts[1].startswith("kg-")
+            or not parts[2].startswith("fk-")
         ):
             raise ValidationError(
-                f"{arm_id} harness config is not bound to this experiment/TinyKG identity"
+                f"{arm_id} harness config is not bound to all experiment artifacts"
             )
-        metacodes_sha256s.add(parts[0])
-        tinykg_sha256s.add(parts[1])
+        hashes = (parts[0][3:], parts[1][3:], parts[2][3:])
+        if any(
+            len(value) != 64
+            or any(char not in "0123456789abcdef" for char in value)
+            for value in hashes
+        ):
+            raise ValidationError(
+                f"{arm_id} harness config contains an invalid artifact digest"
+            )
+        metacodes_sha256s.add(hashes[0])
+        tinykg_sha256s.add(hashes[1])
+        formal_kernel_fingerprints.add(hashes[2])
         revisions.add(contract["harness_revision"])
         contracts[arm_id] = contract
     if len(metacodes_sha256s) != 1:
         raise ValidationError("multi-arm evidence mixes metacodes binary identities")
     if len(tinykg_sha256s) != 1:
         raise ValidationError("multi-arm evidence mixes TinyKG dependency identities")
+    if len(formal_kernel_fingerprints) != 1:
+        raise ValidationError("multi-arm evidence mixes formal kernel artifact identities")
     if len(revisions) != 1:
         raise ValidationError("multi-arm evidence mixes metacodes revisions")
 
@@ -150,6 +163,7 @@ def validate_multi_arm_evidence(
         "experiment_fingerprint": fingerprint,
         "metacodes_sha256": next(iter(metacodes_sha256s)),
         "tinykg_sha256": next(iter(tinykg_sha256s)),
+        "formal_kernel_fingerprint": next(iter(formal_kernel_fingerprints)),
         "harness_revision": next(iter(revisions)),
         "contracts": contracts,
     }
@@ -218,6 +232,7 @@ def build_promotion_receipt(
         "identity": {
             "metacodes_sha256": metadata["metacodes_sha256"],
             "tinykg_sha256": metadata["tinykg_sha256"],
+            "formal_kernel_fingerprint": metadata["formal_kernel_fingerprint"],
             "harness_revision": metadata["harness_revision"],
         },
         "checkpoint_sha256": checkpoint_sha256,
@@ -263,6 +278,7 @@ def validate_calibration_bundle(
     *,
     metacodes_sha256: str,
     tinykg_sha256: str,
+    formal_kernel_fingerprint: str,
     revision: str,
 ) -> Tuple[float, int]:
     """Authorize confirmatory work from source checkpoints, never receipt alone."""
@@ -291,6 +307,7 @@ def validate_calibration_bundle(
         confirmatory_experiment,
         metacodes_sha256=metacodes_sha256,
         tinykg_sha256=tinykg_sha256,
+        formal_kernel_fingerprint=formal_kernel_fingerprint,
         revision=revision,
         source_experiment_fingerprint=source_fingerprint,
     )

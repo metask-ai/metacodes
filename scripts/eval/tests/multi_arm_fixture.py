@@ -21,11 +21,16 @@ def write_multi_arm_checkpoints(
     *,
     metacodes_sha256: str,
     tinykg_sha256: str,
+    formal_kernel_fingerprint: str,
     revision: str,
 ) -> Dict[str, Path]:
     directory.mkdir(parents=True, exist_ok=True)
     config_ids = arm_config_ids(
-        experiment, suite, metacodes_sha256, tinykg_sha256
+        experiment,
+        suite,
+        metacodes_sha256,
+        tinykg_sha256,
+        formal_kernel_fingerprint,
     )
     model = experiment["model"]
     model_fingerprint = hashlib.sha256(
