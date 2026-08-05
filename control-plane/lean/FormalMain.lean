@@ -1,10 +1,11 @@
 import MetaCodesControl.FormalKernel
+import MetaCodesControl.MemoryMigration
 
 open Lean
 open MetaCodesControl.FormalKernel
 
 def usage : String :=
-  "metacodes-formal-kernel reads one metacodes-formal-request-v1 JSON object from stdin"
+  "metacodes-formal-kernel reads one supported canonical JSON request from stdin"
 
 def maxInputBytes : Nat := 64 * 1024
 
@@ -29,10 +30,20 @@ def main (args : List String) : IO UInt32 := do
     return 64
   let stdin ← IO.getStdin
   let input ← readBounded stdin
-  match decodeRequest input with
-  | .error message =>
-      IO.eprintln s!"invalid formal request: {message}"
-      pure 64
-  | .ok request =>
-      IO.println (verdictJson request)
-      pure 0
+  if input.startsWith
+      ("{\"schema_version\":\"" ++ MetaCodesControl.MemoryMigration.requestSchema ++ "\"") then
+    match MetaCodesControl.MemoryMigration.decodeCanonicalRequest input with
+    | .error message =>
+        IO.eprintln s!"invalid formal request: {message}"
+        pure 64
+    | .ok request =>
+        IO.println (MetaCodesControl.MemoryMigration.verdictJson request)
+        pure 0
+  else
+    match decodeRequest input with
+    | .error message =>
+        IO.eprintln s!"invalid formal request: {message}"
+        pure 64
+    | .ok request =>
+        IO.println (verdictJson request)
+        pure 0

@@ -3,8 +3,8 @@ import Std
 namespace MetaCodesControl.FormalKernel
 
 def requestSchema : String := "metacodes-formal-request-v1"
-def verdictSchema : String := "metacodes-formal-verdict-v1"
-def checkerVersion : String := "metacodes-formal-kernel-v1"
+def verdictSchema : String := "metacodes-formal-verdict-v2"
+def checkerVersion : String := "metacodes-formal-kernel-v2"
 
 /--
 Facts are measured by the Zig sensor from one bounded TinyKG snapshot.  The
@@ -189,7 +189,9 @@ def parseNat (cursor : Cursor) : Except String (Nat × Cursor) := do
   if digits.isEmpty then throw "expected natural number"
   -- Counts are protocol-bounded below.  Bounding lexical width first prevents
   -- an oversized decimal from becoming a parser-level resource attack.
-  if digits.length > 10 then throw "natural number exceeds lexical bound"
+  -- Counts remain semantically bounded by each request validator; ids need the
+  -- full unsigned-64 decimal width used by TinyKG.
+  if digits.length > 20 then throw "natural number exceeds lexical bound"
   match (String.mk digits).toNat? with
   | some value => pure (value, { remaining := rest })
   | none => throw "invalid natural number"

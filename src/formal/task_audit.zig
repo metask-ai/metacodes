@@ -249,6 +249,7 @@ fn auditSnapshotTimed(
     defer allocator.free(request);
     const sensor_elapsed_ns = elapsedSince(sensor_started);
     var invocation = try runtime.invoke(allocator, config, request, .{
+        .operation = "task_audit",
         .request_id = request_id,
         .proposal_sha256 = proposal_sha256,
         .snapshot_sha256 = snapshot_sha256,
@@ -549,8 +550,8 @@ fn renderReceipt(allocator: std.mem.Allocator, receipt: Receipt) ![]u8 {
         try writer.print(",\"provenance_elapsed_ns\":{d},\"provenance\":", .{receipt.provenance_elapsed_ns});
         if (receipt.provenance) |loaded| {
             try writer.print(
-                "{{\"schema_version\":\"{s}\",\"manifest_sha256\":\"{s}\",\"kernel_source_sha256\":\"{s}\",\"main_source_sha256\":\"{s}\",\"axiom_audit_source_sha256\":\"{s}\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"source_identity_claim\":\"builder_reported_manifest_unpinned\",\"host_os\":",
-                .{ provenance.MANIFEST_SCHEMA, loaded.manifest_sha256[0..], loaded.kernel_source_sha256[0..], loaded.main_source_sha256[0..], loaded.axiom_audit_source_sha256[0..] },
+                "{{\"schema_version\":\"{s}\",\"manifest_sha256\":\"{s}\",\"kernel_source_sha256\":\"{s}\",\"memory_kernel_source_sha256\":\"{s}\",\"main_source_sha256\":\"{s}\",\"axiom_audit_source_sha256\":\"{s}\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"source_identity_claim\":\"builder_reported_manifest_unpinned\",\"host_os\":",
+                .{ provenance.MANIFEST_SCHEMA, loaded.manifest_sha256[0..], loaded.kernel_source_sha256[0..], loaded.memory_kernel_source_sha256[0..], loaded.main_source_sha256[0..], loaded.axiom_audit_source_sha256[0..] },
             );
             try std.json.Stringify.encodeJsonString(loaded.host_os, .{}, writer);
             try writer.writeAll(",\"host_arch\":");
@@ -571,16 +572,19 @@ fn renderReceipt(allocator: std.mem.Allocator, receipt: Receipt) ![]u8 {
     }
     try writer.writeAll(",\"verdict\":");
     if (receipt.invocation) |invocation| {
-        if (invocation.verdict) |verdict| {
-            try writer.print("{{\"checker_admitted\":{s},\"reason_codes\":[", .{boolText(verdict.admitted)});
-            for (verdict.reasons, 0..) |reason, index| {
-                if (index != 0) try writer.writeAll(",");
-                try writer.print("\"{s}\"", .{@tagName(reason)});
-            }
-            try writer.print(
-                "],\"checks\":{{\"counts_consistent\":{s},\"claims_owned\":{s},\"hierarchy_recoverable\":{s},\"terminal_evidence_preserved\":{s},\"references_valid\":{s},\"preservation_obligations\":{s}}}}}",
-                .{ boolText(verdict.checks.counts_consistent), boolText(verdict.checks.claims_owned), boolText(verdict.checks.hierarchy_recoverable), boolText(verdict.checks.terminal_evidence_preserved), boolText(verdict.checks.references_valid), boolText(verdict.checks.preservation_obligations) },
-            );
+        if (invocation.verdict) |verdict| switch (verdict.checks) {
+            .task_audit => |checks| {
+                try writer.print("{{\"checker_admitted\":{s},\"reason_codes\":[", .{boolText(verdict.admitted)});
+                for (verdict.reasons, 0..) |reason, index| {
+                    if (index != 0) try writer.writeAll(",");
+                    try writer.print("\"{s}\"", .{@tagName(reason)});
+                }
+                try writer.print(
+                    "],\"checks\":{{\"counts_consistent\":{s},\"claims_owned\":{s},\"hierarchy_recoverable\":{s},\"terminal_evidence_preserved\":{s},\"references_valid\":{s},\"preservation_obligations\":{s}}}}}",
+                    .{ boolText(checks.counts_consistent), boolText(checks.claims_owned), boolText(checks.hierarchy_recoverable), boolText(checks.terminal_evidence_preserved), boolText(checks.references_valid), boolText(checks.preservation_obligations) },
+                );
+            },
+            .memory_supersede_existing => try writer.writeAll("null"),
         } else {
             try writer.writeAll("null");
         }

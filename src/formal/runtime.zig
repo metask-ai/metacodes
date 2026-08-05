@@ -13,8 +13,9 @@ const time = @import("../util/time.zig");
 const AbortSignal = @import("../util/abort.zig").AbortSignal;
 
 pub const REQUEST_SCHEMA = "metacodes-formal-request-v1";
-pub const VERDICT_SCHEMA = "metacodes-formal-verdict-v1";
-pub const CHECKER_VERSION = "metacodes-formal-kernel-v1";
+pub const MEMORY_REQUEST_SCHEMA = "metacodes-memory-migration-request-v1";
+pub const VERDICT_SCHEMA = "metacodes-formal-verdict-v2";
+pub const CHECKER_VERSION = "metacodes-formal-kernel-v2";
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_CHECKER_BYTES: u64 = 128 * 1024 * 1024;
@@ -32,6 +33,7 @@ pub const ConfigLoad = union(enum) {
 };
 
 pub const Bindings = struct {
+    operation: []const u8,
     request_id: [64]u8,
     proposal_sha256: [64]u8,
     snapshot_sha256: [64]u8,
@@ -80,9 +82,13 @@ pub const ReasonCode = enum {
     schema_not_preserved,
     contradiction_promoted,
     proposal_not_reversible,
+    unsupported_memory_effect,
+    stale_memory_generation,
+    migration_evidence_invalid,
+    replacement_excluded,
 };
 
-pub const Checks = struct {
+pub const TaskAuditChecks = struct {
     counts_consistent: bool,
     claims_owned: bool,
     hierarchy_recoverable: bool,
@@ -90,10 +96,40 @@ pub const Checks = struct {
     references_valid: bool,
     preservation_obligations: bool,
 
-    pub fn all(self: Checks) bool {
+    pub fn all(self: TaskAuditChecks) bool {
         return self.counts_consistent and self.claims_owned and
             self.hierarchy_recoverable and self.terminal_evidence_preserved and
             self.references_valid and self.preservation_obligations;
+    }
+};
+
+pub const MemorySupersedeChecks = struct {
+    snapshot_usable: bool,
+    proposal_well_formed: bool,
+    references_valid: bool,
+    tasks_preserved: bool,
+    evidence_preserved: bool,
+    recovery_preserved: bool,
+    schema_preserved: bool,
+    contradiction_safe: bool,
+    reversible: bool,
+
+    pub fn all(self: MemorySupersedeChecks) bool {
+        return self.snapshot_usable and self.proposal_well_formed and
+            self.references_valid and self.tasks_preserved and
+            self.evidence_preserved and self.recovery_preserved and
+            self.schema_preserved and self.contradiction_safe and self.reversible;
+    }
+};
+
+pub const Checks = union(enum) {
+    task_audit: TaskAuditChecks,
+    memory_supersede_existing: MemorySupersedeChecks,
+
+    pub fn all(self: Checks) bool {
+        return switch (self) {
+            inline else => |checks| checks.all(),
+        };
     }
 };
 
@@ -320,7 +356,7 @@ fn hashChecker(allocator: std.mem.Allocator, path: []const u8) HashError!FileDig
     return .{ .sha256 = std.fmt.bytesToHex(raw, .lower), .bytes = total };
 }
 
-const RawVerdict = struct {
+const RawTaskVerdict = struct {
     schema_version: []const u8,
     checker_version: []const u8,
     request_id: []const u8,
@@ -331,13 +367,53 @@ const RawVerdict = struct {
     decision: []const u8,
     admitted: bool,
     reason_codes: [][]const u8,
-    checks: Checks,
+    checks: TaskAuditChecks,
 };
+
+const RawMemoryVerdict = struct {
+    schema_version: []const u8,
+    checker_version: []const u8,
+    request_id: []const u8,
+    operation: []const u8,
+    proposal_sha256: []const u8,
+    snapshot_sha256: []const u8,
+    snapshot_revision: []const u8,
+    decision: []const u8,
+    admitted: bool,
+    reason_codes: [][]const u8,
+    checks: MemorySupersedeChecks,
+};
+
+const OperationProbe = struct { operation: []const u8 };
 
 const VerdictError = error{ OutOfMemory, InvalidJson, SchemaMismatch, VersionMismatch, BindingMismatch, Inconsistent };
 
 fn parseVerdict(allocator: std.mem.Allocator, payload: []const u8, bindings: Bindings) VerdictError!Verdict {
-    var parsed = std.json.parseFromSlice(RawVerdict, allocator, payload, .{
+    var probe = std.json.parseFromSlice(OperationProbe, allocator, payload, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidJson,
+    };
+    defer probe.deinit();
+    if (!std.mem.eql(u8, probe.value.operation, bindings.operation)) return error.BindingMismatch;
+    if (std.mem.eql(u8, bindings.operation, "task_audit")) {
+        var parsed = try parseRawVerdict(RawTaskVerdict, allocator, payload);
+        defer parsed.deinit();
+        return finishVerdict(allocator, parsed.value, bindings, .{ .task_audit = parsed.value.checks });
+    }
+    if (std.mem.eql(u8, bindings.operation, "memory_supersede_existing")) {
+        var parsed = try parseRawVerdict(RawMemoryVerdict, allocator, payload);
+        defer parsed.deinit();
+        return finishVerdict(allocator, parsed.value, bindings, .{ .memory_supersede_existing = parsed.value.checks });
+    }
+    return error.BindingMismatch;
+}
+
+fn parseRawVerdict(comptime T: type, allocator: std.mem.Allocator, payload: []const u8) VerdictError!std.json.Parsed(T) {
+    return std.json.parseFromSlice(T, allocator, payload, .{
         .ignore_unknown_fields = false,
         .allocate = .alloc_always,
         .duplicate_field_behavior = .@"error",
@@ -345,11 +421,17 @@ fn parseVerdict(allocator: std.mem.Allocator, payload: []const u8, bindings: Bin
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidJson,
     };
-    defer parsed.deinit();
-    const raw = parsed.value;
+}
+
+fn finishVerdict(
+    allocator: std.mem.Allocator,
+    raw: anytype,
+    bindings: Bindings,
+    checks: Checks,
+) VerdictError!Verdict {
     if (!std.mem.eql(u8, raw.schema_version, VERDICT_SCHEMA)) return error.SchemaMismatch;
     if (!std.mem.eql(u8, raw.checker_version, CHECKER_VERSION)) return error.VersionMismatch;
-    if (!std.mem.eql(u8, raw.operation, "task_audit") or
+    if (!std.mem.eql(u8, raw.operation, bindings.operation) or
         !std.mem.eql(u8, raw.request_id, bindings.request_id[0..]) or
         !std.mem.eql(u8, raw.proposal_sha256, bindings.proposal_sha256[0..]) or
         !std.mem.eql(u8, raw.snapshot_sha256, bindings.snapshot_sha256[0..]) or
@@ -367,10 +449,10 @@ fn parseVerdict(allocator: std.mem.Allocator, payload: []const u8, bindings: Bin
         for (reasons[0..index]) |prior| if (prior == reason) return error.Inconsistent;
         reasons[index] = reason;
     }
-    if ((raw.admitted and (reasons.len != 0 or !raw.checks.all())) or
+    if ((raw.admitted and (reasons.len != 0 or !checks.all())) or
         (!raw.admitted and reasons.len == 0))
         return error.Inconsistent;
-    return .{ .admitted = raw.admitted, .reasons = reasons, .checks = raw.checks };
+    return .{ .admitted = raw.admitted, .reasons = reasons, .checks = checks };
 }
 
 fn verdictPayload(stdout: []const u8) ?[]const u8 {
@@ -472,7 +554,7 @@ test "formal runtime times out and rejects a verdict bound to another request" {
         defer std.testing.allocator.free(liar_path);
         const liar =
             "#!/bin/sh\n" ++
-            "printf '%s\\n' '{\"schema_version\":\"metacodes-formal-verdict-v1\",\"checker_version\":\"metacodes-formal-kernel-v1\",\"request_id\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"operation\":\"task_audit\",\"proposal_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"snapshot_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"snapshot_revision\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"decision\":\"admit\",\"admitted\":true,\"reason_codes\":[],\"checks\":{\"counts_consistent\":true,\"claims_owned\":true,\"hierarchy_recoverable\":true,\"terminal_evidence_preserved\":true,\"references_valid\":true,\"preservation_obligations\":true}}'\n";
+            "printf '%s\\n' '{\"schema_version\":\"metacodes-formal-verdict-v2\",\"checker_version\":\"metacodes-formal-kernel-v2\",\"request_id\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"operation\":\"task_audit\",\"proposal_sha256\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"snapshot_sha256\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"snapshot_revision\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"decision\":\"admit\",\"admitted\":true,\"reason_codes\":[],\"checks\":{\"counts_consistent\":true,\"claims_owned\":true,\"hierarchy_recoverable\":true,\"terminal_evidence_preserved\":true,\"references_valid\":true,\"preservation_obligations\":true}}'\n";
         try writeTestExecutable(std.testing.allocator, liar_path, liar);
         const liar_digest = try hashChecker(std.testing.allocator, liar_path);
         var lied = try invoke(std.testing.allocator, .{
@@ -487,6 +569,7 @@ test "formal runtime times out and rejects a verdict bound to another request" {
 
 fn testBindings() Bindings {
     return .{
+        .operation = "task_audit",
         .request_id = ("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").*,
         .proposal_sha256 = ("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").*,
         .snapshot_sha256 = ("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc").*,

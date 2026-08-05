@@ -33,6 +33,10 @@ mkdir -p "$(dirname "$output")" "$(dirname "$manifest")"
 # exact trust set is a release-blocking review event.
 axiom_audit=$(cd "$lean_dir" && "$lake" env lean FormalAxiomAudit.lean 2>&1)
 expected_axioms="'MetaCodesControl.FormalKernel.safeMigration_sound' depends on axioms: [propext, Quot.sound]"
+expected_axioms="$expected_axioms
+'MetaCodesControl.MemoryMigration.safeSupersede_sound' depends on axioms: [propext]
+'MetaCodesControl.MemoryMigration.applySupersede_preserves_nodes' does not depend on any axioms
+'MetaCodesControl.MemoryMigration.rollbackSupersede_apply' depends on axioms: [propext, Quot.sound]"
 if [[ "$axiom_audit" != "$expected_axioms" ]]; then
   echo "build-formal-kernel: unexpected soundness theorem axiom set" >&2
   printf '%s\n' "$axiom_audit" >&2
@@ -59,6 +63,7 @@ if [[ "$host_os" == "Darwin" ]]; then
   LEAN_CC=/usr/bin/clang "$leanc" -o "$tmp_binary" \
     "$lean_dir/.lake/build/ir/FormalMain.c.o.export" \
     "$lean_dir/.lake/build/ir/MetaCodesControl/FormalKernel.c.o.export" \
+    "$lean_dir/.lake/build/ir/MetaCodesControl/MemoryMigration.c.o.export" \
     "${link_args[@]}"
   data_const_flags=$(otool -l "$tmp_binary" | awk '
     $1 == "segname" && $2 == "__DATA_CONST" { in_segment = 1; next }
@@ -78,7 +83,7 @@ hex_a=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 hex_b=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 hex_c=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 hex_d=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
-request_prefix="{\"schema_version\":\"metacodes-formal-request-v1\",\"request_id\":\"$hex_a\",\"operation\":\"task_audit\",\"proposal_sha256\":\"$hex_b\",\"snapshot_sha256\":\"$hex_c\",\"snapshot_revision\":\"$hex_d\",\"expected_checker_version\":\"metacodes-formal-kernel-v1\",\"facts\":{"
+request_prefix="{\"schema_version\":\"metacodes-formal-request-v1\",\"request_id\":\"$hex_a\",\"operation\":\"task_audit\",\"proposal_sha256\":\"$hex_b\",\"snapshot_sha256\":\"$hex_c\",\"snapshot_revision\":\"$hex_d\",\"expected_checker_version\":\"metacodes-formal-kernel-v2\",\"facts\":{"
 admit_request="${request_prefix}\"schema_supported\":true,\"snapshot_bounded\":true,\"task_count\":1,\"open_count\":1,\"claimed_count\":0,\"completed_count\":0,\"failed_count\":0,\"claimed_with_owner_count\":0,\"reachable_task_count\":1,\"terminal_with_evidence_count\":0,\"invalid_reference_count\":0,\"truncated\":false,\"proposal_bound\":true,\"preserves_tasks\":true,\"preserves_evidence\":true,\"preserves_recovery\":true,\"preserves_schema\":true,\"contradiction_safe\":true,\"reversible\":true}}"
 block_request="${request_prefix}\"schema_supported\":true,\"snapshot_bounded\":true,\"task_count\":1,\"open_count\":0,\"claimed_count\":1,\"completed_count\":0,\"failed_count\":0,\"claimed_with_owner_count\":0,\"reachable_task_count\":1,\"terminal_with_evidence_count\":0,\"invalid_reference_count\":0,\"truncated\":false,\"proposal_bound\":true,\"preserves_tasks\":true,\"preserves_evidence\":true,\"preserves_recovery\":true,\"preserves_schema\":true,\"contradiction_safe\":true,\"reversible\":true}}"
 
@@ -90,6 +95,19 @@ fi
 block_verdict=$(printf '%s' "$block_request" | "$output")
 if [[ "$block_verdict" != *'"decision":"block"'* || "$block_verdict" != *'"claim_without_owner"'* ]]; then
   echo "build-formal-kernel: native block smoke failed" >&2
+  exit 1
+fi
+
+memory_prefix="{\"schema_version\":\"metacodes-memory-migration-request-v1\",\"request_id\":\"$hex_a\",\"operation\":\"memory_supersede_existing\",\"proposal_sha256\":\"$hex_b\",\"snapshot_sha256\":\"$hex_c\",\"snapshot_revision\":\"$hex_d\",\"expected_checker_version\":\"metacodes-formal-kernel-v2\",\"snapshot\":{\"bounded\":true,\"truncated\":false,\"source\":{\"id\":1,\"kind\":\"observation\",\"schema_type\":\"lesson\",\"current_generation\":true,\"retrieval_excluded\":false,\"contradicted\":false},\"replacement\":{\"id\":2,\"kind\":\"observation\",\"schema_type\":\"lesson\",\"current_generation\":true,\"retrieval_excluded\":false,\"contradicted\":false},\"evidence\":{\"id\":3,\"kind\":\"verification\",\"schema_type\":\"verification\",\"current_generation\":true,\"retrieval_excluded\":false,\"contradicted\":false},\"deprecated_edge_exists\":false},\"proposal\":{\"source_id\":1,\"replacement_id\":2,\"evidence_id\":3,\"effect\":\"add_deprecated_by_and_exclude_source\",\"rollback\":\"remove_deprecated_by_and_restore_source\",\"snapshot_revision\":\"$hex_d\"}}"
+memory_admit=$(printf '%s' "$memory_prefix" | "$output")
+if [[ "$memory_admit" != *'"decision":"admit"'* || "$memory_admit" != *'"reversible":true'* ]]; then
+  echo "build-formal-kernel: native memory migration admit smoke failed" >&2
+  exit 1
+fi
+memory_block=${memory_prefix/\"replacement_id\":2/\"replacement_id\":4}
+memory_block_verdict=$(printf '%s' "$memory_block" | "$output")
+if [[ "$memory_block_verdict" != *'"decision":"block"'* || "$memory_block_verdict" != *'"invalid_reference"'* ]]; then
+  echo "build-formal-kernel: native memory migration block smoke failed" >&2
   exit 1
 fi
 set +e
@@ -104,11 +122,13 @@ fi
 if command -v shasum >/dev/null 2>&1; then
   binary_sha256=$(shasum -a 256 "$output" | awk '{print $1}')
   kernel_source_sha256=$(shasum -a 256 "$lean_dir/MetaCodesControl/FormalKernel.lean" | awk '{print $1}')
+  memory_kernel_source_sha256=$(shasum -a 256 "$lean_dir/MetaCodesControl/MemoryMigration.lean" | awk '{print $1}')
   main_source_sha256=$(shasum -a 256 "$lean_dir/FormalMain.lean" | awk '{print $1}')
   axiom_audit_source_sha256=$(shasum -a 256 "$lean_dir/FormalAxiomAudit.lean" | awk '{print $1}')
 else
   binary_sha256=$(sha256sum "$output" | awk '{print $1}')
   kernel_source_sha256=$(sha256sum "$lean_dir/MetaCodesControl/FormalKernel.lean" | awk '{print $1}')
+  memory_kernel_source_sha256=$(sha256sum "$lean_dir/MetaCodesControl/MemoryMigration.lean" | awk '{print $1}')
   main_source_sha256=$(sha256sum "$lean_dir/FormalMain.lean" | awk '{print $1}')
   axiom_audit_source_sha256=$(sha256sum "$lean_dir/FormalAxiomAudit.lean" | awk '{print $1}')
 fi
@@ -122,7 +142,7 @@ host_arch=$(uname -m)
 built_at_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
 printf '%s\n' \
-  "{\"schema_version\":\"metacodes-formal-artifact-v1\",\"checker_version\":\"metacodes-formal-kernel-v1\",\"request_schema\":\"metacodes-formal-request-v1\",\"verdict_schema\":\"metacodes-formal-verdict-v1\",\"binary_sha256\":\"$binary_sha256\",\"binary_bytes\":$binary_bytes,\"kernel_source_sha256\":\"$kernel_source_sha256\",\"main_source_sha256\":\"$main_source_sha256\",\"axiom_audit_source_sha256\":\"$axiom_audit_source_sha256\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"host_os\":\"$host_os\",\"host_arch\":\"$host_arch\",\"linker\":\"$linker\",\"lean_version\":\"$lean_version\",\"native_smoke\":\"passed\",\"built_at_utc\":\"$built_at_utc\"}" \
+  "{\"schema_version\":\"metacodes-formal-artifact-v2\",\"checker_version\":\"metacodes-formal-kernel-v2\",\"request_schema\":\"metacodes-formal-request-v1\",\"memory_request_schema\":\"metacodes-memory-migration-request-v1\",\"verdict_schema\":\"metacodes-formal-verdict-v2\",\"binary_sha256\":\"$binary_sha256\",\"binary_bytes\":$binary_bytes,\"kernel_source_sha256\":\"$kernel_source_sha256\",\"memory_kernel_source_sha256\":\"$memory_kernel_source_sha256\",\"main_source_sha256\":\"$main_source_sha256\",\"axiom_audit_source_sha256\":\"$axiom_audit_source_sha256\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"host_os\":\"$host_os\",\"host_arch\":\"$host_arch\",\"linker\":\"$linker\",\"lean_version\":\"$lean_version\",\"native_smoke\":\"passed\",\"built_at_utc\":\"$built_at_utc\"}" \
   >"$manifest"
 
 echo "formal kernel: $output"

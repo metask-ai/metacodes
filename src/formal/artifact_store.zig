@@ -49,10 +49,35 @@ pub const PersistResult = struct {
     index_persisted: bool,
 };
 
+pub const VerifiedBundle = struct {
+    event_id: [64]u8,
+    manifest_sha256: [64]u8,
+    files_verified: usize,
+};
+
 const FileRecord = struct {
     name: []const u8,
     bytes: usize,
     sha256: [64]u8,
+};
+
+const ManifestFile = struct {
+    name: []const u8,
+    bytes: usize,
+    sha256: []const u8,
+};
+
+const Manifest = struct {
+    schema_version: []const u8,
+    event_id: []const u8,
+    completion_marker: bool,
+    write_policy: []const u8,
+    durability: []const u8,
+    integrity_model: []const u8,
+    storage_threat_model: []const u8,
+    pre_manifest_persistence_elapsed_ns: u64,
+    persistence_latency_boundary: []const u8,
+    files: []ManifestFile,
 };
 
 /// Unique event identity, not a content identity. Re-running an unchanged
@@ -162,6 +187,111 @@ pub fn persist(
         .receipt_sha256 = receipt_sha256,
         .index_persisted = index_persisted,
     };
+}
+
+/// Verify the authoritative manifest and every listed artifact. Discovery
+/// index lines are intentionally excluded: they are rebuildable hints, not
+/// evidence. Unknown/duplicate filenames, symlinks, size drift, and hash drift
+/// all fail closed.
+pub fn verifyBundle(allocator: std.mem.Allocator, event_dir: []const u8) !VerifiedBundle {
+    if (!std.fs.path.isAbsolute(event_dir)) return error.InvalidArtifactTarget;
+    try rejectSymlink(allocator, event_dir);
+    if (std.fs.path.dirname(event_dir)) |parent| try rejectSymlink(allocator, parent);
+    const basename = std.fs.path.basename(event_dir);
+    const event_id = parseLowerHex64(basename) orelse return error.InvalidEventId;
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/manifest.json", .{event_dir});
+    defer allocator.free(manifest_path);
+    const manifest_bytes = try readVerifiedFile(allocator, manifest_path, MAX_ARTIFACT_BYTES);
+    defer allocator.free(manifest_bytes);
+    var parsed = std.json.parseFromSlice(Manifest, allocator, manifest_bytes, .{
+        .ignore_unknown_fields = false,
+        .allocate = .alloc_always,
+        .duplicate_field_behavior = .@"error",
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidManifest,
+    };
+    defer parsed.deinit();
+    const manifest = parsed.value;
+    if (!std.mem.eql(u8, manifest.schema_version, BUNDLE_SCHEMA) or
+        !std.mem.eql(u8, manifest.event_id, basename) or
+        !manifest.completion_marker or
+        !std.mem.eql(u8, manifest.write_policy, "exclusive_create_manifest_last") or
+        !std.mem.eql(u8, manifest.durability, "file_fsync_attempted_directory_entry_sync_not_guaranteed") or
+        !std.mem.eql(u8, manifest.integrity_model, "hash_linked_not_signed") or
+        !std.mem.eql(u8, manifest.storage_threat_model, "same_user_storage_not_adversarial") or
+        !std.mem.eql(u8, manifest.persistence_latency_boundary, "directory_create_through_receipt_fsync_before_manifest") or
+        manifest.files.len == 0 or manifest.files.len > MAX_FILES)
+        return error.InvalidManifest;
+
+    var receipt_seen = false;
+    for (manifest.files, 0..) |entry, index| {
+        if (!validArtifactName(entry.name) or entry.bytes > MAX_ARTIFACT_BYTES)
+            return error.InvalidManifest;
+        for (manifest.files[0..index]) |prior| {
+            if (std.mem.eql(u8, prior.name, entry.name)) return error.InvalidManifest;
+        }
+        const expected_hash = parseLowerHex64(entry.sha256) orelse return error.InvalidManifest;
+        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ event_dir, entry.name });
+        defer allocator.free(path);
+        const payload = try readVerifiedFile(allocator, path, MAX_ARTIFACT_BYTES);
+        defer allocator.free(payload);
+        const actual_hash = sha256Hex(payload);
+        if (payload.len != entry.bytes or !std.mem.eql(u8, &actual_hash, &expected_hash))
+            return error.ArtifactHashMismatch;
+        if (std.mem.eql(u8, entry.name, "receipt.json")) receipt_seen = true;
+    }
+    if (!receipt_seen) return error.InvalidManifest;
+    return .{
+        .event_id = event_id,
+        .manifest_sha256 = sha256Hex(manifest_bytes),
+        .files_verified = manifest.files.len,
+    };
+}
+
+fn validArtifactName(name: []const u8) bool {
+    const names = [_][]const u8{
+        "snapshot-source.bin", "snapshot.json",      "proposal.json",      "request.json",
+        "verdict.json",        "checker-stdout.bin", "checker-stderr.bin", "checker-provenance.json",
+        "receipt.json",
+    };
+    for (names) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
+    return false;
+}
+
+fn readVerifiedFile(allocator: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.ArtifactOpenFailed;
+    defer _ = pfs.close(fd);
+    const before = pfs.fileInfo(fd) catch return error.ArtifactStatFailed;
+    if (!before.is_regular or before.size > max_bytes) return error.ArtifactTooLarge;
+    const size: usize = @intCast(before.size);
+    const bytes = try allocator.alloc(u8, size);
+    errdefer allocator.free(bytes);
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        const count = pfs.readZ(fd, bytes[offset..]) catch return error.ArtifactReadFailed;
+        if (count == 0) return error.ArtifactChangedDuringRead;
+        offset += count;
+    }
+    var probe: [1]u8 = undefined;
+    if ((pfs.readZ(fd, &probe) catch return error.ArtifactReadFailed) != 0)
+        return error.ArtifactChangedDuringRead;
+    const after = pfs.fileInfo(fd) catch return error.ArtifactChangedDuringRead;
+    if (!after.is_regular or after.size != before.size) return error.ArtifactChangedDuringRead;
+    return bytes;
+}
+
+fn parseLowerHex64(raw: []const u8) ?[64]u8 {
+    if (raw.len != 64) return null;
+    var result: [64]u8 = undefined;
+    for (raw, 0..) |byte, index| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return null;
+        result[index] = byte;
+    }
+    return result;
 }
 
 fn rejectSymlink(allocator: std.mem.Allocator, path: []const u8) !void {
@@ -370,6 +500,15 @@ test "formal artifact bundle never overwrites an existing event identity" {
         metadata,
     );
     try std.testing.expect(first.index_persisted);
+    const event_dir = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/{s}/{s}",
+        .{ root, ARTIFACT_DIR_NAME, event_id[0..] },
+    );
+    defer std.testing.allocator.free(event_dir);
+    const verified = try verifyBundle(std.testing.allocator, event_dir);
+    try std.testing.expectEqual(@as(usize, 2), verified.files_verified);
+    try std.testing.expectEqualStrings(first.manifest_sha256[0..], verified.manifest_sha256[0..]);
     try std.testing.expectError(
         error.EventDirectoryCreateFailed,
         persist(
@@ -391,6 +530,18 @@ test "formal artifact bundle never overwrites an existing event identity" {
     const stored = try readTestFile(std.testing.allocator, receipt_path);
     defer std.testing.allocator.free(stored);
     try std.testing.expectEqualStrings("{\"receipt\":1}", stored);
+
+    const snapshot_source_path = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}/snapshot-source.bin",
+        .{event_dir},
+    );
+    defer std.testing.allocator.free(snapshot_source_path);
+    try overwriteTestFile(std.testing.allocator, snapshot_source_path, "tampered");
+    try std.testing.expectError(
+        error.ArtifactHashMismatch,
+        verifyBundle(std.testing.allocator, event_dir),
+    );
 }
 
 test "formal artifact bundle remains authoritative when discovery index append fails" {
@@ -451,4 +602,13 @@ fn readTestFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
         try out.appendSlice(allocator, buffer[0..count]);
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn overwriteTestFile(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
+    const path_z = try allocator.dupeZ(u8, path);
+    defer allocator.free(path_z);
+    const fd = pfs.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .TRUNC = true, .NOFOLLOW = true }, 0);
+    if (fd < 0) return error.FileNotFound;
+    defer _ = pfs.close(fd);
+    try writeAll(fd, bytes);
 }

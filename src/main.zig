@@ -62,6 +62,7 @@ pub const formal_runtime = @import("formal/runtime.zig");
 pub const formal_artifact_store = @import("formal/artifact_store.zig");
 pub const formal_provenance = @import("formal/provenance.zig");
 pub const formal_task_audit = @import("formal/task_audit.zig");
+pub const formal_memory_migration = @import("formal/memory_migration.zig");
 pub const kg_tools = @import("tools/kg_tools.zig");
 pub const core_goal = @import("core/goal.zig");
 pub const core_auth = auth;

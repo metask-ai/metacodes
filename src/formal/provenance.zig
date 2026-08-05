@@ -9,17 +9,19 @@ const std = @import("std");
 const pfs = @import("platform").fs;
 const runtime = @import("runtime.zig");
 
-pub const MANIFEST_SCHEMA = "metacodes-formal-artifact-v1";
+pub const MANIFEST_SCHEMA = "metacodes-formal-artifact-v2";
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 
 const Raw = struct {
     schema_version: []const u8,
     checker_version: []const u8,
     request_schema: []const u8,
+    memory_request_schema: []const u8,
     verdict_schema: []const u8,
     binary_sha256: []const u8,
     binary_bytes: u64,
     kernel_source_sha256: []const u8,
+    memory_kernel_source_sha256: []const u8,
     main_source_sha256: []const u8,
     axiom_audit_source_sha256: []const u8,
     axiom_policy: []const u8,
@@ -39,6 +41,7 @@ pub const Loaded = struct {
     binary_sha256: [64]u8,
     binary_bytes: u64,
     kernel_source_sha256: [64]u8,
+    memory_kernel_source_sha256: [64]u8,
     main_source_sha256: [64]u8,
     axiom_audit_source_sha256: [64]u8,
     host_os: []const u8,
@@ -75,6 +78,7 @@ pub fn loadAdjacent(
     if (!std.mem.eql(u8, parsed.schema_version, MANIFEST_SCHEMA) or
         !std.mem.eql(u8, parsed.checker_version, runtime.CHECKER_VERSION) or
         !std.mem.eql(u8, parsed.request_schema, runtime.REQUEST_SCHEMA) or
+        !std.mem.eql(u8, parsed.memory_request_schema, runtime.MEMORY_REQUEST_SCHEMA) or
         !std.mem.eql(u8, parsed.verdict_schema, runtime.VERDICT_SCHEMA) or
         !std.mem.eql(u8, parsed.axiom_policy, "propext,Quot.sound") or
         !std.mem.eql(u8, parsed.axiom_audit, "passed") or
@@ -84,6 +88,8 @@ pub fn loadAdjacent(
     const binary_sha256 = parseLowerHex64(parsed.binary_sha256) orelse
         return error.InvalidProvenanceHash;
     const kernel_source_sha256 = parseLowerHex64(parsed.kernel_source_sha256) orelse
+        return error.InvalidProvenanceHash;
+    const memory_kernel_source_sha256 = parseLowerHex64(parsed.memory_kernel_source_sha256) orelse
         return error.InvalidProvenanceHash;
     const main_source_sha256 = parseLowerHex64(parsed.main_source_sha256) orelse
         return error.InvalidProvenanceHash;
@@ -104,6 +110,7 @@ pub fn loadAdjacent(
         .binary_sha256 = binary_sha256,
         .binary_bytes = parsed.binary_bytes,
         .kernel_source_sha256 = kernel_source_sha256,
+        .memory_kernel_source_sha256 = memory_kernel_source_sha256,
         .main_source_sha256 = main_source_sha256,
         .axiom_audit_source_sha256 = axiom_audit_source_sha256,
         .host_os = parsed.host_os,
