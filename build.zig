@@ -1087,6 +1087,29 @@ pub fn build(b: *std.Build) void {
         }
     }
 
+    // 专用的知识治理闭环反馈门：只编译 Kg 自动召回、真实 API prompt 和真 TinyKG
+    // KgContext 纵切，避免 rule-control 为三个测试冷编译整个 test:spike 图。
+    const kg_governance_step = b.step("test:kg-governance", "Run TinyKG evidence/freshness governance L2 tests");
+    {
+        const m = b.createModule(.{
+            .root_source_file = b.path("tests/component/kg_integration_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        m.addImport("harness", test_harness_mod);
+        m.addImport("cc", test_cc_mod);
+        addPlatform(b, m);
+        const t = b.addTest(.{
+            .name = "kg-governance-l2",
+            .root_module = m,
+            .filters = if (tfilter) |filter_text| &.{filter_text} else &.{"L2 KG governance:"},
+        });
+        const run_t = addTestRunArtifact(b, t, windows_test_prelude);
+        if (tinykg_install_step) |s| run_t.step.dependOn(s);
+        kg_governance_step.dependOn(&run_t.step);
+    }
+
     // 注:TTY 渲染测试(tests/tty/)用独立 python runner 跑,**不接 zig build**——
     // PTY(pty.fork)在 zig build-runner 的进程/stdio 监管下时序不稳(直接跑 12/12 全过,
     // 经 build SystemCommand 跑会大面积假失败)。跑法:

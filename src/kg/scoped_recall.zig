@@ -78,9 +78,9 @@ pub fn build(
         const type_str = if (h.schema_type.len > 0) h.schema_type else h.kind;
         // 带来源的 hit(记忆 markdown)标注文件名:模型更新该文件而非另存(PM P0-2)。
         const line = if (h.source_label.len > 0)
-            try std.fmt.allocPrint(allocator, "- [{s}:{s}] {s}\n", .{ type_str, h.source_label, firstLine(h.text) })
+            try std.fmt.allocPrint(allocator, "- [node_id={d} {s}:{s}] {s}\n", .{ h.node_id, type_str, h.source_label, firstLine(h.text) })
         else
-            try std.fmt.allocPrint(allocator, "- [{s}] {s}\n", .{ type_str, firstLine(h.text) });
+            try std.fmt.allocPrint(allocator, "- [node_id={d} {s}] {s}\n", .{ h.node_id, type_str, firstLine(h.text) });
         defer allocator.free(line);
         try out.appendSlice(allocator, line);
         injected += 1;

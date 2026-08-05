@@ -149,6 +149,123 @@ class DeclarationSensorTests(unittest.TestCase):
         self.assertTrue(any("duplicate exclusion" in error for error in observation.errors))
 
 
+class MemoryGovernanceSensorTests(unittest.TestCase):
+    def make_repo(self) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        for directory in ("src/kg", "src/core", "src/tools", "tests/component"):
+            (root / directory).mkdir(parents=True, exist_ok=True)
+        (root / "src/kg/scoped_recall.zig").write_text(
+            'const line = std.fmt.allocPrint(a, "- [node_id={d}]", .{h.node_id});\n'
+            'try out.appendSlice(a, retrieval_protocol.AUTO_RECALL_NOTE);\n'
+            'const next = "KgContext(node_id)";\n',
+            encoding="utf-8",
+        )
+        (root / "src/kg/client.zig").write_text(
+            "pub fn nodeMetadataJson() void {}\n",
+            encoding="utf-8",
+        )
+        (root / "src/kg/retrieval_protocol.zig").write_text(
+            'pub const SYSTEM_RULES = "Memory is a candidate, not a current fact; verified_by or evidences; '
+            'deprecated_by, resolved_by, and contradiction; current code, git, tests, or external state";\n',
+            encoding="utf-8",
+        )
+        (root / "src/core/system_prompt.zig").write_text(
+            "const section = kg_retrieval.SYSTEM_RULES;\n",
+            encoding="utf-8",
+        )
+        (root / "src/tools/kg_tools.zig").write_text(
+            'const metadata = kg.nodeMetadataJson(node_id, true);\n'
+            'const governance = buildKnowledgeGovernance(parsed.value, node_id);\n'
+            'try out.appendSlice(a, ",\\\"knowledge_governance\\\":");\n'
+            'const schema = "metacodes-knowledge-governance-v1";\n',
+            encoding="utf-8",
+        )
+        (root / "src/tools.zig").write_text(
+            "const context = retrieval_protocol.CONTEXT_DESCRIPTION;\n",
+            encoding="utf-8",
+        )
+        kg_test = (
+            'test "L2 KG governance: scoped recall exposes stable node ids and candidate-only guidance" {\n'
+            '  const expected_id = "node_id={d}";\n'
+            '  try std.testing.expect(injHas(expected_id));\n'
+            '  try std.testing.expect(injHas("KgContext(node_id)"));\n'
+            '}\n\n'
+            'test "L2 KG governance: freshness and contradiction contract enters the actual API request" {\n'
+            '  try std.testing.expect(requestHas("Memory is a candidate, not a current fact"));\n'
+            '  try std.testing.expect(requestHas("verified_by or evidences"));\n'
+            '  try std.testing.expect(requestHas("deprecated_by, resolved_by, and contradiction"));\n'
+            '  try std.testing.expect(requestHas("current code, git, tests, or external state"));\n'
+            '}\n\n'
+            'test "L2 KG governance: KgContext emits evidence, freshness, and supersession signals" {\n'
+            '  try std.testing.expect(resultHas("knowledge_governance"));\n'
+            '  try std.testing.expect(resultHas("current_generation"));\n'
+            '  try std.testing.expect(resultHas("deprecated_by"));\n'
+            '  try std.testing.expect(resultHas("verification_edge_count"));\n'
+            '}\n'
+        )
+        (root / "tests/component/kg_integration_test.zig").write_text(kg_test, encoding="utf-8")
+        (root / "build.zig").write_text(
+            'const kg_governance_step = b.step("test:kg-governance", "fixture");\n'
+            'const files = [_][]const u8{\n'
+            '  "tests/component/kg_integration_test.zig",\n'
+            '};\n'
+            'kg_governance_step.dependOn(&run.step);\n'
+            'const later_step = b.step("test:later", "boundary");\n',
+            encoding="utf-8",
+        )
+        return temporary, root
+
+    def test_runtime_prompt_result_and_l2_wiring_close_all_governance_obligations(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        observation = rule_control.observe_memory_evidence_governance(root)
+        self.assertTrue(observation.sensor_ok, observation.errors)
+        self.assertEqual("memory_evidence_governance", observation.sensor)
+        self.assertEqual(3, observation.declared)
+        self.assertEqual(3, observation.covered)
+        self.assertEqual(
+            [{"step": "test:kg-governance", "filter": "L2 KG governance:"}],
+            observation.feedback_bindings,
+        )
+
+    def test_manifest_cannot_replace_missing_automatic_recall_node_identity(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        source = root / "src/kg/scoped_recall.zig"
+        source.write_text(source.read_text(encoding="utf-8").replace("h.node_id", "0"), encoding="utf-8")
+        observation = rule_control.observe_memory_evidence_governance(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn("automatic_recall_node_identity", observation.missing_declarations)
+
+    def test_commented_governance_actuator_is_not_observed_as_runtime_wiring(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        source = root / "src/tools/kg_tools.zig"
+        source.write_text(
+            "// buildKnowledgeGovernance knowledge_governance metacodes-knowledge-governance-v1\n",
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_memory_evidence_governance(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn("context_structured_governance", observation.missing_declarations)
+
+    def test_unwired_governance_l2_cannot_count_as_feedback(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        build = root / "build.zig"
+        build.write_text(
+            'const kg_governance_step = b.step("test:kg-governance", "fixture");\n'
+            '// tests/component/kg_integration_test.zig is only an inert comment\n'
+            'const later_step = b.step("test:later", "boundary");\n',
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_memory_evidence_governance(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertEqual([], observation.covered_declarations)
+        self.assertTrue(any("not wired" in error for error in observation.errors))
+
+
 class TopologyTests(unittest.TestCase):
     def actuator_config(self) -> dict:
         return {
@@ -231,6 +348,19 @@ class TopologyTests(unittest.TestCase):
         )
         self.assertFalse(topology["actuator"])
         self.assertTrue(any("formalization orphan" in error for error in errors))
+
+    def test_memory_governance_adapter_is_a_supported_sensor_link(self) -> None:
+        rule = self.complete_rule()
+        rule["sensor"] = {
+            "adapter": "memory_evidence_governance",
+            "schema_version": 1,
+        }
+        topology, errors = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertTrue(topology["sensor"], errors)
 
     def test_release_gate_is_observed_from_build_ci_and_telemetry_wiring(self) -> None:
         temporary, workspace, repo, actuator = self.make_actuator_workspace()

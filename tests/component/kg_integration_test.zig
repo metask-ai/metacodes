@@ -131,7 +131,7 @@ test "L2 KG: listRecentMemories 按 id 降序枚举最近(替虚词 hack)" {
     try std.testing.expect(std.mem.indexOf(u8, hits[0].text, "gamma") != null);
 }
 
-test "L2 KG: scoped 自动召回 — 相关请求注入、无关请求不注入(相关性门,L0 双侧)" {
+test "L2 KG governance: scoped recall exposes stable node ids and candidate-only guidance" {
     const a = std.testing.allocator;
     const bin = findBin(a) orelse return error.SkipZigTest;
     defer a.free(bin);
@@ -148,7 +148,7 @@ test "L2 KG: scoped 自动召回 — 相关请求注入、无关请求不注入(
     kg.ensureReady();
     if (!kg.ready) return error.SkipZigTest;
 
-    _ = try kg.remember(.observation, "src/kg/client.zig 用子进程驱动 tinykg 集成,进程隔离崩溃", "module", false);
+    const memory_id = try kg.remember(.observation, "src/kg/client.zig 用子进程驱动 tinykg 集成,进程隔离崩溃", "module", false);
 
     var ab = cc.abort.AbortSignal.init();
 
@@ -160,7 +160,12 @@ test "L2 KG: scoped 自动召回 — 相关请求注入、无关请求不注入(
         const inj = try cc.kg_scoped_recall.build(a, &kg, &conv, &ab);
         defer if (inj) |s| a.free(s);
         try std.testing.expect(inj != null);
+        const expected_id = try std.fmt.allocPrint(a, "node_id={d}", .{memory_id});
+        defer a.free(expected_id);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, expected_id) != null);
         try std.testing.expect(std.mem.indexOf(u8, inj.?, "子进程") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "candidate, not a current fact") != null);
+        try std.testing.expect(std.mem.indexOf(u8, inj.?, "KgContext(node_id)") != null);
         try std.testing.expect(std.mem.indexOf(u8, inj.?, "one untyped raw-message lexical BM25 probe") != null);
         try std.testing.expect(std.mem.indexOf(u8, inj.?, "exact canonical alias/symbol") != null);
         try std.testing.expect(std.mem.indexOf(u8, inj.?, "exact/high-precision") != null);
@@ -410,7 +415,7 @@ test "L2 KG: 注入段经 inject_user_context 进请求体(字节断言,DoD)" {
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "KgRecall") != null);
 }
 
-test "L2 KG: lexical bridge and persistent task protocol enter the actual API request" {
+test "L2 KG governance: freshness and contradiction contract enters the actual API request" {
     const a = std.testing.allocator;
 
     var srv = try harness.MockServer.start(KG_END_TURN_SSE, 0);
@@ -461,7 +466,11 @@ test "L2 KG: lexical bridge and persistent task protocol enter the actual API re
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "mechanism, symptom, desired outcome, or nearby implementation term") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Deduplicate candidates by node_id across every call") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "KgContext") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Stop as soon as authoritative evidence is sufficient") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Stop as soon as authoritative evidence and any required current-state check are sufficient") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Memory is a candidate, not a current fact") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "verified_by or evidences") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "deprecated_by, resolved_by, and contradiction") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "current code, git, tests, or external state") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "FIRST inspect automatic recall") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Omit on the exact/high-precision seed") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Persistent task control-plane algorithm") != null);
@@ -507,14 +516,14 @@ test "L2 KG: KgRecall result carries staged variants, dedup, and graph verificat
     defer parsed.deinit();
     try std.testing.expect(parsed.value == .object);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"retrieval_mode\":\"lexical_bm25_no_embeddings\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Semantically judge these lexical hits") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Semantically judge these lexical candidates") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "deduplicate node_id values across calls") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "2-4 separate compact variants") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "KgContext") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "authoritative node text and connected evidence") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "authoritative text and knowledge_governance signals") != null);
 }
 
-test "L2 KG: KgContext pages authoritative text and returns a bounded versioned neighborhood" {
+test "L2 KG governance: KgContext emits evidence, freshness, and supersession signals" {
     const a = std.testing.allocator;
     const bin = findBin(a) orelse return error.SkipZigTest;
     defer a.free(bin);
@@ -531,9 +540,12 @@ test "L2 KG: KgContext pages authoritative text and returns a bounded versioned 
     kg.ensureReady();
     if (!kg.ready) return error.SkipZigTest;
 
+    const old_id = try kg.remember(.decision, "authoritative-policy=quartz-16; superseded generation", "decision", false);
     const root_id = try kg.remember(.decision, "authoritative-policy=quartz-17; verify connected evidence", "decision", false);
     const evidence_id = try kg.remember(.observation, "evidence: approved after concurrency replay", "observation", false);
     try kg.addEdge(root_id, "derived_from", evidence_id);
+    try kg.addEdge(root_id, "verified_by", evidence_id);
+    try kg.addEdge(old_id, "deprecated_by", root_id);
 
     const ctx = @import("cc").tool_context.ToolContext{ .allocator = a, .kg = &kg };
     const args = try std.fmt.allocPrint(a, "{{\"node_id\":{d},\"limit\":5,\"text_offset\":0,\"text_limit\":16}}", .{root_id});
@@ -554,6 +566,26 @@ test "L2 KG: KgContext pages authoritative text and returns a bounded versioned 
     try std.testing.expectEqualStrings("neighbors", graph.get("mode").?.string);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"rel\":\"derived_from\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Inspect connected evidence nodes with KgContext") != null);
+    const governance = obj.get("knowledge_governance").?.object;
+    try std.testing.expectEqualStrings("metacodes-knowledge-governance-v1", governance.get("schema_version").?.string);
+    try std.testing.expect(governance.get("current_generation").?.bool);
+    try std.testing.expect(governance.get("deprecated_by").? == .null);
+    try std.testing.expectEqual(@as(i64, 1), governance.get("verification_edge_count").?.integer);
+    try std.testing.expectEqualStrings("evidence_connected_candidate", governance.get("trust_state").?.string);
+    try std.testing.expectEqualStrings("unknown_requires_current_state_check", governance.get("freshness_state").?.string);
+    try std.testing.expectEqualStrings("candidate_only", governance.get("usage").?.string);
+
+    const old_args = try std.fmt.allocPrint(a, "{{\"node_id\":{d},\"limit\":20}}", .{old_id});
+    defer a.free(old_args);
+    const old_out = try @import("cc").kg_tools.executeContext(&ctx, old_args);
+    defer a.free(old_out);
+    var old_parsed = try std.json.parseFromSlice(std.json.Value, a, old_out, .{});
+    defer old_parsed.deinit();
+    const old_governance = old_parsed.value.object.get("knowledge_governance").?.object;
+    try std.testing.expect(!old_governance.get("current_generation").?.bool);
+    try std.testing.expectEqual(@as(i64, @intCast(root_id)), old_governance.get("deprecated_by").?.integer);
+    try std.testing.expectEqualStrings("superseded", old_governance.get("trust_state").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, old_out, "do not use memory as a current fact") != null);
 
     var detail: ?[]const u8 = null;
     defer if (detail) |d| a.free(d);

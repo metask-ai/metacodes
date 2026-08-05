@@ -1483,6 +1483,20 @@ pub const KgClient = struct {
         return record.text;
     }
 
+    /// 取节点版本化 metadata JSON。KgContext 用它读取 current_generation/deprecated_by，
+    /// 因为 TinyKG 会有意把历史节点从 neighbors 子图中省略为 history continuation。
+    /// include_text=true 时同一次 subprocess 带权威正文，避免 metadata + get 双调用。
+    pub fn nodeMetadataJson(self: *KgClient, node_id: u64, include_text: bool) KgError![]u8 {
+        var idbuf: [24]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&idbuf, "{d}", .{node_id}) catch unreachable;
+        const out = if (include_text)
+            try self.runChecked(&.{ "get", self.store_path, id_str, "--format", "json", "--meta", "--include-text" })
+        else
+            try self.runChecked(&.{ "get", self.store_path, id_str, "--format", "json", "--meta" });
+        defer self.freeOut(out);
+        return self.allocator.dupe(u8, std.mem.trim(u8, out.stdout, " \t\r\n")) catch KgError.OutOfMemory;
+    }
+
     /// task-frontier(注入段/看板用)。返回 owned rows。
     pub fn frontier(self: *KgClient, root_id: u64, limit: usize) KgError![]FrontierRow {
         var idbuf: [24]u8 = undefined;

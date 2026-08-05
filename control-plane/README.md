@@ -23,7 +23,7 @@ A rule is enforced only when all six links are valid:
 
 Missing any link makes `Topology.complete = false`. The same Lean function used by the gate then returns `block_release`; Python does not reimplement the policy.
 
-## Current vertical slice
+## Current vertical slices
 
 `declaration.agentdef-task-required.l2` governs the runtime fields from `AgentDef` plus the required fields of the `Task` tool. The sensor derives declarations from Zig source and validates exact evidence bindings in `declaration-l2-evidence.json`:
 
@@ -41,6 +41,28 @@ The actuator is also sensed, not trusted from `rules.json`. The controller must 
 This repository-local sensor proves wiring through the CI check. Whether a hosting service's branch-protection policy marks that check as required is external state and must be audited separately; this control plane does not claim to formalize an unobserved server setting.
 
 The first slice intentionally does not claim that all repository rules are formalized. Existing exclusions are visible debt, not silent coverage. New rule families should be added incrementally after this loop is stable.
+
+`memory.evidence-freshness-governance.l2` is the second slice. Its dedicated
+`memory_evidence_governance` adapter does not accept an evidence registry that
+can certify itself. It observes fixed production paths and requires three
+executable obligations:
+
+- automatic recall renders each hit's real `node_id`, so `KgContext(node_id)`
+  is callable without a second lexical guess;
+- the system prompt and actual tool schema carry the candidate-only,
+  provenance, evidence, supersession, contradiction, and current-state-check
+  contract into a captured API request;
+- `KgContext` derives a versioned `knowledge_governance` object from TinyKG
+  node metadata plus the bounded graph, including historical-node omission,
+  `deprecated_by`, evidence counts, truncation, and unknown freshness.
+
+The feedback actuator runs `test:kg-governance` against a real TinyKG process.
+Sensor unit tests remove the runtime ID, leave governance words only in a
+comment, and disconnect the focused build step; each mutation is observed as a
+deviation. Lean sees the same obligation counts, returns `run_feedback` only at
+3/3, and admits release only after the focused feedback passes and the exact
+source fingerprint is re-observed unchanged. Thus the prose describes the
+loop, but cannot substitute for it.
 
 ## Commands
 

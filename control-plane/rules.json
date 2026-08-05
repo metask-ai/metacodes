@@ -79,6 +79,74 @@
         "fixture": "control-plane/counterexamples.json",
         "required": true
       }
+    },
+    {
+      "id": "memory.evidence-freshness-governance.l2",
+      "title": "TinyKG candidates expose identity, evidence, supersession, and current-state checks",
+      "target": {
+        "metric": "governance_obligations_minus_observed",
+        "setpoint": 0,
+        "goal": "Every automatic or explicit memory path remains candidate-only until executable evidence, supersession, contradiction, and freshness checks are visible."
+      },
+      "sensor": {
+        "adapter": "memory_evidence_governance",
+        "schema_version": 1
+      },
+      "decision": {
+        "engine": "lean",
+        "kernel": "MetaCodesControl.ClosedLoop.signal",
+        "theorems": [
+          "admitted_implies_closed_loop",
+          "admitted_implies_zero_deviation",
+          "admitted_implies_feedback_passed",
+          "missing_evidence_blocks",
+          "orphan_cannot_be_compliant",
+          "failed_feedback_blocks",
+          "sensor_failure_blocks",
+          "unobserved_actuator_blocks"
+        ]
+      },
+      "actuator": {
+        "kind": "release_gate",
+        "on_violation": "block",
+        "remediation": "Restore runtime node identity and structured governance signals plus their exact L2 assertions; prompt prose or manifest claims alone are insufficient.",
+        "observation": {
+          "schema_version": 1,
+          "build_file": "control-plane/build.zig",
+          "build_step": "rule-check",
+          "workflow_file": ".github/workflows/cross-platform.yml",
+          "workflow_job": "rule-control",
+          "workflow_workdir": "metacodes",
+          "telemetry_path": "metacodes/zig-out/reports/rule-control.json"
+        }
+      },
+      "feedback": {
+        "kind": "zig_l2_then_reobserve",
+        "reobserve": true,
+        "timeout_seconds": 300,
+        "commands": [
+          [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.tests.test_rule_control.MemoryGovernanceSensorTests",
+            "-v"
+          ],
+          [
+            "zig",
+            "build",
+            "test:kg-governance",
+            "-Dtfilter=L2 KG governance:",
+            "-j2",
+            "--summary",
+            "all"
+          ]
+        ]
+      },
+      "counterexample": {
+        "fixture": "control-plane/counterexamples.json",
+        "required": true
+      }
     }
   ]
 }

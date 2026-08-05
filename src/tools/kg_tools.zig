@@ -196,7 +196,7 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try out.appendSlice(ctx.allocator, count);
     try out.appendSlice(ctx.allocator, ",\"types_in_results\":{");
     try out.appendSlice(ctx.allocator, facet.items);
-    try out.appendSlice(ctx.allocator, "},\"retrieval_mode\":\"lexical_bm25_no_embeddings\",\"lexical_guidance\":");
+    try out.appendSlice(ctx.allocator, "},\"retrieval_mode\":\"lexical_bm25_no_embeddings\",\"knowledge_status\":\"unverified_candidates\",\"lexical_guidance\":");
     try appendJsonString(&out, ctx.allocator, retrieval_protocol.RESULT_GUIDANCE);
     const tail = "}";
     try out.appendSlice(ctx.allocator, tail);
@@ -257,8 +257,21 @@ pub fn executeContext(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     }
     const text_limit = std.math.cast(usize, text_limit_u64) orelse return error.InvalidLimit;
 
-    const text = kg.fetchNodeText(node_id) catch |e| return kgErrorResult(ctx, kg, e, "KgContext");
-    defer kg.allocator.free(text);
+    const metadata_raw = kg.nodeMetadataJson(node_id, true) catch |e| return kgErrorResult(ctx, kg, e, "KgContext");
+    defer kg.allocator.free(metadata_raw);
+    var parsed_metadata = std.json.parseFromSlice(std.json.Value, ctx.allocator, metadata_raw, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext 收到无效 node metadata JSON", .{});
+            return error.InvalidGraphProtocol;
+        },
+    };
+    defer parsed_metadata.deinit();
+    const metadata = parseNodeContextMetadata(parsed_metadata.value, node_id) orelse {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext 不支持当前 node metadata 协议", .{});
+        return error.InvalidGraphProtocol;
+    };
+    const text = metadata.text;
     const graph_raw = kg.neighborsJson(node_id, limit) catch |e| return kgErrorResult(ctx, kg, e, "KgContext");
     defer kg.allocator.free(graph_raw);
     const graph = std.mem.trim(u8, graph_raw, " \t\r\n");
@@ -277,8 +290,12 @@ pub fn executeContext(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         },
     };
     defer parsed.deinit();
-    const graph_node_count = validateNeighborGraph(parsed.value, node_id, limit) orelse {
+    const graph_node_count = validateNeighborGraph(parsed.value, node_id, limit, metadata.generation) orelse {
         common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext 不支持当前 neighbors 协议版本", .{});
+        return error.InvalidGraphProtocol;
+    };
+    const governance = buildKnowledgeGovernance(parsed.value, node_id, metadata.generation) orelse {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgContext 图协议缺少知识治理状态", .{});
         return error.InvalidGraphProtocol;
     };
 
@@ -297,10 +314,138 @@ pub fn executeContext(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer ctx.allocator.free(meta);
     try out.appendSlice(ctx.allocator, meta);
     try out.appendSlice(ctx.allocator, graph);
+    try appendKnowledgeGovernance(&out, ctx.allocator, governance);
     try out.appendSlice(ctx.allocator, ",\"verification_guidance\":");
     try appendJsonString(&out, ctx.allocator, retrieval_protocol.CONTEXT_RESULT_GUIDANCE);
     try out.appendSlice(ctx.allocator, "}");
     return out.toOwnedSlice(ctx.allocator);
+}
+
+const KnowledgeGovernance = struct {
+    current_generation: bool,
+    deprecated_by: ?u64,
+    verification_edge_count: usize,
+    evidence_edge_count: usize,
+    provenance_edge_count: usize,
+    resolution_edge_count: usize,
+    contradiction_edge_count: usize,
+    graph_truncated: bool,
+
+    fn trustState(self: KnowledgeGovernance) []const u8 {
+        if (!self.current_generation or self.deprecated_by != null) return "superseded";
+        if (self.contradiction_edge_count > 0) return "contradicted";
+        if (self.graph_truncated) return "incomplete_graph";
+        if (self.verification_edge_count + self.evidence_edge_count > 0) return "evidence_connected_candidate";
+        return "unverified_candidate";
+    }
+};
+
+const NodeGeneration = struct {
+    current_generation: bool,
+    deprecated_by: ?u64,
+};
+
+const NodeContextMetadata = struct {
+    text: []const u8,
+    generation: NodeGeneration,
+};
+
+fn parseNodeContextMetadata(value: std.json.Value, requested_node_id: u64) ?NodeContextMetadata {
+    if (value != .object or
+        !jsonStringEquals(value.object.get("schema_version"), "tinykg-agent-retrieval-v1")) return null;
+    const found = value.object.get("found") orelse return null;
+    if (found != .bool or !found.bool) return null;
+    const node = value.object.get("node") orelse return null;
+    if (node != .object) return null;
+    const node_id = node.object.get("id") orelse return null;
+    if (node_id != .integer or node_id.integer < 1 or @as(u64, @intCast(node_id.integer)) != requested_node_id) return null;
+    const text = node.object.get("text") orelse return null;
+    if (text != .string) return null;
+    const status = node.object.get("status") orelse return null;
+    if (status != .object) return null;
+    const current = status.object.get("current_generation") orelse return null;
+    if (current != .bool) return null;
+    const deprecated_value = status.object.get("deprecated_by") orelse return null;
+    const deprecated_by: ?u64 = switch (deprecated_value) {
+        .null => null,
+        .integer => |raw| if (raw > 0) @intCast(raw) else return null,
+        else => return null,
+    };
+    if (current.bool == (deprecated_by != null)) return null;
+    return .{
+        .text = text.string,
+        .generation = .{ .current_generation = current.bool, .deprecated_by = deprecated_by },
+    };
+}
+
+fn buildKnowledgeGovernance(value: std.json.Value, requested_node_id: u64, generation: NodeGeneration) ?KnowledgeGovernance {
+    if (value != .object) return null;
+    const summary = value.object.get("summary") orelse return null;
+    if (summary != .object) return null;
+    const truncated = summary.object.get("truncated") orelse return null;
+    if (truncated != .bool) return null;
+
+    var result = KnowledgeGovernance{
+        .current_generation = generation.current_generation,
+        .deprecated_by = generation.deprecated_by,
+        .verification_edge_count = 0,
+        .evidence_edge_count = 0,
+        .provenance_edge_count = 0,
+        .resolution_edge_count = 0,
+        .contradiction_edge_count = 0,
+        .graph_truncated = truncated.bool,
+    };
+    countGovernanceEdges(value.object.get("edges") orelse return null, requested_node_id, &result) orelse return null;
+    countGovernanceEdges(value.object.get("backrefs") orelse return null, requested_node_id, &result) orelse return null;
+    return result;
+}
+
+fn countGovernanceEdges(value: std.json.Value, requested_node_id: u64, result: *KnowledgeGovernance) ?void {
+    if (value != .array) return null;
+    for (value.array.items) |edge| {
+        if (edge != .object) return null;
+        const src_value = edge.object.get("src") orelse return null;
+        const dst_value = edge.object.get("dst") orelse return null;
+        if (src_value != .integer or src_value.integer < 1 or dst_value != .integer or dst_value.integer < 1) return null;
+        const src: u64 = @intCast(src_value.integer);
+        const dst: u64 = @intCast(dst_value.integer);
+        if (src != requested_node_id and dst != requested_node_id) continue;
+        const rel_value = edge.object.get("rel") orelse return null;
+        if (rel_value != .string) return null;
+        const rel = rel_value.string;
+        if (std.mem.eql(u8, rel, "verified_by")) result.verification_edge_count += 1;
+        if (std.mem.eql(u8, rel, "evidences")) result.evidence_edge_count += 1;
+        if (std.mem.eql(u8, rel, "derived_from") or std.mem.eql(u8, rel, "based_on")) result.provenance_edge_count += 1;
+        if (std.mem.eql(u8, rel, "resolved_by")) result.resolution_edge_count += 1;
+        if (std.mem.eql(u8, rel, "contradicts") or std.mem.eql(u8, rel, "conflicts_with")) result.contradiction_edge_count += 1;
+    }
+    return {};
+}
+
+fn appendKnowledgeGovernance(out: *std.ArrayList(u8), allocator: std.mem.Allocator, governance: KnowledgeGovernance) !void {
+    try out.appendSlice(allocator, ",\"knowledge_governance\":{\"schema_version\":\"metacodes-knowledge-governance-v1\",\"trust_state\":");
+    try appendJsonString(out, allocator, governance.trustState());
+    const head = try std.fmt.allocPrint(
+        allocator,
+        ",\"current_generation\":{s},\"deprecated_by\":",
+        .{if (governance.current_generation) "true" else "false"},
+    );
+    defer allocator.free(head);
+    try out.appendSlice(allocator, head);
+    if (governance.deprecated_by) |node_id| {
+        const rendered = try std.fmt.allocPrint(allocator, "{d}", .{node_id});
+        defer allocator.free(rendered);
+        try out.appendSlice(allocator, rendered);
+    } else {
+        try out.appendSlice(allocator, "null");
+    }
+    const counts = try std.fmt.allocPrint(
+        allocator,
+        ",\"verification_edge_count\":{d},\"evidence_edge_count\":{d},\"provenance_edge_count\":{d},\"resolution_edge_count\":{d},\"contradiction_edge_count\":{d},\"graph_truncated\":{s},\"freshness_state\":\"unknown_requires_current_state_check\",\"usage\":\"candidate_only\",\"required_action\":\"inspect evidence, supersession and conflict signals; do not use memory as a current fact until any required current-state check passes\"}}",
+        .{ governance.verification_edge_count, governance.evidence_edge_count, governance.provenance_edge_count, governance.resolution_edge_count, governance.contradiction_edge_count, if (governance.graph_truncated) "true" else "false" },
+    );
+    defer allocator.free(counts);
+    try out.appendSlice(allocator, counts);
 }
 
 fn readU64Arg(ctx: *const ToolContext, obj: std.json.ObjectMap, name: []const u8) anyerror!?u64 {
@@ -331,7 +476,7 @@ fn jsonStringEquals(value: ?std.json.Value, expected: []const u8) bool {
     return v == .string and std.mem.eql(u8, v.string, expected);
 }
 
-fn validateNeighborGraph(value: std.json.Value, requested_node_id: u64, limit: usize) ?u64 {
+fn validateNeighborGraph(value: std.json.Value, requested_node_id: u64, limit: usize, generation: NodeGeneration) ?u64 {
     if (value != .object or
         !jsonStringEquals(value.object.get("schema_version"), "tinykg-agent-retrieval-v1") or
         !jsonStringEquals(value.object.get("mode"), "neighbors")) return null;
@@ -342,11 +487,25 @@ fn validateNeighborGraph(value: std.json.Value, requested_node_id: u64, limit: u
     const summary = value.object.get("summary") orelse return null;
     if (summary != .object) return null;
     const count = summary.object.get("node_count") orelse return null;
-    if (count != .integer or count.integer < 1) return null;
+    if (count != .integer or count.integer < 0) return null;
     const node_count: u64 = @intCast(count.integer);
     // TinyKG `--limit N` bounds neighbor edges; the JSON node set may contain
     // the root plus N adjacent nodes.
     if (node_count > limit + 1) return null;
+    const root = value.object.get("root") orelse return null;
+    if (generation.current_generation) {
+        if (node_count < 1 or root != .object) return null;
+        const graph_root_id = root.object.get("id") orelse return null;
+        if (graph_root_id != .integer or graph_root_id.integer < 1 or @as(u64, @intCast(graph_root_id.integer)) != requested_node_id) return null;
+    } else {
+        // Historical generations are intentionally omitted from TinyKG's
+        // neighbor graph. Metadata remains authoritative for deprecated_by;
+        // the empty history continuation is the only accepted sentinel.
+        if (node_count != 0 or root != .null) return null;
+        const truncated = summary.object.get("truncated") orelse return null;
+        if (truncated != .bool or !truncated.bool or
+            !jsonStringEquals(summary.object.get("truncate_reason"), "history")) return null;
+    }
     return node_count;
 }
 
@@ -418,11 +577,34 @@ test "textPage preserves UTF-8 boundaries and supports deterministic paging" {
 
 test "validateNeighborGraph binds version, root, and requested limit" {
     const raw =
-        \\{"schema_version":"tinykg-agent-retrieval-v1","mode":"neighbors","query":{"root_id":42},"summary":{"node_count":6}}
+        \\{"schema_version":"tinykg-agent-retrieval-v1","mode":"neighbors","query":{"root_id":42},"summary":{"node_count":6},"root":{"id":42}}
     ;
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, raw, .{});
     defer parsed.deinit();
-    try testing.expectEqual(@as(?u64, 6), validateNeighborGraph(parsed.value, 42, 5));
-    try testing.expect(validateNeighborGraph(parsed.value, 41, 5) == null);
-    try testing.expect(validateNeighborGraph(parsed.value, 42, 4) == null);
+    const current = NodeGeneration{ .current_generation = true, .deprecated_by = null };
+    try testing.expectEqual(@as(?u64, 6), validateNeighborGraph(parsed.value, 42, 5, current));
+    try testing.expect(validateNeighborGraph(parsed.value, 41, 5, current) == null);
+    try testing.expect(validateNeighborGraph(parsed.value, 42, 4, current) == null);
+}
+
+test "node metadata and historical neighbor sentinel fail closed around supersession" {
+    const metadata_raw =
+        \\{"schema_version":"tinykg-agent-retrieval-v1","found":true,"node":{"id":7,"status":{"current_generation":false,"deprecated_by":9},"text":"old fact"}}
+    ;
+    var metadata = try std.json.parseFromSlice(std.json.Value, testing.allocator, metadata_raw, .{});
+    defer metadata.deinit();
+    const parsed_metadata = parseNodeContextMetadata(metadata.value, 7) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("old fact", parsed_metadata.text);
+    try testing.expect(!parsed_metadata.generation.current_generation);
+    try testing.expectEqual(@as(?u64, 9), parsed_metadata.generation.deprecated_by);
+    try testing.expect(parseNodeContextMetadata(metadata.value, 8) == null);
+
+    const history_raw =
+        \\{"schema_version":"tinykg-agent-retrieval-v1","mode":"neighbors","query":{"root_id":7},"summary":{"node_count":0,"truncated":true,"truncate_reason":"history"},"root":null}
+    ;
+    var history = try std.json.parseFromSlice(std.json.Value, testing.allocator, history_raw, .{});
+    defer history.deinit();
+    try testing.expectEqual(@as(?u64, 0), validateNeighborGraph(history.value, 7, 12, parsed_metadata.generation));
+    const current = NodeGeneration{ .current_generation = true, .deprecated_by = null };
+    try testing.expect(validateNeighborGraph(history.value, 7, 12, current) == null);
 }

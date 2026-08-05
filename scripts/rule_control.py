@@ -22,6 +22,7 @@ SCHEMA_VERSION = 1
 DEFAULT_MANIFEST = Path("control-plane/rules.json")
 DEFAULT_REPORT = Path("zig-out/reports/rule-control.json")
 LOOP_LINKS = ("target", "sensor", "decision", "actuator", "feedback", "counterexample")
+SUPPORTED_SENSOR_ADAPTERS = frozenset(("declaration_l2", "memory_evidence_governance"))
 RULE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,127}$")
 FIELD_RE = re.compile(r"^    ([a-z][a-z0-9_]*):", re.MULTILINE)
 STRING_RE = re.compile(r'"([a-zA-Z_][a-zA-Z0-9_]*)"')
@@ -547,6 +548,175 @@ def observe_declaration_l2(repo: Path, registry_path: Path) -> Observation:
     )
 
 
+def observe_memory_evidence_governance(repo: Path) -> Observation:
+    """Observe executable memory-governance wiring, not manifest claims.
+
+    The dynamic Zig feedback still proves behavior. This pre/post sensor proves
+    that the production paths, exact L2 assertions, and focused build actuator
+    remain connected while feedback executes.
+    """
+    source_relatives = {
+        "scoped": "src/kg/scoped_recall.zig",
+        "client": "src/kg/client.zig",
+        "protocol": "src/kg/retrieval_protocol.zig",
+        "system": "src/core/system_prompt.zig",
+        "context": "src/tools/kg_tools.zig",
+        "tools": "src/tools.zig",
+        "test": "tests/component/kg_integration_test.zig",
+        "build": "build.zig",
+    }
+    paths: dict[str, Path] = {}
+    touched: list[Path] = []
+    errors: list[str] = []
+    for name, relative in source_relatives.items():
+        try:
+            path = safe_repo_path(repo, relative)
+            paths[name] = path
+            touched.append(path)
+        except ControlError as exc:
+            errors.append(str(exc))
+    if errors:
+        return Observation(
+            sensor="memory_evidence_governance",
+            errors=errors,
+            fingerprint_sha256=fingerprint(touched),
+        )
+    try:
+        sources = {
+            name: _strip_zig_comments(read_text(path))
+            for name, path in paths.items()
+            if name != "test"
+        }
+        test_source = read_text(paths["test"])
+    except ControlError as exc:
+        return Observation(
+            sensor="memory_evidence_governance",
+            errors=[str(exc)],
+            fingerprint_sha256=fingerprint(touched),
+        )
+
+    step = build_step_slice(sources["build"], "test:kg-governance")
+    test_wired = step is not None and '"tests/component/kg_integration_test.zig"' in step
+    if not test_wired:
+        errors.append(
+            "knowledge-governance L2 is not wired into build step test:kg-governance"
+        )
+
+    obligations: dict[str, tuple[bool, list[str]]] = {}
+
+    automatic_test_name = (
+        "L2 KG governance: scoped recall exposes stable node ids and candidate-only guidance"
+    )
+    automatic_body = test_slice(test_source, automatic_test_name)
+    automatic_test = _strip_zig_comments(automatic_body) if automatic_body is not None else ""
+    automatic_checks = {
+        "runtime formats node_id": "node_id={d}" in sources["scoped"],
+        "runtime reads hit node id": "h.node_id" in sources["scoped"],
+        "runtime appends governance note": "retrieval_protocol.AUTO_RECALL_NOTE" in sources["scoped"],
+        "L2 test exists": automatic_body is not None,
+        "L2 asserts exact id": "expected_id" in automatic_test and "node_id={d}" in automatic_test,
+        "L2 asserts context handoff": "KgContext(node_id)" in automatic_test,
+        "L2 contains an expectation": "std.testing.expect" in automatic_test,
+        "L2 build wiring exists": test_wired,
+    }
+    obligations["automatic_recall_node_identity"] = (
+        all(automatic_checks.values()),
+        [name for name, present in automatic_checks.items() if not present],
+    )
+
+    request_test_name = (
+        "L2 KG governance: freshness and contradiction contract enters the actual API request"
+    )
+    request_body = test_slice(test_source, request_test_name)
+    request_test = _strip_zig_comments(request_body) if request_body is not None else ""
+    protocol_markers = (
+        "Memory is a candidate, not a current fact",
+        "verified_by or evidences",
+        "deprecated_by, resolved_by, and contradiction",
+        "current code, git, tests, or external state",
+    )
+    prompt_checks = {
+        "protocol carries governance contract": all(marker in sources["protocol"] for marker in protocol_markers),
+        "system prompt consumes protocol": "kg_retrieval.SYSTEM_RULES" in sources["system"],
+        "tool schema consumes context protocol": re.search(
+            r"(?:retrieval_protocol|kg_retrieval)\.CONTEXT_DESCRIPTION", sources["tools"]
+        ) is not None,
+        "request L2 test exists": request_body is not None,
+        "request L2 asserts all contract markers": all(marker in request_test for marker in protocol_markers),
+        "request L2 contains an expectation": "std.testing.expect" in request_test,
+        "request L2 build wiring exists": test_wired,
+    }
+    obligations["prompt_and_tool_governance"] = (
+        all(prompt_checks.values()),
+        [name for name, present in prompt_checks.items() if not present],
+    )
+
+    context_test_name = (
+        "L2 KG governance: KgContext emits evidence, freshness, and supersession signals"
+    )
+    context_body = test_slice(test_source, context_test_name)
+    context_test = _strip_zig_comments(context_body) if context_body is not None else ""
+    context_markers = (
+        "knowledge_governance",
+        "current_generation",
+        "deprecated_by",
+        "verification_edge_count",
+    )
+    context_checks = {
+        "runtime reads versioned node metadata": "nodeMetadataJson" in sources["client"] and "nodeMetadataJson" in sources["context"],
+        "runtime derives graph signals": "buildKnowledgeGovernance" in sources["context"],
+        "runtime emits governance object": '"knowledge_governance"' in sources["context"] or "\\\"knowledge_governance\\\"" in sources["context"],
+        "runtime versions governance schema": "metacodes-knowledge-governance-v1" in sources["context"],
+        "context L2 test exists": context_body is not None,
+        "context L2 asserts structured fields": all(marker in context_test for marker in context_markers),
+        "context L2 contains an expectation": "std.testing.expect" in context_test,
+        "context L2 build wiring exists": test_wired,
+    }
+    obligations["context_structured_governance"] = (
+        all(context_checks.values()),
+        [name for name, present in context_checks.items() if not present],
+    )
+
+    covered = sorted(name for name, (present, _) in obligations.items() if present)
+    missing = sorted(name for name, (present, _) in obligations.items() if not present)
+    for name in missing:
+        failures = obligations[name][1]
+        errors.append(f"{name}: missing executable evidence: {', '.join(failures)}")
+    declarations = sorted(obligations)
+    return Observation(
+        sensor="memory_evidence_governance",
+        sensor_ok=not errors and len(covered) == len(declarations),
+        declared=len(declarations),
+        covered=len(covered),
+        deviation=max(len(declarations) - len(covered), 0),
+        declarations=declarations,
+        covered_declarations=covered,
+        missing_declarations=missing,
+        feedback_bindings=[{"step": "test:kg-governance", "filter": "L2 KG governance:"}],
+        errors=errors,
+        fingerprint_sha256=fingerprint(touched),
+    )
+
+
+def observe_rule(repo: Path, rule: dict[str, Any]) -> Observation:
+    sensor = rule.get("sensor")
+    if not isinstance(sensor, dict):
+        return Observation(sensor="unknown", errors=["sensor must be an object"])
+    adapter = sensor.get("adapter")
+    if adapter == "declaration_l2":
+        registry_relative = sensor.get("evidence_registry")
+        if not isinstance(registry_relative, str):
+            return Observation(sensor=adapter, errors=["sensor evidence_registry is missing"])
+        try:
+            registry_path = safe_repo_path(repo, registry_relative)
+        except ControlError as exc:
+            return Observation(sensor=adapter, errors=[str(exc)])
+        return observe_declaration_l2(repo, registry_path)
+    if adapter == "memory_evidence_governance":
+        return observe_memory_evidence_governance(repo)
+    return Observation(sensor=str(adapter), errors=[f"unsupported sensor adapter: {adapter!r}"])
+
+
 def executable(name: str, env_name: str | None = None) -> str:
     override = os.environ.get(env_name, "") if env_name else ""
     if override:
@@ -665,11 +835,15 @@ def link_topology(
     target = rule.get("target")
     target_ok = isinstance(target, dict) and bool(target.get("goal")) and target.get("setpoint") == 0
     sensor = rule.get("sensor")
+    adapter = sensor.get("adapter") if isinstance(sensor, dict) else None
     sensor_ok = (
         isinstance(sensor, dict)
-        and sensor.get("adapter") == "declaration_l2"
+        and adapter in SUPPORTED_SENSOR_ADAPTERS
         and sensor.get("schema_version") == SCHEMA_VERSION
-        and isinstance(sensor.get("evidence_registry"), str)
+        and (
+            adapter != "declaration_l2"
+            or isinstance(sensor.get("evidence_registry"), str)
+        )
     )
     decision = rule.get("decision")
     decision_ok = (
@@ -1028,12 +1202,7 @@ def run_check(repo: Path, manifest_path: Path, report_path: Path) -> int:
             rule_report["violations"].extend(topology_errors)
             rule_report["violations"].extend(actuator_before.errors)
 
-            sensor = raw_rule.get("sensor", {})
-            registry_relative = sensor.get("evidence_registry") if isinstance(sensor, dict) else None
-            if not isinstance(registry_relative, str):
-                raise ControlError(f"{rule_id}: sensor evidence_registry is missing")
-            registry_path = safe_repo_path(repo, registry_relative)
-            before = observe_declaration_l2(repo, registry_path)
+            before = observe_rule(repo, raw_rule)
             rule_report["observation_before"] = asdict(before)
             feedback = raw_rule.get("feedback")
             if not isinstance(feedback, dict):
@@ -1065,7 +1234,7 @@ def run_check(repo: Path, manifest_path: Path, report_path: Path) -> int:
             feedback_ok, feedback_results = run_feedback(repo, feedback)
             rule_report["feedback_runs"] = feedback_results
 
-            after = observe_declaration_l2(repo, registry_path)
+            after = observe_rule(repo, raw_rule)
             rule_report["observation_after"] = asdict(after)
             actuator_after = observe_release_gate(repo, workspace, raw_rule.get("actuator"))
             rule_report["actuator_observation_after"] = asdict(actuator_after)
