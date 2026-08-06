@@ -44,6 +44,11 @@ if __package__ in {None, ""}:
         validate_suite,
         write_rollouts,
     )
+    from scripts.eval.memory_benchmark import (  # type: ignore
+        load_memory_rows,
+        render_memory_markdown,
+        summarize_memory,
+    )
     from scripts.eval.paired_runner import run_multi_arm, run_paired  # type: ignore
     from scripts.eval.promotion import (  # type: ignore
         build_promotion_receipt,
@@ -80,6 +85,11 @@ else:
         stable_json,
         validate_suite,
         write_rollouts,
+    )
+    from .memory_benchmark import (
+        load_memory_rows,
+        render_memory_markdown,
+        summarize_memory,
     )
     from .paired_runner import run_multi_arm, run_paired
     from .promotion import (
@@ -140,6 +150,21 @@ def cmd_validate_suite(args: argparse.Namespace) -> int:
 def cmd_validate_rollouts(args: argparse.Namespace) -> int:
     rollouts = load_rollouts(Path(args.rollouts))
     print(f"rollouts: valid ({len(rollouts)} records)")
+    return 0
+
+
+def cmd_validate_memory(args: argparse.Namespace) -> int:
+    rows = load_memory_rows(Path(args.results))
+    print(f"memory results: valid ({len(rows)} records)")
+    return 0
+
+
+def cmd_report_memory(args: argparse.Namespace) -> int:
+    rows = load_memory_rows(Path(args.results))
+    summary = summarize_memory(rows, base_arm=args.base_arm)
+    _write(args.markdown, render_memory_markdown(summary, args.title))
+    if args.json:
+        _write_json(args.json, summary)
     return 0
 
 
@@ -772,6 +797,24 @@ def parser() -> argparse.ArgumentParser:
     report_parser.add_argument("--markdown")
     report_parser.add_argument("--json")
     report_parser.set_defaults(func=cmd_report)
+
+    validate_memory_parser = commands.add_parser(
+        "validate-memory",
+        help="validate memory-maturation-v1 result JSONL without scoring",
+    )
+    validate_memory_parser.add_argument("results")
+    validate_memory_parser.set_defaults(func=cmd_validate_memory)
+
+    memory_report_parser = commands.add_parser(
+        "report-memory",
+        help="score episodic, multi-hop, and procedural memory result JSONL",
+    )
+    memory_report_parser.add_argument("results")
+    memory_report_parser.add_argument("--base-arm", default="no_memory")
+    memory_report_parser.add_argument("--title", default="metacodes memory maturation")
+    memory_report_parser.add_argument("--markdown")
+    memory_report_parser.add_argument("--json")
+    memory_report_parser.set_defaults(func=cmd_report_memory)
 
     paired_parser = commands.add_parser(
         "run-paired", help="run repeated order-balanced baseline/candidate native E2E"
