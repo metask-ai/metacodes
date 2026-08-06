@@ -6,7 +6,9 @@
 //!   运行结束后从 conversation 提取最后一条 assistant 的文本，干净地打到 stdout。
 //! - `--json`：改为 NDJSON 事件流（每行一个 JSON），便于 CI/脚本消费。
 //!
-//! 退出码：end_turn / max_turns → 0；api_error / tool_error / aborted → 1。
+//! 退出码：end_turn / max_turns / budget / tool_loop → 0；
+//! api_error / tool_error / aborted → 1。tool_loop 保留在 result.stop_reason
+//! 供上游区分，但它和其它受控软停一样不把已有产出判成进程失败。
 
 const std = @import("std");
 const pfs = @import("platform").fs;
@@ -16,7 +18,6 @@ const writer_backend = @import("../core/writer_backend.zig");
 
 /// headless 用 WriterBackend null-sink:吞掉 agent_loop 的流式输出（ANSI + tool 注解），
 /// 只要最终文本。工具卡事件 no-op,text_chunk/颜色括号全丢弃。
-
 /// 跑单次 prompt。返回进程退出码。
 pub fn run(
     app: *app_mod.App,
@@ -223,7 +224,7 @@ pub fn resumeSuspended(
 }
 
 /// 把 conversation 最后一条 assistant message 的所有 text block 拼起来（owned）。
-fn lastAssistantText(conv: *const @import("../core/conversation.zig").Conversation, allocator: std.mem.Allocator) ![]const u8 {
+pub fn lastAssistantText(conv: *const @import("../core/conversation.zig").Conversation, allocator: std.mem.Allocator) ![]const u8 {
     var i: usize = conv.messages.items.len;
     while (i > 0) {
         i -= 1;
@@ -236,6 +237,13 @@ fn lastAssistantText(conv: *const @import("../core/conversation.zig").Conversati
                 .text => |t| try buf.appendSlice(allocator, t),
                 else => {},
             }
+        }
+        // A breaker finalization provider may ignore the empty tool set and
+        // return only tool_use. Fall back to the preceding assistant prose
+        // instead of replacing useful partial work with an empty final result.
+        if (buf.items.len == 0) {
+            buf.deinit(allocator);
+            continue;
         }
         return buf.toOwnedSlice(allocator);
     }
@@ -286,11 +294,11 @@ pub fn buildResultLine(
     return try aw.toOwnedSlice();
 }
 
-/// 退出码逻辑(提 pub 供 L2):end_turn/max_turns → 0;suspended → 2(挂起待恢复,非失败);
-/// 其它(error/loop/aborted)→ 1。
+/// 退出码逻辑(提 pub 供 L2):受控停止 → 0;suspended → 2(挂起待恢复,非失败);
+/// 其它(api/tool error 或 aborted)→ 1。
 pub fn exitCodeFor(stop_reason: agent_loop.StopReason) u8 {
     return switch (stop_reason) {
-        .end_turn, .max_turns, .budget => 0, // budget/max_turns=受控停(非失败),同 end_turn
+        .end_turn, .max_turns, .budget, .tool_loop => 0,
         .suspended => 2, // 挂起待恢复:区别于完成(0)与失败(1)
         else => 1,
     };

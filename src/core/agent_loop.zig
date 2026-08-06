@@ -133,7 +133,7 @@ const EventTramp = struct {
 /// 同一工具连续返回同样错误码达到此次数 → 判定模型陷入死循环,熔断中止本轮 run。
 /// 实战痛点(e2e 实测):MiniMax 端点对 Task/TaskCreate 反复发空参 `{}`,触发同一
 /// MissingField 错误,从 ~46 turn 烧到 max_turns=50 才停。3 次足以区分"偶发重试"
-/// 与"原地空参风暴";到达即注入明确终止现场并停。
+/// 与"原地空参风暴";到达后注入明确终止现场，再借一个无工具采样轮收尾。
 pub const MAX_SAME_TOOL_ERROR: u32 = 3;
 
 /// **零增益重复熔断(主防线,与轮数正交)**:同一 (tool, input) 产出**同一 result** 累计达此
@@ -156,6 +156,13 @@ pub const ZeroGainTracker = struct {
     pub fn deinit(self: *ZeroGainTracker) void {
         self.map.deinit();
     }
+    pub fn clear(self: *ZeroGainTracker) void {
+        self.map.clearRetainingCapacity();
+    }
+    pub fn hasSameResult(self: *const ZeroGainTracker, sig_hash: u64, result_hash: u64) bool {
+        const entry = self.map.get(sig_hash) orelse return false;
+        return entry.result_hash == result_hash;
+    }
     /// 记录一次并返回该 sig 的当前同结果累计次数。OOM → best-effort 返 0(不阻塞 run)。
     pub fn record(self: *ZeroGainTracker, sig_hash: u64, result_hash: u64) u32 {
         const gop = self.map.getOrPut(sig_hash) catch return 0;
@@ -170,6 +177,17 @@ pub const ZeroGainTracker = struct {
         return self.record(sig_hash, result_hash) >= MAX_ZERO_GAIN_REPEAT;
     }
 };
+
+const ZeroGainObservation = struct {
+    sig_hash: u64,
+    result_hash: u64,
+    tool_name: []const u8,
+};
+
+const LOOP_BREAKER_FINALIZATION =
+    "[loop-breaker] Repeated ineffective tool actions were stopped. " ++
+    "Do not call any more tools. Using only the evidence already present, provide a concise final answer " ++
+    "covering completed work, verified results, remaining blockers, and the next step.";
 
 /// 工具失败签名:工具名 + 错误码 的哈希。用于检测"同工具同错连续 N 次"。
 /// 用哈希而非存切片:tu.name/code 生命周期随 turn 释放,存哈希避免悬挂。
@@ -553,6 +571,13 @@ fn stopReasonForAbort(abort: ?*const AbortSignal) StopReason {
         .aborted;
 }
 
+fn providerFailureStopReason(breaker_finalization: bool) StopReason {
+    // The breaker itself already established the terminal condition. Failure
+    // of its best-effort prose finalizer must not rewrite that controlled stop
+    // into an unrelated API failure (or discard the preceding assistant text).
+    return if (breaker_finalization) .tool_loop else .api_error;
+}
+
 /// 一次用户请求的完整 agent 运行：发送当前 conversation 到 API，
 /// 收集事件到 assistant message 里（text 和 tool_use blocks），
 /// 如果有 tool_use 则执行、追加 tool_result 到 conversation，继续下一轮。
@@ -590,6 +615,12 @@ pub fn run(
     // 零增益重复熔断(主防线),持有整个 run。
     var zero_gain = ZeroGainTracker.init(allocator);
     defer zero_gain.deinit();
+    // A breaker is a controlled soft stop, not permission to throw away the
+    // work already completed. After the triggering tool_result turn, allow one
+    // extra provider request with no advertised tools so the model can turn the
+    // existing evidence into a useful final answer. This one borrowed turn is
+    // intentionally allowed even when the triggering turn reached max_turns.
+    var breaker_finalization = false;
     // 成本次闸:累计本 run 成本(USD),达 opts.cost_budget_usd → 停(.budget)。
     const cost_rates = @import("../util/pricing.zig").rateFor(provider.model());
     var run_cost_usd: f64 = 0;
@@ -603,7 +634,7 @@ pub fn run(
     // the transcript or across process revisions.
     var compact_summary_reserve_tokens: usize = 0;
 
-    while (turns < opts.max_turns) : (turns += 1) {
+    while (turns < opts.max_turns or breaker_finalization) : (turns += 1) {
         // 开头检查 abort
         if (opts.abort) |a| if (a.isAborted()) {
             log.warn("agent", "aborted before turn {d}", .{turns + 1});
@@ -660,7 +691,10 @@ pub fn run(
             provider,
         );
         defer effective_tools.deinit(allocator);
-        const gated_tool_defs = effective_tools.defs;
+        const gated_tool_defs: []const json_mod.ToolDefinition = if (breaker_finalization)
+            &.{}
+        else
+            effective_tools.defs;
 
         // 自动 compact：发请求前检查 token 估算,超阈值则保留最近 N 条。
         // 阈值 null 时 = input context window * 0.8(逼近 context 上限才压缩,留出回复空间)。
@@ -698,7 +732,7 @@ pub fn run(
                     opts.abort,
                 );
                 if (previous_model_compact_outcome == .api_error) {
-                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
+                    return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = providerFailureStopReason(breaker_finalization), .turns = turns, .tool_calls = total_tool_calls });
                 }
                 if (previous_model_compact_outcome == .aborted) {
                     return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
@@ -732,7 +766,7 @@ pub fn run(
                 opts.abort,
             );
             if (pre_sampling_compact == .api_error) {
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = providerFailureStopReason(breaker_finalization), .turns = turns, .tool_calls = total_tool_calls });
             }
             if (pre_sampling_compact == .aborted) {
                 return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stopReasonForAbort(opts.abort), .turns = turns, .tool_calls = total_tool_calls });
@@ -855,7 +889,7 @@ pub fn run(
             stream = provider.sendStreamRetry(
                 api_messages.items,
                 effective_system_prompt,
-                gated_tool_defs,
+                if (breaker_finalization) null else gated_tool_defs,
                 opts.abort,
                 opts.model_override,
                 null,
@@ -889,13 +923,22 @@ pub fn run(
                             turns + 1,
                             allocator,
                         )) {
-                            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
+                            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = providerFailureStopReason(breaker_finalization), .turns = turns, .tool_calls = total_tool_calls });
                         }
                         continue :request_recovery;
                     },
                     else => |e| {
                         log.err("agent", "sendMessageStream failed turn={d}: {s}", .{ turns + 1, @errorName(e) });
-                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns, .tool_calls = total_tool_calls });
+                        // An explicit user/evaluation abort still outranks the
+                        // breaker finalizer. Other provider failures preserve
+                        // .tool_loop so already-completed work is not recast as
+                        // a fresh API failure merely because prose cleanup
+                        // could not be sampled.
+                        const stop_reason = if (e == error.Aborted)
+                            stopReasonForAbort(opts.abort)
+                        else
+                            providerFailureStopReason(breaker_finalization);
+                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = stop_reason, .turns = turns, .tool_calls = total_tool_calls });
                     },
                 }
             };
@@ -1099,11 +1142,11 @@ pub fn run(
                         turns + 1,
                         allocator,
                     )) {
-                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
+                        return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = providerFailureStopReason(breaker_finalization), .turns = turns + 1, .tool_calls = total_tool_calls });
                     }
                     continue :request_recovery;
                 }
-                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .api_error, .turns = turns + 1, .tool_calls = total_tool_calls });
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = providerFailureStopReason(breaker_finalization), .turns = turns + 1, .tool_calls = total_tool_calls });
             }
 
             break :request_recovery;
@@ -1138,6 +1181,11 @@ pub fn run(
             break;
         };
         if (!has_tool_use) {
+            if (breaker_finalization) {
+                backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+                fireStopHook(permission_ctx.hooks, allocator, conversation, "tool_loop", depth);
+                return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
+            }
             // max_tokens 续写:模型被 token 上限截断(非自然 end_turn),
             // 注入 continue 提示让它接着写,而不是当作完成。最多 MAX_CONTINUATIONS 次。
             if (turn_stop_reason == .max_tokens and continuations < MAX_CONTINUATIONS) {
@@ -1154,6 +1202,15 @@ pub fn run(
             // Stop hook:顶层 agent 自然结束 → 触发(记忆提取挂载点)。
             fireStopHook(permission_ctx.hooks, allocator, conversation, "end_turn", depth);
             return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .end_turn, .turns = turns + 1, .tool_calls = total_tool_calls });
+        }
+
+        // A provider should not emit tool_use after receiving no tool schema.
+        // Treat non-compliance as the end of the one-shot finalization instead
+        // of executing an unadvertised action or entering another loop.
+        if (breaker_finalization) {
+            backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+            fireStopHook(permission_ctx.hooks, allocator, conversation, "tool_loop", depth);
+            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
         }
 
         // 6. 执行所有 tool_use，把结果作为 user-role 的 tool_result block 追加。
@@ -1493,6 +1550,10 @@ pub fn run(
         var turn_uniform_err = true; // 本轮 error slot 是否全是同一签名
         var turn_any_error = false; // 本轮是否有 error slot
         var turn_any_success = false; // 本轮是否有成功 slot
+        // Per-turn aggregation is essential: three identical calls in one
+        // parallel block are one model decision, not three failed turns.
+        var turn_zero_gain: std.ArrayList(ZeroGainObservation) = .empty;
+        defer turn_zero_gain.deinit(allocator);
         // P0.2 PostToolUse:执行后 hook 产出的 additionalContext,拼成一段注入本轮 user 消息(下轮模型可见)。
         var post_ctx: std.ArrayList(u8) = .empty;
         defer post_ctx.deinit(allocator);
@@ -1536,19 +1597,28 @@ pub fn run(
                 };
             }
 
-            // 零增益重复熔断(主防线):同 (name,input) 产出同 result 累计 MAX_ZERO_GAIN_REPEAT 次
-            // → 原地打转 → 复用 tool_loop 停。分页(offset 异)= 异 signature 不触发;结果变 →
-            // result_hash 变 → 重置,不误杀 re-check。best-effort:getOrPut OOM 时跳过(不阻塞)。
-            {
+            // 这里只归纳本轮成功结果；跨轮计数在 slot 循环后统一进行。错误风暴由
+            // same-error breaker 负责，避免两套熔断器对同一错误重复计数。
+            if (!s.is_error) {
                 var sh = std.hash.Wyhash.init(0);
                 sh.update(s.name);
                 sh.update(s.input);
-                const n = zero_gain.record(sh.final(), std.hash.Wyhash.hash(0, content));
-                if (n >= MAX_ZERO_GAIN_REPEAT) {
-                    log.warnId("agent", rid, "zero-gain repeat breaker: tool {s} identical input+result x{d}", .{ s.name, n });
-                    backend.emitEvent(sess, .{ .diag_breaker_tripped = .{ .trace_id = trace_id, .depth = depth, .same_err_count = n } });
-                    tool_loop_tripped = true;
+                const observation = ZeroGainObservation{
+                    .sig_hash = sh.final(),
+                    .result_hash = std.hash.Wyhash.hash(0, content),
+                    .tool_name = s.name,
+                };
+                var found = false;
+                for (turn_zero_gain.items) |*existing| {
+                    if (existing.sig_hash != observation.sig_hash) continue;
+                    // Same signature appearing several times in one parallel
+                    // response counts once. If results differ, retain the last
+                    // result; that difference will be classified as progress.
+                    existing.* = observation;
+                    found = true;
+                    break;
                 }
+                if (!found) turn_zero_gain.append(allocator, observation) catch {};
             }
 
             // 实时工具卡渲染(REPL):把结果经 backend 渲染到屏幕——Edit/Write diff 着色、
@@ -1563,6 +1633,34 @@ pub fn run(
                     .is_error = s.is_error,
                     .elapsed_ms = s.elapsed_ms,
                 } });
+            }
+        }
+
+        // "Repeated" only means zero gain when no successful action in this
+        // turn is new or changed. Any such progress clears stale counts from
+        // unrelated work, then seeds the current observations at count one.
+        // This gives the tracker a real cross-turn window while preserving the
+        // three-turn protection for an unchanged Read/Bash loop.
+        var turn_has_progress = false;
+        for (turn_zero_gain.items) |observation| {
+            if (!zero_gain.hasSameResult(observation.sig_hash, observation.result_hash)) {
+                turn_has_progress = true;
+                break;
+            }
+        }
+        if (turn_has_progress) {
+            zero_gain.clear();
+            for (turn_zero_gain.items) |observation| {
+                _ = zero_gain.record(observation.sig_hash, observation.result_hash);
+            }
+        } else {
+            for (turn_zero_gain.items) |observation| {
+                const n = zero_gain.record(observation.sig_hash, observation.result_hash);
+                if (n >= MAX_ZERO_GAIN_REPEAT) {
+                    log.warnId("agent", rid, "zero-gain repeat breaker: tool {s} identical input+result x{d} turns", .{ observation.tool_name, n });
+                    backend.emitEvent(sess, .{ .diag_breaker_tripped = .{ .trace_id = trace_id, .depth = depth, .same_err_count = n } });
+                    tool_loop_tripped = true;
+                }
             }
         }
 
@@ -1598,15 +1696,21 @@ pub fn run(
             const ctx_text = try std.fmt.allocPrint(allocator, "[PostToolUse hook]\n{s}", .{post_ctx.items});
             try result_blocks.append(allocator, .{ .text = ctx_text });
         }
+        if (tool_loop_tripped) {
+            const breaker_text = try allocator.dupe(u8, LOOP_BREAKER_FINALIZATION);
+            errdefer allocator.free(breaker_text);
+            try result_blocks.append(allocator, .{ .text = breaker_text });
+        }
 
         const blocks_owned = try result_blocks.toOwnedSlice(allocator);
         try conversation.append(.{ .role = .user, .blocks = blocks_owned });
 
-        // 工具熔断:同工具同错连续 MAX_SAME_TOOL_ERROR 次 → 停。错误结果已写入
-        // conversation(供复盘),这里直接返回 .tool_loop,不再发下一轮请求——避免
-        // 模型原地空参风暴烧满 max_turns。
+        // 工具熔断是受控软停。错误/重复结果和明确 breaker 标记都已进入
+        // conversation；再借一个不带 tools 的采样轮生成可交付的收尾文本。
         if (tool_loop_tripped) {
-            return finishRun(backend, sess, trace_id, depth, .{ .stop_reason = .tool_loop, .turns = turns + 1, .tool_calls = total_tool_calls });
+            breaker_finalization = true;
+            backend.emitEvent(sess, .{ .diag_turn_end = .{ .trace_id = trace_id, .depth = depth, .turn = turns + 1, .tool_calls = total_tool_calls } });
+            continue;
         }
 
         // Mid-turn follow-up compact: after tool_result blocks are appended and

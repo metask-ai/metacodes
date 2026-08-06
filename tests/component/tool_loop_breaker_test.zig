@@ -5,7 +5,8 @@
 //!   从 ~46 turn 烧到 max_turns=50 才停。原先 agent_loop 只有 max_turns 粗保护。
 //!
 //! 本轮补:同一工具连续返回同样错误码达 MAX_SAME_TOOL_ERROR(3)次 → 熔断,
-//!   stop_reason=.tool_loop,远早于 max_turns 停。任意工具成功 / 换工具 / 换错误码 → 重置。
+//!   再借一个无工具采样轮收尾，stop_reason=.tool_loop。任意工具成功 / 换工具 /
+//!   换错误码 → 重置。
 //!
 //! 测试策略(对齐 subagent_model_test.zig):MockServer.startCassette 喂 N 个"调用未知
 //!   工具"的 tool_use 响应 → dispatch 每轮返回 error.UnknownTool(同签名) → 第 3 轮熔断。
@@ -29,13 +30,13 @@ const TOOL_USE_NOPE_SSE =
 
 // 旧 SilentWriter 已由 WriterBackend null-sink 取代(见各 test)。
 
-test "L2 熔断器: 同工具同错连续 3 次 → stop_reason=.tool_loop 且 turns==3(不烧到 max_turns)" {
+test "L2 熔断器: 同工具同错 3 轮后仅借一轮无工具收尾" {
     const a = std.testing.allocator;
 
-    // 6 个相同响应:若无熔断,循环会跑满 6 轮(或受 cassette 限制);有熔断应在第 3 轮停。
+    // 三个同错轮后必须只再请求一个无工具收尾轮。
     const bodies = [_][]const u8{
         TOOL_USE_NOPE_SSE, TOOL_USE_NOPE_SSE, TOOL_USE_NOPE_SSE,
-        TOOL_USE_NOPE_SSE, TOOL_USE_NOPE_SSE, TOOL_USE_NOPE_SSE,
+        BREAKER_FINAL_SSE,
     };
     var srv = try harness.MockServer.startCassette(&bodies, 0);
     defer srv.stop();
@@ -63,7 +64,7 @@ test "L2 熔断器: 同工具同错连续 3 次 → stop_reason=.tool_loop 且 t
         client.provider(),
         empty_defs,
         &perm,
-        .{ .max_turns = 20 }, // 远高于 3:证明是熔断而非 max_turns 停的
+        .{ .max_turns = agent_loop.MAX_SAME_TOOL_ERROR }, // 收尾必须借到帽外第 1 轮
         &be,
         a,
     ) catch |e| {
@@ -72,7 +73,35 @@ test "L2 熔断器: 同工具同错连续 3 次 → stop_reason=.tool_loop 且 t
     };
 
     try std.testing.expectEqual(agent_loop.StopReason.tool_loop, result.stop_reason);
-    try std.testing.expectEqual(@as(u32, agent_loop.MAX_SAME_TOOL_ERROR), result.turns);
+    try std.testing.expectEqual(@as(u32, agent_loop.MAX_SAME_TOOL_ERROR + 1), result.turns);
+    try std.testing.expectEqual(@as(u32, agent_loop.MAX_SAME_TOOL_ERROR), result.tool_calls);
+    try std.testing.expectEqual(@as(usize, agent_loop.MAX_SAME_TOOL_ERROR + 1), srv.requestCount());
+    const final_request = srv.lastRequest() orelse return error.NoRequestCaptured;
+    try std.testing.expect(final_request.jsonField("tools") == null);
+    try std.testing.expect(std.mem.indexOf(u8, final_request.body(), "loop-breaker") != null);
+    const final_text = try cc.repl_headless.lastAssistantText(&conv, a);
+    defer a.free(final_text);
+    try std.testing.expectEqualStrings("finalized from existing evidence", final_text);
+    const result_line = try cc.repl_headless.buildResultLine(
+        a,
+        final_text,
+        result,
+        &cc.app_module.UsageTotals{},
+        "fixture-model",
+    );
+    defer a.free(result_line);
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        a,
+        std.mem.trimEnd(u8, result_line, "\n"),
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "finalized from existing evidence",
+        parsed.value.object.get("text").?.string,
+    );
+    try std.testing.expectEqual(@as(u8, 0), cc.repl_headless.exitCodeFor(result.stop_reason));
 }
 
 /// 单轮内 **两个** tool_use(都调 __nope__),同轮同错。回归:修复前内层循环会把
@@ -95,6 +124,55 @@ const END_TURN_SSE =
     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n" ++
     "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const BREAKER_FINAL_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m-final\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"finalized from existing evidence\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const THREE_IDENTICAL_BASH_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m-batch\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"bash_1\",\"name\":\"Bash\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"true\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"bash_2\",\"name\":\"Bash\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"true\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"bash_3\",\"name\":\"Bash\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"true\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":2}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const CHANGING_TAIL_BASH_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m-tail\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"bash_tail\",\"name\":\"Bash\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"python3 -c 'import time;print(chr(120)*31000+str(time.time_ns()))'\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const ONE_BASH_TRUE_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m-one\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"bash_true\",\"name\":\"Bash\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"true\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+    "data: {\"type\":\"message_stop\"}\n\n";
+
+const BASH_TRUE_WITH_PROGRESS_SSE =
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m-progress\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"bash_repeat\",\"name\":\"Bash\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"true\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+    "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"bash_progress\",\"name\":\"Bash\",\"input\":{}}}\n\n" ++
+    "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"printf progress\\\"}\"}}\n\n" ++
+    "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n" ++
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
     "data: {\"type\":\"message_stop\"}\n\n";
 
 test "L2 熔断器回归: 单轮内多工具同错 不应熔断(turns 继续到 end_turn)" {
@@ -128,4 +206,123 @@ test "L2 熔断器回归: 单轮内多工具同错 不应熔断(turns 继续到 
     // 不应熔断:单轮 2 个同错只算 1 个"同错轮",未达 MAX_SAME_TOOL_ERROR=3。
     try std.testing.expect(result.stop_reason != .tool_loop);
     try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+}
+
+test "L2 零增益熔断: 单轮三个相同并发成功调用只计一次" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const bodies = [_][]const u8{ THREE_IDENTICAL_BASH_SSE, END_TURN_SSE };
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "go");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    const tool_defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(tool_defs);
+    var wb = writer_backend.WriterBackend.initNull();
+    const be = wb.backend();
+
+    const result = try agent_loop.run(
+        &conv,
+        client.provider(),
+        tool_defs,
+        &perm,
+        .{ .max_turns = 10, .auto_compact_threshold = std.math.maxInt(usize) },
+        &be,
+        a,
+    );
+    try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(u32, 3), result.tool_calls);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+}
+
+test "L2 零增益熔断: 30KB 以后变化的 Bash 输出不碰撞" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const bodies = [_][]const u8{
+        CHANGING_TAIL_BASH_SSE,
+        CHANGING_TAIL_BASH_SSE,
+        CHANGING_TAIL_BASH_SSE,
+        END_TURN_SSE,
+    };
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "go");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    const tool_defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(tool_defs);
+    var wb = writer_backend.WriterBackend.initNull();
+    const be = wb.backend();
+
+    const result = try agent_loop.run(
+        &conv,
+        client.provider(),
+        tool_defs,
+        &perm,
+        .{ .max_turns = 10, .auto_compact_threshold = std.math.maxInt(usize) },
+        &be,
+        a,
+    );
+    try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 4), srv.requestCount());
+    try std.testing.expectEqual(@as(u32, 3), result.tool_calls);
+}
+
+test "L2 零增益熔断: 同轮新的成功动作重置旧重复窗口" {
+    if (@import("builtin").os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const bodies = [_][]const u8{
+        ONE_BASH_TRUE_SSE,
+        ONE_BASH_TRUE_SSE,
+        BASH_TRUE_WITH_PROGRESS_SSE,
+        ONE_BASH_TRUE_SSE,
+        END_TURN_SSE,
+    };
+    var srv = try harness.MockServer.startCassette(&bodies, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer client.deinit();
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "go");
+    const perm = cc.permission.createContext(.bypass_permissions, a);
+    const tool_defs = try cc.tools.toToolDefinitions(a);
+    defer a.free(tool_defs);
+    var wb = writer_backend.WriterBackend.initNull();
+    const be = wb.backend();
+
+    const result = try agent_loop.run(
+        &conv,
+        client.provider(),
+        tool_defs,
+        &perm,
+        .{ .max_turns = 10, .auto_compact_threshold = std.math.maxInt(usize) },
+        &be,
+        a,
+    );
+    try std.testing.expectEqual(agent_loop.StopReason.end_turn, result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 5), srv.requestCount());
+    try std.testing.expectEqual(@as(u32, 5), result.tool_calls);
 }

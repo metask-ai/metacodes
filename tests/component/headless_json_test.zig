@@ -50,11 +50,30 @@ test "L2 headless --json: stop_reason 各值都能序列化(含 tool_loop)" {
     }
 }
 
-test "L2 headless 退出码:end_turn/max_turns→0,其它→1" {
+test "L2 headless 退出码:受控停止含 tool_loop → 0,硬错误 → 1" {
     try std.testing.expectEqual(@as(u8, 0), headless.exitCodeFor(.end_turn));
     try std.testing.expectEqual(@as(u8, 0), headless.exitCodeFor(.max_turns));
+    try std.testing.expectEqual(@as(u8, 0), headless.exitCodeFor(.budget));
+    try std.testing.expectEqual(@as(u8, 0), headless.exitCodeFor(.tool_loop));
     try std.testing.expectEqual(@as(u8, 1), headless.exitCodeFor(.tool_error));
-    try std.testing.expectEqual(@as(u8, 1), headless.exitCodeFor(.tool_loop));
     try std.testing.expectEqual(@as(u8, 1), headless.exitCodeFor(.aborted));
     try std.testing.expectEqual(@as(u8, 1), headless.exitCodeFor(.api_error));
+}
+
+test "L2 headless breaker fallback:跳过只有 tool_use 的尾消息" {
+    const a = std.testing.allocator;
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.assistant, "work completed before breaker");
+    const blocks = try a.alloc(cc.message.Block, 1);
+    blocks[0] = .{ .tool_use = .{
+        .id = try a.dupe(u8, "tu-final"),
+        .name = try a.dupe(u8, "Read"),
+        .input = try a.dupe(u8, "{}"),
+    } };
+    try conv.append(.{ .role = .assistant, .blocks = blocks });
+
+    const text = try headless.lastAssistantText(&conv, a);
+    defer a.free(text);
+    try std.testing.expectEqualStrings("work completed before breaker", text);
 }

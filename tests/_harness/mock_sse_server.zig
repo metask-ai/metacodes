@@ -16,6 +16,10 @@ const psync = @import("platform").sync;
 
 pub const MockServer = struct {
     pub const MAX_CAPTURED_REQUESTS: usize = 32;
+    // Component tests exercise bounded 30KB tool previews across several
+    // turns. 64KB truncated the third HTTP request mid-body, making the mock
+    // server close a valid client stream before it could test the breaker.
+    pub const MAX_REQUEST_BYTES: usize = 512 * 1024;
 
     listen_sock: net.Socket,
     port: u16,
@@ -218,7 +222,7 @@ pub const MockServer = struct {
 
         // 读完整请求(headers + body)到临时缓冲，再按实际长度写入账本。
         // 算法:recv 直到看见 \r\n\r\n,然后根据 Content-Length 读余下 body。
-        const cap: usize = 64 * 1024;
+        const cap: usize = MAX_REQUEST_BYTES;
         const buf = std.heap.page_allocator.alloc(u8, cap) catch {
             sendResponse(conn, self);
             return;
@@ -247,7 +251,7 @@ pub const MockServer = struct {
             self.cassette_pos += 1;
 
             // 读请求(同 serveOne)
-            const cap: usize = 64 * 1024;
+            const cap: usize = MAX_REQUEST_BYTES;
             const buf = std.heap.page_allocator.alloc(u8, cap) catch {
                 sendResponse(conn, self);
                 net.closeSocket(conn);

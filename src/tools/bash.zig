@@ -50,6 +50,42 @@ fn truncateHead(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     return try out.toOwnedSlice();
 }
 
+fn sha256Hex(bytes: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+/// Format the model-visible bounded preview while retaining a commitment to
+/// the captured bytes before the 30KB display truncation. The zero-gain
+/// breaker hashes this whole JSON result, so two commands whose warnings share
+/// the same 30KB head but whose diagnostics differ later no longer collide.
+fn formatCompletedOutput(
+    allocator: std.mem.Allocator,
+    stdout: []const u8,
+    stderr: []const u8,
+    exit_code: i32,
+) ![]u8 {
+    const stdout_hash = sha256Hex(stdout);
+    const stderr_hash = sha256Hex(stderr);
+    const out_trunc = try truncateHead(allocator, stdout);
+    defer allocator.free(out_trunc);
+    const err_trunc = try truncateHead(allocator, stderr);
+    defer allocator.free(err_trunc);
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try aw.writer.writeAll("{\"stdout\":");
+    try std.json.Stringify.encodeJsonString(out_trunc, .{}, &aw.writer);
+    try aw.writer.writeAll(",\"stderr\":");
+    try std.json.Stringify.encodeJsonString(err_trunc, .{}, &aw.writer);
+    try aw.writer.print(
+        ",\"exit_code\":{d},\"stdout_original_bytes\":{d},\"stderr_original_bytes\":{d},\"stdout_sha256\":\"{s}\",\"stderr_sha256\":\"{s}\"}}",
+        .{ exit_code, stdout.len, stderr.len, stdout_hash[0..], stderr_hash[0..] },
+    );
+    return try aw.toOwnedSlice();
+}
+
 pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     const allocator = ctx.allocator;
     const command_escaped = common.extractJsonArg(args, "command") orelse return error.MissingCommand;
@@ -107,9 +143,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
                 // 后台:profile 文件不能删(进程还在跑),detach
                 if (sandbox_wrap) |*sw| sw.detached = true;
                 const j = try registry.spawnBackground(command);
-                return try std.fmt.allocPrint(allocator,
-                    "{{\"job_id\":\"{s}\",\"status\":\"started\",\"stdout_path\":\"{s}\",\"stderr_path\":\"{s}\"}}",
-                    .{ j.id[0..], j.stdout_path, j.stderr_path });
+                return try std.fmt.allocPrint(allocator, "{{\"job_id\":\"{s}\",\"status\":\"started\",\"stdout_path\":\"{s}\",\"stderr_path\":\"{s}\"}}", .{ j.id[0..], j.stdout_path, j.stderr_path });
             }
         }
     }
@@ -149,19 +183,7 @@ pub fn execute(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     defer allocator.free(out.stderr);
 
     // 截断到 MAX_OUTPUT_BYTES(保留头部),防大输出撑爆上下文。
-    const out_trunc = try truncateHead(allocator, out.stdout);
-    defer allocator.free(out_trunc);
-    const err_trunc = try truncateHead(allocator, out.stderr);
-    defer allocator.free(err_trunc);
-
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    try aw.writer.writeAll("{\"stdout\":");
-    try std.json.Stringify.encodeJsonString(out_trunc, .{}, &aw.writer);
-    try aw.writer.writeAll(",\"stderr\":");
-    try std.json.Stringify.encodeJsonString(err_trunc, .{}, &aw.writer);
-    try aw.writer.print(",\"exit_code\":{d}}}", .{out.exit_code});
-    return try aw.toOwnedSlice();
+    return try formatCompletedOutput(allocator, out.stdout, out.stderr, out.exit_code);
 }
 
 /// 新路径：总是 spawn 到 job_registry（stdout/stderr 落盘），父端轮询等待。
@@ -214,19 +236,7 @@ fn readJobAsSync(allocator: std.mem.Allocator, j: *const @import("../core/job_re
     const err_bytes = readWholeFile(j.stderr_path, allocator, common.MAX_SPAWN_CAPTURE_BYTES) catch try allocator.dupe(u8, "");
     defer allocator.free(err_bytes);
 
-    const out_trunc = try truncateHead(allocator, out_bytes);
-    defer allocator.free(out_trunc);
-    const err_trunc = try truncateHead(allocator, err_bytes);
-    defer allocator.free(err_trunc);
-
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    try aw.writer.writeAll("{\"stdout\":");
-    try std.json.Stringify.encodeJsonString(out_trunc, .{}, &aw.writer);
-    try aw.writer.writeAll(",\"stderr\":");
-    try std.json.Stringify.encodeJsonString(err_trunc, .{}, &aw.writer);
-    try aw.writer.print(",\"exit_code\":{d}}}", .{j.exit_code orelse 0});
-    return try aw.toOwnedSlice();
+    return try formatCompletedOutput(allocator, out_bytes, err_bytes, j.exit_code orelse 0);
 }
 
 fn formatAutoBackgrounded(allocator: std.mem.Allocator, j: *const @import("../core/job_registry.zig").JobEntry) ![]u8 {
@@ -390,5 +400,3 @@ test "BashTool 大输出被截断(防撑爆上下文)" {
     // 整个返回 JSON 不该是完整 100000 行(粗略:远小于 ~600KB)。
     try std.testing.expect(r.len < 60_000);
 }
-
-
