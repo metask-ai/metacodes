@@ -27,6 +27,7 @@ from scripts.eval.treatment_activation import (
 from scripts.eval.tests.multi_arm_fixture import write_multi_arm_checkpoints
 from scripts.eval.tests.test_treatment_activation import (
     TINYKG as REAL_TINYKG,
+    append_baseline_invocation,
     write_activation_artifacts,
     write_baseline_artifacts,
 )
@@ -1002,6 +1003,126 @@ class LongHorizonExperimentTest(unittest.TestCase):
                     )
             verifier.assert_called_once()
             run_once.assert_not_called()
+
+    def test_multi_arm_checkpoints_real_multi_invocation_baseline_receipt(self):
+        experiment = copy.deepcopy(self.experiment)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "metacodes"
+            binary.write_bytes(b"multi-invocation-metacodes")
+            binary.chmod(0o755)
+            tinykg = root / "tinykg"
+            tinykg.write_bytes(b"multi-invocation-tinykg")
+            tinykg.chmod(0o755)
+            metacodes_sha = hashlib.sha256(binary.read_bytes()).hexdigest()
+            tinykg_sha = hashlib.sha256(tinykg.read_bytes()).hexdigest()
+            tinykg_identity = {
+                "path": str(tinykg.resolve()),
+                "sha256": tinykg_sha,
+                "version": "tinykg test",
+            }
+            formal, formal_identity = fake_formal_artifact(root)
+            seed_paths = write_multi_arm_checkpoints(
+                root / "seed",
+                experiment,
+                self.suite,
+                ROOT,
+                metacodes_sha256=metacodes_sha,
+                tinykg_sha256=tinykg_sha,
+                formal_kernel_fingerprint=formal_identity["artifact_fingerprint"],
+                revision="multi-invocation-revision",
+            )
+            rollout = load_rollouts(seed_paths["codex_style"])[0]
+            task = next(
+                task for task in self.suite["tasks"] if task["id"] == rollout["task_id"]
+            )
+            identity = comparison_fingerprints(
+                task,
+                ROOT,
+                model_provider=experiment["model"]["provider"],
+                model_id=experiment["model"]["id"],
+                harness_config_id=rollout["harness"]["config_id"],
+                harness_revision="multi-invocation-revision",
+                permission_mode=task["constraints"]["permission_mode"],
+                binary_path=binary,
+            )
+            rollout["model"]["fingerprint"] = identity["model_fingerprint"]
+            rollout["harness"]["fingerprint"] = identity["harness_fingerprint"]
+            rollout["harness"]["environment_fingerprint"] = identity[
+                "environment_fingerprint"
+            ]
+            rollout["evaluator"]["fingerprint"] = identity["grader_fingerprint"]
+            metadata = {
+                "run_id": rollout["run_id"],
+                "trial": rollout["trial"],
+                "suite_id": rollout["suite_id"],
+                "task_id": rollout["task_id"],
+                "harness_config_id": rollout["harness"]["config_id"],
+            }
+            workspace = root / "baseline-workspace"
+            workspace.mkdir()
+            write_baseline_artifacts(
+                workspace, "codex_style", metadata=metadata
+            )
+            append_baseline_invocation(
+                workspace,
+                arm_id="codex_style",
+                invocation=1,
+                trace_id="baseline-trace-1",
+                metadata_overrides=metadata,
+            )
+            append_baseline_invocation(
+                workspace,
+                arm_id="codex_style",
+                invocation=2,
+                trace_id="baseline-trace-2",
+                metadata_overrides=metadata,
+            )
+            rollout["artifacts"] = {"workspace": str(workspace)}
+            run_dir = root / "run"
+            run_dir.mkdir()
+            output_dir = root / "checkpoints"
+
+            with mock.patch(
+                "scripts.eval.paired_runner.tinykg_binary_identity",
+                return_value=tinykg_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner.formal_kernel_identity",
+                return_value=formal_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner._run_once",
+                side_effect=[run_dir, RuntimeError("stop after baseline attestation")],
+            ), mock.patch(
+                "scripts.eval.paired_runner.import_run", return_value=[rollout]
+            ), mock.patch(
+                "scripts.eval.paired_runner.attach_treatment_activation",
+                new=real_attach_treatment_activation,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "stop after baseline attestation"
+                ):
+                    run_multi_arm(
+                        experiment,
+                        self.suite,
+                        ROOT,
+                        binary,
+                        tinykg_binary=tinykg,
+                        formal_kernel=formal,
+                        revision="multi-invocation-revision",
+                        output_dir=output_dir,
+                        suite_path=SUITE_PATH,
+                        allow_paid_rollouts=True,
+                    )
+
+            persisted = load_rollouts(output_dir / "codex_style.jsonl")
+            self.assertEqual(len(persisted), 1)
+            self.assertEqual(
+                persisted[0]["treatment_activation"]["expectation"],
+                "persistent_tinykg_lifecycle_absent",
+            )
+            self.assertEqual(
+                persisted[0]["treatment_activation"]["store"], {"present": False}
+            )
 
     @unittest.skipUnless(
         REAL_TINYKG.is_file(), "build the vendored TinyKG binary first"

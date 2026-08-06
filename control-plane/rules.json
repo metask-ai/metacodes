@@ -478,7 +478,7 @@
           "treatment_failure_abort_requires_committed_checkpoint",
           "treatment_failure_abort_before_checkpoint_is_rejected",
           "abort_without_invalid_mark_is_rejected",
-          "treatment_activation_admitted_implies_seven_obligations",
+          "treatment_activation_admitted_implies_eight_obligations",
           "treatment_activation_missing_obligation_blocks",
           "treatment_activation_wrong_cardinality_blocks",
           "orphan_cannot_be_compliant",
@@ -519,6 +519,7 @@
             "scripts.eval.tests.test_treatment_activation.TreatmentActivationTest",
             "scripts.eval.tests.test_experiment.LongHorizonExperimentTest.test_multi_arm_checkpoints_treatment_failure_before_abort",
             "scripts.eval.tests.test_experiment.LongHorizonExperimentTest.test_multi_arm_does_not_abort_past_failed_treatment_checkpoint",
+            "scripts.eval.tests.test_experiment.LongHorizonExperimentTest.test_multi_arm_checkpoints_real_multi_invocation_baseline_receipt",
             "scripts.eval.tests.test_experiment.LongHorizonExperimentTest.test_multi_arm_resume_reverifies_treatment_before_network",
             "scripts.eval.tests.test_experiment.LongHorizonExperimentTest.test_promotion_reverifies_all_raw_treatment_artifacts",
             "-v"

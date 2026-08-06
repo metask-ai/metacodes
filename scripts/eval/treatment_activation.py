@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 from dataclasses import dataclass
@@ -38,6 +39,11 @@ MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024
 MAX_LINE_BYTES = 4 * 1024 * 1024
 PACKET_TIMEOUT_SECONDS = 20
 STORE_RELATIVE_PATH = Path(".home/.metacodes/kg/store.kg")
+CLEARED_TOOL_RESULT_STUB = "[tool result cleared to save context]"
+TOOL_RESULT_COMMITMENT_RE = re.compile(
+    r"^\[tool-result-commitment original_bytes=([0-9]+) "
+    r"sha256=([0-9a-f]{64})\]$"
+)
 
 
 @dataclass(frozen=True)
@@ -202,10 +208,40 @@ def _parse_transcript(payload: bytes) -> Dict[str, ToolUse]:
 def _parse_native_events(
     payload: bytes,
 ) -> tuple[Mapping[str, Any], Dict[str, NativeCall]]:
-    starts: Dict[str, tuple[str, int, int, str]] = {}
-    finishes: Dict[str, tuple[str, int, int, str, bool]] = {}
+    # Native sequence numbers are local to one agent-loop invocation.  The E2E
+    # driver appends several invocations to the same artifact, so every new
+    # run_started legitimately restarts at zero.  Keep the raw sequence for
+    # per-trace integrity, but use the append ordinal below for lifecycle order
+    # across invocations.
+    starts: Dict[str, tuple[str, str, int, int, str]] = {}
+    finishes: Dict[str, tuple[str, str, int, int, str, bool]] = {}
     run_metadata: list[Mapping[str, Any]] = []
+    trace_ids: set[str] = set()
+    active_trace_id: str | None = None
+    active_session_id: str | None = None
     expected_sequence = 0
+    identity_keys = (
+        "run_id",
+        "trial",
+        "suite_id",
+        "task_id",
+        "task_fingerprint",
+        "task_fingerprint_provenance",
+        "model_provider",
+        "model_id",
+        "model_fingerprint",
+        "runtime_model_provider",
+        "runtime_model_id",
+        "harness_config_id",
+        "harness_revision",
+        "harness_fingerprint",
+        "permission_mode",
+        "runtime_permission_mode",
+        "environment_fingerprint",
+        "grader_fingerprint",
+        "max_metered_tokens",
+        "max_cost_usd",
+    )
     for row_no, envelope in enumerate(
         _parse_json_lines(payload, label="events.jsonl"), 1
     ):
@@ -218,12 +254,20 @@ def _parse_native_events(
             raise ValidationError(
                 f"treatment activation events.jsonl:{row_no}.sequence is invalid"
             )
-        if sequence != expected_sequence:
+        session_id = envelope.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
             raise ValidationError(
-                "treatment activation native event sequence is not contiguous: "
-                f"expected {expected_sequence}, observed {sequence}"
+                f"treatment activation events.jsonl:{row_no}.session_id is invalid"
             )
-        expected_sequence += 1
+        monotonic_elapsed_ns = envelope.get("monotonic_elapsed_ns")
+        if (
+            not isinstance(monotonic_elapsed_ns, int)
+            or isinstance(monotonic_elapsed_ns, bool)
+            or monotonic_elapsed_ns < 0
+        ):
+            raise ValidationError(
+                f"treatment activation events.jsonl:{row_no}.monotonic_elapsed_ns is invalid"
+            )
         event = envelope.get("event")
         if not isinstance(event, dict) or len(event) != 1:
             raise ValidationError(
@@ -234,10 +278,72 @@ def _parse_native_events(
             raise ValidationError(
                 f"treatment activation events.jsonl:{row_no}.{kind} must be an object"
             )
+        trace_id = _non_empty_string(
+            value.get("trace_id"),
+            f"treatment activation events.jsonl:{row_no}.{kind}.trace_id",
+        )
         if kind == "run_started":
+            if active_trace_id is not None:
+                raise ValidationError(
+                    "treatment activation native invocation started before the prior "
+                    f"trace {active_trace_id!r} finished"
+                )
+            if trace_id in trace_ids:
+                raise ValidationError(
+                    f"treatment activation native events duplicate trace {trace_id!r}"
+                )
             metadata = value.get("metadata")
-            if isinstance(metadata, dict):
-                run_metadata.append(metadata)
+            if not isinstance(metadata, dict):
+                raise ValidationError(
+                    f"treatment activation events.jsonl:{row_no}.run_started has no metadata"
+                )
+            invocation = metadata.get("invocation")
+            if (
+                not isinstance(invocation, int)
+                or isinstance(invocation, bool)
+                or invocation != len(run_metadata)
+            ):
+                raise ValidationError(
+                    "treatment activation native invocation identities are not contiguous: "
+                    f"expected {len(run_metadata)}, observed {invocation!r}"
+                )
+            if run_metadata and any(
+                metadata.get(key) != run_metadata[0].get(key) for key in identity_keys
+            ):
+                raise ValidationError(
+                    "treatment activation native events mix execution identities"
+                )
+            run_metadata.append(metadata)
+            trace_ids.add(trace_id)
+            active_trace_id = trace_id
+            active_session_id = session_id
+            expected_sequence = 0
+        elif active_trace_id is None:
+            raise ValidationError(
+                f"treatment activation native {kind} appears outside an invocation"
+            )
+
+        if trace_id != active_trace_id:
+            raise ValidationError(
+                "treatment activation native trace changed within an invocation: "
+                f"expected {active_trace_id!r}, observed {trace_id!r}"
+            )
+        if session_id != active_session_id:
+            raise ValidationError(
+                f"treatment activation native trace {trace_id!r} changed session_id"
+            )
+        if sequence != expected_sequence:
+            raise ValidationError(
+                "treatment activation native event sequence is not contiguous within "
+                f"trace {trace_id!r}: expected {expected_sequence}, observed {sequence}"
+            )
+        expected_sequence += 1
+
+        # The zero-based append ordinal is globally ordered even though the raw
+        # native sequence restarts for every invocation.
+        global_sequence = row_no - 1
+        if kind == "run_started":
+            continue
         elif kind == "tool_started":
             tool_use_id = _non_empty_string(
                 value.get("id"), "treatment activation tool_started.id"
@@ -260,7 +366,13 @@ def _parse_native_events(
                 raise ValidationError(
                     f"treatment activation native events duplicate start {tool_use_id!r}"
                 )
-            starts[tool_use_id] = (name, sequence, input_bytes, input_sha256)
+            starts[tool_use_id] = (
+                trace_id,
+                name,
+                global_sequence,
+                input_bytes,
+                input_sha256,
+            )
         elif kind == "tool_finished":
             tool_use_id = _non_empty_string(
                 value.get("id"), "treatment activation tool_finished.id"
@@ -286,28 +398,34 @@ def _parse_native_events(
                     f"treatment activation native events duplicate finish {tool_use_id!r}"
                 )
             finishes[tool_use_id] = (
+                trace_id,
                 name,
-                sequence,
+                global_sequence,
                 result_bytes,
                 result_sha256,
                 is_error,
             )
+        elif kind == "run_finished":
+            dropped_events = value.get("dropped_events")
+            if (
+                not isinstance(dropped_events, int)
+                or isinstance(dropped_events, bool)
+                or dropped_events != 0
+            ):
+                raise ValidationError(
+                    f"treatment activation native trace {trace_id!r} dropped events"
+                )
+            active_trace_id = None
+            active_session_id = None
+            expected_sequence = 0
 
     if not run_metadata:
         raise ValidationError("treatment activation native events have no run_started metadata")
+    if active_trace_id is not None:
+        raise ValidationError(
+            f"treatment activation native trace {active_trace_id!r} is incomplete"
+        )
     canonical_metadata = run_metadata[0]
-    identity_keys = (
-        "run_id",
-        "trial",
-        "suite_id",
-        "task_id",
-        "harness_config_id",
-    )
-    for metadata in run_metadata[1:]:
-        if any(metadata.get(key) != canonical_metadata.get(key) for key in identity_keys):
-            raise ValidationError(
-                "treatment activation native events mix execution identities"
-            )
 
     dangling = sorted((set(starts) ^ set(finishes)))
     if dangling:
@@ -315,11 +433,26 @@ def _parse_native_events(
             f"treatment activation native events have incomplete tool calls: {dangling}"
         )
     calls: Dict[str, NativeCall] = {}
-    for tool_use_id, (name, start_sequence, input_bytes, input_sha256) in starts.items():
-        finish_name, finish_sequence, result_bytes, result_sha256, is_error = finishes[
-            tool_use_id
-        ]
-        if name != finish_name or start_sequence >= finish_sequence:
+    for tool_use_id, (
+        start_trace,
+        name,
+        start_sequence,
+        input_bytes,
+        input_sha256,
+    ) in starts.items():
+        (
+            finish_trace,
+            finish_name,
+            finish_sequence,
+            result_bytes,
+            result_sha256,
+            is_error,
+        ) = finishes[tool_use_id]
+        if (
+            start_trace != finish_trace
+            or name != finish_name
+            or start_sequence >= finish_sequence
+        ):
             raise ValidationError(
                 f"treatment activation native call {tool_use_id!r} has invalid lifecycle"
             )
@@ -349,12 +482,21 @@ def _bind_tool_call(
             f"treatment activation tool {tool.tool_use_id!r} is not bound to native events"
         )
     input_bytes = tool.input_text.encode("utf-8")
+    result_commitment = _tool_result_commitment(tool.result_text)
     result_bytes = tool.result_text.encode("utf-8")
+    expected_result_bytes = (
+        len(result_bytes) if result_commitment is None else result_commitment[0]
+    )
+    expected_result_sha256 = (
+        _sha256_bytes(result_bytes)
+        if result_commitment is None
+        else result_commitment[1]
+    )
     if (
         native.input_bytes != len(input_bytes)
         or native.input_sha256 != _sha256_bytes(input_bytes)
-        or native.result_bytes != len(result_bytes)
-        or native.result_sha256 != _sha256_bytes(result_bytes)
+        or native.result_bytes != expected_result_bytes
+        or native.result_sha256 != expected_result_sha256
         or native.is_error != tool.result_is_error
     ):
         raise ValidationError(
@@ -365,6 +507,35 @@ def _bind_tool_call(
             f"treatment activation lifecycle tool {tool.tool_use_id!r} failed"
         )
     return native
+
+
+def _tool_result_commitment(text: str) -> tuple[int, str] | None:
+    """Resolve a context projection to its execution-time byte commitment.
+
+    Evaluation traces intentionally avoid raw tool payloads.  When the live
+    conversation clears or truncates a result, the projection must therefore
+    retain the original byte count and SHA-256.  The old unauthenticated stub is
+    rejected: accepting it would recreate the exact evidence hole this binding
+    is meant to close.
+    """
+    lines = text.splitlines()
+    commitment_line: str | None = None
+    if text.startswith(CLEARED_TOOL_RESULT_STUB):
+        if len(lines) < 2:
+            raise ValidationError(
+                "treatment activation projected tool result lacks a byte commitment"
+            )
+        commitment_line = lines[1]
+    elif lines and lines[0].startswith("[tool-result-commitment "):
+        commitment_line = lines[0]
+    else:
+        return None
+    match = TOOL_RESULT_COMMITMENT_RE.fullmatch(commitment_line)
+    if match is None:
+        raise ValidationError(
+            "treatment activation projected tool result has an invalid byte commitment"
+        )
+    return int(match.group(1)), match.group(2)
 
 
 def _bind_all_tool_calls(
@@ -400,6 +571,14 @@ def _json_object(text: str, where: str) -> Mapping[str, Any]:
     return value
 
 
+def _projected_json_object(
+    tool: ToolUse, where: str
+) -> Mapping[str, Any] | None:
+    if _tool_result_commitment(tool.result_text) is not None:
+        return None
+    return _json_object(tool.result_text, where)
+
+
 def _trace_row(phase: str, native: NativeCall) -> Dict[str, Any]:
     return {
         "phase": phase,
@@ -430,31 +609,16 @@ def _task_lifecycle(
     create_input = _json_object(create_tool.input_text, "TaskCreate input")
     _non_empty_string(create_input.get("subject"), "TaskCreate input.subject")
     _non_empty_string(create_input.get("description"), "TaskCreate input.description")
-    create_result = _json_object(create_tool.result_text, "TaskCreate result")
-    task = create_result.get("task")
-    if not isinstance(task, dict) or task.get("persisted") is not True:
-        raise ValidationError(
-            "TinyKG treatment TaskCreate did not return persisted=true"
-        )
-    task_id_text = task.get("id")
-    if (
-        not isinstance(task_id_text, str)
-        or not task_id_text.startswith("kg-")
-        or not task_id_text[3:].isdigit()
-    ):
-        raise ValidationError("TinyKG treatment TaskCreate did not return a kg-* id")
-    task_id = int(task_id_text[3:])
+    create_result = _projected_json_object(create_tool, "TaskCreate result")
 
-    updates: list[tuple[ToolUse, NativeCall, Mapping[str, Any], Mapping[str, Any]]] = []
+    updates: list[
+        tuple[ToolUse, NativeCall, Mapping[str, Any], Mapping[str, Any] | None]
+    ] = []
     for tool, native in bound:
         if tool.name != "TaskUpdate":
             continue
         update_input = _json_object(tool.input_text, "TaskUpdate input")
-        update_result = _json_object(tool.result_text, "TaskUpdate result")
-        if update_input.get("taskId") != task_id_text:
-            raise ValidationError(
-                "TinyKG treatment used more than one persistent task lifecycle"
-            )
+        update_result = _projected_json_object(tool, "TaskUpdate result")
         updates.append((tool, native, update_input, update_result))
     if len(updates) != 2:
         raise ValidationError(
@@ -468,22 +632,44 @@ def _task_lifecycle(
         raise ValidationError(
             "TinyKG treatment lifecycle must contain in_progress then completed"
         )
-    _, claim_native, _, claim_result = claim
+    _, claim_native, claim_input, claim_result = claim
     _, completed_native, completed_input, completed_result = completed
-    if claim_result.get("claimed") is not True:
-        raise ValidationError("TinyKG treatment claim did not return claimed=true")
-    packet = claim_result.get("task_packet")
+    task_id_text = claim_input.get("taskId")
     if (
-        not isinstance(packet, dict)
-        or not isinstance(packet.get("query"), dict)
-        or packet["query"].get("task_id") != task_id
-        or packet["query"].get("status") != "claimed"
+        not isinstance(task_id_text, str)
+        or not task_id_text.startswith("kg-")
+        or not task_id_text[3:].isdigit()
+        or completed_input.get("taskId") != task_id_text
     ):
-        raise ValidationError("TinyKG treatment claim lacks the same live task packet")
+        raise ValidationError(
+            "TinyKG treatment used more than one valid persistent task lifecycle"
+        )
+    task_id = int(task_id_text[3:])
+    if create_result is not None:
+        task = create_result.get("task")
+        if not isinstance(task, dict) or task.get("persisted") is not True:
+            raise ValidationError(
+                "TinyKG treatment TaskCreate did not return persisted=true"
+            )
+        if task.get("id") != task_id_text:
+            raise ValidationError(
+                "TinyKG treatment TaskCreate did not return the updated kg-* id"
+            )
+    if claim_result is not None:
+        if claim_result.get("claimed") is not True:
+            raise ValidationError("TinyKG treatment claim did not return claimed=true")
+        packet = claim_result.get("task_packet")
+        if (
+            not isinstance(packet, dict)
+            or not isinstance(packet.get("query"), dict)
+            or packet["query"].get("task_id") != task_id
+            or packet["query"].get("status") != "claimed"
+        ):
+            raise ValidationError("TinyKG treatment claim lacks the same live task packet")
     _non_empty_string(
         completed_input.get("conclusion"), "TaskUpdate completed conclusion"
     )
-    if completed_result.get("closed") is not True:
+    if completed_result is not None and completed_result.get("closed") is not True:
         raise ValidationError("TinyKG treatment completion did not return closed=true")
     if not (
         create_native.finished_sequence < claim_native.started_sequence

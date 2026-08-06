@@ -1904,10 +1904,13 @@ def observe_treatment_activation(repo: Path) -> Observation:
         "resume_reverification_before_network",
         "promotion_reverification_from_raw_artifacts",
         "real_tinykg_and_tamper_counterexamples",
+        "multi_invocation_and_compaction_evidence_integrity",
     ]
     relative_sources = {
         "prompt": "src/kg/task_protocol.zig",
         "prompt_test": "tests/component/prompt_tool_coupling_test.zig",
+        "conversation": "src/core/conversation.zig",
+        "microcompact_test": "tests/component/microcompact_test.zig",
         "attester": "scripts/eval/treatment_activation.py",
         "model": "scripts/eval/model.py",
         "runner": "scripts/eval/paired_runner.py",
@@ -2004,6 +2007,8 @@ def observe_treatment_activation(repo: Path) -> Observation:
     prompt_source = sources["prompt"]
     prompt_test = sources["prompt_test"]
     bind_source = function_source("attester", "_bind_all_tool_calls")
+    native_parser_source = function_source("attester", "_parse_native_events")
+    commitment_source = function_source("attester", "_tool_result_commitment")
     lifecycle_source = function_source("attester", "_task_lifecycle")
     store_source = function_source("attester", "_store_packet")
     store_verify_source = function_source("attester", "_verify_store_packet")
@@ -2031,6 +2036,10 @@ def observe_treatment_activation(repo: Path) -> Observation:
     )
     promotion_real_test = function_source(
         "experiment_tests", "test_promotion_reverifies_all_raw_treatment_artifacts"
+    )
+    multi_invocation_runner_test = function_source(
+        "experiment_tests",
+        "test_multi_arm_checkpoints_real_multi_invocation_baseline_receipt",
     )
 
     failure_order = (
@@ -2219,6 +2228,53 @@ def observe_treatment_activation(repo: Path) -> Observation:
                 "validate_treatment_activation_receipt" in attest_source
             ),
         },
+        declarations[7]: {
+            "native traces validate each invocation before normalizing global order": all(
+                marker in native_parser_source
+                for marker in (
+                    "invocation != len(run_metadata)",
+                    "trace_id != active_trace_id",
+                    "global_sequence = row_no - 1",
+                    "dropped_events != 0",
+                )
+            ),
+            "context projections retain execution-time byte commitments": all(
+                marker in sources["conversation"]
+                for marker in (
+                    "TOOL_RESULT_COMMITMENT_PREFIX",
+                    "sha256Hex(tr.content)",
+                    "new_content.len >= tr.content.len",
+                )
+            )
+            and all(
+                marker in commitment_source
+                for marker in (
+                    "TOOL_RESULT_COMMITMENT_RE.fullmatch",
+                    "lacks a byte commitment",
+                    "invalid byte commitment",
+                )
+            ),
+            "positive and negative fixtures cover invocation resets and compacted results": all(
+                name in attester_tests
+                for name in (
+                    "test_baseline_accepts_contiguous_multi_invocation_native_trace",
+                    "test_multi_invocation_gap_is_rejected",
+                    "test_sequence_reset_without_new_invocation_is_rejected",
+                    "test_compacted_lifecycle_results_retain_native_hash_and_store_binding",
+                    "test_legacy_compaction_stub_without_commitment_is_rejected",
+                )
+            )
+            and "isCommittedToolResultProjection" in sources["microcompact_test"],
+            "real multi-arm path checkpoints a multi-invocation baseline receipt": all(
+                marker in multi_invocation_runner_test
+                for marker in (
+                    "run_multi_arm(",
+                    "append_baseline_invocation(",
+                    'load_rollouts(output_dir / "codex_style.jsonl")',
+                    '"persistent_tinykg_lifecycle_absent"',
+                )
+            ),
+        },
     }
     covered = [name for name, checks in obligations.items() if all(checks.values())]
     missing = [name for name in declarations if name not in covered]
@@ -2239,6 +2295,12 @@ def observe_treatment_activation(repo: Path) -> Observation:
         missing_declarations=missing,
         feedback_bindings=[
             {"unittest": "scripts.eval.tests.test_treatment_activation.TreatmentActivationTest"},
+            {
+                "unittest": (
+                    "scripts.eval.tests.test_experiment.LongHorizonExperimentTest."
+                    "test_multi_arm_checkpoints_real_multi_invocation_baseline_receipt"
+                )
+            },
             {
                 "unittest": (
                     "scripts.eval.tests.test_experiment.LongHorizonExperimentTest."

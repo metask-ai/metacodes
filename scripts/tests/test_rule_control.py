@@ -1011,6 +1011,8 @@ class TreatmentActivationSensorTests(unittest.TestCase):
     RELATIVE_SOURCES = (
         "src/kg/task_protocol.zig",
         "tests/component/prompt_tool_coupling_test.zig",
+        "src/core/conversation.zig",
+        "tests/component/microcompact_test.zig",
         "scripts/eval/treatment_activation.py",
         "scripts/eval/model.py",
         "scripts/eval/paired_runner.py",
@@ -1030,14 +1032,32 @@ class TreatmentActivationSensorTests(unittest.TestCase):
             target.write_bytes(source.read_bytes())
         return temporary, root
 
-    def test_all_seven_treatment_activation_obligations_are_observed(self) -> None:
+    def test_all_eight_treatment_activation_obligations_are_observed(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
         observation = rule_control.observe_treatment_activation(root)
         self.assertTrue(observation.sensor_ok, observation.errors)
-        self.assertEqual(7, observation.declared)
-        self.assertEqual(7, observation.covered)
-        self.assertEqual(5, len(observation.feedback_bindings))
+        self.assertEqual(8, observation.declared)
+        self.assertEqual(8, observation.covered)
+        self.assertEqual(6, len(observation.feedback_bindings))
+
+    def test_missing_real_multi_invocation_runner_path_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        tests = root / "scripts/eval/tests/test_experiment.py"
+        tests.write_text(
+            tests.read_text(encoding="utf-8").replace(
+                "test_multi_arm_checkpoints_real_multi_invocation_baseline_receipt",
+                "test_attester_helper_only_without_real_multi_arm_path",
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_treatment_activation(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "multi_invocation_and_compaction_evidence_integrity",
+            observation.missing_declarations,
+        )
 
     def test_missing_checkpoint_publication_breaks_treatment_failure_order(self) -> None:
         temporary, root = self.make_repo()

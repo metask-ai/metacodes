@@ -2681,6 +2681,16 @@ test "auto-compact preflight truncates huge recent tool_result before next reque
     var state = TestProviderState{};
     const provider = testProvider(&state);
     const before = try estimateNextRequestTokens(a, provider, &c, null, null, null, &.{}, null);
+    var api_before = try buildApiMessages(&c, a, null, null);
+    defer freeApiMessages(&api_before, a);
+    const body_before = try json_mod.serializeMessagesRequest(.{
+        .model = provider.model(),
+        .max_tokens = provider.maxTokens(),
+        .messages = api_before.items,
+        .stream = true,
+        .tools = &.{},
+    }, a);
+    defer a.free(body_before);
     const reduced = c.truncateLargeToolResults(limit);
     try std.testing.expectEqual(@as(usize, 1), reduced.truncated);
     const after = try estimateNextRequestTokens(a, provider, &c, null, null, null, &.{}, null);
@@ -2700,7 +2710,7 @@ test "auto-compact preflight truncates huge recent tool_result before next reque
     try std.testing.expect(std.mem.indexOf(u8, body, "toolu_huge") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "Z") != null);
     try std.testing.expectEqual(Conversation.estimateTokens(body), after);
-    try std.testing.expect(body.len < before);
+    try std.testing.expect(body.len < body_before.len);
 }
 
 test "mid-turn follow-up auto-compact emits post-tool cause and preserves tool suffix" {

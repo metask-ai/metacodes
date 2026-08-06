@@ -201,13 +201,24 @@ and the caller could reload it after the process-level abort. The rule does not
 claim power-loss durability of the parent directory on every filesystem.
 
 `eval.treatment-activation.l2` governs whether the three-arm experiment really
-activated the mechanism it claims to compare. Its seven fixed obligations bind
+activated the mechanism it claims to compare. Its eight fixed obligations bind
 the treatment prompt to the TinyKG arm only; require exact native-event and
 transcript call identities/hashes; admit one create→claim→complete lifecycle
 only after frozen-binary `task-packet` readback and `verified_by` evidence; use
 the shared durable-abort protocol for attestation failures; reverify checkpoints
 before resumed paid work; recompute receipts from raw artifacts during
-promotion/reporting; and retain real TinyKG plus mutation counterexamples.
+promotion/reporting; retain real TinyKG plus mutation counterexamples; and
+require multi-invocation native traces plus cryptographic commitments for tool
+results removed from the model-facing context.
+
+Native `sequence` is intentionally local to one agent-loop invocation, while a
+single scored rollout can append several invocations. The attester therefore
+proves contiguous invocation ids and per-trace sequences before deriving one
+append-order lifecycle. Context clearing/truncation may replace result bytes in
+the model projection, but it must preserve the original byte count and SHA-256;
+the unauthenticated legacy placeholder is rejected. A real `run_multi_arm`
+counterexample checkpoints a three-invocation baseline receipt, so a single-run
+fixture or helper-only parser test cannot satisfy this obligation.
 
 The treatment failure feedback exercises both halves of the storage boundary.
 One real `run_multi_arm` test injects an attestation failure, observes the raised

@@ -119,10 +119,10 @@ theorem treatment_failure_abort_before_checkpoint_is_rejected :
     DurableAbort.runTrace .observed [.markInvalid, .abort] = none := by
   exact DurableAbort.abort_before_checkpoint_is_rejected
 
-/-- Seven repository obligations bind the model to the real execution path. -/
+/-- Eight repository obligations bind the model to the real execution path. -/
 def treatmentActivationSignal
     (topology : Topology) (observation : Observation) : Signal :=
-  if observation.declared == 7 then signal topology observation else .blockRelease
+  if observation.declared == 8 then signal topology observation else .blockRelease
 
 def treatmentActivationNextState
     (topology : Topology) (observation : Observation) : RuleState :=
@@ -135,13 +135,13 @@ def treatmentActivationReleaseAllowed
     (topology : Topology) (observation : Observation) : Bool :=
   treatmentActivationSignal topology observation == .admitRelease
 
-theorem treatment_activation_admitted_implies_seven_obligations
+theorem treatment_activation_admitted_implies_eight_obligations
     (topology : Topology) (observation : Observation)
     (admitted : treatmentActivationReleaseAllowed topology observation = true) :
-    observation.declared = 7 ∧ observation.covered = 7 := by
+    observation.declared = 8 ∧ observation.covered = 8 := by
   simp [treatmentActivationReleaseAllowed, treatmentActivationSignal] at admitted
   split at admitted
-  · rename_i declaredSeven
+  · rename_i declaredEight
     have genericAdmitted : releaseAllowed topology observation = true := by
       simpa [releaseAllowed] using admitted
     have exact := admitted_implies_zero_deviation topology observation genericAdmitted
@@ -150,16 +150,16 @@ theorem treatment_activation_admitted_implies_seven_obligations
 
 theorem treatment_activation_missing_obligation_blocks
     (topology : Topology) (observation : Observation)
-    (declaresSeven : observation.declared = 7)
-    (missing : observation.covered < 7) :
+    (declaresEight : observation.declared = 8)
+    (missing : observation.covered < 8) :
     treatmentActivationSignal topology observation = .blockRelease := by
-  simp [treatmentActivationSignal, declaresSeven]
+  simp [treatmentActivationSignal, declaresEight]
   apply missing_evidence_blocks topology observation
   omega
 
 theorem treatment_activation_wrong_cardinality_blocks
     (topology : Topology) (observation : Observation)
-    (wrong : observation.declared ≠ 7) :
+    (wrong : observation.declared ≠ 8) :
     treatmentActivationSignal topology observation = .blockRelease := by
   simp [treatmentActivationSignal, wrong]
 

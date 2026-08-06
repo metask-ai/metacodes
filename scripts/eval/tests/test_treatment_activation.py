@@ -30,6 +30,15 @@ def compact(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def committed_projection(content):
+    payload = content.encode("utf-8")
+    return (
+        "[tool result cleared to save context]\n"
+        f"[tool-result-commitment original_bytes={len(payload)} "
+        f"sha256={hashlib.sha256(payload).hexdigest()}]"
+    )
+
+
 def run_tinykg(binary: Path, *args: str) -> str:
     completed = subprocess.run(
         [str(binary), *args],
@@ -56,7 +65,9 @@ def envelope(sequence, event):
     }
 
 
-def call_events(sequence, tool_use_id, name, input_text, result_text):
+def call_events(
+    sequence, tool_use_id, name, input_text, result_text, *, trace_id="activation-trace"
+):
     input_bytes = input_text.encode()
     result_bytes = result_text.encode()
     return [
@@ -64,7 +75,7 @@ def call_events(sequence, tool_use_id, name, input_text, result_text):
             sequence,
             {
                 "tool_started": {
-                    "trace_id": "activation-trace",
+                    "trace_id": trace_id,
                     "id": tool_use_id,
                     "name": name,
                     "input_bytes": len(input_bytes),
@@ -76,7 +87,7 @@ def call_events(sequence, tool_use_id, name, input_text, result_text):
             sequence + 1,
             {
                 "tool_finished": {
-                    "trace_id": "activation-trace",
+                    "trace_id": trace_id,
                     "id": tool_use_id,
                     "name": name,
                     "is_error": False,
@@ -148,6 +159,13 @@ def run_metadata(arm_id):
         "environment_fingerprint": "environment-fingerprint",
         "grader_fingerprint": "grader-fingerprint",
     }
+
+
+def merged_metadata(arm_id, overrides):
+    metadata = run_metadata(arm_id)
+    if overrides:
+        metadata.update(overrides)
+    return metadata
 
 
 def write_activation_artifacts(
@@ -254,7 +272,7 @@ def write_activation_artifacts(
             {
                 "run_started": {
                     "trace_id": "activation-trace",
-                    "metadata": metadata or run_metadata("tinykg"),
+                    "metadata": merged_metadata("tinykg", metadata),
                 }
             },
         )
@@ -296,7 +314,7 @@ def write_baseline_artifacts(
             {
                 "run_started": {
                     "trace_id": "baseline-trace",
-                    "metadata": metadata or run_metadata(arm_id),
+                    "metadata": merged_metadata(arm_id, metadata),
                 }
             },
         ),
@@ -320,6 +338,42 @@ def write_baseline_artifacts(
         workspace / "transcript.jsonl",
         [{"role": "assistant", "blocks": [{"type": "text", "text": "done"}]}],
     )
+
+
+def append_baseline_invocation(
+    workspace: Path,
+    *,
+    arm_id: str,
+    invocation: int,
+    trace_id: str,
+    metadata_overrides: dict | None = None,
+) -> None:
+    path = workspace / "events.jsonl"
+    metadata = merged_metadata(arm_id, metadata_overrides)
+    metadata["invocation"] = invocation
+    events = [
+        envelope(
+            0,
+            {"run_started": {"trace_id": trace_id, "metadata": metadata}},
+        ),
+        envelope(
+            1,
+            {
+                "run_finished": {
+                    "trace_id": trace_id,
+                    "depth": 0,
+                    "turns": 1,
+                    "tool_calls": 0,
+                    "stop_reason": "end_turn",
+                    "wall_time_ms": 1,
+                    "dropped_events": 0,
+                }
+            },
+        ),
+    ]
+    with path.open("a", encoding="utf-8") as handle:
+        for row in events:
+            handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 @unittest.skipUnless(TINYKG.is_file(), "build the vendored TinyKG binary first")
@@ -419,6 +473,50 @@ class TreatmentActivationTest(unittest.TestCase):
                     workspace, "tinykg", self.binary, self.binary_sha256
                 )
 
+    def test_compacted_lifecycle_results_retain_native_hash_and_store_binding(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            write_activation_artifacts(workspace, self.binary)
+            path = workspace / "transcript.jsonl"
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            for row in rows:
+                for block in row["blocks"]:
+                    if block.get("type") == "tool_result":
+                        block["content"] = committed_projection(block["content"])
+            write_jsonl(path, rows)
+
+            receipt = attest_treatment_activation(
+                workspace, "tinykg", self.binary, self.binary_sha256
+            )
+
+            self.assertEqual(receipt["task"]["status"], "completed")
+            self.assertEqual(
+                [item["phase"] for item in receipt["trace"]],
+                ["created", "claimed", "completed"],
+            )
+
+    def test_legacy_compaction_stub_without_commitment_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            write_activation_artifacts(workspace, self.binary)
+            path = workspace / "transcript.jsonl"
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            result = next(
+                block
+                for row in rows
+                for block in row["blocks"]
+                if block.get("type") == "tool_result"
+            )
+            result["content"] = "[tool result cleared to save context]"
+            write_jsonl(path, rows)
+
+            with self.assertRaisesRegex(ValidationError, "lacks a byte commitment"):
+                attest_treatment_activation(
+                    workspace, "tinykg", self.binary, self.binary_sha256
+                )
+
     def test_store_without_verified_completion_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory) / "workspace"
@@ -465,6 +563,142 @@ class TreatmentActivationTest(unittest.TestCase):
             self.assertEqual(receipt["trace"], [])
             self.assertEqual(receipt["store"], {"present": False})
 
+    def test_baseline_accepts_contiguous_multi_invocation_native_trace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            write_baseline_artifacts(workspace)
+            append_baseline_invocation(
+                workspace,
+                arm_id="codex_style",
+                invocation=1,
+                trace_id="baseline-trace-1",
+            )
+            append_baseline_invocation(
+                workspace,
+                arm_id="codex_style",
+                invocation=2,
+                trace_id="baseline-trace-2",
+            )
+
+            receipt = attest_treatment_activation(
+                workspace, "codex_style", self.binary, self.binary_sha256
+            )
+
+            self.assertEqual(receipt["execution"]["run_id"], "activation:codex_style:0")
+            self.assertEqual(receipt["trace"], [])
+
+    def test_multi_invocation_gap_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            write_baseline_artifacts(workspace)
+            append_baseline_invocation(
+                workspace,
+                arm_id="codex_style",
+                invocation=2,
+                trace_id="baseline-trace-2",
+            )
+
+            with self.assertRaisesRegex(
+                ValidationError, "invocation identities are not contiguous"
+            ):
+                attest_treatment_activation(
+                    workspace, "codex_style", self.binary, self.binary_sha256
+                )
+
+    def test_sequence_reset_without_new_invocation_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            write_baseline_artifacts(workspace)
+            path = workspace / "events.jsonl"
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            rows.insert(
+                1,
+                envelope(
+                    0,
+                    {
+                        "turn_started": {
+                            "trace_id": "baseline-trace",
+                            "depth": 0,
+                            "turn": 1,
+                        }
+                    },
+                ),
+            )
+            write_jsonl(path, rows)
+
+            with self.assertRaisesRegex(
+                ValidationError, "not contiguous within trace"
+            ):
+                attest_treatment_activation(
+                    workspace, "codex_style", self.binary, self.binary_sha256
+                )
+
+    def test_multi_invocation_identity_drift_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            write_baseline_artifacts(workspace)
+            append_baseline_invocation(
+                workspace,
+                arm_id="codex_style",
+                invocation=1,
+                trace_id="baseline-trace-1",
+                metadata_overrides={"model_id": "different-model"},
+            )
+
+            with self.assertRaisesRegex(ValidationError, "mix execution identities"):
+                attest_treatment_activation(
+                    workspace, "codex_style", self.binary, self.binary_sha256
+                )
+
+    def test_trace_change_within_invocation_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            write_baseline_artifacts(workspace)
+            path = workspace / "events.jsonl"
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            rows[-1]["event"]["run_finished"]["trace_id"] = "different-trace"
+            write_jsonl(path, rows)
+
+            with self.assertRaisesRegex(ValidationError, "trace changed"):
+                attest_treatment_activation(
+                    workspace, "codex_style", self.binary, self.binary_sha256
+                )
+
+    def test_dropped_native_events_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            write_baseline_artifacts(workspace)
+            path = workspace / "events.jsonl"
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            rows[-1]["event"]["run_finished"]["dropped_events"] = 1
+            write_jsonl(path, rows)
+
+            with self.assertRaisesRegex(ValidationError, "dropped events"):
+                attest_treatment_activation(
+                    workspace, "codex_style", self.binary, self.binary_sha256
+                )
+
+    def test_incomplete_native_invocation_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            workspace.mkdir()
+            write_baseline_artifacts(workspace)
+            path = workspace / "events.jsonl"
+            rows = [json.loads(line) for line in path.read_text().splitlines()]
+            write_jsonl(path, rows[:-1])
+
+            with self.assertRaisesRegex(ValidationError, "is incomplete"):
+                attest_treatment_activation(
+                    workspace, "codex_style", self.binary, self.binary_sha256
+                )
+
+
     def test_baseline_cannot_hide_native_kg_call_by_removing_transcript_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory) / "workspace"
@@ -475,7 +709,12 @@ class TreatmentActivationTest(unittest.TestCase):
             input_text = compact({"query": "hidden"})
             result_text = compact({"hits": []})
             events[1:1] = call_events(
-                1, "hidden-kg", "KgRecall", input_text, result_text
+                1,
+                "hidden-kg",
+                "KgRecall",
+                input_text,
+                result_text,
+                trace_id="baseline-trace",
             )
             events[-1]["sequence"] = 3
             write_jsonl(events_path, events)
