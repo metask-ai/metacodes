@@ -42,6 +42,29 @@ maximum hop depth (default 3). Record gold supporting-fact ids, retrieved ids, v
 semantic variants, and per-hop candidates. Report EM, token F1, evidence recall/precision, all-support coverage,
 query count, hop count, fan-out, and graph truncation. Include no-context and oracle-gold-context controls.
 
+The repository adapter consumes the official `hotpot_dev_distractor_v1.json` shape. It validates every source
+record, rejects duplicate ids/titles/supports and missing or out-of-range support ids, then selects cases by
+`SHA256(split_seed || NUL || source_id)` rather than input order. A known upstream annotation defect may only be
+excluded through a source-SHA-bound quarantine policy that exactly matches the observed defect; unused or stale
+exclusions fail closed.
+
+```bash
+python3 -m scripts.eval.cli adapt-hotpot-memory \
+  --source /path/to/hotpot_dev_distractor_v1.json \
+  --expected-source-sha256 <pinned-source-sha256> \
+  --execution evals/memory/fixtures/hotpot-adapter-smoke-execution.json \
+  --output-source /tmp/hotpot-memory-source.json \
+  --output-manifest /tmp/hotpot-memory-manifest.json \
+  --limit 1000 \
+  --split-seed 20260806
+```
+
+The output source slice is safe to import as a candidate corpus: it contains questions, titles, sentence ids and
+text, but no answers, gold support ids, or `supporting` labels. The separate host-owned manifest contains hidden
+answers/support ids and is the only artifact passed to deterministic scoring. Do not expose the manifest to the
+agent or import it into the treatment graph. The execution file shown above is for zero-rollout adapter smoke
+only; a real experiment must replace it with the actual model, harness, arm and trial fingerprints.
+
 ### Procedural transfer
 
 Create intent-template families from coding tasks: one instance per template is `online` (insert+retrieve),

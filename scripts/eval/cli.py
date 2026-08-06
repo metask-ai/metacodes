@@ -50,6 +50,14 @@ if __package__ in {None, ""}:
         summarize_memory,
         write_memory_rows,
     )
+    from scripts.eval.memory_hotpot_adapter import (  # type: ignore
+        OFFICIAL_SOURCE_REVISION,
+        OFFICIAL_SOURCE_URL,
+        adapt_hotpot,
+        artifact_bytes as memory_adapter_artifact_bytes,
+        load_execution as load_memory_execution,
+        load_source_policy as load_hotpot_source_policy,
+    )
     from scripts.eval.memory_replay import (  # type: ignore
         load_manifest as load_memory_manifest,
         load_observations as load_memory_observations,
@@ -98,6 +106,14 @@ else:
         render_memory_markdown,
         summarize_memory,
         write_memory_rows,
+    )
+    from .memory_hotpot_adapter import (
+        OFFICIAL_SOURCE_REVISION,
+        OFFICIAL_SOURCE_URL,
+        adapt_hotpot,
+        artifact_bytes as memory_adapter_artifact_bytes,
+        load_execution as load_memory_execution,
+        load_source_policy as load_hotpot_source_policy,
     )
     from .memory_replay import (
         load_manifest as load_memory_manifest,
@@ -220,6 +236,58 @@ def cmd_replay_memory(args: argparse.Namespace) -> int:
     print(
         f"memory replay complete: rows={len(rows)} "
         f"manifest={hashlib.sha256(stable_json(manifest).encode('utf-8')).hexdigest()[:16]}"
+    )
+    return 0
+
+
+def cmd_adapt_hotpot_memory(args: argparse.Namespace) -> int:
+    input_paths = {
+        Path(args.source).resolve(),
+        Path(args.execution).resolve(),
+    }
+    if args.source_policy:
+        input_paths.add(Path(args.source_policy).resolve())
+    output_paths = {
+        Path(args.output_source).resolve(),
+        Path(args.output_manifest).resolve(),
+    }
+    if len(output_paths) != 2:
+        raise ValidationError("HotpotQA adapter output paths must be distinct")
+    overlap = input_paths.intersection(output_paths)
+    if overlap:
+        raise ValidationError(
+            "HotpotQA adapter output would overwrite an input artifact: "
+            f"{sorted(map(str, overlap))}"
+        )
+    execution = load_memory_execution(Path(args.execution))
+    source_policy = (
+        load_hotpot_source_policy(Path(args.source_policy))
+        if args.source_policy
+        else None
+    )
+    source_slice, manifest = adapt_hotpot(
+        Path(args.source),
+        execution,
+        expected_source_sha256=args.expected_source_sha256,
+        limit=args.limit,
+        split_seed=args.split_seed,
+        source_url=args.source_url,
+        source_revision=args.source_revision,
+        source_policy=source_policy,
+    )
+    _write(
+        args.output_source,
+        memory_adapter_artifact_bytes(source_slice).decode("utf-8"),
+    )
+    _write(
+        args.output_manifest,
+        memory_adapter_artifact_bytes(manifest).decode("utf-8"),
+    )
+    print(
+        "HotpotQA memory adapter complete: "
+        f"cases={len(manifest['cases'])} "
+        f"source={manifest['dataset']['source_sha256'][:16]} "
+        f"upstream={source_slice['upstream']['source_sha256'][:16]}"
     )
     return 0
 
@@ -871,6 +939,28 @@ def parser() -> argparse.ArgumentParser:
     memory_report_parser.add_argument("--markdown")
     memory_report_parser.add_argument("--json")
     memory_report_parser.set_defaults(func=cmd_report_memory)
+
+    hotpot_adapter_parser = commands.add_parser(
+        "adapt-hotpot-memory",
+        help="freeze a pinned HotpotQA distractor subset and replay manifest",
+    )
+    hotpot_adapter_parser.add_argument("--source", required=True)
+    hotpot_adapter_parser.add_argument("--expected-source-sha256", required=True)
+    hotpot_adapter_parser.add_argument("--execution", required=True)
+    hotpot_adapter_parser.add_argument(
+        "--source-policy",
+        help="source-SHA-bound quarantine policy for known upstream annotation defects",
+    )
+    hotpot_adapter_parser.add_argument("--output-source", required=True)
+    hotpot_adapter_parser.add_argument("--output-manifest", required=True)
+    hotpot_adapter_parser.add_argument("--limit", type=int, default=1000)
+    hotpot_adapter_parser.add_argument("--split-seed", type=int, default=20260806)
+    hotpot_adapter_parser.add_argument("--source-url", default=OFFICIAL_SOURCE_URL)
+    hotpot_adapter_parser.add_argument(
+        "--source-revision",
+        default=OFFICIAL_SOURCE_REVISION,
+    )
+    hotpot_adapter_parser.set_defaults(func=cmd_adapt_hotpot_memory)
 
     memory_replay_parser = commands.add_parser(
         "replay-memory",
