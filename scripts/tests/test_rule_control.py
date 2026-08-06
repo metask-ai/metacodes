@@ -1155,6 +1155,8 @@ class FeedbackExecutionTests(unittest.TestCase):
         )
         self.assertFalse(passed)
         self.assertEqual(7, results[0]["exit_code"])
+        self.assertIsInstance(results[0]["elapsed_ns"], int)
+        self.assertGreater(results[0]["elapsed_ns"], 0)
 
 
 class LeanSourceAuditTests(unittest.TestCase):

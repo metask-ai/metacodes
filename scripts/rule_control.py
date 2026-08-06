@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, Iterable, Sequence
 
 
@@ -2619,6 +2620,7 @@ def run_feedback(repo: Path, feedback: dict[str, Any]) -> tuple[bool, list[dict[
     env["METACODES_RULE_CONTROL"] = "1"
     for raw in commands:
         command = normalize_command(raw)
+        started_ns = time.monotonic_ns()
         try:
             result = subprocess.run(
                 command,
@@ -2630,6 +2632,7 @@ def run_feedback(repo: Path, feedback: dict[str, Any]) -> tuple[bool, list[dict[
                 timeout=timeout,
             )
             output = result.stdout or ""
+            elapsed_ns = time.monotonic_ns() - started_ns
             skipped = sum(int(value) for value in NONZERO_SKIP_RE.findall(output))
             skipped += sum(int(value) for value in UNITTEST_SKIP_RE.findall(output))
             passed = result.returncode == 0 and skipped == 0
@@ -2637,17 +2640,20 @@ def run_feedback(repo: Path, feedback: dict[str, Any]) -> tuple[bool, list[dict[
                 {
                     "command": raw,
                     "exit_code": result.returncode,
+                    "elapsed_ns": elapsed_ns,
                     "skipped_tests": skipped,
                     "passed": passed,
                     "output_tail": output[-12000:],
                 }
             )
         except subprocess.TimeoutExpired as exc:
+            elapsed_ns = time.monotonic_ns() - started_ns
             passed = False
             results.append(
                 {
                     "command": raw,
                     "exit_code": None,
+                    "elapsed_ns": elapsed_ns,
                     "skipped_tests": 0,
                     "passed": False,
                     "error": f"feedback timed out after {timeout}s",
