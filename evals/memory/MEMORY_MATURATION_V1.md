@@ -64,6 +64,8 @@ text, but no answers, gold support ids, or `supporting` labels. The separate hos
 answers/support ids and is the only artifact passed to deterministic scoring. Do not expose the manifest to the
 agent or import it into the treatment graph. The execution file shown above is for zero-rollout adapter smoke
 only; a real experiment must replace it with the actual model, harness, arm and trial fingerprints.
+The checked-in `pins/hotpotqa-dev-distractor-1000-pin.json` records the mirror distribution, conversion,
+quarantine, ordered sample and generated artifact hashes without redistributing benchmark questions or answers.
 
 ### Procedural transfer
 
