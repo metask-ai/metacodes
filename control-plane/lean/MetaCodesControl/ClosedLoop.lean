@@ -88,6 +88,26 @@ def executionProjectionReleaseAllowed
     (topology : Topology) (observation : Observation) : Bool :=
   executionProjectionSignal topology observation == .admitRelease
 
+/-- The build/test throughput slice has five non-substitutable obligations:
+per-test diagnostics, deterministic sharding, fail-closed aggregation, exact
+source inventory, and explicit fast/full build paths.  Fixing the cardinality
+here prevents a weakened repository sensor from calling its surviving subset
+complete after an optimization silently removes a coverage guard. -/
+def buildTestSignal
+    (topology : Topology) (observation : Observation) : Signal :=
+  if observation.declared == 5 then signal topology observation else .blockRelease
+
+def buildTestNextState
+    (topology : Topology) (observation : Observation) : RuleState :=
+  match buildTestSignal topology observation with
+  | .blockRelease => .blocked
+  | .runFeedback => .verifying
+  | .admitRelease => .compliant
+
+def buildTestReleaseAllowed
+    (topology : Topology) (observation : Observation) : Bool :=
+  buildTestSignal topology observation == .admitRelease
+
 /-- An admitted rule can never be a formalization orphan. -/
 theorem admitted_implies_closed_loop
     (topology : Topology) (observation : Observation)
@@ -155,6 +175,37 @@ theorem execution_projection_wrong_cardinality_blocks
     (wrong : observation.declared ≠ 3) :
     executionProjectionSignal topology observation = .blockRelease := by
   simp [executionProjectionSignal, wrong]
+
+/-- Admission proves that all five throughput-integrity obligations were
+observed and survived real test feedback; wall-clock speed alone is never a
+substitute for coverage or leak/failure semantics. -/
+theorem build_test_admitted_implies_five_obligations
+    (topology : Topology) (observation : Observation)
+    (admitted : buildTestReleaseAllowed topology observation = true) :
+    observation.declared = 5 ∧ observation.covered = 5 := by
+  simp [buildTestReleaseAllowed, buildTestSignal] at admitted
+  split at admitted
+  · rename_i declaredFive
+    have genericAdmitted : releaseAllowed topology observation = true := by
+      simpa [releaseAllowed] using admitted
+    have exact := admitted_implies_zero_deviation topology observation genericAdmitted
+    omega
+  · simp at admitted
+
+theorem build_test_missing_obligation_blocks
+    (topology : Topology) (observation : Observation)
+    (declaresFive : observation.declared = 5)
+    (missing : observation.covered < 5) :
+    buildTestSignal topology observation = .blockRelease := by
+  simp [buildTestSignal, declaresFive]
+  apply missing_evidence_blocks topology observation
+  omega
+
+theorem build_test_wrong_cardinality_blocks
+    (topology : Topology) (observation : Observation)
+    (wrong : observation.declared ≠ 5) :
+    buildTestSignal topology observation = .blockRelease := by
+  simp [buildTestSignal, wrong]
 
 /-- A theorem with any missing loop link cannot reach the compliant state. -/
 theorem orphan_cannot_be_compliant

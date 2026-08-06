@@ -91,6 +91,37 @@ that admission entails coverage of all three. The actual runtime kernel is
 feedback; the controller rejects substituting the generic kernel for this
 rule. A manifest or prompt cannot manufacture an observed execution fact.
 
+`build.test-throughput-integrity.l2` is the build/test slice. It keeps performance
+work inside the same feedback discipline without pretending that a theorem can
+predict host wall time. Zig and the operating system measure wall/CPU/RSS;
+Lean decides whether the measurement came from an admissible test topology.
+Its five fixed obligations are:
+
+- a diagnostic runner reports every compiled test, slow buckets/top-N, total
+  time, failures, skips, and allocator leaks with checked duration arithmetic;
+- deterministic process shards reset per-test allocator/I/O state and carry a
+  versioned name partition plus full/selected commutative fingerprints;
+  captured reports are explicitly side-effecting so a later gate cannot reuse
+  an earlier successful execution from Zig's build cache;
+- the aggregate verifier rejects duplicate/missing shards, count drift,
+  fingerprint drift, failures, leaks, malformed time, and arithmetic overflow;
+- component/integration source inventory is scanned at build-graph creation,
+  every aggregate test is imported exactly once, and the dedicated AgentCore
+  ABI test remains on its independent artifact gate;
+- `dev` installs only Debug for the edit loop; `dev:full` explicitly adds
+  TinyKG without ReleaseSmall, while the monolithic, sharded, timing,
+  negative-harness, and full-test paths remain separately callable.
+
+`buildTestSignal` fixes that surface at 5/5. The sensor also refuses aggregate
+inventory shrinkage below the measured 2026-08-06 baseline of 67 files. Real
+feedback runs the negative shard harness, the four-shard core graph, and the
+single-process aggregate integration graph, then re-observes all test sources.
+A lower elapsed time with missing coverage, hidden failure/leak semantics, a
+changed source graph during measurement, or a weakened 4/4 adapter is blocked.
+Cold and warm measurements must still be labelled separately in experiment
+data; Lean validates the governance facts supplied by sensors, not the
+physical truth of an unobserved cache claim.
+
 ## Commands
 
 From `metacodes/`:

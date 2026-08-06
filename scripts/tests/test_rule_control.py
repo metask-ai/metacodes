@@ -425,7 +425,206 @@ class ExecutionOntologySensorTests(unittest.TestCase):
         self.assertIn("focused_l2_feedback", observation.missing_declarations)
 
 
+class BuildTestThroughputSensorTests(unittest.TestCase):
+    def make_repo(self) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        for directory in ("scripts", "tests/component", "tests/integration"):
+            (root / directory).mkdir(parents=True, exist_ok=True)
+
+        (root / "scripts/time_test_runner.zig").write_text(
+            "const tests = builtin.test_functions;\n"
+            "std.testing.allocator_instance = .{};\n"
+            "std.testing.io_instance = .init();\n"
+            "std.testing.io_instance.deinit();\n"
+            "if (std.testing.allocator_instance.deinit() == .leak) {}\n"
+            "total_ns = std.math.add(u64, total_ns, elapsed_ns);\n"
+            'const a = "test_slow_bucket threshold_ms=";\n'
+            'const b = "test_slow_top rank=";\n'
+            'const c = "passed={} skipped={} failed={} leaked={}";\n'
+            "if (failed != 0 or leaked != 0) std.process.exit(1);\n",
+            encoding="utf-8",
+        )
+        (root / "scripts/sharded_test_runner.zig").write_text(
+            'const a = "METACODES_TEST_SHARD_COUNT METACODES_TEST_SHARD_INDEX";\n'
+            "const fnv1a_offset_basis = 1; const fnv1a_prime = 1;\n"
+            'const partition = "fnv1a64-name-v1";\n'
+            "const shard = hashTestName(name);\n"
+            "var all_fingerprint = Fingerprint{};\n"
+            "var selected_fingerprint = Fingerprint{};\n"
+            'const fields = "selected_xor selected_sum";\n'
+            "std.testing.allocator_instance = .{};\n"
+            "std.testing.io_instance = .init();\n"
+            "std.testing.io_instance.deinit();\n"
+            "if (std.testing.allocator_instance.deinit() == .leak) {}\n"
+            "if (failed != 0 or leaked != 0) std.process.exit(1);\n",
+            encoding="utf-8",
+        )
+        (root / "scripts/sharded_test_reporter.zig").write_text(
+            "const a = error.DuplicateShardReportHeader;\n"
+            "const b = error.DuplicateShardReportSummary;\n"
+            "const c = error.DuplicateShardReport;\n"
+            "const d = error.IncompleteShardSet;\n"
+            "const e = error.IncompleteTestCoverage;\n"
+            "const f = error.IncompleteTestFingerprint;\n"
+            "const n = std.math.add(usize, passed, skipped);\n"
+            "const g = error.FailedShardReportedSuccess;\n"
+            'test "parse report rejects header-summary drift" {}\n'
+            'test "aggregate verifies exact count and commutative fingerprints" {\n'
+            "  try expectError(error.DuplicateShardReport);\n"
+            "  try expectError(error.IncompleteTestFingerprint);\n"
+            "  try expectError(error.FailedShardReportedSuccess);\n"
+            "}\n",
+            encoding="utf-8",
+        )
+
+        imports: list[str] = []
+        for index in range(67):
+            relative = f"component/case_{index:02d}_test.zig"
+            (root / "tests" / relative).write_text('test "fixture" {}\n', encoding="utf-8")
+            imports.append(f'    _ = @import("{relative}");')
+        (root / "tests/component/agentcore_abi_test.zig").write_text(
+            'test "dedicated" {}\n', encoding="utf-8"
+        )
+        (root / "tests/integration_suite.zig").write_text(
+            "test {\n" + "\n".join(imports) + "\n}\n",
+            encoding="utf-8",
+        )
+        (root / "build.zig").write_text(
+            "fn validateAggregateTestInventory(b: *Build) void {\n"
+            '  _ = "tests/component"; _ = "tests/integration"; _ = "_test.zig";\n'
+            "}\n"
+            "validateAggregateTestInventory(b);\n"
+            'const abi = "agentcore_abi_test.zig";\n'
+            'const agentcore_test_step = b.step("agentcore:test", "fixture");\n'
+            'const dev_step = b.step("dev", "fixture");\n'
+            "dev_step.dependOn(&install_debug.step);\n"
+            'const dev_full_step = b.step("dev:full", "fixture");\n'
+            "dev_full_step.dependOn(&install_debug.step);\n"
+            "dev_full_step.dependOn(vendor_tinykg_step);\n"
+            'const core_test_step = b.step("test:lib", "fixture");\n'
+            'const core_test_monolithic_step = b.step("test:lib-monolithic", "fixture");\n'
+            'const core_test_times_step = b.step("test:lib-times", "fixture");\n'
+            'const core_shard_harness_step = b.step("test:lib-shard-harness", "fixture");\n'
+            'const integration_monolithic_step = b.step("test:integration-monolithic", "fixture");\n'
+            'const integration_times_step = b.step("test:integration-times", "fixture");\n'
+            'const suite = b.path("tests/integration_suite.zig");\n'
+            "const run_integration_reporter = true;\n"
+            "run_shard.has_side_effects = true;\n"
+            "run_shard.has_side_effects = true;\n"
+            "test_step.dependOn(spike_step);\n"
+            'const lib_arg = "lib-test-shards";\n'
+            'const integration_arg = "integration-test-shards";\n'
+            'const shard_bound = "must be between 1 and 64";\n'
+            "const lib_default = value orelse 4;\n"
+            "const integration_default = value orelse 8;\n",
+            encoding="utf-8",
+        )
+        return temporary, root
+
+    def test_all_five_integrity_obligations_are_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        observation = rule_control.observe_build_test_throughput(root)
+        self.assertTrue(observation.sensor_ok, observation.errors)
+        self.assertEqual(5, observation.declared)
+        self.assertEqual(5, observation.covered)
+        self.assertEqual(
+            ["test:lib-shard-harness", "test:lib", "test:integration-monolithic"],
+            [binding["step"] for binding in observation.feedback_bindings],
+        )
+
+    def test_unfingerprinted_partition_is_not_accepted_as_parallel_coverage(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        runner = root / "scripts/sharded_test_runner.zig"
+        runner.write_text(
+            runner.read_text(encoding="utf-8").replace("selected_sum", "omitted_sum"),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_build_test_throughput(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn("deterministic_process_sharding", observation.missing_declarations)
+
+    def test_aggregate_inventory_omission_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        suite = root / "tests/integration_suite.zig"
+        suite.write_text(
+            suite.read_text(encoding="utf-8").replace(
+                '    _ = @import("component/case_00_test.zig");\n', ""
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_build_test_throughput(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn("aggregate_source_inventory", observation.missing_declarations)
+        self.assertTrue(any("case_00_test.zig" in error for error in observation.errors))
+
+    def test_import_text_outside_an_inventory_statement_is_not_wiring(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        suite = root / "tests/integration_suite.zig"
+        statement = '    _ = @import("component/case_00_test.zig");'
+        suite.write_text(
+            suite.read_text(encoding="utf-8").replace(
+                statement,
+                '    const decoy = "@import(\\\"component/case_00_test.zig\\\")";',
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_build_test_throughput(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn("aggregate_source_inventory", observation.missing_declarations)
+
+    def test_reporter_that_hides_failures_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        reporter = root / "scripts/sharded_test_reporter.zig"
+        reporter.write_text(
+            reporter.read_text(encoding="utf-8").replace(
+                "FailedShardReportedSuccess", "IgnoredShardFailure"
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_build_test_throughput(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn("fail_closed_shard_aggregation", observation.missing_declarations)
+
+    def test_dev_path_cannot_pull_release_artifact_back_into_hot_loop(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        build = root / "build.zig"
+        build.write_text(
+            build.read_text(encoding="utf-8").replace(
+                "dev_step.dependOn(&install_debug.step);",
+                "dev_step.dependOn(&install_debug.step);\ndev_step.dependOn(&exe.step);",
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_build_test_throughput(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn("fast_and_full_build_paths", observation.missing_declarations)
+
+
 class FeedbackExecutionTests(unittest.TestCase):
+    def test_shard_key_value_summary_does_not_impersonate_skipped_feedback(self) -> None:
+        passed, results = rule_control.run_feedback(
+            Path.cwd(),
+            {
+                "commands": [
+                    [
+                        "python",
+                        "-c",
+                        "print('selected=292 passed=291 skipped=1 failed=0 leaked=0')",
+                    ]
+                ],
+                "timeout_seconds": 30,
+            },
+        )
+        self.assertTrue(passed)
+        self.assertEqual(0, results[0]["skipped_tests"])
+
     def test_zero_exit_with_skipped_feedback_fails_closed(self) -> None:
         passed, results = rule_control.run_feedback(
             Path.cwd(),
@@ -434,6 +633,14 @@ class FeedbackExecutionTests(unittest.TestCase):
         self.assertFalse(passed)
         self.assertEqual(1, results[0]["skipped_tests"])
 
+    def test_unittest_skip_summary_fails_closed(self) -> None:
+        passed, results = rule_control.run_feedback(
+            Path.cwd(),
+            {"commands": [["python", "-c", "print('OK (skipped=2)')"]], "timeout_seconds": 30},
+        )
+        self.assertFalse(passed)
+        self.assertEqual(2, results[0]["skipped_tests"])
+
     def test_nonzero_feedback_fails_closed(self) -> None:
         passed, results = rule_control.run_feedback(
             Path.cwd(),
@@ -441,6 +648,25 @@ class FeedbackExecutionTests(unittest.TestCase):
         )
         self.assertFalse(passed)
         self.assertEqual(7, results[0]["exit_code"])
+
+
+class LeanSourceAuditTests(unittest.TestCase):
+    def test_protocol_strings_and_comments_do_not_impersonate_proof_placeholders(self) -> None:
+        source = (
+            'def verdict := "admit"\n'
+            '-- sorry admit axiom\n'
+            '/- axiom hidden : False -/\n'
+            'theorem sound : True := by trivial\n'
+        )
+        self.assertEqual([], rule_control.lean_proof_placeholders(source))
+
+    def test_executable_proof_placeholders_remain_visible(self) -> None:
+        self.assertEqual(
+            ["admit", "axiom", "sorry"],
+            rule_control.lean_proof_placeholders(
+                "axiom escape : False\ntheorem unsound : False := by admit\ntheorem deferred : True := by sorry\n"
+            ),
+        )
 
 
 class TopologyTests(unittest.TestCase):
@@ -547,6 +773,28 @@ class TopologyTests(unittest.TestCase):
             "schema_version": 1,
         }
         rule["decision"]["kernel"] = "MetaCodesControl.ClosedLoop.executionProjectionSignal"
+        topology, errors = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertTrue(topology["decision"], errors)
+        rule["decision"]["kernel"] = "MetaCodesControl.ClosedLoop.signal"
+        weakened, _ = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertFalse(weakened["decision"])
+
+    def test_build_test_rule_requires_its_five_obligation_kernel(self) -> None:
+        rule = self.complete_rule()
+        rule["id"] = "build.test-throughput-integrity.l2"
+        rule["sensor"] = {
+            "adapter": "build_test_throughput",
+            "schema_version": 1,
+        }
+        rule["decision"]["kernel"] = "MetaCodesControl.ClosedLoop.buildTestSignal"
         topology, errors = rule_control.link_topology(
             rule,
             counterexamples_ok=True,

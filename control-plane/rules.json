@@ -218,6 +218,87 @@
         "fixture": "control-plane/counterexamples.json",
         "required": true
       }
+    },
+    {
+      "id": "build.test-throughput-integrity.l2",
+      "title": "Build and test throughput improves without losing coverage or failure semantics",
+      "target": {
+        "metric": "build_test_integrity_obligations_minus_observed",
+        "setpoint": 0,
+        "goal": "Per-test diagnostics, deterministic sharding, fail-closed aggregation, exact aggregate inventory, and explicit fast/full build paths remain connected while wall, CPU, RSS, and critical-path measurements are collected as host observations."
+      },
+      "sensor": {
+        "adapter": "build_test_throughput",
+        "schema_version": 1
+      },
+      "decision": {
+        "engine": "lean",
+        "kernel": "MetaCodesControl.ClosedLoop.buildTestSignal",
+        "theorems": [
+          "admitted_implies_closed_loop",
+          "admitted_implies_zero_deviation",
+          "admitted_implies_feedback_passed",
+          "build_test_admitted_implies_five_obligations",
+          "build_test_missing_obligation_blocks",
+          "build_test_wrong_cardinality_blocks",
+          "orphan_cannot_be_compliant",
+          "failed_feedback_blocks",
+          "sensor_failure_blocks",
+          "unobserved_actuator_blocks"
+        ]
+      },
+      "actuator": {
+        "kind": "release_gate",
+        "on_violation": "block",
+        "remediation": "Restore exact test inventory, deterministic partition fingerprints, checked aggregate accounting, leak/failure propagation, per-test timing diagnostics, and the separate dev/full build paths. A lower wall time without these obligations is not an admissible optimization.",
+        "observation": {
+          "schema_version": 1,
+          "build_file": "control-plane/build.zig",
+          "build_step": "rule-check",
+          "workflow_file": ".github/workflows/cross-platform.yml",
+          "workflow_job": "rule-control",
+          "workflow_workdir": "metacodes",
+          "telemetry_path": "metacodes/zig-out/reports/rule-control.json"
+        }
+      },
+      "feedback": {
+        "kind": "zig_l2_then_reobserve",
+        "reobserve": true,
+        "timeout_seconds": 600,
+        "commands": [
+          [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.tests.test_rule_control.BuildTestThroughputSensorTests",
+            "scripts.tests.test_rule_control.FeedbackExecutionTests",
+            "-v"
+          ],
+          [
+            "zig",
+            "build",
+            "test:lib-shard-harness",
+            "-j4"
+          ],
+          [
+            "zig",
+            "build",
+            "test:lib",
+            "-Dlib-test-shards=4",
+            "-j4"
+          ],
+          [
+            "zig",
+            "build",
+            "test:integration-monolithic",
+            "-j4"
+          ]
+        ]
+      },
+      "counterexample": {
+        "fixture": "control-plane/counterexamples.json",
+        "required": true
+      }
     }
   ]
 }

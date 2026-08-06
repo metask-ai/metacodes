@@ -3,6 +3,11 @@
   "cases": [
     {
       "id": "closed-loop-pass",
+      "rule_ids": [
+        "declaration.agentdef-task-required.l2",
+        "memory.evidence-freshness-governance.l2",
+        "ontology.execution-grounded-projection.l2"
+      ],
       "topology": {
         "target": true,
         "sensor": true,
@@ -20,6 +25,11 @@
     },
     {
       "id": "missing-l2-evidence-blocks",
+      "rule_ids": [
+        "declaration.agentdef-task-required.l2",
+        "memory.evidence-freshness-governance.l2",
+        "ontology.execution-grounded-projection.l2"
+      ],
       "topology": {
         "target": true,
         "sensor": true,
@@ -37,6 +47,11 @@
     },
     {
       "id": "formalization-orphan-blocks",
+      "rule_ids": [
+        "declaration.agentdef-task-required.l2",
+        "memory.evidence-freshness-governance.l2",
+        "ontology.execution-grounded-projection.l2"
+      ],
       "topology": {
         "target": true,
         "sensor": true,
@@ -54,6 +69,11 @@
     },
     {
       "id": "failed-zig-feedback-blocks",
+      "rule_ids": [
+        "declaration.agentdef-task-required.l2",
+        "memory.evidence-freshness-governance.l2",
+        "ontology.execution-grounded-projection.l2"
+      ],
       "topology": {
         "target": true,
         "sensor": true,
@@ -71,6 +91,11 @@
     },
     {
       "id": "sensor-failure-blocks",
+      "rule_ids": [
+        "declaration.agentdef-task-required.l2",
+        "memory.evidence-freshness-governance.l2",
+        "ontology.execution-grounded-projection.l2"
+      ],
       "topology": {
         "target": true,
         "sensor": true,
@@ -102,6 +127,126 @@
       "sensor_ok": true,
       "declared": 2,
       "covered": 2,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "build-test-closed-loop-pass",
+      "rule_ids": [
+        "build.test-throughput-integrity.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 5,
+      "covered": 5,
+      "feedback_status": "passed",
+      "expected_signal": "admit_release",
+      "expected_state": "compliant"
+    },
+    {
+      "id": "build-test-missing-obligation-blocks",
+      "rule_ids": [
+        "build.test-throughput-integrity.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 5,
+      "covered": 4,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "build-test-formalization-orphan-blocks",
+      "rule_ids": [
+        "build.test-throughput-integrity.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": false,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 5,
+      "covered": 5,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "build-test-failed-feedback-blocks",
+      "rule_ids": [
+        "build.test-throughput-integrity.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 5,
+      "covered": 5,
+      "feedback_status": "failed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "build-test-sensor-failure-blocks",
+      "rule_ids": [
+        "build.test-throughput-integrity.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": false,
+      "declared": 5,
+      "covered": 5,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "build-test-wrong-cardinality-blocks",
+      "rule_ids": [
+        "build.test-throughput-integrity.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 4,
+      "covered": 4,
       "feedback_status": "passed",
       "expected_signal": "block_release",
       "expected_state": "blocked"

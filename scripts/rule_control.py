@@ -23,12 +23,22 @@ DEFAULT_MANIFEST = Path("control-plane/rules.json")
 DEFAULT_REPORT = Path("zig-out/reports/rule-control.json")
 LOOP_LINKS = ("target", "sensor", "decision", "actuator", "feedback", "counterexample")
 SUPPORTED_SENSOR_ADAPTERS = frozenset(
-    ("declaration_l2", "memory_evidence_governance", "execution_ontology_feedback")
+    (
+        "declaration_l2",
+        "memory_evidence_governance",
+        "execution_ontology_feedback",
+        "build_test_throughput",
+    )
 )
 RULE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,127}$")
 FIELD_RE = re.compile(r"^    ([a-z][a-z0-9_]*):", re.MULTILINE)
 STRING_RE = re.compile(r'"([a-zA-Z_][a-zA-Z0-9_]*)"')
-NONZERO_SKIP_RE = re.compile(r"(?<!\d)([1-9][0-9]*)\s+skipped\b", re.IGNORECASE)
+# Match standalone runner summaries such as "1 skipped", but never treat the
+# value of a preceding key/value field as the skip count.  In particular,
+# sharded reports contain "passed=291 skipped=1"; the old expression started
+# at 291 and falsely reported 291 skipped tests.
+NONZERO_SKIP_RE = re.compile(r"(?<![\d=])([1-9][0-9]*)\s+skipped\b", re.IGNORECASE)
+UNITTEST_SKIP_RE = re.compile(r"\bOK\s*\([^)]*\bskipped=([1-9][0-9]*)\b", re.IGNORECASE)
 
 
 class ControlError(RuntimeError):
@@ -933,6 +943,227 @@ def observe_execution_ontology_feedback(repo: Path) -> Observation:
     )
 
 
+def observe_build_test_throughput(repo: Path) -> Observation:
+    """Observe the test-speed control loop without treating speed as proof.
+
+    The sensor governs the mechanisms that make timing evidence trustworthy:
+    exact source inventory, deterministic partitioning, fail-closed aggregate
+    reports, per-test diagnostics, and separate fast/full build paths. Actual
+    wall/CPU/RSS values remain host observations and are recorded by the
+    experiment; Lean decides only whether the integrity obligations survived.
+    """
+
+    declarations = [
+        "per_test_timing_diagnostics",
+        "deterministic_process_sharding",
+        "fail_closed_shard_aggregation",
+        "aggregate_source_inventory",
+        "fast_and_full_build_paths",
+    ]
+    relative_sources = {
+        "timing": "scripts/time_test_runner.zig",
+        "runner": "scripts/sharded_test_runner.zig",
+        "reporter": "scripts/sharded_test_reporter.zig",
+        "suite": "tests/integration_suite.zig",
+        "build": "build.zig",
+    }
+    paths = {name: repo / relative for name, relative in relative_sources.items()}
+    missing_files = [relative_sources[name] for name, path in paths.items() if not path.is_file()]
+    if missing_files:
+        return Observation(
+            sensor="build_test_throughput",
+            declared=len(declarations),
+            declarations=declarations,
+            missing_declarations=declarations,
+            deviation=len(declarations),
+            errors=[f"required throughput-control source is missing: {path}" for path in missing_files],
+            fingerprint_sha256=fingerprint(paths.values()),
+        )
+
+    sources = {name: _strip_zig_comments(read_text(path)) for name, path in paths.items()}
+    timing_checks = {
+        "enumerates compiled tests": "builtin.test_functions" in sources["timing"],
+        "resets allocator per test": "std.testing.allocator_instance = .{}" in sources["timing"],
+        "checks allocator leaks": "std.testing.allocator_instance.deinit() == .leak" in sources["timing"],
+        "checks aggregate duration overflow": "std.math.add(u64, total_ns, elapsed_ns)" in sources["timing"],
+        "reports slow buckets": "test_slow_bucket threshold_ms=" in sources["timing"],
+        "reports top slow tests": "test_slow_top rank=" in sources["timing"],
+        "reports result totals": all(
+            marker in sources["timing"] for marker in ("passed={}", "skipped={}", "failed={}", "leaked={}")
+        ),
+        "fails on test or leak": "if (failed != 0 or leaked != 0) std.process.exit(1)" in sources["timing"],
+    }
+    sharding_checks = {
+        "requires explicit shard identity": all(
+            marker in sources["runner"]
+            for marker in ("METACODES_TEST_SHARD_COUNT", "METACODES_TEST_SHARD_INDEX")
+        ),
+        "uses versioned stable partition": all(
+            marker in sources["runner"]
+            for marker in ("fnv1a_offset_basis", "fnv1a_prime", "fnv1a64-name-v1", "hashTestName(name)")
+        ),
+        "fingerprints all and selected tests": all(
+            marker in sources["runner"]
+            for marker in ("all_fingerprint", "selected_fingerprint", "selected_xor", "selected_sum")
+        ),
+        "resets test state per shard item": all(
+            marker in sources["runner"]
+            for marker in (
+                "std.testing.allocator_instance = .{}",
+                "std.testing.io_instance = .init",
+                "std.testing.io_instance.deinit()",
+                "std.testing.allocator_instance.deinit() == .leak",
+            )
+        ),
+        "fails on test or leak": "if (failed != 0 or leaked != 0) std.process.exit(1)" in sources["runner"],
+    }
+    aggregation_checks = {
+        "rejects duplicate report records": all(
+            marker in sources["reporter"]
+            for marker in ("DuplicateShardReportHeader", "DuplicateShardReportSummary", "DuplicateShardReport")
+        ),
+        "rejects missing shards and test names": all(
+            marker in sources["reporter"]
+            for marker in ("IncompleteShardSet", "IncompleteTestCoverage", "IncompleteTestFingerprint")
+        ),
+        "checks result addition": "std.math.add(usize, passed, skipped)" in sources["reporter"],
+        "rejects failure or leak": "FailedShardReportedSuccess" in sources["reporter"],
+        "has executable negative fixtures": all(
+            marker in sources["reporter"]
+            for marker in (
+                'test "parse report rejects header-summary drift"',
+                'test "aggregate verifies exact count and commutative fingerprints"',
+                "expectError(error.DuplicateShardReport",
+                "expectError(error.IncompleteTestFingerprint",
+                "expectError(error.FailedShardReportedSuccess",
+            )
+        ),
+    }
+
+    tests_root = repo / "tests"
+    discovered = sorted(
+        path.relative_to(tests_root).as_posix()
+        for directory in (tests_root / "component", tests_root / "integration")
+        for path in directory.rglob("*_test.zig")
+        if path.is_file() and not path.is_symlink()
+    )
+    dedicated = {"component/agentcore_abi_test.zig"}
+    aggregate_expected = sorted(set(discovered) - dedicated)
+    # Mirror build.zig's exact executable inventory form. A mention in prose,
+    # a string literal, or a trailing-comment decoy must not count as wiring.
+    imported = re.findall(
+        r'^\s*_\s*=\s*@import\("((?:component|integration)/[^"\n]+_test\.zig)"\);\s*$',
+        sources["suite"],
+        re.MULTILINE,
+    )
+    imported_set = set(imported)
+    inventory_checks = {
+        "does not shrink below measured baseline": len(aggregate_expected) >= 67,
+        "every aggregate test is imported exactly once": (
+            len(imported) == len(imported_set) and imported_set == set(aggregate_expected)
+        ),
+        "dedicated ABI test remains separate": (
+            dedicated.issubset(set(discovered))
+            and dedicated.isdisjoint(imported_set)
+            and "agentcore_abi_test.zig" in sources["build"]
+            and 'b.step("agentcore:test"' in sources["build"]
+        ),
+        "build-time inventory guard executes": all(
+            marker in sources["build"]
+            for marker in (
+                "fn validateAggregateTestInventory",
+                "validateAggregateTestInventory(b);",
+                '"tests/component"',
+                '"tests/integration"',
+                '"_test.zig"',
+            )
+        ),
+    }
+
+    dev_step = build_step_slice(sources["build"], "dev") or ""
+    build_path_checks = {
+        "fast path installs debug only": (
+            "dev_step.dependOn(&install_debug.step)" in dev_step
+            and "dev_step.dependOn(&exe.step)" not in dev_step
+            and "installArtifact(exe)" not in dev_step
+            and "vendor_tinykg_step" not in dev_step
+        ),
+        "full development path explicitly includes TinyKG": (
+            'b.step("dev:full"' in sources["build"]
+            and "dev_full_step.dependOn(&install_debug.step)" in sources["build"]
+            and "dev_full_step.dependOn(vendor_tinykg_step)" in sources["build"]
+        ),
+        "core gates expose sharded monolithic timing and harness paths": all(
+            f'b.step("{step}"' in sources["build"]
+            for step in ("test:lib", "test:lib-monolithic", "test:lib-times", "test:lib-shard-harness")
+        ),
+        "integration gates expose aggregate monolithic and timing paths": all(
+            marker in sources["build"]
+            for marker in (
+                'b.path("tests/integration_suite.zig")',
+                'b.step("test:integration-monolithic"',
+                'b.step("test:integration-times"',
+                "run_integration_reporter",
+            )
+        ),
+        "full test includes aggregate suite": "test_step.dependOn(spike_step)" in sources["build"],
+        "captured shard reports never cache test execution": (
+            sources["build"].count("run_shard.has_side_effects = true") >= 2
+        ),
+        "default shard counts are bounded": all(
+            marker in sources["build"]
+            for marker in (
+                '"lib-test-shards"',
+                "orelse 4",
+                '"integration-test-shards"',
+                "orelse 8",
+                "must be between 1 and 64",
+            )
+        ),
+    }
+
+    obligations = {
+        declarations[0]: timing_checks,
+        declarations[1]: sharding_checks,
+        declarations[2]: aggregation_checks,
+        declarations[3]: inventory_checks,
+        declarations[4]: build_path_checks,
+    }
+    covered = [name for name, checks in obligations.items() if all(checks.values())]
+    missing = [name for name in declarations if name not in covered]
+    errors: list[str] = []
+    for obligation, checks in obligations.items():
+        absent = [name for name, present in checks.items() if not present]
+        if absent:
+            errors.append(f"{obligation}: missing {', '.join(absent)}")
+    if imported_set != set(aggregate_expected):
+        omitted = sorted(set(aggregate_expected) - imported_set)
+        surplus = sorted(imported_set - set(aggregate_expected))
+        if omitted:
+            errors.append(f"aggregate_source_inventory: omitted tests: {', '.join(omitted)}")
+        if surplus:
+            errors.append(f"aggregate_source_inventory: stale imports: {', '.join(surplus)}")
+
+    touched = list(paths.values()) + [tests_root / path for path in discovered]
+    return Observation(
+        sensor="build_test_throughput",
+        sensor_ok=not errors and len(covered) == len(declarations),
+        declared=len(declarations),
+        covered=len(covered),
+        deviation=max(len(declarations) - len(covered), 0),
+        declarations=declarations,
+        covered_declarations=covered,
+        missing_declarations=missing,
+        feedback_bindings=[
+            {"step": "test:lib-shard-harness", "filter": ""},
+            {"step": "test:lib", "filter": ""},
+            {"step": "test:integration-monolithic", "filter": ""},
+        ],
+        errors=errors,
+        fingerprint_sha256=fingerprint(touched),
+    )
+
+
 def observe_rule(repo: Path, rule: dict[str, Any]) -> Observation:
     sensor = rule.get("sensor")
     if not isinstance(sensor, dict):
@@ -951,6 +1182,8 @@ def observe_rule(repo: Path, rule: dict[str, Any]) -> Observation:
         return observe_memory_evidence_governance(repo)
     if adapter == "execution_ontology_feedback":
         return observe_execution_ontology_feedback(repo)
+    if adapter == "build_test_throughput":
+        return observe_build_test_throughput(repo)
     return Observation(sensor=str(adapter), errors=[f"unsupported sensor adapter: {adapter!r}"])
 
 
@@ -968,9 +1201,16 @@ def executable(name: str, env_name: str | None = None) -> str:
     raise ControlError(f"required executable is unavailable: {name}")
 
 
-def strip_lean_comments(source: str) -> str:
+def strip_lean_noncode(source: str) -> str:
     source = re.sub(r"/-.*?-/", "", source, flags=re.DOTALL)
-    return re.sub(r"--.*$", "", source, flags=re.MULTILINE)
+    source = re.sub(r"--.*$", "", source, flags=re.MULTILINE)
+    # Protocol payloads legitimately contain strings such as "admit". The
+    # audit governs Lean code tokens, not data rendered by that code.
+    return re.sub(r'"(?:\\.|[^"\\])*"', '""', source)
+
+
+def lean_proof_placeholders(source: str) -> list[str]:
+    return sorted(set(re.findall(r"\b(?:sorry|admit|axiom)\b", strip_lean_noncode(source))))
 
 
 class LeanKernel:
@@ -984,8 +1224,8 @@ class LeanKernel:
 
     def verify_sources(self, theorem_names: Sequence[str]) -> dict[str, str]:
         combined = "\n".join(read_text(path) for path in self.source_paths)
-        stripped = strip_lean_comments(combined)
-        forbidden = sorted(set(re.findall(r"\b(?:sorry|admit|axiom)\b", stripped)))
+        stripped = strip_lean_noncode(combined)
+        forbidden = lean_proof_placeholders(combined)
         if forbidden:
             raise ControlError(f"Lean proof placeholders are forbidden: {', '.join(forbidden)}")
         missing = [name for name in theorem_names if f"theorem {name}" not in stripped]
@@ -1083,11 +1323,14 @@ def link_topology(
         )
     )
     decision = rule.get("decision")
-    expected_kernel = (
-        "MetaCodesControl.ClosedLoop.executionProjectionSignal"
-        if rule.get("id") == "ontology.execution-grounded-projection.l2"
-        else "MetaCodesControl.ClosedLoop.signal"
-    )
+    expected_kernel = {
+        "ontology.execution-grounded-projection.l2": (
+            "MetaCodesControl.ClosedLoop.executionProjectionSignal"
+        ),
+        "build.test-throughput-integrity.l2": (
+            "MetaCodesControl.ClosedLoop.buildTestSignal"
+        ),
+    }.get(rule.get("id"), "MetaCodesControl.ClosedLoop.signal")
     decision_ok = (
         isinstance(decision, dict)
         and decision.get("engine") == "lean"
@@ -1329,6 +1572,7 @@ def run_feedback(repo: Path, feedback: dict[str, Any]) -> tuple[bool, list[dict[
             )
             output = result.stdout or ""
             skipped = sum(int(value) for value in NONZERO_SKIP_RE.findall(output))
+            skipped += sum(int(value) for value in UNITTEST_SKIP_RE.findall(output))
             passed = result.returncode == 0 and skipped == 0
             results.append(
                 {
