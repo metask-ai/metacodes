@@ -63,21 +63,28 @@ def main (args : List String) : IO UInt32 := do
             sensorOk, declared, covered, feedback := feedbackStatus
           }
           let executionOntologyRule := ruleId == "ontology.execution-grounded-projection.l2"
+          let experienceFeedbackRule := ruleId == "ontology.experience-feedback.l2"
           let buildTestRule := ruleId == "build.test-throughput-integrity.l2"
           let controlSignal := if buildTestRule then
             buildTestSignal topology observation
+          else if experienceFeedbackRule then
+            experienceFeedbackSignal topology observation
           else if executionOntologyRule then
             executionProjectionSignal topology observation
           else
             signal topology observation
           let state := if buildTestRule then
             buildTestNextState topology observation
+          else if experienceFeedbackRule then
+            experienceFeedbackNextState topology observation
           else if executionOntologyRule then
             executionProjectionNextState topology observation
           else
             nextState topology observation
           let allowed := if buildTestRule then
             buildTestReleaseAllowed topology observation
+          else if experienceFeedbackRule then
+            experienceFeedbackReleaseAllowed topology observation
           else if executionOntologyRule then
             executionProjectionReleaseAllowed topology observation
           else

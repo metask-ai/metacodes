@@ -88,6 +88,26 @@ def executionProjectionReleaseAllowed
     (topology : Topology) (observation : Observation) : Bool :=
   executionProjectionSignal topology observation == .admitRelease
 
+/-- The experience-feedback slice has five non-substitutable runtime links:
+task-only exact retrieval, lifecycle/evidence governance, pre-work result
+actuation, the model-side bounded semantic-expansion contract required by a
+non-vector store, and focused real-TinyKG/provider feedback. A weakened adapter
+cannot redefine 4/4 as success after silently removing one of them. -/
+def experienceFeedbackSignal
+    (topology : Topology) (observation : Observation) : Signal :=
+  if observation.declared == 5 then signal topology observation else .blockRelease
+
+def experienceFeedbackNextState
+    (topology : Topology) (observation : Observation) : RuleState :=
+  match experienceFeedbackSignal topology observation with
+  | .blockRelease => .blocked
+  | .runFeedback => .verifying
+  | .admitRelease => .compliant
+
+def experienceFeedbackReleaseAllowed
+    (topology : Topology) (observation : Observation) : Bool :=
+  experienceFeedbackSignal topology observation == .admitRelease
+
 /-- The build/test throughput slice has five non-substitutable obligations:
 per-test diagnostics, deterministic sharding, fail-closed aggregation, exact
 source inventory, and explicit fast/full build paths.  Fixing the cardinality
@@ -175,6 +195,37 @@ theorem execution_projection_wrong_cardinality_blocks
     (wrong : observation.declared ≠ 3) :
     executionProjectionSignal topology observation = .blockRelease := by
   simp [executionProjectionSignal, wrong]
+
+/-- Admission of historical execution feedback proves that all five observed
+links are still present, not merely that the surviving subset is internally
+consistent. -/
+theorem experience_feedback_admitted_implies_five_obligations
+    (topology : Topology) (observation : Observation)
+    (admitted : experienceFeedbackReleaseAllowed topology observation = true) :
+    observation.declared = 5 ∧ observation.covered = 5 := by
+  simp [experienceFeedbackReleaseAllowed, experienceFeedbackSignal] at admitted
+  split at admitted
+  · rename_i declaredFive
+    have genericAdmitted : releaseAllowed topology observation = true := by
+      simpa [releaseAllowed] using admitted
+    have exact := admitted_implies_zero_deviation topology observation genericAdmitted
+    omega
+  · simp at admitted
+
+theorem experience_feedback_missing_obligation_blocks
+    (topology : Topology) (observation : Observation)
+    (declaresFive : observation.declared = 5)
+    (missing : observation.covered < 5) :
+    experienceFeedbackSignal topology observation = .blockRelease := by
+  simp [experienceFeedbackSignal, declaresFive]
+  apply missing_evidence_blocks topology observation
+  omega
+
+theorem experience_feedback_wrong_cardinality_blocks
+    (topology : Topology) (observation : Observation)
+    (wrong : observation.declared ≠ 5) :
+    experienceFeedbackSignal topology observation = .blockRelease := by
+  simp [experienceFeedbackSignal, wrong]
 
 /-- Admission proves that all five throughput-integrity obligations were
 observed and survived real test feedback; wall-clock speed alone is never a

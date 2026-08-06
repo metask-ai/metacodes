@@ -1261,11 +1261,30 @@ pub const KgClient = struct {
         return self.recallTyped(query, limit, include_tasks, null);
     }
 
+    /// Retrieve only task nodes.  Experience feedback cannot rely on the
+    /// ordinary mixed-kind result window: a dense set of decisions/concepts
+    /// may otherwise crowd every completed task out before client filtering.
+    /// The kind restriction is pushed into TinyKG's text-search plan.
+    pub fn recallTasks(self: *KgClient, query: []const u8, limit: usize) KgError![]RecallHit {
+        return self.recallFiltered(query, limit, true, null, "task");
+    }
+
     /// type_filter 非 null 时按 schema_type 过滤(typed recall)。
     /// **best-effort 契约(Linus HIGH-2)**:BM25 按相关度排序不按类型,稀有类型可能全排在超采窗口外
     /// → 库里有该类型却返空。拉高超采倍数缓解,但不保证:typed recall 可能少返相关度低的同类节点。
     /// 正解是 tinykg server-side --schema-type 下推(本切片 defer)。空返 ≠ 库中无该类型。
     pub fn recallTyped(self: *KgClient, query: []const u8, limit: usize, include_tasks: bool, type_filter: ?[]const u8) KgError![]RecallHit {
+        return self.recallFiltered(query, limit, include_tasks, type_filter, null);
+    }
+
+    fn recallFiltered(
+        self: *KgClient,
+        query: []const u8,
+        limit: usize,
+        include_tasks: bool,
+        type_filter: ?[]const u8,
+        kind_filter: ?[]const u8,
+    ) KgError![]RecallHit {
         // project-containment 召回:项目子树 + global 子树各一次 search --project(图拓扑隔离,
         // 取代旧 domain_id 属性客户端过滤)。读路径不创建 project 节点:两个子树都不存在
         // (库中无任何挂接记忆)→ 零 spawn 返空。
@@ -1276,10 +1295,10 @@ pub const KgClient = struct {
         }
         const proj_id = try self.projectNodeId(false, false);
         const glob_id = try self.projectNodeId(true, false);
-        if (proj_id) |pid| try self.searchSubtreeInto(&results, pid, self.domain, query, limit, include_tasks, type_filter);
+        if (proj_id) |pid| try self.searchSubtreeInto(&results, pid, self.domain, query, limit, include_tasks, type_filter, kind_filter);
         if (glob_id) |gid| {
             if (proj_id == null or gid != proj_id.?) // domain=="global" 时两者同节点,防重扫
-                try self.searchSubtreeInto(&results, gid, "global", query, limit, include_tasks, type_filter);
+                try self.searchSubtreeInto(&results, gid, "global", query, limit, include_tasks, type_filter, kind_filter);
         }
         // 两路合并:按 BM25 分数降序(同库同查询,分数可比),截 limit。
         std.mem.sort(RecallHit, results.items, {}, recallHitScoreDescLessThan);
@@ -1306,6 +1325,7 @@ pub const KgClient = struct {
         limit: usize,
         include_tasks: bool,
         type_filter: ?[]const u8,
+        kind_filter: ?[]const u8,
     ) KgError!void {
         var limbuf: [16]u8 = undefined;
         var pbuf: [24]u8 = undefined;
@@ -1321,6 +1341,7 @@ pub const KgClient = struct {
             "--profile", "agent-memory",  "--format", "json",      "--include-text",
         }) catch return KgError.OutOfMemory;
         if (type_filter) |tf| argv.appendSlice(self.allocator, &.{ "--schema-type", tf }) catch return KgError.OutOfMemory;
+        if (kind_filter) |kind| argv.appendSlice(self.allocator, &.{ "--kind", kind }) catch return KgError.OutOfMemory;
         const out = try self.runChecked(argv.items);
         defer self.freeOut(out);
 
@@ -1338,6 +1359,10 @@ pub const KgClient = struct {
             const node = node_v.object;
 
             const kind = jsonStr(node.get("kind")) orelse continue;
+            // Treat the server-side filter as a contract, not as permission to
+            // trust malformed output from a skewed TinyKG binary.
+            if (kind_filter) |expected_kind|
+                if (!std.mem.eql(u8, kind, expected_kind)) continue;
             const schema_v = node.get("schema");
             const schema_type = if (schema_v != null and schema_v.? == .object)
                 (jsonStr(schema_v.?.object.get("schema_type")) orelse "")

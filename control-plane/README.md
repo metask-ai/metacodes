@@ -91,6 +91,38 @@ that admission entails coverage of all three. The actual runtime kernel is
 feedback; the controller rejects substituting the generic kernel for this
 rule. A manifest or prompt cannot manufacture an observed execution fact.
 
+`ontology.experience-feedback.l2` is the fourth slice and closes the read side
+of that ontology loop. It fixes five non-substitutable obligations:
+
+- the claimed task text drives one bounded exact BM25 probe with `kind=task`
+  pushed into TinyKG before truncation; this is
+  explicitly lexical, and an empty result is not treated as proof of absence;
+- only current-generation completed tasks with current verification evidence
+  and untruncated task/neighbor packets can contribute associations, while
+  tentative and confirmed edge states remain distinct;
+- the packet is appended at the unified successful `TaskUpdate` result boundary
+  after claim, and again when `TaskGet` recovers a claimed task after restart or
+  compaction, before the next model request can perform work;
+- because TinyKG has no vector search, the system and task contracts require the
+  model to derive at most 2-4 separate semantic variants when the exact probe is
+  insufficient, deduplicate node ids, and treat recalled text as untrusted data;
+- `test:kg-experience-feedback` drives a real TinyKG process and proves that a
+  verified completed task enters the new claim result, while an unfinished
+  lexically close decoy is rejected, then proves the packet is serialized into
+  the next provider request while bounded paper telemetry is emitted.
+
+The adapter derives these obligations from fixed production paths after
+stripping comments. Its negative fixtures remove the retrieval source, weaken
+the lifecycle/evidence gate, disconnect the tool-result actuator, remove the
+semantic-expansion contract, leave the same words only in comments, and remove
+focused build wiring. Lean fixes this slice at five obligations through
+`experienceFeedbackSignal`; even a self-consistent weakened 4/4 sensor is
+blocked, and the controller rejects the
+generic three-obligation kernel for this rule. This proves that persisted
+ontology edges reach a later decision surface; it does not claim that a
+candidate changed the model's chosen action or improved task quality, which
+requires controlled rollout evidence.
+
 `build.test-throughput-integrity.l2` is the build/test slice. It keeps performance
 work inside the same feedback discipline without pretending that a theorem can
 predict host wall time. Zig and the operating system measure wall/CPU/RSS;

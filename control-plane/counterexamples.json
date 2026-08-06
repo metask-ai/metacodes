@@ -132,6 +132,126 @@
       "expected_state": "blocked"
     },
     {
+      "id": "experience-feedback-closed-loop-pass",
+      "rule_ids": [
+        "ontology.experience-feedback.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 5,
+      "covered": 5,
+      "feedback_status": "passed",
+      "expected_signal": "admit_release",
+      "expected_state": "compliant"
+    },
+    {
+      "id": "experience-feedback-missing-obligation-blocks",
+      "rule_ids": [
+        "ontology.experience-feedback.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 5,
+      "covered": 4,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "experience-feedback-formalization-orphan-blocks",
+      "rule_ids": [
+        "ontology.experience-feedback.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": false,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 5,
+      "covered": 5,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "experience-feedback-failed-feedback-blocks",
+      "rule_ids": [
+        "ontology.experience-feedback.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 5,
+      "covered": 5,
+      "feedback_status": "failed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "experience-feedback-sensor-failure-blocks",
+      "rule_ids": [
+        "ontology.experience-feedback.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": false,
+      "declared": 5,
+      "covered": 5,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "experience-feedback-wrong-cardinality-blocks",
+      "rule_ids": [
+        "ontology.experience-feedback.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 4,
+      "covered": 4,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
       "id": "build-test-closed-loop-pass",
       "rule_ids": [
         "build.test-throughput-integrity.l2"

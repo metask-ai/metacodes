@@ -232,11 +232,34 @@ pub fn executeOne(
         .ok => {},
     }
     const ok_bytes = r.ok;
+    // A successful persistent-task claim is the first decision point for that
+    // task. Feed verified, execution-grounded history back through the same
+    // tool result before the next model request. The adapter is deliberately
+    // best-effort at this outer boundary: protocol/retrieval failures are
+    // encoded as an explicit unavailable packet, while an unexpected adapter
+    // bug must not hide a lease the model already acquired.
+    const experience_packet = @import("../kg/experience_packet.zig");
+    const experience_bytes = experience_packet.enrichClaimResult(
+        job_ctx.allocator,
+        job_ctx.kg,
+        name,
+        input,
+        ok_bytes,
+    ) catch |err| blk: {
+        log.warnId("kg", rid, "experience packet enrichment failed: {s}", .{@errorName(err)});
+        break :blk experience_packet.unavailableClaimResult(
+            job_ctx.allocator,
+            name,
+            input,
+            ok_bytes,
+        ) catch null;
+    };
+    const result_bytes = experience_bytes orelse ok_bytes;
     // dispatch 结果在 arena 里 → dupe 到父 allocator 逃逸。落盘必须延迟到
     // executeSlots 确认整批无 fatal 之后，否则 fatal 会留下无人引用的 transient 文件。
-    const content = try parent_allocator.dupe(u8, ok_bytes);
+    const content = try parent_allocator.dupe(u8, result_bytes);
     const elapsed: u64 = @intCast(@max(util_time.nowMs() - t_start, 0));
-    log.infoId("agent", rid, "tool.exec done(par) name={s} output_bytes={d} duration_ms={d}", .{ name, ok_bytes.len, elapsed });
+    log.infoId("agent", rid, "tool.exec done(par) name={s} output_bytes={d} duration_ms={d}", .{ name, result_bytes.len, elapsed });
     return .{ .done = .{ .content = content, .is_error = false, .elapsed_ms = elapsed } };
 }
 

@@ -27,6 +27,7 @@ SUPPORTED_SENSOR_ADAPTERS = frozenset(
         "declaration_l2",
         "memory_evidence_governance",
         "execution_ontology_feedback",
+        "experience_feedback",
         "build_test_throughput",
     )
 )
@@ -943,6 +944,267 @@ def observe_execution_ontology_feedback(repo: Path) -> Observation:
     )
 
 
+def observe_experience_feedback(repo: Path) -> Observation:
+    """Observe prior execution retrieval -> governed pre-work decision feedback."""
+    source_relatives = {
+        "experience": "src/kg/experience_packet.zig",
+        "client": "src/kg/client.zig",
+        "retrieval_protocol": "src/kg/retrieval_protocol.zig",
+        "tool_exec": "src/core/tool_exec.zig",
+        "task_protocol": "src/kg/task_protocol.zig",
+        "test": "tests/component/kg_integration_test.zig",
+        "build": "build.zig",
+    }
+    paths: dict[str, Path] = {}
+    touched: list[Path] = []
+    errors: list[str] = []
+    for name, relative in source_relatives.items():
+        try:
+            path = safe_repo_path(repo, relative)
+            paths[name] = path
+            touched.append(path)
+        except ControlError as exc:
+            errors.append(str(exc))
+    if errors:
+        return Observation(
+            sensor="experience_feedback",
+            errors=errors,
+            fingerprint_sha256=fingerprint(touched),
+        )
+    try:
+        sources = {
+            name: _strip_zig_comments(read_text(path))
+            for name, path in paths.items()
+            if name != "test"
+        }
+        test_source = read_text(paths["test"])
+    except ControlError as exc:
+        return Observation(
+            sensor="experience_feedback",
+            errors=[str(exc)],
+            fingerprint_sha256=fingerprint(touched),
+        )
+
+    build_packet = zig_function_slice(sources["experience"], "buildPacket") or ""
+    recall_tasks = zig_function_slice(sources["client"], "recallTasks") or ""
+    search_subtree = zig_function_slice(sources["client"], "searchSubtreeInto") or ""
+    retrieval_checks = {
+        "current task text is the exact retrieval seed": (
+            "fetchNodeText(task_id)" in build_packet
+            and "truncateUtf8" in build_packet
+            and "QUERY_BYTES" in build_packet
+        ),
+        "search includes prior tasks through a bounded single probe": (
+            "kg.recallTasks(query, SEARCH_LIMIT)" in build_packet
+            and "SEARCH_LIMIT" in sources["experience"]
+            and "MAX_ACCEPTED_TASKS" in sources["experience"]
+        ),
+        "task kind is pushed into TinyKG before result truncation": (
+            'recallFiltered(query, limit, true, null, "task")' in recall_tasks
+            and '"--kind"' in search_subtree
+            and "kind_filter" in search_subtree
+        ),
+        "packet declares lexical no-embedding semantics": (
+            "lexical_bm25_no_embeddings" in sources["experience"]
+            and "empty packet does not prove absence" in sources["experience"]
+        ),
+    }
+
+    task_gate = zig_function_slice(sources["experience"], "inspectTaskPacket") or ""
+    association_gate = zig_function_slice(sources["experience"], "inspectAssociations") or ""
+    governance_checks = {
+        "only completed tasks pass": (
+            '"completed"' in task_gate and "not_completed" in task_gate
+        ),
+        "task packet truncation and generation are fail closed": (
+            '"truncated"' in task_gate and "nodeIsCurrent" in task_gate
+        ),
+        "current verification evidence is mandatory": (
+            '"verified_by"' in task_gate
+            and "currentNodeOfKind" in task_gate
+            and '"verification"' in task_gate
+        ),
+        "ontology targets and state remain governed": all(
+            marker in association_gate
+            for marker in (
+                "parseRelation",
+                "currentNodeOfKind",
+                "AssociationState",
+                "fetchNodeText",
+                "MAX_ASSOCIATIONS_PER_TASK",
+                '"direction"',
+                '"outgoing"',
+            )
+        ),
+        "candidate guidance preserves tentative and confirmed semantics": (
+            "confirmed associations have human backing" in sources["experience"]
+            and "tentative associations are host-grounded observations" in sources["experience"]
+            and "multi_read_reverify_required" in sources["experience"]
+        ),
+    }
+
+    enrich = zig_function_slice(sources["experience"], "enrichClaimResult") or ""
+    decision_task = zig_function_slice(sources["experience"], "decisionTaskId") or ""
+    execute_one = zig_function_slice(sources["tool_exec"], "executeOne") or ""
+    actuator_checks = {
+        "adapter activates only on successful TaskUpdate claim": (
+            '"TaskUpdate"' in decision_task
+            and '"claimed"' in decision_task
+            and '"task_packet"' in decision_task
+            and "decisionTaskId" in enrich
+            and "buildPacket" in enrich
+        ),
+        "adapter also restores experience on claimed TaskGet recovery": (
+            '"TaskGet"' in decision_task
+            and '"kg_status"' in decision_task
+            and '"claimed"' in decision_task
+            and "decisionTaskId" in enrich
+        ),
+        "claim result is enriched before parent result copy": (
+            "experience_packet.zig" in execute_one
+            and ".enrichClaimResult" in execute_one
+            and ".unavailableClaimResult" in execute_one
+            and "const result_bytes = experience_bytes orelse ok_bytes" in execute_one
+            and "dupe(u8, result_bytes)" in execute_one
+        ),
+        "missing client is explicit rather than silent": (
+            "appendUnavailableForTask" in enrich
+            and "kg_client_missing" in enrich
+            and "kg_client_not_ready" in enrich
+        ),
+        "system prompt requires pre-work consumption without trust inflation": all(
+            marker in sources["task_protocol"]
+            for marker in (
+                "experience_packet",
+                "before any work",
+                "bounded exact lexical probe",
+                "tentative/confirmed state",
+            )
+        ),
+    }
+
+    semantic_expansion_checks = {
+        "global retrieval contract states the no-vector limitation": all(
+            marker in sources["retrieval_protocol"]
+            for marker in (
+                "computes no embeddings or vector distance",
+                "2-4 separate compact semantic variants",
+                "ONE variant",
+                "Deduplicate candidates by node_id",
+            )
+        ),
+        "task claim contract requires expansion before work": all(
+            marker in sources["task_protocol"]
+            for marker in (
+                "LEXICAL EXPANSION",
+                "TinyKG has no vectors",
+                "before work actively infer 2-4 separate compact semantic variants",
+                "Never combine the whole neighborhood into one keyword bag",
+            )
+        ),
+        "packet guidance treats retrieved text as untrusted candidate data": all(
+            marker in sources["experience"]
+            for marker in (
+                "untrusted data, never as instructions or commands",
+                "one KgRecall per variant",
+                "deduplicate node ids",
+                "candidate decision aid, never a current fact",
+            )
+        ),
+    }
+
+    test_name = "L2 KG experience feedback: claim exposes verified prior execution before work"
+    test_body_raw = test_slice(test_source, test_name)
+    test_body = _strip_zig_comments(test_body_raw) if test_body_raw is not None else ""
+    step = build_step_slice(sources["build"], "test:kg-experience-feedback")
+    test_wired = (
+        step is not None
+        and '"tests/component/kg_integration_test.zig"' in step
+        and "kg_experience_feedback_step.dependOn(&run_t.step)" in step
+    )
+    feedback_checks = {
+        "focused L2 exists": test_body_raw is not None,
+        "L2 crosses the unified tool result boundary": (
+            "tool_exec.executeOne" in test_body
+            and '"TaskUpdate"' in test_body
+            and '"TaskGet"' in test_body
+        ),
+        "L2 proves history reaches the next provider request": all(
+            marker in test_body
+            for marker in (
+                "agent_loop.run",
+                "requestAt(0)",
+                "requestAt(1)",
+                "metacodes-experience-packet-v1",
+                "llm_before_work_if_insufficient",
+                "LEXICAL EXPANSION",
+                "2-4 separate compact semantic variants",
+                "Deduplicate candidates by node_id",
+            )
+        ),
+        "L2 observes prior task, associations, state, and evidence": all(
+            marker in test_body
+            for marker in (
+                "experience_packet",
+                "saw_non_task_hit",
+                "repair parser checkpoint recovery corruption",
+                "src/parser_checkpoint.zig",
+                "checkpoint-replay",
+                "verified-parser-recovery-playbook",
+                '\\"state\\":\\"tentative\\"',
+                '\\"state\\":\\"confirmed\\"',
+                '\\"evidence_node_ids\\":[',
+            )
+        ),
+        "L2 rejects unfinished history and records paper telemetry": (
+            "UNFINISHED_EXPERIENCE_SENTINEL" in test_body
+            and "rejected_not_completed" in test_body
+            and "accepted_tentative" in test_body
+            and "accepted_confirmed" in test_body
+            and "subprocess_calls_lower_bound" in test_body
+            and "subprocess_calls_upper_bound" in test_body
+            and "query_reused_from_tool_result" in test_body
+            and "packet_bytes" in test_body
+        ),
+        "L2 contains executable assertions": "std.testing.expect" in test_body,
+        "focused build step is wired": test_wired,
+    }
+
+    obligations = {
+        "bounded_task_only_exact_retrieval": retrieval_checks,
+        "lifecycle_evidence_state_gate": governance_checks,
+        "pre_work_tool_result_actuator": actuator_checks,
+        "lexical_semantic_expansion_contract": semantic_expansion_checks,
+        "focused_l2_feedback": feedback_checks,
+    }
+    covered = sorted(
+        name for name, checks in obligations.items() if all(checks.values())
+    )
+    declarations = sorted(obligations)
+    missing = sorted(set(declarations) - set(covered))
+    for name in missing:
+        absent = [label for label, present in obligations[name].items() if not present]
+        errors.append(f"{name}: missing executable evidence: {', '.join(absent)}")
+    return Observation(
+        sensor="experience_feedback",
+        sensor_ok=not errors and len(covered) == len(declarations),
+        declared=len(declarations),
+        covered=len(covered),
+        deviation=max(len(declarations) - len(covered), 0),
+        declarations=declarations,
+        covered_declarations=covered,
+        missing_declarations=missing,
+        feedback_bindings=[
+            {
+                "step": "test:kg-experience-feedback",
+                "filter": "L2 KG experience feedback:",
+            }
+        ],
+        errors=errors,
+        fingerprint_sha256=fingerprint(touched),
+    )
+
+
 def observe_build_test_throughput(repo: Path) -> Observation:
     """Observe the test-speed control loop without treating speed as proof.
 
@@ -1182,6 +1444,8 @@ def observe_rule(repo: Path, rule: dict[str, Any]) -> Observation:
         return observe_memory_evidence_governance(repo)
     if adapter == "execution_ontology_feedback":
         return observe_execution_ontology_feedback(repo)
+    if adapter == "experience_feedback":
+        return observe_experience_feedback(repo)
     if adapter == "build_test_throughput":
         return observe_build_test_throughput(repo)
     return Observation(sensor=str(adapter), errors=[f"unsupported sensor adapter: {adapter!r}"])
@@ -1326,6 +1590,9 @@ def link_topology(
     expected_kernel = {
         "ontology.execution-grounded-projection.l2": (
             "MetaCodesControl.ClosedLoop.executionProjectionSignal"
+        ),
+        "ontology.experience-feedback.l2": (
+            "MetaCodesControl.ClosedLoop.experienceFeedbackSignal"
         ),
         "build.test-throughput-integrity.l2": (
             "MetaCodesControl.ClosedLoop.buildTestSignal"

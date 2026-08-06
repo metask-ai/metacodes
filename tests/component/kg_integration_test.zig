@@ -496,6 +496,8 @@ test "L2 KG governance: freshness and contradiction contract enters the actual A
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "Persistent task control-plane algorithm") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "A successful claim returns a bounded") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "A title or compact summary alone is insufficient") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "experience_packet") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.body(), "preserve tentative/confirmed state") != null);
     try std.testing.expect(std.mem.indexOf(u8, cap.body(), "never leave finished work claimed/open") != null);
 
     // KgRecall/Write remain directly callable. FormalAuditTask is genuinely deferred, so
@@ -2105,6 +2107,221 @@ test "L2 KG ontology feedback: successful host execution projects without model 
     try std.testing.expect(!(try neighborTargetContains(a, &kg, second, "DENIED_SENTINEL")));
     try std.testing.expect(!(try neighborTargetContains(a, &kg, second, "MISSING_SENTINEL")));
     try std.testing.expect(!(try neighborTargetContains(a, &kg, first, "second.zig")));
+}
+
+test "L2 KG experience feedback: claim exposes verified prior execution before work" {
+    const a = std.testing.allocator;
+    const bin = findBin(a) orelse return error.SkipZigTest;
+    defer a.free(bin);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &pbuf);
+    const project_dir = pbuf[0..dir_len];
+    const store_path = try std.fmt.allocPrint(a, "{s}/kg-experience-feedback.kg", .{project_dir});
+    defer a.free(store_path);
+
+    var kg = try makeClient(a, bin, store_path, "proj-experience-feedback");
+    defer kg.deinit();
+    kg.ensureReady();
+    if (!kg.ready) return error.SkipZigTest;
+
+    const root = try kg.createTask("parser recovery roadmap", "plan_root");
+    const prior = try kg.createChildTask(root, "repair parser checkpoint recovery corruption", "plan_step");
+    const unfinished = try kg.createChildTask(root, "parser checkpoint recovery unfinished decoy", "plan_step");
+    const current = try kg.createChildTask(root, "diagnose parser checkpoint recovery regression", "plan_step");
+
+    var tasks = cc.core_task_store.TaskStore.init(a);
+    defer tasks.deinit();
+    const ctx = cc.tool_context.ToolContext{
+        .allocator = a,
+        .tasks = &tasks,
+        .kg = &kg,
+        .project_dir = project_dir,
+        .cwd_abs = project_dir,
+    };
+
+    // Materialize the same lifecycle/provenance shape produced in normal use:
+    // claim -> completed + verified_by -> tentative execution association.
+    const prior_claim_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"in_progress\"}}", .{prior});
+    defer a.free(prior_claim_args);
+    const prior_claim = try cc.task_tools.executeUpdate(&ctx, prior_claim_args);
+    defer a.free(prior_claim);
+    const prior_close_args = try std.fmt.allocPrint(
+        a,
+        "{{\"taskId\":\"kg-{d}\",\"status\":\"completed\",\"conclusion\":\"parser checkpoint replay verified\",\"acts_on\":[\"src/parser_checkpoint.zig\"],\"uses\":[\"checkpoint-replay\"]}}",
+        .{prior},
+    );
+    defer a.free(prior_close_args);
+    const prior_close = try cc.task_tools.executeUpdate(&ctx, prior_close_args);
+    defer a.free(prior_close);
+    const confirmed_playbook = try kg.ensureConcept("verified-parser-recovery-playbook");
+    try kg.addRefEdge(prior, "produces", confirmed_playbook, true);
+
+    // A lexically closer but unfinished task must never enter the experience
+    // packet. Its graph association is deliberately present to catch adapters
+    // that inspect neighbors but forget lifecycle/evidence governance.
+    const decoy = try kg.ensureConcept("UNFINISHED_EXPERIENCE_SENTINEL");
+    try kg.addRefEdge(unfinished, "acts_on", decoy, false);
+
+    // Prove the fixture actually distinguishes mixed-kind retrieval from the
+    // task-only contract. This exact decision would consume a normal recall
+    // slot, but must never appear in the experience packet's search window.
+    _ = try kg.remember(.decision, "diagnose parser checkpoint recovery regression", "decision", false);
+    const mixed_hits = try kg.recall("diagnose parser checkpoint recovery regression", 8, true);
+    defer {
+        for (mixed_hits) |*hit| hit.deinit(kg.allocator);
+        kg.allocator.free(mixed_hits);
+    }
+    var saw_non_task_hit = false;
+    for (mixed_hits) |hit| {
+        if (!std.mem.eql(u8, hit.kind, "task")) saw_non_task_hit = true;
+    }
+    try std.testing.expect(saw_non_task_hit);
+
+    const current_claim_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\",\"status\":\"in_progress\"}}", .{current});
+    defer a.free(current_claim_args);
+    const rid = cc.util_log.RequestId{ .bytes = [_]u8{'x'} ** 12 };
+    const claim_result = try cc.tool_exec.executeOne(&ctx, "TaskUpdate", current_claim_args, "claim-current", a, rid);
+    switch (claim_result) {
+        .done => |done| {
+            defer if (done.content) |content| a.free(content);
+            try std.testing.expect(!done.is_error);
+            const content = done.content orelse return error.TestUnexpectedResult;
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, content, .{});
+            defer parsed.deinit();
+            const packet = parsed.value.object.get("experience_packet") orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualStrings("metacodes-experience-packet-v1", packet.object.get("schema_version").?.string);
+            try std.testing.expect(packet.object.get("candidate_only").?.bool);
+            try std.testing.expectEqualStrings("exact_task_text_task_kind_only", packet.object.get("automatic_probe_scope").?.string);
+            try std.testing.expectEqualStrings("llm_before_work_if_insufficient", packet.object.get("semantic_expansion_owner").?.string);
+            try std.testing.expectEqualStrings("multi_read_reverify_required", packet.object.get("snapshot_consistency").?.string);
+            try std.testing.expectEqual(@as(i64, @intCast(current)), packet.object.get("query_task_id").?.integer);
+            try std.testing.expect(std.mem.indexOf(u8, content, "repair parser checkpoint recovery corruption") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "src/parser_checkpoint.zig") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "checkpoint-replay") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "verified-parser-recovery-playbook") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "\"state\":\"tentative\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "\"state\":\"confirmed\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "\"evidence_node_ids\":[") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "UNFINISHED_EXPERIENCE_SENTINEL") == null);
+            const metrics = packet.object.get("metrics").?.object;
+            try std.testing.expect(metrics.get("accepted_tasks").?.integer >= 1);
+            try std.testing.expect(metrics.get("rejected_not_completed").?.integer >= 1);
+            try std.testing.expectEqual(@as(i64, 2), metrics.get("accepted_tentative").?.integer);
+            try std.testing.expectEqual(@as(i64, 1), metrics.get("accepted_confirmed").?.integer);
+            // The text-search window itself is task-only. Execution concepts
+            // such as src/parser_checkpoint.zig cannot crowd out prior tasks.
+            try std.testing.expectEqual(metrics.get("search_hits").?.integer, metrics.get("task_candidates").?.integer);
+            const subprocess_lower = metrics.get("subprocess_calls_lower_bound").?.integer;
+            const subprocess_upper = metrics.get("subprocess_calls_upper_bound").?.integer;
+            try std.testing.expect(subprocess_lower >= 1);
+            try std.testing.expect(subprocess_upper >= subprocess_lower);
+            try std.testing.expect(!metrics.get("subprocess_count_exact").?.bool);
+            try std.testing.expectEqual(@as(usize, 10), metrics.get("packet_bytes").?.string.len);
+            if (std.c.getenv("METACODES_PRINT_EXPERIENCE_METRICS") != null) {
+                std.debug.print(
+                    "experience_feedback_metrics schema=v1 search_hits={d} task_candidates={d} accepted_tasks={d} accepted_associations={d} accepted_tentative={d} accepted_confirmed={d} rejected_not_completed={d} subprocess_lower={d} subprocess_upper={d} elapsed_ms={d} packet_bytes={s}\n",
+                    .{
+                        metrics.get("search_hits").?.integer,
+                        metrics.get("task_candidates").?.integer,
+                        metrics.get("accepted_tasks").?.integer,
+                        metrics.get("accepted_associations").?.integer,
+                        metrics.get("accepted_tentative").?.integer,
+                        metrics.get("accepted_confirmed").?.integer,
+                        metrics.get("rejected_not_completed").?.integer,
+                        subprocess_lower,
+                        subprocess_upper,
+                        metrics.get("elapsed_ms").?.integer,
+                        metrics.get("packet_bytes").?.string,
+                    },
+                );
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // A fresh decision round after compaction/restart follows TaskGet rather
+    // than re-claiming the live lease. The same governed experience must cross
+    // the unified result boundary on that recovery path too.
+    const current_get_args = try std.fmt.allocPrint(a, "{{\"taskId\":\"kg-{d}\"}}", .{current});
+    defer a.free(current_get_args);
+    const get_result = try cc.tool_exec.executeOne(&ctx, "TaskGet", current_get_args, "recover-current", a, rid);
+    switch (get_result) {
+        .done => |done| {
+            defer if (done.content) |content| a.free(content);
+            try std.testing.expect(!done.is_error);
+            const content = done.content orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, content, "\"kg_status\":\"claimed\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "\"experience_packet\":{") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "repair parser checkpoint recovery corruption") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "UNFINISHED_EXPERIENCE_SENTINEL") == null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "\"query_reused_from_tool_result\":true") != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    // Scope-matched L2: prove the enriched tool result is not merely computed
+    // and discarded. A real two-turn agent loop must serialize the historical
+    // task into the second provider request before the model can choose work.
+    const api_current = try kg.createChildTask(root, "investigate parser checkpoint recovery failure", "plan_step");
+    var api_id_buf: [24]u8 = undefined;
+    const api_id = try std.fmt.bufPrint(&api_id_buf, "{d}", .{api_current});
+    const claim_sse_template =
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"model\":\"x\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n" ++
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"claim1\",\"name\":\"TaskUpdate\",\"input\":{}}}\n\n" ++
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"taskId\\\":\\\"kg-__TASK_ID__\\\",\\\"status\\\":\\\"in_progress\\\"}\"}}\n\n" ++
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" ++
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":1}}\n\n" ++
+        "data: {\"type\":\"message_stop\"}\n\n";
+    const claim_sse = try std.mem.replaceOwned(u8, a, claim_sse_template, "__TASK_ID__", api_id);
+    defer a.free(claim_sse);
+    const responses = [_][]const u8{ claim_sse, KG_END_TURN_SSE };
+    var srv = try harness.MockServer.startCassette(&responses, 0);
+    defer srv.stop();
+    const url = try srv.urlOwned(a);
+    defer a.free(url);
+
+    var io_runtime = std.Io.Threaded.init(a, .{});
+    defer io_runtime.deinit();
+    var api_client = cc.client_mod.Client.initWithBaseUrl(a, io_runtime.io(), "test-key", "claude-sonnet-4-20250514", url);
+    defer api_client.deinit();
+    var conv = cc.conversation.Conversation.init(a);
+    defer conv.deinit();
+    try conv.appendText(.user, "Claim the persistent task, inspect prior evidence, then continue.");
+    var api_tasks = cc.core_task_store.TaskStore.init(a);
+    defer api_tasks.deinit();
+    const enabled = [_][]const u8{ "TaskUpdate", "KgRecall", "KgContext" };
+    var defs_arena = std.heap.ArenaAllocator.init(a);
+    defer defs_arena.deinit();
+    var prompt_context = cc.tools.PromptContext{ .enabled_tool_names = &enabled };
+    const defs = try cc.tools.toToolDefinitionsFull(defs_arena.allocator(), null, &prompt_context);
+    const system_prompt = try cc.system_prompt.buildFull(a, "claude-sonnet-4-20250514", null, null, &enabled, "", true);
+    defer a.free(system_prompt);
+    const permission = cc.permission.createContext(.bypass_permissions, a);
+    var writer = cc.writer_backend.WriterBackend.initNull();
+    const backend = writer.backend();
+    const run_result = try cc.agent_loop.run(&conv, api_client.provider(), defs, &permission, .{
+        .max_turns = 2,
+        .system_prompt = system_prompt,
+        .tasks = &api_tasks,
+        .kg = &kg,
+        .project_dir = project_dir,
+        .cwd_abs = project_dir,
+    }, &backend, a);
+    try std.testing.expectEqual(cc.agent_loop.StopReason.end_turn, run_result.stop_reason);
+    try std.testing.expectEqual(@as(usize, 2), srv.requestCount());
+    const first_request = srv.requestAt(0) orelse return error.NoRequestCaptured;
+    const second_request = srv.requestAt(1) orelse return error.NoRequestCaptured;
+    try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "LEXICAL EXPANSION") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "2-4 separate compact semantic variants") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "Deduplicate candidates by node_id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "repair parser checkpoint recovery corruption") == null);
+    try std.testing.expect(std.mem.indexOf(u8, second_request.body(), "metacodes-experience-packet-v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_request.body(), "repair parser checkpoint recovery corruption") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_request.body(), "llm_before_work_if_insufficient") != null);
+    if (std.c.getenv("METACODES_PRINT_EXPERIENCE_METRICS") != null)
+        std.debug.print("experience_feedback_delivery schema=v1 provider_requests={d} delivered_to_next_request=1\n", .{srv.requestCount()});
 }
 
 test "L2 KG: ref-edge 重试修复缺失 state 且不降级 confirmed" {
