@@ -467,11 +467,11 @@ def _group_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
 def _density(rows: Sequence[Mapping[str, Any]], base_arm: str) -> Dict[str, float | None]:
     """Compute PlugMem-style PMI density as a clearly secondary statistic."""
 
-    grouped: Dict[Tuple[str, int, str], Dict[str, Mapping[str, Any]]] = defaultdict(dict)
+    grouped: Dict[Tuple[str, int, str, str], Dict[str, Mapping[str, Any]]] = defaultdict(dict)
     for row in rows:
         if row["execution"]["status"] != "completed" or row["outcome"]["status"] not in {"pass", "fail"}:
             continue
-        grouped[(row["benchmark"], row["trial"], row["case_id"])][row["arm"]] = row
+        grouped[(row["benchmark"], row["trial"], row["case_id"], row["split"])][row["arm"]] = row
     by_arm: Dict[str, List[Tuple[float, float, int]]] = defaultdict(list)
     for pair in grouped.values():
         base = pair.get(base_arm)
