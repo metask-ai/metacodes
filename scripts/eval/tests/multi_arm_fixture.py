@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from scripts.eval.e2e_adapter import grounding_fingerprints
-from scripts.eval.experiment import ARM_IDS, arm_config_ids
+from scripts.eval.experiment import ARM_IDS, arm_config_ids, fixed_rollout_budget
 from scripts.eval.model import stable_json, write_rollouts
 from scripts.eval.tests.test_analysis import rollout
 
@@ -36,6 +36,9 @@ def write_multi_arm_checkpoints(
     model_fingerprint = hashlib.sha256(
         stable_json(model).encode("utf-8")
     ).hexdigest()[:16]
+    fixed = fixed_rollout_budget(experiment["budget"], required=True)
+    assert fixed is not None
+    rollout_cost, rollout_tokens = fixed
     paths: Dict[str, Path] = {}
     for arm_id in ARM_IDS:
         rows = []
@@ -58,6 +61,10 @@ def write_multi_arm_checkpoints(
                             "environment_fingerprint"
                         ],
                         "permission_mode": identity["permission_mode"],
+                        "runtime_budget": {
+                            "max_metered_tokens": rollout_tokens,
+                            "max_cost_usd": rollout_cost,
+                        },
                     }
                 )
                 item["evaluator"]["fingerprint"] = identity["grader_fingerprint"]

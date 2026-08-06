@@ -82,6 +82,18 @@ EXPERIMENT_KEYS = frozenset(
         "stop_rules",
     }
 )
+LEGACY_BUDGET_KEYS = frozenset(
+    {
+        "max_stage_cost_usd",
+        "max_stage_tokens",
+        "max_aggregate_cost_usd",
+        "max_aggregate_tokens",
+        "paid_rollouts_enabled",
+    }
+)
+FIXED_ROLLOUT_BUDGET_KEYS = frozenset(
+    {"max_rollout_cost_usd", "max_rollout_tokens"}
+)
 BLIND_WORKSPACE_CHECKS = frozenset(
     {
         "file_exists",
@@ -110,6 +122,47 @@ def _non_empty_string(value: Any, where: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValidationError(f"{where}: expected non-empty string")
     return value
+
+
+def fixed_rollout_budget(
+    budget: Mapping[str, Any], *, required: bool
+) -> Tuple[float, int] | None:
+    """Return the arm-independent runtime cap frozen into each rollout.
+
+    Schema-v2 evidence created before this field existed remains readable, but
+    current dry-run/live execution requires both fields.  Accepting one without
+    the other would make token and dollar enforcement describe different
+    experiments.
+    """
+    present = FIXED_ROLLOUT_BUDGET_KEYS & set(budget)
+    if not present:
+        if required:
+            raise ValidationError(
+                "experiment.budget must freeze max_rollout_cost_usd and "
+                "max_rollout_tokens before execution"
+            )
+        return None
+    if present != FIXED_ROLLOUT_BUDGET_KEYS:
+        raise ValidationError(
+            "experiment.budget must provide both max_rollout_cost_usd and "
+            "max_rollout_tokens"
+        )
+    max_cost = budget.get("max_rollout_cost_usd")
+    if (
+        not isinstance(max_cost, (int, float))
+        or isinstance(max_cost, bool)
+        or not math.isfinite(float(max_cost))
+        or float(max_cost) <= 0
+    ):
+        raise ValidationError(
+            "experiment.budget.max_rollout_cost_usd must be finite and > 0"
+        )
+    max_tokens = budget.get("max_rollout_tokens")
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
+        raise ValidationError(
+            "experiment.budget.max_rollout_tokens must be an integer > 0"
+        )
+    return float(max_cost), max_tokens
 
 
 def _dependency_env() -> Dict[str, str]:
@@ -578,12 +631,10 @@ def validate_experiment(
     budget = experiment.get("budget")
     if not isinstance(budget, dict):
         raise ValidationError("experiment.budget: expected object")
-    if set(budget) != {
-        "max_stage_cost_usd",
-        "max_stage_tokens",
-        "max_aggregate_cost_usd",
-        "max_aggregate_tokens",
-        "paid_rollouts_enabled",
+    budget_keys = frozenset(budget)
+    if budget_keys not in {
+        LEGACY_BUDGET_KEYS,
+        LEGACY_BUDGET_KEYS | FIXED_ROLLOUT_BUDGET_KEYS,
     }:
         raise ValidationError("experiment.budget contains missing or unknown fields")
     max_stage_cost = budget.get("max_stage_cost_usd")
@@ -613,6 +664,24 @@ def validate_experiment(
         raise ValidationError("aggregate token budget must cover its stage")
     if not isinstance(budget.get("paid_rollouts_enabled"), bool):
         raise ValidationError("experiment.budget.paid_rollouts_enabled must be boolean")
+    rollout_budget = fixed_rollout_budget(budget, required=False)
+    expected_rollouts = len(suite["tasks"]) * int(trials) * len(ARM_IDS)
+    if rollout_budget is not None:
+        rollout_cost, rollout_tokens = rollout_budget
+        if rollout_cost > float(max_stage_cost) or rollout_tokens > max_stage_tokens:
+            raise ValidationError(
+                "per-rollout budget cannot exceed its stage budget"
+            )
+        # This is a capacity proof over registered maxima, not a prediction of
+        # actual spend.  Without it, a schedule can be known-impossible before
+        # its first paid request and arm order changes the effective allowance.
+        if (
+            rollout_cost * expected_rollouts >= float(max_stage_cost)
+            or rollout_tokens * expected_rollouts >= max_stage_tokens
+        ):
+            raise ValidationError(
+                "stage budget must strictly cover every fixed per-rollout cap"
+            )
     promotion = experiment.get("promotion")
     if not isinstance(promotion, dict) or set(promotion) != {
         "requires_receipt",
@@ -624,7 +693,6 @@ def validate_experiment(
         raise ValidationError(
             "experiment.promotion must freeze its receipt, source manifest, fingerprint, and gate"
         )
-    expected_rollouts = len(suite["tasks"]) * int(trials) * len(ARM_IDS)
     if stage_id == "calibration":
         expected_gate = {
             "required_valid_rollouts": expected_rollouts,
@@ -933,14 +1001,36 @@ def build_dry_run_plan(
         or budget_used_tokens < 0
     ):
         raise ValidationError("budget usage offsets must be non-negative")
+    rollout_cost_cap, rollout_token_cap = fixed_rollout_budget(
+        experiment["budget"], required=True
+    )
+    rollout_count = (
+        len(suite["tasks"])
+        * len(counterbalanced_schedule(ARM_IDS, experiment["trials"]))
+    )
+    required_cost_reserve = rollout_cost_cap * rollout_count
+    required_token_reserve = rollout_token_cap * rollout_count
+    remaining_cost = min(
+        float(experiment["budget"]["max_stage_cost_usd"])
+        - budget_used_cost_usd,
+        float(experiment["budget"]["max_aggregate_cost_usd"])
+        - budget_used_cost_usd,
+    )
+    remaining_tokens = min(
+        int(experiment["budget"]["max_stage_tokens"]) - budget_used_tokens,
+        int(experiment["budget"]["max_aggregate_tokens"]) - budget_used_tokens,
+    )
     if (
-        budget_used_cost_usd >= float(experiment["budget"]["max_stage_cost_usd"])
-        or budget_used_tokens >= int(experiment["budget"]["max_stage_tokens"])
-        or budget_used_cost_usd
-        >= float(experiment["budget"]["max_aggregate_cost_usd"])
-        or budget_used_tokens >= int(experiment["budget"]["max_aggregate_tokens"])
+        remaining_cost <= required_cost_reserve
+        or remaining_tokens <= required_token_reserve
     ):
-        raise ValidationError("budget carryover reaches a frozen stage or aggregate cap")
+        raise ValidationError(
+            "budget carryover cannot reserve the complete fixed-cap schedule: "
+            f"remaining_cost_usd={remaining_cost:.9f}, "
+            f"required_cost_usd>{required_cost_reserve:.9f}, "
+            f"remaining_tokens={remaining_tokens}, "
+            f"required_tokens>{required_token_reserve}"
+        )
     binary_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
     tinykg_identity = tinykg_binary_identity(tinykg_binary)
     formal_identity = formal_kernel_identity(formal_kernel)
@@ -966,6 +1056,10 @@ def build_dry_run_plan(
                     "arm_id": arm_id,
                     "task_id": task_id,
                     "timeout_seconds": tasks[task_id]["constraints"]["timeout_seconds"],
+                    "runtime_budget": {
+                        "max_cost_usd": rollout_cost_cap,
+                        "max_metered_tokens": rollout_token_cap,
+                    },
                     "harness_config_id": config_ids[arm_id],
                     "runtime_env": arm_runtime_env(
                         experiment,
@@ -1013,6 +1107,15 @@ def build_dry_run_plan(
                 experiment["budget"]["max_aggregate_tokens"]
             )
             - budget_used_tokens,
+        },
+        "schedule_capacity": {
+            "fixed_rollout_cost_usd": rollout_cost_cap,
+            "fixed_rollout_tokens": rollout_token_cap,
+            "required_cost_reserve_usd": required_cost_reserve,
+            "required_token_reserve": required_token_reserve,
+            "available_cost_usd": remaining_cost,
+            "available_tokens": remaining_tokens,
+            "strictly_feasible": True,
         },
         "promotion_receipt_required": experiment["promotion"]["requires_receipt"],
         "rows": rows,

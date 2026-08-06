@@ -9,8 +9,10 @@ from scripts.eval.e2e_adapter import comparison_fingerprints
 from scripts.eval.model import ValidationError
 from scripts.eval.paired_runner import (
     InfrastructureRunError,
+    _mark_runtime_budget_invalid,
     _require_budget,
     _require_multi_budget,
+    _require_remaining_schedule_capacity,
     _require_runtime_budget_provenance,
     _remaining_multi_budget,
     _run_once,
@@ -21,6 +23,28 @@ from scripts.eval.paired_runner import (
 
 
 class PairedRunnerTest(unittest.TestCase):
+    def test_runtime_budget_violation_is_checkpointable_invalid_evidence(self):
+        rollout = {
+            "execution": {"status": "completed", "invalid_reasons": []},
+            "judgement": {
+                "valid_for_scoring": True,
+                "trustworthy_success": True,
+            },
+            "attribution": [],
+        }
+        _mark_runtime_budget_invalid(rollout, "tokens=1001/1000")
+        self.assertEqual(rollout["execution"]["status"], "invalid")
+        self.assertEqual(
+            rollout["execution"]["invalid_reasons"],
+            ["runtime_budget_contract_violation"],
+        )
+        self.assertFalse(rollout["judgement"]["valid_for_scoring"])
+        self.assertFalse(rollout["judgement"]["trustworthy_success"])
+        self.assertEqual(
+            rollout["attribution"][0]["code"],
+            "runtime_budget_contract_violation",
+        )
+
     def test_normalized_runtime_budget_must_match_sealed_allowance(self):
         rollout = {
             "harness": {
@@ -28,7 +52,14 @@ class PairedRunnerTest(unittest.TestCase):
                     "max_metered_tokens": 1000,
                     "max_cost_usd": 5.0,
                 }
-            }
+            },
+            "metrics": {
+                "cost_usd": 4.0,
+                "input_tokens": 400,
+                "output_tokens": 100,
+                "cache_read_tokens": 400,
+                "cache_write_tokens": 100,
+            },
         }
         _require_runtime_budget_provenance(
             rollout, max_metered_tokens=1000, max_cost_usd=5.0
@@ -36,6 +67,44 @@ class PairedRunnerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "does not match"):
             _require_runtime_budget_provenance(
                 rollout, max_metered_tokens=999, max_cost_usd=5.0
+            )
+        rollout["metrics"]["cache_read_tokens"] = 401
+        with self.assertRaisesRegex(ValidationError, "exceeded"):
+            _require_runtime_budget_provenance(
+                rollout, max_metered_tokens=1000, max_cost_usd=5.0
+            )
+
+    def test_remaining_schedule_capacity_blocks_before_a_doomed_paid_run(self):
+        budget = {
+            "max_rollout_cost_usd": 5.0,
+            "max_rollout_tokens": 1000,
+            "max_stage_cost_usd": 100.0,
+            "max_stage_tokens": 10_000,
+            "max_aggregate_cost_usd": 1000.0,
+            "max_aggregate_tokens": 100_000,
+            "paid_rollouts_enabled": True,
+        }
+        self.assertEqual(
+            _require_remaining_schedule_capacity(
+                {},
+                budget,
+                remaining_rollouts=9,
+                stage_prior_cost_usd=0.0,
+                stage_prior_tokens=0,
+                aggregate_prior_cost_usd=0.0,
+                aggregate_prior_tokens=0,
+            ),
+            (5.0, 1000),
+        )
+        with self.assertRaisesRegex(ValidationError, "not budget-feasible before network"):
+            _require_remaining_schedule_capacity(
+                {},
+                budget,
+                remaining_rollouts=10,
+                stage_prior_cost_usd=0.0,
+                stage_prior_tokens=0,
+                aggregate_prior_cost_usd=0.0,
+                aggregate_prior_tokens=0,
             )
 
     def test_runtime_budget_is_the_smaller_remaining_stage_or_aggregate_allowance(self):

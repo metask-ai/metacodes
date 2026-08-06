@@ -108,7 +108,35 @@ class LongHorizonExperimentTest(unittest.TestCase):
         self.assertEqual(
             self.confirmatory_experiment["stage"]["id"], "confirmatory"
         )
+        self.assertEqual(
+            self.experiment["budget"]["max_rollout_tokens"], 1_200_000
+        )
+        self.assertEqual(
+            self.confirmatory_experiment["budget"]["max_rollout_tokens"],
+            1_200_000,
+        )
+        self.assertEqual(
+            self.experiment["budget"]["max_rollout_cost_usd"], 2.0
+        )
         self.assertEqual([arm["id"] for arm in self.experiment["arms"]], list(ARM_IDS))
+
+    def test_budget_contract_rejects_partial_or_infeasible_fixed_rollout_caps(self):
+        partial = copy.deepcopy(self.experiment)
+        partial["budget"].pop("max_rollout_tokens")
+        with self.assertRaisesRegex(ValidationError, "missing or unknown"):
+            validate_experiment(partial, ROOT, self.suite)
+
+        infeasible = copy.deepcopy(self.experiment)
+        infeasible["budget"]["max_stage_tokens"] = 18 * 1_200_000
+        with self.assertRaisesRegex(ValidationError, "strictly cover"):
+            validate_experiment(infeasible, ROOT, self.suite)
+
+        # Frozen schema-v2 failure evidence predates fixed caps and remains
+        # readable, but current dry-run/live entry points reject it.
+        legacy = copy.deepcopy(self.experiment)
+        legacy["budget"].pop("max_rollout_tokens")
+        legacy["budget"].pop("max_rollout_cost_usd")
+        validate_experiment(legacy, ROOT, self.suite)
 
     def test_schedule_balances_every_position_and_ordered_carryover(self):
         schedule = counterbalanced_schedule(ARM_IDS, 6)
@@ -276,9 +304,25 @@ class LongHorizonExperimentTest(unittest.TestCase):
         self.assertEqual(first["budget_carryover"]["stage_used_cost_usd"], 1.25)
         self.assertEqual(first["budget_carryover"]["stage_used_tokens"], 1234)
         self.assertEqual(first["budget_carryover"]["stage_remaining_cost_usd"], 98.75)
-        self.assertEqual(first["budget_carryover"]["stage_remaining_tokens"], 2_998_766)
+        self.assertEqual(first["budget_carryover"]["stage_remaining_tokens"], 23_998_766)
+        self.assertEqual(
+            first["schedule_capacity"],
+            {
+                "fixed_rollout_cost_usd": 2.0,
+                "fixed_rollout_tokens": 1_200_000,
+                "required_cost_reserve_usd": 36.0,
+                "required_token_reserve": 21_600_000,
+                "available_cost_usd": 98.75,
+                "available_tokens": 23_998_766,
+                "strictly_feasible": True,
+            },
+        )
         self.assertEqual(len({row["harness_config_id"] for row in first["rows"]}), 3)
         for row in first["rows"]:
+            self.assertEqual(
+                row["runtime_budget"],
+                {"max_cost_usd": 2.0, "max_metered_tokens": 1_200_000},
+            )
             self.assertEqual(
                 row["runtime_env"]["METACODES_LONG_HORIZON_ARM"], row["arm_id"]
             )
@@ -509,6 +553,183 @@ class LongHorizonExperimentTest(unittest.TestCase):
                     for row in rows
                 )
             )
+
+    def test_multi_arm_rejects_infeasible_remaining_schedule_before_rollout(self):
+        experiment = copy.deepcopy(self.experiment)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "metacodes"
+            binary.write_bytes(b"frozen")
+            binary.chmod(0o755)
+            tinykg = root / "tinykg"
+            tinykg.write_bytes(b"tinykg")
+            tinykg.chmod(0o755)
+            tinykg_identity = {
+                "path": str(tinykg.resolve()),
+                "sha256": hashlib.sha256(tinykg.read_bytes()).hexdigest(),
+                "version": "tinykg test",
+            }
+            formal, formal_identity = fake_formal_artifact(root)
+            with mock.patch(
+                "scripts.eval.paired_runner.tinykg_binary_identity",
+                return_value=tinykg_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner.formal_kernel_identity",
+                return_value=formal_identity,
+            ), mock.patch("scripts.eval.paired_runner._run_once") as run_once:
+                # 24M stage cap - 2.4M carryover leaves exactly 18 × 1.2M.
+                # Equality is not enough because reaching the hard cap denies
+                # promotion; the runner must spend zero model calls.
+                with self.assertRaisesRegex(
+                    ValidationError, "not budget-feasible before network"
+                ):
+                    run_multi_arm(
+                        experiment,
+                        self.suite,
+                        ROOT,
+                        binary,
+                        tinykg_binary=tinykg,
+                        formal_kernel=formal,
+                        revision="abc123",
+                        output_dir=root / "checkpoints",
+                        suite_path=SUITE_PATH,
+                        allow_paid_rollouts=True,
+                        budget_used_tokens=2_400_000,
+                    )
+            run_once.assert_not_called()
+
+    def test_multi_arm_checkpoints_runtime_budget_overrun_before_abort(self):
+        experiment = copy.deepcopy(self.experiment)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "metacodes"
+            binary.write_bytes(b"fixed-budget-metacodes")
+            binary.chmod(0o755)
+            tinykg = root / "tinykg"
+            tinykg.write_bytes(b"fixed-budget-tinykg")
+            tinykg.chmod(0o755)
+            metacodes_sha = hashlib.sha256(binary.read_bytes()).hexdigest()
+            tinykg_sha = hashlib.sha256(tinykg.read_bytes()).hexdigest()
+            tinykg_identity = {
+                "path": str(tinykg.resolve()),
+                "sha256": tinykg_sha,
+                "version": "tinykg test",
+            }
+            formal, formal_identity = fake_formal_artifact(root)
+            seed_paths = write_multi_arm_checkpoints(
+                root / "seed",
+                experiment,
+                self.suite,
+                ROOT,
+                metacodes_sha256=metacodes_sha,
+                tinykg_sha256=tinykg_sha,
+                formal_kernel_fingerprint=formal_identity["artifact_fingerprint"],
+                revision="budget-revision",
+            )
+            over_budget = load_rollouts(seed_paths["codex_style"])[0]
+            sealed_tokens = over_budget["harness"]["runtime_budget"][
+                "max_metered_tokens"
+            ]
+            over_budget["metrics"].update(
+                {
+                    "input_tokens": sealed_tokens + 1,
+                    "output_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                }
+            )
+            run_dir = root / "over-budget-run"
+            run_dir.mkdir()
+            output_dir = root / "checkpoints"
+
+            with mock.patch(
+                "scripts.eval.paired_runner.tinykg_binary_identity",
+                return_value=tinykg_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner.formal_kernel_identity",
+                return_value=formal_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner._run_once", return_value=run_dir
+            ), mock.patch(
+                "scripts.eval.paired_runner.import_run",
+                return_value=[copy.deepcopy(over_budget)],
+            ):
+                with self.assertRaisesRegex(
+                    ValidationError, "exceeded its sealed fixed budget"
+                ):
+                    run_multi_arm(
+                        experiment,
+                        self.suite,
+                        ROOT,
+                        binary,
+                        tinykg_binary=tinykg,
+                        formal_kernel=formal,
+                        revision="budget-revision",
+                        output_dir=output_dir,
+                        suite_path=SUITE_PATH,
+                        allow_paid_rollouts=True,
+                    )
+
+            checkpoint = load_rollouts(output_dir / "codex_style.jsonl")
+            self.assertEqual(len(checkpoint), 1)
+            self.assertEqual(
+                checkpoint[0]["metrics"]["input_tokens"], sealed_tokens + 1
+            )
+            self.assertEqual(checkpoint[0]["execution"]["status"], "invalid")
+            self.assertIn(
+                "runtime_budget_contract_violation",
+                checkpoint[0]["execution"]["invalid_reasons"],
+            )
+            self.assertFalse(checkpoint[0]["judgement"]["valid_for_scoring"])
+            self.assertIn(
+                "runtime_budget_contract_violation",
+                [item["code"] for item in checkpoint[0]["attribution"]],
+            )
+
+    def test_promotion_rechecks_fixed_runtime_budget_and_usage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = write_multi_arm_checkpoints(
+                root,
+                self.experiment,
+                self.suite,
+                ROOT,
+                metacodes_sha256="a" * 64,
+                tinykg_sha256="b" * 64,
+                formal_kernel_fingerprint="c" * 64,
+                revision="budget-revision",
+            )
+            original = paths["tinykg"].read_bytes()
+            rows = load_rollouts(paths["tinykg"])
+            rows[0]["harness"]["runtime_budget"]["max_metered_tokens"] += 1
+            write_rollouts(paths["tinykg"], rows)
+            with self.assertRaisesRegex(
+                ValidationError, "runtime budget is not the frozen"
+            ):
+                build_promotion_receipt(
+                    self.experiment, self.suite, ROOT, paths
+                )
+
+            paths["tinykg"].write_bytes(original)
+            rows = load_rollouts(paths["tinykg"])
+            sealed_tokens = rows[0]["harness"]["runtime_budget"][
+                "max_metered_tokens"
+            ]
+            rows[0]["metrics"].update(
+                {
+                    "input_tokens": sealed_tokens + 1,
+                    "output_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                }
+            )
+            write_rollouts(paths["tinykg"], rows)
+            with self.assertRaisesRegex(
+                ValidationError, "exceeded its frozen per-rollout budget"
+            ):
+                build_promotion_receipt(
+                    self.experiment, self.suite, ROOT, paths
+                )
 
     def test_multi_arm_rechecks_binary_after_each_rollout(self):
         experiment = copy.deepcopy(self.experiment)

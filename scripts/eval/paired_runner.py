@@ -17,6 +17,7 @@ from .experiment import (
     arm_config_ids,
     arm_runtime_env,
     counterbalanced_schedule,
+    fixed_rollout_budget,
     formal_kernel_identity,
     tinykg_binary_identity,
     validate_experiment,
@@ -197,6 +198,7 @@ def _require_runtime_budget_provenance(
     *,
     max_metered_tokens: int,
     max_cost_usd: float,
+    require_usage: bool = True,
 ) -> None:
     """Bind the normalized checkpoint to the cap sealed before execution."""
     actual = rollout.get("harness", {}).get("runtime_budget")
@@ -209,6 +211,73 @@ def _require_runtime_budget_provenance(
             "normalized rollout runtime budget does not match the sealed "
             f"execution allowance: expected {expected!r}, observed {actual!r}"
         )
+    if not require_usage:
+        return
+    metrics = rollout.get("metrics", {})
+    missing = [key for key in ("cost_usd", *TOKEN_METRICS) if metrics.get(key) is None]
+    if missing:
+        raise ValidationError(
+            f"normalized rollout is missing runtime budget telemetry {missing}"
+        )
+    observed_cost = float(metrics["cost_usd"])
+    observed_tokens = sum(int(metrics[key]) for key in TOKEN_METRICS)
+    if (
+        not math.isfinite(observed_cost)
+        or observed_cost > float(max_cost_usd)
+        or observed_tokens > max_metered_tokens
+    ):
+        raise ValidationError(
+            "normalized rollout exceeded its sealed fixed budget: "
+            f"cost_usd={observed_cost:.9f}/{float(max_cost_usd):.9f}, "
+            f"tokens={observed_tokens}/{max_metered_tokens}"
+        )
+
+
+def _remaining_schedule_count(
+    experiment: Mapping[str, Any],
+    expected_tasks: Mapping[str, Mapping[str, Any]],
+    completed_keys: Mapping[str, set[tuple[str, int]]],
+) -> int:
+    return sum(
+        1
+        for trial, arm_id in counterbalanced_schedule(ARM_IDS, experiment["trials"])
+        for task_id in expected_tasks
+        if (task_id, trial) not in completed_keys[arm_id]
+    )
+
+
+def _require_remaining_schedule_capacity(
+    collected: Mapping[str, Sequence[Dict[str, Any]]],
+    budget: Mapping[str, Any],
+    *,
+    remaining_rollouts: int,
+    stage_prior_cost_usd: float,
+    stage_prior_tokens: int,
+    aggregate_prior_cost_usd: float,
+    aggregate_prior_tokens: int,
+) -> tuple[float, int]:
+    """Prove the whole remaining schedule fits before another paid request."""
+    fixed = fixed_rollout_budget(budget, required=True)
+    assert fixed is not None
+    rollout_cost_cap, rollout_token_cap = fixed
+    remaining_cost, remaining_tokens = _remaining_multi_budget(
+        collected,
+        budget,
+        stage_prior_cost_usd=stage_prior_cost_usd,
+        stage_prior_tokens=stage_prior_tokens,
+        aggregate_prior_cost_usd=aggregate_prior_cost_usd,
+        aggregate_prior_tokens=aggregate_prior_tokens,
+    )
+    required_cost = rollout_cost_cap * remaining_rollouts
+    required_tokens = rollout_token_cap * remaining_rollouts
+    if remaining_cost <= required_cost or remaining_tokens <= required_tokens:
+        raise ValidationError(
+            "remaining multi-arm schedule is not budget-feasible before network: "
+            f"rollouts={remaining_rollouts}, remaining_cost_usd={remaining_cost:.9f}, "
+            f"required_cost_usd>{required_cost:.9f}, "
+            f"remaining_tokens={remaining_tokens}, required_tokens>{required_tokens}"
+        )
+    return rollout_cost_cap, rollout_token_cap
 
 
 def _require_scoring_rollout(rollout: Dict[str, Any], *, variant: str) -> None:
@@ -221,6 +290,27 @@ def _require_scoring_rollout(rollout: Dict[str, Any], *, variant: str) -> None:
             f"{variant} rollout {(task_id, trial)!r} is not valid for scoring; "
             f"execution_reasons={reasons}, evaluator={evaluator}; fail-closed"
         )
+
+
+def _mark_runtime_budget_invalid(
+    rollout: Dict[str, Any], detail: str
+) -> None:
+    execution = rollout.setdefault("execution", {})
+    execution["status"] = "invalid"
+    reasons = execution.setdefault("invalid_reasons", [])
+    if "runtime_budget_contract_violation" not in reasons:
+        reasons.append("runtime_budget_contract_violation")
+    rollout.setdefault("judgement", {})["valid_for_scoring"] = False
+    rollout["judgement"]["trustworthy_success"] = False
+    rollout.setdefault("attribution", []).append(
+        {
+            "code": "runtime_budget_contract_violation",
+            "source": "O",
+            "count": 1,
+            "confidence": 1.0,
+            "detail": detail[:512],
+        }
+    )
 
 
 def alternating_schedule(trials: int) -> List[Tuple[int, str]]:
@@ -725,6 +815,12 @@ def run_multi_arm(
             "experiment contract has paid_rollouts_enabled=false; deterministic gates "
             "must pass before editing the contract"
         )
+    # A live experiment must freeze one identical allowance for every arm and
+    # schedule position. Legacy schema-v2 evidence remains reportable, but it
+    # cannot start new paid work with order-dependent "all remaining budget".
+    fixed = fixed_rollout_budget(experiment["budget"], required=True)
+    assert fixed is not None
+    fixed_rollout_cost_usd, fixed_rollout_tokens = fixed
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise ValidationError(f"binary is not executable: {binary}")
     revision = revision.strip()
@@ -808,9 +904,27 @@ def run_multi_arm(
         for arm_id in ARM_IDS
     }
     budget = experiment["budget"]
+    for rows in collected.values():
+        for rollout in rows:
+            _require_runtime_budget_provenance(
+                rollout,
+                max_metered_tokens=fixed_rollout_tokens,
+                max_cost_usd=fixed_rollout_cost_usd,
+            )
     _require_multi_budget(
         collected,
         budget,
+        stage_prior_cost_usd=stage_prior_cost_usd,
+        stage_prior_tokens=stage_prior_tokens,
+        aggregate_prior_cost_usd=aggregate_prior_cost_usd,
+        aggregate_prior_tokens=aggregate_prior_tokens,
+    )
+    _require_remaining_schedule_capacity(
+        collected,
+        budget,
+        remaining_rollouts=_remaining_schedule_count(
+            experiment, expected_tasks, completed_keys
+        ),
         stage_prior_cost_usd=stage_prior_cost_usd,
         stage_prior_tokens=stage_prior_tokens,
         aggregate_prior_cost_usd=aggregate_prior_cost_usd,
@@ -829,9 +943,12 @@ def run_multi_arm(
                 aggregate_prior_cost_usd=aggregate_prior_cost_usd,
                 aggregate_prior_tokens=aggregate_prior_tokens,
             )
-            runtime_max_cost_usd, runtime_max_metered_tokens = _remaining_multi_budget(
+            runtime_max_cost_usd, runtime_max_metered_tokens = _require_remaining_schedule_capacity(
                 collected,
                 budget,
+                remaining_rollouts=_remaining_schedule_count(
+                    experiment, expected_tasks, completed_keys
+                ),
                 stage_prior_cost_usd=stage_prior_cost_usd,
                 stage_prior_tokens=stage_prior_tokens,
                 aggregate_prior_cost_usd=aggregate_prior_cost_usd,
@@ -931,16 +1048,24 @@ def run_multi_arm(
                     f"{arm_id} trial {trial} task {task_id}: expected one "
                     "execution-grounded rollout"
                 )
-            _require_runtime_budget_provenance(
-                selected[0],
-                max_metered_tokens=runtime_max_metered_tokens,
-                max_cost_usd=runtime_max_cost_usd,
-            )
+            runtime_budget_error: ValidationError | None = None
+            try:
+                _require_runtime_budget_provenance(
+                    selected[0],
+                    max_metered_tokens=runtime_max_metered_tokens,
+                    max_cost_usd=runtime_max_cost_usd,
+                    require_usage=infrastructure_error is None,
+                )
+            except ValidationError as exc:
+                runtime_budget_error = exc
+                _mark_runtime_budget_invalid(selected[0], str(exc))
             collected[arm_id].extend(selected)
             completed_keys[arm_id].add((task_id, trial))
             write_rollouts(outputs[arm_id], collected[arm_id])
             if infrastructure_error is not None:
                 raise infrastructure_error
+            if runtime_budget_error is not None:
+                raise runtime_budget_error
             _require_scoring_rollout(selected[0], variant=arm_id)
             _require_multi_budget(
                 collected,

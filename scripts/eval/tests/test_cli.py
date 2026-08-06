@@ -9,7 +9,7 @@ from pathlib import Path
 
 from scripts.eval.cli import main
 from scripts.eval.e2e_adapter import EVALUATION_CONTRACT_VERSION, grounding_fingerprints
-from scripts.eval.experiment import arm_config_ids
+from scripts.eval.experiment import arm_config_ids, fixed_rollout_budget
 from scripts.eval.model import load_json, stable_json, write_rollouts
 from scripts.eval.promotion import build_promotion_receipt
 from scripts.eval.tests.test_analysis import rollout
@@ -146,6 +146,9 @@ class CliTest(unittest.TestCase):
         suite_path = ROOT / "evals/suites/long-horizon-repository-pk.json"
         experiment = load_json(experiment_path)
         suite = load_json(suite_path)
+        fixed = fixed_rollout_budget(experiment["budget"], required=True)
+        assert fixed is not None
+        rollout_cost, rollout_tokens = fixed
         config_ids = arm_config_ids(
             experiment, suite, "a" * 64, "b" * 64, "c" * 64
         )
@@ -173,6 +176,10 @@ class CliTest(unittest.TestCase):
                                 "fingerprint": f"{arm_id}:{task['id']}",
                                 "environment_fingerprint": identity["environment_fingerprint"],
                                 "permission_mode": identity["permission_mode"],
+                                "runtime_budget": {
+                                    "max_metered_tokens": rollout_tokens,
+                                    "max_cost_usd": rollout_cost,
+                                },
                             }
                         )
                         item["evaluator"]["fingerprint"] = identity["grader_fingerprint"]
@@ -254,6 +261,9 @@ class CliTest(unittest.TestCase):
         suite_path = ROOT / "evals/suites/long-horizon-calibration.json"
         experiment = load_json(experiment_path)
         suite = load_json(suite_path)
+        fixed = fixed_rollout_budget(experiment["budget"], required=True)
+        assert fixed is not None
+        rollout_cost, rollout_tokens = fixed
         config_ids = arm_config_ids(
             experiment, suite, "e" * 64, "f" * 64, "d" * 64
         )
@@ -283,6 +293,10 @@ class CliTest(unittest.TestCase):
                             "fingerprint": arm_id,
                             "environment_fingerprint": identity["environment_fingerprint"],
                             "permission_mode": identity["permission_mode"],
+                            "runtime_budget": {
+                                "max_metered_tokens": rollout_tokens,
+                                "max_cost_usd": rollout_cost,
+                            },
                         }
                     )
                     item["evaluator"]["fingerprint"] = identity["grader_fingerprint"]

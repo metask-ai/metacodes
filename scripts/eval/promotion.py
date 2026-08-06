@@ -14,6 +14,7 @@ from .experiment import (
     ARM_IDS,
     PROMOTION_RECEIPT_SCHEMA_VERSION,
     experiment_fingerprint,
+    fixed_rollout_budget,
     validate_experiment,
     validate_promotion_receipt,
 )
@@ -111,6 +112,9 @@ def validate_multi_arm_evidence(
     formal_kernel_fingerprints = set()
     revisions = set()
     fingerprint = experiment_fingerprint(experiment, suite)
+    fixed = fixed_rollout_budget(experiment["budget"], required=True)
+    assert fixed is not None
+    fixed_rollout_cost, fixed_rollout_tokens = fixed
     for arm_id, rollouts in rollouts_by_arm.items():
         contract = validate_release_contract(
             rollouts,
@@ -148,6 +152,34 @@ def validate_multi_arm_evidence(
         tinykg_sha256s.add(hashes[1])
         formal_kernel_fingerprints.add(hashes[2])
         revisions.add(contract["harness_revision"])
+        for rollout in rollouts:
+            runtime_budget = rollout.get("harness", {}).get("runtime_budget")
+            expected_runtime_budget = {
+                "max_metered_tokens": fixed_rollout_tokens,
+                "max_cost_usd": fixed_rollout_cost,
+            }
+            if runtime_budget != expected_runtime_budget:
+                raise ValidationError(
+                    f"{arm_id} checkpoint runtime budget is not the frozen "
+                    "per-rollout contract"
+                )
+            observed_cost = rollout.get("metrics", {}).get("cost_usd")
+            token_values = [
+                rollout.get("metrics", {}).get(key) for key in TOKEN_METRICS
+            ]
+            if observed_cost is None or any(value is None for value in token_values):
+                raise ValidationError(
+                    f"{arm_id} checkpoint is missing fixed-budget telemetry"
+                )
+            observed_tokens = sum(int(value) for value in token_values)
+            if (
+                not math.isfinite(float(observed_cost))
+                or float(observed_cost) > fixed_rollout_cost
+                or observed_tokens > fixed_rollout_tokens
+            ):
+                raise ValidationError(
+                    f"{arm_id} checkpoint exceeded its frozen per-rollout budget"
+                )
         contracts[arm_id] = contract
     if len(metacodes_sha256s) != 1:
         raise ValidationError("multi-arm evidence mixes metacodes binary identities")
