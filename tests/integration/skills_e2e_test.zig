@@ -405,7 +405,21 @@ test "Skills E2E: project root lookup remains presentation-only utility" {
     defer allocator.free(cwd);
     const root = try cc.skills.findRepoRoot(allocator, cwd);
     defer allocator.free(root);
-    try std.testing.expect(std.mem.endsWith(u8, root, "cc-t2z"));
+
+    const root_is_cwd = std.mem.eql(u8, root, cwd);
+    const root_is_ancestor = cwd.len > root.len and
+        std.mem.eql(u8, root, cwd[0..root.len]) and
+        (cwd[root.len] == '/' or cwd[root.len] == '\\');
+    try std.testing.expect(root_is_cwd or root_is_ancestor);
+
+    const git_marker = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}/.git",
+        .{root},
+        0,
+    );
+    defer allocator.free(git_marker);
+    try std.testing.expect(pfs.exists(git_marker));
 }
 
 test "Skills E2E: slash adapter tokenization is bounded and rejects partial quotes" {
