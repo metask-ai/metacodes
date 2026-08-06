@@ -388,7 +388,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
         self.assertEqual(first["budget_carryover"]["stage_used_cost_usd"], 1.25)
         self.assertEqual(first["budget_carryover"]["stage_used_tokens"], 1234)
         self.assertEqual(first["budget_carryover"]["stage_remaining_cost_usd"], 98.75)
-        self.assertEqual(first["budget_carryover"]["stage_remaining_tokens"], 23_998_766)
+        self.assertEqual(first["budget_carryover"]["stage_remaining_tokens"], 24_998_766)
         self.assertEqual(
             first["schedule_capacity"],
             {
@@ -397,7 +397,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 "required_cost_reserve_usd": 36.0,
                 "required_token_reserve": 21_600_000,
                 "available_cost_usd": 98.75,
-                "available_tokens": 23_998_766,
+                "available_tokens": 24_998_766,
                 "strictly_feasible": True,
             },
         )
@@ -661,7 +661,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 "scripts.eval.paired_runner.formal_kernel_identity",
                 return_value=formal_identity,
             ), mock.patch("scripts.eval.paired_runner._run_once") as run_once:
-                # 24M stage cap - 2.4M carryover leaves exactly 18 × 1.2M.
+                # 25M stage cap - 3.4M carryover leaves exactly 18 × 1.2M.
                 # Equality is not enough because reaching the hard cap denies
                 # promotion; the runner must spend zero model calls.
                 with self.assertRaisesRegex(
@@ -678,7 +678,7 @@ class LongHorizonExperimentTest(unittest.TestCase):
                         output_dir=root / "checkpoints",
                         suite_path=SUITE_PATH,
                         allow_paid_rollouts=True,
-                        budget_used_tokens=2_400_000,
+                        budget_used_tokens=3_400_000,
                     )
             run_once.assert_not_called()
 

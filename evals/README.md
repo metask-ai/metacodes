@@ -192,9 +192,9 @@ AutoMemory）和 `tinykg`（再加 TinyKG/DAG 与原生 Lean formal audit）。�
 每个阶段使用 6-row Williams-style block，平衡顺序位置和一阶 carryover。
 
 - `long-horizon-three-arm-calibration-v2.json`：1 个非结论性机制任务 × 3 臂 × 6 trial =
-  18 rollouts；只校验基础设施、遥测、checkpoint 和 treatment 隔离，阶段上限 $100 / 24M token。
+  18 rollouts；只校验基础设施、遥测、checkpoint 和 treatment 隔离，阶段上限 $100 / 25M token。
 - `long-horizon-three-arm-confirmatory-v2.json`：3 个 held-out 真实历史仓库快照 × 3 臂 ×
-  6 trial = 54 rollouts；只在校准 receipt 通过后计分，阶段上限 $900 / 66M token。
+  6 trial = 54 rollouts；只在校准 receipt 通过后计分，阶段上限 $900 / 65M token。
 - 两阶段 aggregate 硬上限 $1000 / 90M token。每个 rollout 在所有 arm/order position
   上固定为最多 $2 / 1.2M metered token；runner 在任何模型请求前证明完整剩余 schedule 的
   固定上限总和严格小于 stage 与 aggregate 剩余额度。confirmatory runner 自动把 receipt 中的校准消耗
@@ -202,8 +202,13 @@ AutoMemory）和 `tinykg`（再加 TinyKG/DAG 与原生 Lean formal audit）。�
 
 最初的 3M/30M token 合同经两次非结论性 calibration 被实测证伪：完整 trial-0 的单 rollout
 最高达到 1,017,497 metered token，旧合同即使每条都恰好达成也不可能容纳 18 条 schedule。
-24M/90M 是基于该非评分资源上界预注册的容量修正，不改变 $100/$1000 用户授权、任务、grader、
-arm treatment 或 confirmatory held-out 数据。旧失败 checkpoint 保留原 fingerprint，不能混入新 schedule。
+24M/90M 是基于该非评分资源上界预注册的容量修正。attempt 3 随后因 treatment-attestation
+instrumentation 缺陷 fail-closed，但仍消耗 369,133 tokens，使累计 carryover 达到 2,588,426；
+24M 剩余额度 21,411,574 已低于未执行 18 条 schedule 的固定 reserve 21,600,000。2026-08-06
+因此只把 calibration stage cap 修正为 25M；这不是根据 arm outcome 调参，也不改变 $100/$1000
+用户授权、任务、grader、arm treatment、90M aggregate cap 或 confirmatory held-out 数据。旧失败
+checkpoint 保留原 fingerprint，不能混入新 schedule。为保持两阶段 token 上限之和仍为 90M，
+confirmatory 同步从 66M 重分配为 65M；它仍严格大于 54 × 1.2M = 64.8M 的固定 reserve。
 
 confirmatory 的 83–85 任务从三个完整 Git commit id 安全抽取稀疏快照，分别覆盖 POSIX pipe
 hangup drain、Windows swarm lock liveness 和 AgentCore Skill identity。物化器拒绝链接、特殊文件、
@@ -239,7 +244,7 @@ runner 会把 Lean checker 二进制、稳定的 v3 artifact manifest、独立�
 因此相同完整构建得到相同 treatment identity，同时 receipt 篡改仍会 fail closed。
 将 identity 绑定到三臂 config/checkpoint，但只向 `tinykg` 臂注入 checker 路径与 SHA-256；
 基线臂既拿不到路径，也不能从宿主环境继承它。用户在 2026-08-06 授权总预算不超过
-$1000 后，checked-in calibration manifest 只开启最多 $100 / 24M token 的基础设施校准；
+$1000 后，checked-in calibration manifest 只开启最多 $100 / 25M token 的基础设施校准；
 confirmatory manifest 仍保持 `paid_rollouts_enabled=false`。真正执行 calibration 还必须显式传
 `--allow-paid-rollouts`，形成合同与命令行双钥匙。每个昂贵 rollout 后独立原子 checkpoint；invalid 或基础设施
 失败先保留证据再中止。TinyKG binary 的 storage/schema/version/SHA 会在执行前冻结，只有 TinyKG

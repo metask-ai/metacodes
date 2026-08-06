@@ -15,7 +15,7 @@
   "schedule": {"kind": "balanced_williams", "complete_blocks_only": true, "task_order": "sorted"},
   "grading": {"blind": true, "arm_identity_visible_to_grader": false},
   "invalid_policy": {"exclude_from_scoring": true, "abort_after_invalid": true},
-  "budget": {"max_rollout_cost_usd": 2.0, "max_rollout_tokens": 1200000, "max_stage_cost_usd": 900.0, "max_stage_tokens": 66000000, "max_aggregate_cost_usd": 1000.0, "max_aggregate_tokens": 90000000, "paid_rollouts_enabled": false},
-  "promotion": {"requires_receipt": true, "source_experiment_id": "metacodes-long-horizon-three-arm-calibration-v2", "source_experiment": "evals/experiments/long-horizon-three-arm-calibration-v2.json", "source_experiment_fingerprint": "600772f9af665667", "gate": null},
+  "budget": {"max_rollout_cost_usd": 2.0, "max_rollout_tokens": 1200000, "max_stage_cost_usd": 900.0, "max_stage_tokens": 65000000, "max_aggregate_cost_usd": 1000.0, "max_aggregate_tokens": 90000000, "paid_rollouts_enabled": false},
+  "promotion": {"requires_receipt": true, "source_experiment_id": "metacodes-long-horizon-three-arm-calibration-v2", "source_experiment": "evals/experiments/long-horizon-three-arm-calibration-v2.json", "source_experiment_fingerprint": "f8d9e8620bf120a0", "gate": null},
   "stop_rules": {"on_budget_reached": "stop_before_next_rollout", "on_invalid_rollout": "checkpoint_then_abort", "on_infrastructure_failure": "mark_invalid_then_abort"}
 }
