@@ -252,6 +252,7 @@ python3 scripts/eval/cli.py promote-multi \
   --codex-style /tmp/metacodes-lh3-calibration/codex_style.jsonl \
   --claude-style /tmp/metacodes-lh3-calibration/claude_style.jsonl \
   --tinykg /tmp/metacodes-lh3-calibration/tinykg.jsonl \
+  --tinykg-binary zig-out/vendor/tinykg/tinykg \
   --output /tmp/metacodes-lh3-calibration/promotion.json
 ```
 
@@ -267,6 +268,7 @@ python3 scripts/eval/cli.py report-multi \
   --codex-style /tmp/metacodes-lh3-confirmatory/codex_style.jsonl \
   --claude-style /tmp/metacodes-lh3-confirmatory/claude_style.jsonl \
   --tinykg /tmp/metacodes-lh3-confirmatory/tinykg.jsonl \
+  --tinykg-binary zig-out/vendor/tinykg/tinykg \
   --promotion-receipt /tmp/metacodes-lh3-calibration/promotion.json \
   --calibration-dir /tmp/metacodes-lh3-calibration \
   --markdown /tmp/metacodes-lh3-confirmatory/report.md \
