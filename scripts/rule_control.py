@@ -1215,7 +1215,8 @@ def observe_build_test_throughput(repo: Path) -> Observation:
     The sensor governs the mechanisms that make timing evidence trustworthy:
     exact source inventory, deterministic partitioning, fail-closed aggregate
     reports, per-test diagnostics, separate fast/full build paths, and
-    location-independent shipped artifacts. Actual wall/CPU/RSS values remain
+    location-independent shipped artifacts and reproducible formal identity.
+    Actual wall/CPU/RSS values remain
     host observations and are recorded by the experiment; Lean decides only
     whether the integrity obligations survived.
     """
@@ -1227,6 +1228,7 @@ def observe_build_test_throughput(repo: Path) -> Observation:
         "aggregate_source_inventory",
         "fast_and_full_build_paths",
         "reproducible_shipped_artifacts",
+        "reproducible_formal_artifact_identity",
     ]
     relative_sources = {
         "timing": "scripts/time_test_runner.zig",
@@ -1235,6 +1237,8 @@ def observe_build_test_throughput(repo: Path) -> Observation:
         "suite": "tests/integration_suite.zig",
         "build": "build.zig",
         "artifact_repro": "scripts/tests/test_artifact_reproducibility.py",
+        "formal_build": "scripts/build-formal-kernel.sh",
+        "experiment": "scripts/eval/experiment.py",
     }
     paths = {name: repo / relative for name, relative in relative_sources.items()}
     missing_files = [relative_sources[name] for name, path in paths.items() if not path.is_file()]
@@ -1392,7 +1396,7 @@ def observe_build_test_throughput(repo: Path) -> Observation:
         ),
     }
 
-    artifact_repro_checks = {
+    tinykg_artifact_repro_checks = {
         "shipped TinyKG strips location-bearing debug symbols": (
             "tinykg_exe.root_module.strip = true" in sources["build"]
         ),
@@ -1424,13 +1428,95 @@ def observe_build_test_throughput(repo: Path) -> Observation:
         ),
     }
 
+    fingerprint_payload_keys: set[str] = set()
+    try:
+        experiment_tree = ast.parse(
+            read_text(paths["experiment"]), filename=str(paths["experiment"])
+        )
+        identity_function = next(
+            node
+            for node in ast.walk(experiment_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "formal_kernel_identity"
+        )
+        payload_assignment = next(
+            node
+            for node in ast.walk(identity_function)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "fingerprint_payload"
+                for target in node.targets
+            )
+            and isinstance(node.value, ast.Dict)
+        )
+        fingerprint_payload_keys = {
+            key.value
+            for key in payload_assignment.value.keys
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        }
+    except (SyntaxError, StopIteration):
+        pass
+
+    formal_artifact_repro_checks = {
+        "builder separates stable manifest from time-bearing receipt": all(
+            marker in sources["formal_build"]
+            for marker in (
+                "metacodes-formal-artifact-v3",
+                "metacodes-formal-build-receipt-v1",
+                "artifact_manifest_sha256",
+                "built_at_utc",
+            )
+        ),
+        "runtime requires and rehashes the complete build receipt": all(
+            marker in sources["experiment"]
+            for marker in (
+                "FORMAL_BUILD_RECEIPT_KEYS",
+                "build_receipt_path.lstat()",
+                "artifact_manifest_sha256",
+                "build receipt changed during its readiness probe",
+            )
+        ),
+        "stable fingerprint excludes the per-build receipt": (
+            {
+                "binary_sha256",
+                "provenance_sha256",
+                "checker_version",
+                "request_schema",
+                "memory_request_schema",
+                "verdict_schema",
+            }
+            == fingerprint_payload_keys
+            and "build_receipt_sha256" not in fingerprint_payload_keys
+        ),
+        "feedback invokes two complete formal builds": all(
+            marker in sources["artifact_repro"]
+            for marker in (
+                "FormalKernelArtifactIdentityReproducibilityTest",
+                "test_two_isolated_complete_builds_share_identity_and_bind_time_receipts",
+                "scripts/build-formal-kernel.sh",
+                "for artifact in artifacts",
+            )
+        ),
+        "feedback compares binary manifest and stable fingerprint": all(
+            marker in sources["artifact_repro"]
+            for marker in (
+                "self.assertEqual(payloads[0], payloads[1])",
+                "self.assertEqual(manifests[0], manifests[1])",
+                'identities[0]["artifact_fingerprint"]',
+                'identities[1]["artifact_fingerprint"]',
+            )
+        ),
+    }
+
     obligations = {
         declarations[0]: timing_checks,
         declarations[1]: sharding_checks,
         declarations[2]: aggregation_checks,
         declarations[3]: inventory_checks,
         declarations[4]: build_path_checks,
-        declarations[5]: artifact_repro_checks,
+        declarations[5]: tinykg_artifact_repro_checks,
+        declarations[6]: formal_artifact_repro_checks,
     }
     covered = [name for name, checks in obligations.items() if all(checks.values())]
     missing = [name for name in declarations if name not in covered]
@@ -1466,6 +1552,13 @@ def observe_build_test_throughput(repo: Path) -> Observation:
                     "scripts.tests.test_artifact_reproducibility."
                     "TinyKgArtifactReproducibilityTest."
                     "test_two_isolated_vendor_builds_are_byte_identical_and_runnable"
+                )
+            },
+            {
+                "unittest": (
+                    "scripts.tests.test_artifact_reproducibility."
+                    "FormalKernelArtifactIdentityReproducibilityTest."
+                    "test_two_isolated_complete_builds_share_identity_and_bind_time_receipts"
                 )
             },
         ],

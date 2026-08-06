@@ -233,7 +233,10 @@ python3 scripts/eval/cli.py run-multi \
   --dry-run --plan-output /tmp/metacodes-lh3-confirmatory-plan.json
 ```
 
-runner 会把 Lean checker 二进制、相邻 provenance 及其版本化协议验证为一个 artifact identity，
+runner 会把 Lean checker 二进制、稳定的 v3 artifact manifest、独立的 build receipt
+及其版本化协议一起验证。实验 artifact fingerprint 绑定二进制、源码、工具链与协议，
+不绑定 `built_at_utc`；带时间的 receipt 仍被单独哈希、绑定并在 rollout 前后重验，
+因此相同完整构建得到相同 treatment identity，同时 receipt 篡改仍会 fail closed。
 将 identity 绑定到三臂 config/checkpoint，但只向 `tinykg` 臂注入 checker 路径与 SHA-256；
 基线臂既拿不到路径，也不能从宿主环境继承它。用户在 2026-08-06 授权总预算不超过
 $1000 后，checked-in calibration manifest 只开启最多 $100 / 24M token 的基础设施校准；

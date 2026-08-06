@@ -693,7 +693,37 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
             'right = hashlib.sha256(payloads[1])\n'
             'self.assertEqual(payloads[0], payloads[1])\n'
             'versions = [run([str(artifact), "version"]) for artifact in artifacts]\n'
-            'self.assertEqual(versions[0].stdout, versions[1].stdout)\n',
+            'self.assertEqual(versions[0].stdout, versions[1].stdout)\n'
+            'class FormalKernelArtifactIdentityReproducibilityTest:\n'
+            '    def test_two_isolated_complete_builds_share_identity_and_bind_time_receipts(self):\n'
+            '        results = [run(["scripts/build-formal-kernel.sh"]) for artifact in artifacts]\n'
+            '        self.assertEqual(payloads[0], payloads[1])\n'
+            '        self.assertEqual(manifests[0], manifests[1])\n'
+            '        self.assertEqual(identities[0]["artifact_fingerprint"], identities[1]["artifact_fingerprint"])\n',
+            encoding="utf-8",
+        )
+        (root / "scripts/build-formal-kernel.sh").write_text(
+            'manifest="metacodes-formal-artifact-v3"\n'
+            'receipt="metacodes-formal-build-receipt-v1"\n'
+            'artifact_manifest_sha256="$manifest_sha256"\n'
+            'built_at_utc=$(date -u)\n',
+            encoding="utf-8",
+        )
+        (root / "scripts/eval").mkdir(parents=True, exist_ok=True)
+        (root / "scripts/eval/experiment.py").write_text(
+            'FORMAL_BUILD_RECEIPT_KEYS = {"artifact_manifest_sha256"}\n'
+            'def formal_kernel_identity():\n'
+            '    build_receipt_path.lstat()\n'
+            '    artifact_manifest_sha256 = provenance_sha256\n'
+            '    message = "build receipt changed during its readiness probe"\n'
+            '    fingerprint_payload = {\n'
+            '        "binary_sha256": binary_sha256,\n'
+            '        "provenance_sha256": provenance_sha256,\n'
+            '        "checker_version": checker_version,\n'
+            '        "request_schema": request_schema,\n'
+            '        "memory_request_schema": memory_request_schema,\n'
+            '        "verdict_schema": verdict_schema,\n'
+            '    }\n',
             encoding="utf-8",
         )
 
@@ -744,13 +774,13 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
         )
         return temporary, root
 
-    def test_all_six_integrity_obligations_are_observed(self) -> None:
+    def test_all_seven_integrity_obligations_are_observed(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
         observation = rule_control.observe_build_test_throughput(root)
         self.assertTrue(observation.sensor_ok, observation.errors)
-        self.assertEqual(6, observation.declared)
-        self.assertEqual(6, observation.covered)
+        self.assertEqual(7, observation.declared)
+        self.assertEqual(7, observation.covered)
         self.assertEqual(
             ["test:lib-shard-harness", "test:lib", "test:spike"],
             [binding["step"] for binding in observation.feedback_bindings if "step" in binding],
@@ -759,7 +789,10 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
             [
                 "scripts.tests.test_artifact_reproducibility."
                 "TinyKgArtifactReproducibilityTest."
-                "test_two_isolated_vendor_builds_are_byte_identical_and_runnable"
+                "test_two_isolated_vendor_builds_are_byte_identical_and_runnable",
+                "scripts.tests.test_artifact_reproducibility."
+                "FormalKernelArtifactIdentityReproducibilityTest."
+                "test_two_isolated_complete_builds_share_identity_and_bind_time_receipts",
             ],
             [
                 binding["unittest"]
@@ -853,6 +886,24 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
         observation = rule_control.observe_build_test_throughput(root)
         self.assertFalse(observation.sensor_ok)
         self.assertIn("reproducible_shipped_artifacts", observation.missing_declarations)
+
+    def test_time_bearing_formal_fingerprint_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        experiment = root / "scripts/eval/experiment.py"
+        experiment.write_text(
+            experiment.read_text(encoding="utf-8").replace(
+                '"verdict_schema": verdict_schema,',
+                '"verdict_schema": verdict_schema,\n'
+                '        "build_receipt_sha256": build_receipt_sha256,',
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_build_test_throughput(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "reproducible_formal_artifact_identity", observation.missing_declarations
+        )
 
 
 class EvalBudgetCheckpointSensorTests(unittest.TestCase):
@@ -1319,7 +1370,7 @@ class TopologyTests(unittest.TestCase):
         )
         self.assertFalse(weakened["decision"])
 
-    def test_build_test_rule_requires_its_six_obligation_kernel(self) -> None:
+    def test_build_test_rule_requires_its_seven_obligation_kernel(self) -> None:
         rule = self.complete_rule()
         rule["id"] = "build.test-throughput-integrity.l2"
         rule["sensor"] = {

@@ -12,6 +12,7 @@ repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 lean_dir="$repo_dir/control-plane/lean"
 output=${1:-"$repo_dir/zig-out/libexec/metacodes/metacodes-formal-kernel"}
 manifest=${2:-"$output.provenance.json"}
+receipt=${3:-"$output.build-receipt.json"}
 lake=${LAKE:-"$HOME/.elan/bin/lake"}
 
 if [[ ! -x "$lake" ]]; then
@@ -19,11 +20,22 @@ if [[ ! -x "$lake" ]]; then
   exit 1
 fi
 
-mkdir -p "$(dirname "$output")" "$(dirname "$manifest")"
+mkdir -p "$(dirname "$output")" "$(dirname "$manifest")" "$(dirname "$receipt")"
 
+host_os=$(uname -s)
 (
   cd "$lean_dir"
-  "$lake" build metacodes-formal-kernel
+  if [[ "$host_os" == "Darwin" ]]; then
+    # A clean Darwin build cannot first link Lake's executable and then repair
+    # it: Lean 4.14's bundled ld64.lld may reject the current macOS SDK before
+    # our Apple-clang relink is reached. Build only the exported objects here.
+    "$lake" build \
+      FormalMain:c.o \
+      MetaCodesControl.FormalKernel:c.o \
+      MetaCodesControl.MemoryMigration:c.o
+  else
+    "$lake" build metacodes-formal-kernel
+  fi
 )
 
 # Lean permits declarations containing `sorry` to compile by inserting
@@ -43,7 +55,6 @@ if [[ "$axiom_audit" != "$expected_axioms" ]]; then
   exit 1
 fi
 
-host_os=$(uname -s)
 linker="lake-default"
 if [[ "$host_os" == "Darwin" ]]; then
   lean_prefix=$(cd "$lean_dir" && "$lake" env lean --print-prefix)
@@ -155,11 +166,25 @@ lean_version=$(cd "$lean_dir" && "$lake" env lean --version | tr -d '\n')
 host_arch=$(uname -m)
 built_at_utc=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
+# The artifact manifest is intentionally time-independent.  It is the stable
+# semantic identity used by experiment fingerprints.  Per-build facts such as
+# the wall-clock timestamp live in a separately hashed receipt so rebuilding
+# identical source cannot silently create a different experiment treatment.
 printf '%s\n' \
-  "{\"schema_version\":\"metacodes-formal-artifact-v2\",\"checker_version\":\"metacodes-formal-kernel-v2\",\"request_schema\":\"metacodes-formal-request-v1\",\"memory_request_schema\":\"metacodes-memory-migration-request-v1\",\"verdict_schema\":\"metacodes-formal-verdict-v2\",\"binary_sha256\":\"$binary_sha256\",\"binary_bytes\":$binary_bytes,\"kernel_source_sha256\":\"$kernel_source_sha256\",\"memory_kernel_source_sha256\":\"$memory_kernel_source_sha256\",\"main_source_sha256\":\"$main_source_sha256\",\"axiom_audit_source_sha256\":\"$axiom_audit_source_sha256\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"host_os\":\"$host_os\",\"host_arch\":\"$host_arch\",\"linker\":\"$linker\",\"lean_version\":\"$lean_version\",\"native_smoke\":\"passed\",\"built_at_utc\":\"$built_at_utc\"}" \
+  "{\"schema_version\":\"metacodes-formal-artifact-v3\",\"checker_version\":\"metacodes-formal-kernel-v2\",\"request_schema\":\"metacodes-formal-request-v1\",\"memory_request_schema\":\"metacodes-memory-migration-request-v1\",\"verdict_schema\":\"metacodes-formal-verdict-v2\",\"binary_sha256\":\"$binary_sha256\",\"binary_bytes\":$binary_bytes,\"kernel_source_sha256\":\"$kernel_source_sha256\",\"memory_kernel_source_sha256\":\"$memory_kernel_source_sha256\",\"main_source_sha256\":\"$main_source_sha256\",\"axiom_audit_source_sha256\":\"$axiom_audit_source_sha256\",\"axiom_policy\":\"propext,Quot.sound\",\"axiom_audit\":\"passed\",\"host_os\":\"$host_os\",\"host_arch\":\"$host_arch\",\"linker\":\"$linker\",\"lean_version\":\"$lean_version\",\"native_smoke\":\"passed\"}" \
   >"$manifest"
+
+if command -v shasum >/dev/null 2>&1; then
+  manifest_sha256=$(shasum -a 256 "$manifest" | awk '{print $1}')
+else
+  manifest_sha256=$(sha256sum "$manifest" | awk '{print $1}')
+fi
+printf '%s\n' \
+  "{\"schema_version\":\"metacodes-formal-build-receipt-v1\",\"artifact_manifest_sha256\":\"$manifest_sha256\",\"binary_sha256\":\"$binary_sha256\",\"built_at_utc\":\"$built_at_utc\"}" \
+  >"$receipt"
 
 echo "formal kernel: $output"
 echo "sha256: $binary_sha256"
 echo "bytes: $binary_bytes"
 echo "provenance: $manifest"
+echo "build receipt: $receipt"

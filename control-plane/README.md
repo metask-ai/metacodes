@@ -127,7 +127,7 @@ requires controlled rollout evidence.
 work inside the same feedback discipline without pretending that a theorem can
 predict host wall time. Zig and the operating system measure wall/CPU/RSS;
 Lean decides whether the measurement came from an admissible test topology.
-Its six fixed obligations are:
+Its seven fixed obligations are:
 
 - a diagnostic runner reports every compiled test, slow buckets/top-N, total
   time, failures, skips, and allocator leaks with checked duration arithmetic;
@@ -148,15 +148,22 @@ Its six fixed obligations are:
   cache/prefix paths, requires byte-identical SHA-256 results, then executes
   both binaries. A source-order claim or a single successful build is not
   reproducibility evidence.
+- the formal checker publishes a time-independent v3 artifact manifest and a
+  separately hashed, time-bearing build receipt. Two complete builder runs
+  must produce identical executable bytes, manifest bytes, and artifact
+  fingerprints; the runtime still requires, binds, and rehashes the full
+  receipt so excluding build time from treatment identity does not weaken
+  tamper detection.
 
-`buildTestSignal` fixes that surface at 6/6. The sensor also refuses aggregate
+`buildTestSignal` fixes that surface at 7/7. The sensor also refuses aggregate
 inventory shrinkage below the measured 2026-08-06 baseline of 67 files. Real
 feedback runs the negative shard harness, the four-shard core graph, and the
 eight-shard fail-closed aggregate integration graph plus the isolated TinyKG
-double build, then re-observes all test sources. The monolithic and per-test
+double build and complete formal double build, then re-observes all test
+sources. The monolithic and per-test
 timing paths remain explicit diagnostic gates rather than taxing every release.
 A lower elapsed time with missing coverage, hidden failure/leak semantics, a
-changed source graph during measurement, or a weakened 5/5 adapter is blocked.
+changed source graph during measurement, or a weakened 6/6 adapter is blocked.
 Cold and warm measurements must still be labelled separately in experiment
 data; Lean validates the governance facts supplied by sensors, not the
 physical truth of an unobserved cache claim.

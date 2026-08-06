@@ -48,7 +48,7 @@ def fake_formal_artifact(root: Path) -> tuple[Path, dict]:
     binary_sha = hashlib.sha256(binary.read_bytes()).hexdigest()
     provenance_path = Path(f"{binary}.provenance.json")
     provenance = {
-        "schema_version": "metacodes-formal-artifact-v2",
+        "schema_version": "metacodes-formal-artifact-v3",
         "checker_version": "metacodes-formal-kernel-v2",
         "request_schema": "metacodes-formal-request-v1",
         "memory_request_schema": "metacodes-memory-migration-request-v1",
@@ -66,13 +66,24 @@ def fake_formal_artifact(root: Path) -> tuple[Path, dict]:
         "linker": "test",
         "lean_version": "Lean test",
         "native_smoke": "passed",
-        "built_at_utc": "2026-08-06T00:00:00Z",
     }
     provenance_path.write_text(
         json.dumps(provenance, sort_keys=True, separators=(",", ":")),
         encoding="utf-8",
     )
     provenance_sha = hashlib.sha256(provenance_path.read_bytes()).hexdigest()
+    build_receipt_path = Path(f"{binary}.build-receipt.json")
+    build_receipt = {
+        "schema_version": "metacodes-formal-build-receipt-v1",
+        "artifact_manifest_sha256": provenance_sha,
+        "binary_sha256": binary_sha,
+        "built_at_utc": "2026-08-06T00:00:00Z",
+    }
+    build_receipt_path.write_text(
+        json.dumps(build_receipt, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    build_receipt_sha = hashlib.sha256(build_receipt_path.read_bytes()).hexdigest()
     fingerprint_payload = {
         "binary_sha256": binary_sha,
         "provenance_sha256": provenance_sha,
@@ -87,6 +98,8 @@ def fake_formal_artifact(root: Path) -> tuple[Path, dict]:
         "bytes": binary.stat().st_size,
         "provenance_path": str(provenance_path.resolve()),
         "provenance_sha256": provenance_sha,
+        "build_receipt_path": str(build_receipt_path.resolve()),
+        "build_receipt_sha256": build_receipt_sha,
         "checker_version": "metacodes-formal-kernel-v2",
         "artifact_fingerprint": hashlib.sha256(
             json.dumps(
@@ -280,6 +293,49 @@ class LongHorizonExperimentTest(unittest.TestCase):
             provenance["binary_sha256"] = "0" * 64
             provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
             with self.assertRaisesRegex(ValidationError, "does not bind"):
+                formal_kernel_identity(binary)
+
+    def test_formal_kernel_identity_separates_stable_manifest_from_build_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary, _ = fake_formal_artifact(Path(directory))
+            verdict = {
+                "schema_version": "metacodes-formal-verdict-v2",
+                "checker_version": "metacodes-formal-kernel-v2",
+                "request_id": "a" * 64,
+                "operation": "task_audit",
+                "proposal_sha256": "b" * 64,
+                "snapshot_sha256": "c" * 64,
+                "snapshot_revision": "d" * 64,
+                "decision": "admit",
+                "admitted": True,
+                "reason_codes": [],
+            }
+            with mock.patch(
+                "scripts.eval.experiment.subprocess.run",
+                return_value=mock.Mock(returncode=0, stdout=json.dumps(verdict), stderr=""),
+            ):
+                first = formal_kernel_identity(binary)
+                receipt_path = Path(first["build_receipt_path"])
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                receipt["built_at_utc"] = "2026-08-06T00:00:01Z"
+                receipt_path.write_text(
+                    json.dumps(receipt, sort_keys=True, separators=(",", ":")),
+                    encoding="utf-8",
+                )
+                second = formal_kernel_identity(binary)
+
+            self.assertEqual(first["artifact_fingerprint"], second["artifact_fingerprint"])
+            self.assertEqual(first["provenance_sha256"], second["provenance_sha256"])
+            self.assertNotEqual(
+                first["build_receipt_sha256"], second["build_receipt_sha256"]
+            )
+
+            receipt["artifact_manifest_sha256"] = "0" * 64
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            with mock.patch(
+                "scripts.eval.experiment.subprocess.run",
+                return_value=mock.Mock(returncode=0, stdout=json.dumps(verdict), stderr=""),
+            ), self.assertRaisesRegex(ValidationError, "does not bind"):
                 formal_kernel_identity(binary)
 
     def test_dry_run_freezes_binary_revision_arm_env_and_all_rollouts(self):

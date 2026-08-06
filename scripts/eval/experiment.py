@@ -9,6 +9,7 @@ import os
 import stat
 import subprocess
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
@@ -247,6 +248,12 @@ FORMAL_PROVENANCE_KEYS = {
     "linker",
     "lean_version",
     "native_smoke",
+}
+
+FORMAL_BUILD_RECEIPT_KEYS = {
+    "schema_version",
+    "artifact_manifest_sha256",
+    "binary_sha256",
     "built_at_utc",
 }
 
@@ -351,7 +358,7 @@ def _formal_probe(binary: Path) -> None:
 
 
 def formal_kernel_identity(binary: Path) -> Dict[str, Any]:
-    """Freeze the executable and mandatory adjacent provenance as one artifact."""
+    """Freeze stable artifact identity plus its mandatory per-build receipt."""
     try:
         binary_info = binary.lstat()
     except OSError as exc:
@@ -384,10 +391,23 @@ def formal_kernel_identity(binary: Path) -> Dict[str, Any]:
         raise ValidationError("formal kernel provenance must be a real regular file")
     if provenance_info.st_size <= 0 or provenance_info.st_size > 64 * 1024:
         raise ValidationError("formal kernel provenance size is outside the 1..65536 byte bound")
+    build_receipt_path = Path(f"{resolved}.build-receipt.json")
+    try:
+        build_receipt_info = build_receipt_path.lstat()
+    except OSError as exc:
+        raise ValidationError(f"cannot inspect formal kernel build receipt: {exc}") from exc
+    if build_receipt_path.is_symlink() or not stat.S_ISREG(build_receipt_info.st_mode):
+        raise ValidationError("formal kernel build receipt must be a real regular file")
+    if build_receipt_info.st_size <= 0 or build_receipt_info.st_size > 64 * 1024:
+        raise ValidationError(
+            "formal kernel build receipt size is outside the 1..65536 byte bound"
+        )
 
     binary_sha256 = hashlib.sha256(resolved.read_bytes()).hexdigest()
     provenance_bytes = provenance_path.read_bytes()
     provenance_sha256 = hashlib.sha256(provenance_bytes).hexdigest()
+    build_receipt_bytes = build_receipt_path.read_bytes()
+    build_receipt_sha256 = hashlib.sha256(build_receipt_bytes).hexdigest()
     provenance = _load_unique_json(provenance_path, "formal kernel provenance")
     if set(provenance) != FORMAL_PROVENANCE_KEYS:
         unknown = sorted(set(provenance) - FORMAL_PROVENANCE_KEYS)
@@ -396,7 +416,7 @@ def formal_kernel_identity(binary: Path) -> Dict[str, Any]:
             f"formal kernel provenance fields mismatch: missing={missing} unknown={unknown}"
         )
     if (
-        provenance.get("schema_version") != "metacodes-formal-artifact-v2"
+        provenance.get("schema_version") != "metacodes-formal-artifact-v3"
         or provenance.get("checker_version") != "metacodes-formal-kernel-v2"
         or provenance.get("request_schema") != "metacodes-formal-request-v1"
         or provenance.get("memory_request_schema")
@@ -408,7 +428,7 @@ def formal_kernel_identity(binary: Path) -> Dict[str, Any]:
         or provenance.get("binary_sha256") != binary_sha256
         or provenance.get("binary_bytes") != binary_info.st_size
     ):
-        raise ValidationError("formal kernel provenance does not bind a deployable v2 artifact")
+        raise ValidationError("formal kernel provenance does not bind a deployable v3 artifact")
     source_hash_fields = (
         "kernel_source_sha256",
         "memory_kernel_source_sha256",
@@ -423,11 +443,47 @@ def formal_kernel_identity(binary: Path) -> Dict[str, Any]:
     ):
         raise ValidationError("formal kernel provenance contains an invalid source digest")
 
+    build_receipt = _load_unique_json(
+        build_receipt_path, "formal kernel build receipt"
+    )
+    if set(build_receipt) != FORMAL_BUILD_RECEIPT_KEYS:
+        unknown = sorted(set(build_receipt) - FORMAL_BUILD_RECEIPT_KEYS)
+        missing = sorted(FORMAL_BUILD_RECEIPT_KEYS - set(build_receipt))
+        raise ValidationError(
+            "formal kernel build receipt fields mismatch: "
+            f"missing={missing} unknown={unknown}"
+        )
+    if (
+        build_receipt.get("schema_version")
+        != "metacodes-formal-build-receipt-v1"
+        or build_receipt.get("artifact_manifest_sha256") != provenance_sha256
+        or build_receipt.get("binary_sha256") != binary_sha256
+    ):
+        raise ValidationError(
+            "formal kernel build receipt does not bind the artifact manifest and binary"
+        )
+    built_at_utc = build_receipt.get("built_at_utc")
+    if not isinstance(built_at_utc, str):
+        raise ValidationError("formal kernel build receipt has an invalid timestamp")
+    try:
+        datetime.strptime(built_at_utc, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError as exc:
+        raise ValidationError(
+            "formal kernel build receipt has an invalid timestamp"
+        ) from exc
+
     _formal_probe(resolved)
     if hashlib.sha256(resolved.read_bytes()).hexdigest() != binary_sha256:
         raise ValidationError("formal kernel changed during its readiness probe")
     if hashlib.sha256(provenance_path.read_bytes()).hexdigest() != provenance_sha256:
         raise ValidationError("formal kernel provenance changed during its readiness probe")
+    if (
+        hashlib.sha256(build_receipt_path.read_bytes()).hexdigest()
+        != build_receipt_sha256
+    ):
+        raise ValidationError(
+            "formal kernel build receipt changed during its readiness probe"
+        )
     fingerprint_payload = {
         "binary_sha256": binary_sha256,
         "provenance_sha256": provenance_sha256,
@@ -442,6 +498,8 @@ def formal_kernel_identity(binary: Path) -> Dict[str, Any]:
         "bytes": binary_info.st_size,
         "provenance_path": str(provenance_path),
         "provenance_sha256": provenance_sha256,
+        "build_receipt_path": str(build_receipt_path),
+        "build_receipt_sha256": build_receipt_sha256,
         "checker_version": provenance["checker_version"],
         "artifact_fingerprint": hashlib.sha256(
             stable_json(fingerprint_payload).encode("utf-8")

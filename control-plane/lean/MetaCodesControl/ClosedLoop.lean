@@ -108,15 +108,16 @@ def experienceFeedbackReleaseAllowed
     (topology : Topology) (observation : Observation) : Bool :=
   experienceFeedbackSignal topology observation == .admitRelease
 
-/-- The build/test throughput slice has six non-substitutable obligations:
+/-- The build/test throughput slice has seven non-substitutable obligations:
 per-test diagnostics, deterministic sharding, fail-closed aggregation, exact
-source inventory, explicit fast/full build paths, and location-independent
-shipped artifacts.  Fixing the cardinality
+source inventory, explicit fast/full build paths, a location-independent
+TinyKG binary, and a reproducible formal artifact identity whose per-build
+receipt is not part of the experiment treatment.  Fixing the cardinality
 here prevents a weakened repository sensor from calling its surviving subset
 complete after an optimization silently removes a coverage guard. -/
 def buildTestSignal
     (topology : Topology) (observation : Observation) : Signal :=
-  if observation.declared == 6 then signal topology observation else .blockRelease
+  if observation.declared == 7 then signal topology observation else .blockRelease
 
 def buildTestNextState
     (topology : Topology) (observation : Observation) : RuleState :=
@@ -228,16 +229,16 @@ theorem experience_feedback_wrong_cardinality_blocks
     experienceFeedbackSignal topology observation = .blockRelease := by
   simp [experienceFeedbackSignal, wrong]
 
-/-- Admission proves that all six throughput-integrity obligations were
+/-- Admission proves that all seven throughput-integrity obligations were
 observed and survived real test feedback; wall-clock speed alone is never a
 substitute for coverage or leak/failure semantics. -/
-theorem build_test_admitted_implies_six_obligations
+theorem build_test_admitted_implies_seven_obligations
     (topology : Topology) (observation : Observation)
     (admitted : buildTestReleaseAllowed topology observation = true) :
-    observation.declared = 6 ∧ observation.covered = 6 := by
+    observation.declared = 7 ∧ observation.covered = 7 := by
   simp [buildTestReleaseAllowed, buildTestSignal] at admitted
   split at admitted
-  · rename_i declaredSix
+  · rename_i declaredSeven
     have genericAdmitted : releaseAllowed topology observation = true := by
       simpa [releaseAllowed] using admitted
     have exact := admitted_implies_zero_deviation topology observation genericAdmitted
@@ -246,16 +247,16 @@ theorem build_test_admitted_implies_six_obligations
 
 theorem build_test_missing_obligation_blocks
     (topology : Topology) (observation : Observation)
-    (declaresSix : observation.declared = 6)
-    (missing : observation.covered < 6) :
+    (declaresSeven : observation.declared = 7)
+    (missing : observation.covered < 7) :
     buildTestSignal topology observation = .blockRelease := by
-  simp [buildTestSignal, declaresSix]
+  simp [buildTestSignal, declaresSeven]
   apply missing_evidence_blocks topology observation
   omega
 
 theorem build_test_wrong_cardinality_blocks
     (topology : Topology) (observation : Observation)
-    (wrong : observation.declared ≠ 6) :
+    (wrong : observation.declared ≠ 7) :
     buildTestSignal topology observation = .blockRelease := by
   simp [buildTestSignal, wrong]
 
