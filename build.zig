@@ -48,6 +48,90 @@ fn addNestedBuildCacheArgs(b: *std.Build, run: *std.Build.Step.Run) void {
     });
 }
 
+const aggregate_test_exclusions = [_][]const u8{
+    // Has a dedicated ABI artifact/consumer gate with a different module graph.
+    "component/agentcore_abi_test.zig",
+};
+
+fn isAggregateTestExclusion(path: []const u8) bool {
+    for (aggregate_test_exclusions) |excluded| {
+        if (std.mem.eql(u8, path, excluded)) return true;
+    }
+    return false;
+}
+
+fn countAggregateImport(source: []const u8, expected_line: []const u8) usize {
+    var count: usize = 0;
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.eql(u8, std.mem.trim(u8, line, " \t\r"), expected_line)) {
+            count = std.math.add(usize, count, 1) catch @panic("integration inventory count overflow");
+        }
+    }
+    return count;
+}
+
+/// Fail during build-graph construction if a new component/integration test
+/// is not wired into the aggregate suite. The old one-artifact-per-file graph
+/// discovered new files implicitly; aggregation is much faster, but needs this
+/// explicit guard so the speedup can never silently reduce coverage.
+fn validateAggregateTestInventory(b: *std.Build) void {
+    const suite = b.build_root.handle.readFileAlloc(
+        b.graph.io,
+        "tests/integration_suite.zig",
+        b.allocator,
+        .limited(1024 * 1024),
+    ) catch |err| std.debug.panic("cannot read aggregate test inventory: {t}", .{err});
+
+    const roots = [_]struct { dir: []const u8, prefix: []const u8 }{
+        .{ .dir = "tests/component", .prefix = "component" },
+        .{ .dir = "tests/integration", .prefix = "integration" },
+    };
+    for (roots) |root| {
+        var dir = b.build_root.handle.openDir(b.graph.io, root.dir, .{
+            .iterate = true,
+            .follow_symlinks = false,
+        }) catch |err| std.debug.panic("cannot scan {s}: {t}", .{ root.dir, err });
+        defer dir.close(b.graph.io);
+        var walker = dir.walk(b.allocator) catch |err|
+            std.debug.panic("cannot walk {s}: {t}", .{ root.dir, err });
+        defer walker.deinit();
+
+        while (walker.next(b.graph.io) catch |err|
+            std.debug.panic("cannot enumerate {s}: {t}", .{ root.dir, err })) |entry|
+        {
+            const kind = if (entry.kind == .unknown)
+                (entry.dir.statFile(b.graph.io, entry.basename, .{ .follow_symlinks = false }) catch |err|
+                    std.debug.panic("cannot stat {s}/{s}: {t}", .{ root.dir, entry.path, err })).kind
+            else
+                entry.kind;
+            if (kind != .file or !std.mem.endsWith(u8, entry.basename, "_test.zig")) continue;
+            const path = b.fmt("{s}/{s}", .{ root.prefix, entry.path });
+            std.mem.replaceScalar(u8, path, '\\', '/');
+            const expected_line = b.fmt("_ = @import(\"{s}\");", .{path});
+            const occurrences = countAggregateImport(suite, expected_line);
+            if (isAggregateTestExclusion(path)) {
+                if (occurrences != 0) std.debug.panic(
+                    "dedicated test {s} must not also appear in tests/integration_suite.zig",
+                    .{path},
+                );
+            } else if (occurrences != 1) {
+                std.debug.panic(
+                    "aggregate test inventory requires exactly one @import for {s}; found {}",
+                    .{ path, occurrences },
+                );
+            }
+        }
+    }
+    for (aggregate_test_exclusions) |excluded| {
+        const path = b.fmt("tests/{s}", .{excluded});
+        const stat = b.build_root.handle.statFile(b.graph.io, path, .{
+            .follow_symlinks = false,
+        }) catch |err| std.debug.panic("dedicated test exclusion is missing: {s}: {t}", .{ path, err });
+        if (stat.kind != .file) std.debug.panic("dedicated test exclusion is not a regular file: {s}", .{path});
+    }
+}
+
 fn agentcoreRustTarget(target: std.Target) ?[]const u8 {
     if (target.cpu.arch == .x86_64 and target.os.tag == .windows) return switch (target.abi) {
         .msvc => "x86_64-pc-windows-msvc",
@@ -93,10 +177,15 @@ fn createAgentCoreAbiModule(b: *std.Build, options: AgentCoreAbiModuleOptions) *
 }
 
 pub fn build(b: *std.Build) void {
+    validateAggregateTestInventory(b);
     const target = b.standardTargetOptions(.{});
     const target_was_explicit = b.user_input_options.contains("target");
     const optimize = b.standardOptimizeOption(.{});
     const tfilter = b.option([]const u8, "tfilter", "test filter");
+    const lib_test_shards = b.option(u8, "lib-test-shards", "Parallel metacodes-core test shards (1-64)") orelse 4;
+    if (lib_test_shards == 0 or lib_test_shards > 64) @panic("-Dlib-test-shards must be between 1 and 64");
+    const integration_test_shards = b.option(u8, "integration-test-shards", "Parallel component/integration test shards (1-64)") orelse 8;
+    if (integration_test_shards == 0 or integration_test_shards > 64) @panic("-Dintegration-test-shards must be between 1 and 64");
     const agentcore_strip = b.option(bool, "agentcore-strip", "Strip AgentCore library debug information") orelse (optimize != .Debug);
 
     // Compatibility prelude for the remaining tests that spell temporary
@@ -145,6 +234,7 @@ pub fn build(b: *std.Build) void {
     // (让 `zig build test` 自包含地把 tinykg 建到 zig-out/vendor/tinykg/tinykg,测试候选路径命中)。
     var tinykg_install_step: ?*std.Build.Step = null;
     var tinykg_artifact: ?*std.Build.Step.Compile = null;
+    const vendor_tinykg_step = b.step("vendor:tinykg", "Build and install the vendored TinyKG engine");
     if (build_tinykg) {
         const tinykg_exe = b.addExecutable(.{
             .name = "tinykg",
@@ -161,6 +251,9 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&install_tinykg.step);
         tinykg_install_step = &install_tinykg.step;
         tinykg_artifact = tinykg_exe;
+        vendor_tinykg_step.dependOn(&install_tinykg.step);
+    } else {
+        vendor_tinykg_step.dependOn(&b.addFail("vendor:tinykg requires -Dtinykg=true").step);
     }
 
     const debug_mod = b.createModule(.{
@@ -174,7 +267,13 @@ pub fn build(b: *std.Build) void {
         .name = "metacodes-debug",
         .root_module = debug_mod,
     });
-    b.installArtifact(debug_exe);
+    const install_debug = b.addInstallArtifact(debug_exe, .{});
+    b.getInstallStep().dependOn(&install_debug.step);
+    const dev_step = b.step("dev", "Install only the runnable Debug app (fast edit loop)");
+    dev_step.dependOn(&install_debug.step);
+    const dev_full_step = b.step("dev:full", "Install the Debug app and vendored TinyKG without compiling ReleaseSmall");
+    dev_full_step.dependOn(&install_debug.step);
+    dev_full_step.dependOn(vendor_tinykg_step);
 
     // ── 共享测试模块────────────────────────────────────────────────────────
     // cc(全 src 树)与 harness(mock SSE server)被单测/spike/integ/new/mem/agentcore/
@@ -201,7 +300,8 @@ pub fn build(b: *std.Build) void {
     });
     addPlatform(b, test_harness_mod); // harness socket 层走 platform/net(POSIX+Winsock 双后端)
 
-    // mock MCP server 二进制：测试专用，不 install。
+    // mock MCP server 二进制：测试专用，只装这个 artifact 即可运行 aggregate
+    // integration；测试不应依赖全局 install step，否则会顺带冷编译 release/debug/replay。
     const mock_mcp_mod = b.createModule(.{
         .root_source_file = b.path("tests/_harness/mock_mcp_server.zig"),
         .target = target,
@@ -213,7 +313,8 @@ pub fn build(b: *std.Build) void {
         .name = "mock_mcp_server",
         .root_module = mock_mcp_mod,
     });
-    b.installArtifact(mock_mcp_exe);
+    const install_mock_mcp = b.addInstallArtifact(mock_mcp_exe, .{});
+    b.getInstallStep().dependOn(&install_mock_mcp.step);
 
     // replay_server 二进制(Stage 7):从 cassette 起 mock,供 e2e replay。测试专用。
     // 三端可编:曾经的三个 Windows blocker 已清(socket server→platform/net、
@@ -684,9 +785,76 @@ pub fn build(b: *std.Build) void {
         .name = "metacodes-core-test",
         .root_module = core_test_mod,
         .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+        .test_runner = .{
+            .path = b.path("scripts/sharded_test_runner.zig"),
+            .mode = .simple,
+        },
     });
-    const core_test_step = b.step("test:lib", "Test/compile the metacodes-core library module (proves UI isolation)");
-    core_test_step.dependOn(&addTestRunArtifact(b, core_test, windows_test_prelude).step);
+    const core_test_step = b.step("test:lib", "Run the complete metacodes-core suite in checked deterministic shards");
+    const core_shard_reports = b.allocator.alloc(std.Build.LazyPath, lib_test_shards) catch @panic("OOM");
+    for (0..lib_test_shards) |shard_index| {
+        const run_shard = addTestRunArtifact(b, core_test, windows_test_prelude);
+        // captureStdOut would otherwise make the Run step cacheable. A test
+        // gate must execute on every invocation; cached reports are evidence
+        // from an earlier repository/environment state, not current feedback.
+        run_shard.has_side_effects = true;
+        run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", b.fmt("{}", .{lib_test_shards}));
+        run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", b.fmt("{}", .{shard_index}));
+        run_shard.expectExitCode(0);
+        core_shard_reports[shard_index] = run_shard.captureStdOut(.{
+            .basename = b.fmt("metacodes-core-test-shard-{}.txt", .{shard_index}),
+        });
+    }
+    const core_shard_reporter = b.addExecutable(.{
+        .name = "metacodes-core-shard-reporter",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/sharded_test_reporter.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const run_core_shard_reporter = b.addRunArtifact(core_shard_reporter);
+    for (core_shard_reports) |report| run_core_shard_reporter.addFileArg(report);
+    core_test_step.dependOn(&run_core_shard_reporter.step);
+
+    const core_monolithic_run = addTestRunArtifact(b, core_test, windows_test_prelude);
+    core_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", "1");
+    core_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", "0");
+    const core_test_monolithic_step = b.step("test:lib-monolithic", "Run the complete metacodes-core suite in one diagnostic process");
+    core_test_monolithic_step.dependOn(&core_monolithic_run.step);
+
+    const shard_runner_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/sharded_test_runner.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const shard_reporter_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/sharded_test_reporter.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const core_shard_harness_step = b.step("test:lib-shard-harness", "Test core shard partition and aggregate fail-closed checks");
+    core_shard_harness_step.dependOn(&b.addRunArtifact(shard_runner_tests).step);
+    core_shard_harness_step.dependOn(&b.addRunArtifact(shard_reporter_tests).step);
+
+    // Diagnostic companion to test:lib. It runs the identical test graph and
+    // semantics, but emits per-test timings plus slow-test buckets/top-N so
+    // performance work is driven by evidence instead of guessed timeouts.
+    const core_timed_test = b.addTest(.{
+        .name = "metacodes-core-test-times",
+        .root_module = core_test_mod,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+        .test_runner = .{
+            .path = b.path("scripts/time_test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const core_test_times_step = b.step("test:lib-times", "Run metacodes-core tests with per-test timing diagnostics");
+    core_test_times_step.dependOn(&addTestRunArtifact(b, core_timed_test, windows_test_prelude).step);
 
     // test:lsp —— LSP 子系统(Y2 Step2:被动诊断)隔离测试。
     // 根在 src/ 层(而非 src/lsp/lsp.zig):service.zig 相对引 ../util/time.zig,
@@ -818,96 +986,67 @@ pub fn build(b: *std.Build) void {
         spike_step.dependOn(&run_t.step);
     }
 
-    // Integration / Component 测试:都需要 cc + harness imports,共享构建配置。
-    // 目录区分用途:integration = 真子进程/真 fs;component = mock HTTP + 请求捕获(L2)。
-    const integ_files = [_][]const u8{
-        "tests/integration/http_stream_e2e_test.zig",
-        "tests/integration/tool_abort_test.zig",
-        "tests/integration/mcp_e2e_test.zig",
-        "tests/integration/skills_e2e_test.zig",
-        "tests/integration/agents_e2e_test.zig",
-        "tests/component/subagent_model_test.zig",
-        "tests/component/subagent_agentdef_fields_test.zig",
-        "tests/component/web_search_test.zig",
-        "tests/component/allowed_tools_test.zig",
-        "tests/component/agent_session_tools_test.zig",
-        "tests/component/agent_session_host_tools_test.zig",
-        "tests/component/agent_session_ui_test.zig",
-        "tests/component/skill_fork_test.zig",
-        "tests/component/prompt_tool_coupling_test.zig",
-        "tests/component/http_error_test.zig",
-        "tests/component/answer_queue_test.zig",
-        "tests/component/base_url_flag_test.zig",
-        "tests/component/task_error_test.zig",
-        "tests/component/tool_loop_breaker_test.zig",
-        "tests/component/plan_mode_inject_test.zig",
-        "tests/component/user_context_inject_test.zig",
-        "tests/component/memdir_inject_test.zig",
-        "tests/component/agent_background_test.zig",
-        "tests/component/skill_fileref_test.zig",
-        "tests/component/transcript_roundtrip_test.zig",
-        "tests/component/headless_json_test.zig",
-        "tests/component/compound_perm_test.zig",
-        "tests/component/protected_skill_inject_test.zig",
-        "tests/component/read_state_test.zig",
-        "tests/component/tool_concurrency_test.zig",
-        "tests/component/tool_result_storage_test.zig",
-        "tests/component/cache_break_test.zig",
-        "tests/component/microcompact_test.zig",
-        "tests/component/kg_integration_test.zig",
-        "tests/component/kg_task_projection_test.zig",
-        "tests/component/formal_kernel_test.zig",
-        "tests/component/goal_state_test.zig",
-        "tests/component/auth_test.zig",
-        "tests/component/schema_validation_test.zig",
-        "tests/component/tool_schema_coverage_test.zig",
-        "tests/component/tool_smoke_test.zig",
-        "tests/component/compact_summary_test.zig",
-        "tests/component/auto_compact_request_test.zig",
-        "tests/component/render_region_test.zig",
-        "tests/component/stream_retry_test.zig",
-        "tests/component/ui_state_test.zig",
-        "tests/component/ui_render_test.zig",
-        "tests/component/ui_backend_test.zig",
-        "tests/component/ui_multifrontend_test.zig",
-        "tests/component/diagnostics_test.zig",
-        "tests/component/provider_vtable_test.zig",
-        "tests/component/capability_gate_test.zig",
-        "tests/component/openai_provider_test.zig",
-        "tests/component/gemini_provider_test.zig",
-        "tests/component/background_main_test.zig",
-        "tests/component/suspend_resume_test.zig",
-        "tests/component/diff_highlight_test.zig",
-        "tests/component/prompt_override_test.zig",
-        "tests/component/web_ui_test.zig",
-        "tests/component/weak_model_test.zig",
-        "tests/component/task_batch_test.zig",
-        "tests/component/teammate_runtime_test.zig",
-        "tests/component/swarm_tools_test.zig",
-        "tests/component/swarm_dag_test.zig",
-        "tests/component/swarm_security_test.zig",
-        "tests/component/swarm_process_test.zig",
-        "tests/component/add_dir_test.zig",
-    };
-    for (integ_files) |f| {
-        const m = b.createModule(.{
-            .root_source_file = b.path(f),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
+    // Integration / Component tests share one compilation root. The old graph
+    // built 67 near-identical binaries (409 CPU-seconds in the 2026-08-06
+    // baseline). tests/integration_suite.zig is now the inventory source of
+    // truth; individual test names are partitioned only after one compilation.
+    const integration_suite_mod = b.createModule(.{
+        .root_source_file = b.path("tests/integration_suite.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    integration_suite_mod.addImport("harness", test_harness_mod);
+    integration_suite_mod.addImport("cc", test_cc_mod);
+    addPlatform(b, integration_suite_mod);
+    const integration_suite_test = b.addTest(.{
+        .name = "integration-suite",
+        .root_module = integration_suite_mod,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+        .test_runner = .{
+            .path = b.path("scripts/sharded_test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const integration_reports = b.allocator.alloc(std.Build.LazyPath, integration_test_shards) catch @panic("OOM");
+    for (0..integration_test_shards) |shard_index| {
+        const run_shard = addTestRunArtifact(b, integration_suite_test, windows_test_prelude);
+        run_shard.has_side_effects = true;
+        run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", b.fmt("{}", .{integration_test_shards}));
+        run_shard.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", b.fmt("{}", .{shard_index}));
+        run_shard.expectExitCode(0);
+        run_shard.step.dependOn(&install_mock_mcp.step);
+        if (tinykg_install_step) |step| run_shard.step.dependOn(step);
+        integration_reports[shard_index] = run_shard.captureStdOut(.{
+            .basename = b.fmt("integration-test-shard-{}.txt", .{shard_index}),
         });
-        m.addImport("harness", test_harness_mod);
-        m.addImport("cc", test_cc_mod);
-        addPlatform(b, m); // 测试文件用 platform 的可移植 env/net 封装(setEnv、clientRoundtrip)
-        const t = b.addTest(.{
-            .name = "integration",
-            .root_module = m,
-            .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
-        });
-        const run_t = addTestRunArtifact(b, t, windows_test_prelude);
-        run_t.step.dependOn(b.getInstallStep()); // 确保 mock_mcp_server 被 build
-        spike_step.dependOn(&run_t.step);
     }
+    const run_integration_reporter = b.addRunArtifact(core_shard_reporter);
+    for (integration_reports) |report| run_integration_reporter.addFileArg(report);
+    spike_step.dependOn(&run_integration_reporter.step);
+
+    const integration_monolithic_run = addTestRunArtifact(b, integration_suite_test, windows_test_prelude);
+    integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_COUNT", "1");
+    integration_monolithic_run.setEnvironmentVariable("METACODES_TEST_SHARD_INDEX", "0");
+    integration_monolithic_run.step.dependOn(&install_mock_mcp.step);
+    if (tinykg_install_step) |step| integration_monolithic_run.step.dependOn(step);
+    const integration_monolithic_step = b.step("test:integration-monolithic", "Run the aggregate component/integration suite in one process");
+    integration_monolithic_step.dependOn(&integration_monolithic_run.step);
+
+    const integration_timed_test = b.addTest(.{
+        .name = "integration-suite-times",
+        .root_module = integration_suite_mod,
+        .filters = if (tfilter) |filter_text| &.{filter_text} else &.{},
+        .test_runner = .{
+            .path = b.path("scripts/time_test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const integration_timed_run = addTestRunArtifact(b, integration_timed_test, windows_test_prelude);
+    integration_timed_run.step.dependOn(&install_mock_mcp.step);
+    if (tinykg_install_step) |step| integration_timed_run.step.dependOn(step);
+    const integration_times_step = b.step("test:integration-times", "Run aggregate component/integration tests with per-test timings");
+    integration_times_step.dependOn(&integration_timed_run.step);
 
     // Focused Revision 5 gate. Keep Skill Runtime/adapter work independently
     // runnable instead of forcing every unrelated spike/component artifact
