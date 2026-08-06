@@ -155,8 +155,8 @@ data; Lean validates the governance facts supplied by sensors, not the
 physical truth of an unobserved cache claim.
 
 `eval.budget-checkpoint-durability.l2` governs the paid long-horizon runner's
-failure ordering. `BudgetCheckpoint.lean` represents the violation path as a
-four-phase state machine:
+failure ordering. `DurableAbort.lean` defines the reusable four-phase state
+machine and `BudgetCheckpoint.lean` applies it to runtime budget violations:
 
 ```text
 observed → invalidMarked → checkpointCommitted → aborted
@@ -185,6 +185,28 @@ Here “committed” means the writer validated every row, flushed and `fsync`ed
 same-directory temporary file, atomically replaced the checkpoint, returned,
 and the caller could reload it after the process-level abort. The rule does not
 claim power-loss durability of the parent directory on every filesystem.
+
+`eval.treatment-activation.l2` governs whether the three-arm experiment really
+activated the mechanism it claims to compare. Its seven fixed obligations bind
+the treatment prompt to the TinyKG arm only; require exact native-event and
+transcript call identities/hashes; admit one create→claim→complete lifecycle
+only after frozen-binary `task-packet` readback and `verified_by` evidence; use
+the shared durable-abort protocol for attestation failures; reverify checkpoints
+before resumed paid work; recompute receipts from raw artifacts during
+promotion/reporting; and retain real TinyKG plus mutation counterexamples.
+
+The treatment failure feedback exercises both halves of the storage boundary.
+One real `run_multi_arm` test injects an attestation failure, observes the raised
+error, and reloads the invalid JSONL checkpoint. A second makes checkpoint
+publication itself fail and proves that storage error wins: the original
+treatment abort cannot pass an uncommitted checkpoint. Resume tests prove zero
+next runner calls when raw artifacts no longer attest, while promotion rereads
+all 18 calibration rollouts and rejects transcript mutation. Thus Lean owns the
+legal ordering and admission cardinality, while executable sensors establish
+the actual I/O and TinyKG facts represented by those abstract events.
+The feedback topology also requires `zig build vendor:tinykg` before the Python
+L2 command, so a clean checkout cannot turn missing native coverage into a
+machine-local skip.
 
 ## Commands
 

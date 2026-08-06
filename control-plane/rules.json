@@ -438,6 +438,88 @@
         "fixture": "control-plane/counterexamples.json",
         "required": true
       }
+    },
+    {
+      "id": "eval.treatment-activation.l2",
+      "title": "TinyKG treatment activation is execution-grounded and reverified",
+      "target": {
+        "metric": "treatment_activation_obligations_minus_observed",
+        "setpoint": 0,
+        "goal": "Only the TinyKG arm activates one persistent create-claim-complete lifecycle; native events, transcript and frozen-store readback agree; failures are checkpointed before abort; resume and promotion recompute the attestation from raw artifacts before any further paid work or outcome claim."
+      },
+      "sensor": {
+        "adapter": "treatment_activation",
+        "schema_version": 1
+      },
+      "decision": {
+        "engine": "lean",
+        "kernel": "MetaCodesControl.TreatmentActivation.treatmentActivationSignal",
+        "theorems": [
+          "admitted_implies_closed_loop",
+          "admitted_implies_zero_deviation",
+          "admitted_implies_feedback_passed",
+          "treatment_admitted_implies_store_verified",
+          "store_verification_requires_completed",
+          "canonical_treatment_trace_is_admitted",
+          "claim_before_create_is_rejected",
+          "complete_before_claim_is_rejected",
+          "completion_without_store_readback_is_not_admitted",
+          "baseline_admitted_implies_persistent_lifecycle_absent",
+          "treatment_failure_checkpoint_requires_invalid_mark",
+          "treatment_failure_abort_requires_committed_checkpoint",
+          "treatment_failure_abort_before_checkpoint_is_rejected",
+          "abort_without_invalid_mark_is_rejected",
+          "treatment_activation_admitted_implies_seven_obligations",
+          "treatment_activation_missing_obligation_blocks",
+          "treatment_activation_wrong_cardinality_blocks",
+          "orphan_cannot_be_compliant",
+          "failed_feedback_blocks",
+          "sensor_failure_blocks",
+          "unobserved_actuator_blocks"
+        ]
+      },
+      "actuator": {
+        "kind": "release_gate",
+        "on_violation": "block",
+        "remediation": "Restore prompt/arm isolation, exact native-transcript hashes, the one-task create-claim-complete lifecycle, frozen TinyKG task-packet readback with verified_by evidence, mark-checkpoint-abort ordering, resume-before-network reattestation, promotion-time raw-artifact reattestation, and all real TinyKG/tamper/failure counterexamples. Source order, cached receipts, a pure marker test, or an uncommitted checkpoint attempt cannot satisfy the gate.",
+        "observation": {
+          "schema_version": 1,
+          "build_file": "control-plane/build.zig",
+          "build_step": "rule-check",
+          "workflow_file": ".github/workflows/cross-platform.yml",
+          "workflow_job": "rule-control",
+          "workflow_workdir": "metacodes",
+          "telemetry_path": "metacodes/zig-out/reports/rule-control.json"
+        }
+      },
+      "feedback": {
+        "kind": "python_l2_then_reobserve",
+        "reobserve": true,
+        "timeout_seconds": 300,
+        "commands": [
+          [
+            "zig",
+            "build",
+            "vendor:tinykg"
+          ],
+          [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.tests.test_rule_control.TreatmentActivationSensorTests",
+            "scripts.eval.tests.test_treatment_activation.TreatmentActivationTest",
+            "scripts.eval.tests.test_experiment.LongHorizonExperimentTest.test_multi_arm_checkpoints_treatment_failure_before_abort",
+            "scripts.eval.tests.test_experiment.LongHorizonExperimentTest.test_multi_arm_does_not_abort_past_failed_treatment_checkpoint",
+            "scripts.eval.tests.test_experiment.LongHorizonExperimentTest.test_multi_arm_resume_reverifies_treatment_before_network",
+            "scripts.eval.tests.test_experiment.LongHorizonExperimentTest.test_promotion_reverifies_all_raw_treatment_artifacts",
+            "-v"
+          ]
+        ]
+      },
+      "counterexample": {
+        "fixture": "control-plane/counterexamples.json",
+        "required": true
+      }
     }
   ]
 }

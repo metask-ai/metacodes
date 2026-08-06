@@ -2,6 +2,7 @@ import MetaCodesControl
 
 open MetaCodesControl.ClosedLoop
 open MetaCodesControl.BudgetCheckpoint
+open MetaCodesControl.TreatmentActivation
 
 def parseBool? : String → Option Bool
   | "true" => some true
@@ -67,7 +68,10 @@ def main (args : List String) : IO UInt32 := do
           let experienceFeedbackRule := ruleId == "ontology.experience-feedback.l2"
           let buildTestRule := ruleId == "build.test-throughput-integrity.l2"
           let evalBudgetRule := ruleId == "eval.budget-checkpoint-durability.l2"
-          let controlSignal := if evalBudgetRule then
+          let treatmentActivationRule := ruleId == "eval.treatment-activation.l2"
+          let controlSignal := if treatmentActivationRule then
+            treatmentActivationSignal topology observation
+          else if evalBudgetRule then
             evalBudgetSignal topology observation
           else if buildTestRule then
             buildTestSignal topology observation
@@ -77,7 +81,9 @@ def main (args : List String) : IO UInt32 := do
             executionProjectionSignal topology observation
           else
             signal topology observation
-          let state := if evalBudgetRule then
+          let state := if treatmentActivationRule then
+            treatmentActivationNextState topology observation
+          else if evalBudgetRule then
             evalBudgetNextState topology observation
           else if buildTestRule then
             buildTestNextState topology observation
@@ -87,7 +93,9 @@ def main (args : List String) : IO UInt32 := do
             executionProjectionNextState topology observation
           else
             nextState topology observation
-          let allowed := if evalBudgetRule then
+          let allowed := if treatmentActivationRule then
+            treatmentActivationReleaseAllowed topology observation
+          else if evalBudgetRule then
             evalBudgetReleaseAllowed topology observation
           else if buildTestRule then
             buildTestReleaseAllowed topology observation

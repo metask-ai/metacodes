@@ -31,6 +31,7 @@ SUPPORTED_SENSOR_ADAPTERS = frozenset(
         "experience_feedback",
         "build_test_throughput",
         "eval_budget_checkpoint",
+        "treatment_activation",
     )
 )
 RULE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,127}$")
@@ -1748,6 +1749,388 @@ def observe_eval_budget_checkpoint(repo: Path) -> Observation:
     )
 
 
+def observe_treatment_activation(repo: Path) -> Observation:
+    """Bind the formal treatment lifecycle to execution, recovery, and promotion.
+
+    The Lean kernel owns the legal create/claim/complete/store-verify order.  The
+    sensor refuses to call that model connected unless real tests exercise the
+    runner checkpoint path, resume-before-network gate, and promotion-time raw
+    artifact revalidation with a real TinyKG store.
+    """
+
+    declarations = [
+        "prompt_and_arm_treatment_isolation",
+        "native_transcript_store_attestation",
+        "persistent_lifecycle_admission",
+        "treatment_failure_checkpoint_before_abort",
+        "resume_reverification_before_network",
+        "promotion_reverification_from_raw_artifacts",
+        "real_tinykg_and_tamper_counterexamples",
+    ]
+    relative_sources = {
+        "prompt": "src/kg/task_protocol.zig",
+        "prompt_test": "tests/component/prompt_tool_coupling_test.zig",
+        "attester": "scripts/eval/treatment_activation.py",
+        "model": "scripts/eval/model.py",
+        "runner": "scripts/eval/paired_runner.py",
+        "promotion": "scripts/eval/promotion.py",
+        "cli": "scripts/eval/cli.py",
+        "attester_tests": "scripts/eval/tests/test_treatment_activation.py",
+        "experiment_tests": "scripts/eval/tests/test_experiment.py",
+    }
+    paths = {name: repo / relative for name, relative in relative_sources.items()}
+    missing_files = [relative_sources[name] for name, path in paths.items() if not path.is_file()]
+    if missing_files:
+        return Observation(
+            sensor="treatment_activation",
+            declared=len(declarations),
+            declarations=declarations,
+            missing_declarations=declarations,
+            deviation=len(declarations),
+            errors=[f"required treatment-control source is missing: {path}" for path in missing_files],
+            fingerprint_sha256=fingerprint(paths.values()),
+        )
+
+    try:
+        sources = {name: read_text(path) for name, path in paths.items()}
+        trees = {
+            name: ast.parse(sources[name], filename=str(paths[name]))
+            for name in (
+                "attester",
+                "model",
+                "runner",
+                "promotion",
+                "cli",
+                "attester_tests",
+                "experiment_tests",
+            )
+        }
+    except (ControlError, SyntaxError) as exc:
+        return Observation(
+            sensor="treatment_activation",
+            declared=len(declarations),
+            declarations=declarations,
+            missing_declarations=declarations,
+            deviation=len(declarations),
+            errors=[f"treatment-control source cannot be observed: {exc}"],
+            fingerprint_sha256=fingerprint(paths.values()),
+        )
+
+    def function_node(tree_name: str, name: str) -> ast.FunctionDef | None:
+        return next(
+            (
+                node
+                for node in ast.walk(trees[tree_name])
+                if isinstance(node, ast.FunctionDef) and node.name == name
+            ),
+            None,
+        )
+
+    def function_source(tree_name: str, name: str) -> str:
+        node = function_node(tree_name, name)
+        if node is None:
+            return ""
+        return ast.get_source_segment(sources[tree_name], node) or ""
+
+    def call_lines(function: ast.FunctionDef | None, name: str) -> list[int]:
+        if function is None:
+            return []
+        return sorted(
+            node.lineno
+            for node in ast.walk(function)
+            if isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id == name)
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == name)
+            )
+        )
+
+    runner = function_node("runner", "run_multi_arm")
+    attach_lines = call_lines(runner, "attach_treatment_activation")
+    mark_lines = call_lines(runner, "_mark_treatment_activation_invalid")
+    write_lines = call_lines(runner, "write_rollouts")
+    load_lines = call_lines(runner, "_load_checkpoint")
+    run_lines = call_lines(runner, "_run_once")
+    treatment_abort_lines = (
+        []
+        if runner is None
+        else sorted(
+            node.lineno
+            for node in ast.walk(runner)
+            if isinstance(node, ast.Raise)
+            and isinstance(node.exc, ast.Name)
+            and node.exc.id == "treatment_error"
+        )
+    )
+
+    prompt_source = sources["prompt"]
+    prompt_test = sources["prompt_test"]
+    bind_source = function_source("attester", "_bind_all_tool_calls")
+    lifecycle_source = function_source("attester", "_task_lifecycle")
+    store_source = function_source("attester", "_store_packet")
+    store_verify_source = function_source("attester", "_verify_store_packet")
+    attest_source = function_source("attester", "attest_treatment_activation")
+    receipt_source = function_source("model", "validate_treatment_activation_receipt")
+    writer_source = function_source("model", "write_rollouts")
+    marker_source = function_source("runner", "_mark_treatment_activation_invalid")
+    load_source = function_source("runner", "_load_checkpoint")
+    promotion_source = function_source("promotion", "validate_multi_arm_evidence")
+    cli_source = sources["cli"]
+    attester_tests = sources["attester_tests"]
+    experiment_tests = sources["experiment_tests"]
+    checkpoint_test = function_source(
+        "experiment_tests", "test_multi_arm_checkpoints_treatment_failure_before_abort"
+    )
+    checkpoint_failure_test = function_source(
+        "experiment_tests",
+        "test_multi_arm_does_not_abort_past_failed_treatment_checkpoint",
+    )
+    resume_test = function_source(
+        "experiment_tests", "test_multi_arm_resume_reverifies_treatment_before_network"
+    )
+    runner_real_test = function_source(
+        "experiment_tests", "test_multi_arm_attaches_real_tinykg_receipt_before_checkpoint"
+    )
+    promotion_real_test = function_source(
+        "experiment_tests", "test_promotion_reverifies_all_raw_treatment_artifacts"
+    )
+
+    failure_order = (
+        len(attach_lines) == 1
+        and len(mark_lines) == 1
+        and len(write_lines) == 1
+        and len(treatment_abort_lines) == 1
+        and attach_lines[0] < mark_lines[0] < write_lines[0] < treatment_abort_lines[0]
+    )
+    resume_before_network = (
+        len(load_lines) == 1
+        and len(run_lines) == 1
+        and load_lines[0] < run_lines[0]
+        and "reverify_treatment_activation" in load_source
+    )
+
+    obligations = {
+        declarations[0]: {
+            "prompt activates one persistent anchor and requires verified closure": all(
+                marker in prompt_source
+                for marker in (
+                    "ACTIVATE:",
+                    "create exactly one persistent lifecycle anchor",
+                    "persisted: true",
+                    "after verifying the final artifacts",
+                )
+            ),
+            "component test proves baseline prompt exclusion": all(
+                marker in prompt_test
+                for marker in (
+                    '"ACTIVATE:"',
+                    "tinykg_prompt",
+                    "baseline_prompt",
+                    "== null",
+                )
+            ),
+        },
+        declarations[1]: {
+            "transcript and native calls have exact identities and byte hashes": all(
+                marker in bind_source
+                for marker in (
+                    "transcript_ids != native_ids",
+                    "_bind_tool_call",
+                    "require_success=False",
+                )
+            )
+            and all(
+                marker in sources["attester"]
+                for marker in ("input_sha256", "result_sha256", "events_sha256", "transcript_sha256")
+            ),
+            "store is read by the frozen TinyKG binary": all(
+                marker in store_source
+                for marker in (
+                    "expected_tinykg_sha256",
+                    '"task-packet"',
+                    "resolved_store.relative_to(workspace)",
+                    "after != before",
+                )
+            ),
+        },
+        declarations[2]: {
+            "one task moves create claim complete in event order": all(
+                marker in lifecycle_source
+                for marker in (
+                    "exactly one execution-grounded TaskCreate",
+                    'task.get("persisted") is not True',
+                    'status") == "in_progress"',
+                    'status") == "completed"',
+                    "create_native.finished_sequence < claim_native.started_sequence",
+                )
+            ),
+            "terminal store packet requires verification evidence": all(
+                marker in store_verify_source
+                for marker in (
+                    'query.get("status") != "completed"',
+                    'edge.get("rel") == "verified_by"',
+                    'node_kinds.get(edge.get("dst")) == "verification"',
+                )
+            ),
+            "receipt schema freezes lifecycle phases and terminal task": all(
+                marker in receipt_source
+                for marker in (
+                    '["created", "claimed", "completed"]',
+                    'task.get("kind") != "task"',
+                    'task.get("status") != "completed"',
+                    'store.get("present") is not True',
+                )
+            ),
+        },
+        declarations[3]: {
+            "production failure path is mark then checkpoint then abort": failure_order,
+            "failure marker is unscorable and attributed": all(
+                marker in marker_source
+                for marker in (
+                    'execution["status"] = "invalid"',
+                    'reasons.append("treatment_activation_failed")',
+                    'judgement["valid_for_scoring"] = False',
+                    '"code": "treatment_activation_failed"',
+                )
+            ),
+            "checkpoint publication validates flushes and atomically replaces": all(
+                marker in writer_source
+                for marker in (
+                    "validate_rollout",
+                    "tempfile.NamedTemporaryFile",
+                    "dir=path.parent",
+                    "handle.flush()",
+                    "os.fsync(handle.fileno())",
+                    "os.replace(temp_path, path)",
+                )
+            ),
+            "disk counterexample reloads the real runner checkpoint": all(
+                marker in checkpoint_test
+                for marker in (
+                    "run_multi_arm(",
+                    'load_rollouts(output_dir / "codex_style.jsonl")',
+                    '"treatment_activation_failed"',
+                    "attester.assert_called_once()",
+                )
+            ),
+            "failed publication cannot be mistaken for the original abort": all(
+                marker in checkpoint_failure_test
+                for marker in (
+                    'side_effect=OSError("checkpoint commit failed")',
+                    'self.assertRaisesRegex(OSError, "checkpoint commit failed")',
+                    "checkpoint_writer.assert_called_once()",
+                    'written_rows[0]["execution"]["status"], "invalid"',
+                    'self.assertFalse((output_dir / "codex_style.jsonl").exists())',
+                )
+            ),
+        },
+        declarations[4]: {
+            "checkpoint reattestation precedes any paid runner call": resume_before_network,
+            "resume counterexample proves zero next calls": all(
+                marker in resume_test
+                for marker in (
+                    'side_effect=ValidationError("activation artifacts changed")',
+                    "verifier.assert_called_once()",
+                    "run_once.assert_not_called()",
+                )
+            ),
+        },
+        declarations[5]: {
+            "promotion recomputes receipts while checkpoint hashes stay stable": all(
+                marker in promotion_source
+                for marker in (
+                    "reverify_treatment_activation",
+                    "before_sha256",
+                    "after_sha256",
+                    "before_sha256 != after_sha256",
+                )
+            ),
+            "promotion and reporting require a TinyKG verifier binary": (
+                cli_source.count('add_argument("--tinykg-binary", required=True)') >= 3
+                and "tinykg_binary=Path(args.tinykg_binary)" in cli_source
+            ),
+        },
+        declarations[6]: {
+            "attester negative tests cover omitted calls tamper symlink and binary drift": all(
+                name in attester_tests
+                for name in (
+                    "test_baseline_cannot_hide_native_kg_call_by_removing_transcript_rows",
+                    "test_transcript_tamper_breaks_native_hash_binding",
+                    "test_store_symlink_is_rejected",
+                    "test_wrong_frozen_binary_hash_is_rejected",
+                )
+            ),
+            "real runner persists and rereads a real TinyKG receipt": all(
+                marker in runner_real_test
+                for marker in (
+                    "real_attach_treatment_activation",
+                    "real_reverify_treatment_activation",
+                    'load_rollouts(output_dir / "tinykg.jsonl")',
+                )
+            ),
+            "promotion rechecks all raw artifacts and rejects mutation": all(
+                marker in promotion_real_test
+                for marker in (
+                    "real_attach_treatment_activation",
+                    "real_reverify_treatment_activation",
+                    '"artifacts changed after attestation"',
+                    'receipt["gate"]["valid_rollouts"], 18',
+                )
+            ),
+            "attester output is validated before admission": (
+                "validate_treatment_activation_receipt" in attest_source
+            ),
+        },
+    }
+    covered = [name for name, checks in obligations.items() if all(checks.values())]
+    missing = [name for name in declarations if name not in covered]
+    errors: list[str] = []
+    for obligation, checks in obligations.items():
+        absent = [name for name, present in checks.items() if not present]
+        if absent:
+            errors.append(f"{obligation}: missing {', '.join(absent)}")
+
+    return Observation(
+        sensor="treatment_activation",
+        sensor_ok=not errors and len(covered) == len(declarations),
+        declared=len(declarations),
+        covered=len(covered),
+        deviation=max(len(declarations) - len(covered), 0),
+        declarations=declarations,
+        covered_declarations=covered,
+        missing_declarations=missing,
+        feedback_bindings=[
+            {"unittest": "scripts.eval.tests.test_treatment_activation.TreatmentActivationTest"},
+            {
+                "unittest": (
+                    "scripts.eval.tests.test_experiment.LongHorizonExperimentTest."
+                    "test_multi_arm_checkpoints_treatment_failure_before_abort"
+                )
+            },
+            {
+                "unittest": (
+                    "scripts.eval.tests.test_experiment.LongHorizonExperimentTest."
+                    "test_multi_arm_does_not_abort_past_failed_treatment_checkpoint"
+                )
+            },
+            {
+                "unittest": (
+                    "scripts.eval.tests.test_experiment.LongHorizonExperimentTest."
+                    "test_multi_arm_resume_reverifies_treatment_before_network"
+                )
+            },
+            {
+                "unittest": (
+                    "scripts.eval.tests.test_experiment.LongHorizonExperimentTest."
+                    "test_promotion_reverifies_all_raw_treatment_artifacts"
+                )
+            },
+        ],
+        errors=errors,
+        fingerprint_sha256=fingerprint(paths.values()),
+    )
+
+
 def observe_rule(repo: Path, rule: dict[str, Any]) -> Observation:
     sensor = rule.get("sensor")
     if not isinstance(sensor, dict):
@@ -1772,6 +2155,8 @@ def observe_rule(repo: Path, rule: dict[str, Any]) -> Observation:
         return observe_build_test_throughput(repo)
     if adapter == "eval_budget_checkpoint":
         return observe_eval_budget_checkpoint(repo)
+    if adapter == "treatment_activation":
+        return observe_treatment_activation(repo)
     return Observation(sensor=str(adapter), errors=[f"unsupported sensor adapter: {adapter!r}"])
 
 
@@ -1924,6 +2309,9 @@ def link_topology(
         "eval.budget-checkpoint-durability.l2": (
             "MetaCodesControl.BudgetCheckpoint.evalBudgetSignal"
         ),
+        "eval.treatment-activation.l2": (
+            "MetaCodesControl.TreatmentActivation.treatmentActivationSignal"
+        ),
     }.get(rule.get("id"), "MetaCodesControl.ClosedLoop.signal")
     decision_ok = (
         isinstance(decision, dict)
@@ -1963,12 +2351,18 @@ def link_topology(
         and len(command) > 3
         for command in feedback_commands
     )
+    has_tinykg_build = commands_are_arrays and any(
+        command[0] == "zig" and "vendor:tinykg" in command[1:]
+        for command in feedback_commands
+    )
     feedback_kind = feedback.get("kind") if isinstance(feedback, dict) else None
     feedback_runner_ok = (
         feedback_kind == "zig_l2_then_reobserve" and has_zig_test
     ) or (
         feedback_kind == "python_l2_then_reobserve" and has_python_unittest
     )
+    if rule.get("id") == "eval.treatment-activation.l2":
+        feedback_runner_ok = feedback_runner_ok and has_tinykg_build
     feedback_ok = (
         isinstance(feedback, dict)
         and feedback_kind

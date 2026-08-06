@@ -1,62 +1,38 @@
 import MetaCodesControl.ClosedLoop
+import MetaCodesControl.DurableAbort
 
 namespace MetaCodesControl.BudgetCheckpoint
 
 open MetaCodesControl.ClosedLoop
+open MetaCodesControl.DurableAbort
 
-/-- The only legal phases after runtime budget telemetry reports a violation. -/
-inductive ViolationPhase where
-  | observed
-  | invalidMarked
-  | checkpointCommitted
-  | aborted
-  deriving Repr, DecidableEq
+/-- Budget violations instantiate the repository-wide durable-abort protocol. -/
+abbrev ViolationPhase := FailurePhase
+abbrev ViolationEvent := FailureEvent
 
-inductive ViolationEvent where
-  | markInvalid
-  | commitCheckpoint
-  | abort
-  deriving Repr, DecidableEq
-
-/--
-The transition relation makes the durability order executable.  In particular,
-`abort` has no transition from `observed` or `invalidMarked`, and checkpoint
-publication has no transition before the invalid marker exists.
--/
-def transition : ViolationPhase → ViolationEvent → Option ViolationPhase
-  | .observed, .markInvalid => some .invalidMarked
-  | .invalidMarked, .commitCheckpoint => some .checkpointCommitted
-  | .checkpointCommitted, .abort => some .aborted
-  | _, _ => none
-
-def runTrace : ViolationPhase → List ViolationEvent → Option ViolationPhase
-  | phase, [] => some phase
-  | phase, event :: rest => do
-      let next ← transition phase event
-      runTrace next rest
-
-def canonicalViolationTrace : List ViolationEvent :=
-  [.markInvalid, .commitCheckpoint, .abort]
+def budgetTransition := MetaCodesControl.DurableAbort.transition
+def runBudgetTrace := MetaCodesControl.DurableAbort.runTrace
+def canonicalViolationTrace := MetaCodesControl.DurableAbort.canonicalTrace
 
 theorem checkpoint_transition_requires_invalid_mark
     (phase : ViolationPhase) (event : ViolationEvent)
-    (committed : transition phase event = some .checkpointCommitted) :
+    (committed : budgetTransition phase event = some .checkpointCommitted) :
     phase = .invalidMarked ∧ event = .commitCheckpoint := by
-  cases phase <;> cases event <;> simp_all [transition]
+  exact DurableAbort.checkpoint_transition_requires_invalid_mark phase event committed
 
 theorem abort_transition_requires_committed_checkpoint
     (phase : ViolationPhase) (event : ViolationEvent)
-    (aborted : transition phase event = some .aborted) :
+    (aborted : budgetTransition phase event = some .aborted) :
     phase = .checkpointCommitted ∧ event = .abort := by
-  cases phase <;> cases event <;> simp_all [transition]
+  exact DurableAbort.abort_transition_requires_committed_checkpoint phase event aborted
 
 theorem canonical_budget_violation_trace_aborts :
-    runTrace .observed canonicalViolationTrace = some .aborted := by
-  decide
+    runBudgetTrace .observed canonicalViolationTrace = some .aborted := by
+  exact DurableAbort.canonical_failure_trace_aborts
 
 theorem abort_before_checkpoint_is_rejected :
-    runTrace .observed [.markInvalid, .abort] = none := by
-  decide
+    runBudgetTrace .observed [.markInvalid, .abort] = none := by
+  exact DurableAbort.abort_before_checkpoint_is_rejected
 
 /--
 The repository slice has six independently observed links: fixed arm-neutral

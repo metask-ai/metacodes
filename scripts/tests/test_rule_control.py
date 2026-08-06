@@ -915,6 +915,165 @@ class EvalBudgetCheckpointSensorTests(unittest.TestCase):
         )
 
 
+class TreatmentActivationSensorTests(unittest.TestCase):
+    RELATIVE_SOURCES = (
+        "src/kg/task_protocol.zig",
+        "tests/component/prompt_tool_coupling_test.zig",
+        "scripts/eval/treatment_activation.py",
+        "scripts/eval/model.py",
+        "scripts/eval/paired_runner.py",
+        "scripts/eval/promotion.py",
+        "scripts/eval/cli.py",
+        "scripts/eval/tests/test_treatment_activation.py",
+        "scripts/eval/tests/test_experiment.py",
+    )
+
+    def make_repo(self) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        for relative in self.RELATIVE_SOURCES:
+            source = PROJECT_ROOT / relative
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+        return temporary, root
+
+    def test_all_seven_treatment_activation_obligations_are_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        observation = rule_control.observe_treatment_activation(root)
+        self.assertTrue(observation.sensor_ok, observation.errors)
+        self.assertEqual(7, observation.declared)
+        self.assertEqual(7, observation.covered)
+        self.assertEqual(5, len(observation.feedback_bindings))
+
+    def test_missing_checkpoint_publication_breaks_treatment_failure_order(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        runner = root / "scripts/eval/paired_runner.py"
+        runner.write_text(
+            runner.read_text(encoding="utf-8").replace(
+                "write_rollouts(outputs[arm_id], collected[arm_id])",
+                "checkpoint_not_written = True",
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_treatment_activation(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "treatment_failure_checkpoint_before_abort",
+            observation.missing_declarations,
+        )
+
+    def test_source_order_without_disk_counterexample_is_not_evidence(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        tests = root / "scripts/eval/tests/test_experiment.py"
+        tests.write_text(
+            tests.read_text(encoding="utf-8").replace(
+                "test_multi_arm_checkpoints_treatment_failure_before_abort",
+                "test_treatment_marker_without_real_runner_checkpoint",
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_treatment_activation(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "treatment_failure_checkpoint_before_abort",
+            observation.missing_declarations,
+        )
+
+    def test_missing_checkpoint_failure_counterexample_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        tests = root / "scripts/eval/tests/test_experiment.py"
+        tests.write_text(
+            tests.read_text(encoding="utf-8").replace(
+                "test_multi_arm_does_not_abort_past_failed_treatment_checkpoint",
+                "test_treatment_checkpoint_failure_not_exercised",
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_treatment_activation(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "treatment_failure_checkpoint_before_abort",
+            observation.missing_declarations,
+        )
+
+    def test_non_atomic_treatment_checkpoint_writer_is_not_committed_evidence(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        model = root / "scripts/eval/model.py"
+        model.write_text(
+            model.read_text(encoding="utf-8").replace(
+                "os.replace(temp_path, path)", "path.write_text(text)"
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_treatment_activation(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "treatment_failure_checkpoint_before_abort",
+            observation.missing_declarations,
+        )
+
+    def test_resume_without_raw_reattestation_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        runner = root / "scripts/eval/paired_runner.py"
+        runner.write_text(
+            runner.read_text(encoding="utf-8").replace(
+                "reverify_treatment_activation(\n                rollout,",
+                "trust_cached_treatment_receipt(\n                rollout,",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_treatment_activation(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "resume_reverification_before_network",
+            observation.missing_declarations,
+        )
+
+    def test_promotion_without_raw_reattestation_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        promotion = root / "scripts/eval/promotion.py"
+        promotion.write_text(
+            promotion.read_text(encoding="utf-8").replace(
+                "reverify_treatment_activation(\n                rollout,",
+                "trust_cached_treatment_receipt(\n                rollout,",
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_treatment_activation(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "promotion_reverification_from_raw_artifacts",
+            observation.missing_declarations,
+        )
+
+    def test_missing_real_tinykg_runner_counterexample_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        tests = root / "scripts/eval/tests/test_experiment.py"
+        tests.write_text(
+            tests.read_text(encoding="utf-8").replace(
+                "test_multi_arm_attaches_real_tinykg_receipt_before_checkpoint",
+                "test_runner_with_synthetic_treatment_receipt",
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_treatment_activation(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "real_tinykg_and_tamper_counterexamples",
+            observation.missing_declarations,
+        )
+
+
 class FeedbackExecutionTests(unittest.TestCase):
     def test_shard_key_value_summary_does_not_impersonate_skipped_feedback(self) -> None:
         passed, results = rule_control.run_feedback(
@@ -1187,6 +1346,71 @@ class TopologyTests(unittest.TestCase):
             actuator_observed=True,
         )
         self.assertFalse(disconnected["feedback"])
+
+    def test_treatment_activation_rule_requires_its_kernel_and_python_feedback(self) -> None:
+        rule = self.complete_rule()
+        rule["id"] = "eval.treatment-activation.l2"
+        rule["sensor"] = {
+            "adapter": "treatment_activation",
+            "schema_version": 1,
+        }
+        rule["decision"]["kernel"] = (
+            "MetaCodesControl.TreatmentActivation.treatmentActivationSignal"
+        )
+        rule["feedback"] = {
+            "kind": "python_l2_then_reobserve",
+            "reobserve": True,
+            "commands": [
+                ["zig", "build", "vendor:tinykg"],
+                [
+                    "python",
+                    "-m",
+                    "unittest",
+                    "scripts.eval.tests.test_experiment.TreatmentActivationTest",
+                ]
+            ],
+        }
+        topology, errors = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertTrue(topology["decision"], errors)
+        self.assertTrue(topology["feedback"], errors)
+
+        rule["decision"]["kernel"] = "MetaCodesControl.ClosedLoop.signal"
+        weakened, _ = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertFalse(weakened["decision"])
+
+        rule["decision"]["kernel"] = (
+            "MetaCodesControl.TreatmentActivation.treatmentActivationSignal"
+        )
+        rule["feedback"]["commands"] = [["python", "-c", "print('not l2')"]]
+        disconnected, _ = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertFalse(disconnected["feedback"])
+
+        rule["feedback"]["commands"] = [
+            [
+                "python",
+                "-m",
+                "unittest",
+                "scripts.eval.tests.test_experiment.TreatmentActivationTest",
+            ]
+        ]
+        missing_real_dependency, _ = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertFalse(missing_real_dependency["feedback"])
 
     def test_release_gate_is_observed_from_build_ci_and_telemetry_wiring(self) -> None:
         temporary, workspace, repo, actuator = self.make_actuator_workspace()

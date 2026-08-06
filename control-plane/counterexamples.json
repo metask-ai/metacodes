@@ -490,6 +490,126 @@
       "feedback_status": "passed",
       "expected_signal": "block_release",
       "expected_state": "blocked"
+    },
+    {
+      "id": "eval-treatment-activation-closed-loop-pass",
+      "rule_ids": [
+        "eval.treatment-activation.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 7,
+      "covered": 7,
+      "feedback_status": "passed",
+      "expected_signal": "admit_release",
+      "expected_state": "compliant"
+    },
+    {
+      "id": "eval-treatment-activation-missing-obligation-blocks",
+      "rule_ids": [
+        "eval.treatment-activation.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 7,
+      "covered": 6,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "eval-treatment-activation-formalization-orphan-blocks",
+      "rule_ids": [
+        "eval.treatment-activation.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": false,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 7,
+      "covered": 7,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "eval-treatment-activation-failed-feedback-blocks",
+      "rule_ids": [
+        "eval.treatment-activation.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 7,
+      "covered": 7,
+      "feedback_status": "failed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "eval-treatment-activation-sensor-failure-blocks",
+      "rule_ids": [
+        "eval.treatment-activation.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": false,
+      "declared": 7,
+      "covered": 7,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "eval-treatment-activation-wrong-cardinality-blocks",
+      "rule_ids": [
+        "eval.treatment-activation.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 6,
+      "covered": 6,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
     }
   ]
 }
