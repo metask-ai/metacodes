@@ -1,0 +1,49 @@
+{
+  "adapter": {
+    "commit": "0e3eb5b4c6c7a4590fdb67858e6ae61f26fb6190",
+    "id": "coding-intent-families",
+    "revision": "workspace-validator-family-v1"
+  },
+  "dataset": {
+    "bytes": 16649,
+    "id": "coding-intent-transfer-v1",
+    "path": "evals/memory/fixtures/procedural-coding-source.json",
+    "revision": "checked-in-fixture-v1",
+    "sha256": "c840e626a3a21474acac47043ad8211a1e5b2d711159f85a4b99e262320b715e"
+  },
+  "outputs": {
+    "manifest_bytes": 5378,
+    "manifest_sha256": "c956eb5ae4159ff7b4f2c03d912c9ba23ff74774a85c7be1fab6380ef29ad421",
+    "source_slice_bytes": 8204,
+    "source_slice_sha256": "b2042faea02dc0c1a9bd00c5304ede9153807a83c8f240ed17cfa3118c880b76",
+    "validator_bundle_bytes": 6165,
+    "validator_bundle_sha256": "309acc4bd93d3129f4047750a5061149cb120c9f8290a2c5587037a2cee70773"
+  },
+  "runtime": {
+    "execution_fixture": "evals/memory/fixtures/procedural-adapter-smoke-execution.json",
+    "execution_fixture_sha256": "01808ba54609675b2b10033e57b3448aefbd46c2dac9c896c0d4b881da9131af",
+    "network_calls_during_adapter": 0,
+    "paid_model_calls": 0,
+    "shell_commands_during_validation": 0,
+    "tinykg_processes_during_adapter": 0
+  },
+  "schema_version": 1,
+  "selection": {
+    "algorithm": "sha256-seed-null-family-id-v1",
+    "case_count": 6,
+    "family_count": 2,
+    "ordered_case_ids_sha256": "ce12980549a7d21216f1333271db87e440d6e62e54f67ed4e53a13aa4669d427",
+    "ordered_family_ids_sha256": "ec9f90ff8997f6b2629953a6b07bc1e8023eaa5efdbc31020c6ea88388caa681",
+    "ordered_schedule_tsv_sha256": "72eba727797cceafc85d30ba6aa79925f76d4726d5f177f34385bd2a17be9f6e",
+    "schedule_rows": 12,
+    "split_seed": 20260806
+  },
+  "structure": {
+    "baseline_workspaces_rejected": 6,
+    "deterministic_checks": 24,
+    "offline_cases": 4,
+    "online_cases": 2,
+    "oracle_workspaces_accepted": 6,
+    "workspace_files": 18
+  }
+}
