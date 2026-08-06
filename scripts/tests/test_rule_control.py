@@ -10,6 +10,9 @@ import unittest
 from scripts import rule_control
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
 class DeclarationSensorTests(unittest.TestCase):
     def make_repo(self) -> tuple[tempfile.TemporaryDirectory[str], Path, dict]:
         temporary = tempfile.TemporaryDirectory()
@@ -811,6 +814,107 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
         self.assertIn("fast_and_full_build_paths", observation.missing_declarations)
 
 
+class EvalBudgetCheckpointSensorTests(unittest.TestCase):
+    RELATIVE_SOURCES = (
+        "scripts/eval/experiment.py",
+        "scripts/eval/paired_runner.py",
+        "scripts/eval/model.py",
+        "scripts/eval/promotion.py",
+        "scripts/eval/tests/test_experiment.py",
+        "scripts/eval/tests/test_paired_runner.py",
+        "evals/experiments/long-horizon-three-arm-calibration-v2.json",
+        "evals/experiments/long-horizon-three-arm-confirmatory-v2.json",
+    )
+
+    def make_repo(self) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        for relative in self.RELATIVE_SOURCES:
+            source = PROJECT_ROOT / relative
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+        return temporary, root
+
+    def test_all_six_budget_durability_obligations_are_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        observation = rule_control.observe_eval_budget_checkpoint(root)
+        self.assertTrue(observation.sensor_ok, observation.errors)
+        self.assertEqual(6, observation.declared)
+        self.assertEqual(6, observation.covered)
+        self.assertEqual(3, len(observation.feedback_bindings))
+
+    def test_missing_checkpoint_publication_breaks_invalid_and_abort_order(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        runner = root / "scripts/eval/paired_runner.py"
+        runner.write_text(
+            runner.read_text(encoding="utf-8").replace(
+                "write_rollouts(outputs[arm_id], collected[arm_id])",
+                "checkpoint_not_written = True",
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_eval_budget_checkpoint(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "invalid_marked_before_checkpoint", observation.missing_declarations
+        )
+        self.assertIn(
+            "checkpoint_committed_before_abort", observation.missing_declarations
+        )
+
+    def test_source_order_without_disk_counterexample_is_not_durable_evidence(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        tests = root / "scripts/eval/tests/test_experiment.py"
+        tests.write_text(
+            tests.read_text(encoding="utf-8").replace(
+                "test_multi_arm_checkpoints_runtime_budget_overrun_before_abort",
+                "test_budget_overrun_without_durability_contract",
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_eval_budget_checkpoint(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "checkpoint_committed_before_abort", observation.missing_declarations
+        )
+
+    def test_non_atomic_checkpoint_writer_is_not_committed_evidence(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        model = root / "scripts/eval/model.py"
+        model.write_text(
+            model.read_text(encoding="utf-8").replace(
+                "os.replace(temp_path, path)", "path.write_text(text)"
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_eval_budget_checkpoint(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "checkpoint_committed_before_abort", observation.missing_declarations
+        )
+
+    def test_arm_or_stage_specific_cap_drift_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        manifest = (
+            root
+            / "evals/experiments/long-horizon-three-arm-confirmatory-v2.json"
+        )
+        document = json.loads(manifest.read_text(encoding="utf-8"))
+        document["budget"]["max_rollout_tokens"] += 1
+        manifest.write_text(json.dumps(document), encoding="utf-8")
+        observation = rule_control.observe_eval_budget_checkpoint(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "fixed_arm_independent_rollout_caps", observation.missing_declarations
+        )
+
+
 class FeedbackExecutionTests(unittest.TestCase):
     def test_shard_key_value_summary_does_not_impersonate_skipped_feedback(self) -> None:
         passed, results = rule_control.run_feedback(
@@ -1034,6 +1138,55 @@ class TopologyTests(unittest.TestCase):
             actuator_observed=True,
         )
         self.assertFalse(weakened["decision"])
+
+    def test_eval_budget_rule_requires_its_kernel_and_python_feedback(self) -> None:
+        rule = self.complete_rule()
+        rule["id"] = "eval.budget-checkpoint-durability.l2"
+        rule["sensor"] = {
+            "adapter": "eval_budget_checkpoint",
+            "schema_version": 1,
+        }
+        rule["decision"]["kernel"] = (
+            "MetaCodesControl.BudgetCheckpoint.evalBudgetSignal"
+        )
+        rule["feedback"] = {
+            "kind": "python_l2_then_reobserve",
+            "reobserve": True,
+            "commands": [
+                [
+                    "python",
+                    "-m",
+                    "unittest",
+                    "scripts.eval.tests.test_experiment.BudgetTest",
+                ]
+            ],
+        }
+        topology, errors = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertTrue(topology["decision"], errors)
+        self.assertTrue(topology["feedback"], errors)
+
+        rule["decision"]["kernel"] = "MetaCodesControl.ClosedLoop.signal"
+        weakened, _ = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertFalse(weakened["decision"])
+
+        rule["decision"]["kernel"] = (
+            "MetaCodesControl.BudgetCheckpoint.evalBudgetSignal"
+        )
+        rule["feedback"]["commands"] = [["python", "-c", "print('not l2')"]]
+        disconnected, _ = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertFalse(disconnected["feedback"])
 
     def test_release_gate_is_observed_from_build_ci_and_telemetry_wiring(self) -> None:
         temporary, workspace, repo, actuator = self.make_actuator_workspace()

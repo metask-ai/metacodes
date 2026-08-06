@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 from dataclasses import asdict, dataclass, field
 import datetime as dt
 import hashlib
@@ -29,6 +30,7 @@ SUPPORTED_SENSOR_ADAPTERS = frozenset(
         "execution_ontology_feedback",
         "experience_feedback",
         "build_test_throughput",
+        "eval_budget_checkpoint",
     )
 )
 RULE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,127}$")
@@ -1426,6 +1428,326 @@ def observe_build_test_throughput(repo: Path) -> Observation:
     )
 
 
+def observe_eval_budget_checkpoint(repo: Path) -> Observation:
+    """Observe the proof-carrying budget/checkpoint transition in real code.
+
+    Lean owns the legal phase ordering.  This adapter binds that small model to
+    the Python runner, checked-in experiment caps, promotion revalidation, and
+    disk-backed counterexample tests.  Source order alone is deliberately not
+    enough: the focused feedback must execute the over-cap path and reload its
+    checkpoint after the raised error.
+    """
+
+    declarations = [
+        "fixed_arm_independent_rollout_caps",
+        "whole_schedule_capacity_before_network",
+        "runtime_usage_bound_to_sealed_cap",
+        "invalid_marked_before_checkpoint",
+        "checkpoint_committed_before_abort",
+        "promotion_revalidates_fixed_budget",
+    ]
+    relative_sources = {
+        "experiment": "scripts/eval/experiment.py",
+        "runner": "scripts/eval/paired_runner.py",
+        "model": "scripts/eval/model.py",
+        "promotion": "scripts/eval/promotion.py",
+        "experiment_tests": "scripts/eval/tests/test_experiment.py",
+        "runner_tests": "scripts/eval/tests/test_paired_runner.py",
+        "calibration": "evals/experiments/long-horizon-three-arm-calibration-v2.json",
+        "confirmatory": "evals/experiments/long-horizon-three-arm-confirmatory-v2.json",
+    }
+    paths = {name: repo / relative for name, relative in relative_sources.items()}
+    missing_files = [relative_sources[name] for name, path in paths.items() if not path.is_file()]
+    if missing_files:
+        return Observation(
+            sensor="eval_budget_checkpoint",
+            declared=len(declarations),
+            declarations=declarations,
+            missing_declarations=declarations,
+            deviation=len(declarations),
+            errors=[f"required budget-control source is missing: {path}" for path in missing_files],
+            fingerprint_sha256=fingerprint(paths.values()),
+        )
+
+    try:
+        sources = {
+            name: read_text(path)
+            for name, path in paths.items()
+            if name not in {"calibration", "confirmatory"}
+        }
+        trees = {
+            name: ast.parse(source, filename=str(paths[name]))
+            for name, source in sources.items()
+        }
+        manifests = {
+            name: load_json(paths[name]) for name in ("calibration", "confirmatory")
+        }
+        for name, manifest in manifests.items():
+            if not isinstance(manifest, dict) or manifest.get("schema_version") != 2:
+                raise ControlError(
+                    f"{paths[name]}: evaluation schema_version must be 2"
+                )
+    except (ControlError, SyntaxError) as exc:
+        return Observation(
+            sensor="eval_budget_checkpoint",
+            declared=len(declarations),
+            declarations=declarations,
+            missing_declarations=declarations,
+            deviation=len(declarations),
+            errors=[f"budget-control source cannot be observed: {exc}"],
+            fingerprint_sha256=fingerprint(paths.values()),
+        )
+
+    def function_node(tree_name: str, name: str) -> ast.FunctionDef | None:
+        return next(
+            (
+                node
+                for node in ast.walk(trees[tree_name])
+                if isinstance(node, ast.FunctionDef) and node.name == name
+            ),
+            None,
+        )
+
+    def function_source(tree_name: str, name: str) -> str:
+        node = function_node(tree_name, name)
+        if node is None:
+            return ""
+        return ast.get_source_segment(sources[tree_name], node) or ""
+
+    def call_nodes(function: ast.FunctionDef | None, name: str) -> list[ast.Call]:
+        if function is None:
+            return []
+        return sorted(
+            (
+                node
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call)
+                and (
+                    (isinstance(node.func, ast.Name) and node.func.id == name)
+                    or (isinstance(node.func, ast.Attribute) and node.func.attr == name)
+                )
+            ),
+            key=lambda node: node.lineno,
+        )
+
+    runner = function_node("runner", "run_multi_arm")
+    capacity_calls = call_nodes(runner, "_require_remaining_schedule_capacity")
+    run_once_calls = call_nodes(runner, "_run_once")
+    mark_calls = call_nodes(runner, "_mark_runtime_budget_invalid")
+    write_calls = call_nodes(runner, "write_rollouts")
+    provenance_calls = call_nodes(runner, "_require_runtime_budget_provenance")
+    budget_abort_lines = (
+        []
+        if runner is None
+        else sorted(
+            node.lineno
+            for node in ast.walk(runner)
+            if isinstance(node, ast.Raise)
+            and isinstance(node.exc, ast.Name)
+            and node.exc.id == "runtime_budget_error"
+        )
+    )
+
+    calibration_budget = manifests["calibration"].get("budget", {})
+    confirmatory_budget = manifests["confirmatory"].get("budget", {})
+    cap_keys = ("max_rollout_cost_usd", "max_rollout_tokens")
+    caps_match = all(
+        key in calibration_budget
+        and calibration_budget.get(key) == confirmatory_budget.get(key)
+        for key in cap_keys
+    )
+    fixed_source = function_source("experiment", "fixed_rollout_budget")
+    validate_source = function_source("experiment", "validate_experiment")
+    capacity_source = function_source("runner", "_require_remaining_schedule_capacity")
+    provenance_source = function_source("runner", "_require_runtime_budget_provenance")
+    invalid_source = function_source("runner", "_mark_runtime_budget_invalid")
+    writer_source = function_source("model", "write_rollouts")
+    promotion_source = function_source("promotion", "validate_multi_arm_evidence")
+    capacity_test = function_source(
+        "experiment_tests",
+        "test_multi_arm_rejects_infeasible_remaining_schedule_before_rollout",
+    )
+    checkpoint_test = function_source(
+        "experiment_tests",
+        "test_multi_arm_checkpoints_runtime_budget_overrun_before_abort",
+    )
+    promotion_test = function_source(
+        "experiment_tests", "test_promotion_rechecks_fixed_runtime_budget_and_usage"
+    )
+
+    call_text = "\n".join(ast.unparse(node) for node in run_once_calls)
+    first_run_line = min((node.lineno for node in run_once_calls), default=-1)
+    capacity_lines = [node.lineno for node in capacity_calls]
+    mark_lines = [node.lineno for node in mark_calls]
+    write_lines = [node.lineno for node in write_calls]
+    provenance_lines = [node.lineno for node in provenance_calls]
+
+    obligations = {
+        declarations[0]: {
+            "both stages freeze identical dollar and token caps": caps_match,
+            "cap parser requires both dimensions": all(
+                marker in fixed_source
+                for marker in (
+                    "FIXED_ROLLOUT_BUDGET_KEYS",
+                    "must provide both",
+                    "max_rollout_cost_usd",
+                    "max_rollout_tokens",
+                )
+            ),
+            "manifest validation reserves every registered rollout": all(
+                marker in validate_source
+                for marker in (
+                    "expected_rollouts",
+                    "rollout_cost * expected_rollouts",
+                    "rollout_tokens * expected_rollouts",
+                    "strictly cover every fixed per-rollout cap",
+                )
+            ),
+        },
+        declarations[1]: {
+            "initial and per-rollout capacity checks precede network": (
+                len(capacity_lines) >= 2
+                and first_run_line > 0
+                and all(line < first_run_line for line in capacity_lines)
+            ),
+            "capacity uses strict stage and aggregate reserve": all(
+                marker in capacity_source
+                for marker in (
+                    "_remaining_multi_budget",
+                    "remaining_cost <= required_cost",
+                    "remaining_tokens <= required_tokens",
+                )
+            ),
+            "counterexample proves zero paid calls": all(
+                marker in capacity_test
+                for marker in (
+                    "not budget-feasible before network",
+                    "run_once.assert_not_called()",
+                )
+            ),
+        },
+        declarations[2]: {
+            "native call receives the frozen two-dimensional cap": all(
+                marker in call_text
+                for marker in (
+                    "max_metered_tokens=runtime_max_metered_tokens",
+                    "max_cost_usd=runtime_max_cost_usd",
+                )
+            ),
+            "normalized telemetry is compared with sealed provenance": all(
+                marker in provenance_source
+                for marker in (
+                    "TOKEN_METRICS",
+                    "observed_cost > float(max_cost_usd)",
+                    "observed_tokens > max_metered_tokens",
+                )
+            ),
+            "resume and new evidence both pass provenance validation": len(provenance_lines) >= 2,
+        },
+        declarations[3]: {
+            "invalid marker executes before checkpoint publication": (
+                len(mark_lines) == 1
+                and len(write_lines) == 1
+                and mark_lines[0] < write_lines[0]
+            ),
+            "marker changes execution judgement and attribution": all(
+                marker in invalid_source
+                for marker in (
+                    'execution["status"] = "invalid"',
+                    'reasons.append("runtime_budget_contract_violation")',
+                    '["valid_for_scoring"] = False',
+                    '"code": "runtime_budget_contract_violation"',
+                )
+            ),
+        },
+        declarations[4]: {
+            "checkpoint publication precedes budget abort": (
+                len(write_lines) == 1
+                and len(budget_abort_lines) == 1
+                and write_lines[0] < budget_abort_lines[0]
+            ),
+            "checkpoint writer validates fsyncs and atomically replaces": all(
+                marker in writer_source
+                for marker in (
+                    "validate_rollout",
+                    "tempfile.NamedTemporaryFile",
+                    "dir=path.parent",
+                    "handle.flush()",
+                    "os.fsync(handle.fileno())",
+                    "os.replace(temp_path, path)",
+                )
+            ),
+            "disk-backed counterexample reloads invalid evidence after abort": all(
+                marker in checkpoint_test
+                for marker in (
+                    "with self.assertRaisesRegex",
+                    'load_rollouts(output_dir / "codex_style.jsonl")',
+                    'checkpoint[0]["execution"]["status"], "invalid"',
+                    '"runtime_budget_contract_violation"',
+                )
+            ),
+        },
+        declarations[5]: {
+            "promotion rechecks exact cap and measured usage": all(
+                marker in promotion_source
+                for marker in (
+                    "fixed_rollout_budget",
+                    "expected_runtime_budget",
+                    "observed_tokens > fixed_rollout_tokens",
+                    "float(observed_cost) > fixed_rollout_cost",
+                )
+            ),
+            "promotion has cap-drift and overrun counterexamples": all(
+                marker in promotion_test
+                for marker in (
+                    "runtime budget is not the frozen",
+                    "exceeded its frozen per-rollout budget",
+                )
+            ),
+        },
+    }
+    covered = [name for name, checks in obligations.items() if all(checks.values())]
+    missing = [name for name in declarations if name not in covered]
+    errors: list[str] = []
+    for obligation, checks in obligations.items():
+        absent = [name for name, present in checks.items() if not present]
+        if absent:
+            errors.append(f"{obligation}: missing {', '.join(absent)}")
+
+    return Observation(
+        sensor="eval_budget_checkpoint",
+        sensor_ok=not errors and len(covered) == len(declarations),
+        declared=len(declarations),
+        covered=len(covered),
+        deviation=max(len(declarations) - len(covered), 0),
+        declarations=declarations,
+        covered_declarations=covered,
+        missing_declarations=missing,
+        feedback_bindings=[
+            {
+                "unittest": (
+                    "scripts.eval.tests.test_experiment.LongHorizonExperimentTest."
+                    "test_multi_arm_rejects_infeasible_remaining_schedule_before_rollout"
+                )
+            },
+            {
+                "unittest": (
+                    "scripts.eval.tests.test_experiment.LongHorizonExperimentTest."
+                    "test_multi_arm_checkpoints_runtime_budget_overrun_before_abort"
+                )
+            },
+            {
+                "unittest": (
+                    "scripts.eval.tests.test_experiment.LongHorizonExperimentTest."
+                    "test_promotion_rechecks_fixed_runtime_budget_and_usage"
+                )
+            },
+        ],
+        errors=errors,
+        fingerprint_sha256=fingerprint(paths.values()),
+    )
+
+
 def observe_rule(repo: Path, rule: dict[str, Any]) -> Observation:
     sensor = rule.get("sensor")
     if not isinstance(sensor, dict):
@@ -1448,6 +1770,8 @@ def observe_rule(repo: Path, rule: dict[str, Any]) -> Observation:
         return observe_experience_feedback(repo)
     if adapter == "build_test_throughput":
         return observe_build_test_throughput(repo)
+    if adapter == "eval_budget_checkpoint":
+        return observe_eval_budget_checkpoint(repo)
     return Observation(sensor=str(adapter), errors=[f"unsupported sensor adapter: {adapter!r}"])
 
 
@@ -1597,6 +1921,9 @@ def link_topology(
         "build.test-throughput-integrity.l2": (
             "MetaCodesControl.ClosedLoop.buildTestSignal"
         ),
+        "eval.budget-checkpoint-durability.l2": (
+            "MetaCodesControl.BudgetCheckpoint.evalBudgetSignal"
+        ),
     }.get(rule.get("id"), "MetaCodesControl.ClosedLoop.signal")
     decision_ok = (
         isinstance(decision, dict)
@@ -1630,12 +1957,25 @@ def link_topology(
         command[0] == "zig" and any(item.startswith("test:") for item in command[1:])
         for command in feedback_commands
     )
+    has_python_unittest = commands_are_arrays and any(
+        command[0] in {"python", "python3"}
+        and command[1:3] == ["-m", "unittest"]
+        and len(command) > 3
+        for command in feedback_commands
+    )
+    feedback_kind = feedback.get("kind") if isinstance(feedback, dict) else None
+    feedback_runner_ok = (
+        feedback_kind == "zig_l2_then_reobserve" and has_zig_test
+    ) or (
+        feedback_kind == "python_l2_then_reobserve" and has_python_unittest
+    )
     feedback_ok = (
         isinstance(feedback, dict)
-        and feedback.get("kind") == "zig_l2_then_reobserve"
+        and feedback_kind
+        in {"zig_l2_then_reobserve", "python_l2_then_reobserve"}
         and feedback.get("reobserve") is True
         and commands_are_arrays
-        and has_zig_test
+        and feedback_runner_ok
     )
     counterexample = rule.get("counterexample")
     counterexample_declared = (
@@ -1800,6 +2140,21 @@ def feedback_binding_errors(observation: Observation, feedback: dict[str, Any]) 
     commands = feedback.get("commands", [])
     errors: list[str] = []
     for binding in observation.feedback_bindings:
+        unittest_name = binding.get("unittest")
+        if unittest_name:
+            matched = any(
+                isinstance(command, list)
+                and len(command) > 3
+                and command[0] in {"python", "python3"}
+                and command[1:3] == ["-m", "unittest"]
+                and unittest_name in command[3:]
+                for command in commands
+            )
+            if not matched:
+                errors.append(
+                    f"feedback commands do not execute unittest {unittest_name}"
+                )
+            continue
         step = binding["step"]
         selected_filter = binding.get("filter", "")
         matched = False

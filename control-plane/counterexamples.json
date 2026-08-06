@@ -370,6 +370,126 @@
       "feedback_status": "passed",
       "expected_signal": "block_release",
       "expected_state": "blocked"
+    },
+    {
+      "id": "eval-budget-checkpoint-closed-loop-pass",
+      "rule_ids": [
+        "eval.budget-checkpoint-durability.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 6,
+      "covered": 6,
+      "feedback_status": "passed",
+      "expected_signal": "admit_release",
+      "expected_state": "compliant"
+    },
+    {
+      "id": "eval-budget-checkpoint-missing-obligation-blocks",
+      "rule_ids": [
+        "eval.budget-checkpoint-durability.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 6,
+      "covered": 5,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "eval-budget-checkpoint-formalization-orphan-blocks",
+      "rule_ids": [
+        "eval.budget-checkpoint-durability.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": false,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 6,
+      "covered": 6,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "eval-budget-checkpoint-failed-feedback-blocks",
+      "rule_ids": [
+        "eval.budget-checkpoint-durability.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 6,
+      "covered": 6,
+      "feedback_status": "failed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "eval-budget-checkpoint-sensor-failure-blocks",
+      "rule_ids": [
+        "eval.budget-checkpoint-durability.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": false,
+      "declared": 6,
+      "covered": 6,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
+    },
+    {
+      "id": "eval-budget-checkpoint-wrong-cardinality-blocks",
+      "rule_ids": [
+        "eval.budget-checkpoint-durability.l2"
+      ],
+      "topology": {
+        "target": true,
+        "sensor": true,
+        "decision": true,
+        "actuator": true,
+        "feedback": true,
+        "counterexample": true
+      },
+      "sensor_ok": true,
+      "declared": 5,
+      "covered": 5,
+      "feedback_status": "passed",
+      "expected_signal": "block_release",
+      "expected_state": "blocked"
     }
   ]
 }

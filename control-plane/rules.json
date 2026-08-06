@@ -370,6 +370,74 @@
         "fixture": "control-plane/counterexamples.json",
         "required": true
       }
+    },
+    {
+      "id": "eval.budget-checkpoint-durability.l2",
+      "title": "Budget violations are durably checkpointed before evaluation abort",
+      "target": {
+        "metric": "budget_checkpoint_obligations_minus_observed",
+        "setpoint": 0,
+        "goal": "Every arm and order position receives the same fixed cap, the complete remaining schedule is feasible before network, measured usage is bound to that cap, and any violation is marked invalid and durably checkpointed before abort; promotion rechecks the same contract."
+      },
+      "sensor": {
+        "adapter": "eval_budget_checkpoint",
+        "schema_version": 1
+      },
+      "decision": {
+        "engine": "lean",
+        "kernel": "MetaCodesControl.BudgetCheckpoint.evalBudgetSignal",
+        "theorems": [
+          "admitted_implies_closed_loop",
+          "admitted_implies_zero_deviation",
+          "admitted_implies_feedback_passed",
+          "checkpoint_transition_requires_invalid_mark",
+          "abort_transition_requires_committed_checkpoint",
+          "canonical_budget_violation_trace_aborts",
+          "abort_before_checkpoint_is_rejected",
+          "eval_budget_admitted_implies_six_obligations",
+          "eval_budget_missing_obligation_blocks",
+          "eval_budget_wrong_cardinality_blocks",
+          "orphan_cannot_be_compliant",
+          "failed_feedback_blocks",
+          "sensor_failure_blocks",
+          "unobserved_actuator_blocks"
+        ]
+      },
+      "actuator": {
+        "kind": "release_gate",
+        "on_violation": "block",
+        "remediation": "Restore identical per-rollout caps, whole-schedule preflight before network, sealed usage validation, invalid marking before checkpoint publication, durable checkpoint publication before the raised abort, promotion-time revalidation, and their disk-backed counterexample tests. Source order or a pure marker test alone is insufficient.",
+        "observation": {
+          "schema_version": 1,
+          "build_file": "control-plane/build.zig",
+          "build_step": "rule-check",
+          "workflow_file": ".github/workflows/cross-platform.yml",
+          "workflow_job": "rule-control",
+          "workflow_workdir": "metacodes",
+          "telemetry_path": "metacodes/zig-out/reports/rule-control.json"
+        }
+      },
+      "feedback": {
+        "kind": "python_l2_then_reobserve",
+        "reobserve": true,
+        "timeout_seconds": 300,
+        "commands": [
+          [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.tests.test_rule_control.EvalBudgetCheckpointSensorTests",
+            "scripts.eval.tests.test_experiment.LongHorizonExperimentTest.test_multi_arm_rejects_infeasible_remaining_schedule_before_rollout",
+            "scripts.eval.tests.test_experiment.LongHorizonExperimentTest.test_multi_arm_checkpoints_runtime_budget_overrun_before_abort",
+            "scripts.eval.tests.test_experiment.LongHorizonExperimentTest.test_promotion_rechecks_fixed_runtime_budget_and_usage",
+            "-v"
+          ]
+        ]
+      },
+      "counterexample": {
+        "fixture": "control-plane/counterexamples.json",
+        "required": true
+      }
     }
   ]
 }

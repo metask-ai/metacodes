@@ -1,6 +1,7 @@
 import MetaCodesControl
 
 open MetaCodesControl.ClosedLoop
+open MetaCodesControl.BudgetCheckpoint
 
 def parseBool? : String → Option Bool
   | "true" => some true
@@ -65,7 +66,10 @@ def main (args : List String) : IO UInt32 := do
           let executionOntologyRule := ruleId == "ontology.execution-grounded-projection.l2"
           let experienceFeedbackRule := ruleId == "ontology.experience-feedback.l2"
           let buildTestRule := ruleId == "build.test-throughput-integrity.l2"
-          let controlSignal := if buildTestRule then
+          let evalBudgetRule := ruleId == "eval.budget-checkpoint-durability.l2"
+          let controlSignal := if evalBudgetRule then
+            evalBudgetSignal topology observation
+          else if buildTestRule then
             buildTestSignal topology observation
           else if experienceFeedbackRule then
             experienceFeedbackSignal topology observation
@@ -73,7 +77,9 @@ def main (args : List String) : IO UInt32 := do
             executionProjectionSignal topology observation
           else
             signal topology observation
-          let state := if buildTestRule then
+          let state := if evalBudgetRule then
+            evalBudgetNextState topology observation
+          else if buildTestRule then
             buildTestNextState topology observation
           else if experienceFeedbackRule then
             experienceFeedbackNextState topology observation
@@ -81,7 +87,9 @@ def main (args : List String) : IO UInt32 := do
             executionProjectionNextState topology observation
           else
             nextState topology observation
-          let allowed := if buildTestRule then
+          let allowed := if evalBudgetRule then
+            evalBudgetReleaseAllowed topology observation
+          else if buildTestRule then
             buildTestReleaseAllowed topology observation
           else if experienceFeedbackRule then
             experienceFeedbackReleaseAllowed topology observation

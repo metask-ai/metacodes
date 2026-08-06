@@ -154,6 +154,38 @@ Cold and warm measurements must still be labelled separately in experiment
 data; Lean validates the governance facts supplied by sensors, not the
 physical truth of an unobserved cache claim.
 
+`eval.budget-checkpoint-durability.l2` governs the paid long-horizon runner's
+failure ordering. `BudgetCheckpoint.lean` represents the violation path as a
+four-phase state machine:
+
+```text
+observed → invalidMarked → checkpointCommitted → aborted
+```
+
+There is no legal transition from `observed` or `invalidMarked` directly to
+`aborted`. Lean proves that reaching `aborted` requires a committed checkpoint,
+that publication requires the invalid marker, that the canonical trace reaches
+the terminal state, and that `markInvalid → abort` is rejected. The repository
+sensor then binds that model to six real obligations: identical two-dimensional
+caps for every arm/order position, full remaining-schedule capacity before
+network, normalized usage bound to the sealed cap, invalid marking before
+publication, publication before the raised abort, and promotion-time
+revalidation of the same cap and usage.
+
+This rule intentionally requires a disk-backed counterexample: the feedback
+creates an over-cap rollout, observes `run_multi_arm` raise, then reloads the
+checkpoint and verifies its invalid reason. Static source order or a pure
+marker-function unit test cannot satisfy the rule. A separate counterexample
+proves an infeasible complete schedule invokes no paid runner, and promotion
+tests reject both cap drift and measured overrun. The Python L2 is still
+actuated by the same Lean-backed `rule-check` build/CI release gate and is
+re-observed before admission.
+
+Here “committed” means the writer validated every row, flushed and `fsync`ed a
+same-directory temporary file, atomically replaced the checkpoint, returned,
+and the caller could reload it after the process-level abort. The rule does not
+claim power-loss durability of the parent directory on every filesystem.
+
 ## Commands
 
 From `metacodes/`:
