@@ -58,6 +58,13 @@ if __package__ in {None, ""}:
         load_execution as load_memory_execution,
         load_source_policy as load_hotpot_source_policy,
     )
+    from scripts.eval.memory_longmem_adapter import (  # type: ignore
+        OFFICIAL_SOURCE_REVISION as LONGMEM_OFFICIAL_SOURCE_REVISION,
+        OFFICIAL_SOURCE_URL as LONGMEM_OFFICIAL_SOURCE_URL,
+        adapt_longmem,
+        artifact_bytes as longmem_adapter_artifact_bytes,
+        load_execution as load_longmem_execution,
+    )
     from scripts.eval.memory_replay import (  # type: ignore
         load_manifest as load_memory_manifest,
         load_observations as load_memory_observations,
@@ -114,6 +121,13 @@ else:
         artifact_bytes as memory_adapter_artifact_bytes,
         load_execution as load_memory_execution,
         load_source_policy as load_hotpot_source_policy,
+    )
+    from .memory_longmem_adapter import (
+        OFFICIAL_SOURCE_REVISION as LONGMEM_OFFICIAL_SOURCE_REVISION,
+        OFFICIAL_SOURCE_URL as LONGMEM_OFFICIAL_SOURCE_URL,
+        adapt_longmem,
+        artifact_bytes as longmem_adapter_artifact_bytes,
+        load_execution as load_longmem_execution,
     )
     from .memory_replay import (
         load_manifest as load_memory_manifest,
@@ -285,6 +299,50 @@ def cmd_adapt_hotpot_memory(args: argparse.Namespace) -> int:
     )
     print(
         "HotpotQA memory adapter complete: "
+        f"cases={len(manifest['cases'])} "
+        f"source={manifest['dataset']['source_sha256'][:16]} "
+        f"upstream={source_slice['upstream']['source_sha256'][:16]}"
+    )
+    return 0
+
+
+def cmd_adapt_longmem_memory(args: argparse.Namespace) -> int:
+    input_paths = {
+        Path(args.source).resolve(),
+        Path(args.execution).resolve(),
+    }
+    output_paths = {
+        Path(args.output_source).resolve(),
+        Path(args.output_manifest).resolve(),
+    }
+    if len(output_paths) != 2:
+        raise ValidationError("LongMemEval-S adapter output paths must be distinct")
+    overlap = input_paths.intersection(output_paths)
+    if overlap:
+        raise ValidationError(
+            "LongMemEval-S adapter output would overwrite an input artifact: "
+            f"{sorted(map(str, overlap))}"
+        )
+    execution = load_longmem_execution(Path(args.execution))
+    source_slice, manifest = adapt_longmem(
+        Path(args.source),
+        execution,
+        expected_source_sha256=args.expected_source_sha256,
+        limit=args.limit,
+        split_seed=args.split_seed,
+        source_url=args.source_url,
+        source_revision=args.source_revision,
+    )
+    _write(
+        args.output_source,
+        longmem_adapter_artifact_bytes(source_slice).decode("utf-8"),
+    )
+    _write(
+        args.output_manifest,
+        longmem_adapter_artifact_bytes(manifest).decode("utf-8"),
+    )
+    print(
+        "LongMemEval-S memory adapter complete: "
         f"cases={len(manifest['cases'])} "
         f"source={manifest['dataset']['source_sha256'][:16]} "
         f"upstream={source_slice['upstream']['source_sha256'][:16]}"
@@ -961,6 +1019,27 @@ def parser() -> argparse.ArgumentParser:
         default=OFFICIAL_SOURCE_REVISION,
     )
     hotpot_adapter_parser.set_defaults(func=cmd_adapt_hotpot_memory)
+
+    longmem_adapter_parser = commands.add_parser(
+        "adapt-longmem-memory",
+        help="freeze a pinned cleaned LongMemEval-S subset and replay manifest",
+    )
+    longmem_adapter_parser.add_argument("--source", required=True)
+    longmem_adapter_parser.add_argument("--expected-source-sha256", required=True)
+    longmem_adapter_parser.add_argument("--execution", required=True)
+    longmem_adapter_parser.add_argument("--output-source", required=True)
+    longmem_adapter_parser.add_argument("--output-manifest", required=True)
+    longmem_adapter_parser.add_argument("--limit", type=int, default=500)
+    longmem_adapter_parser.add_argument("--split-seed", type=int, default=20260806)
+    longmem_adapter_parser.add_argument(
+        "--source-url",
+        default=LONGMEM_OFFICIAL_SOURCE_URL,
+    )
+    longmem_adapter_parser.add_argument(
+        "--source-revision",
+        default=LONGMEM_OFFICIAL_SOURCE_REVISION,
+    )
+    longmem_adapter_parser.set_defaults(func=cmd_adapt_longmem_memory)
 
     memory_replay_parser = commands.add_parser(
         "replay-memory",

@@ -35,6 +35,30 @@ Construct memory before the question, reset the agent context, and record answer
 session/message ids. Report normalized EM/F1 when references permit; official LLM judge accuracy is a secondary
 comparison only.
 
+`adapt-longmem-memory` consumes the pinned cleaned LongMemEval-S JSON. It preserves the six official categories,
+source position and timestamp, but does not reorder sessions: the cleaned dataset contains deliberate duplicate
+non-gold session ids, empty distractor turns, non-chronological array order, and same-day sessions later than the
+question clock time. `question_date` is therefore treated as a reasoning reference, not a transaction cutoff.
+Each session occurrence receives a distinct stable id, while every gold session id must resolve to exactly one
+occurrence. Integer answers are canonically converted to decimal strings.
+
+```bash
+python3 -m scripts.eval.cli adapt-longmem-memory \
+  --source /path/to/longmemeval_s_cleaned.json \
+  --expected-source-sha256 d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442 \
+  --execution evals/memory/fixtures/hotpot-adapter-smoke-execution.json \
+  --output-source /tmp/longmem-memory-source.json \
+  --output-manifest /tmp/longmem-memory-manifest.json \
+  --limit 500 \
+  --split-seed 20260806
+```
+
+The importable source slice strips `answer`, `answer_session_ids`, every `has_answer` flag, raw question ids and
+the public `_abs` suffix. The host-owned manifest retains answer and session-level evidence. For abstention cases,
+the official `answer_session_ids` are treated as relevant near-miss evidence that justifies the refusal; they are
+not erased from the retrieval denominator. As with HotpotQA, the smoke execution identity is not a paid rollout
+configuration.
+
 ### Multi-hop retrieval
 
 Use the 1,000-example HippoRAG-preprocessed HotpotQA subset or a pinned smaller smoke split. Freeze `K=10` and
