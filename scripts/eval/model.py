@@ -385,6 +385,203 @@ def validate_suite(data: Dict[str, Any], root: Path) -> List[str]:
     return warnings
 
 
+def validate_treatment_activation_receipt(
+    value: Any,
+    where: str = "treatment_activation",
+    *,
+    expected_arm: Optional[str] = None,
+) -> None:
+    """Validate the versioned proof-carrying treatment receipt.
+
+    This is deliberately structural.  The authoritative verifier in
+    ``treatment_activation.py`` recomputes transcript/native hashes and the
+    TinyKG task packet; schema validation alone never admits a rollout.
+    """
+    if not isinstance(value, dict):
+        raise ValidationError(f"{where}: expected object")
+    expected_keys = {
+        "schema_version",
+        "contract",
+        "arm_id",
+        "expectation",
+        "status",
+        "execution",
+        "artifacts",
+        "trace",
+        "task",
+        "store",
+    }
+    if set(value) != expected_keys:
+        raise ValidationError(
+            f"{where}: expected exactly {sorted(expected_keys)}"
+        )
+    if value.get("schema_version") != 1:
+        raise ValidationError(f"{where}.schema_version: expected 1")
+    if value.get("contract") != "metacodes-treatment-activation-v1":
+        raise ValidationError(f"{where}.contract: unsupported contract")
+    arm_id = value.get("arm_id")
+    if arm_id not in {"codex_style", "claude_style", "tinykg"}:
+        raise ValidationError(f"{where}.arm_id: unknown arm")
+    if expected_arm is not None and arm_id != expected_arm:
+        raise ValidationError(
+            f"{where}.arm_id: expected {expected_arm!r}, observed {arm_id!r}"
+        )
+    if value.get("status") != "verified":
+        raise ValidationError(f"{where}.status: expected verified")
+
+    execution = value.get("execution")
+    execution_keys = {
+        "run_id",
+        "suite_id",
+        "task_id",
+        "trial",
+        "harness_config_id",
+    }
+    if not isinstance(execution, dict) or set(execution) != execution_keys:
+        raise ValidationError(
+            f"{where}.execution: expected exactly {sorted(execution_keys)}"
+        )
+    for key in ("run_id", "suite_id", "task_id", "harness_config_id"):
+        if not isinstance(execution.get(key), str) or not execution[key]:
+            raise ValidationError(f"{where}.execution.{key}: expected non-empty string")
+    trial = execution.get("trial")
+    if not isinstance(trial, int) or isinstance(trial, bool) or trial < 0:
+        raise ValidationError(f"{where}.execution.trial: expected integer >= 0")
+
+    artifacts = value.get("artifacts")
+    artifact_keys = {
+        "events_sha256",
+        "transcript_sha256",
+        "tinykg_binary_sha256",
+    }
+    if not isinstance(artifacts, dict) or set(artifacts) != artifact_keys:
+        raise ValidationError(
+            f"{where}.artifacts: expected exactly {sorted(artifact_keys)}"
+        )
+    for key in artifact_keys:
+        digest = artifacts.get(key)
+        if (
+            not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            raise ValidationError(f"{where}.artifacts.{key}: invalid SHA-256")
+
+    trace = value.get("trace")
+    if not isinstance(trace, list):
+        raise ValidationError(f"{where}.trace: expected array")
+    store = value.get("store")
+    if not isinstance(store, dict):
+        raise ValidationError(f"{where}.store: expected object")
+    if arm_id == "tinykg":
+        if value.get("expectation") != "persistent_task_lifecycle":
+            raise ValidationError(
+                f"{where}.expectation: TinyKG arm requires persistent task lifecycle"
+            )
+        task = value.get("task")
+        if (
+            not isinstance(task, dict)
+            or set(task) != {"id", "kind", "status"}
+            or not isinstance(task.get("id"), int)
+            or isinstance(task.get("id"), bool)
+            or task["id"] <= 0
+            or task.get("kind") != "task"
+            or task.get("status") != "completed"
+        ):
+            raise ValidationError(f"{where}.task: invalid completed task identity")
+        if len(trace) != 3:
+            raise ValidationError(f"{where}.trace: expected three lifecycle events")
+        phases = []
+        prior_finish = -1
+        trace_keys = {
+            "phase",
+            "tool_use_id",
+            "started_sequence",
+            "finished_sequence",
+            "input_sha256",
+            "result_sha256",
+        }
+        for index, item in enumerate(trace):
+            if not isinstance(item, dict) or set(item) != trace_keys:
+                raise ValidationError(
+                    f"{where}.trace[{index}]: invalid lifecycle event schema"
+                )
+            phases.append(item.get("phase"))
+            if not isinstance(item.get("tool_use_id"), str) or not item["tool_use_id"]:
+                raise ValidationError(
+                    f"{where}.trace[{index}].tool_use_id: expected non-empty string"
+                )
+            started = item.get("started_sequence")
+            finished = item.get("finished_sequence")
+            if (
+                not isinstance(started, int)
+                or isinstance(started, bool)
+                or not isinstance(finished, int)
+                or isinstance(finished, bool)
+                or started <= prior_finish
+                or finished <= started
+            ):
+                raise ValidationError(
+                    f"{where}.trace[{index}]: lifecycle sequences are not ordered"
+                )
+            prior_finish = finished
+            for key in ("input_sha256", "result_sha256"):
+                if (
+                    not isinstance(item.get(key), str)
+                    or re.fullmatch(r"[0-9a-f]{64}", item[key]) is None
+                ):
+                    raise ValidationError(
+                        f"{where}.trace[{index}].{key}: invalid SHA-256"
+                    )
+        if phases != ["created", "claimed", "completed"]:
+            raise ValidationError(
+                f"{where}.trace: expected created, claimed, completed"
+            )
+        store_keys = {
+            "present",
+            "relative_path",
+            "manifest_sha256",
+            "packet_schema",
+            "packet_sha256",
+            "verification_node_ids",
+        }
+        if set(store) != store_keys or store.get("present") is not True:
+            raise ValidationError(f"{where}.store: invalid persistent store receipt")
+        if store.get("relative_path") != ".home/.metacodes/kg/store.kg":
+            raise ValidationError(f"{where}.store.relative_path: unexpected path")
+        if store.get("packet_schema") != "tinykg-agent-retrieval-v1":
+            raise ValidationError(f"{where}.store.packet_schema: unsupported schema")
+        for key in ("manifest_sha256", "packet_sha256"):
+            if (
+                not isinstance(store.get(key), str)
+                or re.fullmatch(r"[0-9a-f]{64}", store[key]) is None
+            ):
+                raise ValidationError(f"{where}.store.{key}: invalid SHA-256")
+        verification_ids = store.get("verification_node_ids")
+        if (
+            not isinstance(verification_ids, list)
+            or not verification_ids
+            or any(
+                not isinstance(node_id, int)
+                or isinstance(node_id, bool)
+                or node_id <= 0
+                for node_id in verification_ids
+            )
+            or verification_ids != sorted(set(verification_ids))
+        ):
+            raise ValidationError(
+                f"{where}.store.verification_node_ids: invalid node id set"
+            )
+    else:
+        if value.get("expectation") != "persistent_tinykg_lifecycle_absent":
+            raise ValidationError(
+                f"{where}.expectation: baseline arm must prove treatment absence"
+            )
+        if trace or value.get("task") is not None or store != {"present": False}:
+            raise ValidationError(
+                f"{where}: baseline arm contains persistent treatment evidence"
+            )
+
+
 def validate_rollout(data: Dict[str, Any], where: str = "rollout") -> None:
     if data.get("schema_version") != SCHEMA_VERSION:
         raise ValidationError(f"{where}.schema_version: expected {SCHEMA_VERSION}")
@@ -542,6 +739,10 @@ def validate_rollout(data: Dict[str, Any], where: str = "rollout") -> None:
             raise ValidationError(
                 f"{where}.attribution[{index}].confidence: expected finite number in [0, 1]"
             )
+    if "treatment_activation" in data:
+        validate_treatment_activation_receipt(
+            data["treatment_activation"], f"{where}.treatment_activation"
+        )
 
 
 def load_json(path: Path) -> Dict[str, Any]:

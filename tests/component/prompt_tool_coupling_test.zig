@@ -234,6 +234,18 @@ test "L2: long-horizon arm gates TinyKG tools as one typed treatment" {
     try std.testing.expect(for (tinykg_props) |prop| {
         if (std.mem.eql(u8, prop.name, "conclusion")) break true;
     } else false);
+
+    const enabled_names = [_][]const u8{ "TaskCreate", "TaskList", "TaskGet", "TaskUpdate", "KgRecall", "KgContext", "KgRemember" };
+    const tinykg_prompt = try cc.system_prompt.buildFull(a, "glm-5.2", null, null, &enabled_names, "", true);
+    defer a.free(tinykg_prompt);
+    try std.testing.expect(std.mem.indexOf(u8, tinykg_prompt, "ACTIVATE:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tinykg_prompt, "create exactly one persistent lifecycle anchor") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tinykg_prompt, "Require its result to contain a `kg-*` id and `persisted: true`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tinykg_prompt, "after verifying the final artifacts") != null);
+
+    const baseline_prompt = try cc.system_prompt.buildFull(a, "glm-5.2", null, null, &enabled_names, "", false);
+    defer a.free(baseline_prompt);
+    try std.testing.expect(std.mem.indexOf(u8, baseline_prompt, "ACTIVATE:") == null);
 }
 
 // ② 动态耦合:USING_TOOLS 段按工具集裁剪。
