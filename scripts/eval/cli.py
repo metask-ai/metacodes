@@ -65,6 +65,11 @@ if __package__ in {None, ""}:
         artifact_bytes as longmem_adapter_artifact_bytes,
         load_execution as load_longmem_execution,
     )
+    from scripts.eval.memory_procedural_adapter import (  # type: ignore
+        adapt_procedural,
+        artifact_bytes as procedural_adapter_artifact_bytes,
+        load_execution as load_procedural_execution,
+    )
     from scripts.eval.memory_replay import (  # type: ignore
         load_manifest as load_memory_manifest,
         load_observations as load_memory_observations,
@@ -128,6 +133,11 @@ else:
         adapt_longmem,
         artifact_bytes as longmem_adapter_artifact_bytes,
         load_execution as load_longmem_execution,
+    )
+    from .memory_procedural_adapter import (
+        adapt_procedural,
+        artifact_bytes as procedural_adapter_artifact_bytes,
+        load_execution as load_procedural_execution,
     )
     from .memory_replay import (
         load_manifest as load_memory_manifest,
@@ -346,6 +356,53 @@ def cmd_adapt_longmem_memory(args: argparse.Namespace) -> int:
         f"cases={len(manifest['cases'])} "
         f"source={manifest['dataset']['source_sha256'][:16]} "
         f"upstream={source_slice['upstream']['source_sha256'][:16]}"
+    )
+    return 0
+
+
+def cmd_adapt_procedural_memory(args: argparse.Namespace) -> int:
+    input_paths = {
+        Path(args.source).resolve(),
+        Path(args.execution).resolve(),
+    }
+    output_paths = {
+        Path(args.output_source).resolve(),
+        Path(args.output_validators).resolve(),
+        Path(args.output_manifest).resolve(),
+    }
+    if len(output_paths) != 3:
+        raise ValidationError("procedural adapter output paths must be distinct")
+    overlap = input_paths.intersection(output_paths)
+    if overlap:
+        raise ValidationError(
+            "procedural adapter output would overwrite an input artifact: "
+            f"{sorted(map(str, overlap))}"
+        )
+    execution = load_procedural_execution(Path(args.execution))
+    source_slice, validators, manifest = adapt_procedural(
+        Path(args.source),
+        execution,
+        expected_source_sha256=args.expected_source_sha256,
+        limit_families=args.limit_families,
+        split_seed=args.split_seed,
+    )
+    _write(
+        args.output_source,
+        procedural_adapter_artifact_bytes(source_slice).decode("utf-8"),
+    )
+    _write(
+        args.output_validators,
+        procedural_adapter_artifact_bytes(validators).decode("utf-8"),
+    )
+    _write(
+        args.output_manifest,
+        procedural_adapter_artifact_bytes(manifest).decode("utf-8"),
+    )
+    print(
+        "procedural coding memory adapter complete: "
+        f"families={len(source_slice['families'])} "
+        f"cases={len(manifest['cases'])} "
+        f"source={manifest['dataset']['source_sha256'][:16]}"
     )
     return 0
 
@@ -1040,6 +1097,20 @@ def parser() -> argparse.ArgumentParser:
         default=LONGMEM_OFFICIAL_SOURCE_REVISION,
     )
     longmem_adapter_parser.set_defaults(func=cmd_adapt_longmem_memory)
+
+    procedural_adapter_parser = commands.add_parser(
+        "adapt-procedural-memory",
+        help="freeze coding intent families, workspaces, validators, and causal schedule",
+    )
+    procedural_adapter_parser.add_argument("--source", required=True)
+    procedural_adapter_parser.add_argument("--expected-source-sha256", required=True)
+    procedural_adapter_parser.add_argument("--execution", required=True)
+    procedural_adapter_parser.add_argument("--output-source", required=True)
+    procedural_adapter_parser.add_argument("--output-validators", required=True)
+    procedural_adapter_parser.add_argument("--output-manifest", required=True)
+    procedural_adapter_parser.add_argument("--limit-families", type=int, default=2)
+    procedural_adapter_parser.add_argument("--split-seed", type=int, default=20260806)
+    procedural_adapter_parser.set_defaults(func=cmd_adapt_procedural_memory)
 
     memory_replay_parser = commands.add_parser(
         "replay-memory",

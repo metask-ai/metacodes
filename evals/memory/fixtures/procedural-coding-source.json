@@ -1,0 +1,462 @@
+{
+  "schema_version": 1,
+  "dataset_id": "coding-intent-transfer-v1",
+  "dataset_revision": "checked-in-fixture-v1",
+  "families": [
+    {
+      "id": "config-field-migration",
+      "intent_template": "Migrate legacy configuration field `{old}` to canonical `{new}`. Update parser, serializer, docs, and round-trip contract while retaining input compatibility.",
+      "procedure_evidence_id": "procedure:config-field-migration:v1",
+      "cases": [
+        {
+          "id": "trace-header",
+          "split": "online",
+          "bindings": {
+            "new": "requestHeader",
+            "old": "traceHeader"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/config.md",
+                "content": "# Request tracing\n\n`traceHeader` is the canonical header configuration key.\n"
+              },
+              {
+                "path": "src/config.py",
+                "content": "def parse(raw):\n    return {\"traceHeader\": raw.get(\"traceHeader\")}\n\ndef serialize(config):\n    return {\"traceHeader\": config[\"traceHeader\"]}\n"
+              },
+              {
+                "path": "tests/contract.txt",
+                "content": "canonical=traceHeader\nlegacy=\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/config.md",
+              "src/config.py",
+              "tests/contract.txt"
+            ],
+            "required_changed_paths": [
+              "docs/config.md",
+              "src/config.py",
+              "tests/contract.txt"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/config.py",
+                "value": "raw.get(\"requestHeader\", raw.get(\"traceHeader\"))"
+              },
+              {
+                "kind": "contains",
+                "path": "src/config.py",
+                "value": "return {\"requestHeader\": config[\"requestHeader\"]}"
+              },
+              {
+                "kind": "not_contains",
+                "path": "src/config.py",
+                "value": "return {\"traceHeader\": config[\"traceHeader\"]}"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/config.md",
+                "value": "`traceHeader` remains accepted as a legacy input alias."
+              },
+              {
+                "kind": "equals",
+                "path": "tests/contract.txt",
+                "value": "canonical=requestHeader\nlegacy=traceHeader\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/config.md",
+              "content": "# Request tracing\n\n`requestHeader` is the canonical header configuration key.\n`traceHeader` remains accepted as a legacy input alias.\n"
+            },
+            {
+              "path": "src/config.py",
+              "content": "def parse(raw):\n    return {\"requestHeader\": raw.get(\"requestHeader\", raw.get(\"traceHeader\"))}\n\ndef serialize(config):\n    return {\"requestHeader\": config[\"requestHeader\"]}\n"
+            },
+            {
+              "path": "tests/contract.txt",
+              "content": "canonical=requestHeader\nlegacy=traceHeader\n"
+            }
+          ]
+        },
+        {
+          "id": "retry-cap",
+          "split": "offline",
+          "bindings": {
+            "new": "maxRetries",
+            "old": "retryCap"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/config.md",
+                "content": "# Retry policy\n\n`retryCap` is the canonical retry limit key.\n"
+              },
+              {
+                "path": "src/config.py",
+                "content": "def parse(raw):\n    return {\"retryCap\": raw.get(\"retryCap\")}\n\ndef serialize(config):\n    return {\"retryCap\": config[\"retryCap\"]}\n"
+              },
+              {
+                "path": "tests/contract.txt",
+                "content": "canonical=retryCap\nlegacy=\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/config.md",
+              "src/config.py",
+              "tests/contract.txt"
+            ],
+            "required_changed_paths": [
+              "docs/config.md",
+              "src/config.py",
+              "tests/contract.txt"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/config.py",
+                "value": "raw.get(\"maxRetries\", raw.get(\"retryCap\"))"
+              },
+              {
+                "kind": "contains",
+                "path": "src/config.py",
+                "value": "return {\"maxRetries\": config[\"maxRetries\"]}"
+              },
+              {
+                "kind": "not_contains",
+                "path": "src/config.py",
+                "value": "return {\"retryCap\": config[\"retryCap\"]}"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/config.md",
+                "value": "`retryCap` remains accepted as a legacy input alias."
+              },
+              {
+                "kind": "equals",
+                "path": "tests/contract.txt",
+                "value": "canonical=maxRetries\nlegacy=retryCap\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/config.md",
+              "content": "# Retry policy\n\n`maxRetries` is the canonical retry limit key.\n`retryCap` remains accepted as a legacy input alias.\n"
+            },
+            {
+              "path": "src/config.py",
+              "content": "def parse(raw):\n    return {\"maxRetries\": raw.get(\"maxRetries\", raw.get(\"retryCap\"))}\n\ndef serialize(config):\n    return {\"maxRetries\": config[\"maxRetries\"]}\n"
+            },
+            {
+              "path": "tests/contract.txt",
+              "content": "canonical=maxRetries\nlegacy=retryCap\n"
+            }
+          ]
+        },
+        {
+          "id": "cache-ttl",
+          "split": "offline",
+          "bindings": {
+            "new": "cacheTtlSeconds",
+            "old": "cacheTTL"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/config.md",
+                "content": "# Cache lifetime\n\n`cacheTTL` is the canonical cache lifetime key.\n"
+              },
+              {
+                "path": "src/config.py",
+                "content": "def parse(raw):\n    return {\"cacheTTL\": raw.get(\"cacheTTL\")}\n\ndef serialize(config):\n    return {\"cacheTTL\": config[\"cacheTTL\"]}\n"
+              },
+              {
+                "path": "tests/contract.txt",
+                "content": "canonical=cacheTTL\nlegacy=\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/config.md",
+              "src/config.py",
+              "tests/contract.txt"
+            ],
+            "required_changed_paths": [
+              "docs/config.md",
+              "src/config.py",
+              "tests/contract.txt"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/config.py",
+                "value": "raw.get(\"cacheTtlSeconds\", raw.get(\"cacheTTL\"))"
+              },
+              {
+                "kind": "contains",
+                "path": "src/config.py",
+                "value": "return {\"cacheTtlSeconds\": config[\"cacheTtlSeconds\"]}"
+              },
+              {
+                "kind": "not_contains",
+                "path": "src/config.py",
+                "value": "return {\"cacheTTL\": config[\"cacheTTL\"]}"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/config.md",
+                "value": "`cacheTTL` remains accepted as a legacy input alias."
+              },
+              {
+                "kind": "equals",
+                "path": "tests/contract.txt",
+                "value": "canonical=cacheTtlSeconds\nlegacy=cacheTTL\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/config.md",
+              "content": "# Cache lifetime\n\n`cacheTtlSeconds` is the canonical cache lifetime key.\n`cacheTTL` remains accepted as a legacy input alias.\n"
+            },
+            {
+              "path": "src/config.py",
+              "content": "def parse(raw):\n    return {\"cacheTtlSeconds\": raw.get(\"cacheTtlSeconds\", raw.get(\"cacheTTL\"))}\n\ndef serialize(config):\n    return {\"cacheTtlSeconds\": config[\"cacheTtlSeconds\"]}\n"
+            },
+            {
+              "path": "tests/contract.txt",
+              "content": "canonical=cacheTtlSeconds\nlegacy=cacheTTL\n"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "error-contract-propagation",
+      "intent_template": "Add internal error code `{code}` for `{condition}` and propagate it through the registry, protocol manifest, docs, and contract using stable wire spelling `{wire}`.",
+      "procedure_evidence_id": "procedure:error-contract-propagation:v1",
+      "cases": [
+        {
+          "id": "quota-exceeded",
+          "split": "online",
+          "bindings": {
+            "code": "quota_exceeded",
+            "condition": "a request exceeding its metered quota",
+            "wire": "QUOTA_EXCEEDED"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/errors.md",
+                "content": "# Errors\n\n- `INVALID_REQUEST`: malformed input.\n"
+              },
+              {
+                "path": "src/errors.py",
+                "content": "ERROR_CODES = {\n    \"invalid_request\": \"INVALID_REQUEST\",\n}\n"
+              },
+              {
+                "path": "tests/protocol.json",
+                "content": "{\"errors\":[\"INVALID_REQUEST\"]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/errors.md",
+              "src/errors.py",
+              "tests/protocol.json"
+            ],
+            "required_changed_paths": [
+              "docs/errors.md",
+              "src/errors.py",
+              "tests/protocol.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/errors.py",
+                "value": "\"quota_exceeded\": \"QUOTA_EXCEEDED\""
+              },
+              {
+                "kind": "contains",
+                "path": "tests/protocol.json",
+                "value": "\"QUOTA_EXCEEDED\""
+              },
+              {
+                "kind": "contains",
+                "path": "docs/errors.md",
+                "value": "a request exceeding its metered quota"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/errors.md",
+              "content": "# Errors\n\n- `INVALID_REQUEST`: malformed input.\n- `QUOTA_EXCEEDED`: a request exceeding its metered quota.\n"
+            },
+            {
+              "path": "src/errors.py",
+              "content": "ERROR_CODES = {\n    \"invalid_request\": \"INVALID_REQUEST\",\n    \"quota_exceeded\": \"QUOTA_EXCEEDED\",\n}\n"
+            },
+            {
+              "path": "tests/protocol.json",
+              "content": "{\"errors\":[\"INVALID_REQUEST\",\"QUOTA_EXCEEDED\"]}\n"
+            }
+          ]
+        },
+        {
+          "id": "stale-revision",
+          "split": "offline",
+          "bindings": {
+            "code": "stale_revision",
+            "condition": "a compare-and-swap against an outdated graph revision",
+            "wire": "STALE_REVISION"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/errors.md",
+                "content": "# Errors\n\n- `INVALID_REQUEST`: malformed input.\n"
+              },
+              {
+                "path": "src/errors.py",
+                "content": "ERROR_CODES = {\n    \"invalid_request\": \"INVALID_REQUEST\",\n}\n"
+              },
+              {
+                "path": "tests/protocol.json",
+                "content": "{\"errors\":[\"INVALID_REQUEST\"]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/errors.md",
+              "src/errors.py",
+              "tests/protocol.json"
+            ],
+            "required_changed_paths": [
+              "docs/errors.md",
+              "src/errors.py",
+              "tests/protocol.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/errors.py",
+                "value": "\"stale_revision\": \"STALE_REVISION\""
+              },
+              {
+                "kind": "contains",
+                "path": "tests/protocol.json",
+                "value": "\"STALE_REVISION\""
+              },
+              {
+                "kind": "contains",
+                "path": "docs/errors.md",
+                "value": "a compare-and-swap against an outdated graph revision"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/errors.md",
+              "content": "# Errors\n\n- `INVALID_REQUEST`: malformed input.\n- `STALE_REVISION`: a compare-and-swap against an outdated graph revision.\n"
+            },
+            {
+              "path": "src/errors.py",
+              "content": "ERROR_CODES = {\n    \"invalid_request\": \"INVALID_REQUEST\",\n    \"stale_revision\": \"STALE_REVISION\",\n}\n"
+            },
+            {
+              "path": "tests/protocol.json",
+              "content": "{\"errors\":[\"INVALID_REQUEST\",\"STALE_REVISION\"]}\n"
+            }
+          ]
+        },
+        {
+          "id": "invalid-lease",
+          "split": "offline",
+          "bindings": {
+            "code": "invalid_lease",
+            "condition": "a task mutation attempted with an expired ownership lease",
+            "wire": "INVALID_LEASE"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/errors.md",
+                "content": "# Errors\n\n- `INVALID_REQUEST`: malformed input.\n"
+              },
+              {
+                "path": "src/errors.py",
+                "content": "ERROR_CODES = {\n    \"invalid_request\": \"INVALID_REQUEST\",\n}\n"
+              },
+              {
+                "path": "tests/protocol.json",
+                "content": "{\"errors\":[\"INVALID_REQUEST\"]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/errors.md",
+              "src/errors.py",
+              "tests/protocol.json"
+            ],
+            "required_changed_paths": [
+              "docs/errors.md",
+              "src/errors.py",
+              "tests/protocol.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/errors.py",
+                "value": "\"invalid_lease\": \"INVALID_LEASE\""
+              },
+              {
+                "kind": "contains",
+                "path": "tests/protocol.json",
+                "value": "\"INVALID_LEASE\""
+              },
+              {
+                "kind": "contains",
+                "path": "docs/errors.md",
+                "value": "a task mutation attempted with an expired ownership lease"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/errors.md",
+              "content": "# Errors\n\n- `INVALID_REQUEST`: malformed input.\n- `INVALID_LEASE`: a task mutation attempted with an expired ownership lease.\n"
+            },
+            {
+              "path": "src/errors.py",
+              "content": "ERROR_CODES = {\n    \"invalid_request\": \"INVALID_REQUEST\",\n    \"invalid_lease\": \"INVALID_LEASE\",\n}\n"
+            },
+            {
+              "path": "tests/protocol.json",
+              "content": "{\"errors\":[\"INVALID_REQUEST\",\"INVALID_LEASE\"]}\n"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

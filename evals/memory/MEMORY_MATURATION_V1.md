@@ -99,6 +99,34 @@ without the online transcript. Report online/offline success, transfer gain over
 success, repair/rollback count, tool/turn/token/cost, and any offline write leakage. Human demonstrations, if
 used, are a separately named factor and never silently included.
 
+`adapt-procedural-memory` freezes complete intent families rather than sampling sibling cases independently.
+Each selected family must contain exactly one online case and at least two offline cases. The raw host-owned
+source includes baseline inline workspaces, deterministic workspace assertions, and oracle replacements used
+only to prove that the baseline fails and a known solution passes. The public source slice strips the assertions
+and oracle while retaining every baseline file plus workspace, task, intent-template, and validator fingerprints.
+The separate validator bundle strips the oracle too and is bound to the public source hash; its per-case
+fingerprint is the manifest grader identity. No LLM judge, shell command, network request, or TinyKG instance is
+used during adaptation.
+
+```bash
+source_sha=$(shasum -a 256 evals/memory/fixtures/procedural-coding-source.json | cut -d' ' -f1)
+python3 -m scripts.eval.cli adapt-procedural-memory \
+  --source evals/memory/fixtures/procedural-coding-source.json \
+  --expected-source-sha256 "$source_sha" \
+  --execution evals/memory/fixtures/procedural-adapter-smoke-execution.json \
+  --output-source /tmp/procedural-memory-source.json \
+  --output-validators /tmp/procedural-memory-validators.json \
+  --output-manifest /tmp/procedural-memory-manifest.json \
+  --limit-families 2 \
+  --split-seed 20260806
+```
+
+The generated schedule is family-causal for every arm and trial: the online case is always observed before any
+offline sibling. Actual runners must materialize each workspace afresh, execute the host-owned validator after
+the agent stops, and compare the graph revision around every offline run. Offline and read-only arms must report
+zero inserts and zero write events. The checked fixture is an adapter/validator trace, not evidence that one
+memory arm improves coding success.
+
 ## Result row contract
 
 Each v2 JSONL row is validated by `scripts.eval.memory_benchmark` and must bind:
