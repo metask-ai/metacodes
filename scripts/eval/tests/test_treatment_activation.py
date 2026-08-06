@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import copy
 import hashlib
 import json
@@ -149,7 +151,11 @@ def run_metadata(arm_id):
 
 
 def write_activation_artifacts(
-    workspace: Path, binary: Path, *, close_task: bool = True
+    workspace: Path,
+    binary: Path,
+    *,
+    close_task: bool = True,
+    metadata: dict | None = None,
 ) -> None:
     store = workspace / ".home/.metacodes/kg/store.kg"
     store.parent.mkdir(parents=True)
@@ -242,7 +248,17 @@ def write_activation_artifacts(
             compact({"ok": True, "closed": True, "next": []}),
         ),
     ]
-    events = [envelope(0, {"run_started": {"trace_id": "activation-trace", "metadata": run_metadata("tinykg")}})]
+    events = [
+        envelope(
+            0,
+            {
+                "run_started": {
+                    "trace_id": "activation-trace",
+                    "metadata": metadata or run_metadata("tinykg"),
+                }
+            },
+        )
+    ]
     transcript = []
     sequence = 1
     for tool_use_id, name, input_text, result_text in calls:
@@ -271,14 +287,16 @@ def write_activation_artifacts(
     write_jsonl(workspace / "transcript.jsonl", transcript)
 
 
-def write_baseline_artifacts(workspace: Path, arm_id: str = "codex_style") -> None:
+def write_baseline_artifacts(
+    workspace: Path, arm_id: str = "codex_style", *, metadata: dict | None = None
+) -> None:
     events = [
         envelope(
             0,
             {
                 "run_started": {
                     "trace_id": "baseline-trace",
-                    "metadata": run_metadata(arm_id),
+                    "metadata": metadata or run_metadata(arm_id),
                 }
             },
         ),

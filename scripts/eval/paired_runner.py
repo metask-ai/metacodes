@@ -24,6 +24,10 @@ from .experiment import (
 )
 from .model import ValidationError, load_rollouts, write_rollouts
 from .promotion import validate_calibration_bundle
+from .treatment_activation import (
+    attach_treatment_activation,
+    reverify_treatment_activation,
+)
 
 
 TOKEN_METRICS = (
@@ -313,6 +317,35 @@ def _mark_runtime_budget_invalid(
     )
 
 
+def _mark_treatment_activation_invalid(
+    rollout: Dict[str, Any], detail: str
+) -> None:
+    """Keep a failed treatment attestation as durable, unscorable evidence."""
+    execution = rollout.setdefault("execution", {})
+    execution["status"] = "invalid"
+    reasons = execution.setdefault("invalid_reasons", [])
+    if "treatment_activation_failed" not in reasons:
+        reasons.append("treatment_activation_failed")
+    judgement = rollout.setdefault("judgement", {})
+    judgement["valid_for_scoring"] = False
+    judgement["trustworthy_success"] = False
+    attribution = rollout.setdefault("attribution", [])
+    if not any(
+        item.get("code") == "treatment_activation_failed"
+        for item in attribution
+        if isinstance(item, dict)
+    ):
+        attribution.append(
+            {
+                "code": "treatment_activation_failed",
+                "source": "L",
+                "count": 1,
+                "confidence": 1.0,
+                "detail": detail[:512],
+            }
+        )
+
+
 def alternating_schedule(trials: int) -> List[Tuple[int, str]]:
     if trials <= 0:
         raise ValidationError("trials must be > 0")
@@ -346,6 +379,7 @@ def _load_checkpoint(
     harness_revision: str,
     harness_config_id: str | None = None,
     require_runtime_budget: bool = False,
+    treatment_verifier: tuple[Path, str] | None = None,
 ) -> List[Dict[str, Any]]:
     if not path.exists():
         return []
@@ -415,6 +449,14 @@ def _load_checkpoint(
         if mismatches:
             raise ValidationError(
                 f"{variant} checkpoint {(task_id, trial)!r} identity mismatch: {mismatches}"
+            )
+        if treatment_verifier is not None:
+            verifier_binary, verifier_sha256 = treatment_verifier
+            reverify_treatment_activation(
+                rollout,
+                variant,
+                verifier_binary,
+                verifier_sha256,
             )
     return rollouts
 
@@ -857,6 +899,7 @@ def run_multi_arm(
             experiment,
             repo_root,
             calibration_checkpoints,
+            tinykg_binary=Path(tinykg_identity["path"]),
             metacodes_sha256=metacodes_sha256,
             tinykg_sha256=tinykg_identity["sha256"],
             formal_kernel_fingerprint=formal_identity["artifact_fingerprint"],
@@ -896,6 +939,10 @@ def run_multi_arm(
             harness_revision=revision,
             harness_config_id=config_ids[arm_id],
             require_runtime_budget=True,
+            treatment_verifier=(
+                Path(tinykg_identity["path"]),
+                tinykg_identity["sha256"],
+            ),
         )
         for arm_id in ARM_IDS
     }
@@ -1059,6 +1106,18 @@ def run_multi_arm(
             except ValidationError as exc:
                 runtime_budget_error = exc
                 _mark_runtime_budget_invalid(selected[0], str(exc))
+            treatment_error: ValidationError | None = None
+            if infrastructure_error is None and runtime_budget_error is None:
+                try:
+                    attach_treatment_activation(
+                        selected[0],
+                        arm_id,
+                        Path(tinykg_identity["path"]),
+                        tinykg_identity["sha256"],
+                    )
+                except ValidationError as exc:
+                    treatment_error = exc
+                    _mark_treatment_activation_invalid(selected[0], str(exc))
             collected[arm_id].extend(selected)
             completed_keys[arm_id].add((task_id, trial))
             write_rollouts(outputs[arm_id], collected[arm_id])
@@ -1066,6 +1125,8 @@ def run_multi_arm(
                 raise infrastructure_error
             if runtime_budget_error is not None:
                 raise runtime_budget_error
+            if treatment_error is not None:
+                raise treatment_error
             _require_scoring_rollout(selected[0], variant=arm_id)
             _require_multi_budget(
                 collected,

@@ -328,9 +328,15 @@ def _validated_multi_arm_outputs(
     experiment: Dict[str, Any],
     suite: Dict[str, Any],
     paths: Dict[str, Path],
+    *,
+    tinykg_binary: Path,
 ) -> tuple[Dict[str, Any], Dict[str, list[Dict[str, Any]]]]:
     metadata, rollouts_by_arm, _checkpoint_sha256 = validate_multi_arm_evidence(
-        experiment, suite, REPO_ROOT, paths
+        experiment,
+        suite,
+        REPO_ROOT,
+        paths,
+        tinykg_binary=tinykg_binary,
     )
     result = compare_multi_arm(rollouts_by_arm)
     result.update(metadata)
@@ -350,7 +356,10 @@ def cmd_report_multi(args: argparse.Namespace) -> int:
         "tinykg": Path(args.tinykg),
     }
     result, _rollouts_by_arm = _validated_multi_arm_outputs(
-        experiment, suite, paths
+        experiment,
+        suite,
+        paths,
+        tinykg_binary=Path(args.tinykg_binary),
     )
     receipt = load_json(Path(args.promotion_receipt))
     calibration_cost, calibration_tokens = validate_calibration_bundle(
@@ -358,6 +367,7 @@ def cmd_report_multi(args: argparse.Namespace) -> int:
         experiment,
         REPO_ROOT,
         calibration_checkpoint_paths(Path(args.calibration_dir)),
+        tinykg_binary=Path(args.tinykg_binary),
         metacodes_sha256=result["metacodes_sha256"],
         tinykg_sha256=result["tinykg_sha256"],
         formal_kernel_fingerprint=result["formal_kernel_fingerprint"],
@@ -384,7 +394,13 @@ def cmd_promote_multi(args: argparse.Namespace) -> int:
         "claude_style": Path(args.claude_style),
         "tinykg": Path(args.tinykg),
     }
-    receipt = build_promotion_receipt(experiment, suite, REPO_ROOT, paths)
+    receipt = build_promotion_receipt(
+        experiment,
+        suite,
+        REPO_ROOT,
+        paths,
+        tinykg_binary=Path(args.tinykg_binary),
+    )
     _write_json(args.output, receipt)
     return 0
 
@@ -834,6 +850,7 @@ def parser() -> argparse.ArgumentParser:
     multi_report_parser.add_argument("--tinykg", required=True)
     multi_report_parser.add_argument("--promotion-receipt", required=True)
     multi_report_parser.add_argument("--calibration-dir", required=True)
+    multi_report_parser.add_argument("--tinykg-binary", required=True)
     multi_report_parser.add_argument("--markdown")
     multi_report_parser.add_argument("--json")
     multi_report_parser.set_defaults(func=cmd_report_multi)
@@ -846,6 +863,7 @@ def parser() -> argparse.ArgumentParser:
     promote_parser.add_argument("--codex-style", required=True)
     promote_parser.add_argument("--claude-style", required=True)
     promote_parser.add_argument("--tinykg", required=True)
+    promote_parser.add_argument("--tinykg-binary", required=True)
     promote_parser.add_argument("--output", required=True)
     promote_parser.set_defaults(func=cmd_promote_multi)
 

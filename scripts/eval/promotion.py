@@ -24,6 +24,7 @@ from .model import (
     load_rollouts,
     safe_posix_relative_path,
 )
+from .treatment_activation import reverify_treatment_activation
 
 
 TOKEN_METRICS = (
@@ -70,6 +71,8 @@ def validate_multi_arm_evidence(
     suite: Dict[str, Any],
     repo_root: Path,
     paths: Mapping[str, Path],
+    *,
+    tinykg_binary: Path,
 ) -> Tuple[Dict[str, Any], Dict[str, list[Dict[str, Any]]], Dict[str, str]]:
     """Re-read and validate one complete three-arm checkpoint set."""
     validate_experiment(experiment, repo_root, suite)
@@ -81,12 +84,6 @@ def validate_multi_arm_evidence(
     rollouts_by_arm = {
         arm_id: load_rollouts(paths[arm_id]) for arm_id in ARM_IDS
     }
-    after_sha256 = {
-        arm_id: _sha256_regular_file(paths[arm_id]) for arm_id in ARM_IDS
-    }
-    if before_sha256 != after_sha256:
-        raise ValidationError("multi-arm checkpoints changed while being validated")
-
     invalid = {
         arm_id: [
             (rollout["task_id"], rollout["trial"])
@@ -190,6 +187,22 @@ def validate_multi_arm_evidence(
     if len(revisions) != 1:
         raise ValidationError("multi-arm evidence mixes metacodes revisions")
 
+    expected_tinykg_sha256 = next(iter(tinykg_sha256s))
+    for arm_id, rollouts in rollouts_by_arm.items():
+        for rollout in rollouts:
+            reverify_treatment_activation(
+                rollout,
+                arm_id,
+                tinykg_binary,
+                expected_tinykg_sha256,
+            )
+
+    after_sha256 = {
+        arm_id: _sha256_regular_file(paths[arm_id]) for arm_id in ARM_IDS
+    }
+    if before_sha256 != after_sha256:
+        raise ValidationError("multi-arm checkpoints changed while being validated")
+
     metadata = {
         "experiment_id": experiment["experiment_id"],
         "experiment_fingerprint": fingerprint,
@@ -207,12 +220,18 @@ def build_promotion_receipt(
     suite: Dict[str, Any],
     repo_root: Path,
     paths: Mapping[str, Path],
+    *,
+    tinykg_binary: Path,
 ) -> Dict[str, Any]:
     """Derive a receipt only from a complete authoritative calibration set."""
     if experiment.get("stage", {}).get("id") != "calibration":
         raise ValidationError("promotion receipts can only be built from calibration")
     metadata, rollouts_by_arm, checkpoint_sha256 = validate_multi_arm_evidence(
-        experiment, suite, repo_root, paths
+        experiment,
+        suite,
+        repo_root,
+        paths,
+        tinykg_binary=tinykg_binary,
     )
     rollouts = [row for arm_id in ARM_IDS for row in rollouts_by_arm[arm_id]]
     gate = experiment["promotion"]["gate"]
@@ -308,6 +327,7 @@ def validate_calibration_bundle(
     repo_root: Path,
     checkpoint_paths: Mapping[str, Path],
     *,
+    tinykg_binary: Path,
     metacodes_sha256: str,
     tinykg_sha256: str,
     formal_kernel_fingerprint: str,
@@ -328,7 +348,11 @@ def validate_calibration_bundle(
             "calibration source manifest does not match the frozen confirmatory contract"
         )
     expected_receipt = build_promotion_receipt(
-        source_experiment, source_suite, repo_root, checkpoint_paths
+        source_experiment,
+        source_suite,
+        repo_root,
+        checkpoint_paths,
+        tinykg_binary=tinykg_binary,
     )
     if dict(receipt) != expected_receipt:
         raise ValidationError(

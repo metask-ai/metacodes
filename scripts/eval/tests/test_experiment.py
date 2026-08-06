@@ -20,7 +20,16 @@ from scripts.eval.experiment import (
 from scripts.eval.model import ValidationError, load_json, load_rollouts, write_rollouts
 from scripts.eval.paired_runner import InfrastructureRunError, run_multi_arm
 from scripts.eval.promotion import build_promotion_receipt
+from scripts.eval.treatment_activation import (
+    attach_treatment_activation as real_attach_treatment_activation,
+    reverify_treatment_activation as real_reverify_treatment_activation,
+)
 from scripts.eval.tests.multi_arm_fixture import write_multi_arm_checkpoints
+from scripts.eval.tests.test_treatment_activation import (
+    TINYKG as REAL_TINYKG,
+    write_activation_artifacts,
+    write_baseline_artifacts,
+)
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -94,6 +103,24 @@ class LongHorizonExperimentTest(unittest.TestCase):
         self.suite = load_json(SUITE_PATH)
         self.confirmatory_experiment = load_json(CONFIRMATORY_EXPERIMENT_PATH)
         self.confirmatory_suite = load_json(CONFIRMATORY_SUITE_PATH)
+        # Most runner tests use normalized synthetic rollouts.  Keep that test
+        # seam explicit instead of weakening the production verifier; dedicated
+        # treatment tests exercise real events/transcripts/TinyKG stores.
+        attach_patcher = mock.patch(
+            "scripts.eval.paired_runner.attach_treatment_activation"
+        )
+        resume_patcher = mock.patch(
+            "scripts.eval.paired_runner.reverify_treatment_activation"
+        )
+        promotion_patcher = mock.patch(
+            "scripts.eval.promotion.reverify_treatment_activation"
+        )
+        self.attach_activation = attach_patcher.start()
+        self.resume_activation = resume_patcher.start()
+        self.promotion_activation = promotion_patcher.start()
+        self.addCleanup(attach_patcher.stop)
+        self.addCleanup(resume_patcher.stop)
+        self.addCleanup(promotion_patcher.stop)
 
     def test_checked_in_contract_is_valid_and_zero_cost(self):
         validate_experiment(self.experiment, ROOT, self.suite)
@@ -686,9 +713,363 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 [item["code"] for item in checkpoint[0]["attribution"]],
             )
 
+    def test_multi_arm_checkpoints_treatment_failure_before_abort(self):
+        experiment = copy.deepcopy(self.experiment)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "metacodes"
+            binary.write_bytes(b"activation-metacodes")
+            binary.chmod(0o755)
+            tinykg = root / "tinykg"
+            tinykg.write_bytes(b"activation-tinykg")
+            tinykg.chmod(0o755)
+            metacodes_sha = hashlib.sha256(binary.read_bytes()).hexdigest()
+            tinykg_sha = hashlib.sha256(tinykg.read_bytes()).hexdigest()
+            tinykg_identity = {
+                "path": str(tinykg.resolve()),
+                "sha256": tinykg_sha,
+                "version": "tinykg test",
+            }
+            formal, formal_identity = fake_formal_artifact(root)
+            seed_paths = write_multi_arm_checkpoints(
+                root / "seed",
+                experiment,
+                self.suite,
+                ROOT,
+                metacodes_sha256=metacodes_sha,
+                tinykg_sha256=tinykg_sha,
+                formal_kernel_fingerprint=formal_identity["artifact_fingerprint"],
+                revision="activation-revision",
+            )
+            rollout = load_rollouts(seed_paths["codex_style"])[0]
+            run_dir = root / "activation-run"
+            run_dir.mkdir()
+            output_dir = root / "checkpoints"
+
+            with mock.patch(
+                "scripts.eval.paired_runner.tinykg_binary_identity",
+                return_value=tinykg_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner.formal_kernel_identity",
+                return_value=formal_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner._run_once", return_value=run_dir
+            ), mock.patch(
+                "scripts.eval.paired_runner.import_run",
+                return_value=[copy.deepcopy(rollout)],
+            ), mock.patch(
+                "scripts.eval.paired_runner.attach_treatment_activation",
+                side_effect=ValidationError("persistent lifecycle was not activated"),
+            ) as attester:
+                with self.assertRaisesRegex(
+                    ValidationError, "persistent lifecycle was not activated"
+                ):
+                    run_multi_arm(
+                        experiment,
+                        self.suite,
+                        ROOT,
+                        binary,
+                        tinykg_binary=tinykg,
+                        formal_kernel=formal,
+                        revision="activation-revision",
+                        output_dir=output_dir,
+                        suite_path=SUITE_PATH,
+                        allow_paid_rollouts=True,
+                    )
+
+            attester.assert_called_once()
+            checkpoint = load_rollouts(output_dir / "codex_style.jsonl")
+            self.assertEqual(len(checkpoint), 1)
+            self.assertEqual(checkpoint[0]["execution"]["status"], "invalid")
+            self.assertIn(
+                "treatment_activation_failed",
+                checkpoint[0]["execution"]["invalid_reasons"],
+            )
+            self.assertFalse(checkpoint[0]["judgement"]["valid_for_scoring"])
+            self.assertIn(
+                "treatment_activation_failed",
+                [item["code"] for item in checkpoint[0]["attribution"]],
+            )
+
+    def test_multi_arm_does_not_abort_past_failed_treatment_checkpoint(self):
+        experiment = copy.deepcopy(self.experiment)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "metacodes"
+            binary.write_bytes(b"checkpoint-failure-metacodes")
+            binary.chmod(0o755)
+            tinykg = root / "tinykg"
+            tinykg.write_bytes(b"checkpoint-failure-tinykg")
+            tinykg.chmod(0o755)
+            metacodes_sha = hashlib.sha256(binary.read_bytes()).hexdigest()
+            tinykg_sha = hashlib.sha256(tinykg.read_bytes()).hexdigest()
+            tinykg_identity = {
+                "path": str(tinykg.resolve()),
+                "sha256": tinykg_sha,
+                "version": "tinykg test",
+            }
+            formal, formal_identity = fake_formal_artifact(root)
+            seed_paths = write_multi_arm_checkpoints(
+                root / "seed",
+                experiment,
+                self.suite,
+                ROOT,
+                metacodes_sha256=metacodes_sha,
+                tinykg_sha256=tinykg_sha,
+                formal_kernel_fingerprint=formal_identity["artifact_fingerprint"],
+                revision="checkpoint-failure-revision",
+            )
+            rollout = load_rollouts(seed_paths["codex_style"])[0]
+            run_dir = root / "activation-run"
+            run_dir.mkdir()
+            output_dir = root / "checkpoints"
+
+            with mock.patch(
+                "scripts.eval.paired_runner.tinykg_binary_identity",
+                return_value=tinykg_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner.formal_kernel_identity",
+                return_value=formal_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner._run_once", return_value=run_dir
+            ), mock.patch(
+                "scripts.eval.paired_runner.import_run",
+                return_value=[copy.deepcopy(rollout)],
+            ), mock.patch(
+                "scripts.eval.paired_runner.attach_treatment_activation",
+                side_effect=ValidationError("persistent lifecycle was not activated"),
+            ) as attester, mock.patch(
+                "scripts.eval.paired_runner.write_rollouts",
+                side_effect=OSError("checkpoint commit failed"),
+            ) as checkpoint_writer:
+                with self.assertRaisesRegex(OSError, "checkpoint commit failed"):
+                    run_multi_arm(
+                        experiment,
+                        self.suite,
+                        ROOT,
+                        binary,
+                        tinykg_binary=tinykg,
+                        formal_kernel=formal,
+                        revision="checkpoint-failure-revision",
+                        output_dir=output_dir,
+                        suite_path=SUITE_PATH,
+                        allow_paid_rollouts=True,
+                    )
+
+            attester.assert_called_once()
+            checkpoint_writer.assert_called_once()
+            written_rows = list(checkpoint_writer.call_args.args[1])
+            self.assertEqual(written_rows[0]["execution"]["status"], "invalid")
+            self.assertIn(
+                "treatment_activation_failed",
+                written_rows[0]["execution"]["invalid_reasons"],
+            )
+            self.assertFalse((output_dir / "codex_style.jsonl").exists())
+
+    def test_multi_arm_resume_reverifies_treatment_before_network(self):
+        experiment = copy.deepcopy(self.experiment)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "metacodes"
+            binary.write_bytes(b"resume-metacodes")
+            binary.chmod(0o755)
+            tinykg = root / "tinykg"
+            tinykg.write_bytes(b"resume-tinykg")
+            tinykg.chmod(0o755)
+            metacodes_sha = hashlib.sha256(binary.read_bytes()).hexdigest()
+            tinykg_sha = hashlib.sha256(tinykg.read_bytes()).hexdigest()
+            tinykg_identity = {
+                "path": str(tinykg.resolve()),
+                "sha256": tinykg_sha,
+                "version": "tinykg test",
+            }
+            formal, formal_identity = fake_formal_artifact(root)
+            seed_paths = write_multi_arm_checkpoints(
+                root / "seed",
+                experiment,
+                self.suite,
+                ROOT,
+                metacodes_sha256=metacodes_sha,
+                tinykg_sha256=tinykg_sha,
+                formal_kernel_fingerprint=formal_identity["artifact_fingerprint"],
+                revision="resume-revision",
+            )
+            resumed = load_rollouts(seed_paths["codex_style"])[0]
+            task = next(
+                item for item in self.suite["tasks"] if item["id"] == resumed["task_id"]
+            )
+            identity = comparison_fingerprints(
+                task,
+                ROOT,
+                model_provider=experiment["model"]["provider"],
+                model_id=experiment["model"]["id"],
+                harness_config_id=resumed["harness"]["config_id"],
+                harness_revision="resume-revision",
+                permission_mode=task["constraints"]["permission_mode"],
+                binary_path=binary,
+            )
+            resumed["model"]["fingerprint"] = identity["model_fingerprint"]
+            resumed["harness"]["fingerprint"] = identity["harness_fingerprint"]
+            resumed["harness"]["environment_fingerprint"] = identity[
+                "environment_fingerprint"
+            ]
+            resumed["evaluator"]["fingerprint"] = identity["grader_fingerprint"]
+            output_dir = root / "checkpoints"
+            write_rollouts(output_dir / "codex_style.jsonl", [resumed])
+
+            with mock.patch(
+                "scripts.eval.paired_runner.tinykg_binary_identity",
+                return_value=tinykg_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner.formal_kernel_identity",
+                return_value=formal_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner.reverify_treatment_activation",
+                side_effect=ValidationError("activation artifacts changed"),
+            ) as verifier, mock.patch(
+                "scripts.eval.paired_runner._run_once"
+            ) as run_once:
+                with self.assertRaisesRegex(
+                    ValidationError, "activation artifacts changed"
+                ):
+                    run_multi_arm(
+                        experiment,
+                        self.suite,
+                        ROOT,
+                        binary,
+                        tinykg_binary=tinykg,
+                        formal_kernel=formal,
+                        revision="resume-revision",
+                        output_dir=output_dir,
+                        suite_path=SUITE_PATH,
+                        allow_paid_rollouts=True,
+                    )
+            verifier.assert_called_once()
+            run_once.assert_not_called()
+
+    @unittest.skipUnless(
+        REAL_TINYKG.is_file(), "build the vendored TinyKG binary first"
+    )
+    def test_multi_arm_attaches_real_tinykg_receipt_before_checkpoint(self):
+        experiment = copy.deepcopy(self.experiment)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = root / "metacodes"
+            binary.write_bytes(b"real-activation-metacodes")
+            binary.chmod(0o755)
+            tinykg = REAL_TINYKG.resolve()
+            metacodes_sha = hashlib.sha256(binary.read_bytes()).hexdigest()
+            tinykg_sha = hashlib.sha256(tinykg.read_bytes()).hexdigest()
+            tinykg_identity = {
+                "path": str(tinykg),
+                "sha256": tinykg_sha,
+                "version": "tinykg test",
+            }
+            formal, formal_identity = fake_formal_artifact(root)
+            seed_paths = write_multi_arm_checkpoints(
+                root / "seed",
+                experiment,
+                self.suite,
+                ROOT,
+                metacodes_sha256=metacodes_sha,
+                tinykg_sha256=tinykg_sha,
+                formal_kernel_fingerprint=formal_identity["artifact_fingerprint"],
+                revision="real-activation-revision",
+            )
+
+            def normalize(arm_id):
+                item = load_rollouts(seed_paths[arm_id])[0]
+                task = next(
+                    task
+                    for task in self.suite["tasks"]
+                    if task["id"] == item["task_id"]
+                )
+                identity = comparison_fingerprints(
+                    task,
+                    ROOT,
+                    model_provider=experiment["model"]["provider"],
+                    model_id=experiment["model"]["id"],
+                    harness_config_id=item["harness"]["config_id"],
+                    harness_revision="real-activation-revision",
+                    permission_mode=task["constraints"]["permission_mode"],
+                    binary_path=binary,
+                )
+                item["model"]["fingerprint"] = identity["model_fingerprint"]
+                item["harness"]["fingerprint"] = identity["harness_fingerprint"]
+                item["harness"]["environment_fingerprint"] = identity[
+                    "environment_fingerprint"
+                ]
+                item["evaluator"]["fingerprint"] = identity["grader_fingerprint"]
+                return item
+
+            output_dir = root / "checkpoints"
+            for arm_id in ("codex_style", "claude_style"):
+                write_rollouts(output_dir / f"{arm_id}.jsonl", [normalize(arm_id)])
+
+            tinykg_rollout = normalize("tinykg")
+            workspace = root / "tinykg-workspace"
+            workspace.mkdir()
+            write_activation_artifacts(
+                workspace,
+                tinykg,
+                metadata={
+                    "run_id": tinykg_rollout["run_id"],
+                    "trial": tinykg_rollout["trial"],
+                    "suite_id": tinykg_rollout["suite_id"],
+                    "task_id": tinykg_rollout["task_id"],
+                    "harness_config_id": tinykg_rollout["harness"]["config_id"],
+                },
+            )
+            tinykg_rollout["artifacts"] = {"workspace": str(workspace)}
+            run_dir = root / "run"
+            run_dir.mkdir()
+
+            with mock.patch(
+                "scripts.eval.paired_runner.tinykg_binary_identity",
+                return_value=tinykg_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner.formal_kernel_identity",
+                return_value=formal_identity,
+            ), mock.patch(
+                "scripts.eval.paired_runner._run_once",
+                side_effect=[run_dir, RuntimeError("stop after real activation")],
+            ), mock.patch(
+                "scripts.eval.paired_runner.import_run",
+                return_value=[tinykg_rollout],
+            ), mock.patch(
+                "scripts.eval.paired_runner.attach_treatment_activation",
+                new=real_attach_treatment_activation,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stop after real activation"):
+                    run_multi_arm(
+                        experiment,
+                        self.suite,
+                        ROOT,
+                        binary,
+                        tinykg_binary=tinykg,
+                        formal_kernel=formal,
+                        revision="real-activation-revision",
+                        output_dir=output_dir,
+                        suite_path=SUITE_PATH,
+                        allow_paid_rollouts=True,
+                    )
+
+            persisted = load_rollouts(output_dir / "tinykg.jsonl")
+            self.assertEqual(len(persisted), 1)
+            self.assertEqual(
+                [row["phase"] for row in persisted[0]["treatment_activation"]["trace"]],
+                ["created", "claimed", "completed"],
+            )
+            real_reverify_treatment_activation(
+                persisted[0], "tinykg", tinykg, tinykg_sha
+            )
+
     def test_promotion_rechecks_fixed_runtime_budget_and_usage(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            tinykg = root / "tinykg"
+            tinykg.write_bytes(b"test-only-tinykg")
+            tinykg.chmod(0o755)
             paths = write_multi_arm_checkpoints(
                 root,
                 self.experiment,
@@ -707,7 +1088,11 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 ValidationError, "runtime budget is not the frozen"
             ):
                 build_promotion_receipt(
-                    self.experiment, self.suite, ROOT, paths
+                    self.experiment,
+                    self.suite,
+                    ROOT,
+                    paths,
+                    tinykg_binary=tinykg,
                 )
 
             paths["tinykg"].write_bytes(original)
@@ -728,8 +1113,95 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 ValidationError, "exceeded its frozen per-rollout budget"
             ):
                 build_promotion_receipt(
-                    self.experiment, self.suite, ROOT, paths
+                    self.experiment,
+                    self.suite,
+                    ROOT,
+                    paths,
+                    tinykg_binary=tinykg,
                 )
+
+    @unittest.skipUnless(
+        REAL_TINYKG.is_file(), "build the vendored TinyKG binary first"
+    )
+    def test_promotion_reverifies_all_raw_treatment_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tinykg = REAL_TINYKG.resolve()
+            tinykg_sha = hashlib.sha256(tinykg.read_bytes()).hexdigest()
+            paths = write_multi_arm_checkpoints(
+                root / "checkpoints",
+                self.experiment,
+                self.suite,
+                ROOT,
+                metacodes_sha256="a" * 64,
+                tinykg_sha256=tinykg_sha,
+                formal_kernel_fingerprint="c" * 64,
+                revision="raw-promotion-revision",
+            )
+            baseline_transcript = None
+            for arm_id, path in paths.items():
+                rows = load_rollouts(path)
+                for row in rows:
+                    workspace = (
+                        root
+                        / "artifacts"
+                        / arm_id
+                        / f"{row['task_id']}-{row['trial']}"
+                    )
+                    workspace.mkdir(parents=True)
+                    metadata = {
+                        "run_id": row["run_id"],
+                        "trial": row["trial"],
+                        "suite_id": row["suite_id"],
+                        "task_id": row["task_id"],
+                        "harness_config_id": row["harness"]["config_id"],
+                    }
+                    if arm_id == "tinykg":
+                        write_activation_artifacts(
+                            workspace, tinykg, metadata=metadata
+                        )
+                    else:
+                        write_baseline_artifacts(
+                            workspace, arm_id, metadata=metadata
+                        )
+                        baseline_transcript = workspace / "transcript.jsonl"
+                    row["artifacts"] = {"workspace": str(workspace)}
+                    real_attach_treatment_activation(
+                        row, arm_id, tinykg, tinykg_sha
+                    )
+                write_rollouts(path, rows)
+
+            with mock.patch(
+                "scripts.eval.promotion.reverify_treatment_activation",
+                new=real_reverify_treatment_activation,
+            ):
+                receipt = build_promotion_receipt(
+                    self.experiment,
+                    self.suite,
+                    ROOT,
+                    paths,
+                    tinykg_binary=tinykg,
+                )
+                self.assertTrue(receipt["eligible"])
+                self.assertEqual(receipt["gate"]["valid_rollouts"], 18)
+
+                assert baseline_transcript is not None
+                baseline_transcript.write_text(
+                    baseline_transcript.read_text(encoding="utf-8").replace(
+                        '"text": "done"', '"text": "tampered"'
+                    ),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    ValidationError, "artifacts changed after attestation"
+                ):
+                    build_promotion_receipt(
+                        self.experiment,
+                        self.suite,
+                        ROOT,
+                        paths,
+                        tinykg_binary=tinykg,
+                    )
 
     def test_multi_arm_rechecks_binary_after_each_rollout(self):
         experiment = copy.deepcopy(self.experiment)
@@ -985,8 +1457,13 @@ class LongHorizonExperimentTest(unittest.TestCase):
                 revision="confirmatory-revision",
             )
             receipt = build_promotion_receipt(
-                self.experiment, self.suite, ROOT, calibration_paths
+                self.experiment,
+                self.suite,
+                ROOT,
+                calibration_paths,
+                tinykg_binary=tinykg,
             )
+            self.assertEqual(self.promotion_activation.call_count, 18)
             with mock.patch(
                 "scripts.eval.paired_runner.tinykg_binary_identity",
                 return_value=tinykg_identity,

@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.eval.cli import main
 from scripts.eval.e2e_adapter import EVALUATION_CONTRACT_VERSION, grounding_fingerprints
@@ -20,6 +21,15 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 class CliTest(unittest.TestCase):
+    def setUp(self):
+        # CLI contract tests use synthetic normalized rows. Raw-artifact
+        # attestation has its own real TinyKG test suite.
+        promotion_patcher = mock.patch(
+            "scripts.eval.promotion.reverify_treatment_activation"
+        )
+        self.promotion_activation = promotion_patcher.start()
+        self.addCleanup(promotion_patcher.stop)
+
     def test_experiment_rejects_escaped_suite_before_reading_it(self):
         experiment = load_json(
             ROOT / "evals/experiments/long-horizon-three-arm-calibration-v2.json"
@@ -198,6 +208,9 @@ class CliTest(unittest.TestCase):
                 ROOT / "evals/suites/long-horizon-calibration.json"
             )
             calibration_dir = root / "calibration"
+            tinykg_binary = root / "tinykg-verifier"
+            tinykg_binary.write_bytes(b"test-only-tinykg")
+            tinykg_binary.chmod(0o755)
             calibration_paths = write_multi_arm_checkpoints(
                 calibration_dir,
                 calibration_experiment,
@@ -215,6 +228,7 @@ class CliTest(unittest.TestCase):
                         calibration_suite,
                         ROOT,
                         calibration_paths,
+                        tinykg_binary=tinykg_binary,
                     ),
                     sort_keys=True,
                 )
@@ -236,6 +250,8 @@ class CliTest(unittest.TestCase):
                     str(receipt),
                     "--calibration-dir",
                     str(calibration_dir),
+                    "--tinykg-binary",
+                    str(tinykg_binary),
                     "--markdown",
                     str(markdown),
                     "--json",
@@ -273,6 +289,9 @@ class CliTest(unittest.TestCase):
         ).hexdigest()[:16]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            tinykg_binary = root / "tinykg-verifier"
+            tinykg_binary.write_bytes(b"test-only-tinykg")
+            tinykg_binary.chmod(0o755)
             paths = {}
             task = suite["tasks"][0]
             identity = grounding_fingerprints(task, ROOT)
@@ -316,6 +335,8 @@ class CliTest(unittest.TestCase):
                     str(paths["claude_style"]),
                     "--tinykg",
                     str(paths["tinykg"]),
+                    "--tinykg-binary",
+                    str(tinykg_binary),
                     "--output",
                     str(receipt_path),
                 ]
