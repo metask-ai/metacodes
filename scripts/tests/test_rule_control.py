@@ -721,6 +721,7 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
             'const dev_full_step = b.step("dev:full", "fixture");\n'
             "dev_full_step.dependOn(&install_debug.step);\n"
             "dev_full_step.dependOn(vendor_tinykg_step);\n"
+            'const spike_step = b.step("test:spike", "fixture");\n'
             'const core_test_step = b.step("test:lib", "fixture");\n'
             'const core_test_monolithic_step = b.step("test:lib-monolithic", "fixture");\n'
             'const core_test_times_step = b.step("test:lib-times", "fixture");\n'
@@ -751,7 +752,7 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
         self.assertEqual(6, observation.declared)
         self.assertEqual(6, observation.covered)
         self.assertEqual(
-            ["test:lib-shard-harness", "test:lib", "test:integration-monolithic"],
+            ["test:lib-shard-harness", "test:lib", "test:spike"],
             [binding["step"] for binding in observation.feedback_bindings if "step" in binding],
         )
         self.assertEqual(

@@ -152,8 +152,9 @@ Its six fixed obligations are:
 `buildTestSignal` fixes that surface at 6/6. The sensor also refuses aggregate
 inventory shrinkage below the measured 2026-08-06 baseline of 67 files. Real
 feedback runs the negative shard harness, the four-shard core graph, and the
-single-process aggregate integration graph plus the isolated TinyKG double
-build, then re-observes all test sources.
+eight-shard fail-closed aggregate integration graph plus the isolated TinyKG
+double build, then re-observes all test sources. The monolithic and per-test
+timing paths remain explicit diagnostic gates rather than taxing every release.
 A lower elapsed time with missing coverage, hidden failure/leak semantics, a
 changed source graph during measurement, or a weakened 5/5 adapter is blocked.
 Cold and warm measurements must still be labelled separately in experiment

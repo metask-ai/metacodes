@@ -361,8 +361,9 @@
           [
             "zig",
             "build",
-            "test:integration-monolithic",
-            "-j4"
+            "test:spike",
+            "-Dintegration-test-shards=8",
+            "-j8"
           ],
           [
             "python",

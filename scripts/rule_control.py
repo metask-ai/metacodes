@@ -1370,6 +1370,7 @@ def observe_build_test_throughput(repo: Path) -> Observation:
             marker in sources["build"]
             for marker in (
                 'b.path("tests/integration_suite.zig")',
+                'b.step("test:spike"',
                 'b.step("test:integration-monolithic"',
                 'b.step("test:integration-times"',
                 "run_integration_reporter",
@@ -1459,7 +1460,7 @@ def observe_build_test_throughput(repo: Path) -> Observation:
         feedback_bindings=[
             {"step": "test:lib-shard-harness", "filter": ""},
             {"step": "test:lib", "filter": ""},
-            {"step": "test:integration-monolithic", "filter": ""},
+            {"step": "test:spike", "filter": ""},
             {
                 "unittest": (
                     "scripts.tests.test_artifact_reproducibility."
