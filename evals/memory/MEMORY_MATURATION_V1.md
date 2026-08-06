@@ -52,18 +52,62 @@ used, are a separately named factor and never silently included.
 
 ## Result row contract
 
-Each JSONL row is validated by `scripts.eval.memory_benchmark` and must bind:
+Each v2 JSONL row is validated by `scripts.eval.memory_benchmark` and must bind:
 
-- protocol/benchmark/case/trial/arm/split;
-- dataset SHA-256, task fingerprint, model id, harness revision and grader fingerprint;
-- execution validity and outcome success;
+- protocol/benchmark/case/sequence/trial/arm/split;
+- dataset SHA-256, adapter id/revision, split seed, manifest/runtime-receipt/observation SHA-256,
+  task fingerprint, model id+fingerprint, harness revision, arm fingerprint and grader fingerprint;
+- execution validity, evaluator validity and outcome success as three separate states;
 - answer/gold answers where applicable;
 - retrieval evidence sets, query variants, hop count and truncation;
 - exposed/internal tokens and cost/latency;
-- graph/provenance and governance counters.
+- input graph revision, provenance and governance counters.
 
 Rows with invalid execution or evaluator state remain in the artifact for audit but are excluded from outcome
 denominators. Missing evidence is not interpreted as a failed answer; it is reported as a retrieval miss.
+An empty model prediction is different: it is retained as a scored failure so silence cannot disappear from the
+denominator.
+
+## Frozen replay boundary
+
+`replay-memory` joins three deliberately separate artifacts:
+
+- the case manifest owns prompts, hidden gold answers/support ids, dataset and adapter identity, arm/model/grader
+  fingerprints, trial count, retrieval limits, and every ordered `(sequence, case, trial, arm)` schedule entry;
+- observation JSONL owns only host-observed execution/evaluator state, prediction, retrieval trace, graph/memory
+  counters, cost and trajectory. It cannot provide gold answers, outcome success, arm fingerprints, or the
+  denominator.
+- the host-owned runtime receipt records the identities actually used and binds canonical manifest,
+  observations, dataset, adapter, model, harness, arms and graders. Replay rejects any mismatch instead of
+  copying expected identities onto unverified observations.
+
+The manifest must contain exactly one online case per procedural family and schedule it before all offline
+siblings for every arm/trial. Observations must occur in that frozen line order, with no missing or duplicate
+tuple. Replay recomputes QA exact match from hidden manifest gold and accepts procedural success only from the
+pinned deterministic validator. A scored non-control offline row must use the same graph revision as its online
+predecessor, and that predecessor must have valid execution and evaluator state.
+
+Fail-closed invariants include:
+
+- `no_memory` disables retrieval and memory writes and reports zero memory counters;
+- disabled retrieval cannot report retrieved or verified evidence;
+- `read_only`, `disabled`, and every offline row have zero inserted nodes;
+- an invalid execution does not invent a procedural success boolean;
+- prompts cannot contain treatment labels;
+- dataset bytes, manifest, observations, task, model, harness, arm and grader are hash-bound.
+
+Zero-cost smoke:
+
+```bash
+python3 -m scripts.eval.cli replay-memory \
+  --manifest evals/memory/fixtures/smoke-manifest.json \
+  --observations evals/memory/fixtures/smoke-observations.jsonl \
+  --dataset-source evals/memory/fixtures/smoke-source.json \
+  --runtime-receipt evals/memory/fixtures/smoke-runtime-receipt.json \
+  --output /tmp/memory-maturation-smoke.jsonl \
+  --markdown /tmp/memory-maturation-smoke.md \
+  --json /tmp/memory-maturation-smoke-summary.json
+```
 
 ## Metrics hierarchy
 
@@ -73,6 +117,7 @@ governance, exposed/internal cost, latency and graph compactness. Optional: Plug
 
 ## Reproducibility rules
 
-Use a deterministic split seed, stable JSON, immutable dataset/artifact revisions, and order-balanced paired
-trials. Keep raw transcript/events and TinyKG graph revision with each row. Run the synthetic smoke fixture and
-metric unit tests before any paid or external benchmark execution.
+Use a deterministic split seed, stable JSON, immutable dataset/artifact revisions, and an explicitly frozen
+ordered schedule. Keep raw transcript/events and TinyKG graph revision with each row. Run the synthetic smoke
+fixture and metric unit tests before any paid or external benchmark execution. The smoke fixture validates the
+adapter and scoring boundary; it is not scientific evidence of memory quality.

@@ -11,8 +11,10 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
 import string
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
@@ -21,7 +23,7 @@ from .model import ValidationError
 
 
 PROTOCOL_ID = "metacodes-memory-maturation-v1"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BENCHMARKS = frozenset({"episodic_recall", "multihop_retrieval", "procedural_transfer"})
 WRITE_MODES = frozenset({"disabled", "online", "read_only"})
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -31,11 +33,13 @@ TOP_LEVEL_KEYS = frozenset(
         "protocol_id",
         "benchmark",
         "case_id",
+        "sequence",
         "trial",
         "arm",
         "split",
         "identity",
         "execution",
+        "evaluator",
         "outcome",
         "retrieval",
         "memory",
@@ -54,6 +58,14 @@ def _fail(where: str, message: str) -> None:
 def _string(value: Any, where: str) -> str:
     if not isinstance(value, str) or not value.strip():
         _fail(where, "expected non-empty string")
+    return value
+
+
+def _text(value: Any, where: str) -> str:
+    """Validate host/model text while preserving an observable empty output."""
+
+    if not isinstance(value, str):
+        _fail(where, "expected a string")
     return value
 
 
@@ -129,6 +141,7 @@ def validate_memory_row(row: Mapping[str, Any], where: str = "memory row") -> No
     if benchmark not in BENCHMARKS:
         _fail(f"{where}.benchmark", f"unsupported benchmark {benchmark!r}")
     _string(row["case_id"], f"{where}.case_id")
+    _integer(row["sequence"], f"{where}.sequence")
     _integer(row["trial"], f"{where}.trial")
     _string(row["arm"], f"{where}.arm")
     split = _string(row["split"], f"{where}.split")
@@ -143,15 +156,39 @@ def validate_memory_row(row: Mapping[str, Any], where: str = "memory row") -> No
         (
             "dataset_id",
             "dataset_sha256",
+            "adapter_id",
+            "adapter_revision",
+            "split_seed",
+            "manifest_sha256",
+            "runtime_receipt_sha256",
             "task_fingerprint",
             "model_id",
+            "model_fingerprint",
             "harness_revision",
+            "arm_fingerprint",
             "grader_fingerprint",
+            "observation_sha256",
         ),
     )
-    for key in ("dataset_id", "model_id", "harness_revision"):
+    for key in (
+        "dataset_id",
+        "adapter_id",
+        "adapter_revision",
+        "model_id",
+        "harness_revision",
+    ):
         _string(identity[key], f"{where}.identity.{key}")
-    for key in ("dataset_sha256", "task_fingerprint", "grader_fingerprint"):
+    _integer(identity["split_seed"], f"{where}.identity.split_seed")
+    for key in (
+        "dataset_sha256",
+        "manifest_sha256",
+        "runtime_receipt_sha256",
+        "task_fingerprint",
+        "model_fingerprint",
+        "arm_fingerprint",
+        "grader_fingerprint",
+        "observation_sha256",
+    ):
         _hash(identity[key], f"{where}.identity.{key}")
 
     execution = _object(row["execution"], f"{where}.execution", ("status", "invalid_reason"))
@@ -162,6 +199,15 @@ def validate_memory_row(row: Mapping[str, Any], where: str = "memory row") -> No
         _fail(f"{where}.execution.invalid_reason", "completed rows must use null")
     if execution_status == "invalid":
         _string(execution["invalid_reason"], f"{where}.execution.invalid_reason")
+
+    evaluator = _object(row["evaluator"], f"{where}.evaluator", ("status", "invalid_reason"))
+    evaluator_status = _string(evaluator["status"], f"{where}.evaluator.status")
+    if evaluator_status not in {"ready", "invalid"}:
+        _fail(f"{where}.evaluator.status", "must be ready or invalid")
+    if evaluator_status == "ready" and evaluator["invalid_reason"] is not None:
+        _fail(f"{where}.evaluator.invalid_reason", "ready evaluators must use null")
+    if evaluator_status == "invalid":
+        _string(evaluator["invalid_reason"], f"{where}.evaluator.invalid_reason")
 
     outcome = _object(
         row["outcome"],
@@ -174,12 +220,21 @@ def validate_memory_row(row: Mapping[str, Any], where: str = "memory row") -> No
     success = outcome["success"]
     if success is not None and (not isinstance(success, bool)):
         _fail(f"{where}.outcome.success", "expected boolean or null")
-    if execution_status == "completed" and outcome_status in {"pass", "fail"}:
+    if execution_status == "completed" and evaluator_status == "ready" and outcome_status in {"pass", "fail"}:
         if success is not (outcome_status == "pass"):
             _fail(f"{where}.outcome", "status and success disagree")
-    if execution_status == "invalid" and success is not None:
-        _fail(f"{where}.outcome.success", "invalid rows must use null")
-    _string(outcome["prediction"], f"{where}.outcome.prediction")
+    if (execution_status == "invalid" or evaluator_status == "invalid") and (
+        outcome_status != "unscored" or success is not None
+    ):
+        _fail(
+            f"{where}.outcome",
+            "invalid execution/evaluator rows must be unscored with null success",
+        )
+    if execution_status == "completed" and evaluator_status == "ready" and outcome_status == "unscored":
+        _fail(f"{where}.outcome", "ready completed rows must be scored")
+    # Empty output is a real scored failure, not an infrastructure-invalid row.
+    # Keeping it in the denominator prevents adapters from laundering silence.
+    _text(outcome["prediction"], f"{where}.outcome.prediction")
     gold_answers = _string_list(outcome["gold_answers"], f"{where}.outcome.gold_answers")
     if benchmark in {"episodic_recall", "multihop_retrieval"} and not gold_answers:
         _fail(f"{where}.outcome.gold_answers", "cannot be empty for QA benchmarks")
@@ -236,6 +291,11 @@ def validate_memory_row(row: Mapping[str, Any], where: str = "memory row") -> No
     expected = _string_list(retrieval["expected_evidence_ids"], f"{where}.retrieval.expected_evidence_ids")
     retrieved = _string_list(retrieval["retrieved_evidence_ids"], f"{where}.retrieval.retrieved_evidence_ids")
     verified = _string_list(retrieval["verified_evidence_ids"], f"{where}.retrieval.verified_evidence_ids")
+    if not retrieval["enabled"] and (retrieved or verified):
+        _fail(
+            f"{where}.retrieval",
+            "disabled retrieval must not report retrieved or verified evidence",
+        )
     if not set(verified).issubset(set(retrieved)):
         _fail(f"{where}.retrieval.verified_evidence_ids", "must be a subset of retrieved evidence")
     if benchmark == "multihop_retrieval" and retrieval["enabled"] and len(expected) < 2:
@@ -274,8 +334,40 @@ def validate_memory_row(row: Mapping[str, Any], where: str = "memory row") -> No
     _number(memory["candidate_fanout"], f"{where}.memory.candidate_fanout")
     if memory["abstraction_nodes_with_provenance"] > memory["abstraction_nodes"]:
         _fail(f"{where}.memory", "provenance-bearing abstractions exceed abstractions")
-    if benchmark == "procedural_transfer" and split == "offline" and write_mode != "read_only":
-        _fail(f"{where}.memory.write_mode", "offline procedural evaluation must be read_only")
+    if write_mode in {"disabled", "read_only"} and memory["inserted_nodes"] != 0:
+        _fail(
+            f"{where}.memory.inserted_nodes",
+            f"{write_mode} memory must not insert nodes",
+        )
+    if (
+        benchmark == "procedural_transfer"
+        and split == "offline"
+        and write_mode not in {"read_only", "disabled"}
+    ):
+        _fail(
+            f"{where}.memory.write_mode",
+            "offline procedural evaluation must be read_only or disabled",
+        )
+    if split == "offline" and memory["inserted_nodes"] != 0:
+        _fail(f"{where}.memory.inserted_nodes", "offline evaluation must not insert nodes")
+    if row["arm"] == "no_memory":
+        if retrieval["enabled"]:
+            _fail(f"{where}.retrieval.enabled", "no_memory must disable retrieval")
+        if write_mode != "disabled":
+            _fail(f"{where}.memory.write_mode", "no_memory must disable memory writes")
+        for key in (
+            "exposed_tokens",
+            "internal_tokens",
+            "inserted_nodes",
+            "active_nodes",
+            "provenance_links",
+            "abstraction_nodes",
+            "abstraction_nodes_with_provenance",
+        ):
+            if memory[key] != 0:
+                _fail(f"{where}.memory.{key}", "no_memory counters must be zero")
+        if float(memory["candidate_fanout"]) != 0.0:
+            _fail(f"{where}.memory.candidate_fanout", "no_memory fanout must be zero")
 
     graph = _object(row["graph"], f"{where}.graph", ("revision", "text_stale", "retrieval_excluded_nodes", "contradiction_edges"))
     _string(graph["revision"], f"{where}.graph.revision")
@@ -315,8 +407,16 @@ def validate_memory_row(row: Mapping[str, Any], where: str = "memory row") -> No
 
 
 def _parse_json_line(raw: str, where: str) -> Mapping[str, Any]:
+    def reject_duplicates(pairs: Sequence[Tuple[str, Any]]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                _fail(where, f"duplicate field {key!r}")
+            result[key] = value
+        return result
+
     try:
-        value = json.loads(raw)
+        value = json.loads(raw, object_pairs_hook=reject_duplicates)
     except json.JSONDecodeError as exc:
         _fail(where, f"invalid JSON: {exc}")
     if not isinstance(value, dict):
@@ -346,6 +446,11 @@ def _normalize_answer(value: str) -> str:
     value = value.translate(str.maketrans("", "", string.punctuation))
     value = re.sub(r"\b(a|an|the)\b", " ", value)
     return " ".join(value.split())
+
+
+def normalized_exact_match(prediction: str, references: Sequence[str]) -> bool:
+    normalized = _normalize_answer(prediction)
+    return any(normalized == _normalize_answer(reference) for reference in references)
 
 
 def _f1(prediction: str, reference: str) -> float:
@@ -399,7 +504,12 @@ def _group_key(row: Mapping[str, Any]) -> Tuple[str, str, str]:
 
 
 def _group_summary(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
-    valid = [row for row in rows if row["execution"]["status"] == "completed"]
+    valid = [
+        row
+        for row in rows
+        if row["execution"]["status"] == "completed"
+        and row["evaluator"]["status"] == "ready"
+    ]
     scored = [row for row in valid if row["outcome"]["status"] in {"pass", "fail"}]
     ems: List[float] = []
     f1s: List[float] = []
@@ -469,7 +579,11 @@ def _density(rows: Sequence[Mapping[str, Any]], base_arm: str) -> Dict[str, floa
 
     grouped: Dict[Tuple[str, int, str, str], Dict[str, Mapping[str, Any]]] = defaultdict(dict)
     for row in rows:
-        if row["execution"]["status"] != "completed" or row["outcome"]["status"] not in {"pass", "fail"}:
+        if (
+            row["execution"]["status"] != "completed"
+            or row["evaluator"]["status"] != "ready"
+            or row["outcome"]["status"] not in {"pass", "fail"}
+        ):
             continue
         grouped[(row["benchmark"], row["trial"], row["case_id"], row["split"])][row["arm"]] = row
     by_arm: Dict[str, List[Tuple[float, float, int]]] = defaultdict(list)
@@ -518,9 +632,9 @@ def summarize_memory(rows: Sequence[Mapping[str, Any]], *, base_arm: str = "no_m
     transfer: Dict[str, Dict[str, float | None]] = {}
     procedural = [row for row in rows if row["benchmark"] == "procedural_transfer"]
     for arm in sorted({row["arm"] for row in procedural}):
-        online = [row for row in procedural if row["arm"] == arm and row["split"] == "online" and row["execution"]["status"] == "completed"]
-        offline = [row for row in procedural if row["arm"] == arm and row["split"] == "offline" and row["execution"]["status"] == "completed"]
-        cold = [row for row in procedural if row["arm"] == base_arm and row["split"] == "offline" and row["execution"]["status"] == "completed"]
+        online = [row for row in procedural if row["arm"] == arm and row["split"] == "online" and row["execution"]["status"] == "completed" and row["evaluator"]["status"] == "ready"]
+        offline = [row for row in procedural if row["arm"] == arm and row["split"] == "offline" and row["execution"]["status"] == "completed" and row["evaluator"]["status"] == "ready"]
+        cold = [row for row in procedural if row["arm"] == base_arm and row["split"] == "offline" and row["execution"]["status"] == "completed" and row["evaluator"]["status"] == "ready"]
         online_rate = _mean([float(row["outcome"]["success"]) for row in online]) if online else None
         offline_rate = _mean([float(row["outcome"]["success"]) for row in offline]) if offline else None
         cold_rate = _mean([float(row["outcome"]["success"]) for row in cold]) if cold else None
@@ -562,4 +676,41 @@ def render_memory_markdown(summary: Mapping[str, Any], title: str = "metacodes m
 
 
 def file_sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_memory_rows(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
+    materialized = [dict(row) for row in rows]
+    for index, row in enumerate(materialized):
+        validate_memory_row(row, f"memory rows[{index}]")
+    text = "".join(
+        json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+        for row in materialized
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass

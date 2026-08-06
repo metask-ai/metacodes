@@ -1,0 +1,25 @@
+{
+  "dataset_id": "memory-maturation-smoke-v1",
+  "episodes": [
+    {
+      "evidence_id": "episode:preference:1",
+      "text": "The user chose amber for warning labels and rejected red for routine warnings."
+    }
+  ],
+  "facts": [
+    {
+      "evidence_id": "fact:bridge:1",
+      "text": "The build codename ORCHID-731 uses the X-Metacodes-Trace header."
+    },
+    {
+      "evidence_id": "fact:bridge:2",
+      "text": "The service using X-Metacodes-Trace listens on port 4317."
+    }
+  ],
+  "procedures": [
+    {
+      "evidence_id": "procedure:config-migration:1",
+      "text": "When renaming a config key, update the parser, serializer, migration note, and round-trip test together."
+    }
+  ]
+}

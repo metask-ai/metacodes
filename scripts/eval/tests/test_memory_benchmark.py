@@ -30,25 +30,36 @@ def memory_row(
     enabled = arm != "no_memory"
     expected = ["e1", "e2"] if benchmark == "multihop_retrieval" else ["e1"]
     if arm == "no_memory":
+        write_mode = "disabled"
         retrieved = ()
         verified = ()
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "protocol_id": PROTOCOL_ID,
         "benchmark": benchmark,
         "case_id": case_id,
+        "sequence": 0,
         "trial": 0,
         "arm": arm,
         "split": split,
         "identity": {
             "dataset_id": "fixture",
             "dataset_sha256": "a" * 64,
+            "adapter_id": "fixture-adapter",
+            "adapter_revision": "fixture-adapter-v1",
+            "split_seed": 20260806,
+            "manifest_sha256": "d" * 64,
+            "runtime_receipt_sha256": "1" * 64,
             "task_fingerprint": "b" * 64,
             "model_id": "fixture-model",
+            "model_fingerprint": "e" * 64,
             "harness_revision": "fixture-revision",
+            "arm_fingerprint": "f" * 64,
             "grader_fingerprint": "c" * 64,
+            "observation_sha256": "0" * 64,
         },
         "execution": {"status": "completed", "invalid_reason": None},
+        "evaluator": {"status": "ready", "invalid_reason": None},
         "outcome": {
             "status": "pass" if success else "fail",
             "success": success,
@@ -81,7 +92,7 @@ def memory_row(
             "write_mode": write_mode,
             "exposed_tokens": 80 if enabled else 0,
             "internal_tokens": 25 if enabled else 0,
-            "inserted_nodes": 4 if enabled else 0,
+            "inserted_nodes": 4 if write_mode == "online" else 0,
             "active_nodes": 4 if enabled else 0,
             "provenance_links": 4 if enabled else 0,
             "abstraction_nodes": 4 if enabled else 0,
@@ -152,6 +163,46 @@ class MemoryBenchmarkTest(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "offline write leakage"):
             validate_memory_row(row)
 
+    def test_read_only_and_offline_rows_cannot_claim_inserted_nodes(self):
+        row = memory_row(
+            benchmark="procedural_transfer",
+            split="offline",
+            case_id="offline-1",
+        )
+        row["memory"]["inserted_nodes"] = 1
+        with self.assertRaisesRegex(ValidationError, "must not insert nodes"):
+            validate_memory_row(row)
+
+    def test_disabled_retrieval_cannot_carry_evidence(self):
+        row = memory_row(arm="no_memory", success=False, write_mode="disabled")
+        row["retrieval"]["retrieved_evidence_ids"] = ["e1"]
+        with self.assertRaisesRegex(ValidationError, "must not report retrieved"):
+            validate_memory_row(row)
+
+    def test_no_memory_arm_cannot_enable_retrieval_or_writes(self):
+        row = memory_row(arm="no_memory", success=False, write_mode="disabled")
+        row["retrieval"]["enabled"] = True
+        row["retrieval"]["k"] = 10
+        row["retrieval"]["hop_count"] = 1
+        row["retrieval"]["query_variants"] = [
+            {"kind": "exact", "text": "forbidden retrieval"}
+        ]
+        with self.assertRaisesRegex(ValidationError, "no_memory must disable retrieval"):
+            validate_memory_row(row)
+
+        row = memory_row(arm="no_memory", success=False, write_mode="disabled")
+        row["memory"]["write_mode"] = "online"
+        with self.assertRaisesRegex(ValidationError, "no_memory must disable memory writes"):
+            validate_memory_row(row)
+
+    def test_empty_prediction_is_a_scored_failure(self):
+        row = memory_row(success=False)
+        row["outcome"]["prediction"] = ""
+        validate_memory_row(row)
+        group = summarize_memory([row])["groups"]["multihop_retrieval/tinykg_lexical/test"]
+        self.assertEqual(group["scored_rows"], 1)
+        self.assertEqual(group["outcome_success_rate"], 0.0)
+
     def test_procedural_transfer_reports_gain_over_cold_start(self):
         cold = memory_row(
             benchmark="procedural_transfer",
@@ -197,6 +248,21 @@ class MemoryBenchmarkTest(unittest.TestCase):
         self.assertEqual(group["invalid_rows"], 1)
         self.assertEqual(group["scored_rows"], 0)
         self.assertIsNone(group["outcome_success_rate"])
+
+    def test_evaluator_failure_is_audited_but_not_scored(self):
+        row = memory_row()
+        row["evaluator"] = {"status": "invalid", "invalid_reason": "grader unavailable"}
+        row["outcome"] = {
+            "status": "unscored",
+            "success": None,
+            "prediction": "William Shakespeare",
+            "gold_answers": ["William Shakespeare"],
+            "deterministic": True,
+        }
+        group = summarize_memory([row])["groups"]["multihop_retrieval/tinykg_lexical/test"]
+        self.assertEqual(group["valid_rows"], 0)
+        self.assertEqual(group["invalid_rows"], 1)
+        self.assertEqual(group["scored_rows"], 0)
 
     def test_cli_validates_and_renders_a_smoke_result(self):
         with tempfile.TemporaryDirectory() as directory:

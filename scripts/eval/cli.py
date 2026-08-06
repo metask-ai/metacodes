@@ -48,6 +48,13 @@ if __package__ in {None, ""}:
         load_memory_rows,
         render_memory_markdown,
         summarize_memory,
+        write_memory_rows,
+    )
+    from scripts.eval.memory_replay import (  # type: ignore
+        load_manifest as load_memory_manifest,
+        load_observations as load_memory_observations,
+        load_runtime_receipt as load_memory_runtime_receipt,
+        replay_observations,
     )
     from scripts.eval.paired_runner import run_multi_arm, run_paired  # type: ignore
     from scripts.eval.promotion import (  # type: ignore
@@ -90,6 +97,13 @@ else:
         load_memory_rows,
         render_memory_markdown,
         summarize_memory,
+        write_memory_rows,
+    )
+    from .memory_replay import (
+        load_manifest as load_memory_manifest,
+        load_observations as load_memory_observations,
+        load_runtime_receipt as load_memory_runtime_receipt,
+        replay_observations,
     )
     from .paired_runner import run_multi_arm, run_paired
     from .promotion import (
@@ -165,6 +179,48 @@ def cmd_report_memory(args: argparse.Namespace) -> int:
     _write(args.markdown, render_memory_markdown(summary, args.title))
     if args.json:
         _write_json(args.json, summary)
+    return 0
+
+
+def cmd_replay_memory(args: argparse.Namespace) -> int:
+    input_paths = {
+        Path(args.manifest).resolve(),
+        Path(args.observations).resolve(),
+        Path(args.dataset_source).resolve(),
+        Path(args.runtime_receipt).resolve(),
+    }
+    output_paths = [
+        Path(value).resolve()
+        for value in (args.output, args.markdown, args.json)
+        if value
+    ]
+    if len(set(output_paths)) != len(output_paths):
+        raise ValidationError("memory replay output paths must be distinct")
+    overlap = input_paths.intersection(output_paths)
+    if overlap:
+        raise ValidationError(
+            f"memory replay output would overwrite an input artifact: {sorted(map(str, overlap))}"
+        )
+    manifest = load_memory_manifest(Path(args.manifest))
+    observations = load_memory_observations(Path(args.observations))
+    runtime_receipt = load_memory_runtime_receipt(Path(args.runtime_receipt))
+    rows = replay_observations(
+        manifest,
+        observations,
+        dataset_source=Path(args.dataset_source),
+        runtime_receipt=runtime_receipt,
+    )
+    write_memory_rows(Path(args.output), rows)
+    if args.markdown or args.json:
+        summary = summarize_memory(rows, base_arm=args.base_arm)
+        if args.markdown:
+            _write(args.markdown, render_memory_markdown(summary, args.title))
+        if args.json:
+            _write_json(args.json, summary)
+    print(
+        f"memory replay complete: rows={len(rows)} "
+        f"manifest={hashlib.sha256(stable_json(manifest).encode('utf-8')).hexdigest()[:16]}"
+    )
     return 0
 
 
@@ -815,6 +871,21 @@ def parser() -> argparse.ArgumentParser:
     memory_report_parser.add_argument("--markdown")
     memory_report_parser.add_argument("--json")
     memory_report_parser.set_defaults(func=cmd_report_memory)
+
+    memory_replay_parser = commands.add_parser(
+        "replay-memory",
+        help="join a frozen memory case manifest with host-owned observations",
+    )
+    memory_replay_parser.add_argument("--manifest", required=True)
+    memory_replay_parser.add_argument("--observations", required=True)
+    memory_replay_parser.add_argument("--dataset-source", required=True)
+    memory_replay_parser.add_argument("--runtime-receipt", required=True)
+    memory_replay_parser.add_argument("--output", required=True)
+    memory_replay_parser.add_argument("--base-arm", default="no_memory")
+    memory_replay_parser.add_argument("--title", default="metacodes memory maturation")
+    memory_replay_parser.add_argument("--markdown")
+    memory_replay_parser.add_argument("--json")
+    memory_replay_parser.set_defaults(func=cmd_replay_memory)
 
     paired_parser = commands.add_parser(
         "run-paired", help="run repeated order-balanced baseline/candidate native E2E"
