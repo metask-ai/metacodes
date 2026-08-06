@@ -684,6 +684,18 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
             "}\n",
             encoding="utf-8",
         )
+        (root / "scripts/tests").mkdir(parents=True, exist_ok=True)
+        (root / "scripts/tests/test_artifact_reproducibility.py").write_text(
+            'with ThreadPoolExecutor(max_workers=2) as executor:\n'
+            '    executor.map(build, roots)\n'
+            'command = ["vendor:tinykg", "--cache-dir", "--prefix"]\n'
+            'left = hashlib.sha256(payloads[0])\n'
+            'right = hashlib.sha256(payloads[1])\n'
+            'self.assertEqual(payloads[0], payloads[1])\n'
+            'versions = [run([str(artifact), "version"]) for artifact in artifacts]\n'
+            'self.assertEqual(versions[0].stdout, versions[1].stdout)\n',
+            encoding="utf-8",
+        )
 
         imports: list[str] = []
         for index in range(67):
@@ -724,21 +736,35 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
             'const integration_arg = "integration-test-shards";\n'
             'const shard_bound = "must be between 1 and 64";\n'
             "const lib_default = value orelse 4;\n"
-            "const integration_default = value orelse 8;\n",
+            "const integration_default = value orelse 8;\n"
+            "const tinykg_exe = artifact;\n"
+            "tinykg_exe.root_module.strip = true;\n",
             encoding="utf-8",
         )
         return temporary, root
 
-    def test_all_five_integrity_obligations_are_observed(self) -> None:
+    def test_all_six_integrity_obligations_are_observed(self) -> None:
         temporary, root = self.make_repo()
         self.addCleanup(temporary.cleanup)
         observation = rule_control.observe_build_test_throughput(root)
         self.assertTrue(observation.sensor_ok, observation.errors)
-        self.assertEqual(5, observation.declared)
-        self.assertEqual(5, observation.covered)
+        self.assertEqual(6, observation.declared)
+        self.assertEqual(6, observation.covered)
         self.assertEqual(
             ["test:lib-shard-harness", "test:lib", "test:integration-monolithic"],
-            [binding["step"] for binding in observation.feedback_bindings],
+            [binding["step"] for binding in observation.feedback_bindings if "step" in binding],
+        )
+        self.assertEqual(
+            [
+                "scripts.tests.test_artifact_reproducibility."
+                "TinyKgArtifactReproducibilityTest."
+                "test_two_isolated_vendor_builds_are_byte_identical_and_runnable"
+            ],
+            [
+                binding["unittest"]
+                for binding in observation.feedback_bindings
+                if "unittest" in binding
+            ],
         )
 
     def test_unfingerprinted_partition_is_not_accepted_as_parallel_coverage(self) -> None:
@@ -812,6 +838,20 @@ class BuildTestThroughputSensorTests(unittest.TestCase):
         observation = rule_control.observe_build_test_throughput(root)
         self.assertFalse(observation.sensor_ok)
         self.assertIn("fast_and_full_build_paths", observation.missing_declarations)
+
+    def test_location_dependent_shipped_artifact_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        build = root / "build.zig"
+        build.write_text(
+            build.read_text(encoding="utf-8").replace(
+                "tinykg_exe.root_module.strip = true;", ""
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_build_test_throughput(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn("reproducible_shipped_artifacts", observation.missing_declarations)
 
 
 class EvalBudgetCheckpointSensorTests(unittest.TestCase):
@@ -1276,7 +1316,7 @@ class TopologyTests(unittest.TestCase):
         )
         self.assertFalse(weakened["decision"])
 
-    def test_build_test_rule_requires_its_five_obligation_kernel(self) -> None:
+    def test_build_test_rule_requires_its_six_obligation_kernel(self) -> None:
         rule = self.complete_rule()
         rule["id"] = "build.test-throughput-integrity.l2"
         rule["sensor"] = {

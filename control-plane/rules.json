@@ -292,11 +292,11 @@
     },
     {
       "id": "build.test-throughput-integrity.l2",
-      "title": "Build and test throughput improves without losing coverage or failure semantics",
+      "title": "Build and test throughput improves without losing coverage, failure semantics, or artifact identity",
       "target": {
         "metric": "build_test_integrity_obligations_minus_observed",
         "setpoint": 0,
-        "goal": "Per-test diagnostics, deterministic sharding, fail-closed aggregation, exact aggregate inventory, and explicit fast/full build paths remain connected while wall, CPU, RSS, and critical-path measurements are collected as host observations."
+        "goal": "Per-test diagnostics, deterministic sharding, fail-closed aggregation, exact aggregate inventory, explicit fast/full build paths, and location-independent shipped artifacts remain connected while wall, CPU, RSS, and critical-path measurements are collected as host observations."
       },
       "sensor": {
         "adapter": "build_test_throughput",
@@ -309,7 +309,7 @@
           "admitted_implies_closed_loop",
           "admitted_implies_zero_deviation",
           "admitted_implies_feedback_passed",
-          "build_test_admitted_implies_five_obligations",
+          "build_test_admitted_implies_six_obligations",
           "build_test_missing_obligation_blocks",
           "build_test_wrong_cardinality_blocks",
           "orphan_cannot_be_compliant",
@@ -321,7 +321,7 @@
       "actuator": {
         "kind": "release_gate",
         "on_violation": "block",
-        "remediation": "Restore exact test inventory, deterministic partition fingerprints, checked aggregate accounting, leak/failure propagation, per-test timing diagnostics, and the separate dev/full build paths. A lower wall time without these obligations is not an admissible optimization.",
+        "remediation": "Restore exact test inventory, deterministic partition fingerprints, checked aggregate accounting, leak/failure propagation, per-test timing diagnostics, separate dev/full build paths, and the isolated double-build artifact-identity check. A lower wall time or a runnable but location-dependent binary is not admissible.",
         "observation": {
           "schema_version": 1,
           "build_file": "control-plane/build.zig",
@@ -363,6 +363,13 @@
             "build",
             "test:integration-monolithic",
             "-j4"
+          ],
+          [
+            "python",
+            "-m",
+            "unittest",
+            "scripts.tests.test_artifact_reproducibility.TinyKgArtifactReproducibilityTest.test_two_isolated_vendor_builds_are_byte_identical_and_runnable",
+            "-v"
           ]
         ]
       },

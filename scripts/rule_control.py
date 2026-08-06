@@ -1213,9 +1213,10 @@ def observe_build_test_throughput(repo: Path) -> Observation:
 
     The sensor governs the mechanisms that make timing evidence trustworthy:
     exact source inventory, deterministic partitioning, fail-closed aggregate
-    reports, per-test diagnostics, and separate fast/full build paths. Actual
-    wall/CPU/RSS values remain host observations and are recorded by the
-    experiment; Lean decides only whether the integrity obligations survived.
+    reports, per-test diagnostics, separate fast/full build paths, and
+    location-independent shipped artifacts. Actual wall/CPU/RSS values remain
+    host observations and are recorded by the experiment; Lean decides only
+    whether the integrity obligations survived.
     """
 
     declarations = [
@@ -1224,6 +1225,7 @@ def observe_build_test_throughput(repo: Path) -> Observation:
         "fail_closed_shard_aggregation",
         "aggregate_source_inventory",
         "fast_and_full_build_paths",
+        "reproducible_shipped_artifacts",
     ]
     relative_sources = {
         "timing": "scripts/time_test_runner.zig",
@@ -1231,6 +1233,7 @@ def observe_build_test_throughput(repo: Path) -> Observation:
         "reporter": "scripts/sharded_test_reporter.zig",
         "suite": "tests/integration_suite.zig",
         "build": "build.zig",
+        "artifact_repro": "scripts/tests/test_artifact_reproducibility.py",
     }
     paths = {name: repo / relative for name, relative in relative_sources.items()}
     missing_files = [relative_sources[name] for name, path in paths.items() if not path.is_file()]
@@ -1387,12 +1390,45 @@ def observe_build_test_throughput(repo: Path) -> Observation:
         ),
     }
 
+    artifact_repro_checks = {
+        "shipped TinyKG strips location-bearing debug symbols": (
+            "tinykg_exe.root_module.strip = true" in sources["build"]
+        ),
+        "feedback builds two isolated locations concurrently": all(
+            marker in sources["artifact_repro"]
+            for marker in (
+                "ThreadPoolExecutor(max_workers=2)",
+                "executor.map(build, roots)",
+                '"vendor:tinykg"',
+                '"--cache-dir"',
+                '"--prefix"',
+            )
+        ),
+        "feedback compares full bytes and SHA-256": all(
+            marker in sources["artifact_repro"]
+            for marker in (
+                "hashlib.sha256(payloads[0])",
+                "hashlib.sha256(payloads[1])",
+                "self.assertEqual(payloads[0], payloads[1])",
+            )
+        ),
+        "feedback executes both resulting artifacts": all(
+            marker in sources["artifact_repro"]
+            for marker in (
+                '[str(artifact), "version"]',
+                "for artifact in artifacts",
+                "self.assertEqual(versions[0].stdout, versions[1].stdout)",
+            )
+        ),
+    }
+
     obligations = {
         declarations[0]: timing_checks,
         declarations[1]: sharding_checks,
         declarations[2]: aggregation_checks,
         declarations[3]: inventory_checks,
         declarations[4]: build_path_checks,
+        declarations[5]: artifact_repro_checks,
     }
     covered = [name for name, checks in obligations.items() if all(checks.values())]
     missing = [name for name in declarations if name not in covered]
@@ -1423,6 +1459,13 @@ def observe_build_test_throughput(repo: Path) -> Observation:
             {"step": "test:lib-shard-harness", "filter": ""},
             {"step": "test:lib", "filter": ""},
             {"step": "test:integration-monolithic", "filter": ""},
+            {
+                "unittest": (
+                    "scripts.tests.test_artifact_reproducibility."
+                    "TinyKgArtifactReproducibilityTest."
+                    "test_two_isolated_vendor_builds_are_byte_identical_and_runnable"
+                )
+            },
         ],
         errors=errors,
         fingerprint_sha256=fingerprint(touched),

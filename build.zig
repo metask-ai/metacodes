@@ -245,6 +245,9 @@ pub fn build(b: *std.Build) void {
                 .link_libc = true,
             }),
         });
+        // ReleaseSafe keeps absolute source paths in Mach-O debug symbols,
+        // which makes otherwise identical TinyKG builds differ by worktree.
+        tinykg_exe.root_module.strip = true;
         const install_tinykg = b.addInstallArtifact(tinykg_exe, .{
             .dest_dir = .{ .override = .{ .custom = "vendor/tinykg" } },
         });
