@@ -1,0 +1,96 @@
+{
+  "artifacts": {
+    "execution.json": {
+      "bytes": 705,
+      "sha256": "6c273d01eed102ca477695c973d0c0b8938bc138ec0dec297d3f545c241f1209"
+    },
+    "manifest.json": {
+      "bytes": 3667,
+      "sha256": "9b8e362661dcc6ee680a48b3186b4b3c32d443cedc5f849f242c70621556d595"
+    },
+    "source.json": {
+      "bytes": 4391,
+      "sha256": "8e695bd27769ae08324af520bcaa431b8afde194cb8f787e15066bd1c3cf812e"
+    },
+    "validators.json": {
+      "bytes": 2837,
+      "sha256": "93cc0d0e4a9747ca2465f226d27cfdcf5428d29fb65e3195dd23c7768e46e268"
+    }
+  },
+  "budget_authority": {
+    "max_output_tokens": 4096,
+    "max_rollout_cost_usd": 0.9,
+    "max_rollout_metered_tokens": 300000,
+    "max_total_cost_usd": 10.0,
+    "max_total_metered_tokens": 3100000
+  },
+  "current_phase": {
+    "paid_rollouts_authorized": false,
+    "quality_evidence": false,
+    "scope": "frozen-protocol-and-zero-network-preflight"
+  },
+  "generation": {
+    "adapter": "adapt-procedural-memory",
+    "expected_upstream_sha256": "c840e626a3a21474acac47043ad8211a1e5b2d711159f85a4b99e262320b715e",
+    "limit_families": 1,
+    "source_path": "evals/memory/fixtures/procedural-coding-source.json",
+    "split_seed": 20260807
+  },
+  "harness": {
+    "git_commit": "c7be832",
+    "revision": "metacodes-memory-production-pilot-v5-c7be832"
+  },
+  "model": {
+    "fingerprint": "e5cc883082b2a25721ee8b861c5e0cca37b6bdd93648d6883d6c8c54a34bf650",
+    "id": "glm-5.2"
+  },
+  "pilot_id": "procedural-glm52-v1",
+  "protocol": {
+    "arms": [
+      {
+        "fingerprint": "1d70eb700887237a6b751c4d80d777d04d2d59710b7cac76d882920583033c96",
+        "id": "no_memory",
+        "treatment": "external memory and TinyKG retrieval disabled"
+      },
+      {
+        "fingerprint": "a527f5e9632936476018d118e5c869c1c49f1aabf78869584f12ac08b17b6699",
+        "id": "markdown_memory",
+        "treatment": "online durable Markdown memory followed by read-only offline reuse"
+      },
+      {
+        "fingerprint": "6cd0325087d56afe2ef3ba83835cd8fdd54b61e0b9069968da1333e6cfab29d7",
+        "id": "tinykg_lexical",
+        "treatment": "exact lexical query, at most four separate LLM-selected semantic probes, bounded graph traversal, and provenance verification"
+      }
+    ],
+    "deterministic_workspace_validator": true,
+    "family_id": "error-contract-propagation",
+    "offline_cases": 2,
+    "online_cases": 1,
+    "rollouts": 9,
+    "trials": 1
+  },
+  "paid_execution_requirements": {
+    "budget_journal": "single-machine locked crash-conservative journal outside the fresh run directory",
+    "credential_transport": "private 0600 auth file to anonymous one-shot inherited file descriptor",
+    "filesystem_isolation": "re-observe the macOS Seatbelt production profile and bound negative probes before provider access",
+    "local_tinykg": "the TinyKG treatment uses a fresh isolated local store; no benchmark arm uses the remote harness",
+    "remote_tinykg": "forbidden for benchmark corpus, trace, and store; refined verification only",
+    "single_provider_attempt": true
+  },
+  "schedule": {
+    "ordered_rows": [
+      [0, "coding:error-contract-propagation:quota-exceeded", 0, "no_memory"],
+      [1, "coding:error-contract-propagation:quota-exceeded", 0, "markdown_memory"],
+      [2, "coding:error-contract-propagation:quota-exceeded", 0, "tinykg_lexical"],
+      [3, "coding:error-contract-propagation:invalid-lease", 0, "markdown_memory"],
+      [4, "coding:error-contract-propagation:invalid-lease", 0, "tinykg_lexical"],
+      [5, "coding:error-contract-propagation:invalid-lease", 0, "no_memory"],
+      [6, "coding:error-contract-propagation:stale-revision", 0, "tinykg_lexical"],
+      [7, "coding:error-contract-propagation:stale-revision", 0, "no_memory"],
+      [8, "coding:error-contract-propagation:stale-revision", 0, "markdown_memory"]
+    ],
+    "ordered_tsv_sha256": "128b43eac8bf699524db6fd295469195af75c55943facf608e1657cd44451eba"
+  },
+  "schema_version": 1
+}
