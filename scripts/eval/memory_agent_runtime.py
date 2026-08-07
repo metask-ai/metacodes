@@ -1017,6 +1017,23 @@ def _parse_result(stdout: str) -> Mapping[str, Any]:
     return result
 
 
+def _estimated_costs_match(metric_cost: float, result_cost: float) -> bool:
+    """Compare independent runtime totals at the journal's micro-USD precision."""
+
+    if (
+        not math.isfinite(metric_cost)
+        or not math.isfinite(result_cost)
+        or metric_cost < 0
+        or result_cost < 0
+    ):
+        return False
+    # Native usage events retain sub-micro-USD components while the public
+    # result is rendered to six decimal places.  The durable ledger accounts
+    # in whole micro-USD, so a difference within one ledger unit is equivalent;
+    # the more precise event total remains authoritative for charging.
+    return usd_to_microusd_ceiling(abs(metric_cost - result_cost)) <= 1
+
+
 def _cassette_tool_data(
     cassette: Path,
     logical_ids: Mapping[int, str],
@@ -2199,13 +2216,7 @@ def run_memory_agent_schedule(
             )
         metric_cost = float(metrics["cost_usd"])
         result_cost = float(result["cost_usd"])
-        if (
-            not math.isfinite(metric_cost)
-            or not math.isfinite(result_cost)
-            or metric_cost < 0
-            or result_cost < 0
-            or abs(metric_cost - result_cost) > 1e-12
-        ):
+        if not _estimated_costs_match(metric_cost, result_cost):
             _fail(f"native memory rollout {run_id}", "runtime emitted an invalid estimated cost")
         metered_tokens = sum(
             int(metrics[key])

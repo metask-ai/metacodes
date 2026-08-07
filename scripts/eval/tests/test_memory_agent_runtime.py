@@ -18,6 +18,7 @@ from scripts.eval.memory_agent_runtime import (
     _assert_executable_identity,
     _assert_production_secret_absent,
     _copy_memory_tree,
+    _estimated_costs_match,
     _project_domain,
     _production_environment,
     _materialize_production_sandbox,
@@ -77,6 +78,15 @@ def digest(label: str) -> str:
 
 
 class MemoryAgentRuntimeContractTest(unittest.TestCase):
+    def test_runtime_cost_cross_check_uses_journal_precision(self):
+        # Reproduces the first production pilot rollout: native usage events
+        # retained the sub-micro sum while the public result rounded to 6 dp.
+        self.assertTrue(_estimated_costs_match(0.0689886, 0.068989))
+        self.assertFalse(_estimated_costs_match(0.0689874, 0.068989))
+        self.assertFalse(_estimated_costs_match(float("nan"), 0.0))
+        self.assertFalse(_estimated_costs_match(0.0, float("inf")))
+        self.assertFalse(_estimated_costs_match(-0.000001, 0.0))
+
     def _materialize_valid_production_events(self, root, rollout, grader_fingerprint):
         cassette = root / rollout["artifact_paths"]["cassette"]
         uses = {}
