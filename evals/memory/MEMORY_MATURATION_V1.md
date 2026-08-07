@@ -161,6 +161,35 @@ read-only guard still hashes the raw manifest and every store file/directory, so
 write during retrieval. This makes equivalent fresh stores comparable while preserving fail-closed write-leak
 detection.
 
+### Native agent-loop wiring smoke
+
+`memory_agent_runtime_smoke.py` closes the gap between adapter/replay tests and the actual product runtime. It
+freezes one small case family for each adapter, then executes the complete arm schedule through the native
+`metacodes -p --json` path. A deterministic loopback Anthropic-SSE provider makes this gate paid-cost zero while
+still forcing TinyKG rows through the real `KgRecall` and, when a candidate exists, `KgContext` tool lifecycle.
+The no-memory rows must expose no TinyKG tool. Headless mode is decorated with the same host-owned metadata/event
+FD backend as the REPL; missing tool-start events, incomplete traces, dropped events, model/provider drift, or a
+non-zero process exit fail the smoke.
+
+```bash
+zig build
+python3 scripts/eval/memory_agent_runtime_smoke.py \
+  --binary zig-out/bin/metacodes \
+  --tinykg-binary zig-out/vendor/tinykg/tinykg \
+  --output-dir evals/runs/$(date +%F)-memory-native-wiring-v1
+```
+
+The optional output directory is local experimental data and must be fresh. It contains the per-rollout provider
+cassette, native events, headless result, sealed home/transcript tree, isolated TinyKG stores, strict observations,
+and a runtime-receipt-v2. Each receipt binds the metacodes/TinyKG binary hashes, task and observation hashes,
+provider request count, raw and normalized store digests before/after reads, run-relative artifact paths and
+hashes (native events, stdout, stderr, provider cassette, transcript, workspace and TinyKG store), actual paid
+cost, and external-network count. Replay resolves every relative path below the receipt directory, rejects
+symlinks/path escape, and rehashes the raw artifacts; a v2 receipt without its artifact tree is not promotable.
+`quality_evidence=false` is mandatory: the scripted provider always returns the fixed
+answer `runtime-smoke`, so this gate proves execution and isolation, not an accuracy or transfer advantage. Corpus,
+trace, and store artifacts stay local and must never be uploaded through the remote TinyKG skill harness.
+
 ## Result row contract
 
 Each v2 JSONL row is validated by `scripts.eval.memory_benchmark` and must bind:

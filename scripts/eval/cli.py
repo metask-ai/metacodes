@@ -245,12 +245,14 @@ def cmd_replay_memory(args: argparse.Namespace) -> int:
         )
     manifest = load_memory_manifest(Path(args.manifest))
     observations = load_memory_observations(Path(args.observations))
-    runtime_receipt = load_memory_runtime_receipt(Path(args.runtime_receipt))
+    runtime_receipt_path = Path(args.runtime_receipt).resolve()
+    runtime_receipt = load_memory_runtime_receipt(runtime_receipt_path)
     rows = replay_observations(
         manifest,
         observations,
         dataset_source=Path(args.dataset_source),
         runtime_receipt=runtime_receipt,
+        runtime_artifact_root=runtime_receipt_path.parent,
     )
     write_memory_rows(Path(args.output), rows)
     if args.markdown or args.json:

@@ -925,8 +925,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&test_run.step);
 
     // test:eval —— harness 评估控制面（suite/readiness/rollout/judgement/
-    // compare/gate）。纯 stdlib Python，确定性且不打模型；默认 test 也执行，避免
-    // 评估器自身漂移后继续给出看似可信的分数。
+    // compare/gate）。Python 合同测试 + 同宿主原生零付费 smoke；不访问真实模型，
+    // 默认 test 也执行，避免评估器或 native 接线漂移后继续给出看似可信的分数。
     const eval_test_step = b.step("test:eval", "Test the harness evaluation framework");
     const eval_python_exe = if (@import("builtin").os.tag == .windows) "python" else "python3";
     const eval_test_cmd = b.addSystemCommand(&.{
@@ -945,6 +945,11 @@ pub fn build(b: *std.Build) void {
         target.result.cpu.arch == @import("builtin").cpu.arch;
     if (runtime_tests_can_execute_target) {
         if (tinykg_artifact) |tinykg_exe| {
+            // Native Python cases discover the installed TinyKG by path.  On
+            // a clean checkout they must wait for installation; otherwise
+            // test discovery races the build and silently turns coverage into
+            // machine-state-dependent skips.
+            if (tinykg_install_step) |install| eval_test_cmd.step.dependOn(install);
             const arm_smoke = b.addSystemCommand(&.{
                 eval_python_exe,
                 "scripts/eval/runtime_arm_smoke.py",
@@ -955,6 +960,21 @@ pub fn build(b: *std.Build) void {
             arm_smoke.addArtifactArg(tinykg_exe);
             eval_test_step.dependOn(&arm_smoke.step);
             test_step.dependOn(&arm_smoke.step);
+
+            // A replay fixture cannot prove that memory adapters cross the
+            // real agent-loop/tool/runtime boundary.  Run all three adapters
+            // against the native binary and hash-pinned local TinyKG with a
+            // deterministic loopback provider (paid=0, external network=0).
+            const memory_runtime_smoke = b.addSystemCommand(&.{
+                eval_python_exe,
+                "scripts/eval/memory_agent_runtime_smoke.py",
+                "--binary",
+            });
+            memory_runtime_smoke.addArtifactArg(exe);
+            memory_runtime_smoke.addArg("--tinykg-binary");
+            memory_runtime_smoke.addArtifactArg(tinykg_exe);
+            eval_test_step.dependOn(&memory_runtime_smoke.step);
+            test_step.dependOn(&memory_runtime_smoke.step);
         }
     }
 

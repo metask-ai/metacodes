@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
-from pathlib import Path
+import stat
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 from .memory_benchmark import (
@@ -26,6 +28,7 @@ from .model import ValidationError, stable_json
 
 
 REPLAY_SCHEMA_VERSION = 1
+RUNTIME_RECEIPT_SCHEMA_VERSION = 2
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,127}$")
 TREATMENT_LEAK_TERMS = (
@@ -105,6 +108,89 @@ def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()
 
 
+def _finite_number(value: Any, where: str, *, minimum: float = 0.0) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or float(value) < minimum
+    ):
+        _fail(where, f"expected finite number >= {minimum}")
+    return float(value)
+
+
+def _artifact_relative_path(value: Any, where: str) -> PurePosixPath:
+    raw = _string(value, where)
+    path = PurePosixPath(raw)
+    if path.is_absolute() or raw != path.as_posix() or any(part in {"", ".", ".."} for part in path.parts):
+        _fail(where, "expected a normalized relative POSIX path")
+    return path
+
+
+def _artifact_path(root: Path, value: Any, where: str, *, directory: bool) -> Path:
+    relative = _artifact_relative_path(value, where)
+    try:
+        resolved_root = root.expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise ValidationError(f"{where}: artifact root is unavailable: {exc}") from exc
+    if not resolved_root.is_dir():
+        _fail(where, "artifact root is not a directory")
+    current = resolved_root
+    try:
+        for part in relative.parts:
+            current = current / part
+            info = current.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                _fail(where, "artifact path contains a symlink")
+    except OSError as exc:
+        raise ValidationError(f"{where}: artifact is unavailable: {exc}") from exc
+    try:
+        current.resolve(strict=True).relative_to(resolved_root)
+    except (OSError, ValueError) as exc:
+        raise ValidationError(f"{where}: artifact escapes the receipt root") from exc
+    if directory and not current.is_dir():
+        _fail(where, "expected a directory artifact")
+    if not directory and not current.is_file():
+        _fail(where, "expected a file artifact")
+    return current
+
+
+def _artifact_tree_digest(
+    root: Path,
+    where: str = "runtime artifact",
+    *,
+    ignore_lock_files: bool = False,
+) -> str:
+    records: List[Mapping[str, Any]] = []
+    try:
+        if stat.S_ISLNK(root.lstat().st_mode) or not root.is_dir():
+            _fail(where, "expected a non-symlink directory")
+        for path in sorted(root.rglob("*")):
+            relative = path.relative_to(root).as_posix()
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                _fail(where, f"unexpected symlink {relative!r}")
+            if path.is_dir():
+                records.append({"path": relative, "type": "directory"})
+                continue
+            if not path.is_file() or (ignore_lock_files and path.name.endswith(".lock")):
+                continue
+            data = path.read_bytes()
+            records.append(
+                {
+                    "path": relative,
+                    "type": "file",
+                    "bytes": len(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                }
+            )
+    except ValidationError:
+        raise
+    except OSError as exc:
+        raise ValidationError(f"{where}: cannot re-observe artifact tree: {exc}") from exc
+    return hashlib.sha256(stable_json(records).encode("utf-8")).hexdigest()
+
+
 def _load_unique_json(path: Path, label: str) -> Mapping[str, Any]:
     def reject_duplicates(pairs: Sequence[Tuple[str, Any]]) -> Dict[str, Any]:
         result: Dict[str, Any] = {}
@@ -176,6 +262,22 @@ def validate_runtime_receipt(
     dataset_sha256: str,
     where: str = "memory runtime receipt",
 ) -> None:
+    schema_version = receipt.get("schema_version")
+    if schema_version not in {REPLAY_SCHEMA_VERSION, RUNTIME_RECEIPT_SCHEMA_VERSION}:
+        _fail(
+            f"{where}.schema_version",
+            f"expected {REPLAY_SCHEMA_VERSION} or {RUNTIME_RECEIPT_SCHEMA_VERSION}",
+        )
+    v2_fields = (
+        "execution_mode",
+        "quality_evidence",
+        "metacodes_binary_sha256",
+        "tinykg_binary_sha256",
+        "external_network_calls",
+        "paid_cost_usd",
+        "estimated_cost_usd",
+        "rollouts",
+    )
     value = _object(
         receipt,
         where,
@@ -192,10 +294,9 @@ def validate_runtime_receipt(
             "harness_revision",
             "arms",
             "graders",
+            *(v2_fields if schema_version == RUNTIME_RECEIPT_SCHEMA_VERSION else ()),
         ),
     )
-    if value["schema_version"] != REPLAY_SCHEMA_VERSION:
-        _fail(f"{where}.schema_version", f"expected {REPLAY_SCHEMA_VERSION}")
     if value["protocol_id"] != PROTOCOL_ID:
         _fail(f"{where}.protocol_id", f"expected {PROTOCOL_ID!r}")
     expected_scalars = {
@@ -251,6 +352,335 @@ def validate_runtime_receipt(
         )
     if observed_graders != expected_graders:
         _fail(f"{where}.graders", "runtime grader identities do not match the manifest")
+
+    if schema_version != RUNTIME_RECEIPT_SCHEMA_VERSION:
+        return
+    if value["execution_mode"] != "native-agent-loop-scripted-wiring-smoke":
+        _fail(f"{where}.execution_mode", "unsupported native execution mode")
+    if value["quality_evidence"] is not False:
+        _fail(
+            f"{where}.quality_evidence",
+            "scripted wiring smoke must never claim memory-quality evidence",
+        )
+    metacodes_sha256 = _hash(
+        value["metacodes_binary_sha256"],
+        f"{where}.metacodes_binary_sha256",
+    )
+    tinykg_sha256 = _hash(
+        value["tinykg_binary_sha256"],
+        f"{where}.tinykg_binary_sha256",
+    )
+    external_network_calls = _integer(
+        value["external_network_calls"],
+        f"{where}.external_network_calls",
+    )
+    if external_network_calls != 0:
+        _fail(f"{where}.external_network_calls", "scripted wiring smoke must be zero")
+    paid_cost_usd = _finite_number(value["paid_cost_usd"], f"{where}.paid_cost_usd")
+    if paid_cost_usd != 0.0:
+        _fail(f"{where}.paid_cost_usd", "scripted wiring smoke must be zero")
+    estimated_cost_usd = _finite_number(
+        value["estimated_cost_usd"],
+        f"{where}.estimated_cost_usd",
+    )
+    rollouts = value["rollouts"]
+    if not isinstance(rollouts, list) or len(rollouts) != len(observations):
+        _fail(f"{where}.rollouts", f"expected exactly {len(observations)} entries")
+    schedule = {entry["sequence"]: entry for entry in manifest["schedule"]}
+    cases_by_id = {case["id"]: case for case in manifest["cases"]}
+    seen_sequences: set[int] = set()
+    seen_run_ids: set[str] = set()
+    for index, raw_rollout in enumerate(rollouts):
+        rollout_where = f"{where}.rollouts[{index}]"
+        rollout = _object(
+            raw_rollout,
+            rollout_where,
+            (
+                "sequence",
+                "case_id",
+                "trial",
+                "arm",
+                "run_id",
+                "task_fingerprint",
+                "metacodes_binary_sha256",
+                "tinykg_binary_sha256",
+                "native_events_sha256",
+                "result_sha256",
+                "stderr_sha256",
+                "cassette_sha256",
+                "transcript_sha256",
+                "workspace_sha256",
+                "artifact_paths",
+                "store_revision_before",
+                "store_revision_after",
+                "raw_store_digest_before",
+                "raw_store_digest_after",
+                "stop_reason",
+                "provider_mode",
+                "provider_requests",
+                "external_network_calls",
+                "paid_cost_usd",
+                "estimated_cost_usd",
+                "observation_sha256",
+                "host_elapsed_ms",
+            ),
+        )
+        sequence = _integer(rollout["sequence"], f"{rollout_where}.sequence")
+        if sequence != index or sequence in seen_sequences or sequence not in schedule:
+            _fail(f"{rollout_where}.sequence", "must be unique, contiguous, and scheduled")
+        seen_sequences.add(sequence)
+        run_id = _string(rollout["run_id"], f"{rollout_where}.run_id")
+        if run_id in seen_run_ids:
+            _fail(f"{rollout_where}.run_id", "must be unique")
+        seen_run_ids.add(run_id)
+        scheduled = schedule[sequence]
+        for key in ("case_id", "trial", "arm"):
+            if rollout[key] != scheduled[key]:
+                _fail(f"{rollout_where}.{key}", "does not match frozen schedule")
+        case = cases_by_id[rollout["case_id"]]
+        expected_task = _canonical_sha256(case)
+        if _hash(rollout["task_fingerprint"], f"{rollout_where}.task_fingerprint") != expected_task:
+            _fail(f"{rollout_where}.task_fingerprint", "does not bind the frozen case")
+        if _hash(
+            rollout["metacodes_binary_sha256"],
+            f"{rollout_where}.metacodes_binary_sha256",
+        ) != metacodes_sha256:
+            _fail(f"{rollout_where}.metacodes_binary_sha256", "binary identity drift")
+        tinykg_enabled = rollout["arm"] in {"tinykg", "tinykg_lexical"}
+        observed_tinykg = rollout["tinykg_binary_sha256"]
+        if tinykg_enabled:
+            if _hash(observed_tinykg, f"{rollout_where}.tinykg_binary_sha256") != tinykg_sha256:
+                _fail(f"{rollout_where}.tinykg_binary_sha256", "binary identity drift")
+        elif observed_tinykg is not None:
+            _fail(f"{rollout_where}.tinykg_binary_sha256", "control arm must use null")
+        for key in (
+            "native_events_sha256",
+            "result_sha256",
+            "stderr_sha256",
+            "cassette_sha256",
+            "transcript_sha256",
+            "workspace_sha256",
+        ):
+            _hash(rollout[key], f"{rollout_where}.{key}")
+        artifact_paths = _object(
+            rollout["artifact_paths"],
+            f"{rollout_where}.artifact_paths",
+            (
+                "native_events",
+                "result",
+                "stderr",
+                "cassette",
+                "transcript",
+                "workspace",
+                "store",
+            ),
+        )
+        for key in ("native_events", "result", "stderr", "cassette", "transcript", "workspace"):
+            _artifact_relative_path(
+                artifact_paths[key],
+                f"{rollout_where}.artifact_paths.{key}",
+            )
+        if tinykg_enabled:
+            _artifact_relative_path(
+                artifact_paths["store"],
+                f"{rollout_where}.artifact_paths.store",
+            )
+        elif artifact_paths["store"] is not None:
+            _fail(f"{rollout_where}.artifact_paths.store", "control arm must use null")
+        if rollout["stop_reason"] not in {"end_turn", "max_turns", "tool_loop", "budget"}:
+            _fail(f"{rollout_where}.stop_reason", "unsupported native stop reason")
+        if rollout["provider_mode"] != "scripted-local":
+            _fail(f"{rollout_where}.provider_mode", "must be scripted-local")
+        provider_requests = _integer(
+            rollout["provider_requests"],
+            f"{rollout_where}.provider_requests",
+            minimum=1,
+        )
+        rollout_external_calls = _integer(
+            rollout["external_network_calls"],
+            f"{rollout_where}.external_network_calls",
+        )
+        if rollout_external_calls != 0:
+            _fail(f"{rollout_where}.external_network_calls", "must be zero")
+        rollout_paid_cost = _finite_number(
+            rollout["paid_cost_usd"],
+            f"{rollout_where}.paid_cost_usd",
+        )
+        if rollout_paid_cost != 0.0:
+            _fail(f"{rollout_where}.paid_cost_usd", "must be zero")
+        _finite_number(
+            rollout["estimated_cost_usd"],
+            f"{rollout_where}.estimated_cost_usd",
+        )
+        _finite_number(rollout["host_elapsed_ms"], f"{rollout_where}.host_elapsed_ms")
+        expected_observation = _canonical_sha256(observations[sequence])
+        if _hash(
+            rollout["observation_sha256"],
+            f"{rollout_where}.observation_sha256",
+        ) != expected_observation:
+            _fail(f"{rollout_where}.observation_sha256", "does not bind observation")
+        observation = observations[sequence]
+        trajectory = observation.get("trajectory")
+        retrieval = observation.get("retrieval")
+        cost = observation.get("cost")
+        if not isinstance(trajectory, dict):
+            _fail(f"{rollout_where}.observation", "missing native trajectory")
+        model_requests = _integer(
+            trajectory.get("model_requests"),
+            f"{rollout_where}.observation.trajectory.model_requests",
+            minimum=1,
+        )
+        if model_requests != provider_requests:
+            _fail(
+                f"{rollout_where}.provider_requests",
+                "does not match native observation trajectory",
+            )
+        if not isinstance(retrieval, dict) or retrieval.get("enabled") is not tinykg_enabled:
+            _fail(f"{rollout_where}.observation.retrieval", "arm activation mismatch")
+        if tinykg_enabled and not retrieval.get("query_variants"):
+            _fail(
+                f"{rollout_where}.observation.retrieval.query_variants",
+                "native TinyKG rollout did not execute lexical retrieval",
+            )
+        if not isinstance(cost, dict) or cost.get("cost_usd") != rollout["paid_cost_usd"]:
+            _fail(f"{rollout_where}.paid_cost_usd", "does not match observation cost")
+        before = _string(
+            rollout["store_revision_before"],
+            f"{rollout_where}.store_revision_before",
+        )
+        after = _string(
+            rollout["store_revision_after"],
+            f"{rollout_where}.store_revision_after",
+        )
+        raw_before = _string(
+            rollout["raw_store_digest_before"],
+            f"{rollout_where}.raw_store_digest_before",
+        )
+        raw_after = _string(
+            rollout["raw_store_digest_after"],
+            f"{rollout_where}.raw_store_digest_after",
+        )
+        if tinykg_enabled:
+            _hash(before, f"{rollout_where}.store_revision_before")
+            _hash(after, f"{rollout_where}.store_revision_after")
+            _hash(raw_before, f"{rollout_where}.raw_store_digest_before")
+            _hash(raw_after, f"{rollout_where}.raw_store_digest_after")
+            if before != after:
+                _fail(rollout_where, "read-only rollout changed TinyKG store revision")
+            if raw_before != raw_after:
+                _fail(rollout_where, "read-only rollout changed raw TinyKG store bytes")
+        elif (
+            before != "none"
+            or after != "none"
+            or raw_before != "none"
+            or raw_after != "none"
+        ):
+            _fail(rollout_where, "control arm must use none store digests")
+    estimated_total = sum(float(item["estimated_cost_usd"]) for item in rollouts)
+    if not math.isfinite(estimated_total) or abs(estimated_cost_usd - estimated_total) > 1e-12:
+        _fail(f"{where}.estimated_cost_usd", "does not equal rollout total")
+
+
+def validate_runtime_artifacts(
+    receipt: Mapping[str, Any],
+    artifact_root: Path,
+    where: str = "memory runtime artifacts",
+) -> None:
+    """Re-open every v2 native artifact instead of trusting receipt-shaped hashes."""
+
+    if receipt.get("schema_version") != RUNTIME_RECEIPT_SCHEMA_VERSION:
+        return
+    rollouts = receipt.get("rollouts")
+    if not isinstance(rollouts, list):
+        _fail(where, "receipt rollouts are unavailable")
+    seen_paths: set[str] = set()
+    file_specs = (
+        ("native_events", "native_events_sha256"),
+        ("result", "result_sha256"),
+        ("stderr", "stderr_sha256"),
+    )
+    tree_specs = (
+        ("cassette", "cassette_sha256"),
+        ("transcript", "transcript_sha256"),
+        ("workspace", "workspace_sha256"),
+    )
+    for index, raw_rollout in enumerate(rollouts):
+        rollout_where = f"{where}.rollouts[{index}]"
+        if not isinstance(raw_rollout, dict):
+            _fail(rollout_where, "expected an object")
+        paths = raw_rollout.get("artifact_paths")
+        if not isinstance(paths, dict):
+            _fail(f"{rollout_where}.artifact_paths", "expected an object")
+        for path_key, digest_key in file_specs:
+            raw_path = paths.get(path_key)
+            relative = _artifact_relative_path(
+                raw_path,
+                f"{rollout_where}.artifact_paths.{path_key}",
+            ).as_posix()
+            if relative in seen_paths:
+                _fail(f"{rollout_where}.artifact_paths.{path_key}", "reuses another rollout artifact")
+            seen_paths.add(relative)
+            path = _artifact_path(
+                artifact_root,
+                relative,
+                f"{rollout_where}.artifact_paths.{path_key}",
+                directory=False,
+            )
+            try:
+                observed = file_sha256(path)
+            except OSError as exc:
+                raise ValidationError(f"{rollout_where}.{digest_key}: cannot hash artifact: {exc}") from exc
+            expected = _hash(raw_rollout.get(digest_key), f"{rollout_where}.{digest_key}")
+            if observed != expected:
+                _fail(f"{rollout_where}.{digest_key}", "raw artifact SHA-256 mismatch")
+        for path_key, digest_key in tree_specs:
+            raw_path = paths.get(path_key)
+            relative = _artifact_relative_path(
+                raw_path,
+                f"{rollout_where}.artifact_paths.{path_key}",
+            ).as_posix()
+            if relative in seen_paths:
+                _fail(f"{rollout_where}.artifact_paths.{path_key}", "reuses another rollout artifact")
+            seen_paths.add(relative)
+            path = _artifact_path(
+                artifact_root,
+                relative,
+                f"{rollout_where}.artifact_paths.{path_key}",
+                directory=True,
+            )
+            observed = _artifact_tree_digest(path, f"{rollout_where}.artifact_paths.{path_key}")
+            expected = _hash(raw_rollout.get(digest_key), f"{rollout_where}.{digest_key}")
+            if observed != expected:
+                _fail(f"{rollout_where}.{digest_key}", "raw artifact tree mismatch")
+        store_path = paths.get("store")
+        tinykg_enabled = raw_rollout.get("tinykg_binary_sha256") is not None
+        if tinykg_enabled:
+            relative = _artifact_relative_path(
+                store_path,
+                f"{rollout_where}.artifact_paths.store",
+            ).as_posix()
+            path = _artifact_path(
+                artifact_root,
+                relative,
+                f"{rollout_where}.artifact_paths.store",
+                directory=True,
+            )
+            observed = _artifact_tree_digest(
+                path,
+                f"{rollout_where}.artifact_paths.store",
+                ignore_lock_files=True,
+            )
+            expected = _hash(
+                raw_rollout.get("raw_store_digest_after"),
+                f"{rollout_where}.raw_store_digest_after",
+            )
+            if observed != expected:
+                _fail(
+                    f"{rollout_where}.raw_store_digest_after",
+                    "current store tree no longer matches the read-phase receipt",
+                )
+        elif store_path is not None:
+            _fail(f"{rollout_where}.artifact_paths.store", "control arm must use null")
 
 
 def validate_manifest(manifest: Mapping[str, Any], where: str = "memory manifest") -> None:
@@ -524,6 +954,7 @@ def replay_observations(
     *,
     dataset_source: Path,
     runtime_receipt: Mapping[str, Any],
+    runtime_artifact_root: Path | None = None,
 ) -> List[Dict[str, Any]]:
     validate_manifest(manifest)
     try:
@@ -542,6 +973,13 @@ def replay_observations(
         observations,
         observed_source_sha,
     )
+    if runtime_receipt.get("schema_version") == RUNTIME_RECEIPT_SCHEMA_VERSION:
+        if runtime_artifact_root is None:
+            _fail(
+                "memory runtime artifacts",
+                "v2 replay requires the receipt directory for raw-artifact re-observation",
+            )
+        validate_runtime_artifacts(runtime_receipt, runtime_artifact_root)
 
     cases = _case_map(manifest)
     arms = _arm_map(manifest)
