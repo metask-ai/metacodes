@@ -978,7 +978,14 @@ pub const App = struct {
         mkdirKgProjectsDir(app.allocator, home, anchor_hash);
 
         // domain = git 根 basename + git 根 hash 前 8(可读 + 防撞)。
-        const domain = app.computeKgDomain(anchor, anchor_hash) catch return;
+        const domain_override: ?[]const u8 = if (std.c.getenv("METACODES_KG_DOMAIN")) |value|
+            std.mem.span(value)
+        else
+            null;
+        const domain = app.computeKgDomain(anchor, anchor_hash, domain_override) catch |err| {
+            @import("util/log.zig").warn("kg", "project domain override rejected: {s}", .{@errorName(err)});
+            return;
+        };
         defer app.allocator.free(domain);
 
         var client = @import("kg/client.zig").KgClient.init(app.allocator, .{
@@ -1045,8 +1052,19 @@ pub const App = struct {
         _ = std.c.mkdir(fz, 0o700);
     }
 
-    /// domain id:锚点(git 根/cwd)basename + 锚点 hash 前 8(可读 + 防撞)。
-    fn computeKgDomain(app: *App, anchor: []const u8, anchor_hash: [16]u8) ![]u8 {
+    /// domain id:默认由锚点(git 根/cwd)basename + hash 前 8 生成。隔离 worktree
+    /// 可由可信 host 显式绑定同一 logical project；值只允许短 ASCII identifier，
+    /// 防止换行/路径等外部输入进入 TinyKG project name。
+    fn computeKgDomain(app: *App, anchor: []const u8, anchor_hash: [16]u8, override: ?[]const u8) ![]u8 {
+        if (override) |value| {
+            if (value.len == 0 or value.len > 128) return error.InvalidKgDomainOverride;
+            for (value) |character| {
+                if (!(std.ascii.isAlphanumeric(character) or character == '-' or character == '_' or character == '.')) {
+                    return error.InvalidKgDomainOverride;
+                }
+            }
+            return app.allocator.dupe(u8, value);
+        }
         const base = std.fs.path.basename(anchor);
         const safe_base = if (base.len == 0) "root" else base;
         return std.fmt.allocPrint(app.allocator, "{s}-{s}", .{ safe_base, anchor_hash[0..8] });
@@ -1967,6 +1985,29 @@ test "U2 S1: toggleVim 翻转 config.vim_mode 返回新值" {
     try std.testing.expect(app.config.vim_mode);
     try std.testing.expect(!app.toggleVim()); // → false
     try std.testing.expect(!app.config.vim_mode);
+}
+
+test "KG domain override binds isolated worktrees and rejects unsafe identifiers" {
+    var app: App = undefined;
+    app.allocator = std.testing.allocator;
+    const anchor_hash: [16]u8 = "0123456789abcdef".*;
+
+    const fallback = try app.computeKgDomain("/tmp/repo", anchor_hash, null);
+    defer app.allocator.free(fallback);
+    try std.testing.expectEqualStrings("repo-01234567", fallback);
+
+    const shared = try app.computeKgDomain("/tmp/worktree-a", anchor_hash, "project-deadbeef");
+    defer app.allocator.free(shared);
+    try std.testing.expectEqualStrings("project-deadbeef", shared);
+
+    try std.testing.expectError(
+        error.InvalidKgDomainOverride,
+        app.computeKgDomain("/tmp/worktree-b", anchor_hash, "project\nother"),
+    );
+    try std.testing.expectError(
+        error.InvalidKgDomainOverride,
+        app.computeKgDomain("/tmp/worktree-b", anchor_hash, ""),
+    );
 }
 
 test "U2 S1: compactWindow 结构化返回 {dropped,before,after}(loop/web 共用)" {

@@ -1145,6 +1145,7 @@ def _sanitized_environment(base: Mapping[str, str]) -> Dict[str, str]:
         "TMP",
         "TEMP",
         "METACODES_KG_BIN",
+        "METACODES_KG_DOMAIN",
         "METACODES_KG_STORE",
         "METACODES_LONG_HORIZON_ARM",
         "METACODES_BASE_URL",
@@ -1930,6 +1931,7 @@ def run_memory_agent_schedule(
         )
         if tinykg_enabled and store is not None:
             env["METACODES_KG_BIN"] = str(tinykg)
+            env["METACODES_KG_DOMAIN"] = _project_domain(project_root)
             env["METACODES_KG_STORE"] = str(store)
         if production_mode:
             env["METACODES_FORCE_COMPACT_AT"] = PRODUCTION_FORCE_COMPACT_AT

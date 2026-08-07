@@ -15,6 +15,8 @@ import hashlib
 import json
 import os
 import stat
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -122,11 +124,81 @@ def _config(args: argparse.Namespace, api_key: str, *, authorized: bool) -> Prod
     )
 
 
+def _probe_tinykg_compatibility(binary: Path, expected_sha256: str) -> Mapping[str, Any]:
+    """Exercise the exact local-store commands required before any paid arm."""
+
+    def run(command: str, *arguments: str) -> str:
+        try:
+            completed = subprocess.run(
+                [str(binary), command, *arguments],
+                env={"PATH": os.defpath},
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ValidationError(f"TinyKG compatibility preflight {command} failed: {exc}") from exc
+        if completed.returncode != 0:
+            detail = completed.stderr.strip()[-500:]
+            raise ValidationError(
+                f"TinyKG compatibility preflight {command} failed with exit "
+                f"{completed.returncode}: {detail!r}"
+            )
+        return completed.stdout
+
+    if file_sha256(binary) != expected_sha256:
+        raise ValidationError("TinyKG binary changed before compatibility preflight")
+    with tempfile.TemporaryDirectory(prefix="metacodes-tinykg-preflight-") as directory:
+        root = Path(directory)
+        store = root / "store.kg"
+        batch = root / "batch.jsonl"
+        batch.write_text(
+            stable_json({"version": 1})
+            + "\n"
+            + stable_json(
+                {
+                    "id": 1,
+                    "kind": "project",
+                    "name": "preflight-domain",
+                    "op": "node",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        run("init", str(store))
+        run("apply", str(store), str(batch))
+        info = {}
+        for line in run("store-info", str(store)).splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                info[key] = value
+        required = {
+            "nodes": "1",
+            "edges": "0",
+            "storage_format_version": "2",
+            "schema_version": "3",
+        }
+        if any(info.get(key) != value for key, value in required.items()):
+            raise ValidationError("TinyKG compatibility preflight returned an incompatible store contract")
+    if file_sha256(binary) != expected_sha256:
+        raise ValidationError("TinyKG binary changed during compatibility preflight")
+    return {
+        "commands": ["init", "apply", "store-info"],
+        "storage_format_version": 2,
+        "schema_version": 3,
+    }
+
+
 def _public_plan(
     args: argparse.Namespace,
     manifest: Mapping[str, Any],
-    metacodes: Path,
-    tinykg: Path,
+    metacodes_sha256: str,
+    tinykg_sha256: str,
+    tinykg_preflight: Mapping[str, Any],
 ) -> Mapping[str, Any]:
     budget = _config(args, "dry-run-placeholder", authorized=True)
     _validate_production_manifest(manifest, budget)
@@ -143,8 +215,9 @@ def _public_plan(
         "tool_network_isolation": PRODUCTION_TOOL_NETWORK_ISOLATION,
         "filesystem_isolation": PRODUCTION_FILESYSTEM_ISOLATION,
         "auto_compact_policy": PRODUCTION_AUTO_COMPACT_POLICY,
-        "metacodes_binary_sha256": file_sha256(metacodes),
-        "tinykg_binary_sha256": file_sha256(tinykg),
+        "metacodes_binary_sha256": metacodes_sha256,
+        "tinykg_binary_sha256": tinykg_sha256,
+        "tinykg_preflight": tinykg_preflight,
         "source_sha256": file_sha256(args.source.resolve()),
         "credential_loaded": False,
     }
@@ -184,12 +257,25 @@ def main(argv: list[str] | None = None) -> int:
             raise ValidationError(f"{label} is unavailable")
     if not os.access(metacodes, os.X_OK) or not os.access(tinykg, os.X_OK):
         raise ValidationError("production binaries must be executable")
+    metacodes_sha = file_sha256(metacodes)
+    tinykg_sha = file_sha256(tinykg)
     manifest = load_manifest(manifest_path)
     if file_sha256(source) != manifest["dataset"]["source_sha256"]:
         raise ValidationError("adapter source SHA-256 does not match the frozen manifest")
+    tinykg_preflight = _probe_tinykg_compatibility(tinykg, tinykg_sha)
 
     if args.dry_run:
-        print(stable_json(_public_plan(args, manifest, metacodes, tinykg)))
+        print(
+            stable_json(
+                _public_plan(
+                    args,
+                    manifest,
+                    metacodes_sha,
+                    tinykg_sha,
+                    tinykg_preflight,
+                )
+            )
+        )
         return 0
     if not args.allow_paid_rollouts:
         raise ValidationError("production pilot requires --allow-paid-rollouts")
@@ -232,8 +318,6 @@ def main(argv: list[str] | None = None) -> int:
         # closes that descriptor before App/tools/subprocesses are initialized.
         production = _config(args, api_key, authorized=True)
         production.validate(len(manifest["schedule"]))
-        metacodes_sha = file_sha256(metacodes)
-        tinykg_sha = file_sha256(tinykg)
         observations, receipt = run_memory_agent_schedule(
             metacodes_binary=metacodes,
             expected_metacodes_sha256=metacodes_sha,

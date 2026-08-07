@@ -281,6 +281,18 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             manifest_path.write_text(stable_json(manifest) + "\n", encoding="utf-8")
             missing_auth = root / "must-not-be-read.json"
             budget_journal = root / "must-not-be-created-budget-journal.json"
+            tinykg = root / "fake-tinykg"
+            tinykg.write_text(
+                "#!/bin/sh\n"
+                "case \"$1\" in\n"
+                "  init) mkdir \"$2\" ;;\n"
+                "  apply) printf 'apply version=1 nodes_created=1 nodes_existing=0 edges_created=0 edges_existing=0\\n' ;;\n"
+                "  store-info) printf 'nodes=1\\nedges=0\\nstorage_format_version=2\\nschema_version=3\\n' ;;\n"
+                "  *) exit 91 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            tinykg.chmod(0o700)
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 code = production_pilot_main(
@@ -288,7 +300,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                         "--binary",
                         "/bin/echo",
                         "--tinykg-binary",
-                        "/bin/echo",
+                        str(tinykg),
                         "--source",
                         str(FIXTURES / "smoke-source.json"),
                         "--manifest",
@@ -305,8 +317,39 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             self.assertTrue(plan["dry_run"])
             self.assertEqual(plan["network_requests"], 0)
             self.assertFalse(plan["credential_loaded"])
+            self.assertEqual(
+                plan["tinykg_preflight"]["commands"],
+                ["init", "apply", "store-info"],
+            )
             self.assertFalse(missing_auth.exists())
             self.assertFalse(budget_journal.exists())
+
+    def test_production_pilot_rejects_incompatible_tinykg_before_credential(self):
+        manifest = copy.deepcopy(load_manifest(FIXTURES / "smoke-manifest.json"))
+        manifest["execution"]["model_id"] = "glm-5.2"
+        manifest["execution"]["model_fingerprint"] = PRODUCTION_MODEL_FINGERPRINT
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(stable_json(manifest) + "\n", encoding="utf-8")
+            missing_auth = root / "must-not-be-read.json"
+            with self.assertRaisesRegex(ValidationError, "TinyKG compatibility preflight"):
+                production_pilot_main(
+                    [
+                        "--binary",
+                        "/bin/echo",
+                        "--tinykg-binary",
+                        "/bin/echo",
+                        "--source",
+                        str(FIXTURES / "smoke-source.json"),
+                        "--manifest",
+                        str(manifest_path),
+                        "--auth-file",
+                        str(missing_auth),
+                        "--dry-run",
+                    ]
+                )
+            self.assertFalse(missing_auth.exists())
 
     def test_production_secret_scan_rejects_artifact_and_pending_receipt(self):
         secret = 'super-secret-"escaped"-key'
@@ -362,6 +405,15 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             }
         )
         self.assertEqual(clean, {"PATH": PRODUCTION_CHILD_PATH})
+
+    def test_scripted_environment_drops_untrusted_tinykg_domain_override(self):
+        clean = _sanitized_environment(
+            {
+                "PATH": "/operator/bin",
+                "METACODES_KG_DOMAIN": "host-domain-must-not-pass",
+            }
+        )
+        self.assertEqual(clean, {"PATH": "/operator/bin"})
 
     def test_production_auth_rejects_parent_environment_and_reads_private_file(self):
         with tempfile.TemporaryDirectory() as directory:
