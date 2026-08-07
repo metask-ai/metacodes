@@ -61,6 +61,8 @@ from .memory_replay import (
     PRODUCTION_FORCE_COMPACT_AT,
     PRODUCTION_FILESYSTEM_ISOLATION,
     PRODUCTION_RUNNER_SOURCE_MODULES,
+    PRODUCTION_SANDBOX_BACKEND,
+    PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION,
     PRODUCTION_TOOL_NETWORK_ISOLATION,
     REPLAY_SCHEMA_VERSION,
     RUNNER_SOURCE_MODULES,
@@ -100,6 +102,26 @@ PRODUCTION_MODEL_FINGERPRINT = hashlib.sha256(
     ).encode("utf-8")
 ).hexdigest()
 PRODUCTION_CREDENTIAL_MAX_BYTES = 4096
+PRODUCTION_SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
+PRODUCTION_SYSTEM_READ_ROOTS = (
+    Path("/System"),
+    Path("/usr"),
+    Path("/bin"),
+    Path("/sbin"),
+    Path("/Library/Apple"),
+    Path("/Library/Developer/CommandLineTools"),
+    Path("/Library/Preferences"),
+    Path("/Library/Keychains"),
+    Path("/etc"),
+    Path("/var/db"),
+    Path("/var/run"),
+    Path("/var/select"),
+    Path("/private/etc"),
+    Path("/private/var/db"),
+    Path("/private/var/run"),
+    Path("/private/var/select"),
+    Path("/dev"),
+)
 ARM_TO_RUNTIME = {
     "no_memory": "codex_style",
     "codex_style": "codex_style",
@@ -183,6 +205,15 @@ class ProductionRuntimeConfig:
             "max_rollout_metered_tokens": self.max_rollout_metered_tokens,
             "max_output_tokens": self.max_output_tokens,
         }
+
+
+@dataclass(frozen=True)
+class ProductionSandbox:
+    profile_path: Path
+    profile_sha256: str
+
+    def command(self, command: Sequence[str]) -> List[str]:
+        return [str(PRODUCTION_SANDBOX_EXEC), "-f", str(self.profile_path), *command]
 
 
 def _fail(where: str, message: str) -> None:
@@ -1149,6 +1180,247 @@ def _production_environment(_base: Mapping[str, str]) -> Dict[str, str]:
     return {"PATH": PRODUCTION_CHILD_PATH}
 
 
+def _sbpl_string(value: str) -> str:
+    if any(character in value for character in ("\x00", "\n", "\r")):
+        _fail("production sandbox path", "contains a forbidden control character")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _production_sandbox_profile(
+    *,
+    read_write_roots: Sequence[Path],
+    read_only_files: Sequence[Path],
+    sealed_files: Sequence[Path],
+) -> str:
+    """Build a whole-child Seatbelt profile with a filesystem default deny.
+
+    ``allow default`` deliberately preserves the provider's HTTPS stack and the
+    normal process primitives used by Bash. File reads/writes are then denied
+    from ``/`` and only the current rollout is restored. ``process-info*`` is
+    denied independently so a tool cannot recover the Python parent's command
+    line or environment through ``ps``/pid inspection.
+    """
+
+    if platform.system() != "Darwin" or not PRODUCTION_SANDBOX_EXEC.is_file():
+        _fail(
+            "production sandbox",
+            "macOS sandbox-exec is required for a paid production rollout",
+        )
+
+    roots: List[Path] = []
+    for raw in read_write_roots:
+        path = raw.expanduser().resolve()
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise ValidationError(f"production sandbox root is unavailable: {exc}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            _fail("production sandbox root", "must be a real directory")
+        if path not in roots:
+            roots.append(path)
+    roots.sort(key=lambda item: (len(item.parts), str(item)))
+    minimal_roots: List[Path] = []
+    for root in roots:
+        if any(_path_is_within(str(root), parent) for parent in minimal_roots):
+            continue
+        minimal_roots.append(root)
+    if not minimal_roots:
+        _fail("production sandbox", "has no current-rollout roots")
+
+    # Seatbelt matches the spelling used by the syscall. Keep both macOS's
+    # public symlink spelling (/var, /etc) and the resolved /private target;
+    # resolving everything would block xcode-select before a script starts.
+    system_roots = sorted(
+        {
+            candidate
+            for path in PRODUCTION_SYSTEM_READ_ROOTS
+            if path.exists() and path.is_dir()
+            for candidate in (path.absolute(), path.resolve())
+        },
+        key=str,
+    )
+    readonly: List[Path] = []
+    for raw in read_only_files:
+        path = raw.expanduser().resolve()
+        if not path.is_file():
+            _fail("production sandbox read-only file", "is unavailable")
+        if path not in readonly:
+            readonly.append(path)
+    sealed = sorted({path.expanduser().resolve(strict=False) for path in sealed_files}, key=str)
+    for path in sealed:
+        if not any(_path_is_within(str(path), root) for root in minimal_roots):
+            _fail("production sandbox sealed file", "is outside the writable rollout roots")
+
+    # Seatbelt's subpath filter does not grant metadata access to ancestors.
+    # Shell startup calls getcwd(), which must stat every parent of the current
+    # workspace; macOS launch shims likewise resolve /var and /etc symlinks.
+    # Grant metadata only (not contents) on those path components.
+    ancestor_metadata: set[Path] = set()
+    for path in (*system_roots, *minimal_roots, *readonly):
+        current = path.parent
+        while current != current.parent:
+            ancestor_metadata.add(current)
+            current = current.parent
+
+    lines = [
+        "(version 1)",
+        "(allow default)",
+        # Shells need process metadata about themselves. Deny only cross-process
+        # inspection so ps cannot recover the Python parent's argv/environment.
+        "(deny process-info* (target others))",
+        '(deny file-read* (subpath "/"))',
+        '(deny file-write* (subpath "/"))',
+        "(allow file-read*",
+        '  (literal "/")',
+    ]
+    lines.extend(f"  (subpath {_sbpl_string(str(path))})" for path in system_roots)
+    lines.extend(f"  (subpath {_sbpl_string(str(path))})" for path in minimal_roots)
+    lines.extend(f"  (literal {_sbpl_string(str(path))})" for path in sorted(readonly, key=str))
+    lines.extend(
+        [
+            ")",
+            "(allow file-read-metadata",
+            *[
+                f"  (literal {_sbpl_string(str(path))})"
+                for path in sorted(ancestor_metadata, key=str)
+            ],
+            ")",
+            "(allow file-write*",
+            *[f"  (subpath {_sbpl_string(str(path))})" for path in minimal_roots],
+            '  (literal "/dev/null")',
+            '  (literal "/dev/zero")',
+            '  (literal "/dev/stdout")',
+            '  (literal "/dev/stderr")',
+            '  (literal "/dev/random")',
+            '  (literal "/dev/urandom")',
+            '  (regex #"^/dev/fd/")',
+            ")",
+        ]
+    )
+    if sealed:
+        lines.append("(deny file-write*")
+        lines.extend(f"  (literal {_sbpl_string(str(path))})" for path in sealed)
+        lines.append(")")
+    return "\n".join(lines) + "\n"
+
+
+def _materialize_production_sandbox(
+    *,
+    profile_path: Path,
+    evidence_path: Path,
+    artifact_dir: Path,
+    workspace: Path,
+    store: Path | None,
+    metacodes: Path,
+    tinykg: Path | None,
+) -> ProductionSandbox:
+    roots = [artifact_dir, workspace]
+    if store is not None:
+        roots.append(store)
+    profile = _production_sandbox_profile(
+        read_write_roots=roots,
+        read_only_files=(metacodes,) if tinykg is None else (metacodes, tinykg),
+        sealed_files=(profile_path, evidence_path),
+    )
+    _write_new(profile_path, profile.encode("utf-8"))
+    return ProductionSandbox(
+        profile_path=profile_path,
+        profile_sha256=file_sha256(profile_path),
+    )
+
+
+def _run_production_sandbox_probe(
+    sandbox: ProductionSandbox,
+    *,
+    host_read_path: Path,
+    sibling_read_path: Path,
+    writable_root: Path,
+    evidence_path: Path,
+) -> Mapping[str, Any]:
+    """Run a zero-network controlled negative before exposing the API key."""
+
+    host = host_read_path.expanduser().resolve()
+    sibling = sibling_read_path.expanduser().resolve()
+    for path, label in ((host, "host"), (sibling, "sibling")):
+        if not path.is_file() or not os.access(path, os.R_OK):
+            _fail(f"production sandbox {label} sentinel", "must be host-readable")
+    allowed = writable_root.expanduser().resolve() / "sandbox-positive-probe.txt"
+    token = _hash_text(f"{sandbox.profile_sha256}:{host}:{sibling}")
+    script = """
+if /usr/bin/head -c 1 "$1" >/dev/null 2>&1; then exit 11; fi
+if /usr/bin/head -c 1 "$2" >/dev/null 2>&1; then exit 12; fi
+if /bin/ps -p "$PPID" -o command= >/dev/null 2>&1; then exit 13; fi
+/bin/echo "$3" > "$4" || exit 14
+test "$(/bin/cat "$4")" = "$3" || exit 15
+""".strip()
+    try:
+        completed = subprocess.run(
+            sandbox.command(
+                [
+                    "/bin/sh",
+                    "-c",
+                    script,
+                    "production-sandbox-probe",
+                    str(host),
+                    str(sibling),
+                    token,
+                    str(allowed),
+                ]
+            ),
+            cwd=writable_root,
+            env={"PATH": PRODUCTION_CHILD_PATH, "LC_ALL": "C", "LANG": "C"},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if completed.returncode != 0:
+            diagnostic = completed.stderr.strip().replace("\n", " ")[:512]
+            _fail(
+                "production sandbox controlled negative",
+                f"probe exited {completed.returncode}: {diagnostic}",
+            )
+        if _read_regular_file(allowed, "production sandbox positive probe").strip() != token.encode():
+            _fail("production sandbox controlled negative", "writable-root round trip failed")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValidationError(f"production sandbox controlled negative failed: {exc}") from exc
+    finally:
+        try:
+            allowed.unlink()
+        except FileNotFoundError:
+            pass
+
+    evidence = {
+        "schema_version": PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION,
+        "backend": PRODUCTION_SANDBOX_BACKEND,
+        "profile_sha256": sandbox.profile_sha256,
+        "host_path_sha256": _hash_text(str(host)),
+        "host_content_sha256": file_sha256(host),
+        "sibling_path_sha256": _hash_text(str(sibling)),
+        "sibling_content_sha256": file_sha256(sibling),
+        "host_read_denied": True,
+        "sibling_read_denied": True,
+        "process_info_denied": True,
+        "workspace_read_write_allowed": True,
+    }
+    _write_new(
+        evidence_path,
+        (stable_json(evidence) + "\n").encode("utf-8"),
+    )
+    return evidence
+
+
+def _assert_production_sandbox_identity(sandbox: ProductionSandbox, evidence_path: Path) -> None:
+    if file_sha256(sandbox.profile_path) != sandbox.profile_sha256:
+        _fail("production sandbox profile", "changed during the rollout")
+    evidence = _load_json(evidence_path, "production sandbox evidence")
+    if evidence.get("backend") != PRODUCTION_SANDBOX_BACKEND:
+        _fail("production sandbox evidence", "backend drift")
+    if evidence.get("profile_sha256") != sandbox.profile_sha256:
+        _fail("production sandbox evidence", "profile identity drift")
+
+
 def _assert_executable_identity(path: Path, expected_sha256: str, where: str) -> None:
     if not path.is_file() or not os.access(path, os.X_OK):
         _fail(where, "is no longer executable")
@@ -1377,7 +1649,10 @@ def run_memory_agent_schedule(
             project_root = artifact_dir / "project"
             workspace = project_root / "workspace"
         workspace.mkdir(parents=True)
-        (project_root / ".git").mkdir(exist_ok=True)
+        # Keep repository discovery inside the current rollout. A shared
+        # family-level .git sentinel would force the sandbox to expose parent
+        # directories containing sibling online/offline workspaces.
+        (workspace / ".git").mkdir(exist_ok=True)
         sealed_home = artifact_dir / "sealed-home"
         child_tmp = artifact_dir / "tmp"
         cassette = artifact_dir / "cassette"
@@ -1523,6 +1798,37 @@ def run_memory_agent_schedule(
             else b""
         )
 
+        sandbox: ProductionSandbox | None = None
+        sandbox_evidence: Mapping[str, Any] | None = None
+        sandbox_profile_path: Path | None = None
+        sandbox_evidence_path: Path | None = None
+        if production_mode:
+            sandbox_profile_path = artifact_dir / "production-seatbelt.sb"
+            sandbox_evidence_path = artifact_dir / "production-seatbelt-probe.json"
+            sibling_sentinel = (
+                resolved_run / "isolation-sentinels" / f"{component}.sentinel"
+            )
+            _write_new(
+                sibling_sentinel,
+                f"forbidden-sibling:{_hash_text(component)}\n".encode("utf-8"),
+            )
+            sandbox = _materialize_production_sandbox(
+                profile_path=sandbox_profile_path,
+                evidence_path=sandbox_evidence_path,
+                artifact_dir=artifact_dir,
+                workspace=workspace,
+                store=store,
+                metacodes=metacodes,
+                tinykg=tinykg if tinykg_enabled else None,
+            )
+            sandbox_evidence = _run_production_sandbox_probe(
+                sandbox,
+                host_read_path=source_path,
+                sibling_read_path=sibling_sentinel,
+                writable_root=child_tmp,
+                evidence_path=sandbox_evidence_path,
+            )
+
         events = artifact_dir / "native-events.jsonl"
         metadata_path = artifact_dir / "runtime-metadata.json"
         stdout_path = artifact_dir / "stdout.ndjson"
@@ -1561,6 +1867,14 @@ def run_memory_agent_schedule(
             "child_path": PRODUCTION_CHILD_PATH,
             "auto_compact_policy": PRODUCTION_AUTO_COMPACT_POLICY,
         }
+        if production_mode:
+            assert sandbox is not None
+            environment_claim.update(
+                {
+                    "sandbox_backend": PRODUCTION_SANDBOX_BACKEND,
+                    "sandbox_profile_sha256": sandbox.profile_sha256,
+                }
+            )
         environment_fingerprint = _canonical_sha256(environment_claim)
         metadata = _runtime_metadata(
             manifest=manifest,
@@ -1584,7 +1898,9 @@ def run_memory_agent_schedule(
         )
         metadata_fd = os.open(metadata_path, os.O_RDONLY)
         metadata_path.unlink()
-        events_file = tempfile.TemporaryFile()
+        # Keep the inherited event vnode inside the current artifact allowlist;
+        # a process-global temp directory would punch an unnecessary write hole.
+        events_file = tempfile.TemporaryFile(dir=artifact_dir)
         started = time.monotonic_ns()
         provider_memory_verified = False
         treatment_activation: Mapping[str, Any] | None = None
@@ -1652,6 +1968,9 @@ def run_memory_agent_schedule(
                     )
                 )
                 budget_transaction_id = str(reserved["transaction_id"])
+                assert sandbox is not None
+                assert sandbox_evidence_path is not None
+                _assert_production_sandbox_identity(sandbox, sandbox_evidence_path)
                 credential_read_fd, credential_write_fd = os.pipe()
                 try:
                     credential = production.api_key.encode("utf-8")
@@ -1676,14 +1995,16 @@ def run_memory_agent_schedule(
                             budget_transaction_receipt,
                         )
                     completed = subprocess.run(
-                        [
-                            *common_args[:3],
-                            "--max-tokens",
-                            str(production.max_output_tokens),
-                            "--disallowedTools",
-                            ",".join(PRODUCTION_DISALLOWED_PROVIDER_TOOLS),
-                            *common_args[3:],
-                        ],
+                        sandbox.command(
+                            [
+                                *common_args[:3],
+                                "--max-tokens",
+                                str(production.max_output_tokens),
+                                "--disallowedTools",
+                                ",".join(PRODUCTION_DISALLOWED_PROVIDER_TOOLS),
+                                *common_args[3:],
+                            ]
+                        ),
                         cwd=workspace,
                         env=env,
                         stdout=subprocess.PIPE,
@@ -1791,6 +2112,9 @@ def run_memory_agent_schedule(
                 expected_tinykg_sha256,
                 "production TinyKG binary",
             )
+            assert sandbox is not None
+            assert sandbox_evidence_path is not None
+            _assert_production_sandbox_identity(sandbox, sandbox_evidence_path)
             # Stop the schedule at the first contaminated rollout rather than
             # spending the remaining budget and discovering the leak only when
             # publishing the final receipt.
@@ -2215,6 +2539,10 @@ def run_memory_agent_schedule(
         if production_mode:
             assert treatment_activation is not None
             assert budget_transaction_receipt is not None
+            assert sandbox is not None
+            assert sandbox_profile_path is not None
+            assert sandbox_evidence_path is not None
+            assert sandbox_evidence is not None
             rollout_receipt.update(
                 {
                     "harness_fingerprint": harness_fingerprint,
@@ -2239,6 +2567,19 @@ def run_memory_agent_schedule(
                     "memory_tool_result_bytes": int(exposure["tool_result_bytes"]),
                     "treatment_activation": treatment_activation,
                     "budget_transaction": budget_transaction_receipt,
+                    "sandbox": {
+                        "backend": PRODUCTION_SANDBOX_BACKEND,
+                        "profile_path": artifact_relative(
+                            sandbox_profile_path,
+                            "production sandbox profile",
+                        ),
+                        "profile_sha256": sandbox.profile_sha256,
+                        "probe_path": artifact_relative(
+                            sandbox_evidence_path,
+                            "production sandbox probe",
+                        ),
+                        "probe_sha256": file_sha256(sandbox_evidence_path),
+                    },
                 }
             )
         else:

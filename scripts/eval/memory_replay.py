@@ -87,6 +87,8 @@ PRODUCTION_DISALLOWED_PROVIDER_TOOLS = (
     "WebSearch",
 )
 PRODUCTION_TOOL_NETWORK_ISOLATION = "not_proven_bash_network_unsandboxed"
+PRODUCTION_SANDBOX_BACKEND = "macos-seatbelt-sandbox-exec-v1"
+PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION = 1
 PRODUCTION_FILESYSTEM_ISOLATION = "not_proven_bypass_permissions_same_uid"
 PRODUCTION_CHILD_PATH = "/bin:/usr/bin"
 PRODUCTION_AUTO_COMPACT_POLICY = "disabled_threshold_reject_any_compact_event"
@@ -1117,6 +1119,7 @@ def _validate_production_runtime_receipt(
                 "memory_tool_result_bytes",
                 "treatment_activation",
                 *(("budget_transaction",) if journal_bound else ()),
+                *(("sandbox",) if journal_bound else ()),
                 "observation_sha256",
                 "host_elapsed_ms",
             ),
@@ -1172,6 +1175,7 @@ def _validate_production_runtime_receipt(
                 "project_domain",
                 "child_path",
                 "auto_compact_policy",
+                *(("sandbox_backend", "sandbox_profile_sha256") if journal_bound else ()),
             ),
         )
         environment_fingerprint = _hash(
@@ -1189,6 +1193,45 @@ def _validate_production_runtime_receipt(
             _fail(f"{rollout_where}.environment.child_path", "production environment is not minimal")
         if environment["auto_compact_policy"] != PRODUCTION_AUTO_COMPACT_POLICY:
             _fail(f"{rollout_where}.environment.auto_compact_policy", "production trace may compact")
+        if journal_bound:
+            sandbox = _object(
+                rollout["sandbox"],
+                f"{rollout_where}.sandbox",
+                (
+                    "backend",
+                    "profile_path",
+                    "profile_sha256",
+                    "probe_path",
+                    "probe_sha256",
+                ),
+            )
+            if sandbox["backend"] != PRODUCTION_SANDBOX_BACKEND:
+                _fail(f"{rollout_where}.sandbox.backend", "sandbox backend drift")
+            profile_sha256 = _hash(
+                sandbox["profile_sha256"],
+                f"{rollout_where}.sandbox.profile_sha256",
+            )
+            _hash(sandbox["probe_sha256"], f"{rollout_where}.sandbox.probe_sha256")
+            profile_path = _artifact_relative_path(
+                sandbox["profile_path"],
+                f"{rollout_where}.sandbox.profile_path",
+            ).as_posix()
+            probe_path = _artifact_relative_path(
+                sandbox["probe_path"],
+                f"{rollout_where}.sandbox.probe_path",
+            ).as_posix()
+            if profile_path == probe_path:
+                _fail(f"{rollout_where}.sandbox", "profile and probe paths must be distinct")
+            if environment["sandbox_backend"] != PRODUCTION_SANDBOX_BACKEND:
+                _fail(
+                    f"{rollout_where}.environment.sandbox_backend",
+                    "sandbox backend drift",
+                )
+            if environment["sandbox_profile_sha256"] != profile_sha256:
+                _fail(
+                    f"{rollout_where}.environment.sandbox_profile_sha256",
+                    "does not bind the sandbox profile",
+                )
         if tinykg_enabled:
             if _hash(rollout["tinykg_binary_sha256"], f"{rollout_where}.tinykg_binary_sha256") != tinykg_sha:
                 _fail(f"{rollout_where}.tinykg_binary_sha256", "binary identity drift")
@@ -2152,6 +2195,107 @@ def validate_runtime_artifacts(
                         f"{rollout_where}.budget_transaction.{key}",
                         "does not match the hash-chained checkpoint",
                     )
+            sandbox = raw_rollout.get("sandbox")
+            if not isinstance(sandbox, dict):
+                _fail(f"{rollout_where}.sandbox", "expected an object")
+            if sandbox.get("backend") != PRODUCTION_SANDBOX_BACKEND:
+                _fail(f"{rollout_where}.sandbox.backend", "sandbox backend drift")
+            sandbox_paths: Dict[str, Path] = {}
+            for path_key, digest_key in (
+                ("profile_path", "profile_sha256"),
+                ("probe_path", "probe_sha256"),
+            ):
+                relative = _artifact_relative_path(
+                    sandbox.get(path_key),
+                    f"{rollout_where}.sandbox.{path_key}",
+                ).as_posix()
+                if relative in seen_paths:
+                    _fail(
+                        f"{rollout_where}.sandbox.{path_key}",
+                        "reuses another runtime artifact",
+                    )
+                seen_paths.add(relative)
+                path = _artifact_path(
+                    artifact_root,
+                    relative,
+                    f"{rollout_where}.sandbox.{path_key}",
+                    directory=False,
+                )
+                sandbox_paths[path_key] = path
+                try:
+                    observed = file_sha256(path)
+                except OSError as exc:
+                    raise ValidationError(
+                        f"{rollout_where}.sandbox.{digest_key}: cannot hash artifact: {exc}"
+                    ) from exc
+                expected = _hash(
+                    sandbox.get(digest_key),
+                    f"{rollout_where}.sandbox.{digest_key}",
+                )
+                if observed != expected:
+                    _fail(
+                        f"{rollout_where}.sandbox.{digest_key}",
+                        "sandbox artifact SHA-256 mismatch",
+                    )
+            environment = raw_rollout.get("environment")
+            if not isinstance(environment, dict):
+                _fail(f"{rollout_where}.environment", "expected an object")
+            if environment.get("sandbox_backend") != sandbox.get("backend"):
+                _fail(
+                    f"{rollout_where}.environment.sandbox_backend",
+                    "does not bind the sandbox receipt",
+                )
+            if environment.get("sandbox_profile_sha256") != sandbox.get(
+                "profile_sha256"
+            ):
+                _fail(
+                    f"{rollout_where}.environment.sandbox_profile_sha256",
+                    "does not bind the sandbox receipt",
+                )
+            evidence = _object(
+                _load_unique_json(
+                    sandbox_paths["probe_path"],
+                    f"{rollout_where}.sandbox.probe",
+                ),
+                f"{rollout_where}.sandbox.probe",
+                (
+                    "schema_version",
+                    "backend",
+                    "profile_sha256",
+                    "host_path_sha256",
+                    "host_content_sha256",
+                    "sibling_path_sha256",
+                    "sibling_content_sha256",
+                    "host_read_denied",
+                    "sibling_read_denied",
+                    "process_info_denied",
+                    "workspace_read_write_allowed",
+                ),
+            )
+            if evidence["schema_version"] != PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION:
+                _fail(f"{rollout_where}.sandbox.probe.schema_version", "unsupported probe")
+            if evidence["backend"] != PRODUCTION_SANDBOX_BACKEND:
+                _fail(f"{rollout_where}.sandbox.probe.backend", "sandbox backend drift")
+            if evidence["profile_sha256"] != sandbox.get("profile_sha256"):
+                _fail(
+                    f"{rollout_where}.sandbox.probe.profile_sha256",
+                    "does not bind the sandbox profile",
+                )
+            for digest_key in (
+                "host_path_sha256",
+                "host_content_sha256",
+                "sibling_path_sha256",
+                "sibling_content_sha256",
+            ):
+                _hash(evidence[digest_key], f"{rollout_where}.sandbox.probe.{digest_key}")
+            for claim in (
+                "host_read_denied",
+                "sibling_read_denied",
+                "process_info_denied",
+                "workspace_read_write_allowed",
+            ):
+                if evidence[claim] is not True:
+                    _fail(f"{rollout_where}.sandbox.probe.{claim}", "probe did not pass")
         paths = raw_rollout.get("artifact_paths")
         if not isinstance(paths, dict):
             _fail(f"{rollout_where}.artifact_paths", "expected an object")

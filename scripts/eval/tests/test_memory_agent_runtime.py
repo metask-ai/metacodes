@@ -4,6 +4,8 @@ import hashlib
 import io
 import json
 import os
+import platform
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,14 +14,18 @@ from unittest import mock
 from scripts.eval.memory_agent_runtime import (
     PRODUCTION_MODEL_FINGERPRINT,
     ProductionRuntimeConfig,
+    _assert_production_sandbox_identity,
     _assert_executable_identity,
     _assert_production_secret_absent,
     _copy_memory_tree,
     _project_domain,
     _production_environment,
+    _materialize_production_sandbox,
+    _run_production_sandbox_probe,
     _safe_component,
     _sanitized_environment,
     _xxhash64,
+    run_memory_agent_schedule,
 )
 from scripts.eval.memory_budget_journal import (
     BudgetAuthority,
@@ -36,6 +42,8 @@ from scripts.eval.memory_replay import (
     PRODUCTION_FILESYSTEM_ISOLATION,
     LEGACY_PRODUCTION_RUNNER_SOURCE_MODULES,
     PRODUCTION_RUNNER_SOURCE_MODULES,
+    PRODUCTION_SANDBOX_BACKEND,
+    PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION,
     PRODUCTION_TOOL_NETWORK_ISOLATION,
     RUNNER_SOURCE_MODULES,
     _artifact_tree_digest,
@@ -366,6 +374,68 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {}, clear=False):
                 os.environ.pop("METASK_API_KEY", None)
                 self.assertEqual(_load_api_key(auth), "private-file-key")
+
+    @unittest.skipUnless(platform.system() == "Darwin", "requires macOS Seatbelt")
+    def test_production_seatbelt_denies_host_sibling_and_process_info(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "run" / "rollouts" / "current"
+            workspace = root / "run" / "projects" / "current-workspace"
+            store = root / "run" / "stores" / "current.kg"
+            child_tmp = artifact / "tmp"
+            for path in (artifact, workspace, store, child_tmp):
+                path.mkdir(parents=True, exist_ok=True)
+            host = root / "host-sentinel.txt"
+            sibling = root / "run" / "sibling-sentinel.txt"
+            host.write_text("host-secret\n", encoding="utf-8")
+            sibling.write_text("sibling-secret\n", encoding="utf-8")
+            profile = artifact / "production-seatbelt.sb"
+            evidence_path = artifact / "production-seatbelt-probe.json"
+
+            sandbox = _materialize_production_sandbox(
+                profile_path=profile,
+                evidence_path=evidence_path,
+                artifact_dir=artifact,
+                workspace=workspace,
+                store=store,
+                metacodes=Path("/bin/echo"),
+                tinykg=Path("/bin/cat"),
+            )
+            evidence = _run_production_sandbox_probe(
+                sandbox,
+                host_read_path=host,
+                sibling_read_path=sibling,
+                writable_root=child_tmp,
+                evidence_path=evidence_path,
+            )
+            self.assertTrue(evidence["host_read_denied"])
+            self.assertTrue(evidence["sibling_read_denied"])
+            self.assertTrue(evidence["process_info_denied"])
+            self.assertTrue(evidence["workspace_read_write_allowed"])
+            _assert_production_sandbox_identity(sandbox, evidence_path)
+
+            sealed_probe = subprocess.run(
+                sandbox.command(
+                    [
+                        "/bin/sh",
+                        "-c",
+                        'if /bin/echo changed > "$1" 2>/dev/null; then exit 21; fi; '
+                        'if /bin/echo changed > "$2" 2>/dev/null; then exit 22; fi',
+                        "sealed-profile-probe",
+                        str(profile),
+                        str(evidence_path),
+                    ]
+                ),
+                cwd=workspace,
+                env={"PATH": PRODUCTION_CHILD_PATH, "LC_ALL": "C", "LANG": "C"},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(sealed_probe.returncode, 0, sealed_probe.stderr)
+            _assert_production_sandbox_identity(sandbox, evidence_path)
 
     def test_memory_exposure_uses_only_injected_and_successful_memory_reads(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1144,6 +1214,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         )
         arms = {arm["id"]: arm for arm in receipt["arms"]}
         for rollout in receipt["rollouts"]:
+            sequence = rollout["sequence"]
             runtime_arm = (
                 "codex_style"
                 if rollout["arm"] in {"no_memory", "codex_style"}
@@ -1162,6 +1233,46 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 runtime_budget=receipt["budget"],
                 runner_sources=receipt["runner_sources"],
             )
+            profile_relative = f"rollouts/{sequence}/production-seatbelt.sb"
+            probe_relative = f"rollouts/{sequence}/production-seatbelt-probe.json"
+            profile_path = root / profile_relative
+            profile_path.parent.mkdir(parents=True, exist_ok=True)
+            profile_path.write_text(
+                "(version 1)\n(allow default)\n(deny file-read* (subpath \"/\"))\n",
+                encoding="utf-8",
+            )
+            profile_sha256 = hashlib.sha256(profile_path.read_bytes()).hexdigest()
+            probe = {
+                "schema_version": PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION,
+                "backend": PRODUCTION_SANDBOX_BACKEND,
+                "profile_sha256": profile_sha256,
+                "host_path_sha256": digest(f"sandbox-host-path:{sequence}"),
+                "host_content_sha256": digest(f"sandbox-host-content:{sequence}"),
+                "sibling_path_sha256": digest(f"sandbox-sibling-path:{sequence}"),
+                "sibling_content_sha256": digest(f"sandbox-sibling-content:{sequence}"),
+                "host_read_denied": True,
+                "sibling_read_denied": True,
+                "process_info_denied": True,
+                "workspace_read_write_allowed": True,
+            }
+            probe_path = root / probe_relative
+            probe_path.write_text(stable_json(probe) + "\n", encoding="utf-8")
+            rollout["sandbox"] = {
+                "backend": PRODUCTION_SANDBOX_BACKEND,
+                "profile_path": profile_relative,
+                "profile_sha256": profile_sha256,
+                "probe_path": probe_relative,
+                "probe_sha256": hashlib.sha256(probe_path.read_bytes()).hexdigest(),
+            }
+            rollout["environment"].update(
+                {
+                    "sandbox_backend": PRODUCTION_SANDBOX_BACKEND,
+                    "sandbox_profile_sha256": profile_sha256,
+                }
+            )
+            rollout["environment_fingerprint"] = hashlib.sha256(
+                stable_json(rollout["environment"]).encode("utf-8")
+            ).hexdigest()
 
         authority = BudgetAuthority(
             manifest_sha256=receipt["manifest_sha256"],
@@ -1424,6 +1535,27 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                     for rollout in receipt["rollouts"]
                 )
             )
+
+            first_sandbox = receipt["rollouts"][0]["sandbox"]
+            profile_path = root / first_sandbox["profile_path"]
+            original_profile = profile_path.read_bytes()
+            profile_path.write_text("tampered sandbox profile\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValidationError, "sandbox artifact SHA-256 mismatch"):
+                validate_runtime_artifacts(receipt, root)
+            profile_path.write_bytes(original_profile)
+
+            probe_path = root / first_sandbox["probe_path"]
+            original_probe = probe_path.read_bytes()
+            failed_probe = json.loads(original_probe)
+            failed_probe["process_info_denied"] = False
+            probe_path.write_text(stable_json(failed_probe) + "\n", encoding="utf-8")
+            failed_probe_receipt = copy.deepcopy(receipt)
+            failed_probe_receipt["rollouts"][0]["sandbox"]["probe_sha256"] = hashlib.sha256(
+                probe_path.read_bytes()
+            ).hexdigest()
+            with self.assertRaisesRegex(ValidationError, "process_info_denied: probe did not pass"):
+                validate_runtime_artifacts(failed_probe_receipt, root)
+            probe_path.write_bytes(original_probe)
 
             authorized_drift = copy.deepcopy(receipt)
             authorized_drift["rollouts"][0]["budget_transaction"][

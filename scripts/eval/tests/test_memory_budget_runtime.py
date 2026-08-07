@@ -444,7 +444,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
                 self._write_fake_metacodes(fake, provider.url)
                 with BudgetJournal(journal_path, self._authority(manifest)) as journal:
                     with mock.patch(
-                        "scripts.eval.memory_agent_runtime.os.pipe",
+                        "scripts.eval.memory_agent_runtime.os.fpathconf",
                         side_effect=OSError("injected pre-authorization failure"),
                     ):
                         with self.assertRaisesRegex(
