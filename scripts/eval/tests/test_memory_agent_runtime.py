@@ -1100,6 +1100,59 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
         ).validate(len(rows))
 
+    def test_checked_in_pilot_v12_binds_real_tinykg_read_probe(self):
+        pilot = ROOT / "evals/memory/pilots/procedural-glm52-v12"
+        contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
+        manifest = load_manifest(pilot / "manifest.json")
+        execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
+
+        for name, identity in contract["artifacts"].items():
+            payload = (pilot / name).read_bytes()
+            self.assertEqual(len(payload), identity["bytes"])
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), identity["sha256"])
+        fixture = ROOT / contract["generation"]["source_path"]
+        self.assertEqual(
+            hashlib.sha256(fixture.read_bytes()).hexdigest(),
+            contract["generation"]["expected_upstream_sha256"],
+        )
+        self.assertEqual(manifest["execution"], execution)
+        self.assertEqual(contract["harness"]["revision"], execution["harness_revision"])
+        self.assertEqual(contract["harness"]["git_commit"], "3e2b32ed357a8715dda9bdd09c4d09cbca0c851a")
+        rows = [
+            [item["sequence"], item["case_id"], item["trial"], item["arm"]]
+            for item in manifest["schedule"]
+        ]
+        self.assertEqual(rows, contract["schedule"]["ordered_rows"])
+        ordered_tsv = "".join("\t".join(str(value) for value in row) + "\n" for row in rows)
+        self.assertEqual(
+            hashlib.sha256(ordered_tsv.encode("utf-8")).hexdigest(),
+            contract["schedule"]["ordered_tsv_sha256"],
+        )
+        self.assertEqual(contract["protocol"]["sandbox_probe_schema_version"], 3)
+        self.assertIn(
+            "store-info and one bounded lexical search",
+            contract["paid_execution_requirements"]["tinykg_read_preflight"],
+        )
+        self.assertEqual(contract["budget_authority"]["prior_conservative_cost_usd"], 7.6764158)
+        self.assertEqual(
+            contract["budget_authority"]["prior_conservative_metered_tokens"],
+            4729364,
+        )
+        self.assertTrue(contract["current_phase"]["paid_rollouts_authorized"])
+        self.assertFalse(contract["current_phase"]["quality_evidence"])
+        budget = contract["budget_authority"]
+        ProductionRuntimeConfig(
+            api_key="test-only",
+            allow_paid_rollouts=True,
+            max_total_cost_usd=budget["max_total_cost_usd"],
+            max_total_metered_tokens=budget["max_total_metered_tokens"],
+            max_rollout_cost_usd=budget["max_rollout_cost_usd"],
+            max_rollout_metered_tokens=budget["max_rollout_metered_tokens"],
+            max_output_tokens=budget["max_output_tokens"],
+            ripgrep_binary=TEST_RIPGREP,
+            ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
+        ).validate(len(rows))
+
     def _materialize_valid_production_events(self, root, rollout, grader_fingerprint):
         cassette = root / rollout["artifact_paths"]["cassette"]
         uses = {}
