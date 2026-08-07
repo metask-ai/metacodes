@@ -29,16 +29,6 @@ const OAUTH_REFRESH_SKEW_SECONDS: i64 = 300;
 const DEFAULT_LOGIN_PORT: u16 = 1455;
 const FALLBACK_LOGIN_PORT: u16 = 1457;
 
-/// Zig 0.16's default `std.process.Init.io` keeps a borrowed view of the
-/// process environment and scans it lazily.  POSIX `unsetenv` may move that
-/// pointer array, so the one-shot FD credential scrub below must not run until
-/// the Io implementation has consumed its view.  The progress-parent lookup
-/// is the smallest public vtable operation that forces that scan; the returned
-/// descriptor, when present, remains owned by the process environment.
-pub fn stabilizeRuntimeIoEnvironment(io: std.Io) void {
-    _ = io.vtable.progressParentFile(io.userdata) catch {};
-}
-
 pub const AuthPrecedence = types.AuthPrecedence;
 
 pub fn parsePrecedence(s: []const u8) ?AuthPrecedence {
@@ -58,9 +48,14 @@ pub const CredentialSource = enum {
 pub const ResolvedCredential = struct {
     bearer_token: []u8,
     source: CredentialSource,
+    /// A consumed runtime descriptor is kept open at EOF for the session so
+    /// its stale environment number cannot be reused for another descriptor.
+    /// CLOEXEC prevents every later tool/process boundary from inheriting it.
+    spent_runtime_fd: ?pfs.Fd = null,
 
     pub fn deinit(self: *ResolvedCredential, allocator: std.mem.Allocator) void {
         secureFree(allocator, self.bearer_token);
+        if (self.spent_runtime_fd) |fd| _ = pfs.close(fd);
         self.* = undefined;
     }
 };
@@ -138,34 +133,41 @@ pub fn resolveCredential(
 
 /// Runtime-only credential boundary.
 ///
-/// The one-shot FD authority is consumed before App/tool threads exist. When
-/// that authority is present, any ambient METASK_API_KEY is also scrubbed so it
-/// cannot become an accidental second credential channel. Ordinary env-based
-/// sessions preserve their historical inheritance semantics because detached
-/// teammate processes still authenticate through the inherited environment.
-/// Production evaluation never uses that path: its parent supplies only the FD
-/// inside a minimal child environment.
+/// The one-shot FD authority is consumed before App/tool threads exist. An
+/// ambient METASK_API_KEY alongside it is rejected as ambiguous before App
+/// initialization; mutating libc's borrowed startup environment is forbidden.
+/// Ordinary env-based sessions preserve their historical inheritance semantics
+/// because detached teammate processes still authenticate through the inherited
+/// environment. Production evaluation never uses that path: its parent supplies
+/// only the FD inside a minimal child environment.
 pub fn resolveRuntimeCredential(
     allocator: std.mem.Allocator,
     cli_api_key: ?[]const u8,
     precedence: AuthPrecedence,
 ) !ResolvedCredential {
-    const fd_api_key = try takeRuntimeFdApiKey(allocator);
-    defer if (fd_api_key) |key| secureFree(allocator, key);
+    var fd_api_key = try takeRuntimeFdApiKey(allocator);
+    defer if (fd_api_key) |*runtime| runtime.deinit(allocator);
     if (cli_api_key != null and fd_api_key != null) return error.AmbiguousRuntimeCredentials;
+    // Never mutate libc's environment after Zig 0.16 has captured its startup
+    // pointer block: HTTPS lazily scans that borrowed block while loading the
+    // CA bundle, and unsetenv can otherwise turn it into a use-after-free.
+    // An ambient key alongside FD authority is rejected and the process exits,
+    // instead of trying to scrub the second channel in place.
+    if (fd_api_key != null and std.c.getenv(METASK_API_KEY_ENV) != null) {
+        return error.AmbiguousRuntimeCredentials;
+    }
 
     // An inherited FD is an explicit runtime authority, not another candidate
     // in the stored OAuth/API-key preference chain. In particular,
     // `oauth_first` must not silently discard the one-shot pilot credential.
-    var credential = if (fd_api_key) |key|
-        try credentialFromApiKey(allocator, key, .fd_api_key)
+    var credential = if (fd_api_key) |runtime|
+        try credentialFromApiKey(allocator, runtime.bytes, .fd_api_key)
     else
         try resolveCredential(allocator, cli_api_key, precedence);
     errdefer credential.deinit(allocator);
-    if (fd_api_key != null) {
-        if (!@import("platform").paths.unsetEnvChecked(METASK_API_KEY_ENV)) {
-            return error.CredentialEnvironmentScrubFailed;
-        }
+    if (fd_api_key) |*runtime| {
+        credential.spent_runtime_fd = runtime.fd;
+        runtime.fd = pfs.invalid_fd;
     }
     return credential;
 }
@@ -174,31 +176,29 @@ const MAX_RUNTIME_API_KEY_BYTES: usize = 16 * 1024;
 
 /// Consume a credential from an inherited descriptor without ever placing the
 /// secret in argv or the process's initial environment. The descriptor number
-/// itself arrives through RUNTIME_API_KEY_FD_ENV, is removed immediately, and
-/// the descriptor is closed before App/tool threads can start.
-fn takeRuntimeFdApiKey(allocator: std.mem.Allocator) !?[]u8 {
+/// itself arrives through RUNTIME_API_KEY_FD_ENV. Zig 0.16 borrows the initial
+/// POSIX environment block, so the variable is deliberately not removed in
+/// place. Instead the descriptor is drained, marked CLOEXEC, and held open at
+/// EOF until `ResolvedCredential.deinit`; the stale number carries no secret
+/// and cannot alias a later descriptor or cross an exec boundary.
+const RuntimeFdApiKey = struct {
+    bytes: []u8,
+    fd: pfs.Fd,
+
+    fn deinit(self: *RuntimeFdApiKey, allocator: std.mem.Allocator) void {
+        secureFree(allocator, self.bytes);
+        if (self.fd >= 0) _ = pfs.close(self.fd);
+        self.* = undefined;
+    }
+};
+
+fn takeRuntimeFdApiKey(allocator: std.mem.Allocator) !?RuntimeFdApiKey {
     const raw = std.c.getenv(RUNTIME_API_KEY_FD_ENV) orelse return null;
     const raw_fd = std.mem.span(raw);
-    // Parse before unset: getenv's slice points into environment-owned storage
-    // and becomes invalid as soon as unsetenv/_putenv_s mutates that storage.
-    const fd = std.fmt.parseInt(pfs.Fd, raw_fd, 10) catch {
-        if (!@import("platform").paths.unsetEnvChecked(RUNTIME_API_KEY_FD_ENV)) {
-            return error.CredentialEnvironmentScrubFailed;
-        }
-        return error.InvalidCredentialFd;
-    };
-    if (fd < 3) {
-        if (!@import("platform").paths.unsetEnvChecked(RUNTIME_API_KEY_FD_ENV)) {
-            return error.CredentialEnvironmentScrubFailed;
-        }
-        return error.InvalidCredentialFd;
-    }
-    // Once the descriptor number is known and safe to close, every subsequent
-    // failure path owns and closes it, including an environment-scrub failure.
-    defer pfs.close(fd);
-    if (!@import("platform").paths.unsetEnvChecked(RUNTIME_API_KEY_FD_ENV)) {
-        return error.CredentialEnvironmentScrubFailed;
-    }
+    const fd = std.fmt.parseInt(pfs.Fd, raw_fd, 10) catch return error.InvalidCredentialFd;
+    if (fd < 3) return error.InvalidCredentialFd;
+    errdefer _ = pfs.close(fd);
+    try pfs.makeCloseOnExec(fd);
 
     var bytes = std.ArrayList(u8).empty;
     errdefer {
@@ -218,7 +218,7 @@ fn takeRuntimeFdApiKey(allocator: std.mem.Allocator) !?[]u8 {
         try bytes.appendSlice(allocator, chunk[0..count]);
     }
     if (bytes.items.len == 0) return error.MissingCredentials;
-    return try bytes.toOwnedSlice(allocator);
+    return .{ .bytes = try bytes.toOwnedSlice(allocator), .fd = fd };
 }
 
 fn credentialFromApiKey(allocator: std.mem.Allocator, key_raw: []const u8, source: CredentialSource) !ResolvedCredential {

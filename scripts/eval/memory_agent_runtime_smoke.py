@@ -9,8 +9,11 @@ import hashlib
 import json
 import os
 import platform
+import signal
+import socket
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -236,6 +239,88 @@ def _run_fd_auth_seatbelt_smoke(root: Path, metacodes: Path) -> None:
         os.close(credential_read_fd)
 
 
+def _run_fd_auth_https_environment_regression(root: Path, metacodes: Path) -> None:
+    """HTTPS must fail normally after FD auth, never scan a freed env block."""
+
+    if platform.system() != "Darwin":
+        return
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    listener.settimeout(0.25)
+    listener_stop = threading.Event()
+
+    def close_connections() -> None:
+        while not listener_stop.is_set():
+            try:
+                connection, _address = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            connection.close()
+
+    listener_thread = threading.Thread(target=close_connections, daemon=True)
+    listener_thread.start()
+    credential_read_fd, credential_write_fd = os.pipe()
+    try:
+        secret = b"loopback-only-https-env-regression"
+        if os.write(credential_write_fd, secret) != len(secret):
+            raise RuntimeError("HTTPS environment regression wrote a partial credential")
+        os.close(credential_write_fd)
+        credential_write_fd = -1
+        env = {
+            "PATH": PRODUCTION_CHILD_PATH,
+            "HOME": str(root),
+            "TMPDIR": str(root),
+            "TMP": str(root),
+            "TEMP": str(root),
+            "LC_ALL": "C",
+            "LANG": "C",
+            "METACODES_API_KEY_FD": str(credential_read_fd),
+            "METACODES_NO_PROBE": "1",
+            "METACODES_PROVIDER": "anthropic",
+        }
+        completed = subprocess.run(
+            [
+                str(metacodes),
+                "--base-url",
+                f"https://127.0.0.1:{listener.getsockname()[1]}/v1/messages",
+                "--model",
+                "glm-5.2",
+                "--permission",
+                "bypassPermissions",
+                "--no-theme",
+                "--max-tokens",
+                "16",
+                "-p",
+                "offline HTTPS environment regression",
+                "--json",
+            ],
+            cwd=root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=20,
+            check=False,
+            pass_fds=(credential_read_fd,),
+        )
+        if completed.returncode in {-signal.SIGSEGV, 128 + signal.SIGSEGV}:
+            raise RuntimeError("FD auth HTTPS path crashed while scanning the startup environment")
+        if completed.returncode == 0:
+            raise RuntimeError("closed loopback HTTPS endpoint unexpectedly succeeded")
+        if secret.decode("ascii") in completed.stdout or secret.decode("ascii") in completed.stderr:
+            raise RuntimeError("HTTPS environment regression leaked its credential")
+    finally:
+        if credential_write_fd >= 0:
+            os.close(credential_write_fd)
+        os.close(credential_read_fd)
+        listener_stop.set()
+        listener.close()
+        listener_thread.join(timeout=5)
+
+
 def _run_adapter(
     root: Path,
     label: str,
@@ -373,6 +458,7 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["TINYKG_REMOTE_CONFIG"] = str(remote_config)
         os.environ["TINYKG_STORE"] = str(remote_store)
         try:
+            _run_fd_auth_https_environment_regression(root, metacodes)
             _run_fd_auth_seatbelt_smoke(root, metacodes)
             raw_hotpot = root / "hotpot-upstream.json"
             raw_hotpot.write_text(stable_json([_hotpot_record()]) + "\n", encoding="utf-8")
