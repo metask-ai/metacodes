@@ -671,6 +671,253 @@
           ]
         }
       ]
+    },
+    {
+      "id": "lifecycle-state-propagation",
+      "intent_template": "Add lifecycle state `{name}` for {purpose}. Propagate it through the state registry, stable wire map, terminal classification, docs, and contract using wire spelling `{wire}` and terminal flag `{terminal}`.",
+      "procedure_evidence_id": "procedure:lifecycle-state-propagation:v1",
+      "cases": [
+        {
+          "id": "paused",
+          "split": "online",
+          "bindings": {
+            "name": "paused",
+            "purpose": "temporarily suspending work while preserving resumability",
+            "terminal": "false",
+            "wire": "PAUSED"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/lifecycle.md",
+                "content": "# Lifecycle states\n\n- `OPEN`: accepted but not started.\n- `RUNNING`: actively executing.\n"
+              },
+              {
+                "path": "src/lifecycle.py",
+                "content": "STATES = [\"open\", \"running\"]\nWIRE = {\"open\": \"OPEN\", \"running\": \"RUNNING\"}\nTERMINAL = {\"open\": False, \"running\": False}\n"
+              },
+              {
+                "path": "tests/lifecycle.json",
+                "content": "{\"states\":[{\"name\":\"open\",\"wire\":\"OPEN\",\"terminal\":false},{\"name\":\"running\",\"wire\":\"RUNNING\",\"terminal\":false}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/lifecycle.md",
+              "src/lifecycle.py",
+              "tests/lifecycle.json"
+            ],
+            "required_changed_paths": [
+              "docs/lifecycle.md",
+              "src/lifecycle.py",
+              "tests/lifecycle.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/lifecycle.py",
+                "value": "STATES = [\"open\", \"running\", \"paused\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/lifecycle.py",
+                "value": "\"paused\": \"PAUSED\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/lifecycle.py",
+                "value": "\"paused\": False"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/lifecycle.md",
+                "value": "`PAUSED`: temporarily suspending work while preserving resumability."
+              },
+              {
+                "kind": "equals",
+                "path": "tests/lifecycle.json",
+                "value": "{\"states\":[{\"name\":\"open\",\"wire\":\"OPEN\",\"terminal\":false},{\"name\":\"running\",\"wire\":\"RUNNING\",\"terminal\":false},{\"name\":\"paused\",\"wire\":\"PAUSED\",\"terminal\":false}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/lifecycle.md",
+              "content": "# Lifecycle states\n\n- `OPEN`: accepted but not started.\n- `RUNNING`: actively executing.\n- `PAUSED`: temporarily suspending work while preserving resumability.\n"
+            },
+            {
+              "path": "src/lifecycle.py",
+              "content": "STATES = [\"open\", \"running\", \"paused\"]\nWIRE = {\"open\": \"OPEN\", \"running\": \"RUNNING\", \"paused\": \"PAUSED\"}\nTERMINAL = {\"open\": False, \"running\": False, \"paused\": False}\n"
+            },
+            {
+              "path": "tests/lifecycle.json",
+              "content": "{\"states\":[{\"name\":\"open\",\"wire\":\"OPEN\",\"terminal\":false},{\"name\":\"running\",\"wire\":\"RUNNING\",\"terminal\":false},{\"name\":\"paused\",\"wire\":\"PAUSED\",\"terminal\":false}]}\n"
+            }
+          ]
+        },
+        {
+          "id": "cancelled",
+          "split": "offline",
+          "bindings": {
+            "name": "cancelled",
+            "purpose": "ending work after an explicit cancellation request",
+            "terminal": "true",
+            "wire": "CANCELLED"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/lifecycle.md",
+                "content": "# Lifecycle states\n\n- `OPEN`: accepted but not started.\n- `RUNNING`: actively executing.\n"
+              },
+              {
+                "path": "src/lifecycle.py",
+                "content": "STATES = [\"open\", \"running\"]\nWIRE = {\"open\": \"OPEN\", \"running\": \"RUNNING\"}\nTERMINAL = {\"open\": False, \"running\": False}\n"
+              },
+              {
+                "path": "tests/lifecycle.json",
+                "content": "{\"states\":[{\"name\":\"open\",\"wire\":\"OPEN\",\"terminal\":false},{\"name\":\"running\",\"wire\":\"RUNNING\",\"terminal\":false}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/lifecycle.md",
+              "src/lifecycle.py",
+              "tests/lifecycle.json"
+            ],
+            "required_changed_paths": [
+              "docs/lifecycle.md",
+              "src/lifecycle.py",
+              "tests/lifecycle.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/lifecycle.py",
+                "value": "STATES = [\"open\", \"running\", \"cancelled\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/lifecycle.py",
+                "value": "\"cancelled\": \"CANCELLED\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/lifecycle.py",
+                "value": "\"cancelled\": True"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/lifecycle.md",
+                "value": "`CANCELLED`: ending work after an explicit cancellation request."
+              },
+              {
+                "kind": "equals",
+                "path": "tests/lifecycle.json",
+                "value": "{\"states\":[{\"name\":\"open\",\"wire\":\"OPEN\",\"terminal\":false},{\"name\":\"running\",\"wire\":\"RUNNING\",\"terminal\":false},{\"name\":\"cancelled\",\"wire\":\"CANCELLED\",\"terminal\":true}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/lifecycle.md",
+              "content": "# Lifecycle states\n\n- `OPEN`: accepted but not started.\n- `RUNNING`: actively executing.\n- `CANCELLED`: ending work after an explicit cancellation request.\n"
+            },
+            {
+              "path": "src/lifecycle.py",
+              "content": "STATES = [\"open\", \"running\", \"cancelled\"]\nWIRE = {\"open\": \"OPEN\", \"running\": \"RUNNING\", \"cancelled\": \"CANCELLED\"}\nTERMINAL = {\"open\": False, \"running\": False, \"cancelled\": True}\n"
+            },
+            {
+              "path": "tests/lifecycle.json",
+              "content": "{\"states\":[{\"name\":\"open\",\"wire\":\"OPEN\",\"terminal\":false},{\"name\":\"running\",\"wire\":\"RUNNING\",\"terminal\":false},{\"name\":\"cancelled\",\"wire\":\"CANCELLED\",\"terminal\":true}]}\n"
+            }
+          ]
+        },
+        {
+          "id": "draining",
+          "split": "offline",
+          "bindings": {
+            "name": "draining",
+            "purpose": "finishing accepted work while refusing new work",
+            "terminal": "false",
+            "wire": "DRAINING"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/lifecycle.md",
+                "content": "# Lifecycle states\n\n- `OPEN`: accepted but not started.\n- `RUNNING`: actively executing.\n"
+              },
+              {
+                "path": "src/lifecycle.py",
+                "content": "STATES = [\"open\", \"running\"]\nWIRE = {\"open\": \"OPEN\", \"running\": \"RUNNING\"}\nTERMINAL = {\"open\": False, \"running\": False}\n"
+              },
+              {
+                "path": "tests/lifecycle.json",
+                "content": "{\"states\":[{\"name\":\"open\",\"wire\":\"OPEN\",\"terminal\":false},{\"name\":\"running\",\"wire\":\"RUNNING\",\"terminal\":false}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/lifecycle.md",
+              "src/lifecycle.py",
+              "tests/lifecycle.json"
+            ],
+            "required_changed_paths": [
+              "docs/lifecycle.md",
+              "src/lifecycle.py",
+              "tests/lifecycle.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/lifecycle.py",
+                "value": "STATES = [\"open\", \"running\", \"draining\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/lifecycle.py",
+                "value": "\"draining\": \"DRAINING\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/lifecycle.py",
+                "value": "\"draining\": False"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/lifecycle.md",
+                "value": "`DRAINING`: finishing accepted work while refusing new work."
+              },
+              {
+                "kind": "equals",
+                "path": "tests/lifecycle.json",
+                "value": "{\"states\":[{\"name\":\"open\",\"wire\":\"OPEN\",\"terminal\":false},{\"name\":\"running\",\"wire\":\"RUNNING\",\"terminal\":false},{\"name\":\"draining\",\"wire\":\"DRAINING\",\"terminal\":false}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/lifecycle.md",
+              "content": "# Lifecycle states\n\n- `OPEN`: accepted but not started.\n- `RUNNING`: actively executing.\n- `DRAINING`: finishing accepted work while refusing new work.\n"
+            },
+            {
+              "path": "src/lifecycle.py",
+              "content": "STATES = [\"open\", \"running\", \"draining\"]\nWIRE = {\"open\": \"OPEN\", \"running\": \"RUNNING\", \"draining\": \"DRAINING\"}\nTERMINAL = {\"open\": False, \"running\": False, \"draining\": False}\n"
+            },
+            {
+              "path": "tests/lifecycle.json",
+              "content": "{\"states\":[{\"name\":\"open\",\"wire\":\"OPEN\",\"terminal\":false},{\"name\":\"running\",\"wire\":\"RUNNING\",\"terminal\":false},{\"name\":\"draining\",\"wire\":\"DRAINING\",\"terminal\":false}]}\n"
+            }
+          ]
+        }
+      ]
     }
   ]
 }

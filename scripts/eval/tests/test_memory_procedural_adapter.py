@@ -41,7 +41,7 @@ class ProceduralMemoryAdapterTest(unittest.TestCase):
         path.write_text(stable_json(value) + "\n", encoding="utf-8")
         return path, hashlib.sha256(path.read_bytes()).hexdigest()
 
-    def adapt_value(self, root: Path, value: dict, *, limit_families=3):
+    def adapt_value(self, root: Path, value: dict, *, limit_families=4):
         source, source_sha = self.write_source(root, value)
         return adapt_procedural(
             source,
@@ -237,8 +237,8 @@ class ProceduralMemoryAdapterTest(unittest.TestCase):
                 limit_families=2,
                 split_seed=20260806,
             )
-        with self.assertRaisesRegex(ValidationError, "requested 4 families"):
-            select_families(load_fixture()["families"], limit_families=4, split_seed=1)
+        with self.assertRaisesRegex(ValidationError, "requested 5 families"):
+            select_families(load_fixture()["families"], limit_families=5, split_seed=1)
 
     def test_cli_writes_three_distinct_artifacts_and_rejects_overlap(self):
         fixture_sha = hashlib.sha256(FIXTURE.read_bytes()).hexdigest()
