@@ -1103,6 +1103,9 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
     def test_checked_in_pilot_v12_binds_real_tinykg_read_probe(self):
         pilot = ROOT / "evals/memory/pilots/procedural-glm52-v12"
         contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
+        attempt = json.loads(
+            (pilot / "attempt-001-observation.json").read_text(encoding="utf-8")
+        )
         manifest = load_manifest(pilot / "manifest.json")
         execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
 
@@ -1137,6 +1140,35 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         self.assertEqual(
             contract["budget_authority"]["prior_conservative_metered_tokens"],
             4729364,
+        )
+        self.assertEqual(attempt["outcome"]["status"], "halted")
+        self.assertFalse(attempt["outcome"]["quality_evidence"])
+        self.assertFalse(attempt["outcome"]["canonical_runtime_receipt_published"])
+        self.assertEqual(attempt["outcome"]["committed_rollout_transactions"], 0)
+        self.assertEqual(attempt["budget_journal"]["uncertain_authorized_transactions"], 1)
+        self.assertEqual(
+            attempt["failure"]["classification"],
+            "request-authorized-invalid-api-key",
+        )
+        self.assertEqual(attempt["provider_evidence"]["provider_http_status"], 401)
+        self.assertEqual(
+            attempt["provider_evidence"]["provider_error_code"], "INVALID_API_KEY"
+        )
+        self.assertEqual(attempt["provider_evidence"]["http_requests"], 1)
+        self.assertEqual(attempt["provider_evidence"]["turns"], 0)
+        self.assertEqual(attempt["provider_evidence"]["tool_calls"], 0)
+        self.assertFalse(attempt["provider_evidence"]["credential_present_in_artifacts"])
+        self.assertEqual(attempt["unsettled_transaction"]["state"], "request_authorized")
+        self.assertTrue(attempt["outcome"]["automatic_retry_forbidden"])
+        self.assertAlmostEqual(
+            attempt["program_authority"]["conservative_cost_usd_after_attempt"],
+            contract["budget_authority"]["prior_conservative_cost_usd"]
+            + attempt["unsettled_transaction"]["max_cost_usd"],
+        )
+        self.assertEqual(
+            attempt["program_authority"]["conservative_metered_tokens_after_attempt"],
+            contract["budget_authority"]["prior_conservative_metered_tokens"]
+            + attempt["unsettled_transaction"]["max_metered_tokens"],
         )
         self.assertTrue(contract["current_phase"]["paid_rollouts_authorized"])
         self.assertFalse(contract["current_phase"]["quality_evidence"])
