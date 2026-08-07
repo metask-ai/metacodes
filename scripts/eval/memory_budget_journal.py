@@ -715,13 +715,20 @@ class BudgetJournal:
             if identity[key] != authority[key]:
                 _fail("budget transaction identity", f"{key} does not match journal authority")
         identity_sha = _canonical_sha256(identity)
-        existing = [
+        existing_run = [
             item
             for item in self._state["transactions"].values()
-            if item["identity_sha256"] == identity_sha and item["state"] != "aborted_pre_request"
+            if item["identity"]["run_id"] == identity["run_id"]
+            and item["state"] != "aborted_pre_request"
         ]
-        if existing:
-            current = existing[-1]
+        if existing_run:
+            current = existing_run[-1]
+            if current["identity_sha256"] != identity_sha:
+                _fail(
+                    "budget transaction",
+                    "run id is already bound to a different transaction identity; "
+                    "use a new explicit run identity instead of retrying",
+                )
             if current["state"] == "reserved":
                 return self.transaction_receipt(current["transaction_id"])
             if current["state"] == "request_authorized":

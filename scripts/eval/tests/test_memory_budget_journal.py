@@ -126,6 +126,29 @@ class MemoryBudgetJournalTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValidationError, "cannot be aborted"):
                     journal.abort_pre_request(authorized["transaction_id"])
 
+    def test_authorized_run_id_cannot_be_reauthorized_by_harness_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pilot-budget.json"
+            original = self.transaction("stable-run")
+            drifted = BudgetTransaction(
+                run_id=original.run_id,
+                manifest_sha256=original.manifest_sha256,
+                model_fingerprint=original.model_fingerprint,
+                harness_fingerprint=digest("changed-harness"),
+                provider_identity=original.provider_identity,
+                max_cost_microusd=original.max_cost_microusd,
+                max_metered_tokens=original.max_metered_tokens,
+            )
+            with BudgetJournal(path, self.authority()) as journal:
+                self.authorize(journal, original)
+                before = journal.snapshot()
+                with self.assertRaisesRegex(
+                    ValidationError,
+                    "run id is already bound.*new explicit run identity",
+                ):
+                    journal.reserve(drifted)
+                self.assertEqual(journal.snapshot(), before)
+
     def test_exposure_limit_is_checked_before_persist(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pilot-budget.json"
