@@ -368,6 +368,12 @@ def _replay_document(document: Mapping[str, Any]) -> Mapping[str, Any]:
         if action == "reserved":
             if current is not None:
                 _fail(where, "transaction was reserved more than once")
+            if any(
+                transaction["identity"]["run_id"] == identity["run_id"]
+                and transaction["state"] != "aborted_pre_request"
+                for transaction in transactions.values()
+            ):
+                _fail(where, "run id already has a non-aborted transaction")
             expected_transaction_id = _canonical_sha256(
                 {
                     "journal_id": expected_journal_id,

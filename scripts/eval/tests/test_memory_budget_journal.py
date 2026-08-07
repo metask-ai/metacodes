@@ -11,6 +11,7 @@ from scripts.eval.memory_budget_journal import (
     BudgetAuthority,
     BudgetJournal,
     BudgetTransaction,
+    _canonical_sha256,
     usd_to_microusd,
     usd_to_microusd_ceiling,
     validate_checkpoint_payload,
@@ -147,6 +148,26 @@ class MemoryBudgetJournalTest(unittest.TestCase):
                     "run id is already bound.*new explicit run identity",
                 ):
                     journal.reserve(drifted)
+                self.assertEqual(journal.snapshot(), before)
+
+                identity = drifted.record()
+                reservation_revision = before["revision"] + 1
+                transaction_id = _canonical_sha256(
+                    {
+                        "journal_id": before["journal_id"],
+                        "reservation_revision": reservation_revision,
+                        "identity": identity,
+                    }
+                )
+                with self.assertRaisesRegex(
+                    ValidationError,
+                    "run id already has a non-aborted transaction",
+                ):
+                    journal._append(
+                        action="reserved",
+                        transaction_id=transaction_id,
+                        identity=identity,
+                    )
                 self.assertEqual(journal.snapshot(), before)
 
     def test_exposure_limit_is_checked_before_persist(self):
