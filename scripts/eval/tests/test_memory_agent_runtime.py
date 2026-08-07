@@ -935,6 +935,9 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
     def test_checked_in_pilot_v10_uses_new_fixture_and_read_only_adapter(self):
         pilot = ROOT / "evals/memory/pilots/procedural-glm52-v10"
         contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
+        attempt = json.loads(
+            (pilot / "attempt-001-observation.json").read_text(encoding="utf-8")
+        )
         source = json.loads((pilot / "source.json").read_text(encoding="utf-8"))
         manifest = load_manifest(pilot / "manifest.json")
         execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
@@ -993,6 +996,20 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         )
         self.assertTrue(contract["current_phase"]["paid_rollouts_authorized"])
         self.assertFalse(contract["current_phase"]["quality_evidence"])
+        self.assertEqual(attempt["outcome"]["status"], "halted")
+        self.assertEqual(attempt["outcome"]["committed_rollout_transactions"], 4)
+        self.assertEqual(attempt["budget_journal"]["uncertain_authorized_transactions"], 0)
+        self.assertEqual(
+            attempt["failure"]["classification"],
+            "offline-markdown-no-op-write-misclassified",
+        )
+        self.assertTrue(attempt["memory_safety"]["seatbelt_read_only_roots_enforced"])
+        self.assertEqual(
+            attempt["memory_safety"]["markdown_revision_before"],
+            attempt["memory_safety"]["markdown_revision_after"],
+        )
+        self.assertEqual(attempt["memory_safety"]["activity_after_fix_markdown_writes"], 0)
+        self.assertFalse(attempt["outcome"]["quality_evidence"])
         ProductionRuntimeConfig(
             api_key="test-only",
             allow_paid_rollouts=True,
@@ -1522,6 +1539,18 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                                 "name": "WebSearch",
                                 "input": {"query": "must not execute"},
                             },
+                            {
+                                "type": "tool_use",
+                                "id": "memory-write-error",
+                                "name": "Edit",
+                                "input": {"file_path": str(memory / "MEMORY.md")},
+                            },
+                            {
+                                "type": "tool_use",
+                                "id": "memory-write-success",
+                                "name": "Write",
+                                "input": {"file_path": str(memory / "procedure.md")},
+                            },
                         ],
                     },
                     {
@@ -1554,6 +1583,17 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                                 "content": "denied",
                                 "is_error": True,
                             },
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "memory-write-error",
+                                "content": "no-op edit",
+                                "is_error": True,
+                            },
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "memory-write-success",
+                                "content": "persisted",
+                            },
                         ],
                     },
                 ]
@@ -1585,6 +1625,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 memory_root=memory,
             )
             self.assertEqual(activity["markdown_reads"], 2)
+            self.assertEqual(activity["markdown_writes"], 1)
             self.assertEqual(activity["tinykg_reads"], 1)
             self.assertEqual(activity["forbidden_provider_tool_attempts"], 1)
 

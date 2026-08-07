@@ -434,7 +434,7 @@ def _cassette_memory_activity(
         _fail(where, "provider cassette has no request artifacts")
     request_numbers: List[int] = []
     tool_defs: Dict[str, Tuple[str, str]] = {}
-    tool_results: set[str] = set()
+    tool_results: Dict[str, Tuple[bool, str]] = {}
     for request_path in request_paths:
         match = re.fullmatch(r"req-([0-9]+)\.json", request_path.name)
         if match is None:
@@ -470,7 +470,14 @@ def _cassette_memory_activity(
                 elif item_type == "tool_result":
                     tool_id = item.get("tool_use_id")
                     if isinstance(tool_id, str) and tool_id:
-                        tool_results.add(tool_id)
+                        is_error = item.get("is_error", False)
+                        if not isinstance(is_error, bool):
+                            _fail(where, f"tool_result {tool_id!r} has non-boolean is_error")
+                        signature = (is_error, stable_json(item.get("content")))
+                        prior = tool_results.get(tool_id)
+                        if prior is not None and prior != signature:
+                            _fail(where, f"tool result {tool_id!r} changed semantics across requests")
+                        tool_results[tool_id] = signature
     if request_numbers != list(range(1, len(request_paths) + 1)):
         _fail(where, "provider request sequence is not contiguous from one")
 
@@ -502,13 +509,14 @@ def _cassette_memory_activity(
             _fail(where, f"memory tool {tool_id!r} has no observable result")
         if tool_id not in tool_results:
             continue
+        result_is_error = tool_results[tool_id][0]
         if name in {"KgRecall", "KgContext"}:
             counts["tinykg_reads"] += 1
-        elif name == "KgRemember":
+        elif name == "KgRemember" and not result_is_error:
             counts["tinykg_writes"] += 1
         if markdown_read:
             counts["markdown_reads"] += 1
-        elif markdown_write:
+        elif markdown_write and not result_is_error:
             counts["markdown_writes"] += 1
     return counts
 
