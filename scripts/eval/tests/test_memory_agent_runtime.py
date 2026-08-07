@@ -932,6 +932,79 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
         ).validate(len(rows))
 
+    def test_checked_in_pilot_v10_uses_new_fixture_and_read_only_adapter(self):
+        pilot = ROOT / "evals/memory/pilots/procedural-glm52-v10"
+        contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
+        source = json.loads((pilot / "source.json").read_text(encoding="utf-8"))
+        manifest = load_manifest(pilot / "manifest.json")
+        execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
+
+        for name, identity in contract["artifacts"].items():
+            payload = (pilot / name).read_bytes()
+            self.assertEqual(len(payload), identity["bytes"])
+            self.assertEqual(hashlib.sha256(payload).hexdigest(), identity["sha256"])
+        fixture = ROOT / contract["generation"]["source_path"]
+        self.assertEqual(
+            hashlib.sha256(fixture.read_bytes()).hexdigest(),
+            contract["generation"]["expected_upstream_sha256"],
+        )
+        self.assertEqual(
+            [family["id"] for family in source["families"]],
+            ["audit-receipt-transfer"],
+        )
+        self.assertEqual(
+            source["adapter_revision"],
+            "workspace-validator-family-v2-offline-read-only",
+        )
+        public_source = stable_json(source)
+        self.assertIn("Reuse the previously established family audit receipt protocol", public_source)
+        self.assertIn("persistent memory, if available, is read-only", public_source)
+        self.assertNotIn("AUDIT_BUDGET_COMMIT_V2", public_source)
+        self.assertNotIn("AUDIT_MEMORY_MIGRATE_V2", public_source)
+        self.assertEqual(manifest["execution"], execution)
+        self.assertEqual(contract["harness"]["revision"], execution["harness_revision"])
+        rows = [
+            [item["sequence"], item["case_id"], item["trial"], item["arm"]]
+            for item in manifest["schedule"]
+        ]
+        self.assertEqual(rows, contract["schedule"]["ordered_rows"])
+        ordered_tsv = "".join("\t".join(str(value) for value in row) + "\n" for row in rows)
+        self.assertEqual(
+            hashlib.sha256(ordered_tsv.encode("utf-8")).hexdigest(),
+            contract["schedule"]["ordered_tsv_sha256"],
+        )
+        self.assertEqual(contract["protocol"]["production_receipt_schema_version"], 8)
+        self.assertIn(
+            "Seatbelt probe v2",
+            contract["paid_execution_requirements"]["offline_memory_immutability"],
+        )
+        budget = contract["budget_authority"]
+        self.assertGreaterEqual(
+            budget["max_total_metered_tokens"],
+            len(rows) * budget["max_rollout_metered_tokens"],
+        )
+        self.assertGreater(
+            budget["max_total_cost_usd"],
+            len(rows) * budget["max_rollout_cost_usd"],
+        )
+        self.assertLessEqual(
+            budget["prior_conservative_cost_usd"] + budget["max_total_cost_usd"],
+            budget["user_authorization_max_cost_usd"],
+        )
+        self.assertTrue(contract["current_phase"]["paid_rollouts_authorized"])
+        self.assertFalse(contract["current_phase"]["quality_evidence"])
+        ProductionRuntimeConfig(
+            api_key="test-only",
+            allow_paid_rollouts=True,
+            max_total_cost_usd=budget["max_total_cost_usd"],
+            max_total_metered_tokens=budget["max_total_metered_tokens"],
+            max_rollout_cost_usd=budget["max_rollout_cost_usd"],
+            max_rollout_metered_tokens=budget["max_rollout_metered_tokens"],
+            max_output_tokens=budget["max_output_tokens"],
+            ripgrep_binary=TEST_RIPGREP,
+            ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
+        ).validate(len(rows))
+
     def _materialize_valid_production_events(self, root, rollout, grader_fingerprint):
         cassette = root / rollout["artifact_paths"]["cassette"]
         uses = {}

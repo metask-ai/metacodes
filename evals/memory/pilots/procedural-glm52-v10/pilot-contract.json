@@ -1,0 +1,170 @@
+{
+  "schema_version": 1,
+  "pilot_id": "procedural-glm52-v10",
+  "artifacts": {
+    "execution.json": {
+      "bytes": 706,
+      "sha256": "3792fd5ee64167b0d27756539ead1940ede0b85b4811a4e2f310c773a72c0702"
+    },
+    "manifest.json": {
+      "bytes": 4106,
+      "sha256": "4d8da320a6245848a57262efb946d873cebe94306f822df1366931ca77fb51c5"
+    },
+    "source.json": {
+      "bytes": 5758,
+      "sha256": "4aa52c8204366566c5d7aaabe397b5cdb0b5d09e2c6fc0606f64e31c8c23ce04"
+    },
+    "validators.json": {
+      "bytes": 4434,
+      "sha256": "97ec600ba3aeedbf3aa2b228f98f6f1974ae8f189649ed5ca85bc68953773180"
+    }
+  },
+  "budget_authority": {
+    "max_output_tokens": 4096,
+    "max_rollout_cost_usd": 1.5,
+    "max_rollout_metered_tokens": 600000,
+    "max_total_cost_usd": 14.0,
+    "max_total_metered_tokens": 5500000,
+    "prior_conservative_cost_usd": 5.7920468,
+    "prior_conservative_metered_tokens": 3670041,
+    "user_authorization_max_cost_usd": 1000.0
+  },
+  "current_phase": {
+    "paid_rollouts_authorized": true,
+    "quality_evidence": false,
+    "scope": "authorized-new-fixture-pilot-with-offline-read-only-seatbelt-probe-v2"
+  },
+  "generation": {
+    "adapter": "adapt-procedural-memory",
+    "expected_upstream_sha256": "976dae5b97950c0c08b6970ce7448086d6acc181ed67f1ca8507a6a393499ce8",
+    "family_id": "audit-receipt-transfer",
+    "limit_families": 1,
+    "source_path": "evals/memory/fixtures/procedural-coding-source-v2.json",
+    "split_seed": 2026080812
+  },
+  "harness": {
+    "binary_sha256": "32c0d1d103ad84c396e966dbb93c88b32c8a6464c6ebfc029d9739488e646c22",
+    "git_commit": "55775cb56effec2eaae265b32d8ace1335a88af6",
+    "revision": "metacodes-memory-production-pilot-v15-55775cb"
+  },
+  "model": {
+    "fingerprint": "e5cc883082b2a25721ee8b861c5e0cca37b6bdd93648d6883d6c8c54a34bf650",
+    "id": "glm-5.2"
+  },
+  "predecessor_attempts": [
+    {
+      "committed_cost_usd": 0.19427,
+      "committed_metered_tokens": 220721,
+      "completed_rollout_transactions": 4,
+      "pilot_id": "procedural-glm52-v9",
+      "quality_evidence": false,
+      "status": "halted"
+    }
+  ],
+  "predecessor_uncertain_requests": [
+    {
+      "automatic_retry_forbidden": true,
+      "classification": "request-authorized-child-crash-conservative-exposure",
+      "manifest_id": "coding-intent-families-2026080802-1",
+      "maximum_cost_usd": 0.85,
+      "maximum_metered_tokens": 280000,
+      "state": "request_authorized",
+      "transaction_id": "27da31d17143929fba09e07328a178c5cfc09e35708c7d1c781a1f15dc438a0d"
+    },
+    {
+      "automatic_retry_forbidden": true,
+      "classification": "request-authorized-child-crash-conservative-exposure",
+      "manifest_id": "coding-intent-families-2026080803-1",
+      "maximum_cost_usd": 0.85,
+      "maximum_metered_tokens": 280000,
+      "state": "request_authorized",
+      "transaction_id": "b5a9a0c309f62b92f97e4241cffcfa9f14b05917beb9ccc5d8c1f116c4035830"
+    },
+    {
+      "automatic_retry_forbidden": true,
+      "classification": "request-authorized-toolchain-drift-conservative-exposure",
+      "manifest_id": "coding-intent-families-2026080810-1",
+      "maximum_cost_usd": 1.5,
+      "maximum_metered_tokens": 600000,
+      "state": "request_authorized",
+      "transaction_id": "ee403d91d4be42294b54ba7f45ba2dde1ced3a6b622c691e6f84b21b75fd22bd"
+    }
+  ],
+  "protocol": {
+    "arms": [
+      {
+        "fingerprint": "1d70eb700887237a6b751c4d80d777d04d2d59710b7cac76d882920583033c96",
+        "id": "no_memory",
+        "treatment": "external memory, host recall, consolidation, and TinyKG retrieval disabled"
+      },
+      {
+        "fingerprint": "5879e7949fd4690eda7ba2aa9445c1b8f4895bc832ce21da370496b4acedf585",
+        "fingerprint_basis": "sha256:markdown-memory-host-episode-consolidation-v1",
+        "id": "markdown_memory",
+        "treatment": "host-observed online execution episode consolidated to durable Markdown, then exposed read-only offline"
+      },
+      {
+        "fingerprint": "1b7c69db0fa9a1ca6dc0a4061428d6d11816c3d9e2145fda6aa5a950ffa80d5b",
+        "fingerprint_basis": "sha256:tinykg-lexical-host-recall-episode-consolidation-v1",
+        "id": "tinykg_lexical",
+        "treatment": "host-observed episode imported into isolated TinyKG, derived lexical catalog published, automatic scoped recall performed, and bounded graph evidence exposed"
+      }
+    ],
+    "deterministic_workspace_validator": true,
+    "family_id": "audit-receipt-transfer",
+    "observation_schema_version": 2,
+    "offline_cases": 2,
+    "online_cases": 1,
+    "production_receipt_schema_version": 8,
+    "rollouts": 9,
+    "trials": 1
+  },
+  "paid_execution_requirements": {
+    "budget_journal": "single-machine locked crash-conservative journal outside the fresh run directory",
+    "credential_transport": "private 0600 auth file to anonymous one-shot inherited file descriptor",
+    "filesystem_isolation": "re-observe the macOS Seatbelt production profile and bound negative probes before provider access",
+    "local_tinykg": "the TinyKG treatment uses a fresh isolated local store; no benchmark arm uses the remote harness",
+    "offline_memory_immutability": "before credential exposure, Seatbelt probe v2 must prove every offline Markdown and TinyKG root readable but not writable, creatable, chmod-able, or rename-able",
+    "remote_tinykg": "forbidden for benchmark corpus, trace, and store; refined verification only",
+    "single_provider_attempt": true,
+    "toolchain_snapshot": "ripgrep is copied to the canonical run-owned 0500 snapshot before provider access; rollout copies derive from that snapshot"
+  },
+  "schedule": {
+    "ordered_rows": [
+      [0, "coding:audit-receipt-transfer:evidence-snapshot", 0, "no_memory"],
+      [1, "coding:audit-receipt-transfer:evidence-snapshot", 0, "markdown_memory"],
+      [2, "coding:audit-receipt-transfer:evidence-snapshot", 0, "tinykg_lexical"],
+      [3, "coding:audit-receipt-transfer:budget-commit", 0, "markdown_memory"],
+      [4, "coding:audit-receipt-transfer:budget-commit", 0, "tinykg_lexical"],
+      [5, "coding:audit-receipt-transfer:budget-commit", 0, "no_memory"],
+      [6, "coding:audit-receipt-transfer:memory-migrate", 0, "tinykg_lexical"],
+      [7, "coding:audit-receipt-transfer:memory-migrate", 0, "no_memory"],
+      [8, "coding:audit-receipt-transfer:memory-migrate", 0, "markdown_memory"]
+    ],
+    "ordered_tsv_sha256": "f4479a8fb2c1a2b0da9935d2954fa5907e71f93d6acbf2fafc3e82404734e6e8"
+  },
+  "tinykg_runtime": {
+    "binary_sha256": "66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee",
+    "build_profile": "metacodes-vendored-ReleaseSafe-stripped",
+    "online_consolidation_commands": [
+      "import-md-doc",
+      "add-edge",
+      "neighbors",
+      "rebuild-text",
+      "store-info"
+    ],
+    "preflight_commands": [
+      "init",
+      "apply",
+      "store-info"
+    ],
+    "schema_version": 3,
+    "source_commit": "93d89bcd4d0208c994da3632fb6166efffcc86e7",
+    "storage_format_version": 2
+  },
+  "toolchain": {
+    "ripgrep_sha256": "882ee4837235e252ce5ffecc3c1707f6d5b7db0054b7922301b5dc0f466a0fed",
+    "ripgrep_version": "15.2.0",
+    "snapshot_path": "production-toolchain/.metacodes/toolchain/rg"
+  }
+}
