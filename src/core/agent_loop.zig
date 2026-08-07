@@ -623,6 +623,11 @@ pub fn run(
     // 零增益重复熔断(主防线),持有整个 run。
     var zero_gain = ZeroGainTracker.init(allocator);
     defer zero_gain.deinit();
+    // Governed lexical recall is run-scoped: the model proposes aliases and
+    // variants, while this bounded host ledger remembers only node ids that
+    // were actually returned. It is shared by every turn/tool context in this
+    // run and never persisted into the canonical TinyKG store.
+    var kg_lexical_ledger = @import("../kg/lexical_query_plan.zig").Ledger{};
     // A breaker is a controlled soft stop, not permission to throw away the
     // work already completed. After the triggering tool_result turn, allow one
     // extra provider request with no advertised tools so the model can turn the
@@ -845,6 +850,7 @@ pub fn run(
             .plan_prev_mode = opts.plan_prev_mode,
             .tasks = opts.tasks,
             .kg = opts.kg,
+            .kg_lexical_ledger = &kg_lexical_ledger,
             .kg_projects_dir = opts.kg_projects_dir,
             .memdir_abs = opts.memdir_abs,
             .api_client = opts.api_client,
@@ -1370,6 +1376,7 @@ pub fn run(
             .plan_prev_mode = opts.plan_prev_mode,
             .tasks = opts.tasks,
             .kg = opts.kg,
+            .kg_lexical_ledger = &kg_lexical_ledger,
             .kg_projects_dir = opts.kg_projects_dir,
             .memdir_abs = opts.memdir_abs,
             .api_client = opts.api_client,

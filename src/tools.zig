@@ -386,6 +386,28 @@ pub const registry: []const ToolEntry = &.{
         .input_schema = .{ .type = "object", .prop_specs = &.{
             .{ .name = "query", .type = "string", .description = kg_retrieval.QUERY_DESCRIPTION },
             .{ .name = "type", .type = "string", .description = kg_retrieval.TYPE_DESCRIPTION },
+            .{
+                .name = "lexical_plan",
+                .type = "object",
+                .description = kg_retrieval.PLAN_DESCRIPTION,
+                .object_props = &.{
+                    .{ .name = "schema_version", .type = "string", .enum_values = &.{"lexical-query-plan-v1"} },
+                    .{ .name = "intent", .type = "string", .enum_values = &.{ "fact_lookup", "procedure_reuse", "task_recovery", "enumeration", "temporal", "causal", "entity", "other" } },
+                    .{ .name = "stage", .type = "string", .enum_values = &.{ "seed", "semantic_expansion", "focused_refinement" } },
+                    .{
+                        .name = "variants",
+                        .type = "array",
+                        .items_props = &.{
+                            .{ .name = "kind", .type = "string", .enum_values = &.{ "exact", "alias", "paraphrase", "mechanism", "symptom", "outcome", "broader", "narrower", "relation", "type", "time" } },
+                            .{ .name = "text", .type = "string", .description = "One compact lexical probe, 1-400 UTF-8 bytes." },
+                        },
+                        .items_required = &.{ "kind", "text" },
+                    },
+                    .{ .name = "variant_index", .type = "integer", .description = "Zero-based member of variants executed by this call." },
+                    .{ .name = "seen_node_ids", .type = "array", .items_type = "integer", .description = "Exactly the up-to-32 unique positive node IDs already returned under this same fixed plan. Empty on a new seed/expansion plan; the host rejects invented, omitted, stale, or cross-plan IDs." },
+                },
+                .object_required = &.{ "schema_version", "intent", "stage", "variants", "variant_index", "seen_node_ids" },
+            },
         }, .required = &.{"query"} },
         .execute = kg_tools.executeRecall,
         .tinykg_gated = true,

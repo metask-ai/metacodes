@@ -64,6 +64,7 @@ pub const formal_provenance = @import("formal/provenance.zig");
 pub const formal_task_audit = @import("formal/task_audit.zig");
 pub const formal_memory_migration = @import("formal/memory_migration.zig");
 pub const kg_tools = @import("tools/kg_tools.zig");
+pub const kg_lexical_query_plan = @import("kg/lexical_query_plan.zig");
 pub const core_goal = @import("core/goal.zig");
 pub const core_auth = auth;
 pub const core_read_state = @import("core/read_state.zig");

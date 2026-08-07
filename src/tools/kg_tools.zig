@@ -14,6 +14,7 @@ const util_json = @import("../util/json.zig");
 const common = @import("common.zig");
 const log = @import("../util/log.zig");
 const retrieval_protocol = @import("../kg/retrieval_protocol.zig");
+const lexical_query_plan = @import("../kg/lexical_query_plan.zig");
 
 fn requireKg(ctx: *const ToolContext) ?*kg_mod.KgClient {
     return ctx.kg;
@@ -125,26 +126,73 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     if (!kg.ready) return degradedResult(ctx.allocator, kg);
     kg.setAbort(ctx.abort); // M1:ESC 可中断 spawn
 
-    const query = util_json.extractStringField(args, "query") orelse {
+    var parsed_args = std.json.parseFromSlice(std.json.Value, ctx.allocator, args, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall 参数必须是合法 JSON object", .{});
+            return error.InvalidArguments;
+        },
+    };
+    defer parsed_args.deinit();
+    if (parsed_args.value != .object) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall 参数必须是合法 JSON object", .{});
+        return error.InvalidArguments;
+    }
+    const object = parsed_args.value.object;
+    const query_value = object.get("query") orelse {
         common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall 缺少必填字段 query", .{});
         return error.MissingQuery;
     };
-    const query_owned = try util_json.unescapeString(query, ctx.allocator);
-    defer ctx.allocator.free(query_owned);
+    if (query_value != .string) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall query 必须是字符串", .{});
+        return error.InvalidQuery;
+    }
+    const query = std.mem.trim(u8, query_value.string, " \t\r\n");
+    if (!validRecallQuery(query)) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall query 必须是 1..400 字节的 UTF-8 紧凑查询", .{});
+        return error.InvalidQuery;
+    }
 
     // 可选 type 过滤:归一化 + 集合校验,菜单外报错**不静默空返**(Linus MEDIUM-1)。
     var type_canon: ?[]const u8 = null;
-    if (util_json.extractStringField(args, "type")) |raw| {
-        const resolved = kg_mod.resolveMemoryType(raw) orelse {
+    if (object.get("type")) |raw| {
+        if (raw != .string) {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall type 必须是字符串", .{});
+            return error.InvalidType;
+        }
+        const resolved = kg_mod.resolveMemoryType(raw.string) orelse {
             common.setErrorDetail(ctx.error_detail, ctx.allocator, "type 必须是 decision|user_preference|module|bug|observation 之一", .{});
             return error.InvalidType;
         };
         type_canon = resolved.schema_type;
     }
-    // 采用率埋点(PM:kill-criterion 的 load-bearing 仪器,measure 模型是否用 --type)。
-    log.info("kg", "kg_recall type_filter={s}", .{type_canon orelse "none"});
 
-    const hits = kg.recallTyped(query_owned, 8, false, type_canon) catch |e| {
+    var plan = lexical_query_plan.parse(ctx.allocator, object, query, type_canon) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall lexical_plan 非法: {s}", .{lexical_query_plan.diagnostic(err)});
+        return error.InvalidLexicalPlan;
+    };
+    defer if (plan) |*value| value.deinit(ctx.allocator);
+
+    // Do not trust model-declared seen ids. A governed plan must bind to the
+    // run-scoped host ledger before TinyKG is touched; legacy query-only calls
+    // intentionally preserve their old behavior.
+    var ledger_guard: ?lexical_query_plan.Ledger.Guard = null;
+    defer if (ledger_guard) |*guard| guard.deinit();
+    if (plan) |value| {
+        const ledger = ctx.kg_lexical_ledger orelse {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall lexical_plan requires the session host ledger; governed information-gain metrics fail closed when it is unavailable", .{});
+            return error.LexicalPlanLedgerUnavailable;
+        };
+        ledger_guard = ledger.lockPlan(value) catch |err| {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall lexical_plan host ledger rejected the call: {s}", .{lexical_query_plan.ledgerDiagnostic(err)});
+            return error.InvalidLexicalPlanState;
+        };
+    }
+    // 采用率埋点(PM:kill-criterion 的 load-bearing 仪器,measure 模型是否用 --type)。
+    log.info("kg", "kg_recall type_filter={s} lexical_plan={s}", .{ type_canon orelse "none", if (plan == null) "legacy" else "v1" });
+
+    const hits = kg.recallTyped(query, 8, false, type_canon) catch |e| {
         return kgErrorResult(ctx, kg, e, "KgRecall");
     };
     defer {
@@ -155,8 +203,16 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(ctx.allocator);
+    var new_hit_count: usize = 0;
+    var repeated_hit_count: usize = 0;
+    var hit_ids: [lexical_query_plan.MAX_SEEN_NODE_IDS]u64 = [_]u64{0} ** lexical_query_plan.MAX_SEEN_NODE_IDS;
+    if (hits.len > hit_ids.len) {
+        common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall returned more hits than the governed 32-node ledger can represent", .{});
+        return error.InvalidLexicalPlanState;
+    }
     try out.appendSlice(ctx.allocator, "{\"hits\":[");
     for (hits, 0..) |h, i| {
+        hit_ids[i] = h.node_id;
         if (i > 0) try out.appendSlice(ctx.allocator, ",");
         const type_str = if (h.schema_type.len > 0) h.schema_type else h.kind;
         const row = try std.fmt.allocPrint(ctx.allocator, "{{\"node_id\":{d},\"type\":\"{s}\",\"scope\":\"{s}\",\"score\":{d:.2},\"text\":", .{
@@ -170,6 +226,18 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
         if (h.source_label.len > 0) {
             try out.appendSlice(ctx.allocator, ",\"source\":");
             try appendJsonString(&out, ctx.allocator, h.source_label);
+        }
+        if (ledger_guard) |*guard| {
+            const seen_before = guard.wasSeen(h.node_id);
+            const duplicate_in_batch = containsNodeId(hit_ids[0..i], h.node_id);
+            if (!duplicate_in_batch) {
+                if (seen_before) {
+                    repeated_hit_count += 1;
+                } else {
+                    new_hit_count += 1;
+                }
+            }
+            try out.appendSlice(ctx.allocator, if (seen_before) ",\"seen_before\":true" else ",\"seen_before\":false");
         }
         try out.appendSlice(ctx.allocator, "}");
     }
@@ -196,11 +264,60 @@ pub fn executeRecall(ctx: *const ToolContext, args: []const u8) anyerror![]u8 {
     try out.appendSlice(ctx.allocator, count);
     try out.appendSlice(ctx.allocator, ",\"types_in_results\":{");
     try out.appendSlice(ctx.allocator, facet.items);
-    try out.appendSlice(ctx.allocator, "},\"retrieval_mode\":\"lexical_bm25_no_embeddings\",\"knowledge_status\":\"unverified_candidates\",\"lexical_guidance\":");
+    try out.append(ctx.allocator, '}');
+    if (plan) |value| try appendLexicalPlanReceipt(&out, ctx.allocator, value, new_hit_count, repeated_hit_count);
+    try out.appendSlice(ctx.allocator, ",\"retrieval_mode\":\"lexical_bm25_no_embeddings\",\"knowledge_status\":\"unverified_candidates\",\"lexical_guidance\":");
     try appendJsonString(&out, ctx.allocator, retrieval_protocol.RESULT_GUIDANCE);
     const tail = "}";
     try out.appendSlice(ctx.allocator, tail);
-    return out.toOwnedSlice(ctx.allocator);
+    const owned = try out.toOwnedSlice(ctx.allocator);
+    errdefer ctx.allocator.free(owned);
+    if (ledger_guard) |*guard| {
+        guard.commit(hit_ids[0..hits.len]) catch |err| {
+            common.setErrorDetail(ctx.error_detail, ctx.allocator, "KgRecall lexical_plan host ledger could not commit the observed hits: {s}", .{lexical_query_plan.ledgerDiagnostic(err)});
+            return error.InvalidLexicalPlanState;
+        };
+    }
+    return owned;
+}
+
+fn validRecallQuery(query: []const u8) bool {
+    if (query.len == 0 or query.len > lexical_query_plan.MAX_QUERY_BYTES or !std.unicode.utf8ValidateSlice(query)) return false;
+    for (query) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+    return true;
+}
+
+fn containsNodeId(values: []const u64, expected: u64) bool {
+    for (values) |value| if (value == expected) return true;
+    return false;
+}
+
+fn appendLexicalPlanReceipt(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    plan: lexical_query_plan.Plan,
+    new_hit_count: usize,
+    repeated_hit_count: usize,
+) !void {
+    const selected = plan.selected();
+    const receipt = try std.fmt.allocPrint(
+        allocator,
+        ",\"lexical_query_plan\":{{\"schema_version\":\"{s}\",\"plan_sha256\":\"{s}\",\"intent\":\"{s}\",\"stage\":\"{s}\",\"variant_index\":{d},\"variant_count\":{d},\"variant_kind\":\"{s}\",\"seen_node_count\":{d},\"seen_state_verified\":true,\"ledger_scope\":\"agent_run_plan\",\"new_hit_count\":{d},\"repeated_hit_count\":{d}}}",
+        .{
+            lexical_query_plan.SCHEMA_VERSION,
+            plan.fingerprint,
+            @tagName(plan.intent),
+            @tagName(plan.stage),
+            plan.variant_index,
+            plan.variants.len,
+            @tagName(selected.kind),
+            plan.seen_node_ids.len,
+            new_hit_count,
+            repeated_hit_count,
+        },
+    );
+    defer allocator.free(receipt);
+    try out.appendSlice(allocator, receipt);
 }
 
 const DEFAULT_CONTEXT_EDGES: usize = 12;
