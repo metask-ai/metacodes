@@ -237,6 +237,21 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
         path.write_text(script, encoding="utf-8")
         path.chmod(0o700)
 
+    def _write_compatible_fake_tinykg(self, path: Path) -> None:
+        path.write_text(
+            "#!/bin/sh\n"
+            "case \"$1\" in\n"
+            "  init) mkdir \"$2\" ;;\n"
+            "  apply) printf 'apply version=1 nodes_created=1 nodes_existing=0 "
+            "edges_created=0 edges_existing=0\\n' ;;\n"
+            "  store-info) printf 'nodes=1\\nedges=0\\nstorage_format_version=2\\n"
+            "schema_version=3\\n' ;;\n"
+            "  *) exit 91 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        path.chmod(0o700)
+
     def _production(self) -> ProductionRuntimeConfig:
         return ProductionRuntimeConfig(
             api_key="runtime-l2-private-key",
@@ -388,6 +403,8 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
                 encoding="utf-8",
             )
             fake.chmod(0o700)
+            tinykg = root / "fake-tinykg"
+            self._write_compatible_fake_tinykg(tinykg)
             missing_auth = root / "must-not-be-read.json"
             command = [
                 sys.executable,
@@ -396,7 +413,7 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
                 "--binary",
                 str(fake),
                 "--tinykg-binary",
-                "/bin/echo",
+                str(tinykg),
                 "--source",
                 str(source_path),
                 "--manifest",
