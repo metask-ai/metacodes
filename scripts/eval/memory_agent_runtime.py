@@ -293,6 +293,27 @@ def _verify_scoped_recall_activation(
     return dict(receipt)
 
 
+def _host_recall_covers_missing_explicit_recall(
+    scoped_recall: Mapping[str, Any] | None,
+    query_plan_trace: Mapping[str, Any],
+) -> bool:
+    """A completed host lookup makes a duplicate model KgRecall optional.
+
+    `no_hits` is still an observed, successful lookup result.  It is the
+    expected online state before the first episode is consolidated; treating
+    it as a query-plan failure erases the real deterministic validator outcome
+    and makes the consolidation receipt unverifiable.  `search_error` remains
+    invalid and therefore cannot launder an unavailable TinyKG treatment.
+    """
+
+    return bool(
+        scoped_recall is not None
+        and scoped_recall.get("status") in {"injected", "no_hits"}
+        and query_plan_trace.get("invalid_reasons")
+        == ["TinyKG backend executed no KgRecall"]
+    )
+
+
 def _safe_component(value: str) -> str:
     # Artifact paths are visible to the model through cwd, memory instructions,
     # and METACODES_KG_STORE. Never leak arm labels such as "tinykg" or
@@ -341,6 +362,61 @@ def _write_new(path: Path, payload: bytes) -> None:
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
+
+
+def _write_failed_validation_checkpoint(
+    run_dir: Path,
+    *,
+    observations_payload: bytes,
+    receipt: Mapping[str, Any],
+    error: BaseException,
+    budget_journal_receipt: Mapping[str, Any] | None,
+) -> Mapping[str, Any]:
+    failed_observations = run_dir / "failed-validation-observations.jsonl"
+    failed_receipt = run_dir / "failed-validation-runtime-candidate.json"
+    failure_identity = {
+        "schema_version": "metacodes-memory-runtime-validation-failure-v1",
+        "status": "invalid",
+        "classification": "post-run-runtime-receipt-validation",
+        "error_type": type(error).__name__,
+        "error_sha256": hashlib.sha256(str(error).encode("utf-8")).hexdigest(),
+    }
+    failed_receipt_payload = (
+        stable_json(
+            {
+                **failure_identity,
+                # Deliberately wrapped: this file cannot masquerade as a
+                # canonical runtime receipt after a future validator change,
+                # but the paid candidate remains recoverable.
+                "candidate_runtime_receipt": receipt,
+            }
+        )
+        + "\n"
+    ).encode("utf-8")
+    _write_new(failed_observations, observations_payload)
+    _write_new(failed_receipt, failed_receipt_payload)
+    diagnostic = {
+        **failure_identity,
+        "observations_file": failed_observations.name,
+        "observations_sha256": _hash_bytes(observations_payload),
+        "runtime_candidate_file": failed_receipt.name,
+        "runtime_candidate_sha256": _hash_bytes(failed_receipt_payload),
+        "budget_journal_revision": (
+            budget_journal_receipt["revision"]
+            if budget_journal_receipt is not None
+            else None
+        ),
+        "budget_journal_head_sha256": (
+            budget_journal_receipt["head_sha256"]
+            if budget_journal_receipt is not None
+            else None
+        ),
+    }
+    _write_new(
+        run_dir / "failed-validation-diagnostic.json",
+        (stable_json(diagnostic) + "\n").encode("utf-8"),
+    )
+    return diagnostic
 
 
 def _child_failure_diagnostic(
@@ -2746,10 +2822,9 @@ def run_memory_agent_schedule(
             provenance_links = store_edges
 
         evaluator_invalid: str | None = None
-        host_only_query_plan_gap = (
-            host_recall_injected
-            and query_plan_trace["invalid_reasons"]
-            == ["TinyKG backend executed no KgRecall"]
+        host_only_query_plan_gap = _host_recall_covers_missing_explicit_recall(
+            scoped_recall_activation,
+            query_plan_trace,
         )
         if query_plan_trace["status"] == "invalid" and not host_only_query_plan_gap:
             evaluator_invalid = "query-plan trace invalid: " + "; ".join(
@@ -3021,16 +3096,6 @@ def run_memory_agent_schedule(
             }
         )
     receipt: Mapping[str, Any] = receipt_common
-    # Join before publication: a malformed observation must not leave a receipt
-    # that looks complete.  The v3 receipt additionally binds each row to its
-    # durable memory pre/post state and raw native artifacts.
-    replay_observations(
-        manifest,
-        observations,
-        dataset_source=source_path,
-        runtime_receipt=receipt,
-        runtime_artifact_root=resolved_run,
-    )
     observations_payload = b"".join(
         (stable_json(row) + "\n").encode("utf-8") for row in observations
     )
@@ -3044,6 +3109,29 @@ def run_memory_agent_schedule(
                 ("pending runtime receipt", receipt_payload),
             ),
         )
+    # Join before canonical publication: a malformed observation must not
+    # leave runtime-receipt.json looking complete.  A paid run has already
+    # incurred irreversible provider cost, though, so preserve an explicitly
+    # invalid candidate checkpoint before re-raising.  This closes the
+    # evidence-loss window without making the candidate promotable.
+    try:
+        replay_observations(
+            manifest,
+            observations,
+            dataset_source=source_path,
+            runtime_receipt=receipt,
+            runtime_artifact_root=resolved_run,
+        )
+    except ValidationError as exc:
+        if production is not None:
+            _write_failed_validation_checkpoint(
+                resolved_run,
+                observations_payload=observations_payload,
+                receipt=receipt,
+                error=exc,
+                budget_journal_receipt=budget_journal_receipt,
+            )
+        raise
     _write_new(
         observations_output,
         observations_payload,

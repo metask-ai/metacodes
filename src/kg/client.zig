@@ -1993,6 +1993,9 @@ pub const KgClient = struct {
             "ClaimHeld",
             "SchemaProjectScopeViolation",
             "ProjectTreeViolation",
+            // Deterministic capability/index-state failure.  Retrying the
+            // exact search only burns turns and is not lock contention.
+            "Unsupported",
         };
         for (data_errors) |d| {
             if (std.ascii.eqlIgnoreCase(name, d)) return .data;
@@ -2336,6 +2339,7 @@ test "classifyCliError 三类归一" {
     try testing.expectEqual(KgClient.ErrClass.data, KgClient.classifyCliError("WouldCreateCycle"));
     try testing.expectEqual(KgClient.ErrClass.transient, KgClient.classifyCliError("Timeout"));
     try testing.expectEqual(KgClient.ErrClass.transient, KgClient.classifyCliError("SomethingNew"));
+    try testing.expectEqual(KgClient.ErrClass.data, KgClient.classifyCliError("Unsupported"));
     // 项目级 schema:确定性结构违规归 data(重试无用 + 让 .data 分支 setDetail 兜住原因,
     // 否则 remember 的 scope 违规检测匹配不上 → agent 收到空 Transient。PM 终审接线漏抓)。
     try testing.expectEqual(KgClient.ErrClass.data, KgClient.classifyCliError("SchemaProjectScopeViolation"));

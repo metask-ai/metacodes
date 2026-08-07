@@ -461,6 +461,7 @@ class LocalTinyKg:
             "init",
             "apply",
             "search",
+            "rebuild-text",
             "neighbors",
             "store-info",
             "import-md-doc",

@@ -351,11 +351,19 @@ def commit_execution_episode(
             store,
             int(tinykg["tinykg_document_id"]),
         )
+        # TinyKG deliberately keeps BM25 as a derived index.  The online
+        # episode import makes that catalog stale; publish it at the explicit
+        # consolidation boundary so the next offline rollout can actually
+        # exercise lexical recall instead of deterministically receiving
+        # `Unsupported` from an unwarmed store.
+        local.command("rebuild-text", store, ())
         tinykg["tinykg_revision_after"] = _tree_digest(
             store, normalize_store_manifest=True
         )
         tinykg["tinykg_raw_digest_after"] = _tree_digest(store)
         after_info = _store_info(local.command("store-info", store, ()))
+        if after_info.get("text_current") != "1" or after_info.get("text_stale") != "0":
+            _fail("memory consolidation", "TinyKG text catalog was not durably published")
         tinykg["tinykg_nodes_after"] = int(after_info["nodes"])
         tinykg["tinykg_edges_after"] = int(after_info["edges"])
         if (

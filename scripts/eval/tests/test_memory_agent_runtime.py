@@ -20,6 +20,7 @@ from scripts.eval.memory_agent_runtime import (
     _assert_production_secret_absent,
     _copy_memory_tree,
     _estimated_costs_match,
+    _host_recall_covers_missing_explicit_recall,
     _project_domain,
     _production_environment,
     _materialize_production_sandbox,
@@ -27,6 +28,7 @@ from scripts.eval.memory_agent_runtime import (
     _safe_component,
     _sanitized_environment,
     _verify_scoped_recall_activation,
+    _write_failed_validation_checkpoint,
     _xxhash64,
     run_memory_agent_schedule,
 )
@@ -91,6 +93,57 @@ def digest(label: str) -> str:
 
 
 class MemoryAgentRuntimeContractTest(unittest.TestCase):
+    def test_failed_paid_validation_checkpoint_is_explicitly_invalid_and_recoverable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            observations = b'{"case_id":"case-1"}\n'
+            candidate = {"schema_version": "candidate-receipt", "rollouts": []}
+            diagnostic = _write_failed_validation_checkpoint(
+                root,
+                observations_payload=observations,
+                receipt=candidate,
+                error=ValidationError("validator outcome drift"),
+                budget_journal_receipt={"revision": 9, "head_sha256": digest("head")},
+            )
+
+            wrapper = json.loads(
+                (root / diagnostic["runtime_candidate_file"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(wrapper["status"], "invalid")
+            self.assertEqual(wrapper["candidate_runtime_receipt"], candidate)
+            self.assertEqual(diagnostic["budget_journal_revision"], 9)
+            self.assertFalse((root / "runtime-receipt.json").exists())
+            self.assertFalse((root / "observations.jsonl").exists())
+            for path in root.iterdir():
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_completed_host_no_hit_does_not_require_duplicate_model_recall(self):
+        missing_explicit = {
+            "status": "invalid",
+            "invalid_reasons": ["TinyKG backend executed no KgRecall"],
+        }
+        self.assertTrue(
+            _host_recall_covers_missing_explicit_recall(
+                {"status": "no_hits"},
+                missing_explicit,
+            )
+        )
+        self.assertTrue(
+            _host_recall_covers_missing_explicit_recall(
+                {"status": "injected"},
+                missing_explicit,
+            )
+        )
+        self.assertFalse(
+            _host_recall_covers_missing_explicit_recall(
+                {"status": "search_error"},
+                missing_explicit,
+            )
+        )
+        self.assertFalse(
+            _host_recall_covers_missing_explicit_recall(None, missing_explicit)
+        )
+
     def test_v6_query_plan_source_identity_remains_replayable(self):
         receipt = {
             "schema_version": PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
@@ -591,6 +644,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
     def test_checked_in_pilot_v7_binds_durable_cwd_fix_and_larger_rollout_reserve(self):
         pilot = ROOT / "evals/memory/pilots/procedural-glm52-v7"
         contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
+        attempt = json.loads((pilot / "attempt-001-observation.json").read_text(encoding="utf-8"))
         source = json.loads((pilot / "source.json").read_text(encoding="utf-8"))
         manifest = load_manifest(pilot / "manifest.json")
         execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
@@ -655,6 +709,28 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         )
         self.assertTrue(contract["current_phase"]["paid_rollouts_authorized"])
         self.assertFalse(contract["current_phase"]["quality_evidence"])
+        self.assertEqual(attempt["outcome"]["status"], "invalid")
+        self.assertFalse(attempt["outcome"]["quality_evidence"])
+        self.assertFalse(attempt["outcome"]["canonical_runtime_receipt_published"])
+        self.assertEqual(attempt["outcome"]["committed_rollout_transactions"], len(rows))
+        self.assertEqual(attempt["outcome"]["workspace_validator_successes"], len(rows))
+        self.assertEqual(
+            sum(item["provider_http_requests"] for item in attempt["rollouts"]),
+            attempt["outcome"]["provider_http_requests"],
+        )
+        self.assertEqual(
+            sum(item["actual_metered_tokens"] for item in attempt["rollouts"]),
+            attempt["budget_journal"]["committed_metered_tokens"],
+        )
+        self.assertAlmostEqual(
+            sum(item["actual_cost_usd"] for item in attempt["rollouts"]),
+            attempt["budget_journal"]["committed_cost_usd"],
+        )
+        self.assertEqual(
+            attempt["treatment_activation"]["tinykg_offline_rows_with_search_error"],
+            2,
+        )
+        self.assertTrue(attempt["treatment_activation"]["tinykg_store_text_stale_after_online"])
         ProductionRuntimeConfig(
             api_key="test-only",
             allow_paid_rollouts=True,

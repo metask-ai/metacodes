@@ -207,16 +207,36 @@ class LocalTinyKgNativeTest(unittest.TestCase):
             self.assertGreater(int(after["nodes"]), int(before["nodes"]))
             self.assertGreater(int(after["edges"]), int(before["edges"]))
             self.assertEqual(
-                [command["action"] for command in local.commands[-6:]],
+                [command["action"] for command in local.commands[-7:]],
                 [
                     "store-info",
                     "import-md-doc",
                     "add-edge",
                     "neighbors",
+                    "rebuild-text",
                     "store-info",
                     "store-info",
                 ],
             )
+            self.assertEqual(after["text_current"], "1")
+            self.assertEqual(after["text_stale"], "0")
+            search = json.loads(
+                local.command(
+                    "search",
+                    store,
+                    (
+                        "registry protocol",
+                        "--project",
+                        "1",
+                        "--limit",
+                        "10",
+                        "--format",
+                        "json",
+                        "--include-text",
+                    ),
+                )
+            )
+            self.assertGreater(len(search["hits"]), 0)
             self.assertTrue(all(not command["child_tinykg_env_keys"] for command in local.commands))
 
     def test_real_local_cli_isolated_store_and_remote_sentinels_remain_untouched(self):
