@@ -487,6 +487,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
     def test_checked_in_pilot_v6_binds_unseen_family_and_all_uncertain_requests(self):
         pilot = ROOT / "evals/memory/pilots/procedural-glm52-v6"
         contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
+        attempt = json.loads((pilot / "attempt-001-observation.json").read_text(encoding="utf-8"))
         source = json.loads((pilot / "source.json").read_text(encoding="utf-8"))
         manifest = load_manifest(pilot / "manifest.json")
         execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
@@ -561,6 +562,22 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         )
         self.assertTrue(contract["current_phase"]["paid_rollouts_authorized"])
         self.assertFalse(contract["current_phase"]["quality_evidence"])
+        self.assertFalse(attempt["outcome"]["quality_evidence"])
+        self.assertEqual(attempt["outcome"]["status"], "halted")
+        self.assertEqual(attempt["outcome"]["completed_provider_requests"], 4)
+        self.assertEqual(attempt["outcome"]["remaining_provider_requests_not_started"], 5)
+        self.assertEqual(
+            sum(item["actual_metered_tokens"] for item in attempt["rollouts"]),
+            attempt["budget_journal"]["committed_metered_tokens"],
+        )
+        self.assertAlmostEqual(
+            sum(item["actual_cost_usd"] for item in attempt["rollouts"]),
+            attempt["budget_journal"]["committed_cost_usd"],
+        )
+        self.assertEqual(
+            attempt["failure"]["classification"],
+            "treatment-activation-evidence-failure",
+        )
         ProductionRuntimeConfig(
             api_key="test-only",
             allow_paid_rollouts=True,

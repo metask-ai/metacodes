@@ -25,6 +25,7 @@ if __package__ in {None, ""}:
         PRODUCTION_CHILD_PATH,
         SCRIPTED_PROVIDER_ID,
         ScriptedMemoryProvider,
+        _cassette_memory_exposure,
         _materialize_production_sandbox,
         _run_production_sandbox_probe,
         run_memory_agent_schedule,
@@ -42,6 +43,7 @@ else:
         PRODUCTION_CHILD_PATH,
         SCRIPTED_PROVIDER_ID,
         ScriptedMemoryProvider,
+        _cassette_memory_exposure,
         _materialize_production_sandbox,
         _run_production_sandbox_probe,
         run_memory_agent_schedule,
@@ -368,6 +370,25 @@ def _run_adapter(
     for row in observations:
         rollout = receipts[(row["case_id"], row["trial"], row["arm"])]
         cassette = run_dir / rollout["artifact_paths"]["cassette"]
+        split = next(
+            case["split"] for case in manifest["cases"] if case["id"] == row["case_id"]
+        )
+        if (
+            benchmarks[row["case_id"]] == "procedural_transfer"
+            and split != "online"
+            and row["arm"] == "markdown_memory"
+        ):
+            memory_root = run_dir / rollout["artifact_paths"]["memory_state"]
+            memory_index = memory_root / "MEMORY.md"
+            exposure = _cassette_memory_exposure(
+                cassette,
+                f"{label} native offline memory injection",
+                memory_root=memory_root,
+                expected_memory_index=memory_index.read_bytes(),
+                count_graph_context=False,
+            )
+            if exposure["auto_injected_bytes"] < memory_index.stat().st_size:
+                raise RuntimeError(f"{label}: durable MEMORY.md was not injected")
         query_plan_trace = load_and_verify_query_plan_sidecar(
             cassette,
             run_id=rollout["run_id"],

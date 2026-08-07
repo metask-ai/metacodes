@@ -554,10 +554,10 @@ def _project_domain(project_root: Path) -> str:
     return f"{project_root.name or 'root'}-{_xxhash64(resolved.encode('utf-8')):016x}"[: len(project_root.name or 'root') + 9]
 
 
-def _memory_dir(home: Path, project_root: Path) -> Path:
-    """Mirror ``memdir.memoryIndexPath`` without invoking the product binary."""
+def _memory_dir(home: Path, workspace: Path) -> Path:
+    """Mirror the product memdir derived from the actual process cwd."""
 
-    cwd_hash = f"{_xxhash64(str(project_root.resolve()).encode('utf-8')):016x}"
+    cwd_hash = f"{_xxhash64(str(workspace.resolve()).encode('utf-8')):016x}"
     return home / ".metacodes" / "projects" / cwd_hash / "memory"
 
 
@@ -1882,7 +1882,7 @@ def run_memory_agent_schedule(
                 "registry, protocol manifest, documentation, and contract surfaces"
             )
         if runtime_arm == "claude_style" or (runtime_arm == "tinykg" and production_mode):
-            memory_dir = _memory_dir(sealed_home, project_root)
+            memory_dir = _memory_dir(sealed_home, workspace)
             memory_dir.mkdir(parents=True)
             memory_index = memory_dir / "MEMORY.md"
             if case["benchmark"] == "procedural_transfer":
