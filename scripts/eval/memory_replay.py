@@ -24,17 +24,30 @@ from .memory_benchmark import (
     normalized_exact_match,
     validate_memory_row,
 )
+from .memory_budget_journal import (
+    usd_to_microusd,
+    usd_to_microusd_ceiling,
+    validate_checkpoint_payload,
+)
 from .model import ValidationError, stable_json
 
 
 REPLAY_SCHEMA_VERSION = 1
 LEGACY_RUNTIME_RECEIPT_SCHEMA_VERSION = 2
 RUNTIME_RECEIPT_SCHEMA_VERSION = 3
-PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 4
+LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 4
+PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 5
 NATIVE_RUNTIME_RECEIPT_VERSIONS = frozenset(
     {
         LEGACY_RUNTIME_RECEIPT_SCHEMA_VERSION,
         RUNTIME_RECEIPT_SCHEMA_VERSION,
+        LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+    }
+)
+PRODUCTION_RUNTIME_RECEIPT_VERSIONS = frozenset(
+    {
+        LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }
 )
@@ -50,7 +63,14 @@ RUNNER_SOURCE_MODULES = (
     "memory_tinykg_local",
     "model",
 )
-PRODUCTION_RUNNER_SOURCE_MODULES = (*RUNNER_SOURCE_MODULES, "memory_agent_runtime_pilot")
+LEGACY_PRODUCTION_RUNNER_SOURCE_MODULES = (
+    *RUNNER_SOURCE_MODULES,
+    "memory_agent_runtime_pilot",
+)
+PRODUCTION_RUNNER_SOURCE_MODULES = (
+    *LEGACY_PRODUCTION_RUNNER_SOURCE_MODULES,
+    "memory_budget_journal",
+)
 PRODUCTION_PROVIDER_ID = "metask-anthropic-compatible-v1"
 PRODUCTION_MODEL_PROVIDER = "anthropic"
 PRODUCTION_MODEL_ID = "glm-5.2"
@@ -642,6 +662,215 @@ def _production_runtime_arm(arm_id: str) -> str:
     raise AssertionError("unreachable")
 
 
+def _validate_budget_transaction_receipt(
+    raw: Any,
+    *,
+    where: str,
+    expected_run_id: str,
+    expected_manifest_sha256: str,
+    expected_model_fingerprint: str,
+    expected_harness_fingerprint: str,
+    expected_max_cost_usd: float,
+    expected_max_metered_tokens: int,
+    expected_actual_cost_usd: float,
+    expected_actual_metered_tokens: int,
+) -> Mapping[str, Any]:
+    value = _object(
+        raw,
+        where,
+        (
+            "journal_id",
+            "journal_revision",
+            "journal_head_sha256",
+            "transaction_id",
+            "state",
+            "identity_sha256",
+            "run_id",
+            "manifest_sha256",
+            "model_fingerprint",
+            "harness_fingerprint",
+            "provider_identity",
+            "max_cost_microusd",
+            "max_metered_tokens",
+            "reservation_revision",
+            "reservation_head_sha256",
+            "authorization_revision",
+            "authorization_head_sha256",
+            "commit_revision",
+            "commit_head_sha256",
+            "actual_cost_microusd",
+            "actual_metered_tokens",
+        ),
+    )
+    journal_id = _hash(value["journal_id"], f"{where}.journal_id")
+    journal_revision = _integer(
+        value["journal_revision"], f"{where}.journal_revision", minimum=3
+    )
+    journal_head = _hash(value["journal_head_sha256"], f"{where}.journal_head_sha256")
+    if value["state"] != "committed":
+        _fail(f"{where}.state", "successful rollout must bind a committed transaction")
+    identity = {
+        "run_id": _string(value["run_id"], f"{where}.run_id"),
+        "manifest_sha256": _hash(
+            value["manifest_sha256"], f"{where}.manifest_sha256"
+        ),
+        "model_fingerprint": _hash(
+            value["model_fingerprint"], f"{where}.model_fingerprint"
+        ),
+        "harness_fingerprint": _hash(
+            value["harness_fingerprint"], f"{where}.harness_fingerprint"
+        ),
+        "provider_identity": _string(
+            value["provider_identity"], f"{where}.provider_identity"
+        ),
+        "max_cost_microusd": _integer(
+            value["max_cost_microusd"], f"{where}.max_cost_microusd", minimum=1
+        ),
+        "max_metered_tokens": _integer(
+            value["max_metered_tokens"], f"{where}.max_metered_tokens", minimum=1
+        ),
+    }
+    expected_identity = {
+        "run_id": expected_run_id,
+        "manifest_sha256": expected_manifest_sha256,
+        "model_fingerprint": expected_model_fingerprint,
+        "harness_fingerprint": expected_harness_fingerprint,
+        "provider_identity": PRODUCTION_PROVIDER_ID,
+        "max_cost_microusd": usd_to_microusd(expected_max_cost_usd),
+        "max_metered_tokens": expected_max_metered_tokens,
+    }
+    if identity != expected_identity:
+        _fail(where, "transaction identity or fixed caps drifted")
+    identity_sha = _canonical_sha256(identity)
+    if _hash(value["identity_sha256"], f"{where}.identity_sha256") != identity_sha:
+        _fail(f"{where}.identity_sha256", "does not bind transaction identity")
+    reservation_revision = _integer(
+        value["reservation_revision"], f"{where}.reservation_revision", minimum=1
+    )
+    transaction_id = _hash(value["transaction_id"], f"{where}.transaction_id")
+    if transaction_id != _canonical_sha256(
+        {
+            "journal_id": journal_id,
+            "reservation_revision": reservation_revision,
+            "identity": identity,
+        }
+    ):
+        _fail(f"{where}.transaction_id", "does not bind journal revision and identity")
+    authorization_revision = _integer(
+        value["authorization_revision"],
+        f"{where}.authorization_revision",
+        minimum=reservation_revision + 1,
+    )
+    commit_revision = _integer(
+        value["commit_revision"],
+        f"{where}.commit_revision",
+        minimum=authorization_revision + 1,
+    )
+    for key in (
+        "reservation_head_sha256",
+        "authorization_head_sha256",
+        "commit_head_sha256",
+    ):
+        _hash(value[key], f"{where}.{key}")
+    if commit_revision != journal_revision or value["commit_head_sha256"] != journal_head:
+        _fail(where, "commit receipt does not bind its journal revision/head")
+    actual_cost = _integer(
+        value["actual_cost_microusd"], f"{where}.actual_cost_microusd"
+    )
+    actual_tokens = _integer(
+        value["actual_metered_tokens"], f"{where}.actual_metered_tokens"
+    )
+    if actual_cost != usd_to_microusd_ceiling(expected_actual_cost_usd):
+        _fail(f"{where}.actual_cost_microusd", "does not conservatively bind runtime cost")
+    if actual_tokens != expected_actual_metered_tokens:
+        _fail(f"{where}.actual_metered_tokens", "does not bind runtime token usage")
+    return value
+
+
+def _validate_budget_journal_receipt(
+    raw: Any,
+    *,
+    where: str,
+    manifest_sha256: str,
+    model_fingerprint: str,
+    budget: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    value = _object(
+        raw,
+        where,
+        (
+            "schema_version",
+            "journal_id",
+            "authority",
+            "revision",
+            "head_sha256",
+            "committed_cost_microusd",
+            "committed_metered_tokens",
+            "unsettled_max_cost_microusd",
+            "unsettled_max_metered_tokens",
+            "exposure_cost_microusd",
+            "exposure_metered_tokens",
+            "transaction_states",
+            "checkpoint_path",
+            "checkpoint_sha256",
+        ),
+    )
+    if value["schema_version"] != 1:
+        _fail(f"{where}.schema_version", "unsupported budget journal schema")
+    authority = _object(
+        value["authority"],
+        f"{where}.authority",
+        (
+            "manifest_sha256",
+            "model_fingerprint",
+            "provider_identity",
+            "total_cost_microusd",
+            "total_metered_tokens",
+        ),
+    )
+    expected_authority = {
+        "manifest_sha256": manifest_sha256,
+        "model_fingerprint": model_fingerprint,
+        "provider_identity": PRODUCTION_PROVIDER_ID,
+        "total_cost_microusd": usd_to_microusd(budget["max_total_cost_usd"]),
+        "total_metered_tokens": budget["max_total_metered_tokens"],
+    }
+    if authority != expected_authority:
+        _fail(f"{where}.authority", "does not bind experiment authority")
+    expected_journal_id = _canonical_sha256(
+        {"schema_version": 1, "authority": authority}
+    )
+    if _hash(value["journal_id"], f"{where}.journal_id") != expected_journal_id:
+        _fail(f"{where}.journal_id", "does not bind authority")
+    _integer(value["revision"], f"{where}.revision", minimum=1)
+    _hash(value["head_sha256"], f"{where}.head_sha256")
+    _artifact_relative_path(value["checkpoint_path"], f"{where}.checkpoint_path")
+    _hash(value["checkpoint_sha256"], f"{where}.checkpoint_sha256")
+    for key in (
+        "committed_cost_microusd",
+        "committed_metered_tokens",
+        "unsettled_max_cost_microusd",
+        "unsettled_max_metered_tokens",
+        "exposure_cost_microusd",
+        "exposure_metered_tokens",
+    ):
+        _integer(value[key], f"{where}.{key}")
+    if value["unsettled_max_cost_microusd"] != 0 or value[
+        "unsettled_max_metered_tokens"
+    ] != 0:
+        _fail(where, "successful schedule cannot have unsettled exposure")
+    states = value["transaction_states"]
+    if not isinstance(states, dict) or any(
+        not isinstance(key, str)
+        or not isinstance(count, int)
+        or isinstance(count, bool)
+        or count < 0
+        for key, count in states.items()
+    ):
+        _fail(f"{where}.transaction_states", "expected non-negative state counts")
+    return value
+
+
 def _validate_production_runtime_receipt(
     receipt: Mapping[str, Any],
     manifest: Mapping[str, Any],
@@ -649,6 +878,13 @@ def _validate_production_runtime_receipt(
     dataset_sha256: str,
     where: str,
 ) -> None:
+    schema_version = receipt.get("schema_version")
+    if schema_version not in {
+        LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+    }:
+        _fail(f"{where}.schema_version", "expected production runtime receipt v4 or v5")
+    journal_bound = schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION
     value = _object(
         receipt,
         where,
@@ -682,11 +918,10 @@ def _validate_production_runtime_receipt(
             "estimated_cost_usd",
             "metered_tokens",
             "pricing_provenance",
+            *(("budget_journal",) if journal_bound else ()),
             "rollouts",
         ),
     )
-    if value["schema_version"] != PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
-        _fail(f"{where}.schema_version", "expected production runtime receipt v4")
     if value["protocol_id"] != PROTOCOL_ID:
         _fail(f"{where}.protocol_id", f"expected {PROTOCOL_ID!r}")
     expected_scalars = {
@@ -757,7 +992,12 @@ def _validate_production_runtime_receipt(
             _fail(source_where, "duplicate runner source")
         source_modules.append(module)
         source_paths.add(path)
-    if source_modules != list(PRODUCTION_RUNNER_SOURCE_MODULES):
+    expected_source_modules = (
+        PRODUCTION_RUNNER_SOURCE_MODULES
+        if journal_bound
+        else LEGACY_PRODUCTION_RUNNER_SOURCE_MODULES
+    )
+    if source_modules != list(expected_source_modules):
         _fail(f"{where}.runner_sources", "does not bind the production host source set")
 
     if value["arms"] != manifest["execution"]["arms"]:
@@ -807,6 +1047,17 @@ def _validate_production_runtime_receipt(
         _fail(f"{where}.budget", "total cost cap lacks strict schedule headroom")
     if max_rollout_tokens * len(rollouts) >= max_total_tokens:
         _fail(f"{where}.budget", "total token cap lacks strict schedule headroom")
+    budget_journal_value = (
+        _validate_budget_journal_receipt(
+            value["budget_journal"],
+            where=f"{where}.budget_journal",
+            manifest_sha256=_canonical_sha256(manifest),
+            model_fingerprint=manifest["execution"]["model_fingerprint"],
+            budget=budget,
+        )
+        if journal_bound
+        else None
+    )
 
     metacodes_sha = _hash(value["metacodes_binary_sha256"], f"{where}.metacodes_binary_sha256")
     tinykg_sha = _hash(value["tinykg_binary_sha256"], f"{where}.tinykg_binary_sha256")
@@ -814,6 +1065,8 @@ def _validate_production_runtime_receipt(
     cases = {case["id"]: case for case in manifest["cases"]}
     arms_by_id = {arm["id"]: arm for arm in value["arms"]}
     seen_run_ids: set[str] = set()
+    seen_budget_transaction_ids: set[str] = set()
+    budget_transactions: List[Mapping[str, Any]] = []
     for index, raw_rollout in enumerate(rollouts):
         rollout_where = f"{where}.rollouts[{index}]"
         rollout = _object(
@@ -863,6 +1116,7 @@ def _validate_production_runtime_receipt(
                 "memory_auto_injected_bytes",
                 "memory_tool_result_bytes",
                 "treatment_activation",
+                *(("budget_transaction",) if journal_bound else ()),
                 "observation_sha256",
                 "host_elapsed_ms",
             ),
@@ -1006,6 +1260,30 @@ def _validate_production_runtime_receipt(
         )
         if estimated_cost > max_rollout_cost or metered_tokens > max_rollout_tokens:
             _fail(rollout_where, "rollout exceeded its fixed production budget")
+        if journal_bound:
+            assert budget_journal_value is not None
+            transaction = _validate_budget_transaction_receipt(
+                rollout["budget_transaction"],
+                where=f"{rollout_where}.budget_transaction",
+                expected_run_id=run_id,
+                expected_manifest_sha256=_canonical_sha256(manifest),
+                expected_model_fingerprint=value["model_fingerprint"],
+                expected_harness_fingerprint=expected_harness_fingerprint,
+                expected_max_cost_usd=max_rollout_cost,
+                expected_max_metered_tokens=max_rollout_tokens,
+                expected_actual_cost_usd=estimated_cost,
+                expected_actual_metered_tokens=metered_tokens,
+            )
+            if transaction["journal_id"] != budget_journal_value["journal_id"]:
+                _fail(
+                    f"{rollout_where}.budget_transaction.journal_id",
+                    "does not match final journal",
+                )
+            transaction_id = str(transaction["transaction_id"])
+            if transaction_id in seen_budget_transaction_ids:
+                _fail(f"{rollout_where}.budget_transaction.transaction_id", "is duplicated")
+            seen_budget_transaction_ids.add(transaction_id)
+            budget_transactions.append(transaction)
         if rollout["pricing_provenance"] != PRODUCTION_PRICING_PROVENANCE:
             _fail(f"{rollout_where}.pricing_provenance", "unknown pricing provenance")
         compact_events = _integer(
@@ -1183,6 +1461,36 @@ def _validate_production_runtime_receipt(
     provider_total = sum(int(item["provider_requests"]) for item in rollouts)
     if observed_provider_total != provider_total:
         _fail(f"{where}.provider_requests", "does not equal rollout total")
+    if journal_bound:
+        assert budget_journal_value is not None
+        committed_cost = sum(
+            int(transaction["actual_cost_microusd"])
+            for transaction in budget_transactions
+        )
+        committed_tokens = sum(
+            int(transaction["actual_metered_tokens"])
+            for transaction in budget_transactions
+        )
+        if (
+            budget_journal_value["committed_cost_microusd"] != committed_cost
+            or budget_journal_value["exposure_cost_microusd"] != committed_cost
+            or budget_journal_value["committed_metered_tokens"] != committed_tokens
+            or budget_journal_value["exposure_metered_tokens"] != committed_tokens
+        ):
+            _fail(f"{where}.budget_journal", "final exposure does not equal committed rollouts")
+        states = budget_journal_value["transaction_states"]
+        if set(states) - {"committed", "aborted_pre_request"}:
+            _fail(f"{where}.budget_journal.transaction_states", "contains an unsettled state")
+        if states.get("committed", 0) != len(rollouts):
+            _fail(f"{where}.budget_journal.transaction_states", "committed count drift")
+        if budget_transactions:
+            final_transaction = budget_transactions[-1]
+            if (
+                final_transaction["journal_revision"] != budget_journal_value["revision"]
+                or final_transaction["journal_head_sha256"]
+                != budget_journal_value["head_sha256"]
+            ):
+                _fail(f"{where}.budget_journal", "final revision/head is not the last commit")
 
 
 def validate_runtime_receipt(
@@ -1196,9 +1504,9 @@ def validate_runtime_receipt(
     if schema_version not in {REPLAY_SCHEMA_VERSION, *NATIVE_RUNTIME_RECEIPT_VERSIONS}:
         _fail(
             f"{where}.schema_version",
-            "expected replay v1, native wiring v2, native lifecycle v3, or production v4",
+            "expected replay v1, native wiring v2, native lifecycle v3, or production v4/v5",
         )
-    if schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+    if schema_version in PRODUCTION_RUNTIME_RECEIPT_VERSIONS:
         _validate_production_runtime_receipt(
             receipt,
             manifest,
@@ -1297,6 +1605,7 @@ def validate_runtime_receipt(
         return
     if schema_version in {
         RUNTIME_RECEIPT_SCHEMA_VERSION,
+        LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }:
         raw_sources = value["runner_sources"]
@@ -1696,8 +2005,10 @@ def validate_runtime_artifacts(
     if schema_version not in NATIVE_RUNTIME_RECEIPT_VERSIONS:
         return
     seen_paths: set[str] = set()
+    checkpoint_transactions: Mapping[str, Mapping[str, Any]] | None = None
     if schema_version in {
         RUNTIME_RECEIPT_SCHEMA_VERSION,
+        LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }:
         raw_sources = receipt.get("runner_sources")
@@ -1727,6 +2038,64 @@ def validate_runtime_artifacts(
             expected_runner_sha = _hash(raw_source.get("sha256"), f"{source_where}.sha256")
             if observed_runner_sha != expected_runner_sha:
                 _fail(f"{source_where}.sha256", "runtime source mismatch")
+    if schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+        journal_receipt = receipt.get("budget_journal")
+        if not isinstance(journal_receipt, dict):
+            _fail(f"{where}.budget_journal", "expected an object")
+        checkpoint_relative = _artifact_relative_path(
+            journal_receipt.get("checkpoint_path"),
+            f"{where}.budget_journal.checkpoint_path",
+        ).as_posix()
+        if checkpoint_relative in seen_paths:
+            _fail(f"{where}.budget_journal.checkpoint_path", "reuses another artifact")
+        seen_paths.add(checkpoint_relative)
+        checkpoint = _artifact_path(
+            artifact_root,
+            checkpoint_relative,
+            f"{where}.budget_journal.checkpoint_path",
+            directory=False,
+        )
+        checkpoint_payload = checkpoint.read_bytes()
+        if hashlib.sha256(checkpoint_payload).hexdigest() != journal_receipt.get(
+            "checkpoint_sha256"
+        ):
+            _fail(f"{where}.budget_journal.checkpoint_sha256", "checkpoint bytes drifted")
+        checkpoint_state = validate_checkpoint_payload(checkpoint_payload)
+        checkpoint_transactions = checkpoint_state["transactions"]
+        for receipt_key, checkpoint_key in (
+            ("journal_id", "journal_id"),
+            ("authority", "authority"),
+            ("revision", "revision"),
+            ("head_sha256", "head_sha256"),
+        ):
+            if journal_receipt.get(receipt_key) != checkpoint_state[checkpoint_key]:
+                _fail(f"{where}.budget_journal.{receipt_key}", "checkpoint state drift")
+        states: Dict[str, int] = {}
+        committed_cost = 0
+        committed_tokens = 0
+        unsettled_cost = 0
+        unsettled_tokens = 0
+        for transaction in checkpoint_state["transactions"].values():
+            state = str(transaction["state"])
+            states[state] = states.get(state, 0) + 1
+            if state == "committed":
+                committed_cost += int(transaction["actual_cost_microusd"])
+                committed_tokens += int(transaction["actual_metered_tokens"])
+            elif state in {"reserved", "request_authorized"}:
+                unsettled_cost += int(transaction["identity"]["max_cost_microusd"])
+                unsettled_tokens += int(transaction["identity"]["max_metered_tokens"])
+        expected_summary = {
+            "committed_cost_microusd": committed_cost,
+            "committed_metered_tokens": committed_tokens,
+            "unsettled_max_cost_microusd": unsettled_cost,
+            "unsettled_max_metered_tokens": unsettled_tokens,
+            "exposure_cost_microusd": committed_cost + unsettled_cost,
+            "exposure_metered_tokens": committed_tokens + unsettled_tokens,
+            "transaction_states": states,
+        }
+        for key, expected in expected_summary.items():
+            if journal_receipt.get(key) != expected:
+                _fail(f"{where}.budget_journal.{key}", "checkpoint summary drift")
     rollouts = receipt.get("rollouts")
     if not isinstance(rollouts, list):
         _fail(where, "receipt rollouts are unavailable")
@@ -1744,13 +2113,56 @@ def validate_runtime_artifacts(
         rollout_where = f"{where}.rollouts[{index}]"
         if not isinstance(raw_rollout, dict):
             _fail(rollout_where, "expected an object")
+        if schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+            assert checkpoint_transactions is not None
+            transaction_receipt = raw_rollout.get("budget_transaction")
+            if not isinstance(transaction_receipt, dict):
+                _fail(f"{rollout_where}.budget_transaction", "expected an object")
+            transaction_id = transaction_receipt.get("transaction_id")
+            transaction = checkpoint_transactions.get(transaction_id)
+            if transaction is None:
+                _fail(
+                    f"{rollout_where}.budget_transaction.transaction_id",
+                    "is absent from the checkpoint",
+                )
+            identity = transaction["identity"]
+            expected_transaction_receipt = {
+                "transaction_id": transaction_id,
+                "state": transaction["state"],
+                "identity_sha256": transaction["identity_sha256"],
+                "run_id": identity["run_id"],
+                "manifest_sha256": identity["manifest_sha256"],
+                "model_fingerprint": identity["model_fingerprint"],
+                "harness_fingerprint": identity["harness_fingerprint"],
+                "provider_identity": identity["provider_identity"],
+                "max_cost_microusd": identity["max_cost_microusd"],
+                "max_metered_tokens": identity["max_metered_tokens"],
+                "reservation_revision": transaction["reservation_revision"],
+                "reservation_head_sha256": transaction["reservation_head_sha256"],
+                "authorization_revision": transaction["authorization_revision"],
+                "authorization_head_sha256": transaction["authorization_head_sha256"],
+                "commit_revision": transaction["commit_revision"],
+                "commit_head_sha256": transaction["commit_head_sha256"],
+                "actual_cost_microusd": transaction["actual_cost_microusd"],
+                "actual_metered_tokens": transaction["actual_metered_tokens"],
+            }
+            for key, expected in expected_transaction_receipt.items():
+                if transaction_receipt.get(key) != expected:
+                    _fail(
+                        f"{rollout_where}.budget_transaction.{key}",
+                        "does not match the hash-chained checkpoint",
+                    )
         paths = raw_rollout.get("artifact_paths")
         if not isinstance(paths, dict):
             _fail(f"{rollout_where}.artifact_paths", "expected an object")
         memory_root: Path | None = None
         if (
             schema_version
-            in {RUNTIME_RECEIPT_SCHEMA_VERSION, PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION}
+            in {
+                RUNTIME_RECEIPT_SCHEMA_VERSION,
+                LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+            }
             and paths.get("memory_state") is not None
         ):
             memory_root = _artifact_path(
@@ -1783,7 +2195,7 @@ def validate_runtime_artifacts(
                 _fail(f"{rollout_where}.{digest_key}", "raw artifact SHA-256 mismatch")
             if (
                 path_key == "native_events"
-                and schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION
+                and schema_version in PRODUCTION_RUNTIME_RECEIPT_VERSIONS
             ):
                 from .e2e_adapter import _native_trace_metrics
 
@@ -1881,6 +2293,7 @@ def validate_runtime_artifacts(
                 _fail(f"{rollout_where}.{digest_key}", "raw artifact tree mismatch")
             if path_key == "cassette" and schema_version in {
                 RUNTIME_RECEIPT_SCHEMA_VERSION,
+                LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
             }:
                 activity = _cassette_memory_activity(
@@ -1891,7 +2304,7 @@ def validate_runtime_artifacts(
                 if activity["provider_requests"] != raw_rollout.get("provider_requests"):
                     _fail(f"{rollout_where}.provider_requests", "raw cassette count mismatch")
                 if (
-                    schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION
+                    schema_version in PRODUCTION_RUNTIME_RECEIPT_VERSIONS
                     and activity["forbidden_provider_tool_attempts"] != 0
                 ):
                     _fail(
@@ -1929,7 +2342,7 @@ def validate_runtime_artifacts(
                     _fail(f"{rollout_where}.memory_read_events", "raw cassette count mismatch")
                 if expected_writes != raw_rollout.get("memory_write_events"):
                     _fail(f"{rollout_where}.memory_write_events", "raw cassette count mismatch")
-                if schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+                if schema_version in PRODUCTION_RUNTIME_RECEIPT_VERSIONS:
                     runtime_arm = _production_runtime_arm(str(raw_rollout.get("arm")))
                     activation = _cassette_treatment_activation(
                         path,
@@ -2034,7 +2447,7 @@ def validate_runtime_artifacts(
                     f"{rollout_where}.artifact_paths.memory_state",
                     "only Markdown rollouts have a separate memory tree",
                 )
-        elif schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+        elif schema_version in PRODUCTION_RUNTIME_RECEIPT_VERSIONS:
             memory_path = paths.get("memory_state")
             backend = raw_rollout.get("memory_backend")
             if backend == "none":

@@ -30,6 +30,11 @@ if __package__ in {None, ""}:
         run_memory_agent_schedule,
     )
     from scripts.eval.memory_benchmark import file_sha256  # type: ignore
+    from scripts.eval.memory_budget_journal import (  # type: ignore
+        BudgetAuthority,
+        BudgetJournal,
+        usd_to_microusd,
+    )
     from scripts.eval.memory_replay import (  # type: ignore
         PRODUCTION_AUTO_COMPACT_POLICY,
         PRODUCTION_DISALLOWED_PROVIDER_TOOLS,
@@ -48,6 +53,7 @@ else:
         run_memory_agent_schedule,
     )
     from .memory_benchmark import file_sha256
+    from .memory_budget_journal import BudgetAuthority, BudgetJournal, usd_to_microusd
     from .memory_replay import (
         PRODUCTION_AUTO_COMPACT_POLICY,
         PRODUCTION_DISALLOWED_PROVIDER_TOOLS,
@@ -152,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--validators", type=Path)
     parser.add_argument("--run-dir", type=Path)
+    parser.add_argument("--budget-journal", type=Path)
     parser.add_argument("--auth-file", type=Path, default=Path.home() / ".metacodes" / "auth.json")
     parser.add_argument("--timeout-seconds", type=int, default=300)
     parser.add_argument("--max-output-tokens", type=int, default=4096)
@@ -188,49 +195,82 @@ def main(argv: list[str] | None = None) -> int:
         raise ValidationError("production pilot requires --allow-paid-rollouts")
     if args.run_dir is None:
         raise ValidationError("production pilot requires a fresh --run-dir")
+    if args.budget_journal is None:
+        raise ValidationError("production pilot requires --budget-journal")
     run_dir = args.run_dir.expanduser().resolve()
     if run_dir.exists():
         raise ValidationError("production --run-dir must not already exist")
 
-    api_key = _load_api_key(args.auth_file.expanduser().resolve())
-    # The key was never present in this process's initial environment. The
-    # metacodes child receives it only through an anonymous inherited FD and
-    # closes that descriptor before App/tools/subprocesses are initialized.
-    production = _config(args, api_key, authorized=True)
-    production.validate(len(manifest["schedule"]))
-    metacodes_sha = file_sha256(metacodes)
-    tinykg_sha = file_sha256(tinykg)
-    observations, receipt = run_memory_agent_schedule(
-        metacodes_binary=metacodes,
-        expected_metacodes_sha256=metacodes_sha,
-        tinykg_binary=tinykg,
-        expected_tinykg_sha256=tinykg_sha,
-        source_path=source,
-        manifest_path=manifest_path,
-        run_dir=run_dir,
-        observations_path=run_dir / "observations.jsonl",
-        runtime_receipt_path=run_dir / "runtime-receipt.json",
-        validator_bundle_path=(args.validators.expanduser().resolve() if args.validators else None),
-        timeout_seconds=args.timeout_seconds,
-        production=production,
+    journal_candidate = args.budget_journal.expanduser()
+    if not journal_candidate.is_absolute():
+        journal_candidate = (Path.cwd() / journal_candidate).absolute()
+    try:
+        journal_candidate.relative_to(run_dir.resolve(strict=False))
+    except ValueError:
+        pass
+    else:
+        raise ValidationError("budget journal must be outside the fresh run directory")
+    journal_parent = journal_candidate.parent.resolve(strict=True)
+    journal_path = journal_parent / journal_candidate.name
+    try:
+        journal_path.relative_to(run_dir.resolve(strict=False))
+    except ValueError:
+        pass
+    else:
+        raise ValidationError("budget journal must be outside the fresh run directory")
+    authority = BudgetAuthority(
+        manifest_sha256=hashlib.sha256(stable_json(manifest).encode("utf-8")).hexdigest(),
+        model_fingerprint=manifest["execution"]["model_fingerprint"],
+        provider_identity="metask-anthropic-compatible-v1",
+        total_cost_microusd=usd_to_microusd(args.max_total_cost_usd),
+        total_metered_tokens=args.max_total_metered_tokens,
     )
-    validate_runtime_artifacts(receipt, run_dir)
-    summary = {
-        "dry_run": False,
-        "quality_evidence": receipt["quality_evidence"],
-        "run_dir": str(run_dir),
-        "rollouts": len(observations),
-        "provider_requests": receipt["provider_requests"],
-        "tool_network_isolation": receipt["tool_network_isolation"],
-        "filesystem_isolation": receipt["filesystem_isolation"],
-        "auto_compact_policy": receipt["auto_compact_policy"],
-        "provider_billed_cost_usd": receipt["provider_billed_cost_usd"],
-        "estimated_cost_usd": receipt["estimated_cost_usd"],
-        "metered_tokens": receipt["metered_tokens"],
-        "receipt_sha256": hashlib.sha256(
-            (stable_json(receipt) + "\n").encode("utf-8")
-        ).hexdigest(),
-    }
+    with BudgetJournal(journal_path, authority) as budget_journal:
+        api_key = _load_api_key(args.auth_file.expanduser().resolve())
+        # The key was never present in this process's initial environment. The
+        # metacodes child receives it only through an anonymous inherited FD and
+        # closes that descriptor before App/tools/subprocesses are initialized.
+        production = _config(args, api_key, authorized=True)
+        production.validate(len(manifest["schedule"]))
+        metacodes_sha = file_sha256(metacodes)
+        tinykg_sha = file_sha256(tinykg)
+        observations, receipt = run_memory_agent_schedule(
+            metacodes_binary=metacodes,
+            expected_metacodes_sha256=metacodes_sha,
+            tinykg_binary=tinykg,
+            expected_tinykg_sha256=tinykg_sha,
+            source_path=source,
+            manifest_path=manifest_path,
+            run_dir=run_dir,
+            observations_path=run_dir / "observations.jsonl",
+            runtime_receipt_path=run_dir / "runtime-receipt.json",
+            validator_bundle_path=(
+                args.validators.expanduser().resolve() if args.validators else None
+            ),
+            timeout_seconds=args.timeout_seconds,
+            production=production,
+            budget_journal=budget_journal,
+        )
+        validate_runtime_artifacts(receipt, run_dir)
+        summary = {
+            "dry_run": False,
+            "quality_evidence": receipt["quality_evidence"],
+            "run_dir": str(run_dir),
+            "rollouts": len(observations),
+            "provider_requests": receipt["provider_requests"],
+            "tool_network_isolation": receipt["tool_network_isolation"],
+            "filesystem_isolation": receipt["filesystem_isolation"],
+            "auto_compact_policy": receipt["auto_compact_policy"],
+            "provider_billed_cost_usd": receipt["provider_billed_cost_usd"],
+            "estimated_cost_usd": receipt["estimated_cost_usd"],
+            "metered_tokens": receipt["metered_tokens"],
+            "budget_journal_id": receipt["budget_journal"]["journal_id"],
+            "budget_journal_revision": receipt["budget_journal"]["revision"],
+            "budget_journal_head_sha256": receipt["budget_journal"]["head_sha256"],
+            "receipt_sha256": hashlib.sha256(
+                (stable_json(receipt) + "\n").encode("utf-8")
+            ).hexdigest(),
+        }
     print(stable_json(summary))
     return 0
 

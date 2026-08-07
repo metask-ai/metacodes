@@ -21,12 +21,20 @@ from scripts.eval.memory_agent_runtime import (
     _sanitized_environment,
     _xxhash64,
 )
+from scripts.eval.memory_budget_journal import (
+    BudgetAuthority,
+    BudgetJournal,
+    BudgetTransaction,
+    usd_to_microusd,
+    usd_to_microusd_ceiling,
+)
 from scripts.eval.memory_replay import (
     PRODUCTION_PRICING_PROVENANCE,
     PRODUCTION_AUTO_COMPACT_POLICY,
     PRODUCTION_CHILD_PATH,
     PRODUCTION_DISALLOWED_PROVIDER_TOOLS,
     PRODUCTION_FILESYSTEM_ISOLATION,
+    LEGACY_PRODUCTION_RUNNER_SOURCE_MODULES,
     PRODUCTION_RUNNER_SOURCE_MODULES,
     PRODUCTION_TOOL_NETWORK_ISOLATION,
     RUNNER_SOURCE_MODULES,
@@ -264,6 +272,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             manifest_path = root / "manifest.json"
             manifest_path.write_text(stable_json(manifest) + "\n", encoding="utf-8")
             missing_auth = root / "must-not-be-read.json"
+            budget_journal = root / "must-not-be-created-budget-journal.json"
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 code = production_pilot_main(
@@ -278,6 +287,8 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                         str(manifest_path),
                         "--auth-file",
                         str(missing_auth),
+                        "--budget-journal",
+                        str(budget_journal),
                         "--dry-run",
                     ]
                 )
@@ -287,6 +298,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             self.assertEqual(plan["network_requests"], 0)
             self.assertFalse(plan["credential_loaded"])
             self.assertFalse(missing_auth.exists())
+            self.assertFalse(budget_journal.exists())
 
     def test_production_secret_scan_rejects_artifact_and_pending_receipt(self):
         secret = 'super-secret-"escaped"-key'
@@ -953,7 +965,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 "path": f"runner-sources/{module}.py",
                 "sha256": digest(f"production-runner:{module}"),
             }
-            for module in PRODUCTION_RUNNER_SOURCE_MODULES
+            for module in LEGACY_PRODUCTION_RUNNER_SOURCE_MODULES
         ]
         receipt["arms"] = copy.deepcopy(manifest["execution"]["arms"])
         for source in receipt["runner_sources"]:
@@ -1115,6 +1127,95 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             paths = rollout["artifact_paths"]
             rollout["transcript_sha256"] = _artifact_tree_digest(root / paths["transcript"])
             rollout["workspace_sha256"] = _artifact_tree_digest(root / paths["workspace"])
+        return manifest, observations, receipt
+
+    def _v5(self, root):
+        manifest, observations, receipt = self._v4(root)
+        receipt["schema_version"] = 5
+        journal_module = "memory_budget_journal"
+        runner_path = root / "runner-sources" / f"{journal_module}.py"
+        runner_path.write_text("production budget journal source\n", encoding="utf-8")
+        receipt["runner_sources"].append(
+            {
+                "module": journal_module,
+                "path": f"runner-sources/{journal_module}.py",
+                "sha256": hashlib.sha256(runner_path.read_bytes()).hexdigest(),
+            }
+        )
+        arms = {arm["id"]: arm for arm in receipt["arms"]}
+        for rollout in receipt["rollouts"]:
+            runtime_arm = (
+                "codex_style"
+                if rollout["arm"] in {"no_memory", "codex_style"}
+                else "claude_style"
+                if rollout["arm"] in {"markdown_memory", "claude_style"}
+                else "tinykg"
+            )
+            rollout["harness_fingerprint"] = _production_harness_fingerprint(
+                metacodes_binary_sha256=receipt["metacodes_binary_sha256"],
+                tinykg_binary_sha256=(
+                    receipt["tinykg_binary_sha256"] if runtime_arm == "tinykg" else None
+                ),
+                harness_revision=receipt["harness_revision"],
+                arm=arms[rollout["arm"]],
+                runtime_arm=runtime_arm,
+                runtime_budget=receipt["budget"],
+                runner_sources=receipt["runner_sources"],
+            )
+
+        authority = BudgetAuthority(
+            manifest_sha256=receipt["manifest_sha256"],
+            model_fingerprint=receipt["model_fingerprint"],
+            provider_identity=receipt["provider_id"],
+            total_cost_microusd=usd_to_microusd(
+                receipt["budget"]["max_total_cost_usd"]
+            ),
+            total_metered_tokens=receipt["budget"]["max_total_metered_tokens"],
+        )
+        journal_path = root / "test-budget-control" / "journal.json"
+        journal_path.parent.mkdir(mode=0o700)
+        with BudgetJournal(journal_path, authority) as journal:
+            for rollout in receipt["rollouts"]:
+                transaction = BudgetTransaction(
+                    run_id=rollout["run_id"],
+                    manifest_sha256=receipt["manifest_sha256"],
+                    model_fingerprint=receipt["model_fingerprint"],
+                    harness_fingerprint=rollout["harness_fingerprint"],
+                    provider_identity=receipt["provider_id"],
+                    max_cost_microusd=usd_to_microusd(
+                        receipt["budget"]["max_rollout_cost_usd"]
+                    ),
+                    max_metered_tokens=receipt["budget"][
+                        "max_rollout_metered_tokens"
+                    ],
+                )
+                reserved = journal.reserve(transaction)
+                authorized = journal.authorize_request(
+                    reserved["transaction_id"],
+                    expected_revision=reserved["journal_revision"],
+                    expected_head_sha256=reserved["journal_head_sha256"],
+                )
+                rollout["budget_transaction"] = journal.commit(
+                    authorized["transaction_id"],
+                    actual_cost_microusd=usd_to_microusd_ceiling(
+                        rollout["estimated_cost_usd"]
+                    ),
+                    actual_metered_tokens=rollout["metered_tokens"],
+                )
+                grader = next(
+                    item["fingerprint"]
+                    for item in receipt["graders"]
+                    if item["case_id"] == rollout["case_id"]
+                )
+                self._materialize_valid_production_events(root, rollout, grader)
+            checkpoint = journal.checkpoint_payload()
+            checkpoint_path = root / "budget-journal-checkpoint.json"
+            checkpoint_path.write_bytes(checkpoint)
+            receipt["budget_journal"] = {
+                **journal.snapshot(),
+                "checkpoint_path": "budget-journal-checkpoint.json",
+                "checkpoint_sha256": hashlib.sha256(checkpoint).hexdigest(),
+            }
         return manifest, observations, receipt
 
     def test_v2_receipt_binds_native_rows_and_rejects_replay_laundering(self):
@@ -1299,6 +1400,58 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             runner = root / receipt["runner_sources"][0]["path"]
             runner.write_text("tampered runner\n", encoding="utf-8")
             with self.assertRaisesRegex(ValidationError, "runtime source mismatch"):
+                validate_runtime_artifacts(receipt, root)
+
+    def test_v5_receipt_binds_durable_budget_transactions_and_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, observations, receipt = self._v5(root)
+            validate_runtime_receipt(
+                receipt,
+                manifest,
+                observations,
+                manifest["dataset"]["source_sha256"],
+            )
+            validate_runtime_artifacts(receipt, root)
+
+            self.assertEqual(
+                receipt["budget_journal"]["transaction_states"],
+                {"committed": len(receipt["rollouts"])},
+            )
+            self.assertTrue(
+                all(
+                    rollout["budget_transaction"]["state"] == "committed"
+                    for rollout in receipt["rollouts"]
+                )
+            )
+
+            authorized_drift = copy.deepcopy(receipt)
+            authorized_drift["rollouts"][0]["budget_transaction"][
+                "authorization_revision"
+            ] = 1
+            with self.assertRaisesRegex(ValidationError, "authorization_revision"):
+                validate_runtime_receipt(
+                    authorized_drift,
+                    manifest,
+                    observations,
+                    manifest["dataset"]["source_sha256"],
+                )
+
+            usage_drift = copy.deepcopy(receipt)
+            usage_drift["rollouts"][0]["budget_transaction"][
+                "actual_metered_tokens"
+            ] += 1
+            with self.assertRaisesRegex(ValidationError, "actual_metered_tokens"):
+                validate_runtime_receipt(
+                    usage_drift,
+                    manifest,
+                    observations,
+                    manifest["dataset"]["source_sha256"],
+                )
+
+            checkpoint = root / receipt["budget_journal"]["checkpoint_path"]
+            checkpoint.write_bytes(checkpoint.read_bytes()[:-1])
+            with self.assertRaisesRegex(ValidationError, "checkpoint bytes drifted"):
                 validate_runtime_artifacts(receipt, root)
 
         manifest, observations, receipt = self._v3()

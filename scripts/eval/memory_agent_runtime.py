@@ -31,7 +31,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, MutableMapping, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Sequence, Tuple
 
 from .e2e_adapter import (
     NATIVE_EVENT_SCHEMA_VERSION,
@@ -39,6 +39,12 @@ from .e2e_adapter import (
     finalize_evaluation_fd,
 )
 from .memory_benchmark import PROTOCOL_ID, file_sha256
+from .memory_budget_journal import (
+    BudgetJournal,
+    BudgetTransaction,
+    usd_to_microusd,
+    usd_to_microusd_ceiling,
+)
 from .memory_procedural_adapter import (
     evaluate_workspace,
     validate_validator_bundle,
@@ -79,7 +85,7 @@ from .model import ValidationError, stable_json
 
 
 RUNTIME_RECEIPT_SCHEMA_VERSION = 3
-PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 4
+PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 5
 RUNTIME_METADATA_SCHEMA_VERSION = NATIVE_EVENT_SCHEMA_VERSION
 SCRIPTED_PROVIDER_ID = "metacodes-memory-scripted-lifecycle-v3"
 SCRIPTED_LIFECYCLE_MODE = "native-agent-loop-scripted-lifecycle-smoke"
@@ -104,6 +110,7 @@ ARM_TO_RUNTIME = {
 }
 SAFE_STOP_REASONS = frozenset({"end_turn", "max_turns", "tool_loop", "budget"})
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+BudgetFaultHook = Callable[[str, Mapping[str, Any]], None]
 
 
 @dataclass(frozen=True)
@@ -1211,12 +1218,14 @@ def run_memory_agent_schedule(
     validator_bundle_path: Path | None = None,
     timeout_seconds: int = 45,
     production: ProductionRuntimeConfig | None = None,
+    budget_journal: BudgetJournal | None = None,
+    budget_fault_hook: BudgetFaultHook | None = None,
 ) -> Tuple[List[Mapping[str, Any]], Mapping[str, Any]]:
     """Run one complete frozen schedule through scripted or production provider.
 
     The default remains the v3 zero-cost lifecycle smoke. Passing ``production``
-    selects the stricter v4 contract and requires explicit paid authority plus
-    schedule-wide and per-rollout caps before any provider request.
+    selects the stricter v5 contract and requires an exclusively locked,
+    persistent authorization journal before any provider-capable subprocess.
     """
 
     metacodes = metacodes_binary.expanduser().resolve()
@@ -1253,6 +1262,22 @@ def run_memory_agent_schedule(
                 "inherited credential FD transport is not implemented on Windows",
             )
         _validate_production_manifest(manifest, production)
+        if budget_journal is None:
+            _fail("production memory runtime", "requires an open persistent budget journal")
+        budget_snapshot = budget_journal.snapshot()
+        if (
+            budget_snapshot["authority"]["manifest_sha256"] != _canonical_sha256(manifest)
+            or budget_snapshot["authority"]["model_fingerprint"]
+            != manifest["execution"]["model_fingerprint"]
+            or budget_snapshot["authority"]["provider_identity"] != PRODUCTION_PROVIDER_ID
+            or budget_snapshot["authority"]["total_cost_microusd"]
+            != usd_to_microusd(production.max_total_cost_usd)
+            or budget_snapshot["authority"]["total_metered_tokens"]
+            != production.max_total_metered_tokens
+        ):
+            _fail("production memory runtime", "budget journal authority drift")
+    elif budget_journal is not None or budget_fault_hook is not None:
+        _fail("memory agent runtime", "budget journal is only valid in production mode")
 
     procedural_cases = _public_procedural_cases(source)
     public_cases = {
@@ -1563,6 +1588,9 @@ def run_memory_agent_schedule(
         started = time.monotonic_ns()
         provider_memory_verified = False
         treatment_activation: Mapping[str, Any] | None = None
+        budget_transaction_receipt: Mapping[str, Any] | None = None
+        budget_transaction_id: str | None = None
+        budget_request_authorized = False
         env = (
             _production_environment(os.environ)
             if production_mode
@@ -1604,11 +1632,26 @@ def run_memory_agent_schedule(
         ]
         try:
             if production is not None:
+                assert budget_journal is not None
                 _require_production_budget(
                     production,
                     rollout_receipts,
                     len(manifest["schedule"]) - expected_sequence,
                 )
+                reserved = budget_journal.reserve(
+                    BudgetTransaction(
+                        run_id=run_id,
+                        manifest_sha256=_canonical_sha256(manifest),
+                        model_fingerprint=manifest["execution"]["model_fingerprint"],
+                        harness_fingerprint=harness_fingerprint,
+                        provider_identity=PRODUCTION_PROVIDER_ID,
+                        max_cost_microusd=usd_to_microusd(
+                            production.max_rollout_cost_usd
+                        ),
+                        max_metered_tokens=production.max_rollout_metered_tokens,
+                    )
+                )
+                budget_transaction_id = str(reserved["transaction_id"])
                 credential_read_fd, credential_write_fd = os.pipe()
                 try:
                     credential = production.api_key.encode("utf-8")
@@ -1621,6 +1664,17 @@ def run_memory_agent_schedule(
                     os.close(credential_write_fd)
                     credential_write_fd = -1
                     env["METACODES_API_KEY_FD"] = str(credential_read_fd)
+                    budget_transaction_receipt = budget_journal.authorize_request(
+                        budget_transaction_id,
+                        expected_revision=int(reserved["journal_revision"]),
+                        expected_head_sha256=str(reserved["journal_head_sha256"]),
+                    )
+                    budget_request_authorized = True
+                    if budget_fault_hook is not None:
+                        budget_fault_hook(
+                            "after_request_authorized",
+                            budget_transaction_receipt,
+                        )
                     completed = subprocess.run(
                         [
                             *common_args[:3],
@@ -1643,6 +1697,11 @@ def run_memory_agent_schedule(
                             credential_read_fd,
                         ),
                     )
+                    if budget_fault_hook is not None:
+                        budget_fault_hook(
+                            "after_provider_return_before_commit",
+                            budget_transaction_receipt,
+                        )
                 finally:
                     if credential_write_fd >= 0:
                         os.close(credential_write_fd)
@@ -1685,11 +1744,25 @@ def run_memory_agent_schedule(
                     provider_memory_verified = provider.planner.memory_verified
         except (OSError, subprocess.TimeoutExpired) as exc:
             events_file.close()
+            if (
+                production is not None
+                and budget_transaction_id is not None
+                and not budget_request_authorized
+            ):
+                assert budget_journal is not None
+                budget_journal.abort_pre_request(budget_transaction_id)
             if production is not None:
                 _assert_production_secret_absent(resolved_run, production.api_key)
             raise ValidationError(f"native memory rollout {run_id} failed to execute: {exc}") from exc
         except BaseException:
             events_file.close()
+            if (
+                production is not None
+                and budget_transaction_id is not None
+                and not budget_request_authorized
+            ):
+                assert budget_journal is not None
+                budget_journal.abort_pre_request(budget_transaction_id)
             if production is not None:
                 _assert_production_secret_absent(resolved_run, production.api_key)
             raise
@@ -1801,6 +1874,13 @@ def run_memory_agent_schedule(
                 _fail(f"native memory rollout {run_id}", "production budget exceeded")
             if pricing_provenance != PRODUCTION_PRICING_PROVENANCE:
                 _fail(f"native memory rollout {run_id}", "production pricing provenance drift")
+            assert budget_journal is not None
+            assert budget_transaction_id is not None
+            budget_transaction_receipt = budget_journal.commit(
+                budget_transaction_id,
+                actual_cost_microusd=usd_to_microusd_ceiling(metric_cost),
+                actual_metered_tokens=metered_tokens,
+            )
 
         tool_data = _cassette_tool_data(
             cassette,
@@ -2134,6 +2214,7 @@ def run_memory_agent_schedule(
         }
         if production_mode:
             assert treatment_activation is not None
+            assert budget_transaction_receipt is not None
             rollout_receipt.update(
                 {
                     "harness_fingerprint": harness_fingerprint,
@@ -2157,6 +2238,7 @@ def run_memory_agent_schedule(
                     "memory_auto_injected_bytes": int(exposure["auto_injected_bytes"]),
                     "memory_tool_result_bytes": int(exposure["tool_result_bytes"]),
                     "treatment_activation": treatment_activation,
+                    "budget_transaction": budget_transaction_receipt,
                 }
             )
         else:
@@ -2168,6 +2250,24 @@ def run_memory_agent_schedule(
                 }
             )
         rollout_receipts.append(rollout_receipt)
+
+    budget_journal_receipt: Mapping[str, Any] | None = None
+    if production is not None:
+        assert budget_journal is not None
+        budget_checkpoint_payload = budget_journal.checkpoint_payload()
+        budget_checkpoint_path = resolved_run / "budget-journal-checkpoint.json"
+        _write_new(budget_checkpoint_path, budget_checkpoint_payload)
+        final_budget = budget_journal.snapshot()
+        if (
+            final_budget["unsettled_max_cost_microusd"] != 0
+            or final_budget["unsettled_max_metered_tokens"] != 0
+        ):
+            _fail("production memory runtime", "successful schedule has unsettled budget exposure")
+        budget_journal_receipt = {
+            **final_budget,
+            "checkpoint_path": budget_checkpoint_path.relative_to(resolved_run).as_posix(),
+            "checkpoint_sha256": _hash_bytes(budget_checkpoint_payload),
+        }
 
     receipt_common: Dict[str, Any] = {
         "protocol_id": PROTOCOL_ID,
@@ -2213,6 +2313,7 @@ def run_memory_agent_schedule(
                     int(rollout["metered_tokens"]) for rollout in rollout_receipts
                 ),
                 "pricing_provenance": PRODUCTION_PRICING_PROVENANCE,
+                "budget_journal": budget_journal_receipt,
             }
         )
     else:

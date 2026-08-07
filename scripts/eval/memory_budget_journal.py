@@ -15,7 +15,7 @@ import os
 import stat
 import time
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping
 
@@ -82,6 +82,20 @@ def usd_to_microusd(value: float | int | str) -> int:
     if scaled != scaled.to_integral_value():
         _fail("budget cost", "requires precision no finer than one micro-USD")
     return int(scaled)
+
+
+def usd_to_microusd_ceiling(value: float | int | str) -> int:
+    """Conservatively account sub-micro prices without ever rounding down."""
+
+    if isinstance(value, bool):
+        _fail("budget cost", "boolean is not a monetary value")
+    try:
+        decimal = Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise ValidationError(f"budget cost: invalid decimal: {exc}") from exc
+    if not decimal.is_finite() or decimal < 0:
+        _fail("budget cost", "expected a finite non-negative value")
+    return int((decimal * MICRO_USD_PER_USD).to_integral_value(rounding=ROUND_CEILING))
 
 
 def microusd_to_usd(value: int) -> float:
@@ -441,6 +455,12 @@ def _replay_document(document: Mapping[str, Any]) -> Mapping[str, Any]:
         "head_sha256": head,
         "transactions": transactions,
     }
+
+
+def validate_checkpoint_payload(payload: bytes) -> Mapping[str, Any]:
+    """Validate an exported checkpoint and return its replayed public state."""
+
+    return _replay_document(_unique_json(payload, "budget journal checkpoint"))
 
 
 class BudgetJournal:
@@ -859,3 +879,11 @@ class BudgetJournal:
             "exposure_metered_tokens": committed_tokens + maximum_tokens,
             "transaction_states": states,
         }
+
+    def checkpoint_payload(self) -> bytes:
+        """Return the current hash-chained document while retaining the lock."""
+
+        self._require_open()
+        self._reobserve()
+        assert self._document is not None
+        return (stable_json(self._document) + "\n").encode("utf-8")

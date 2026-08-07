@@ -12,6 +12,8 @@ from scripts.eval.memory_budget_journal import (
     BudgetJournal,
     BudgetTransaction,
     usd_to_microusd,
+    usd_to_microusd_ceiling,
+    validate_checkpoint_payload,
 )
 from scripts.eval.model import ValidationError
 
@@ -58,6 +60,7 @@ class MemoryBudgetJournalTest(unittest.TestCase):
     def test_exact_money_and_authority_cap(self):
         self.assertEqual(usd_to_microusd(0.9), 900_000)
         self.assertEqual(usd_to_microusd("1000"), 1_000_000_000)
+        self.assertEqual(usd_to_microusd_ceiling("0.0000003"), 1)
         with self.assertRaisesRegex(ValidationError, "precision"):
             usd_to_microusd("0.0000001")
         with self.assertRaisesRegex(ValidationError, "must not exceed"):
@@ -107,6 +110,8 @@ class MemoryBudgetJournalTest(unittest.TestCase):
                 final = recovered.snapshot()
                 self.assertEqual(final["committed_cost_microusd"], 750_000)
                 self.assertEqual(final["unsettled_max_cost_microusd"], 0)
+                checkpoint = validate_checkpoint_payload(recovered.checkpoint_payload())
+                self.assertEqual(checkpoint["head_sha256"], final["head_sha256"])
 
     def test_abort_is_only_legal_before_authorization(self):
         with tempfile.TemporaryDirectory() as directory:
