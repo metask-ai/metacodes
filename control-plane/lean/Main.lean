@@ -69,7 +69,10 @@ def main (args : List String) : IO UInt32 := do
           let buildTestRule := ruleId == "build.test-throughput-integrity.l2"
           let evalBudgetRule := ruleId == "eval.budget-checkpoint-durability.l2"
           let treatmentActivationRule := ruleId == "eval.treatment-activation.l2"
-          let controlSignal := if treatmentActivationRule then
+          let memoryIsolationRule := ruleId == "eval.memory-local-store-isolation.l2"
+          let controlSignal := if memoryIsolationRule then
+            memoryIsolationSignal topology observation
+          else if treatmentActivationRule then
             treatmentActivationSignal topology observation
           else if evalBudgetRule then
             evalBudgetSignal topology observation
@@ -81,7 +84,9 @@ def main (args : List String) : IO UInt32 := do
             executionProjectionSignal topology observation
           else
             signal topology observation
-          let state := if treatmentActivationRule then
+          let state := if memoryIsolationRule then
+            memoryIsolationNextState topology observation
+          else if treatmentActivationRule then
             treatmentActivationNextState topology observation
           else if evalBudgetRule then
             evalBudgetNextState topology observation
@@ -93,7 +98,9 @@ def main (args : List String) : IO UInt32 := do
             executionProjectionNextState topology observation
           else
             nextState topology observation
-          let allowed := if treatmentActivationRule then
+          let allowed := if memoryIsolationRule then
+            memoryIsolationReleaseAllowed topology observation
+          else if treatmentActivationRule then
             treatmentActivationReleaseAllowed topology observation
           else if evalBudgetRule then
             evalBudgetReleaseAllowed topology observation

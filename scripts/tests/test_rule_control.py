@@ -1186,6 +1186,105 @@ class TreatmentActivationSensorTests(unittest.TestCase):
         )
 
 
+class MemoryLocalStoreIsolationSensorTests(unittest.TestCase):
+    RELATIVE_SOURCES = (
+        "scripts/eval/memory_tinykg_local.py",
+        "scripts/eval/cli.py",
+        "scripts/eval/tests/test_memory_tinykg_local.py",
+        "evals/memory/pins/local-tinykg-memory-smoke-pin.json",
+    )
+
+    def make_repo(self) -> tuple[tempfile.TemporaryDirectory[str], Path]:
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        for relative in self.RELATIVE_SOURCES:
+            source = PROJECT_ROOT / relative
+            target = root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+        return temporary, root
+
+    def test_all_six_local_store_isolation_obligations_are_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        observation = rule_control.observe_memory_local_store_isolation(root)
+        self.assertTrue(observation.sensor_ok, observation.errors)
+        self.assertEqual(6, observation.declared)
+        self.assertEqual(6, observation.covered)
+        self.assertEqual(2, len(observation.feedback_bindings))
+
+    def test_missing_environment_sanitizer_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        runtime = root / "scripts/eval/memory_tinykg_local.py"
+        runtime.write_text(
+            runtime.read_text(encoding="utf-8").replace(
+                'if not key.startswith("TINYKG_")',
+                "if True",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_memory_local_store_isolation(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "sealed_child_environment_without_remote_configuration",
+            observation.missing_declarations,
+        )
+
+    def test_missing_raw_store_digest_guard_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        runtime = root / "scripts/eval/memory_tinykg_local.py"
+        runtime.write_text(
+            runtime.read_text(encoding="utf-8").replace(
+                "raw_before_reads = _tree_digest(store)",
+                'raw_before_reads = "trusted"',
+                1,
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_memory_local_store_isolation(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "raw_store_digest_guards_read_phase",
+            observation.missing_declarations,
+        )
+
+    def test_missing_native_remote_sentinel_l2_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        tests = root / "scripts/eval/tests/test_memory_tinykg_local.py"
+        tests.write_text(
+            tests.read_text(encoding="utf-8").replace(
+                "test_real_local_cli_isolated_store_and_remote_sentinels_remain_untouched",
+                "test_synthetic_local_helper_only",
+                1,
+            ),
+            encoding="utf-8",
+        )
+        observation = rule_control.observe_memory_local_store_isolation(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "three_adapter_native_sentinel_and_fault_l2",
+            observation.missing_declarations,
+        )
+
+    def test_pin_missing_one_adapter_trace_is_observed(self) -> None:
+        temporary, root = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        pin_path = root / "evals/memory/pins/local-tinykg-memory-smoke-pin.json"
+        pin = json.loads(pin_path.read_text(encoding="utf-8"))
+        pin["traces"] = pin["traces"][:-1]
+        pin_path.write_text(json.dumps(pin), encoding="utf-8")
+        observation = rule_control.observe_memory_local_store_isolation(root)
+        self.assertFalse(observation.sensor_ok)
+        self.assertIn(
+            "three_trace_identity_and_zero_remote_pin",
+            observation.missing_declarations,
+        )
+
+
 class FeedbackExecutionTests(unittest.TestCase):
     def test_shard_key_value_summary_does_not_impersonate_skipped_feedback(self) -> None:
         passed, results = rule_control.run_feedback(
@@ -1525,6 +1624,58 @@ class TopologyTests(unittest.TestCase):
             actuator_observed=True,
         )
         self.assertFalse(missing_real_dependency["feedback"])
+
+    def test_memory_isolation_rule_requires_six_obligation_kernel_and_native_feedback(self) -> None:
+        rule = self.complete_rule()
+        rule["id"] = "eval.memory-local-store-isolation.l2"
+        rule["sensor"] = {
+            "adapter": "memory_local_store_isolation",
+            "schema_version": 1,
+        }
+        rule["decision"]["kernel"] = (
+            "MetaCodesControl.ClosedLoop.memoryIsolationSignal"
+        )
+        rule["feedback"] = {
+            "kind": "python_l2_then_reobserve",
+            "reobserve": True,
+            "commands": [
+                ["zig", "build", "vendor:tinykg"],
+                [
+                    "python",
+                    "-m",
+                    "unittest",
+                    "scripts.tests.test_rule_control.MemoryLocalStoreIsolationSensorTests",
+                    "scripts.eval.tests.test_memory_tinykg_local",
+                ],
+            ],
+        }
+        topology, errors = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertTrue(topology["sensor"], errors)
+        self.assertTrue(topology["decision"], errors)
+        self.assertTrue(topology["feedback"], errors)
+
+        rule["decision"]["kernel"] = "MetaCodesControl.ClosedLoop.signal"
+        weakened, _ = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertFalse(weakened["decision"])
+
+        rule["decision"]["kernel"] = (
+            "MetaCodesControl.ClosedLoop.memoryIsolationSignal"
+        )
+        rule["feedback"]["commands"] = [rule["feedback"]["commands"][1]]
+        missing_native_dependency, _ = rule_control.link_topology(
+            rule,
+            counterexamples_ok=True,
+            actuator_observed=True,
+        )
+        self.assertFalse(missing_native_dependency["feedback"])
 
     def test_release_gate_is_observed_from_build_ci_and_telemetry_wiring(self) -> None:
         temporary, workspace, repo, actuator = self.make_actuator_workspace()

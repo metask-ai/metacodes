@@ -233,6 +233,35 @@ The feedback topology also requires `zig build vendor:tinykg` before the Python
 L2 command, so a clean checkout cannot turn missing native coverage into a
 machine-local skip.
 
+`eval.memory-local-store-isolation.l2` makes the memory-benchmark storage
+boundary a release rule rather than a convention. Its six fixed obligations
+require:
+
+- direct invocation of an explicit hash-pinned TinyKG binary, with no import
+  or execution path through the TinyKG skill harness;
+- a sealed child `HOME`/temporary directory and removal of every `TINYKG_*`
+  variable, including local-store and remote URL/key/build/config overrides;
+- a previously absent run directory whose stores, batches, home, temporary
+  files, and output remain below that owned directory;
+- an unnormalized digest of every non-lock store file and directory before and
+  after search, traversal, and store inspection, independently of the
+  normalized logical graph revision used for reproducible trace identity;
+- graph-materialization tests for HotpotQA, LongMemEval-S, and coding
+  procedural transfer, plus a real vendored-TinyKG test that poisons remote
+  configuration, preserves external sentinels, and rejects read-time writes,
+  binary drift, preexisting runs, and output escape;
+- one provenance-complete pinned native trace for each adapter, including
+  binary/source/manifest/batch/graph/trace identities and explicit zero counts
+  for skill-harness calls, remote API calls, and remote-store writes.
+
+`memoryIsolationSignal` fixes this surface at 6/6, so a weakened 5/5 sensor is
+blocked even if its surviving checks agree. Feedback first builds the vendored
+TinyKG binary, then runs both the sensor counterexamples and the real local
+TinyKG module; any native-environment skip is treated as failure. The
+repository and actuator are re-observed before the final Lean decision. This
+rule proves the observed execution boundary and fail-closed tests—it does not
+turn a smoke trace into evidence of memory quality.
+
 ## Commands
 
 From `metacodes/`:

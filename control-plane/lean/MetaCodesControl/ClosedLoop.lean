@@ -130,6 +130,27 @@ def buildTestReleaseAllowed
     (topology : Topology) (observation : Observation) : Bool :=
   buildTestSignal topology observation == .admitRelease
 
+/-- The memory-benchmark storage boundary has six non-substitutable links:
+direct invocation of a hash-pinned TinyKG binary, a sealed child environment,
+fresh run-local path containment, a raw store-digest read guard, native L2
+sentinel/fault feedback across all three adapters, and a provenance-complete
+three-trace pin. A weakened adapter cannot redefine its surviving subset as a
+safe local benchmark after silently reconnecting the remote skill harness. -/
+def memoryIsolationSignal
+    (topology : Topology) (observation : Observation) : Signal :=
+  if observation.declared == 6 then signal topology observation else .blockRelease
+
+def memoryIsolationNextState
+    (topology : Topology) (observation : Observation) : RuleState :=
+  match memoryIsolationSignal topology observation with
+  | .blockRelease => .blocked
+  | .runFeedback => .verifying
+  | .admitRelease => .compliant
+
+def memoryIsolationReleaseAllowed
+    (topology : Topology) (observation : Observation) : Bool :=
+  memoryIsolationSignal topology observation == .admitRelease
+
 /-- An admitted rule can never be a formalization orphan. -/
 theorem admitted_implies_closed_loop
     (topology : Topology) (observation : Observation)
@@ -259,6 +280,37 @@ theorem build_test_wrong_cardinality_blocks
     (wrong : observation.declared ≠ 7) :
     buildTestSignal topology observation = .blockRelease := by
   simp [buildTestSignal, wrong]
+
+/-- Admission proves that every part of the local-store isolation boundary was
+observed and survived native feedback; a self-consistent 5/5 projection is not
+an admissible substitute for the fixed six-part boundary. -/
+theorem memory_isolation_admitted_implies_six_obligations
+    (topology : Topology) (observation : Observation)
+    (admitted : memoryIsolationReleaseAllowed topology observation = true) :
+    observation.declared = 6 ∧ observation.covered = 6 := by
+  simp [memoryIsolationReleaseAllowed, memoryIsolationSignal] at admitted
+  split at admitted
+  · rename_i declaredSix
+    have genericAdmitted : releaseAllowed topology observation = true := by
+      simpa [releaseAllowed] using admitted
+    have exact := admitted_implies_zero_deviation topology observation genericAdmitted
+    omega
+  · simp at admitted
+
+theorem memory_isolation_missing_obligation_blocks
+    (topology : Topology) (observation : Observation)
+    (declaresSix : observation.declared = 6)
+    (missing : observation.covered < 6) :
+    memoryIsolationSignal topology observation = .blockRelease := by
+  simp [memoryIsolationSignal, declaresSix]
+  apply missing_evidence_blocks topology observation
+  omega
+
+theorem memory_isolation_wrong_cardinality_blocks
+    (topology : Topology) (observation : Observation)
+    (wrong : observation.declared ≠ 6) :
+    memoryIsolationSignal topology observation = .blockRelease := by
+  simp [memoryIsolationSignal, wrong]
 
 /-- A theorem with any missing loop link cannot reach the compliant state. -/
 theorem orphan_cannot_be_compliant

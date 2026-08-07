@@ -33,6 +33,7 @@ SUPPORTED_SENSOR_ADAPTERS = frozenset(
         "build_test_throughput",
         "eval_budget_checkpoint",
         "treatment_activation",
+        "memory_local_store_isolation",
     )
 )
 RULE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{2,127}$")
@@ -2331,6 +2332,445 @@ def observe_treatment_activation(repo: Path) -> Observation:
     )
 
 
+def observe_memory_local_store_isolation(repo: Path) -> Observation:
+    """Observe the executable boundary between memory evals and remote TinyKG.
+
+    This adapter deliberately reads fixed production, L2, CLI, and pin paths.
+    Manifest prose cannot certify itself: source obligations are extracted from
+    Python AST nodes, feedback executes the real vendored binary, and the pin is
+    checked as a structured three-adapter provenance record.
+    """
+
+    declarations = [
+        "direct_hash_pinned_binary_without_skill_harness",
+        "sealed_child_environment_without_remote_configuration",
+        "fresh_run_local_path_containment",
+        "raw_store_digest_guards_read_phase",
+        "three_adapter_native_sentinel_and_fault_l2",
+        "three_trace_identity_and_zero_remote_pin",
+    ]
+    relative_sources = {
+        "runtime": "scripts/eval/memory_tinykg_local.py",
+        "cli": "scripts/eval/cli.py",
+        "tests": "scripts/eval/tests/test_memory_tinykg_local.py",
+        "pin": "evals/memory/pins/local-tinykg-memory-smoke-pin.json",
+    }
+    paths = {name: repo / relative for name, relative in relative_sources.items()}
+    missing_files = [relative_sources[name] for name, path in paths.items() if not path.is_file()]
+    if missing_files:
+        return Observation(
+            sensor="memory_local_store_isolation",
+            declared=len(declarations),
+            declarations=declarations,
+            missing_declarations=declarations,
+            deviation=len(declarations),
+            errors=[f"required memory-isolation source is missing: {path}" for path in missing_files],
+            fingerprint_sha256=fingerprint(paths.values()),
+        )
+
+    try:
+        sources = {
+            name: read_text(path)
+            for name, path in paths.items()
+            if name != "pin"
+        }
+        trees = {
+            name: ast.parse(source, filename=str(paths[name]))
+            for name, source in sources.items()
+        }
+        pin = require_schema(load_json(paths["pin"]), paths["pin"])
+    except (ControlError, SyntaxError) as exc:
+        return Observation(
+            sensor="memory_local_store_isolation",
+            declared=len(declarations),
+            declarations=declarations,
+            missing_declarations=declarations,
+            deviation=len(declarations),
+            errors=[f"memory-isolation source cannot be observed: {exc}"],
+            fingerprint_sha256=fingerprint(paths.values()),
+        )
+
+    def module_function_source(tree_name: str, function_name: str) -> str:
+        node = next(
+            (
+                item
+                for item in trees[tree_name].body
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and item.name == function_name
+            ),
+            None,
+        )
+        return ast.get_source_segment(sources[tree_name], node) if node is not None else ""
+
+    def class_source(tree_name: str, class_name: str) -> str:
+        node = next(
+            (
+                item
+                for item in trees[tree_name].body
+                if isinstance(item, ast.ClassDef) and item.name == class_name
+            ),
+            None,
+        )
+        return ast.get_source_segment(sources[tree_name], node) if node is not None else ""
+
+    def class_method_source(tree_name: str, class_name: str, method_name: str) -> str:
+        class_node = next(
+            (
+                item
+                for item in trees[tree_name].body
+                if isinstance(item, ast.ClassDef) and item.name == class_name
+            ),
+            None,
+        )
+        if class_node is None:
+            return ""
+        node = next(
+            (
+                item
+                for item in class_node.body
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and item.name == method_name
+            ),
+            None,
+        )
+        return ast.get_source_segment(sources[tree_name], node) if node is not None else ""
+
+    local_init = class_method_source("runtime", "LocalTinyKg", "__init__")
+    local_environment = class_method_source("runtime", "LocalTinyKg", "_environment")
+    local_command = class_method_source("runtime", "LocalTinyKg", "command")
+    smoke_source = module_function_source("runtime", "run_local_tinykg_smoke")
+    tree_digest_source = module_function_source("runtime", "_tree_digest")
+    cli_command = module_function_source("cli", "cmd_smoke_local_tinykg_memory")
+    cli_module = sources["cli"]
+
+    imports_harness = any(
+        (
+            isinstance(node, ast.Import)
+            and any("tinykg_harness" in alias.name for alias in node.names)
+        )
+        or (
+            isinstance(node, ast.ImportFrom)
+            and "tinykg_harness" in (node.module or "")
+        )
+        for node in ast.walk(trees["runtime"])
+    )
+    runtime_subprocess_calls = [
+        node
+        for node in ast.walk(trees["runtime"])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "subprocess"
+    ]
+    supported_adapter_values: set[str] = set()
+    for node in trees["runtime"].body:
+        if not isinstance(node, ast.Assign) or not any(
+            isinstance(target, ast.Name) and target.id == "SUPPORTED_ADAPTERS"
+            for target in node.targets
+        ):
+            continue
+        supported_adapter_values = {
+            item.value
+            for item in ast.walk(node.value)
+            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+        }
+
+    native_test = class_method_source(
+        "tests",
+        "LocalTinyKgNativeTest",
+        "test_real_local_cli_isolated_store_and_remote_sentinels_remain_untouched",
+    )
+    hash_and_fresh_test = class_method_source(
+        "tests",
+        "LocalTinyKgNativeTest",
+        "test_wrong_binary_hash_and_preexisting_run_fail_before_store_creation",
+    )
+    mutation_test = class_method_source(
+        "tests",
+        "LocalTinyKgFailClosedTest",
+        "test_read_only_store_mutation_fails_closed",
+    )
+    escape_test = class_method_source(
+        "tests",
+        "LocalTinyKgFailClosedTest",
+        "test_output_must_remain_inside_fresh_run_directory",
+    )
+    batch_test_class = class_source("tests", "LocalTinyKgBatchTest")
+
+    remote_keys = {
+        "TINYKG_STORE",
+        "TINYKG_REMOTE_URL",
+        "TINYKG_API_KEY",
+        "TINYKG_REMOTE_EXPECTED_BUILD_ID",
+        "TINYKG_REMOTE_CONFIG",
+    }
+
+    def hash_hex(value: Any) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 64
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    def commit_hex(value: Any) -> bool:
+        return (
+            isinstance(value, str)
+            and len(value) == 40
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    implementation = pin.get("implementation")
+    isolation = pin.get("isolation")
+    tinykg = pin.get("tinykg")
+    traces = pin.get("traces")
+    verification = pin.get("verification")
+    pin_objects = all(
+        isinstance(value, dict)
+        for value in (implementation, isolation, tinykg, verification)
+    ) and isinstance(traces, list)
+    expected_adapters = {
+        "coding-intent-families",
+        "hotpotqa-distractor",
+        "longmemeval-s-cleaned",
+    }
+    trace_adapters = {
+        trace.get("adapter_id")
+        for trace in traces
+        if isinstance(trace, dict) and isinstance(trace.get("adapter_id"), str)
+    } if isinstance(traces, list) else set()
+    trace_identity_complete = (
+        isinstance(traces, list)
+        and len(traces) == 3
+        and trace_adapters == expected_adapters
+        and all(
+            isinstance(trace, dict)
+            and all(
+                hash_hex(trace.get(field))
+                for field in (
+                    "source_sha256",
+                    "manifest_sha256",
+                    "batch_sha256",
+                    "graph_revision",
+                    "trace_sha256",
+                )
+            )
+            and trace.get("read_only_preserved") is True
+            and type(trace.get("nodes")) is int
+            and trace["nodes"] > 0
+            and type(trace.get("retrieval_hits")) is int
+            and trace["retrieval_hits"] > 0
+            and type(trace.get("graph_probe_nodes")) is int
+            and trace["graph_probe_nodes"] > 0
+            for trace in traces
+        )
+    )
+    pin_zero_remote = (
+        isinstance(isolation, dict)
+        and isolation.get("direct_cli") is True
+        and isolation.get("remote_environment_removed") is True
+        and isolation.get("stores_below_fresh_run_directory") is True
+        and isolation.get("read_phase_raw_store_digest_guard") is True
+        and isolation.get("external_store_sentinel_unchanged_in_l2") is True
+        and isolation.get("read_phase_write_fault_injection_rejected") is True
+        and isolation.get("skill_harness_invocations") == 0
+        and isolation.get("remote_api_calls") == 0
+        and isolation.get("remote_store_writes") == 0
+    )
+    pin_identity = (
+        isinstance(implementation, dict)
+        and commit_hex(implementation.get("commit"))
+        and implementation.get("entrypoint")
+        == "scripts.eval.cli smoke-local-tinykg-memory"
+        and implementation.get("trace_schema_version") == 1
+        and isinstance(tinykg, dict)
+        and tinykg.get("binary") == "zig-out/vendor/tinykg/tinykg"
+        and hash_hex(tinykg.get("binary_sha256"))
+        and type(tinykg.get("storage_format_version")) is int
+        and tinykg["storage_format_version"] >= 1
+        and isinstance(verification, dict)
+        and type(verification.get("native_local_tinykg_cases")) is int
+        and verification["native_local_tinykg_cases"] >= 1
+        and type(verification.get("targeted_tests_passed")) is int
+        and verification["targeted_tests_passed"] >= 7
+        and verification.get("targeted_tests_skipped") == 0
+    )
+
+    obligations = {
+        declarations[0]: {
+            "runtime has no TinyKG skill-harness import": not imports_harness,
+            "runtime has one explicit subprocess boundary": len(runtime_subprocess_calls) == 1,
+            "binary hash is checked before execution": all(
+                marker in local_init
+                for marker in (
+                    "file_sha256(self.binary)",
+                    "_hash(expected_sha256",
+                    "SHA-256 mismatch",
+                )
+            ),
+            "command invokes the explicit binary and explicit store": all(
+                marker in local_command
+                for marker in (
+                    "argv = [str(self.binary), action, str(resolved_store)",
+                    "subprocess.run(",
+                    "env=env",
+                )
+            ),
+            "CLI requires and forwards the expected binary hash": all(
+                marker in cli_command
+                for marker in (
+                    "run_local_tinykg_smoke(",
+                    "binary=Path(args.binary)",
+                    "expected_binary_sha256=args.expected_binary_sha256",
+                )
+            )
+            and 'add_argument("--expected-binary-sha256", required=True)' in cli_module,
+        },
+        declarations[1]: {
+            "child drops every TinyKG variable and replaces host directories": all(
+                marker in local_environment
+                for marker in (
+                    'if not key.startswith("TINYKG_")',
+                    'key not in {"HOME", "TMPDIR", "TMP", "TEMP"}',
+                    '"HOME": str(self.sealed_home)',
+                    '"TMPDIR": str(self.child_tmp)',
+                )
+            ),
+            "runtime rejects leaked TinyKG keys": all(
+                marker in local_command
+                for marker in (
+                    'key.startswith("TINYKG_")',
+                    "contains forbidden keys",
+                )
+            ),
+            "native L2 poisons every remote and store variable": all(
+                key in native_test for key in remote_keys
+            )
+            and "mock.patch.dict(os.environ, poisoned, clear=False)" in native_test,
+        },
+        declarations[2]: {
+            "run directory must be fresh and owns all child roots": all(
+                marker in local_init
+                for marker in (
+                    "if self.run_dir.exists()",
+                    "must not already exist",
+                    'self.store_root = self.run_dir / "stores"',
+                    'self.sealed_home = self.run_dir / "sealed-home"',
+                )
+            ),
+            "store and output are resolved below owned roots": all(
+                marker in local_command
+                for marker in (
+                    "resolved_store.relative_to(self.store_root)",
+                    "store escapes the isolated store root",
+                )
+            )
+            and all(
+                marker in smoke_source
+                for marker in (
+                    "resolved_output.relative_to(resolved_run_dir)",
+                    "output must stay inside the fresh run directory",
+                )
+            ),
+            "L2 rejects preexisting runs and escaping output": all(
+                marker in hash_and_fresh_test
+                for marker in ("SHA-256 mismatch", "must not already exist")
+            )
+            and all(
+                marker in escape_test
+                for marker in ("output must stay inside", "self.assertFalse(run_dir.exists())")
+            ),
+        },
+        declarations[3]: {
+            "raw digest includes the complete store tree": all(
+                marker in tree_digest_source
+                for marker in (
+                    'for path in sorted(root.rglob("*"))',
+                    "unexpected symlink",
+                    'if not path.is_file() or path.name.endswith(".lock")',
+                    "sha256",
+                )
+            ),
+            "unnormalized digest brackets every read": all(
+                marker in smoke_source
+                for marker in (
+                    "raw_before_reads = _tree_digest(store)",
+                    '"search",',
+                    '"neighbors",',
+                    "raw_after_reads = _tree_digest(store)",
+                    "if raw_before_reads != raw_after_reads",
+                    "read-only search/traversal changed store contents",
+                )
+            ),
+            "fault injection proves a read mutation is rejected": all(
+                marker in mutation_test
+                for marker in (
+                    '"FAKE_MUTATE_ON_READ": "1"',
+                    "read-only search/traversal changed",
+                    'self.assertFalse((run_dir / "trace.json").exists())',
+                )
+            ),
+        },
+        declarations[4]: {
+            "all three adapters have graph-materialization L2": all(
+                name in batch_test_class
+                for name in (
+                    "test_hotpot_batch_contains_public_sentences_and_graph_edges",
+                    "test_longmem_turn_nodes_map_back_to_official_session_unit",
+                    "test_procedural_batch_uses_online_evidence_and_queries_offline_sibling",
+                )
+            ),
+            "runtime admits exactly the three benchmark adapters": (
+                supported_adapter_values == expected_adapters
+            ),
+            "native L2 proves remote sentinels stay unchanged": all(
+                marker in native_test
+                for marker in (
+                    'marker.write_text("remote-canonical-store"',
+                    "run_local_tinykg_smoke(",
+                    'marker.read_text(encoding="utf-8"), "remote-canonical-store"',
+                    'trace["isolation"]["skill_harness_invocations"], 0',
+                    'trace["isolation"]["remote_api_calls"], 0',
+                    'trace["isolation"]["remote_store_writes"], 0',
+                )
+            ),
+            "fault and binary drift paths fail closed": bool(mutation_test)
+            and all(
+                marker in hash_and_fresh_test
+                for marker in ("SHA-256 mismatch", "must not already exist")
+            ),
+        },
+        declarations[5]: {
+            "pin has strict identity and native no-skip evidence": pin_objects and pin_identity,
+            "pin has one provenance-complete trace per adapter": trace_identity_complete,
+            "pin records zero remote access and the executable guards": pin_zero_remote,
+        },
+    }
+    covered = [name for name, checks in obligations.items() if all(checks.values())]
+    missing = [name for name in declarations if name not in covered]
+    errors: list[str] = []
+    for obligation, checks in obligations.items():
+        absent = [name for name, present in checks.items() if not present]
+        if absent:
+            errors.append(f"{obligation}: missing {', '.join(absent)}")
+
+    return Observation(
+        sensor="memory_local_store_isolation",
+        sensor_ok=not errors and len(covered) == len(declarations),
+        declared=len(declarations),
+        covered=len(covered),
+        deviation=max(len(declarations) - len(covered), 0),
+        declarations=declarations,
+        covered_declarations=covered,
+        missing_declarations=missing,
+        feedback_bindings=[
+            {"unittest": "scripts.tests.test_rule_control.MemoryLocalStoreIsolationSensorTests"},
+            {"unittest": "scripts.eval.tests.test_memory_tinykg_local"},
+        ],
+        errors=errors,
+        fingerprint_sha256=fingerprint(paths.values()),
+    )
+
+
 def observe_rule(repo: Path, rule: dict[str, Any]) -> Observation:
     sensor = rule.get("sensor")
     if not isinstance(sensor, dict):
@@ -2357,6 +2797,8 @@ def observe_rule(repo: Path, rule: dict[str, Any]) -> Observation:
         return observe_eval_budget_checkpoint(repo)
     if adapter == "treatment_activation":
         return observe_treatment_activation(repo)
+    if adapter == "memory_local_store_isolation":
+        return observe_memory_local_store_isolation(repo)
     return Observation(sensor=str(adapter), errors=[f"unsupported sensor adapter: {adapter!r}"])
 
 
@@ -2512,6 +2954,9 @@ def link_topology(
         "eval.treatment-activation.l2": (
             "MetaCodesControl.TreatmentActivation.treatmentActivationSignal"
         ),
+        "eval.memory-local-store-isolation.l2": (
+            "MetaCodesControl.ClosedLoop.memoryIsolationSignal"
+        ),
     }.get(rule.get("id"), "MetaCodesControl.ClosedLoop.signal")
     decision_ok = (
         isinstance(decision, dict)
@@ -2561,7 +3006,10 @@ def link_topology(
     ) or (
         feedback_kind == "python_l2_then_reobserve" and has_python_unittest
     )
-    if rule.get("id") == "eval.treatment-activation.l2":
+    if rule.get("id") in {
+        "eval.treatment-activation.l2",
+        "eval.memory-local-store-isolation.l2",
+    }:
         feedback_runner_ok = feedback_runner_ok and has_tinykg_build
     feedback_ok = (
         isinstance(feedback, dict)
