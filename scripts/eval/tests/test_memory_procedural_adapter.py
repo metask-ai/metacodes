@@ -11,6 +11,7 @@ from scripts.eval.cli import main
 from scripts.eval.memory_procedural_adapter import (
     ADAPTER_ID,
     ADAPTER_REVISION,
+    OFFLINE_READ_ONLY_POLICY,
     SELECTION_ALGORITHM,
     adapt_procedural,
     artifact_bytes,
@@ -85,6 +86,10 @@ class ProceduralMemoryAdapterTest(unittest.TestCase):
             self.assertGreaterEqual(splits.count("offline"), 2)
             self.assertEqual(splits[0], "online")
             for case in family["cases"]:
+                if case["split"] == "online":
+                    self.assertNotIn(OFFLINE_READ_ONLY_POLICY, case["prompt"])
+                else:
+                    self.assertTrue(case["prompt"].startswith(OFFLINE_READ_ONLY_POLICY))
                 self.assertEqual(
                     case["workspace"]["fingerprint"],
                     next(
@@ -93,6 +98,11 @@ class ProceduralMemoryAdapterTest(unittest.TestCase):
                         if item["case_id"] == case["id"]
                     ),
                 )
+
+        manifest_prompts = {case["id"]: case["prompt"] for case in manifest["cases"]}
+        for family in source_slice["families"]:
+            for case in family["cases"]:
+                self.assertEqual(manifest_prompts[case["id"]], case["prompt"])
 
         schedule_positions = {
             (entry["case_id"], entry["arm"]): entry["sequence"]
@@ -109,6 +119,12 @@ class ProceduralMemoryAdapterTest(unittest.TestCase):
                         for case in offline
                     )
                 )
+
+    def test_checked_in_v9_freeze_remains_valid_after_adapter_revision_bump(self):
+        pilot = ROOT / "evals/memory/pilots/procedural-glm52-v9"
+        source_slice = json.loads((pilot / "source.json").read_text(encoding="utf-8"))
+        validators = json.loads((pilot / "validators.json").read_text(encoding="utf-8"))
+        validate_validator_bundle(validators, source_slice)
 
     def test_adapter_is_byte_deterministic_and_family_selection_is_input_order_independent(self):
         value = load_fixture()

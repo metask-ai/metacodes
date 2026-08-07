@@ -851,6 +851,9 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
     def test_checked_in_pilot_v9_uses_new_family_and_receipt_v8_contract(self):
         pilot = ROOT / "evals/memory/pilots/procedural-glm52-v9"
         contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
+        attempt = json.loads(
+            (pilot / "attempt-001-observation.json").read_text(encoding="utf-8")
+        )
         source = json.loads((pilot / "source.json").read_text(encoding="utf-8"))
         manifest = load_manifest(pilot / "manifest.json")
         execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
@@ -908,6 +911,15 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         )
         self.assertTrue(contract["current_phase"]["paid_rollouts_authorized"])
         self.assertFalse(contract["current_phase"]["quality_evidence"])
+        self.assertEqual(attempt["outcome"]["status"], "halted")
+        self.assertEqual(attempt["outcome"]["committed_rollout_transactions"], 4)
+        self.assertEqual(attempt["outcome"]["remaining_rollouts_not_started"], 5)
+        self.assertEqual(attempt["budget_journal"]["uncertain_authorized_transactions"], 0)
+        self.assertEqual(
+            attempt["failure"]["classification"],
+            "offline-markdown-treatment-mutation",
+        )
+        self.assertFalse(attempt["outcome"]["quality_evidence"])
         ProductionRuntimeConfig(
             api_key="test-only",
             allow_paid_rollouts=True,
@@ -1301,6 +1313,15 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             ripgrep.parent.mkdir(parents=True)
             ripgrep.write_bytes(TEST_RIPGREP.read_bytes())
             ripgrep.chmod(0o500)
+            memory = artifact / "sealed-home" / ".metacodes" / "projects" / "test" / "memory"
+            memory.mkdir(parents=True)
+            memory_index = memory / "MEMORY.md"
+            memory_index.write_text("- [Procedure](procedure.md) -- durable pattern\n", encoding="utf-8")
+            memory_before = hashlib.sha256(memory_index.read_bytes()).hexdigest()
+            store_manifest = store / ".tinykg" / "store-manifest.json"
+            store_manifest.parent.mkdir()
+            store_manifest.write_text('{"revision":1}\n', encoding="utf-8")
+            store_before = hashlib.sha256(store_manifest.read_bytes()).hexdigest()
 
             sandbox = _materialize_production_sandbox(
                 profile_path=profile,
@@ -1311,6 +1332,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 metacodes=Path("/bin/echo"),
                 tinykg=Path("/bin/cat"),
                 ripgrep=ripgrep,
+                read_only_roots=(memory, store),
             )
             evidence = _run_production_sandbox_probe(
                 sandbox,
@@ -1318,11 +1340,18 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 sibling_read_path=sibling,
                 writable_root=child_tmp,
                 evidence_path=evidence_path,
+                read_only_probes=((memory, memory_index), (store, store_manifest)),
             )
             self.assertTrue(evidence["host_read_denied"])
             self.assertTrue(evidence["sibling_read_denied"])
             self.assertTrue(evidence["process_info_denied"])
             self.assertTrue(evidence["workspace_read_write_allowed"])
+            self.assertTrue(evidence["read_only_roots_enforced"])
+            self.assertEqual(evidence["read_only_root_count"], 2)
+            self.assertEqual(hashlib.sha256(memory_index.read_bytes()).hexdigest(), memory_before)
+            self.assertEqual(hashlib.sha256(store_manifest.read_bytes()).hexdigest(), store_before)
+            self.assertFalse((memory / ".metacodes-seatbelt-write-probe").exists())
+            self.assertFalse((store / ".metacodes-seatbelt-write-probe").exists())
             _assert_production_sandbox_identity(sandbox, evidence_path)
 
             sealed_probe = subprocess.run(
@@ -1332,11 +1361,19 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                         "-c",
                         'if /bin/echo changed > "$1" 2>/dev/null; then exit 21; fi; '
                         'if /bin/echo changed > "$2" 2>/dev/null; then exit 22; fi; '
-                        'if /bin/echo changed > "$3" 2>/dev/null; then exit 23; fi',
+                        'if /bin/echo changed > "$3" 2>/dev/null; then exit 23; fi; '
+                        'if /bin/echo changed > "$4" 2>/dev/null; then exit 24; fi; '
+                        'if /bin/echo changed > "$5" 2>/dev/null; then exit 25; fi; '
+                        'if /bin/echo changed > "$6" 2>/dev/null; then exit 26; fi; '
+                        'if /bin/echo changed > "$7" 2>/dev/null; then exit 27; fi',
                         "sealed-profile-probe",
                         str(profile),
                         str(evidence_path),
                         str(ripgrep),
+                        str(memory_index),
+                        str(memory / "new-memory.md"),
+                        str(store_manifest),
+                        str(store / "new-store-file"),
                     ]
                 ),
                 cwd=workspace,
@@ -1349,6 +1386,10 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             )
             self.assertEqual(sealed_probe.returncode, 0, sealed_probe.stderr)
             self.assertEqual(hashlib.sha256(ripgrep.read_bytes()).hexdigest(), TEST_RIPGREP_SHA256)
+            self.assertEqual(hashlib.sha256(memory_index.read_bytes()).hexdigest(), memory_before)
+            self.assertEqual(hashlib.sha256(store_manifest.read_bytes()).hexdigest(), store_before)
+            self.assertFalse((memory / "new-memory.md").exists())
+            self.assertFalse((store / "new-store-file").exists())
             _assert_production_sandbox_identity(sandbox, evidence_path)
 
     def test_memory_exposure_uses_only_injected_and_successful_memory_reads(self):
@@ -2517,6 +2558,19 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 "sibling_read_denied": True,
                 "process_info_denied": True,
                 "workspace_read_write_allowed": True,
+                "read_only_roots_enforced": True,
+                "read_only_root_count": (
+                    2
+                    if rollout["memory_phase"] == "offline"
+                    and rollout["memory_backend"] == "tinykg_integrated"
+                    else 1
+                    if rollout["memory_phase"] == "offline"
+                    and rollout["memory_backend"] == "markdown"
+                    else 0
+                ),
+                "read_only_roots_sha256": digest(
+                    f"sandbox-read-only-roots:{sequence}"
+                ),
             }
             probe_path = root / probe_relative
             probe_path.write_text(stable_json(probe) + "\n", encoding="utf-8")

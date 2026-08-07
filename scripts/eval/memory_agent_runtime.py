@@ -1424,6 +1424,7 @@ def _production_sandbox_profile(
     read_write_roots: Sequence[Path],
     read_only_files: Sequence[Path],
     sealed_files: Sequence[Path],
+    sealed_roots: Sequence[Path] = (),
 ) -> str:
     """Build a whole-child Seatbelt profile with a filesystem default deny.
 
@@ -1483,6 +1484,21 @@ def _production_sandbox_profile(
     for path in sealed:
         if not any(_path_is_within(str(path), root) for root in minimal_roots):
             _fail("production sandbox sealed file", "is outside the writable rollout roots")
+    sealed_directories: List[Path] = []
+    for raw in sealed_roots:
+        spelled = raw.expanduser().absolute()
+        try:
+            info = spelled.lstat()
+        except OSError as exc:
+            raise ValidationError(f"production sandbox sealed root is unavailable: {exc}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            _fail("production sandbox sealed root", "must be a real directory")
+        path = spelled.resolve(strict=True)
+        if not any(_path_is_within(str(path), root) for root in minimal_roots):
+            _fail("production sandbox sealed root", "is outside the writable rollout roots")
+        if path not in sealed_directories:
+            sealed_directories.append(path)
+    sealed_directories.sort(key=str)
 
     # Seatbelt's subpath filter does not grant metadata access to ancestors.
     # Shell startup calls getcwd(), which must stat every parent of the current
@@ -1530,9 +1546,12 @@ def _production_sandbox_profile(
             ")",
         ]
     )
-    if sealed:
+    if sealed or sealed_directories:
         lines.append("(deny file-write*")
         lines.extend(f"  (literal {_sbpl_string(str(path))})" for path in sealed)
+        lines.extend(
+            f"  (subpath {_sbpl_string(str(path))})" for path in sealed_directories
+        )
         lines.append(")")
     return "\n".join(lines) + "\n"
 
@@ -1547,6 +1566,7 @@ def _materialize_production_sandbox(
     metacodes: Path,
     tinykg: Path | None,
     ripgrep: Path,
+    read_only_roots: Sequence[Path] = (),
 ) -> ProductionSandbox:
     roots = [artifact_dir, workspace]
     if store is not None:
@@ -1555,6 +1575,7 @@ def _materialize_production_sandbox(
         read_write_roots=roots,
         read_only_files=(metacodes, ripgrep) if tinykg is None else (metacodes, tinykg, ripgrep),
         sealed_files=(profile_path, evidence_path, ripgrep),
+        sealed_roots=read_only_roots,
     )
     _write_new(profile_path, profile.encode("utf-8"))
     return ProductionSandbox(
@@ -1570,6 +1591,7 @@ def _run_production_sandbox_probe(
     sibling_read_path: Path,
     writable_root: Path,
     evidence_path: Path,
+    read_only_probes: Sequence[Tuple[Path, Path]] = (),
 ) -> Mapping[str, Any]:
     """Run a zero-network controlled negative before exposing the API key."""
 
@@ -1579,7 +1601,53 @@ def _run_production_sandbox_probe(
         if not path.is_file() or not os.access(path, os.R_OK):
             _fail(f"production sandbox {label} sentinel", "must be host-readable")
     allowed = writable_root.expanduser().resolve() / "sandbox-positive-probe.txt"
-    token = _hash_text(f"{sandbox.profile_sha256}:{host}:{sibling}")
+    validated_read_only: List[Tuple[Path, Path, Path, Path, str]] = []
+    seen_read_only_roots: set[Path] = set()
+    for raw_root, raw_file in read_only_probes:
+        spelled_root = raw_root.expanduser().absolute()
+        spelled_file = raw_file.expanduser().absolute()
+        try:
+            root_info = spelled_root.lstat()
+            file_info = spelled_file.lstat()
+        except OSError as exc:
+            raise ValidationError(f"production sandbox read-only probe is unavailable: {exc}") from exc
+        if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+            _fail("production sandbox read-only probe", "root must be a real directory")
+        if (
+            stat.S_ISLNK(file_info.st_mode)
+            or not stat.S_ISREG(file_info.st_mode)
+            or file_info.st_nlink != 1
+        ):
+            _fail("production sandbox read-only probe", "sentinel must be a single-link regular file")
+        root = spelled_root.resolve(strict=True)
+        read_only = spelled_file.resolve(strict=True)
+        try:
+            read_only.relative_to(root)
+        except ValueError:
+            _fail("production sandbox read-only probe", "sentinel must be inside its root")
+        if root in seen_read_only_roots:
+            _fail("production sandbox read-only probe", "roots must be unique")
+        seen_read_only_roots.add(root)
+        read_only_created = root / ".metacodes-seatbelt-write-probe"
+        read_only_moved = root.with_name(root.name + ".metacodes-seatbelt-move-probe")
+        if read_only_created.exists() or read_only_moved.exists():
+            _fail("production sandbox read-only probe", "mutation sentinel already exists")
+        validated_read_only.append(
+            (root, read_only, read_only_created, read_only_moved, file_sha256(read_only))
+        )
+    token = _hash_text(
+        stable_json(
+            {
+                "profile": sandbox.profile_sha256,
+                "host": str(host),
+                "sibling": str(sibling),
+                "read_only": [
+                    {"root": str(root), "sentinel": str(read_only)}
+                    for root, read_only, _created, _moved, _sha256 in validated_read_only
+                ],
+            }
+        )
+    )
     script = """
 if /usr/bin/head -c 1 "$1" >/dev/null 2>&1; then exit 11; fi
 if /usr/bin/head -c 1 "$2" >/dev/null 2>&1; then exit 12; fi
@@ -1617,6 +1685,47 @@ test "$(/bin/cat "$4")" = "$3" || exit 15
             )
         if _read_regular_file(allowed, "production sandbox positive probe").strip() != token.encode():
             _fail("production sandbox controlled negative", "writable-root round trip failed")
+        read_only_script = """
+/usr/bin/head -c 1 "$1" >/dev/null 2>&1 || exit 16
+if /bin/echo changed 2>/dev/null > "$1"; then exit 17; fi
+if /bin/echo changed 2>/dev/null > "$2"; then exit 18; fi
+if /bin/chmod 700 "$3" 2>/dev/null; then exit 19; fi
+if /bin/mv "$3" "$4" 2>/dev/null; then exit 20; fi
+""".strip()
+        for root, read_only, read_only_created, read_only_moved, read_only_sha256 in validated_read_only:
+            completed = subprocess.run(
+                sandbox.command(
+                    [
+                        "/bin/sh",
+                        "-c",
+                        read_only_script,
+                        "production-sandbox-read-only-probe",
+                        str(read_only),
+                        str(read_only_created),
+                        str(root),
+                        str(read_only_moved),
+                    ]
+                ),
+                cwd=writable_root,
+                env={"PATH": PRODUCTION_CHILD_PATH, "LC_ALL": "C", "LANG": "C"},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if completed.returncode != 0:
+                diagnostic = completed.stderr.strip().replace("\n", " ")[:512]
+                _fail(
+                    "production sandbox controlled negative",
+                    f"read-only probe exited {completed.returncode}: {diagnostic}",
+                )
+            if (
+                file_sha256(read_only) != read_only_sha256
+                or read_only_created.exists()
+                or read_only_moved.exists()
+            ):
+                _fail("production sandbox controlled negative", "read-only memory changed")
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ValidationError(f"production sandbox controlled negative failed: {exc}") from exc
     finally:
@@ -1637,6 +1746,11 @@ test "$(/bin/cat "$4")" = "$3" || exit 15
         "sibling_read_denied": True,
         "process_info_denied": True,
         "workspace_read_write_allowed": True,
+        "read_only_roots_enforced": True,
+        "read_only_root_count": len(validated_read_only),
+        "read_only_roots_sha256": _canonical_sha256(
+            [str(root) for root, _file, _created, _moved, _sha256 in validated_read_only]
+        ),
     }
     _write_new(
         evidence_path,
@@ -2088,6 +2202,14 @@ def run_memory_agent_schedule(
                 sibling_sentinel,
                 f"forbidden-sibling:{_hash_text(component)}\n".encode("utf-8"),
             )
+            offline_read_only_probes: List[Tuple[Path, Path]] = []
+            if split == "offline":
+                if memory_dir is not None and memory_index is not None:
+                    offline_read_only_probes.append((memory_dir, memory_index))
+                if store is not None:
+                    offline_read_only_probes.append(
+                        (store, store / ".tinykg" / "store-manifest.json")
+                    )
             sandbox = _materialize_production_sandbox(
                 profile_path=sandbox_profile_path,
                 evidence_path=sandbox_evidence_path,
@@ -2097,6 +2219,7 @@ def run_memory_agent_schedule(
                 metacodes=metacodes,
                 tinykg=tinykg if tinykg_enabled else None,
                 ripgrep=pinned_ripgrep,
+                read_only_roots=tuple(root for root, _file in offline_read_only_probes),
             )
             sandbox_evidence = _run_production_sandbox_probe(
                 sandbox,
@@ -2104,6 +2227,7 @@ def run_memory_agent_schedule(
                 sibling_read_path=sibling_sentinel,
                 writable_root=child_tmp,
                 evidence_path=sandbox_evidence_path,
+                read_only_probes=tuple(offline_read_only_probes),
             )
 
         events = artifact_dir / "native-events.jsonl"

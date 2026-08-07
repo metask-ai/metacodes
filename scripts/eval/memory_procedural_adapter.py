@@ -28,7 +28,18 @@ from .model import ValidationError, stable_json
 
 
 ADAPTER_ID = "coding-intent-families"
-ADAPTER_REVISION = "workspace-validator-family-v1"
+ADAPTER_REVISION = "workspace-validator-family-v2-offline-read-only"
+SUPPORTED_ADAPTER_REVISIONS = frozenset(
+    {
+        "workspace-validator-family-v1",
+        ADAPTER_REVISION,
+    }
+)
+OFFLINE_READ_ONLY_POLICY = (
+    "Evaluation policy: persistent memory, if available, is read-only for this rollout. "
+    "Use it for recall, but do not create, edit, delete, chmod, or otherwise mutate "
+    "memory artifacts."
+)
 SOURCE_SCHEMA_VERSION = 1
 SOURCE_SLICE_SCHEMA_VERSION = 1
 VALIDATOR_BUNDLE_SCHEMA_VERSION = 1
@@ -89,6 +100,12 @@ def _hash(value: Any, where: str) -> str:
 
 def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()
+
+
+def _execution_prompt(prompt: str, split: str) -> str:
+    if split == "online":
+        return prompt
+    return f"{OFFLINE_READ_ONLY_POLICY}\n\n{prompt}"
 
 
 def artifact_bytes(value: Any) -> bytes:
@@ -454,7 +471,7 @@ def _validate_source(raw: Any) -> Mapping[str, Any]:
             split_counts[split] += 1
             bindings = _bindings(case["bindings"], f"{case_where}.bindings", fields)
             try:
-                prompt = template.format_map(bindings)
+                prompt = _execution_prompt(template.format_map(bindings), split)
             except (KeyError, ValueError) as exc:
                 raise ValidationError(f"{case_where}.bindings: cannot render intent template: {exc}") from exc
             _string(prompt, f"{case_where}.prompt")
@@ -677,7 +694,17 @@ def validate_validator_bundle(
     )
     if value["schema_version"] != VALIDATOR_BUNDLE_SCHEMA_VERSION:
         _fail(f"{where}.schema_version", f"expected {VALIDATOR_BUNDLE_SCHEMA_VERSION}")
-    if value["adapter_id"] != ADAPTER_ID or value["adapter_revision"] != ADAPTER_REVISION:
+    source_adapter_id = _string(source_slice.get("adapter_id"), "public source adapter_id")
+    source_revision = _string(
+        source_slice.get("adapter_revision"),
+        "public source adapter_revision",
+    )
+    if (
+        value["adapter_id"] != ADAPTER_ID
+        or source_adapter_id != ADAPTER_ID
+        or value["adapter_revision"] != source_revision
+        or source_revision not in SUPPORTED_ADAPTER_REVISIONS
+    ):
         _fail(where, "adapter identity mismatch")
     expected_source_sha256 = hashlib.sha256(artifact_bytes(source_slice)).hexdigest()
     if _hash(value["dataset_source_sha256"], f"{where}.dataset_source_sha256") != expected_source_sha256:
