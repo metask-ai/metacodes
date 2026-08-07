@@ -88,6 +88,7 @@ ROOT = Path(__file__).resolve().parents[3]
 FIXTURES = ROOT / "evals/memory/fixtures"
 TEST_RIPGREP = Path(sys.executable).resolve()
 TEST_RIPGREP_SHA256 = hashlib.sha256(TEST_RIPGREP.read_bytes()).hexdigest()
+REAL_TINYKG = ROOT / "zig-out/vendor/tinykg/tinykg"
 
 
 def digest(label: str) -> str:
@@ -1025,6 +1026,9 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
     def test_checked_in_pilot_v11_binds_write_result_semantics_fix(self):
         pilot = ROOT / "evals/memory/pilots/procedural-glm52-v11"
         contract = json.loads((pilot / "pilot-contract.json").read_text(encoding="utf-8"))
+        attempt = json.loads(
+            (pilot / "attempt-001-observation.json").read_text(encoding="utf-8")
+        )
         manifest = load_manifest(pilot / "manifest.json")
         execution = json.loads((pilot / "execution.json").read_text(encoding="utf-8"))
 
@@ -1068,6 +1072,22 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         )
         self.assertTrue(contract["current_phase"]["paid_rollouts_authorized"])
         self.assertFalse(contract["current_phase"]["quality_evidence"])
+        self.assertEqual(attempt["outcome"]["status"], "halted")
+        self.assertEqual(attempt["outcome"]["committed_rollout_transactions"], 4)
+        self.assertEqual(attempt["budget_journal"]["uncertain_authorized_transactions"], 1)
+        self.assertEqual(
+            attempt["failure"]["classification"],
+            "offline-tinykg-cli-lock-denied-before-graph-activation",
+        )
+        self.assertTrue(attempt["memory_safety"]["markdown_memory_prompt_active"])
+        self.assertFalse(attempt["memory_safety"]["knowledge_graph_prompt_active"])
+        self.assertEqual(
+            attempt["memory_safety"]["raw_tinykg_store_digest_before"],
+            attempt["memory_safety"]["raw_tinykg_store_digest_after"],
+        )
+        self.assertEqual(attempt["unsettled_transaction"]["state"], "request_authorized")
+        self.assertTrue(attempt["outcome"]["automatic_retry_forbidden"])
+        self.assertFalse(attempt["outcome"]["quality_evidence"])
         ProductionRuntimeConfig(
             api_key="test-only",
             allow_paid_rollouts=True,
@@ -1481,6 +1501,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 tinykg=Path("/bin/cat"),
                 ripgrep=ripgrep,
                 read_only_roots=(memory, store),
+                tinykg_read_only_store=store,
             )
             evidence = _run_production_sandbox_probe(
                 sandbox,
@@ -1538,6 +1559,94 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             self.assertEqual(hashlib.sha256(store_manifest.read_bytes()).hexdigest(), store_before)
             self.assertFalse((memory / "new-memory.md").exists())
             self.assertFalse((store / "new-store-file").exists())
+            _assert_production_sandbox_identity(sandbox, evidence_path)
+
+    @unittest.skipUnless(
+        platform.system() == "Darwin" and REAL_TINYKG.is_file(),
+        "requires macOS Seatbelt and the pinned TinyKG binary",
+    )
+    def test_production_seatbelt_runs_real_read_only_tinykg_before_authorization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "run" / "rollouts" / "current"
+            workspace = root / "run" / "projects" / "current-workspace"
+            store = root / "run" / "stores" / "current.kg"
+            child_tmp = artifact / "tmp"
+            for path in (artifact, workspace, store.parent, child_tmp):
+                path.mkdir(parents=True, exist_ok=True)
+            batch = root / "run" / "episode.jsonl"
+            batch.write_text(
+                stable_json({"version": 1})
+                + "\n"
+                + stable_json(
+                    {
+                        "op": "node",
+                        "id": 1,
+                        "kind": "observation",
+                        "name": "Execution episode durable audit receipt protocol",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            def tinykg(action, *arguments):
+                completed = subprocess.run(
+                    [str(REAL_TINYKG), action, *map(str, arguments)],
+                    env={"PATH": os.defpath, "LC_ALL": "C", "LANG": "C"},
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                return completed.stdout
+
+            tinykg("init", store)
+            tinykg("apply", store, batch)
+            tinykg("rebuild-text", store)
+            store_manifest = store / ".tinykg" / "store-manifest.json"
+            store_digest_before = _artifact_tree_digest(store)
+            host = root / "host-sentinel.txt"
+            sibling = root / "run" / "sibling-sentinel.txt"
+            host.write_text("host-secret\n", encoding="utf-8")
+            sibling.write_text("sibling-secret\n", encoding="utf-8")
+            profile = artifact / "production-seatbelt.sb"
+            evidence_path = artifact / "production-seatbelt-probe.json"
+            ripgrep = artifact / "sealed-home" / ".metacodes" / "toolchain" / "rg"
+            ripgrep.parent.mkdir(parents=True)
+            ripgrep.write_bytes(TEST_RIPGREP.read_bytes())
+            ripgrep.chmod(0o500)
+            sandbox = _materialize_production_sandbox(
+                profile_path=profile,
+                evidence_path=evidence_path,
+                artifact_dir=artifact,
+                workspace=workspace,
+                store=store,
+                metacodes=Path("/bin/echo"),
+                tinykg=REAL_TINYKG,
+                ripgrep=ripgrep,
+                read_only_roots=(store,),
+                tinykg_read_only_store=store,
+            )
+            evidence = _run_production_sandbox_probe(
+                sandbox,
+                host_read_path=host,
+                sibling_read_path=sibling,
+                writable_root=child_tmp,
+                evidence_path=evidence_path,
+                read_only_probes=((store, store_manifest),),
+                tinykg_read_probe=(REAL_TINYKG, store, "execution episode"),
+            )
+            self.assertTrue(evidence["tinykg_read_probe_performed"])
+            self.assertTrue(evidence["tinykg_lock_path_clean"])
+            self.assertTrue(evidence["tinykg_store_unchanged"])
+            self.assertRegex(evidence["tinykg_store_info_sha256"], r"^[0-9a-f]{64}$")
+            self.assertRegex(evidence["tinykg_recall_sha256"], r"^[0-9a-f]{64}$")
+            self.assertFalse((store / ".tinykg-cli.lock").exists())
+            self.assertEqual(_artifact_tree_digest(store), store_digest_before)
             _assert_production_sandbox_identity(sandbox, evidence_path)
 
     def test_memory_exposure_uses_only_injected_and_successful_memory_reads(self):
@@ -2743,6 +2852,34 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 "read_only_roots_sha256": digest(
                     f"sandbox-read-only-roots:{sequence}"
                 ),
+                "tinykg_read_probe_performed": (
+                    rollout["memory_phase"] == "offline"
+                    and rollout["memory_backend"] == "tinykg_integrated"
+                ),
+                "tinykg_store_info_sha256": (
+                    digest(f"tinykg-store-info:{sequence}")
+                    if rollout["memory_phase"] == "offline"
+                    and rollout["memory_backend"] == "tinykg_integrated"
+                    else None
+                ),
+                "tinykg_recall_sha256": (
+                    digest(f"tinykg-recall:{sequence}")
+                    if rollout["memory_phase"] == "offline"
+                    and rollout["memory_backend"] == "tinykg_integrated"
+                    else None
+                ),
+                "tinykg_lock_path_clean": (
+                    True
+                    if rollout["memory_phase"] == "offline"
+                    and rollout["memory_backend"] == "tinykg_integrated"
+                    else None
+                ),
+                "tinykg_store_unchanged": (
+                    True
+                    if rollout["memory_phase"] == "offline"
+                    and rollout["memory_backend"] == "tinykg_integrated"
+                    else None
+                ),
             }
             probe_path = root / probe_relative
             probe_path.write_text(stable_json(probe) + "\n", encoding="utf-8")
@@ -3083,6 +3220,19 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             ).hexdigest()
             with self.assertRaisesRegex(ValidationError, "process_info_denied: probe did not pass"):
                 validate_runtime_artifacts(failed_probe_receipt, root)
+            probe_path.write_bytes(original_probe)
+
+            forged_tinykg_probe = json.loads(original_probe)
+            forged_tinykg_probe["tinykg_store_info_sha256"] = digest("forged-store-info")
+            probe_path.write_text(stable_json(forged_tinykg_probe) + "\n", encoding="utf-8")
+            forged_tinykg_receipt = copy.deepcopy(receipt)
+            forged_tinykg_receipt["rollouts"][0]["sandbox"]["probe_sha256"] = hashlib.sha256(
+                probe_path.read_bytes()
+            ).hexdigest()
+            with self.assertRaisesRegex(
+                ValidationError, "non-TinyKG rollout carries TinyKG read-probe claims"
+            ):
+                validate_runtime_artifacts(forged_tinykg_receipt, root)
             probe_path.write_bytes(original_probe)
 
             authorized_drift = copy.deepcopy(receipt)

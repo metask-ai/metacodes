@@ -3,6 +3,7 @@ import hashlib
 import http.server
 import json
 import os
+import platform
 import signal
 import subprocess
 import sys
@@ -12,6 +13,8 @@ import threading
 import unittest
 from pathlib import Path
 from unittest import mock
+
+import scripts.eval.memory_agent_runtime as memory_runtime
 
 from scripts.eval.e2e_adapter import NATIVE_EVENT_SCHEMA_VERSION
 from scripts.eval.memory_agent_runtime import (
@@ -43,6 +46,7 @@ ROOT = Path(__file__).resolve().parents[3]
 FIXTURES = ROOT / "evals/memory/fixtures"
 TEST_RIPGREP = Path(sys.executable).resolve()
 TEST_RIPGREP_SHA256 = hashlib.sha256(TEST_RIPGREP.read_bytes()).hexdigest()
+REAL_TINYKG = ROOT / "zig-out/vendor/tinykg/tinykg"
 
 
 class _AuthorizationObservingServer:
@@ -641,6 +645,148 @@ class MemoryBudgetRuntimeL2Test(unittest.TestCase):
                     )
                     self.assertEqual(journal.snapshot()["exposure_cost_microusd"], 0)
                 self.assertEqual(provider.requests, 0)
+
+    @unittest.skipUnless(
+        platform.system() == "Darwin" and REAL_TINYKG.is_file(),
+        "requires macOS Seatbelt and the pinned TinyKG binary",
+    )
+    def test_real_tinykg_read_probe_failure_precedes_authorization_and_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = copy.deepcopy(load_manifest(FIXTURES / "smoke-manifest.json"))
+            case = copy.deepcopy(manifest["cases"][0])
+            arm = next(
+                copy.deepcopy(item)
+                for item in manifest["execution"]["arms"]
+                if item["id"] == "tinykg_lexical"
+            )
+            control_arm = next(
+                copy.deepcopy(item)
+                for item in manifest["execution"]["arms"]
+                if item["id"] == "no_memory"
+            )
+            manifest["dataset"]["adapter_id"] = "hotpotqa-distractor"
+            manifest["dataset"]["adapter_revision"] = "real-tinykg-preauth-l2-v1"
+            source = {
+                "adapter_id": manifest["dataset"]["adapter_id"],
+                "adapter_revision": manifest["dataset"]["adapter_revision"],
+                "cases": [
+                    {
+                        "id": case["id"],
+                        "documents": [
+                            {
+                                "id": "document:warning-labels",
+                                "title": "Routine warning labels",
+                                "sentences": [
+                                    {
+                                        "id": "episode:preference:1",
+                                        "sentence_id": 0,
+                                        "text": "The user chose amber for routine warning labels.",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+            source_path = root / "source.json"
+            source_path.write_text(stable_json(source) + "\n", encoding="utf-8")
+            manifest["dataset"]["source_sha256"] = file_sha256(source_path)
+            manifest["execution"]["model_id"] = "glm-5.2"
+            manifest["execution"]["model_fingerprint"] = PRODUCTION_MODEL_FINGERPRINT
+            manifest["execution"]["harness_revision"] = "real-tinykg-preauth-l2-v1"
+            manifest["execution"]["arms"] = [arm, control_arm]
+            manifest["execution"]["trials"] = 1
+            manifest["cases"] = [case]
+            manifest["schedule"] = [
+                {
+                    "sequence": 0,
+                    "case_id": case["id"],
+                    "trial": 0,
+                    "arm": arm["id"],
+                },
+                {
+                    "sequence": 1,
+                    "case_id": case["id"],
+                    "trial": 0,
+                    "arm": control_arm["id"],
+                },
+            ]
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(stable_json(manifest) + "\n", encoding="utf-8")
+            manifest = load_manifest(manifest_path)
+            # QA manifests intentionally expose only ``test``. Inject the
+            # internal read-only phase after public validation so this L2 can
+            # isolate the runner's offline TinyKG -> budget seam without first
+            # spending an unrelated procedural online transaction.
+            runtime_manifest = copy.deepcopy(manifest)
+            runtime_manifest["cases"][0]["split"] = "offline"
+            journal_path = root / "budget-control" / "journal.json"
+            journal_path.parent.mkdir(mode=0o700)
+            production = self._production()
+            observed_probe = []
+            original_probe = memory_runtime._run_production_sandbox_probe
+
+            def fail_after_real_probe(*args, **kwargs):
+                kwargs["read_only_probes"] = tuple(
+                    item for item in kwargs["read_only_probes"] if item[1].exists()
+                )
+                probe_binary, probe_store, _probe_query = kwargs["tinykg_read_probe"]
+                rebuilt = subprocess.run(
+                    [str(probe_binary), "rebuild-text", str(probe_store)],
+                    env={"PATH": os.defpath, "LC_ALL": "C", "LANG": "C"},
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=30,
+                    check=False,
+                )
+                self.assertEqual(rebuilt.returncode, 0, rebuilt.stderr)
+                evidence = original_probe(*args, **kwargs)
+                observed_probe.append(evidence)
+                raise ValidationError("injected after real TinyKG read probe")
+
+            with _AuthorizationObservingServer(journal_path) as provider:
+                fake = root / "fake-metacodes"
+                self._write_fake_metacodes(fake, provider.url)
+                with BudgetJournal(
+                    journal_path,
+                    self._authority(runtime_manifest, production),
+                ) as journal:
+                    with mock.patch(
+                        "scripts.eval.memory_agent_runtime._run_production_sandbox_probe",
+                        side_effect=fail_after_real_probe,
+                    ), mock.patch(
+                        "scripts.eval.memory_agent_runtime.load_manifest",
+                        return_value=runtime_manifest,
+                    ):
+                        with self.assertRaisesRegex(
+                            ValidationError, "injected after real TinyKG read probe"
+                        ):
+                            run_dir = root / "run-real-tinykg-preauth"
+                            run_memory_agent_schedule(
+                                metacodes_binary=fake,
+                                expected_metacodes_sha256=file_sha256(fake),
+                                tinykg_binary=REAL_TINYKG,
+                                expected_tinykg_sha256=file_sha256(REAL_TINYKG),
+                                source_path=source_path,
+                                manifest_path=manifest_path,
+                                run_dir=run_dir,
+                                observations_path=run_dir / "observations.jsonl",
+                                runtime_receipt_path=run_dir / "runtime-receipt.json",
+                                timeout_seconds=30,
+                                production=production,
+                                budget_journal=journal,
+                            )
+                    snapshot = journal.snapshot()
+                    self.assertEqual(snapshot["transaction_states"], {})
+                    self.assertEqual(snapshot["exposure_cost_microusd"], 0)
+                    self.assertEqual(snapshot["exposure_metered_tokens"], 0)
+                self.assertEqual(provider.requests, 0)
+                self.assertEqual(len(observed_probe), 1)
+                self.assertTrue(observed_probe[0]["tinykg_store_unchanged"])
+                self.assertTrue(observed_probe[0]["tinykg_lock_path_clean"])
 
 if __name__ == "__main__":
     unittest.main()

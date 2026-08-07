@@ -1425,6 +1425,7 @@ def _production_sandbox_profile(
     read_only_files: Sequence[Path],
     sealed_files: Sequence[Path],
     sealed_roots: Sequence[Path] = (),
+    transient_write_roots: Sequence[Path] = (),
 ) -> str:
     """Build a whole-child Seatbelt profile with a filesystem default deny.
 
@@ -1499,6 +1500,42 @@ def _production_sandbox_profile(
         if path not in sealed_directories:
             sealed_directories.append(path)
     sealed_directories.sort(key=str)
+    transient_directories: List[Path] = []
+    for raw in transient_write_roots:
+        spelled = raw.expanduser().absolute()
+        if spelled.name != ".tinykg-cli.lock":
+            _fail(
+                "production sandbox transient write root",
+                "only the TinyKG CLI lock path is supported",
+            )
+        try:
+            spelled.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise ValidationError(
+                f"production sandbox transient write root is unavailable: {exc}"
+            ) from exc
+        else:
+            _fail("production sandbox transient write root", "must not already exist")
+        parent = spelled.parent
+        try:
+            parent_info = parent.lstat()
+        except OSError as exc:
+            raise ValidationError(
+                f"production sandbox transient write parent is unavailable: {exc}"
+            ) from exc
+        if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
+            _fail("production sandbox transient write root", "parent must be a real directory")
+        path = parent.resolve(strict=True) / spelled.name
+        if not any(_path_is_within(str(path), root) for root in sealed_directories):
+            _fail(
+                "production sandbox transient write root",
+                "must be inside a sealed read-only root",
+            )
+        if path not in transient_directories:
+            transient_directories.append(path)
+    transient_directories.sort(key=str)
 
     # Seatbelt's subpath filter does not grant metadata access to ancestors.
     # Shell startup calls getcwd(), which must stat every parent of the current
@@ -1553,6 +1590,12 @@ def _production_sandbox_profile(
             f"  (subpath {_sbpl_string(str(path))})" for path in sealed_directories
         )
         lines.append(")")
+    if transient_directories:
+        lines.append("(allow file-write*")
+        lines.extend(
+            f"  (subpath {_sbpl_string(str(path))})" for path in transient_directories
+        )
+        lines.append(")")
     return "\n".join(lines) + "\n"
 
 
@@ -1567,6 +1610,7 @@ def _materialize_production_sandbox(
     tinykg: Path | None,
     ripgrep: Path,
     read_only_roots: Sequence[Path] = (),
+    tinykg_read_only_store: Path | None = None,
 ) -> ProductionSandbox:
     roots = [artifact_dir, workspace]
     if store is not None:
@@ -1576,12 +1620,125 @@ def _materialize_production_sandbox(
         read_only_files=(metacodes, ripgrep) if tinykg is None else (metacodes, tinykg, ripgrep),
         sealed_files=(profile_path, evidence_path, ripgrep),
         sealed_roots=read_only_roots,
+        transient_write_roots=(
+            (tinykg_read_only_store / ".tinykg-cli.lock",)
+            if tinykg_read_only_store is not None
+            else ()
+        ),
     )
     _write_new(profile_path, profile.encode("utf-8"))
     return ProductionSandbox(
         profile_path=profile_path,
         profile_sha256=file_sha256(profile_path),
     )
+
+
+def _run_production_tinykg_read_probe(
+    sandbox: ProductionSandbox,
+    *,
+    tinykg_binary: Path,
+    store: Path,
+    query: str,
+    writable_root: Path,
+) -> Mapping[str, Any]:
+    binary = tinykg_binary.expanduser().resolve(strict=True)
+    resolved_store = store.expanduser().resolve(strict=True)
+    store_info = resolved_store.lstat()
+    if stat.S_ISLNK(store_info.st_mode) or not stat.S_ISDIR(store_info.st_mode):
+        _fail("production TinyKG read probe", "store must be a real directory")
+    compact_query = " ".join(query.split())
+    if not compact_query or len(compact_query.encode("utf-8")) > 400:
+        _fail("production TinyKG read probe", "query must contain 1-400 UTF-8 bytes")
+    lock_path = resolved_store / ".tinykg-cli.lock"
+    try:
+        lock_path.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise ValidationError(f"production TinyKG CLI lock path is unavailable: {exc}") from exc
+    else:
+        _fail("production TinyKG read probe", "CLI lock path already exists")
+    normalized_before = _tree_digest(resolved_store, normalize_store_manifest=True)
+    raw_before = _tree_digest(resolved_store)
+
+    def run(action: str, *arguments: str) -> str:
+        try:
+            completed = subprocess.run(
+                sandbox.command([str(binary), action, str(resolved_store), *arguments]),
+                cwd=writable_root,
+                env={"PATH": PRODUCTION_CHILD_PATH, "LC_ALL": "C", "LANG": "C"},
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ValidationError(
+                f"production TinyKG read probe {action} failed to execute: {exc}"
+            ) from exc
+        if completed.returncode != 0:
+            diagnostic = completed.stderr.strip().replace("\n", " ")[-512:]
+            _fail(
+                f"production TinyKG read probe {action}",
+                f"exited {completed.returncode}: {diagnostic}",
+            )
+        try:
+            lock_path.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise ValidationError(
+                f"production TinyKG read probe {action} cannot inspect CLI lock: {exc}"
+            ) from exc
+        else:
+            _fail(f"production TinyKG read probe {action}", "CLI lock was not released")
+        return completed.stdout
+
+    info_output = run("store-info")
+    parsed_info = _store_info(info_output)
+    if (
+        parsed_info.get("storage_format_version") != "2"
+        or parsed_info.get("schema_version") != "3"
+        or parsed_info.get("text_current") != "1"
+        or parsed_info.get("text_stale") != "0"
+    ):
+        _fail("production TinyKG read probe", "store is not current and recall-ready")
+    recall_output = run(
+        "search",
+        compact_query,
+        "--profile",
+        "agent-memory",
+        "--limit",
+        "1",
+        "--format",
+        "json",
+    )
+    try:
+        recall = json.loads(recall_output)
+    except json.JSONDecodeError as exc:
+        raise ValidationError(f"production TinyKG read probe returned invalid JSON: {exc}") from exc
+    hits = recall.get("hits") if isinstance(recall, dict) else None
+    if (
+        not isinstance(recall, dict)
+        or recall.get("schema_version") != "tinykg-agent-retrieval-v1"
+        or not isinstance(hits, list)
+        or not hits
+    ):
+        _fail("production TinyKG read probe", "recall returned no bounded evidence")
+    if (
+        _tree_digest(resolved_store, normalize_store_manifest=True) != normalized_before
+        or _tree_digest(resolved_store) != raw_before
+    ):
+        _fail("production TinyKG read probe", "read-only commands changed store bytes")
+    return {
+        "tinykg_read_probe_performed": True,
+        "tinykg_store_info_sha256": _hash_bytes(info_output.encode("utf-8")),
+        "tinykg_recall_sha256": _hash_bytes(recall_output.encode("utf-8")),
+        "tinykg_lock_path_clean": True,
+        "tinykg_store_unchanged": True,
+    }
 
 
 def _run_production_sandbox_probe(
@@ -1592,6 +1749,7 @@ def _run_production_sandbox_probe(
     writable_root: Path,
     evidence_path: Path,
     read_only_probes: Sequence[Tuple[Path, Path]] = (),
+    tinykg_read_probe: Tuple[Path, Path, str] | None = None,
 ) -> Mapping[str, Any]:
     """Run a zero-network controlled negative before exposing the API key."""
 
@@ -1734,6 +1892,23 @@ if /bin/mv "$3" "$4" 2>/dev/null; then exit 20; fi
         except FileNotFoundError:
             pass
 
+    tinykg_evidence: Mapping[str, Any] = {
+        "tinykg_read_probe_performed": False,
+        "tinykg_store_info_sha256": None,
+        "tinykg_recall_sha256": None,
+        "tinykg_lock_path_clean": None,
+        "tinykg_store_unchanged": None,
+    }
+    if tinykg_read_probe is not None:
+        tinykg_binary, tinykg_store, tinykg_query = tinykg_read_probe
+        tinykg_evidence = _run_production_tinykg_read_probe(
+            sandbox,
+            tinykg_binary=tinykg_binary,
+            store=tinykg_store,
+            query=tinykg_query,
+            writable_root=writable_root,
+        )
+
     evidence = {
         "schema_version": PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION,
         "backend": PRODUCTION_SANDBOX_BACKEND,
@@ -1751,6 +1926,7 @@ if /bin/mv "$3" "$4" 2>/dev/null; then exit 20; fi
         "read_only_roots_sha256": _canonical_sha256(
             [str(root) for root, _file, _created, _moved, _sha256 in validated_read_only]
         ),
+        **tinykg_evidence,
     }
     _write_new(
         evidence_path,
@@ -2220,6 +2396,22 @@ def run_memory_agent_schedule(
                 tinykg=tinykg if tinykg_enabled else None,
                 ripgrep=pinned_ripgrep,
                 read_only_roots=tuple(root for root, _file in offline_read_only_probes),
+                tinykg_read_only_store=(
+                    store if split == "offline" and store is not None else None
+                ),
+            )
+            tinykg_probe_query_bytes = (
+                "execution episode"
+                if case["benchmark"] == "procedural_transfer"
+                else " ".join(str(case["prompt"]).split())
+            ).encode("utf-8")[:400]
+            tinykg_probe_query = tinykg_probe_query_bytes.decode(
+                "utf-8", errors="ignore"
+            ).rstrip()
+            _assert_executable_identity(
+                tinykg,
+                expected_tinykg_sha256,
+                "production TinyKG binary before sandbox probe",
             )
             sandbox_evidence = _run_production_sandbox_probe(
                 sandbox,
@@ -2228,6 +2420,16 @@ def run_memory_agent_schedule(
                 writable_root=child_tmp,
                 evidence_path=sandbox_evidence_path,
                 read_only_probes=tuple(offline_read_only_probes),
+                tinykg_read_probe=(
+                    (tinykg, store, tinykg_probe_query)
+                    if split == "offline" and store is not None
+                    else None
+                ),
+            )
+            _assert_executable_identity(
+                tinykg,
+                expected_tinykg_sha256,
+                "production TinyKG binary after sandbox probe",
             )
 
         events = artifact_dir / "native-events.jsonl"

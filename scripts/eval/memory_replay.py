@@ -138,7 +138,8 @@ PRODUCTION_ALLOWED_PROVIDER_TOOLS = (
 PRODUCTION_TOOL_NETWORK_ISOLATION = "not_proven_bash_network_unsandboxed"
 PRODUCTION_SANDBOX_BACKEND = "macos-seatbelt-sandbox-exec-v1"
 LEGACY_PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION = 1
-PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION = 2
+READ_ONLY_PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION = 2
+PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION = 3
 PRODUCTION_FILESYSTEM_ISOLATION = "not_proven_bypass_permissions_same_uid"
 PRODUCTION_CHILD_PATH = "/bin:/usr/bin"
 PRODUCTION_RIPGREP_SNAPSHOT_PATH = "production-toolchain/.metacodes/toolchain/rg"
@@ -2685,7 +2686,12 @@ def validate_runtime_artifacts(
                 _fail(f"{rollout_where}.sandbox.probe", "expected an object")
             probe_schema_version = raw_evidence.get("schema_version")
             legacy_probe = probe_schema_version == LEGACY_PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION
-            if not legacy_probe and probe_schema_version != PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION:
+            read_only_probe = probe_schema_version in {
+                READ_ONLY_PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION,
+                PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION,
+            }
+            tinykg_probe = probe_schema_version == PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION
+            if not legacy_probe and not read_only_probe:
                 _fail(f"{rollout_where}.sandbox.probe.schema_version", "unsupported probe")
             evidence_fields = (
                 "schema_version",
@@ -2700,11 +2706,19 @@ def validate_runtime_artifacts(
                 "process_info_denied",
                 "workspace_read_write_allowed",
             )
-            if not legacy_probe:
+            if read_only_probe:
                 evidence_fields += (
                     "read_only_roots_enforced",
                     "read_only_root_count",
                     "read_only_roots_sha256",
+                )
+            if tinykg_probe:
+                evidence_fields += (
+                    "tinykg_read_probe_performed",
+                    "tinykg_store_info_sha256",
+                    "tinykg_recall_sha256",
+                    "tinykg_lock_path_clean",
+                    "tinykg_store_unchanged",
                 )
             evidence = _object(
                 raw_evidence,
@@ -2733,7 +2747,7 @@ def validate_runtime_artifacts(
             ):
                 if evidence[claim] is not True:
                     _fail(f"{rollout_where}.sandbox.probe.{claim}", "probe did not pass")
-            if not legacy_probe:
+            if read_only_probe:
                 if evidence["read_only_roots_enforced"] is not True:
                     _fail(
                         f"{rollout_where}.sandbox.probe.read_only_roots_enforced",
@@ -2761,6 +2775,44 @@ def validate_runtime_artifacts(
                     _fail(
                         f"{rollout_where}.sandbox.probe.read_only_root_count",
                         f"expected {expected_read_only_roots}",
+                    )
+            if tinykg_probe:
+                expected_tinykg_probe = (
+                    raw_rollout.get("memory_phase") == "offline"
+                    and raw_rollout.get("memory_backend") == "tinykg_integrated"
+                )
+                if evidence["tinykg_read_probe_performed"] is not expected_tinykg_probe:
+                    _fail(
+                        f"{rollout_where}.sandbox.probe.tinykg_read_probe_performed",
+                        f"expected {expected_tinykg_probe}",
+                    )
+                if expected_tinykg_probe:
+                    for digest_key in (
+                        "tinykg_store_info_sha256",
+                        "tinykg_recall_sha256",
+                    ):
+                        _hash(
+                            evidence[digest_key],
+                            f"{rollout_where}.sandbox.probe.{digest_key}",
+                        )
+                    for claim in ("tinykg_lock_path_clean", "tinykg_store_unchanged"):
+                        if evidence[claim] is not True:
+                            _fail(
+                                f"{rollout_where}.sandbox.probe.{claim}",
+                                "probe did not pass",
+                            )
+                elif any(
+                    evidence[key] is not None
+                    for key in (
+                        "tinykg_store_info_sha256",
+                        "tinykg_recall_sha256",
+                        "tinykg_lock_path_clean",
+                        "tinykg_store_unchanged",
+                    )
+                ):
+                    _fail(
+                        f"{rollout_where}.sandbox.probe",
+                        "non-TinyKG rollout carries TinyKG read-probe claims",
                     )
         paths = raw_rollout.get("artifact_paths")
         if not isinstance(paths, dict):
