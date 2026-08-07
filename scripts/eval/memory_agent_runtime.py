@@ -49,6 +49,10 @@ from .memory_procedural_adapter import (
     evaluate_workspace,
     validate_validator_bundle,
 )
+from .memory_query_plan import (
+    SIDECAR_NAME as QUERY_PLAN_SIDECAR_NAME,
+    build_query_plan_trace,
+)
 from .memory_replay import (
     PRODUCTION_EXECUTION_MODE,
     PRODUCTION_MODEL_ID,
@@ -765,10 +769,36 @@ class _ScriptedPlanner:
                 request_id,
             )
         if self.stage == "kg_recall":
-            query = self.memory_marker if self.memory_marker is not None else self.prompt
+            query_source = self.memory_marker if self.memory_marker is not None else self.prompt
+            query = " ".join(query_source.split())
+            if len(query.encode("utf-8")) > 400:
+                query = query.encode("utf-8")[:400].decode("utf-8", errors="ignore").rstrip()
+            if not query:
+                raise ValueError("TinyKG scripted recall has no compact lexical query")
             self.stage = "kg_context"
+            intent = {
+                "procedural_transfer": "procedure_reuse",
+                "multihop_retrieval": "causal",
+                "episodic_recall": "temporal",
+            }.get(self.benchmark, "fact_lookup")
             return _tool_sse(
-                [("kg-recall-1", "KgRecall", {"query": query})],
+                [
+                    (
+                        "kg-recall-1",
+                        "KgRecall",
+                        {
+                            "query": query,
+                            "lexical_plan": {
+                                "schema_version": "lexical-query-plan-v1",
+                                "intent": intent,
+                                "stage": "seed",
+                                "variants": [{"kind": "exact", "text": query}],
+                                "variant_index": 0,
+                                "seen_node_ids": [],
+                            },
+                        },
+                    )
+                ],
                 request_id,
             )
         if self.stage == "kg_context":
@@ -2246,7 +2276,34 @@ def run_memory_agent_schedule(
                 case["prompt"],
                 memory_dir=memory_dir,
             )
+        query_plan_trace = build_query_plan_trace(
+            cassette,
+            run_id=run_id,
+            arm=arm_id,
+            memory_backend=memory_backend,
+            where=f"native memory rollout {run_id} query plan",
+        )
+        _write_new(
+            cassette / QUERY_PLAN_SIDECAR_NAME,
+            (stable_json(query_plan_trace) + "\n").encode("utf-8"),
+        )
         query_variants = tool_data["query_variants"]
+        if query_plan_trace["status"] == "verified":
+            governed_variants: List[Mapping[str, str]] = []
+            governed_text: set[str] = set()
+            for call in query_plan_trace["calls"]:
+                text = str(call["query"])
+                normalized = " ".join(text.casefold().split())
+                if normalized in governed_text:
+                    continue
+                governed_text.add(normalized)
+                governed_variants.append(
+                    {
+                        "kind": "exact" if call["stage"] == "seed" else "semantic",
+                        "text": text,
+                    }
+                )
+            query_variants = governed_variants
         retrieved = tool_data["retrieved"]
         verified = tool_data["verified"]
         graph_truncated = bool(tool_data["graph_truncated"])
@@ -2417,10 +2474,14 @@ def run_memory_agent_schedule(
 
         deterministic_success: bool | None = None
         evaluator_invalid: str | None = None
+        if query_plan_trace["status"] == "invalid":
+            evaluator_invalid = "query-plan trace invalid: " + "; ".join(
+                str(reason) for reason in query_plan_trace["invalid_reasons"]
+            )
         if case["benchmark"] == "procedural_transfer":
             validator_entry = validators.get(case["id"])
             if validator_entry is None:
-                evaluator_invalid = "validator bundle missing case"
+                evaluator_invalid = evaluator_invalid or "validator bundle missing case"
             else:
                 candidate = _read_workspace(workspace, baseline)
                 deterministic_success, _failures = evaluate_workspace(

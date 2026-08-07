@@ -29,6 +29,10 @@ from .memory_budget_journal import (
     usd_to_microusd_ceiling,
     validate_checkpoint_payload,
 )
+from .memory_query_plan import (
+    load_and_verify_query_plan_sidecar,
+    summarize_query_plan_traces,
+)
 from .model import ValidationError, stable_json
 
 
@@ -51,7 +55,7 @@ PRODUCTION_RUNTIME_RECEIPT_VERSIONS = frozenset(
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }
 )
-RUNNER_SOURCE_MODULES = (
+LEGACY_RUNNER_SOURCE_MODULES = (
     "e2e_adapter",
     "memory_agent_runtime",
     "memory_agent_runtime_smoke",
@@ -63,12 +67,21 @@ RUNNER_SOURCE_MODULES = (
     "memory_tinykg_local",
     "model",
 )
+RUNNER_SOURCE_MODULES = (
+    *LEGACY_RUNNER_SOURCE_MODULES,
+    "memory_query_plan",
+)
 LEGACY_PRODUCTION_RUNNER_SOURCE_MODULES = (
-    *RUNNER_SOURCE_MODULES,
+    *LEGACY_RUNNER_SOURCE_MODULES,
     "memory_agent_runtime_pilot",
 )
-PRODUCTION_RUNNER_SOURCE_MODULES = (
+PRE_QUERY_PLAN_PRODUCTION_RUNNER_SOURCE_MODULES = (
     *LEGACY_PRODUCTION_RUNNER_SOURCE_MODULES,
+    "memory_budget_journal",
+)
+PRODUCTION_RUNNER_SOURCE_MODULES = (
+    *RUNNER_SOURCE_MODULES,
+    "memory_agent_runtime_pilot",
     "memory_budget_journal",
 )
 PRODUCTION_PROVIDER_ID = "metask-anthropic-compatible-v1"
@@ -170,6 +183,51 @@ def _string_list(value: Any, where: str, *, allow_empty: bool) -> List[str]:
 
 def _canonical_sha256(value: Any) -> str:
     return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()
+
+
+def _query_plan_source_bound(receipt: Mapping[str, Any], where: str) -> bool:
+    """Distinguish historical receipts from query-plan-aware runs.
+
+    The runner source list is already part of the runtime receipt identity.
+    Treating arbitrary source lists as "legacy" would let a caller remove the
+    analyzer module and thereby make a missing sidecar look acceptable.
+    """
+
+    schema_version = receipt.get("schema_version")
+    if schema_version == LEGACY_RUNTIME_RECEIPT_SCHEMA_VERSION:
+        return False
+    raw_sources = receipt.get("runner_sources")
+    if not isinstance(raw_sources, list):
+        _fail(f"{where}.runner_sources", "expected an array")
+    modules: List[str] = []
+    for index, source in enumerate(raw_sources):
+        if not isinstance(source, dict):
+            _fail(f"{where}.runner_sources[{index}]", "expected an object")
+        modules.append(
+            _identifier(
+                source.get("module"),
+                f"{where}.runner_sources[{index}].module",
+            )
+        )
+    observed = tuple(modules)
+    if schema_version == RUNTIME_RECEIPT_SCHEMA_VERSION:
+        if frozenset(observed) not in {
+            frozenset(LEGACY_RUNNER_SOURCE_MODULES),
+            frozenset(RUNNER_SOURCE_MODULES),
+        }:
+            _fail(f"{where}.runner_sources", "unknown native runtime source set")
+    elif schema_version == LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+        if observed != LEGACY_PRODUCTION_RUNNER_SOURCE_MODULES:
+            _fail(f"{where}.runner_sources", "unknown legacy production source set")
+    elif schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+        if observed not in {
+            PRE_QUERY_PLAN_PRODUCTION_RUNNER_SOURCE_MODULES,
+            PRODUCTION_RUNNER_SOURCE_MODULES,
+        }:
+            _fail(f"{where}.runner_sources", "unknown production runtime source set")
+    else:
+        _fail(f"{where}.schema_version", "unsupported native runtime receipt")
+    return "memory_query_plan" in observed
 
 
 def _production_harness_fingerprint(
@@ -994,12 +1052,12 @@ def _validate_production_runtime_receipt(
             _fail(source_where, "duplicate runner source")
         source_modules.append(module)
         source_paths.add(path)
-    expected_source_modules = (
-        PRODUCTION_RUNNER_SOURCE_MODULES
+    allowed_source_modules = (
+        (PRE_QUERY_PLAN_PRODUCTION_RUNNER_SOURCE_MODULES, PRODUCTION_RUNNER_SOURCE_MODULES)
         if journal_bound
-        else LEGACY_PRODUCTION_RUNNER_SOURCE_MODULES
+        else (LEGACY_PRODUCTION_RUNNER_SOURCE_MODULES,)
     )
-    if source_modules != list(expected_source_modules):
+    if tuple(source_modules) not in allowed_source_modules:
         _fail(f"{where}.runner_sources", "does not bind the production host source set")
 
     if value["arms"] != manifest["execution"]["arms"]:
@@ -1670,7 +1728,10 @@ def validate_runtime_receipt(
                 _fail(f"{source_where}.path", "duplicate runner source path")
             observed_modules[module] = digest
             observed_paths.add(path)
-        if set(observed_modules) != set(RUNNER_SOURCE_MODULES):
+        if frozenset(observed_modules) not in {
+            frozenset(LEGACY_RUNNER_SOURCE_MODULES),
+            frozenset(RUNNER_SOURCE_MODULES),
+        }:
             _fail(f"{where}.runner_sources", "does not bind the complete host runtime source set")
     expected_mode = (
         "native-agent-loop-scripted-wiring-smoke"
@@ -2048,6 +2109,7 @@ def validate_runtime_artifacts(
     if schema_version not in NATIVE_RUNTIME_RECEIPT_VERSIONS:
         return
     seen_paths: set[str] = set()
+    query_plan_bound = _query_plan_source_bound(receipt, where)
     checkpoint_transactions: Mapping[str, Mapping[str, Any]] | None = None
     if schema_version in {
         RUNTIME_RECEIPT_SCHEMA_VERSION,
@@ -2486,6 +2548,14 @@ def validate_runtime_artifacts(
                     _fail(f"{rollout_where}.memory_read_events", "raw cassette count mismatch")
                 if expected_writes != raw_rollout.get("memory_write_events"):
                     _fail(f"{rollout_where}.memory_write_events", "raw cassette count mismatch")
+                load_and_verify_query_plan_sidecar(
+                    path,
+                    run_id=str(raw_rollout.get("run_id")),
+                    arm=str(raw_rollout.get("arm")),
+                    memory_backend=str(raw_rollout.get("memory_backend")),
+                    required=query_plan_bound,
+                    where=f"{rollout_where}.query_plan",
+                )
                 if schema_version in PRODUCTION_RUNTIME_RECEIPT_VERSIONS:
                     runtime_arm = _production_runtime_arm(str(raw_rollout.get("arm")))
                     activation = _cassette_treatment_activation(
@@ -2612,6 +2682,49 @@ def validate_runtime_artifacts(
                         f"{rollout_where}.memory_components_after.markdown",
                         "current Markdown tree no longer matches the production receipt",
                     )
+
+
+def summarize_runtime_query_plans(
+    receipt: Mapping[str, Any],
+    artifact_root: Path,
+    where: str = "memory query-plan report",
+) -> Dict[str, Any]:
+    """Validate native artifacts, then summarize only host-verifiable plan traces."""
+
+    validate_runtime_artifacts(receipt, artifact_root, f"{where}.artifacts")
+    query_plan_bound = _query_plan_source_bound(receipt, where)
+    rollouts = receipt.get("rollouts")
+    if not isinstance(rollouts, list):
+        _fail(where, "runtime receipt has no rollouts")
+    traces: List[Mapping[str, Any] | None] = []
+    for index, rollout in enumerate(rollouts):
+        rollout_where = f"{where}.rollouts[{index}]"
+        if not isinstance(rollout, dict):
+            _fail(rollout_where, "expected an object")
+        paths = rollout.get("artifact_paths")
+        if not isinstance(paths, dict):
+            _fail(f"{rollout_where}.artifact_paths", "expected an object")
+        relative = _artifact_relative_path(
+            paths.get("cassette"),
+            f"{rollout_where}.artifact_paths.cassette",
+        ).as_posix()
+        cassette = _artifact_path(
+            artifact_root,
+            relative,
+            f"{rollout_where}.artifact_paths.cassette",
+            directory=True,
+        )
+        traces.append(
+            load_and_verify_query_plan_sidecar(
+                cassette,
+                run_id=str(rollout.get("run_id")),
+                arm=str(rollout.get("arm")),
+                memory_backend=str(rollout.get("memory_backend")),
+                required=query_plan_bound,
+                where=f"{rollout_where}.query_plan",
+            )
+        )
+    return summarize_query_plan_traces(traces)
 
 
 def validate_manifest(manifest: Mapping[str, Any], where: str = "memory manifest") -> None:

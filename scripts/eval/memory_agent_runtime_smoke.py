@@ -23,6 +23,9 @@ if __package__ in {None, ""}:
     from scripts.eval.memory_hotpot_adapter import adapt_hotpot, artifact_bytes  # type: ignore
     from scripts.eval.memory_longmem_adapter import adapt_longmem  # type: ignore
     from scripts.eval.memory_procedural_adapter import adapt_procedural  # type: ignore
+    from scripts.eval.memory_query_plan import (  # type: ignore
+        load_and_verify_query_plan_sidecar,
+    )
     from scripts.eval.memory_tinykg_local import _store_info  # type: ignore
     from scripts.eval.model import stable_json  # type: ignore
 else:
@@ -30,6 +33,7 @@ else:
     from .memory_hotpot_adapter import adapt_hotpot, artifact_bytes
     from .memory_longmem_adapter import adapt_longmem
     from .memory_procedural_adapter import adapt_procedural
+    from .memory_query_plan import load_and_verify_query_plan_sidecar
     from .memory_tinykg_local import _store_info
     from .model import stable_json
 
@@ -148,10 +152,22 @@ def _run_adapter(
         for rollout in receipt["rollouts"]
     }
     for row in observations:
+        rollout = receipts[(row["case_id"], row["trial"], row["arm"])]
+        cassette = run_dir / rollout["artifact_paths"]["cassette"]
+        query_plan_trace = load_and_verify_query_plan_sidecar(
+            cassette,
+            run_id=rollout["run_id"],
+            arm=rollout["arm"],
+            memory_backend=rollout["memory_backend"],
+            required=True,
+            where=f"{label} native query plan",
+        )
+        assert query_plan_trace is not None
         if row["arm"] == "tinykg_lexical":
             if row["trajectory"]["tool_calls"] < 1 or not row["retrieval"]["query_variants"]:
                 raise RuntimeError(f"{label}: TinyKG treatment did not reach real tools")
-            rollout = receipts[(row["case_id"], row["trial"], row["arm"])]
+            if query_plan_trace["status"] != "verified":
+                raise RuntimeError(f"{label}: TinyKG query-plan receipt was not host-verified")
             store = run_dir / rollout["artifact_paths"]["store"]
             completed = subprocess.run(
                 [str(tinykg), "store-info", str(store)],
@@ -173,6 +189,8 @@ def _run_adapter(
                 if not row["retrieval"]["verified_evidence_ids"]:
                     raise RuntimeError(f"{label}: real KgContext did not verify a candidate")
         elif row["arm"] == "markdown_memory":
+            if query_plan_trace["status"] != "not_applicable":
+                raise RuntimeError(f"{label}: Markdown arm reported TinyKG query-plan activity")
             if row["trajectory"]["tool_calls"] < 1:
                 raise RuntimeError(f"{label}: Markdown treatment did not reach real tools")
             if benchmarks[row["case_id"]] != "procedural_transfer" or next(
@@ -180,8 +198,11 @@ def _run_adapter(
             ) != "online":
                 if not row["retrieval"]["query_variants"]:
                     raise RuntimeError(f"{label}: Markdown treatment did not recall durable memory")
-        elif row["trajectory"]["tool_calls"] != 0:
-            raise RuntimeError(f"{label}: no-memory control exposed treatment tools")
+        else:
+            if query_plan_trace["status"] != "not_applicable":
+                raise RuntimeError(f"{label}: no-memory arm reported TinyKG query-plan activity")
+            if row["trajectory"]["tool_calls"] != 0:
+                raise RuntimeError(f"{label}: no-memory control exposed treatment tools")
     if receipt["quality_evidence"] is not False:
         raise RuntimeError(f"{label}: wiring smoke was mislabeled as quality evidence")
     if receipt["external_network_calls"] != 0 or receipt["paid_cost_usd"] != 0:

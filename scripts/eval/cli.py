@@ -70,11 +70,13 @@ if __package__ in {None, ""}:
         artifact_bytes as procedural_adapter_artifact_bytes,
         load_execution as load_procedural_execution,
     )
+    from scripts.eval.memory_query_plan import render_query_plan_markdown  # type: ignore
     from scripts.eval.memory_replay import (  # type: ignore
         load_manifest as load_memory_manifest,
         load_observations as load_memory_observations,
         load_runtime_receipt as load_memory_runtime_receipt,
         replay_observations,
+        summarize_runtime_query_plans,
     )
     from scripts.eval.memory_tinykg_local import run_local_tinykg_smoke  # type: ignore
     from scripts.eval.paired_runner import run_multi_arm, run_paired  # type: ignore
@@ -140,11 +142,13 @@ else:
         artifact_bytes as procedural_adapter_artifact_bytes,
         load_execution as load_procedural_execution,
     )
+    from .memory_query_plan import render_query_plan_markdown
     from .memory_replay import (
         load_manifest as load_memory_manifest,
         load_observations as load_memory_observations,
         load_runtime_receipt as load_memory_runtime_receipt,
         replay_observations,
+        summarize_runtime_query_plans,
     )
     from .memory_tinykg_local import run_local_tinykg_smoke
     from .paired_runner import run_multi_arm, run_paired
@@ -221,6 +225,27 @@ def cmd_report_memory(args: argparse.Namespace) -> int:
     _write(args.markdown, render_memory_markdown(summary, args.title))
     if args.json:
         _write_json(args.json, summary)
+    return 0
+
+
+def cmd_report_memory_query_plans(args: argparse.Namespace) -> int:
+    receipt_path = Path(args.runtime_receipt).resolve()
+    receipt = load_memory_runtime_receipt(receipt_path)
+    artifact_root = (
+        Path(args.artifact_root).resolve()
+        if args.artifact_root
+        else receipt_path.parent
+    )
+    summary = summarize_runtime_query_plans(receipt, artifact_root)
+    _write(args.markdown, render_query_plan_markdown(summary, args.title))
+    if args.json:
+        _write_json(args.json, summary)
+    print(
+        "memory query plans: "
+        f"verified={summary['status_counts']['verified']} "
+        f"invalid={summary['status_counts']['invalid']} "
+        f"legacy_unavailable={summary['status_counts']['legacy_unavailable']}"
+    )
     return 0
 
 
@@ -1077,6 +1102,23 @@ def parser() -> argparse.ArgumentParser:
     memory_report_parser.add_argument("--markdown")
     memory_report_parser.add_argument("--json")
     memory_report_parser.set_defaults(func=cmd_report_memory)
+
+    query_plan_report_parser = commands.add_parser(
+        "report-memory-query-plans",
+        help="recompute governed TinyKG query-plan gain from native cassettes",
+    )
+    query_plan_report_parser.add_argument("--runtime-receipt", required=True)
+    query_plan_report_parser.add_argument(
+        "--artifact-root",
+        help="runtime artifact root (defaults to the receipt parent directory)",
+    )
+    query_plan_report_parser.add_argument(
+        "--title",
+        default="metacodes governed lexical query plans",
+    )
+    query_plan_report_parser.add_argument("--markdown")
+    query_plan_report_parser.add_argument("--json")
+    query_plan_report_parser.set_defaults(func=cmd_report_memory_query_plans)
 
     hotpot_adapter_parser = commands.add_parser(
         "adapt-hotpot-memory",

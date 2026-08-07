@@ -34,7 +34,9 @@ from scripts.eval.memory_budget_journal import (
     usd_to_microusd,
     usd_to_microusd_ceiling,
 )
+from scripts.eval.memory_query_plan import SIDECAR_NAME, build_query_plan_trace
 from scripts.eval.memory_replay import (
+    LEGACY_RUNNER_SOURCE_MODULES,
     PRODUCTION_PRICING_PROVENANCE,
     PRODUCTION_AUTO_COMPACT_POLICY,
     PRODUCTION_CHILD_PATH,
@@ -952,7 +954,7 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 "path": f"runner-sources/{module}.py",
                 "sha256": digest(f"runner-source:{module}"),
             }
-            for module in RUNNER_SOURCE_MODULES
+            for module in LEGACY_RUNNER_SOURCE_MODULES
         ]
         receipt["arms"] = copy.deepcopy(manifest["execution"]["arms"])
         receipt["manifest_sha256"] = hashlib.sha256(
@@ -1564,6 +1566,45 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             runner.write_text("tampered runner\n", encoding="utf-8")
             with self.assertRaisesRegex(ValidationError, "runtime source mismatch"):
                 validate_runtime_artifacts(receipt, root)
+
+    def test_v3_query_plan_source_binding_requires_replayable_sidecars(self):
+        manifest, observations, receipt = self._v3()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._materialize_v3_artifacts(root, manifest, observations, receipt)
+            module = "memory_query_plan"
+            source_path = root / "runner-sources" / f"{module}.py"
+            source_path.write_text("query-plan analyzer source\n", encoding="utf-8")
+            receipt["runner_sources"].append(
+                {
+                    "module": module,
+                    "path": f"runner-sources/{module}.py",
+                    "sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                }
+            )
+            validate_runtime_receipt(
+                receipt,
+                manifest,
+                observations,
+                manifest["dataset"]["source_sha256"],
+            )
+            with self.assertRaisesRegex(ValidationError, "required query-plan.json is missing"):
+                validate_runtime_artifacts(receipt, root)
+
+            for rollout in receipt["rollouts"]:
+                cassette = root / rollout["artifact_paths"]["cassette"]
+                trace = build_query_plan_trace(
+                    cassette,
+                    run_id=rollout["run_id"],
+                    arm=rollout["arm"],
+                    memory_backend=rollout["memory_backend"],
+                )
+                (cassette / SIDECAR_NAME).write_text(
+                    stable_json(trace) + "\n",
+                    encoding="utf-8",
+                )
+                rollout["cassette_sha256"] = _artifact_tree_digest(cassette)
+            validate_runtime_artifacts(receipt, root)
 
     def test_v5_receipt_binds_durable_budget_transactions_and_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -197,6 +197,26 @@ replayable. `quality_evidence=false` is mandatory: the scripted provider always 
 answer `runtime-smoke`, so this gate proves execution and isolation, not an accuracy or transfer advantage. Corpus,
 trace, and store artifacts stay local and must never be uploaded through the remote TinyKG skill harness.
 
+Every newly generated cassette also contains canonical `query-plan.json`. For TinyKG arms it is derived from the
+raw `KgRecall` input/result pair and verifies `lexical-query-plan-v1`, the Zig-compatible plan SHA-256, selected
+typed variant, run-scoped seen-state progression, and host-measured new/repeated hits. Markdown and no-memory arms
+record `not_applicable`. The cassette tree hash binds the sidecar, while replay recomputes it from `req-*.json`;
+missing, forged, stale-seen, or cross-plan evidence becomes `invalid`, never zero gain. Historical receipts whose
+bound runner source set predates this analyzer remain replayable and report `legacy_unavailable` rather than a
+fabricated metric.
+
+```bash
+python3 -m scripts.eval.cli report-memory-query-plans \
+  --runtime-receipt /path/to/native-run/runtime-receipt.json \
+  --json /tmp/query-plan-report.json \
+  --markdown /tmp/query-plan-report.md
+```
+
+The report separates exact/alias seed probes from semantic/refinement probes and aggregates calls, plans,
+new/repeated hits, unique-gain ratio, stopping calls, stage, and variant kind. Only `verified` traces enter these
+ablation metrics. The deterministic lifecycle smoke must itself produce a verified TinyKG trace; merely observing
+a `KgRecall` call is no longer sufficient.
+
 ## Result row contract
 
 Each v2 JSONL row is validated by `scripts.eval.memory_benchmark` and must bind:
