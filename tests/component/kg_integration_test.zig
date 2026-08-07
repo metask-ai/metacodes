@@ -2204,9 +2204,30 @@ test "L2 KG experience feedback: claim exposes verified prior execution before w
             try std.testing.expect(std.mem.indexOf(u8, content, "\"state\":\"tentative\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, content, "\"state\":\"confirmed\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, content, "\"evidence_node_ids\":[") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "parser checkpoint replay verified") != null);
             try std.testing.expect(std.mem.indexOf(u8, content, "UNFINISHED_EXPERIENCE_SENTINEL") == null);
+            const history = packet.object.get("history").?.array.items;
+            var prior_history: ?std.json.ObjectMap = null;
+            for (history) |entry| {
+                if (entry != .object) continue;
+                const entry_id = entry.object.get("task_id") orelse continue;
+                if (entry_id == .integer and entry_id.integer == @as(i64, @intCast(prior))) {
+                    prior_history = entry.object;
+                    break;
+                }
+            }
+            const prior_entry = prior_history orelse return error.TestUnexpectedResult;
+            const evidence_ids = prior_entry.get("evidence_node_ids").?.array.items;
+            const verified_evidence = prior_entry.get("verified_evidence").?.array.items;
+            try std.testing.expect(evidence_ids.len >= 1);
+            try std.testing.expect(verified_evidence.len >= 1);
+            const evidence_entry = verified_evidence[0].object;
+            try std.testing.expectEqual(evidence_ids[0].integer, evidence_entry.get("node_id").?.integer);
+            try std.testing.expect(std.mem.indexOf(u8, evidence_entry.get("text").?.string, "parser checkpoint replay verified") != null);
             const metrics = packet.object.get("metrics").?.object;
             try std.testing.expect(metrics.get("accepted_tasks").?.integer >= 1);
+            try std.testing.expect(metrics.get("accepted_evidence_excerpts").?.integer >= 1);
+            try std.testing.expectEqual(@as(i64, 0), metrics.get("evidence_excerpt_failures").?.integer);
             try std.testing.expect(metrics.get("rejected_not_completed").?.integer >= 1);
             try std.testing.expectEqual(@as(i64, 2), metrics.get("accepted_tentative").?.integer);
             try std.testing.expectEqual(@as(i64, 1), metrics.get("accepted_confirmed").?.integer);
@@ -2255,6 +2276,7 @@ test "L2 KG experience feedback: claim exposes verified prior execution before w
             try std.testing.expect(std.mem.indexOf(u8, content, "\"kg_status\":\"claimed\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, content, "\"experience_packet\":{") != null);
             try std.testing.expect(std.mem.indexOf(u8, content, "repair parser checkpoint recovery corruption") != null);
+            try std.testing.expect(std.mem.indexOf(u8, content, "parser checkpoint replay verified") != null);
             try std.testing.expect(std.mem.indexOf(u8, content, "UNFINISHED_EXPERIENCE_SENTINEL") == null);
             try std.testing.expect(std.mem.indexOf(u8, content, "\"query_reused_from_tool_result\":true") != null);
         },
@@ -2317,8 +2339,10 @@ test "L2 KG experience feedback: claim exposes verified prior execution before w
     try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "2-4 separate compact semantic variants") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "Deduplicate candidates by node_id") != null);
     try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "repair parser checkpoint recovery corruption") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first_request.body(), "parser checkpoint replay verified") == null);
     try std.testing.expect(std.mem.indexOf(u8, second_request.body(), "metacodes-experience-packet-v1") != null);
     try std.testing.expect(std.mem.indexOf(u8, second_request.body(), "repair parser checkpoint recovery corruption") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second_request.body(), "parser checkpoint replay verified") != null);
     try std.testing.expect(std.mem.indexOf(u8, second_request.body(), "llm_before_work_if_insufficient") != null);
     if (std.c.getenv("METACODES_PRINT_EXPERIENCE_METRICS") != null)
         std.debug.print("experience_feedback_delivery schema=v1 provider_requests={d} delivered_to_next_request=1\n", .{srv.requestCount()});
