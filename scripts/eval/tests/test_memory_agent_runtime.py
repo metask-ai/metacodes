@@ -1,15 +1,18 @@
 import copy
 import hashlib
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
 from scripts.eval.memory_agent_runtime import (
+    _copy_memory_tree,
     _project_domain,
     _xxhash64,
 )
 from scripts.eval.memory_replay import (
+    RUNNER_SOURCE_MODULES,
     _artifact_tree_digest,
     load_manifest,
     load_observations,
@@ -47,6 +50,33 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         resolved = str(root.resolve())
         expected_domain = f"{root.name}-{_xxhash64(resolved.encode()):016x}"[: len(root.name) + 9]
         self.assertEqual(_project_domain(root), expected_domain)
+
+    def test_markdown_state_copy_rejects_links_and_overlap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            outside = root / "outside.md"
+            outside.write_text("outside\n", encoding="utf-8")
+            (source / "escape.md").symlink_to(outside)
+            with self.assertRaisesRegex(ValidationError, "symlink is forbidden"):
+                _copy_memory_tree(source, root / "target")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            outside = root / "outside.md"
+            outside.write_text("outside\n", encoding="utf-8")
+            os.link(outside, source / "hardlink.md")
+            with self.assertRaisesRegex(ValidationError, "hard-linked file is forbidden"):
+                _copy_memory_tree(source, root / "target")
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source"
+            source.mkdir()
+            with self.assertRaisesRegex(ValidationError, "must not overlap"):
+                _copy_memory_tree(source, source / "nested")
 
     def _v2(self):
         manifest = load_manifest(FIXTURES / "smoke-manifest.json")
@@ -159,6 +189,271 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 raw_digest = _artifact_tree_digest(store)
                 rollout["raw_store_digest_before"] = raw_digest
                 rollout["raw_store_digest_after"] = raw_digest
+
+    def _materialize_v3_artifacts(self, root, manifest, observations, receipt):
+        cases = {case["id"]: case for case in manifest["cases"]}
+        for source in receipt["runner_sources"]:
+            path = root / source["path"]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"runner-source:{source['module']}\n", encoding="utf-8")
+            source["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+        for rollout in receipt["rollouts"]:
+            sequence = rollout["sequence"]
+            case = cases[rollout["case_id"]]
+            paths = rollout["artifact_paths"]
+            file_payloads = {
+                "native_events": f"native-events:{sequence}\n",
+                "result": stable_json(
+                    {
+                        "type": "result",
+                        "stop_reason": "end_turn",
+                        "turns": 1,
+                        "tool_calls": rollout["memory_read_events"]
+                        + rollout["memory_write_events"],
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "cost_usd": 0.0,
+                        "text": "runtime-smoke",
+                    }
+                )
+                + "\n",
+                "stderr": "",
+            }
+            for path_key, hash_key in (
+                ("native_events", "native_events_sha256"),
+                ("result", "result_sha256"),
+                ("stderr", "stderr_sha256"),
+            ):
+                path = root / paths[path_key]
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(file_payloads[path_key], encoding="utf-8")
+                rollout[hash_key] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+            for path_key in ("transcript", "workspace"):
+                path = root / paths[path_key]
+                path.mkdir(parents=True, exist_ok=True)
+                (path / "artifact.txt").write_text(
+                    f"{path_key}:{sequence}\n",
+                    encoding="utf-8",
+                )
+
+            cassette = root / paths["cassette"]
+            cassette.mkdir(parents=True)
+            tools = []
+            backend = rollout["memory_backend"]
+            online = case["benchmark"] == "procedural_transfer" and case["split"] == "online"
+            if backend == "markdown":
+                tools = (
+                    [
+                        ("markdown-memory-1", "Write"),
+                        ("markdown-index-1", "Write"),
+                    ]
+                    if online
+                    else [("markdown-read-1", "Read")]
+                )
+            elif backend == "tinykg":
+                tools = (
+                    [("kg-remember-1", "KgRemember")]
+                    if online
+                    else []
+                ) + [("kg-recall-1", "KgRecall"), ("kg-context-1", "KgContext")]
+            for request_id in range(1, rollout["provider_requests"] + 1):
+                messages = []
+                if request_id == rollout["provider_requests"] and tools:
+                    messages = [
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "tool_use", "id": tool_id, "name": name, "input": {}}
+                                for tool_id, name in tools
+                            ],
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "tool_result", "tool_use_id": tool_id, "content": "{}"}
+                                for tool_id, _name in tools
+                            ],
+                        },
+                    ]
+                (cassette / f"req-{request_id:03d}.json").write_text(
+                    stable_json({"messages": messages}) + "\n",
+                    encoding="utf-8",
+                )
+            rollout["cassette_sha256"] = _artifact_tree_digest(cassette)
+
+            family_key = case.get("family_id") or case["id"]
+            if backend == "markdown":
+                memory = root / paths["memory_state"]
+                memory.mkdir(parents=True, exist_ok=True)
+                (memory / "memory.md").write_text(
+                    f"durable-memory:{family_key}:{rollout['trial']}\n",
+                    encoding="utf-8",
+                )
+                state_after = _artifact_tree_digest(memory)
+                rollout["memory_state_after"] = state_after
+                rollout["memory_state_before"] = (
+                    digest(f"markdown-before:{sequence}") if online else state_after
+                )
+            elif backend == "tinykg":
+                store = root / paths["store"]
+                store.mkdir(parents=True, exist_ok=True)
+                (store / "events.bin").write_text(
+                    f"tinykg-state:{family_key}:{rollout['trial']}\n",
+                    encoding="utf-8",
+                )
+                raw_after = _artifact_tree_digest(store)
+                state_after = digest(
+                    f"tinykg-normalized:{family_key}:{rollout['trial']}:{rollout['arm']}"
+                )
+                rollout["raw_store_digest_after"] = raw_after
+                rollout["raw_store_digest_before"] = (
+                    digest(f"tinykg-raw-before:{sequence}") if online else raw_after
+                )
+                rollout["store_revision_after"] = state_after
+                rollout["store_revision_before"] = (
+                    digest(f"tinykg-before:{sequence}") if online else state_after
+                )
+                rollout["memory_state_after"] = state_after
+                rollout["memory_state_before"] = rollout["store_revision_before"]
+            else:
+                state_after = "none"
+
+            observations[sequence]["graph"]["revision"] = state_after
+            rollout["observation_sha256"] = hashlib.sha256(
+                stable_json(observations[sequence]).encode("utf-8")
+            ).hexdigest()
+
+        for rollout in receipt["rollouts"]:
+            paths = rollout["artifact_paths"]
+            for path_key, hash_key in (
+                ("transcript", "transcript_sha256"),
+                ("workspace", "workspace_sha256"),
+            ):
+                rollout[hash_key] = _artifact_tree_digest(root / paths[path_key])
+        receipt["observations_sha256"] = hashlib.sha256(
+            stable_json(observations).encode("utf-8")
+        ).hexdigest()
+
+    def _v3(self):
+        manifest, observations, receipt = self._v2()
+        markdown_fingerprint = digest("markdown-memory")
+        manifest["execution"]["arms"][0] = {
+            "id": "markdown_memory",
+            "fingerprint": markdown_fingerprint,
+        }
+        cases = {case["id"]: case for case in manifest["cases"]}
+        for entry in manifest["schedule"]:
+            if entry["arm"] == "no_memory":
+                entry["arm"] = "markdown_memory"
+        receipt["schema_version"] = 3
+        receipt["execution_mode"] = "native-agent-loop-scripted-lifecycle-smoke"
+        receipt["runner_sources"] = [
+            {
+                "module": module,
+                "path": f"runner-sources/{module}.py",
+                "sha256": digest(f"runner-source:{module}"),
+            }
+            for module in RUNNER_SOURCE_MODULES
+        ]
+        receipt["arms"] = copy.deepcopy(manifest["execution"]["arms"])
+        receipt["manifest_sha256"] = hashlib.sha256(
+            stable_json(manifest).encode("utf-8")
+        ).hexdigest()
+        for sequence, (entry, observation, rollout) in enumerate(
+            zip(manifest["schedule"], observations, receipt["rollouts"])
+        ):
+            case = cases[entry["case_id"]]
+            online = case["benchmark"] == "procedural_transfer" and case["split"] == "online"
+            rollout["arm"] = entry["arm"]
+            observation["arm"] = entry["arm"]
+            rollout["artifact_paths"]["memory_state"] = None
+            rollout["memory_phase"] = case["split"]
+            if entry["arm"] == "markdown_memory":
+                before = digest(f"markdown-before:{sequence}")
+                after = digest(f"markdown-after:{sequence}") if online else before
+                rollout.update(
+                    {
+                        "memory_backend": "markdown",
+                        "memory_state_before": before,
+                        "memory_state_after": after,
+                        "memory_read_events": 0 if online else 1,
+                        "memory_write_events": 2 if online else 0,
+                    }
+                )
+                rollout["artifact_paths"]["memory_state"] = f"rollouts/{sequence}/sealed-home/memory"
+                observation["retrieval"].update(
+                    {
+                        "enabled": not online,
+                        "k": 0 if online else 1,
+                        "hop_count": 0 if online else 1,
+                        "query_variants": []
+                        if online
+                        else [{"kind": "exact", "text": case["prompt"]}],
+                        "retrieved_evidence_ids": [],
+                        "verified_evidence_ids": [],
+                    }
+                )
+                observation["memory"].update(
+                    {
+                        "write_mode": "online" if online else "read_only",
+                        "inserted_nodes": 1 if online else 0,
+                        "active_nodes": 2,
+                        "provenance_links": 1,
+                    }
+                )
+                observation["graph"]["revision"] = after
+                rollout["tinykg_binary_sha256"] = None
+                rollout["store_revision_before"] = "none"
+                rollout["store_revision_after"] = "none"
+                rollout["raw_store_digest_before"] = "none"
+                rollout["raw_store_digest_after"] = "none"
+            else:
+                before = digest(f"tinykg-before:{sequence}")
+                after = digest(f"tinykg-after:{sequence}") if online else before
+                raw_before = digest(f"tinykg-raw-before:{sequence}")
+                raw_after = digest(f"tinykg-raw-after:{sequence}") if online else raw_before
+                rollout.update(
+                    {
+                        "memory_backend": "tinykg",
+                        "memory_state_before": before,
+                        "memory_state_after": after,
+                        "memory_read_events": 2,
+                        "memory_write_events": 1 if online else 0,
+                        "store_revision_before": before,
+                        "store_revision_after": after,
+                        "raw_store_digest_before": raw_before,
+                        "raw_store_digest_after": raw_after,
+                    }
+                )
+                observation["memory"].update(
+                    {
+                        "write_mode": "online" if online else "read_only",
+                        "inserted_nodes": 1 if online else 0,
+                    }
+                )
+                observation["graph"]["revision"] = after
+            provider_requests = (
+                2
+                if entry["arm"] == "markdown_memory"
+                else 4
+                if online
+                else 3
+            )
+            rollout["provider_requests"] = provider_requests
+            observation["trajectory"]["model_requests"] = provider_requests
+            observation["trajectory"]["tool_calls"] = (
+                rollout["memory_read_events"] + rollout["memory_write_events"]
+            )
+            observation["trajectory"]["tool_errors"] = 0
+            rollout["observation_sha256"] = hashlib.sha256(
+                stable_json(observation).encode("utf-8")
+            ).hexdigest()
+        receipt["observations_sha256"] = hashlib.sha256(
+            stable_json(observations).encode("utf-8")
+        ).hexdigest()
+        return manifest, observations, receipt
 
     def test_v2_receipt_binds_native_rows_and_rejects_replay_laundering(self):
         manifest, observations, receipt = self._v2()
@@ -281,6 +576,120 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
                 dataset_source=FIXTURES / "smoke-source.json",
                 runtime_receipt=receipt,
             )
+
+    def test_v3_receipt_binds_markdown_and_tinykg_online_offline_lifecycle(self):
+        manifest, observations, receipt = self._v3()
+        validate_runtime_receipt(
+            receipt,
+            manifest,
+            observations,
+            manifest["dataset"]["source_sha256"],
+        )
+
+        offline = next(
+            index
+            for index, entry in enumerate(manifest["schedule"])
+            if entry["arm"] == "markdown_memory"
+            and next(case for case in manifest["cases"] if case["id"] == entry["case_id"])["split"]
+            == "offline"
+        )
+        leaked = copy.deepcopy(receipt)
+        leaked["rollouts"][offline]["memory_write_events"] = 1
+        with self.assertRaisesRegex(ValidationError, "read-only phase changed"):
+            validate_runtime_receipt(
+                leaked,
+                manifest,
+                observations,
+                manifest["dataset"]["source_sha256"],
+            )
+
+        tiny_online = next(
+            index
+            for index, entry in enumerate(manifest["schedule"])
+            if entry["arm"] == "tinykg_lexical"
+            and next(case for case in manifest["cases"] if case["id"] == entry["case_id"])["split"]
+            == "online"
+        )
+        unchanged = copy.deepcopy(receipt)
+        unchanged["rollouts"][tiny_online]["store_revision_after"] = unchanged["rollouts"][tiny_online]["store_revision_before"]
+        unchanged["rollouts"][tiny_online]["memory_state_after"] = unchanged["rollouts"][tiny_online]["memory_state_before"]
+        with self.assertRaisesRegex(ValidationError, "online TinyKG phase"):
+            validate_runtime_receipt(
+                unchanged,
+                manifest,
+                observations,
+                manifest["dataset"]["source_sha256"],
+            )
+
+    def test_v3_reopens_source_memory_and_cassette_semantics(self):
+        manifest, observations, receipt = self._v3()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._materialize_v3_artifacts(root, manifest, observations, receipt)
+            validate_runtime_receipt(
+                receipt,
+                manifest,
+                observations,
+                manifest["dataset"]["source_sha256"],
+            )
+            validate_runtime_artifacts(receipt, root)
+
+            runner = root / receipt["runner_sources"][0]["path"]
+            runner.write_text("tampered runner\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValidationError, "runtime source mismatch"):
+                validate_runtime_artifacts(receipt, root)
+
+        manifest, observations, receipt = self._v3()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._materialize_v3_artifacts(root, manifest, observations, receipt)
+            markdown = next(
+                rollout
+                for rollout in receipt["rollouts"]
+                if rollout["memory_backend"] == "markdown"
+            )
+            memory = root / markdown["artifact_paths"]["memory_state"]
+            (memory / "late.md").write_text("tampered\n", encoding="utf-8")
+            transcript = root / markdown["artifact_paths"]["transcript"]
+            markdown["transcript_sha256"] = _artifact_tree_digest(transcript)
+            with self.assertRaisesRegex(ValidationError, "memory_state_after"):
+                validate_runtime_artifacts(receipt, root)
+
+        manifest, observations, receipt = self._v3()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._materialize_v3_artifacts(root, manifest, observations, receipt)
+            offline = next(
+                rollout
+                for rollout in receipt["rollouts"]
+                if rollout["memory_backend"] == "markdown"
+                and next(
+                    case for case in manifest["cases"] if case["id"] == rollout["case_id"]
+                )["split"]
+                == "offline"
+            )
+            cassette = root / offline["artifact_paths"]["cassette"]
+            request = cassette / f"req-{offline['provider_requests']:03d}.json"
+            body = json.loads(request.read_text(encoding="utf-8"))
+            body["messages"][0]["content"].append(
+                {
+                    "type": "tool_use",
+                    "id": "markdown-laundered-1",
+                    "name": "Write",
+                    "input": {},
+                }
+            )
+            body["messages"][1]["content"].append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "markdown-laundered-1",
+                    "content": "{}",
+                }
+            )
+            request.write_text(stable_json(body) + "\n", encoding="utf-8")
+            offline["cassette_sha256"] = _artifact_tree_digest(cassette)
+            with self.assertRaisesRegex(ValidationError, "memory_write_events"):
+                validate_runtime_artifacts(receipt, root)
 
 
 if __name__ == "__main__":

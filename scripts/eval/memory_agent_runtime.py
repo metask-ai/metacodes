@@ -7,10 +7,11 @@ records the provider cassette.  TinyKG arms use a hash-pinned binary and a
 fresh store below the owned run directory; the TinyKG skill harness is never
 imported or executed.
 
-The built-in provider is a deterministic *wiring smoke*.  It calls the real
-KgRecall/KgContext tools and then returns a fixed negative answer.  It is useful
-for proving the execution boundary at zero paid cost, but is intentionally not
-memory-quality evidence.
+The built-in provider is a deterministic *lifecycle smoke*.  It drives the real
+Markdown Write/Read and TinyKG KgRemember/KgRecall/KgContext tools, including a
+fresh-process procedural online-to-offline handoff, and then returns a fixed
+negative answer.  It proves execution and durability boundaries at zero paid
+cost, but is intentionally not memory-quality evidence.
 """
 
 from __future__ import annotations
@@ -29,7 +30,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, MutableMapping, Sequence, Tuple
 
 from .e2e_adapter import (
     NATIVE_EVENT_SCHEMA_VERSION,
@@ -43,7 +44,9 @@ from .memory_procedural_adapter import (
 )
 from .memory_replay import (
     REPLAY_SCHEMA_VERSION,
+    RUNNER_SOURCE_MODULES,
     _artifact_tree_digest,
+    _cassette_memory_activity,
     load_manifest,
     replay_observations,
 )
@@ -57,9 +60,10 @@ from .memory_tinykg_local import (
 from .model import ValidationError, stable_json
 
 
-RUNTIME_RECEIPT_SCHEMA_VERSION = 2
+RUNTIME_RECEIPT_SCHEMA_VERSION = 3
 RUNTIME_METADATA_SCHEMA_VERSION = NATIVE_EVENT_SCHEMA_VERSION
-SCRIPTED_PROVIDER_ID = "metacodes-memory-scripted-wiring-v1"
+SCRIPTED_PROVIDER_ID = "metacodes-memory-scripted-lifecycle-v3"
+SCRIPTED_LIFECYCLE_MODE = "native-agent-loop-scripted-lifecycle-smoke"
 ARM_TO_RUNTIME = {
     "no_memory": "codex_style",
     "codex_style": "codex_style",
@@ -126,6 +130,30 @@ def _write_new(path: Path, payload: bytes) -> None:
         except OSError:
             pass
         raise
+    finally:
+        os.close(fd)
+
+
+def _read_regular_file(path: Path, where: str) -> bytes:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise ValidationError(f"{where}: cannot open regular file: {exc}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            _fail(where, "expected a regular file")
+        chunks: List[bytes] = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+    except OSError as exc:
+        raise ValidationError(f"{where}: cannot read regular file: {exc}") from exc
     finally:
         os.close(fd)
 
@@ -213,6 +241,85 @@ def _xxhash64(data: bytes, seed: int = 0) -> int:
 def _project_domain(project_root: Path) -> str:
     resolved = str(project_root.resolve())
     return f"{project_root.name or 'root'}-{_xxhash64(resolved.encode('utf-8')):016x}"[: len(project_root.name or 'root') + 9]
+
+
+def _memory_dir(home: Path, project_root: Path) -> Path:
+    """Mirror ``memdir.memoryIndexPath`` without invoking the product binary."""
+
+    cwd_hash = f"{_xxhash64(str(project_root.resolve()).encode('utf-8')):016x}"
+    return home / ".metacodes" / "projects" / cwd_hash / "memory"
+
+
+def _copy_memory_tree(source: Path, target: Path) -> None:
+    """Copy a small durable-memory tree without following links or overwriting.
+
+    The source may ultimately contain model-authored files, so a normal
+    ``copytree`` is too permissive: a symlink must never escape the owned run
+    directory or become a different artifact on replay.
+    """
+
+    if not source.is_dir() or source.is_symlink():
+        _fail("markdown memory state", "source must be a real directory")
+    source_root = source.resolve()
+    target_root = target.resolve(strict=False)
+    if source_root == target_root or source_root in target_root.parents or target_root in source_root.parents:
+        _fail("markdown memory state", "source and target must not overlap")
+    if target.exists() and (target.is_symlink() or not target.is_dir()):
+        _fail("markdown memory state", "target must be a real directory")
+    target.mkdir(parents=True, exist_ok=True)
+    if any(target.iterdir()):
+        _fail("markdown memory state", "target must be empty")
+    for path in sorted(source.rglob("*")):
+        relative = path.relative_to(source)
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            _fail("markdown memory state", f"symlink is forbidden: {relative.as_posix()!r}")
+        destination = target / relative
+        if stat.S_ISDIR(info.st_mode):
+            destination.mkdir()
+        elif stat.S_ISREG(info.st_mode):
+            if info.st_nlink != 1:
+                _fail(
+                    "markdown memory state",
+                    f"hard-linked file is forbidden: {relative.as_posix()!r}",
+                )
+            _write_new(
+                destination,
+                _read_regular_file(path, f"markdown memory state {relative.as_posix()!r}"),
+            )
+        else:
+            _fail("markdown memory state", f"unsupported entry: {relative.as_posix()!r}")
+
+
+def _public_memory_document(public_case: Mapping[str, Any]) -> str:
+    payload = stable_json(public_case)
+    marker = f"public-memory-sha256:{_hash_text(payload)}"
+    return (
+        "---\n"
+        "name: benchmark-public-memory\n"
+        "description: Public benchmark context; contains no hidden gold labels.\n"
+        "metadata:\n  type: project\n"
+        "---\n\n"
+        f"# Public benchmark memory\n\n{marker}\n\n"
+        f"```json\n{payload}\n```\n"
+    )
+
+
+def _seed_public_markdown_memory(
+    memory_dir: Path,
+    public_case: Mapping[str, Any],
+) -> Tuple[Path, str]:
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    document = _public_memory_document(public_case)
+    marker = f"public-memory-sha256:{_hash_text(stable_json(public_case))}"
+    corpus = memory_dir / "benchmark-public-memory.md"
+    index = memory_dir / "MEMORY.md"
+    _write_new(corpus, document.encode("utf-8"))
+    _write_new(
+        index,
+        b"- [Benchmark public memory](benchmark-public-memory.md) -- public corpus for this case\n",
+    )
+    return corpus, marker
 
 
 def _agent_batch(
@@ -372,20 +479,98 @@ def _tool_results(body: Mapping[str, Any]) -> Dict[str, str]:
 
 
 class _ScriptedPlanner:
-    def __init__(self, prompt: str, tinykg_enabled: bool) -> None:
+    def __init__(
+        self,
+        prompt: str,
+        runtime_arm: str,
+        benchmark: str,
+        split: str,
+        *,
+        memory_file: Path | None,
+        memory_index: Path | None,
+        memory_marker: str | None,
+    ) -> None:
         self.prompt = prompt
-        self.tinykg_enabled = tinykg_enabled
-        self.stage = "recall" if tinykg_enabled else "final"
+        self.runtime_arm = runtime_arm
+        self.benchmark = benchmark
+        self.split = split
+        self.memory_file = memory_file
+        self.memory_index = memory_index
+        self.memory_marker = memory_marker
+        self.memory_verified = False
+        if runtime_arm == "tinykg":
+            self.stage = "kg_remember" if benchmark == "procedural_transfer" and split == "online" else "kg_recall"
+        elif runtime_arm == "claude_style":
+            self.stage = "markdown_write" if benchmark == "procedural_transfer" and split == "online" else "markdown_read"
+        else:
+            self.stage = "final"
 
     def response(self, body: Mapping[str, Any], request_id: int) -> bytes:
         results = _tool_results(body)
-        if self.stage == "recall":
-            self.stage = "context"
+        if self.stage == "markdown_write":
+            if self.memory_file is None or self.memory_index is None or self.memory_marker is None:
+                raise ValueError("markdown online phase is missing its durable memory paths")
+            self.stage = "final"
+            memory_text = (
+                "---\nname: benchmark-procedural-pattern\n"
+                "description: Procedure learned during the online member of a frozen intent family.\n"
+                "metadata:\n  type: project\n---\n\n"
+                f"{self.memory_marker}\n"
+            )
             return _tool_sse(
-                [("kg-recall-1", "KgRecall", {"query": self.prompt})],
+                [
+                    (
+                        "markdown-memory-1",
+                        "Write",
+                        {"file_path": str(self.memory_file), "content": memory_text},
+                    ),
+                    (
+                        "markdown-index-1",
+                        "Write",
+                        {
+                            "file_path": str(self.memory_index),
+                            "content": "- [Procedural pattern](benchmark-procedural-pattern.md) -- frozen online intent-family lesson\n",
+                        },
+                    ),
+                ],
                 request_id,
             )
-        if self.stage == "context":
+        if self.stage == "markdown_read":
+            if self.memory_file is None or self.memory_marker is None:
+                raise ValueError("markdown read phase is missing its durable memory artifact")
+            self.stage = "markdown_verify"
+            return _tool_sse(
+                [("markdown-read-1", "Read", {"file_path": str(self.memory_file)})],
+                request_id,
+            )
+        if self.stage == "markdown_verify":
+            raw = results.get("markdown-read-1", "")
+            if self.memory_marker not in raw:
+                raise ValueError("fresh-process Markdown read did not expose the expected marker")
+            self.memory_verified = True
+            self.stage = "final"
+        if self.stage == "kg_remember":
+            if self.memory_marker is None:
+                raise ValueError("TinyKG online phase is missing its durable marker")
+            self.stage = "kg_recall"
+            return _tool_sse(
+                [
+                    (
+                        "kg-remember-1",
+                        "KgRemember",
+                        {"text": self.memory_marker, "kind": "observation", "scope": "project"},
+                    )
+                ],
+                request_id,
+            )
+        if self.stage == "kg_recall":
+            query = self.memory_marker if self.memory_marker is not None else self.prompt
+            self.stage = "kg_context"
+            return _tool_sse(
+                [("kg-recall-1", "KgRecall", {"query": query})],
+                request_id,
+            )
+        if self.stage == "kg_context":
             raw = results.get("kg-recall-1", "")
             node_id = None
             try:
@@ -396,11 +581,23 @@ class _ScriptedPlanner:
             except json.JSONDecodeError:
                 pass
             if isinstance(node_id, int) and not isinstance(node_id, bool):
-                self.stage = "final"
+                self.stage = "kg_verify"
                 return _tool_sse(
                     [("kg-context-1", "KgContext", {"node_id": node_id, "limit": 12})],
                     request_id,
                 )
+            self.stage = "final"
+        if self.stage == "kg_verify":
+            raw = results.get("kg-context-1", "")
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError("KgContext did not return JSON") from exc
+            if not isinstance(parsed, dict) or parsed.get("kg_unavailable") is True:
+                raise ValueError("KgContext did not return an available bounded packet")
+            if self.memory_marker is not None and self.memory_marker not in raw:
+                raise ValueError("KgContext did not expose the expected durable marker")
+            self.memory_verified = True
             self.stage = "final"
         return _text_sse("runtime-smoke", request_id)
 
@@ -408,8 +605,26 @@ class _ScriptedPlanner:
 class ScriptedMemoryProvider:
     """Loopback-only deterministic Anthropic SSE provider for native L2."""
 
-    def __init__(self, prompt: str, tinykg_enabled: bool) -> None:
-        self.planner = _ScriptedPlanner(prompt, tinykg_enabled)
+    def __init__(
+        self,
+        prompt: str,
+        runtime_arm: str,
+        benchmark: str,
+        split: str,
+        *,
+        memory_file: Path | None,
+        memory_index: Path | None,
+        memory_marker: str | None,
+    ) -> None:
+        self.planner = _ScriptedPlanner(
+            prompt,
+            runtime_arm,
+            benchmark,
+            split,
+            memory_file=memory_file,
+            memory_index=memory_index,
+            memory_marker=memory_marker,
+        )
         self.requests: List[Mapping[str, Any]] = []
         self._server: socketserver.TCPServer | None = None
         self._thread: threading.Thread | None = None
@@ -481,7 +696,11 @@ def _public_procedural_cases(source: Mapping[str, Any]) -> Dict[str, Mapping[str
             continue
         for case in family["cases"]:
             if isinstance(case, dict) and isinstance(case.get("id"), str):
-                result[case["id"]] = {**case, "_family_id": family.get("id")}
+                result[case["id"]] = {
+                    **case,
+                    "_family_id": family.get("id"),
+                    "_procedure_evidence_id": family.get("procedure_evidence_id"),
+                }
     return result
 
 
@@ -570,12 +789,14 @@ def _parse_result(stdout: str) -> Mapping[str, Any]:
 def _cassette_tool_data(
     cassette: Path,
     logical_ids: Mapping[int, str],
-) -> Tuple[List[Mapping[str, str]], List[str], List[str], bool, int]:
+    fallback_query: str,
+) -> Mapping[str, Any]:
     query_variants: List[Mapping[str, str]] = []
     retrieved: List[str] = []
     verified: List[str] = []
     graph_truncated = False
     exposed_bytes = 0
+    remembered_node_ids: List[int] = []
     seen_tools: set[str] = set()
     for request_path in sorted(cassette.glob("req-*.json")):
         body = _load_json(request_path, "provider request cassette")
@@ -636,7 +857,26 @@ def _cassette_tool_data(
                         )
                 except json.JSONDecodeError:
                     pass
-    return query_variants, retrieved, verified, graph_truncated, exposed_bytes
+            elif name == "KgRemember":
+                try:
+                    parsed = json.loads(raw_result)
+                    remembered = parsed.get("remembered") if isinstance(parsed, dict) else None
+                    node_id = remembered.get("node_id") if isinstance(remembered, dict) else None
+                    if isinstance(node_id, int) and not isinstance(node_id, bool):
+                        remembered_node_ids.append(node_id)
+                except json.JSONDecodeError:
+                    pass
+            elif name == "Read" and tool_id.startswith("markdown-read-"):
+                if not query_variants:
+                    query_variants.append({"kind": "exact", "text": fallback_query})
+    return {
+        "query_variants": query_variants,
+        "retrieved": retrieved,
+        "verified": verified,
+        "graph_truncated": graph_truncated,
+        "exposed_bytes": exposed_bytes,
+        "remembered_node_ids": remembered_node_ids,
+    }
 
 
 def _runtime_metadata(
@@ -733,6 +973,12 @@ def run_memory_agent_schedule(
         _fail("memory adapter source", "adapter revision does not match manifest")
 
     procedural_cases = _public_procedural_cases(source)
+    public_cases = {
+        item["id"]: item
+        for item in source.get("cases", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    public_cases.update(procedural_cases)
     validators: Dict[str, Mapping[str, Any]] = {}
     if manifest["dataset"]["adapter_id"] == "coding-intent-families":
         if validator_bundle_path is None:
@@ -751,6 +997,20 @@ def run_memory_agent_schedule(
     if observations_output == receipt_output:
         _fail("memory agent runtime", "observation and receipt outputs must be distinct")
     resolved_run.mkdir(parents=True)
+    runtime_source_root = Path(__file__).resolve().parent
+    runner_sources: List[Mapping[str, str]] = []
+    for module in RUNNER_SOURCE_MODULES:
+        runtime_source = runtime_source_root / f"{module}.py"
+        target = resolved_run / "runner-sources" / f"{module}.py"
+        _write_new(target, _read_regular_file(runtime_source, f"runtime source {module}"))
+        runner_sources.append(
+            {
+                "module": module,
+                "path": target.relative_to(resolved_run).as_posix(),
+                "sha256": file_sha256(target),
+            }
+        )
+    runner_sources_sha = _canonical_sha256(runner_sources)
 
     def artifact_relative(path: Path, label: str) -> str:
         return _inside(path, resolved_run, label).relative_to(resolved_run).as_posix()
@@ -804,9 +1064,53 @@ def run_memory_agent_schedule(
             directory.mkdir()
 
         baseline: Dict[str, str] = {}
-        public_case = procedural_cases.get(case["id"])
-        if public_case is not None:
+        public_case = public_cases.get(case["id"])
+        if public_case is None:
+            _fail("memory agent runtime", f"public source is missing case {case['id']!r}")
+        if case["id"] in procedural_cases:
             baseline = _materialize_workspace(public_case, workspace)
+
+        split = str(case["split"])
+        memory_backend = {
+            "codex_style": "none",
+            "claude_style": "markdown",
+            "tinykg": "tinykg",
+        }[runtime_arm]
+        memory_dir: Path | None = None
+        memory_file: Path | None = None
+        memory_index: Path | None = None
+        memory_marker: str | None = None
+        markdown_state: Path | None = None
+        memory_state_before = "none"
+        memory_state_after = "none"
+        if case["benchmark"] == "procedural_transfer":
+            procedure_id = public_case.get("_procedure_evidence_id")
+            if not isinstance(procedure_id, str) or not procedure_id:
+                _fail("procedural memory runtime", "public source is missing procedure evidence id")
+            memory_marker = (
+                f"procedure-memory:{procedure_id}: preserve the intent-family pattern across "
+                "registry, protocol manifest, documentation, and contract surfaces"
+            )
+        if runtime_arm == "claude_style":
+            memory_dir = _memory_dir(sealed_home, project_root)
+            memory_dir.mkdir(parents=True)
+            memory_index = memory_dir / "MEMORY.md"
+            if case["benchmark"] == "procedural_transfer":
+                markdown_state = project_root / "durable-markdown-state"
+                if markdown_state.exists():
+                    _copy_memory_tree(markdown_state, memory_dir)
+                elif split != "online":
+                    _fail("procedural Markdown runtime", "offline phase has no online memory state")
+                memory_file = memory_dir / "benchmark-procedural-pattern.md"
+            else:
+                memory_file, memory_marker = _seed_public_markdown_memory(
+                    memory_dir,
+                    public_case,
+                )
+            memory_state_before = _artifact_tree_digest(
+                memory_dir,
+                "markdown memory before rollout",
+            )
 
         store: Path | None = None
         logical_ids: Dict[int, str] = {}
@@ -865,6 +1169,7 @@ def run_memory_agent_schedule(
             if info.get("text_stale") not in {"0", "1"}:
                 _fail(f"native memory rollout {case['id']}", "invalid TinyKG text_stale state")
             store_text_stale = info["text_stale"] == "1"
+            memory_state_before = graph_revision_before
 
         events = artifact_dir / "native-events.jsonl"
         metadata_path = artifact_dir / "runtime-metadata.json"
@@ -878,6 +1183,7 @@ def run_memory_agent_schedule(
                 "arm": arms[arm_id],
                 "runtime_arm": runtime_arm,
                 "provider": SCRIPTED_PROVIDER_ID,
+                "runner_sources_sha256": runner_sources_sha,
             }
         )
         environment_fingerprint = _canonical_sha256(
@@ -907,8 +1213,17 @@ def run_memory_agent_schedule(
         metadata_path.unlink()
         events_file = tempfile.TemporaryFile()
         started = time.monotonic_ns()
+        provider_memory_verified = False
         try:
-            with ScriptedMemoryProvider(case["prompt"], tinykg_enabled) as provider:
+            with ScriptedMemoryProvider(
+                case["prompt"],
+                runtime_arm,
+                case["benchmark"],
+                split,
+                memory_file=memory_file,
+                memory_index=memory_index,
+                memory_marker=memory_marker,
+            ) as provider:
                 env = _sanitized_environment(os.environ)
                 env.update(
                     {
@@ -956,13 +1271,20 @@ def run_memory_agent_schedule(
                     pass_fds=(metadata_fd, events_file.fileno()),
                 )
                 provider_request_count = len(provider.requests)
+                provider_memory_verified = provider.planner.memory_verified
         except (OSError, subprocess.TimeoutExpired) as exc:
+            events_file.close()
             raise ValidationError(f"native memory rollout {run_id} failed to execute: {exc}") from exc
+        except BaseException:
+            events_file.close()
+            raise
         finally:
             os.close(metadata_fd)
         elapsed_ms = (time.monotonic_ns() - started) / 1_000_000.0
-        finalize_evaluation_fd(events_file.fileno(), events)
-        events_file.close()
+        try:
+            finalize_evaluation_fd(events_file.fileno(), events)
+        finally:
+            events_file.close()
         _write_new(stdout_path, completed.stdout.encode("utf-8"))
         _write_new(stderr_path, completed.stderr.encode("utf-8"))
         result = _parse_result(completed.stdout)
@@ -1007,27 +1329,131 @@ def run_memory_agent_schedule(
         ):
             _fail(f"native memory rollout {run_id}", "runtime emitted an invalid estimated cost")
 
-        query_variants, retrieved, verified, graph_truncated, exposed_bytes = _cassette_tool_data(
+        tool_data = _cassette_tool_data(cassette, logical_ids, case["prompt"])
+        cassette_activity = _cassette_memory_activity(
             cassette,
-            logical_ids,
+            f"native memory rollout {run_id} cassette",
         )
+        if cassette_activity["provider_requests"] != provider_request_count:
+            _fail(f"native memory rollout {run_id}", "raw provider request count drift")
+        if (
+            tinykg_enabled
+            and case["benchmark"] == "procedural_transfer"
+            and tool_data["remembered_node_ids"]
+        ):
+            procedure_id = public_case.get("_procedure_evidence_id")
+            assert isinstance(procedure_id, str)
+            for node_id in tool_data["remembered_node_ids"]:
+                logical_ids[int(node_id)] = procedure_id
+            procedural_stores[family_key] = {
+                "store": str(store),
+                "logical_ids": logical_ids,
+                "abstraction_nodes": abstraction_nodes,
+            }
+            tool_data = _cassette_tool_data(cassette, logical_ids, case["prompt"])
+        query_variants = tool_data["query_variants"]
+        retrieved = tool_data["retrieved"]
+        verified = tool_data["verified"]
+        graph_truncated = bool(tool_data["graph_truncated"])
+        exposed_bytes = int(tool_data["exposed_bytes"])
+        remembered_node_ids = [int(node_id) for node_id in tool_data["remembered_node_ids"]]
+        if memory_backend == "tinykg":
+            memory_reads = int(cassette_activity["tinykg_reads"])
+            memory_writes = int(cassette_activity["tinykg_writes"])
+            foreign_memory_events = int(
+                cassette_activity["markdown_reads"] + cassette_activity["markdown_writes"]
+            )
+        elif memory_backend == "markdown":
+            memory_reads = int(cassette_activity["markdown_reads"])
+            memory_writes = int(cassette_activity["markdown_writes"])
+            foreign_memory_events = int(
+                cassette_activity["tinykg_reads"] + cassette_activity["tinykg_writes"]
+            )
+        else:
+            memory_reads = 0
+            memory_writes = 0
+            foreign_memory_events = sum(
+                int(cassette_activity[key])
+                for key in (
+                    "tinykg_reads",
+                    "tinykg_writes",
+                    "markdown_reads",
+                    "markdown_writes",
+                )
+            )
+        if foreign_memory_events != 0:
+            _fail(f"native memory rollout {run_id}", "cross-backend memory activity")
+        if int(metrics["tool_calls"]) != memory_reads + memory_writes:
+            _fail(f"native memory rollout {run_id}", "scripted lifecycle reached an undeclared tool")
+        if int(metrics["model_tool_errors"] + metrics["harness_tool_errors"]) != 0:
+            _fail(f"native memory rollout {run_id}", "scripted lifecycle contains a tool failure")
         if len([item for item in query_variants if item["kind"] == "semantic"]) > 4:
             _fail(f"native memory rollout {run_id}", "semantic query cap exceeded")
+        online_memory = case["benchmark"] == "procedural_transfer" and split == "online"
         if tinykg_enabled:
             assert store is not None
             graph_revision_after = _tree_digest(store, normalize_store_manifest=True)
             raw_store_digest_after = _tree_digest(store)
-            if graph_revision_after != graph_revision_before:
+            info_after = _store_info(local.command("store-info", store, ()))
+            store_nodes, store_edges = int(info_after["nodes"]), int(info_after["edges"])
+            if info_after.get("text_stale") not in {"0", "1"}:
+                _fail(f"native memory rollout {case['id']}", "invalid TinyKG text_stale state")
+            store_text_stale = info_after["text_stale"] == "1"
+            memory_state_after = graph_revision_after
+            if online_memory:
+                if memory_writes < 1 or graph_revision_after == graph_revision_before:
+                    _fail(f"native memory rollout {run_id}", "online TinyKG phase did not commit memory")
+                if raw_store_digest_after == raw_store_digest_before:
+                    _fail(f"native memory rollout {run_id}", "online TinyKG bytes did not change")
+                if len(set(remembered_node_ids)) != 1:
+                    _fail(f"native memory rollout {run_id}", "online TinyKG insert was not observable")
+            elif graph_revision_after != graph_revision_before:
                 _fail(f"native memory rollout {run_id}", "read-only memory rollout changed TinyKG store")
-            if raw_store_digest_after != raw_store_digest_before:
+            elif raw_store_digest_after != raw_store_digest_before:
                 _fail(
                     f"native memory rollout {run_id}",
                     "read-only memory rollout changed raw TinyKG store bytes",
                 )
-            if not query_variants:
+            if memory_reads < 1 or not query_variants or not provider_memory_verified:
                 _fail(f"native memory rollout {run_id}", "TinyKG arm did not call KgRecall")
-        elif query_variants:
-            _fail(f"native memory rollout {run_id}", "control arm reached TinyKG tools")
+        elif runtime_arm == "claude_style":
+            assert memory_dir is not None
+            memory_state_after = _artifact_tree_digest(
+                memory_dir,
+                "markdown memory after rollout",
+            )
+            if online_memory:
+                if memory_writes < 1 or memory_state_after == memory_state_before:
+                    _fail(f"native memory rollout {run_id}", "online Markdown phase did not persist memory")
+                assert markdown_state is not None
+                if markdown_state.exists():
+                    _fail("procedural Markdown runtime", "online state already exists")
+                _copy_memory_tree(memory_dir, markdown_state)
+            else:
+                if memory_writes != 0 or memory_state_after != memory_state_before:
+                    _fail(f"native memory rollout {run_id}", "read-only Markdown phase changed memory")
+                if memory_reads < 1 or not query_variants or not provider_memory_verified:
+                    _fail(f"native memory rollout {run_id}", "Markdown arm did not read durable memory")
+        elif query_variants or memory_reads != 0 or memory_writes != 0:
+            _fail(f"native memory rollout {run_id}", "no-memory control reached memory tools")
+
+        inserted_nodes = 0
+        if online_memory and memory_backend == "markdown":
+            inserted_nodes = 1
+        elif online_memory and memory_backend == "tinykg":
+            inserted_nodes = len(set(remembered_node_ids))
+
+        retrieval_enabled = memory_reads > 0
+        if memory_backend == "none":
+            active_memory = 0
+            provenance_links = 0
+        elif memory_backend == "markdown":
+            assert memory_dir is not None
+            active_memory = sum(1 for path in memory_dir.rglob("*") if path.is_file())
+            provenance_links = 1 if active_memory >= 2 else 0
+        else:
+            active_memory = store_nodes
+            provenance_links = store_edges
 
         deterministic_success: bool | None = None
         evaluator_invalid: str | None = None
@@ -1057,27 +1483,31 @@ def run_memory_agent_schedule(
             },
             "prediction": str(result["text"]),
             "retrieval": {
-                "enabled": tinykg_enabled,
-                "k": 8 if query_variants else 0,
-                "hop_count": 1 if verified else 0,
+                "enabled": retrieval_enabled,
+                "k": (8 if tinykg_enabled else 1) if retrieval_enabled else 0,
+                "hop_count": 1 if provider_memory_verified else 0,
                 "query_variants": query_variants,
                 "retrieved_evidence_ids": retrieved,
                 "verified_evidence_ids": verified,
                 "graph_truncated": graph_truncated,
             },
             "memory": {
-                "write_mode": "read_only" if tinykg_enabled else "disabled",
+                "write_mode": (
+                    "disabled"
+                    if memory_backend == "none"
+                    else "online" if online_memory else "read_only"
+                ),
                 "exposed_tokens": (exposed_bytes + 3) // 4,
                 "internal_tokens": 0,
-                "inserted_nodes": 0,
-                "active_nodes": store_nodes,
-                "provenance_links": store_edges,
-                "abstraction_nodes": abstraction_nodes,
-                "abstraction_nodes_with_provenance": abstraction_nodes,
-                "candidate_fanout": float(len(retrieved)),
+                "inserted_nodes": inserted_nodes,
+                "active_nodes": active_memory,
+                "provenance_links": provenance_links,
+                "abstraction_nodes": abstraction_nodes if tinykg_enabled else 0,
+                "abstraction_nodes_with_provenance": abstraction_nodes if tinykg_enabled else 0,
+                "candidate_fanout": float(len(retrieved) if tinykg_enabled else memory_reads),
             },
             "graph": {
-                "revision": graph_revision_after,
+                "revision": memory_state_after,
                 "text_stale": store_text_stale,
                 "retrieval_excluded_nodes": 0,
                 "contradiction_edges": 0,
@@ -1089,7 +1519,7 @@ def run_memory_agent_schedule(
                 "contradictory_rejected": 0,
                 "retrieval_excluded_returned": 0,
                 "provenance_missing_returned": 0,
-                "offline_write_events": 0,
+                "offline_write_events": memory_writes if split == "offline" else 0,
             },
             "cost": {
                 # The provider is an in-process test fixture; token-priced
@@ -1132,11 +1562,20 @@ def run_memory_agent_schedule(
                     "store": artifact_relative(store, "TinyKG store artifact")
                     if store is not None
                     else None,
+                    "memory_state": artifact_relative(memory_dir, "Markdown memory artifact")
+                    if memory_dir is not None
+                    else None,
                 },
                 "store_revision_before": graph_revision_before,
                 "store_revision_after": graph_revision_after,
                 "raw_store_digest_before": raw_store_digest_before,
                 "raw_store_digest_after": raw_store_digest_after,
+                "memory_backend": memory_backend,
+                "memory_phase": split,
+                "memory_state_before": memory_state_before,
+                "memory_state_after": memory_state_after,
+                "memory_read_events": memory_reads,
+                "memory_write_events": memory_writes,
                 "stop_reason": result["stop_reason"],
                 "provider_mode": "scripted-local",
                 "provider_requests": provider_request_count,
@@ -1159,12 +1598,13 @@ def run_memory_agent_schedule(
         "model_id": manifest["execution"]["model_id"],
         "model_fingerprint": manifest["execution"]["model_fingerprint"],
         "harness_revision": manifest["execution"]["harness_revision"],
+        "runner_sources": runner_sources,
         "arms": list(manifest["execution"]["arms"]),
         "graders": [
             {"case_id": case["id"], "fingerprint": case["grader"]["fingerprint"]}
             for case in manifest["cases"]
         ],
-        "execution_mode": "native-agent-loop-scripted-wiring-smoke",
+        "execution_mode": SCRIPTED_LIFECYCLE_MODE,
         "quality_evidence": False,
         "metacodes_binary_sha256": metacodes_sha,
         "tinykg_binary_sha256": tinykg_sha,
@@ -1176,8 +1616,8 @@ def run_memory_agent_schedule(
         "rollouts": rollout_receipts,
     }
     # Join before publication: a malformed observation must not leave a receipt
-    # that looks complete.  The v2 receipt validator additionally binds each
-    # row to native artifacts.
+    # that looks complete.  The v3 receipt additionally binds each row to its
+    # durable memory pre/post state and raw native artifacts.
     replay_observations(
         manifest,
         observations,

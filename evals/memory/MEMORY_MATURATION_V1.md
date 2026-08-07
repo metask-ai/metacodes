@@ -161,32 +161,39 @@ read-only guard still hashes the raw manifest and every store file/directory, so
 write during retrieval. This makes equivalent fresh stores comparable while preserving fail-closed write-leak
 detection.
 
-### Native agent-loop wiring smoke
+### Native agent-loop lifecycle smoke
 
 `memory_agent_runtime_smoke.py` closes the gap between adapter/replay tests and the actual product runtime. It
-freezes one small case family for each adapter, then executes the complete arm schedule through the native
-`metacodes -p --json` path. A deterministic loopback Anthropic-SSE provider makes this gate paid-cost zero while
-still forcing TinyKG rows through the real `KgRecall` and, when a candidate exists, `KgContext` tool lifecycle.
-The no-memory rows must expose no TinyKG tool. Headless mode is decorated with the same host-owned metadata/event
-FD backend as the REPL; missing tool-start events, incomplete traces, dropped events, model/provider drift, or a
-non-zero process exit fail the smoke.
+freezes one small case family for each adapter, then executes the complete `no_memory` / `markdown_memory` /
+`tinykg_lexical` arm schedule through the native `metacodes -p --json` path. A deterministic loopback
+Anthropic-SSE provider makes this gate paid-cost zero. TinyKG rows use the real `KgRemember` / `KgRecall` /
+`KgContext` lifecycle; Markdown rows use the real `Write` / `Read` AutoMem lifecycle. For procedural transfer,
+the online member must change its bound durable state, then a fresh-process offline sibling must recover exactly
+that state without writing. Non-procedural Markdown rows read a public-corpus Markdown artifact containing no
+hidden gold labels. The no-memory rows must expose no memory tool. Headless mode is decorated with the same
+host-owned metadata/event FD backend as the REPL; missing tool-start events, incomplete traces, dropped events,
+model/provider drift, state drift, or a non-zero process exit fail the smoke.
 
 ```bash
 zig build
 python3 scripts/eval/memory_agent_runtime_smoke.py \
   --binary zig-out/bin/metacodes \
   --tinykg-binary zig-out/vendor/tinykg/tinykg \
-  --output-dir evals/runs/$(date +%F)-memory-native-wiring-v1
+  --output-dir evals/runs/$(date +%F)-memory-native-lifecycle-v3
 ```
 
 The optional output directory is local experimental data and must be fresh. It contains the per-rollout provider
-cassette, native events, headless result, sealed home/transcript tree, isolated TinyKG stores, strict observations,
-and a runtime-receipt-v2. Each receipt binds the metacodes/TinyKG binary hashes, task and observation hashes,
-provider request count, raw and normalized store digests before/after reads, run-relative artifact paths and
-hashes (native events, stdout, stderr, provider cassette, transcript, workspace and TinyKG store), actual paid
-cost, and external-network count. Replay resolves every relative path below the receipt directory, rejects
-symlinks/path escape, and rehashes the raw artifacts; a v2 receipt without its artifact tree is not promotable.
-`quality_evidence=false` is mandatory: the scripted provider always returns the fixed
+cassette, native events, headless result, sealed home/transcript tree, isolated Markdown/TinyKG states, strict
+observations, and a runtime-receipt-v3. Each receipt binds the metacodes/TinyKG binary hashes, task and observation
+hashes, provider request count, memory backend/phase/read/write events, pre/post durable state, raw and normalized
+TinyKG store digests, run-relative artifact paths and hashes (native events, stdout, stderr, provider cassette,
+transcript, workspace, Markdown state and TinyKG store), and immutable copies/hashes of the complete Python host
+source bundle used by the lifecycle smoke, plus actual paid cost and external-network count. Replay derives memory
+read/write counts again from the raw cassette;
+changing receipt/observation fields together cannot conceal an offline write or cross-backend memory call.
+It resolves every relative path below the receipt directory, rejects symlinks/path escape, and rehashes the raw
+artifacts; a v3 receipt without its artifact tree is not promotable. Legacy read-only v2 receipts remain
+replayable. `quality_evidence=false` is mandatory: the scripted provider always returns the fixed
 answer `runtime-smoke`, so this gate proves execution and isolation, not an accuracy or transfer advantage. Corpus,
 trace, and store artifacts stay local and must never be uploaded through the remote TinyKG skill harness.
 

@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
-import json
 import os
 import subprocess
 import tempfile
@@ -46,10 +45,11 @@ def _execution() -> Mapping[str, Any]:
     return {
         "model_id": SCRIPTED_PROVIDER_ID,
         "model_fingerprint": _digest(SCRIPTED_PROVIDER_ID),
-        "harness_revision": "native-memory-agent-wiring-smoke-v1",
+        "harness_revision": "native-memory-agent-lifecycle-smoke-v3",
         "arms": [
-            {"id": "no_memory", "fingerprint": _digest("no-memory-native-v1")},
-            {"id": "tinykg_lexical", "fingerprint": _digest("tinykg-native-v1")},
+            {"id": "no_memory", "fingerprint": _digest("no-memory-native-v3")},
+            {"id": "markdown_memory", "fingerprint": _digest("markdown-native-v3")},
+            {"id": "tinykg_lexical", "fingerprint": _digest("tinykg-native-v3")},
         ],
         "trials": 1,
         "retrieval_limits": {
@@ -172,6 +172,14 @@ def _run_adapter(
                     raise RuntimeError(f"{label}: real KgRecall returned no mapped evidence")
                 if not row["retrieval"]["verified_evidence_ids"]:
                     raise RuntimeError(f"{label}: real KgContext did not verify a candidate")
+        elif row["arm"] == "markdown_memory":
+            if row["trajectory"]["tool_calls"] < 1:
+                raise RuntimeError(f"{label}: Markdown treatment did not reach real tools")
+            if benchmarks[row["case_id"]] != "procedural_transfer" or next(
+                case["split"] for case in manifest["cases"] if case["id"] == row["case_id"]
+            ) != "online":
+                if not row["retrieval"]["query_variants"]:
+                    raise RuntimeError(f"{label}: Markdown treatment did not recall durable memory")
         elif row["trajectory"]["tool_calls"] != 0:
             raise RuntimeError(f"{label}: no-memory control exposed treatment tools")
     if receipt["quality_evidence"] is not False:
@@ -291,7 +299,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.output_dir:
             summary = {
                 "schema_version": 1,
-                "mode": "native-agent-loop-scripted-wiring-smoke",
+                "mode": "native-agent-loop-scripted-lifecycle-smoke",
                 "quality_evidence": False,
                 "adapters": [
                     "hotpotqa-distractor",
@@ -310,7 +318,7 @@ def main(argv: list[str] | None = None) -> int:
             )
     suffix = f", artifacts={Path(args.output_dir).resolve()}" if args.output_dir else ""
     print(
-        "memory-agent-runtime-smoke: 3 adapters, native agent loop, "
+        "memory-agent-runtime-smoke: 3 adapters, 3 arms, durable lifecycle, native agent loop, "
         f"paid=0, external_network=0{suffix}"
     )
     return 0

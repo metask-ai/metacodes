@@ -28,7 +28,23 @@ from .model import ValidationError, stable_json
 
 
 REPLAY_SCHEMA_VERSION = 1
-RUNTIME_RECEIPT_SCHEMA_VERSION = 2
+LEGACY_RUNTIME_RECEIPT_SCHEMA_VERSION = 2
+RUNTIME_RECEIPT_SCHEMA_VERSION = 3
+NATIVE_RUNTIME_RECEIPT_VERSIONS = frozenset(
+    {LEGACY_RUNTIME_RECEIPT_SCHEMA_VERSION, RUNTIME_RECEIPT_SCHEMA_VERSION}
+)
+RUNNER_SOURCE_MODULES = (
+    "e2e_adapter",
+    "memory_agent_runtime",
+    "memory_agent_runtime_smoke",
+    "memory_benchmark",
+    "memory_hotpot_adapter",
+    "memory_longmem_adapter",
+    "memory_procedural_adapter",
+    "memory_replay",
+    "memory_tinykg_local",
+    "model",
+)
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,127}$")
 TREATMENT_LEAK_TERMS = (
@@ -152,6 +168,8 @@ def _artifact_path(root: Path, value: Any, where: str, *, directory: bool) -> Pa
         _fail(where, "expected a directory artifact")
     if not directory and not current.is_file():
         _fail(where, "expected a file artifact")
+    if not directory and current.lstat().st_nlink != 1:
+        _fail(where, "hard-linked file artifacts are forbidden")
     return current
 
 
@@ -170,11 +188,15 @@ def _artifact_tree_digest(
             info = path.lstat()
             if stat.S_ISLNK(info.st_mode):
                 _fail(where, f"unexpected symlink {relative!r}")
-            if path.is_dir():
+            if stat.S_ISDIR(info.st_mode):
                 records.append({"path": relative, "type": "directory"})
                 continue
-            if not path.is_file() or (ignore_lock_files and path.name.endswith(".lock")):
+            if not stat.S_ISREG(info.st_mode):
+                _fail(where, f"unexpected non-regular entry {relative!r}")
+            if ignore_lock_files and path.name.endswith(".lock"):
                 continue
+            if info.st_nlink != 1:
+                _fail(where, f"unexpected hard-linked file {relative!r}")
             data = path.read_bytes()
             records.append(
                 {
@@ -189,6 +211,88 @@ def _artifact_tree_digest(
     except OSError as exc:
         raise ValidationError(f"{where}: cannot re-observe artifact tree: {exc}") from exc
     return hashlib.sha256(stable_json(records).encode("utf-8")).hexdigest()
+
+
+def _cassette_memory_activity(root: Path, where: str) -> Mapping[str, int]:
+    """Recompute executed memory operations from the raw provider requests.
+
+    Requests contain the complete conversation-so-far, so tool ids are
+    deduplicated across files and count only after a matching tool_result is
+    observable.  A repeated id with different semantics is corruption, not a
+    second event.
+    """
+
+    request_paths = sorted(root.glob("req-*.json"))
+    if not request_paths:
+        _fail(where, "provider cassette has no request artifacts")
+    request_numbers: List[int] = []
+    tool_defs: Dict[str, Tuple[str, str]] = {}
+    tool_results: set[str] = set()
+    for request_path in request_paths:
+        match = re.fullmatch(r"req-([0-9]+)\.json", request_path.name)
+        if match is None:
+            _fail(where, f"malformed request artifact {request_path.name!r}")
+        request_numbers.append(int(match.group(1)))
+        body = _load_unique_json(request_path, f"{where}.{request_path.name}")
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            _fail(f"{where}.{request_path.name}.messages", "expected an array")
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type")
+                if item_type == "tool_use":
+                    tool_id = item.get("id")
+                    name = item.get("name")
+                    tool_input = item.get("input")
+                    if not isinstance(tool_id, str) or not tool_id:
+                        _fail(where, "tool_use has no stable id")
+                    if not isinstance(name, str) or not name:
+                        _fail(where, f"tool_use {tool_id!r} has no name")
+                    if not isinstance(tool_input, dict):
+                        _fail(where, f"tool_use {tool_id!r} has non-object input")
+                    signature = (name, stable_json(tool_input))
+                    prior = tool_defs.get(tool_id)
+                    if prior is not None and prior != signature:
+                        _fail(where, f"tool id {tool_id!r} changed semantics across requests")
+                    tool_defs[tool_id] = signature
+                elif item_type == "tool_result":
+                    tool_id = item.get("tool_use_id")
+                    if isinstance(tool_id, str) and tool_id:
+                        tool_results.add(tool_id)
+    if request_numbers != list(range(1, len(request_paths) + 1)):
+        _fail(where, "provider request sequence is not contiguous from one")
+
+    counts = {
+        "provider_requests": len(request_paths),
+        "tinykg_reads": 0,
+        "tinykg_writes": 0,
+        "markdown_reads": 0,
+        "markdown_writes": 0,
+    }
+    for tool_id, (name, _raw_input) in tool_defs.items():
+        memory_operation = (
+            name in {"KgRecall", "KgContext", "KgRemember"}
+            or (name == "Read" and tool_id.startswith("markdown-read-"))
+            or (name in {"Write", "Edit"} and tool_id.startswith("markdown-"))
+        )
+        if memory_operation and tool_id not in tool_results:
+            _fail(where, f"memory tool {tool_id!r} has no observable result")
+        if tool_id not in tool_results:
+            continue
+        if name in {"KgRecall", "KgContext"}:
+            counts["tinykg_reads"] += 1
+        elif name == "KgRemember":
+            counts["tinykg_writes"] += 1
+        elif name == "Read" and tool_id.startswith("markdown-read-"):
+            counts["markdown_reads"] += 1
+        elif name in {"Write", "Edit"} and tool_id.startswith("markdown-"):
+            counts["markdown_writes"] += 1
+    return counts
 
 
 def _load_unique_json(path: Path, label: str) -> Mapping[str, Any]:
@@ -263,10 +367,10 @@ def validate_runtime_receipt(
     where: str = "memory runtime receipt",
 ) -> None:
     schema_version = receipt.get("schema_version")
-    if schema_version not in {REPLAY_SCHEMA_VERSION, RUNTIME_RECEIPT_SCHEMA_VERSION}:
+    if schema_version not in {REPLAY_SCHEMA_VERSION, *NATIVE_RUNTIME_RECEIPT_VERSIONS}:
         _fail(
             f"{where}.schema_version",
-            f"expected {REPLAY_SCHEMA_VERSION} or {RUNTIME_RECEIPT_SCHEMA_VERSION}",
+            "expected replay v1, native wiring v2, or native lifecycle v3",
         )
     v2_fields = (
         "execution_mode",
@@ -292,9 +396,10 @@ def validate_runtime_receipt(
             "model_id",
             "model_fingerprint",
             "harness_revision",
+            *(("runner_sources",) if schema_version == RUNTIME_RECEIPT_SCHEMA_VERSION else ()),
             "arms",
             "graders",
-            *(v2_fields if schema_version == RUNTIME_RECEIPT_SCHEMA_VERSION else ()),
+            *(v2_fields if schema_version in NATIVE_RUNTIME_RECEIPT_VERSIONS else ()),
         ),
     )
     if value["protocol_id"] != PROTOCOL_ID:
@@ -353,14 +458,41 @@ def validate_runtime_receipt(
     if observed_graders != expected_graders:
         _fail(f"{where}.graders", "runtime grader identities do not match the manifest")
 
-    if schema_version != RUNTIME_RECEIPT_SCHEMA_VERSION:
+    if schema_version not in NATIVE_RUNTIME_RECEIPT_VERSIONS:
         return
-    if value["execution_mode"] != "native-agent-loop-scripted-wiring-smoke":
+    if schema_version == RUNTIME_RECEIPT_SCHEMA_VERSION:
+        raw_sources = value["runner_sources"]
+        if not isinstance(raw_sources, list):
+            _fail(f"{where}.runner_sources", "expected an array")
+        observed_modules: Dict[str, str] = {}
+        observed_paths: set[str] = set()
+        for index, raw_source in enumerate(raw_sources):
+            source_where = f"{where}.runner_sources[{index}]"
+            source = _object(raw_source, source_where, ("module", "path", "sha256"))
+            module = _identifier(source["module"], f"{source_where}.module")
+            path = _artifact_relative_path(source["path"], f"{source_where}.path").as_posix()
+            digest = _hash(source["sha256"], f"{source_where}.sha256")
+            if path != f"runner-sources/{module}.py":
+                _fail(f"{source_where}.path", "does not match its runner module")
+            if module in observed_modules:
+                _fail(f"{source_where}.module", "duplicate runner module")
+            if path in observed_paths:
+                _fail(f"{source_where}.path", "duplicate runner source path")
+            observed_modules[module] = digest
+            observed_paths.add(path)
+        if set(observed_modules) != set(RUNNER_SOURCE_MODULES):
+            _fail(f"{where}.runner_sources", "does not bind the complete host runtime source set")
+    expected_mode = (
+        "native-agent-loop-scripted-wiring-smoke"
+        if schema_version == LEGACY_RUNTIME_RECEIPT_SCHEMA_VERSION
+        else "native-agent-loop-scripted-lifecycle-smoke"
+    )
+    if value["execution_mode"] != expected_mode:
         _fail(f"{where}.execution_mode", "unsupported native execution mode")
     if value["quality_evidence"] is not False:
         _fail(
             f"{where}.quality_evidence",
-            "scripted wiring smoke must never claim memory-quality evidence",
+            "scripted native smoke must never claim memory-quality evidence",
         )
     metacodes_sha256 = _hash(
         value["metacodes_binary_sha256"],
@@ -375,10 +507,10 @@ def validate_runtime_receipt(
         f"{where}.external_network_calls",
     )
     if external_network_calls != 0:
-        _fail(f"{where}.external_network_calls", "scripted wiring smoke must be zero")
+        _fail(f"{where}.external_network_calls", "scripted native smoke must be zero")
     paid_cost_usd = _finite_number(value["paid_cost_usd"], f"{where}.paid_cost_usd")
     if paid_cost_usd != 0.0:
-        _fail(f"{where}.paid_cost_usd", "scripted wiring smoke must be zero")
+        _fail(f"{where}.paid_cost_usd", "scripted native smoke must be zero")
     estimated_cost_usd = _finite_number(
         value["estimated_cost_usd"],
         f"{where}.estimated_cost_usd",
@@ -423,6 +555,18 @@ def validate_runtime_receipt(
                 "estimated_cost_usd",
                 "observation_sha256",
                 "host_elapsed_ms",
+                *(
+                    (
+                        "memory_backend",
+                        "memory_phase",
+                        "memory_state_before",
+                        "memory_state_after",
+                        "memory_read_events",
+                        "memory_write_events",
+                    )
+                    if schema_version == RUNTIME_RECEIPT_SCHEMA_VERSION
+                    else ()
+                ),
             ),
         )
         sequence = _integer(rollout["sequence"], f"{rollout_where}.sequence")
@@ -473,6 +617,7 @@ def validate_runtime_receipt(
                 "transcript",
                 "workspace",
                 "store",
+                *(('memory_state',) if schema_version == RUNTIME_RECEIPT_SCHEMA_VERSION else ()),
             ),
         )
         for key in ("native_events", "result", "stderr", "cassette", "transcript", "workspace"):
@@ -487,6 +632,25 @@ def validate_runtime_receipt(
             )
         elif artifact_paths["store"] is not None:
             _fail(f"{rollout_where}.artifact_paths.store", "control arm must use null")
+        expected_backend = (
+            "tinykg"
+            if tinykg_enabled
+            else "markdown" if rollout["arm"] in {"markdown_memory", "claude_style"} else "none"
+        )
+        if schema_version == RUNTIME_RECEIPT_SCHEMA_VERSION:
+            if rollout["memory_backend"] != expected_backend:
+                _fail(f"{rollout_where}.memory_backend", "does not match the frozen arm")
+            memory_artifact = artifact_paths["memory_state"]
+            if expected_backend == "markdown":
+                _artifact_relative_path(
+                    memory_artifact,
+                    f"{rollout_where}.artifact_paths.memory_state",
+                )
+            elif memory_artifact is not None:
+                _fail(
+                    f"{rollout_where}.artifact_paths.memory_state",
+                    "only the Markdown arm has a separate memory tree",
+                )
         if rollout["stop_reason"] not in {"end_turn", "max_turns", "tool_loop", "budget"}:
             _fail(f"{rollout_where}.stop_reason", "unsupported native stop reason")
         if rollout["provider_mode"] != "scripted-local":
@@ -535,12 +699,29 @@ def validate_runtime_receipt(
                 f"{rollout_where}.provider_requests",
                 "does not match native observation trajectory",
             )
-        if not isinstance(retrieval, dict) or retrieval.get("enabled") is not tinykg_enabled:
+        memory_reads = (
+            _integer(
+                rollout["memory_read_events"],
+                f"{rollout_where}.memory_read_events",
+            )
+            if schema_version == RUNTIME_RECEIPT_SCHEMA_VERSION
+            else int(tinykg_enabled)
+        )
+        memory_writes = (
+            _integer(
+                rollout["memory_write_events"],
+                f"{rollout_where}.memory_write_events",
+            )
+            if schema_version == RUNTIME_RECEIPT_SCHEMA_VERSION
+            else 0
+        )
+        expected_retrieval = memory_reads > 0 if schema_version == RUNTIME_RECEIPT_SCHEMA_VERSION else tinykg_enabled
+        if not isinstance(retrieval, dict) or retrieval.get("enabled") is not expected_retrieval:
             _fail(f"{rollout_where}.observation.retrieval", "arm activation mismatch")
-        if tinykg_enabled and not retrieval.get("query_variants"):
+        if expected_retrieval and not retrieval.get("query_variants"):
             _fail(
                 f"{rollout_where}.observation.retrieval.query_variants",
-                "native TinyKG rollout did not execute lexical retrieval",
+                "native memory rollout did not execute an observable retrieval",
             )
         if not isinstance(cost, dict) or cost.get("cost_usd") != rollout["paid_cost_usd"]:
             _fail(f"{rollout_where}.paid_cost_usd", "does not match observation cost")
@@ -560,15 +741,20 @@ def validate_runtime_receipt(
             rollout["raw_store_digest_after"],
             f"{rollout_where}.raw_store_digest_after",
         )
+        online_memory = case["benchmark"] == "procedural_transfer" and case["split"] == "online"
         if tinykg_enabled:
             _hash(before, f"{rollout_where}.store_revision_before")
             _hash(after, f"{rollout_where}.store_revision_after")
             _hash(raw_before, f"{rollout_where}.raw_store_digest_before")
             _hash(raw_after, f"{rollout_where}.raw_store_digest_after")
-            if before != after:
-                _fail(rollout_where, "read-only rollout changed TinyKG store revision")
-            if raw_before != raw_after:
-                _fail(rollout_where, "read-only rollout changed raw TinyKG store bytes")
+            if schema_version == RUNTIME_RECEIPT_SCHEMA_VERSION and online_memory:
+                if memory_writes < 1 or before == after or raw_before == raw_after:
+                    _fail(rollout_where, "online TinyKG phase did not change bound state")
+            else:
+                if before != after:
+                    _fail(rollout_where, "read-only rollout changed TinyKG store revision")
+                if raw_before != raw_after:
+                    _fail(rollout_where, "read-only rollout changed raw TinyKG store bytes")
         elif (
             before != "none"
             or after != "none"
@@ -576,6 +762,86 @@ def validate_runtime_receipt(
             or raw_after != "none"
         ):
             _fail(rollout_where, "control arm must use none store digests")
+        if schema_version == RUNTIME_RECEIPT_SCHEMA_VERSION:
+            phase = _string(rollout["memory_phase"], f"{rollout_where}.memory_phase")
+            if phase != case["split"]:
+                _fail(f"{rollout_where}.memory_phase", "does not match the frozen case split")
+            state_before = _string(
+                rollout["memory_state_before"],
+                f"{rollout_where}.memory_state_before",
+            )
+            state_after = _string(
+                rollout["memory_state_after"],
+                f"{rollout_where}.memory_state_after",
+            )
+            if expected_backend == "none":
+                if (state_before, state_after, memory_reads, memory_writes) != ("none", "none", 0, 0):
+                    _fail(rollout_where, "no-memory arm has durable-memory activity")
+            else:
+                _hash(state_before, f"{rollout_where}.memory_state_before")
+                _hash(state_after, f"{rollout_where}.memory_state_after")
+                if online_memory:
+                    if memory_writes < 1 or state_before == state_after:
+                        _fail(rollout_where, "online phase did not persist a new memory state")
+                elif memory_writes != 0 or state_before != state_after:
+                    _fail(rollout_where, "read-only phase changed durable memory state")
+                if not online_memory and memory_reads < 1:
+                    _fail(rollout_where, "read-only memory phase did not recall durable state")
+                if expected_backend == "tinykg" and (state_before != before or state_after != after):
+                    _fail(rollout_where, "TinyKG memory state does not bind its store revision")
+            if expected_backend == "none":
+                expected_reads, expected_writes = 0, 0
+            elif expected_backend == "markdown":
+                expected_reads, expected_writes = (0, 2) if online_memory else (1, 0)
+            else:
+                expected_reads, expected_writes = (2, 1) if online_memory else (2, 0)
+            if (memory_reads, memory_writes) != (expected_reads, expected_writes):
+                _fail(
+                    rollout_where,
+                    "memory event counts do not match the fixed lifecycle protocol",
+                )
+            tool_calls = _integer(
+                trajectory.get("tool_calls"),
+                f"{rollout_where}.observation.trajectory.tool_calls",
+            )
+            tool_errors = _integer(
+                trajectory.get("tool_errors"),
+                f"{rollout_where}.observation.trajectory.tool_errors",
+            )
+            if tool_calls != memory_reads + memory_writes:
+                _fail(
+                    f"{rollout_where}.observation.trajectory.tool_calls",
+                    "scripted lifecycle reached an undeclared tool",
+                )
+            if tool_errors != 0:
+                _fail(
+                    f"{rollout_where}.observation.trajectory.tool_errors",
+                    "scripted lifecycle contains a tool failure",
+                )
+            memory = observation.get("memory")
+            graph = observation.get("graph")
+            governance = observation.get("governance")
+            if not isinstance(memory, dict) or not isinstance(graph, dict) or not isinstance(governance, dict):
+                _fail(f"{rollout_where}.observation", "missing memory lifecycle fields")
+            expected_write_mode = (
+                "disabled"
+                if expected_backend == "none"
+                else "online"
+                if online_memory
+                else "read_only"
+            )
+            if memory.get("write_mode") != expected_write_mode:
+                _fail(f"{rollout_where}.observation.memory.write_mode", "lifecycle mismatch")
+            expected_inserts = 1 if online_memory and expected_backend != "none" else 0
+            if memory.get("inserted_nodes") != expected_inserts:
+                _fail(
+                    f"{rollout_where}.observation.memory.inserted_nodes",
+                    "does not match lifecycle inserts",
+                )
+            if graph.get("revision") != state_after:
+                _fail(f"{rollout_where}.observation.graph.revision", "does not bind post-state")
+            if case["split"] == "offline" and governance.get("offline_write_events") != 0:
+                _fail(f"{rollout_where}.observation.governance", "offline write leakage")
     estimated_total = sum(float(item["estimated_cost_usd"]) for item in rollouts)
     if not math.isfinite(estimated_total) or abs(estimated_cost_usd - estimated_total) > 1e-12:
         _fail(f"{where}.estimated_cost_usd", "does not equal rollout total")
@@ -586,14 +852,43 @@ def validate_runtime_artifacts(
     artifact_root: Path,
     where: str = "memory runtime artifacts",
 ) -> None:
-    """Re-open every v2 native artifact instead of trusting receipt-shaped hashes."""
+    """Re-open every native artifact instead of trusting receipt-shaped hashes."""
 
-    if receipt.get("schema_version") != RUNTIME_RECEIPT_SCHEMA_VERSION:
+    schema_version = receipt.get("schema_version")
+    if schema_version not in NATIVE_RUNTIME_RECEIPT_VERSIONS:
         return
+    seen_paths: set[str] = set()
+    if schema_version == RUNTIME_RECEIPT_SCHEMA_VERSION:
+        raw_sources = receipt.get("runner_sources")
+        if not isinstance(raw_sources, list):
+            _fail(f"{where}.runner_sources", "expected an array")
+        for index, raw_source in enumerate(raw_sources):
+            source_where = f"{where}.runner_sources[{index}]"
+            if not isinstance(raw_source, dict):
+                _fail(source_where, "expected an object")
+            relative = _artifact_relative_path(
+                raw_source.get("path"),
+                f"{source_where}.path",
+            ).as_posix()
+            if relative in seen_paths:
+                _fail(f"{source_where}.path", "reuses another runtime artifact")
+            seen_paths.add(relative)
+            runner = _artifact_path(
+                artifact_root,
+                relative,
+                f"{source_where}.path",
+                directory=False,
+            )
+            try:
+                observed_runner_sha = file_sha256(runner)
+            except OSError as exc:
+                raise ValidationError(f"{source_where}.sha256: cannot hash artifact: {exc}") from exc
+            expected_runner_sha = _hash(raw_source.get("sha256"), f"{source_where}.sha256")
+            if observed_runner_sha != expected_runner_sha:
+                _fail(f"{source_where}.sha256", "runtime source mismatch")
     rollouts = receipt.get("rollouts")
     if not isinstance(rollouts, list):
         _fail(where, "receipt rollouts are unavailable")
-    seen_paths: set[str] = set()
     file_specs = (
         ("native_events", "native_events_sha256"),
         ("result", "result_sha256"),
@@ -652,6 +947,40 @@ def validate_runtime_artifacts(
             expected = _hash(raw_rollout.get(digest_key), f"{rollout_where}.{digest_key}")
             if observed != expected:
                 _fail(f"{rollout_where}.{digest_key}", "raw artifact tree mismatch")
+            if path_key == "cassette" and schema_version == RUNTIME_RECEIPT_SCHEMA_VERSION:
+                activity = _cassette_memory_activity(
+                    path,
+                    f"{rollout_where}.artifact_paths.cassette",
+                )
+                if activity["provider_requests"] != raw_rollout.get("provider_requests"):
+                    _fail(f"{rollout_where}.provider_requests", "raw cassette count mismatch")
+                backend = raw_rollout.get("memory_backend")
+                if backend == "tinykg":
+                    expected_reads = activity["tinykg_reads"]
+                    expected_writes = activity["tinykg_writes"]
+                    foreign_activity = activity["markdown_reads"] + activity["markdown_writes"]
+                elif backend == "markdown":
+                    expected_reads = activity["markdown_reads"]
+                    expected_writes = activity["markdown_writes"]
+                    foreign_activity = activity["tinykg_reads"] + activity["tinykg_writes"]
+                else:
+                    expected_reads = 0
+                    expected_writes = 0
+                    foreign_activity = sum(
+                        activity[key]
+                        for key in (
+                            "tinykg_reads",
+                            "tinykg_writes",
+                            "markdown_reads",
+                            "markdown_writes",
+                        )
+                    )
+                if foreign_activity != 0:
+                    _fail(f"{rollout_where}.memory_backend", "raw cassette used another memory backend")
+                if expected_reads != raw_rollout.get("memory_read_events"):
+                    _fail(f"{rollout_where}.memory_read_events", "raw cassette count mismatch")
+                if expected_writes != raw_rollout.get("memory_write_events"):
+                    _fail(f"{rollout_where}.memory_write_events", "raw cassette count mismatch")
         store_path = paths.get("store")
         tinykg_enabled = raw_rollout.get("tinykg_binary_sha256") is not None
         if tinykg_enabled:
@@ -677,10 +1006,41 @@ def validate_runtime_artifacts(
             if observed != expected:
                 _fail(
                     f"{rollout_where}.raw_store_digest_after",
-                    "current store tree no longer matches the read-phase receipt",
+                    "current store tree no longer matches the lifecycle receipt",
                 )
         elif store_path is not None:
             _fail(f"{rollout_where}.artifact_paths.store", "control arm must use null")
+        if schema_version == RUNTIME_RECEIPT_SCHEMA_VERSION:
+            memory_path = paths.get("memory_state")
+            if raw_rollout.get("memory_backend") == "markdown":
+                relative = _artifact_relative_path(
+                    memory_path,
+                    f"{rollout_where}.artifact_paths.memory_state",
+                ).as_posix()
+                path = _artifact_path(
+                    artifact_root,
+                    relative,
+                    f"{rollout_where}.artifact_paths.memory_state",
+                    directory=True,
+                )
+                observed = _artifact_tree_digest(
+                    path,
+                    f"{rollout_where}.artifact_paths.memory_state",
+                )
+                expected = _hash(
+                    raw_rollout.get("memory_state_after"),
+                    f"{rollout_where}.memory_state_after",
+                )
+                if observed != expected:
+                    _fail(
+                        f"{rollout_where}.memory_state_after",
+                        "current Markdown tree no longer matches the lifecycle receipt",
+                    )
+            elif memory_path is not None:
+                _fail(
+                    f"{rollout_where}.artifact_paths.memory_state",
+                    "only Markdown rollouts have a separate memory tree",
+                )
 
 
 def validate_manifest(manifest: Mapping[str, Any], where: str = "memory manifest") -> None:
@@ -973,11 +1333,11 @@ def replay_observations(
         observations,
         observed_source_sha,
     )
-    if runtime_receipt.get("schema_version") == RUNTIME_RECEIPT_SCHEMA_VERSION:
+    if runtime_receipt.get("schema_version") in NATIVE_RUNTIME_RECEIPT_VERSIONS:
         if runtime_artifact_root is None:
             _fail(
                 "memory runtime artifacts",
-                "v2 replay requires the receipt directory for raw-artifact re-observation",
+                "native replay requires the receipt directory for raw-artifact re-observation",
             )
         validate_runtime_artifacts(runtime_receipt, runtime_artifact_root)
 
