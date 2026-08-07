@@ -95,7 +95,8 @@
   },
   "schema_version": 1,
   "tinykg_runtime": {
-    "binary_sha256": "6ce9495c79ff9cab306fb3f70239c36611160c0a871eb1d28b70bb33333dcbd1",
+    "binary_sha256": "66e5aeae156563868e2d8b0970bd08c0bc3189280af17395fafc327c07543eee",
+    "build_profile": "metacodes-vendored-ReleaseSafe-stripped",
     "preflight_commands": ["init", "apply", "store-info"],
     "schema_version": 3,
     "source_commit": "93d89bcd4d0208c994da3632fb6166efffcc86e7",
