@@ -1412,6 +1412,247 @@
           ]
         }
       ]
+    },
+    {
+      "id": "compatibility-convention-transfer",
+      "procedure_evidence_id": "procedure:compatibility-convention-transfer:v1",
+      "intent_template": "Register sibling command `{name}`. {instruction}",
+      "cases": [
+        {
+          "id": "snapshot-export",
+          "split": "online",
+          "bindings": {
+            "instruction": "Establish this family's compatibility convention: use legacy alias COMPAT_<UPPER_SNAKE_NAME>, sentinel order authorize > execute > audit, and documentation line - <name> => <alias> [authorize > execute > audit]. Update the command registry, legacy alias map, sentinel map, docs, and JSON contract.",
+            "name": "snapshot_export"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/command-contracts.md",
+                "content": "# Command contracts\n\n- read => READ_V1 [validate > commit]\n"
+              },
+              {
+                "path": "src/command_contract.py",
+                "content": "COMMANDS = [\"read\"]\nLEGACY_ALIAS = {\"read\": \"READ_V1\"}\nSENTINELS = {\"read\": [\"validate\", \"commit\"]}\n"
+              },
+              {
+                "path": "tests/command-contract.json",
+                "content": "{\"commands\":[{\"name\":\"read\",\"legacy_alias\":\"READ_V1\",\"sentinels\":[\"validate\",\"commit\"]}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/command-contracts.md",
+              "src/command_contract.py",
+              "tests/command-contract.json"
+            ],
+            "required_changed_paths": [
+              "docs/command-contracts.md",
+              "src/command_contract.py",
+              "tests/command-contract.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/command_contract.py",
+                "value": "COMMANDS = [\"read\", \"snapshot_export\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/command_contract.py",
+                "value": "\"snapshot_export\": \"COMPAT_SNAPSHOT_EXPORT\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/command_contract.py",
+                "value": "\"snapshot_export\": [\"authorize\", \"execute\", \"audit\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/command-contracts.md",
+                "value": "- snapshot_export => COMPAT_SNAPSHOT_EXPORT [authorize > execute > audit]"
+              },
+              {
+                "kind": "equals",
+                "path": "tests/command-contract.json",
+                "value": "{\"commands\":[{\"name\":\"read\",\"legacy_alias\":\"READ_V1\",\"sentinels\":[\"validate\",\"commit\"]},{\"name\":\"snapshot_export\",\"legacy_alias\":\"COMPAT_SNAPSHOT_EXPORT\",\"sentinels\":[\"authorize\",\"execute\",\"audit\"]}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/command-contracts.md",
+              "content": "# Command contracts\n\n- read => READ_V1 [validate > commit]\n- snapshot_export => COMPAT_SNAPSHOT_EXPORT [authorize > execute > audit]\n"
+            },
+            {
+              "path": "src/command_contract.py",
+              "content": "COMMANDS = [\"read\", \"snapshot_export\"]\nLEGACY_ALIAS = {\"read\": \"READ_V1\", \"snapshot_export\": \"COMPAT_SNAPSHOT_EXPORT\"}\nSENTINELS = {\"read\": [\"validate\", \"commit\"], \"snapshot_export\": [\"authorize\", \"execute\", \"audit\"]}\n"
+            },
+            {
+              "path": "tests/command-contract.json",
+              "content": "{\"commands\":[{\"name\":\"read\",\"legacy_alias\":\"READ_V1\",\"sentinels\":[\"validate\",\"commit\"]},{\"name\":\"snapshot_export\",\"legacy_alias\":\"COMPAT_SNAPSHOT_EXPORT\",\"sentinels\":[\"authorize\",\"execute\",\"audit\"]}]}\n"
+            }
+          ]
+        },
+        {
+          "id": "task-handoff",
+          "split": "offline",
+          "bindings": {
+            "instruction": "Reuse the previously established family compatibility convention for this sibling. Update the command registry, legacy alias map, sentinel map, docs, and JSON contract.",
+            "name": "task_handoff"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/command-contracts.md",
+                "content": "# Command contracts\n\n- read => READ_V1 [validate > commit]\n"
+              },
+              {
+                "path": "src/command_contract.py",
+                "content": "COMMANDS = [\"read\"]\nLEGACY_ALIAS = {\"read\": \"READ_V1\"}\nSENTINELS = {\"read\": [\"validate\", \"commit\"]}\n"
+              },
+              {
+                "path": "tests/command-contract.json",
+                "content": "{\"commands\":[{\"name\":\"read\",\"legacy_alias\":\"READ_V1\",\"sentinels\":[\"validate\",\"commit\"]}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/command-contracts.md",
+              "src/command_contract.py",
+              "tests/command-contract.json"
+            ],
+            "required_changed_paths": [
+              "docs/command-contracts.md",
+              "src/command_contract.py",
+              "tests/command-contract.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/command_contract.py",
+                "value": "COMMANDS = [\"read\", \"task_handoff\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/command_contract.py",
+                "value": "\"task_handoff\": \"COMPAT_TASK_HANDOFF\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/command_contract.py",
+                "value": "\"task_handoff\": [\"authorize\", \"execute\", \"audit\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/command-contracts.md",
+                "value": "- task_handoff => COMPAT_TASK_HANDOFF [authorize > execute > audit]"
+              },
+              {
+                "kind": "equals",
+                "path": "tests/command-contract.json",
+                "value": "{\"commands\":[{\"name\":\"read\",\"legacy_alias\":\"READ_V1\",\"sentinels\":[\"validate\",\"commit\"]},{\"name\":\"task_handoff\",\"legacy_alias\":\"COMPAT_TASK_HANDOFF\",\"sentinels\":[\"authorize\",\"execute\",\"audit\"]}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/command-contracts.md",
+              "content": "# Command contracts\n\n- read => READ_V1 [validate > commit]\n- task_handoff => COMPAT_TASK_HANDOFF [authorize > execute > audit]\n"
+            },
+            {
+              "path": "src/command_contract.py",
+              "content": "COMMANDS = [\"read\", \"task_handoff\"]\nLEGACY_ALIAS = {\"read\": \"READ_V1\", \"task_handoff\": \"COMPAT_TASK_HANDOFF\"}\nSENTINELS = {\"read\": [\"validate\", \"commit\"], \"task_handoff\": [\"authorize\", \"execute\", \"audit\"]}\n"
+            },
+            {
+              "path": "tests/command-contract.json",
+              "content": "{\"commands\":[{\"name\":\"read\",\"legacy_alias\":\"READ_V1\",\"sentinels\":[\"validate\",\"commit\"]},{\"name\":\"task_handoff\",\"legacy_alias\":\"COMPAT_TASK_HANDOFF\",\"sentinels\":[\"authorize\",\"execute\",\"audit\"]}]}\n"
+            }
+          ]
+        },
+        {
+          "id": "ontology-promote",
+          "split": "offline",
+          "bindings": {
+            "instruction": "Reuse the previously established family compatibility convention for this sibling. Update the command registry, legacy alias map, sentinel map, docs, and JSON contract.",
+            "name": "ontology_promote"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/command-contracts.md",
+                "content": "# Command contracts\n\n- read => READ_V1 [validate > commit]\n"
+              },
+              {
+                "path": "src/command_contract.py",
+                "content": "COMMANDS = [\"read\"]\nLEGACY_ALIAS = {\"read\": \"READ_V1\"}\nSENTINELS = {\"read\": [\"validate\", \"commit\"]}\n"
+              },
+              {
+                "path": "tests/command-contract.json",
+                "content": "{\"commands\":[{\"name\":\"read\",\"legacy_alias\":\"READ_V1\",\"sentinels\":[\"validate\",\"commit\"]}]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/command-contracts.md",
+              "src/command_contract.py",
+              "tests/command-contract.json"
+            ],
+            "required_changed_paths": [
+              "docs/command-contracts.md",
+              "src/command_contract.py",
+              "tests/command-contract.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/command_contract.py",
+                "value": "COMMANDS = [\"read\", \"ontology_promote\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "src/command_contract.py",
+                "value": "\"ontology_promote\": \"COMPAT_ONTOLOGY_PROMOTE\""
+              },
+              {
+                "kind": "contains",
+                "path": "src/command_contract.py",
+                "value": "\"ontology_promote\": [\"authorize\", \"execute\", \"audit\"]"
+              },
+              {
+                "kind": "contains",
+                "path": "docs/command-contracts.md",
+                "value": "- ontology_promote => COMPAT_ONTOLOGY_PROMOTE [authorize > execute > audit]"
+              },
+              {
+                "kind": "equals",
+                "path": "tests/command-contract.json",
+                "value": "{\"commands\":[{\"name\":\"read\",\"legacy_alias\":\"READ_V1\",\"sentinels\":[\"validate\",\"commit\"]},{\"name\":\"ontology_promote\",\"legacy_alias\":\"COMPAT_ONTOLOGY_PROMOTE\",\"sentinels\":[\"authorize\",\"execute\",\"audit\"]}]}\n"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/command-contracts.md",
+              "content": "# Command contracts\n\n- read => READ_V1 [validate > commit]\n- ontology_promote => COMPAT_ONTOLOGY_PROMOTE [authorize > execute > audit]\n"
+            },
+            {
+              "path": "src/command_contract.py",
+              "content": "COMMANDS = [\"read\", \"ontology_promote\"]\nLEGACY_ALIAS = {\"read\": \"READ_V1\", \"ontology_promote\": \"COMPAT_ONTOLOGY_PROMOTE\"}\nSENTINELS = {\"read\": [\"validate\", \"commit\"], \"ontology_promote\": [\"authorize\", \"execute\", \"audit\"]}\n"
+            },
+            {
+              "path": "tests/command-contract.json",
+              "content": "{\"commands\":[{\"name\":\"read\",\"legacy_alias\":\"READ_V1\",\"sentinels\":[\"validate\",\"commit\"]},{\"name\":\"ontology_promote\",\"legacy_alias\":\"COMPAT_ONTOLOGY_PROMOTE\",\"sentinels\":[\"authorize\",\"execute\",\"audit\"]}]}\n"
+            }
+          ]
+        }
+      ]
     }
   ]
 }
