@@ -728,7 +728,12 @@ test "Read 流式:≥10MB 大范围触发 100KB 封顶 → 裁到完整行 + 精
 test "Read 流式:offset 超文件行数 → 空" {
     const a = std.testing.allocator;
     const ctx = testCtx();
-    const path = "/tmp/cc-zig-read-stream-eof.txt";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/read-stream-eof.txt", .{root_buf[0..root_len]});
     const fd = pfs.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     try std.testing.expect(fd >= 0);
     // ~11MB 文件,offset 远超行数。
@@ -738,9 +743,10 @@ test "Read 流式:offset 超文件行数 → 空" {
     var w: usize = 0;
     while (w < 176) : (w += 1) _ = pfs.write(fd, &buf); // ~11MB,~176 行(每行 64KB)
     _ = pfs.close(fd);
-    defer _ = std.c.unlink(path);
 
-    const r = try execute(&ctx, "{\"file_path\":\"/tmp/cc-zig-read-stream-eof.txt\",\"offset\":9999999,\"limit\":5}");
+    const args = try std.fmt.allocPrint(a, "{{\"file_path\":\"{s}\",\"offset\":9999999,\"limit\":5}}", .{path});
+    defer a.free(args);
+    const r = try execute(&ctx, args);
     defer a.free(r);
     try std.testing.expectEqualStrings("", r);
 }

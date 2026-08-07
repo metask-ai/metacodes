@@ -1148,6 +1148,7 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
             kind, payload = next(iter(tagged.items()))
             known_kinds = {
                 "run_started",
+                "scoped_recall",
                 "turn_started",
                 "turn_finished",
                 "model_request_finished",
@@ -1293,6 +1294,11 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
             "continuation": ("depth", "n", "max"),
             "auto_compact": ("dropped", "kept", "before_tokens", "after_tokens"),
             "run_finished": ("depth", "turns", "tool_calls", "wall_time_ms", "dropped_events"),
+            "scoped_recall": (
+                "result_count",
+                "injected_count",
+                "injected_bytes",
+            ),
         }.get(kind, ())
         for field in integer_fields:
             value = payload.get(field)
@@ -1306,6 +1312,32 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
                 or cost < 0
             ):
                 return None, "usage has invalid estimated_cost_usd"
+        if kind == "scoped_recall":
+            if payload.get("schema_version") != "metacodes-scoped-recall-v1":
+                return None, "scoped_recall has unsupported schema_version"
+            status = payload.get("status")
+            if status not in {
+                "injected",
+                "disabled",
+                "kg_not_ready",
+                "no_user_text",
+                "query_too_short",
+                "search_error",
+                "no_hits",
+                "below_floor",
+            }:
+                return None, "scoped_recall has invalid status"
+            for field in ("query_sha256", "injection_sha256"):
+                digest = payload.get(field)
+                if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                    return None, f"scoped_recall has invalid {field}"
+            injected = status == "injected"
+            if injected != (
+                payload.get("injected_count", 0) > 0
+                and payload.get("injected_bytes", 0) > 0
+                and payload.get("injection_sha256") != "0" * 64
+            ):
+                return None, "scoped_recall injection fields contradict status"
         if kind == "tool_finished" and not isinstance(payload.get("is_error"), bool):
             return None, "tool_finished has invalid is_error"
         if kind == "policy_decision":
@@ -1466,6 +1498,11 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
     tool_starts = [payload for kind, payload, _seq, _session in events if kind == "tool_started"]
     tool_finishes = [payload for kind, payload, _seq, _session in events if kind == "tool_finished"]
     policies = [payload for kind, payload, _seq, _session in events if kind == "policy_decision"]
+    scoped_recalls = [
+        payload for kind, payload, _seq, _session in events if kind == "scoped_recall"
+    ]
+    if len(scoped_recalls) > len(starts):
+        return None, "native trace has more scoped recall receipts than invocations"
     failures = [item for item in tool_finishes if item.get("is_error")]
     model_failures = [
         item
@@ -1603,6 +1640,13 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
         "policy_decisions": len(policies),
         "retries": sum(1 for kind, _payload, _seq, _session in events if kind == "retry"),
         "tool_distribution": starts_by_tool,
+        "scoped_recall_count": len(scoped_recalls),
+        "scoped_recall_injected_count": sum(
+            int(item.get("injected_count", 0)) for item in scoped_recalls
+        ),
+        "scoped_recall_injected_bytes": sum(
+            int(item.get("injected_bytes", 0)) for item in scoped_recalls
+        ),
     }
     return {
         "metadata": metadata,
@@ -1622,6 +1666,7 @@ def _native_trace_metrics(path: Path) -> Tuple[Optional[Dict[str, Any]], Optiona
             }
             for item in failures
         ],
+        "scoped_recalls": scoped_recalls,
     }, None
 
 

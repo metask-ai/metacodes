@@ -74,6 +74,7 @@ from .memory_replay import (
     _artifact_tree_digest,
     _cassette_memory_activity,
     _cassette_memory_exposure,
+    _cassette_scoped_recall_injections,
     _cassette_treatment_activation,
     _validate_production_provider_tool_schema,
     _native_pricing_provenance,
@@ -93,7 +94,7 @@ from .model import ValidationError, stable_json
 
 
 RUNTIME_RECEIPT_SCHEMA_VERSION = 3
-PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 6
+PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 7
 RUNTIME_METADATA_SCHEMA_VERSION = NATIVE_EVENT_SCHEMA_VERSION
 SCRIPTED_PROVIDER_ID = "metacodes-memory-scripted-lifecycle-v3"
 SCRIPTED_LIFECYCLE_MODE = "native-agent-loop-scripted-lifecycle-smoke"
@@ -249,6 +250,48 @@ def _hash_text(value: str) -> str:
     return _hash_bytes(value.encode("utf-8"))
 
 
+def _verify_scoped_recall_activation(
+    native: Mapping[str, Any],
+    cassette: Path,
+    prompt: str,
+    *,
+    tinykg_enabled: bool,
+    where: str,
+) -> Mapping[str, Any] | None:
+    raw_receipts = native.get("scoped_recalls")
+    if not isinstance(raw_receipts, list):
+        _fail(where, "native trace omitted scoped recall evidence collection")
+    injections = _cassette_scoped_recall_injections(cassette, where)
+    if not tinykg_enabled:
+        if raw_receipts or injections:
+            _fail(where, "non-TinyKG arm exposed scoped recall evidence")
+        return None
+    if len(raw_receipts) != 1:
+        _fail(where, f"expected one native scoped recall receipt, observed {len(raw_receipts)}")
+    receipt = raw_receipts[0]
+    if not isinstance(receipt, dict):
+        _fail(where, "scoped recall receipt is not an object")
+    if receipt.get("query_sha256") != _hash_bytes(prompt.encode("utf-8")[:400]):
+        _fail(where, "scoped recall query does not bind the rollout prompt")
+    status = receipt.get("status")
+    if status == "injected":
+        if len(injections) != 1:
+            _fail(where, f"native injection requires one provider block, observed {len(injections)}")
+        payload = injections[0]
+        injected_count = receipt.get("injected_count")
+        if (
+            receipt.get("injected_bytes") != len(payload)
+            or receipt.get("injection_sha256") != _hash_bytes(payload)
+            or not isinstance(injected_count, int)
+            or isinstance(injected_count, bool)
+            or injected_count < 1
+        ):
+            _fail(where, "native scoped recall commitment does not match provider bytes")
+    elif injections:
+        _fail(where, "provider received a scoped recall block without an injected receipt")
+    return dict(receipt)
+
+
 def _safe_component(value: str) -> str:
     # Artifact paths are visible to the model through cwd, memory instructions,
     # and METACODES_KG_STORE. Never leak arm labels such as "tinykg" or
@@ -292,6 +335,11 @@ def _write_new(path: Path, payload: bytes) -> None:
         raise
     finally:
         os.close(fd)
+    directory_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _read_regular_file(path: Path, where: str) -> bytes:
@@ -1575,7 +1623,7 @@ def run_memory_agent_schedule(
     """Run one complete frozen schedule through scripted or production provider.
 
     The default remains the v3 zero-cost lifecycle smoke. Passing ``production``
-    selects the stricter v5 contract and requires an exclusively locked,
+    selects the stricter v7 contract and requires an exclusively locked,
     persistent authorization journal before any provider-capable subprocess.
     """
 
@@ -1763,6 +1811,7 @@ def run_memory_agent_schedule(
             baseline = _materialize_workspace(public_case, workspace)
 
         split = str(case["split"])
+        online_memory = case["benchmark"] == "procedural_transfer" and split == "online"
         memory_backend = {
             "codex_style": "none",
             "claude_style": "markdown",
@@ -2244,6 +2293,13 @@ def run_memory_agent_schedule(
         if native_error is not None or native is None:
             _fail(f"native memory rollout {run_id}", native_error or "invalid events")
         metrics = native["metrics"]
+        scoped_recall_activation = _verify_scoped_recall_activation(
+            native,
+            cassette,
+            str(case["prompt"]),
+            tinykg_enabled=tinykg_enabled,
+            where=f"native memory rollout {run_id} scoped recall",
+        )
         if completed.returncode != 0:
             _fail(f"native memory rollout {run_id}", f"process exited {completed.returncode}")
         if result["stop_reason"] not in SAFE_STOP_REASONS:
@@ -2320,6 +2376,60 @@ def run_memory_agent_schedule(
                 actual_metered_tokens=metered_tokens,
             )
 
+        deterministic_success: bool | None = None
+        candidate: Mapping[str, str] | None = None
+        if case["benchmark"] == "procedural_transfer":
+            validator_entry = validators.get(case["id"])
+            if validator_entry is not None:
+                candidate = _read_workspace(workspace, baseline)
+                deterministic_success, _failures = evaluate_workspace(
+                    baseline,
+                    candidate,
+                    validator_entry["validator"],
+                )
+
+        consolidation_receipt: Mapping[str, Any] | None = None
+        if production_mode and online_memory and memory_backend != "none":
+            from .memory_consolidation import commit_execution_episode
+
+            if memory_dir is None or memory_index is None or candidate is None:
+                _fail(
+                    f"native memory rollout {run_id}",
+                    "online consolidation requires durable memory and validator output",
+                )
+            consolidation_receipt = commit_execution_episode(
+                local=local,
+                memory_dir=memory_dir,
+                memory_index=memory_index,
+                store=store if tinykg_enabled else None,
+                prompt=str(case["prompt"]),
+                stop_reason=str(result["stop_reason"]),
+                deterministic_success=deterministic_success,
+                baseline=baseline,
+                candidate=candidate,
+                source_events_sha256=file_sha256(events),
+            )
+            if tinykg_enabled:
+                procedure_id = public_case.get("_procedure_evidence_id")
+                projection_nodes = consolidation_receipt.get(
+                    "tinykg_projection_node_ids"
+                )
+                if not isinstance(procedure_id, str) or not isinstance(
+                    projection_nodes, list
+                ):
+                    _fail(
+                        f"native memory rollout {run_id}",
+                        "TinyKG consolidation omitted logical projection provenance",
+                    )
+                for node_id in projection_nodes:
+                    if not isinstance(node_id, int) or isinstance(node_id, bool):
+                        _fail(
+                            f"native memory rollout {run_id}",
+                            "TinyKG consolidation returned an invalid projection id",
+                        )
+                    logical_ids[node_id] = procedure_id
+                procedural_stores[family_key]["logical_ids"] = logical_ids
+
         tool_data = _cassette_tool_data(
             cassette,
             logical_ids,
@@ -2376,6 +2486,10 @@ def run_memory_agent_schedule(
             (stable_json(query_plan_trace) + "\n").encode("utf-8"),
         )
         query_variants = tool_data["query_variants"]
+        host_recall_injected = bool(
+            scoped_recall_activation is not None
+            and scoped_recall_activation.get("status") == "injected"
+        )
         if query_plan_trace["status"] == "verified":
             governed_variants: List[Mapping[str, str]] = []
             governed_text: set[str] = set()
@@ -2392,6 +2506,11 @@ def run_memory_agent_schedule(
                     }
                 )
             query_variants = governed_variants
+        elif host_recall_injected and not query_variants:
+            prompt_bytes = str(case["prompt"]).encode("utf-8")[:400]
+            query_variants = [
+                {"kind": "exact", "text": prompt_bytes.decode("utf-8", errors="ignore")}
+            ]
         retrieved = tool_data["retrieved"]
         verified = tool_data["verified"]
         graph_truncated = bool(tool_data["graph_truncated"])
@@ -2456,7 +2575,6 @@ def run_memory_agent_schedule(
                 _fail(f"native memory rollout {run_id}", "scripted lifecycle contains a tool failure")
         if len([item for item in query_variants if item["kind"] == "semantic"]) > 4:
             _fail(f"native memory rollout {run_id}", "semantic query cap exceeded")
-        online_memory = case["benchmark"] == "procedural_transfer" and split == "online"
         if memory_dir is not None:
             markdown_revision_after = _artifact_tree_digest(
                 memory_dir,
@@ -2548,7 +2666,11 @@ def run_memory_agent_schedule(
                 else len(set(remembered_node_ids))
             )
 
-        retrieval_enabled = bool(query_variants) if production_mode else memory_reads > 0
+        retrieval_enabled = (
+            bool(query_variants) or host_recall_injected
+            if production_mode
+            else memory_reads > 0 or host_recall_injected
+        )
         if memory_backend == "none":
             active_memory = 0
             provenance_links = 0
@@ -2560,9 +2682,13 @@ def run_memory_agent_schedule(
             active_memory = store_nodes
             provenance_links = store_edges
 
-        deterministic_success: bool | None = None
         evaluator_invalid: str | None = None
-        if query_plan_trace["status"] == "invalid":
+        host_only_query_plan_gap = (
+            host_recall_injected
+            and query_plan_trace["invalid_reasons"]
+            == ["TinyKG backend executed no KgRecall"]
+        )
+        if query_plan_trace["status"] == "invalid" and not host_only_query_plan_gap:
             evaluator_invalid = "query-plan trace invalid: " + "; ".join(
                 str(reason) for reason in query_plan_trace["invalid_reasons"]
             )
@@ -2570,12 +2696,22 @@ def run_memory_agent_schedule(
             validator_entry = validators.get(case["id"])
             if validator_entry is None:
                 evaluator_invalid = evaluator_invalid or "validator bundle missing case"
-            else:
-                candidate = _read_workspace(workspace, baseline)
-                deterministic_success, _failures = evaluate_workspace(
-                    baseline,
-                    candidate,
-                    validator_entry["validator"],
+        if production_mode and split == "offline" and memory_backend == "markdown":
+            if int(exposure["auto_injected_bytes"]) <= 0 and int(
+                exposure["tool_result_bytes"]
+            ) <= 0:
+                evaluator_invalid = (
+                    evaluator_invalid
+                    or "Markdown backend exposed no durable memory"
+                )
+        if production_mode and split == "offline" and tinykg_enabled:
+            explicit_recall = bool(
+                memory_reads > 0 and query_variants and int(exposure["tool_result_bytes"]) > 0
+            )
+            if not host_recall_injected and not explicit_recall:
+                evaluator_invalid = (
+                    evaluator_invalid
+                    or "TinyKG backend exposed no verified host or explicit recall"
                 )
 
         observation: Mapping[str, Any] = {
@@ -2717,6 +2853,8 @@ def run_memory_agent_schedule(
                     "memory_auto_injected_bytes": int(exposure["auto_injected_bytes"]),
                     "memory_tool_result_bytes": int(exposure["tool_result_bytes"]),
                     "treatment_activation": treatment_activation,
+                    "scoped_recall": scoped_recall_activation,
+                    "consolidation": consolidation_receipt,
                     "budget_transaction": budget_transaction_receipt,
                     "sandbox": {
                         "backend": PRODUCTION_SANDBOX_BACKEND,

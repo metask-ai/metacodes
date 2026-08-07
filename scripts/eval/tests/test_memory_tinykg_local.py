@@ -6,8 +6,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from scripts.eval.memory_consolidation import commit_execution_episode
 from scripts.eval.memory_procedural_adapter import adapt_procedural, artifact_bytes
-from scripts.eval.memory_tinykg_local import build_case_batch, run_local_tinykg_smoke
+from scripts.eval.memory_tinykg_local import (
+    LocalTinyKg,
+    _store_info,
+    build_case_batch,
+    run_local_tinykg_smoke,
+)
 from scripts.eval.model import ValidationError
 
 
@@ -156,6 +162,63 @@ class LocalTinyKgBatchTest(unittest.TestCase):
 
 @unittest.skipUnless(NATIVE_TINYKG.is_file(), "build the vendored TinyKG binary first")
 class LocalTinyKgNativeTest(unittest.TestCase):
+    def test_execution_episode_import_and_project_membership_are_native(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary_sha256 = hashlib.sha256(NATIVE_TINYKG.read_bytes()).hexdigest()
+            local = LocalTinyKg(
+                binary=NATIVE_TINYKG,
+                expected_sha256=binary_sha256,
+                run_dir=root / "isolated-consolidation",
+            )
+            store = local.store_root / "episode.kg"
+            local.command("init", store, ())
+            batch = local.batch_root / "project.jsonl"
+            batch.write_text(
+                '{"version":1}\n'
+                '{"op":"node","id":1,"kind":"project","name":"episode-test"}\n',
+                encoding="utf-8",
+            )
+            local.command("apply", store, (str(batch),))
+            before = _store_info(local.command("store-info", store, ()))
+
+            memory = local.run_dir / "memory"
+            memory.mkdir()
+            receipt = commit_execution_episode(
+                local=local,
+                memory_dir=memory,
+                memory_index=memory / "MEMORY.md",
+                store=store,
+                prompt="Preserve the registry migration protocol intent.",
+                stop_reason="end_turn",
+                deterministic_success=True,
+                baseline={"src/registry.zig": "const version = 1;\n"},
+                candidate={"src/registry.zig": "const version = 2;\n"},
+                source_events_sha256=hashlib.sha256(b"native-events").hexdigest(),
+            )
+            after = _store_info(local.command("store-info", store, ()))
+
+            self.assertEqual(receipt["status"], "committed")
+            self.assertIn(
+                receipt["tinykg_document_id"],
+                receipt["tinykg_projection_node_ids"],
+            )
+            self.assertGreater(len(receipt["tinykg_projection_node_ids"]), 1)
+            self.assertGreater(int(after["nodes"]), int(before["nodes"]))
+            self.assertGreater(int(after["edges"]), int(before["edges"]))
+            self.assertEqual(
+                [command["action"] for command in local.commands[-6:]],
+                [
+                    "store-info",
+                    "import-md-doc",
+                    "add-edge",
+                    "neighbors",
+                    "store-info",
+                    "store-info",
+                ],
+            )
+            self.assertTrue(all(not command["child_tinykg_env_keys"] for command in local.commands))
+
     def test_real_local_cli_isolated_store_and_remote_sentinels_remain_untouched(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

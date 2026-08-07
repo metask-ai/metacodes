@@ -29,6 +29,11 @@ from .memory_budget_journal import (
     usd_to_microusd_ceiling,
     validate_checkpoint_payload,
 )
+from .memory_consolidation import (
+    SCHEMA_VERSION as CONSOLIDATION_SCHEMA_VERSION,
+    validate_artifacts as _validate_consolidation_artifacts,
+    validate_receipt as _validate_consolidation_receipt,
+)
 from .memory_query_plan import (
     load_and_verify_query_plan_sidecar,
     summarize_query_plan_traces,
@@ -41,13 +46,15 @@ LEGACY_RUNTIME_RECEIPT_SCHEMA_VERSION = 2
 RUNTIME_RECEIPT_SCHEMA_VERSION = 3
 LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 4
 BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 5
-PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 6
+PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 6
+PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION = 7
 NATIVE_RUNTIME_RECEIPT_VERSIONS = frozenset(
     {
         LEGACY_RUNTIME_RECEIPT_SCHEMA_VERSION,
         RUNTIME_RECEIPT_SCHEMA_VERSION,
         LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }
 )
@@ -55,6 +62,7 @@ PRODUCTION_RUNTIME_RECEIPT_VERSIONS = frozenset(
     {
         LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }
 )
@@ -82,10 +90,14 @@ PRE_QUERY_PLAN_PRODUCTION_RUNNER_SOURCE_MODULES = (
     *LEGACY_PRODUCTION_RUNNER_SOURCE_MODULES,
     "memory_budget_journal",
 )
-PRODUCTION_RUNNER_SOURCE_MODULES = (
+PRE_CONSOLIDATION_PRODUCTION_RUNNER_SOURCE_MODULES = (
     *RUNNER_SOURCE_MODULES,
     "memory_agent_runtime_pilot",
     "memory_budget_journal",
+)
+PRODUCTION_RUNNER_SOURCE_MODULES = (
+    *PRE_CONSOLIDATION_PRODUCTION_RUNNER_SOURCE_MODULES,
+    "memory_consolidation",
 )
 PRODUCTION_PROVIDER_ID = "metask-anthropic-compatible-v1"
 PRODUCTION_MODEL_PROVIDER = "anthropic"
@@ -125,6 +137,7 @@ PRODUCTION_FILESYSTEM_ISOLATION = "not_proven_bypass_permissions_same_uid"
 PRODUCTION_CHILD_PATH = "/bin:/usr/bin"
 PRODUCTION_AUTO_COMPACT_POLICY = "disabled_threshold_reject_any_compact_event"
 PRODUCTION_FORCE_COMPACT_AT = "9223372036854775807"
+SCOPED_RECALL_PREFIX = "<system-reminder>\n# 相关持久记忆(按你的请求自动召回,可能不全)\n"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,127}$")
 TREATMENT_LEAK_TERMS = (
@@ -240,12 +253,18 @@ def _query_plan_source_bound(receipt: Mapping[str, Any], where: str) -> bool:
             _fail(f"{where}.runner_sources", "unknown legacy production source set")
     elif schema_version in {
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }:
-        if observed not in {
-            PRE_QUERY_PLAN_PRODUCTION_RUNNER_SOURCE_MODULES,
-            PRODUCTION_RUNNER_SOURCE_MODULES,
-        }:
+        expected_sources = {
+            BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+                PRE_QUERY_PLAN_PRODUCTION_RUNNER_SOURCE_MODULES,
+            PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+                PRE_CONSOLIDATION_PRODUCTION_RUNNER_SOURCE_MODULES,
+            PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+                PRODUCTION_RUNNER_SOURCE_MODULES,
+        }[schema_version]
+        if observed != expected_sources:
             _fail(f"{where}.runner_sources", "unknown production runtime source set")
     else:
         _fail(f"{where}.schema_version", "unsupported native runtime receipt")
@@ -580,6 +599,11 @@ def _cassette_memory_exposure(
             if section and section not in seen_sections:
                 seen_sections.add(section)
                 auto_injected_bytes += len(section.encode("utf-8"))
+        auto_injected_bytes += sum(
+            len(block.encode("utf-8"))
+            for block in first_text_blocks
+            if block.startswith(SCOPED_RECALL_PREFIX)
+        )
 
     tool_defs: Dict[str, Tuple[str, str]] = {}
     tool_results: Dict[str, Tuple[str, bool]] = {}
@@ -636,6 +660,36 @@ def _cassette_memory_exposure(
         "tool_result_bytes": tool_result_bytes,
         "total_bytes": auto_injected_bytes + tool_result_bytes,
     }
+
+
+def _cassette_scoped_recall_injections(root: Path, where: str) -> List[bytes]:
+    """Read exact host-injected recall blocks from the first provider request.
+
+    Native events carry only byte/hash commitments. The cassette independently
+    proves those committed bytes crossed the provider boundary.
+    """
+
+    request_paths = sorted(root.glob("req-*.json"))
+    if not request_paths:
+        _fail(where, "provider cassette has no request artifacts")
+    first = _load_unique_json(request_paths[0], f"{where}.{request_paths[0].name}")
+    messages = first.get("messages")
+    if not isinstance(messages, list):
+        _fail(f"{where}.{request_paths[0].name}.messages", "expected an array")
+    result: List[bytes] = []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            text = (
+                item.get("text")
+                if isinstance(item, dict) and item.get("type") == "text"
+                else None
+            )
+            if isinstance(text, str) and text.startswith(SCOPED_RECALL_PREFIX):
+                result.append(text.encode("utf-8"))
+    return result
 
 
 def _cassette_treatment_activation(
@@ -1002,12 +1056,17 @@ def _validate_production_runtime_receipt(
 ) -> None:
     schema_version = receipt.get("schema_version")
     if schema_version not in PRODUCTION_RUNTIME_RECEIPT_VERSIONS:
-        _fail(f"{where}.schema_version", "expected production runtime receipt v4, v5, or v6")
+        _fail(f"{where}.schema_version", "expected production runtime receipt v4, v5, v6, or v7")
     journal_bound = schema_version in {
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }
-    toolchain_bound = schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION
+    toolchain_bound = schema_version in {
+        PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+    }
+    scoped_recall_bound = schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION
     value = _object(
         receipt,
         where,
@@ -1123,12 +1182,13 @@ def _validate_production_runtime_receipt(
             _fail(source_where, "duplicate runner source")
         source_modules.append(module)
         source_paths.add(path)
-    allowed_source_modules = (
-        (PRE_QUERY_PLAN_PRODUCTION_RUNNER_SOURCE_MODULES, PRODUCTION_RUNNER_SOURCE_MODULES)
-        if journal_bound
-        else (LEGACY_PRODUCTION_RUNNER_SOURCE_MODULES,)
-    )
-    if tuple(source_modules) not in allowed_source_modules:
+    expected_source_modules = {
+        LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION: LEGACY_PRODUCTION_RUNNER_SOURCE_MODULES,
+        BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION: PRE_QUERY_PLAN_PRODUCTION_RUNNER_SOURCE_MODULES,
+        PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION: PRE_CONSOLIDATION_PRODUCTION_RUNNER_SOURCE_MODULES,
+        PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION: PRODUCTION_RUNNER_SOURCE_MODULES,
+    }[schema_version]
+    if tuple(source_modules) != expected_source_modules:
         _fail(f"{where}.runner_sources", "does not bind the production host source set")
 
     if value["arms"] != manifest["execution"]["arms"]:
@@ -1247,6 +1307,8 @@ def _validate_production_runtime_receipt(
                 "memory_auto_injected_bytes",
                 "memory_tool_result_bytes",
                 "treatment_activation",
+                *(("scoped_recall",) if scoped_recall_bound else ()),
+                *(("consolidation",) if scoped_recall_bound else ()),
                 *(("budget_transaction",) if journal_bound else ()),
                 *(("sandbox",) if journal_bound else ()),
                 "observation_sha256",
@@ -1522,6 +1584,58 @@ def _validate_production_runtime_receipt(
         if _hash(activation["fingerprint"], f"{rollout_where}.treatment_activation.fingerprint") != _canonical_sha256(activation_payload):
             _fail(f"{rollout_where}.treatment_activation.fingerprint", "does not bind activation")
 
+        scoped_recall = rollout.get("scoped_recall") if scoped_recall_bound else None
+        if tinykg_enabled and scoped_recall_bound:
+            scoped_recall = _object(
+                scoped_recall,
+                f"{rollout_where}.scoped_recall",
+                (
+                    "trace_id",
+                    "schema_version",
+                    "status",
+                    "query_sha256",
+                    "result_count",
+                    "injected_count",
+                    "injected_bytes",
+                    "injection_sha256",
+                ),
+            )
+            if scoped_recall["schema_version"] != "metacodes-scoped-recall-v1":
+                _fail(f"{rollout_where}.scoped_recall.schema_version", "unsupported receipt")
+            _string(scoped_recall["trace_id"], f"{rollout_where}.scoped_recall.trace_id")
+            if scoped_recall["status"] not in {
+                "injected",
+                "search_error",
+                "no_hits",
+                "below_floor",
+            }:
+                _fail(f"{rollout_where}.scoped_recall.status", "invalid ready-KG status")
+            _hash(scoped_recall["query_sha256"], f"{rollout_where}.scoped_recall.query_sha256")
+            _hash(scoped_recall["injection_sha256"], f"{rollout_where}.scoped_recall.injection_sha256")
+            for key in ("result_count", "injected_count", "injected_bytes"):
+                _integer(scoped_recall[key], f"{rollout_where}.scoped_recall.{key}")
+            expected_query = hashlib.sha256(
+                str(case["prompt"]).encode("utf-8")[:400]
+            ).hexdigest()
+            if scoped_recall["query_sha256"] != expected_query:
+                _fail(f"{rollout_where}.scoped_recall.query_sha256", "does not bind case prompt")
+            if scoped_recall["status"] == "injected":
+                if scoped_recall["injected_count"] < 1 or scoped_recall["injected_bytes"] < 1:
+                    _fail(f"{rollout_where}.scoped_recall", "injected receipt is empty")
+                if auto_injected_bytes < scoped_recall["injected_bytes"]:
+                    _fail(f"{rollout_where}.memory_auto_injected_bytes", "omits scoped recall")
+            elif (
+                scoped_recall["injected_count"] != 0
+                or scoped_recall["injected_bytes"] != 0
+                or scoped_recall["injection_sha256"] != "0" * 64
+            ):
+                _fail(f"{rollout_where}.scoped_recall", "non-injected receipt claims payload")
+        elif scoped_recall_bound and scoped_recall is not None:
+            _fail(f"{rollout_where}.scoped_recall", "control arm must use null")
+
+        online = case["benchmark"] == "procedural_transfer" and case["split"] == "online"
+        consolidation = rollout.get("consolidation") if scoped_recall_bound else None
+
         observation = observations[sequence]
         if _hash(rollout["observation_sha256"], f"{rollout_where}.observation_sha256") != _canonical_sha256(observation):
             _fail(f"{rollout_where}.observation_sha256", "does not bind observation")
@@ -1531,8 +1645,23 @@ def _validate_production_runtime_receipt(
         memory = observation.get("memory")
         graph = observation.get("graph")
         governance = observation.get("governance")
-        if not all(isinstance(item, dict) for item in (trajectory, retrieval, cost, memory, graph, governance)):
+        evaluator = observation.get("evaluator")
+        if not all(
+            isinstance(item, dict)
+            for item in (trajectory, retrieval, cost, memory, graph, governance, evaluator)
+        ):
             _fail(f"{rollout_where}.observation", "missing production lifecycle fields")
+        if scoped_recall_bound:
+            consolidation = _validate_consolidation_receipt(
+                consolidation,
+                required=online and expected_backend != "none",
+                tinykg_enabled=tinykg_enabled,
+                native_events_sha256=rollout["native_events_sha256"],
+                deterministic_success=evaluator.get("deterministic_success"),
+                final_store_revision=rollout["store_revision_after"],
+                final_raw_store_digest=rollout["raw_store_digest_after"],
+                where=f"{rollout_where}.consolidation",
+            )
         if _integer(trajectory.get("model_requests"), f"{rollout_where}.trajectory.model_requests", minimum=1) != provider_requests:
             _fail(f"{rollout_where}.provider_requests", "does not match native trajectory")
         memory_reads = _integer(rollout["memory_read_events"], f"{rollout_where}.memory_read_events")
@@ -1597,12 +1726,61 @@ def _validate_production_runtime_receipt(
         expected_write_mode = "disabled" if expected_backend == "none" else "online" if online else "read_only"
         if memory.get("write_mode") != expected_write_mode:
             _fail(f"{rollout_where}.observation.memory.write_mode", "lifecycle mismatch")
+        if scoped_recall_bound and online and expected_backend != "none":
+            if state_before == state_after or before_components["markdown"] == after_components["markdown"]:
+                _fail(
+                    rollout_where,
+                    "online memory arm did not durably consolidate Markdown state",
+                )
+            if tinykg_enabled and (
+                before_components["tinykg"] == after_components["tinykg"]
+                or rollout["raw_store_digest_before"] == rollout["raw_store_digest_after"]
+            ):
+                _fail(
+                    rollout_where,
+                    "online TinyKG arm did not durably consolidate graph bytes",
+                )
         if not online and (memory_writes != 0 or state_before != state_after):
             _fail(rollout_where, "read-only phase changed durable memory state")
         if phase == "offline" and governance.get("offline_write_events") != 0:
             _fail(f"{rollout_where}.observation.governance", "offline write leakage")
-        if retrieval.get("enabled") is not bool(retrieval.get("query_variants")):
-            _fail(f"{rollout_where}.observation.retrieval", "activation is not grounded in observed queries")
+        host_recall_injected = bool(
+            isinstance(scoped_recall, dict) and scoped_recall.get("status") == "injected"
+        )
+        if retrieval.get("enabled") is not bool(
+            retrieval.get("query_variants") or host_recall_injected
+        ):
+            _fail(
+                f"{rollout_where}.observation.retrieval",
+                "activation is not grounded in observed queries or host recall",
+            )
+        markdown_activation_missing = bool(
+            scoped_recall_bound
+            and phase == "offline"
+            and expected_backend == "markdown"
+            and auto_injected_bytes <= 0
+            and tool_result_bytes <= 0
+        )
+        explicit_recall = bool(
+            memory_reads > 0
+            and tool_result_bytes > 0
+            and isinstance(retrieval.get("query_variants"), list)
+            and retrieval["query_variants"]
+        )
+        tinykg_activation_missing = bool(
+            scoped_recall_bound
+            and phase == "offline"
+            and tinykg_enabled
+            and not host_recall_injected
+            and not explicit_recall
+        )
+        if (markdown_activation_missing or tinykg_activation_missing) and evaluator.get(
+            "status"
+        ) != "invalid":
+            _fail(
+                f"{rollout_where}.observation.evaluator",
+                "inactive memory treatment must be explicitly invalid",
+            )
 
         store_before = _string(rollout["store_revision_before"], f"{rollout_where}.store_revision_before")
         store_after = _string(rollout["store_revision_after"], f"{rollout_where}.store_revision_after")
@@ -1791,6 +1969,7 @@ def validate_runtime_receipt(
         RUNTIME_RECEIPT_SCHEMA_VERSION,
         LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }:
         raw_sources = value["runner_sources"]
@@ -2199,6 +2378,7 @@ def validate_runtime_artifacts(
         RUNTIME_RECEIPT_SCHEMA_VERSION,
         LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }:
         raw_sources = receipt.get("runner_sources")
@@ -2230,6 +2410,7 @@ def validate_runtime_artifacts(
                 _fail(f"{source_where}.sha256", "runtime source mismatch")
     if schema_version in {
         BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+        PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     }:
         journal_receipt = receipt.get("budget_journal")
@@ -2304,10 +2485,12 @@ def validate_runtime_artifacts(
     )
     for index, raw_rollout in enumerate(rollouts):
         rollout_where = f"{where}.rollouts[{index}]"
+        native_scoped_recalls: List[Mapping[str, Any]] | None = None
         if not isinstance(raw_rollout, dict):
             _fail(rollout_where, "expected an object")
         if schema_version in {
             BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+            PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
             PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
         }:
             assert checkpoint_transactions is not None
@@ -2459,6 +2642,7 @@ def validate_runtime_artifacts(
                 RUNTIME_RECEIPT_SCHEMA_VERSION,
                 LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
             }
             and paths.get("memory_state") is not None
@@ -2540,6 +2724,15 @@ def validate_runtime_artifacts(
                             "does not match the production receipt",
                         )
                 metrics = native["metrics"]
+                raw_native_scoped = native.get("scoped_recalls")
+                if not isinstance(raw_native_scoped, list) or any(
+                    not isinstance(item, dict) for item in raw_native_scoped
+                ):
+                    _fail(
+                        f"{rollout_where}.native_events",
+                        "scoped recall evidence is malformed",
+                    )
+                native_scoped_recalls = raw_native_scoped
                 metered_tokens = sum(
                     int(metrics[key])
                     for key in (
@@ -2591,7 +2784,11 @@ def validate_runtime_artifacts(
                 _fail(f"{rollout_where}.{digest_key}", "raw artifact tree mismatch")
             if (
                 path_key == "transcript"
-                and schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION
+                and schema_version
+                in {
+                    PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                    PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                }
             ):
                 ripgrep = path / ".metacodes" / "toolchain" / "rg"
                 try:
@@ -2614,6 +2811,7 @@ def validate_runtime_artifacts(
                 RUNTIME_RECEIPT_SCHEMA_VERSION,
                 LEGACY_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 BUDGET_JOURNAL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
                 PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
             }:
                 activity = _cassette_memory_activity(
@@ -2621,7 +2819,10 @@ def validate_runtime_artifacts(
                     f"{rollout_where}.artifact_paths.cassette",
                     memory_root=memory_root,
                 )
-                if schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+                if schema_version in {
+                    PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                    PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+                }:
                     _validate_production_provider_tool_schema(
                         path,
                         f"{rollout_where}.artifact_paths.cassette",
@@ -2637,6 +2838,57 @@ def validate_runtime_artifacts(
                         f"{rollout_where}.artifact_paths.cassette",
                         "production model attempted a forbidden nested-provider tool",
                     )
+                if schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+                    if native_scoped_recalls is None:
+                        _fail(
+                            f"{rollout_where}.native_events",
+                            "scoped recall evidence was not re-observed",
+                        )
+                    if len(native_scoped_recalls) == 0:
+                        observed_scoped: Mapping[str, Any] | None = None
+                    elif len(native_scoped_recalls) == 1:
+                        observed_scoped = native_scoped_recalls[0]
+                    else:
+                        _fail(
+                            f"{rollout_where}.native_events",
+                            "multiple scoped recall receipts in one invocation",
+                        )
+                    if observed_scoped != raw_rollout.get("scoped_recall"):
+                        _fail(
+                            f"{rollout_where}.scoped_recall",
+                            "does not match the native event",
+                        )
+                    injections = _cassette_scoped_recall_injections(
+                        path,
+                        f"{rollout_where}.artifact_paths.cassette.scoped_recall",
+                    )
+                    if observed_scoped is None:
+                        if injections:
+                            _fail(
+                                f"{rollout_where}.scoped_recall",
+                                "provider block exists without native receipt",
+                            )
+                    elif observed_scoped.get("status") == "injected":
+                        if len(injections) != 1:
+                            _fail(
+                                f"{rollout_where}.scoped_recall",
+                                "injected receipt requires one provider block",
+                            )
+                        payload = injections[0]
+                        if (
+                            observed_scoped.get("injected_bytes") != len(payload)
+                            or observed_scoped.get("injection_sha256")
+                            != hashlib.sha256(payload).hexdigest()
+                        ):
+                            _fail(
+                                f"{rollout_where}.scoped_recall",
+                                "provider block differs from native commitment",
+                            )
+                    elif injections:
+                        _fail(
+                            f"{rollout_where}.scoped_recall",
+                            "non-injected receipt has a provider block",
+                        )
                 backend = raw_rollout.get("memory_backend")
                 if backend == "tinykg":
                     expected_reads = activity["tinykg_reads"]
@@ -2801,6 +3053,26 @@ def validate_runtime_artifacts(
                     _fail(
                         f"{rollout_where}.memory_components_after.markdown",
                         "current Markdown tree no longer matches the production receipt",
+                    )
+            if schema_version == PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION:
+                consolidation_required = bool(
+                    raw_rollout.get("memory_phase") == "online" and backend != "none"
+                )
+                if consolidation_required:
+                    if memory_root is None:
+                        _fail(
+                            f"{rollout_where}.artifact_paths.memory_state",
+                            "online consolidation has no durable memory tree",
+                        )
+                    _validate_consolidation_artifacts(
+                        raw_rollout,
+                        memory_root,
+                        rollout_where,
+                    )
+                elif raw_rollout.get("consolidation") is not None:
+                    _fail(
+                        f"{rollout_where}.consolidation",
+                        "only online memory arms may consolidate",
                     )
 
 

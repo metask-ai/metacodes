@@ -32,6 +32,32 @@ const REL_RATIO: f64 = 0.5; // 相对门:只留 ≥ top×0.5 的命中
 // BM25 分跨 query 不可比,固定地板固有不精确;仪器日志(injected/top_score)供持续校准。
 const DEFAULT_ABS_FLOOR: f64 = 3.0;
 
+pub const RECEIPT_SCHEMA_VERSION = "metacodes-scoped-recall-v1";
+
+/// Redacted execution receipt for evaluation. It commits to the exact query
+/// and synthetic block without exposing either one in the native event log.
+/// Counts remain zero on every non-injection path, so replay can distinguish a
+/// real host recall miss from a missing/forged activation claim.
+pub const Receipt = struct {
+    schema_version: []const u8 = RECEIPT_SCHEMA_VERSION,
+    status: []const u8,
+    query_sha256: [64]u8 = .{'0'} ** 64,
+    result_count: usize = 0,
+    injected_count: usize = 0,
+    injected_bytes: usize = 0,
+    injection_sha256: [64]u8 = .{'0'} ** 64,
+};
+
+pub const BuildResult = struct {
+    text: ?[]u8,
+    receipt: Receipt,
+
+    pub fn deinit(self: *BuildResult, allocator: std.mem.Allocator) void {
+        if (self.text) |text| allocator.free(text);
+        self.* = undefined;
+    }
+};
+
 /// 相关性门 + 动态条数。best-effort:kg 未就绪 / 关闭 / 无末条 user 文本 / 消息琐碎 / 无相关命中
 /// → null(不注入)。返回 error 仅内部分配失败(调用方 `catch null` 兜底,等价不注入)。owned。
 pub fn build(
@@ -40,19 +66,36 @@ pub fn build(
     conversation: *const conv_mod.Conversation,
     abort: *const AbortSignal,
 ) !?[]u8 {
-    if (disabled()) return null; // escape hatch(解耦 KG)
-    if (!kg.ready) return null;
-    const raw = lastUserText(conversation) orelse return null;
-    if (raw.len < MIN_QUERY_LEN) return null; // 琐碎轮不召回
+    const result = try buildWithReceipt(allocator, kg, conversation, abort);
+    return result.text;
+}
+
+pub fn buildWithReceipt(
+    allocator: std.mem.Allocator,
+    kg: *client_mod.KgClient,
+    conversation: *const conv_mod.Conversation,
+    abort: *const AbortSignal,
+) !BuildResult {
+    if (disabled()) return noInjection("disabled"); // escape hatch(解耦 KG)
+    if (!kg.ready) return noInjection("kg_not_ready");
+    const raw = lastUserText(conversation) orelse return noInjection("no_user_text");
+    if (raw.len < MIN_QUERY_LEN) return noInjection("query_too_short"); // 琐碎轮不召回
     const query = raw[0..@min(raw.len, MAX_QUERY_LEN)]; // 上界截断
+    const query_sha256 = sha256Hex(query);
 
     kg.setAbort(abort); // ESC 可中断
-    const hits = kg.recall(query, TOP_K, false) catch return null;
+    const hits = kg.recall(query, TOP_K, false) catch return .{
+        .text = null,
+        .receipt = .{ .status = "search_error", .query_sha256 = query_sha256 },
+    };
     defer {
         for (hits) |*h| h.deinit(allocator);
         allocator.free(hits);
     }
-    if (hits.len == 0) return null;
+    if (hits.len == 0) return .{
+        .text = null,
+        .receipt = .{ .status = "no_hits", .query_sha256 = query_sha256 },
+    };
 
     // 相关性门:top 分做绝对地板(答案缺席→0 条)+ 相对衰减(留 ≥top×REL)。
     var top: f64 = 0;
@@ -62,7 +105,14 @@ pub fn build(
     const floor = absFloor();
     if (top < floor) {
         log.info("kg", "scoped_recall injected=0 top_score={d:.2} (below floor {d:.2})", .{ top, floor });
-        return null; // 最相关的都弱 → 判为答案缺席,不注入噪声
+        return .{
+            .text = null,
+            .receipt = .{
+                .status = "below_floor",
+                .query_sha256 = query_sha256,
+                .result_count = hits.len,
+            },
+        }; // 最相关的都弱 → 判为答案缺席,不注入噪声
     }
     const keep_min = top * REL_RATIO;
 
@@ -89,8 +139,29 @@ pub fn build(
     try out.appendSlice(allocator, "\n");
     try out.appendSlice(allocator, "</system-reminder>");
 
+    const text = try out.toOwnedSlice(allocator);
     log.info("kg", "scoped_recall injected={d} top_score={d:.2} query_len={d}", .{ injected, top, query.len });
-    return try out.toOwnedSlice(allocator);
+    return .{
+        .text = text,
+        .receipt = .{
+            .status = "injected",
+            .query_sha256 = query_sha256,
+            .result_count = hits.len,
+            .injected_count = injected,
+            .injected_bytes = text.len,
+            .injection_sha256 = sha256Hex(text),
+        },
+    };
+}
+
+fn noInjection(status: []const u8) BuildResult {
+    return .{ .text = null, .receipt = .{ .status = status } };
+}
+
+fn sha256Hex(bytes: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
 }
 
 fn disabled() bool {

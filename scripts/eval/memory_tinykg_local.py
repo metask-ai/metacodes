@@ -457,7 +457,15 @@ class LocalTinyKg:
         return value.replace(str(self.run_dir), "<RUN_DIR>").replace(str(self.binary), "<TINYKG_BINARY>")
 
     def command(self, action: str, store: Path, extra: Sequence[str]) -> str:
-        if action not in {"init", "apply", "search", "neighbors", "store-info"}:
+        if action not in {
+            "init",
+            "apply",
+            "search",
+            "neighbors",
+            "store-info",
+            "import-md-doc",
+            "add-edge",
+        }:
             _fail("local TinyKG command", f"unsupported action {action!r}")
         resolved_store = store.resolve()
         try:

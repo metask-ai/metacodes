@@ -72,8 +72,24 @@ pub fn run(
     const eval_tee_ui = eval_tee.backend();
     const effective_be: *const ui_backend_mod.UiBackend = if (eval_be != null) &eval_tee_ui else &be;
     // scoped 自动召回(一等公民 P1):headless 单次 prompt 也按请求装配相关记忆(cache-safe 尾注入)。
-    const scoped_recall = if (app.kg) |*k| (@import("../kg/scoped_recall.zig").build(allocator, k, &app.conversation, &app.abort) catch null) else null;
-    defer if (scoped_recall) |s| allocator.free(s);
+    const scoped_recall_mod = @import("../kg/scoped_recall.zig");
+    var scoped_recall_result: ?scoped_recall_mod.BuildResult = if (app.kg) |*k|
+        (scoped_recall_mod.buildWithReceipt(allocator, k, &app.conversation, &app.abort) catch null)
+    else
+        null;
+    defer if (scoped_recall_result) |*result| result.deinit(allocator);
+    if (eval_be) |*evaluation| if (scoped_recall_result) |result| {
+        try evaluation.setScopedRecallEvidence(.{
+            .schema_version = result.receipt.schema_version,
+            .status = result.receipt.status,
+            .query_sha256 = result.receipt.query_sha256,
+            .result_count = result.receipt.result_count,
+            .injected_count = result.receipt.injected_count,
+            .injected_bytes = result.receipt.injected_bytes,
+            .injection_sha256 = result.receipt.injection_sha256,
+        });
+    };
+    const scoped_recall = if (scoped_recall_result) |result| result.text else null;
     const result = agent_loop.run(
         &app.conversation,
         app.provider(),

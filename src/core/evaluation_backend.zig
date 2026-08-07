@@ -352,6 +352,16 @@ pub const RuntimeConfig = struct {
 /// synchronous stringify call inside EvaluationBackend.emitThunk.
 pub const EvalEvent = union(enum) {
     run_started: struct { trace_id: []const u8, metadata: RunMetadata },
+    scoped_recall: struct {
+        trace_id: []const u8,
+        schema_version: []const u8,
+        status: []const u8,
+        query_sha256: []const u8,
+        result_count: usize,
+        injected_count: usize,
+        injected_bytes: usize,
+        injection_sha256: []const u8,
+    },
     turn_started: struct { trace_id: []const u8, depth: u8, turn: u32 },
     turn_finished: struct { trace_id: []const u8, depth: u8, turn: u32, tool_calls: u32 },
     model_request_finished: struct { trace_id: []const u8, depth: u8, turn: u32, attempt: u32, elapsed_ms: u64, outcome: []const u8 },
@@ -417,6 +427,16 @@ pub const EvalEvent = union(enum) {
     },
 };
 
+pub const ScopedRecallEvidence = struct {
+    schema_version: []const u8,
+    status: []const u8,
+    query_sha256: [64]u8,
+    result_count: usize,
+    injected_count: usize,
+    injected_bytes: usize,
+    injection_sha256: [64]u8,
+};
+
 pub const Envelope = struct {
     schema_version: u32 = SCHEMA_VERSION,
     sequence: u64,
@@ -438,6 +458,8 @@ pub const EvaluationBackend = struct {
     sink_fd: ?pfs.Fd = null,
     flushed_len: usize = 0,
     budget: ?*EvaluationBudget = null,
+    pending_scoped_recall: ?ScopedRecallEvidence = null,
+    scoped_recall_emitted: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, metadata: RunMetadata) EvaluationBackend {
         return .{
@@ -463,6 +485,19 @@ pub const EvaluationBackend = struct {
 
     pub fn backend(self: *EvaluationBackend) UiBackend {
         return .{ .ctx = @ptrCast(self), .emit = emitThunk, .poll = pollThunk };
+    }
+
+    /// Queue a host recall receipt before agent_loop starts. The receipt is
+    /// emitted immediately after run_started, once the loop supplies the real
+    /// trace id. Calling this twice would make activation ambiguous, so it is
+    /// deliberately rejected.
+    pub fn setScopedRecallEvidence(
+        self: *EvaluationBackend,
+        evidence: ScopedRecallEvidence,
+    ) !void {
+        if (self.pending_scoped_recall != null or self.scoped_recall_emitted)
+            return error.DuplicateScopedRecallEvidence;
+        self.pending_scoped_recall = evidence;
     }
 
     pub fn jsonl(self: *const EvaluationBackend) []const u8 {
@@ -710,6 +745,19 @@ pub const EvaluationBackend = struct {
             .trace_id = self.traceSlice(),
             .metadata = self.metadata,
         } });
+        if (self.pending_scoped_recall) |evidence| {
+            self.append(session, .{ .scoped_recall = .{
+                .trace_id = self.traceSlice(),
+                .schema_version = evidence.schema_version,
+                .status = evidence.status,
+                .query_sha256 = evidence.query_sha256[0..],
+                .result_count = evidence.result_count,
+                .injected_count = evidence.injected_count,
+                .injected_bytes = evidence.injected_bytes,
+                .injection_sha256 = evidence.injection_sha256[0..],
+            } });
+            self.scoped_recall_emitted = true;
+        }
     }
 
     fn elapsedNs(self: *const EvaluationBackend) u64 {
@@ -886,6 +934,49 @@ test "EvaluationBackend projects versioned redacted events" {
     try std.testing.expect(std.mem.indexOf(u8, out, "do-not-store") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "private") == null);
     try std.testing.expectEqual(@as(u64, 10), eval.sequence);
+}
+
+test "EvaluationBackend binds one scoped recall receipt after run start" {
+    const a = std.testing.allocator;
+    var eval = EvaluationBackend.init(a, .{ .run_id = "scoped-run" });
+    defer eval.deinit();
+    const query_sha: [64]u8 = .{'a'} ** 64;
+    const injection_sha: [64]u8 = .{'b'} ** 64;
+    const evidence: ScopedRecallEvidence = .{
+        .schema_version = "metacodes-scoped-recall-v1",
+        .status = "injected",
+        .query_sha256 = query_sha,
+        .result_count = 3,
+        .injected_count = 2,
+        .injected_bytes = 41,
+        .injection_sha256 = injection_sha,
+    };
+    try eval.setScopedRecallEvidence(evidence);
+    try std.testing.expectError(
+        error.DuplicateScopedRecallEvidence,
+        eval.setScopedRecallEvidence(evidence),
+    );
+
+    const be = eval.backend();
+    const tid: [12]u8 = "scope0000001".*;
+    be.emit(be.ctx, .single, .{
+        .diag_turn_begin = .{ .trace_id = tid, .depth = 0, .turn = 1 },
+    });
+
+    const out = eval.jsonl();
+    const run_pos = std.mem.indexOf(u8, out, "run_started").?;
+    const recall_pos = std.mem.indexOf(u8, out, "scoped_recall").?;
+    const turn_pos = std.mem.indexOf(u8, out, "turn_started").?;
+    try std.testing.expect(run_pos < recall_pos and recall_pos < turn_pos);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"trace_id\":\"scope0000001\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"injected_bytes\":41") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, query_sha[0..]) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, injection_sha[0..]) != null);
+    try std.testing.expectEqual(@as(u64, 3), eval.sequence);
+    try std.testing.expectError(
+        error.DuplicateScopedRecallEvidence,
+        eval.setScopedRecallEvidence(evidence),
+    );
 }
 
 test "RuntimeConfig loads frozen identities and records runtime identity" {

@@ -3254,9 +3254,15 @@ test "auto-compact 触发 PreCompact + PostCompact hook(G-rest 接线,端到端)
     const backend = UiBackend{ .ctx = @ptrCast(&dummy), .emit = Capture.emit, .poll = Capture.poll };
 
     // PreCompact hook 写 marker(证明压缩前触发);PostCompact hook 回 additionalContext(模拟重注入 skill)。
-    const pre_marker: [:0]const u8 = "/tmp/cc_precompact_fired.marker";
-    _ = std.c.unlink(@ptrCast(pre_marker.ptr));
-    const pre_cmds = [_][]const u8{"touch /tmp/cc_precompact_fired.marker"};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_buf);
+    var marker_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const pre_marker = try std.fmt.bufPrintZ(&marker_buf, "{s}/precompact-fired.marker", .{root_buf[0..root_len]});
+    const pre_cmd = try std.fmt.allocPrint(a, "touch -- {s}", .{pre_marker});
+    defer a.free(pre_cmd);
+    const pre_cmds = [_][]const u8{pre_cmd};
     const pre_entries = [_]hooks_mod.HookEntry{.{ .matcher = "*", .commands = &pre_cmds }};
     const post_cmds = [_][]const u8{"echo '{\"additionalContext\":\"ACTIVE_SKILL_REINJECTED\"}'"};
     const post_entries = [_]hooks_mod.HookEntry{.{ .matcher = "*", .commands = &post_cmds }};
@@ -3269,8 +3275,6 @@ test "auto-compact 触发 PreCompact + PostCompact hook(G-rest 接线,端到端)
     const pre_fd = pfs.open(@ptrCast(pre_marker.ptr), .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     try std.testing.expect(pre_fd >= 0);
     if (pre_fd >= 0) _ = pfs.close(pre_fd);
-    _ = std.c.unlink(@ptrCast(pre_marker.ptr));
-
     // PostCompact 的 additionalContext 拼进投影摘要 → 模型下轮读得到。
     try std.testing.expect(c.compact_summary != null);
     try std.testing.expect(std.mem.indexOf(u8, c.compact_summary.?, "ACTIVE_SKILL_REINJECTED") != null);

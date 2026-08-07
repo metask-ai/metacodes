@@ -26,9 +26,11 @@ from scripts.eval.memory_agent_runtime import (
     _run_production_sandbox_probe,
     _safe_component,
     _sanitized_environment,
+    _verify_scoped_recall_activation,
     _xxhash64,
     run_memory_agent_schedule,
 )
+from scripts.eval.memory_consolidation import commit_execution_episode
 from scripts.eval.memory_budget_journal import (
     BudgetAuthority,
     BudgetJournal,
@@ -40,6 +42,7 @@ from scripts.eval.memory_query_plan import SIDECAR_NAME, build_query_plan_trace
 from scripts.eval.memory_replay import (
     LEGACY_RUNNER_SOURCE_MODULES,
     PRODUCTION_ALLOWED_PROVIDER_TOOLS,
+    CONSOLIDATION_SCHEMA_VERSION,
     PRODUCTION_PRICING_PROVENANCE,
     PRODUCTION_AUTO_COMPACT_POLICY,
     PRODUCTION_CHILD_PATH,
@@ -47,15 +50,21 @@ from scripts.eval.memory_replay import (
     PRODUCTION_FILESYSTEM_ISOLATION,
     LEGACY_PRODUCTION_RUNNER_SOURCE_MODULES,
     PRODUCTION_RUNNER_SOURCE_MODULES,
+    PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+    PRE_CONSOLIDATION_PRODUCTION_RUNNER_SOURCE_MODULES,
+    PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
     PRODUCTION_SANDBOX_BACKEND,
     PRODUCTION_SANDBOX_PROBE_SCHEMA_VERSION,
     PRODUCTION_TOOL_NETWORK_ISOLATION,
+    SCOPED_RECALL_PREFIX,
     RUNNER_SOURCE_MODULES,
     _artifact_tree_digest,
     _cassette_memory_activity,
     _cassette_memory_exposure,
     _cassette_treatment_activation,
     _production_harness_fingerprint,
+    _query_plan_source_bound,
+    _validate_consolidation_artifacts,
     load_manifest,
     load_observations,
     load_runtime_receipt,
@@ -82,6 +91,143 @@ def digest(label: str) -> str:
 
 
 class MemoryAgentRuntimeContractTest(unittest.TestCase):
+    def test_v6_query_plan_source_identity_remains_replayable(self):
+        receipt = {
+            "schema_version": PRE_SCOPED_RECALL_PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION,
+            "runner_sources": [
+                {"module": module}
+                for module in PRE_CONSOLIDATION_PRODUCTION_RUNNER_SOURCE_MODULES
+            ],
+        }
+        self.assertTrue(_query_plan_source_bound(receipt, "production v6 receipt"))
+
+    def test_execution_episode_consolidation_is_bounded_private_and_content_addressed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            memory = root / "memory"
+            memory.mkdir()
+            index = memory / "MEMORY.md"
+            receipt = commit_execution_episode(
+                local=mock.Mock(),
+                memory_dir=memory,
+                memory_index=index,
+                store=None,
+                prompt="Preserve the registry protocol across all surfaces.",
+                stop_reason="end_turn",
+                deterministic_success=True,
+                baseline={"src/registry.zig": "const version = 1;\n"},
+                candidate={"src/registry.zig": "const version = 2;\n"},
+                source_events_sha256=digest("native-events"),
+            )
+            episode = memory / receipt["episode_file"]
+            self.assertEqual(receipt["status"], "committed")
+            self.assertEqual(receipt["changed_files"], ["src/registry.zig"])
+            self.assertEqual(
+                hashlib.sha256(episode.read_bytes()).hexdigest(),
+                receipt["episode_sha256"],
+            )
+            self.assertEqual(
+                hashlib.sha256(index.read_bytes()).hexdigest(),
+                receipt["memory_index_sha256"],
+            )
+            self.assertEqual(episode.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(index.stat().st_mode & 0o777, 0o600)
+            self.assertIn("source_events_sha256", episode.read_text(encoding="utf-8"))
+            self.assertIn(f"]({episode.name})", index.read_text(encoding="utf-8"))
+            self.assertTrue(
+                all(
+                    receipt[key] is None
+                    for key in (
+                        "tinykg_document_id",
+                        "tinykg_projection_node_ids",
+                        "tinykg_revision_before",
+                        "tinykg_revision_after",
+                        "tinykg_raw_digest_before",
+                        "tinykg_raw_digest_after",
+                        "tinykg_nodes_before",
+                        "tinykg_nodes_after",
+                        "tinykg_edges_before",
+                        "tinykg_edges_after",
+                    )
+                )
+            )
+            rollout = {"consolidation": receipt, "stop_reason": "end_turn"}
+            _validate_consolidation_artifacts(rollout, memory, "test consolidation")
+            episode_payload = episode.read_bytes()
+            episode.write_text("tampered episode\n", encoding="utf-8")
+            episode.chmod(0o600)
+            with self.assertRaisesRegex(ValidationError, "episode bytes drifted"):
+                _validate_consolidation_artifacts(rollout, memory, "test consolidation")
+            episode.write_bytes(episode_payload)
+            episode.chmod(0o600)
+            index.write_bytes(index.read_bytes() + b"tampered index\n")
+            index.chmod(0o600)
+            with self.assertRaisesRegex(ValidationError, "MEMORY.md bytes drifted"):
+                _validate_consolidation_artifacts(rollout, memory, "test consolidation")
+
+    def test_scoped_recall_receipt_must_match_provider_visible_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cassette = Path(directory)
+            prompt = "Apply the registry protocol migration."
+            block = (
+                "<system-reminder>\n"
+                "# 相关持久记忆(按你的请求自动召回,可能不全)\n"
+                "- [42] preserve protocol intent\n"
+                "</system-reminder>"
+            ).encode("utf-8")
+            (cassette / "req-001.json").write_text(
+                stable_json(
+                    {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": block.decode("utf-8")}
+                                ],
+                            }
+                        ]
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            receipt = {
+                "schema_version": "metacodes-scoped-recall-v1",
+                "status": "injected",
+                "query_sha256": hashlib.sha256(prompt.encode("utf-8")[:400]).hexdigest(),
+                "result_count": 1,
+                "injected_count": 1,
+                "injected_bytes": len(block),
+                "injection_sha256": hashlib.sha256(block).hexdigest(),
+            }
+            observed = _verify_scoped_recall_activation(
+                {"scoped_recalls": [receipt]},
+                cassette,
+                prompt,
+                tinykg_enabled=True,
+                where="test scoped recall",
+            )
+            self.assertEqual(observed, receipt)
+
+            forged = copy.deepcopy(receipt)
+            forged["injection_sha256"] = "0" * 64
+            with self.assertRaisesRegex(ValidationError, "does not match provider bytes"):
+                _verify_scoped_recall_activation(
+                    {"scoped_recalls": [forged]},
+                    cassette,
+                    prompt,
+                    tinykg_enabled=True,
+                    where="test scoped recall",
+                )
+            with self.assertRaisesRegex(ValidationError, "expected one native"):
+                _verify_scoped_recall_activation(
+                    {"scoped_recalls": []},
+                    cassette,
+                    prompt,
+                    tinykg_enabled=True,
+                    where="test scoped recall",
+                )
+
     def test_runtime_cost_cross_check_uses_journal_precision(self):
         # Reproduces the first production pilot rollout: native usage events
         # retained the sub-micro sum while the public result rounded to 6 dp.
@@ -242,6 +388,9 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         }
         trace = "production-test-trace"
         events = [{"run_started": {"trace_id": trace, "metadata": metadata}}]
+        scoped_recall = rollout.get("scoped_recall")
+        if isinstance(scoped_recall, dict):
+            events.append({"scoped_recall": copy.deepcopy(scoped_recall)})
         request_count = rollout["provider_requests"]
         for request_index in range(1, request_count + 1):
             events.append(
@@ -1195,6 +1344,344 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
         ).hexdigest()
         return manifest, observations, receipt
 
+    def _v7(self, root):
+        manifest, observations, receipt = self._v5(root)
+        receipt["schema_version"] = PRODUCTION_RUNTIME_RECEIPT_SCHEMA_VERSION
+        receipt["allowed_provider_tools"] = list(PRODUCTION_ALLOWED_PROVIDER_TOOLS)
+        receipt["ripgrep_binary_sha256"] = TEST_RIPGREP_SHA256
+
+        sources = {item["module"]: item for item in receipt["runner_sources"]}
+        ordered_sources = []
+        for module in PRODUCTION_RUNNER_SOURCE_MODULES:
+            source_path = root / "runner-sources" / f"{module}.py"
+            if not source_path.exists():
+                source_path.write_text(
+                    f"production-v7-runner-source:{module}\n",
+                    encoding="utf-8",
+                )
+            source = sources.get(module, {"module": module, "path": f"runner-sources/{module}.py"})
+            source["sha256"] = hashlib.sha256(source_path.read_bytes()).hexdigest()
+            ordered_sources.append(source)
+        receipt["runner_sources"] = ordered_sources
+
+        cases = {case["id"]: case for case in manifest["cases"]}
+        arms = {arm["id"]: arm for arm in receipt["arms"]}
+        for rollout, observation in zip(receipt["rollouts"], observations):
+            sequence = rollout["sequence"]
+            case = cases[rollout["case_id"]]
+            online = case["benchmark"] == "procedural_transfer" and case["split"] == "online"
+            runtime_arm = (
+                "codex_style"
+                if rollout["arm"] in {"no_memory", "codex_style"}
+                else "claude_style"
+                if rollout["arm"] in {"markdown_memory", "claude_style"}
+                else "tinykg"
+            )
+            tinykg_enabled = runtime_arm == "tinykg"
+            memory_root = (
+                root / rollout["artifact_paths"]["memory_state"]
+                if rollout["artifact_paths"]["memory_state"] is not None
+                else None
+            )
+
+            ripgrep = (
+                root
+                / rollout["artifact_paths"]["transcript"]
+                / ".metacodes"
+                / "toolchain"
+                / "rg"
+            )
+            ripgrep.parent.mkdir(parents=True, exist_ok=True)
+            ripgrep.write_bytes(TEST_RIPGREP.read_bytes())
+            ripgrep.chmod(0o500)
+            rollout["environment"]["ripgrep_binary_sha256"] = TEST_RIPGREP_SHA256
+            rollout["harness_fingerprint"] = _production_harness_fingerprint(
+                metacodes_binary_sha256=receipt["metacodes_binary_sha256"],
+                tinykg_binary_sha256=(
+                    receipt["tinykg_binary_sha256"] if tinykg_enabled else None
+                ),
+                harness_revision=receipt["harness_revision"],
+                arm=arms[rollout["arm"]],
+                runtime_arm=runtime_arm,
+                runtime_budget=receipt["budget"],
+                runner_sources=receipt["runner_sources"],
+                allowed_provider_tools=receipt["allowed_provider_tools"],
+                ripgrep_binary_sha256=TEST_RIPGREP_SHA256,
+            )
+            rollout["environment_fingerprint"] = hashlib.sha256(
+                stable_json(rollout["environment"]).encode("utf-8")
+            ).hexdigest()
+
+            cassette = root / rollout["artifact_paths"]["cassette"]
+            first_request = cassette / "req-001.json"
+            body = json.loads(first_request.read_text(encoding="utf-8"))
+            messages = body.setdefault("messages", [])
+            if tinykg_enabled:
+                prompt = str(case["prompt"])
+                block = (
+                    SCOPED_RECALL_PREFIX
+                    + "- [node_id=1 execution-episode] preserved protocol intent\n"
+                    + "先把它作为候选线索；必要时用 KgContext 核验证据。\n"
+                    + "</system-reminder>"
+                )
+                if not messages or messages[0].get("role") != "user":
+                    messages.insert(0, {"role": "user", "content": []})
+                messages[0].setdefault("content", []).append(
+                    {"type": "text", "text": block}
+                )
+                payload = block.encode("utf-8")
+                rollout["scoped_recall"] = {
+                    "trace_id": "production-test-trace",
+                    "schema_version": "metacodes-scoped-recall-v1",
+                    "status": "injected",
+                    "query_sha256": hashlib.sha256(
+                        prompt.encode("utf-8")[:400]
+                    ).hexdigest(),
+                    "result_count": 1,
+                    "injected_count": 1,
+                    "injected_bytes": len(payload),
+                    "injection_sha256": hashlib.sha256(payload).hexdigest(),
+                }
+            else:
+                rollout["scoped_recall"] = None
+            first_request.write_text(stable_json(body) + "\n", encoding="utf-8")
+            for request_path in sorted(cassette.glob("req-*.json")):
+                request_body = json.loads(request_path.read_text(encoding="utf-8"))
+                request_body["model"] = body["model"]
+                request_body["system"] = body["system"]
+                request_body["tools"] = copy.deepcopy(body["tools"])
+                request_path.write_text(
+                    stable_json(request_body) + "\n",
+                    encoding="utf-8",
+                )
+            query_plan = build_query_plan_trace(
+                cassette,
+                run_id=rollout["run_id"],
+                arm=rollout["arm"],
+                memory_backend=rollout["memory_backend"],
+                where=f"test v7 rollout {sequence}",
+            )
+            (cassette / SIDECAR_NAME).write_text(
+                stable_json(query_plan) + "\n",
+                encoding="utf-8",
+            )
+
+            grader = next(
+                item["fingerprint"]
+                for item in receipt["graders"]
+                if item["case_id"] == rollout["case_id"]
+            )
+            self._materialize_valid_production_events(root, rollout, grader)
+
+            consolidation = None
+            if online and runtime_arm != "codex_style":
+                assert memory_root is not None
+                deterministic = observation["evaluator"]["deterministic_success"]
+                outcome = (
+                    "success"
+                    if deterministic is True
+                    else "failure" if deterministic is False else "unknown"
+                )
+                episode_text = (
+                    "---\n"
+                    f"schema_version: {CONSOLIDATION_SCHEMA_VERSION}\n"
+                    "memory_type: episodic\n"
+                    f"outcome: {outcome}\n"
+                    f"stop_reason: {rollout['stop_reason']}\n"
+                    f"source_events_sha256: {rollout['native_events_sha256']}\n"
+                    "---\n\n"
+                    "# Execution episode\n\n"
+                    f"## Task\n\n{case['prompt']}\n\n"
+                    "## Observed workspace changes\n\n"
+                    "No tracked file content changed during this fixture.\n"
+                ).encode("utf-8")
+                episode_sha = hashlib.sha256(episode_text).hexdigest()
+                episode_name = f"execution-episode-{episode_sha[:12]}.md"
+                episode_path = memory_root / episode_name
+                episode_path.write_bytes(episode_text)
+                episode_path.chmod(0o600)
+                index_path = memory_root / "MEMORY.md"
+                prior_index = index_path.read_bytes() if index_path.exists() else b""
+                if prior_index and not prior_index.endswith(b"\n"):
+                    prior_index += b"\n"
+                index_payload = (
+                    prior_index
+                    + f"- [Execution episode]({episode_name}) — fixture episode\n".encode(
+                        "utf-8"
+                    )
+                )
+                index_path.write_bytes(index_payload)
+                index_path.chmod(0o600)
+
+                tinykg_fields = {
+                    "tinykg_document_id": None,
+                    "tinykg_projection_node_ids": None,
+                    "tinykg_revision_before": None,
+                    "tinykg_revision_after": None,
+                    "tinykg_raw_digest_before": None,
+                    "tinykg_raw_digest_after": None,
+                    "tinykg_nodes_before": None,
+                    "tinykg_nodes_after": None,
+                    "tinykg_edges_before": None,
+                    "tinykg_edges_after": None,
+                }
+                if tinykg_enabled:
+                    store = root / rollout["artifact_paths"]["store"]
+                    graph_before = rollout["store_revision_after"]
+                    raw_before = rollout["raw_store_digest_after"]
+                    events_bin = store / "events.bin"
+                    events_bin.write_bytes(events_bin.read_bytes() + b"\nv7-consolidation")
+                    raw_after = _artifact_tree_digest(store)
+                    graph_after = digest(f"v7-graph:{sequence}:{raw_after}")
+                    rollout["store_revision_after"] = graph_after
+                    rollout["raw_store_digest_after"] = raw_after
+                    tinykg_fields = {
+                        "tinykg_document_id": 42,
+                        "tinykg_projection_node_ids": [42],
+                        "tinykg_revision_before": graph_before,
+                        "tinykg_revision_after": graph_after,
+                        "tinykg_raw_digest_before": raw_before,
+                        "tinykg_raw_digest_after": raw_after,
+                        "tinykg_nodes_before": 1,
+                        "tinykg_nodes_after": 3,
+                        "tinykg_edges_before": 0,
+                        "tinykg_edges_after": 2,
+                    }
+                consolidation = {
+                    "schema_version": CONSOLIDATION_SCHEMA_VERSION,
+                    "trigger": "run_finished",
+                    "projection": "bounded_execution_episode",
+                    "status": "committed",
+                    "source_events_sha256": rollout["native_events_sha256"],
+                    "episode_file": episode_name,
+                    "episode_sha256": episode_sha,
+                    "memory_index_sha256": hashlib.sha256(index_payload).hexdigest(),
+                    "changed_files": [],
+                    "outcome": outcome,
+                    "truncated": False,
+                    **tinykg_fields,
+                }
+            rollout["consolidation"] = consolidation
+
+            if memory_root is not None:
+                index_path = memory_root / "MEMORY.md"
+                if case["split"] == "offline" and not index_path.exists():
+                    index_path.write_text("# Durable memory\n", encoding="utf-8")
+                    index_path.chmod(0o600)
+                    first = json.loads(first_request.read_text(encoding="utf-8"))
+                    first_messages = first.setdefault("messages", [])
+                    if not first_messages or first_messages[0].get("role") != "user":
+                        first_messages.insert(0, {"role": "user", "content": []})
+                    first_messages[0].setdefault("content", []).append(
+                        {"type": "text", "text": index_path.read_text(encoding="utf-8")}
+                    )
+                    first_request.write_text(stable_json(first) + "\n", encoding="utf-8")
+                markdown_after = _artifact_tree_digest(memory_root)
+                if online:
+                    rollout["memory_components_after"]["markdown"] = markdown_after
+                else:
+                    rollout["memory_components_before"]["markdown"] = markdown_after
+                    rollout["memory_components_after"]["markdown"] = markdown_after
+                if tinykg_enabled:
+                    rollout["memory_components_after"]["tinykg"] = rollout[
+                        "store_revision_after"
+                    ]
+                    if not online:
+                        rollout["memory_components_before"]["tinykg"] = rollout[
+                            "store_revision_before"
+                        ]
+                rollout["memory_state_before"] = hashlib.sha256(
+                    stable_json(rollout["memory_components_before"]).encode("utf-8")
+                ).hexdigest()
+                rollout["memory_state_after"] = hashlib.sha256(
+                    stable_json(rollout["memory_components_after"]).encode("utf-8")
+                ).hexdigest()
+                observation["graph"]["revision"] = (
+                    rollout["store_revision_after"]
+                    if tinykg_enabled
+                    else rollout["memory_state_after"]
+                )
+
+            expected_index = b""
+            if memory_root is not None and case["split"] != "online":
+                expected_index = (memory_root / "MEMORY.md").read_bytes()
+            exposure = _cassette_memory_exposure(
+                cassette,
+                f"test v7 exposure {sequence}",
+                memory_root=memory_root,
+                expected_memory_index=expected_index,
+                count_graph_context=tinykg_enabled,
+            )
+            rollout["memory_auto_injected_bytes"] = exposure["auto_injected_bytes"]
+            rollout["memory_tool_result_bytes"] = exposure["tool_result_bytes"]
+            observation["memory"]["exposed_tokens"] = (exposure["total_bytes"] + 3) // 4
+            rollout["treatment_activation"] = _cassette_treatment_activation(
+                cassette,
+                runtime_arm,
+                "glm-5.2",
+            )
+            rollout["cassette_sha256"] = _artifact_tree_digest(cassette)
+            rollout["transcript_sha256"] = _artifact_tree_digest(
+                root / rollout["artifact_paths"]["transcript"]
+            )
+            rollout["workspace_sha256"] = _artifact_tree_digest(
+                root / rollout["artifact_paths"]["workspace"]
+            )
+            rollout["observation_sha256"] = hashlib.sha256(
+                stable_json(observation).encode("utf-8")
+            ).hexdigest()
+
+        authority = BudgetAuthority(
+            manifest_sha256=receipt["manifest_sha256"],
+            model_fingerprint=receipt["model_fingerprint"],
+            provider_identity=receipt["provider_id"],
+            total_cost_microusd=usd_to_microusd(
+                receipt["budget"]["max_total_cost_usd"]
+            ),
+            total_metered_tokens=receipt["budget"]["max_total_metered_tokens"],
+        )
+        journal_path = root / "test-budget-control-v7" / "journal.json"
+        journal_path.parent.mkdir(mode=0o700)
+        with BudgetJournal(journal_path, authority) as journal:
+            for rollout in receipt["rollouts"]:
+                transaction = BudgetTransaction(
+                    run_id=rollout["run_id"],
+                    manifest_sha256=receipt["manifest_sha256"],
+                    model_fingerprint=receipt["model_fingerprint"],
+                    harness_fingerprint=rollout["harness_fingerprint"],
+                    provider_identity=receipt["provider_id"],
+                    max_cost_microusd=usd_to_microusd(
+                        receipt["budget"]["max_rollout_cost_usd"]
+                    ),
+                    max_metered_tokens=receipt["budget"]["max_rollout_metered_tokens"],
+                )
+                reserved = journal.reserve(transaction)
+                authorized = journal.authorize_request(
+                    reserved["transaction_id"],
+                    expected_revision=reserved["journal_revision"],
+                    expected_head_sha256=reserved["journal_head_sha256"],
+                )
+                rollout["budget_transaction"] = journal.commit(
+                    authorized["transaction_id"],
+                    actual_cost_microusd=usd_to_microusd_ceiling(
+                        rollout["estimated_cost_usd"]
+                    ),
+                    actual_metered_tokens=rollout["metered_tokens"],
+                )
+            checkpoint = journal.checkpoint_payload()
+            checkpoint_path = root / "budget-journal-checkpoint-v7.json"
+            checkpoint_path.write_bytes(checkpoint)
+            receipt["budget_journal"] = {
+                **journal.snapshot(),
+                "checkpoint_path": checkpoint_path.name,
+                "checkpoint_sha256": hashlib.sha256(checkpoint).hexdigest(),
+            }
+
+        receipt["observations_sha256"] = hashlib.sha256(
+            stable_json(observations).encode("utf-8")
+        ).hexdigest()
+        return manifest, observations, receipt
+
     def _v4(self, root):
         manifest, observations, receipt = self._v3()
         manifest["execution"]["model_id"] = "glm-5.2"
@@ -1874,6 +2361,124 @@ class MemoryAgentRuntimeContractTest(unittest.TestCase):
             request.write_text(stable_json(body) + "\n", encoding="utf-8")
             offline["cassette_sha256"] = _artifact_tree_digest(cassette)
             with self.assertRaisesRegex(ValidationError, "memory_write_events"):
+                validate_runtime_artifacts(receipt, root)
+
+    def test_v7_receipt_binds_host_recall_and_consolidation_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, observations, receipt = self._v7(root)
+            validate_runtime_receipt(
+                receipt,
+                manifest,
+                observations,
+                manifest["dataset"]["source_sha256"],
+            )
+            validate_runtime_artifacts(receipt, root)
+
+            missing = copy.deepcopy(receipt)
+            online_memory = next(
+                rollout
+                for rollout in missing["rollouts"]
+                if rollout["memory_phase"] == "online"
+                and rollout["memory_backend"] != "none"
+            )
+            online_memory["consolidation"] = None
+            with self.assertRaisesRegex(ValidationError, "consolidation"):
+                validate_runtime_receipt(
+                    missing,
+                    manifest,
+                    observations,
+                    manifest["dataset"]["source_sha256"],
+                )
+
+            for backend in ("markdown", "tinykg_integrated"):
+                inactive_receipt = copy.deepcopy(receipt)
+                inactive_observations = copy.deepcopy(observations)
+                inactive_rollout = next(
+                    rollout
+                    for rollout in inactive_receipt["rollouts"]
+                    if rollout["memory_phase"] == "offline"
+                    and rollout["memory_backend"] == backend
+                )
+                sequence = inactive_rollout["sequence"]
+                inactive_rollout["memory_tool_result_bytes"] = 0
+                if backend == "markdown":
+                    inactive_rollout["memory_auto_injected_bytes"] = 0
+                else:
+                    scoped = inactive_rollout["scoped_recall"]
+                    scoped.update(
+                        {
+                            "status": "no_hits",
+                            "result_count": 0,
+                            "injected_count": 0,
+                            "injected_bytes": 0,
+                            "injection_sha256": "0" * 64,
+                        }
+                    )
+                inactive_observation = inactive_observations[sequence]
+                exposed = (
+                    inactive_rollout["memory_auto_injected_bytes"]
+                    + inactive_rollout["memory_tool_result_bytes"]
+                )
+                inactive_observation["memory"]["exposed_tokens"] = (exposed + 3) // 4
+                inactive_observation["evaluator"] = {
+                    "status": "invalid",
+                    "invalid_reason": "memory treatment inactive",
+                    "deterministic_success": None,
+                }
+                inactive_rollout["observation_sha256"] = hashlib.sha256(
+                    stable_json(inactive_observation).encode("utf-8")
+                ).hexdigest()
+                inactive_receipt["observations_sha256"] = hashlib.sha256(
+                    stable_json(inactive_observations).encode("utf-8")
+                ).hexdigest()
+                validate_runtime_receipt(
+                    inactive_receipt,
+                    manifest,
+                    inactive_observations,
+                    manifest["dataset"]["source_sha256"],
+                )
+
+                falsely_ready = copy.deepcopy(inactive_observations)
+                falsely_ready[sequence]["evaluator"] = {
+                    "status": "ready",
+                    "invalid_reason": None,
+                    "deterministic_success": True,
+                }
+                falsely_ready_receipt = copy.deepcopy(inactive_receipt)
+                falsely_ready_receipt["rollouts"][sequence][
+                    "observation_sha256"
+                ] = hashlib.sha256(
+                    stable_json(falsely_ready[sequence]).encode("utf-8")
+                ).hexdigest()
+                falsely_ready_receipt["observations_sha256"] = hashlib.sha256(
+                    stable_json(falsely_ready).encode("utf-8")
+                ).hexdigest()
+                with self.assertRaisesRegex(ValidationError, "explicitly invalid"):
+                    validate_runtime_receipt(
+                        falsely_ready_receipt,
+                        manifest,
+                        falsely_ready,
+                        manifest["dataset"]["source_sha256"],
+                    )
+
+            online_tinykg = next(
+                rollout
+                for rollout in receipt["rollouts"]
+                if rollout["memory_phase"] == "online"
+                and rollout["memory_backend"] == "tinykg_integrated"
+            )
+            episode = (
+                root
+                / online_tinykg["artifact_paths"]["memory_state"]
+                / online_tinykg["consolidation"]["episode_file"]
+            )
+            episode.write_text("tampered\n", encoding="utf-8")
+            episode.chmod(0o600)
+            with self.assertRaisesRegex(
+                ValidationError,
+                "episode|Markdown tree|transcript_sha256",
+            ):
                 validate_runtime_artifacts(receipt, root)
 
     def test_v4_receipt_binds_production_budget_treatment_and_unknown_bill(self):
