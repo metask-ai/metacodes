@@ -457,6 +457,220 @@
           ]
         }
       ]
+    },
+    {
+      "id": "capability-contract-propagation",
+      "intent_template": "Register capability `{name}` for {purpose}. Update the implementation registry, protocol manifest, and docs using stable wire spelling `{wire}`.",
+      "procedure_evidence_id": "procedure:capability-contract-propagation:v1",
+      "cases": [
+        {
+          "id": "audit-stream",
+          "split": "online",
+          "bindings": {
+            "name": "audit_stream",
+            "purpose": "streaming immutable audit records to compliance sinks",
+            "wire": "AUDIT_STREAM"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/capabilities.md",
+                "content": "# Capabilities\n\n- `HEALTH_CHECK`: reporting service health.\n"
+              },
+              {
+                "path": "src/capabilities.py",
+                "content": "CAPABILITIES = {\n    \"health_check\": \"HEALTH_CHECK\",\n}\n"
+              },
+              {
+                "path": "tests/capabilities.json",
+                "content": "{\"capabilities\":[\"HEALTH_CHECK\"]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/capabilities.md",
+              "src/capabilities.py",
+              "tests/capabilities.json"
+            ],
+            "required_changed_paths": [
+              "docs/capabilities.md",
+              "src/capabilities.py",
+              "tests/capabilities.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/capabilities.py",
+                "value": "\"audit_stream\": \"AUDIT_STREAM\""
+              },
+              {
+                "kind": "contains",
+                "path": "tests/capabilities.json",
+                "value": "\"AUDIT_STREAM\""
+              },
+              {
+                "kind": "contains",
+                "path": "docs/capabilities.md",
+                "value": "streaming immutable audit records to compliance sinks"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/capabilities.md",
+              "content": "# Capabilities\n\n- `HEALTH_CHECK`: reporting service health.\n- `AUDIT_STREAM`: streaming immutable audit records to compliance sinks.\n"
+            },
+            {
+              "path": "src/capabilities.py",
+              "content": "CAPABILITIES = {\n    \"health_check\": \"HEALTH_CHECK\",\n    \"audit_stream\": \"AUDIT_STREAM\",\n}\n"
+            },
+            {
+              "path": "tests/capabilities.json",
+              "content": "{\"capabilities\":[\"HEALTH_CHECK\",\"AUDIT_STREAM\"]}\n"
+            }
+          ]
+        },
+        {
+          "id": "snapshot-restore",
+          "split": "offline",
+          "bindings": {
+            "name": "snapshot_restore",
+            "purpose": "restoring a workspace from a versioned snapshot",
+            "wire": "SNAPSHOT_RESTORE"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/capabilities.md",
+                "content": "# Capabilities\n\n- `HEALTH_CHECK`: reporting service health.\n"
+              },
+              {
+                "path": "src/capabilities.py",
+                "content": "CAPABILITIES = {\n    \"health_check\": \"HEALTH_CHECK\",\n}\n"
+              },
+              {
+                "path": "tests/capabilities.json",
+                "content": "{\"capabilities\":[\"HEALTH_CHECK\"]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/capabilities.md",
+              "src/capabilities.py",
+              "tests/capabilities.json"
+            ],
+            "required_changed_paths": [
+              "docs/capabilities.md",
+              "src/capabilities.py",
+              "tests/capabilities.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/capabilities.py",
+                "value": "\"snapshot_restore\": \"SNAPSHOT_RESTORE\""
+              },
+              {
+                "kind": "contains",
+                "path": "tests/capabilities.json",
+                "value": "\"SNAPSHOT_RESTORE\""
+              },
+              {
+                "kind": "contains",
+                "path": "docs/capabilities.md",
+                "value": "restoring a workspace from a versioned snapshot"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/capabilities.md",
+              "content": "# Capabilities\n\n- `HEALTH_CHECK`: reporting service health.\n- `SNAPSHOT_RESTORE`: restoring a workspace from a versioned snapshot.\n"
+            },
+            {
+              "path": "src/capabilities.py",
+              "content": "CAPABILITIES = {\n    \"health_check\": \"HEALTH_CHECK\",\n    \"snapshot_restore\": \"SNAPSHOT_RESTORE\",\n}\n"
+            },
+            {
+              "path": "tests/capabilities.json",
+              "content": "{\"capabilities\":[\"HEALTH_CHECK\",\"SNAPSHOT_RESTORE\"]}\n"
+            }
+          ]
+        },
+        {
+          "id": "schema-inspect",
+          "split": "offline",
+          "bindings": {
+            "name": "schema_inspect",
+            "purpose": "reporting the active schema and storage-format contract",
+            "wire": "SCHEMA_INSPECT"
+          },
+          "workspace": {
+            "files": [
+              {
+                "path": "docs/capabilities.md",
+                "content": "# Capabilities\n\n- `HEALTH_CHECK`: reporting service health.\n"
+              },
+              {
+                "path": "src/capabilities.py",
+                "content": "CAPABILITIES = {\n    \"health_check\": \"HEALTH_CHECK\",\n}\n"
+              },
+              {
+                "path": "tests/capabilities.json",
+                "content": "{\"capabilities\":[\"HEALTH_CHECK\"]}\n"
+              }
+            ]
+          },
+          "validator": {
+            "kind": "workspace_assertions_v1",
+            "allowed_changed_paths": [
+              "docs/capabilities.md",
+              "src/capabilities.py",
+              "tests/capabilities.json"
+            ],
+            "required_changed_paths": [
+              "docs/capabilities.md",
+              "src/capabilities.py",
+              "tests/capabilities.json"
+            ],
+            "checks": [
+              {
+                "kind": "contains",
+                "path": "src/capabilities.py",
+                "value": "\"schema_inspect\": \"SCHEMA_INSPECT\""
+              },
+              {
+                "kind": "contains",
+                "path": "tests/capabilities.json",
+                "value": "\"SCHEMA_INSPECT\""
+              },
+              {
+                "kind": "contains",
+                "path": "docs/capabilities.md",
+                "value": "reporting the active schema and storage-format contract"
+              }
+            ]
+          },
+          "oracle_files": [
+            {
+              "path": "docs/capabilities.md",
+              "content": "# Capabilities\n\n- `HEALTH_CHECK`: reporting service health.\n- `SCHEMA_INSPECT`: reporting the active schema and storage-format contract.\n"
+            },
+            {
+              "path": "src/capabilities.py",
+              "content": "CAPABILITIES = {\n    \"health_check\": \"HEALTH_CHECK\",\n    \"schema_inspect\": \"SCHEMA_INSPECT\",\n}\n"
+            },
+            {
+              "path": "tests/capabilities.json",
+              "content": "{\"capabilities\":[\"HEALTH_CHECK\",\"SCHEMA_INSPECT\"]}\n"
+            }
+          ]
+        }
+      ]
     }
   ]
 }
